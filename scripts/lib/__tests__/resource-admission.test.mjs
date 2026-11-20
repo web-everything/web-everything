@@ -47,6 +47,38 @@ it('handles missing, stale, boundary freshness and grace', () => {
   expect(decide(snapshot(), 'build', 130000).unknown).toBe(false);
   expect(decide(snapshot(), 'build', 130001, resolveResourcePolicy({ tool: { staleGraceMs: 100 } })).unknown).toBe(false);
 });
+it.each([
+  ['build', 2], ['build', 3], ['fix', 2], ['fix', 3], ['light', 2], ['light', 3],
+])('explicit memory ceiling of 1 holds %s at warn level %s despite clean corroborators', (kind, memPressureLevel) => {
+  const policy = resolveResourcePolicy({ tool: { [kind]: { maxMemPressureLevel: 1 } } });
+  const result = decide(snapshot({ memPressureLevel, memFreePct: 45, swapGrowthMb: 0 }), kind, 100000, policy);
+  expect(result).toMatchObject({ verdict: 'hold', inputs: { freePct: 45, swapGrowthMb: 0 } });
+  expect(result.reason).toContain(`memory pressure ${memPressureLevel} > 1`);
+  expect(result.reason).toContain('free 45% (>=20%), swap +0MB (<=256MB)');
+  expect(decide(snapshot(), kind, 100000, policy).verdict).toBe('admit');
+});
+it('admits warn with clean free memory even when swap growth is unknown (first sample)', () => {
+  expect(decide(snapshot({ memPressureLevel: 2, memFreePct: 45 })).verdict).toBe('admit');
+});
+it.each([undefined, null, NaN, -1, 101])('warn holds unreadable free percent %s despite flat swap', memFreePct => {
+  expect(decide(snapshot({ memPressureLevel: 2, memFreePct, swapGrowthMb: 0 })).verdict).toBe('hold');
+});
+it.each([3, 4, 5, 2.5])('non-warn pressure %s holds despite clean free memory and swap, even under a ceiling of 4', memPressureLevel => {
+  const s = snapshot({ memPressureLevel, memFreePct: 45, swapGrowthMb: 0 });
+  expect(decide(s).verdict).toBe('hold');
+  expect(decide(s, 'build', 100000, resolveResourcePolicy({ tool: { build: { maxMemPressureLevel: 4 } } })).verdict).toBe('hold');
+});
+it('enforces the default ceiling of 2 for level 3', () => {
+  expect(decide(snapshot({ memPressureLevel: 3, memFreePct: 45, swapGrowthMb: 0 })).reason).toContain('memory pressure 3 > 2');
+});
+it('warn holds 19.96% free at the 20% threshold and admits exactly 20%', () => {
+  expect(decide(snapshot({ memPressureLevel: 2, memFreePct: 19.96 })).verdict).toBe('hold');
+  expect(decide(snapshot({ memPressureLevel: 2, memFreePct: 20 })).verdict).toBe('admit');
+});
+it.each([1, 2, 4])('critical pressure holds even with memory ceiling %s and clean corroborators', maxMemPressureLevel => {
+  const policy = resolveResourcePolicy({ tool: { build: { maxMemPressureLevel } } });
+  expect(decide(snapshot({ memPressureLevel: 4, memFreePct: 45, swapGrowthMb: 0 }), 'build', 100000, policy).verdict).toBe('hold');
+});
 it('applies memory, cpu, disk and optional slot limits with null diagnostics', () => {
   expect(decide(snapshot({ memPressureLevel: 4, cpuIdlePct: 0 }))).toMatchObject({ verdict: 'hold', projectedWaitMinutes: 2 });
   expect(decide(snapshot({ cpuIdlePct: 14 }))).toMatchObject({ verdict: 'wait', projectedWaitMinutes: 2 });
@@ -55,7 +87,7 @@ it('applies memory, cpu, disk and optional slot limits with null diagnostics', (
   const diskPolicy = resolveResourcePolicy({ tool: { build: { maxDiskBusyPct: 95 } } });
   expect(decide(snapshot({ disk: { busyPct: 96 } }), 'build', 100000, diskPolicy).verdict).toBe('wait');
   expect(decide(snapshot({ disk: { busyPct: 100 } }), 'prepare').verdict).toBe('admit');
-  expect(decide(snapshot({ cpuIdlePct: 15, memPressureLevel: 2, disk: { busyPct: 95 } })).verdict).toBe('admit');
+  expect(decide(snapshot({ cpuIdlePct: 15, memPressureLevel: 2, memFreePct: 45, disk: { busyPct: 95 } })).verdict).toBe('admit');
   const result = decide(snapshot({ cpuIdlePct: null, memPressureLevel: null, disk: null }));
   expect(result.verdict).toBe('admit');
   expect(result.reason).toMatch(/cpu.*unknown.*memory.*unknown.*disk.*unknown/);

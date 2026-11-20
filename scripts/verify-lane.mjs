@@ -20,6 +20,16 @@
  * The default build.finalGate is full: the whole unit tier plus standards, through heavy admission.
  * build.finalGate=related selects related tests; build.finalGateStandards defaults to always,
  * retaining standards on every diff. Set finalGateStandards=selected for the verify-settings selection.
+ * retryFailed (default 1; WE_VERIFY_RETRY_FAILED, 0 restores legacy isolatedRetry) retries only failed
+ * files, including edited files, serially with scaled timeouts.
+ * isolatedRetry=off disables all retries; isolatedRetry=timeouts restricts retries to timeout-only failures.
+ * At most three files per phase; incomplete inventories or larger failures stay red: fix them or run a fresh
+ * verify. Each retry requires a JSON report proving the original failing assertions passed.
+ * Green recoveries carry flakes + flaky-retried-green and
+ * append advisory host telemetry to <coordination root>/.operations/test-flakes.jsonl; CI is unchanged.
+ * Selected Vitest, scan, guard and the recognized full-unit default gate support this. The full default
+ * runs tests and standards separately so retry never masks a standards failure. Opaque explicit combined
+ * commands retain their original red: their other checks cannot be proven by a Vitest inventory.
  * Explicit --gate commands retain precedence. Settings and their sources are logged through policy-cascade.
  *
  * Usage:
@@ -66,7 +76,7 @@ import { readLockEntry } from './readiness/file-locks.mjs';
 import { spawn } from 'node:child_process';
 import { createFailureCollector, mergeFailureDetails } from './lib/verify-failures.mjs';
 import { createOutputTail } from './lib/output-tail.mjs';
-import { isolatedRetryArgv, isolatedRetryFailures, describeIsolatedRetry, isolatedRetryAudit, FLAKY_OUTSIDE_DIFF, STILL_RED_IN_ISOLATION, MAX_TIMEOUT_LOG_BYTES } from './lib/gate-timeout-retry.mjs';
+import { isolatedRetryArgv, isolatedRetryFailures, describeIsolatedRetry, isolatedRetryAudit, FLAKY_OUTSIDE_DIFF, STILL_RED_IN_ISOLATION, MAX_TIMEOUT_LOG_BYTES, retryFailedPhase, appendTestFlake, scanFailureDiagnostic, FLAKY_RETRIED_GREEN } from './lib/gate-timeout-retry.mjs';
 import * as nodeFs from 'node:fs';
 import { writeFileSync, renameSync, existsSync, readFileSync, readdirSync, unlinkSync, lstatSync, mkdtempSync, rmSync, realpathSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
@@ -88,7 +98,7 @@ import { revertRedForVerify, appendRevertRedLog, recoverRevertRed, applyRevertRe
 import { createRevertProbe } from './operations/mutation-check-io.mjs';
 import { resolveCoordinationRoot } from './operations/coordination-root.mjs';
 import { admissionLockRoot, resolveCap, resolveTimeoutMs, acquireSlotBlocking, releaseOwnedSlot, heartbeatOwnedSlot, ADMISSION_HELD_ENV, classifyCommandKind } from './readiness/heavy-admission.mjs';
-import { SHARD_RUN_SCRIPT, localPhaseReason, localPhaseShape, phaseAdmissionPlan, shouldConfirmRemoteRed, decidePhaseRemote, readRemoteReport, phaseRunLocation, mergeRunLocation, overallRunLocation, remoteInfrastructureFailure, REMOTE_TERMINATION_UNCONFIRMED } from './lib/verify-remote-routing.mjs';
+import { SHARD_RUN_SCRIPT, checkoutHasRetryableTestUnit, scanRetryCommand, localPhaseReason, localPhaseShape, localPhaseBypassDetail, phaseAdmissionPlan, shouldConfirmRemoteRed, decidePhaseRemote, readRemoteReport, phaseRunLocation, mergeRunLocation, overallRunLocation, remoteInfrastructureFailure, REMOTE_TERMINATION_UNCONFIRMED } from './lib/verify-remote-routing.mjs';
 import { startTreeWatchdog } from './lib/tree-watchdog.mjs';
 import { shellQuote, isShardWrapperCommand } from './lib/verify-lane-gate.mjs';
 import { randomBytes } from 'node:crypto';
@@ -660,15 +670,27 @@ const ADMISSION_TIMEOUT_MS = resolveTimeoutMs(process.env);
 const laneMatch = /lane-(\d+)/.exec(REPO);
 // #verify-phase-admission — acquire the first phase before dispatch's execution marker.
 const retryableGate = isSelectedTestCommand(resolvedGate?.testCommand ?? '');
+// Only the known default full command is separable; arbitrary shell commands remain opaque.
+const fullRetryGate = verifySetting('retryFailed', process.env) > 0 && resolvedGate?.decision?.mode === 'full'
+  && /^npm run test:unit(?: && npm run check:standards)?$/.test(resolvedGate.command)
+  && checkoutHasRetryableTestUnit(REPO);
+if (verifySetting('retryFailed', process.env) > 0 && resolvedGate?.decision?.mode === 'full' && !fullRetryGate) {
+  process.stderr.write('verify-lane: full-gate retry unavailable: cannot prove a hook-free admission-wrapped test:unit; fix failures or run a fresh verify.\n');
+}
+if (fullRetryGate) {
+  resolvedGate.testCommand = 'npm run test:unit';
+  resolvedGate.standardsCommand = resolvedGate.command.includes('check:standards') ? 'npm run check:standards' : null;
+}
+const phasedTestGate = retryableGate || fullRetryGate;
 // The helper resolves environment overrides over the running checkout's cached settings file.
-const phaseAdmission = verifyPhaseAdmissionEnabled(process.env) && retryableGate;
+const phaseAdmission = verifyPhaseAdmissionEnabled(process.env) && phasedTestGate;
 const admissionPhases = {};
 async function acquireAdmission(phase, command) {
   let decision = { remote: false, reason: localPhaseReason(command, { cwd: REPO }) };
   if (!phaseAdmissionPlan({ command, cwd: REPO, decision: { remote: true } }).takeLocalSlot) {
     decision = await decidePhaseRemote({ cwd: REPO, env: process.env, argv: command.split(/\s+/) });
     process.stderr.write(`verify-lane: ${decision.remote ? 'remote' : 'local'} admission (${decision.reason})\n`);
-  } else if (decision.reason !== 'raw-command') {
+  } else {
     process.stderr.write(`verify-lane: local admission (${decision.reason})\n`);
   }
   const plan = phaseAdmissionPlan({ command, cwd: REPO, decision });
@@ -676,7 +698,7 @@ async function acquireAdmission(phase, command) {
   const routing = phaseAdmission ? phaseAdmissionKind({
     phase, decision: resolvedGate.decision, standardsScoped: resolvedGate.decision.standards?.scoped, env: process.env,
   }) : { kind: classifyCommandKind(GATE) };
-  recordLocalSlotFallback({ lockRoot: ADMISSION_LOCK_ROOT, reason: decision.reason, detail: decision.reason === 'raw-command' ? localPhaseShape(command) : null, repo: REPO, kind: routing.kind }); // logging only; never throws
+  recordLocalSlotFallback({ lockRoot: ADMISSION_LOCK_ROOT, reason: decision.reason, detail: decision.reason === 'raw-command' ? localPhaseBypassDetail(command, { lane: laneMatch?.[1], session: process.env.WE_HEAVY_SESSION }) : null, repo: REPO, kind: routing.kind }); // logging only; never throws
   const acquired = await acquireSlotBlocking({
     lockRoot: ADMISSION_LOCK_ROOT, cap: ADMISSION_CAP, owner: REPO, timeoutMs: ADMISSION_TIMEOUT_MS,
     lane: laneMatch ? laneMatch[1] : null, kind: routing.kind,
@@ -693,7 +715,7 @@ async function acquireAdmission(phase, command) {
   }
   return acquired;
 }
-const admission = await acquireAdmission('vitest', retryableGate ? resolvedGate.testCommand : (resolvedGate?.command ?? GATE));
+const admission = await acquireAdmission('vitest', phasedTestGate ? resolvedGate.testCommand : (resolvedGate?.command ?? GATE));
 let currentAdmission = admission;
 let vitestAdmittedLocally = admission.ok;
 const ranOnPhases = {};
@@ -941,6 +963,10 @@ let gateMs;
 // Only an infrastructure failure (a signal / killed runner) stops early: a dead runner must not run more phases.
 const runAllPhases = verifySetting('runAllPhases', process.env) === true;
 const isolatedRetryMode = verifySetting('isolatedRetry', process.env);
+const retryFailed = verifySetting('retryFailed', process.env);
+const flakes = [];
+const loggedFlakeFiles = new Set();
+process.stderr.write(`verify-lane: retryFailed=${retryFailed} (${verifySettingSource('retryFailed', process.env)})\n`);
 const phaseResults = [];
 // The guard run writes vitest's JSON report here: the inventory of files that ACTUALLY executed, which is the only
 // proof every declared guard ran (vitest treats file arguments as filters, so a config-excluded guard is dropped
@@ -951,14 +977,60 @@ const alwaysRun = retryableGate
   ? alwaysRunPlan({ declared: verifySetting('alwaysRunTests', process.env), fileExists: (p) => existsSync(join(REPO, p)),
     scanCommands: resolvedGate.scanCommands ?? [], testTimeoutFactor: resolvedGate.decision?.testTimeoutFactor ?? 1, reportFile: alwaysRunReport })
   : { command: null, declared: [], files: [], skipped: [] };
+// Retry commands use direct test-file filters, retain scan inputs, and write their own execution report.
+async function retryPhase(result, phase, previousOutcome, scanCommand) {
+  if (phase === 'scan' && scanRetryCommand(scanCommand, ['npx', 'vitest', 'run']) === null) {
+    process.stderr.write('verify-lane: scan stays red: cannot reproduce its environment; fix the failures or run a fresh verify.\n');
+    return result;
+  }
+  const phaseKind = phase === 'vitest' ? 'vitest' : 'scan';
+  const audit = await retryFailedPhase({ result, attempts: retryFailed, cwd: realpathSync(REPO),
+    mode: isolatedRetryMode === 'untouched' ? 'all' : isolatedRetryMode,
+    infrastructureFailure: verificationInfrastructureFailure,
+    onFlake: entry => {
+      if (loggedFlakeFiles.has(entry.file)) return;
+      loggedFlakeFiles.add(entry.file);
+      appendTestFlake({ ...entry, sha: headSha }, { root: resolveCoordinationRoot });
+    },
+    run: async (files, attempt) => {
+      const dir = mkdtempSync(join(tmpdir(), 'verify-retry-'));
+      const report = join(dir, 'results.json');
+      try {
+        process.stderr.write(`Re-running only ${files.length} failing file(s) in ${phase}, isolated attempt ${attempt}/${retryFailed}: ${files.join(', ')}\n`);
+        const timeouts = scaledTimeoutFlags(resolvedGate.decision?.testTimeoutFactor ?? verifySetting('testTimeoutFactor', process.env)).split(' ').filter(Boolean);
+        const argv = isolatedRetryArgv(files, [...timeouts, '--reporter=default', '--reporter=json', `--outputFile.json=${report}`]);
+        const retry = phase === 'scan'
+          ? await timedRunGate(`${phaseKind}Ms`, scanRetryCommand(scanCommand, argv), undefined, { outcomeKey: `${phase}-retry` })
+          : await timedRunGate(`${phaseKind}Ms`, argv[0], argv.slice(1), { outcomeKey: `${phase}-retry` });
+        let retryReportText = null;
+        try { if (nodeFs.statSync(report).size <= MAX_TIMEOUT_LOG_BYTES) retryReportText = readFileSync(report, 'utf8'); } catch { /* unproven execution stays red */ }
+        return { ...retry, retryReportText };
+      } finally { rmSync(dir, { recursive: true, force: true }); }
+    },
+  });
+  if (result.exitCode !== 0 && !result.signal && !verificationInfrastructureFailure(result) && !audit.retried.length) {
+    process.stderr.write(`verify-lane: ${phase} stays red: no complete retry inventory within the three-file cap; fix the failures or run a fresh verify.\n`);
+  }
+  if (audit.retried.length) {
+    retriedFailures.push(...audit.retried.map(f => ({ ...f, phase })));
+    flakes.push(...audit.flakes.map(f => ({ ...f, phase })));
+    if (audit.result.exitCode !== 0 || audit.result.signal) isolatedRetry = STILL_RED_IN_ISOLATION;
+    else {
+      if (isolatedRetry !== STILL_RED_IN_ISOLATION) isolatedRetry = FLAKY_RETRIED_GREEN;
+      if (previousOutcome?.result !== 'fail') outcomes[phase] = buildPhaseOutcome({ ...audit.result, kind: phaseKind, decision: resolvedGate?.decision });
+      process.stderr.write(`verify-lane: green-with-flakes (${phase}): ${audit.flakes.map(f => f.file).join(', ')}\n`);
+    }
+  }
+  return audit.result;
+}
 const continueAfter = (r) => r.exitCode === 0 || (runAllPhases && !r.signal && !verificationInfrastructureFailure(r));
 try {
-  let result = await timedRunGate(retryableGate ? 'vitestMs' : null,
+  let result = await timedRunGate(phasedTestGate ? 'vitestMs' : null,
     // Item 59 (b) — a recognized default gate with a non-`vitest related` test half (a skipped-vitest echo)
     // runs the plan resolved under THIS (the daemon's) standards policy, not the requester's stamped command.
     // `GATE` stays the marker's `suites`, so the cache key still matches.
-    retryableGate ? resolvedGate.testCommand : (resolvedGate?.command ?? GATE));
-  if (retryableGate && vitestAdmittedLocally && isolatedRetryMode !== 'off' && result.exitCode !== 0 && !verificationInfrastructureFailure(result) && result.output) {
+    phasedTestGate ? resolvedGate.testCommand : (resolvedGate?.command ?? GATE));
+  if (retryFailed === 0 && retryableGate && vitestAdmittedLocally && isolatedRetryMode !== 'off' && result.exitCode !== 0 && !verificationInfrastructureFailure(result) && result.output) {
     // Edits during admission or test execution must also count as the change's own files.
     const changedNow = localChangedSet({ runGit: git });
     editedDuringRun = changedNow?.changedFiles ?? [];
@@ -977,13 +1049,17 @@ try {
       isolatedRetry = result.exitCode === 0 && !result.signal ? FLAKY_OUTSIDE_DIFF : STILL_RED_IN_ISOLATION;
     }
   }
+  if (phasedTestGate && retryFailed > 0) result = await retryPhase(result, 'vitest');
   phaseResults.push({ phase: 'vitest', result });
   // #3887 — the repo-scanning tests `vitest related` cannot select, scoped to the changed files (each command carries
   // its own VERIFY_SCAN_FILES). Before check:standards, so a scanner failure is reported with the tests.
   if (retryableGate && continueAfter(result)) {
     for (const scanCommand of resolvedGate.scanCommands ?? []) {
       process.stderr.write(`⏱ repo-scanning tests (scoped to changed files): ${scanCommand.replace(/^VERIFY_SCAN_FILES='[^']*'/, 'VERIFY_SCAN_FILES=<changed files>')}\n`);
-      const scan = await timedRunGate('scanMs', scanCommand);
+      const previousOutcome = outcomes.scan;
+      let scan = await timedRunGate('scanMs', scanCommand);
+      if (scan.exitCode !== 0) process.stderr.write(scanFailureDiagnostic(scan, scanCommand));
+      if (retryFailed > 0) scan = await retryPhase(scan, 'scan', previousOutcome, scanCommand);
       phaseResults.push({ phase: 'scan', result: scan });
       if (!continueAfter(scan)) break;
     }
@@ -1014,10 +1090,12 @@ try {
         outcomes.guard = buildPhaseOutcome({ kind: 'scan', exitCode: 1, failureDetails: guard.failureDetails });
       }
     }
+    if (guard.exitCode !== 0) process.stderr.write(scanFailureDiagnostic(guard, 'always-run guard'));
+    if (retryFailed > 0 && !alwaysRun.missing.length) guard = await retryPhase(guard, 'guard');
     alwaysRun.result = guard.exitCode === 0 && !guard.signal ? 'passed' : 'failed';
     phaseResults.push({ phase: 'scan', guard: true, result: guard });
   }
-  if (retryableGate && resolvedGate.standardsCommand && phaseResults.every(p => continueAfter(p.result))) {
+  if (phasedTestGate && resolvedGate.standardsCommand && phaseResults.every(p => continueAfter(p.result))) {
     phaseResults.push({ phase: 'standards', result: await timedRunGate('standardsMs', resolvedGate.standardsCommand) });
   }
   // The verdict is the FIRST non-zero phase (an earlier red is never masked by a later green); failure details
@@ -1085,7 +1163,7 @@ const builtPhases = buildVerifyPhases({ admission: { mode: phaseAdmission ? 'pha
 const phases = admissionFallback ? { ...builtPhases, admissionFallback } : builtPhases;
 
 const retryAudit = isolatedRetryAudit(retriedFailures, isolatedRetry);
-const diagnostic = { ...(exitCode === 0 ? {} : { failureDetails }), ...retryAudit };
+const diagnostic = { ...(exitCode === 0 ? {} : { failureDetails }), ...retryAudit, ...(flakes.length ? { flakes } : {}) };
 const retryDetail = describeIsolatedRetry(retryAudit);
 // Item 99 — why the gate was red (also when a flaky failure outside the diff went green alone), with the files.
 const infrastructureBase = verificationInfrastructureFailure({ exitCode, signal, failureDetails, ...(phaseTimeout ? { timedOutPhase: phaseTimeout.phase, ceilingMs: phaseTimeout.ceilingMs, killer: 'verify-lane' } : {}) })

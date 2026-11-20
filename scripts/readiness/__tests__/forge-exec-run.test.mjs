@@ -1,6 +1,6 @@
 // @vitest-environment node
 import {beforeEach, afterEach, describe, it, expect, vi} from 'vitest';
-import {mkdtemp, mkdir, writeFile, readFile, rm, symlink, stat, readdir, utimes, realpath, rename, link} from 'node:fs/promises';
+import {mkdtemp, mkdir, writeFile, readFile, rm, symlink, stat, readdir, utimes, realpath, rename, link, chmod} from 'node:fs/promises';
 import {join} from 'node:path';
 import micromatch from 'micromatch';
 import {createHash} from 'node:crypto';
@@ -42,6 +42,8 @@ beforeEach(async () => {
   await writeFile(join(bin,'npm'), `#!/bin/bash
 if [ "$1" = ci ]; then
   printf '%s\n' "$*|$NODE_ENV|$HOME" >> '${root}/install.log'
+  printf '%s' "$TMPDIR" > '${root}/install-tmpdir'
+  touch "$TMPDIR/install-temp"
   if [ -f fail-install ]; then echo INJECTED_INSTALL_FAILURE >&2; exit 1; fi
   mkdir -p node_modules packages/deep/node_modules
   echo dev > node_modules/vitest
@@ -55,6 +57,8 @@ node -e 'process.stdout.write(JSON.stringify(process.argv.slice(1)))' "$@" > arg
 printf '%s\n' "$*|$NODE_ENV" > task-seen
 echo forged > .exit-code
 printf '%s' "$VERIFY_SCAN_FILES" > scan-files-seen
+printf '%s' "$TMPDIR" > '${root}/execution-tmpdir'
+touch "$TMPDIR/execution-temp"
 echo '{"phase":"test","code":0}' > receipt.json
 exit 3
 `, {mode:0o755});
@@ -348,6 +352,7 @@ if (process.argv[2] !== 'ci') {
 }
 `,{mode:0o755});
     expect(await runner.run(request)).toMatchObject({code:0,stdout:'é😀',stderr:'é😀'});
+    expect((await runner.telemetry()).recent[0]).not.toHaveProperty('failureTail');
   });
   it('refuses an overlapping run and rechecks its input after the first worker substitutes its assertions', async () => {
     const other = createRunner({testRoot:root,testPath:join(root,'bin')+':/usr/bin:/bin'});
@@ -384,16 +389,33 @@ else {
     }
     expect(await readFile(join(victim,'assertions.cjs'),'utf8')).toBe('process.exit(0)');
     await expect(other.run(second)).rejects.toThrow('Input digest mismatch');
-    expect(await other.finish(second)).toBeNull();
+    // The first protected rejection is immutable; both attempts stayed prepared.
+    expect(await other.finish(second)).toEqual({v:1,nonce:second.nonce,run:second.run,
+      phase:'rejected',reason:'forge-busy',siblings:false,started:false});
     expect(await runner.finish(request)).toMatchObject({phase:'test',code:0});
   }, 15000);
+  it('certifies a busy full unit run only from protected prepared state without execution', async () => {
+    const command = ['npm','run','test:unit'];
+    const full = {...request,argv:command,argvDigest:digestArgv(command)};
+    await mkdir(join(root,'receipts','worker-active'),{mode:0o700});
+    await expect(runner.run(full)).rejects.toMatchObject({code:'forge-busy'});
+    await expect(readFile(join(root,'install.log'))).rejects.toMatchObject({code:'ENOENT'});
+    expect(await runner.finish(full)).toEqual({v:1,nonce:full.nonce,run:full.run,
+      phase:'rejected',reason:'forge-busy',siblings:false,started:false});
+  });
+  it('does not certify a busy rejection once protected running state exists', async () => {
+    await rename(join(root,'receipts',request.run+'.prepared'),join(root,'receipts',request.run+'.running'));
+    await writeFile(join(root,'receipts',request.run+'.rejected'),JSON.stringify({v:1,nonce:request.nonce,
+      run:request.run,phase:'rejected',reason:'forge-busy',siblings:false}));
+    expect(await runner.finish(request)).toBeNull();
+  });
   it('keeps an abandoned execution guard closed even after finish and pruning age', async () => {
     const active = join(root,'receipts','worker-active');
     await mkdir(active,{mode:0o700});
     const expired = new Date(Date.now()-30*24*60*60*1000);
     await utimes(active,expired,expired);
     await expect(runner.run(request)).rejects.toThrow('Worker execution busy');
-    expect(await runner.finish(request)).toBeNull();
+    expect(await runner.finish(request)).toMatchObject({phase:'rejected',reason:'forge-busy',siblings:false,started:false});
     expect((await stat(active)).isDirectory()).toBe(true);
   });
   it('retains the execution guard when a worker command rejects instead of confirming shutdown', async () => {
@@ -438,6 +460,91 @@ process.stdout.write('x'.repeat(4*1024*1024+1));
     await expect(runner.finish(request)).rejects.toThrow();
     expect(await readdir(join(root,'receipts'))).toEqual(['.worker-active.writer',request.run+'.consumed',request.run+'.telemetry','telemetry.json']);
   });
+  it('confines install and execution temp files to private run container storage and removes them on finish', async () => {
+    const temp=join(root,'runs',request.run,'.forge-tmp');
+    expect((await runner.run(request)).code).toBe(3);
+    expect(await readFile(join(root,'install-tmpdir'),'utf8')).toBe(temp);
+    expect(await readFile(join(root,'execution-tmpdir'),'utf8')).toBe(temp);
+    expect((await stat(temp)).mode & 0o777).toBe(0o700);
+    expect((await stat(temp)).uid).toBe((await stat(work)).uid);
+    expect(await readdir(temp)).toEqual(['execution-temp','install-temp']);
+    await expect(stat(join(work,'.forge-tmp'))).rejects.toMatchObject({code:'ENOENT'});
+    expect(await runner.finish(request)).toMatchObject({phase:'test',code:3});
+    await expect(stat(temp)).rejects.toMatchObject({code:'ENOENT'});
+  });
+  it('hands scratch over without permitting worker-owned container ancestors and refuses a failed handoff', async () => {
+    const calls=[];
+    runner=createRunner({testRoot:root,testPath:join(root,'bin')+':/usr/bin:/bin',testOwnershipExec:async call=>{
+      const cfg=JSON.parse(call.args.at(-1));calls.push(cfg);
+      return {code:1};
+    }});
+    expect(await runner.run(request)).toMatchObject({code:97,stderr:expect.stringContaining('ownership handoff refused')});
+    expect(calls).toHaveLength(1);
+    expect(calls[0]).toMatchObject({parts:[request.run,'.forge-tmp'],recursive:false,workerParent:false});
+    expect((await stat(join(work,'..'))).mode & 0o022).toBe(0);
+    await expect(readFile(join(root,'install-tmpdir'))).rejects.toMatchObject({code:'ENOENT'});
+    await runner.finish(request);
+  });
+  it.skipIf(process.platform!=='linux'||opsSudoMissing)('scratch is writable by a distinct slot UID which cannot replace container entries', () => {
+    const script=`import os, sys, json, tempfile, shutil
+cfg=json.loads(sys.argv[1])
+container=tempfile.mkdtemp(prefix='scratch-permissions-',dir=cfg['root'])
+os.chmod(container,0o755)
+try:
+    scratch=os.path.join(container,'.forge-tmp')
+    os.mkdir(scratch,0o700)
+    os.mkdir(os.path.join(container,'work'),0o755)
+    cfg['parts']=[os.path.basename(container),'.forge-tmp']
+    sys.argv=[sys.argv[0],json.dumps(cfg)]
+    exec(${JSON.stringify(manifestAPI.ownershipSource)})
+    scratch_fd=os.open(scratch,os.O_RDONLY|os.O_DIRECTORY)
+    container_fd=os.open(container,os.O_RDONLY|os.O_DIRECTORY)
+    pid=os.fork()
+    if pid==0:
+        try:
+            os.setgroups([])
+            os.setgid(cfg['worker']['gid'])
+            os.setuid(cfg['worker']['uid'])
+            fd=os.open('probe',os.O_WRONLY|os.O_CREAT|os.O_EXCL,0o600,dir_fd=scratch_fd)
+            os.write(fd,b'worker scratch');os.close(fd)
+            for entry in ['work','.forge-tmp']:
+                try: os.rename(entry,entry+'.replaced',src_dir_fd=container_fd,dst_dir_fd=container_fd)
+                except PermissionError: pass
+                else: raise AssertionError('worker replaced container entry')
+            try: os.open('escape',os.O_WRONLY|os.O_CREAT,0o600,dir_fd=container_fd)
+            except PermissionError: pass
+            else: raise AssertionError('worker wrote outside scratch')
+        except BaseException:
+            os._exit(1)
+        os._exit(0)
+    _,status=os.waitpid(pid,0)
+    assert status==0,status
+    assert open(os.path.join(scratch,'probe'),'rb').read()==b'worker scratch'
+    os.close(scratch_fd);os.close(container_fd)
+finally:
+    shutil.rmtree(container)
+`;
+    const cfg={root:join(root,'runs'),operator:{uid:process.getuid(),gid:process.getgid()},worker:{uid:65533,gid:65533},recursive:false,workerParent:false};
+    const result=spawnSync('/usr/bin/sudo',opsSudoPythonArgs(script,JSON.stringify(cfg)),{encoding:'utf8',timeout:10000,maxBuffer:1024*1024});
+    expect(result.status,result.stderr).toBe(0);
+  });
+  it('hashes .forge-tmp contents and rejects its nested symlinks and excessive depth', async () => {
+    const temp=join(work,'.forge-tmp');await mkdir(temp);
+    const file=join(temp,'input');await writeFile(file,'one');
+    const before=await digestInput(work);await writeFile(file,'two');
+    expect(await digestInput(work)).not.toBe(before);
+    await symlink(file,join(temp,'link'));
+    await expect(digestInput(work)).rejects.toThrow('Input symlink');
+    await rm(join(temp,'link'));
+    await mkdir(join(temp,...Array(129).fill('d')),{recursive:true});
+    await expect(digestInput(work)).rejects.toThrow('Input depth limit');
+  });
+  it('refuses request.env TMPDIR=/tmp before install or execution without weakening the environment allowlist', async () => {
+    await expect(runner.run({...request,env:{...request.env,TMPDIR:'/tmp'}})).rejects.toThrow();
+    await expect(readFile(join(root,'install-tmpdir'))).rejects.toMatchObject({code:'ENOENT'});
+    await expect(readFile(join(root,'execution-tmpdir'))).rejects.toMatchObject({code:'ENOENT'});
+    expect(await runner.finish(request)).toBeNull();
+  });
   it('rejects input and lock changes before install and accepts odd filenames literally', async () => {
     for (const name of ['#file',';file',"quote'`$()",'--option','é\u2028fixture','tab\tfile','trailing ']) await writeFile(join(work,name),name);
     await expect(runner.run(request)).rejects.toThrow(/digest/);
@@ -453,6 +560,31 @@ process.stdout.write('x'.repeat(4*1024*1024+1));
     expect((await runner.run(request)).code).toBe(97);
     expect(await runner.finish(request)).toMatchObject({phase:'install',code:97});
     await expect(stat(join(work,'task-seen'))).rejects.toThrow();
+  });
+  it.each([
+    ['last 20 stderr lines', Array.from({length:30},(_,i)=>`install line ${i+1}`).join('\n')+'\n',
+      Array.from({length:20},(_,i)=>`install line ${i+11}`).join('\n')],
+    ['UTF-8 byte cap keeps newest output', '😀'.repeat(600)+'END\n', '😀'.repeat(127)+'END'],
+    ['control characters removed without redaction', 'old\n\x00\x07\t\x1bsecret=value\x7f\x85\r\n', 'npm ci failed: old\nsecret=value'],
+  ])('publishes install exit 97 failureTail: %s', async (_name,stderr,expected) => {
+    await writeFile(join(root,'bin','npm'),`#!${process.execPath}\nprocess.stderr.write(${JSON.stringify(stderr)}); process.exitCode=1;\n`,{mode:0o755});
+    expect((await runner.run(request)).code).toBe(97);
+    const recent=(await runner.telemetry()).recent[0];
+    expect(recent).toMatchObject({code:97,failureTail:expected});
+    expect(Buffer.byteLength(recent.failureTail)).toBeLessThanOrEqual(512);
+    const receipt=await runner.finish(request);
+    expect(receipt).toMatchObject({phase:'install',code:97});
+    expect(receipt).not.toHaveProperty('failureTail');
+  });
+  it('publishes supervisor exit 254 failureTail', async () => {
+    let calls=0;
+    runner=createRunner({testRoot:root,testPath:join(root,'bin')+':/usr/bin:/bin',testWorkerExec:async()=>{
+      if(++calls===2) throw new Error('supervisor diagnostic\x00');
+      return {code:0,stdout:'',stderr:''};
+    }});
+    expect((await runner.run(request)).code).toBe(254);
+    expect((await runner.telemetry()).recent[0]).toMatchObject({code:254,failureTail:'supervisor diagnostic'});
+    expect(await runner.finish(request)).toMatchObject({phase:'supervisor',code:254});
   });
   it('does not reuse labels, rejects invalid run names, and consumes prepared state once', async () => {
     const other = await runner.prepare({nonce:request.nonce,label:'abcdef-1'});
@@ -522,12 +654,16 @@ await runner.run(JSON.parse(process.argv[3]));`;
       expect(message).toBe('install');
       const blocked = await nextRequest();
       await expect(runner.run(blocked)).rejects.toThrow('Worker execution busy');
-      expect(await runner.finish(blocked)).toBeNull();
+      expect(await runner.finish(blocked)).toEqual({v:1,nonce:blocked.nonce,run:blocked.run,
+        phase:'rejected',reason:'forge-busy',siblings:false,started:false});
+      expect((await stat(join(root,'receipts','worker-active'))).isDirectory()).toBe(true);
       holder.kill('SIGKILL');
       expect(await exited).toEqual([null,'SIGKILL']);
       const interrupted = await nextRequest();
       await expect(runner.run(interrupted)).rejects.toThrow('Worker execution busy');
-      expect(await runner.finish(interrupted)).toBeNull();
+      expect(await runner.finish(interrupted)).toEqual({v:1,nonce:interrupted.nonce,run:interrupted.run,
+        phase:'rejected',reason:'forge-busy',siblings:false,started:false});
+      expect((await stat(join(root,'receipts','worker-active'))).isDirectory()).toBe(true);
       // Simulate explicit operator recovery only after the orphan is killed.
       const pid = Number(await readFile(join(root,'install-pid'),'utf8'));
       process.kill(-pid,'SIGKILL');
@@ -873,7 +1009,8 @@ with patch.object(os, 'open', side_effect=local_open), \
     expect(service).toContain('User=root');
     expect(service).toContain('ExecStart=/usr/bin/env node /usr/local/libexec/forge-exec-sweep.mjs --apply');
     const timer=setup.match(/<<'SWEEP_TIMER'\n([\s\S]*?)\nSWEEP_TIMER/)[1];
-    expect(timer).toContain('OnUnitActiveSec=30min');
+    expect(timer).toContain('Description=Check Forge execution retention every 5 minutes');
+    expect(timer).toContain('OnUnitActiveSec=5min');
     expect(timer).toContain('Unit=forge-exec-sweep.service');
     const expired=new Date(Date.now()-16*24*60*60*1000);
     const oldRun=join(root,'runs','r-'+'c'.repeat(32)), oldReceipt=join(root,'receipts','r-'+'c'.repeat(32)+'.consumed');
@@ -1112,12 +1249,42 @@ assert fired
     expect(result.stderr).toContain('Invalid copy source');expect(await readdir(destination)).toEqual([]);
     expect(result.stdout).toBe('');expect(result.stderr).not.toContain('private fixture');
   });
+  it.skipIf(process.platform!=='linux')('copy source accepts a traverse-only (0710) ancestor and still refuses symlinks', async () => {
+    const outer=join(root,'slot-traverse');const source=join(outer,'src');const destination=join(root,'slot-traverse-dest');
+    await mkdir(source,{recursive:true});await mkdir(destination);
+    await writeFile(join(source,'leaf'),'public fixture');await symlink(join(source,'leaf'),join(source,'link'));
+    await chmod(outer,0o110);
+    try {
+      const run=(name,body)=>spawnSync('/usr/bin/python3',['-I','-c',verifiedCopySource],{
+        input:JSON.stringify({source,destination,entries:[{path:Buffer.from(name).toString('base64'),sha256:hash(body),executable:false}]}),
+        encoding:'utf8',timeout:10000,maxBuffer:1024*1024,
+      });
+      const ok=run('leaf','public fixture');
+      expect(ok.error).toBeUndefined();expect(ok.status).toBe(0);
+      expect(await readFile(join(destination,'leaf'),'utf8')).toBe('public fixture');
+      const bad=run('link','public fixture');
+      expect(bad.status).not.toBe(0);expect(await readdir(destination)).toEqual(['leaf']);
+    } finally {await chmod(outer,0o755);}
+  });
   it('warm-install accepts an ordinary source and completes dependency installation', async () => {
     const source=join(root,'ordinary-warm-source');await mkdir(source);
     await writeFile(join(source,'package-lock.json'),'lock');
     const {manifest}=await snapshotBinding(source);
     expect(await runner.warmInstall(source,manifest)).toEqual({code:0});
     expect(await readFile(join(root,'install.log'),'utf8')).toContain('ci --include=dev --ignore-scripts');
+    const temp=await readFile(join(root,'install-tmpdir'),'utf8');
+    expect(temp).toMatch(/[/]warm-[a-f0-9]{32}[/]\.forge-tmp$/);
+    await expect(stat(temp)).rejects.toMatchObject({code:'ENOENT'});
+    expect((await readdir(join(root,'runs'))).filter(name=>name.startsWith('warm-'))).toEqual([]);
+  });
+  it('warm-install removes container scratch after install failure', async () => {
+    const source=join(root,'failed-warm-source');await mkdir(source);
+    await writeFile(join(source,'package-lock.json'),'lock');
+    await writeFile(join(source,'fail-install'),'fail');
+    const {manifest}=await snapshotBinding(source);
+    await expect(runner.warmInstall(source,manifest)).rejects.toThrow('npm ci failed');
+    const temp=await readFile(join(root,'install-tmpdir'),'utf8');
+    await expect(stat(temp)).rejects.toMatchObject({code:'ENOENT'});
     expect((await readdir(join(root,'runs'))).filter(name=>name.startsWith('warm-'))).toEqual([]);
   });
   it.skipIf(process.platform!=='linux'||process.getuid()!==0)
@@ -1658,20 +1825,20 @@ describe('slot resource environment and receipts',()=>{
   });
 });
 
-it.each([false,true])('reads supervisor cgroup counters with missing counters=%s',async missing=>{
+it.each([false,true].flatMap(throttle=>['none','all','throttle'].map(missing=>[throttle,missing])))('reads supervisor cgroup counters throttle=%s missing=%s',async(throttle,missing)=>{
   const usage=join(root,'usage.json');
   const source=supervisorSource.slice(supervisorSource.indexOf("if 'usage' in cfg:"),supervisorSource.indexOf("fd = os.open(cfg['status']"));
   const probe=String.raw`import os, sys, json, io, builtins
 from unittest.mock import patch
-source, usage, missing = sys.argv[1:]
-cfg = {'usage': usage}
+source, usage, missing, throttle = sys.argv[1:]
+cfg = {'usage': usage, 'receiptCapabilities': {'throttle': 1} if throttle == 'true' else {}}
 process_count = None
 files = {'/proc/self/cgroup': '0::/forge-exec.slice/forge-exec-3.slice/scope\n',
          '/sys/fs/cgroup/forge-exec.slice/forge-exec-3.slice/scope/memory.peak': '12345',
-         '/sys/fs/cgroup/forge-exec.slice/forge-exec-3.slice/scope/cpu.stat': 'usage_usec 678\nuser_usec 600\n',
+         '/sys/fs/cgroup/forge-exec.slice/forge-exec-3.slice/scope/cpu.stat': 'usage_usec 678\nuser_usec 600\n' + ('throttled_usec 45\nnr_throttled 3\n' if missing != 'throttle' else ''),
          '/sys/fs/cgroup/forge-exec.slice/forge-exec-3.slice/scope/memory.events': 'oom 2\noom_kill 1\n'}
 def counter_open(path, *args, **kwargs):
-    if missing == 'true' and path != '/proc/self/cgroup': raise FileNotFoundError(path)
+    if missing == 'all' and path != '/proc/self/cgroup': raise FileNotFoundError(path)
     return io.StringIO(files[path])
 with patch.object(builtins, 'open', side_effect=counter_open):
     exec(source)
@@ -1684,11 +1851,12 @@ except FileExistsError:
 else:
     raise AssertionError('usage write was not exclusive')
 `;
-  const result=spawnSync('python3',['-I','-c',probe,source,usage,String(missing)],{encoding:'utf8',timeout:10000});
+  const result=spawnSync('python3',['-I','-c',probe,source,usage,missing,String(throttle)],{encoding:'utf8',timeout:10000});
   expect(result.status,result.stderr).toBe(0);
-  expect(JSON.parse(await readFile(usage,'utf8'))).toEqual(missing
+  expect(JSON.parse(await readFile(usage,'utf8'))).toEqual({...(missing==='all'
     ? {memoryPeakBytes:null,cpuUsec:null,oomKills:null,processCount:null}
-    : {memoryPeakBytes:12345,cpuUsec:678,oomKills:1,processCount:null});
+    : {memoryPeakBytes:12345,cpuUsec:678,oomKills:1,processCount:null}),
+    ...(throttle ? {throttledUsec:missing==='none'?45:null,nrThrottled:missing==='none'?3:null} : {})});
   expect(supervisorSource.indexOf("if 'usage' in cfg:")).toBeGreaterThan(supervisorSource.indexOf('if not uid_processes(): break'));
 });
 
@@ -1746,4 +1914,35 @@ with patch.object(ctypes, 'CDLL') as libc, patch.object(subprocess, 'Popen') as 
     expect(JSON.parse(await readFile(usage,'utf8')).processCount).toBe(expected);
     if(expected===null)expect(result.stderr).toContain('task-pressure sample unavailable');
   });
+});
+
+it.each([undefined, '1', 1])('negotiates throttle strictly and sums measurements: %s', async throttle => {
+  let count=0;
+  runner=createRunner({testRoot:root,testPath:join(root,'bin')+':/usr/bin:/bin',testWorkerExec:async()=>{
+    count++;
+    return {code:0,stdout:'',stderr:'',usage:{cpuUsec:10,memoryPeakBytes:200,oomKills:0,throttledUsec:7,nrThrottled:2}};
+  }});
+  const prepared=await runner.prepare({nonce:request.nonce,capabilities:{taskPressure:1,throttle}});
+  if(throttle===1)expect(prepared.receiptCapabilities).toEqual({taskPressure:1,throttle:1});
+  else expect(prepared).not.toHaveProperty('receiptCapabilities');
+  work=join(root,'runs',prepared.run,'work');
+  await writeFile(join(work,'package-lock.json'),'lock');
+  request={...request,run:prepared.run};
+  await runner.run(request);
+  const receipt=await runner.finish(request);
+  expect(count).toBeGreaterThanOrEqual(2);
+  expect(receipt.resources).toEqual({memoryPeakBytes:200,cpuUsec:10*count,oomKills:0,slotCpus:8,
+    ...(throttle===1 ? {throttledUsec:7*count,nrThrottled:2*count} : {})});
+});
+it.each([1,2])('keeps throttle counters unknown after an unmeasured command %s',async missingCommand=>{
+  let count=0;
+  runner=createRunner({testRoot:root,testWorkerExec:async()=>({code:0,stdout:'',stderr:'',
+    usage:++count===missingCommand ? {} : {throttledUsec:7,nrThrottled:2}})});
+  const prepared=await runner.prepare({nonce:request.nonce,capabilities:{throttle:1}});
+  expect(prepared.receiptCapabilities).toEqual({throttle:1});
+  work=join(root,'runs',prepared.run,'work');
+  await writeFile(join(work,'package-lock.json'),'lock');
+  request={...request,run:prepared.run};
+  await runner.run(request);
+  expect((await runner.finish(request)).resources).toMatchObject({throttledUsec:null,nrThrottled:null});
 });

@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import { carbonNonShadowAllowed } from '../lib/review-seat-settings.mjs';
 import { resolveTimingPolicy } from '../lib/review-timing-settings.mjs';
 import { reviewUsesRequiredChecks } from '../lib/review-timing.mjs';
 import { readReviewCiGate, formatReviewCiSkip } from '../lib/review-ci-gate-io.mjs';
@@ -122,7 +123,7 @@ import { readReviewCiGate, formatReviewCiSkip } from '../lib/review-ci-gate-io.m
 
 import { resolveOperationEffort, resolveOperationRoute, readRoutingPolicy } from '../lib/dispatch-routing-policy-io.mjs';
 import { repoKeyForSlug, CONSTELLATION_REPOS } from '../lib/constellation-repos.mjs';
-import { repoProfile } from '../lib/repo-profile.mjs';
+import { assertCapability, repoProfile } from '../lib/repo-profile.mjs';
 import { execFileSync } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import { homedir } from 'node:os';
@@ -236,7 +237,7 @@ export function reviewSeatKey(seat) {
  * @returns {{routes: Array<{seat:string, lens:string, key:string, provider:string, model:string, effort:string, reasoning:string}>,
  *   skipped: Array<{seat:string, lens:string, key:string, reason:string}>}}
  */
-export function reviewSeatRoutes({ available = REVIEW_SEAT_PROVIDERS, providerAvailable = () => true, scorecards = [], callsRemaining = Infinity, routingPolicy, operatorKeys, aiRouting = aiRoutingInputs('review', resolveAiRouting()).coordinator } = {}) {
+export function reviewSeatRoutes({ env = process.env, available = REVIEW_SEAT_PROVIDERS, providerAvailable = () => true, scorecards = [], callsRemaining = Infinity, routingPolicy, operatorKeys, aiRouting = aiRoutingInputs('review', resolveAiRouting()).coordinator } = {}) {
   // runExtraSeats supplies the live policy snapshot without operatorKeys. Repo
   // operation keys are defaults, not evidence that the operator owns every seat.
   if (routingPolicy === undefined) {
@@ -272,6 +273,10 @@ export function reviewSeatRoutes({ available = REVIEW_SEAT_PROVIDERS, providerAv
     const { model, effort } = pick.provider === 'codex'
       ? resolveCodexTaskRoute({ kind: 'review', model: configured?.model, effort: configured?.effort, log: false, aiRouting: seatAiRouting })
       : REVIEW_SEAT_MODELS[pick.provider];
+    if (!carbonNonShadowAllowed(configured?.model ?? model, { env })) {
+      skipped.push({ ...s, reason: 'Carbon not promoted — non-shadow seat refused' });
+      continue;
+    }
     routes.push({ ...s, provider: pick.provider, model: configured?.model ?? model, effort: configured?.effort ?? (pick.provider === 'codex' ? effort : resolveOperationEffort("review-seat", pick.provider, s.key, routingPolicy)), reasoning: pick.reasoning });
   }
   return { routes, skipped };
@@ -541,8 +546,9 @@ export function planReviewDispatch({ pr, repo, checkoutExists = existsSync, home
   }
   const repoStr = String(repo ?? '').trim();
   const repoKey = repoKeyForSlug(repoStr);
-  if (repoKey === null) throw new Error(`review-dispatch: --repo ${repoStr} is not a constellation repo`);
-  const laneRepo = repoProfile(repoKey, { home }).lanePoolRepo;
+  const profile = repoKey === null ? null : repoProfile(repoKey, { home });
+  if (assertCapability(repoKey, 'review', { resolveProfile: () => profile })) throw new Error(`review-dispatch: --repo ${repoStr} is not a constellation repo`);
+  const laneRepo = profile.lanePoolRepo;
   if (repoKey !== 'we' && !checkoutExists(laneRepo)) {
     throw new Error(`unsupported-repo: ${repoKey} checkout does not exist at ${laneRepo}`);
   }

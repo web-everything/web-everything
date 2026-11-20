@@ -11,6 +11,19 @@ import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
+// Keep host-wide operator settings out of hermetic daemon fixtures; exercise the real reader
+// against an explicitly injected missing store. Operator precedence has policy-cascade coverage.
+const operatorFixture = await vi.hoisted(async () => {
+  const { join } = await import('node:path');
+  const { tmpdir } = await import('node:os');
+  const { randomUUID } = await import('node:crypto');
+  return { file: join(tmpdir(), `missing-review-operator-${randomUUID()}.json`) };
+});
+vi.mock('../../../scripts/lib/operator-override-reader.mjs', async importOriginal => {
+  const actual = await importOriginal();
+  return { ...actual, readOperatorOverrides: options => actual.readOperatorOverrides({ ...options, file: operatorFixture.file }) };
+});
+
 // Mocked so `defaultReapSessions`'s own describe block below can assert exactly what it passes through
 // WITHOUT ever shelling a real `claude agents`/`claude stop`/`gh` call — this repo's own hard rule (never touch
 // a real process in a test; inject a fake). `session-reaper.mjs`'s OWN test suite
@@ -99,7 +112,7 @@ describe('live review cap with Node configuration options', () => {
       listCommands: () => `101 1 ${command}` });
     const before = { live: budget.live, left: budget.left };
     const dispatch = vi.fn(() => ({ agentId: 'started-review' }));
-    const tick = runReviewTickAllRepos({ repos: ['review-cap-fixture/healthy'], liveReviewBudget: budget,
+    const tick = runReviewTickAllRepos({ startIndex: 0, repos: ['web-everything/web-everything'], liveReviewBudget: budget,
       authGateOverride: () => ({ paused: false, reason: null }),
       reconcile: () => ({ dispatch: [1, 2, 3].map(prNumber => ({ kind: 'review', prNumber })), refusals: [] }),
       dispatch, holdReconcile: () => [], tagRound: () => {}, tagStatus: () => {}, statusCandidates: () => [],
@@ -176,7 +189,7 @@ describe('live review cap with Node configuration options', () => {
         `${pr} 1 ${runtime} scripts/operations/review-loop-cli.mjs --pr=${pr}`).join('\n') });
     expect(budget.left).toBe(0);
     const dispatch = vi.fn();
-    const tick = runReviewTickAllRepos({ repos: ['review-cap-fixture/healthy'], liveReviewBudget: budget,
+    const tick = runReviewTickAllRepos({ startIndex: 0, repos: ['web-everything/web-everything'], liveReviewBudget: budget,
       authGateOverride: () => ({ paused: false, reason: null }),
       reconcile: () => ({ dispatch: [{ kind: 'review', prNumber: 104 }], refusals: [] }),
       dispatch, holdReconcile: () => [], tagRound: () => {}, tagStatus: () => {}, statusCandidates: () => [],
@@ -222,7 +235,7 @@ describe('live review cap with Node configuration options', () => {
       listCommands: () => [1, 2, 3].map(pr => `${100 + pr} 1 node ${argv} --pr=${pr}`).join('\n') });
     const leftBeforeTick = budget.left;
     const dispatch = vi.fn(() => ({ agentId: 'unexpected-review' }));
-    const tick = runReviewTickAllRepos({ repos: ['review-cap-fixture/healthy'], liveReviewBudget: budget,
+    const tick = runReviewTickAllRepos({ startIndex: 0, repos: ['web-everything/web-everything'], liveReviewBudget: budget,
       authGateOverride: () => ({ paused: false, reason: null }),
       reconcile: () => ({ dispatch: [1, 2, 3].map(prNumber => ({ kind: 'review', prNumber })), refusals: [] }),
       dispatch, holdReconcile: () => [], tagRound: () => {}, tagStatus: () => {}, statusCandidates: () => [],
@@ -992,12 +1005,56 @@ describe('runReviewTick — #3383 bug 3: dispatch is capped by acquirableLanes, 
     expect(check).toHaveBeenCalledTimes(1);
   });
 
+  it.each([NaN, -1, 2.5, '3', undefined, Infinity, -Infinity])('malformed shared budget %s fails closed and warns once across ticks', async (maxPerTick) => {
+    const { sharedHostBudget } = await import('../review-daemon.mjs');
+    const { DEFAULT_MAX_REVIEW_DISPATCH_PER_TICK: expected } = await import('../../../scripts/lib/host-overload-settings.mjs');
+    const log = vi.fn();
+    const check = () => ({ admitted: true, maxPerTick });
+    const hostAdmission = sharedHostBudget(check, log);
+    expect(hostAdmission()).toMatchObject({ maxPerTick: expected, startBudget: expected });
+    hostAdmission().take(expected);
+    expect(hostAdmission()).toMatchObject({ maxPerTick: 0, startBudget: expected });
+    expect(sharedHostBudget(check, log)()).toMatchObject({ maxPerTick: expected, startBudget: expected });
+    expect(log).toHaveBeenCalledOnce();
+    expect(log).toHaveBeenCalledWith(`review-daemon: review-start-budget-malformed (got ${String(maxPerTick)}) - using safe default ${expected}`);
+  });
+
+  it('an unavailable standard budget falls back to one start', async () => {
+    const settings = await import('../../../scripts/lib/host-overload-settings.mjs');
+    const standard = vi.spyOn(settings, 'DEFAULT_MAX_REVIEW_DISPATCH_PER_TICK', 'get').mockReturnValue(undefined);
+    try {
+      const { sharedHostBudget } = await import('../review-daemon.mjs');
+      const log = vi.fn();
+      expect(sharedHostBudget(() => ({ admitted: true, maxPerTick: false }), log)())
+        .toMatchObject({ maxPerTick: 1, startBudget: 1 });
+      expect(log).toHaveBeenCalledWith('review-daemon: review-start-budget-malformed (got false) - using safe default 1');
+    } finally { standard.mockRestore(); }
+  });
+
+  it.each([0, 3])('valid shared budget %s is preserved without a warning', async (maxPerTick) => {
+    const { sharedHostBudget } = await import('../review-daemon.mjs');
+    const log = vi.fn();
+    const hostAdmission = sharedHostBudget(() => ({ admitted: true, maxPerTick }), log);
+    expect(hostAdmission()).toMatchObject({ maxPerTick, startBudget: maxPerTick });
+    expect(log).not.toHaveBeenCalled();
+  });
+
+  it('a throwing malformed-budget logger cannot break admission or retry its warning', async () => {
+    const { sharedHostBudget } = await import('../review-daemon.mjs');
+    const { DEFAULT_MAX_REVIEW_DISPATCH_PER_TICK: expected } = await import('../../../scripts/lib/host-overload-settings.mjs');
+    const log = vi.fn(() => { throw Error('logger unavailable'); });
+    const check = () => ({ admitted: true, maxPerTick: null });
+    expect(sharedHostBudget(check, log)()).toMatchObject({ maxPerTick: expected, startBudget: expected });
+    expect(sharedHostBudget(check, log)()).toMatchObject({ maxPerTick: expected, startBudget: expected });
+    expect(log).toHaveBeenCalledOnce();
+  });
+
   it('host admission (verify-admission): runReviewTickAllRepos wraps one check into a host-wide budget across every repo', () => {
     const check = vi.fn(() => ({ admitted: true, reason: 'ok', maxPerTick: 2 }));
     const dispatch = vi.fn(({ pr }) => ({ agentId: `agent-${pr}` }));
     const tick = (opts) => runReviewTick({ reconcile: () => reviewsPlan(3), dispatch, tagRound: () => {}, tagStatus: () => {},
       statusCandidates: () => [], acquirableLanes: () => 10, ...opts });
-    runReviewTickAllRepos({ repos: ['repo-a', 'repo-b', 'repo-c'], tick, hostAdmission: check,
+    runReviewTickAllRepos({ startIndex: 0, repos: ['web-everything/web-everything', 'frontier-ui/frontierui', 'plateauapp/plateau-app'], tick, hostAdmission: check,
       authGateOverride: () => ({ paused: false, reason: null }) });
     expect(check).toHaveBeenCalledTimes(1);
     expect(dispatch).toHaveBeenCalledTimes(2);
@@ -1037,10 +1094,11 @@ describe('runReviewTick — #3383 bug 3: dispatch is capped by acquirableLanes, 
   });
 
   it('host admission (verify-admission): the CLI daemon\'s review pass is wired to defaultReviewHostAdmission', async () => {
-    const { cliReviewTickOpts, defaultReviewHostAdmission } = await import('../review-daemon.mjs');
-    const opts = cliReviewTickOpts({ log: { error: () => {} } });
+    const { cliReviewTickOpts, defaultReviewHostAdmission, defaultRecoveryLaneNumbers } = await import('../review-daemon.mjs');
+    const opts = cliReviewTickOpts({ log: { error: () => {} }, listCommands: () => '' });
     expect(typeof defaultReviewHostAdmission).toBe('function');
     expect(opts.hostAdmission).toBe(defaultReviewHostAdmission);
+    expect(opts.recoveryAcquirableLanes).toBe(defaultRecoveryLaneNumbers);
     // The default runReview of buildCliDaemonEffects runs with those opts, and the host check it hands every repo's
     // tick is the real one (real host-load + memory readers; the Vitest host seams stand in for the machine).
     vi.stubEnv('WE_REVIEW_FACTS', '0');
@@ -1051,7 +1109,7 @@ describe('runReviewTick — #3383 bug 3: dispatch is capped by acquirableLanes, 
       const tick = vi.fn((o) => { seen.push(o); return { reviewsOwed: 0, dispatched: [], failed: [], refusals: 0 }; });
       const effects = buildCliDaemonEffects({ owner: 'test', log: { error: () => {} }, reapSessions: () => null,
         runPrepReview: noPrepReview, convertAdvisoryEnabled: false,
-        reviewTickOpts: (args) => ({ ...cliReviewTickOpts(args), tick, repos: ['repo-a'], authGateOverride: () => ({ paused: false, reason: null }) }) });
+        reviewTickOpts: (args) => ({ ...cliReviewTickOpts({ ...args, listCommands: () => '' }), tick, repos: ['web-everything/web-everything'], authGateOverride: () => ({ paused: false, reason: null }) }) });
       await effects.tickOnce();
       expect(tick).toHaveBeenCalledTimes(1);
       expect(seen[0].hostAdmission()).toMatchObject({ admitted: true, maxPerTick: 2 });
@@ -1068,7 +1126,7 @@ describe('runReviewTick — #3383 bug 3: dispatch is capped by acquirableLanes, 
     const liveReviewBudget = { left };
     const hostAdmission = vi.fn(() => ({ admitted: true, reason: 'host ok', maxPerTick }));
     const dispatch = vi.fn(({ pr }) => ({ agentId: `agent-${pr}` }));
-    runReviewTickAllRepos({ repos: ['repo-a', 'repo-b'], liveReviewBudget, hostAdmission,
+    runReviewTickAllRepos({ startIndex: 0, repos: ['web-everything/web-everything', 'frontier-ui/frontierui'], liveReviewBudget, hostAdmission,
       reconcile: () => reviewsPlan(3), dispatch, tagRound: () => {}, tagStatus: () => {},
       statusCandidates: () => [], acquirableLanes: () => 10, holdReconcile: () => [],
       authGateOverride: () => ({ paused: false, reason: null }),
@@ -1082,18 +1140,18 @@ describe('runReviewTick — #3383 bug 3: dispatch is capped by acquirableLanes, 
     for (const uncertain of [false, true]) {
       const liveReviewBudget = { left: 1 };
       const dispatch = vi.fn(({ repo }) => {
-        if (repo === 'repo-b') return { agentId: 'healthy' };
+        if (repo === 'frontier-ui/frontierui') return { agentId: 'healthy' };
         if (uncertain) throw Error('job record write failed after spawn');
         return { skipped: 'unreadable-ci' };
       });
-      const out = runReviewTickAllRepos({ repos: ['repo-a', 'repo-b'], liveReviewBudget,
+      const out = runReviewTickAllRepos({ startIndex: 0, repos: ['web-everything/web-everything', 'frontier-ui/frontierui'], liveReviewBudget,
         hostAdmission: () => ({ admitted: true, reason: 'host ok', maxPerTick: 1 }),
         reconcile: () => reviewsPlan(1), dispatch, tagRound: () => {}, tagStatus: () => {},
         statusCandidates: () => [], acquirableLanes: () => 10, holdReconcile: () => [],
         authGateOverride: () => ({ paused: false, reason: null }),
       });
       expect(dispatch).toHaveBeenCalledTimes(uncertain ? 1 : 2);
-      expect(out.dispatched).toEqual(uncertain ? [] : [{ prNumber: 100, agentId: 'healthy', repo: 'repo-b' }]);
+      expect(out.dispatched).toEqual(uncertain ? [] : [{ prNumber: 100, agentId: 'healthy', repo: 'frontier-ui/frontierui' }]);
       expect(liveReviewBudget.left).toBe(0);
     }
   });
@@ -1120,6 +1178,156 @@ describe('runReviewTick — #3383 bug 3: dispatch is capped by acquirableLanes, 
     const budget = liveReviewRoundBudget({ env: {}, listCommands: () => commands });
     expect(budget).toMatchObject({ live, max: 8, left });
     expect(budget.reason).toBe(`live review rounds ${live} of maxLiveReviewRounds=8 (tool)`);
+  });
+
+  it('holds all new rounds when the committed default is unreadable and no valid override exists', async () => {
+    const { liveReviewRoundBudget } = await import('../review-daemon.mjs');
+    const budget = liveReviewRoundBudget({ env: {}, listCommands: () => '',
+      readFile: () => { throw new Error('settings unreadable'); } });
+    expect(budget).toMatchObject({ max: 0, live: 0, left: 0 });
+    expect(budget.reason).toBe('live review rounds 0 of maxLiveReviewRounds=0 (standard)');
+  });
+
+  it.each(['{', '{}', ...[17, 0, 1.5, null].map(maxLiveReviewRounds => JSON.stringify({ maxLiveReviewRounds }))])(
+    'holds all new rounds when the committed default is invalid (%s) and no valid override exists', async contents => {
+      const { liveReviewRoundBudget } = await import('../review-daemon.mjs');
+      const budget = liveReviewRoundBudget({ env: {}, listCommands: () => '', readFile: () => contents });
+      expect(budget).toMatchObject({ max: 0, live: 0, left: 0 });
+      expect(budget.reason).toBe('live review rounds 0 of maxLiveReviewRounds=0 (standard)');
+    });
+
+  it.each(['tool', 'env'])('accepts 16 and falls back to a finite default for 17, 0 and non-integers from the %s layer', async layer => {
+    const { liveReviewRoundBudget } = await import('../review-daemon.mjs');
+    const dir = mkdtempSync(join(tmpdir(), 'review-cap-bounds-'));
+    const toolPath = join(dir, 'review-concurrency.json');
+    try {
+      for (const max of [16, 17, 0, 1.5, null]) {
+        writeFileSync(toolPath, JSON.stringify({ maxLiveReviewRounds: layer === 'tool' ? max : 8 }));
+        const budget = liveReviewRoundBudget({ toolPath, listCommands: () => '',
+          env: layer === 'env' ? { WE_REVIEW_MAX_LIVE_ROUNDS: String(max) } : {} });
+        if (max === 16) {
+          expect(budget).toMatchObject({ max: 16, live: 0, left: 16 });
+          expect(budget.reason).toContain(`maxLiveReviewRounds=16 (${layer})`);
+        } else {
+          expect(budget).toMatchObject({ max: 8, live: 0, left: 8 });
+          expect(budget.reason).toContain(`maxLiveReviewRounds=8 (${layer === 'tool' ? 'standard' : 'tool'})`);
+        }
+      }
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+
+  it.each([0, 1, 4, 5])('a live cap of 16 holds excess owed reviews with a lane reason when the pool has %i acquirable lanes', async laneCount => {
+    const { liveReviewRoundBudget, defaultAcquirableLaneNumbers } = await import('../review-daemon.mjs');
+    const lanes = Math.floor(laneCount / 2);
+    const pool = Array.from({ length: laneCount }, (_, i) => i + 1);
+    const budget = liveReviewRoundBudget({ env: { WE_REVIEW_MAX_LIVE_ROUNDS: '16' }, listCommands: () => '' });
+    const dispatch = vi.fn(({ pr }) => ({ agentId: `agent-${pr}` }));
+    const poolExhaustion = { exhausted: vi.fn(), recovered: vi.fn() };
+    const prs = Array.from({ length: 16 }, (_, i) => ({ number: 100 + i, labels: ['review:pending'] }));
+    const out = runReviewTick({ reconcile: () => reviewsPlan(16), dispatch, liveReviewBudget: budget,
+      readPrs: () => prs, readAgents: () => [],
+      acquirableLanes: opts => defaultAcquirableLaneNumbers(opts, { readLanes: () => pool }),
+      hostAdmission: () => ({ admitted: true, maxPerTick: 8 }), poolExhaustion,
+      holdReconcile: () => [], tagRound: () => {}, tagStatus: () => {}, statusCandidates: () => [],
+    });
+    expect(dispatch).toHaveBeenCalledTimes(lanes);
+    expect(out.failed).toEqual([]);
+    expect(out.reviewsOwed).toBe(16);
+    expect(out.deferredForLanes).toBe(16 - lanes);
+    expect(out.deferredForCap).toBe(0);
+    expect(budget.left).toBe(16 - lanes);
+    expect(out.pendingNotDispatched).toHaveLength(16 - lanes);
+    for (const row of out.pendingNotDispatched) {
+      expect(row.reasons.join(' ')).toContain('no acquirable lane this tick');
+    }
+    if (lanes === 0) expect(poolExhaustion.exhausted).toHaveBeenCalledWith(expect.objectContaining({ deferred: 16 }));
+    else expect(poolExhaustion.recovered).toHaveBeenCalled();
+  });
+
+  it.each([0, 1])('with %i free lanes, red-team-only recovery uses unhalved capacity while ordinary reviews defer for lanes', async laneCount => {
+    const { defaultAcquirableLaneNumbers, defaultRecoveryLaneNumbers } = await import('../review-daemon.mjs');
+    const pool = Array.from({ length: laneCount }, (_, i) => i + 1);
+    const readLanes = vi.fn(() => pool);
+    const dispatch = vi.fn();
+    const recoveryDispatch = vi.fn(() => ({ prNumber: 900, agentId: 'red-team' }));
+    let recoveryLanes;
+    const out = runReviewTick({ reconcile: () => reviewsPlan(1), dispatch,
+      readPrs: () => [{ number: 100, labels: ['review:pending'] }], readAgents: () => [],
+      acquirableLanes: opts => defaultAcquirableLaneNumbers(opts, { readLanes }),
+      recoveryAcquirableLanes: opts => defaultRecoveryLaneNumbers(opts, { readLanes }),
+      redTeamOnSkip: ({ capacity }) => {
+        recoveryLanes = capacity.lanes;
+        if (capacity.lanes < 1 || capacity.remainingStarts < 1) return { dispatched: [] };
+        capacity.take();
+        capacity.lanes--;
+        capacity.remainingStarts--;
+        return { dispatched: [recoveryDispatch()] };
+      },
+      hostAdmission: () => ({ admitted: true, maxPerTick: 2 }),
+      holdReconcile: () => [], tagRound: () => {}, tagStatus: () => {}, statusCandidates: () => [],
+    });
+    expect(recoveryLanes).toBe(laneCount);
+    expect(recoveryDispatch).toHaveBeenCalledTimes(laneCount);
+    expect(out.redTeamOnSkip.dispatched).toHaveLength(laneCount);
+    expect(dispatch).not.toHaveBeenCalled();
+    expect(out.deferredForLanes).toBe(1);
+    expect(out.pendingNotDispatched[0].reasons.join(' ')).toContain('no acquirable lane this tick');
+    expect(out.failed).toEqual([]);
+  });
+
+  it.each([0, 1, 2])('recovery subtracts occupied starts from raw capacity %i and floors at zero', rawLanes => {
+    let recoveryLanes;
+    const redTeamOnSkip = vi.fn(({ capacity }) => {
+      recoveryLanes = capacity.lanes;
+      return { dispatched: [] };
+    });
+    runReviewTick({ reconcile: () => reviewsPlan(1), dispatch: () => ({ agentId: 'ordinary' }),
+      acquirableLanes: () => 1, recoveryAcquirableLanes: () => rawLanes, redTeamOnSkip,
+      hostAdmission: () => ({ admitted: true, maxPerTick: 1 }),
+      holdReconcile: () => [], tagRound: () => {}, tagStatus: () => {}, statusCandidates: () => [],
+    });
+    expect(redTeamOnSkip).toHaveBeenCalledTimes(1);
+    expect(recoveryLanes).toBe(Math.max(0, rawLanes - 1));
+  });
+
+  it('PR #7023 red team: no ordinary reviews owed + one free lane ⇒ red-team-only recovery still starts (production readers)', async () => {
+    const { defaultAcquirableLaneNumbers, defaultRecoveryLaneNumbers } = await import('../review-daemon.mjs');
+    const readLanes = vi.fn(() => [7]);
+    const dispatch = vi.fn();
+    let seen;
+    const out = runReviewTick({ reconcile: () => owedPlan([]), dispatch,
+      acquirableLanes: opts => defaultAcquirableLaneNumbers(opts, { readLanes }),
+      recoveryAcquirableLanes: opts => defaultRecoveryLaneNumbers(opts, { readLanes }),
+      liveReviewBudget: { left: 4 },
+      redTeamOnSkip: ({ capacity }) => {
+        seen = { lanes: capacity.lanes, starts: capacity.remainingStarts };
+        if (capacity.lanes < 1 || capacity.remainingStarts < 1) return { dispatched: [], skipped: ['no review capacity left'] };
+        capacity.take(); capacity.lanes--; capacity.remainingStarts--;
+        return { dispatched: [{ prNumber: 900 }] };
+      },
+      hostAdmission: () => ({ admitted: true, maxPerTick: 4 }),
+      holdReconcile: () => [], tagRound: () => {}, tagStatus: () => {}, statusCandidates: () => [],
+    });
+    expect(seen).toEqual({ lanes: 1, starts: 4 });
+    expect(out.redTeamOnSkip.dispatched).toEqual([{ prNumber: 900 }]);
+    expect(dispatch).not.toHaveBeenCalled();
+    expect(out.failed).toEqual([]);
+  });
+
+  it('a throwing recovery lane read fails closed to 0 recovery lanes and never aborts ordinary dispatch', () => {
+    const log = vi.fn();
+    let recoveryLanes;
+    const dispatch = vi.fn(({ pr }) => ({ agentId: `agent-${pr}` }));
+    const out = runReviewTick({ reconcile: () => reviewsPlan(1), dispatch, log,
+      acquirableLanes: () => 2, recoveryAcquirableLanes: () => { throw new Error('lane pool unreadable'); },
+      redTeamOnSkip: ({ capacity }) => { recoveryLanes = capacity.lanes; return { dispatched: [] }; },
+      hostAdmission: () => ({ admitted: true, maxPerTick: 2 }),
+      holdReconcile: () => [], tagRound: () => {}, tagStatus: () => {}, statusCandidates: () => [],
+    });
+    expect(recoveryLanes).toBe(0);
+    expect(dispatch).toHaveBeenCalledTimes(1);
+    expect(out.dispatched.map(d => d.prNumber)).toEqual([100]);
+    expect(log.mock.calls.flat().join('\n')).toContain('recovery lane read failed (lane pool unreadable)');
   });
 
   it('EMERGENCY live-review cap: a shared budget bounds new reviews across repos; 0 left dispatches nothing', async () => {
@@ -1195,15 +1403,15 @@ describe('runReviewTick — #3383 bug 3: dispatch is capped by acquirableLanes, 
   it('confirmed non-starts leave capacity for healthy repos on every tick', () => {
     for (let tick = 0; tick < 2; tick++) {
       const budget = { left: 3 };
-      const out = runReviewTickAllRepos({ repos: ['repo-a', 'repo-b'], liveReviewBudget: budget,
-        reconcile: ({ repo }) => repo === 'repo-a' ? reviewsPlan(3) : reviewsPlan(1),
+      const out = runReviewTickAllRepos({ startIndex: 0, repos: ['web-everything/web-everything', 'frontier-ui/frontierui'], liveReviewBudget: budget,
+        reconcile: ({ repo }) => repo === 'web-everything/web-everything' ? reviewsPlan(3) : reviewsPlan(1),
         dispatch: ({ repo }) => {
-          if (repo === 'repo-b') return { agentId: 'healthy' };
+          if (repo === 'frontier-ui/frontierui') return { agentId: 'healthy' };
           return { skipped: 'review-ci: unreadable-ci' };
         },
         holdReconcile: () => [], tagRound: () => {}, tagStatus: () => {}, statusCandidates: () => [], acquirableLanes: () => 40,
       });
-      expect(out.dispatched).toEqual([{ prNumber: 100, agentId: 'healthy', repo: 'repo-b' }]);
+      expect(out.dispatched).toEqual([{ prNumber: 100, agentId: 'healthy', repo: 'frontier-ui/frontierui' }]);
       expect(out.deferredForCap).toBe(0);
       expect(budget.left).toBe(2);
     }
@@ -1418,7 +1626,7 @@ describe('runReviewTick — #3383 bug 3: dispatch is capped by acquirableLanes, 
     });
     expect(out.pendingNotDispatched).toHaveLength(1);
     const reasons = out.pendingNotDispatched.flatMap(p => p.reasons).join('\n');
-    expect(reasons).toMatch(/host start budget|host admission/);
+    expect(reasons).toContain('per-tick review start budget (2 of 2 used this tick; host admitted: not checked)');
     expect(reasons).not.toContain('held by the live-review cap');
     expect(liveReviewBudget.left).toBe(2);
     expect(out).toMatchObject({ deferredForHost: 1, deferredForCap: 0, deferredForCapReason: null });
@@ -1449,6 +1657,225 @@ describe('runReviewTick — #3383 bug 3: dispatch is capped by acquirableLanes, 
     });
     expect(statusCandidates).toHaveBeenCalledTimes(1);
     expect(statusCandidates.mock.calls[0][0]).toHaveLength(4); // all 4 owed reviews, not just the 1 dispatched
+  });
+});
+
+describe('review dispatch waiting history', () => {
+  const state = () => ({ firstOwedAt: new Map(), lastDispatched: new Map() });
+  function tick(dispatchState, numbers, options = {}) {
+    return runReviewTick({ repo: 'web-everything/web-everything', dispatchState,
+      reconcile: () => ({ dispatch: numbers.map(prNumber => ({ kind: 'review', prNumber, headRefOid: 'head', attempts: 0 })), refusals: [] }),
+      readPrs: () => numbers.map(number => ({ number, headRefOid: 'head', labels: ['review:pending'] })),
+      readAgents: () => [], dispatch: () => ({ agentId: 'review' }),
+      tagRound: () => {}, tagStatus: () => {}, statusCandidates: () => [],
+      acquirableLanes: () => 10, now: () => 100,
+      diagnoseJob: () => ({ exitCode: 1, signal: null, lastErrorLine: 'fatal: job failed' }),
+      writeJobDiagnosis: () => {}, ...options });
+  }
+
+  it('serves continuously owed higher PRs before newly owed lower PRs, removes cleared ages, and isolates repos', () => {
+    const history = state();
+    tick(history, [7012, 7013], { acquirableLanes: () => 0 });
+    const dispatch = vi.fn(() => ({}));
+    tick(history, [6933, 7013, 7012], { now: () => 200, dispatch,
+      hostAdmission: () => ({ admitted: true, maxPerTick: 2 }) });
+    expect(dispatch.mock.calls.map(([o]) => o.pr)).toEqual([7012, 7013]);
+    tick(history, [7012], { repo: 'frontier-ui/frontierui', now: () => 250, acquirableLanes: () => 0 });
+    tick(history, [6933, 7013], { now: () => 300, acquirableLanes: () => 0 });
+    expect(history.firstOwedAt.has('web-everything/web-everything#7012')).toBe(false);
+    expect(history.firstOwedAt.get('frontier-ui/frontierui#7012')).toBe(250);
+    tick(history, [7012, 6933, 7013], { now: () => 400, dispatch });
+    expect(dispatch.mock.calls.slice(2).map(([o]) => o.pr)).toEqual([7013, 6933, 7012]);
+  });
+
+  it('keeps rank and red-team slots ahead of age, and leaves inputs unchanged', async () => {
+    const { orderReviewsForDispatch } = await import('../review-daemon.mjs');
+    const reviews = [{ prNumber: 1 }, { prNumber: 2 }, { prNumber: 3, redTeamRequest: {} },
+      { prNumber: 4 }, { prNumber: 5, mainFix: true }, { prNumber: 6 }];
+    const owedSince = new Map([[1, 20], [2, 10], [4, 100], [5, 200], [6, 10]]);
+    const labelsByPr = new Map([[4, ['review:human']]]);
+    expect(orderReviewsForDispatch(reviews, { owedSince, labelsByPr }).map(r => r.prNumber)).toEqual([5, 4, 3, 2, 6, 1]);
+    expect(reviews.map(r => r.prNumber)).toEqual([1, 2, 3, 4, 5, 6]);
+    expect(owedSince.get(2)).toBe(10);
+  });
+
+  it('explains exhausted shared starts with the original budget and admitted memory reason', async () => {
+    const { sharedHostBudget } = await import('../review-daemon.mjs');
+    const reason = 'host load 0.28, memory fine source=memory-pressure';
+    const hostAdmission = sharedHostBudget(() => ({ admitted: true, maxPerTick: 1, reason }));
+    tick(state(), [1], { hostAdmission });
+    const out = tick(state(), [2], { repo: 'frontier-ui/frontierui', hostAdmission });
+    expect(out.pendingNotDispatched[0].reasons).toEqual([
+      `review owed, held by the per-tick review start budget (1 of 1 used this tick; host admitted: ${reason})`,
+    ]);
+    expect(out.deferredForHost).toBe(1);
+    expect(out.deferredForLanes).toBe(0);
+  });
+
+  it('holds an admitted zero shared budget across repos with the start-budget message', async () => {
+    const { sharedHostBudget } = await import('../review-daemon.mjs');
+    const check = vi.fn(() => ({ admitted: true, maxPerTick: 0, reason: 'host ok' }));
+    const hostAdmission = sharedHostBudget(check);
+    const dispatch = vi.fn();
+    for (const repo of ['web-everything/web-everything', 'frontier-ui/frontierui']) {
+      const out = tick(state(), [1], { repo, hostAdmission, dispatch });
+      expect(out.pendingNotDispatched[0].reasons).toEqual([
+        'review owed, held by the per-tick review start budget (0 of 0 used this tick; host admitted: host ok)',
+      ]);
+      expect(out.deferredForHost).toBe(1);
+      expect(out.failed).toEqual([]);
+    }
+    expect(dispatch).not.toHaveBeenCalled();
+    expect(hostAdmission()).toMatchObject({ maxPerTick: 0, startBudget: 0 });
+    expect(check).toHaveBeenCalledTimes(1);
+  });
+
+  it('records a dead same-head job as no-verdict once, retries immediately, and retains its owed age', () => {
+    const history = state();
+    const log = vi.fn();
+    tick(history, [7012], { dispatch: () => ({ mode: 'job', jobPid: 42 }) });
+    const dispatch = vi.fn(() => ({}));
+    const tagRound = vi.fn();
+    const out = tick(history, [6933, 7012], { now: () => 200, isPidAlive: () => false, log, dispatch, tagRound,
+      hostAdmission: () => ({ admitted: true, maxPerTick: 1 }) });
+    expect(out.endedNoVerdict).toEqual([{ prNumber: 7012, reason: 'review-job-ended-no-verdict', jobPid: 42,
+      diagnosis: 'exit=1 signal=? last="fatal: job failed"' }]);
+    expect(log).toHaveBeenCalledWith('review-daemon: web-everything/web-everything#7012 review-job-ended-no-verdict (job pid 42; exit=1 signal=? last="fatal: job failed") - will retry');
+    expect(dispatch.mock.calls.map(([o]) => o.pr)).toEqual([7012]);
+    expect(tagRound).toHaveBeenCalledWith(expect.objectContaining({ pr: 7012, round: 1 }));
+    expect(history.firstOwedAt.get('web-everything/web-everything#7012')).toBe(100);
+    expect(out.failed).toEqual([]);
+    const next = tick(history, [7012], { isPidAlive: () => false, acquirableLanes: () => 0, log });
+    expect(next.endedNoVerdict).toBeUndefined();
+    expect(log).toHaveBeenCalledTimes(1);
+  });
+
+  it('stores the dispatch slug and diagnoses it before retrying', () => {
+    const history = state();
+    tick(history, [7012], { dispatch: () => ({ jobPid: 42, sessionSlug: 'review-we-7012' }) });
+    expect(history.lastDispatched.get('web-everything/web-everything#7012')).toEqual({ pid: 42, head: 'head', slug: 'review-we-7012' });
+    const diagnoseJob = vi.fn(() => ({ exitCode: null, signal: 'SIGTERM', lastErrorLine: 'stopped', tail: 'stopped', marker: true }));
+    const writeJobDiagnosis = vi.fn();
+    const out = tick(history, [7012], { isPidAlive: () => false, diagnoseJob, writeJobDiagnosis });
+    expect(diagnoseJob).toHaveBeenCalledWith({ slug: 'review-we-7012', pid: 42 });
+    expect(writeJobDiagnosis).toHaveBeenCalledWith({ slug: 'review-we-7012', pid: 42 }, expect.objectContaining({ tail: 'stopped' }));
+    expect(out.endedNoVerdict[0].diagnosis).toBe('exit=? signal=SIGTERM last="stopped"');
+  });
+
+  it('derives the canonical slug for historical dispatch state without a slug', () => {
+    const history = state();
+    history.lastDispatched.set('we#7012', { pid: 42, head: 'head' });
+    const diagnoseJob = vi.fn(() => ({ exitCode: 2, signal: null, lastErrorLine: 'error' }));
+    const out = tick(history, [7012], { repo: 'we', isPidAlive: () => false, diagnoseJob });
+    expect(diagnoseJob).toHaveBeenCalledWith({ slug: 'review-7012', pid: 42 });
+    expect(out.endedNoVerdict[0].diagnosis).toBe('exit=2 signal=? last="error"');
+  });
+
+  it.each(['read', 'write'])('diagnostic %s failure never stops the tick or retry', failure => {
+    const history = state();
+    tick(history, [7012], { dispatch: () => ({ jobPid: 42, sessionSlug: 'review-we-7012' }) });
+    const dispatch = vi.fn(() => ({}));
+    const out = tick(history, [7012], { isPidAlive: () => false, dispatch,
+      ...(failure === 'read' ? { diagnoseJob: () => { throw Error('denied'); } }
+        : { writeJobDiagnosis: () => { throw Error('denied'); } }) });
+    expect(out.endedNoVerdict[0].diagnosis).toBe(failure === 'read'
+      ? 'exit=? signal=? last="diagnosis unavailable"' : 'exit=1 signal=? last="fatal: job failed"');
+    expect(dispatch).toHaveBeenCalledTimes(1);
+  });
+
+  it.each([
+    { head: 'head', alive: true }, { head: 'head', alive: null },
+    { head: 'changed', alive: false }, { head: null, alive: false },
+  ])('does not claim no-verdict without a dead same-head job: %j', ({ head, alive }) => {
+    const history = state();
+    history.lastDispatched.set('web-everything/web-everything#7012', { pid: 42, head });
+    const log = vi.fn();
+    const out = tick(history, [7012], { isPidAlive: () => alive, log, acquirableLanes: () => 0 });
+    expect(out.endedNoVerdict).toBeUndefined();
+    expect(log).not.toHaveBeenCalled();
+  });
+
+  it('yields to peers from the second consecutive no-verdict, with one start per tick and no cooldown', () => {
+    const history = state(); // Older injected state has no counter map yet.
+    const dispatch = vi.fn(() => ({ mode: 'job', jobPid: 42 }));
+    const log = vi.fn();
+    const options = { dispatch, log, isPidAlive: () => false,
+      hostAdmission: () => ({ admitted: true, maxPerTick: 1 }) };
+    tick(history, [7012], options);
+    const first = tick(history, [7012, 7013], { ...options, now: () => 200 });
+    expect(first.endedNoVerdict).toHaveLength(1);
+    expect(history.firstOwedAt.get('web-everything/web-everything#7012')).toBe(100);
+    const second = tick(history, [7012, 7013], { ...options, now: () => 300 });
+    expect(second.endedNoVerdict).toEqual([{ prNumber: 7012, reason: 'review-job-ended-no-verdict', jobPid: 42,
+      diagnosis: 'exit=1 signal=? last="fatal: job failed"' }]);
+    expect(history.firstOwedAt.get('web-everything/web-everything#7012')).toBe(300);
+    expect(history.noVerdictCounts.get('web-everything/web-everything#7012')).toEqual({ head: 'head', count: 2 });
+    tick(history, [7012, 7013], { ...options, now: () => 400 });
+    tick(history, [7012, 7013], { ...options, now: () => 500 });
+    tick(history, [7012, 7013], { ...options, now: () => 600 });
+    expect(dispatch.mock.calls.map(([o]) => o.pr)).toEqual([7012, 7012, 7013, 7013, 7012, 7013]);
+    expect(log.mock.calls.filter(([line]) => line.includes('review-job-ended-no-verdict'))).toHaveLength(5);
+  });
+
+  it.each([true, false])('retains age and retry history through live-process refusals (known open PRs: %s)', (knownOpen) => {
+    const history = state();
+    tick(history, [7012], { dispatch: () => ({ jobPid: 42 }) });
+    tick(history, [7012], { now: () => 200, isPidAlive: () => false, dispatch: () => ({ jobPid: 43 }) });
+    tick(history, [], { now: () => 300,
+      readPrs: knownOpen ? () => [{ number: 7012, headRefOid: 'head', labels: [] }] : null,
+      reconcile: () => ({ dispatch: [], refusals: [{ prNumber: '7012', kind: 'live-process' }] }) });
+    expect(history.firstOwedAt.get('web-everything/web-everything#7012')).toBe(100);
+    expect(history.lastDispatched.get('web-everything/web-everything#7012')).toEqual({ pid: 43, head: 'head' });
+    expect(history.noVerdictCounts.get('web-everything/web-everything#7012')).toEqual({ head: 'head', count: 1 });
+    const out = tick(history, [7012], { now: () => 400, isPidAlive: () => false });
+    expect(out.endedNoVerdict).toHaveLength(1);
+    expect(history.firstOwedAt.get('web-everything/web-everything#7012')).toBe(400);
+  });
+
+  it.each(['not-owed', 'closed', 'head-changed', 'refused-head-changed'])('clears consecutive no-verdict history when %s', (reason) => {
+    const history = state();
+    const key = 'web-everything/web-everything#7012';
+    tick(history, [7012], { dispatch: () => ({ jobPid: 42 }) });
+    tick(history, [7012], { isPidAlive: () => false });
+    history.noVerdictCounts.set('frontier-ui/frontierui#7012', { head: 'head', count: 2 });
+    const changed = reason.includes('head-changed');
+    tick(history, reason === 'head-changed' ? [7012] : [], {
+      acquirableLanes: () => 0,
+      readPrs: () => reason === 'closed' ? [] : [{ number: 7012, headRefOid: changed ? 'new-head' : 'head', labels: [] }],
+      ...(reason === 'head-changed' ? { reconcile: () => ({ dispatch: [{ kind: 'review', prNumber: 7012, headRefOid: 'new-head' }], refusals: [] }) } : {}),
+      ...(reason === 'closed' || reason === 'refused-head-changed'
+        ? { reconcile: () => ({ dispatch: [], refusals: [{ prNumber: 7012, kind: 'live-process' }] }) } : {}),
+    });
+    expect(history.noVerdictCounts.has(key)).toBe(false);
+    expect(history.noVerdictCounts.get('frontier-ui/frontierui#7012')).toEqual({ head: 'head', count: 2 });
+    if (!changed) expect(history.firstOwedAt.has(key)).toBe(false);
+    tick(history, [7012], { dispatch: () => ({ jobPid: 43 }) });
+    const age = history.firstOwedAt.get(key);
+    const out = tick(history, [7012], { now: () => 500, isPidAlive: () => false });
+    expect(out.endedNoVerdict).toHaveLength(1);
+    expect(history.noVerdictCounts.get(key)).toEqual({ head: 'head', count: 1 });
+    expect(history.firstOwedAt.get(key)).toBe(age);
+  });
+
+  it('deletes the ended job before logging and still retries and tags when the logger throws', () => {
+    const history = state();
+    const key = 'web-everything/web-everything#7012';
+    tick(history, [7012], { dispatch: () => ({ jobPid: 42 }) });
+    const deletedBeforeLog = [];
+    const log = vi.fn(() => {
+      deletedBeforeLog.push(!history.lastDispatched.has(key));
+      throw new Error('logger unavailable');
+    });
+    const dispatch = vi.fn(() => ({}));
+    const tagRound = vi.fn();
+    const out = tick(history, [7012], { isPidAlive: () => false, log, dispatch, tagRound });
+    expect(deletedBeforeLog).toEqual([true]);
+    expect(out.endedNoVerdict).toHaveLength(1);
+    expect(dispatch).toHaveBeenCalledTimes(1);
+    expect(tagRound).toHaveBeenCalledWith(expect.objectContaining({ pr: 7012, round: 1 }));
+    expect(history.lastDispatched.has(key)).toBe(false);
+    expect(tick(history, [7012], { isPidAlive: () => false, log }).endedNoVerdict).toBeUndefined();
+    expect(log).toHaveBeenCalledTimes(1);
   });
 });
 
@@ -1510,8 +1937,8 @@ describe('runReviewTickAllRepos — the Claude-auth-broken gate is computed ONCE
       reconcile: () => ({ dispatch: [{ kind: 'review', prNumber: 1, attempts: 0 }], refusals: [] }),
       dispatch, tagRound: () => {}, tagStatus: () => {}, statusCandidates: () => [], ...opts,
     });
-    const out = runReviewTickAllRepos({
-      repos: ['repo-a', 'repo-b'], tick,
+    const out = runReviewTickAllRepos({ startIndex: 0,
+      repos: ['web-everything/web-everything', 'frontier-ui/frontierui'], tick,
       authGateOverride: () => ({ paused: true, reason: 'paused: Claude login expired — run /login' }),
     });
     expect(dispatch).not.toHaveBeenCalled();
@@ -1527,8 +1954,8 @@ describe('runReviewTickAllRepos — the Claude-auth-broken gate is computed ONCE
       reconcile: () => ({ dispatch: [{ kind: 'review', prNumber: 1, attempts: 0 }], refusals: [] }),
       dispatch, tagRound: () => {}, tagStatus: () => {}, statusCandidates: () => [], ...opts,
     });
-    const out = runReviewTickAllRepos({
-      repos: ['repo-a'], tick, authGateOverride: () => ({ paused: false, reason: null }),
+    const out = runReviewTickAllRepos({ startIndex: 0,
+      repos: ['web-everything/web-everything'], tick, authGateOverride: () => ({ paused: false, reason: null }),
     });
     expect(dispatch).toHaveBeenCalledTimes(1);
     expect(out.authPaused).toBe(false);
@@ -1536,9 +1963,9 @@ describe('runReviewTickAllRepos — the Claude-auth-broken gate is computed ONCE
 
   it('with a fake `tick` (not the real runReviewTick) and no authGateOverride, the gate defaults unpaused rather than shelling out (test hermeticity)', () => {
     const tick = vi.fn(() => ({ reviewsOwed: 0, dispatched: [], failed: [], refusals: 0 }));
-    const out = runReviewTickAllRepos({ repos: ['repo-a'], tick });
+    const out = runReviewTickAllRepos({ startIndex: 0, repos: ['web-everything/web-everything'], tick });
     expect(out.authPaused).toBe(false);
-    expect(tick).toHaveBeenCalledWith({ repo: 'repo-a', paused: false, pauseReason: null });
+    expect(tick).toHaveBeenCalledWith({ repo: 'web-everything/web-everything', paused: false, pauseReason: null });
   });
 });
 
@@ -1598,7 +2025,7 @@ describe('runReviewTickAllRepos — #3383 bug 3: deferredForLanes aggregates acr
     const tick = vi.fn()
       .mockReturnValueOnce({ reviewsOwed: 3, dispatched: [], failed: [], refusals: 0, reconcileError: null, deferredForLanes: 2 })
       .mockReturnValueOnce({ reviewsOwed: 1, dispatched: [], failed: [], refusals: 0, reconcileError: null, deferredForLanes: 0 });
-    const out = runReviewTickAllRepos({ repos: ['web-everything/web-everything', 'frontier-ui/frontierui'], tick });
+    const out = runReviewTickAllRepos({ startIndex: 0, repos: ['web-everything/web-everything', 'frontier-ui/frontierui'], tick });
     expect(out.deferredForLanes).toBe(2);
   });
 });
@@ -1780,7 +2207,7 @@ describe('runReviewTick — #4133 shared reads (opt-in via readPrs/readAgents)',
   });
 
   it('never carries a token-shaped string from stderr into reconcileError', () => {
-    const readPrs = () => { const err = new Error('Command failed: gh pr list'); err.status = 1; err.stderr = 'HTTP 401: Bad credentials (token gh\x73_abcdefghijklmnopqrstuvwxyz0123456789)\n'; throw err; };
+    const readPrs = () => { const err = new Error('Command failed: gh pr list'); err.status = 1; err.stderr = 'HTTP 401: Bad credentials (token gh' + 's_abcdefghijklmnopqrstuvwxyz0123456789)\n'; throw err; };
     const out = runReviewTick({ reconcile: () => ({ dispatch: [], refusals: [] }), readPrs, readAgents: () => [], dispatch: () => ({}), tagRound: () => {}, tagStatus: () => {}, statusCandidates: () => [] });
     expect(out.reconcileError).toContain('HTTP 401');
     expect(out.reconcileError).not.toMatch(/ghs_[A-Za-z0-9]{10}/);
@@ -1931,42 +2358,42 @@ describe('REVIEW_DAEMON_REPOS', () => {
 
 describe('runReviewTickAllRepos — one runReviewTick call per watched repo', () => {
   it('ticks every repo in the list, tagging each dispatched/failed entry with its own repo', () => {
-    const tick = vi.fn(({ repo }) => (repo === 'repo-a'
+    const tick = vi.fn(({ repo }) => (repo === 'web-everything/web-everything'
       ? { reviewsOwed: 1, dispatched: [{ prNumber: 10, agentId: 'a10' }], failed: [], refusals: 0 }
       : { reviewsOwed: 1, dispatched: [], failed: [{ prNumber: 20, error: 'boom' }], refusals: 1 }));
-    const out = runReviewTickAllRepos({ repos: ['repo-a', 'repo-b'], tick });
+    const out = runReviewTickAllRepos({ startIndex: 0, repos: ['web-everything/web-everything', 'frontier-ui/frontierui'], tick });
     expect(tick).toHaveBeenCalledTimes(2);
-    expect(tick).toHaveBeenCalledWith(expect.objectContaining({ repo: 'repo-a' }));
-    expect(tick).toHaveBeenCalledWith(expect.objectContaining({ repo: 'repo-b' }));
+    expect(tick).toHaveBeenCalledWith(expect.objectContaining({ repo: 'web-everything/web-everything' }));
+    expect(tick).toHaveBeenCalledWith(expect.objectContaining({ repo: 'frontier-ui/frontierui' }));
     expect(out.reviewsOwed).toBe(2);
     expect(out.refusals).toBe(1);
-    expect(out.dispatched).toEqual([{ prNumber: 10, agentId: 'a10', repo: 'repo-a' }]);
-    expect(out.failed).toEqual([{ prNumber: 20, error: 'boom', repo: 'repo-b' }]);
+    expect(out.dispatched).toEqual([{ prNumber: 10, agentId: 'a10', repo: 'web-everything/web-everything' }]);
+    expect(out.failed).toEqual([{ prNumber: 20, error: 'boom', repo: 'frontier-ui/frontierui' }]);
     expect(out.repos).toEqual([
-      { repo: 'repo-a', result: expect.any(Object) },
-      { repo: 'repo-b', result: expect.any(Object) },
+      { repo: 'web-everything/web-everything', result: expect.any(Object) },
+      { repo: 'frontier-ui/frontierui', result: expect.any(Object) },
     ]);
   });
 
   it('one repo throwing (a gh outage, a rate limit) never stops the others — isolated the same way a bad PR is isolated one level down', () => {
     const tick = vi.fn(({ repo }) => {
-      if (repo === 'repo-bad') throw new Error('gh: rate limited');
+      if (repo === 'frontier-ui/frontierui') throw new Error('gh: rate limited');
       return { reviewsOwed: 1, dispatched: [{ prNumber: 1, agentId: 'a1' }], failed: [], refusals: 0 };
     });
-    const out = runReviewTickAllRepos({ repos: ['repo-bad', 'repo-good'], tick });
-    expect(out.dispatched).toEqual([{ prNumber: 1, agentId: 'a1', repo: 'repo-good' }]);
-    expect(out.failed).toEqual([{ prNumber: null, repo: 'repo-bad', error: 'gh: rate limited' }]);
-    expect(out.repos[0]).toEqual({ repo: 'repo-bad', error: 'gh: rate limited' });
+    const out = runReviewTickAllRepos({ startIndex: 0, repos: ['frontier-ui/frontierui', 'web-everything/web-everything'], tick });
+    expect(out.dispatched).toEqual([{ prNumber: 1, agentId: 'a1', repo: 'web-everything/web-everything' }]);
+    expect(out.failed).toEqual([{ prNumber: null, repo: 'frontier-ui/frontierui', error: 'gh: rate limited' }]);
+    expect(out.repos[0]).toEqual({ repo: 'frontier-ui/frontierui', error: 'gh: rate limited' });
   });
 
   it('every non-`repo` option is forwarded to every repo\'s own tick call', () => {
     const tick = vi.fn(() => ({ reviewsOwed: 0, dispatched: [], failed: [], refusals: 0 }));
     const dispatch = () => ({});
-    runReviewTickAllRepos({ repos: ['repo-a'], tick, dispatch });
+    runReviewTickAllRepos({ startIndex: 0, repos: ['web-everything/web-everything'], tick, dispatch });
     // card x5kagse — `tick` here is a fake (not the real `runReviewTick`), so the auth gate defaults to
     // not-paused without any real IO; `paused`/`pauseReason` are still forwarded into every call, same as any
     // other shared per-tick fact (`acquirableLanes`, `readPrs`, ...).
-    expect(tick).toHaveBeenCalledWith({ dispatch, repo: 'repo-a', paused: false, pauseReason: null });
+    expect(tick).toHaveBeenCalledWith({ dispatch, repo: 'web-everything/web-everything', paused: false, pauseReason: null });
   });
 
   // Regression, #xvzwiew live-caught 2026-09-23: a repo whose `runReviewTick` catches its own reconcile
@@ -1980,7 +2407,7 @@ describe('runReviewTickAllRepos — one runReviewTick call per watched repo', ()
     const tick = vi.fn(({ repo }) => (repo === 'frontier-ui/frontierui'
       ? { reviewsOwed: 0, dispatched: [], failed: [], refusals: 0, reconcileError: 'spawnSync claude ENOENT' }
       : { reviewsOwed: 1, dispatched: [{ prNumber: 1, agentId: 'a1' }], failed: [], refusals: 0, reconcileError: null }));
-    const out = runReviewTickAllRepos({ repos: ['web-everything/web-everything', 'frontier-ui/frontierui'], tick });
+    const out = runReviewTickAllRepos({ startIndex: 0, repos: ['web-everything/web-everything', 'frontier-ui/frontierui'], tick });
     expect(out.failed).toEqual([]); // no bogus `prNumber: null` dispatch failure
     expect(out.reconcileFailed).toEqual([{ repo: 'frontier-ui/frontierui', error: 'spawnSync claude ENOENT' }]);
     expect(out.dispatched).toEqual([{ prNumber: 1, agentId: 'a1', repo: 'web-everything/web-everything' }]);
@@ -1990,27 +2417,27 @@ describe('runReviewTickAllRepos — one runReviewTick call per watched repo', ()
   // #x01u7az — holdReconcile results/errors are aggregated the SAME way as dispatched/failed: tagged with
   // their own repo, folded across every watched repo, one bad repo isolated from the rest.
   it('aggregates holdReconcile findings across repos, each tagged with its own repo', () => {
-    const tick = vi.fn(({ repo }) => (repo === 'repo-a'
+    const tick = vi.fn(({ repo }) => (repo === 'web-everything/web-everything'
       ? { reviewsOwed: 0, dispatched: [], failed: [], refusals: 0, reconcileError: null, holdReconcile: [{ num: 2549, remove: ['review:pending'] }], holdReconcileError: null }
       : { reviewsOwed: 0, dispatched: [], failed: [], refusals: 0, reconcileError: null, holdReconcile: [], holdReconcileError: null }));
-    const out = runReviewTickAllRepos({ repos: ['repo-a', 'repo-b'], tick });
-    expect(out.holdReconcile).toEqual([{ num: 2549, remove: ['review:pending'], repo: 'repo-a' }]);
+    const out = runReviewTickAllRepos({ startIndex: 0, repos: ['web-everything/web-everything', 'frontier-ui/frontierui'], tick });
+    expect(out.holdReconcile).toEqual([{ num: 2549, remove: ['review:pending'], repo: 'web-everything/web-everything' }]);
     expect(out.holdReconcileFailed).toEqual([]);
   });
 
   it('a repo whose holdReconcile failed is folded into holdReconcileFailed even when its reconcile itself failed too', () => {
-    const tick = vi.fn(({ repo }) => (repo === 'repo-a'
+    const tick = vi.fn(({ repo }) => (repo === 'web-everything/web-everything'
       ? { reviewsOwed: 0, dispatched: [], failed: [], refusals: 0, reconcileError: 'spawnSync claude ENOENT', holdReconcile: [], holdReconcileError: 'gh: rate limited' }
       : { reviewsOwed: 1, dispatched: [], failed: [], refusals: 0, reconcileError: null, holdReconcile: [], holdReconcileError: null }));
-    const out = runReviewTickAllRepos({ repos: ['repo-a', 'repo-b'], tick });
-    expect(out.reconcileFailed).toEqual([{ repo: 'repo-a', error: 'spawnSync claude ENOENT' }]);
-    expect(out.holdReconcileFailed).toEqual([{ repo: 'repo-a', error: 'gh: rate limited' }]);
-    expect(out.reviewsOwed).toBe(1); // repo-b's own count is untouched
+    const out = runReviewTickAllRepos({ startIndex: 0, repos: ['web-everything/web-everything', 'frontier-ui/frontierui'], tick });
+    expect(out.reconcileFailed).toEqual([{ repo: 'web-everything/web-everything', error: 'spawnSync claude ENOENT' }]);
+    expect(out.holdReconcileFailed).toEqual([{ repo: 'web-everything/web-everything', error: 'gh: rate limited' }]);
+    expect(out.reviewsOwed).toBe(1); // frontier-ui/frontierui's own count is untouched
   });
 
   it('a fake tick that omits holdReconcile entirely (older-shaped mock) never throws — defaults to nothing found', () => {
     const tick = vi.fn(() => ({ reviewsOwed: 0, dispatched: [], failed: [], refusals: 0 }));
-    const out = runReviewTickAllRepos({ repos: ['repo-a'], tick });
+    const out = runReviewTickAllRepos({ startIndex: 0, repos: ['web-everything/web-everything'], tick });
     expect(out.holdReconcile).toEqual([]);
     expect(out.holdReconcileFailed).toEqual([]);
   });
@@ -2020,7 +2447,7 @@ describe('runReviewTickAllRepos — one runReviewTick call per watched repo', ()
     // test injects neither `repos` nor `tick`'s inner effects — it only proves the DEFAULTS are wired, via a
     // spy on `tick` itself so the real runReviewTick's own IO defaults are never reached.
     const tick = vi.fn(() => ({ reviewsOwed: 0, dispatched: [], failed: [], refusals: 0 }));
-    const out = runReviewTickAllRepos({ tick });
+    const out = runReviewTickAllRepos({ startIndex: 0, tick });
     expect(tick).toHaveBeenCalledTimes(REVIEW_DAEMON_REPOS.length);
     expect(out.repos.map((r) => r.repo)).toEqual(REVIEW_DAEMON_REPOS);
   });
@@ -2394,7 +2821,7 @@ describe('runReviewTickAllRepos — liveProcessPrs (#3383 follow-up): aggregated
       reviewsOwed: 0, dispatched: [], failed: [], refusals: 0, reconcileError: null,
       liveProcessPrs: repo === 'web-everything/web-everything' ? [10] : [],
     }));
-    const out = runReviewTickAllRepos({ repos: ['web-everything/web-everything', 'plateauapp/plateau-app'], tick });
+    const out = runReviewTickAllRepos({ startIndex: 0, repos: ['web-everything/web-everything', 'plateauapp/plateau-app'], tick });
     expect(out.liveProcessPrs).toEqual([{ repo: 'web-everything/web-everything', prNumber: 10 }]);
   });
 });
@@ -2558,7 +2985,7 @@ describe('review:pending PRs the tick did not dispatch — the daemon prints why
   });
 
   it('runReviewTickAllRepos aggregates pendingNotDispatched with the repo', () => {
-    const r = runReviewTickAllRepos({ repos: ['a/b'], tick: () => ({ reviewsOwed: 0, refusals: 0, dispatched: [], failed: [], pendingNotDispatched: [{ prNumber: 9, reasons: ['x'] }] }) });
+    const r = runReviewTickAllRepos({ startIndex: 0, repos: ['a/b'], tick: () => ({ reviewsOwed: 0, refusals: 0, dispatched: [], failed: [], pendingNotDispatched: [{ prNumber: 9, reasons: ['x'] }] }) });
     expect(r.pendingNotDispatched).toEqual([{ prNumber: 9, reasons: ['x'], repo: 'a/b' }]);
   });
 
@@ -2769,7 +3196,7 @@ describe('operator-hold snapshots (card 5653)', () => {
       if (repo === c) return { reconcileError: 'x', reviewsOwed: 0, dispatched: [], failed: [] };
       return { reviewsOwed: 0, dispatched: [], failed: [], refusals: 0, operatorHolds: { observedAt: 9, holds: [{ prNumber: 1, kind: 'cap-exhausted' }] } };
     };
-    const out = runReviewTickAllRepos({ tick, authGateOverride: () => ({ paused: false, reason: null }) });
+    const out = runReviewTickAllRepos({ startIndex: 0, tick, authGateOverride: () => ({ paused: false, reason: null }) });
     expect(out.operatorHoldSnapshots).toEqual([{ repo: a, observedAt: 9, holds: [{ prNumber: 1, kind: 'cap-exhausted' }] }]);
   });
 
@@ -2815,3 +3242,62 @@ it.each(['idle', 'low', 'denied', 'floor throws', 'sample throws', 'infinite'])(
       expect(readCpuIdlePct).not.toHaveBeenCalled();
     }
   });
+
+it('capability-off refuses ordinary reviews while recovery safety and hold reconciliation run', () => {
+  const dispatch = vi.fn(), redTeamOnSkip = vi.fn(), holdReconcile = vi.fn(() => []);
+  const resolveProfile = vi.fn(() => ({ capabilities: { review: false } }));
+  const out = runReviewTick({ repo: 'web-everything/web-everything', resolveProfile,
+    reconcile: () => ({ dispatch: [{ kind: 'review', prNumber: 88 }], refusals: [] }),
+    dispatch, redTeamOnSkip, holdReconcile, tagRound: () => {}, tagStatus: () => {}, statusCandidates: () => [],
+  });
+  expect(out.notStarted).toEqual([expect.objectContaining({ prNumber: 88, reason: expect.stringContaining('capability unavailable') })]);
+  expect(dispatch).not.toHaveBeenCalled();
+  expect(redTeamOnSkip).toHaveBeenCalledOnce();
+  expect(holdReconcile).toHaveBeenCalledOnce();
+});
+
+
+it('capability-off scope-bloat recovery never refreshes/pushes, records an attempt or publishes a marker', () => {
+  const push = vi.fn(), rerun = vi.fn();
+  const refreshScopeBloat = vi.fn(() => { push(); rerun(); return {ok: true}; });
+  const recordScopeBloatRefresh = vi.fn(), postRefreshMarker = vi.fn(), holdReconcile = vi.fn(() => []);
+  const out = runReviewTick({ repo: 'web-everything/web-everything',
+    resolveProfile: () => ({capabilities: {review: false}}),
+    reconcile: () => ({dispatch: [], refusals: [{kind: 'scope-bloat', prNumber: 89,
+      scopeBloat: {stale: true}, headRefName: 'lane/x', headRefOid: 'a'.repeat(40)}]}),
+    refreshScopeBloat, recordScopeBloatRefresh, postRefreshMarker, holdReconcile,
+    tagRound: () => {}, tagStatus: () => {}, statusCandidates: () => [],
+  });
+  expect(out.failed).toContainEqual({prNumber: 89, error: expect.stringContaining('capability unavailable')});
+  for (const effect of [refreshScopeBloat, push, rerun, recordScopeBloatRefresh, postRefreshMarker]) expect(effect).not.toHaveBeenCalled();
+  expect(holdReconcile).toHaveBeenCalledOnce();
+});
+
+it.each([false, true])('capability-off convert-advisory refuses judge and publication (dryRun=%s)', async dryRun => {
+  const judge = vi.fn(), publish = vi.fn();
+  const convertAdvisory = vi.fn(async () => { judge(); publish(); return {posted: true}; });
+  const reconcile = vi.fn(() => ({dispatch: [{kind: 'convert-advisory', prNumber: 90}], refusals: []}));
+  const out = await runConvertAdvisoryTick({repo: 'web-everything/web-everything', dryRun,
+    resolveProfile: () => ({capabilities: {review: false}}), reconcile, convertAdvisory});
+  expect(out.skipped).toEqual([{prNumber: 90, reason: expect.stringContaining('capability unavailable')}]);
+  expect(out.convertAdvisoriesOwed).toBe(1);
+  expect(reconcile).toHaveBeenCalledOnce();
+  for (const effect of [convertAdvisory, judge, publish]) expect(effect).not.toHaveBeenCalled();
+});
+
+it('capability-off blocks same-tick draft promotion before ready or replanning', () => {
+  const ready = vi.fn();
+  const promoteDrafts = vi.fn(() => { ready(); return { rows: [{ pr: 91, action: 'promoted' }] }; });
+  const reconcile = vi.fn(() => ({ dispatch: [{ kind: 'promote-draft', prNumber: 91 }], refusals: [] }));
+  const notePromotions = vi.fn();
+  runReviewTick({ repo: 'web-everything/web-everything',
+    resolveProfile: () => ({ capabilities: { review: false } }), reconcile, promoteDrafts, notePromotions,
+    holdReconcile: () => [], tagRound: () => {}, tagStatus: () => {}, statusCandidates: () => [],
+  });
+  expect(promoteDrafts).not.toHaveBeenCalled();
+  expect(ready).not.toHaveBeenCalled();
+  expect(reconcile).toHaveBeenCalledOnce();
+  expect(notePromotions).toHaveBeenCalledWith(expect.objectContaining({
+    promotions: [expect.objectContaining({ pr: 91, action: 'skip', why: expect.stringContaining('capability unavailable') })],
+  }));
+});

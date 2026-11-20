@@ -24,7 +24,7 @@
  *     scope gap, not a correctness bug — see `EXTRA_MOUNTS` below for how a future pass would close it).
  *   - The CPU cap is REAL under this exact command: a `--cpus N` container genuinely bounds host CPU draw,
  *     reproducing #3621's own busy-spin containment result (8 unbounded spinners capped to ~2 cores' worth
- *     of host CPU instead of ~8, on this 12-core host).
+ *     of host CPU instead of ~8, on the host).
  *   - `check:standards` needs NO npm dependency that requires a native (darwin-arm64) binding — its actual
  *     import closure is pure JS (`gray-matter`, `markdown-it`) plus `git` (installed into the image; alpine's
  *     base does not ship it). This lets this POC mount the lane's OWN `node_modules` read-only rather than

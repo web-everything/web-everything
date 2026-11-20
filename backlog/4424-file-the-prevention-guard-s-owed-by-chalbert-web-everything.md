@@ -6,8 +6,8 @@ parent: "4075"
 status: open
 scope: ["we:scripts/lib/lane-salvage.mjs", "we:scripts/lib/salvage-index.mjs", "we:scripts/lib/__tests__/lane-salvage.test.mjs", "we:scripts/lib/__tests__/salvage-index.test.mjs"]
 dateOpened: "2026-09-29"
-preparedDate: "2026-11-14"
-preparedAgainstSha: "432c9452663c588aa03b798d8eeb8421b8372f36"
+preparedDate: "2026-11-18"
+preparedAgainstSha: "1565355003eab180fd9513c8d8f88987e6212e43"
 tags: []
 ---
 
@@ -23,6 +23,7 @@ Idempotency key (do not edit): approval-prevention-key:chalbert/web-everything#2
 - **Re-preparation 2026-11-06 (against 3f930713):** premise re-checked on current `main`; not delivered. Source drifted after nested-gitdir salvage work (PR #6438). Current sites replace every earlier line citation below: mtime catch `we:scripts/lib/lane-salvage.mjs:395`, copy walker `copyLitterTreeSync` `we:scripts/lib/lane-salvage.mjs:461` (symlink branch :463, no special-file check), root discovery `we:scripts/lib/lane-salvage.mjs:256` with discarded root lstat at :263, and salvage-index deletions `we:scripts/lib/salvage-index.mjs:281`, `:284` (guarded) and `:285` (empty outDir `rmSync`, still unguarded). Scope, size and plan unchanged; use symbol names when lines disagree at build time.
 - **Re-preparation 2026-11-10 (against b8df75d5):** premise re-checked; not delivered. `git log 3f93071..HEAD` on the four scoped files is empty, so every citation above (mtime catch :395, `copyLitterTreeSync` :461, root lstat :263, unguarded `rmSync(e.outDir)` `we:scripts/lib/salvage-index.mjs:285`) still holds. No Acceptance TODO scaffold remains; A1–A7 each name a failing-before/passing-after test. Only the stamp sha is refreshed.
 - **Re-preparation 2026-11-14 (against 432c9452):** premise re-checked; not delivered. `git log b8df75d..HEAD` on the four scoped files is empty; every citation still holds (mtime catch :395, `copyLitterTreeSync` :461, root lstat :263, unguarded `rmSync(e.outDir)` `we:scripts/lib/salvage-index.mjs:285`). A1–A7 already cover each guarantee (defaults in A1, callers in the Proof plan throw-path grep, fail-closed paths in A1/A5/A7). Only the stamp sha is refreshed.
+- **Re-preparation 2026-11-18 (against 15653550):** premise re-checked; not delivered. No commits to the scoped runtime files since 432c9452; citations hold (mtime catch :395, `copyLitterTreeSync` :461, root lstat :263, unguarded `rmSync(e.outDir)` `we:scripts/lib/salvage-index.mjs:285`). A1–A7 unchanged. Only the stamp sha is refreshed.
 - **Touch-set estimate:** retain story size 3 (no task-only estimatedLoc): approximately 25 changed lines in `we:scripts/lib/lane-salvage.mjs`, 5 in `we:scripts/lib/salvage-index.mjs`, 150 in `we:scripts/lib/__tests__/lane-salvage.test.mjs`, and 150 in `we:scripts/lib/__tests__/salvage-index.test.mjs`. The parser is already declared at `we:package.json:134`; the static checker stays test-local. No frontmatter stamp is changed.
 
 - **Premise correction:** the original references to lines 279, 420, 240 and 244 have moved. The current sites are `we:scripts/lib/lane-salvage.mjs:394` (mtime catch), `we:scripts/lib/lane-salvage.mjs:451` (copy walker), and `we:scripts/lib/lane-salvage.mjs:255` (litter discovery). The mtime catch already substitutes `nowMs`; the debt is direct gate coverage, not inventing a new liveness gate. Existing unreadability coverage at `we:scripts/lib/__tests__/lane-salvage.test.mjs:459` tests the reader and salvage, not that catch.

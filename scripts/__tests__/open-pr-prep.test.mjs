@@ -11,9 +11,9 @@ function fixture(test, enforce = true) {
   const dir = mkdtempSync(join(tmpdir(), 'open-pr-prep-'));
   const bodyFile = join(dir, 'body.md');
   const logPath = join(dir, 'events.log');
-  const spawn = vi.fn(() => ({ status: 0, stdout: '{"pr":123,"url":"example"}' }));
+  const spawn = vi.fn((_command, args) => ({ status: 0, stdout: args.includes('--check') ? '{"reason":"check-ok"}' : '{"pr":123,"url":"example"}' }));
   const review = vi.fn(() => ({ action: 'pass' }));
-  const runner = (options = {}) => createPrLandRunner({ spawn, prePrReview: review, cwd: dir, prepLogPath: logPath, ...(enforce ? { prepMode: 'enforce' } : {}), ...options });
+  const runner = (options = {}) => createPrLandRunner({ canonicalAudit: () => ({ ok: true }), spawn, prePrReview: review, cwd: dir, prepLogPath: logPath, ...(enforce ? { prepMode: 'enforce' } : {}), ...options });
   const argv = ['--ref=lane/prep', '--title=feature', `--body-file=${bodyFile}`];
   try { test({ dir, bodyFile, logPath, spawn, review, runner, argv }); }
   finally { rmSync(dir, { recursive: true, force: true }); }
@@ -46,13 +46,13 @@ describe('open-pr prep admission', () => {
     const stderr = vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
     try {
       expect(runner()({ argv })).toMatchObject({ outcome: 'refused', reason: 'pre-pr-review-missing' });
-      expect(spawn).not.toHaveBeenCalled(); expect(review).toHaveBeenCalledOnce();
+      expect(spawn).toHaveBeenCalledOnce(); expect(spawn.mock.calls[0][1]).toContain('--check'); expect(review).toHaveBeenCalledOnce();
     } finally { stderr.mockRestore(); }
   }, false));
-  it.each(['A description without prep.', prep.replace('visible outcome', ''), prep.replace('missing events', 'TODO')])('refuses missing/incomplete readable prep before review: %s', (body) => fixture(({ bodyFile, spawn, review, runner, argv }) => {
+  it.each(['A description without prep.', prep.replace('visible outcome', ''), prep.replace('missing events', 'TODO')])('collects missing/incomplete prep alongside review: %s', (body) => fixture(({ bodyFile, spawn, review, runner, argv }) => {
     writeFileSync(bodyFile, body);
     expect(runner()({ argv })).toMatchObject({ outcome: 'refused', reason: 'prep-block-missing', detail: expect.stringContaining('PREP:') });
-    expect(spawn).not.toHaveBeenCalled(); expect(review).not.toHaveBeenCalled();
+    expect(spawn).toHaveBeenCalledOnce(); expect(spawn.mock.calls[0][1]).toContain('--check'); expect(review).toHaveBeenCalledOnce();
   }));
   it('refuses an absent body-file argument', () => fixture(({ runner, argv }) => {
     expect(runner()({ argv: argv.filter((arg) => !arg.startsWith('--body-file=')) })).toMatchObject({ outcome: 'refused', reason: 'prep-block-missing' });
@@ -92,7 +92,7 @@ describe('open-pr prep admission', () => {
     expect(readPrepBody).toHaveReturnedWith(body);
     if (outcome === 'refused') {
       expect(result.reason).toBe('prep-block-missing');
-      expect(review).not.toHaveBeenCalled(); expect(spawn).not.toHaveBeenCalled();
+      expect(review).toHaveBeenCalledOnce(); expect(spawn).toHaveBeenCalledOnce(); expect(spawn.mock.calls[0][1]).toContain('--check');
     } else {
       expect(spawn).toHaveBeenCalledOnce();
       expect(publishedBody.startsWith(body)).toBe(true);
@@ -107,7 +107,7 @@ describe('open-pr prep admission', () => {
     expect(result.outcome).toBe(outcome);
     if (outcome === 'refused') {
       expect(result.reason).toBe('prep-block-missing');
-      expect(spawn).not.toHaveBeenCalled(); expect(review).not.toHaveBeenCalled();
+      expect(spawn).toHaveBeenCalledOnce(); expect(spawn.mock.calls[0][1]).toContain('--check'); expect(review).toHaveBeenCalledOnce();
     } else expect(spawn).toHaveBeenCalledOnce();
   }));
   it.each(['~', '~draft.md', '~someone/body.md', '~\n'])('matches pr-land leading-home expansion when reading prep from %j', (path) => fixture(({ runner, argv, spawn }) => {
@@ -129,7 +129,7 @@ describe('open-pr prep admission', () => {
       import { createPrLandRunner } from ${JSON.stringify(moduleUrl)};
       import { prepVerdict } from ${JSON.stringify(pathToFileURL(join(dirname(fileURLToPath(import.meta.url)), '../lib/prep-block.mjs')).href)};
       let copiedBody, gatedBody, prepPath, spawns = 0;
-      const run = createPrLandRunner({
+      const run = createPrLandRunner({ canonicalAudit: () => ({ ok: true }),
         readPrepBody: (path, encoding) => {
           prepPath = path;
           return readFileSync(path, encoding);
@@ -171,7 +171,7 @@ describe('open-pr prep admission', () => {
   it.each(['resolve the conflict', 'resolve conflict', 'rebase onto main', 're-run CI', 'rerun CI', 'retrigger CI', 'red-team the PR', 'redteam this PR', 'review the PR', 'review this PR', 'code review', 'file a backlog card', 'file the item', 'card-only'])('allows explicit shared task in title only in enforce mode: %s', (text) => fixture(({ bodyFile, runner, argv, spawn, review }) => {
     writeFileSync(bodyFile, text);
     expect(runner()({ argv })).toMatchObject({ outcome: 'refused', reason: 'prep-block-missing' });
-    expect(spawn).not.toHaveBeenCalled(); expect(review).not.toHaveBeenCalled();
+    expect(spawn).toHaveBeenCalledOnce(); expect(spawn.mock.calls[0][1]).toContain('--check'); expect(review).toHaveBeenCalledOnce();
     writeFileSync(bodyFile, 'description');
     expect(runner()({ argv: [...argv.filter((arg) => !arg.startsWith('--title=')), `--title=${text}`] }).outcome).toBe('opened');
   }));
@@ -179,13 +179,13 @@ describe('open-pr prep admission', () => {
     writeFileSync(bodyFile, 'Description without PREP.');
     expect(runner()({ argv: [...argv.filter((arg) => !arg.startsWith('--title=')), `--title=${title}`] }))
       .toMatchObject({ outcome: 'refused', reason: 'prep-block-missing' });
-    expect(spawn).not.toHaveBeenCalled(); expect(review).not.toHaveBeenCalled();
+    expect(spawn).toHaveBeenCalledOnce(); expect(spawn.mock.calls[0][1]).toContain('--check'); expect(review).toHaveBeenCalledOnce();
   }));
   it.each(['implement', 'build', 'add', 'fix', 'refactor', 'write'])('refuses build-worded title containing an exemption before review: %s', (verb) => fixture(({ bodyFile, runner, argv, spawn, review }) => {
     writeFileSync(bodyFile, 'Description without PREP.');
     expect(runner()({ argv: [...argv.filter((arg) => !arg.startsWith('--title=')), `--title=${verb} code review guard`] }))
       .toMatchObject({ outcome: 'refused', reason: 'prep-block-missing', detail: expect.stringContaining('PREP:') });
-    expect(spawn).not.toHaveBeenCalled(); expect(review).not.toHaveBeenCalled();
+    expect(spawn).toHaveBeenCalledOnce(); expect(spawn.mock.calls[0][1]).toContain('--check'); expect(review).toHaveBeenCalledOnce();
   }));
   it.each(['resolve merge conflict', 'fix merge conflict', 're-run CI; inspect the fix', 'retrigger CI; inspect the fix',
     'file a backlog card for the fix', 'review the PR for the fix'])('opens explicit exempt title without PREP: %s', (title) => fixture(({ bodyFile, runner, argv, spawn, review }) => {
@@ -196,7 +196,7 @@ describe('open-pr prep admission', () => {
   it.each(['The jury discussed this implementation.', 'This implementation needs code review.'])('refuses a build title whose body mentions exempt work: %s', (body) => fixture(({ bodyFile, runner, argv, spawn, review }) => {
     writeFileSync(bodyFile, body);
     expect(runner()({ argv })).toMatchObject({ outcome: 'refused', reason: 'prep-block-missing' });
-    expect(spawn).not.toHaveBeenCalled(); expect(review).not.toHaveBeenCalled();
+    expect(spawn).toHaveBeenCalledOnce(); expect(spawn.mock.calls[0][1]).toContain('--check'); expect(review).toHaveBeenCalledOnce();
   }));
   it('does not read or gate a dry-run', () => fixture(({ runner, argv, spawn }) => {
     const readPrepBody = vi.fn(() => { throw new Error('must not read'); });

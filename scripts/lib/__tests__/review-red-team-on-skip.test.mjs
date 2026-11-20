@@ -22,7 +22,8 @@ import { publishRedTeamCheckFromLive, evaluateRedTeamCheckFact, clearLivePublica
 import { newRunRecord, writeRun } from '../../operations/run-store.mjs';
 import { RESUME_MAX_ATTEMPTS, refusedReferralsAreRuled, reviewRunEvidence } from '../../conveyor/review-referral-hold.mjs';
 import { buildOperatorRulingComment, mandatoryReferralReviewer, normalizeFinding, referralFindingKey, renderReferralRecord } from '../jury-core.mjs';
-import { chmodSync, mkdirSync, mkdtempSync, rmSync, utimesSync } from 'node:fs';
+import { chmodSync, mkdirSync, mkdtempSync, rmSync, utimesSync, writeFileSync } from 'node:fs';
+import { execFileSync } from 'node:child_process';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 
@@ -1770,37 +1771,29 @@ describe('proveCardOnlyHeadMove', () => {
     } finally { detector.mockRestore(); }
   });
   it('carries a renumber plus docs id rewrite through the real numbering detector', () => {
-    const zero = '0'.repeat(40), beforeOid = '1'.repeat(40), afterOid = '2'.repeat(40);
-    const docBeforeOid = '3'.repeat(40), docAfterOid = '4'.repeat(40);
-    const blobs = new Map([[beforeOid, '---\ntitle: card\n---\n'], [afterOid, '---\nbornAs: xabcdef\ntitle: card\n---\n'],
-      [docBeforeOid, 'See xabcdef.\n'], [docAfterOid, 'See 123.\n']]);
-    const exec = vi.fn((file, args, options) => {
-      expect(file).toBe('git');
-      expect(options.cwd).toBe('checkout');
-      let output;
-      if (args[0] === 'cat-file') {
-        if (args[1] === '-e') output = '';
-        else {
-          const blob = blobs.get(args[2]);
-          if (blob === undefined) throw Error('unknown blob');
-          output = args[1] === '-t' ? 'blob\n' : args[1] === '-s' ? `${Buffer.byteLength(blob)}\n` : blob;
-        }
-      } else if (args[0] === 'rev-parse') output = fromSha;
-      else if (args[0] === 'rev-list') output = `${toSha} ${fromSha}\n`;
-      else if (args[0] === 'log') output = 'drain: JIT-number xabcdef→#123 at land (#2288)\n';
-      else if (['ls-tree', 'grep'].includes(args[0])) output = '';
-      else if (args[0] === 'diff-tree') output = [
-        `:100644 000000 ${beforeOid} ${zero} D\0backlog/xabcdef-card.md\0`,
-        `:000000 100644 ${zero} ${afterOid} A\0backlog/123-card.md\0`,
-        `:100644 100644 ${docBeforeOid} ${docAfterOid} M\0docs/agent/testing.md\0`,
-      ].join('');
-      else throw Error(`unexpected Git read: ${args[0]}`);
-      return options.encoding === null ? Buffer.from(output) : output;
-    });
-    expect(proveCardOnlyHeadMove({ exec, fromSha, toSha, cwd: 'checkout', mainRef: 'fixture/main' }))
-      .toMatchObject({ ok: true, commits: [toSha], pairs: [['xabcdef', '123']] });
-    expect(exec).toHaveBeenCalledWith('git', expect.arrayContaining(['ls-tree', 'fixture/main']), expect.anything());
-    expect(exec.mock.calls.some(([, args]) => args[0] === 'merge-base')).toBe(false);
+    const cwd = mkdtempSync(join(tmpdir(), 'red-team-numbering-'));
+    const git = args => execFileSync('git', args, { cwd, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }).trim();
+    try {
+      git(['init', '-q']);
+      git(['config', 'user.name', 'Numbering Test']);
+      git(['config', 'user.email', 'test@example.com']);
+      mkdirSync(join(cwd, 'backlog'));
+      mkdirSync(join(cwd, 'docs', 'agent'), { recursive: true });
+      writeFileSync(join(cwd, 'backlog/xabcdef-card.md'), '---\ntitle: card\n---\n');
+      writeFileSync(join(cwd, 'docs/agent/testing.md'), 'See xabcdef.\n');
+      git(['add', '-A']); git(['commit', '-q', '-m', 'base']);
+      const fromSha = git(['rev-parse', 'HEAD']);
+      git(['update-ref', 'refs/remotes/fixture/main', fromSha]);
+      git(['mv', 'backlog/xabcdef-card.md', 'backlog/123-card.md']);
+      writeFileSync(join(cwd, 'backlog/123-card.md'), '---\nbornAs: xabcdef\ntitle: card\n---\n');
+      writeFileSync(join(cwd, 'docs/agent/testing.md'), 'See 123.\n');
+      git(['add', '-A']); git(['commit', '-q', '-m', 'drain: JIT-number xabcdef→#123 at land (#2288)']);
+      const toSha = git(['rev-parse', 'HEAD']);
+      const exec = vi.fn(() => { throw Error('numbering proof must own its Git reader'); });
+      expect(proveCardOnlyHeadMove({ exec, fromSha, toSha, cwd, mainRef: 'fixture/main' }))
+        .toMatchObject({ ok: true, commits: [toSha], pairs: [['xabcdef', '123']] });
+      expect(exec).not.toHaveBeenCalled();
+    } finally { rmSync(cwd, { recursive: true, force: true }); }
   });
   const c1 = 'c'.repeat(40);
   const fake = ({ ancestor = true, revList = `${c1} ${fromSha}`, tree }) => vi.fn((file, args) => {

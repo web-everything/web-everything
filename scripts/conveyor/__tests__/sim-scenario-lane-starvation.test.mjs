@@ -5,7 +5,8 @@
  * `defaultAcquirableLaneCount` only by `buildCliDaemonEffects` — the pure function's own default stays
  * unbounded `() => Infinity`, unaffected).
  *
- * SETUP: 2 lanes, 5 `review:pending` PRs — more owed than the pool can serve at once.
+ * SETUP: 4 lanes (two per review round, so 2 rounds fit), 5 `review:pending` PRs — more owed than the pool can
+ * serve at once.
  *
  * The scripted review sessions do what the REAL review-agent-brief's own step 1 does first: acquire a lane —
  * `node scripts/lane-pool.mjs acquire --purpose=review-loop --session=<name> --json` (this scenario's own
@@ -18,7 +19,7 @@
  * `LANE_POOL_ACQUIRE_GROWTH_MAX_NEW=0` (#3383, `scripts/lane-pool.mjs`'s own `acquire` auto-pick growth,
  * `1723ea4d3`'s OTHER half) is pinned in this scenario's own env: `acquire`'s auto-pick path growing the pool
  * past a genuinely starved reading would let a session succeed anyway, masking whether the review daemon's
- * OWN dispatch cap is what is actually bounding concurrency here — pinning growth to zero makes the 2-lane
+ * OWN dispatch cap is what is actually bounding concurrency here — pinning growth to zero makes the 4-lane
  * pool a hard ceiling, so if the daemon ever over-dispatches, the excess session's `acquireLane()` genuinely
  * fails instead of quietly growing its way past the defect.
  *
@@ -33,7 +34,9 @@ import { scenario, runScenario } from './sim/scenario.mjs';
 import { FALLBACK_REQUIRED_STATUS_CHECKS } from '../../lib/required-status-checks.mjs';
 
 const PR_COUNT = 5;
-const LANE_COUNT = 2;
+// The daemon now budgets roughly two lanes per review round (a round needs a companion lane), so 4 lanes
+// still admit exactly 2 rounds per tick — the same 2 + 2 + 1 shape this scenario was written around.
+const LANE_COUNT = 4;
 
 function reviewSessionNames(w) {
   return w.claude.sessions().filter((s) => /^review-\d+$/.test(s.name)).map((s) => s.name);
@@ -46,7 +49,7 @@ function def() {
     daemons: ['review'],
     lanes: LANE_COUNT,
     setup(w) {
-      // #3383 — pin the pool's own growth off, so the 2-lane pool is a HARD ceiling for this scenario (see
+      // #3383 — pin the pool's own growth off, so the 4-lane pool is a HARD ceiling for this scenario (see
       // file header for why: otherwise a real over-dispatch defect could be masked by `acquire` silently
       // growing the pool past it, rather than the excess session's `acquireLane()` genuinely failing).
       w.env.LANE_POOL_ACQUIRE_GROWTH_MAX_NEW = '0';
@@ -83,7 +86,7 @@ function def() {
     play: [
       'tick review',
       (w) => {
-        // Capped by acquirable lanes (2), never by reviews owed (5) — the decisive assertion for #3383.
+        // Capped by acquirable lanes (4 lanes = 2 rounds), never by reviews owed (5) — the decisive assertion for #3383.
         expect(reviewSessionNames(w)).toHaveLength(2);
       },
       'agents', 'agents', 'agents', 'agents',

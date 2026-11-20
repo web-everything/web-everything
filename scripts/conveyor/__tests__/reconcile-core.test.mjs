@@ -1,3 +1,5 @@
+import { HEAD, workflowRow, workflowEvidence } from '../soak/fixtures/workflow-edit-protection.mjs';
+import { excusePrMergeGateHolds, readMergeGateVerdict } from '../../lib/merge-gate-hold-class.mjs';
 /**
  * @file scripts/conveyor/__tests__/reconcile-core.test.mjs
  * @description Pins the resident reconcile pass (WE #3296) — the dispatch and, mostly, its FOUR REFUSALS.
@@ -31,7 +33,7 @@
 import { describe, it, expect } from 'vitest';
 import { FIX_BEGIN_MARKER, FIX_END_MARKER, buildFixBeginComment, buildFixEndComment } from '../fix-procedure.mjs';
 import {
-  staleRequiredBaseRepair, planReconcile as planReconcileCore, fixWaitingSince, countFindings, bindAgents, assessLiveness, isAwaitingPermission, startedAtMs, releasedFixClaim, isReleasedClaimSession,
+  staleRequiredBaseRepair, reviewHoldOnlyRed, reviewHoldCiWaivable, planReconcile as planReconcileCore, fixWaitingSince, countFindings, bindAgents, assessLiveness, isAwaitingPermission, startedAtMs, releasedFixClaim, isReleasedClaimSession,
   REFUSAL_KINDS, DISPATCH_KINDS, selectStatusCandidates, markSelfReportedDone, markHungSessions,
   markAuthExpiredSessions, markIdleFinishedSessions, markBgIsolationStalls, CI_HEAL_ROUND_CAP,
   CONFLICT_FIX_ROUND_CAP, ADVISORY_FIX_ROUND_CAP, CONFLICT_FIX_ABSOLUTE_CEILING, foldReviewRefusalInto,
@@ -63,6 +65,7 @@ import { reconcileHolds } from '../../operations/land-advance-items-io.mjs';
 import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
+import { planNoteComment } from '../reconcile-note-comment.mjs';
 
 // ── fixtures — measured shapes, 2026-08-26 ───────────────────────────────────────────────────────────────────
 const NOW = Date.parse('2026-08-26T17:34:00Z');
@@ -99,6 +102,36 @@ const pr1563 = (over = {}) => ({
   statusCheckRollup: greenRollup,
   comments: [finding()],
   ...over,
+});
+
+describe('live send-back supersedes stale accepted phase and verdict', () => {
+  const oldHead = 'a'.repeat(40), head = 'b'.repeat(40);
+  const accepted = { author: AUTOMATION, createdAt: '2026-08-26T15:00:00Z', body: buildReviewedShaMarker(oldHead) };
+  const sentBack = { ...finding(), createdAt: '2026-08-26T16:00:00Z' };
+  it.each([
+    ['review:changes', { name: 'ready-to-merge' }],
+    ['review:changes', { name: 'review:accepted' }],
+    ['review:changes', { name: 'review:human' }],
+  ])('uses the live changes label despite stale acceptance: %j', (...labels) => {
+    const plan = planReconcile({ prs: [pr1563({ labels, headRefOid: head, comments: [accepted, sentBack] })], agents: [], now: NOW });
+    expect(plan.dispatch).toMatchObject([{ kind: 'fix', phase: 'bounced', headRefOid: head }]);
+    expect(plan.refusals).toEqual([]);
+  });
+  it.each(['label', 'merge-state'])('repairs a same-head conflict after acceptance using %s evidence', evidence => {
+    const plan = planReconcile({ prs: [pr1563({
+      labels: ['review:changes', { name: 'review:pending' }, ...(evidence === 'label' ? ['merge-status:conflicting'] : [])],
+      headRefOid: head, mergeStateStatus: evidence === 'merge-state' ? 'DIRTY' : 'CLEAN',
+      comments: [{ ...accepted, body: buildReviewedShaMarker(head) }, sentBack],
+    })], agents: [], now: NOW });
+    expect(plan.dispatch).toMatchObject([{ kind: 'fix', phase: 'bounced' }]);
+    expect(plan.dispatch[0].isConflict).toBe(evidence === 'label' ? true : undefined);
+    expect(plan.refusals).toEqual([]);
+  });
+  it('keeps the no-findings guard for a send-back without conflict evidence', () => {
+    const plan = planReconcile({ prs: [pr1563({ labels: ['review:changes'], comments: [] })], agents: [], now: NOW });
+    expect(plan.dispatch).toEqual([]);
+    expect(plan.refusals[0].kind).toBe('no-findings');
+  });
 });
 
 /** The four PRs actually open at 17:34Z, with the labels and comment counts measured then. */
@@ -214,6 +247,57 @@ describe('case 2 — refusal 1: a fixer that stopped to ASK is never restarted (
     expect(plan.refusals[0].kind).toBe('stood-down');
     expect(plan.refusals[0].prNumber).toBe(1563);
     expect(plan.refusals[0].standDowns).toBe(1);
+  });
+
+  it('escalates an unanswered stand-down once through trusted operator-note markers', () => {
+    const run = pr => planReconcile({ prs: [pr], agents: [], now: NOW });
+    const first = run(stoodDown);
+    expect(first.notes).toMatchObject([{ kind: 'stood-down', prNumber: 1563 }]);
+    const note = first.notes[0];
+    const publication = planNoteComment(note, stoodDown.comments);
+    expect(publication.alreadyPosted).toBe(false);
+    expect(publication.body).toContain('needs your decision');
+    const comments = [...stoodDown.comments, { author: AUTOMATION, body: publication.body }];
+    const next = run({ ...stoodDown, comments });
+    expect(next.dispatch).toEqual([]);
+    expect(next.refusals[0].kind).toBe('stood-down');
+    expect(planNoteComment(next.notes[0], comments).alreadyPosted).toBe(true);
+    expect(planNoteComment(note, [...stoodDown.comments, { author: { login: 'stranger' }, body: publication.body }]).alreadyPosted).toBe(false);
+  });
+
+  it('a cleared stand-down with only its operator note and bookkeeping refuses no-findings', () => {
+    const held = pr1563({ comments: [{ author: AUTOMATION,
+      body: buildStandDownComment({ reason: 'needs-judgment', head: pr1563().headRefOid }) }] });
+    const first = planReconcile({ prs: [held], agents: [], now: NOW });
+    expect(first.refusals[0].kind).toBe('stood-down');
+    const publication = planNoteComment(first.notes[0], held.comments);
+    const comments = [...held.comments, { author: AUTOMATION, body: publication.body }];
+    expect(countFindings(comments)).toBe(0);
+    const cleared = { ...held, headRefOid: 'f'.repeat(40), comments };
+    const plan = planReconcile({ prs: [cleared], agents: [], now: NOW });
+    expect(plan.dispatch).toEqual([]);
+    expect(plan.refusals.map(r => r.kind)).toEqual(['no-findings']);
+    expect(countFindings([{ body: `> ${publication.body}\nThis still needs repair.` }])).toBe(1);
+  });
+
+  it('does not count a trusted published note as a finding', () => {
+    const { body } = planNoteComment({ kind: 'stood-down', prNumber: 1563, text: 'Needs a decision.' }, []);
+    expect(countFindings([{ author: AUTOMATION, body }])).toBe(0);
+  });
+
+  it('counts an untrusted note lookalike containing a repair request even with a valid episode marker', () => {
+    const { body } = planNoteComment({ kind: 'stood-down', prNumber: 1563, text: 'Repair the broken guard.' }, []);
+    expect(countFindings([{ author: { login: 'stranger' }, body }])).toBe(1);
+    expect(countFindings([{ body }])).toBe(1);
+    expect(countFindings([body])).toBe(1);
+  });
+
+  it('counts a trusted note lookalike containing a repair request without a valid episode marker', () => {
+    const { body } = planNoteComment({ kind: 'stood-down', prNumber: 1563, text: 'Repair the broken guard.' }, []);
+    const withoutKey = body.replace(/^<!-- conveyor-note-key: .* -->$/m, '');
+    expect(countFindings([{ author: AUTOMATION, body: withoutKey }])).toBe(1);
+    expect(countFindings([{ author: AUTOMATION, body: `${withoutKey}\n<!-- conveyor-note-key: -->` }])).toBe(1);
+    expect(countFindings([{ author: AUTOMATION, body: `${withoutKey}\n<!-- conveyor-note-key: invalid -->` }])).toBe(1);
   });
 
   it('TERMINAL — a week later the answer is byte-identical: no decay, no clock', () => {
@@ -1755,6 +1839,30 @@ describe('case 5f — conflict-fix dispatch, capped by its OWN durable marker, n
     ...over,
   });
 
+  it.each([
+    ['main', 'main', 'clean', true],
+    ['main', 'main', 'manifest-only', true],
+    ['main', 'lane/stacked-base', 'clean', false],
+    ['main', 'lane/stacked-base', 'manifest-only', false],
+    ['main', 'main', 'real', false],
+    ['main', 'main', 'unsupported', false],
+    ['main', 'main', undefined, false],
+    ['main', 'main', null, false],
+    ['main', undefined, 'clean', false],
+    ['trunk', 'trunk', 'clean', true],
+    ['trunk', 'main', 'manifest-only', false],
+  ])('conflictFixMechanical requires the default base and an allowed disposition (default=%s, base=%s, disposition=%s → %s)',
+    (defaultBranch, baseRefName, conflictDisposition, expected) => {
+      const plan = planReconcile({
+        prs: [prConflict({ baseRefName, conflictDisposition, comments: [finding()] })],
+        agents: [], now: NOW, defaultBranch,
+      });
+      expect(plan.refusals).toEqual([]);
+      expect(plan.dispatch).toEqual([expect.objectContaining({
+        kind: 'fix', prNumber: 2549, isConflict: true, conflictFixMechanical: expected,
+      })]);
+    });
+
   it('a conflict-labelled bounce with zero prior conflict-fix rounds is dispatched `fix`, even though the shared cap is fully spent', () => {
     // Flood the thread with REARM/advisory markers past `NEGOTIATION_ROUND_CAP` — the shared cap this bounce
     // would otherwise be refused on — and confirm it still dispatches, because the conflict-fix cap reads its
@@ -1848,6 +1956,35 @@ describe('case 5f — conflict-fix dispatch, capped by its OWN durable marker, n
     // xilx617 — the generic REFUSAL 3 now names its OWN population (`capKind: OWED[phase]`) so its
     // `round-cap-exhausted` note can say WHICH auto-repair rounds were exhausted; a `bounced` phase owes `fix`.
     expect(plan.refusals[0].capKind).toBe('fix');
+  });
+
+  it.each([NEGOTIATION_ROUND_CAP, NEGOTIATION_ROUND_CAP + 1])('a DIRTY bounce without the conflict label refuses cap-exhausted after %i shared rounds', (attempts) => {
+    const shared = Array.from({ length: attempts }, () => ({ body: REARM_COMMENT_MARKER, author: AUTOMATION }));
+    const plan = planReconcile({
+      prs: [pr1563({ mergeStateStatus: 'DIRTY', comments: [finding(), ...shared,
+        { body: CONFLICT_FIX_COMMENT_MARKER, author: AUTOMATION },
+      ] })], agents: [], now: NOW,
+    });
+    expect(plan.dispatch).toEqual([]);
+    expect(plan.refusals).toEqual([expect.objectContaining({
+      kind: 'cap-exhausted', attempts, cap: NEGOTIATION_ROUND_CAP, capKind: 'fix',
+      why: expect.stringContaining('a person must take it'),
+    })]);
+  });
+
+  it('a DIRTY review:changes bounce with a live finding dispatches an ordinary fix at four shared rounds plus one completed conflict round', () => {
+    const shared = Array.from({ length: NEGOTIATION_ROUND_CAP - 1 }, () => ({ body: REARM_COMMENT_MARKER, author: AUTOMATION }));
+    const plan = planReconcile({
+      prs: [pr1563({ mergeStateStatus: 'DIRTY', comments: [finding(), ...shared,
+        { body: CONFLICT_FIX_COMMENT_MARKER, author: AUTOMATION },
+      ] })], agents: [], now: NOW,
+    });
+    expect(plan.refusals).toEqual([]);
+    expect(plan.dispatch).toEqual([expect.objectContaining({
+      kind: 'fix', prNumber: 1563, phase: 'bounced', attempts: NEGOTIATION_ROUND_CAP - 1,
+    })]);
+    expect(plan.dispatch[0].isConflict).toBeUndefined();
+    expect(plan.dispatch[0].why).toContain(`${NEGOTIATION_ROUND_CAP - 1} of ${NEGOTIATION_ROUND_CAP} attempts are spent`);
   });
 
   it('`countConflictFixComments` narrows on the leading line, like every sibling counter', async () => {
@@ -3600,6 +3737,41 @@ describe('review-hold-only required reds do not deadlock draft promotion or revi
       kind: 'ci-heal-escalated', reviewRefusal: expect.objectContaining({ kind: 'review-ci' }),
     }));
   });
+
+  it('does not waive CI for a review-hold advisory while another required check is still pending', () => {
+    const rollup = heldRollup().map(row => row.name === 'test' ? { name: 'test', status: 'IN_PROGRESS', conclusion: '' } : row);
+    const result = planReconcile({
+      prs: [pr1563({ isDraft: false, labels: lbl('review:pending'), comments: [], statusCheckRollup: rollup })],
+      requiredChecks, agents: [], durableCounts: {}, now: NOW, advisoryReviewOnHumanHandoff: 'on',
+    });
+    expect(result.dispatch.some(row => row.kind === 'review')).toBe(false);
+  });
+
+  it('does not waive CI for a review-hold advisory when a green required check is from another head', () => {
+    const rollup = heldRollup().map(row => row.name === 'test' ? { ...row, head_sha: 'f'.repeat(40) } : row);
+    const source = pr1563({ isDraft: false, labels: lbl('review:pending'), comments: [], statusCheckRollup: rollup });
+    expect(reviewHoldOnlyRed(rollup, requiredChecks, source.headRefOid)).toBe(false);
+    expect(reviewHoldOnlyRed(heldRollup(), requiredChecks, source.headRefOid)).toBe(true);
+    const result = planReconcile({ prs: [source], requiredChecks, agents: [], durableCounts: {}, now: NOW,
+      advisoryReviewOnHumanHandoff: 'on' });
+    expect(result.dispatch.some(row => row.kind === 'review')).toBe(false);
+    expect(reviewHoldCiWaivable({ pr: source, requiredChecks })).toBe(false);
+  });
+
+  it.each(['SKIPPED', 'NEUTRAL'])('does not waive CI for a review-hold advisory when a required check concluded %s', conclusion => {
+    const required = [...requiredChecks, 'lint'];
+    const rollup = [...heldRollup(), check('lint', conclusion)];
+    const source = pr1563({ isDraft: false, labels: lbl('review:pending'), comments: [], statusCheckRollup: rollup });
+    expect(reviewHoldCiWaivable({ pr: source, requiredChecks: required })).toBe(false);
+    const result = planReconcile({ prs: [source], requiredChecks: required, agents: [], durableCounts: {}, now: NOW,
+      advisoryReviewOnHumanHandoff: 'on' });
+    expect(result.dispatch.some(row => row.kind === 'review')).toBe(false);
+  });
+
+  it('still waives CI for a review-hold advisory when only the held gates are red', () => {
+    const source = pr1563({ isDraft: false, labels: lbl('review:pending'), comments: [], statusCheckRollup: heldRollup() });
+    expect(reviewHoldCiWaivable({ pr: source, requiredChecks })).toBe(true);
+  });
 });
 
 describe('fix waiting episode', () => {
@@ -4701,4 +4873,20 @@ describe('R359 early start shadow refusal diagnostics (xtxt36v / xrz0ezn)', () =
     expect(off.refusals[0]).not.toHaveProperty('earlyStartShadow');
     expect(off.dispatch).toEqual(baseline.dispatch);
   });
+});
+
+
+it('admits PR 7106 workflow-edit protection on review:pending without a ci-heal', () => {
+  const evidence = workflowEvidence();
+  const prs = excusePrMergeGateHolds([pr1563({ number: 7106, headRefOid: HEAD,
+    labels: lbl('review:pending'), comments: [], statusCheckRollup: [workflowRow,
+      { name: 'test', status: 'COMPLETED', conclusion: 'SUCCESS' }] })], {
+    repo: 'owner/repo', mergeGateSetting: 'on',
+    readMergeGateVerdict: args => readMergeGateVerdict({ ...args, cache: new Map(),
+      runGh: argv => argv.at(-1).endsWith('/logs') ? evidence.log : JSON.stringify(evidence.job) }),
+  });
+  const plan = planReconcile({ prs, requiredChecks: ['test', 'merge-gate'], now: NOW, agents: [],
+    advisoryReviewOnHumanHandoff: 'on' });
+  expect(plan.dispatch).toContainEqual(expect.objectContaining({ kind: 'review', prNumber: 7106 }));
+  expect(plan.dispatch.some(d => d.kind === 'ci-heal')).toBe(false);
 });

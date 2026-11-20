@@ -22,7 +22,7 @@ import { prSnapshotEnabled, markPrSnapshotDirty, repoFromGhArgs, snapshotPath, P
 
 const REPO = 'web-everything/web-everything';
 const PRS = Array.from({ length: 14 }, (_, i) => ({
-  number: 100 + i, title: `t${i}`, body: `b${i}`, url: `u${i}`, isDraft: false, createdAt: 'c', updatedAt: 'u',
+  rowsHead: null, rowsComplete: false, number: 100 + i, title: `t${i}`, body: `b${i}`, url: `u${i}`, isDraft: false, createdAt: 'c', updatedAt: 'u',
   headRefName: `lane/x${i}`, headRefOid: `abc${i}`, baseRefName: 'main', isCrossRepository: false, reviewDecision: 'APPROVED', mergeable: 'MERGEABLE', mergeStateStatus: 'CLEAN',
   labels: [{ name: 'ready-to-merge' }], files: [{ path: 'a.mjs' }], comments: [{ body: 'hi' }], statusCheckRollup: [{ __typename: 'CheckRun', name: 'test', conclusion: 'SUCCESS', status: 'COMPLETED',
     startedAt: 's', completedAt: 'e', detailsUrl: 'url', workflowName: 'build', appSlug: 'github-actions', appId: 15368 }],
@@ -142,6 +142,24 @@ describe('readSharedOpenPrs — one fetch serves the fleet', () => {
     expect(pageCalls(calls)).toHaveLength(1);
     expect(viewCalls(calls)).toHaveLength(1);
     expect(SNAPSHOT_FIELDS).toContain('comments');
+  });
+  it('cacheOnly serves a fresh snapshot and refuses a dirty or expired one, with no gh call (drain listing seed)', () => {
+    const { exec, calls } = fakeExec();
+    const fields = 'number,updatedAt,headRefOid,body,files';
+    readSharedOpenPrs(opts({ fields, exec }));
+    const before = calls.length;
+    const seedOpts = opts({ fields, exec, cacheOnly: true, ttlMs: 75_000 });
+    clock += 30_000;
+    expect(readSharedOpenPrs(seedOpts)).toHaveLength(14);
+    clock += 60_000;
+    expect(readSharedOpenPrs(seedOpts)).toBeNull(); // expired, no dirty mark: TTL alone refuses
+    expect(calls.length).toBe(before);
+    readSharedOpenPrs(opts({ fields, exec })); // refresh, then dirty it
+    const afterRefresh = calls.length;
+    markPrSnapshotDirty({ repo: REPO, env: { WE_PR_SNAPSHOT_DIR: dir }, nowMs: clock + 1 });
+    clock += 20_000;
+    expect(readSharedOpenPrs(seedOpts)).toBeNull(); // dirty, inside TTL: no seed, never a refresh
+    expect(calls.length).toBe(afterRefresh);
   });
   it('8 readers with 8 different field sets inside the TTL share ONE paged refresh and hydration', () => {
     const { exec, calls } = fakeExec();
@@ -408,4 +426,12 @@ it('cache-only planner reads never wait for or initiate a snapshot refresh', () 
     expect(readSharedOpenPrs({ repo: REPO, fields: 'number', dir, exec, cacheOnly: true })).toEqual([{ number: 42 }]);
     expect(calls).toBe(0);
   } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+
+it('snapshot v2 projects check evidence metadata without losing completeness', () => {
+  expect(PR_SNAPSHOT_VERSION).toBe(2);
+  expect(SNAPSHOT_FIELDS).toEqual(expect.arrayContaining(['rowsHead', 'rowsComplete']));
+  const pr = { number: 1, rowsHead: 'a'.repeat(40), rowsComplete: true };
+  expect(projectPrs([pr], SNAPSHOT_FIELDS)).toEqual([pr]);
 });

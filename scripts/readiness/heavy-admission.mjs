@@ -145,6 +145,8 @@
  *     fresh resource snapshot permits it. Status and release scan every slot that scaling may hand out.
  */
 import '../lib/tools-root-guard.mjs';
+import { pinDeveloperDir } from '../lib/lane-git-hardening.mjs';
+pinDeveloperDir();
 import { constants, existsSync, mkdirSync, mkdtempSync, rmdirSync, readdirSync, readFileSync, realpathSync, statSync, writeFileSync, unlinkSync, appendFileSync, renameSync } from 'node:fs';
 import { lstat, mkdir, open, rename, unlink } from 'node:fs/promises';
 import { execSync, execFile, spawn } from 'node:child_process';
@@ -168,6 +170,7 @@ import { isUnderTest } from '../lib/under-test.mjs';
 import { execContainerized, containerCliAvailable, containerImageAvailable, resolveContainerImage, resolveNodeModulesVolume, nodeModulesVolumeAvailable } from '../lib/container-exec.mjs'; // #3621 sequencing note (tracked on #3383) — the heavy-command-pool container POC; see that module's own header for proven scope (check:standards + test:unit)
 import { resolveHostRoot, readHostToday, extractSamplesByName, utcDayKey, readTailBytes } from '../operations/telemetry-summary-io.mjs'; // #4076 — REUSE the host-sampler's own root-resolution + tail-read + metric-extraction primitives (never reimplemented — see loadAdmissionDecision's section header below)
 import { latestValue, median } from '../lib/telemetry-machine.mjs'; // #4076/#4343 — the SAME "latest sample wins" reducer + median telemetry-machine.mjs already uses/exports — never a second implementation
+import { decideMemoryPressure, DEFAULT_WARN_MIN_FREE_PCT, DEFAULT_WARN_SWAP_GROWTH_MB } from '../lib/memory-warn-corroboration.mjs';
 import {
   classifyCommandKind, refineKind, holderLabel, holdBreakdown, resolveFastRunTimeoutMs, normalizeKind, queueLaneOf, typicalMinutes, typicalDispatchMinutes, resolvePrepareAdmission, classifyDispatchKind, dispatchDemandMinutes,
   queueBacklog, laneProjection, slotOrderFor, DEFAULT_QUEUE_MAX_WAIT_MINUTES, QUEUE_MAX_WAIT_ENV,
@@ -175,8 +178,9 @@ import {
 } from './heavy-queue-projection.mjs'; // card xkyw1x4 — the pure projection + fast-lane rules
 import { routeNeedsGit } from './needs-git-route.mjs';
 import { capabilityBundleVerdict, capabilityRecord } from './remote-git-bundle.mjs'; // R501: test files that spawn git cannot run on Forge's .git-less snapshot
-import { recordRemoteRun } from '../lib/forge-share.mjs'; // R501: the one durable remote-success row forgeShare reads
-import { createMarkerReaper, markerContent, recordMarkerRun, blockedSlots, heldTombstone, runVerdict } from './forge-slot-markers.mjs';
+import { recordRemoteRun, recordRemoteUsage } from '../lib/forge-share.mjs'; // R501: the one durable remote-success row forgeShare reads
+import { createMarkerReaper, markerContent, recordMarkerRun, watchMarkerExit, blockedSlots, heldTombstone, runVerdict } from './forge-slot-markers.mjs';
+import { createRunFinisher } from './forge-run-finish.mjs';
 import { classifyWaiterPriority, waiterPriorityClass, validRepairPatterns, DEFAULT_REPAIR_PATTERNS, ADMISSION_PRIORITY_MODES } from './heavy-repair-priority.mjs'; // red-main repair class — kept out of the projection (which the read-only `heavy-queue` op imports) because it needs `node:vm`
 export * from './heavy-queue-projection.mjs';
 export * from './heavy-repair-priority.mjs';
@@ -243,6 +247,7 @@ export const ADMISSION_POLICY_STANDARD = Object.freeze({
   runWaitMs: 0,
   wholeSuite: 'allow',
   fastScale: Object.freeze({ maxSlots: null, minShortWaiters: 3, minShortShare: 0.6, minCpuIdlePct: 30, maxMemPressureLevel: 1 }),
+  warnMinFreePct: DEFAULT_WARN_MIN_FREE_PCT, warnSwapGrowthMb: DEFAULT_WARN_SWAP_GROWTH_MB,
   // main-fix-queue-priority — a red-main repair waiter (P0) is admitted to the next free slot ahead of all others.
   priority: Object.freeze({ mode: 'enforce', repairPatterns: DEFAULT_REPAIR_PATTERNS }),
   // transport (R593): 'rsync' (default, rollback value) | 'git-bundle' (ship a verified git bundle; needs a runner advertising gitBundle:1).
@@ -280,6 +285,8 @@ const ADMISSION_VALID = {
   'fastScale.minShortShare': (v) => Number.isFinite(v) && v >= 0 && v <= 1,
   'fastScale.minCpuIdlePct': (v) => Number.isFinite(v) && v >= 0 && v <= 100,
   'fastScale.maxMemPressureLevel': (v) => admissionInt(1)(v) && v <= 4,
+  warnMinFreePct: (v) => Number.isFinite(v) && v >= 0 && v <= 100,
+  warnSwapGrowthMb: (v) => Number.isFinite(v) && v >= 0,
   'priority.mode': (v) => ADMISSION_PRIORITY_MODES.includes(v),
   'priority.repairPatterns': validRepairPatterns,
   'remote.clientPath': (v) => v === null || typeof v === 'string',
@@ -307,10 +314,13 @@ const ADMISSION_ENV = {
   cap: 'WE_HEAVY_ADMISSION_CAP', fastSlots: 'WE_HEAVY_ADMISSION_FAST_SLOTS', onTimeout: 'WE_HEAVY_ADMISSION_ON_TIMEOUT',
   runWaitMs: 'WE_HEAVY_ADMISSION_RUN_WAIT_MS',
   wholeSuite: 'WE_HEAVY_ADMISSION_WHOLE_SUITE',
+  warnMinFreePct: 'WE_LOAD_ADMISSION_WARN_MIN_FREE_PCT', warnSwapGrowthMb: 'WE_LOAD_ADMISSION_WARN_SWAP_GROWTH_MB',
   'priority.mode': 'WE_HEAVY_ADMISSION_PRIORITY', 'priority.repairPatterns': 'WE_HEAVY_ADMISSION_REPAIR_PATTERNS',
 };
-/** Leaves that shape this caller's execution policy, never shared capacity or queue ordering. */
-const PER_CALLER_LEAVES = new Set(['onTimeout', 'runWaitMs', 'wholeSuite']);
+/** Leaves that shape this caller's execution policy; warn thresholds may only tighten shared settings. */
+const PER_CALLER_LEAVES = new Set(['onTimeout', 'runWaitMs', 'wholeSuite', 'warnMinFreePct', 'warnSwapGrowthMb']);
+const tightensWarn = (leaf, value, setting) => leaf === 'warnMinFreePct' ? value >= setting
+  : leaf === 'warnSwapGrowthMb' ? value <= setting : true;
 /** Env text → a leaf value: a JSON array (or one bare pattern) for the repair patterns, lower-case for words. */
 function parseAdmissionEnv(leaf, raw) {
   const s = String(raw).trim();
@@ -392,6 +402,10 @@ export function resolveAdmissionPolicy({ platform, tool, env = {}, checkoutRoot 
         ignored.push(`tool.${leaf}=${oneLine(JSON.stringify(v))} (checkout-local settings would diverge from the shared host pool; set heavyAdmission.${leaf} in platform-preferences)`);
         continue;
       }
+      if (layer === 'tool' && valid(v) && !tightensWarn(leaf, v, value)) {
+        ignored.push(`tool.${leaf}=${v} (may only tighten shared setting ${value})`);
+        continue;
+      }
       if (valid(v)) { value = v; sources[leaf] = layer; }
       else {
         invalid.push(`${layer}.${leaf}=${leaf === 'remote.clientPath' ? clientPathForLog(v) : oneLine(JSON.stringify(v))}`);
@@ -420,7 +434,9 @@ export function resolveAdmissionPolicy({ platform, tool, env = {}, checkoutRoot 
 
 const admissionPolicyCache = new Map();
 const platformLastGood = new Map(); // path → last successfully parsed heavyAdmission block (survives a torn write)
-const PLATFORM_FILE_MAX_BYTES = 256 * 1024;
+// The host platform bag grew past 256 KiB on 2026-11-19 and every fresh process then read the standard layer
+// (remote.enabled=false); the bound is a sanity limit, not a policy limit.
+const PLATFORM_FILE_MAX_BYTES = 4 * 1024 * 1024;
 /**
  * IO: the shared platform/tool settings, cached for ten seconds per path and environment. Never throws.
  * On the shared host pool the platform file is the ONE capacity and priority source; every caller reads the SAME file:
@@ -476,12 +492,21 @@ export function loadAdmissionPolicy({ env = process.env, repoRoot, checkoutRoot,
 }
 
 export function formatAdmissionPolicy({ settings, sources, ignored = [], invalid = [] }) {
-  const values = ['cap', 'fastSlots', 'onTimeout', 'wholeSuite', 'fastScale.maxSlots', 'priority.mode',
+  // Keep bounded path diagnostics within the log budget; explicit warn settings retain their provenance.
+  const warnLeaves = ['warnMinFreePct', 'warnSwapGrowthMb'].filter(leaf =>
+    settings[leaf] !== ADMISSION_POLICY_STANDARD[leaf] || (sources[leaf] ?? 'standard') !== 'standard');
+  const values = ['cap', 'fastSlots', 'onTimeout', 'wholeSuite', 'fastScale.maxSlots', ...warnLeaves, 'priority.mode',
     ...Object.keys(ADMISSION_POLICY_STANDARD.remote)
       .filter(key => key !== 'clientPath' || settings.remote?.clientPath != null)
       .map(key => key === 'elasticSlots' ? 'remote.elasticSlots.enabled' : key === 'bundle' ? 'remote.bundle.mainMaxAgeMin' : `remote.${key}`)]
     .map((leaf) => `${leaf}=${leaf === 'remote.clientPath' ? clientPathForLog(admissionLeaf(settings, leaf)) : admissionObject(admissionLeaf(settings, leaf)) ? JSON.stringify(admissionLeaf(settings, leaf)) : admissionLeaf(settings, leaf)} (${sources[leaf] ?? 'standard'})`);
   return `heavy-admission policy · ${values.join(', ')}${ignored.length ? ` · ignored: ${ignored.join('; ')}` : ''}${invalid.length ? ` · invalid: ${invalid.join('; ')}` : ''}`;
+}
+
+/** All memory gates consume these same admission-policy leaves (not a second settings cascade). */
+export function loadMemoryPressureSettings(options = {}) {
+  const { settings } = loadAdmissionPolicy(options);
+  return { warnMinFreePct: settings.warnMinFreePct, warnSwapGrowthMb: settings.warnSwapGrowthMb };
 }
 
 /** Vitest's boolean `--coverage.*` leaves accept only true/false as a separate value. */
@@ -1155,6 +1180,20 @@ function recordRemoteFallback({lockRoot, reason, detail = null, cwd, argv, env, 
   } catch { /* Observability must never prevent local admission. */ }
 }
 
+/** R830/R823: the reason a run executes locally when no remote attempt logged one. Pure. */
+export function localReasonFor({ useContainer = false, forceLocal = false, bypass = null, decisionReason = null } = {}) {
+  if (forceLocal) return 'local-flag';
+  if (useContainer) return 'local-container';
+  if (bypass) return `local-admission-${bypass}`;
+  if (decisionReason) return /load-unreadable/.test(decisionReason) ? 'local-load-unreadable'
+    : /remote\.enabled=false/.test(decisionReason) ? 'local-remote-disabled'
+    : /<=/.test(decisionReason) ? 'local-below-threshold' : 'local-by-policy';
+  return 'local-held-or-unrouted';
+}
+
+/** Logs a local-by-design run's reason into remote-fallbacks.jsonl (never throws). */
+export function recordLocalReason(args) { recordRemoteFallback(args); }
+
 /** Attempt remote execution before taking a local slot; remote is disabled by default.
  * Only { mode: 'remote', code: <integer 0..254> } exits with that code. Local admission requires
  * { mode: 'not-started', terminated: true } or { mode: 'cancelled', terminated: true }.
@@ -1178,9 +1217,10 @@ function abortableSleep(ms, signal) {
   });
 }
 
+// Loaded Forge cancellation can settle minutes after the run timeout; keep polling bounded.
 function resolveTimeoutCancelWaitMs(env) {
   const n = Number((env ?? {}).WE_HEAVY_TIMEOUT_CANCEL_WAIT_MS);
-  return Number.isInteger(n) && n >= 0 ? Math.min(n, 90000) : 30000;
+  return Number.isInteger(n) && n >= 0 ? Math.min(n, 300000) : 180000;
 }
 
 export async function runWithRemoteDecision({
@@ -1243,9 +1283,12 @@ export async function runWithRemoteDecision({
   const cap = policy.settings.remote.maxConcurrent;
   const slotOptions = {lockRoot:remoteRoot,cap,owner,pid:process.pid};
   let unitPolicy;
-  const kind = classifyAdmissionCommandKind(argv.map(shellQuoteWord).join(' '), env);
+  const command = argv.map(shellQuoteWord).join(' ');
+  const kind = classifyAdmissionCommandKind(command, env);
+  const wholeSuite = isWholeSuiteCommand(command, env);
   let lease = null;
   try { lease = readLaneLease(cwd); } catch { /* unknown identity grants no priority */ }
+  const markerTags = buildMarkerTags({kind, env, lease, argv});
   const priority = classifyWaiterPriority({purpose:lease?.purpose,session:lease?.session,holder:lease?.holder,
     envSession:clipIdentity(env?.[HOLD_SESSION_ENV])}, policy.settings.priority).class === 'P0';
   try {
@@ -1261,7 +1304,7 @@ export async function runWithRemoteDecision({
   let healthAt = waitAt;
   let reapedAt = -Infinity;
   const stuck = policy.settings.remote;
-  const markerReaper = createMarkerReaper({root:remoteRoot,host,clock,log,
+  const markerReaper = createMarkerReaper({root:remoteRoot,host,clock,log,finishRun:createRunFinisher({host}),
     stuckMinSlots:stuck.stuckMinSlots,stuckAgeMs:stuck.stuckAgeMs,signalEveryMs:stuck.stuckSignalEveryMs,
     signal:({kind,detail})=>{void appendEvent({kind:'forge-slots-stuck',daemon:'heavy-admission',detail:{reason:kind,host,...detail}});}});
   let overloadWaitLogged = false;
@@ -1355,10 +1398,11 @@ export async function runWithRemoteDecision({
   let terminated = false;
   let executionRun = null;
   const executor = remoteExec ?? createRemoteExec({ policy, cwd, env, lockRoot, log, runOverride: remoteClientOverride });
-  remoteExec = options => executor({...options,slotUnits:units,onRun:run => {
-    options.onRun(run);
-    for (const file of extraMarkers) recordMarkerRun(file,{owner,run});
+  remoteExec = options => executor({...options,slotUnits:units,onRun:(run, metadata) => {
+    try { options.onRun(run, metadata); } catch { /* advisory */ }
+    for (const file of extraMarkers) recordMarkerRun(file,{owner,run,nonce:metadata?.nonce,slot:metadata?.slot});
   }});
+  let exitWatcher;
   const refuseLocal = (reason) => {
     log(`heavy-admission: remote failed (${oneLine(reason)}) - remote termination unconfirmed; refusing local rerun (exit 124). Confirm remote termination before retrying; remote slot-${slot.slot} retained until its .unconfirmed marker is cleared.\n`);
     return { handled: true, exitCode: 124 };
@@ -1370,7 +1414,7 @@ export async function runWithRemoteDecision({
   const cancelController = new AbortController();
   let signalled = null; let onSignal;
   let escalate; const escalatePromise = new Promise((resolve) => { escalate = () => resolve(null); });
-  const signalPromise = new Promise((resolve) => { onSignal = (name) => { if (signalled) { escalate(); return; } signalled = name; resolve({ clientSignal: name }); cancelController.abort(); controller.abort(); }; });
+  const signalPromise = new Promise((resolve) => { onSignal = (name) => { exitWatcher?.record(128 + CLIENT_SIGNAL_NUMBERS[name], name); if (signalled) { escalate(); return; } signalled = name; resolve({ clientSignal: name }); cancelController.abort(); controller.abort(); }; });
   let signalHandlers = [];
   // A kill that lands while a result is being recorded is honoured: exit with the signal code, keeping `terminated` as is.
   const killedExit = () => signalled ? { handled: true, exitCode: 128 + CLIENT_SIGNAL_NUMBERS[signalled], signal: signalled } : null;
@@ -1411,7 +1455,7 @@ export async function runWithRemoteDecision({
     try {
       // A held tombstone for this slot (an in-flight or interrupted reap) still means termination is unconfirmed.
       if(blockedSlots(remoteRoot,slot.slot+1).has(slot.slot))return localFallback('remote-slot-held');
-      writeFileSync(executionMarker,markerContent({owner,pid:process.pid,nowMs:clock(),host}),{flag:'wx',mode:0o600});
+      writeFileSync(executionMarker,markerContent({owner,pid:process.pid,nowMs:clock(),host,...markerTags}),{flag:'wx',mode:0o600});
       primaryCreated = true;
       // A reaper may have parked a tombstone for this slot between the check and the create. Nothing has been
       // dispatched yet, so withdraw our own marker and fall back; the tombstone keeps its evidence.
@@ -1419,11 +1463,12 @@ export async function runWithRemoteDecision({
       for (const n of slot.slots.slice(1)) {
         const file = join(remoteRoot,`slot-${n}.unconfirmed`);
         if (blockedSlots(remoteRoot,n+1).has(n)) throw new Error('Slot held');
-        writeFileSync(file,markerContent({owner,pid:process.pid,nowMs:clock(),host}),{flag:'wx',mode:0o600});
+        writeFileSync(file,markerContent({owner,pid:process.pid,nowMs:clock(),host,...markerTags}),{flag:'wx',mode:0o600});
         extraMarkers.push(file);
         if (heldTombstone(remoteRoot,n)) throw new Error('Slot held');
       }
       outstanding = true;
+      exitWatcher = watchMarkerExit({files:[executionMarker, ...extraMarkers], owner, clock});
     } catch { return localFallback('remote-execution-marker-unwritable'); }
     signalHandlers = Object.keys(CLIENT_SIGNAL_NUMBERS).map((name) => { const h = () => onSignal(name); process.on(name, h); return [name, h]; });
     const timeout = new Promise((resolve) => {
@@ -1436,8 +1481,8 @@ export async function runWithRemoteDecision({
       executionRun = null;
       return Promise.resolve(remoteExec({ argv, cwd, env, host, signal: controller.signal, cancelSignal: cancelController.signal, transport: policy.settings.remote.transport, bundleMainMaxAgeMs: policy.settings.remote.bundle.mainMaxAgeMin * 60_000,
       onWarning: (reason, detail) => recordRemoteFallback({lockRoot, reason, detail, cwd, argv, env, clock}),
-      onCapabilities: capabilities => writeRunnerCapabilities({ root: remoteRoot, host, capabilities, clock }), onRun: run => {
-        if (recordMarkerRun(executionMarker, {owner, run})) executionRun = run;
+      onCapabilities: capabilities => writeRunnerCapabilities({ root: remoteRoot, host, capabilities, clock }), onRun: (run, metadata) => {
+        if (recordMarkerRun(executionMarker, {owner, run, nonce:metadata?.nonce, slot:metadata?.slot})) executionRun = run;
       } }));
     };
     let remote = dispatch();
@@ -1447,7 +1492,7 @@ export async function runWithRemoteDecision({
     const busyBudget = policy.settings.remote.busyWaitMs ?? 0;
     const busyStart = clock();
     const isBusy = (r) => r?.mode === 'not-started' && r.terminated === true && (r.reason === 'forge-busy'
-      || ((kind === 'FULL' || kind === 'coverage') && ['sibling-inventory-failed', 'git-head-unavailable'].includes(r.reason)));
+      || (wholeSuite && ['sibling-inventory-failed', 'git-head-unavailable'].includes(r.reason)));
     while (isBusy(result) && busyBudget > 0) {
       const spent = clock() - busyStart;
       const backoff = Math.max(1000, policy.settings.remote.busyBackoffMs ?? 45000);
@@ -1534,7 +1579,7 @@ export async function runWithRemoteDecision({
       const confirmedByTelemetry = !terminated && await confirmFinished();
       await record(confirmedByTelemetry ? {mode:'cancelled',terminated:true,reason:result?.reason} : result); // record() itself skips a busy Forge result when the busy wait is enabled
       if (killedExit()) return killedExit();
-      if (result?.mode === 'remote' && Number.isInteger(result.code) && result.code >= 0 && result.code <= 254) return { handled: true, exitCode: result.code, remoteResult: result };
+      if (result?.mode === 'remote' && Number.isInteger(result.code) && result.code >= 0 && result.code <= 254) return { handled: true, exitCode: result.code, remoteResult: result.resources ? {...result,slotUnits:units} : result };
       // Explicit acknowledgement or a fresh settled per-run result must confirm termination. Throws and
       // malformed replies alone may come from an executor whose remote child is still alive.
       if (!terminated) return killedExit() ?? refuseLocal(result?.reason ?? 'unconfirmed remote result');
@@ -1551,8 +1596,9 @@ export async function runWithRemoteDecision({
     clearTimeout(timer); clearInterval(heartbeat);
     for (const [name, h] of signalHandlers) process.removeListener(name, h);
     if (!outstanding || terminated) {
+      exitWatcher?.stop();
       for (const file of extraMarkers) {
-        try { try {unlinkSync(`${file}.run`);} catch {} unlinkSync(file); }
+        try { try {unlinkSync(`${file}.run`);} catch {} try {unlinkSync(`${file}.exit`);} catch {} unlinkSync(file); }
         catch { log(`heavy-admission: remote unit marker retained; operator cleanup required\n`); }
       }
       if (!outstanding) {if (primaryCreated) {try {unlinkSync(executionMarker);} catch {}} releaseUnits();}
@@ -1561,13 +1607,13 @@ export async function runWithRemoteDecision({
       // Unconfirmed results, throws and client death leave the pre-dispatch
       // marker intact across PID reclaim and lease expiry. Only confirmed
       // completion/termination can make this index available again.
-      try {try{unlinkSync(`${executionMarker}.run`);}catch{/* none */}unlinkSync(executionMarker);outstanding = false;}
+      try {try{unlinkSync(`${executionMarker}.run`);}catch{/* none */}try{unlinkSync(`${executionMarker}.exit`);}catch{/* none */}unlinkSync(executionMarker);outstanding = false;}
       catch {log(`heavy-admission: remote slot-${slot.slot} retained; execution confirmed terminated but its .unconfirmed marker could not be removed; operator cleanup required\n`);}
       if(!outstanding)releaseUnits();
     }
   }
   recordRemoteFallback({lockRoot, reason, detail, cwd, argv, env, clock});
-  if ((kind === 'FULL' || kind === 'coverage') && ['sibling-inventory-failed', 'bundle-credential-hit', 'bundle-credential-scan-too-large', 'git-head-unavailable'].includes(reason)) {
+  if (wholeSuite && ['sibling-inventory-failed', 'bundle-credential-hit', 'bundle-credential-scan-too-large', 'git-head-unavailable'].includes(reason)) {
     log(`heavy-admission: refusing local fallback (${oneLine(reason)})\n`);
     return { handled: true, exitCode: 125 };
   }
@@ -1635,7 +1681,7 @@ export function isAdmissionOff(env = process.env) {
 //
 // #4343 — NOT `load1/cores` ALONE ANY MORE. macOS `load1` counts RUNNABLE THREADS, and our own daemons
 // (cards 4344/4345/4346) start ~400 short-lived processes per second — a fork storm that inflates `load1` into
-// the 20s–60s on this 12-core host while CPU idle sits at 25–65% and memory is never under pressure (live
+// the 20s–60s on the host while CPU idle sits at 25–65% and memory is never under pressure (live
 // evidence on #4343's own card: 08:30 ET held on "load 21.24/12 (1.77 > 1.5)" while `top` read 29.6% idle).
 // The gate was holding dispatch on ITS OWN polling, not on real host saturation. The PRIMARY signal is now the
 // host-sampler's own `host.cpu.busy_pct` sample's `idle_pct` ATTRIBUTE (see `telemetry.mjs`'s own header: the
@@ -1652,7 +1698,7 @@ export function isAdmissionOff(env = process.env) {
 // confirm it directly) for a saturation shape idle% alone might miss (a true CPU-bound compute storm with
 // little forking). `load1` here is ALSO the median over the SAME window as idle% ({@link readLatestLoad}'s own
 // doc comment) — an earlier draft read a single instantaneous sample, which the card's own evidence (fork-storm
-// `load1` reaching the 20s–60s range on this 12-core host, i.e. up to ~5/core) shows can itself spuriously
+// `load1` reaching the 20s–60s range on the host, i.e. up to ~5/core) shows can itself spuriously
 // cross even this much-higher backstop threshold during an ordinary burst, reintroducing this very card's own
 // bug at a higher bar rather than closing it. The backstop's env var is its OWN new name
 // (`WE_LOAD_ADMISSION_BACKSTOP_PER_CORE`), never the OLD `WE_LOAD_ADMISSION_MAX_PER_CORE`: that name meant a
@@ -1693,12 +1739,9 @@ export const DEFAULT_LOAD_ADMISSION_WINDOW = 4;
 /** The env var a machine overrides {@link DEFAULT_LOAD_ADMISSION_WINDOW} with. */
 export const LOAD_ADMISSION_WINDOW_ENV = 'WE_LOAD_ADMISSION_WINDOW';
 
-/** Hold when the LATEST `host.mem.pressure_level` sample is at or above this (macOS "warn" is `2`). Checked on
- *  the single latest sample, never windowed like idle% — deliberately, not an oversight: unlike `load1`/idle%,
- *  which our own fork-storm daemons visibly flap, the card's own evidence found pressure steady at "1 (normal)"
- *  across every one of 3239 samples on its evidence day, so there is no observed noise here to smooth, and a
- *  real jump to "warn" or worse is exactly the kind of signal that should hold immediately rather than wait out
- *  a median. Overridable via `WE_LOAD_ADMISSION_MIN_PRESSURE_LEVEL`. */
+/** Check the LATEST `host.mem.pressure_level` at or above this (macOS warn is `2`). Warn can remain sticky
+ *  after swap use, so levels 2/3 require low free memory or windowed swap growth (missing both fails closed).
+ *  Critical (>=4) always holds. Overridable via `WE_LOAD_ADMISSION_MIN_PRESSURE_LEVEL`. */
 export const DEFAULT_LOAD_ADMISSION_MIN_PRESSURE_LEVEL = 2;
 
 /** The env var a machine overrides {@link DEFAULT_LOAD_ADMISSION_MIN_PRESSURE_LEVEL} with. */
@@ -1762,9 +1805,11 @@ export function isLoadAdmissionOff(env = process.env) {
  *   1. **idle-low** — the MEDIAN of `idlePctSamples` (the last {@link DEFAULT_LOAD_ADMISSION_WINDOW} `idle_pct`
  *      readings) is below `minIdlePct` (default {@link DEFAULT_LOAD_ADMISSION_MIN_IDLE_PCT}).
  *   2. **mem-pressure** — the LATEST `pressureLevel` is `>= minPressureLevel` (default
- *      {@link DEFAULT_LOAD_ADMISSION_MIN_PRESSURE_LEVEL}, macOS "warn"). Checked on the single latest sample,
- *      never windowed like idle% — see {@link DEFAULT_LOAD_ADMISSION_MIN_PRESSURE_LEVEL}'s own doc comment for
- *      why that asymmetry is deliberate.
+ *      {@link DEFAULT_LOAD_ADMISSION_MIN_PRESSURE_LEVEL}, macOS "warn") with corroborating scarcity, or no
+ *      readable free-memory data. Only level 2 can relax; every other level above 1 holds. Free percent uses latest available/total bytes;
+ *      swap growth uses oldest/latest bytes in the sample window. Defaults: free <20% or swap growth >256 MB,
+ *      from heavyAdmission.warnMinFreePct / warnSwapGrowthMb and WE_LOAD_ADMISSION_WARN_MIN_FREE_PCT /
+ *      WE_LOAD_ADMISSION_WARN_SWAP_GROWTH_MB.
  *   3. **load-backstop** — `load1 / cores` is, on its own, above `backstopPerCore` (default
  *      {@link DEFAULT_LOAD_ADMISSION_BACKSTOP_PER_CORE}) — a much higher ratio than the OLD primary threshold,
  *      kept only as a runaway safety net idle% alone might miss.
@@ -1774,11 +1819,12 @@ export function isLoadAdmissionOff(env = process.env) {
  * in a held `reason` is FLOORED, never rounded — `Math.round` could display e.g. "15%" for a true 14.99% (which
  * reads as self-contradictory next to "(<15%)"); `Math.floor(x) <= x` always, so a floored display can never
  * read as satisfying the threshold it just failed.
- * @param {{idlePctSamples?:number[], pressureLevel?:number|null, load1?:number|null, cores?:number|null, minIdlePct?:number, minPressureLevel?:number, backstopPerCore?:number}} [o]
+ * @param {{idlePctSamples?:number[], pressureLevel?:number|null, freePct?:number|null, swapGrowthMb?:number|null, warnMinFreePct?:number, warnSwapGrowthMb?:number, load1?:number|null, cores?:number|null, minIdlePct?:number, minPressureLevel?:number, backstopPerCore?:number}} [o]
  * @returns {{held:boolean, idlePct:number|null, minIdlePct:number, pressureLevel:number|null, minPressureLevel:number, load1:number|null, cores:number|null, perCore:number|null, backstopPerCore:number, reason?:string}}
  */
 export function loadAdmissionDecision({
   idlePctSamples = [], pressureLevel = null, load1 = null, cores = null,
+  freePct = null, swapGrowthMb = null, warnMinFreePct, warnSwapGrowthMb,
   minIdlePct = DEFAULT_LOAD_ADMISSION_MIN_IDLE_PCT, minPressureLevel = DEFAULT_LOAD_ADMISSION_MIN_PRESSURE_LEVEL,
   backstopPerCore = DEFAULT_LOAD_ADMISSION_BACKSTOP_PER_CORE,
 } = {}) {
@@ -1792,6 +1838,7 @@ export function loadAdmissionDecision({
   const l = load1 == null ? NaN : Number(load1);
   const c = cores == null ? NaN : Number(cores);
   const perCore = (Number.isFinite(l) && Number.isFinite(c) && c > 0) ? l / c : null;
+  const pressure = decideMemoryPressure({ pressureLevel: pLevel, minPressureLevel, freePct, swapGrowthMb, warnMinFreePct, warnSwapGrowthMb });
   const base = {
     idlePct, minIdlePct,
     pressureLevel: Number.isFinite(pLevel) ? pLevel : null,
@@ -1799,12 +1846,14 @@ export function loadAdmissionDecision({
     load1: Number.isFinite(l) ? l : null,
     cores: (Number.isFinite(c) && c > 0) ? c : null,
     perCore, backstopPerCore,
+    freePct: pressure.freePct, swapGrowthMb: pressure.swapGrowthMb,
+    warnMinFreePct: pressure.warnMinFreePct, warnSwapGrowthMb: pressure.warnSwapGrowthMb,
   };
   if (idlePct != null && idlePct < minIdlePct) {
     return { held: true, ...base, reason: `cpu idle ${Math.floor(idlePct)}% (<${minIdlePct}%)` };
   }
-  if (Number.isFinite(pLevel) && pLevel >= minPressureLevel) {
-    return { held: true, ...base, reason: `mem pressure ${pLevel} (>=${minPressureLevel})` };
+  if (pressure.held) {
+    return { held: true, ...base, reason: pressure.reason };
   }
   if (perCore != null && perCore > backstopPerCore) {
     return { held: true, ...base, reason: `load1 ${l.toFixed(2)}/${c} cores (${perCore.toFixed(2)} > backstop ${backstopPerCore})` };
@@ -1826,7 +1875,7 @@ export function loadAdmissionDecision({
  *
  * `load1` is ALSO the MEDIAN over the same `window`, never a single instantaneous sample — deliberately, not an
  * oversight (#4343 review finding): the card's own evidence is that the fork-storm daemons this fix targets
- * push `load1` into the 20s–60s range on a 12-core host, i.e. up to ~5/core — ABOVE the new backstop's default
+ * push `load1` into the 20s–60s range on the host, i.e. up to ~5/core — ABOVE the new backstop's default
  * ratio (4) — so an unwindowed backstop reading could still spuriously hold on the exact burst this card exists
  * to stop admitting on, even while idle%/pressure are comfortable. Medianing it exactly like idle% closes that
  * gap: a brief fork-storm spike is absorbed, a SUSTAINED runaway (the #xupukxa cascade this backstop exists to
@@ -1837,7 +1886,7 @@ export function loadAdmissionDecision({
  * never a read error. `root` defaults to the REAL shared telemetry root ({@link resolveHostRoot}) but is
  * overridable, same "injectable seam, real default" shape `readHostToday` itself already has.
  * @param {{root?:string, now?:Date, window?:number}} [o]
- * @returns {{idlePctSamples:number[], pressureLevel:number|null, load1:number|null, cores:number|null}}
+ * @returns {{idlePctSamples:number[], pressureLevel:number|null, load1:number|null, cores:number|null, freePct:number|null, swapGrowthMb:number|null}}
  */
 export function readLatestLoad({ root = resolveHostRoot(), now = new Date(), window = DEFAULT_LOAD_ADMISSION_WINDOW } = {}) {
   const dayKey = utcDayKey(now);
@@ -1863,11 +1912,25 @@ export function readLatestLoad({ root = resolveHostRoot(), now = new Date(), win
   const load1Samples = lastByWindow(extractSamplesByName(records, 'host.cpu.load1'))
     .map((s) => Number(s.value))
     .filter(Number.isFinite);
+  const memorySamples = (name) => lastByWindow(extractSamplesByName(records, `host.mem.${name}`)
+    .filter(s => Number.isFinite(Date.parse(s.timestamp)))
+    .map(s => ({ ...s, value: s.value == null ? NaN : Number(s.value) })));
+  const latestMemory = (name) => {
+    const value = latestValue(memorySamples(name));
+    return Number.isFinite(value) && value >= 0 ? value : null;
+  };
+  const available = latestMemory('available_bytes') ?? latestMemory('free_bytes');
+  const total = latestMemory('total_bytes');
+  const swap = memorySamples('swap_used_bytes');
+  const firstSwap = swap[0]?.value; const lastSwap = swap.at(-1)?.value;
   return {
     idlePctSamples,
     pressureLevel: latestValue(extractSamplesByName(records, 'host.mem.pressure_level')),
     load1: load1Samples.length ? median(load1Samples) : null,
     cores: latestValue(extractSamplesByName(records, 'host.cpu.count')),
+    freePct: Number.isFinite(available) && available >= 0 && Number.isFinite(total) && total > 0 ? available / total * 100 : null,
+    swapGrowthMb: swap.length >= 2 && Number.isFinite(firstSwap) && firstSwap >= 0 && Number.isFinite(lastSwap) && lastSwap >= 0
+      ? (lastSwap - firstSwap) / (1024 * 1024) : null,
   };
 }
 
@@ -1887,12 +1950,20 @@ export function readLatestLoad({ root = resolveHostRoot(), now = new Date(), win
  * @param {{env?:NodeJS.ProcessEnv, minIdlePct?:number, minPressureLevel?:number, backstopPerCore?:number, window?:number, root?:string, now?:Date, kind?:string, shadow?:Function}} [o]
  * @returns {{held:boolean, idlePct:number|null, minIdlePct:number, pressureLevel:number|null, minPressureLevel:number, load1:number|null, cores:number|null, perCore:number|null, backstopPerCore:number, reason?:string, bypassed?:string}}
  */
-export function resolveLoadAdmission({ env = process.env, minIdlePct, minPressureLevel, backstopPerCore, window, root, now = new Date(), kind = 'build', shadow = shadowAdmission, mode, admitFn } = {}) {
+export function resolveLoadAdmission({ env = process.env, minIdlePct, minPressureLevel, backstopPerCore, warnMinFreePct, warnSwapGrowthMb, window, root, now = new Date(), kind = 'build', shadow = shadowAdmission, mode, admitFn } = {}) {
   const effectiveEnv = { ...env };
   if (minIdlePct !== undefined) effectiveEnv[LOAD_ADMISSION_MIN_IDLE_PCT_ENV] = String(minIdlePct);
   if (minPressureLevel !== undefined) effectiveEnv[LOAD_ADMISSION_MIN_PRESSURE_LEVEL_ENV] = String(minPressureLevel);
   if (backstopPerCore !== undefined) effectiveEnv[LOAD_ADMISSION_BACKSTOP_PER_CORE_ENV] = String(backstopPerCore);
   if (window !== undefined) effectiveEnv[LOAD_ADMISSION_WINDOW_ENV] = String(window);
+  // Environment is the operator's settings layer; function parameters can only tighten its resolved policy.
+  const pressureSettings = loadMemoryPressureSettings({ env });
+  for (const [leaf, value] of Object.entries({ warnMinFreePct, warnSwapGrowthMb })) {
+    if (ADMISSION_VALID[leaf](value) && tightensWarn(leaf, value, pressureSettings[leaf])) {
+      pressureSettings[leaf] = value;
+      effectiveEnv[ADMISSION_ENV[leaf]] = String(value);
+    }
+  }
   const minIdle = resolveLoadAdmissionMinIdlePct(effectiveEnv);
   const minPressure = resolveLoadAdmissionMinPressureLevel(effectiveEnv);
   const backstop = resolveLoadAdmissionBackstopPerCore(effectiveEnv);
@@ -1900,22 +1971,23 @@ export function resolveLoadAdmission({ env = process.env, minIdlePct, minPressur
   const bypassed = (reason) => ({
     held: false, idlePct: null, minIdlePct: minIdle, pressureLevel: null, minPressureLevel: minPressure,
     load1: null, cores: null, perCore: null, backstopPerCore: backstop, bypassed: reason,
+    freePct: null, swapGrowthMb: null, ...pressureSettings,
   });
   // The off/CI escape hatches read the REAL env only — never `effectiveEnv` — so a caller cannot accidentally
   // arm/disarm them by passing a knob param; those two switches have their own dedicated params were one ever
   // needed, deliberately not folded into this generic override list.
   if (isLoadAdmissionOff(env)) return bypassed('off');
   if (/^(?:true|1)$/i.test(String(env.CI || ''))) return bypassed('ci');
-  const { idlePctSamples, pressureLevel, load1, cores } = readLatestLoad(root != null ? { root, now, window: win } : { now, window: win });
-  const decision = loadAdmissionDecision({ idlePctSamples, pressureLevel, load1, cores, minIdlePct: minIdle, minPressureLevel: minPressure, backstopPerCore: backstop });
+  const samples = readLatestLoad(root != null ? { root, now, window: win } : { now, window: win });
+  const decision = loadAdmissionDecision({ ...samples, ...pressureSettings, minIdlePct: minIdle, minPressureLevel: minPressure, backstopPerCore: backstop });
   // x6nuodj (slice 3): the shared decision for `kind` DECIDES (`resourceGate.cutover` enforce, the default); the
   // telemetry rule above is the logged comparison. `shadow` mode keeps it deciding. Stale/missing snapshot = admit()'s
   // own rule (hold a heavy kind). The JSON contract keeps every field; `resourceAdmission` names what decided.
   let cutoverMode = mode;
   if (cutoverMode === undefined) { try { cutoverMode = loadResourceGateSettings({ env }).settings.cutover; } catch { cutoverMode = 'enforce'; } }
   const legacy = { admit: !decision.held, ...(decision.held ? { why: decision.reason } : { note: `admitted (idle ${decision.idlePct}%, load1 ${decision.load1})` }) };
-  const cut = cutoverDecision({ gate: 'heavy-admission.load-status', kind, legacy, mode: cutoverMode, env, nowMs: now.getTime(),
-    shadow: (args) => shadow({ gate: args.gate, kind: args.kind, oldVerdict: args.oldVerdict, oldReason: args.oldReason, env }),
+  const cut = cutoverDecision({ gate: 'heavy-admission.load-status', kind, legacy, mode: cutoverMode, env: effectiveEnv, nowMs: now.getTime(),
+    shadow: (args) => shadow({ gate: args.gate, kind: args.kind, oldVerdict: args.oldVerdict, oldReason: args.oldReason, env: effectiveEnv }),
     ...(admitFn ? { admitFn } : {}) });
   // R559: a gate-error refusal (no shared decision could be had in enforce mode) is decidedBy 'legacy' but must still
   // hold — never fall back to the telemetry rule's `held:false` (e.g. no-sample).
@@ -2649,6 +2721,21 @@ export const HOLD_SESSION_ENV = 'WE_HEAVY_SESSION';
 export const HOLD_DISPATCH_KIND_ENV = 'WE_HEAVY_DISPATCH_KIND';
 export const HOLD_RUN_ID_ENV = 'WE_HEAVY_RUN_ID';
 
+/**
+ * The advisory trace tags a remote slot marker carries (caller, lane, PR). `markerContent` drops any tag the marker
+ * reader would reject, so a boundary value here (ppid 0, an empty or overlong session) can never make a marker unreadable.
+ */
+export function buildMarkerTags({kind, env, lease, argv = [], ppid = process.ppid}) {
+  const cleanTag = value => typeof value === 'string' && value.trim() && !/[\x00-\x1f\x7f]/.test(value) ? value.trim().slice(0, 200) : undefined;
+  const session = cleanTag(env?.[HOLD_SESSION_ENV]) ?? cleanTag(lease?.session);
+  const cmd = basename(String(argv[0] ?? '').trim().split(/\s+/)[0]).replace(/[\x00-\x1f\x7f\\]/g, '').slice(0, 40);
+  const lane = Number.isSafeInteger(lease?.lane) && lease.lane >= 0 ? lease.lane : cleanTag(lease?.lane);
+  const prValue = lease?.pr ?? lease?.prNumber ?? env?.WE_PR_NUMBER ?? env?.PR_NUMBER;
+  const pr = /^[1-9]\d*$/.test(String(prValue ?? '')) && Number.isSafeInteger(Number(prValue)) ? Number(prValue) : undefined;
+  return {caller: {...(kind ? {kind} : {}), ...(session ? {session} : {}), ppid, ...(cmd ? {cmd} : {})},
+    ...(lane !== undefined ? {lane} : {}), ...(pr !== undefined ? {pr} : {})};
+}
+
 const clipIdentity = (v) => { const s = String(v ?? '').trim(); return s ? s.slice(0, 200) : null; };
 
 /** `{session, dispatchKind, leaseAcquiredAt}` from a lane lease, each omitted when absent. Pure. */
@@ -3238,6 +3325,10 @@ export async function main(argv, { remoteExec, readTelemetry } = {}) {
     // Preflight may have chosen remote before policy/load changed or admission was bypassed.
     // Every local completion of that handoff still needs evidence of the first local verdict.
     let reportLocalExecution = forgeGate;
+    // R830/R823: every local run records WHY it is local. A remote-routed decision that fell back already logged its
+    // own reason; every other local path (decided local, --local, container, bypass) is logged below.
+    let remoteDecided = false;
+    let localDecisionReason = null;
     if (!useContainer && !forceLocal && ((!bypass && !process.env[ADMISSION_HELD_ENV]) || (bypass==='held' && forgeGate && !isAdmissionOff(process.env) && !/^(true|1)$/i.test(process.env.CI??'')))) {
       const requested=argv.slice(dashDashIdx+1);
       // package.json wraps the underlying executable, so reconstruct only the
@@ -3255,12 +3346,14 @@ export async function main(argv, { remoteExec, readTelemetry } = {}) {
       const result = await runWithRemoteDecision({
         argv: remoteArgv, policy, cwd: repo ?? process.cwd(),
         env: process.env, remoteExec, readTelemetry, lockRoot, remoteClientOverride,
-        onDecision: decision => { reportLocalExecution ||= decision.remote; },
+        onDecision: decision => { reportLocalExecution ||= decision.remote; remoteDecided = decision.remote; localDecisionReason = decision.reason; },
         timeoutMs: runCeilingMs > 0 ? runCeilingMs : classifyAdmissionCommandKind(command, process.env) === 'files' ? resolveFastRunTimeoutMs(process.env) : ceilingMs,
       });
       if (result.handled) {
         if (result.remoteResult?.mode === 'remote') recordRemoteRun({ lockRoot, ms: Date.now() - remoteStartedAt, kind: classifyAdmissionCommandKind(command, process.env),
           receiptId: result.remoteResult.receiptId ?? result.remoteResult.run });
+        if (result.remoteResult?.mode === 'remote') recordRemoteUsage({ lockRoot, argv: remoteArgv,
+          ...result.remoteResult, kind: classifyAdmissionCommandKind(command, process.env) });
         if (result.remoteResult?.mode === 'remote') appendVerifyRemoteReport(process.env, {
           location: 'remote', receiptId: result.remoteResult.receiptId ?? result.remoteResult.run, exitCode: result.exitCode,
         });
@@ -3293,6 +3386,8 @@ export async function main(argv, { remoteExec, readTelemetry } = {}) {
     }
     const runOpts = { lockRoot, cap, owner, policy, lane: lane ?? (/lane-(\d+)/.exec(repo) || [])[1] ?? null, num, repo, ceilingMs, command, cwd: repo, bypass, kind: typeof flags.kind === 'string' ? flags.kind : null, waitMs, waitSource, runCeilingMs, ...(forceLocal ? { location: 'local' } : {}) };
     if (useContainer) runOpts.exec = (cmd, o) => execContainerized(cmd, { ...o, nodeModulesVolume: useNodeModulesVolume });
+    // A bypass (CI pass-through, held re-entry, admission off) takes no slot and records no duration, so it needs no reason.
+    if (!remoteDecided && !bypass) recordLocalReason({ lockRoot, reason: localReasonFor({ useContainer, forceLocal, bypass, decisionReason: localDecisionReason }), detail: localDecisionReason, cwd: repo ?? process.cwd(), argv: argv.slice(dashDashIdx + 1), env: process.env, clock: Date.now });
     const { exitCode } = await runUnderAdmission(runOpts);
     if (reportLocalExecution) appendVerifyRemoteReport(process.env, { location: 'local-fallback', exitCode });
     process.exit(exitCode);

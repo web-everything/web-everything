@@ -8,8 +8,42 @@ const IO_OPTIONS = { encoding: 'utf8', maxBuffer: 8 * 1024 * 1024 };
 // Restoration evidence is compared against itself before a write: a memoized read would let a cached
 // body pass the pre-write check and overwrite an intervening edit. Every GitHub call here is live.
 const live = (exec) => createMqLiveReader(exec);
-const refusal = (reason) => ({ action: 'refuse', reason });
+const refusal = (reason, evidence) => ({ action: 'refuse', reason, ...evidence });
+const excerpt = (value) => String(value ?? '').replace(/[\p{Cc}\p{Cf}\u2028\u2029]/gu, '').slice(0, 120);
+const contentEvidence = (edit, offender) => ({
+  contentRefusal: true,
+  snapshotId: edit ? excerpt(`${edit.createdAt} by ${edit.editor?.login}`) : 'live body (no edit snapshot)',
+  offender: excerpt(offender),
+});
+const markerLine = (text) => text.split(/\r\n|[\r\n]/).find(line => line.includes('authored-by-actor:'));
+const htmlOffender = (text) => text.split(/\r\n|[\r\n]/).find(line => /[\[\]]/.test(line) && line.includes('`'))
+  ?? text.match(/<\/?[a-z][^>]*>|<[!?][^>]*(?:>|$)/i)?.[0];
 const safe = (value) => String(value).replace(/[\x00-\x1f\x7f-\x9f\u2028\u2029]/g, ' ');
+
+// Allowlist, not a Markdown parser: the only text treated as plain is a bare placeholder token
+// (<name>: no attributes, slash or other characters) inside a balanced single-line inline code span.
+// The token is removed; every other character, including other tag-like text in the span, stays visible
+// to the HTML refusal. Escaped or unmatched backticks are ambiguous; a snapshot with link/reference brackets
+// anywhere gets no exemption at all (see planStampRestore).
+function outsideInlineCode(line) {
+  if (!line.includes('`')) return line;
+  if (line.includes('\\`')) return undefined;
+  let delimiter;
+  let start = 0;
+  let plain = '';
+  for (const run of line.matchAll(/`+/g)) {
+    if (!delimiter) {
+      plain += line.slice(start, run.index);
+      delimiter = run[0];
+      start = run.index + run[0].length;
+    } else if (run[0] === delimiter) {
+      plain += line.slice(start, run.index).replace(/<[a-z][a-z0-9_-]*>/g, ' ') + ' ';
+      start = run.index + run[0].length;
+      delimiter = undefined;
+    }
+  }
+  return delimiter ? undefined : plain + line.slice(start);
+}
 
 /** One bounded request. Truncation is not agreement: operators must investigate the full history. */
 export function readAuthorStampEdits(pr, { repo, exec = execFileSyncThrottled } = {}) {
@@ -35,7 +69,7 @@ export function planStampRestore({ state, body, authorLogin, edits } = {}) {
   if (readAuthorActorStamps(body).length || hasStampLostMarker(body)) {
     return { action: 'skip', reason: 'live body already carries a stamp or stamp-lost marker' };
   }
-  if (body.includes('authored-by-actor:')) return refusal('malformed live stamp; inspect the live body');
+  if (body.includes('authored-by-actor:')) return refusal('malformed live stamp; inspect the live body', contentEvidence(null, markerLine(body)));
   if (state === 'CLOSED' || state === 'MERGED') return { action: 'skip', reason: 'PR is not open' };
   if (state !== 'OPEN') return refusal('unreadable PR state');
   if (typeof authorLogin !== 'string' || !authorLogin.trim()) return refusal('missing PR author login');
@@ -48,6 +82,8 @@ export function planStampRestore({ state, body, authorLogin, edits } = {}) {
   const ids = new Set();
   let oldest;
   let oldestMarker;
+  let conflictEvidence;
+  let firstStampEvidence;
   for (const edit of edits) {
     if (typeof edit?.diff !== 'string' || !['Bot', 'User'].includes(edit.editor?.__typename)
       || typeof edit.editor?.login !== 'string'
@@ -57,20 +93,35 @@ export function planStampRestore({ state, body, authorLogin, edits } = {}) {
     // Accept only unambiguous plain bodies: delta text cannot prove marker authorship.
     // Any ambiguous snapshot invalidates the entire history, even when ids agree.
     if (/^@@ .* @@/m.test(edit.diff) || /\[-|-\]|\{\+|\+\}/.test(edit.diff)) {
-      return refusal('unsupported delta edit snapshot; inspect complete GitHub history manually');
-    }
-    if (/<\/?[a-z][^>]*>/i.test(edit.diff)) {
-      return refusal('unsupported HTML edit snapshot; inspect complete GitHub history manually');
+      return refusal('unsupported delta edit snapshot; inspect complete GitHub history manually',
+        contentEvidence(edit, edit.diff.match(/^@@ .* @@.*$/m)?.[0] ?? edit.diff.split(/\r\n|[\r\n]/).find(line => /\[-|-\]|\{\+|\+\}/.test(line))));
     }
     const markers = [];
+    const htmlLines = [];
+    let ambiguousTicks = false;
+    // Brackets can make a backticked span part of a link target or text across lines: no exemption.
+    const bracketed = /[\[\]]/.test(edit.diff);
     let fence;
     for (const line of edit.diff.split(/\r\n|[\r\n]/)) {
       const delimiter = line.match(/^[ \t]{0,3}(`{3,}|~{3,})(.*)$/);
+      // Never let a multiline comment hide a later standalone stamp. Fenced tags
+      // remain unsupported; only balanced, single-line inline code is exempt.
+      const unclosedComment = [...line.matchAll(/<!--/g)].some((opener) => line.indexOf('-->', opener.index + 4) === -1);
+      if (unclosedComment) {
+        return refusal('unsupported HTML edit snapshot; inspect complete GitHub history manually', contentEvidence(edit, htmlOffender(line)));
+      }
+      const stripped = fence || delimiter ? line : outsideInlineCode(line);
+      // One ambiguous backtick line may open a multiline span: no inline-code exemption anywhere in the snapshot.
+      if (stripped === undefined) ambiguousTicks = true;
+      // Backticks inside any HTML comment other than a bare stamp marker are not code: disable the exemption.
+      if (line.includes('<!--') && !/^<!--[ \t]*authored-by-actor:[^<>\r\n]*-->[^\S\r\n]*$/.test(line)) ambiguousTicks = true;
+      htmlLines.push(stripped ?? line);
       if (line.includes('authored-by-actor:')) {
         // A stamp is evidence only as a whole, unindented line outside code fences.
         const marker = line.match(/^(<!--[ \t]*authored-by-actor:[^<>\r\n]*-->)[^\S\r\n]*$/)?.[1];
         if (fence || !marker || marker.indexOf('authored-by-actor:', marker.indexOf('authored-by-actor:') + 1) !== -1) {
-          return refusal('malformed or non-standalone historical stamp; inspect complete GitHub history manually');
+          return refusal('malformed or non-standalone historical stamp; inspect complete GitHub history manually',
+            contentEvidence(edit, line));
         }
         markers.push(marker);
       }
@@ -79,6 +130,22 @@ export function planStampRestore({ state, body, authorLogin, edits } = {}) {
         else if (delimiter[1][0] === fence[0] && delimiter[1].length >= fence.length && !delimiter[2].trim()) fence = undefined;
       }
     }
+    // Tags can span lines and contain an apparently standalone stamp in an attribute.
+    // Preserve snapshot-wide detection after exempting only validated inline spans.
+    const noExempt = ambiguousTicks || bracketed;
+    // Raw HTML constructs (CDATA, processing instructions, declarations, comments other than a bare stamp
+    // marker) open HTML blocks where backticks are not code: refuse them outright, outside code spans too.
+    const candidate = (noExempt ? edit.diff.split(/\r\n|[\r\n]/) : htmlLines)
+      .filter((l) => !/^<!--[ \t]*authored-by-actor:[^<>\r\n]*-->[^\S\r\n]*$/.test(l)).join('\n');
+    if (/<\/?[a-z][^>]*>/i.test(noExempt ? edit.diff : htmlLines.join('\n')) || /<[!?]/.test(candidate)) {
+      return refusal('unsupported HTML edit snapshot; inspect complete GitHub history manually',
+        contentEvidence(edit, htmlOffender(candidate)));
+    }
+    // An unmatched backtick line may open a multiline code span around a marker: not evidence of authorship.
+    if (ambiguousTicks && markers.length) {
+      return refusal('malformed or non-standalone historical stamp; inspect complete GitHub history manually',
+        contentEvidence(edit, markerLine(edit.diff)));
+    }
     // GitHub lists newest first for equal timestamps: the later position is older.
     if (!oldest || Date.parse(edit.createdAt) <= Date.parse(oldest.createdAt)) {
       oldest = edit;
@@ -86,11 +153,13 @@ export function planStampRestore({ state, body, authorLogin, edits } = {}) {
     }
     for (const verbatim of markers) {
       const found = readAuthorActorStamps(verbatim);
-      if (found.length !== 1 || !found[0]) return refusal('malformed historical stamp');
+      if (found.length !== 1 || !found[0]) return refusal('malformed historical stamp', contentEvidence(edit, verbatim));
+      firstStampEvidence ??= contentEvidence(edit, verbatim);
+      if (ids.size && !ids.has(found[0]) && !conflictEvidence) conflictEvidence = contentEvidence(edit, verbatim);
       ids.add(found[0]);
     }
   }
-  if (ids.size > 1) return refusal('history has conflicting stamp ids; inspect GitHub history');
+  if (ids.size > 1) return refusal('history has conflicting stamp ids; inspect GitHub history', conflictEvidence);
   // Complete, validated history with zero stamps: no id exists to restore and none is invented. The author
   // stamp was never written, so take the existing stamp-lost path (stricter review independence), not "independent".
   if (ids.size === 0) {
@@ -98,7 +167,8 @@ export function planStampRestore({ state, body, authorLogin, edits } = {}) {
       body: `${body}\n\n${buildStampLostMarker()}\n` };
   }
   if (!oldestMarker || oldest.editor.__typename !== authorType || oldest.editor.login.toLowerCase() !== author) {
-    return refusal('no evidence the PR author supplied the stamp in the oldest snapshot; inspect GitHub history');
+    return refusal('no evidence the PR author supplied the stamp in the oldest snapshot; inspect GitHub history',
+      oldestMarker ? contentEvidence(oldest, oldestMarker) : firstStampEvidence);
   }
   return { action: 'restore', reason: 'all historical stamps agree with the oldest author-edited snapshot',
     id: [...ids][0], source: oldest, marker: oldestMarker, body: `${body}\n\n${oldestMarker}\n` };
@@ -150,7 +220,7 @@ const RETRY_MS = 5 * 60_000;
 
 export function sweepAuthorStamps({ repo, exec = execFileSyncThrottled,
   listPrs = () => JSON.parse(live(exec)('gh', ['pr', 'list', '--repo', repo, '--state', 'open', '--limit', '100',
-    '--json', 'number,body,author'], IO_OPTIONS)), now = Date.now, ...io } = {}) {
+    '--json', 'number,body,author,headRefOid'], IO_OPTIONS)), now = Date.now, ...io } = {}) {
   const time = now();
   for (const [key, entry] of refusedUntil) if (entry.until <= time) refusedUntil.delete(key);
   const prs = listPrs({ repo });
@@ -158,7 +228,7 @@ export function sweepAuthorStamps({ repo, exec = execFileSyncThrottled,
     throw new Error('unreadable or capped PR listing; narrow the repository listing or inspect remaining PRs manually');
   }
   return prs.map((pr) => {
-    const key = JSON.stringify([repo, pr?.number, pr?.body, pr?.author?.login]);
+    const key = JSON.stringify([repo, pr?.number, pr?.body, pr?.author?.login, pr?.headRefOid]);
     let result;
     if (!Number.isInteger(pr?.number) || pr.number <= 0) result = refusal('invalid listed PR number');
     else if (typeof pr.body !== 'string' || typeof pr.author?.login !== 'string' || !pr.author.login.trim()) {
@@ -171,6 +241,6 @@ export function sweepAuthorStamps({ repo, exec = execFileSyncThrottled,
       if (refusedUntil.size >= 1000) refusedUntil.delete(refusedUntil.keys().next().value);
       refusedUntil.set(key, { result, until: refusedUntil.get(key)?.until ?? time + RETRY_MS });
     }
-    return { num: pr?.number, ...result, detail: result };
+    return { num: pr?.number, headSha: pr?.headRefOid, ...result, detail: result };
   });
 }

@@ -12,6 +12,7 @@ import { spawnSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { GATE_IDS } from '../../lib/merge-gate-inventory.mjs';
 import {
   buildCiHealEscalationComment, parseCiHealEscalations, latestCiHealEscalationForHead,
   escalationStaleAgainstBase, enrichPrsWithEscalationBaseFacts, defaultReadBaseHead,
@@ -742,13 +743,15 @@ for (const method of ['execFileSync', 'spawnSync', 'execSync', 'exec', 'execFile
     appendFileSync(${JSON.stringify(log)}, JSON.stringify({ method, args: args.slice(0, 2) }) + '\\n');
     if (method === 'execFileSync' && args[0] === 'gh') {
       if (args[1][0] === 'pr' && args[1][1] === 'view') return JSON.stringify(facts);
-      if (args[1][0] === 'api' && args[1][1] === 'repos/web-everything/web-everything/actions/jobs/123') {
+      if (args[1][0] === 'api' && args[1].at(-1) === 'repos/web-everything/web-everything/actions/jobs/123') {
         if (${JSON.stringify(evidence)} === 'unreadable') return 'invalid JSON';
         return JSON.stringify({ head_sha: ${JSON.stringify(evidence === 'other-head' ? 'a'.repeat(40) : HEAD)}, completed_at: '2026-10-29T03:00:00Z' });
       }
-      if (args[1][0] === 'api' && args[1][1] === 'repos/web-everything/web-everything/actions/jobs/123/logs')
+      if (args[1][0] === 'api' && args[1].at(-1) === 'repos/web-everything/web-everything/actions/jobs/123/logs')
         return ${JSON.stringify('#6042: HOLD\n  hold review-acceptance review pending\n'
-          + (evidence === 'job-failure' ? '  fail-closed codeql security check failed\n' : '')
+          // The parser requires the whole gate inventory per table, as the real job log prints.
+          + GATE_IDS.filter(id => id !== 'review-acceptance').map(id => id === 'codeql' && evidence === 'job-failure'
+            ? '  fail-closed codeql security check failed\n' : `  pass ${id} ok\n`).join('')
           + (evidence === 'truncated' ? '' : 'merge-gate: HOLD — held\n'))};
     }
     throw new Error('unexpected child process in CLI preflight test');
@@ -788,10 +791,10 @@ syncBuiltinESMExports();
         && call.args[1][1] !== 'comment');
       expect(reads[0].args).toEqual(['gh', ['pr', 'view', '6042', '--json',
         'number,labels,headRefOid,statusCheckRollup,url', '--repo=web-everything/web-everything']]);
-      expect(reads.map(call => call.args[1].slice(0, 2))).toEqual([
+      expect(reads.map(call => call.args[1][0] === 'api' ? call.args[1] : call.args[1].slice(0, 2))).toEqual([
         ['pr', 'view'], ...(gate === 'merge-gate' && evidence !== 'conflicting-flags' ? [
           ['api', 'repos/web-everything/web-everything/actions/jobs/123'],
-          ...(evidence === 'unreadable' ? [] : [['api', 'repos/web-everything/web-everything/actions/jobs/123/logs']]),
+          ...(evidence === 'unreadable' ? [] : [['api', '--allow-escape-sequences', 'repos/web-everything/web-everything/actions/jobs/123/logs']]),
         ] : []),
       ]);
       if (['review', 'malformed', 'conflicting-flags'].includes(evidence)) expect(calls).toEqual(reads);

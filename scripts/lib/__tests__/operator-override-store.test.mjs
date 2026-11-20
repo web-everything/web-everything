@@ -43,17 +43,35 @@ beforeEach(async () => {
 afterEach(() => { vi.unstubAllEnvs(); rmSync(dir, { recursive: true, force: true }); });
 
 const ranges = [
-  ['reviewConcurrency.maxLiveReviewRounds', 1, 8],
-  ['host.maxReviewDispatchPerTick', 1, 8],
-  ['resourceGate.fixCap.floor', 1, 12],
-  ['resourceGate.fixCap.ceiling', 1, 12],
+  ['fix.conflictFixesPerPass', 0, 24],
+  ['fix.conflictFixExemptPerPass', 0, 10],
+  ['reviewConcurrency.maxLiveReviewRounds', 1, 16],
+  ['host.maxReviewDispatchPerTick', 1, 16],
+  ['resourceGate.fixCap.floor', 1, 24],
+  ['resourceGate.fixCap.ceiling', 1, 24],
   ['resourceGate.fixCap.raiseMinMemFreePct', 25, 60],
-  ['redTeamQueue.minConcurrent', 0, 12],
+  ['redTeamQueue.minConcurrent', 0, 24],
   ['deliveryCapacity.pinUnits', 1, 200],
 ];
 const EXPIRY_LEAVES = ['deliveryCapacity.pinUntil', 'deliveryCapacity.holdUntil']; // epoch-ms expiries, covered by delivery-capacity-override tests
 
 describe('capacity-only operator store', () => {
+  it('accepts a fix ceiling raise to 16 and still allows lowering to 1', () => {
+    const key = 'resourceGate.fixCap.ceiling';
+    write(6, { key });
+    write(16, { key });
+    expect(store.readOperatorOverrides({ file }).values[key]).toBe(16);
+    write(1, { key });
+    expect(store.readOperatorOverrides({ file }).values[key]).toBe(1);
+  });
+  it('refuses a fix ceiling above 24 before writing', () => {
+    expect(() => write(25, { key: 'resourceGate.fixCap.ceiling' })).toThrow(/outside hard range/);
+    expect(io.events).toEqual([]);
+  });
+  it.each(['resourceGate.hardFloor.memFreePct', 'unknown.capacity'])('still refuses guard or unknown leaf %s', key => {
+    expect(() => write(1, { key })).toThrow(/guard leaves need the signed-attestation slice/);
+    expect(io.events).toEqual([]);
+  });
   it('exports exactly the closed capacity allowlist', () => {
     expect(Object.keys(store.CAPACITY_LEAVES).sort()).toEqual([...ranges.map(([k]) => k), ...EXPIRY_LEAVES].sort());
   });
@@ -107,7 +125,7 @@ describe('capacity-only operator store', () => {
   });
   it('drops each unknown, wrong-type and out-of-range key while preserving valid siblings', () => {
     writeFileSync(file, JSON.stringify({ [key]: 4, 'host.maxReviewDispatchPerTick': '3',
-      'redTeamQueue.minConcurrent': 13, 'mergeQueue.refreshOnStaleMergeGate': false }));
+      'redTeamQueue.minConcurrent': 25, 'mergeQueue.refreshOnStaleMergeGate': false }));
     const log = vi.fn();
     expect(store.readOperatorOverrides({ file, log }).values[key]).toBe(4);
     for (const ignored of ['host.maxReviewDispatchPerTick', 'redTeamQueue.minConcurrent', 'mergeQueue.refreshOnStaleMergeGate']) {

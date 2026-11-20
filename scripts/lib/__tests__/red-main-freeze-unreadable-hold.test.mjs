@@ -25,10 +25,36 @@ describe('unreadable freeze is its own hold', () => {
     expect(d.hold).toBe(true);
     expect(d.reason).toMatch(/freeze-unreadable/);
     expect(d.reason).not.toMatch(/main is red/);
+    expect(d.reason).toContain('freeze unreadable');
+    expect(d.reason).not.toContain('red-main');
     expect(redMainHoldReason(sig)).toMatch(/NOT known red/);
   });
   it('still holds other repos (fail closed)', () => {
     expect(decideRedMainHold({ num: 1, isLocal: false, signal: sig }).hold).toBe(true);
+  });
+  it.each([null, { red: false, expiresAt: 100 }, { red: true, expiresAt: 1 }])('priority cannot label unreadable freeze as red with main state %j', mainRedState => {
+    for (const holdOn of [true, false]) {
+      const signal = drainFreezeSignal({ state, mainRedState, priority: { repo: 'we', pr: 7, expiresAt: 100 }, now: 1, holdOn });
+      expect(signal.red).toBe(true);
+      expect(signal.sources).toEqual(['freeze-unreadable']);
+      expect(signal.fixPrs).toEqual([]);
+      for (const isLocal of [true, false]) {
+        const decision = decideRedMainHold({ num: 7, isLocal, signal });
+        expect(decision.hold).toBe(true);
+        expect(decision.reason).toMatch(/^freeze-unreadable-hold: freeze unreadable/);
+        expect(decision.reason).not.toContain('red-main');
+      }
+    }
+  });
+  it('genuine red main keeps red text while unreadable freeze holds every repo and the fix', () => {
+    const signal = drainFreezeSignal({ state, mainRedState: { red: true, expiresAt: 100 }, priority: { repo: 'we', pr: 7, expiresAt: 100 }, now: 1 });
+    expect(signal.sources).toEqual(['published', 'freeze-unreadable']);
+    expect(signal.fixPrs).toEqual([]);
+    for (const isLocal of [true, false]) {
+      const decision = decideRedMainHold({ num: 7, isLocal, signal });
+      expect(decision.hold).toBe(true);
+      expect(decision.reason).toMatch(/^red-main-hold: main is red/);
+    }
   });
   it('a real manual freeze keeps the manual source', () => {
     const s = evaluateDrainFreeze({ local: { reason: 'x', at: 'y' }, shared: { error: 'e' }, settings });

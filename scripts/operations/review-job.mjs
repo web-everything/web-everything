@@ -89,7 +89,7 @@ import { spawn, spawnSync } from 'node:child_process';
 import { heapCapArgs } from '../lib/node-heap-cap.mjs';
 import { execRead, READ_MAX_BUFFER } from '../lib/proc-read.mjs';
 import { execFileSyncThrottled } from '../lib/gh-throttle.mjs';
-import { laneGitHardeningEnv } from '../lib/lane-git-hardening.mjs';
+import { laneGitHardeningEnv, laneHistoryProofEnv, scrubGitRepoEnv, scrubRiskyLaneConfig } from '../lib/lane-git-hardening.mjs';
 import { readCompletePrComments } from '../conveyor/pr-comments-complete.mjs';
 import { contributionPatchId, findCarriableVerdict, decideRebaseVerdictCarry, buildVerdictCarriedMarker, resolveCarryAcrossRebase } from '../lib/rebase-verdict-carry.mjs';
 import { isPublishableRedTeamResult, liveResultGateState, parseRedTeamComment, readRedTeamProbes, redTeamForHead, redTeamGateMarker, redTeamMarker, redTeamResultId } from '../lib/red-team-gate.mjs';
@@ -103,18 +103,19 @@ import { RED_TEAM_STATUS_LABEL_META } from '../lib/red-team-status-label-meta.mj
 import { publishAttention } from './needs-you-feed.mjs';
 
 import { randomUUID } from 'node:crypto';
-import { closeSync, existsSync, mkdirSync, openSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
-import { homedir, hostname } from 'node:os';
-import { basename, join, resolve } from 'node:path';
+import { closeSync, existsSync, mkdirSync, mkdtempSync, openSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { homedir, hostname, tmpdir } from 'node:os';
+import { basename, dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import { assertNotALaneCheckout, REPO_ROOT, resolveGhShimSettingsEnv } from './dispatch-lane-io.mjs';
 import {
-  decideJobClaim, jobLogPath, pidAlive, readJobRecord, removeJobRecord, reviewJobsDir, writeJobRecord,
+  decideJobClaim, diagnosticPath, jobLogPath, pidAlive, readJobRecord, removeJobRecord, reviewJobsDir, writeJobRecord,
 } from './review-job-store.mjs';
 import { assertMainNotStale, dispatchReview, isReviewCodePath, planReviewDispatch } from './review-dispatch.mjs';
 import { runReport } from './completion-cli.mjs';
 import { writeReviewJobDone, writeReviewJobStarted } from './review-job-envelope.mjs';
+import { reviewSeatLaunchEnv } from '../lib/review-seat-caps.mjs';
 import { workerWrapperEnabledFor } from './worker-wrapper-launch.mjs';
 import { tryReadCompletion } from './completion-store.mjs';
 import { rateAndRecordReviewJob } from '../conveyor/run-rating.mjs';
@@ -310,16 +311,116 @@ export function execReadRaw(file, args, options = {}) {
   return execFileSyncThrottled(file, args, { ...options, maxBuffer: options.maxBuffer ?? READ_MAX_BUFFER });
 }
 
+/** An `owner/name` GitHub slug. A `.` or `..` segment is no GitHub name and would walk a `gh api repos/<slug>` path. */
+const isGithubSlug = slug => /^[\w.-]+\/[\w.-]+$/.test(slug ?? '') && !slug.split('/').some(part => /^\.+$/.test(part));
+
+/** Fetch outside the lane's config boundary, then hand only verified objects to the lane. */
+function fetchPinnedPrHead({ lanePath, repo, pr, head, headChangedError, env, exec, readConfig, spawnPack, log, repoIds }) {
+  if (!isGithubSlug(repo)) throw Error('invalid review repository; inspect repo argument before retrying');
+  const options = { cwd: lanePath, env, timeout: 180_000, maxBuffer: 1024 * 1024 };
+  const configDir = mkdtempSync(join(tmpdir(), 'review-git-config-'));
+  try {
+    const emptyConfig = join(configDir, 'empty');
+    writeFileSync(emptyConfig, '', { mode: 0o600 });
+    // One environment for every lane Git call: no inherited config sources or indexed overrides.
+    const gitOptions = { ...options, env: laneGitHardeningEnv({ ...scrubGitRepoEnv(env),
+      GIT_CONFIG_GLOBAL: emptyConfig, GIT_CONFIG_SYSTEM: emptyConfig, GIT_CONFIG_NOSYSTEM: '1' }) };
+    // Object checking pins do not override per-message severities or skip lists.
+    // Check before scrubbing can remove include directives and hide prohibited settings.
+    const fsckConfig = readConfig('git', ['config', '--includes', '--name-only', '--get-regexp',
+      '^(fetch|transfer|receive)\\.fsck\\.|^fsck\\.'], {
+      cwd: lanePath, env: gitOptions.env, encoding: 'utf8', timeout: 30_000, maxBuffer: 1024 * 1024,
+    });
+    if (fsckConfig.error || fsckConfig.signal || fsckConfig.status !== 1
+      || fsckConfig.stdout !== '' || fsckConfig.stderr !== '') {
+      throw Error('review lane config scrub failed; inspect and repair lane configuration before retrying');
+    }
+    const { kept } = scrubRiskyLaneConfig(lanePath, { log, run: (args, opts) => exec('git', args,
+      { ...gitOptions, ...opts }) });
+    // Only these exact origin keys are intentionally retained by the scrubber. Everything else
+    // reports a failed read/removal, including failures that leave transport URL rewrites active.
+    if (kept.some(key => !/^remote\.origin\.(?:url|pushurl|proxy|receivepack|uploadpack|vcs)$/i.test(key))) {
+      throw Error('review lane config scrub failed; inspect and repair lane configuration before retrying');
+    }
+    const origin = exec('git', ['remote', 'get-url', 'origin'], gitOptions).trim();
+    // Only GitHub's own ports name github.com: 22 for ssh, 443 for https, 22 or 443 for ssh.github.com (as
+    // drain-api-reads' origin parser does). The origin is identity evidence only: the fetch below uses a fixed URL.
+    // An https login part is RFC 3986 userinfo characters only: `#`, `?`, `\` or whitespace would end the real host
+    // before `@github.com` (`https://evil.example#@github.com/o/r` is evil.example).
+    const originRepo = /^(?:git@github\.com:|ssh:\/\/git@github\.com(?::22)?\/|ssh:\/\/git@ssh\.github\.com(?::22|:443)?\/|https:\/\/(?:[\w.~%!$&'()*+,;=:-]+@)?github\.com(?::443)?\/)([^/]+\/[^/]+?)(?:\.git)?\/?$/i.exec(origin)?.[1];
+    const identityError = 'review lane origin repository mismatch or unreadable; inspect lane before retrying';
+    if (!isGithubSlug(originRepo)) throw Error(identityError);
+    if (originRepo.toLowerCase() !== repo.toLowerCase()) {
+      const resolveId = slug => {
+        const key = slug.toLowerCase();
+        if (repoIds.has(key)) return repoIds.get(key);
+        const output = exec('gh', ['api', `repos/${slug}`, '--jq', '.id'], gitOptions).trim();
+        const id = Number(output);
+        if (!/^\d+$/.test(output) || !Number.isSafeInteger(id) || id <= 0) throw Error(identityError);
+        repoIds.set(key, id);
+        return id;
+      };
+      try {
+        const originId = resolveId(originRepo), expectedId = resolveId(repo);
+        if (originId !== expectedId) throw Error(identityError);
+      } catch { throw Error(identityError); }
+    }
+    const iso = join(configDir, 'iso.git');
+    // An empty template and no inherited template dir: a hostile template must never seed iso.git/config.
+    const { GIT_TEMPLATE_DIR: _template, ...isolatedEnv } = gitOptions.env;
+    exec('git', ['init', '--bare', '--quiet', '--template=', iso], { ...gitOptions, env: isolatedEnv, cwd: configDir });
+    const isoOptions = { ...gitOptions, env: isolatedEnv, cwd: iso };
+    const pins = ['-c', 'protocol.allow=never', '-c', 'protocol.ssh.allow=always', '-c', 'protocol.ext.allow=never', '-c', 'submodule.recurse=false', '-c', 'gc.auto=0',
+      '-c', 'maintenance.auto=false', '-c', 'fetch.fsckObjects=true', '-c', 'transfer.fsckObjects=true',
+      '-c', 'core.sshCommand=ssh', '-c', 'ssh.variant=ssh'];
+    // No network command sees the lane as cwd or git-dir. Its config cannot redirect this URL.
+    exec('git', [...pins, 'fetch', '--no-recurse-submodules', '--no-auto-gc', '--no-auto-maintenance', '--upload-pack=git-upload-pack',
+      '--no-tags', `git@github.com:${repo}.git`, `refs/pull/${pr}/head`], isoOptions);
+    const fetched = exec('git', ['rev-parse', 'FETCH_HEAD^{commit}'], isoOptions).trim();
+    if (!/^[a-f0-9]{40}$/i.test(fetched)) throw Error('pinned review commit unavailable');
+    if (fetched !== head) throw Error(headChangedError);
+    const packOptions = { ...isoOptions, encoding: null, maxBuffer: 1024 ** 3 };
+    const checkedSpawn = (args, options) => {
+      const result = spawnPack('git', args, options);
+      if (result.error || result.signal || result.status !== 0 || !Buffer.isBuffer(result.stdout)) {
+        throw Error('pinned review commit unavailable; object handoff failed; inspect lane and retry shared setup', { cause: result.error });
+      }
+      return result.stdout;
+    };
+    const pack = checkedSpawn([...pins, 'pack-objects', '--revs', '--stdout'], {
+      ...packOptions, input: `${fetched}\n`,
+    });
+    checkedSpawn([...pins, 'index-pack', '--stdin', '--strict'], {
+      ...packOptions, cwd: lanePath, input: pack,
+    });
+    // A lane loose object can shadow the genuine object just imported in the pack.
+    // Compare against the independently fetched commit, including its exact bytes.
+    try {
+      const tree = exec('git', ['rev-parse', `${fetched}^{tree}`], isoOptions).trim();
+      const laneTree = exec('git', ['rev-parse', `${fetched}^{tree}`], gitOptions).trim();
+      const commit = checkedSpawn([...pins, 'cat-file', 'commit', fetched], packOptions);
+      const laneCommit = checkedSpawn([...pins, 'cat-file', 'commit', fetched], { ...packOptions, cwd: lanePath });
+      if (!/^[a-f0-9]{40}$/i.test(tree) || tree !== laneTree || !commit.equals(laneCommit)) {
+        throw Error('commit content mismatch');
+      }
+    } catch (cause) {
+      throw Error('pinned review commit unavailable; inspect lane and retry shared setup', { cause });
+    }
+    return fetched;
+  } finally { rmSync(configDir, { recursive: true, force: true }); }
+}
+
 /** The real effects, each one command. `root` is the checkout the arc runs from (the daemon's clone). */
-export function createReviewJobIo({ root = REPO_ROOT, env = process.env, dir = reviewJobsDir(env, root), readFile = readFileSync, exec = execReadRaw, readStatus = readRedTeamStatus, writeStatus = recordRedTeamStatus, readEvidence = readDrainRedTeamEvidence,
+export function createReviewJobIo({ root = REPO_ROOT, env = process.env, dir = reviewJobsDir(env, root), readFile = readFileSync, exec = execReadRaw, readConfig = spawnSync, spawnPack = spawnSync, readStatus = readRedTeamStatus, writeStatus = recordRedTeamStatus, readEvidence = readDrainRedTeamEvidence,
   readSeatRecords = () => createRedTeamIo({ root, env }).readRecords({ strict: true }),
   readWitness = key => readRecoveryWitness({ ...key, env, readScorecards: readSeatRecords }), recoveryProbe = defaultRecoveryProbe(),
   queueBaseline = () => resolveLiveQueueBaseline({ checkoutRoot: root, env }),
-  seatAvailable = provider => createRedTeamIo({ root, env }).cliAvailable(provider),
+  seatAvailable = provider => createRedTeamIo({ root, env }).cliAvailable(provider), spawnSpeculative = spawn,
   log = line => writeLineSync(2, `[${new Date().toISOString()}] ${line}`),
 } = {}) {
   // Keep rollback authority in this process; the runner's admission file is untrusted.
   const recoveryAdmissions = new Map();
+  const repoIds = new Map();
   const restoreAdmission = ({ repo, pr, head }) => {
     const path = join(redTeamStatusDir(env), `${encodeURIComponent(repo)}-${Number(pr)}-${head}.json`);
     const admission = recoveryAdmissions.get(path);
@@ -358,7 +459,7 @@ export function createReviewJobIo({ root = REPO_ROOT, env = process.env, dir = r
         lanePath: input.carry.lanePath,
         skipPolicy: () => readRedTeamProbes({ env, log: line => process.stderr.write(`${line}\n`) }).value.skipCardOnly,
         proveMove: move => proveCardOnlyHeadMove({ ...move,
-          exec: (file, args, options) => exec(file, args, { ...options, env: laneGitHardeningEnv(env) }) }),
+          exec: (file, args, options) => exec(file, args, { ...options, env: laneHistoryProofEnv(env) }) }),
         applyLabel: ({ repo, pr }) => {
           provider.ensureLabel(repo, 'red-team:clear', RED_TEAM_STATUS_LABEL_META['red-team:clear']);
           provider.setLabels(repo, pr, { add: 'red-team:clear', remove: ['red-team:pending'] });
@@ -367,6 +468,8 @@ export function createReviewJobIo({ root = REPO_ROOT, env = process.env, dir = r
       publishNeedsYou: isUnderTest(env) || isUnderTest(process.env) ? () => {} : item => publishAttention(item),
     } }),
     clearRedTeamQueued: restoreAdmission,
+    planRedTeamMode: ({ pr, repo, head }) => planRedTeamRecovery(readWitness({ pr, repo, head, env }),
+      { now: Date.now(), probe: recoveryProbe, deadlineMs: staleRunDeadlineMs(env), env }).mode,
     redTeamStatus: input => {
       const head = input.loopPayload?.findings?.read?.netBasis?.rev;
       const key = { repo: input.repo, pr: input.pr, head, env };
@@ -450,24 +553,18 @@ export function createReviewJobIo({ root = REPO_ROOT, env = process.env, dir = r
           ...(admissionPrior.retryCount !== undefined ? { retryCount: admissionPrior.retryCount } : {}) } } } : {}) };
     },
     root,
-    fetchRedTeamHead: ({ lanePath, pr, head }) => {
+    fetchRedTeamHead: ({ lanePath, repo, pr, head }) => {
       if (!/^[a-f0-9]{40}$/i.test(head ?? '')) throw Error('missing pinned red-team head');
-      const options = { cwd: lanePath, env: laneGitHardeningEnv(env), timeout: 180_000, maxBuffer: 1024 * 1024 };
-      exec('git', ['-C', lanePath, 'fetch', '--quiet', '--no-tags', 'origin', `pull/${pr}/head`], options);
-      const fetched = exec('git', ['-C', lanePath, 'rev-parse', '--verify', 'FETCH_HEAD^{commit}'], options).trim();
+      const fetched = fetchPinnedPrHead({ lanePath, repo, pr, head, headChangedError: 'red-team head changed during fetch', env, exec, readConfig, spawnPack, log, repoIds });
       if (fetched !== head) throw Error('red-team head changed during fetch');
-      const resolved = exec('git', ['-C', lanePath, 'rev-parse', '--verify', `${head}^{commit}`], options).trim();
-      if (resolved !== head) throw Error('pinned red-team commit unavailable');
-      return { head: resolved };
+      return { head };
     },
     prepareLane: ({ pr, repo, lanePath }) => {
+      if (!isGithubSlug(repo)) throw Error('invalid review repository; inspect repo argument before retrying');
       const options = { cwd: lanePath, env, timeout: 180_000, maxBuffer: 1024 * 1024 };
       const { headRefOid: head } = JSON.parse(exec('gh', ['pr', 'view', String(pr), `--repo=${repo}`, '--json', 'headRefOid'], options));
       if (!/^[a-f0-9]{40}$/i.test(head ?? '')) throw Error('review head missing; inspect PR evidence before retrying');
-      // Acquisition scrubs unsafe config, but command-valued pins must also apply to every lane Git call.
-      const gitOptions = { ...options, env: laneGitHardeningEnv(env) };
-      exec('git', ['fetch', '--no-tags', `https://github.com/${repo}.git`, `refs/pull/${pr}/head`], gitOptions);
-      const fetched = exec('git', ['rev-parse', 'FETCH_HEAD^{commit}'], gitOptions).trim();
+      const fetched = fetchPinnedPrHead({ lanePath, repo, pr, head, headChangedError: 'review head changed during fetch; retry shared setup on the live head', env, exec, readConfig, spawnPack, log, repoIds });
       if (fetched !== head) throw Error('review head changed during fetch; retry shared setup on the live head');
       return { head };
     },
@@ -483,7 +580,7 @@ export function createReviewJobIo({ root = REPO_ROOT, env = process.env, dir = r
     // Prove in the review lane: prepareLane fetched and pinned the PR head there; the daemon's own clone may lack it.
     proveCardOnlyHeadMove: ({ lanePath, ...move } = {}) => (typeof lanePath === 'string' && lanePath
       ? proveCardOnlyHeadMove({ ...move, cwd: lanePath,
-        exec: (file, args, options) => exec(file, args, { ...options, env: laneGitHardeningEnv(env) }) })
+        exec: (file, args, options) => exec(file, args, { ...options, env: laneHistoryProofEnv(env) }) })
       : { ok: false }),
     // The carry's own resolver is its only source (logged with that source); no timing setting governs it.
     carryAcrossRebaseSetting: () => resolveCarryAcrossRebase({ env, readFile }),
@@ -649,11 +746,11 @@ export function createReviewJobIo({ root = REPO_ROOT, env = process.env, dir = r
       for (const f of [handle.readSink, handle.passFile, handle.reservedFile]) { try { rmSync(f, { force: true }); } catch { /* fresh */ } }
       const fd = openSync(handle.logFile, 'w');
       try {
-        const child = spawn(process.execPath, [
+        const child = spawnSpeculative(process.execPath, [
           ...heapCapArgs('review-extra-seats'),
           'scripts/operations/review-extra-seats.mjs', 'red-team-speculate', `--pr=${pr}`, `--repo=${repo}`, `--lane=${lanePath}`,
           `--read-sink=${handle.readSink}`, `--out=${handle.passFile}`, `--wait-ms=${waitMs}`,
-        ], { cwd: root, env, stdio: ['ignore', fd, fd], detached: true });
+        ], { cwd: root, env: reviewSeatLaunchEnv(env), stdio: ['ignore', fd, fd], detached: true });
         child.unref();
         if (!child.pid) return null;
         return { ...handle, pid: child.pid, startedAt: Date.now() };
@@ -1089,10 +1186,11 @@ function expectedHeadRefusal(expectedHead, input, io) {
 }
 
 function runReviewArc({
-  pr, repo, expectedHead, redTeamOnly = false, redTeamMode = 'fresh', preferLane = null, laneWaitMs = REVIEW_JOB_LANE_WAIT_MS, loopTimeoutMs = resolveLoopTimeoutMs(), pid = process.pid,
+  pr, repo, expectedHead, redTeamOnly = false, redTeamMode = 'fresh', preferLane = null, laneWaitMs = REVIEW_JOB_LANE_WAIT_MS, loopTimeoutMs = resolveLoopTimeoutMs(), pid = process.pid, onSessionSlug,
 } = {}, io, seatsBox = {}) {
   const planned = planReviewDispatch({ pr, repo });
   const slug = planned.sessionSlug;
+  onSessionSlug?.(slug);
   const t0 = io.now();
   const timings = { acquireMs: null, loopMs: null, totalMs: 0 };
   const result = (fields) => ({
@@ -1240,6 +1338,10 @@ function runReviewArc({
       return result({ ...classified, lanePath });
     };
     if (redTeamOnly) {
+      if (redTeamMode === 'auto') {
+        const mode = io.planRedTeamMode({ pr: planned.pr, repo: planned.repo, head });
+        redTeamMode = ['fresh', 'resume'].includes(mode) ? mode : 'fresh';
+      }
       if (!['fresh', 'resume'].includes(redTeamMode)) throw Error('unknown red-team mode; inspect recovery settings before retrying');
       const stored = io.readRedTeamOnlyPayload({ pr: planned.pr, repo: planned.repo, head });
       let loopPayload = stored?.loopPayload;
@@ -1403,7 +1505,7 @@ export function dispatchReviewJob({
   dir = reviewJobsDir(env, root),
   spawnJob = defaultSpawnJob,
   readCompletion = (slug) => { try { return tryReadCompletion(slug); } catch { return null; } },
-  resolveSettingsEnv = () => resolveGhShimSettingsEnv(undefined),
+  resolveSettingsEnv = () => resolveGhShimSettingsEnv(undefined, { env }),
   isAlive = pidAlive,
   checkoutExists = existsSync, home = homedir(), expectedHead, io = createReviewJobIo({ root, env }),
 } = {}) {
@@ -1436,7 +1538,7 @@ export function dispatchReviewJob({
     && !(ci.affected ?? []).some(row => ['wrong-head', 'malformed', 'missing'].includes(row.reason));
   if (!ci?.allowed && !waived) return { pr: planned.pr, repo: planned.repo, headSha: ci?.headSha ?? null, skipped: formatReviewCiSkip(ci), ci };
   const settingsEnv = resolveSettingsEnv() || {};
-  const childEnv = { ...env, ...settingsEnv };
+  const childEnv = reviewSeatLaunchEnv(env, settingsEnv);
   // The dispatcher's own actor id (if it happens to run inside a session) must never leak into the job — the
   // job mints its own per round.
   delete childEnv[ACTOR_ENV];
@@ -1573,8 +1675,25 @@ export function carryStackAccept({ pr, repo, root = REPO_ROOT, env = process.env
 
 // ── CLI ────────────────────────────────────────────────────────────────────────────────────────────────────────
 
+/** CLI-only registration. Returns the callback used when the arc first knows its slug. */
+export function installReviewJobExitHooks({ proc = process, dir = reviewJobsDir() } = {}) {
+  let slug;
+  const record = (exitCode, signal) => {
+    try {
+      if (!slug) return;
+      const path = diagnosticPath(slug, dir, 'exit');
+      mkdirSync(dirname(path), { recursive: true });
+      writeFileSync(path, `${JSON.stringify({ pid: proc.pid, exitCode, signal, endedAt: new Date().toISOString() })}\n`);
+    } catch { /* Exit diagnostics must never prevent termination. */ }
+  };
+  // No signal handlers: installing one would stop a SIGTERM from killing the process during the synchronous arc.
+  // A signal death therefore fires no 'exit' event and leaves no marker, which the daemon reports as such.
+  proc.on('exit', code => record(code, null));
+  return value => { if (value) slug = value; };
+}
+
 /** CLI boundary; injected job and rating effects keep recovery guard tests hermetic. */
-export function runReviewJobCli(argv = process.argv.slice(2), { runJob = runReviewJob, rate = rateAndRecordReviewJob } = {}) {
+export function runReviewJobCli(argv = process.argv.slice(2), { runJob = runReviewJob, rate = rateAndRecordReviewJob, trackExit = false } = {}) {
   const [sub, ...rest] = argv;
   const flag = (name) => {
     const hit = rest.find((a) => a.startsWith(`--${name}=`));
@@ -1584,18 +1703,19 @@ export function runReviewJobCli(argv = process.argv.slice(2), { runJob = runRevi
     writeLineSync(2, 'usage: review-job.mjs run --pr=<n> --repo=<owner/repo>');
     process.exitCode = 2;
   } else {
-    // No signal handler: the arc is synchronous, so a handler could not run before the in-flight child returns
-    // anyway. A killed job leaves a record with a dead pid (pruned on the next read) and, at worst, a lease under
-    // its slug, which the lane pool's ghost-lease reaper reclaims (#2748).
+    // Signals can only be handled after a synchronous child returns. SIGKILL is uncatchable and
+    // leaves no exit marker; dead records and ghost leases retain their existing cleanup paths.
+    const onSessionSlug = trackExit ? installReviewJobExitHooks() : undefined;
     try {
       if (rest.some(arg => arg === '--red-team-plan' || arg.startsWith('--red-team-plan='))) throw Error('removed --red-team-plan; recovery is decided by the job');
       const lane = Number(flag('prefer-lane'));
-      // Bare legacy flag is fresh-guarded; explicit modes survive detached dispatch.
-      const redTeamMode = flag('red-team-only') ?? 'fresh';
+      // Bare legacy flag selects recovery automatically; explicit modes stay strict.
+      const redTeamMode = flag('red-team-only') ?? (rest.includes('--red-team-only') ? 'auto' : 'fresh');
       const redTeamOnly = rest.includes('--red-team-only') || flag('red-team-only') !== undefined;
-      const out = runJob({ pr: flag('pr'), repo: flag('repo'), redTeamOnly, redTeamMode,
+      const out = runJob({ pr: flag('pr'), repo: flag('repo'), redTeamOnly, redTeamMode, onSessionSlug,
         ...(flag('expected-head') === undefined ? {} : { expectedHead: flag('expected-head') }),
         preferLane: Number.isInteger(lane) && lane > 0 ? lane : null });
+      onSessionSlug?.(out.sessionSlug);
       writeAllSync(1, `${JSON.stringify(out)}\n`);
       // #4075/run-rating slice 1 — mechanical grading for this now-finished job-mode review, read back from
       // THIS job's own log file (stdout/stderr above were redirected there by `dispatchReviewJob`'s spawn — see
@@ -1612,4 +1732,4 @@ export function runReviewJobCli(argv = process.argv.slice(2), { runJob = runRevi
 }
 
 const IS_CLI = process.argv[1] && resolve(process.argv[1]) === resolve(THIS_FILE);
-if (IS_CLI) runReviewJobCli();
+if (IS_CLI) runReviewJobCli(process.argv.slice(2), { trackExit: true });

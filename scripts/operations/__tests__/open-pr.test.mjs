@@ -120,7 +120,7 @@ describe('planOpen — the home\'s rules as a pre-flight, and nothing more', () 
   it('does NOT re-decide the lane-verification gate — that has one home', () => {
     const plan = planOpen(good());
     expect(Object.keys(plan).sort())
-      .toEqual(['actor', 'argv', 'base', 'bodyFile', 'dryRun', 'mode', 'operatorInstruction', 'parkLabel', 'ref', 'requireVerified', 'sha', 'skipPrePrReview', 'title']);
+      .toEqual(['actor', 'argv', 'base', 'bodyFile', 'dryRun', 'mode', 'operatorInstruction', 'parkLabel', 'ref', 'requireVerified', 'sha', 'skipPrePrReview', 'title', 'verify']);
     // No marker, no verdict, no gate decision — only the caller's own request, echoed back.
     expect(plan.requireVerified).toBe(false);
     expect(JSON.stringify(plan)).not.toMatch(/marker|break-glass|verifyGate/i);
@@ -429,7 +429,7 @@ describe('classifySubmit — refused and could-not-run are different facts', () 
       expect(r.outcome).toBe('unrun');
       expect(r.outcome).not.toBe('refused');
     }
-    expect(SUBMIT_OUTCOMES).toEqual(['opened', 'refused', 'unrun']);
+    expect(SUBMIT_OUTCOMES).toEqual(['opened', 'refused', 'unrun', 'checked']);
   });
 
   // The no-credential case specifically: it must never read as an open, and never as a refusal to fix.
@@ -459,7 +459,7 @@ describe('the submit effect', () => {
 describe('the io shell — one spawn of the home, and no second route', () => {
   it('spawns pr-land.mjs with the planned argv and --json', () => {
     const calls = [];
-    const run = createPrLandRunner({ prepGate: () => ({ ok: true }), readPrepBody: () => '',
+    const run = createPrLandRunner({ canonicalAudit: () => ({ ok: true }), prepGate: () => ({ ok: true }), readPrepBody: () => '',
       prePrReview: () => ({ action: 'pass' }),
       spawn: (cmd, argv) => { calls.push(argv); return { status: 0, stdout: JSON.stringify({ pr: 7, url: 'u' }) }; },
     });
@@ -626,7 +626,7 @@ describe('items 79/81 — truthful label-on-green outcome, credential env, --bra
     const env = resolveGhCredentialEnv({ env: { PATH: '/usr/bin' }, build: () => null, exists: () => true, orgShimDir: () => null });
     expect(env.PATH).toMatch(/gh-shim:\/usr\/bin$/);
     let seen;
-    createPrLandRunner({ prepGate: () => ({ ok: true }), readPrepBody: () => '', prePrReview: () => ({ action: 'pass' }), env, spawn: (_n, _a, o) => { seen = o.env; return { status: 0, stdout: '{"pr":1}' }; } })({ argv: ['--ref=lane/x'] });
+    createPrLandRunner({ canonicalAudit: () => ({ ok: true }), prepGate: () => ({ ok: true }), readPrepBody: () => '', prePrReview: () => ({ action: 'pass' }), env, spawn: (_n, _a, o) => { seen = o.env; return { status: 0, stdout: '{"pr":1}' }; } })({ argv: ['--ref=lane/x'] });
     expect(seen.PATH).toBe(env.PATH);
   });
 
@@ -648,7 +648,7 @@ describe('items 79/81 — truthful label-on-green outcome, credential env, --bra
     const orig = process.stderr.write;
     process.stderr.write = (s) => { warned.push(String(s)); return true; };
     try {
-      createPrLandRunner({ prepGate: () => ({ ok: true }), readPrepBody: () => '',
+      createPrLandRunner({ canonicalAudit: () => ({ ok: true }), prepGate: () => ({ ok: true }), readPrepBody: () => '',
         prePrReview: () => ({ action: 'pass' }),
         dupBornAs: (opts) => checkDuplicateBornAs({ ...opts, exec }),
         spawn: () => ({ status: 0, stdout: '{"pr":4478}' }),
@@ -677,5 +677,21 @@ describe('R502: a parked PR whose review label did not apply is loud, not a clea
   it('describeSubmit fails the call and names the repair', () => {
     const d = describeSubmit({ outcome: 'opened', labelStep: 'missing', pr: 7, url: 'u', reviewLabel: 'review:pending' });
     expect(d.failed).toBe(true); expect(d.line).toContain('NO review:pending label'); expect(d.line).toContain('gh pr edit 7 --repo <owner/repo> --add-label review:pending');
+  });
+});
+
+// R1086: the operation forwards posture; only pr-land judges host saturation.
+describe('ci-only opening', () => {
+  it('carries the sanctioned flag, omits empty input, and refuses invalid values', () => {
+    expect(planOpen(good({ verify: 'ci-only' })).argv).toContain('--verify=ci-only');
+    expect(planOpen(good({ verify: '' })).argv.some(a => a.startsWith('--verify='))).toBe(false);
+    for (const verify of ['local', true, null]) expect(() => planOpen(good({ verify }))).toThrow(/verify.*ci-only/);
+    const planStep = step(ops(), 'plan');
+    expect(planStep.reads).toContain('input.verify');
+    const planned = planStep.fn({ input: good({ verify: 'ci-only' }) });
+    expect(planned.verify).toBe('ci-only');
+    expect(planned.argv).toContain('--verify=ci-only');
+    expect(ops().input.verify.default).toBe('');
+    expect(HOME_REASONS['ci-only-not-saturated']).toBe('refused');
   });
 });

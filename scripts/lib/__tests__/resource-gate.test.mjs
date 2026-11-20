@@ -196,17 +196,18 @@ describe('settings — one resourceGate block through the policy cascade, with s
       tool: { fixCap: { holdCpuIdleBelowPct: 12 } },
       env: { WE_FIX_DISPATCH_MAX_CONCURRENT: '8', WE_RESOURCE_CUTOVER: 'enforce', WE_FIX_CAP_RAISE_MAX_SWAP_USED_PCT: '50' }, legacyFloor: 2,
     });
-    expect(r.settings).toEqual({ cutover: 'enforce', fixCap: { floor: 8, ceiling: 12, ceilingAboveFloor: 4, raiseQueueOver: 3, raiseStepPerPass: 2,
+    expect(r.settings).toEqual({ cutover: 'enforce', fixCap: { floor: 8, ceiling: 16, ceilingAboveFloor: 4, raiseQueueOver: 3, raiseStepPerPass: 2,
       raiseMinMemFreePct: 40, raiseMaxSwapUsedPct: 50, raiseMaxHeavyWaitMinutes: 15,
       lowerBelowMemFreePct: 15, lowerAboveSwapUsedPct: 90, lowerAboveHeavyWaitMinutes: 45, lowerBy: 4, lowerMinimum: 2,
       holdCpuIdleBelowPct: 12 } });
     expect(r.sources).toMatchObject({ cutover: 'env WE_RESOURCE_CUTOVER', 'fixCap.floor': 'env WE_FIX_DISPATCH_MAX_CONCURRENT',
-      'fixCap.ceiling': 'floor + 4', 'fixCap.raiseQueueOver': 'platform', 'fixCap.holdCpuIdleBelowPct': 'tool', 'fixCap.raiseStepPerPass': 'standard',
+      'fixCap.ceiling': 'standard', 'fixCap.raiseQueueOver': 'platform', 'fixCap.holdCpuIdleBelowPct': 'tool', 'fixCap.raiseStepPerPass': 'standard',
       'fixCap.raiseMaxSwapUsedPct': 'env WE_FIX_CAP_RAISE_MAX_SWAP_USED_PCT' });
     expect(r.invalid).toEqual(['platform.fixCap.ceiling="lots"']);
   });
   it('defaults: enforce; floor = the legacy static cap; a ceiling below the floor is raised to it', () => {
     expect(RESOURCE_GATE_STANDARD.cutover).toBe('enforce');
+    expect(resolveResourceGateSettings().settings.fixCap.ceiling).toBe(16);
     const r = resolveResourceGateSettings({ tool: { fixCap: { ceiling: 3 } }, env: {}, legacyFloor: 6 });
     expect(r.settings.fixCap).toMatchObject({ floor: 6, ceiling: 6 });
     expect(r.sources['fixCap.floor']).toBe('standard (fixDispatchMaxConcurrent)');
@@ -376,6 +377,37 @@ describe('dynamic fixer cap', () => {
     it.each([2, 4])('refuses under memory pressure level %s', (pressure) => {
       expect(mk(() => snap({ pressure })).tryAdmit('fix')).toMatchObject({ admit: false, signal: 'mem-floor' });
     });
+    it('admits sticky warn, but corroborated warn and critical still refuse with inputs', () => {
+      expect(mk(() => snap({ pressure: 2, freePct: 45 })).tryAdmit('fix').admit).toBe(true);
+      const low = mk(() => snap({ pressure: 2, freePct: 10 })).tryAdmit('fix');
+      expect(low).toMatchObject({ admit: false, signal: 'mem-floor' });
+      expect(low.why).toContain('free 10% (<20%)');
+      const growing = mk(() => ({ ...snap({ pressure: 3, freePct: 45 }),
+        memory: { ...snap({ pressure: 3, freePct: 45 }).memory, swapGrowthMb: 512 } })).tryAdmit('fix');
+      expect(growing.why).toContain('swap +512MB (>256MB)');
+      expect(mk(() => snap({ pressure: 4, freePct: 45 })).tryAdmit('fix').admit).toBe(false);
+    });
+    it('reads warn thresholds from the same admission settings environment', () => {
+      const t = createResourceFixThrottle({ env: { WE_LOAD_ADMISSION_WARN_MIN_FREE_PCT: '5' },
+        sendBackReservedSlots: 0, listClaims: () => [], queueLength: 0, readSnap: () => snap({ pressure: 2, freePct: 10 }),
+        nowMs: () => NOW, settings: { cutover: 'enforce', fixCap: { ...fixCap, floor: 4, ceiling: 4 } },
+        gate: () => ({ admit: true }), log: quiet });
+      expect(t.tryAdmit('fix').admit).toBe(true);
+    });
+    it.each([undefined, null, NaN, -1, 101])('warn refuses unreadable free percent %s despite flat swap', freePct => {
+      const s = snap({ pressure: 2, freePct });
+      s.memory.swapGrowthMb = 0;
+      expect(mk(() => s).tryAdmit('fix')).toMatchObject({ admit: false, signal: 'mem-floor' });
+    });
+    it.each([3, 4, 5, 2.5])('refuses non-warn pressure %s despite clean free memory and swap', pressure => {
+      const s = snap({ pressure, freePct: 45 });
+      s.memory.swapGrowthMb = 0;
+      expect(mk(() => s).tryAdmit('fix')).toMatchObject({ admit: false, signal: 'mem-floor' });
+    });
+    it('warn compares unrounded free memory and allows unknown swap growth', () => {
+      expect(mk(() => snap({ pressure: 2, freePct: 19.96 })).tryAdmit('fix').admit).toBe(false);
+      expect(mk(() => snap({ pressure: 2, freePct: 20 })).tryAdmit('fix').admit).toBe(true);
+    });
     it.each([['no snapshot', () => null], ['read throws', () => { throw Error('x'); }], ['stale', () => snap({ ageMs: 600000 })],
       ['no available reading', () => snap({ availableMb: null })],
       ['no pressure', () => snap({ pressure: null })]])('fails closed on %s', (_n, readSnap) => {
@@ -488,8 +520,8 @@ describe('operator-db host and resource capacity leaves', () => {
   });
   it('fails closed on oversized capacity and guard keys despite looser lower layers', () => {
     const env = { WE_HOST_MAX_REVIEW_DISPATCH_PER_TICK: '3', WE_FIX_DISPATCH_MAX_CONCURRENT: '4',
-      ...operatorEnv(overrideFile({ 'host.maxReviewDispatchPerTick': 9, 'host.capacity.memAvailableFloorMb': 1,
-        'resourceGate.fixCap.floor': 13, 'resourceGate.cutover': 'shadow' })) };
+      ...operatorEnv(overrideFile({ 'host.maxReviewDispatchPerTick': 17, 'host.capacity.memAvailableFloorMb': 1,
+        'resourceGate.fixCap.floor': 25, 'resourceGate.cutover': 'shadow' })) };
     const host = resolveHostOverloadSettings({ env, log: quiet });
     expect(host.settings.host.maxReviewDispatchPerTick).toBe(2);
     expect(host.settings.host.capacity.memAvailableFloorMb).toBe(2048);
@@ -529,11 +561,11 @@ it('resolved operator ceiling stays at least the floor when only one bound overr
 });
 
 
-it('floor-only operator override 12 derives a ceiling no higher than 12', () => {
+it('floor-only operator override 24 derives a ceiling no higher than 24', () => {
   const file = join(root, 'operator-floor-only.json');
-  writeFileSync(file, JSON.stringify({ 'resourceGate.fixCap.floor': 12 }));
+  writeFileSync(file, JSON.stringify({ 'resourceGate.fixCap.floor': 24 }));
   const r = resolveResourceGateSettings({ env: { ...operatorEnv(file) } });
-  expect(r.settings.fixCap).toMatchObject({ floor: 12, ceiling: 12 });
+  expect(r.settings.fixCap).toMatchObject({ floor: 24, ceiling: 24 });
 });
 
 it.each(['corrupt', 'unreadable'])('%s operator store preserves configured fixCap 1/1 and memory 60 percent', kind => {
@@ -561,7 +593,7 @@ it.each([undefined, 8])('R907 operator ceiling 1 lowers the default/configured f
 describe('R907 malformed host/resource policy evidence', () => {
   it.each([
     ['wrong type', 'fixCap.floor', '1'],
-    ['out of range', 'fixCap.ceiling', 13],
+    ['out of range', 'fixCap.ceiling', 25],
     ['unknown key', 'unknownCapacity', 1],
     ['non-allowlisted guard', 'cutover', 'shadow'],
   ])('%s closes every capacity leaf in the affected policy, direction-aware', (_label, key, value) => {
@@ -590,7 +622,7 @@ describe('R907 malformed host/resource policy evidence', () => {
   });
   it.each([
     ['host.maxReviewDispatchPerTick', '1'],
-    ['host.maxReviewDispatchPerTick', 9],
+    ['host.maxReviewDispatchPerTick', 17],
     ['host.unknownCapacity', 1],
     ['host.capacity.memAvailableFloorMb', 1],
   ])('malformed %s=%j bounds host dispatch by the finite fallback', (key, value) => {

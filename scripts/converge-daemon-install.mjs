@@ -27,6 +27,7 @@
  *   node scripts/converge-daemon-install.mjs status     # is it loaded? where does it log?
  *   node scripts/converge-daemon-install.mjs uninstall  # bootout + remove the plist
  */
+import { pinDeveloperDir } from './lib/lane-git-hardening.mjs';
 import { spawnSync } from 'node:child_process';
 import { existsSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
 import { homedir } from 'node:os';
@@ -70,6 +71,7 @@ export function resolveInstallConfig(env = process.env, home = homedir(), nodePa
   const rawInterval = Number(env.CONVERGE_DAEMON_INTERVAL_SEC);
   return {
     ...pass,
+    developerDir: env.DEVELOPER_DIR,
     label: LABEL,
     node: nodePath,
     // The daemon runs the script FROM ITS OWN CLONE — so a self-update (the pass's `reset --hard origin/main`)
@@ -98,6 +100,8 @@ export function renderPlist(cfg) {
     // nothing. Read-only: the daemon never writes into the primary tree.
     ['CONVERGE_DAEMON_JURY_DIR', cfg.juryDir],
   ];
+  const developerEnv = pinDeveloperDir({ DEVELOPER_DIR: cfg.developerDir }, { exists: cfg.exists ?? existsSync });
+  if (developerEnv.DEVELOPER_DIR) envPairs.push(['DEVELOPER_DIR', developerEnv.DEVELOPER_DIR]);
   if (cfg.repo) envPairs.push(['CONVERGE_DAEMON_REPO', cfg.repo]);
 
   const envXml = envPairs

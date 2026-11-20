@@ -16,8 +16,12 @@ import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { openPrPageFixture } from './fixtures/open-pr-page-fixture.mjs';
 
+// One drain pass here takes ~31s on an idle 30-core host (each held row's ledger write
+// exhausts its fail-closed retry backoff against the fixture git), so the 30s default
+// child budget timed out with no load at all. Give each child 90s before load scaling.
+const CLI_SPAWN_BASE_MS = 90_000;
 // Cover the 6x load cap (even if load rises later), an explicit override, and fixture cleanup.
-const CLI_TEST_TIMEOUT_MS = 2 * Math.max(180_000, spawnTimeoutMs()) + 10_000;
+const CLI_TEST_TIMEOUT_MS = 2 * Math.max(180_000, spawnTimeoutMs(CLI_SPAWN_BASE_MS)) + 10_000;
 
 const script = join(dirname(fileURLToPath(import.meta.url)), '..', 'merge-ai-prs.mjs');
 const remediation = join(dirname(fileURLToPath(import.meta.url)), '..', 'readiness', 'red-main-remediation.mjs');
@@ -42,7 +46,7 @@ if (a[0] === 'pr' && a[1] === 'list' && process.env.RMH_LATE_FREEZE && !fs.exist
 if (a[0] === 'pr' && a[1] === 'list' && process.env.RMH_LATE_GROUP) {
   const [file, n] = process.env.RMH_LATE_GROUP.split('#');
   if (a.includes('lane/leaf-' + n) && !fs.existsSync(file)) {
-    fs.writeFileSync(file, JSON.stringify({ groups: [{ id: 'late', repo: 'fixture/drain-rmh', pr: 4100, branch: 'lane/card-group-late',
+    fs.writeFileSync(file, JSON.stringify({ groups: [{ id: 'late', repo: 'web-everything/web-everything', pr: 4100, branch: 'lane/card-group-late',
       createdAt: Date.now(), files: ['backlog/leaf-' + n + '.md'], sources: [{ num: Number(n), headSha: 'sha-' + n }] }], failed: {} }));
   }
 }
@@ -86,7 +90,7 @@ if (S) {
   if (a[0] === 'log' && a.includes('--pretty=%s') && a.includes('origin/main')) say('WE #7001: the stranded delivery (#7001)');
   if (a[0] === 'ls-files' && /^backlog\\/7001-/.test(a[1] || '')) say('backlog/7001-stranded-card.md');
 }
-if (a[0] === 'remote' && a[1] === 'get-url') process.stdout.write('git@github.com:fixture/drain-rmh.git\\n');
+if (a[0] === 'remote' && a[1] === 'get-url') process.stdout.write('git@github.com:web-everything/web-everything.git\\n');
 if (a[0] === 'diff') process.exit(1);
 process.exit(0);
 `;
@@ -127,7 +131,7 @@ function runCli({ freeze = null, priorityPrs = null, publishedRed = false, holdS
     if (freeze === 'both') writeFileSync(newMarker, JSON.stringify({ ...marker, reason: 'raised at the new path' }));
     if (priorityPrs) writeFileSync(join(coord, 'main-red-priority.json'), JSON.stringify({ repo: 'we', pr: priorityPrs[0], prs: priorityPrs, firstRedSha: 'abc1234567', expiresAt: FUTURE }));
     // xym8nt4 — an open card group (combined #4000, awaiting review) that RESERVES the fix PR's card file.
-    if (cardGroup) writeFileSync(join(coord, 'drain-card-groups.json'), JSON.stringify({ groups: [{ id: 'g', repo: 'fixture/drain-rmh', pr: 4000,
+    if (cardGroup) writeFileSync(join(coord, 'drain-card-groups.json'), JSON.stringify({ groups: [{ id: 'g', repo: 'web-everything/web-everything', pr: 4000,
       branch: 'lane/card-group-g', createdAt: NOW, files: [`backlog/leaf-${FIX}.md`], sources: [{ num: 4001, headSha: 'sha-4001' }] }], failed: {} }));
     if (publishedRed) writeFileSync(join(coord, 'main-ci-red-state.json'), JSON.stringify({ red: true, firstRedSha: 'abc1234567', since: NOW - 60_000, setAt: NOW, expiresAt: FUTURE }));
     // The merge-queue/freshness hook is a separate gate (its own wiring test); with VITEST cleared the live ON file would
@@ -163,11 +167,11 @@ function runCli({ freeze = null, priorityPrs = null, publishedRed = false, holdS
     delete env.RMH_SHARED_FREEZE;
     if (shared !== null) env.RMH_SHARED_FREEZE = shared;
     if (unfreezeFirst) { // the operator lifts the freeze through the real remediation CLI BEFORE the drain pass
-      const u = spawnSync(process.execPath, ['--import', preload, remediation, 'unfreeze'], { cwd: dir, encoding: 'utf8', timeout: spawnTimeoutMs(), env });
+      const u = spawnSync(process.execPath, ['--import', preload, remediation, 'unfreeze'], { cwd: dir, encoding: 'utf8', timeout: spawnTimeoutMs(CLI_SPAWN_BASE_MS), env });
       expect(u.status, u.stderr).toBe(0);
     }
     const r = spawnSync(process.execPath, ['--import', preload, script, '--this-repo', '--label=ready-to-merge',
-      '--no-reconcile-labels', '--no-drain-lease', '--json', ...(dryRun ? ['--dry-run'] : [])], { cwd: dir, encoding: 'utf8', timeout: spawnTimeoutMs(), env });
+      '--no-reconcile-labels', '--no-drain-lease', '--json', ...(dryRun ? ['--dry-run'] : [])], { cwd: dir, encoding: 'utf8', timeout: spawnTimeoutMs(CLI_SPAWN_BASE_MS), env });
     expect(r.error, r.stderr).toBeUndefined();
     const lines = r.stdout.trim().split('\n').filter(Boolean);
     const result = lines.length ? JSON.parse(lines.at(-1)) : null;
@@ -409,7 +413,9 @@ describe('x09e2bn shared reader wiring', () => {
   it('unreadable shared JSON holds with an error', () => {
     const r = runCli({ shared: '{bad json', priorityPrs: [FIX] });
     expect(r.attempts, r.stderr).toEqual([]);
-    expect(r.result.skipped[0].reason).toContain('shared freeze unreadable');
+    expect(r.result.skipped[0].reason).toMatch(/^freeze-unreadable-hold: freeze unreadable/);
+    expect(r.result.skipped[0].reason).not.toContain('red-main');
+    expect(r.result.skipped.filter(v => v.redMainHold).every(v => v.reason.startsWith('freeze-unreadable-hold:')), JSON.stringify(r.result.skipped)).toBe(true);
   }, CLI_TEST_TIMEOUT_MS);
   it('local automatic freeze exempts the published fix PR', () => {
     const r = runCli({ freeze: 'env', markerKind: 'auto', priorityPrs: [FIX] });

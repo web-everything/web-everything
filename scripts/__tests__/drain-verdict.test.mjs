@@ -214,6 +214,9 @@ describe('T3b: the dry-run ready-not-reached accounting row is not an admission 
     ['red-main-hold (real enqueue hold kind)', () => ({ skipReasons: buildSkipReasons({ verdicts: [merge(7)],
       enqueueOutcomes: [{ num: 7, repo: null, outcome: 'not-enqueued', kind: 'red-main-hold', reason: 'red-main-hold: main is red' }] }) }), 'red-main-hold'],
     ['red-main-hold (hand-built row)', () => ({ skipReasons: [{ ...row, kind: 'red-main-hold', reason: 'red-main-hold', source: 'skipped' }] }), 'red-main-hold'],
+    ['freeze-unreadable-hold (real skip reason)', () => ({ skipReasons: buildSkipReasons({ verdicts: [
+      { ...merge(7), decision: 'skip', reason: 'freeze-unreadable-hold: freeze unreadable' },
+    ] }) }), 'red-main-hold'],
     ['ready-not-reached from another source', () => ({ skipReasons: [{ ...row, kind: 'ready-not-reached', reason: 'x', source: 'skipped' }] }), 'ready-not-reached'],
     ['an unknown kind', () => ({ skipReasons: [{ ...row, kind: 'brand-new-hold', reason: 'x', source: 'unaccounted' }] }), 'brand-new-hold'],
     ['an accounting row plus a hold for the same target under the slug key', () => ({ skipReasons: [
@@ -480,10 +483,13 @@ describe('T5c: the spawned drain reads with the workflow token on a fresh runner
 
   it('every drain auth call in merge-ai-prs routes through the CI read-only exemption', () => {
     const src = readFileSync(new URL('../merge-ai-prs.mjs', import.meta.url), 'utf8');
+    // The exported entry uses injected inputs; the real CLI supplies process values.
+    expect(src).toMatch(/export async function main\(argv, \{ env = process\.env/);
+    expect(src).toMatch(/if \(IS_CLI\) main\(process\.argv\.slice\(2\)\)/);
     // Every call, whatever its argument shape (an options variable would bypass an object-literal match).
     const calls = src.split('\n').filter(line => /ensureFreshGithubAppEnv\s*\(/.test(line) && !/^\s*(\/\/|\*)/.test(line));
     expect(calls.length).toBeGreaterThanOrEqual(2);
-    for (const call of calls) expect(call).toMatch(/ensureFreshGithubAppEnv\(\{[^}]*daemon: !isCiReadonlyDryRun\(process\.env, process\.argv\) \}\)/);
+    for (const call of calls) expect(call).toMatch(/ensureFreshGithubAppEnv\(\{[^}]*daemon: !isCiReadonlyDryRun\(env, argv\) \}\)/);
   });
 });
 

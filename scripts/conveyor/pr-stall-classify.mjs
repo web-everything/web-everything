@@ -114,6 +114,7 @@ const EXPECTED_ACTOR = Object.freeze({
   'in-merge-queue': 'drain', 'drain-skip:queue-file-overlap': 'drain', 'drain-skip:overlap-yield': 'drain', 'drain-skip:ready-not-reached': 'drain',
   'drain-skip:mq-same-head-failed': 'drain', 'drain-skip:card-grouped': 'drain',
   'drain-skip:unknown-mergeability': 'drain',
+  'drain-skip:batching-deferred': 'drain',
 });
 /** Operator-owned states the judge does not cover: why a person is needed. */
 const OPERATOR_STATES = Object.freeze({
@@ -125,6 +126,7 @@ const OPERATOR_STATES = Object.freeze({
   'drain-skip:not-certified': 'the drain will not merge it uncertified',
   'drain-skip:mq-same-head-failed': 'the same-head merge-queue attempt failed; held until the head changes',
   'drain-skip:card-grouped': 'the PR is grouped into an open card group; waiting for that group to land',
+  'drain-skip:batching-deferred': 'drain is batching; deferred to a later pass',
   unclassified: 'no signal says who moves next',
 });
 

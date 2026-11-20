@@ -11,6 +11,7 @@
   </array>
   <key>EnvironmentVariables</key>
   <dict>
+__DEVELOPER_DIR_ENV__
     <key>WE_GUARD_CLONE</key><string>__GUARD_CLONE_PATH__</string>
     <key>PATH</key><string>__EXECUTABLE_PATH__</string>
   </dict>

@@ -70,6 +70,10 @@ describe('quarantine IO — ops/quarantine branch (real git)', () => {
 });
 
 describe('runAddCommand — the `add` CLI wiring triggers the rerun', () => {
+  it('operator --job reaches the published entry', () => {
+    runAddCommand({ tests: 'a.test.mjs', 'broken-sha': SHA, actor: 'operator', owner: 'o', reason: 'r', job: 'soak-shard (1)' },
+      { rerun: () => null, write: ({ change }) => { expect(change(null).list.entries[0].job).toBe('soak-shard (1)'); return { ok: true }; } });
+  });
   const flags = { tests: 'a.test.mjs', 'broken-sha': SHA, owner: 'o', reason: 'r', actor: 'a' };
   it('a successful add calls the rerun with the broken sha and --dir, and attaches `rerun` to the output', () => {
     const rerun = vi.fn(() => ({ rerun: true, runId: 42 }));

@@ -55,6 +55,8 @@ export const MODULE_REPO_ROOT = resolve(dirname(fileURLToPath(import.meta.url)),
  */
 export const READ_ONLY_AGY_TOOLS = Object.freeze([
   'view_file', 'list_dir', 'grep_search', 'find_by_name', 'view_file_outline', 'view_code_item', 'codebase_search',
+  // Gemini 4 Carbon names its plain file read `read_file` (live 2026-11-18: a pure read voided the seat). Path-contained like the rest.
+  'read_file',
   // agy returns its structured answer through a `finish` tool step (live transcripts: ~1 in 4 runs end this way).
   'finish',
 ]);
@@ -243,7 +245,8 @@ export function changedCheckouts(before = {}, after = {}) {
 
 /**
  * Tool steps in an agy stream-json transcript that were NOT a read-only tool and did NOT end in an error, judged on
- * each step's LAST update (a denied call is first ACTIVE, then an error). Fail closed: a tool step with no name counts.
+ * each step's LAST status (a denied call is first ACTIVE, then an error). read_file validates every update's parameters.
+ * Fail closed: a tool step with no name counts.
  * PURE.
  */
 export function stateChangingToolCalls(transcriptText, { allowedRoots = [], home = homedir(), sessionId } = {}) {
@@ -255,13 +258,22 @@ export function stateChangingToolCalls(transcriptText, { allowedRoots = [], home
   for (const event of parseJsonlEvents(String(transcriptText ?? ''))) {
     const step = event?.event === 'step_update' ? event.step_update : null;
     if (!step) continue;
-    const key = step.step_index != null ? JSON.stringify([step.conversation_id ?? null, step.step_index]) : (step.step_type === 'tool' ? `#${n++}` : null);
+    // Anything that names a tool counts as a tool step, whatever its `step_type` says (an unknown type must not hide a command).
+    const namesTool = typeof step.tool_name === 'string' || typeof step.tool_info?.name === 'string';
+    const isToolStep = step.step_type === 'tool' || namesTool;
+    const key = step.step_index != null ? JSON.stringify([step.conversation_id ?? null, step.step_index]) : (isToolStep ? `#${n++}` : null);
     if (key == null) continue;
-    const cur = steps.get(key) ?? { isTool: false, name: undefined, params: undefined, errored: false };
-    if (step.step_type === 'tool') {
+    const cur = steps.get(key) ?? { isTool: false, name: undefined, params: undefined, updates: [], errored: false };
+    cur.updates.push(step.tool_info?.parameters);
+    if (isToolStep) {
+      if (cur.params == null) cur.params = step.tool_info?.parameters;
       cur.isTool = true;
       cur.name ??= step.tool_name ?? step.tool_info?.name;
-      cur.params ??= step.tool_info?.parameters;
+      // A later update of the SAME step that names a different tool must not be hidden by keeping only the first name.
+      // Both name fields count: `tool_name: read_file` must not mask `tool_info.name: run_command` within one update.
+      for (const updateName of [step.tool_name, step.tool_info?.name]) {
+        if (typeof updateName === 'string' && updateName) (cur.names ??= new Set()).add(updateName);
+      }
     }
     if (step.status === 'TOOL_ERROR' || step.state === 'ERROR' || step.tool_info?.error != null) cur.errored = true;
     steps.set(key, cur);
@@ -282,18 +294,44 @@ export function stateChangingToolCalls(transcriptText, { allowedRoots = [], home
   }
   const out = [];
   for (const step of steps.values()) {
-    if (!step.isTool || step.errored) continue;
+    if (!step.isTool) continue;
+    if (step.names && step.names.size > 1) { out.push(`<tool changed mid-step: ${[...step.names].join('>')}>`); continue; }
+    // NOTE (R1052, carded must-fix before promotion): errored tools other than read_file are still exempt here.
+    if (step.errored && step.name !== 'read_file') continue;
     const name = step.name;
     if (typeof name !== 'string' || !READ_ONLY_AGY_TOOLS.includes(name)) { out.push(typeof name === 'string' ? name : '<unnamed tool>'); continue; }
+    if (name === 'read_file') {
+      const laneRoots = lanes.map(canonicalPath).filter(Boolean);
+      const seenPaths = new Set();
+      // Judge each update independently, then their union: no update may omit or change the direct path.
+      const invalid = step.updates.some(update => {
+        let params = update;
+        if (typeof params === 'string') { try { params = JSON.parse(params); } catch { params = null; } }
+        const paths = params && typeof params === 'object' && !Array.isArray(params)
+          ? Object.entries(params).filter(([key]) => PATH_PARAM_KEY.test(key)).map(([, value]) => value) : [];
+        for (const path of paths) seenPaths.add(path);
+        return !cwd || !paths.length || paths.some(p => typeof p !== 'string' || !p.trim()
+          || readsOutside(p, laneRoots, cwd))
+          || pathLeaves(params, false).some(p => readsOutside(p, laneRoots, cwd));
+      });
+      if (invalid || seenPaths.size !== 1) {
+        out.push('read_file (missing or invalid in-lane path)');
+      }
+      continue;
+    }
     // A completed READ must stay inside the juror lane or this conversation's brain folder.
     // Every path-like parameter is judged — relative, `~`, URI, array and nested forms included — after following symlinks.
-    if (roots.length && name !== 'finish' && step.params != null) {
-      // Parameters can arrive as a JSON string; one that does not parse, or parses to a bare scalar, cannot be judged: void.
-      let params = step.params;
-      if (typeof params === 'string') { try { params = JSON.parse(params); } catch { params = '\0'; } }
-      // A bare array names no key to say what its elements are, so every element is judged as a path.
-      const leaves = typeof params === 'object' ? pathLeaves(params, Array.isArray(params)) : ['\0'];
-      if (leaves.some((leaf) => readsOutside(leaf, roots, cwd))) out.push(`${name} (read outside the juror lane)`);
+    // EVERY update of the step is judged, not just the first: a later update must not swap in an outside path (audit).
+    if (roots.length && name !== 'finish') {
+      for (const updateParams of [step.params, ...step.updates]) {
+        if (updateParams == null) continue;
+        // Parameters can arrive as a JSON string; one that does not parse, or parses to a bare scalar, cannot be judged: void.
+        let params = updateParams;
+        if (typeof params === 'string') { try { params = JSON.parse(params); } catch { params = '\0'; } }
+        // A bare array names no key to say what its elements are, so every element is judged as a path.
+        const leaves = typeof params === 'object' ? pathLeaves(params, Array.isArray(params)) : ['\0'];
+        if (leaves.some((leaf) => readsOutside(leaf, roots, cwd))) { out.push(`${name} (read outside the juror lane)`); break; }
+      }
     }
   }
   return out;
@@ -390,7 +428,9 @@ export function scrubPaths(text, roots = [], home = homedir()) {
  */
 export function relativizeFindings(findings, roots = []) {
   const prefixes = roots.filter(Boolean).map((r) => `${String(r).replace(/\/+$/, '')}/`);
-  return (Array.isArray(findings) ? findings : []).map((f) => {
+  // Preserve malformed raw evidence for the shadow answer validator; never turn it into a clean accept.
+  if (!Array.isArray(findings)) return findings;
+  return findings.map((f) => {
     if (!f || typeof f.file !== 'string') return f;
     const hit = prefixes.find((p) => f.file.startsWith(p));
     return hit ? { ...f, file: f.file.slice(hit.length) } : f;
@@ -481,6 +521,26 @@ export async function runAgyReviewJuror({ request, laneCwd, model, watch = [], d
     let transcriptText = '';
     if (transcriptFile) {
       try { transcriptText = readFile(transcriptFile); } catch { reasons.push('transcript unreadable — escape check incomplete'); }
+      // Every line must be an event object; an answered juror must end with a successful result.
+      const lines = String(transcriptText).split('\n').filter(line => line.trim());
+      const events = [];
+      let malformed = false;
+      for (const line of lines) {
+        try {
+          const event = JSON.parse(line);
+          if (!event || typeof event !== 'object' || Array.isArray(event) || typeof event.event !== 'string') malformed = true;
+          else events.push(event);
+        } catch { malformed = true; }
+      }
+      if (malformed) reasons.push('transcript malformed — escape check incomplete');
+      const terminal = events.at(-1);
+      const successfulResult = terminal?.event === 'result' && terminal.result
+        && typeof terminal.result === 'object' && !Array.isArray(terminal.result)
+        && terminal.result.status === 'SUCCESS';
+      const relevant = events.some(event => event.event === 'step_update' || event.event === 'result');
+      if (!lines.length || !relevant || (outcome?.value != null && !successfulResult)) {
+        reasons.push('transcript empty/unrelated — escape check incomplete');
+      }
       const calls = stateChangingToolCalls(transcriptText, {
         allowedRoots: [jurorLane, realpathOr(jurorLane)], home, sessionId: outcome?.sessionId,
       });
@@ -498,7 +558,7 @@ export async function runAgyReviewJuror({ request, laneCwd, model, watch = [], d
       }
     }
 
-    const common = { sessionId: outcome?.sessionId || null, servedModel: outcome?.servedModel, transcriptFile };
+    const common = { telemetry: spawnError?.telemetry, sessionId: outcome?.sessionId || null, servedModel: outcome?.servedModel, transcriptFile };
     // A voided run that ALSO failed keeps the failure, so the agreement row says why there was no answer.
     if (spawnError) reasons.push(`and the juror gave no answer: ${scrubPaths(spawnError.message ?? spawnError, [jurorLane, laneCwd, repoRoot])}`);
     if (reasons.length > (spawnError ? 1 : 0)) return result('voided', { ...common, reasons });

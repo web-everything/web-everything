@@ -142,6 +142,82 @@ describe('planStampRestore — agreement and author-of-record provenance', () =>
 });
 
 describe('plain snapshot provenance — oldest author snapshot and agreeing ids', () => {
+  it('plans the anonymized #6989 User then Bot snapshots identically with an inline-code placeholder', () => {
+    const marker = buildAuthorActorMarker('00000000-0000-4000-8000-000000000000');
+    const fixture = (placeholder) => {
+      const body = `- \`codex-audit.mjs\` gains \`--invariants-file=${placeholder}\`. In this mode, the audit reads the supplied file.`;
+      return {
+        body, authorLogin: 'app/author-bot',
+        edits: [
+          edit(body, 'operator', '2026-11-17T11:00:00Z', 'User'),
+          edit(`${body}\n\n${marker}`, 'author-bot', '2026-11-17T10:00:00Z', 'Bot'),
+        ],
+      };
+    };
+    const baseline = plan(fixture('invariants.json'));
+    expect(baseline).toMatchObject({ action: 'restore', id: '00000000-0000-4000-8000-000000000000' });
+    const result = plan(fixture('<path>'));
+    expect(result).toEqual(JSON.parse(JSON.stringify(baseline).replaceAll('invariants.json', '<path>')));
+  });
+
+  it.each([
+    ['single backticks', '`<path>`'],
+    ['double backticks containing single backticks', '`` `<path>` ``'],
+    ['multiple spans', '`<path>` then ``<other>``'],
+  ])('ignores tag-like text in balanced inline code with %s', (_name, text) => {
+    expect(plan({ edits: [edit(`${text}\n\n${buildAuthorActorMarker(ID)}`)] }))
+      .toMatchObject({ action: 'restore', id: ID });
+  });
+
+  it.each([
+    ['bare placeholder', '<path>'],
+    ['details tag', '<details>'],
+    ['tag after balanced code', '`example` <path>'],
+    ['unbalanced backtick plus tag', '`<path>'],
+    ['unbalanced backtick after balanced tag span', '`<path>` then `'],
+    ['mismatched backtick runs', '``<path>`'],
+    ['multiline code span around balanced tag span', '`\n`<div>`\n`'],
+    ['backticks inside a link url', '[link](https://example.test/`<path>`)'],
+    ['backticks in multiline link text', '[text\n`<path>`\n](https://example.test)'],
+    ['non-placeholder tag with attribute in code', '`<a href="x">`'],
+    ['closing tag in code', '`</path>`'],
+    ['placeholder plus extra tag in code', '`<path> <div class="x">`'],
+    ['backtick inside comment hiding attribute', '<!-- ` --> <div data-note=" <!-- ` -->\n<x>\n">'],
+    ['cdata block hiding marker', '<![CDATA[\n`<path>`'],
+    ['escaped backticks around a tag','\\`<details>\\`'],
+    ['unclosed comment hiding a marker', '<!-- hidden\n'],
+    ['unclosed comment inside inline code', '`<!-- hidden`\n'],
+    ['unclosed second comment', '<!-- closed --> <!-- hidden\n'],
+    ['tag in a backtick fence', '```html\n`<path>`\n```'],
+    ['tag in a tilde fence', '~~~html\n`<path>`\n~~~'],
+  ])('refuses %s with the HTML refusal', (_name, text) => {
+    expect(plan({ edits: [edit(`${text}\n${buildAuthorActorMarker(ID)}`)] })).toEqual({
+      action: 'refuse', reason: 'unsupported HTML edit snapshot; inspect complete GitHub history manually',
+      contentRefusal: true, snapshotId: '2026-10-01T10:00:00Z by plateau-worker', offender: expect.any(String),
+    });
+  });
+
+  it('refuses a marker inside a multiline inline code span', () => {
+    expect(plan({ edits: [edit(`\`\n${buildAuthorActorMarker(ID)}\n\``)] })).toEqual({
+      action: 'refuse',
+      reason: 'malformed or non-standalone historical stamp; inspect complete GitHub history manually',
+      contentRefusal: true, snapshotId: '2026-10-01T10:00:00Z by plateau-worker', offender: buildAuthorActorMarker(ID),
+    });
+  });
+
+  it('refuses a standalone-looking stamp inside a multiline HTML attribute without writing', async () => {
+    const diff = `<div\n data-note="\n${buildAuthorActorMarker(ID)}\n">`;
+    const edits = [edit(diff)];
+    const expected = {
+      action: 'refuse', reason: 'unsupported HTML edit snapshot; inspect complete GitHub history manually',
+      contentRefusal: true, snapshotId: '2026-10-01T10:00:00Z by plateau-worker', offender: expect.any(String),
+    };
+    expect(plan({ edits })).toEqual(expected);
+    const seams = io({ readEdits: vi.fn(() => edits) });
+    expect(await restoreAuthorStamp(seams)).toEqual(expected);
+    expect(seams.writeBody).not.toHaveBeenCalled();
+  });
+
   it.each([
     ['word-diff deletion', `[-${buildAuthorActorMarker(ID)}-]`],
     ['word-diff insertion', `{+${buildAuthorActorMarker(ID)}+}`],
@@ -786,4 +862,80 @@ process.stdout.write(out);
     }
     expect(process.env.WE_GH_READ_MEMO_DIR).toBe('memo-dir');
   });
+});
+
+
+describe('content refusal evidence', () => {
+  it.each([
+    ['HTML token', '<details>\nbody', '<details>'],
+    ['brackets and backticks', '[`<path>`](target)', '[`<path>`](target)'],
+    ['hunk header', '@@ -1 +2 @@\n+new', '@@ -1 +2 @@'],
+    ['inline delta', '{+new+}', '{+new+}'],
+    ['malformed marker', '<!-- authored-by-actor: -->', '<!-- authored-by-actor: -->'],
+    ['non-standalone marker', `prefix ${buildAuthorActorMarker(ID)}`, `prefix ${buildAuthorActorMarker(ID)}`],
+  ])('identifies the offending snapshot and first %s', (_name, diff, offender) => {
+    expect(plan({ edits: [edit(diff, 'operator', '2026-10-02T10:00:00Z')] })).toMatchObject({
+      action: 'refuse', contentRefusal: true, snapshotId: '2026-10-02T10:00:00Z by operator', offender,
+    });
+  });
+
+  it('identifies the first conflicting stamp with its uuid intact', () => {
+    const marker = buildAuthorActorMarker(OTHER);
+    expect(plan({ edits: [...history(), edit(marker, 'operator')] })).toMatchObject({
+      contentRefusal: true, snapshotId: '2026-10-01T10:00:00Z by operator', offender: marker,
+    });
+  });
+
+  it('identifies the oldest non-author stamp', () => {
+    const marker = buildAuthorActorMarker(ID);
+    expect(plan({ edits: [edit(marker, 'operator')] })).toMatchObject({
+      contentRefusal: true, snapshotId: '2026-10-01T10:00:00Z by operator', offender: marker,
+    });
+  });
+
+  it('bounds oversized evidence and strips controls without allowing the HTML', () => {
+    const result = plan({ edits: [edit(`<div title="${'x'.repeat(200)}\x1b">`)] });
+    expect(result.action).toBe('refuse');
+    expect(result.offender).toBe(`<div title="${'x'.repeat(108)}`);
+    expect(result.offender).toHaveLength(120);
+    expect(plan({ edits: [edit('<div\x1b>')] }).offender).toBe('<div>');
+  });
+
+  it('reports a malformed live marker without inventing a historical snapshot', () => {
+    expect(plan({ body: '<!-- authored-by-actor: -->' })).toMatchObject({
+      contentRefusal: true, snapshotId: 'live body (no edit snapshot)', offender: '<!-- authored-by-actor: -->',
+    });
+  });
+
+  it('does not classify unreadable history as a deterministic content refusal', () => {
+    expect(plan({ edits: undefined }).contentRefusal).toBeUndefined();
+    expect(plan({ edits: [{ diff: '<div>' }] }).contentRefusal).toBeUndefined();
+  });
+});
+
+
+it('identifies a malformed second marker rather than the preceding valid marker', () => {
+  const malformed = '<!-- authored-by-actor: -->';
+  expect(plan({ edits: [edit(`${buildAuthorActorMarker(ID)}\n${malformed}`)] })).toMatchObject({
+    action: 'refuse', reason: 'malformed historical stamp', offender: malformed,
+  });
+});
+
+it('identifies the stamped edit when the oldest author snapshot has no stamp', () => {
+  const marker = buildAuthorActorMarker(ID);
+  expect(plan({ edits: [edit('Original'), edit(marker, 'operator', '2026-10-02T10:00:00Z')] })).toMatchObject({
+    action: 'refuse', contentRefusal: true, snapshotId: '2026-10-02T10:00:00Z by operator', offender: marker,
+  });
+});
+
+it('a new listed head bypasses the refusal memo and carries the new head identity', () => {
+  let headRefOid = 'a'.repeat(40);
+  const seams = io({ repo: 'o/stamp-head-change', listPrs: () => [{ number: 1, body: BODY,
+    author: { login: `app/${AUTHOR}` }, headRefOid }], readEdits: vi.fn(() => [edit('<div>')]) });
+  expect(sweepAuthorStamps(seams)[0].headSha).toBe(headRefOid);
+  sweepAuthorStamps(seams);
+  expect(seams.readEdits).toHaveBeenCalledTimes(1);
+  headRefOid = 'b'.repeat(40);
+  expect(sweepAuthorStamps(seams)[0].headSha).toBe(headRefOid);
+  expect(seams.readEdits).toHaveBeenCalledTimes(2);
 });

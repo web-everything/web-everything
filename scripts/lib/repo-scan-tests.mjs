@@ -43,6 +43,15 @@ const skipped = (file) => /(?:^|\/)(?:__tests__|__fixtures__|node_modules)(?:\/|
 /** @type {readonly RepoScanTest[]} */
 export const REPO_SCAN_TESTS = Object.freeze([
   {
+    test: 'scripts/__tests__/capability-dispatch-only.test.mjs',
+    scope: 'files',
+    why: 'capability checks admit dispatch only; roster filtering and unapproved admission are forbidden per source file',
+    matches: (f) => /\.(mjs|js|ts)$/.test(f) && !/(?:^|\/)(__tests__|node_modules)(?:\/|$)/.test(f)
+      && !/\.(test|spec)\./.test(f)
+      && (f === 'scripts/merge-ai-prs.mjs' || inTree(f, ['scripts/conveyor', 'skills-src/conveyor', 'scripts/operations'])),
+    inputs: ['scripts/__tests__/capability-dispatch-only.test.mjs'],
+  },
+  {
     test: 'scripts/operations/__tests__/health-watch-lane-scan-boundary.test.mjs',
     scope: 'files',
     why: 'inventories health-watch and stale-state command/helper calls so new destructive lane actions require guard coverage',
@@ -133,6 +142,10 @@ export const REPO_SCAN_TESTS = Object.freeze([
  * @type {Readonly<Record<string, string>>}
  */
 export const DEFERRED_SCAN_TESTS = Object.freeze({
+  'scripts/conveyor/soak/breaks/gh-log-escape-sequences-block-ci-heal.soak.test.mjs': 'false positive: its readdirSync calls only list scripts/ to symlink a throwaway pre-fix tree under mkdtemp for the break replay; it asserts a planner outcome, never a repo rule; the soak lane runs it',
+  'scripts/lib/__tests__/gh-ci-log.test.mjs': 'whole-tree structural check that every job-log reader under scripts/ and skills-src/ uses the shared gh-ci-log helper or is on its explicit deferred allowlist; it imports gh-ci-log.mjs so `vitest related` selects it when the helper changes, and CI runs it for any new bypass elsewhere',
+  'scripts/lib/__tests__/daemon-host-guard.test.mjs': 'false positive: readdirSync(join(root, ...)) lists only mkdtemp host-identity fixtures to assert atomic publication and cleanup; imports daemon-host-guard.mjs, so vitest related already selects it when the guard changes',
+  'scripts/operations/__tests__/daemon-preflight.test.mjs': 'false positive: readdirSync(join(root, ...)) lists only mkdtemp identity fixtures to assert read-only behavior; reads named checkout files without scanning the repo and imports daemon-preflight.mjs, so vitest related already selects it when preflight changes',
   'scripts/conveyor/__tests__/reconcile-pass-read-only.test.mjs': 'false positive: recursively snapshots only its mkdtemp cache fixture to assert zero writes, never the live repo; imports reconcile-pass.mjs, so vitest related already selects it when reconciliation changes',
   'scripts/readiness/__tests__/forge-cache-prune-running-record.test.mjs': 'false positive: its `snapshotBinding` readdir walk enumerates only the mkdtemp fixture tree it builds, never the live repo; a hermetic prune-record test, not a repo rule scanner',
   'scripts/__tests__/daemon-heavy-spawn-lint.test.mjs': 'repo scan: reads and TypeScript-parses every non-test .mjs under scripts/ (all subdirectories) plus skills-src/conveyor for unadmitted heavy child_process spawns; the lint helper is unit-tested hermetically and CI runs the full test',

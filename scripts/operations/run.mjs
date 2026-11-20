@@ -28,6 +28,8 @@ import { ruledWeakenedAddOperation, RULED_WEAKENED_ADD_OP, RULED_WEAKENED_ADD_EF
 import { OPERATOR_OVERRIDE_OPS, OPERATOR_OVERRIDE_EFFECT, operatorOverrideOperation } from './operator-override.mjs';
 import { lastOverrideReason, readOperatorOverrides, writeOperatorOverride, clearOperatorOverride } from '../lib/operator-override-store.mjs';
 import { aiRoutingOperation, AI_ROUTING_OP, finishAiRouting } from './ai-routing.mjs';
+import { briefModeOperation, BRIEF_MODE_OP, finishBriefMode } from './brief-mode.mjs';
+import { loadDeliveryRoutes } from '../lib/delivery-routes.mjs';
 import { resolveAiRouting, aiRoutingInputs, AI_ROUTING_ROLES } from '../lib/ai-routing.mjs';
 import { routingOverrideOperation, ROUTING_OVERRIDE_OP } from './routing-override.mjs';
 import { createRoutingOverrideSinks } from './routing-override-file.mjs';
@@ -45,6 +47,8 @@ import { bootstrapPlan } from './operator-session-bootstrap-io.mjs';
 import { createRegistry, op } from './registry.mjs';
 import { compute, effect } from './step-kinds.mjs';
 import { main as codexAuditMain } from './codex-audit.mjs';
+import { urgentSweep } from './urgent-sweep.mjs';
+import { urgentVerify } from './urgent-verify.mjs';
 import { manualDaemonPassOperation, MANUAL_DAEMON_PASS_OP } from './manual-daemon-pass.mjs';
 import { createManualDaemonPassSinks } from './manual-daemon-pass-io.mjs';
 import { createFileRunStore, createMemoryRunStore, newRunId } from './run-store.mjs';
@@ -102,11 +106,13 @@ import { resolveDeliveryCapacity, assessCapacity } from '../lib/delivery-capacit
 import { readSharedOpenPrs } from '../lib/pr-snapshot.mjs';
 import { ghRepoSlug, DEFAULT_REPO_KEY } from '../lib/constellation-repos.mjs';
 import { execFileSyncThrottled } from '../lib/gh-throttle.mjs';
-import { readSettings } from '../lib/settings-files.mjs';
+import { readSettings, readSettingsChecked } from '../lib/settings-files.mjs';
 import { prePrCheckOperation, PRE_PR_CHECK_OP, finishPrePrCheckOutcome } from './pre-pr-check.mjs';
 import { createPrePrCheckReader } from './pre-pr-check-io.mjs';
 import { maintenanceOperation, MAINTENANCE_OP } from './maintenance.mjs';
 import { createMaintenanceSinks } from './maintenance-io.mjs';
+import { updateBranchOperation, UPDATE_BRANCH_OP, finishUpdateBranch } from './update-branch.mjs';
+import { createUpdateBranchSinks } from './update-branch-io.mjs';
 import { freeScopeOperation, FREE_SCOPE_OP } from './free-scope.mjs';
 import { prototypeLoadOperation, PROTOTYPE_LOAD_OP, PROTOTYPE_LOAD_EFFECT } from './prototype-load.mjs';
 import { createPrototypeLoader, defaultDeps as prototypeLoadDeps } from './prototype-load-io.mjs';
@@ -265,6 +271,8 @@ export const CLI_ONLY_OPERATIONS = Object.freeze({
 });
 
 export const OPERATIONS = Object.freeze({
+  [BRIEF_MODE_OP]: () => ({ declaration: briefModeOperation({ collect: () => loadDeliveryRoutes(readSettingsChecked) }),
+    sinks: {}, finish: finishBriefMode }),
   [AI_ROUTING_OP]: () => ({ declaration: aiRoutingOperation({ collect: () => {
     const routing = resolveAiRouting();
     return { settings: routing.value, sources: routing.sources, invalid: routing.invalid,
@@ -309,7 +317,8 @@ export const OPERATIONS = Object.freeze({
   // invocation with no `--cwd` is byte-identical to before.
   // `review.seatsByTouchSet` — `securitySeat` is the CALLER's choice, made before the run starts (the review
   // daemon's `review-loop-cli.mjs#chooseSecuritySeat`) or read off a saved run on `--resume` (below); default: seated.
-  [REVIEW_PR_OP]: ({ json = false, cwd = null, securitySeat = true, cardOnlyLight = false, resumeId = null } = {}) => {
+  [REVIEW_PR_OP]: ({ json = false, cwd = null, securitySeat = true, cardOnlyLight = false, resumeId = null,
+    sinkFactory = createReviewPrSinks } = {}) => {
     // A bad id or torn record falls back to the live roster, so the adapter's own resume read refuses it
     // normally instead of this builder aborting resolveOperation with the root usage.
     let savedRun = null;
@@ -325,7 +334,7 @@ export const OPERATIONS = Object.freeze({
         ...seats,
         readPr: createReviewPrReader(cwd ? { cwd } : {}),
       }),
-      sinks: createReviewPrSinks({ json }),
+      sinks: sinkFactory({ json, ...(cwd ? { cwd } : {}) }),
     };
   },
   // backlog/xzdi27a-* — the sibling of `review-pr` for a BACKLOG CARD instead of a PR diff (no `gh`, no diff,
@@ -603,12 +612,43 @@ export const OPERATIONS = Object.freeze({
     declaration: maintenanceOperation(),
     sinks: createMaintenanceSinks(),
   }),
+  [UPDATE_BRANCH_OP]: () => ({
+    declaration: updateBranchOperation(),
+    sinks: createUpdateBranchSinks(),
+    finish: finishUpdateBranch,
+  }),
   // free-scope — rules 21/26 of the operator handoff: are these files free of every open PR and every running
   // agent's declared scope? Read-only (no sinks). Register/release live in free-scope-cli.mjs.
   'operator-session-bootstrap': () => ({ declaration: operatorSessionBootstrapOperation({ collect: bootstrapPlan }), sinks: {}, finish: finishBootstrap }),
   [FREE_SCOPE_OP]: () => ({
     declaration: freeScopeOperation({ collect: collectFreeScope }),
     sinks: {},
+  }),
+  'urgent-verify': () => ({
+    declaration: op('urgent-verify', {
+      input: { sha: { type: 'string' } }, verdictFrom: 'assess',
+      verify: effect({ reads: ['input.sha'], effects: ({ input }) => [{ type: 'urgent-verify.run', payload: input, idempotent: false }] }),
+      assess: compute({ reads: ['findings.verify'], fn: ({ findings }) => {
+        const entry = findings.verify?.effects?.[0];
+        if (entry?.status !== 'applied' || !entry.result) throw new Error('urgent-verify did not complete');
+        return entry.result;
+      } }),
+    }),
+    sinks: { 'urgent-verify.run': input => urgentVerify(input) },
+    finish: ({ run, code, lines }) => run?.verdict ? { code: run.verdict.ok ? 0 : 1, lines: [JSON.stringify(run.verdict)] } : { code, lines },
+  }),
+  'urgent-sweep': () => ({
+    declaration: op('urgent-sweep', {
+      input: {}, verdictFrom: 'assess',
+      verify: effect({ reads: [], effects: ({ input }) => [{ type: 'urgent-sweep.run', payload: input, idempotent: false }] }),
+      assess: compute({ reads: ['findings.verify'], fn: ({ findings }) => {
+        const entry = findings.verify?.effects?.[0];
+        if (entry?.status !== 'applied' || !entry.result) throw new Error('urgent-sweep did not complete');
+        return entry.result;
+      } }),
+    }),
+    sinks: { 'urgent-sweep.run': input => urgentSweep(input) },
+    finish: ({ run, code, lines }) => run?.verdict ? { code: run.verdict.ok ? 0 : 1, lines: [JSON.stringify(run.verdict)] } : { code, lines },
   }),
   'codex-audit': () => ({
     declaration: op('codex-audit', {
@@ -856,8 +896,9 @@ export function createCliJudgeFactory({ env = process.env, factory = createDefau
  * Build an isolated registry plus the bindings for ONE named operation. Throws on an unknown name.
  *
  * @param {string} name
- * @param {{json?: boolean, cwd?: string, securitySeat?: boolean, resumeId?: string}} [opts] - passed to the
+ * @param {{json?: boolean, cwd?: string, securitySeat?: boolean, resumeId?: string, sinkFactory?: Function}} [opts] - passed to the
  *   builder before parsing: review-pr uses resumeId to reconstruct its saved roster and json/cwd for its IO.
+ *   sinkFactory lets fixtures inject IO while exercising the production control-value forwarding.
  */
 export function resolveOperation(name, opts = {}) {
   // `Object.hasOwn`, never a bare bracket read: `OPERATIONS['toString']` on a normal-prototype object returns an

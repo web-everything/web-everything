@@ -13,6 +13,8 @@
  *
  * IMPURE by construction: `child_process`.
  */
+import { blocker, mergeBlockers, formatBlockers } from '../lib/open-pr-preflight.mjs';
+import { checkCanonicalAuditForOpen } from './canonical-audit-gate.mjs';
 import { readMainCard, assertMachineTitle } from './machine-pr-title.mjs';
 import { execFileSync, spawnSync } from 'node:child_process';
 import { dirname, isAbsolute, join, sep } from 'node:path';
@@ -138,7 +140,7 @@ import { createGitReader } from '../lib/pr-size-admission.mjs';
  * The runner the declaration is injected with. ONE spawn; `spawn` is injected so every branch of
  * `classifySubmit` is reachable with no `gh`, no network and no PR.
  */
-export function createPrLandRunner({ prePrReview = checkPrePrReview, loadSettings = loadPrePrSettings, spawn = spawnSync, cwd = process.cwd(),
+export function createPrLandRunner({ canonicalAudit = checkCanonicalAuditForOpen, prePrReview = checkPrePrReview, loadSettings = loadPrePrSettings, spawn = spawnSync, cwd = process.cwd(),
   // Advisory rollout until automated producers have migrated their generated bodies.
   // Enforce remains injectable so admission and path-parity tests cover the eventual strict gate.
   prepMode = 'advise', prepGate = prepVerdict, readPrepBody = readFileSync, prepLogPath,
@@ -152,8 +154,13 @@ export function createPrLandRunner({ prePrReview = checkPrePrReview, loadSetting
 } = {}) {
   const git = gitOpt === undefined ? createGitReader(cwd) : gitOpt;
   return ({ argv, skipPrePrReview = '', actor = '', operatorInstruction = '' }) => {
+    const checking = argv.includes('--check');
+    if (checking) argv = argv.filter(a => a !== '--dry-run');
+    const blockers = [];
+    const collect = (gate, reason, detail, sha) => blockers.push(blocker(gate, reason, detail, sha));
+    let bypass;
     let env;
-    try { env = envOpt ?? resolveEnv(); }
+    try { env = envOpt ?? (checking && resolveEnv === resolveGhCredentialEnv ? process.env : resolveEnv()); }
     catch (e) { return { outcome: 'refused', reason: 'gh-auth-guard-unavailable', detail: String(e?.message || e) }; }
     let r;
     let cleanupBody = () => {}; // removes the temp PR-body copy a bypass writes; called on every path out
@@ -172,10 +179,10 @@ export function createPrLandRunner({ prePrReview = checkPrePrReview, loadSetting
       }
       if (readable) {
         const prep = prepGate(body);
-        if (prep.waived) logPrepEvent({ kind: 'waiver', detail: prep.reason }, { logPath: prepLogPath });
+        if (prep.waived && !checking) logPrepEvent({ kind: 'waiver', detail: prep.reason }, { logPath: prepLogPath });
         else if (!isPrepExempt(arg('title')) && !prep.ok) {
-          if (prepMode !== 'advise') return { outcome: 'refused', reason: 'prep-block-missing', detail: prep.reason };
-          logPrepEvent({ kind: 'prep-advisory', detail: prep.reason }, { logPath: prepLogPath });
+          if (prepMode !== 'advise') collect('prep', 'prep-block-missing', prep.reason);
+          if (!checking) logPrepEvent({ kind: 'prep-advisory', detail: prep.reason }, { logPath: prepLogPath });
           process.stderr.write(`open-pr: prep advisory (rollout pending caller migration) — ${String(prep.reason).replace(/[\x00-\x1f\x7f-\x9f\u2028\u2029]/g, ' ')}\n`);
         }
       }
@@ -186,22 +193,19 @@ export function createPrLandRunner({ prePrReview = checkPrePrReview, loadSetting
     if (!argv.includes('--dry-run')) {
       let gate;
       try {
-        gate = prePrReview({ cwd, base: arg('base') || 'main', sha: arg('sha') || 'HEAD', env, skip: skipPrePrReview, actor, operatorInstruction });
+        gate = prePrReview({ cwd, base: arg('base') || 'main', sha: arg('sha') || 'HEAD', env, skip: skipPrePrReview, actor, operatorInstruction, readOnly: checking });
         if (!gate || !GATE_ACTIONS.includes(gate.action)) throw new Error(`the check returned no usable decision (action: ${JSON.stringify(gate?.action)})`);
       } catch (e) { gate = failedGate(e, loadSettings); }
       if (gate.settingsError) process.stderr.write(`open-pr: WARNING — ${gate.settingsError}\n`);
-      if (gate.action === 'refuse') return { outcome: 'refused', reason: gate.reason || 'pre-pr-review-missing', detail: gate.message };
+      if (gate.action === 'refuse') collect('pre-pr-review', gate.reason || 'pre-pr-review-missing', gate.message);
       // Gate and push are bound to the SAME commit: pr-land publishes exactly the sha the gate judged.
       if (gate.sha) argv = [...argv.filter((a) => !a.startsWith('--sha=')), `--sha=${gate.sha}`];
-      if (gate.bypass) {
-        try { ({ argv, cleanup: cleanupBody } = withBypassInBody(argv, gate.bypass, cwd)); }
-        catch (e) { return { outcome: 'refused', reason: 'pre-pr-review-bypass-unrecorded', detail: `bypass refused — ${e.message}` }; }
-      }
+      bypass = gate.bypass;
       if (gate.action === 'advise') process.stderr.write(`open-pr: advisory — ${gate.message}\n`);
       // Size admission belongs to pr-land for every caller, including audited bypasses.
     }
     // xsjn0uf-incident — advisory: a card this PR adds whose bornAs is already on main / in another open PR.
-    if (!argv.includes('--dry-run')) {
+    if (!checking && !argv.includes('--dry-run')) {
       let dups = [];
       // xbdzt01 — the scan must skip THIS PR. open-pr always hands pr-land `--ref=` (never `--branch=`), so the head
       // ref is `ref`; reading only `branch` excluded nothing and flagged every card as "also in" the PR itself.
@@ -218,8 +222,21 @@ export function createPrLandRunner({ prePrReview = checkPrePrReview, loadSetting
         argv.push(`--title=${assertMachineTitle(batchIds.length ? `prepare: ${batchIds.join(', ')}` : preparePrTitle(item, readMainCard(item, git)))}`, `--sha=${sha}`);
       } catch (e) {
         cleanupBody();
+        // Legacy shape, kept: a prepare refusal stops before any child runs and its reason IS the message.
         return { outcome: 'refused', reason: String(e.message || e) };
       }
+    }
+    let audit;
+    try { audit = canonicalAudit({ repo: cwd, ref: arg('ref'), sha: arg('sha'), env, refreshMain: checking }); }
+    catch { audit = { ok: false, reason: 'canonical-audit-missing', message: 'canonical audit check failed; resolve the full head sha and run node scripts/operations/run.mjs codex-audit --base=origin/main --head=<fullsha>' }; }
+    if (audit?.ok !== true) collect('canonical-audit', audit?.reason || 'canonical-audit-missing',
+      audit?.message || 'canonical audit check returned no decision', audit?.sha || arg('sha'));
+    if (audit?.sha) argv = [...argv.filter(a => !a.startsWith('--sha=')), `--sha=${audit.sha}`];
+    const collectOnly = checking || blockers.length > 0;
+    if (collectOnly) argv = [...argv.filter(a => a !== '--check' && a !== '--dry-run'), '--check'];
+    else if (bypass) {
+      try { ({ argv, cleanup: cleanupBody } = withBypassInBody(argv, bypass, cwd)); }
+      catch (e) { return { outcome: 'refused', reason: 'pre-pr-review-bypass-unrecorded', detail: `bypass refused — ${e.message}` }; }
     }
     try {
       r = spawn(process.execPath, [PR_LAND_CLI, ...argv, '--json'], {
@@ -230,7 +247,16 @@ export function createPrLandRunner({ prePrReview = checkPrePrReview, loadSetting
     } finally {
       cleanupBody();
     }
-    return classifySubmit(r ?? {});
+    const child = classifySubmit(r ?? {});
+    if (collectOnly) {
+      const childBlockers = child.blockers?.length ? child.blockers : (child.outcome === 'refused'
+        ? [blocker('pr-land', child.reason, child.detail)]
+        : child.reason === 'check-ok' ? [] : [blocker('pr-land', 'preflight-unconfirmed', child.detail || child.reason)]);
+      const all = mergeBlockers(blockers, childBlockers);
+      if (all.length) return { outcome: 'refused', reason: all[0].reason, blockers: all,
+        detail: [formatBlockers(all), ...(child.info || [])].join('\n') };
+    }
+    return child;
   };
 }
 

@@ -102,6 +102,15 @@ describe('recordLocalSlotFallback', () => {
   });
 });
 
+describe('refinedFallbackKind (FB1)', () => {
+  it('refines other from the holder label like the slot row, and keeps named kinds', async () => {
+    const { refinedFallbackKind } = await import('../remote-fallback-log.mjs');
+    expect(refinedFallbackKind('other', ['node', '/x/verify-lane.mjs'])).toBe('verify');
+    expect(refinedFallbackKind('files', ['node', '/x/verify-lane.mjs'])).toBe('files');
+    expect(refinedFallbackKind('other', ['node', '/x/unknown.mjs'])).toBe('other');
+  });
+});
+
 describe('recordLocalSlotFallback detail', () => {
   it('records a bounded detail and keeps null when absent', () => {
     const root = mkdtempSync(join(tmpdir(), 'rfl-detail-'));
@@ -123,5 +132,15 @@ describe('verify-lane local-slot paths', () => {
       const before = lines.slice(Math.max(0, i - 4), i).join('\n');
       expect(before, `acquireSlotBlocking at line ${i + 1} must log a fallback row`).toMatch(/recordLocalSlotFallback\(/);
     }
+  });
+});
+
+describe('R830/R823 local-by-design reasons', () => {
+  it('are advisory and never displace the top real fallback cause', async () => {
+    const { summarize } = await import('../remote-fallback-log.mjs');
+    const out = summarize([{ reason: 'local-unrecognized-failure' }, { reason: 'local-flag' }, { reason: 'local-flag' }, { reason: 'remote-slot-unreadable' }]);
+    expect(out.topReal).toEqual({ reason: 'local-unrecognized-failure', count: 1 });
+    expect(out.advisory).toBe(2);
+    expect(out.byReason).toMatchObject({ 'local-unrecognized-failure': 1 });
   });
 });

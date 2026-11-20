@@ -13,6 +13,7 @@ import {BASE_RETENTION} from './forge-exec-bases.mjs';
 import {resolveTransport,runnerSupportsBundle,planBundle,mainFreshness,bundleEvidence,makeBundleDirectory,removeBundleDirectory} from './remote-git-bundle.mjs';
 import {routeNeedsGit,selectionUnproven} from './needs-git-route.mjs';
 import {writeJsonAtomic} from '../lib/atomic-json-file.mjs';
+import {SKIP_REASON, SECTION_INPUTS, DYNAMIC_SECTIONS, createSectionGate} from '../lib/standards-sections.mjs';
 
 const ROOT = '/srv/forge-exec';
 const LIMIT = 4 * 1024 * 1024;
@@ -637,6 +638,22 @@ export async function buildManifest({cwd = process.cwd(), exec = defaultExec, fs
     indexBlobs.set(key, indexStage === '0' && !indexBlobs.has(key) ? oid : null);
     if (record.subarray(0,6).equals(Buffer.from('120000'))) indexLinks.set(key,indexBlobs.get(key));
     start = i + 1;
+  }
+  // The runner restores HEAD symlinks into its index and cannot prove from the
+  // manifest that the client still has them: a link deleted, retargeted or turned
+  // into a file here (staged or not) can leave an identical-looking projection.
+  // So refuse remote use when the client index differs from HEAD at any HEAD link.
+  if(head!==undefined) {
+    const changed=await exec({file:'git',args:['diff-index','--cached','--raw','-z','--no-renames',head,'--'],cwd});
+    if(changed.code!==0||!Buffer.isBuffer(changed.stdout)||changed.stdout.length>LIMIT
+      ||(changed.stdout.length&&changed.stdout.at(-1)!==0))throw manifestRefusal('head-symlink-changed','HEAD links unreadable');
+    const fields=splitPaths(changed.stdout);
+    if(fields.length%2)throw manifestRefusal('head-symlink-changed','HEAD links unreadable');
+    for(let i=0;i<fields.length;i+=2) {
+      const meta=fields[i].toString('latin1').match(/^:([0-7]{6}) ([0-7]{6}) [a-f0-9]{40,64} [a-f0-9]{40,64} [ACDMTUXB]$/);
+      if(!meta)throw manifestRefusal('head-symlink-changed','HEAD links unreadable');
+      if(meta[1]==='120000')throw manifestRefusal('head-symlink-changed',fields[i+1]);
+    }
   }
   const trackedLinks=new Map();
   for(const key of indexLinks.keys()) {
@@ -1377,11 +1394,45 @@ async function executeRemote({ warningSink, argv, cwd = process.cwd(), env = pro
   const cancel = { signal: cancelSignal ?? new AbortController().signal };
   const nonce = randomBytes(16).toString('hex');
   const tails = {stdout:'',stderr:''};
-  let incompleteStandards = false;
+  const standardsFilesArg = argv.find(arg => arg.startsWith('--files='));
+  const standardsFiles = standardsFilesArg
+    ? standardsFilesArg.split('=').slice(1).join('=').split(/[\s,]+/).map(file => file.trim()).filter(Boolean)
+    : [];
+  let incompleteStandards;
+  const inspectStandardsLine = line => {
+    // A whole-line summary is only a candidate: explicit argv scope and the
+    // local gate must independently agree. Remote backlog links only widen scope,
+    // so a local would-run always contradicts a remote skip. Dynamic inputs
+    // cannot be verified here, so their sections never qualify for the exemption.
+    const plain = line.replace(/\x1b\[[0-9;]*m/g, '').trim();
+    const prefix = `local ${SKIP_REASON}: `;
+    let benign = false;
+    if (plain.startsWith(prefix) && argv.includes('--local') && standardsFiles.length) {
+      try {
+        // bindGit above verifies cwd is the repository root.
+        const gate = createSectionGate({scoped:true, touched:standardsFiles, root:cwd});
+        benign = plain.slice(prefix.length).split(', ').every(id =>
+          Object.hasOwn(SECTION_INPUTS, id) && !DYNAMIC_SECTIONS.has(id) && gate.shouldRun(id) === false);
+      } catch { /* incomplete local evidence requires fallback */ }
+    }
+    // ANSI suffixes such as "2m" must not mask the word boundary before "skipped".
+    const evidence = benign ? '' : plain;
+    if (/\bskipp(?:ing|ed)\b|\bno-scope\b|\bENOENT\b|no changed tier lines; nothing to attribute/i.test(evidence))
+      incompleteStandards ??= line;
+  };
   const observeStandards = (chunk, stream = 'stdout') => {
     const text = tails[stream] + String(chunk);
-    if (/\bskipp(?:ing|ed)\b|\bno-scope\b|\bENOENT\b|no changed tier lines; nothing to attribute/i.test(text)) incompleteStandards = true;
-    tails[stream] = text.slice(-128);
+    const lines = text.split('\n');
+    tails[stream] = lines.pop();
+    for (const line of lines) {
+      if (line.length > 4096) incompleteStandards ??= `standards output line exceeds 4096 characters: ${line.slice(0, 4000)}`;
+      else inspectStandardsLine(line);
+    }
+    // An unbounded/unknown line is incomplete evidence, never a remote green.
+    if (tails[stream].length > 4096) {
+      incompleteStandards ??= `standards output line exceeds 4096 characters: ${tails[stream].slice(0, 4000)}`;
+      tails[stream] = '';
+    }
   };
   const ssh = (command, request, inherit = false) => exec({file:'ssh',
     args:[host, `sudo -n -u ops /usr/local/libexec/forge-exec-run.mjs ${command}`],
@@ -1400,7 +1451,7 @@ async function executeRemote({ warningSink, argv, cwd = process.cwd(), env = pro
     try{return await ssh('finish', {nonce,run,...(cancel.signal.aborted?{cancel:true}:{})});}finally{done();}
   };
   try {
-    let expected, expectedManifest, delta, transferBytes=0, transferCount=0, bundlePlan;
+    let receiptCapabilities, expected, expectedManifest, delta, transferBytes=0, transferCount=0, bundlePlan;
     try {
       const manifestDone=begin('manifest-build');
       const substages=substageTimer(clock),beginSub=stage=>substages.begin(stage);
@@ -1486,7 +1537,7 @@ async function executeRemote({ warningSink, argv, cwd = process.cwd(), env = pro
       const inputDigest = delta ? await digestDeltaInput(delta,workStage,cwd,exec) : await digestInput(workStage, selected);
       stageDone();
       const prepareDone=begin('forge-prepare');
-      const prepared = await ssh('prepare',{nonce,label:runId,capabilities:{taskPressure:1},...(slotUnits > 1 ? {slotUnits} : {}),...(bundleTransport?{gitBundle:true}:{}),...(delta ? {baseSha:delta.baseSha,baseManifestDigest:delta.baseManifestDigest}:{}),...(manifest.siblings ? {siblings:true} : {})});
+      const prepared = await ssh('prepare',{nonce,label:runId,capabilities:{taskPressure:1,throttle:1},...(slotUnits > 1 ? {slotUnits} : {}),...(bundleTransport?{gitBundle:true}:{}),...(delta ? {baseSha:delta.baseSha,baseManifestDigest:delta.baseManifestDigest}:{}),...(manifest.siblings ? {siblings:true} : {})});
       prepareDone();
       if(prepared.code !== 0) {
         // Prepare precedes every byte transfer and cannot have started work.
@@ -1494,10 +1545,11 @@ async function executeRemote({ warningSink, argv, cwd = process.cwd(), env = pro
         throw new Error('Prepare failed');
       }
       const preparation = JSON.parse(protocolText(prepared.stdout,4096));
+      receiptCapabilities = preparation.receiptCapabilities;
       run = preparation.run;
       if(typeof run !== 'string' || !/^r-[a-f0-9]{32}$/.test(run)) {run=undefined; throw new Error('Invalid server run');}
       // Tell the admission wrapper which Forge run this client now owns, so a stale slot marker can be judged per run.
-      try {onRun?.(run);} catch { /* advisory only */ }
+      try {onRun?.(run, {nonce, slot:typeof preparation.slot === 'string' ? preparation.slot : undefined});} catch { /* advisory only */ }
       const slot=preparation.slot??'forge-exec';
       if(slot!=='forge-exec'&&(!/^forge-exec-[1-9]\d*$/.test(slot)||!Array.isArray(preparation.capabilities?.workers)||!preparation.capabilities.workers.includes(slot)))throw new Error('Invalid server slot');
       const runRoot=slot==='forge-exec'?ROOT:ROOT+'/'+slot.replace('forge-exec-','slot-');
@@ -1583,7 +1635,7 @@ async function executeRemote({ warningSink, argv, cwd = process.cwd(), env = pro
       if (error.code === 'git-bundle-failed') return fallback(error.code,error.detail);
       if (['coverage-report-not-portable','diff-coverage-base-unavailable'].includes(error.code)) return fallback(error.code);
       if (error.code === 'excluded-source-file') return {mode:'not-started', terminated:true, reason:error.code, detail:safeFallbackDetail(error.code,error.detail)};
-      return fallback(['ignored-test-file','unshipped-test-file','unshipped-symlink','manifest-worktree-mismatch','manifest-walk-limit','unbound-worktree'].includes(error.code) ? error.code : 'copy-failed',error.detail);
+      return fallback(['ignored-test-file','unshipped-test-file','unshipped-symlink','head-symlink-changed','manifest-worktree-mismatch','manifest-walk-limit','unbound-worktree'].includes(error.code) ? error.code : 'copy-failed',error.detail);
     }
     try {
       const runAt=clock(),runDone=begin('forge-run');
@@ -1618,15 +1670,20 @@ async function executeRemote({ warningSink, argv, cwd = process.cwd(), env = pro
       }
       // x40a9dk: a cancelled client is terminated only when the protected finish succeeded (it reaps the worker
       // UID and removes the run), answering either a matching receipt or the null of a run killed before one.
-      if(cancel.signal.aborted && !(result && verifyReceipt(text,expected,result.code))) {
-        return (reply && reply.cancelAck === true && reply.v === 1 && reply.nonce === nonce && reply.run === run) || (reply && verifyReceipt(text,expected,reply.code)) ? {mode:'cancelled',terminated:true,reason:'client-signal'} : {mode:'unconfirmed',reason:'ambiguous-result'};
+      if(cancel.signal.aborted && !(result && verifyReceipt(text,expected,result.code,receiptCapabilities))) {
+        return (reply && reply.cancelAck === true && reply.v === 1 && reply.nonce === nonce && reply.run === run) || (reply && verifyReceipt(text,expected,reply.code,receiptCapabilities)) ? {mode:'cancelled',terminated:true,reason:'client-signal'} : {mode:'unconfirmed',reason:'ambiguous-result'};
       }
-      if(!result || !verifyReceipt(text,expected,result.code)) return {mode:'unconfirmed',reason:'ambiguous-result'};
+      if(!result || !verifyReceipt(text,expected,result.code,receiptCapabilities)) return {mode:'unconfirmed',reason:'ambiguous-result'};
       if (argv[2] === 'check:standards') {
+        for (const stream of ['stdout', 'stderr']) {
+          inspectStandardsLine(tails[stream]);
+          tails[stream] = '';
+        }
         observeStandards(result.stdout ?? '', 'stdout');
         observeStandards(result.stderr ?? '', 'stderr');
+        for (const stream of ['stdout', 'stderr']) inspectStandardsLine(tails[stream]);
         // Only a matching protected receipt proves it is safe to rerun locally.
-        if (incompleteStandards) return {mode:'cancelled',terminated:true,code:1,reason:'incomplete-standards-inputs'};
+        if (incompleteStandards !== undefined) return {mode:'cancelled',terminated:true,code:1,reason:'incomplete-standards-inputs',detail:incompleteStandards};
       }
       // A verified receipt proves it ran remotely. Without a usable report on a green run, rerun locally;
       // a red run keeps its verdict (verify-lane treats a missing report as unavailable, never green).
@@ -1638,7 +1695,7 @@ async function executeRemote({ warningSink, argv, cwd = process.cwd(), env = pro
         const index=timings.findLastIndex(t=>t.stage==='finish-receipt');
         timings.splice(index,0,{stage:'forge-install',startedAtET:easternTimestamp(runAt),ms:reply.timings.installMs},{stage:'forge-run',startedAtET:easternTimestamp(runAt+reply.timings.installMs),ms:reply.timings.runMs});
       }
-      return {mode:'remote',code:result.code,run};
+      return {mode:'remote',code:result.code,run,...(reply.resources ? {resources:reply.resources,slotUnits} : {}),...(reply.timings ? {runMs:reply.timings.runMs} : {})};
     } catch {return {mode:'unconfirmed',reason:'ambiguous-result'};}
   } finally {
     try {await finish();} catch { /* Pruning is the cleanup backstop; never retry execution. */ }
@@ -1646,9 +1703,11 @@ async function executeRemote({ warningSink, argv, cwd = process.cwd(), env = pro
   }
 }
 
-export function verifyReceipt(text, expected, code) {
+export function verifyReceipt(text, expected, code, receiptCapabilities) {
   try {
     const receipt=JSON.parse(text);
+    const resourceKeys=['cpuUsec','memoryPeakBytes','oomKills'];
+    const throttleKeys=receiptCapabilities?.throttle===1 ? ['nrThrottled','throttledUsec'] : [];
     const taskFields=['processCount','tasksMax','tasksNear','tasksNote'];
     const presentTasks=taskFields.filter(key=>Object.hasOwn(receipt,key));
     // This diagnostic is optional for old runners, but a partial or inconsistent note is not evidence.
@@ -1660,9 +1719,9 @@ export function verifyReceipt(text, expected, code) {
       && !/[\x00-\x1f\x7f-\x9f]/.test(receipt.tasksNote));
     return receipt && validTasks && typeof expected?.manifestDigest === 'string' && /^[a-f0-9]{64}$/.test(expected.manifestDigest)
       && Object.keys(receipt).filter(key=>key!=='timings'&&key!=='resources'&&!taskFields.includes(key)).sort().join(',') === (expected.siblingShas ? 'argvDigest,code,inputDigest,lock,manifestDigest,nonce,phase,run,siblingShas,v' : 'argvDigest,code,inputDigest,lock,manifestDigest,nonce,phase,run,v')
-      && (!Object.hasOwn(receipt,'resources') || (receipt.resources && !Array.isArray(receipt.resources)
-        && Object.keys(receipt.resources).sort().join(',')==='cpuUsec,memoryPeakBytes,oomKills,slotCpus'
-        && ['cpuUsec','memoryPeakBytes','oomKills'].every(key=>receipt.resources[key]===null || Number.isSafeInteger(receipt.resources[key])&&receipt.resources[key]>=0)
+      && (!Object.hasOwn(receipt,'resources') && !throttleKeys.length || (receipt.resources && !Array.isArray(receipt.resources)
+        && [throttleKeys.length ? resourceKeys.concat(throttleKeys,'slotCpus').sort().join(',') : resourceKeys.concat('slotCpus').sort().join(',')].includes(Object.keys(receipt.resources).sort().join(','))
+        && resourceKeys.concat(throttleKeys.filter(key=>Object.hasOwn(receipt.resources,key))).every(key=>receipt.resources[key]===null || Number.isSafeInteger(receipt.resources[key])&&receipt.resources[key]>=0)
         && Number.isSafeInteger(receipt.resources.slotCpus)&&receipt.resources.slotCpus>=1))
       && (!Object.hasOwn(receipt,'timings') || (!!receipt.timings && Object.keys(receipt.timings).sort().join(',')==='installMs,runMs' && [receipt.timings.installMs,receipt.timings.runMs].every(ms=>Number.isSafeInteger(ms)&&ms>=0)))
       && Object.entries(expected).every(([key,value])=>key === 'siblingShas' ? sameSiblingShas(receipt[key],value) : receipt[key]===value)

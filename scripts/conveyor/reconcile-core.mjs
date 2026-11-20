@@ -134,6 +134,7 @@ import { NEGOTIATION_ROUND_CAP } from '../lib/jury-core.mjs';
 import { resolveRoundCap } from '../lib/round-cap.mjs';
 import { countRearmComments, REARM_COMMENT_MARKER } from './rearm-review.mjs';
 import { isFixRoundRearmComment } from './rearm-round-count.mjs';
+import { NOTE_COMMENT_MARKER } from './reconcile-note-comment.mjs';
 // #3383 — see this module's own REFUSAL 3 note below, and `advisory-round-count.mjs`'s header for the
 // `#2117`/`#2298` incident this closes.
 import { countAdvisoryComments, ADVISORY_NOTE_MARKER } from './advisory-round-count.mjs';
@@ -518,9 +519,20 @@ export function reviewHoldGatesOnlyRed(rollup, requiredChecks) {
     || (name === 'merge-gate' && Boolean(mergeGate?.mergeGateReviewHold)));
 }
 
-/** PURE: required reds are exclusively review-owned holds, with all other required evidence green. */
-export function reviewHoldOnlyRed(rollup, requiredChecks) {
+/**
+ * PURE: required reds are exclusively review-owned holds, with all other required evidence green.
+ * @param {object[]} rollup Check rows to assess.
+ * @param {string[]} requiredChecks Required check names.
+ * @param {string} [headSha] When supplied, reject rows whose head_sha identifies another head.
+ * @returns {boolean} Whether only review-owned holds prevent green required CI.
+ * @example
+ * reviewHoldOnlyRed(rollup, ['test', 'review-gate'], headSha);
+ */
+export function reviewHoldOnlyRed(rollup, requiredChecks, headSha) {
   if (!reviewHoldGatesOnlyRed(rollup, requiredChecks)) return false;
+  // A check run from another head is never evidence for this head (strict gate: `wrong-head`).
+  if (headSha && Array.isArray(rollup) && rollup.some(row => row?.head_sha != null
+    && String(row.head_sha).toLowerCase() !== String(headSha).toLowerCase())) return false;
   const latest = collapseRollupToLatestPerName(rollup);
   const failing = splitFailingChecks(latest, requiredChecks).required;
   // Removing the proven holds must leave complete, readable green CI, never pending or unknown evidence.
@@ -664,7 +676,8 @@ export function startedAtMs(startedAt) {
 /**
  * we:scripts/conveyor/reconcile-core.mjs#countFindings — how many comments on this PR are a REVIEWER speaking,
  * rather than the conveyor talking to itself. A comment whose LEADING line is one of
- * {@link BOOKKEEPING_MARKERS} is this loop's own record and is not a finding. Pure.
+ * {@link BOOKKEEPING_MARKERS} is this loop's own record and is not a finding. Note comments additionally
+ * require the same trusted-author gate as `hasPostedNoteComment` and a valid episode-key line. Pure.
  *
  * The leading-line narrowing matches `countRearmComments`'s, and for the same reason: a human who QUOTES a
  * marker comment in their reply is raising a finding, not posting a marker, and must not be discounted.
@@ -679,6 +692,8 @@ export function countFindings(comments) {
     if (typeof body !== 'string') continue;
     const head = body.trimStart();
     if (BOOKKEEPING_MARKERS.some((m) => head.startsWith(m))) continue;
+    if (head.split(/\r?\n/, 1)[0] === NOTE_COMMENT_MARKER && isTrustedMarkerAuthor(c)
+      && /^<!-- conveyor-note-key: [a-z][a-z0-9-]*:(?:\d+|unknown)(?::[^\r\n<>]*)? -->$/m.test(body)) continue;
     n += 1;
   }
   return n;
@@ -1555,13 +1570,33 @@ function timingFacts(pr, { agents = [], repo, requiredChecks = null, reviewDispa
     reviewPending: reviewCanFinish, requiredChecks });
 }
 
+/**
+ * PURE: a review-hold advisory may skip the CI wait only when the strict start gate is satisfied except for the
+ * held gates themselves (review-gate, or a merge-gate annotated as a review hold). Pending, skipped, neutral,
+ * missing or wrong-head required checks all keep the strict refusal, exactly as on the reader path.
+ * @param {{ pr: object, requiredChecks: string[] }} input PR row and required check names.
+ * @returns {boolean} Whether CI may be waived for the review-hold advisory.
+ * @example
+ * reviewHoldCiWaivable({ pr, requiredChecks: ['review-gate', 'merge-gate'] });
+ */
+export function reviewHoldCiWaivable({ pr, requiredChecks }) {
+  const ci = reviewStartGate({ headSha: pr?.headRefOid, requiredChecks, checks: pr?.statusCheckRollup, verifyGreen: pr?.verifyGreen, policy: pr?.reviewTiming });
+  if (ci.allowed) return true;
+  const rollup = Array.isArray(pr?.statusCheckRollup) ? pr.statusCheckRollup : [];
+  const annotated = rollup.some(row => row?.name === 'merge-gate' && row.mergeGateReviewHold);
+  return Array.isArray(ci.affected) && ci.affected.length > 0
+    && ci.affected.every(row => FAILED_CHECK_CONCLUSIONS.includes(String(row.reason).toUpperCase())
+      && (row.name === 'review-gate' || (row.name === 'merge-gate' && annotated)))
+    && reviewHoldOnlyRed(rollup, requiredChecks, pr?.headRefOid);
+}
+
 /** A shared prerequisite for every review emission, including advisory review branches. */
 function reviewChecksAllow({ pr, requiredChecks, refuse, withPhase, extra = {} }) {
   const ci = reviewStartGate({ headSha: pr?.headRefOid, requiredChecks, checks: pr?.statusCheckRollup, verifyGreen: pr?.verifyGreen, policy: pr.reviewTiming });
   // Excuse only failed conclusions, preserving missing-head, wrong-head and incomplete-evidence refusals.
   const onlyFailures = ci.reason === 'ci-red' || (ci.affected.length > 0
     && ci.affected.every(row => FAILED_CHECK_CONCLUSIONS.includes(row.reason.toUpperCase())));
-  const allowed = ci.allowed || (onlyFailures && reviewHoldOnlyRed(pr?.statusCheckRollup, requiredChecks));
+  const allowed = ci.allowed || (onlyFailures && reviewHoldOnlyRed(pr?.statusCheckRollup, requiredChecks, pr?.headRefOid));
   if (!allowed) refuse('review-ci', {
     ...withPhase, ...extra, ci, ...earlyStartShadowFields(pr, requiredChecks),
     why: `${ci.reason}: ${ci.affected.map(row => `${row.name}=${row.reason}`).join(', ')}`,
@@ -2331,6 +2366,7 @@ export function planReconcile({
     const realFixRounds = countRealFixRounds(pr);
     const openSendBacks = openOperatorSendBacks(pr);
     const base = {
+      ...(pr.timeoutRetry?.reason === 'log-unreadable' ? { ciLogEvidenceReason: 'log-unreadable' } : {}),
       ...(openSendBacks.length ? { openOperatorSendBacks: openSendBacks } : {}),
       ...(realFixRounds.ok ? { mechanicalRebaseRounds: realFixRounds.total - realFixRounds.real } : {}),
       ...(roundExtensions > 0 ? { roundExtensions, roundExtensionAnchor: {
@@ -2625,6 +2661,12 @@ export function planReconcile({
         standDowns: stoodDown,
         why: `a fix agent already stopped here to ask a question — re-dispatching would re-ask it forever. Terminal on this head until an explicit operator answer is recorded with stand-down-answer.mjs. fix.standDownHoldsAcrossHeads=${standDownHoldsAcrossHeads.value} (source: ${standDownHoldsAcrossHeads.source}).`,
       });
+      // Use the shared operator-note publisher: its trusted episode marker posts once,
+      // while the refusal continues to hold until an explicit answer. Count all historical
+      // stand-downs so a later question on the same head starts a new episode.
+      notes.push({ kind: 'stood-down', prNumber,
+        text: `PR #${prNumber}: needs your decision — unanswered stand-down on head ${pr.headRefOid ?? 'unknown'}`
+          + ` (question ${standDownComments(pr.comments).length}). Record an explicit operator answer with stand-down-answer.mjs.` });
       continue;
     }
 
@@ -2790,7 +2832,9 @@ export function planReconcile({
 
     // ── PHASE, BORROWED. `classifyPr` for the labels, `reduceCheckState` for CI truth. Not re-derived.
     const phase = classifyPr({
-      state: pr?.state, labels: pr?.labels, mergeStateStatus: pr?.mergeStateStatus,
+      // The planner accepts strings and GraphQL label objects; the board classifier
+      // accepts objects only. Never let a live send-back disappear behind an older accept.
+      state: pr?.state, labels: labelNames(pr?.labels).map(name => ({ name })), mergeStateStatus: pr?.mergeStateStatus,
       statusCheckRollup: pr?.statusCheckRollup,
     }, requiredChecks);
     const check = reduceCheckState(pr?.statusCheckRollup, requiredChecks);
@@ -2984,7 +3028,9 @@ export function planReconcile({
       // Card 273, #5157: review-pr INVARIANT 2 never accepts a review:human PR.
       dispatchReviewRow({ pr, requiredChecks, withPhase, base, attempts: roundAttempts(),
         roundCap: effectiveRoundCap, now, refuse: folded, refuseCapExhausted: capExhaustedVia(folded), dispatch,
-        extra: { humanHandoffAdvisory: true }, advisoryReview: { head: headSha, reason, ciWaived: true,
+        extra: { humanHandoffAdvisory: true }, advisoryReview: { head: headSha, reason,
+          // A review-hold advisory waives only the held gate: any other required check still pending/red keeps the CI wait.
+          ciWaived: reason !== 'review-hold' || reviewHoldCiWaivable({ pr, requiredChecks }),
           why: reason === 'human-handoff'
             ? 'ci-heal handed this head to a human, so one advisory AI review runs so the human gets its verdict; it never accepts a review:human PR'
             : 'review holds handed this head to review, so one advisory AI review supplies its verdict; it never accepts a review:human PR' } });
@@ -3978,6 +4024,7 @@ export function planReconcile({
     // floor below, which a PR can independently have already exhausted on real review negotiation (CONFIRMED
     // LIVE: `web-everything/web-everything#2549`, `review-round:5` against the shared cap of 5, zero conflict-fix
     // rounds ever run). See that constant's own docblock for the full incident.
+    // DIRTY alone stays on the ordinary review-repair path and consumes its shared allowance.
     const isConflictBounce = phase === 'bounced' && withPhase.labels.includes(CONFLICT_LABEL);
     if (isConflictBounce) {
       // #2787-live-incident — `currentRef` is `defaultBranch` (this population is, by definition, a main-base
@@ -4008,6 +4055,7 @@ export function planReconcile({
       const advisoryAlsoPending = withPhase.labels.includes(ADVISORY_LABELS.CHANGES);
       dispatch.push({
         ...base, ...withPhase, kind: 'fix', isConflict: true, advisoryPending: advisoryAlsoPending,
+        conflictFixMechanical: pr.baseRefName === defaultBranch && ['clean', 'manifest-only'].includes(pr.conflictDisposition),
         findings, attempts: conflictAttempts, cap: conflictFixCapHere,
         why: `bounced with ${findings} finding(s) via a mechanical conflict-resolution route (merge-status:conflicting),`
           + ` nothing live is working it, and ${conflictAttempts} of ${conflictFixCapHere} conflict-fix attempts are spent`

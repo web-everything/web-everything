@@ -100,7 +100,9 @@ async function replayCase(runAgyReviewJuror, scenario) {
           const foreign = scenario.foreignId ? `${JSON.stringify({ event: 'step_update', step_update: {
             step_type: 'message', step_index: 2, conversation_id: 'other-conversation', state: 'DONE',
           } })}\n` : '';
-          writeFileSync(transcriptFile, scenario.emptyTranscript ? '' : `${JSON.stringify({ event: 'step_update', step_update })}\n${foreign}`);
+          // A real agy transcript ends in a terminal `result` event; the juror refuses an empty or unrelated one (R1062).
+          const terminal = `${JSON.stringify({ event: 'result', result: { conversation_id: SESSION, status: 'SUCCESS', response: 'fixture review' } })}\n`;
+          writeFileSync(transcriptFile, scenario.emptyTranscript ? '' : `${JSON.stringify({ event: 'step_update', step_update })}\n${foreign}${terminal}`);
           return { value: { summary: 'fixture review', findings: [] }, sessionId: SESSION, transcriptFile };
         },
       },

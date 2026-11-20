@@ -1,5 +1,7 @@
 import { greenLedgerDir, hasGreenLedger } from '../lib/lane-verify.mjs';
 import { unread } from './dispatch-eligibility.mjs';
+import { isDrainTransientPath } from '../lib/transient-paths.mjs';
+import { gitMergeTreeParsed } from './parked-pr-conflict-watch.mjs';
 import { resolveCoordinationRoot } from '../operations/coordination-root.mjs';
 import { pidIdentity, holderStartedBy } from '../lib/pid-alive.mjs';
 import { resolveTimingPolicy } from '../lib/review-timing-settings.mjs';
@@ -65,6 +67,7 @@ import { FAILING_CONCLUSIONS, NON_BLOCKING_CONCLUSIONS, reduceCheckState } from 
 import { checksArgv, parseJsonLines, GH_TIMEOUT_MS } from '../operations/pr-status-io.mjs';
 import { isGhDeferred } from '../lib/gh-deferred.mjs';
 import { readTimeoutBudget } from './timeout-retry-state.mjs';
+import { resolveTimeoutEvidenceConcurrency, runTimeoutEvidencePool } from './timeout-evidence-pool.mjs';
 import { EVIDENCE_READ_BACKOFF_MS, isEvidenceReadTimeout, syncSleep } from './evidence-read-retry.mjs';
 import { isInfraCancelledOnlyRun, isInfraCancelledJob, isAggregateGateFailure, classifyInfraCancelled, resolveInfraCancelledMode, DEFAULT_INFRA_CANCELLED_MAX_RERUNS, authoritativeCheckRuns } from './infra-cancelled.mjs';
 import { createHash } from 'node:crypto';
@@ -321,7 +324,7 @@ export function enrichPrsWithReviewEvidence(prs, { repo, readCommits = fetchPrCo
  */
 /** `PR_LIST_JSON_FIELDS` minus `author`: `author` is not a snapshot field, so asking for it made EVERY production read
  *  bypass the shared paged snapshot and run a heavy 200-row `gh pr list` (HTTP 504 all day, 2026-11-03). */
-export const SNAPSHOT_LIST_FIELDS = PR_LIST_JSON_FIELDS.split(',').filter(f => f !== 'author').join(',');
+export const SNAPSHOT_LIST_FIELDS = [...PR_LIST_JSON_FIELDS.split(',').filter(f => f !== 'author'), 'rowsHead', 'rowsComplete'].join(',');
 const pagedHeavyCache = new Map();
 /** A `fresh` read may reuse a cached heavy read (comments/body/files) only if it was taken AFTER its PR's `updatedAt`
  *  second had ended: updatedAt has 1 s granularity, so a comment posted in the same second as a cached read would leave
@@ -416,9 +419,9 @@ export function defaultReadPrs({ exec = execFileSyncThrottled, repo = null, read
   readShared = readSharedOpenPrs, listPaged = listOpenPrsPagedHydrated, readRest = ghRestGetJson, retryOpts = {},
   // `fresh`: skip the host-shared snapshot (valid ~75 s, may predate the caller's own baseline probe) but still read small
   // pages — never the heavy 200-row `gh pr list`. The fix daemon plans from such a read.
-  fresh = false, readOnly = false } = {}) {
+  fresh = false, readOnly = false, step = (_name, fn) => fn() } = {}) {
   const enrichFresh = (rows, extra = {}) => enrichPrsWithCompleteComments(enrichPrsWithReviewEvidence(rows, { repo: attributionRepo, readCommits: (slug, number, opts) => readCommits(slug, number, { ...opts, ...(exec !== execFileSyncThrottled ? { exec: args => exec('gh', args) } : {}), ...(readOnly ? { git: readOnlyGitExec } : {}) }) }), { repo: attributionRepo ?? repo, ...(readComments ? { readComments } : {}), ...extra });
-  const enrich = rows => {
+  const enrich = rows => step('planner-cache-diff', () => {
     if (readOnly || factCache?.mode !== 'shadow') return enrichFresh(rows);
     const out = [];
     for (const pr of rows) {
@@ -453,7 +456,7 @@ export function defaultReadPrs({ exec = execFileSyncThrottled, repo = null, read
     }
     if (rows.discoveryIncomplete === true || out.length !== rows.length) Object.defineProperty(out, 'discoveryIncomplete', { value: true });
     return out;
-  };
+  });
   // #gh-graphql-budget — read the host-shared open-PR snapshot (one right-sized list per repo per TTL for the
   // whole fleet) instead of a private `gh pr list`; null = not applicable (tests, cwd repo) → the direct read below.
   // Production path: ONE retried read (shared snapshot, else small pages) — a 502/503/504 is retried with backoff and a
@@ -502,7 +505,7 @@ export function defaultReadPrs({ exec = execFileSyncThrottled, repo = null, read
     if (!Array.isArray(listed)) return listed;
     return enrich(listed);
   }
-  if (exec === execFileSyncThrottled) { const shared = readSharedOpenPrs({ repo, fields: PR_LIST_JSON_FIELDS, allowDeferred: true, ...(readOnly ? { cacheOnly: true } : {}) }); if (shared) return Array.isArray(shared) ? enrich(shared) : shared; }
+  if (exec === execFileSyncThrottled) { const shared = readSharedOpenPrs({ repo, fields: SNAPSHOT_LIST_FIELDS, allowDeferred: true, ...(readOnly ? { cacheOnly: true } : {}) }); if (shared) return Array.isArray(shared) ? enrich(shared) : shared; }
   const rows = direct();
   return Array.isArray(rows) ? enrich(rows) : rows;
 }
@@ -1298,10 +1301,9 @@ export function defaultReadPullsForCommit(sha, { exec = execFileSyncThrottled, r
  * file-by-file, present on `main` — see `we:scripts/lib/already-landed-content.mjs`'s own header for the full
  * incident and why this needs blob identity rather than a plain diff.
  *
- * PAYS THE EXTRA READS ONLY FOR A PR CARRYING `merge-status:conflicting` — the population
- * `we:scripts/conveyor/parked-pr-conflict-watch.mjs` already narrows this to (a real merge conflict on a
- * review-parked PR), and the ONLY phase `reconcile-core.mjs`'s own `isConflictBounce` would otherwise dispatch a
- * mechanical conflict-fix for. A pass with no such PR (the common case) costs nothing beyond the label scan
+ * PAYS THE EXTRA READS ONLY FOR A PR CARRYING `merge-status:conflicting` OR `mergeStateStatus: DIRTY` —
+ * the same conflict evidence `reconcile-core.mjs`'s own `isConflictBounce` would dispatch a mechanical
+ * conflict-fix for. A pass with no such PR (the common case) costs nothing beyond the conflict scan
  * `defaultReadPrs` already fetched every field for.
  * @param {Array<object>} prs
  * @param {{fetchRef?:Function, readMergeBase?:Function, readChanges?:Function, findMatchingCommit?:Function,
@@ -1316,7 +1318,8 @@ export function enrichPrsWithAlreadyLandedFacts(prs, {
   const list = Array.isArray(prs) ? prs : [];
   const mainRef = mainRefFor(defaultBranch);
   return list.map((pr) => {
-    if (!hasLabel(pr?.labels, CONFLICT_LABEL)) return pr;
+    if (!hasLabel(pr?.labels, CONFLICT_LABEL)
+      && String(pr?.mergeStateStatus ?? '').toUpperCase() !== 'DIRTY') return pr;
     const prNumber = Number(pr?.number);
     const headSha = pr?.headRefOid;
     if (!Number.isInteger(prNumber) || prNumber <= 0 || !isSha(headSha) || !mainRef) return pr;
@@ -1379,6 +1382,33 @@ export function enrichPrsWithBaseRefFacts(prs, { resolveRef = defaultResolveMain
     if (!baseRefName || baseRefName === defaultBranch) return pr;
     if (!shaByRef.has(baseRefName)) shaByRef.set(baseRefName, resolveRef(baseRefName));
     return { ...pr, baseRefSha: shaByRef.get(baseRefName) ?? null };
+  });
+}
+
+export const CONFLICT_DISPOSITION_MAX_PER_PASS = 20;
+/** Bound git probes; unprobed rows retain the ordinary dispatch budget (no exemption). */
+export function enrichPrsWithConflictDisposition(prs, { compute = gitMergeTreeParsed,
+  defaultBranch = 'main', mainSha = defaultResolveMainSha(defaultBranch), max = CONFLICT_DISPOSITION_MAX_PER_PASS } = {}) {
+  let remaining = Number.isInteger(max) && max > 0 ? max : 0;
+  return prs.map(pr => {
+    // Supplied/stale evidence is never trusted: only a probe made this pass may set the field.
+    const stripped = Object.hasOwn(pr, 'conflictDisposition') ? { ...pr, conflictDisposition: null } : pr;
+    if (!remaining || (pr.state != null && pr.state !== 'OPEN') || pr.baseRefName !== defaultBranch
+      || !(pr.mergeable === 'CONFLICTING' || pr.mergeStateStatus === 'DIRTY' || hasLabel(pr.labels, 'merge-status:conflicting'))) return stripped;
+    // Without both planner pins the result cannot qualify; do not fetch refs or spend probe capacity.
+    if (!isSha(mainSha) || !isSha(pr.headRefOid)) return { ...stripped, conflictDisposition: null };
+    remaining--;
+    let conflictDisposition = null;
+    try {
+      const parsed = compute({ pr, includeRefEvidence: true });
+      if (isSha(mainSha) && isSha(pr.headRefOid) && parsed?.fetchSucceeded === true
+        && parsed.headSha === pr.headRefOid && parsed.baseSha === mainSha) {
+        if (parsed.clean === true) conflictDisposition = 'clean';
+        else if (parsed.clean === false && parsed.exitCode === 1 && parsed.unrecognizedConflictLines === 0 && parsed.conflictPaths?.length > 0
+          && parsed.conflictPaths.every(path => isDrainTransientPath(path))) conflictDisposition = 'manifest-only';
+      }
+    } catch { /* Unknown evidence never earns a mechanical exemption. */ }
+    return { ...pr, conflictDisposition };
   });
 }
 
@@ -1611,7 +1641,8 @@ function hydrateChecks(prs, { repo, requiredChecks, readChecks, defaultBranch })
     const known = runs.length && ['red', 'pending'].includes(reduceCheckState(runs, requiredChecks).state) ? runs : null;
     // A refused or never-started read leaves a rollup that may miss a live run (past the page limit, or unread):
     // flag it so a mechanical re-run, which GitHub rejects against a live run, holds instead of guessing.
-    ready.push({ ...pr, statusCheckRollup: (refused || neverStarted) && known ? known : result.error ? [] : result.rows,
+    // The rows are no longer the GraphQL rollup the evidence describes, so it must not read as complete.
+    ready.push({ ...pr, rowsComplete: false, rowsHead: null, statusCheckRollup: (refused || neverStarted) && known ? known : result.error ? [] : result.rows,
       ...((refused || neverStarted) ? { rollupIncomplete: true } : {}) });
   }
   return { prs: ready, refusals, notes, owedTriggers };
@@ -1674,6 +1705,7 @@ export function runReconcilePass({
   // #4265 — the stacked-base conflict-fix cap's own `currentSha` (see {@link enrichPrsWithBaseRefFacts}'s own
   // docblock). Injectable exactly like every other enrich step above, so a test supplies a fixture with no git.
   enrichBaseRef = enrichPrsWithBaseRefFacts,
+  enrichConflictDisposition = enrichPrsWithConflictDisposition,
   // #4263 — re-arms a `waiting-on-system-fix` ci-heal escalation once its named fix PR lands (see
   // {@link enrichPrsWithSystemFixFacts}'s own docblock). Injectable exactly like every other enrich step above.
   enrichSystemFix = enrichPrsWithSystemFixFacts,
@@ -1737,17 +1769,23 @@ export function runReconcilePass({
   if (repoKey === null) throw new Error(`reconcile-pass: --repo ${repo} is not a constellation repo`);
   const step = (name, fn) => {
     const startedAt = stepNow();
-    try { return fn(); } finally {
-      try { stepLog(`reconcile-pass: planner-step name=${name} repo=${repoKey} ms=${stepNow() - startedAt} startedAt=${new Date(startedAt).toISOString()}`); } catch { /* best-effort */ }
-    }
+    // Preserve the original failure output for the smoke classifier when a read throws.
+    const result = fn();
+    try { stepLog(`reconcile-pass: planner-step name=${name} repo=${repoKey} ms=${stepNow() - startedAt} startedAt=${new Date(startedAt).toISOString()}`); } catch { /* best-effort */ }
+    return result;
   };
   const timedStep = (name, fn) => (...args) => step(name, () => fn(...args));
+  enrichStandDownAutoProceed = timedStep('enrich-stand-down-auto-proceed', enrichStandDownAutoProceed);
+  loadLadder = timedStep('load-fixer-ladder', loadLadder);
+  resolveMainSha = timedStep('resolve-main-sha', resolveMainSha);
+  readPriority = timedStep('read-main-red-priority', readPriority);
   readAgents = timedStep('read-agents', readAgents);
   enrich = timedStep('enrich-agents', enrich);
   excuseMergeGateHolds = timedStep('excuse-merge-gate-holds', excuseMergeGateHolds);
   enrichMainRed = timedStep('enrich-main-red', enrichMainRed);
   enrichAlreadyLanded = timedStep('enrich-already-landed', enrichAlreadyLanded);
   enrichBaseRef = timedStep('enrich-base-ref', enrichBaseRef);
+  enrichConflictDisposition = timedStep('enrich-conflict-disposition', enrichConflictDisposition);
   enrichSystemFix = timedStep('enrich-system-fix', enrichSystemFix);
   enrichEscalationBase = timedStep('enrich-escalation-base', enrichEscalationBase);
   enrichFixClaims = timedStep('enrich-fix-claims', enrichFixClaims);
@@ -1767,7 +1805,7 @@ export function runReconcilePass({
   // `owner/name` slug, never the raw input. `repo == null` stays `null` (gh infers the repo from cwd, same as
   // before) — only a caller-supplied value is normalised.
   const resolvedRepo = repo == null ? null : CONSTELLATION_REPOS[repoKey].slug;
-  const rawPrs = readPrs({ repo: resolvedRepo, ...(readOnly ? { readOnly: true } : {}), ...(readPrs === defaultReadPrs ? { attributionRepo: CONSTELLATION_REPOS[repoKey].slug } : {}) });
+  const rawPrs = step('read-prs', () => readPrs({ repo: resolvedRepo, ...(readOnly ? { readOnly: true } : {}), ...(readPrs === defaultReadPrs ? { attributionRepo: CONSTELLATION_REPOS[repoKey].slug, step } : {}) }));
   if (isGhDeferred(rawPrs)) return { ...rawPrs, dispatch: [], refusals: [], notes: [rawPrs.message], prs: 0, agents: 0 };
   // #4501 — read the live required-check set (branch protection, cached; degrades to
   // the repo's declared fallback if the live fetch fails) BEFORE enriching main-red facts, so BOTH
@@ -1777,7 +1815,7 @@ export function runReconcilePass({
   // one pass over the same PRs. A repo this constellation does not know the gh slug for (`resolvedRepo` stays
   // `null`, `gh` infers from cwd) can return an unavailable empty set. The shared reducer then evaluates
   // observed CI checks, retaining red/pending/unchecked evidence; [] never means an automatic pass.
-  const { checks: requiredChecks } = readRequiredChecks({ repo: resolvedRepo, branch: defaultBranch,
+  const { checks: requiredChecks, source: rosterSource } = readRequiredChecks({ repo: resolvedRepo, branch: defaultBranch,
     ...(readOnly ? { readOnly: true } : {}) });
   // we:backlog/x5uqim1-*.md — attach `requiredCheckCompletedAt`/`aheadByOnMain` to any currently-failing
   // PR and read `main`'s own red windows, so `planReconcile` can tell a `ci-red` PR caused by a red `main` apart
@@ -1787,6 +1825,9 @@ export function runReconcilePass({
   const hydrated = step('hydrate-checks', () => hydrateChecks(rawPrs, {
     repo: resolvedRepo ?? CONSTELLATION_REPOS[repoKey].slug, requiredChecks, readChecks, defaultBranch,
   }));
+  if (typeof rosterSource === 'string') hydrated.prs = hydrated.prs.map(pr => ({ ...pr, rosterSource }));
+  const covered = hydrated.prs.filter(pr => pr.rowsComplete === true && pr.rowsHead === pr.headRefOid).length;
+  console.error(`check-evidence-coverage: ${covered}/${hydrated.prs.length} PRs rowsComplete===true && rowsHead===headRefOid`);
   // Evidence is applied before every downstream CI reader, including main-red attribution.
   const autoProceedPrs = !readOnly && allowStandDownAutoProceed === true ? enrichStandDownAutoProceed(hydrated.prs, {
     repo: CONSTELLATION_REPOS[repoKey].slug, requiredChecks, defaultBranch, env,
@@ -1805,10 +1846,21 @@ export function runReconcilePass({
   const alreadyLandedPrs = enrichAlreadyLanded(redPrs, { repo: resolvedRepo, defaultBranch, ...(readOnly ? { readOnly: true } : {}) });
   // #4265 — attach each stacked PR's own base ref's current tip, purely locally, no `gh` cost.
   const baseRefPrs = enrichBaseRef(alreadyLandedPrs, { defaultBranch });
+  let fixSettings = {};
+  try { fixSettings = loadFixSettings({ env }); } catch { /* No exemption without settings. */ }
+  const mainSha = resolveMainSha(defaultBranch);
+  console.error(`fix.conflictFixesPerPass=${fixSettings?.conflictFixesPerPass ?? 0} (source: ${fixSettings?.sources?.conflictFixesPerPass ?? 'unknown'})`);
+  const conflictCap = fixSettings?.conflictFixExemptPerPass;
+  console.error(`fix.conflictFixExemptPerPass=${conflictCap ?? 0} (source: ${fixSettings?.sources?.conflictFixExemptPerPass ?? 'unknown'})`);
+  const conflictPrs = Number.isInteger(conflictCap) && conflictCap > 0
+    ? enrichConflictDisposition(baseRefPrs, { defaultBranch, mainSha, compute: ({ pr, includeRefEvidence }) => {
+      const cwd = repoKey === 'we' ? REPO_ROOT : resolveLanePoolRepoPath(CONSTELLATION_REPOS[repoKey].slug);
+      return cwd ? gitMergeTreeParsed({ pr, cwd, includeRefEvidence, ...(readOnly ? { exec: readOnlyGitExec } : {}) }) : null;
+    } }) : baseRefPrs;
   // #4263 — re-check any `waiting-on-system-fix` escalation's named fix PR for having since landed.
   const fixerLadder = loadLadder();
   if (fixerLadder.error) console.error(`fixer-escalation: ignoring the local override, using the platform default: ${fixerLadder.error}`);
-  const prsBeforeMechanical = enrichScopeBloat(enrichCodeQL(enrichRulings(enrichReferralAutoResolve(enrichLedgerHolds(enrichReferralHolds(enrichTimeouts(enrichFixClaims(enrichSystemFix(enrichEscalationBase(baseRefPrs, { repo: CONSTELLATION_REPOS[repoKey].slug, defaultBranch }), { repo: resolvedRepo }), { repo: repoKey }),
+  const prsBeforeMechanical = enrichScopeBloat(enrichCodeQL(enrichRulings(enrichReferralAutoResolve(enrichLedgerHolds(enrichReferralHolds(enrichTimeouts(enrichFixClaims(enrichSystemFix(enrichEscalationBase(conflictPrs, { repo: CONSTELLATION_REPOS[repoKey].slug, defaultBranch }), { repo: resolvedRepo }), { repo: repoKey }),
     { repo: CONSTELLATION_REPOS[repoKey].slug }), { repo: CONSTELLATION_REPOS[repoKey].slug, now }), { repo: CONSTELLATION_REPOS[repoKey].slug, now, env, ...(readOnly ? { readOnly: true } : {}) }), { repo: CONSTELLATION_REPOS[repoKey].slug, env }), { humanAt: fixerLadder.humanAt }), { repo: CONSTELLATION_REPOS[repoKey].slug }),
     { repo: CONSTELLATION_REPOS[repoKey].slug, defaultBranch });
   if (repoKey === 'we') enrichOwedMainRule(prsBeforeMechanical, { repo: CONSTELLATION_REPOS[repoKey].slug, settings: resolveRefreshSettings({ env }) });
@@ -1823,7 +1875,6 @@ export function runReconcilePass({
   const rulingPrs = step('enrich-review-churn', () => enrichPrsWithReviewChurn(enrichStandingRulingGrants(prsBeforeRulings, { repo: CONSTELLATION_REPOS[repoKey].slug }), { repo: CONSTELLATION_REPOS[repoKey].slug }));
   const listedAgents = readAgents(readOnly ? { readOnly: true } : {});
   const agents = preserveIncomplete(listedAgents, enrich(listedAgents));
-  const mainSha = resolveMainSha(defaultBranch);
   const owedCiRerunSetting = loadOwedCiRerunSettings({ env });
   console.error(`fix.owedCiRerun rerun=${owedCiRerunSetting.value.rerun} maxRerunsPerHead=${owedCiRerunSetting.value.maxRerunsPerHead} (${owedCiRerunSetting.source})`);
   const staleCiRerunSetting = loadStaleCiRerunSetting({ env });
@@ -1840,7 +1891,7 @@ export function runReconcilePass({
     roundCap: resolveRoundCap(env),
     repo: repoKey, prs, agents, durableCounts: durableCountsFrom(prs), now, defaultBranch, mainRedWindows,
     mainLatestCheckRuns, requiredChecks, mainSha, fixerLadder,
-    ...fixCapSettings(loadFixSettings, env, loadTakeoverBudget),
+    ...fixCapSettings(() => fixSettings, env, loadTakeoverBudget),
     ...operatorRulingRoundsSetting(loadOperatorRulingRounds, env),
     ...roundExtensionAnchorSetting(loadRoundExtensionAnchorSetting, env),
     ...takeoverReviewSetting(loadReviewSettings, env),
@@ -1893,8 +1944,12 @@ if (IS_CLI) {
     else flags[a.slice(2, eq)] = a.slice(eq + 1);
   }
   let result;
+  // A later read can fail after successful steps. Keep their diagnostics out of a
+  // failed child's first line: live-smoke classifies the original failure summary.
+  const stepLines = [];
   try {
     result = runReconcilePass({
+      stepLog: line => stepLines.push(line),
       repo: typeof flags.repo === 'string' ? flags.repo : null,
       ...(typeof flags['prs-file'] === 'string' ? { readPrs: () => readPrsFromFile(flags['prs-file']) } : {}),
       ...(typeof flags['agents-file'] === 'string' ? { readAgents: () => readPrsFromFile(flags['agents-file']) } : {}),
@@ -1903,6 +1958,7 @@ if (IS_CLI) {
     process.stderr.write(`✗ reconcile pass could not read state: ${String((e && e.message) || e).split('\n')[0]}\n`);
     process.exit(1);
   }
+  for (const line of stepLines) console.error(line);
   if (flags.json) process.stdout.write(JSON.stringify(result) + '\n');
   else process.stdout.write(formatReport(result) + '\n');
 }
@@ -2099,7 +2155,13 @@ function readTimeoutEvidenceOnce(pr, { repo, exec = execFileSyncThrottled, ts, r
     return raw ? String(value) : JSON.parse(value);
   };
   const api = reader?.api ?? plainApi;
-  const readLog = reader?.readLog ?? ((job) => plainApi(`repos/${repo}/actions/jobs/${job.id}/logs`, true));
+  const rawLog = reader?.readLog ?? ((job) => plainApi(`repos/${repo}/actions/jobs/${job.id}/logs`, true));
+  const readLog = job => {
+    try { return rawLog(job); } catch (error) {
+      if (isEvidenceReadTimeout(error)) throw error;
+      throw Object.assign(new Error('log-unreadable'), { reason: 'log-unreadable', cause: error });
+    }
+  };
   const factsGate = reader || factsOverride ? (factsOverride ?? checkFixFacts)({ repo, number: pr.number, head: pr.headRefOid }) : null;
   if (factsGate?.stale) return { eligible: false, reason: `timeout-evidence:${factsGate.reason}` };
   const head = pr.headRefOid;
@@ -2194,7 +2256,9 @@ function readTimeoutEvidenceOnce(pr, { repo, exec = execFileSyncThrottled, ts, r
     return result;
   } catch (error) {
     if (isEvidenceReadTimeout(error)) return { eligible: false, unknown: true, reason: `timeout-evidence-unknown:${error.message}` };
-    return { eligible: false, reason: `timeout-evidence:${error.message}` };
+    return error.reason === 'log-unreadable'
+      ? { eligible: false, reason: 'log-unreadable' }
+      : { eligible: false, reason: `timeout-evidence:${error.message}` };
   }
 }
 
@@ -2211,34 +2275,69 @@ function defaultReadCheckOrigin({ repo, head, name, exec = execFileSyncThrottled
 export function enrichPrsWithTimeoutEvidence(prs, {
   repo, read = readTimeoutEvidence, readBudget = readTimeoutBudget, enabled = process.env.WE_CI_TIMEOUT_RERUN_ENABLED !== '0',
   readCheckOrigin = defaultReadCheckOrigin,
+  env = process.env, concurrency: requestedConcurrency,
+  poolRunner = runTimeoutEvidencePool, log = line => console.error(line),
+  clock = Date.now,
   infraMode = resolveInfraCancelledMode(repoKeyForSlug(repo)), infraMaxReruns = DEFAULT_INFRA_CANCELLED_MAX_RERUNS,
 } = {}) {
   // GRADUATED 2026-10-04 (PR #3826): the opt-in flag was never set on the edge, so the re-run that does not spend
   // heal budget was dead code and a flaky-timeout PR burned 3/3 heals. On by default now; `=0` is the kill switch.
   if (!enabled) return prs;
-  return prs.map((pr) => {
-    if (!(pr.statusCheckRollup ?? []).some((c) => c.name !== 'review-gate'
-      && ['failure', 'timed_out', 'cancelled', 'startup_failure'].includes(String(c.conclusion).toLowerCase()))) return pr;
-    const timeoutRetryBudget = readBudget({ repo, pr: pr.number, head: pr.headRefOid });
-    if (!(pr.statusCheckRollup ?? []).some((c) => c.detailsUrl?.startsWith(`https://github.com/${repo}/actions/runs/`))) {
-      let detailsUrl;
-      try {
-        detailsUrl = readCheckOrigin({ repo, pr: pr.number, head: pr.headRefOid, name: pr.requiredCheckName });
-      } catch { /* Unreadable origins remain missing evidence. */ }
-      if (typeof detailsUrl !== 'string' || !detailsUrl.startsWith(`https://github.com/${repo}/actions/runs/`)
-          || !pr.requiredCheckName || !pr.statusCheckRollup.some((c) => c.name === pr.requiredCheckName)) {
-        return { ...pr, timeoutRetryBudget, timeoutRetry: { eligible: false, reason: 'missing-check-origin' } };
-      }
-      pr = { ...pr, statusCheckRollup: pr.statusCheckRollup.map((c) => c.name === pr.requiredCheckName
-        ? { ...c, detailsUrl } : c) };
-    }
-    let timeoutRetry = read(pr, { repo });
+  const started = clock();
+  const setting = resolveTimeoutEvidenceConcurrency({ env });
+  const concurrency = Number.isInteger(requestedConcurrency) && requestedConcurrency >= 1 && requestedConcurrency <= 8
+    ? requestedConcurrency : setting.value;
+  const parallel = read === readTimeoutEvidence && concurrency > 1;
+  let reads = 0;
+  const safeLog = line => { try { log(line); } catch { /* logging never changes evidence */ } };
+  safeLog(`timeout-evidence: ci.timeoutEvidenceConcurrency=${concurrency} (source: ${requestedConcurrency === concurrency ? 'injected' : setting.source})`);
+  const pending = [];
+  const finish = (pr, timeoutRetryBudget, raw) => {
+    let timeoutRetry = raw;
     if (timeoutRetry?.infraCancelled) {
       timeoutRetry = infraMode === 'rerun' ? { ...timeoutRetry, cap: timeoutRetry.cancelledShard ? 1 : infraMaxReruns }
         : { eligible: false, reason: 'infra-cancelled-heal-mode' };
     }
     return { ...pr, timeoutRetry, timeoutRetryBudget };
-  });
+  };
+  try {
+    const out = prs.map((pr, index) => {
+      if (!(pr.statusCheckRollup ?? []).some((c) => c.name !== 'review-gate'
+        && ['failure', 'timed_out', 'cancelled', 'startup_failure'].includes(String(c.conclusion).toLowerCase()))) return pr;
+      const timeoutRetryBudget = readBudget({ repo, pr: pr.number, head: pr.headRefOid });
+      if (!(pr.statusCheckRollup ?? []).some((c) => c.detailsUrl?.startsWith(`https://github.com/${repo}/actions/runs/`))) {
+        let detailsUrl;
+        try {
+          detailsUrl = readCheckOrigin({ repo, pr: pr.number, head: pr.headRefOid, name: pr.requiredCheckName });
+        } catch { /* Unreadable origins remain missing evidence. */ }
+        if (typeof detailsUrl !== 'string' || !detailsUrl.startsWith(`https://github.com/${repo}/actions/runs/`)
+            || !pr.requiredCheckName || !pr.statusCheckRollup.some((c) => c.name === pr.requiredCheckName)) {
+          return { ...pr, timeoutRetryBudget, timeoutRetry: { eligible: false, reason: 'missing-check-origin' } };
+        }
+        pr = { ...pr, statusCheckRollup: pr.statusCheckRollup.map((c) => c.name === pr.requiredCheckName
+          ? { ...c, detailsUrl } : c) };
+      }
+      reads++;
+      if (parallel) { pending.push({ pr, index, timeoutRetryBudget }); return pr; }
+      const raw = read(pr, { repo });
+      return finish(pr, timeoutRetryBudget, raw);
+    });
+    if (pending.length) {
+      let results;
+      try { results = poolRunner(pending.map(row => row.pr), { repo, concurrency }); } catch (error) {
+        if (error.code === 'TIMEOUT_EVIDENCE_CLEANUP_FAILED') throw error;
+        /* Serial fallback below. */
+      }
+      pending.forEach(({ pr, index, timeoutRetryBudget }, i) => {
+        if (results?.[i] == null) safeLog(`timeout-evidence: serial-fallback repo=${repo} pr=${pr.number} reason=worker-failed-or-deadline`);
+        const raw = results?.[i] ?? read(pr, { repo });
+        out[index] = finish(pr, timeoutRetryBudget, raw);
+      });
+    }
+    return out;
+  } finally {
+    safeLog(`timeout-evidence prs=${prs.length} read=${reads} concurrency=${concurrency} ms=${clock() - started}`);
+  }
 }
 
 /** IO shell enrichment: never consult the ledger when the policy is off. */

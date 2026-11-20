@@ -1,4 +1,14 @@
+import { applyRedTeamGate, createRedTeamGateIo } from '../../../scripts/operations/red-team-gate-apply.mjs';
+import { repoProfile } from '../../../scripts/lib/repo-profile.mjs';
+import * as preventionLanding from '../../../scripts/lib/prevention-landing-job.mjs';
 import { it, expect, vi, afterAll, beforeEach } from 'vitest';
+// The host operator store (~/.claude/operator-overrides.json) outranks env, so a developer's live
+// redTeamQueue override would leak into these fixtures; read a missing store instead (= no overrides).
+const operatorFixture = vi.hoisted(() => ({ file: `/nonexistent-operator-store-${process.pid}-${Date.now()}.json` }));
+vi.mock('../../../scripts/lib/operator-override-reader.mjs', async importOriginal => {
+  const actual = await importOriginal();
+  return { ...actual, readOperatorOverrides: options => actual.readOperatorOverrides({ ...options, file: options?.file ?? operatorFixture.file }) };
+});
 import { existsSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -11,6 +21,7 @@ import * as gateCatchUp from '../../../scripts/lib/red-team-gate-catchup.mjs';
 import * as redTeamRecovery from '../../../scripts/lib/review-red-team-on-skip.mjs';
 import * as repoProfiles from '../../../scripts/lib/repo-profile.mjs';
 import * as hostSample from '../../../scripts/lib/host-sample.mjs';
+import * as operatorOverrideReader from '../../../scripts/lib/operator-override-reader.mjs';
 import { planReconcile } from '../../../scripts/conveyor/reconcile-core.mjs';
 import { buildReviewedShaMarker } from '../../../scripts/lib/review-escalation.mjs';
 
@@ -25,8 +36,16 @@ beforeEach(() => {
   vi.stubEnv('WE_RED_TEAM_QUEUE_MIN_CONCURRENT', '2');
   vi.stubEnv('WE_RED_TEAM_QUEUE_MIN_CONCURRENT_IDLE_PCT', '10');
   vi.spyOn(hostSample, 'sampleHost').mockReturnValue({ idlePct: 0 });
+  // Hermetic: the host's real operator overrides (e.g. redTeamQueue.minConcurrent) must not raise the pinned floor.
+  vi.spyOn(operatorOverrideReader, 'readOperatorOverrides').mockReturnValue({ readable: true, values: {} });
 });
 const readQueueFile = () => existsSync(QUEUE_FILE) ? readFileSync(QUEUE_FILE, 'utf8') : null;
+
+function livePrReader(rawPrs) {
+  const heads = new Map(rawPrs.map(({ number, headRefOid }) => [number, headRefOid]));
+  // Retire entries left in the shared queue by earlier fixtures.
+  return ({ pr }) => heads.has(pr) ? { state: 'OPEN', comments: [], headRefOid: heads.get(pr) } : { state: 'CLOSED' };
+}
 
 it('CLI catches up gates after label repair, before capacity recovery, and survives catch-up exceptions', () => {
   const repo = 'frontier-ui/frontierui', rawPrs = [], repaired = [], refusals = [];
@@ -43,13 +62,13 @@ it('CLI catches up gates after label repair, before capacity recovery, and survi
   });
   vi.stubEnv('WE_RED_TEAM_DISPATCH_QUEUE', 'off');
   try {
-    const production = cliReviewTickOpts({ log: { error: vi.fn() } });
+    const production = cliReviewTickOpts({ readLivePr: livePrReader(rawPrs), log: { error: vi.fn() } });
     const input = { repo, rawPrs, plan: { refusals } };
     expect(() => production.redTeamOnSkip(input)).not.toThrow();
     expect(order).toEqual(['labels', 'gate', 'capacity']);
     expect(redTeamRecovery.runRedTeamOnSkip).toHaveBeenCalledWith(expect.objectContaining({ repo, cwd: 'subject-checkout' }));
     const history = catchUp.mock.calls[0][0].history;
-    expect(catchUp).toHaveBeenCalledWith({ repo, refusals, rawPrs: repaired, history, log: expect.any(Function) });
+    expect(catchUp).toHaveBeenCalledWith({ repo, refusals, rawPrs: repaired, history, resolveProfile: undefined, log: expect.any(Function) });
     production.redTeamOnSkip(input);
     expect(catchUp.mock.calls[1][0].history).toBe(history);
   } finally { vi.restoreAllMocks(); vi.unstubAllEnvs(); }
@@ -79,7 +98,7 @@ it('CLI routes red-team recovery through the FIFO queue: capacity 1 dispatches o
   vi.stubEnv('WE_RED_TEAM_DISPATCH_QUEUE', 'on');
   const recovery = vi.spyOn(redTeamRecovery, 'runRedTeamOnSkip');
   try {
-    const production = cliReviewTickOpts({ log: { error: vi.fn() } });
+    const production = cliReviewTickOpts({ readLivePr: livePrReader(rawPrs), log: { error: vi.fn() } });
     const result = production.redTeamOnSkip({ repo, plan, rawPrs, lastDispatch: new Map(),
       capacity: { lanes: 1, budget: { left: 1 }, remainingStarts: 1, take: vi.fn() }, paused: false });
     expect(recovery.mock.calls[0][0].plan.refusals.map(row => row.prNumber)).toEqual([6001]);
@@ -103,7 +122,7 @@ it.each(['off', 'OFF', ' off ', '0', 'false', 'no'])('CLI bypasses the dispatch 
   const lines = [];
   const queueBefore = readQueueFile();
   try {
-    const production = cliReviewTickOpts({ log: { error: line => lines.push(line) } });
+    const production = cliReviewTickOpts({ readLivePr: livePrReader(rawPrs), log: { error: line => lines.push(line) } });
     production.redTeamOnSkip({ repo, plan, rawPrs, lastDispatch: new Map(),
       capacity: { lanes: 3, budget: { left: 3 }, remainingStarts: 3, take: vi.fn() }, paused: false });
     // Direct runner: the full unfiltered plan and PRs, no queue filtering, no queue file IO.
@@ -125,7 +144,7 @@ it('CLI keeps the queue on and logs when WE_RED_TEAM_DISPATCH_QUEUE is unrecogni
   vi.stubEnv('WE_RED_TEAM_DISPATCH_QUEUE', 'maybe');
   const lines = [];
   try {
-    const production = cliReviewTickOpts({ log: { error: line => lines.push(line) } });
+    const production = cliReviewTickOpts({ readLivePr: livePrReader(rawPrs), log: { error: line => lines.push(line) } });
     production.redTeamOnSkip({ repo, plan, rawPrs, lastDispatch: new Map(),
       capacity: { lanes: 1, budget: { left: 1 }, remainingStarts: 1, take: vi.fn() }, paused: false });
     expect(dispatch.mock.calls.map(call => call[0].pr)).toEqual([6031]);
@@ -143,7 +162,7 @@ it('CLI exhausted capacity passes every owed PR to the real runner without spend
   const recovery = vi.spyOn(redTeamRecovery, 'runRedTeamOnSkip');
   const lastDispatch = new Map();
   try {
-    const production = cliReviewTickOpts({ log: { error: vi.fn() } });
+    const production = cliReviewTickOpts({ readLivePr: livePrReader(rawPrs), log: { error: vi.fn() } });
     const result = production.redTeamOnSkip({ repo, plan, rawPrs, lastDispatch,
       capacity: { lanes: 0, budget: { left: 0 }, remainingStarts: 0, take: vi.fn() }, paused: false });
     expect(recovery.mock.calls[0][0].plan.refusals.map(row => row.prNumber)).toEqual([6021, 6022]);
@@ -176,7 +195,7 @@ it('CLI label repair exception preserves original PRs and still dispatches red-t
   vi.stubEnv('WE_REVIEW_RED_TEAM_ON_SKIP', '1');
   vi.stubEnv('WE_RED_TEAM_QUEUE_FILE', QUEUE_FILE);
   try {
-    const production = cliReviewTickOpts({ log: { error: vi.fn() } });
+    const production = cliReviewTickOpts({ readLivePr: livePrReader(rawPrs), log: { error: vi.fn() } });
     const result = production.redTeamOnSkip({ repo, plan, rawPrs, lastDispatch: new Map(),
       capacity: { lanes: 1, budget: { left: 1 }, remainingStarts: 1, take: vi.fn() }, paused: false });
 
@@ -206,11 +225,12 @@ it.each(['fresh', 'resume'])('CLI tick options recover an already-reviewed head 
   vi.stubEnv('WE_REVIEW_RED_TEAM_ON_SKIP', '1');
   vi.stubEnv('WE_RED_TEAM_QUEUE_FILE', QUEUE_FILE);
   try {
-    const production = cliReviewTickOpts({ log: { error: vi.fn() } });
+    const production = cliReviewTickOpts({ readLivePr: livePrReader([{ number: pr, headRefOid: head }]), log: { error: vi.fn() } });
     const take = vi.fn();
     const out = runReviewTick({ ...production, repo,
       readPrs: () => [{ number: pr, headRefOid: head, labels: [], comments: [] }],
-      readAgents: () => [], holdReconcile: () => [], acquirableLanes: () => 1,
+      // Production wires a separate (unhalved) recovery lane reader; pin both seams so the fixture never reads the real pool.
+      readAgents: () => [], holdReconcile: () => [], acquirableLanes: () => 1, recoveryAcquirableLanes: () => 1,
       liveReviewBudget: { left: 1 }, hostAdmission: () => ({ admitted: true, maxPerTick: 1, take }),
       reconcile: () => ({ dispatch: [], refusals: [{ kind: 'already-reviewed-head', prNumber: pr, headSha: head }] }),
       tagRound: vi.fn(), tagStatus: vi.fn(), statusCandidates: () => [],
@@ -263,7 +283,7 @@ it('already-reviewed heads get one recovery hook with remaining capacity; null a
   const out = runReviewTick(options);
   expect(redTeamOnSkip).toHaveBeenCalledTimes(1);
   expect(redTeamOnSkip).toHaveBeenCalledWith({ repo, plan, rawPrs,
-    capacity: { lanes: 3, budget: liveReviewBudget, remainingStarts: Infinity, startsCeiling: Infinity, take: expect.any(Function) }, paused: false });
+    capacity: { lanes: 3, budget: liveReviewBudget, remainingStarts: Infinity, startsCeiling: Infinity, take: expect.any(Function) }, paused: false, resolveProfile: expect.any(Function) });
   expect(out.redTeamOnSkip).toBe(result);
   expect(tagStatus.mock.calls.at(-1)[0].agents).toBeUndefined();
   expect(runReviewTick({ ...options, redTeamOnSkip: null })).not.toHaveProperty('redTeamOnSkip');
@@ -340,7 +360,7 @@ it('a throwing host check blocks recovery-only starts', () => {
   expect(recoveryDispatch).not.toHaveBeenCalled();
 });
 
-it.each([38, 'throws'])('CLI queue uses the shared CPU sample (%s) and preserves lane/budget bounds', idle => {
+it.each([38, 5, 'throws'])('CLI queue uses the shared CPU sample (%s) and preserves lane/budget bounds', idle => {
   vi.stubEnv('WE_RED_TEAM_QUEUE_FILE', QUEUE_FILE);
   vi.spyOn(hostSample, 'sampleHost').mockImplementation(() => {
     if (idle === 'throws') throw new Error('sample unavailable');
@@ -352,12 +372,12 @@ it.each([38, 'throws'])('CLI queue uses the shared CPU sample (%s) and preserves
   const capacity = { lanes: 4, startsCeiling: 3, remainingStarts: 1, budget: { left: 3 } };
   const budget = capacity.budget;
   try {
-    cliReviewTickOpts({ log: { error: vi.fn() } }).redTeamOnSkip({
+    cliReviewTickOpts({ readLivePr: livePrReader([]), log: { error: vi.fn() } }).redTeamOnSkip({
       repo: 'fixture/cpu-floor', plan: { refusals: [] }, rawPrs: [], capacity,
     });
     expect(hostSample.sampleHost).toHaveBeenCalledOnce();
     expect(recovery.mock.calls[0][0].capacity).toBe(capacity);
-    expect(capacity).toEqual({ lanes: 4, startsCeiling: 3, remainingStarts: idle === 'throws' ? 1 : 2, budget: { left: 3 } });
+    expect(capacity).toEqual({ lanes: 4, startsCeiling: 3, remainingStarts: idle === 38 ? 2 : 1, budget: { left: 3 } });
     expect(capacity.budget).toBe(budget);
   } finally { vi.restoreAllMocks(); vi.unstubAllEnvs(); }
 });
@@ -376,7 +396,7 @@ it.each([
   const dispatch = vi.spyOn(reviewJob, 'dispatchReviewJob').mockReturnValue({ jobPid: 42 });
   const take = vi.fn();
   try {
-    const production = cliReviewTickOpts({ log: { error: vi.fn() } });
+    const production = cliReviewTickOpts({ readLivePr: livePrReader(rawPrs), log: { error: vi.fn() } });
     const out = runReviewTick({ ...options, redTeamOnSkip: production.redTeamOnSkip,
       readPrs: () => rawPrs,
       reconcile: () => ({ ...plan, dispatch: [{ kind: 'review', prNumber: 6104 }] }),
@@ -401,13 +421,13 @@ it('production queue floor at idle 100 cannot replenish the shared host allowanc
   const check = vi.fn(() => ({ admitted: true, maxPerTick: 1 }));
   const hostAdmission = sharedHostBudget(check);
   try {
-    const production = cliReviewTickOpts({ log: { error: vi.fn() } });
+    const production = cliReviewTickOpts({ readLivePr: livePrReader(rawPrs), log: { error: vi.fn() } });
     const tickOptions = { ...options, redTeamOnSkip: production.redTeamOnSkip,
       readPrs: () => rawPrs, reconcile: () => ({ ...plan, dispatch: [] }),
       liveReviewBudget: { left: 5 }, hostAdmission,
     };
     const first = runReviewTick(tickOptions);
-    const second = runReviewTick({ ...tickOptions, repo: 'web-everything/frontierui' });
+    const second = runReviewTick({ ...tickOptions, repo: 'frontier-ui/frontierui' });
     expect(first.redTeamOnSkip.dispatched).toHaveLength(1);
     expect(second.redTeamOnSkip.dispatched).toEqual([]);
     expect(dispatch).toHaveBeenCalledOnce();
@@ -433,7 +453,7 @@ it('recovery-only starts consume the shared host budget across repos', () => {
   const check = vi.fn(() => ({ admitted: true, maxPerTick: 1 }));
   const hostAdmission = sharedHostBudget(check);
   const first = runReviewTick({ ...options, hostAdmission });
-  const second = runReviewTick({ ...options, repo: 'web-everything/frontierui', hostAdmission });
+  const second = runReviewTick({ ...options, repo: 'frontier-ui/frontierui', hostAdmission });
   expect(first.redTeamOnSkip.dispatched).toHaveLength(1);
   expect(second.redTeamOnSkip.dispatched).toEqual([]);
   expect(recoveryDispatch).toHaveBeenCalledTimes(1);
@@ -463,7 +483,7 @@ it.each([[10, 2], [9, 1]])('production admission at idle %s starts %s recovery r
   vi.spyOn(hostSample, 'sampleHost').mockReturnValue({ idlePct });
   const dispatch = vi.spyOn(reviewJob, 'dispatchReviewJob').mockReturnValue({ jobPid: 42 });
   try {
-    const production = cliReviewTickOpts({ log: { error: vi.fn() } });
+    const production = cliReviewTickOpts({ readLivePr: livePrReader(rawPrs), log: { error: vi.fn() } });
     const out = runReviewTick({ ...options, redTeamOnSkip: production.redTeamOnSkip,
       readPrs: () => rawPrs, reconcile: () => ({ ...plan, dispatch: [{ kind: 'review', prNumber: 6204 }] }),
       liveReviewBudget: { left: 5 }, hostAdmission: () => defaultReviewHostAdmission({
@@ -476,4 +496,101 @@ it.each([[10, 2], [9, 1]])('production admission at idle %s starts %s recovery r
     expect(dispatch).toHaveBeenCalledTimes(recoveryStarts);
     expect(out.redTeamOnSkip.dispatched).toHaveLength(recoveryStarts);
   } finally { vi.restoreAllMocks(); vi.unstubAllEnvs(); }
+});
+
+
+it.each(['on', 'off'])('capability-disabled tick still enforces overdue send-backs and gates without starting reviews (queue %s)', queue => {
+  const repo = 'fixture/capability';
+  const { plan, rawPrs } = owedPrs(repo, [9601, 9602]);
+  const head = rawPrs[0].headRefOid;
+  rawPrs[0].comments = [{
+    body: `<!-- we:red-team-advisory pr=9601 rev=${head} -->\n1. [**confirmed**] (edge-case, broken) \`scripts/x.mjs:1\` — confirmed break`,
+    createdAt: '2026-11-14T16:00:00Z', author: { login: 'web-everything' },
+  }];
+  const realCatchUp = gateCatchUp.runGateCatchUp;
+  const enforceSendBack = vi.fn(() => ({ status: 'applied' }));
+  const catchUp = vi.spyOn(gateCatchUp, 'runGateCatchUp').mockImplementation(options => realCatchUp({
+    ...options, now: Date.parse('2026-11-14T16:20:00Z'), history: new Map(),
+    setting: { broken: 'send-back', degraded: 'card', unconfirmed: 'advisory' },
+    readGrantScope: () => null, runGate: enforceSendBack,
+  }));
+  const start = vi.spyOn(reviewJob, 'dispatchReviewJob').mockReturnValue({ jobPid: 42 });
+  const ordinary = vi.fn();
+  vi.stubEnv('WE_REVIEW_RED_TEAM_ON_SKIP', '1');
+  vi.stubEnv('WE_RED_TEAM_DISPATCH_QUEUE', queue);
+  vi.stubEnv('WE_RED_TEAM_QUEUE_FILE', QUEUE_FILE);
+  try {
+    const production = cliReviewTickOpts({ readLivePr: livePrReader(rawPrs), log: { error: vi.fn() }, listCommands: () => '' });
+    const out = runReviewTick({ repo,
+      resolveProfile: () => ({ capabilities: { review: false } }),
+      reconcile: () => ({ ...plan, dispatch: [] }),
+      readPrs: () => rawPrs, readAgents: () => [],
+      dispatch: ordinary, redTeamOnSkip: production.redTeamOnSkip,
+      acquirableLanes: () => 2, hostAdmission: () => ({ admitted: true, maxPerTick: 2 }),
+      tagRound: () => {}, tagStatus: () => {}, statusCandidates: () => [], holdReconcile: () => [],
+    });
+    expect(catchUp).toHaveBeenCalledOnce();
+    expect(enforceSendBack).toHaveBeenCalledOnce();
+    expect(enforceSendBack).toHaveBeenCalledWith({ repo, pr: 9601 });
+    expect(out.redTeamOnSkip.dispatched).toEqual([]);
+    expect(out.redTeamOnSkip.notStarted).toContainEqual({ prNumber: 9602, reason: expect.stringContaining('capability unavailable') });
+    expect(start).not.toHaveBeenCalled();
+    expect(ordinary).not.toHaveBeenCalled();
+  } finally { vi.restoreAllMocks(); vi.unstubAllEnvs(); }
+});
+
+it.each(['on', 'off'].flatMap(queue => [repoProfile('longshore').slug, 'unknown/repo'].map(repo => [queue, repo])))(
+  'mixed catch-up sends back before refusing card work (queue %s, repo %s)', async (queue, repo) => {
+  const { plan, rawPrs } = owedPrs(repo, [9701]);
+  const head = rawPrs[0].headRefOid;
+  rawPrs[0].comments = [{
+    body: `<!-- we:red-team-advisory pr=9701 rev=${head} -->\n1. [**confirmed**] (edge-case, broken) \`scripts/x.mjs:1\` — confirmed break\n2. [**confirmed**] (edge-case, degraded) \`scripts/y.mjs:1\` — degradation`,
+    createdAt: '2026-11-14T16:00:00Z', author: { login: 'web-everything' },
+  }];
+  const realCatchUp = gateCatchUp.runGateCatchUp;
+  const comments = rawPrs[0].comments, history = new Map();
+  const sendBack = vi.fn(() => ({ ok: true }));
+  const start = vi.spyOn(preventionLanding, 'spawnPreventionLandingJob');
+  const fileCard = vi.fn(createRedTeamGateIo().fileCard);
+  let applied;
+  const runGate = vi.fn(input => {
+    applied = applyRedTeamGate(input, {
+      readPr: () => ({ headRefOid: head, comments, labels: [] }),
+      readSetting: () => ({ value: { broken: 'send-back', degraded: 'card', unconfirmed: 'advisory' } }),
+      readRound: () => 1, readHead: () => head, sendBack, fileCard,
+      appendSendBackEvent: () => {}, dequeueSentBack: () => {},
+      postComment: ({ body }) => comments.push({ body, author: { login: 'web-everything' } }), log: () => {},
+    });
+    return { status: 'applied' };
+  });
+  vi.spyOn(gateCatchUp, 'runGateCatchUp').mockImplementation(options => realCatchUp({
+    ...options, now: Date.parse('2026-11-14T16:20:00Z'), history,
+    setting: { broken: 'send-back', degraded: 'card', unconfirmed: 'advisory' },
+    readGrantScope: () => null, runGate,
+  }));
+  vi.stubEnv('WE_RED_TEAM_DISPATCH_QUEUE', queue);
+  const log = vi.fn();
+  try {
+    const production = cliReviewTickOpts({ log: { error: log }, listCommands: () => '' });
+    const input = { repo, plan, rawPrs, resolveProfile: () => ({ capabilities: { review: false } }), paused: true };
+    production.redTeamOnSkip(input);
+    expect(runGate).toHaveBeenCalledOnce();
+    expect(await applied).toMatchObject({ status: 'card-failed', outcome: 'sent-back', error: expect.stringContaining('capability unavailable') });
+    expect(sendBack).toHaveBeenCalledOnce();
+    expect(fileCard).toHaveBeenCalledOnce();
+    expect(start).not.toHaveBeenCalled();
+    expect(comments.at(-1).body).toContain('outcome=sent-back');
+    production.redTeamOnSkip(input);
+    expect(runGate).toHaveBeenCalledOnce();
+    expect(sendBack).toHaveBeenCalledOnce();
+  } finally { vi.restoreAllMocks(); vi.unstubAllEnvs(); }
+});
+
+it('live gate refuses prevention work for an unsupported repo even if the tick snapshot missed its card findings', () => {
+  const start = vi.spyOn(preventionLanding, 'spawnPreventionLandingJob');
+  try {
+    expect(createRedTeamGateIo().fileCard({ repo: 'fixture/capability' }))
+      .toEqual({ ok: false, error: expect.stringContaining('capability unavailable') });
+    expect(start).not.toHaveBeenCalled();
+  } finally { vi.restoreAllMocks(); }
 });

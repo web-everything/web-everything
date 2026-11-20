@@ -55,7 +55,7 @@ import {
 export const SNAPSHOT_FIELDS = Object.freeze([
   'number', 'title', 'body', 'url', 'isDraft', 'createdAt', 'updatedAt',
   'headRefName', 'headRefOid', 'baseRefName', 'isCrossRepository', 'mergeable', 'mergeStateStatus', 'reviewDecision',
-  'labels', 'files', 'comments', 'statusCheckRollup',
+  'labels', 'files', 'comments', 'statusCheckRollup', 'rowsHead', 'rowsComplete',
 ]);
 
 /** Smoke-only controls; unset keeps the normal snapshot read unchanged. */
@@ -253,7 +253,7 @@ export function readSharedOpenPrs({
   if (exec === undefined) exec = execFileSyncThrottled;
   const servable = () => {
     const snap = readSnapshotFile(path);
-    if (staleOkMs && isServable(snap, { fields: want, nowMs: now(), ttlMs: staleOkMs })) {
+    if (staleOkMs && !cacheOnly && isServable(snap, { fields: want, nowMs: now(), ttlMs: staleOkMs })) {
       if (now() - snap.fetchedAtMs >= ttl && !injectedExec
         && (spawnRefresh || (!isUnderTest(env) && !isUnderTest())) && !refreshStarted.has(snapshotKey(repo))) {
         refreshStarted.add(snapshotKey(repo));
