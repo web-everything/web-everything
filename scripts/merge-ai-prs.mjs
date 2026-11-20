@@ -3,7 +3,7 @@ import { assertCapability } from './lib/repo-profile.mjs';
 import { resolveHandoffSettings } from './lib/handoff-settings.mjs';
 import { writeLabelWithHandoff, signalFixDispatch } from './lib/fix-handoff.mjs';
 import { readCompletePrComments } from './conveyor/pr-comments-complete.mjs';
-import { createMqLiveReader, mqSameHeadGuard, createMqSameHeadRefreshStore, createMqSameHeadRefreshOptions, mqSameHeadRefreshStatePath, readDrainQueueSafety, redTeamEnqueueHold } from './lib/drain-queue-safety.mjs';
+import { createMqLiveReader, mqSameHeadGuard, createMqSameHeadRefreshStore, createMqSameHeadRefreshOptions, mqSameHeadRefreshStatePath, readDrainQueueSafety, redTeamEnqueueHold, sendBackReason, redTeamLabelHoldReason } from './lib/drain-queue-safety.mjs';
 import { readDrainRedTeamEvidence } from './lib/drain-red-team-evidence.mjs';
 import { readStandingRuling, readOperatorIssues, headIsCardOnly, headBelongsToPr, readUneditedCommentIds, standingRulingScope } from './conveyor/standing-ruling-io.mjs';
 import { resolveApprovalLicensesEnqueue, proveHumanOnlyLicense } from './lib/human-only-enqueue-license.mjs';
@@ -228,7 +228,7 @@ import { parseArgvFlags, reconcileWouldRunFor } from './lib/reconcile-predicate.
 import { createPrestageCache, resolvePrestageSettings, prestageCi, prestageRequiredChecks, labelSignature, enqueuePrestage } from './lib/drain-prestage.mjs';
 import { reviewCiGate } from './lib/review-ci-gate.mjs';
 import { resolveRequiredChecks } from './lib/check-state-predicate.mjs';
-import { REQUIRED_WORKFLOWS_UNSATISFIED, resolveRefreshOnUnsatisfiedWorkflows, handleRequiredWorkflowsRefusal, resolveRefreshOnStaleMergeGate, handleStaleMergeGate } from './lib/merge-queue-enqueue.mjs';
+import { REQUIRED_WORKFLOWS_UNSATISFIED, resolveRefreshOnUnsatisfiedWorkflows, handleRequiredWorkflowsRefusal, resolveRefreshOnStaleMergeGate, resolveStaleGateUpdateBranchMax, handleStaleMergeGate } from './lib/merge-queue-enqueue.mjs';
 import { recordEnqueueOutcome } from './lib/drain-poison-guard.mjs';
 import { createAsyncShadow } from './lib/drain-async-shadow.mjs';
 import { appendDaemonEvent } from './lib/daemon-events.mjs';
@@ -5134,16 +5134,7 @@ export async function main(argv, { env = process.env, stdout = process.stdout, e
   const mergeStrategy = createDrainMergeStrategy({ resolved: resolvedMergePolicy, dryRun: DRY_RUN, quiet: AS_JSON, isLocalRepo, localSlug, isMainFix,
     withLock: (fn) => withLandWriteLock(fn, { runUnlockedOnContention: false }), primary: resolvePrimaryPath(process.cwd(), { flag: flags.primary, env: env.WE_PRIMARY }) }); // xtpxusq — logs strategy + source once per pass
   const prestageCache = createPrestageCache();
-  function enqueueWithSameHeadGuard(c, sha, options, approvedHeadHold, shadow) {
-    // Admission must precede same-head recovery, which can update the branch.
-    const refusal = assertCapability(c.repo ?? localSlug, 'review');
-    if (refusal) return { enqueued: false, ...refusal, reason: refusal.why };
-    // Live manual retries pass the guard and retain the strategy's already-queued bookkeeping.
-    const refresh = DRY_RUN ? undefined : createMqSameHeadRefreshOptions({ store: mqSameHeadRefreshStore,
-      approvedHeadHold, repo: c.repo ?? localSlug, pr: c.num, head: sha,
-      // Refresh mutates the branch before enqueue runs. Reuse its authorization gates here,
-      // with fresh evidence at H, before the refresh's label read or once-per-head claim.
-      enqueueAllowed: () => {
+  function queueHeadMutationAllowed(c, sha) {
         const repo = c.repo ?? localSlug;
         const exec = createMqLiveReader();
         const gh = args => exec('gh', args, { encoding: 'utf8', timeout: 60_000,
@@ -5182,7 +5173,17 @@ export async function main(argv, { env = process.env, stdout = process.stdout, e
           const license = proveHumanOnlyLicense({ repo, pr: c.num, headSha: sha, cwd: process.cwd(), exec });
           return license?.licensed === true && ['exact', 'numbering', 'mechanical'].includes(license.tier);
         } catch { return false; }
-      } });
+  }
+  function enqueueWithSameHeadGuard(c, sha, options, approvedHeadHold, shadow) {
+    // Admission must precede same-head recovery, which can update the branch.
+    const refusal = assertCapability(c.repo ?? localSlug, 'review');
+    if (refusal) return { enqueued: false, ...refusal, reason: refusal.why };
+    // Live manual retries pass the guard and retain the strategy's already-queued bookkeeping.
+    const refresh = DRY_RUN ? undefined : createMqSameHeadRefreshOptions({ store: mqSameHeadRefreshStore,
+      approvedHeadHold, repo: c.repo ?? localSlug, pr: c.num, head: sha,
+      // Refresh mutates the branch before enqueue runs. Reuse its authorization gates here,
+      // with fresh evidence at H, before the refresh's label read or once-per-head claim.
+      enqueueAllowed: () => queueHeadMutationAllowed(c, sha) });
     const guard = mqSameHeadGuard({ refresh, dryRun: DRY_RUN, repo: c.repo ?? localSlug, pr: c.num, head: sha,
       log: line => process.stderr.write(`${line}\n`) });
     // The visible reason (decline/accept text with the deciding main run id) replaces the bare hold line.
@@ -6234,6 +6235,29 @@ export async function main(argv, { env = process.env, stdout = process.stdout, e
     // Shared by freshness prechecks, required-workflow recovery and stale-merge recovery.
     const refusal = assertCapability(v.repo ?? localSlug, 'review');
     if (refusal) return { ok: false, action: refusal.kind, error: refusal.why };
+    return refreshAdmittedHead(v, options);
+  };
+  const refreshAdmittedHead = async (v, options) => {
+    // Gate recovery is a head mutation under the same admission policy as the queue's existing refresh.
+    if (options.forceRefresh || options.runConclusion === 'startup_failure') {
+      try {
+        if (cardGrouping.inGroup(v)) throw Error('open card group owns this head');
+        // Membership needs readable evidence; the shared hold also refuses unknown group state.
+        const groupHold = cardGrouping.holdFor(v);
+        if (groupHold) throw Error(`card group holds this head (${groupHold.reason}); retry after group state clears`);
+        const live = await fetchFreshPrForRevalidation(v.repo, v.num);
+        if (!live || live.headRefOid !== options.expectedHead
+          || classifyPr({ ...live, mergeStateStatus: 'CLEAN' }, { requiredCheck: REQUIRED,
+            defaultBranch: defaultBranchOf(v.repo) }).decision !== 'merge') throw Error('live PR admission refused');
+        const held = sendBackReason(live.labels) || redTeamLabelHoldReason(live.labels);
+        if (held) throw Error(held);
+        if (options.forceRefresh && !hasLabel(live, 'red-team:clear')) throw Error('red-team:clear missing');
+        if (options.forceRefresh && !hasLabel(live, 'review:accepted')) throw Error('review:accepted missing');
+        if (mqSameHeadGuard({ repo: v.repo || localSlug, pr: v.num, head: options.expectedHead,
+          allowAlreadyQueued: false, dryRun: true }).hold) throw Error('merge-queue history refuses refresh');
+        if (!queueHeadMutationAllowed(v, options.expectedHead)) throw Error('queue head mutation authorization refused');
+      } catch (error) { return { ok: false, action: 'held', error: String(error?.message ?? error) }; }
+    }
     return refreshApprovedHeadChecked({
       readHold: () => {
         let unreadable = null;
@@ -7869,6 +7893,8 @@ export async function main(argv, { env = process.env, stdout = process.stdout, e
   }
   if (queueEnqueueMode) {
     const staleMergeGateRefresh = resolveRefreshOnStaleMergeGate();
+    const failedGateLimit = resolveStaleGateUpdateBranchMax({ log: line => process.stderr.write(`${line}\n`) });
+    const failedGateBudget = { remaining: failedGateLimit.value.staleGateUpdateBranchMax };
     if (!AS_JSON) process.stderr.write(`  merge-queue: refreshOnStaleMergeGate=${staleMergeGateRefresh.value} (${staleMergeGateRefresh.source})${staleMergeGateRefresh.invalid.length ? ` · ignored invalid: ${staleMergeGateRefresh.invalid.join('; ')}` : ''}\n`);
     for (const c of skipped) {
       const pr = (prsByRepo.get(c.repo) || []).find(p => p.number === c.num);
@@ -7877,7 +7903,7 @@ export async function main(argv, { env = process.env, stdout = process.stdout, e
         requiredChecks: queueRequiredChecksOf(c.repo), classifyPr,
         classifyOptions: { requiredCheck: REQUIRED, defaultBranch: defaultBranchOf(c.repo),
           allowPendingReview: (escalationRelief.prs || []).includes(Number(c.num)) || (escalationRelief.passWide && !!label) },
-        setting: staleMergeGateRefresh, dryRun: DRY_RUN, cloneDir, cwd: isLocalRepo(c.repo) ? undefined : cloneDir,
+        setting: staleMergeGateRefresh, failedGateBudget, dryRun: DRY_RUN, cloneDir, cwd: isLocalRepo(c.repo) ? undefined : cloneDir,
         tag: repoTag(c.repo), readAcceptance: readDrainAcceptance,
         refreshStalePr: options => refreshApprovedHead(c, options), needsAcceptanceRestamp, restampAcceptance,
         warn: line => { if (!AS_JSON) process.stderr.write(`${line}\n`); } });

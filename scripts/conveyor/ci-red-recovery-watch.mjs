@@ -177,8 +177,9 @@ export function buildCandidates(prs, {
  * we:scripts/conveyor/ci-red-recovery-watch.mjs#refreshOntoMain — refresh ONE PR's lane branch onto current
  * `main`, the ONE write this pass ever performs. A thin wrapper over the shared, proven
  * `we:scripts/lib/rebase-drop-manifest.mjs#rebaseDropManifest` — never a second rebase implementation. Reports
- * `rebaseDropManifest`'s own `action` verbatim (`'rebased'` / `'current'` / `'skip'` / `'error'`) so a reader can
+ * `rebaseDropManifest`'s ordinary `action` (`'rebased'` / `'current'` / `'skip'` / `'error'`) so a reader can
  * tell "refreshed" apart from "was already current" apart from "hit a real conflict, left for a human".
+ * Forced gate recovery exposes a proven pre-push error separately so its attempt can be retried.
  * The sink guard: when the caller names the PR (`prNumber`), it must be provably same-repo
  * ({@link sameRepoRefusal}) before anything is rebased or pushed — a fork PR, or one whose head name merely
  * shadows a same-repo lane, would otherwise have `origin/<laneRef>` (someone else's branch) force-pushed.
@@ -188,14 +189,15 @@ export function buildCandidates(prs, {
  */
 export function refreshOntoMain(laneRef, {
   root = REPO_ROOT, base = 'origin/main', rebase = rebaseDropManifest,
-  prNumber = null, repo = null, readIsCrossRepository = defaultReadIsCrossRepository,
+  prNumber = null, repo = null, readIsCrossRepository = defaultReadIsCrossRepository, forceRefresh = false, expectedHead = null,
 } = {}) {
   if (prNumber !== null) {
     const refused = sameRepoRefusal(prNumber, { repo, readIsCrossRepository });
     if (refused) return refused;
   }
-  const result = rebase({ laneRef, base, cwd: root });
-  if (result.action === 'error') return { ok: false, action: 'error', error: result.reason };
+  const result = rebase({ laneRef, base, cwd: root, ...(forceRefresh ? { forceRefresh: true, expectedHead } : {}) });
+  if (result.action === 'error') return { ok: false,
+    action: forceRefresh && result.pushAttempted === false ? 'pre-push-error' : 'error', error: result.reason };
   if (result.action === 'skip') return { ok: false, action: 'skip', error: result.reason };
   // #2811 — `newCommit` threaded through (never dropped): `sweepCiRedRecovery`'s own apply loop needs the
   // AUTHORITATIVE post-rebase head to re-verify/re-arm a live `review:accepted` against, the same "this

@@ -114,16 +114,20 @@ describe('required-workflows refusal (ruleset 24930207)', () => {
       expect(reader).toHaveBeenCalledOnce();
     } finally { reader.mockRestore(); }
   });
-  it.each(['VITEST', 'WE_UNDER_TEST'])('isolates repo settings under %s unless an explicit file is given', (flag) => temporary((dir) => {
-    const reader = vi.spyOn(settingsFiles, 'readDeclaredSettings').mockImplementation(() => { throw new Error('must not read live settings'); });
+  it.each(['VITEST', 'WE_UNDER_TEST'])('honours the declared kill switch under %s and permits explicit settings overrides', (flag) => temporary((dir) => {
+    const reader = vi.spyOn(settingsFiles, 'readDeclaredSettings').mockReturnValue({ settings: setting('off'), errors: [] });
     try {
       const env = { [flag]: '1' };
-      expect(q.resolveRefreshOnUnsatisfiedWorkflows({ env, platform: setting('off') })).toEqual({ value: 'off', source: 'platform', invalid: [] });
+      expect(q.resolveRefreshOnUnsatisfiedWorkflows({ env, platform: setting('on') })).toEqual({ value: 'off', source: 'settings', invalid: [] });
+      expect(reader).toHaveBeenCalledOnce();
       const file = join(dir, 'settings.json');
       writeFileSync(file, JSON.stringify(setting('on')));
       expect(q.resolveRefreshOnUnsatisfiedWorkflows({ env: { ...env, WE_MERGE_QUEUE_SETTINGS_FILE: ` ${file} ` }, platform: setting('off') }))
         .toEqual({ value: 'on', source: 'settings', invalid: [] });
-      expect(reader).not.toHaveBeenCalled();
+      // Hermetic callers inject settings instead of relying on process test flags.
+      expect(q.resolveRefreshOnUnsatisfiedWorkflows({ env, settings: {}, platform: setting('off') }))
+        .toEqual({ value: 'off', source: 'platform', invalid: [] });
+      expect(reader).toHaveBeenCalledOnce();
     } finally { reader.mockRestore(); }
   }));
   it('falls through a malformed explicit settings file to platform', () => temporary((dir) => {

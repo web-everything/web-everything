@@ -61,7 +61,7 @@ export async function refreshApprovedHeadChecked({ readHold, readRunId, options,
   let hold; let opts = options;
   try {
     hold = readHold();
-    if (hold && !opts.runId) opts = { ...opts, runId: readRunId() };
+    if (hold && !opts.runId && !opts.forceRefresh) opts = { ...opts, runId: readRunId() };
   } catch (e) {
     const msg = String(e?.message ?? e).replace(/[\r\n]+/g, ' ');
     warn(`approved-head refresh proof unreadable (${msg}); not refreshing`);
