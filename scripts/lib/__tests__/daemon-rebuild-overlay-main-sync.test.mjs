@@ -6,7 +6,7 @@ import ts from 'typescript';
 import { tmpdir } from 'node:os';
 import { pathToFileURL } from 'node:url';
 import { spawnSync } from 'node:child_process';
-import { kickOverlayMainSync, runOverlayMainSync, selectSyncTargets, resolveOverlayMainSyncMode, VITEST_INVENTORY_MARK } from '../daemon-rebuild/overlay-main-sync.mjs';
+import { retryGit, kickOverlayMainSync, runOverlayMainSync, selectSyncTargets, resolveOverlayMainSyncMode, VITEST_INVENTORY_MARK } from '../daemon-rebuild/overlay-main-sync.mjs';
 import { addOverlay, readOverlayState, overlayFilePath, appendOverlayEvent } from '../daemon-overlays.mjs';
 import { alertsFilePath } from '../daemon-rebuild/state.mjs';
 import { readOverlayConflictWakes } from '../overlay-conflict-wake.mjs';
@@ -627,6 +627,30 @@ describe('overlay main sync', () => {
     const f = fixture(), seen = flakyFetch(f, 'fatal: something odd', 99);
     await expect(job(f)).rejects.toMatchObject({ step: 'fetch' });
     expect(seen.calls.fetch).toBe(1);
+  });
+  it('retryGit auth exclusion covers error.message and timeout text; SSH transport failures retry; thrown timeouts keep 3 attempts', () => {
+    const noop = () => {}, count = (result, deps = { gitBackoff: noop }) => {
+      let calls = 0; let thrown;
+      try { retryGit(() => { calls++; if (result instanceof Error) throw result; return result; }, ['fetch'], {}, deps); } catch (e) { thrown = e; }
+      return { calls, thrown };
+    };
+    expect(count({ status: 128, stdout: '', stderr: '', error: new Error('Permission denied (publickey). Connection reset') }).calls).toBe(1);
+    expect(count({ status: 128, stdout: '', stderr: 'Permission denied (publickey). Connection timed out' })).toMatchObject({ calls: 1 });
+    expect(count({ status: 128, stdout: '', stderr: 'Connection reset by peer\nfatal: Could not read from remote repository.' }).calls).toBe(4);
+    expect(count(Object.assign(new Error('spawnSync git ETIMEDOUT'), { code: 'ETIMEDOUT' }))).toMatchObject({ calls: 3, thrown: { transientGit: true } });
+    const slept = [];
+    count({ status: 128, stdout: '', stderr: 'Connection reset' }, { gitBackoff: ms => slept.push(ms) });
+    expect(slept).toEqual([5000, 15000, 45000]);
+  });
+  it('the backoff override is bounded to 3 delays of at most 60 s', () => {
+    const slept = [], prev = process.env.WE_DAEMON_OVERLAY_MAIN_SYNC_NETWORK_BACKOFF_MS;
+    try {
+      for (const value of ['1,1,1,1,1,1,1,1,1,1,1,1', '999999999']) {
+        process.env.WE_DAEMON_OVERLAY_MAIN_SYNC_NETWORK_BACKOFF_MS = value; slept.length = 0;
+        try { retryGit(() => ({ status: 128, stdout: '', stderr: 'Connection reset' }), ['fetch'], {}, { gitBackoff: ms => slept.push(ms) }); } catch { /* escalates */ }
+        expect(slept).toEqual([5000, 15000, 45000]);
+      }
+    } finally { if (prev === undefined) delete process.env.WE_DAEMON_OVERLAY_MAIN_SYNC_NETWORK_BACKOFF_MS; else process.env.WE_DAEMON_OVERLAY_MAIN_SYNC_NETWORK_BACKOFF_MS = prev; }
   });
   it('all transient fetch retries failing escalates with the attempt count', async () => {
     const f = fixture(), seen = flakyFetch(f, 'Connection reset by peer', 99);

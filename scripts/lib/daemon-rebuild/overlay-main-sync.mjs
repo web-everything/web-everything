@@ -88,23 +88,28 @@ const sha = result => {
   return value;
 };
 // Retried Git read/preparation timeouts are tick-local: no failure memory or attention is consumed.
-const transientGit = result => result?.error?.code === 'ETIMEDOUT'
-  || ((result?.status !== 0 || result?.error)
-    && /ETIMEDOUT|timed out/i.test(`${result?.stderr ?? ''} ${result?.error?.message ?? ''}`));
-// Transient network classes for fetch only. Auth denial and unknown errors are never retried (escalate at once).
-const AUTH_FAILURE = /permission denied|authentication failed|could not read from remote repository|repository not found|host key verification/i;
+// Auth denial is never transient, whatever else the text says (escalate at once).
+const AUTH_FAILURE = /permission denied|authentication failed|repository not found|host key verification/i;
+const failureText = result => `${result?.stderr ?? ''} ${result?.error?.message ?? ''}`;
+const transientGit = result => !AUTH_FAILURE.test(failureText(result)) && (result?.error?.code === 'ETIMEDOUT'
+  || ((result?.status !== 0 || result?.error) && /ETIMEDOUT|timed out/i.test(failureText(result))));
+// Transient network classes for fetch only. Unknown errors are never retried.
 const NETWORK_TRANSIENT = /could not resolve host|connection reset|connection refused|connection closed by|ssh: connect to host|\b50[23]\b|bad gateway|service unavailable/i;
 export const networkTransientGit = result => (result?.status !== 0 || result?.error)
-  && !AUTH_FAILURE.test(`${result?.stderr ?? ''}`) && NETWORK_TRANSIENT.test(`${result?.stderr ?? ''} ${result?.error?.message ?? ''}`);
+  && !AUTH_FAILURE.test(failureText(result)) && NETWORK_TRANSIENT.test(failureText(result));
 const NETWORK_BACKOFF_MS = [5_000, 15_000, 45_000];
+// Bounded override: at most 3 delays of at most 60 s each, else the default (keeps heartbeat/lock fences safe).
 function networkBackoffMs(deps) {
   if (deps.networkBackoffMs) return deps.networkBackoffMs;
-  const parsed = (process.env.WE_DAEMON_OVERLAY_MAIN_SYNC_NETWORK_BACKOFF_MS ?? '').split(',').map(Number);
-  return parsed.length && parsed.every(n => Number.isFinite(n) && n >= 0) && process.env.WE_DAEMON_OVERLAY_MAIN_SYNC_NETWORK_BACKOFF_MS ? parsed : NETWORK_BACKOFF_MS;
+  const raw = process.env.WE_DAEMON_OVERLAY_MAIN_SYNC_NETWORK_BACKOFF_MS;
+  const parsed = (raw ?? '').split(',').map(Number);
+  return raw && parsed.length <= 3 && parsed.every(n => Number.isFinite(n) && n >= 0 && n <= 60_000) ? parsed : NETWORK_BACKOFF_MS;
 }
 export function retryGit(run, args, opts, deps = {}, cleanup = () => {}) {
   if (args[0] === 'fetch') {
-    const first = run(args, opts);
+    let first, thrown;
+    try { first = run(args, opts); } catch (error) { thrown = error; first = { error }; }
+    if (thrown && !transientGit(first)) throw thrown;
     if (networkTransientGit(first) && !transientGit(first)) {
       const delays = networkBackoffMs(deps), sleep = deps.gitBackoff ?? (ms => Atomics.wait(transactionWait, 0, 0, ms));
       let result = first, attempts = 1;
@@ -113,9 +118,9 @@ export function retryGit(run, args, opts, deps = {}, cleanup = () => {}) {
       return { ...result, step: 'fetch' };
     }
     if (!transientGit(first)) return { ...first, step: 'fetch' };
-    let pending = first; // reuse the first result so the timeout loop does not run fetch an extra time
+    let pending = true; // reuse the first result so the timeout loop does not run fetch an extra time
     const reuse = run;
-    run = (a, o) => { if (pending) { const r = pending; pending = null; return r; } return reuse(a, o); };
+    run = (a, o) => { if (pending) { pending = false; if (thrown) throw thrown; return first; } return reuse(a, o); };
   }
   for (let attempt = 0; attempt < 3; attempt++) {
     let result;
