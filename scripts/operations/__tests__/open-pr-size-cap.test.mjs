@@ -344,7 +344,8 @@ describe('open-pr delegates size admission to the direct producer', () => {
     const { run, diffStat, spawn } = wrapper({ prePrReview: () => ({ action: 'refuse', reason: 'pre-pr-review-missing' }) });
     expect(run({ argv })).toMatchObject({ outcome: 'refused', reason: 'pre-pr-review-missing' });
     expect(diffStat).not.toHaveBeenCalled();
-    expect(spawn).not.toHaveBeenCalled();
+    // The only child allowed is the read-only `--check` blocker aggregation; never a producer (publishing) run.
+    expect(spawn.mock.calls.filter((call) => !call[1].includes('--check'))).toEqual([]);
   });
 
   it('a reviewed SHA is passed intact to the producer for measurement and publication', () => {

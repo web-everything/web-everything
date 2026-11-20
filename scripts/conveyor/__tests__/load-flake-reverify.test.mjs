@@ -538,3 +538,48 @@ describe('defaultReverifyIo admission decision source (x9xkupj)', () => {
       gate: 'load-flake-reverify', kind: 'load-flake-rearm', oldVerdict: 'hold' }));
   });
 });
+
+it('capability-off refuses saved-fix work before acquiring a lane and still ends obsolete holds', async () => {
+  const resolveProfile = () => ({ capabilities: { fix: false } });
+  const { io, pr } = fixture();
+  expect(await runLoadFlakeReverify({ resolveProfile }, io)).toMatchObject({ deferred: 'unsupported-repo' });
+  expect(io.push).not.toHaveBeenCalled();
+  expect(io.acquire).not.toHaveBeenCalled();
+  expect(io.verify).not.toHaveBeenCalled();
+  expect(io.release).not.toHaveBeenCalled();
+  expect(io.comment).not.toHaveBeenCalled();
+  io.readPr.mockResolvedValue({ ...pr, state: 'CLOSED' });
+  expect(await runLoadFlakeReverify({ resolveProfile }, io)).toMatchObject({ deferred: 'head-moved' });
+  expect(io.comment.mock.calls.at(-1)[2]).toContain('result=head-moved');
+});
+
+it('capability-off refuses load-flake redispatch before merging or ending its hold', async () => {
+  const { buildLoadFlakeRedispatchComment } = await import('../stand-down.mjs');
+  const { io, pr } = fixture();
+  pr.comments = [comment(buildLoadFlakeRedispatchComment({ head: pr.headRefOid, detail: 'timing' }))];
+  io.mergeMain = vi.fn();
+  const out = await runLoadFlakeReverify({ resolveProfile: () => ({ capabilities: { fix: false } }) }, io);
+  expect(out.redispatched).toEqual([expect.objectContaining({ deferred: 'unsupported-repo' })]);
+  expect(io.mergeMain).not.toHaveBeenCalled();
+  expect(io.comment).not.toHaveBeenCalled();
+});
+
+it.each([0, 2])('capability-off never verifies or consumes a saved-fix attempt with %s previous failures', async attempts => {
+  const { io } = fixture(attempts ? [red('2026-10-04T19:00:00Z'), red('2026-10-04T20:00:00Z')] : []);
+  io.verify.mockReturnValue({ ok: false, summary: 'broken' });
+  expect(await runLoadFlakeReverify({ resolveProfile: () => ({ capabilities: { fix: false } }) }, io))
+    .toMatchObject({ deferred: 'unsupported-repo' });
+  for (const effect of [io.acquire, io.verify, io.push, io.comment, io.release]) expect(effect).not.toHaveBeenCalled();
+});
+
+it('saved-fix rechecks capability after verification before pushing', async () => {
+  const { io } = fixture();
+  let fix = true;
+  io.verify.mockImplementation(() => { fix = false; return { ok: true }; });
+  expect(await runLoadFlakeReverify({ resolveProfile: () => ({ capabilities: { fix } }) }, io))
+    .toMatchObject({ deferred: 'unsupported-repo' });
+  expect(io.verify).toHaveBeenCalledOnce();
+  expect(io.release).toHaveBeenCalledOnce();
+  expect(io.push).not.toHaveBeenCalled();
+  expect(io.comment).not.toHaveBeenCalled();
+});
