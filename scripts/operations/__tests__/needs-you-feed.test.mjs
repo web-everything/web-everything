@@ -473,6 +473,17 @@ describe('gateReadyItems: "your review" is re-checked against the live PR (#5768
           body: `${redTeamGateMarker(5768, head, GATE_OUTCOMES.CARD_QUEUED, id)}\n- 1 finding(s) filed as a follow-up card (#1).` }];
       expect(await kind(comments, readPolicy)).toBe('confirmed-break-owed-send-back');
     });
+    it('a throwing policy reader plus a class-deferred degraded card record alarms (nothing automatic settles)', async () => {
+      const body = renderRedTeamComment({ pr: 5768, rev: head, provider: 'codex', model: 'm', recheckStatus: 'ok', foldedVerdict: 'changes',
+        findings: [{ summary: 'confirmed break', category: 'edge-case', impactIfUnfixed: 'degraded', file: 'scripts/x.mjs', line: 3,
+          confirmedByRecheck: true, recheckReason: 'real', findingClass: 'theoretical-race', classBasis: 'needs a rare race' }] });
+      const id = redTeamResultId(parseRedTeamComment(body));
+      const comments = [{ user: { login: 'web-everything' }, body, created_at: '2026-10-10T02:04:41Z' },
+        { user: { login: 'web-everything' }, created_at: '2026-10-10T02:05:00Z',
+          body: `${redTeamGateMarker(5768, head, GATE_OUTCOMES.CARD_QUEUED, id)}\n- 1 finding(s) filed as a follow-up card (#1).` }];
+      expect(await kind(comments, () => { throw new Error('unreadable'); })).toBe('confirmed-break-owed-send-back');
+      expect(await kind(comments, () => cardPolicy)).toBe('needs-you');
+    });
     it('an unreadable setting falls back to the strict policy (alarm)', async () => {
       const comments = queued('degraded', 2);
       expect(await kind(comments, () => { throw new Error('unreadable'); })).toBe('confirmed-break-owed-send-back');

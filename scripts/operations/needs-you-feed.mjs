@@ -246,8 +246,8 @@ export async function gateReadyItems(items, report, { gh, cwd, now = Date.now(),
   fixClaimLive = (repo, pr) => { try { return readLiveFixClaim({ repo, pr }) !== null; } catch { return null; } },
   readPolicy = readBreakPolicy } = {}) {
   // The same policy reader the gate uses; an unreadable setting keeps the strict policy (alarm).
-  let policy;
-  try { policy = readPolicy(); if (!policy || typeof policy !== 'object') throw new Error('no policy'); } catch { policy = ALERT_BREAK_POLICY; }
+  let policy, strict = false;
+  try { policy = readPolicy(); if (!policy || typeof policy !== 'object') throw new Error('no policy'); } catch { policy = ALERT_BREAK_POLICY; strict = true; }
   // "your review" and "needs your merge" rows both ask the operator to approve: both pass the same live red-team gate.
   const ready = new Set([...(report.ready ?? []), ...(report.needsYourMerge ?? [])].map((r) => `${r.repo}#${r.number ?? r.pr}`));
   const deadline = Date.now() + deadlineMs;
@@ -278,7 +278,7 @@ export async function gateReadyItems(items, report, { gh, cwd, now = Date.now(),
       const open = new Set([...(disposition?.sendBack ?? []), ...(disposition?.held ?? [])].map(f => f.index));
       const cardByPolicy = new Set(planRedTeamActions(state.result, policy).card.map(f => f.index));
       const settled = f => !open.has(f.index) && (disposition?.rulings.get(f.index) ?? []).some(r => r.kind !== 'block'
-        && (r.source === 'operator' || (r.kind === 'card' && breakClass(f) !== 'broken' && cardByPolicy.has(f.index))));
+        && (r.source === 'operator' || (!strict && r.kind === 'card' && breakClass(f) !== 'broken' && cardByPolicy.has(f.index))));
       // Index 0 is the shared hold on stored evidence the thread does not show in full: no operator ruling settles it.
       // An index-0 hold that is only "publication pending" (stored evidence not sealed yet) is no break: never approve, never alarm.
       const publicationPending = (disposition?.held ?? []).some(f => f.index === 0 && f.unsealed === true);
