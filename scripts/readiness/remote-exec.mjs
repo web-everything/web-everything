@@ -9,6 +9,9 @@ import { randomBytes, createHash } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import { allowedCommand, allowedEnv, normalizeScanFilesValue, digestInput, digestArgv, digestLock, isTestFile, validateTestNames, pathParts, bytePath, splitPaths, manifestWire, digestManifest, readManifestFile, SIBLING_PATHS, siblingShas, sameSiblingShas } from './forge-exec-run.mjs';
 
+import {trackedTree, validateTrackedFile, logManifestVerdict, FORGE_MANIFEST_FILE_CAP, FORGE_MANIFEST_TOTAL_CAP, FORGE_MANIFEST_SIZE_EXCEPTIONS} from './forge-manifest-tracked.mjs';
+export {FORGE_MANIFEST_SIZE_EXCEPTIONS, FORGE_MANIFEST_BINARY_EXTENSIONS} from './forge-manifest-tracked.mjs';
+
 import {BASE_RETENTION} from './forge-exec-bases.mjs';
 import {resolveTransport,runnerSupportsBundle,planBundle,mainFreshness,bundleEvidence,makeBundleDirectory,removeBundleDirectory} from './remote-git-bundle.mjs';
 import {routeNeedsGit,selectionUnproven} from './needs-git-route.mjs';
@@ -386,7 +389,7 @@ async function verifyTrackedLink(cwd, {linkPath,linkOid:oid,targetPath}, fs) {
 }
 
 const manifestRefusal=(code,path)=>Object.assign(new Error(`${code}: use local fallback`),{
-  code,detail:(Buffer.isBuffer(path)?path.toString('utf8'):String(path)).replace(/[\x00-\x1f\x7f-\x9f\u2028\u2029]/g,'?')||'.',
+  code,manifestPath:Buffer.from(path),detail:(Buffer.isBuffer(path)?path.toString('utf8'):String(path)).replace(/[\x00-\x1f\x7f-\x9f\u2028\u2029]/g,'?')||'.',
 });
 // Walk independently of Git's inventory. Never follow a directory link.
 async function crossCheckManifest({cwd,fs,entries,identities,indexBlobs,trackedLinks,ignoredPaths,exec,head,rootInfo,scoped}) {
@@ -590,9 +593,40 @@ async function siblingPathReferences(config){
   return [...paths];
 }
 
-export async function buildManifest({cwd = process.cwd(), exec = defaultExec, fs = filesystem, listFiles, trackedOnly = false, head, reuse, env=process.env, beginSub=noTiming, onWarning} = {}) {
+export async function buildManifest(options = {}) {
+  const {manifestMode = 'legacy', trackedOnly = false, env = process.env, shadow = false} = options;
+  // Sibling snapshots retain their established index-based contract and do not shadow.
+  if (trackedOnly) return buildManifestInventory(options);
+  let head = options.head;
+  const tracked = () => buildManifestInventory({...options, manifestMode:'tracked',
+    onTrackedHead:value=>{head=value;}});
+  if (manifestMode === 'tracked') {
+    try { return await tracked(); }
+    catch (error) { await logManifestVerdict({env,mode:'tracked',error,head}); throw error; }
+  }
+  if (manifestMode !== 'legacy') throw manifestRefusal('mode','.');
+  // Never let an unavailable Git probe, shadow verdict or telemetry write change legacy output/refusals.
+  try { return await buildManifestInventory(options); }
+  finally {
+    if (shadow) {
+      let error;
+      try { await buildManifestInventory({...options,manifestMode:'tracked',reuse:undefined,
+        beginSub:noTiming,onWarning:()=>{},onTrackedHead:value=>{head=value;}}); }
+      catch (failure) { error=failure; }
+      await logManifestVerdict({env,mode:'legacy',error,head});
+    }
+  }
+}
+
+async function buildManifestInventory({cwd = process.cwd(), exec = defaultExec, fs = filesystem, listFiles, trackedOnly = false, head, reuse, env=process.env, beginSub=noTiming, onWarning,
+  manifestMode = 'legacy', sizeExceptions = FORGE_MANIFEST_SIZE_EXCEPTIONS, totalCap = FORGE_MANIFEST_TOTAL_CAP, byteBudget = {bytes:0}, onTrackedHead} = {}) {
   exec=await bindGit({cwd,env,exec});
   if(head!==undefined&&!/^[a-f0-9]{40}(?:[a-f0-9]{24})?$/.test(head))throw new Error('Invalid Git HEAD');
+  const trackedMode = manifestMode === 'tracked' && !trackedOnly;
+  const tree = trackedMode ? await trackedTree({cwd,exec,head,refuse:manifestRefusal,onHead:onTrackedHead}) : undefined;
+  const validationTree = tree ?? (manifestMode === 'tracked' && trackedOnly
+    ? await trackedTree({cwd,exec,head,refuse:manifestRefusal,trackedOnly:true}) : undefined);
+  if (tree) head=tree.head;
   // Neither Git ignores nor Vitest discovery prove that a file is unused:
   // selected tests can import excluded tests, directly or through helpers.
   // Until dependency inclusion is established, retain local fallback.
@@ -608,7 +642,9 @@ export async function buildManifest({cwd = process.cwd(), exec = defaultExec, fs
   }
   const walkDone=beginSub('inventory-walk');
   let files;
-  if (listFiles) {
+  if (tree) {
+    files=[...tree.entries.values()].map(entry=>entry.path);
+  } else if (listFiles) {
     const names = await listFiles(cwd);
     if (!Array.isArray(names) || names.some(name => !Buffer.isBuffer(name) && typeof name !== 'string')) throw new Error('Invalid inventory');
     files = names.map(name => Buffer.from(name));
@@ -617,9 +653,8 @@ export async function buildManifest({cwd = process.cwd(), exec = defaultExec, fs
     if (result.code !== 0 || !Buffer.isBuffer(result.stdout)) throw new Error('Byte inventory unavailable');
     files = splitPaths(result.stdout);
   }
-  // Only this ignored coverage input is transportable; it uses the same leaf
-  // safety checks and digests below as ordinary inventory entries.
-  if (!trackedOnly) files.push(...ignoredPaths.filter(path => path.equals(Buffer.from('coverage/coverage-final.json'))));
+  // Legacy retains its ignored coverage input. Tracked mode never transports coverage.
+  if (!trackedOnly && !trackedMode) files.push(...ignoredPaths.filter(path => path.equals(Buffer.from('coverage/coverage-final.json'))));
   // Index evidence still rejects unsupported gitlinks, including injected inventories.
   const stage = await exec({file:'git',args:['ls-files','--stage','-z'],cwd});
   if (stage.code !== 0 || !Buffer.isBuffer(stage.stdout) || stage.stdout.length > LIMIT
@@ -639,6 +674,9 @@ export async function buildManifest({cwd = process.cwd(), exec = defaultExec, fs
     if (record.subarray(0,6).equals(Buffer.from('120000'))) indexLinks.set(key,indexBlobs.get(key));
     start = i + 1;
   }
+  if (tree) for (const key of indexBlobs.keys())
+    if (!Buffer.from(key,'base64').equals(Buffer.from('coverage/coverage-final.json'))
+      && !tree.entries.has(key)) throw manifestRefusal('untracked',Buffer.from(key,'base64'));
   // The runner restores HEAD symlinks into its index and cannot prove from the
   // manifest that the client still has them: a link deleted, retargeted or turned
   // into a file here (staged or not) can leave an identical-looking projection.
@@ -654,6 +692,10 @@ export async function buildManifest({cwd = process.cwd(), exec = defaultExec, fs
       if(!meta)throw manifestRefusal('head-symlink-changed','HEAD links unreadable');
       if(meta[1]==='120000')throw manifestRefusal('head-symlink-changed',fields[i+1]);
     }
+  }
+  if (tree) for (const [key,oid] of indexLinks) {
+    const entry=tree.entries.get(key);
+    if(entry?.mode!=='120000' || entry.oid!==oid)throw manifestRefusal('dirty',Buffer.from(key,'base64'));
   }
   const trackedLinks=new Map();
   for(const key of indexLinks.keys()) {
@@ -732,7 +774,10 @@ export async function buildManifest({cwd = process.cwd(), exec = defaultExec, fs
   })();
   // Each leaf runs the same per-leaf checks; leaves run concurrently and their
   // results are reassembled in inventory order (see orderedPool).
+  let admittedBytes=0;
+  const admittedSizes=new Map();
   const leaves = await orderedPool(files, MANIFEST_CONCURRENCY, async path => {
+    if (manifestMode === 'tracked' && path.equals(Buffer.from('coverage/coverage-final.json'))) return {excluded:path};
     if (trackedLinks.has(path.toString('hex'))) return;
     const {parts,names,excluded:excludedByPolicy,credentialSource}=classifyManifestPath(path);
     let publicOid;
@@ -755,7 +800,7 @@ export async function buildManifest({cwd = process.cwd(), exec = defaultExec, fs
       if (excludedTest) throw new Error('Excluded test: use local fallback');
       return {excluded:path};
     }
-    if(!listFiles && !trackedOnly && indexBlobs.has(path.toString('base64'))) {
+    if(!trackedMode && !listFiles && !trackedOnly && indexBlobs.has(path.toString('base64'))) {
       const missing=await fs.lstat(bytePath(cwd,path)).then(()=>false,error=>{if(error.code==='ENOENT')return true;throw error;});
       if(missing) {
         let deleted;
@@ -767,18 +812,32 @@ export async function buildManifest({cwd = process.cwd(), exec = defaultExec, fs
     let absolute = Buffer.from(cwd), st;
     for (const [i,part] of parts.entries()) {
       absolute = bytePath(absolute,part);
-      st = await inventoryStat(fs,absolute);
+      try { st = await inventoryStat(fs,absolute); }
+      catch(error) { if(tree)throw manifestRefusal('dirty',path); throw error; }
       if (st.isSymbolicLink()) throw manifestRefusal('unshipped-symlink',absolute.subarray(Buffer.byteLength(cwd)+1));
-      if (i === parts.length-1 ? !st.isFile() : !st.isDirectory()) throw new Error('Unsafe inventory component');
+      if (i === parts.length-1 ? !st.isFile() : !st.isDirectory()) throw tree ? manifestRefusal('dirty',path) : new Error('Unsafe inventory component');
     }
     identities.set(path.toString('hex'),st);
-    const previous=!trackedOnly && !credentialSource && reuse?.get(path.toString('hex'));
+    const previous=!trackedMode && !trackedOnly && !credentialSource && reuse?.get(path.toString('hex'));
     const executable=!!(st.mode & 0o111), tracked=indexBlobs.has(path.toString('base64'));
     const stable=previous?.stat && ['dev','ino','size','mode','mtimeNs','ctimeNs','mtimeMs','ctimeMs'].every(key=>st[key]===previous.stat[key]);
     if(previous && stable && st.size===previous.size && executable===previous.executable)
       return {entry:{path,sha256:previous.sha256,executable,tracked}};
     const hashDone=beginSub('hashing');
+    if (manifestMode === 'tracked') {
+      const oid=validationTree ? validationTree.entries.get(path.toString('base64'))?.oid : indexBlobs.get(path.toString('base64'));
+      if (st.size>FORGE_MANIFEST_FILE_CAP && !sizeExceptions.some(exception=>Buffer.from(exception.path).equals(path)&&exception.oid===oid))
+        throw manifestRefusal('oversize',path);
+    }
     const content = await readManifestFile(absolute,st,fs);
+    if (validationTree) {
+      validateTrackedFile({path,content,st,tree:validationTree,refuse:manifestRefusal,sizeExceptions});
+    }
+    if (manifestMode === 'tracked') {
+      admittedBytes+=content.length;
+      admittedSizes.set(path.toString('hex'),content.length);
+      if (byteBudget.bytes+admittedBytes>totalCap) throw manifestRefusal('total-oversize',path);
+    }
     if (publicOid || trackedOnly) {
       publicOid ??= indexBlobs.get(path.toString('base64'));
       if (!publicOid) throw new Error('Sibling index unavailable');
@@ -813,6 +872,7 @@ export async function buildManifest({cwd = process.cwd(), exec = defaultExec, fs
     const leaves=[];
     for (const entry of targets) {
       const path=Buffer.concat([directoryPrefix(link.linkPath),entry.path.subarray(link.sourcePrefix.length)]);
+      if (manifestMode === 'tracked' && path.equals(Buffer.from('coverage/coverage-final.json'))) continue;
       // Only the established Claude bridges may bypass their dot-directory prefix;
       // their remaining components and all other aliases obey the normal policy.
       const bridge=['.claude/skills/','.claude/agent-memory/'].find(prefix=>path.subarray(0,prefix.length).equals(Buffer.from(prefix)));
@@ -835,6 +895,11 @@ export async function buildManifest({cwd = process.cwd(), exec = defaultExec, fs
     return leaves;
   }
   for(const link of trackedLinks.values())entries.push(...project(link));
+  if (manifestMode === 'tracked') {
+    const total=entries.reduce((sum,entry)=>sum+(admittedSizes.get((entry.sourcePath??entry.path).toString('hex'))??0),0);
+    if(byteBudget.bytes+total>totalCap)throw manifestRefusal('total-oversize','.');
+    byteBudget.bytes+=total;
+  }
   if(trackedLinks.size) {
     entries.sort((a,b)=>Buffer.compare(a.path,b.path));
     validateTestNames(entries.map(entry=>entry.path));
@@ -857,21 +922,25 @@ export async function buildManifest({cwd = process.cwd(), exec = defaultExec, fs
         throw error;
       });
       if (present) {
-        const checked = await checkSibling(siblingRoot,exec,fs);
+        // Tracked validation reports HEAD byte/mode mismatches as dirty before
+        // the final status check; legacy retains its original early status check.
+        const checked = await checkSibling(siblingRoot,exec,fs,{checkClean:manifestMode !== 'tracked'});
         const result = await exec({file:'git',args:['ls-files','-z','--',...Object.values(SIBLING_PATHS).map(path => path.slice('../frontierui/'.length))],cwd:siblingRoot});
         if (result.code !== 0) throw new Error('Sibling inventory unavailable');
         const files = splitPaths(result.stdout);
         const prefixes = Object.values(SIBLING_PATHS).map(path => Buffer.from(path.slice('../frontierui/'.length)+'/'));
         if (files.some(path => !prefixes.some(prefix => path.subarray(0,prefix.length).equals(prefix)))) throw new Error('Unsupported sibling inventory');
         const siblingDone=beginSub('sibling-inventory');
-        const snapshot = await buildManifest({cwd:siblingRoot,exec,fs,listFiles:async()=>files,trackedOnly:true,onWarning});
+        const snapshot = await buildManifest({cwd:siblingRoot,exec,fs,listFiles:async()=>files,trackedOnly:true,onWarning,
+          ...(manifestMode === 'tracked' ? {manifestMode,env,sizeExceptions,totalCap,byteBudget,head:checked.sha} : {})});
         siblingDone();
         if (!sameSiblingEvidence(await checkSibling(siblingRoot,exec,fs),checked)) throw new Error('Sibling HEAD changed');
         siblings = {frontierui:{sha:checked.sha,roots:checked.roots,entries:snapshot.entries,excluded:snapshot.excluded}};
       }
     } catch (error) {
       if(typeof error.path==='string'){const rel=relative(resolve(cwd,'../frontierui'),Buffer.isBuffer(error.path)?error.path.toString('utf8'):error.path);if(rel&&!rel.startsWith('..'))error.siblingPath=rel;}
-      error.code = ['unsupported-sibling-dependency','excluded-source-file','ignored-test-file'].includes(error.code) ? error.code : 'sibling-inventory-failed';
+      error.code = ['unsupported-sibling-dependency','excluded-source-file','ignored-test-file',
+        ...(manifestMode === 'tracked' ? ['dirty','oversize','total-oversize','binary-type'] : [])].includes(error.code) ? error.code : 'sibling-inventory-failed';
       throw error;
     }
   }
@@ -914,7 +983,7 @@ export async function rankBases({cwd=process.cwd(),exec=defaultExec,env=process.
 export async function selectBase(options={}) {return (await rankBases(options))[0]??null;}
 const manifestFailure=error=>String(error?.message??error??'Base evidence unavailable').replace(/[\x00-\x1f\x7f-\x9f]/g,' ').slice(0,200)||'Base evidence unavailable';
 const delay=ms=>new Promise(resolve=>setTimeout(resolve,ms));
-export async function buildDeltaManifest({cwd=process.cwd(),exec=defaultExec,fs=filesystem,base,head,env=process.env,beginSub=noTiming,onWarning}={}) {
+export async function buildDeltaManifest({cwd=process.cwd(),exec=defaultExec,fs=filesystem,base,head,env=process.env,beginSub=noTiming,onWarning,shadow=false}={}) {
   exec=await bindGit({cwd,env,exec});
   if(!base || digestManifest(base.manifest)!==base.manifestDigest)throw new Error('Base manifest digest mismatch');
   const snapshot=decodeManifest(base.manifest);
@@ -1013,7 +1082,7 @@ export async function buildDeltaManifest({cwd=process.cwd(),exec=defaultExec,fs=
     } finally {await reader?.close();}
     manifestMode='git-delta';
   } catch {manifestReason ??='base or git evidence unavailable';reuse=undefined;}
-  const manifest=await buildManifest({cwd,exec,fs,head,reuse,env,beginSub,onWarning});
+  const manifest=await buildManifest({cwd,exec,fs,head,reuse,env,beginSub,onWarning,shadow});
   // Transfer decisions still compare the complete manifest, including fresh modes.
   const final=new Set(manifest.entries.map(e=>e.path.toString('hex')));
   const deltaPaths=manifest.entries.filter(entry=>{
@@ -1053,7 +1122,7 @@ async function digestDeltaInput(delta,stage,cwd,exec) {
 }
 
 // All sibling evidence is local Git evidence; never ask Forge to resolve a revision.
-async function checkSibling(root, exec, fs) {
+async function checkSibling(root, exec, fs, {checkClean = true} = {}) {
   exec=await bindGit({cwd:root,exec});
   const roots = [];
   for (const path of [root,...Object.values(SIBLING_PATHS).map(path => resolve(root,'..',path.slice(3)))]) {
@@ -1069,7 +1138,7 @@ async function checkSibling(root, exec, fs) {
   if (await fs.realpath(root) !== (await git(['rev-parse','--show-toplevel'])).trim()) throw new Error('Unresolvable sibling worktree');
   const sha = (await git(['rev-parse','HEAD'])).trim();
   if (!/^[a-f0-9]{40}(?:[a-f0-9]{24})?$/.test(sha)) throw new Error('Invalid sibling HEAD');
-  if ((await git(['status','--porcelain=v1','-z','--untracked-files=normal','--',...Object.values(SIBLING_PATHS).map(path => path.slice('../frontierui/'.length))])).length) throw new Error('Dirty sibling worktree');
+  if (checkClean && (await git(['status','--porcelain=v1','-z','--untracked-files=normal','--',...Object.values(SIBLING_PATHS).map(path => path.slice('../frontierui/'.length))])).length) throw new Error('Dirty sibling worktree');
   return {sha,roots};
 }
 const sameSiblingEvidence = (actual, expected) => actual.sha === expected.sha && JSON.stringify(actual.roots) === JSON.stringify(expected.roots);
@@ -1146,7 +1215,7 @@ async function stageSnapshot({fs,stageDirectory,source:sourceRoot,destination:de
 
 // Shared by the run and presync: one base selection and one delta manifest
 // builder, so both apply identical exclusion and walk checks.
-async function discoverDelta({cwd,exec,fs,env,host,discovery,fetchBaseManifest,head,beginSub=noTiming,onWarning}) {
+async function discoverDelta({cwd,exec,fs,env,host,discovery,fetchBaseManifest,head,beginSub=noTiming,onWarning,shadow=false}) {
   const gitDir=exec[gitBinding]?.dir;
   if(discovery.code!==0)throw new Error('No base capabilities');
   const caps=JSON.parse(protocolText(discovery.stdout,8192));
@@ -1174,7 +1243,7 @@ async function discoverDelta({cwd,exec,fs,env,host,discovery,fetchBaseManifest,h
     if(selected)break;
   }
   if(!selected)throw lastError;
-  return buildDeltaManifest({cwd,exec,fs,base:selected,head,env,beginSub,onWarning});
+  return buildDeltaManifest({cwd,exec,fs,base:selected,head,env,beginSub,onWarning,shadow});
 }
 
 // Presync (card 7515): ship a lane's delta leaves to a per-lane Forge cache
@@ -1238,7 +1307,11 @@ async function acquirePresyncLock(path,fs) {
 }
 // One presync round. Every failure is recorded in the lane state and never
 // thrown: a run must behave exactly as without presync.
-export async function presync({cwd=process.cwd(),host='forge',exec=defaultExec,fs=filesystem,sshOptions,env=process.env,clock=Date.now}={}) {
+export async function presync({cwd=process.cwd(),host='forge',exec=defaultExec,fs=filesystem,sshOptions,env=process.env,clock=Date.now,home}={}) {
+  const {loadAdmissionPolicy} = await import('./heavy-admission.mjs');
+  const policy = loadAdmissionPolicy({env,checkoutRoot:cwd,home});
+  if (policy.manifestFailClosed || policy.settings.remote.manifest !== 'legacy')
+    return {status:'skipped',reason:policy.manifestFailClosed ? policy.sources['remote.enabled'] : 'tracked-manifest'};
   if(!/^[a-zA-Z0-9][a-zA-Z0-9._-]*$/.test(host))return {status:'failed',reason:'invalid-host'};
   try {exec=await bindGit({cwd,env,exec});}catch {return {status:'failed',reason:'unbound-worktree'};}
   const gitDir=exec[gitBinding].dir;
@@ -1296,6 +1369,10 @@ export function logLocalLocation(result,log) {
 }
 
 export async function runRemote(options={}) {
+  // Decide from the original caller options, before bindGit wraps the executor.
+  // Carry this decision through retries; injected IO retains its legacy call sequence.
+  const shadow=options.exec===undefined && options.fs===undefined && options.listFiles===undefined
+    && (options.env??process.env).FORGE_MANIFEST_SHADOW!=='0';
   const clock=options.clock??Date.now,timings=[],start=clock();
   const pending=new Map();
   const begin=stage=>{
@@ -1303,7 +1380,7 @@ export async function runRemote(options={}) {
     timings.push(item);pending.set(item,at);
     return extra=>{pending.delete(item);Object.assign(item,{ms:Math.max(0,Math.round(clock()-at)),...extra});};
   };
-  const result=await executeRemote({...options,clock,timings,begin});
+  const result=await executeRemote({...options,shadow,clock,timings,begin});
   logLocalLocation(result,options.log);
   for(const [item,at] of pending)item.ms=Math.max(0,Math.round(clock()-at));
   timings.push({stage:'total',startedAtET:easternTimestamp(start),ms:Math.max(0,Math.round(clock()-start))});
@@ -1345,7 +1422,7 @@ export function detectTestNeedsGit({argv,cwd,route=routeNeedsGit,unproven=select
   try{return route({argv,cwd}).local===true||unproven({argv,cwd})===true;}catch{return true;}
 }
 
-async function executeRemote({ warningSink, argv, cwd = process.cwd(), env = process.env, runId = newRunId(), host = 'forge', exec = defaultExec, listFiles, fs = filesystem, clock, timings, begin, disableDelta=false, sshOptions, cancelSignal, onRun, slotUnits = 1, transport, onCapabilities, onWarning, bundleMainMaxAgeMs = 600000, log = text=>process.stderr.write(text) } = {}) {
+async function executeRemote({ warningSink, argv, cwd = process.cwd(), env = process.env, runId = newRunId(), host = 'forge', exec = defaultExec, listFiles, fs = filesystem, clock, timings, begin, disableDelta=false, sshOptions, cancelSignal, onRun, slotUnits = 1, transport, manifestMode = 'legacy', shadow = false, onCapabilities, onWarning, bundleMainMaxAgeMs = 600000, log = text=>process.stderr.write(text) } = {}) {
   let warningCount=0;
   // The credential-warn log is what a later re-tightening reads: never drop a warning silently. With no callback,
   // or when the callback throws, append it to remote-fallbacks.jsonl; a failed write is logged, never fatal.
@@ -1371,11 +1448,18 @@ async function executeRemote({ warningSink, argv, cwd = process.cwd(), env = pro
   const {collect:collectGuard} = guardCollector;
   let executionEnv;
   try { executionEnv = filterEnv(env); } catch (error) { return fallback(error.code); }
-  const bundleTransport=resolveTransport(transport)==='git-bundle';
+  const bundleRequested=resolveTransport(transport)==='git-bundle';
+  // Git history is outside the tracked leaf manifest, even when its tip is clean.
+  const bundleTransport=manifestMode === 'legacy' && bundleRequested;
   const standardsNeedGit=argv[2]==='check:standards'||Object.hasOwn(executionEnv,'DIFF_COVERAGE_BASE');
-  // git-bundle only: a test file that spawns git also gets a real worktree (otherwise it stays on the git-less snapshot).
-  let testNeedsGit=false;
-  if(bundleTransport&&!standardsNeedGit)testNeedsGit=detectTestNeedsGit({argv,cwd});
+  // Legacy bundles provide a real worktree. Tracked runs must keep Git-dependent tests local.
+  const testNeedsGit=!standardsNeedGit && (bundleRequested || manifestMode === 'tracked')
+    && detectTestNeedsGit({argv,cwd});
+  if (manifestMode === 'tracked' && testNeedsGit) {
+    const error=manifestRefusal('bundle-local','.');
+    await logManifestVerdict({env,mode:manifestMode,error});
+    return fallback(error.code,error.detail);
+  }
   const needsGit=standardsNeedGit||testNeedsGit;
   let bundleDirectory;
   if (!validateRunId(runId) || !/^[a-zA-Z0-9][a-zA-Z0-9._-]*$/.test(host)) return fallback('invalid-parameters');
@@ -1462,6 +1546,12 @@ async function executeRemote({ warningSink, argv, cwd = process.cwd(), env = pro
         logicalHead=protocolText(evidence.stdout,128).trim();
         if(evidence.code!==0||!/^[a-f0-9]{40}(?:[a-f0-9]{24})?$/.test(logicalHead))throw new Error('Missing Git evidence');
       }
+      // These commands consume the local coverage report; no coverage bytes may cross the tracked boundary.
+      if (manifestMode === 'tracked' && standardsNeedGit) {
+        const error=manifestRefusal('coverage-local',Buffer.from('coverage/coverage-final.json'));
+        await logManifestVerdict({env,mode:manifestMode,error,head:logicalHead});
+        throw error;
+      }
       if (Object.hasOwn(executionEnv,'DIFF_COVERAGE_BASE')) {
         try {
           const evidence=await exec({file:'git',args:['rev-parse','--verify','--end-of-options',executionEnv.DIFF_COVERAGE_BASE+'^{commit}'],cwd});
@@ -1473,15 +1563,15 @@ async function executeRemote({ warningSink, argv, cwd = process.cwd(), env = pro
       // Discovery is read-only. Older separately installed wrappers reject this
       // subcommand; their full-ship path retains its existing admission order.
       try {
-        if(disableDelta)throw new Error('Full ship selected');
-        delta=await discoverDelta({cwd,exec,fs,env,host,discovery:unwrap(initial[2]),fetchBaseManifest:sha=>ssh('base-manifest',{sha}),head:logicalHead,beginSub,onWarning:reportWarning});
+        if(disableDelta || manifestMode === 'tracked')throw new Error('Full ship selected');
+        delta=await discoverDelta({cwd,exec,fs,env,host,discovery:unwrap(initial[2]),fetchBaseManifest:sha=>ssh('base-manifest',{sha}),head:logicalHead,beginSub,onWarning:reportWarning,shadow});
         // Warm-leaf assembly recreates mtimes; coverage freshness needs full ship.
         if (delta.entries.some(entry => entry.path.equals(Buffer.from('coverage/coverage-final.json')))) throw new Error('Coverage inputs require full ship');
         manifest=delta;
         if(delta.manifestMode==='full-scan'){manifestReason=manifestFailure(delta.manifestReason);delta=undefined;}
       } catch(error) {manifestReason=manifestFailure(error);delta=undefined;}
 
-      manifest ??= await buildManifest({cwd,exec,listFiles,fs,head:logicalHead,env,beginSub,onWarning:reportWarning});
+      manifest ??= await buildManifest({cwd,exec,listFiles,fs,head:logicalHead,env,beginSub,onWarning:reportWarning,manifestMode,shadow});
       log(`manifest: ${delta ? `git-delta (${delta.changedCount} changed of ${delta.baseCount})` : `full-scan (${manifestReason})`}\n`);
       manifestDone({...(!delta?{manifestReason}:{}),substages:[...substages.values].map(([stage,ms])=>({stage,ms:Math.round(ms)}))});
       // Scanners may skip nonexistent paths. Require the entire requested scope
@@ -1628,14 +1718,14 @@ async function executeRemote({ warningSink, argv, cwd = process.cwd(), env = pro
       if(delta) {
         await finish();
         if(staging){await fs.rm(staging,{recursive:true,force:true});staging=undefined;}
-        return executeRemote({argv:withGuardReport(argv,guardOutputFile),cwd,env,runId,host,exec,listFiles,fs,clock,timings,begin,disableDelta:true,sshOptions,cancelSignal,onRun,slotUnits,transport,onCapabilities,onWarning:reportWarning,bundleMainMaxAgeMs,log});
+        return executeRemote({argv:withGuardReport(argv,guardOutputFile),cwd,env,runId,host,exec,listFiles,fs,clock,timings,begin,disableDelta:true,sshOptions,cancelSignal,onRun,slotUnits,transport,manifestMode,shadow,onCapabilities,onWarning:reportWarning,bundleMainMaxAgeMs,log});
       }
       if (error.code === 'sibling-inventory-failed') return {mode:'not-started',terminated:true,reason:error.code,detail:safeFallbackDetail(error.code,error.siblingPath)};
       if (error.code === 'unsupported-sibling-dependency') return fallback(error.code);
       if (error.code === 'git-bundle-failed') return fallback(error.code,error.detail);
       if (['coverage-report-not-portable','diff-coverage-base-unavailable'].includes(error.code)) return fallback(error.code);
       if (error.code === 'excluded-source-file') return {mode:'not-started', terminated:true, reason:error.code, detail:safeFallbackDetail(error.code,error.detail)};
-      return fallback(['ignored-test-file','unshipped-test-file','unshipped-symlink','head-symlink-changed','manifest-worktree-mismatch','manifest-walk-limit','unbound-worktree'].includes(error.code) ? error.code : 'copy-failed',error.detail);
+      return fallback(['untracked','dirty','oversize','total-oversize','binary-type','mode','coverage-local','gitlink-unsupported','ignored-test-file','unshipped-test-file','unshipped-symlink','head-symlink-changed','manifest-worktree-mismatch','manifest-walk-limit','unbound-worktree'].includes(error.code) ? error.code : 'copy-failed',error.detail);
     }
     try {
       const runAt=clock(),runDone=begin('forge-run');
@@ -1662,7 +1752,7 @@ async function executeRemote({ warningSink, argv, cwd = process.cwd(), env = pro
           // finish consumed protected prepared state and proved started=false.
           // A fresh full prepare is safe once; disableDelta bounds the retry.
           if(staging){await fs.rm(staging,{recursive:true,force:true});staging=undefined;}
-          const retried=await executeRemote({argv:withGuardReport(argv,guardOutputFile),cwd,env,runId,host,exec,listFiles,fs,clock,timings,begin,disableDelta:true,sshOptions,cancelSignal,onRun,slotUnits,transport,onCapabilities,onWarning:reportWarning,bundleMainMaxAgeMs,log});
+          const retried=await executeRemote({argv:withGuardReport(argv,guardOutputFile),cwd,env,runId,host,exec,listFiles,fs,clock,timings,begin,disableDelta:true,sshOptions,cancelSignal,onRun,slotUnits,transport,manifestMode,shadow,onCapabilities,onWarning:reportWarning,bundleMainMaxAgeMs,log});
           for(const timing of timings)if(timing.stage==='rsync')timing.shipMode='delta-then-full';
           return retried;
         }
@@ -1735,10 +1825,13 @@ export async function main(options = {}) {
   if (!isAllowedCommand(normalizeRemoteArgv(splitGuardReport(options.argv).argv))) throw new Error('command-not-allowed: use npm run <allowed-task> -- <task-args>');
   // Import at invocation time: heavy-admission's default executor imports us.
   const { runWithRemoteDecision, loadAdmissionPolicy, adaptLegacyRemoteResult } = await import('./heavy-admission.mjs');
-  const loaded = loadAdmissionPolicy({env:options.env,checkoutRoot:options.cwd});
-  const policy = {...loaded,settings:{...loaded.settings,remote:{...loaded.settings.remote,enabled:true,mode:'always'}},sources:{...loaded.sources}};
-  policy.sources['remote.enabled'] = 'explicit remote CLI request';
-  policy.sources['remote.mode'] = 'explicit remote CLI request';
+  const loaded = loadAdmissionPolicy({env:options.env,checkoutRoot:options.cwd,home:options.home});
+  const policy = {...loaded,settings:{...loaded.settings,remote:{...loaded.settings.remote}},sources:{...loaded.sources}};
+  if (!loaded.manifestFailClosed) {
+    Object.assign(policy.settings.remote,{enabled:true,mode:'always'});
+    policy.sources['remote.enabled'] = 'explicit remote CLI request';
+    policy.sources['remote.mode'] = 'explicit remote CLI request';
+  }
   let capturedTimings;
   const remoteExecutor=options.remoteExec ?? (async decisionOptions=>adaptLegacyRemoteResult(await runRemote({...options,...decisionOptions})));
   const result = await runWithRemoteDecision({
