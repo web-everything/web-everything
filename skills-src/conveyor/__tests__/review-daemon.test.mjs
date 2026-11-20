@@ -1,3 +1,4 @@
+import { completeCheckRows } from '../../../scripts/lib/__tests__/helpers/complete-check-rows.mjs';
 import { dispatchReview } from '../../../scripts/operations/review-dispatch.mjs';
 import { readReviewCiGate } from '../../../scripts/lib/review-ci-gate-io.mjs';
 import { sweepAuthorStamps } from '../../../scripts/lib/author-stamp-restore.mjs';
@@ -3025,7 +3026,7 @@ it('x6n7c2p required checks before review — synthetic #3432 four-tick soak spe
       dispatch: options => dispatchReview({ ...options, root: '/repo', checkStaleness: () => ({ fresh: true, behind: 0 }),
         ciGate: args => readReviewCiGate({ ...args, policy: { startAfter: 'ci-green' }, readHead: () => head.repeat(40),
           readRequired: () => ({ source: 'live', checks: ['test', 'daemon-soak'] }),
-          readChecks: () => [{ name: 'test', status: 'completed', conclusion: 'success' }, { name: 'daemon-soak', status, conclusion }],
+          readChecks: ({ headSha: rowsHead }) => completeCheckRows([{ name: 'test', status: 'completed', conclusion: 'success' }, { name: 'daemon-soak', status, conclusion }], rowsHead),
         }),
         readBrief: () => 'review {{PR}}', mintSessionId: () => 'ci-soak', ensureSessionCwd: path => path,
         resolveSettingsEnv: () => ({}), isolateSession: () => ({ worktreeSettings: {} }), spawnAgent,

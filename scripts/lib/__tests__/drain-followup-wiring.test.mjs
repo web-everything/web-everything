@@ -13,6 +13,7 @@ import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { openPrPageFixture } from '../../__tests__/fixtures/open-pr-page-fixture.mjs';
+import { completeCheckReadFixture } from '../../__tests__/fixtures/complete-check-read-fixture.mjs';
 
 import {
   DRAIN_FOLLOWUP_KIND, ensureDepsLink, followupWorktreeLayout, handOffDrainFollowup, resolveDrainFollowupSetting,
@@ -29,6 +30,9 @@ const F = process.env.FU_FIXTURE;
 const prs = JSON.parse(fs.readFileSync(F, 'utf8'));
 const landed = n => fs.existsSync(F + '.merged-' + n);
 const out = x => { fs.writeSync(1, JSON.stringify(x)); process.exit(0); };
+const completeCheckReadFixture = ${completeCheckReadFixture};
+const checkPages = completeCheckReadFixture(prs, a);
+if (checkPages !== undefined) out(checkPages);
 if (a[0] === 'repo' && a[1] === 'view') { process.stdout.write('main'); process.exit(0); }
 if (a[0] === 'pr' && a[1] === 'list') out(prs.filter(p => !landed(p.number)));
 if (a[0] === 'api' && a[1] === 'graphql') out(openPrPageFixture(prs.filter(p => !landed(p.number)), a.find(v => v.startsWith('query=')) || ''));
