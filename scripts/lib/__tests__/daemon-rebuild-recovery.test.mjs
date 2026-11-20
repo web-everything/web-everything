@@ -7,7 +7,7 @@ import { join } from 'node:path';
 import { prepareRebuild } from '../daemon-rebuild/prepare.mjs';
 import { smokeAndAdopt } from '../daemon-rebuild/smoke.mjs';
 import { readRebuildState, writeRebuildState, readReadyCandidate } from '../daemon-rebuild/state.mjs';
-import { envTimeoutRetry, recoveryDue, timeoutRetryAt, resolveRecovery, MAX_OVERLAY_OVERDUE_MS } from '../daemon-rebuild/recovery.mjs';
+import { envTimeoutRetry, envTimeoutAppliesToPlan, recoveryDue, timeoutRetryAt, resolveRecovery, MAX_OVERLAY_OVERDUE_MS } from '../daemon-rebuild/recovery.mjs';
 import { rebuildClone } from '../daemon-rebuild/rebuild.mjs';
 import { rebuildCloneAsJob, REBUILD_JOB_KIND, RESULT_SUFFIX } from '../daemon-rebuild/rebuild-job.mjs';
 import { createJobStore, enqueueJob } from '../daemon-jobs-runtime.mjs';
@@ -66,6 +66,43 @@ function expectHeld(f, result, held) {
 }
 
 describe('environment-timeout recovery deadlines', () => {
+  it.each([
+    [{}, true], [{ target: 'old' }, false], [{ target: 'target' }, true],
+    [{ target: null }, true], [{ inputsKey: 'old' }, false], [{ inputsKey: 'inputs' }, true],
+    [{ target: 'target', inputsKey: 'old' }, false], [{ target: 'old', inputsKey: 'inputs' }, false],
+  ])('legacy and current plan identity %j applies=%s', (identity, expected) => {
+    expect(envTimeoutAppliesToPlan({ reason: 'smoke-env-timeout', ...identity },
+      { inputsKey: 'inputs', finalSha: 'target' })).toBe(expected);
+  });
+
+  it.each(['inputsKey', 'finalSha'])('new %s bypasses the previous plan timeout backoff through early admission', async changed => {
+    const f = fixture(null);
+    vi.spyOn(locks, 'withWriteLock').mockImplementation(async (_root, fn) => ({ ok: true, value: await fn() }));
+    vi.spyOn(candidate, 'materializeCandidate').mockReturnValue({ ok: true, path: f.root });
+    vi.spyOn(candidate, 'removeCandidate').mockImplementation(() => {});
+    const runSmoke = vi.fn().mockResolvedValue({ verdict: 'env-timeout', smoke: { results: [] } });
+    const child = nowMs => rebuildClone({ root: f.root, env: f.env, run: f.run, log: { error() {} },
+      now: () => nowMs, readyOnly: true, asJob: false, mainOnly: true, versions: null, runSmoke,
+      dispatchSmoke: { settings: { dispatchSmoke: 'off' }, run() {}, match: () => false } });
+    expect((await child(1000)).reason).toBe('smoke-env-timeout');
+    expect(readRebuildState(f.root, f.env).held).toMatchObject({ inputsKey: f.plan.inputsKey, target: f.plan.finalSha });
+    expect((await child(1001)).reason).toBe('smoke-env-timeout-backoff');
+    f.plan[changed] = changed === 'finalSha' ? f.head : 'changed-inputs';
+    const store = createJobStore(join(f.root, 'jobs'));
+    const result = await rebuildCloneAsJob({ root: f.root, env: f.env, store, launchOnly: true, launchedBy: 'early',
+      codeSha: f.head, now: () => 1001, settings: { minIntervalMs: 0, minIntervalJitterPct: 0 },
+      adopt: options => rebuildClone({ root: f.root, env: f.env, run: f.run, mainOnly: true, versions: null,
+        asJob: false, adoptOnly: true, launchedBy: 'early', ...options, now: () => 1001, log: { error() {} } }),
+      reattach: async () => {}, evict() {}, log: { error() {} } });
+    expect(result.reason).toBe('rebuild-job-started');
+    expect(store.list().records).toHaveLength(1);
+    expect(runSmoke).toHaveBeenCalledTimes(1);
+    // A timeout on the new plan starts its own retry sequence.
+    expect((await child(1002)).reason).toBe('smoke-env-timeout');
+    expect(readRebuildState(f.root, f.env).held).toMatchObject({ attempts: 1, retryAt: at(2002),
+      inputsKey: f.plan.inputsKey, target: f.plan.finalSha });
+  });
+
   it('refuses before persisted retryAt and retries exactly at expiry after rereading state', async () => {
     const held = { reason: 'smoke-env-timeout', since: at(1000), updatedAt: at(2000), attempts: 2, retryAt: at(9000) };
     const f = fixture(held);

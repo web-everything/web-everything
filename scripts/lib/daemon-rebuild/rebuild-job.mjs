@@ -156,7 +156,7 @@ function readResult(dir, id) {
   try {
     const result = JSON.parse(readFileSync(join(dir, `${id}${RESULT_SUFFIX}`), 'utf8'));
     if (!result || typeof result !== 'object' || Array.isArray(result)
-      || typeof result.reason !== 'string'
+      || !(result.reason === null || typeof result.reason === 'string')
       || ('readyRecorded' in result && typeof result.readyRecorded !== 'boolean')) throw new Error('Invalid rebuild result');
     return result;
   } catch (error) { if (error?.code !== 'ENOENT') throw error; return null; }

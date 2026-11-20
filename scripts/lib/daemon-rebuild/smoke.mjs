@@ -6,7 +6,7 @@ import {
   SMOKE_ENVIRONMENT_VERDICTS, loadDifferentialEnabled, envLoadRetryDelayMs, isLoadShapedRow, busyPoolSkippedChecks,
   redactDetail,
 } from './smoke-classify/index.mjs';
-import { envTimeoutRetry, resolveRecovery } from './recovery.mjs';
+import { envTimeoutRetry, resolveRecovery, envTimeoutAppliesToPlan } from './recovery.mjs';
 import { isRepoFile, pickSmokeDiagnostics, sourceFilesIn } from '../daemon-boot-smoke.mjs';
 import { withWriteLock } from '../daemon-clone-lock.mjs';
 import { readRebuildState, writeRebuildState, alertsFilePath, writeReadyCandidate, clearReadyCandidate } from './state.mjs';
@@ -682,7 +682,9 @@ export async function smokeAndAdopt({
   const hold = async (reason, failed, extra = {}, mutateMore) => {
     let since = null;
     const state = (await locked((st) => {
-      if (reason === 'smoke-env-timeout') Object.assign(extra, envTimeoutRetry(st.held, now(), resolveRecovery({ env, log: m => log.error?.(m) })));
+      if (reason === 'smoke-env-timeout') Object.assign(extra, { inputsKey: plan.inputsKey },
+        envTimeoutRetry(envTimeoutAppliesToPlan(st.held, plan) ? st.held : null,
+          now(), resolveRecovery({ env, log: m => log.error?.(m) })));
       mutateMore?.(st);
       since = st.held?.since ?? nowIso();
       st.held = {

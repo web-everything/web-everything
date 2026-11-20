@@ -5,8 +5,8 @@ import { dirname, join } from 'node:path';
 import { rebuildClone } from '../rebuild.mjs';
 import { rebuildStatePath, readyCandidatePath, writeRebuildState, readRebuildState,
   readReadyCandidate, writeReadyCandidate, clearReadyCandidate, rebuildStateSchema } from '../state.mjs';
-import { pendingAdoptionPath, readPendingAdoptions } from '../../overlay-adoption.mjs';
-import { overlayFilePath, readOverlayState, appendOverlayEvent } from '../../daemon-overlays.mjs';
+import { pendingAdoptionPath, readPendingAdoptions, recordPendingAdoption } from '../../overlay-adoption.mjs';
+import { overlayFilePath, readOverlayState, appendOverlayEvent, addOverlay } from '../../daemon-overlays.mjs';
 import { reportDiscardedCandidate } from '../adopt.mjs';
 import { starvePath, readRebuildStarvation } from '../lease.mjs';
 import { readOverlayEventLog } from '../prepare.mjs';
@@ -123,6 +123,52 @@ it('absent evidence stays empty for every strict reader', () => {
   expect(readers.ready(root, env)).toBeNull();
   expect(readers.pending(root, env)).toEqual([]);
 });
+
+it('replays legacy registry metadata and ref-less audit events without rewriting them', () => {
+  const { root, env } = fixture();
+  const registry = overlayFilePath(root, env);
+  mkdirSync(dirname(registry), { recursive: true });
+  const registryBytes = JSON.stringify({ overlays: [{ ref: 'lane/legacy' }] });
+  const eventBytes = JSON.stringify({ at: new Date(0).toISOString(), kind: 'needs-you', detail: 'legacy-notice' }) + '\n';
+  writeFileSync(registry, registryBytes);
+  writeFileSync(registry.replace(/\.json$/, '.events.jsonl'), eventBytes);
+  const readers = createRebuildReaders({ strict: true });
+  expect(() => readers.validate(root, env)).not.toThrow();
+  expect(readers.overlays(root, env).overlays).toEqual([{ ref: 'lane/legacy' }]);
+  expect(readers.overlayEvents(root, env)).toHaveLength(1);
+  expect(readFileSync(registry, 'utf8')).toBe(registryBytes);
+  expect(readFileSync(registry.replace(/\.json$/, '.events.jsonl'), 'utf8')).toBe(eventBytes);
+});
+
+it('replays production state, ready, pending, registry and aggregate event writer output', () => {
+  const { root, env } = fixture();
+  const stamp = new Date().toISOString();
+  const sha = 'a'.repeat(40);
+  writeRebuildState(root, { held: { reason: 'smoke-env-timeout', since: stamp, updatedAt: stamp,
+    inputsKey: 'inputs', target: sha, retryAt: stamp, attempts: 1 } }, env);
+  writeReadyCandidate(root, { prevHead: sha, tree: sha, passedAt: stamp, kind: 'candidate',
+    adopt: { finalSha: sha, mainSha: sha, inputsKey: 'inputs', applied: [] } }, env);
+  expect(recordPendingAdoption(root, { ref: 'lane/x', sha, at: stamp }, { env })).toBe(true);
+  addOverlay(root, { ref: 'lane/x', pr: 1 }, { env });
+  // finishPendingSwaps emits a swap with old/new identities, not ref.
+  appendOverlayEvent(root, { kind: 'auto-rebase-swapped', old: 'lane/x', new: 'lane/rebased', newSha: sha }, { env });
+  const files = [rebuildStatePath(root, env), readyCandidatePath(root, env), pendingAdoptionPath(root, env),
+    overlayFilePath(root, env), overlayFilePath(root, env).replace(/\.json$/, '.events.jsonl')];
+  const bytes = files.map(file => readFileSync(file, 'utf8'));
+  expect(() => createRebuildReaders({ strict: true }).validate(root, env)).not.toThrow();
+  expect(files.map(file => readFileSync(file, 'utf8'))).toEqual(bytes);
+});
+
+it.each([{ pr: '1' }, { addedAt: 42 }, { addedBy: 42 }, { reason: false }, { ref: null }])(
+  'legacy registry compatibility still refuses malformed present fields %j', patch => {
+    const { root, env } = fixture();
+    const file = overlayFilePath(root, env);
+    mkdirSync(dirname(file), { recursive: true });
+    const bytes = JSON.stringify({ overlays: [{ ref: 'lane/x', ...patch }] });
+    writeFileSync(file, bytes);
+    expect(() => createRebuildReaders({ strict: true }).validate(root, env)).toThrow(RebuildEvidenceError);
+    expect(readFileSync(file, 'utf8')).toBe(bytes);
+  });
 
 it.each([true, false])('tick-start readyOnly=%s proceeds normally with cleanly absent evidence', async readyOnly => {
   const { root, env } = fixture();

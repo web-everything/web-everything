@@ -63,17 +63,20 @@ export function createRebuildReaders({ strict = false, read = readFileSync } = {
     overlays: checked((root, env) => {
       const r = json(overlayFilePath(root, env), { clone: null, overlays: [] });
       if (!r || Array.isArray(r) || !Array.isArray(r.overlays)
-        || !(r.clone === null || typeof r.clone === 'string')
+        || !(!Object.hasOwn(r, 'clone') || r.clone === null || typeof r.clone === 'string')
         || !r.overlays.every(o => object(o) && text(o.ref)
-          && (o.pr === null || (Number.isSafeInteger(o.pr) && o.pr > 0)) && date(o.addedAt)
-          && (o.addedBy === null || text(o.addedBy)) && (o.reason === null || typeof o.reason === 'string')
+          // Old registries can omit audit metadata; identity remains mandatory.
+          && (!Object.hasOwn(o, 'pr') || o.pr === null || (Number.isSafeInteger(o.pr) && o.pr > 0))
+          && (!Object.hasOwn(o, 'addedAt') || date(o.addedAt))
+          && (!Object.hasOwn(o, 'addedBy') || o.addedBy === null || text(o.addedBy))
+          && (!Object.hasOwn(o, 'reason') || o.reason === null || typeof o.reason === 'string')
           && (!('pinned' in o) || typeof o.pinned === 'boolean')
           && (!('stackBases' in o) || (Array.isArray(o.stackBases) && o.stackBases.every(text)))
           && (!('conflictOverride' in o) || (object(o.conflictOverride) && text(o.conflictOverride.instruction)
             && text(o.conflictOverride.actor) && date(o.conflictOverride.at))))) {
         throw new Error('Invalid overlay registry');
       }
-      return { ...r, corrupt: false };
+      return { ...r, clone: r.clone ?? null, corrupt: false };
     }),
     overlayEvents: checked((root, env) => {
       let source;
@@ -87,9 +90,15 @@ export function createRebuildReaders({ strict = false, read = readFileSync } = {
         const discard = object(r) && r.kind === 'needs-you' && r.need === 'ready-candidate-discarded'
           && date(r.at) && text(r.target) && text(r.reason)
           && Array.isArray(r.refs) && r.refs.every(text);
+        // Also recognize a notice whose discriminator was lost, so legacy-event
+        // compatibility cannot turn an incomplete discard into valid evidence.
+        const discardNotice = object(r) && r.kind === 'needs-you'
+          && (r.need === 'ready-candidate-discarded' || (Object.hasOwn(r, 'target') && Object.hasOwn(r, 'refs')));
         if (!object(r) || typeof r.kind !== 'string'
-          || (Object.hasOwn(r, 'ref') ? typeof r.ref !== 'string' : !discard)
-          || (r.kind === 'needs-you' && r.need === 'ready-candidate-discarded' && !discard)) {
+          // Aggregate and auto-rebase events need not name a single ref. The
+          // consumers require ref themselves before using per-overlay evidence.
+          || (Object.hasOwn(r, 'ref') && typeof r.ref !== 'string')
+          || (discardNotice && !discard)) {
           throw new Error('Invalid overlay event');
         }
         return r;

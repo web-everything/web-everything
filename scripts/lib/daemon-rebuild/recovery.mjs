@@ -22,6 +22,14 @@ export function resolveRecovery({ env = process.env, log = console.error, tool }
   return resolved.value;
 }
 
+// Legacy holds lack inputsKey (and some lack target). Keep their deadline unless
+// the identity they DO record proves this is a different plan.
+export function envTimeoutAppliesToPlan(held, plan) {
+  return held?.reason === 'smoke-env-timeout'
+    && (held.inputsKey === undefined || held.inputsKey === plan.inputsKey)
+    && (held.target == null || held.target === plan.finalSha);
+}
+
 export function envTimeoutRetry(held, nowMs, settings) {
   const attempts = (held?.reason === 'smoke-env-timeout' && Number.isSafeInteger(held.attempts) && held.attempts > 0 ? held.attempts : 0) + 1;
   const delay = Math.min(settings.envTimeoutBaseMs * 2 ** Math.min(attempts - 1, 32), settings.envTimeoutMaxMs);

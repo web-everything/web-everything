@@ -27,6 +27,7 @@ import * as cloneLocks from '../../daemon-clone-lock.mjs';
 import { addOverlay, appendOverlayEvent, overlayFilePath, readOverlays } from '../../daemon-overlays.mjs';
 import { finishPendingSwaps } from '../auto-rebase.mjs';
 import { matchReadyCandidate } from '../adopt.mjs';
+import { starvePath, writeRebuildStarvation } from '../lease.mjs';
 
 let root;
 beforeEach(() => { root = mkdtempSync(join(tmpdir(), 'we-job-jitter-')); });
@@ -464,6 +465,73 @@ it.each(['consumed.json', 'result'])('corrupt persisted %s refuses before changi
   expect(readFileSync(file, 'utf8')).toBe('{broken');
   expect(store.read(old.id)).toEqual(before);
   expect(store.list().records).toHaveLength(1);
+});
+
+it.each([{}, { reason: undefined, readyRecorded: undefined }, { reason: null, readyRecorded: null },
+  { reason: 'ready-recorded', readyRecorded: true }])('consumes the result writer output for child fields %j once', async child => {
+  const env = { WE_DAEMON_STATE_DIR: join(root, 'state'), WE_DAEMON_OVERLAY_DIR: join(root, 'overlays') };
+  const store = createJobStore(join(root, 'jobs'));
+  mkdirSync(store.dir);
+  const job = enqueueJob({ store, kindDef: REBUILD_JOB_KIND, codeSha: 'a'.repeat(40), input: { root }, now: 1000 });
+  store.update(job.id, r => markSucceeded(r, { at: new Date(1000).toISOString() }));
+  const written = rebuildJob.buildRebuildJobResult({}, child, null, 1000);
+  writeFileSync(join(store.dir, `${job.id}${rebuildJob.RESULT_SUFFIX}`), JSON.stringify(written));
+  const invoke = () => rebuildCloneAsJob({ root, env, store, now: () => 1001,
+    adopt: async () => ({ reason: 'up-to-date' }), reattach: async () => {}, evict() {}, log: { error() {} } });
+  expect(await invoke()).toMatchObject({ reason: 'up-to-date', finishedJobs: [{ id: job.id,
+    reason: written.reason ?? 'no-result', readyRecorded: written.readyRecorded }] });
+  expect(JSON.parse(readFileSync(join(store.dir, 'consumed.json'), 'utf8'))).toContain(job.id);
+  expect(await invoke()).toMatchObject({ reason: 'up-to-date', finishedJobs: [] });
+});
+
+it.each(['early', 'recovery', 'tick-start'])('%s lock contention preserves all state except tick-start starvation', async launchedBy => {
+  const env = { WE_DAEMON_STATE_DIR: join(root, 'state'), WE_DAEMON_OVERLAY_DIR: join(root, 'overlays') };
+  writeRebuildState(root, {}, env);
+  writeRebuildStarvation(root, 3, env);
+  const snapshot = () => Object.fromEntries(nodeFs.readdirSync(env.WE_DAEMON_STATE_DIR, { recursive: true })
+    .filter(p => nodeFs.statSync(join(env.WE_DAEMON_STATE_DIR, p)).isFile())
+    .map(p => [p, readFileSync(join(env.WE_DAEMON_STATE_DIR, p), 'utf8')]));
+  const before = snapshot();
+  vi.spyOn(cloneLocks, 'withWriteLock').mockResolvedValue({ ok: false, reason: 'tick-in-progress', heldBy: 'fixture' });
+  const result = await rebuildClone({ root, env, launchedBy, readyOnly: true, asJob: false,
+    versions: null, mainOnly: true, now: () => 1000, run: vi.fn(), log: { error() {} } });
+  expect(result.reason).toBe('tick-in-progress');
+  if (launchedBy === 'tick-start') {
+    expect(JSON.parse(readFileSync(starvePath(root, env), 'utf8')).count).toBe(4);
+  } else expect(snapshot()).toEqual(before);
+});
+
+it.each(['early', 'recovery'])('%s successful preparation preserves the whole state directory including starvation', async launchedBy => {
+  const env = { WE_DAEMON_STATE_DIR: join(root, 'state'), WE_DAEMON_OVERLAY_DIR: join(root, 'overlays') };
+  writeRebuildState(root, {}, env);
+  writeRebuildStarvation(root, 3, env);
+  const snapshot = () => Object.fromEntries(nodeFs.readdirSync(env.WE_DAEMON_STATE_DIR, { recursive: true })
+    .filter(p => nodeFs.statSync(join(env.WE_DAEMON_STATE_DIR, p)).isFile())
+    .map(p => [p, readFileSync(join(env.WE_DAEMON_STATE_DIR, p), 'utf8')]));
+  const before = snapshot();
+  vi.spyOn(preparation, 'prepareRebuild').mockResolvedValue({ terminal: true,
+    result: { moved: false, reason: 'up-to-date' }, alerts: [] });
+  vi.spyOn(cloneLocks, 'withWriteLock').mockImplementation(async (_root, fn) => ({ ok: true, value: await fn() }));
+  expect(await rebuildClone({ root, env, launchedBy, readyOnly: true, asJob: false,
+    versions: null, mainOnly: true, now: () => 1000, log: { error() {} } })).toMatchObject({ reason: 'up-to-date' });
+  expect(snapshot()).toEqual(before);
+});
+
+it.each([42, true, {}, [], undefined])('refuses an invalid terminal result reason %j without consuming it', async reason => {
+  const env = { WE_DAEMON_STATE_DIR: join(root, 'state'), WE_DAEMON_OVERLAY_DIR: join(root, 'overlays') };
+  const store = createJobStore(join(root, 'jobs'));
+  mkdirSync(store.dir);
+  const job = enqueueJob({ store, kindDef: REBUILD_JOB_KIND, codeSha: 'a'.repeat(40), input: { root }, now: 1000 });
+  store.update(job.id, r => markSucceeded(r, { at: new Date(1000).toISOString() }));
+  const file = join(store.dir, `${job.id}${rebuildJob.RESULT_SUFFIX}`);
+  const bytes = JSON.stringify({ reason, readyRecorded: false });
+  writeFileSync(file, bytes);
+  const adopt = vi.fn();
+  expect(await rebuildCloneAsJob({ root, env, store, adopt, log: { error() {} } }))
+    .toMatchObject({ reason: 'state-unreadable' });
+  expect(adopt).not.toHaveBeenCalled();
+  expect(nodeFs.existsSync(join(store.dir, 'consumed.json'))).toBe(false);
+  expect(readFileSync(file, 'utf8')).toBe(bytes);
 });
 
 // Complete persisted fixtures: mutation cases below bypass writers deliberately.

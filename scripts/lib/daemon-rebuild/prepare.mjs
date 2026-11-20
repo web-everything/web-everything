@@ -4,7 +4,7 @@
 import { rebuildReaders } from './evidence-context.mjs';
 
 
-import { timeoutRetryAt, resolveRecovery } from './recovery.mjs';
+import { timeoutRetryAt, resolveRecovery, envTimeoutAppliesToPlan } from './recovery.mjs';
 
 import { makeGit, verifyRev, OVERLAY_EDGE_RESOLVE_ENV, REBUILD_IDENTITY_ENV } from './shared.mjs';
 import {
@@ -756,7 +756,7 @@ export async function prepareRebuild({
   if (forceBypass && (state.rejected?.inputsKey === plan.inputsKey || state.held?.reason === 'smoke-harness-broken')) {
     alert('force-adopt-bypasses-rejection', { target: plan.finalSha, rejected: state.rejected?.reason ?? null });
   }
-  if (!forceBypass && state.held?.reason === 'smoke-env-timeout') {
+  if (!forceBypass && envTimeoutAppliesToPlan(state.held, plan)) {
     const retryAt = timeoutRetryAt(state.held, resolveRecovery({ env, log: m => log.error?.(m) }));
     if (!Number.isFinite(retryAt) || nowMs() < retryAt) return terminal({ moved: false, reason: 'smoke-env-timeout-backoff', plan });
   }

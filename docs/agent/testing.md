@@ -5638,6 +5638,30 @@ hand-written fixture missing them instead of making the validator permissive.
 `daemon-rebuild.test.mjs` proves absent-verification rollback with real Git;
 `daemon-rebuild-force-adopt.test.mjs` proves head-only force-watch rollback.
 
+The result writer emits `reason: null` when child output has no reason. Strict job
+admission accepts that value, consumes the terminal job once and reports `no-result`;
+other non-string reasons and corrupt JSON still refuse without consuming evidence.
+Keep round-trip coverage over absent, undefined and null child fields in
+`daemon-rebuild/__tests__/rebuild-job.test.mjs`.
+
+Environment-timeout holds record `inputsKey` and `target`. A changed value bypasses
+the old plan's deadline and resets its attempt count if smoke times out again.
+Legacy holds keep their deadline unless a recorded identity proves the plan changed.
+`daemon-rebuild-recovery.test.mjs` covers input-only and target-only changes through
+early admission, plus unchanged and legacy deadlines.
+
+Legacy overlay registries may omit audit metadata and clone identity; overlay refs
+remain required and present fields remain typed. Audit events may omit a single ref
+(for example `auto-rebase-swapped`); per-overlay consumers must match their own ref
+before using an event as evidence. Aggregate discard notices retain their full schema.
+`evidence-readers.test.mjs` replays legacy shapes and production state, ready, pending,
+registry and event writer output through `validate`, preserving file bytes. Its corpus
+is reconstructed from writer contracts; captured deployment files can extend it.
+The `rebuild-evidence-compatibility` soak replays null-result consumption, legacy
+registry/events and changed-plan admission through the durable queue. The job tests
+snapshot the entire state directory on early/recovery lock contention and successful
+preparation, including starvation evidence; tick-start remains the positive control.
+
 Simulator runtime snapshots must also carry `.githooks/pre-commit` with its executable
 mode: real lane provisioning verifies the tracked, runnable guard before handing out a
 lane. The rebuild soak scenarios exercise this prerequisite through actual provisioning.

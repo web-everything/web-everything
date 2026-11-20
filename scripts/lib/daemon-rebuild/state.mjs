@@ -95,7 +95,9 @@ const backoff = { retryAt: nullable(date), attempts: positive };
 export const rebuildStateSchema = {
   // A legacy env-timeout hold has no retryAt (the live incident that this recovery exists for): it is valid evidence
   // and is treated as due by recovery. A present retryAt must still be a date or null.
-  held: v => fields(v, { reason: string, since: date, updatedAt: date }, backoff),
+  held: v => fields(v, { reason: string, since: date, updatedAt: date }, {
+    ...backoff, inputsKey: string, target: nullable(string),
+  }),
   rejected: v => fields(v, { inputsKey: string, reason: string, at: date }, { ...backoff,
     harnessBroken: boolean, externalOnly: boolean, envLoad: boolean, dispatchSmoke: boolean })
     && (!(v.harnessBroken || v.externalOnly || v.envLoad) || date(v.retryAt)),
