@@ -8,7 +8,7 @@ const SOURCE = 'scripts/lib/daemon-rebuild/audited-tip.mjs';
 const ref = 'lane/pin', sha = 'a'.repeat(40), pin = 'b'.repeat(40);
 export default {
   id: 'pinnedfrom-audited-exemption',
-  title: 'an arbitrary or unaudited pinnedFrom no longer exempts a held tip; an audited 40-hex pin still does',
+  title: 'pinnedFrom (arbitrary, unaudited or audited) never exempts an applied tip that has no audit evidence of its own',
   card: 'pinnedfrom-audited',
   fixedBy: { sha: 'HEAD', where: 'lane/pinnedfrom-audited', paths: [SOURCE] },
   // Behavioural and independent of run(): one narrow probe of the fixed behaviour (an arbitrary pin does not exempt),
@@ -37,7 +37,7 @@ export default {
         auditedTip: makeAuditedTipGate(env), auditAdopted: [ref], held });
       if (check('arbitrary').length !== 1) violations.push('an arbitrary pinnedFrom exempted a held tip');
       if (check('e'.repeat(40)).length !== 1) violations.push('an unaudited 40-hex pinnedFrom exempted a held tip');
-      if (check(pin).length !== 0) violations.push('an audited 40-hex pinnedFrom lost its exemption');
+      if (check(pin).length !== 1) violations.push('an audited pinnedFrom exempted an applied sha with no evidence');
       return { violations };
     } finally { rmSync(dir, { recursive: true, force: true }); }
   },

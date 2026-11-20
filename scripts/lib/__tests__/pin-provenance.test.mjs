@@ -22,7 +22,7 @@ function env({ rows = [{ ref, sha: pin, tests: 'green', audit: 'NOT WEAKENED' }]
 const revoked = (pinnedFrom, e, held = []) => revokedAppliedTips({
   applied: [{ ref, pr: 42, sha, pinnedFrom }], auditedTip: makeAuditedTipGate(e), auditAdopted: [ref], held });
 
-describe('pinnedFrom exemption requires an audited exact 40-hex sha', () => {
+describe('pinnedFrom never exempts; the applied sha is judged on its own audit evidence', () => {
   for (const held of [false, true]) {
     it.each(invalid)(`refuses pin %j (held=${held}) and runs the normal audit`, pinnedFrom => {
       const gate = vi.fn(makeAuditedTipGate(env()));
@@ -30,20 +30,25 @@ describe('pinnedFrom exemption requires an audited exact 40-hex sha', () => {
         held: held ? [{ detail: { ref, newTip: sha } }] : [] })).toEqual([ref]);
     });
   }
-  it('honours a lowercase 40-hex pin that is audited for the ref (no regression)', () => {
-    expect(revoked(pin, env())).toEqual([]);
-    expect(revoked(pin, env(), [{ detail: { ref, newTip: pin } }])).toEqual([]);
+  const good = (s) => ({ ref, sha: s, tests: 'green', audit: 'NOT WEAKENED' });
+  it('an audited pin never exempts an applied sha that has no evidence of its own', () => {
+    expect(revoked(pin, env())).toEqual([ref]);
   });
-  it('a live hold on the applied sha itself wins over an audited pin', () => {
-    expect(revoked(pin, env(), [{ detail: { ref, newTip: sha } }])).toEqual([ref]);
+  it('an applied sha that is itself audited is not revoked, whatever the pin says (normal audit)', () => {
+    expect(revoked('arbitrary', env({ rows: [good(sha)] }))).toEqual([]);
+    expect(revoked(pin, env({ rows: [good(sha), good(pin)] }))).toEqual([]);
   });
-  it('does not honour a 40-hex pin audited only for another ref, or revoked', () => {
-    expect(revoked(pin, env({ rows: [{ ref: 'lane/other', sha: pin, tests: 'green', audit: 'NOT WEAKENED' }] }))).toEqual([ref]);
-    const row = { ref, sha: pin, tests: 'green', audit: 'NOT WEAKENED' };
-    expect(revoked(pin, env({ rows: [row, { ...row, tests: 'red' }] }))).toEqual([ref]);
+  it('an applied sha with red evidence is revoked even when the pin is audited', () => {
+    expect(revoked(pin, env({ rows: [good(pin), good(sha), { ...good(sha), tests: 'red' }] }))).toEqual([ref]);
+  });
+  it('a live hold on the applied sha wins over everything', () => {
+    expect(revoked(pin, env({ rows: [good(sha), good(pin)] }), [{ detail: { ref, newTip: sha } }])).toEqual([ref]);
+  });
+  it('evidence for another ref does not count', () => {
+    expect(revoked(pin, env({ rows: [{ ...good(sha), ref: 'lane/other' }] }))).toEqual([ref]);
   });
   it('fails closed when the audited set is missing', () => {
-    expect(revoked(pin, env({ ledger: false }))).toEqual([ref]);
+    expect(revoked(pin, env({ ledger: false, rows: [] }))).toEqual([ref]);
   });
   it('fails closed when the audited set is unreadable', () => {
     const e = env(); e.WE_FIX_READY_PATH = join(e.WE_FIX_READY_PATH, 'not-a-file');
