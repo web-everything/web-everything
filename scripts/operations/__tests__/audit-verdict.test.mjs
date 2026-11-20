@@ -1063,7 +1063,7 @@ describe('R473 structured concurrency evidence', () => {
         'scripts/operations/codex-audit-io.mjs', 'scripts/lib/audit-settings.mjs', 'scripts/lib/audit-path.mjs', 'scripts/lib/policy-cascade.mjs',
         'scripts/codex-direct-task.mjs']));
       expect(auditorImports).toEqual(expect.arrayContaining(['scripts/lib/audit-path.mjs', 'scripts/lib/net-diff-fingerprint.mjs',
-        'scripts/codex-direct-task.mjs', 'scripts/lib/build-self-review.mjs']));
+        'scripts/codex-direct-task.mjs', 'scripts/lib/build-self-review.mjs', 'scripts/lib/agent-launch.mjs']));
       expect(auditorImports.filter(p => !existsSync(`${repoRoot}${p}`))).toEqual([]);
     });
     it.each([...new Set([...AUDITOR_ROOTS, ...auditorImports])].sort())(
@@ -1088,7 +1088,8 @@ describe('R473 structured concurrency evidence', () => {
     it('the floor-settings scan is live and reads every quoted form', () => {
       expect(FLOOR_MODULES.length).toBeGreaterThan(100);
       expect(floorSettings).toEqual(expect.arrayContaining(['scripts/settings/red-team.json', 'scripts/settings/github-auth.json',
-        'scripts/settings/stand-down.json', 'scripts/settings/fix.json', 'scripts/review-settings.json', 'scripts/lib/delivery-platform-preferences.json']));
+        'scripts/settings/stand-down.json', 'scripts/settings/fix.json', 'scripts/review-settings.json', 'scripts/lib/delivery-platform-preferences.json',
+        'scripts/lib/agent-launch-env-registry.json']));
     });
     it.each(floorSettings)('every settings file a floor module names is on the floor: E2 in %s never ships (PR #6381 self-review)', async file => {
       neverShips(await compute([finding({ class: 'E2', file })], options()));
