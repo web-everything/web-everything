@@ -87,6 +87,7 @@ import {
   // `parseReviewedSha`'s answer whenever it is non-null; a second independent parse would only ever agree.
   parseReviewedSha, parseReviewedDiff, parseReviewedContribution, parseOperatorClearance,
   parseLatestHumanClearedSha, headEverHumanCleared, acceptanceCoversHead,
+  parseChangesVerdictProse, findSupersedingEscalation,
   // #x9krtkc (mutual-exclusivity fix, #2766/#2767) — the automated-escalation park decision and its detector,
   // re-exported below for the same reason `REASONLESS_BOUNCE_REFUSAL` is: this file is the SINGLE label home
   // (#2644), so a reader looks HERE for what governs a label swap even though the pure decision itself lives
@@ -879,13 +880,20 @@ export function decideRestampHumanClearance({ comments, headSha, headDiff } = {}
  * current clearance's SHA and strict diff match. Unknown evidence retains the
  * existing verdict/label behavior; findings always proceed.
  */
-export function reviewLoopWritePlan({ to, comments, headSha, headDiff } = {}) {
+export function reviewLoopWritePlan({ to, comments, reviews, currentLabels, keepHumanClearance = false, headSha, headDiff } = {}) {
   let preserve = false;
-  if (to === 'accepted' && Array.isArray(comments) && typeof headSha === 'string' && headSha) {
+  if (keepHumanClearance && to === 'accepted' && hasReviewLabel(currentLabels, REVIEW_LABELS.accepted)
+    && Array.isArray(comments) && Array.isArray(reviews) && typeof headSha === 'string' && headSha) {
     try {
       const clearedSha = parseLatestHumanClearedSha(comments);
       const clearance = latestHumanClearanceComment(comments);
       const fingerprint = normalizeDiffFingerprint(headDiff);
+      const later = clearance ? comments.slice(comments.indexOf(clearance) + 1) : [];
+      // Objections need no trusted author or SHA stamp. Unreadable evidence posts as today.
+      if (later.some(c => typeof c?.body !== 'string' || parseChangesVerdictProse(c.body)
+        || /review:changes/.test(c.body))
+        || findSupersedingEscalation(later)
+        || laterReviewHold(reviews, clearance?.createdAt)) return { advisory: true, verdict: true, label: true };
       preserve = !!clearedSha && clearedSha.toLowerCase() === headSha.toLowerCase()
         && !!fingerprint && parseReviewedDiff(clearance ? [clearance] : []) === fingerprint;
     } catch { /* Unreadable clearance: post as today. */ }
@@ -1688,23 +1696,6 @@ export function runReviewLabelCli({
     if (normalizeDiffFingerprint(reviewedDiff) !== expectedFingerprint) fail('net diff of --expect-head differs from --expect-fingerprint', 1);
   }
 
-  // The loop's advisory is a separate write. Do not follow it with an accept
-  // that would erase a current same-head human clearance (#7140). A full page
-  // needs the shared paged reader: a later finding/accept may supersede it.
-  if (to === 'accepted') {
-    let comments = prCommentsReadable ? prComments : null;
-    if (comments?.length >= PR_COMMENTS_PAGE_SIZE) {
-      try { comments = provider.readComments(repo, pr); } catch { comments = null; }
-    }
-    const plan = reviewLoopWritePlan({ to, comments, headSha, headDiff: reviewedDiff });
-    if (!plan.verdict) {
-      emit(`${JSON.stringify({ ...successResult({ pr: Number(pr), to, decision,
-        labels: currentLabels.map(l => typeof l === 'string' ? l : l.name) }),
-        skipped: 'current human clearance covers the same head and reviewed diff' })}\n`);
-      return;
-    }
-  }
-
   // card xu7kxtt (#5472) — the proof a re-stamp needs to cross a `review:human` re-hold: the latest trusted accept is
   // the operator's `clear-human`, and its strict reviewed-diff equals THIS head's net diff. Unscored diff → no proof
   // → refused (fail closed). The comment records both SHAs (the reason names the cleared one; the marker the new one).
@@ -2036,6 +2027,31 @@ export function runReviewLabelCli({
     let live = null;
     try { live = provider.readPrState(repo, pr).headRefOid; } catch (e) { fail(ghErr(e, 'gh pr view failed'), 1); }
     if (live !== expectedHead) fail(pinnedClearHuman ? 'live head differs from --expect-head' : 'live head differs from --expect-head; nothing written', 1);
+  }
+
+  // Only the unattended loop opts in. Validate fresh head/referrals before suppressing
+  // the ordinary verdict, ledger, label, prevention and trial writes.
+  if (to === 'accepted' && argv.includes('--keep-human-clearance')) {
+    let fresh;
+    try {
+      fresh = provider.readPrState(repo, pr);
+      if (fresh.headRefOid !== headSha) throw new Error('head changed before acceptance; hold retained');
+      assertMandatoryReferralsCleared(fresh, { repo, pr, ...referralOptions });
+    } catch (e) { fail(ghErr(e, 'acceptance state unreadable'), 1); }
+    let comments = Array.isArray(fresh.comments) ? fresh.comments : null;
+    let reviews = null;
+    try {
+      if (comments?.length >= PR_COMMENTS_PAGE_SIZE) comments = provider.readComments(repo, pr);
+      reviews = provider.readPrReviews(repo, pr);
+    } catch { comments = null; }
+    const plan = reviewLoopWritePlan({ to, comments, reviews, currentLabels: fresh.labels,
+      keepHumanClearance: true, headSha, headDiff: reviewedDiff });
+    if (!plan.verdict) {
+      emit(`${JSON.stringify({ ...successResult({ pr: Number(pr), to, decision,
+        labels: fresh.labels.map(l => typeof l === 'string' ? l : l.name) }),
+        skipped: 'current human clearance covers the same head and reviewed diff' })}\n`);
+      return;
+    }
   }
 
   // Check the pin before each write. At the label write, reuse the clearance check's

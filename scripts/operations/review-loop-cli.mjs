@@ -596,6 +596,10 @@ export async function runReviewLoopOnce({
   recordAdvisoryLoops = recordPostAcceptAdvisoryLoops, recordAdvisoryRating = recordPostAcceptAdvisoryRating,
   advisoryLog = line => console.error(line),
 } = {}) {
+  // Scope clearance preservation to this unattended driver, including resumed runs.
+  const labelSink = sinks[REVIEW_EFFECTS.LABEL];
+  if (labelSink) sinks = { ...sinks, [REVIEW_EFFECTS.LABEL]: Object.assign(
+    (payload, ctx) => labelSink(payload, { ...ctx, keepHumanClearance: true }), labelSink) };
   const parsed = parseOperationArgv(declaration, argv);
   const requiresCleanReferrals = acceptPolicy.value.unattendedAcceptRequiresCleanReferrals;
   // `filed: true` (an accept about to be recorded) admits a round-cards `changes` round only once its card is filed:

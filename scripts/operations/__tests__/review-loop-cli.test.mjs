@@ -307,8 +307,10 @@ describe('runReviewLoopOnce — property 1: a clean verdict on review:pending AC
     const { declaration, registry } = registryFor({});
     const store = createMemoryRunStore();
     const seen = [];
+    const sinks = recordingSinks(seen);
+    const label = vi.fn(sinks[REVIEW_EFFECTS.LABEL]);
     const out = await runReviewLoopOnce({
-      declaration, registry, argv: BASE_ARGV, store, sinks: recordingSinks(seen),
+      declaration, registry, argv: BASE_ARGV, store, sinks: { ...sinks, [REVIEW_EFFECTS.LABEL]: label },
       makeJudge: cannedJudge(CLEAN_ANSWER), mintRunId: () => 'r-clean',
       appendLearning: () => { throw new Error('must not be called — nothing to file when accept lands mechanically'); },
     });
@@ -316,6 +318,7 @@ describe('runReviewLoopOnce — property 1: a clean verdict on review:pending AC
     expect(out.code).toBe(0);
     expect(out.stopped).toBe('complete');
     expect(out.run.findings.confirm).toBe('accept');
+    expect(label.mock.calls[0][1].keepHumanClearance).toBe(true);
     // The SAME effect application a bounce gets — a label swap lands, this time to accepted, not parked.
     expect(seen.map((s) => s.type)).toContain(REVIEW_EFFECTS.LABEL);
     expect(out.lines.join('\n')).not.toMatch(/QUEUED for a human/);

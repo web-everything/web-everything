@@ -148,3 +148,10 @@ describe('early accepted verdict publication requires strict head CI', () => {
     expect(f.runNode).not.toHaveBeenCalled();
   });
 });
+
+
+it.each([false, true])('label sink forwards clearance opt-in only when requested (%s)', async keepHumanClearance => {
+  const f = fixture({ publishGate: () => green });
+  await f.publish({}, { keepHumanClearance });
+  expect(f.runNode.mock.calls[0][0].includes('--keep-human-clearance')).toBe(keepHumanClearance);
+});

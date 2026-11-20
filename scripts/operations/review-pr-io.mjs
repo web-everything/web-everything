@@ -1796,6 +1796,7 @@ export function createReviewPrSinks({
         String(payload.pr),
         `--repo=${payload.repo}`,
         `--to=${payload.to}`,
+        ...(ctx?.keepHumanClearance ? ['--keep-human-clearance'] : []),
         `--actor=${payload.actor}`,
         // #2898 — state the surface the verdict actually came through. Conditional because the payload shape
         // predates the flag: a run record written before it (a `--resume` across the upgrade) has no `channel`,
