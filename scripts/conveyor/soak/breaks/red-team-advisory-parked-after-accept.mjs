@@ -1,4 +1,4 @@
-/** A later advisory-only run must not strand a completed same-head accept's red team. */
+/** Advisory parking and older active rejections must not strand an accepted head's red team. */
 import { mkdtempSync, rmSync, utimesSync } from 'node:fs';
 import { spawnSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
@@ -40,8 +40,24 @@ export default {
       utimesSync(writeRun(parked, runsDir), 20, 20);
       const witness = readRecoveryWitness({ repo, pr, head, runsDir, env: { WE_SHARED_RUNS_DIR: runsDir },
         now: 30_000, readScorecards: () => [], scanSettings: { file: {}, platform: {}, env: {} } });
-      return { violations: witness?.ok === false || witness?.newest?.id !== parked.id
-        ? [{ invariant: 'accepted-head-red-team-not-held-by-advisory', detail: witness?.reason ?? 'same-head payload missing' }] : [] };
+      const violations = witness?.ok === false || witness?.newest?.id !== parked.id
+        ? [{ invariant: 'accepted-head-red-team-not-held-by-advisory', detail: witness?.reason ?? 'same-head payload missing' }] : [];
+      // A prior rejection remains active when the reaper quarantines the accepting panel.
+      const clearedPr = pr + 1;
+      const rejected = { ...accepted, id: 'review-pr-rejected', input: { repo, pr: clearedPr }, verdict: { verdict: 'changes' } };
+      const quarantined = { ...accepted, id: 'review-pr-quarantined', input: { repo, pr: clearedPr },
+        pending: { kind: 'effect', step: 'record', stepIndex: 1 },
+        effects: [{ key: 'record-label', type: 'review.label-swap', stepIndex: 1, index: 0, status: 'failed' }],
+        stepTimings: [{ step: 'read', stepIndex: 0, startedAt: new Date(10_000).toISOString() }] };
+      utimesSync(writeRun(rejected, runsDir), 19, 19);
+      utimesSync(writeRun(quarantined, join(dir, 'runs-quarantine')), 17, 17);
+      const cleared = readRecoveryWitness({ repo, pr: clearedPr, head, runsDir, env: { WE_SHARED_RUNS_DIR: runsDir },
+        clearance: { sha: head, at: 30_000 }, now: 40_000, readScorecards: () => [],
+        scanSettings: { file: {}, platform: {}, env: {} } });
+      if (cleared?.ok === false || cleared?.newest?.id !== quarantined.id) violations.push({
+        invariant: 'newer-cleared-quarantine-outranks-active-rejection', detail: cleared?.reason ?? cleared?.newest?.id ?? 'missing review',
+      });
+      return { violations, selectedQuarantineId: cleared?.newest?.id };
     } finally { rmSync(dir, { recursive: true, force: true }); }
   },
   judge: report => report.violations,

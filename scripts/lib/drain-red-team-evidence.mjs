@@ -679,7 +679,7 @@ function clearedQuarantinedReview({ repo, pr, head, clearance, runsDir, scanSett
   const clearedAt = typeof clearance?.at === 'number' ? clearance.at : Date.parse(clearance?.at);
   if (clearance?.sha !== head || !Number.isFinite(clearedAt)) return null;
   try { stat(dir); } catch (error) { if (error.code === 'ENOENT') return null; throw error; }
-  let selected = null, conflict = false;
+  let selected = null, conflict = false, unknownStart = false;
   const ids = list(dir).filter(id => id.startsWith('review-pr-')).sort();
   const identities = new Map();
   const identity = metadata => JSON.stringify([metadata.mtimeMs, metadata.dev, metadata.ino, metadata.size, metadata.ctimeMs, metadata.birthtimeMs]);
@@ -701,7 +701,10 @@ function clearedQuarantinedReview({ repo, pr, head, clearance, runsDir, scanSett
       || (!['accept', 'prevention-outstanding'].includes(verdictOf(run)) && !redTeamOwedFor(run))) conflict = true;
     // Two different panels cannot stand in for one another without an operator choosing the evidence.
     if (selected && JSON.stringify([selected.run.verdict, selected.run.findings]) !== JSON.stringify([run.verdict, run.findings])) conflict = true;
-    selected ??= { run, id, at };
+    const started = reviewStartedAt({ run });
+    if (!Number.isFinite(started)) unknownStart = true;
+    if (!selected || (Number.isFinite(started)
+      && (!Number.isFinite(reviewStartedAt(selected)) || started > reviewStartedAt(selected)))) selected = { run, id, at };
     return false; // Prove the whole bounded scan, including errors and conflicting candidates.
   });
   if (end?.ok === false) throw Error('quarantined review scan-capped; hold and inspect quarantine evidence');
@@ -710,7 +713,7 @@ function clearedQuarantinedReview({ repo, pr, head, clearance, runsDir, scanSett
     throw Error('quarantined review changed during scan; hold and inspect quarantine evidence');
   }
   if (conflict) throw Error('quarantined review conflict; hold and inspect quarantine evidence');
-  return selected;
+  return selected ? { ...selected, unknownStart } : null;
 }
 
 // Match resolveRunsDir's override precedence without migrating runs during a raw read.
@@ -756,8 +759,20 @@ export function readRecoveryWitness({ repo, pr, head, env = process.env, runsDir
       if (carryEvidence?.ok === false) return latest;
     }
   }
-  const newest = latest.run ? { id: latest.id, run: latest.run, at: latest.at }
-    : latest.ok === false ? null : clearedQuarantinedReview({ ...key, clearance, runsDir, scanSettings, warn, ...quarantine });
+  let newest = latest.run ? { id: latest.id, run: latest.run, at: latest.at } : null;
+  // A reaped accepting panel can be newer than the remaining active rejection. Prove
+  // quarantine eligibility even when an active match exists; unfinished/capped active
+  // evidence still holds above. File mtimes establish clearance, never verdict order.
+  if (latest.ok !== false && !unfinishedReviewException) {
+    const quarantined = clearedQuarantinedReview({ ...key, clearance, runsDir, scanSettings, warn, ...quarantine });
+    if (quarantined && newest) {
+      const activeStart = reviewStartedAt(newest), quarantinedStart = reviewStartedAt(quarantined);
+      if (quarantined.unknownStart || !Number.isFinite(activeStart) || !Number.isFinite(quarantinedStart) || activeStart === quarantinedStart) {
+        throw Error('active/quarantined review order unknown; hold and inspect quarantine evidence');
+      }
+      if (quarantinedStart > activeStart) newest = quarantined;
+    } else if (quarantined) newest = quarantined;
+  }
   const marker = optionalBytes(`${path}.stale-redispatch-1`);
   return { ...key, statusAt, rawWriter: { bytes, parsed, sha256: digest(bytes) }, seats, newest: newest?.run ?? null,
     ...(unfinishedReviewException ? { unfinishedReviewException: true } : {}),

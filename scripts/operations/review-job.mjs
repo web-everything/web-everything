@@ -491,7 +491,7 @@ export function createReviewJobIo({ root = REPO_ROOT, env = process.env, dir = r
       publishNeedsYou: isUnderTest(env) || isUnderTest(process.env) ? () => {} : item => publishAttention(item),
     } }),
     clearRedTeamQueued: restoreAdmission,
-    planRedTeamMode: ({ pr, repo, head }) => planRedTeamRecovery(readWitness({ pr, repo, head, env }),
+    planRedTeamMode: ({ pr, repo, head }) => planRedTeamRecovery(readClearedWitness({ pr, repo, head }),
       { now: Date.now(), probe: recoveryProbe, deadlineMs: staleRunDeadlineMs(env), env }).mode,
     redTeamStatus: input => {
       const head = input.loopPayload?.findings?.read?.netBasis?.rev;

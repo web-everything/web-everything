@@ -255,6 +255,7 @@ describe('red-team-only head clearance', () => {
     const readWitness = vi.fn(() => ({ newest: payload() }));
     const io = productionJobIo({ readHeadClearance: () => { throw Error('clearance unreadable'); }, readWitness });
     expect(() => io.readRedTeamOnlyPayload({ repo, pr, head })).toThrow(/clearance.*inspect/);
+    expect(() => io.planRedTeamMode({ repo, pr, head })).toThrow(/clearance.*inspect/);
     expect(readWitness).not.toHaveBeenCalled();
   });
 
@@ -387,7 +388,7 @@ describe('red-team-only completed accept with later advisory run', () => {
 });
 
 describe('red-team-only quarantined head review', () => {
-  it.each(['accept', 'no-clearance', 'other-head', 'late', 'changes', 'other-pr', 'read-error', 'refused-outcome', 'refused-label', 'other-step', 'other-effect'])(
+  it.each(['accept', 'older-rejection', 'no-clearance', 'other-head', 'late', 'changes', 'other-pr', 'read-error', 'refused-outcome', 'refused-label', 'other-step', 'other-effect'])(
     'uses only cleared exact-head quarantine evidence through production admission: %s', kind => {
       const dir = mkdtempSync(join(tmpdir(), 'red-team-quarantine-'));
       const env = { WE_SHARED_RUNS_DIR: join(dir, 'runs') };
@@ -395,6 +396,7 @@ describe('red-team-only quarantined head review', () => {
         const loopPayload = { ...newRunRecord({ id: 'review-pr-quarantined', op: 'review-pr',
           input: { repo, pr: kind === 'other-pr' ? pr + 1 : pr } }),
           ...payload(), verdict: { verdict: kind === 'changes' ? 'changes' : 'accept' },
+          stepTimings: [{ step: 'read', stepIndex: 0, startedAt: new Date(10_000).toISOString() }],
           pending: { kind: 'effect', step: 'record', stepIndex: 3 }, effects: [
             { key: 'label', type: 'review.label-swap', stepIndex: 3, index: 0, status: 'failed' },
             { key: 'ledger', type: 'verdict-ledger.append', stepIndex: 3, index: 1, status: 'declared' },
@@ -409,16 +411,18 @@ describe('red-team-only quarantined head review', () => {
         if (kind === 'other-head') loopPayload.findings.read.netBasis.rev = 'b'.repeat(40);
         const path = writeRun(loopPayload, join(dir, 'runs-quarantine'));
         utimesSync(path, 17, kind === 'late' ? 21 : 17);
-        // The remaining active review belongs to an older head.
-        writeRun({ ...newRunRecord({ id: 'review-pr-old', op: 'review-pr', input: { repo, pr } }),
-          ...payload(), findings: { read: { netBasis: { rev: 'c'.repeat(40) } } } }, env.WE_SHARED_RUNS_DIR);
+        const activePath = writeRun({ ...newRunRecord({ id: 'review-pr-old', op: 'review-pr', input: { repo, pr } }),
+          ...payload(), verdict: { verdict: 'changes' },
+          stepTimings: [{ step: 'read', stepIndex: 0, startedAt: new Date(1000).toISOString() }],
+          findings: { read: { netBasis: { rev: kind === 'older-rejection' ? head : 'c'.repeat(40) } } } }, env.WE_SHARED_RUNS_DIR);
+        utimesSync(activePath, 17, 17);
         const production = productionJobIo({ env, readEvidence: () => ({}),
           readHeadClearance: () => kind === 'no-clearance' ? null : { sha: head, at: 20_000 },
           readWitness: key => readRecoveryWitness({ ...key, env, readScorecards: () => [],
             ...(kind === 'read-error' ? { quarantine: { read: () => { throw Error('quarantine unreadable'); } } } : {}) }) });
         const io = fakeIo({ readRedTeamOnlyPayload: production.readRedTeamOnlyPayload, redTeamStatus: production.redTeamStatus });
         const result = runReviewJob({ repo, pr, redTeamOnly: true }, io);
-        if (kind === 'accept') {
+        if (['accept', 'older-rejection'].includes(kind)) {
           expect(result.outcome).toBe('red-team-only');
           expect(io.runRedTeam.mock.calls[0][0].loopPayload).toEqual(loopPayload);
         } else {
@@ -432,6 +436,40 @@ describe('red-team-only quarantined head review', () => {
 });
 
 describe('red-team-only review job', () => {
+  it.each(['auto', 'resume', 'clearance-revoked'])('cleared parked acceptance resumes through production planning and admission (%s)', kind => {
+    const redTeamMode = kind === 'clearance-revoked' ? 'auto' : kind;
+    const dir = mkdtempSync(join(tmpdir(), 'red-team-cleared-auto-'));
+    const env = { WE_SHARED_RUNS_DIR: join(dir, 'runs') };
+    try {
+      const parked = { ...newRunRecord({ id: 'review-pr-cleared-auto', op: 'review-pr', input: { repo, pr } }),
+        ...payload(), pending: { kind: 'effect', step: 'advise', stepIndex: 2 },
+        effects: [{ key: 'shadow', type: 'review.scoped-rereview-shadow', stepIndex: 2, index: 0, status: 'pending' }],
+        stepTimings: [{ step: 'read', stepIndex: 0, startedAt: new Date(10_000).toISOString() }] };
+      utimesSync(writeRun(parked, env.WE_SHARED_RUNS_DIR), 17, 17);
+      recordRedTeamStatus({ repo, pr, loopPayload: parked, status: 'finished',
+        result: { status: 'ran', comment: { status: 'withheld' } } }, { env });
+      let cleared = true;
+      const production = productionJobIo({ env, readHeadClearance: () => cleared ? { sha: head, at: 30_000 } : null,
+        readEvidence: () => ({}), readSeatRecords: () => [
+          { dispatchKind: 'review-seat', seat: 'red-team', repo, pr, rev: head, status: 'ok' },
+        ] });
+      const io = fakeIo({ planRedTeamMode: production.planRedTeamMode,
+        readRedTeamOnlyPayload: production.readRedTeamOnlyPayload, redTeamStatus: production.redTeamStatus,
+        fetchRedTeamHead: () => { if (kind === 'clearance-revoked') cleared = false; return { head }; },
+        runRedTeam: vi.fn(() => ({ status: 'resumed', comment: { status: 'posted' } })) });
+      const result = runReviewJob({ repo, pr, redTeamOnly: true, redTeamMode }, io);
+      if (kind === 'clearance-revoked') {
+        expect(result).toMatchObject({ outcome: 'blocked-on-infra', label: expect.stringContaining('review-unfinished') });
+        expect(io.runRedTeam).not.toHaveBeenCalled();
+        expect(readRedTeamStatus({ repo, pr, head, env })).toMatchObject({ status: 'finished', result: { status: 'ran' } });
+        return;
+      }
+      expect(result)
+        .toMatchObject({ outcome: 'red-team-only', redTeam: { status: 'resumed' } });
+      expect(io.runRedTeam.mock.calls[0][0]).toMatchObject({ redTeamMode: 'resume', loopPayload: parked });
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+
   it.each([['auto', 'resume'], ['fresh', null], ['resume', 'resume']])(
     'completed seat with unposted finished/ran status resolves %s to %s', (redTeamMode, expectedMode) => {
       const dir = mkdtempSync(join(tmpdir(), 'red-team-auto-mode-'));

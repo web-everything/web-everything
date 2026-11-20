@@ -8,6 +8,12 @@ import { defineBreakTest } from '../define-break-test.mjs';
 
 defineBreakTest(scenario);
 
+it('selects the newer cleared quarantined acceptance while the old rejection stays active', async () => {
+  const report = await scenario.run();
+  expect(report.selectedQuarantineId).toBe('review-pr-quarantined');
+  expect(scenario.judge(report)).toEqual([]);
+});
+
 it('detects the fix by exercising the real witness against persisted review runs', () => {
   const root = fileURLToPath(new URL('../../../../', import.meta.url));
   expect(scenario.fixPresent(root)).toBe(true);

@@ -5533,3 +5533,12 @@ Park opens ready for review; draft-promotion still handles older drafts.
 Check mode fetches origin main before evaluating canonical audit evidence. A failed fetch reports
 `main not refreshed: <reason>` and refuses even when local evidence would pass against stale refs.
 `open-pr-audit-gate.test.mjs` covers both refresh outcomes, aggregation and an unconfirmed check child.
+
+## Red-team recovery selection after human clearance
+
+Exercise auto mode with a parked accepting review, exact-head clearance, a completed seat,
+and a finished result whose comment was withheld. Production planning, payload selection,
+and admission must use the same clearance reader; revocation before admission must hold.
+Keep older active rejections alongside newer cleared quarantined accepts in persisted fixtures.
+Order panels by read-step start, preserve newer rejections, and hold on missing or equal starts
+across stores. Quarantine scan caps, unreadable records and unfinished active reviews remain holds.

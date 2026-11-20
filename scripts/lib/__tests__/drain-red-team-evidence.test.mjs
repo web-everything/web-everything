@@ -1188,6 +1188,43 @@ describe('completed accepts release later advisory bookkeeping in recovery', () 
 });
 
 describe('cleared quarantined recovery reviews', () => {
+  it.each(['older-active', 'newer-active', 'equal-start', 'missing-active-start', 'missing-quarantine-start', 'multiple-quarantined', 'unknown-quarantined-start',
+    'active-unfinished', 'no-clearance', 'unreadable-quarantine'])(
+    'orders active and cleared quarantined same-head evidence: %s', kind => {
+      const f = fixture();
+      const active = { ...newRunRecord({ id: 'review-pr-active', op: 'review-pr', input: { repo: f.repo, pr: f.pr } }),
+        ...payload(f.head), verdict: { verdict: 'changes' },
+        stepTimings: [{ step: 'read', stepIndex: 0, startedAt: new Date(kind === 'newer-active' ? 15_000 : kind === 'equal-start' ? 10_000 : 1000).toISOString() }] };
+      const accepted = { ...newRunRecord({ id: 'review-pr-quarantined', op: 'review-pr', input: { repo: f.repo, pr: f.pr } }),
+        ...payload(f.head), pending: { kind: 'effect', step: 'record', stepIndex: 3 },
+        effects: [{ key: 'label', type: 'review.label-swap', stepIndex: 3, index: 0, status: 'failed' }],
+        stepTimings: [{ step: 'read', stepIndex: 0, startedAt: new Date(10_000).toISOString() }] };
+      if (kind === 'missing-active-start') active.stepTimings = [];
+      if (kind === 'missing-quarantine-start') accepted.stepTimings = [];
+      if (kind === 'active-unfinished') active.pending = { kind: 'step', step: 'record', stepIndex: 3 };
+      // Deliberately touch the older active panel later: mtime must not order verdicts.
+      utimesSync(writeRun(active, f.runsDir), 19, 19);
+      utimesSync(writeRun(accepted, join(f.runsDir, '..', 'runs-quarantine')), 17, 17);
+      if (['multiple-quarantined', 'unknown-quarantined-start'].includes(kind)) {
+        const older = { ...accepted, id: 'review-pr-quarantined-old',
+          stepTimings: kind === 'unknown-quarantined-start' ? []
+            : [{ step: 'read', stepIndex: 0, startedAt: new Date(500).toISOString() }] };
+        utimesSync(writeRun(older, join(f.runsDir, '..', 'runs-quarantine')), 19, 19);
+      }
+      const read = () => readRecoveryWitness({ ...f, now: 40_000,
+        clearance: kind === 'no-clearance' ? null : { sha: f.head, at: 30_000 },
+        ...(kind === 'unreadable-quarantine' ? { quarantine: { read: () => { throw Error('quarantine unreadable'); } } } : {}) });
+      if (['equal-start', 'missing-active-start', 'missing-quarantine-start', 'unknown-quarantined-start', 'unreadable-quarantine'].includes(kind)) {
+        expect(read).toThrow(/quarantin.*inspect|quarantine unreadable/);
+      } else if (kind === 'active-unfinished') expect(read()).toMatchObject({ ok: false, reason: 'review-unfinished' });
+      else {
+        const result = read();
+        const owes = ['older-active', 'multiple-quarantined'].includes(kind);
+        expect(result.newest).toEqual(owes ? accepted : active);
+        expect(redTeamOwedFor(result.newest)).toBe(owes);
+      }
+    });
+
   it.each(['accept', 'prevention-outstanding', 'advisory', 'no-clearance', 'other-clearance', 'other-head', 'late',
     'changes', 'other-pr', 'other-repo', 'read-error', 'parse-error', 'conflict', 'scan-capped'])(
     'requires exact, readable, pre-clearance quarantine evidence: %s', kind => {
