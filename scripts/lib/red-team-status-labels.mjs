@@ -182,6 +182,13 @@ export function syncRedTeamStatusLabels({ repo, pr, head, evidence = {}, env = p
     if (!Array.isArray(lastLabels)) return { add: null, remove: [], skipped: 'labels-unreadable' };
     if (plan.add !== 'red-team:blocked' && lastLabels.some(l => (typeof l === 'string' ? l : l?.name) === 'red-team:blocked'))
       return { add: null, remove: [], skipped: 'blocked-label' };
+    // Compare-and-swap: clear is written only while pending is still on the fresh labels and the check is still clear for this head.
+    if (plan.add === 'red-team:clear') {
+      if (!lastLabels.some(l => (typeof l === 'string' ? l : l?.name) === 'red-team:pending')) return { add: null, remove: [], skipped: 'pending-gone' };
+      let lastClear = false;
+      try { lastClear = readCheckClear({ repo, pr, head }) === true; } catch { lastClear = false; }
+      if (!lastClear) return { add: null, remove: [], skipped: 'check-changed' };
+    }
   }
   if (!dryRun && (plan.add || plan.remove.length)) {
     if (plan.add) provider.ensureLabel(repo, plan.add, RED_TEAM_STATUS_LABEL_META[plan.add]);

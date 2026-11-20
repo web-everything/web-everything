@@ -189,6 +189,18 @@ describe('red-team label settles from the head\'s check', () => {
     it('a partial env still sees a carried-check marker under the process env', () => {
       expect(readCheckClearFact({ ...input, env: { WE_APP_ID: '123' }, gh: ghFor([run()]) })).toBe(true);
     });
+    it('vanished-clear race: pending gone on the last read means no clear is written', () => {
+      const { provider, run: go } = make(() => true);
+      provider.readPrState.mockReturnValue({ headRefOid: head, labels: [] });
+      expect(go().skipped).toBe('pending-gone');
+      expect(provider.setLabels).not.toHaveBeenCalled();
+    });
+    it('vanished-clear race: the check no longer clear on the last read keeps pending', () => {
+      let calls = 0;
+      const { provider, run: go } = make(() => ++calls <= 2);
+      go();
+      expect(provider.setLabels).not.toHaveBeenCalled();
+    });
     it('a blocked label on the fresh state vetoes the settle to clear', () => {
       const { provider, run: go } = make(() => true);
       provider.readPrState.mockReturnValue({ headRefOid: head, labels: ['red-team:pending', 'red-team:blocked'] });
