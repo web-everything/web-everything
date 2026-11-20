@@ -440,3 +440,11 @@ describe('referral hold settle: coordinator negatives', () => {
     expect(detectRoundCap({ comments: [holdFor(`${H(1).slice(0, 9)}-unknown`)], pr: PR, head: H(9), state: 'at-round-limit' })).toMatchObject({ trigger: 'referral-hold' });
   });
 });
+
+describe('referral hold settle: sparse history', () => {
+  it('a sparse hole in the history keeps the hold', () => {
+    const h = bot(`review paused: head ${H(1)} was already reviewed\n\nWaiting on your ruling (block, card or not-real):\n- \`src/a.mjs:5\` — x\n\n<!-- review-referral-hold: abcdef0123456789 -->`, at());
+    const sparse = [h, , bot('hi', at())]; // eslint-disable-line no-sparse-arrays
+    expect(detectRoundCap({ comments: sparse, pr: PR, head: H(9), state: 'at-round-limit' })).toMatchObject({ trigger: 'referral-hold' });
+  });
+});

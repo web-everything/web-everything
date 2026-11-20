@@ -138,7 +138,7 @@ export function extractRounds(comments, pr) {
 function holdSettled(list, holdIdx, live) {
   const named = /^review paused: head ([0-9a-f]{7,40})(?=\s)/i.exec(bodyOf(list[holdIdx]).trimStart())?.[1]?.toLowerCase();
   // Any unreadable history entry means the hold stands (fail closed): it could conceal unresolved evidence.
-  if (list.some((c) => !c || typeof c !== 'object' || typeof c.body !== 'string')) return false;
+  for (let i = 0; i < list.length; i++) { const c = list[i]; if (!c || typeof c !== 'object' || typeof c.body !== 'string') return false; } // index loop: .some() skips sparse holes
   if (!/^[0-9a-f]{40}$/.test(live)) return false; // an unreadable live head never settles
   if (!named) return false; // a hold that names no readable head is never settled
   if (!live.startsWith(named)) return true;
