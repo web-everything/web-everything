@@ -55,6 +55,11 @@ function linkMayEnclose(diff) {
     if (/[\[\]]/.test(l) && (count(l, /\[/g) !== count(l, /\]/g) || count(l, /\(/g) !== count(l, /\)/g))) return true;
     const open = l.match(/^[ \t]{0,3}\[[^\]]*\]:[ \t]*\S*[ \t]*(["'(])(.*)$/)
       ?? l.match(/\]\([ \t]*\S+[ \t]+(["'(])(.*)$/) ?? l.match(/^[ \t]{0,3}(["'(])(.*)$/);
+    // Any link-syntax line with an odd count of unescaped quotes may leave a title open, wherever it starts.
+    if (/\]\(|^[ \t]{0,3}\[[^\]]*\]:/.test(l)) {
+      const bare = l.replace(/\\./g, '');
+      if (count(bare, /"/g) % 2 || count(bare, /'/g) % 2) return true;
+    }
     // A backslash-escaped delimiter does not close the title.
     return !!open && !open[2].replace(/\\./g, '').includes(TITLE_CLOSE[open[1]]);
   });
