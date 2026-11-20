@@ -224,11 +224,15 @@ test('round3: settings can extend but cannot remove the JSON floor', () => {
 // Protect dependencies by default; any exception here must carry a one-line reason.
 const allowedHotPatchable = [];
 
-test('round3: every transitive static relative gate import inside scripts/lib is protected', () => {
+test('round3: every transitive static relative gate import across scripts is protected', async () => {
+  const { default: ts } = await import('typescript');
+  const scripts = resolve(root, 'scripts');
   const pending = [
-    'daemon-rebuild/smoke.mjs', 'daemon-rebuild/prepare.mjs',
-    'daemon-rebuild/adopt.mjs', 'daemon-force-adopt.mjs',
-  ].map(path => resolve(lib, path));
+    'lib/daemon-rebuild/smoke.mjs', 'lib/daemon-rebuild/prepare.mjs',
+    'lib/daemon-rebuild/adopt.mjs', 'lib/daemon-force-adopt.mjs',
+    'lib/daemon-rebuild/rebuild.mjs', 'lib/daemon-rebuild/rebuild-job.mjs',
+    'lib/daemon-rebuild/audited-tip.mjs', 'lib/hot-patch.mjs', 'hot-patch.mjs',
+  ].map(path => resolve(scripts, path));
   const reached = new Set();
   while (pending.length) {
     const path = pending.pop();
@@ -236,12 +240,22 @@ test('round3: every transitive static relative gate import inside scripts/lib is
     reached.add(path);
     // Reading errors deliberately fail the gate rather than silently omitting evidence.
     const source = readFileSync(path, 'utf8');
-    const imports = /(?:^|[;\n])\s*(?:import\s+(?:(?:[^'";]+?)\s+from\s+)?|export\s+(?:\*(?:\s+as\s+\w+)?|\{[^}]*\})\s+from\s*)['"]([^'"]+)['"]/g;
-    for (const [, specifier] of source.matchAll(imports)) {
-      if (!specifier.startsWith('.')) continue;
-      const dependency = resolve(dirname(path), specifier);
-      if (dependency.startsWith(lib + sep)) pending.push(dependency);
-    }
+    // Parse syntax so import examples in comments or strings cannot become graph edges.
+    const module = ts.createSourceFile(path, source, ts.ScriptTarget.Latest, true, ts.ScriptKind.JS);
+    expect(module.parseDiagnostics, repoPath(path)).toEqual([]);
+    const visit = node => {
+      let specifier;
+      if (ts.isImportDeclaration(node) || ts.isExportDeclaration(node)) specifier = node.moduleSpecifier;
+      if (ts.isCallExpression(node) && node.expression.kind === ts.SyntaxKind.ImportKeyword) {
+        specifier = node.arguments[0];
+      }
+      if (specifier && ts.isStringLiteral(specifier) && specifier.text.startsWith('.')) {
+        const dependency = resolve(dirname(path), specifier.text);
+        if (dependency.startsWith(scripts + sep)) pending.push(dependency);
+      }
+      ts.forEachChild(node, visit);
+    };
+    visit(module);
   }
   const unprotected = [...reached].map(repoPath).filter(path =>
     !allowedHotPatchable.includes(path) &&
