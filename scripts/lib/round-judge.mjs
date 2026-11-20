@@ -131,6 +131,17 @@ export function extractRounds(comments, pr) {
 }
 
 /**
+ * The one settle predicate for a referral hold: it is settled when it names a head that is not the live head (a push
+ * moved on), or a later trusted reviewer verdict comment (by thread position, never by timestamp) followed it.
+ * A hold that names no readable head, or any unreadable input, is NOT settled (the hold stands).
+ */
+function holdSettled(list, holdIdx, live) {
+  const named = /^review paused: head ([0-9a-f]{7,40})\b/i.exec(bodyOf(list[holdIdx]).trimStart())?.[1]?.toLowerCase();
+  if (named && live && !live.startsWith(named) && !named.startsWith(live)) return true;
+  return list.slice(holdIdx + 1).some((c) => isTrustedMarkerAuthor(c) && /^(✅ review — accepted|🔁 review — changes requested)/.test(bodyOf(c).trimStart()));
+}
+
+/**
  * Which cap the PR is at, from the thread and the status state. PURE.
  * red-team-cap: the gate's `round-cap` record for the LIVE head, with no later `sent-back` record for that head.
  * referral-hold: the review paused for a ruling on mandatory referral findings and none was recorded after it.
@@ -149,8 +160,9 @@ export function detectRoundCap({ comments, pr, head, state = null, repo = null }
     if (!later) return { trigger: 'red-team-cap', at: timeOf(cap.c), key: `${pr}:${live}:red-team-cap:${cap.g.result ?? ''}` };
   }
   // referral-hold: the review paused waiting for a block / card / not-real ruling, and none has been recorded since.
-  const hold = list.filter((c) => isTrustedMarkerAuthor(c) && /^review paused:/.test(bodyOf(c).trimStart()) && /Waiting on your ruling/.test(bodyOf(c))).at(-1);
-  if (hold && !list.some((c) => timeOf(c) > timeOf(hold) && isTrustedMarkerAuthor(c) && /^## (?:Operator|Automatic policy) ruling on mandatory referrals/.test(bodyOf(c).trimStart()))) {
+  const holdIdx = list.findLastIndex((c) => isTrustedMarkerAuthor(c) && /^review paused:/.test(bodyOf(c).trimStart()) && /Waiting on your ruling/.test(bodyOf(c)));
+  const hold = holdIdx >= 0 ? list[holdIdx] : null;
+  if (hold && !list.some((c) => timeOf(c) > timeOf(hold) && isTrustedMarkerAuthor(c) && /^## (?:Operator|Automatic policy) ruling on mandatory referrals/.test(bodyOf(c).trimStart())) && !holdSettled(list, holdIdx, live)) {
     const h = /review-referral-hold: ([0-9a-f]{8,})/.exec(bodyOf(hold))?.[1] ?? String(timeOf(hold));
     return { trigger: 'referral-hold', at: timeOf(hold), key: `${pr}:${live}:referral-hold:${h}` };
   }
