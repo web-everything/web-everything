@@ -92,11 +92,7 @@ describe('operator CLI fresh-checkout fallback (drain re-stamp, PR #4880)', () =
     expect(call()).toEqual({ reexecedFrom: candidate, status: 7 });
   });
 
-  it.each([
-    ['reported error', () => ({ error: new Error('ENOENT') })],
-    ['thrown error', () => { throw new Error('spawn failed'); }],
-    ['signal death', () => ({ status: null, signal: 'SIGTERM' })],
-  ])('keeps the re-run outcome unknown after %s', (_, spawn) => {
+  const expectOutcomeUnknown = (spawn) => {
     const { o, call } = fixture({ spawn: vi.fn(spawn) });
     let error;
     try { call(); } catch (e) { error = e; }
@@ -107,6 +103,17 @@ describe('operator CLI fresh-checkout fallback (drain re-stamp, PR #4880)', () =
     expect(isPreWriteRefusal(error.message)).toBe(false);
     expect(o.spawn).toHaveBeenCalledTimes(1);
     expect(o.exit).not.toHaveBeenCalled();
+  };
+
+  it.each([
+    ['reported error', () => ({ error: new Error('ENOENT') })],
+    ['thrown error', () => { throw new Error('spawn failed'); }],
+  ])('keeps the re-run outcome unknown after %s', (_, spawn) => {
+    expectOutcomeUnknown(spawn);
+  });
+
+  it('keeps the re-run outcome unknown after a signal death', () => {
+    expectOutcomeUnknown(() => ({ status: null, signal: 'SIGTERM' }));
   });
 
   it('leaves a fresh root unchanged', () => {
