@@ -208,7 +208,7 @@ describe('pinned caller evidence', () => {
     expect(upper.cumulativeDiffLines).toBe(plain.cumulativeDiffLines);
     expect(upper.diffLines).toBe(plain.diffLines);
   });
-  it.each(['café.test.mjs', 'quote"slash\\.test.mjs'])('deleted test %s raises tamper hold or stays unscored', name => {
+  it.each(['café.test.mjs', 'quote"slash\\.test.mjs'])('deleted test %s raises a tamper hold or an opaque exact-head human hold', name => {
     const f = fixture();
     writeFileSync(join(f.dir, name), 'test("guard", () => expect(true).toBe(true));\n');
     f.git(['add', '.']);
@@ -222,17 +222,36 @@ describe('pinned caller evidence', () => {
       expect(sig.scored).toBe(true);
       expect(scanTestTampering({ diffText: sig.netDiffText.text }).tampered).toBe(true);
     } else {
-      expect(sig.scored).toBe(false);
-      expect(sig.netDiffText.reason).toBe('unparseable-diff');
-      expect(() => requireScoredNetDiff(sig, head)).toThrow('retry or request human review');
+      // A C-quoted header the tamper parser cannot attribute is opaque: scored at file level, held for a human
+      // clearance of this exact head (no agent accept or older-head clearance lands it).
+      expect(sig.scored).toBe(true);
+      expect(isScorableDiffText(sig.netDiffText.text)).toBe(false);
+      expect(opaqueDiffFiles(sig.netDiffText.text)).toHaveLength(1);
+      const gate = withOpaqueDiffHold(scanTestTampering({ diffText: sig.netDiffText.text }), sig.netDiffText.text);
+      expect(gate.tampered).toBe(true);
+      expect(shouldReparkForTestTampering({ tampered: gate.tampered, netDiffScored: true, humanClearedSha: base, headSha: head })).toBe(true);
+      expect(opaqueDiffEscalation(sig.netDiffText.text).humanRequired).toBe(true);
     }
   });
-  it.each(['diff --git "a/quoted.test.mjs" "b/quoted.test.mjs"', 'diff --git unsupported'])('rejects unsupported headers at both scoring boundaries: %s', header => {
+  it.each(['diff --git "a/quoted.test.mjs" "b/quoted.test.mjs"', 'diff --git unsupported'])('unsupported headers are opaque at both scoring boundaries: %s', header => {
     const f = fixture(); const basis = resolve(f);
     const good = computeNetDiffSignals({ exec: f.exec, basis });
     const text = `${good.netDiffText.text}${header}\ndeleted file mode 100644\n`;
     const exec = (cmd, args, opts) => args.includes('diff') && !args.includes('--numstat') ? text : f.exec(cmd, args, opts);
-    expect(computeNetDiffSignals({ exec, basis }).scored).toBe(false);
+    const sig = computeNetDiffSignals({ exec, basis });
+    expect(sig.scored).toBe(true);
+    expect(() => requireScoredNetDiff(sig, f.head)).not.toThrow();
+    expect(isScorableDiffText(text)).toBe(false);
+    expect(opaqueDiffFiles(text)).toEqual([header.slice('diff --git '.length)]);
+    expect(withOpaqueDiffHold(scanTestTampering({ diffText: text }), text).tampered).toBe(true);
+    expect(pinnedDiffMergeRefusal({ exec, headSha: f.head, readComments: () => [] })).toMatch(/opaque content/);
+  });
+  it('a zero-context hunk stays unscored at both boundaries: no human review repairs a hidden-context diff', () => {
+    const f = fixture(); const basis = resolve(f);
+    const good = computeNetDiffSignals({ exec: f.exec, basis });
+    const text = 'diff --git a/x b/x\n--- a/x\n+++ b/x\n@@ -6 +6 @@\n-line6\n+changed6\n';
+    const exec = (cmd, args, opts) => args.includes('diff') && !args.includes('--numstat') ? text : f.exec(cmd, args, opts);
+    expect(computeNetDiffSignals({ exec, basis })).toMatchObject({ scored: false, netDiffText: { reason: 'unparseable-diff' } });
     expect(() => requireScoredNetDiff({ ...good, netDiffText: { ...good.netDiffText, text } }, f.head)).toThrow('unscored');
   });
   it('drain carry ignores real replacement objects that make changed content look cleared', () => {
@@ -357,12 +376,21 @@ describe('pinned caller evidence', () => {
 describe('opaque binary content lands only on a human clearance of the exact head (#7101 red team)', () => {
   const cleared = (sha, login = 'chalbert') => ({ id: `IC_${login}_${sha.slice(0, 7)}`,
     body: [buildReviewedShaMarker(sha), buildClearedHumanMarker(login)].join('\n'), author: { login } });
-  const binaryHead = (files) => {
+  // `baseFiles` land in a new base commit (the pinned attribute source); `files` only in the head.
+  const binaryHead = (files, baseFiles = null) => {
     const f = fixture();
+    writeFileSync(join(f.dir, 'file.txt'), 'base\n');
+    let parent = f.base;
+    if (baseFiles) {
+      for (const [name, bytes] of Object.entries(baseFiles)) writeFileSync(join(f.dir, name), bytes);
+      f.git(['add', '.']);
+      parent = f.git(['commit-tree', f.git(['write-tree']), '-p', f.base, '-m', 'attr base']);
+      f.setFetched(parent);
+    }
     for (const [name, bytes] of Object.entries(files)) writeFileSync(join(f.dir, name), bytes);
     f.git(['add', '.']);
-    const head = f.git(['commit-tree', f.git(['write-tree']), '-p', f.base, '-m', 'binary head']);
-    return { f, head, basis: resolvePinnedDiffBasis({ exec: f.exec, headSha: head }) };
+    const head = f.git(['commit-tree', f.git(['write-tree']), '-p', parent, '-m', 'binary head']);
+    return { f, head, parent, basis: resolvePinnedDiffBasis({ exec: f.exec, headSha: head }) };
   };
   const WEBP = Buffer.from([0x52, 0x49, 0x46, 0x46, 0x00, 0x00, 0x00, 0x00, 0x57, 0x45, 0x42, 0x50]);
 
@@ -378,14 +406,33 @@ describe('opaque binary content lands only on a human clearance of the exact hea
     expect(opaqueDiffEscalation(sig.netDiffText.text)).toMatchObject({ humanRequired: true });
     expect(opaqueDiffEscalation(sig.netDiffText.text).reasons.join(' ')).toContain('screenshot.webp');
   });
-  it('a test file marked -diff in .gitattributes is opaque too, so its hidden edits need a human', () => {
-    const { f, basis } = binaryHead({ '.gitattributes': 'guard.test.mjs -diff\n', 'guard.test.mjs': 'test.skip("x", () => {});\n' });
+  it('a base-tree -diff attribute makes a test file opaque, so its hidden edits need a human', () => {
+    const { f, basis } = binaryHead({ 'guard.test.mjs': 'test.skip("x", () => {});\n' }, { '.gitattributes': 'guard.test.mjs -diff\n' });
     const text = computeNetDiffSignals({ exec: f.exec, basis }).netDiffText.text;
     expect(opaqueDiffFiles(text)).toEqual(['guard.test.mjs']);
     expect(scanTestTampering({ diffText: text }).tampered).toBe(false); // the scanner alone cannot see it
     const gate = withOpaqueDiffHold(scanTestTampering({ diffText: text }), text);
     expect(gate.tampered).toBe(true);
     expect(gate.opaqueFiles).toEqual(['guard.test.mjs']);
+  });
+  it('attributes come from the pinned base tree: the head and the checked-out worktree cannot re-render content', () => {
+    // The head adds `-diff` for its own test edit (and the worktree holds that file): the edit stays visible text.
+    const hide = binaryHead({ '.gitattributes': 'guard.test.mjs -diff\n', 'guard.test.mjs': 'test.skip("x", () => {});\n' });
+    const hidden = computeNetDiffSignals({ exec: hide.f.exec, basis: hide.basis }).netDiffText.text;
+    expect(hidden).toContain('+test.skip("x", () => {});');
+    expect(opaqueDiffFiles(hidden)).toEqual([]);
+    expect(scanTestTampering({ diffText: hidden }).tampered).toBe(true);
+    // The head forces `diff` on its own binary: it stays opaque and still needs a human.
+    const reveal = binaryHead({ '.gitattributes': '*.webp diff\n', 'screenshot.webp': WEBP });
+    const shown = computeNetDiffSignals({ exec: reveal.f.exec, basis: reveal.basis }).netDiffText.text;
+    expect(opaqueDiffFiles(shown)).toEqual(['screenshot.webp']);
+    // An inherited GIT_ATTR_SOURCE cannot redirect the attribute read either.
+    const saved = process.env.GIT_ATTR_SOURCE;
+    process.env.GIT_ATTR_SOURCE = reveal.head;
+    try {
+      const again = computeNetDiffSignals({ exec: reveal.f.exec, basis: reveal.basis }).netDiffText.text;
+      expect(opaqueDiffFiles(again)).toEqual(['screenshot.webp']);
+    } finally { if (saved === undefined) delete process.env.GIT_ATTR_SOURCE; else process.env.GIT_ATTR_SOURCE = saved; }
   });
   it('drain escalation: an opaque hold clears only at the human-cleared exact head', () => {
     const { f, head, basis } = binaryHead({ 'screenshot.webp': WEBP });
@@ -405,11 +452,11 @@ describe('opaque binary content lands only on a human clearance of the exact hea
     const refuse = readComments => pinnedDiffMergeRefusal({ exec: f.exec, headSha: head, readComments });
     expect(refuse(() => [cleared(head)])).toBeNull();
     expect(refuse(() => [cleared(head.toUpperCase())])).toBeNull();
-    expect(refuse(() => [cleared(f.base)])).toMatch(/opaque binary content.*screenshot\.webp/);
-    expect(refuse(() => [cleared(head, 'mallory')])).toMatch(/opaque binary content/);
-    expect(refuse(() => [])).toMatch(/opaque binary content/);
-    expect(refuse(() => { throw new Error('gh down'); })).toMatch(/opaque binary content/);
-    expect(refuse(undefined)).toMatch(/opaque binary content/);
+    expect(refuse(() => [cleared(f.base)])).toMatch(/opaque content.*screenshot\.webp/);
+    expect(refuse(() => [cleared(head, 'mallory')])).toMatch(/opaque content/);
+    expect(refuse(() => [])).toMatch(/opaque content/);
+    expect(refuse(() => { throw new Error('gh down'); })).toMatch(/opaque content/);
+    expect(refuse(undefined)).toMatch(/opaque content/);
   });
   it('a text-only diff keeps landing on the no-review-escalation path without any comment read', () => {
     const f = fixture();

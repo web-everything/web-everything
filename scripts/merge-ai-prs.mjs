@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-import { resolvePinnedDiffBasis, isPinnedDiffBasis, stampDiffBasis, pinnedGit, readPinnedDiff, requireScoredNetDiff, isScorableDiffText, opaqueDiffEscalation } from './lib/pinned-diff-basis.mjs';
+import { resolvePinnedDiffBasis, isPinnedDiffBasis, stampDiffBasis, pinnedGit, readPinnedDiff, requireScoredNetDiff, isLandableDiffText, opaqueDiffEscalation } from './lib/pinned-diff-basis.mjs';
 import { assertCapability } from './lib/repo-profile.mjs';
 import { resolveHandoffSettings } from './lib/handoff-settings.mjs';
 import { writeLabelWithHandoff, signalFixDispatch } from './lib/fix-handoff.mjs';
@@ -4511,7 +4511,7 @@ export function computeNetDiffSignals({ exec, remote = 'origin', base = 'main', 
       const text = diff(mergeBaseSha);
       // Binary sections stay scored at file level; every landing path holds them for a human clearance of this
       // exact head (`opaqueDiffFiles` — the drain tamper gate, the no-escalation refusal and pr-land's escalation).
-      if (!isScorableDiffText(text)) return miss('unparseable-diff');
+      if (!isLandableDiffText(text)) return miss('unparseable-diff');
       const netDiffText = { ...stamp, text, base: mergeBaseSha, rev: headSha, scored: true };
       return { ...stamp, ...own, humanBasisFiles: cumulative.changedFiles,
         cumulativeDiffLines: cumulative.diffLines, basisKind: 'merge-base', basisNarrowed: true,
@@ -6736,6 +6736,9 @@ export async function main(argv, { env = process.env, stdout = process.stdout, e
             v.reason = 'net diff head moved; retry with fresh evidence (tamper hold retained)';
             continue;
           }
+          // `gh pr view --json comments` stops at one page: a full page hides a later clearance (or a later revocation),
+          // so re-read the complete thread; an incomplete read throws and keeps the hold (opaque content has no carry re-read).
+          if ((cd.comments || []).length >= PR_COMMENTS_PAGE_SIZE) cd.comments = readCompletePrComments(v.num, { repo: v.repo || localSlug });
           humanClearedSha = parseLatestHumanClearedSha(cd.comments || []);
           // card xu7kxtt (#5472) — the clearance names an OLDER head (the merge queue / rebase-drop moved it), but the
           // net diff is byte-identical to the one the human cleared: the clearance carries. Live #4535 (fcc29ce1 →
