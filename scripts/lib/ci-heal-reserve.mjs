@@ -19,14 +19,15 @@ export function resolveCiHealReserve({ env = process.env } = {}) {
 /** ONE per pass. `tryAdmit()` -> `{admit:true, reserved:true}` | `{admit:false, kind, why}`. */
 export function createCiHealReserve({
   listClaims = () => [], env = process.env, loadavg = () => os.loadavg()[0], cpuCount = () => os.cpus().length, sample,
+  resolveReserve = () => resolveCiHealReserve({ env }),
   // x6nuodj: the host gate decides through admit({kind:'ci-heal'}) (legacy gateHost is the logged comparison).
   gate = () => gateLaunch({ kind: 'ci-heal', gate: 'ci-heal-reserve', env, loadavg, cpuCount, ...(sample ? { sample } : {}) }),
 } = {}) {
+  const reserve = resolveReserve();
   let liveHeal = null;
   let holders = [];
   return {
     tryAdmit() {
-      const reserve = resolveCiHealReserve({ env });
       if (liveHeal === null) {
         try {
           const seen = new Set();
