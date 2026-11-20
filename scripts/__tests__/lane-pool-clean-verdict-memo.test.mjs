@@ -307,18 +307,20 @@ describe('the verdict memo file format is versioned with its entry shape', () =>
     const memo = JSON.parse(readFileSync(MEMO(), 'utf8'));
     // If this fails because an entry key was added/removed/renamed, bump VERDICT_MEMO_VERSION in lane-pool.mjs
     // (an older reader treats any `{at, fp}` entry as "held / not acquirable") and update BOTH numbers here.
-    expect(memo.v).toBe(3);
+    expect(memo.v).toBe(4);
     expect(Object.keys(memo.lanes[1]).sort()).toEqual(['at', 'clean', 'fp', 'tree']);
   });
 
-  it('a v2-shaped file carrying a clean entry is discarded by the current reader (and vice versa the file is v3)', () => {
-    extraEnv = ON;
-    list();
-    const memo = JSON.parse(readFileSync(MEMO(), 'utf8'));
-    writeFileSync(MEMO(), JSON.stringify({ ...memo, v: 2 }) + '\n');
-    resetTrace();
-    expect(list()).toEqual([1, 2, 3]);
-    for (const n of [1, 2, 3]) expect(gitCallsIn(n).length).toBeGreaterThan(0); // nothing reused: every lane re-probed
-    expect(JSON.parse(readFileSync(MEMO(), 'utf8')).v).toBe(3);
-  });
+  for (const version of [2, 3]) {
+    it(`a v${version} memo is discarded and every lane is re-probed before writing v4`, () => {
+      extraEnv = ON;
+      list();
+      const memo = JSON.parse(readFileSync(MEMO(), 'utf8'));
+      writeFileSync(MEMO(), JSON.stringify({ ...memo, v: version }) + '\n');
+      resetTrace();
+      expect(list()).toEqual([1, 2, 3]);
+      for (const n of [1, 2, 3]) expect(gitCallsIn(n).length).toBeGreaterThan(0); // nothing reused: every lane re-probed
+      expect(JSON.parse(readFileSync(MEMO(), 'utf8')).v).toBe(4);
+    });
+  }
 });

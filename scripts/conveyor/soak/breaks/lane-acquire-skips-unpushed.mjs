@@ -56,9 +56,8 @@ export default {
   title: 'auto-pick skips unpushed free-list hints without blocking bounded growth',
   card: 'we:lane/autopick-skip-unpushed',
   fixedBy: { sha: 'HEAD', where: 'lane/autopick-skip-unpushed', paths: ['scripts/lane-pool.mjs'] },
-  fixPresent(root) {
-    return readFileSync(join(root, 'scripts/lane-pool.mjs'), 'utf8').includes('if (usingFreeList || retryingCandidates)');
-  },
+  // This regression is always enforced; source text must never turn it into an expected failure.
+  fixPresent: () => true,
   run: ({ root = REPO_ROOT } = {}) => replay(root),
   judge: r => [
     ...(r.code === 0 && r.picked === 2 ? [] : ['acquire failed to skip the unsafe hint and grow']),

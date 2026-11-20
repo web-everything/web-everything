@@ -703,8 +703,8 @@ function ensureOneSibling(repo, name, { force = false } = {}) {
   if (!force) {
     // #2267-style data-loss guard, now load-bearing here too: this clone is real & pushable (unlike the
     // #2166 symlink it replaces), so an unconditional reset/clean could destroy in-flight local state.
-    const { dirty, ahead } = laneDirtyOrAhead(dest, branch);
-    if (dirty || ahead > 0) {
+    const { dirty, ahead, probeFailed } = laneDirtyOrAhead(dest, branch);
+    if (probeFailed || dirty || ahead > 0) {
       log(`  ${name} sibling: SKIPPED reset (dirty/ahead) — use --force to override; skipping rebuild too`);
       return;
     }
@@ -1241,7 +1241,7 @@ function porcelainPaths(porcelain) {
  * the live pool + synthetic cases (fully pushed / one unpushed commit / deleted remote ref / detached HEAD /
  * no remotes / empty repo / unresolvable sha mixed with a valid one) — zero verdict flips vs. the old loop.
  */
-function aheadIsProvablyPushed(dir, remoteShas, branch) {
+function aheadIsProvablyPushed(dir, remoteShas, branch, { strict = false } = {}) {
   if (!remoteShas || remoteShas.size === 0) return false;
   const headRaw = tryGit(['rev-parse', 'HEAD'], dir);
   if (!headRaw) return false;
@@ -1254,7 +1254,7 @@ function aheadIsProvablyPushed(dir, remoteShas, branch) {
   // lane's own commit(s), but built on top of whatever else landed first — never on top of the lane's commit
   // itself. No ancestry walk will ever find it (the lane's commit is simply not an ancestor of anything on
   // origin), yet a manual `git cherry origin/<branch> HEAD` shows `-` (patch already applied) for every one.
-  return aheadIsPatchEquivalent(dir, head, remoteShas, branch);
+  return aheadIsPatchEquivalent(dir, head, remoteShas, branch, { strict });
 }
 
 /**
@@ -1284,9 +1284,11 @@ function aheadIsProvablyPushed(dir, remoteShas, branch) {
  *     if it doesn't hit) simply stays protected — fails closed, same as any other unproven candidate, never a
  *     false positive.
  */
-function aheadIsPatchEquivalent(dir, head, remoteShas, branch) {
-  if (branch && cherryAllPatchEquivalent(dir, `origin/${branch}`, head)) return true;
-  return otherRemoteHeadsPatchEquivalentBatched(dir, head, remoteShas, branch);
+function aheadIsPatchEquivalent(dir, head, remoteShas, branch, { strict = false } = {}) {
+  const branchSha = branch ? tryGit(['rev-parse', '--verify', '--quiet', `origin/${branch}`], dir) : null;
+  // A stale integration ref cannot prove that a patch still exists on origin.
+  if (branchSha && remoteShas.has(branchSha) && cherryAllPatchEquivalent(dir, branchSha, head)) return true;
+  return otherRemoteHeadsPatchEquivalentBatched(dir, head, remoteShas, branch, { strict });
 }
 
 /** ONE `git cherry <upstream> <head>` call. `true` iff every commit `<head>` has that `<upstream>` lacks is
@@ -1313,7 +1315,7 @@ function cherryAllPatchEquivalent(dir, upstream, head) {
  * @param {string} [branch] - excluded from "other" heads (already tried, above, via the precise `git cherry`)
  * @returns {boolean}
  */
-function otherRemoteHeadsPatchEquivalentBatched(dir, head, remoteShas, branch) {
+function otherRemoteHeadsPatchEquivalentBatched(dir, head, remoteShas, branch, { strict = false } = {}) {
   const branchSha = branch ? tryGit(['rev-parse', '--verify', '--quiet', `origin/${branch}`], dir) : null;
   const others = [...remoteShas].filter((sha) => sha !== branchSha);
   if (others.length === 0) return false;
@@ -1329,7 +1331,7 @@ function otherRemoteHeadsPatchEquivalentBatched(dir, head, remoteShas, branch) {
   // xbdixjc — 'every' (the lane-hold setting `aheadEquivalence`): each ahead commit that is on NO remote must
   // itself match. 'any' (the old rule) let one already-pushed PR commit vouch for a newer, unpushed fix commit
   // on top of it — exactly how acquire reset lane-5 over verified 4b254297 on 2026-10-08.
-  if (resolveLaneHoldSettings({ env: process.env }).aheadEquivalence === 'any') {
+  if (!strict && resolveLaneHoldSettings({ env: process.env }).aheadEquivalence === 'any') {
     for (const id of ourPatchIds.values()) if (theirPatchIds.has(id)) return true;
     return false;
   }
@@ -1410,7 +1412,7 @@ function effectiveDirtyOrAhead(dir, branch, getRemoteShas) {
   let aheadPushed = false;
   if (ahead > 0) {
     const remoteShas = getRemoteShas();
-    if (aheadIsProvablyPushed(dir, remoteShas, branch)) {
+    if (aheadIsProvablyPushed(dir, remoteShas, branch, { strict: true })) {
       ahead = 0;
       aheadPushed = true;
     }
@@ -1528,16 +1530,20 @@ function refreshLane(repo, n, { force = false } = {}) {
   if (!force) {
     // #2267 — dirty/ahead is a property of the TREE (possibly abandoned residue from a dead session), which
     // `--force` exists to recycle. Skippable by `--force`, unlike the lease check above.
-    const { dirty, uncommitted, ahead } = laneDirtyOrAhead(dir, repo.branch);
-    if (dirty || ahead > 0) {
+    const { dirty, uncommitted, ahead, probeFailed } = laneDirtyOrAhead(dir, repo.branch);
+    if (probeFailed || dirty || ahead > 0) {
       log(`  lane-${n}: SKIPPED (dirty/ahead — ${uncommitted} uncommitted, ${ahead} ahead) — use --force to override`);
       return { skipped: true, dirty, uncommitted, ahead };
     }
   }
   // #4370 — `refresh --force` is an operator's explicit override of the dirty/ahead guard, so it may destroy
-  // unpushed work; it is never refused here, but it is journalled LOUD when it does (never silent).
+  // known unpushed work, journalled LOUD when it does. Unknown snapshot evidence still refuses the reset.
   const before = laneStateSnapshot(dir, `origin/${repo.branch}`);
   const verdict = destructiveActionVerdict({ unpushed: before.unpushed, override: force });
+  if (!verdict.allowed) {
+    log(`  lane-${n}: SKIPPED (${verdict.reason}) — inspect the lane before retrying`);
+    return { skipped: true };
+  }
   git(['reset', '--hard', `origin/${repo.branch}`, '--quiet'], dir);
   git(['clean', '-fd', '--quiet'], dir); // remove untracked, KEEP ignored (node_modules) — no -x
   journalLaneEvent(dir, {
@@ -1761,6 +1767,7 @@ function laneStatus(repo, n, { leasedOnly = false, statusCache = null } = {}) {
 // dirtyOrAhead shape in lane-lease.test.mjs) — and it is where the cost was: on the real pool most lanes are
 // leased, yet every scan ran `status --porcelain` + `rev-list` (+ a second porcelain for litter) in each one.
 // `nowMs`/`ttlMs` must be the SAME values the caller hands `isLaneAcquirable`, so both reads agree on staleness.
+let laneEligibilityProbeFailed = false; // Sticky: local inspection failure never proves capacity exhaustion.
 function laneAcquirableInfo(repo, n, remoteShasBox = null, nowMs = Date.now(), ttlMs = ttlMsFromFlags()) {
   const dir = laneDir(repo, n);
   if (!existsSync(dir)) return { lane: n, exists: false };
@@ -1780,12 +1787,12 @@ function laneAcquirableInfo(repo, n, remoteShasBox = null, nowMs = Date.now(), t
     }
     return remoteShasBox.value;
   };
-  return {
-    lane: n,
-    exists: true,
-    lease,
-    dirtyOrAhead: effectiveDirtyOrAhead(dir, repo.branch, getRemoteShas),
-  };
+  const dirtyOrAhead = effectiveDirtyOrAhead(dir, repo.branch, getRemoteShas);
+  if (dirtyOrAhead.probeFailed) {
+    laneEligibilityProbeFailed = true;
+    log(`  lane-${n}: eligibility probe failed — growth/recovery blocked; inspect local git status/history, then retry`);
+  }
+  return { lane: n, exists: true, lease, dirtyOrAhead };
 }
 
 // ── output ──────────────────────────────────────────────────────────────────────────────────────────
@@ -2841,10 +2848,17 @@ async function cmdAcquire(repo) {
         .sort((a, b) => a - b);
       for (const pick of pickable) {
         if (usingFreeList || retryingCandidates) {
-          // The free list is only a hint. Check current eligibility before claiming/provisioning,
-          // just as for grown/recovered lanes; an unsafe hint must not become a provision failure
-          // that blocks growth. --force never widens auto-pick eligibility.
+          // Preserve the history evidence/repair/quarantine path before eligibility can skip this hint.
           const candidateNow = Date.now();
+          if (leaseDisqualifiesAcquire(readLease(laneDir(repo, pick)), candidateNow, ttlMs)) continue;
+          try { requireReadableLaneHistory(repo, pick); } catch (e) {
+            log(`  lane-${pick}: ${msgOf(e)}`);
+            sawProvisionFailure = true;
+            sawNonHoldProvisionFailure = true;
+            excluded.add(pick);
+            continue;
+          }
+          // --force never widens auto-pick eligibility.
           if (!isLaneAcquirable(laneAcquirableInfo(repo, pick, retryRemoteShasBox, candidateNow, ttlMs), candidateNow, ttlMs)) continue;
         }
         const claimed = tryClaimLane(laneDir(repo, pick), session, Date.now(), ttlMs);
@@ -2920,7 +2934,7 @@ async function cmdAcquire(repo) {
       // either), and a fresh, dedicated, ONE-TIME live remote-reachability probe taken only here (never on the
       // hot scan path above) — a network/remote outage must never be misread as "genuinely starved, so clone
       // more".
-      if (!grownOnce && !sawScanTimeout && !sawLockContention && !sawProvisionFailure) {
+      if (!grownOnce && !sawScanTimeout && !sawLockContention && !sawProvisionFailure && !laneEligibilityProbeFailed) {
         grownOnce = true;
         // Probe the exact URL growth will clone from (`provisionLane` → `repo.originUrl`, resolved against the
         // same process cwd the clone uses) — never from inside an existing lane: a vanished/corrupted `lanes[0]`
@@ -2934,7 +2948,7 @@ async function cmdAcquire(repo) {
           continue;
         }
       }
-      if (!recoveredOnce && recoveryEnabled() && !sawScanTimeout && !sawLockContention && !sawProvisionFailure) {
+      if (!recoveredOnce && recoveryEnabled() && !sawScanTimeout && !sawLockContention && !sawProvisionFailure && !laneEligibilityProbeFailed) {
         recoveredOnce = true;
         try {
           const names = classifyLaneNames(readdirSync(repo.poolDir), acquireHardMaxFor(repo));
@@ -2972,6 +2986,8 @@ async function cmdAcquire(repo) {
             ? `no lane within ${waitMs}ms in pool "${repo.name}" — a different acquire's shared acquirability ` +
                 `scan was still running when this call's --wait-ms elapsed (lock contention); this is NOT ` +
                 `necessarily because all ${lanes.length} lane(s) are held/dirty — retry, or raise --wait-ms`
+            : laneEligibilityProbeFailed
+              ? `no free lane in pool "${repo.name}" — local eligibility probe failed; growth/recovery blocked — inspect local git status/history, then retry`
             : sawProvisionFailure
               // #3407 — every candidate this call tried was claimed but then failed to PROVISION (a network
               // blip, #2924's re-verify, a bad --base, an npm hiccup) — a different fact from "held/dirty", so
@@ -4107,7 +4123,8 @@ const DEFAULT_VERDICT_MEMO_MAX_AGE_MS = 10 * 60_000;
 // `at`+`fp` as "held / not acquirable", so it would read every clean lane as holding work. Bumping the version
 // makes an older lane-pool.mjs discard the file instead. ANY change to the shape or meaning of an entry written by
 // `noteVerdict` MUST bump this constant (pinned by `lane-pool-clean-verdict-memo.test.mjs`).
-const VERDICT_MEMO_VERSION = 3;
+// v4: failed local probes cannot be remembered as held, including litter-only dirt.
+const VERDICT_MEMO_VERSION = 4;
 // Upper bound on tracked files + directories a clean-lane tree signature will cover; a bigger tree is simply not
 // memoized (the full probe runs) rather than turning every hit into a long stat walk.
 const TREE_SIG_MAX_ENTRIES = 50_000;
@@ -4260,7 +4277,7 @@ function noteVerdict(memo, n, fp, info, remoteShasBox, dir = null, probeStartMs 
   // daemon re-probe the whole pool each tick (83 s cold vs 16 s warm). The entry stays validated on read (env on,
   // fingerprint, tree signature, max age), so leaving it is sound.
   if (!holdsWork) return;
-  let provable = holdsWork && fp && !(doa.ahead > 0 && !doa.dirty && remoteShasBox?.failed);
+  let provable = holdsWork && !doa.probeFailed && fp && !(doa.ahead > 0 && !doa.dirty && remoteShasBox?.failed);
   let dirt = null;
   if (provable && doa.dirty) {
     dirt = dir ? dirtSignature(dir, doa.dirtyPaths, probeStartMs) : null;
@@ -4643,7 +4660,7 @@ function acquirableListCachedRaw(repo, { limit, scanTimeoutMs, cacheTtlMs, calle
         const myOwner = readLockOwner(repo);
         const publishPartial = myOwner ? (lanes) => publishPartialFree(LIST_LOCK_DIR(repo), myOwner, lanes) : null;
         const paths = scanAcquirable(repo, { ...scanOpts, limit: null, publishPartial });
-        if (!lastScanPartial) writeListCache(repo, paths); // a partial answer is a lower bound — never cached
+        if (!lastScanPartial && !laneEligibilityProbeFailed) writeListCache(repo, paths); // a partial answer is a lower bound — never cached
         return paths;
       } finally {
         releaseListLock(repo);
