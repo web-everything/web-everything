@@ -645,6 +645,8 @@ export function runLaneGate({ pool, lane, dir, headSha, marker, runId, spawnGate
   let owned = { ...marker, startedAt: null, requestStartedAt: marker.startedAt ?? null, runId };
   const args = [VERIFY_LANE_CLI, `--repo=${dir}`, '--json', `--run-id=${runId}`];
   if (marker.suites) args.push(`--gate=${marker.suites}`);
+  // Preserve the request's execution policy in both in-process and detached gate jobs.
+  if (marker.local === true) args.push('--local');
   let gate;
   try { gate = spawnGate(args, {
     onSpawn: (pid) => { try { onSpawn?.(pid, logPath); } catch {} },

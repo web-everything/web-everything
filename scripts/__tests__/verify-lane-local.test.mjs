@@ -8,6 +8,7 @@ import { homedir, tmpdir } from 'node:os';
 import { runInNewContext } from 'node:vm';
 import { SHARD_RUN_SCRIPT, localPhaseReason, localPhaseBypassDetail, phaseAdmissionPlan, phaseRunLocation, shouldConfirmRemoteRed, remoteInfrastructureFailure } from '../lib/verify-remote-routing.mjs';
 import { shellQuote, isShardWrapperCommand } from '../lib/verify-lane-gate.mjs';
+import { runLaneGate } from '../conveyor/verify-dispatch.mjs';
 
 const source = readFileSync(new URL('../verify-lane.mjs', import.meta.url), 'utf8');
 const admissionStart = source.indexOf('async function acquireAdmission(');
@@ -30,17 +31,42 @@ const commandShapes = [
   ['unsupported shard command refuses local execution', unsupportedShardCommand],
 ];
 
-function parseCli(context, local) {
+function parseCli(context, local, childArgs) {
   const start = source.indexOf('const flags = {}');
   const end = source.indexOf('// #2833 finding 5', start);
   expect(end).toBeGreaterThan(start);
-  context.process.argv = ['node', 'verify-lane.mjs', ...(local ? ['--local'] : [])];
+  context.process.argv = ['node', ...(childArgs ?? ['verify-lane.mjs', ...(local ? ['--local'] : [])])];
   context.process.cwd = () => process.cwd();
   Object.assign(context, { resolve, join, homedir });
   runInNewContext(`${source.slice(start, end)}; Object.assign(globalThis, { FORCE_LOCAL, flags, REPO });`, context);
 }
 
 describe('verify-lane --local', () => {
+  it.each([false, true])('request marker preserves parsed --local through daemon dispatch to the executing CLI (local=%s)', async local => {
+    const startLine = source.split('\n').find(line => line.startsWith("if (MODE !== 'run') writeMarker("));
+    const context = {
+      MODE: 'request', process: { env: {} }, verifyStartBody: value => value,
+      headSha: 'head', GATE: selectedTests, currentTreeHash: 'tree', writeMarker: vi.fn(),
+    };
+    parseCli(context, local);
+    runInNewContext(startLine, context);
+    const marker = context.writeMarker.mock.calls[0][0];
+    const spawnGate = vi.fn(async () => ({ pid: 123 }));
+    await runLaneGate({
+      pool: 'fixture', lane: 1, dir: process.cwd(), headSha: 'head', marker,
+      runId: 'request-local-policy', spawnGate, log: () => {}, logPath: 'unused',
+      gateCeiling: { ms: 1000, mode: 'fixture', source: 'fixture', factor: 1 },
+    });
+    expect(spawnGate).toHaveBeenCalledTimes(1);
+    const [args] = spawnGate.mock.calls[0];
+    expect(args).toContain(`--gate=${selectedTests}`);
+    expect(args).toContain('--run-id=request-local-policy');
+    const child = { process: { env: {} } };
+    parseCli(child, false, args);
+    expect(child.FORCE_LOCAL).toBe(local);
+    expect(child.flags.gate).toBe(selectedTests);
+  });
+
   it.each([false, true])('takes local slots for every phase and bypasses remote policy (phaseAdmission=%s)', async phaseAdmission => {
     expect(admissionStart).toBeGreaterThan(-1);
     expect(admissionEnd).toBeGreaterThan(admissionStart);
