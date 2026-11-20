@@ -14,13 +14,14 @@ export const SKIP_KINDS = Object.freeze([
   'unknown-mergeability', 'conflicting', 'behind', 'checks-pending', 'review-hold', 'cap', 'head-moved',
   'couple-held', 'blocked-by', 'overlap-yield', 'rebuilt-pending-ci', 'merge-failed', 'parked',
   // Former "other" bucket, now named: every skip says which rule held it.
-  'not-certified', 'off-base', 'codeql-failed', 'empty-body', 'stale-read', 'escalated',
+  'restamp-stale-code', 'not-certified', 'off-base', 'codeql-failed', 'empty-body', 'stale-read', 'escalated',
   'partner-pending', 'ready-not-reached', 'red-main-hold', 'unrecognized-reason', 'card-grouped',
 ]);
 
 /** Map a drain reason string to a stable kind. Order matters: the most specific signal wins. */
 export function classifySkipReason(reason) {
   const r = String(reason ?? '');
+  if (/restamp-stale-code/i.test(r) || /acceptance re-stamp failed:[\s\S]*(?:STALE code|commit(?:\(s\)|s)? behind origin)/i.test(r)) return 'restamp-stale-code';
   // All four card-group hold reasons (we:scripts/lib/card-group.mjs#cardGroupHold).
   if (/^grouped into | is reserved by open card group |^card-group state unreadable|^card-group repository identity missing/.test(r)) return 'card-grouped';
   if (/^(?:red-main-hold|freeze-unreadable-hold)\b/.test(r)) return 'red-main-hold'; // Stable pass-level kind, including unreadable freeze evidence.

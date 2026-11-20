@@ -451,6 +451,27 @@ describe('wakeWorthy — a wake filter, never the gate', () => {
     expect(wakeWorthy({ ...READY_PR, statusCheckRollup: [{ __typename: 'StatusContext', context: 'ci', state: 'PENDING' }] }).wake).toBe(false);
   });
 
+  it('a concluded check counts as completed', () => {
+    const roll = (c) => wakeWorthy({ ...READY_PR, statusCheckRollup: [{ __typename: 'CheckRun', name: 'daemon-soak', ...c }] });
+    // #7112: GitHub kept status in_progress after the job concluded success.
+    expect(roll({ status: 'IN_PROGRESS', conclusion: 'SUCCESS', completedAt: '2026-11-20T16:13:38Z' }).wake).toBe(true);
+    expect(roll({ status: 'IN_PROGRESS', conclusion: 'SUCCESS' }).wake).toBe(true);
+    expect(roll({ status: 'IN_PROGRESS', conclusion: '', completedAt: '2026-11-20T16:13:38Z' }).wake).toBe(true);
+    // negatives: a truly running or queued check still waits
+    expect(roll({ status: 'IN_PROGRESS', conclusion: '', completedAt: '0001-01-01T00:00:00Z' }).wake).toBe(false);
+    expect(roll({ status: 'IN_PROGRESS', conclusion: null }).wake).toBe(false);
+    expect(roll({ status: 'QUEUED', conclusion: '' }).wake).toBe(false);
+    expect(roll({ status: 'IN_PROGRESS', conclusion: 'UNKNOWN' }).wake).toBe(false);
+    expect(roll({ status: 'IN_PROGRESS', conclusion: ' ' }).wake).toBe(false);
+    expect(roll({ status: 'IN_PROGRESS', completedAt: 'garbage' }).wake).toBe(false);
+    expect(roll({ status: 'IN_PROGRESS', completedAt: true }).wake).toBe(false);
+    expect(roll({ status: 'IN_PROGRESS', completedAt: '2999-01-01T00:00:00Z' }).wake).toBe(false);
+    // a failure with a stale status is completed, and its conclusion is not rewritten into a pass
+    const failed = { __typename: 'CheckRun', name: 'x', status: 'IN_PROGRESS', conclusion: 'FAILURE' };
+    expect(wakeWorthy({ ...READY_PR, statusCheckRollup: [failed] }).wake).toBe(true);
+    expect(failed.conclusion).toBe('FAILURE');
+  });
+
   it('skips the fast drain for a PR the filter does not wake, and logs why', async () => {
     const { handle, calls, lines, advance } = setup({ readPr: async () => ({ ...READY_PR, labels: [] }) });
     handle.notePoll({ ok: true, marked: [mark(42)] });
