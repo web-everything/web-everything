@@ -488,11 +488,23 @@ describe('parent parity minus never; caller bag stays tighten-only', () => {
   it.each(neverRules)('never: %s cannot cross from either source', pattern => {
     const name = sampleName(pattern);
     clearEnv(name);
+    if (name === 'GIT_CONFIG_COUNT') {
+      // Count 1 must be incomplete even if the test host supplied indexed config.
+      clearEnv('GIT_CONFIG_KEY_0');
+      clearEnv('GIT_CONFIG_VALUE_0');
+    }
     for (const value of ['hostile', '', '1']) {
       for (const source of ['bag', 'ambient', 'both']) {
         clearEnv(name);
         if (source !== 'bag') vi.stubEnv(name, value);
-        const env = childEnv(source === 'ambient' ? undefined : { [name]: value });
+        const project = () => childEnv(source === 'ambient' ? undefined : { [name]: value });
+        if (name === 'GIT_CONFIG_COUNT' && source !== 'bag') {
+          // Malformed parent Git config refuses launch; caller config cannot repair it.
+          expect(project, `${name}=${JSON.stringify(value)} from ${source}`)
+            .toThrow(/ambient GIT_CONFIG_COUNT.*complete valid configuration/);
+          continue;
+        }
+        const env = project();
         if (name === 'PATH' || name === 'HOME') expect(env[name]).not.toBe(value);
         else expect(env, `${name} from ${source}`).not.toHaveProperty(name);
       }

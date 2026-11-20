@@ -5466,6 +5466,10 @@ restrictive vocabulary and canonical enabling strings.
 
 The registry suite enumerates every non-never, non-gated entry for verbatim ambient
 parity, every never entry/pattern from both sources, and every exact restriction.
+For `GIT_CONFIG_COUNT`, malformed or incomplete ambient configuration must refuse
+launch even when a caller bag is present; bag-only malformed configuration stays
+excluded. Pin missing indexed entries in those fixtures so host Git configuration
+cannot make an incomplete-count case valid.
 Named finding regressions preserve bag-only zero leak limits, exponential ambient
 throttle caps, WE_PLATFORM_PREFERENCES_FILE, WE_FIX_LOOP_MAX_SESSIONS,
 WE_DAEMON_MANAGED_CLONE and WE_GUARD_LISTING_MAX_BYTES. Keep all fourteen attack
