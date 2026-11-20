@@ -10,6 +10,7 @@ import { createCiHealReserve, resolveCiHealReserve } from '../ci-heal-reserve.mj
 import { resolveMaxConcurrentLanes } from '../lane-concurrency.mjs';
 import { capacityPolicyLeaves, readOperatorPolicy } from '../policy-cascade.mjs';
 import { writeOperatorOverride } from '../operator-override-store.mjs';
+import { CAPACITY_LEAVES } from '../operator-override-reader.mjs';
 
 const pathProbe = vi.hoisted(() => ({ throws: false }));
 vi.mock('node:os', async original => {
@@ -339,7 +340,11 @@ it('does not change capacityPolicyLeaves or readOperatorPolicy for existing casc
     'deliveryCapacity.holdUntil': Date.now() + 3600000 };
   const path = file(JSON.stringify({ ...values, 'ciHeal.reserve': 6, 'lanes.maxConcurrent': 12 }));
   for (const [policy, keys] of Object.entries(policies)) {
-    expect(capacityPolicyLeaves(policy)).toEqual(keys);
+    // Keep the historical leaves, while allowing independently registered policy additions.
+    const registered = Object.keys(CAPACITY_LEAVES)
+      .filter(key => key.startsWith(`${policy}.`)).map(key => key.slice(policy.length + 1));
+    expect(registered).toEqual(expect.arrayContaining(keys));
+    expect(capacityPolicyLeaves(policy)).toEqual(registered);
     expect(readOperatorPolicy(policy, { file: path })).toEqual(Object.fromEntries(
       keys.map(key => [key, values[`${policy}.${key}`]])));
   }
