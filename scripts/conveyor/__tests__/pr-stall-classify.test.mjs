@@ -698,6 +698,19 @@ describe('stall classify waits for published findings', () => {
   it('findings pending past the bound escalate as findings-stuck', () => {
     expect(empty(CLASSIFY_DEFAULTS.findingsPendingMinutes + 1)).toMatchObject({ lane: 'operator', action: 'findings-stuck' });
   });
+  it('a break open in another source, an approximate age, or a stateLanes=operator setting is never pending', () => {
+    expect(at(RT, { verdict: ev('send-back', 'red-team-cap', { latest: [], crossBroken: 1 }), row: { ageMinutes: 2 } })).toMatchObject({ lane: 'operator' });
+    expect(at(RT, { verdict: ev('send-back', 'red-team-cap', { latest: [] }), row: { ageMinutes: 2, approxSince: true } })).toMatchObject({ lane: 'operator' });
+    expect(at(RT, { verdict: ev('send-back', 'red-team-cap', { latest: [] }), row: { ageMinutes: 2 }, settings: { stateLanes: { [RT]: 'operator' } } })).toMatchObject({ lane: 'operator' });
+  });
+  it('findingsPendingMinutes is an env-overridable sweep setting', async () => {
+    // A fresh process: the settings/classify import cycle only resolves in the production load order.
+    const { execFileSync } = await import('node:child_process');
+    const url = `file://${join(process.cwd(), 'scripts/conveyor/pr-stall-settings.mjs')}`;
+    const out = execFileSync(process.execPath, ['--input-type=module', '-e',
+      `const m = await import(${JSON.stringify(url)}); const r = m.resolveStallSweepSettings({ env: { WE_PR_STALL_SWEEP_FINDINGS_PENDING_MINUTES: '5' }, log: () => {} }); console.log(JSON.stringify([r.errors, r.value.findingsPendingMinutes]));`], { encoding: 'utf8' });
+    expect(JSON.parse(out.trim().split('\n').pop())).toEqual([[], 5]);
+  });
   it('an unknown pending age fails closed', () => {
     expect(empty(undefined)).toMatchObject({ lane: 'operator' });
   });

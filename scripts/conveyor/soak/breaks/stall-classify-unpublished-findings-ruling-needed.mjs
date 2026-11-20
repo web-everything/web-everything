@@ -3,7 +3,6 @@
  * ruling-needed "findings missing or malformed" because the findings were not readable yet. Unreadable findings must be
  * pending (no action) for a bounded time, then escalate as findings-stuck.
  */
-import { spawnSync } from 'node:child_process';
 import { join } from 'node:path';
 import { pathToFileURL } from 'node:url';
 
@@ -14,13 +13,8 @@ export default {
   title: 'PR #7188: the stall classifier rules "findings missing or malformed" on a red-team confirm whose findings are not yet readable',
   card: 'PR #7188 stall-classify findings race (parked item 26)',
   fixedBy: { sha: '7ea7720c7874f49c183b8379c004f39445b03403', where: 'lane/stall-findings-race', paths: ['scripts/conveyor/pr-stall-classify.mjs'] },
-  // Decided by behaviour: run the scenario in a child process against the tree under test.
-  fixPresent(root) {
-    const r = spawnSync(process.execPath, ['--input-type=module', '-e',
-      `const b=(await import(${JSON.stringify(import.meta.url)})).default;process.env.SOAK_TREE_ROOT=${JSON.stringify(root)};const v=b.judge(await b.run());process.exit(v.length?1:0)`],
-    { env: { ...process.env, SOAK_TREE_ROOT: root }, timeout: 60_000 });
-    return r.status === 0;
-  },
+  // The break lands with its fix, so the scenario is always required green (a regression must fail, never read as expected-fail).
+  fixPresent() { return true; },
   async run() {
     const root = process.env.SOAK_TREE_ROOT || new URL('../../../../', import.meta.url).pathname;
     await import(pathToFileURL(join(root, 'scripts/conveyor/pr-stall-settings.mjs')).href); // load order: settings first breaks the import cycle

@@ -252,11 +252,12 @@ function classifyUnsafe(o = {}) {
 
   const trigger = JUDGED_STATES[state];
   if (!trigger) return operator('unclassified', `fail-closed: unknown waiting state ${JSON.stringify(state)}`);
-  return judged({ head, verdict, trigger, files, card, grantsSoFar, acts, out, operator, cfg, ageMinutes: row.ageMinutes });
+  return judged({ head, verdict, trigger, files, card, grantsSoFar, acts, out, operator, cfg, ageMinutes: row.ageMinutes,
+    pendingOk: row.approxSince !== true && cfg.stateLanes[state] !== 'operator' });
 }
 
 /** A PR at a round cap / referral hold: the judge's verdict decides, within the standing policy. */
-function judged({ head, verdict, trigger, files, card, grantsSoFar, acts, out, operator, cfg, ageMinutes }) {
+function judged({ head, verdict, trigger, files, card, grantsSoFar, acts, out, operator, cfg, ageMinutes, pendingOk }) {
   if (!isRec(verdict) || !validateVerdict(verdict).ok) return operator('no-verdict', `fail-closed: no valid round-judge verdict (${validateVerdict(verdict).why})`);
   // validateVerdict walks arrays with .some(), which skips holes: densify before trusting the reasons.
   if (![...verdict.reasons].every((r) => typeof r === 'string' && r.trim())) return operator('no-verdict', 'fail-closed: the verdict reasons are malformed');
@@ -312,8 +313,9 @@ function judged({ head, verdict, trigger, files, card, grantsSoFar, acts, out, o
   const latest = ev.latest;
   if (!latest.length) {
     // The red team's findings may still be publishing: no readable finding yet is pending (retry next pass), bounded by age.
-    if (trigger === 'red-team-cap' && Number.isFinite(ageMinutes) && ageMinutes >= 0) {
-      return ageMinutes <=cfg.findingsPendingMinutes ? null
+    // Pending only on affirmative evidence: an exact wait age, no setting forcing this state to a person, and no break open elsewhere.
+    if (trigger === 'red-team-cap' && pendingOk && ev.crossBroken === 0 && Number.isFinite(ageMinutes) && ageMinutes >= 0) {
+      return ageMinutes <= cfg.findingsPendingMinutes ? null
         : operator('findings-stuck', `the red team's findings stayed unreadable past ${cfg.findingsPendingMinutes} minutes`);
     }
     return operator(verdict.verdict, 'fail-closed: the judge\'s open findings are missing or malformed');
