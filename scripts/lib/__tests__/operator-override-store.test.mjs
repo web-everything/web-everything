@@ -58,6 +58,31 @@ const ranges = [
 const EXPIRY_LEAVES = ['deliveryCapacity.pinUntil', 'deliveryCapacity.holdUntil']; // epoch-ms expiries, covered by delivery-capacity-override tests
 
 describe('capacity-only operator store', () => {
+  it.each([
+    ['duplicate key', '{"ciHeal.reserve":1,"ciHeal.reserve":6}'],
+    ['escaped duplicate key', '{"ciHeal.reserve":1,"ciHeal\\u002ereserve":6}'],
+    ['unknown key', '{"ciHeal.reserve":6,"unknown.capacity":1}'],
+    ['nested legacy store', '{"reviewConcurrency":{"maxLiveReviewRounds":1}}'],
+    ['invalid sibling', '{"ciHeal.reserve":6,"lanes.maxConcurrent":0}'],
+    ['oversized store', '{}'.padEnd(65537, ' ')],
+  ])('refuses to republish a current store containing %s on unrelated set or clear', (_name, raw) => {
+    writeFileSync(file, raw);
+    expect(() => write(3)).toThrow(/invalid store.*repair/i);
+    expect(() => store.clearOperatorOverride({ file, key, reason: 'clear', actor, io: writerIO }))
+      .toThrow(/invalid store.*repair/i);
+    expect(readFileSync(file, 'utf8')).toBe(raw);
+    expect(io.events).toEqual([]);
+    expect(existsSync(join(dir, 'operator-overrides.log.jsonl'))).toBe(false);
+  });
+  it('sets and clears against the six-key live store without losing valid siblings', () => {
+    const live = { [key]: 3, 'host.maxReviewDispatchPerTick': 2, 'fix.conflictFixesPerPass': 4,
+      'resourceGate.fixCap.floor': 2, 'resourceGate.fixCap.ceiling': 6, 'redTeamQueue.minConcurrent': 0 };
+    writeFileSync(file, JSON.stringify(live));
+    write(5, { key: 'ciHeal.reserve' });
+    expect(JSON.parse(readFileSync(file, 'utf8'))).toEqual({ ...live, 'ciHeal.reserve': 5 });
+    store.clearOperatorOverride({ file, key: 'ciHeal.reserve', reason: 'clear', actor, io: writerIO });
+    expect(JSON.parse(readFileSync(file, 'utf8'))).toEqual(live);
+  });
   it('accepts a fix ceiling raise to 16 and still allows lowering to 1', () => {
     const key = 'resourceGate.fixCap.ceiling';
     write(6, { key });
