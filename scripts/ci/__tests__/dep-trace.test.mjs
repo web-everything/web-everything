@@ -141,11 +141,11 @@ describe('shadow dependency tracer', () => {
     expect(f.tracer.snapshot().edges).toEqual([{ file: 'scripts/script.mjs', kind: 'spawn' }]);
   });
   it.each(['spawn', 'spawnSync', 'execFile', 'execFileSync', 'fork'])('%s keeps inherited env keys and falls back on a falsy env like Node', name => {
-    const f = fixture({ env: { WE_TRACE_TEST: test, WE_TRACE_DIR: 'artifacts', NODE_OPTIONS: '--conditions=original', HOME: '/home/probe' } });
+    const f = fixture({ env: { WE_TRACE_TEST: test, WE_TRACE_DIR: 'artifacts', NODE_OPTIONS: '--conditions=original', PROBE_PARENT: 'parent-value' } });
     f.child_process[name]('node', [], { env: Object.create({ FOO_PROBE: 'inherited' }) });
     expect(f.originals[name].mock.calls[0][2].env).toMatchObject({ FOO_PROBE: 'inherited', WE_TRACE_TEST: test });
     f.child_process[name]('node', [], { env: false });
-    expect(f.originals[name].mock.calls[1][2].env).toMatchObject({ HOME: '/home/probe', WE_TRACE_TEST: test });
+    expect(f.originals[name].mock.calls[1][2].env).toMatchObject({ PROBE_PARENT: 'parent-value', WE_TRACE_TEST: test });
   });
   it('resolves URL commands like the path normalizer, and ignores legacy url.parse objects Node rejects', async () => {
     const { parse } = await import('node:url');
