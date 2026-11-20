@@ -17,7 +17,7 @@ import { basename, dirname, resolve, relative, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { readPlatformPreferences, resolveCascade, formatCascadeSourcesLine } from '../lib/policy-cascade.mjs';
 import { spawnToCompletion } from '../lib/spawn-to-completion.mjs';
-import { retireRegistration, proveOverlayWithdrawal } from '../daemon-overlay.mjs';
+import { retireRegistration, withdrawRegisteredOverlay } from '../daemon-overlay.mjs';
 import { assertHumanOperator, resolveOperatorIdentity } from '../lib/operator-identity.mjs';
 import { execFileSyncThrottled } from '../lib/gh-throttle.mjs';
 import { readOverlayState, cloneKey } from '../lib/daemon-overlays.mjs';
@@ -456,11 +456,10 @@ export function createPrototypeLoader({ exec, fs, now, sleep, env, settings, com
         const tip = requireGit('rev-parse', '--verify', `refs/remotes/origin/${input.remove}^{commit}`);
         if (!validSha(tip)) return stop('remove-refused', { detail: 'invalid-tip' });
         if (input.dryRun) { out.ok = true; out.wouldRemove = [input.remove]; return out; }
-        const removeOne = removeRegistration || ((args) => retireRegistration({ ...args, env: childEnv,
+        const removeOne = removeRegistration || ((args) => withdrawRegisteredOverlay({ ...args, env: childEnv, reason: input.reason, git,
           deps: {
             // Explicit operator withdrawal uses the existing guarded retirement transaction:
             // entry identity, durable drop intent and post-drop tip check all stay enforced.
-            prove: () => proveOverlayWithdrawal({ root: out.clone, ref: input.remove, tip, reason: input.reason, env: childEnv, git }),
             tip: (ref) => requireGit('ls-remote', 'origin', `refs/heads/${ref}`).split(/\s+/)[0],
           } }));
         const data = await removeOne({ root: out.clone, ref: input.remove, expectedTip: tip, expectedEntry: targets[0], by: env.USER || 'prototype-load',

@@ -54,7 +54,7 @@
  *   node scripts/daemon-overlay.mjs approve-edge --clone=<path> --ref=<branch> --sha=<40-hex> [--by=..] [--reason=..] [--json]
  *   node scripts/daemon-overlay.mjs replace --clone=<path> --ref=<new> --replaces=<old> --expected-sha=<40-hex> [--pr=N] [--check] [--reason=..] [--by=..] [--json]
  *   node scripts/daemon-overlay.mjs retire  --clone=<path> --ref=<branch> --expected-tip=<40-hex> [--expected-entry=<json>] [--reason=..] [--by=..] [--json]
- *   node scripts/daemon-overlay.mjs retire  --clone=<path> --ref=<branch> --tip=<40-hex> --actor=<login> --reason="..." [--json]
+ *   node scripts/daemon-overlay.mjs retire  --clone=<path> --ref=<branch> --tip=<40-hex> --actor=<login> --reason="..." [--accept-uncontained] [--json]
  *   node scripts/daemon-overlay.mjs recover-drops --clone=<path> [--json]   (settle drop intents an interrupted retire/replace left)
  *
  * `replace` (R310, incident 2026-11-01) registers `--ref` and drops `--replaces` in one command, only when every
@@ -122,7 +122,7 @@ import {
   addOverlay, removeOverlay, readOverlayState, readOverlays, appendOverlayEvent, overlayFilePath, recordEdgeResolution, allowConflictGate,
   readOverrideViewerLogin, registrationIdentity,
 } from './lib/daemon-overlays.mjs';
-import { mergeRefBase, planRetirements, planFetchFailed, resolveOriginRepository } from './operations/prototype-retire.mjs';
+import { mergeRefBase, planRetirements, planFetchFailed, resolveOriginRepository, AUTOMATIC_RETIREMENT_REASONS } from './operations/prototype-retire.mjs';
 import { isDeepStrictEqual } from 'node:util';
 import { safeRegistrationRef, validSha } from './operations/prototype-load.mjs';
 import { previewOverlayConflict, writeRebuildRequest } from './lib/daemon-rebuild.mjs';
@@ -146,10 +146,11 @@ function removalActor({ actor, env, deps }) {
 }
 
 /** Operator repair of an actorless withdrawal: no registration mutation or remote tip lookup. */
-export async function withdrawUnregisteredOverlay({ root, ref, tip, actor, reason, env = process.env, deps = {} }) {
+export async function withdrawUnregisteredOverlay({ root, ref, tip, actor, reason, acceptUncontained = false, env = process.env, deps = {} }) {
   if (!safeRegistrationRef(ref)) throw new Error('a valid --ref is required');
   if (typeof tip !== 'string' || !/^[a-f0-9]{40}(?![\s\S])/.test(tip)) throw new Error('--tip must be a full lowercase 40-hex live tip');
   if (typeof reason !== 'string' || !reason.trim()) throw new Error('--reason is required for operator withdrawal');
+  if (AUTOMATIC_RETIREMENT_REASONS.includes(reason.trim().toLowerCase())) throw new Error('--reason must explicitly describe operator withdrawal, not automatic retirement');
   if (typeof actor !== 'string' || !actor.trim()) throw new Error('--actor is required for operator withdrawal');
   const login = assertHumanOperator(await (deps.resolveOperatorIdentity ?? resolveOperatorIdentity)({ env }), actor);
   return withAddGuardLock(root, env, async () => {
@@ -172,7 +173,16 @@ export async function withdrawUnregisteredOverlay({ root, ref, tip, actor, reaso
         && [2, 3].includes(ps.length) && ps[1] === tip;
     });
     if (!applied) throw new Error('--tip is not a live applied tip for this ref; inspect the clone rebuild merge parents and retry');
-    appendOverlayEvent(root, { kind: 'auto-retired', ref, tip, reason: reason.trim(), actor: login, operatorReason: true }, { env });
+    const proof = proveOverlayWithdrawal({ root, ref, tip, reason, env, localOnly: true,
+      git: (...args) => { const r = git(args); return { code: r.error ? null : r.status, stdout: r.stdout ?? '' }; } });
+    if (proof.action !== 'retire') throw new Error(`${proof.reason}; inspect stacked dependents and restore local tracking refs before retrying withdrawal`);
+    const containment = git(['merge-base', '--is-ancestor', tip, 'refs/remotes/origin/main']);
+    if (containment.error || ![0, 1].includes(containment.status))
+      throw new Error('content containment unreadable; restore local origin/main evidence and retry');
+    if (containment.status !== 0 && acceptUncontained !== true)
+      throw new Error('tip is not contained in origin/main; pass --accept-uncontained to explicitly authorize content withdrawal');
+    appendOverlayEvent(root, { kind: 'auto-retired', ref, tip, reason: reason.trim(), actor: login, operatorReason: true,
+      ...(acceptUncontained === true ? { acceptUncontained: true } : {}) }, { env });
     return { retired: true, list: state.overlays };
   });
 }
@@ -474,7 +484,10 @@ export function removeRegistration({ root, ref, expectedTip, by = null, reason =
   if (!entry) return { removed: false, list: state.overlays };
   // authenticatedActor is supplied only by the explicit CLI authentication boundary.
   // A legacy caller-supplied actor is deliberately ignored.
-  // Preserve the exact tip for reasoned removal bookkeeping; this path supplies no operator retirement proof.
+  // Preserve the exact tip and distinguish explicit authenticated withdrawal from automatic cleanup.
+  const operatorReason = typeof authenticatedActor === 'string' && !!authenticatedActor.trim()
+    && typeof reason === 'string' && !!reason.trim()
+    && !AUTOMATIC_RETIREMENT_REASONS.includes(reason.trim().toLowerCase());
   let tip = null;
   if (typeof reason === 'string' && reason.trim()) {
     try { tip = (deps.tip ?? ((r) => remoteTip({ root, ref: r, env })))(ref) ?? null; }
@@ -492,12 +505,13 @@ export function removeRegistration({ root, ref, expectedTip, by = null, reason =
     }
   }
   if (result.removed && entry.pinned === true) writeRebuildRequest(root, { by, reason: reason || 'operator', ref, lockRoot: env.WE_DAEMON_CLONE_LOCK_ROOT });
-  if (result.removed) appendOverlayEvent(root, { kind: 'removed', ref, by, reason, tip, ...(authenticatedActor ? { actor: authenticatedActor } : {}) }, { env });
+  if (result.removed) appendOverlayEvent(root, { kind: 'removed', ref, by, reason, tip,
+    ...(authenticatedActor ? { actor: authenticatedActor } : {}), ...(operatorReason ? { operatorReason: true } : {}) }, { env });
   return result;
 }
 
 /** Shared explicit/urgent withdrawal proof. Call under the add guard; cached stacks alone cannot prove independence. */
-export function proveOverlayWithdrawal({ root, ref, tip, reason, env = process.env, git = (...args) => {
+export function proveOverlayWithdrawal({ root, ref, tip, reason, localOnly = false, env = process.env, git = (...args) => {
   const result = spawnSync('git', args, { cwd: root, env, encoding: 'utf8', timeout: 30000, maxBuffer: 1024 * 1024 });
   return { code: result.status, stdout: result.stdout ?? '' };
 } }) {
@@ -507,17 +521,24 @@ export function proveOverlayWithdrawal({ root, ref, tip, reason, env = process.e
     return result.stdout.trim();
   };
   const state = readOverlayState(root, { env });
-  const stacked = state.overlays.some((r) => r.ref !== ref && r.stackBases?.includes(ref));
-  if (state.corrupt || stacked) return { action: 'keep', reason: 'stacked-or-unreadable' };
-  const current = requireGit('ls-remote', 'origin', `refs/heads/${ref}`).split(/\s+/)[0];
+  if (state.corrupt) return { action: 'keep', reason: 'stacked-or-unreadable' };
+  if (state.overlays.some(r => !r || !safeRegistrationRef(r.ref)
+    || (r.stackBases !== undefined && (!Array.isArray(r.stackBases) || !r.stackBases.every(safeRegistrationRef)))
+    || (r.stackVia !== undefined && (!r.stackVia || typeof r.stackVia !== 'object' || Array.isArray(r.stackVia)
+      || !Object.values(r.stackVia).every(bases => Array.isArray(bases) && bases.every(safeRegistrationRef))))))
+    return { action: 'keep', reason: 'unreadable-stack-evidence' };
+  const stacked = state.overlays.some((r) => r.ref !== ref && (r.stackBases?.includes(ref)
+    || Object.values(r.stackVia || {}).flat().includes(ref)));
+  if (stacked) return { action: 'keep', reason: 'stacked-or-unreadable' };
+  const current = localOnly ? tip : requireGit('ls-remote', 'origin', `refs/heads/${ref}`).split(/\s+/)[0];
   // stackBases is only a cache. Re-prove ancestry under the add guard so
   // an uncached or newly registered stack top cannot lose its base.
   const others = state.overlays.filter((r) => r.ref !== ref);
   // Explicit --remove already fetched the target; urgent callers may not have its objects yet.
-  if (others.length) requireGit('fetch', 'origin', `+refs/heads/${ref}:refs/remotes/origin/${ref}`);
+  if (others.length && !localOnly) requireGit('fetch', 'origin', `+refs/heads/${ref}:refs/remotes/origin/${ref}`);
   for (const other of others) {
     if (!safeRegistrationRef(other.ref)) return { action: 'keep', reason: 'unreadable-stack-evidence' };
-    requireGit('fetch', 'origin', `+refs/heads/${other.ref}:refs/remotes/origin/${other.ref}`);
+    if (!localOnly) requireGit('fetch', 'origin', `+refs/heads/${other.ref}:refs/remotes/origin/${other.ref}`);
     const otherTip = requireGit('rev-parse', '--verify', `refs/remotes/origin/${other.ref}^{commit}`);
     if (!validSha(otherTip)) return { action: 'keep', reason: 'stacked-dependents' };
     const ancestry = git('merge-base', '--is-ancestor', tip, otherTip);
@@ -542,9 +563,21 @@ export function proveOverlayWithdrawal({ root, ref, tip, reason, env = process.e
  * Same race class as the rebuild's own auto-drop (`daemon-rebuild/prepare.mjs` removes `in-main`/`pr-merged` decisions by
  * name with no tip re-check at all); this path adds a re-proof, a pre- and post-drop tip check and a durable intent.
  */
-// `actor` is the authenticated lowercase login verified by the explicit withdrawal caller.
-// Automatic retirement callers omit it and cannot produce operator retirement evidence.
-export async function retireRegistration({ root, ref, expectedTip, expectedEntry, mode = 'retired', trackingId, by = null, actor, env = process.env, deps = {} }) {
+// Ordinary retirement can record attribution, but never operator withdrawal authority.
+export function retireRegistration(options) {
+  return retireRegistrationTransaction(options, false);
+}
+
+/** Explicit prototype-load --remove; retain the same guarded stack/drop transaction. */
+export function withdrawRegisteredOverlay({ reason, git, ...options }) {
+  if (typeof reason !== 'string' || !reason.trim() || AUTOMATIC_RETIREMENT_REASONS.includes(reason.trim().toLowerCase()))
+    throw new Error('explicit operator withdrawal reason required');
+  return retireRegistrationTransaction({ ...options, deps: { ...options.deps,
+    prove: () => proveOverlayWithdrawal({ ...options, tip: options.expectedTip, reason, git }),
+  } }, true);
+}
+
+async function retireRegistrationTransaction({ root, ref, expectedTip, expectedEntry, mode = 'retired', trackingId, by = null, actor, env = process.env, deps = {} }, operatorWithdrawal) {
   const prove = deps.prove ?? ((entry) => proveRetirement({ root, entry, env }));
   const tip = deps.tip ?? ((r) => remoteTip({ root, ref: r, env }));
   return withAddGuardLock(root, env, async () => {
@@ -617,7 +650,7 @@ export async function retireRegistration({ root, ref, expectedTip, expectedEntry
     if (entry.pinned === true) writeRebuildRequest(root, { by, reason: proof.reason, ref, lockRoot: env.WE_DAEMON_CLONE_LOCK_ROOT });
     appendOverlayEvent(root, { kind: 'auto-retired', ref, pr: entry.pr ?? null, by, reason: proof.reason, tip: expectedTip, evidence: proof.evidence,
       ...(mode === 'retired' && typeof actor === 'string' && actor.trim() && typeof proof.reason === 'string' && proof.reason.trim()
-        ? { actor, operatorReason: true } : {}) }, { env });
+        ? { actor, ...(operatorWithdrawal ? { operatorReason: true } : {}) } : {}) }, { env });
     return { retired: true, refused: null, reason: proof.reason, evidence: proof.evidence, settled, list: readOverlays(root, { env }) };
   });
 }
@@ -1088,7 +1121,7 @@ export async function main(argv = process.argv.slice(2), deps = {}) {
     // R310: see retireRegistration. The CLI re-proves retirement itself; --reason is bookkeeping only.
     const expectedTip = flags['expected-tip'];
     if (expectedTip === undefined && (flags.tip !== undefined || flags.actor !== undefined)) {
-      output = await withdrawUnregisteredOverlay({ root, ref: flags.ref, tip: flags.tip, actor: flags.actor, reason, env });
+      output = await withdrawUnregisteredOverlay({ root, ref: flags.ref, tip: flags.tip, actor: flags.actor, reason, acceptUncontained: flags['accept-uncontained'] === true, env, deps });
       process.stdout.write(`${JSON.stringify(output)}\n`);
       return;
     }

@@ -4,7 +4,7 @@
  * omitting it was discarded as `superseded-omits-live-overlay`. Intentional retirement of the exact live tip
  * must permit adoption and report the retired ref; removal without that evidence must still discard.
  *
- * Scenario: real `retireRegistration` records the retirement, then real `overlayRetiredByOperator` supplies the
+ * Scenario: real `withdrawRegisteredOverlay` records the retirement, then real `overlayRetiredByOperator` supplies the
  * `retiredByOperator` predicate to `matchReadyCandidate`. PRE-fix the proven case discards; FIXED it adopts,
  * while missing-tip and missing-record cases still discard.
  */
@@ -28,7 +28,7 @@ export default {
   async run({ log } = {}) {
     const root = REPO_ROOT;
     const { matchReadyCandidate, overlayRetiredByOperator } = await import(pathToFileURL(join(root, 'scripts/lib/daemon-rebuild/adopt.mjs')).href);
-    const { retireRegistration } = await import(pathToFileURL(join(root, 'scripts/daemon-overlay.mjs')).href);
+    const { withdrawRegisteredOverlay, retireRegistration } = await import(pathToFileURL(join(root, 'scripts/daemon-overlay.mjs')).href);
     const { addOverlay, appendOverlayEvent, readOverlays } = await import(pathToFileURL(join(root, 'scripts/lib/daemon-overlays.mjs')).href);
     const { readOverlayEventLog } = await import(pathToFileURL(join(root, 'scripts/lib/daemon-rebuild/prepare.mjs')).href);
     const { OPERATOR_LOGINS } = await import(pathToFileURL(join(root, 'scripts/lib/marker-authorship.mjs')).href);
@@ -48,9 +48,8 @@ export default {
       addOverlay(scratch, { ref }, { env });
       appendOverlayEvent(scratch, { kind: 'added', ref, at: '2026-11-14T10:00:00Z' }, { env });
       const expectedEntry = readOverlays(scratch, { env }).find((entry) => entry.ref === ref);
-      const removal = await retireRegistration({ root: scratch, ref, expectedTip: sha, expectedEntry, by: 'operator', actor, env,
-        deps: { resolveOperatorIdentity: () => ({ login: actor, type: 'User' }),
-          prove: () => ({ action: 'retire', tip: sha, reason }), tip: () => sha } });
+      const removal = await withdrawRegisteredOverlay({ reason, git: (cmd) => ({ code: 0, stdout: cmd === 'ls-remote' ? `${sha}\trefs/heads/${ref}` : '' }), root: scratch, ref, expectedTip: sha, expectedEntry, by: 'operator', actor, env,
+        deps: { tip: () => sha } });
       const events = readOverlayEventLog(scratch, env);
       const removed = events.at(-1);
       if (!removal.retired || removed?.kind !== 'auto-retired' || removed.ref !== ref || removed.tip !== sha || removed.reason !== reason || removed.actor !== actor || removed.operatorReason !== true) {
@@ -72,6 +71,8 @@ export default {
       }
       for (const [name, history] of [
         ['removed-with-allowlisted-actor', events.map((e) => e.kind === 'auto-retired' ? { ...e, kind: 'removed' } : e)],
+        ['missing-operator-authority', events.map((e) => e.kind === 'auto-retired' ? { ...e, operatorReason: undefined } : e)],
+        ['automatic-in-main-with-actor', events.map((e) => e.kind === 'auto-retired' ? { ...e, reason: 'in-main' } : e)],
         ['missing-actor', events.map((e) => e.kind === 'auto-retired' ? { ...e, actor: undefined } : e)],
         ['non-operator-actor', events.map((e) => e.kind === 'auto-retired' ? { ...e, actor: 'unregistered[bot]' } : e)],
         ['missing-tip', events.map((e) => e.kind === 'auto-retired' ? { ...e, tip: undefined } : e)],
@@ -84,6 +85,12 @@ export default {
           violations.push({ invariant: 'unproven-retirement-adopted', detail: `${name} must keep the live-overlay omission refusal: ${JSON.stringify(result)}` });
         }
       }
+      addOverlay(scratch, { ref }, { env });
+      await retireRegistration({ root: scratch, ref, expectedTip: sha, actor, env,
+        deps: { prove: () => ({ action: 'retire', tip: sha, reason: 'in-main' }), tip: () => sha } });
+      const automatic = readOverlayEventLog(scratch, env);
+      if (automatic.at(-1).operatorReason === true || m(automatic).adopt !== null)
+        violations.push({ invariant: 'automatic-retirement-authorized-omission', detail: 'ordinary in-main retirement with operator attribution must refuse omission' });
       return { violations };
     } finally {
       rmSync(scratch, { recursive: true, force: true });

@@ -14,13 +14,14 @@ import * as repair from '../../lane-repair.mjs';
 import { addOverlay, appendOverlayEvent, overlayFilePath, readOverlays, removeOverlay } from '../../daemon-overlays.mjs';
 import { removeRegistration, retireRegistration } from '../../../daemon-overlay.mjs';
 import { createPrototypeLoader } from '../../../operations/prototype-load-io.mjs';
+import { AUTOMATIC_RETIREMENT_REASONS } from '../../../operations/prototype-retire.mjs';
 import { OPERATOR_LOGINS } from '../../marker-authorship.mjs';
 
 const ref = 'lane/overlay-fix';
 const sha = 'a'.repeat(40);
 const added = { kind: 'added', ref, at: '2026-11-14T10:00:00Z' };
 const actor = OPERATOR_LOGINS[0];
-const removed = { kind: 'auto-retired', ref, tip: sha, by: 'operator', actor, reason: 'retire fix', at: '2026-11-14T11:00:00Z' };
+const removed = { kind: 'auto-retired', ref, tip: sha, by: 'operator', actor, operatorReason: true, reason: 'retire fix', at: '2026-11-14T11:00:00Z' };
 // The last appended add is older than retirement; the earlier appended add is newer.
 const outOfOrderAdds = [{ ...added, at: '2026-11-14T12:00:00Z' }, added, removed];
 
@@ -89,6 +90,24 @@ describe('operator retirement of a live overlay', () => {
     expect(readOverlayEventLog(root, env)).toEqual([added]);
   });
 
+  it('ordinary in-main retirement with an allowlisted actor cannot authorize omission', async () => {
+    expect(await retireRegistration({ root, ref, expectedTip: sha, actor, env, deps: {
+      prove: () => ({ action: 'retire', tip: sha, reason: 'in-main' }), tip: () => sha,
+    } })).toMatchObject({ retired: true });
+    const event = readOverlayEventLog(root, env).at(-1);
+    expect(event).toMatchObject({ actor, reason: 'in-main' });
+    expect(event).not.toHaveProperty('operatorReason');
+    expect(adoption.overlayRetiredByOperator({ ref, sha, registered: () => false, events: [added, event] })).toBe(false);
+    refused();
+  });
+  it.each(['in-main', 'pr-merged', 'pr-squash-merged', 'redundant-merge-sibling', 'superseded', 'urgent-failed', 'pr-closed'])('rejects persisted automatic %s evidence even with operatorReason', reason => {
+    removeOverlay(root, ref, { env });
+    refused(match([added, { ...removed, reason }]));
+  });
+  it.each([undefined, false, 'true'])('requires exact boolean operatorReason, received %s', operatorReason => {
+    removeOverlay(root, ref, { env });
+    refused(match([added, { ...removed, operatorReason }]));
+  });
   it('automatic retireRegistration supplies no operator proof', async () => {
     expect(await retireRegistration({ root, ref, expectedTip: sha, env, by: 'prototype-load', deps: {
       prove: () => ({ action: 'retire', tip: sha, reason: 'in-main' }), tip: () => sha,
@@ -271,7 +290,7 @@ describe('operator retirement of a live overlay', () => {
       const source = readFileSync(join(dirname(fileURLToPath(import.meta.url)), '../adopt.mjs'), 'utf8')
         .match(/export (function overlayRetiredByOperator\([\s\S]*?\n\})/)[1];
       expect(source).toContain('added.every(');
-      const mutant = new Function('OPERATOR_LOGINS', `return (${source.replace('added.every(', replacement)});`)(OPERATOR_LOGINS);
+      const mutant = new Function('OPERATOR_LOGINS', 'AUTOMATIC_RETIREMENT_REASONS', `return (${source.replace('added.every(', replacement)});`)(OPERATOR_LOGINS, AUTOMATIC_RETIREMENT_REASONS);
       expect(mutant({ ref, sha, events: outOfOrderAdds, registered: () => false })).toBe(true);
       expect(() => refusesRetirementOlderThanAnyPrecedingAdd(mutant)).toThrow();
     },

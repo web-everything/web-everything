@@ -7,6 +7,7 @@ import { withdrawUnregisteredOverlay, main, replaceRegistration } from '../daemo
 import { addOverlay, appendOverlayEvent, overlayFilePath } from '../lib/daemon-overlays.mjs';
 import { overlayRetiredByOperator } from '../lib/daemon-rebuild/adopt.mjs';
 import { REBUILD_IDENTITY_ENV } from '../lib/daemon-rebuild/shared.mjs';
+import { AUTOMATIC_RETIREMENT_REASONS } from '../operations/prototype-retire.mjs';
 
 const roots = [];
 afterEach(() => {
@@ -33,13 +34,93 @@ function fixture() {
   const tip = git('rev-parse', 'HEAD');
   git('checkout', '-q', 'main');
   git('merge', '--no-ff', '-m', 'daemon-rebuild: merge overlay lane/withdraw onto main', 'lane/withdraw');
-  const args = { root, ref: 'lane/withdraw', tip, actor: 'CHALBERT', reason: 'operator withdrawal', env,
+  const args = { root, ref: 'lane/withdraw', tip, actor: 'CHALBERT', reason: 'operator withdrawal', acceptUncontained: true, env,
     deps: { resolveOperatorIdentity: () => ({ login: 'chalbert', type: 'User' }) } };
   const events = () => { try { return readFileSync(overlayFilePath(root, env).replace(/\.json$/, '.events.jsonl'), 'utf8').trim().split('\n').map(JSON.parse); } catch { return []; } };
   return { root, env, git, args, tip, events };
 }
 
 describe('operator withdrawal of an unregistered live overlay', () => {
+  it.each(['stackBases', 'stackVia', 'ancestry'])('refuses a registered stacked dependent via %s even with acceptance', async (via) => {
+    const f = fixture();
+    addOverlay(f.root, { ref: 'lane/top', ...(via === 'stackBases' ? { stackBases: [f.args.ref] } : {}) }, { env: f.env });
+    if (via === 'stackVia') {
+      const store = JSON.parse(readFileSync(overlayFilePath(f.root, f.env), 'utf8'));
+      store.overlays[0].stackVia = { pr: [f.args.ref] };
+      writeFileSync(overlayFilePath(f.root, f.env), JSON.stringify(store));
+    }
+    f.git('update-ref', 'refs/remotes/origin/lane/top', f.tip);
+    const before = f.events();
+    await expect(withdrawUnregisteredOverlay(f.args)).rejects.toThrow(/stacked/);
+    expect(f.events()).toEqual(before);
+  });
+  it.each([{ stackBases: 'unknown' }, { stackVia: { ancestry: null } }])('refuses malformed stored stack evidence %j', async fields => {
+    const f = fixture();
+    addOverlay(f.root, { ref: 'lane/other' }, { env: f.env });
+    const store = JSON.parse(readFileSync(overlayFilePath(f.root, f.env), 'utf8'));
+    Object.assign(store.overlays[0], fields);
+    writeFileSync(overlayFilePath(f.root, f.env), JSON.stringify(store));
+    const before = f.events();
+    await expect(withdrawUnregisteredOverlay(f.args)).rejects.toThrow(/unreadable-stack-evidence/);
+    expect(f.events()).toEqual(before);
+  });
+  it('refuses uncontained content without explicit acceptance', async () => {
+    const f = fixture();
+    await expect(withdrawUnregisteredOverlay({ ...f.args, acceptUncontained: undefined })).rejects.toThrow(/--accept-uncontained/);
+    expect(f.events()).toEqual([]);
+  });
+  it('accepts uncontained content with explicit acceptance and records it', async () => {
+    const f = fixture();
+    expect(await withdrawUnregisteredOverlay(f.args)).toMatchObject({ retired: true });
+    expect(f.events().at(-1)).toMatchObject({ operatorReason: true, acceptUncontained: true });
+  });
+  it('accepts contained content without acceptance override', async () => {
+    const f = fixture();
+    f.git('update-ref', 'refs/remotes/origin/main', f.tip);
+    expect(await withdrawUnregisteredOverlay({ ...f.args, acceptUncontained: undefined })).toMatchObject({ retired: true });
+    expect(f.events().at(-1)).not.toHaveProperty('acceptUncontained');
+  });
+  it('refuses unreadable dependent tracking evidence without fetching', async () => {
+    const f = fixture();
+    addOverlay(f.root, { ref: 'lane/missing' }, { env: f.env });
+    const before = f.events();
+    await expect(withdrawUnregisteredOverlay(f.args)).rejects.toThrow(/stacked dependents/);
+    expect(f.events()).toEqual(before);
+  });
+  it('refuses unreadable containment even with explicit acceptance', async () => {
+    const f = fixture();
+    const run = (cmd, args, opts) => args[0] === 'merge-base' && args[1] === '--is-ancestor'
+      ? { status: 128, stdout: '' } : spawnSync(cmd, args, opts);
+    await expect(withdrawUnregisteredOverlay({ ...f.args, deps: { ...f.args.deps, run } })).rejects.toThrow(/containment unreadable/);
+    expect(f.events()).toEqual([]);
+  });
+  it('accepts an independent registered overlay using only local evidence', async () => {
+    const f = fixture();
+    addOverlay(f.root, { ref: 'lane/independent' }, { env: f.env });
+    f.git('update-ref', 'refs/remotes/origin/lane/independent', f.git('rev-parse', 'refs/remotes/origin/main'));
+    const run = vi.fn((cmd, args, opts) => {
+      if (['fetch', 'ls-remote'].includes(args[0])) throw new Error('withdrawal must be fetch-free');
+      return spawnSync(cmd, args, opts);
+    });
+    expect(await withdrawUnregisteredOverlay({ ...f.args, deps: { ...f.args.deps, run } })).toMatchObject({ retired: true });
+    expect(run).toHaveBeenCalled();
+  });
+  it('refuses automatic reasons as explicit withdrawal authority', async () => {
+    const f = fixture();
+    await expect(withdrawUnregisteredOverlay({ ...f.args, reason: 'in-main' })).rejects.toThrow(/operator withdrawal/);
+    expect(f.events()).toEqual([]);
+  });
+  it('CLI requires --accept-uncontained and records explicit acceptance', async () => {
+    const f = fixture();
+    vi.stubEnv('WE_DAEMON_OVERLAY_DIR', f.env.WE_DAEMON_OVERLAY_DIR);
+    vi.spyOn(process.stdout, 'write').mockImplementation(() => true);
+    const argv = ['retire', `--clone=${f.root}`, `--ref=${f.args.ref}`, `--tip=${f.tip}`, '--actor=chalbert', '--reason=withdraw live work'];
+    const deps = { pruneStaleOverlayRecords: () => {}, ...f.args.deps };
+    await expect(main(argv, deps)).rejects.toThrow(/--accept-uncontained/);
+    expect(f.events()).toEqual([]);
+    await main([...argv, '--accept-uncontained'], deps);
+    expect(f.events().at(-1)).toMatchObject({ acceptUncontained: true, operatorReason: true });
+  });
   it('refuses a registered ref without writing events', async () => {
     const f = fixture();
     addOverlay(f.root, { ref: f.args.ref }, { env: f.env });
@@ -107,11 +188,11 @@ describe('operator withdrawal of an unregistered live overlay', () => {
     expect(overlayRetiredByOperator({ ref: f.args.ref, sha: f.tip, registered: () => false, events: f.events() })).toBe(true);
   });
   describe.each(['remove', 'retire'])('ordinary %s CLI', cmd => {
-    async function run(f, actor, identity) {
+    async function run(f, actor, identity, reason = f.args.reason) {
       vi.stubEnv('WE_DAEMON_OVERLAY_DIR', f.env.WE_DAEMON_OVERLAY_DIR);
       vi.spyOn(process.stdout, 'write').mockImplementation(() => true);
       return main([cmd, `--clone=${f.root}`, `--ref=${f.args.ref}`, '--json',
-        `--reason=${f.args.reason}`, ...(cmd === 'retire' ? [`--expected-tip=${f.tip}`] : []),
+        `--reason=${reason}`, ...(cmd === 'retire' ? [`--expected-tip=${f.tip}`] : []),
         ...(actor === undefined ? [] : [`--actor=${actor}`])], {
         pruneStaleOverlayRecords: () => {}, resolveOperatorIdentity: identity,
         tip: () => f.tip, prove: () => ({ action: 'retire', reason: 'in-main', tip: f.tip }),
@@ -124,8 +205,8 @@ describe('operator withdrawal of an unregistered live overlay', () => {
       await run(f, 'CHALBERT', identity);
       expect(identity).toHaveBeenCalledTimes(1);
       expect(f.events().at(-1)).toMatchObject({ kind: cmd === 'remove' ? 'removed' : 'auto-retired', actor: 'chalbert' });
-      if (cmd === 'remove') expect(f.events().at(-1)).not.toHaveProperty('operatorReason');
-      else expect(f.events().at(-1)).toHaveProperty('operatorReason', true);
+      if (cmd === 'remove') expect(f.events().at(-1)).toHaveProperty('operatorReason', true);
+      else expect(f.events().at(-1)).not.toHaveProperty('operatorReason');
     });
     it('without --actor removes without resolving identity or supplying operator proof', async () => {
       const f = fixture();
@@ -137,6 +218,15 @@ describe('operator withdrawal of an unregistered live overlay', () => {
       expect(f.events().at(-1)).not.toHaveProperty('actor');
       expect(f.events().at(-1)).not.toHaveProperty('operatorReason');
     });
+    it.each(['', ' ', ...AUTOMATIC_RETIREMENT_REASONS.map(reason => ` ${reason.toUpperCase()} `)])(
+      'authenticated actor with empty or automatic reason %j supplies no withdrawal authority', async reason => {
+        const f = fixture();
+        addOverlay(f.root, { ref: f.args.ref }, { env: f.env });
+        await run(f, 'CHALBERT', () => ({ login: 'CHALBERT', type: 'User' }), reason);
+        expect(f.events().at(-1)).toMatchObject({ kind: cmd === 'remove' ? 'removed' : 'auto-retired', actor: 'chalbert' });
+        expect(f.events().at(-1)).not.toHaveProperty('operatorReason');
+      },
+    );
     it('refuses a non-operator --actor before removing or writing an event', async () => {
       const f = fixture();
       addOverlay(f.root, { ref: f.args.ref }, { env: f.env });

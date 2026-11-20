@@ -23,6 +23,10 @@
  */
 import { parseSupersedes, isTrustedSupersedeAuthor, isBodyEditedAfterMergeByUntrusted } from '../conveyor/supersede-rule.mjs';
 
+export const AUTOMATIC_RETIREMENT_REASONS = Object.freeze([
+  'in-main', 'pr-merged', 'pr-squash-merged', 'redundant-merge-sibling', 'superseded', 'urgent-failed', 'pr-closed',
+]);
+
 const SHA = /^[a-f0-9]{40}$/;
 const lines = (text) => String(text || '').split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
 
