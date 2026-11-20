@@ -389,3 +389,22 @@ describe('a later push or ruling settles a referral hold', () => {
     expect(detectRoundCap({ comments: [h, null, { body: 5 }], pr: PR, head: H(9), state: 'at-round-limit' })).toMatchObject({ trigger: 'referral-hold' });
   });
 });
+
+describe('referral hold settle: audit negatives', () => {
+  const holdFor = (head, n = 5) => bot(`review paused: head ${head} was already reviewed\n\nWaiting on your ruling (block, card or not-real):\n- \`src/a.mjs:${n}\` — x\n\n<!-- review-referral-hold: abcdef0123456789 -->`, at());
+  it('an accept does not settle a hold', () => {
+    expect(detectRoundCap({ comments: [holdFor(H(9)), bot('✅ review — accepted', at())], pr: PR, head: H(9), state: 'at-round-limit' })).toMatchObject({ trigger: 'referral-hold' });
+  });
+  it('a mechanical bounce or another head\'s verdict does not settle a hold', () => {
+    const h = holdFor(H(9));
+    const bounce = bot('🔁 review — changes requested\n\nRecorded by parked-pr-conflict', at());
+    const other = bot(`🔁 review — changes requested\n\nhead ${H(1)}`, at());
+    expect(detectRoundCap({ comments: [h, bounce, other], pr: PR, head: H(9), state: 'at-round-limit' })).toMatchObject({ trigger: 'referral-hold' });
+  });
+  it('an older live-head hold still wins behind a newer stale-head hold', () => {
+    expect(detectRoundCap({ comments: [holdFor(H(9)), holdFor(H(1))], pr: PR, head: H(9), state: 'at-round-limit' })).toMatchObject({ trigger: 'referral-hold' });
+  });
+  it('an unreadable live head never settles a hold', () => {
+    expect(detectRoundCap({ comments: [holdFor(H(1))], pr: PR, head: 'unknown', state: 'at-round-limit' })).toMatchObject({ trigger: 'referral-hold' });
+  });
+});
