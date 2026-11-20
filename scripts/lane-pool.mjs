@@ -138,7 +138,7 @@ import { candidateLaunch } from './readiness/scope-lease-live.mjs';
 // spin-acquire (`we:scripts/readiness/drain-lock.mjs`), reused rather than re-implemented, for `acquire`'s
 // own bounded full-pool retry/backoff below. No cycle: drain-lock.mjs never imports lane-pool.
 import { sleepSyncMs } from './readiness/drain-lock.mjs';
-import { publishPartialFree, readPartialFree, resetBlockedByProbe } from './lib/lane-pool-scan.mjs';
+import { publishPartialFree, readPartialFree, resetBlockedByProbe, retryGitProbe } from './lib/lane-pool-scan.mjs';
 import { jitteredDelayMs } from './lib/lane-acquire-backoff.mjs';
 // #2748 — REUSE the standalone reaper's PURE core so the "provably-dead lease" verdict is SINGLE-SOURCED with
 // `scripts/conveyor/lease-reaper.mjs` (the acquire-native backstop must agree with the periodic reaper, never
@@ -1180,18 +1180,24 @@ function recloneLane(repo, n, reason) {
 // -fd`. Compute this AFTER the fetch (so "ahead" reflects the latest origin/<branch>) but BEFORE any
 // destructive git call.
 function laneDirtyOrAhead(dir, branch) {
-  const porcelain = tryGit(['status', '--porcelain'], dir);
+  const probeErrors = [];
+  const probe = (args) => {
+    const { output, error } = retryGitProbe(args, dir, git);
+    if (output === null) probeErrors.push({ probe: `git ${args.join(' ')}`, error });
+    return output;
+  };
+  const porcelain = probe(['status', '--porcelain']);
   const uncommitted = porcelain ? porcelain.split('\n').filter(Boolean).length : 0;
   const dirtyPaths = porcelain ? porcelainPaths(porcelain) : [];
-  const aheadRaw = tryGit(['rev-list', '--count', `origin/${branch}..HEAD`], dir);
+  const aheadRaw = probe(['rev-list', '--count', `origin/${branch}..HEAD`]);
   const ahead = aheadRaw === null ? 0 : Number(aheadRaw);
   // #2452 review — this predicate reports the FACT only ("how many commits ahead of the local origin ref").
   // The Gap-1 relaxation used to live here, which silently changed reset/skip semantics for every caller
   // (`refreshLane`'s hard-reset decision, `status`, the board) even though it is justified only for acquire's
   // auto-pick. Policy now lives at that one call site — see `aheadIsProvablyPushed`.
   // A git that failed (spawn error, kill, EMFILE under load) reads above as "nothing uncommitted / nothing ahead".
-  // That is the right fail-open answer for ONE scan, but it must never be REMEMBERED as a clean verdict.
-  return { dirty: uncommitted > 0, uncommitted, ahead, dirtyPaths, probeFailed: porcelain === null || aheadRaw === null };
+  // Keep the historical counts, but carry unknown evidence explicitly so it cannot authorize a reset.
+  return { dirty: uncommitted > 0, uncommitted, ahead, dirtyPaths, probeFailed: probeErrors.length > 0, probeErrors };
 }
 
 /**
@@ -2414,7 +2420,7 @@ function provisionClaimedLane(repo, chosen, targetWasReserved, { beforeDestructi
     // refreshed eligible tracking refs; `localRemoteShas` checks the mapping before using local state.
     let reclaimAhead = false;
     if (!flags.force) {
-      const { uncommitted, ahead, probeFailed } = laneDirtyOrAhead(dir, repo.branch);
+      const { uncommitted, ahead, probeFailed, probeErrors } = laneDirtyOrAhead(dir, repo.branch);
       // #3383 — re-apply the SAME litter relaxation auto-pick's earlier cached-scan candidate check already
       // granted this lane (or that an explicit `--lane=N` acquire's own pre-claim check just granted it, just above):
       // without this, a litter-only-dirty lane picked exactly because it looked acquirable would immediately
@@ -2424,12 +2430,17 @@ function provisionClaimedLane(repo, chosen, targetWasReserved, { beforeDestructi
       if (dirty || !provablyPushed) {
         // #3407 — THROWS (was `fail()`, uncatchable) so a caller can restore/drop this claim's lease — and, on
         // auto-pick, fall through to the next candidate — before the process actually exits.
-        throw new Error(
+        const refusal = new Error(
           `lane-${chosen} is no longer provably safe to reset as of this fetch (${uncommitted} uncommitted, ` +
-            `${ahead} ahead, provably-pushed=${provablyPushed}) — a ref its earlier containment proof relied on ` +
-            `may have been deleted or force-pushed in the window since (#2924). Use --force to proceed anyway, ` +
+            `${ahead} ahead, provably-pushed=${provablyPushed}) — ` +
+            (probeFailed
+              ? `probe failed: ${probeErrors.map(({ probe, error }) => `${probe}: ${error}`.replace(/[\p{Cc}\p{Cf}\u2028\u2029]/gu, ' ')).join('; ')}. `
+              : `a ref its earlier containment proof relied on may have been deleted or force-pushed in the window since (#2924). `) +
+            `Use --force to proceed anyway, ` +
             `or investigate/salvage the tree first.`,
         );
+        refusal.safetyRefusal = true; // probe stderr is evidence, not a corruption signal: never repair/reclone on it
+        throw refusal;
       }
       // Landing-freeze fix (lane-leftover-reclaim) — a reclaim reached ONLY via the patch-equivalence
       // relaxation just above (never via a genuinely clean lane, where `ahead` is already 0) drops real local
@@ -2477,7 +2488,7 @@ function provisionClaimedLane(repo, chosen, targetWasReserved, { beforeDestructi
     try {
       reset = resetToBase();
     } catch (e) {
-      if (!looksLikeCorruption(msgOf(e))) throw e;
+      if (e?.safetyRefusal || !looksLikeCorruption(msgOf(e))) throw e;
       healSharedStoreFor(repo, e);
       repairUnhealthyClone();
       reset = resetToBase();

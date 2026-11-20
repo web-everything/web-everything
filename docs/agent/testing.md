@@ -5568,3 +5568,11 @@ Park opens ready for review; draft-promotion still handles older drafts.
 Check mode fetches origin main before evaluating canonical audit evidence. A failed fetch reports
 `main not refreshed: <reason>` and refuses even when local evidence would pass against stale refs.
 `open-pr-audit-gate.test.mjs` covers both refresh outcomes, aggregation and an unconfirmed check child.
+
+## Lane reset safety probe regressions
+
+`lane-pool-acquire-reset-probe-failed.test.mjs` uses a PATH Git shim activated after fetch
+to isolate the reset-time status/ahead probes. Cover both transient recovery and persistent
+refusal, and assert no checkout/reset/clean follows a failed probe. The bounded process
+reader wraps the original stderr in `ProcReadError.cause`; preserve that stderr (or the
+spawn error message) in probe diagnostics rather than reporting zero counts as proof.
