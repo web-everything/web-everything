@@ -31,8 +31,11 @@ describe('pinnedFrom exemption requires an audited exact 40-hex sha', () => {
     });
   }
   it('honours a lowercase 40-hex pin that is audited for the ref (no regression)', () => {
-    expect(revoked(pin, env(), [{ detail: { ref, newTip: sha } }])).toEqual([]);
     expect(revoked(pin, env())).toEqual([]);
+    expect(revoked(pin, env(), [{ detail: { ref, newTip: pin } }])).toEqual([]);
+  });
+  it('a live hold on the applied sha itself wins over an audited pin', () => {
+    expect(revoked(pin, env(), [{ detail: { ref, newTip: sha } }])).toEqual([ref]);
   });
   it('does not honour a 40-hex pin audited only for another ref, or revoked', () => {
     expect(revoked(pin, env({ rows: [{ ref: 'lane/other', sha: pin, tests: 'green', audit: 'NOT WEAKENED' }] }))).toEqual([ref]);

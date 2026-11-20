@@ -58,10 +58,11 @@ export function revokedAppliedTips({
   return (applied ?? [])
     .filter((a) => {
       if (!a?.ref || !a.sha) return false;
+      // A live hold on the applied sha itself always wins over any pin.
+      if (held.some((x) => x.detail.ref === a.ref && x.detail.newTip === a.sha)) return true;
       // pinnedFrom exempts only as an exact lowercase 40-hex sha the audit gate accepts for this ref; no gate = no exemption.
       if (typeof a.pinnedFrom === 'string' && FULL_SHA_RE.test(a.pinnedFrom)
         && typeof auditedTip === 'function' && auditedTip(a.ref, a.pinnedFrom) === true) return false;
-      if (held.some((x) => x.detail.ref === a.ref && x.detail.newTip === a.sha)) return true;
       if (typeof auditedTip !== 'function') return false;
       if (carries(a.sha, prevHead) || carries(a.sha, mainSha) || inMain(a.sha)) return false;
       if (Array.isArray(auditAdopted) && !auditAdopted.includes(a.ref)) return false; // never adopted: the plan applies it unaudited

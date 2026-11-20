@@ -11,8 +11,19 @@ export default {
   title: 'an arbitrary or unaudited pinnedFrom no longer exempts a held tip; an audited 40-hex pin still does',
   card: 'pinnedfrom-audited',
   fixedBy: { sha: 'HEAD', where: 'lane/pinnedfrom-audited', paths: [SOURCE] },
-  // Behavioural: decided by running the predicate, not by a marker string.
-  fixPresent() { return this.run().violations.length === 0; },
+  // Behavioural and independent of run(): one narrow probe of the fixed behaviour (an arbitrary pin does not exempt),
+  // so a regression in the other run() assertions still fails the test instead of flipping it to an expected failure.
+  fixPresent() {
+    const dir = mkdtempSync(join(tmpdir(), 'soak-pinnedfrom-probe-'));
+    try {
+      const env = { WE_FIX_READY_PATH: join(dir, 'a.jsonl'), WE_PLATFORM_PREFERENCES_FILE: join(dir, 'p.json'),
+        WE_DAEMON_OVERLAY_FOLLOW_TIP: 'audited-only' };
+      writeFileSync(env.WE_PLATFORM_PREFERENCES_FILE, '{}');
+      writeFileSync(env.WE_FIX_READY_PATH, '');
+      return revokedAppliedTips({ applied: [{ ref, sha, pinnedFrom: 'arbitrary' }],
+        auditedTip: makeAuditedTipGate(env), auditAdopted: [ref] }).length === 1;
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  },
   run() {
     const dir = mkdtempSync(join(tmpdir(), 'soak-pinnedfrom-'));
     const violations = [];
@@ -21,7 +32,7 @@ export default {
         WE_DAEMON_OVERLAY_FOLLOW_TIP: 'audited-only' };
       writeFileSync(env.WE_PLATFORM_PREFERENCES_FILE, '{}');
       writeFileSync(env.WE_FIX_READY_PATH, JSON.stringify({ ref, sha: pin, tests: 'green', audit: 'NOT WEAKENED' }) + '\n');
-      const held = [{ detail: { ref, newTip: sha } }];
+      const held = [{ detail: { ref, newTip: pin } }];
       const check = (pinnedFrom) => revokedAppliedTips({ applied: [{ ref, sha, pinnedFrom }],
         auditedTip: makeAuditedTipGate(env), auditAdopted: [ref], held });
       if (check('arbitrary').length !== 1) violations.push('an arbitrary pinnedFrom exempted a held tip');
