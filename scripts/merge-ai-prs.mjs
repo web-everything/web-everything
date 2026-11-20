@@ -2895,8 +2895,8 @@ export function planLabelDrain(candidates, { landedThisPass = new Set(), provenO
   // Resolve ordinary deferrals first, then accept waits only on targets that
   // neither defer on another gate nor yield themselves in this pass.
   if (overlapContext instanceof Map && overlapContext.size) {
-    const base = planLabelDrain(candidates, { landedThisPass, provenOnMain, coupleIncomplete, extraOpenItems,
-      contextComplete, malformedRepos, strictAbsentHashDependencies, isWeRepo, overlapLocalSlug });
+    const base = planLabelDrain(candidates, { landedThisPass, provenOnMain, coupleIncomplete, extraOpenItems, ...contextProofFields({ contextComplete, malformedRepos }),
+      strictAbsentHashDependencies, isWeRepo, overlapLocalSlug });
     const eligible = new Set(base.ready.map(c => overlapRowKey({ repo: c.repo || overlapLocalSlug, number: c.num })));
     const known = new Set(list.map(c => overlapRowKey({ repo: c.repo || overlapLocalSlug, number: c.num })));
     const waits = overlapContext;
