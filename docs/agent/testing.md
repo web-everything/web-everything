@@ -5528,3 +5528,19 @@ Park opens ready for review; draft-promotion still handles older drafts.
 Check mode fetches origin main before evaluating canonical audit evidence. A failed fetch reports
 `main not refreshed: <reason>` and refuses even when local evidence would pass against stale refs.
 `open-pr-audit-gate.test.mjs` covers both refresh outcomes, aggregation and an unconfirmed check child.
+
+## Independent fix-daemon cadence
+
+The fix daemon uses synchronous child calls in its serial phases. A second async loop on
+that event loop cannot prove an independent cadence: ci-heal runs in a worker thread under
+the same PID and lease. Its scheduler tests inject time and sleep; the soak cadence probe
+observes two simulated hours with forty-minute main ticks. Worker shutdown must settle
+before lease release. Keep the worker's phase cursors in their separate file so independent
+writers cannot overwrite each other's fairness state.
+
+The ci-heal loop suite also launches the production CLI with a test-only Node loader
+that substitutes IO function bodies and scales the interval. The startup call, worker
+entry point, and both schedulers stay intact. Worker dispatch-boundary records must
+continue during a synchronous child call on the main thread; disconnecting worker
+startup must fail this integration test. The cooperative fake-clock probe alone cannot
+establish this guarantee.

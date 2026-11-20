@@ -472,7 +472,8 @@ describe('runTickAllRepos — R242 shared snapshot and empty-work skips', () => 
         ? { repo: 'repo-a', allowStandDownAutoProceed: false, cursor: undefined, deadlineAt: expect.any(Number), now: expect.any(Function) }
         : step === 'main-red-rebase'
           // The daemon wires a per-repo file-backed fairness ledger into the main-red rebase sweep only.
-          ? { repo: 'repo-a', apply: true, applyLedger: { read: expect.any(Function), write: expect.any(Function) } }
+          ? { repo: 'repo-a', apply: true, applyLedger: { read: expect.any(Function), write: expect.any(Function) },
+            cursor: undefined, deadlineAt: expect.any(Number), now: expect.any(Function), applyBudgetMs: expect.any(Number) }
           : ['hung-ci', 'missing-run'].includes(step)
             ? { repo: 'repo-a', apply: true } : ['ci-heal', 'promote-draft', 'notes'].includes(step)
               ? { repo: 'repo-a', cursor: undefined, deadlineAt: expect.any(Number), now: expect.any(Function) } : { repo: 'repo-a' });
@@ -645,7 +646,8 @@ describe('runTickAllRepos — R242 shared snapshot and empty-work skips', () => 
         ? { repo: 'repo-a', allowStandDownAutoProceed: false, cursor: undefined, deadlineAt: expect.any(Number), now: expect.any(Function) }
         : step === 'main-red-rebase'
           // The daemon wires a per-repo file-backed fairness ledger into the main-red rebase sweep only.
-          ? { repo: 'repo-a', apply: true, applyLedger: { read: expect.any(Function), write: expect.any(Function) } }
+          ? { repo: 'repo-a', apply: true, applyLedger: { read: expect.any(Function), write: expect.any(Function) },
+            cursor: undefined, deadlineAt: expect.any(Number), now: expect.any(Function), applyBudgetMs: expect.any(Number) }
           : ['hung-ci', 'missing-run'].includes(step)
             ? { repo: 'repo-a', apply: true } : ['ci-heal', 'promote-draft', 'notes'].includes(step)
               ? { repo: 'repo-a', cursor: undefined, deadlineAt: expect.any(Number), now: expect.any(Function) } : { repo: 'repo-a' });
@@ -752,7 +754,8 @@ describe('runTickAllRepos — R242 shared snapshot and empty-work skips', () => 
         ? { repo: 'repo-a', allowStandDownAutoProceed: false, cursor: undefined, deadlineAt: expect.any(Number), now: expect.any(Function) }
         : step === 'main-red-rebase'
           // The daemon wires a per-repo file-backed fairness ledger into the main-red rebase sweep only.
-          ? { repo: 'repo-a', apply: true, applyLedger: { read: expect.any(Function), write: expect.any(Function) } }
+          ? { repo: 'repo-a', apply: true, applyLedger: { read: expect.any(Function), write: expect.any(Function) },
+            cursor: undefined, deadlineAt: expect.any(Number), now: expect.any(Function), applyBudgetMs: expect.any(Number) }
           : ['hung-ci', 'missing-run'].includes(step)
             ? { repo: 'repo-a', apply: true } : ['ci-heal', 'promote-draft', 'notes'].includes(step)
               ? { repo: 'repo-a', cursor: undefined, deadlineAt: expect.any(Number), now: expect.any(Function) } : { repo: 'repo-a' });
@@ -2788,6 +2791,7 @@ describe('fix pass budgets', () => {
     expect(resolveFixPassBudgets({ file: { fixPassBudget: { stuckFixersMs: 9999999, ciHealMs: 1 } },
       env: { WE_FIX_BUDGET_PROMOTE_DRAFT_MS: '9999999', WE_FIX_BUDGET_CI_HEAL_MS: '2000' },
     })).toEqual({
+      mainRedRebaseMs: { value: 120000, source: 'standard' },
       stuckFixersMs: { value: 600000, source: 'tool' },
       ciHealMs: { value: 2000, source: 'env' },
       promoteDraftMs: { value: 600000, source: 'env' },
