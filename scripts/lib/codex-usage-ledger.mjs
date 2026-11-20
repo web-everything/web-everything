@@ -49,7 +49,7 @@ export function readCodexQuota(env = process.env) {
     };
     walk(join(env.CODEX_HOME || join(homedir(), '.codex'), 'sessions'));
     files.sort((a, b) => b.mtime - a.mtime);
-    for (const { path } of files.slice(0, 8)) {
+    for (const { path, mtime } of files.slice(0, 8)) {
       let fd;
       let text;
       try {
@@ -64,7 +64,7 @@ export function readCodexQuota(env = process.env) {
         try { e = JSON.parse(line); } catch { continue; }
         const limits = e?.type === 'event_msg' && e.payload?.type === 'token_count' ? e.payload.rate_limits : null;
         if (limits?.limit_id === 'codex' && Number.isFinite(limits.primary?.used_percent)) {
-          return { used_percent: limits.primary.used_percent, resets_at: limits.primary.resets_at ?? null, at: e.timestamp ?? null,
+          return { used_percent: limits.primary.used_percent, resets_at: limits.primary.resets_at ?? null, at: e.timestamp ?? null, mtime,
             ...(limits.primary.window_minutes ? { window_minutes: limits.primary.window_minutes } : {}),
             ...(limits.secondary ? { secondary: limits.secondary } : {}) };
         }
@@ -75,14 +75,14 @@ export function readCodexQuota(env = process.env) {
 }
 
 /** Read a bounded ledger tail. Legacy rows infer resets from percentage drops; new rows identify windows. */
-export function readCodexBurnRate({ env = process.env, now = Date.now(), lookbackHours = 24, window } = {}) {
+export function readCodexBurnRate({ env = process.env, now = Date.now(), lookbackHours = 24, window, read = readSync } = {}) {
   if (env.WE_CAPACITY_READERS === 'off') return null;
   let fd;
   try {
     if (!Number.isFinite(lookbackHours) || lookbackHours <= 0 || !window) return null;
     fd = openSync(codexUsageLedgerPath(env), 'r');
     const size = fstatSync(fd).size, buffer = Buffer.alloc(Math.min(size, 8 * 1024 * 1024));
-    const bytes = readSync(fd, buffer, 0, buffer.length, size - buffer.length);
+    const bytes = read(fd, buffer, 0, buffer.length, size - buffer.length);
     const lines = buffer.subarray(0, bytes).toString('utf8').split('\n');
     if (size > buffer.length) lines.shift();
     const epoch = v => typeof v === 'number' ? (v < 1e12 ? v * 1000 : v) : Date.parse(v);

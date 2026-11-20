@@ -47,7 +47,9 @@ export function readProviderCapacity({ env = {}, now = Date.now(), readers = {},
       const at = epoch(raw?.at ?? raw?.asOf ?? raw?.mtime);
       const seed = env.WE_CAPACITY_READERS === 'off' ? undefined : def.operatorReading, seedAt = epoch(seed?.asOf);
       const operatorReadingStale = Boolean(seed) && (!Number.isFinite(seedAt) || seedAt > now || now - seedAt > s.operatorReadingMaxAgeHours * HOUR);
-      const liveUsable = owner.readers?.some(r => r.type === 'codex-rollout') || (at <= now && now - at <= s.staleHours * HOUR);
+      const timestampMissing = raw?.at == null && raw?.asOf == null && raw?.mtime == null;
+      const liveUsable = Number.isFinite(at) ? at <= now && now - at <= s.staleHours * HOUR
+        : timestampMissing && Boolean(raw) && owner.readers?.some(r => r.type === 'codex-rollout');
       const add = (name, w, source = 'live') => {
         const usedPercent = w?.usedPercent ?? w?.used_percent ?? w?.used_percentage;
         const resetsAt = epoch(w?.resetsAt ?? w?.resets_at);
@@ -55,7 +57,8 @@ export function readProviderCapacity({ env = {}, now = Date.now(), readers = {},
         if (typeof usedPercent === 'number' && usedPercent >= 0 && usedPercent <= 100 && resetsAt > now) windows.push({ name, usedPercent, resetsAt, source,
           lengthHours: w.lengthHours ?? (w.window_minutes > 0 ? w.window_minutes / 60 : null) ?? configured?.lengthHours ?? lengths[name] ?? null });
       };
-      if (seed && !operatorReadingStale && seedAt <= now && (!raw || !Number.isFinite(at) || at < seedAt)) add(def.windows?.[0]?.name ?? 'weekly', seed, 'operator');
+      // An absent timestamp does not prove the live observation predates the operator seed.
+      if (seed && !operatorReadingStale && seedAt <= now && (!raw || (Number.isFinite(at) && at < seedAt))) add(def.windows?.[0]?.name ?? 'weekly', seed, 'operator');
       else if (liveUsable) {
         if (owner.readers?.some(r => r.type === 'codex-rollout')) {
           const name = (w, fallback) => w?.window_minutes > 0
@@ -114,7 +117,7 @@ export function scoreProvider(cap, kind, settings = {}) {
   const pace = planner.pace;
   const burn = planner.action === 'burn' || planner.pacingAction === 'burn' || planner.burnAggressively;
   const paceFactor = (pace === 'ahead' ? s.aheadPenalty : burn || pace === 'behind' ? s.behindBoost : 1) * (1 + (planner.scoreBoost ?? 0));
-  const label = cap.active === false ? 'inactive' : cap.held ? 'held' : !w || w.resetsAt <= now ? 'unknown' : usedPercent >= s.exhaustedPercent ? 'exhausted'
+  const label = (cap.active ?? def?.active) === false ? 'inactive' : cap.held ? 'held' : !w || w.resetsAt <= now ? 'unknown' : usedPercent >= s.exhaustedPercent ? 'exhausted'
     : !fit ? 'tier-excluded' : effectiveUsed >= 100 ? 'reserve-only' : pace === 'ahead' ? 'ahead' : pace === 'behind' ? 'behind' : 'normal';
   const excluded = ['inactive', 'held', 'unknown', 'exhausted', 'tier-excluded', 'reserve-only'].includes(label);
   const remaining = spare * hoursToReset;
@@ -125,16 +128,32 @@ export function scoreProvider(cap, kind, settings = {}) {
 
 export function chooseBuilder({ kind = 'build', capacities, settings = {}, fallback }) {
   const s = options(settings);
-  const inputs = capacities.map(cap => {
-    const def = (settings.providers ?? PROVIDER_DEFAULTS.providers).find(p => p.id === cap.provider);
-    return { ...scoreProvider(cap, kind, settings), allowed: cap.active !== false && (cap.allowedKinds ?? def?.allowedKinds ?? []).includes(kind), emergencyOnly: cap.emergencyOnly ?? def?.emergencyOnly };
-  });
+  const inputs = capacities.map(cap => capacityEligibility(cap, kind, settings));
   const ranked = inputs.filter(i => i.allowed && !i.emergencyOnly && i.score !== null).sort((a, b) => b.score - a.score);
   if (ranked.length) return { provider: ranked[0].provider, account: ranked[0].account, model: ranked[0].model, launcher: ranked[0].launcher, reason: 'capacity-score', inputs };
   const emergency = inputs.find(i => i.emergencyOnly && i.allowed && i.label === 'unknown' && i.fit);
   if (emergency && s.allowUnknownEmergency) return { provider: emergency.provider, account: emergency.account, reason: 'unknown-emergency', inputs };
   if (!capacities.some(c => c.known) && !capacities.some(c => c.held) && inputs.some(i => i.provider === fallback && i.allowed && i.fit && i.label === 'unknown')) return { provider: fallback, reason: 'all-readers-unknown', inputs };
+  // Unknown usage never competes on score. If every measured option is excluded,
+  // retain the legacy launcher fallback without assigning an unattributed account.
+  const unknown = [fallback, 'claude'].map(provider => inputs.find(i => i.provider === provider
+    && i.allowed && i.fit && !i.emergencyOnly && i.label === 'unknown')).find(Boolean);
+  if (unknown) return { provider: unknown.provider, account: unknown.account, model: unknown.model,
+    launcher: unknown.launcher, reason: 'unknown-fallback', inputs };
   return { provider: null, reason: 'no-eligible-capacity', inputs };
+}
+
+/** One eligibility boundary for scoring, escalation and dispatch fallbacks. Unknown
+ * capacity remains eligible as a fallback, but never acquires a numeric score. */
+export function capacityEligibility(cap, kind, settings = {}) {
+  const def = (settings.providers ?? PROVIDER_DEFAULTS.providers).find(p => p.id === cap.provider);
+  const scored = scoreProvider(cap, kind, settings);
+  const allowed = (cap.active ?? def?.active) !== false && (cap.allowedKinds ?? def?.allowedKinds ?? []).includes(kind);
+  const emergencyOnly = cap.emergencyOnly ?? def?.emergencyOnly;
+  const eligible = allowed && Boolean(scored.fit) && (emergencyOnly
+    ? options(settings).allowUnknownEmergency && scored.label === 'unknown'
+    : scored.score !== null || scored.label === 'unknown');
+  return { ...scored, allowed, emergencyOnly, eligible };
 }
 
 export function burnWindows(capacities, settings = {}) {

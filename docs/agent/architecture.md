@@ -82,6 +82,8 @@ operator preferences use the platform layer). Arrays replace as a whole. Effecti
 use the normal cascade log. `routing.capacity` owns global pacing weights, working hours, reset
 thresholds and demand assumptions. Unknown readings never score; unknown horizons require operator
 input. All-readers-unknown preserves the historical builder threshold only for an eligible fallback.
+If measured providers are excluded, an eligible unknown legacy fallback (then native Claude) may
+run without a capacity score or account attribution. Holds, tier and kind restrictions still apply.
 
 The pure `scripts/lib/capacity-planner.mjs` handles fixed-window end-of-window burn, rolling usage
 rates and restart-on-reset inventories. Each manual reset restores a full window and forfeits the
@@ -109,6 +111,8 @@ planner actions, rate pressure, reset choices, missing operator inputs and a 14-
 Horizon days run midnight-to-midnight in `workingHours.tz`, including DST transitions. Banked
 resets contribute capacity on their planner-selected working day, earliest expiry first; absent
 forecast demand, the observed burn rate projects reset timing while expected demand stays unknown.
+For restart-on-reset windows a consumed manual reset replaces the old natural reset with a full
+window from that point; fixed windows retain their original schedule.
 Inactive accounts never route or contribute capacity; sustained shortfall on three working days
 (`activateAfterShortfallDays`) recommends activation. Banked inventory alone does not guarantee
 demand coverage: working-hour deferrals can cause a shortfall before the next reset. Inventory-only
@@ -129,20 +133,26 @@ routes also remain Claude policy data.
 Capacity ranks provider/model candidates; the normal routing gate, holds, vetoes, disabled-provider
 and model validation still apply. Projection preserves configured effort, disabled providers and
 other policy fields, and never changes non-build operations such as prepare-decision. Candidates
-are tried in order; only all-unknown readers may use the historical policy fallback. Known rejected
+are tried in order; unknown fallback usage never competes against a scored candidate. Known rejected
 capacity holds with named reasons and a wait/reset/clear-hold fallback. Apply capacity eligibility
 both to route selection and to every returned fallback rung: the pure router's `available` input
 constrains its selected route, but does not filter its returned fallback list.
 A closed critical-work gate permits only Claude, including for fixes; a Codex-only route refuses.
 Provider tiers remain capacity data for other configured minimum-tier constraints.
 Critical takeover and ruling-not-addressed send-backs remain Claude-only and hold when Claude is unavailable.
-Escalation preserves rung order while removing held, exhausted, inactive, reserve-only, disallowed
-and below-minimum providers. Unknown rungs retain their configured position;
+Escalation removes held, exhausted, inactive, reserve-only, disallowed and below-minimum providers,
+then starts at the capacity winner and retains the suffix of the configured chain. This prevents
+escalation from Claude back to Codex. Main-fix requires an eligible, available Claude rung;
 when every reader is unknown the historical effective-builder chain applies (Claude drops Codex).
 `routing.capacity.operatorReadingMaxAgeHours` defaults to 24 and follows the normal cascade with
 `capacitySources` provenance. Older operator readings never supply quota; the calendar reports
 “operator reading stale — refresh”. Refresh the reading, restore live quota, or wait for reset/clear
 holds when routing refuses. A chain decision with `executor:null` holds every launch and resume caller.
+Timestamped Codex readings use the same freshness bound as other live readers. Persisted rollout
+files supply their modification time when the event has no timestamp; a timestamp-free injected
+Codex reading retains legacy precedence over an operator seed because its age is unproven.
+Account IDs use the provider ID grammar, and dedupe receipts hash the full event identity to keep
+all receipt writes within the capacity state directory, including directly injected observations.
 
 When critical or unproductive escalation requires Claude but filtering removed Claude, the chain
 holds instead of continuing on Codex. An invalid AI overlay makes the fixer-ladder rung unavailable

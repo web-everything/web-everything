@@ -11,6 +11,30 @@ const cap = (model = 'restartOnReset', used = 30, extra = {}) => ({ provider: 'c
   known: true, health: 1, windows: [{ name: 'weekly', usedPercent: used, resetsAt: now + 144 * HOUR, lengthHours: 168 }], now, ...extra });
 const plan = (c, opts = {}, config = {}) => planCapacity(c, config, { now, ...opts });
 
+it('restart-on-reset horizon moves scheduled resets after a manual reset; fixed windows retain their schedule', () => {
+  const config = { workingHours: { start: '00:00', end: '24:00', tz: 'UTC', days: [0, 1, 2, 3, 4, 5, 6] } };
+  const start = Date.parse('2026-11-19T00:00:00Z');
+  const c = cap('restartOnReset', 95, { bankedResets: [{ count: 1, expiresAt: '2026-11-21T00:00:00Z' }],
+    windows: [{ usedPercent: 95, resetsAt: start + 12 * HOUR, lengthHours: 48 }] });
+  const run = model => planHorizon({ capacities: [{ ...c, windowModel: model }], config,
+    now: start, days: 4, demandPerDay: 24 }).days.map(d => d.entries[0]);
+  const restarted = run('restartOnReset');
+  expect(restarted[0].bankedConsumed).toHaveLength(1);
+  expect(restarted[0].available).toBe(100);
+  expect(restarted[1].available).toBe(76);
+  expect(restarted[2].available).toBe(100);
+  expect(run('fixed')[0].available).toBe(112);
+});
+
+it('stale, future or malformed Codex rollout timestamps are unknown even when reset is in the future', () => {
+  const providers = PROVIDER_DEFAULTS.providers.map(p => ({ ...p, accounts: undefined, operatorReading: undefined }));
+  for (const at of [now - 7 * HOUR, now + HOUR, 'invalid', Infinity]) {
+    const cs = readProviderCapacity({ now, settings: { providers },
+      readers: { codex: () => ({ at, used_percent: 5, resets_at: now + 120 * HOUR }) } });
+    expect(cs.filter(c => c.provider.startsWith('codex')).every(c => !c.known)).toBe(true);
+  }
+});
+
 describe('per-window-model planner', () => {
   it('Claude 40% with one day of seven left burns at a higher rate', () => {
     const c = cap('fixed', 40); c.windows[0].resetsAt = now + 24 * HOUR;

@@ -2,7 +2,7 @@ import { afterEach, expect, it, vi } from 'vitest';
 import { mkdtempSync, writeFileSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
-import { chooseBuilder } from '../provider-capacity.mjs';
+import { chooseBuilder, readProviderCapacity } from '../provider-capacity.mjs';
 import { DEFAULT_ROUTING_POLICY } from '../dispatch-routing-policy.mjs';
 import { createRoutingPolicyReader, resolveOperationRoute, resolveDispatchRoute } from '../dispatch-routing-policy-io.mjs';
 
@@ -111,4 +111,18 @@ it.each(['fix', 'ci-heal'])('%s dispatch injects settings, quota, capacity and d
 
   options.capacity[0].held = true;
   expect(resolveDispatchRoute(dispatch, options)).toMatchObject({ outcome: 'refused', refusal: expect.stringContaining('no eligible capacity') });
+});
+
+it.each(['fix', 'ci-heal', 'build'])('%s uses shipped capacity defaults and unattributed Claude after Codex rejection', kind => {
+  const now = Date.parse('2026-11-20T15:00:00Z');
+  for (const [used_percent, held] of [[95, false], [99, false], [20, true]]) {
+    const quota = () => ({ at: now, used_percent, resets_at: now + 120 * 3600000 });
+    const capacity = readProviderCapacity({ env: { WE_CAPACITY_READERS: 'off' }, now,
+      readers: { codex: quota, hold: provider => provider === 'codex' && held } });
+    const route = resolveDispatchRoute({ kind, size: 3, scopePaths: ['we:scripts/example.mjs'] }, {
+      env: {}, repo: { routing: { builder: 'auto' } }, routingPolicy: DEFAULT_ROUTING_POLICY,
+      capacity, now, quota, record: () => {}, scorecards: [],
+    });
+    expect(route).toMatchObject({ outcome: 'routed', executed: 'claude' });
+  }
 });

@@ -1,6 +1,6 @@
 import { test } from 'vitest';
 import assert from 'node:assert/strict';
-import { mkdtempSync, writeFileSync, readFileSync, rmSync, mkdirSync } from 'node:fs';
+import { mkdtempSync, writeFileSync, readFileSync, readdirSync, rmSync, mkdirSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { PROVIDER_DEFAULTS, readProviderCapacity, scoreProvider, chooseBuilder, burnWindows, planLine, calendarReset } from './provider-capacity.mjs';
@@ -82,6 +82,43 @@ test('all readers failing preserves historical threshold fallback and repair cha
 test('explicit builders bypass capacity and disabled auto retains threshold', () => {
   assert.equal(effectiveBuilder({ repo: { routing: { builder: 'codex' } }, env: {}, capacity: [], quota: () => { throw Error(); } }).builder, 'codex');
   assert.equal(effectiveBuilder({ repo: { routing: { builder: 'auto', capacity: { enabled: false } } }, env: {}, quota: () => ({ used_percent: 80 }) }).builder, 'claude');
+});
+
+test('shipped capacity defaults fall back to unattributed Claude when Codex is rejected', () => {
+  for (const codex of [cap('codex', 95, 120), cap('codex', 99, 120), cap('codex', 20, 120, { held: true })]) {
+    const capacity = [codex, cap('claude', null, 120)];
+    const options = { repo: { routing: { builder: 'auto' } }, env: {}, platform: {}, capacity, now,
+      quota: () => ({ used_percent: codex.windows[0].usedPercent }), record: () => {} };
+    const selected = effectiveBuilder(options);
+    assert.equal(selected.settings.capacity.claudeUsageAccount, null);
+    assert.equal(selected.builder, 'claude');
+    assert.equal(selected.decision.reason, 'unknown-fallback');
+    const resolved = resolveFixExecutorChain(options);
+    assert.deepEqual(resolved.value, ['claude']);
+    assert.equal(pickChainRung({ chain: resolved.value }).executor, 'claude');
+  }
+});
+
+test('unknown fallback still rejects held, inactive, disallowed and below-tier Claude', () => {
+  for (const extra of [{ held: true }, { active: false }, { allowedKinds: [] }, { tier: -1 }]) {
+    assert.equal(choose([cap('codex', 99, 120), cap('claude', null, 120, extra)]).provider, null);
+  }
+});
+
+test('operator seed only wins against missing or older live Codex readings', () => {
+  const settings = { providers: [{ ...providers[0], operatorReading: {
+    asOf: now - hour, usedPercent: 10, resetsAt: now + 120 * hour } }] };
+  for (const at of [undefined, null, now]) {
+    const live = readProviderCapacity({ now, settings,
+      readers: { codex: () => ({ at, used_percent: 85, resets_at: now + 120 * hour }) } });
+    assert.equal(live[0].windows[0].usedPercent, 85);
+    assert.equal(live[0].windows[0].source, 'live');
+  }
+  for (const raw of [null, { at: now - 2 * hour, used_percent: 85, resets_at: now + 120 * hour }]) {
+    const seeded = readProviderCapacity({ now, settings, readers: { codex: () => raw } });
+    assert.equal(seeded[0].windows[0].source, 'operator');
+    assert.equal(seeded[0].windows[0].usedPercent, 10);
+  }
 });
 test('reserve protects every window until release; security retains access', () => {
   const c = cap('codex', 90, 12);
@@ -180,10 +217,25 @@ test('escalation removes reserve-only, inactive, disallowed and below-minimum ca
     assert.deepEqual(chain([bad, cap('claude', 10, 2)]), ['claude']);
   }
 });
-test('mixed unknown capacity retains main escalation order and never escalates from Claude to Codex', () => {
-  assert.deepEqual(chain([cap('codex', null), cap('claude', 10, 2)]), ['codex', 'codex-alt', 'claude']);
-  assert.equal(pickChainRung({ chain: chain([cap('codex', null), cap('claude', 10, 2)]), trigger: 'stronger-model' }).rung, 'codex-alt');
-  assert.deepEqual(chain([cap('codex', 70, 120), cap('claude', 10, 2)]), ['codex', 'codex-alt', 'claude']);
+test('known Claude winner starts the chain and never escalates back to unknown or lower-scored Codex', () => {
+  assert.deepEqual(chain([cap('codex', null), cap('claude', 10, 2)]), ['claude']);
+  assert.equal(pickChainRung({ chain: chain([cap('codex', null), cap('claude', 10, 2)]), trigger: 'stronger-model' }).rung, 'claude');
+  assert.deepEqual(chain([cap('codex', 70, 120), cap('claude', 10, 2)]), ['claude']);
+});
+
+test('capacity receipt names confine even directly injected account paths and distinguish identities', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'capacity-receipt-'));
+  try {
+    const env = { WE_CAPACITY_LEDGER: join(dir, 'state', 'decisions.jsonl') };
+    const events = [];
+    for (const account of ['../outside', 'nested/account', 'nested\\account', 'account\nother']) {
+      const capacities = [cap('codex', 27, 2, { account })];
+      for (let i = 0; i < 2; i++) recordCapacityDecision({}, { env, now, capacities, emit: event => events.push(event) });
+    }
+    assert.equal(events.length, 4);
+    assert.deepEqual(readdirSync(dir), ['state']);
+    assert.equal(readdirSync(join(dir, 'state')).filter(file => /^capacity-[a-f0-9]{64}$/.test(file)).length, 4);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
 });
 test('critical takeover and send-back refuse when exhausted Claude has been removed', () => {
   const value = chain([cap('codex', 27, 2), cap('claude', 98, 120)]);

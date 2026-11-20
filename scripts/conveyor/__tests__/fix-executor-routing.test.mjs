@@ -13,6 +13,41 @@ import { fixDetachedProvider, fixLauncherAvailable } from '../../operations/disp
 import { dispatchFix, roundEscalationFor, routeFixExecutor } from '../reconcile-fix-dispatch.mjs';
 
 const setting = { value: 'codex-first', source: 'default' };
+it('ordinary fix starts on the capacity winner without escalating from Claude back to Codex', async () => {
+  const { resolveFixExecutorChain } = await import('../../lib/fix-executor-chain.mjs');
+  const now = Date.parse('2026-11-20T15:00:00Z');
+  const capacity = [['codex', 70, 120], ['claude', 10, 2]].map(([provider, usedPercent, hours]) => ({
+    provider, account: provider === 'claude' ? 'claude-a' : provider, health: 1, known: true,
+    windows: [{ usedPercent, resetsAt: now + hours * 3600000, lengthHours: 168 }],
+  }));
+  const chain = resolveFixExecutorChain({ repo: { routing: { builder: 'auto', capacity: { claudeUsageAccount: 'claude-a' } } },
+    platform: {}, env: {}, capacity, now, quota: () => null, record: () => {} });
+  expect(chooseFixExecutor({ setting, chain, launcherAvailable: () => true })).toMatchObject({ executor: 'claude' });
+  expect(chain.value).toEqual(['claude']);
+});
+
+it('main-fix refuses when Claude was filtered from the capacity chain or its launcher is unavailable', () => {
+  for (const value of [[], ['codex', 'codex-alt']]) {
+    expect(chooseFixExecutor({ setting, chain: { value }, mainFix: true, launcherAvailable: () => true }).executor).toBeNull();
+  }
+  expect(chooseFixExecutor({ setting, chain: { value: ['claude'] }, mainFix: true,
+    launcherAvailable: () => false }).executor).toBeNull();
+});
+
+it('ordinary fix starts at argon when the capacity winner is named agy-gemini', async () => {
+  const { resolveFixExecutorChain } = await import('../../lib/fix-executor-chain.mjs');
+  const { PROVIDER_DEFAULTS } = await import('../../lib/provider-capacity.mjs');
+  const now = Date.parse('2026-11-20T15:00:00Z');
+  const providers = PROVIDER_DEFAULTS.providers.map(p => p.id === 'agy-gemini' ? { ...p, allowedKinds: ['fix'] } : p);
+  const capacity = [['codex', 70, 120], ['agy-gemini', 1, 1]].map(([provider, usedPercent, hours]) => ({
+    provider, health: 1, known: true, windows: [{ usedPercent, resetsAt: now + hours * 3600000, lengthHours: 168 }],
+  }));
+  const chain = resolveFixExecutorChain({ repo: { routing: { builder: 'auto' }, providerCapacity: { providers },
+    fixExecutor: { fallbackChain: ['codex', 'argon', 'claude'] } }, platform: {}, env: {}, capacity, now,
+    quota: () => null, record: () => {} });
+  expect(chain.value).toEqual(['argon']);
+  expect(chooseFixExecutor({ setting, chain, launcherAvailable: () => true })).toMatchObject({ executor: 'antigravity', rung: 'argon' });
+});
 describe('fix.executor cascade', () => {
   it.each([
     [{}, setting],

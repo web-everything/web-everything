@@ -9,6 +9,7 @@ export const BUILDERS = Object.freeze(['claude', 'codex', 'auto']);
 /** Dispatch kinds whose code-writing may move off Codex. Review, red-team and audit seats are never in this list. */
 export const BUILD_KINDS = Object.freeze(['prepare', 'prepare-item', 'prepare-complex', 'prepare-card', 'takeover', 'design', 'fix', 'ci-heal', 'build', 'worker', 'doc-fix', 'prevention-card']);
 const DEFAULTS = Object.freeze({ builder: 'codex', auditProvider: 'codex', codexReserveForAudit: true, autoClaudeAbovePercent: 70 });
+const validId = id => typeof id === 'string' && id === id.trim() && /^[a-z][a-z0-9-]*$/.test(id);
 
 export function resolveRoutingSettings({ env = process.env, repo, declared } = {}) {
   const read = repo === undefined ? (declared ?? readDeclaredSettings()) : { settings: repo, errors: [] };
@@ -37,9 +38,10 @@ export function resolveRoutingSettings({ env = process.env, repo, declared } = {
   const providers = cascadePolicy('providerCapacity', read.settings?.providerCapacity, {
     standard: PROVIDER_DEFAULTS, platform: readPlatformPreferences({ env }).prefs.providerCapacity ?? {}, env,
     valid: { providers: value => Array.isArray(value) && value.length <= 100 && new Set(value.map(p => p?.id)).size === value.length
-      && value.every(p => p && /^[a-z][a-z0-9-]*$/.test(p.id) && typeof p.launcher === 'string' && Number.isFinite(p.tier)
+      && value.every(p => p && validId(p.id) && typeof p.launcher === 'string' && Number.isFinite(p.tier)
         && ['fixed', 'restartOnReset', 'rolling'].includes(p.windowModel) && Array.isArray(p.allowedKinds)
-        && Array.isArray(p.windows) && Array.isArray(p.readers) && (!p.accounts || (Array.isArray(p.accounts) && p.accounts.length <= 100))),
+        && Array.isArray(p.windows) && Array.isArray(p.readers) && (!p.accounts || (Array.isArray(p.accounts) && p.accounts.length > 0 && p.accounts.length <= 100
+          && new Set(p.accounts.map(a => a?.id)).size === p.accounts.length && p.accounts.every(a => a && validId(a.id))))),
       minimumTiers: v => Number.isFinite(v) && v >= 0 },
   });
   out.capacity = { ...capacity.value, ...providers.value };

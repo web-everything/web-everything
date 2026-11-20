@@ -67,6 +67,9 @@ export function chooseFixExecutor({ setting = { value: 'codex-first', source: 'd
   if (setting.value === 'claude') return claude('fix.executor=claude');
   if (setting.value === 'provider-routing') return claude('existing provider routing');
   const available = typeof launcherAvailable === 'function' ? launcherAvailable : executor => executor === 'codex' ? launcherAvailable : true;
+  if (chain && entry.mainFix && (!chain.value.includes('claude') || !available('claude'))) {
+    return { executor: null, reason: 'main-fix requires Claude; no eligible capacity or launcher — wait for quota reset or clear provider hold', source: chain.source ?? source };
+  }
   if (chain && setting.value === 'codex-first' && !entry.mainFix) {
     const trigger = entry.takeover ? 'takeover' : entry.rulingNotAddressed ? 'ruling-not-addressed'
       : entry.strongerModel || (entry.round ?? 1) >= 3 ? 'stronger-model' : null;

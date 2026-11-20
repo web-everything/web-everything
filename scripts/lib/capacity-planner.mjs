@@ -134,8 +134,17 @@ export function planHorizon({ capacities, config = {}, demandPerDay = config.exp
       .map(c => ({ at: time(c.at), type: 'banked', expiresAt: c.expiresAt, forfeitPercent: c.forfeitPercent })) ?? [];
     const endHorizon = boundaries[days].at;
     if (w && finite(w.lengthHours) && w.lengthHours > 0) {
-      for (let at = time(w.resetsAt), n = 0; at < endHorizon && n < 1000; at += w.lengthHours * HOUR, n++) {
-        if (at >= now) events.push({ at, type: 'scheduled' });
+      const banked = [...events].sort((a, b) => a.at - b.at);
+      let bankIndex = 0;
+      for (let at = time(w.resetsAt), n = 0; at < endHorizon && n < 1000; n++) {
+        // Restarting a window invalidates its old natural reset. Fixed windows
+        // keep their original calendar even when a banked reset is consumed.
+        if (cap.windowModel === 'restartOnReset' && banked[bankIndex]?.at <= at) {
+          at = banked[bankIndex++].at + w.lengthHours * HOUR;
+        } else {
+          if (at >= now) events.push({ at, type: 'scheduled' });
+          at += w.lengthHours * HOUR;
+        }
       }
     }
     events.sort((a, b) => a.at - b.at);

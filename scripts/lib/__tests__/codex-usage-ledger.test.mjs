@@ -7,6 +7,7 @@ import { appendCodexUsage, readCodexBurnRate, codexUsageLedgerPath, codexRunToke
 import { aggregateCodexUsage, readCodexUsageReport, parseSince, formatCodexUsageReport } from '../../codex-usage-report.mjs';
 import * as procRead from '../proc-read.mjs';
 import * as fs from 'node:fs';
+import { recentCapacityRates } from '../provider-capacity-io.mjs';
 
 // Native ESM namespace exports are non-configurable. Keep real filesystem behavior
 // behind a mock module so spies also observe the ledger's named fs imports.
@@ -28,6 +29,23 @@ function snapshotGit(state = {}) {
 
 const fixture = (fn) => { const root = mkdtempSync(join(tmpdir(), 'codex-ledger-')); return Promise.resolve().then(() => fn(root)).finally(() => rmSync(root, { recursive: true, force: true })); };
 const stdout = `${JSON.stringify({ type: 'turn.completed', usage: { input_tokens: 100, cached_input_tokens: 60, output_tokens: 20, reasoning_output_tokens: 10 } })}\n`;
+
+it('ledger readers enforce their 8 MiB and 256 KiB tail byte limits and offsets', () => fixture(root => {
+  const path = join(root, 'large-ledger.jsonl');
+  writeFileSync(path, '');
+  const size = 9 * 1024 * 1024;
+  truncateSync(path, size);
+  const read = vi.fn((...args) => fs.readSync(...args));
+  const now = Date.parse('2026-11-20T15:00:00Z');
+  readCodexBurnRate({ env: { WE_CODEX_USAGE_LEDGER: path }, now, read,
+    window: { usedPercent: 20, resetsAt: now + 24 * 3600000, lengthHours: 168 } });
+  expect(read).toHaveBeenCalledTimes(1);
+  expect(read.mock.calls[0].slice(2)).toEqual([0, 8 * 1024 * 1024, size - 8 * 1024 * 1024]);
+  read.mockClear();
+  recentCapacityRates(path, now, { read });
+  expect(read).toHaveBeenCalledTimes(1);
+  expect(read.mock.calls[0].slice(2)).toEqual([0, 256 * 1024, size - 256 * 1024]);
+}));
 
 describe('Codex usage ledger', () => {
   it('reuses the central conveyor root and honors the explicit override', () => {
@@ -66,7 +84,8 @@ describe('Codex usage ledger', () => {
     const sessions = join(root, 'sessions', '2026'); mkdirSync(sessions, { recursive: true });
     const event = (id, used, reset) => JSON.stringify({ type: 'event_msg', payload: { type: 'token_count', rate_limits: { limit_id: id, primary: { used_percent: used, resets_at: reset } } } });
     writeFileSync(join(sessions, 'run.jsonl'), `${event('codex', 10, 5)}\n${event('codex', 12, 5)}\n${event('other', 99, 6)}\n`);
-    expect(readCodexQuota({ CODEX_HOME: root })).toEqual({ used_percent: 12, resets_at: 5, at: null });
+    expect(readCodexQuota({ CODEX_HOME: root })).toEqual({ used_percent: 12, resets_at: 5, at: null,
+      mtime: fs.statSync(join(sessions, 'run.jsonl')).mtimeMs });
     expect(readCodexQuota({ CODEX_HOME: join(root, 'missing') })).toBeNull();
   }));
   it('selects the newest rollout containing a Codex bucket', () => fixture(root => {
@@ -76,7 +95,7 @@ describe('Codex usage ledger', () => {
       writeFileSync(path, JSON.stringify({ type: 'event_msg', payload: { type: 'token_count', rate_limits: { limit_id: id, primary: { used_percent: used, resets_at: 5 } } } }) + '\n');
       utimesSync(path, time, time);
     }
-    expect(readCodexQuota({ CODEX_HOME: root })).toEqual({ used_percent: 22, resets_at: 5, at: null });
+    expect(readCodexQuota({ CODEX_HOME: root })).toEqual({ used_percent: 22, resets_at: 5, at: null, mtime: 200000 });
   }));
   it('records successes and failed launches exactly once without altering their result', async () => {
     const rows = []; let time = 100;

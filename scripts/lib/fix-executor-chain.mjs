@@ -3,7 +3,7 @@ import { readFileSync } from 'node:fs';
 import { readDeclaredSettings } from './settings-files.mjs';
 import { cascadePolicy } from './policy-cascade.mjs';
 import { ROUTED_CODEX_MAX_UNPRODUCTIVE } from './fix-slot-borrow.mjs';
-import { scoreProvider } from './provider-capacity.mjs';
+import { capacityEligibility } from './provider-capacity.mjs';
 import { effectiveBuilder } from './routing-settings.mjs';
 
 const rung = (id, executor, policyRoute) => Object.freeze({ id, executor,
@@ -40,7 +40,8 @@ export function resolveFixExecutorChain({ env = process.env, platform = platform
   // To use Codex again set routing.builder=codex (or WE_ROUTING_BUILDER=codex); a chain alone cannot override it.
   const chosen = effectiveBuilder({ env, ...(declared ? { declared } : { repo }), kind: 'fix', capacity, now, quota, records, record });
   if (chosen.decision && chosen.decision.reason !== 'all-readers-unknown') {
-    // Filtering only removes rungs; unknown capacity never changes escalation order.
+    // Remove ineligible rungs, then start at the scored winner. A suffix preserves
+    // escalation direction and cannot send a Claude-started repair back to Codex.
     const kept = [];
     for (const id of result.value) {
       const provider = id === 'argon' ? 'agy-gemini' : id;
@@ -50,12 +51,11 @@ export function resolveFixExecutorChain({ env = process.env, platform = platform
       const eligible = observations.map(c => ({ ...c, ...definition, provider, windows: c.windows, held: c.held,
         active: c.active === false ? false : definition?.active, tier: c.tier ?? definition?.tier,
         allowedKinds: c.allowedKinds ?? definition?.allowedKinds }));
-      const fits = c => c.active !== false && c.allowedKinds?.includes('fix')
-        && Number.isFinite(c.tier) && c.tier >= (chosen.settings.capacity.minimumTiers?.fix ?? 0);
-      if (eligible.some(c => fits(c) && scoreProvider(c, 'fix', { ...chosen.settings.capacity, now }).score !== null)) kept.push(id);
-      else if (eligible.some(c => fits(c) && scoreProvider(c, 'fix', { ...chosen.settings.capacity, now }).label === 'unknown')) kept.push(id);
+      if (eligible.some(c => capacityEligibility(c, 'fix', { ...chosen.settings.capacity, now }).eligible)) kept.push(id);
     }
-    result.value = kept;
+    const winner = chosen.decision.provider === 'agy-gemini' ? 'argon' : chosen.decision.provider;
+    const start = chosen.decision.reason === 'capacity-score' ? kept.indexOf(winner) : -1;
+    result.value = start < 0 ? kept : kept.slice(start);
     result.source += '+capacity';
   } else if (chosen.builder === 'claude') {
     const kept = result.value.filter(id => FIX_EXECUTOR_RUNGS[id].executor !== 'codex');

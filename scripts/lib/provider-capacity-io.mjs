@@ -2,6 +2,7 @@
 import { readFileSync, statSync, mkdirSync, appendFileSync, openSync, closeSync, readSync } from 'node:fs';
 import { join, dirname, isAbsolute } from 'node:path';
 import { homedir } from 'node:os';
+import { createHash } from 'node:crypto';
 import { daemonConveyorStateRoot } from './daemon-last-good.mjs';
 import { readCodexQuota, readCodexBurnRate } from './codex-usage-ledger.mjs';
 import { providerQuotaHold } from './provider-quota-hold.mjs';
@@ -16,12 +17,12 @@ function jsonFile(path) {
   } catch { return null; }
 }
 /** A bounded recent-ledger slope; resets/older windows cannot fabricate positive demand. */
-export function recentCapacityRates(path, now) {
+export function recentCapacityRates(path, now, { read = readSync } = {}) {
   let fd;
   try {
     fd = openSync(path, 'r');
     const size = statSync(path).size, buffer = Buffer.alloc(Math.min(size, 256 * 1024));
-    const bytes = readSync(fd, buffer, 0, buffer.length, size - buffer.length);
+    const bytes = read(fd, buffer, 0, buffer.length, size - buffer.length);
     const lines = buffer.subarray(0, bytes).toString('utf8').split('\n');
     if (size > buffer.length) lines.shift();
     const samples = new Map();
@@ -78,7 +79,8 @@ export function recordCapacityDecision(decision, { env = process.env, now = Date
     append(path, `${JSON.stringify({ at: new Date(now).toISOString(), kind, ...decision })}\n`, { mode: 0o600 });
     for (const window of burnWindows(capacities, { ...settings, now })) {
       // Exclusive create dedupes across processes as well as decisions. One tiny receipt per reset.
-      const receipt = join(dirname(path), `capacity-${window.kind}-${window.provider}-${window.account ?? "default"}-${window.resetsAt}`);
+      const identity = createHash('sha256').update(JSON.stringify([window.kind, window.provider, window.account ?? null, window.resetsAt])).digest('hex');
+      const receipt = join(dirname(path), `capacity-${identity}`);
       try { closeSync(openSync(receipt, 'wx', 0o600)); } catch { continue; }
       try { Promise.resolve(emit({ kind: window.kind, detail: window })).catch(() => {}); } catch { /* best effort */ }
     }
