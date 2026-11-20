@@ -39,11 +39,13 @@ const blocked=content=>{
 };
 
 describe('Forge key structure slice 1',()=>{
-  it('blocks the importable version-2 PKCS#8 key through every admission hook',()=>{
-    const bytes=Buffer.from('302e020102300506032b657004220420'+'01'.repeat(32),'hex');
+  it('blocks version-2 PKCS#8 derived from a usable key through every admission hook',()=>{
+    const bytes=Buffer.from('302e020100300506032b657004220420'+'01'.repeat(32),'hex');
     const privateKey=createPrivateKey({key:bytes,format:'der',type:'pkcs8'});
     const message=Buffer.from('unfamiliar version regression');
     expect(verify(null,message,createPublicKey(privateKey),sign(null,message,privateKey))).toBe(true);
+    // OpenSSL versions differ on importing version 2; the tripwire must block its structure regardless.
+    bytes[4]=2;
     for(const content of [bytes,...Object.values(views).map(encode=>Buffer.from(encode(bytes)))])blocked(content);
   });
   it.each([[2],[127],[0,128],[1,0],[255],[255,127],[0,2]].map(version=>({version})))(
