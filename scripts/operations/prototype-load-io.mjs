@@ -475,7 +475,12 @@ export function createPrototypeLoader({ exec, fs, now, sleep, env, settings, com
         if (targets.length !== 1) return stop('remove-refused', { detail: 'expected-one-registration' });
         const dependents = listed.rows.filter((r) => r.ref !== input.remove &&
           (r.stackBases?.includes(input.remove) || Object.values(r.stackVia || {}).flat().includes(input.remove)));
-        if (dependents.length) return stop('remove-refused', { detail: 'stacked-dependents', dependents: dependents.map((r) => r.ref) });
+        if (dependents.length) {
+          // Share the withdrawal refusal event; this cached path must also alert for hot patches.
+          if (/^hotpatch\/[a-f0-9]{40}$/.test(input.remove))
+            proveOverlayWithdrawal({ root: out.clone, ref: input.remove, env: childEnv, git });
+          return stop('remove-refused', { detail: 'stacked-dependents', dependents: dependents.map((r) => r.ref) });
+        }
         requireGit('fetch', 'origin', `+refs/heads/${input.remove}:refs/remotes/origin/${input.remove}`);
         const tip = requireGit('rev-parse', '--verify', `refs/remotes/origin/${input.remove}^{commit}`);
         if (!validSha(tip)) return stop('remove-refused', { detail: 'invalid-tip' });

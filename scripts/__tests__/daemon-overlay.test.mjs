@@ -646,6 +646,40 @@ describe('stackAwareOverlayCheck', () => {
       stackBases: () => ({ bases: [ref], via: { chain: [ref], ancestry: [] } }),
     })).toMatchObject({ ok: false, reason: 'hot-patch-stack-refused' });
   });
+  it.each(['reader-failure', 'missing-object', 'unknown-result'])('refuses unknown hot-patch independence: %s', async kind => {
+    const hot = `hotpatch/${'a'.repeat(40)}`, candidate = 'b'.repeat(40);
+    const preview = vi.fn().mockResolvedValue({ ok: true, clean: true });
+    const stackBases = opts => findStackBases({ ...opts, run: (cmd, args) => {
+      if (kind === 'reader-failure') throw Error('offline');
+      if (args[0] === 'ls-remote') return { status: 0, stdout: `${candidate}\trefs/heads/lane/c\n${'a'.repeat(40)}\trefs/heads/${hot}\n` };
+      return { status: kind === 'missing-object' ? 128 : null };
+    } });
+    expect(await stackAwareOverlayCheck({ ...options, env: { WE_DAEMON_OVERLAY_STACK_BASES: '{}' },
+      existingOverlays: [{ ref: hot }], preview, stackBases,
+    })).toMatchObject({ ok: false, reason: 'hot-patch-stack-refused' });
+    expect(preview).not.toHaveBeenCalled();
+  });
+
+  it.each(['independent', 'descendant', 'missing-tip', 'chain-reader', 'chain-bound', 'malformed-map'])('checks hot-patch independence with %s evidence', async kind => {
+    const hot = `hotpatch/${'a'.repeat(40)}`, candidate = 'b'.repeat(40);
+    const preview = vi.fn().mockResolvedValue({ ok: true, clean: true });
+    const chain = Object.fromEntries(Array.from({ length: 12 }, (_, i) => [i ? `base-${i}` : 'lane/c', `base-${i + 1}`]));
+    const env = kind === 'chain-reader' ? {} : { WE_DAEMON_OVERLAY_STACK_BASES:
+      kind === 'chain-bound' ? JSON.stringify(chain) : kind === 'malformed-map' ? '{' : '{}' };
+    const stackBases = opts => findStackBases({ ...opts, run: (cmd, args) => {
+      if (cmd === 'gh') return { status: 1 };
+      if (args[0] === 'ls-remote') return { status: 0, stdout:
+        `${candidate}\trefs/heads/lane/c\n${kind === 'missing-tip' ? '' : `${'a'.repeat(40)}\trefs/heads/${hot}\n`}` };
+      return { status: kind === 'descendant' ? 0 : 1 };
+    } });
+    const result = await stackAwareOverlayCheck({ ...options, env,
+      existingOverlays: [{ ref: hot }], preview, stackBases });
+    expect(result).toMatchObject(kind === 'independent' ? { ok: true, clean: true }
+      : { ok: false, reason: 'hot-patch-stack-refused' });
+    expect(preview).toHaveBeenCalledTimes(kind === 'independent' ? 1 : 0);
+    if (kind === 'chain-bound') expect(result.fallback).toContain('NEEDS-YOU');
+  });
+
   it('runs only one preview with no bases', async () => {
     const preview = vi.fn().mockResolvedValue(full);
     const stackBases = vi.fn().mockReturnValue({ bases: [], via });

@@ -179,21 +179,27 @@ export async function withdrawUnregisteredOverlay({ root, ref, tip, actor, reaso
 }
 
 /**
- * Best-effort, read-only stack evidence. Remote tips are checked only against objects already in root;
- * absent objects contribute no ancestry evidence. The explicit chain map suppresses all gh calls.
+ * Read-only stack evidence. With a registered hot patch, missing objects or failed readers
+ * make independence unknown and registration refuses. Other overlays keep best-effort discovery.
+ * The explicit chain map suppresses all gh calls.
  */
 export function findStackBases({
   root, ref, pr = null, existingOverlays, env = process.env, originUrl, run = spawnSync,
 }) {
   const refs = [...new Set(existingOverlays.map(o => o.ref).filter(r => r !== ref))];
   const via = { chain: [], ancestry: [] };
+  const strict = refs.some(r => /^hotpatch\/[a-f0-9]{40}$/.test(r));
+  let unknown = false;
   const invoke = (cmd, args) => {
     try {
-      return run(cmd, args, {
+      const result = run(cmd, args, {
         cwd: root, encoding: 'utf8', timeout: 15_000,
         env: { ...env, GIT_OPTIONAL_LOCKS: '0' },
       }) ?? { status: null };
+      if (result.error || result.status === null || result.status === undefined) unknown = true;
+      return result;
     } catch {
+      unknown = true;
       return { status: null };
     }
   };
@@ -203,7 +209,8 @@ export function findStackBases({
     try {
       const parsed = JSON.parse(env.WE_DAEMON_OVERLAY_STACK_BASES);
       if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) chainMap = parsed;
-    } catch { /* An invalid test map is empty, never a reason to call gh. */ }
+      else unknown = true;
+    } catch { unknown = true; /* Never fall back to gh for an explicit map. */ }
   }
   let head = ref;
   const seen = new Set([ref]);
@@ -216,21 +223,26 @@ export function findStackBases({
         ? ['pr', 'view', String(pr), '--json', 'baseRefName', '--jq', '.baseRefName']
         : ['pr', 'list', '--head', head, '--state', 'open', '--json', 'baseRefName', '--jq', '.[0].baseRefName'];
       const result = invoke('gh', args);
+      if (result.status !== 0 || result.error || typeof result.stdout !== 'string') unknown = true;
       base = result.status === 0 ? result.stdout : null;
     }
+    if (base != null && typeof base !== 'string') unknown = true;
     base = typeof base === 'string' ? base.trim() : '';
-    if (!base || base === 'null' || seen.has(base)) break;
+    if (base && base !== 'null' && !safeRegistrationRef(base)) unknown = true;
+    if (seen.has(base)) { unknown = true; break; }
+    if (!base || base === 'null') break;
     via.chain.push(base);
     if (base === 'main' || base === 'master') break;
     seen.add(base);
     head = base;
+    if (hop === 11) unknown = true;
   }
 
   if (refs.length) {
     let url = originUrl;
     if (!url) {
       const result = invoke('git', ['-C', root, 'remote', 'get-url', 'origin']);
-      url = result.status === 0 ? String(result.stdout ?? '').trim() : null;
+      url = result.status === 0 && !result.error ? String(result.stdout ?? '').trim() : null;
     }
     if (url) {
       const result = invoke('git', ['ls-remote', url, ...[ref, ...refs].map(r => `refs/heads/${r}`)]);
@@ -244,16 +256,23 @@ export function findStackBases({
         if (candidate) {
           for (const base of refs) {
             const tip = tips.get(base);
-            if (tip && invoke('git', ['merge-base', '--is-ancestor', tip, candidate]).status === 0) {
-              via.ancestry.push(base);
+            if (!tip) { unknown = true; continue; }
+            const ancestry = invoke('git', ['merge-base', '--is-ancestor', tip, candidate]);
+            if (ancestry.error || ![0, 1].includes(ancestry.status)) unknown = true;
+            if (ancestry.status === 0) via.ancestry.push(base);
+            if (/^hotpatch\/[a-f0-9]{40}$/.test(base) && tip !== base.slice(9)) {
+              // A moved remote ref cannot hide ancestry of the immutable patch SHA.
+              const pinned = invoke('git', ['merge-base', '--is-ancestor', base.slice(9), candidate]);
+              if (pinned.error || ![0, 1].includes(pinned.status)) unknown = true;
+              if (pinned.status === 0) via.ancestry.push(base);
             }
           }
-        }
-      }
-    }
+        } else unknown = true;
+      } else unknown = true;
+    } else unknown = true;
   }
   const found = new Set([...via.chain, ...via.ancestry]);
-  return { bases: refs.filter(r => found.has(r)), via };
+  return { bases: refs.filter(r => found.has(r)), via, ...(strict ? { unknown } : {}) };
 }
 
 /** Retry a conflicting preview with the candidate's registered bases set aside, like stack-tops rebuild. */
@@ -262,9 +281,19 @@ export async function stackAwareOverlayCheck({
   preview = previewOverlayConflict, stackBases = findStackBases,
 }) {
   const options = { root, ref, pr, existingOverlays, env, originUrl };
-  const { bases, via } = await stackBases(options);
+  const strict = existingOverlays.some(o => /^hotpatch\/[a-f0-9]{40}$/.test(o.ref));
+  let result;
+  try { result = await stackBases(options); } catch (error) {
+    if (!strict) throw error;
+    return { ok: false, reason: 'hot-patch-stack-refused' };
+  }
+  const { bases, via } = result ?? {};
+  if (strict && (result?.unknown !== false || !Array.isArray(bases)
+    || !via || !Array.isArray(via.chain) || !Array.isArray(via.ancestry)))
+    return { ok: false, reason: 'hot-patch-stack-refused',
+      fallback: 'NEEDS-YOU: prove hot-patch independence with readable ancestry or unload it before registering.' };
   const evidence = { stackBases: bases, stackVia: via };
-  if (bases.some(base => /^hotpatch\/[a-f0-9]{40}$/.test(base)))
+  if ([...bases, ...(via?.chain ?? []), ...(via?.ancestry ?? [])].some(base => /^hotpatch\/[a-f0-9]{40}$/.test(base)))
     return { ok: false, reason: 'hot-patch-stack-refused', ...evidence };
   const full = await preview(options);
   if (!full.ok || full.clean || bases.length === 0) return { ...full, ...evidence };
@@ -508,40 +537,21 @@ export function proveOverlayWithdrawal({ root, ref, tip, reason, env = process.e
     return result.stdout.trim();
   };
   const state = readOverlayState(root, { env });
-  if (/^hotpatch\/[a-f0-9]{40}$/.test(ref)) {
-    const dependents = new Set();
-    const others = state.overlays.filter(r => r.ref !== ref);
-    for (const other of others) {
-      try {
-        requireGit('fetch', 'origin', `+refs/heads/${ref}:refs/remotes/origin/${ref}`);
-        requireGit('fetch', 'origin', `+refs/heads/${other.ref}:refs/remotes/origin/${other.ref}`);
-        const ancestry = git('merge-base', '--is-ancestor', tip, `refs/remotes/origin/${other.ref}`);
-        if (ancestry.code !== 1) dependents.add(other.ref);
-      } catch { dependents.add(other.ref); }
-    }
-    // Close over cached dependency edges too, including transitive and unreadable edges.
-    for (let changed = true; changed;) {
-      changed = false;
-      for (const other of others) {
-        const bases = other.stackBases ?? [], via = other.stackVia ?? {};
-        const unknown = !Array.isArray(bases) || typeof via !== 'object' || via === null
-          || !Object.values(via).every(Array.isArray);
-        if (unknown || [...(Array.isArray(bases) ? bases : []), ...Object.values(via || {}).flat()]
-          .some(base => base === ref || dependents.has(base))) {
-          if (!dependents.has(other.ref)) { dependents.add(other.ref); changed = true; }
-        }
-      }
-    }
-    return { action: 'retire', tip, reason, dependents: others.filter(r => dependents.has(r.ref)) };
-  }
+  const refuseDependents = (reason, dependents) => {
+    if (/^hotpatch\/[a-f0-9]{40}$/.test(ref)) appendOverlayEvent(root, {
+      kind: 'needs-you', ref, alert: true, dependents,
+      reason: `NEEDS-YOU: hot-patch withdrawal refused; inspect dependents: ${dependents.join(', ')}. Retain registrations and resolve dependencies manually.`,
+    }, { env });
+    return { action: 'keep', reason };
+  };
   if (state.corrupt) return { action: 'keep', reason: 'stacked-or-unreadable' };
   if (state.overlays.some((r) => r.stackVia !== undefined && (!r.stackVia
     || typeof r.stackVia !== 'object' || Array.isArray(r.stackVia)
     || !Object.values(r.stackVia).every((bases) => Array.isArray(bases) && bases.every(safeRegistrationRef)))))
     return { action: 'keep', reason: 'unreadable-stack-evidence' };
-  const stacked = state.overlays.some((r) => r.ref !== ref && (r.stackBases?.includes(ref)
+  const stacked = state.overlays.filter((r) => r.ref !== ref && (r.stackBases?.includes(ref)
     || Object.values(r.stackVia || {}).flat().includes(ref)));
-  if (stacked) return { action: 'keep', reason: 'stacked-or-unreadable' };
+  if (stacked.length) return refuseDependents('stacked-or-unreadable', stacked.map(r => r.ref));
   const current = requireGit('ls-remote', 'origin', `refs/heads/${ref}`).split(/\s+/)[0];
   // stackBases is only a cache. Re-prove ancestry under the add guard so
   // an uncached or newly registered stack top cannot lose its base.
@@ -555,7 +565,7 @@ export function proveOverlayWithdrawal({ root, ref, tip, reason, env = process.e
     if (!validSha(otherTip)) return { action: 'keep', reason: 'stacked-dependents' };
     const ancestry = git('merge-base', '--is-ancestor', tip, otherTip);
     if (![0, 1].includes(ancestry.code)) throw new Error('ancestry unverifiable; inspect stacked dependents before unloading manually');
-    if (ancestry.code === 0) return { action: 'keep', reason: 'stacked-dependents' };
+    if (ancestry.code === 0) return refuseDependents('stacked-dependents', [other.ref]);
   }
   return { action: 'retire', tip: current, reason };
 }
@@ -590,7 +600,6 @@ export async function retireRegistration({ root, ref, expectedTip, expectedEntry
     if (mode === 'urgent-failed' && (!expectedEntry || expectedEntry.ref !== ref || !/^[a-f0-9]{40}$/.test(expectedTip ?? ''))) return refuse('urgent-snapshot-required');
     if (!entry) return refuse('not-registered');
     if (expectedEntry !== undefined && !isDeepStrictEqual(registrationIdentity(entry), registrationIdentity(expectedEntry))) return refuse('registration-changed');
-    let dependentWithdrawals = [];
     if (mode === 'urgent-failed') {
       let records;
       try { records = await deps.readUrgentLoads?.(); } catch { return refuse('urgent-tracking-unreadable'); }
@@ -648,7 +657,6 @@ export async function retireRegistration({ root, ref, expectedTip, expectedEntry
       try { withdrawal = proveOverlayWithdrawal({ root, ref, tip: expectedTip, reason: 'urgent-failed', env }); }
       catch { return refuse('stacked-or-unreadable'); }
       if (withdrawal.action !== 'retire') return refuse(withdrawal.reason);
-      dependentWithdrawals = withdrawal.dependents ?? [];
     }
     let proof = prove(entry);
     if (proof.action === 'keep' && ['unique-commits-not-on-main', 'pr-open'].includes(proof.reason) && mode === 'urgent-failed') {
@@ -662,15 +670,6 @@ export async function retireRegistration({ root, ref, expectedTip, expectedEntry
     }
     if (proof.action !== 'retire') return refuse('not-proved', { proof });
     if (proof.tip !== expectedTip) return refuse('tip-moved', { proof, tipNow: proof.tip });
-    if (dependentWithdrawals.length) {
-      const unloaded = [];
-      for (const dependent of dependentWithdrawals) {
-        const result = removeOverlay(root, dependent.ref, { env, why: 'hot-patch-base-withdrawn', expectedOverlay: dependent });
-        if (result.removed) unloaded.push(dependent.ref);
-      }
-      appendOverlayEvent(root, { kind: 'hot-patch-dependents-unloaded', ref, dependents: unloaded,
-        alert: true, by, reason: 'Hot-patch base withdrawn; dependent or unverifiable overlays unloaded. Inspect before reloading.' }, { env });
-    }
     addPending(root, env, { kind: 'retire', ref, entry, tip: expectedTip, ...(proof.evidence?.refGone === true ? { refGone: true } : {}), at: new Date().toISOString() });
     let removed;
     try {
@@ -717,6 +716,7 @@ export async function replaceRegistration({ root, ref, old, expectedSha, pr = nu
     if (oldEntry.edgeResolution) return { ok: false, refused: 'replaced-has-edge-resolution', code: 3 };
     const containment = contain();
     if (!containment.ok) return { ok: false, refused: containment.reason, containment, code: containment.reason === 'sha-moved' ? 3 : 1 };
+    if (/^hotpatch\/[a-f0-9]{40}$/.test(old)) return { ok: false, refused: 'hot-patch-stack-refused', containment, code: 1 };
     if (!containment.contained) return { ok: false, refused: 'not-contained', containment, code: 3 };
     const check = await conflictCheck(state.overlays.filter((o) => o?.ref !== old));
     warnSetAside(check);

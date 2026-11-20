@@ -10,7 +10,7 @@ import { tmpdir } from 'node:os';
 import { join, dirname, resolve } from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
-import { retireRegistration, replaceRegistration, settlePendingDrops, readPendingDrops, recoverDrops, inferPrNumber } from '../daemon-overlay.mjs';
+import { retireRegistration, replaceRegistration, settlePendingDrops, readPendingDrops, recoverDrops, inferPrNumber, proveOverlayWithdrawal } from '../daemon-overlay.mjs';
 import { addOverlay, recordEdgeResolution } from '../lib/daemon-overlays.mjs';
 import { planRebuild } from '../lib/daemon-rebuild.mjs';
 
@@ -84,6 +84,17 @@ function fixture() {
 }
 
 describe('daemon-overlay.mjs replace', () => {
+  it('refuses replacing a hot patch with a descendant before excluding the old registration', async () => {
+    const f = fixture(), oldTip = f.push('lane/patch', 'patch.txt', 'patch\n');
+    const old = `hotpatch/${oldTip}`;
+    gitOk(f.author, ['push', '-q', 'origin', `HEAD:refs/heads/${old}`]);
+    addOverlay(f.clone, { ref: old }, { env: f.env });
+    const newTip = f.push('lane/descendant', 'next.txt', 'next\n', `origin/${old}`);
+    const result = await replaceRegistration({ root: f.clone, old, ref: 'lane/descendant', expectedSha: newTip, env: f.env });
+    expect(result).toMatchObject({ ok: false, refused: 'hot-patch-stack-refused' });
+    expect(f.list()).toEqual([old]);
+  });
+
   it('registers the new top and drops the old one when every old commit is contained', () => {
     const f = fixture();
     f.push('lane/old-top', 'a.txt', 'a\n');
@@ -797,22 +808,42 @@ describe('hot-patch retirement decision authorization', () => {
     expect(await retireRegistration(args)).toMatchObject(age ? { retired: true } : { retired: false, refused: 'urgent-decision-required' });
     expect(f.list()).toEqual(age ? [] : [ref]);
   });
-  it('unloads cached transitive dependents and alerts when a hot patch withdraws', async () => {
+  it('refuses hot-patch withdrawal with cached dependents and emits NEEDS-YOU without touching registrations', async () => {
     const { f, args, ref } = retirement('ci-unknown', 31 * 60_000, null);
     addOverlay(f.clone, { ref: 'lane/top', stackBases: [ref] }, { env: f.env });
     addOverlay(f.clone, { ref: 'lane/top-two', stackBases: ['lane/top'] }, { env: f.env });
+    expect(await retireRegistration(args)).toMatchObject({ retired: false });
+    expect(f.list()).toEqual([ref, 'lane/top', 'lane/top-two']);
+    expect(f.events()).toContainEqual(expect.objectContaining({ alert: true, ref,
+      reason: expect.stringContaining('NEEDS-YOU'), dependents: ['lane/top'] }));
+  });
+  it.each([0, 128])('refuses uncached hot-patch dependent or unreadable ancestry without mutation: %i', status => {
+    const { f, ref } = retirement('ci-unknown', 31 * 60_000, null);
+    addOverlay(f.clone, { ref: 'lane/top' }, { env: f.env });
+    const git = (...args) => ({ code: args[0] === 'merge-base' ? status : 0,
+      stdout: args[0] === 'rev-parse' ? other : args[0] === 'ls-remote' ? tip : '' });
+    if (status === 128) expect(() => proveOverlayWithdrawal({ root: f.clone, ref, tip, env: f.env, git })).toThrow('ancestry unverifiable');
+    else {
+      expect(proveOverlayWithdrawal({ root: f.clone, ref, tip, env: f.env, git })).toMatchObject({ action: 'keep', reason: 'stacked-dependents' });
+      expect(f.events()).toContainEqual(expect.objectContaining({ alert: true, dependents: ['lane/top'], reason: expect.stringContaining('NEEDS-YOU') }));
+    }
+    expect(f.list()).toEqual([ref, 'lane/top']);
+  });
+  it.each(['neutral', 'skipped', 'stale', 'failure'])('guarded reread treats completed %s as unknown at 30 minutes', async conclusion => {
+    const { f, args } = retirement('ci-unknown', 30 * 60_000, null);
+    args.deps.readUrgentChecks = () => boundChecks(conclusion);
+    args.deps.readUrgentRequired = () => ['test'];
+    args.deps.readUrgentPr = () => ({ number: 42, state: 'open', merged: false, head: { sha: tip } });
     expect(await retireRegistration(args)).toMatchObject({ retired: true });
     expect(f.list()).toEqual([]);
-    expect(f.events()).toContainEqual(expect.objectContaining({ kind: 'hot-patch-dependents-unloaded', ref,
-      dependents: ['lane/top', 'lane/top-two'] }));
   });
-  it.each(['green', 'red', 'pending'])('refuses ci-unknown when CI is readable now: %s', async verdict => {
+  it.each(['green', 'pending'])('refuses ci-unknown when CI is successful or pending now: %s', async verdict => {
     const { f, args, ref } = retirement('ci-unknown', 31 * 60_000, null);
     args.deps.readUrgentRequired = () => ['test'];
     args.deps.readUrgentPr = () => ({ number: 42, state: 'open', merged: false, head: { sha: tip } });
     args.deps.readUrgentChecks = () => ({ total_count: 1, check_runs: [{ id: 81, name: 'test', head_sha: tip,
       app: { id: 15368 }, check_suite: { id: 7 }, status: verdict === 'pending' ? 'queued' : 'completed',
-      conclusion: verdict === 'pending' ? null : verdict === 'red' ? 'failure' : 'success' }],
+      conclusion: verdict === 'pending' ? null : 'success' }],
       workflows: { total_count: 1, workflow_runs: [{ check_suite_id: 7, head_sha: tip, path: '.github/workflows/ci.yml' }] } });
     expect(await retireRegistration(args)).toMatchObject({ retired: false, refused: 'urgent-decision-required' });
     expect(f.list()).toEqual([ref]);

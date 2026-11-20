@@ -39,6 +39,14 @@ export function hotPatchCiEvidence(data, sha, required) {
   validateChecks(data, sha);
   if (!Array.isArray(required) || !required.includes('test') || required.some(n => typeof n !== 'string' || !n))
     throw Error('unreadable required CI jobs');
+  const latest = new Map();
+  for (const c of data.check_runs) {
+    const key = JSON.stringify([c.app.id, c.check_suite?.id, c.name]);
+    if (!latest.has(key) || c.id > latest.get(key).id) latest.set(key, c);
+  }
+  if ([...latest.values()].some(c => c.app.id === TEST_CHECK_APP_ID
+    && c.status === 'completed' && c.conclusion !== 'success'))
+    throw Error('unknown hot-patch CI conclusion; inspect checks or unload manually');
   if (!testWorkflowBound(testCheckEvidence(data, sha), data.workflows, sha, data.testWorkflowPath))
     throw Error('unreadable hot-patch CI binding');
 }

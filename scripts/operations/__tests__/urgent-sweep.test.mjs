@@ -1033,6 +1033,13 @@ describe('hot-patch sweep (R1100)', () => {
     expect(f.d.remove).not.toHaveBeenCalled();
     expect(f.d.escalate).toHaveBeenCalled();
   });
+  it.each(['neutral', 'skipped', 'stale'])('unloads completed %s as unknown after 30 minutes', async conclusion => {
+    const f = hotFixture([check('test', conclusion)]);
+    f.d.now = () => new Date(Date.parse(load.at) + 30 * 60_000).toISOString();
+    decisionBeforeRemoval(f, 'ci-unknown');
+    expect(await f.run()).toMatchObject({ results: [{ status: 'unloaded-pending-adoption' }] });
+    expect(f.d.remove).toHaveBeenCalledTimes(1);
+  });
   it('unloads pending CI after 31 minutes when PR evidence is unreadable', async () => {
     const f = hotFixture([check('test', null, { status: 'in_progress' })]);
     f.d.pr.mockImplementation(() => { throw Error('PR unavailable'); });
