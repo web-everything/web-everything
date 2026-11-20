@@ -939,3 +939,152 @@ it('a new listed head bypasses the refusal memo and carries the new head identit
   expect(sweepAuthorStamps(seams)[0].headSha).toBe(headRefOid);
   expect(seams.readEdits).toHaveBeenCalledTimes(2);
 });
+
+describe('planStampRestore — #7227 full-body edit dropped the stamp', () => {
+  const prBody = 'A hot-patch uses an immutable `hotpatch/<sha>` ref.\n\n<!-- pr-size:begin -->\n<!-- size-admission:29899b -->\n<!-- pr-size:end -->';
+  const dropped = () => [
+    edit(BODY, 'chalbert', '2026-11-20T19:22:58Z'),
+    edit(`${prBody}\n\n${buildAuthorActorMarker(ID)}`, AUTHOR, '2026-11-20T18:39:58Z'),
+  ];
+  it('restores when snapshots carry backticked placeholder text and non-stamp size comments', () => {
+    expect(plan({ edits: dropped() })).toMatchObject({ action: 'restore', id: ID });
+  });
+  it('refuses (blunt bracket rule) a balanced one-line markdown link in the snapshot', () => {
+    const edits = [edit(`${prBody}\nGenerated with [Claude Code](https://claude.com/claude-code)\n${buildAuthorActorMarker(ID)}`)];
+    expect(plan({ edits })).toMatchObject({ action: 'refuse' });
+  });
+  it('still refuses a backtick on a comment line (not code)', () => {
+    const edits = [edit(`${prBody}\n<!-- \`x\` -->\n${buildAuthorActorMarker(ID)}`)];
+    expect(plan({ edits })).toMatchObject({ action: 'refuse' });
+  });
+  it('refuses an earlier stamp by a different login', () => {
+    const edits = [edit(BODY, 'chalbert', '2026-11-20T19:22:58Z'),
+      edit(`${prBody}\n\n${buildAuthorActorMarker(ID)}`, 'mallory', '2026-11-20T18:39:58Z', 'User')];
+    expect(plan({ edits })).toMatchObject({ action: 'refuse' });
+  });
+  it('refuses a history whose stamp content was altered between snapshots', () => {
+    const edits = [edit(`${prBody}\n\n${buildAuthorActorMarker(OTHER)}`, AUTHOR, '2026-11-20T19:00:00Z'),
+      edit(`${prBody}\n\n${buildAuthorActorMarker(ID)}`, AUTHOR, '2026-11-20T18:39:58Z')];
+    expect(plan({ edits })).toMatchObject({ action: 'refuse' });
+  });
+  it('marks lost, never restores, with no earlier stamped snapshot', () => {
+    expect(plan({ edits: [edit(prBody)] })).toMatchObject({ action: 'mark-lost' });
+  });
+  it('refuses arbitrary comments and multiline link destinations', () => {
+    for (const text of ['<!-- anything -->', '[text](\n`<div>`\n)']) {
+      expect(plan({ edits: [edit(`${text}\n${buildAuthorActorMarker(ID)}`)] })).toMatchObject({ action: 'refuse' });
+    }
+  });
+});
+
+describe('planStampRestore — marker inside a markdown link title is not a stamp (R10)', () => {
+  const m = () => buildAuthorActorMarker(ID);
+  it.each([
+    ['multiline reference-link title', `[ref]: https://example.test "title\n${'MARK'}\nend"`],
+    ['reference-link title on the next line', `[ref]: https://example.test\n"title\n${'MARK'}\nend"`],
+    ['multiline inline-link title', `[text](https://example.test "title\n${'MARK'}\nend")`],
+    ['single-line title', `[ref]: https://example.test "title ${'MARK'}"`],
+    ['title closed only by an escaped quote', `[x](https://example.test "title\\")\n\`<path>\`\n${'MARK'}\nend")`],
+    ['second title on a line left open', `[a](https://example.test "ok") [b](https://example.test "open )\n\`<path>\`\n${'MARK'}\nend")`],
+    ['backtick span', `\`\n${'MARK'}\n\``],
+  ])('refuses a marker in a %s', (_n, tpl) => {
+    expect(plan({ edits: [edit(tpl.replace('MARK', m()))] })).toMatchObject({ action: 'refuse' });
+  });
+  it('refuses (blunt bracket rule) beside a closed reference definition', () => {
+    expect(plan({ edits: [edit(`[ref]: https://example.test "title"\n${m()}`)] })).toMatchObject({ action: 'refuse' });
+  });
+});
+
+describe('reference titles containing inline code cannot supply author stamps', () => {
+  const snapshot = (open = '"', close = '"', newline = '\n', nextLine = true) =>
+    `[ref]: https://example.test${nextLine ? newline : ' '}${open}${newline}\`<div>\`${newline}${buildAuthorActorMarker(ID)}${newline}${close}${newline}${newline}[ref]`;
+
+  it.each([
+    ['double quote on next line', '"', '"', '\n', true],
+    ['double quote on definition line', '"', '"', '\n', false],
+    ['single quote on next line', "'", "'", '\n', true],
+    ['single quote on definition line', "'", "'", '\n', false],
+    ['parenthesis on next line', '(', ')', '\n', true],
+    ['parenthesis on definition line', '(', ')', '\n', false],
+    ['four-space indented title', '    "', '    "', '\n', true],
+    ['tab-indented title', '\t"', '\t"', '\n', true],
+    ['mixed indentation and CR-only lines', ' \t   "', ' \t   "', '\r', true],
+    ['CRLF title', '"', '"', '\r\n', true],
+  ])('refuses a same-author marker inside a %s', (_name, open, close, newline, nextLine) => {
+    const result = planStampRestore({ state: 'OPEN', body: 'Current description', authorLogin: 'alice',
+      edits: [edit(snapshot(open, close, newline, nextLine), 'alice', '2026-11-20T10:00:00Z', 'User')] });
+    expect(result).toMatchObject({ action: 'refuse', reason: expect.stringMatching(/unsupported HTML edit snapshot/) });
+  });
+
+  it('refuses through the restoration write path without promoting a title marker', () => {
+    const seams = io({ readPr: vi.fn(() => ({ state: 'OPEN', body: 'Current description', author: { login: 'alice' } })),
+      readEdits: vi.fn(() => [edit(snapshot(), 'alice', '2026-11-20T10:00:00Z', 'User')]) });
+    expect(restoreAuthorStamp(seams)).toMatchObject({ action: 'refuse' });
+    expect(seams.writeBody).not.toHaveBeenCalled();
+  });
+
+  it('refuses an indented title through the restoration write path', () => {
+    const seams = io({ readEdits: vi.fn(() => [edit(snapshot('    "', '    "'))]) });
+    expect(restoreAuthorStamp(seams)).toMatchObject({ action: 'refuse' });
+    expect(seams.writeBody).not.toHaveBeenCalled();
+  });
+
+  it('refuses title HTML even when no marker was found, rather than recording stamp-lost', () => {
+    expect(plan({ edits: [edit(snapshot().replace(buildAuthorActorMarker(ID), 'Example title text'))] }))
+      .toMatchObject({ action: 'refuse', reason: expect.stringMatching(/unsupported HTML edit snapshot/) });
+  });
+
+  it('refuses an indented multiline title marker even without HTML or backticks', () => {
+    expect(plan({ edits: [edit(snapshot('    "', '    "').replace('`<div>`', 'Example title text'))] }))
+      .toMatchObject({ action: 'refuse' });
+  });
+
+  it('refuses (blunt bracket rule) a marker below a completed indented reference title', () => {
+    expect(plan({ edits: [edit(`[ref]: https://example.test\n    "title"\n\n${buildAuthorActorMarker(ID)}`)] }))
+      .toMatchObject({ action: 'refuse' });
+  });
+});
+
+describe('planStampRestore — any bracket refuses a marker (judge R10 round 2)', () => {
+  const m = () => buildAuthorActorMarker(ID);
+  it.each([
+    ['second link multiline title', `[a](https://example.test "closed") [b "](https://example.test "open )\n\`<div>\`\nMARK\nend")`],
+    ['escaped-bracket reference label', '[a\\[b\\]c]: https://example.test "t\n`<div>`\nMARK\nend"'],
+    ['title on line after URL-only definition', '[ref]: https://example.test\n"t\n`<div>`\nMARK\nend"'],
+    ['quote-cancel inline link', '[x](https://example.test/" "title )\n`<div>`\nMARK\nend")'],
+    ['plain link beside marker', `[Author's guide](https://example.test)\nMARK`],
+  ])('refuses a marker with brackets: %s', (_n, tpl) => {
+    expect(plan({ edits: [edit(tpl.replace('MARK', m()))] })).toMatchObject({ action: 'refuse' });
+  });
+  it.each([
+    ['paren prose across lines', 'Intro\n(see below\nmore)\nMARK'],
+    ['quoted prose across lines', 'He said:\n"hello\nworld"\nMARK'],
+  ])('bracket-free prose still restores: %s', (_n, tpl) => {
+    expect(plan({ edits: [edit(tpl.replace('MARK', m()))] })).toMatchObject({ action: 'restore', id: ID });
+  });
+});
+
+describe('restoreAuthorStamp — second link title cannot supply a stamp', () => {
+  // A closed first title and a quote in the second label fooled snapshot-wide quote counting.
+  const snapshot = '[a] (https://example.test "closed") [b "] (https://example.test "open )\n`<div>`\n'
+    + buildAuthorActorMarker(ID) + '\nend")';
+
+  it.each([
+    ['reported payload', snapshot],
+    ['CRLF lines', snapshot.replaceAll('\n', '\r\n')],
+    ['CR lines', snapshot.replaceAll('\n', '\r')],
+    ['Unicode line separators', snapshot.replaceAll('\n', '\u2028')],
+    ['single-quoted titles', snapshot.replaceAll('"', "'")],
+    ['marker without HTML or inline code', snapshot.replace('`<div>`\n', '')],
+    ['HTML entities in title text', snapshot.replace('`<div>`', '&lt;div&gt;')],
+  ])('refuses %s without writing a promoted title marker', (_name, diff) => {
+    const seams = io({
+      readPr: vi.fn(() => ({ state: 'OPEN', body: 'Current description', author: { login: 'alice' } })),
+      readEdits: vi.fn(() => [edit(diff, 'alice', '2026-11-20T10:00:00Z', 'User')]),
+    });
+
+    expect(restoreAuthorStamp(seams)).toMatchObject({ action: 'refuse', contentRefusal: true });
+    expect(seams.readEdits).toHaveBeenCalledTimes(1);
+    expect(seams.writeBody).not.toHaveBeenCalled();
+  });
+});
