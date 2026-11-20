@@ -3045,7 +3045,7 @@ export async function runUnderAdmission({
   kind = null, command, cwd = process.cwd(), exec = defaultExec, log = (m) => process.stderr.write(m),
   now = () => Date.now(), sleep = (ms) => new Promise((r) => setTimeout(r, ms)),
   bypass = null, env = process.env, policy = loadAdmissionPolicy({ env }), waitMs = 0, waitSource = 'standard', location = null,
-  runCeilingMs = 0,
+  runCeilingMs = 0, hostAdmission,
 }) {
   if (wholeSuiteRefused({ command, policy, env, log })) return { exitCode: 125 };
   // The child always runs with the re-entrancy flag, so anything it runs that is itself wrapped passes through.
@@ -3067,7 +3067,7 @@ export async function runUnderAdmission({
   // `WE_HEAVY_ADMISSION=off` check apply to the `run` wrapper's wait too, not just this function's own messages.
   // Card xkyw1x4 — the kind is read off the wrapped command itself unless the caller names it.
   const runKind = kind ?? classifyAdmissionCommandKind(command, env);
-  const admission = await acquireSlotBlocking({ lockRoot, cap, owner, lane, num, repo, kind: runKind, command, ceilingMs, leaseMinutes, now, sleep, log, env, policy, canDefer: true, waitMs, waitSource, location });
+  const admission = await acquireSlotBlocking({ lockRoot, cap, owner, lane, num, repo, kind: runKind, command, ceilingMs, leaseMinutes, now, sleep, log, env, policy, canDefer: true, waitMs, waitSource, location, hostAdmission });
   if (admission.deferred) return { exitCode: ADMISSION_DEFERRED_EXIT, admission };
   if (admission.timedOut) {
     log(`⚠ heavy-command admission: timed out after ${admission.waitedMs}ms waiting for capacity (cap=${cap}) — proceeding unslotted.\n`);
@@ -3133,7 +3133,7 @@ function parseFlags(argv) {
 }
 
 // @test-only-export-ok: exercise CLI routing through the real decision before slot acquisition.
-export async function main(argv, { remoteExec, readTelemetry } = {}) {
+export async function main(argv, { remoteExec, readTelemetry, hostAdmission } = {}) {
   // `run`'s command tail lives after a literal `--` and must never be parsed as this CLI's OWN flags (a
   // `--coverage` meant for the wrapped command would otherwise be read as a flag of THIS script).
   const dashDashIdx = argv.indexOf('--');
@@ -3388,7 +3388,7 @@ export async function main(argv, { remoteExec, readTelemetry } = {}) {
         }
       }
     }
-    const runOpts = { lockRoot, cap, owner, policy, lane: lane ?? (/lane-(\d+)/.exec(repo) || [])[1] ?? null, num, repo, ceilingMs, command, cwd: repo, bypass, kind: typeof flags.kind === 'string' ? flags.kind : null, waitMs, waitSource, runCeilingMs, ...(forceLocal ? { location: 'local' } : {}) };
+    const runOpts = { lockRoot, cap, owner, policy, lane: lane ?? (/lane-(\d+)/.exec(repo) || [])[1] ?? null, num, repo, ceilingMs, command, cwd: repo, bypass, kind: typeof flags.kind === 'string' ? flags.kind : null, waitMs, waitSource, runCeilingMs, hostAdmission, ...(forceLocal ? { location: 'local' } : {}) };
     if (useContainer) runOpts.exec = (cmd, o) => execContainerized(cmd, { ...o, nodeModulesVolume: useNodeModulesVolume });
     // A bypass (CI pass-through, held re-entry, admission off) takes no slot and records no duration, so it needs no reason.
     if (!remoteDecided && !bypass) recordLocalReason({ lockRoot, reason: localReasonFor({ useContainer, forceLocal, bypass, decisionReason: localDecisionReason }), detail: localDecisionReason, cwd: repo ?? process.cwd(), argv: argv.slice(dashDashIdx + 1), env: process.env, clock: Date.now });

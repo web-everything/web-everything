@@ -4,6 +4,7 @@ import * as realFs from 'node:fs';
 import { spawnSync as realSpawn } from 'node:child_process';
 import { hostname, homedir, tmpdir } from 'node:os';
 import { join, dirname, resolve, delimiter } from 'node:path';
+import { defaultPoolRoot } from '../lib/lane-pool-paths.mjs';
 import { ciUnitPlan, ciGatePlan, urgentLedger, urgentKeyPath, urgentSignature, normalizeUrgentRepo, urgentFuiRepo, canonicalFuiRepo } from './urgent-verify-marker.mjs';
 
 const worktreePrefix = '.urgent-verify-';
@@ -23,15 +24,21 @@ export function createUrgentDeps({ cwd = process.cwd(), home = homedir(), fs = r
   // Appended (not prepended) so checkout-local binaries can never shadow system git/sh/npm.
   const systemPath = childEnv.PATH ?? '';
   childEnv.PATH = [childEnv.PATH, ...binDirs].filter(Boolean).join(delimiter);
+  // Resolve before changing HOME or cwd; ~/ overrides and relative paths belong to the caller.
+  const admissionPool = resolve(cwd, defaultPoolRoot(cwd, env));
   const run = (cmd, args, dir = cwd) => {
     // Checkout-local bins only for the admission wrapper that runs vitest/npm; git, gh and plain node calls
     // (which decide trust, e.g. the FUI origin) get the system PATH so a local replacement cannot shadow them.
     // Checkout code (the wrapper's children) gets the throwaway HOME, never the real one that holds the signing key.
     const wrapper = String(args[0]).endsWith('heavy-admission.mjs');
-    const env = wrapper ? { ...childEnv, ...(stepHome ? { HOME: stepHome, npm_config_cache: join(home, '.npm') } : {}) } : { ...childEnv, PATH: systemPath };
+    const env = wrapper ? { ...childEnv, LANE_POOL_ROOT: admissionPool, ...(stepHome ? { HOME: stepHome, npm_config_cache: join(home, '.npm') } : {}) } : { ...childEnv, PATH: systemPath };
     const r = spawnSync(cmd, args, { cwd: dir, env, encoding: 'utf8', timeout: 4 * 60 * 60_000, maxBuffer: 16 * 1024 * 1024 });
     if (r.error || r.status !== 0) {
-      const tail = String(r.stderr ?? '').split(/\r?\n/).filter(Boolean).slice(-20).join('\n');
+      const bytes = Buffer.from(String(r.stderr ?? '').split(/\r?\n/).filter(Boolean).slice(-20).join('\n'));
+      let start = Math.max(0, bytes.length - 8192);
+      // Keep a suffix of at most 8 KiB without splitting a UTF-8 character.
+      for (; start < bytes.length && (bytes[start] & 0xc0) === 0x80; start++) { /* continuation byte */ }
+      const tail = bytes.subarray(start).toString('utf8');
       const err = new Error(`urgent-verify subprocess failed or admission unavailable (exit ${r.status ?? r.error?.code ?? 'unknown'}): ${cmd} ${args.join(' ')}`);
       err.failure = { cmd: [cmd, ...args].join(' ').slice(0, 300), exit: r.status ?? null, error: r.error ? String(r.error.message ?? r.error) : undefined, stderrTail: tail };
       throw err;
@@ -58,16 +65,22 @@ export function createUrgentDeps({ cwd = process.cwd(), home = homedir(), fs = r
     }
     const dir = join(parent, `${worktreePrefix}${sha.slice(0, 12)}-${process.pid}`);
     const stepHome = fs.mkdtempSync(join(tmpdir(), 'urgent-step-home-'));
-    const cleanup = () => { try { fs.rmSync(stepHome, { recursive: true, force: true }); fs.rmSync(dir, { recursive: true, force: true }); } catch (e) { console.error(`urgent-verify: checkout cleanup failed: ${e.message}`); } };
+    const resetCheckout = () => fs.rmSync(dir, { recursive: true, force: true });
+    const cleanup = () => {
+      for (const path of [stepHome, dir]) {
+        try { fs.rmSync(path, { recursive: true, force: true }); }
+        catch (e) { console.error(`urgent-verify: cleanup failed: ${e.message}`); }
+      }
+    };
     try {
       const origin = run('git', ['remote', 'get-url', 'origin']).trim();
       const objects = join(run('git', ['rev-parse', '--path-format=absolute', '--git-common-dir']).trim(), 'objects');
-      cleanup();
+      resetCheckout();
       run('git', ['init', '-q', dir]);
       run('git', ['remote', 'add', 'origin', origin], dir);
       fs.writeFileSync(join(dir, '.git/objects/info/alternates'), `${objects}\n`);
       run('git', ['checkout', '-q', '--detach', sha], dir);
-      const scoped = createUrgentDeps({ cwd: dir, home, fs, spawnSync, env, isolated: false, stepHome });
+      const scoped = createUrgentDeps({ cwd: dir, home, fs, spawnSync, env: { ...env, LANE_POOL_ROOT: admissionPool }, isolated: false, stepHome });
       if (scoped.head() !== sha) throw new Error('isolated checkout not at requested sha');
       return { deps: decorate ? decorate(scoped, dir) : scoped, cleanup };
     } catch (e) { cleanup(); throw e; }
@@ -179,24 +192,27 @@ export async function urgentVerify({ sha }, deps = createUrgentDeps({ isolated: 
       return { ok: false, detail: 'clean-checkout-at-sha-required', fallback };
     const plan = deps.plan(), startedAt = deps.now(), repo = deps.repo(), steps = [];
     if (!repo) throw new Error('unreadable origin remote');
-    let result = 'green', fuiSha, fuiRepo, failure;
+    let result = 'green', fuiSha, fuiRepo, failure, currentStep = 'guard-signing';
     // Stop on failure, including queue exhaustion: no admission polling or retry loop.
     try {
       if (iso) guard = deps.guardSigning?.();
-      steps.push('fetch-main-history');
+      currentStep = 'fetch-main-history'; steps.push(currentStep);
       await deps['fetch-main-history'](); intact();
+      currentStep = 'verify-fui';
       const fui = await deps.verifyFui();
       fuiSha = fui.sha; fuiRepo = fui.repo;
       if (fuiRepo !== urgentFuiRepo) throw new Error('untrusted FUI origin');
-      for (const step of ['install-fui', 'install']) { steps.push(step); await deps[step](); intact(); }
-      for (const shard of plan) { steps.push(`unit:${shard.group ?? 'unit'}:${shard.shard}`); await deps.shard(shard); intact(); }
-      for (const step of ['coverage', 'hostPaths', 'integration', 'standards']) { steps.push(step); await deps[step](); intact(); }
+      for (const step of ['install-fui', 'install']) { currentStep = step; steps.push(step); await deps[step](); intact(); }
+      for (const shard of plan) { currentStep = `unit:${shard.group ?? 'unit'}:${shard.shard}`; steps.push(currentStep); await deps.shard(shard); intact(); }
+      for (const step of ['coverage', 'hostPaths', 'integration', 'standards']) { currentStep = step; steps.push(step); await deps[step](); intact(); }
+      currentStep = 'verify-checkout-final';
       if (!deps.clean() || deps.head() !== sha) throw new Error('checkout changed');
+      currentStep = 'verify-fui-final';
       const finalFui = await deps.verifyFui({ sha: fuiSha, repo: fuiRepo });
       if (finalFui.sha !== fuiSha || finalFui.repo !== fuiRepo) throw new Error('FUI sibling changed');
     } catch (e) {
       result = 'red';
-      failure = { step: steps.at(-1), message: String(e?.message ?? e), ...(e?.failure ?? {}) };
+      failure = { step: currentStep, message: String(e?.message ?? e), ...(e?.failure ?? {}) };
       console.error(`urgent-verify RED at step ${failure.step}: ${failure.message}${failure.stderrTail ? `\n${failure.stderrTail}` : ''}`);
     }
     guard?.release(); // the parent alone reads the key and appends, after every step has finished
