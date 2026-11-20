@@ -48,9 +48,10 @@ export function evaluateStuck({ now, prs, logs, claims } = {}) {
     if (dead.length) add('R-c', 'D', dead.map(c => ({ at: stamp,
       line: `${c.kind} claim holder ${clean(c.holder)} live=false` })));
     // Capacity chatter is not a review run state. Bind both sides to the live head.
-    const states = review.filter(r => /review:(?:human|pending|accepted|changes)\b|review-status[:= ]+\w+/.test(r.line));
+    const states = review.filter(r => headBound(r.line, pr.headSha)
+      && /review:(?:human|pending|accepted|changes)\b|review-status[:= ]+\w+/.test(r.line));
     const latest = states.at(-1);
-    if (latest && pending(latest.line) && headBound(latest.line, pr.headSha)
+    if (latest && pending(latest.line)
       && (pr.labels.includes('review:accepted') || review.some(r => headBound(r.line, pr.headSha)
         && /clear-human|review:accepted/.test(r.line)))) add('R-d', 'B', [latest]);
     for (const rows of [fix, drain, review]) {

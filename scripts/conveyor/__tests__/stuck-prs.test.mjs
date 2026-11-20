@@ -1,11 +1,11 @@
 // @vitest-environment node
 import { test } from 'vitest';
 import assert from 'node:assert/strict';
-import { mkdtempSync, writeFileSync, rmSync, readFileSync } from 'node:fs';
+import { mkdtempSync, writeFileSync, rmSync, readFileSync, mkdirSync, utimesSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { evaluateStuck } from '../pass-daemons/stuck-rules.mjs';
-import { readLogTail, runStuckCli, emitNewCauses } from '../stuck-prs.mjs';
+import { readLogTail, runStuckCli, emitNewCauses, collectClaims } from '../stuck-prs.mjs';
 
 // Daemon lines captured in sweep2/{7204,7042,7171,7112}.txt (operator why truncates them).
 const drain = '[drain-daemon] 2026-11-20T16:11:37.513Z enqueue-on-event: catch-up #7204 catch-up, check_suite.completed=success — not woken: 1 check(s) still running (red-team';
@@ -68,6 +68,27 @@ test('R-d negative: captured #7112 capacity/unbound human, stale head, no accept
     assert.deepEqual(rule(evaluate([pr(7112, ['review:accepted'])], { review: lines.map(l => row(l)) }), 'R-d'), []);
   assert.deepEqual(evaluate([pr(7112)], { review: [row(`${human} head=${sha}`)] }), []);
 });
+test('R-d: later old-head acceptance cannot hide current-head pending', () => {
+  const review = [row(`${human} head=${sha}`),
+    row(`review-daemon: #7112 review:accepted head=${'b'.repeat(40)}`, now)];
+  assert.equal(rule(evaluate([pr(7112, ['review:accepted'])], { review }), 'R-d').length, 1);
+});
+test('R-c collector: only successfully listed sessions and claims older than ten minutes prove death', () => {
+  const stamp = Date.parse(now), meta = { repo: 'web-everything', pr: 7171, kind: 'fix', who: 'fix-7171' };
+  const collect = (claim, readAgents = () => []) => collectClaims(() => {}, {
+    listClaims: () => [{ meta, ...claim }], readAgents, now: () => stamp,
+  })[0].live;
+  for (const mtimeMs of [stamp, stamp - 600000, stamp + 1])
+    assert.equal(collect({ mtimeMs }), null);
+  assert.equal(collect({}), null);
+  assert.equal(collect({ meta: { ...meta, claimedAt: 'bad' } }), null);
+  assert.equal(collect({ mtimeMs: stamp - 600001 }), false);
+  assert.equal(collect({ meta: { ...meta, claimedAt: at } }), false);
+  assert.equal(collect({ mtimeMs: stamp, meta: { ...meta, claimedAt: at } }), null);
+  for (const readAgents of [() => { throw Error('unreadable'); }, () => ({ invalid: true })])
+    assert.equal(collect({ mtimeMs: stamp - 600001 }, readAgents), null);
+  assert.equal(collect({ mtimeMs: stamp }, () => [{ name: 'fix-7171', state: 'working' }]), true);
+});
 test('R-e: three captured same-daemon refusals ignore timestamps and seq numbers', () => {
   const lines = [1, 2, 3].map(n => row(`${nothing} seq ${n}`, new Date(Date.parse(at) + n).toISOString()));
   assert.equal(rule(evaluate([pr(7042)], { fix: lines }), 'R-e')[0].cause, 'E');
@@ -95,6 +116,26 @@ test('R-a known head-moved cause A and unknown reason NEW; independent evidence 
   assert.equal(evaluateStuck(input)[0].cause, 'NEW'); assert.equal(JSON.stringify(input), original);
 });
 const scratch = fn => { const dir = mkdtempSync(join(tmpdir(), 'stuck-prs-')); return Promise.resolve().then(() => fn(dir)).finally(() => rmSync(dir, { recursive: true, force: true })); };
+test('claim file mtime protects new claims; missing/corrupt claim files are unknown to the CLI', () => scratch(async dir => {
+  const claimDir = join(dir, 'claim'), file = join(claimDir, 'lock.json');
+  mkdirSync(claimDir);
+  writeFileSync(file, JSON.stringify({ owner: 'fixer', heartbeatAt: at,
+    meta: { repo: 'web-everything', pr: 7171, kind: 'fix', who: 'fix-7171', claimedAt: at } }));
+  const opts = { claimRoot: dir, readAgents: () => [], now: () => Date.parse(now) };
+  utimesSync(file, new Date(now), new Date(now));
+  assert.equal(collectClaims(() => {}, opts)[0].live, null);
+  utimesSync(file, new Date(at), new Date(at));
+  assert.equal(collectClaims(() => {}, opts)[0].live, false);
+  for (const corrupt of [false, true]) {
+    if (corrupt) writeFileSync(file, 'bad JSON'); else rmSync(file);
+    const warnings = [];
+    const output = JSON.parse(await runStuckCli(['--json'], { readPrs: () => [],
+      readLogs: () => ({ fix: [], review: [], drain: [] }), readClaims: () => collectClaims(() => {}, opts),
+      emit: async () => {}, warn: s => warnings.push(s) }));
+    assert.deepEqual(output.unknown, ['claims']);
+    assert.match(warnings[0], /claims unreadable/);
+  }
+}));
 test('bounded tail drops cut first and incomplete last lines; missing is unknown; warns on oversized input', () => scratch(dir => {
   const path = join(dir, 'log'), warnings = [];
   writeFileSync(path, `${'x'.repeat(150)}\n${nothing}\nunfinished`);
@@ -104,14 +145,46 @@ test('bounded tail drops cut first and incomplete last lines; missing is unknown
 }));
 test('CLI: one batched PR read, no mutation, empty/json/md output and listing cap escalation', async () => {
   const calls = [], warnings = [], base = { readPrs: args => { calls.push(args); return [ready]; },
-    readLogs: () => ({ drain: [row(drain)] }), readClaims: () => [], now: () => now, emit: async () => {} };
+    readLogs: () => ({ drain: [row(drain)], fix: [], review: [] }), readClaims: () => [], now: () => now, emit: async () => {} };
   assert.match(await runStuckCli(['--md'], base), /^#7204 R-a \(cause B\) since 11:11 ET https:/);
   assert.equal(calls.length, 1); assert.ok(calls[0].includes('200')); assert.ok(calls[0].includes('number,headRefOid,labels,mergeStateStatus'));
   assert.equal(await runStuckCli(['--json'], { ...base, readPrs: () => [] }), 'none');
   assert.equal(JSON.parse(await runStuckCli(['--json'], base))[0].pr, 7204);
-  assert.equal(await runStuckCli([], { ...base, readPrs: () => { throw Error('unreadable'); }, warn: s => warnings.push(s) }), 'none');
   await runStuckCli([], { ...base, readPrs: () => Array(200).fill(ready), warn: s => warnings.push(s) });
   assert.ok(warnings.some(s => /200.*inspect/.test(s)));
+});
+test('CLI: unreadable PR list reports unknown in text/JSON, warns and exits unsuccessfully', async () => {
+  const exitCode = process.exitCode;
+  try {
+    for (const args of [[], ['--json']]) {
+      const warnings = [];
+      const output = await runStuckCli(args, { readPrs: () => { throw Error('unreadable'); }, warn: s => warnings.push(s) });
+      assert.equal(process.exitCode, 1);
+      if (args.length) {
+        assert.equal(JSON.parse(output).unknown, true);
+        assert.deepEqual(JSON.parse(output).warnings, warnings);
+      } else assert.equal(output, 'unknown');
+      assert.match(warnings[0], /PR list unreadable/);
+    }
+  } finally { process.exitCode = exitCode; }
+});
+test('CLI: missing/unreadable logs and claims are named unknown with warnings, while healthy empty is none', async () => {
+  const base = { readPrs: () => [], readLogs: () => ({ fix: [], review: [], drain: [] }),
+    readClaims: () => [], emit: async () => {} };
+  assert.equal(await runStuckCli([], base), 'none');
+  for (const sources of [
+    { readLogs: () => ({ fix: null, review: [] }), readClaims: () => null, names: ['fix', 'drain', 'claims'] },
+    { readLogs: () => { throw Error('logs'); }, readClaims: () => { throw Error('claims'); }, names: ['fix', 'review', 'drain', 'claims'] },
+  ]) {
+    const warnings = [];
+    const opts = { ...base, ...sources, warn: s => warnings.push(s) };
+    const output = JSON.parse(await runStuckCli(['--json'], opts));
+    assert.deepEqual(output.unknown, sources.names);
+    assert.deepEqual(output.records, []);
+    assert.deepEqual(output.warnings, warnings);
+    assert.ok(warnings.length);
+    assert.equal(await runStuckCli([], opts), 'unknown');
+  }
 });
 test('NEW cause event is at most once per PR/rule/head, known causes never emit; failed reservation never sends', () => scratch(async dir => {
   const path = join(dir, 'state.json'), events = [], record = { pr: 7, rule: 'R-a', cause: 'NEW', evidence: ['unknown refusal'], sinceET: '11:11', link: 'link' };
@@ -125,7 +198,7 @@ test('NEW cause event is at most once per PR/rule/head, known causes never emit;
   await emitNewCauses([record], prs, { ...opts, statePath: join(dir, 'missing', 'state.json') });
   assert.equal(events.length, 2);
 }));
-test('event receipt closed paths: corrupt/oversized state and concurrent lock never emit; failed append stays reserved', () => scratch(async dir => {
+test('event receipt closed paths: corrupt/oversized state and concurrent lock never emit; failed append retries', () => scratch(async dir => {
   const record = { pr: 7, rule: 'R-a', cause: 'NEW' }, events = [], warnings = [];
   const statePath = join(dir, 'state.json'), opts = { statePath, warn: s => warnings.push(s),
     send: async e => { events.push(e); return false; } };
@@ -136,5 +209,19 @@ test('event receipt closed paths: corrupt/oversized state and concurrent lock ne
   writeFileSync(statePath, '[]');
   await Promise.all([emitNewCauses([record], [pr(7)], opts), emitNewCauses([record], [pr(7)], opts)]);
   await emitNewCauses([record], [pr(7)], opts);
-  assert.equal(events.length, 1); assert.ok(warnings.some(s => /append failed/.test(s)));
+  assert.equal(events.length, 2); assert.deepEqual(JSON.parse(readFileSync(statePath, 'utf8')), []);
+  assert.ok(warnings.some(s => /append failed/.test(s)));
+}));
+test('event send throw restores only failed reservation; retry succeeds once and survives restart', () => scratch(async dir => {
+  const statePath = join(dir, 'state.json'), record = { pr: 7, rule: 'R-a', cause: 'NEW' };
+  const prior = JSON.stringify([8, 'R-a', sha]);
+  writeFileSync(statePath, JSON.stringify([prior]));
+  const opts = { statePath, warn: () => {} };
+  await emitNewCauses([record], [pr(7)], { ...opts, send: async () => { throw Error('failed'); } });
+  assert.deepEqual(JSON.parse(readFileSync(statePath, 'utf8')), [prior]);
+  let sends = 0;
+  const send = async () => { sends++; return true; };
+  await emitNewCauses([record], [pr(7)], { ...opts, send });
+  await emitNewCauses([record], [pr(7)], { ...opts, send });
+  assert.equal(sends, 1);
 }));
