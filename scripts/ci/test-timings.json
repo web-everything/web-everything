@@ -1970,6 +1970,7 @@
   "wrapper-conformance/__tests__/runner.test.ts": 0.01
  },
  "soak": {
+  "scripts/conveyor/soak/breaks/forge-manifest-untracked-shipped.soak.test.mjs": 0.3,
   "scripts/conveyor/soak/breaks/catch-up-clean-first-snapshot-first.soak.test.mjs": 4.65,
   "scripts/conveyor/soak/breaks/rebuild-job-ready-candidate-starvation.soak.test.mjs": 2,
   "scripts/conveyor/soak/breaks/same-head-hold-clean-head-never-resolves.soak.test.mjs": 2,
@@ -2020,6 +2021,7 @@
   "scripts/conveyor/soak/breaks/answer-scope-baseline-read-by-reset.soak.test.mjs": 1,
   "scripts/conveyor/soak/breaks/answered-stand-down-never-redispatched.soak.test.mjs": 99.38,
   "scripts/conveyor/soak/breaks/argon-feature-dispatch.soak.test.mjs": 2.31,
+  "scripts/conveyor/soak/breaks/audited-tip-reads-ops-waiver-store.soak.test.mjs": 1,
   "scripts/conveyor/soak/breaks/auto-rebase-operator-withdrawal.soak.test.mjs": 0.62,
   "scripts/conveyor/soak/breaks/await-verify-delivered-previous-ci-never-retired.soak.test.mjs": 1,
   "scripts/conveyor/soak/breaks/await-verify-lane-config-executes.soak.test.mjs": 1.33,
