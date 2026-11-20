@@ -13,4 +13,4 @@ it('real CLI prepares pending CI, then consumes the green-event admission', () =
   const next = await run(true);
   expect(next.report).toMatchObject({ prestaged: true, enqueueOutcomes: [{ num: 42, outcome: 'enqueued' }] });
   expect(next.calls.filter(a => a.some(x => x.includes('enqueuePullRequest')))).toHaveLength(1);
-}), 120_000);
+}, { slug: 'web-everything/web-everything' }), 120_000); // capability gate refuses the fixture default slug
