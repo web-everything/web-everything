@@ -11,7 +11,7 @@ import { handoffHome } from './handoff-home.mjs';
 import { humanReviewHold } from './pr-sweep-core.mjs';
 import { readPlatformPreferences } from '../lib/policy-cascade.mjs';
 import { FINDING_CLASSES } from '../lib/finding-class-policy.mjs';
-import { liveResultGateState, breakClass, planRedTeamActions, readConfirmedBreaks, parseRedTeamComment, RED_TEAM_COMMENT_MARKER, readRedTeamDisposition } from '../lib/red-team-gate.mjs';
+import { CONFIRMED_BREAK_ACTIONS, BREAK_CLASSES, CONFIRMED_BREAKS_ENV, RED_TEAM_SETTINGS_FILE, liveResultGateState, breakClass, planRedTeamActions, readConfirmedBreaks, parseRedTeamComment, RED_TEAM_COMMENT_MARKER, readRedTeamDisposition } from '../lib/red-team-gate.mjs';
 import { isTrustedMarkerAuthor } from '../lib/marker-authorship.mjs';
 import { readLiveFixClaim } from '../conveyor/fix-procedure.mjs';
 import { writeJsonAtomic, withFileLock } from '../lib/atomic-json-file.mjs';
@@ -101,17 +101,27 @@ export function itemsFromReport(report) {
 // Strict fallback: every confirmed break is owed a send-back and no finding class defers to a card.
 const ALERT_BREAK_POLICY = Object.freeze({ broken: 'send-back', degraded: 'send-back', unconfirmed: 'advisory', findingClasses: Object.freeze({}) });
 /** The shared reader; a missing file or an unset/invalid broken/degraded value is unreadable (strict), never a default. */
-export function readBreakPolicy({ env = process.env } = {}) {
+export function readBreakPolicy({ env = process.env, readPrefs = readPlatformPreferences, settingsPath = RED_TEAM_SETTINGS_FILE } = {}) {
   // Unreadable or absent finding-class preferences are unreadable policy: the class reader would silently default to deferrals.
-  const prefs = readPlatformPreferences({ env, warn: () => {} });
+  // The preferences are read ONCE here and the validated classes are used as the policy (no second, divergent read).
+  const prefs = readPrefs({ env, warn: () => {} });
   const classes = prefs.prefs.findingClasses;
   // Every class must be named explicitly: the class reader defaults any omitted class to a deferral.
   const complete = classes && typeof classes === 'object' && !Array.isArray(classes)
     && FINDING_CLASSES.every(c => classes[c] === 'fix-now' || classes[c] === 'defer-card');
   if (prefs.errors.length || !complete) throw new Error('findingClasses preferences are unreadable');
-  const read = readConfirmedBreaks({ env, strict: true });
+  // Every override value must be a known action: the shared resolver silently drops an invalid one and keeps a lower layer.
+  const actions = new Set(Object.values(CONFIRMED_BREAK_ACTIONS));
+  const fromFile = JSON.parse(readFileSync(settingsPath, 'utf8'))?.redTeam?.confirmedBreaks ?? {};
+  for (const [k, v] of Object.entries(fromFile)) if (BREAK_CLASSES.includes(k) && !actions.has(v)) throw new Error(`invalid confirmedBreaks.${k}`);
+  for (const pair of String(env?.[CONFIRMED_BREAKS_ENV] ?? '').split(',')) {
+    if (!pair.trim()) continue;
+    const [k, v] = pair.split('=').map(x => String(x ?? '').trim().toLowerCase());
+    if (!BREAK_CLASSES.includes(k) || !actions.has(v)) throw new Error('invalid confirmedBreaks override');
+  }
+  const read = readConfirmedBreaks({ env, path: settingsPath, strict: true });
   if (read.source?.broken === 'default' || read.source?.degraded === 'default') throw new Error('confirmedBreaks is not set');
-  return read.value;
+  return { ...read.value, findingClasses: classes };
 }
 // The parser silently drops a finding line it cannot read; the comment's own headline counts them. Any result
 // comment for the live head whose headline disagrees with what parsed is not a clean pass (fail closed).

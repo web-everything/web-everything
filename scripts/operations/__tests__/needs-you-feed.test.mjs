@@ -494,6 +494,23 @@ describe('gateReadyItems: "your review" is re-checked against the live PR (#5768
       if (content !== null) writeFileSync(file, content);
       expect(() => readBreakPolicy({ env: { WE_PLATFORM_PREFERENCES_FILE: file } })).toThrow(/unreadable/);
     });
+    const allClasses = Object.fromEntries(['live-reproduced', 'correctness-in-normal-use', 'security-reachable-today',
+      'theoretical-race', 'attacker-same-user', 'coverage-or-style'].map(c => [c, 'fix-now']));
+    it('readBreakPolicy returns the class policy it validated (read once, no second read)', () => {
+      const dir = temp(), missing = join(dir, 'gone.json');
+      const policy = readBreakPolicy({ env: { WE_PLATFORM_PREFERENCES_FILE: missing },
+        readPrefs: () => ({ prefs: { findingClasses: allClasses }, errors: [] }) });
+      expect(policy.findingClasses).toEqual(allClasses);
+    });
+    it.each(['degraded=send-bak', 'nonsense=card', 'degraded'])('an invalid override %j is unreadable (strict), not a silent lower layer', value => {
+      expect(() => readBreakPolicy({ env: { WE_CONFIRMED: 'x', WE_RED_TEAM_CONFIRMED_BREAKS: value },
+        readPrefs: () => ({ prefs: { findingClasses: allClasses }, errors: [] }) })).toThrow(/invalid/);
+    });
+    it('an invalid value in the settings file is unreadable (strict)', () => {
+      const file = join(temp(), 'red-team.json');
+      writeFileSync(file, JSON.stringify({ redTeam: { confirmedBreaks: { degraded: 'send-bak' } } }));
+      expect(() => readBreakPolicy({ settingsPath: file, readPrefs: () => ({ prefs: { findingClasses: allClasses }, errors: [] }) })).toThrow(/invalid/);
+    });
     it('an unreadable setting falls back to the strict policy (alarm)', async () => {
       const comments = queued('degraded', 2);
       expect(await kind(comments, () => { throw new Error('unreadable'); })).toBe('confirmed-break-owed-send-back');
