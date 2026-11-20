@@ -37,8 +37,8 @@ export const readReviewChecks = ({ repo, headSha, run = gh }) => {
     return page.statuses.map(({ context, state, target_url }) => ({ context, state, target_url }));
   });
   // Partial means not attested: the delivered rows must equal the server's claimed total for BOTH feeds.
-  const delivered = (pages, rows) => pages.length > 0 && pages.every(page => Number.isSafeInteger(page.total_count))
-    && rows.length === pages[0].total_count;
+  const delivered = (pages, rows) => pages.length > 0 && pages.every(page => Number.isSafeInteger(page.total_count)
+    && page.total_count === pages[0].total_count) && rows.length === pages[0].total_count;
   const rowsComplete = delivered(runPages, runs) && delivered(statusPages, statuses);
   return Object.defineProperties([...runs, ...statuses], { rowsComplete: { value: rowsComplete }, rowsHead: { value: headSha } });
 };

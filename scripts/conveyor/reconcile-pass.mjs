@@ -1664,7 +1664,7 @@ export function hydrateChecks(prs,{ repo, requiredChecks, readChecks, defaultBra
     ready.push({ ...pr, rowsComplete, rowsHead: rowsComplete ? sha : null,
       ...(neverStarted ? { ciNeverStarted: true } : {}),
       statusCheckRollup: (refused || neverStarted) && known ? known : result.error ? [] : result.rows,
-      ...((refused || neverStarted) ? { rollupIncomplete: true } : rowsComplete ? { rollupIncomplete: false } : {}) });
+      ...((refused || neverStarted || (!rowsComplete && result.rows)) ? { rollupIncomplete: true } : rowsComplete ? { rollupIncomplete: false } : {}) });
   }
   return { prs: ready, refusals, notes, owedTriggers };
 }

@@ -283,4 +283,7 @@ it('attests rows only when delivered rows equal total_count for both check runs 
   expect(readReviewChecks({ repo: 'o/p', headSha, run: mk(100, 100) }).rowsComplete).toBe(true);
   const noTotal = readReviewChecks({ repo: 'o/p', headSha, run: argv => JSON.stringify(argv[3].includes('/status?') ? [{ total_count: 0, statuses: [] }] : [{ check_runs: [] }]) });
   expect(noTotal.rowsComplete).toBe(false);
+  const disagree = readReviewChecks({ repo: 'o/p', headSha, run: argv => JSON.stringify(argv[3].includes('/status?')
+    ? [{ total_count: 0, statuses: [] }] : [{ total_count: 1, check_runs: runs(1) }, { total_count: 2, check_runs: [] }]) });
+  expect(disagree.rowsComplete).toBe(false);
 });

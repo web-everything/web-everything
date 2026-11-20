@@ -10,11 +10,14 @@ export function completeCheckReadFixture(prs, argv) {
   const pr = prs.find(pr => pr.headRefOid === match[1]);
   if (!pr || !Array.isArray(pr.statusCheckRollup)) throw new Error('missing complete check fixture for ' + match[1]);
   const rows = pr.statusCheckRollup;
-  return match[2] === 'check-runs'
-    ? [{ check_runs: rows.filter(row => !row.context).map(row => ({ ...row,
+  if (match[2] === 'check-runs') {
+    const check_runs = rows.filter(row => !row.context).map(row => ({ ...row,
       status: row.status?.toLowerCase(), conclusion: row.conclusion?.toLowerCase(),
-    })) }]
-    : [{ statuses: rows.filter(row => row.context).map(row => ({ ...row,
-      state: row.state?.toLowerCase(), target_url: row.target_url ?? row.targetUrl,
-    })) }];
+    }));
+    return [{ total_count: check_runs.length, check_runs }];
+  }
+  const statuses = rows.filter(row => row.context).map(row => ({ ...row,
+    state: row.state?.toLowerCase(), target_url: row.target_url ?? row.targetUrl,
+  }));
+  return [{ total_count: statuses.length, statuses }];
 }
