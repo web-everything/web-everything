@@ -655,10 +655,14 @@ describe('posted red-team results retain pending and escalate', () => {
 describe('headNeverReviewedFromRuns complete bounded proof', () => {
   const run = (over = {}) => ({ op: 'review-pr', input: { repo, pr }, ...payload('accept', old),
     pending: null, effects: [], ...over });
+  let fixtureNumber = 0;
   function scanFixture(records = {}) {
-    return { repo, pr, head, runsDir: 'fixture-runs', list: vi.fn(() => Object.keys(records)),
-      read: vi.fn(id => records[id]), stat: vi.fn(() => ({ mtimeMs: acceptedAt })) };
+    return { repo, pr, head, runsDir: `fixture-runs-${++fixtureNumber}`,
+      list: vi.fn(() => Object.keys(records)), readdir: vi.fn(() => Object.keys(records).map(id => `${id}.json`)),
+      scanSettings: { file: { runs: { scan: { maxParses: 5000 } } }, platform: {}, env: {} },
+      read: vi.fn(id => records[id] && ({ id, ...records[id] })), stat: vi.fn(() => ({ mtimeMs: acceptedAt, ctimeMs: acceptedAt, dev: 1, size: 100, ino: 1 })) };
   }
+  const legacyRecords = () => Object.fromEntries(Array.from({ length: 401 }, (_, i) => [`review-pr-${i}`, run()]));
   function scan(f) {
     expect(mod.headNeverReviewedFromRuns, 'export the complete never-reviewed-head scanner').toBeTypeOf('function');
     return mod.headNeverReviewedFromRuns(f);
@@ -708,9 +712,118 @@ describe('headNeverReviewedFromRuns complete bounded proof', () => {
     const f = scanFixture(Object.fromEntries(Array.from({ length: 400 }, (_, i) => [`review-pr-${i}`, run()])));
     expect(scan(f)).toBe(true); expect(f.read).toHaveBeenCalledTimes(400);
   });
-  it('over 400 parses returns false for operator inspection without claiming never-reviewed', () => {
-    const f = scanFixture(Object.fromEntries(Array.from({ length: 401 }, (_, i) => [`review-pr-${i}`, run()])));
-    expect(scan(f)).toBe(false); expect(f.read.mock.calls.length).toBeLessThanOrEqual(400);
+  it('Tier-1 1: over 400 legacy records and an old needs-human ledger effect permit a full review', () => {
+    const f = scanFixture({ ...legacyRecords(), 'review-pr-old': run({ verdict: { verdict: 'needs-human' },
+      pending: { kind: 'confirm' }, effects: [{ kind: 'ledgerEvents', status: 'pending' }] }) });
+    expect(scan(f)).toBe(true);
+    const o = runFixture({ readEvidence: () => ({ ok: false, reason: 'review-unfinished' }),
+      headNeverReviewed: () => scan(f) });
+    expect(mod.runRedTeamOnSkip(o).rows[0]).toMatchObject({ action: 'review', why: 'head never reviewed; a review is always allowed' });
+    expect(o.dispatch).toHaveBeenCalledWith({ repo, pr });
+    expect(o.settlePending).not.toHaveBeenCalled();
+  });
+  it('Tier-1 2: a live-head record among over 400 refuses proof', () => {
+    expect(scan(scanFixture({ ...legacyRecords(), 'review-pr-live': run(payload('accept')) }))).toBe(false);
+  });
+  it.each([undefined, 'short', 'z'.repeat(40)])('Tier-1 3: unreadable head %s refuses proof', rev => {
+    expect(scan(scanFixture({ 'review-pr-old': run({ findings: { read: { netBasis: { rev } } } }) }))).toBe(false);
+  });
+  it('Tier-1 4: an unrelated malformed legacy record refuses proof', () => {
+    expect(scan(scanFixture({ 'review-pr-other': run({ input: { repo: 'else/where', pr: 1 }, verdict: {} }) }))).toBe(false);
+  });
+  it('Tier-1 5: all named PR ids are validated once, then cached reads are free', () => {
+    const own = `review-pr-pr${pr}-00000000-0000-0000-0000-000000000000`;
+    const other = `review-pr-pr${pr + 1}-00000000-0000-0000-0000-000000000000`;
+    const f = scanFixture({ [own]: run(), [other]: run({ input: { repo, pr: pr + 1 } }) });
+    f.scanSettings.file.runs.scan.maxParses = 1;
+    expect(scan(f)).toBe(false);
+    expect(f.read).toHaveBeenCalledTimes(1);
+    expect(scan(f)).toBe(true);
+    expect(f.read.mock.calls.map(([id]) => id)).toEqual([own, other]);
+    expect(scan(f)).toBe(true);
+    expect(f.read).toHaveBeenCalledTimes(2);
+  });
+  it.each(['live head', 'corrupt', 'unreadable'])('another PR filename with %s payload refuses proof', kind => {
+    const other = `review-pr-pr${pr + 1}-00000000-0000-0000-0000-000000000000`;
+    const f = scanFixture({ [other]: kind === 'corrupt' ? {} : run(payload('accept')) });
+    if (kind === 'unreadable') f.read.mockImplementation(() => { throw Error('unreadable payload'); });
+    expect(scan(f)).toBe(false);
+    expect(f.read).toHaveBeenCalledTimes(1);
+    expect(scan(f)).toBe(false);
+    expect(f.read).toHaveBeenCalledTimes(1);
+  });
+  it('payload repo and PR determine relevance regardless of the named PR', () => {
+    const other = `review-pr-pr${pr + 1}-00000000-0000-0000-0000-000000000000`;
+    const f = scanFixture({ [other]: run() });
+    expect(scan(f)).toBe(true);
+    expect(f.read).toHaveBeenCalledTimes(1);
+  });
+  it.each(['review-pr-invalid!.json', 'review-other.json'])('omitted review-like file %s refuses proof', name => {
+    const f = scanFixture();
+    f.readdir.mockReturnValue([name]);
+    expect(scan(f)).toBe(false);
+    expect(f.read).not.toHaveBeenCalled();
+  });
+  it('an invalid review filename appearing after parsing refuses proof', () => {
+    const f = scanFixture({ 'review-pr-old': run() });
+    f.read.mockImplementation(id => {
+      f.readdir.mockReturnValue(['review-pr-old.json', 'review-pr-invalid!.json']);
+      return { id, ...run() };
+    });
+    expect(scan(f)).toBe(false);
+  });
+  it('known abandoned and temporary files do not prevent an empty proof', () => {
+    const f = scanFixture();
+    f.readdir.mockReturnValue(['review-pr-old.abandoned.json', 'review-pr-old.json.123.tmp']);
+    expect(scan(f)).toBe(true);
+  });
+  it('Tier-1 6: parse misses above the setting hold with bounded reads and resume on the next call', () => {
+    const f = scanFixture({ 'review-pr-1': run(), 'review-pr-2': run(), 'review-pr-3': run() });
+    f.scanSettings.file.runs.scan.maxParses = 2;
+    expect(scan(f)).toBe(false); expect(f.read).toHaveBeenCalledTimes(2);
+    expect(scan(f)).toBe(true); expect(f.read).toHaveBeenCalledTimes(3);
+    expect(scan(f)).toBe(true); expect(f.read).toHaveBeenCalledTimes(3);
+  });
+  it.each(['mtimeMs', 'ctimeMs', 'dev', 'size', 'ino'])('Tier-1 7: cached record rewritten to live head with changed %s refuses proof', key => {
+    const records = { 'review-pr-old': run() }, f = scanFixture(records);
+    expect(scan(f)).toBe(true);
+    records['review-pr-old'] = run(payload('accept'));
+    f.stat = vi.fn(() => ({ mtimeMs: acceptedAt, ctimeMs: acceptedAt, dev: 1, size: 100, ino: 1, [key]: 200 }));
+    expect(scan(f)).toBe(false); expect(f.read).toHaveBeenCalledTimes(2);
+  });
+  it('Tier-1 8: a candidate listing changed between snapshots refuses proof', () => {
+    const f = scanFixture({ 'review-pr-old': run() });
+    f.readdir.mockReturnValueOnce(['review-pr-old.json']).mockReturnValue(['review-pr-old.json', 'review-pr-new.json']);
+    expect(scan(f)).toBe(false);
+  });
+  it.each(['archive', 'claim', 'unreadable'])('Tier-1 9: null named candidates from %s refuse proof', kind => {
+    const f = scanFixture();
+    f.readdir = vi.fn(() => {
+      if (kind === 'unreadable') throw Error('unreadable directory');
+      return kind === 'claim' ? ['.review-pr-old.archiving-claim'] : ['archive', 'review-pr-old.json'];
+    });
+    expect(scan(f)).toBe(false); expect(f.read).not.toHaveBeenCalled();
+  });
+  it.each(['cooldown', 'formal hold', 'publishableClearGuard'])('Tier-1 10: %s still blocks a proven never-reviewed head', kind => {
+    const f = scanFixture({ 'review-pr-old': run() });
+    expect(scan(f)).toBe(true);
+    const o = runFixture({ readEvidence: () => ({ ok: false, reason: 'review-unfinished' }), headNeverReviewed: () => scan(f) });
+    if (kind === 'cooldown') o.lastDispatch.set(`${repo}#${pr}@${head}`, o.now() - 1);
+    if (kind === 'formal hold') o.rawPrs[0].reviews = [{ state: 'CHANGES_REQUESTED', submittedAt: iso(acceptedAt + 1) }];
+    if (kind === 'publishableClearGuard') o.rawPrs[0].labels.push('review:changes');
+    expect(mod.runRedTeamOnSkip(o).rows[0].action).toBe('skip');
+    expect(o.dispatch).not.toHaveBeenCalled();
+  });
+  it('an identity changed during a payload read refuses proof', () => {
+    const f = scanFixture({ 'review-pr-old': run() });
+    f.stat.mockReturnValueOnce({ mtimeMs: acceptedAt, ctimeMs: acceptedAt, dev: 1, size: 100, ino: 1 }).mockReturnValue({ mtimeMs: acceptedAt, ctimeMs: acceptedAt, dev: 1, size: 101, ino: 1 });
+    expect(scan(f)).toBe(false);
+  });
+  it.each(['mtimeMs', 'ctimeMs', 'dev', 'size', 'ino'])('missing %s metadata refuses proof', key => {
+    const f = scanFixture({ 'review-pr-old': run() });
+    const identity = { mtimeMs: acceptedAt, ctimeMs: acceptedAt, dev: 1, size: 100, ino: 1 }; delete identity[key];
+    f.stat.mockReturnValue(identity);
+    expect(scan(f)).toBe(false);
   });
 });
 

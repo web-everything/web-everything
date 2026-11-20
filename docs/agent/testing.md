@@ -5489,24 +5489,37 @@ verifies persisted events and commit messages against a temporary local Git orig
 
 ## Negative review-run proofs
 
-`headNeverReviewedFromRuns` may bypass its 400-run scan only through
-`readCompleteReviewRunsForPr`: an all-PR backfill watermark, acknowledged poison
-markers, stat-only listing verification, and no overflow or eviction for that PR.
-The full-backfill verified staging state lives in the index and uses the same identity
-reconciliation and bad-record cooldown as the open-PR backfill, parsing at most 50
-records per call by default. Concurrent writes requeue only changed identities; a bad
-or unreadable record blocks the global watermark while other candidates advance.
-Open-PR hint refreshes must preserve that staging state and proof.
-Full completeness includes a SHA-256 digest of the rebuilt entries and eviction
-markers. Readers and the backfill reuse path reject a missing or mismatched digest:
-deleting a PR key, dropping one row, or losing an eviction marker cannot preserve
-the proof. Old snapshots without the digest require a new bounded full pass.
-Appends never reseal a proof; only a completed rebuild writes the digest. This
-checks persisted consistency, not authenticity against a writer forging the whole index.
-Unverifiable indexed identities return to the original capped scan; they never
-establish absence. Keep bounded resumption, a 3,012-file snapshot, eviction, poison
-races, and capped negative fallbacks in `review-run-index.test.mjs`, alongside the
-existing `redteam-pending-settle` and `review-red-team-on-skip` suites.
+`headNeverReviewedFromRuns` proves absence through `readNamedCandidates`, independently
+of the full-review index. Archive evidence, archive claims, unreadable listings or
+records, malformed evidence, and missing/non-40-hex subject heads retain the
+hold. Every candidate, including ids named for other PRs, is read and validated with
+`assertReviewRunEvidence` on a cache miss. Payload repo/PR determines relevance
+regardless of the filename's PR; corrupt or unreadable unrelated records refuse proof.
+Independently list the directory before and after parsing: any review-like JSON file
+omitted by candidate discovery refuses proof. Known `.abandoned.json` tombstones and
+temporary files ending in `.tmp` remain excluded. Operators must inspect and repair
+omitted or malformed evidence before retrying. An unfinished review on an older head
+permits a fresh full review (R640); any live-head review prevents this proof.
+
+A process-local summary cache binds each directory/id to mtimeMs, ctimeMs, device,
+size and inode; a difference in any field forces a fresh read and validation.
+Only cache misses consume `runs.scan.maxParses`, resolved through the shared settings
+cascade. Reaching the limit returns false while retaining verified summaries for the
+next tick. Operators can wait for subsequent ticks, inspect omitted evidence, or
+explicitly raise the setting; a partial scan never authorizes a dispatch. Rewritten
+records are reparsed. Before returning true, re-read the candidate snapshot and
+recheck every candidate's file identity; changed or unreadable evidence returns false.
+
+Keep the ten Tier-1 regressions in `redteam-pending-settle.test.mjs`: over-400 legacy
+success and live-head refusal, unreadable heads, unrelated malformed records,
+other-PR payload validation and cached reuse, bounded cache resumption, rewritten
+identities (including ctime/device), omitted review filenames, listing races,
+null candidate discovery, and planner cooldown/formal-review/publishability holds.
+Keep index integrity/backfill tests in `review-run-index.test.mjs`; index corruption,
+poison, overflow or eviction alone no longer determines the never-reviewed proof.
+This proof only permits a full review. Red-team release still requires the unchanged
+reader's finished acceptance on the live head.
+
 ## Forge sweep partial work
 
 `forge-exec-sweep.mjs` shares `slots.scanEntryBound` (integer 1000–1000000, default 200000) between

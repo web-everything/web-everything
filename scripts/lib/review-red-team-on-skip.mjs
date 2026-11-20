@@ -1,9 +1,10 @@
 /** Recover an owed red-team result on an already-reviewed head through the existing review job. */
 import { execFileSync } from 'node:child_process';
 import { proveCardOnlyHeadMove } from './card-only-head-move.mjs';
-import { readFileSync, statSync } from 'node:fs';
-import { assertReviewRunEvidence, readCompleteReviewRunsForPr } from './review-run-index.mjs';
+import { readFileSync, readdirSync, statSync } from 'node:fs';
+import { assertReviewRunEvidence, readNamedCandidates } from './review-run-index.mjs';
 import { listRunIds, readRun, sharedRunsDir } from '../operations/run-store.mjs';
+import { resolveRunScanSettings } from './stream-filter-runs.mjs';
 import { runBacklogOnlyPrep, readBacklogOnlyNetFiles } from './red-team-backlog-only.mjs';
 import { createGhProvider } from './review-label-provider.mjs';
 import { isUnderTest } from './under-test.mjs';
@@ -407,33 +408,64 @@ function* reviewRuns({ runsDir, list, read, stat }) {
   }
 }
 
-/** Complete bounded proof; unknown state never establishes a never-reviewed head. */
+// Keep only summaries, replacing each id's entry when its file identity changes.
+const neverReviewedSummaryCache = new Map();
+
+/** Complete named-candidate proof; incomplete calls warm the cache but retain the hold. */
 export function headNeverReviewedFromRuns({ repo, pr, head, env = process.env,
-  runsDir = runsDirectory(env), list = strictListRuns, read = readRun, stat = statSync } = {}) {
+  runsDir = runsDirectory(env), list = listRunIds, read = readRun, stat = statSync,
+  readdir = readdirSync, scanSettings } = {}) {
   try {
     if (!isRealHead(head)) return false;
-    try {
-      const ids = readCompleteReviewRunsForPr(runsDir, repo, pr, { list,
-        stat: id => stat(join(runsDir, `${id}.json`)) });
-      if (ids !== null) {
-        const verifiedRead = (id, dir) => {
-          const run = read(id, dir);
-          if (run?.id !== id || run.op !== 'review-pr' || run.input?.repo !== repo
-            || Number(run.input?.pr) !== Number(pr)) throw Error('indexed review subject unreadable');
-          return run;
-        };
-        for (const { run } of reviewRuns({ runsDir, list: () => ids, read: verifiedRead, stat })) {
-          const rev = run.findings?.read?.netBasis?.rev;
-          if (!isRealHead(rev) || rev === head) return false;
-        }
-        return true;
+    const candidates = readNamedCandidates(runsDir, repo, pr, { list, readdir });
+    if (candidates === null) return false;
+    const directorySnapshot = candidates => {
+      const ids = new Set(candidates.ids);
+      const names = readdir(runsDir).sort();
+      if (names.some(name => name.startsWith('review-') && name.endsWith('.json')
+        && !name.endsWith('.abandoned.json') && !ids.has(name.slice(0, -5)))) {
+        throw Error('review run filename omitted from candidates; inspect stored evidence');
       }
-    } catch { /* Unverifiable indexed evidence takes the original bounded scan. */ }
-    for (const { run } of reviewRuns({ runsDir, list, read, stat })) {
-      if (run.op !== 'review-pr' || run.input?.repo !== repo || Number(run.input?.pr) !== Number(pr)) continue;
-      const rev = run.findings?.read?.netBasis?.rev;
-      // R640: unfinished reviews on other heads do not veto a review of this head.
-      if (!isRealHead(rev) || rev === head) return false;
+      return JSON.stringify(names);
+    };
+    const namesBefore = directorySnapshot(candidates);
+    const maxParses = resolveRunScanSettings({ env, ...scanSettings }).value.scan.maxParses;
+    const identity = id => {
+      const { mtimeMs, ctimeMs, dev, size, ino } = stat(join(runsDir, `${id}.json`));
+      if (![mtimeMs, ctimeMs, dev, size, ino].every(Number.isFinite) || dev < 0 || size < 0 || ino < 0) throw Error('run metadata unreadable');
+      return JSON.stringify([mtimeMs, ctimeMs, dev, size, ino]);
+    };
+    let parsed = 0;
+    const identities = new Map();
+    for (const id of candidates.ids) {
+      const before = identity(id), key = JSON.stringify([runsDir, id]);
+      identities.set(id, before);
+      let summary = neverReviewedSummaryCache.get(key);
+      if (summary?.identity !== before) {
+        if (parsed >= maxParses) return false; // Next tick resumes; operators can inspect or raise runs.scan.maxParses.
+        parsed++;
+        summary = { identity: before, valid: false };
+        try {
+          const run = read(id, runsDir);
+          assertReviewRunEvidence(run);
+          if (run.id !== id) throw Error('review run filename and payload id disagree');
+          summary = { ...summary, valid: true, op: run.op, repo: run.input?.repo,
+            pr: Number(run.input?.pr), head: run.findings?.read?.netBasis?.rev };
+        } catch { /* Invalid evidence is cached only for this exact file identity. */ }
+        if (identity(id) !== before) { neverReviewedSummaryCache.delete(key); return false; }
+        neverReviewedSummaryCache.set(key, summary);
+      }
+      if (!summary.valid) return false;
+      if (summary.op === 'review-pr' && summary.repo === repo && summary.pr === Number(pr)
+        && (!isRealHead(summary.head) || summary.head === head)) return false;
+    }
+    const after = readNamedCandidates(runsDir, repo, pr, { list, readdir });
+    if (after === null || after.snapshot !== candidates.snapshot || directorySnapshot(after) !== namesBefore) return false;
+    for (const [id, before] of identities) {
+      if (identity(id) !== before) {
+        neverReviewedSummaryCache.delete(JSON.stringify([runsDir, id]));
+        return false;
+      }
     }
     return true;
   } catch { return false; }
