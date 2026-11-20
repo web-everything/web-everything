@@ -20,7 +20,8 @@ import { createAsyncShadow } from '../lib/drain-async-shadow.mjs';
 
 const script = join(dirname(fileURLToPath(import.meta.url)), '..', 'merge-ai-prs.mjs');
 const sha = 'a'.repeat(40);
-const world = createPrestageWorld((argv, options) => runInProcess(argv, { ...options, ports: prestagePorts }));
+const prestageWorld = createPrestageWorld((argv, options) => runInProcess(argv, { ...options, ports: prestagePorts }));
+const world = (fn, options) => prestageWorld(fn, { slug: 'web-everything/web-everything', ...options });
 
 describe('real drain pre-stage path', () => {
   it.each(['dependency-held', 'cascade', 'prestage'])('shadow adds zero gh calls compared with off (%s)', async path => {
@@ -430,7 +431,7 @@ const repairEnv = { WE_MERGE_QUEUE_REFRESH_ON_STALE_MERGE_GATE:'on',
   WE_MERGE_QUEUE_SKIP_REBASE_APPROVED_HUMAN_SURFACE:'off' };
 const refreshPushes = calls => calls.filter(a => a[0] === 'git' && a[1] === 'push');
 describe('failed-gate trigger through the real drain', () => {
-  it('rebuilds through refreshStalePr and preserves the original BLOCKED skip, once per head', () => world(async ({pr,run}) => {
+  it('rebuilds through refreshStalePr and preserves the original BLOCKED skip, once per head', () => world(async ({pr,run,slug}) => {
     failedGatePr(pr);
     const first = await run(false, {env:repairEnv});
     expect(first.report.merged).toEqual([]);
@@ -438,7 +439,7 @@ describe('failed-gate trigger through the real drain', () => {
     expect(first.report.skipped).toEqual([expect.objectContaining({num:42, reason:expect.stringContaining('merge state BLOCKED')})]);
     expect(first.report.revalidationAborted).toEqual([expect.objectContaining({reason:expect.stringContaining('rebased')})]);
     expect(first.calls.filter(a => a[0] === 'node')).toEqual([[
-      'node', expect.stringMatching(/\/review-set-label\.mjs$/), '42', '--repo=fixture/prestage',
+      'node', expect.stringMatching(/\/review-set-label\.mjs$/), '42', `--repo=${slug}`,
       '--to=restamp', '--actor=drain', '--channel=drain-rebase',
       `--reason=head moved to ${'b'.repeat(40)} by this drain's own content-preserving rebase`,
       `--new-head=${'b'.repeat(40)}`,

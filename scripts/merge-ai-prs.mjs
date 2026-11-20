@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import { assertCapability } from './lib/repo-profile.mjs';
 import { resolveHandoffSettings } from './lib/handoff-settings.mjs';
 import { writeLabelWithHandoff, signalFixDispatch } from './lib/fix-handoff.mjs';
 import { readCompletePrComments } from './conveyor/pr-comments-complete.mjs';
@@ -4757,11 +4758,11 @@ export function ghListErrText(e) {
 }
 
 /**
- * Partial success exits 0 while JSON `failed` stays populated; `ok` still means no duplicate ids.
- * A failure with no landed PRs exits 2. Duplicate ids always take precedence (exit 3).
+ * Partial merge success exits 0 while JSON `failed` stays populated; `ok` requires a known clean duplicate check.
+ * An unknown duplicate check (null) or a failure with no landed PRs exits 2. Duplicates take precedence (exit 3).
  */
 export function passExitCode({ dup = [], failed = [], mergedCount = 0 } = {}) {
-  return dup?.length ? 3 : (failed.length && mergedCount === 0 ? 2 : 0);
+  return dup?.length ? 3 : (dup === null || (failed.length && mergedCount === 0) ? 2 : 0);
 }
 
 export function engineTierForCandidate(score) { // `score` names the real future param — unused until #3493 unblocks
@@ -5166,6 +5167,9 @@ export async function main(argv, { env = process.env, stdout = process.stdout, e
         } catch { return false; }
   }
   function enqueueWithSameHeadGuard(c, sha, options, approvedHeadHold, shadow) {
+    // Admission must precede same-head recovery, which can update the branch.
+    const refusal = assertCapability(c.repo ?? localSlug, 'review');
+    if (refusal) return { enqueued: false, ...refusal, reason: refusal.why };
     // Live manual retries pass the guard and retain the strategy's already-queued bookkeeping.
     const refresh = DRY_RUN ? undefined : createMqSameHeadRefreshOptions({ store: mqSameHeadRefreshStore,
       approvedHeadHold, repo: c.repo ?? localSlug, pr: c.num, head: sha,
@@ -5218,6 +5222,8 @@ export async function main(argv, { env = process.env, stdout = process.stdout, e
   // incident; once closed, GitHub refuses both `pr edit --base` and reopen, so this MUST run before landing.
   // `--base <headRef>` scopes the listing to exactly the stacked set — no full-repo PR fan-out.
   const announceAndRetargetBeforeLand = (c, { preread, defaultBranch }) => {
+    const refusal = assertCapability(c.repo ?? localSlug, 'review');
+    if (refusal) return { skipped: refusal.kind, reason: refusal.why };
     if (preread.read) {
       const gaps = reviewCoverageGaps(reviewCoverageGapArgs(c, preread.comments));
       if (gaps.length) {
@@ -6010,7 +6016,9 @@ export async function main(argv, { env = process.env, stdout = process.stdout, e
     const settings = resolveRefreshSettings(), log = AS_JSON ? { write() {} } : process.stderr;
     logRefreshSettings(settings, log);
     const repo = REPOS.find(isLocalRepo);
-    if (REPOS.some(isLocalRepo)) await runRenamedPrRefresh({ prs: fastDrainPrs(repo, openPrContext.prsByRepo.get(repo) || []), slug: localSlug, root: process.cwd(), settings, dryRun: DRY_RUN, log });
+    const refusal = assertCapability(localSlug, 'review');
+    if (refusal) log.write(`renamed-pr-refresh: ${refusal.why}\n`);
+    if (!refusal && REPOS.some(isLocalRepo)) await runRenamedPrRefresh({ prs: fastDrainPrs(repo, openPrContext.prsByRepo.get(repo) || []), slug: localSlug, root: process.cwd(), settings, dryRun: DRY_RUN, log });
   } catch (e) { if (!AS_JSON) process.stderr.write(`renamed-pr-refresh: ${e.message}\n`); }
 
   // #xc7p3q9 (Fix 4 / B12) — the narrow→classify→attach→couple-join sequence is now `prepareDrainVerdicts`, the
@@ -6142,6 +6150,8 @@ export async function main(argv, { env = process.env, stdout = process.stdout, e
         if (probe.action === 'error' && !AS_JSON) process.stderr.write(`  ⚠ ${repoTag(v.repo)}${v.num} could not probe id collision (${probe.reason})\n`);
         continue;
       }
+      const refusal = assertCapability(v.repo ?? localSlug, 'review');
+      if (refusal) { v.reason = refusal.why; continue; }
       const h = healNnnCollision({ laneRef: v.headRef, base: 'origin/main' });
       if (h.action === 'rebased') {
         v.collisionHealed = h.renumbered;
@@ -6171,7 +6181,13 @@ export async function main(argv, { env = process.env, stdout = process.stdout, e
         hold: pr?.mergeStateStatus === 'BEHIND' && approvedHeadHold({ repo, num }, opts.expectedHeadSha) });
     }, opts, setting: UNKNOWN_RETRY, sleep: sleepSync,
   });
-  const refreshApprovedHead = async (v, options) => {
+  const refreshApprovedHead = (v, options) => {
+    // Shared by freshness prechecks, required-workflow recovery and stale-merge recovery.
+    const refusal = assertCapability(v.repo ?? localSlug, 'review');
+    if (refusal) return { ok: false, action: refusal.kind, error: refusal.why };
+    return refreshAdmittedHead(v, options);
+  };
+  const refreshAdmittedHead = async (v, options) => {
     // Gate recovery is a head mutation under the same admission policy as the queue's existing refresh.
     if (options.forceRefresh || options.runConclusion === 'startup_failure') {
       try {
@@ -6192,20 +6208,20 @@ export async function main(argv, { env = process.env, stdout = process.stdout, e
       } catch (error) { return { ok: false, action: 'held', error: String(error?.message ?? error) }; }
     }
     return refreshApprovedHeadChecked({
-    readHold: () => {
-      let unreadable = null;
-      const hold = approvedHeadHold(v, options.expectedHead, { strict: true, onUnreadable: (e) => { unreadable = e; } });
-      if (unreadable) throw unreadable; // strict reports an unreadable proof as a hold for the enqueue guard; the refresh must refuse instead
-      return hold;
-    },
-    readRunId: () => {
-      const facts = readMergeFreshnessFacts({ repo: v.repo, num: v.num, headSha: options.expectedHead, requiredCheck: REQUIRED,
-        defaultBranch: defaultBranchOf(v.repo) || 'main', gh: (args) => readGh(args, { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }) });
-      if (facts.errors.length) throw new Error(`required run unreadable: ${facts.errors.join('; ')}`);
-      return facts.pr.requiredCheck?.runId ?? null;
-    },
-    options, prNumber: Number(v.num), repo: v.repo || localSlug, refresh: refreshStalePr,
-    warn: (msg) => process.stderr.write(`  ⚠ PR ${repoTag(v.repo)}${v.num}: ${msg}\n`),
+      readHold: () => {
+        let unreadable = null;
+        const hold = approvedHeadHold(v, options.expectedHead, { strict: true, onUnreadable: (e) => { unreadable = e; } });
+        if (unreadable) throw unreadable; // strict reports an unreadable proof as a hold for the enqueue guard; the refresh must refuse instead
+        return hold;
+      },
+      readRunId: () => {
+        const facts = readMergeFreshnessFacts({ repo: v.repo, num: v.num, headSha: options.expectedHead, requiredCheck: REQUIRED,
+          defaultBranch: defaultBranchOf(v.repo) || 'main', gh: (args) => readGh(args, { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }) });
+        if (facts.errors.length) throw new Error(`required run unreadable: ${facts.errors.join('; ')}`);
+        return facts.pr.requiredCheck?.runId ?? null;
+      },
+      options, prNumber: Number(v.num), repo: v.repo || localSlug, refresh: refreshStalePr,
+      warn: (msg) => process.stderr.write(`  ⚠ PR ${repoTag(v.repo)}${v.num}: ${msg}\n`),
     });
   };
   // #2198 — rebase-drop the transient manifest so a certified+green PR that is only CONFLICTING/BEHIND on the
@@ -6293,6 +6309,8 @@ export async function main(argv, { env = process.env, stdout = process.stdout, e
         if (!AS_JSON) process.stderr.write(`  ↻ ${repoTag(v.repo)}${v.num} would rebase-drop manifest (state ${v.state}/${v.mergeable})${cloneDir ? ` via ${cloneDir}` : ''} then merge\n`);
         continue;
       }
+      const refusal = assertCapability(v.repo ?? localSlug, 'review');
+      if (refusal) { v.reason = refusal.why; continue; }
       let r = rebase({ laneRef, base: 'origin/main', healCollision: HEAL_COLLISION, run: gitRunner, cwd: cloneDir });
       // #2371 — a REAL (non-manifest) conflict is the manifest resolver's own skip boundary; retry it with the
       // wider content resolver, which ONLY auto-resolves if every conflicting hunk is non-overlapping. Its own
@@ -7312,7 +7330,13 @@ export async function main(argv, { env = process.env, stdout = process.stdout, e
   const numberCardsBeforeEnqueue = logQueueNumbering();
   const numberingOnBranch = numberCardsBeforeEnqueue && mergeStrategy.enqueues(null) && mainAcceptsBranchNumbering();
   if (numberCardsBeforeEnqueue && mergeStrategy.enqueues(null) && !numberingOnBranch) process.stderr.write("  merge-queue: numberCardsBeforeEnqueue=on but main's CI does not yet accept drain-numbered cards (contract drain-branch-numbering-ci-v1 missing on origin/main) — numbering at land (post-land push) this pass\n");
-  if (numberingOnBranch && !DRY_RUN) sweepQueuedHashCards({ repo: localSlug, cwd: process.cwd(), isOpen: (repo, num) => openReservationPr(openPrContext, repo, num) });
+  if (numberingOnBranch && !DRY_RUN) sweepQueuedHashCards({ repo: localSlug, cwd: process.cwd(), isOpen: (repo, num) => openReservationPr(openPrContext, repo, num),
+    // Dequeue is cancellation; only the subsequent branch rewrite requires admission.
+    prepare: options => {
+      const refusal = assertCapability(localSlug, 'review');
+      if (refusal) return { action: 'skip', reason: refusal.why };
+      return prepareBranchBeforeEnqueue(options);
+    } });
   const branchPreparationRequired = createBranchPreparationRequired({ enabled: numberingOnBranch,
     serial: resolvedMergePolicy.policy.concurrency.enqueue === 1,
     // -z: line output C-quotes non-ASCII names, which would hide a pending hash card.
@@ -7353,7 +7377,11 @@ export async function main(argv, { env = process.env, stdout = process.stdout, e
   // groups (under any delivery strategy, so a switch to direct merging never strands a hold), then, under the merge
   // queue, forms at most one new group from the planner's overlap waits and the PRs they yield to. The cascade's
   // hold below then keeps every source out of the queue this same pass. Never throws.
-  runCardGroupPass({ grouping: cardGrouping, onlyPr, enqueues: mergeStrategy.enqueues(null), enqueueOutcomes, deferred: preparedPass.plan.deferred, verdicts,
+  runCardGroupPass({ grouping: { ...cardGrouping, form: (...args) => {
+    const refusal = assertCapability(localSlug, 'review');
+    if (refusal) return { reason: refusal.why };
+    return cardGrouping.form(...args);
+  } }, onlyPr, enqueues: mergeStrategy.enqueues(null), enqueueOutcomes, deferred: preparedPass.plan.deferred, verdicts,
     mainFixNums: [...passMainFix], isLocalRepo });
   let deferred = [];
   if (DRY_RUN) {
@@ -7590,6 +7618,9 @@ export async function main(argv, { env = process.env, stdout = process.stdout, e
             if (!AS_JSON) process.stderr.write(`  ⚠ ${repoTag(c.repo)}${c.num} no longer safe to merge on a fresh re-read (${revalidated.reason}) — the pass-start decision is stale; refusing to merge this pass (xvzc4v4)\n`);
             continue;
           }
+          // Admit before freshness recovery, result stamps, retargeting or branch preparation.
+          const refusal = assertCapability(c.repo ?? localSlug, 'review');
+          if (refusal) throw Object.assign(new Error(refusal.why), { enqueueFailure: refusal });
           // card xs1hdl7 — THE MERGE-QUEUE FRESHNESS HOOK. Every existing gate above has passed; before any land-side
           // stamp or the merge write, ask the freshness rule (we:scripts/lib/merge-freshness.mjs) whether the green
           // pass still proves THIS merge: the pass is on the pinned head, main moved only on files this PR does not
@@ -7847,14 +7878,16 @@ export async function main(argv, { env = process.env, stdout = process.stdout, e
   // x4y74wj — the follow-up point. With `drainFollowupJob` on (we:scripts/settings/drain-followup-job.json) a
   // pass that landed a local PR records ONE detached `drain-followup` job (numbering, resolve-on-land, push,
   // derived regen, primary ff-sync) and skips all of that below; `handedOff:false` keeps today's inline path.
+  const localWriteRefusal = assertCapability(localSlug, 'review');
+  if (localWriteRefusal && !AS_JSON) process.stderr.write(`  ${localWriteRefusal.why}; local land follow-up writes held for operator\n`);
   const followup = await handOffDrainFollowup({
-    landed: !DRY_RUN && merged.some((m) => isLocalRepo(m.repo)), dryRun: DRY_RUN, log: (m) => process.stderr.write(`  ${m}\n`),
+    landed: !DRY_RUN && !localWriteRefusal && merged.some((m) => isLocalRepo(m.repo)), dryRun: DRY_RUN || !!localWriteRefusal, log: (m) => process.stderr.write(`  ${m}\n`),
     buildInput: () => buildFollowupInput({ numberingOnBranch, landedLocal: true, merged, landedItems: [...landedThisPass], openHeadRefs: liveOpenHeadRefs({ verdicts, merged, prsByRepo: openPrContext.prsByRepo }).openHeadRefs, primary: resolvePrimaryPath(process.cwd(), { flag: flags.primary, env: env.WE_PRIMARY }), passCwd: process.cwd(), primaryHinted: !!((typeof flags.primary === 'string' && flags.primary.trim()) || (typeof env.WE_PRIMARY === 'string' && env.WE_PRIMARY.trim())), carriers: verdicts.filter((v) => v && v.hasManifest && v.item != null).map((v) => ({ item: v.item, repo: v.repo || null, isWe: isLocalRepo(v.repo), headRef: v.headRef, manifestRefs: v.manifestRefs })) }),
   });
   if (followup.handedOff) process.stderr.write(`merge-ai-prs · follow-up handed to job ${followup.job?.id} (${followup.job?.status}) — numbering/resolve/push/derived regen/primary sync run detached (x4y74wj)\n`);
   const __postMergeSyncT0 = __t.mark();
   let localSynced = false;
-  const landedLocalAny = !DRY_RUN && merged.some((m) => isLocalRepo(m.repo));
+  const landedLocalAny = !DRY_RUN && !localWriteRefusal && merged.some((m) => isLocalRepo(m.repo));
   const landedLocal = landedLocalAny && !followup.handedOff;
   // The pass's OWN checkout is refreshed inline even when the job takes the rest (cheap, and the duplicate-id
   // tripwire below reads this tree): the job only syncs a separate `primary`, so skipping this left a
@@ -7923,7 +7956,7 @@ export async function main(argv, { env = process.env, stdout = process.stdout, e
   let resolveOnLandReport = { resolved: [], alreadyResolved: [], deferred: [], failed: [] };
   if (mergeStrategy.enqueues(null) && !DRY_RUN) numbered = probeQueuedLand(process.cwd());
   const queuedHashOnMain = !!numbered.files?.length;
-  if (queuedHashOnMain && !landedLocal && !DRY_RUN) numbered = repairHashOnMain({ cwd: process.cwd() });
+  if (!localWriteRefusal && queuedHashOnMain && !landedLocal && !DRY_RUN) numbered = repairHashOnMain({ cwd: process.cwd() });
   if (landedLocal && !DRY_RUN) {
     if (queuedHashOnMain) process.stderr.write('  ⚠ FALLBACK: hash card(s) reached main under the merge queue — running the post-land JIT push so main does not stay red\n');
     // #2391 — number+publish is the NUMBERING CRITICAL SECTION (sole-serial-writer, #2288/#2290). Guard it with
@@ -8029,7 +8062,7 @@ export async function main(argv, { env = process.env, stdout = process.stdout, e
   // exactly what a real pass would resolve, without writing anything. `runStrandedSweepStep` never throws —
   // any failure (an unreadable `backlog/`, `git log` unavailable, a thrown resolve) is logged and this pass
   // continues exactly as if the sweep found nothing.
-  const strandedSweep = runStrandedSweepStep({ dryRun: DRY_RUN, asJson: AS_JSON, redMainHeld });
+  const strandedSweep = runStrandedSweepStep({ dryRun: DRY_RUN || !!localWriteRefusal, asJson: AS_JSON, redMainHeld });
 
   // #2318 — POST-LAND DUPLICATE-NNN TRIPWIRE (LOUD-ONLY, #xsyia6k). JIT numbering (#2288) makes two lanes racing
   // to one birth-NNN structurally rare, but a bug on ANY land path could still put two files at one numeric id on
@@ -8051,8 +8084,11 @@ export async function main(argv, { env = process.env, stdout = process.stdout, e
   // prior failed land is caught too — the detect is a cheap fs read, so a standing invariant is strictly stronger.
   let duplicateIdsOnMain = [];
   if (!DRY_RUN) {
-    duplicateIdsOnMain = __t.time('duplicateCheck', () => findDuplicateIds(join(process.cwd(), 'backlog')));
-    if (duplicateIdsOnMain.length && !AS_JSON) {
+    // Refused checkout sync leaves freshness unknown; never certify the stale local backlog.
+    duplicateIdsOnMain = localWriteRefusal ? null
+      : __t.time('duplicateCheck', () => findDuplicateIds(join(process.cwd(), 'backlog')));
+    if (duplicateIdsOnMain === null && !AS_JSON) process.stderr.write(`  ⚠ duplicate-ID tripwire UNKNOWN — checkout sync refused; operator must sync main and rerun the drain\n`);
+    if (duplicateIdsOnMain?.length && !AS_JSON) {
       process.stderr.write(`\n  ✗✗ TRIPWIRE (#2318): duplicate id(s) on main — ${summarizeDuplicates(duplicateIdsOnMain)}. The merge queue stays RED (exit 3) until this is resolved by hand: run \`node scripts/backlog-renumber-collisions.mjs --onto-ref=<pre-dup main sha>\` on main. NOT auto-healed (an unguarded sweep can clobber a surviving edge, #2314); NOT left silent.\n\n`);
     }
   }
@@ -8073,7 +8109,8 @@ export async function main(argv, { env = process.env, stdout = process.stdout, e
 
   // xtpxusq — retire the queue-merged PRs' follow-ups only now that numbering, resolve-on-land and derived regen are
   // done AND none of them reported a failure; otherwise they stay pending and the next pass reruns them (idempotent).
-  const queueFollowUpsClean = (!landedLocal || localSynced) && !numbered?.warning &&!(resolveOnLandReport.failed || []).length && !derived.warning && !(derived.failed || []).length;
+  // Capability refusal skips that work, so it must also keep the follow-ups pending for the operator.
+  const queueFollowUpsClean = !localWriteRefusal && (!landedLocal || localSynced) && !numbered?.warning &&!(resolveOnLandReport.failed || []).length && !derived.warning && !(derived.failed || []).length;
   mergeStrategy.confirmQueueFollowUps(queueFollowUps, { complete: queueFollowUpsClean });
 
   // #2222 — a healed tip is a PENDING rebuild (CI re-running on the renumbered tree), so it counts as progress
@@ -8111,8 +8148,12 @@ export async function main(argv, { env = process.env, stdout = process.stdout, e
     const mark = stuckUnknownMarks.get(`${alert.repo}#${alert.num}`);
     return mark && !mark.resolved;
   });
-  const result = { alerts, ok: duplicateIdsOnMain.length === 0, dryRun: DRY_RUN, label, repos: REPOS.map((r) => r || localSlug || 'cwd'), considered: verdicts.length, heldCoupleMembers, skipReasons, ...(overlapYieldSkips.length ? { overlapYieldSkips } : {}), toMerge: toMerge.map((v) => ({ num: v.num, repo: v.repo || localSlug, headSha: v.headSha ?? null, ...(v.resolutionBasis ? { resolutionBasis: v.resolutionBasis } : {}) })), merged, failed: failedMerges, ...(revalidationAborted.length ? { revalidationAborted } : {}), ...(coupleHeld.length ? { coupleHeld } : {}), ...(coupleSplit.length ? { coupleSplit } : {}), rebased, pendingRebased, healed, deferred, localSynced, ...(primarySynced !== null ? { primarySynced } : {}), ...(numbered.assigned.length ? { jitNumbered: numbered.assigned } : {}), ...(numbered.warning ? { numberingWarning: numbered.warning } : {}), ...(resolveOnLandReport.resolved.length || resolveOnLandReport.deferred.length || resolveOnLandReport.failed.length || resolveOnLandReport.alreadyResolved.length ? { resolveOnLand: resolveOnLandReport } : {}), ...((strandedSweep.autoResolvable.length || strandedSweep.applied.length || !strandedSweep.ok) ? { strandedSweep } : {}), ...(duplicateIdsOnMain.length ? { duplicateIdsOnMain } : {}), derivedRegenerated: derived.done, derivedFailed: derived.failed, ...(derived.warning ? { derivedWarning: derived.warning } : {}), reconciledLabels, ...(failedListings.length ? { failedRepos: failedListings.map((l) => ({ repo: l.repo || localSlug, kind: l.err.kind, text: l.err.text, retryable: !!l.err.retryable })) } : {}), parked, skipped: skipped.map((v) => ({ num: v.num, repo: v.repo || localSlug, reason: v.reason, ...(v.escalated ? { escalated: v.escalated } : {}), ...(v.humanRequired ? { humanRequired: true } : {}), headSha: v.headSha ?? null, ...(v.resolutionBasis ? { resolutionBasis: v.resolutionBasis } : {}) })), timings };
+  const result = { alerts, ok: duplicateIdsOnMain?.length === 0, dryRun: DRY_RUN, label, repos: REPOS.map((r) => r || localSlug || 'cwd'), considered: verdicts.length, heldCoupleMembers, skipReasons, ...(overlapYieldSkips.length ? { overlapYieldSkips } : {}), toMerge: toMerge.map((v) => ({ num: v.num, repo: v.repo || localSlug, headSha: v.headSha ?? null, ...(v.resolutionBasis ? { resolutionBasis: v.resolutionBasis } : {}) })), merged, failed: failedMerges, ...(revalidationAborted.length ? { revalidationAborted } : {}), ...(coupleHeld.length ? { coupleHeld } : {}), ...(coupleSplit.length ? { coupleSplit } : {}), rebased, pendingRebased, healed, deferred, localSynced, ...(primarySynced !== null ? { primarySynced } : {}), ...(numbered.assigned.length ? { jitNumbered: numbered.assigned } : {}), ...(numbered.warning ? { numberingWarning: numbered.warning } : {}), ...(resolveOnLandReport.resolved.length || resolveOnLandReport.deferred.length || resolveOnLandReport.failed.length || resolveOnLandReport.alreadyResolved.length ? { resolveOnLand: resolveOnLandReport } : {}), ...((strandedSweep.autoResolvable.length || strandedSweep.applied.length || !strandedSweep.ok) ? { strandedSweep } : {}), ...(duplicateIdsOnMain?.length ? { duplicateIdsOnMain } : {}), derivedRegenerated: derived.done, derivedFailed: derived.failed, ...(derived.warning ? { derivedWarning: derived.warning } : {}), reconciledLabels, ...(failedListings.length ? { failedRepos: failedListings.map((l) => ({ repo: l.repo || localSlug, kind: l.err.kind, text: l.err.text, retryable: !!l.err.retryable })) } : {}), parked, skipped: skipped.map((v) => ({ num: v.num, repo: v.repo || localSlug, reason: v.reason, ...(v.escalated ? { escalated: v.escalated } : {}), ...(v.humanRequired ? { humanRequired: true } : {}), headSha: v.headSha ?? null, ...(v.resolutionBasis ? { resolutionBasis: v.resolutionBasis } : {}) })), timings };
   if (enqueueOutcomes.length) result.enqueueOutcomes = enqueueOutcomes;
+  if (localWriteRefusal) result.localWriteRefusal = localWriteRefusal;
+  if (duplicateIdsOnMain === null) {
+    result.duplicateIdCheck = { status: 'unknown', reason: 'checkout-sync-refused', fallback: 'Operator must sync main and rerun the drain.' };
+  }
   if (followup.mode === 'job' || followup.job) result.followupJob = { handedOff: followup.handedOff, job: followup.job ?? null, actions: followup.actions ?? [], ...(followup.handedOff ? {} : { reason: followup.reason }) }; // x4y74wj — a launch-failed job rides along (handedOff:false) so the fallback to inline is visible
   return { result, merged, failedMerges, pendingRebased: pendingAll, deferred, duplicateIdsOnMain };
   }; // end sweepOnce
@@ -8265,9 +8306,13 @@ export async function main(argv, { env = process.env, stdout = process.stdout, e
     passes.push(result);
     allMerged.push(...merged);
     lastFailed = failedMerges;
-    lastDup = duplicateIdsOnMain || [];
+    lastDup = duplicateIdsOnMain;
     // #2318 — a duplicate id on main is a hard, LOUD stop: polling won't clear it (main is globally red), so
     // break the watch immediately and surface it rather than spinning idle passes over a broken main.
+    if (lastDup === null) {
+      if (!AS_JSON) process.stderr.write('watch: STOPPING — duplicate-ID tripwire unknown; operator must sync main and rerun the drain.\n');
+      break;
+    }
     if (lastDup.length) {
       if (!AS_JSON) process.stderr.write(`watch: STOPPING — duplicate id(s) survive on main (${summarizeDuplicates(lastDup)}); resolve by hand then re-run the drain.\n`);
       break;
@@ -8304,7 +8349,11 @@ export async function main(argv, { env = process.env, stdout = process.stdout, e
         passes.push(confirm.result);
         allMerged.push(...confirm.merged);
         lastFailed = confirm.failedMerges;
-        lastDup = confirm.duplicateIdsOnMain || [];
+        lastDup = confirm.duplicateIdsOnMain;
+        if (lastDup === null) {
+          if (!AS_JSON) process.stderr.write('watch: STOPPING — duplicate-ID tripwire unknown; operator must sync main and rerun the drain.\n');
+          break;
+        }
         if (lastDup.length) {
           if (!AS_JSON) process.stderr.write(`watch: STOPPING — duplicate id(s) survive on main (${summarizeDuplicates(lastDup)}); resolve by hand then re-run the drain.\n`);
           break;
@@ -8330,7 +8379,7 @@ export async function main(argv, { env = process.env, stdout = process.stdout, e
   if (!AS_JSON) process.stderr.write(`watch: stopped after ${passes.length} pass(es); merged ${allMerged.length} PR(s) total.\n`);
   // A red-main freeze already emitted its own stop payload (above) — don't double-emit; just exit 5.
   if (redMainStopped) exit(5);
-  if (AS_JSON) writeStdout(JSON.stringify({ ok: lastDup.length === 0, watch: true, label, interval: INTERVAL, maxIdle: MAX_IDLE, passes: passes.length, merged: allMerged, lastFailed, ...(lastDup.length ? { duplicateIdsOnMain: lastDup } : {}) }) + '\n');
+  if (AS_JSON) writeStdout(JSON.stringify({ ok: lastDup?.length === 0, watch: true, label, interval: INTERVAL, maxIdle: MAX_IDLE, passes: passes.length, merged: allMerged, lastFailed, ...(lastDup === null ? { duplicateIdCheck: { status: 'unknown', reason: 'checkout-sync-refused' } } : lastDup.length ? { duplicateIdsOnMain: lastDup } : {}) }) + '\n');
   const exitCode = passExitCode({ dup: lastDup, failed: lastFailed, mergedCount: allMerged.length });
   exit(exitCode);
 }
