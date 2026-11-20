@@ -65,13 +65,19 @@ export async function rollbackDegradedLoad({ root, ref, sha, fastPath, reason, e
   return { ...rollback, eventRecorded: eventRecorded === true };
 }
 
+/** Refusal evidence must name the registration, not merely mention its ref in prose. */
+export function matchesDegradedRegistration(detail, { ref, sha }) {
+  return (detail?.ref === ref || (Array.isArray(detail?.refs) && detail.refs.includes(ref)))
+    && (detail.sha === undefined || detail.sha === sha);
+}
+
 /** Called by the rebuild that owns smoke, including after prototype-load has returned pending. */
 export async function checkDegradedFailures({ root, result, env, now = () => Date.now(), ...deps }) {
   for (const pending of readPendingAdoptions(root, { env })) {
     if (!pending.degradedFastPath) continue;
     const refused = (result.alerts ?? []).find(a => /discard|reject|drop|refus|conflict/.test(a.kind)
       && !['expired', 'other-base', 'already-head'].includes(a.detail?.reason)
-      && JSON.stringify(a.detail ?? {}).includes(pending.ref));
+      && matchesDegradedRegistration(a.detail, pending));
     const smoked = /^(?:smoke-|dispatch-smoke-failed|still-rejected)/.test(result.reason ?? '')
       && result.plan?.applied?.some(a => a.ref === pending.ref && a.sha === pending.sha);
     const dropped = [...(result.fallback?.dropped ?? []), ...(result.setAside?.dropped ?? [])]

@@ -3,6 +3,28 @@ import scenario from './degraded-daemon-fast-path.mjs';
 import { defineBreakTest } from '../define-break-test.mjs';
 
 defineBreakTest(scenario);
+it.each([
+  ['sibling ref', ({ ref }) => ({ ref: `${ref}-other` })],
+  ['sibling refs array', ({ ref }) => ({ refs: [`${ref}-2`] })],
+  ['ref mentioned in prose', ({ ref }) => ({ message: `refused ${ref}` })],
+  ['malformed refs string', ({ ref }) => ({ refs: ref })],
+  ['same ref at another SHA', ({ ref }) => ({ ref, sha: 'f'.repeat(40) })],
+  ['same refs array at another SHA', ({ ref }) => ({ refs: [ref], sha: 'f'.repeat(40) })],
+])('R1075 does not withdraw a pending registration for an unrelated refusal: %s', async (_, refusalDetail) => {
+  const report = await scenario.run({ failure: 'ready-candidate-discarded', refusalDetail, expectRefusal: false });
+  expect(report.violations).toEqual([]);
+  expect(report.remains).toBe(true);
+  expect(report.eventAttempts).toBe(0);
+  expect(report.alerts).toBe('');
+});
+it.each([
+  ['ref', ({ ref, sha }) => ({ ref, sha })],
+  ['refs array', ({ ref }) => ({ refs: [`${ref}-other`, ref] })],
+])('R1075 withdraws the exact registration identified by %s', async (_, refusalDetail) => {
+  const report = await scenario.run({ failure: 'ready-candidate-discarded', refusalDetail });
+  expect(report.violations).toEqual([]);
+  expect(report.remains).toBe(false);
+});
 it.each(['pinned', 'edge', 'stacked', 'uncached-stack', 'moved-tip'])('R1075 preserves %s protections during withdrawal', async protection => {
   const report = await scenario.run({ protection });
   expect(report.violations).toEqual([]);

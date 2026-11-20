@@ -29,7 +29,7 @@ import { netDiffFingerprint, carriesAcross } from '../lib/net-diff-fingerprint.m
 import { mergeRefBase, planRetirements, planFetchFailed, resolveOriginRepository, defaultRetirePlanner } from './prototype-retire.mjs';
 import { ciUnitPlan, urgentLedger, urgentMarker, urgentReason, urgentKeyPath, normalizeUrgentRepo } from './urgent-verify-marker.mjs';
 import { assessDegraded } from './degraded-daemon.mjs';
-import { rollbackDegradedLoad } from './degraded-load-rollback.mjs';
+import { matchesDegradedRegistration, rollbackDegradedLoad } from './degraded-load-rollback.mjs';
 import { appendDaemonEvent, daemonEventsPath } from '../lib/daemon-events.mjs';
 const repo = resolve(dirname(fileURLToPath(import.meta.url)), '../..');
 
@@ -353,6 +353,7 @@ export function createPrototypeLoader({ exec, fs, now, sleep, env, settings, com
     let pendingAdoption = null;
     let degradedEventWritten = false;
     let degradedRegistrationPresent = false;
+    let degradedRegistrationUncertain = false;
     const stop = (reason, details = {}) => {
       Object.assign(out, reason === 'no-ready' ? { detail: 'readiness-unreadable',
         fallback: 'Repair unreadable readiness evidence and retry.' } : {}, details, { stopReason: reason });
@@ -895,6 +896,7 @@ export function createPrototypeLoader({ exec, fs, now, sleep, env, settings, com
         // Cancel tracking only with readable evidence that this clone/ref is absent.
         if (urgentIntent && !out.registered) {
           let absent = false;
+          degradedRegistrationUncertain = Boolean(out.degradedFastPath);
           try {
             const state = await readState(out.clone, { env: childEnv });
             absent = state?.corrupt === false && Array.isArray(state.overlays)
@@ -902,6 +904,7 @@ export function createPrototypeLoader({ exec, fs, now, sleep, env, settings, com
             degradedRegistrationPresent = Boolean(out.degradedFastPath) && state?.corrupt === false
               && Array.isArray(state.overlays) && state.overlays.every(e => safeRegistrationRef(e?.ref))
               && state.overlays.some(e => e.ref === out.effectiveRef);
+            if (absent || degradedRegistrationPresent) degradedRegistrationUncertain = false;
           } catch { /* Unknown state keeps the persisted urgent intent monitored. */ }
           if (absent) appendUrgent({ ...urgentIntent,
             type: 'prototype-load.urgent-registration-failed', status: 'registration-failed', at: new Date(now()).toISOString() });
@@ -953,10 +956,17 @@ export function createPrototypeLoader({ exec, fs, now, sleep, env, settings, com
       // Rebuilds currently emit to the self-sync state directory. Also read the requested overlay
       // sibling trail, so both the loader events and rebuild refusals are observed.
       const rebuildAlerts = join(env.WE_DAEMON_STATE_DIR || join(env.HOME, '.claude/daemon-self-sync-state'), `${basename(state)}.alerts.jsonl`);
+      const refusalRecords = path => {
+        const records = jsonLines(read(path));
+        if (!out.degradedFastPath) return records;
+        const registration = { ref: out.effectiveRef, sha: out.effectiveSha };
+        return records.filter(record => matchesDegradedRegistration(record, registration)
+          || matchesDegradedRegistration(record?.detail, registration));
+      };
       for (;;) {
-        const alerts = refusal(jsonLines(read(`${state}.alerts.jsonl`)), out.effectiveRef, registeredAt, true)
-          || refusal(jsonLines(read(rebuildAlerts)), out.effectiveRef, registeredAt, true)
-          || refusal(jsonLines(read(`${state}.events.jsonl`)), out.effectiveRef, registeredAt);
+        const alerts = refusal(refusalRecords(`${state}.alerts.jsonl`), out.effectiveRef, registeredAt, true)
+          || refusal(refusalRecords(rebuildAlerts), out.effectiveRef, registeredAt, true)
+          || refusal(refusalRecords(`${state}.events.jsonl`), out.effectiveRef, registeredAt);
         if (alerts) {
           if (out.degradedFastPath) {
             out.rollback = await rollbackDegradedLoad({ root: out.clone, ref: out.effectiveRef, sha: out.effectiveSha,
@@ -1029,9 +1039,9 @@ export function createPrototypeLoader({ exec, fs, now, sleep, env, settings, com
       }
       // Pending is the only outcome that delegates its adoption notice to the rebuild path. Do not leave
       // refused/unverifiable loads or a load already adopted during its wait to emit misleading notices.
-      // A degraded load that failed after registration and ran no rollback keeps its pending-adoption tracking, so the
+      // A degraded load whose registration succeeded or cannot be ruled out keeps its pending-adoption tracking, so the
       // asynchronous smoke-failure rollback can still find it; only a finished rollback or an adopted load clears it.
-      const keepDegradedTracking = Boolean(out.degradedFastPath) && Boolean(out.registered || degradedRegistrationPresent) && !out.ok && !out.rollback;
+      const keepDegradedTracking = Boolean(out.degradedFastPath) && Boolean(out.registered || degradedRegistrationPresent || degradedRegistrationUncertain) && !out.ok && !out.rollback;
       if (out.adoptionEventTracked && !keepDegradedTracking && (!out.rollback || (out.rollback.retired === true && out.rollback.eventRecorded)) && (out.result !== 'registered-pending' || !out.ok)) {
         clearPendingAdoption(out.clone, pendingAdoption, { env: childEnv, fs });
       }

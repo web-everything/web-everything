@@ -19,7 +19,8 @@ export default {
   fixPresent() {
     return assessDegraded({ events: [signal], daemon: 'control', clone: 'wev-control', now, afterMinutes: 60 }).degraded;
   },
-  async run({ failure = 'smoke-rejected', retire, readState, failEventOnce = false, adopted = false, protection } = {}) {
+  async run({ failure = 'smoke-rejected', retire, readState, failEventOnce = false, adopted = false, protection,
+    refusalDetail, expectRefusal = true } = {}) {
     return withBareOrigin(async repo => {
       const dir = repo.tmp;
       const violations = [];
@@ -50,7 +51,7 @@ export default {
         violations.push('pending fast-path evidence was not persisted');
       if (protection === 'moved-tip') repo.seedOriginBranch(ref, { 'later.mjs': 'export const later = true;\n' }, ref);
       const result = { adopted, moved: adopted, reason: failure, plan: { applied: [{ ref, sha }] }, alerts: failure === 'ready-candidate-discarded'
-        ? [{ kind: failure, detail: { refs: [ref], reason: 'superseded-omits-live-overlay' } }] : [] };
+        ? [{ kind: failure, detail: refusalDetail ? refusalDetail({ ref, sha }) : { refs: [ref], reason: 'superseded-omits-live-overlay' } }] : [] };
       let eventAttempts = 0, pendingAfterFailedEvent;
       const check = () => checkDegradedFailures({ root, result, env, now: () => now + 1000,
         emit: async (event, opts) => {
@@ -70,15 +71,18 @@ export default {
       }
       const remains = readOverlayState(root, { env }).overlays.some(r => r.ref === ref);
       const protectedRegistration = protection && protection !== 'open-pr';
-      if (!adopted && !retire && !readState && !protectedRegistration && remains) violations.push('failed candidate registration remained');
-      if (!adopted && !retire && !readState && !protectedRegistration && readPendingAdoptions(root, { env }).length) violations.push('retired candidate retained pending tracking');
+      if (expectRefusal && !adopted && !retire && !readState && !protectedRegistration && remains) violations.push('failed candidate registration remained');
+      if (expectRefusal && !adopted && !retire && !readState && !protectedRegistration && readPendingAdoptions(root, { env }).length) violations.push('retired candidate retained pending tracking');
+      if (!expectRefusal && !remains) violations.push('unrelated refusal withdrew the pending registration');
+      if (!expectRefusal && readPendingAdoptions(root, { env }).length !== 1) violations.push('unrelated refusal cleared pending tracking');
       if (protectedRegistration && !remains) violations.push('protected registration was withdrawn');
       if (fs.readFileSync(join(root, 'running-build'), 'utf8') !== 'previous-build') violations.push('previous build changed');
       const events = fs.readFileSync(env.WE_DAEMON_EVENTS, 'utf8').trim().split('\n').map(JSON.parse);
-      if (!adopted && !events.some(e => e.kind === 'prototype-load.degraded-fast-path-failed' && e.detail?.marker?.sig === 'receipt-marker'))
+      if (expectRefusal && !adopted && !events.some(e => e.kind === 'prototype-load.degraded-fast-path-failed' && e.detail?.marker?.sig === 'receipt-marker'))
         violations.push('failure event lost evidence or receipt');
-      const alerts = adopted ? '' : fs.readFileSync(alertsFilePath(root, env), 'utf8');
-      if (!adopted && !alerts.includes('NEEDS-YOU')) violations.push('failure did not escalate NEEDS-YOU');
+      const alertsPath = alertsFilePath(root, env);
+      const alerts = fs.existsSync(alertsPath) ? fs.readFileSync(alertsPath, 'utf8') : '';
+      if (expectRefusal && !adopted && !alerts.includes('NEEDS-YOU')) violations.push('failure did not escalate NEEDS-YOU');
       return { violations, remains, events, alerts, pendingAfterFailedEvent, eventAttempts };
     });
   },

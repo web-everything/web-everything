@@ -3494,6 +3494,24 @@ describe('R1075 degraded daemon admission', () => {
     expect([...f.pendingFiles.values()]).toHaveLength(1);
     expect(f.records.some(r => r.kind === 'prototype-load.degraded-fast-path')).toBe(true);
   });
+  it.each([
+    ['corrupt', { corrupt: true, overlays: [] }],
+    ['missing corruption status', { overlays: [] }],
+    ['missing overlays', { corrupt: false }],
+    ['malformed entry', { corrupt: false, overlays: [null] }],
+    ['invalid ref', { corrupt: false, overlays: [{ ref: '../invalid' }] }],
+    ['throwing', new Error('registry unreadable')],
+  ])('retains deferred rollback tracking after a failed add with a %s registry read', async (_, state) => {
+    const f = degraded({ addFails: true, persistBeforeAddFailure: true,
+      readState: () => { if (state instanceof Error) throw state; return state; } });
+    expect(await f.run()).toMatchObject({ ok: false, registered: false, stopReason: 'register-failed' });
+    expect(f.admitted).toEqual([{ ref: BASE.branch }]);
+    expect([...f.pendingFiles.values()]).toHaveLength(1);
+    const [pending] = JSON.parse([...f.pendingFiles.values()][0]);
+    expect(pending).toMatchObject({ ref: BASE.branch, sha: SHA, degradedFastPath: { marker } });
+    expect(f.records.some(r => r.type === 'prototype-load.urgent-registration-failed')).toBe(false);
+    expect(f.records.some(r => r.kind === 'prototype-load.degraded-fast-path')).toBe(false);
+  });
   it('records no admitted fast-path event on early refusal', async () => {
     const f = degraded({ ready: '' });
     expect(await f.run()).toMatchObject({ ok: false, registered: false });
@@ -3551,9 +3569,27 @@ describe('R1075 degraded daemon admission', () => {
     expect(await f.run()).toMatchObject({ ok: false, stopReason: 'no-canonical-audit', detail: 'security-finding' });
     expect(mutations(f, 'add')).toHaveLength(0);
   });
-  it('refused smoke withdraws the candidate through retirement and raises NEEDS-YOU', async () => {
+  it.each([
+    ['sibling ref', { ref: `${BASE.branch}-other` }],
+    ['sibling refs array', { refs: [`${BASE.branch}-2`] }],
+    ['prose mention', { message: `refused ${BASE.branch}` }],
+    ['malformed refs string', { refs: BASE.branch }],
+    ['another SHA', { ref: BASE.branch, sha: TREE }],
+  ])('does not roll back a degraded load during its wait for %s refusal evidence', async (_, detail) => {
+    const retire = vi.fn(), needsYou = vi.fn();
+    const f = degraded({ alerts: JSON.stringify({ at: new Date(0).toISOString(), kind: 'smoke-rejected', detail }),
+      removeRegistration: retire, needsYou });
+    expect(await f.run()).toMatchObject({ ok: true, registered: true });
+    expect(retire).not.toHaveBeenCalled();
+    expect(needsYou).not.toHaveBeenCalled();
+    expect(f.records.some(r => r.kind === 'prototype-load.degraded-fast-path-failed')).toBe(false);
+  });
+  it.each([
+    { detail: { ref: BASE.branch } },
+    { ref: BASE.branch, detail: { message: 'smoke rejected' } },
+  ])('refused smoke withdraws the candidate through retirement and raises NEEDS-YOU (%j)', async identity => {
     const retire = vi.fn(async () => ({ retired: true })), needsYou = vi.fn();
-    const f = degraded({ alerts: JSON.stringify({ at: new Date(0).toISOString(), kind: 'smoke-rejected', detail: { ref: BASE.branch } }), removeRegistration: retire, needsYou,
+    const f = degraded({ alerts: JSON.stringify({ at: new Date(0).toISOString(), kind: 'smoke-rejected', ...identity }), removeRegistration: retire, needsYou,
       retirePlan: ({ rows }) => rows.map(r => ({ ref: r.ref, action: 'retire', reason: 'pr-merged', tip: SHA })) });
     expect(await f.run()).toMatchObject({ ok: false, stopReason: 'adoption-refused', registered: false, rollback: { retired: true }, needsYou: true });
     expect(retire).toHaveBeenCalledWith(expect.objectContaining({ ref: BASE.branch, expectedTip: SHA, expectedEntry: { ref: BASE.branch } }));
