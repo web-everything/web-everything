@@ -286,24 +286,35 @@ it.each([readDrainRedTeamEvidence, readRecoveryWitness])('a capped scan cannot h
   expect(result).toMatchObject({ ok: false, reason: 'scan-capped' });
   expect(warnings.join(' ')).toContain('HOLD and inspect omitted runs');
 });
-it.each(['changes', 'unknown', {}, false, 0, '', { outcome: 'needs-work' }].flatMap(verdict =>
-  ['pending', 'refused'].map(status => [verdict, status])))('rejecting verdict %j with %s effect is kept and a historical tombstone still holds', (verdict, status) => {
+it.each([
+  [{ verdict: 'changes' }, 'review-unfinished'],
+  [{ verdict: 'unknown' }, 'review-unfinished'],
+  // The evidence reader rejects malformed records before classifying unfinished work.
+  ...['changes', 'unknown', {}, false, 0, '', { outcome: 'needs-work' }].map(verdict => [verdict, 'scan-capped']),
+].flatMap(([verdict, reason]) => ['pending', 'refused'].map(status => [verdict, status, reason])))('rejecting verdict %j with %s effect is kept and a historical tombstone still holds (%s)', (verdict, status, reason) => {
   const r = fixture(); r.verdict = verdict; r.effects = [{ ...r.effects[1], status,
     ...(status === 'refused' ? { attempts: 1, error: 'SELF-CLEAR REFUSED before any write' } : {}) }];
   r.outcome = status === 'refused' ? 'refused' : null;
   if (status === 'refused') r.pending = null;
   writeRun(r, dir); utimesSync(runPath(r.id, dir), (now - 8 * 60 * MIN) / 1000, (now - 8 * 60 * MIN) / 1000);
   const before = evidence();
-  expect(before).toMatchObject({ ok: false, reason: 'review-unfinished' });
+  expect(before).toMatchObject({ ok: false, reason });
   expect(op(['--apply']).result.kept['rejecting-verdict']).toEqual([r.id]);
   expect(isRunAbandoned(r.id, dir)).toBe(false);
   completed(r, now - 60 * MIN, 'review-pr-old');
   markRunAbandoned({ id: r.id, dir, now, reason: 'historical tombstone', by: 'fixture', probes: {} });
   expect(isRunAbandoned(r.id, dir)).toBe(true);
   for (const reader of [readDrainRedTeamEvidence, readRecoveryWitness]) {
-    expect(evidence(7109, reader)).toMatchObject({ ok: false, reason: 'review-unfinished' });
+    const held = evidence(7109, reader);
+    expect(held).toMatchObject({ ok: false, reason });
+    expect(held.loopPayload).toBeFalsy();
   }
-  expect(before.settleBounds.completeHeadRead({ pr: 7109, head, at: now + MIN })).toEqual({ complete: true, blocked: true });
+  if (reason === 'review-unfinished') {
+    expect(before.settleBounds.completeHeadRead({ pr: 7109, head, at: now + MIN })).toEqual({ complete: true, blocked: true });
+  } else {
+    // Invalid evidence cannot expose comment-settlement bounds as a route around the hold.
+    expect(before.settleBounds).toBeUndefined();
+  }
 });
 it('planner ignores abandoned parked runs, including cached/injected evidence, and sees rewrites again', () => {
   const r = fixture(), pr = { number: 7109, headRefOid: head, comments: [] };

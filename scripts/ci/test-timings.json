@@ -784,7 +784,6 @@
   "scripts/conveyor/soak/__tests__/run-shard-plan.test.mjs": 0.01,
   "scripts/conveyor/soak/__tests__/shard-files.test.mjs": 2.7,
   "scripts/conveyor/soak/__tests__/soak-scope.test.mjs": 39.21,
-  "scripts/conveyor/soak/breaks/review-abandon-redo.soak.test.mjs": 1,
   "scripts/design-refs/__tests__/archive-quarantine.test.mjs": 0.01,
   "scripts/design-refs/__tests__/benchmark.test.mjs": 0.01,
   "scripts/design-refs/__tests__/codification.test.mjs": 0.02,
