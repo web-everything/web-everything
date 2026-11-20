@@ -5343,10 +5343,19 @@ format-only pin check. Tick-start uses the same strict readers as early/recovery
 wrong-type, wrong-shape and EACCES evidence, preserving pending notifications and bytes.
 Legacy records may omit backoff fields, env-timeout retryAt and lease adoptOnly.
 Force-watch health checks and owed rollback still run outside between-tick launches
-when unrelated admission evidence refuses. That bounded watch scope validates its
-own rebuild state, ready and watch evidence; it must never fall back to empty evidence
-or erase corrupt state while attempting rollback. Launch ownership and strict evidence
-are separate concerns: keep isBetweenTickLaunch and the once-per-tick watch tests.
+before strict admission reads, even when unrelated admission evidence refuses. Only
+the watch record is required for that bounded scope. Corrupt ready/state evidence
+must neither suppress rollback nor be erased or replaced with empty evidence: use
+the intact watch's last-good target with the locked, clean-tree rollback helper when
+normal finalization cannot preserve those files. Admission afterwards still refuses
+adopt/launch with `state-unreadable` and emits its failure once. Preserve arrival health
+checks for newly installed watched builds without counting an existing watch twice.
+An in-memory owed rollback still refuses a second force request during that call,
+including when the watch merely confirms HEAD is already at last-good; preserve
+the existing request-consumption test alongside rollback-before-admission ordering.
+Keep isBetweenTickLaunch and the once-per-tick watch tests; the force-adopt matrix
+covers corrupt ready, rebuild state and pending adoptions, including owed rollback
+and byte-preserving between-tick refusal.
 
 
 ### Persisted rebuild producer compatibility

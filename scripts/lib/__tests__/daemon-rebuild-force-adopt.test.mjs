@@ -23,6 +23,7 @@ import { cloneKeyOf } from '../daemon-last-good.mjs';
 import { gitRun } from '../main-staleness.mjs';
 import * as rebuildJob from '../daemon-rebuild/rebuild-job.mjs';
 import * as rebuildPrepare from '../daemon-rebuild/prepare.mjs';
+import { pendingAdoptionPath } from '../overlay-adoption.mjs';
 import { withWriteLock } from '../daemon-clone-lock.mjs';
 // Pre-dates daemonRebuild.skipUnrelated: these tests assert a smoke runs for non-code moves, so pin the knob off.
 process.env.WE_DAEMON_REBUILD_SKIP_UNRELATED = '0';
@@ -810,6 +811,111 @@ describe('R508 force-adopt: a force-adopted build stays unverified (never the in
     expect(headOf(cloneDir)).toBe(F); // F is force-adopted
     return { originDir, cloneDir, env, F };
   };
+
+  describe.each([
+    ['ready', (root, env) => join(env.WE_DAEMON_STATE_DIR, `${cloneKeyOf(root)}.ready.json`)],
+    ['state', rebuildStatePath],
+    ['pending-adoptions', pendingAdoptionPath],
+  ])('corrupt %s does not gate force-watch rollback', (_evidence, evidencePath) => {
+    it.each([
+      ['tick-start', { launchedBy: 'tick-start', launchOnly: true, asJob: true }],
+      ['inline', { launchedBy: 'early', asJob: false }],
+      ['adopt-only', { adoptOnly: true, asJob: false }],
+    ])('%s rolls back before strict admission refuses adopt and launch', async (_call, options) => {
+      const { cloneDir, env } = await forceAdoptF();
+      const watch = readForceWatch(cloneDir, env);
+      writeFileSync(join(env.WE_DAEMON_STATE_DIR, `${cloneKeyOf(cloneDir)}.force-watch.json`),
+        JSON.stringify({ ...watch, adoptedSeen: false, rollbackPending: 'health-failed' }));
+      const file = evidencePath(cloneDir, env);
+      mkdirSync(dirname(file), { recursive: true });
+      const corrupt = Buffer.from('{corrupt\n');
+      writeFileSync(file, corrupt);
+      const probe = vi.fn(healthy);
+      const run = vi.fn(gitRun);
+      const smoke = passing();
+      const emitEvent = vi.fn();
+      const prepare = vi.spyOn(rebuildPrepare, 'prepareRebuild');
+      const launch = vi.spyOn(rebuildJob, 'rebuildCloneAsJob');
+
+      const result = await tick(cloneDir, env, { ...options, run, runSmoke: smoke, forceWatchProbe: probe, emitEvent });
+
+      expect(probe).toHaveBeenCalledTimes(1);
+      expect(run).toHaveBeenCalledWith(['reset', '--hard', watch.lastGood.head], expect.any(Object));
+      expect(headOf(cloneDir)).toBe(watch.lastGood.head);
+      expect(readForceWatch(cloneDir, env)).toBeNull();
+      expect(readFileSync(file)).toEqual(corrupt);
+      expect(result).toEqual({ moved: false, reason: 'state-unreadable' });
+      expect(prepare).not.toHaveBeenCalled();
+      expect(launch).not.toHaveBeenCalled();
+      expect(smoke).not.toHaveBeenCalled();
+      expect(emitEvent.mock.calls.filter(([event]) => event.kind === 'rebuild-failed'))
+        .toEqual([[expect.objectContaining({ detail: { reason: 'state-unreadable' } }), expect.any(Object)]]);
+    });
+
+    it('tick-start probes before admission reads and advances a healthy watch exactly once', async () => {
+      const { cloneDir, env } = await forceAdoptF();
+      const before = readForceWatch(cloneDir, env);
+      const file = evidencePath(cloneDir, env);
+      mkdirSync(dirname(file), { recursive: true });
+      writeFileSync(file, '{corrupt');
+      const probe = vi.fn(healthy);
+      const pendingFile = pendingAdoptionPath(cloneDir, env);
+      const evidenceRead = vi.fn((path, ...args) => {
+        if (path === pendingFile || path === rebuildStatePath(cloneDir, env)) expect(probe).toHaveBeenCalledTimes(1);
+        return readFileSync(path, ...args);
+      });
+      expect(await tick(cloneDir, env, { launchedBy: 'tick-start', launchOnly: true, asJob: true, evidenceRead, forceWatchProbe: probe }))
+        .toEqual({ moved: false, reason: 'state-unreadable' });
+      expect(probe).toHaveBeenCalledTimes(1);
+      expect(readForceWatch(cloneDir, env)).toEqual({ ...before, ticksLeft: before.ticksLeft - 1, version: before.version + 1 });
+      expect(readFileSync(file, 'utf8')).toBe('{corrupt');
+      expect(headOf(cloneDir)).toBe(before.sha);
+    });
+
+    it.each(['early', 'recovery'])('between-tick %s refuses without probing or changing owed rollback evidence', async (launchedBy) => {
+      const { cloneDir, env } = await forceAdoptF();
+      const watch = readForceWatch(cloneDir, env);
+      const watchFile = join(env.WE_DAEMON_STATE_DIR, `${cloneKeyOf(cloneDir)}.force-watch.json`);
+      writeFileSync(watchFile, JSON.stringify({ ...watch, rollbackPending: 'health-failed' }));
+      const file = evidencePath(cloneDir, env);
+      mkdirSync(dirname(file), { recursive: true });
+      writeFileSync(file, '{corrupt');
+      const files = [file, watchFile, rebuildStatePath(cloneDir, env)];
+      const bytes = files.map(path => readFileSync(path));
+      const probe = vi.fn(healthy);
+      const run = vi.fn(gitRun);
+      const emitEvent = vi.fn();
+      expect(await tick(cloneDir, env, { launchedBy, launchOnly: true, asJob: true, forceWatchProbe: probe, run, emitEvent }))
+        .toEqual({ moved: false, reason: 'state-unreadable' });
+      expect(probe).not.toHaveBeenCalled();
+      expect(run).not.toHaveBeenCalled();
+      expect(files.map(path => readFileSync(path))).toEqual(bytes);
+      expect(headOf(cloneDir)).toBe(watch.sha);
+      expect(emitEvent).toHaveBeenCalledTimes(1);
+      expect(emitEvent).toHaveBeenCalledWith(expect.objectContaining({ kind: 'rebuild-failed', detail: { reason: 'state-unreadable' } }), expect.any(Object));
+    });
+  });
+
+  it('corrupt state with a dirty tree retains owed rollback without overwriting either file', async () => {
+    const { cloneDir, env } = await forceAdoptF();
+    const watch = readForceWatch(cloneDir, env);
+    writeFileSync(join(env.WE_DAEMON_STATE_DIR, `${cloneKeyOf(cloneDir)}.force-watch.json`),
+      JSON.stringify({ ...watch, rollbackPending: 'health-failed' }));
+    const stateFile = rebuildStatePath(cloneDir, env);
+    writeFileSync(stateFile, '{corrupt');
+    const dirtyFile = join(cloneDir, 'README.md');
+    writeFileSync(dirtyFile, 'local edit\n');
+    const probe = vi.fn(healthy);
+    const run = vi.fn(gitRun);
+    expect(await tick(cloneDir, env, { asJob: false, forceWatchProbe: probe, run }))
+      .toEqual({ moved: false, reason: 'state-unreadable' });
+    expect(probe).toHaveBeenCalledTimes(1);
+    expect(run.mock.calls.some(([args]) => args[0] === 'reset')).toBe(false);
+    expect(headOf(cloneDir)).toBe(watch.sha);
+    expect(readForceWatch(cloneDir, env)).toMatchObject({ sha: watch.sha, rollbackPending: 'health-failed' });
+    expect(readFileSync(stateFile, 'utf8')).toBe('{corrupt');
+    expect(readFileSync(dirtyFile, 'utf8')).toBe('local edit\n');
+  });
 
   it('a head-only last-good watch rolls back with the persisted production shape accepted by strict reads', async () => {
     const { cloneDir, env } = await forceAdoptF();

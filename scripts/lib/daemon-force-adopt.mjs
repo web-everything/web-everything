@@ -190,6 +190,8 @@ function retireWatch(root, env, { sha = null, unlessRan = false } = {}) {
  *  sticky-rejection bypass asks it too, so a force that `recordForcedAdoption` would refuse never triggers a full re-smoke per tick.
  *  A watch is open (`watch-already-open`), exists but is unreadable (`watch-unreadable`), or a rollback is owed that never reached disk (`rollback-owed`). */
 export function forceBlockedReason(root, env = process.env) {
+  const held = rebuildReaders()?.forceAdoptBlocker?.(root, env);
+  if (held) return held;
   if (readForceWatch(root, env)) return 'watch-already-open';
   if (watchUnreadable(root, env)) return 'watch-unreadable'; // fail closed: an unreadable watch may be an open one
   if (pendingRollbacks.has(watchPath(root, env))) return 'rollback-owed'; // never adopt over an unpaid rollback

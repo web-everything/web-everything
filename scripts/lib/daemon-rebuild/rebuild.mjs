@@ -16,7 +16,7 @@ import { gitRun } from '../main-staleness.mjs';
 import { runLiveSmokeWithRetry } from '../daemon-live-smoke.mjs';
 import { acquireSmokeSlot } from '../daemon-smoke-slots.mjs';
 import { withWriteLock } from '../daemon-clone-lock.mjs';
-import { runForceWatchTick, readForceAdopt } from '../daemon-force-adopt.mjs';
+import { runForceWatchTick, readForceAdopt, forceBlockedReason } from '../daemon-force-adopt.mjs';
 import { finalizeRebuild } from './adopt.mjs';
 import { defaultPrState } from './edge-fetch.mjs';
 import {
@@ -27,6 +27,7 @@ import {
 import { readReadyCandidate, readRebuildState, writeRebuildState, clearReadyCandidate } from './state.mjs';
 import { verifyRev, makeGit } from './shared.mjs';
 import { makeSkipCheck } from './skip-unrelated.mjs';
+import { rollbackUnverified } from './local-state.mjs';
 import { prepareRebuild } from './prepare.mjs';
 import { smokeAndAdopt } from './smoke.mjs';
 import { resolveVersionedContext, versionedRebuild } from '../daemon-version-runtime.mjs';
@@ -118,18 +119,16 @@ export async function rebuildClone({ emitEvent = appendDaemonEvent, ...options }
     const startedAtMs = Date.now();
     let result;
     try {
+      const watch = await forceWatch(options, emitEvent, startedAtMs);
       readers.validate(options.root, { ...(options.env ?? process.env), ...options.stateOpts?.env });
-      result = await rebuildCloneWithReaders(emitEvent, options);
+      // Paying a memory-only rollback must not authorize a second force request
+      // in this same call. Preserve its existing refusal/consumption path.
+      const admissionReaders = watch?.blocker === 'rollback-owed'
+        ? { ...readers, forceAdoptBlocker: root => root === options.root ? watch.blocker : null } : readers;
+      result = await withRebuildReaders(admissionReaders, () => rebuildCloneWithReaders(emitEvent, options, watch, startedAtMs));
     } catch (error) {
       if (!(error instanceof RebuildEvidenceError)) throw error;
       (options.log ?? console).error?.(error.message);
-      if (!isBetweenTickLaunch(options)) {
-        try { await forceWatch(options, emitEvent, startedAtMs); }
-        catch (watchError) {
-          if (!(watchError instanceof RebuildEvidenceError)) throw watchError;
-          (options.log ?? console).error?.(watchError.message);
-        }
-      }
       result = { moved: false, reason: 'state-unreadable' };
     }
     await emitRebuildResult(emitEvent, options, result);
@@ -160,9 +159,10 @@ async function emitRebuildResult(emitEvent, options, result) {
   } catch { /* Event failures must never change the rebuild outcome. */ }
 }
 
-async function rebuildCloneWithReaders(emitEvent, options) {
-  const startedAtMs = Date.now();
-  const result = await rebuildCloneInternal(options);
+async function rebuildCloneWithReaders(emitEvent, options, watch, startedAtMs) {
+  // Do not undo a completed rollback, or install another build while rollback is owed.
+  const rollbackTick = watch?.tick?.rolledBack === true || watch?.tick?.action === 'rollback-failed';
+  const result = rollbackTick ? { moved: false, adopted: false, reason: 'needs-build', alerts: [] } : await rebuildCloneInternal(options);
   const { waitInFlightTickMs, waitSmokeSlotMs } = result;
   // Keep the caller's enumerable result contract stable. The CLI explicitly serializes this record
   // for the detached job; ordinary equality checks, spreads and JSON retain the legacy shape.
@@ -186,7 +186,13 @@ async function rebuildCloneWithReaders(emitEvent, options) {
       emit: (event) => emitEvent(event, eventOptions),
     });
   } catch { /* Event failures must never change the rebuild outcome. */ }
-  await forceWatch(options, emitEvent, startedAtMs);
+  // Preserve arrival health checks when this invocation installs a watched build.
+  // An existing running watch already counted its tick before admission; arrival
+  // checks may follow the newly installed HEAD but must not count it a second time.
+  if (!watch?.present || result.moved === true) {
+    const arrivalOnly = watch?.present && watch.tick?.action !== 'waiting';
+    await forceWatch(options, emitEvent, arrivalOnly ? -Infinity : startedAtMs);
+  }
   return result;
 }
 
@@ -194,26 +200,38 @@ async function rebuildCloneWithReaders(emitEvent, options) {
  *  clone to the last-good build on a failed check or a crash loop. Evidence errors refuse the rebuild;
  *  readyOnly and between-tick launches skip it. */
 async function forceWatch(options, emitEvent, startedAtMs) {
-  // Health checks and owed rollback still run when unrelated admission evidence
-  // refuses. Their own state, ready and watch evidence must remain strict.
+  // Only the watch is required to check health and pay an owed rollback. Admission
+  // validates every other file afterwards; corrupt evidence must survive for repair.
   if (!options.root || options.readyOnly || isBetweenTickLaunch(options)) return;
   const readers = createRebuildReaders({ strict: true, read: options.evidenceRead });
+  const ready = (root, env) => {
+    try { return readers.ready(root, env); }
+    catch (error) { if (!(error instanceof RebuildEvidenceError)) throw error; return null; }
+  };
+  // Normal finalization still revalidates the files it writes. This is a write
+  // guard, never a prerequisite for the watch's health probe or clean-tree rollback.
   const validate = (root, env) => {
     readers.state(root, env); readers.ready(root, env); readers.forceWatch(root, env);
   };
-  return withRebuildReaders({ ...readers, validate }, () => {
-    validate(options.root, { ...(options.env ?? process.env), ...options.stateOpts?.env });
-    return forceWatchAtTick(options, emitEvent, startedAtMs);
+  return withRebuildReaders({ ...readers, ready, validate }, async () => {
+    const blocker = forceBlockedReason(options.root, { ...(options.env ?? process.env), ...options.stateOpts?.env });
+    const tick = await forceWatchAtTick(options, emitEvent, startedAtMs, readers);
+    return { present: blocker !== null, blocker, tick };
   });
 }
 
-async function forceWatchAtTick(options, emitEvent, startedAtMs) {
+async function forceWatchAtTick(options, emitEvent, startedAtMs, readers) {
   const { root, env = process.env, log = console, run = gitRun, stateOpts = {}, now = () => Date.now(), readyOnly = false, adoptOnly = false } = options;
   const betweenTicks = !adoptOnly && isBetweenTickLaunch(options);
   if (!root || readyOnly || betweenTicks) return;
   const stEnv = { ...env, ...(stateOpts?.env || {}) };
+  let rolledBack = false;
+  const clearReady = () => {
+    try { readers.ready(root, stEnv); clearReadyCandidate(root, stEnv); }
+    catch (error) { if (!(error instanceof RebuildEvidenceError)) throw error; }
+  };
   try {
-    await runForceWatchTick({
+    const tick = await runForceWatchTick({
       root, env: stEnv, notBefore: startedAtMs, currentHead: () => verifyRev(makeGit({ run, cwd: root, env }), 'HEAD'), emit: (e) => emitEvent(e, { env: { WE_DAEMON_EVENTS: process.env.WE_DAEMON_EVENTS, ...options.env } }),
       probe: options.forceWatchProbe ?? defaultForceWatchProbe(run, env),
       rollback: async (lastGood, { sha } = {}) => {
@@ -224,19 +242,29 @@ async function forceWatchAtTick(options, emitEvent, startedAtMs) {
         const fin = await withWriteLock(root, async () => {
           const head = verifyRev(git, 'HEAD');
           if (!head) return { ok: false }; // HEAD unreadable: unknown is not "superseded" — the rollback stays owed and is retried
-          if (head === lastGood.head) { clearReadyCandidate(root, stEnv); return { ok: true }; } // already reverted
+          if (head === lastGood.head) { clearReady(); return { ok: true }; } // already reverted
           if (head !== sha) return { superseded: true, head };
-          clearReadyCandidate(root, stEnv);
+          clearReady();
+          try { readers.state(root, stEnv); readers.ready(root, stEnv); }
+          catch (error) {
+            if (!(error instanceof RebuildEvidenceError)) throw error;
+            // No corrupt evidence can be reconstructed or erased safely. The intact
+            // watch authorizes only reverting its running SHA to last-good.
+            rolledBack = rollbackUnverified({ git, prevHead: lastGood.head });
+            return { ok: rolledBack };
+          }
           const done = await finalizeRebuild({
             root, env, log, run, stateOpts, now, prevHead: head, lease: { token: 'force-adopt-rollback' },
             plan: { ok: true, finalSha: lastGood.head, inputsKey: lastGood.inputsKey, mainSha: lastGood.mainSha, applied: lastGood.applied || [] },
           });
-          return { ok: done?.adopted === true };
+          rolledBack = done?.adopted === true;
+          return { ok: rolledBack };
         }, { now });
         if (fin.ok !== true) return { ok: false };
         return fin.value;
       },
     });
+    return { ...tick, rolledBack };
   } catch (error) {
     if (error instanceof RebuildEvidenceError) throw error;
     // A health probe failure retains the existing watch retry policy.
