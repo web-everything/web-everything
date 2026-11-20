@@ -2430,7 +2430,7 @@ function provisionClaimedLane(repo, chosen, targetWasReserved, { beforeDestructi
       if (dirty || !provablyPushed) {
         // #3407 — THROWS (was `fail()`, uncatchable) so a caller can restore/drop this claim's lease — and, on
         // auto-pick, fall through to the next candidate — before the process actually exits.
-        throw new Error(
+        const refusal = new Error(
           `lane-${chosen} is no longer provably safe to reset as of this fetch (${uncommitted} uncommitted, ` +
             `${ahead} ahead, provably-pushed=${provablyPushed}) — ` +
             (probeFailed
@@ -2439,6 +2439,8 @@ function provisionClaimedLane(repo, chosen, targetWasReserved, { beforeDestructi
             `Use --force to proceed anyway, ` +
             `or investigate/salvage the tree first.`,
         );
+        refusal.safetyRefusal = true; // probe stderr is evidence, not a corruption signal: never repair/reclone on it
+        throw refusal;
       }
       // Landing-freeze fix (lane-leftover-reclaim) — a reclaim reached ONLY via the patch-equivalence
       // relaxation just above (never via a genuinely clean lane, where `ahead` is already 0) drops real local
@@ -2486,7 +2488,7 @@ function provisionClaimedLane(repo, chosen, targetWasReserved, { beforeDestructi
     try {
       reset = resetToBase();
     } catch (e) {
-      if (!looksLikeCorruption(msgOf(e))) throw e;
+      if (e?.safetyRefusal || !looksLikeCorruption(msgOf(e))) throw e;
       healSharedStoreFor(repo, e);
       repairUnhealthyClone();
       reset = resetToBase();
