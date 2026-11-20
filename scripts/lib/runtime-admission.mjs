@@ -1,6 +1,6 @@
 import { AsyncLocalStorage } from 'node:async_hooks';
 import { readdirSync, readFileSync, lstatSync } from 'node:fs';
-import { join } from 'node:path';
+import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { readField } from '../backlog/frontmatter.mjs';
 import { decideRuntimeAdmission, readBuildPrioritySettings } from './build-queue.mjs';
@@ -8,7 +8,7 @@ import { decideRuntimeAdmission, readBuildPrioritySettings } from './build-queue
 export { decideRuntimeAdmission };
 const ticks = new AsyncLocalStorage();
 const key = num => String(num ?? '').replace(/^#/, '');
-const recoveryRoot = fileURLToPath(new URL('../../', import.meta.url));
+const recoveryRoot = resolve(dirname(fileURLToPath(import.meta.url)), '..', '..');
 
 /** Resolve aliases from the canonical backlog, never from a persisted payload's path or alias.
  * Missing cards retain their numeric identity; ambiguous/unreadable evidence refuses recovery. */
