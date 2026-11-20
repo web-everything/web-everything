@@ -43,6 +43,8 @@ function fixture(options = {}) {
   const calls = [], records = [], readyWrites = [], sleeps = [], reads = [], cloneRoots = [];
   let clock = 0;
   let remoteTip = candidateSha;
+  // Being behind main does not imply a merge was published (urgent conflict loads keep the receipt SHA).
+  let publishedSha = candidateSha;
   let tipReads = 0;
   let establishedAdvanced = false;
   const lateChanges = [];
@@ -158,7 +160,7 @@ function fixture(options = {}) {
         if (args.at(-1) === 'HEAD^{commit}') return options.badHead ? fail(1) : SHA;
         return options.missingCandidate ? fail(1, '', '') : SHA;
       }
-      expect(args.slice(2)).toEqual(['merge-base', '--is-ancestor', options.behind ? MERGE : candidateSha, 'HEAD']);
+      expect(args.slice(2)).toEqual(['merge-base', '--is-ancestor', publishedSha, 'HEAD']);
       if (options.missingCandidate && (options.missingForever || sleeps.length === 0)) return fail(128, '', 'Not a valid commit name');
       if (options.adoptionError) return fail(options.adoptionError);
       return options.timeout ? fail(1) : '';
@@ -247,7 +249,7 @@ function fixture(options = {}) {
       return options.remote || '';
     }
     if (args[0] === 'commit-tree') return MERGE;
-    if (args[0] === 'push') { remoteTip = MERGE; return ''; }
+    if (args[0] === 'push') { remoteTip = publishedSha = MERGE; return ''; }
     throw new Error(`unexpected command ${cmd} ${args}`);
   };
   const combinedTest = vi.fn(async (input) => typeof options.combinedTest === 'function'
@@ -3355,6 +3357,9 @@ describe('default test check-run reader (production wiring)', () => {
     expect(f.calls.some(c => c.cmd === 'node' && c.args.includes('--check'))).toBe(true);
     expect(mutations(f, 'add')).toHaveLength(dryRun ? 0 : 1);
     if (!dryRun) {
+      expect(result.adopted).toBe(true);
+      expect(f.calls).toContainEqual(expect.objectContaining({ cmd: 'git',
+        args: ['-C', result.clone, 'merge-base', '--is-ancestor', SHA, 'HEAD'] }));
       expect(f.readyWrites.at(-1).testCheck).toMatchObject({ source: 'urgent-local-full', conflict: true });
       expect(f.records).toContainEqual(expect.objectContaining({ type: 'prototype-load.urgent',
         registration: { clone: expect.any(String), ref: BASE.branch, sha: SHA },
