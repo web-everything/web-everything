@@ -101,7 +101,7 @@ import {
 // #4140 — `decideRestampHumanClearance` names the carried clearance's actor from TRUSTED comments only, so a later
 // untrusted `cleared-human` marker cannot rename it (the other three parsers it reaches gate themselves).
 import { isTrustedMarkerAuthor, AUTOMATION_LOGINS } from './lib/marker-authorship.mjs';
-import { gateOutcomesForHead, parseRedTeamGateMarker, sendBackStepState, gateRoundGrants, GATE_OUTCOMES, readRedTeamDisposition, redTeamResultId, liveResultGateState } from './lib/red-team-gate.mjs';
+import { GATE_OUTCOMES, readRedTeamDisposition } from './lib/red-team-gate.mjs';
 import { REARM_COMMENT_MARKER } from './conveyor/rearm-review.mjs';
 import { sleepSyncMs } from './readiness/drain-lock.mjs';
 
@@ -1527,53 +1527,9 @@ export function runReviewLabelCli({
         throw new Error('send-back thread incomplete');
       }
       const standingRuling = readGrantScope({ repo, pr: { number: Number(pr), headRefOid: head, comments: thread } }) ?? null;
-      const grants = gateRoundGrants(thread, pr, repo, standingRuling);
-      // Resolve each result separately: a cap for another result cannot cancel its send-back.
-      // Legacy gates decide their preceding result; only gates without one share the null step.
-      const steps = new Map();
-      const resultPositions = new Map();
-      const resultComments = new Set();
-      const legacyBindings = new Map();
-      let precedingResultId = null;
-      thread.forEach((c, at) => {
-        const resultId = liveResultGateState([c], pr, head).resultId;
-        if (resultId) {
-          precedingResultId = resultId;
-          resultPositions.set(resultId, at);
-          resultComments.add(at);
-        }
-        if (!gateOutcomesForHead([c], pr, head).size) return;
-        const gate = parseRedTeamGateMarker(c.body);
-        if (!gate.result) legacyBindings.set(at, precedingResultId);
-        const key = gate.result ?? precedingResultId;
-        if (!steps.has(key)) steps.set(key, []);
-        steps.get(key).push({ at, i: at, ts: 0, gate, resultId: key });
-      });
-      const sentBackSteps = [...steps].filter(([, gates]) => sendBackStepState(gates, grants).outcome === GATE_OUTCOMES.SENT_BACK);
-      if (!sentBackSteps.length) return false;
-      // Validate the live result and head-wide seals against the complete thread first.
-      // A seal describes the latest published result, not each historical result.
-      const disposition = readRedTeamDisposition({ comments: thread, pr, head, repo, standingRuling });
-      if (disposition.sendBack.length || disposition.held.length) return true;
-      const liveResultId = redTeamResultId(disposition.result);
-      const sentBackResults = new Set(sentBackSteps.flatMap(([, gates]) => gates
-        .filter(g => g.gate.outcome === GATE_OUTCOMES.SENT_BACK).map(g => g.resultId)));
-      return [...sentBackResults].some(resultId => {
-        if (!resultId || !resultPositions.has(resultId)) return true;
-        const at = resultPositions.get(resultId);
-        // Keep the original prefix (including carry sources), grants, and later explicit
-        // rulings. Hide later results and legacy gates bound to them so the shared reader
-        // resolves this result without borrowing another result's release or hold.
-        // Blank bodies preserve comment positions/timestamps used by grant ownership.
-        const comments = thread.map((c, i) => i > at && (resultComments.has(i)
-          || (legacyBindings.has(i) && legacyBindings.get(i) !== resultId)) ? { ...c, body: '' } : c);
-        const resolved = resultId === liveResultId ? disposition
-          : readRedTeamDisposition({ comments, pr, head, repo, standingRuling, sealed: null });
-        const operatorReleased = [...resolved.dispositions.values()].some(({ state, by }) =>
-          by?.source === 'operator' && (state === 'released carded' || state === 'released not-real'));
-        return redTeamResultId(resolved.result) !== resultId || !operatorReleased
-          || resolved.sendBack.length > 0 || resolved.held.length > 0;
-      });
+      // One stateless rule: the merge path's own reader (redTeamQueueReason without the label check).
+      const d = readRedTeamDisposition({ comments: thread, pr, head, repo, standingRuling });
+      return d.outcome === GATE_OUTCOMES.SENT_BACK && d.sendBack.length > 0;
     } catch {
       // Unknown evidence must never erase a send-back. Retry the read or push the fix.
       return true;
