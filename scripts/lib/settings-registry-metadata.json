@@ -624,6 +624,12 @@
       "changeVia": "pr",
       "instant": false
     },
+    "hotPatch": {
+      "description": "Hot-patch admission: checks the veto ignores while CI is pending.",
+      "owner": "scripts/settings/prototype-load.json",
+      "changeVia": "pr",
+      "instant": false
+    },
     "readyRecordPath": {
       "description": "Fix readiness coordination record location.",
       "owner": "scripts/settings/prototype-load.json",

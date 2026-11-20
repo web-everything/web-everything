@@ -2,6 +2,7 @@
 import yaml from 'js-yaml';
 import { createHmac, timingSafeEqual } from 'node:crypto';
 import { isDeepStrictEqual } from 'node:util';
+import { execFileSyncThrottled } from '../lib/gh-throttle.mjs';
 export const urgentKeyPath = home => `${home}/workspace/.operations/state/urgent-verify.key`;
 export const normalizeUrgentRepo = url => {
   const value = String(url ?? '').trim().replace(/\/+$/, '').replace(/\.git$/, '');
@@ -10,6 +11,29 @@ export const normalizeUrgentRepo = url => {
   return match ? `https://${match[1].toLowerCase()}/${match[1].toLowerCase() === 'github.com' ? match[2].toLowerCase() : match[2]}` : value;
 };
 export const urgentFuiRepo = 'https://github.com/frontier-ui/frontierui';
+export const canonicalUrgentRepo = 'web-everything/web-everything';
+const originRepoCache = new Map();
+/** Resolve redirects through GitHub; an unverified spelling never grants admission. */
+export function resolveOriginRepo(originUrl, {
+  gh = (args, options) => execFileSyncThrottled('gh', args, options), cache = originRepoCache,
+} = {}) {
+  const match = normalizeUrgentRepo(originUrl).match(/^https:\/\/github\.com\/([\w.-]+\/[\w.-]+)$/);
+  if (!match) throw Error('unreadable GitHub origin repository');
+  const slug = match[1];
+  if (cache.has(slug)) return cache.get(slug);
+  const env = { ...process.env }; delete env.GH_REPO; delete env.GH_HOST;
+  const result = gh(['api', `repos/${slug}`, '-q', '.full_name'], {
+    env, encoding: 'utf8', timeout: 30000, maxBuffer: 1024 * 1024,
+  });
+  if (result && typeof result === 'object' && !Buffer.isBuffer(result) && result.code !== 0)
+    throw Error('unreadable GitHub origin repository');
+  const output = typeof result === 'string' || Buffer.isBuffer(result) ? String(result) : result?.stdout;
+  const fullName = typeof output === 'string' ? output.trim() : '';
+  if (!/^[A-Za-z0-9][A-Za-z0-9-]*\/[A-Za-z0-9_.-]+$/.test(fullName))
+    throw Error('unreadable GitHub origin repository');
+  cache.set(slug, fullName);
+  return fullName;
+}
 // The repo moved from chalbert/frontierui (GitHub redirects). Accept only that one known old owner, mapped to canonical.
 const urgentFuiAliases = new Set(['https://github.com/chalbert/frontierui']);
 export const canonicalFuiRepo = repo => (urgentFuiAliases.has(repo) ? urgentFuiRepo : repo);
