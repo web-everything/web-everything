@@ -16,9 +16,9 @@ For repo defaults, edit the owner file through a PR and rebuild the consuming da
 
 ## Summary
 
-- Top-level keys: 157 (159 declaration rows).
-- Declared leaves: 584 (platform copies counted separately).
-- Instant top-level keys: 0; not instant: 157.
+- Top-level keys: 158 (160 declaration rows).
+- Declared leaves: 585 (platform copies counted separately).
+- Instant top-level keys: 0; not instant: 158.
 - Instant capacity leaves: 14.
 - Constants to settle: 312.
 - Instant gaps: 28.
@@ -125,6 +125,7 @@ Operator-prefs layer: ~/.plateau/platform-preferences.json is the requested oper
 | github | scripts/settings/github-auth.json | 2 | {"auth":"app","personalExceptions":{"main-push":"git push t… | pr | no | GitHub authentication mode and documented personal-identity exceptions. |
 | handoffP90Minutes | scripts/settings/coroner-postmortem.json | 9 | {"ci-green-review":6.6,"accepted-ready":5.6,"changes-fix":2… | pr | no | Recorded p90 handoff durations in minutes by delivery transition. |
 | heavyAdmissionCap | scripts/dispatch-settings.json | 1 | 3 | pr | no | Maximum concurrent heavy commands admitted on the host. |
+| hotPatch | scripts/settings/prototype-load.json | 1 | {"vetoIgnoreChecks":["review-gate","merge-gate"]} | pr | no | Hot-patch admission: checks the veto ignores while CI is pending. |
 | humanClearance | scripts/settings/human-clearance-carry.json | 1 | {"mechanicalCarry":"refuse"} | pr | no | Mechanical carry-forward policy for human clearance. |
 | humanReviewSurfaces | scripts/settings/human-review-surfaces.json | 1 | "narrow" | pr | no | Scope of surfaces requiring human review. |
 | launchAgentsDir | scripts/settings/prototype-load.json | 1 | "~/Library/LaunchAgents" | pr | no | Host directory for rendered launchd agent definitions. |
