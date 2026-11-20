@@ -33,6 +33,18 @@ describe('pending-CI start policy', () => {
       expect(result.affected).toContainEqual({ name: 'integration', reason: 'missing' });
     }
   });
+  // PR #7160 round 7: the registration gate validates heads on raw rows, so a newer current-head run cannot hide
+  // an older same-name run explicitly bound to another head.
+  it.each(['off', 'shadow', 'on'])('push refuses foreign-head evidence hidden behind a same-name current-head rerun under startEarly=%s', startEarly => {
+    const input = { rowsComplete: true, rowsHead: head, headSha: head, requiredChecks: ['test'],
+      policy: { ...review, startAfter: 'push', startEarly, fastChecks: ['test'] } };
+    for (const [older, newer] of [[{ id: 1 }, { id: 2 }], [{}, {}]]) {
+      expect(reviewStartGate({ ...input, checks: [check('test', 'success', older), check('test', 'success', newer)] }).allowed).toBe(true);
+      const result = reviewStartGate({ ...input, checks: [check('test', 'success', { ...older, head_sha: 'other' }), check('test', 'success', newer)] });
+      expect(result.allowed).toBe(false);
+      expect(result.affected).toContainEqual({ name: 'test', reason: 'wrong-head' });
+    }
+  });
   it.each(['off', 'shadow', 'on'])('a green test aggregate implies integration, but not standards, under startEarly=%s', startEarly => {
     const policy = { ...review, startAfter: 'fast-checks', startEarly, fastChecks: ['test', 'integration', 'standards'] };
     const result = reviewStartGate({ rowsComplete: true, rowsHead: head, headSha: head, requiredChecks: ['test', 'integration'], checks: [check('test')], policy });

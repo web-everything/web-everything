@@ -147,12 +147,13 @@ function registeredStartGate({ headSha, checks, requiredChecks, rowsHead, rowsCo
   if (!checkNames(requiredChecks) || typeof headSha !== 'string' || !headSha.trim()) return strict;
   const latest = new Map(collapseRollupToLatestPerName(checks).map(row => [row?.name ?? row?.context, row]));
   // Keep raw rows for readability checks; share normalization and head-before-implication with the strict gate.
-  const { needed } = reviewCiPrerequisites({ headSha, requiredChecks, checks });
+  // wrongHeads is judged on every RAW row, so a newer current-head run cannot hide a foreign-head run of its name.
+  const { needed, wrongHeads } = reviewCiPrerequisites({ headSha, requiredChecks, checks });
   const affected = needed.flatMap(name => {
     const row = latest.get(name);
     let reason;
     if (!row) reason = 'missing';
-    else if (row.head_sha != null && row.head_sha !== headSha) reason = 'wrong-head';
+    else if (wrongHeads.has(name) || (row.head_sha != null && row.head_sha !== headSha)) reason = 'wrong-head';
     else if (!readableEarlyChecks([row], headSha)) reason = 'malformed';
     else {
       const state = String(row.status ?? row.state).toLowerCase();

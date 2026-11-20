@@ -16,11 +16,16 @@ function statusAsCheckRow(row) {
   return row;
 }
 
-/** Shared head-bound prerequisite selection; foreign rows cannot imply required checks away. */
+/**
+ * Shared head-bound prerequisite selection; foreign rows cannot imply required checks away. Heads are validated on
+ * EVERY raw row before the per-name collapse (PR #7160): collapsing first lets a newer current-head run of a name
+ * hide an older run of that name explicitly bound to another head, so the foreign evidence was never seen.
+ */
 export function reviewCiPrerequisites({ headSha, requiredChecks, checks }) {
-  const latest = new Map(collapseRollupToLatestPerName(checks).map(row => [row?.name ?? row?.context, statusAsCheckRow(row)]));
-  // Validate explicit row heads before allowing an aggregate to imply a required check.
-  const wrongHeads = new Set([...latest].filter(([, row]) => row?.head_sha != null && row.head_sha !== headSha).map(([name]) => name));
+  const rows = Array.isArray(checks) ? checks : [];
+  const wrongHeads = new Set(rows.filter(row => row?.head_sha != null && row.head_sha !== headSha)
+    .map(row => row?.name ?? row?.context));
+  const latest = new Map(collapseRollupToLatestPerName(rows).map(row => [row?.name ?? row?.context, statusAsCheckRow(row)]));
   const currentRows = [...latest].filter(([name]) => !wrongHeads.has(name)).map(([, row]) => row);
   const needed = withoutImpliedRequiredChecks(requiredChecks, currentRows);
   // A wrong-head row is reported when required, or when it alone would have implied a required check away.

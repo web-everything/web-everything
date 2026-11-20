@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { reviewCiGate } from '../review-ci-gate.mjs';
+import { reviewCiGate, reviewCiPrerequisites } from '../review-ci-gate.mjs';
 const headSha = 'a'.repeat(40);
 const success = name => ({ name, status: 'completed', conclusion: 'success' });
 const gate = checks => reviewCiGate({ rowsComplete: true, rowsHead: headSha, headSha, requiredChecks: ['test', 'daemon-soak'], checks });
@@ -78,5 +78,30 @@ describe('aggregate head binding before implication', () => {
     expect(result).toMatchObject({ allowed: false, unknown: true, reason: 'required-checks-not-successful' });
     expect(result.affected).toContainEqual({ name: 'test', reason: 'wrong-head' });
     expect(result.affected).toContainEqual({ name: 'integration', reason: 'missing' });
+  });
+  // PR #7160 round 7: heads must be validated on every raw row BEFORE the per-name collapse, so a newer
+  // current-head run cannot hide an older run of the same name that is explicitly bound to another head.
+  it.each([
+    ['check-run ids, foreign older', [{ ...success('test'), id: 1, head_sha: 'other' }, { ...success('test'), id: 2, head_sha: headSha }]],
+    ['check-run ids, foreign newer', [{ ...success('test'), id: 2, head_sha: 'other' }, { ...success('test'), id: 1, head_sha: headSha }]],
+    ['rollup order, foreign first', [{ ...success('test'), head_sha: 'other' }, { ...success('test'), head_sha: headSha }]],
+    ['status context, foreign first', [{ context: 'test', state: 'success', head_sha: 'other' }, { context: 'test', state: 'success', head_sha: headSha }]],
+  ])('refuses foreign-head evidence hidden behind a same-name current-head row (%s)', (_label, checks) => {
+    expect(gate([...checks.map(row => ({ ...row, head_sha: headSha })), success('daemon-soak')]).allowed).toBe(true);
+    const result = gate([...checks, success('daemon-soak')]);
+    expect(result).toMatchObject({ allowed: false, unknown: true });
+    expect(result.affected).toContainEqual({ name: 'test', reason: 'wrong-head' });
+  });
+  it('refuses a foreign-head aggregate hidden behind a current-head rerun when it would imply a required check', () => {
+    const result = reviewCiGate({ headSha, rowsHead: headSha, rowsComplete: true, requiredChecks: ['integration'],
+      checks: [{ ...success('test'), id: 1, head_sha: 'other' }, { ...success('test'), id: 2, head_sha: headSha }] });
+    expect(result).toMatchObject({ allowed: false, unknown: true });
+    expect(result.affected).toContainEqual({ name: 'test', reason: 'wrong-head' });
+  });
+  it('reviewCiPrerequisites reports the name wrong-head from raw rows, not only the collapsed latest', () => {
+    const { wrongHeads, needed } = reviewCiPrerequisites({ headSha, requiredChecks: ['test'],
+      checks: [{ ...success('test'), id: 1, head_sha: 'other' }, { ...success('test'), id: 2, head_sha: headSha }] });
+    expect([...wrongHeads]).toEqual(['test']);
+    expect(needed).toEqual(['test']);
   });
 });
