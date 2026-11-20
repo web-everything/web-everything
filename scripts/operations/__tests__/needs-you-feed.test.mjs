@@ -502,7 +502,7 @@ describe('gateReadyItems: "your review" is re-checked against the live PR (#5768
         readPrefs: () => ({ prefs: { findingClasses: allClasses }, errors: [] }) });
       expect(policy.findingClasses).toEqual(allClasses);
     });
-    it.each(['degraded=send-bak', 'nonsense=card', 'degraded'])('an invalid override %j is unreadable (strict), not a silent lower layer', value => {
+    it.each(['degraded=send-bak', 'nonsense=card', 'degraded', 'degraded=card=send-back'])('an invalid override %j is unreadable (strict), not a silent lower layer', value => {
       expect(() => readBreakPolicy({ env: { WE_CONFIRMED: 'x', WE_RED_TEAM_CONFIRMED_BREAKS: value },
         readPrefs: () => ({ prefs: { findingClasses: allClasses }, errors: [] }) })).toThrow(/invalid/);
     });

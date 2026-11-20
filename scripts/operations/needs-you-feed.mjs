@@ -116,8 +116,9 @@ export function readBreakPolicy({ env = process.env, readPrefs = readPlatformPre
   for (const [k, v] of Object.entries(fromFile)) if (BREAK_CLASSES.includes(k) && !actions.has(v)) throw new Error(`invalid confirmedBreaks.${k}`);
   for (const pair of String(env?.[CONFIRMED_BREAKS_ENV] ?? '').split(',')) {
     if (!pair.trim()) continue;
-    const [k, v] = pair.split('=').map(x => String(x ?? '').trim().toLowerCase());
-    if (!BREAK_CLASSES.includes(k) || !actions.has(v)) throw new Error('invalid confirmedBreaks override');
+    const parts = pair.split('=').map(x => String(x ?? '').trim().toLowerCase());
+    const [k, v] = parts;
+    if (parts.length !== 2 || !BREAK_CLASSES.includes(k) || !actions.has(v)) throw new Error('invalid confirmedBreaks override');
   }
   const read = readConfirmedBreaks({ env, path: settingsPath, strict: true });
   if (read.source?.broken === 'default' || read.source?.degraded === 'default') throw new Error('confirmedBreaks is not set');
