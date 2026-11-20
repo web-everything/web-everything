@@ -1974,7 +1974,7 @@
   "wrapper-conformance/__tests__/runner.test.ts": 0.01
  },
  "soak": {
-  "scripts/conveyor/soak/breaks/accepted-pr-stale-accept-row-never-executed.soak.test.mjs": 15.28,
+  "scripts/conveyor/soak/breaks/forge-manifest-untracked-shipped.soak.test.mjs": 0.3,
   "scripts/conveyor/soak/breaks/catch-up-clean-first-snapshot-first.soak.test.mjs": 4.65,
   "scripts/conveyor/soak/breaks/same-head-hold-clean-head-never-resolves.soak.test.mjs": 2,
   "scripts/conveyor/soak/breaks/run-store-stray-entry.soak.test.mjs": 2,
@@ -1991,6 +1991,7 @@
   "scripts/conveyor/soak/breaks/answered-stand-down-never-redispatched.soak.test.mjs": 99.38,
   "scripts/conveyor/soak/breaks/approved-human-head-review-churn.soak.test.mjs": 1.4,
   "scripts/conveyor/soak/breaks/argon-feature-dispatch.soak.test.mjs": 2.31,
+  "scripts/conveyor/soak/breaks/audited-tip-reads-ops-waiver-store.soak.test.mjs": 1,
   "scripts/conveyor/soak/breaks/auto-rebase-operator-withdrawal.soak.test.mjs": 0.62,
   "scripts/conveyor/soak/breaks/automation-operator-ruling-orphan.soak.test.mjs": 0.81,
   "scripts/conveyor/soak/breaks/await-verify-delivered-previous-ci-never-retired.soak.test.mjs": 1,
@@ -2315,6 +2316,8 @@
   "scripts/conveyor/soak/breaks/wip-cap-counts-worker-prs.soak.test.mjs": 0.01,
   "scripts/conveyor/soak/breaks/withdrawn-operator-block-directs-takeover.soak.test.mjs": 0.53,
   "scripts/conveyor/soak/breaks/worker-push-during-fix-claim.soak.test.mjs": 93.82,
+  "scripts/conveyor/soak/breaks/accepted-pr-stale-accept-row-never-executed.soak.test.mjs": 15.28,
+  "scripts/conveyor/soak/breaks/added-seats-concurrent-head-binding.soak.test.mjs": 4.67,
   "scripts/conveyor/soak/daemon-soak.soak.test.mjs": 450.96,
   "scripts/conveyor/soak/breaks/pinnedfrom-audited-exemption.soak.test.mjs": 0.1,
   "scripts/conveyor/soak/breaks/agy-juror-first-output.soak.test.mjs": 2,

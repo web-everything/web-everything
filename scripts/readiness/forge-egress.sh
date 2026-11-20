@@ -4,7 +4,7 @@
 # forge-exec-run.mjs installDependencies -> workCommand). Warm installs are offline.
 # Usage: forge-egress.sh render   # print the nftables ruleset (no root needed)
 #        forge-egress.sh apply    # load it atomically (root); re-run to refresh registry IPs
-# Env: FORGE_EXEC_SLOTS (default 8); FORGE_EGRESS_UIDS / FORGE_EGRESS_REGISTRY_V4/_V6 override lookups (tests).
+# Env: FORGE_EXEC_SLOTS (default: per-host forge-slots.json); FORGE_EGRESS_UIDS / FORGE_EGRESS_REGISTRY_V4/_V6 override lookups (tests).
 #      FORGE_EGRESS_STATE_DIR (default /run/forge-egress) and FORGE_EGRESS_KEEP_SNAPSHOTS (default 3): registry addresses stay
 #      allowed for that many refreshes after they last resolved.
 # Residual (accepted, see the PR): the allowlist matches destination IP + tcp/443 only. The registry shares CDN addresses
@@ -18,7 +18,27 @@
 #   systemctl disable --now forge-exec-egress.timer forge-exec-egress.service
 set -euo pipefail
 
-SLOTS=${FORGE_EXEC_SLOTS:-8}
+SLOTS=$(bash "$(dirname -- "$0")/forge-slots.sh")
+# Standalone refreshes must also contain a pool retained after settings were lowered.
+# Explicit counts are a floor; UID fixtures keep their existing override semantics.
+if [[ -z "${FORGE_EGRESS_UIDS+x}" ]]; then
+  if command -v getent >/dev/null 2>&1; then
+    installed_users=$(getent passwd)
+  else
+    installed_users=$(< /etc/passwd)
+  fi
+  prefix=${FORGE_EGRESS_USER_PREFIX:-forge-exec-}
+  while IFS=: read -r user rest; do
+    [[ "$user" == "$prefix"* ]] || continue
+    suffix=${user#"$prefix"}
+    if [[ "$suffix" =~ ^[1-9][0-9]*$ ]] && (( suffix > SLOTS )); then SLOTS=$suffix; fi
+  done <<<"$installed_users"
+  for existing in /srv/forge-exec/slot-*; do
+    if [[ "$existing" =~ /slot-([1-9][0-9]*)$ ]] && (( BASH_REMATCH[1] > SLOTS )); then
+      SLOTS=${BASH_REMATCH[1]}
+    fi
+  done
+fi
 REGISTRY_HOST=registry.npmjs.org
 TABLE=forge_exec_egress
 

@@ -1,10 +1,12 @@
 /** unaudited-tip — fail closed to the adopted head when audit evidence is unavailable. */
-import { readFileSync } from 'node:fs';
+import fs, { readFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { resolveOverlayFollowTip } from '../daemon-overlays.mjs';
 import { verifyRev } from './shared.mjs';
 import { readPlatformPreferences } from '../policy-cascade.mjs';
-import { mergeRuledWeakened, readyEvidence } from '../../operations/prototype-load.mjs';
+import { readyEvidence } from '../../operations/prototype-load.mjs';
+
+import { loadRuledWeakened } from '../../operations/prototype-load-io.mjs';
 
 const TOOL_SETTINGS = new URL('../../settings/prototype-load.json', import.meta.url);
 
@@ -26,7 +28,10 @@ export function makeAuditedTipGate(env = process.env) {
         // The operator allowlist is the same union prototype-load uses; a WEAKENED record is only ever evidence
         // when an entry binds its exact ref, sha, ruling and disclosed findings.
         const platform = readPlatformPreferences({ env, warn: () => {} });
-        snapshot.ruledWeakened = mergeRuledWeakened(platform.prefs.prototypeLoad?.ruledWeakened, tool.ruledWeakened);
+        snapshot.ruledWeakened = loadRuledWeakened({
+          platform: platform.prefs.prototypeLoad?.ruledWeakened, tool: tool.ruledWeakened,
+          fs, env: { HOME: homedir(), ...env },
+        });
       } catch { /* unaudited-tip: unreadable evidence never authorizes a moving tip. */ }
     }
     // The canonical admission judge decides (latest record for the exact ref+sha wins; a red or unruled-WEAKENED
