@@ -2112,6 +2112,7 @@ export function primaryInfraStoreEnv({ env = process.env, home = homedir() } = {
 export function cliRetryInfraBlocked({
   exec = execFileSync, env = process.env, home = homedir(), timeoutMs = INFRA_RETRY_TIMEOUT_MS,
   readEntries = path => readInfraStore(path), now = () => performance.now(),
+  readContext = producerBuildContext, readIdentity,
 } = {}) {
   const deadline = now() + timeoutMs;
   try {
@@ -2129,7 +2130,7 @@ export function cliRetryInfraBlocked({
     for (const [index, stored] of entries.entries()) {
       if (now() >= deadline) return deferRemaining(index);
       let entry;
-      try { entry = infraRecoveryCard(stored, { readContext: producerBuildContext }); }
+      try { entry = infraRecoveryCard(stored, { readContext }); }
       catch {
         // A damaged historical context refuses only its own card, never the rest of the pass.
         result.failed.push({ num: stored.num, refused: true, reason: 'unproven infra recovery identity',
@@ -2141,10 +2142,10 @@ export function cliRetryInfraBlocked({
           detail: 'Entry retained; repair groupMembers before retrying.' });
         continue;
       }
-      const admission = assertRuntimeAdmitted(entry, 'infra-recovery');
+      const admission = assertRuntimeAdmitted(entry, 'infra-recovery', { readIdentity });
       if (!admission.admitted) { result.failed.push({ num: entry.num, refused: true, reason: admission.reason }); continue; }
       const groupMembers = entry.groupMembers ?? [];
-      if (groupMembers.some(member => !assertRuntimeAdmitted({ num: member }, 'infra-recovery').admitted)) {
+      if (groupMembers.some(member => !assertRuntimeAdmitted({ num: member }, 'infra-recovery', { readIdentity }).admitted)) {
         result.failed.push({ num: entry.num, refused: true, reason: 'runtime admission refused group' }); continue;
       }
       // Charge validation and earlier retries to the same pass deadline; never give each card a fresh budget.
@@ -2155,7 +2156,7 @@ export function cliRetryInfraBlocked({
         encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], maxBuffer: 16 * 1024 * 1024, cwd: REPO_ROOT,
         timeout: remainingMs, killSignal: 'SIGTERM',
         env: childEnv,
-      }));
+      }), { readIdentity });
       if (text?.outcome === 'runtime-refused') { result.failed.push({ num: entry.num, refused: true, reason: text.reason }); continue; }
       const pass = JSON.parse(text || '{}');
       // Only collections participate in aggregation; error/deadline metadata stays separate.

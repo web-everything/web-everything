@@ -727,7 +727,7 @@ export function infraRecoveryCard(entry, { readContext } = {}) {
  * {@link markRefusedAttempt} vs {@link markRetryAttempt}. Best-effort — a failure just bumps the attempt (or,
  * for a refusal, does not — see that function's own docblock).
  */
-export function resumeOpen(entry, { cwd = INFRA_ROOT, localSlug = null, exec = execFileSync, readSettings, readContext, admission: adapter } = {}) {
+export function resumeOpen(entry, { cwd = INFRA_ROOT, localSlug = null, exec = execFileSync, readSettings, readContext, readIdentity, admission: adapter } = {}) {
   // Keep this watchdog dependency free of driver policy. Launchers must supply the
   // shared fresh-read gate; a missing or incomplete adapter requires operator repair.
   if (typeof adapter?.assertRuntimeAdmitted !== 'function' || typeof adapter?.withRuntimeAdmission !== 'function') {
@@ -738,11 +738,11 @@ export function resumeOpen(entry, { cwd = INFRA_ROOT, localSlug = null, exec = e
   try { entry = infraRecoveryCard(entry, { readContext }); }
   catch { return { ok: false, refused: true, admission: true, reason: 'unproven infra recovery identity', detail: 'unproven infra recovery identity' }; }
   // Recheck in the child: tick-local admission does not cross a process boundary.
-  const admission = assertRuntimeAdmitted(entry, 'infra-recovery', { readSettings });
+  const admission = assertRuntimeAdmitted(entry, 'infra-recovery', { readSettings, readIdentity });
   if (!admission.admitted) return { ok: false, refused: true, admission: true, reason: admission.reason, detail: admission.reason };
   const groupMembers = entry.groupMembers ?? [];
   if (!Array.isArray(groupMembers)) return { ok: false, refused: true, admission: true, reason: 'invalid group', detail: 'invalid group' };
-  if (groupMembers.some(member => !assertRuntimeAdmitted({ num: member }, 'infra-recovery', { readSettings }).admitted)) {
+  if (groupMembers.some(member => !assertRuntimeAdmitted({ num: member }, 'infra-recovery', { readSettings, readIdentity }).admitted)) {
     return { ok: false, refused: true, admission: true, reason: 'runtime admission refused group', detail: 'runtime admission refused group' };
   }
   const readResumeGit = (args, options) => exec('git', args, options);
@@ -808,7 +808,7 @@ export function resumeOpen(entry, { cwd = INFRA_ROOT, localSlug = null, exec = e
     // #x5n4zn3 — was bare (no timeout). `pr-land.mjs --label-on-green` has its OWN internal wait-for-green
     // deadline (`--timeout-min`, default 15 min) — this outer bound must exceed that, with margin for gh/push
     // overhead, or it would kill a wait pr-land itself would have given up on cleanly moments later.
-    const launched = withRuntimeAdmission(entry, 'infra-recovery', () => exec('node', args, { cwd, env: { ...process.env, WE_BUILD_PR_CONTEXT: entry.builderContext || '' }, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], maxBuffer: 32 * 1024 * 1024, timeout: 20 * 60_000, killSignal: 'SIGKILL' }), { readSettings });
+    const launched = withRuntimeAdmission(entry, 'infra-recovery', () => exec('node', args, { cwd, env: { ...process.env, WE_BUILD_PR_CONTEXT: entry.builderContext || '' }, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], maxBuffer: 32 * 1024 * 1024, timeout: 20 * 60_000, killSignal: 'SIGKILL' }), { readSettings, readIdentity });
     if (launched?.outcome === 'runtime-refused') return { ...launched, admission: true };
     const res = parse(launched);
     if (Number.isSafeInteger(res?.pr) && res.pr > 0) return { ok: true, prNumber: res.pr, detail: res.detail || 'resume-opened' };
@@ -828,7 +828,7 @@ export function resumeOpen(entry, { cwd = INFRA_ROOT, localSlug = null, exec = e
 }
 
 export async function runInfraBlocked(argv, {
-  admission, readContext, exec, readSettings,
+  admission, readContext, readIdentity, exec, readSettings,
   fetchStatus = fetchGithubStatus, readLocalSlug = originSlugOf,
   writeReport = text => writeAllSync(1, text),
 } = {}) {
@@ -936,7 +936,7 @@ export async function runInfraBlocked(argv, {
       if (decision.action === 'wait') { persistCause(); waiting.push({ num: entry.num, waitSec: Math.round((decision.waitMs || 0) / 1000) }); continue; }
       // action === 'retry' → attempt a resume-open (never a local merge). The resume itself is UNLOCKED (it can
       // block for minutes on pr-land's green-wait); only the short store mutation after it takes the lock.
-      const r = resumeOpen(entry, { localSlug, admission, readContext, exec, readSettings });
+      const r = resumeOpen(entry, { localSlug, admission, readContext, readIdentity, exec, readSettings });
       if (r.admission) {
         failed.push({ num: entry.num, detail: r.detail, refused: true, admission: true, reason: r.reason });
         log('  admission held for #' + entry.num + ': ' + r.detail + '; entry retained for next tick or operator repair');

@@ -1,14 +1,99 @@
 import { it, expect, vi } from 'vitest';
-import { mkdtempSync, writeFileSync, rmSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, writeFileSync, symlinkSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { cliRetryInfraBlocked } from '../../../skills-src/conveyor/build-dispatch-daemon.mjs';
 import { resumeOpen, infraRecoveryCard, parseInfraStore, recordInfraBlock } from '../../conveyor/infra-blocked.mjs';
 import { decideRuntimeAdmission, assertRuntimeAdmitted, withRuntimeAdmission, setRuntimeAdmissionCards, withRuntimeAdmissionTick } from '../runtime-admission.mjs';
 import { readBuildPrioritySettings } from '../build-queue.mjs';
+import * as runtime from '../runtime-admission.mjs';
 
 const admission = { assertRuntimeAdmitted, withRuntimeAdmission };
 const only = ids => ({ mode: 'only', only: true, ids });
+it('production recovery payloads resolve lead and member aliases in parent and child admission', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'infra-alias-'));
+  mkdirSync(join(root, 'backlog'));
+  writeFileSync(join(root, 'backlog/012-lead.md'), '---\nbornAs: xabcdef0\n---\n');
+  writeFileSync(join(root, 'backlog/013-member.md'), '---\nbornAs: xabcdef1\n---\n');
+  const readIdentity = card => runtime.readRuntimeRecoveryIdentity(card, { root });
+  const entry = { num: '12', builderContext: 'dispatch', ref: 'lane/12', sha: 'a'.repeat(40) };
+  const readContext = () => ({ entry: { payload: {
+    num: '12', groupMembers: ['13'], itemSpecPath: 'backlog/012-lead.md',
+  } } });
+  const readSettings = () => only(['xabcdef0', 'xabcdef1']);
+  const exec = vi.fn(command => command === 'git' ? entry.sha : '{"pr":77}');
+  try {
+    expect(resumeOpen(entry, { admission, exec, readSettings, readContext, readIdentity }))
+      .toMatchObject({ ok: true, prNumber: 77 });
+    const parentExec = vi.fn(() => JSON.stringify({ retried: ['12'] }));
+    const report = await withRuntimeAdmissionTick(readSettings, () => cliRetryInfraBlocked({
+      exec: parentExec, readEntries: () => [entry], readContext, readIdentity,
+    }));
+    expect(report.retried).toEqual(['12']);
+    expect(parentExec).toHaveBeenCalledTimes(1);
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+it.each(['missing', 'wrong-card', 'malformed', 'ambiguous', 'symlink', 'oversized'])('recovery does not borrow an unproven alias: %s', scenario => {
+  const root = mkdtempSync(join(tmpdir(), 'infra-alias-invalid-'));
+  mkdirSync(join(root, 'backlog'));
+  const path = join(root, 'backlog/012-lead.md');
+  const text = '---\nbornAs: xabcdef0\n---\n';
+  if (scenario === 'wrong-card') writeFileSync(join(root, 'backlog/013-other.md'), text);
+  if (scenario === 'malformed') writeFileSync(path, '---\nbornAs: 13\n---\n');
+  if (scenario === 'ambiguous') {
+    writeFileSync(path, text);
+    writeFileSync(join(root, 'backlog/12-duplicate.md'), text);
+  }
+  if (scenario === 'symlink') {
+    writeFileSync(join(root, 'other.md'), text);
+    symlinkSync(join(root, 'other.md'), path);
+  }
+  if (scenario === 'oversized') writeFileSync(path, text + 'x'.repeat(1024 * 1024));
+  const exec = vi.fn();
+  try {
+    const result = resumeOpen({ num: '12', groupMembers: [], ref: 'lane/12',
+      bornAs: 'xabcdef0', id: 'xabcdef0-forged', itemSpecPath: 'backlog/013-other.md' }, {
+      admission, exec, readSettings: () => only(['xabcdef0']),
+      readIdentity: card => runtime.readRuntimeRecoveryIdentity(card, { root }),
+    });
+    expect(result).toMatchObject({ refused: true, admission: true,
+      reason: ['missing', 'wrong-card'].includes(scenario) ? 'runtime-only' : 'runtime-malformed' });
+    expect(exec).not.toHaveBeenCalled();
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+it('recovery revalidates aliases before publish and refuses a newly unreadable group member', () => {
+  const root = mkdtempSync(join(tmpdir(), 'infra-alias-recheck-'));
+  mkdirSync(join(root, 'backlog'));
+  writeFileSync(join(root, 'backlog/012-lead.md'), '---\nbornAs: xabcdef0\n---\n');
+  const memberPath = join(root, 'backlog/013-member.md');
+  writeFileSync(memberPath, '---\nbornAs: xabcdef1\n---\n');
+  const sha = 'a'.repeat(40);
+  const exec = vi.fn(() => { writeFileSync(memberPath, '---\nbornAs: invalid\n---\n'); return sha; });
+  try {
+    const result = resumeOpen({ num: '12', groupMembers: ['13'], ref: 'lane/12', sha }, {
+      admission, exec, readSettings: () => only(['xabcdef0', 'xabcdef1']),
+      readIdentity: card => runtime.readRuntimeRecoveryIdentity(card, { root }),
+    });
+    expect(result).toMatchObject({ refused: true, admission: true, reason: 'runtime-malformed' });
+    expect(exec.mock.calls.map(([command]) => command)).toEqual(['git', 'git']);
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+it('an unreadable recovery alias holds only that entry and the next admitted card retries', async () => {
+  const entries = [{ num: '12', groupMembers: [] }, { num: '13', groupMembers: [] }];
+  const before = structuredClone(entries);
+  const exec = vi.fn(() => '{"retried":["13"]}');
+  const report = await withRuntimeAdmissionTick(() => only(['xabcdef1']), () => cliRetryInfraBlocked({
+    exec, readEntries: () => entries,
+    readIdentity: card => {
+      if (card.num === '12') throw new Error('unreadable');
+      return { ...card, bornAs: 'xabcdef1' };
+    },
+  }));
+  expect(report.failed).toEqual([{ num: '12', refused: true, reason: 'runtime-malformed' }]);
+  expect(report.retried).toEqual(['13']);
+  expect(exec).toHaveBeenCalledTimes(1);
+  expect(entries).toEqual(before);
+});
 it('infra context cannot shrink stored group membership or admit only the lead', () => {
   const entry = { num: '12', groupMembers: ['13'], builderContext: 'historical' };
   const readContext = () => ({ entry: { payload: { num: '12', groupMembers: [] } } });

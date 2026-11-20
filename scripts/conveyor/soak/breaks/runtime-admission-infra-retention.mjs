@@ -1,5 +1,5 @@
 /** Slice 1: admission holds retain infra evidence and isolate malformed cards. */
-import { mkdtempSync, readFileSync, writeFileSync, rmSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, readFileSync, writeFileSync, rmSync } from 'node:fs';
 import { spawnSync } from 'node:child_process';
 import { pathToFileURL } from 'node:url';
 import { tmpdir } from 'node:os';
@@ -7,10 +7,35 @@ import { join } from 'node:path';
 import { cliRetryInfraBlocked } from '../../../../skills-src/conveyor/build-dispatch-daemon.mjs';
 import { resumeOpen, runInfraBlocked } from '../../infra-blocked.mjs';
 import { assertRuntimeAdmitted, withRuntimeAdmission } from '../../../lib/runtime-admission.mjs';
+import * as runtime from '../../../lib/runtime-admission.mjs';
 
 const admission = { assertRuntimeAdmitted, withRuntimeAdmission };
 const lift = () => ({ mode: 'lift' });
 const sha = 'a'.repeat(40);
+
+export async function aliasProbe() {
+  const root = mkdtempSync(join(tmpdir(), 'soak-infra-alias-'));
+  mkdirSync(join(root, 'backlog'));
+  writeFileSync(join(root, 'backlog/012-lead.md'), '---\nbornAs: xabcdef0\n---\n');
+  writeFileSync(join(root, 'backlog/013-member.md'), '---\nbornAs: xabcdef1\n---\n');
+  const readIdentity = card => runtime.readRuntimeRecoveryIdentity(card, { root });
+  const entry = { num: '12', builderContext: 'dispatch', ref: 'lane/12', sha };
+  const readContext = () => ({ entry: { payload: {
+    num: '12', groupMembers: ['13'], itemSpecPath: 'backlog/012-lead.md',
+  } } });
+  const readSettings = () => ({ mode: 'only', ids: ['xabcdef0', 'xabcdef1'] });
+  const calls = [];
+  try {
+    const child = () => resumeOpen(entry, { admission, readContext, readIdentity, readSettings,
+      exec: command => { calls.push(command); return command === 'git' ? sha : '{"pr":77}'; } });
+    const direct = child();
+    const parent = await runtime.withRuntimeAdmissionTick(readSettings, () => cliRetryInfraBlocked({
+      readEntries: () => [entry], readContext, readIdentity,
+      exec: () => { const result = child(); return JSON.stringify({ resumed: result.ok ? ['12'] : [] }); },
+    }));
+    return { direct, resumed: parent.resumed, calls };
+  } finally { rmSync(root, { recursive: true, force: true }); }
+}
 
 export function retryProbe(groupMembers) {
   const entries = [{ num: '12', groupMembers }, { num: '13', groupMembers: [] }];
@@ -27,6 +52,9 @@ export function retryProbe(groupMembers) {
 
 export async function replay() {
   const violations = [];
+  const aliases = await aliasProbe();
+  if (!aliases.direct.ok || aliases.resumed?.join() !== '12' || aliases.calls.filter(c => c === 'node').length !== 2)
+    violations.push('hash-only admission stranded production recovery payload');
   for (const members of [null, {}, '13', [null], [undefined], ['12\n'], Array(1)]) {
     const probe = retryProbe(members);
     if (!probe.unchanged || probe.calls.join() !== '--num=13'
@@ -96,7 +124,7 @@ export default {
   title: 'infra admission holds preserve evidence and malformed groups do not stop retries',
   card: 'PR #7090 Slice 1',
   fixedBy: { sha: 'HEAD', where: 'Slice 1', paths: [
-    'scripts/conveyor/infra-blocked.mjs', 'skills-src/conveyor/build-dispatch-daemon.mjs',
+    'scripts/conveyor/infra-blocked.mjs', 'skills-src/conveyor/build-dispatch-daemon.mjs', 'scripts/lib/runtime-admission.mjs',
   ] },
   fixPresent(root) {
     // Probe the candidate tree's real behavior, including persisted refusal accounting.
