@@ -2221,6 +2221,7 @@
   "scripts/conveyor/soak/breaks/red-team-queue-stale-eviction.soak.test.mjs": 4.12,
   "scripts/conveyor/soak/breaks/red-team-queue-verdict-evict.soak.test.mjs": 4.12,
   "scripts/conveyor/soak/breaks/red-team-renamed-host-dead-owner-never-reaped.soak.test.mjs": 1.4,
+  "scripts/conveyor/soak/breaks/red-team-reservation-route-exhaustion.soak.test.mjs": 2,
   "scripts/conveyor/soak/breaks/red-team-round-cap-never-rulable.soak.test.mjs": 1.4,
   "scripts/conveyor/soak/breaks/red-team-skip-never-settles.soak.test.mjs": 4.42,
   "scripts/conveyor/soak/breaks/red-team-skip-reason-drops-comment-error.soak.test.mjs": 2,

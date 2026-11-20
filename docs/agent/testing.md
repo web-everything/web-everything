@@ -411,6 +411,26 @@ The sequential and speculative paths skip before budget reservation and record t
 `red team skipped: card-only`. Setting `recheckReadsRepo=false` restores a tool-free re-check;
 negative answers without file reads remain unverifiable.
 
+Red-team cap deferrals retain the reservation provider's daily-cap reason when the operator's
+routing chain is exhausted; a roster provider outside that chain is never a fallback. Explicit
+operator cap env values survive launcher settings overlays that omit caps (or contain invalid caps)
+and the speculative spawn. A valid settings cap takes precedence, including lowering to zero;
+an own provider cap still takes precedence over the legacy Codex fallback. The
+reservation union includes today's scorecards and outstanding ledger IDs, so a scorecard-only
+availability snapshot can still lose the reservation race. Regressions live in
+`review-extra-seats.test.mjs`, `review-job.test.mjs`, and the behavior-probed
+`red-team-reservation-route-exhaustion` soak break.
+Named coverage: **launch cap precedence matrix** crosses valid, invalid and absent parent/overlay
+values for each cap key; **settings overlay can lower a cap to zero through both the job and
+speculative launch** pins the wiring. **default settings resolver forwards the passed** and
+**default settings resolver refuses failed shim setup** exercise dispatch without replacing its
+resolver, including both daemon markers. **logs each resolved provider cap and its source** covers
+explicit caps, defaults, legacy caps and routing controls; **retains codex daily-cap denial** also
+asserts the deferral log. **counts the union of scorecards and outstanding reservation IDs**
+asserts overlap deduplication and denial at the combined cap for every provider;
+**defers red team when the scorecard and outstanding ledger union exhausts codex capacity**
+reaches that accounting through speculative routing without a reservation stub.
+
 ## Drain red-team disposition and retry evidence
 
 Stale abandonment publishes a complete marker before replacing the writer, under the shared status
