@@ -7,12 +7,21 @@
  *   integration with `scoreEscalation`/`diffHunksFrom` from `scripts/lib/review-escalation.mjs`.
  */
 import { describe, it, expect } from 'vitest';
-import { readFileSync } from 'node:fs';
+import { readFileSync, mkdtempSync, writeFileSync, rmSync, existsSync } from 'node:fs';
+import { execFileSync } from 'node:child_process';
+import { tmpdir } from 'node:os';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
 import { computeNetDiffPaths, parseNumstat, computeNetDiffChangedFiles, computeNetDiffText, resolveNetDiffBasis, computeNetDiffSignals } from '../merge-ai-prs.mjs';
 import { scoreEscalation, diffHunksFrom } from '../lib/review-escalation.mjs';
 
+
+const BASE_SHA = 'a'.repeat(40);
+// Old hermetic fixtures name the base symbolically; preserve those intent keys while
+// the resolver now requires a full SHA from the fully qualified remote ref.
+function fixtureArgs(args) {
+  return (args[0] === '-c' ? args.slice(8) : args).map(a => a.replaceAll(BASE_SHA, 'origin/main'));
+}
 
 describe('parseNumstat (#1821 — net two-dot diff for the review-escalation backstop)', () => {
   it('parses `<added>\\t<deleted>\\t<path>` lines into changedFiles + total diffLines', () => {
@@ -44,12 +53,13 @@ describe('computeNetDiffChangedFiles (#2373 — SHARED net-diff basis, producer 
   const fakeExec = (script = {}) => {
     const calls = [];
     const exec = (cmd, args, opts) => {
+      args = fixtureArgs(args);
       // The stub key names WHICH TREES are compared, deliberately ignoring `--end-of-options` and
       // (#2890-review-r2 finding 2b) `--no-ext-diff`. Both are argv hygiene, not intent: encoding them in every
       // fixture key means adding one guard to one more call site reds 17 unrelated tests and tempts the author
       // to drop the guard instead of the fixtures. Each has its own dedicated assertion (`guards the git-diff
       // argv…`, `computeNetDiffText passes --no-ext-diff`), which is where a regression must fail.
-      const intent = args.filter((a) => a !== '--end-of-options' && a !== '--verify' && a !== '--no-ext-diff');
+      const intent = args.filter((a) => a !== '--end-of-options' && a !== '--verify' && a !== '--no-ext-diff' && a !== '--no-textconv' && a !== '--no-color');
       calls.push({ cmd, args, opts, key: `${cmd} ${intent.join(' ')}` });
       const h = script[`${cmd} ${intent.join(' ')}`];
       if (h && h.throw) throw new Error(h.throw);
@@ -57,6 +67,7 @@ describe('computeNetDiffChangedFiles (#2373 — SHARED net-diff basis, producer 
       // Faithful to real git: an UNSTUBBED `git diff` against a ref this fake doesn't know throws
       // (unknown revision) rather than silently returning '' — so an invalid candidate (e.g. the producer's
       // `<remote>/<sha>`) fails fast and the fallthrough is exercised as it would be against real git.
+      if (args[0] === 'rev-parse' && args.some(a => a.startsWith('refs/remotes/') && a.endsWith('^{commit}'))) return BASE_SHA;
       if (args[0] === 'diff') throw new Error('unknown revision (unstubbed)');
       // #3343 — same faithfulness for the ancestry probe (`git log <base>..<head>`): real git exits 128 on a
       // range whose refs it cannot resolve, it does not print an empty log. Returning '' here would hand
@@ -111,14 +122,14 @@ describe('computeNetDiffChangedFiles (#2373 — SHARED net-diff basis, producer 
     expect(r.changedFiles).not.toContain('scripts/lib/review-escalation.mjs');
   });
 
-  it('the fetch failing degrades gracefully — still attempts the diff off whatever is locally cached', () => {
+  it('the fetch failing is unscored — never uses a cached base', () => {
     const { exec, calls } = fakeExec({
-      'git fetch origin +main:refs/remotes/origin/main --quiet': { throw: 'network unreachable' },
+      'git fetch --quiet origin +main:refs/remotes/origin/main': { throw: 'network unreachable' },
       'git diff --numstat origin/main deadbeef': { stdout: '1\t0\tREADME.md\n' },
     });
     const r = computeNetDiffChangedFiles({ exec, rev: 'deadbeef' });
-    expect(r).toEqual({ changedFiles: ['README.md'], diffLines: 1, scored: true, humanBasisFiles: ['README.md'] });
-    expect(calls.some((c) => c.args[0] === 'diff')).toBe(true);
+    expect(r).toEqual({ changedFiles: [], diffLines: 0, scored: false, humanBasisFiles: [], reason: 'fetch-failed' });
+    expect(calls.some((c) => c.args[0] === 'diff')).toBe(false);
   });
 
   it('#2373-review-r2 — the REMOTE-tracking candidate `<remote>/<rev>` is tried BEFORE the bare `rev` (dodges a stale-local-branch-name collision in the drain, where `rev` is `v.headRef`, a branch NAME)', () => {
@@ -482,16 +493,18 @@ describe('computeNetDiffText (#2450 — reviewer-facing NET diff TEXT, SAME basi
   const fakeExec = (script = {}) => {
     const calls = [];
     const exec = (cmd, args, opts) => {
+      args = fixtureArgs(args);
       // The stub key names WHICH TREES are compared, deliberately ignoring `--end-of-options` and
       // (#2890-review-r2 finding 2b) `--no-ext-diff`. Both are argv hygiene, not intent: encoding them in every
       // fixture key means adding one guard to one more call site reds 17 unrelated tests and tempts the author
       // to drop the guard instead of the fixtures. Each has its own dedicated assertion (`guards the git-diff
       // argv…`, `computeNetDiffText passes --no-ext-diff`), which is where a regression must fail.
-      const intent = args.filter((a) => a !== '--end-of-options' && a !== '--verify' && a !== '--no-ext-diff');
+      const intent = args.filter((a) => a !== '--end-of-options' && a !== '--verify' && a !== '--no-ext-diff' && a !== '--no-textconv' && a !== '--no-color');
       calls.push({ cmd, args, opts, key: `${cmd} ${intent.join(' ')}` });
       const h = script[`${cmd} ${intent.join(' ')}`];
       if (h && h.throw) throw new Error(h.throw);
       if (h && 'stdout' in h) return h.stdout;
+      if (args[0] === 'rev-parse' && args.some(a => a.startsWith('refs/remotes/') && a.endsWith('^{commit}'))) return BASE_SHA;
       if (args[0] === 'diff') throw new Error('unknown revision (unstubbed)');
       // #3343 — same faithfulness for the ancestry probe (`git log <base>..<head>`): real git exits 128 on a
       // range whose refs it cannot resolve, it does not print an empty log. Returning '' here would hand
@@ -511,7 +524,7 @@ describe('computeNetDiffText (#2450 — reviewer-facing NET diff TEXT, SAME basi
     const r = computeNetDiffText({ exec, rev: 'deadbeef' });
     expect(r.scored).toBe(true);
     expect(r.text).toContain('diff --git a/README.md');
-    expect(r.base).toBe('origin/main');
+    expect(r.base).toBe(BASE_SHA);
     expect(r.rev).toBe('deadbeef');
     // exact same fetch refspec computeNetDiffChangedFiles uses — proving ONE shared basis, no drift.
     expect(calls.some((c) => c.args[0] === 'fetch' && c.args.includes('+main:refs/remotes/origin/main'))).toBe(true);
@@ -581,11 +594,13 @@ describe('resolveNetDiffBasis shared across both helpers (#2890-review-fix findi
   const fakeExec = (script = {}) => {
     const calls = [];
     const exec = (cmd, args, opts) => {
-      const intent = args.filter((a) => a !== '--end-of-options' && a !== '--verify' && a !== '--no-ext-diff');
+      args = fixtureArgs(args);
+      const intent = args.filter((a) => a !== '--end-of-options' && a !== '--verify' && a !== '--no-ext-diff' && a !== '--no-textconv' && a !== '--no-color');
       calls.push({ cmd, args, opts, key: `${cmd} ${intent.join(' ')}` });
       const h = script[`${cmd} ${intent.join(' ')}`];
       if (h && h.throw) throw new Error(h.throw);
       if (h && 'stdout' in h) return h.stdout;
+      if (args[0] === 'rev-parse' && args.some(a => a.startsWith('refs/remotes/') && a.endsWith('^{commit}'))) return BASE_SHA;
       if (args[0] === 'diff') throw new Error('unknown revision (unstubbed)');
       // #3343 — same faithfulness for the ancestry probe (`git log <base>..<head>`): real git exits 128 on a
       // range whose refs it cannot resolve, it does not print an empty log. Returning '' here would hand
@@ -611,7 +626,7 @@ describe('resolveNetDiffBasis shared across both helpers (#2890-review-fix findi
     expect(calls.filter((c) => c.args[0] === 'fetch').length).toBe(1);
     expect(calls.filter((c) => c.args[0] === 'merge-base').length).toBe(1);
     expect(calls.filter((c) => c.key.startsWith('git diff --numstat')).length).toBe(1);
-    expect(calls.length).toBe(4); // fetch + merge-base + numstat probe + the text diff
+    expect(calls.length).toBe(5); // fetch + base rev-parse + merge-base + numstat probe + text diff
   });
 
   it('the UNSHARED path costs strictly more — the measurement the review made, pinned', () => {
@@ -654,11 +669,13 @@ describe('#2890-review-r2 finding 1 — a basis resolved for a DIFFERENT request
   const fakeExec = (script = {}) => {
     const calls = [];
     const exec = (cmd, args, opts) => {
-      const intent = args.filter((a) => a !== '--end-of-options' && a !== '--verify' && a !== '--no-ext-diff');
+      args = fixtureArgs(args);
+      const intent = args.filter((a) => a !== '--end-of-options' && a !== '--verify' && a !== '--no-ext-diff' && a !== '--no-textconv' && a !== '--no-color');
       calls.push({ cmd, args, opts, key: `${cmd} ${intent.join(' ')}` });
       const h = script[`${cmd} ${intent.join(' ')}`];
       if (h && h.throw) throw new Error(h.throw);
       if (h && 'stdout' in h) return h.stdout;
+      if (args[0] === 'rev-parse' && args.some(a => a.startsWith('refs/remotes/') && a.endsWith('^{commit}'))) return BASE_SHA;
       if (args[0] === 'diff') throw new Error('unknown revision (unstubbed)');
       // #3343 — same faithfulness for the ancestry probe (`git log <base>..<head>`): real git exits 128 on a
       // range whose refs it cannot resolve, it does not print an empty log. Returning '' here would hand
@@ -754,11 +771,13 @@ describe('computeNetDiffSignals — the ONE net-diff derivation both call sites 
   const fakeExec = (script = {}) => {
     const calls = [];
     const exec = (cmd, args, opts) => {
-      const intent = args.filter((a) => a !== '--end-of-options' && a !== '--verify' && a !== '--no-ext-diff');
+      args = fixtureArgs(args);
+      const intent = args.filter((a) => a !== '--end-of-options' && a !== '--verify' && a !== '--no-ext-diff' && a !== '--no-textconv' && a !== '--no-color');
       calls.push({ cmd, args, opts, key: `${cmd} ${intent.join(' ')}` });
       const h = script[`${cmd} ${intent.join(' ')}`];
       if (h && h.throw) throw new Error(h.throw);
       if (h && 'stdout' in h) return h.stdout;
+      if (args[0] === 'rev-parse' && args.some(a => a.startsWith('refs/remotes/') && a.endsWith('^{commit}'))) return BASE_SHA;
       if (args[0] === 'diff') throw new Error('unknown revision (unstubbed)');
       // #3343 — same faithfulness for the ancestry probe (`git log <base>..<head>`): real git exits 128 on a
       // range whose refs it cannot resolve, it does not print an empty log. Returning '' here would hand
@@ -782,7 +801,7 @@ describe('computeNetDiffSignals — the ONE net-diff derivation both call sites 
     expect(calls.filter((c) => c.args[0] === 'fetch').length).toBe(1);
     expect(calls.filter((c) => c.args[0] === 'merge-base').length).toBe(1);
     expect(calls.filter((c) => c.key.startsWith('git diff --numstat')).length).toBe(1);
-    expect(calls.length).toBe(4);
+    expect(calls.length).toBe(5);
   });
 
   it('returns the changed-file shape, the cumulative human basis, the text object AND the mapped hunks', () => {
@@ -882,7 +901,9 @@ describe('computeNetDiffText passes --no-ext-diff (#2890-review-r2 finding 2b)',
   it('the flag is on the argv, ahead of --end-of-options', () => {
     const calls = [];
     const exec = (cmd, args) => {
+      args = fixtureArgs(args);
       calls.push(args);
+      if (args[0] === 'rev-parse') return BASE_SHA;
       if (args[0] === 'diff' && args.includes('--numstat')) return '1\t0\tREADME.md\n';
       return 'diff --git a/README.md b/README.md\n';
     };
@@ -894,7 +915,9 @@ describe('computeNetDiffText passes --no-ext-diff (#2890-review-r2 finding 2b)',
   it('but NOT --text: a whole-PR diff must not force binary assets into the reviewer-facing text', () => {
     const calls = [];
     const exec = (cmd, args) => {
+      args = fixtureArgs(args);
       calls.push(args);
+      if (args[0] === 'rev-parse') return BASE_SHA;
       if (args[0] === 'diff' && args.includes('--numstat')) return '1\t0\tREADME.md\n';
       return 'diff\n';
     };
@@ -907,11 +930,13 @@ describe('computeNetDiffPaths (#2901/#1031 — NET changed-file list as plain pa
   const fakeExec = (script = {}) => {
     const calls = [];
     const exec = (cmd, args, opts) => {
-      const intent = args.filter((a) => a !== '--end-of-options' && a !== '--verify' && a !== '--no-ext-diff');
+      args = fixtureArgs(args);
+      const intent = args.filter((a) => a !== '--end-of-options' && a !== '--verify' && a !== '--no-ext-diff' && a !== '--no-textconv' && a !== '--no-color');
       calls.push({ cmd, args, opts, key: `${cmd} ${intent.join(' ')}` });
       const h = script[`${cmd} ${intent.join(' ')}`];
       if (h && h.throw) throw new Error(h.throw);
       if (h && 'stdout' in h) return h.stdout;
+      if (args[0] === 'rev-parse' && args.some(a => a.startsWith('refs/remotes/') && a.endsWith('^{commit}'))) return BASE_SHA;
       if (args[0] === 'diff') throw new Error('unknown revision (unstubbed)');
       // #3343 — same faithfulness for the ancestry probe (`git log <base>..<head>`): real git exits 128 on a
       // range whose refs it cannot resolve, it does not print an empty log. Returning '' here would hand
@@ -929,7 +954,7 @@ describe('computeNetDiffPaths (#2901/#1031 — NET changed-file list as plain pa
       'git diff --name-only -z origin/main..deadbeef': { stdout: 'README.md\0' },
     });
     const r = computeNetDiffPaths({ exec, rev: 'deadbeef' });
-    expect(r).toEqual({ paths: ['README.md'], base: 'origin/main', rev: 'deadbeef', scored: true });
+    expect(r).toEqual({ paths: ['README.md'], base: BASE_SHA, rev: 'deadbeef', scored: true });
   });
 
   it('#2952 — degrades with reason:"ref-unresolved" when neither candidate resolves (legitimately absent — a foreign/sibling clone with no head ref)', () => {
@@ -966,5 +991,174 @@ describe('computeNetDiffPaths (#2901/#1031 — NET changed-file list as plain pa
     const { exec, calls } = fakeExec();
     expect(computeNetDiffPaths({ exec })).toEqual({ paths: [], base: null, rev: null, scored: false });
     expect(calls.length).toBe(0);
+  });
+});
+
+// Real object/ref/config probes; transport is a local no-op (or explicit failure), never a network fetch.
+describe('hardened net-diff basis — real Git', () => {
+  function fixture(run) {
+    const cwd = mkdtempSync(join(process.env.TMPDIR || tmpdir(), 'netdiff-'));
+    const git = (...args) => String(execFileSync('git', args, { cwd, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'],
+      env: { ...process.env, GIT_CONFIG_GLOBAL: '/dev/null', GIT_CONFIG_NOSYSTEM: '1' } })).trim();
+    try {
+      git('init', '-b', 'main');
+      git('config', 'user.name', 'Net Diff'); git('config', 'user.email', 'netdiff@example.invalid');
+      writeFileSync(join(cwd, 'file.txt'), 'base\n');
+      git('add', '.'); git('commit', '-m', 'base');
+      const base = git('rev-parse', 'HEAD');
+      git('update-ref', 'refs/remotes/origin/main', base);
+      writeFileSync(join(cwd, 'file.txt'), 'head\n');
+      git('commit', '-am', 'head');
+      const head = git('rev-parse', 'HEAD');
+      const calls = [];
+      const exec = (cmd, args, opts) => {
+        calls.push({ args, opts });
+        if (args.includes('fetch')) return ''; // tracking ref above is the fetched base
+        return execFileSync(cmd, args, { cwd, ...opts });
+      };
+      run({ cwd, git, base, head, exec, calls });
+    } finally { rmSync(cwd, { recursive: true, force: true }); }
+  }
+
+  it('a moved head ref cannot replace the exact requested SHA', () => fixture(({ git, base, head, exec }) => {
+    git('update-ref', `refs/remotes/origin/${head}`, base);
+    git('update-ref', 'refs/heads/lane', base);
+    const result = computeNetDiffSignals({ exec, rev: head, fetchExtraRefs: ['lane'] });
+    expect(result.netDiffText.rev).toBe(head);
+    expect(result.changedFiles).toEqual(['file.txt']);
+    expect(result.netDiffText.text).toContain('+head');
+  }));
+
+  for (const kind of ['heads', 'tags']) {
+    it(`a shadow ${kind} origin/main cannot win base resolution`, () => fixture(({ git, base, head, exec }) => {
+      git('update-ref', `refs/${kind}/origin/main`, head);
+      const basis = resolveNetDiffBasis({ exec, rev: head });
+      expect(basis.baseRef).toBe(base);
+      expect(basis.humanBasis.changedFiles).toEqual(['file.txt']);
+    }));
+  }
+
+  it('replacement objects do not alter ancestry, numstat or text', () => fixture(({ git, base, head, exec }) => {
+    git('replace', head, base);
+    const result = computeNetDiffSignals({ exec, rev: head, baseRev: base });
+    expect(result.changedFiles).toEqual(['file.txt']);
+    expect(result.diffLines).toBe(2);
+    expect(result.netDiffText.text).toContain('+head');
+  }));
+
+  it('repo textconv and external drivers are not executed; removing no-textconv mutates the result', () => fixture(({ cwd, git, head, exec }) => {
+    const marker = join(cwd, 'driver-ran');
+    const driver = join(cwd, 'driver.sh');
+    writeFileSync(driver, '#!/bin/sh\necho ran > "' + marker + '"\necho CONVERTED\n', { mode: 0o755 });
+    writeFileSync(join(cwd, '.git/info/attributes'), '*.txt diff=hostile\n');
+    git('config', 'diff.hostile.textconv', driver);
+    git('config', 'diff.external', driver);
+    const result = computeNetDiffSignals({ exec, rev: head });
+    expect(result.netDiffText.text).toContain('+head');
+    expect(existsSync(marker)).toBe(false);
+    const mutated = (cmd, args, opts) => exec(cmd, args.filter(a => a !== '--no-textconv'), opts);
+    const converted = computeNetDiffText({ exec: mutated, rev: head });
+    expect(converted.scored).toBe(true);
+    expect(converted.text).not.toContain('+head');
+    expect(existsSync(marker)).toBe(true);
+  }));
+
+  it('colour, quotepath and noprefix settings cannot alter diff text or numstat parsing', () => fixture(({ cwd, git, head, exec }) => {
+    const clean = computeNetDiffSignals({ exec, rev: head });
+    git('config', 'color.ui', 'always'); git('config', 'diff.noprefix', 'true');
+    git('config', 'core.quotepath', 'true');
+    const configured = computeNetDiffSignals({ exec, rev: head });
+    expect(configured.netDiffText.text).toBe(clean.netDiffText.text);
+    expect(configured.changedFiles).toEqual(['file.txt']);
+    expect(configured.diffLines).toBe(2);
+  }));
+
+  it('failed fetch is unscored despite a usable cached base', () => fixture(({ head, exec }) => {
+    const offline = (cmd, args, opts) => { if (args.includes('fetch')) throw new Error('offline'); return exec(cmd, args, opts); };
+    const result = computeNetDiffSignals({ exec: offline, rev: head });
+    expect(result.scored).toBe(false);
+    expect(result.netDiffText.reason).toBe('fetch-failed');
+  }));
+
+  it('an absent SHA never falls back to a remote ref with that name', () => fixture(({ git, head, exec }) => {
+    const absent = '1'.repeat(40);
+    git('update-ref', `refs/remotes/origin/${absent}`, head);
+    const result = computeNetDiffSignals({ exec, rev: absent });
+    expect(result.scored).toBe(false);
+    expect(result.netDiffText.reason).toBe('ref-unresolved');
+  }));
+
+  it('an unresolved fully qualified base is unscored even if a shadow base exists', () => fixture(({ git, head, exec }) => {
+    git('update-ref', '-d', 'refs/remotes/origin/main');
+    git('update-ref', 'refs/tags/origin/main', head);
+    expect(resolveNetDiffBasis({ exec, rev: head })).toMatchObject({ ok: false, reason: 'ref-unresolved' });
+  }));
+
+  it('binary files keep zero line counts and binary diff text', () => fixture(({ cwd, git, exec }) => {
+    writeFileSync(join(cwd, 'binary.dat'), Buffer.from([0, 1, 2, 3]));
+    git('add', 'binary.dat'); git('commit', '-m', 'binary');
+    const result = computeNetDiffSignals({ exec, rev: git('rev-parse', 'HEAD') });
+    expect(result.changedFiles).toEqual(['binary.dat', 'file.txt']);
+    expect(result.diffLines).toBe(2);
+    expect(result.netDiffText.text).toContain('Binary files /dev/null and b/binary.dat differ');
+  }));
+
+  it('ancestry fallback uses hardened log numstat', () => fixture(({ head, exec, calls }) => {
+    const noMergeBase = (cmd, args, opts) => {
+      if (args.includes('merge-base')) throw new Error('no merge base');
+      return exec(cmd, args, opts);
+    };
+    const basis = resolveNetDiffBasis({ exec: noMergeBase, rev: head });
+    expect(basis.basisKind).toBe('ancestry');
+    expect(basis.humanBasis).toEqual({ changedFiles: ['file.txt'], diffLines: 2 });
+    const log = calls.find(c => c.args.includes('log'));
+    expect(log.opts.env.GIT_NO_REPLACE_OBJECTS).toBe('1');
+    expect(log.args).toContain('--no-textconv');
+    expect(log.args).toContain('--no-ext-diff');
+    expect(log.args).toContain('--no-color');
+  }));
+
+  it('every basis, own-delta and text call carries the hardened environment and global config', () => fixture(({ head, base, exec, calls }) => {
+    computeNetDiffSignals({ exec, rev: head, baseRev: base });
+    for (const { args, opts } of calls) {
+      expect(opts.env.GIT_NO_REPLACE_OBJECTS).toBe('1');
+      expect(opts.env.GIT_GRAFT_FILE).toBe('/dev/null');
+      expect(args.slice(0, 8)).toEqual(['-c', 'core.quotepath=false', '-c', 'color.ui=never', '-c', 'diff.noprefix=false', '-c', 'diff.external=']);
+      if (args.includes('diff') || args.includes('log')) {
+        expect(args).toContain('--no-textconv'); expect(args).toContain('--no-ext-diff'); expect(args).toContain('--no-color');
+      }
+    }
+  }));
+});
+
+
+describe('landing head binding', () => {
+  const source = readFileSync(join(dirname(fileURLToPath(import.meta.url)), '..', 'pr-land.mjs'), 'utf8');
+  const start = source.indexOf('    // Read at the scoring point.');
+  const end = source.indexOf('    const exec =', start);
+  // Exercise the actual CLI guard in isolation, with emit's process-exit represented by a sentinel.
+  const guard = new Function('forge', 'prNum', 'refSha', 'REPO', 'emit', source.slice(start, end));
+  it.each(['different', 'missing', 'unreadable'])('refuses %s PR head evidence before scoring', kind => {
+    const head = 'b'.repeat(40);
+    const forge = { viewPr: () => {
+      if (kind === 'unreadable') throw new Error('unreadable');
+      return { headRefOid: kind === 'missing' ? null : 'c'.repeat(40) };
+    } };
+    let refusal;
+    expect(() => guard(forge, 12, head, 'repo', (result, code) => {
+      refusal = { result, code }; throw new Error('exit');
+    })).toThrow('exit');
+    expect(refusal.code).toBe(3);
+    expect(refusal.result).toMatchObject({ merged: false, reason: 'pr-head-mismatch', sha: head });
+  });
+  it('allows scoring only when the PR head matches the local SHA', () => {
+    const head = 'b'.repeat(40);
+    guard({ viewPr: () => ({ headRefOid: head }) }, 12, head, 'repo', () => { throw new Error('unexpected refusal'); });
+  });
+  it('the drain scores the listing head SHA and fetches the branch only for transport', () => {
+    const drain = readFileSync(join(dirname(fileURLToPath(import.meta.url)), '..', 'merge-ai-prs.mjs'), 'utf8');
+    const call = drain.slice(drain.indexOf('const sig = computeNetDiffSignals({ exec, rev:'));
+    expect(call.slice(0, call.indexOf(';'))).toContain("v.listedHeadSha : null");
+    expect(call.slice(0, call.indexOf(';'))).toContain('fetchExtraRefs: [v.headRef]');
   });
 });

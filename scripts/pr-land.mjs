@@ -1236,6 +1236,15 @@ async function runCli() {
   // `main` between this lane's claim and its PR-open, live repro: PR #324) into the score as if the PR itself
   // touched them.
   const applyReviewEscalationLabel = () => {
+    // Read at the scoring point. emit exits, including inside best-effort callers.
+    if (prNum) {
+      let prHeadSha = null;
+      try { prHeadSha = forge.viewPr(prNum, 'headRefOid')?.headRefOid; } catch { /* unread evidence refuses below */ }
+      if (!/^[0-9a-f]{40}$/i.test(prHeadSha || '') || prHeadSha.toLowerCase() !== refSha.toLowerCase()) {
+        emit({ repo: REPO, merged: false, reason: 'pr-head-mismatch', pr: Number(prNum),
+          sha: refSha, prHeadSha, detail: 'PR head is unreadable or differs from the local scoring head; refresh the ref and rerun pr-land.' }, 3);
+      }
+    }
     const exec = (cmd, args, opts) => execFileSync(cmd, args, { cwd: REPO, ...opts });
     // xnsk54v — prefer the SCRATCH manifest (--manifest-file, the new off-tree carrier); fall back to the
     // legacy tree-committed `.lane-manifest.json` off the ref for a lane that still commits it. Loaded BEFORE
@@ -1259,6 +1268,7 @@ async function runCli() {
     // brings that to 6 subprocesses and 1 fetch. Assembling it here instead would leave that sharing — and the
     // `diffHunks` mapping below — pinned by nothing a test can observe at this call site.
     const sig = computeNetDiffSignals({ exec, remote: REMOTE, base: BASE, baseRev, rev: refSha });
+    if (sig.netDiffText.scored) process.stderr.write(`pr-land net-diff basis: base=${sig.netDiffText.base} head=${sig.netDiffText.rev}\n`);
     const changedFiles = sig.changedFiles;
     const diffLines = sig.diffLines;
     // #2390-review-fix — the CUMULATIVE origin/main…head basis the gate-self/human trigger scores over; a

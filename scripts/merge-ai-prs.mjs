@@ -4021,6 +4021,15 @@ export function parseNumstat(numstat) {
   return { changedFiles, diffLines };
 }
 
+// Keep injected exec's (command, argv, options) contract; isolate all net-diff Git reads.
+function netDiffGit(exec, args, opts = {}) {
+  const flags = args[0] === 'diff' || args[0] === 'log'
+    ? ['--no-textconv', '--no-ext-diff', '--no-color'] : [];
+  return exec('git', ['-c', 'core.quotepath=false', '-c', 'color.ui=never',
+    '-c', 'diff.noprefix=false', '-c', 'diff.external=', args[0], ...flags, ...args.slice(1)],
+  { ...opts, env: { ...process.env, GIT_NO_REPLACE_OBJECTS: '1', GIT_GRAFT_FILE: '/dev/null' } });
+}
+
 /**
  * #2390-review-fix — is `ancestor` a STRICT ancestor of `descendant` (an ancestor, AND not the same commit)?
  * Used to gate the stacked-lane SIZE de-inflation: a self-declared/mis-set `base` is trusted for `base…head`
@@ -4031,11 +4040,11 @@ export function parseNumstat(numstat) {
  */
 function isStrictAncestor(exec, ancestor, descendant) {
   try {
-    exec('git', ['merge-base', '--is-ancestor', '--end-of-options', ancestor, descendant], { stdio: ['ignore', 'ignore', 'ignore'] });
+    netDiffGit(exec, ['merge-base', '--is-ancestor', '--end-of-options', ancestor, descendant], { stdio: ['ignore', 'ignore', 'ignore'] });
   } catch { return false; } // non-zero exit (not an ancestor) or unresolvable → don't trust the base
   try {
-    const a = String(exec('git', ['rev-parse', '--verify', '--end-of-options', ancestor], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }) || '').trim();
-    const b = String(exec('git', ['rev-parse', '--verify', '--end-of-options', descendant], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }) || '').trim();
+    const a = String(netDiffGit(exec, ['rev-parse', '--verify', '--end-of-options', ancestor], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }) || '').trim();
+    const b = String(netDiffGit(exec, ['rev-parse', '--verify', '--end-of-options', descendant], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }) || '').trim();
     if (a && b && a === b) return false; // base == head → degenerate empty own-delta, reject
   } catch { /* can't resolve to SHAs → is-ancestor already vouched it's a distinct ancestor path */ }
   return true;
@@ -4179,7 +4188,7 @@ function basisAnswersRequest(basis, { remote, base, rev }) {
 function ancestryNetDiff(exec, baseRef, candidate) {
   let parsed;
   try {
-    parsed = parseNumstat(exec('git', ['log', '--numstat', '--diff-merges=first-parent', '--pretty=format:', '--end-of-options', `${baseRef}..${candidate}`, '--'], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }));
+    parsed = parseNumstat(netDiffGit(exec, ['log', '--numstat', '--diff-merges=first-parent', '--pretty=format:', '--end-of-options', `${baseRef}..${candidate}`, '--'], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }));
   } catch (err) {
     if (isExecContractError(err)) throw err; // let the caller's own contract short-circuit classify it
     return null; // git can't answer (old git, unresolvable range) — caller keeps the base-tip basis
@@ -4221,21 +4230,31 @@ export function resolveNetDiffBasis({ exec, remote = 'origin', base = 'main', re
   // own `'ref-unresolved'` either (that reads as "this branch is gone", which is a different fact).
   const requestedFor = { remote, base, rev: rev || null };
   if (typeof exec !== 'function' || !rev) return { ok: false, reason: 'ref-unresolved', requestedFor };
-  const baseRef = `${remote}/${base}`;
+  let baseRef;
   try {
     // ALWAYS force-update the base tracking-ref (#2373 opportunistic-fetch fix): the cumulative human-gate basis
     // below is `<remote>/<base>…head`, which a stacked `baseRev` must never be able to shrink (#2390-review-fix).
     // `--end-of-options` FIRST: `fetchExtraRefs` carries a branch name straight off the `gh` API, and a
     // dash-leading refname is legal (`git check-ref-format 'refs/heads/--output=/tmp/pwn'` exits 0), so without
     // the guard git parses it as an option — `--upload-pack=<script>` EXECUTES. Verified against git 2.50.1.
-    exec('git', ['fetch', '--quiet', '--end-of-options', remote, `+${base}:refs/remotes/${remote}/${base}`, ...fetchExtraRefs], { stdio: ['ignore', 'ignore', 'ignore'] });
+    netDiffGit(exec, ['fetch', '--quiet', '--end-of-options', remote, `+${base}:refs/remotes/${remote}/${base}`, ...fetchExtraRefs], { stdio: ['ignore', 'ignore', 'ignore'] });
   } catch (err) {
     // #2952 — a shape-violating exec fails EVERY call the same way; bail immediately rather than degrade to
     // "whatever is locally cached", which would just re-throw on the very next call below.
     if (isExecContractError(err)) return { ok: false, reason: 'exec-contract', requestedFor };
-    /* a real fetch failure degrades to whatever is locally cached — the diff attempts below still run */
+    return { ok: false, reason: 'fetch-failed', requestedFor };
   }
-  const candidates = [`${remote}/${rev}`, rev];
+  const shaRev = /^[0-9a-f]{40}$/i.test(rev);
+  try {
+    baseRef = String(netDiffGit(exec, ['rev-parse', '--verify', '--end-of-options',
+      `refs/remotes/${remote}/${base}^{commit}`], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }) || '').trim();
+    if (!/^[0-9a-f]{40}$/i.test(baseRef)) return { ok: false, reason: 'ref-unresolved', requestedFor };
+    if (shaRev) netDiffGit(exec, ['cat-file', '-e', `${rev}^{commit}`], { stdio: ['ignore', 'ignore', 'ignore'] });
+  } catch (err) {
+    return { ok: false, reason: isExecContractError(err) ? 'exec-contract' : 'ref-unresolved', requestedFor };
+  }
+  // Branch callers retain remote-first lookup; exact commit requests never try a ref alias.
+  const candidates = shaRev ? [rev] : [`${remote}/${rev}`, rev];
   for (const candidate of candidates) {
     // #2404 — narrow the LEFT side of the diff to the provable fork point (`merge-base(baseRef, candidate)`)
     // when one exists, instead of diffing straight off the base tip: a head that's behind an advanced base
@@ -4252,7 +4271,7 @@ export function resolveNetDiffBasis({ exec, remote = 'origin', base = 'main', re
       // newline in a would-be single revision arg, making it an invalid `git diff` argument (a "continue" to
       // the next candidate, or a `null` resolve if both candidates hit it — always the safe over-scoring
       // fallback, never wrong data, but avoidable).
-      const mb = String(exec('git', ['merge-base', '--end-of-options', baseRef, candidate], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }) || '').split('\n')[0].trim();
+      const mb = String(netDiffGit(exec, ['merge-base', '--end-of-options', baseRef, candidate], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }) || '').split('\n')[0].trim();
       if (mb) { diffBase = mb; basisKind = 'merge-base'; }
     } catch (err) {
       if (isExecContractError(err)) return { ok: false, reason: 'exec-contract', requestedFor };
@@ -4265,7 +4284,7 @@ export function resolveNetDiffBasis({ exec, remote = 'origin', base = 'main', re
       // Verified on git 2.50.1: unguarded, `git diff --numstat <base> '--output=<path>'` exits 0 and WRITES that
       // file, and the swallowed numstat then reads EMPTY while the candidate still resolves — a zero blast-radius
       // score for a PR about to land, the exact de-inflation the #2390-review-fix comments assert is impossible.
-      humanBasis = parseNumstat(exec('git', ['diff', '--numstat', '--end-of-options', diffBase, candidate], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }));
+      humanBasis = parseNumstat(netDiffGit(exec, ['diff', '--numstat', '--end-of-options', diffBase, candidate], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }));
     } catch (err) {
       if (isExecContractError(err)) return { ok: false, reason: 'exec-contract', requestedFor };
       continue; /* candidate doesn't resolve — try the next one */
@@ -4319,7 +4338,7 @@ export function computeNetDiffChangedFiles({ exec, remote = 'origin', base = 'ma
     // refname. Every argv position in this file that takes a caller-supplied ref is now guarded; `merge-base`
     // and `rev-parse` are hardening rather than live holes (both reject an unknown option on git 2.50.1, and
     // the surrounding catch absorbs it), while the `git diff` positions are genuinely exploitable — verified.
-    try { own = parseNumstat(exec('git', ['diff', '--numstat', '--end-of-options', baseRev, candidate], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] })); }
+    try { own = parseNumstat(netDiffGit(exec, ['diff', '--numstat', '--end-of-options', baseRev, candidate], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] })); }
     catch { own = humanBasis; /* own-delta diff failed → fall back to the cumulative basis */ }
   }
   // #3343 — the basis's `basisKind` / `basisNarrowed` are DELIBERATELY not re-exported here. This function's
@@ -4369,13 +4388,13 @@ export function computeNetDiffText({ exec, remote = 'origin', base = 'main', rev
   let revSha;
   if (pinRev) {
     try {
-      revSha = String(exec('git', ['rev-parse', '--verify', '--end-of-options', `${candidate}^{commit}`],
+      revSha = String(netDiffGit(exec, ['rev-parse', '--verify', '--end-of-options', `${candidate}^{commit}`],
         { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }) || '').trim().toLowerCase();
       if (!/^[0-9a-f]{40,64}$/.test(revSha)) return { ...unscored, reason: 'diff-failed' };
-      // Only the fork-point basis can be pinned on BOTH sides: a `base-tip` / `ancestry` basis diffs against the moving
-      // `<remote>/<base>` NAME, which is an unpinned ref read next to the stamp — it is unscored here (fail closed).
+      // Preserve pinRev's fork-point-only contract: ancestry/base-tip measurements are not
+      // interchangeable with a narrowed two-tree text diff, even with the base pinned to a SHA.
       if (basis.basisKind !== 'merge-base') return { ...unscored, reason: 'diff-failed' };
-      diffBase = String(exec('git', ['merge-base', '--end-of-options', basis.baseRef, revSha],
+      diffBase = String(netDiffGit(exec, ['merge-base', '--end-of-options', basis.baseRef, revSha],
         { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }) || '').split('\n')[0].trim();
       if (!/^[0-9a-f]{40,64}$/i.test(diffBase)) return { ...unscored, reason: 'diff-failed' };
       candidate = revSha;
@@ -4393,7 +4412,7 @@ export function computeNetDiffText({ exec, remote = 'origin', base = 'main', rev
     // Deliberately NOT `--text`: unlike the single-file write-time diff, this is a whole-PR diff and forcing
     // binary blobs into it would splat megabytes of asset bytes into the reviewer-facing text (see
     // `diff-hunks.mjs`, where `--text` is right precisely because the payload is one bounded file).
-    const text = String(exec('git', ['diff', '--no-ext-diff', '--end-of-options', diffBase, candidate], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }) || '');
+    const text = String(netDiffGit(exec, ['diff', '--end-of-options', diffBase, candidate], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }) || '');
     return { text, base: diffBase, rev: candidate, scored: true, ...(revSha ? { revSha } : {}) };
   } catch (err) {
     // the text diff failed even though the basis resolved → caller falls back to `gh pr diff`
@@ -6506,7 +6525,8 @@ export async function main(argv, { env = process.env, stdout = process.stdout, e
       if (v.headRef && (isLocalRepo(v.repo) || escCwd)) {
         const exec = (cmd, args, opts) => execFileSync(cmd, args, { cwd: escCwd, ...opts });
         diffExec = exec;
-        const sig = computeNetDiffSignals({ exec, rev: v.headRef, baseRev: v.base, fetchExtraRefs: [v.headRef] });
+        const sig = computeNetDiffSignals({ exec, rev: /^[0-9a-f]{40}$/i.test(v.listedHeadSha || '') ? v.listedHeadSha : null, baseRev: v.base, fetchExtraRefs: [v.headRef] });
+        if (sig.netDiffText.scored) process.stderr.write(`net-diff #${v.num}: base=${sig.netDiffText.base} head=${sig.netDiffText.rev}\n`);
         changedFiles = sig.changedFiles;
         diffLines = sig.diffLines;
         humanBasisFiles = sig.humanBasisFiles;

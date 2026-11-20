@@ -452,6 +452,7 @@ describe('resolveNetDiff — a `net` basis is CLAIMED only when it is PROVEN', (
     return {
       calls,
       exec: (cmd, args) => {
+        args = args[0] === '-c' ? args.slice(8) : args;
         calls.push([cmd, ...args].join(' '));
         const a = args.join(' ');
         if (a.startsWith('fetch')) { if (fetchThrows) throw new Error('transport failed'); return ''; }
@@ -563,6 +564,7 @@ describe('resolveNetDiff binds the diff to the OID, not the ref NAME (PR #1039 f
     // the diff saw a tag of the same name, and `net` was still claimed.
     const seen = [];
     const exec = (cmd, args) => {
+      args = args[0] === '-c' ? args.slice(8) : args;
       const a = args.join(' ');
       if (a.startsWith('fetch')) return '';
       if (a.startsWith('rev-parse --verify --end-of-options refs/remotes/')) return `${OID2}\n`;
@@ -584,6 +586,7 @@ describe('resolveNetDiff binds the diff to the OID, not the ref NAME (PR #1039 f
   it('still fetches by NAME — the oid is not fetchable, only diffable', () => {
     const fetches = [];
     const exec = (cmd, args) => {
+      args = args[0] === '-c' ? args.slice(8) : args;
       const a = args.join(' ');
       if (a.startsWith('fetch')) { fetches.push(a); return ''; }
       if (a.startsWith('rev-parse')) return `${OID2}\n`;
