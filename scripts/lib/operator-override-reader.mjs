@@ -19,7 +19,7 @@ export const CAPACITY_LEAVES = Object.freeze({
   'lanes.maxConcurrent': instant(1, 48, 12),
   'resourceGate.fixCap.raiseQueueOver': instant(0, 100, 5, 'threshold'),
   'resourceGate.fixCap.raiseStepPerPass': instant(1, 24, 2),
-  'resourceGate.fixCap.raiseMaxSwapUsedPct': instant(0, 200, 60, 'cap', number),
+  'resourceGate.fixCap.raiseMaxSwapUsedPct': instant(0, 100, 60, 'cap', number),
   'resourceGate.fixCap.raiseMaxHeavyWaitMinutes': instant(0, 120, 15, 'cap', number),
   'redTeam.queue.cap': instant(0, 24, 12),
   'redTeam.queue.minConcurrentIdlePct': instant(0, 100, 10, 'threshold'),

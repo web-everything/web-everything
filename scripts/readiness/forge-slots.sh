@@ -38,9 +38,7 @@ try:
     except Exception as error:
         message = re.sub(r'[\x00-\x1f\x7f-\x9f]', ' ', str(error))
         print('operator-override: operator-db-unreadable store (' + message + '); using lower setting', file=sys.stderr)
-    if override is not None:
-        count = override
-    elif 'FORGE_EXEC_SLOTS' in os.environ:
+    if 'FORGE_EXEC_SLOTS' in os.environ:
         value = os.environ['FORGE_EXEC_SLOTS']
         if not re.fullmatch(r'[1-9][0-9]*', value):
             raise ValueError('FORGE_EXEC_SLOTS must be 1..128')
@@ -55,6 +53,8 @@ try:
             checked(value, 'forgeSlots.hosts.' + name)
         host = os.environ.get('FORGE_HOST', socket.gethostname()).split('.')[0]
         count = config['hosts'].get(host, config['default'])
+    if override is not None:
+        count = override
     print(count)
 except Exception as error:
     print('forge-slots: ' + str(error), file=sys.stderr)

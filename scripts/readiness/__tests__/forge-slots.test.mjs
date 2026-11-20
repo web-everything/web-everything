@@ -120,13 +120,24 @@ describe('Forge slot settings', () => {
       const result = run(dir, { FORGE_HOST: 'forge', FORGE_EXEC_SLOTS: '3' }, python);
       expect(result.status, result.stderr).toBe(0); expect(result.stdout).toBe(expected);
     });
-    it(`${reader}: valid operator leaf survives unreadable lower settings`, () => {
-      const dir = fixture(); mkdirSync(join(dir, '.claude'));
-      writeFileSync(join(dir, '.claude', 'operator-overrides.json'), JSON.stringify({ 'forgeSlots.forge': 28 }));
-      rmSync(join(dir, 'forge-slots.json'));
-      const result = run(dir, { FORGE_HOST: 'forge' }, python);
-      expect(result.status, result.stderr).toBe(0); expect(result.stdout).toBe('28\n');
-    });
+    it.each([null, '{', '{}', JSON.stringify({forgeSlots: {default: 8, hosts: {other: 129}}})])(
+      `${reader}: refuses missing or invalid settings %j despite a valid operator leaf`, text => {
+        const dir = fixture(); mkdirSync(join(dir, '.claude'));
+        writeFileSync(join(dir, '.claude', 'operator-overrides.json'), JSON.stringify({ 'forgeSlots.forge': 28 }));
+        if (text === null) rmSync(join(dir, 'forge-slots.json'));
+        else writeFileSync(join(dir, 'forge-slots.json'), text);
+        const result = run(dir, {FORGE_HOST: 'forge'}, python);
+        expect(result.status).not.toBe(0); expect(result.stdout).toBe('');
+        expect(result.stderr).toContain('forge-slots:');
+      });
+    it.each(['', '129', 'bad', '08', '1.5'])(
+      `${reader}: refuses explicit invalid env %j despite a valid operator leaf`, value => {
+        const dir = fixture(); mkdirSync(join(dir, '.claude'));
+        writeFileSync(join(dir, '.claude', 'operator-overrides.json'), JSON.stringify({ 'forgeSlots.forge': 28 }));
+        const result = run(dir, {FORGE_HOST: 'forge', FORGE_EXEC_SLOTS: value}, python);
+        expect(result.status).not.toBe(0); expect(result.stdout).toBe('');
+        expect(result.stderr).toContain('FORGE_EXEC_SLOTS must be 1..128');
+      });
     it(`${reader}: copied flat deployment reads the same JSON and FORGE_HOST`, () => {
       const result = run(fixture(), {FORGE_HOST: 'forge'}, python);
       expect(result.status, result.stderr).toBe(0); expect(result.stdout).toBe('14\n');

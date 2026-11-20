@@ -108,12 +108,13 @@ export function loadRedTeamQueueFloor({ env = process.env,
   const startsSetting = resolveCapacityLeaf('redTeam.queue.reviewStartsPerTickWhileIdle', { env, log,
     standard: 0, tool: Number.isInteger(settings?.reviewStartsPerTickWhileIdle) && settings.reviewStartsPerTickWhileIdle >= 0
       ? Math.min(settings.reviewStartsPerTickWhileIdle, RED_TEAM_QUEUE_REVIEW_STARTS_CAP) : undefined,
-    envValue: Number.isInteger(reviewStarts) && reviewStarts >= 0 ? Math.min(reviewStarts, RED_TEAM_QUEUE_REVIEW_STARTS_CAP) : undefined });
+    envValue: reviewStartsEnv === undefined ? undefined
+      : Number.isInteger(reviewStarts) && reviewStarts >= 0 ? Math.min(reviewStarts, RED_TEAM_QUEUE_REVIEW_STARTS_CAP) : 0 });
   const floor = {
     // A missing threshold means the default 10; a present but invalid one disables the floor (never a looser guess).
     minConcurrent: operator === null ? failClosedCapacity('redTeamQueue.minConcurrent', 0, { log })
       : (idleSetting.source === 'operator-db' || idle === undefined || validIdle(idle)) && Number.isInteger(minimum) && minimum >= 0
-      ? Math.min(minimum, operatorMinimum === undefined ? cap : RED_TEAM_QUEUE_MIN_CONCURRENT_MAX) : 0,
+      ? Math.min(minimum, cap) : 0,
     idlePct: idleSetting.value,
     reviewStartsPerTick: startsSetting.value,
   };

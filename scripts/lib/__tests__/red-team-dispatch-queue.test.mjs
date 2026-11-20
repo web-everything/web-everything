@@ -1359,7 +1359,7 @@ describe('idle-only review start allowance', () => {
     expect(loadRedTeamQueueFloor({ env: {}, readFile }).reviewStartsPerTick).toBe(expected);
     expect(RED_TEAM_QUEUE_REVIEW_STARTS_CAP).toBe(12);
   });
-  it.each([['3', 3], ['99', 12], ['', 4], [' ', 4], ['bad', 4], ['Infinity', 4], ['1.5', 4], ['-1', 4]])(
+  it.each([['3', 3], ['99', 12], ['', 0], [' ', 0], ['bad', 0], ['Infinity', 0], ['1.5', 0], ['-1', 0]])(
     'environment review starts %j overrides file with %s', (value, expected) => {
       const log = vi.fn();
       const readFile = () => JSON.stringify({ redTeam: { queue: { reviewStartsPerTickWhileIdle: 4 } } });
@@ -1401,11 +1401,23 @@ describe('R878 red-team queue admits up to 4 only within the host ceiling', () =
 
 
 describe('operator-db red-team capacity override', () => {
+  it.each([0, 1, 6, 12, 24])('clamps the legacy operator minimum to the resolved queue cap %s', cap => {
+    writeFileSync(operatorFixture.file, JSON.stringify({ 'redTeamQueue.minConcurrent': 24, 'redTeam.queue.cap': cap }));
+    const floor = loadRedTeamQueueFloor({ env: {} });
+    expect(floor.minConcurrent).toBe(cap);
+    const bound = { lanes: 30, startsCeiling: 30, remainingStarts: 0, budget: { left: 30 } };
+    applyRedTeamQueueFloor(bound, { floor, cpuIdlePct: 100 });
+    expect(redTeamQueueAdmitCount(bound)).toBe(cap);
+  });
+  it('clamps a legacy operator minimum to the default cap when the new override is absent', () => {
+    writeFileSync(operatorFixture.file, JSON.stringify({ 'redTeamQueue.minConcurrent': 24 }));
+    expect(loadRedTeamQueueFloor({ env: {} }).minConcurrent).toBe(12);
+  });
   it.each([0, 9, 16, 24])('loads operator minimum %s above env and logs operator-db', minimum => {
     const dir = mkdtempSync(join(tmpdir(), 'red-team-override-'));
     try {
       const file = join(dir, 'operator-overrides.json');
-      writeFileSync(file, JSON.stringify({ 'redTeamQueue.minConcurrent': minimum }));
+      writeFileSync(file, JSON.stringify({ 'redTeamQueue.minConcurrent': minimum, 'redTeam.queue.cap': 24 }));
       const log = vi.fn();
       const floor = loadRedTeamQueueFloor({ env: { ...operatorEnv(file), WE_RED_TEAM_QUEUE_MIN_CONCURRENT: '2' }, log });
       expect(floor.minConcurrent).toBe(minimum);

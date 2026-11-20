@@ -5545,3 +5545,17 @@ including the shared pool. Other shared-pool policies retain host-owned platform
 Forge's flat deployment must ship the builtin-only operator reader beside `forge-slots.mjs`.
 The no-Node Python bootstrap also reads the two Forge leaves with the same 1..128 bound;
 its subprocess fixtures redirect the account-home lookup in the copied script, never in production.
+
+R1103 audit regressions keep swap thresholds within 0..100 across every layer, clamp the
+legacy red-team minimum to the resolved queue cap (including zero), and disable review-start
+allowance on invalid explicit environment input. Forge validates its selected env/file input
+before applying operator capacity; a valid operator leaf cannot authorize a missing or corrupt
+settings file. `capacity-shrink.test.mjs` and `gh-throttle-holders.test.mjs` retain high-index
+holders in occupancy, status, heartbeat and release after reductions, scanning at least the
+previous hard ceiling. `instant-capacity-settings.test.mjs` exercises override creation, edits,
+corruption and removal inside the admission-policy cache lifetime.
+The named `concurrent acquisitions after shrink never exceed the resolved cap` regression
+pauses one caller after its occupancy snapshot and runs a competing worker before reservation.
+Keep the pool-wide arbitration around both operations: per-slot atomic writes alone cannot
+enforce aggregate occupancy after a shrink. Arbitration is nonblocking (busy retries through
+the existing admission queue), never age-reclaims a live arbiter, and releases on errors.

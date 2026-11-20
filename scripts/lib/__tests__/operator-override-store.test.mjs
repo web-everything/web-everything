@@ -45,7 +45,7 @@ afterEach(() => { vi.unstubAllEnvs(); rmSync(dir, { recursive: true, force: true
 const ranges = [
   ['ciHeal.reserve', 0, 24], ['lanes.maxConcurrent', 1, 48],
   ['resourceGate.fixCap.raiseQueueOver', 0, 100], ['resourceGate.fixCap.raiseStepPerPass', 1, 24],
-  ['resourceGate.fixCap.raiseMaxSwapUsedPct', 0, 200], ['resourceGate.fixCap.raiseMaxHeavyWaitMinutes', 0, 120],
+  ['resourceGate.fixCap.raiseMaxSwapUsedPct', 0, 100], ['resourceGate.fixCap.raiseMaxHeavyWaitMinutes', 0, 120],
   ['redTeam.queue.cap', 0, 24], ['redTeam.queue.minConcurrentIdlePct', 0, 100],
   ['redTeam.queue.reviewStartsPerTickWhileIdle', 0, 24],
   ['heavyAdmission.cap', 1, 32], ['heavyAdmission.fastSlots', 0, 16],

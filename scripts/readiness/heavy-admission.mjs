@@ -144,7 +144,7 @@
  *     slots, but full suites cannot take fast slots. Fast capacity can scale with short-kind demand when a
  *     fresh resource snapshot permits it. Status and release scan every slot that scaling may hand out.
  */
-import { CAPACITY_LEAVES } from '../lib/operator-override-reader.mjs';
+import { CAPACITY_LEAVES, readOperatorOverrides } from '../lib/operator-override-reader.mjs';
 import { resolveCapacityLeaf } from '../lib/policy-cascade.mjs';
 import '../lib/tools-root-guard.mjs';
 import { pinDeveloperDir } from '../lib/lane-git-hardening.mjs';
@@ -164,8 +164,9 @@ import { DEFAULT_HOST_MAX_WAIT_MS, loadHostOverloadSettings } from '../lib/host-
 import { LEGACY_SETTINGS_PATH, readDeclaredSettings } from '../lib/settings-files.mjs';
 import { cutoverDecision, loadResourceGateSettings } from '../lib/resource-gate.mjs';
 import { LEASE_FILENAME, isLeaseStale } from '../lib/lane-lease.mjs';
-import { reserve, releaseLockDir, readLockEntry, heartbeatOwn, lockDirFor, ENTRYLESS_LOCK_DIR_GRACE_MS } from './file-locks.mjs';
+import { reserve, reclaimDecision, releaseLockDir, readLockEntry, heartbeatOwn, lockDirFor, ENTRYLESS_LOCK_DIR_GRACE_MS } from './file-locks.mjs';
 import { probePidLiveness } from './pid-liveness.mjs';
+import { withLock } from './with-lock.mjs';
 import { defaultPoolRoot, guardedPoolRoot, workspaceFor } from '../lib/lane-pool-paths.mjs';
 import { writeAllSync } from '../lib/write-all-sync.mjs';
 import { isUnderTest } from '../lib/under-test.mjs';
@@ -486,7 +487,8 @@ export function loadAdmissionPolicy({ env = process.env, repoRoot, checkoutRoot,
     path = envSelected ? env.WE_PLATFORM_PREFERENCES : hostPath;
   }
   catch (e) { errors.push(`platform: ${String(e?.message ?? e).split('\n')[0]}`); }
-  const key = JSON.stringify([path, hostPath, envSelected, repoRoot, checkoutRoot, env.LANE_POOL_ROOT, ...Object.values(ADMISSION_ENV).map((name) => env[name])]);
+  // Read the operator layer uncached: creations, edits and removals must take effect immediately.
+  const key = JSON.stringify([path, hostPath, envSelected, repoRoot, checkoutRoot, env.LANE_POOL_ROOT, readOperatorOverrides(), ...Object.values(ADMISSION_ENV).map((name) => env[name])]);
   const nowMs = Date.now();
   const cached = admissionPolicyCache.get(key);
   if (cached && nowMs < cached.expiresAt) return cached.policy;
@@ -2113,24 +2115,42 @@ export function probeSlotHolderLiveness(pid, selfPid, readStat) {
  * omitted argument the way `verify-lane.mjs`'s call site originally did.
  * @returns {{ ok:boolean, slot:number|null, cap:number, heldBy:Array<{slot:number,owner:string}> }}
  */
-export function tryAcquireSlot({ lockRoot, cap, owner, nowMs, nowIso, pid = null, leaseMinutes = ADMISSION_LEASE_MINUTES, meta = null, slots = null }) {
-  const heldBy = [];
-  const selfPid = Number.isInteger(pid) ? pid : process.pid;
-  // Card xkyw1x4 — `slots` is the ORDERED list of slot indices this caller may take (`slotOrderFor`: a full
-  // suite only the heavy slots `0…cap-1`; a short job the fast slots after them first, then the heavy ones).
-  // Default: the `cap` heavy slots, in order (every pre-xkyw1x4 caller, and gh-throttle's own pool).
-  const order = Array.isArray(slots) ? slots.filter((i) => Number.isInteger(i) && i >= 0) : Array.from({ length: cap }, (_, i) => i);
-  for (const i of order) {
-    const current = readLockEntry(lockRoot, slotPath(i));
-    // Probe liveness whenever a slot is currently held — including a same-owner-string holder (the #3383
-    // case); `probeSlotHolderLiveness` itself no-ops to 'unknown' when `current.pid === selfPid` (our own
-    // slot), so it is always safe to call unconditionally here.
-    const pidLiveness = current ? probeSlotHolderLiveness(current.pid, selfPid) : 'unknown';
-    const r = reserve(lockRoot, slotPath(i), owner, nowMs, nowIso, selfPid, pidLiveness, leaseMinutes, meta, /* requireOwnProcess */ true);
-    if (r.ok) return { ok: true, slot: i, cap, heldBy };
-    heldBy.push({ slot: i, owner: r.heldBy });
+export function tryAcquireSlot({ lockRoot, cap, owner, nowMs, nowIso, pid = null, leaseMinutes = ADMISSION_LEASE_MINUTES, meta = null, slots = null, slotSpan = cap }) {
+  try {
+    // Scan and reserve under one pool-wide lock. A live arbiter never expires during its critical
+    // section; only a proven dead process permits recovery. Callers retry through their normal queue.
+    return withLock(join(lockRoot, '.acquisition'), '<admission:slot-acquisition>', () => {
+      const heldBy = [];
+      const selfPid = Number.isInteger(pid) ? pid : process.pid;
+      // Card xkyw1x4 — `slots` is the ORDERED list of slot indices this caller may take (`slotOrderFor`: a full
+      // suite only the heavy slots `0…cap-1`; a short job the fast slots after them first, then the heavy ones).
+      // Default: the `cap` heavy slots, in order (every pre-xkyw1x4 caller, and gh-throttle's own pool).
+      const order = Array.isArray(slots) ? slots.filter((i) => Number.isInteger(i) && i >= 0) : Array.from({ length: cap }, (_, i) => i);
+      const span = Math.max(slotSpan, cap, ...order.map(i => i + 1));
+      const heavyOnly = !order.some(i => i >= cap);
+      // Current fast slots retain their own allowance; retired indices still consume capacity.
+      const occupied = heldSlots({ lockRoot, cap: span }).filter(h => {
+        if (heavyOnly && h.slot >= cap && h.slot < span) return false;
+        return !reclaimDecision(h, nowMs, null, probeSlotHolderLiveness(h.pid, selfPid), leaseMinutes).acquirable;
+      });
+      const full = occupied.length >= (heavyOnly ? cap : span);
+      for (const i of order) {
+        const current = readLockEntry(lockRoot, slotPath(i));
+        if (full && reclaimDecision(current, nowMs, owner, 'unknown', leaseMinutes, selfPid).reason !== 'own') continue;
+        // Probe liveness whenever a slot is currently held — including a same-owner-string holder (the #3383
+        // case); `probeSlotHolderLiveness` itself no-ops to 'unknown' when `current.pid === selfPid` (our own
+        // slot), so it is always safe to call unconditionally here.
+        const pidLiveness = current ? probeSlotHolderLiveness(current.pid, selfPid) : 'unknown';
+        const r = reserve(lockRoot, slotPath(i), owner, nowMs, nowIso, selfPid, pidLiveness, leaseMinutes, meta, /* requireOwnProcess */ true);
+        if (r.ok) return { ok: true, slot: i, cap, heldBy };
+        heldBy.push({ slot: i, owner: r.heldBy });
+      }
+      return { ok: false, slot: null, cap, heldBy: full ? occupied.map(h => ({ slot: h.slot, owner: h.owner })) : heldBy };
+    }, { timeoutMs: 0, leaseMinutes: Infinity });
+  } catch (error) {
+    if (error?.code !== 'ELOCKTIMEOUT') throw error;
+    return { ok: false, slot: null, cap, heldBy: [], reason: 'pool-busy' };
   }
-  return { ok: false, slot: null, cap, heldBy };
 }
 
 /**
@@ -2152,7 +2172,7 @@ export function releaseOwnedSlot({ lockRoot, cap, owner, pid = process.pid, fast
   let ownerOnlyFallback = null;
   // Card xkyw1x4 — also scan the fast-lane slots after the heavy ones (a short job may hold one). Scanning an
   // index nobody uses (another pool, e.g. gh-throttle's) finds nothing and releases nothing.
-  for (let i = 0; i < cap + fastSlots; i++) {
+  for (let i = 0; i < Math.max(ADMISSION_MAX_SLOTS, cap + fastSlots); i++) {
     const entry = readLockEntry(lockRoot, slotPath(i));
     if (!entry || entry.owner !== owner) continue;
     if (selfPid !== null && Number.isInteger(entry.pid) && entry.pid === selfPid) {
@@ -2188,7 +2208,7 @@ export function releaseOwnedSlot({ lockRoot, cap, owner, pid = process.pid, fast
  * rewrites `lock.json`. Returns the refreshed slot index, or null when this process holds none.
  */
 export function heartbeatOwnedSlot({ lockRoot, cap, owner, pid = process.pid, nowIso = new Date().toISOString(), fastSlots = resolveSlotSpan({ ...loadAdmissionPolicy({ env: process.env }).settings, cap }) - cap }) {
-  for (let i = 0; i < cap + fastSlots; i++) {
+  for (let i = 0; i < Math.max(ADMISSION_MAX_SLOTS, cap + fastSlots); i++) {
     const entry = readLockEntry(lockRoot, slotPath(i));
     if (!entry || entry.owner !== owner || entry.pid !== pid) continue;
     // Residual (audited): the heartbeat file is keyed by owner, so a same-owner sibling that reclaimed this slot in
@@ -2205,7 +2225,7 @@ export function heartbeatOwnedSlot({ lockRoot, cap, owner, pid = process.pid, no
 export function heldSlots({ lockRoot, cap, fastSlots = 0 }) {
   const held = [];
   // `fastSlots` (card xkyw1x4): the heavy-admission pool's extra fast-lane slots, scanned after the heavy ones.
-  for (let i = 0; i < cap + fastSlots; i++) {
+  for (let i = 0; i < Math.max(ADMISSION_MAX_SLOTS, cap + fastSlots); i++) {
     const entry = readLockEntry(lockRoot, slotPath(i));
     if (entry) held.push({ slot: i, owner: entry.owner, pid: entry.pid, heartbeatAt: entry.heartbeatAt, meta: entry.meta || null });
   }
@@ -2639,7 +2659,7 @@ export async function acquireSlotBlocking({
         // reading it at release mis-attributes a lane whose lease was reaped or re-leased meanwhile.
         const identity = resolveHoldIdentity({ env, repo: repo ?? repoOfOwner(owner), readLease: seams.readLease });
         const meta = { kind: jobKind, acquiredAt: nowIso, lane: lane ?? null, ...(command ? { command: String(command).slice(0, 200) } : {}), ...(holder ? { holder } : {}), ...(location ? { location } : {}), ...identity, ...(cls.class !== 'P3' ? { priority: cls.class } : {}) };
-        const r = tryAcquireSlot({ lockRoot, cap, owner, nowMs: attempt, nowIso, pid, leaseMinutes, meta, slots: slotOrder });
+        const r = tryAcquireSlot({ lockRoot, cap, owner, nowMs: attempt, nowIso, pid, leaseMinutes, meta, slots: slotOrder, slotSpan: cap + fastSlots });
         if (r.ok) {
           const admittedAt = now();
           recordAdmissionWait({ lockRoot, kind: jobKind, waitMs: Math.max(0, admittedAt - startedAt), route: 'local',
@@ -2994,7 +3014,7 @@ export function admissionStatus({ lockRoot, cap, nowMs = Date.now(), fastSlots =
   const waiting = listWaiting(lockRoot).filter((marker) => isRankableWaiter(marker, { nowMs, ...reapSeams }));
   // xaipsbs — `reaped` is what the reap has removed so far; `staleWaiting` is what it WOULD remove right now.
   const staleWaiting = reapStaleWaiters({ lockRoot, nowMs, apply: false, ...reapSeams }).reaped.length;
-  const heavyHeld = held.filter((h) => h.slot < cap).length;
+  const heavyHeld = held.filter((h) => h.slot < cap || h.slot >= cap + fastSlots).length;
   return {
     cap, fastSlots, heldCount: held.length, freeCount: Math.max(0, cap + fastSlots - held.length),
     heavyFreeCount: Math.max(0, cap - heavyHeld), fastFreeCount: Math.max(0, fastSlots - (held.length - heavyHeld)),

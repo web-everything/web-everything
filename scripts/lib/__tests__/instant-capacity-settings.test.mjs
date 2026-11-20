@@ -12,7 +12,7 @@ import { resolveCiHealReserve } from '../ci-heal-reserve.mjs';
 import { resolveMaxConcurrentLanes } from '../lane-concurrency.mjs';
 import { resolveResourceGateSettings, loadResourceGateSettings } from '../resource-gate.mjs';
 import { loadRedTeamQueueFloor, applyRedTeamQueueFloor, redTeamQueueAdmitCount } from '../red-team-dispatch-queue.mjs';
-import { resolveAdmissionPolicy } from '../../readiness/heavy-admission.mjs';
+import { loadAdmissionPolicy, resolveAdmissionPolicy } from '../../readiness/heavy-admission.mjs';
 import { resolveDeliveryCapacity } from '../delivery-capacity.mjs';
 import { resolveProviderCap, resolveDailyCap } from '../review-seat-caps.mjs';
 import { resolveForgeSlots } from '../../readiness/forge-slots.mjs';
@@ -33,7 +33,7 @@ const cases = [
   ['lanes.maxConcurrent', 1, 48, 3, () => resolveMaxConcurrentLanes({ WE_MAX_CONCURRENT_LANES: '3' })],
   ['resourceGate.fixCap.raiseQueueOver', 0, 100, 3, () => gate('raiseQueueOver')],
   ['resourceGate.fixCap.raiseStepPerPass', 1, 24, 3, () => gate('raiseStepPerPass')],
-  ['resourceGate.fixCap.raiseMaxSwapUsedPct', 0, 200, 3, () => gate('raiseMaxSwapUsedPct')],
+  ['resourceGate.fixCap.raiseMaxSwapUsedPct', 0, 100, 3, () => gate('raiseMaxSwapUsedPct')],
   ['resourceGate.fixCap.raiseMaxHeavyWaitMinutes', 0, 120, 3, () => gate('raiseMaxHeavyWaitMinutes')],
   ['redTeam.queue.cap', 0, 24, 12, () => loadRedTeamQueueFloor({ env: {}, readFile: () => JSON.stringify({ redTeam: { queue: { minConcurrent: 99 } } }) }).minConcurrent],
   ['redTeam.queue.minConcurrentIdlePct', 0, 100, 10, () => queue('idlePct')],
@@ -129,10 +129,43 @@ describe('instant bounded capacity leaves', () => {
     expect(result.value).toEqual({ openPrCap: 90, maxStartsPerCheck: 8 });
   });
   it.each([
-    ['raiseMaxSwapUsedPct', 120.5], ['raiseMaxHeavyWaitMinutes', 30.5],
+    ['raiseMaxSwapUsedPct', 80.5], ['raiseMaxHeavyWaitMinutes', 30.5],
   ])('preserves fractional resource threshold %s', (leaf, value) => {
     seed({ [`resourceGate.fixCap.${leaf}`]: value });
     expect(gate(leaf)).toBe(value);
+  });
+  it.each([100.5, 101, 200])('rejects swap percentage %s in every policy layer', value => {
+    const key = 'resourceGate.fixCap.raiseMaxSwapUsedPct';
+    seed({ [key]: value });
+    expect(readOperatorOverrides({ file, log: quiet }).values[key]).toBeUndefined();
+    for (const options of [
+      { tool: { fixCap: { raiseMaxSwapUsedPct: value } } },
+      { platform: { fixCap: { raiseMaxSwapUsedPct: value } } },
+      { env: { WE_FIX_CAP_RAISE_MAX_SWAP_USED_PCT: String(value) } },
+    ]) {
+      expect(resolveResourceGateSettings({ env: {}, log: quiet, ...options }).settings.fixCap.raiseMaxSwapUsedPct).toBe(60);
+    }
+  });
+  it('loadAdmissionPolicy observes override creation, changes, corruption and removal within its cache lifetime', () => {
+    const root = dirname(file);
+    const platform = join(root, 'platform-preferences.json');
+    writeFileSync(platform, JSON.stringify({ heavyAdmission: { cap: 4, fastSlots: 2 } }));
+    const options = { env: {}, repoRoot: root, home: dirname(root) };
+    const read = () => {
+      const { settings } = loadAdmissionPolicy(options);
+      return [settings.cap, settings.fastSlots];
+    };
+    expect(read()).toEqual([4, 2]);
+    seed({ 'heavyAdmission.cap': 8, 'heavyAdmission.fastSlots': 4 });
+    expect(read()).toEqual([8, 4]);
+    seed({ 'heavyAdmission.cap': 1, 'heavyAdmission.fastSlots': 0 });
+    expect(read()).toEqual([1, 0]);
+    writeFileSync(file, '{');
+    expect(read()).toEqual([4, 2]);
+    seed({ 'heavyAdmission.cap': 6, 'heavyAdmission.fastSlots': 3 });
+    expect(read()).toEqual([6, 3]);
+    rmSync(file);
+    expect(read()).toEqual([4, 2]);
   });
   it('provider routing keeps an operator zero disabled even when routing enables Gemini', async () => {
     const { resolveRoutingProviderCap } = await import('../review-seat-caps.mjs');
