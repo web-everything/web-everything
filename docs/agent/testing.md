@@ -487,6 +487,11 @@ The moved-card cases in `review-red-team-on-skip.test.mjs`, `drain-red-team-evid
 and `review-job-red-team-only.test.mjs` pin selection, fail-closed proof and real comment settlement.
 Keep these files in the affected-test gate whenever the moved-card readers, proof or job wiring change:
 `npm run test:unit -- scripts/lib/__tests__/review-red-team-on-skip.test.mjs scripts/lib/__tests__/drain-red-team-evidence.test.mjs scripts/operations/__tests__/review-job-red-team-only.test.mjs`.
+Red-team-only head clearance may ignore only pre-clearance advisory/refused
+bookkeeping on that exact head; test missing or unreadable clearance, later writes, pending label work,
+and missing/rejecting verdicts as holds. Pin that refused effects still hold without clearance and
+that clearance preserves the advisory accept's red-team ownership. The drain settlement path is unchanged.
+
 Exercise new factory IO members through `createReviewJobIo` with temporary persisted evidence and an
 injected command reader; cover runner defaults as well as injected proofs. History cases must include
 20 and 21 commits, a root, an intermediate code change, and a code-to-card rename whose source becomes

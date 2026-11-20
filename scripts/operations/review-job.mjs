@@ -90,10 +90,11 @@ import { execRead, READ_MAX_BUFFER } from '../lib/proc-read.mjs';
 import { execFileSyncThrottled } from '../lib/gh-throttle.mjs';
 import { laneGitHardeningEnv, laneHistoryProofEnv, scrubGitRepoEnv, scrubRiskyLaneConfig } from '../lib/lane-git-hardening.mjs';
 import { readCompletePrComments } from '../conveyor/pr-comments-complete.mjs';
+import { latestAcceptRecord } from '../lib/accept-carry-forward.mjs';
 import { contributionPatchId, findCarriableVerdict, decideRebaseVerdictCarry, buildVerdictCarriedMarker, resolveCarryAcrossRebase } from '../lib/rebase-verdict-carry.mjs';
 import { isPublishableRedTeamResult, liveResultGateState, parseRedTeamComment, readRedTeamProbes, redTeamForHead, redTeamGateMarker, redTeamMarker, redTeamResultId } from '../lib/red-team-gate.mjs';
 
-import { planRedTeamRecovery, recoveryProbe as defaultRecoveryProbe, staleRunDeadlineMs, normalizeRedTeamResult, redTeamSkipNeedsSettlement, cardOnlyHeadMoveCandidate, cardOnlySkipSettlementCandidate } from '../lib/review-red-team-on-skip.mjs';
+import { planRedTeamRecovery, recoveryProbe as defaultRecoveryProbe, staleRunDeadlineMs, normalizeRedTeamResult, redTeamSkipNeedsSettlement, cardOnlyHeadMoveCandidate, cardOnlySkipSettlementCandidate, readCompletePrReviews } from '../lib/review-red-team-on-skip.mjs';
 import { failedRedTeamRetry, redTeamStatusWithoutRun, reviewOnlyRedTeamResult } from '../lib/red-team-run-result.mjs';
 import { classifyRedTeamSkip, isRealHead, safeErrorText, settleRedTeamSkip } from '../lib/red-team-skip-outcome.mjs';
 import { createRedTeamCarryIo } from '../lib/red-team-carry-io.mjs';
@@ -413,6 +414,18 @@ function fetchPinnedPrHead({ lanePath, repo, pr, head, headChangedError, env, ex
 export function createReviewJobIo({ root = REPO_ROOT, env = process.env, dir = reviewJobsDir(env, root), readFile = readFileSync, exec = execReadRaw, readConfig = spawnSync, spawnPack = spawnSync, readStatus = readRedTeamStatus, writeStatus = recordRedTeamStatus, readEvidence = readDrainRedTeamEvidence,
   readSeatRecords = () => createRedTeamIo({ root, env }).readRecords({ strict: true }),
   readWitness = key => readRecoveryWitness({ ...key, env, readScorecards: readSeatRecords }), recoveryProbe = defaultRecoveryProbe(),
+  readHeadClearance = ({ repo, pr, head }) => {
+    const comments = readCompletePrComments(Number(pr), {
+      repo, exec: (file, args, options) => exec(file, args, { ...options, cwd: root, env }),
+    });
+    const reviews = readCompletePrReviews({ repo, pr, env,
+      exec: (args, options) => exec('gh', args, { ...options, cwd: root, env }) });
+    if (!Array.isArray(comments) || !Array.isArray(reviews)) return null;
+    const record = latestAcceptRecord(comments, reviews, { sha: head });
+    return record?.humanCleared === true && !record.laterBodyDerivedHold && !record.laterVerdict
+      && !record.reviewsUnreadable && Number.isFinite(Date.parse(record.at))
+      ? { sha: record.sha, at: record.at } : null;
+  },
   queueBaseline = () => resolveLiveQueueBaseline({ checkoutRoot: root, env }),
   seatAvailable = provider => createRedTeamIo({ root, env }).cliAvailable(provider), spawnSpeculative = spawn,
   log = line => writeLineSync(2, `[${new Date().toISOString()}] ${line}`),
@@ -420,6 +433,11 @@ export function createReviewJobIo({ root = REPO_ROOT, env = process.env, dir = r
   // Keep rollback authority in this process; the runner's admission file is untrusted.
   const recoveryAdmissions = new Map();
   const repoIds = new Map();
+  const readClearedWitness = key => {
+    let clearance;
+    try { clearance = readHeadClearance(key); } catch { /* No clearance authority on a read miss. */ }
+    return readWitness({ ...key, clearance });
+  };
   const restoreAdmission = ({ repo, pr, head }) => {
     const path = join(redTeamStatusDir(env), `${encodeURIComponent(repo)}-${Number(pr)}-${head}.json`);
     const admission = recoveryAdmissions.get(path);
@@ -474,7 +492,7 @@ export function createReviewJobIo({ root = REPO_ROOT, env = process.env, dir = r
       try {
         if (queued) {
           if (input.redTeamMode) {
-            witness = readWitness(key);
+            witness = readClearedWitness(key);
             recovery = planRedTeamRecovery(witness, { now: Date.now(), probe: recoveryProbe, deadlineMs: staleRunDeadlineMs(env), env });
             if (recovery.abandon) log(`red-team run dead (infra): pid=${witness.rawWriter.parsed.pid} head=${head} reason=${recovery.deathReason}; requeued once`);
             if (recovery.mode === 'skip' || recovery.abandon || recovery.mode !== input.redTeamMode
@@ -513,7 +531,7 @@ export function createReviewJobIo({ root = REPO_ROOT, env = process.env, dir = r
         attempted = true;
         writeStatus(input, { env, ...(witness ? { expectedSha256: witness.rawWriter.sha256 } : {}) });
         if (queued) {
-          stored = witness ? readWitness(key).rawWriter.parsed : readStatus(key);
+          stored = witness ? readClearedWitness(key).rawWriter.parsed : readStatus(key);
           if (stored?.status !== 'queued' || stored.pid !== process.pid
             || stored.admissionId !== admissionId
             || JSON.stringify(stored.result) !== JSON.stringify(priorResult)
@@ -558,7 +576,7 @@ export function createReviewJobIo({ root = REPO_ROOT, env = process.env, dir = r
       return { head };
     },
     readRedTeamOnlyPayload: ({ pr, repo, head }) => {
-      const w = readWitness({ pr, repo, head });
+      const w = readClearedWitness({ pr, repo, head });
       if (w?.ok === false) throw Error(`red-team evidence ${w.reason}; hold and inspect run evidence`);
       if (w?.carryEvidence?.ok === false) throw Error(`red-team evidence ${w.carryEvidence.reason}; hold and inspect run evidence`);
       const legacy = w.carryEvidence;
