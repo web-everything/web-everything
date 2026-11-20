@@ -58,7 +58,7 @@ describe('R907 red-team reader retains operator authority under test flags', () 
       env: { VITEST: 'true', WE_UNDER_TEST: '1', NODE_ENV: 'test',
         WE_RED_TEAM_QUEUE_MIN_CONCURRENT: '6', WE_RED_TEAM_QUEUE_REVIEW_STARTS_WHILE_IDLE: '4' }, log,
     });
-    expect(floor).toEqual({ minConcurrent: 0, idlePct: 10, reviewStartsPerTick: 0, maxProbesPerTick: 6 });
+    expect(floor).toEqual({ minConcurrent: 0, idlePct: 10, reviewStartsPerTick: 0, maxProbesPerTick: 0 });
     expect(log.mock.calls.flat().join(' ')).toContain('operator-db-unreadable');
   });
 });
@@ -1436,7 +1436,7 @@ it('corrupt operator store disables red-team capacity raises and logs operator-d
     const log = vi.fn();
     const floor = loadRedTeamQueueFloor({ env: { ...operatorEnv(file),
       WE_RED_TEAM_QUEUE_MIN_CONCURRENT: '12', WE_RED_TEAM_QUEUE_REVIEW_STARTS_WHILE_IDLE: '6' }, log });
-    expect(floor).toEqual({ minConcurrent: 0, idlePct: 10, reviewStartsPerTick: 0, maxProbesPerTick: 6 });
+    expect(floor).toEqual({ minConcurrent: 0, idlePct: 10, reviewStartsPerTick: 0, maxProbesPerTick: 0 });
     expect(log.mock.calls.flat().join(' ')).toContain('operator-db-unreadable');
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
@@ -1471,7 +1471,7 @@ it.each([
     const log = vi.fn();
     const floor = loadRedTeamQueueFloor({ env: { ...operatorEnv(file),
       WE_RED_TEAM_QUEUE_MIN_CONCURRENT: '12', WE_RED_TEAM_QUEUE_REVIEW_STARTS_WHILE_IDLE: '6' }, log });
-    expect(floor).toEqual({ minConcurrent: 0, idlePct: 10, reviewStartsPerTick: 0, maxProbesPerTick: 6 });
+    expect(floor).toEqual({ minConcurrent: 0, idlePct: 10, reviewStartsPerTick: 0, maxProbesPerTick: 0 });
     const bound = { lanes: 20, startsCeiling: 20, remainingStarts: 0, budget: { left: 20 } };
     applyRedTeamQueueFloor(bound, { floor, cpuIdlePct: 100 });
     expect(redTeamQueueAdmitCount(bound)).toBe(0);
@@ -1601,9 +1601,9 @@ describe('probe cap resolution through queue admission', () => {
     ['higher operator overrides lower settings', 3, 9, 9],
     ['oversized settings clamps at hard ceiling', 500, undefined, 50],
     ['operator at hard ceiling overrides settings', 3, 50, 50],
-    ['oversized operator is refused with finite default', 9, 500, 6],
+    ['oversized operator fails closed to zero', 9, 500, 0],
     ['invalid settings uses finite default', '9', undefined, 6],
-    ['invalid operator refuses otherwise valid settings', 9, '3', 6],
+    ['invalid operator fails closed to zero despite otherwise valid settings', 9, '3', 0],
   ])('%s determines the actual bounded probe count', (_name, fileCap, operatorCap, expected) => {
     const store = join(operatorRoot, 'probe-cap-precedence.json');
     writeFileSync(store, JSON.stringify(operatorCap === undefined ? {} : { 'redTeamQueue.maxProbesPerTick': operatorCap }));
@@ -1613,7 +1613,10 @@ describe('probe cap resolution through queue admission', () => {
     expect(probeTick(savedProbeQueue({ count: 60 }), floor)).toHaveLength(expected);
   });
 
-  it.each(['settings', 'operator'])('unreadable %s falls back to six actual probes', source => {
+  it.each([
+    ['settings', 'falls back to six actual probes', 6],
+    ['operator', 'fails closed to zero actual probes', 0],
+  ])('unreadable %s %s', (source, _behavior, expected) => {
     const store = join(operatorRoot, 'probe-cap-unreadable.json');
     writeFileSync(store, source === 'operator' ? '{' : '{}');
     const floor = loadRedTeamQueueFloor({ env: operatorEnv(store), file: 'probe-settings.json',
@@ -1621,8 +1624,8 @@ describe('probe cap resolution through queue admission', () => {
         if (source === 'settings') throw new Error('settings unreadable');
         return JSON.stringify({ redTeam: { queue: { maxProbesPerTick: 9 } } });
       }, log: vi.fn() });
-    expect(floor.maxProbesPerTick).toBe(6);
-    expect(probeTick(savedProbeQueue(), floor)).toHaveLength(6);
+    expect(floor.maxProbesPerTick).toBe(expected);
+    expect(probeTick(savedProbeQueue(), floor)).toHaveLength(expected);
   });
 });
 
@@ -1652,14 +1655,15 @@ describe('probe cap setting', () => {
     expect(floor.maxProbesPerTick).toBe(6);
   });
 
-  it.each(['file', 'operator'])('%s setting 500 is refused or clamped at the hard ceiling 50', source => {
+  it.each([
+    ['file', 'clamps at the hard ceiling 50', 50],
+    ['operator', 'fails closed to zero', 0],
+  ])('%s setting 500 %s', (source, _behavior, expected) => {
     const floor = probeFloor(source, 500);
     const rows = probeTick(savedProbeQueue({ count: 60 }), floor);
-    expect(rows.length).toBeGreaterThan(0);
-    expect(rows.length).toBeLessThanOrEqual(50);
+    expect(rows).toHaveLength(expected);
     expect(Number.isSafeInteger(floor.maxProbesPerTick)).toBe(true);
-    expect(floor.maxProbesPerTick).toBeGreaterThan(0);
-    expect(floor.maxProbesPerTick).toBeLessThanOrEqual(50);
+    expect(floor.maxProbesPerTick).toBe(expected);
   });
 
   it('probe order stays least-recently-probed first across persisted ticks', () => {
@@ -1676,34 +1680,39 @@ describe('probe cap setting', () => {
 
 describe('invalid probe cap', () => {
   const invalid = [-1, 2.5, '7', NaN, Infinity, null, true];
-  describe.each(['file', 'operator'])('%s setting', source => {
-    it.each(invalid)('%s falls back to exactly six finite probes', value => {
+  describe.each([
+    ['file', 'falls back to exactly six finite probes', 6],
+    ['operator', 'fails closed to zero probes', 0],
+  ])('%s setting', (source, behavior, expected) => {
+    it.each(invalid)(`%s ${behavior}`, value => {
       const floor = probeFloor(source, value);
-      expect(probeTick(savedProbeQueue(), floor)).toHaveLength(6);
-      expect(floor.maxProbesPerTick).toBe(6);
+      expect(probeTick(savedProbeQueue(), floor)).toHaveLength(expected);
+      expect(floor.maxProbesPerTick).toBe(expected);
     });
   });
   it.each(invalid)('raw floor value %s also falls back to six probes', value => {
     expect(probeTick(savedProbeQueue(), { maxProbesPerTick: value })).toHaveLength(6);
   });
-  it.each([0, 1])('an unreadable operator store preserves a stricter settings cap of %i', cap => {
+  it.each([0, 1, 6, 50])('an unreadable operator store means 0 probes whatever the settings cap (%i) and logs loudly', cap => {
     const store = join(operatorRoot, 'restrictive-probe-store.json');
     writeFileSync(store, '{');
+    const log = vi.fn();
     const floor = loadRedTeamQueueFloor({ env: operatorEnv(store), file: 'probe-settings.json',
-      readFile: () => JSON.stringify({ redTeam: { queue: { maxProbesPerTick: cap } } }), log: vi.fn() });
-    expect(floor.maxProbesPerTick).toBe(cap);
-    expect(probeTick(savedProbeQueue(), floor)).toHaveLength(cap);
+      readFile: () => JSON.stringify({ redTeam: { queue: { maxProbesPerTick: cap } } }), log });
+    expect(floor.maxProbesPerTick).toBe(0);
+    expect(probeTick(savedProbeQueue(), floor)).toHaveLength(0);
+    expect(log.mock.calls.flat().join(' ')).toMatch(/maxProbesPerTick=0 .*operator-db-unreadable.*probes OFF/);
   });
 
-  it('an unreadable operator store returns null policy and uses the finite default', () => {
+  it('an unreadable operator store returns null policy and never re-enables probes', () => {
     const store = join(operatorRoot, 'unreadable-probe-store.json');
     writeFileSync(store, '{');
     operatorEnv(store);
     expect(readOperatorPolicy('redTeamQueue')).toBeNull();
     const floor = loadRedTeamQueueFloor({ env: {}, file: 'probe-settings.json',
       readFile: () => JSON.stringify({ redTeam: { queue: { maxProbesPerTick: 500 } } }) });
-    expect(probeTick(savedProbeQueue(), floor)).toHaveLength(6);
-    expect(floor.maxProbesPerTick).toBe(6);
+    expect(probeTick(savedProbeQueue(), floor)).toHaveLength(0);
+    expect(floor.maxProbesPerTick).toBe(0);
   });
 });
 

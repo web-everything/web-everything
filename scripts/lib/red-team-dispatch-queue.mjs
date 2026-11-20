@@ -108,9 +108,9 @@ export function loadRedTeamQueueFloor({ env = process.env,
   const operator = readOperatorPolicy('redTeamQueue', { env, log });
   const operatorMinimum = operator?.minConcurrent;
   if (operator === null) {
-    const maxProbesPerTick = Math.min(probeCap(settings?.maxProbesPerTick), DEFAULT_MAX_PROBES,
-      failClosedCapacity('redTeamQueue.maxProbesPerTick', undefined, { log }));
-    note(log, `maxProbesPerTick=${maxProbesPerTick} (source: settings capped by operator-db-unreadable fallback; ceiling 6)`);
+    // An unreadable operator store cannot prove the operator did not turn probes off, so it never re-enables them.
+    const maxProbesPerTick = 0;
+    note(log, `maxProbesPerTick=0 (source: operator-db-unreadable; fail closed, probes OFF until the operator store is readable)`);
     return { maxProbesPerTick, minConcurrent: failClosedCapacity('redTeamQueue.minConcurrent', 0, { log }), idlePct: 10, reviewStartsPerTick: 0 };
   }
   const minimum = operatorMinimum ?? (minimumEnv === undefined ? settings?.minConcurrent : parseEnv(minimumEnv));
