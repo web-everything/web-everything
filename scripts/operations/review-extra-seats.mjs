@@ -1922,17 +1922,29 @@ export async function speculateRedTeam({
           operation: 'review-seat', taskType: RED_TEAM_SEAT.key, policy: routingPolicy, operatorKeys });
         if (routeError && !configuredRoute) throw routeError;
       } catch (error) { lastReason = error.message; break; }
-      const pick = configuredRoute ? { provider: configuredRoute.provider, reasoning: 'routing-policy' } : selectReviewSeatProvider({ lens: RED_TEAM_SEAT.key, available: candidates, scorecards: records });
+      let pick = configuredRoute ? { provider: configuredRoute.provider, reasoning: 'routing-policy' } : selectReviewSeatProvider({ lens: RED_TEAM_SEAT.key, available: candidates, scorecards: records });
       if (!pick.provider) { lastReason = pick.reasoning; break; }
       // Check the resolved model, including builder/AI overrides, before spending its budget.
       // Keep runSeat's guard too: promotion can be withdrawn between admission and execution.
       const candidateModel = configuredRoute?.model ?? RED_TEAM_MODELS[pick.provider].model;
       if (!carbonNonShadowAllowed(candidateModel, { env, log: io.log })) {
         lastReason = 'Carbon not promoted — non-shadow seat refused';
-        unavailable.push(`${pick.provider}: ${lastReason}`);
-        io.log(`red team: ${pick.provider}: ${lastReason}; retrying fallback provider`);
-        available = available.filter(p => p !== pick.provider);
-        continue;
+        unavailable.push(`${pick.provider}/${candidateModel}: ${lastReason}`);
+        // The refusal is about this MODEL, not the provider: take the next configured route in the chain
+        // (same provider or not) whose model is allowed, before dropping the provider altogether.
+        const chain = configuredRoute?.fallback ?? [];
+        const nextIndex = chain.findIndex(route => candidates.includes(route.provider)
+          && carbonNonShadowAllowed(route.model, { env, log: io.log }));
+        if (nextIndex >= 0) {
+          configuredRoute = { ...configuredRoute, ...chain[nextIndex], fallback: chain.slice(nextIndex + 1) };
+          delete configuredRoute.mode;
+          pick = { provider: configuredRoute.provider, reasoning: 'routing-policy' };
+          io.log(`red team: ${unavailable.at(-1)}; fallback route ${configuredRoute.provider}/${configuredRoute.model}`);
+        } else {
+          io.log(`red team: ${pick.provider}: ${lastReason}; no allowed route left for it; retrying fallback provider`);
+          available = available.filter(p => p !== pick.provider);
+          continue;
+        }
       }
       if (deferredByCap) io.log(`red team: capped route (${unavailable.join('; ') || lastReason}); fallback to ${pick.provider}`);
       if (pick.provider === 'agy-claude') io.log('red team: emergency fallback to agy-claude — codex and agy-gemini at cap');

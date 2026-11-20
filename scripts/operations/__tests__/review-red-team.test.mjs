@@ -1032,6 +1032,34 @@ describe('R1077 builder company routing', () => {
     expect(calls.some(c => c[0] === 'log' && /Carbon not promoted.*fallback/.test(c[1]))).toBe(true);
   });
 
+  // Round-6 red team: a Carbon refusal must skip that ROUTE, not the whole provider, so an explicitly
+  // configured same-provider fallback (Flash needs no promotion) still runs.
+  it.each([['no builder marker', 'no marker'], ['a Codex builder', marker('codex')]])('falls back from unpromoted Carbon to the configured same-provider Flash route (%s)', async (_label, body) => {
+    const policy = structuredClone(DEFAULT_ROUTING_POLICY);
+    policy.operations['review-seat:red-team'] = { provider: 'agy-gemini', model: 'carbon', effort: { 'agy-gemini': 'high' },
+      fallback: [{ provider: 'agy-gemini', model: 'flash', effort: 'high' }] };
+    const { io, calls } = policyIo({ readRoutingPolicy: () => structuredClone(policy) });
+    const args = input(body);
+    args.env = { WE_REVIEW_SEAT_CAP_AGY_GEMINI: '20', WE_REVIEW_SHADOW_AGY_PROMOTED: 'false' };
+    const result = await speculateRedTeam(args, io);
+    expect(result.status).toBe('speculated');
+    expect(calls.filter(c => c[0] === 'reserve').map(c => c[1])).toEqual(['agy-gemini']);
+    expect(calls.find(c => c[0] === 'seat')[1]).toMatchObject({ provider: 'agy-gemini', model: 'gemini-3.8-flash' });
+    expect(calls.some(c => c[0] === 'log' && /Carbon not promoted.*fallback route agy-gemini\/gemini-3\.8-flash/.test(c[1]))).toBe(true);
+  });
+
+  it('still skips when every configured route left is unpromoted Carbon', async () => {
+    const policy = structuredClone(DEFAULT_ROUTING_POLICY);
+    policy.operations['review-seat:red-team'] = { provider: 'agy-gemini', model: 'carbon', effort: { 'agy-gemini': 'high' }, fallback: [] };
+    const { io, calls } = policyIo({ readRoutingPolicy: () => structuredClone(policy) });
+    const args = input('no marker');
+    args.env = { WE_REVIEW_SEAT_CAP_AGY_GEMINI: '20', WE_REVIEW_SHADOW_AGY_PROMOTED: 'false' };
+    const result = await speculateRedTeam(args, io);
+    expect(result.status).toBe('skipped');
+    expect(calls.some(c => c[0] === 'reserve')).toBe(false);
+    expect(result.reason).toMatch(/Carbon not promoted/);
+  });
+
   it('uses the pinned head co-author stamp when the PR has no builder marker', async () => {
     const { io, calls } = policyIo({ readHeadMessage: vi.fn(() => 'Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>') });
     await speculateRedTeam(input('no marker'), io);
