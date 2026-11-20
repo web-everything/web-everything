@@ -238,7 +238,8 @@ describe('setting-driven red-team queue floor', () => {
         floor: configured, readCpuIdlePct: () => 50, run, log: f.log });
       expect(run.mock.calls[0][0].plan.refusals.map(row => row.prNumber)).toEqual([1, 2, 3, 4, 5, 6]);
       expect(f.logs.filter(line => line.startsWith(`${prefix}admit `))).toHaveLength(6);
-      expect(f.logs.filter(line => new RegExp(`^${prefix}hold \\S+: capacity \\d+$`).test(line))).toHaveLength(2);
+      expect(f.logs.filter(line => line.startsWith(`${prefix}hold `) && line.includes(': capacity ')))
+        .toEqual([7, 8].map(pr => `${prefix}hold ${repo}#${pr}: capacity 6; head=${head(pr)}`));
     },
   );
 
@@ -260,7 +261,10 @@ describe('setting-driven red-team queue floor', () => {
         floor, readCpuIdlePct: () => idle, run, log: f.log });
       expect(run.mock.calls[0][0].plan.refusals.map(row => row.prNumber)).toEqual([1, 2, 3].slice(0, admits));
       expect(f.logs.filter(line => line.startsWith(`${prefix}admit `))).toHaveLength(admits);
-      expect(f.logs.filter(line => new RegExp(`^${prefix}hold \\S+: capacity \\d+$`).test(line))).toHaveLength(holds);
+      const heldPrs = [1, 2, 3].slice(admits);
+      expect(heldPrs).toHaveLength(holds);
+      expect(f.logs.filter(line => line.startsWith(`${prefix}hold `) && line.includes(': capacity ')))
+        .toEqual(heldPrs.map(pr => `${prefix}hold ${repo}#${pr}: capacity ${admits}; head=${head(pr)}`));
     },
   );
 
@@ -1189,10 +1193,10 @@ describe('FIFO red-team dispatch queue (R752/R785)', () => {
           return { rows: [], dispatched: [], notStarted: [] };
         } });
       expect(f.logs.filter(line => line.startsWith(`${prefix}probe `))).toHaveLength(2);
-      expect(f.logs.filter(line => line.startsWith(`${prefix}admit `))).toEqual([`${prefix}admit ${repo}#6: capacity 1`]);
+      expect(f.logs.filter(line => line.startsWith(`${prefix}admit `))).toEqual([`${prefix}admit ${repo}#6: capacity 1; head=${head(6)}`]);
       expect(f.logs.filter(line => line.startsWith(`${prefix}hold `))).toEqual([
         ...[3, 4, 5].map(pr => `${prefix}hold ${repo}#${pr}: waiting for a probe turn`),
-        `${prefix}hold ${repo}#7: capacity 1`,
+        `${prefix}hold ${repo}#7: capacity 1; head=${head(7)}`,
         ...[3, 4, 5].map(pr => `${prefix}hold ${repo}#${pr}: waiting for a probe turn; waiting for a later tick`),
         `${prefix}hold ${repo}#7: capacity; waiting for a later tick`,
       ]);
