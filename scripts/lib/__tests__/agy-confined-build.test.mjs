@@ -433,7 +433,7 @@ describe('launcher-owned atomic application', () => {
     })).status).toBe('voided');
     expect(git(f.lane, 'status', '--porcelain')).toBe('');
   });
-  it.each(['.git/config', '.git/commondir', '.git/HEAD', '.git/info/attributes', '.git/info/exclude',
+  it.each(['.git/config', '.git/commondir', '.git/HEAD', '.git/index', '.git/info/attributes', '.git/info/exclude',
     '.git/objects/info/alternates', '.git/shallow', '.git/worktrees/evil/gitdir', '.git/modules/evil/config',
     '.git/refs/replace/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', '.git/hooks/pre-commit', '.git/hooks/nested/hook',
   ])('voids planted %s without ANY post-run git', async p => {
@@ -493,10 +493,17 @@ describe('launcher-owned atomic application', () => {
   });
   it('rejects a submodule entry', async () => {
     const f = fixture();
-    expect((await f.run(dir => {
+    let post;
+    const result = await f.run(dir => {
+      writeFileSync(join(dir, 'docs/a.md'), 'after\n');
       mkdirSync(join(dir, 'docs/sub'));
       git(dir, 'update-index', '--add', '--cacheinfo', `160000,${git(dir, 'rev-parse', 'HEAD').trim()},docs/sub`);
-    })).status).toBe('voided');
+      post = f.commands.length;
+    });
+    expect(result).toMatchObject({ status: 'voided', applied: [] });
+    expect(result.reasons.join(' ')).toContain('clone git controls changed');
+    expect(f.commands.slice(post)).toEqual([]);
+    expect(git(f.lane, 'status', '--porcelain')).toBe('');
   });
   it('rejects a traversal path in per-file evidence', async () => {
     const f = fixture();

@@ -4971,7 +4971,7 @@ narrow it, with criticality re-checked), before the normal review and audit path
 for agy's API. Mach/XPC/LaunchServices-mediated access remains out of scope; direct-file probes do not establish service isolation.
 Size-1 jobs of any kind are also admitted by R1062; neither is a confinement claim.
 
-The launcher hashes clone Git redirect/configuration controls with filesystem reads; unreadable or
+The launcher hashes clone Git redirect/configuration controls and the index with filesystem reads; unreadable or
 changed controls and a missing Git directory void the run. The detached exclusive-transcript worker
 group is stopped on exit, before pipe close returns evidence. Post-run host Git never runs against
 the worker clone: a second repository created before launch owns its Git metadata, index and copied
@@ -4982,6 +4982,12 @@ on the host. Ignored additions are enumerated too. Git reads in the launcher-own
 both Git directories and the work tree and disable external diff/textconv and external configuration.
 Snapshot capture is bounded to 100,000 entries, depth 128, 64 MiB per file and 1 GiB total;
 exceeding a bound voids the run with a next-provider fallback before patch generation.
+Index-only changes, including staged submodule entries, void the whole run before any post-worker Git
+call. Keep the submodule regression paired with an ordinary doc edit to prove atomic refusal.
+Exclusive-transcript descriptor tests spy on the native filesystem export and call
+`syncBuiltinESMExports()` when installing and restoring the spy, so native ESM imports are observed
+without replacing the hermetic filesystem guard. Keep hold, success, spawn throw/error and timeout
+closure assertions against the real descriptor (`EBADF`).
 Recheck every tracked and untracked diff path
 against the shared critical-work verdict as well as the allowlist predicate before applying anything.
 Keep regression cases asserting zero post-run exec calls after control tampering and atomic refusal

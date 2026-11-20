@@ -45,7 +45,7 @@ function cloneGitControls(clone) {
   record('.git', 'dir');
   if (out['.git'] === null) throw new Error('missing clone git directory');
   for (const p of ['info', 'objects', 'objects/info', 'refs']) record(`.git/${p}`, 'dir');
-  for (const p of ['commondir', 'HEAD', 'packed-refs', 'config', 'info/attributes', 'info/exclude', 'objects/info/alternates', 'shallow'])
+  for (const p of ['commondir', 'HEAD', 'packed-refs', 'index', 'config', 'info/attributes', 'info/exclude', 'objects/info/alternates', 'shallow'])
     record(`.git/${p}`, 'file');
   for (const p of ['worktrees', 'modules', 'refs', 'hooks']) record(`.git/${p}`, 'dir', true);
   record('.gitattributes', 'file');
@@ -341,7 +341,7 @@ export async function runConfinedAgyBuild({ task, laneDir, scope, kind, size, mo
     const summary = summarizeAgyEvents(events);
     return result('ok', [], { applied: [...new Set(finalPaths)], finalMessage: summary.finalResponse || summary.agentMessages.at(-1) || '', stdout: outcome.stdout ?? '' });
   } catch {
-    return result('voided', ['confinement or atomic apply evidence failed; use another fix provider or request human review']);
+    return result('voided', ['confinement or atomic apply evidence failed; use the next fix provider or request human review']);
   } finally {
     try { if (clone) removeDir(clone); }
     finally {

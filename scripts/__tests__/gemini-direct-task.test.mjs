@@ -1,7 +1,8 @@
 /** Mechanical tests only. Supplied live agy 1.2.2 streams are literal fixtures; real git regressions; no real agy processes. */
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { EventEmitter } from 'node:events';
-import { mkdtempSync, rmSync, readFileSync, writeFileSync, statSync, fstatSync } from 'node:fs';
+import fs, { mkdtempSync, rmSync, readFileSync, writeFileSync, statSync, fstatSync } from 'node:fs';
+import { syncBuiltinESMExports } from 'node:module';
 import { execFileSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { join, resolve, relative } from 'node:path';
@@ -14,15 +15,6 @@ import {
 } from '../gemini-direct-task.mjs';
 
 const tempDirs = [];
-const opened = vi.hoisted(() => []);
-vi.mock('node:fs', async importOriginal => {
-  const original = await importOriginal();
-  return { ...original, openSync: (...args) => {
-    const fd = original.openSync(...args);
-    opened.push({ path: args[0], fd });
-    return fd;
-  } };
-});
 function tempDir() {
   const dir = mkdtempSync(join(tmpdir(), 'we-gemini-direct-test-'));
   tempDirs.push(dir);
@@ -35,6 +27,7 @@ beforeEach(() => {
 afterEach(() => {
   vi.unstubAllEnvs();
   vi.restoreAllMocks();
+  syncBuiltinESMExports();
   vi.unstubAllEnvs();
   vi.useRealTimers();
   process.exitCode = 0;
@@ -570,7 +563,15 @@ describe('runAgyDirectExec / geminiDirectTask — injected process mechanics', (
   it.each(['hold', 'success', 'spawn throw', 'spawn error', 'timeout'])('closes the exclusive transcript fd on %s', async mode => {
     const dir = tempDir();
     const logFile = join(dir, 'exclusive.jsonl');
-    opened.length = 0;
+    const opened = [];
+    const open = fs.openSync;
+    vi.spyOn(fs, 'openSync').mockImplementation((...args) => {
+      const fd = open(...args);
+      opened.push({ path: args[0], fd });
+      return fd;
+    });
+    // Observe native ESM consumers too, while preserving the setup file's filesystem guard.
+    syncBuiltinESMExports();
     const { fn } = fakeSpawn('recorded\n', { hang: mode === 'timeout', error: mode === 'spawn error' ? 'ENOENT' : null });
     const spawnFn = mode === 'spawn throw' ? vi.fn(() => { throw new Error('ENOENT'); }) : fn;
     await runAgyDirectExec({ dir, task: 't', logFile, exclusiveLog: true, stream: false,
