@@ -1981,6 +1981,7 @@
   "scripts/conveyor/soak/breaks/answered-stand-down-never-redispatched.soak.test.mjs": 99.38,
   "scripts/conveyor/soak/breaks/approved-human-head-review-churn.soak.test.mjs": 1.4,
   "scripts/conveyor/soak/breaks/argon-feature-dispatch.soak.test.mjs": 2.31,
+  "scripts/conveyor/soak/breaks/audited-tip-reads-ops-waiver-store.soak.test.mjs": 1,
   "scripts/conveyor/soak/breaks/auto-rebase-operator-withdrawal.soak.test.mjs": 0.62,
   "scripts/conveyor/soak/breaks/automation-operator-ruling-orphan.soak.test.mjs": 0.81,
   "scripts/conveyor/soak/breaks/await-verify-delivered-previous-ci-never-retired.soak.test.mjs": 1,
