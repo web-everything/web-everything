@@ -4703,6 +4703,9 @@ PID/dirty refusals precede takeover; unleased reclaim retains its preservation-r
 Apply lease-holder safety only when a marker exists. Unleased recovery and salvage retain their
 backup, preservation and liveness checks; dirty content alone must not skip those checks.
 Fixtures for abandoned leases must use a dead PID (2147483646), never the test process PID.
+Keep expired dirty-lease refusal separate from unleased `--force` recycling assertions.
+Resident reaper controls must initialize real, clean Git repositories: an empty `.git`
+directory is unreadable evidence and must be retained by the fail-closed safety gate.
 Heartbeat owners must keep the event loop available while children run and stop in `finally`;
 synchronous child execution prevents interval renewals. The Codex child runner covers detached
 jobs too. Inject `readAgents`/`readCwds` into liveness fixtures; never probe host processes in unit tests.

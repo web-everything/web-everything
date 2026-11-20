@@ -47,7 +47,7 @@
  * regression on a genuinely dead, unowned lease).
  */
 import { mkdtempSync, mkdirSync, writeFileSync, chmodSync, rmSync, readFileSync } from 'node:fs';
-import { spawnSync } from 'node:child_process';
+import { execFileSync, spawnSync } from 'node:child_process';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { runSoak } from '../soak.mjs';
@@ -56,7 +56,14 @@ const MIN = 60_000;
 const ACQUIRED_MIN_AGO = 30; // past the 10-minute listing-visibility grace window, nowhere near the 240min TTL
 
 function writeLease(dir, lease) {
-  mkdirSync(join(dir, '.git'), { recursive: true });
+  mkdirSync(dir, { recursive: true });
+  // A bare .git directory is unreadable evidence to the reclaim-safety gate.
+  // Both controls need readable, clean trees so only session liveness keeps lane-1.
+  const options = { cwd: dir, encoding: 'utf8', timeout: 5000, maxBuffer: 1024 * 1024, stdio: 'pipe' };
+  execFileSync('git', ['init', '--quiet', '--initial-branch=main'], options);
+  if (execFileSync('git', ['status', '--porcelain', '--untracked-files=all'], options) !== '') {
+    throw new Error('lease-reaper fixture must start with a clean worktree');
+  }
   writeFileSync(join(dir, '.git', '.lane-lease'), `${JSON.stringify(lease, null, 2)}\n`);
 }
 
