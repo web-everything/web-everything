@@ -693,12 +693,13 @@ export function classifyChecks(rows) {
  * into the rubric, which floors SIZE at it. Together with `humanBasisFiles` that makes EVERY signal cumulative,
  * so a stacked lane's self-declared `base` can no longer de-inflate the size or blast-radius the producer stamps.
  * `computeNetDiffSignals` supplies it off the already-resolved basis; omitting it is the pre-#3317 behaviour.
+ * `netDiffScored` must explicitly confirm both the basis and text were scored; absent evidence requires human review.
  * @param {{changedFiles?:string[], diffLines?:number, humanBasisFiles?:string[]|null, cumulativeDiffLines?:number|null,
- *          dismissedFindings?:number, crossRepo?:boolean, currentLabels?:Array, diffHunks?:string|null}} o
+ *          dismissedFindings?:number, crossRepo?:boolean, currentLabels?:Array, diffHunks?:string|null, netDiffScored?:boolean}} o
  * @returns {{label:string|null, apply:boolean, reasons:string[], humanRequired:boolean}}
  */
 export function resolveProducerReviewLabel({
-  changedFiles = [], diffLines = 0, humanBasisFiles = null, cumulativeDiffLines = null, dismissedFindings = 0, crossRepo = false, currentLabels = [], diffHunks = null, basisNarrowed = true, deviation = null, sizeAdmission = null, netDiffScored = true, netDiffReason = null,
+  changedFiles = [], diffLines = 0, humanBasisFiles = null, cumulativeDiffLines = null, dismissedFindings = 0, crossRepo = false, currentLabels = [], diffHunks = null, basisNarrowed = true, deviation = null, sizeAdmission = null, netDiffScored = false, netDiffReason = null,
 } = {}) {
   // #3343 — `basisNarrowed` comes from `computeNetDiffSignals`: `false` means the cumulative file set is the
   // un-narrowed base TIP, so it may name files only upstream touched. It never relaxes the human gate (see
@@ -1240,8 +1241,8 @@ async function runCli() {
   // "successful" fetch, sweeping already-landed upstream commits (e.g. a gate-fix another lane merged onto
   // `main` between this lane's claim and its PR-open, live repro: PR #324) into the score as if the PR itself
   // touched them.
-  const applyReviewEscalationLabel = () => {
-    // Read at the scoring point. emit exits, including inside best-effort callers.
+  const assertPrHeadMatches = () => {
+    // Read before publishing readiness and again at the scoring point. emit exits, including inside best-effort callers.
     if (prNum) {
       let prHeadSha = null;
       try { prHeadSha = forge.viewPr(prNum, 'headRefOid')?.headRefOid; } catch { /* unread evidence refuses below */ }
@@ -1250,6 +1251,9 @@ async function runCli() {
           sha: refSha, prHeadSha, detail: 'PR head is unreadable or differs from the local scoring head; refresh the ref and rerun pr-land.' }, 3);
       }
     }
+  };
+  const applyReviewEscalationLabel = () => {
+    assertPrHeadMatches();
     const exec = (cmd, args, opts) => execFileSync(cmd, args, { cwd: REPO, ...opts });
     // xnsk54v — prefer the SCRATCH manifest (--manifest-file, the new off-tree carrier); fall back to the
     // legacy tree-committed `.lane-manifest.json` off the ref for a lane that still commits it. Loaded BEFORE
@@ -1488,6 +1492,7 @@ async function runCli() {
   if (PLAN.labelWhenGreen) {
     const deferredRefusal = deferredLabelRefusal({ forge, prNum, sha: refSha, deferred: DEFERRED_TO_CI });
     if (deferredRefusal) emit({ repo: REPO, merged: false, ...deferredRefusal }, 3);
+    assertPrHeadMatches();
     applyLabel();
   }
 

@@ -1212,8 +1212,8 @@ describe('hardened net-diff basis — real Git', () => {
 
 describe('landing head binding', () => {
   const source = readFileSync(join(dirname(fileURLToPath(import.meta.url)), '..', 'pr-land.mjs'), 'utf8');
-  const start = source.indexOf('    // Read at the scoring point.');
-  const end = source.indexOf('    const exec =', start);
+  const start = source.indexOf('    // Read before publishing readiness');
+  const end = source.indexOf('\n  };', start);
   // Exercise the actual CLI guard in isolation, with emit's process-exit represented by a sentinel.
   const guard = new Function('forge', 'prNum', 'refSha', 'REPO', 'emit', source.slice(start, end));
   it.each(['different', 'missing', 'unreadable'])('refuses %s PR head evidence before scoring', kind => {
@@ -1238,6 +1238,27 @@ describe('landing head binding', () => {
     const call = drain.slice(drain.indexOf('const sig = computeNetDiffSignals({ exec, rev:'));
     expect(call.slice(0, call.indexOf(';'))).toContain("v.listedHeadSha : null");
     expect(call.slice(0, call.indexOf(';'))).toContain('fetchExtraRefs: [v.headRef]');
+  });
+});
+
+describe('producer net-diff verification evidence', () => {
+  const sig = { changedFiles: ['backlog/leaf.md'], diffLines: 2, humanBasisFiles: ['backlog/leaf.md'],
+    cumulativeDiffLines: 2, diffHunks: '@@ -1 +1 @@\n-old\n+new\n', basisNarrowed: true,
+    scored: true, netDiffText: { scored: true } };
+
+  it('passes explicitly scored basis and text to the producer rubric', () => {
+    expect(producerRubric(sig)).toMatchObject({ label: null, humanRequired: false });
+  });
+
+  it.each([
+    { ...sig, scored: false },
+    { ...sig, scored: undefined },
+    { ...sig, netDiffText: { scored: false } },
+    { ...sig, netDiffText: {} },
+  ])('holds when either basis or text scoring evidence is absent: %j', evidence => {
+    const verdict = producerRubric(evidence);
+    expect(verdict).toMatchObject({ label: 'review:human', humanRequired: true });
+    expect(verdict.reasons.join(' ')).toContain('net diff unverified');
   });
 });
 

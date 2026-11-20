@@ -68,16 +68,34 @@ describe('#2844 — pr-land stamps the PR author into the body at open', () => {
 });
 
 describe('resolveProducerReviewLabel — #2307 deterministic review-escalation label AT PR-OPEN', () => {
+  it('omitted net-diff scoring evidence fails closed even with a supplied leaf diff', () => {
+    const v = resolveProducerReviewLabel({ changedFiles: ['backlog/leaf.md'], diffLines: 2, diffHunks: '@@ -1 +1 @@\n-old\n+new\n' });
+    expect(v.label).toBe(REVIEW_LABELS.human);
+    expect(v.humanRequired).toBe(true);
+    expect(v.reasons.join(' ')).toContain('net diff unverified (unscored)');
+    expect(v.reasons.join(' ')).toContain('human review of the full diff');
+  });
+
+  it.each([undefined, null, false, 1, 'true'])('netDiffScored=%s cannot verify a diff without explicit true', netDiffScored => {
+    expect(resolveProducerReviewLabel({ changedFiles: ['backlog/leaf.md'], diffLines: 2, netDiffScored }))
+      .toMatchObject({ label: REVIEW_LABELS.human, humanRequired: true });
+  });
+
+  it('explicitly scored leaf diff needs no review hold', () => {
+    expect(resolveProducerReviewLabel({ changedFiles: ['backlog/leaf.md'], diffLines: 2, netDiffScored: true }))
+      .toMatchObject({ label: null, humanRequired: false });
+  });
+
   it('a DECLARATIVE-LEASH diff (the roster — the encoded policy itself) → review:human, applied', () => {
     vi.stubEnv('WE_HUMAN_REVIEW_SURFACES', 'broad'); // Restore-path integration through the producer.
-    const v = resolveProducerReviewLabel({ changedFiles: ['scripts/lib/gate-config.mjs'], diffLines: 10 });
+    const v = resolveProducerReviewLabel({ netDiffScored: true, changedFiles: ['scripts/lib/gate-config.mjs'], diffLines: 10 });
     expect(v.label).toBe(REVIEW_LABELS.human);
     expect(v.apply).toBe(true);
     expect(v.humanRequired).toBe(true);
     expect(v.reasons.join(' ')).toMatch(/gate-self/);
   });
   it('#2771/#2785 — a policy-tier DERIVATION-CODE diff → review:pending (the committee), never review:human', () => {
-    const v = resolveProducerReviewLabel({ changedFiles: ['scripts/lib/review-escalation.mjs'], diffLines: 10 });
+    const v = resolveProducerReviewLabel({ netDiffScored: true, changedFiles: ['scripts/lib/review-escalation.mjs'], diffLines: 10 });
     expect(v.label).toBe(REVIEW_LABELS.pending);
     expect(v.apply).toBe(true);
     expect(v.humanRequired).toBe(false);
@@ -85,40 +103,40 @@ describe('resolveProducerReviewLabel — #2307 deterministic review-escalation l
   });
   it('#2771 Fork A — a STATUTE diff is UNCHANGED by the narrowing: still review:human', () => {
     vi.stubEnv('WE_HUMAN_REVIEW_SURFACES', 'broad'); // Restore-path integration through the producer.
-    const v = resolveProducerReviewLabel({ changedFiles: ['docs/agent/platform-decisions.md'], diffLines: 10 });
+    const v = resolveProducerReviewLabel({ netDiffScored: true, changedFiles: ['docs/agent/platform-decisions.md'], diffLines: 10 });
     expect(v.label).toBe(REVIEW_LABELS.human);
     expect(v.humanRequired).toBe(true);
     expect(v.reasons.join(' ')).toMatch(/statute/);
   });
   it('an escalating non-gate-self diff (blast-radius) → review:pending, applied', () => {
-    const v = resolveProducerReviewLabel({ changedFiles: ['scripts/pr-land.mjs'], diffLines: 10 });
+    const v = resolveProducerReviewLabel({ netDiffScored: true, changedFiles: ['scripts/pr-land.mjs'], diffLines: 10 });
     expect(v.label).toBe(REVIEW_LABELS.pending);
     expect(v.apply).toBe(true);
     expect(v.humanRequired).toBe(false);
   });
   it('a leaf diff with no escalation signal → no review label at all', () => {
-    const v = resolveProducerReviewLabel({ changedFiles: ['backlog/2307-x.md'], diffLines: 10 });
+    const v = resolveProducerReviewLabel({ netDiffScored: true, changedFiles: ['backlog/2307-x.md'], diffLines: 10 });
     expect(v.label).toBe(null);
     expect(v.apply).toBe(false);
   });
   it('cross-repo + dismissed-findings signals off the manifest also escalate (review:pending)', () => {
-    expect(resolveProducerReviewLabel({ crossRepo: true }).label).toBe(REVIEW_LABELS.pending);
-    expect(resolveProducerReviewLabel({ dismissedFindings: 2 }).label).toBe(REVIEW_LABELS.pending);
+    expect(resolveProducerReviewLabel({ netDiffScored: true, crossRepo: true }).label).toBe(REVIEW_LABELS.pending);
+    expect(resolveProducerReviewLabel({ netDiffScored: true, dismissedFindings: 2 }).label).toBe(REVIEW_LABELS.pending);
   });
   it('a PR that already carries the verdict label is NOT re-applied (idempotent — never a double-apply)', () => {
-    const v = resolveProducerReviewLabel({ changedFiles: ['scripts/pr-land.mjs'], diffLines: 10, currentLabels: [REVIEW_LABELS.pending] });
+    const v = resolveProducerReviewLabel({ netDiffScored: true, changedFiles: ['scripts/pr-land.mjs'], diffLines: 10, currentLabels: [REVIEW_LABELS.pending] });
     expect(v.label).toBe(REVIEW_LABELS.pending);
     expect(v.apply).toBe(false);
   });
   it('#2890 — accepts diffHunks and is otherwise unaffected by it (pure plumbing, no detector reads it yet)', () => {
     const hunks = '@@ -1,2 +1,2 @@\n-old\n+new\n';
-    const withHunks = resolveProducerReviewLabel({ changedFiles: ['scripts/pr-land.mjs'], diffLines: 10, diffHunks: hunks });
-    const withoutHunks = resolveProducerReviewLabel({ changedFiles: ['scripts/pr-land.mjs'], diffLines: 10 });
+    const withHunks = resolveProducerReviewLabel({ netDiffScored: true, changedFiles: ['scripts/pr-land.mjs'], diffLines: 10, diffHunks: hunks });
+    const withoutHunks = resolveProducerReviewLabel({ netDiffScored: true, changedFiles: ['scripts/pr-land.mjs'], diffLines: 10 });
     expect(withHunks.label).toBe(withoutHunks.label);
     expect(withHunks.apply).toBe(withoutHunks.apply);
     expect(withHunks.humanRequired).toBe(withoutHunks.humanRequired);
     expect(withHunks.reasons).toEqual(withoutHunks.reasons);
-    expect(() => resolveProducerReviewLabel({ diffHunks: undefined })).not.toThrow();
+    expect(() => resolveProducerReviewLabel({ netDiffScored: true, diffHunks: undefined })).not.toThrow();
   });
   it('#2890-review-fix finding 1 — the producer-side default is null (NOT COMPUTED), never the fail-open \'\'', () => {
     // `scoreEscalation` is what a follow-on detector reads, so the producer wrapper must not re-introduce the
@@ -943,22 +961,22 @@ describe('resolveProducerReviewLabel — the basis trust question (#3343)', () =
   const statute = ['docs/agent/platform-decisions.md'];
 
   it('threads `basisNarrowed:false` onto the verdict as `basisUntrusted`, so a human clearing the label can see the scored file set was not provably this PR\'s', () => {
-    const v = resolveProducerReviewLabel({ changedFiles: ['backlog/a.md'], humanBasisFiles: ['backlog/a.md'], diffLines: 4, basisNarrowed: false });
+    const v = resolveProducerReviewLabel({ netDiffScored: true, changedFiles: ['backlog/a.md'], humanBasisFiles: ['backlog/a.md'], diffLines: 4, basisNarrowed: false });
     expect(v.basisUntrusted).toBe(true);
     expect(v.reasons.some((r) => r.startsWith('basis un-narrowed'))).toBe(true);
   });
 
   it('NEGATIVE DIRECTION — an un-narrowed basis still labels a genuine statute edit `review:human`; the flag never buys a PR its way past the gate', () => {
     vi.stubEnv('WE_HUMAN_REVIEW_SURFACES', 'broad'); // Restore-path integration through the producer.
-    const v = resolveProducerReviewLabel({ changedFiles: statute, humanBasisFiles: statute, diffLines: 12, basisNarrowed: false });
+    const v = resolveProducerReviewLabel({ netDiffScored: true, changedFiles: statute, humanBasisFiles: statute, diffLines: 12, basisNarrowed: false });
     expect(v.humanRequired).toBe(true);
     expect(v.label).toBe('review:human');
   });
 
   it('defaults to TRUSTED — a caller supplying no `basisNarrowed` produces the same verdict as before', () => {
-    expect(resolveProducerReviewLabel({ changedFiles: statute, humanBasisFiles: statute, diffLines: 12 }))
-      .toEqual(resolveProducerReviewLabel({ changedFiles: statute, humanBasisFiles: statute, diffLines: 12, basisNarrowed: true }));
-    expect(resolveProducerReviewLabel({ changedFiles: statute, humanBasisFiles: statute, diffLines: 12 }).basisUntrusted).toBe(false);
+    expect(resolveProducerReviewLabel({ netDiffScored: true, changedFiles: statute, humanBasisFiles: statute, diffLines: 12 }))
+      .toEqual(resolveProducerReviewLabel({ netDiffScored: true, changedFiles: statute, humanBasisFiles: statute, diffLines: 12, basisNarrowed: true }));
+    expect(resolveProducerReviewLabel({ netDiffScored: true, changedFiles: statute, humanBasisFiles: statute, diffLines: 12 }).basisUntrusted).toBe(false);
   });
 });
 
