@@ -3,9 +3,20 @@
  * Fix: judge each candidate overlay by (ref, sha), accepting equal or descendant wanted tips.
  * Expectation: descendant churn adopts the verified superseded candidate; removed and divergent inputs refuse.
  */
-import { readFileSync } from 'node:fs';
+import { execFileSync } from 'node:child_process';
 import { join } from 'node:path';
+import { pathToFileURL } from 'node:url';
 import { matchReadyCandidate } from '../../../lib/daemon-rebuild/adopt.mjs';
+
+// Reuse the scenario's positive and negative controls, so moving wanted-tip checks into a helper
+// cannot turn a passing regression into an expected failure. Import the matcher from the supplied tree.
+const PROBE = `
+const { matchReadyCandidate } = await import(process.argv[1]);
+if (typeof matchReadyCandidate !== 'function') throw new TypeError('matcher export missing');
+const { default: scenario } = await import(process.argv[2]);
+const report = await scenario.run({ matchCandidate: matchReadyCandidate });
+process.stdout.write(scenario.judge(report).length === 0 ? 'fixed' : 'broken');
+`;
 
 export default {
   id: 'ready-candidate-adopted-across-overlay-churn',
@@ -17,7 +28,11 @@ export default {
   },
   fixPresent(root) {
     try {
-      return readFileSync(join(root, 'scripts/lib/daemon-rebuild/adopt.mjs'), 'utf8').includes('stillWanted(a.ref, a.sha)');
+      const matcher = pathToFileURL(join(root, 'scripts/lib/daemon-rebuild/adopt.mjs')).href;
+      const out = execFileSync(process.execPath, ['--input-type=module', '-e', PROBE, matcher, import.meta.url], {
+        encoding: 'utf8', timeout: 20_000, maxBuffer: 64 * 1024, stdio: ['ignore', 'pipe', 'pipe'],
+      });
+      return out === 'fixed';
     } catch { return false; }
   },
   async run({ log, matchCandidate = matchReadyCandidate } = {}) {
