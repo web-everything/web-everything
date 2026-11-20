@@ -5333,6 +5333,24 @@ modes and verify that card refusal cannot repeat an already recorded send-back.
 Saved-fix admission precedes lane acquisition and branch verification; retain the final pre-push
 check because verification may outlive a capability change. Refusal must not consume an attempt.
 
+## Concurrent added review seats
+
+Added-seat evidence uses the loop read sink with `review.extraSeats.concurrent` (standard true,
+platform → tool → environment `WE_REVIEW_EXTRA_SEATS_CONCURRENT`; the job logs value and source).
+The extra-seats kill switch still wins. The single-shot `run` command remains speculate then finish.
+A speculative pass writes reservations before calling providers, and writes comparison rows only
+against the final pinned loop head. Bounce, park, infra block, missing input, failed pass, moved
+head, and final-head skip discard spend without a sequential rerun. The red team and added seats
+share the sink when both start; only its owner removes it. Job-summary timings include `loopMs`,
+`seatsMs` (pass duration when available), `seatsConcurrent`, and total wall time including settlement.
+Scoped regressions live in the review-extra-seats and review-job-speculative-red-team tests; the
+`added-seats-concurrent-head-binding` soak break decides fix presence by executing both head cases.
+
+Discarded added-seat quota rows retain each call’s `finishedAt` (falling back to `startedAt`),
+so settlement order cannot let an older clean call clear a newer exhaustion hold.
+`review-extra-seats-discard-quota-order.test.mjs` covers both timestamp sources and append orders,
+including a newer clean call clearing an older hold. Replaying an old discarded call must not
+re-arm the probe interval; a fresh exhausted call does.
 ## Forge tracked-at-HEAD manifests (S1)
 
 `remote.manifest` defaults to `legacy`; `tracked` binds shipped regular files to the
@@ -5404,6 +5422,31 @@ sandboxes may deny creating such filenames before the manifest code can observe 
 The `forge-manifest-untracked-shipped` soak break uses the real manifest builder in a
 temporary Git repository. Run these scoped tests through heavy admission; the soak
 file needs `--config vitest.soak.config.ts`.
+### Orchestrator quarantine authority
+
+`resolveOrchestratorAuthority` reads repo `authority.redMainQuarantine` from the discovered
+`scripts/settings/orchestrator-authority.json` and platform `orchestrator.authority.redMainQuarantine`
+through `readPlatformPreferences().prefs.orchestrator` using only its default paths. Missing current
+platform or operator files deny authority; absent optional legacy files are allowed. Unreadable or
+invalid platform evidence still denies authority. Authority reads validate raw JSON in every platform
+file (including legacy files) before merging: duplicate object keys, including escape-equivalent names
+and repeated parent blocks, deny access even when a later file or the repo grants it. Fix the ambiguous
+file to restore an explicit grant. Repeated names in separate objects and punctuation inside strings
+are valid. The repo reader uses
+`readSettingsChecked`: duplicate ownership or read taint denies authority even over a platform grant.
+For this explicit authority grant, platform wins over
+repo in both directions; only boolean `true` grants access, and invalid values deny it. There is
+no authority environment override, including platform-file path overrides. Tests inject
+`platform`/`tool` or the `readFile` IO seam instead of redirecting the authority files.
+The resolver logs the effective value and actual source through the shared policy diagnostics.
+
+The IO writer and CLI add/remove/prune resolve authority; pure quarantine functions receive
+`orchestratorAuthority` explicitly. Keep owner validation, TTL limits, and actor audit records
+on the same path as operator and safety-net writes. `setMode` and `setFixPrs` remain limited to
+the safety net and operator even with orchestrator authority enabled. The authority settings tests cover closed
+defaults and conflicting layers; quarantine tests cover validation and removal; the IO test
+verifies persisted events and commit messages against a temporary local Git origin.
+
 ## Negative review-run proofs
 
 `headNeverReviewedFromRuns` may bypass its 400-run scan only through
@@ -5438,6 +5481,34 @@ a reclaimed/remaining partial note. Invalid bounds use defaults and report
 `default (invalid budget value)` provenance. Partial work alone exits zero with a stderr
 warning. Unreadable reservations refuse and preserve the entire affected slot.
 The sweep unit suite and `forge-sweep-scan-bound-refusal` soak pin these guarantees.
+
+## Review-run filename discovery (R1099)
+
+`review-run-names.fs.test.mjs` covers 6,000 real files, full-scan parity across PR-keyed names,
+legacy parsing, in-place corruption, shared parse budgets, filename churn, archive
+claims and age-gated archives. Run it with `review-run-index.test.mjs`,
+`drain-red-team-evidence.test.mjs`, `archive-closed-review-runs.test.mjs`, and
+`red-team-skip-settle-r622.test.mjs` through heavy admission.
+
+`writeRun` validates keyed filename/payload identity before atomic publication.
+Archiving keeps keyed filename/payload PR mismatches live in `kept.mismatch`,
+including dry-run proposals. `archive-closed-review-runs.test.mjs` covers old
+mismatched files, matching numeric/string PRs, claim-time mismatch rollback,
+and CLI mismatch counts and IDs. Legacy IDs retain their existing behavior.
+Discovery lists every review-pr ID without name-based exclusion, using the ordinary
+scan order, parse cap and liveness bounds. Every examined candidate is
+parsed; keyed ID, operation or PR disagreement holds through fallback. Compare
+names around parsing, retry once on churn, then use the bounded scan and HOLD.
+Claims or a nonempty target archive require operator restoration before absence
+can be proven. Archives default to closed/merged terminal records at least 14 days
+old under `archive/review-pr/<owner>/<repo>/<pr>/`; race fixtures explicitly use
+`minAgeDays: 0` to exercise fresh-record claims. The probe CLI is
+`scripts/review-run-probe.mjs --probe <repo>#<pr> [--head=] [--runs-dir=]`.
+
+Filesystem mtime fixtures must restore numeric seconds (`mtimeMs / 1000`), not a
+`Date`: Date truncates fractional milliseconds and cannot verify unchanged mtime
+at sub-millisecond precision. The retained JSON index sidecar is expected; the
+filename contract removes journal JSONL and seals, not the existing index writer.
 ## CI-only PR opening (R1086)
 
 `pr-land --verify=ci-only` is restricted to open modes and observed host saturation.
