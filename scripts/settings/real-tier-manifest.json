@@ -1,4 +1,7 @@
 {
   "$comment": "R1063a real-tier manifest: every tracked *.real.test.mjs must be listed here and must actually start a real process (child_process, git or a spawn helper). Renaming a test into the real tier therefore needs a visible manifest edit and cannot silently drop it from PR validation. Empty while the tier is a scaffold; passWithNoTests in vitest.real.config.ts flips to false once the first real test lands.",
-  "realTierFiles": []
+  "realTierFiles": [
+    "scripts/__tests__/merge-ai-prs-listing-dedupe.real.test.mjs",
+    "scripts/__tests__/merge-ai-prs-prestage.real.test.mjs"
+  ]
 }

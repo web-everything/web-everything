@@ -1089,8 +1089,49 @@ describe('standards input parity', () => {
       expect(existsSync(active)).toBe(true);
       expect(existsSync(join(root, 'runs/slot-1', prepared.run))).toBe(true);
       expect(existsSync(cancel)).toBe(['cleanup failure','stale execution'].includes(fault));
-      expect(cleanup).toHaveBeenCalledTimes(fault === 'cleanup failure' ? 1 : 0);
+      expect(cleanup).toHaveBeenCalledTimes(['cleanup failure','stale execution'].includes(fault) ? 1 : 0);
+      if (fault === 'stale execution') expect(existsSync(join(active, 'executing'))).toBe(true);
     } finally {time?.mockRestore();}
+  });
+
+  it.each([[-1,'ok'], [0,'ok'], [1,'ok'], [1,'nonzero'], [1,'throws']])('stale executing cancellation requires hard max runtime (offset %s ms) and proven UID cleanup: %s', async (offset, outcome) => {
+    const root = mkdtempSync(join(process.env.TMPDIR, 'cancel-stale-')); auxiliary.push(root);
+    mkdirSync(join(root, 'runs/slot-1'), {recursive:true, mode:0o710});
+    const cleanup = vi.fn(async () => {
+      expect(existsSync(join(root, 'receipts/worker-active-1/executing'))).toBe(true);
+      if (outcome === 'throws') throw new Error('uid cleanup unconfirmed');
+      return {code:outcome === 'ok' ? 0 : 1};
+    });
+    const now = Date.now(), maxRuntimeMs = 3*1_740_000+15*60*1000;
+    const runner = createRunner({testRoot:root, testPath:'/usr/bin:/bin', testWorkerExec:cleanup, testReapProbe:{uidBusy:async()=>false}, clock:()=>now});
+    const nonce = 'a'.repeat(32), prepared = await runner.prepare({nonce});
+    const active = join(root, 'receipts/worker-active-1'), executing = join(active, 'executing');
+    mkdirSync(executing);
+    const started = new Date(now-maxRuntimeMs-offset);
+    utimesSync(executing, started, started);
+    await expect(runner.finish({...prepared, nonce})).rejects.toThrow('Worker execution unconfirmed');
+    expect(cleanup).not.toHaveBeenCalled();
+    let tick = 0n;
+    const time = vi.spyOn(process.hrtime, 'bigint').mockImplementation(() => (tick += 25000000000n));
+    try {
+      const finishing = runner.finish({...prepared, nonce, cancel:true});
+      if (outcome === 'ok' && offset >= 0) {
+        await expect(finishing).resolves.toMatchObject({run:prepared.run, cancelAck:true});
+        expect(existsSync(executing)).toBe(false);
+        expect(existsSync(active)).toBe(false);
+        expect(existsSync(join(root, 'runs/slot-1', prepared.run))).toBe(false);
+        expect(cleanup).toHaveBeenCalledTimes(2); // recovery proof, then ordinary finish proof
+      } else {
+        await expect(finishing).rejects.toThrow('Worker cancellation unconfirmed');
+        expect(existsSync(executing)).toBe(true);
+        expect(existsSync(join(active, 'reservation.json'))).toBe(true);
+        expect(existsSync(join(root, 'runs/slot-1', prepared.run))).toBe(true);
+        expect(cleanup).toHaveBeenCalledTimes(1);
+      }
+      expect(cleanup).toHaveBeenCalledWith(expect.objectContaining({argv:['/usr/bin/true'],
+        cwd:join(root, 'runs/slot-1', prepared.run), env:expect.objectContaining({PATH:'/usr/bin:/bin', HOME:'/nonexistent'}), cancel:undefined}));
+      expect(tick).toBeGreaterThanOrEqual(75000000000n); // preserve the supervisor's 45s grace
+    } finally {time.mockRestore();}
   });
 
   it('does not certify cancellation of a legacy shared-UID reservation', async () => {
@@ -1286,6 +1327,22 @@ describe('runRemote', () => {
     expect(await runRemote(f)).toEqual({mode:'not-started',terminated:true,reason:'forge-busy'});
     expect(callsOf(f.exec).some(c=>c.file==='rsync'||isRun(c)||isCleanup(c))).toBe(false);
   });
+  it.each(['bound','started','wrong nonce','wrong run','missing started','extra field'])(
+    'busy full unit rejection requires a bound not-started finish: %s', async kind => {
+      const f = fixture({runCode:254, receipt:(_nonce, value) => {
+        const reply = {v:1,nonce:value.nonce,run:value.run,phase:'rejected',reason:'forge-busy',siblings:false,started:false};
+        if (kind === 'started') reply.started = true;
+        if (kind === 'wrong nonce') reply.nonce = '0'.repeat(32);
+        if (kind === 'wrong run') reply.run = 'r-'+'0'.repeat(32);
+        if (kind === 'missing started') delete reply.started;
+        if (kind === 'extra field') reply.code = 254;
+        return JSON.stringify(reply);
+      }});
+      f.argv = ['npm','run','test:unit'];
+      expect(await runRemote(f)).toEqual(kind === 'bound'
+        ? {mode:'not-started',terminated:true,reason:'forge-busy'}
+        : {mode:'unconfirmed',reason:'ambiguous-result'});
+    });
   it.each(['forge-exec-2','root','forge-exec-3','forge-exec-01'])('rsync targets only a valid server-reserved pool member: %s',async slot=>{
     const f=fixture(),execute=f.exec;
     f.exec=vi.fn(async call=>{
@@ -1786,6 +1843,26 @@ describe('runRemote', () => {
     expect(callsOf(f.exec).some(c=>c.file==='rsync'||isRun(c))).toBe(false);
     expect(callsOf(f.exec).filter(isCleanup)).toHaveLength(1);
   });
+  it.each([
+    ['staged deletion','D',':120000 000000'],['staged retarget','M',':120000 120000'],['mode change','T',':120000 100644'],
+  ])('falls back locally, with no copy or run, when a HEAD symlink changed in the index (%s)',async(_name,status,modes)=>{
+    const f=fixture(),original=f.exec;
+    f.argv=['npm','run','check:standards'];
+    f.exec=vi.fn(async call=>{
+      if(call.file==='git'&&gitArgs(call)[0]==='diff-index')
+        return {code:0,stdout:Buffer.from(`${modes} ${'a'.repeat(40)} ${'b'.repeat(40)} ${status}\0alias\0`)};
+      return original(call);
+    });
+    expect(await runRemote(f)).toEqual({mode:'not-started',terminated:true,reason:'head-symlink-changed',detail:'alias'});
+    expect(callsOf(f.exec).some(c=>c.file==='rsync'||isRun(c))).toBe(false);
+  });
+  it('falls back locally when the HEAD-link comparison is unreadable (fail closed)',async()=>{
+    const f=fixture(),original=f.exec;
+    f.argv=['npm','run','check:standards'];
+    f.exec=vi.fn(async call=>gitArgs(call)[0]==='diff-index'&&call.file==='git'?{code:1,stdout:Buffer.alloc(0)}:original(call));
+    expect(await runRemote(f)).toMatchObject({mode:'not-started',terminated:true,reason:'head-symlink-changed'});
+    expect(callsOf(f.exec).some(c=>c.file==='rsync'||isRun(c))).toBe(false);
+  });
   it('R807: a git-needing test routed remote on an unknown capability cache is refused safely at prepare by a runner without gitBundle',async()=>{
     const f=fixture(),original=f.exec,body=readFileSync(join(cwd,'a.test.mjs'));
     writeFileSync(join(cwd,'a.test.mjs'),"import { execFileSync } from 'node:child_process';\nexecFileSync('git', ['ls-files']);\n");
@@ -1997,8 +2074,8 @@ describe('explicit remote CLI decision', () => {
     try {
       const pending = remoteManifestAPI.main({argv,cwd,lockRoot:join(cwd,'heavy'), timeoutMs:10, remoteExec:() => new Promise(() => {}), local, log:vi.fn()});
       await vi.dynamicImportSettled();
-      // An unconfirmed remote still exits 124 after the default 30s cancellation wait.
-      await vi.advanceTimersByTimeAsync(30010);
+      // An unconfirmed remote still exits 124 after the default 180s cancellation wait.
+      await vi.advanceTimersByTimeAsync(180010);
       expect(await pending).toBe(124);
       expect(local).not.toHaveBeenCalled();
     } finally { vi.useRealTimers(); }
@@ -2094,7 +2171,7 @@ ${body.replaceAll('"/srv"', JSON.stringify(srv))}
 assert owners[os.stat(${JSON.stringify(join(srv, 'forge-exec'))}).st_ino] == (0, os.getgid())
 assert owners[os.stat(${JSON.stringify(join(srv, 'forge-exec/.cache'))}).st_ino] == (0, os.getgid())
 for k in (1, 2):
-    path = ${JSON.stringify(join(srv, 'forge-exec'))} + '/slot-' + str(k)
+    path = ${JSON.stringify(join(srv, 'forge-exec'))} + '/.disabled-slot-' + str(k)
     assert owners[os.stat(path).st_ino] == (0, 6000+k)
     assert os.stat(path).st_mode & 0o7777 == 0o710`;
   }
@@ -3398,7 +3475,7 @@ describe('R324 elastic request envelope',()=>{
   it('omits the extension for a one-unit legacy request',async()=>{
     const f=fixture();await runRemote(f);
     expect(JSON.parse(callsOf(f.exec).find(isPrepare).input)).not.toHaveProperty('slotUnits');
-    expect(JSON.parse(callsOf(f.exec).find(isPrepare).input).capabilities).toEqual({taskPressure:1});
+    expect(JSON.parse(callsOf(f.exec).find(isPrepare).input).capabilities).toEqual({taskPressure:1,throttle:1});
   });
   it.each([0,257,1.5,NaN])('rejects invalid units before transport: %s',async slotUnits=>{
     const f=fixture();
@@ -3466,5 +3543,34 @@ describe('safeFallbackDetail', () => {
     expect(remoteManifestAPI.safeFallbackDetail('command-not-allowed',['npm','run','x','--token=abc'])).toBe('npm');
     expect(remoteManifestAPI.safeFallbackDetail('command-not-allowed',['./evil-ghp_secret','x'])).toBe('other');
     expect(remoteManifestAPI.safeFallbackDetail('command-not-allowed','nope')).toBe('other');
+  });
+});
+
+describe('negotiated throttle resources',()=>{
+  const legacy={cpuUsec:10,memoryPeakBytes:20,oomKills:0,slotCpus:8};
+  it.each([undefined,'1',1])('accepts extended resources only after strict echo %s',async throttle=>{
+    const resources={...legacy,throttledUsec:5,nrThrottled:2};
+    const f=fixture({receipt:(_n,v)=>JSON.stringify({...v,resources,timings:{installMs:2,runMs:8}})});
+    const execute=f.exec;
+    f.exec=vi.fn(async call=>{
+      const reply=await execute(call);
+      return isPrepare(call) ? {...reply,stdout:JSON.stringify({...JSON.parse(reply.stdout),receiptCapabilities:{throttle}})} : reply;
+    });
+    const result=await runRemote({...f,slotUnits:3});
+    expect(JSON.parse(callsOf(f.exec).find(isPrepare).input).capabilities).toEqual({taskPressure:1,throttle:1});
+    expect(result).toMatchObject(throttle===1 ? {mode:'remote',resources,runMs:8,slotUnits:3} : {mode:'unconfirmed',reason:'ambiguous-result'});
+  });
+  it.each([legacy,{...legacy,throttledUsec:null,nrThrottled:null},
+    ...[-1,1.5,Number.MAX_SAFE_INTEGER+1,'2'].flatMap(value=>[
+      {...legacy,throttledUsec:value,nrThrottled:0},{...legacy,throttledUsec:0,nrThrottled:value}]),
+    {...legacy,throttledUsec:1},{...legacy,nrThrottled:1},{...legacy,throttledUsec:0,nrThrottled:0,extra:1}])
+  ('validates exact sets and safe nullable throttle counters %j',resources=>{
+    const expected={v:1,nonce:'n',run:'r',inputDigest:'i',argvDigest:'a',lock:'l',manifestDigest:'a'.repeat(64)};
+    const valid=resources.throttledUsec===null;
+    expect(remoteManifestAPI.verifyReceipt(JSON.stringify({...expected,phase:'test',code:0,resources}),expected,0,{throttle:1})).toBe(valid);
+  });
+  it('rejects missing resources under throttle',()=>{
+    const expected={v:1,nonce:'n',run:'r',inputDigest:'i',argvDigest:'a',lock:'l',manifestDigest:'a'.repeat(64)};
+    expect(remoteManifestAPI.verifyReceipt(JSON.stringify({...expected,phase:'test',code:0}),expected,0,{throttle:1})).toBeFalsy();
   });
 });

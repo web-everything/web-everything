@@ -10,8 +10,10 @@ import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import {
   CONTEXT_PACK_DEFAULTS, TRIM_SECTIONS, resolveContextPackSettings, settingsLogLine, extractFindings, extractFileRefs,
-  excerptLines, trimBriefSections, applyContextPack, briefWithContextPack, extractFailedTests, readFixPackInputs, localTestsSection,
+  excerptLines, trimBriefSections, applyContextPack, briefWithContextPack, extractFailedTests, readFixPackInputs, readCiPackInputs, renderCiPack, localTestsSection,
 } from '../fix-context-pack.mjs';
+import { boundedCiLogTail } from '../../lib/ci-log-evidence.mjs';
+import { FENCED_DATA_RULE } from '../../lib/mandate-fence.mjs';
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), '..', '..', '..');
 const FIX_BRIEF = readFileSync(join(ROOT, 'skills-src/conveyor/fix-agent-brief.md'), 'utf8');
@@ -35,6 +37,114 @@ const FILES = [
   { path: 'scripts/conveyor/verify-gate-job.mjs', additions: 396, deletions: 0 },
   { path: 'scripts/conveyor/__tests__/verify-gate-job.test.mjs', additions: 268, deletions: 0 },
 ];
+describe('CI context pack whole-job reads', () => {
+  const check = { name: 'test', bucket: 'fail', link: 'https://github.com/o/r/actions/runs/1/job/2' };
+  const logs = '2026-11-17T12:00:01Z passing step\n'
+    + '\x1b[31mFAIL\x1b[0m passing-step-fixture.test.mjs > expected output\n'
+    + '2026-11-17T12:00:11Z failed step\nFAIL actual.test.mjs > actual failure\n';
+  function reader(unreadable = false) {
+    return (_command, args) => {
+      if (args[0] === 'pr') return JSON.stringify(args[1] === 'checks' ? [check] : { files: FILES });
+      expect(args).toEqual(['api', '--allow-escape-sequences', 'repos/o/r/actions/jobs/2/logs']);
+      if (unreadable) throw new Error('unreadable log');
+      return logs;
+    };
+  }
+  it('retains whole-job context without promoting passing-step FAIL fixtures to failing tests', () => {
+    const result = readCiPackInputs({ repoSlug: 'o/r', pr: 7, exec: reader() });
+    expect(result.logTail).toBe(logs.replace(/\x1b\[\d+m/g, ''));
+    expect(result.filtered).toBe(false);
+    expect(result.failedTests).toEqual([]);
+    expect(result.files).toEqual(FILES);
+    const pack = renderCiPack({ ...result, maxBytes: 8000 });
+    expect(pack).toContain('### Failing tests\n\nunknown (unfiltered log)');
+    expect(pack).not.toContain('- FAIL');
+    expect(pack).toContain('Job log (unfiltered context, last lines)');
+    expect(pack).toContain('FAIL passing-step-fixture.test.mjs');
+    expect(pack).not.toContain('\x1b');
+    const brief = applyContextPack(CI_BRIEF, { kind: 'ci-heal', settings: ON, inputs: result });
+    expect(brief).toContain('### Failing tests\n\nunknown (unfiltered log)');
+    expect(brief).toContain('FAIL passing-step-fixture.test.mjs');
+    expect(brief).not.toContain('- FAIL');
+  });
+  it('strips coloured FAIL rows before extraction when explicitly tagged filtered:true', () => {
+    const result = readCiPackInputs({ repoSlug: 'o/r', pr: 7, exec: reader(),
+      readLog: () => ({ ok: true, filtered: true, text: '\x1b[31mFAIL\x1b[0m actual.test.mjs > actual failure' }) });
+    expect(result.failedTests).toEqual(['FAIL actual.test.mjs > actual failure']);
+    expect(result.filtered).toBe(true);
+    expect(renderCiPack({ ...result, maxBytes: 8000 })).toContain('- FAIL actual.test.mjs > actual failure');
+    expect(extractFailedTests('\x1b[31mFAIL\x1b[0m a.test.mjs > red')).toEqual(['FAIL a.test.mjs > red']);
+  });
+  it('fails closed on missing provenance, including precomputed failure rows at render time', () => {
+    const result = readCiPackInputs({ repoSlug: 'o/r', pr: 7, exec: reader(),
+      readLog: () => ({ ok: true, text: logs }) });
+    expect(result.failedTests).toEqual([]);
+    const pack = renderCiPack({ checks: [check], failedTests: ['FAIL fixture.test.mjs'] });
+    expect(pack).toContain('unknown (unfiltered log)');
+    expect(pack).not.toContain('fixture.test.mjs');
+  });
+  it.each(['lines', 'bytes'])('bounds oversized unfiltered context by %s and names the full-log fallback', bound => {
+    const text = bound === 'lines' ? Array.from({ length: 900 }, (_, i) => `row ${i}`).join('\n')
+      : 'early context\n' + '\x1b[31m' + 'é'.repeat(20_000) + '\x1b[0m';
+    const result = readCiPackInputs({ repoSlug: 'o/r', pr: 7, exec: reader(),
+      readLog: () => ({ ok: true, filtered: false, text }) });
+    expect(result.failedTests).toEqual([]);
+    expect(result.logTail.split('\n').length).toBeLessThanOrEqual(400);
+    expect(Buffer.byteLength(result.logTail)).toBeLessThanOrEqual(16_000);
+    expect(result.logTail).toContain('inspect the full job log');
+    expect(result.logTail).not.toContain('\x1b');
+    expect(result.logTail).not.toContain('\uFFFD');
+    const pack = renderCiPack({ ...result, maxBytes: 2500 });
+    expect(pack).toContain('unknown (unfiltered log)');
+    expect(pack).toContain('inspect the full job log');
+    expect(Buffer.byteLength(pack)).toBeLessThanOrEqual(2500);
+    expect(boundedCiLogTail(text)).toBe(result.logTail);
+  });
+  it('does not stage evidence when the log read fails', () => {
+    expect(readCiPackInputs({ repoSlug: 'o/r', pr: 7, exec: reader(true) }))
+      .toEqual({ checks: [{ name: check.name, link: check.link }], failedTests: [], logTail: '', filtered: false, files: FILES });
+  });
+  it('reserves the final failure before early diagnostics at 100 and 1000 bytes (live PR #7028)', () => {
+    const text = 'Error: ' + 'x'.repeat(300) + '\n' + 'cleanup\n'.repeat(450) + 'Error: deployment denied';
+    for (const maxBytes of [100, 1000]) {
+      const tail = boundedCiLogTail(text, { maxBytes });
+      expect(Buffer.byteLength(tail)).toBeLessThanOrEqual(maxBytes);
+      expect(tail).toContain('deployment denied');
+    }
+    for (const filtered of [false, true]) {
+      const pack = renderCiPack({ checks: [check], logTail: boundedCiLogTail(text), filtered, maxBytes: 1000 });
+      expect(Buffer.byteLength(pack)).toBeLessThanOrEqual(1000);
+      expect(pack).toContain('deployment denied');
+      expect(pack).toContain(FENCED_DATA_RULE);
+      expect(pack).toContain('<material>\n');
+      expect(pack).toContain('\n</material>');
+      if (!filtered) expect(pack).toContain('### Failing tests\n\nunknown (unfiltered log)');
+    }
+  });
+  it('honours every byte budget from 20 through 2000 and retains a final diagnostic when it fits', () => {
+    const notice = '… [log tail truncated; inspect the full job log for earlier context]\n';
+    for (const finalLine of ['Error: deployment denied', 'Error: deployment denied\n', 'Error: ' + 'é😀'.repeat(50) + ' deployment denied']) {
+      const text = 'Error: ' + 'x'.repeat(300) + '\n' + 'cleanup\n'.repeat(450) + finalLine;
+      for (let maxBytes = 20; maxBytes <= 2000; maxBytes++) {
+        const tail = boundedCiLogTail(text, { maxBytes });
+        expect(Buffer.byteLength(tail), `budget ${maxBytes}`).toBeLessThanOrEqual(maxBytes);
+        expect(tail).not.toContain('\uFFFD');
+        if (maxBytes >= Buffer.byteLength(notice + 'deployment denied\n')) expect(tail).toContain('deployment denied');
+        if (maxBytes >= Buffer.byteLength(notice + finalLine)) expect(tail).toContain(finalLine);
+      }
+    }
+  });
+  it('returns only a UTF-8-safe notice prefix when the notice exhausts the budget', () => {
+    const notice = '… [log tail truncated; inspect the full job log for earlier context]\n';
+    const text = 'Error: ' + 'x'.repeat(300) + '\nError: deployment denied';
+    for (let maxBytes = 0; maxBytes <= Buffer.byteLength(notice); maxBytes++) {
+      const tail = boundedCiLogTail(text, { maxBytes });
+      expect(Buffer.byteLength(tail)).toBeLessThanOrEqual(maxBytes);
+      expect(notice.startsWith(tail)).toBe(true);
+      expect(tail).not.toContain('\uFFFD');
+    }
+  });
+});
 const sampleInputs = () => {
   const { findings, advisory } = extractFindings(COMMENTS);
   return {
@@ -66,6 +176,13 @@ describe('settings (standard → tool file → env, source logged)', () => {
 });
 
 describe('finding + reference extraction', () => {
+  it('strips ANSI before finding, reference, excerpt and brief-heading line matching', () => {
+    const body = '\x1b[31m🔁 review — changes requested\x1b[0m\n\x1b[31mscripts/a.mjs\x1b[0m:12';
+    expect(extractFindings([{ body }]).findings).toEqual([{ kind: 'changes', body, createdAt: null }]);
+    expect(extractFileRefs(body)).toEqual([{ path: 'scripts/a.mjs', line: 12, end: 12 }]);
+    expect(excerptLines('\x1b[31mcode\x1b[0m', 1, 0)).toBe('1> code');
+    expect(trimBriefSections('\x1b[31m## Drop\x1b[0m\nx\n## Keep\ny', ['## Drop']).text).toBe('## Keep\ny');
+  });
   it('takes the LATEST changes-requested comment verbatim and the path:line refs it names', () => {
     const { findings } = extractFindings(COMMENTS);
     expect(findings).toEqual([{ kind: 'changes', body: FINDING, createdAt: '2026-10-10T13:55:36Z' }]);
@@ -162,7 +279,7 @@ describe('the brief with a context pack', () => {
       'test\tRun tests\t2026-10-10T12:00:01.0Z  FAIL  scripts/conveyor/__tests__/pr-stack.test.mjs > restack > keeps the base',
       'test\tRun tests\t2026-10-10T12:00:02.0Z AssertionError: expected 1 to be 2',
     ].map((l) => l.replace(/^[^\t]*\t[^\t]*\t\d{4}-\d\d-\d\dT[\d:.]+Z\s?/, '')).join('\n');
-    const inputs = { checks: [{ name: 'test', link: 'https://github.com/o/r/actions/runs/1/job/2' }], failedTests: extractFailedTests(log), logTail: log, files: FILES };
+    const inputs = { checks: [{ name: 'test', link: 'https://github.com/o/r/actions/runs/1/job/2' }], filtered: true, failedTests: extractFailedTests(log), logTail: log, files: FILES };
     expect(inputs.failedTests).toEqual(['FAIL  scripts/conveyor/__tests__/pr-stack.test.mjs > restack > keeps the base']);
     const out = applyContextPack(CI_BRIEF, { kind: 'ci-heal', settings: ON, inputs });
     const pack = out.slice(0, out.indexOf('\n---\n'));

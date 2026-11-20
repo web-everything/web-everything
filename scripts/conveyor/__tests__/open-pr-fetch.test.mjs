@@ -9,7 +9,8 @@ import {
   fetchOpenPrsRest, restPullToBuildDispatchShape, BUILD_DISPATCH_PR_FIELDS,
 } from '../open-pr-fetch.mjs';
 import { runGhSync } from '../../lib/gh-throttle.mjs';
-import { resolveCheckAppsByCommit } from '../../lib/pr-list-paged.mjs';
+import { resolveCheckAppsByCommit, mapGraphqlPr } from '../../lib/pr-list-paged.mjs';
+import { resolveRequiredChecks } from '../../lib/check-state-predicate.mjs';
 import { normalizeOpenPrs } from '../build-dispatch-policy.mjs';
 import { defaultListOpenPrs } from '../duplicate-pr-watch.mjs';
 import { defaultListParkedPrs as listConflicts } from '../parked-pr-conflict-watch.mjs';
@@ -58,7 +59,7 @@ describe('shared open-PR discovery', () => {
   it.each([null, 'owner/repo'])('uses runGhSync by default with the full query (repo %s)', (repo) => {
     const prs = [{ number: 123, comments: [{ body: 'retained' }], files: [{ path: 'a.mjs' }] }];
     runGhSync.mockReset().mockReturnValue(JSON.stringify(prs));
-    expect(defaultFetchOpenPrs({ repo })).toEqual(prs);
+    expect(defaultFetchOpenPrs({ repo })).toEqual(prs.map(pr => ({ ...pr, rowsComplete: false, rowsHead: null })));
     expect(runGhSync).toHaveBeenCalledTimes(1);
     expect(runGhSync).toHaveBeenCalledWith(
       ['pr', 'list', '--state', 'open', '--limit', '200', '--json', OPEN_PR_LIST_FIELDS, ...(repo ? ['--repo', repo] : [])],
@@ -277,3 +278,47 @@ describe('snapshot reader', () => {
     expect(readPrsFromFile('unused', { readFile: () => { throw new Error('ENOENT'); } })).toEqual([]);
   });
 });
+
+
+describe('rollup connection completeness at the fetch boundary', () => {
+  const head = 'a'.repeat(40);
+  const nodes = [{ __typename: 'CheckRun', name: 'gate', status: 'COMPLETED', conclusion: 'SUCCESS' }];
+  it.each([
+    ['complete', { pageInfo: { hasNextPage: false }, totalCount: 1, nodes }, true],
+    ['paged failure', { pageInfo: { hasNextPage: true }, totalCount: 2,
+      nodes: [{ __typename: 'CheckRun', name: 'gate', status: 'COMPLETED', conclusion: 'FAILURE' }] }, false],
+    ['paged', { pageInfo: { hasNextPage: true }, totalCount: 1, nodes }, false],
+    ['count mismatch', { pageInfo: { hasNextPage: false }, totalCount: 2, nodes }, false],
+    ['missing pageInfo', { totalCount: 1, nodes }, false],
+    ['invalid count', { pageInfo: { hasNextPage: false }, totalCount: '1', nodes }, false],
+    ['missing nodes', { pageInfo: { hasNextPage: false }, totalCount: 0 }, false],
+    ['malformed row', { pageInfo: { hasNextPage: false }, totalCount: 1, nodes: [{}] }, false],
+    ['empty complete', { pageInfo: { hasNextPage: false }, totalCount: 0, nodes: [] }, true],
+  ])('%s metadata determines GraphQL evidence without changing mapped rows', (_name, contexts, complete) => {
+    const commit = { oid: head, statusCheckRollup: { contexts } };
+    const mapped = mapGraphqlPr({ headRefOid: head, commits: { nodes: [{ commit }] } });
+    expect(mapped).toMatchObject({ rowsHead: head, rowsComplete: complete });
+    // Connection metadata must not change which rows main's mapper returns.
+    const withoutMetadata = mapGraphqlPr({ commits: { nodes: [{ commit: {
+      statusCheckRollup: { contexts: { nodes: contexts.nodes } },
+    } }] } });
+    expect(mapped.statusCheckRollup).toEqual(withoutMetadata.statusCheckRollup);
+    if (_name === 'paged failure') expect(mapped.statusCheckRollup[0].conclusion).toBe('FAILURE');
+  });
+});
+
+it.each(['SUCCESS', 'FAILURE', 'PENDING', 'empty'])(
+  'legacy %s rows remain unchanged with unknown evidence and no rollup refresh', state => {
+    const head = 'a'.repeat(40);
+    const listed = state === 'empty' ? [] : [
+      { __typename: 'CheckRun', name: 'gate', status: 'COMPLETED', conclusion: state },
+      { __typename: 'StatusContext', context: 'legacy', state },
+    ];
+    const exec = vi.fn(() => JSON.stringify([{ number: 1, headRefOid: head, statusCheckRollup: listed }]));
+    const pr = defaultFetchOpenPrs({ repo: 'o/r', exec, readComments: () => [] })[0];
+    expect(exec).toHaveBeenCalledTimes(1);
+    expect(exec.mock.calls[0][0].slice(0, 2)).toEqual(['pr', 'list']);
+    expect(pr).toMatchObject({ rowsHead: null, rowsComplete: false, statusCheckRollup: listed });
+    expect(resolveRequiredChecks({ head, rowsHead: pr.rowsHead, rowsComplete: pr.rowsComplete,
+      rows: pr.statusCheckRollup, requiredNames: ['gate'], rosterSource: 'live' }).state).toBe('unknown');
+  });

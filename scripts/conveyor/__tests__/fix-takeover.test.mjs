@@ -1,4 +1,10 @@
 // Card xx0055i — automatic takeover at the fix round cap.
+const operatorFixture = vi.hoisted(() => ({ file: undefined }));
+vi.mock('../../lib/operator-override-reader.mjs', async importOriginal => {
+  const actual = await importOriginal();
+  return { ...actual, readOperatorOverrides: options => operatorFixture.file
+    ? actual.readOperatorOverrides({ ...options, file: operatorFixture.file }) : { readable: true, values: {} } };
+});
 import { describe, it, expect, vi } from 'vitest';
 import {
   resolveFixSettings, takeoverRung, takeoverMarkers, takeoverMarkerBody, takeoverVoidMarkerBody, withTakeover,
@@ -13,7 +19,9 @@ const planReconcile = options => planReconcileWithTiming({ reviewTiming: { start
 import { REARM_COMMENT_MARKER } from '../rearm-review.mjs';
 import { briefWithRoundContext, fixerTableFor, dispatchFix } from '../reconcile-fix-dispatch.mjs';
 import { readDeclaredSettings } from '../../lib/settings-files.mjs';
-import { readFileSync } from 'node:fs';
+import { readFileSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 
 const BOT = { login: 'web-everything' };
 const HEAD = 'a'.repeat(40);
@@ -580,5 +588,104 @@ describe('dispatchFix takeover ordering and failure (card xx0055i review round 1
     expect(() => dispatchFix({ ...planned, mode: undefined, takeover: undefined }, opts)).toThrow('boom');
     expect(opts.postTakeover).not.toHaveBeenCalled();
     expect(opts.postTakeoverVoidMark).not.toHaveBeenCalled();
+  });
+});
+
+
+describe('conflict-fix pass exemption setting', () => {
+  const resolve = options => resolveFixSettings({ env: {}, platform: {}, read: () => '{}', ...options });
+  it('defaults to three and resolves platform, tool and environment provenance', () => {
+    expect(resolve()).toMatchObject({ conflictFixExemptPerPass: 3, sources: { conflictFixExemptPerPass: 'standard' } });
+    expect(resolve({ platform: { conflictFixExemptPerPass: 2 } })).toMatchObject({ conflictFixExemptPerPass: 2, sources: { conflictFixExemptPerPass: 'platform' } });
+    expect(resolve({ platform: { conflictFixExemptPerPass: 2 }, read: () => '{"fix":{"conflictFixExemptPerPass":1}}' }))
+      .toMatchObject({ conflictFixExemptPerPass: 1, sources: { conflictFixExemptPerPass: 'tool' } });
+    expect(resolve({ env: { WE_CONFLICT_FIX_EXEMPT_PER_PASS: '0' }, read: () => '{"fix":{"conflictFixExemptPerPass":1}}' }))
+      .toMatchObject({ conflictFixExemptPerPass: 0, sources: { conflictFixExemptPerPass: 'env' } });
+  });
+  it.each([-1, 1.5, null, false, [], {}, '', 'bad', '9007199254740992'])('fails closed on invalid bound %j at every layer', bad => {
+    expect(resolve({ platform: { conflictFixExemptPerPass: bad } }).conflictFixExemptPerPass).toBe(0);
+    expect(resolve({ read: () => JSON.stringify({ fix: { conflictFixExemptPerPass: bad } }) }).conflictFixExemptPerPass).toBe(0);
+    expect(resolve({ env: { WE_CONFLICT_FIX_EXEMPT_PER_PASS: bad } }).conflictFixExemptPerPass).toBe(0);
+  });
+  it.each(['not JSON', '{"fix":false}'])('disables exemption for unreadable settings %s', raw => {
+    expect(resolve({ read: () => raw }).conflictFixExemptPerPass).toBe(0);
+  });
+  it('disables exemption on a failed settings read', () => {
+    expect(resolve({ read: () => { throw new Error('EACCES'); } }).conflictFixExemptPerPass).toBe(0);
+  });
+});
+
+
+describe('conflictFixExemptPerPass operational maximum', () => {
+  it.each(['11', '1000'])('treats %s as invalid (disabled)', async value => {
+    const mod = await import('../fix-takeover.mjs');
+    const resolve = mod.resolveFixSettings ?? mod.resolveFixTakeoverSettings;
+    expect(resolve({ env: { WE_CONFLICT_FIX_EXEMPT_PER_PASS: value } }).conflictFixExemptPerPass).toBe(0);
+  });
+});
+
+
+describe('conflictFixesPerPass setting and live operator capacity', () => {
+  const resolve = options => resolveFixSettings({ env: {}, platform: {}, read: () => '{}', ...options });
+  it('defaults to sixteen with standard provenance', () => {
+    expect(FIX_SETTINGS_DEFAULTS.conflictFixesPerPass).toBe(16);
+    expect(resolve()).toMatchObject({ conflictFixesPerPass: 16, sources: { conflictFixesPerPass: 'standard' } });
+  });
+  it('inherits sixteen when the settings file is missing', () => {
+    expect(resolve({ read: () => { throw Object.assign(Error('missing'), { code: 'ENOENT' }); } }))
+      .toMatchObject({ conflictFixesPerPass: 16, sources: { conflictFixesPerPass: 'standard' } });
+  });
+  it('resolves platform, tool and environment in order with provenance', () => {
+    const platform = { conflictFixesPerPass: 5 };
+    const read = () => '{"fix":{"conflictFixesPerPass":6}}';
+    expect(resolve({ platform })).toMatchObject({ conflictFixesPerPass: 5, sources: { conflictFixesPerPass: 'platform' } });
+    expect(resolve({ platform, read })).toMatchObject({ conflictFixesPerPass: 6, sources: { conflictFixesPerPass: 'tool' } });
+    expect(resolve({ platform, read, env: { WE_CONFLICT_FIXES_PER_PASS: '24' } }))
+      .toMatchObject({ conflictFixesPerPass: 24, sources: { conflictFixesPerPass: 'env' } });
+    expect(resolve({ env: { WE_CONFLICT_FIXES_PER_PASS: '0' } }).conflictFixesPerPass).toBe(0);
+  });
+  it.each([-1, 25, 1.5, null, false, [], {}, '', 'bad', '9007199254740992'])('disables allowance for invalid bound %j at each layer', bad => {
+    expect(resolve({ platform: { conflictFixesPerPass: bad } }))
+      .toMatchObject({ conflictFixesPerPass: 0, sources: { conflictFixesPerPass: 'platform' } });
+    expect(resolve({ platform: { conflictFixesPerPass: 5 }, read: () => JSON.stringify({ fix: { conflictFixesPerPass: bad } }) }))
+      .toMatchObject({ conflictFixesPerPass: 0, sources: { conflictFixesPerPass: 'tool' } });
+    expect(resolve({ platform: { conflictFixesPerPass: 5 }, env: { WE_CONFLICT_FIXES_PER_PASS: bad } }))
+      .toMatchObject({ conflictFixesPerPass: 0, sources: { conflictFixesPerPass: 'env' } });
+  });
+  it.each(['not JSON', '{"fix":false}'])('disables allowance for unreadable settings %s', raw => {
+    expect(resolve({ read: () => raw }).conflictFixesPerPass).toBe(0);
+  });
+  it('disables allowance on a failed settings read and retries next pass', () => {
+    const read = vi.fn().mockImplementationOnce(() => { throw Error('EACCES'); })
+      .mockReturnValue('{"fix":{"conflictFixesPerPass":6}}');
+    expect(resolve({ read }).conflictFixesPerPass).toBe(0);
+    expect(resolve({ read }).conflictFixesPerPass).toBe(6);
+  });
+  it('rereads both operator leaves instantly above env and fails closed on unreadable or oversized evidence', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'fix-pass-operator-'));
+    operatorFixture.file = join(dir, 'operator.json');
+    try {
+      const env = { WE_CONFLICT_FIXES_PER_PASS: '6', WE_CONFLICT_FIX_EXEMPT_PER_PASS: '3' };
+      const read = () => '{"fix":{"conflictFixesPerPass":5,"conflictFixExemptPerPass":2}}';
+      const write = (cap, exempt) => writeFileSync(operatorFixture.file, JSON.stringify({
+        'fix.conflictFixesPerPass': cap, 'fix.conflictFixExemptPerPass': exempt,
+      }));
+      write(24, 10);
+      expect(resolve({ env, read })).toMatchObject({ conflictFixesPerPass: 24, conflictFixExemptPerPass: 10,
+        sources: { conflictFixesPerPass: 'operator-db', conflictFixExemptPerPass: 'operator-db' } });
+      write(0, 0);
+      expect(resolve({ env, read })).toMatchObject({ conflictFixesPerPass: 0, conflictFixExemptPerPass: 0 });
+      writeFileSync(operatorFixture.file, '{');
+      expect(resolve({ env, read })).toMatchObject({ conflictFixesPerPass: 1, conflictFixExemptPerPass: 1 });
+      expect(resolve({ env: { WE_CONFLICT_FIXES_PER_PASS: '0', WE_CONFLICT_FIX_EXEMPT_PER_PASS: '0' } }))
+        .toMatchObject({ conflictFixesPerPass: 0, conflictFixExemptPerPass: 0 });
+      write(25, 3);
+      expect(resolve({ env, read })).toMatchObject({ conflictFixesPerPass: 1, conflictFixExemptPerPass: 1 });
+      write(24, 11);
+      expect(resolve({ env, read })).toMatchObject({ conflictFixesPerPass: 1, conflictFixExemptPerPass: 1 });
+    } finally {
+      operatorFixture.file = undefined;
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 });

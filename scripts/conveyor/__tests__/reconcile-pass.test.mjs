@@ -1,6 +1,7 @@
 import { vi, it, expect, describe } from 'vitest';
 
 
+
 vi.mock('node:child_process', async (importOriginal) => ({
   ...await importOriginal(), execFileSync: vi.fn(),
 }));
@@ -567,6 +568,178 @@ it.each([
 // `baseRefSha` — the SAME purely-local `git rev-parse origin/<ref>` read `defaultResolveMainSha` already does
 // for `mainSha`, just pointed at each stacked PR's own base ref — so `reconcile-core.mjs` can tell a stale
 // repeat apart from a fresh tip.
+describe('enrichPrsWithConflictDisposition', () => {
+  const head = 'a'.repeat(40), base = 'b'.repeat(40);
+  const evidence = (disposition, headSha = head) => ({ fetchSucceeded: true, headSha, baseSha: base, exitCode: disposition === 'clean' ? 0 : 1, unrecognizedConflictLines: 0,
+    clean: disposition === 'clean', conflictPaths: disposition === 'manifest-only' ? ['.lane-manifest.json'] : ['src/app.js'] });
+  const dirty = (over = {}) => ({ number: 1, headRefOid: head, headRefName: 'lane/x', state: 'OPEN', baseRefName: 'main', mergeStateStatus: 'DIRTY', ...over });
+
+  it.each(['clean', 'manifest-only', 'real'])('classifies %s evidence for a DIRTY main-base PR', async disposition => {
+    const { enrichPrsWithConflictDisposition } = await import('../reconcile-pass.mjs');
+    const pr = dirty(), compute = vi.fn(() => evidence(disposition));
+    expect(enrichPrsWithConflictDisposition([pr], { mainSha: base, compute })).toEqual([{ ...pr, conflictDisposition: disposition === 'real' ? null : disposition }]);
+    expect(compute).toHaveBeenCalledWith({ pr, includeRefEvidence: true });
+    expect(pr).not.toHaveProperty('conflictDisposition');
+  });
+
+  it.each([{ mergeable: 'CONFLICTING' }, { labels: ['merge-status:conflicting'] }, { labels: [{ name: 'merge-status:conflicting' }] }])(
+    'classifies the other conflict signals %j on the configured default branch', async signal => {
+      const { enrichPrsWithConflictDisposition } = await import('../reconcile-pass.mjs');
+      const pr = dirty({ baseRefName: 'trunk', mergeStateStatus: 'CLEAN', ...signal });
+      expect(enrichPrsWithConflictDisposition([pr], { mainSha: base, defaultBranch: 'trunk', compute: () => evidence('clean') })[0].conflictDisposition).toBe('clean');
+    });
+
+  it.each([{ exitCode: 2 }, { unrecognizedConflictLines: 1 }])('refuses manifest-only on incomplete conflict evidence %j', async over => {
+    const { enrichPrsWithConflictDisposition } = await import('../reconcile-pass.mjs');
+    const out = enrichPrsWithConflictDisposition([dirty()], { mainSha: base, compute: () => ({ ...evidence('manifest-only'), ...over }) });
+    expect(out[0].conflictDisposition).toBeNull();
+  });
+
+  it('never trusts a supplied conflictDisposition on unprobed rows', async () => {
+    const { enrichPrsWithConflictDisposition } = await import('../reconcile-pass.mjs');
+    const supplied = dirty({ conflictDisposition: 'clean' }), stacked = dirty({ baseRefName: 'lane/base', conflictDisposition: 'clean' });
+    const out = enrichPrsWithConflictDisposition([supplied, stacked], { mainSha: base, compute: vi.fn(), max: 0 });
+    expect(out.map(row => row.conflictDisposition)).toEqual([null, null]);
+  });
+
+  it('leaves stacked-base, non-conflicting and closed PR rows unchanged', async () => {
+    const { enrichPrsWithConflictDisposition } = await import('../reconcile-pass.mjs');
+    const prs = [dirty({ baseRefName: 'lane/base' }), dirty({ mergeStateStatus: 'CLEAN' }), dirty({ state: 'CLOSED' }), dirty({ state: 'MERGED' })];
+    const compute = vi.fn();
+    const out = enrichPrsWithConflictDisposition(prs, { mainSha: base, compute });
+    prs.forEach((pr, i) => expect(out[i]).toBe(pr));
+    expect(compute).not.toHaveBeenCalled();
+  });
+
+  it.each([2, undefined])('bounds probes at max=%j; overflow rows keep the ordinary budget', async max => {
+    const { enrichPrsWithConflictDisposition } = await import('../reconcile-pass.mjs');
+    const prs = Array.from({ length: 21 }, (_, number) => dirty({ number }));
+    const compute = vi.fn(() => evidence('manifest-only'));
+    const out = enrichPrsWithConflictDisposition(prs, { mainSha: base, compute, max });
+    const bound = max ?? 20;
+    expect(compute).toHaveBeenCalledTimes(bound);
+    expect(out.slice(0, bound).every(pr => pr.conflictDisposition === 'manifest-only')).toBe(true);
+    out.slice(bound).forEach((pr, i) => expect(pr).toBe(prs[bound + i]));
+  });
+
+  it.each([() => { throw new Error('unreadable'); }, () => null, () => 'unsupported'])(
+    'fails closed to null on compute failure or unknown evidence (%#)', async compute => {
+      const { enrichPrsWithConflictDisposition } = await import('../reconcile-pass.mjs');
+      expect(enrichPrsWithConflictDisposition([dirty({ conflictDisposition: 'clean' })], { mainSha: base, compute })[0].conflictDisposition).toBeNull();
+    });
+
+  it('makes no compute calls with max zero', async () => {
+    const { enrichPrsWithConflictDisposition } = await import('../reconcile-pass.mjs');
+    const compute = vi.fn(), pr = dirty();
+    expect(enrichPrsWithConflictDisposition([pr], { mainSha: base, compute, max: 0 })[0]).toBe(pr);
+    expect(compute).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ['clean exit', 0, [], 'clean'],
+    ['manifest conflict', 1, ['.lane-manifest.json'], 'manifest-only'],
+    ['all transient conflicts', 1, ['.lane-manifest.json', '.fix-123-evidence.md'], 'manifest-only'],
+    ['real conflict', 1, ['.lane-manifest.json', 'src/app.js'], null],
+    ['non-zero with no conflict paths', 1, [], null],
+  ])('classifies parsed evidence: %s', async (_name, status, paths, expected) => {
+    const { enrichPrsWithConflictDisposition } = await import('../reconcile-pass.mjs');
+    const { gitMergeTreeParsed } = await import('../parked-pr-conflict-watch.mjs');
+    const exec = vi.fn((_cmd, args) => {
+      if (args[0] === 'rev-parse') return args[2].includes('lane/x') ? head : base;
+      if (args[0] !== 'merge-tree') return '';
+      const stdout = ['tree', ...paths.map(p => `100644 aaa 2\t${p}`), '', 'diagnostic'].join('\n');
+      if (status) throw Object.assign(new Error('conflict'), { status, stdout });
+      return stdout;
+    });
+    const [out] = enrichPrsWithConflictDisposition([dirty()], { mainSha: base,
+      compute: opts => gitMergeTreeParsed({ ...opts, exec }) });
+    expect(out.conflictDisposition).toBe(expected);
+    expect(exec).toHaveBeenCalledWith('git', ['merge-tree', '--write-tree', base, head], expect.anything());
+  });
+
+  it.each(['fetch failed', 'head changed', 'base changed', 'unreadable ref', 'invalid ref'])(
+    'refuses clean evidence when %s', async failure => {
+      const { enrichPrsWithConflictDisposition } = await import('../reconcile-pass.mjs');
+      const { gitMergeTreeParsed } = await import('../parked-pr-conflict-watch.mjs');
+      const exec = vi.fn((_cmd, args) => {
+        if (args[0] === 'fetch' && failure === 'fetch failed') throw new Error('offline');
+        if (args[0] === 'rev-parse') {
+          if (failure === 'unreadable ref') throw new Error('missing');
+          if (failure === 'invalid ref') return 'not-a-sha';
+          return args[2].includes('lane/x') ? (failure === 'head changed' ? 'c'.repeat(40) : head)
+            : (failure === 'base changed' ? 'c'.repeat(40) : base);
+        }
+        return 'tree\n'; // Even a clean stale local ref cannot earn an exemption.
+      });
+      expect(enrichPrsWithConflictDisposition([dirty({ conflictDisposition: 'clean' })], { mainSha: base,
+        compute: opts => gitMergeTreeParsed({ ...opts, exec }) })[0].conflictDisposition).toBeNull();
+    });
+
+  it.each([null, undefined, '', 'invalid'])('refuses missing or unreadable planner head %j without probing', async headRefOid => {
+    const { enrichPrsWithConflictDisposition } = await import('../reconcile-pass.mjs');
+    const compute = vi.fn(() => evidence('clean'));
+    expect(enrichPrsWithConflictDisposition([dirty({ headRefOid, conflictDisposition: 'clean' })], { mainSha: base,
+      compute })[0].conflictDisposition).toBeNull();
+    expect(compute).not.toHaveBeenCalled();
+  });
+
+  it.each([null, '', 'invalid'])('refuses missing or unreadable main tip %j without probing', async mainSha => {
+    const { enrichPrsWithConflictDisposition } = await import('../reconcile-pass.mjs');
+    const compute = vi.fn(() => evidence('clean'));
+    expect(enrichPrsWithConflictDisposition([dirty({ conflictDisposition: 'clean' })], { mainSha,
+      compute })[0].conflictDisposition).toBeNull();
+    expect(compute).not.toHaveBeenCalled();
+  });
+
+  it('reserves probe capacity for pinned rows after an unpinned head', async () => {
+    const { enrichPrsWithConflictDisposition } = await import('../reconcile-pass.mjs');
+    const compute = vi.fn(() => evidence('clean'));
+    const pinned = dirty({ number: 2 });
+    const rows = enrichPrsWithConflictDisposition([dirty({ headRefOid: null }), pinned],
+      { mainSha: base, compute, max: 1 });
+    expect(rows.map(pr => pr.conflictDisposition)).toEqual([null, 'clean']);
+    expect(compute).toHaveBeenCalledTimes(1);
+    expect(compute).toHaveBeenCalledWith({ pr: pinned, includeRefEvidence: true });
+  });
+
+  it.each([false, undefined])('refuses unconfirmed fetch status %j', async fetchSucceeded => {
+    const { enrichPrsWithConflictDisposition } = await import('../reconcile-pass.mjs');
+    expect(enrichPrsWithConflictDisposition([dirty()], { mainSha: base,
+      compute: () => ({ ...evidence('clean'), fetchSucceeded }) })[0].conflictDisposition).toBeNull();
+  });
+
+  it('holds one main tip across all probes even when the base moves during the pass', async () => {
+    const { enrichPrsWithConflictDisposition, runReconcilePass } = await import('../reconcile-pass.mjs');
+    const resolveMainSha = vi.fn(() => base);
+    const compute = vi.fn().mockReturnValueOnce(evidence('clean'))
+      .mockReturnValueOnce({ ...evidence('clean'), baseSha: 'c'.repeat(40) });
+    let rows;
+    runReconcilePass({ ...xxOptions(), resolveMainSha, readPrs: () => [dirty(), dirty({ number: 2 })],
+      enrichAlreadyLanded: p => p, enrichBaseRef: p => p,
+      loadFixSettings: () => ({ conflictFixExemptPerPass: 3 }),
+      enrichConflictDisposition: (prs, opts) => (rows = enrichPrsWithConflictDisposition(prs, { ...opts, compute })) });
+    expect(resolveMainSha).toHaveBeenCalledTimes(1);
+    expect(rows.map(pr => pr.conflictDisposition)).toEqual(['clean', null]);
+  });
+
+  it.each([0, 3])('threads evidence into the dispatch row and skips compute when the exemption cap is %s', async cap => {
+    const { runReconcilePass, enrichPrsWithConflictDisposition } = await import('../reconcile-pass.mjs');
+    const { readFileSync } = await import('node:fs');
+    const pr = { ...JSON.parse(readFileSync('scripts/conveyor/__tests__/fixtures/pr-3771-conflicting-no-ci.json', 'utf8')), baseRefName: 'main' };
+    const compute = vi.fn(() => evidence('manifest-only', pr.headRefOid));
+    const enrichConflictDisposition = vi.fn((prs, opts) => enrichPrsWithConflictDisposition(prs, { ...opts, compute }));
+    const lines = [];
+    const plan = runReconcilePass({ ...xxOptions(), resolveMainSha: () => base, readPrs: () => [pr],
+      enrichFixClaims: p => p, enrichTimeouts: p => p, enrichReferralHolds: p => p,
+      loadFixSettings: () => ({ conflictFixExemptPerPass: cap }), enrichConflictDisposition,
+      stepLog: line => lines.push(line) });
+    expect(plan.dispatch).toContainEqual(expect.objectContaining({ kind: 'fix', isConflict: true, conflictFixMechanical: cap > 0 }));
+    expect(compute).toHaveBeenCalledTimes(cap > 0 ? 1 : 0);
+    expect(enrichConflictDisposition).toHaveBeenCalledTimes(cap > 0 ? 1 : 0);
+    expect(lines.some(line => line.includes('name=enrich-conflict-disposition '))).toBe(cap > 0);
+  });
+});
+
 describe('enrichPrsWithBaseRefFacts (#4265)', () => {
   it('attaches baseRefSha for a PR whose base differs from defaultBranch, resolved via the injected reader', async () => {
     const { enrichPrsWithBaseRefFacts } = await import('../reconcile-pass.mjs');
@@ -625,7 +798,7 @@ it('runReconcilePass threads enrichBaseRef\'s output through to planReconcile (#
     enrichMainRed: (prs) => ({ prs, mainRedWindows: [] }), enrichAlreadyLanded: (prs) => prs,
     enrichBaseRef,
   });
-  expect(enrichBaseRef).toHaveBeenCalledWith([stackedPr], { defaultBranch: 'main' });
+  expect(enrichBaseRef).toHaveBeenCalledWith([expect.objectContaining(stackedPr)], { defaultBranch: 'main' });
 });
 
 // #4263 (PR #2787 review, live incident 2026-09-27) — a `waiting-on-system-fix` ci-heal escalation refuses
@@ -703,7 +876,7 @@ it('runReconcilePass threads enrichSystemFix\'s output through to planReconcile 
     enrichMainRed: (prs) => ({ prs, mainRedWindows: [] }), enrichAlreadyLanded: (prs) => prs,
     enrichBaseRef: (prs) => prs, enrichSystemFix,
   });
-  expect(enrichSystemFix).toHaveBeenCalledWith([escalatedPr], { repo: null });
+  expect(enrichSystemFix).toHaveBeenCalledWith([expect.objectContaining(escalatedPr)], { repo: null });
 });
 
 it('defaultFetchRef fetches refs/pull/<n>/head behind --end-of-options into an explicit destination — never the branch name (PR #2769 security review)', async () => {
@@ -1060,9 +1233,10 @@ it('xng7q1p immutable GitHub reads feed enrichment → planner without checkout-
   Object.values(sources).forEach((source, i) => { data[`${prefix}/git/blobs/blob${i}`] = {encoding:'base64',content:Buffer.from(source).toString('base64')}; });
   const calls = [];
   const exec = (cmd, args) => {
-    expect(cmd).toBe('gh'); expect(args[0]).toBe('api'); calls.push(args[1]);
-    if (!(args[1] in data)) throw new Error(`unaccounted read ${args[1]}`);
-    return typeof data[args[1]] === 'string' ? data[args[1]] : JSON.stringify(data[args[1]]);
+    expect(cmd).toBe('gh'); expect(args[0]).toBe('api');
+    const path = args.at(-1); calls.push(path);
+    if (!(path in data)) throw new Error(`unaccounted read ${path}`);
+    return typeof data[path] === 'string' ? data[path] : JSON.stringify(data[path]);
   };
   const pr = { number:3415,headRefOid:head,state:'OPEN',labels:[],statusCheckRollup:[{
     name:'test',status:'COMPLETED',conclusion:'FAILURE',detailsUrl:`https://github.com/${repo}/actions/runs/10/job/20`}] };

@@ -176,6 +176,8 @@ export default defineConfig({
     exclude: [
       ...configDefaults.exclude,
       ...LIVE_SUITE,
+      // R1063a: merge CLI process smoke belongs to the scheduled real-process tier.
+      'scripts/__tests__/merge-ai-prs-*.real.test.mjs',
       // #3061 real-CLI regression proof (`check-standards.mjs`/`lane-review.mjs`, captured through a real
       // pipe — an in-process call can't reproduce the truncation bug this exists to catch). Measured at
       // 88.9s total, 2 of its tests alone at 48.4s/39.7s — the single most expensive file in the unit suite,
