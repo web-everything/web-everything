@@ -131,6 +131,29 @@ export function extractRounds(comments, pr) {
 }
 
 /**
+ * The one settle predicate for a referral hold: it is settled when it names a head that is not the live head (a push
+ * moved on), or a later trusted reviewer verdict comment (by thread position, never by timestamp) followed it.
+ * A hold that names no readable head, or any unreadable input, is NOT settled (the hold stands).
+ */
+function holdSettled(list, holdIdx, live) {
+  const named = /^review paused: head ([0-9a-f]{7,40})(?=\s)/i.exec(bodyOf(list[holdIdx]).trimStart())?.[1]?.toLowerCase();
+  // Any unreadable history entry means the hold stands (fail closed): it could conceal unresolved evidence.
+  for (let i = 0; i < list.length; i++) { const c = list[i]; if (!c || typeof c !== 'object' || typeof c.body !== 'string') return false; } // index loop: .some() skips sparse holes
+  if (!/^[0-9a-f]{40}$/.test(live)) return false; // an unreadable live head never settles
+  if (!named) return false; // a hold that names no readable head is never settled
+  if (!live.startsWith(named)) return true;
+  // A later reviewer changes-requested comment for THIS head (not a mechanical bounce, not another head's) settles it.
+  return list.slice(holdIdx + 1).some((c) => {
+    if (!isTrustedMarkerAuthor(c)) return false;
+    const b = bodyOf(c).trimStart();
+    if (!b.startsWith('🔁 review — changes requested') || /Recorded by /i.test(b.slice(0, 400))) return false;
+    // Only the comment's own head field counts (a line `head <sha>` or `head: <sha>`); quoted text elsewhere does not.
+    const fields = [...b.matchAll(/^head:? ([^\s]+)[ \t]*$/gim)].map((m) => m[1].toLowerCase());
+    return fields.length > 0 && fields.every((x) => x === live);
+  });
+}
+
+/**
  * Which cap the PR is at, from the thread and the status state. PURE.
  * red-team-cap: the gate's `round-cap` record for the LIVE head, with no later `sent-back` record for that head.
  * referral-hold: the review paused for a ruling on mandatory referral findings and none was recorded after it.
@@ -149,8 +172,17 @@ export function detectRoundCap({ comments, pr, head, state = null, repo = null }
     if (!later) return { trigger: 'red-team-cap', at: timeOf(cap.c), key: `${pr}:${live}:red-team-cap:${cap.g.result ?? ''}` };
   }
   // referral-hold: the review paused waiting for a block / card / not-real ruling, and none has been recorded since.
-  const hold = list.filter((c) => isTrustedMarkerAuthor(c) && /^review paused:/.test(bodyOf(c).trimStart()) && /Waiting on your ruling/.test(bodyOf(c))).at(-1);
-  if (hold && !list.some((c) => timeOf(c) > timeOf(hold) && isTrustedMarkerAuthor(c) && /^## (?:Operator|Automatic policy) ruling on mandatory referrals/.test(bodyOf(c).trimStart()))) {
+  // Every hold is checked, newest first: any one that is still unsettled wins.
+  let holdIdx = -1;
+  for (let i = list.length - 1; i >= 0; i--) {
+    const c = list[i];
+    if (!(isTrustedMarkerAuthor(c) && /^review paused:/.test(bodyOf(c).trimStart()) && /Waiting on your ruling/.test(bodyOf(c)))) continue;
+    if (list.some((r) => timeOf(r) > timeOf(c) && isTrustedMarkerAuthor(r) && /^## (?:Operator|Automatic policy) ruling on mandatory referrals/.test(bodyOf(r).trimStart()))) continue;
+    if (holdSettled(list, i, live)) continue;
+    holdIdx = i; break;
+  }
+  const hold = holdIdx >= 0 ? list[holdIdx] : null;
+  if (hold) {
     const h = /review-referral-hold: ([0-9a-f]{8,})/.exec(bodyOf(hold))?.[1] ?? String(timeOf(hold));
     return { trigger: 'referral-hold', at: timeOf(hold), key: `${pr}:${live}:referral-hold:${h}` };
   }
