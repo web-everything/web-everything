@@ -914,7 +914,7 @@ async function timedRunGate(phase, command, args, { outcomeKey } = {}) {
         if (match[0] === '&&') segments.push([]);
         else if (!/^[ \t]+$/.test(match[0])) segments.at(-1).push({ value: unquote(match[0]), start: match.index });
       }
-      const refusal = () => { throw new Error('verify-lane: --local requires a selected Vitest command in the shard wrapper; use a literal node path and an &&-joined gate'); };
+      const refusal = () => { throw new Error('verify-lane: --local requires a selected Vitest command in the shard wrapper; use an unprefixed literal node path and an &&-joined gate'); };
       if (offset !== command.length) {
         if (command.includes('verify-shard-run.mjs') || segments.flat().some(t => t.value.includes('verify-shard-run.mjs'))) refusal();
       } else {
@@ -922,11 +922,19 @@ async function timedRunGate(phase, command, args, { outcomeKey } = {}) {
         // count: a quoted test name or echo argument containing wrapper text is never rewritten.
         for (const words of segments.reverse()) {
           const start = words.findIndex(t => !/^[A-Za-z_][A-Za-z0-9_]*=/.test(t.value));
-          if (start < 0 || !/(?:^|\/)node$/.test(words[start].value)) continue;
+          if (start < 0) continue;
+          const mentionsWrapper = word => word.value.includes('verify-shard-run.mjs');
+          if (!/(?:^|\/)node$/.test(words[start].value)) {
+            // env/command (including nested launchers and shell payloads) can hide a shard
+            // runner that drops our held slot. Refuse before spawn instead of guessing prefix
+            // semantics. Literal echo arguments are data and cannot execute the wrapper.
+            if (words[start].value !== 'echo' && words.slice(start).some(mentionsWrapper)) refusal();
+            continue;
+          }
           const scriptIndex = start + (words[start + 1]?.value === '--' ? 2 : 1);
           const isWrapper = word => word && resolve(REPO, word.value).endsWith('/scripts/lib/verify-shard-run.mjs');
           if (!isWrapper(words[scriptIndex])) {
-            if (words[scriptIndex]?.value.startsWith('-') && words.slice(scriptIndex + 1).some(isWrapper)) refusal();
+            if (words[scriptIndex]?.value.startsWith('-') && words.slice(scriptIndex + 1).some(mentionsWrapper)) refusal();
             continue;
           }
           const options = words.slice(scriptIndex + 1, scriptIndex + 4).map(t => t.value);

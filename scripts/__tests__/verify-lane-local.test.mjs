@@ -43,6 +43,18 @@ const commandShapes = [
   ['two shard wrappers', `${relativeShard} && ${shardCommand}`, `${selectedTests} && ${selectedTests}`],
   ['reordered shard options and tabs', `node\t./scripts/lib/verify-shard-run.mjs\t--budget-ms=1000 --parallel=2 --shards=2 -- ${selectedTests}`, selectedTests],
   ['node option terminator', relativeShard.replace('node ', 'node -- '), selectedTests],
+  ...[
+    'env', 'command', '/usr/bin/env', 'env --', 'env -i',
+    'env WE_HEAVY_ADMISSION_HELD=0', 'command -p', 'command env',
+    'env command', 'exec', 'nice -n 5', 'timeout 60',
+  ].map(prefix => [`shell prefix ${prefix} refuses local execution`, `${prefix} ${relativeShard}`, null]),
+  ['quoted prefix and wrapper path refuse local execution', `"env" node './scripts/lib/verify-shard-run.mjs' --shards=2 --parallel=2 --budget-ms=60000 -- ${selectedTests}`, null],
+  ['prefixed shard after standards refuses local execution', `npm run check:standards && env ${relativeShard}`, null],
+  ['shell payload refuses local execution', `sh -c ${shellQuote(relativeShard)}`, null],
+  ...shardPathVariants.map(path => [
+    `prefixed shard path ${path} refuses local execution`, `env node ${path} --shards=2 --parallel=2 --budget-ms=1000 -- ${selectedTests}`, null,
+  ]),
+  ['node eval payload refuses local execution', `node -e ${shellQuote(`import('./scripts/lib/verify-shard-run.mjs')`)}`, null],
   ['unsupported node options refuse local execution', relativeShard.replace('node ', 'node --no-warnings '), null],
   ['relative shard unsupported selection', relativeShard.replace(selectedTests, 'echo unexpected'), null],
   ['relative shard malformed options', relativeShard.replace('--parallel=2', '--parallel=bad'), null],
