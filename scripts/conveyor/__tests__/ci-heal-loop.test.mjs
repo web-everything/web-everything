@@ -1,16 +1,23 @@
 import { hostname } from 'node:os';
+import { mkdtempSync, rmSync } from 'node:fs';
+import { join, dirname, resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
+import { execFileSync } from 'node:child_process';
 import { describe, expect, it, vi } from 'vitest';
-import { main, resolveCiHealInterval, runCiHealLoop, runCiHealLoopIteration } from '../ci-heal-loop.mjs';
+import { main, resolveCiHealInterval, runCiHealTick, runCiHealLoop, runCiHealLoopIteration } from '../ci-heal-loop.mjs';
+import { HEARTBEAT_INTERVAL_MS } from '../../lib/daemon-clone-lock.mjs';
+import { readLockEntry } from '../../readiness/file-locks.mjs';
 
 function fixture() {
   let busy = false;
   const lock = {
     reserve: vi.fn(() => busy ? { ok: false } : (busy = true, { ok: true })),
     release: vi.fn(() => { busy = false; }),
+    heartbeat: vi.fn(),
   };
   return {
     root: '/clone', lock,
-    locks: { acquireRead: vi.fn(() => ({ ok: true })), releaseRead: vi.fn() },
+    locks: { acquireRead: vi.fn(() => ({ ok: true })), releaseRead: vi.fn(), heartbeatRead: vi.fn() },
     tick: vi.fn(async () => ({ healed: true })), ensureAuth: vi.fn(),
     now: vi.fn().mockReturnValueOnce(10).mockReturnValue(25), write: vi.fn(),
     readHead: vi.fn(() => 'boot-head'), parentAlive: vi.fn(() => true),
@@ -74,6 +81,133 @@ describe('CI heal iteration', () => {
     expect(deps.tick).not.toHaveBeenCalled();
     expect(deps.locks.releaseRead).not.toHaveBeenCalled();
     expect(deps.lock.release).toHaveBeenCalledOnce();
+  });
+});
+
+describe('CI heal audit regressions', () => {
+  it('defaults to only ci-heal, with explicit empty injections and the real gate result forwarded', async () => {
+    const gate = { paused: false, reason: null };
+    const planAuth = vi.fn(() => gate);
+    const heal = vi.fn(async () => ({ dispatched: ['healed'] }));
+    const daemon = {
+      defaultTagDispatchStatus: vi.fn(),
+      withFixDispatchClaimRefresh: effects => effects,
+      runTickAllRepos: vi.fn(async options => {
+        expect(planAuth).toHaveBeenCalledOnce();
+        expect(options).not.toHaveProperty('ciHealOnly');
+        expect(options).not.toHaveProperty('ciHealTick');
+        expect(options.authGateOverride()).toBe(gate);
+        expect(options.orphanGuardTick).toBeNull();
+        for (const key of ['fixTick', 'hungCiTick', 'mainRedRebaseTick', 'missingRunTick', 'promoteDraftTick',
+          'rulingStandDownTick', 'notesTick', 'awaitVerifyTick', 'stuckFixerTick', 'supersedeTick']) {
+          expect(typeof options[key]).toBe('function');
+          const empty = await options[key]();
+          expect(Object.values(empty).every(value => value instanceof Map ? value.size === 0 : value.length === 0)).toBe(true);
+        }
+        return heal();
+      }),
+    };
+    expect(await runCiHealTick({ daemon, planAuth })).toEqual({ dispatched: ['healed'] });
+    expect(daemon.runTickAllRepos).toHaveBeenCalledOnce();
+    expect(heal).toHaveBeenCalledOnce();
+  });
+
+  it('skips an auth-paused tick before any daemon work', async () => {
+    const daemon = { runTickAllRepos: vi.fn(), withFixDispatchClaimRefresh: vi.fn() };
+    expect(await runCiHealTick({ daemon, planAuth: () => ({ paused: true }) })).toEqual({ skipped: 'auth-paused' });
+    expect(daemon.runTickAllRepos).not.toHaveBeenCalled();
+    expect(daemon.withFixDispatchClaimRefresh).not.toHaveBeenCalled();
+  });
+
+  it('rejects concurrent same-process cycles using the real reentrant cycle lock', async () => {
+    const temp = mkdtempSync(join(process.env.TMPDIR, 'ci-heal-cycle-'));
+    const deps = fixture();
+    delete deps.lock;
+    deps.env = { WE_COORDINATION_ROOT: temp };
+    let finish, entered;
+    const started = new Promise(resolve => { entered = resolve; });
+    let first;
+    try {
+      deps.tick.mockImplementationOnce(() => new Promise(resolve => { finish = resolve; entered(); }));
+      first = runCiHealLoopIteration(deps);
+      await started;
+      const lockRoot = join(temp, 'ci-heal-cycle-lock');
+      const held = readLockEntry(lockRoot, 'ci-heal-cycle');
+      expect(held).not.toBeNull();
+      expect(await runCiHealLoopIteration(deps)).toEqual({ skipped: 'busy' });
+      expect(readLockEntry(lockRoot, 'ci-heal-cycle')).toEqual(held);
+      expect(deps.locks.acquireRead).toHaveBeenCalledOnce();
+      expect(deps.locks.releaseRead).not.toHaveBeenCalled();
+    } finally {
+      finish?.('done');
+      await first;
+      rmSync(temp, { recursive: true, force: true });
+    }
+  });
+
+  it.each([false, true])('heartbeats both locks and clears its unref timer after failure=%s', async fails => {
+    const deps = fixture();
+    const timer = { unref: vi.fn() };
+    const interval = vi.fn(() => timer), clearInterval = vi.fn();
+    deps.tick.mockImplementation(async () => {
+      interval.mock.calls[0][0]();
+      expect(deps.lock.heartbeat).toHaveBeenCalledOnce();
+      expect(deps.locks.heartbeatRead).toHaveBeenCalledWith('/clone', { owner: `${hostname()}:${process.pid}` });
+      if (fails) throw new Error('tick failed');
+    });
+    const running = runCiHealLoopIteration({ ...deps, interval, clearInterval });
+    if (fails) await expect(running).rejects.toThrow('tick failed');
+    else await running;
+    expect(interval).toHaveBeenCalledWith(expect.any(Function), HEARTBEAT_INTERVAL_MS);
+    expect(timer.unref).toHaveBeenCalledOnce();
+    expect(clearInterval).toHaveBeenCalledWith(timer);
+  });
+
+  it('resolves the default clone from the script checkout even with an unrelated cwd', async () => {
+    const expected = execFileSync('git', ['-C', dirname(fileURLToPath(import.meta.url)), 'rev-parse', '--show-toplevel'], { encoding: 'utf8' }).trim();
+    const cwd = vi.spyOn(process, 'cwd').mockReturnValue(resolve(process.env.TMPDIR));
+    const deps = fixture();
+    delete deps.root;
+    const iteration = vi.fn(async () => ({}));
+    try {
+      await runCiHealLoop({ ...deps, once: true, iteration });
+      expect(iteration).toHaveBeenCalledWith(expect.objectContaining({ root: expected }));
+    } finally { cwd.mockRestore(); }
+  });
+
+  it.each(['--parent-pid', '--parent-pid=', '--parent-pid=0', '--parent-pid=-1', '--parent-pid=1.5',
+    '--parent-pid=abc', '--parent-pid=Infinity', '--parent-pid=9007199254740992'])('refuses invalid supervision flag %s', async flag => {
+    const deps = fixture();
+    await expect(main(['--once', flag], deps)).rejects.toThrow('parent-pid');
+    expect(deps.tick).not.toHaveBeenCalled();
+  });
+
+  it('reports refusal/error counts and authPaused alongside completion timing', async () => {
+    const deps = fixture();
+    deps.tick.mockResolvedValue({ refusals: [{}, {}], errors: [{}], authPaused: true });
+    await runCiHealLoopIteration(deps);
+    expect(deps.write).toHaveBeenCalledWith('ci-heal-loop: refusals=2 errors=1 authPaused=true');
+    expect(deps.write).toHaveBeenCalledWith('ci-heal-loop: completed in 15ms');
+  });
+
+  it.each([undefined, 'GITHUB_APP_AUTH_GUARD_UNAVAILABLE'])('returns error for a failed once iteration (%s) and main sets exit code 1', async code => {
+    const deps = fixture();
+    deps.tick.mockRejectedValue(Object.assign(new Error('failed'), { code }));
+    expect(await runCiHealLoop({ ...deps, once: true })).toEqual({ exit: 'error' });
+    const previous = process.exitCode;
+    try {
+      expect(await main(['--once'], deps)).toEqual({ exit: 'error' });
+      expect(process.exitCode).toBe(1);
+    } finally { process.exitCode = previous; }
+  });
+
+  it.each([undefined, 'GITHUB_APP_AUTH_GUARD_UNAVAILABLE'])('logs an iteration error (%s) and continues in loop mode', async code => {
+    const deps = fixture();
+    deps.tick.mockRejectedValueOnce(Object.assign(new Error('failed'), { code }));
+    deps.sleep.mockImplementation(async () => { deps.parentAlive.mockReturnValue(false); });
+    expect(await runCiHealLoop({ ...deps, parentPid: 42 })).toEqual({ exit: 'parent-dead' });
+    expect(deps.write).toHaveBeenCalledWith('ci-heal-loop: iteration failed: failed');
+    expect(deps.sleep).toHaveBeenCalledOnce();
   });
 });
 
