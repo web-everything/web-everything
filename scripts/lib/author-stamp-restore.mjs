@@ -103,7 +103,8 @@ export function planStampRestore({ state, body, authorLogin, edits } = {}) {
     // A bracketed line is harmless only when it has no backtick and its brackets balance on that line
     // (a one-line `[text](url)` cannot span a code span across lines).
     const bracketed = edit.diff.split(/\r\n|[\r\n]/).some((l) => /[\[\]]/.test(l)
-      && (l.includes('`') || (l.match(/\[/g) ?? []).length !== (l.match(/\]/g) ?? []).length));
+      && (l.includes('`') || (l.match(/\[/g) ?? []).length !== (l.match(/\]/g) ?? []).length
+        || (l.match(/\(/g) ?? []).length !== (l.match(/\)/g) ?? []).length));
     let fence;
     for (const line of edit.diff.split(/\r\n|[\r\n]/)) {
       const delimiter = line.match(/^[ \t]{0,3}(`{3,}|~{3,})(.*)$/);
@@ -141,8 +142,8 @@ export function planStampRestore({ state, body, authorLogin, edits } = {}) {
     // marker) open HTML blocks where backticks are not code: refuse them outright, outside code spans too.
     const candidate = (noExempt ? edit.diff.split(/\r\n|[\r\n]/) : htmlLines)
       .filter((l) => !/^<!--[ \t]*authored-by-actor:[^<>\r\n]*-->[^\S\r\n]*$/.test(l))
-      // Whole-line, closed, plain comments (pr-size / policy markers) are inert: no backtick, tag or nested opener.
-      .filter((l) => !/^<!--[^<>`\r\n]*-->[^\S\r\n]*$/.test(l) || l.includes('authored-by-actor:')).join('\n');
+      // Only the repo's own known machine markers (pr-size / size-admission / policy-set) are inert comments.
+      .filter((l) => !/^<!-- (?:pr-size:(?:begin|end)|size-admission:[0-9a-f]+|policy-set: [A-Za-z0-9 ._-]+) -->[^\S\r\n]*$/.test(l)).join('\n');
     if (/<\/?[a-z][^>]*>/i.test(noExempt ? edit.diff : htmlLines.join('\n')) || /<[!?]/.test(candidate)) {
       return refusal('unsupported HTML edit snapshot; inspect complete GitHub history manually',
         contentEvidence(edit, htmlOffender(candidate)));

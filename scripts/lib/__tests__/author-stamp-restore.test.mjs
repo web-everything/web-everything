@@ -968,6 +968,11 @@ describe('planStampRestore — #7227 full-body edit dropped the stamp', () => {
     expect(plan({ edits })).toMatchObject({ action: 'refuse' });
   });
   it('marks lost, never restores, with no earlier stamped snapshot', () => {
-    expect(plan({ edits: [edit(prBody)] }).action).not.toBe('restore');
+    expect(plan({ edits: [edit(prBody)] })).toMatchObject({ action: 'mark-lost' });
+  });
+  it('refuses arbitrary comments and multiline link destinations', () => {
+    for (const text of ['<!-- anything -->', '[text](\n`<div>`\n)']) {
+      expect(plan({ edits: [edit(`${text}\n${buildAuthorActorMarker(ID)}`)] })).toMatchObject({ action: 'refuse' });
+    }
   });
 });
