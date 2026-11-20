@@ -114,9 +114,9 @@ function isBetweenTickLaunch(options) {
  */
 export async function rebuildClone({ emitEvent = appendDaemonEvent, ...options } = {}) {
   // Between-tick launches leave force-watch checks and rollback to the next tick.
-  const strict = strictRebuildEvidence(options.env, options.launchedBy);
+  const strict = strictRebuildEvidence(options.env, options.launchOnly ? 'early' : options.launchedBy);
   const readers = createRebuildReaders({ strict, read: options.evidenceRead });
-  if (!strict) (options.log ?? console).error?.('daemon-rebuild: strictEvidence=false (source env; tick-start compatibility rollback)');
+  if (!strict) (options.log ?? console).error?.(`daemon-rebuild: strictEvidence=false (source ${(options.env ?? process.env).WE_DAEMON_REBUILD_STRICT_EVIDENCE === '0' ? 'env' : 'default'}; tick-start compatibility)`);
   return withRebuildReaders(readers, async () => {
     const startedAtMs = Date.now();
     let result;

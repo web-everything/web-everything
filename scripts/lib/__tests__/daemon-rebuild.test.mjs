@@ -921,6 +921,7 @@ describe('rebuildClone', () => {
   // built main alone and dropped every registered fix, with no alert anywhere.
   it('a corrupt overlay-state file refuses as state-unreadable with a visible log, never builds main alone', async () => {
     const { originDir, cloneDir, env } = makeFixture();
+    env.WE_DAEMON_REBUILD_STRICT_EVIDENCE = '1';
     pushBranch(originDir, 'lane/kept', (dir) => writeFile(dir, 'kept.txt', 'x\n'));
     addOverlay(cloneDir, { ref: 'lane/kept' }, { env });
     const first = await rebuildClone({ root: cloneDir, env, runSmoke: passSmoke(), prState: async () => null, lockOpts: LOCK_OPTS });

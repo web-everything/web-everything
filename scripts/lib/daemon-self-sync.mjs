@@ -834,7 +834,7 @@ export function withSelfSync(effects, {
   maintainObjects, maintain, hasMaintenanceRebuildJob = () => cloneHasRebuildJob(root, env),
 }) {
   const tick = effects.tickOnce;
-  if (!strictRebuildEvidence(env)) log.error?.('daemon-self-sync: strictEvidence=false (source env; tick-start compatibility rollback)');
+  if (!strictRebuildEvidence(env)) log.error?.(`daemon-self-sync: strictEvidence=false (source ${env.WE_DAEMON_REBUILD_STRICT_EVIDENCE === '0' ? 'env' : 'default'}; tick-start compatibility)`);
   const unreadableHold = () => {
     log.error?.('daemon-self-sync: state-unreadable — skipping this tick; repair persisted evidence before retrying');
     return skippedTick('state-unreadable');

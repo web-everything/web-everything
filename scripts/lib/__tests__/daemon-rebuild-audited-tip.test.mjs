@@ -1000,6 +1000,7 @@ describe('unaudited-tip evidence and policy', () => {
 
 it.each(['early', 'recovery', 'tick-start'])('%s refuses malformed pins and defers readable pins to locked adoption proof', async launchedBy => {
   const f = await fixture();
+  f.env.WE_DAEMON_REBUILD_STRICT_EVIDENCE = '1';
   f.env.WE_DAEMON_STATE_DIR = join(f.dir, 'state');
   f.env.WE_DAEMON_OVERLAY_DIR = join(f.dir, 'overlays');
   addOverlay(f.root, { ref, pr: 42 }, { env: f.env });

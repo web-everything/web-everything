@@ -25,7 +25,7 @@ import * as fs from 'node:fs';
 import { createHash } from 'node:crypto';
 import { hostname } from 'node:os';
 import {
-  existsSync, mkdirSync, readFileSync, rmSync, writeFileSync,
+  existsSync, mkdirSync, readFileSync, rmSync,
 } from 'node:fs';
 import { basename, dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -47,6 +47,7 @@ import { strictRebuildEvidence } from './evidence-context.mjs';
 import { processStartMs } from './lease.mjs';
 import { readGit } from '../proc-read.mjs';
 import { cascadePolicy } from '../policy-cascade.mjs';
+import { writeJsonAtomic } from '../atomic-json-file.mjs';
 
 const SELF = fileURLToPath(import.meta.url);
 const SETTINGS_PATH = resolve(SELF, '..', '..', 'daemon-rebuild-settings.json');
@@ -143,24 +144,24 @@ export function cloneNodeModulesInstaller(sourceRoot, { exec = execFileSync, fal
   };
 }
 
-function readConsumed(dir) {
+function readConsumed(dir, strict) {
   try {
     const ids = JSON.parse(readFileSync(join(dir, CONSUMED_FILE), 'utf8'));
     if (!Array.isArray(ids) || !ids.every(id => typeof id === 'string' && id)) throw new Error('Invalid consumed jobs');
     return new Set(ids);
-  } catch (error) { if (error?.code !== 'ENOENT') throw error; return new Set(); }
+  } catch (error) { if (strict && error?.code !== 'ENOENT') throw error; return new Set(); }
 }
 function writeConsumed(dir, set) {
-  try { writeFileSync(join(dir, CONSUMED_FILE), `${JSON.stringify([...set])}\n`); } catch { /* best-effort */ }
+  try { writeJsonAtomic(join(dir, CONSUMED_FILE), [...set]); } catch { /* best-effort */ }
 }
-function readResult(dir, id) {
+function readResult(dir, id, strict) {
   try {
     const result = JSON.parse(readFileSync(join(dir, `${id}${RESULT_SUFFIX}`), 'utf8'));
     if (!result || typeof result !== 'object' || Array.isArray(result)
       || !(result.reason === null || typeof result.reason === 'string')
       || ('readyRecorded' in result && typeof result.readyRecorded !== 'boolean')) throw new Error('Invalid rebuild result');
     return result;
-  } catch (error) { if (error?.code !== 'ENOENT') throw error; return null; }
+  } catch (error) { if (strict && error?.code !== 'ENOENT') throw error; return null; }
 }
 function removeJobFiles(dir, id) {
   try { deleteRun(id, dir); } catch { /* gone */ }
@@ -191,13 +192,14 @@ export async function rebuildCloneAsJob({
   store = createJobStore(rebuildJobsDir(root, env)), reattach = reattachTick, clock, now = () => Date.now(),
   launchOnly = false, launchedBy = 'tick-start', waitInFlightTickMs = 0,
   recoverySettings = resolveRecovery({ env, log: m => log.error?.(m) }),
-  readState = strictRebuildEvidence(env, launchedBy) ? readRebuildStateStrict : readRebuildState,
-  readPending = strictRebuildEvidence(env, launchedBy) ? readPendingAdoptionsStrict : readPendingAdoptions,
-  readReady = strictRebuildEvidence(env, launchedBy) ? readReadyCandidateStrict : readReadyCandidate,
+  readState = strictRebuildEvidence(env, launchOnly ? 'early' : launchedBy) ? readRebuildStateStrict : readRebuildState,
+  readPending = strictRebuildEvidence(env, launchOnly ? 'early' : launchedBy) ? readPendingAdoptionsStrict : readPendingAdoptions,
+  readReady = strictRebuildEvidence(env, launchOnly ? 'early' : launchedBy) ? readReadyCandidateStrict : readReadyCandidate,
   codeSha, snapshot, settings = loadRebuildAsJobSettings(undefined, { env }), evict = evictSnapshots, rng,
 }) {
   const say = (m) => log.error?.(`daemon-rebuild-job: ${m}`);
-  if (!strictRebuildEvidence(env, launchedBy)) say('strictEvidence=false (source env; tick-start compatibility rollback)');
+  const strict = strictRebuildEvidence(env, launchOnly ? 'early' : launchedBy);
+  if (!strict) say(`strictEvidence=false (source ${env.WE_DAEMON_REBUILD_STRICT_EVIDENCE === '0' ? 'env' : 'default'}; tick-start compatibility)`);
   // Refuse before preparation or reattach can erase evidence or launch an existing job.
   const unreadable = () => {
     say('state-unreadable: rebuild/ready/pending-adoptions/job evidence is unreadable or invalid; repair persisted evidence before retrying');
@@ -212,13 +214,15 @@ export async function rebuildCloneAsJob({
     initialState = readState(root, env);
     initialReady = readReady(root, env);
     readPending(root, { env });
-    consumed = readConsumed(store.dir);
-    initialFinished = store.list().records.filter(r => r.job.kind === REBUILD_JOB_KIND.kind
+    consumed = readConsumed(store.dir, strict);
+    const listed = store.list();
+    if (strict && listed.corrupt?.length) return unreadable();
+    initialFinished = listed.records.filter(r => r.job.kind === REBUILD_JOB_KIND.kind
       && TERMINAL_JOB_STATUSES.includes(r.job.status));
-    for (const r of initialFinished) results.set(r.id, readResult(store.dir, r.id));
+    for (const r of initialFinished) results.set(r.id, readResult(store.dir, r.id, strict));
   } catch { return unreadable(); }
   mkdirSync(store.dir, { recursive: true });
-  if (store.list().corrupt?.length) return { moved: false, reason: 'rebuild-job-running', unknownJobState: true };
+  if (strict && store.list().corrupt?.length) return unreadable();
   const kind = REBUILD_JOB_KIND.kind;
   const mine = () => store.list().records.filter((r) => r.job.kind === kind);
   const snap = snapshot ?? { repoDir: root, install: cloneNodeModulesInstaller(root) };
@@ -313,8 +317,8 @@ export async function rebuildCloneAsJob({
     .sort((a, b) => Date.parse(b.job.finishedAt || 0) - Date.parse(a.job.finishedAt || 0))[0];
   let lastRes;
   try {
-    readConsumed(store.dir);
-    lastRes = last ? readResult(store.dir, last.id) : null;
+    readConsumed(store.dir, strict);
+    lastRes = last ? readResult(store.dir, last.id, strict) : null;
   } catch { return { ...unreadable(), finishedJobs }; }
   const sinceMs = last ? now() - Date.parse(last.job.finishedAt || 0) : Infinity;
   const intervalMs = rebuildJobInterval(settings, entries, rng);
@@ -477,7 +481,7 @@ export async function jobMain({
         const r = await runChild({ input, env: childEnv, onChild: (c) => { child = c; } });
         const timeout = reportTimeout({ root: input.root, env, r });
         const result = buildRebuildJobResult(input, r, timeout);
-        writeFileSync(join(dir, `${jobId}${RESULT_SUFFIX}`), `${JSON.stringify(result)}\n`);
+        writeJsonAtomic(join(dir, `${jobId}${RESULT_SUFFIX}`), result);
         process.stderr.write(`[rebuild-job ${jobId}] ${new Date().toISOString()} done: ${result.reason}${result.mutation ? ` (${result.mutation})` : ''}${result.readyRecorded ? ' (ready candidate recorded)' : ''}\n`);
         return { reason: result.reason, readyRecorded: result.readyRecorded };
       },

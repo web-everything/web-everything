@@ -1,6 +1,6 @@
 /** Replay persisted writer output and legacy metadata through real rebuild admission. */
-import { mkdtempSync, mkdirSync, readFileSync, writeFileSync, rmSync } from 'node:fs';
-import { tmpdir } from 'node:os';
+import { mkdtempSync, mkdirSync, readFileSync, writeFileSync, rmSync, existsSync } from 'node:fs';
+import { tmpdir, hostname } from 'node:os';
 import { dirname, join } from 'node:path';
 import { createJobStore, enqueueJob } from '../../../lib/daemon-jobs-runtime.mjs';
 import { markSucceeded } from '../../../lib/daemon-jobs.mjs';
@@ -14,6 +14,46 @@ import { addOverlay } from '../../../lib/daemon-overlays.mjs';
 import { readReadyCandidate } from '../../../lib/daemon-rebuild/state.mjs';
 import { rebuildClone } from '../../../lib/daemon-rebuild/rebuild.mjs';
 import { acquireRead, releaseRead } from '../../../lib/daemon-clone-lock.mjs';
+import { claimBuildLease, releaseBuildLease } from '../../../lib/daemon-rebuild/lease.mjs';
+
+/** Torn job sidecars cannot wedge default ticks; unattended children retain abandoned worktrees for cleanup. */
+export async function probeTickCompatibility() {
+  const root = mkdtempSync(join(tmpdir(), 'rebuild-tick-compatibility-'));
+  const env = { WE_DAEMON_STATE_DIR: join(root, 'state') };
+  const run = (args) => {
+    const result = spawnSync('git', ['-c', 'user.name=soak', '-c', 'user.email=soak@example.invalid', ...args],
+      { cwd: root, encoding: 'utf8', timeout: 10_000, maxBuffer: 65536 });
+    return { status: result.status, stdout: result.stdout ?? '', stderr: result.stderr ?? '' };
+  };
+  const git = args => { const r = run(args); if (r.status !== 0) throw new Error(r.stderr); return r.stdout; };
+  const violations = [];
+  try {
+    for (const fault of ['job', 'consumed', 'result']) {
+      const store = createJobStore(join(root, fault)); mkdirSync(store.dir);
+      const old = enqueueJob({ store, kindDef: REBUILD_JOB_KIND, codeSha: 'a'.repeat(40), input: { root }, now: 1000 });
+      store.update(old.id, r => markSucceeded(r, { at: new Date(1000).toISOString() }));
+      const file = join(store.dir, fault === 'job' ? old.id + '.json' : fault === 'consumed' ? 'consumed.json' : old.id + RESULT_SUFFIX);
+      writeFileSync(file, '{torn');
+      const result = await rebuildCloneAsJob({ root, env, store, now: () => 2000, log: { error() {} },
+        adopt: async () => ({ moved: true, adopted: true }), reattach: async () => {}, evict() {} });
+      if (!result.adopted) violations.push(`torn ${fault} blocked tick adoption`);
+    }
+    git(['init', '-q', '-b', 'main']);
+    git(['commit', '--allow-empty', '-qm', 'fixture']);
+    const path = join(root, 'abandoned');
+    git(['worktree', 'add', '--detach', path, 'HEAD']);
+    const state = { building: { token: 'abandoned', pid: process.pid, host: hostname(),
+      startedAt: new Date(0).toISOString(), path } };
+    const options = { root, env, run, state, nowMs: 1000, plan: { finalSha: git(['rev-parse', 'HEAD']).trim(), inputsKey: 'next' } };
+    const early = claimBuildLease({ ...options, cleanupAbandoned: false });
+    if (early || state.building?.path !== path) violations.push('early claim forgot abandoned worktree');
+    if (early) releaseBuildLease(state, early);
+    const tick = claimBuildLease(options);
+    if (existsSync(path) || git(['worktree', 'list', '--porcelain']).includes(path)) violations.push('tick left abandoned worktree registered');
+    if (tick) releaseBuildLease(state, tick);
+    return { violations };
+  } finally { rmSync(root, { recursive: true, force: true }); }
+}
 
 /** Real Git: publish a smoke-passed pinned candidate, move its tip, then run tick-start. */
 export async function probeStalePinnedReady() {

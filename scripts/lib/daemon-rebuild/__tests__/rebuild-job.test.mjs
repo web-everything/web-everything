@@ -307,7 +307,7 @@ it.each([{}, { forced: false }, { forced: true }, {
 
 it.each([true, false].flatMap(launchOnly => ['rebuild', 'ready'].map(kind => [launchOnly, kind])))(
   'launchOnly=%s refuses corrupt %s evidence in stateOpts.env override before preparation', async (launchOnly, kind) => {
-    const env = { WE_DAEMON_STATE_DIR: join(root, 'base-state'), WE_DAEMON_OVERLAY_DIR: join(root, 'overlays') };
+    const env = { WE_DAEMON_REBUILD_STRICT_EVIDENCE: '1', WE_DAEMON_STATE_DIR: join(root, 'base-state'), WE_DAEMON_OVERLAY_DIR: join(root, 'overlays') };
     const stateOpts = { env: { WE_DAEMON_STATE_DIR: join(root, 'override-state') } };
     writeRebuildState(root, {}, env);
     mkdirSync(stateOpts.env.WE_DAEMON_STATE_DIR);
@@ -373,7 +373,7 @@ it.each([true, false].flatMap(launchOnly =>
 
 it.each([['early', true], ['recovery', true], ['tick-start', true], ['tick-start', false]])(
   '%s launchOnly=%s preserves mixed overdue and malformed pending-adoption bytes on strict refusal', async (launchedBy, launchOnly) => {
-    const env = { WE_DAEMON_STATE_DIR: join(root, 'state'), WE_DAEMON_OVERLAY_DIR: join(root, 'overlays') };
+    const env = { WE_DAEMON_REBUILD_STRICT_EVIDENCE: '1', WE_DAEMON_STATE_DIR: join(root, 'state'), WE_DAEMON_OVERLAY_DIR: join(root, 'overlays') };
     const file = pendingAdoptionPath(root, env);
     mkdirSync(join(env.WE_DAEMON_OVERLAY_DIR, 'adoption-pending'), { recursive: true });
     const original = Buffer.from(JSON.stringify([
@@ -518,7 +518,7 @@ it.each(['early', 'recovery'])('%s successful preparation preserves the whole st
 });
 
 it.each([42, true, {}, [], undefined])('refuses an invalid terminal result reason %j without consuming it', async reason => {
-  const env = { WE_DAEMON_STATE_DIR: join(root, 'state'), WE_DAEMON_OVERLAY_DIR: join(root, 'overlays') };
+  const env = { WE_DAEMON_REBUILD_STRICT_EVIDENCE: '1', WE_DAEMON_STATE_DIR: join(root, 'state'), WE_DAEMON_OVERLAY_DIR: join(root, 'overlays') };
   const store = createJobStore(join(root, 'jobs'));
   mkdirSync(store.dir);
   const job = enqueueJob({ store, kindDef: REBUILD_JOB_KIND, codeSha: 'a'.repeat(40), input: { root }, now: 1000 });
@@ -742,7 +742,7 @@ it.each(['early', 'recovery', 'tick-start', 'unknown', undefined].flatMap(source
   ['state', 'ready', 'pending', 'lease', 'forceWatch'].flatMap(reader =>
     ['corrupt', 'EACCES', 'wrong type', 'wrong shape'].map(failure => [source, reader, failure]))))(
   'detached %s child re-reads %s/%s after queue admission without changing bytes', async (launchedBy, reader, failure) => {
-    const env = { ...process.env, WE_DAEMON_STATE_DIR: join(root, 'state'),
+    const env = { ...process.env, WE_DAEMON_REBUILD_STRICT_EVIDENCE: '1', WE_DAEMON_STATE_DIR: join(root, 'state'),
       WE_DAEMON_CLONE_LOCK_ROOT: join(root, 'locks'), WE_DAEMON_OVERLAY_DIR: join(root, 'overlays'),
       WE_DAEMON_EVENTS: join(root, 'events.jsonl'), WE_DAEMON_AUTO_REBASE: '0', WE_OVERLAY_STALE: '0' };
     execFileSync('git', ['init', '-q', '-b', 'child-fixture', root], { timeout: 5000, maxBuffer: 65536 });
@@ -854,7 +854,7 @@ it.each(['early', 'recovery'])('%s launch and child prepare preserve actionable 
     if (args[0] === 'symbolic-ref') return { status: 0, stdout: 'main' };
     if (args[0] === 'rev-parse') return args.includes('MERGE_HEAD') ? { status: 1, stdout: '' }
       : { status: 0, stdout: args.some(a => a.includes('lane/new')) ? next : head };
-    if (['cat-file', 'merge-base', 'fetch', 'commit-graph', 'ls-files', 'status', 'rev-list', 'log'].includes(args[0])) return { status: 0, stdout: '' };
+    if (['cat-file', 'merge-base', 'fetch', 'commit-graph', 'ls-files', 'status', 'rev-list', 'log', 'worktree'].includes(args[0])) return { status: 0, stdout: '' };
     throw new Error('unexpected git: ' + args.join(' '));
   });
   const store = createJobStore(join(root, 'jobs'));
@@ -867,15 +867,18 @@ it.each(['early', 'recovery'])('%s launch and child prepare preserve actionable 
   expect(files.map(f => readFileSync(f, 'utf8'))).toEqual(before);
   const child = await preparation.prepareRebuild({ root, env, stEnv: env, run, launchedBy,
     readyOnly: true, now: () => 1000, log: { error() {} }, prBaseChain: Object.assign(() => null, { fresh: new Map([[2, []]]) }) });
-  expect(child.terminal).toBe(false);
+  expect(child).toMatchObject({ terminal: true, result: { reason: 'readonly-job-mutation-due', mutation: 'abandoned-build-cleanup' } });
   expect(files.slice(0, 3).map(f => readFileSync(f, 'utf8'))).toEqual(before.slice(0, 3));
   const state = JSON.parse(readFileSync(files[3], 'utf8'));
-  expect(state.building).toMatchObject({ target: next });
-  state.building = JSON.parse(before[3]).building;
   expect(state).toEqual(JSON.parse(before[3]));
   expect(readFileSync(abandonedEvidence, 'utf8')).toBe('keep this abandoned build for tick-start cleanup');
   // Positive control: this exact swap is actionable on the normal tick path.
   await finishPendingSwaps({ root, env, run });
   expect(readOverlays(root, { env }).map(o => o.ref)).toEqual(['lane/new']);
   expect(nodeFs.existsSync(swap)).toBe(false);
+  const tick = await preparation.prepareRebuild({ root, env, stEnv: env, run, launchedBy: 'tick-start',
+    readyOnly: true, now: () => 1000, log: { error() {} }, prBaseChain: Object.assign(() => null, { fresh: new Map([[2, []]]) }) });
+  expect(tick.terminal).toBe(false);
+  expect(nodeFs.existsSync(abandoned)).toBe(false);
+  expect(run.mock.calls.some(([args]) => args[0] === 'worktree' && args.includes('remove') && args.includes(abandoned))).toBe(true);
 });

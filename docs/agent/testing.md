@@ -5727,8 +5727,11 @@ permission failures never count as proof of exit.
 
 Early watcher jobs carry `early`; both timed env-timeout retries and overdue-registration
 recovery jobs carry `recovery`. Only the ordinary tick-start launch carries `tick-start`.
-`rebuildClone` defaults to the same strict evidence policy for every provenance, including tick-start and inline rebuilds.
-Its async scope covers indirect legacy consumers as well as prepare, smoke, lease renewal,
+`rebuildClone` uses strict evidence for early/recovery launches; ordinary tick-start and
+inline rebuilds retain compatibility readers unless `WE_DAEMON_REBUILD_STRICT_EVIDENCE=1`.
+Keep fleet-wide strict validation opt-in until captured, anonymised deployment files have
+passed replay; the current writer-contract corpus is synthetic, not a fleet capture.
+The strict async scope covers indirect legacy consumers as well as prepare, smoke, lease renewal,
 cleanup and ready publication. Keep evidence entry points connected to this scope when adding
 readers; do not add a child-specific permissive fallback. Only ENOENT means empty, including after queue admission and after waiting for the preparation lock.
 The build lease lives in the strictly validated rebuild state. Ready, pending adoptions,
@@ -5737,12 +5740,26 @@ also refuse malformed or unreadable evidence; only ENOENT is absent. Writes reva
 before replacing or deleting it. Refusal requires operator repair of the persisted evidence.
 For deployment schema incompatibility, `WE_DAEMON_REBUILD_STRICT_EVIDENCE=0` restores legacy
 evidence readers for ordinary tick-start and inline rebuilds, including job admission and
-the `withSelfSync` state check. The override logs `strictEvidence=false (source env)`.
+the `withSelfSync` state check. Compatibility logs `strictEvidence=false` with source
+`default` or `env`. Missing and invalid switch values retain the compatibility default.
 Early/recovery provenance remains strict, even with this override; unknown provenance also
-remains strict. Force-watch rollback safety, job-result protocol validation and ready adoption
+remains strict. Launch-only admission is strict even when provenance is omitted.
+Tick-start compatibility ignores corrupt job records and treats unreadable consumed/results
+as empty/null, preserving the legacy adoption and queue paths. Strict job-store refusal
+reports `state-unreadable` and preserves bytes instead of reporting a live job.
+Force-watch rollback safety and ready adoption
 proof remain enforced. `evidence-readers.test.mjs`, `daemon-rebuild-early-launch.test.mjs` and
-`daemon-self-sync.test.mjs` exercise the switch at each entry point. Ordinary strict refusal
-blocks tick-start by default: treat changes to that policy as a reviewed rollout decision.
+`daemon-self-sync.test.mjs` exercise the switch at each entry point.
+`daemon-rebuild/__tests__/review-compatibility.test.mjs` tables torn job/consumed/result
+evidence across tick-start, early and recovery, absent/disabled/enabled strict mode,
+all documented early/recovery overrides, and nonzero-jitter recovery spacing.
+
+**Evidence publication standard:** never use `writeFileSync` directly on a complete
+JSON evidence document parsed by a strict reader. Use `writeJsonAtomic` (validated
+same-directory temporary file then rename), or an equivalent existing atomic writer.
+This includes the consumed-job ledger and job result sidecars. Atomic publication
+prevents partial reads; it does not replace the existing locks for read-modify-write
+state or serialize multiple ledger writers. Append-only event logs keep their own protocol.
 `daemon-rebuild/__tests__/evidence-readers.test.mjs` tables both provenances against each reader
 and corrupt JSON, EACCES and wrong shapes, at entry and after waiting for the write lock,
 asserting unchanged bytes. It also pins indirect legacy-reader inheritance and late ready
@@ -5760,11 +5777,13 @@ and overlay events; ready cleanup, forced-watch transitions and ready/skip-unrel
 finalization. Alert-file appends, wrapper pending-adoption rewrites/notifications,
 force-watch checks/rollback, and starvation writes also defer. Fetch and deterministic
 plan object creation remain part of rebuilding; admission never claims a lease, while
-the detached child may claim its actual build lease before smoke, without deleting
-an abandoned lease's candidate worktree. The actionable-swap
-fixture asserts registry, event and swap bytes survive launch plus child prepare,
-with only the child's build lease changing in rebuild state, and proves the same
-swap removes the original registration when ordinary cleanup is called.
+the detached child may claim its actual build lease before smoke. If an abandoned
+lease still records a candidate path, the child returns `readonly-job-mutation-due`
+(`abandoned-build-cleanup`) and leaves the lease intact for tick-start cleanup.
+The actionable-swap fixture asserts registry, event, swap and abandoned lease bytes
+survive child preparation, then proves ordinary preparation removes the candidate.
+The `rebuild-evidence-compatibility` soak also checks removal of the real Git worktree
+registration after an early claim defers, and tick adoption despite torn job sidecars.
 
 
 ### Tick-start pin and evidence security

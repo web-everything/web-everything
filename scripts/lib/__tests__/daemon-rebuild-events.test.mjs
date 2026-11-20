@@ -75,6 +75,7 @@ describe('rebuildClone coordination events', () => {
     ['as-job', { launchedBy: 'tick-start', asJob: true }],
   ].flatMap(([provenance, flags]) => ['EIO', 'EACCES', 'corrupt', 'shape'].map(fault => [provenance, fault, flags])))(
     '%s %s evidence refusal emits exactly one failure and preserves state/pending bytes', async (_provenance, fault, flags) => {
+      options.env.WE_DAEMON_REBUILD_STRICT_EVIDENCE = '1';
       writeRebuildState(options.root, {}, options.env);
       const file = rebuildStatePath(options.root, options.env);
       if (fault === 'corrupt' || fault === 'shape') writeFileSync(file, fault === 'corrupt' ? '{broken' : '{}');

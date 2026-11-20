@@ -550,6 +550,7 @@ describe('a passed candidate blocked at finalize by a long reader tick is adopte
     ['missing event log', { log: 'missing' }, false],
   ])('historical merge retirement: %s', async (_name, options, accepted) => {
     const { originDir, cloneDir, env } = makeFixture();
+    env.WE_DAEMON_REBUILD_STRICT_EVIDENCE = '1';
     env.WE_DAEMON_REBUILD_SKIP_UNRELATED = '0';
     const ref = 'lane/review-seat-fairness-m1';
     const sha = pushBranch(originDir, ref, (dir) => writeFile(dir, 'live.txt', 'live\n'));

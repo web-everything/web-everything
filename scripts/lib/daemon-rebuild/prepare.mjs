@@ -869,6 +869,9 @@ export async function prepareRebuild({
       plan,
     });
   }
+  if (strictState && state.building?.path && !buildLeaseIsLive(state.building, { env: stEnv, nowMs: nowMs() })) {
+    return mutationDue('abandoned-build-cleanup');
+  }
   const lease = claimBuildLease({
     state, plan, root, run, env: stEnv, nowMs: nowMs(), adoptOnly, cleanupAbandoned: !strictState,
   });

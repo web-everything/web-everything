@@ -108,6 +108,7 @@ function makeFixture() {
   const overlayDir = mktemp('we-daemon-rebuild-fb-overlay-');
   const env = {
     ...process.env,
+    WE_DAEMON_REBUILD_STRICT_EVIDENCE: '1',
     WE_DAEMON_STATE_DIR: stateDir,
     WE_DAEMON_CLONE_LOCK_ROOT: lockDir,
     WE_DAEMON_OVERLAY_DIR: overlayDir,

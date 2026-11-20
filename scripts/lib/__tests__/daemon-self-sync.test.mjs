@@ -230,7 +230,7 @@ describe('withSelfSync — DEFAULT path: rebuild-driven (#4044 Module E)', () =>
     'unreadable %s state holds the tick visibly and preserves file bytes', async fault => {
       const root = mkdtempSync(join(tmpdir(), 'self-sync-unreadable-'));
       try {
-        const env = { WE_DAEMON_STATE_DIR: join(root, 'state'), WE_DAEMON_CLONE_LOCK_ROOT: join(root, 'locks') };
+        const env = { WE_DAEMON_REBUILD_STRICT_EVIDENCE: '1', WE_DAEMON_STATE_DIR: join(root, 'state'), WE_DAEMON_CLONE_LOCK_ROOT: join(root, 'locks') };
         writeRebuildState(root, {}, env);
         const file = rebuildStatePath(root, env);
         if (fault === 'corrupt' || fault === 'shape') writeFileSync(file, fault === 'corrupt' ? '{broken' : '{}');
@@ -269,10 +269,11 @@ describe('withSelfSync — DEFAULT path: rebuild-driven (#4044 Module E)', () =>
     } finally { rmSync(root, { recursive: true, force: true }); }
   });
 
-  it('strict-evidence rollback lets the tick read legacy state', async () => {
+  it.each([undefined, '0'])('strict-evidence compatibility (%s) lets the tick read legacy state', async value => {
     const root = mkdtempSync(join(tmpdir(), 'self-sync-legacy-'));
     try {
-      const env = { WE_DAEMON_STATE_DIR: join(root, 'state'), WE_DAEMON_REBUILD_STRICT_EVIDENCE: '0' };
+      const env = { WE_DAEMON_STATE_DIR: join(root, 'state'),
+        ...(value === undefined ? {} : { WE_DAEMON_REBUILD_STRICT_EVIDENCE: value }) };
       writeRebuildState(root, {}, env);
       writeFileSync(rebuildStatePath(root, env), '{}');
       const tick = vi.fn(() => 'ticked');

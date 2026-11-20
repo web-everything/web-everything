@@ -35,7 +35,7 @@ const inventory = [
 ];
 function fixture() {
   const root = mkdtempSync(join(tmpdir(), 'rebuild-evidence-')); dirs.push(root);
-  const env = { WE_DAEMON_STATE_DIR: join(root, 'state'), WE_DAEMON_OVERLAY_DIR: join(root, 'overlays') };
+  const env = { WE_DAEMON_REBUILD_STRICT_EVIDENCE: '1', WE_DAEMON_STATE_DIR: join(root, 'state'), WE_DAEMON_OVERLAY_DIR: join(root, 'overlays') };
   return { root, env };
 }
 const cases = inventory.flatMap(([reader, path, legacy]) => ['corrupt', 'EACCES', 'wrong type', 'wrong shape'].map(fault => ({ reader, path, legacy, fault })));
@@ -124,9 +124,11 @@ it('absent evidence stays empty for every strict reader', () => {
   expect(readers.pending(root, env)).toEqual([]);
 });
 
-it.each(['tick-start', undefined, 'early', 'recovery'])('strict-evidence rollback is scoped to tick-start/inline: %s', async launchedBy => {
+it.each(['tick-start', undefined, 'early', 'recovery'].flatMap(source => [undefined, '0'].map(value => [source, value])))(
+  'strict-evidence compatibility is scoped to tick-start/inline: %s setting=%s', async (launchedBy, value) => {
   const { root, env } = fixture();
-  env.WE_DAEMON_REBUILD_STRICT_EVIDENCE = '0';
+  if (value === undefined) delete env.WE_DAEMON_REBUILD_STRICT_EVIDENCE;
+  else env.WE_DAEMON_REBUILD_STRICT_EVIDENCE = value;
   writeRebuildState(root, {}, env);
   writeFileSync(rebuildStatePath(root, env), '{}'); // legacy reader accepts this historical empty shape
   const prepare = vi.spyOn(preparation, 'prepareRebuild').mockResolvedValue({

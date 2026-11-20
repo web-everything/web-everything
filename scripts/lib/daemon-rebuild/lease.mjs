@@ -162,6 +162,9 @@ export function buildLeaseIsLive(building, { env = process.env, nowMs = Date.now
  */
 export function claimBuildLease({ state, plan, root, run, env, nowMs, adoptOnly = false, startTimeOf = processStartMs, cleanupAbandoned = true }) {
   if (buildLeaseIsLive(state.building, { env, nowMs, startTimeOf })) return null;
+  // Between-tick children cannot clean up. Keep the old path reachable until a
+  // normal tick takes the lease and removes its abandoned worktree registration.
+  if (!cleanupAbandoned && state.building?.path) return null;
   if (cleanupAbandoned && state.building?.path && leaseOwnerIsGone(state.building, startTimeOf)) removeCandidate({ root, path: state.building.path, run, env });
   const token = `${process.pid}-${randomBytes(4).toString('hex')}`;
   const lease = {

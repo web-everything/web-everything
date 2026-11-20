@@ -187,7 +187,7 @@ test('corrupt job-store evidence blocks early queuing without adopting', async (
     store.list = () => ({ records: [], corrupt: ['unreadable'] });
     const r = await rebuildCloneAsJob({ root, store, launchOnly: true, env: {},
       adopt: () => { throw new Error('unexpected adopt'); } });
-    assert.equal(r.reason, 'rebuild-job-running'); assert.equal(r.unknownJobState, true);
+    assert.equal(r.reason, 'state-unreadable');
   } finally { rmSync(root, { recursive: true, force: true }); }
 });
 

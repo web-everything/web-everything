@@ -14,7 +14,10 @@ export function resolveEarlyLaunch({ entries = [], env = process.env, log = () =
     try { tool = JSON.parse(readFileSync(new URL('./daemon-rebuild-settings.json', import.meta.url), 'utf8')).earlyLaunch; } catch { tool = {}; }
   }
   const envValues = {};
-  if (env.WE_DAEMON_REBUILD_EARLY_LAUNCH !== undefined) envValues.enabled = env.WE_DAEMON_REBUILD_EARLY_LAUNCH === '1';
+  if (env.WE_DAEMON_REBUILD_EARLY_LAUNCH !== undefined) {
+    const value = env.WE_DAEMON_REBUILD_EARLY_LAUNCH;
+    envValues.enabled = value === '1' ? true : value === '0' ? false : value;
+  }
   if (env.WE_DAEMON_REBUILD_EARLY_DEBOUNCE_MS !== undefined) envValues.debounceMs = Number(env.WE_DAEMON_REBUILD_EARLY_DEBOUNCE_MS);
   const r = cascadePolicy('earlyLaunch', tool, { env, log, envValues,
     standard: { enabled: false, entries: [], debounceMs: 60_000 },
