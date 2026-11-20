@@ -441,6 +441,25 @@ describe('merge-queue exact-test extra retry after two failed_checks removals', 
     expectExtraRetry(f);
   }));
 
+  it.each(['run_started_at', 'created_at'])('refuses replacement CI that started before removal but finished after, using %s', field => exactFixture(f => {
+    lightQueue(f);
+    f.runs[890][field] = iso(removedAt - 1);
+    expect(f.guard().hold).toBe(true);
+  }));
+
+  it.each(['run_started_at', 'created_at'])('accepts replacement CI that started after removal, using %s', field => exactFixture(f => {
+    lightQueue(f);
+    f.runs[890].created_at = iso(removedAt - 600_000);
+    f.runs[890][field] = iso(removedAt + 1);
+    expectExtraRetry(f);
+  }));
+
+  it.each([0, NaN])('refuses replacement CI with a start at removal or unreadable: %s', offset => exactFixture(f => {
+    lightQueue(f);
+    f.runs[890].run_started_at = Number.isNaN(offset) ? 'unknown' : iso(removedAt + offset);
+    expect(f.guard().hold).toBe(true);
+  }));
+
   it.each([removedAt - 1, removedAt, NaN])('refuses replacement evidence completed at %s before/at removal or unknown (finding 6)', stamp => exactFixture(f => {
     lightQueue(f);
     f.runs[890].created_at = iso(removedAt - 600_000);

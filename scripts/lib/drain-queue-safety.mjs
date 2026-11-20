@@ -50,16 +50,18 @@ function fullMainEvidenceRun(main, json, completeArtifacts = null, removedAt, no
     if (page.workflow_runs.some(r => r.id !== main.id && (r.id > source.id
       || r.status !== 'completed' || r.conclusion !== 'success')))
       throw new Error('conflicting same-SHA run; wait for full main CI');
-    if (!Number.isFinite(removedAt) || !Number.isFinite(now) || !Number.isFinite(Date.parse(source.updated_at))
+    const startedAt = Date.parse(source.run_started_at ?? source.created_at);
+    if (!Number.isFinite(removedAt) || !Number.isFinite(now) || !Number.isFinite(startedAt)
+      || startedAt <= removedAt || startedAt > Date.parse(source.updated_at) || !Number.isFinite(Date.parse(source.updated_at))
       || Date.parse(source.updated_at) <= removedAt || Date.parse(source.updated_at) > now)
-      throw new Error('full CI did not complete after removal; wait for fresh full CI');
+      throw new Error('full CI did not start and complete after removal; wait for fresh full CI');
     const inventory = json(`actions/runs/${source.id}/artifacts?per_page=100`);
     if (!Array.isArray(inventory?.artifacts) || inventory.total_count !== inventory.artifacts.length || inventory.total_count > 100)
       throw new Error('incomplete full CI artifacts; operator must inspect full CI');
     if (!inventory.artifacts.some(a => typeof a?.name === 'string' && a.name.startsWith('timing-unit-'))) continue;
     if (sibling(inventory.artifacts) !== fui) throw new Error('full CI sibling differs from push record; wait for full main CI');
     const detail = json(`actions/runs/${source.id}`);
-    if (['id', 'path', 'head_sha', 'event', 'head_branch', 'status', 'conclusion', 'updated_at'].some(key => detail?.[key] !== source[key]))
+    if (['id', 'path', 'head_sha', 'event', 'head_branch', 'status', 'conclusion', 'run_started_at', 'created_at', 'updated_at'].some(key => detail?.[key] !== source[key]))
       throw new Error('unreadable full CI identity');
     return detail;
   }

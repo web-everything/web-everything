@@ -71,9 +71,16 @@ export const DEFAULT_MAIN_WORKFLOW_NAME = 'CI';
  *  already uses everywhere else in this repo (`requiredCheck = 'test'`), reused rather than re-declared. */
 export const DEFAULT_REQUIRED_CHECK = 'test';
 
-/** Latest decisive main result; cancelled and infra-only runs prove nothing. */
+// Backstops can finish behind a newer push. Only a freshly resolved current tip proves main's state;
+// missing tip evidence (including old persisted snapshots) leaves schedules ineligible.
+const isCurrentMainEvidence = run => run?.event !== 'schedule'
+  || (typeof run.currentMainTipSha === 'string' && /^[0-9a-f]{40}$/.test(run.currentMainTipSha)
+    && !/^0+$/.test(run.currentMainTipSha) && run.headSha === run.currentMainTipSha);
+
+/** Latest decisive main result; cancelled, infra-only and stale/unknown-tip scheduled runs prove nothing. */
 export function currentMainGreen(mainRuns) {
   const run = (Array.isArray(mainRuns) ? mainRuns : [])
+    .filter(isCurrentMainEvidence)
     .filter(r => r && String(r.status).toLowerCase() === 'completed' && r.infraCancelledOnly !== true)
     .filter(r => ['success', ...MAIN_RED_CONCLUSIONS].includes(String(r.conclusion).toLowerCase()))
     .sort((a, b) => Date.parse(b.updatedAt) - Date.parse(a.updatedAt))[0];
@@ -109,6 +116,7 @@ export function currentMainGreen(mainRuns) {
  */
 export function computeMainRedWindows(mainRuns) {
   const terminal = (Array.isArray(mainRuns) ? mainRuns : [])
+    .filter(isCurrentMainEvidence)
     .filter((r) => r && String(r.status).toLowerCase() === 'completed' && r.updatedAt)
     .slice()
     .sort((a, b) => Date.parse(a.updatedAt) - Date.parse(b.updatedAt));

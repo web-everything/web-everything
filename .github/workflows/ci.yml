@@ -87,6 +87,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
+          ref: ${{ github.event_name == 'schedule' && 'main' || '' }}
           fetch-depth: 50
       - name: Is this a card-only PR?
         timeout-minutes: 4
@@ -212,6 +213,7 @@ jobs:
       - name: Checkout WE
         uses: actions/checkout@v4
         with:
+          ref: ${{ github.event_name == 'schedule' && 'main' || '' }}
           path: web-everything
           fetch-depth: 50 # backlog scope guards compare the PR against origin/main
       - name: Fetch main history (blobless)
@@ -307,6 +309,7 @@ jobs:
         if: ${{ needs.changes.outputs.light != 'true' }}
         uses: actions/checkout@v4
         with:
+          ref: ${{ github.event_name == 'schedule' && 'main' || '' }}
           path: web-everything
           fetch-depth: 50 # live-git tests use the HEAD window; main's full history comes from the blobless fetch below
       - name: Fetch main history (blobless)
@@ -430,6 +433,7 @@ jobs:
           fi
       - uses: actions/checkout@v4
         with:
+          ref: ${{ github.event_name == 'schedule' && 'main' || '' }}
           path: web-everything
       - uses: actions/setup-node@v4
         with:
@@ -455,6 +459,8 @@ jobs:
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event_name == 'schedule' && 'main' || '' }}
       - uses: actions/setup-node@v4
         with:
           node-version: 22
@@ -552,6 +558,7 @@ jobs:
         if: ${{ steps.gate.outputs.run == 'true' }}
         uses: actions/checkout@v4
         with:
+          ref: ${{ github.event_name == 'schedule' && 'main' || '' }}
           path: web-everything
           fetch-depth: 50
       - name: Fetch main history (blobless)
@@ -686,6 +693,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
+          ref: ${{ github.event_name == 'schedule' && 'main' || '' }}
           fetch-depth: 50
       - name: Fetch main history (blobless)
         timeout-minutes: 4
@@ -739,6 +747,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
+          ref: ${{ github.event_name == 'schedule' && 'main' || '' }}
           # quarantine-skip proves the PR's changed files against its merge base: depth 50 plus blobless main
           # (below); quarantine-skip deepens further, or fails closed (runs everything), if the base is unprovable.
           fetch-depth: 50
@@ -853,6 +862,7 @@ jobs:
         if: ${{ needs.changes.outputs.light != 'true' }}
         uses: actions/checkout@v4
         with:
+          ref: ${{ github.event_name == 'schedule' && 'main' || '' }}
           path: web-everything
       - name: Mint FUI read token (GitHub App)
         id: fui-app-token
@@ -963,6 +973,7 @@ jobs:
       - name: Checkout WE
         uses: actions/checkout@v4
         with:
+          ref: ${{ github.event_name == 'schedule' && 'main' || '' }}
           path: web-everything
       - name: Mint FUI read token (GitHub App)
         id: fui-app-token

@@ -10,7 +10,7 @@
  */
 import { describe, it, expect } from 'vitest';
 import {
-  MAIN_RED_CONCLUSIONS, computeMainRedWindows, isWithinRedWindow, isMainCurrentlyRed,
+  MAIN_RED_CONCLUSIONS, currentMainGreen, computeMainRedWindows, isWithinRedWindow, isMainCurrentlyRed,
   classifyCiFailureAttribution, isPrCiFailureOwedRerun, planMainRedRebases,
   extractCiErrorSignatures, signatureFragments, isMainFixedSignatureOwed,
   // landing-freeze fix (2026-09-27)
@@ -47,6 +47,16 @@ const MAIN_RUNS_STILL_RED = [
 ];
 
 describe('main-red-recovery — computeMainRedWindows / isWithinRedWindow / isMainCurrentlyRed', () => {
+  it.each(['stale', 'current', 'unknown'])('only accepts a schedule on the freshly resolved main tip: %s', kind => {
+    const tip = 'b'.repeat(40);
+    const red = { ...run('2026-11-19T00:00:00Z', '2026-11-19T01:00:00Z', 'failure'), event: 'push', headSha: tip };
+    const schedule = { ...run('2026-11-18T23:00:00Z', '2026-11-19T02:00:00Z', 'success'), event: 'schedule',
+      headSha: kind === 'stale' ? 'a'.repeat(40) : tip, currentMainTipSha: kind === 'unknown' ? null : tip };
+    expect(currentMainGreen([red, schedule])?.red).toBe(kind !== 'current');
+    expect(computeMainRedWindows([red, schedule])).toEqual([{ start: red.updatedAt, end: kind === 'current' ? schedule.updatedAt : null }]);
+    expect(currentMainGreen([schedule])).toEqual(kind === 'current' ? { red: false, sha: tip, at: schedule.updatedAt } : null);
+  });
+
   it('opens a window at the completing red run, closes it at the completing green run, and ignores cancelled runs', () => {
     const windows = computeMainRedWindows(MAIN_RUNS);
     expect(windows).toEqual([

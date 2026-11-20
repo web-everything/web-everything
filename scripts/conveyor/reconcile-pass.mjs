@@ -693,11 +693,8 @@ export function durableCountsFrom(prs) {
 export function defaultReadMainRuns({
   exec = execFileSyncThrottled, repo = null, branch = 'main', workflowName = DEFAULT_MAIN_WORKFLOW_NAME, limit = 100,
 } = {}) {
-  // `headSha` (added landing-freeze fix, 2026-09-27) — the one extra field `latestCompletedMainRun` needs to
-  // name WHICH commit `main`'s own latest verdict belongs to, so `defaultReadMainLatestCheckRuns` below can read
-  // that commit's own per-check conclusions. Purely additive: `computeMainRedWindows` ignores fields it doesn't
-  // read, so every existing caller of this function sees byte-identical behaviour.
-  const argv = ['run', 'list', '--branch', branch, '--limit', String(limit), '--json', 'databaseId,conclusion,status,createdAt,updatedAt,workflowName,headSha'];
+  // Event identity is required: a backstop can complete after a newer push while testing an older SHA.
+  const argv = ['run', 'list', '--branch', branch, '--limit', String(limit), '--json', 'databaseId,conclusion,status,createdAt,updatedAt,workflowName,headSha,event'];
   if (repo) argv.push('--repo', repo);
   const out = exec('gh', argv, {
     encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], maxBuffer: 16 * 1024 * 1024,
@@ -705,7 +702,20 @@ export function defaultReadMainRuns({
   });
   if (isGhDeferred(out)) return JSON.parse(String(out));
   const parsed = JSON.parse(String(out || '[]'));
-  const runs = (Array.isArray(parsed) ? parsed : []).filter((r) => r?.workflowName === workflowName);
+  let runs = (Array.isArray(parsed) ? parsed : []).filter((r) => r?.workflowName === workflowName);
+  if (runs.some(r => r.event === 'schedule')) {
+    let currentMainTipSha = null;
+    try {
+      const ref = JSON.parse(String(exec('gh', ['api', `repos/${repo ?? '{owner}/{repo}'}/git/ref/heads/${encodeURIComponent(branch)}`], {
+        encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], maxBuffer: 1024 * 1024,
+        timeout: resolveChildTimeoutMs(), killSignal: 'SIGKILL', throttle: { maxAttempts: 1 },
+      })));
+      if (typeof ref?.object?.sha === 'string' && /^[0-9a-f]{40}$/.test(ref.object.sha)
+        && !/^0+$/.test(ref.object.sha)) currentMainTipSha = ref.object.sha;
+    } catch { /* Unknown tip: ignore backstops; push evidence remains available. */ }
+    runs = runs.filter(r => r.event !== 'schedule' || (currentMainTipSha && r.headSha === currentMainTipSha))
+      .map(r => r.event === 'schedule' ? { ...r, currentMainTipSha } : r);
+  }
   // Outage fix: a `failure` run whose only red jobs were cancelled / had no runner is NOT "main is red". Annotate it
   // (bounded: only recent completed `failure` runs, read failures leave the run counted red, the safe direction).
   let reads = 0;

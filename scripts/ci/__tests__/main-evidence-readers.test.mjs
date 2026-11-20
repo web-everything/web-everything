@@ -27,9 +27,10 @@ it('timings selects full queue/schedule runs past a skipped-success push, for la
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
 it('red-main IO includes schedule on main, and a later successful light push closes the red window', () => {
-  const red = { databaseId: 10, workflowName: 'CI', event: 'schedule', headBranch: 'main', status: 'completed', conclusion: 'failure', updatedAt: '2026-11-19T00:00:00Z' };
+  const red = { databaseId: 10, workflowName: 'CI', event: 'schedule', headBranch: 'main', headSha: 'a'.repeat(40), status: 'completed', conclusion: 'failure', updatedAt: '2026-11-19T00:00:00Z' };
   const green = { ...red, databaseId: 11, event: 'push', conclusion: 'success', updatedAt: '2026-11-19T01:00:00Z' };
   const exec = (_, args) => {
+    if (args[1] === 'repos/fixture/repo/git/ref/heads/main') return JSON.stringify({ object: { sha: red.headSha } });
     if (args[0] === 'api') return JSON.stringify({ total_count: 1, jobs: [{ name: 'test', conclusion: 'failure' }] });
     expect(args).not.toContain('--event=push'); expect(args).toContain('main'); return JSON.stringify([green, red]);
   };
@@ -37,6 +38,34 @@ it('red-main IO includes schedule on main, and a later successful light push clo
   expect(currentMainGreen([runs[1]]).red).toBe(true);
   expect(currentMainGreen(runs).red).toBe(false);
   expect(computeMainRedWindows(runs)).toEqual([{ start: red.updatedAt, end: green.updatedAt }]);
+});
+
+it.each(['stale', 'current', 'unreadable', 'malformed', 'missing head'])('schedule evidence requires a freshly readable current main tip: %s', kind => {
+  const tip = 'b'.repeat(40);
+  const red = { databaseId: 20, workflowName: 'CI', event: 'push', headSha: tip,
+    status: 'completed', conclusion: 'failure', updatedAt: '2026-11-19T01:00:00Z' };
+  const green = { ...red, databaseId: 19, event: 'schedule',
+    headSha: kind === 'current' ? tip : kind === 'missing head' ? undefined : 'a'.repeat(40),
+    updatedAt: '2026-11-19T02:00:00Z' };
+  let tipReads = 0;
+  const exec = (_, args) => {
+    if (args[0] === 'run') {
+      expect(args[args.indexOf('--json') + 1].split(',')).toContain('event');
+      return JSON.stringify([green, red]);
+    }
+    if (args[1] === 'repos/fixture/repo/git/ref/heads/main') {
+      tipReads++;
+      if (kind === 'unreadable') throw new Error('tip unavailable');
+      return JSON.stringify({ object: { sha: kind === 'malformed' ? 'unknown' : tip } });
+    }
+    return JSON.stringify({ total_count: 1, jobs: [{ name: 'test', conclusion: 'failure' }] });
+  };
+  green.conclusion = 'success';
+  const runs = defaultReadMainRuns({ exec, repo: 'fixture/repo' });
+  expect(tipReads).toBe(1);
+  expect(currentMainGreen(runs)?.red).toBe(kind !== 'current');
+  expect(computeMainRedWindows(runs)).toEqual([{ start: red.updatedAt, end: kind === 'current' ? green.updatedAt : null }]);
+  expect(currentMainGreen(runs.filter(r => r.event === 'schedule'))?.red).toBe(kind === 'current' ? false : undefined);
 });
 
 it('timing search refuses an oversized inventory with an explicit-run fallback before downloading', async () => {
