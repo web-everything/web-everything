@@ -496,6 +496,38 @@ describe('gateReadyItems: "your review" is re-checked against the live PR (#5768
     });
     const allClasses = Object.fromEntries(['live-reproduced', 'correctness-in-normal-use', 'security-reachable-today',
       'theoretical-race', 'attacker-same-user', 'coverage-or-style'].map(c => [c, 'fix-now']));
+    it.each([
+      ['missing settings file', null],
+      ['empty settings file', {}],
+      ['unset confirmedBreaks', { redTeam: {} }],
+      ['unset broken', { redTeam: { confirmedBreaks: { degraded: 'card', unconfirmed: 'advisory' } } }],
+      ['unset degraded', { redTeam: { confirmedBreaks: { broken: 'send-back', unconfirmed: 'advisory' } } }],
+    ])('readBreakPolicy rejects %s and retains the owed-send-back alarm with a card-queued record', async (_name, settings) => {
+      const dir = temp(), settingsPath = join(dir, 'red-team.json'), prefsPath = join(dir, 'prefs.json');
+      writeFileSync(prefsPath, JSON.stringify({ findingClasses: allClasses }));
+      if (settings !== null) writeFileSync(settingsPath, JSON.stringify(settings));
+      const readPolicy = () => readBreakPolicy({ settingsPath, env: { WE_PLATFORM_PREFERENCES_FILE: prefsPath } });
+      // Valid class preferences and no env override isolate the source-default guard.
+      // Missing broken must also fail closed even though degraded is explicitly card.
+      expect(readPolicy).toThrow(settings === null ? /ENOENT/ : 'confirmedBreaks is not set');
+      expect(await kind(queued('degraded', 2), readPolicy)).toBe('confirmed-break-owed-send-back');
+    });
+    it('readBreakPolicy with explicit settings and valid class preferences settles a card-queued degraded break', async () => {
+      const dir = temp(), settingsPath = join(dir, 'red-team.json'), prefsPath = join(dir, 'prefs.json');
+      writeFileSync(prefsPath, JSON.stringify({ findingClasses: allClasses }));
+      writeFileSync(settingsPath, JSON.stringify({ redTeam: { confirmedBreaks: cardPolicy } }));
+      const readPolicy = () => readBreakPolicy({ settingsPath, env: { WE_PLATFORM_PREFERENCES_FILE: prefsPath } });
+      expect(readPolicy()).toEqual({ ...cardPolicy, findingClasses: allClasses });
+      expect(await kind(queued('degraded', 2), readPolicy)).toBe('needs-you');
+    });
+    it('readBreakPolicy rejects malformed settings and retains the owed-send-back alarm', async () => {
+      const settingsPath = join(temp(), 'red-team.json');
+      writeFileSync(settingsPath, '{not json');
+      const readPolicy = () => readBreakPolicy({ settingsPath, env: {},
+        readPrefs: () => ({ prefs: { findingClasses: allClasses }, errors: [] }) });
+      expect(readPolicy).toThrow(SyntaxError);
+      expect(await kind(queued('degraded'), readPolicy)).toBe('confirmed-break-owed-send-back');
+    });
     it('readBreakPolicy returns the class policy it validated (read once, no second read)', () => {
       const dir = temp(), missing = join(dir, 'gone.json');
       const policy = readBreakPolicy({ env: { WE_PLATFORM_PREFERENCES_FILE: missing },
