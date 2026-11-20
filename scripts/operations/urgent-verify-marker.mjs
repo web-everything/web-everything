@@ -70,6 +70,14 @@ while IFS= read -r f; do [ -z "$f" ] || files+=("$f"); done <<< "$list"
 echo "unit no-coverage group: \${#files[@]} files"
 npm run test:unit -- --reporter=default --reporter=json --outputFile.json=coverage/timing-unit-\${{ matrix.shard }}.json "\${files[@]}" $(node scripts/ci/quarantine-skip.mjs) # red-main quarantine (xx7ckd6): skip args from ops/quarantine, empty unless redMainMode=quarantine
 `,
+    // Non-failing measurement step (index 3): nproc, memory.peak, wall time. Never gates a shard.
+    `
+cpu_count=$(nproc)
+memory_peak=$(cat /sys/fs/cgroup/memory.peak 2>/dev/null) || memory_peak=unavailable
+wall_seconds=$(cut -d. -f1 /proc/uptime)
+printf 'nproc: %s\\nmemory.peak: %s\\nwall time (seconds): %s\\n' "$cpu_count" "$memory_peak" "$wall_seconds" >> "$GITHUB_STEP_SUMMARY"
+printf '{"nproc":%s,"memory.peak":"%s","wall_seconds":%s}\\n' "$cpu_count" "$memory_peak" "$wall_seconds" > shard-resources.json
+`,
   ],
   'coverage-merge': [
     `
@@ -175,6 +183,9 @@ const mirroredActions = {
     { name: 'Upload shard timings', if: "${{ needs.changes.outputs.light != 'true' && (always()) }}", uses: 'actions/upload-artifact@v4', with: {
       name: 'timing-unit-${{ matrix.shard }}', path: 'web-everything/coverage/timing-unit-${{ matrix.shard }}.json', 'if-no-files-found': 'ignore',
     } },
+    { name: 'Upload shard resources', if: "${{ always() && needs.changes.outputs.light != 'true' }}", 'continue-on-error': true, uses: 'actions/upload-artifact@v4', with: {
+      name: 'shard-resources-test-${{ matrix.shard }}', path: 'web-everything/shard-resources.json', 'if-no-files-found': 'ignore',
+    } },
   ],
   'coverage-merge': [
     { name: undefined, uses: 'actions/checkout@v4', with: { path: 'web-everything' } },
@@ -205,9 +216,10 @@ function mirroredRunContext(job, text) {
     "${{ needs.changes.outputs.light == 'true' }}",
     "${{ needs.changes.outputs.light != 'true' && (matrix.shard != 10) }}",
     "${{ needs.changes.outputs.light != 'true' && (matrix.shard == 10) }}",
+    "${{ always() && needs.changes.outputs.light != 'true' }}",
   ][index]) : job === 'integration-part' && (setup || index === 1) ? fullIntegration : undefined;
   return {
-    'working-directory': directory, if: condition, shell: undefined, 'continue-on-error': undefined,
+    'working-directory': directory, if: condition, shell: undefined, 'continue-on-error': job === 'test-shard' && index === 3 ? true : undefined,
     env: job === 'changes' ? {
       EVENT_NAME: '${{ github.event_name }}', BASE_SHA: '${{ github.event.pull_request.base.sha }}',
       MG_BASE_SHA: '${{ github.event.merge_group.base_sha }}', BASE_REF: '${{ github.event.pull_request.base.ref }}',
@@ -273,7 +285,10 @@ export function ciGatePlan(workflow) {
       return Object.hasOwn(options, 'ref') || options.path !== path
         || (fui ? options.repository !== 'frontier-ui/frontierui' : Object.hasOwn(options, 'repository'));
     })) throw new Error(`unreadable-ci-gates: ${job} checkout layout; update the urgent verification mirror`);
-    if (jobs[job].defaults?.run !== undefined || jobs[job].env !== undefined || jobs[job].container !== undefined
+    const jobEnvOk = job === 'test-shard'
+      ? isDeepStrictEqual(jobs[job].env, { WE_VITEST_MAX_WORKERS: "${{ vars.WE_VITEST_MAX_WORKERS || '4' }}" })
+      : jobs[job].env === undefined;
+    if (jobs[job].defaults?.run !== undefined || !jobEnvOk || jobs[job].container !== undefined
       || jobs[job]['continue-on-error'] !== undefined)
       throw new Error(`unreadable-ci-gates: ${job} execution context; update the urgent verification mirror`);
     for (const step of steps.filter(s => 'run' in s)) {

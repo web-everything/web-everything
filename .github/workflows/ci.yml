@@ -173,6 +173,8 @@ jobs:
   # is deliberately deferred; shallow checkout brings changes to roughly 30-40 seconds.
   test-shard:
     needs: changes
+    env:
+      WE_VITEST_MAX_WORKERS: ${{ vars.WE_VITEST_MAX_WORKERS || '4' }}
     # #5027 — Arm-runner experiment switch. The repo is public, so `ubuntu-24.04-arm` is free; paid larger
     # runners were rejected on cost. `vars.WE_SHARD_RUNNER` unset (the default) = x86 `ubuntu-latest`; set it to
     # `ubuntu-24.04-arm` to trial the shards on Arm, unset it to abort — no PR needed either way. ONLY this job
@@ -315,6 +317,26 @@ jobs:
         with:
           name: timing-unit-${{ matrix.shard }}
           path: web-everything/coverage/timing-unit-${{ matrix.shard }}.json
+          if-no-files-found: ignore
+
+      - name: Measure shard resources
+        if: ${{ always() && needs.changes.outputs.light != 'true' }}
+        continue-on-error: true
+        working-directory: web-everything
+        run: |
+          cpu_count=$(nproc)
+          memory_peak=$(cat /sys/fs/cgroup/memory.peak 2>/dev/null) || memory_peak=unavailable
+          wall_seconds=$(cut -d. -f1 /proc/uptime)
+          printf 'nproc: %s\nmemory.peak: %s\nwall time (seconds): %s\n' "$cpu_count" "$memory_peak" "$wall_seconds" >> "$GITHUB_STEP_SUMMARY"
+          printf '{"nproc":%s,"memory.peak":"%s","wall_seconds":%s}\n' "$cpu_count" "$memory_peak" "$wall_seconds" > shard-resources.json
+
+      - name: Upload shard resources
+        if: ${{ always() && needs.changes.outputs.light != 'true' }}
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: shard-resources-test-${{ matrix.shard }}
+          path: web-everything/shard-resources.json
           if-no-files-found: ignore
 
   # Coverage merging and host-path checks run independently; the required test job only reads results.
@@ -638,6 +660,25 @@ jobs:
 
       - name: Soak shard ${{ matrix.shard }}/${{ strategy.job-total }}
         run: npm run test:soak:shard -- --shard=${{ matrix.shard }}/${{ strategy.job-total }} $(node scripts/ci/quarantine-skip.mjs --job="soak-shard (${{ matrix.shard }})")
+
+      - name: Measure shard resources
+        if: always()
+        continue-on-error: true
+        run: |
+          cpu_count=$(nproc)
+          memory_peak=$(cat /sys/fs/cgroup/memory.peak 2>/dev/null) || memory_peak=unavailable
+          wall_seconds=$(cut -d. -f1 /proc/uptime)
+          printf 'nproc: %s\nmemory.peak: %s\nwall time (seconds): %s\n' "$cpu_count" "$memory_peak" "$wall_seconds" >> "$GITHUB_STEP_SUMMARY"
+          printf '{"nproc":%s,"memory.peak":"%s","wall_seconds":%s}\n' "$cpu_count" "$memory_peak" "$wall_seconds" > shard-resources.json
+
+      - name: Upload shard resources
+        if: always()
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: shard-resources-soak-${{ matrix.shard }}
+          path: shard-resources.json
+          if-no-files-found: ignore
 
   # THE required `daemon-soak` check (name unchanged from before the split — see the header above for why that
   # matters). Skips green in ~10s when `daemon-soak-scope` SUCCEEDED and found no daemon code touched, same as the
