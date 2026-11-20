@@ -617,7 +617,10 @@ export async function retireRegistration({ root, ref, expectedTip, expectedEntry
       const matches = decision?.clone === root && decision.ref === load.ref && decision.sha === load.sha
         && isDeepStrictEqual(decision.registration, load.registration);
       // Only immutable hot-patch loads may use the shorter unknown clock or PR lifecycle evidence.
-      const hotPatch = validSha(load.sha) && load.ref === `hotpatch/${load.sha}`;
+      const hotPatch = validSha(load.sha) && load.ref === `hotpatch/${load.sha}`
+        && load.registration.ref === load.ref && load.registration.sha === load.sha;
+      if (typeof load.ref === 'string' && load.ref.startsWith('hotpatch/') && !hotPatch)
+        return refuse('urgent-decision-required');
       let hotNegative = false;
       let currentFailure = false;
       if (hotPatch && ['ci-unknown', 'ci-failed', 'expired', 'pr-head-moved', 'pr-closed'].includes(decision?.reason)) {
@@ -703,7 +706,9 @@ export async function retireRegistration({ root, ref, expectedTip, expectedEntry
  * otherwise `old` is restored (`replace-raced-restored`). Same lock and drop intent as retire.
  * `deps` ({contain, check, tip, afterDrop}) is a test seam.
  */
-export async function replaceRegistration({ root, ref, old, expectedSha, pr = null, by = null, reason = null, pinned, env = process.env, checkOnly = false, deps = {} }) {
+export async function replaceRegistration({ root, ref, old, expectedSha, pr = null, by = null, reason = null, pinned, env = process.env, checkOnly = false, hotPatchProvenance = false, deps = {} }) {
+  if (typeof ref === 'string' && ref.startsWith('hotpatch/') && hotPatchProvenance !== true)
+    return { ok: false, refused: 'hot-patch-provenance-required', code: 3 };
   const contain = deps.contain ?? (() => proveReplaceContainment({ root, oldRef: old, newRef: ref, expectedSha, env }));
   const conflictCheck = deps.check ?? ((existingOverlays) => stackAwareOverlayCheck({ root, ref, pr, existingOverlays, env }));
   const tip = deps.tip ?? ((r) => remoteTip({ root, ref: r, env }));
@@ -923,7 +928,7 @@ export async function withAddGuardLock(root, env, fn, hooks = {}) {
   }
 }
 
-export async function main(argv = process.argv.slice(2), deps = {}) {
+export async function main(argv = process.argv.slice(2), deps = {}, { hotPatchProvenance = false } = {}) {
   const [cmd, ...rest] = argv;
   if (!['add', 'remove', 'list', 'approve-edge', 'replace', 'retire', 'recover-drops', 'stale'].includes(cmd)) {
     fail(`expected add|remove|list|approve-edge|replace|retire|recover-drops|stale, got ${JSON.stringify(cmd ?? null)}`);
@@ -940,6 +945,16 @@ export async function main(argv = process.argv.slice(2), deps = {}) {
 
   if (cmd !== 'list' && cmd !== 'stale' && cmd !== 'recover-drops' && typeof flags.ref !== 'string') {
     return fail(`--ref=<branch> is required for ${cmd}`);
+  }
+  // Only prototype-load's validated hot-patch path supplies this in-process option.
+  // Never derive it from parsed flags or the environment, including for --check.
+  if (['add', 'replace'].includes(cmd) && flags.ref.startsWith('hotpatch/') && hotPatchProvenance !== true) {
+    const refused = 'hot-patch-provenance-required';
+    process.stderr.write(`daemon-overlay: REFUSED ${refused}; use prototype-load's hot-patch path.\n`);
+    if (flags.json) process.stdout.write(`${JSON.stringify({ registered: false, replaced: false, refused,
+      check: { ok: false, reason: refused }, wouldRegister: false, wouldReplace: false })}\n`);
+    process.exitCode = 3;
+    return;
   }
   if (cmd === 'approve-edge' && typeof flags.sha !== 'string') {
     return fail('--sha=<full 40-hex tip of origin/edge/<ref>> is required for approve-edge');
@@ -1143,6 +1158,7 @@ export async function main(argv = process.argv.slice(2), deps = {}) {
     }
     const r = await replaceRegistration({
       root, ref: flags.ref, old, expectedSha: flags['expected-sha'], pr, by, reason, pinned, env, checkOnly: !!flags.check,
+      hotPatchProvenance,
     });
     if (r.code) process.exitCode = r.code;
     if (!asJson && !r.ok) {

@@ -14,7 +14,7 @@ import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, readdirSync, exist
 import { tmpdir } from 'node:os';
 import { join, dirname, resolve } from 'node:path';
 import { spawnSync } from 'node:child_process';
-import { fileURLToPath } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 import { withAddGuardLock, stackAwareOverlayCheck, findStackBases } from '../daemon-overlay.mjs';
 import { overlayFilePath } from '../lib/daemon-overlays.mjs';
 
@@ -99,6 +99,21 @@ function overlayStateFile(overlayDir, cloneDir) {
 }
 
 describe('daemon-overlay.mjs add — expected SHA admission', () => {
+  it.each(['cli', 'cli-spoof', 'in-process', 'trusted'])('hot-patch add requires in-process provenance: %s', mode => {
+    const f = makeFixture();
+    const sha = gitOk(f.cloneDir, ['rev-parse', 'HEAD']).trim(), ref = `hotpatch/${sha}`;
+    gitOk(f.cloneDir, ['push', '-q', 'origin', `HEAD:refs/heads/${ref}`]);
+    const args = ['add', `--clone=${f.cloneDir}`, `--ref=${ref}`, `--expected-sha=${sha}`, '--pr=42', '--json'];
+    const env = { ...f.env, WE_HOT_PATCH_PROVENANCE: 'true' };
+    const r = mode.startsWith('cli') ? runCli([...args, ...(mode === 'cli-spoof' ? ['--hotPatchProvenance=true', '--hot-patch-provenance=true'] : [])], env)
+      : spawnSync(process.execPath, ['--input-type=module', '--eval',
+        `const { main } = await import(${JSON.stringify(pathToFileURL(CLI).href)}); await main(process.argv.slice(1), {}, { hotPatchProvenance: ${mode === 'trusted'} });`,
+        ...args], { env, encoding: 'utf8', timeout: 30_000 });
+    expect(r.status, r.stderr).toBe(mode === 'trusted' ? 0 : 3);
+    if (mode !== 'trusted') expect(r.stderr).toContain('hot-patch-provenance-required');
+    expect(overlayStateFile(f.overlayDir, f.cloneDir)?.overlays.map(row => row.ref) ?? []).toEqual(mode === 'trusted' ? [ref] : []);
+  });
+
   it.each([false, true])('refuses an advanced branch before registration (check: %s)', (check) => {
     const f = makeFixture();
     const ref = 'lane/sha-bound';

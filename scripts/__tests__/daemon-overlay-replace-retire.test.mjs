@@ -84,6 +84,22 @@ function fixture() {
 }
 
 describe('daemon-overlay.mjs replace', () => {
+  it.each(['cli', 'in-process'])('refuses a hot-patch replacement without provenance: %s', async mode => {
+    const f = fixture();
+    const sha = f.push('lane/old', 'patch.txt', 'patch\n'), ref = `hotpatch/${sha}`;
+    gitOk(f.author, ['push', '-q', 'origin', `HEAD:refs/heads/${ref}`]);
+    addOverlay(f.clone, { ref: 'lane/old' }, { env: f.env });
+    if (mode === 'cli') {
+      const result = f.run(['replace', `--ref=${ref}`, '--replaces=lane/old', `--expected-sha=${sha}`, '--pr=42']);
+      expect(result.status).toBe(3);
+      expect(result.stderr).toContain('hot-patch-provenance-required');
+    } else {
+      expect(await replaceRegistration({ root: f.clone, ref, old: 'lane/old', expectedSha: sha, env: f.env }))
+        .toMatchObject({ ok: false, refused: 'hot-patch-provenance-required' });
+    }
+    expect(f.list()).toEqual(['lane/old']);
+  });
+
   it('refuses replacing a hot patch with a descendant before excluding the old registration', async () => {
     const f = fixture(), oldTip = f.push('lane/patch', 'patch.txt', 'patch\n');
     const old = `hotpatch/${oldTip}`;
@@ -785,6 +801,23 @@ describe('hot-patch retirement decision authorization', () => {
   const boundChecks = (conclusion = 'success') => ({ total_count: 1, check_runs: [{ id: 91, name: 'test', head_sha: tip,
     app: { id: 15368 }, check_suite: { id: 7 }, status: 'completed', conclusion }],
     workflows: { total_count: 1, workflow_runs: [{ check_suite_id: 7, head_sha: tip, path: '.github/workflows/ci.yml' }] } });
+  it.each([...reasons, ['ci-failed', 30 * 60_000, null]].flatMap(([reason, age, pr]) => ['ref', 'sha'].map(mismatch => [reason, mismatch, age, pr])))
+    ('refuses %s when the load and registration %s differ', async (reason, mismatch, age, pr) => {
+      const { f, args, decision, ref } = retirement(reason, age, pr, mismatch === 'ref');
+      const load = args.deps.readUrgentLoads()[0];
+      load.ref = `hotpatch/${tip}`;
+      decision.ref = load.ref;
+      if (mismatch === 'sha') {
+        load.registration.sha = other;
+        args.expectedTip = other;
+        args.deps.tip = () => other;
+      }
+      if (reason === 'pr-head-moved') args.deps.readUrgentPr = () => ({ ...pr, head: { sha: 'c'.repeat(40) } });
+      expect(await retireRegistration(args)).toMatchObject({ retired: false, refused: 'urgent-decision-required' });
+      expect(f.list()).toEqual([ref]);
+      expect(f.events()).toEqual([]);
+      expect(readPendingDrops(f.clone, f.env)).toEqual([]);
+    });
   it.each(['required-reader', 'pr-reader'])('unloads ci-unknown with bound checks but failed %s', async kind => {
     const { f, args } = retirement('ci-unknown', 31 * 60_000, null);
     args.deps.readUrgentChecks = () => boundChecks();

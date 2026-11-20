@@ -93,7 +93,13 @@ function fixture(options = {}) {
   };
   const fail = (status, stdout = '', stderr = 'failed') => { throw Object.assign(new Error(stderr), { status, stdout, stderr }); };
   const exec = (cmd, args, config) => {
-    calls.push({ cmd, args, config });
+    const invocationArgs = args;
+    if (cmd === 'node' && args[0] === '--input-type=module') {
+      expect(args[1]).toBe('--eval');
+      expect(args[2]).toContain('await main(process.argv.slice(1), {}, { hotPatchProvenance: true })');
+      args = [resolve(dirname(fileURLToPath(import.meta.url)), '../../..', settings.loaderCli), ...args.slice(3)];
+    }
+    calls.push({ cmd, args, config, invocationArgs });
     if (options.combinedIO?.handles(cmd, args)) return options.combinedIO.exec(cmd, args, config);
     expect(args.join(' ')).not.toMatch(/--allow-conflict|--force|--allow-no-pr/);
     expect(Object.keys(config.env).sort()).toEqual(['HOME', 'PATH', 'USER', ...Object.keys(options.gitEnv || {}), ...(env.WE_DAEMON_OVERLAY_DIR ? ['WE_DAEMON_OVERLAY_DIR'] : []), ...(env.WE_OVERLAY_NO_PR?.trim() === 'refuse' ? ['WE_OVERLAY_NO_PR'] : [])].sort());
@@ -3710,6 +3716,17 @@ describe('hot-patch urgent admission (R1100)', () => {
     expect(f.reads.some(p => p.endsWith('/urgent-full-green.jsonl'))).toBe(false);
     expect(f.gh.some(args => args.includes(`repos/${repo}/commits/${SHA}/pulls`))).toBe(true);
     expect(f.gh.some(args => args.includes(`repos/${repo}/rulesets/27726920`))).toBe(true);
+  });
+  it('passes hot-patch provenance through an in-process module invocation for check and registration', async () => {
+    const f = hotFixture();
+    expect(await f.run()).toMatchObject({ ok: true, registered: true });
+    const admissions = f.calls.filter(c => c.cmd === 'node' && c.args[1] === 'add');
+    expect(admissions).toHaveLength(2);
+    for (const call of admissions) {
+      expect(call.invocationArgs?.slice(0, 2)).toEqual(['--input-type=module', '--eval']);
+      expect(call.invocationArgs?.[2]).toContain('hotPatchProvenance: true');
+      expect(call.args.some(arg => /provenance/i.test(arg))).toBe(false);
+    }
   });
   it.each(['neutral', 'skipped', 'cancelled', 'stale'])('refuses queued test masking completed %s in any suite', async conclusion => {
     const f = hotFixture({ rows: [

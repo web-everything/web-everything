@@ -30,7 +30,7 @@ import { randomUUID } from 'node:crypto';
 import nodeFs from 'node:fs';
 import { homedir, tmpdir } from 'node:os';
 import { basename, dirname, resolve, relative, join } from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 import { readPlatformPreferences, resolveCascade, formatCascadeSourcesLine } from '../lib/policy-cascade.mjs';
 import { spawnToCompletion } from '../lib/spawn-to-completion.mjs';
 import { retireRegistration, proveOverlayWithdrawal } from '../daemon-overlay.mjs';
@@ -303,7 +303,16 @@ export function createPrototypeLoader({ exec, fs, now, sleep, env, settings, com
         return difference.code === 0 && difference.stdout === '';
       });
     };
-    const loader = (action, clone, ref, extra = []) => execute('node', [resolve(repo, config.loaderCli), action, `--clone=${clone}`, ...(ref ? [`--ref=${ref}`] : []), ...extra, ...(action === 'remove' ? [] : ['--json'])], repo);
+    const loader = (action, clone, ref, extra = []) => {
+      const args = [action, `--clone=${clone}`, ...(ref ? [`--ref=${ref}`] : []), ...extra, ...(action === 'remove' ? [] : ['--json'])];
+      if (input.urgent === true && validSha(input.sha) && input.branch === `hotpatch/${input.sha}`
+        && ref === input.branch && ['add', 'replace'].includes(action)) {
+        // Provenance exists only in the imported function's options. No CLI flag or environment bypass.
+        const source = `const { main } = await import(${JSON.stringify(pathToFileURL(resolve(repo, config.loaderCli)).href)}); await main(process.argv.slice(1), {}, { hotPatchProvenance: true });`;
+        return execute('node', ['--input-type=module', '--eval', source, ...args], repo);
+      }
+      return execute('node', [resolve(repo, config.loaderCli), ...args], repo);
+    };
     const lastJson = (r) => { try { return JSON.parse(r.stdout.trim().split(/\r?\n/).at(-1)); } catch { return null; } };
     // A replace check proves containment and checks the new ref against the list without the replaced one.
     const replaceCheck = (clone, ref, expectedSha, old) => {
