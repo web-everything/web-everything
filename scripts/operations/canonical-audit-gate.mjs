@@ -6,7 +6,7 @@ import { canonicalAuditEvidence, validSha } from './prototype-load.mjs';
 import { loadRuledWeakened } from './prototype-load-io.mjs';
 import { readPlatformPreferences } from '../lib/policy-cascade.mjs';
 import { readAuditSettings, resolveAuditRecordPath } from './codex-audit-io.mjs';
-import { netDiffFingerprint } from '../lib/net-diff-fingerprint.mjs';
+import { netDiffFingerprint, carriesAcross } from '../lib/net-diff-fingerprint.mjs';
 import { findAudit, QUESTION_HASH } from './codex-audit.mjs';
 
 // The shared evaluator skips unusable records. At admission, corrupt evidence must
@@ -91,19 +91,32 @@ export function checkCanonicalAuditForOpen({ repo = process.cwd(), ref, sha, env
       return fp;
     } catch (e) { throw Object.assign(new Error(`live diff fingerprint unavailable (${String(e?.message || e).slice(0, 120)})`), { fingerprintLookup: true }); }
   });
+  // Unknown means no carry: any git failure, a non-merge head, or an unrelated audited head refuses.
+  const mergesIn = (auditedHead) => {
+    try {
+      if (!validSha(auditedHead) || auditedHead.toLowerCase() === fullSha) return false;
+      if (git('rev-list', '--parents', '-n', '1', fullSha).split(/\s+/).filter(Boolean).length < 3) return false;
+      git('merge-base', '--is-ancestor', auditedHead.toLowerCase(), fullSha);
+      return true;
+    } catch { return false; }
+  };
   let evidence;
   try {
     const fp = liveFingerprint(records);
     evidence = canonicalAuditEvidence(records, fullSha, covers, fp);
     if (!evidence.ok && evidence.reason === 'weakened') {
       for (const entry of config.ruledWeakened) {
-        if (entry.ref !== ref || !validSha(entry.sha) || entry.sha.toLowerCase() !== fullSha
+        // A waiver for the audited head H1 also covers a merge-from-main head with the same net-diff fingerprint.
+        const entrySha = validSha(entry.sha) ? entry.sha.toLowerCase() : null;
+        const carriedFp = entrySha && entrySha !== fullSha && mergesIn(entrySha)
+          ? records.find(r => typeof r.head === 'string' && r.head.toLowerCase() === entrySha && carriesAcross(r.fingerprint, fp))?.fingerprint : null;
+        if (entry.ref !== ref || !entrySha || (entrySha !== fullSha && !carriedFp)
           || !/^R\d+(?:\+R\d+)*$/.test(entry.ruling) || !Array.isArray(entry.findings)
           || !entry.findings.length || !entry.findings.every(f => typeof f === 'string' && f.trim())) continue;
         const waived = canonicalAuditEvidence(records, fullSha, covers, fp, { ruledWeakened: {
-          ruledWeakened: { ruling: entry.ruling, findings: entry.findings }, record: { sha: fullSha, fingerprint: null },
+          ruledWeakened: { ruling: entry.ruling, findings: entry.findings }, record: { sha: entrySha, fingerprint: carriedFp || null },
         } });
-        if (waived.ok) { evidence = waived; break; }
+        if (waived.ok && (waived.record?.head === fullSha || mergesIn(waived.record?.head))) { evidence = waived; break; }
       }
     }
   } catch (e) {
@@ -113,6 +126,9 @@ export function checkCanonicalAuditForOpen({ repo = process.cwd(), ref, sha, env
   }
   // Evaluate every head's veto first, then require this head's own passing evidence to open.
   if (evidence.ok && evidence.record?.head === fullSha) return { ok: true, reason: null, message: '', record: evidence.record, sha: fullSha };
+  // Merge-from-main carry (R503 reuse): evidence.ok for another head already means its stored net-diff fingerprint
+  // equals the live one. It admits only when the live head is a merge commit that contains that audited head.
+  if (evidence.ok && mergesIn(evidence.record?.head)) return { ok: true, reason: null, message: '', record: evidence.record, sha: fullSha };
   return evidence.reason === 'weakened'
     ? refuse('canonical-audit-weakened', `latest canonical audit for ${fullSha} is WEAKENED and no ruledWeakened waiver matches ref+sha+findings`)
     : refuse('canonical-audit-missing', `no canonical codex-audit record for ${fullSha} with coverage of origin/main`);
