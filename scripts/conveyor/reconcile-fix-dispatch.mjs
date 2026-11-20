@@ -1,3 +1,4 @@
+import { runCooperativeSteps } from '../lib/cooperative-steps.mjs';
 import { renderNoPromptCommandRules, assertBriefTaskContent } from '../lib/no-prompt-command-rules.mjs';
 import { safeAdoptYield } from '../lib/daemon-rebuild/adopt-yield.mjs';
 import { admitMqFailureRoute } from './mq-failure-intake.mjs';
@@ -1833,7 +1834,11 @@ export function classifyEnvFaultRefusals(refusals) {
  *   for PRs the plan DID offer. Handing up `reconciled.refusals` itself is what lets the daemon's own onTick
  *   print the reconcile layer's real reason instead of discarding it to a count.
  */
-export function runReconcileFixDispatch({
+export function runReconcileFixDispatch(options = {}) {
+  return runCooperativeSteps(runReconcileFixDispatchSteps(options));
+}
+
+function* runReconcileFixDispatchSteps({
   shadowDeps,
   // A synchronous executor keeps this pass's existing return contract. Tests may inject hermetic IO.
   refreshMqFailure = refreshMqFailureHeadSync,
@@ -1913,7 +1918,7 @@ export function runReconcileFixDispatch({
   // The published red-main priority record, for an idle restack row the planner never built (hermetic under a test runner).
   readMainRedPriorityRecord = () => readMainRedPriority(),
   now = Date.now(),
-  deadlineAt, cursor, shouldYield,
+  deadlineAt, cursor, shouldYield, maybeCiHealSlice,
   clock = typeof now === 'function' ? now : Date.now,
   // One line per step (name, optional pr, ms, startedAt): shows which sub-step makes a slow fix phase. Never fails a step.
   stepNow = Date.now, stepLog = (line) => console.error(line),
@@ -2177,6 +2182,7 @@ export function runReconcileFixDispatch({
   console.error(`reconcile-fix-dispatch: fix.conflictFixExemptPerPass=${exemptCap} (source ${fixSettings.sources?.conflictFixExemptPerPass ?? 'invalid'})`);
   console.error(`reconcile-fix-dispatch: fix.conflictFixesPerPass=${conflictCap} (source ${fixSettings.sources?.conflictFixesPerPass ?? 'invalid'})`);
   for (const entry of planned) {
+    yield maybeCiHealSlice?.();
     if (handled > 0) yieldedForAdoption ||= safeAdoptYield(shouldYield);
     const conflict = entry.isConflict === true && !entry.restack;
     const mechanical = conflict && entry.conflictFixMechanical === true;

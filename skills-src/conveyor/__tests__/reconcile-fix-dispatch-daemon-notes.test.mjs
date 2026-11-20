@@ -123,7 +123,7 @@ describe('runTickAllRepos — now runs FIVE halves, notes included (#4191)', () 
       notes: [{ kind: 'ci-heal-exhausted', prNumber: 10, attempts: 3, cap: 3, text: 'exhausted' }],
       prsByNumber: new Map([[10, { number: 10, comments: [] }]]),
     });
-    const out = await runTickAllRepos({
+    const out = await runTickAllRepos({ fenceOk: () => true,
       repos: ['repo-a'], fixTick: noopFixTick, ciHealTick: noopCiHealTick, hungCiTick: noopHungCiTick,
       mainRedRebaseTick: noopMainRedRebaseTick, missingRunTick: noopMissingRunTick, notesTick, notesDryRun: true,
     });
@@ -133,7 +133,7 @@ describe('runTickAllRepos — now runs FIVE halves, notes included (#4191)', () 
 
   it('a notes-side failure for one repo does not skip that SAME repo\'s other halves', async () => {
     const notesTick = ({ repo }) => { if (repo === 'repo-a') throw new Error('notes broke'); return { notes: [], prsByNumber: new Map() }; };
-    const out = await runTickAllRepos({
+    const out = await runTickAllRepos({ fenceOk: () => true,
       repos: ['repo-a'], fixTick: noopFixTick, ciHealTick: noopCiHealTick, hungCiTick: noopHungCiTick,
       mainRedRebaseTick: noopMainRedRebaseTick, missingRunTick: noopMissingRunTick, notesTick, notesDryRun: true,
     });

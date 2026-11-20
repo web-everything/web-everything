@@ -67,7 +67,7 @@ describe('R242 fixDispatch.skipEmptySteps policy cascade', () => {
 
 // These historical fixtures exercise other daemon halves with R123 explicitly disabled.
 // stand-down-auto-proceed-daemon.test.mjs exercises the production policy defaults and writer.
-const runTickAllRepos = options => realRunTickAllRepos({ allowStandDownAutoProceed: false, ...options });
+const runTickAllRepos = options => realRunTickAllRepos({ allowStandDownAutoProceed: false, fenceOk: () => true, ...options });
 
 // #3383 bug 1 — wired into withSelfSync's `hasStaleRefusal` option in main(); tested here in isolation
 // (pure, no IO) against the exact shape `runReconcileFixDispatchAllRepos` returns.
@@ -469,14 +469,13 @@ describe('runTickAllRepos — R242 shared snapshot and empty-work skips', () => 
     for (const [step, tickName] of Object.entries(steps)) {
       expect(opts[tickName]).toHaveBeenCalledTimes(1);
       expect(opts[tickName]).toHaveBeenCalledWith(step === 'fix'
-        ? { repo: 'repo-a', allowStandDownAutoProceed: false, cursor: undefined, deadlineAt: expect.any(Number), now: expect.any(Function) }
+        ? { repo: 'repo-a', allowStandDownAutoProceed: false, cursor: undefined, deadlineAt: expect.any(Number), now: expect.any(Function), maybeCiHealSlice: expect.any(Function) }
         : step === 'main-red-rebase'
           // The daemon wires a per-repo file-backed fairness ledger into the main-red rebase sweep only.
-          ? { repo: 'repo-a', apply: true, applyLedger: { read: expect.any(Function), write: expect.any(Function) },
-            cursor: undefined, deadlineAt: expect.any(Number), now: expect.any(Function), applyBudgetMs: expect.any(Number) }
+          ? { repo: 'repo-a', apply: true, applyLedger: { read: expect.any(Function), write: expect.any(Function) }, cursor: undefined, deadlineAt: expect.any(Number), now: expect.any(Function), applyBudgetMs: expect.any(Number), maybeCiHealSlice: expect.any(Function) }
           : ['hung-ci', 'missing-run'].includes(step)
-            ? { repo: 'repo-a', apply: true } : ['ci-heal', 'promote-draft', 'notes'].includes(step)
-              ? { repo: 'repo-a', cursor: undefined, deadlineAt: expect.any(Number), now: expect.any(Function) } : { repo: 'repo-a' });
+            ? { repo: 'repo-a', apply: true, maybeCiHealSlice: expect.any(Function) } : ['ci-heal', 'promote-draft', 'notes'].includes(step)
+              ? { repo: 'repo-a', cursor: undefined, deadlineAt: expect.any(Number), now: expect.any(Function), ...(step === 'promote-draft' ? { maybeCiHealSlice: expect.any(Function) } : {}) } : { repo: 'repo-a' });
       expect(result.phaseMs[step]).toBeGreaterThan(0);
     }
     expect(readPrs).toHaveBeenCalledTimes(1);
@@ -643,14 +642,13 @@ describe('runTickAllRepos — R242 shared snapshot and empty-work skips', () => 
     for (const [step, tickName] of Object.entries(steps)) {
       expect(opts[tickName]).toHaveBeenCalledTimes(1);
       expect(opts[tickName]).toHaveBeenCalledWith(step === 'fix'
-        ? { repo: 'repo-a', allowStandDownAutoProceed: false, cursor: undefined, deadlineAt: expect.any(Number), now: expect.any(Function) }
+        ? { repo: 'repo-a', allowStandDownAutoProceed: false, cursor: undefined, deadlineAt: expect.any(Number), now: expect.any(Function), maybeCiHealSlice: expect.any(Function) }
         : step === 'main-red-rebase'
           // The daemon wires a per-repo file-backed fairness ledger into the main-red rebase sweep only.
-          ? { repo: 'repo-a', apply: true, applyLedger: { read: expect.any(Function), write: expect.any(Function) },
-            cursor: undefined, deadlineAt: expect.any(Number), now: expect.any(Function), applyBudgetMs: expect.any(Number) }
+          ? { repo: 'repo-a', apply: true, applyLedger: { read: expect.any(Function), write: expect.any(Function) }, cursor: undefined, deadlineAt: expect.any(Number), now: expect.any(Function), applyBudgetMs: expect.any(Number), maybeCiHealSlice: expect.any(Function) }
           : ['hung-ci', 'missing-run'].includes(step)
-            ? { repo: 'repo-a', apply: true } : ['ci-heal', 'promote-draft', 'notes'].includes(step)
-              ? { repo: 'repo-a', cursor: undefined, deadlineAt: expect.any(Number), now: expect.any(Function) } : { repo: 'repo-a' });
+            ? { repo: 'repo-a', apply: true, maybeCiHealSlice: expect.any(Function) } : ['ci-heal', 'promote-draft', 'notes'].includes(step)
+              ? { repo: 'repo-a', cursor: undefined, deadlineAt: expect.any(Number), now: expect.any(Function), ...(step === 'promote-draft' ? { maybeCiHealSlice: expect.any(Function) } : {}) } : { repo: 'repo-a' });
     }
     expect(result.skippedSteps ?? []).toEqual([]);
     expect(skipLines(log)).toEqual([]);
@@ -751,14 +749,13 @@ describe('runTickAllRepos — R242 shared snapshot and empty-work skips', () => 
       const options = opts[tickName].mock.calls[0][0];
       expect(opts[tickName]).toHaveBeenCalledTimes(1);
       expect(options).toEqual(step === 'fix'
-        ? { repo: 'repo-a', allowStandDownAutoProceed: false, cursor: undefined, deadlineAt: expect.any(Number), now: expect.any(Function) }
+        ? { repo: 'repo-a', allowStandDownAutoProceed: false, cursor: undefined, deadlineAt: expect.any(Number), now: expect.any(Function), maybeCiHealSlice: expect.any(Function) }
         : step === 'main-red-rebase'
           // The daemon wires a per-repo file-backed fairness ledger into the main-red rebase sweep only.
-          ? { repo: 'repo-a', apply: true, applyLedger: { read: expect.any(Function), write: expect.any(Function) },
-            cursor: undefined, deadlineAt: expect.any(Number), now: expect.any(Function), applyBudgetMs: expect.any(Number) }
+          ? { repo: 'repo-a', apply: true, applyLedger: { read: expect.any(Function), write: expect.any(Function) }, cursor: undefined, deadlineAt: expect.any(Number), now: expect.any(Function), applyBudgetMs: expect.any(Number), maybeCiHealSlice: expect.any(Function) }
           : ['hung-ci', 'missing-run'].includes(step)
-            ? { repo: 'repo-a', apply: true } : ['ci-heal', 'promote-draft', 'notes'].includes(step)
-              ? { repo: 'repo-a', cursor: undefined, deadlineAt: expect.any(Number), now: expect.any(Function) } : { repo: 'repo-a' });
+            ? { repo: 'repo-a', apply: true, maybeCiHealSlice: expect.any(Function) } : ['ci-heal', 'promote-draft', 'notes'].includes(step)
+              ? { repo: 'repo-a', cursor: undefined, deadlineAt: expect.any(Number), now: expect.any(Function), ...(step === 'promote-draft' ? { maybeCiHealSlice: expect.any(Function) } : {}) } : { repo: 'repo-a' });
     }
   });
 
@@ -883,7 +880,7 @@ describe('runTickAllRepos — the daemon tick now runs BOTH fix and ci-heal disp
       repos: ['repo-a', 'repo-b'], fixTick, ciHealTick, hungCiTick: noopHungCiTick, mainRedRebaseTick: noopMainRedRebaseTick, missingRunTick: noopMissingRunTick, notesTick: noopNotesTick, promoteDraftTick: noopPromoteDraftTick,
     });
     expect(ciHealTick).toHaveBeenCalledWith({ repo: 'repo-a', cursor: undefined, deadlineAt: expect.any(Number), now: expect.any(Function) }); // ci-heal still ran for repo-a despite fix's own failure there
-    expect(fixTick).toHaveBeenCalledWith({ repo: 'repo-b', allowStandDownAutoProceed: false, cursor: undefined, deadlineAt: expect.any(Number), now: expect.any(Function) }); // fix still ran for repo-b despite ci-heal's own failure there
+    expect(fixTick).toHaveBeenCalledWith({ repo: 'repo-b', allowStandDownAutoProceed: false, cursor: undefined, deadlineAt: expect.any(Number), now: expect.any(Function), maybeCiHealSlice: expect.any(Function) }); // fix still ran for repo-b despite ci-heal's own failure there
     expect(out.refusals).toEqual(expect.arrayContaining([
       { repo: 'repo-a', prNumber: null, kind: 'tick-failed', why: 'fix broke' },
       { repo: 'repo-b', prNumber: null, kind: 'tick-failed', why: 'ci-heal broke' },
@@ -1309,7 +1306,7 @@ describe('runTickAllRepos — now runs THREE halves: fix, ci-heal, and hung-ci-r
     const out = await runTickAllRepos({
       repos: ['repo-a', 'repo-b'], fixTick, ciHealTick, hungCiTick, mainRedRebaseTick: noopMainRedRebaseTick, missingRunTick: noopMissingRunTick, notesTick: noopNotesTick, promoteDraftTick: noopPromoteDraftTick,
     });
-    expect(fixTick).toHaveBeenCalledWith({ repo: 'repo-a', allowStandDownAutoProceed: false, cursor: undefined, deadlineAt: expect.any(Number), now: expect.any(Function) });
+    expect(fixTick).toHaveBeenCalledWith({ repo: 'repo-a', allowStandDownAutoProceed: false, cursor: undefined, deadlineAt: expect.any(Number), now: expect.any(Function), maybeCiHealSlice: expect.any(Function) });
     expect(ciHealTick).toHaveBeenCalledWith({ repo: 'repo-a', cursor: undefined, deadlineAt: expect.any(Number), now: expect.any(Function) });
     expect(out.refusals).toEqual(expect.arrayContaining([{ repo: 'repo-a', prNumber: null, kind: 'tick-failed', why: 'hung-ci broke' }]));
   });
@@ -1445,7 +1442,7 @@ describe('runTickAllRepos — now runs FOUR halves: fix, ci-heal, hung-ci-recove
       repos: ['repo-a', 'repo-b'], fixTick, ciHealTick, hungCiTick: noopHungCiTick, mainRedRebaseTick,
       missingRunTick: noopMissingRunTick, notesTick: noopNotesTick, promoteDraftTick: noopPromoteDraftTick,
     });
-    expect(fixTick).toHaveBeenCalledWith({ repo: 'repo-a', allowStandDownAutoProceed: false, cursor: undefined, deadlineAt: expect.any(Number), now: expect.any(Function) });
+    expect(fixTick).toHaveBeenCalledWith({ repo: 'repo-a', allowStandDownAutoProceed: false, cursor: undefined, deadlineAt: expect.any(Number), now: expect.any(Function), maybeCiHealSlice: expect.any(Function) });
     expect(ciHealTick).toHaveBeenCalledWith({ repo: 'repo-a', cursor: undefined, deadlineAt: expect.any(Number), now: expect.any(Function) });
     expect(out.refusals).toEqual(expect.arrayContaining([{ repo: 'repo-a', prNumber: null, kind: 'tick-failed', why: 'rebase broke' }]));
   });
@@ -1559,7 +1556,7 @@ describe('runTickAllRepos — now runs SIX halves, missing-run-recovery included
       repos: ['repo-a', 'repo-b'], fixTick, ciHealTick, hungCiTick: noopHungCiTick,
       mainRedRebaseTick: noopMainRedRebaseTick, missingRunTick, notesTick: noopNotesTick, promoteDraftTick: noopPromoteDraftTick,
     });
-    expect(fixTick).toHaveBeenCalledWith({ repo: 'repo-a', allowStandDownAutoProceed: false, cursor: undefined, deadlineAt: expect.any(Number), now: expect.any(Function) });
+    expect(fixTick).toHaveBeenCalledWith({ repo: 'repo-a', allowStandDownAutoProceed: false, cursor: undefined, deadlineAt: expect.any(Number), now: expect.any(Function), maybeCiHealSlice: expect.any(Function) });
     expect(ciHealTick).toHaveBeenCalledWith({ repo: 'repo-a', cursor: undefined, deadlineAt: expect.any(Number), now: expect.any(Function) });
     expect(out.refusals).toEqual(expect.arrayContaining([{ repo: 'repo-a', prNumber: null, kind: 'tick-failed', why: 'trigger broke' }]));
   });
@@ -1660,7 +1657,7 @@ describe('runTickAllRepos — draft-first PRs: the promote-draft half rides THIS
       mainRedRebaseTick: noopMainRedRebaseTick, missingRunTick: noopMissingRunTick, notesTick: noopNotesTick,
       promoteDraftTick,
     });
-    expect(fixTick).toHaveBeenCalledWith({ repo: 'repo-a', allowStandDownAutoProceed: false, cursor: undefined, deadlineAt: expect.any(Number), now: expect.any(Function) });
+    expect(fixTick).toHaveBeenCalledWith({ repo: 'repo-a', allowStandDownAutoProceed: false, cursor: undefined, deadlineAt: expect.any(Number), now: expect.any(Function), maybeCiHealSlice: expect.any(Function) });
     expect(out.dispatched).toEqual(expect.arrayContaining([{ pr: 1, repo: 'repo-a' }]));
     expect(out.refusals).toEqual(expect.arrayContaining([{ repo: 'repo-a', prNumber: null, kind: 'tick-failed', why: 'promote-draft half: promote broke' }]));
   });
@@ -2155,7 +2152,7 @@ describe('runTickAllRepos — one reconcile plan per repo per pass', () => {
         { kind: 'promote-draft', prNumber: 8, headRefOid: 'def', baseRefName: 'main' }] });
     });
     return { planner, dispatch, promote, checkStaleness, timeoutHold, readHeadCheckState, live,
-      options: { repos: ['we'], fixSettings: { skipEmptySteps: false, standDownAutoProceed: false },
+      options: { fenceOk: () => true, repos: ['we'], fixSettings: { skipEmptySteps: false, standDownAutoProceed: false },
         authGateOverride: () => ({ paused: false, reason: null }), notesDryRun: true,
         now: () => elapsed,
         readPlanFingerprint: () => { elapsed += 20; return new Map([[7, 'a'], [8, 'a']]); },

@@ -2,7 +2,7 @@ import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
-import { Worker } from 'node:worker_threads';
+import { fork } from 'node:child_process';
 import { withLedgerAppendLock } from '../../lib/ledger-append-lock.mjs';
 import { afterEach, expect, it } from 'vitest';
 import { readUnsupported, recordUnsupported } from '../unsupported-repo.mjs';
@@ -47,22 +47,29 @@ it('holds the shared writer lock throughout read-modify-write', () => {
 it.each([false, true])('concurrent writers preserve durable records across repositories and action scopes (shared repo=%s)', async sameRepo => {
   const dir = mkdtempSync(join(tmpdir(), 'unsupported-concurrent-')); dirs.push(dir);
   const path = join(dir, 'rows.json');
-  const barrier = new SharedArrayBuffer(4);
-  const workers = Array.from({ length: 4 }, (_, index) => new Worker(`
-    const { workerData } = require('node:worker_threads');
-    (async () => {
-      const { recordUnsupported } = await import(workerData.url);
-      const gate = new Int32Array(workerData.barrier);
-      Atomics.add(gate, 0, 1);
-      Atomics.wait(gate, 0, Atomics.load(gate, 0), 30);
-      recordUnsupported({ repo: workerData.sameRepo ? 'shared' : 'repo-' + workerData.index,
-        actions: workerData.sameRepo ? ['action-' + workerData.index] : null,
-        rows: [{ pr: workerData.index, action: 'action-' + workerData.index }], path: workerData.path });
-    })().catch(error => { throw error; });
-  `, { eval: true, workerData: { url: pathToFileURL(resolve('scripts/conveyor/unsupported-repo.mjs')).href, index, path, barrier, sameRepo } }));
-  await Promise.all(workers.map(worker => new Promise((resolve, reject) => {
-    worker.on('error', reject); worker.on('exit', code => code === 0 ? resolve() : reject(Error('writer failed')));
-  })));
+  const workers = Array.from({ length: 4 }, (_, index) => fork('--eval', [`
+    process.on('message', async data => {
+      try {
+        const { recordUnsupported } = await import(data.url);
+        recordUnsupported({ repo: data.sameRepo ? 'shared' : 'repo-' + data.index,
+          actions: data.sameRepo ? ['action-' + data.index] : null,
+          rows: [{ pr: data.index, action: 'action-' + data.index }], path: data.path });
+        process.exit(0);
+      } catch (error) { console.error(error); process.exit(1); }
+    });
+    process.send('ready');
+  `], { execArgv: [], stdio: ['ignore', 'ignore', 'ignore', 'ipc'] }));
+  try {
+    const completed = workers.map(worker => new Promise((resolve, reject) => {
+      worker.on('error', reject);
+      worker.on('exit', code => code === 0 ? resolve() : reject(Error('writer failed')));
+    }));
+    await Promise.all(workers.map(worker => new Promise(resolve => worker.once('message', resolve))));
+    workers.forEach((worker, index) => worker.send({
+      url: pathToFileURL(resolve('scripts/conveyor/unsupported-repo.mjs')).href, index, path, sameRepo,
+    }));
+    await Promise.all(completed);
+  } finally { workers.forEach(worker => worker.kill()); }
   expect(readUnsupported({ path }).map(row => row.pr).sort()).toEqual([0, 1, 2, 3]);
   expect(readUnsupported({ path }).every(row => row.repo === (sameRepo ? 'shared' : 'repo-' + row.pr))).toBe(true);
 });

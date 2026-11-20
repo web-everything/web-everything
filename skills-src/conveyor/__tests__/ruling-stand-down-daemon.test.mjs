@@ -11,7 +11,7 @@ it('runs the injected ruling half even with auth paused, forwarding results', as
   const result = await runTickAllRepos({ repos: ['web-everything/web-everything'], fixTick: empty, ciHealTick: empty,
     hungCiTick: empty, mainRedRebaseTick: empty, missingRunTick: empty, promoteDraftTick: empty, notesTick: empty,
     awaitVerifyTick: () => ({ rows: [] }), stuckFixerTick: () => ({ rows: [] }), supersedeTick: () => ({ rows: [] }),
-    rulingStandDownTick, authGateOverride: () => ({ paused: true, reason: 'test' }) });
+    rulingStandDownTick, fenceOk: () => true, authGateOverride: () => ({ paused: true, reason: 'test' }) });
   expect(rulingStandDownTick).toHaveBeenCalledOnce();
   expect(rulingStandDownTick.mock.calls[0][0]).toMatchObject({ repo: 'web-everything/web-everything', setting: 'on' });
   expect(result.rulingStandDown.rows).toHaveLength(1);

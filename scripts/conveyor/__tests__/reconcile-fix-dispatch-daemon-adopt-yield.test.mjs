@@ -9,7 +9,7 @@ import { runReconcileFixDispatch } from '../reconcile-fix-dispatch.mjs';
 
 const empty = () => ({ dispatched: [], refusals: [] });
 function fixture(extra = {}) {
-  return { repos: ['a'], fixTick: empty, ciHealTick: async () => empty(), promoteDraftTick: empty,
+  return { fenceOk: () => true, repos: ['a'], fixTick: empty, ciHealTick: async () => empty(), promoteDraftTick: empty,
     hungCiTick: () => ({ dispatch: [], refusals: [], applied: [] }),
     mainRedRebaseTick: () => ({ dispatch: [], refusals: [], applied: [] }),
     missingRunTick: () => ({ dispatch: [], refusals: [], applied: [] }),

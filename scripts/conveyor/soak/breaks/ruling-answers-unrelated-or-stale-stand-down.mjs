@@ -45,7 +45,7 @@ export default {
     const empty = () => ({ dispatched: [], refusals: [], reconcileRefusals: [], rows: [] });
     const tick = rulingStandDownTick => runTickAllRepos({ repos: [repo], fixTick: empty, ciHealTick: empty,
       hungCiTick: empty, mainRedRebaseTick: empty, missingRunTick: empty, promoteDraftTick: empty, notesTick: empty,
-      awaitVerifyTick: empty, stuckFixerTick: empty, supersedeTick: empty, rulingStandDownTick,
+      awaitVerifyTick: empty, stuckFixerTick: empty, supersedeTick: empty, fenceOk: () => true, rulingStandDownTick,
       authGateOverride: () => ({ paused: true, reason: 'hermetic replay' }) });
     const violations = [];
     const brief = readFileSync(join(root, 'skills-src/conveyor/fix-agent-brief.md'), 'utf8').replace(/\\\r?\n/g, '');

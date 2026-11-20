@@ -277,13 +277,16 @@ export async function runOrphanFixRoundPass({
   graceMs = DEFAULT_ORPHAN_GRACE_MS,
   resolveProfile = repoProfile,
   cardReadable = (ref) => referralCardReadable(ref, ROOT),
+  maybeCiHealSlice,
 } = {}) {
   const enabled = orphanGuardEnabled(env);
   const rows = [];
   for (const { key, slug } of repos) {
+    await maybeCiHealSlice?.();
     let prs;
     try { prs = listBounced(slug); } catch (e) { rows.push({ repo: slug, decision: 'error', reason: `listing failed: ${String(e?.message ?? e).split('\n')[0]}` }); continue; }
     for (const p of prs ?? []) {
+      await maybeCiHealSlice?.();
       const row = { repo: slug, pr: p.number };
       try {
         const owned = await isOwned(key, p.number);

@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import { runCooperativeSteps } from '../lib/cooperative-steps.mjs';
 /**
  * @file scripts/conveyor/ci-red-recovery-watch.mjs
  * @description we:backlog/x5uqim1-*.md (parent #4075, epic #3383) — THE ACTUAL RECOVERY ACTION.
@@ -236,7 +237,11 @@ export function defaultPostRebaseComment(prNumber, {
  * @returns {{dispatch:Array<object>, refusals:Array<object>, applied:Array<object>, mainRedWindows:Array<object>,
  *   mainLatestCheckRuns:Array<object>}}
  */
-export function sweepCiRedRecovery({
+export function sweepCiRedRecovery(options = {}) {
+  return runCooperativeSteps(sweepCiRedRecoverySteps(options));
+}
+
+function* sweepCiRedRecoverySteps({
   repo = null, apply = false, requiredCheck = null, defaultBranch = 'main',
   readOpenPrs = defaultReadOpenPrs, readMainRuns = defaultReadMainRuns, readAheadBy = defaultReadAheadBy,
   readRequiredContexts, // Compatibility for callers injecting the original main-red reader.
@@ -262,6 +267,8 @@ export function sweepCiRedRecovery({
   // {@link createFileApplyLedger}) remembers which PRs were attempted so the next tick starts with the
   // least-recently-attempted. null = no memory (the plan's own order); the CLI wires the file-backed one.
   applyLedger = null,
+  maybeCiHealSlice,
+  deadlineAt,
 } = {}) {
   const tickStartedAt = now();
   const retrySettings = exhaustedRetrySettings ?? resolveExhaustedRetry();
@@ -296,7 +303,7 @@ export function sweepCiRedRecovery({
   // PR #2793 review — a check green on main's latest run is NOT enough on its own: the candidate also needs the
   // per-PR evidence `isMainGreenFixOwed` requires (lacks that green commit; check not already green at its merge
   // base), read only for a candidate this path could actually admit.
-  const candidates = rawCandidates.map((c) => {
+  const hydrateCandidate = (c) => {
     let exhaustionComments;
     if (exhaustedRetrySettings?.enabled && exhaustedRetrySettings.maxRetries > 0) {
       exhaustionComments = readComments(c.prNumber, { repo });
@@ -331,7 +338,12 @@ export function sweepCiRedRecovery({
     }
     comments ??= readComments(c.prNumber, { repo });
     return { ...withFacts, comments, rebaseAttemptsForSha: countRebaseOntoMainComments(comments, c.headSha, { mainRedWindows, mainGreen }) };
-  });
+  };
+  const candidates = [];
+  for (const candidate of rawCandidates) {
+    yield maybeCiHealSlice?.();
+    candidates.push(hydrateCandidate(candidate));
+  }
   // xd3dkzx — mainRuns (with per-check verdicts) so recovery is judged on the PR's own failing check.
   // Card xu1nixv — the red-main fix PRs (published priority record) are never told to wait for main.
   const prio = readPriority();
@@ -339,6 +351,7 @@ export function sweepCiRedRecovery({
   const mainFixPrs = prio && prio.repo === 'we' && isWe ? (Array.isArray(prio.prs) ? prio.prs : [prio.pr]) : [];
   const signatureHolds = new Set();
   for (const c of candidates) {
+    yield maybeCiHealSlice?.();
     c.mainRecoveryOwned = existingMainRecoveryOwns(c, { mainRedWindows, mainLatestCheckRuns });
     if (!c.mainRecoveryOwned && c.mainFailureSignature?.matched && countBlockingRetryStandDowns(c.comments, c.headSha)) {
       signatureHolds.add(c);
@@ -385,11 +398,12 @@ export function sweepCiRedRecovery({
     const order = plan.dispatch.map((d, i) => ({ d, i, seen: ledger.at[applyKey(d)] ?? 0 }))
       .sort((a, b) => a.seen - b.seen || a.i - b.i).map((x) => x.d);
     for (const d of order) {
+      yield maybeCiHealSlice?.();
       // Progress floor: once over budget, the tick may still start a refresh that does work — discovery (per-PR
       // comment reads) can by itself outlast the budget, and without the floor every tick would defer everything.
       // Deferrals do not spend the floor, but they may only hunt for that refresh for `floorGraceMs` of loop time.
       const overBudget = now() - tickStartedAt >= applyBudgetMs;
-      if (started >= maxApplyPerTick
+      if ((deadlineAt != null && now() >= deadlineAt) || started >= maxApplyPerTick
         || (overBudget && (started >= 1 || now() - applyStartedAt >= floorGraceMs))) {
         applied.push({ prNumber: d.prNumber, headRefName: d.headRefName, ok: false, action: 'deferred', deferred: true, budgetExhausted: true,
           error: 'tick apply budget spent — left for the next tick (no rebase comment posted, the per-sha cap is untouched)' });
@@ -1064,12 +1078,17 @@ export function cancelAndRerunHungRun(runId, { repo = null, exec = execFileSyncT
  *   readRunAttempt?:Function}} [o] `readRunAttempt(runId, {repo})` → the run's current attempt (positive integer) or null.
  * @returns {{dispatch:Array<object>, refusals:Array<object>, applied:Array<object>}}
  */
-export function sweepHungCiRecovery({
+export function sweepHungCiRecovery(options = {}) {
+  return runCooperativeSteps(sweepHungCiRecoverySteps(options));
+}
+
+function* sweepHungCiRecoverySteps({
   repo = null, apply = false, requiredCheck = DEFAULT_REQUIRED_CHECK, workflowName = DEFAULT_MAIN_WORKFLOW_NAME,
   thresholdMs = DEFAULT_HUNG_THRESHOLD_MS, maxRetriesPerSha = DEFAULT_MAX_HUNG_RETRIES_PER_SHA,
   readOpenPrs = defaultReadOpenPrs, readComments = defaultReadPrComments,
   cancelAndRerun = cancelAndRerunHungRun, cancelOnly = cancelHungRun, postComment = defaultPostHungCiComment, now = Date.now(),
   trigger = triggerCiForPr, defaultBranch = 'main', readRunAttempt = defaultReadRunAttempt,
+  maybeCiHealSlice,
 } = {}) {
   // The run's current attempt as a canonical positive-integer string, or null when unknown. Never throws.
   const currentAttempt = (runId) => {
@@ -1086,7 +1105,7 @@ export function sweepHungCiRecovery({
   // matters for a candidate this tick has ALREADY found hung — mirrors `sweepCiRedRecovery`'s own "pay for it
   // only when needed" discipline (there, gating the `gh run list --branch main` read on `candidates.length`).
   // ONE read serves both counts — never two separate `gh pr view` calls for the same PR.
-  const candidates = rawCandidates.map((c) => {
+  const hydrateCandidate = (c) => {
     if (c.runId == null || !Number.isFinite(Date.parse(c.startedAt))) return c;
     const hungNow = (now - Date.parse(c.startedAt)) >= thresholdMs;
     if (!hungNow) return c;
@@ -1145,7 +1164,13 @@ export function sweepHungCiRecovery({
       hungAttemptsForSha: countHungCiComments(comments, c.headSha),
       hungAttemptsForJob: countHungCiCommentsByJob(otherShaComments, c.jobName),
     };
-  }).filter(Boolean);
+  };
+  const candidates = [];
+  for (const candidate of rawCandidates) {
+    yield maybeCiHealSlice?.();
+    const hydrated = hydrateCandidate(candidate);
+    if (hydrated) candidates.push(hydrated);
+  }
   const plan = planHungCiRecoveries({
     candidates, now, thresholdMs, maxRetriesPerSha,
   });
@@ -1154,6 +1179,7 @@ export function sweepHungCiRecovery({
   const applied = [];
   if (apply) {
     for (const d of plan.dispatch) {
+      yield maybeCiHealSlice?.();
       let result = d.runId == null
         ? { ok: false, action: 'no-run-id', error: `PR #${d.prNumber}'s hung check has no resolvable run id (detailsUrl missing/unparseable)` }
         // #4075/#3383, 2026-09-25 18:55 ET correction — `hung-cap-escalate` cancels only, exactly like
@@ -1545,7 +1571,11 @@ export function restackStackedPr(d, {
  *   startup-failure admission counts only current-head attempts.
  * @returns {{dispatch:Array<object>, refusals:Array<object>, applied:Array<object>}}
  */
-export function sweepMissingRunRecovery({
+export function sweepMissingRunRecovery(options = {}) {
+  return runCooperativeSteps(sweepMissingRunRecoverySteps(options));
+}
+
+function* sweepMissingRunRecoverySteps({
   repo = null, apply = false, defaultBranch = 'main',
   mainRuns = null, readMainRuns = defaultReadMainRuns, restack = restackStackedPr, readIsCrossRepository = defaultReadIsCrossRepository,
   readOpenPrs = defaultReadOpenPrs, readRequiredContexts = defaultReadRequiredContexts,
@@ -1560,6 +1590,7 @@ export function sweepMissingRunRecovery({
   readComments = defaultReadPrComments, trigger = triggerCiForPr, postComment = defaultPostMissingRunComment,
   readPush = readFixPush, clearLabel = clearStaleCheckingLabel, thresholdMs = resolveHandoffSettings().value.ciMissingAfterPushMin * 60_000,
   maxRetriesPerSha = resolveRecoveryCaps().missingRunRetriesPerSha, maxRetriesPerPr = maxRetriesPerSha, now = Date.now(),
+  maybeCiHealSlice,
 } = {}) {
   // #2793 — `mergeable` added so {@link buildMissingRunCandidates} can exclude a real merge conflict (never a
   // "missing run", a conflicting PR can produce no `pull_request` run at all — see that function's own docblock).
@@ -1590,6 +1621,7 @@ export function sweepMissingRunRecovery({
   // workflow-only evidence; admission still reads the unmodified live evidence.
   const legacyCandidateNumbers = new Set();
   for (const pr of Array.isArray(prs) ? prs : []) {
+    yield maybeCiHealSlice?.();
     const legacyPr = {
       ...pr,
       workflowRuns: Array.isArray(pr?.workflowRuns)
@@ -1655,6 +1687,7 @@ export function sweepMissingRunRecovery({
   const applied = [];
   if (apply) {
     for (const d of plan.dispatch) {
+      yield maybeCiHealSlice?.();
       // 2026-10-10 live (#4759…#4797): a stacked PR gets no run because its merge commit's ci.yml predates the
       // `lane/**` trigger — an empty push cannot fix that; restacking the chain onto main can.
       const stacked = d.baseRefName && d.baseRefName !== defaultBranch;

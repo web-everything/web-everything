@@ -256,6 +256,7 @@ export async function runFixerStuckReclaimPass({
   orphanPass = process.env.VITEST ? null : runOrphanFixRoundPass,
   readComments = null,
   verifyRunningFor = defaultVerifyRunningFor,
+  maybeCiHealSlice,
 } = {}) {
   const result = await runReclaim();
   if (orphanPass) {
@@ -287,6 +288,7 @@ export async function runFixerStuckReclaimPass({
   const stop = stopSession ?? (await import('../operations/dispatch-abort.mjs')).stopSession;
   const rows = [];
   for (const p of plan) {
+    await maybeCiHealSlice?.();
     const row = { key: p.key, repo: p.event.repo, pr: p.event.pr, session: p.event.session?.name ?? null, decision: p.decision, reason: p.reason };
     rows.push(row);
     if (p.decision === 'hold') continue;

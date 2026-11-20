@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import { runCooperativeSteps } from '../lib/cooperative-steps.mjs';
 import { assertCapability, repoProfile } from '../lib/repo-profile.mjs';
 import { safeAdoptYield } from '../lib/daemon-rebuild/adopt-yield.mjs';
 import { isTerminalStatus } from '../lib/backlog-status.cjs';
@@ -266,7 +267,11 @@ export function ownedCards(cards, view = {}) {
  *   off whatever tick they wrap (see e.g. `runReconcileCiHealDispatchAllRepos`) — a differently-named field
  *   here would have silently produced an empty `dispatched` array for the daemon composing this pass in.
  */
-export function runReconcilePromoteDraftDispatch({
+export function runReconcilePromoteDraftDispatch(options = {}) {
+  return runCooperativeSteps(runReconcilePromoteDraftDispatchSteps(options));
+}
+
+function* runReconcilePromoteDraftDispatchSteps({
   resolveProfile = repoProfile,
   root = process.cwd(),
   repo = null,
@@ -295,7 +300,7 @@ export function runReconcilePromoteDraftDispatch({
   // `stack.reviewWhileBaseOpen` (operator go 2026-10-10): a GitHub-stacked draft (base = another lane branch) is
   // promoted on its OWN green checks while its base is open. Off, it is refused here and waits for its base to land.
   reviewWhileBaseOpen = undefined,
-  deadlineAt, cursor, shouldYield, now = Date.now,
+  deadlineAt, cursor, shouldYield, now = Date.now, maybeCiHealSlice,
 } = {}) {
   let yieldedForAdoption = false;
   const repoKey = repo == null ? 'we' : repoKeyForSlug(repo);
@@ -341,6 +346,7 @@ export function runReconcilePromoteDraftDispatch({
   }
   let stackPolicy;
   for (const entry of entries) {
+    yield maybeCiHealSlice?.();
     // Yield only before an entry: its reads and writes must finish together.
     // Always finish the first entry: when planning alone outlasts the budget, yielding before it would defer
     // the same PR every pass (reconcile re-runs before the cursor is read) and nothing would ever promote.

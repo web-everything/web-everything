@@ -5529,26 +5529,24 @@ Check mode fetches origin main before evaluating canonical audit evidence. A fai
 `main not refreshed: <reason>` and refuses even when local evidence would pass against stale refs.
 `open-pr-audit-gate.test.mjs` covers both refresh outcomes, aggregation and an unconfirmed check child.
 
-## Independent fix-daemon cadence
+## Cooperative ci-heal cadence
 
-The fix daemon uses synchronous child calls in its serial phases. A second async loop on
-that event loop cannot prove an independent cadence: ci-heal runs in a worker thread under
-the same PID and lease. Its scheduler tests inject time and sleep; the soak cadence probe
-observes two simulated hours with forty-minute main ticks. Worker shutdown must settle
-before lease release. Keep the worker's phase cursors in their separate file so independent
-writers cannot overwrite each other's fairness state. Both threads use self-sync and claim-refresh
-wrappers; the worker starts with the managed-clone environment already set. Dispatch phases
-share an exclusive non-waiting guard, fresh fail-closed claim reads, and queue charges retained
-until overlapping passes end. Replay corrupt claims, concurrent capacity/queue demand,
-incomplete supersede publication, a tighter recovery apply budget, and lease loss during
-pending work. A lost lease fences dispatch and exits the worker immediately. Unsupported-work
-writers must hold the shared ledger lock across read-modify-write, including preservation of
-other actions for the same repository. Callers replace only their named action scope;
-corrupt records or inconsistent action scopes refuse replacement.
+`reconcile-fix-dispatch-daemon-ci-heal-slice.test.mjs` uses a fake clock to cover two-hour cadence,
+lease-loss/unknown/read-error refusal, nested calls, retry after a thrown slice, and the main-red-rebase
+budget. The `ci-heal-own-loop-cadence` soak runs the real daemon with slow injected phases and judges
+emitted gate timestamps; its serial control must expose a gap over ten minutes. Keep this soak a required
+`it`, since `defineBreakTest` turns an absent fix into `it.fails` and would mask a cadence regression.
+Slices are cooperative: a single blocking read or PR action cannot be interrupted; inspect timestamp gaps
+and the phase timing logs when an individual action exceeds the interval. Run only scoped suites through
+the host heavy-admission queue.
 
-The ci-heal loop suite also launches the production CLI with a test-only Node loader
-that substitutes IO function bodies and scales the interval. The startup call, worker
-entry point, and both schedulers stay intact. Worker dispatch-boundary records must
-continue during a synchronous child call on the main thread; disconnecting worker
-startup must fail this integration test. The cooperative fake-clock probe alone cannot
-establish this guarantee.
+Keep admission evidence separate from scheduling: each daemon admission re-reads strict live claims and
+refuses unreadable evidence; ci-heal rechecks its lease after asynchronous routing preparation, immediately
+before dispatch. Preserve the shared unsupported-record lock and action-scoped replacement; its process-based
+concurrent-writer tests and corrupt-store refusal test protect outstanding work across daemon instances.
+
+A lease refusal at a cooperative boundary must abort the owning fix pass, not only its ci-heal slice.
+The named `lease loss between fix entries prevents subsequent launches` regression runs the real fix
+PR loop and revokes ownership after its first launch, including unknown and throwing lease reads.
+Latch that refusal for the remainder of the pass; the CLI heartbeat then stops the daemon so only
+a lease-owning instance can retry deferred work.
