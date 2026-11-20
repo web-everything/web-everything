@@ -952,6 +952,8 @@ describe('computeNetDiffText passes --no-ext-diff (#2890-review-r2 finding 2b)',
     computeNetDiffText({ exec, rev: 'deadbeef' });
     const textDiff = calls.find((a) => a[0] === 'diff' && !a.includes('--numstat'));
     expect(textDiff).toContain('--no-ext-diff');
+    expect(textDiff).toContain('--no-textconv');
+    expect(textDiff.indexOf('--no-textconv')).toBeLessThan(textDiff.indexOf('--end-of-options'));
     expect(textDiff.indexOf('--no-ext-diff')).toBeLessThan(textDiff.indexOf('--end-of-options'));
   });
   it('but NOT --text: a whole-PR diff must not force binary assets into the reviewer-facing text', () => {
@@ -1322,3 +1324,33 @@ function drainScore(sig) {
     'const { changedFiles, diffLines, humanBasisFiles, cumulativeDiffLines, diffHunks, basisNarrowed, netDiffText } = sig; const v = {};\n'
     + source.slice(start, end) + '\nreturn score;')(sig, scoreEscalation);
 }
+
+describe('R1105 pinned test-gaming evidence producer', () => {
+  it('resolves a full commit before reading text and returns that immutable revision', () => {
+    const head = 'a'.repeat(40), base = 'c'.repeat(40);
+    const calls = [];
+    const exec = (_cmd, args) => {
+      args = args.slice();
+      while (args[0] === '-c') args = args.slice(2);
+      calls.push(args);
+      if (args[0] === 'fetch') return '';
+      if (args[0] === 'merge-base') return base;
+      if (args.includes('--git-common-dir')) return `${tmpdir()}\n${tmpdir()}\n`;
+      if (args[0] === 'rev-parse') return head;
+      if (args.includes('--numstat')) return '1\t0\tx.mjs\n';
+      if (args[0] === 'diff') return 'diff --git a/x.mjs b/x.mjs\n@@\n+x';
+      throw new Error(`unexpected git command: ${args[0]}`);
+    };
+    const sig = computeNetDiffSignals({ exec, rev: 'lane/x', pinRev: true });
+    expect(sig.netDiffText).toMatchObject({ scored: true, rev: head });
+    expect(calls.filter((a) => a[0] === 'diff' && !a.includes('--numstat'))).toEqual([
+      ['diff', '--no-textconv', '--no-ext-diff', '--no-color', '--src-prefix=a/', '--dst-prefix=b/', '--end-of-options', base, head],
+    ]);
+  });
+  it('the drain requests pinning, supplies approved-head evidence, and holds incomplete scans', () => {
+    const src = readFileSync(join(dirname(fileURLToPath(import.meta.url)), '..', 'merge-ai-prs.mjs'), 'utf8');
+    expect(src).toMatch(/computeNetDiffSignals\(\{ exec, rev: [^\n]*v\.listedHeadSha : null,[^\n]*pinRev: true/);
+    expect(src).toMatch(/scanTestTampering\(\{\s*netDiffText, pinnedHeadSha: v\.listedHeadSha \|\| v\.headSha \|\| null/);
+    expect(src).toMatch(/gaming\.evidenceIncomplete \|\| shouldReparkForTestTampering/);
+  });
+});

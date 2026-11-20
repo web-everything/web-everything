@@ -17,6 +17,7 @@ import { reviewLoopAutoConfirm } from '../../lib/review-loop-policy.mjs';
  */
 
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
+import { drainScoredGit } from '../../__tests__/fixtures/drain-scored-git.mjs';
 import { mkdtempSync, symlinkSync, mkdirSync, readFileSync, readdirSync, rmSync, existsSync, writeFileSync, realpathSync, statSync } from 'node:fs';
 import { checkBodyFileLocation, bodyFileRoots } from '../../review-set-label.mjs';
 import { assertOperatorCliFresh, OPERATOR_CLI_STALE_MARKER, STALE_MAIN_REFUSAL_MARKER } from '../../lib/main-staleness.mjs';
@@ -3704,7 +3705,7 @@ describe('#5135 fix range read wiring', () => {
     const calls = [];
     const exec = (file, args) => {
       calls.push(args);
-      return args[0] === 'rev-parse' ? head : '';
+      return drainScoredGit(args, { gitDir: tmpdir(), head, files: [] })?.stdout || '';
     };
     const result = readPr({ pr: 7, repo: 'o/n', exec, originRepo: () => 'o/n', readView: () => ({
       number: 7, title: 't', body: '', headRefName: 'lane/x', labels: [], files: [],
@@ -3935,7 +3936,7 @@ describe('held item 177: readPr judges a stacked top against its stack base', ()
   const STACK_DIFF = 'diff --git a/own.mjs b/own.mjs\n--- a/own.mjs\n+++ b/own.mjs\n@@ -1 +1 @@\n-old\n+new\n';
   const view = () => ({ number: 7, title: 't', body: '', headRefName: 'lane/x', labels: [], files: [], comments: [] });
   // The main-basis diff is whatever the git stub prints; empty here, so a stack read is distinguishable from it.
-  const exec = (_file, args) => (args[0] === 'rev-parse' ? HEAD : '');
+  const exec = (_file, args) => drainScoredGit(args, { gitDir: tmpdir(), head: HEAD, files: [] })?.stdout || '';
   const stack = (over = {}) => ({ pr: 4624, ref: 'lane/red-main-contain', head: 'c'.repeat(40), contained: 'd'.repeat(40), tree: TREE, topHead: HEAD, ...over });
   const read = (over = {}) => {
     const calls = { stack: [], text: [], files: [] };

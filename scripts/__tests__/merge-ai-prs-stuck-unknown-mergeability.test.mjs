@@ -1,4 +1,4 @@
-import { scoredGitScript } from './fixtures/drain-scored-git.mjs';
+import { pinnedLeafDiffFixture } from './fixtures/pinned-leaf-diff-fixture.mjs';
 /**
  * RED contract for merge-ai-prs.mjs (no production changes in this task):
  * - revalidateWithUnknownRetry accepts repo?, num?, onPersistentUnknown and nudge.
@@ -313,7 +313,12 @@ if (a[0] === 'pr' && a[1] === 'merge') {
 if (a[0] === 'api') out([]);
 process.exit(0);
 `;
-const cliGit = scoredGitScript;
+const cliGit = `#!/usr/bin/env node
+const a = process.argv.slice(2);
+if (a[0] === 'remote' && a[1] === 'get-url') process.stdout.write('git@github.com:web-everything/web-everything.git\\n');
+${pinnedLeafDiffFixture}
+process.exit(0);
+`;
 
 function withCli(test) {
   const dir = mkdtempSync(join(tmpdir(), 'drain-unknown-'));

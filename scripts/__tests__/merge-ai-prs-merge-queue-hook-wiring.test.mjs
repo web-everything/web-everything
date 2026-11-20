@@ -3,7 +3,6 @@
  * (the #4389 isolation harness). Proves the merge-site wiring, not just the pure rule: a stale-pass PR is never
  * handed to `gh pr merge`, a fresh one merges unchanged, and with the hook off both merge (today).
  */
-import { drainScoredGit } from './fixtures/drain-scored-git.mjs';
 import { daemonAppEnv } from './fixtures/daemon-app-env.mjs';
 import { describe, it, expect } from 'vitest';
 import { spawnSync } from 'node:child_process';
@@ -12,6 +11,7 @@ import { tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { openPrPageFixture } from './fixtures/open-pr-page-fixture.mjs';
+import { fixtureOid, pinnedPrDiffFixture } from './fixtures/pinned-pr-diff-fixture.mjs';
 
 const script = join(dirname(fileURLToPath(import.meta.url)), '..', 'merge-ai-prs.mjs');
 const TIMEOUT_SCALE = 3; // Allow extra time for CLI subprocesses on loaded shards.
@@ -77,13 +77,13 @@ if (a[0] === 'api') {
       protection: { required_status_checks: { contexts: ['smoke'] } } });
   }
   let m;
-  if ((m = /commits\\/([a-f0-9]{40})\\/check-runs/.exec(path))) {
+  if ((m = /commits\\/([0-9a-f]{40})\\/check-runs/.exec(path))) {
     const p = prs.find(p => p.headRefOid === m[1]);
     out([{ check_runs: [{ id: 7, name: 'test', head_sha: m[1], status: 'completed', conclusion: 'success',
       started_at: p.passAt, completed_at: p.passAt, details_url: 'https://github.com/o/r/actions/runs/99' + p.number + '/job/1' }] }]);
   }
   if (/\\/branches\\/main$/.test(path)) out({ sha: 'tip' });
-  if ((m = /compare\\/([a-f0-9]{40})\\.\\.\\.tip$/.exec(path))) out({ base: 'base-' + m[1], ahead: 3, files: ['backlog/elsewhere.md'], n: 1 });
+  if ((m = /compare\\/([0-9a-f]{40})\\.\\.\\.tip$/.exec(path))) out({ base: 'base-' + m[1], ahead: 3, files: ['backlog/elsewhere.md'], n: 1 });
   if ((m = /pulls\\/(\\d+)\\/files/.exec(path))) out([[{ filename: 'backlog/leaf-' + m[1] + '.md' }]]);
 }
 process.exit(0);
@@ -96,9 +96,9 @@ if (a[0] === 'ls-remote') fs.appendFileSync(process.env.MQ_FIXTURE + '.refresh-p
 if (a[0] === 'fetch') fs.appendFileSync(process.env.MQ_FIXTURE + '.rebase-fetches', a.join(' ') + '\\n');
 if (a[0] === 'merge-tree') fs.appendFileSync(process.env.MQ_FIXTURE + '.rebase-trees', a.join(' ') + '\\n');
 if (a[0] === 'remote' && a[1] === 'get-url') process.stdout.write('git@github.com:fixture/drain-mq.git\\n');
-const result = (${drainScoredGit.toString()})(a, { gitDir: process.cwd() + '/.git',
-  files: [{ path: process.env.MQ_APPROVED_HEAD ? '.github/workflows/test.yml' : 'backlog/leaf.md' }] });
-if (result) { process.stdout.write(result.stdout); process.exit(result.status); }
+const db = JSON.parse(fs.readFileSync(process.env.MQ_FIXTURE, 'utf8'));
+const diffPrs = Array.isArray(db) ? db : Object.values(db.repos).flat();
+${pinnedPrDiffFixture}
 process.exit(0);
 `;
 
@@ -110,7 +110,7 @@ function runCli({ capabilityOff = false, hookOn, seedRefreshed = null, ages = [[
     // (the main-fix record names the WE repo by key, so that run's clone must read as WE: the couple shim's `origin`)
     for (const [name, code] of [['gh', fakeGh], ['git', mainFixPr ? fakeGitCouple : fakeGit.replace('fixture/drain-mq.git', capabilityOff ? 'longshoreai/longshore.git' : 'web-everything/web-everything.git')]]) writeFileSync(join(bin, name), code, { mode: 0o755 });
     const fixture = join(dir, 'prs.json');
-    const head = number => approvedHeadPlan ? 'a'.repeat(40) : number.toString(16).padStart(40, '0');
+    const head = number => approvedHeadPlan ? 'a'.repeat(40) : fixtureOid(`sha-${number}`);
     const comments = approvedHeadPlan ? [{ author: { login: 'chalbert' }, body: `<!-- reviewed-sha: ${head()} -->\n<!-- cleared-human: operator -->` }] : [];
     const cwd = approvedHeadPlan ? join(dir, 'local') : dir;
     if (approvedHeadPlan) {
@@ -228,7 +228,7 @@ describe('card xs1hdl7 — merge-queue hook wired at the drain merge site', () =
     expect(attempts).toEqual([3001]);
     expect(result.merged.map((p) => p.num)).toEqual([3001]);
     expect(stderr).toMatch(/merge-queue: refresh \(pass-too-old\)/);
-    expect(api.some((p) => p.includes('commits/' + (3002).toString(16).padStart(40, '0') + '/check-runs'))).toBe(true);
+    expect(api.some((p) => p.includes(`commits/${fixtureOid('sha-3002')}/check-runs`))).toBe(true);
   }, 30_000 * TIMEOUT_SCALE);
 
   it('a refresh that did not go through is NOT recorded, so the next pass retries it', () => {
@@ -241,7 +241,7 @@ describe('card xs1hdl7 — merge-queue hook wired at the drain merge site', () =
   // The record a refresh writes: the head AND the pass it was requested against (the fixture's check-run id is 7 and
   // its pass completed at `iso(120)`), plus when it was requested.
   const seedFor = (over = {}) => Object.fromEntries(['web-everything/web-everything#3002', 'cwd#3002'].map((k) => [k,
-    { head: (3002).toString(16).padStart(40, '0'), checkRunId: 7, completedAtMs: Date.parse(iso(120)), atMs: NOW, ...over }]));
+    { head: fixtureOid('sha-3002'), checkRunId: 7, completedAtMs: Date.parse(iso(120)), atMs: NOW, ...over }]));
 
   it('once per pass: a head refreshed against the pass still in force waits — no second refresh, no merge', () => {
     const { stderr, attempts } = runCli({ hookOn: true, seedRefreshed: seedFor() });
@@ -258,7 +258,7 @@ describe('card xs1hdl7 — merge-queue hook wired at the drain merge site', () =
   }, 30_000 * TIMEOUT_SCALE);
 
   it('a legacy head-only record (key → head) does not park the head either', () => {
-    const seed = Object.fromEntries(['web-everything/web-everything#3002', 'cwd#3002'].map((k) => [k, (3002).toString(16).padStart(40, '0')]));
+    const seed = Object.fromEntries(['web-everything/web-everything#3002', 'cwd#3002'].map((k) => [k, fixtureOid('sha-3002')]));
     const { stderr } = runCli({ hookOn: true, seedRefreshed: seed });
     expect(stderr).not.toMatch(/refresh-already-requested/);
     expect(stderr).toMatch(/merge-queue: refresh \(pass-too-old\)/);
@@ -370,7 +370,7 @@ function runCouple({ implPassAges, carrierPassAges, secondImplPassAges = null, e
     const manifest = { item: 'xcarr01', repos: [{ repo: 'we', ref: 'lane/xcarr01-we' }, { repo: 'fui', ref: 'lane/xcarr01-fui' },
       ...(secondImplPassAges ? [{ repo: 'plateau-app', ref: 'lane/xcarr01-pa' }] : [])], blockedBy: [], stackParents: [] };
     const body = `A real summary.\n\n<!-- lane-manifest:begin -->\n\`\`\`json\n${JSON.stringify(manifest)}\n\`\`\`\n<!-- lane-manifest:end -->\n`;
-    const sha = (number) => String(number).padStart(40, 'a'); // a hex sha, so a reviewed-sha marker can name it
+    const sha = (number) => String(number).padStart(40, 'a'); // a full hex commit identity for pinned diff reads
     // A cross-repo couple is always escalated for review; the carrier carries the human clearance for ITS head
     // (label + a trusted reviewed-sha marker), which is what the real drain requires before it will land it.
     const accepted = (number) => ({ labels: [{ name: 'ready-to-merge' }, { name: 'review:accepted' }],

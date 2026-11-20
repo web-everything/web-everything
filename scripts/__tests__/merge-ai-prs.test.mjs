@@ -7,7 +7,6 @@
  *   on its text — stays byte-identical. Also the non-default-base hold (#3674, ruled #3805 Fork 2 (a)): a PR whose
  *   base is not the repo's default branch is skipped with `base is not <default> (<base>)`.
  */
-import { scoredGitScript } from './fixtures/drain-scored-git.mjs';
 import { describe, it, expect, vi } from 'vitest';
 import { withResolutionBasis, buildDrainReasonComment, hasDrainReasonComment, buildDrainVerdicts, classifyPr, isRebaseDropCandidate, isBehindButClean, headTreeLacksManifestFile, routeRebaseBeforeEnqueue, retainCheckedQueueHead, retainBypassedQueueHead, readFreshQueueRollup, revalidateWithUnknownRetry, resolveRebaseBeforeEnqueue, buildLiveListingsByRepo, unlandableStateReason } from '../merge-ai-prs.mjs';
 import { readFastDrainRoundListing, withFastDrainRoundLock } from '../lib/fast-drain-scope.mjs';
@@ -17,6 +16,7 @@ import { join, resolve, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { spawnSync } from 'node:child_process';
 import { daemonAppEnv } from './fixtures/daemon-app-env.mjs';
+import { pinnedLeafDiffFixture } from './fixtures/pinned-leaf-diff-fixture.mjs';
 import { buildManifest, manifestBodyBlock } from '../readiness/lane-manifest.mjs';
 import { deriveResolutionBasis, graduatedToFromBody } from '../lib/review-render.mjs';
 
@@ -497,10 +497,10 @@ describe('round listing freshness at the CLI boundary', () => {
     const dir = mkdtempSync(join(tmpdir(), 'drain-round-cli-'));
     try {
       const row = (number, item, blockedBy = []) => ({ number, title: `PR ${number}`, state: 'OPEN',
-        headRefName: `lane/${number}`, headRefOid: number.toString(16).padStart(40, '0'), baseRefName: 'main', updatedAt: '2026-01-01T00:00:00Z',
+        headRefName: `lane/leaf-${number}`, headRefOid: number.toString(16).padStart(40, '0'), baseRefName: 'main', updatedAt: '2026-01-01T00:00:00Z',
         isDraft: false, mergeable: 'MERGEABLE', mergeStateStatus: 'CLEAN', files: [],
         labels: [{ name: 'ready-to-merge' }], statusCheckRollup: [{ __typename: 'CheckRun', name: 'test', status: 'COMPLETED', conclusion: 'SUCCESS', checkSuite: { workflowRun: { workflow: { name: 'test' } } } }],
-        body: manifestBodyBlock(buildManifest({ item, blockedBy, repos: [{ repo: 'we', ref: `lane/${number}` }] })) });
+        body: manifestBodyBlock(buildManifest({ item, blockedBy, repos: [{ repo: 'we', ref: `lane/leaf-${number}` }] })) });
       const target = row(42, 42, ['43']);
       const sibling = row(43, 43);
       const snapshot = join(dir, 'round.json');
@@ -541,7 +541,12 @@ if (a[0] === 'pr' && a[1] === 'view' && a.includes('id')) out = { id: 'PR_43' };
 fs.writeSync(1, typeof out === 'string' ? out : JSON.stringify(out));
 `);
       // All git operations are local fixture responses, including the CLI's identity probe.
-      writeFileSync(join(dir, 'git'), scoredGitScript);
+      writeFileSync(join(dir, 'git'), `#!/usr/bin/env node
+const a = process.argv.slice(2);
+if (a[0] === 'remote') { process.stdout.write('https://github.com/web-everything/web-everything.git'); process.exit(0); }
+${pinnedLeafDiffFixture}
+process.exit(1);
+`);
       for (const name of ['gh', 'git']) chmodSync(join(dir, name), 0o755);
       const result = spawnSync(process.execPath, [resolve(dirname(fileURLToPath(import.meta.url)), '..', 'merge-ai-prs.mjs'),
         '--only=42', '--this-repo', '--label=ready-to-merge', ...(!sendBack ? ['--dry-run'] : []), ...(!reconcile ? ['--no-reconcile-labels'] : []), '--no-drain-lease', '--no-red-main-freeze', '--json', `--listing-snapshot=${snapshot}`], {

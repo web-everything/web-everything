@@ -11,14 +11,12 @@
  * HOW IT STAYS HERMETIC (and CI-safe). It puts fake `gh` and `git` executables on `PATH` (a shim dir this
  * test writes), so the real `runCli` runs unmodified but every network/repo call is answered from a canned
  * PR fixture — no GitHub, no real repo, no auth. `--dry-run` means it decides but never merges; we read the
- * decision off its `--json` output (`toMerge` / `parked` / `skipped`). The fake Git serves a scored net diff
- * derived from each PR fixture, so ALL escalation input is controlled through the fixture. Everything lives
- * in an OS temp dir; nothing touches the real tree.
+ * decision off its `--json` output (`toMerge` / `parked` / `skipped`). The fake `git` serves pinned diff
+ * evidence from the same PR heads and files as fake `gh`, so downstream gates receive resolved evidence.
+ * Everything lives in an OS temp dir; nothing touches the real tree.
  *
  * Under #2162/#2171/#2285/#2366 (the auto-review gate) — the entrypoint half of the gate-invariants tripwires.
  */
-import { drainScoredGit } from './fixtures/drain-scored-git.mjs';
-import { createHash } from 'node:crypto';
 import { daemonAppEnv } from './fixtures/daemon-app-env.mjs';
 import { describe, it, expect, beforeAll, afterAll } from 'vitest';
 import { execFileSync } from 'node:child_process';
@@ -27,8 +25,7 @@ import { tmpdir } from 'node:os';
 import { join, resolve, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { openPrPageFixture } from './fixtures/open-pr-page-fixture.mjs';
-
-const fixtureSha = value => createHash('sha1').update(value).digest('hex');
+import { fixtureOid, pinnedPrDiffFixture } from './fixtures/pinned-pr-diff-fixture.mjs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const SCRIPT = resolve(HERE, '..', 'merge-ai-prs.mjs'); // the REAL entrypoint under test
@@ -93,8 +90,7 @@ if (a[0] === 'pr' && a[1] === 'merge') {
 // The listed head is the commits tip (a later _headRefOid then models a push after the pass-start read); with no
 // tip oid the fixture's _headRefOid, else headOf's stand-in, is the head at listing time too.
 const listedRows = () => fx.prs.map((pr) => {
-  const row = { ...pr };
-  if (!row.headRefName) row.headRefName = 'lane/fixture-' + pr.number;
+  const row = { ...pr, headRefName: pr.headRefName || 'lane/fixture-' + pr.number };
   const tip = (pr._commits || [])[(pr._commits || []).length - 1];
   // These unrelated gate scenarios use known modifications; unknown/rename metadata
   // and the pinned fallback are exercised by drain-workflow-edit-replay.test.mjs.
@@ -165,24 +161,19 @@ if (a[0] === 'pr' && a[1] === 'view') {
 process.stdout.write(''); process.exit(0);
 `;
 
-// Git evidence is pinned to the listed head; a moved live head is still rejected at revalidation.
+// Serve the listed head (not a later live push) and that PR's own changed files.
 const FAKE_GIT = `#!/usr/bin/env node
-let a = process.argv.slice(2);
-while (a[0] === '-c') a = a.slice(2);
+const fs = require('node:fs');
+const a = process.argv.slice(2);
 if (a[0] === 'remote' && a[1] === 'get-url') { process.stdout.write('git@github.com:web-everything/web-everything.git\\n'); process.exit(0); }
-const fx = JSON.parse(require('node:fs').readFileSync(process.env.GATE_FIXTURE, 'utf8'));
-const pr = fx.prs.find(p => {
-  const tip = (p._commits || []).at(-1);
-  const head = p.headRefOid || tip?.oid || p._headRefOid || ('0'.repeat(40) + p.number).slice(-40);
-  return a.some(arg => arg.includes(head));
-}) || fx.prs[0];
-const result = (${drainScoredGit.toString()})(a, { gitDir: process.cwd() + '/.git', files: pr.files || pr._files || [] });
-// Stale-acceptance scenarios changed content after review. Serving the same patch
-// for both SHAs would correctly carry the acceptance forward by diff identity.
-if (result && a[0] === 'diff' && fx.prs.some(p => p._reviewedSha && a.some(arg => arg.includes(p._reviewedSha)))) {
-  result.stdout = result.stdout.replaceAll('+new', '+previously-reviewed');
-}
-if (result) { process.stdout.write(result.stdout); process.exit(result.status); }
+const fx = JSON.parse(fs.readFileSync(process.env.GATE_FIXTURE, 'utf8'));
+const diffPrs = fx.prs.map(pr => {
+  const tip = (pr._commits || []).at(-1);
+  return { headRefName: pr.headRefName || 'lane/fixture-' + pr.number,
+    headRefOid: pr.headRefOid || (tip && tip.oid) || pr._headRefOid || ('0'.repeat(40) + pr.number).slice(-40),
+    files: pr.files || pr._files || [] };
+});
+${pinnedPrDiffFixture}
 process.exit(0);
 `;
 
@@ -358,26 +349,26 @@ describe('the real drain entrypoint consults the gate before merging', () => {
   // field off EVERY bucket, not only the landed one, to tell a thrashing (force-pushed) PR from one just waiting.
   it('#2502: every result bucket (toMerge/parked/skipped) carries the PR tip commit\'s headSha', () => {
     const RED = [{ name: 'test', conclusion: 'FAILURE', status: 'COMPLETED' }];
-    const shaCommits = (oid) => [{ authors: [{ name: 'Claude', email: 'noreply@anthropic.com' }], oid }];
+    const shaCommits = (oid) => [{ authors: [{ name: 'Claude', email: 'noreply@anthropic.com' }], oid: fixtureOid(oid) }];
     const fixture = {
       _id: 'headsha',
       prs: [
         { number: 901, title: 'clean leaf, lands', body: 'a real summary', headRefName: 'lane/m', baseRefName: 'main',
           mergeable: 'MERGEABLE', mergeStateStatus: 'CLEAN', statusCheckRollup: GREEN,
-          labels: [{ name: 'ready-to-merge' }], _commits: shaCommits(fixtureSha('sha-toMerge-901')), _files: [{ path: 'backlog/hs1.md', additions: 1, deletions: 0 }] },
+          labels: [{ name: 'ready-to-merge' }], _commits: shaCommits('sha-toMerge-901'), _files: [{ path: 'backlog/hs1.md', additions: 1, deletions: 0 }] },
         { number: 902, title: 'held, parks', body: 'a real summary', headRefName: 'lane/n', baseRefName: 'main',
           mergeable: 'MERGEABLE', mergeStateStatus: 'CLEAN', statusCheckRollup: GREEN,
-          labels: [{ name: 'ready-to-merge' }, { name: 'review:changes' }], _commits: shaCommits(fixtureSha('sha-parked-902')), _files: [{ path: 'backlog/hs2.md', additions: 1, deletions: 0 }] },
+          labels: [{ name: 'ready-to-merge' }, { name: 'review:changes' }], _commits: shaCommits('sha-parked-902'), _files: [{ path: 'backlog/hs2.md', additions: 1, deletions: 0 }] },
         { number: 903, title: 'red CI, plain skip', body: 'a real summary', headRefName: 'lane/o', baseRefName: 'main',
           mergeable: 'MERGEABLE', mergeStateStatus: 'CLEAN', statusCheckRollup: RED,
-          labels: [{ name: 'ready-to-merge' }], _commits: shaCommits(fixtureSha('sha-skipped-903')), _files: [{ path: 'backlog/hs3.md', additions: 1, deletions: 0 }] },
+          labels: [{ name: 'ready-to-merge' }], _commits: shaCommits('sha-skipped-903'), _files: [{ path: 'backlog/hs3.md', additions: 1, deletions: 0 }] },
       ],
     };
     const r = runDrain(fixture, ['--label=ready-to-merge', '--no-reconcile-labels']);
 
-    expect(r.toMerge.find((x) => Number(x.num) === 901)?.headSha).toBe(fixtureSha('sha-toMerge-901'));
-    expect(r.parked.find((x) => Number(x.num) === 902)?.headSha).toBe(fixtureSha('sha-parked-902'));
-    expect(r.skipped.find((x) => Number(x.num) === 903)?.headSha).toBe(fixtureSha('sha-skipped-903'));
+    expect(r.toMerge.find((x) => Number(x.num) === 901)?.headSha).toBe(fixtureOid('sha-toMerge-901'));
+    expect(r.parked.find((x) => Number(x.num) === 902)?.headSha).toBe(fixtureOid('sha-parked-902'));
+    expect(r.skipped.find((x) => Number(x.num) === 903)?.headSha).toBe(fixtureOid('sha-skipped-903'));
   });
 
   // #2502 — the `merged`/`failed` buckets ONLY populate on a REAL (non-dry-run) merge attempt, which the
@@ -385,17 +376,17 @@ describe('the real drain entrypoint consults the gate before merging', () => {
   // `merged.push`/`failedMerges.push` call sites (scripts/merge-ai-prs.mjs, the live cascade) carry the real
   // headSha through, not just `null` — the exact gap the panel found in every hand-built pure-unit fixture.
   it('#2502: a REAL merge carries the PR tip commit\'s headSha into the merged bucket', () => {
-    const shaCommits = (oid) => [{ authors: [{ name: 'Claude', email: 'noreply@anthropic.com' }], oid }];
+    const shaCommits = (oid) => [{ authors: [{ name: 'Claude', email: 'noreply@anthropic.com' }], oid: fixtureOid(oid) }];
     const fixture = {
       _id: 'headsha-live-merge',
       prs: [
         { number: 911, title: 'clean leaf, actually merges', body: 'a real summary', headRefName: 'lane/p', baseRefName: 'main',
           mergeable: 'MERGEABLE', mergeStateStatus: 'CLEAN', statusCheckRollup: GREEN,
-          labels: [{ name: 'ready-to-merge' }], _commits: shaCommits(fixtureSha('sha-merged-911')), _files: [{ path: 'backlog/hs4.md', additions: 1, deletions: 0 }] },
+          labels: [{ name: 'ready-to-merge' }], _commits: shaCommits('sha-merged-911'), _files: [{ path: 'backlog/hs4.md', additions: 1, deletions: 0 }] },
       ],
     };
     const { result } = runDrainLive(fixture, ['--label=ready-to-merge', '--no-reconcile-labels']);
-    expect(result.merged.find((x) => Number(x.num) === 911)?.headSha).toBe(fixtureSha('sha-merged-911'));
+    expect(result.merged.find((x) => Number(x.num) === 911)?.headSha).toBe(fixtureOid('sha-merged-911'));
     const memo = JSON.parse(readFileSync(join(workDir, `fixture-${fixture._id}.json.labels.json`), 'utf8'));
     expect(memo.labels[`${LABEL_REPO_URL}::review:human`]).toBeTypeOf('number');
   });
@@ -404,13 +395,13 @@ describe('the real drain entrypoint consults the gate before merging', () => {
   // plain execFileSync throws — read the JSON off the thrown error's own captured stdout instead (child_process
   // still populates it on a non-zero exit; only a genuine spawn failure would leave it empty).
   it('#2502: a REAL merge failure carries the PR tip commit\'s headSha into the failed bucket', () => {
-    const shaCommits = (oid) => [{ authors: [{ name: 'Claude', email: 'noreply@anthropic.com' }], oid }];
+    const shaCommits = (oid) => [{ authors: [{ name: 'Claude', email: 'noreply@anthropic.com' }], oid: fixtureOid(oid) }];
     const fixture = {
       _id: 'headsha-live-fail',
       prs: [
         { number: 912, title: 'clean leaf, merge write FAILS', body: 'a real summary', headRefName: 'lane/q', baseRefName: 'main',
           mergeable: 'MERGEABLE', mergeStateStatus: 'CLEAN', statusCheckRollup: GREEN,
-          labels: [{ name: 'ready-to-merge' }], _commits: shaCommits(fixtureSha('sha-failed-912')), _files: [{ path: 'backlog/hs5.md', additions: 1, deletions: 0 }], _mergeFail: true },
+          labels: [{ name: 'ready-to-merge' }], _commits: shaCommits('sha-failed-912'), _files: [{ path: 'backlog/hs5.md', additions: 1, deletions: 0 }], _mergeFail: true },
       ],
     };
     const fxPath = join(workDir, `fixture-${fixture._id}.json`);
@@ -427,17 +418,17 @@ describe('the real drain entrypoint consults the gate before merging', () => {
     } catch (e) {
       result = JSON.parse(String(e.stdout).trim().split('\n').filter(Boolean).pop());
     }
-    expect(result.failed.find((x) => Number(x.num) === 912)?.headSha).toBe(fixtureSha('sha-failed-912'));
+    expect(result.failed.find((x) => Number(x.num) === 912)?.headSha).toBe(fixtureOid('sha-failed-912'));
   });
 
   // xvzc4v4 advisory fix — REAL-EXECUTION coverage of the pre-merge revalidation and the already-merged recovery
   // paths. The source-text tests in merge-ai-prs-merge-trace-post-confirm.test.mjs regex-match those branches;
   // they could not see that the catch branch called a `const` declared inside the sibling `try` block (a
   // ReferenceError that crashed the whole pass). These drive the real entrypoint through each branch instead.
-  const shaCommitsX = (oid) => [{ authors: [{ name: 'Claude', email: 'noreply@anthropic.com' }], oid }];
+  const shaCommitsX = (oid) => [{ authors: [{ name: 'Claude', email: 'noreply@anthropic.com' }], oid: fixtureOid(oid) }];
   const liveLeaf = (number, extra) => ({ number, title: `leaf ${number}`, body: 'a real summary', headRefName: `lane/x${number}`, baseRefName: 'main',
     mergeable: 'MERGEABLE', mergeStateStatus: 'CLEAN', statusCheckRollup: GREEN, labels: [{ name: 'ready-to-merge' }],
-    _commits: shaCommitsX(fixtureSha(`sha-${number}`)), _files: [{ path: `backlog/x${number}.md`, additions: 1, deletions: 0 }], ...extra });
+    _commits: shaCommitsX(`sha-${number}`), _files: [{ path: `backlog/x${number}.md`, additions: 1, deletions: 0 }], ...extra });
   /** Non-dry-run drain that tolerates a non-zero exit and records every `gh pr merge` argv. */
   function runDrainLiveRecordingMerges(fixture) {
     const fxPath = join(workDir, `fixture-${fixture._id}.json`);
@@ -467,18 +458,18 @@ describe('the real drain entrypoint consults the gate before merging', () => {
     expect(nums(result.merged)).toContain(921);
     expect(merges).toHaveLength(1);
     const argv = merges[0];
-    expect(argv[argv.indexOf('--match-head-commit') + 1]).toBe(fixtureSha('sha-921'));
+    expect(argv[argv.indexOf('--match-head-commit') + 1]).toBe(fixtureOid('sha-921'));
   });
 
   it('xvzc4v4: the pin is the LISTING head, not the commits-read tip (a capped commits read cannot strand the PR)', () => {
-    const { result, merges } = runDrainLiveRecordingMerges({ _id: 'pin-listed', prs: [liveLeaf(927, { headRefOid: fixtureSha('sha-927-real-head'), _headRefOid: fixtureSha('sha-927-real-head') })] });
+    const { result, merges } = runDrainLiveRecordingMerges({ _id: 'pin-listed', prs: [liveLeaf(927, { headRefOid: fixtureOid('sha-927-real-head'), _headRefOid: fixtureOid('sha-927-real-head') })] });
     expect(nums(result.merged)).toContain(927);
     const argv = merges[0];
-    expect(argv[argv.indexOf('--match-head-commit') + 1]).toBe(fixtureSha('sha-927-real-head'));
+    expect(argv[argv.indexOf('--match-head-commit') + 1]).toBe(fixtureOid('sha-927-real-head'));
   });
 
   it('xvzc4v4: a push after the pass-start read (live head ≠ judged head) is refused, never merged', () => {
-    const { result, merges } = runDrainLiveRecordingMerges({ _id: 'head-moved', prs: [liveLeaf(922, { _headRefOid: fixtureSha('sha-922-pushed-later') })] });
+    const { result, merges } = runDrainLiveRecordingMerges({ _id: 'head-moved', prs: [liveLeaf(922, { _headRefOid: fixtureOid('sha-922-pushed-later') })] });
     expect(merges).toHaveLength(0);
     expect(nums(result.merged)).not.toContain(922);
     expect(result.revalidationAborted.find((x) => Number(x.num) === 922)?.reason).toMatch(/head moved/);
@@ -500,15 +491,15 @@ describe('the real drain entrypoint consults the gate before merging', () => {
     // …and its merge-trace comment, like every other already-merged path (a no-op stub used to swallow it here).
     const traces = traceCommentsFor(comments, 925);
     expect(traces).toHaveLength(1);
-    expect(traces[0].body).toContain('landed head `' + fixtureSha('sha-925') + '`');
+    expect(traces[0].body).toContain(`landed head \`${fixtureOid('sha-925')}\``);
   });
 
   it('xvzc4v4: the confirmed-merge paths each post exactly one merge trace naming the pinned head', () => {
     const { comments } = runDrainLiveRecordingMerges({ _id: 'trace-paths', prs: [liveLeaf(928), liveLeaf(929, { _mergeFailButLands: true })] });
     expect(traceCommentsFor(comments, 928)).toHaveLength(1);
-    expect(traceCommentsFor(comments, 928)[0].body).toContain('landed head `' + fixtureSha('sha-928') + '`');
+    expect(traceCommentsFor(comments, 928)[0].body).toContain(`landed head \`${fixtureOid('sha-928')}\``);
     expect(traceCommentsFor(comments, 929)).toHaveLength(1);
-    expect(traceCommentsFor(comments, 929)[0].body).toContain('landed head `' + fixtureSha('sha-929') + '`');
+    expect(traceCommentsFor(comments, 929)[0].body).toContain(`landed head \`${fixtureOid('sha-929')}\``);
   });
 
   it('xvzc4v4: a failed fresh re-read on a still-OPEN PR fails closed (not merged, reported)', () => {
@@ -701,8 +692,8 @@ describe('the real drain entrypoint consults the gate before merging', () => {
           mergeable: 'MERGEABLE', mergeStateStatus: 'CLEAN', statusCheckRollup: GREEN,
           body: 'a real summary', _commits: AI_COMMIT,
           _files: [{ path: 'backlog/w.md', additions: 1, deletions: 0 }], // benign fresh diff → escalated:'no' → the skip loop is eligible to stamp
-          _headRefOid: fixtureSha('deadbeef'),    // live head …
-          _reviewedSha: fixtureSha('cafef00d'),   // … advanced past the reviewed SHA → review:accepted is STALE → re-park review:human
+          _headRefOid: fixtureOid('deadbeef'),    // live head …
+          _reviewedSha: fixtureOid('cafef00d'),   // … advanced past the reviewed SHA → review:accepted is STALE → re-park review:human
           _editBodyFail: true,        // force the #2324 body write to fail so `verified` stays false
         },
       ],
@@ -732,8 +723,8 @@ describe('the real drain entrypoint consults the gate before merging', () => {
       _commits: AI_COMMIT,
       // the declarative leash → the fresh score is humanRequired, exactly as WE PR #1106's was
       _files: [{ path: 'scripts/lib/gate-config.mjs', additions: 3, deletions: 1 }],
-      _headRefOid: fixtureSha('deadbeef'),   // the drain's own rebase moved the head …
-      _reviewedSha: fixtureSha('cafef00d'),  // … past the reviewed commit → review:accepted is STALE → re-park review:human
+      _headRefOid: fixtureOid('deadbeef'),   // the drain's own rebase moved the head …
+      _reviewedSha: fixtureOid('cafef00d'),  // … past the reviewed commit → review:accepted is STALE → re-park review:human
     };
     const fixture = {
       _id: 'clearance-revocation',

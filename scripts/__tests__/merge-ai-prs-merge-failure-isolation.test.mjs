@@ -1,3 +1,4 @@
+import { pinnedLeafDiffFixture } from './fixtures/pinned-leaf-diff-fixture.mjs';
 /** #4389 — exercise the real drain with hermetic git/gh shims; no real PRs are touched. */
 import { daemonAppEnv } from './fixtures/daemon-app-env.mjs';
 import { describe, it, expect } from 'vitest';
@@ -47,21 +48,8 @@ process.exit(0);
 const fakeGit = `#!/usr/bin/env node
 let a = process.argv.slice(2);
 while (a[0] === '-c') a = a.slice(2); // the net-diff wrapper prepends hardening -c flags
-const SHA = 'a'.repeat(40);
-const BASE_SHA = 'b'.repeat(40);
 if (a[0] === 'remote' && a[1] === 'get-url') process.stdout.write('git@github.com:web-everything/web-everything.git\\n');
-// A real, scored net diff: the drain fails closed when the diff is unverified.
-if (a[0] === 'rev-parse' && a.includes('--git-common-dir')) {
-  // The hardened diff reader needs absolute common/git directories to isolate attributes.
-  const gitDir = require('node:path').join(process.env.ISOLATION_HOME, '.git');
-  process.stdout.write(gitDir + '\\n' + (a.includes('--absolute-git-dir') ? gitDir + '\\n' : ''));
-} else if (a[0] === 'rev-parse') {
-  process.stdout.write((a.includes('refs/remotes/origin/main^{commit}') ? BASE_SHA : SHA) + '\\n');
-}
-if (a[0] === 'merge-base') process.stdout.write(BASE_SHA + '\\n');
-if (a[0] === 'cat-file' && a[1] === '-e' && a[2] !== SHA + '^{commit}') process.exit(1);
-if (a[0] === 'diff' && a.includes('--numstat')) process.stdout.write('1\\t0\\tbacklog/leaf.md\\n');
-else if (a[0] === 'diff') process.stdout.write('diff --git a/backlog/leaf.md b/backlog/leaf.md\\n--- a/backlog/leaf.md\\n+++ b/backlog/leaf.md\\n@@ -0,0 +1 @@\\n+x\\n');
+${pinnedLeafDiffFixture}
 process.exit(0);
 `;
 
@@ -75,10 +63,10 @@ function runCli({ failAll = false, watch = false } = {}) {
     const fixture = join(dir, 'prs.json');
     writeFileSync(fixture, JSON.stringify([2879, 2880].map(number => ({
       number, title: `independent leaf ${number}`, body: 'A real summary.', headRefName: `lane/leaf-${number}`,
-      baseRefName: 'main', headRefOid: 'a'.repeat(40), mergeable: 'MERGEABLE', mergeStateStatus: 'CLEAN',
+      baseRefName: 'main', headRefOid: number.toString(16).padStart(40, '0'), mergeable: 'MERGEABLE', mergeStateStatus: 'CLEAN',
       statusCheckRollup: [{ name: 'test', conclusion: 'SUCCESS', status: 'COMPLETED' }],
       labels: [{ name: 'ready-to-merge' }], comments: [],
-      commits: [{ oid: 'a'.repeat(40), authors: [{ name: 'Claude', email: 'noreply@anthropic.com' }] }],
+      commits: [{ oid: number.toString(16).padStart(40, '0'), authors: [{ name: 'Claude', email: 'noreply@anthropic.com' }] }],
       files: [{ path: `backlog/leaf-${number}.md`, additions: 1, deletions: 0, changeType: 'ADDED' }],
     }))));
     // Keep the real lock implementation, but isolate its os.homedir()-based state from the resident drain.
@@ -93,7 +81,7 @@ function runCli({ failAll = false, watch = false } = {}) {
     expect(r.error, r.stderr).toBeUndefined();
     const result = JSON.parse(r.stdout.trim().split('\n').at(-1));
     for (const number of [2879, 2880]) {
-      expect(r.stderr).toContain(`net-diff #${number}: base=${'b'.repeat(40)} head=${'a'.repeat(40)}`);
+      expect(r.stderr).toContain(`net-diff #${number}: base=${'b'.repeat(40)} head=${number.toString(16).padStart(40, '0')}`);
     }
     expect(r.stderr).not.toContain('net diff unverified');
     if (!watch) expect(result.parked, r.stderr).toEqual([]);

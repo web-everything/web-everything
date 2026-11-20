@@ -1,3 +1,4 @@
+import { pinnedLeafDiffFixture } from './fixtures/pinned-leaf-diff-fixture.mjs';
 /**
  * Card xx7ckd6 — the red-main hold, exercised through the REAL drain CLI with hermetic git/gh shims (the #4389
  * isolation harness shared with merge-ai-prs-merge-queue-hook-wiring.test.mjs). That harness passes
@@ -6,7 +7,6 @@
  * legacy-marker migration) is defended at the `gh pr merge` call: a held PR must never reach it.
  * The child env clears VITEST/WE_UNDER_TEST, because the record readers return null under them.
  */
-import { drainScoredGit } from './fixtures/drain-scored-git.mjs';
 import { daemonAppEnv } from './fixtures/daemon-app-env.mjs';
 import { describe, it, expect } from 'vitest';
 import { spawnSync } from 'node:child_process';
@@ -93,8 +93,7 @@ if (S) {
   if (a[0] === 'ls-files' && /^backlog\\/7001-/.test(a[1] || '')) say('backlog/7001-stranded-card.md');
 }
 if (a[0] === 'remote' && a[1] === 'get-url') process.stdout.write('git@github.com:web-everything/web-everything.git\\n');
-const result = (${drainScoredGit.toString()})(a, { gitDir: process.cwd() + '/.git' });
-if (result) { process.stdout.write(result.stdout); process.exit(result.status); }
+${pinnedLeafDiffFixture}
 process.exit(0);
 `;
 
