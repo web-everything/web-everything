@@ -5084,6 +5084,11 @@ Soak worlds enable the paged snapshot reader with a private `WE_PR_SNAPSHOT_DIR`
 under each world's cleanup root. Vitest's flattened-list fallback cannot attest
 check completeness. Replays that simulate a push must also model a complete read
 on the new head before expecting a recovery review.
+Scenario ticks run without the production daemon's sleep, so these worlds pin
+`WE_PR_SNAPSHOT_TTL_MS=0` and `WE_PR_SNAPSHOT_STALE_OK_MS=0`. Each read still uses
+the paged reader and validates completeness, but immediate follow-up ticks see
+verdicts and pushes rather than cached pending labels. A failed fresh read must
+remain unreadable instead of falling back to the previous snapshot.
 
 The shared CLI GraphQL page fixture must include the commit `oid` and contexts
 `totalCount`/`pageInfo`; a flattened `gh pr view` response alone never attests

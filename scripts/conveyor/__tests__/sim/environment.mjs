@@ -13,6 +13,10 @@ export function isolatedProcessEnv(root, ambient = process.env) {
     // reader under Vitest with a private snapshot, never an ambient cache or flattened PR list.
     WE_PR_SNAPSHOT: '1',
     WE_PR_SNAPSHOT_DIR: join(root, 'pr-snapshot'),
+    // Scenario ticks have no production sleep between them. Refresh each read so a verdict or push
+    // is visible on the next tick, including inside the production snapshot's dirty-refresh floor.
+    WE_PR_SNAPSHOT_TTL_MS: '0',
+    WE_PR_SNAPSHOT_STALE_OK_MS: '0',
   };
   for (const key of ['WE_DISPATCH_ROUTING_SNAPSHOT', 'WE_GITHUB_APP_ID',
     'WE_GITHUB_APP_INSTALLATION_ID', 'WE_GITHUB_APP_PRIVATE_KEY_PATH', 'GITHUB_TOKEN']) delete env[key];
