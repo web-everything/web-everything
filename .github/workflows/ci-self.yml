@@ -14,3 +14,7 @@ permissions:
 jobs:
   self:
     uses: ./.github/workflows/ci.yml
+    # Only the two secrets ci.yml reads for the private FUI checkout; never `inherit`.
+    secrets:
+      WE_APP_PRIVATE_KEY: ${{ secrets.WE_APP_PRIVATE_KEY }}
+      FUI_READ_TOKEN: ${{ secrets.FUI_READ_TOKEN }}

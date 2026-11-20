@@ -53,6 +53,11 @@ on:
   # Called only by ci-self.yml (manual dry run of a branch's own ci.yml). github.event_name stays the
   # caller's `workflow_dispatch`, so the existing "manual dispatch runs the full suite" rules apply.
   workflow_call:
+    secrets:
+      WE_APP_PRIVATE_KEY:
+        required: false
+      FUI_READ_TOKEN:
+        required: false
 
 concurrency:
   group: ci-${{ github.ref }}

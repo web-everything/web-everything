@@ -37,9 +37,21 @@ describe('ci-self.yml', () => {
     }
   });
 
-  it('grants no more than read permissions and no secrets inherit surprises', () => {
+  it('grants read permissions, passes only the two named secrets (never inherit), and is unconditional', () => {
     const doc = load('ci-self.yml');
     expect(doc.permissions).toEqual({ contents: 'read' });
+    expect(doc.jobs.self.secrets).toEqual({
+      WE_APP_PRIVATE_KEY: '${{ secrets.WE_APP_PRIVATE_KEY }}',
+      FUI_READ_TOKEN: '${{ secrets.FUI_READ_TOKEN }}',
+    });
+    expect(doc.jobs.self.if).toBeUndefined();
+    expect(doc.jobs.self['continue-on-error']).toBeUndefined();
+    expect(doc.concurrency).toBeUndefined();
+  });
+
+  it('ci.yml declares exactly those secrets as optional workflow_call secrets', () => {
+    const wc = load('ci.yml').on.workflow_call;
+    expect(Object.keys(wc.secrets).sort()).toEqual(['FUI_READ_TOKEN', 'WE_APP_PRIVATE_KEY']);
   });
 });
 
@@ -54,5 +66,15 @@ describe('ci.yml triggers', () => {
   it('still defines the required check jobs under their own names', () => {
     const { jobs } = load('ci.yml');
     for (const name of REQUIRED) expect(jobs[name]).toBeDefined();
+  });
+
+  it('keeps push/pull_request branch filters (no restrictive paths filters)', () => {
+    const on = load('ci.yml').on;
+    expect(on.push.branches).toEqual(['main']);
+    expect(on.pull_request.branches).toContain('main');
+    for (const k of ['push', 'pull_request']) {
+      expect(on[k]['paths']).toBeUndefined();
+      expect(on[k]['paths-ignore']).toBeUndefined();
+    }
   });
 });
