@@ -4700,12 +4700,14 @@ Use `lane-lease-heartbeat.mjs` for best-effort atomic renewal from any lane subd
 Owned `acquire --lane=N --adopt` may skip canonical-origin resolution, but must still
 probe local history without repair; missing ancestors quarantine the lane. Stale-lease
 PID/dirty refusals precede takeover; unleased reclaim retains its preservation-report contract.
+Apply lease-holder safety only when a marker exists. Unleased recovery and salvage retain their
+backup, preservation and liveness checks; dirty content alone must not skip those checks.
 Fixtures for abandoned leases must use a dead PID (2147483646), never the test process PID.
 Heartbeat owners must keep the event loop available while children run and stop in `finally`;
 synchronous child execution prevents interval renewals. The Codex child runner covers detached
 jobs too. Inject `readAgents`/`readCwds` into liveness fixtures; never probe host processes in unit tests.
-Acquire preserves its historical fail-open takeover on unreadable cwd evidence; explicit reclaim
-remains fail-closed. Observed live occupants journal `reclaim-refused-live-process`.
+Acquire takeover and explicit reclaim fail closed on unreadable cwd evidence.
+Observed live occupants journal `reclaim-refused-live-process`.
 Provisioning failures stay excluded across acquire poll rounds and allow bounded pool growth.
 Review lane setup uses one hardened environment for the config scrub, origin validation and fetch.
 Global and system config point at the same temporary empty file, system config is disabled, and

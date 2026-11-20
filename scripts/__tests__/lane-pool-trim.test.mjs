@@ -13,6 +13,7 @@
  */
 import { describe, it, expect, beforeEach, afterEach, beforeAll, afterAll } from 'vitest';
 import { sharedRepos, withGhStub } from './fixtures/shared-git-fixture.mjs';
+import { emptyCwdsArgs } from './fixtures/empty-lane-cwds.mjs';
 import { spawn, spawnSync, execFileSync } from 'node:child_process';
 import { writeFileSync, mkdtempSync, rmSync, existsSync, readFileSync, mkdirSync } from 'node:fs';
 import { resolve, join, basename } from 'node:path';
@@ -27,7 +28,7 @@ function git(args, cwd) {
 let base, originDir, referenceDir, poolRoot;
 
 function runPool(args, extraEnv = {}) {
-  const r = spawnSync('node', [SCRIPT, ...args], { encoding: 'utf8', timeout: 30_000, killSignal: 'SIGKILL', env: withGhStub({ ...process.env, ...extraEnv }) });
+  const r = spawnSync('node', [...emptyCwdsArgs, SCRIPT, ...args], { encoding: 'utf8', timeout: 30_000, killSignal: 'SIGKILL', env: withGhStub({ ...process.env, ...extraEnv }) });
   return { code: r.status ?? 1, out: String(r.stdout || ''), err: String(r.stderr || '') };
 }
 
@@ -56,11 +57,16 @@ function trim(args = []) {
   return runPool(['trim', ...REPO(), '--json', ...args], ENV());
 }
 
-function leaseLane(n, { session = 'foreign-holder', ttlMinutes, reserve = false } = {}) {
+function leaseLane(n, { session = 'foreign-holder', ttlMinutes, reserve = false, pid } = {}) {
   const ttl = ttlMinutes === undefined ? [] : [`--ttl-minutes=${ttlMinutes}`];
   const reserveArgs = reserve ? ['--reserve'] : [];
   const r = runPool(['acquire', `--lane=${n}`, ...REPO(), '--no-reset', `--session=${session}`, ...ttl, ...reserveArgs], ENV());
   expect(r.code).toBe(0);
+  if (pid !== undefined) {
+    const file = join(laneDir(n), '.git', '.lane-lease');
+    const lease = JSON.parse(readFileSync(file, 'utf8'));
+    writeFileSync(file, JSON.stringify({ ...lease, pid }));
+  }
 }
 
 // One origin + reference per FILE (built once, restored after every test) instead of one per test — see
@@ -142,7 +148,7 @@ describe('lane-pool trim (#4025) — TOCTOU: a lane acquired between evaluation 
 
   it('a lane whose provably-dead lease was re-acquired mid-run survives too', async () => {
     provision(2);
-    leaseLane(2, { ttlMinutes: 0 }); // dead at evaluation time → eligible
+    leaseLane(2, { ttlMinutes: 0, pid: 2147483646 }); // dead at evaluation time → eligible
     const parsed = await trimWithMidRunAcquire(['--max=0'], 2, { dirty: false });
     expect(existingLaneNums()).toContain(2);
     expect(readFileSync(join(laneDir(2), '.git', '.lane-lease'), 'utf8')).toMatch(/mid-trim-acquirer/);
@@ -266,13 +272,25 @@ describe('lane-pool trim (#4025) — safety: never removes real work', () => {
     expect(parsed.removed).toContain(2);
   });
 
-  it('a STALE (TTL-expired) lease does NOT protect a lane — it is provably dead, so removable', () => {
+  it('an expired lease with a dead holder and clean tree is removable', () => {
     provision(2);
-    leaseLane(2, { ttlMinutes: 0 }); // already stale
+    leaseLane(2, { ttlMinutes: 0, pid: 2147483646 });
     const r = trim(['--max=0']);
     const parsed = JSON.parse(r.out);
     expect(parsed.removed).toContain(2);
     expect(existingLaneNums()).not.toContain(2);
+  });
+
+  it('keeps an expired lease whose holder is still alive', () => {
+    provision(1);
+    leaseLane(1, { ttlMinutes: 0 });
+    const file = join(laneDir(1), '.git', '.lane-lease');
+    const before = readFileSync(file, 'utf8');
+    const r = trim(['--max=0']);
+    expect(r.code, r.err).toBe(0);
+    expect(JSON.parse(r.out).removed).toEqual([]);
+    expect(readFileSync(file, 'utf8')).toBe(before);
+    expect(r.err).toContain('stale-but-live');
   });
 
   it('NEVER removes a RESERVED (permanent) lane, even with --max=0 and no other candidates', () => {

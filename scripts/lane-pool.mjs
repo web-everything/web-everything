@@ -1036,6 +1036,9 @@ const acquireDefaultWaitInvalid = acquireDefaultWaitRaw !== undefined
   && !(/^\d+$/.test(acquireDefaultWaitRaw) && Number.isSafeInteger(Number(acquireDefaultWaitRaw)));
 // A lane holds a LIVE lease when a marker exists and hasn't outlived its TTL (owner presumed alive).
 function reclaimSafety(dir, lease) {
+  // This protects an existing lease's holder. Unleased salvage/recovery still run
+  // their own preservation, backup and liveness checks before resetting anything.
+  if (!lease) return { safe: true, reason: null };
   const verdict = probeLaneReclaim(dir, lease);
   if (!verdict.safe) {
     log(`  ${basename(dir)}: ${verdict.reason} — kept; inspect holder/worktree before retrying`);
