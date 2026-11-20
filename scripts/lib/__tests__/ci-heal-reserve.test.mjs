@@ -85,3 +85,26 @@ describe('ci-heal reserve slot', () => {
     } finally { rmSync(dir, { recursive: true, force: true }); }
   });
 });
+
+// Round 2 (R1103): an injected resolveReserve result that is not a non-negative integer must never admit unlimited
+// reserved heals. It falls back to the lower resolver's value, and when that is also invalid, to 0 (off).
+describe('ci-heal reserve: injected resolveReserve sanitising', () => {
+  const tryOnce = (resolveReserve, env = {}) => createCiHealReserve({ listClaims: () => [], env, resolveReserve, ...idle }).tryAdmit();
+  for (const bad of [undefined, null, NaN, Infinity, -1, 1.5, '3', {}]) {
+    it(`bad value ${String(bad)} with lower 0 admits nothing`, () => {
+      const v = tryOnce(() => bad, { WE_CI_HEAL_RESERVE: '0' });
+      expect(v.admit).toBe(false);
+    });
+    it(`bad value ${String(bad)} with junk lower env uses the lower resolver value 2, never unlimited`, () => {
+      const r = createCiHealReserve({ listClaims: () => [claim('ci-heal', 1), claim('ci-heal', 2)], env: { WE_CI_HEAL_RESERVE: 'x' }, resolveReserve: () => bad, ...idle });
+      expect(r.tryAdmit().admit).toBe(false);
+    });
+    it(`bad value ${String(bad)} with lower 2 uses the lower value`, () => {
+      const r = createCiHealReserve({ listClaims: () => [claim('ci-heal', 1), claim('ci-heal', 2)], env: { WE_CI_HEAL_RESERVE: '2' }, resolveReserve: () => bad, ...idle });
+      expect(r.tryAdmit().admit).toBe(false);
+    });
+  }
+  it('a throwing resolver is treated as invalid', () => {
+    expect(tryOnce(() => { throw new Error('x'); }, { WE_CI_HEAL_RESERVE: '0' }).admit).toBe(false);
+  });
+});
