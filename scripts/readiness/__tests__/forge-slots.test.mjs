@@ -54,10 +54,68 @@ describe('Forge slot settings', () => {
   it.each([null, {}, {forgeSlots: {default: 8}}, {forgeSlots: {default: 8, hosts: []}}])('refuses incomplete settings %j', config => {
     expect(() => resolveForgeSlots(config)).toThrow();
   });
+  it.each(['physical', 'directory symlink', 'file symlink'])(
+    'Node CLI resolves settings and validates overrides through a %s path', kind => {
+      const dir = fixture();
+      let entry = join(dir, 'forge-slots.mjs');
+      if (kind === 'directory symlink') {
+        symlinkSync(dir, join(dir, 'deployment'), 'dir');
+        entry = join(dir, 'deployment', 'forge-slots.mjs');
+      } else if (kind === 'file symlink') {
+        symlinkSync('forge-slots.mjs', join(dir, 'reader.mjs'));
+        entry = join(dir, 'reader.mjs');
+      }
+      for (const [overrides, status, stdout] of [
+        [{}, 0, '14\n'], [{FORGE_EXEC_SLOTS: '12'}, 0, '12\n'], [{FORGE_EXEC_SLOTS: '129'}, 1, ''],
+      ]) {
+        const result = spawnSync(process.execPath, [entry], {
+          encoding: 'utf8', timeout: 10000, maxBuffer: 65536,
+          env: {PATH: process.env.PATH, FORGE_HOST: 'forge', ...overrides},
+        });
+        expect(result.status, result.stderr).toBe(status);
+        expect(result.stdout).toBe(stdout);
+        if (status) expect(result.stderr).toContain('FORGE_EXEC_SLOTS must be 1..128');
+      }
+    });
+  it.each([undefined, '/nonexistent-forge-slots-entry.mjs'])(
+    'import stays silent with argv[1]=%s', argv => {
+      const dir = fixture();
+      const result = spawnSync(process.execPath, ['--input-type=module', '-e',
+        `process.argv[1] = ${JSON.stringify(argv) ?? 'undefined'}; await import(${JSON.stringify(join(dir, 'forge-slots.mjs'))}); console.log('imported');`], {
+        encoding: 'utf8', timeout: 10000, maxBuffer: 65536, env: {PATH: process.env.PATH, FORGE_HOST: 'forge'},
+      });
+      expect(result.status, result.stderr).toBe(0);
+      expect(result.stdout).toBe('imported\n');
+      expect(result.stderr).toBe('');
+    });
+  it('setup resolves its host setting through a symlinked deployment directory before provisioning', () => {
+    const dir = fixture(), pool = join(dir, 'pool');
+    mkdirSync(pool);
+    symlinkSync(dir, join(dir, 'deployment'), 'dir');
+    const guard = setup.slice(setup.indexOf('set -euo pipefail'), setup.indexOf('# Preflight egress'))
+      .replaceAll('/srv/forge-exec', pool);
+    writeFileSync(join(dir, 'forge-setup.sh'), guard + '\nprintf "%s\\n" "$FORGE_EXEC_SLOTS"\n');
+    const result = spawnSync('/bin/bash', [join(dir, 'deployment', 'forge-setup.sh')], {
+      encoding: 'utf8', timeout: 10000, maxBuffer: 65536, env: {PATH: process.env.PATH, FORGE_HOST: 'forge'},
+    });
+    expect(result.status, result.stderr).toBe(0);
+    expect(result.stdout).toBe('14\n');
+    expect(result.stderr).toContain('FORGE_EXEC_SLOTS=14 (forge-slots.json host/default setting)');
+  });
   for (const python of [false, true]) {
     const reader = python ? 'Python fallback without Node' : 'Node CLI';
     it(`${reader}: copied flat deployment reads the same JSON and FORGE_HOST`, () => {
       const result = run(fixture(), {FORGE_HOST: 'forge'}, python);
+      expect(result.status, result.stderr).toBe(0); expect(result.stdout).toBe('14\n');
+    });
+    it(`${reader}: symlinked checkout reads settings from the sibling settings directory`, () => {
+      const dir = fixture(), checkout = join(dir, 'checkout');
+      mkdirSync(join(checkout, 'settings'), {recursive: true});
+      mkdirSync(join(checkout, 'readiness'));
+      for (const file of ['forge-slots.mjs', 'forge-slots.sh']) cpSync(join(dir, file), join(checkout, 'readiness', file));
+      cpSync(join(dir, 'forge-slots.json'), join(checkout, 'settings', 'forge-slots.json'));
+      symlinkSync(checkout, join(dir, 'deployment'), 'dir');
+      const result = run(join(dir, 'deployment', 'readiness'), {FORGE_HOST: 'forge'}, python);
       expect(result.status, result.stderr).toBe(0); expect(result.stdout).toBe('14\n');
     });
     it(`${reader}: discovers the machine short hostname`, () => {

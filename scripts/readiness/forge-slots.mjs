@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-import {readFileSync, existsSync} from 'node:fs';
+import {readFileSync, existsSync, realpathSync} from 'node:fs';
 import {hostname} from 'node:os';
 import {fileURLToPath} from 'node:url';
 
@@ -22,7 +22,8 @@ export function resolveForgeSlots(settings, {env = {}, host = ''} = {}) {
   return Object.hasOwn(config.hosts, name) ? config.hosts[name] : config.default;
 }
 
-if(process.argv[1] && fileURLToPath(import.meta.url) === process.argv[1]) {
+const cliPath = (() => { try { return realpathSync(process.argv[1]); } catch { return ''; } })();
+if(process.argv[1] && cliPath === realpathSync(fileURLToPath(import.meta.url))) {
   try {
     const beside = new URL('./forge-slots.json', import.meta.url);
     const path = existsSync(beside) ? beside : new URL('../settings/forge-slots.json', import.meta.url);
