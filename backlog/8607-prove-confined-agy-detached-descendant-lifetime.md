@@ -1,4 +1,5 @@
 ---
+bornAs: x7agyp4
 kind: story
 status: open
 size: 3
@@ -17,4 +18,4 @@ PR #7134's 2026-11-20 security advisory identified that stopping the original pr
 - [A2] Planned `voids build when descendant shutdown is unproved` in `we:scripts/lib/__tests__/agy-confined-build.test.mjs`: feed the real runner's nonterminal or failed shutdown outcome into the build path; assert zero applied files and provider fallback. Parameterize normal exit, timeout, spawn error and interruption, with inherited pipes both open and closed.
 - [A3] The fixture records and cleans up only its own child PIDs in a finally path, including assertion failure; verify no child or pipe survives the test. Run `npm run test:unit -- <test-files>` using the A1/A2 files' repository-relative paths after the `we:` prefix on Darwin and a non-Darwin host.
 
-These are planned cases. No machine-wide process termination, new process grants or enablement. A process-fork restriction may be an alternative only if a real probe proves it blocks this detached-child shape while required worker behavior remains supported. Shared log isolation is separately tracked in #x9ffusk.
+These are planned cases. No machine-wide process termination, new process grants or enablement. A process-fork restriction may be an alternative only if a real probe proves it blocks this detached-child shape while required worker behavior remains supported. Shared log isolation is separately tracked in #8610.

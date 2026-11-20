@@ -5015,16 +5015,16 @@ The 2026-11-20 advisory prevention work is recorded as planned work, not impleme
 
 | Guarantee | Prevention item |
 | --- | --- |
-| Every declared secret root has a real denial probe | #x7agyp1 |
-| Credential-state reads cannot become an applied patch | #x7agyp2 |
-| Worker test code cannot run on the host before review or equivalent confinement | #x7agyp3 |
-| Detached descendants cannot yield successful evidence while alive | #x7agyp4 |
-| Repair admission requires loaded item evidence | #x7agyp5 |
-| Every snapshot limit bounds actual reads as well as rejection | #x7agyp6 |
-| Unreadable ancestors and broken secret links fail closed | #x6fx90l |
-| Securityd, launchd and agent-socket denial are independently observed | #x6wh6fe |
-| Logs stay isolated during concurrent sessions and interrupted cleanup | #x9ffusk |
-| Egress remains closed until a narrow model path is proved | #x4pdtzg |
+| Every declared secret root has a real denial probe | #8604 |
+| Credential-state reads cannot become an applied patch | #8605 |
+| Worker test code cannot run on the host before review or equivalent confinement | #8606 |
+| Detached descendants cannot yield successful evidence while alive | #8607 |
+| Repair admission requires loaded item evidence | #8608 |
+| Every snapshot limit bounds actual reads as well as rejection | #8609 |
+| Unreadable ancestors and broken secret links fail closed | #8602 |
+| Securityd, launchd and agent-socket denial are independently observed | #8603 |
+| Logs stay isolated during concurrent sessions and interrupted cleanup | #8610 |
+| Egress remains closed until a narrow model path is proved | #8601 |
 | Active Acceptance sections reject unfinished placeholders | #6933 |
 | Each behavioral guarantee names a planned case and observable assertion | #5360 |
 
@@ -5081,7 +5081,7 @@ The private temp is made outside the clone, lane and home workspace. The transcr
 outside every write grant; the launcher removes only its own temporary directories after the run.
 Redirected log directories refuse with a provider/operator fallback rather than widening write access.
 The shared log directory is still writable: planted entries could affect a later unsandboxed logger.
-Per-run log isolation is tracked in #x9ffusk; service-mediated credential isolation is tracked in #x6wh6fe.
+Per-run log isolation is tracked in #8610; service-mediated credential isolation is tracked in #8603.
 
 Home reads are denied by default, then reopened only for the disposable clone, private temp,
 real-HOME `.gemini` state and the resolved agy binary directory/Homebrew prefix. Keep this
@@ -5147,7 +5147,7 @@ Size-1 jobs of any kind are also admitted by R1062; neither is a confinement cla
 The launcher hashes clone Git redirect/configuration controls and the index with filesystem reads; unreadable or
 changed controls and a missing Git directory void the run. The detached exclusive-transcript worker
 group receives a stop signal on exit, before pipe close returns evidence. This does not prove
-termination of descendants that create a new session; #x7agyp4 tracks that gap. Post-run host Git never runs against
+termination of descendants that create a new session; #8607 tracks that gap. Post-run host Git never runs against
 the worker clone: a second repository created before launch owns its Git metadata, index and copied
 work tree, outside all worker write grants. Regular-file bytes are copied; unchanged baseline symlinks
 are recreated from trusted Git objects without dereferencing them. New/changed links and special files

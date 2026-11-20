@@ -1,4 +1,5 @@
 ---
+bornAs: x9ffusk
 kind: story
 status: open
 size: 3
@@ -22,4 +23,4 @@ Planned cases in `we:scripts/lib/__tests__/agy-confined-launcher.test.mjs`, run 
 - [A3] `isolates logs when confined cleanup is interrupted`: interrupt after link creation and before cleanup; run the host logger while the abandoned tree remains. Assert unchanged target bytes and no host traversal into the abandoned tree. Exercise success, refusal, timeout and interrupted cleanup separately.
 - [A4] `refuses unsupported private log destination`: when a per-run destination or private login state cannot be established, assert no worker spawn, provider fallback and no shared-HOME write grant added as a fallback.
 
-These are planned regressions, not passing proofs. Until isolation lands, the shared log directory remains writable and is an outstanding review risk, not a confinement guarantee. Production must remain unavailable. Detached descendant lifetime is tracked separately in #x7agyp4.
+These are planned regressions, not passing proofs. Until isolation lands, the shared log directory remains writable and is an outstanding review risk, not a confinement guarantee. Production must remain unavailable. Detached descendant lifetime is tracked separately in #8607.

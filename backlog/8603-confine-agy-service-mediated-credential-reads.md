@@ -1,4 +1,5 @@
 ---
+bornAs: x6wh6fe
 kind: story
 status: open
 size: 3
@@ -22,4 +23,4 @@ All cases below are planned in `we:scripts/lib/__tests__/agy-sandbox.test.mjs`. 
 - [A3] `REAL denies ssh-agent fixture socket`: a launcher-owned fake agent socket accepts an unsandboxed control request; the sandboxed client gets EPERM/EACCES and the fixture receives zero worker requests. Never connect to the operator's agent.
 - [A4] `refuses service probe setup failure`: missing helpers, unsupported channels and incomplete evidence preserve the unavailable gate and provider fallback, rather than counting as a successful proof. Clean up disposable fixtures on success, refusal and interruption.
 
-Keep the documentation caveat until these independent channel assertions pass. Credential-file-to-diff exposure is tracked separately in #x7agyp2.
+Keep the documentation caveat until these independent channel assertions pass. Credential-file-to-diff exposure is tracked separately in #8605.

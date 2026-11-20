@@ -1,4 +1,5 @@
 ---
+bornAs: x7agyp1
 kind: story
 status: open
 size: 2
@@ -19,4 +20,4 @@ PR #7134's 2026-11-20 advisory found that only ssh, secrets and clone environmen
 
 ## Non-goals and variants
 
-No production enablement or real operator-secret access. Cover absent roots, file versus directory roots, canonical aliases and all roots added to the helper. Service channels remain #x6wh6fe; direct credential-state exposure remains #x7agyp2. This test plan is not implemented coverage.
+No production enablement or real operator-secret access. Cover absent roots, file versus directory roots, canonical aliases and all roots added to the helper. Service channels remain #8603; direct credential-state exposure remains #8605. This test plan is not implemented coverage.
