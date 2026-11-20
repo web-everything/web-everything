@@ -18,7 +18,7 @@
 import { describe, it, expect } from 'vitest';
 
 import { advance, advanceWhileRunning, runStatus, startRun } from '../engine.mjs';
-import { LEDGER_EFFECT_TYPE, applyPendingEffects, createEffectExecutor, inFlight, inFlightEntries, notApplied, resolveInFlight } from '../effect-executor.mjs';
+import { LEDGER_EFFECT_TYPE, applyPendingEffects, createEffectExecutor, inFlight, inFlightEntries, notApplied, resolveInFlight, retryableWarning } from '../effect-executor.mjs';
 import * as effectExecutor from '../effect-executor.mjs';
 import { createMemoryRunStore, createFileRunStore } from '../run-store.mjs';
 import { mkdtempSync, rmSync } from 'node:fs';
@@ -34,6 +34,54 @@ import { effect } from '../step-kinds.mjs';
 import { FIXTURE_JUDGE_ANSWER, FIXTURE_OP, fixtureRegistry } from '../__fixtures__/fixture-operation.mjs';
 
 const registry = fixtureRegistry();
+
+describe('retryable effect warnings', () => {
+  function warningRun(idempotent) {
+    const r = createRegistry();
+    r.register(op('warning', {
+      go: effect({ effects: () => [{ type: 'publish', idempotent }, { type: 'later' }] }),
+    }));
+    const run = advance(startRun({ op: 'warning', id: 'warning-run', registry: r }), { registry: r });
+    const store = createMemoryRunStore();
+    store.write(run);
+    return { run, store };
+  }
+
+  it('retryableWarning preserves the sink payload and parks an idempotent effect until replay succeeds', async () => {
+    const { run, store } = warningRun(true);
+    const payload = { warning: 'Retry publication', pushed: false };
+    const warning = retryableWarning(payload);
+    expect(warning).toMatchObject(payload);
+    expect(warning).not.toBe(payload);
+    let later = 0;
+    const sinks = { publish: async () => warning, later: async () => { later++; } };
+    const first = await applyPendingEffects(run, { store, sinks });
+    expect(first).toMatchObject({ warning: payload.warning, error: null, applied: [] });
+    expect(first.run.effects.map(e => e.status)).toEqual(['pending', 'declared']);
+    expect(store.read(run.id).effects[0]).toMatchObject({ status: 'pending', result: payload, attempts: 1 });
+    expect(later).toBe(0);
+    const second = await applyPendingEffects(store.read(run.id), { store, sinks: { ...sinks, publish: async () => ({ pushed: true }) } });
+    expect(second.error).toBeNull();
+    expect(second.run.effects.map(e => e.status)).toEqual(['applied', 'applied']);
+    expect(second.run.effects[0].attempts).toBe(2);
+    expect(later).toBe(1);
+  });
+
+  it('records a failure for a non-idempotent retryable warning and refuses replay', async () => {
+    const { run, store } = warningRun(false);
+    let calls = 0;
+    const outcome = await applyPendingEffects(run, { store, sinks: {
+      publish: async () => { calls++; return retryableWarning({ warning: 'Unsafe retry' }); },
+      later: async () => { throw new Error('must not reach later effect'); },
+    } });
+    expect(outcome.error?.message).toBe('retryable warnings require an idempotent effect');
+    expect(outcome).not.toHaveProperty('warning');
+    expect(store.read(run.id).effects[0]).toMatchObject({ status: 'pending', error: outcome.error.message, attempts: 1 });
+    await expect(applyPendingEffects(store.read(run.id), { store, sinks: { publish: async () => { calls++; }, later: async () => {} } }))
+      .rejects.toThrow(/outcome is UNKNOWN/);
+    expect(calls).toBe(1);
+  });
+});
 
 /** Drive the fixture up to its effect step: compute → judge (canned answer) → confirm (accept). */
 function atEffectStep(id = 'run-fx') {
