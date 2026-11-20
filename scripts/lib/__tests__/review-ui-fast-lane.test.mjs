@@ -1,4 +1,4 @@
-import { test } from 'node:test';
+import { describe, test } from 'vitest';
 import assert from 'node:assert/strict';
 import { classifyUiFastLane, parseRawDiffZ, addedLinesFromPatch, resolveUiFastLaneSettings, gatherUiFastLaneEvidence, classifyFromGit } from '../review-ui-fast-lane.mjs';
 
@@ -8,7 +8,7 @@ const settings = { enabled: false, seats: 1, redTeam: false, nitpicksBlock: fals
 const entry = (path = 'src/styles/a.css', extra = {}) => ({ path, status: 'M', mode: '100644', ...extra });
 const classify = extra => classifyUiFastLane({ repo, settings, entries: [entry()], ...extra });
 
-test('classifier threat table and UI happy paths (disabled still shadows)', async t => {
+describe('classifier threat table and UI happy paths (disabled still shadows)', () => {
   const cases = [
     ...['120000', '100755', '160000'].map(mode => [`mode ${mode}`, { entries: [entry(undefined, { mode })] }, 'bad-mode']),
     ['old executable mode', { entries: [entry(undefined, { oldMode: '100755', newMode: '100644' })] }, 'bad-mode'],
@@ -35,7 +35,7 @@ test('classifier threat table and UI happy paths (disabled still shadows)', asyn
     ['glob star does not span directories', { settings: { ...settings, paths: { [repo]: ['src/styles/*'] } }, entries: [entry('src/styles/sub/a.css')] }, 'not-in-allowlist'],
     ['NFKC normalizes fullwidth letters', { entries: [entry('src/ｓｔｙｌｅｓ/a.css')] }, 'ui-only'],
   ];
-  for (const [name, input, reason] of cases) await t.test(name, () => {
+  test.each(cases)('%s', (_name, input, reason) => {
     const result = classify(input);
     assert.equal(result.reason, reason);
     assert.equal(result.verdict, reason === 'ui-only' ? 'ui-fast-lane' : 'full-panel');
