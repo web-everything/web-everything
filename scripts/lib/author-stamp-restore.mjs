@@ -100,7 +100,10 @@ export function planStampRestore({ state, body, authorLogin, edits } = {}) {
     const htmlLines = [];
     let ambiguousTicks = false;
     // Brackets can make a backticked span part of a link target or text across lines: no exemption.
-    const bracketed = /[\[\]]/.test(edit.diff);
+    // A bracketed line is harmless only when it has no backtick and its brackets balance on that line
+    // (a one-line `[text](url)` cannot span a code span across lines).
+    const bracketed = edit.diff.split(/\r\n|[\r\n]/).some((l) => /[\[\]]/.test(l)
+      && (l.includes('`') || (l.match(/\[/g) ?? []).length !== (l.match(/\]/g) ?? []).length));
     let fence;
     for (const line of edit.diff.split(/\r\n|[\r\n]/)) {
       const delimiter = line.match(/^[ \t]{0,3}(`{3,}|~{3,})(.*)$/);
@@ -114,7 +117,8 @@ export function planStampRestore({ state, body, authorLogin, edits } = {}) {
       // One ambiguous backtick line may open a multiline span: no inline-code exemption anywhere in the snapshot.
       if (stripped === undefined) ambiguousTicks = true;
       // Backticks inside any HTML comment other than a bare stamp marker are not code: disable the exemption.
-      if (line.includes('<!--') && !/^<!--[ \t]*authored-by-actor:[^<>\r\n]*-->[^\S\r\n]*$/.test(line)) ambiguousTicks = true;
+      // A comment line without a backtick cannot change code-span state (e.g. pr-size markers).
+      if (line.includes('<!--') && line.includes('`') && !/^<!--[ \t]*authored-by-actor:[^<>\r\n]*-->[^\S\r\n]*$/.test(line)) ambiguousTicks = true;
       htmlLines.push(stripped ?? line);
       if (line.includes('authored-by-actor:')) {
         // A stamp is evidence only as a whole, unindented line outside code fences.
@@ -136,7 +140,9 @@ export function planStampRestore({ state, body, authorLogin, edits } = {}) {
     // Raw HTML constructs (CDATA, processing instructions, declarations, comments other than a bare stamp
     // marker) open HTML blocks where backticks are not code: refuse them outright, outside code spans too.
     const candidate = (noExempt ? edit.diff.split(/\r\n|[\r\n]/) : htmlLines)
-      .filter((l) => !/^<!--[ \t]*authored-by-actor:[^<>\r\n]*-->[^\S\r\n]*$/.test(l)).join('\n');
+      .filter((l) => !/^<!--[ \t]*authored-by-actor:[^<>\r\n]*-->[^\S\r\n]*$/.test(l))
+      // Whole-line, closed, plain comments (pr-size / policy markers) are inert: no backtick, tag or nested opener.
+      .filter((l) => !/^<!--[^<>`\r\n]*-->[^\S\r\n]*$/.test(l) || l.includes('authored-by-actor:')).join('\n');
     if (/<\/?[a-z][^>]*>/i.test(noExempt ? edit.diff : htmlLines.join('\n')) || /<[!?]/.test(candidate)) {
       return refusal('unsupported HTML edit snapshot; inspect complete GitHub history manually',
         contentEvidence(edit, htmlOffender(candidate)));
