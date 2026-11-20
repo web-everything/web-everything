@@ -5568,6 +5568,13 @@ The sweep unit suite and `forge-sweep-scan-bound-refusal` soak pin these guarant
 
 ## Expectation babysitter replay (S1)
 
+`stuck-prs.test.mjs` tests the separate observe-only detector through heavy admission.
+Its captured sweep daemon lines are fixtures, not live-head attestations: R-d requires
+an explicit current-head binding; the original unbound #7112 human-hold line stays
+unknown. The CLI reads one open-PR batch and 8 MB log tails. Tail/list caps warn the
+operator to inspect omitted history/PRs. NEW-cause receipts reserve before append;
+failed appends, abandoned locks and capped receipts require manual inspection.
+
 Run `npm run test:unit -- scripts/conveyor/__tests__/pr-expectations.test.mjs` through
 heavy admission. Replays require all three scratch paths: `--events-file`,
 `--evidence-file`, and `--state-file`; `--as-of` requires those paths too. The events
