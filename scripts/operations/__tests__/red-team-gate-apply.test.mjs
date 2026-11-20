@@ -2,9 +2,10 @@
  * Card x1b8hlo — the red-team gate's impure half over a fake io: broken → send-back, degraded → card,
  * unconfirmed → advisory, a stale head → ignored, the round cap, dedup — and review-job runs it after the red team.
  */
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import { createHash } from 'node:crypto';
-import { pickSendBackError, applyRedTeamGate, buildGateComment, buildRedTeamCardInput, buildSendBackArgv, buildSendBackBody, gateExitCode, renderGateSummary, RED_TEAM_GATE_ACTOR, RED_TEAM_GATE_CHANNEL } from '../red-team-gate-apply.mjs';
+import { pickSendBackError, applyRedTeamGate, createRedTeamGateIo, buildGateComment, buildRedTeamCardInput, buildSendBackArgv, buildSendBackBody, gateExitCode, renderGateSummary, RED_TEAM_GATE_ACTOR, RED_TEAM_GATE_CHANNEL } from '../red-team-gate-apply.mjs';
+import * as preventionLanding from '../../lib/prevention-landing-job.mjs';
 import { runReviewJob } from '../review-job.mjs';
 import { renderRedTeamComment } from '../review-extra-seats.mjs';
 import { CONFIRMED_BREAKS_DEFAULTS, GATE_OUTCOMES, gateRoundGrants, liveResultGateState, parseRedTeamComment, parseRedTeamGateMarker, readRedTeamDisposition, redTeamGateMarker, redTeamQueueReason, redTeamResultId, redTeamRulingNeeded } from '../../lib/red-team-gate.mjs';
@@ -120,6 +121,20 @@ describe('applyRedTeamGate', () => {
     expect(calls[0][1]).toMatchObject({ kind: 'story', scope: 'we:scripts/x.mjs' });
     expect(calls[0][1].digest).toMatch(/stale config/);
     expect(calls[1][1].body.startsWith(namedGate('card-queued'))).toBe(true);
+  });
+
+  it.each(['mixed', 'card-only'])('passes the enabled repo identity through real %s card admission', async kind => {
+    const start = vi.spyOn(preventionLanding, 'spawnPreventionLandingJob').mockReturnValue({ ok: true, session: 'admitted-card' });
+    try {
+      const findings = [...(kind === 'mixed' ? [F()] : []), F({ impactIfUnfixed: 'degraded' })];
+      const { io, calls } = fakeIo({ comments: [comment(findings)], fileCard: createRedTeamGateIo().fileCard });
+      expect(await applyRedTeamGate({ repo: REPO, pr: 4722 }, io)).toMatchObject({ status: 'applied' });
+      expect(start).toHaveBeenCalledOnce();
+      expect(start).toHaveBeenCalledWith(expect.objectContaining({ repo: REPO }), { sessionPrefix: 'red-team-card' });
+      expect(kinds(calls).filter(k => k === 'sendBack')).toHaveLength(kind === 'mixed' ? 1 : 0);
+      expect(await applyRedTeamGate({ repo: REPO, pr: 4722 }, io)).toMatchObject({ status: 'already-acted' });
+      expect(start).toHaveBeenCalledOnce();
+    } finally { start.mockRestore(); }
   });
 
   // Review of the repair: a card job that was spawned but whose record never posted would be queued AGAIN next run.

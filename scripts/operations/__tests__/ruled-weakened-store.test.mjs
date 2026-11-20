@@ -27,6 +27,69 @@ const union = (opts = {}) => loadRuledWeakened({ fs, env, ...opts });
 const append = (e = entry(), opts = {}) => appendEntry(e, { path, fs, now: () => at, ...opts });
 
 describe('ops ruled-weakened evidence', () => {
+  const requests = (...rows) => {
+    const file = join(home, 'workspace/.operations/handoff/waiver-requests.jsonl');
+    fs.mkdirSync(join(file, '..'), { recursive: true });
+    fs.appendFileSync(file, rows.map(r => typeof r === 'string' ? r : JSON.stringify(r)).join('\n') + '\n');
+    return file;
+  };
+  const withdrawn = (over = {}) => ({ ref: 'lane/fix (description)', sha: SHA.toUpperCase(), ruling: 'WITHDRAWN', at: '2026-11-18T12:00:00Z', ...over });
+  it('revokes a recorded waiver after a later WITHDRAWN, matching bare ref and case-insensitive sha', () => {
+    append();
+    expect(gate(union())).not.toBeNull();
+    requests(withdrawn());
+    expect(union()).toEqual([]);
+    expect(gate(union())).toBeNull();
+  });
+  it('keeps waivers newer than WITHDRAWN and admits a later store re-approval over revoked settings', () => {
+    append();
+    requests(withdrawn({ at: '2026-11-16T12:00:00Z' }));
+    expect(gate(union())).not.toBeNull();
+    requests(withdrawn());
+    append(entry(), { now: () => '2026-11-19T12:00:00Z' });
+    expect(union({ platform: [{ ...entry(), at: undefined }], tool: [{ ...entry(), at: undefined }] }))
+      .toEqual([expect.objectContaining({ layer: 'ops', at: '2026-11-19T12:00:00.000Z' })]);
+  });
+  it('does not revoke for another ref, sha or ruling', () => {
+    append();
+    requests(withdrawn({ ref: 'lane/other' }), withdrawn({ sha: 'b'.repeat(40) }), withdrawn({ ruling: 'APPROVED' }));
+    expect(gate(union())).not.toBeNull();
+  });
+  it.each([undefined, 'not-a-date', 0])('revokes all matching layers when WITHDRAWN has unusable at: %s', at => {
+    append();
+    requests(withdrawn({ at }));
+    expect(union({ platform: [entry()], tool: [entry()] })).toEqual([]);
+  });
+  it('revokes at equal timestamps and revokes undated platform/tool waivers even for older WITHDRAWN', () => {
+    append();
+    requests(withdrawn({ at }));
+    expect(union()).toEqual([]);
+    requests(withdrawn({ at: '2026-11-16T12:00:00Z' }));
+    for (const layer of ['platform', 'tool']) expect(union({ [layer]: [{ ...entry(), at: undefined }] })).toEqual([]);
+  });
+  it('ignores malformed request lines with warnings while still applying valid revocations', () => {
+    append();
+    requests('{bad', 'null', '{}', withdrawn());
+    const warn = vi.fn();
+    expect(union({ warn })).toEqual([]);
+    expect(warn.mock.calls.map(([s]) => s)).toEqual([1, 2, 3].map(i => expect.stringContaining(`line ${i}:`)));
+  });
+  it('fails closed for an unreadable request log, including platform/tool waivers, with a recovery warning', () => {
+    append();
+    const file = requests();
+    fs.rmSync(file);
+    fs.mkdirSync(file);
+    const warn = vi.fn();
+    expect(union({ platform: [entry()], tool: [entry()], warn })).toEqual([]);
+    expect(warn).toHaveBeenCalledWith(expect.stringContaining('Restore log readability'));
+  });
+  it('fails closed for a request log exceeding 16 MiB and asks the operator to archive it', () => {
+    append();
+    requests(' '.repeat(16 * 1024 * 1024));
+    const warn = vi.fn();
+    expect(union({ warn })).toEqual([]);
+    expect(warn).toHaveBeenCalledWith(expect.stringMatching(/16 MiB.*archive/i));
+  });
   it('matches through the loader merge only with the same ref, full sha and verbatim ordered findings', () => {
     append();
     expect(gate(union())).toMatchObject({ ruledWeakened: { layer: 'ops' } });
@@ -95,22 +158,42 @@ describe('ops ruled-weakened evidence', () => {
     fs.writeFileSync(path, rows.slice(0, -1).join('\n'));
     expect(gate(union({ warn }))).toBeNull();
   });
-  it('skips an extra fingerprint field with a warning and grants no waiver for another SHA with a matching live fingerprint', () => {
+  it('preserves a valid optional carry fingerprint through append, read and the ops waiver union', () => {
     const fingerprint = 'c'.repeat(64);
-    fs.mkdirSync(join(path, '..'), { recursive: true });
-    fs.writeFileSync(path, JSON.stringify(entry({ fingerprint })) + '\n');
+    const value = append(entry({ fingerprint }));
     const warn = vi.fn();
-    const loaded = readStore({ path, fs, warn });
-    expect(loaded).toEqual({ entries: [], error: null });
-    expect(warn).toHaveBeenCalledTimes(1);
-    expect(warn).toHaveBeenCalledWith('WARNING: ruled-weakened store line 1: malformed JSON or invalid entry; ignored');
+    expect(readStore({ path, fs, warn })).toEqual({ entries: [value], error: null });
+    expect(warn).not.toHaveBeenCalled();
     const liveInput = { ...input, sha: 'b'.repeat(40) };
     const carriedRecord = { ...record, fingerprint };
-    expect(readyEvidence([carriedRecord], liveInput, loaded.entries, fingerprint)).toBeNull();
-    expect(readyEvidence([carriedRecord], liveInput, union({ warn }), fingerprint)).toBeNull();
+    expect(readyEvidence([carriedRecord], liveInput, union({ warn }), fingerprint))
+      .toMatchObject({ ruledWeakened: { layer: 'ops' } });
+    expect(readyEvidence([carriedRecord], liveInput, union({ warn }), 'd'.repeat(64))).toBeNull();
+  });
+  it.each([null, undefined, 'd'.repeat(64)])('a fingerprint-bearing store entry cannot authorize another sha without an exact live match: %s', liveFp => {
+    const fingerprint = 'c'.repeat(64);
+    append(entry({ fingerprint }));
+    const liveInput = { ...input, sha: 'b'.repeat(40) };
+    expect(readyEvidence([{ ...record, fingerprint }], liveInput, union(), liveFp)).toBeNull();
+    expect(readyEvidence([{ ...record, sha: liveInput.sha, fingerprint }], liveInput, union(), liveFp)).toBeNull();
+  });
+  it('a store entry without a fingerprint cannot authorize another sha even when readiness carries', () => {
+    append();
+    const fingerprint = 'c'.repeat(64);
+    expect(readyEvidence([{ ...record, fingerprint }], { ...input, sha: 'b'.repeat(40) }, union(), fingerprint)).toBeNull();
+  });
+  it('malformed optional fingerprints remain unreadable and grant no waiver', () => {
+    fs.mkdirSync(join(path, '..'), { recursive: true });
+    for (const fingerprint of [null, true, 12, '', 'c'.repeat(63), 'z'.repeat(64)]) {
+      fs.writeFileSync(path, JSON.stringify(entry({ fingerprint })) + '\n');
+      const warn = vi.fn();
+      expect(readStore({ path, fs, warn })).toEqual({ entries: [], error: null });
+      expect(warn).toHaveBeenCalledTimes(1);
+      expect(gate(union({ warn }))).toBeNull();
+    }
   });
   it('rejects unknown fields in validation and append without writing', () => {
-    for (const extra of [{ fingerprint: 'c'.repeat(64) }, { unexpected: true }]) {
+    for (const extra of [{ fingerprint: 'invalid' }, { unexpected: true }]) {
       const value = entry(extra);
       expect(validateEntry(value)).toBe(false);
       expect(() => append(value)).toThrow(/invalid ruled-weakened entry/);

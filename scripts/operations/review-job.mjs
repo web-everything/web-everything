@@ -115,6 +115,7 @@ import {
 import { assertMainNotStale, dispatchReview, isReviewCodePath, planReviewDispatch } from './review-dispatch.mjs';
 import { runReport } from './completion-cli.mjs';
 import { writeReviewJobDone, writeReviewJobStarted } from './review-job-envelope.mjs';
+import { reviewSeatLaunchEnv } from '../lib/review-seat-caps.mjs';
 import { workerWrapperEnabledFor } from './worker-wrapper-launch.mjs';
 import { tryReadCompletion } from './completion-store.mjs';
 import { rateAndRecordReviewJob } from '../conveyor/run-rating.mjs';
@@ -426,7 +427,7 @@ export function createReviewJobIo({ root = REPO_ROOT, env = process.env, dir = r
       ? { sha: record.sha, at: record.at } : null;
   },
   queueBaseline = () => resolveLiveQueueBaseline({ checkoutRoot: root, env }),
-  seatAvailable = provider => createRedTeamIo({ root, env }).cliAvailable(provider),
+  seatAvailable = provider => createRedTeamIo({ root, env }).cliAvailable(provider), spawnSpeculative = spawn,
   log = line => writeLineSync(2, `[${new Date().toISOString()}] ${line}`),
 } = {}) {
   // Keep rollback authority in this process; the runner's admission file is untrusted.
@@ -479,6 +480,8 @@ export function createReviewJobIo({ root = REPO_ROOT, env = process.env, dir = r
       publishNeedsYou: isUnderTest(env) || isUnderTest(process.env) ? () => {} : item => publishAttention(item),
     } }),
     clearRedTeamQueued: restoreAdmission,
+    planRedTeamMode: ({ pr, repo, head }) => planRedTeamRecovery(readWitness({ pr, repo, head, env }),
+      { now: Date.now(), probe: recoveryProbe, deadlineMs: staleRunDeadlineMs(env), env }).mode,
     redTeamStatus: input => {
       const head = input.loopPayload?.findings?.read?.netBasis?.rev;
       const key = { repo: input.repo, pr: input.pr, head, env };
@@ -750,11 +753,11 @@ export function createReviewJobIo({ root = REPO_ROOT, env = process.env, dir = r
       for (const f of [handle.readSink, handle.passFile, handle.reservedFile]) { try { rmSync(f, { force: true }); } catch { /* fresh */ } }
       const fd = openSync(handle.logFile, 'w');
       try {
-        const child = spawn(process.execPath, [
+        const child = spawnSpeculative(process.execPath, [
           ...heapCapArgs('review-extra-seats'),
           'scripts/operations/review-extra-seats.mjs', 'red-team-speculate', `--pr=${pr}`, `--repo=${repo}`, `--lane=${lanePath}`,
           `--read-sink=${handle.readSink}`, `--out=${handle.passFile}`, `--wait-ms=${waitMs}`,
-        ], { cwd: root, env, stdio: ['ignore', fd, fd], detached: true });
+        ], { cwd: root, env: reviewSeatLaunchEnv(env), stdio: ['ignore', fd, fd], detached: true });
         child.unref();
         if (!child.pid) return null;
         return { ...handle, pid: child.pid, startedAt: Date.now() };
@@ -1342,6 +1345,10 @@ function runReviewArc({
       return result({ ...classified, lanePath });
     };
     if (redTeamOnly) {
+      if (redTeamMode === 'auto') {
+        const mode = io.planRedTeamMode({ pr: planned.pr, repo: planned.repo, head });
+        redTeamMode = ['fresh', 'resume'].includes(mode) ? mode : 'fresh';
+      }
       if (!['fresh', 'resume'].includes(redTeamMode)) throw Error('unknown red-team mode; inspect recovery settings before retrying');
       const stored = io.readRedTeamOnlyPayload({ pr: planned.pr, repo: planned.repo, head });
       let loopPayload = stored?.loopPayload;
@@ -1502,7 +1509,7 @@ export function dispatchReviewJob({
   dir = reviewJobsDir(env, root),
   spawnJob = defaultSpawnJob,
   readCompletion = (slug) => { try { return tryReadCompletion(slug); } catch { return null; } },
-  resolveSettingsEnv = () => resolveGhShimSettingsEnv(undefined),
+  resolveSettingsEnv = () => resolveGhShimSettingsEnv(undefined, { env }),
   isAlive = pidAlive,
   checkoutExists = existsSync, home = homedir(), expectedHead, io = createReviewJobIo({ root, env }),
 } = {}) {
@@ -1535,7 +1542,7 @@ export function dispatchReviewJob({
     && !(ci.affected ?? []).some(row => ['wrong-head', 'malformed', 'missing'].includes(row.reason));
   if (!ci?.allowed && !waived) return { pr: planned.pr, repo: planned.repo, headSha: ci?.headSha ?? null, skipped: formatReviewCiSkip(ci), ci };
   const settingsEnv = resolveSettingsEnv() || {};
-  const childEnv = { ...env, ...settingsEnv };
+  const childEnv = reviewSeatLaunchEnv(env, settingsEnv);
   // The dispatcher's own actor id (if it happens to run inside a session) must never leak into the job — the
   // job mints its own per round.
   delete childEnv[ACTOR_ENV];
@@ -1706,8 +1713,8 @@ export function runReviewJobCli(argv = process.argv.slice(2), { runJob = runRevi
     try {
       if (rest.some(arg => arg === '--red-team-plan' || arg.startsWith('--red-team-plan='))) throw Error('removed --red-team-plan; recovery is decided by the job');
       const lane = Number(flag('prefer-lane'));
-      // Bare legacy flag is fresh-guarded; explicit modes survive detached dispatch.
-      const redTeamMode = flag('red-team-only') ?? 'fresh';
+      // Bare legacy flag selects recovery automatically; explicit modes stay strict.
+      const redTeamMode = flag('red-team-only') ?? (rest.includes('--red-team-only') ? 'auto' : 'fresh');
       const redTeamOnly = rest.includes('--red-team-only') || flag('red-team-only') !== undefined;
       const out = runJob({ pr: flag('pr'), repo: flag('repo'), redTeamOnly, redTeamMode, onSessionSlug,
         ...(flag('expected-head') === undefined ? {} : { expectedHead: flag('expected-head') }),
