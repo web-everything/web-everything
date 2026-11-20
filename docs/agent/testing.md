@@ -5510,6 +5510,11 @@ permits a fresh full review (R640); any live-head review prevents this proof.
 
 A process-local summary cache binds each directory/id to mtimeMs, ctimeMs, device,
 size and inode; a difference in any field forces a fresh read and validation.
+Read exceptions retain the current hold without caching a failed summary; the next
+scan retries even when metadata is unchanged. Returned payloads rejected by scanner
+validation remain cached as invalid for that identity. The transient-read regression
+in `redteam-pending-settle.test.mjs` covers repeated EMFILE failures and full-review
+dispatch recovery for PR, prep and ledger-check records without settling red-team pending.
 Only cache misses consume `runs.scan.maxParses`, resolved through the shared settings
 cascade. Reaching the limit returns false while retaining verified summaries for the
 next tick. Operators can wait for subsequent ticks, inspect omitted evidence, or

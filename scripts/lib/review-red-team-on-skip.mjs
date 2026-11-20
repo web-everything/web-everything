@@ -452,9 +452,11 @@ export function headNeverReviewedFromRuns({ repo, pr, head, env = process.env,
       if (summary?.identity !== before) {
         if (parsed >= maxParses) return false; // Next tick resumes; operators can inspect or raise runs.scan.maxParses.
         parsed++;
+        neverReviewedSummaryCache.delete(key);
+        // A failed read holds this scan but must be retried even if metadata stays unchanged.
+        const run = read(id, runsDir);
         summary = { identity: before, valid: false };
         try {
-          const run = read(id, runsDir);
           if (!id.startsWith('review-pr-')) {
             assertRunRecord(run);
             if (run.op === 'review-pr' || !run.op.startsWith('review-') || !id.startsWith(`${run.op}-`)) {

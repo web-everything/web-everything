@@ -794,6 +794,33 @@ describe('headNeverReviewedFromRuns complete bounded proof', () => {
     f[method] = () => { throw Error('unreadable run scan'); };
     expect(scan(f)).toBe(false);
   });
+  it.each(['review-pr', 'review-prep', 'review-ledger-check'])('retries transient %s read failures without a metadata change and recovers full-review dispatch', op => {
+    const id = `${op}-00000000-0000-0000-0000-000000000000`;
+    const record = op === 'review-pr' ? run() : newRunRecord({ id, op, input: { repo } });
+    const f = scanFixture({ [id]: record });
+    f.scanSettings.file.runs.scan.maxParses = 1;
+    const unreadable = () => { throw Object.assign(Error('too many open files'), { code: 'EMFILE' }); };
+    f.read.mockImplementationOnce(unreadable).mockImplementationOnce(unreadable);
+    const o = runFixture({ readEvidence: () => ({ ok: false, reason: 'review-unfinished' }),
+      headNeverReviewed: () => scan(f) });
+    expect(mod.runRedTeamOnSkip(o).rows[0]).toMatchObject({ action: 'skip' });
+    expect(f.read).toHaveBeenCalledTimes(1);
+    expect(mod.runRedTeamOnSkip(o).rows[0]).toMatchObject({ action: 'skip' });
+    expect(f.read).toHaveBeenCalledTimes(2);
+    expect(o.dispatch).not.toHaveBeenCalled();
+    expect(mod.runRedTeamOnSkip(o).rows[0]).toMatchObject({ action: 'review' });
+    expect(o.dispatch).toHaveBeenCalledWith({ repo, pr });
+    expect(o.settlePending).not.toHaveBeenCalled();
+    expect(f.read).toHaveBeenCalledTimes(3);
+    expect(scan(f)).toBe(true);
+    expect(f.read).toHaveBeenCalledTimes(3);
+  });
+  it('caches successfully read malformed evidence for its unchanged identity', () => {
+    const f = scanFixture({ 'review-pr-malformed': {} });
+    expect(scan(f)).toBe(false);
+    expect(scan(f)).toBe(false);
+    expect(f.read).toHaveBeenCalledTimes(1);
+  });
   it('proves no exact-head review after exactly 400 parsed old-head runs', () => {
     const f = scanFixture(Object.fromEntries(Array.from({ length: 400 }, (_, i) => [`review-pr-${i}`, run()])));
     expect(scan(f)).toBe(true); expect(f.read).toHaveBeenCalledTimes(400);
