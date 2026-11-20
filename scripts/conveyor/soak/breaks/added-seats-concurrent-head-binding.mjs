@@ -2,6 +2,7 @@
 import { spawnSync } from 'node:child_process';
 import { join, resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
+import { ghRepoSlug } from '../../../lib/constellation-repos.mjs';
 
 const ROOT = resolve(fileURLToPath(import.meta.url), '../../../../..');
 
@@ -30,7 +31,7 @@ export function exercise(runReviewJob) {
       recordDiscardedSeats: () => { calls.push('spend'); return { status: 'recorded' }; }, cleanupSpeculativeSeats: () => calls.push('cleanup'),
       runExtraSeats: () => { calls.push('sequential'); return { status: 'ran', seats: [] }; },
     };
-    const result = runReviewJob({ pr: 7, repo: 'web-everything/web-everything', pid: 1 }, io);
+    const result = runReviewJob({ pr: 7, repo: ghRepoSlug('we'), pid: 1 }, io);
     const expected = moved ? ['start', 'loop', 'cancel', 'spend', 'cleanup'] : ['start', 'loop', 'finish', 'cleanup'];
     if (JSON.stringify(calls) !== JSON.stringify(expected)) violations.push(`moved=${moved}: wrong concurrent order ${calls.join(',')}`);
     if (result.extraSeats?.status !== (moved ? 'discarded' : 'ran')) violations.push(`moved=${moved}: incorrect evidence status`);
