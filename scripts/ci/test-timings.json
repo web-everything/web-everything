@@ -76,6 +76,7 @@
   "module-resolution/__tests__/provider.test.ts": 0.01,
   "repro-bundle/__tests__/repro-bundle.test.ts": 0.01,
   "reproduction-parity/__tests__/shadcn.test.ts": 0.02,
+  "scripts/__tests__/lane-pool-branch.test.mjs": 32.01,
   "scripts/__tests__/apply-review-request.test.mjs": 0.04,
   "scripts/__tests__/audit-backlog-health.test.mjs": 0.1,
   "scripts/__tests__/backlog-5874-followups.test.mjs": 0.9,

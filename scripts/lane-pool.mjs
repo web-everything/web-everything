@@ -33,6 +33,7 @@ import { isTerminalStatus } from './lib/backlog-status.cjs';
  *   node scripts/lane-pool.mjs path    --lane=N                     # print one lane's absolute path
  *   node scripts/lane-pool.mjs acquire [--purpose=<slug>] [--session=<slug>] [--lane=N] [--item=NNN[,NNN…]] [--ttl-minutes=N] [--no-reset] [--no-reap] [--base=<ref>] [--scope=<repo:path,...>] [--reserve] [--wait-ms=N] [--no-free-list] [--free-list-max-age-ms=N] [--json]  # #2275 lease a free lane (exclusive) + reset to origin/main (or, with #2386 --base=<ref>, to a predecessor lane's pushed tip); stdout = its path. #4122: auto-pick tries `we:scripts/conveyor/lane-pool-health-watch.mjs`'s pre-computed free-lane list FIRST (near-zero git) when it exists and is fresh (< --free-list-max-age-ms / LANE_POOL_FREE_LIST_MAX_AGE_MS, default 10min) — every candidate is still atomically claimed + re-verified fresh before it's ever handed out, so a stale entry costs at most a lost race, never a clobbered lane; --no-free-list opts out. Falls back to today's shared, single-flight, cached full-pool scan (#xn432dz/#3383) unchanged, only when the list is missing, stale or exhausted. #x3jmao3: auto-pick (no --lane) bounded retry — --wait-ms=<total> polls (ACQUIRE_POLL_MS spacing, no busy-wait) for up to that many ms before the "no free lane" failure (omitted ⇒ 8000ms, overridden by LANE_POOL_ACQUIRE_DEFAULT_WAIT_MS; invalid env falls back to 8000ms; explicit --wait-ms=0 ⇒ instant-fail); a genuinely-exhausted pool still fails with the identical message once the bound elapses. #2748: BEFORE selecting, a reaper backstop reclaims any PROVABLY-DEAD ghost lease in the pool (item resolved on main, or PR merged/closed) so a finished-but-unreleased lane never blocks a fresh dispatch — the pool ACTS on the ghost the board only flags; --no-reap opts out. #2413: --purpose=workflow-lane MARKS the lease (workflowLane:true) → the guard requires a sibling to assert its minted slug before a destructive op. #2560: --scope=<repo:path,...> declares this lane's ADVISORY predicted file-scope — persisted into the marker (the live scope-lease collector reads it) + warns on overlap, but NEVER gates the acquire (the whole-clone lease is the real lock). #2616: --item=NNN records this lane's item → lane in the lane-ports registry (same as `map`) so conveyor-state's health-stall scan can flag a genuinely stalled lane — the self-serve population a conveyor delivery agent needs (nothing else calls `map` for it). #2350: --reserve (requires --lane=N) mints a PERMANENT reserved lane — no TTL, never stale, off-limits to acquire/refresh/provision (even --force); dropped only by `release --release-reserved`. #2997: EVERY acquire now mints a per-holder `holder` slug into the lease and prints it (stderr + --json `holder`) — the one signal that separates this holder from a SIBLING agent of the same session, which `ownerSession` cannot; assert it as `--session=<slug>` (release) or `LANE_SESSION=<slug>` (a destructive git op) whenever a sibling of your session also holds a live lane. #2997 r2: --adopt also stamps YOU as the lane's OCCUPANT (`workerSession`) — pass it when the process running this acquire is the one that will work in the lane, omit it when you are leasing on someone else's behalf (they run `adopt` instead).
  *   node scripts/lane-pool.mjs adopt   --lane=N [--force] [--json]   # #2997 r2 the dispatcher → worker OCCUPANCY hand-off: declare the CALLING session the agent working in lane-N (stamps `workerSession`), which is what arms guard-lane.mjs's Edit/Write refusal against every OTHER session. `ownerSession` cannot do this job — it records whoever RAN `acquire`, which for a dispatched lane is the dispatcher, not the worker. Idempotent; a lane already declared-occupied by a different LIVE session needs --force (a deliberate takeover, which names who is displaced).
+ *   node scripts/lane-pool.mjs branch --lane=N --session=<holder> --name=lane/<slug> [--from=<ref>] [--pool=<name>] # create and check out a branch in your leased clone only; default from HEAD
  *   node scripts/lane-pool.mjs release (--lane=N | --all | --all-pools (--session=<slug> | --item=<num>)) [--session=<slug>] [--pool=<name>] [--force] [--release-reserved] [--discard]   # #2275 hand a leased lane back to the pool (own lease, or --force); refuses unpushed commits or tracked changes unless --discard explicitly accepts their loss; #2350 --release-reserved is the deliberate un-reserve for a PERMANENT reserved lane (--force alone never drops one); #2667 --all-pools --session sweeps EVERY pool under POOL_ROOT and releases that session's leases (cross-locus couple cleanup in one call), and --pool=<name> selects a pool by dir-name (no checkout path needed); #2748 --all-pools --item=<num> is the by-ITEM sweep the drain's release-on-land uses (matches every lease whose session encodes that item number — needs no exact slug); #2997 a CONTESTED lease (another live lease — in ANY pool under POOL_ROOT, per r2 — shares its ownerSession, i.e. a sibling agent of yours holds a lane) is never released on the ownerSession match alone — pass `--session=<the holder slug acquire printed>` or `--force`. A STALE lease is never contested (r2): a dead holder has nothing to prove, so an expired lease releases without --force exactly as on main.
  *   node scripts/lane-pool.mjs remove  (--lane=N | --all) [--dry-run] # tear down lane(s); #2350 REFUSES a reserved lane (even --all/--force) — deliberate teardown is `remove --lane=N --release-reserved`
  *   node scripts/lane-pool.mjs salvage-unpushed [--dry-run]  # park free lanes’ branch/HEAD/stash tips on origin, verify all SHAs, then reset; never touches live leases
@@ -5615,6 +5616,73 @@ function cmdReclaimSalvage(repo, { n, dir, dryRun, lease, proof }) {
 // silences a lane number — it silences THIS content, and the moment the lane's content changes (new work
 // lands, or a fresh `acquire`/`reclaim` resets it for reuse), the old decision stops applying on its own and
 // the lane is free to resurface if it once again needs one.
+// A branch is created only in an independently cloned lane held by this exact holder.
+// No lease branch field exists in leaseBody; leave the marker byte-for-byte unchanged.
+function cmdBranch(repo) {
+  const n = Number(flags.lane);
+  if (!Number.isSafeInteger(n) || n < 1) fail('branch needs --lane=<positive integer>');
+  if (typeof flags.session !== 'string' || !flags.session.trim()) fail('branch needs --session=<holder>');
+  const name = flags.name;
+  if (typeof name !== 'string' || !/^lane\/[A-Za-z0-9._-]+$(?![\s\S])/.test(name)
+    || name.includes('..') || name.startsWith('lane/-')) fail('branch: invalid --name; use lane/<slug> (no .. or leading -)');
+  const dir = laneDir(repo, n);
+  const refuse = reason => fail(`branch lane-${n}: ${reason}`);
+  const branchGit = args => git(args, dir, { env: releaseEvidenceEnv(args) });
+  try {
+    // Reject symlinks, worktrees and shared gitdirs before reading a marker or running git.
+    if (dirname(resolve(repo.poolDir)) !== resolve(POOL_ROOT)
+      || realpathSync(repo.poolDir) !== join(realpathSync(POOL_ROOT), basename(repo.poolDir))
+      || !lstatSync(dir).isDirectory() || !lstatSync(join(dir, '.git')).isDirectory()
+      || realpathSync(dir) !== join(realpathSync(repo.poolDir), `lane-${n}`)
+      || realpathSync(join(dir, '.git')) !== join(realpathSync(dir), '.git')
+      || realpathSync(dir) === realpathSync(repo.referencePath)) {
+      refuse('requires its own clone; shared checkout or symlink refused');
+    }
+    const root = branchGit(['rev-parse', '--show-toplevel']);
+    const common = branchGit(['rev-parse', '--git-common-dir']);
+    if (realpathSync(root) !== realpathSync(dir)
+      || realpathSync(resolve(dir, common)) !== realpathSync(join(dir, '.git'))) {
+      refuse('requires its own clone; shared repository refused');
+    }
+  } catch {
+    refuse('lane directory/repository unknown or unreadable');
+  }
+  const lease = readLease(dir, () => refuse('lease unreadable'));
+  if (!lease) refuse('lane is unleased');
+  if (typeof lease.holder !== 'string' || !lease.holder.trim()) refuse('lease holder unknown');
+  if (lease.holder !== flags.session) refuse('session does not match lease holder');
+  if (!Number.isFinite(Date.parse(lease.acquiredAt)) || isLeaseStale(lease, Date.now(), ttlMsFromFlags())) refuse('lease stale or undatable; re-acquire the lane');
+  const hold = checkLaneHold(dir, { action: 'reset', byHolder: true });
+  if (!hold.allowed) refuse(hold.reason);
+  try { branchGit(['check-ref-format', `refs/heads/${name}`]); }
+  catch { refuse('invalid --name for a git branch'); }
+  try {
+    // Unlike tryGit/status fallbacks, a failed read must never mean clean or absent.
+    const branches = branchGit(['for-each-ref', '--format=%(refname)', `refs/heads/${name}`]).split('\n');
+    if (branches.includes(`refs/heads/${name}`)) refuse('branch already exists');
+    const tracked = releaseTrackedChanges(dir);
+    if (tracked === null) refuse('tracked worktree state unreadable');
+    if (tracked || branchGit(['status', '--porcelain', '--untracked-files=all'])) refuse('dirty worktree');
+  } catch { refuse('branch/worktree state unreadable'); }
+  const from = flags.from === undefined ? 'HEAD' : flags.from;
+  if (typeof from !== 'string' || !from || from.startsWith('-')) refuse('--from does not resolve to a commit');
+  let commit;
+  try { commit = branchGit(['rev-parse', '--verify', `${from}^{commit}`]); }
+  catch { refuse('--from does not resolve to a commit'); }
+  if (!/^[a-fA-F0-9]{40}$/.test(commit)) refuse('--from commit unreadable');
+  const current = readLease(dir, () => refuse('lease unreadable before switch'));
+  if (!current || current.holder !== lease.holder
+    || !Number.isFinite(Date.parse(current.acquiredAt))
+    || isLeaseStale(current, Date.now(), ttlMsFromFlags())) refuse('lease holder changed or lease stale before switch');
+  if (flags['dry-run']) {
+    process.stdout.write(`would create ${name} at ${commit} in lane-${n}\n`);
+    return;
+  }
+  try { branchGit(['switch', '-c', name, commit]); }
+  catch (error) { refuse(`git switch failed: ${String(error.message).replace(/[\p{Cc}\p{Cf}\u2028\u2029]/gu, ' ')}`); }
+  process.stdout.write(`${name}\n`);
+}
+
 function cmdKeep(repo) {
   const n = Number(flags.lane);
   if (!Number.isInteger(n) || n < 1) {
@@ -5719,7 +5787,7 @@ function cmdUnmap(repo) {
 // reset it — no error, no warning, the exact silent-failure shape lane-pool already goes to lengths to avoid
 // elsewhere (dirty/ahead guards, live-lease guards). This is a flat, not per-command, allowlist: a command
 // reading a flag meant for a different command is a much smaller, less surprising mistake than an
-// unrecognized flag vanishing outright, and a flat set can't drift out of sync with which command reads what.
+// unrecognized flag vanishing outright. Branch's --from is explicitly scoped below.
 const KNOWN_FLAGS = new Set([
   'acquirable', 'adopt', 'all', 'all-pools', 'base', 'branch', 'count', 'discard', 'force', 'item', 'json', 'lane',
   'name', 'no-install', 'no-reap', 'no-reset', 'origin', 'pool', 'purpose', 'reference', 'release-reserved',
@@ -5826,6 +5894,7 @@ const COMMANDS = {
   acquire: cmdAcquire,
   adopt: cmdAdopt,
   release: cmdRelease,
+  branch: cmdBranch,
   remove: cmdRemove,
   trim: cmdTrim,
   reclaim: cmdReclaim,
@@ -5837,7 +5906,7 @@ const COMMANDS = {
 if (!cmd || cmd === 'help' || cmd === '--help' || !COMMANDS[cmd]) {
   if (cmd && cmd !== 'help' && cmd !== '--help') process.stderr.write(`unknown command: ${cmd}\n`);
   process.stderr.write(
-    'usage: lane-pool.mjs <gc|heal-siblings|salvage-unpushed|provision|refresh|status|list|path|acquire|adopt|release|remove|trim|reclaim|keep|map|unmap> [--count=N] [--lane=N] [--all] [--all-pools] [--acquirable] [--max-new=N] ' +
+    'usage: lane-pool.mjs <gc|heal-siblings|salvage-unpushed|provision|refresh|status|list|path|acquire|adopt|release|branch|remove|trim|reclaim|keep|map|unmap> [--count=N] [--lane=N] [--all] [--all-pools] [--acquirable] [--max-new=N] ' +
       '[--item=NNN[,NNN…]] [--purpose=<slug>] [--session=<slug>] [--expect-holder=<slug>] [--adopt] [--base=<ref>] [--scope=<repo:path,...>] [--reserve] [--release-reserved] [--ttl-minutes=N] [--no-reset] [--no-reap] [--limit=N] [--no-cache] [--cache-ttl-ms=N] [--scan-timeout-ms=N] [--list-contention-grace-ms=N] [--repo=<path>] [--pool=<name>] [--origin=<url>] ' +
       '[--reference=<path>] [--name=<slug>] [--branch=<ref>] [--no-install] [--force] [--json] [--max=N] [--dry-run] [--override] [--reason=<text>] ' +
       '[--no-free-list] [--free-list-max-age-ms=N] [--leased-only]  # trim: shrink a pool to --max lanes (default per-repo cap; env LANE_POOL_TRIM_MAX)\n' +
@@ -5858,6 +5927,7 @@ if (!cmd || cmd === 'help' || cmd === '--help' || !COMMANDS[cmd]) {
       'finished-needs-review lane the operator reviewed by eye — explicit, logged, never automatic; --salvage snapshots ' +
       'unpreserved content (bundle + patch + refs/salvage/*, indexed under ~/.claude/lane-salvage) THEN resets, only ' +
       'when no live owner/process is in the lane and it has been quiet (WE_LANE_SALVAGE_QUIET_MIN, default 30)\n' +
+      '  # branch --lane=N --session=<holder> --name=lane/<slug> [--from=<ref>]: create and check out a branch in your leased clone (default HEAD); --pool selects the pool\n' +
       '  # keep --lane=N [--reason=<text>] [--json]: record "I looked at this lane, leave it" so operator-queue\'s ' +
       'LANE RECLAIM section excludes it until its content changes (#4139)\n',
   );
@@ -5867,7 +5937,7 @@ if (!cmd || cmd === 'help' || cmd === '--help' || !COMMANDS[cmd]) {
 if (positionals.length) {
   fail(`unexpected extra argument(s) after "${cmd}": ${positionals.join(' ')} — every lane-pool.mjs argument past the command is a --flag`);
 }
-const unknownFlags = Object.keys(flags).filter((f) => !KNOWN_FLAGS.has(f));
+const unknownFlags = Object.keys(flags).filter((f) => !KNOWN_FLAGS.has(f) && !(cmd === 'branch' && f === 'from'));
 if (unknownFlags.length) {
   fail(
     `unrecognized flag(s): ${unknownFlags.map((f) => `--${f}`).join(', ')} — run \`node scripts/lane-pool.mjs help\` for the ` +
@@ -5885,4 +5955,5 @@ if (flags.lane !== undefined && (
   fail('--lane requires a lane number');
 }
 
-await COMMANDS[cmd](resolveRepo());
+// branch owns --name as the new branch name, rather than the legacy pool-name override.
+await COMMANDS[cmd](resolveRepo(cmd === 'branch' ? { ...flags, name: undefined } : flags));
