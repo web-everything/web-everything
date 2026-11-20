@@ -5144,7 +5144,11 @@ same locked library helper; recovery failure must prevent retirement and unload 
 `scripts/settings/orchestrator-authority.json` and platform `orchestrator.authority.redMainQuarantine`
 through `readPlatformPreferences().prefs.orchestrator` using only its default paths. Missing current
 platform or operator files deny authority; absent optional legacy files are allowed. Unreadable or
-invalid platform evidence still denies authority. The repo reader uses
+invalid platform evidence still denies authority. Authority reads validate raw JSON in every platform
+file (including legacy files) before merging: duplicate object keys, including escape-equivalent names
+and repeated parent blocks, deny access even when a later file or the repo grants it. Fix the ambiguous
+file to restore an explicit grant. Repeated names in separate objects and punctuation inside strings
+are valid. The repo reader uses
 `readSettingsChecked`: duplicate ownership or read taint denies authority even over a platform grant.
 For this explicit authority grant, platform wins over
 repo in both directions; only boolean `true` grants access, and invalid values deny it. There is

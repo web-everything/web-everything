@@ -3,6 +3,7 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { resolveOrchestratorAuthority } from '../orchestrator-authority-settings.mjs';
+import { addEntries, removeEntries, pruneOnGreen } from '../red-main-quarantine.mjs';
 import * as settings from '../settings-files.mjs';
 import { readDeclaredSettings, readSettingsChecked } from '../settings-files.mjs';
 import { LEGACY_PLATFORM_PREFERENCES_PATHS, PLATFORM_PREFERENCES_PATH, operatorPreferencesPath } from '../policy-cascade.mjs';
@@ -64,6 +65,38 @@ describe('orchestrator authority settings', () => {
     });
     expect(resolveOrchestratorAuthority({ env: {}, tool: block(false), readFile })).toEqual({ redMainQuarantine: true });
     for (const path of LEGACY_PLATFORM_PREFERENCES_PATHS) expect(readFile).toHaveBeenCalledWith(path, 'utf8');
+  });
+  describe.each([...LEGACY_PLATFORM_PREFERENCES_PATHS, PLATFORM_PREFERENCES_PATH, operatorPreferencesPath({})])('raw authority evidence in %s', path => {
+    const resolve = evidence => resolveOrchestratorAuthority({
+      env: {}, tool: block(false),
+      readFile: file => file === path ? evidence : '{}',
+    }).redMainQuarantine;
+    it.each([
+      ['conflicting leaf', '{"orchestrator":{"authority":{"redMainQuarantine":false,"redMainQuarantine":true}}}'],
+      ['repeated grant', '{"orchestrator":{"authority":{"redMainQuarantine":true,"redMainQuarantine":true}}}'],
+      ['authority blocks', '{"orchestrator":{"authority":{"redMainQuarantine":false},"authority":{"redMainQuarantine":true}}}'],
+      ['orchestrator blocks', '{"orchestrator":{"authority":{"redMainQuarantine":false}},"orchestrator":{"authority":{"redMainQuarantine":true}}}'],
+      ['escaped leaf', String.raw`{"orchestrator":{"authority":{"redMainQuarantine":false,"redMain\u0051uarantine":true}}}`],
+      ['escaped parent', String.raw`{"orchestrator":{},"\u006frchestrator":{"authority":{"redMainQuarantine":true}}}`],
+      ['duplicate inside array', '{"metadata":[{"x":false,"x":true}],"orchestrator":{"authority":{"redMainQuarantine":true}}}'],
+    ])('denies %s before it can authorize add/remove/prune', (_, evidence) => {
+      const orchestratorAuthority = resolve(evidence);
+      const options = { actor: 'orchestrator', orchestratorAuthority, tests: ['scripts/lib/__tests__/example.test.mjs'],
+        brokenSha: 'a'.repeat(40), owner: 'owner', reason: 'red', now: 1_800_000_000_000 };
+      for (const result of [addEntries(null, options), removeEntries(null, options), pruneOnGreen(null, { ...options, mainGreen: true })]) {
+        expect(result).toMatchObject({ ok: false, error: expect.stringContaining('orchestrator.authority.redMainQuarantine') });
+      }
+      expect(orchestratorAuthority).toBe(false);
+    });
+    it('does not let a later valid grant hide ambiguous evidence or fall back to repo true', () => {
+      const grant = JSON.stringify({ orchestrator: block(true) });
+      const readFile = file => file === path ? '{"orchestrator":{},"orchestrator":{}}' : grant;
+      expect(resolveOrchestratorAuthority({ env: {}, tool: block(true), readFile }).redMainQuarantine).toBe(false);
+    });
+    it('accepts escaped names, punctuation in strings and repeated names in separate objects', () => {
+      const evidence = String.raw`{"metadata":[{"x":"\" }, [ : \\"},{"x":true}],"\u006frchestrator":{"authority":{"redMain\u0051uarantine":true}}}`;
+      expect(resolve(evidence)).toBe(true);
+    });
   });
   it('denies missing current platform evidence even with an operator grant', () => {
     const readFile = platformFiles(JSON.stringify({ orchestrator: block(true) }));

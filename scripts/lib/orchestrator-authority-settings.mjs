@@ -3,6 +3,33 @@ import { resolveCascade, readPlatformPreferences, logCascadeSources, PLATFORM_PR
 import { readFileSync } from 'node:fs';
 import { readSettingsChecked } from './settings-files.mjs';
 
+// Validate raw evidence before the shared, lenient reader collapses duplicate keys. Keep this
+// authority-specific: other platform policies retain their existing preference semantics.
+function checkPlatformAuthorityJson(text) {
+  JSON.parse(text); // Only scan valid JSON; string punctuation is never container syntax.
+  const containers = [];
+  for (let i = 0; i < text.length; i++) {
+    const char = text[i];
+    if (char === '{') containers.push(new Set());
+    else if (char === '[') containers.push(null);
+    else if (char === '}' || char === ']') containers.pop();
+    else if (char === '"') {
+      const start = i++;
+      while (i < text.length && text[i] !== '"') {
+        if (text[i] === '\\') i++;
+        i++;
+      }
+      let next = i + 1;
+      while (next < text.length && /\s/.test(text[next])) next++;
+      if (text[next] !== ':') continue;
+      const key = JSON.parse(text.slice(start, i + 1));
+      const keys = containers.at(-1);
+      if (keys.has(key)) throw new Error('ambiguous platform authority: duplicate JSON key');
+      keys.add(key);
+    }
+  }
+}
+
 export function resolveOrchestratorAuthority({ env = process.env, platform, tool, readFile = readFileSync, log } = {}) {
   const checked = tool === undefined ? readSettingsChecked({ namespace: 'authority' }) : null;
   if (checked) tool = { authority: checked.value };
@@ -12,8 +39,11 @@ export function resolveOrchestratorAuthority({ env = process.env, platform, tool
     // Authority must always consult the default platform files, including operator revocations.
     env: {},
     readFile: (path, encoding) => {
-      try { return readFile(path, encoding); }
-      catch (error) {
+      try {
+        const text = String(readFile(path, encoding));
+        checkPlatformAuthorityJson(text);
+        return text;
+      } catch (error) {
         // Legacy migration files may be absent; current authority evidence may not.
         if (error?.code === 'ENOENT' && requiredPlatformPaths.has(path)) requiredPlatformMissing = true;
         throw error;
