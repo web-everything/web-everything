@@ -6,6 +6,7 @@
 import { join } from 'node:path';
 import { pathToFileURL } from 'node:url';
 
+const REPO = 'web-everything/web-everything';
 const HEAD = 'c'.repeat(40);
 
 export default {
@@ -22,7 +23,7 @@ export default {
     const violations = [];
     const verdict = { verdict: 'send-back', reasons: ['no-parseable-findings-for-trigger'],
       evidence: { trigger: 'red-team-cap', head: HEAD.slice(0, 12), filesKnown: true, crossBroken: 0, grantsSoFar: 0, guardFiles: [], latest: [], latestCount: 0, classes: { broken: 0, degraded: 0, unconfirmed: 0 } } };
-    const at = (ageMinutes) => classifyStall({ head: HEAD, verdict, files: ['scripts/foo.mjs'], row: { repo: 'web-everything/web-everything', number: 7188,
+    const at = (ageMinutes) => classifyStall({ head: HEAD, verdict, files: ['scripts/foo.mjs'], row: { repo: REPO, number: 7188,
       waitingOn: 'ruling-needed:red-team-round-cap', actor: 'operator', stalled: true, liveJob: null, why: 'x', evidence: [], next: { summary: 's', command: 'c' }, ageMinutes } });
     const fresh = at(2);
     if (fresh !== null) violations.push(`unreadable findings one minute after the confirm were ruled on (${fresh.action})`);
