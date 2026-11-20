@@ -25,7 +25,9 @@ if (import.meta.url === pathToFileURL(process.argv[1] || '').href) {
     const output = runGhSync(process.argv.slice(3), {
       ...JSON.parse(process.argv[2]), maxBuffer: 64 * 1024 * 1024,
       stdio: ['inherit', 'pipe', 'pipe'],
-      throttle: { caller: 'merge-ai-prs.mjs', bin: process.env.WE_GH_THROTTLE_GH_BIN || 'gh' },
+      // Gate evidence (required checks, rollups) must be live: never serve it from the read memo.
+      throttle: { caller: 'merge-ai-prs.mjs', bin: process.env.WE_GH_THROTTLE_GH_BIN || 'gh',
+        env: Object.fromEntries(Object.entries(process.env).filter(([k]) => k !== 'WE_GH_READ_MEMO_DIR')) },
     });
     process.stdout.write(output);
   } catch (error) {

@@ -79,3 +79,27 @@ setInterval(() => {}, 1000);
     rmSync(root, { recursive: true, force: true });
   }
 }, 15000);
+
+it('never serves async gate reads from the gh read memo', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'drain-memo-'));
+  try {
+    const bin = join(root, 'bin');
+    mkdirSync(bin);
+    const counter = join(root, 'count');
+    writeFileSync(counter, '0');
+    writeFileSync(join(bin, 'gh'), `#!/usr/bin/env node
+const fs = require('node:fs');
+const n = Number(fs.readFileSync(process.env.DRAIN_TEST_COUNT, 'utf8')) + 1;
+fs.writeFileSync(process.env.DRAIN_TEST_COUNT, String(n));
+process.stdout.write(JSON.stringify({ n }));
+`, { mode: 0o755 });
+    const env = { ...process.env, PATH: `${bin}:${process.env.PATH}`, VITEST: 'true',
+      DRAIN_TEST_COUNT: counter, WE_GH_THROTTLE_LOCK_ROOT: join(root, 'throttle'),
+      WE_GH_READ_MEMO_DIR: join(root, 'memo') };
+    const args = ['pr', 'view', '7', '--repo', 'o/r', '--json', 'statusCheckRollup'];
+    const a = await execDrainAsync('gh', args, { env, encoding: 'utf8' });
+    const b = await execDrainAsync('gh', args, { env, encoding: 'utf8' });
+    expect(JSON.parse(a.stdout).n).toBe(1);
+    expect(JSON.parse(b.stdout).n).toBe(2);
+  } finally { rmSync(root, { recursive: true, force: true }); }
+}, 15000);
