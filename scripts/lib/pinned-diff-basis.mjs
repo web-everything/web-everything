@@ -75,6 +75,30 @@ export function isScorableDiffText(text) {
   return (!text || headers.length > 0) && headers.every(line => /^diff --git a\/(.+) b\/\1$/.test(line));
 }
 
+/**
+ * Paths of file sections Git rendered as binary (a NUL byte, an image, or an in-tree `-diff` attribute).
+ * Their bytes are invisible to every text scanner, so the diff stays scored at file level and these paths
+ * need a human clearance of the exact head. Column 0 is unambiguous: content lines carry a +/-/space prefix.
+ */
+export function opaqueDiffFiles(text) {
+  const files = [];
+  let path = null;
+  for (const line of String(text ?? '').split('\n')) {
+    if (line.startsWith('diff --git ')) { path = /^diff --git a\/(.+) b\/\1$/.exec(line)?.[1] ?? line; continue; }
+    const binary = (line.startsWith('Binary files ') && line.endsWith(' differ')) || line === 'GIT binary patch';
+    if (binary && !files.includes(path ?? '(unknown)')) files.push(path ?? '(unknown)');
+  }
+  return files;
+}
+
+/** Producer and drain share this: opaque content always requires `review:human` and a human clearance at this head. */
+export function opaqueDiffEscalation(text) {
+  const files = opaqueDiffFiles(text);
+  return files.length
+    ? { humanRequired: true, files, reasons: [`opaque binary content (${files.join(', ')}) — no scanner can read it; a human must clear this exact head`] }
+    : { humanRequired: false, files, reasons: [] };
+}
+
 /** Both callers refuse absent evidence; operators retry or review the full diff. */
 export function requireScoredNetDiff(sig, headSha) {
   if (!SHA.test(headSha ?? '') || !sig?.scored || !sig.netDiffText?.scored ||

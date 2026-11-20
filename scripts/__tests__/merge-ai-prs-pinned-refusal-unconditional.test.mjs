@@ -22,5 +22,21 @@ describe('merge path refuses an unpinned or unscored net diff regardless of REVI
     const block = src.slice(start, end);
     expect(block).toContain('pinnedDiffMergeRefusal(');
     expect(block.indexOf('pinnedDiffMergeRefusal(')).toBeLessThan(block.indexOf('hasUnclearedReviewLabel('));
+    // Opaque (binary) content needs the PR's complete trusted thread to find a head-bound human clearance.
+    expect(block).toMatch(/pinnedDiffMergeRefusal\(\{[^}]*readComments: \(\) => readCompletePrComments\(/);
+  });
+  it('the escalation path routes opaque content through the head-bound tamper clearance and never carries it', () => {
+    const src = readFileSync('scripts/merge-ai-prs.mjs', 'utf8');
+    const start = src.indexOf('const gaming = ');
+    const block = src.slice(start, src.indexOf('shouldReparkForTestTampering({', start) + 200);
+    expect(block.startsWith('const gaming = withOpaqueDiffHold(scanTestTampering(')).toBe(true);
+    expect(block).toMatch(/humanClearedSha !== tamperHeadSha && !gaming\.opaqueFiles/);
+  });
+  it('pr-land forces review:human for opaque content in the producer escalation', () => {
+    const src = readFileSync('scripts/pr-land.mjs', 'utf8');
+    const start = src.indexOf('const applyReviewEscalationLabel = () => {');
+    const block = src.slice(start, src.indexOf('const finalLabel = ', start));
+    expect(block).toContain('opaqueDiffEscalation(sig.netDiffText.text)');
+    expect(block).toMatch(/const humanRequired = [^\n]*opaque\.humanRequired/);
   });
 });

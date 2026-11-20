@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-import { resolvePinnedDiffBasis, isPinnedDiffBasis, stampDiffBasis, pinnedGit, readPinnedDiff, requireScoredNetDiff, isScorableDiffText } from './lib/pinned-diff-basis.mjs';
+import { resolvePinnedDiffBasis, isPinnedDiffBasis, stampDiffBasis, pinnedGit, readPinnedDiff, requireScoredNetDiff, isScorableDiffText, opaqueDiffEscalation } from './lib/pinned-diff-basis.mjs';
 import { assertCapability } from './lib/repo-profile.mjs';
 import { resolveHandoffSettings } from './lib/handoff-settings.mjs';
 import { writeLabelWithHandoff, signalFixDispatch } from './lib/fix-handoff.mjs';
@@ -781,15 +781,33 @@ export function readPinnedCarryDiff({ exec, headSha, carriedHeadSha, expected } 
   } catch { return null; } // Retain the hold; retry or request full human review.
 }
 
-/** Merge-path refusal, independent of review escalation: a candidate with no pinned, scored net diff must not merge. */
-export function pinnedDiffMergeRefusal({ exec, headSha, baseRev } = {}) {
+/**
+ * Merge-path refusal, independent of review escalation: a candidate with no pinned, scored net diff must not merge.
+ * Opaque (binary) content merges only on a trusted human clearance naming this exact head; `readComments` returns
+ * the PR's complete thread, and any read miss refuses.
+ */
+export function pinnedDiffMergeRefusal({ exec, headSha, baseRev, readComments } = {}) {
   const reason = 'net diff unscored or head mismatch; retry or request human review of the full diff';
   if (typeof exec !== 'function') return reason;
+  let sig;
   try {
     const basis = resolvePinnedDiffBasis({ exec, headSha });
-    requireScoredNetDiff(computeNetDiffSignals({ exec, basis, baseRev }), headSha);
-    return null;
+    sig = requireScoredNetDiff(computeNetDiffSignals({ exec, basis, baseRev }), headSha);
   } catch { return reason; }
+  const opaque = opaqueDiffEscalation(sig.netDiffText.text);
+  if (!opaque.humanRequired) return null;
+  let humanClearedSha = null;
+  try { humanClearedSha = typeof readComments === 'function' ? parseLatestHumanClearedSha(readComments()) : null; }
+  catch { humanClearedSha = null; }
+  if (humanClearedSha && humanClearedSha === String(headSha).toLowerCase()) return null;
+  return `${opaque.reasons.join('; ')} (review-set-label --to=clear-human on this head)`;
+}
+
+/** The drain's tamper gate, widened: opaque content is an unreadable test-tamper surface held for the exact-head clearance. */
+export function withOpaqueDiffHold(gaming, diffText) {
+  const opaque = opaqueDiffEscalation(diffText);
+  if (!opaque.humanRequired) return gaming;
+  return { ...gaming, tampered: true, opaqueFiles: opaque.files, reasons: [...(gaming?.reasons || []), ...opaque.reasons] };
 }
 
 /** The production tamper-park callback, shared with the carry wiring regression tests. */
@@ -4491,8 +4509,8 @@ export function computeNetDiffSignals({ exec, remote = 'origin', base = 'main', 
         } catch { /* cumulative scoring is the conservative fallback */ }
       }
       const text = diff(mergeBaseSha);
-      // Opaque content cannot grant tamper clearance; request full human review.
-      if (/^Binary files .* differ$/m.test(text)) return miss('opaque-diff');
+      // Binary sections stay scored at file level; every landing path holds them for a human clearance of this
+      // exact head (`opaqueDiffFiles` — the drain tamper gate, the no-escalation refusal and pr-land's escalation).
       if (!isScorableDiffText(text)) return miss('unparseable-diff');
       const netDiffText = { ...stamp, text, base: mergeBaseSha, rev: headSha, scored: true };
       return { ...stamp, ...own, humanBasisFiles: cumulative.changedFiles,
@@ -6429,7 +6447,8 @@ export async function main(argv, { env = process.env, stdout = process.stdout, e
         const bypassCwd = isLocalRepo(v.repo) ? undefined : siblingCloneDir(v.repo);
         const bypassExec = (v.headRef && (isLocalRepo(v.repo) || bypassCwd))
           ? (cmd, args, opts) => execFileSync(cmd, args, { cwd: bypassCwd, ...opts }) : null;
-        const refusal = pinnedDiffMergeRefusal({ exec: bypassExec, headSha: v.listedHeadSha, baseRev: v.base });
+        const refusal = pinnedDiffMergeRefusal({ exec: bypassExec, headSha: v.listedHeadSha, baseRev: v.base,
+          readComments: () => readCompletePrComments(v.num, { repo: v.repo || localSlug }) });
         if (refusal) { v.decision = 'skip'; v.reason = refusal; continue; }
       }
       if (hasUnclearedReviewLabel(v.prLabels, { allowPending })) {
@@ -6690,7 +6709,8 @@ export async function main(argv, { env = process.env, stdout = process.stdout, e
       // clone ⇒ no text ⇒ the scan is a no-op — the same fail-open the manifest baseline gate documents).
       // #2890 — `netDiffText` was already fetched above (feeding `scoreEscalation`'s `diffHunks`); reused here
       // rather than re-fetched, so this scan and the escalation score can never disagree on what changed.
-      const gaming = scanTestTampering({ diffText: netDiffText.text });
+      // Opaque (binary) sections widen the hold: no scanner reads them, so only a human clearance of this exact head lands them.
+      const gaming = withOpaqueDiffHold(scanTestTampering({ diffText: netDiffText.text }), netDiffText.text);
       // #xuboo0q — WAS THIS EXACT TAMPERING FINDING ALREADY HUMAN-CLEARED, AT THE CURRENT HEAD? Before #xuboo0q
       // this gate had no memory: it re-parked `review:human` on every drain pass that saw a tampering-shaped
       // diff, even seconds after a human ran the sanctioned `--to=clear-human` ceremony specifically to clear it
@@ -6720,7 +6740,8 @@ export async function main(argv, { env = process.env, stdout = process.stdout, e
           // card xu7kxtt (#5472) — the clearance names an OLDER head (the merge queue / rebase-drop moved it), but the
           // net diff is byte-identical to the one the human cleared: the clearance carries. Live #4535 (fcc29ce1 →
           // 143107a87, reviewed-diff b945d333… on both) was re-parked here and waited for a second approval.
-          if (humanClearedSha && tamperHeadSha && humanClearedSha !== tamperHeadSha) {
+          // Opaque bytes are identified only by abbreviated blob ids in the text, so an older head's clearance never carries.
+          if (humanClearedSha && tamperHeadSha && humanClearedSha !== tamperHeadSha && !gaming.opaqueFiles) {
             carryRetryable = true; // until the carry returns its own answer
             // The PR's formal reviews and (on a full page) its complete thread are separate reads (`gh pr view --json comments`
             // stops at 100 and never returns reviews); a miss leaves `reviews` null, which the carry refuses.
@@ -6763,7 +6784,9 @@ export async function main(argv, { env = process.env, stdout = process.stdout, e
           baseFiles: stackedBase.changedFiles,
           baseAlreadyEscalated: hasReviewLabel(stackedBase.prLabels, REVIEW_LABELS.human),
         }) : null;
-        v.reason = buildTestGamingParkReason(gaming.reasons, stackedOrigin, stackedBase?.num);
+        v.reason = gaming.opaqueFiles && !gaming.findings?.length
+          ? `human clearance of this exact head required — ${gaming.reasons.join('; ')}`
+          : buildTestGamingParkReason(gaming.reasons, stackedOrigin, stackedBase?.num);
         if (!candidateDryRun) {
           // #2766/#2767 — MUTUAL EXCLUSIVITY. `keepHumanClearance` is `true` ONLY when the humanClearedSha
           // fetch above never ran/succeeded (`tamperHeadSha === null`, incl. a `gh` fetch miss) — the fail-

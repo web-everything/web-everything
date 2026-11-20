@@ -80,7 +80,7 @@
  * state, which auto-retries with backoff and resume-opens the PR once infra recovers (nothing is stranded; the
  * drain stays the sole writer to main). A non-zero exit means `main` was left UNTOUCHED.
  */
-import { resolvePinnedDiffBasis, requireScoredNetDiff, readPinnedDiff, pinnedGit } from './lib/pinned-diff-basis.mjs';
+import { resolvePinnedDiffBasis, requireScoredNetDiff, readPinnedDiff, pinnedGit, opaqueDiffEscalation } from './lib/pinned-diff-basis.mjs';
 import { checkCanonicalAuditForOpen } from './operations/canonical-audit-gate.mjs';
 import { defaultShimDir, resolveOrgAwareShimDir, pathWithOrgAwareShim } from './lib/gh-app-shim.mjs';
 import { publicationTitle, readMainCard } from './operations/machine-pr-title.mjs';
@@ -1307,9 +1307,11 @@ async function runCli() {
     // a lens earned by an ANCESTOR's file is earned by the diff this PR merges. Falls back to `changedFiles` if a
     // caller ever hands back a verdict without it.
     const roster = resolveRosterReconcile({ careLevel: rubric.careLevel, changedFiles: rubric.basisFiles || changedFiles, preRegistered });
-    const humanRequired = rubric.humanRequired || roster.humanAlignmentRequired;
+    // Opaque (binary) content is unreadable to every scanner: review:human, landed by a clearance of this exact head.
+    const opaque = opaqueDiffEscalation(sig.netDiffText.text);
+    const humanRequired = rubric.humanRequired || roster.humanAlignmentRequired || opaque.humanRequired;
     const finalLabel = humanRequired ? REVIEW_LABELS.human : rubric.label;
-    const reasons = [...rubric.reasons, ...roster.reasons];
+    const reasons = [...rubric.reasons, ...roster.reasons, ...opaque.reasons];
     let acceptedAtHead = false;
     try { acceptedAtHead = isAcceptedAtHead(currentLabels, forge.viewPr(prNum, 'comments').comments || [], refSha); } catch { /* read miss: keep today's hold */ }
     const carried = acceptedAtHead && !!finalLabel && isReviewHoldLabel(finalLabel) && !humanRequired;

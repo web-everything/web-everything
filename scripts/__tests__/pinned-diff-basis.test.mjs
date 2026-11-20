@@ -3,9 +3,10 @@ import { mkdtempSync, mkdirSync, rmSync, writeFileSync, readFileSync } from 'nod
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { execFileSync } from 'node:child_process';
-import { resolvePinnedDiffBasis, requireScoredNetDiff, pinnedGit, isScorableDiffText } from '../lib/pinned-diff-basis.mjs';
-import { computeNetDiffSignals, readPinnedCarryDiff, carryHumanClearanceOnIdenticalDiff } from '../merge-ai-prs.mjs';
+import { resolvePinnedDiffBasis, requireScoredNetDiff, pinnedGit, isScorableDiffText, opaqueDiffFiles, opaqueDiffEscalation } from '../lib/pinned-diff-basis.mjs';
+import { computeNetDiffSignals, readPinnedCarryDiff, carryHumanClearanceOnIdenticalDiff, pinnedDiffMergeRefusal, withOpaqueDiffHold } from '../merge-ai-prs.mjs';
 import { scanTestTampering } from '../lib/pr-merge-gate.mjs';
+import { buildReviewedShaMarker, buildClearedHumanMarker, shouldReparkForTestTampering } from '../lib/review-escalation.mjs';
 
 const dirs = [];
 afterEach(() => { for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true }); });
@@ -350,5 +351,70 @@ describe('pinned caller evidence', () => {
     const text = pinnedGit((cmd, args, opts) => execFileSync(cmd, args, { ...opts, cwd: dir }), ['diff', '--end-of-options', first, 'HEAD']);
     expect(text).toContain('-Subproject commit ' + '1'.repeat(40));
     expect(text).toContain('+Subproject commit ' + '2'.repeat(40));
+  });
+});
+
+describe('opaque binary content lands only on a human clearance of the exact head (#7101 red team)', () => {
+  const cleared = (sha, login = 'chalbert') => ({ id: `IC_${login}_${sha.slice(0, 7)}`,
+    body: [buildReviewedShaMarker(sha), buildClearedHumanMarker(login)].join('\n'), author: { login } });
+  const binaryHead = (files) => {
+    const f = fixture();
+    for (const [name, bytes] of Object.entries(files)) writeFileSync(join(f.dir, name), bytes);
+    f.git(['add', '.']);
+    const head = f.git(['commit-tree', f.git(['write-tree']), '-p', f.base, '-m', 'binary head']);
+    return { f, head, basis: resolvePinnedDiffBasis({ exec: f.exec, headSha: head }) };
+  };
+  const WEBP = Buffer.from([0x52, 0x49, 0x46, 0x46, 0x00, 0x00, 0x00, 0x00, 0x57, 0x45, 0x42, 0x50]);
+
+  it('scores a binary asset at file level and marks it opaque instead of refusing it', () => {
+    const { f, head, basis } = binaryHead({ 'screenshot.webp': WEBP });
+    const sig = computeNetDiffSignals({ exec: f.exec, basis });
+    expect(sig.netDiffText.text).toMatch(/^Binary files \/dev\/null and b\/screenshot\.webp differ$/m);
+    expect(sig.scored).toBe(true);
+    expect(sig.changedFiles).toContain('screenshot.webp');
+    expect(sig.diffLines).toBe(0);
+    expect(opaqueDiffFiles(sig.netDiffText.text)).toEqual(['screenshot.webp']);
+    expect(() => requireScoredNetDiff(sig, head)).not.toThrow();
+    expect(opaqueDiffEscalation(sig.netDiffText.text)).toMatchObject({ humanRequired: true });
+    expect(opaqueDiffEscalation(sig.netDiffText.text).reasons.join(' ')).toContain('screenshot.webp');
+  });
+  it('a test file marked -diff in .gitattributes is opaque too, so its hidden edits need a human', () => {
+    const { f, basis } = binaryHead({ '.gitattributes': 'guard.test.mjs -diff\n', 'guard.test.mjs': 'test.skip("x", () => {});\n' });
+    const text = computeNetDiffSignals({ exec: f.exec, basis }).netDiffText.text;
+    expect(opaqueDiffFiles(text)).toEqual(['guard.test.mjs']);
+    expect(scanTestTampering({ diffText: text }).tampered).toBe(false); // the scanner alone cannot see it
+    const gate = withOpaqueDiffHold(scanTestTampering({ diffText: text }), text);
+    expect(gate.tampered).toBe(true);
+    expect(gate.opaqueFiles).toEqual(['guard.test.mjs']);
+  });
+  it('drain escalation: an opaque hold clears only at the human-cleared exact head', () => {
+    const { f, head, basis } = binaryHead({ 'screenshot.webp': WEBP });
+    const text = computeNetDiffSignals({ exec: f.exec, basis }).netDiffText.text;
+    const gate = withOpaqueDiffHold(scanTestTampering({ diffText: text }), text);
+    expect(gate.tampered).toBe(true);
+    expect(gate.findings).toEqual([]); // no fake test-gaming finding
+    expect(shouldReparkForTestTampering({ tampered: gate.tampered, netDiffScored: true, humanClearedSha: null, headSha: head })).toBe(true);
+    expect(shouldReparkForTestTampering({ tampered: gate.tampered, netDiffScored: true, humanClearedSha: f.base, headSha: head })).toBe(true);
+    expect(shouldReparkForTestTampering({ tampered: gate.tampered, netDiffScored: true, humanClearedSha: head, headSha: head })).toBe(false);
+    const plain = withOpaqueDiffHold(scanTestTampering({ diffText: 'diff --git a/x b/x\n' }), 'diff --git a/x b/x\n');
+    expect(plain.tampered).toBe(false);
+    expect(plain.opaqueFiles).toBeUndefined();
+  });
+  it('no-review-escalation merge path: lands on a trusted human clearance at this head, refuses everything else', () => {
+    const { f, head } = binaryHead({ 'screenshot.webp': WEBP });
+    const refuse = readComments => pinnedDiffMergeRefusal({ exec: f.exec, headSha: head, readComments });
+    expect(refuse(() => [cleared(head)])).toBeNull();
+    expect(refuse(() => [cleared(head.toUpperCase())])).toBeNull();
+    expect(refuse(() => [cleared(f.base)])).toMatch(/opaque binary content.*screenshot\.webp/);
+    expect(refuse(() => [cleared(head, 'mallory')])).toMatch(/opaque binary content/);
+    expect(refuse(() => [])).toMatch(/opaque binary content/);
+    expect(refuse(() => { throw new Error('gh down'); })).toMatch(/opaque binary content/);
+    expect(refuse(undefined)).toMatch(/opaque binary content/);
+  });
+  it('a text-only diff keeps landing on the no-review-escalation path without any comment read', () => {
+    const f = fixture();
+    let reads = 0;
+    expect(pinnedDiffMergeRefusal({ exec: f.exec, headSha: f.head, readComments: () => { reads++; return []; } })).toBeNull();
+    expect(reads).toBe(0);
   });
 });
