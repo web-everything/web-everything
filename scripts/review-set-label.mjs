@@ -1095,18 +1095,29 @@ export function redTeamRulingHeld({ repo, pr, headSha, labels, comments, setting
  * A human `clear-human` ruling supersedes the review panel's own open confirm ask ("Record which verdict?") for the SAME
  * PR at the SAME head: that run stays `pending` forever and the red-team queue reads it as `review-unfinished` (live
  * #6381 #6595 #6637 #6633). Answer it `abstain` (writes nothing) through the operation's own resume path. A run on another
- * head, another PR, or with any other pending ask is never touched. Best effort: a failure never undoes the clearance.
+ * head, another PR, or with any other pending ask is never touched. If the abstain was already recorded but its
+ * pending ledger-events effect records a human attempt, resume without another answer, provided every other effect is applied.
+ * Optional ids restrict reads to indexed run files; omitted ids retain the full directory scan.
+ * Best effort: a failure never undoes the clearance.
  */
 const defaultAbstainResume = id => {
   const res = spawnSync(process.execPath, [join(dirname(fileURLToPath(import.meta.url)), 'operations', 'run.mjs'),
     'review-pr', `--resume=${id}`, '--answer=abstain'], { encoding: 'utf8', timeout: 120_000 });
   return res.status === 0;
 };
-export function closeConfirmRunsAfterClearance({ repo, pr, headSha, dir = resolveRunsDir(), resume = defaultAbstainResume } = {}) {
+const defaultEffectResume = id => {
+  const res = spawnSync(process.execPath, [join(dirname(fileURLToPath(import.meta.url)), 'operations', 'run.mjs'),
+    'review-pr', `--resume=${id}`], { encoding: 'utf8', timeout: 120_000 });
+  return res.status === 0;
+};
+export function closeConfirmRunsAfterClearance({ repo, pr, headSha, ids, dir = resolveRunsDir(), resume = defaultAbstainResume, resumeEffect = defaultEffectResume } = {}) {
   const out = { closed: [], failed: [] };
   if (!/^[0-9a-f]{40}$/i.test(String(headSha || ''))) return out;
   let names;
-  try { names = readdirSync(dir); } catch { return out; }
+  try {
+    names = ids === undefined ? readdirSync(dir)
+      : (Array.isArray(ids) ? ids : []).filter(id => typeof id === 'string' && !/[\\/]/.test(id)).map(id => `${id}.json`);
+  } catch { return out; }
   for (const name of names) {
     if (!name.startsWith('review-pr-') || !name.endsWith('.json')) continue;
     let text;
@@ -1115,10 +1126,19 @@ export function closeConfirmRunsAfterClearance({ repo, pr, headSha, dir = resolv
     let r;
     try { r = JSON.parse(text); } catch { continue; }
     if (r?.op !== 'review-pr' || name !== `${r.id}.json` || r.input?.repo !== repo || Number(r.input?.pr) !== Number(pr)) continue;
-    if (r.pending?.kind !== 'confirm') continue;
     if (String(r.findings?.read?.netBasis?.rev || '').toLowerCase() !== String(headSha).toLowerCase()) continue;
+    let settle;
+    if (r.pending?.kind === 'confirm') settle = resume;
+    else if (r.pending?.kind === 'effect' && r.pending.step === 'ledgerEvents'
+      && r.findings?.confirm === 'abstain' && Array.isArray(r.effects)
+      && r.effects.some(effect => effect?.type === 'review.ledger-events' && effect.step === 'ledgerEvents'
+        && effect.status === 'pending' && effect.lastAttemptBy === 'human' && Number(effect.humanAttempts) >= 1)
+      && r.effects.every(effect => effect?.status === 'applied'
+        || (effect?.type === 'review.ledger-events' && effect.step === 'ledgerEvents'
+          && effect.status === 'pending'))) settle = resumeEffect;
+    else continue;
     let ok = false;
-    try { ok = resume(r.id) === true; } catch { ok = false; }
+    try { ok = settle(r.id) === true; } catch { ok = false; }
     (ok ? out.closed : out.failed).push(r.id);
   }
   return out;
