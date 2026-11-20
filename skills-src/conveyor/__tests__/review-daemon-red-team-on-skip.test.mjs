@@ -40,7 +40,7 @@ const readQueueFile = () => existsSync(QUEUE_FILE) ? readFileSync(QUEUE_FILE, 'u
 function livePrReader(rawPrs) {
   const heads = new Map(rawPrs.map(({ number, headRefOid }) => [number, headRefOid]));
   // Retire entries left in the shared queue by earlier fixtures.
-  return ({ pr }) => heads.has(pr) ? { state: 'OPEN', headRefOid: heads.get(pr) } : { state: 'CLOSED' };
+  return ({ pr }) => heads.has(pr) ? { state: 'OPEN', comments: [], headRefOid: heads.get(pr) } : { state: 'CLOSED' };
 }
 
 it('CLI catches up gates after label repair, before capacity recovery, and survives catch-up exceptions', () => {
