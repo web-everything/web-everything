@@ -12,7 +12,7 @@ import replay from './fixtures/review-clearance-7140.json';
 import * as label from '../review-set-label.mjs';
 import { createReviewPrSinks } from '../operations/review-pr-io.mjs';
 import { REVIEW_EFFECTS } from '../operations/review-pr.mjs';
-import { parseLatestHumanClearedSha, decideReviewGate, REVIEW_LABELS } from '../lib/review-escalation.mjs';
+import { parseLatestHumanClearedSha, decideReviewGate, REVIEW_LABELS, buildClearanceRevocationComment } from '../lib/review-escalation.mjs';
 
 const input = { keepHumanClearance: true, reviews: [], currentLabels: [REVIEW_LABELS.accepted], to: 'accepted', comments: replay.comments.slice(0, 2), headSha: replay.headSha, headDiff: replay.reviewedDiff };
 const post = { advisory: true, verdict: true, label: true };
@@ -136,6 +136,13 @@ describe('runReviewLabelCli clearance suppression', () => {
   });
 
   it.each([
+    ['clearance revocation after clearance', { comments: [...input.comments, {
+      author: { login: 'plateau-reviewer[bot]' },
+      body: buildClearanceRevocationComment({ clearance: { actor: 'operator' }, reason: 'New review hold', pr: 7140, repo: 'o/n' }),
+    }] }],
+    ['human changes requested after clearance', { comments: [...input.comments, {
+      author: { login: 'outsider' }, body: '🔁 human review - changes requested\n\nFix this',
+    }] }],
     ['later SHA-less changes verdict', { comments: [...input.comments, { author: { login: 'outsider' }, body: '🔁 review — changes requested\n\nRecorded by outsider.\n\nFix this' }] }],
     ['later review:changes objection', { comments: [...input.comments, { body: 'Keep review:changes until fixed' }] }],
     ['formal changes review', { reviews: [{ state: 'CHANGES_REQUESTED' }] }],

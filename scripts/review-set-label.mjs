@@ -87,7 +87,7 @@ import {
   // `parseReviewedSha`'s answer whenever it is non-null; a second independent parse would only ever agree.
   parseReviewedSha, parseReviewedDiff, parseReviewedContribution, parseOperatorClearance,
   parseLatestHumanClearedSha, headEverHumanCleared, acceptanceCoversHead,
-  parseChangesVerdictProse, findSupersedingEscalation,
+  findSupersedingEscalation,
   // #x9krtkc (mutual-exclusivity fix, #2766/#2767) — the automated-escalation park decision and its detector,
   // re-exported below for the same reason `REASONLESS_BOUNCE_REFUSAL` is: this file is the SINGLE label home
   // (#2644), so a reader looks HERE for what governs a label swap even though the pure decision itself lives
@@ -141,7 +141,7 @@ export function rearmCoversVerdict(body, verdict) {
   return markers.length === 1 && !!key && key === rearmVerdictKey(verdict);
 }
 
-import { resolveAcceptCarryForward, latestAcceptRecord, decideAcceptCarryForward, laterReviewHold } from './lib/accept-carry-forward.mjs'; // card xu7kxtt
+import { resolveAcceptCarryForward, latestAcceptRecord, decideAcceptCarryForward, laterReviewHold, isKnownMachineBody } from './lib/accept-carry-forward.mjs'; // card xu7kxtt
 import { referralCardReadable } from './lib/referral-card-readable.mjs';
 import { assertOperatorCliFresh } from './lib/main-staleness.mjs';
 import { referralLiveContext } from './lib/referral-live-context.mjs';
@@ -890,8 +890,9 @@ export function reviewLoopWritePlan({ to, comments, reviews, currentLabels, keep
       const fingerprint = normalizeDiffFingerprint(headDiff);
       const later = clearance ? comments.slice(comments.indexOf(clearance) + 1) : [];
       // Objections need no trusted author or SHA stamp. Unreadable evidence posts as today.
-      if (later.some(c => typeof c?.body !== 'string' || parseChangesVerdictProse(c.body)
-        || /review:changes/.test(c.body))
+      // The loop's status-only progress note is informational; otherwise use the carry-forward recognizer.
+      if (later.some(c => typeof c?.body !== 'string'
+        || (c.body.trim() !== '<!-- review-status:reviewing -->' && !isKnownMachineBody(c.body, c)))
         || findSupersedingEscalation(later)
         || laterReviewHold(reviews, clearance?.createdAt)) return { advisory: true, verdict: true, label: true };
       preserve = !!clearedSha && clearedSha.toLowerCase() === headSha.toLowerCase()
