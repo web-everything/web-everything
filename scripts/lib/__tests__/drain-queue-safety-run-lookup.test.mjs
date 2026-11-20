@@ -4,7 +4,7 @@ import { mqSameHeadGuard } from '../drain-queue-safety.mjs';
 
 const repo = 'fixture/drain', pr = 6215, head = 'a'.repeat(40), commit = 'b'.repeat(40);
 const removedAt = '2026-11-01T12:00:00.000Z';
-const endpoint = `repos/${repo}/actions/workflows/ci.yml/runs?branch=main`;
+const endpoint = `repos/${repo}/actions/workflows/ci.yml/runs?branch=main&event=push`;
 const latestQuery = `${endpoint}&per_page=100`;
 const beforeQuery = `${endpoint}&status=completed&created=<${removedAt}&per_page=100`;
 const unreadable = 'retry evidence unreadable or incomplete';

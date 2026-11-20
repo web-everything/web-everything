@@ -8,10 +8,10 @@ import { spawnSync } from 'node:child_process';
 const raw = readFileSync(new URL('../../../.github/workflows/ci.yml', import.meta.url), 'utf8');
 const wf = yaml.load(raw), jobs = wf.jobs;
 const evaluate = (expr, values) => Function(...Object.keys(values), `return (${expr.replace(/\$\{\{|\}\}/g, '').replace(/steps\.main-skip/g, "steps['main-skip']")});`)(...Object.values(values));
-it('every WE checkout resolves main at runtime for the scheduled backstop', () => {
+it('every WE checkout pins the scheduled backstop to the run sha (all jobs test one commit)', () => {
   for (const [name, job] of Object.entries(jobs)) for (const step of job.steps ?? []) {
     if (!step.uses?.startsWith('actions/checkout@') || step.with?.repository) continue;
-    expect(step.with?.ref, name).toBe("${{ github.event_name == 'schedule' && 'main' || '' }}");
+    expect(step.with?.ref, name).toBe("${{ github.event_name == 'schedule' && github.sha || '' }}");
   }
 });
 it('hourly main backstop has a distinct concurrency group and cannot cancel or be cancelled by main pushes', () => {

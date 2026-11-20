@@ -430,7 +430,7 @@ it('defaultReadMainRuns filters to the CI workflow and passes the exact pinned a
   const runs = defaultReadMainRuns({});
   expect(runs).toEqual([{ databaseId: 1, workflowName: 'CI', status: 'completed', conclusion: 'success', createdAt: 'a', updatedAt: 'b' }]);
   expect(execFileSync).toHaveBeenCalledWith('gh', [
-    'run', 'list', '--branch', 'main', '--limit', '100', '--json', 'databaseId,conclusion,status,createdAt,updatedAt,workflowName,headSha,event',
+    'run', 'list', '--branch', 'main', '--limit', '100', '--json', 'databaseId,conclusion,status,createdAt,updatedAt,workflowName,headSha',
   ], expect.any(Object));
 });
 
