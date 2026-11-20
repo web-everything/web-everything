@@ -92,6 +92,32 @@ it('pinned routes still refuse an unavailable Claude launcher', () => {
     availability: { claude: 'operator hold' } })).toThrow(/no available route/);
 });
 
+it.each([false, true])('retains the eligible Claude route when capacity projects an ordinary critical fix onto Codex (explicit=%s)', explicit => {
+  const now = Date.parse('2026-11-20T15:00:00Z');
+  const capacity = readProviderCapacity({ env: { WE_CAPACITY_READERS: 'off' }, now,
+    settings: { claudeUsageAccount: 'claude-a' }, readers: {
+      codex: () => ({ at: now, used_percent: 20, resets_at: now + 3600000 }),
+      claude: () => ({ at: now, seven_day: { usedPercent: 20, resetsAt: now + 120 * 3600000 } }),
+    } });
+  expect(chooseBuilder({ kind: 'fix', capacities: capacity, settings: { now }, fallback: null }).provider).toBe('codex');
+  const dispatch = { kind: 'fix', size: 3, scopePaths: ['we:scripts/lib/critical-work.mjs'] };
+  const policy = structuredClone(DEFAULT_ROUTING_POLICY);
+  if (explicit) policy.operations.fix = { provider: 'claude', model: 'opus', effort: 'high', fallback: [] };
+  const options = { env: {}, repo: { routing: { builder: 'auto', capacity: { claudeUsageAccount: 'claude-a' } } },
+    routingPolicy: policy, capacity, now, quota: () => null, record: () => {}, scorecards: [] };
+  const baseline = resolveDispatchRoute(dispatch, { ...options,
+    repo: { routing: { builder: 'auto', capacity: { enabled: false } } } });
+  expect(baseline).toMatchObject({ outcome: 'routed', executed: 'claude' });
+  expect(resolveDispatchRoute(dispatch, options)).toMatchObject({ outcome: 'routed', executed: 'claude', model: baseline.model });
+  expect(resolveDispatchRoute(dispatch, { ...options, availability: { claude: 'operator hold' } }))
+    .toMatchObject({ outcome: 'refused' });
+  expect(resolveDispatchRoute(dispatch, { ...options,
+    capacity: capacity.map(c => c.provider === 'claude' ? { ...c, held: true } : c) }))
+    .toMatchObject({ outcome: 'refused' });
+  policy.operations.fix.disabledProviders = ['claude'];
+  expect(resolveDispatchRoute(dispatch, options)).toMatchObject({ outcome: 'refused' });
+});
+
 it.each(['fix', 'ci-heal'])('%s dispatch injects settings, quota, capacity and decision persistence', kind => {
   const f = fixture();
   const now = Date.parse('2026-11-19T12:00:00Z');

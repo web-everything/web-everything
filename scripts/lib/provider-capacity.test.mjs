@@ -128,6 +128,51 @@ test('reserve protects every window until release; security retains access', () 
   c.windows.push({ name: 'five_hour', usedPercent: 30, resetsAt: now + hour, lengthHours: 5 });
   assert.equal(scoreProvider(c, 'fix', {}).label, 'reserve-only');
 });
+
+test.each([false, true])('weekly operator reading preserves exhausted five-hour quota and alias exclusion (reversed=%s)', reversed => {
+  const clock = Date.parse('2026-11-19T13:00:00Z');
+  const short = { used_percent: 100, window_minutes: 300, resets_at: Date.parse('2026-11-19T17:00:00Z') };
+  const weekly = { used_percent: reversed ? 40 : 27, window_minutes: 10080, resets_at: Date.parse('2026-11-25T08:49:00Z') };
+  const raw = { ...(reversed ? weekly : short), secondary: reversed ? short : weekly,
+    at: Date.parse('2026-11-19T12:30:00Z') };
+  const read = now => readProviderCapacity({ env: {}, now, readers: { codex: () => raw } });
+  const capacity = read(clock);
+  for (const provider of ['codex', 'codex-alt']) {
+    const observation = capacity.find(c => c.provider === provider);
+    assert.equal(observation.windows.length, 2);
+    assert.equal(observation.windows.find(w => w.name === 'five_hour').usedPercent, 100);
+    assert.equal(observation.windows.find(w => w.name === 'weekly').usedPercent, 27);
+    assert.equal(observation.windows.find(w => w.name === 'weekly').source, 'operator');
+    assert.equal(scoreProvider(observation, 'fix', { now: clock }).label, 'exhausted');
+  }
+  assert.equal(chooseBuilder({ kind: 'fix', capacities: capacity, settings: { now: clock }, fallback: 'claude' }).provider, 'claude');
+  const route = now => resolveFixExecutorChain({ repo, platform: {}, env: {}, capacity: read(now), now,
+    quota: () => raw, record: () => {} }).value;
+  assert.deepEqual(route(clock), ['claude']);
+  assert.deepEqual(route(short.resets_at), ['codex', 'codex-alt', 'claude']);
+});
+
+test.each(['weekly', 'seven_day'])('operator merge replaces only the matching %s window for non-Codex readers', name => {
+  const settings = { providers: [{ ...providers.find(p => p.id === 'claude'), windows: [{ name, lengthHours: 168 }],
+    operatorReading: { asOf: now - hour, usedPercent: 27, resetsAt: now + 120 * hour } }] };
+  const [observation] = readProviderCapacity({ env: {}, now, settings, readers: { claude: () => ({ at: now - 2 * hour,
+    five_hour: { usedPercent: 100, resetsAt: now + hour }, seven_day: { usedPercent: 99, resetsAt: now + 120 * hour } }) } });
+  assert.equal(observation.windows.length, 2);
+  assert.equal(observation.windows.find(w => w.name === 'five_hour').usedPercent, 100);
+  assert.equal(observation.windows.find(w => w.source === 'operator').usedPercent, 27);
+  assert.equal(scoreProvider(observation, 'fix', { now }).label, 'exhausted');
+});
+
+test.each([
+  { usedPercent: 101, resetsAt: now + hour },
+  { usedPercent: 10, resetsAt: now },
+])('invalid or expired operator window preserves usable live windows (%j)', seed => {
+  const settings = { providers: [{ ...providers[0], operatorReading: { ...seed, asOf: now - hour } }] };
+  const [observation] = readProviderCapacity({ env: {}, now, settings, readers: { codex: () => ({ at: now - 2 * hour,
+    used_percent: 100, resets_at: now + 120 * hour, window_minutes: 10080 }) } });
+  assert.equal(observation.windows[0]?.source, 'live');
+  assert.equal(scoreProvider(observation, 'fix', { now }).label, 'exhausted');
+});
 test('pace ahead penalizes and behind boosts; long work prefers remaining absolute capacity', () => {
   const ahead = scoreProvider(cap('codex', 70, 150), 'fix', {});
   const behind = scoreProvider(cap('codex', 27, 2), 'fix', {});

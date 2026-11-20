@@ -14,6 +14,7 @@ export const CAPACITY_DEFAULTS = {
 };
 const HOUR = 3600000;
 const lengths = { five_hour: 5, seven_day: 168, daily: 24, weekly: 168 };
+const windowKey = name => name === 'seven_day' ? 'weekly' : name;
 const epoch = v => typeof v === 'number' ? (v < 1e12 ? v * 1000 : v) : Date.parse(v);
 const options = s => ({ ...CAPACITY_DEFAULTS, ...(s?.routing?.capacity ?? s ?? {}) });
 export const bindingWindow = cap => cap.windows.filter(w => Number.isFinite(w.usedPercent))
@@ -39,8 +40,8 @@ export function readProviderCapacity({ env = {}, now = Date.now(), readers = {},
   return providers.flatMap(entry => {
     const owner = providers.find(p => p.id === entry.quotaOf) ?? entry;
     return (owner.accounts ?? [{ id: owner.id }]).map(account => {
-      const def = { ...owner, ...entry, ...account }, windows = [];
-      let raw;
+      const def = { ...owner, ...entry, ...account };
+      let raw, windows = [];
       try { raw = readers[account.id]?.(env) ?? readers[owner.id]?.(env); } catch { /* unknown */ }
       // The shared Claude file cannot identify an account. Never attribute it to both accounts.
       if (owner.id === 'claude' && owner.accounts && s.claudeUsageAccount !== account.id) raw = null;
@@ -53,13 +54,15 @@ export function readProviderCapacity({ env = {}, now = Date.now(), readers = {},
       const add = (name, w, source = 'live') => {
         const usedPercent = w?.usedPercent ?? w?.used_percent ?? w?.used_percentage;
         const resetsAt = epoch(w?.resetsAt ?? w?.resets_at);
-        const configured = def.windows?.find(x => x.name === name || (['weekly', 'seven_day'].includes(name) && ['weekly', 'seven_day'].includes(x.name)));
-        if (typeof usedPercent === 'number' && usedPercent >= 0 && usedPercent <= 100 && resetsAt > now) windows.push({ name, usedPercent, resetsAt, source,
-          lengthHours: w.lengthHours ?? (w.window_minutes > 0 ? w.window_minutes / 60 : null) ?? configured?.lengthHours ?? lengths[name] ?? null });
+        const configured = def.windows?.find(x => windowKey(x.name) === windowKey(name));
+        if (typeof usedPercent === 'number' && usedPercent >= 0 && usedPercent <= 100 && resetsAt > now) {
+          // A valid operator update supersedes only its own quota window.
+          if (source === 'operator') windows = windows.filter(x => windowKey(x.name) !== windowKey(name));
+          windows.push({ name, usedPercent, resetsAt, source,
+            lengthHours: w.lengthHours ?? (w.window_minutes > 0 ? w.window_minutes / 60 : null) ?? configured?.lengthHours ?? lengths[name] ?? null });
+        }
       };
-      // An absent timestamp does not prove the live observation predates the operator seed.
-      if (seed && !operatorReadingStale && seedAt <= now && (!raw || (Number.isFinite(at) && at < seedAt))) add(def.windows?.[0]?.name ?? 'weekly', seed, 'operator');
-      else if (liveUsable) {
+      if (liveUsable) {
         if (owner.readers?.some(r => r.type === 'codex-rollout')) {
           const name = (w, fallback) => w?.window_minutes > 0
             ? def.windows?.find(x => x.lengthHours * 60 === w.window_minutes)?.name
@@ -73,6 +76,9 @@ export function readProviderCapacity({ env = {}, now = Date.now(), readers = {},
           for (const spec of def.readers ?? []) if (spec.window) add(spec.window, raw);
         }
       }
+      // An absent timestamp does not prove the live observation predates the operator seed.
+      // Preserve independent live constraints even when this single-window seed is newer.
+      if (seed && !operatorReadingStale && seedAt <= now && (!raw || (Number.isFinite(at) && at < seedAt))) add(def.windows?.[0]?.name ?? 'weekly', seed, 'operator');
       if (!windows.length) for (const [name, rule] of Object.entries(def.calendar ?? s.calendar?.[owner.id] ?? {})) {
         const resetsAt = calendarReset(rule, now);
         if (resetsAt) windows.push({ name, usedPercent: null, resetsAt, source: 'configured', lengthHours: lengths[name] ?? null });

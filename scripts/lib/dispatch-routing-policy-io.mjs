@@ -140,12 +140,25 @@ export function resolveDispatchRoute(dispatch, options = {}) {
   const ciHealNativeFallback = claudeBuilds && dispatch?.kind === 'ci-heal' && !ciHealNativeHold;
   if (BUILD_KINDS.includes(dispatch.kind) && (builder?.decision?.reason === 'capacity-score' || builder?.decision?.reason === 'unknown-emergency')) {
     const provider = builder.decision.launcher === 'codex' ? 'codex' : builder.builder;
+    let inheritedRoute;
+    const sameRoute = (a, b) => a.provider === b.provider
+      && resolvePureModel(a.provider, a.model, routingPolicy) === resolvePureModel(b.provider, b.model, routingPolicy);
     const project = (entry, parent = {}) => {
       const existing = { ...parent, ...entry };
+      // Materialise the inherited evidence/tier route before replacing it. In
+      // particular, critical fixes must retain their Claude model and effort.
+      if (!existing.provider) inheritedRoute ??= decideDispatchRoute(dispatch, { ...options, availability, ciHealNativeFallback, routingPolicy });
+      const previous = existing.provider ? existing : inheritedRoute?.outcome === 'routed' && inheritedRoute.model
+        ? { provider: inheritedRoute.executed, model: inheritedRoute.model,
+          effort: inheritedRoute.effort ?? existing.effort } : null;
       const fallback = (existing.fallback ?? []).filter(eligibleRoute);
       const next = { ...existing, provider, fallback,
         ...(existing.provider !== provider || builder.decision.provider !== provider || !eligibleRoute(existing)
           ? { model: builder.decision.model ?? defaultPolicyModel(provider) } : {}) };
+      if (previous && eligibleRoute(previous) && !sameRoute(previous, next) && !fallback.some(route => sameRoute(route, previous))) {
+        const { provider, model, effort } = previous;
+        next.fallback = [{ provider, model, effort }, ...fallback];
+      }
       if (parent.disabledProviders || entry?.disabledProviders) next.disabledProviders = [...new Set([...(parent.disabledProviders ?? []), ...(entry?.disabledProviders ?? [])])];
       delete next.inherit;
       return next;
