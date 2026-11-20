@@ -23,8 +23,8 @@ const safe = (value) => String(value).replace(/[\x00-\x1f\x7f-\x9f\u2028\u2029]/
 // Allowlist, not a Markdown parser: the only text treated as plain is a bare placeholder token
 // (<name>: no attributes, slash or other characters) inside a balanced single-line inline code span.
 // The token is removed; every other character, including other tag-like text in the span, stays visible
-// to the HTML refusal. Escaped or unmatched backticks are ambiguous; a snapshot with link/reference brackets
-// anywhere gets no exemption at all (see planStampRestore).
+// to the HTML refusal. Escaped or unmatched backticks and potentially open links/titles are ambiguous;
+// such snapshots get no exemption at all (see planStampRestore).
 function outsideInlineCode(line) {
   if (!line.includes('`')) return line;
   if (line.includes('\\`')) return undefined;
@@ -43,6 +43,27 @@ function outsideInlineCode(line) {
     }
   }
   return delimiter ? undefined : plain + line.slice(start);
+}
+
+// Conservative: true when any line could leave a markdown link open (unbalanced brackets or parens beside a link,
+// a reference-definition or inline-link title whose closing quote/paren is missing, or a title-looking line start).
+// Such a snapshot cannot prove a standalone marker is outside a link title, so a marker in it is refused.
+const TITLE_CLOSE = { '"': '"', "'": "'", '(': ')' };
+function linkMayEnclose(diff) {
+  const count = (s, re) => (s.match(re) ?? []).length;
+  return diff.split(/\r\n|[\r\n]/).some((l) => {
+    if (/[\[\]]/.test(l) && (count(l, /\[/g) !== count(l, /\]/g) || count(l, /\(/g) !== count(l, /\)/g))) return true;
+    // Reference title continuation lines may have more than three spaces (or tabs) of indentation.
+    const open = l.match(/^[ \t]{0,3}\[[^\]]*\]:[ \t]*\S*[ \t]*(["'(])(.*)$/)
+      ?? l.match(/\]\([ \t]*\S+[ \t]+(["'(])(.*)$/) ?? l.match(/^[ \t]*(["'(])(.*)$/);
+    // Any link-syntax line with an odd count of unescaped quotes may leave a title open, wherever it starts.
+    if (/\]\(|^[ \t]{0,3}\[[^\]]*\]:/.test(l)) {
+      const bare = l.replace(/\\./g, '');
+      if (count(bare, /"/g) % 2 || count(bare, /'/g) % 2) return true;
+    }
+    // A backslash-escaped delimiter does not close the title.
+    return !!open && !open[2].replace(/\\./g, '').includes(TITLE_CLOSE[open[1]]);
+  });
 }
 
 /** One bounded request. Truncation is not agreement: operators must investigate the full history. */
@@ -100,7 +121,11 @@ export function planStampRestore({ state, body, authorLogin, edits } = {}) {
     const htmlLines = [];
     let ambiguousTicks = false;
     // Brackets can make a backticked span part of a link target or text across lines: no exemption.
-    const bracketed = /[\[\]]/.test(edit.diff);
+    // A bracketed line is harmless only when it has no backtick and its brackets balance on that line
+    // (a one-line `[text](url)` cannot span a code span across lines).
+    const bracketed = edit.diff.split(/\r\n|[\r\n]/).some((l) => /[\[\]]/.test(l)
+      && (l.includes('`') || (l.match(/\[/g) ?? []).length !== (l.match(/\]/g) ?? []).length
+        || (l.match(/\(/g) ?? []).length !== (l.match(/\)/g) ?? []).length));
     let fence;
     for (const line of edit.diff.split(/\r\n|[\r\n]/)) {
       const delimiter = line.match(/^[ \t]{0,3}(`{3,}|~{3,})(.*)$/);
@@ -114,7 +139,8 @@ export function planStampRestore({ state, body, authorLogin, edits } = {}) {
       // One ambiguous backtick line may open a multiline span: no inline-code exemption anywhere in the snapshot.
       if (stripped === undefined) ambiguousTicks = true;
       // Backticks inside any HTML comment other than a bare stamp marker are not code: disable the exemption.
-      if (line.includes('<!--') && !/^<!--[ \t]*authored-by-actor:[^<>\r\n]*-->[^\S\r\n]*$/.test(line)) ambiguousTicks = true;
+      // A comment line without a backtick cannot change code-span state (e.g. pr-size markers).
+      if (line.includes('<!--') && line.includes('`') && !/^<!--[ \t]*authored-by-actor:[^<>\r\n]*-->[^\S\r\n]*$/.test(line)) ambiguousTicks = true;
       htmlLines.push(stripped ?? line);
       if (line.includes('authored-by-actor:')) {
         // A stamp is evidence only as a whole, unindented line outside code fences.
@@ -132,14 +158,23 @@ export function planStampRestore({ state, body, authorLogin, edits } = {}) {
     }
     // Tags can span lines and contain an apparently standalone stamp in an attribute.
     // Preserve snapshot-wide detection after exempting only validated inline spans.
-    const noExempt = ambiguousTicks || bracketed;
+    // Backticks inside a possible link title do not prove that HTML is in code.
+    const ambiguousLink = linkMayEnclose(edit.diff);
+    const noExempt = ambiguousTicks || bracketed || ambiguousLink;
     // Raw HTML constructs (CDATA, processing instructions, declarations, comments other than a bare stamp
     // marker) open HTML blocks where backticks are not code: refuse them outright, outside code spans too.
     const candidate = (noExempt ? edit.diff.split(/\r\n|[\r\n]/) : htmlLines)
-      .filter((l) => !/^<!--[ \t]*authored-by-actor:[^<>\r\n]*-->[^\S\r\n]*$/.test(l)).join('\n');
+      .filter((l) => !/^<!--[ \t]*authored-by-actor:[^<>\r\n]*-->[^\S\r\n]*$/.test(l))
+      // Only the repo's own known machine markers (pr-size / size-admission / policy-set) are inert comments.
+      .filter((l) => !/^<!-- (?:pr-size:(?:begin|end)|size-admission:[0-9a-f]+|policy-set: [A-Za-z0-9 ._-]+) -->[^\S\r\n]*$/.test(l)).join('\n');
     if (/<\/?[a-z][^>]*>/i.test(noExempt ? edit.diff : htmlLines.join('\n')) || /<[!?]/.test(candidate)) {
       return refusal('unsupported HTML edit snapshot; inspect complete GitHub history manually',
         contentEvidence(edit, htmlOffender(candidate)));
+    }
+    // A marker is not a stamp when a link title/destination or link text may still be open around it.
+    if (markers.length && ambiguousLink) {
+      return refusal('malformed or non-standalone historical stamp; inspect complete GitHub history manually',
+        contentEvidence(edit, markerLine(edit.diff)));
     }
     // An unmatched backtick line may open a multiline code span around a marker: not evidence of authorship.
     if (ambiguousTicks && markers.length) {
