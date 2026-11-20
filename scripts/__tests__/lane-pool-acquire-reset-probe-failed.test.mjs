@@ -48,55 +48,69 @@ const poolArgs = () => [`--origin=${originDir}`, `--reference=${referenceDir}`, 
 // `git fetch` drops a marker; once it exists, `git status --porcelain` run inside a lane exits 1 (a failed probe).
 // `failing` picks which probe fails: 'status' (the tree probe) or 'rev-list' (the ahead-count probe) — the two
 // halves of `probeFailed` in laneDirtyOrAhead.
-function shimStatusFailsAfterFetch(failing = 'status') {
+function shimStatusFailsAfterFetch(failing = 'status', failOnce = false) {
   const shimDir = join(base, 'bin');
   mkdirSync(shimDir, { recursive: true });
   const realGit = execFileSync('which', ['git'], { encoding: 'utf8' }).trim();
   const fetched = join(shimDir, 'fetched');
   const failed = join(shimDir, 'status-failed');
+  const resetAttempted = join(shimDir, 'reset-attempted');
   writeFileSync(
     join(shimDir, 'git'),
     `#!/bin/bash\n` +
       `args=("$@"); while [ "\${args[0]}" = "-c" ]; do args=("\${args[@]:2}"); done\n` +
       `case "\${args[0]}" in\n` +
       `  fetch) touch "${fetched}" ;;\n` +
+      `  checkout|reset|clean) if [ -e "${failed}" ]; then touch "${resetAttempted}"; fi ;;\n` +
       (failing === 'rev-list'
-        ? `  rev-list) if [ -e "${fetched}" ] && [[ " \${args[*]} " == *" --count "* ]] && [[ "$PWD" == *"/lane-1" ]]; then touch "${failed}"; exit 1; fi ;;\n`
-        : `  status) if [ -e "${fetched}" ] && [[ " \${args[*]} " == *" --porcelain "* ]] && [[ "$PWD" == *"/lane-1" ]]; then touch "${failed}"; exit 1; fi ;;\n`) +
+        ? `  rev-list) if [ -e "${fetched}" ] && [[ " \${args[*]} " == *" --count "* ]] && [[ "$PWD" == *"/lane-1" ]]; then if ${failOnce ? '[ ! -e "' + failed + '" ]' : 'true'}; then touch "${failed}"; echo "simulated ${failing} probe error" >&2; exit 1; fi; fi ;;\n`
+        : `  status) if [ -e "${fetched}" ] && [[ " \${args[*]} " == *" --porcelain "* ]] && [[ "$PWD" == *"/lane-1" ]]; then if ${failOnce ? '[ ! -e "' + failed + '" ]' : 'true'}; then touch "${failed}"; echo "simulated ${failing} probe error" >&2; exit 1; fi; fi ;;\n`) +
       `esac\n` +
       `exec "${realGit}" "$@"\n`,
   );
   chmodSync(join(shimDir, 'git'), 0o755);
-  return { shimDir, failed };
+  return { shimDir, failed, resetAttempted };
 }
 
 describe('acquire reset-time re-verify fails closed when the status probe fails (scripts/lane-pool.mjs resetBlockedByProbe)', () => {
-  it('REFUSES the reset and keeps a lane edit when `git status` fails after the fetch', () => {
+  it('status probe failure is named and REFUSES the reset after the fetch', () => {
     expect(runPool(['provision', '--count=1', ...poolArgs()]).code).toBe(0);
     const lane = join(poolRoot, 'resetprobe', 'lane-1');
-    const { shimDir, failed } = shimStatusFailsAfterFetch();
+    const { shimDir, failed, resetAttempted } = shimStatusFailsAfterFetch();
 
     const acquire = runPool(['acquire', ...poolArgs(), '--session=picker', '--lane=1'], { PATH: `${shimDir}:${process.env.PATH}` });
 
     expect(existsSync(failed)).toBe(true); // the shim really failed a post-fetch status probe (the re-verify)
     expect(acquire.code).not.toBe(0);
+    expect(existsSync(resetAttempted)).toBe(false);
     expect(acquire.err).toMatch(/no longer provably safe to reset/);
+    expect(acquire.err).toContain('probe failed: git status --porcelain: simulated status probe error');
     expect(acquire.err).toMatch(/0 uncommitted/); // the failed probe reported nothing — and was still refused
     expect(readFileSync(join(lane, 'file.txt'), 'utf8')).toBe('v1\n');
   });
 
-  it('REFUSES the reset when the ahead-count probe (`git rev-list --count`) fails after the fetch', () => {
+  it('ahead-count probe failure is named and REFUSES the reset after the fetch', () => {
     expect(runPool(['provision', '--count=1', ...poolArgs()]).code).toBe(0);
     const lane = join(poolRoot, 'resetprobe', 'lane-1');
-    const { shimDir, failed } = shimStatusFailsAfterFetch('rev-list');
+    const { shimDir, failed, resetAttempted } = shimStatusFailsAfterFetch('rev-list');
 
     const acquire = runPool(['acquire', ...poolArgs(), '--session=picker', '--lane=1'], { PATH: `${shimDir}:${process.env.PATH}` });
 
     expect(existsSync(failed)).toBe(true);
     expect(acquire.code).not.toBe(0);
+    expect(existsSync(resetAttempted)).toBe(false);
     expect(acquire.err).toMatch(/no longer provably safe to reset/);
+    expect(acquire.err).toContain('probe failed: git rev-list --count origin/trunk..HEAD: simulated rev-list probe error');
     expect(acquire.err).toMatch(/0 uncommitted, 0 ahead/); // a failed count reads as 0 ahead — still refused
     expect(readFileSync(join(lane, 'file.txt'), 'utf8')).toBe('v1\n');
+  });
+
+  it.each(['status', 'rev-list'])('retries a transient %s probe failure once and acquire succeeds', (probe) => {
+    expect(runPool(['provision', '--count=1', ...poolArgs()]).code).toBe(0);
+    const { shimDir, failed } = shimStatusFailsAfterFetch(probe, true);
+    const acquire = runPool(['acquire', ...poolArgs(), '--session=picker', '--lane=1'], { PATH: `${shimDir}:${process.env.PATH}` });
+    expect(existsSync(failed)).toBe(true);
+    expect(acquire.code, acquire.err).toBe(0);
   });
 
   it('control: the same acquire without the shim succeeds, so the refusal above is the failed probe', () => {
