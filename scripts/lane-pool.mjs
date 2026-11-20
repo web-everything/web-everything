@@ -423,7 +423,7 @@ function resolveRepo(repoFlags = flags) {
       || path.split(sep).some(part => /^lane-\d+$/.test(part)));
     return { unreadableOwner, owners, originSourcePaths, laneShaped };
   };
-  if (!repoFlags.origin && (needsOrigin || cmd === 'gc' || cmd === 'release')) {
+  if (!repoFlags.origin && (needsOrigin || cmd === 'gc' || cmd === 'release' || cmd === 'branch')) {
     const { unreadableOwner, owners, originSourcePaths, laneShaped } = scanOwnership();
     if (laneShaped) {
       // Old live daemons export the smoke owner, but not LANE_POOL_CANONICAL_ORIGIN.
@@ -492,7 +492,7 @@ function resolveRepo(repoFlags = flags) {
   // found by name or a reference the ownership scan proved is not a lane — also when an explicit --origin skipped the
   // origin scan above. Null means no validated primary: the proof then runs under the strict lane transport rules.
   const primaryPath = alternatesReferencePath
-    || (repoFlags.origin && (cmd === 'gc' || cmd === 'release') && !scanOwnership().laneShaped ? topLevel : null);
+    || (repoFlags.origin && (cmd === 'gc' || cmd === 'release' || cmd === 'branch') && !scanOwnership().laneShaped ? topLevel : null);
   return { name, originUrl: canonicalOrigin ? originUrl || null : null, referencePath: topLevel, alternatesReferencePath, primaryPath, branch, poolDir: join(POOL_ROOT, name) };
 }
 
@@ -5635,7 +5635,9 @@ function cmdBranch(repo) {
       || !lstatSync(dir).isDirectory() || !lstatSync(join(dir, '.git')).isDirectory()
       || realpathSync(dir) !== join(realpathSync(repo.poolDir), `lane-${n}`)
       || realpathSync(join(dir, '.git')) !== join(realpathSync(dir), '.git')
-      || realpathSync(dir) === realpathSync(repo.referencePath)) {
+      // The invoking reference may be this lane; only a validated primary is shared.
+      || [repo.primaryPath, repo.alternatesReferencePath].filter(Boolean)
+        .some(primary => realpathSync(dir) === realpathSync(primary))) {
       refuse('requires its own clone; shared checkout or symlink refused');
     }
     const root = branchGit(['rev-parse', '--show-toplevel']);

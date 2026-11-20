@@ -1,7 +1,7 @@
 import { beforeEach, afterEach, expect, it } from 'vitest';
 import { execFileSync, spawnSync } from 'node:child_process';
-import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync, symlinkSync } from 'node:fs';
-import { join, resolve } from 'node:path';
+import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync, symlinkSync, copyFileSync, readdirSync } from 'node:fs';
+import { dirname, join, resolve } from 'node:path';
 import { tmpdir } from 'node:os';
 
 const script = resolve('scripts/lane-pool.mjs');
@@ -21,20 +21,20 @@ beforeEach(() => {
   tip = git(primary, 'rev-parse', 'HEAD');
   origin = join(root, 'origin.git');
   git(root, 'clone', '--quiet', '--bare', primary, origin);
-  pool = join(root, 'pool');
+  pool = join(root, '.lanes');
   mkdirSync(join(pool, 'fixture'), { recursive: true });
   lane = join(pool, 'fixture', 'lane-1');
-  git(root, 'clone', '--quiet', origin, lane);
+  git(root, 'clone', '--quiet', '--reference', primary, origin, lane);
   marker = join(lane, '.git', '.lane-lease');
   writeFileSync(marker, JSON.stringify({ session: 'dispatcher', holder: 'holder', acquiredAt: new Date().toISOString(), ttlMinutes: 120 }));
 });
 afterEach(() => rmSync(root, { recursive: true, force: true }));
 
-function run(overrides = {}, poolName = 'fixture', env = {}, command = 'branch') {
+function run(overrides = {}, poolName = 'fixture', env = {}, command = 'branch', options = {}) {
   const args = { lane: '1', session: 'holder', name: 'lane/test', ...overrides };
-  return spawnSync(process.execPath, [script, command, ...(poolName === undefined ? [] : [`--pool=${poolName}`]), `--reference=${primary}`, `--origin=${origin}`,
+  return spawnSync(process.execPath, [options.script || script, command, ...(poolName === undefined ? [] : [`--pool=${poolName}`]), ...(options.fromCwd ? [] : [`--reference=${primary}`, `--origin=${origin}`]),
     ...Object.entries(args).filter(([, v]) => v !== undefined).map(([k, v]) => v === true ? `--${k}` : `--${k}=${v}`)],
-  { encoding: 'utf8', maxBuffer: 1024 * 1024, env: { ...process.env, LANE_POOL_ROOT: pool, WE_LANE_HOLD: 'enforce', ...env } });
+  { cwd: options.cwd, encoding: 'utf8', maxBuffer: 1024 * 1024, env: { ...process.env, LANE_POOL_ROOT: pool, WE_LANE_HOLD: 'enforce', ...env } });
 }
 function refused(overrides, reason, env) {
   const before = git(primary, 'show-ref');
@@ -61,6 +61,33 @@ it.each([undefined, 'sha', 'origin/main'])('lane-pool branch creates a lane bran
   expect(git(primary, 'branch', '--list', 'lane/test')).toBe('');
   expect(readFileSync(marker, 'utf8')).toBe(lease);
 });
+it.each(['primary', 'self', 'other'].flatMap(cwd => ['original', 'lane-copy'].map(script => ({ cwd, script }))))(
+  'creates a branch from $cwd cwd using the $script script and derived pool root', ({ cwd, script: scriptKind }) => {
+    const other = join(pool, 'fixture', 'lane-2');
+    git(root, 'clone', '--quiet', '--reference', primary, origin, other);
+    let entry = script;
+    if (scriptKind === 'lane-copy') {
+      // Copy the entry point so import.meta.url belongs to a lane, sharing only its dependencies.
+      const scriptsDir = join(other, 'scripts');
+      mkdirSync(scriptsDir);
+      for (const name of readdirSync(dirname(script))) {
+        if (name !== 'lane-pool.mjs') symlinkSync(join(dirname(script), name), join(scriptsDir, name));
+      }
+      entry = join(scriptsDir, 'lane-pool.mjs');
+      copyFileSync(script, entry);
+    }
+    const lease = readFileSync(marker, 'utf8');
+    const result = run({}, 'fixture', {
+      LANE_POOL_ROOT: '', WE_ALLOW_REAL_LANE_POOL_IN_TESTS: '1',
+    }, 'branch', { cwd: cwd === 'primary' ? primary : cwd === 'self' ? lane : other, script: entry, fromCwd: true });
+    expect(result.status, result.stderr).toBe(0);
+    expect(git(lane, 'branch', '--show-current')).toBe('lane/test');
+    expect(git(lane, 'rev-parse', 'HEAD')).toBe(tip);
+    expect(git(primary, 'branch', '--list', 'lane/test')).toBe('');
+    expect(git(other, 'branch', '--list', 'lane/test')).toBe('');
+    expect(readFileSync(marker, 'utf8')).toBe(lease);
+  },
+);
 it('refuses an unleased lane', () => { rmSync(marker); refused({}, /unleased/); });
 it('refuses the wrong holder, including the dispatcher session', () => { refused({ session: 'dispatcher' }, /holder/); });
 it.each([undefined, '', true])('refuses missing or unreadable session %s', session => { refused({ session }, /session/); });
@@ -88,7 +115,7 @@ it('refuses an unreadable lane repository', () => {
   expect(result.stderr).toMatch(/lane|repository/);
   expect(git(primary, 'branch', '--list', 'lane/test')).toBe('');
 });
-it('refuses a lane pointing at the primary checkout', () => {
+it('refuses a pool lane symlink pointing at the primary checkout', () => {
   rmSync(lane, { recursive: true }); symlinkSync(primary, lane, 'dir');
   refused({}, /clone|shared|symlink/);
 });
