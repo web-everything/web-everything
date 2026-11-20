@@ -21,7 +21,7 @@ import { readRequiredStatusChecksDetailed } from './required-status-checks.mjs';
 import { reviewCiGate } from './review-ci-gate.mjs';
 import { acceptanceCoversHead } from './review-escalation.mjs';
 import { collapseRollupToLatestPerName } from './rollup-collapse.mjs';
-import { latestFailingMergeGate, readMergeGateVerdict } from './merge-gate-hold-class.mjs';
+import { isCandidacyHold, latestFailingMergeGate, readMergeGateVerdict } from './merge-gate-hold-class.mjs';
 import { readSharedFreeze } from './red-main-freeze-shared.mjs';
 import { resolveCoordinationRoot } from '../operations/coordination-root.mjs';
 import { execFileSyncThrottled } from './gh-throttle.mjs';
@@ -718,7 +718,12 @@ export async function handleStaleMergeGate({ c, pr, requiredChecks, classifyPr, 
   if (legacy.handled) return legacy;
   // failedRequiredGateRefresh: another trigger for the same guarded refresh and its existing per-head ledger.
   // A check-run id is not a workflow run id; this trigger rebuilds the head instead of rerunning the old workflow.
-  if (everyOtherRequiredGreen(requiredChecks, pr.statusCheckRollup)) {
+  // F1: only a readable verdict for THIS PR whose every hold is a candidacy hold the drain has since cleared may rebuild.
+  // A real hold (codeql, manifest...), an unreadable or fail-closed verdict, or no verdict at all stays legacy (no refresh).
+  const rv = legacy.verdict;
+  const blockingRows = Array.isArray(rv?.results) ? rv.results.filter(r => r.status === 'hold' || r.status === 'fail-closed') : [];
+  const onlyCandidacyHolds = rv?.num === c.num && blockingRows.length > 0 && blockingRows.every(r => isCandidacyHold(r));
+  if (onlyCandidacyHolds && everyOtherRequiredGreen(requiredChecks, pr.statusCheckRollup)) {
     try {
       if (newestRequiredFailedGate(await readFailedGate({ repo: c.repo, headSha,
         branch: classifyOptions.defaultBranch || 'main' }), headSha)) {
@@ -745,20 +750,21 @@ async function recoverLegacyStaleMergeGate({ c, pr, headSha, setting, statePath,
   const ids = /\/actions\/runs\/(\d+)\/job\/(\d+)/.exec(run.detailsUrl ?? run.details_url ?? '');
   const runId = Number(ids?.[1]), jobId = Number(ids?.[2]);
   if (!Number.isSafeInteger(runId) || runId <= 0 || !Number.isSafeInteger(jobId) || jobId <= 0) return { ...unchanged, reason: 'merge-gate run/job URL unreadable' };
-  let classification;
+  let classification, verdictRead;
   try {
     const verdict = await readVerdict({ repo: c.repo, jobId, prNumber: c.num });
     if (verdict?.num !== c.num) return { ...unchanged, reason: 'merge-gate PR verdict unreadable' };
+    verdictRead = verdict;
     let evidence = acceptance;
     if (verdict.results?.some(r => r.status === 'hold' && (r.id === 'test-gaming' || (r.id === 'review-acceptance' && r.reason?.startsWith('human-only:'))))) {
       evidence ??= await readAcceptance({ pr: c.num, repo: c.repo, cwd: refreshOptions.cwd });
-      if (evidence?.headSha !== headSha) return { ...unchanged, reason: 'merge-gate acceptance head mismatch' };
+      if (evidence?.headSha !== headSha) return { ...unchanged, reason: 'merge-gate acceptance head mismatch', verdict };
     }
     const freeze = verdict.results?.some(r => r.status === 'hold' && r.id === 'red-main-freeze')
       ? await readFreeze({ board: refreshOptions.cloneDir }) : undefined;
     classification = classifyStaleMergeGate({ verdict, headSha, landableApartFromMergeState: true, humanClearedSha: evidence?.humanClearedSha, freeze });
-  } catch (e) { return { ...unchanged, reason: `merge-gate evidence unreadable: ${errText(e)}` }; }
-  if (!classification.stale) return { ...unchanged, reason: classification.reason };
+  } catch (e) { return { ...unchanged, reason: `merge-gate evidence unreadable: ${errText(e)}`, verdict: verdictRead }; }
+  if (!classification.stale) return { ...unchanged, reason: classification.reason, verdict: verdictRead };
   return handleQueueRefresh({ ...refreshOptions, c, key: `${c.repo}#${c.num}`, headSha, setting, statePath,
     decide: decideStaleMergeGateRefresh, runId, label: 'stale merge-gate', wording: `stale merge-gate (${classification.reason})` });
 }

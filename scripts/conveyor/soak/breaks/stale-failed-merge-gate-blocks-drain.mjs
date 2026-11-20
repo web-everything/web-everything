@@ -20,11 +20,24 @@ export default {
     const world = createPrestageWorld((argv, options) => spawnSync(process.execPath,
       [join(sourceRoot, 'scripts/merge-ai-prs.mjs'), ...argv], options));
     const report = {};
+    // One merge-gate job per PR (the fake serves job 1000 + number).
+    const jobUrl = number => `https://github.com/o/r/actions/runs/123/job/${1000 + number}`;
+    const withJob = copy => {
+      copy.statusCheckRollup = copy.statusCheckRollup.map(row => row.name === 'merge-gate' ? { ...row, detailsUrl: jobUrl(copy.number) } : row);
+      return copy;
+    };
     await world(async ({ pr, run, dir, slug }) => {
       pr.failedGate = true;
       pr.labels.push({ name: 'red-team:clear' });
       pr.statusCheckRollup = ['test', 'merge-gate'].map(name => ({ name, head_sha: pr.headRefOid,
-        status: 'COMPLETED', conclusion: name === 'test' ? 'SUCCESS' : 'FAILURE' }));
+        status: 'COMPLETED', conclusion: name === 'test' ? 'SUCCESS' : 'FAILURE',
+        ...(name === 'merge-gate' ? { detailsUrl: jobUrl(pr.number) } : {}) }));
+      const { GATE_IDS } = await import(pathToFileURL(join(sourceRoot, 'scripts/lib/merge-gate-inventory.mjs')).href);
+      // The gate's own verdict log: a candidacy hold the drain has since cleared (human-only, no human clearance) vs a real hold.
+      const gateLog = holds => ['#N: HOLD', ...GATE_IDS.map(id => holds[id]
+        ? `  hold              ${id.padEnd(22)} ${holds[id]}` : `  pass              ${id.padEnd(22)} ok`),
+      'merge-gate: HOLD — held'].join('\n');
+      pr.gateLog = gateLog({ 'review-acceptance': 'human-only: workflow edit' });
       const env = { WE_MERGE_QUEUE_REFRESH_ON_STALE_MERGE_GATE: 'on',
         WE_MERGE_QUEUE_SKIP_REBASE_APPROVED_HUMAN_SURFACE: 'off' };
       const state = join(dir, 'groups.json');
@@ -48,7 +61,7 @@ export default {
       delete pr.fetchedHead;
       // Two held PRs precede three eligible PRs. Holds refund the pass budget;
       // the following two refresh and the final one still hits the shared cap.
-      const prs = [42, 43, 44, 45, 46].map(number => ({ ...structuredClone(pr), number,
+      const prs = [42, 43, 44, 45, 46].map(number => withJob({ ...structuredClone(pr), number,
         id: `PR_${number}`, headRefName: `lane/readme-${number}` }));
       writeFileSync(state, JSON.stringify({ groups: [{ id: 'held', repo: slug, pr: 77,
         branch: 'lane/card-group-fixture', sources: [42, 43].map(num => ({ num, headSha: pr.headRefOid })),
@@ -76,11 +89,18 @@ export default {
         copy.commits[0].oid = head;
         copy.statusCheckRollup = copy.statusCheckRollup.map(row => ({ ...row, head_sha: head }));
         copy.comments[0].body = `<!-- reviewed-sha: ${reviewed ?? head} -->`;
-        return copy;
+        return withJob(copy);
       };
       writeFileSync(state, JSON.stringify({ groups: [], failed: {}, lastReconcileAt: Date.now() }));
       report.uncovered = (await run(false, { prs: [fresh(47, 'a'.repeat(40))], only: null, env })).calls;
       report.covered = (await run(false, { prs: [fresh(48)], only: null, env })).calls;
+      // F1: a covered head whose gate still shows a REAL hold, or whose verdict cannot be read, is never rebuilt.
+      const realHold = fresh(49);
+      realHold.gateLog = gateLog({ codeql: 'CodeQL: 1 open alert' });
+      const unreadable = fresh(50);
+      delete unreadable.gateLog;
+      report.realHold = (await run(false, { prs: [realHold], only: null, env })).calls;
+      report.unreadableVerdict = (await run(false, { prs: [unreadable], only: null, env })).calls;
     }, { slug: CONSTELLATION_REPOS.we.slug });
     return report;
   },
@@ -103,6 +123,8 @@ export default {
     if (report.laterHeads.some(calls => pushes(calls).length)) violations.push('later head reset the PR refresh bound');
     if (pushes(report.uncovered).length) violations.push('failed gate rebuilt a head the acceptance does not cover');
     if (pushes(report.covered).length !== 1) violations.push('covered failed-gate head was not rebuilt (control)');
+    if (pushes(report.realHold).length) violations.push('failed gate rebuilt a head with a real (non-candidacy) hold');
+    if (pushes(report.unreadableVerdict).length) violations.push('failed gate rebuilt a head whose verdict was unreadable');
     if (report.merged.length) violations.push('repair changed the original skip into a merge');
     if ([...report.first, ...report.second].some(a => a.includes('PUT') || (a[0] === 'api' && a[1] === 'graphql' && a.some(x => x.startsWith('query=mutation')))))
       violations.push('repair bypassed the refresh path');

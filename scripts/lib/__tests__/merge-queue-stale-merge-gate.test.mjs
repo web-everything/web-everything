@@ -10,24 +10,31 @@ const head = 'a'.repeat(40);
 const hold = (id, reason = 'held') => ({ status: 'hold', id, reason });
 const verdict = results => ({ num: 5006, ok: false, head_sha: head, completed_at: '2026-10-12T11:54:00Z', results });
 const freezeRow = hold('red-main-freeze', 'main is RED (freeze: manual freeze: merge-queue switch)');
+// Candidacy hold the legacy rerun declines (no human clearance), so the failed-gate arm decides.
+const humanOnly = hold('review-acceptance', 'human-only: workflow edit');
 const freeze = { frozen: false, publishedAt: '2026-10-12T12:49:00Z' };
 const classify = (results, extra = {}) => q.classifyStaleMergeGate({ verdict: verdict(results), headSha: head, landableApartFromMergeState: true, freeze, ...extra });
 const green = name => ({ name, status: 'COMPLETED', conclusion: 'SUCCESS' });
 const pr = { baseRefName: 'main', number: 5006, headRefOid: head, headRefName: 'lane/test', body: 'A real description', labels: [{ name: 'ready-to-merge' }], mergeable: 'MERGEABLE', mergeStateStatus: 'BLOCKED', statusCheckRollup: [green('test'), { ...green('merge-gate'), conclusion: 'FAILURE', detailsUrl: 'https://github.com/o/r/actions/runs/123/job/456' }] };
 function options(extra = {}) { return { failedGateBudget: { remaining: 2 }, c: { num: 5006, repo: 'o/r', headRef: 'lane/test', ...classifyPr(pr, { defaultBranch: 'main', queueRequiredChecks: ['test', 'merge-gate'] }) }, pr, requiredChecks: ['test', 'merge-gate'], classifyPr, classifyOptions: { defaultBranch: 'main' }, setting: 'on', readVerdict: vi.fn(() => verdict([freezeRow])), readFreeze: () => freeze, readAcceptance: vi.fn(() => ({ acceptedSha: head, headSha: head })), cloneDir: '/clone', statePath: '/unused', readGateRuns: vi.fn(() => []), readFailedGate: vi.fn(() => ({requiredAppId:null,checkRuns:[]})), readState: () => ({}), record: vi.fn(), refreshStalePr: vi.fn(async () => ({ ok: true, action: 'rerun', newCommit: head })), ...extra }; }
 describe('stale merge-gate refresh', () => {
-  it.each(['legacy', 'real-hold', 'unreadable'])('declares recovery ordering when failed-gate and %s evidence overlap', async mode => {
+  it.each(['legacy', 'candidacy', 'real-hold', 'unreadable', 'mixed'])('declares recovery ordering when failed-gate and %s evidence overlap', async mode => {
     const dir = mkdtempSync(join(tmpdir(), 'stale-overlap-'));
     const failedGateBudget = { remaining: 2 };
     const o = options({ statePath: join(dir, 'ledger.json'), failedGateBudget,
       readFailedGate: vi.fn(() => ({ requiredAppId: 1, checkRuns: [{ id: 20, name: 'merge-gate', head_sha: head,
         app: { id: 1 }, status: 'completed', conclusion: 'failure' }] })),
-      readVerdict: vi.fn(() => mode === 'unreadable' ? { error: 'offline' } : verdict([mode === 'legacy' ? freezeRow : hold('codeql')])),
+      readVerdict: vi.fn(() => mode === 'unreadable' ? { error: 'offline' } : verdict(mode === 'legacy' ? [freezeRow] : mode === 'candidacy' ? [humanOnly] : mode === 'mixed' ? [humanOnly, hold('codeql')] : [hold('codeql')])),
     });
     try {
-      expect((await q.handleStaleMergeGate(o)).handled).toBe(true);
+      const refused = mode === 'real-hold' || mode === 'unreadable' || mode === 'mixed';
+      expect((await q.handleStaleMergeGate(o)).handled).toBe(!refused);
       expect(o.readVerdict).toHaveBeenCalledTimes(1);
-      if (mode === 'legacy') {
+      if (refused) {
+        expect(o.refreshStalePr).not.toHaveBeenCalled();
+        expect(failedGateBudget.remaining).toBe(2);
+        expect(readdirSync(dir).some(name => name.includes('failed-pr'))).toBe(false);
+      } else if (mode === 'legacy') {
         expect(o.refreshStalePr).toHaveBeenCalledWith(expect.objectContaining({ runId: 123 }));
         expect(o.refreshStalePr.mock.calls[0][0].forceRefresh).toBeUndefined();
         expect(failedGateBudget.remaining).toBe(2);
@@ -44,7 +51,7 @@ describe('stale merge-gate refresh', () => {
     const run = async readAcceptance => {
       const dir = mkdtempSync(join(tmpdir(), 'stale-cover-'));
       const o = options({ statePath: join(dir, 'ledger.json'), readFailedGate: vi.fn(() => failedRows()),
-        readVerdict: vi.fn(() => verdict([hold('codeql')])), readAcceptance });
+        readVerdict: vi.fn(() => verdict([humanOnly])), readAcceptance });
       try { return { o, r: await q.handleStaleMergeGate(o) }; } finally { rmSync(dir, { recursive: true, force: true }); }
     };
     it('acceptance at A, head B: held, no push, budget kept', async () => {

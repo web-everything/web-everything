@@ -33,6 +33,10 @@ if (a[0] === 'api') {
   if (path.includes('/comments')) out([pr.comments]);
   if (path.includes('/reviews')) out([[]]);
   if (path.includes('/files')) out([[{filename:'README.md',status:'modified'}]]);
+  // Merge-gate job metadata + raw log (the verdict table the stale-gate arm reads); `#N:` is the PR's own header.
+  // One job per PR (job id = 1000 + PR number): a shared log with several blocking tables is ambiguous evidence by design.
+  const gatePr = prs.find(row => path.includes('/actions/jobs/' + (1000 + row.number)));
+  if (gatePr?.gateLog) out(path.endsWith('/logs') ? gatePr.gateLog.replace(/#N:/g, '#'+gatePr.number+':') : { head_sha:gatePr.headRefOid, completed_at:'2026-10-12T11:54:00Z' });
   if (path.includes('/check-runs') && pr.failedGate) out({total_count:1,check_runs:[{id:20,name:'merge-gate',head_sha:pr.headRefOid,app:{id:1},status:'completed',conclusion:'failure'}]});
   if (path.includes('/actions/runs') && pr.startupFailure) out({total_count:1,workflow_runs:[{id:123,head_sha:pr.headRefOid,event:'pull_request_target',path:'.github/workflows/merge-gate.yml',status:'completed',conclusion:'startup_failure'}]});
   if (path.includes('/check-runs')) out(pr.checkRuns || [{check_runs:[]}]);
