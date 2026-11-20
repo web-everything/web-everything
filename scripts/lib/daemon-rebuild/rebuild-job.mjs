@@ -11,7 +11,8 @@
  *      ({@link resolveRebuildAsJob}). Per tick it consumes finished outcomes, then runs the ordinary rebuild
  *      in ADOPT-ONLY mode before inspecting or reattaching jobs. A passed build wins even when main advanced;
  *      the existing matching and last-good checks still apply. With no ready candidate, it watches an in-flight
- *      job or queues one when the adoption pass says a build is due. It never builds or smokes.
+ *      job or queues one when the adoption pass says a build is due. A matching hot-patch ledger may bypass
+ *      spacing once after its wake floor; the wake is marked only after enqueue. It never builds or smokes.
  *   2. JOB CHILD — this file run as a script (the kind's `entry`) from a pinned code snapshot. Its one step spawns
  *      `daemon-rebuild.mjs --ready-only` as an ASYNC child (the smoke's synchronous children never starve this
  *      process's heartbeat), which runs the unchanged prepare → candidate worktree → live smoke → fallback / hold
@@ -44,6 +45,7 @@ import { alertsFilePath, readReadyCandidate } from './state.mjs';
 import { processStartMs } from './lease.mjs';
 import { readGit } from '../proc-read.mjs';
 import { cascadePolicy } from '../policy-cascade.mjs';
+import { hotPatchWakeDue, markHotPatchWoke, readHotPatch } from '../hot-patch.mjs';
 
 const SELF = fileURLToPath(import.meta.url);
 const SETTINGS_PATH = resolve(SELF, '..', '..', 'daemon-rebuild-settings.json');
@@ -169,6 +171,7 @@ function clockFor(dir) {
 /**
  * TICK SIDE. Never waits on a smoke. Returns a `rebuildClone`-shaped result (`moved`/`adopted`/`reason`) plus
  * `job` (the in-flight or just-started job) and `finishedJobs` (outcomes consumed this tick).
+ * A matching hot-patch wake skips spacing once; enqueue failure never consumes it.
  * @param {{root: string, env?: object, log?: object, mainOnly?: boolean, entries?: string[],
  *   adopt: (o?: object) => Promise<object>, store?: object, reattach?: Function, clock?: object, now?: () => number,
  *   codeSha?: string, snapshot?: object, settings?: object, evict?: Function, rng?: () => number}} o
@@ -262,7 +265,12 @@ export async function rebuildCloneAsJob({
   const lastRes = last ? readResult(store.dir, last.id) : null;
   const sinceMs = last ? now() - Date.parse(last.job.finishedAt || 0) : Infinity;
   const intervalMs = rebuildJobInterval(settings, entries, rng);
-  if (last && !lastRes?.readyRecorded && sinceMs < intervalMs) {
+  // Capture the ledger SHA before checking/enqueueing so a replacement cannot consume another patch's wake.
+  let sha;
+  try { sha = readHotPatch(env)?.sha; } catch { /* Unreadable wake evidence retains ordinary spacing. */ }
+  const wake = hotPatchWakeDue({ env, plan: r.plan,
+    lastFinishedMs: last ? Date.parse(last.job.finishedAt || 0) : 0, now: now() });
+  if (!(wake && sha) && last && !lastRes?.readyRecorded && sinceMs < intervalMs) {
     housekeeping();
     return {
       moved: false, reason: 'rebuild-job-spaced', retryInMs: intervalMs - sinceMs, plan: r.plan, finishedJobs, alerts: r.alerts ?? [],
@@ -278,6 +286,10 @@ export async function rebuildCloneAsJob({
   } catch (e) {
     say(`could not queue a rebuild job (${String(e?.message || e).split('\n')[0]}) — the next tick retries`);
     return { moved: false, reason: 'rebuild-job-queue-failed', finishedJobs, alerts: r.alerts ?? [] };
+  }
+  if (wake && sha) {
+    try { markHotPatchWoke(env, sha); }
+    catch { /* The job is already queued; a wake-marker failure must not undo enqueue. */ }
   }
   say(`queued rebuild job ${queued.id} for ${String(r.plan?.finalSha ?? '?').slice(0, 9)} — build + live smoke run detached; this daemon keeps ticking on its current tree and adopts only a smoke-passed build`);
   await pass();

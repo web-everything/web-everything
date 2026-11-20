@@ -18,10 +18,12 @@ import { addOverlay, readOverlays, removeOverlay } from '../daemon-overlays.mjs'
 import { defaultPoolRoot } from '../lane-pool-paths.mjs';
 import { DISPATCH_CWD_ENV } from '../../operations/dispatch-lane-io.mjs';
 import { requestForceAdopt, readForceWatch, runForceWatchTick, readForceAdopt, recordForcedAdoption, forceBlockedReason } from '../daemon-force-adopt.mjs';
-import { readReadyCandidate, alertsFilePath } from '../daemon-rebuild/state.mjs';
+import { readReadyCandidate, alertsFilePath, writeRebuildState, writeReadyCandidate } from '../daemon-rebuild/state.mjs';
 import { cloneKeyOf } from '../daemon-last-good.mjs';
 import { gitRun } from '../main-staleness.mjs';
 import { withWriteLock } from '../daemon-clone-lock.mjs';
+import { rollbackToGood } from '../daemon-rebuild/rebuild.mjs';
+import { hotPatchLedgerPath, readHotPatch, HOT_PATCH_MAX_OPEN_MS, HOT_PATCH_OVERLAY_REASON } from '../hot-patch.mjs';
 // Pre-dates daemonRebuild.skipUnrelated: these tests assert a smoke runs for non-code moves, so pin the knob off.
 process.env.WE_DAEMON_REBUILD_SKIP_UNRELATED = '0';
 
@@ -942,5 +944,108 @@ describe('R508 dispatch smoke after a force', () => {
     // An adoptedApplied list would exempt ref+sha here and suppress the dispatch entirely.
     expect(match).toHaveBeenCalledWith(expect.arrayContaining(['scripts/dispatch.mjs']), ['scripts/**']);
     expect(dispatchRun).toHaveBeenCalledOnce();
+  });
+});
+
+describe('shared hot-patch rollback wiring', () => {
+  const isolationFixture = () => {
+    const { cloneDir, env } = makeFixture();
+    const good = headOf(cloneDir);
+    writeFile(cloneDir, 'README.md', 'patch\n');
+    gitOk(cloneDir, ['commit', '-qam', 'patch']);
+    const sha = headOf(cloneDir);
+    const child = spawnSync(process.execPath, ['-e', 'process.stdout.write(String(process.pid))'],
+      { encoding: 'utf8', timeout: 5000, maxBuffer: 4096 });
+    expect(child.status).toBe(0);
+    const requestPid = Number(child.stdout);
+    expect(() => process.kill(requestPid, 0)).toThrowError(expect.objectContaining({ code: 'ESRCH' }));
+    writeRebuildState(cloneDir, { ...readRebuildState(cloneDir, env), adopted: {
+      head: sha, inputsKey: 'd'.repeat(40), mainSha: good, applied: [{ ref: 'lane/repair', sha }],
+      at: new Date().toISOString(),
+    } }, env);
+    const loadedAt = new Date(Date.now() - HOT_PATCH_MAX_OPEN_MS).toISOString();
+    addOverlay(cloneDir, { ref: 'lane/repair', pr: 42, pinned: true,
+      reason: HOT_PATCH_OVERLAY_REASON, now: loadedAt }, { env });
+    const overlay = readOverlays(cloneDir, { env })[0];
+    const ledger = { sha, pr: 42, branch: overlay.ref, root: cloneDir, requestPid, requestStart: 1,
+      loadedAt, overlay, preGood: { head: good, inputsKey: 'c'.repeat(40), mainSha: good, applied: [] } };
+    writeFileSync(hotPatchLedgerPath(env), JSON.stringify(ledger));
+    expect(readHotPatch(env)).toEqual(ledger);
+    return { cloneDir, env, sha, overlay };
+  };
+
+  it('a foreign clone leaves both HEADs, overlays, and the global hot-patch ledger unchanged', async () => {
+    const { cloneDir, env, sha, overlay } = isolationFixture();
+    // Carry the patch in the foreign clone too: ancestry alone must never authorize its rollback.
+    const foreign = makeAuthorClone(cloneDir);
+    expect(headOf(foreign)).toBe(sha);
+    addOverlay(foreign, { ref: overlay.ref, pr: overlay.pr, pinned: true,
+      reason: overlay.reason, now: overlay.addedAt }, { env });
+    const ownerOverlays = readOverlays(cloneDir, { env });
+    const foreignOverlays = readOverlays(foreign, { env });
+    const ledgerBefore = readFileSync(hotPatchLedgerPath(env), 'utf8');
+    const result = await tick(foreign, env, { versions: {}, adoptOnly: true, emitEvent: async () => true });
+    expect(result.reason).toBe('needs-build');
+    expect(headOf(foreign)).toBe(sha);
+    expect(headOf(cloneDir)).toBe(sha);
+    expect(readOverlays(foreign, { env })).toEqual(foreignOverlays);
+    expect(readOverlays(cloneDir, { env })).toEqual(ownerOverlays);
+    expect(readFileSync(hotPatchLedgerPath(env), 'utf8')).toBe(ledgerBefore);
+  });
+
+  it('a readyOnly invocation leaves HEAD, overlays, and the owning hot-patch ledger unchanged', async () => {
+    const { cloneDir, env, sha } = isolationFixture();
+    // Reach the readyOnly fast return with a pending candidate, without any build/smoke work.
+    expect(writeReadyCandidate(cloneDir, { prevHead: sha, adopt: { finalSha: sha } }, env)).toBe(true);
+    const overlaysBefore = readOverlays(cloneDir, { env });
+    const ledgerBefore = readFileSync(hotPatchLedgerPath(env), 'utf8');
+    const smoke = vi.fn();
+    const result = await tick(cloneDir, env, { versions: null, readyOnly: true,
+      runSmoke: smoke, emitEvent: async () => true });
+    expect(result.reason).toBe('ready-pending');
+    expect(smoke).not.toHaveBeenCalled();
+    expect(headOf(cloneDir)).toBe(sha);
+    expect(readOverlays(cloneDir, { env })).toEqual(overlaysBefore);
+    expect(readFileSync(hotPatchLedgerPath(env), 'utf8')).toBe(ledgerBefore);
+  });
+
+  it('restores preGood under the tick lock and retires the ledger without replacing its fencing token', async () => {
+    const { cloneDir, env } = makeFixture();
+    const good = headOf(cloneDir);
+    writeFile(cloneDir, 'README.md', 'patch\n');
+    gitOk(cloneDir, ['commit', '-qam', 'patch']);
+    const sha = headOf(cloneDir);
+    // A real child that has exited gives a dead requester without needing a process-table read.
+    const child = spawnSync(process.execPath, ['-e', 'process.stdout.write(String(process.pid))'], { encoding: 'utf8' });
+    expect(child.status).toBe(0);
+    const requestPid = Number(child.stdout);
+    expect(() => process.kill(requestPid, 0)).toThrowError(expect.objectContaining({ code: 'ESRCH' }));
+    writeRebuildState(cloneDir, { ...readRebuildState(cloneDir, env), adopted: {
+      head: sha, inputsKey: 'd'.repeat(40), mainSha: good, applied: [{ ref: 'lane/repair', sha }],
+      at: new Date().toISOString(),
+    } }, env);
+    const loadedAt = Date.now() - HOT_PATCH_MAX_OPEN_MS;
+    writeFileSync(hotPatchLedgerPath(env), JSON.stringify({ sha, pr: 42, branch: 'lane/repair', root: cloneDir,
+      requestPid, requestStart: 1, loadedAt: new Date(loadedAt).toISOString(),
+      overlay: { ref: 'lane/repair', pr: 42, pinned: true, reason: HOT_PATCH_OVERLAY_REASON,
+        addedAt: new Date(loadedAt).toISOString(), addedBy: null },
+      preGood: { head: good, inputsKey: 'c'.repeat(40), mainSha: good, applied: [] } }));
+    const result = await tick(cloneDir, env, { versions: {}, adoptOnly: true, emitEvent: async () => true });
+    expect(result.reason).toBe('needs-build');
+    expect(headOf(cloneDir)).toBe(good);
+    expect(readHotPatch(env)).toBeNull();
+  });
+  it('refuses a missing expected HEAD, preserves a superseding build, and accepts an already-restored head', async () => {
+    const { cloneDir, env } = makeFixture();
+    const good = headOf(cloneDir);
+    writeFile(cloneDir, 'README.md', 'patch\n');
+    gitOk(cloneDir, ['commit', '-qam', 'patch']);
+    const sha = headOf(cloneDir);
+    const args = { root: cloneDir, env, good: { head: good, mainSha: good, inputsKey: 'c'.repeat(40), applied: [] } };
+    expect(await rollbackToGood(args)).toEqual({ ok: false });
+    expect(await rollbackToGood({ ...args, expectHead: good })).toEqual({ superseded: true, head: sha });
+    expect(headOf(cloneDir)).toBe(sha);
+    gitOk(cloneDir, ['reset', '--hard', good]);
+    expect(await rollbackToGood({ ...args, expectHead: sha })).toEqual({ ok: true });
   });
 });

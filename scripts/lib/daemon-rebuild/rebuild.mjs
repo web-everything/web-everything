@@ -1,10 +1,12 @@
 /** @file scripts/lib/daemon-rebuild/rebuild.mjs — `rebuildClone`, the IO shell that runs the three phases
- * (locked prepare → unlocked candidate smoke → locked finalize). Split out of daemon-rebuild.mjs (move-only); the
- * design notes it refers to as "the file header" are the header of `scripts/lib/daemon-rebuild.mjs`.
+ * (locked prepare → unlocked candidate smoke → locked finalize). Split out of daemon-rebuild.mjs (move-only).
+ * Force-adopt and owning-clone hot-patch watches share the locked rollback finalizer after each daemon tick.
+ * The design notes it refers to as "the file header" are the header of `scripts/lib/daemon-rebuild.mjs`.
  */
 
 import { checkPendingAdoptions } from '../overlay-adoption.mjs';
 import { execFileSync } from 'node:child_process';
+import { AsyncLocalStorage } from 'node:async_hooks';
 import { hostname } from 'node:os';
 import { basename, resolve } from 'node:path';
 import { appendDaemonEvent } from '../daemon-events.mjs';
@@ -14,6 +16,12 @@ import { acquireSmokeSlot } from '../daemon-smoke-slots.mjs';
 import { withWriteLock } from '../daemon-clone-lock.mjs';
 import { runForceWatchTick, readForceAdopt } from '../daemon-force-adopt.mjs';
 import { finalizeRebuild } from './adopt.mjs';
+import { readHotPatch, runHotPatchTick } from '../hot-patch.mjs';
+import { hotPatchCiVerdict, requiredChecksForMain } from '../hot-patch-ci.mjs';
+import { cloneKeyOf } from '../daemon-last-good.mjs';
+import { readOverlays, readOverlayState, removeOverlay } from '../daemon-overlays.mjs';
+import { runGhSync } from '../gh-throttle.mjs';
+import { isGithubRemoteFor } from '../git-pr-commits.mjs';
 import { defaultPrState } from './edge-fetch.mjs';
 import {
   REBUILD_LOCK_WAIT_ENV, DEFAULT_REBUILD_LOCK_WAIT_MS, readRebuildStarvation, rebuildLockWaitMs,
@@ -128,6 +136,7 @@ export async function rebuildClone({ emitEvent = appendDaemonEvent, ...options }
     });
   } catch { /* Event failures must never change the rebuild outcome. */ }
   await forceWatch(options, emitEvent, startedAtMs);
+  await hotPatchWatch(options, emitEvent);
   return result;
 }
 
@@ -141,26 +150,83 @@ async function forceWatch(options, emitEvent, startedAtMs) {
     await runForceWatchTick({
       root, env: stEnv, notBefore: startedAtMs, currentHead: () => verifyRev(makeGit({ run, cwd: root, env }), 'HEAD'), emit: (e) => emitEvent(e, { env: { WE_DAEMON_EVENTS: process.env.WE_DAEMON_EVENTS, ...options.env } }),
       probe: options.forceWatchProbe ?? defaultForceWatchProbe(run, env),
-      rollback: async (lastGood, { sha } = {}) => {
-        if (!lastGood?.head || !sha) return { ok: false }; // no watched build named: nothing proves it is still the one running, so never revert
-        const git = makeGit({ run, cwd: root, env });
-        // HEAD is read INSIDE the write lock and compared with the watched build: a sibling that adopted a newer build while the
-        // health probe ran must not be reset to last-good (finalize would accept the newer head as `prevHead` and revert it).
-        const fin = await withWriteLock(root, async () => {
-          const head = verifyRev(git, 'HEAD');
-          if (!head) return { ok: false }; // HEAD unreadable: unknown is not "superseded" — the rollback stays owed and is retried
-          if (head === lastGood.head) { clearReadyCandidate(root, stEnv); return { ok: true }; } // already reverted
-          if (head !== sha) return { superseded: true, head };
-          clearReadyCandidate(root, stEnv);
-          const done = await finalizeRebuild({
-            root, env, log, run, stateOpts, now, prevHead: head, lease: { token: 'force-adopt-rollback' },
-            plan: { ok: true, finalSha: lastGood.head, inputsKey: lastGood.inputsKey, mainSha: lastGood.mainSha, applied: lastGood.applied || [] },
-          });
-          return { ok: done?.adopted === true };
-        }, { now });
-        if (fin.ok !== true) return { ok: false };
-        return fin.value;
+      rollback: (good, { sha } = {}) => rollbackToGood({ root, env, log, run, stateOpts, now, good, expectHead: sha }),
+    });
+  } catch { /* a watch failure never changes the rebuild outcome */ }
+}
+
+// The hot-patch tick holds the write lock across overlay removal and ledger retirement.
+// Reuse that hold for its rollback; reacquiring would replace the outer lock's fencing token.
+const hotPatchRollbackLock = new AsyncLocalStorage();
+
+/** Restore a known-good build through finalizeRebuild, with HEAD checked inside the clone write lock.
+ * Missing expected HEAD refuses; an already-restored build succeeds; a newer build is superseded. */
+export async function rollbackToGood({ root, env = process.env, log = console, run = gitRun,
+  stateOpts = {}, now = Date.now, good, expectHead }) {
+  if (!good?.head || !expectHead) return { ok: false };
+  const stEnv = { ...env, ...(stateOpts?.env || {}) };
+  const git = makeGit({ run, cwd: root, env });
+  const restore = async () => {
+    const head = verifyRev(git, 'HEAD');
+    if (!head) return { ok: false };
+    if (head === good.head) { clearReadyCandidate(root, stEnv); return { ok: true }; }
+    if (head !== expectHead) return { superseded: true, head };
+    clearReadyCandidate(root, stEnv);
+    const done = await finalizeRebuild({
+      root, env, log, run, stateOpts, now, prevHead: head, lease: { token: 'force-adopt-rollback' },
+      plan: { ok: true, finalSha: good.head, inputsKey: good.inputsKey, mainSha: good.mainSha, applied: good.applied || [] },
+    });
+    return { ok: done?.adopted === true };
+  };
+  const held = hotPatchRollbackLock.getStore();
+  if (held?.key === cloneKeyOf(root)) return held.stillHeld() ? restore() : { ok: false };
+  const fin = await withWriteLock(root, restore, { now });
+  return fin.ok === true ? fin.value : { ok: false };
+}
+
+/** R1100: tick the global hot-patch ledger only in its owning clone, never in a readyOnly job.
+ * Unknown IO retains the ledger for retry; watch failures never change the rebuild outcome. */
+async function hotPatchWatch(options, emitEvent) {
+  const { root, env = process.env, log = console, run = gitRun, stateOpts = {}, now = Date.now, readyOnly = false } = options;
+  if (!root || readyOnly) return;
+  const stEnv = { ...env, ...(stateOpts?.env || {}) };
+  try {
+    const ledger = readHotPatch(stEnv);
+    if (!ledger || cloneKeyOf(ledger.root) !== cloneKeyOf(root)) return;
+    const git = makeGit({ run, cwd: root, env });
+    const repo = 'web-everything/web-everything';
+    const ghJson = args => JSON.parse(runGhSync(args, {
+      cwd: root, env, encoding: 'utf8', timeout: 20000, maxBuffer: 1024 * 1024,
+    }));
+    await runHotPatchTick({
+      root, env: stEnv, now,
+      ciVerdict: record => {
+        const origin = git(['remote', 'get-url', 'origin']);
+        if (origin.status !== 0 || !isGithubRemoteFor(origin.stdout, repo))
+          return { state: 'unknown', reason: 'Unsupported hot-patch repository' };
+        return hotPatchCiVerdict({
+          repo,
+          sha: record.sha, required: requiredChecksForMain(), fetchJson: path => ghJson(['api', path]),
+        });
       },
+      prState: record => ghJson(['pr', 'view', String(record.pr), '--repo', repo, '--json', 'state,headRefOid']),
+      rollbackToGood: (good, context) => rollbackToGood({
+        root, env, log, run, stateOpts, now, good, expectHead: context?.expectHead,
+      }),
+      removeOverlay,
+      readOverlays: target => {
+        if (readOverlayState(target, { env: stEnv }).corrupt) throw Error('hot-patch overlay state unreadable');
+        return readOverlays(target, { env: stEnv });
+      },
+      readHead: () => verifyRev(git, 'HEAD'),
+      headContains: sha => {
+        const result = git(['merge-base', '--is-ancestor', sha, 'HEAD']);
+        if (![0, 1].includes(result.status)) throw Error('hot-patch ancestry unreadable');
+        return result.status === 0;
+      },
+      lock: (target, fn, opts) => withWriteLock(target, stillHeld =>
+        hotPatchRollbackLock.run({ key: cloneKeyOf(target), stillHeld }, fn), opts),
+      emit: event => emitEvent(event, { env: { WE_DAEMON_EVENTS: process.env.WE_DAEMON_EVENTS, ...options.env } }),
     });
   } catch { /* a watch failure never changes the rebuild outcome */ }
 }
