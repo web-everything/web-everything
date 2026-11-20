@@ -45,6 +45,20 @@ function outsideInlineCode(line) {
   return delimiter ? undefined : plain + line.slice(start);
 }
 
+// Conservative: true when any line could leave a markdown link open (unbalanced brackets or parens beside a link,
+// a reference-definition or inline-link title whose closing quote/paren is missing, or a title-looking line start).
+// Such a snapshot cannot prove a standalone marker is outside a link title, so a marker in it is refused.
+const TITLE_CLOSE = { '"': '"', "'": "'", '(': ')' };
+function linkMayEnclose(diff) {
+  const count = (s, re) => (s.match(re) ?? []).length;
+  return diff.split(/\r\n|[\r\n]/).some((l) => {
+    if (/[\[\]]/.test(l) && (count(l, /\[/g) !== count(l, /\]/g) || count(l, /\(/g) !== count(l, /\)/g))) return true;
+    const open = l.match(/^[ \t]{0,3}\[[^\]]*\]:[ \t]*\S*[ \t]*(["'(])(.*)$/)
+      ?? l.match(/\]\([ \t]*\S+[ \t]+(["'(])(.*)$/) ?? l.match(/^[ \t]{0,3}(["'(])(.*)$/);
+    return !!open && !open[2].includes(TITLE_CLOSE[open[1]]);
+  });
+}
+
 /** One bounded request. Truncation is not agreement: operators must investigate the full history. */
 export function readAuthorStampEdits(pr, { repo, exec = execFileSyncThrottled } = {}) {
   const parts = typeof repo === 'string' ? repo.split('/') : [];
@@ -147,6 +161,11 @@ export function planStampRestore({ state, body, authorLogin, edits } = {}) {
     if (/<\/?[a-z][^>]*>/i.test(noExempt ? edit.diff : htmlLines.join('\n')) || /<[!?]/.test(candidate)) {
       return refusal('unsupported HTML edit snapshot; inspect complete GitHub history manually',
         contentEvidence(edit, htmlOffender(candidate)));
+    }
+    // A marker is not a stamp when a link title/destination or link text may still be open around it.
+    if (markers.length && linkMayEnclose(edit.diff)) {
+      return refusal('malformed or non-standalone historical stamp; inspect complete GitHub history manually',
+        contentEvidence(edit, markerLine(edit.diff)));
     }
     // An unmatched backtick line may open a multiline code span around a marker: not evidence of authorship.
     if (ambiguousTicks && markers.length) {

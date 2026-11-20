@@ -976,3 +976,19 @@ describe('planStampRestore — #7227 full-body edit dropped the stamp', () => {
     }
   });
 });
+
+describe('planStampRestore — marker inside a markdown link title is not a stamp (R10)', () => {
+  const m = () => buildAuthorActorMarker(ID);
+  it.each([
+    ['multiline reference-link title', `[ref]: https://example.test "title\n${'MARK'}\nend"`],
+    ['reference-link title on the next line', `[ref]: https://example.test\n"title\n${'MARK'}\nend"`],
+    ['multiline inline-link title', `[text](https://example.test "title\n${'MARK'}\nend")`],
+    ['single-line title', `[ref]: https://example.test "title ${'MARK'}"`],
+    ['backtick span', `\`\n${'MARK'}\n\``],
+  ])('refuses a marker in a %s', (_n, tpl) => {
+    expect(plan({ edits: [edit(tpl.replace('MARK', m()))] })).toMatchObject({ action: 'refuse' });
+  });
+  it('still restores beside a closed reference definition', () => {
+    expect(plan({ edits: [edit(`[ref]: https://example.test "title"\n${m()}`)] })).toMatchObject({ action: 'restore' });
+  });
+});
