@@ -5627,6 +5627,7 @@ function cmdBranch(repo) {
     || name.includes('..') || name.startsWith('lane/-')) fail('branch: invalid --name; use lane/<slug> (no .. or leading -)');
   const dir = laneDir(repo, n);
   const refuse = reason => fail(`branch lane-${n}: ${reason}`);
+  const branchGit = args => git(args, dir, { env: releaseEvidenceEnv(args) });
   try {
     // Reject symlinks, worktrees and shared gitdirs before reading a marker or running git.
     if (dirname(resolve(repo.poolDir)) !== resolve(POOL_ROOT)
@@ -5637,8 +5638,8 @@ function cmdBranch(repo) {
       || realpathSync(dir) === realpathSync(repo.referencePath)) {
       refuse('requires its own clone; shared checkout or symlink refused');
     }
-    const root = git(['rev-parse', '--show-toplevel'], dir);
-    const common = git(['rev-parse', '--git-common-dir'], dir);
+    const root = branchGit(['rev-parse', '--show-toplevel']);
+    const common = branchGit(['rev-parse', '--git-common-dir']);
     if (realpathSync(root) !== realpathSync(dir)
       || realpathSync(resolve(dir, common)) !== realpathSync(join(dir, '.git'))) {
       refuse('requires its own clone; shared repository refused');
@@ -5650,21 +5651,34 @@ function cmdBranch(repo) {
   if (!lease) refuse('lane is unleased');
   if (typeof lease.holder !== 'string' || !lease.holder.trim()) refuse('lease holder unknown');
   if (lease.holder !== flags.session) refuse('session does not match lease holder');
-  try { git(['check-ref-format', `refs/heads/${name}`], dir); }
+  if (!Number.isFinite(Date.parse(lease.acquiredAt)) || isLeaseStale(lease, Date.now(), ttlMsFromFlags())) refuse('lease stale or undatable; re-acquire the lane');
+  const hold = checkLaneHold(dir, { action: 'reset', byHolder: true });
+  if (!hold.allowed) refuse(hold.reason);
+  try { branchGit(['check-ref-format', `refs/heads/${name}`]); }
   catch { refuse('invalid --name for a git branch'); }
   try {
     // Unlike tryGit/status fallbacks, a failed read must never mean clean or absent.
-    const branches = git(['for-each-ref', '--format=%(refname)', `refs/heads/${name}`], dir).split('\n');
+    const branches = branchGit(['for-each-ref', '--format=%(refname)', `refs/heads/${name}`]).split('\n');
     if (branches.includes(`refs/heads/${name}`)) refuse('branch already exists');
-    if (git(['status', '--porcelain', '--untracked-files=all'], dir)) refuse('dirty worktree');
+    const tracked = releaseTrackedChanges(dir);
+    if (tracked === null) refuse('tracked worktree state unreadable');
+    if (tracked || branchGit(['status', '--porcelain', '--untracked-files=all'])) refuse('dirty worktree');
   } catch { refuse('branch/worktree state unreadable'); }
   const from = flags.from === undefined ? 'HEAD' : flags.from;
   if (typeof from !== 'string' || !from || from.startsWith('-')) refuse('--from does not resolve to a commit');
   let commit;
-  try { commit = git(['rev-parse', '--verify', `${from}^{commit}`], dir); }
+  try { commit = branchGit(['rev-parse', '--verify', `${from}^{commit}`]); }
   catch { refuse('--from does not resolve to a commit'); }
   if (!/^[a-fA-F0-9]{40}$/.test(commit)) refuse('--from commit unreadable');
-  try { git(['switch', '-c', name, commit], dir); }
+  const current = readLease(dir, () => refuse('lease unreadable before switch'));
+  if (!current || current.holder !== lease.holder
+    || !Number.isFinite(Date.parse(current.acquiredAt))
+    || isLeaseStale(current, Date.now(), ttlMsFromFlags())) refuse('lease holder changed or lease stale before switch');
+  if (flags['dry-run']) {
+    process.stdout.write(`would create ${name} at ${commit} in lane-${n}\n`);
+    return;
+  }
+  try { branchGit(['switch', '-c', name, commit]); }
   catch (error) { refuse(`git switch failed: ${String(error.message).replace(/[\p{Cc}\p{Cf}\u2028\u2029]/gu, ' ')}`); }
   process.stdout.write(`${name}\n`);
 }
@@ -5773,10 +5787,10 @@ function cmdUnmap(repo) {
 // reset it — no error, no warning, the exact silent-failure shape lane-pool already goes to lengths to avoid
 // elsewhere (dirty/ahead guards, live-lease guards). This is a flat, not per-command, allowlist: a command
 // reading a flag meant for a different command is a much smaller, less surprising mistake than an
-// unrecognized flag vanishing outright, and a flat set can't drift out of sync with which command reads what.
+// unrecognized flag vanishing outright. Branch's --from is explicitly scoped below.
 const KNOWN_FLAGS = new Set([
   'acquirable', 'adopt', 'all', 'all-pools', 'base', 'branch', 'count', 'discard', 'force', 'item', 'json', 'lane',
-  'name', 'from', 'no-install', 'no-reap', 'no-reset', 'origin', 'pool', 'purpose', 'reference', 'release-reserved',
+  'name', 'no-install', 'no-reap', 'no-reset', 'origin', 'pool', 'purpose', 'reference', 'release-reserved',
   'repo', 'reserve', 'scope', 'session', 'expect-holder', 'ttl-minutes', 'wait-ms',
   // #xn432dz — list --acquirable's single-flight cache / early-stop / bounded-scan knobs.
   'limit', 'no-cache', 'cache-ttl-ms', 'scan-timeout-ms', 'list-contention-grace-ms',
@@ -5923,7 +5937,7 @@ if (!cmd || cmd === 'help' || cmd === '--help' || !COMMANDS[cmd]) {
 if (positionals.length) {
   fail(`unexpected extra argument(s) after "${cmd}": ${positionals.join(' ')} — every lane-pool.mjs argument past the command is a --flag`);
 }
-const unknownFlags = Object.keys(flags).filter((f) => !KNOWN_FLAGS.has(f));
+const unknownFlags = Object.keys(flags).filter((f) => !KNOWN_FLAGS.has(f) && !(cmd === 'branch' && f === 'from'));
 if (unknownFlags.length) {
   fail(
     `unrecognized flag(s): ${unknownFlags.map((f) => `--${f}`).join(', ')} — run \`node scripts/lane-pool.mjs help\` for the ` +

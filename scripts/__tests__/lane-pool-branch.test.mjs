@@ -30,18 +30,18 @@ beforeEach(() => {
 });
 afterEach(() => rmSync(root, { recursive: true, force: true }));
 
-function run(overrides = {}, poolName = 'fixture') {
+function run(overrides = {}, poolName = 'fixture', env = {}, command = 'branch') {
   const args = { lane: '1', session: 'holder', name: 'lane/test', ...overrides };
-  return spawnSync(process.execPath, [script, 'branch', ...(poolName === undefined ? [] : [`--pool=${poolName}`]), `--reference=${primary}`, `--origin=${origin}`,
+  return spawnSync(process.execPath, [script, command, ...(poolName === undefined ? [] : [`--pool=${poolName}`]), `--reference=${primary}`, `--origin=${origin}`,
     ...Object.entries(args).filter(([, v]) => v !== undefined).map(([k, v]) => v === true ? `--${k}` : `--${k}=${v}`)],
-  { encoding: 'utf8', maxBuffer: 1024 * 1024, env: { ...process.env, LANE_POOL_ROOT: pool } });
+  { encoding: 'utf8', maxBuffer: 1024 * 1024, env: { ...process.env, LANE_POOL_ROOT: pool, WE_LANE_HOLD: 'enforce', ...env } });
 }
-function refused(overrides, reason) {
+function refused(overrides, reason, env) {
   const before = git(primary, 'show-ref');
   const laneBefore = git(lane, 'show-ref');
   const head = git(lane, 'rev-parse', 'HEAD');
   const branch = git(lane, 'branch', '--show-current');
-  const result = run(overrides);
+  const result = run(overrides, 'fixture', env);
   expect(result.status).not.toBe(0);
   expect(result.stderr).not.toMatch(/unknown command/);
   expect(result.stderr).toMatch(reason);
@@ -102,4 +102,100 @@ it('refuses a pool path outside the pool root', () => {
   expect(result.status).not.toBe(0);
   expect(result.stderr).toMatch(/shared|clone/);
   expect(git(lane, 'show-ref')).toBe(before);
+});
+
+it.each([
+  { acquiredAt: '2000-01-01T00:00:00Z' },
+  { acquiredAt: new Date().toISOString(), ttlMinutes: 0 },
+  { acquiredAt: undefined },
+  { acquiredAt: 'not-a-date' },
+  { acquiredAt: undefined, reserved: true },
+])('refuses stale, expired or undatable leases: %j', patch => {
+  writeFileSync(marker, JSON.stringify({ ...JSON.parse(readFileSync(marker)), ...patch }));
+  refused({}, /lease stale or undatable/);
+});
+it('uses --ttl-minutes for leases without their own TTL', () => {
+  writeFileSync(marker, JSON.stringify({ holder: 'holder', acquiredAt: new Date(Date.now() - 120_000).toISOString() }));
+  refused({ 'ttl-minutes': 1 }, /lease stale/);
+});
+it('honours a renewed lease', () => {
+  writeFileSync(marker, JSON.stringify({ holder: 'holder', acquiredAt: '2000-01-01T00:00:00Z', renewedAt: new Date().toISOString() }));
+  const result = run();
+  expect(result.status, result.stderr).toBe(0);
+});
+it.each(['running', 'corrupt'])('refuses a verification hold (%s)', status => {
+  // An unreadable verify record holds only when unpushed work is at risk.
+  if (status === 'corrupt') git(lane, '-c', 'user.name=Test', '-c', 'user.email=test@example.com', 'commit', '--quiet', '--allow-empty', '-m', 'unpushed work');
+  writeFileSync(join(lane, '.git', '.lane-verify'), status === 'corrupt' ? '{' : JSON.stringify({ sha: tip, status, startedAt: new Date().toISOString() }));
+  refused({}, /lane-hold/);
+});
+it.each(['assume-unchanged', 'skip-worktree'])('refuses tracked changes hidden by %s', flag => {
+  git(lane, 'update-index', `--${flag}`, 'file.txt');
+  writeFileSync(join(lane, 'file.txt'), 'hidden edit\n');
+  refused({}, /dirty/);
+});
+it('refuses tracked changes masked by repository config', () => {
+  git(lane, 'config', 'core.ignoreStat', 'true');
+  refused({}, /dirty/);
+});
+it('dry-run validates and reports the branch without changing refs, HEAD, index, tree or lease', () => {
+  const paths = [join(lane, '.git', 'HEAD'), join(lane, '.git', 'index'), join(lane, 'file.txt'), marker];
+  const before = paths.map(path => readFileSync(path));
+  const refs = git(lane, 'show-ref');
+  const result = run({ 'dry-run': true, from: first });
+  expect(result.status, result.stderr).toBe(0);
+  expect(result.stdout).toContain(`would create lane/test at ${first}`);
+  expect(git(lane, 'show-ref')).toBe(refs);
+  paths.forEach((path, i) => expect(readFileSync(path)).toEqual(before[i]));
+});
+it('dry-run still refuses dirty work and invalid from commits', () => {
+  refused({ 'dry-run': true, from: 'origin/missing' }, /commit/);
+  writeFileSync(join(lane, 'new.txt'), 'untracked\n');
+  refused({ 'dry-run': true }, /dirty/);
+});
+it('rejects --from on acquire as an unknown flag before any mutation', () => {
+  const lease = readFileSync(marker, 'utf8');
+  const result = run({ from: first }, 'fixture', {}, 'acquire');
+  expect(result.status).not.toBe(0);
+  expect(result.stderr).toMatch(/unrecognized flag\(s\): --from/);
+  expect(readFileSync(marker, 'utf8')).toBe(lease);
+  expect(git(lane, 'branch', '--show-current')).toBe('main');
+});
+it.each(['changed', 'removed', 'corrupt', 'expired'])('rechecks ownership before switching when lease is %s', state => {
+  const preload = join(root, 'change-lease.mjs');
+  writeFileSync(preload, `
+    import fs from 'node:fs';
+    import { syncBuiltinESMExports } from 'node:module';
+    const original = fs.readFileSync;
+    let reads = 0;
+    fs.readFileSync = function(path, ...args) {
+      if (String(path) === process.env.TEST_LEASE && ++reads === 2) {
+        const state = process.env.TEST_LEASE_STATE;
+        if (state === 'removed') fs.rmSync(path);
+        else if (state === 'corrupt') fs.writeFileSync(path, '{');
+        else {
+          const lease = JSON.parse(original(path, 'utf8'));
+          if (state === 'changed') lease.holder = 'someone-else';
+          else { lease.acquiredAt = '2000-01-01T00:00:00Z'; delete lease.renewedAt; }
+          fs.writeFileSync(path, JSON.stringify(lease));
+        }
+      }
+      return original.call(this, path, ...args);
+    };
+    syncBuiltinESMExports();
+  `);
+  refused({}, /lease.*(holder changed|unreadable)/, {
+    NODE_OPTIONS: `--import=${preload}`, TEST_LEASE: marker, TEST_LEASE_STATE: state,
+  });
+});
+it('scrubs inherited Git location and config for branch probes and switch', () => {
+  const result = run({ from: first }, 'fixture', {
+    GIT_DIR: join(primary, '.git'), GIT_WORK_TREE: primary,
+    GIT_CONFIG_PARAMETERS: "'core.bare'='true'",
+  });
+  expect(result.status, result.stderr).toBe(0);
+  expect(git(lane, 'branch', '--show-current')).toBe('lane/test');
+  expect(git(lane, 'rev-parse', 'HEAD')).toBe(first);
+  expect(git(primary, 'branch', '--show-current')).toBe('main');
+  expect(git(primary, 'branch', '--list', 'lane/test')).toBe('');
 });
