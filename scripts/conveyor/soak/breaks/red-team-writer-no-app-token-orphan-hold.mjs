@@ -3,7 +3,7 @@
  * which can post statuses but cannot create check runs, so each run added an orphan `red-team/publication` hold
  * (#6945/#7149/#7156). The round writer must refuse BEFORE posting any hold when the App token does not resolve.
  */
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { pathToFileURL } from 'node:url';
@@ -16,9 +16,11 @@ export default {
   title: 'The red-team round writer posts a publication hold even when no WE App token resolves, orphaning a hold no check run can ever clear',
   card: 'rt-writer-failclosed (operator-shell orphan holds on #6945/#7149/#7156)',
   fixedBy: { sha: '0000000000000000000000000000000000000000', where: 'lane/rt-writer-failclosed', paths: ['scripts/lib/red-team-check-run.mjs', 'scripts/lib/drain-red-team-evidence.mjs'] },
-  async fixPresent(root) {
-    const { redTeamWriterEnv } = await import(pathToFileURL(join(root, 'scripts/lib/red-team-check-run.mjs')).href);
-    return redTeamWriterEnv({}).WE_GH_AUTH_PERSONAL_FALLBACK === 'refuse';
+  fixPresent(root) {
+    // Harness callers require a synchronous boolean. Importing the writer here starts its dependency graph
+    // before run() imports the publisher, leaving Vitest's overlapping cyclic imports waiting on each other.
+    return readFileSync(join(root, 'scripts/lib/red-team-check-run.mjs'), 'utf8')
+      .includes("WE_GH_AUTH_PERSONAL_FALLBACK: 'refuse'");
   },
   async run() {
     const root = process.env.SOAK_TREE_ROOT || new URL('../../../../', import.meta.url).pathname;
