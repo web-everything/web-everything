@@ -9,6 +9,8 @@ import { readSettings } from '../lib/settings-files.mjs';
 import { ensureFreshGithubAppEnv, FLEET_APP_AUTH_OPTS, isGithubAppAuthGuardError } from '../lib/github-app-auth-env.mjs';
 import { isPidAlive } from '../lib/dispatch-throttle.mjs';
 import { acquireRead, releaseRead, defaultOwner, cloneLockDirs, HEARTBEAT_INTERVAL_MS } from '../lib/daemon-clone-lock.mjs';
+import { cloneDispatchBlock } from '../lib/daemon-self-sync.mjs';
+import { readCloneIdentity } from '../lib/daemon-background-build.mjs';
 import { planClaudeAuthDispatchGate } from './claude-auth-health.mjs';
 import { resolveCoordinationRoot } from '../operations/coordination-root.mjs';
 import { reserve, readLockEntry, releaseLockDirIf, heartbeat } from '../readiness/file-locks.mjs';
@@ -76,12 +78,14 @@ function cycleLock({ env = process.env, pid = process.pid, now = Date.now } = {}
   };
 }
 
-export async function runCiHealTick({ tickOnce, refresh, log, planAuth = planClaudeAuthDispatchGate, daemon } = {}) {
+export async function runCiHealTick({ tickOnce, refresh, log, planAuth = planClaudeAuthDispatchGate, daemon, supersedeWatch } = {}) {
   // Injecting fixTick bypasses the daemon's production gate, so own that check here.
   const authGate = await planAuth();
   if (authGate.paused) return { skipped: 'auth-paused' };
   const { runTickAllRepos, defaultTagDispatchStatus, withFixDispatchClaimRefresh } = daemon
     ?? await import('../../skills-src/conveyor/reconcile-fix-dispatch-daemon.mjs');
+  // Supersede holds must still land before any dispatch, so the child runs the real watch, never an empty stub.
+  supersedeWatch ??= (await import('./supersede-watch.mjs')).runSupersedeWatch;
   const empty = async () => ({ dispatched: [], refusals: [], reconcileRefusalDetails: [], applied: [],
     dispatch: [], holds: [], rows: [], notes: [], comments: [], autoGrants: [], prsByNumber: new Map() });
   return withFixDispatchClaimRefresh({
@@ -89,7 +93,7 @@ export async function runCiHealTick({ tickOnce, refresh, log, planAuth = planCla
       reuseReconcilePlan: true, tagDispatchStatus: defaultTagDispatchStatus, authGateOverride: () => authGate,
       fixTick: empty, hungCiTick: empty, mainRedRebaseTick: empty, missingRunTick: empty,
       promoteDraftTick: empty, rulingStandDownTick: empty, notesTick: empty, awaitVerifyTick: empty,
-      stuckFixerTick: empty, supersedeTick: empty, orphanGuardTick: null,
+      stuckFixerTick: empty, supersedeTick: supersedeWatch, orphanGuardTick: null,
     })),
   }, { refresh, log }).tickOnce();
 }
@@ -110,7 +114,8 @@ export async function withCiHealCycleLock(fn, { env = process.env, now = Date.no
 
 export async function runCiHealLoopIteration({
   tick = runCiHealTick, now = Date.now, env = process.env, lock = cycleLock({ env, now }),
-  root = cloneRoot(), locks = cloneLocks, bootHead, readHead = cloneHead,
+  root = cloneRoot(), locks = cloneLocks, bootHead, bootIdentity, readHead = cloneHead,
+  dispatchBlock = () => cloneDispatchBlock({ root, env, knownIdentity: bootIdentity }),
   interval = setInterval, clearInterval: clearTimer = clearInterval,
   ensureAuth = () => ensureFreshGithubAppEnv(FLEET_APP_AUTH_OPTS), write = line => console.error(line),
 } = {}) {
@@ -129,6 +134,9 @@ export async function runCiHealLoopIteration({
         if (!head) return { exit: 'head-unknown' };
         if (head !== bootHead) return { exit: 'head-moved' };
       }
+      // The parent's own gates (quarantine, un-concluded re-clone) bind the child too: same checkout, same rule.
+      const blocked = dispatchBlock();
+      if (blocked) return { skipped: blocked };
       await ensureAuth();
       const start = now();
       const result = await tick();
@@ -144,13 +152,17 @@ export async function runCiHealLoopIteration({
 /** Pin the clone at boot; unknown or changed HEAD forbids every subsequent tick. */
 export async function runCiHealLoop({
   parentPid, parentAlive = isPidAlive, resolveInterval = resolveCiHealInterval, once = false,
-  iteration = runCiHealLoopIteration, sleep = ms => new Promise(resolveSleep => setTimeout(resolveSleep, ms)),
+  iteration = runCiHealLoopIteration, enabled = () => resolveCiHealLoopEnabled(), identityOf = readCloneIdentity, sleep = ms => new Promise(resolveSleep => setTimeout(resolveSleep, ms)),
   root, readHead = cloneHead, write = line => console.error(line), ...iterationDeps
 } = {}) {
   try { root ??= cloneRoot(); } catch { return { exit: 'head-unknown' }; }
   const bootHead = knownHead(readHead, root);
   if (!bootHead) return { exit: 'head-unknown' };
+  let bootIdentity = null;
+  try { bootIdentity = identityOf(root); } catch { /* unknown identity fails closed in cloneDispatchBlock */ }
   for (;;) {
+    // The off-switch is the rollback: re-read it before every iteration and leave cleanly (exit 0, no restart).
+    if (!enabled()) { write('ci-heal-loop: ciHeal.loop is off — exiting'); return { exit: 'disabled' }; }
     if (Number.isInteger(parentPid) && parentPid > 0 && !parentAlive(parentPid)) return { exit: 'parent-dead' };
     const head = knownHead(readHead, root);
     if (!head) return { exit: 'head-unknown' };
@@ -158,7 +170,7 @@ export async function runCiHealLoop({
     const { seconds, source } = resolveInterval();
     write(`ci-heal-loop: ciHeal.intervalSec=${seconds} source=${source}`);
     try {
-      const result = await iteration({ ...iterationDeps, root, write, bootHead, readHead });
+      const result = await iteration({ ...iterationDeps, root, write, bootHead, bootIdentity, readHead });
       if (result?.exit === 'head-moved' || result?.exit === 'head-unknown') return result;
     } catch (error) {
       if (isGithubAppAuthGuardError(error)) throw error;
