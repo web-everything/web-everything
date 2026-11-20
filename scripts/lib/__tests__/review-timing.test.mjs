@@ -66,6 +66,33 @@ describe('pending-CI start policy', () => {
         expect(reviewStartGate({ rowsComplete: true, rowsHead: head, headSha: head, requiredChecks: ['integration'], checks, policy: policy(startEarly) }).allowed).toBe(false);
       });
   });
+  describe.each(['ci-green', 'fast-checks', 'push'])('hydrated commit statuses under startAfter=%s', startAfter => {
+    const row = { __typename: 'StatusContext', name: 'legacy', context: 'legacy',
+      state: 'success', status: 'COMPLETED', conclusion: 'SUCCESS' };
+    const input = { headSha: head, rowsHead: head, rowsComplete: true, requiredChecks: ['legacy'] };
+    const policy = startEarly => ({ ...review, startAfter, startEarly, fastChecks: ['legacy'] });
+    it.each(['shadow', 'on'])('accepts consistent hydration and preserves pending/red policy (%s)', startEarly => {
+      for (const state of ['success', 'failure', 'error', 'pending', 'expected']) {
+        const pending = ['pending', 'expected'].includes(state);
+        const checks = [{ ...row, state, status: pending ? 'PENDING' : 'COMPLETED',
+          conclusion: pending ? null : state === 'error' ? 'FAILURE' : state.toUpperCase() }];
+        const result = reviewStartGate({ ...input, checks, policy: policy(startEarly) });
+        expect(result.allowed).toBe(state === 'success' || (pending && (startAfter === 'push' || startEarly === 'on')));
+        expect(result.affected.some(affected => affected.reason === 'malformed')).toBe(false);
+      }
+    });
+    it.each([
+      { state: 'unknown' }, { state: 'failure' }, { state: 'pending' },
+      { status: 'IN_PROGRESS' }, { conclusion: null },
+      { __typename: 'CheckRun' }, { __typename: undefined }, { head_sha: 'other' },
+    ])('refuses contradictory or foreign hydration: %j', extra => {
+      expect(reviewStartGate({ ...input, checks: [{ ...row, ...extra }], policy: policy('shadow') }).allowed).toBe(false);
+    });
+    it.each([{ rowsComplete: false }, { rowsHead: 'other' }])('requires current-head completeness: %j', provenance => {
+      expect(reviewStartGate({ ...input, ...provenance, checks: [row], policy: policy('on') }))
+        .toMatchObject({ allowed: false, reason: 'rows-incomplete' });
+    });
+  });
   it('off preserves the exact pre-early-start ci-green refusal for completed red CI', () => {
     expect(reviewStartGate({ rowsComplete: true, rowsHead: head, headSha: head, requiredChecks: ['test'], checks: [check('test', 'failure')],
       policy: { ...review, startAfter: 'ci-green', startEarly: 'off' } })).toEqual({ allowed: false,

@@ -35,6 +35,7 @@ function cliFixture(source) {
     import { easternTimestamp } from ${JSON.stringify(new URL('../forge-exec-run.mjs', import.meta.url).href)};
     const policy = loadAdmissionPolicy({ home: ${JSON.stringify(root)}, env: { ...process.env, WE_PLATFORM_PREFERENCES: '' } });
     await main(process.argv.slice(1), {
+      home: ${JSON.stringify(root)},
       readTelemetry: async () => ({ sampledAtET: easternTimestamp(Date.now()),
         cores: 8, loadPerCore: 0.1, memFreePct: 90, activeRuns: 0, recent: [] }),
       remoteExec: createRemoteExec({

@@ -3638,7 +3638,7 @@ integration case that runs prune as root then reserves every slot as the operato
 
 ### Remote diff coverage inputs
 
-Remote coverage fixtures must create the ignored `coverage/coverage-final.json` locally,
+Legacy remote coverage fixtures must create the ignored `coverage/coverage-final.json` locally,
 then assert its manifest digest and snapshot bytes. Preserve source mtimes through staging
 and full shipping so the freshness guard retains local semantics; warm delta assembly
 recreates mtimes. Compare coverage scope with an explicit `DIFF_COVERAGE_BASE`, including
@@ -3649,7 +3649,7 @@ projected from `agent-memory-src/` into regular snapshot leaves. Require `MEMORY
 and the complete target corpus; reject unsafe links or incomplete inputs before
 transfer. These projected inputs require full shipping.
 
-For remote `check:standards`, observe both output streams for skipped gates,
+For legacy remote `check:standards`, observe both output streams for skipped gates,
 `no-scope`, and `ENOENT`. A matching protected completion receipt permits a failed
 remote result to fall back through local admission; an invalid receipt keeps the
 result unconfirmed. The single standards input parity test in `remote-exec.test.mjs`
@@ -3958,7 +3958,7 @@ Remote transport stubs must answer the worktree-binding probe before inventory o
 use `fixtures/forge-bound-git.mjs` in injected-Git fixtures so transport-failure tests
 reach their intended run/finish branch. Keep their exact dispatch and no-local-rerun assertions.
 
-Coverage report rewrites must restore the timestamp captured from the open source file.
+Legacy coverage report rewrites must restore the timestamp captured from the open source file.
 Re-reading the staged timestamp and converting it again can truncate another microsecond,
 making coverage older than a source with the same original mtime. The absolute-path coverage
 table in `scripts/readiness/__tests__/remote-exec.test.mjs` pins equal fractional mtimes and
@@ -4613,7 +4613,20 @@ operator ops store (`ruled-weakened-add`). Another head cannot supply the audit.
 
 ## Bounded red-team probe fairness
 
-`red-team-dispatch-queue.test.mjs` pins the two-probe limit per repository and
+`scripts/lib/__tests__/red-team-dispatch-queue.test.mjs` pins a default of six probes per
+repository per tick and a hard ceiling of 50. Invalid caps (including strings, fractions,
+negative values and values above 50) use six; see `invalid configured cap %s falls back
+to six actual probes` and the `invalid probe cap` cases for file, operator and direct input.
+An unreadable or invalid operator policy uses the stricter of the valid file cap and six
+(invalid or missing file caps count as six), while disabling capacity raises. See
+`unreadable operator store restricts file cap %s to %i actual probes`.
+Unreadable/unparseable settings files and a throwing floor loader still disable probes;
+see `%s settings disables probes and logs settings unreadable loudly` and
+`a throwing floor loader fails closed to zero probes, never the default six, and logs loudly`
+in `skills-src/conveyor/__tests__/review-daemon-red-team-floor-refresh.test.mjs`.
+The valid operator `redTeamQueue.maxProbesPerTick` leaf overrides the settings-file value.
+Zero explicitly disables probes. Historical
+two-probe rotation fixtures explicitly set their cap to two. The tests also pin
 least-recently-probed turns persisted as optional `lastProbeTurn` entry fields.
 Keep historical entries without the field loadable, reject malformed turns, and
 exercise five still-blocked entries across three ticks with a reload between ticks.
@@ -4631,6 +4644,37 @@ still list them. Changed live heads are re-keyed in place with attempts and bloc
 unreadable evidence keeps entries, logs the failure, and defers admission. Reconciliation
 runs inside the dispatch transaction so a thrown runner rolls back eviction and re-keying.
 Planner skips retain the existing bounded, fair probe rotation.
+Partial inventories never sync, enqueue, evict or re-key candidates: only known blocked
+entries with a live OPEN read matching the stored head may be probed, using head-bound
+refusals and raw PRs from those reads. Runnable entries wait for a complete inventory.
+Only the PR reader's inventory or truncation errors enable this recovery; other failures skip it.
+The `red-team-probe-cap-starvation` soak break reopens ten blocked entries between
+ticks and requires multiple probes in one tick and all ten within two default ticks;
+its `fixPresent` presence probe matches source text only. The separate `run()` scenario
+executes queue behavior, including invalid-cap fallback and partial-inventory safety.
+Presence detection alone is not evidence that the behavior works.
+
+Acceptance claims must name a repository-qualified test file, case and expected assertions.
+When documenting an invalid-input default, link the case that pins the actual fallback.
+For this probe-cap change the mapping is:
+
+| Acceptance | Contract test and assertions |
+| --- | --- |
+| Cap 10, absent cap, invalid caps, cap zero | `scripts/lib/__tests__/red-team-dispatch-queue.test.mjs`: `%s setting 10 probes all ten blocked entries in one tick`, `setting absent defaults to exactly six probes among ten blocked entries`, `invalid configured cap %s falls back to six actual probes`, `%s setting 0 disables probes and retains blocked entries`; assert actual probe identities/counts and retained membership for zero. The `invalid probe cap` group also covers raw/direct inputs. |
+| Unreadable operator policy | Same file: `unreadable operator store restricts file cap %s to %i actual probes`; assert zero stays zero, three stays three, ten/fifty become six, and both capacity raises stay disabled. |
+| Partial inventory | `skills-src/conveyor/__tests__/review-daemon-partial-list-red-team.test.mjs`: `partial inventory probes only live matching blocked heads while retaining entries and refusing unknown and draft PRs`; assert exact probe identities, matching raw heads, unchanged queue membership/head/attempt state and exclusion of closed, changed, unreadable, runnable and unknown PRs. `partial inventory host admission fails closed when %s` covers denied, null and throwing host reads; `partial inventory paused ticks retain all entries without probing` and `other list failures do not enable partial inventory probing or enqueue unknown PRs` pin the remaining guards. |
+| Two default ticks over ten synthetic heads | `scripts/conveyor/soak/breaks/red-team-probe-cap-starvation.soak.test.mjs`: `ten blocked red-team heads receive probe turns within two default ticks`; `run()` requires all ten identities across persisted reloads. This does not establish production timing. |
+| Live PRs after load | **PLANNED, not executed:** `specified accepted PRs receive head-bound probes within two post-load daemon ticks`, described below. |
+
+The deployment verification `specified accepted PRs receive head-bound probes within two
+post-load daemon ticks` is required after load. Record the deployed revision and UTC load
+boundary, then the start/end boundaries of the first two complete review-daemon ticks for
+`web-everything/web-everything`. Record each live head SHA for #7155, #7153, #7158, #7156,
+#7149 and #6945 at load. By the second tick's end, require a queue `probe` log with that
+PR identity and `head=<sha>` for every one of the six. Record the tick index and UTC probe
+time for each identity; missing probes, missing boundaries, changed heads or unreadable
+evidence leave the check unverified and require a new observation window. Save the six-row
+record with the PR's fix evidence. A synthetic soak pass cannot satisfy this live check.
 The `red-team-queue-verdict-evict` break also replays decided-head eviction: use
 `isPublishableRedTeamResult(redTeamForHead(...))` over complete trusted comments,
 then require readable carry/status/outbox evidence with no settlement owed and a
@@ -5016,6 +5060,46 @@ planner together using a rollup with `detailsUrl` and no check id. Workflow prot
 head-bound job evidence and the failed evaluation step; unreadable evidence, another failed
 step, and real CI failures retain CI ownership. Keep fix detection behavioural, including
 negative cases, rather than matching planner source text.
+## Live review seat policy (R1077)
+
+`review-seat-caps.test.mjs` covers live `review.seatDailyCaps` reads through the shared
+policy cascade, injected settings IO, invalid layers and legacy environment precedence.
+`review-red-team.test.mjs` exercises the launcher with both builder companies, unknown
+builder evidence, `review.redTeam.routeByBuilder=false`, daily-cap fallback and a raced
+reservation. Keep the pinned-head co-author read ahead of routing; the scratch checkout
+is created only after provider selection. Standard daily caps are Codex 80 (the tool
+settings explicitly raise it to 600), agy-gemini 0
+(off; operator opt-in through `review.seatDailyCaps.agy-gemini` or `enabledProviders`), agy-claude 10 (red-team emergency only). Codex builders prefer agy-gemini;
+if disabled or capped, use Codex and log same-vendor acceptance. Claude builders prefer
+Codex, then agy-gemini at cap. Unknown builders and `routeByBuilder=false` retain policy
+routing among the ordinary providers. Log each cap fallback, including reservation races.
+Never choose agy-claude by default: only exhaustion of both ordinary providers' budgets
+permits the logged emergency route. Exhausting even the emergency budget retains the
+existing cap hold. Tests cover emergency selection, all budgets exhausted, and missing
+CLIs with ordinary budget left (no emergency).
+
+Pin historical cap-warning fixtures to their original cap. Provider-unavailable fixtures
+need explicit positive provider budgets: cap checks precede CLI probes, and a zero cap
+marks the result retryable rather than a completed unavailable-CLI result.
+Red-team routing fakes inject `readSeatSettings` with empty tool/platform layers when
+asserting standard caps, so live settings cannot change their budgets. Keep cap source
+labels aligned with the settings cascade and assert the final skipped log contains the
+returned budget refusal, while retaining reservation-count and no-launch assertions.
+
+R1077 audit: builder preference stays within the resolved policy chain or inherited
+red-team roster; operator routing overrides win, and policy model/effort validation
+still runs. Exhausting an explicit chain refuses dispatch rather than inventing a
+route. `ai-routing-red-team-sites.test.mjs` retains the cap/quota refusal cases and
+covers builder policy models, efforts, operator precedence and disabled fallbacks.
+Explicit settings zero defeats `enabledProviders`; unreadable or malformed seat
+settings warn and use repo defaults, including Gemini's disabled default.
+
+Red-team admission checks the resolved model against the same Carbon promotion guard
+as execution before reserving budget. A positive Gemini cap alone does not promote
+Carbon: builder, policy and AI-overlay routes retry the remaining allowed providers.
+Keep fixtures for unpromoted fallback, promoted Carbon, non-Carbon Gemini aliases and
+an operator chain with no permitted fallback. Historical budget-race fixtures must
+explicitly promote Carbon so they continue exercising reservation denial.
 ## Overlay main-sync interrupted test evidence
 
 A heavy-admission test timeout or killed process is incomplete evidence even if it left a green
@@ -5134,6 +5218,44 @@ probation; a saved run retains its roster. Regressions: `external-juror-liveness
 `review-pr.test.mjs`, and `agy-juror-first-output.soak.test.mjs` (the latter uses the soak
 Vitest config). Run only the affected files through heavy-admission.
 
+## Event fast-drain context freshness
+
+Local `--only --from-green-event` context may reuse full shared-snapshot rows only through
+`cacheOnly: true` (normal TTL/dirty rules, even when stale-ok is configured). A lean live
+open inventory owns membership. Its GraphQL pages use the full listing’s query ordering, connection
+parser and `assertInventoryComplete` guard; counts must stay stable, unique row count must equal
+`totalCount`, and no next page may remain unread. Partial pages, errors, duplicates or count drift
+fall back to full listing. Number, head and updatedAt must match before snapshot reuse. Missing
+or changed rows and dependency/couple/overlap/card-group components are read fully live.
+Unknown inventories or related evidence fall back to the original full listing with one
+`fast-drain: context fell back to full listing (...)` diagnostic. The full hydrated listing must
+also call `assertInventoryComplete` before hydration or cache reuse; a short fallback throws into
+the existing list retry/unreadable path and cannot authorize enqueue. Keep the real CLI regression
+where both lean and full pages return one PR against `totalCount: 2`.
+Both `WE_FAST_DRAIN_CONTEXT=live`
+and `WE_FAST_DRAIN_LISTING=live` restore the original listing. Default-branch hints use a separate
+in-process map, round metadata, then a host-wide one-hour atomic cache under
+`~/.claude/conveyor/default-branches`. Test processes require an explicit
+`WE_DEFAULT_BRANCH_CACHE_DIR`. Neither cache nor parent metadata can authorize merge/enqueue.
+Every admission requires a live default-branch read in the child process, with successes retained per repo/process,
+after synchronous listing/context pages finish (prestage verifies before enqueue). Failure defers and is evicted
+after settlement so later watch passes retry; concurrent callers share each in-flight attempt.
+Keep same-reader recovery coverage for synchronous throws, rejected promises and unreadable responses;
+the drain verdict must hold after failure and admit after a successful retry.
+Live evidence overrides hints and rewrites the cache. Parent round metadata preserves the original
+live observation timestamp; a retained branch never receives fresh evidence timestamps. Branch-only
+records never count as complete PR listings. Keep branch-change, failure, and read-order probes.
+The node:test regression and soak also support the existing Vitest runner; run either through
+heavy-admission, with only the affected files.
+
+The shared drain classifier and merge revalidation refuse missing, undefined, null or empty default-branch
+evidence; pure callers have the same closed default. Valid-admission fixtures must supply the verified branch
+explicitly and include a readable PR base. An unreadable base fails closed globally in this shared authorization
+predicate, including full-list fallback; invalid full context rows fall back to full listing before gates.
+CLI shims must answer `repo view --json defaultBranchRef --jq .defaultBranchRef.name` separately from
+label-memo repository URL reads. The stateful fake reads its configured branch on each invocation and preserves
+fault injection for this verb. Prestage cache assertions must use the world fixture's returned `slug`, so the
+test reaches the enqueue guard even when its repository identity changes.
 ## Antigravity advisory seating and unavailable-provider evidence
 
 `external-juror-liveness.test.mjs` pins `advisorySeats.antigravityReview=probation` to the
@@ -5142,6 +5264,14 @@ graceful skips require an existing explicit `fallbackDecision` skip decision; ab
 or `none` evidence must propagate validation and tool-denial errors. The #3481 replay in
 `review-pr-io.test.mjs` checks that unset-env probation retains unruled referral holds.
 
+## Forge pool grow failure fixtures
+
+`forge-slots.test.mjs` executes setup's account/directory preparation and final
+enable transaction with host IO stubbed. New directories use `.disabled-slot-N`:
+old and new runners discover only `slot-N`. Sudoers is prepared privately and
+published only after the installed runner verifies every target UID's egress.
+Keep failure cases before runner replacement as well as during final publication;
+restoring an old refresh timer must never make the staged slots discoverable.
 
 ## Verify failed-file recovery
 
@@ -5309,6 +5439,66 @@ persisted drop intent at interruption, and recovery confirming or restoring the 
 never creates operator retirement evidence. Both CLI `recover-drops` and sweep recovery use the
 same locked library helper; recovery failure must prevent retirement and unload receipts.
 
+### Audit-waiver compaction and host preference bounds
+
+New audit waivers belong in the ops JSONL store; legacy platform/tool waivers remain readable.
+The audited-tip gate uses the same union as prototype-load. Pruning retains entries on lookup errors;
+run `node scripts/operations/ruled-weakened-prune.mjs --dry-run` before applying compaction.
+The CLI uses remote heads and local commit objects against `origin/main`; refresh those objects
+separately before pruning. New recorder entries carry a repository ownership key derived from
+the selected checkout's origin. Pruning only removes entries with that same key; foreign entries
+and legacy entries without ownership survive even if their branch is absent or collides with a
+local branch. Origin aliases conservatively retain entries, and an unreadable origin retains all.
+Legacy ownership is never inferred from a branch name or retroactively assigned by replay;
+inspect the original repository before manually retiring those entries.
+Host platform-preference reads default to 2 MiB, independently of other
+bounded reads. An oversized file names its path and byte count; prune waivers or set
+`WE_HOST_OVERLOAD_PREFS_MAX_BYTES` to an explicit larger bound and retry.
+
+Waiver append and pruning share the ledger writer lock, keyed by the store parent's realpath
+and filename. Pruning holds it from the initial read through git probes and atomic replacement;
+lock contention refuses mutation with retry guidance. The process-interleaving regression in
+`scripts/operations/__tests__/ruled-weakened-concurrency.test.mjs` pauses pruning after its snapshot,
+proves a concurrent append waits, then verifies the new ruling survives compaction.
+
+Pruning also retains a waiver when either its recorded or current-head net-diff fingerprint is
+unavailable. The prune CLI regression injects each missing fingerprint separately and forces
+compaction of another entry, proving the retained ruling survives the rewrite. Unknown carry
+evidence is distinct from two readable, unequal fingerprints, which still drop a stale waiver.
+
+
+The repo-owned `scripts/operations/ruled-weakened-record.mjs` replaces approval replay in the
+external handoff recorder. Run it from the target repository: it checks current origin heads
+with one bounded `ls-remote` lookup and permits older approved heads only with the shared
+net-diff carry proof. Approvals supply rulings and `findingsHash` (SHA-256 of
+`JSON.stringify(findings)`); the latest canonical WEAKENED audit supplies verbatim findings,
+and WITHDRAWN requests veto recording. Replays deduplicate `(repository, ref, sha, ruling)`
+inside the append/prune lock. Unreadable evidence refuses writes; inputs above 16 MiB require
+archiving old records before retrying. Hermetic recorder proofs live in
+`scripts/operations/__tests__/ruled-weakened-record.test.mjs`.
+
+Prototype-load requires a fix-ready record carrying the waiver's ruling and verbatim disclosure
+before admitting a canonical WEAKENED audit. A waiver alone refuses and names
+`scripts/operations/fix-ready-record.mjs` as the recovery step. These regressions live in
+`scripts/operations/__tests__/prototype-load.test.mjs`.
+The recorder, store and load gate share the handoff R-number shape, including one lowercase
+letter suffix such as `R1063a` and combined rulings joined by `+`.
+
+
+Carry recording must persist the proof consumed by admission. The recorder's injected
+`carries(entry, head)` returns the proven net-diff fingerprint (not just `true`); the CLI
+returns it only after the shared `carriesAcross` comparison succeeds. The store accepts and
+preserves this optional 64-hex fingerprint, while legacy entries without it remain readable
+and malformed fingerprints refuse validation. Exact-head recording also saves available proof
+for future rebases. A replay can enrich a duplicate missing that proof only after the current
+head, canonical audit and approved verbatim findings validate again. The locked store rewrite
+preserves the original approval timestamp, findings and repository ownership; repeated or stale
+snapshots do not add duplicate rows. The recorder tests cover readiness before and after an
+unchanged rebase, legacy replay, changed code and cross-repository pruning through the real store.
+The named `recorder-to-load same-diff waiver
+admission` regression records an old approval through the real append/read store path, then
+loads the equivalent live head with matching carried fix-ready evidence. It also rejects changed code
+and changed canonical findings; an added-count assertion alone does not prove usable carry.
 ## Review capability admission at maintenance boundaries
 
 Same-tick draft promotion and follow-up cards can start work before ordinary review dispatch.
@@ -5319,6 +5509,120 @@ gate's card-launch boundary because it re-reads evidence after the tick snapshot
 modes and verify that card refusal cannot repeat an already recorded send-back.
 Saved-fix admission precedes lane acquisition and branch verification; retain the final pre-push
 check because verification may outlive a capability change. Refusal must not consume an attempt.
+
+## Concurrent added review seats
+
+Added-seat evidence uses the loop read sink with `review.extraSeats.concurrent` (standard true,
+platform → tool → environment `WE_REVIEW_EXTRA_SEATS_CONCURRENT`; the job logs value and source).
+The extra-seats kill switch still wins. The single-shot `run` command remains speculate then finish.
+A speculative pass writes reservations before calling providers, and writes comparison rows only
+against the final pinned loop head. Bounce, park, infra block, missing input, failed pass, moved
+head, and final-head skip discard spend without a sequential rerun. The red team and added seats
+share the sink when both start; only its owner removes it. Job-summary timings include `loopMs`,
+`seatsMs` (pass duration when available), `seatsConcurrent`, and total wall time including settlement.
+Scoped regressions live in the review-extra-seats and review-job-speculative-red-team tests; the
+`added-seats-concurrent-head-binding` soak break decides fix presence by executing both head cases.
+
+Discarded added-seat quota rows retain each call’s `finishedAt` (falling back to `startedAt`),
+so settlement order cannot let an older clean call clear a newer exhaustion hold.
+`review-extra-seats-discard-quota-order.test.mjs` covers both timestamp sources and append orders,
+including a newer clean call clearing an older hold. Replaying an old discarded call must not
+re-arm the probe interval; a fresh exhausted call does.
+## Forge tracked-at-HEAD manifests (S1)
+
+`remote.manifest` defaults to `legacy`; `tracked` binds shipped regular files to the
+pinned HEAD blob and executable mode. Resolve it from the standard and platform preferences
+only; checkout settings and `WE_HEAVY_ADMISSION_REMOTE_MANIFEST` cannot override it, even
+in private pools. The policy log includes its source.
+Tracked runs use a full inventory so warm-leaf reuse cannot bypass the boundary.
+Tracked transport is always rsync: Git bundles contain history outside the validated
+leaf manifest. Git-dependent tests refuse with `bundle-local`, including needsGit
+routing with a cached bundle capability and the host-overload route. Tracked rsync uses
+the same route plus full-selection proof as legacy bundles: a readable pure-test filter
+can also select a Git-dependent test by substring, and must fall back locally. Record the refusal
+in the manifest log before local execution. Presync resolves the same canonical policy
+as admission and skips tracked or manifest-related fail-closed policies before any Git,
+SSH, rsync, lock or cache-state operation. Its legacy delta behavior is unchanged.
+The explicit remote CLI may force enablement only when manifest policy has not failed
+closed; retain and log the canonical refusal reason when entering local admission.
+Tracked admission refuses external client overrides before importing them: an older
+installed client may ignore the manifest option. The built-in client enforces the boundary.
+Coverage is never shipped in tracked mode, including `coverage/coverage-final.json` when
+ignored, untracked, staged or committed. Structure validation cannot bind coverage counters
+to genuine execution or HEAD. Commands that consume coverage input (`check:standards` or
+an explicitly supplied `DIFF_COVERAGE_BASE`, the existing standards/Git-input signal) refuse
+with `coverage-local` and run locally, even if the report is absent. Ordinary test commands
+omit the report without reading it. Generating coverage with `--coverage` does not itself
+consume a local coverage report. Legacy coverage inclusion, portability rewriting and
+full-ship selection remain unchanged.
+Sibling snapshots keep their existing index-based selection and identity checks; tracked
+runs bind every shipped sibling file's bytes and executable bit to the sibling's pinned HEAD
+tree, independently of the index and `core.fileMode`. Mode or content mismatches refuse as
+`dirty` before the final sibling status check. They also apply the path+oid size exceptions
+and binary allowlist, and count sibling bytes
+against the main manifest's total cap. Size/type refusals keep their manifest reason and
+are logged; operators can run locally or review a path+oid size exception.
+
+`remote.manifest` comes only from the canonical host preferences path, including when
+`WE_PLATFORM_PREFERENCES` redirects other settings for a private pool or test. Inject `home`
+into `loadAdmissionPolicy` to test that path without reading the real home file. Missing,
+unreadable, oversized, malformed or structurally invalid canonical evidence disables remote
+execution for every caller, with a policy source explaining the local fallback. A valid,
+existing canonical object without `remote.manifest` uses the standard manifest default.
+Direct `ENOENT` also fails closed, including after a previously tracked policy's cache expires.
+Remote-capable fixtures must inject an existing canonical preferences file via `home`.
+Neither CLI enablement nor last-good settings may override that manifest refusal.
+The shared `loadAdmissionPolicy` resolver is
+the only canonical manifest source for admission, the explicit CLI and presync. Failed reads
+are retried on the next call; they never use the redirected manifest or a cached last-good
+host manifest. An invalid
+platform manifest value disables remote execution with a policy source explaining the local
+execution requirement, even if private tool/environment settings enable remote execution.
+
+Every tracked refusal and every legacy shadow verdict appends metadata only to
+`~/.plateau/forge-manifest-refusals.jsonl`; `FORGE_MANIFEST_REFUSALS_LOG` overrides the path.
+`buildManifest` takes an explicit `shadow` option, default false. `runRemote` selects
+it once from the original options, before `bindGit` wraps the executor, and carries
+it through delta assembly and full retries. Shadow evaluation runs only when the
+caller supplied no executor, filesystem or inventory (`listFiles`); injected callers
+retain the legacy exec/fs call sequence.
+`FORGE_MANIFEST_SHADOW=0` disables the default-on shadow for costly trees. Logging and
+shadow failures never alter legacy admission. Tests must point the log at their temp root.
+The real-Git `runRemote` regression replaces only SSH/rsync executables on PATH and
+asserts a completed legacy run still ships an untracked file while logging its
+shadow refusal; the injected-executor case compares calls against shadow disabled.
+`forge-manifest-tracked.test.mjs` exercises local fallback without remote dispatch,
+HEAD hashes, size bounds, binary extensions, coverage omission and setting provenance.
+`heavy-admission.test.mjs` covers canonical manifest authority and invalid-policy local execution.
+For the non-UTF-8 refusal-log case, inject the raw Git inventory record: filesystem
+sandboxes may deny creating such filenames before the manifest code can observe them.
+The `forge-manifest-untracked-shipped` soak break uses the real manifest builder in a
+temporary Git repository. Run these scoped tests through heavy admission; the soak
+file needs `--config vitest.soak.config.ts`.
+### Orchestrator quarantine authority
+
+`resolveOrchestratorAuthority` reads repo `authority.redMainQuarantine` from the discovered
+`scripts/settings/orchestrator-authority.json` and platform `orchestrator.authority.redMainQuarantine`
+through `readPlatformPreferences().prefs.orchestrator` using only its default paths. Missing current
+platform or operator files deny authority; absent optional legacy files are allowed. Unreadable or
+invalid platform evidence still denies authority. Authority reads validate raw JSON in every platform
+file (including legacy files) before merging: duplicate object keys, including escape-equivalent names
+and repeated parent blocks, deny access even when a later file or the repo grants it. Fix the ambiguous
+file to restore an explicit grant. Repeated names in separate objects and punctuation inside strings
+are valid. The repo reader uses
+`readSettingsChecked`: duplicate ownership or read taint denies authority even over a platform grant.
+For this explicit authority grant, platform wins over
+repo in both directions; only boolean `true` grants access, and invalid values deny it. There is
+no authority environment override, including platform-file path overrides. Tests inject
+`platform`/`tool` or the `readFile` IO seam instead of redirecting the authority files.
+The resolver logs the effective value and actual source through the shared policy diagnostics.
+
+The IO writer and CLI add/remove/prune resolve authority; pure quarantine functions receive
+`orchestratorAuthority` explicitly. Keep owner validation, TTL limits, and actor audit records
+on the same path as operator and safety-net writes. `setMode` and `setFixPrs` remain limited to
+the safety net and operator even with orchestrator authority enabled. The authority settings tests cover closed
+defaults and conflicting layers; quarantine tests cover validation and removal; the IO test
+verifies persisted events and commit messages against a temporary local Git origin.
 
 ## Negative review-run proofs
 
@@ -5354,6 +5658,34 @@ a reclaimed/remaining partial note. Invalid bounds use defaults and report
 `default (invalid budget value)` provenance. Partial work alone exits zero with a stderr
 warning. Unreadable reservations refuse and preserve the entire affected slot.
 The sweep unit suite and `forge-sweep-scan-bound-refusal` soak pin these guarantees.
+
+## Review-run filename discovery (R1099)
+
+`review-run-names.fs.test.mjs` covers 6,000 real files, full-scan parity across PR-keyed names,
+legacy parsing, in-place corruption, shared parse budgets, filename churn, archive
+claims and age-gated archives. Run it with `review-run-index.test.mjs`,
+`drain-red-team-evidence.test.mjs`, `archive-closed-review-runs.test.mjs`, and
+`red-team-skip-settle-r622.test.mjs` through heavy admission.
+
+`writeRun` validates keyed filename/payload identity before atomic publication.
+Archiving keeps keyed filename/payload PR mismatches live in `kept.mismatch`,
+including dry-run proposals. `archive-closed-review-runs.test.mjs` covers old
+mismatched files, matching numeric/string PRs, claim-time mismatch rollback,
+and CLI mismatch counts and IDs. Legacy IDs retain their existing behavior.
+Discovery lists every review-pr ID without name-based exclusion, using the ordinary
+scan order, parse cap and liveness bounds. Every examined candidate is
+parsed; keyed ID, operation or PR disagreement holds through fallback. Compare
+names around parsing, retry once on churn, then use the bounded scan and HOLD.
+Claims or a nonempty target archive require operator restoration before absence
+can be proven. Archives default to closed/merged terminal records at least 14 days
+old under `archive/review-pr/<owner>/<repo>/<pr>/`; race fixtures explicitly use
+`minAgeDays: 0` to exercise fresh-record claims. The probe CLI is
+`scripts/review-run-probe.mjs --probe <repo>#<pr> [--head=] [--runs-dir=]`.
+
+Filesystem mtime fixtures must restore numeric seconds (`mtimeMs / 1000`), not a
+`Date`: Date truncates fractional milliseconds and cannot verify unchanged mtime
+at sub-millisecond precision. The retained JSON index sidecar is expected; the
+filename contract removes journal JSONL and seals, not the existing index writer.
 ## CI-only PR opening (R1086)
 
 `pr-land --verify=ci-only` is restricted to open modes and observed host saturation.
@@ -5373,3 +5705,11 @@ Park opens ready for review; draft-promotion still handles older drafts.
 Check mode fetches origin main before evaluating canonical audit evidence. A failed fetch reports
 `main not refreshed: <reason>` and refuses even when local evidence would pass against stale refs.
 `open-pr-audit-gate.test.mjs` covers both refresh outcomes, aggregation and an unconfirmed check child.
+
+## Lane reset safety probe regressions
+
+`lane-pool-acquire-reset-probe-failed.test.mjs` uses a PATH Git shim activated after fetch
+to isolate the reset-time status/ahead probes. Cover both transient recovery and persistent
+refusal, and assert no checkout/reset/clean follows a failed probe. The bounded process
+reader wraps the original stderr in `ProcReadError.cause`; preserve that stderr (or the
+spawn error message) in probe diagnostics rather than reporting zero counts as proof.

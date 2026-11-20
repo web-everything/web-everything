@@ -414,6 +414,7 @@ export function assertOperatorCliFresh(root, { label = 'operator-cli', base = 'm
     let candidate;
     let entry;
     let child;
+    let childLaunched = false;
     let childCwd = cwd;
     let lease;
     const pool = resolve(root, 'scripts/lane-pool.mjs');
@@ -457,10 +458,13 @@ export function assertOperatorCliFresh(root, { label = 'operator-cli', base = 'm
         if (!exists(entry)) throw refusal;
         write(`${label}: this checkout is ${behind} commit(s) behind origin/${base} in code it runs — re-running from the fresh checkout `
           + `${candidate} (operator-cli fresh fallback, knob source: ${source}).\n`);
+        childLaunched = true;
         child = spawn(process.execPath, [...execArgv, entry, ...argv.slice(2)], {
           stdio: 'inherit', cwd: childCwd, env: { ...env, WE_OPERATOR_CLI_FRESH_REEXEC: '1' },
         });
-        if (child?.error || (lease && (!Number.isInteger(child?.status) || child.status < 0))) throw refusal;
+        if (child?.error || child?.signal || (lease && (!Number.isInteger(child?.status) || child.status < 0))) {
+          throw new Error("Fresh re-run did not complete");
+        }
       } finally {
         // Release before exit (and on verification/spawn failure), using the pool-minted holder.
         if (lease) {
@@ -486,6 +490,10 @@ export function assertOperatorCliFresh(root, { label = 'operator-cli', base = 'm
         }
       }
     } catch {
+      if (childLaunched) {
+        throw new Error(`${label}: ${STALE_MAIN_REFUSAL_MARKER} — ${OPERATOR_CLI_STALE_MARKER}; `
+          + "the fresh re-run's outcome is unknown; it may already have written.");
+      }
       throw refusal;
     }
     const status = Number.isInteger(child?.status) ? child.status : 1;

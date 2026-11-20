@@ -64,6 +64,9 @@ it.each(['complete', 'short-incomplete', 'status-failure', 'status-error', 'stat
   expect(observed.rowsHead).toBe(shape.endsWith('unreadable') ? null : XX_HEAD);
   if (shape === 'complete') {
     expect(observed.statusCheckRollup).toHaveLength(102);
+    expect(observed.statusCheckRollup.find(row => row.name === 'legacy')).toMatchObject({
+      __typename: 'StatusContext', context: 'legacy', state: 'success', status: 'COMPLETED', conclusion: 'SUCCESS',
+    });
     expect(exec.mock.calls).toHaveLength(2);
     expect(exec.mock.calls.every(([, args]) => args.includes('--paginate') && args.includes('--slurp'))).toBe(true);
   }

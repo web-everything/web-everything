@@ -123,6 +123,15 @@ function readableEarlyChecks(checks, headSha) {
     const kind = row.__typename ?? row.type;
     if (kind != null && !['CheckRun', 'StatusContext'].includes(kind)) return false;
     const lower = v => typeof v === 'string' ? v.toLowerCase() : '';
+    // Reconcile hydration retains legacy state/kind and adds reducer fields. Accept that
+    // representation only when both derived fields agree with the original commit status.
+    if (kind === 'StatusContext' && row.status != null) {
+      const state = lower(row.state);
+      if (!['pending', 'expected', 'success', 'failure', 'error'].includes(state)) return false;
+      const pending = ['pending', 'expected'].includes(state);
+      return lower(row.status) === (pending ? 'pending' : 'completed')
+        && (pending ? row.conclusion === null : lower(row.conclusion) === (state === 'error' ? 'failure' : state));
+    }
     if (row.state != null) return kind !== 'CheckRun' && row.status == null && row.conclusion == null
       && ['pending', 'expected', 'success', 'failure', 'error'].includes(lower(row.state));
     if (kind === 'StatusContext') return false;

@@ -158,6 +158,12 @@ export function newRunId(prefix = 'run') {
   return `${prefix}-${randomUUID()}`;
 }
 
+export const NAME_RE = /^review-pr-pr([1-9]\d{0,9})-[0-9a-f]{8}(-[0-9a-f]{4}){3}-[0-9a-f]{12}$/;
+
+export function newReviewRunId(pr) {
+  return newRunId(Number.isInteger(pr) && pr > 0 && pr <= 9999999999 ? `review-pr-pr${pr}` : 'review-pr');
+}
+
 /**
  * Read a run. Returns `null` ONLY when the file genuinely does not exist. THROWS on a corrupt record —
  * refusing is the point: a torn record must never be mistaken for a run that never began, which would
@@ -190,9 +196,13 @@ export function readRun(id, dir = resolveRunsDir()) {
  */
 export function writeRun(record, dir = resolveRunsDir()) {
   assertRunRecord(record, 'run record being written');
+  const named = NAME_RE.exec(record.id);
+  if (named && (record.op !== 'review-pr' || Number(record.input?.pr) !== Number(named[1]))) {
+    throw new TypeError('review run filename and payload disagree');
+  }
   const path = runPath(record.id, dir);
   mkdirSync(dir, { recursive: true });
-  writeJsonAtomic(path, record); // temp file + validate + same-fs rename: safe across daemon processes
+  writeJsonAtomic(path, record);
   if (record.op === 'review-pr') {
     try { appendReviewRunIndex(record, dir); } catch { /* discovery is best-effort; never fail a persisted run */ }
   }

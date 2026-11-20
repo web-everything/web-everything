@@ -1,0 +1,6 @@
+{
+  "$comment": "Repo authority default. orchestrator.authority.redMainQuarantine in platform preferences overrides authority.redMainQuarantine here. Only boolean true grants the orchestrator quarantine add/remove/prune authority; absent or invalid values deny it.",
+  "authority": {
+    "redMainQuarantine": false
+  }
+}

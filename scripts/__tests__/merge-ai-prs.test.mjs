@@ -324,8 +324,8 @@ describe('withResolutionBasis — the drain park/skip comment (#2447)', () => {
 
 describe('buildDrainVerdicts — carries the graduatedTo sources the escalation pass derives the basis from (#2447)', () => {
   const green = [{ name: 'test', conclusion: 'SUCCESS' }];
-  const ghPr = (number, body) => ({ number, title: 't', body, headRefName: `lane/${number}-x`, statusCheckRollup: green, mergeable: 'MERGEABLE', mergeStateStatus: 'CLEAN', labels: [{ name: 'ready-to-merge' }] });
-  const verdictFor = (pr, manifest) => buildDrainVerdicts({ prsByRepo: new Map([[null, [pr]]]), readOf: () => ({ commits: [{ oid: 'abc' }], manifest }), repos: [null] })[0];
+  const ghPr = (number, body) => ({ baseRefName: 'main', number, title: 't', body, headRefName: `lane/${number}-x`, statusCheckRollup: green, mergeable: 'MERGEABLE', mergeStateStatus: 'CLEAN', labels: [{ name: 'ready-to-merge' }] });
+  const verdictFor = (pr, manifest) => buildDrainVerdicts({ defaultBranchOf: () => 'main', prsByRepo: new Map([[null, [pr]]]), readOf: () => ({ commits: [{ oid: 'abc' }], manifest }), repos: [null] })[0];
 
   it('attaches the manifest graduatedTo and the body note, which derive the banner for a backlog-only diff', () => {
     const manifest = buildManifest({ item: 2403, repos: [{ repo: 'we', ref: 'lane/2403-x' }], graduatedTo: '6b5874f7' });
@@ -375,7 +375,7 @@ describe('classifyPr — base is not the default branch: held with a named reaso
   it('base is not <default>: a PR on the default branch is unaffected; an unresolved default still holds a lane/* base', () => {
     const onDefault = verdictFor(ghPr(12, 'main'), () => 'main');
     expect(onDefault.decision).toBe('merge');
-    expect(onDefault.reason).toBe(classifyPr(ghPr(12, 'main')).reason);
+    expect(onDefault.reason).toBe(classifyPr(ghPr(12, 'main'), { defaultBranch: 'main' }).reason);
     // stack.reviewWhileBaseOpen (2026-10-10): a stacked lane PR now runs CI, so its `test` can be green. A failed
     // default-branch read must not let it land into its lane base: a lane/* base is held fail-closed.
     const stacked = verdictFor(ghPr(13, 'lane/mechanical-dispatcher'), () => null);
@@ -412,8 +412,8 @@ describe('fast-drain round listing snapshot', () => {
     expect(live).not.toHaveBeenCalled();
     expect(target).toHaveBeenCalledOnce();
     expect(result[0].headRefOid).toBe('new');
-    expect(classifyPr(old).decision).toBe('merge');
-    expect(classifyPr(result[0])).toMatchObject({ decision: 'skip', reviewHeld: true });
+    expect(classifyPr(old, { defaultBranch: 'main' }).decision).toBe('merge');
+    expect(classifyPr(result[0], { defaultBranch: 'main' })).toMatchObject({ decision: 'skip', reviewHeld: true });
     expect(log).toHaveBeenCalledWith(expect.stringContaining('served-from-snapshot'));
   });
   it.each([
@@ -463,8 +463,8 @@ describe('fast-drain round listing snapshot', () => {
     const { result } = await probe(snap(), { readTarget: async () => ({ ...old, state: 'OPEN', headRefOid: 'moved',
       statusCheckRollup: [{ name: 'test', status: 'COMPLETED', conclusion: 'FAILURE' }],
     }) });
-    expect(classifyPr(old).decision).toBe('merge');
-    expect(classifyPr(result[0])).toMatchObject({ decision: 'skip', reason: 'required check "test" is not green' });
+    expect(classifyPr(old, { defaultBranch: 'main' }).decision).toBe('merge');
+    expect(classifyPr(result[0], { defaultBranch: 'main' })).toMatchObject({ decision: 'skip', reason: 'required check "test" is not green' });
   });
   it('continues with live rows when the snapshot cannot be written', async () => {
     const { result, live, target } = await probe(null, { write: () => { throw new Error('EACCES'); } });
@@ -570,13 +570,17 @@ fs.writeSync(1, typeof out === 'string' ? out : JSON.stringify(out));
     expect(calls.some(a => a[0] === 'pr' && a[1] === 'view' && a[2] === '43' && a.includes('web-everything/web-everything'))).toBe(true);
     expect(payload.deferred).toEqual(expect.arrayContaining([expect.objectContaining({ num: 42, waitOn: expect.arrayContaining([43]) })]));
   });
-  it('re-lists fresh snapshot context live without resolving the stored default branch', () => {
+  it('re-lists fresh snapshot context then verifies the default branch live exactly once', () => {
     const { stderr, calls } = run('snapshot');
     expect(stderr).toContain('served-from-snapshot');
     const localListings = calls.filter(a => a[0] === 'api' && a[1] === 'graphql'
       && a.some(v => v.includes('repository(owner:"web-everything",name:"web-everything")') && v.includes('pullRequests(states:OPEN')));
     expect(localListings).toHaveLength(1);
-    expect(calls.some(a => a[0] === 'repo' && a[1] === 'view')).toBe(false);
+    const branchReads = calls.filter(a => a[0] === 'repo' && a[1] === 'view');
+    expect(branchReads).toHaveLength(1);
+    const branchIndex = calls.indexOf(branchReads[0]);
+    expect(calls.every((a, i) => !(a[0] === 'api' && a[1] === 'graphql'
+      && a.some(v => v.includes('pullRequests(states:OPEN'))) || i < branchIndex)).toBe(true);
     expect(calls.some(a => a[0] === 'pr' && a[1] === 'view' && a[2] === '42')).toBe(true);
   });
   it('discovers blockers live after an expired round is refreshed too', () => {
@@ -632,17 +636,34 @@ it('shadow policy retains pre-enqueue renaming by default (#6121)', async () => 
   expect(resolveCardNumbering({ env: {}, platform: {} })).toMatchObject({ value: { mode: 'rename-before-enqueue', ledgerAuth: 'none', shadow: true } });
 });
 
-it('retries a failed default-branch read on a later call and caches the successful read', async () => {
-  const source = readFileSync(join(dirname(fileURLToPath(import.meta.url)), '..', 'merge-ai-prs.mjs'), 'utf8');
-  const start = source.indexOf('  const resolveDefaultBranch = async (repo) => {');
-  const end = source.indexOf('\n  let [listings]', start);
-  expect(start).toBeGreaterThan(-1);
-  expect(end).toBeGreaterThan(start);
+
+it('a failed live default-branch read holds admission, then the same reader recovers on a later sweep', async () => {
+  const { createLiveDefaultBranchReader } = await import('../lib/default-branch-cache.mjs');
+  const read = vi.fn().mockRejectedValueOnce(new Error('transient read failure')).mockResolvedValueOnce('trunk\n');
+  const map = new Map(), repo = 'fixture/repo';
+  const verify = createLiveDefaultBranchReader({ map, readLive: read, writeCache: () => {} });
+  const pr = { number: 12, title: 't', body: 'what changed and why', headRefName: 'lane/12-x',
+    baseRefName: 'trunk', statusCheckRollup: [{ name: 'test', conclusion: 'SUCCESS' }],
+    mergeable: 'MERGEABLE', mergeStateStatus: 'CLEAN', labels: [{ name: 'ready-to-merge' }] };
+  const verdict = () => buildDrainVerdicts({ prsByRepo: new Map([[repo, [pr]]]),
+    readOf: () => ({ commits: [{ oid: 'abc' }], manifest: null }), repos: [repo],
+    defaultBranchOf: r => map.get(r) ?? null })[0];
+
+  expect(await verify(repo)).toBeNull();
+  expect(verdict()).toMatchObject({ decision: 'skip', reason: expect.stringContaining('deferring merge/enqueue') });
+  expect(read).toHaveBeenCalledOnce();
+  expect(await verify(repo)).toBe('trunk');
+  expect(verdict().decision).toBe('merge');
+  expect(await verify(repo)).toBe('trunk');
+  expect(read).toHaveBeenCalledTimes(2);
+});
+
+it('retries a failed default-branch hint read on a later call and caches the successful hint', async () => {
+  const { resolveCachedDefaultBranch } = await import('../lib/default-branch-cache.mjs');
   const cache = new Map();
-  const read = vi.fn().mockRejectedValueOnce(new Error('transient read failure'))
-    .mockResolvedValueOnce({ stdout: 'trunk\n' });
-  const resolveDefaultBranch = new Function('defaultBranchByRepo', 'execFileP', 'listingSnapshot', 'AS_JSON',
-    `${source.slice(start, end)}; return resolveDefaultBranch;`)(cache, read, null, true);
+  const read = vi.fn().mockImplementationOnce(() => { throw new Error('transient read failure'); })
+    .mockReturnValueOnce('trunk');
+  const resolveDefaultBranch = repo => resolveCachedDefaultBranch({ repo, map: cache, readCache: read });
   await resolveDefaultBranch('fixture/repo');
   expect(cache.has('fixture/repo')).toBe(false);
   await resolveDefaultBranch('fixture/repo');
