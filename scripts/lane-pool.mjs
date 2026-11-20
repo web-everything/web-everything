@@ -177,7 +177,7 @@ import { pickFreshestTip } from './readiness/scope-lease-collect.mjs';
 // import" shape `we:scripts/operations/operator-queue.mjs`'s own header warns about (that warning is about
 // importing `lane-pool.mjs` itself elsewhere — the OPPOSITE direction from this import).
 import { gitStatusSummary, aheadCommits, aheadCommitsPreserved, filePreservedInMain } from './lane-whois.mjs';
-import { staleTakeoverHasLiveProcesses, journalLiveProcessRefusal, probeLaneReclaim } from './lib/lane-lease-liveness.mjs';
+import { staleTakeoverHasLiveProcesses, journalLiveProcessRefusal, probeLaneReclaim, laneHostBootId } from './lib/lane-lease-liveness.mjs';
 import { withLaneLeaseGuard } from './lib/lane-lease-guard.mjs';
 import { guessCardIds } from './lib/lane-whois-core.mjs';
 import { realSalvageIo, redactUrlCredentials, releasePushTarget, salvagePushLane, salvageRefName } from './lib/lane-pool-salvage-push.mjs';
@@ -1041,7 +1041,7 @@ function reclaimSafety(dir, lease) {
   if (!lease) return { safe: true, reason: null };
   const verdict = probeLaneReclaim(dir, lease);
   if (!verdict.safe) {
-    log(`  ${basename(dir)}: ${verdict.reason} — kept; inspect holder/worktree before retrying`);
+    log(`  ${basename(dir)}: ${verdict.reason} — kept; inspect holder/worktree before retrying. After confirming the holder stopped, run: node scripts/lane-pool.mjs release --pool=${basename(dirname(dir))} --lane=${basename(dir).replace('lane-', '')} --force`);
     journalLaneEvent(dir, { action: 'reclaim-refused', reason: verdict.reason });
   }
   return verdict;
@@ -1533,6 +1533,12 @@ function localRemoteShas(dir, fetchedSpecs) {
 // (safe to unmap its stale item mapping, #2139) from a skipped one (still serving its in-flight item).
 function refreshLane(repo, n, { force = false } = {}) {
   const dir = laneDir(repo, n);
+  // Check before fetch healing: recloning is destructive too. A stale marker's
+  // live holder or dirty work is protected even when refresh was forced.
+  const existing = readLease(dir);
+  if (existing && isLeaseStale(existing, Date.now(), ttlMsFromFlags()) && !reclaimSafety(dir, existing).safe) {
+    return { skipped: true, leased: true, dirty: false, uncommitted: 0, ahead: 0 };
+  }
   // Acquire scrubs before ITS fetch; refresh's fetch ran a lane-set credential helper / `core.gitProxy` (PR #5775 self-review).
   scrubClaimedLaneConfig(dir, 'before refresh fetch');
   // xj1vryw — self-healing fetch; may quarantine + re-clone a corrupt lane ONLY when no live lease holds it.
@@ -2041,12 +2047,21 @@ function tryClaimLane(dir, session, nowMs, ttlMs, { allowReacquire = false, read
   // sessions that merely share an upper process ancestor (terminal / a parallel-lane orchestrator). This is the
   // SOLE ownership signal (r2 removed the pid-ancestry fallback, whose chain overlap over-matched exactly that
   // shared-ancestor topology and so failed open while looking protective — see `isForeignLease`, lane-lease.mjs).
-  // The parent is the long-lived caller; its PID protects liveness, never ownership.
+  // Direct long-lived callers may use the parent PID. Per-command shells must
+  // pass LANE_HOLDER_PID for the actual worker (including a surviving sibling),
+  // or maintain a heartbeat: a shell's exit says nothing about a sibling's life.
+  // Daemon callers must name their worker rather than pinning the daemon forever.
+  // This PID protects liveness only; session/holder tokens still own the lease.
+  const declaredPid = process.env.LANE_HOLDER_PID;
+  const holderPid = declaredPid === undefined ? process.ppid : Number(declaredPid);
+  if (declaredPid !== undefined && (!/^\d+$/.test(declaredPid) || !Number.isSafeInteger(holderPid) || holderPid <= 0)) {
+    throw new Error('LANE_HOLDER_PID must name the positive PID of the lane worker');
+  }
   const mintedHolder = mintHolderSlug(dir, flags.purpose);
   const bodyFor = (holder, workerSession, prior = null) => JSON.stringify(
     leaseBody({
       session, purpose: flags.purpose, acquiredAt: new Date(nowMs).toISOString(), ttlMinutes: ttlMinutesFromFlags(),
-      host: hostname(), pid: process.ppid,
+      host: hostname(), hostBootId: laneHostBootId(), pid: holderPid,
       ownerSession: process.env.CLAUDE_CODE_SESSION_ID || null,
       // #2997 — the minted PER-HOLDER slug, stamped on EVERY acquire rather than only on a `workflowLane` one.
       // #2413 built this exact channel but gated it on that marker, so every other concurrent topology (ad-hoc
@@ -2174,7 +2189,7 @@ function deadLeasePlan(repo, nowMs, ttlMs) {
   for (const n of existingLanes(repo)) {
     const dir = laneDir(repo, n);
     const lease = readLease(dir);
-    if (lease && reclaimSafety(dir, lease).safe) candidates.push({ lane: n, dir, lease });
+    if (lease && isLeaseStale(lease, nowMs, ttlMs) && reclaimSafety(dir, lease).safe) candidates.push({ lane: n, dir, lease });
   }
   if (candidates.length === 0) return { reap: [], keep: [] };
   // PR-terminal axis (best-effort, one `gh pr list`): a merged/closed PR whose head ref `lane/<num>-*` maps
@@ -2225,10 +2240,10 @@ function deadLeasePlan(repo, nowMs, ttlMs) {
     // lane. Concurrency collapsed to one lane, and where nothing downstream checks, two agents share a clone.
     //
     // So both axes below are gated on the lease itself looking dead. The one trustworthy liveness signal in
-    // today's schema is TTL: `pid` records the short-lived `lane-pool acquire` CLI, not the delivery agent
-    // (an LLM has no unix pid — see `lease-reaper.pidAliveForLease`, still the plug-in point for a durable
-    // `agentPid`), and `leaseOwnedByCaller` is string equality on every branch, an ownership proof and never
-    // a liveness test. This NARROWS #2748 rather than undoing it: a TTL-stale lease whose item is terminal is
+    // the pass is TTL, followed by the holder PID/worktree gate above. Legacy leases may still record a
+    // short-lived acquire process; new callers may declare their worker via LANE_HOLDER_PID.
+    // `leaseOwnedByCaller` is string equality on every branch, an ownership proof and never
+    // a liveness test. This NARROWS #2748 rather than undoing it: a safe TTL-stale lease whose item is terminal is
     // still reaped HERE, pre-TTL-reclaim and pool-wide, which is the ghost #2748 was built for.
     const holderPresumedGone = isLeaseStale(c.lease, nowMs, ttlMs);
     // #xkk4lv7 — the branch-based fallback (`resolveLeaseItemNum`, imported from `lease-reaper.mjs` rather than

@@ -3111,7 +3111,7 @@ function execWithRunCeiling(command, opts, ceilingMs, exec) {
 export async function runUnderAdmission(options) {
   const { cwd = process.cwd(), startHeartbeat = startLaneLeaseHeartbeat } = options;
   const heartbeat = startHeartbeat({ cwd });
-  try { return await runUnderAdmissionWithoutHeartbeat({ ...options, startHeartbeat: () => ({ stop() {} }) }); }
+  try { return await runUnderAdmissionWithoutHeartbeat(options); }
   finally { heartbeat.stop(); }
 }
 
@@ -3120,14 +3120,13 @@ async function runUnderAdmissionWithoutHeartbeat({
   kind = null, command, cwd = process.cwd(), exec = defaultExec, log = (m) => process.stderr.write(m),
   now = () => Date.now(), sleep = (ms) => new Promise((r) => setTimeout(r, ms)),
   bypass = null, env = process.env, policy = loadAdmissionPolicy({ env }), waitMs = 0, waitSource = 'standard', location = null,
-  runCeilingMs = 0, startHeartbeat = startLaneLeaseHeartbeat,
+  runCeilingMs = 0,
 }) {
   if (wholeSuiteRefused({ command, policy, env, log })) return { exitCode: 125 };
   // The child always runs with the re-entrancy flag, so anything it runs that is itself wrapped passes through.
   const childEnv = { ...env, [ADMISSION_HELD_ENV]: '1' };
   if (bypass) {
     let exitCode = 0;
-    const heartbeat = startHeartbeat({ cwd });
     try {
       const bypassOpts = { cwd, stdio: 'inherit', env: bypass === 'held' ? env : childEnv };
       if (runCeilingMs > 0) await execWithRunCeiling(command, bypassOpts, runCeilingMs, exec);
@@ -3136,7 +3135,6 @@ async function runUnderAdmissionWithoutHeartbeat({
       exitCode = childExitCode(e);
       if (e && e.code === 'ETIMEDOUT') { exitCode = 124; log(`⚠ heavy-command admission: run exceeded ${runCeilingMs}ms and was stopped.\n`); }
     }
-    finally { heartbeat.stop(); }
     return { exitCode, admission: { ok: false, slot: null, timedOut: false, waitedMs: 0, bypassed: bypass } };
   }
   mkdirSync(lockRoot, { recursive: true });
@@ -3153,7 +3151,6 @@ async function runUnderAdmissionWithoutHeartbeat({
   }
   let exitCode = 0;
   let execOptsTimeout = 0;
-  const heartbeat = startHeartbeat({ cwd });
   try {
     // x1ds37v — a single-test debug run (`files`) is bounded to fit under the 10-minute Bash cap.
     const execOpts = { cwd, stdio: 'inherit', env: childEnv };
@@ -3166,7 +3163,6 @@ async function runUnderAdmissionWithoutHeartbeat({
     exitCode = childExitCode(e);
     if (e && e.code === 'ETIMEDOUT') { exitCode = 124; log(`⚠ heavy-command admission: run exceeded ${execOptsTimeout}ms and was stopped.\n`); }
   } finally {
-    heartbeat.stop();
     if (admission.ok) releaseOwnedSlot({ lockRoot, cap, owner, fastSlots: resolveSlotSpan({ ...policy.settings, cap }) - cap });
   }
   return { exitCode, admission };

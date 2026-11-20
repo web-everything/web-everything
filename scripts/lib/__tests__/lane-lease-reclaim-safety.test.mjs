@@ -2,6 +2,7 @@ import { it, expect, vi } from 'vitest';
 import { holderPidAlive, laneReclaimDecision, probeLaneReclaim } from '../lane-lease-liveness.mjs';
 import { applyReclaimSafety } from '../../conveyor/lease-reaper.mjs';
 import { laneGitConfigArgs, laneGitHardeningEnv, scrubGitLocationEnv } from '../lane-git-hardening.mjs';
+import { leaseBody } from '../lane-lease.mjs';
 
 it.each([[true, false, 'stale-but-live'], [false, true, 'stale-but-dirty'],
   [null, false, 'stale-but-live'], [false, null, 'stale-but-dirty']])(
@@ -21,6 +22,24 @@ it('observes the live holder with kill(pid, 0)', () => {
 });
 it('refuses foreign-host PID evidence', () => {
   expect(holderPidAlive({ pid: 123, host: 'elsewhere' }, { host: 'here' })).toBe(null);
+});
+it('uses the boot identity when DHCP changes the hostname', () => {
+  const kill = vi.fn();
+  expect(holderPidAlive({ pid: 123, host: 'old-name', hostBootId: 'ABCD' }, {
+    host: 'new-name', bootId: 'abcd', kill,
+  })).toBe(true);
+  expect(kill).toHaveBeenCalledWith(123, 0);
+});
+it('persists boot identity only when the acquire probe supplies it', () => {
+  expect(leaseBody({ hostBootId: 'abcd' }).hostBootId).toBe('abcd');
+  expect(leaseBody({})).not.toHaveProperty('hostBootId');
+});
+it.each([null, 'other-boot'])('refuses hostname changes with unknown or foreign boot evidence: %s', bootId => {
+  const kill = vi.fn();
+  expect(holderPidAlive({ pid: 123, host: 'old-name', hostBootId: 'abcd' }, {
+    host: 'new-name', bootId, kill,
+  })).toBe(null);
+  expect(kill).not.toHaveBeenCalled();
 });
 it.each([
   () => ({ status: 1, stdout: '' }),

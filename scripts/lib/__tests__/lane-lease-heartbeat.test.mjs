@@ -1,18 +1,38 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { execFileSync } from 'node:child_process';
-import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, renameSync, rmSync, readdirSync, existsSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, renameSync, rmSync, readdirSync, existsSync, realpathSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { renewLaneLease, startLaneLeaseHeartbeat } from '../lane-lease-heartbeat.mjs';
 import { staleTakeoverHasLiveProcesses, journalLiveProcessRefusal } from '../lane-lease-liveness.mjs';
 import { laneLivenessGate } from '../lane-salvage.mjs';
 import { withLaneLeaseGuard } from '../lane-lease-guard.mjs';
+import { createHash } from 'node:crypto';
 
 let dir;
 beforeEach(() => { dir = mkdtempSync(join(tmpdir(), 'lease-heartbeat-')); });
 afterEach(() => { rmSync(dir, { recursive: true, force: true }); });
 
 describe('lane lease renewal', () => {
+  it('recovers a guard left by a dead pid before renewing the lease', () => {
+    const file = join(dir, '.lane-lease');
+    writeFileSync(file, JSON.stringify({ session: 'owner', acquiredAt: '2026-01-01' }));
+    writeFileSync(`${file}.lock`, '2147483646\n');
+    expect(renewLaneLease({ cwd: dir, run: () => ({ status: 0, stdout: dir }) })).toBe(true);
+    expect(JSON.parse(readFileSync(file, 'utf8')).renewedAt).toBeDefined();
+    expect(existsSync(`${file}.lock`)).toBe(false);
+  });
+
+  it('recovers the outer serialization guard after its owner crashes', () => {
+    const file = join(dir, '.lane-lease');
+    const key = join(realpathSync(dir), '.lane-lease.lock');
+    const lock = join(dir, `ledger-append-${createHash('sha256').update(key).digest('hex')}.lock`);
+    mkdirSync(lock);
+    writeFileSync(join(lock, 'dead-owner.json'), JSON.stringify({ pid: 2147483646, timestamp: Date.now() }));
+    expect(withLaneLeaseGuard(file, () => 'recovered')).toBe('recovered');
+    expect(readdirSync(dir)).toEqual([]);
+  });
+
   it('resolves the absolute git dir from a subdirectory and preserves lease identity', () => {
     execFileSync('git', ['init', '--quiet', dir]);
     const cwd = join(dir, 'nested');
@@ -61,15 +81,15 @@ describe('lane lease renewal', () => {
     writeFileSync(file, JSON.stringify({ session: 'owner', acquiredAt: '2026-01-01' }));
     const rename = vi.fn(renameSync);
     const release = vi.fn(() => withLaneLeaseGuard(file, () => rmSync(file)));
-    expect(renewLaneLease({ cwd: dir, run: () => ({ status: 0, stdout: dir }), fs: {
-      writeFileSync(path, body, options) {
+    expect(renewLaneLease({ cwd: dir, run: () => ({ status: 0, stdout: dir }),
+      guard(file, work, fs) {
         // The first comparison has succeeded. Release wins the shared guard
         // immediately before renewal acquires it and attempts its rename.
-        if (path === `${file}.lock`) release();
-        writeFileSync(path, body, options);
+        release();
+        return withLaneLeaseGuard(file, work, fs);
       },
-      renameSync: rename, rmSync,
-    } })).toBe(false);
+      fs: { writeFileSync, renameSync: rename, rmSync },
+    })).toBe(false);
     expect(release).toHaveBeenCalledOnce();
     expect(rename).not.toHaveBeenCalled();
     expect(existsSync(file)).toBe(false);

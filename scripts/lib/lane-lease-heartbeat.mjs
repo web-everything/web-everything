@@ -7,7 +7,7 @@ import { LEASE_FILENAME, renewedLease } from './lane-lease.mjs';
 import { withLaneLeaseGuard } from './lane-lease-guard.mjs';
 
 // Best effort, atomic renewal; resolve the git directory even from a lane subdirectory.
-export function renewLaneLease({ cwd, run = (file, args, opts) => spawnSync(file, args, { ...opts, encoding: 'utf8', timeout: 5000 }), now = () => new Date(), fs = { writeFileSync, renameSync, rmSync } } = {}) {
+export function renewLaneLease({ cwd, run = (file, args, opts) => spawnSync(file, args, { ...opts, encoding: 'utf8', timeout: 5000 }), now = () => new Date(), fs = { writeFileSync, renameSync, rmSync }, guard = withLaneLeaseGuard } = {}) {
   try {
     const gd = run('git', ['rev-parse', '--absolute-git-dir'], { cwd });
     if (gd.status !== 0) return false;
@@ -24,7 +24,7 @@ export function renewLaneLease({ cwd, run = (file, args, opts) => spawnSync(file
       fs.writeFileSync(tmp, `${JSON.stringify(next, null, 2)}\n`, { flag: 'wx' });
       // A release, takeover or another renewal since our read invalidates this snapshot.
       if (!isDeepStrictEqual(JSON.parse(readFileSync(file, 'utf8')), lease)) return false;
-      return withLaneLeaseGuard(file, () => {
+      return guard(file, () => {
         // Release/takeover use this same guard. Compare again under it: a release
         // before acquisition must leave the marker absent, never resurrect it.
         if (!isDeepStrictEqual(JSON.parse(readFileSync(file, 'utf8')), lease)) return false;

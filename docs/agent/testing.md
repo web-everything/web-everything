@@ -4711,7 +4711,16 @@ synchronous child execution prevents interval renewals. The Codex child runner c
 jobs too. Inject `readAgents`/`readCwds` into liveness fixtures; never probe host processes in unit tests.
 Acquire takeover and explicit reclaim fail closed on unreadable cwd evidence.
 Observed live occupants journal `reclaim-refused-live-process`.
-Provisioning failures stay excluded across acquire poll rounds and allow bounded pool growth.
+Provisioning failures stay excluded across acquire poll rounds and prevent pool growth for that attempt.
+Per-command shells and daemon dispatchers must pass `LANE_HOLDER_PID` for the actual worker,
+or keep a lease heartbeat running; the default parent PID only covers a long-lived direct caller.
+New leases record a boot UUID when available, so DHCP hostname changes can still use local PID
+evidence. Legacy or unverified foreign-host leases fail closed. Refusal output prints the exact `release --force`
+command for recovery after the operator confirms the worker stopped.
+Reaper wiring tests must retain the real `applyReclaimSafety` function and inject only its
+probe; identity stubs hide a missing safety gate. Cover both dry-run and actual release.
+Verify-lane renewal tests compare timestamps observed during the running gate, and non-running
+reset/check/print-gate modes must preserve lease bytes.
 Review lane setup uses one hardened environment for the config scrub, origin validation and fetch.
 Global and system config point at the same temporary empty file, system config is disabled, and
 inherited indexed config and config-source overrides are removed before applying the hardening

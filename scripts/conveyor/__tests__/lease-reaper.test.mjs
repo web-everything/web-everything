@@ -53,6 +53,7 @@ import {
   buildLeaseSignalsFor,
   prTerminalPredatesLease,
   laneIndicesIn,
+  applyReclaimSafety,
 } from '../lease-reaper.mjs';
 import { fixDispatchSessionName } from '../fix-claim-store.mjs';
 import { DEFAULT_LEASE_TTL_MINUTES } from '../../lib/lane-lease.mjs';
@@ -797,6 +798,48 @@ describe('buildLeaseSignalsFor + reapPlan — lane-8 old stopped rounds (PR #584
   });
 });
 
+describe('main — reclaim safety wiring', () => {
+  it.each([true, false])('keeps live and dirty leases through the real safety gate (dry-run=%s)', (dryRun) => {
+    const source = readFileSync(join(process.cwd(), 'scripts/conveyor/lease-reaper.mjs'), 'utf8');
+    const shell = source.slice(source.indexOf('function parseFlags('), source.indexOf('// Run the IO shell only'));
+    const leases = new Map([2, 3, 4].map(lane => [lane, stale({ session: `conveyor-${lane}` })]));
+    const probe = vi.fn((dir, lease) => {
+      expect(dir).toBe(join('/fixture', 'pool', `lane-${lease.session.slice(-1)}`));
+      if (lease.session === 'conveyor-2') return { safe: false, reason: 'stale-but-live' };
+      if (lease.session === 'conveyor-3') return { safe: false, reason: 'stale-but-dirty' };
+      return { safe: true, reason: null };
+    });
+    const release = vi.fn();
+    const logs = [];
+    let stdout = '';
+    // Keep the production safety function and its default probe wiring in the VM.
+    // Only its I/O probe is injected; removing the main gate must fail this test.
+    const safety = source.slice(source.indexOf('export function applyReclaimSafety('), source.indexOf('// ── IO SHELL')).replace('export function', 'function');
+    runInNewContext(`${safety}\n${shell}\nmain(${JSON.stringify(dryRun ? ['--dry-run', '--json'] : ['--json'])});`, {
+      Date: class extends Date { static now() { return NOW; } },
+      Map, Set, Number, JSON, join, DEFAULT_LEASE_TTL_MINUTES,
+      POOL_ROOT: '/fixture', log: line => logs.push(line),
+      process: { env: {}, stdout: { write: s => { stdout += s; } }, exit: code => expect(code).toBe(0) },
+      fetchSessionSignals: () => ({ states: null, pidAlive: new Map(), agents: [] }),
+      readWrapperPidsForPass: () => new Map(), listFixDispatchClaims: () => [],
+      claimRunnerPidsBySession, staleTerminalNamesForClaims,
+      poolsToScan: () => ['pool'], repoKeyForPool: () => null,
+      laneIndicesIn: () => [2, 3, 4], readLease: dir => leases.get(Number(dir.slice(-1))),
+      fetchPrStatesForRepo: () => { throw Error('unexpected network lookup'); },
+      buildLeaseSignalsFor, reapPlan, applyLaneHold: plan => plan,
+      probeLaneReclaim: probe, releaseLane: release,
+    }, { timeout: 1000 });
+    expect(probe).toHaveBeenCalledTimes(3);
+    expect(logs).toContain('  kept pool/lane-2: stale-but-live');
+    expect(logs).toContain('  kept pool/lane-3: stale-but-dirty');
+    const safe = { pool: 'pool', lane: 4, reason: 'ttl-stale', session: 'conveyor-4' };
+    expect(JSON.parse(stdout)).toMatchObject({ scanned: 3, kept: 2, failures: 0,
+      ...(dryRun ? { reaped: 0, wouldReap: [safe] } : { reaped: 1, collected: [safe] }) });
+    if (dryRun) expect(release).not.toHaveBeenCalled();
+    else expect(release.mock.calls).toEqual([['pool', 4, { reason: 'ttl-stale' }]]);
+  });
+});
+
 describe('main — claim freshness after slow I/O (PR #5846)', () => {
   // Execute the checked-in CLI shell with real claim/signal/reap helpers. Only I/O
   // is replaced, so a stale clock passed by main cannot hide behind a unit fixture.
@@ -845,7 +888,8 @@ describe('main — claim freshness after slow I/O (PR #5846)', () => {
       fetchPrStatesForRepo: () => { throw new Error('no PR lookup expected'); },
       buildLeaseSignalsFor: (opts) => buildLeaseSignalsFor({ ...opts,
         pidCommand: () => 'node fix-run.mjs --session=fix-5806' }),
-      reapPlan, applyLaneHold: (plan) => plan, applyReclaimSafety: (plan) => plan,
+      reapPlan, applyLaneHold: (plan) => plan,
+      applyReclaimSafety: (plan) => applyReclaimSafety(plan, { check: () => ({ safe: true }) }),
       releaseLane: () => { throw new Error('dry-run must never release'); },
     }, { timeout: 1000 });
     return { report: JSON.parse(stdout), logs };

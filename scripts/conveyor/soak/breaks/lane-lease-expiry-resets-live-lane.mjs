@@ -38,6 +38,17 @@ export function replayExpiry(root) {
       if (kind === 'dirty' && readFileSync(join(lane, 'work'), 'utf8') !== 'uncommitted work') {
         violations.push('dirty: uncommitted bytes lost');
       }
+      const refresh = spawnSync(process.execPath, [join(root, 'scripts/lane-pool.mjs'), 'refresh',
+        '--lane=1', '--pool=fixture', `--origin=${reference}`, `--reference=${reference}`,
+        '--force', '--no-install'], {
+        cwd: reference, encoding: 'utf8', timeout: 20000, maxBuffer: 1024 * 1024,
+        env: { ...process.env, LANE_POOL_ROOT: pool, PATH: `${bin}:${process.env.PATH}` },
+      });
+      if (refresh.error || refresh.status !== 0 || !refresh.stderr?.includes(`stale-but-${kind}`)
+          || readFileSync(marker, 'utf8') !== bytes) violations.push(`${kind}: forced refresh did not retain the stale lease`);
+      if (kind === 'dirty' && readFileSync(join(lane, 'work'), 'utf8') !== 'uncommitted work') {
+        violations.push('dirty: forced refresh lost uncommitted bytes');
+      }
     }
   } catch (error) { violations.push(`scenario failed: ${error.message}`); }
   finally { rmSync(base, { recursive: true, force: true }); }

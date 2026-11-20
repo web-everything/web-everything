@@ -174,10 +174,11 @@ export function chooseFreeLane(laneInfos, nowMs, ttlMs, { excludeLane = null } =
  *  `we:scripts/readiness/lane-manifest.mjs` validates: those are two different facts about two different
  *  artifacts (a lease vs. a PR-body manifest) that merely share a word. OMITTED when absent, so a base-less
  *  acquire's marker stays byte-identical to today; a reader keys on `laneBaseRef`. */
-export function leaseBody({ session, purpose, acquiredAt, ttlMinutes = DEFAULT_LEASE_TTL_MINUTES, host, pid, ownerSession, workflowLane, predictedScope, reserved, holder, workerSession, base }) {
+export function leaseBody({ session, purpose, acquiredAt, ttlMinutes = DEFAULT_LEASE_TTL_MINUTES, host, hostBootId, pid, ownerSession, workflowLane, predictedScope, reserved, holder, workerSession, base }) {
   return {
     session, purpose: purpose || null, acquiredAt, ttlMinutes, host: host || null,
     pid: pid ?? null, ownerSession: ownerSession ?? null,
+    ...(typeof hostBootId === 'string' && hostBootId ? { hostBootId } : {}),
     // #2413 — a MARKED (parallel-/workflow) lease. A plain boolean contract field (never null) so a reader can
     // key on it directly; older on-disk leases lack it (⇒ undefined ⇒ falsy ⇒ unmarked, today's semantics).
     workflowLane: !!workflowLane,

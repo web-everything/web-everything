@@ -2,6 +2,13 @@ import { spawnSync } from 'node:child_process';
 import { hostname } from 'node:os';
 import { readLiveCwds, pidsWithCwdIn } from './lane-salvage.mjs';
 import { laneGitConfigArgs, laneGitHardeningEnv, scrubGitLocationEnv } from './lane-git-hardening.mjs';
+import { record } from './proc-identity.mjs';
+
+// Boot UUID stays stable across DHCP hostname changes. Failure leaves legacy
+// hostname-only evidence in place; a foreign or unreadable host still refuses.
+export function laneHostBootId() {
+  return record(process.pid).identity?.bootId ?? null;
+}
 
 export function journalLiveProcessRefusal(dir, livePids, journal) {
   if (!livePids?.length) return false;
@@ -22,8 +29,12 @@ export function staleTakeoverHasLiveProcesses(dir, { readCwds = readLiveCwds, jo
 }
 
 // Liveness prevents reclamation; it does not confer ownership.
-export function holderPidAlive(lease, { kill = process.kill, host = hostname() } = {}) {
-  if (lease?.host && lease.host !== host) return null;
+export function holderPidAlive(lease, { kill = process.kill, host = hostname(), bootId } = {}) {
+  if (lease?.host && lease.host !== host) {
+    const currentBoot = bootId === undefined && lease.hostBootId ? laneHostBootId() : bootId;
+    if (typeof lease.hostBootId !== 'string' || !lease.hostBootId || typeof currentBoot !== 'string'
+        || lease.hostBootId.toLowerCase() !== currentBoot.toLowerCase()) return null;
+  }
   if (!Number.isSafeInteger(lease?.pid) || lease.pid <= 0) return false;
   try { kill(lease.pid, 0); return true; }
   catch (error) { return error?.code === 'ESRCH' ? false : error?.code === 'EPERM' ? true : null; }
