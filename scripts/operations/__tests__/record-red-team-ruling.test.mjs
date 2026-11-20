@@ -2330,6 +2330,33 @@ describe('R671 v1 acting judge red-team blocks', () => {
     expect(() => sinks[plan.effect](plan)).toThrow(/fix-now|security/);
     expect(post).not.toHaveBeenCalled();
   });
+  it('planner refuses retained security even when every class policy defers', () => {
+    const comments = [redTeam(HEAD, [{ ...coverageFinding, alsoClasses: ['security-reachable-today'] }]), capped()];
+    expect(() => planRedTeamRuling(judgeRead({ comments, isMainAncestor: () => true,
+      setting: { ...CONFIRMED_BREAKS_DEFAULTS, findingClasses: { 'coverage-or-style': 'defer-card', 'security-reachable-today': 'defer-card', allowSecurityDefer: true } } }),
+      judgeInput('card', { card: CARD, preExisting }))).toThrow(/security/);
+  });
+  it('sink rereads current class policy after a defer-card plan becomes fix-now', () => {
+    const plan = planRedTeamRuling(judgeRead({ isMainAncestor: () => true }), judgeInput('card', { card: CARD, preExisting }));
+    const post = vi.fn(), readFindingClasses = vi.fn(() => ({ 'coverage-or-style': 'fix-now' }));
+    const sinks = createRecordRedTeamRulingSinks({ post, readFindingClasses, isMainAncestor: () => true,
+      resolveIdentity: () => identity, resolveCard: () => card, readStandingRulingScope: () => null,
+      readScope: () => ({ value: { anyState: true } }), readThread: () => ({ headRefOid: HEAD, labels: [], comments: judgeRead().comments }), warn: () => {} });
+    expect(() => sinks[plan.effect](plan)).toThrow(/fix-now/);
+    expect(readFindingClasses).toHaveBeenCalled();
+    expect(post).not.toHaveBeenCalled();
+  });
+  it('sink refuses retained security under a permissive current policy', () => {
+    const plan = planRedTeamRuling(judgeRead({ isMainAncestor: () => true }), judgeInput('card', { card: CARD, preExisting }));
+    plan.findings[0].alsoClasses = ['security-reachable-today'];
+    plan.setting = { ...plan.setting, findingClasses: { 'coverage-or-style': 'defer-card', 'security-reachable-today': 'defer-card', allowSecurityDefer: true } };
+    const post = vi.fn();
+    const sinks = createRecordRedTeamRulingSinks({ post, readFindingClasses: () => plan.setting.findingClasses, isMainAncestor: () => true,
+      resolveIdentity: () => identity, resolveCard: () => card, readStandingRulingScope: () => null,
+      readScope: () => ({ value: { anyState: true } }), readThread: () => ({ headRefOid: HEAD, labels: [], comments: judgeRead().comments }), warn: () => {} });
+    expect(() => sinks[plan.effect](plan)).toThrow(/security/);
+    expect(post).not.toHaveBeenCalled();
+  });
   it('auto-filed judge card record carries evidence and proves release', async () => {
     const repo = 'web-everything/web-everything';
     const coordinationRoot = mkdtempSync(join(tmpdir(), 'judge-card-release-'));
@@ -2349,7 +2376,7 @@ describe('R671 v1 acting judge red-team blocks', () => {
       expect(sinks[plan.effect](plan)).toMatchObject({ ruling: 'card', indices: [1] });
       expect(comments.at(-1).body).toContain('actor=judge:r10');
       expect(comments.at(-1).body).toContain('Pre-existing on main');
-      const d = readRedTeamDisposition({ comments, repo, pr: PR, head: HEAD, setting: CONFIRMED_BREAKS_DEFAULTS, operatorRulings: { anyState: true } });
+      const d = readRedTeamDisposition({ comments, repo, pr: PR, head: HEAD, isAncestorOfMain: () => true, cardReadable: () => true, setting: CONFIRMED_BREAKS_DEFAULTS, operatorRulings: { anyState: true } });
       expect(d.dispositions.get(1).state).toBe('released carded');
     } finally { rmSync(coordinationRoot, { recursive: true, force: true }); }
   });
@@ -2377,7 +2404,7 @@ describe('R671 v1 acting judge red-team blocks', () => {
       expect(body).toContain('actor=judge:r10');
       expect(body).toContain(attribution);
       expect(body.indexOf('Pre-existing on main')).toBeGreaterThan(body.indexOf('- 1 finding(s) carded'));
-      const d = readRedTeamDisposition({ comments, repo, pr: PR, head: HEAD, setting: CONFIRMED_BREAKS_DEFAULTS, operatorRulings: { anyState: true } });
+      const d = readRedTeamDisposition({ comments, repo, pr: PR, head: HEAD, isAncestorOfMain: () => true, cardReadable: () => true, setting: CONFIRMED_BREAKS_DEFAULTS, operatorRulings: { anyState: true } });
       expect(d.held).toEqual([]);
       expect(d.rulings.get(1)).toEqual(expect.arrayContaining([expect.objectContaining({ source: 'operator', kind: 'card' })]));
     }

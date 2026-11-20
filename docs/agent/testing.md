@@ -5725,3 +5725,16 @@ the run store. Restore the verifier from trusted injected IO at judge card valid
 preview; never replace it with a persisted boolean. Keep CLI JSON-evidence tests through the full
 operation alongside direct sink tests. Judge card release records append attribution and matching
 main/PR probe evidence after action lines so the gate can read the complete action block.
+
+
+## Judge card release evidence
+
+`judge-card-security.test.mjs` exercises the real red-team readers with ancestry and card-readability
+ports. Judge card releases require the live head, a readable named card, and a current defer-card class
+policy; a security class (including retained classes) or reachable security always refuses. Missing or
+throwing ports ignore the release. Reader callers must supply these live checks explicitly; a saved
+plan or evidence-shaped prose cannot substitute for them. The writer rereads class policy at each
+effect-time check, and auto-filed judge records name their backing cards. Spool-only completion stays
+held until a backing card can be read. Recovery is to restore the readable card and rerun the probe
+and ruling against the current head/main, or ask a human operator to rule. Keep the named arbitrary-SHA,
+missing-card, security, retained-security, and changed-policy negatives beside the positive release.

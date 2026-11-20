@@ -101,12 +101,20 @@ describe('R671 judge readers bind actor and automation author', () => {
   ])('judge card evidence %s releases only valid records', (_name, evidence, login, outcome, releases) => {
     const c = judgeGate(outcome, '- 1 finding(s) carded by the operator to `we:backlog/x.md` (#1).'
       + (evidence === null ? '' : `\nPre-existing on main (${'b'.repeat(40)}): probe ${evidence}`), login);
-    expect(isRulingComment(c)).toBe(releases);
-    const d = disposition([result, cap, c]);
+    const classifiedResult = releases ? { ...result, body: result.body.replace('Class: coverage-or-style → fix-now', 'Class: coverage-or-style → defer-card (basis: missing coverage)') } : result;
+    // Classification changes the result id, so bind this record and cap to the new result.
+    const id = liveResultGateState([classifiedResult], pr, head).resultId;
+    const release = { ...c, body: c.body.replace(rid, id) };
+    const comments = [classifiedResult, { ...cap, body: cap.body.replace(rid, id) }, release];
+    const evidenceContext = { head, findingClasses: {}, findings: liveResultGateState([classifiedResult], pr, head).result.findings,
+      isAncestorOfMain: sha => sha === 'b'.repeat(40), cardReadable: ref => ref === 'we:backlog/x.md' };
+    expect(isRulingComment(release, undefined, evidenceContext)).toBe(releases);
+    const d = readRedTeamDisposition({ comments, pr, head, setting: CONFIRMED_BREAKS_DEFAULTS,
+      operatorRulings: { anyState: true }, ...evidenceContext });
     expect(d.held.map(f => f.index)).toEqual(releases ? [] : [1]);
     if (releases) {
       expect(d.rulings.get(1)).toEqual(expect.arrayContaining([expect.objectContaining({ source: 'operator', kind: 'card' })]));
-      expect(operatorRulingsOnLiveResult([result, cap, c], pr, head).carded.has(1)).toBe(true);
+      expect(operatorRulingsOnLiveResult(comments, pr, head, evidenceContext).carded.has(1)).toBe(true);
     }
   });
   it('judge card refuses malformed SHA, disabled policy, missing attribution and reserved tokens', () => {

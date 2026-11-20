@@ -20,8 +20,8 @@ import { actionResource } from './action-record.mjs';
 import { buildRedTeamCardInput, buildSendBackBody } from './red-team-gate-apply.mjs';
 import { op } from './registry.mjs';
 import { compute, effect as effectStep } from './step-kinds.mjs';
-import { OPERATOR_LOGINS, JUDGE_ACTOR, JUDGE_ATTRIBUTION, assertJudgeAuthority, isSecurityClass } from '../lib/marker-authorship.mjs';
-import { assertRulingIdentity, isHumanOperatorComment, operatorBoundComments } from '../lib/operator-identity.mjs';
+import { OPERATOR_LOGINS, JUDGE_ACTOR, JUDGE_ATTRIBUTION, assertJudgeAuthority } from '../lib/marker-authorship.mjs';
+import { judgeCardFindingAllowed, assertRulingIdentity, isHumanOperatorComment, operatorBoundComments } from '../lib/operator-identity.mjs';
 import { resolveDisposition } from '../lib/red-team-disposition.mjs';
 import { GATE_OUTCOMES, OPERATOR_RULINGS_DEFAULTS, operatorRulingsOnLiveResult, liveResultGateState, readRedTeamDisposition, redTeamGateMarker } from '../lib/red-team-gate.mjs';
 import { FALSE_FINDING_CAUSES } from '../lib/false-finding-causes.mjs';
@@ -248,8 +248,7 @@ export function planRedTeamRuling(read, input) {
   }
   const { pr, ruling, actor, channel, reason } = input;
   const { head, comments, scope, state, atCap, selected } = selectRedTeamRulingFindings(read, input);
-  if (actor === JUDGE_ACTOR && ruling === 'card' && selected.some(f => f.security === true || f.securityReachableToday === true
-    || classAction(f, read.setting?.findingClasses ?? read.findingClassPolicy) !== 'defer-card' || isSecurityClass(f.class ?? f.findingClass)))
+  if (actor === JUDGE_ACTOR && ruling === 'card' && selected.some(f => !judgeCardFindingAllowed(f, read.setting?.findingClasses ?? read.findingClassPolicy ?? {})))
     throw new Error('judge card refuses a fix-now or security break; only coverage-class findings can be carded');
   const base = { repo: input.repo, pr: Number(pr), head, ruling, actor: String(actor).toLowerCase(), channel: String(channel).trim(),
     reason: actor === JUDGE_ACTOR ? `${JUDGE_ATTRIBUTION}\n${reason}` : String(reason), at: read.now, resultId: state.resultId, findings: selected, setting: read.setting,

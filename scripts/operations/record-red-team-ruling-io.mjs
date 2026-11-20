@@ -1,5 +1,5 @@
-import { classAction } from '../lib/finding-class-policy.mjs';
-import { JUDGE_ACTOR, JUDGE_ATTRIBUTION, readJudgeActorPolicy, readJudgeWriterPolicy, assertJudgeAuthority, isSecurityClass, isJudgeAuthored } from '../lib/marker-authorship.mjs';
+import { readFindingClassPolicy } from '../lib/finding-class-policy.mjs';
+import { JUDGE_ACTOR, JUDGE_ATTRIBUTION, readJudgeActorPolicy, readJudgeWriterPolicy, assertJudgeAuthority, isJudgeAuthored } from '../lib/marker-authorship.mjs';
 import { assertJudgeReason, judgeEvidenceComment } from './record-referral-ruling.mjs';
 import { judgeRulingSink, judgeConfirm as defaultJudgeConfirm, readJudgeNotRealMode, readJudgeEvidence, readCardRulingFileMode, readCardAllowNonRegression, landRulingCard as defaultLandRulingCard, rulingCardFilingSink } from './record-referral-ruling-io.mjs';
 /**
@@ -14,14 +14,14 @@ import { tmpdir } from 'node:os';
 import { basename, dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { resolveDisposition } from '../lib/red-team-disposition.mjs';
-import { liveResultGateState, readConfirmedBreaks, readOperatorRulings, readRedTeamDisposition, redTeamGateMarker } from '../lib/red-team-gate.mjs';
+import { judgeCardReaderContext, liveResultGateState, readConfirmedBreaks, readOperatorRulings, readRedTeamDisposition, redTeamGateMarker } from '../lib/red-team-gate.mjs';
 import { syncRedTeamStatusLabels } from '../lib/red-team-status-labels.mjs';
 import { resolveCardRef } from './record-referral-ruling-io.mjs';
 import { CARD_REF_RE, readCardAtPrHead, referralCardReadable } from '../lib/referral-card-readable.mjs';
 import { trackingRefspec } from '../lib/git-transport-branch.mjs';
 import { appWriterProbeFor, redTeamWriterEnv } from '../lib/red-team-check-run.mjs';
 import { LEGACY_BOT_LOGINS } from '../lib/github-app-identity.mjs';
-import { assertRulingIdentity, isRulingComment, judgePolicyOnce, assertHumanOperator, isHumanOperatorComment, operatorBoundComments, operatorGhEnv, resolveOperatorIdentity } from '../lib/operator-identity.mjs';
+import { judgeCardFindingAllowed, assertRulingIdentity, isRulingComment, judgePolicyOnce, assertHumanOperator, isHumanOperatorComment, operatorBoundComments, operatorGhEnv, resolveOperatorIdentity } from '../lib/operator-identity.mjs';
 import { isTrustedMarkerAuthor } from '../lib/marker-authorship.mjs';
 import { createActionStore } from './action-store.mjs';
 import { cardBatchStateDir } from './card-batch-io.mjs';
@@ -236,6 +236,7 @@ export const spawnStableCardJob = (input, session, binding, { spawnDetached = de
 export function createRecordRedTeamRulingSinks({ judgeConfirm = defaultJudgeConfirm, landRulingCard = defaultLandRulingCard, env = process.env, tool, root = REPO_ROOT, readThread = readLiveThread,
   readStandingRulingScope = standingRulingScope,
   readScope = () => readScopeLogged(env),
+  readFindingClasses = () => readFindingClassPolicy({ env, log: warn }),
   runGit = git, isMainAncestor = mainAncestorCheck(runGit), readOnPr = readCardAtPrHead,
   resolveCard = card => resolveCardDefault(card, { runGit, readOnPr }),
   resolveIdentity = actor => resolveRulingIdentity(actor, { env }),
@@ -260,9 +261,9 @@ export function createRecordRedTeamRulingSinks({ judgeConfirm = defaultJudgeConf
     // The SAME policy the plan held (#6494 F7): this sink's env and tool layer, narrowed by the gate-visible policy.
     assertJudgeAuthority(p.actor === JUDGE_ACTOR
       ? { isMainAncestor, judgeActorPolicy: readJudgeWriterPolicy({ env, tool: tool?.judgeActor, log: warn }) } : {}, p);
+    const currentClasses = p.actor === JUDGE_ACTOR && p.ruling === 'card' ? readFindingClasses() : null;
     if (p.actor === JUDGE_ACTOR && p.ruling === 'card' && (!Array.isArray(p.findings) || !p.findings.length
-      || p.findings.some(f => f.security === true || f.securityReachableToday === true
-        || isSecurityClass(f.class ?? f.findingClass) || classAction(f, p.setting?.findingClasses) !== 'defer-card')))
+      || p.findings.some(f => (!judgeCardFindingAllowed(f, currentClasses) || !judgeCardFindingAllowed(f, p.setting?.findingClasses ?? {})))))
       throw new Error('judge card refuses a fix-now or security break; only coverage-class findings can be carded');
     assertRulingIdentity(resolveIdentity(p.actor), p.actor);
     const thread = readThread({ repo: p.repo, pr: p.pr });
@@ -287,13 +288,16 @@ export function createRecordRedTeamRulingSinks({ judgeConfirm = defaultJudgeConf
     const head = String(after.headRefOid ?? '').toLowerCase();
     if (head !== p.head) throw new Error(`${what} was posted but PR #${p.pr}'s head moved to ${head}; the ruling binds to ${p.head} only — inspect and re-run on the new head`);
     const policy = passPolicy();
-    const comments = operatorBoundComments(after.comments, { policy });
+    const evidence = p.actor === JUDGE_ACTOR && p.ruling === 'card'
+      ? judgeCardReaderContext(after.comments, p.pr, head, { findingClasses: readFindingClasses(), isAncestorOfMain: isMainAncestor,
+        cardReadable: ref => { const card = resolveCard(ref, { repo: p.repo, pr: p.pr, head }); return card?.readable === true && card.ref === ref; } }) : {};
+    const comments = operatorBoundComments(after.comments, { policy, ...evidence });
     const standingRuling = readStandingRulingScope({ repo: p.repo, pr: { ...after, number: p.pr, headRefOid: head } });
     if (liveResultGateState(comments, p.pr, head, p.repo, standingRuling).resultId !== p.resultId) throw new Error(`${what} was posted but the live red-team result changed; inspect the thread before retrying`);
-    if (record && !comments.some((c) => String(c?.body ?? '').trim() === record.trim() && isRulingComment(c, policy))) {
+    if (record && !comments.some((c) => String(c?.body ?? '').trim() === record.trim() && isRulingComment(c, policy, evidence))) {
       throw new Error(`${what} is not in the read-back as a human operator's comment (altered, or posted as another account); inspect the thread before retrying`);
     }
-    const d = readRedTeamDisposition({ comments, repo: p.repo, pr: p.pr, head, setting: p.setting, operatorRulings: effectiveScope(p), standingRuling });
+    const d = readRedTeamDisposition({ ...evidence, comments, repo: p.repo, pr: p.pr, head, setting: { ...p.setting, ...(evidence.findingClasses ? { findingClasses: evidence.findingClasses } : {}) }, operatorRulings: effectiveScope(p), standingRuling });
     const still = p.indices.filter((i) => resolveDisposition(i, d.rulings.get(i) ?? []).state === 'held'
       || d.held.some((f) => f.index === i) || d.sendBack.some((f) => f.index === i));
     if (still.length) throw new Error(`${what} was posted but the gate still holds break(s) ${still.map((i) => `#${i}`).join(', ')} `
@@ -421,7 +425,7 @@ export function createRecordRedTeamRulingSinks({ judgeConfirm = defaultJudgeConf
       if (!completion(r, p)) return { ruling: 'card', head: p.head, indices: p.indices, pending: true, released: false, card,
         message: `No validated card completion yet; retry later. If it persists, inspect the landing log for ${session}; recover the owed card and cite its readable --card reference. Do not remove the shared claim.` };
       // Release only with positive child evidence that the card exists or is durably spooled.
-      const record = attributeRuling(p, buildGateComment({ pr: p.pr, head: p.head, outcome: OPERATOR_CARD_OUTCOME, round: null, result: p.resultId,
+      let record = attributeRuling(p, buildGateComment({ pr: p.pr, head: p.head, outcome: OPERATOR_CARD_OUTCOME, round: null, result: p.resultId,
         plan: { sendBack: [], card: p.findings, advisory: [] }, cardResult: card }));
       post(p.repo, p.pr, reasonBody(p, `Follow-up card queued through the prevention landing job (${session}); filing may be paused, in which case it is owed in the spool.`), p.actor);
       // A receipt survives its backing card/spool. Re-read that evidence on every release attempt.
@@ -465,6 +469,19 @@ export function createRecordRedTeamRulingSinks({ judgeConfirm = defaultJudgeConf
         readable = inventoried && (ref ? readable : matched > 0) && backing.every(readableCard);
       } catch { readable = false; }
       if (!readable) throw new Error(`card completion evidence no longer resolves to a readable card or spool; no release record written — inspect the landing log for ${session}; recover the owed card and cite its readable --card reference`);
+      if (p.actor === JUDGE_ACTOR) {
+        // A spool receipt is not a readable card. Name every actual backing reference on the release.
+        const refs = [...new Set([result, ...(r.evidence.backingCards ?? [])].map(backing => {
+          const ref = landingRef(backing);
+          return ref && Number.isInteger(backing.pr) && backing.pr > 0 ? `${ref}@pr${backing.pr}` : ref;
+        }).filter(Boolean))];
+        if (!refs.length || !refs.every(ref => {
+          try { const card = resolveCard(ref, { repo: p.repo, pr: p.pr, head: p.head }); return card?.readable === true && card.ref === ref; }
+          catch { return false; }
+        })) throw new Error('judge card requires a readable backing card; no release record written — recover the owed card and cite its readable --card reference');
+        record = operatorRecord(p, OPERATOR_CARD_OUTCOME, refs.map(ref =>
+          `- ${p.indices.length} finding(s) carded by the operator to \`${ref}\` ${indexList(p)}.`).join('\n'));
+      }
       recheck(p, 'card queued and reason posted; no release record written');
       post(p.repo, p.pr, record, p.actor);
       proveReleased(p, 'the operator-card record', record);

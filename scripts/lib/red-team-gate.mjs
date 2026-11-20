@@ -366,13 +366,15 @@ export function parseRedTeamGateMarker(body) {
 }
 
 /** Every outcome the gate recorded for this head (trusted authors only). PURE. */
-export function gateOutcomesForHead(comments, pr, head) {
+export function gateOutcomesForHead(comments, pr, head, evidence = {}) {
   const live = String(head ?? '').toLowerCase();
   const found = new Set();
   const policy = judgePolicyOnce();
+  const context = evidence.isAncestorOfMain && evidence.cardReadable
+    ? judgeCardReaderContext(comments, pr, head, { ...evidence, policy }) : {};
   for (const c of Array.isArray(comments) ? comments : []) {
     const m = parseRedTeamGateMarker(typeof c === 'string' ? c : c?.body);
-    if (m && m.pr === Number(pr) && m.rev === live && isTrustedMarkerAuthor(c) && (m.actor === undefined || isRulingComment(c, policy))) found.add(m.outcome);
+    if (m && m.pr === Number(pr) && m.rev === live && isTrustedMarkerAuthor(c) && (m.actor === undefined || isRulingComment(c, policy, context))) found.add(m.outcome);
   }
   return found;
 }
@@ -519,18 +521,19 @@ const CLEAR_HUMAN_RULING_RE = /^✅ review — `review:human` cleared via the sa
  * are taken only from before the carried line and must name the head carried to (a chain of carries splits at each
  * link). `at` keeps the thread position and `from` names the head the records were carried from. PURE.
  */
-function threadRecords(comments) {
+function threadRecords(comments, evidence = {}) {
   // Every reader below counts trusted records only, so untrusted comments are dropped before any parse.
   // `at` is the comment's position in the WHOLE thread, so it compares directly with an operator grant's index
   // ({@link roundExtensionGrants}); grant snapshots additionally retain stable identities across thread edits.
   // `ruling` (is this record a ruling a gate reader honours) is decided ONCE per record, with one judge-policy read
   // for the whole pass (#6494 F2); every reader below uses it instead of re-deciding per comment.
-  const policy = judgePolicyOnce();
-  const rec = (c, at, from) => ({ c, at, ...(from !== undefined ? { from } : {}), ruling: isRulingComment(c, policy) });
+  const policy = evidence.policy ?? judgePolicyOnce();
+  const rec = (c, at, from, ruling = isRulingComment(c, policy, evidence)) => ({ c, at, ...(from !== undefined ? { from } : {}), ruling });
   return (Array.isArray(comments) ? comments : []).flatMap((c, at) => {
     if (!isTrustedMarkerAuthor(c)) return [];
     const gate = parseRedTeamGateMarker(c?.body);
-    if (gate?.actor !== undefined && !isRulingComment(c, policy)) return [];
+    const ruling = isRulingComment(c, policy, evidence);
+    if (gate?.actor !== undefined && !ruling) return [];
     const body = typeof c === 'string' ? c : c?.body;
     const lines = typeof body === 'string' ? body.replace(/\r\n/g, '\n').trimStart().split('\n') : [];
     const k = lines.findIndex(line => CARRIED_LINE_RE.test(line));
@@ -541,9 +544,9 @@ function threadRecords(comments) {
     if (!advisory || advisory.rev !== carried.toSha || !lines.slice(0, k).every(line => {
       const gate = parseRedTeamGateMarker(line);
       return gate?.rev === carried.toSha && gate.pr === advisory.pr;
-    })) return [rec(c, at)];
+    })) return [rec(c, at, undefined, ruling)];
     const parts = [...lines.slice(0, k), advisoryBody];
-    return [rec(c, at), ...parts.map(part => rec({ ...c, body: part }, at, carried.fromSha))];
+    return [rec(c, at, undefined, ruling), ...parts.map(part => rec({ ...c, body: part }, at, carried.fromSha))];
   });
 }
 
@@ -551,9 +554,9 @@ const recordBody = r => String((typeof r.c === 'string' ? r.c : r.c?.body) ?? ''
 /** Thread order: creation time, then thread position. A record without a time takes the time of the record before it,
  * so the key is total (a sort never meets a contradiction). PURE. */
 const threadOrder = (a, b) => a.ts - b.ts || a.i - b.i;
-const indexedRecords = comments => {
+const indexedRecords = (comments, evidence) => {
   let ts = 0;
-  return threadRecords(comments).map((r, i) => {
+  return threadRecords(comments, evidence).map((r, i) => {
     const t = Date.parse(commentCreatedAt(r.c)); // GraphQL `createdAt` or raw REST `created_at` (the drain's read)
     if (Number.isFinite(t)) ts = t;
     return { ...r, i, ts };
@@ -613,13 +616,21 @@ function gateRecordsFor(records, pr, sha, hit) {
   });
 }
 
+/** Bind injected card proof to the current trusted result, never to class claims in the ruling. */
+export function judgeCardReaderContext(comments, pr, head, evidence = {}) {
+  const policy = evidence.policy ?? judgePolicyOnce();
+  const hit = latestResult(indexedRecords(comments, { policy }), pr, String(head ?? '').toLowerCase());
+  return { ...evidence, policy, head: String(head ?? '').toLowerCase(), resultId: hit ? redTeamResultId(hit.parsed) : null, findings: hit?.parsed?.findings ?? [],
+    findingClasses: evidence.setting?.findingClasses ?? evidence.findingClasses ?? readFindingClassPolicy({ env: evidence.env }) };
+}
+
 /**
  * The live head's latest red-team result (carried ones included) and the outcomes the gate recorded for THAT result.
  * The gate dedups on this, so a record for an earlier same-head result never stops it deciding a newer one. PURE.
  */
-export function liveResultGateState(comments, pr, head, repo = null, standingRuling = null) {
+export function liveResultGateState(comments, pr, head, repo = null, standingRuling = null, evidence = {}) {
   const live = String(head ?? '').toLowerCase();
-  const records = indexedRecords(comments);
+  const records = indexedRecords(comments, evidence.isAncestorOfMain && evidence.cardReadable ? judgeCardReaderContext(comments, pr, head, evidence) : undefined);
   const hit = latestResult(records, pr, live);
   if (!hit) return { result: null, resultId: null, headReviewIndex: null, outcomes: new Set(), sendBackOutcome: null, reopened: false };
   const gates = gateRecordsFor(records, pr, live, hit);
@@ -726,7 +737,7 @@ const RELEASING_ACTIONS = new Set(['card', 'advisory']);
 const AUTOMATION_RELEASE_OUTCOMES = new Set([GATE_OUTCOMES.SENT_BACK, GATE_OUTCOMES.CARD_QUEUED]);
 
 /** PURE: the action lines of ONE gate record, read only from the block right after its marker (and heading). */
-function gateActionLines(body) {
+export function gateActionLines(body) {
   const lines = String(body ?? '').replace(/\r\n/g, '\n').trimStart().split('\n');
   const found = [];
   let start = 1;
@@ -736,7 +747,7 @@ function gateActionLines(body) {
   if (attribution.test(lines[start] ?? '')) start++;
   for (let i = start; i < lines.length && lines[i].startsWith('- '); i++) {
     const hit = GATE_ACTION_LINES.map(([action, re]) => [action, re.exec(lines[i])]).find(([, m]) => m);
-    if (hit) found.push({ action: hit[0], indices: hit[1][1] ? hit[1][1].split(', ').map(s => Number(s.slice(1))) : [] });
+    if (hit) found.push({ action: hit[0], ...(hit[0] === 'operator-card' ? { cardRef: /to `([^`]+)`/.exec(lines[i])?.[1] } : {}), indices: hit[1][1] ? hit[1][1].split(', ').map(s => Number(s.slice(1))) : [] });
   }
   return found;
 }
@@ -872,23 +883,28 @@ export function redTeamBreaksAgree({ comments, pr, head, breaks } = {}) {
  * re-keyed); the newer head's own records win. Human operator blocks retain gateRecordsFor's binding, including
  * legacy records and carries. Operator card actions never carry: only a direct record on the live head releases
  * its named result. With anyState off, legacy card/advisory records keep their existing binding.
+ * Judge card records require injected `isAncestorOfMain` and `cardReadable` dependencies. Omitted/unreadable
+ * evidence ignores the release. Classification is always taken from the current result and effective class policy.
  * `sealed` (PR #6622): the stored evidence for this exact head ({@link readSealedStatus}); left undefined it is read from
  * the head's persisted status, so no caller reads the flag or the thread on its own. {@link redTeamHoldDecision} turns it
  * into ONE held finding (index 0, which no real finding uses) whenever the stored evidence holds a confirmed break that the
  * posted comment does not show in full: the result is never read as clear while it stands. `legacyHold` forces the same hold.
  */
-export function readRedTeamDisposition({ comments, pr, head, setting, env = process.env, repo = null, standingRuling = null, operatorRulings, legacyHold = false, sealed } = {}) {
+export function readRedTeamDisposition({ comments, pr, head, setting, env = process.env, repo = null, standingRuling = null, operatorRulings, legacyHold = false, sealed, isAncestorOfMain, cardReadable } = {}) {
   const live = String(head ?? '').toLowerCase();
-  const records = indexedRecords(comments);
-  const result = latestResult(records, pr, live)?.parsed ?? null;
   const effectiveSetting = setting ?? readConfirmedBreaks({ env }).value;
   const findingClasses = effectiveSetting.findingClasses ?? readFindingClassPolicy({ env });
+  const evidence = isAncestorOfMain && cardReadable
+    ? judgeCardReaderContext(comments, pr, head, { isAncestorOfMain, cardReadable, findingClasses, env }) : undefined;
+  const records = indexedRecords(comments, evidence);
+  const result = latestResult(records, pr, live)?.parsed ?? null;
   const plan = planRedTeamActions(result, { ...effectiveSetting, findingClasses });
   const anyState = (operatorRulings ?? readOperatorRulings({ env }).value).anyState === true;
   const actions = new Map();
   const classCarded = new Set(); // indices whose recorded automatic card was authorized by class deferral alone
   const rulings = [];
   const ordinaryHolds = new Map();
+  const operatorHolds = new Set(); // authenticated operator-block held lines also retain an explicit hold
   const grants = gateRoundGrants(comments, pr, repo, standingRuling);
   let legacyHeld = false, liveGates = [];
   // Each carry removes its own comment and every later record, so even a cyclic head chain terminates.
@@ -925,6 +941,7 @@ export function readRedTeamDisposition({ comments, pr, head, setting, env = proc
           if (prior.reopened || (!anyState && prior.outcome !== GATE_OUTCOMES.ROUND_CAP)) continue;
         }
         if (action === 'held' && !indices.length) legacyHeld = true;
+        if (block && r.ruling && action === 'held') for (const index of indices) operatorHolds.add(index);
         for (const index of indices) {
           // Operator releases never carry. Any-state releases also require an explicit result binding;
           // the default lets gateRecordsFor bind legacy card/advisory records without result=.
@@ -982,7 +999,7 @@ export function readRedTeamDisposition({ comments, pr, head, setting, env = proc
     dispositions.set(f.index, disposition);
     findingRulings.set(f.index, evidence);
     // Class deferral exempts automatic holds, but cannot release an explicit operator block.
-    if (classDeferred && disposition.state !== 'held') continue;
+    if (classDeferred && disposition.state !== 'held' && !operatorHolds.has(f.index)) continue;
     const effectiveAction = disposition.state === 'held'
       ? outcome === GATE_OUTCOMES.ROUND_CAP ? 'held' : 'send-back'
       : disposition.state === 'open' ? action : null;
@@ -1021,9 +1038,9 @@ export function readRedTeamDisposition({ comments, pr, head, setting, env = proc
  * result (the gate's own card filing too). `record-red-team-ruling` dedups on this (no second card). PURE.
  * @returns {{resultId:(string|null), ruled:Map<number, string[]>, carded:Set<number>, blocked:Set<number>}}
  */
-export function operatorRulingsOnLiveResult(comments, pr, head) {
+export function operatorRulingsOnLiveResult(comments, pr, head, evidence = {}) {
   const live = String(head ?? '').toLowerCase();
-  const records = indexedRecords(comments);
+  const records = indexedRecords(comments, evidence.isAncestorOfMain && evidence.cardReadable ? judgeCardReaderContext(comments, pr, head, evidence) : undefined);
   const hit = latestResult(records, pr, live);
   const ruled = new Map();
   const carded = new Set(), blocked = new Set();
@@ -1042,7 +1059,7 @@ export function operatorRulingsOnLiveResult(comments, pr, head) {
       for (const index of indices) ruled.set(index, [...(ruled.get(index) ?? []), a]);
     }
   }
-  const disposition = readRedTeamDisposition({ comments, pr, head, operatorRulings: { anyState: true } });
+  const disposition = readRedTeamDisposition({ ...evidence, comments, pr, head, operatorRulings: { anyState: true } });
   for (const [index, resolved] of disposition.dispositions) if (resolved.by?.kind === 'block') blocked.add(index);
   return { resultId: id, ruled, carded, blocked };
 }

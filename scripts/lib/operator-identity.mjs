@@ -13,8 +13,10 @@
  *     itself (follow-up hook in `red-team-gate.mjs`); this module's callers apply it today.
  */
 import { spawnSync } from 'node:child_process';
-import { OPERATOR_LOGINS, JUDGE_ACTOR, JUDGE_ATTRIBUTION, JUDGE_RESERVED_TOKEN_RE, isJudgeAuthored, readJudgeActorPolicy } from './marker-authorship.mjs';
-import { parseRedTeamGateMarker } from './red-team-gate.mjs';
+import { OPERATOR_LOGINS, JUDGE_ACTOR, JUDGE_ATTRIBUTION, JUDGE_RESERVED_TOKEN_RE, isJudgeAuthored, readJudgeActorPolicy, isSecurityClass } from './marker-authorship.mjs';
+import { classAction } from './finding-class-policy.mjs';
+import { CARD_REF_RE } from './referral-card-readable.mjs';
+import { parseRedTeamGateMarker, gateActionLines } from './red-team-gate.mjs';
 
 /** Gate-record outcomes only an operator may write. */
 export const OPERATOR_GATE_OUTCOMES = Object.freeze(['operator-card', 'operator-not-real', 'operator-block']);
@@ -56,12 +58,12 @@ export function isHumanOperatorComment(c) {
   return isHuman(login, String(a?.type ?? '')) && a?.is_bot !== true && OPERATOR_LOGINS.includes(login);
 }
 
-/** Drop every `operator-*` gate record that a human operator did not author. All other comments pass. PURE. */
-export function operatorBoundComments(comments, { policy = judgePolicyOnce() } = {}) {
+/** Filter operator records by authorship; judge cards additionally require injected live evidence. */
+export function operatorBoundComments(comments, { policy = judgePolicyOnce(), ...evidence } = {}) {
   return (Array.isArray(comments) ? comments : []).filter((c) => {
     const m = parseRedTeamGateMarker(typeof c === 'string' ? c : c?.body);
-    if (m?.actor !== undefined) return isRulingComment(c, policy);
-    return !(m && OPERATOR_GATE_OUTCOMES.includes(m.outcome)) || isRulingComment(c, policy);
+    if (m?.actor !== undefined) return isRulingComment(c, policy, evidence);
+    return !(m && OPERATOR_GATE_OUTCOMES.includes(m.outcome)) || isRulingComment(c, policy, evidence);
   });
 }
 
@@ -84,19 +86,47 @@ export function assertRulingIdentity(identity, actor) {
   if (!isJudgeAuthored({ author: identity })) throw new Error('judge posting identity must be trusted automation');
   return identity.login;
 }
-/** Judge card releases require a complete, matching pre-existing observation on the record. */
-function hasPreExistingEvidence(body) {
-  const lines = String(body ?? '').split(/\r?\n/).filter(line => line.startsWith('Pre-existing on main'));
+/** Default ancestry dependency for IO callers; missing refs or git failures refuse. No fetch. */
+export function isAncestorOfMain(sha, { run = spawnSync, cwd = process.cwd() } = {}) {
+  if (!/^[0-9a-f]{40}$/i.test(sha ?? '')) return false;
+  try {
+    const r = run('git', ['merge-base', '--is-ancestor', sha, 'origin/main'], {
+      cwd, encoding: 'utf8', timeout: 5000, maxBuffer: 1 << 20, stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    return !r.error && r.status === 0;
+  } catch { return false; }
+}
+
+/** Security is never judge-card eligible, even when policy explicitly permits security deferral. */
+export function judgeCardFindingAllowed(f, findingClasses) {
+  return Boolean(f && findingClasses && typeof findingClasses === 'object' && !Array.isArray(findingClasses) && f.security !== true && f.securityReachableToday !== true
+    && ![f.class, f.findingClass, ...(Array.isArray(f.alsoClasses) ? f.alsoClasses : [])].some(isSecurityClass)
+    && classAction(f, findingClasses) === 'defer-card');
+}
+
+/** Complete live evidence is mandatory. No injected ancestry/card reader means no release. */
+function hasPreExistingEvidence(c, marker, { head, resultId, findings, findingClasses, isAncestorOfMain: ancestor, cardReadable } = {}) {
+  if (marker.rev !== head || (resultId !== undefined && marker.result !== resultId) || !Array.isArray(findings) || !findingClasses
+    || typeof ancestor !== 'function' || typeof cardReadable !== 'function') return false;
+  const body = String(c?.body ?? '');
+  const lines = body.split(/\r?\n/).filter(line => line.startsWith('Pre-existing on main'));
   if (lines.length !== 1) return false;
-  const m = /^Pre-existing on main \([0-9a-f]{40}\): probe (.+); main=(.+) pr=(.+)$/i.exec(lines[0]);
-  return Boolean(m && m[1].trim() && m[2].trim() && m[3].trim() && m[2] === m[3]);
+  const m = /^Pre-existing on main \(([0-9a-f]{40})\): probe (.+); main=(.+) pr=(.+)$/i.exec(lines[0]);
+  if (!m || !m[2].trim() || !m[3].trim() || !m[4].trim() || m[3] !== m[4]) return false;
+  const actions = gateActionLines(body);
+  if (!actions.length || actions.some(a => a.action !== 'operator-card' || !a.indices.length || !CARD_REF_RE.test(a.cardRef ?? '')))
+    return false;
+  try {
+    return ancestor(m[1]) === true && actions.every(a => cardReadable(a.cardRef) === true
+      && a.indices.every(index => judgeCardFindingAllowed(findings.find(f => f.index === index), findingClasses)));
+  } catch { return false; }
 }
 
 /** Judge holds and evidenced card releases require attribution, trusted authorship and live policy. */
-export function isRulingComment(c, policy = judgePolicyOnce()) {
+export function isRulingComment(c, policy = judgePolicyOnce(), evidence = {}) {
   const m = parseRedTeamGateMarker(c?.body);
   if (m?.actor === undefined) return isHumanOperatorComment(c);
-  if (m.actor !== JUDGE_ACTOR || !(m.outcome === 'operator-block' || (m.outcome === 'operator-card' && hasPreExistingEvidence(c?.body))) || !isJudgeAuthored(c)
+  if (m.actor !== JUDGE_ACTOR || !(m.outcome === 'operator-block' || (m.outcome === 'operator-card' && hasPreExistingEvidence(c, m, evidence))) || !isJudgeAuthored(c)
     || JUDGE_RESERVED_TOKEN_RE.test(String(c?.body ?? ''))
     || !String(c?.body ?? '').split(/\r?\n/).some(line => line === JUDGE_ATTRIBUTION || line === `${JUDGE_ATTRIBUTION} (${JUDGE_ACTOR})`)) return false;
   try { const p = policy(); return p.enabled === true && p.actor === JUDGE_ACTOR; }
