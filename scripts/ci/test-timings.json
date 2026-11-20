@@ -614,6 +614,7 @@
   "scripts/conveyor/__tests__/reconcile-fix-dispatch-deferred.test.mjs": 0.04,
   "scripts/conveyor/__tests__/reconcile-fix-dispatch-main-fix-cap.test.mjs": 0.18,
   "scripts/conveyor/__tests__/reconcile-fix-dispatch-operator-send-back.test.mjs": 0.02,
+  "scripts/conveyor/__tests__/reconcile-fix-dispatch-planning-deadline.test.mjs": 0.05,
   "scripts/conveyor/__tests__/reconcile-fix-dispatch-step-timing.test.mjs": 0.04,
   "scripts/conveyor/__tests__/reconcile-fix-dispatch.test.mjs": 1.87,
   "scripts/conveyor/__tests__/reconcile-note-comment.test.mjs": 0.05,
@@ -1969,6 +1970,7 @@
   "wrapper-conformance/__tests__/runner.test.ts": 0.01
  },
  "soak": {
+  "scripts/conveyor/soak/breaks/catch-up-clean-first-snapshot-first.soak.test.mjs": 4.65,
   "scripts/conveyor/soak/breaks/rebuild-job-ready-candidate-starvation.soak.test.mjs": 2,
   "scripts/conveyor/soak/breaks/run-store-stray-entry.soak.test.mjs": 2,
   "scripts/conveyor/soak/breaks/red-team-queue-stale-eviction.soak.test.mjs": 4.12,
@@ -2000,6 +2002,7 @@
   "scripts/conveyor/soak/breaks/review-hold-only-incomplete-inventory.soak.test.mjs": 1,
   "scripts/conveyor/soak/breaks/clone-object-maintenance-borrowed-or-busy.soak.test.mjs": 0.79,
   "scripts/conveyor/soak/breaks/red-team-label-deadlock.soak.test.mjs": 2.53,
+  "scripts/conveyor/soak/breaks/fix-dispatch-plan-eats-budget.soak.test.mjs": 1,
   "scripts/conveyor/soak/breaks/stall-sweep-informational-refusal.soak.test.mjs": 2,
   "scripts/conveyor/soak/breaks/overlay-main-sync-unrunnable-selection.soak.test.mjs": 1,
   "scripts/conveyor/soak/breaks/review-pr-list-504-reads-zero-owed.soak.test.mjs": 3.02,
