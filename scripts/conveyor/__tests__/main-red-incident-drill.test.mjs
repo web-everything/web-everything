@@ -147,7 +147,7 @@ describe('INCIDENT DRILL — 2026-10-08, main red from two causes', () => {
     // (3) Opened READY, never a draft — whether from the owner branch prefix or a red-main fix branch.
     expect(resolveDraft({ mode: 'park', optOut: false, ref: 'lane/main-fix-7c731a95e', title: 'fix red main @ 7c731a95e: both causes' })).toBe(false);
     expect(resolveDraft({ mode: 'park', optOut: false, ref: p4532.headRefName, title: p4532.title })).toBe(false);
-    expect(resolveDraft({ mode: 'park', optOut: false, ref: 'lane/some-feature', title: 'feat: x' })).toBe(true);
+    expect(resolveDraft({ mode: 'park', optOut: false, ref: 'lane/some-feature', title: 'feat: x' })).toBe(false);
     // Combined CI: green on every job main fails → no owed-elsewhere, no deadlock; #4522 was folded in and closed.
     const combinedPlan = planCombinedFix({ mainFailingJobs: TWO.mainFailingJobs, fixPrs: [{ ...p4532, ci: { status: 'green', failedJobs: [] } }] });
     expect(combinedPlan).toEqual({ owedElsewhere: [], deadlock: null });

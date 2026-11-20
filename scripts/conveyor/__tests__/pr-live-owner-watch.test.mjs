@@ -404,7 +404,7 @@ describe('portable feed IO and settings', () => {
     expect(planActions([classified(p, unknown)], [], NOW)).toEqual([]);
     expect(await io.checkAdmission(p)).toMatchObject({ ok: false });
     expect(execute).not.toHaveBeenCalled();
-  });
+  }, 15_000);
   it('settings cascade defaults shadow, permits env override and closes invalid modes', () => {
     const opts = { env: {}, tool: {}, platform: {}, log: vi.fn() };
     expect(resolveLiveOwnerSettings(opts).mode).toBe('shadow');

@@ -4916,7 +4916,7 @@ it('admits PR 7106 workflow-edit protection on review:pending without a ci-heal'
       { name: 'test', status: 'COMPLETED', conclusion: 'SUCCESS' }] })], {
     repo: 'owner/repo', mergeGateSetting: 'on',
     readMergeGateVerdict: args => readMergeGateVerdict({ ...args, cache: new Map(),
-      runGh: argv => argv[1].endsWith('/logs') ? evidence.log : JSON.stringify(evidence.job) }),
+      runGh: argv => argv.at(-1).endsWith('/logs') ? evidence.log : JSON.stringify(evidence.job) }),
   });
   const plan = planReconcile({ prs, requiredChecks: ['test', 'merge-gate'], now: NOW, agents: [],
     advisoryReviewOnHumanHandoff: 'on' });
