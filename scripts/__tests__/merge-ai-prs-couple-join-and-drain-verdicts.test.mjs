@@ -32,7 +32,7 @@ describe('merge-ai-prs — #xc7p3q9: couple-join decoupled from the ready-to-mer
   const green = [{ name: 'test', conclusion: 'SUCCESS' }];
   // a landable AI PR object shaped exactly as `gh pr list --json …` returns it (classifyPr rules it 'merge')
   const ghPr = (number, headRefName, { labels = [] } = {}) =>
-    ({ number, title: 't', body: 'what changed and why', headRefName, statusCheckRollup: green, mergeable: 'MERGEABLE', mergeStateStatus: 'UNSTABLE', labels });
+    ({ baseRefName: 'main', number, title: 't', body: 'what changed and why', headRefName, statusCheckRollup: green, mergeable: 'MERGEABLE', mergeStateStatus: 'UNSTABLE', labels });
 
   // The label/only-BLIND openPrContext (constellation-wide, as collectOpenPrContext produces over CONTEXT_REPOS)
   // holding ONE WE carrier — present here regardless of how the candidate sweep was narrowed. It is built through
@@ -63,7 +63,7 @@ describe('merge-ai-prs — #xc7p3q9: couple-join decoupled from the ready-to-mer
   // itself calls (B12). Returns { verdicts, plan } so a test can assert the DISCRIMINATING per-verdict fields
   // (coupleDeferReason / joinedToCouple / coupleCarrier), not just the ready/deferred number arrays.
   const drivePlan = ({ listings, REPOS, onlyPr = null, onlyRepo = null, openPrContext, reads, escalationRelief = { prs: [], passWide: false }, label = 'ready-to-merge' }) =>
-    planDrainPass({
+    planDrainPass({ defaultBranchOf: () => 'main',
       listings,
       openPrContext,
       repos: REPOS,
@@ -484,7 +484,7 @@ describe('merge-ai-prs — #xc7p3q9: couple-join decoupled from the ready-to-mer
     ]);
     const listings = implRepo === FUI ? [{ repo: FUI, prs: [P, I] }] : [{ repo: FUI, prs: [P] }, { repo: implRepo, prs: [I] }];
     const openPrContext = reduceOpenPrContext({ listings, reads, reconcileRan: true });
-    return planDrainPass({ listings, openPrContext, repos: implRepo === FUI ? [FUI] : [FUI, implRepo], readOf: (repo, num) => reads.get(`${repo || 'cwd'}::${num}`), requiredCheck: 'test', label: 'ready-to-merge', isLocalRepo, localSlug });
+    return planDrainPass({ defaultBranchOf: () => 'main', listings, openPrContext, repos: implRepo === FUI ? [FUI] : [FUI, implRepo], readOf: (repo, num) => reads.get(`${repo || 'cwd'}::${num}`), requiredCheck: 'test', label: 'ready-to-merge', isLocalRepo, localSlug });
   };
 
   it('card xvnrvsv — a manifest-less impl half in the SAME repo as a malformed-manifest carrier is held (end to end)', () => {
@@ -515,7 +515,7 @@ describe('merge-ai-prs — #xc7p3q9: couple-join decoupled from the ready-to-mer
     ]);
     const candReads = new Map([['cwd::77', { manifest: carrierManifest, commits: [claude, claude] }], [`${FUI}::55`, { manifest: null, commits: [claude, claude] }]]);
     const openPrContext = reduceOpenPrContext({ listings, reads: ctxReads, reconcileRan: true });
-    const res = planDrainPass({ listings, openPrContext, repos: [null, FUI], readOf: (repo, num) => candReads.get(`${repo || 'cwd'}::${num}`), requiredCheck: 'test', label: 'ready-to-merge', isLocalRepo, localSlug });
+    const res = planDrainPass({ defaultBranchOf: () => 'main', listings, openPrContext, repos: [null, FUI], readOf: (repo, num) => candReads.get(`${repo || 'cwd'}::${num}`), requiredCheck: 'test', label: 'ready-to-merge', isLocalRepo, localSlug });
     const impl = res.verdicts.find((v) => v.num === 55);
     expect(impl.joinedToCouple).toBe('xcarr01');
     expect(impl.coupleDefer).toBe(true);                                      // NOT 'absent-landed'
@@ -558,7 +558,7 @@ describe('merge-ai-prs — #xc7p3q9: couple-join decoupled from the ready-to-mer
     const listings = [{ repo: null, prs: [D] }, { repo: FUI, prs: [A] }, { repo: OTHER, prs: [B] }];
     const openPrContext = reduceOpenPrContext({ listings, reads, reconcileRan: true });
     expect(openPrContext.contextComplete).toBe(true);
-    const { plan } = planDrainPass({ listings, openPrContext, repos: [null, FUI, OTHER], readOf: (repo, num) => reads.get(`${repo || 'cwd'}::${num}`), requiredCheck: 'test', label: 'ready-to-merge', isLocalRepo, localSlug, strictAbsentHashDependencies: true });
+    const { plan } = planDrainPass({ defaultBranchOf: () => 'main', listings, openPrContext, repos: [null, FUI, OTHER], readOf: (repo, num) => reads.get(`${repo || 'cwd'}::${num}`), requiredCheck: 'test', label: 'ready-to-merge', isLocalRepo, localSlug, strictAbsentHashDependencies: true });
     expect(plan.ready).toEqual([]);
     const waits = new Map(plan.deferred.map((d) => [d.num, d.waitOn]));
     expect(waits.get(61)).toContain('malformed-manifest');
@@ -612,7 +612,7 @@ describe('merge-ai-prs — #xc7p3q9: couple-join decoupled from the ready-to-mer
     const A = ghPr(61, 'lane/a-fui', { labels: ['ready-to-merge'] });
     const spy = vi.spyOn(console, 'error').mockImplementation(() => {});
     try {
-      const vs = buildDrainVerdicts({ prsByRepo: new Map([[FUI, [A]]]), repos: [FUI], readOf: () => ({ manifest: null, commits: [], malformed: true }), isLocalRepo });
+      const vs = buildDrainVerdicts({ defaultBranchOf: () => 'main', prsByRepo: new Map([[FUI, [A]]]), repos: [FUI], readOf: () => ({ manifest: null, commits: [], malformed: true }), isLocalRepo });
       expect(vs[0].readMalformed).toBe(true);
       const lines = spy.mock.calls.map((c) => String(c[0]));
       expect(lines.some((l) => l.includes('#61') && l.includes(FUI) && l.includes('malformed'))).toBe(true);
@@ -706,7 +706,7 @@ describe('merge-ai-prs — #3004 coupleIncomplete: a half-landed couple no longe
   const isLocalRepo = (repo) => repo == null || repo === localSlug;
   const green = [{ name: 'test', conclusion: 'SUCCESS' }];
   const ghPr = (number, headRefName, labels = []) =>
-    ({ number, title: 't', body: 'what changed and why', headRefName, statusCheckRollup: green, mergeable: 'MERGEABLE', mergeStateStatus: 'UNSTABLE', labels });
+    ({ baseRefName: 'main', number, title: 't', body: 'what changed and why', headRefName, statusCheckRollup: green, mergeable: 'MERGEABLE', mergeStateStatus: 'UNSTABLE', labels });
 
   // ── the couple under test ──────────────────────────────────────────────────────────────────────────────────
   // item 100 is a cross-repo couple: impl #55 (frontierui, manifest-less, joined) + WE carrier #77 (the resolve
@@ -975,14 +975,14 @@ describe('merge-ai-prs — #2502 headSha real-value wiring (buildDrainVerdicts -
   // just the always-null shape every other deferred assertion in this file happens to exercise.
   const green = [{ name: 'test', conclusion: 'SUCCESS' }];
   const ghPr = (number, headRefName, labels = []) =>
-    ({ number, title: 't', body: 'a real summary', headRefName, statusCheckRollup: green, mergeable: 'MERGEABLE', mergeStateStatus: 'CLEAN', labels: labels.map((name) => ({ name })) });
+    ({ baseRefName: 'main', number, title: 't', body: 'a real summary', headRefName, statusCheckRollup: green, mergeable: 'MERGEABLE', mergeStateStatus: 'CLEAN', labels: labels.map((name) => ({ name })) });
 
   it('a blockedBy defer carries the REAL tip SHA (not null) through the production buildDrainVerdicts -> planLabelDrain path', () => {
     const pr = ghPr(30, 'lane/b-we', ['ready-to-merge']);
     const prsByRepo = new Map([[null, [pr]]]);
     const manifest = { item: 101, blockedBy: [100], repos: [], stackParents: [] };
     const readOf = () => ({ commits: [{ oid: 'sha-real-30' }], manifest });
-    const verdicts = buildDrainVerdicts({ prsByRepo, readOf, repos: [null] });
+    const verdicts = buildDrainVerdicts({ defaultBranchOf: () => 'main', prsByRepo, readOf, repos: [null] });
     expect(verdicts[0].headSha).toBe('sha-real-30'); // buildDrainVerdicts itself attaches the real value
     const plan = planLabelDrain(verdicts, { extraOpenItems: new Set([100]) });
     expect(plan.ready).toEqual([]);
@@ -993,7 +993,7 @@ describe('merge-ai-prs — #2502 headSha real-value wiring (buildDrainVerdicts -
     const pr = ghPr(31, 'lane/c-we', ['ready-to-merge']);
     const prsByRepo = new Map([[null, [pr]]]);
     const readOf = () => ({ commits: [], manifest: null });
-    const verdicts = buildDrainVerdicts({ prsByRepo, readOf, repos: [null] });
+    const verdicts = buildDrainVerdicts({ defaultBranchOf: () => 'main', prsByRepo, readOf, repos: [null] });
     expect(verdicts[0].headSha).toBeNull();
   });
 
@@ -1006,7 +1006,7 @@ describe('merge-ai-prs — #2502 headSha real-value wiring (buildDrainVerdicts -
     ];
     for (const commits of cases) {
       const pr = ghPr(31, 'lane/c-we', ['ready-to-merge']);
-      const verdicts = buildDrainVerdicts({ prsByRepo: new Map([[null, [pr]]]), readOf: () => ({ commits, manifest: null }), repos: [null] });
+      const verdicts = buildDrainVerdicts({ defaultBranchOf: () => 'main', prsByRepo: new Map([[null, [pr]]]), readOf: () => ({ commits, manifest: null }), repos: [null] });
       expect(verdicts[0].headSha, `commits=${JSON.stringify(commits)}`).toBeNull();
     }
   });
@@ -1016,7 +1016,7 @@ describe('merge-ai-prs — #2502 headSha real-value wiring (buildDrainVerdicts -
     const prsByRepo = new Map([[null, [pr]]]);
     // three commits, oldest-first (the real gh ordering) — the tip is the LAST one, sha-c, never sha-a.
     const readOf = () => ({ commits: [{ oid: 'sha-a' }, { oid: 'sha-b' }, { oid: 'sha-c' }], manifest: null });
-    const verdicts = buildDrainVerdicts({ prsByRepo, readOf, repos: [null] });
+    const verdicts = buildDrainVerdicts({ defaultBranchOf: () => 'main', prsByRepo, readOf, repos: [null] });
     expect(verdicts[0].headSha).toBe('sha-c');
   });
 });

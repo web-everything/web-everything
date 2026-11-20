@@ -140,7 +140,7 @@ describe('decideDrainReviewGate — a listing is trusted only with explicit comp
 // Wiring: the production listing (buildDrainVerdicts) carries the strict evidence the gate now requires, so a
 // real, complete listing at the live head is still trusted (no extra git read) and the drain callers pass it on.
 describe('decideDrainReviewGate — production wiring', () => {
-  const verdictFor = (files) => buildDrainVerdicts({ prsByRepo: new Map([[REPO, [{ number: 6021, headRefOid: HEAD,
+  const verdictFor = (files) => buildDrainVerdicts({ defaultBranchOf: () => 'main', prsByRepo: new Map([[REPO, [{ number: 6021, headRefOid: HEAD,
     labels: ['ready-to-merge', 'review:accepted'], files }]]]), repos: [REPO], readOf: () => ({}) })[0];
   it('a complete listing from buildDrainVerdicts carries filesComplete === true and the live head', () => {
     const v = verdictFor(PLAIN);
