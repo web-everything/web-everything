@@ -516,7 +516,7 @@ describe('urgent-verify blocker fixes', () => {
 
 // Isolation: urgent-verify runs in its own detached worktree (real temp git repos, doubles only for the steps).
 import { afterAll } from 'vitest';
-import { mkdtempSync, mkdirSync, writeFileSync, readdirSync, existsSync, realpathSync, rmSync, chmodSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, writeFileSync, readdirSync, existsSync, realpathSync, rmSync, chmodSync, symlinkSync } from 'node:fs';
 import { dirname } from 'node:path';
 import { spawnSync as spawnSyncReal } from 'node:child_process';
 const tempParents = []; // os.tmpdir() is the hermetic per-run root; still remove what we make (tmp-leak budget)
@@ -592,6 +592,54 @@ describe('urgent-verify isolated worktree', () => {
     const r = await urgentVerify({ sha: t.head }, deps);
     expect(r).toMatchObject({ ok: false, detail: expect.stringMatching(/required system tool "git" not found.*refusing/) });
     expect(leftovers(t.parent)).toEqual([]);
+  });
+  it.each([
+    ['git', 'non-executable file'], ['node', 'non-executable file'],
+    ['npm', 'non-executable file'], ['sh', 'non-executable file'],
+    ['npm', 'directory'], ['npm', 'broken symlink'], ['npm', 'non-executable symlink target'],
+  ])('refuses system %s that is a %s before any checkout replacement can execute', async (tool, kind) => {
+    const parent = mkdtempSync(pjoin(tmpdir(), 'uv-tool-'));
+    tempParents.push(parent);
+    const repo = pjoin(parent, 'repo'), systemBin = pjoin(parent, 'system-bin');
+    const checkoutBin = pjoin(repo, 'node_modules/.bin'), executed = pjoin(parent, 'replacement-executed');
+    mkdirSync(systemBin); mkdirSync(checkoutBin, { recursive: true });
+    for (const name of ['git', 'node', 'npm', 'sh']) {
+      if (name !== tool) writeFileSync(pjoin(systemBin, name), '#!/bin/sh\nexit 99\n', { mode: 0o755 });
+    }
+    const candidate = pjoin(systemBin, tool);
+    if (kind === 'directory') mkdirSync(candidate);
+    else if (kind.includes('symlink')) {
+      const target = pjoin(parent, 'target');
+      if (kind === 'non-executable symlink target') writeFileSync(target, '#!/bin/sh\n', { mode: 0o644 });
+      symlinkSync(target, candidate);
+    } else writeFileSync(candidate, '#!/bin/sh\n', { mode: 0o644 });
+    writeFileSync(pjoin(checkoutBin, tool), '#!/bin/sh\nprintf executed > ../replacement-executed\n', { mode: 0o755 });
+    const spawnSync = vi.fn(spawnSyncReal);
+    const deps = createUrgentDeps({ isolated: true, cwd: repo, home: pjoin(parent, 'home'),
+      env: { PATH: systemBin }, spawnSync });
+    const result = await urgentVerify({ sha }, deps);
+    expect(result).toMatchObject({ ok: false, detail: expect.stringContaining(`required system tool "${tool}" not found`) });
+    expect(result.detail).toContain('refusing to fall back to checkout node_modules/.bin');
+    expect(result.marker).toBeUndefined();
+    expect(spawnSync).not.toHaveBeenCalled();
+    expect(existsSync(executed)).toBe(false);
+    expect(leftovers(parent)).toEqual([]);
+  });
+  it('accepts executable symlinks and continues past a non-executable PATH candidate', () => {
+    const parent = mkdtempSync(pjoin(tmpdir(), 'uv-tool-'));
+    tempParents.push(parent);
+    const first = pjoin(parent, 'first'), second = pjoin(parent, 'second');
+    mkdirSync(first); mkdirSync(second);
+    writeFileSync(pjoin(first, 'npm'), '#!/bin/sh\n', { mode: 0o644 });
+    const target = pjoin(parent, 'executable');
+    writeFileSync(target, '#!/bin/sh\n', { mode: 0o755 });
+    for (const tool of ['git', 'node', 'npm', 'sh']) symlinkSync(target, pjoin(second, tool));
+    const spawnSync = vi.fn(() => ({ status: 99, stderr: 'preflight passed' }));
+    const deps = createUrgentDeps({ isolated: true, cwd: pjoin(parent, 'repo'),
+      env: { PATH: [first, second].join(':') }, spawnSync });
+    expect(() => deps.isolate(sha)).toThrow(/subprocess failed.*exit 99/);
+    expect(spawnSync).toHaveBeenCalledTimes(1);
+    expect(spawnSync).toHaveBeenCalledWith('git', ['remote', 'get-url', 'origin'], expect.any(Object));
   });
   it('a dirty caller checkout before the run does not matter either', async () => {
     const t = tempRepo(); writeFileSync(pjoin(t.repo, 'dirt.md'), 'x'); writeFileSync(pjoin(t.repo, 'a.txt'), 'changed');

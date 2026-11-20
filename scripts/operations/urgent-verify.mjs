@@ -53,9 +53,16 @@ export function createUrgentDeps({ cwd = process.cwd(), home = homedir(), fs = r
   // repo tests (and the hermetic guard) treat as live lane access. Sibling of the caller so ../frontierui resolves.
   const isolate = isolated ? sha => {
     // No fallback to checkout bins: the admission wrapper's PATH ends with them, so a missing system tool
-    // would silently resolve to a checkout-supplied replacement. Refuse up front instead.
+    // or non-executable system tool would silently resolve to a checkout-supplied replacement. Refuse up front instead.
     for (const tool of ['git', 'node', 'npm', 'sh']) {
-      if (!systemPath.split(delimiter).some(d => d && fs.existsSync(join(d, tool))))
+      if (!systemPath.split(delimiter).some(d => {
+        if (!d) return false;
+        try {
+          const candidate = join(d, tool);
+          fs.accessSync(candidate, realFs.constants.X_OK);
+          return fs.statSync(candidate).isFile();
+        } catch { return false; }
+      }))
         throw new Error(`required system tool "${tool}" not found on the system PATH; refusing to fall back to checkout node_modules/.bin`);
     }
     const parent = dirname(cwd);
