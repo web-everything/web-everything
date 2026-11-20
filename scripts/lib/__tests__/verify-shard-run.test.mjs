@@ -13,7 +13,39 @@ import { keepAliveScript } from '../test-keepalive.mjs';
 import { pidIdentity } from '../pid-alive.mjs';
 import { createFailureCollector } from '../verify-failures.mjs';
 import { verifyFinishBody } from '../lane-verify.mjs';
-import { splitVitestArgs, runShards, executeShard, inventoryVerdict, parseShardCli, streamedInventory, SHARD_REPORT_MAX_BYTES, SHARD_UNSETTLED_EXIT } from '../verify-shard-run.mjs';
+import { acquireLocalDefault, splitVitestArgs, runShards, executeShard, inventoryVerdict, parseShardCli, streamedInventory, SHARD_REPORT_MAX_BYTES, SHARD_UNSETTLED_EXIT } from '../verify-shard-run.mjs';
+
+describe('acquireLocalDefault fallback logging', () => {
+  const input = { cwd: process.cwd(), env: { LANE_POOL_ROOT: resolve(tmpdir(), 'shard-fallback-fixture') }, remainingMs: 1000 };
+  it('logs exactly one row after acquiring a local vitest slot', async () => {
+    const rows = [];
+    let acquired = false;
+    const result = await acquireLocalDefault(input, {
+      acquireSlotBlocking: async () => { acquired = true; return { ok: true }; },
+      recordLocalSlotFallback: row => { expect(acquired).toBe(true); rows.push(row); },
+    });
+    expect(result.ok).toBe(true);
+    expect(rows).toEqual([{ lockRoot: result.options.lockRoot, reason: 'unlogged-path:verify-shard-run',
+      detail: 'shard vitest takes a local slot', repo: input.cwd, kind: 'vitest' }]);
+  });
+  it('a throwing logger does not change the acquire result', async () => {
+    const acquired = { ok: true, waitedMs: 7 };
+    const result = await acquireLocalDefault(input, {
+      acquireSlotBlocking: async () => acquired,
+      recordLocalSlotFallback: () => { throw Error('log unavailable'); },
+    });
+    expect(result).toEqual({ ...acquired, options: expect.any(Object) });
+  });
+  it('does not log a local slot when admission is refused', async () => {
+    const rows = [];
+    const result = await acquireLocalDefault(input, {
+      acquireSlotBlocking: async () => ({ ok: false }),
+      recordLocalSlotFallback: row => rows.push(row),
+    });
+    expect(result.ok).toBe(false);
+    expect(rows).toEqual([]);
+  });
+});
 
 describe('shard split', () => {
   it('balances deterministically, covers files once, and preserves flags including values', () => {

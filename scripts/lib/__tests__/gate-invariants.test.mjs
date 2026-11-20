@@ -312,7 +312,7 @@ describe('INVARIANT 3 — a failed required check is never mergeable', () => {
     }
   });
   it('classifyPr: a not-green required check ⇒ decision "skip" (never "merge"), across other signals', () => {
-    const base = {
+    const base = { baseRefName: 'main',
       number: 7,
       title: 'x',
       body: 'a real non-empty body',
@@ -322,7 +322,7 @@ describe('INVARIANT 3 — a failed required check is never mergeable', () => {
       statusCheckRollup: [{ name: 'test', conclusion: 'FAILURE', status: 'COMPLETED' }],
     };
     // even fully certified + clean + mergeable + bodied, a red required check must skip
-    const v = classifyPr(base);
+    const v = classifyPr(base, { defaultBranch: 'main' });
     expect(v.decision).toBe('skip');
     expect(v.decision).not.toBe('merge');
   });
@@ -469,12 +469,12 @@ describe('INVARIANT 8 — an empty PR body never lands', () => {
     expect(hasNonEmptyBody('real content')).toBe(true);
   });
   it('classifyPr skips an otherwise-perfect PR with an empty body', () => {
-    const v = classifyPr({
+    const v = classifyPr({ baseRefName: 'main',
       number: 9, title: 'x', body: '   ',
       mergeStateStatus: 'CLEAN', mergeable: 'MERGEABLE',
       labels: [{ name: 'ready-to-merge' }],
       statusCheckRollup: [{ name: 'test', conclusion: 'SUCCESS', status: 'COMPLETED' }],
-    });
+    }, { defaultBranch: 'main' });
     expect(v.decision).toBe('skip');
   });
 });

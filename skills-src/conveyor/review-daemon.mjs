@@ -82,6 +82,7 @@ import { fileURLToPath } from 'node:url';
 import { execFileSync } from 'node:child_process';
 import { hostname } from 'node:os';
 import { runReconcilePass, defaultReadPrs, defaultReadAgents, isConflictingPr } from '../../scripts/conveyor/reconcile-pass.mjs';
+import { PrListUnreadableError } from '../../scripts/lib/pr-list-paged.mjs';
 import { promoteDraftsThenReplan, promoteDraftsGuarded, rearmStaleAcceptanceGuarded, rearmStaleAcceptsThenReplan } from '../../scripts/conveyor/review-tick-promote.mjs'; // card xemxk3h
 import { notifyReferralHold } from '../../scripts/conveyor/review-referral-hold.mjs';
 // card x29vm8a — a scope-bloated PR (stale base) is refreshed onto main through the SAME mechanical path the ci-red
@@ -389,6 +390,7 @@ export function runReviewTick({
   reconcile = runReconcilePass,
   dispatch = dispatchReviewByMode,
   redTeamOnSkip = null,
+  redTeamPartialInventory = null,
   reconcileRedTeamQueue = null,
   tagRound = tagReviewRound,
   tagStatus = tagReviewStatus,
@@ -462,9 +464,7 @@ export function runReviewTick({
   // over the whole repo, not scoped to whatever this tick's discovery found owed, so a `reconcile` failure
   // below must never suppress it. Isolated in its own try/catch, same "one bad entry never aborts the rest"
   // discipline as every other step in this tick — a `gh` hiccup here must not cost a review dispatch.
-  // Maintenance also runs on paused ticks and before any reconcile/read failure can return early.
-  try { reconcileRedTeamQueue?.({ repo }); }
-  catch (e) { log(`review-daemon: red-team queue reconciliation failed: ${String(e?.message ?? e)}`); }
+  // Maintenance also runs on paused ticks; discovery must first establish whether membership may change.
   const sharedReads = typeof readPrs === 'function' && typeof readAgents === 'function';
   let rawPrs = null;
   let rawPrsError = null;
@@ -472,6 +472,10 @@ export function runReviewTick({
   if (sharedReads) {
     try { rawPrs = readPrs({ repo }); } catch (e) { rawPrsError = e; rawPrsFailed = true; }
   }
+  // Never mutate queue membership using an incomplete inventory.
+  const inventoryComplete = !rawPrsFailed && (!sharedReads || Array.isArray(rawPrs));
+  try { reconcileRedTeamQueue?.({ repo, ...(!inventoryComplete ? { inventoryComplete: false } : {}) }); }
+  catch (e) { log(`review-daemon: red-team queue reconciliation failed: ${String(e?.message ?? e)}`); }
   let holdReconcileResults = [];
   let holdReconcileError = null;
   try {
@@ -515,10 +519,21 @@ export function runReviewTick({
     // never "0 owed". Surface it on the reconcile-failed channel (tick line flags it) so the tick retries visibly.
     if (plan?.deferred === true) throw new Error(`open-PR read deferred — owed unknown this tick: ${String(plan.message ?? plan.reason ?? 'deferred').split('\n')[0]}`);
   } catch (e) {
+    let recovery;
+    const partialInventory = rawPrsError?.code === 'pr-list-truncated'
+      || (rawPrsError instanceof PrListUnreadableError && rawPrsError.stage === 'page' && rawPrsError.page === 'inventory');
+    if (!paused && rawPrsFailed && partialInventory
+      && typeof redTeamPartialInventory === 'function') {
+      try {
+        recovery = redTeamPartialInventory({ repo, reconcile, readAgents, defaultBranch,
+          hostAdmission, recoveryAcquirableLanes, liveReviewBudget });
+      } catch (error) { log(`review-daemon: ${repo} partial-inventory recovery failed: ${String(error?.message ?? error)}`); }
+    }
     return {
       reviewsOwed: 0, dispatched: [], failed: [], refusals: 0, deferredForLanes: 0,
       reconcileError: describeReconcileError(e), staleStatusSwept: [], staleConflictStatusCleared: [],
       holdReconcile: holdReconcileResults, holdReconcileError,
+      ...(recovery !== undefined ? { redTeamOnSkip: recovery } : {}),
     };
   }
   // Refresh stale status labels (including legacy status:awaiting-base) before promotion/dispatch
@@ -1484,19 +1499,47 @@ export function cliReviewTickOpts({ log = console, factCache = null, listCommand
     }
     return livePrs.get(key);
   };
-  return {
+  const options = {
     log: line => log.error(line),
     acquirableLanes: defaultAcquirableLaneNumbers, recoveryAcquirableLanes: defaultRecoveryLaneNumbers,
     readPrs: factCache ? opts => defaultReadPrs({ ...opts, factCache }) : defaultReadPrs, readAgents: defaultReadAgents,
     hostAdmission: defaultReviewHostAdmission,
     // `listCommands` is a test seam: the default lists the host's real processes (`ps`), which a hermetic test must not.
     liveReviewBudget: liveReviewRoundBudget(listCommands ? { listCommands } : {}),
-    reconcileRedTeamQueue: () => {
+    reconcileRedTeamQueue: ({ inventoryComplete = true } = {}) => {
       livePrs.clear();
       if (['off', '0', 'false', 'no'].includes(String(process.env.WE_RED_TEAM_DISPATCH_QUEUE ?? '').trim().toLowerCase())) return;
       redTeamDispatchQueue ??= createRedTeamDispatchQueue({ log: line => log.error(line) });
+      if (!inventoryComplete) return;
       // Maintenance evicts terminal PRs and re-keys changed live heads.
       redTeamDispatchQueue.reconcile({ readLivePr: readQueuePr });
+    },
+    redTeamPartialInventory: ({ repo, reconcile, readAgents, defaultBranch, hostAdmission,
+      recoveryAcquirableLanes, liveReviewBudget }) => {
+      if (['off', '0', 'false', 'no'].includes(String(process.env.WE_RED_TEAM_DISPATCH_QUEUE ?? '').trim().toLowerCase())) return;
+      redTeamDispatchQueue ??= createRedTeamDispatchQueue({ log: line => log.error(line) });
+      const rawPrs = redTeamDispatchQueue.confirmedBlocked({ repo, readLivePr: readQueuePr });
+      if (!rawPrs.length) return;
+      // Use the normal planner, including its draft/hold/accepted-head guards.
+      const plan = reconcile({ repo, defaultBranch, readPrs: () => rawPrs, readAgents });
+      if (plan?.deferred) return;
+      const refusals = (plan.refusals ?? []).map(row => row.kind === 'nothing-owed' && row.phase === 'queued'
+        ? { ...row, kind: 'already-reviewed-head', headSha: row.headRefOid } : row)
+        .filter(row => row.kind === 'already-reviewed-head'
+          && rawPrs.some(pr => pr.number === Number(row.prNumber) && pr.headRefOid === row.headSha));
+      let host, lanes = 0;
+      try { host = hostAdmission(); } catch { /* Unknown host evidence allows no starts. */ }
+      try {
+        const available = recoveryAcquirableLanes({ repo });
+        lanes = Array.isArray(available) ? available.length : available;
+      } catch { /* Unknown lane evidence allows no starts. */ }
+      const limit = host?.admitted === true && Number.isFinite(host.maxPerTick)
+        ? Math.max(0, Math.floor(host.maxPerTick)) : 0;
+      const capacity = { lanes: Number.isFinite(lanes) ? Math.max(0, Math.floor(lanes)) : 0,
+        remainingStarts: limit, startsCeiling: limit, budget: liveReviewBudget,
+        take: () => host?.take?.(1) };
+      return options.redTeamOnSkip({ repo, plan: { ...plan, dispatch: [], refusals }, rawPrs,
+        inventoryComplete: false, capacity, paused: false });
     },
     redTeamOnSkip: o => {
       let rawPrs = o.rawPrs;
@@ -1540,7 +1583,12 @@ export function cliReviewTickOpts({ log = console, factCache = null, listCommand
           if (line.startsWith('review-daemon: red-team queue floor minConcurrent=')) floorLine = line;
           else options.log(line);
         } });
-      } catch { /* Unreadable floor evidence disables raises for this tick. */ }
+      } catch {
+        // Unreadable floor evidence disables raises for this tick and fails closed on probes (never the default 6).
+        floor = { maxProbesPerTick: 0 };
+        try { options.log('review-daemon: red-team queue floor loader failed; maxProbesPerTick=0 (probes OFF this tick)'); }
+        catch { /* Diagnostics must not interrupt recovery. */ }
+      }
       if (floorLine !== lastRedTeamQueueFloorLine) {
         if (floorLine !== undefined) {
           try { options.log(floorLine); } catch { /* Diagnostics must not interrupt recovery. */ }
@@ -1567,6 +1615,7 @@ export function cliReviewTickOpts({ log = console, factCache = null, listCommand
     tagRound: (o) => tagReviewRound({ ...o, provider: factsProvider }),
     tagStatus: (o) => tagReviewStatus({ ...o, provider: factsProvider }),
   };
+  return options;
 }
 
 /**

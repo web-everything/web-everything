@@ -207,7 +207,7 @@ function journalTarget(path, options) {
   }
   const { real } = trusted;
   const same = (a, b) => a.dev === b.dev && a.ino === b.ino && a.birthtimeMs === b.birthtimeMs;
-  const changed = () => Error('Policy journal path changed during access');
+  const changed = () => Object.assign(Error('Policy journal path changed during access'), { code: 'POLICY_JOURNAL_CHANGED' });
   const directories = [];
   for (let parent = dirname(real);; parent = dirname(parent)) {
     const stat = lstatSync(parent);
@@ -312,7 +312,13 @@ export function appendPolicyJournal(path, record, options = {}) {
   const token = randomUUID();
   const reclaimable = stat => {
     if (Date.now() - stat.mtimeMs <= JOURNAL_LOCK_STALE_MS) return false;
-    const owner = lock.readOwner(stat);
+    let owner;
+    try { owner = lock.readOwner(stat); } catch (error) {
+      // A rival writer reclaimed (removed/replaced) this stale lock while we inspected it:
+      // not ours to remove; the acquisition loop retries against the new state.
+      if (error.code === 'ENOENT' || error.code === 'POLICY_JOURNAL_CHANGED') return false;
+      throw error;
+    }
     if (!owner) return true;
     try { process.kill(owner.pid, 0); } catch (error) { return error.code === 'ESRCH'; }
     return false;
