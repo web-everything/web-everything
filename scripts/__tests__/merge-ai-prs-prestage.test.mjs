@@ -382,6 +382,38 @@ describe('real drain pre-stage path', () => {
     expect(next.stderr).toContain('full fast drain');
     expect(next.report.prestaged).not.toBe(true);
   }));
+  it('prestage refuses enqueue when the live default branch changed after preparation', () => world(async ({pr,run,coord,slug}) => {
+    expect((await run()).stderr).toContain('prepared while CI pending (eligible=true)');
+    const cache = createPrestageCache({ root: join(coord, 'drain-prestage') });
+    expect(cache.get(slug, 42, 30)).toMatchObject({ eligible:true, baseRefName:'main' });
+    pr.statusCheckRollup[0] = {name:'test',status:'COMPLETED',conclusion:'SUCCESS',head_sha:sha};
+    const next = await run(true, { defaultBranch:'develop' });
+    // The shortcut's guard must run before fallback listing/classification can defend admission.
+    const branchAt = next.calls.findIndex(a => a[0] === 'repo' && a[1] === 'view' && a.includes('defaultBranchRef'));
+    const listingAt = next.calls.findIndex(a => a.some(x => x.includes('pullRequests(')));
+    expect(branchAt).toBeGreaterThan(-1);
+    expect(listingAt).toBeGreaterThan(branchAt);
+    expect(next.calls.slice(0, listingAt).filter(a => a[0] === 'repo' && a[1] === 'view' && a.includes('defaultBranchRef')), JSON.stringify(next.calls)).toHaveLength(1);
+    expect(next.report.prestaged).not.toBe(true);
+    expect(next.report.skipped).toEqual(expect.arrayContaining([expect.objectContaining({num:42,reason:'base is not develop (main)'})]));
+    expect(next.calls.filter(a => a.some(x => x.includes('enqueuePullRequest')))).toHaveLength(0);
+  }));
+  it('prestage fails closed without enqueue when its live default-branch read fails', () => world(async ({pr,run,coord,slug}) => {
+    expect((await run()).stderr).toContain('prepared while CI pending (eligible=true)');
+    const cache = createPrestageCache({ root: join(coord, 'drain-prestage') });
+    expect(cache.get(slug, 42, 30)).toMatchObject({ eligible:true, baseRefName:'main' });
+    pr.statusCheckRollup[0] = {name:'test',status:'COMPLETED',conclusion:'SUCCESS',head_sha:sha};
+    const next = await run(true, { failDefaultBranch:true });
+    const branchAt = next.calls.findIndex(a => a[0] === 'repo' && a[1] === 'view' && a.includes('defaultBranchRef'));
+    const listingAt = next.calls.findIndex(a => a.some(x => x.includes('pullRequests(')));
+    expect(branchAt).toBeGreaterThan(-1);
+    expect(listingAt).toBeGreaterThan(branchAt);
+    expect(next.calls.slice(0, listingAt).filter(a => a[0] === 'repo' && a[1] === 'view' && a.includes('defaultBranchRef')), JSON.stringify(next.calls)).toHaveLength(1);
+    expect(next.report.prestaged).not.toBe(true);
+    expect(next.stderr).toContain('default branch unresolved live');
+    expect(next.report.skipped).toEqual(expect.arrayContaining([expect.objectContaining({num:42,reason:expect.stringContaining('deferring merge/enqueue')})]));
+    expect(next.calls.filter(a => a.some(x => x.includes('enqueuePullRequest')))).toHaveLength(0);
+  }));
   it('prepares while pending, then a green event enqueues without listing or gate reads', () => world(async ({pr,run,coord}) => {
     const first = (await run());
     expect(first.stderr).toContain('prepared while CI pending (eligible=true)');

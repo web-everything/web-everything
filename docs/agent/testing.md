@@ -4613,7 +4613,20 @@ operator ops store (`ruled-weakened-add`). Another head cannot supply the audit.
 
 ## Bounded red-team probe fairness
 
-`red-team-dispatch-queue.test.mjs` pins the two-probe limit per repository and
+`scripts/lib/__tests__/red-team-dispatch-queue.test.mjs` pins a default of six probes per
+repository per tick and a hard ceiling of 50. Invalid caps (including strings, fractions,
+negative values and values above 50) use six; see `invalid configured cap %s falls back
+to six actual probes` and the `invalid probe cap` cases for file, operator and direct input.
+An unreadable or invalid operator policy uses the stricter of the valid file cap and six
+(invalid or missing file caps count as six), while disabling capacity raises. See
+`unreadable operator store restricts file cap %s to %i actual probes`.
+Unreadable/unparseable settings files and a throwing floor loader still disable probes;
+see `%s settings disables probes and logs settings unreadable loudly` and
+`a throwing floor loader fails closed to zero probes, never the default six, and logs loudly`
+in `skills-src/conveyor/__tests__/review-daemon-red-team-floor-refresh.test.mjs`.
+The valid operator `redTeamQueue.maxProbesPerTick` leaf overrides the settings-file value.
+Zero explicitly disables probes. Historical
+two-probe rotation fixtures explicitly set their cap to two. The tests also pin
 least-recently-probed turns persisted as optional `lastProbeTurn` entry fields.
 Keep historical entries without the field loadable, reject malformed turns, and
 exercise five still-blocked entries across three ticks with a reload between ticks.
@@ -4631,6 +4644,37 @@ still list them. Changed live heads are re-keyed in place with attempts and bloc
 unreadable evidence keeps entries, logs the failure, and defers admission. Reconciliation
 runs inside the dispatch transaction so a thrown runner rolls back eviction and re-keying.
 Planner skips retain the existing bounded, fair probe rotation.
+Partial inventories never sync, enqueue, evict or re-key candidates: only known blocked
+entries with a live OPEN read matching the stored head may be probed, using head-bound
+refusals and raw PRs from those reads. Runnable entries wait for a complete inventory.
+Only the PR reader's inventory or truncation errors enable this recovery; other failures skip it.
+The `red-team-probe-cap-starvation` soak break reopens ten blocked entries between
+ticks and requires multiple probes in one tick and all ten within two default ticks;
+its `fixPresent` presence probe matches source text only. The separate `run()` scenario
+executes queue behavior, including invalid-cap fallback and partial-inventory safety.
+Presence detection alone is not evidence that the behavior works.
+
+Acceptance claims must name a repository-qualified test file, case and expected assertions.
+When documenting an invalid-input default, link the case that pins the actual fallback.
+For this probe-cap change the mapping is:
+
+| Acceptance | Contract test and assertions |
+| --- | --- |
+| Cap 10, absent cap, invalid caps, cap zero | `scripts/lib/__tests__/red-team-dispatch-queue.test.mjs`: `%s setting 10 probes all ten blocked entries in one tick`, `setting absent defaults to exactly six probes among ten blocked entries`, `invalid configured cap %s falls back to six actual probes`, `%s setting 0 disables probes and retains blocked entries`; assert actual probe identities/counts and retained membership for zero. The `invalid probe cap` group also covers raw/direct inputs. |
+| Unreadable operator policy | Same file: `unreadable operator store restricts file cap %s to %i actual probes`; assert zero stays zero, three stays three, ten/fifty become six, and both capacity raises stay disabled. |
+| Partial inventory | `skills-src/conveyor/__tests__/review-daemon-partial-list-red-team.test.mjs`: `partial inventory probes only live matching blocked heads while retaining entries and refusing unknown and draft PRs`; assert exact probe identities, matching raw heads, unchanged queue membership/head/attempt state and exclusion of closed, changed, unreadable, runnable and unknown PRs. `partial inventory host admission fails closed when %s` covers denied, null and throwing host reads; `partial inventory paused ticks retain all entries without probing` and `other list failures do not enable partial inventory probing or enqueue unknown PRs` pin the remaining guards. |
+| Two default ticks over ten synthetic heads | `scripts/conveyor/soak/breaks/red-team-probe-cap-starvation.soak.test.mjs`: `ten blocked red-team heads receive probe turns within two default ticks`; `run()` requires all ten identities across persisted reloads. This does not establish production timing. |
+| Live PRs after load | **PLANNED, not executed:** `specified accepted PRs receive head-bound probes within two post-load daemon ticks`, described below. |
+
+The deployment verification `specified accepted PRs receive head-bound probes within two
+post-load daemon ticks` is required after load. Record the deployed revision and UTC load
+boundary, then the start/end boundaries of the first two complete review-daemon ticks for
+`web-everything/web-everything`. Record each live head SHA for #7155, #7153, #7158, #7156,
+#7149 and #6945 at load. By the second tick's end, require a queue `probe` log with that
+PR identity and `head=<sha>` for every one of the six. Record the tick index and UTC probe
+time for each identity; missing probes, missing boundaries, changed heads or unreadable
+evidence leave the check unverified and require a new observation window. Save the six-row
+record with the PR's fix evidence. A synthetic soak pass cannot satisfy this live check.
 The `red-team-queue-verdict-evict` break also replays decided-head eviction: use
 `isPublishableRedTeamResult(redTeamForHead(...))` over complete trusted comments,
 then require readable carry/status/outbox evidence with no settlement owed and a
@@ -5119,6 +5163,44 @@ probation; a saved run retains its roster. Regressions: `external-juror-liveness
 `review-pr.test.mjs`, and `agy-juror-first-output.soak.test.mjs` (the latter uses the soak
 Vitest config). Run only the affected files through heavy-admission.
 
+## Event fast-drain context freshness
+
+Local `--only --from-green-event` context may reuse full shared-snapshot rows only through
+`cacheOnly: true` (normal TTL/dirty rules, even when stale-ok is configured). A lean live
+open inventory owns membership. Its GraphQL pages use the full listing’s query ordering, connection
+parser and `assertInventoryComplete` guard; counts must stay stable, unique row count must equal
+`totalCount`, and no next page may remain unread. Partial pages, errors, duplicates or count drift
+fall back to full listing. Number, head and updatedAt must match before snapshot reuse. Missing
+or changed rows and dependency/couple/overlap/card-group components are read fully live.
+Unknown inventories or related evidence fall back to the original full listing with one
+`fast-drain: context fell back to full listing (...)` diagnostic. The full hydrated listing must
+also call `assertInventoryComplete` before hydration or cache reuse; a short fallback throws into
+the existing list retry/unreadable path and cannot authorize enqueue. Keep the real CLI regression
+where both lean and full pages return one PR against `totalCount: 2`.
+Both `WE_FAST_DRAIN_CONTEXT=live`
+and `WE_FAST_DRAIN_LISTING=live` restore the original listing. Default-branch hints use a separate
+in-process map, round metadata, then a host-wide one-hour atomic cache under
+`~/.claude/conveyor/default-branches`. Test processes require an explicit
+`WE_DEFAULT_BRANCH_CACHE_DIR`. Neither cache nor parent metadata can authorize merge/enqueue.
+Every admission requires a live default-branch read in the child process, with successes retained per repo/process,
+after synchronous listing/context pages finish (prestage verifies before enqueue). Failure defers and is evicted
+after settlement so later watch passes retry; concurrent callers share each in-flight attempt.
+Keep same-reader recovery coverage for synchronous throws, rejected promises and unreadable responses;
+the drain verdict must hold after failure and admit after a successful retry.
+Live evidence overrides hints and rewrites the cache. Parent round metadata preserves the original
+live observation timestamp; a retained branch never receives fresh evidence timestamps. Branch-only
+records never count as complete PR listings. Keep branch-change, failure, and read-order probes.
+The node:test regression and soak also support the existing Vitest runner; run either through
+heavy-admission, with only the affected files.
+
+The shared drain classifier and merge revalidation refuse missing, undefined, null or empty default-branch
+evidence; pure callers have the same closed default. Valid-admission fixtures must supply the verified branch
+explicitly and include a readable PR base. An unreadable base fails closed globally in this shared authorization
+predicate, including full-list fallback; invalid full context rows fall back to full listing before gates.
+CLI shims must answer `repo view --json defaultBranchRef --jq .defaultBranchRef.name` separately from
+label-memo repository URL reads. The stateful fake reads its configured branch on each invocation and preserves
+fault injection for this verb. Prestage cache assertions must use the world fixture's returned `slug`, so the
+test reaches the enqueue guard even when its repository identity changes.
 ## Antigravity advisory seating and unavailable-provider evidence
 
 `external-juror-liveness.test.mjs` pins `advisorySeats.antigravityReview=probation` to the
@@ -5568,3 +5650,11 @@ Park opens ready for review; draft-promotion still handles older drafts.
 Check mode fetches origin main before evaluating canonical audit evidence. A failed fetch reports
 `main not refreshed: <reason>` and refuses even when local evidence would pass against stale refs.
 `open-pr-audit-gate.test.mjs` covers both refresh outcomes, aggregation and an unconfirmed check child.
+
+## Lane reset safety probe regressions
+
+`lane-pool-acquire-reset-probe-failed.test.mjs` uses a PATH Git shim activated after fetch
+to isolate the reset-time status/ahead probes. Cover both transient recovery and persistent
+refusal, and assert no checkout/reset/clean follows a failed probe. The bounded process
+reader wraps the original stderr in `ProcReadError.cause`; preserve that stderr (or the
+spawn error message) in probe diagnostics rather than reporting zero counts as proof.
