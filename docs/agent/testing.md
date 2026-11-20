@@ -5534,12 +5534,18 @@ Check mode fetches origin main before evaluating canonical audit evidence. A fai
 
 `instant-capacity-settings.test.mjs` tests every new operator capacity leaf through its real
 consumer, including endpoint writes, oversized/type rejection, live rereads and invalid/missing/
-unreadable-store fallback. Instant leaves retain their bounded lower setting; existing
-unreadable-store safety holds remain separate. Unknown or invalid JSON leaves are warned and
-dropped individually, never allowed to erase valid siblings. The reader accepts nested objects
+unreadable-store fallback. Invalid or unreadable operator evidence resolves each affected capacity
+leaf to the stricter of its lower-layer value and its built-in fallback (minimum for caps,
+maximum for thresholds), including instant settings and zero env values. Missing stores leave
+lower layers unchanged. Unknown or invalid JSON leaves are warned and dropped individually;
+valid operator siblings still apply to their own leaves. The reader accepts nested objects
 and dotted keys, refuses unsafe path segments, and the writer publishes canonical dotted keys.
 Policy readers must identify capacity bounds by the full policy key: short names such as `cap`
 are shared by several policies. Never memoize the operator layer for a long-running daemon.
+Manual resource-gate resolution must enumerate the registered capacity leaves and honor its policy-wide
+fallback even beside valid siblings; checking only for a null store misses mixed valid/invalid evidence.
+`resource-gate.test.mjs` crosses platform/tool/env bounds with corrupt, unreadable and malformed entries,
+including valid siblings and a floor that would otherwise raise a fail-closed ceiling.
 R1103 heavy-admission cap/fastSlots resolve operator → env → file → platform → built-in,
 including the shared pool. Other shared-pool policies retain host-owned platform authority.
 Forge's flat deployment must ship the builtin-only operator reader beside `forge-slots.mjs`.

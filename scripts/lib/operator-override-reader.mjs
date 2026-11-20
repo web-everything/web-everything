@@ -7,9 +7,9 @@ import { dirname, join } from 'node:path';
 const epochMs = v => Number.isSafeInteger(v) && v > 0 && v <= Date.now() + 72 * 3600000;
 const number = (min, max) => v => Number.isFinite(v) && v >= min && v <= max;
 const integer = (min, max) => v => Number.isInteger(v) && v >= min && v <= max;
-// Instant settings retain the bounded lower layer when operator evidence is unavailable.
+// Instant settings share the stricter built-in/lower-layer fallback on invalid operator evidence.
 const instant = (min, max, fallback, direction = 'cap', validate = integer) =>
-  Object.freeze({ ...capacityLeaf(validate(min, max), direction, fallback), fallbackToLower: true });
+  capacityLeaf(validate(min, max), direction, fallback);
 const capacityLeaf = (validate, direction, failClosedFallback) => Object.freeze({ validate, direction, failClosedFallback });
 // R1040/R1045: pure capacity raises are accepted up to these hard bounds; lowering stays allowed.
 // These are operator limits, not defaults or fail-closed fallbacks, and grant no guard-leaf authority.
@@ -64,13 +64,13 @@ export function lastOverrideReason(key, { file } = {}) {
   } catch { /* no audit log */ }
   return undefined;
 }
-/** Resolve unreadable operator evidence without relaxing a configured bound. */
-export function failClosedCapacity(key, value, { codeDefault, log = console.error } = {}) {
+/** Resolve invalid or unreadable operator evidence without relaxing a configured bound. */
+export function failClosedCapacity(key, value, { codeDefault, log = console.error, reason = 'unreadable' } = {}) {
   const { direction, failClosedFallback } = CAPACITY_LEAVES[key];
   const stricter = direction === 'cap' ? Math.min : Math.max;
   const fallback = Number.isFinite(codeDefault) ? stricter(codeDefault, failClosedFallback) : failClosedFallback;
   const result = Number.isFinite(value) ? stricter(value, fallback) : fallback;
-  warn(log, `operator-override: operator-db-unreadable ${key}; using finite stricter value ${result}`);
+  warn(log, `operator-override: operator-db-${reason} ${key}; using finite stricter value ${result}`);
   return result;
 }
 export const OPERATOR_OVERRIDES_RELATIVE_PATH = '.claude/operator-overrides.json';

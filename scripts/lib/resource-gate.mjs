@@ -30,7 +30,7 @@ import { resolveHandoffSettings } from './handoff-settings.mjs';
  *   process per distinct set ({@link logGateSettingsOnce}).
  */
 import { CAPACITY_LEAVES, failClosedCapacity, OPERATOR_CAPACITY_MAX } from './operator-override-reader.mjs';
-import { readOperatorPolicy } from './policy-cascade.mjs';
+import { capacityPolicyLeaves, hasInvalidOperatorPolicy, readOperatorPolicy } from './policy-cascade.mjs';
 import { readFileSync } from 'node:fs';
 import os, { homedir } from 'node:os';
 import { basename, dirname, join } from 'node:path';
@@ -106,6 +106,7 @@ const parseEnv = (leaf, raw) => {
 export function resolveResourceGateSettings({ platform, tool, env = {}, legacyFloor = 2, log = console.error } = {}) {
   const values = {}; const sources = {}; const invalid = [];
   const operatorOverride = readOperatorPolicy('resourceGate', { env, log });
+  const invalidOperator = hasInvalidOperatorPolicy(operatorOverride);
   for (const leaf of LEAVES) {
     values[leaf] = leafOf(RESOURCE_GATE_STANDARD, leaf); sources[leaf] = 'standard';
     for (const [layer, block] of [['platform', platform], ['tool', tool]]) {
@@ -122,7 +123,8 @@ export function resolveResourceGateSettings({ platform, tool, env = {}, legacyFl
       if (VALID[leaf](e)) { values[leaf] = e; sources[leaf] = `env ${envKey}`; } else invalid.push(`env ${envKey}=${JSON.stringify(rawEnv)}`);
     }
   }
-  for (const [leaf, value] of Object.entries(operatorOverride ?? {})) {
+  // Malformed resource policy evidence closes the whole policy, even beside valid overrides.
+  for (const [leaf, value] of Object.entries(invalidOperator ? {} : operatorOverride ?? {})) {
     if (!Object.hasOwn(VALID, leaf)) continue;
     if (VALID[leaf](value)) { values[leaf] = value; sources[leaf] = 'operator-db'; }
     else invalid.push(`operator-db.${leaf}=${JSON.stringify(value)}`);
@@ -134,20 +136,22 @@ export function resolveResourceGateSettings({ platform, tool, env = {}, legacyFl
     values['fixCap.ceiling'] = values['fixCap.floor'] + values['fixCap.ceilingAboveFloor'];
     sources['fixCap.ceiling'] = `floor + ${values['fixCap.ceilingAboveFloor']}`;
   }
+  if (invalidOperator) {
+    for (const leaf of capacityPolicyLeaves('resourceGate')) {
+      const before = values[leaf];
+      values[leaf] = failClosedCapacity(`resourceGate.${leaf}`, before, {
+        log, reason: operatorOverride === null ? 'unreadable' : 'invalid',
+      });
+      if (values[leaf] !== before) sources[leaf] = 'standard';
+    }
+  }
   if (values['fixCap.ceiling'] < values['fixCap.floor']) {
-    if (sources['fixCap.ceiling'] === 'operator-db') {
+    if (sources['fixCap.ceiling'] === 'operator-db' || invalidOperator) {
       values['fixCap.floor'] = values['fixCap.ceiling'];
-      sources['fixCap.floor'] = 'operator-db';
+      sources['fixCap.floor'] = sources['fixCap.ceiling'];
     } else {
       invalid.push(`fixCap.ceiling ${values['fixCap.ceiling']} < floor ${values['fixCap.floor']} (ceiling raised to the floor)`);
       values['fixCap.ceiling'] = values['fixCap.floor'];
-    }
-  }
-  if (operatorOverride === null) {
-    for (const leaf of ['fixCap.floor', 'fixCap.ceiling', 'fixCap.raiseMinMemFreePct']) {
-      const before = values[leaf];
-      values[leaf] = failClosedCapacity(`resourceGate.${leaf}`, before, { log });
-      if (values[leaf] !== before) sources[leaf] = 'standard';
     }
   }
   // The operator hard bound applies to ceilings derived from an operator floor.

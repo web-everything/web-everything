@@ -57,7 +57,7 @@ describe('R907 red-team reader retains operator authority under test flags', () 
       env: { VITEST: 'true', WE_UNDER_TEST: '1', NODE_ENV: 'test',
         WE_RED_TEAM_QUEUE_MIN_CONCURRENT: '6', WE_RED_TEAM_QUEUE_REVIEW_STARTS_WHILE_IDLE: '4' }, log,
     });
-    expect(floor).toEqual({ minConcurrent: 0, idlePct: 10, reviewStartsPerTick: 4 });
+    expect(floor).toEqual({ minConcurrent: 0, idlePct: 10, reviewStartsPerTick: 0 });
     expect(log.mock.calls.flat().join(' ')).toContain('operator-db-unreadable');
   });
 });
@@ -1432,23 +1432,23 @@ describe('operator-db red-team capacity override', () => {
     applyRedTeamQueueFloor(bound, { floor: { minConcurrent: minimum, idlePct: 10 }, cpuIdlePct: 100 });
     expect(redTeamQueueAdmitCount(bound)).toBe(12);
   });
-  it('oversized operator input drops only that key and retains a valid env value', () => {
+  it('oversized operator minimum tightens a valid env value to zero', () => {
     const dir = mkdtempSync(join(tmpdir(), 'red-team-override-'));
     try {
       const file = join(dir, 'operator-overrides.json'); writeFileSync(file, JSON.stringify({ 'redTeamQueue.minConcurrent': 25 }));
-      expect(loadRedTeamQueueFloor({ env: { ...operatorEnv(file), WE_RED_TEAM_QUEUE_MIN_CONCURRENT: '3' } }).minConcurrent).toBe(3);
+      expect(loadRedTeamQueueFloor({ env: { ...operatorEnv(file), WE_RED_TEAM_QUEUE_MIN_CONCURRENT: '3' } }).minConcurrent).toBe(0);
     } finally { rmSync(dir, { recursive: true, force: true }); }
   });
 });
 
-it('corrupt operator store disables the minimum while retaining instant start settings and logs operator-db-unreadable', () => {
+it('corrupt operator store disables the minimum and instant start allowance and logs operator-db-unreadable', () => {
   const dir = mkdtempSync(join(tmpdir(), 'red-team-corrupt-'));
   try {
     const file = join(dir, 'operator.json'); writeFileSync(file, '{');
     const log = vi.fn();
     const floor = loadRedTeamQueueFloor({ env: { ...operatorEnv(file),
       WE_RED_TEAM_QUEUE_MIN_CONCURRENT: '12', WE_RED_TEAM_QUEUE_REVIEW_STARTS_WHILE_IDLE: '6' }, log });
-    expect(floor).toEqual({ minConcurrent: 0, idlePct: 10, reviewStartsPerTick: 6 });
+    expect(floor).toEqual({ minConcurrent: 0, idlePct: 10, reviewStartsPerTick: 0 });
     expect(log.mock.calls.flat().join(' ')).toContain('operator-db-unreadable');
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
@@ -1475,7 +1475,7 @@ it.each([
   ['redTeamQueue.minConcurrent', 25],
   ['redTeamQueue.unknownCapacity', 1],
   ['redTeamQueue.minConcurrentIdlePct', 0],
-])('R1103 malformed %s=%j drops only that key and retains lower settings', (key, value) => {
+])('malformed %s=%j closes the affected minimum and retains unrelated instant settings', (key, value) => {
   const dir = mkdtempSync(join(tmpdir(), 'red-team-invalid-'));
   try {
     const file = join(dir, 'operator.json');
@@ -1483,10 +1483,10 @@ it.each([
     const log = vi.fn();
     const floor = loadRedTeamQueueFloor({ env: { ...operatorEnv(file),
       WE_RED_TEAM_QUEUE_MIN_CONCURRENT: '12', WE_RED_TEAM_QUEUE_REVIEW_STARTS_WHILE_IDLE: '6' }, log });
-    expect(floor).toEqual({ minConcurrent: 12, idlePct: 10, reviewStartsPerTick: 6 });
+    expect(floor).toEqual({ minConcurrent: 0, idlePct: 10, reviewStartsPerTick: 6 });
     const bound = { lanes: 20, startsCeiling: 20, remainingStarts: 0, budget: { left: 20 } };
     applyRedTeamQueueFloor(bound, { floor, cpuIdlePct: 100 });
-    expect(redTeamQueueAdmitCount(bound)).toBe(12);
+    expect(redTeamQueueAdmitCount(bound)).toBe(0);
     expect(log.mock.calls.flat().join(' ')).toMatch(/operator-db-(unreadable|invalid)/);
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });

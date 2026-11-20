@@ -15,7 +15,7 @@ import { mkdtempSync, rmSync, writeFileSync, mkdirSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
-  RESOURCE_GATE_STANDARD, resolveResourceGateSettings, loadResourceGateSettings, logGateSettingsOnce,
+  RESOURCE_GATE_STANDARD, RESOURCE_GATE_ENV, resolveResourceGateSettings, loadResourceGateSettings, logGateSettingsOnce,
   cutoverDecision, gateLaunch, decideFixCap, createResourceFixThrottle, resolveCutoverMode,
 } from '../resource-gate.mjs';
 import { resolveHostOverloadSettings } from '../host-overload-settings.mjs';
@@ -495,6 +495,60 @@ describe('dynamic fixer cap', () => {
   });
 });
 
+
+describe('resource-gate capacity fallback across lower layers', () => {
+  const configured = {
+    loose: { floor: 12, ceiling: 12, raiseQueueOver: 1, raiseStepPerPass: 3,
+      raiseMinMemFreePct: 25, raiseMaxSwapUsedPct: 90, raiseMaxHeavyWaitMinutes: 30 },
+    strict: { floor: 1, ceiling: 1, raiseQueueOver: 10, raiseStepPerPass: 1,
+      raiseMinMemFreePct: 60, raiseMaxSwapUsedPct: 30, raiseMaxHeavyWaitMinutes: 5 },
+  };
+  const closed = { ...configured.loose, floor: 2, ceiling: 6, raiseQueueOver: 5,
+    raiseStepPerPass: 2, raiseMinMemFreePct: 40, raiseMaxSwapUsedPct: 60, raiseMaxHeavyWaitMinutes: 15 };
+  const failures = [
+    ['corrupt store', file => writeFileSync(file, '{')],
+    ['invalid store shape', file => writeFileSync(file, '[]')],
+    ['unreadable store', file => mkdirSync(file)],
+    ...[
+      ['oversized entry', { 'resourceGate.fixCap.raiseQueueOver': 101 }],
+      ['wrong type', { 'resourceGate.fixCap.raiseStepPerPass': '3' }],
+      ['descendant under numeric leaf', { 'resourceGate.fixCap.raiseStepPerPass.forbidden': 1 }],
+      ['object at numeric leaf', { 'resourceGate.fixCap.raiseQueueOver': { forbidden: 1 } }],
+      ['empty object at numeric leaf', { 'resourceGate.fixCap.raiseQueueOver': {} }],
+      ['invalid entry with valid sibling', { 'resourceGate.fixCap.raiseQueueOver': 101,
+        'resourceGate.fixCap.raiseMaxSwapUsedPct': 80 }],
+    ].map(([name, data]) => [name, file => writeFileSync(file, JSON.stringify(data))]),
+  ];
+  const matrix = Object.keys(configured).flatMap(bound => ['platform', 'tool', 'env'].flatMap(layer =>
+    failures.map(([failure, setup]) => ({ bound, layer, failure, setup }))));
+  it.each(matrix)('$failure preserves stricter $bound bounds from $layer', ({ bound, layer, setup }) => {
+    const file = join(root, 'operator-capacity-fallback.json');
+    setup(file);
+    const env = operatorEnv(file);
+    const lower = configured[bound];
+    const options = layer === 'env' ? {} : { [layer]: { fixCap: lower } };
+    if (layer === 'env') {
+      for (const [leaf, value] of Object.entries(lower)) {
+        env[RESOURCE_GATE_ENV[`fixCap.${leaf}`]] = String(value);
+      }
+    }
+    const result = resolveResourceGateSettings({ ...options, env, log: quiet });
+    const expected = bound === 'strict' ? lower : closed;
+    expect(result.settings.fixCap).toMatchObject(expected);
+    expect(result.sources['fixCap.raiseQueueOver']).toBe(bound === 'loose' ? 'standard'
+      : layer === 'env' ? 'env WE_FIX_CAP_RAISE_QUEUE_OVER' : layer);
+    expect(result.sources['fixCap.raiseStepPerPass']).toBe(bound === 'loose' ? 'standard'
+      : layer === 'env' ? 'env WE_FIX_CAP_RAISE_STEP_PER_PASS' : layer);
+  });
+  it('a valid operator floor cannot raise a ceiling tightened by invalid sibling evidence', () => {
+    const file = join(root, 'operator-floor-invalid-sibling.json');
+    writeFileSync(file, JSON.stringify({ 'resourceGate.fixCap.floor': 24,
+      'resourceGate.fixCap.raiseQueueOver': 101 }));
+    const result = resolveResourceGateSettings({ env: operatorEnv(file), legacyFloor: 12, log: quiet });
+    expect(result.settings.fixCap).toMatchObject({ floor: 2, ceiling: 6, raiseQueueOver: 5 });
+    expect(result.sources['fixCap.floor']).toBe('standard');
+  });
+});
 
 describe('operator-db host and resource capacity leaves', () => {
   const overrideFile = values => {

@@ -15,7 +15,8 @@
  *     5. OPERATOR DB — capacity-only host overrides, above env (source: operator-db).
  *
  *   Each LEAF resolves independently: the tool value when it is set AND valid, else the platform's, else the
- *   reader's standard default. An invalid value never overrides a lower layer; it is named in `invalid`.
+ *   reader's standard default. Invalid operator capacity evidence tightens the lower value to the built-in
+ *   bound; other invalid values never override a lower layer. Invalid entries are named in `invalid`.
  *
  *   SOURCE LOG: {@link cascadePolicy} prints one `policy-cascade · <policy>: leaf=value (layer), …` line per process
  *   per distinct effective set, so a long-running daemon logs each setting's source once (and again only if it
@@ -46,6 +47,13 @@ export const CASCADE_LAYERS = Object.freeze(['standard', 'platform', 'tool', 'en
 
 const isObj = (v) => v !== null && typeof v === 'object' && !Array.isArray(v);
 const UNSAFE = new Set(['__proto__', 'constructor', 'prototype']);
+// Preserve reader diagnostics without adding policy values for its other consumers.
+const INVALID_OPERATOR_POLICY = Symbol('invalid operator policy');
+
+/** Manual policy readers must retain invalid evidence alongside valid sibling overrides. */
+export function hasInvalidOperatorPolicy(overrides) {
+  return overrides === null || !!overrides?.[INVALID_OPERATOR_POLICY];
+}
 
 function mergeLeaves(base, over) {
   const out = { ...base };
@@ -159,8 +167,16 @@ export function resolveCascade({ standard, platform, tool, envValues = {}, valid
     Object.keys(CAPACITY_LEAVES).some(key => (key === leaf || key.endsWith(`.${leaf}`))));
   const specKeyFor = leaf => capacitySpecs[leaf] ?? (Object.hasOwn(CAPACITY_LEAVES, leaf) ? leaf
     : Object.keys(CAPACITY_LEAVES).find(key => key.endsWith(`.${leaf}`)));
+  const closedLeaves = new Set(hasInvalidOperatorPolicy(operatorOverride) ? paths : []);
+  // Known numeric leaves are atomic: objects (including empty ones) are invalid evidence,
+  // rather than containers whose contents can disappear during flattening.
+  function* operatorLeaves(value, path = []) {
+    if (isObj(value) && !paths.includes(path.join('.')) && Object.keys(value).length) {
+      for (const [key, v] of Object.entries(value)) yield* operatorLeaves(v, [...path, key]);
+    } else if (value !== undefined && path.length) yield { path, v: value };
+  }
   const operatorEntries = [];
-  for (const { path: rawPath, v } of leaves(operatorOverride ?? undefined).values()) {
+  for (const { path: rawPath, v } of operatorLeaves(operatorOverride)) {
     // Preserve dotted schema keys used by flat readers; otherwise expand dotted override paths.
     const path = rawPath.flatMap(k => k.split('.'));
     const flat = rawPath.join('.');
@@ -168,26 +184,30 @@ export function resolveCascade({ standard, platform, tool, envValues = {}, valid
     const specKey = specKeyFor(flat);
     if (actual.some(k => UNSAFE.has(k)) || !paths.includes(flat) || !specKey || !CAPACITY_LEAVES[specKey].validate(v) || !check(actual, v)) {
       invalid.push(`operator-db${at(actual)}=${JSON.stringify(v)}`);
+      for (const leaf of paths) {
+        if (flat === leaf || flat.startsWith(`${leaf}.`) || leaf.startsWith(`${flat}.`)) closedLeaves.add(leaf);
+      }
       continue;
     }
     operatorEntries.push({ actual, v });
   }
-  for (const { actual, v } of operatorEntries) {
-    eff.set(actual.join(SEP), { path: actual, v, layer: 'operator-db' });
-  }
-  if (operatorOverride === null) {
-    for (const leaf of paths) {
+  if (closedLeaves.size) {
+    for (const leaf of closedLeaves) {
       const specKey = specKeyFor(leaf);
-      if (!specKey || CAPACITY_LEAVES[specKey].fallbackToLower) continue;
+      if (!specKey || operatorEntries.some(entry => entry.actual.join('.') === leaf)) continue;
       const path = eff.has(leaf) ? [leaf] : leaf.split('.');
       const key = path.join(SEP);
       const entry = eff.get(key);
       const current = entry?.v ?? leaf.split('.').reduce((v, part) => v?.[part],
         Object.fromEntries([...eff.values()].filter(e => e.path.length === 1).map(e => [e.path[0], e.v])));
       const codeDefault = [...defaults.values()].find(e => e.path.join('.') === leaf)?.v;
-      const v = failClosedCapacity(specKey, current, { codeDefault, log });
+      const v = failClosedCapacity(specKey, current, { codeDefault, log,
+        reason: operatorOverride === null ? 'unreadable' : 'invalid' });
       eff.set(key, { path, v, layer: v === current ? entry?.layer ?? 'standard' : 'standard' });
     }
+  }
+  for (const { actual, v } of operatorEntries) {
+    eff.set(actual.join(SEP), { path: actual, v, layer: 'operator-db' });
   }
   const sources = {};
   const leafValues = {};
@@ -261,18 +281,28 @@ export function cascadePolicy(policy, tool, { standard, envValues, valid, platfo
   const resolved = resolveCascade({ standard, platform: plat, tool, envValues, valid, operatorOverride, capacityLeaves, capacitySpecs, log });
   logCascadeSources(policy, resolved, { env, ...(log ? { log } : {}) });
   // `layered`: platform under tool only (no standard, no env) — the drop-in replacement for a reader's tool block.
-  const layered = resolveCascade({ standard: operatorOverride === null && capacityLeaves.length ? standard : undefined,
+  const closedOperator = hasInvalidOperatorPolicy(operatorOverride)
+    || resolved.invalid.some(entry => entry.startsWith('operator-db'));
+  const layered = resolveCascade({ standard: closedOperator && capacityLeaves.length ? standard : undefined,
     platform: plat, tool, valid, operatorOverride, capacityLeaves, capacitySpecs, log }).value;
   return { ...resolved, platform: plat, layered };
 }
 
-/** Read each call, filtering the exact policy prefix. Null means unreadable; {} means missing/empty.
+/** Read each call, filtering the exact policy prefix. Null means unreadable or invalid with no valid
+ * overrides in this policy; {} means missing/empty. Mixed policies preserve valid leaves plus invalid metadata.
  * Tests isolate the store through the explicit file seam, never environment flags. */
 export function readOperatorPolicy(policy, { file, log } = {}) {
-  const { readable, values } = readOperatorOverrides({ ...(file !== undefined ? { file } : {}), ...(log ? { log } : {}) });
+  const { readable, values, invalidPolicies = [] } = readOperatorOverrides({ ...(file !== undefined ? { file } : {}), ...(log ? { log } : {}) });
   if (!readable) return null;
   const prefix = `${policy}.`;
-  return Object.fromEntries(Object.entries(values).filter(([key]) => key.startsWith(prefix)).map(([key, value]) => [key.slice(prefix.length), value]));
+  const overrides = Object.fromEntries(Object.entries(values).filter(([key]) => key.startsWith(prefix)).map(([key, value]) => [key.slice(prefix.length), value]));
+  if (invalidPolicies.includes(policy.split('.')[0])) {
+    // Older manual consumers already fail closed on null. Keep that signal when there
+    // is no valid override to preserve; mixed policies carry their diagnostics alongside values.
+    if (!Object.keys(overrides).length) return null;
+    Object.defineProperty(overrides, INVALID_OPERATOR_POLICY, { value: true });
+  }
+  return overrides;
 }
 
 /** Test seam: forget what was logged. @test-only-export-ok */
@@ -302,14 +332,17 @@ export function capacityPolicyLeaves(policy) {
 }
 
 /** Bounded scalar adapter for instant settings. All lower layers are validated before the operator
- * layer is applied; an unreadable store contributes no value. Provenance uses the shared source log. */
+ * layer is applied; invalid/unreadable evidence tightens to the built-in bound. Provenance uses the shared source log. */
 export function resolveCapacityLeaf(key, { standard = CAPACITY_LEAVES[key].failClosedFallback,
   tool, envValue, env = process.env, log } = {}) {
   const spec = CAPACITY_LEAVES[key];
-  const { values } = readOperatorOverrides({ ...(log ? { log } : {}) });
+  const { readable, values, invalidPolicies = [] } = readOperatorOverrides({ ...(log ? { log } : {}) });
+  const operatorOverride = readable ? { [key]: values[key] } : null;
+  if (operatorOverride && invalidPolicies.includes(key.split('.')[0]))
+    Object.defineProperty(operatorOverride, INVALID_OPERATOR_POLICY, { value: true });
   const resolved = resolveCascade({ standard: { [key]: standard }, tool: { [key]: tool },
     envValues: { [key]: envValue }, valid: spec.validate,
-    operatorOverride: { [key]: values[key] }, capacityLeaves: [key], ...(log ? { log } : {}) });
+    operatorOverride, capacityLeaves: [key], ...(log ? { log } : {}) });
   logCascadeSources(key, resolved, { env, ...(log ? { log } : {}) });
   return { value: resolved.value[key], source: resolved.sources[key] };
 }

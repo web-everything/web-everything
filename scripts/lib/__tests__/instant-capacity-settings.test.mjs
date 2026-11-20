@@ -7,7 +7,7 @@ import { dirname, join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { CAPACITY_LEAVES, operatorOverridesPath, readOperatorOverrides } from '../operator-override-reader.mjs';
 import { writeOperatorOverride } from '../operator-override-store.mjs';
-import { readOperatorPolicy, resolveCapacityLeaf, resolveCascade } from '../policy-cascade.mjs';
+import { cascadePolicy, readOperatorPolicy, resolveCapacityLeaf, resolveCascade } from '../policy-cascade.mjs';
 import { resolveCiHealReserve } from '../ci-heal-reserve.mjs';
 import { resolveMaxConcurrentLanes } from '../lane-concurrency.mjs';
 import { resolveResourceGateSettings, loadResourceGateSettings } from '../resource-gate.mjs';
@@ -63,6 +63,71 @@ beforeEach(() => {
 });
 afterEach(() => rmSync(file, { force: true, recursive: true }));
 
+describe('invalid operator evidence never relaxes capacity bounds', () => {
+  const bounds = [
+    ['ciHeal.reserve', 0], ['ciHeal.reserve', 20], ['lanes.maxConcurrent', 40],
+    ['resourceGate.fixCap.floor', 20], ['resourceGate.fixCap.ceiling', 20],
+    ['resourceGate.fixCap.raiseQueueOver', 1], ['resourceGate.fixCap.raiseQueueOver', 10],
+    ['resourceGate.fixCap.raiseMinMemFreePct', 25], ['resourceGate.fixCap.raiseMinMemFreePct', 60],
+    ['resourceGate.fixCap.raiseMaxSwapUsedPct', 90], ['heavyAdmission.cap', 20],
+    ['redTeam.queue.minConcurrentIdlePct', 1], ['reviewConcurrency.maxLiveReviewRounds', 12],
+  ];
+  const failures = [
+    ['corrupt store', () => writeFileSync(file, '{')],
+    ['invalid store shape', () => seed([])],
+    ['unreadable store', () => mkdirSync(file)],
+    ['out of range', key => seed({ [key]: 1e9 })],
+    ['wrong type', key => seed({ [key]: 'bad' })],
+    ['forbidden key under leaf', key => seed({ [`${key}.forbidden`]: 1 })],
+    ['object at numeric leaf', key => seed({ [key]: { forbidden: 1 } })],
+    ['empty object at numeric leaf', key => seed({ [key]: {} })],
+  ];
+  it.each(bounds.flatMap(([key, lower]) => failures.map(([failure, setup]) =>
+    ({ key, lower, failure, setup }))))('$key lower=$lower: $failure uses the stricter built-in/lower bound', ({ key, lower, setup }) => {
+    setup(key);
+    const spec = CAPACITY_LEAVES[key];
+    const standard = spec.failClosedFallback;
+    const expected = (spec.direction === 'cap' ? Math.min : Math.max)(lower, standard);
+    expect(resolveCapacityLeaf(key, { tool: lower, envValue: lower, env: {}, log: quiet }).value).toBe(expected);
+    const policy = key.split('.')[0];
+    const leaf = key.slice(policy.length + 1);
+    for (const nested of [false, true]) {
+      const block = value => nested ? leaf.split('.').reduceRight((v, part) => ({ [part]: v }), value) : { [leaf]: value };
+      const result = cascadePolicy(policy, block(lower), {
+        standard: block(standard), platform: null, env: {}, log: quiet,
+      });
+      const at = value => nested ? leaf.split('.').reduce((v, part) => v[part], value) : value[leaf];
+      expect(at(result.value)).toBe(expected);
+      expect(at(result.layered)).toBe(expected);
+    }
+    if (key === 'ciHeal.reserve') expect(resolveCiHealReserve({ env: { WE_CI_HEAL_RESERVE: String(lower) } })).toBe(expected);
+    if (key === 'lanes.maxConcurrent') expect(resolveMaxConcurrentLanes({ WE_MAX_CONCURRENT_LANES: String(lower) })).toBe(expected);
+  });
+  it('applies valid sibling overrides while invalid leaves close in value and layered results', () => {
+    seed({ 'resourceGate.fixCap.floor.forbidden': 1, 'resourceGate.fixCap.ceiling': 24 });
+    const result = cascadePolicy('resourceGate', { fixCap: { floor: 20, ceiling: 20 } }, {
+      standard: { fixCap: { floor: 2, ceiling: 6 } }, platform: null, env: {}, log: quiet,
+    });
+    expect(result.value.fixCap).toEqual({ floor: 2, ceiling: 24, raiseQueueOver: 5,
+      raiseStepPerPass: 2, raiseMaxSwapUsedPct: 60, raiseMaxHeavyWaitMinutes: 15, raiseMinMemFreePct: 40 });
+    expect(result.layered.fixCap).toEqual(result.value.fixCap);
+    expect(result.sources['fixCap.ceiling']).toBe('operator-db');
+  });
+  it.each([{ floor: 'bad' }, { floor: 25 }, { floor: {} }, { 'floor.forbidden': 1 }])('pure cascade closes invalid leaf %j and applies a valid sibling', invalid => {
+    const result = resolveCascade({ standard: { fixCap: { floor: 2, ceiling: 6 } },
+      tool: { fixCap: { floor: 20, ceiling: 20 } },
+      operatorOverride: { fixCap: { ...invalid, ceiling: 24 } }, log: quiet });
+    expect(result.value.fixCap).toEqual({ floor: 2, ceiling: 24 });
+  });
+  it('invalid threshold evidence preserves a stricter reader standard and its provenance', () => {
+    const result = resolveCascade({ standard: { fixCap: { raiseMinMemFreePct: 60 } },
+      tool: { fixCap: { raiseMinMemFreePct: 25 } },
+      operatorOverride: { 'fixCap.raiseMinMemFreePct': 'bad' }, log: quiet });
+    expect(result.value.fixCap.raiseMinMemFreePct).toBe(60);
+    expect(result.sources['fixCap.raiseMinMemFreePct']).toBe('standard');
+  });
+});
+
 describe('instant bounded capacity leaves', () => {
   it.each(cases)('%s: writer accepts endpoints and rejects oversized/wrong types', (key, min, max) => {
     for (const value of [min, max]) {
@@ -79,12 +144,17 @@ describe('instant bounded capacity leaves', () => {
     seed({ [key]: min }); expect(read()).toBe(min);
     rmSync(file); expect(read()).toBe(lower);
   });
-  it.each(cases)('%s: invalid/missing/unreadable store retains the bounded lower value', (key, min, max, lower, read) => {
-    for (const data of [{ [key]: max + 1 }, { [key]: '3' }, { unknown: 1 }, {}]) {
+  it.each(cases)('%s: invalid/unreadable evidence tightens bounds; missing/unrelated entries retain lower values', (key, min, max, lower, read) => {
+    const spec = CAPACITY_LEAVES[key];
+    const closed = (spec.direction === 'cap' ? Math.min : Math.max)(lower, spec.failClosedFallback);
+    for (const data of [{ [key]: max + 1 }, { [key]: '3' }]) {
+      seed(data); expect(read()).toBe(closed);
+    }
+    for (const data of [{ unknown: 1 }, {}]) {
       seed(data); expect(read()).toBe(lower);
     }
-    writeFileSync(file, '{'); expect(read()).toBe(key === 'redTeam.queue.cap' ? 0 : lower);
-    rmSync(file); mkdirSync(file); expect(read()).toBe(key === 'redTeam.queue.cap' ? 0 : lower);
+    writeFileSync(file, '{'); expect(read()).toBe(key === 'redTeam.queue.cap' ? 0 : closed);
+    rmSync(file); mkdirSync(file); expect(read()).toBe(key === 'redTeam.queue.cap' ? 0 : closed);
   });
   it.each(['unknown', 'host.unknown', 'reviewConcurrency.unknown'])('drops only bad key %s; valid siblings and policies survive', bad => {
     const log = vi.fn();
@@ -161,7 +231,7 @@ describe('instant bounded capacity leaves', () => {
     seed({ 'heavyAdmission.cap': 1, 'heavyAdmission.fastSlots': 0 });
     expect(read()).toEqual([1, 0]);
     writeFileSync(file, '{');
-    expect(read()).toEqual([4, 2]);
+    expect(read()).toEqual([2, 1]);
     seed({ 'heavyAdmission.cap': 6, 'heavyAdmission.fastSlots': 3 });
     expect(read()).toEqual([6, 3]);
     rmSync(file);
@@ -179,7 +249,7 @@ describe('instant bounded capacity leaves', () => {
     expect(read({ [name]: '999' })).toBe(3);
     expect(read({})).toBe(3);
     seed({ [`heavyAdmission.${leaf}`]: 5 }); expect(read({ [name]: '4' })).toBe(5);
-    writeFileSync(file, '{'); expect(read({ [name]: '4' })).toBe(4);
+    writeFileSync(file, '{'); expect(read({ [name]: '4' })).toBe(CAPACITY_LEAVES[`heavyAdmission.${leaf}`].failClosedFallback);
   });
   it('resource-gate loads the live legacy floor leaf before deriving its fallback floor', () => {
     seed({ fixDispatchMaxConcurrent: 16 });
