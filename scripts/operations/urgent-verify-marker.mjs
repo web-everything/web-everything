@@ -34,6 +34,9 @@ export function resolveOriginRepo(originUrl, {
   cache.set(slug, fullName);
   return fullName;
 }
+// The repo moved from chalbert/frontierui (GitHub redirects). Accept only that one known old owner, mapped to canonical.
+const urgentFuiAliases = new Set(['https://github.com/chalbert/frontierui']);
+export const canonicalFuiRepo = repo => (urgentFuiAliases.has(repo) ? urgentFuiRepo : repo);
 export function urgentSignature(record, key) {
   if (!Buffer.isBuffer(key) || key.length !== 32) throw new Error('unreadable urgent key');
   const fields = ['sha', 'suite', 'shards', 'result', 'startedAt', 'finishedAt', 'host', 'repo', 'steps', 'fuiSha', 'fuiRepo'];
