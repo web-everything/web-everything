@@ -1,5 +1,5 @@
 /** @file scripts/lib/daemon-rebuild/plan.mjs — Overlay application plan.
- * Split out of daemon-rebuild.mjs (move-only).
+ * Resolves exact registered commit pins before planning; unavailable pins hold the last good build.
  */
 
 import { verifyRev, rebuildCommitEnv, FULL_SHA_RE, REBUILD_IDENTITY_ENV } from './shared.mjs';
@@ -59,6 +59,19 @@ const MECHANISM_CORE_PATHS = Object.freeze(['scripts/lib/daemon-rebuild.mjs', 's
 
 /** A full commit id — the only shape a sha read from git output or the GitHub API may take before it reaches a git argv. */
 const OID = FULL_SHA_RE;
+/** Resolve a registration's commit, fetching an absent exact pin by SHA and verifying its identity.
+ * Legacy registrations continue to follow their remote-tracking branch. Null means unavailable evidence.
+ */
+function overlayShaFor(git, entry) {
+  if (entry?.expectedSha === undefined) return verifyRev(git, `refs/remotes/origin/${entry.ref}^{commit}`);
+  const sha = entry.expectedSha;
+  if (typeof sha !== 'string' || !OID.test(sha)) return null;
+  try {
+    if (verifyRev(git, `${sha}^{commit}`) === sha) return sha;
+    if (git(['fetch', 'origin', sha]).status !== 0) return null;
+    return verifyRev(git, `${sha}^{commit}`) === sha ? sha : null;
+  } catch { return null; }
+}
 /** Who commits a daemon build's overlay merges (REBUILD_IDENTITY_ENV) — only those merges count as adopted heads. */
 const REBUILD_COMMITTER = REBUILD_IDENTITY_ENV.GIT_COMMITTER_EMAIL;
 
@@ -155,7 +168,7 @@ export async function planOverlayStacks({
     const pr = raw.pr ?? null;
     const st = await stateOf(pr);
     if (st === 'MERGED' || st === 'CLOSED') continue;
-    const sha = verifyRev(git, `refs/remotes/origin/${raw.ref}^{commit}`);
+    const sha = overlayShaFor(git, raw);
     if (!sha) continue;
     // Already in main by ancestry: no part in any stack. The main loop removes it as `in-main`; left in, it would
     // be a base of any newer overlay branched from main and be set aside, so it would never be removed.
@@ -320,13 +333,13 @@ export async function planOverlayStacks({
  * as `pinned-contained-in-applied` if carried by the applied top, rather than removed as `in-main`), and an overlay
  * already an ancestor of main is not part of any stack.
  * @param {{git:(args:string[], opts?:{env?:object})=>{status:number,stdout:string,stderr:string},
- *   headSha:string, mainRef:string, overlays?:Array<{ref:string, pr?:number|null}>,
+ *   headSha:string, mainRef:string, overlays?:Array<{ref:string, pr?:number|null, expectedSha?:string}>,
  *   prState?:(pr:number)=>(Promise<string|null>|string|null), mainOnly?:boolean, edgeResolve?:boolean,
  *   prBaseChain?:((pr:number)=>(Promise<string[]|null>|string[]|null))|null,
  *   prForcePushes?:((pr:number)=>(Promise<Array<{before:string,after?:string|null}>|null>))|null, stackMode?:'tops'|'independent',
  *   stackModeSource?:string, auditedTip?:((ref:string, sha:string)=>boolean)|null}} o
- * @returns {Promise<{ok:false, reason:'main-unresolved'}|{ok:true, mainSha:string, finalSha:string,
- *   applied:Array<{ref:string,pr:number|null,sha:string}>,
+ * @returns {Promise<{ok:false, reason:string}|{ok:true, mainSha:string, finalSha:string,
+ *   applied:Array<{ref:string,pr:number|null,sha:string,pinnedFrom?:string}>,
  *   decisions:Array<{ref:string,pr:number|null,action:'remove'|'drop'|'skip'|'apply',reason:string,sha:string|null}>,
  *   alerts:Array<object>, inputsKey:string, upToDate:boolean}>}
  */
@@ -337,6 +350,18 @@ export async function planRebuild({
 }) {
   const mainSha = verifyRev(git, `${mainRef}^{commit}`);
   if (!mainSha) return { ok: false, reason: 'main-unresolved' };
+
+  // Resolve every exact pin before any stack/priority/drop decision can silently omit it.
+  const exactPins = new Map();
+  for (const entry of mainOnly ? [] : overlays) {
+    if (entry?.expectedSha === undefined) continue;
+    if (!overlayShaFor(git, entry)) return {
+      ok: false, reason: 'overlay-sha-unavailable',
+      detail: { ref: entry.ref, sha: entry.expectedSha, message: 'exact overlay commit unavailable — holding last good build; restore the commit on origin or remove and re-register the overlay' },
+    };
+    const tip = verifyRev(git, `refs/remotes/origin/${entry.ref}^{commit}`);
+    if (tip && tip !== entry.expectedSha) exactPins.set(entry.ref, tip);
+  }
 
   const alerts = [];
   const decisions = [];
@@ -355,7 +380,7 @@ export async function planRebuild({
   // live #4658/#4663 instead. With no newcomer (or no established overlay) the order is plain list order.
   const isEstablished = (raw) => {
     if (!headSha || !raw?.ref) return false;
-    const sha = verifyRev(git, `refs/remotes/origin/${raw.ref}^{commit}`);
+    const sha = overlayShaFor(git, raw);
     return !!sha && git(['merge-base', '--is-ancestor', sha, headSha]).status === 0;
   };
   const listed = mainOnly ? [] : overlays;
@@ -403,7 +428,7 @@ export async function planRebuild({
       // A recorded identity (including a different PR reusing that ref) takes precedence over this inference.
       for (const ref of registered.keys()) {
         if (carriedRefs.has(ref) || recordedRefs.has(ref)) continue;
-        const sha = verifyRev(git, `refs/remotes/origin/${ref}^{commit}`);
+        const sha = overlayShaFor(git, listed.find((o) => o.ref === ref));
         if (!sha) continue;
         const bases = git(['merge-base', '--all', headSha, sha]);
         if (bases.status !== 0) {
@@ -429,7 +454,7 @@ export async function planRebuild({
   const deferredContainers = new Map();
   if (stackMode === 'tops' && headSha) {
     const entries = toProcess.map((raw) => ({
-      raw, sha: raw?.ref ? verifyRev(git, `refs/remotes/origin/${raw.ref}^{commit}`) : null,
+      raw, sha: raw?.ref ? overlayShaFor(git, raw) : null,
     }));
     for (const base of entries) {
       if (!base.sha || git(['merge-base', '--is-ancestor', base.sha, headSha]).status !== 0
@@ -627,9 +652,10 @@ export async function planRebuild({
       continue;
     }
 
-    // 2. resolve the overlay ref's remote-tracking tip.
-    let ovSha = verifyRev(git, `refs/remotes/origin/${ref}^{commit}`);
+    // 2. Resolve the exact registered commit, or the remote-tracking tip for legacy entries.
+    let ovSha = overlayShaFor(git, raw);
     if (!ovSha) {
+      if (raw?.expectedSha !== undefined) return { ok: false, reason: 'overlay-sha-unavailable', detail: { ref, sha: raw.expectedSha } };
       if (raw?.pinned === true) return refusePinned(ref, pr, null, 'ref-gone', 'flag');
       decisions.push({ ref, pr, action: 'remove', reason: 'ref-gone', sha: null });
       continue;
@@ -973,6 +999,10 @@ export async function planRebuild({
     });
   }
 
+  // Include exact-pin provenance on every application path (ordinary, retry and stack fallback).
+  for (const entry of applied) {
+    if (exactPins.has(entry.ref)) entry.pinnedFrom = exactPins.get(entry.ref);
+  }
   const inputsKey = createHash('sha256')
     .update(JSON.stringify({ main: mainSha, overlays: applied.map((a) => a.resolvedVia
       ? [a.ref, a.sha, a.resolvedVia, a.edgeSha ?? null] : [a.ref, a.sha]) }))
@@ -1032,7 +1062,7 @@ export async function planRebuild({
           // An explicit pin may survive at its adopted head, through a stack top, or already in main.
           const keepsExplicit = [...explicitRefs].every((ref) => {
             if (altApplied.has(ref)) return true;
-            const sha = verifyRev(git, `refs/remotes/origin/${ref}^{commit}`);
+            const sha = overlayShaFor(git, listed.find((o) => o.ref === ref));
             return !!sha && git(['merge-base', '--is-ancestor', sha, alt.finalSha]).status === 0;
           });
           if (keepsExplicit) return alt;

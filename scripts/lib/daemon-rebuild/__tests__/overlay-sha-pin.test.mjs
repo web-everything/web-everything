@@ -2,7 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { spawnSync } from 'node:child_process';
-import { addOverlay, readOverlays, writeOverlays } from '../../daemon-overlays.mjs';
+import { addOverlay, readOverlays } from '../../daemon-overlays.mjs';
 import { planRebuild } from '../plan.mjs';
 import { rebuildClone } from '../index.mjs';
 
@@ -28,9 +28,6 @@ function commit(name, content) {
 }
 function register(expectedSha = a) {
   addOverlay(root, { ref, pinned: true, ...(expectedSha ? { expectedSha } : {}) }, { env });
-  // Isolate the planner contract from the writer's missing persistence (tested separately).
-  // Seed the on-disk entry a fixed writer will produce, also exercising persisted state reads.
-  if (expectedSha) writeOverlays(root, readOverlays(root, { env }).map(o => ({ ...o, expectedSha })), { env });
 }
 function advance({ sibling = false } = {}) {
   if (sibling) gitOk(author, ['checkout', '-q', '-B', ref, main]);
@@ -81,8 +78,9 @@ beforeEach(() => {
 afterEach(() => { vi.restoreAllMocks(); rmSync(base, { recursive: true, force: true }); });
 
 describe('exact-SHA overlay pin', () => {
-  it('plans A after registration at A and a push of B, reports pinnedFrom B, and excludes B from the result tree', async () => {
+  it('applies the persisted exact commit A after the remote advances to B, reporting pinnedFrom B and excluding B', async () => {
     register();
+    expect(readOverlays(root, { env })[0].expectedSha).toBe(a);
     advance();
     assertOnlyA(await plan());
     expect(gitOk(root, ['rev-parse', 'HEAD'])).toBe(main);
@@ -129,7 +127,7 @@ describe('exact-SHA overlay pin', () => {
       const result = await plan(probe);
       expect(result.ok).toBe(false);
       expect(fetched).toBe(true);
-      expect(result.reason).toEqual(expect.any(String));
+      expect(result.reason).toBe('overlay-sha-unavailable');
       const runSmoke = vi.fn();
       const rebuilt = await rebuildClone({ root, env, prState: () => null, prBaseChain: () => [],
         run: probe, runSmoke });
@@ -140,6 +138,26 @@ describe('exact-SHA overlay pin', () => {
       expect(gitOk(root, ['ls-tree', '-r', '--name-only', 'HEAD']).split('\n')).not.toContain('unapproved-B.txt');
     },
   );
+
+  it.each(['MERGED', 'CLOSED'])('refuses an absent exact pin with overlay-sha-unavailable before %s PR-state processing can omit it', async (state) => {
+    addOverlay(root, { ref, pr: 123, expectedSha: a }, { env });
+    missingA();
+    const before = readOverlays(root, { env });
+    const probe = vi.fn((args, opts = {}) => args[0] === 'fetch' && args.includes(a)
+      ? { status: 128, stdout: '', stderr: 'injected exact-fetch failure' }
+      : git(root, args, opts.env));
+    const prState = vi.fn(() => state);
+    const result = await planRebuild({ git: probe, headSha: main, mainRef: 'origin/main', overlays: before, prState });
+    expect(result).toMatchObject({ ok: false, reason: 'overlay-sha-unavailable', detail: { ref, sha: a } });
+    expect(probe.mock.calls.some(([args]) => args[0] === 'fetch' && args.includes(a))).toBe(true);
+    expect(prState).not.toHaveBeenCalled();
+    const runSmoke = vi.fn();
+    const rebuilt = await rebuildClone({ root, env, prState, prBaseChain: () => [], run: probe, runSmoke });
+    expect(rebuilt.moved).toBe(false);
+    expect(runSmoke).not.toHaveBeenCalled();
+    expect(gitOk(root, ['rev-parse', 'HEAD'])).toBe(main);
+    expect(readOverlays(root, { env })).toEqual(before);
+  });
 
   it('keeps following the branch tip for an old pinned entry without expectedSha', async () => {
     register(null);

@@ -254,11 +254,15 @@ export function registrationIdentity(entry) {
   return identity;
 }
 
+/** Register an overlay, optionally at an immutable full 40-hex expectedSha; re-adds retain that pin. */
 export function addOverlay(root, {
-  ref, pr = null, addedBy = null, reason = null, now, pinned, stackBases, conflictOverride,
+  ref, pr = null, addedBy = null, reason = null, now, pinned, stackBases, conflictOverride, expectedSha,
 } = {}, { env = process.env, expectedOverlay } = {}) {
   if (!isSafeBranchName(ref)) {
     throw new TypeError(`daemon-overlays: ref ${JSON.stringify(ref)} is not a safe branch name — refusing to add it`);
+  }
+  if (expectedSha !== undefined && (typeof expectedSha !== 'string' || !/^[0-9a-f]{40}$/.test(expectedSha))) {
+    throw new TypeError('daemon-overlays: expectedSha must be a full lowercase 40-hex sha');
   }
   const bases = Array.isArray(stackBases) ? stackBases.filter((b) => isSafeBranchName(b)) : null;
   return withListLock(root, env, (pause) => {
@@ -273,11 +277,16 @@ export function addOverlay(root, {
       list.push({
         ref, pr: pr ?? null, addedAt: now || new Date().toISOString(), addedBy: addedBy ?? null, reason: reason ?? null,
         ...(pinned === true ? { pinned: true } : {}),
+        ...(expectedSha !== undefined ? { expectedSha } : {}),
         ...(bases ? { stackBases: bases } : {}),
         ...(conflictOverride ? { conflictOverride } : {}),
       });
     } else {
+      if (expectedSha !== undefined && list[idx].expectedSha !== undefined && list[idx].expectedSha !== expectedSha) {
+        throw new Error('daemon-overlays: expectedSha changed; remove the registration before changing its exact sha');
+      }
       const next = { ...list[idx], pr: pr ?? null, reason: reason ?? null };
+      if (expectedSha !== undefined) next.expectedSha = expectedSha;
       if (pinned === true) next.pinned = true;
       else if (pinned === false) delete next.pinned;
       if (bases) next.stackBases = bases;

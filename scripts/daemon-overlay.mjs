@@ -7,6 +7,7 @@
  *   B) — docs/agent/platform-decisions.md#resident-daemon-reload-lifecycle clause 5: a daemon clone tracks
  *   `main` plus an explicit overlay list kept in a per-clone state file OUTSIDE the clone. This is the
  *   add/remove/list surface a person (or a future automated caller) uses to register/drop an overlay ref.
+ *   `add --expected-sha=<40-hex>` checks the fetched tip and persists that exact commit for every rebuild.
  *
  * THIS CLI NEVER TOUCHES THE CLONE'S WRITE LOCK (#4229/#2760 follow-up, epic #3383/#4075, 2026-09-26).
  * add/remove ONLY register/drop an entry in the overlay STORE (`~/.claude/daemon-overlays/<hash>.json`) and
@@ -1028,7 +1029,7 @@ export async function main(argv = process.argv.slice(2), deps = {}) {
       // mutex and returns immediately — this never touches the clone's tree or its reader/writer lock. See the
       // file header for why that lock was dropped here.
       const list = addOverlay(root, {
-        ref: flags.ref, pr, addedBy: by, reason, pinned,
+        ref: flags.ref, pr, addedBy: by, reason, pinned, expectedSha: flags['expected-sha'],
         ...(!check.clean && gate.override ? { conflictOverride: { ...gate.override, files: check.files } } : {}),
       }, { env });
       appendOverlayEvent(root, {

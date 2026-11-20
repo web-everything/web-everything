@@ -173,6 +173,17 @@ describe('addOverlay', () => {
     expect(readFileSync(overlayFilePath(cloneRoot, env()), 'utf8')).toBe(before);
   });
 
+  it('retains the exact pin on re-registration with an omitted or identical expectedSha', () => {
+    const expectedSha = 'a'.repeat(40);
+    addOverlay(cloneRoot, { ref: 'lane/exact', pinned: true, expectedSha }, { env: env() });
+    for (const pin of [{}, { expectedSha }]) {
+      const list = addOverlay(cloneRoot, { ref: 'lane/exact', reason: 'updated', ...pin }, { env: env() });
+      expect(list).toHaveLength(1);
+      expect(list[0]).toMatchObject({ ref: 'lane/exact', pinned: true, expectedSha, reason: 'updated' });
+      expect(readOverlays(cloneRoot, { env: env() })[0].expectedSha).toBe(expectedSha);
+    }
+  });
+
   it('adds a new entry', () => {
     const list = addOverlay(cloneRoot, { ref: 'lane/foo', pr: 12, addedBy: 'nic', reason: 'fix' }, { env: env() });
     expect(list).toEqual([{ ref: 'lane/foo', pr: 12, addedAt: expect.any(String), addedBy: 'nic', reason: 'fix' }]);
