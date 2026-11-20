@@ -57,7 +57,8 @@ export async function ensureRef({ sha, ghJson }) {
   let ref;
   try { ref = await ghJson(['api', '-X', 'POST', `${prefix}/git/refs`, '-f', `ref=refs/heads/${branch}`, '-f', `sha=${sha}`, '--repo', repo]); }
   catch (e) {
-    if (!/422/.test(String(e.status ?? e.message)) || !/already exists/i.test(e.message)) throw e;
+    const detail = `${e.message}\n${e.stderr ?? ''}`;
+    if (!/422/.test(detail) || !/already exists/i.test(detail)) throw e;
     ref = await ghJson(['api', `${prefix}/git/ref/heads/${branch}`, '--repo', repo]);
   }
   if (ref?.ref !== `refs/heads/${branch}` || ref.object?.sha !== sha) throw Error('immutable ref readback sha mismatch');

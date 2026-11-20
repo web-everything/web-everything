@@ -140,16 +140,33 @@ describe('hot-patch MVP CLI', () => {
     expect(ghJson).toHaveBeenCalledTimes(1);
   });
   it.each([sha, other])('422 already-exists read-back at %s is accepted only at exact sha', async value => {
-    const ghJson = github({ createError: Object.assign(Error('HTTP 422 Reference already exists'), { status: 422 }), readback: ref(value) });
+    const ghJson = github({ createError: Object.assign(Error('Command failed: gh api -X POST .../git/refs\ngh: Reference already exists (HTTP 422)'), {
+      status: 1, stderr: Buffer.from('gh: Reference already exists (HTTP 422)\n'),
+    }), readback: ref(value) });
     if (value === sha) await ensureRef({ sha, ghJson });
-    else await expect(ensureRef({ sha, ghJson })).rejects.toThrow(/mismatch|sha|ref/i);
+    else await expect(ensureRef({ sha, ghJson })).rejects.toThrow('immutable ref readback sha mismatch');
     expect(ghJson).toHaveBeenCalledTimes(2);
     expect(ghJson.mock.calls[1][0]).toContain(`${prefix}/git/ref/heads/${branch}`);
   });
-  it('does not treat a non-422 creation failure as an existing ref', async () => {
-    const ghJson = github({ createError: Object.assign(Error('HTTP 503'), { status: 503 }) });
-    await expect(ensureRef({ sha, ghJson })).rejects.toThrow();
+  it.each([
+    ['non-422', 'Reference already exists (HTTP 503)'],
+    ['422 without already-exists evidence', 'Validation failed (HTTP 422)'],
+  ])('does not read back a status-1 %s creation failure', async (_, detail) => {
+    const createError = Object.assign(Error(`Command failed: gh api -X POST .../git/refs\ngh: ${detail}`), {
+      status: 1, stderr: Buffer.from(`gh: ${detail}\n`),
+    });
+    const ghJson = github({ createError });
+    await expect(ensureRef({ sha, ghJson })).rejects.toBe(createError);
     expect(ghJson).toHaveBeenCalledTimes(1);
+  });
+  it.each([
+    ['stderr only', 'Command failed: gh api -X POST .../git/refs', 'gh: Reference already exists (HTTP 422)'],
+    ['split evidence', 'Command failed: gh api -X POST .../git/refs (HTTP 422)', 'gh: Reference already exists'],
+  ])('reads back an existing ref using %s', async (_, message, stderr) => {
+    const ghJson = github({ createError: Object.assign(Error(message), { status: 1, stderr: Buffer.from(stderr) }) });
+    await ensureRef({ sha, ghJson });
+    expect(ghJson).toHaveBeenCalledTimes(2);
+    expect(ghJson.mock.calls[1][0]).toContain(`${prefix}/git/ref/heads/${branch}`);
   });
   it('builds the exact prototype-load argv without shell quoting', () => {
     expect(buildLoadArgs({ daemon: 'review', sha, pr: 42 })).toEqual([
