@@ -4,7 +4,7 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { redTeamStatusDir } from '../drain-red-team-evidence.mjs';
-import { planRedTeamStatusLabels, readCheckClearFact, syncRedTeamStatusLabels } from '../red-team-status-labels.mjs';
+import { createFreshGh, planRedTeamStatusLabels, readCheckClearFact, syncRedTeamStatusLabels } from '../red-team-status-labels.mjs';
 
 const head = 'a'.repeat(40);
 const old = 'b'.repeat(40);
@@ -58,6 +58,28 @@ describe('red-team label settles from the head\'s check', () => {
     const changes = { status: 'finished', result: { foldedVerdict: 'changes' } };
     for (const evidence of [{ ok: false }, { inFlight: true }, { scheduled: true }, { carryConflict: true }, { status: changes }])
       expect(planRedTeamStatusLabels({ ...input, evidence, checkClear: true }).add).not.toBe('red-team:clear');
+  });
+  it('the fact: a newer pending hold in the summary beats an older trusted success in the history', () => {
+    const ctx = 'red-team/publication #42';
+    const gh = args => {
+      const url = String(args.at(-1));
+      if (url.includes('check-runs')) return JSON.stringify({ total_count: 1, check_runs: [run()] });
+      if (url.includes('/status')) return JSON.stringify({ total_count: 1, statuses: [{ id: 9, context: ctx, state: 'pending', creator: { login: 'x' } }] });
+      return JSON.stringify([{ id: 4, context: ctx, state: 'success', creator: { login: 'web-everything[bot]' } }]);
+    };
+    expect(readCheckClearFact({ ...input, gh })).toBe(false);
+  });
+  it('the settle read bypasses the gh read memo (fresh data only)', () => {
+    const seen = [];
+    const fresh = createFreshGh((args, opts) => { seen.push(opts); return '{}'; }, { WE_GH_READ_MEMO_DIR: '/memo', PATH: 'p' });
+    fresh(['api', 'x'], { encoding: 'utf8' });
+    fresh(['api', 'y'], { env: { WE_GH_READ_MEMO_DIR: '/memo' }, throttle: { env: { WE_GH_READ_MEMO_DIR: '/memo', A: '1' } } });
+    for (const opts of seen) {
+      expect(opts.throttle.env.WE_GH_READ_MEMO_DIR).toBeUndefined();
+      expect(opts.env?.WE_GH_READ_MEMO_DIR).toBeUndefined();
+    }
+    expect(seen[0].throttle.env.PATH).toBe('p');
+    expect(seen[1].throttle.env.A).toBe('1');
   });
   describe('local publication holds', () => {
     const withDir = (suffix, fn) => {

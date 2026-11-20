@@ -5,6 +5,7 @@ import { redTeamCardOnly, redTeamOwedOnHead } from './review-red-team-policy.mjs
 import { RED_TEAM_SETTINGS_FILE, readRedTeamDisposition, readRedTeamProbes, redTeamHoldPendingOnly } from './red-team-gate.mjs';
 import { createGhProvider } from './review-label-provider.mjs';
 import { isUnderTest } from './under-test.mjs';
+import { runGhSync, WE_GH_READ_MEMO_DIR } from './gh-throttle.mjs';
 import { carriedCheckMarkerPresent } from './drain-red-team-evidence.mjs';
 import { redTeamCheckRunIsEvidence, readRedTeamPublicationHoldFact, readRedTeamRecoveryFact, resolveWeAppId } from './red-team-check-run.mjs';
 import { standingRulingScope } from '../conveyor/standing-ruling-io.mjs';
@@ -87,16 +88,27 @@ export function planRedTeamStatusLabels({ labels = [], comments, repo, pr, head,
       && !(desired === null && (l === 'red-team:blocked' || (l === 'red-team:pending' && !cardOnlyBypass)))) };
 }
 
+/** A gh runner that never serves the read memo: a label swap is decided on fresh data only. */
+export function createFreshGh(run = runGhSync, baseEnv = process.env) {
+  return (args, opts = {}) => {
+    const env = { ...(opts.throttle?.env ?? baseEnv) };
+    delete env[WE_GH_READ_MEMO_DIR];
+    const execEnv = opts.env ? { ...opts.env } : undefined;
+    if (execEnv) delete execEnv[WE_GH_READ_MEMO_DIR];
+    return run(args, { ...opts, ...(execEnv ? { env: execEnv } : {}), throttle: { ...opts.throttle, env } });
+  };
+}
+
 /** Is the head's red-team check run a trusted, completed success with no open publication hold? Every unreadable or
  * missing input is false (unknown means pending). Reuses the merge gate's own evaluators. */
-export function readCheckClearFact({ repo, pr, head, env = process.env, gh } = {}) {
+export function readCheckClearFact({ repo, pr, head, env = process.env, gh = createFreshGh(runGhSync, env) } = {}) {
   try {
     const app = resolveWeAppId({ env });
     if (app.ok !== true) return false;
-    const options = { repo, pr, headSha: head, appId: app.appId, ...(gh ? { gh } : {}) };
+    const options = { repo, pr, headSha: head, appId: app.appId, gh };
     // An unconfirmed carried-check publish (its outbox marker, which may own a live hold) is no proof either.
     if (carriedCheckMarkerPresent({ repo, pr, head, env })) return false;
-    return readRedTeamRecoveryFact(options).ok === true && readRedTeamPublicationHoldFact(options).ok === true;
+    return readRedTeamRecoveryFact(options).ok === true && readRedTeamPublicationHoldFact({ ...options, strictSummary: true }).ok === true;
   } catch { return false; }
 }
 
