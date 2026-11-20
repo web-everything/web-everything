@@ -2146,6 +2146,7 @@
   "scripts/conveyor/soak/breaks/missing-run-ruleset-merge-gate-invisible.soak.test.mjs": 1.12,
   "scripts/conveyor/soak/breaks/missing-run-structural-deferral-loops.soak.test.mjs": 0.9,
   "scripts/conveyor/soak/breaks/needs-human-codeql-retirement.soak.test.mjs": 1.12,
+  "scripts/conveyor/soak/breaks/needs-you-feed-card-policy.soak.test.mjs": 1.4,
   "scripts/conveyor/soak/breaks/needs-you-feed-disable.soak.test.mjs": 1.4,
   "scripts/conveyor/soak/breaks/nightly-coroner-deadline-stop.soak.test.mjs": 1.4,
   "scripts/conveyor/soak/breaks/nightly-coroner-never-judges.soak.test.mjs": 1.4,
