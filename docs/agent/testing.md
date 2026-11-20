@@ -5568,3 +5568,11 @@ Park opens ready for review; draft-promotion still handles older drafts.
 Check mode fetches origin main before evaluating canonical audit evidence. A failed fetch reports
 `main not refreshed: <reason>` and refuses even when local evidence would pass against stale refs.
 `open-pr-audit-gate.test.mjs` covers both refresh outcomes, aggregation and an unconfirmed check child.
+
+## Pinned merge-drain leaf fixtures (R1105)
+
+CLI fixtures exercising gates after the test-gaming scan must provide a resolved
+commit matching the listed head, a merge-base, numstat and a readable unified diff.
+Use `scripts/__tests__/fixtures/pinned-leaf-diff-fixture.mjs` for synthetic
+`lane/leaf-N` backlog-only PRs; an always-failing Git diff now exercises the
+incomplete-evidence human hold instead of the downstream gate.
