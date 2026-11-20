@@ -5566,6 +5566,25 @@ a reclaimed/remaining partial note. Invalid bounds use defaults and report
 warning. Unreadable reservations refuse and preserve the entire affected slot.
 The sweep unit suite and `forge-sweep-scan-bound-refusal` soak pin these guarantees.
 
+## Expectation babysitter replay (S1)
+
+Run `npm run test:unit -- scripts/conveyor/__tests__/pr-expectations.test.mjs` through
+heavy admission. Replays require all three scratch paths: `--events-file`,
+`--evidence-file`, and `--state-file`; `--as-of` requires those paths too. The events
+file is both input and the scratch miss-event sink. Evidence fixtures use the
+explicit head-bound contract documented in `pr-expectations.mjs`. Missing or capped
+evidence remains unknown. Miss receipts reserve before append to prevent duplicate
+emission after restart; a failed append or abandoned lock requires operator inspection.
+Delivery is at most once, so a crash after reservation but before append can lose a
+miss event. Failed reservations never append; successful appends followed by a save
+failure never retry. The fault-injection tests pin both boundaries and the event's
+complete facts/response contract. Live logs use a 16 MiB tail, skip an unfinished
+last append, and retain observed current-head actions in state across log rotation.
+Malformed complete lines still make evidence unknown. Historical PRs outside the
+open/tracked set are ignored; terminal PRs retire after a complete evaluation.
+Existing queue entries suppress enqueue timers, including after a dequeue/requeue.
+The `expectation-live-event-history` soak replays producer events through the live pass.
+
 ## Review-run filename discovery (R1099)
 
 `review-run-names.fs.test.mjs` covers 6,000 real files, full-scan parity across PR-keyed names,
