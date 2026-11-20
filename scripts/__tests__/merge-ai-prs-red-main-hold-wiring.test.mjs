@@ -1,3 +1,4 @@
+import { pinnedLeafDiffFixture } from './fixtures/pinned-leaf-diff-fixture.mjs';
 /**
  * Card xx7ckd6 — the red-main hold, exercised through the REAL drain CLI with hermetic git/gh shims (the #4389
  * isolation harness shared with merge-ai-prs-merge-queue-hook-wiring.test.mjs). That harness passes
@@ -91,7 +92,7 @@ if (S) {
   if (a[0] === 'ls-files' && /^backlog\\/7001-/.test(a[1] || '')) say('backlog/7001-stranded-card.md');
 }
 if (a[0] === 'remote' && a[1] === 'get-url') process.stdout.write('git@github.com:web-everything/web-everything.git\\n');
-if (a[0] === 'diff') process.exit(1);
+${pinnedLeafDiffFixture}
 process.exit(0);
 `;
 
@@ -111,10 +112,10 @@ function runCli({ freeze = null, priorityPrs = null, publishedRed = false, holdS
     const fixture = join(dir, 'prs.json');
     writeFileSync(fixture, JSON.stringify([FIX, OTHER].map((number) => ({
       number, title: `leaf ${number}`, body: 'A real summary.', headRefName: `lane/leaf-${number}`,
-      baseRefName: 'main', headRefOid: `sha-${number}`, mergeable: number === FIX ? fixMergeable : 'MERGEABLE', mergeStateStatus: 'CLEAN',
+      baseRefName: 'main', headRefOid: number.toString(16).padStart(40, '0'), mergeable: number === FIX ? fixMergeable : 'MERGEABLE', mergeStateStatus: 'CLEAN',
       statusCheckRollup: [{ name: 'test', conclusion: 'SUCCESS', status: 'COMPLETED' }],
       labels: [{ name: 'ready-to-merge' }], comments: [],
-      commits: [{ oid: `sha-${number}`, authors: [{ name: 'Claude', email: 'noreply@anthropic.com' }] }],
+      commits: [{ oid: number.toString(16).padStart(40, '0'), authors: [{ name: 'Claude', email: 'noreply@anthropic.com' }] }],
       files: [{ path: `backlog/leaf-${number}.md`, additions: 1, deletions: 0, changeType: 'ADDED' }],
     }))));
     const coord = join(dir, 'coord');
