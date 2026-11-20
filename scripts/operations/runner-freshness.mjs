@@ -26,6 +26,7 @@ export function assertRunnerFreshness({ declaration, moduleUrl, zeroWrites = fal
   let head = 'unknown';
   let behind = null;
   let uncertainty = '';
+  let pinnedRunner = false;
   const readGit = (args) => {
     const result = String(git(args, root)).trim();
     if (!result && args[0] !== 'fetch') throw new Error(`empty Git response: ${args.join(' ')}`);
@@ -39,6 +40,24 @@ export function assertRunnerFreshness({ declaration, moduleUrl, zeroWrites = fal
       const parts = relative(pool, root).split(sep);
       lane = parts.length === 2 && parts[0] !== '..' && parts[0] !== '' && /^lane-\d+$/.test(parts[1]);
     } catch { /* A missing pool grants no exemption. */ }
+    if (lane && declaration.name === 'open-pr') {
+      // A detached runner must prove its pinned lease against a fresh remote tip.
+      let attached = '';
+      try { attached = readGit(['symbolic-ref', '--quiet', '--short', 'HEAD']); } catch { /* detached or unreadable: require pin proof */ }
+      if (!attached) {
+        pinnedRunner = true;
+        const leasePath = resolve(root, readGit(['rev-parse', '--git-path', '.lane-lease']));
+        const lease = JSON.parse(filesystem.readFileSync(leasePath, 'utf8'));
+        if (typeof lease.at !== 'string' || !/^[a-f0-9]{40}(?![\s\S])/.test(lease.at)
+          || typeof lease.branch !== 'string' || !lease.branch.startsWith('lane/')) throw new Error('missing or invalid pinned runner lease; reacquire the lane');
+        git(['check-ref-format', `refs/heads/${lease.branch}`], root);
+        head = readGit(['rev-parse', '--verify', 'HEAD']);
+        if (head !== lease.at) throw new Error('pinned runner lease at differs from HEAD; reacquire the lane');
+        const target = `refs/remotes/origin/${lease.branch}`;
+        readGit(['fetch', '--quiet', 'origin', `+refs/heads/${lease.branch}:${target}`]);
+        if (readGit(['rev-parse', '--verify', target]) !== lease.at) throw new Error('pinned runner branch tip moved; reacquire the lane');
+      }
+    }
     if (lane || env.WE_DAEMON_MANAGED_CLONE === '1') return { exempt: true };
     head = readGit(['rev-parse', '--verify', 'HEAD']);
     const remote = readGit(['remote', 'get-url', 'origin']);
@@ -69,6 +88,7 @@ export function assertRunnerFreshness({ declaration, moduleUrl, zeroWrites = fal
   } catch (error) {
     uncertainty = String(error?.message ?? error).replace(/\s+/g, ' ');
   }
+  if (pinnedRunner && uncertainty) throw new Error(`Refusing open-pr pinned runner: ${uncertainty}; reacquire the lane.`);
   const detail = `${declaration.name}: runner ${root}; HEAD ${head}; ${FRESHNESS_REF}: `
     + (behind === null ? 'unknown count' : `${behind} commits behind`)
     + (uncertainty ? `; freshness uncertain: ${uncertainty}` : '');

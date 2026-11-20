@@ -31,7 +31,7 @@ import { isTerminalStatus } from './lib/backlog-status.cjs';
  *   node scripts/lane-pool.mjs status  [--lane=N] [--json] [--leased-only] [--max-age-ms=N]     # per-lane: path / head / clean / behind origin/main / deps / lease. --lane=N probes only that provisioned lane (unknown lane: no rows). #4345: --leased-only reads only the lease marker (no git) for a lane with no LIVE lease, and runs the full git probe only for lanes that ARE leased — for a reader that only ever consumes leased rows (conveyor-state.mjs / scope-lease-collect.mjs); an unleased row's git-derived fields (head/branch/clean/behind) are simply absent. Keep plain `status` for operator use and for anything needing dirty-unleased info (lane-pool-health-watch.mjs's trim).
  *   node scripts/lane-pool.mjs list    [--json] [--acquirable [--limit=N] [--no-cache] [--cache-ttl-ms=N] [--scan-timeout-ms=N] [--lane-clean-reuse-ms=N]]  # existing lane paths (for the orchestrator to dispatch into); --acquirable filters out foreign-leased / busy lanes (#2426); #xn432dz: lease-first (no git in a live-leased lane), SINGLE-FLIGHT + cached for --cache-ttl-ms (env LANE_POOL_LIST_CACHE_TTL_MS, default 30000; 0 disables) so concurrent callers share one scan, --no-cache forces a fresh one, --limit=N stops at N (never cached), and the scan fails cleanly past --scan-timeout-ms (env LANE_POOL_LIST_SCAN_TIMEOUT_MS, default 120000); xkv3p37: a cached-mode scan reuses each CLEAN lane's verdict while its cheap stat signals are unchanged, for up to --lane-clean-reuse-ms (env LANE_POOL_LIST_LANE_CLEAN_REUSE_MS, default 300000; 0 disables), and an overrun returns the lanes already proven acquirable (never cached) — it fails only when it proved none
  *   node scripts/lane-pool.mjs path    --lane=N                     # print one lane's absolute path
- *   node scripts/lane-pool.mjs acquire [--purpose=<slug>] [--session=<slug>] [--lane=N] [--item=NNN[,NNN…]] [--ttl-minutes=N] [--no-reset] [--no-reap] [--base=<ref>] [--scope=<repo:path,...>] [--reserve] [--wait-ms=N] [--no-free-list] [--free-list-max-age-ms=N] [--json]  # #2275 lease a free lane (exclusive) + reset to origin/main (or, with #2386 --base=<ref>, to a predecessor lane's pushed tip); stdout = its path. #4122: auto-pick tries `we:scripts/conveyor/lane-pool-health-watch.mjs`'s pre-computed free-lane list FIRST (near-zero git) when it exists and is fresh (< --free-list-max-age-ms / LANE_POOL_FREE_LIST_MAX_AGE_MS, default 10min) — every candidate is still atomically claimed + re-verified fresh before it's ever handed out, so a stale entry costs at most a lost race, never a clobbered lane; --no-free-list opts out. Falls back to today's shared, single-flight, cached full-pool scan (#xn432dz/#3383) unchanged, only when the list is missing, stale or exhausted. #x3jmao3: auto-pick (no --lane) bounded retry — --wait-ms=<total> polls (ACQUIRE_POLL_MS spacing, no busy-wait) for up to that many ms before the "no free lane" failure (omitted ⇒ 8000ms, overridden by LANE_POOL_ACQUIRE_DEFAULT_WAIT_MS; invalid env falls back to 8000ms; explicit --wait-ms=0 ⇒ instant-fail); a genuinely-exhausted pool still fails with the identical message once the bound elapses. #2748: BEFORE selecting, a reaper backstop reclaims any PROVABLY-DEAD ghost lease in the pool (item resolved on main, or PR merged/closed) so a finished-but-unreleased lane never blocks a fresh dispatch — the pool ACTS on the ghost the board only flags; --no-reap opts out. #2413: --purpose=workflow-lane MARKS the lease (workflowLane:true) → the guard requires a sibling to assert its minted slug before a destructive op. #2560: --scope=<repo:path,...> declares this lane's ADVISORY predicted file-scope — persisted into the marker (the live scope-lease collector reads it) + warns on overlap, but NEVER gates the acquire (the whole-clone lease is the real lock). #2616: --item=NNN records this lane's item → lane in the lane-ports registry (same as `map`) so conveyor-state's health-stall scan can flag a genuinely stalled lane — the self-serve population a conveyor delivery agent needs (nothing else calls `map` for it). #2350: --reserve (requires --lane=N) mints a PERMANENT reserved lane — no TTL, never stale, off-limits to acquire/refresh/provision (even --force); dropped only by `release --release-reserved`. #2997: EVERY acquire now mints a per-holder `holder` slug into the lease and prints it (stderr + --json `holder`) — the one signal that separates this holder from a SIBLING agent of the same session, which `ownerSession` cannot; assert it as `--session=<slug>` (release) or `LANE_SESSION=<slug>` (a destructive git op) whenever a sibling of your session also holds a live lane. #2997 r2: --adopt also stamps YOU as the lane's OCCUPANT (`workerSession`) — pass it when the process running this acquire is the one that will work in the lane, omit it when you are leasing on someone else's behalf (they run `adopt` instead).
+ *   node scripts/lane-pool.mjs acquire [--purpose=<slug>] [--session=<slug>] [--lane=N] [--at=<sha> --branch=lane/x] [--item=NNN[,NNN…]] [--ttl-minutes=N] [--no-reset] [--no-reap] [--base=<ref>] [--scope=<repo:path,...>] [--reserve] [--wait-ms=N] [--no-free-list] [--free-list-max-age-ms=N] [--json]  # #2275 lease a free lane (exclusive) + reset to origin/main (or, with #2386 --base=<ref>, to a predecessor lane's pushed tip); stdout = its path. #4122: auto-pick tries `we:scripts/conveyor/lane-pool-health-watch.mjs`'s pre-computed free-lane list FIRST (near-zero git) when it exists and is fresh (< --free-list-max-age-ms / LANE_POOL_FREE_LIST_MAX_AGE_MS, default 10min) — every candidate is still atomically claimed + re-verified fresh before it's ever handed out, so a stale entry costs at most a lost race, never a clobbered lane; --no-free-list opts out. Falls back to today's shared, single-flight, cached full-pool scan (#xn432dz/#3383) unchanged, only when the list is missing, stale or exhausted. #x3jmao3: auto-pick (no --lane) bounded retry — --wait-ms=<total> polls (ACQUIRE_POLL_MS spacing, no busy-wait) for up to that many ms before the "no free lane" failure (omitted ⇒ 8000ms, overridden by LANE_POOL_ACQUIRE_DEFAULT_WAIT_MS; invalid env falls back to 8000ms; explicit --wait-ms=0 ⇒ instant-fail); a genuinely-exhausted pool still fails with the identical message once the bound elapses. #2748: BEFORE selecting, a reaper backstop reclaims any PROVABLY-DEAD ghost lease in the pool (item resolved on main, or PR merged/closed) so a finished-but-unreleased lane never blocks a fresh dispatch — the pool ACTS on the ghost the board only flags; --no-reap opts out. #2413: --purpose=workflow-lane MARKS the lease (workflowLane:true) → the guard requires a sibling to assert its minted slug before a destructive op. #2560: --scope=<repo:path,...> declares this lane's ADVISORY predicted file-scope — persisted into the marker (the live scope-lease collector reads it) + warns on overlap, but NEVER gates the acquire (the whole-clone lease is the real lock). #2616: --item=NNN records this lane's item → lane in the lane-ports registry (same as `map`) so conveyor-state's health-stall scan can flag a genuinely stalled lane — the self-serve population a conveyor delivery agent needs (nothing else calls `map` for it). #2350: --reserve (requires --lane=N) mints a PERMANENT reserved lane — no TTL, never stale, off-limits to acquire/refresh/provision (even --force); dropped only by `release --release-reserved`. #2997: EVERY acquire now mints a per-holder `holder` slug into the lease and prints it (stderr + --json `holder`) — the one signal that separates this holder from a SIBLING agent of the same session, which `ownerSession` cannot; assert it as `--session=<slug>` (release) or `LANE_SESSION=<slug>` (a destructive git op) whenever a sibling of your session also holds a live lane. #2997 r2: --adopt also stamps YOU as the lane's OCCUPANT (`workerSession`) — pass it when the process running this acquire is the one that will work in the lane, omit it when you are leasing on someone else's behalf (they run `adopt` instead).
  *   node scripts/lane-pool.mjs adopt   --lane=N [--force] [--json]   # #2997 r2 the dispatcher → worker OCCUPANCY hand-off: declare the CALLING session the agent working in lane-N (stamps `workerSession`), which is what arms guard-lane.mjs's Edit/Write refusal against every OTHER session. `ownerSession` cannot do this job — it records whoever RAN `acquire`, which for a dispatched lane is the dispatcher, not the worker. Idempotent; a lane already declared-occupied by a different LIVE session needs --force (a deliberate takeover, which names who is displaced).
  *   node scripts/lane-pool.mjs release (--lane=N | --all | --all-pools (--session=<slug> | --item=<num>)) [--session=<slug>] [--pool=<name>] [--force] [--release-reserved] [--discard]   # #2275 hand a leased lane back to the pool (own lease, or --force); refuses unpushed commits or tracked changes unless --discard explicitly accepts their loss; #2350 --release-reserved is the deliberate un-reserve for a PERMANENT reserved lane (--force alone never drops one); #2667 --all-pools --session sweeps EVERY pool under POOL_ROOT and releases that session's leases (cross-locus couple cleanup in one call), and --pool=<name> selects a pool by dir-name (no checkout path needed); #2748 --all-pools --item=<num> is the by-ITEM sweep the drain's release-on-land uses (matches every lease whose session encodes that item number — needs no exact slug); #2997 a CONTESTED lease (another live lease — in ANY pool under POOL_ROOT, per r2 — shares its ownerSession, i.e. a sibling agent of yours holds a lane) is never released on the ownerSession match alone — pass `--session=<the holder slug acquire printed>` or `--force`. A STALE lease is never contested (r2): a dead holder has nothing to prove, so an expired lease releases without --force exactly as on main.
  *   node scripts/lane-pool.mjs remove  (--lane=N | --all) [--dry-run] # tear down lane(s); #2350 REFUSES a reserved lane (even --all/--force) — deliberate teardown is `remove --lane=N --release-reserved`
@@ -483,8 +483,9 @@ function resolveRepo(repoFlags = flags) {
   }
   const name = explicitPool || repoFlags.name || basename(originUrl).replace(/\.git$/, '');
   // Only discover a default when --branch is absent; explicit-branch acquire must not pay for an unused probe.
-  const head = repoFlags.branch ? null : tryGit(['symbolic-ref', '--short', 'refs/remotes/origin/HEAD'], topLevel, gitOptions);
-  const branch = repoFlags.branch || (head ? head.replace(/^origin\//, '') : 'main');
+  const integrationBranch = cmd === 'acquire' && flags.at !== undefined ? undefined : repoFlags.branch;
+  const head = integrationBranch ? null : tryGit(['symbolic-ref', '--short', 'refs/remotes/origin/HEAD'], topLevel, gitOptions);
+  const branch = integrationBranch || (head ? head.replace(/^origin\//, '') : 'main');
   // alternatesReferencePath: the object store lanes may borrow. A primary found by name replaces the invoking lane.
   const alternatesReferencePath = discoveredPrimaryPath || (referenceValidated ? topLevel : null);
   // primaryPath: the checkout whose own auth config the release proof may use (PR #6319 send-back). Only a primary
@@ -2034,6 +2035,8 @@ function tryClaimLane(dir, session, nowMs, ttlMs, { allowReacquire = false } = {
       // (not free-text purpose) that switches the destructive-op guard fail-closed for this lane, requiring a
       // sibling parallel lane to assert this lease's own minted `session` slug before it can clobber the clone.
       workflowLane: flags.purpose === WORKFLOW_LANE_PURPOSE,
+      at: flags.at,
+      branch: flags.at !== undefined ? flags.branch : undefined,
       // #2560 — persist the ADVISORY predicted file-scope declared via `acquire --scope=` (omitted when empty,
       // so a scope-less acquire's marker is unchanged). This is the real predicted-scope source the live
       // scope-lease collector/observer reads; it NEVER gates the claim (the O_EXCL marker below is the lock).
@@ -3027,6 +3030,25 @@ async function cmdAcquire(repo) {
       fail(e && e.message ? e.message : String(e));
     }
   }
+  if (flags.at !== undefined) {
+    try {
+      const target = `refs/remotes/origin/${flags.branch}`;
+      git(['fetch', '--quiet', 'origin', `+refs/heads/${flags.branch}:${target}`], dir);
+      const tip = git(['rev-parse', '--verify', target], dir).trim();
+      if (!/^[a-f0-9]{40}$/.test(tip) || tip !== flags.at) throw new Error('--at must equal the fetched origin branch tip; inspect the branch and retry');
+      git(['cat-file', '-e', `${flags.at}^{commit}`], dir);
+      git(['checkout', '--detach', flags.at, '--quiet'], dir);
+      journalLaneEvent(dir, { action: 'acquire-detach', headAfter: laneHead(dir), reason: `pinned ${flags.branch} at ${flags.at}` });
+    } catch (e) {
+      // All target checks precede checkout; restore main even if checkout partially failed.
+      try {
+        git(['checkout', '-B', repo.branch, `origin/${repo.branch}`, '--quiet'], dir);
+        journalLaneEvent(dir, { action: 'acquire-rollback', headAfter: laneHead(dir), reason: 'pinned target refused' });
+      }
+      finally { restoreLeaseAfterRefusedClaim(dir, preClaimLease); }
+      fail(msgOf(e));
+    }
+  }
   // #2616 — record this lane's item → lane mapping in the PRIMARY checkout's lane-ports registry (the SAME
   // registry #2139's `map` writes and conveyor-state's health-stall scan reverse-derives lane→num from). A
   // conveyor delivery agent acquires its OWN lane and claims its OWN item, so nothing else calls `map` for it —
@@ -3091,7 +3113,7 @@ async function cmdAcquire(repo) {
   if (occupant) log(`  occupant: ${occupant} (--adopt) — Edit/Write from any OTHER session is now refused (#2997)`);
   else log(`  occupant: NOT declared — hand this lane off with \`node scripts/lane-pool.mjs adopt --lane=${chosen}\` run BY the agent that will work in it (or re-run acquire with --adopt if that is you); until then the Edit/Write guard stays fail-open for this lane`);
   touchFreeList(repo, chosen, false);
-  if (flags.json) process.stdout.write(JSON.stringify({ lane: chosen, path: dir, session, holder: holderSlug, workerSession: occupant, purpose: flags.purpose || null, branch: repo.branch, base: flags.base || null, reserved: !!flags.reserve }, null, 2) + '\n');
+  if (flags.json) process.stdout.write(JSON.stringify({ lane: chosen, path: dir, session, holder: holderSlug, workerSession: occupant, purpose: flags.purpose || null, branch: flags.at !== undefined ? flags.branch : repo.branch, ...(flags.at !== undefined ? { at: flags.at } : {}), base: flags.base || null, reserved: !!flags.reserve }, null, 2) + '\n');
   else process.stdout.write(dir + '\n'); // stdout = path only, so `LANE=$(… acquire)` captures it clean
 }
 
@@ -3929,6 +3951,22 @@ async function cmdRelease(repo) {
       url: repo.originUrl || null });
     if (refusedWork) { kept.push({ lane: n, ...refusedWork }); continue; }
     releaseTestBarrier();
+    if (lease.at !== undefined) {
+      if (!sameLease(readLease(dir), lease)) {
+        log(`  lane-${n}: lease changed before pinned release reset — refusing; inspect the current holder`);
+        kept.push({ lane: n, reason: 'lease-changed' });
+        process.exitCode = 1;
+        continue;
+      }
+      try {
+        git(['checkout', '-B', repo.branch, `origin/${repo.branch}`, '--quiet'], dir);
+        journalLaneEvent(dir, { action: 'release-reset', headAfter: laneHead(dir), reason: 'return pinned lease to integration branch' });
+      } catch (e) {
+        kept.push({ lane: n, reason: 'reset-failed', details: msgOf(e) });
+        process.exitCode = 1;
+        continue;
+      }
+    }
     if (!takeMarkerIf(dir, (moved) => sameLease(moved, lease), n)) {
       log(`  lane-${n}: lease changed since it was read (a new acquire/release raced this one) — not releasing; re-run if lane-${n} still looks wrong`);
       continue;
@@ -5710,7 +5748,7 @@ function cmdUnmap(repo) {
 // reading a flag meant for a different command is a much smaller, less surprising mistake than an
 // unrecognized flag vanishing outright, and a flat set can't drift out of sync with which command reads what.
 const KNOWN_FLAGS = new Set([
-  'acquirable', 'adopt', 'all', 'all-pools', 'base', 'branch', 'count', 'discard', 'force', 'item', 'json', 'lane',
+  'acquirable', 'adopt', 'all', 'all-pools', 'at', 'base', 'branch', 'count', 'discard', 'force', 'item', 'json', 'lane',
   'name', 'no-install', 'no-reap', 'no-reset', 'origin', 'pool', 'purpose', 'reference', 'release-reserved',
   'repo', 'reserve', 'scope', 'session', 'expect-holder', 'ttl-minutes', 'wait-ms',
   // #xn432dz — list --acquirable's single-flight cache / early-stop / bounded-scan knobs.
@@ -5863,6 +5901,19 @@ if (unknownFlags.length) {
       `full flag list. A silently-ignored flag on a destructive command like \`acquire\` is exactly the footgun this check exists to close.`,
   );
 }
+
+// Pinned acquires keep the integration branch at its default; --branch names only the target.
+if (flags.at !== undefined) {
+  if (cmd !== 'acquire' || typeof flags.at !== 'string' || !/^[a-fA-F0-9]{40}(?![\s\S])/.test(flags.at)) fail('--at requires acquire and a full 40-hex sha');
+  if (typeof flags.branch !== 'string' || !flags.branch.startsWith('lane/')) fail('--at requires --branch=lane/<x>');
+  try { git(['check-ref-format', `refs/heads/${flags.branch}`], process.cwd()); }
+  catch { fail('--at requires a valid --branch=lane/<x>'); }
+  for (const flag of ['force', 'base', 'no-reset', 'reserve']) {
+    if (flags[flag] !== undefined) fail(`--at is incompatible with --${flag}`);
+  }
+  flags.at = flags.at.toLowerCase();
+}
+if (cmd === 'acquire' && flags.at !== undefined && flags.lane === 'auto') delete flags.lane;
 
 // Validate before repo resolution or dispatch so every flags.lane consumer is protected.
 // A bare --lane is true, and Number(true) would silently select lane 1 even with --force.
