@@ -35,7 +35,8 @@ function fixture() {
   git('checkout', '-q', 'main');
   git('merge', '--no-ff', '-m', 'daemon-rebuild: merge overlay lane/withdraw onto main', 'lane/withdraw');
   const args = { root, ref: 'lane/withdraw', tip, actor: 'CHALBERT', reason: 'operator withdrawal', acceptUncontained: true, env,
-    deps: { resolveOperatorIdentity: () => ({ login: 'chalbert', type: 'User' }) } };
+    deps: { resolveOperatorIdentity: () => ({ login: 'chalbert', type: 'User' }),
+      fetchMainAndOverlays: vi.fn(() => ({ ok: true, goneRefs: [] })) } };
   const events = () => { try { return readFileSync(overlayFilePath(root, env).replace(/\.json$/, '.events.jsonl'), 'utf8').trim().split('\n').map(JSON.parse); } catch { return []; } };
   return { root, env, git, args, tip, events };
 }
@@ -88,6 +89,37 @@ describe('operator withdrawal of an unregistered live overlay', () => {
       "cannot prove no registered overlay depends on lane/withdraw; fetch the clone's overlays first");
     expect(f.events()).toEqual(before);
   });
+  it('refuses a fresh remote dependent hidden by an independent stale cached tip', async () => {
+    const f = fixture();
+    addOverlay(f.root, { ref: 'lane/top' }, { env: f.env });
+    const stale = f.git('commit-tree', 'HEAD^{tree}', '-p', 'refs/remotes/origin/main', '-m', 'old independent top');
+    const remoteTip = f.git('commit-tree', 'HEAD^{tree}', '-p', f.tip, '-m', 'fresh stacked top');
+    f.git('update-ref', 'refs/remotes/origin/lane/top', stale);
+    expect(f.git('merge-base', f.tip, stale)).toBe(f.git('rev-parse', 'refs/remotes/origin/main'));
+    const before = f.events();
+    f.args.deps.fetchMainAndOverlays.mockImplementation(({ git, overlays }) => {
+      expect(overlays.map(o => o.ref)).toEqual(['lane/top']);
+      expect(git(['update-ref', 'refs/remotes/origin/lane/top', remoteTip]).status).toBe(0);
+      return { ok: true, goneRefs: [] };
+    });
+    await expect(withdrawUnregisteredOverlay(f.args)).rejects.toThrow(/stacked-dependents/);
+    expect(f.args.deps.fetchMainAndOverlays).toHaveBeenCalledTimes(1);
+    expect(f.events()).toEqual(before);
+  });
+  it.each(['throws', 'failed', 'unrefreshed', 'missing result'])('refuses overlay refresh %s with an operator fallback', async failure => {
+    const f = fixture();
+    addOverlay(f.root, { ref: 'lane/other' }, { env: f.env });
+    f.git('update-ref', 'refs/remotes/origin/lane/other', f.git('rev-parse', 'refs/remotes/origin/main'));
+    const before = f.events();
+    f.args.deps.fetchMainAndOverlays.mockImplementation(() => {
+      if (failure === 'throws') throw new Error('remote unavailable');
+      if (failure === 'failed') return { ok: false, reason: 'fetch-failed' };
+      if (failure === 'unrefreshed') return { ok: true, goneRefs: ['lane/other'] };
+      return undefined;
+    });
+    await expect(withdrawUnregisteredOverlay(f.args)).rejects.toThrow(/could not refresh.*restore.*retry/);
+    expect(f.events()).toEqual(before);
+  });
   it('refuses a stale tracking ref with no cached relationship and truncated local history', async () => {
     const f = fixture();
     addOverlay(f.root, { ref: 'lane/top' }, { env: f.env });
@@ -100,7 +132,7 @@ describe('operator withdrawal of an unregistered live overlay', () => {
     expect(ancestry.status).toBe(1);
     const before = f.events();
     const run = vi.fn((cmd, args, opts) => {
-      if (['fetch', 'ls-remote'].includes(args[0])) throw new Error('withdrawal must be fetch-free');
+      if (['fetch', 'ls-remote'].includes(args[0])) throw new Error('fetch must use the injected helper');
       return spawnSync(cmd, args, opts);
     });
     await expect(withdrawUnregisteredOverlay({ ...f.args, deps: { ...f.args.deps, run } })).rejects.toThrow(
@@ -128,19 +160,25 @@ describe('operator withdrawal of an unregistered live overlay', () => {
     await expect(withdrawUnregisteredOverlay({ ...f.args, deps: { ...f.args.deps, run } })).rejects.toThrow(/containment unreadable/);
     expect(f.events()).toEqual([]);
   });
-  it('accepts resolvable independent registered overlays using only local evidence', async () => {
+  it('accepts freshly fetched independent registered overlays', async () => {
     const f = fixture();
     addOverlay(f.root, { ref: 'lane/independent' }, { env: f.env });
     f.git('update-ref', 'refs/remotes/origin/lane/independent', f.git('rev-parse', 'refs/remotes/origin/main'));
     addOverlay(f.root, { ref: 'lane/second' }, { env: f.env });
     const secondTip = f.git('commit-tree', 'HEAD^{tree}', '-p', 'refs/remotes/origin/main', '-m', 'independent');
-    f.git('update-ref', 'refs/remotes/origin/lane/second', secondTip);
+    f.git('update-ref', 'refs/remotes/origin/lane/second', f.tip);
+    f.args.deps.fetchMainAndOverlays.mockImplementation(({ git, overlays }) => {
+      expect(overlays.map(o => o.ref)).toEqual(['lane/independent', 'lane/second']);
+      expect(git(['update-ref', 'refs/remotes/origin/lane/second', secondTip]).status).toBe(0);
+      return { ok: true, goneRefs: [] };
+    });
     const run = vi.fn((cmd, args, opts) => {
-      if (['fetch', 'ls-remote'].includes(args[0])) throw new Error('withdrawal must be fetch-free');
+      if (['fetch', 'ls-remote'].includes(args[0])) throw new Error('fetch must use the injected helper');
       return spawnSync(cmd, args, opts);
     });
     expect(await withdrawUnregisteredOverlay({ ...f.args, deps: { ...f.args.deps, run } })).toMatchObject({ retired: true });
     expect(run).toHaveBeenCalled();
+    expect(f.args.deps.fetchMainAndOverlays).toHaveBeenCalledTimes(1);
   });
   it('refuses automatic reasons as explicit withdrawal authority', async () => {
     const f = fixture();

@@ -5186,8 +5186,9 @@ Check mode fetches origin main before evaluating canonical audit evidence. A fai
 
 ## Local-only overlay withdrawal evidence
 
-`daemon-overlay-operator-withdrawal.test.mjs` uses real Git histories to verify that every other registered
-overlay has a locally resolvable tip and a common ancestor with the withdrawn tip before a negative ancestry
-result proves independence. A stale tracking tip with truncated history can return ancestry status 1 without
-that proof; refuse and ask the operator to fetch the clone's overlays first. Missing tips and unreadable
-merge-base/ancestry evidence also refuse without recording retirement. Keep this path fetch-free.
+`daemon-overlay-operator-withdrawal.test.mjs` uses real Git histories and an injected `fetchMainAndOverlays`
+to verify that withdrawal refreshes every registered overlay before checking independence. A common ancestor
+does not prove freshness: an independent cached tip can hide a fresh remote stacked dependent. Refuse failed,
+missing or incomplete fetch results (including nonempty `goneRefs`) without recording retirement; tell the
+operator to restore remote access and overlay refs before retrying. Freshly fetched independent overlays
+permit withdrawal. Missing tips, truncated history and unreadable merge-base/ancestry evidence still refuse.

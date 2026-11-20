@@ -133,6 +133,7 @@ import { readOverlayStale } from './lib/daemon-rebuild/overlay-prune.mjs';
 import { edgeEnabled, registerPr } from './lib/daemon-edge.mjs';
 import { assertHumanOperator, resolveOperatorIdentity } from './lib/operator-identity.mjs';
 import { REBUILD_IDENTITY_ENV } from './lib/daemon-rebuild/shared.mjs';
+import { fetchMainAndOverlays } from './lib/daemon-rebuild/edge-fetch.mjs';
 
 /** Attribution is optional for ordinary lifecycle operations; never infer it from --by or $USER. */
 function removalActor({ actor, env, deps }) {
@@ -145,7 +146,7 @@ function removalActor({ actor, env, deps }) {
   }
 }
 
-/** Operator repair of an actorless withdrawal: no registration mutation or remote tip lookup. */
+/** Operator repair of an actorless withdrawal: refresh registered overlays before proving independence. */
 export async function withdrawUnregisteredOverlay({ root, ref, tip, actor, reason, acceptUncontained = false, env = process.env, deps = {} }) {
   if (!safeRegistrationRef(ref)) throw new Error('a valid --ref is required');
   if (typeof tip !== 'string' || !/^[a-f0-9]{40}(?![\s\S])/.test(tip)) throw new Error('--tip must be a full lowercase 40-hex live tip');
@@ -173,6 +174,12 @@ export async function withdrawUnregisteredOverlay({ root, ref, tip, actor, reaso
         && [2, 3].includes(ps.length) && ps[1] === tip;
     });
     if (!applied) throw new Error('--tip is not a live applied tip for this ref; inspect the clone rebuild merge parents and retry');
+    let fetched;
+    try {
+      fetched = await (deps.fetchMainAndOverlays ?? fetchMainAndOverlays)({ git, overlays: state.overlays });
+    } catch { /* Unknown freshness cannot authorize withdrawal. */ }
+    if (fetched?.ok !== true || !Array.isArray(fetched.goneRefs) || fetched.goneRefs.length > 0)
+      throw new Error("could not refresh the clone's overlays; restore remote access and overlay refs, then retry withdrawal");
     const proof = proveOverlayWithdrawal({ root, ref, tip, reason, env, localOnly: true,
       git: (...args) => { const r = git(args); return { code: r.error ? null : r.status, stdout: r.stdout ?? '' }; } });
     if (proof.action !== 'retire') throw new Error(`${proof.reason}; inspect stacked dependents and restore local tracking refs before retrying withdrawal`);
