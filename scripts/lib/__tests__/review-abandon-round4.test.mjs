@@ -2,7 +2,7 @@ import { afterEach, beforeEach, expect, it, vi } from 'vitest';
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, renameSync, rmSync, statSync, utimesSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { filterRunFileNames, listRunIds, newRunRecord, runPath, writeRun } from '../../operations/run-store.mjs';
+import { filterRunFileNames, listRunIds, newRunRecord, readRun, runPath, writeRun } from '../../operations/run-store.mjs';
 import { abandonedPath, isRunAbandoned, markRunAbandoned } from '../run-abandoned.mjs';
 import { closeConfirmRunsAfterClearance } from '../../review-set-label.mjs';
 import { reapDeadReviewRuns } from '../reap-dead-review-runs.mjs';
@@ -211,8 +211,13 @@ it.each([
   ['null effects', { effects: null }],
   ['missing pending cursor', { pending: undefined }],
 ])('%s replacement is rejected as corrupt gate evidence', (_name, more) => {
-  replacementFixture(more);
-  expect(() => gate(readDrainRedTeamEvidence)).toThrow('refusing to read run');
+  const replacement = replacementFixture(more);
+  expect(() => readRun(replacement.id, dir)).toThrow('refusing to read run');
+  // Default filename discovery translates unreadable candidates into a hard hold.
+  // Neither gate may use the corrupt replacement to discharge abandonment.
+  for (const reader of [readDrainRedTeamEvidence, readRecoveryWitness]) {
+    expect(gate(reader)).toMatchObject({ ok: false, reason: 'scan-capped' });
+  }
 });
 
 it('replacement with every effect applied suppresses escalation after a long quiet period', () => {
