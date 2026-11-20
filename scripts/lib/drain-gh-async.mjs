@@ -1,18 +1,36 @@
-/** Async drain reads use the existing throttle CLI so its host-wide budgets still apply. */
+/** Async drain reads run the sync throttle in a worker so its budgets and child timeout still apply. */
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
-import { fileURLToPath } from 'node:url';
-import { dirname, join } from 'node:path';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 
 const exec = promisify(execFile);
-const throttle = join(dirname(fileURLToPath(import.meta.url)), 'gh-throttle.mjs');
+const worker = fileURLToPath(import.meta.url);
 export function execDrainAsync(file, args, options = {}) {
   // Test CLI fixtures supply a fake gh on PATH. Keep that seam hermetic even when the host's shim
   // exports a real-binary override; they still execute the throttle, with the fake as its subprocess.
   const env = options.env ?? process.env;
   const testOptions = env.VITEST || env.WE_UNDER_TEST
     ? { env: { ...env, WE_GH_THROTTLE_GH_BIN: 'gh' } } : {};
-  return file === 'gh'
-    ? exec(process.execPath, [throttle, ...args], { maxBuffer: 64 * 1024 * 1024, ...options, ...testOptions })
-    : exec(file, args, options);
+  if (file !== 'gh') return exec(file, args, options);
+  const { timeout, killSignal, ...wrapperOptions } = options;
+  return exec(process.execPath, [worker, JSON.stringify({ timeout, killSignal }), ...args], {
+    maxBuffer: 64 * 1024 * 1024, ...wrapperOptions, ...testOptions,
+  });
+}
+
+// Keep the worker alive until runGhSync kills/reaps gh and releases its slot in finally.
+if (import.meta.url === pathToFileURL(process.argv[1] || '').href) {
+  try {
+    const { runGhSync } = await import('./gh-throttle.mjs');
+    const output = runGhSync(process.argv.slice(3), {
+      ...JSON.parse(process.argv[2]), maxBuffer: 64 * 1024 * 1024,
+      stdio: ['inherit', 'pipe', 'pipe'],
+      throttle: { caller: 'merge-ai-prs.mjs', bin: process.env.WE_GH_THROTTLE_GH_BIN || 'gh' },
+    });
+    process.stdout.write(output);
+  } catch (error) {
+    if (error.stderr?.length) process.stderr.write(error.stderr);
+    process.stderr.write(`${error.message}\n`);
+    process.exitCode = error.status || 1;
+  }
 }

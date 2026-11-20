@@ -5,6 +5,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { execDrainAsync } from '../drain-gh-async.mjs';
 import { runEnqueueCandidates } from '../drain-concurrency.mjs';
+import { readGhSlotHolders } from '../gh-throttle-holders.mjs';
 
 it('runs overlapping subprocess reads through the real throttle and isolates a subprocess failure', async () => {
   const root = mkdtempSync(join(tmpdir(), 'drain-async-'));
@@ -26,6 +27,7 @@ setTimeout(() => {
     const env = { ...process.env, PATH: `${bin}:${process.env.PATH}`, VITEST: 'true',
       DRAIN_TEST_EVENTS: eventsFile, WE_GH_THROTTLE_LOCK_ROOT: join(root, 'throttle'),
       WE_GH_THROTTLE_GH_BIN: 'host-override-must-not-reach-fixture',
+      WE_GH_THROTTLE_CALLER: 'unknown',
       WE_GH_THROTTLE_CAP: '6', WE_GH_THROTTLE_RETRY_MAX_ATTEMPTS: '1' };
     const completed = [], failed = [];
     await runEnqueueCandidates([1, 2, 3].map(num => ({ num })), { concurrency: 3, canParallel: () => true,
@@ -45,5 +47,35 @@ setTimeout(() => {
     expect(active).toBe(0);
     const calls = readFileSync(join(root, 'throttle', 'calls.jsonl'), 'utf8').trim().split('\n').map(JSON.parse);
     expect(calls).toHaveLength(3);
+    expect(calls.map(call => call.caller)).toEqual(Array(3).fill('merge-ai-prs.mjs'));
   } finally { rmSync(root, { recursive: true, force: true }); }
+}, 15000);
+
+it('kills the real gh on timeout and releases its throttle slot', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'drain-timeout-'));
+  const pidFile = join(root, 'pid');
+  let pid;
+  try {
+    const bin = join(root, 'bin');
+    mkdirSync(bin);
+    writeFileSync(join(bin, 'gh'), `#!/usr/bin/env node
+require('node:fs').writeFileSync(process.env.DRAIN_TEST_PID, String(process.pid));
+process.on('SIGTERM', () => {});
+setInterval(() => {}, 1000);
+`, { mode: 0o755 });
+    const lockRoot = join(root, 'throttle');
+    const env = { ...process.env, PATH: `${bin}:${process.env.PATH}`, VITEST: 'true',
+      DRAIN_TEST_PID: pidFile, WE_GH_THROTTLE_LOCK_ROOT: lockRoot,
+      WE_GH_THROTTLE_RETRY_MAX_ATTEMPTS: '1' };
+    await expect(execDrainAsync('gh', ['pr', 'view', '1'], {
+      env, timeout: 1500, killSignal: 'SIGKILL', encoding: 'utf8',
+    })).rejects.toThrow();
+    pid = Number(readFileSync(pidFile, 'utf8'));
+    expect(() => process.kill(pid, 0)).toThrow();
+    expect(readGhSlotHolders({ lockRoot, cap: 6 })).toEqual([]);
+  } finally {
+    if (!pid) { try { pid = Number(readFileSync(pidFile, 'utf8')); } catch {} }
+    if (pid) { try { process.kill(pid, 'SIGKILL'); } catch {} }
+    rmSync(root, { recursive: true, force: true });
+  }
 }, 15000);

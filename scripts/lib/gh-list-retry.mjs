@@ -58,13 +58,16 @@ function* listRetry(fn, { repo = '', op = 'pr-list', attempts, backoffMs, sleep 
   backoffMs ??= listBackoffFromEnv(env);
   attempts ??= backoffMs.length + 1;
   const key = `${repo}:${op}`;
-  const map = streaks ?? (persist ? loadStreaks(env) : new Map());
-  const save = () => { if (!streaks && persist) saveStreaks(env, map); };
+  // Read persistent state only at the update, after any asynchronous list/backoff.
+  // Each read-modify-save is synchronous so parallel listings cannot overwrite one another.
+  const current = () => streaks ?? (persist ? loadStreaks(env) : new Map());
+  const save = (map) => { if (!streaks && persist) saveStreaks(env, map); };
   let lastError;
   for (let attempt = 0; attempt < attempts; attempt++) {
     try {
       const out = yield fn;
-      if (map.delete(key)) save();
+      const map = current();
+      if (map.delete(key)) save(map);
       return out;
     } catch (e) {
       lastError = e;
@@ -73,9 +76,10 @@ function* listRetry(fn, { repo = '', op = 'pr-list', attempts, backoffMs, sleep 
     }
   }
   if (isTransientListFailure(lastError)) {
+    const map = current();
     const consecutive = (Number(map.get(key)) || 0) + 1;
     map.set(key, consecutive);
-    save();
+    save(map);
     if (consecutive >= threshold && consecutive % threshold === 0) {
       const ev = { kind: 'gh-list-failed', repo, daemon: daemon ?? process.env.WE_DAEMON_NAME ?? undefined,
         detail: { op, consecutive, error: String(lastError?.message ?? lastError).split('\n')[0].slice(0, 300) } };
