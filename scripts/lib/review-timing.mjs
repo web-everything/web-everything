@@ -57,11 +57,18 @@ const isHealable = (row, requiredChecks) => {
   if (isReviewHoldGate(row)) return false;
   return Array.isArray(requiredChecks) && requiredChecks.length ? requiredChecks.includes(name) : !NON_HEALABLE_CHECKS.includes(name);
 };
+/**
+ * Raw rows of this head (no head_sha = the pinned commit-status reader), filtered BEFORE any per-name collapse
+ * (PR #7160): collapsing first let a newer foreign-head run hide this head's red run of the same name. The head
+ * compare is trimmed and case-insensitive, so a same-head row is never dropped as foreign.
+ */
+const normHead = sha => String(sha ?? '').trim().toLowerCase();
+const rowsOnHead = (checks, headSha) => (Array.isArray(checks) ? checks : [])
+  .filter(row => !row?.head_sha || normHead(row.head_sha) === normHead(headSha));
 /** Is a healable check red on this head? An optional red (CodeQL, with a known required set) is not. */
 export function ciRedOnHead({ headSha, checks, requiredChecks = null } = {}) {
   if (!headSha) return false;
-  return collapseRollupToLatestPerName(checks).some(row => isHealable(row, requiredChecks)
-    && (!row.head_sha || row.head_sha === headSha)
+  return collapseRollupToLatestPerName(rowsOnHead(checks, headSha)).some(row => isHealable(row, requiredChecks)
     && RED.has(String(row.conclusion ?? row.state ?? '').toLowerCase()));
 }
 /** Diagnostic only, including drafts: a wait retains the existing review gates; never grants merge permission. */
@@ -105,7 +112,7 @@ export function earlyStartShadow({ headSha, checks, requiredChecks, verifyGreen,
     };
     // Judge every RAW row (before rollup collapse or head filtering) so a malformed or contradictory row cannot vanish.
     if (!checks.every(row => readable(row) && !(row.state != null && (row.conclusion != null || row.status != null)))) return result('incomplete-checks');
-    const rows = collapseRollupToLatestPerName(checks).filter(row => !row.head_sha || row.head_sha === headSha);
+    const rows = collapseRollupToLatestPerName(rowsOnHead(checks, headSha));
     if (!requiredChecks.every(name => rows.some(row => (row.name ?? row.context) === name && readable(row)))) return result('incomplete-checks');
     if (rows.some(row => !readable(row))) return result('incomplete-checks');
     if (ciRedOnHead({ headSha, checks, requiredChecks })) return result('ci-red');
@@ -248,8 +255,7 @@ export function joinedFixDecision({ ciFailed = false, reviewFindings = false, fi
  * back to the heal path's own rule (every check but {@link NON_HEALABLE_CHECKS}).
  */
 export function fixReadiness({ headSha, checks = [], findings = [], reviewPending = false, requiredChecks = null } = {}) {
-  const latest = collapseRollupToLatestPerName(checks).filter(row =>
-    !isReviewHoldGate(row) && (!row.head_sha || row.head_sha === headSha));
+  const latest = collapseRollupToLatestPerName(rowsOnHead(checks, headSha)).filter(row => !isReviewHoldGate(row));
   const failed = latest.filter(row => isHealable(row, requiredChecks)
     && RED.has(String(row.conclusion ?? row.state ?? '').toLowerCase()));
   const times = [...failed.map(row => row.completed_at ?? row.completedAt), ...findings.map(row => row.createdAt)]

@@ -45,6 +45,26 @@ describe('pending-CI start policy', () => {
       expect(result.affected).toContainEqual({ name: 'test', reason: 'wrong-head' });
     }
   });
+  // Self-review on d2e6a966: foreign rows must be dropped BEFORE the collapse, or a newer foreign-head green run
+  // hides this head's red run of the same name from every red guard.
+  describe('a newer foreign-head run cannot hide a current-head red', () => {
+    const checks = [check('test', 'failure', { id: 1 }), check('test', 'success', { id: 2, head_sha: 'b'.repeat(40) }), check('lint', 'success', { id: 3 })];
+    const requiredChecks = ['test', 'lint'];
+    it('ciRedOnHead, fixReadiness and reviewMustVoid see the red', () => {
+      expect(ciRedOnHead({ headSha: head, checks, requiredChecks })).toBe(true);
+      expect(fixReadiness({ headSha: head, checks, requiredChecks }).ciFailed).toBe(true);
+      expect(reviewMustVoid({ reviewedHead: head, currentHead: head, checks, requiredChecks, policy: { ...review, cancelOnCiRed: true } })).toBe(true);
+    });
+    it('matches the head case- and whitespace-insensitively', () => {
+      const upper = [check('test', 'failure', { head_sha: ` ${head.toUpperCase()} ` })];
+      expect(ciRedOnHead({ headSha: head, checks: upper, requiredChecks: ['test'] })).toBe(true);
+    });
+    it.each(['push', 'fast-checks'])('reviewStartGate refuses under startAfter=%s', startAfter => {
+      const result = reviewStartGate({ rowsComplete: true, rowsHead: head, headSha: head, requiredChecks, checks,
+        policy: { ...review, startAfter, fastChecks: ['lint'] } });
+      expect(result).toMatchObject({ allowed: false, reason: 'ci-red' });
+    });
+  });
   it.each(['off', 'shadow', 'on'])('a green test aggregate implies integration, but not standards, under startEarly=%s', startEarly => {
     const policy = { ...review, startAfter: 'fast-checks', startEarly, fastChecks: ['test', 'integration', 'standards'] };
     const result = reviewStartGate({ rowsComplete: true, rowsHead: head, headSha: head, requiredChecks: ['test', 'integration'], checks: [check('test')], policy });
