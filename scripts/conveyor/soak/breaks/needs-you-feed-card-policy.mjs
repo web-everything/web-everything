@@ -27,7 +27,7 @@ export default {
         readPolicy: () => ({ broken: 'send-back', degraded: 'card', unconfirmed: 'advisory' }) });
       return kept[0]?.kind;
     };
-    if (await kindFor('degraded') === 'confirmed-break-owed-send-back') violations.push('carded degraded breaks still alarm');
+    if (await kindFor('degraded') !== 'needs-you') violations.push('carded degraded breaks were not settled to needs-you');
     if (await kindFor('broken') !== 'confirmed-break-owed-send-back') violations.push('a broken break with only a card record stopped alarming');
     return { violations };
   },

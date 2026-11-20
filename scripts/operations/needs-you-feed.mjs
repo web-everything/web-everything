@@ -96,7 +96,14 @@ export function itemsFromReport(report) {
 }
 // For the approval alert every confirmed break (degraded as well as broken) counts, whatever the send-back policy;
 // a break the gate already released (recorded card/advisory/ruling) no longer holds.
-const ALERT_BREAK_POLICY = Object.freeze({ broken: 'send-back', degraded: 'send-back', unconfirmed: 'advisory' });
+// Strict fallback: every confirmed break is owed a send-back and no finding class defers to a card.
+const ALERT_BREAK_POLICY = Object.freeze({ broken: 'send-back', degraded: 'send-back', unconfirmed: 'advisory', findingClasses: Object.freeze({}) });
+/** The shared reader; a missing file or an unset/invalid broken/degraded value is unreadable (strict), never a default. */
+export function readBreakPolicy() {
+  const read = readConfirmedBreaks({ strict: true });
+  if (read.source?.broken === 'default' || read.source?.degraded === 'default') throw new Error('confirmedBreaks is not set');
+  return read.value;
+}
 // The parser silently drops a finding line it cannot read; the comment's own headline counts them. Any result
 // comment for the live head whose headline disagrees with what parsed is not a clean pass (fail closed).
 function headlineAgrees(comments, pr, head) {
@@ -237,7 +244,7 @@ async function readLivePr(item, { gh, cwd }, fields = 'labels,headRefOid') {
  */
 export async function gateReadyItems(items, report, { gh, cwd, now = Date.now(), log = console.error, deadlineMs = 120000, concurrency = 4,
   fixClaimLive = (repo, pr) => { try { return readLiveFixClaim({ repo, pr }) !== null; } catch { return null; } },
-  readPolicy = () => readConfirmedBreaks({ strict: true }).value } = {}) {
+  readPolicy = readBreakPolicy } = {}) {
   // The same policy reader the gate uses; an unreadable setting keeps the strict policy (alarm).
   let policy;
   try { policy = readPolicy(); if (!policy || typeof policy !== 'object') throw new Error('no policy'); } catch { policy = ALERT_BREAK_POLICY; }

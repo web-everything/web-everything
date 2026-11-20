@@ -458,7 +458,12 @@ describe('gateReadyItems: "your review" is re-checked against the live PR (#5768
     const kind = async (comments, readPolicy) => (await run(comments, readPolicy)).kept.find(i => i.pr === 5768).kind;
     it('#7181: two degraded breaks with the gate card-queued record raise no alarm under degraded=card', async () => {
       const comments = queued('degraded', 2);
-      expect(await kind(comments, () => cardPolicy)).not.toBe('confirmed-break-owed-send-back');
+      expect(await kind(comments, () => cardPolicy)).toBe('needs-you');
+    });
+    it('a broken deferred-class finding still alarms under the strict fallback', async () => {
+      const [res, rec] = queued('broken');
+      const body = res.body.replace(/\bedge-case\b/, 'theoretical-race');
+      expect(await kind([{ ...res, body }, rec], () => { throw new Error('unreadable'); })).not.toBe('needs-you');
     });
     it('an unreadable setting falls back to the strict policy (alarm)', async () => {
       const comments = queued('degraded', 2);
