@@ -5660,6 +5660,7 @@ run id in the clearance comment. `ci-self.yml` is manual dispatch only and calls
 `test`, `smoke` or `daemon-soak`. GitHub only dispatches a workflow that exists on main, so this works
 after the first merge. `scripts/ci/__tests__/ci-self-workflow.test.mjs` parses the YAML to keep the
 contract (triggers, local call, no required-name collision). Merge-gate enforcement is a later card.
+
 ## Lane reset safety probe regressions
 
 `lane-pool-acquire-reset-probe-failed.test.mjs` uses a PATH Git shim activated after fetch
