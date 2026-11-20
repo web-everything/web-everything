@@ -88,6 +88,7 @@
     "scripts/lib/gate-timeout-retry.mjs",
     "scripts/lib/gh-app-shim.mjs",
     "scripts/lib/gh-argv.mjs",
+    "scripts/lib/gh-ci-log.mjs",
     "scripts/lib/gh-deferred.mjs",
     "scripts/lib/gh-throttle-holders.mjs",
     "scripts/lib/gh-throttle.mjs",

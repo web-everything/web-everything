@@ -748,7 +748,7 @@ describe('load-shaped smoke failure: an overlay is blamed only by a same-run dif
     const st = readRebuildState(cloneDir, env);
     expect(st.held?.reason).toBe('smoke-env-load');
     expect(st.rejected).toMatchObject({ envLoad: true });
-    expect(st.rejected.harnessBroken).toBeUndefined();
+    expect(st.rejected.harnessBroken).toBe(false);
     expect(runSmoke).toHaveBeenCalledTimes(2); // A + B only
   });
 

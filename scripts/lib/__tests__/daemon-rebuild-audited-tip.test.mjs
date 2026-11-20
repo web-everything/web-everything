@@ -970,7 +970,7 @@ describe('unaudited-tip evidence and policy', () => {
 });
 
 
-it.each(['early', 'recovery'])('%s refuses arbitrary or unproven ready pins; allows a proven adopted pin', async launchedBy => {
+it.each(['early', 'recovery'])('%s refuses arbitrary or unproven ready pins; a proven adopted pin still requires audit approval', async launchedBy => {
   const f = await fixture();
   f.env.WE_DAEMON_STATE_DIR = join(f.dir, 'state');
   f.env.WE_DAEMON_OVERLAY_DIR = join(f.dir, 'overlays');
@@ -1001,7 +1001,9 @@ it.each(['early', 'recovery'])('%s refuses arbitrary or unproven ready pins; all
     : spawnSync('git', args, opts) })).toThrow('Unreadable ready pin history');
   const args = { ready, plan, prevHead: ready.prevHead, treeOf: () => ready.tree, stillWanted: () => true,
     verifyBuilt: () => true, auditedTip: () => false, nowMs: Date.now(), maxAgeMs: 60000 };
-  expect(matchReadyCandidate(args).adopt).toBeTruthy();
+  expect(matchReadyCandidate(args).reason).toBe('ready-audit-revoked');
+  expect(matchReadyCandidate({ ...args, auditedTip: (candidateRef, sha) => candidateRef === ref && sha === f.a }).adopt)
+    .toEqual(ready.adopt);
   expect(matchReadyCandidate({ ...args, ready: { ...ready, adopt: { ...plan, applied: [{ ref, sha: f.b }] } } }).reason)
     .toBe('ready-audit-revoked');
 });

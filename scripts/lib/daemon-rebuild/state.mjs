@@ -208,8 +208,9 @@ export function readReadyCandidateStrict(root, env = process.env, read = readFil
   }))) {
     throw new Error('Invalid ready candidate');
   }
-  // pinnedFrom bypasses audit revocation. Prove the same registration and adopted
-  // second parent used by planRebuild, plus the exact branch tip being held back.
+  // Validate pin provenance against the same registration and adopted second parent
+  // used by planRebuild, plus the exact branch tip being held back. This supplies no
+  // audit exemption: adoption still judges the applied sha through revokedAppliedTips.
   const pins = r.adopt.applied.filter(a => Object.hasOwn(a, 'pinnedFrom'));
   if (strictPins && pins.length) {
     if (!FULL_SHA_RE.test(r.prevHead) || !FULL_SHA_RE.test(r.adopt.mainSha)) throw new Error('Invalid ready pin history bounds');

@@ -63,8 +63,8 @@ export function matchReadyCandidate({
   const heldTips = (plan.alerts ?? []).filter((x) => x?.kind === 'overlay-unaudited-tip' && x.detail?.ref && x.detail.newTip);
   // The alert only names the tip the plan sees NOW (the latest); a record built on an EARLIER tip B of the same ref is not
   // named when the branch fast-forwarded to C, so the record's OWN tips are re-judged against the evidence at adoption time
-  // too (fail closed: no gate result for a tip = refused). Exempt: a head applied with `pinnedFrom` (the audited adopted head),
-  // a tip the running head already carries (established) and a tip main already has (merged) — the gate's own exemptions.
+  // too (fail closed: no gate result for a tip = refused). pinnedFrom supplies no exemption. A tip the running head
+  // already carries (established) or main already has (merged) retains the gate's own exemptions.
   // Follow mode (`auditedTip` null) has no gate and nothing to revoke.
   const revokedAudit = (adopt) => revokedAppliedTips({
     applied: adopt?.applied, auditedTip, held: heldTips, carries, inMain: tipInMain, prevHead, mainSha: plan.mainSha,
