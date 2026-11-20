@@ -5649,10 +5649,15 @@ harnessBroken/externalOnly/envLoad/dispatchSmoke booleans are typed when present
 transient rejection flags require a date. Legacy env-timeout holds may omit retryAt.
 busySkippedTrees/forceUnverifiedTrees contain strings; smokePassed entries require key/tree/passedAt;
 pinnedNotified is a string-valued map. Applied entries require ref/sha and a nonempty string for any pinnedFrom.
-Strict ready pins require sha and pinnedFrom to be distinct full 40-hex SHAs. Strict ready pins also prove the registered ref/PR,
-exact held remote tip, and latest rebuild-authored second-parent adopted SHA on
-the running head. Malformed or unproven pins refuse as `state-unreadable`;
-operator repair is required. Every provenance, including tick-start, requires that exact pinnedFrom SHA to be accepted for the ref by the audit gate; the pin-proof option cannot downgrade validation.
+Strict ready pins require sha and pinnedFrom to be distinct full 40-hex SHAs.
+Record readers validate shape; locked adoption separately proves the registered ref/PR,
+exact held remote tip, latest rebuild-authored second-parent adopted SHA and audit membership.
+Malformed records or unreadable proof refuse as `state-unreadable`, preserving evidence.
+A readable record with expired proof is discarded as `ready-pin-stale` before any match,
+including exact/same-tree matches, so a new smoke can proceed. Moved tips, retired overlays,
+changed HEAD and revoked audit membership must not become permanent tick-start holds.
+The real-Git table in `daemon-rebuild-ready.test.mjs` covers tip, registration and HEAD churn;
+the pin-provenance table retains every audit/history refusal at the adoption boundary.
 Ready records require prevHead/tree/passedAt/kind/forced and adopt.finalSha/inputsKey/mainSha/applied.
 Fallbacks also require forInputsKey/dropRefs/failed, with ref/sha/pr on each drop (pr may be null).
 Optional diagnostic ready metadata remains typed when present.
@@ -5722,7 +5727,7 @@ permission failures never count as proof of exit.
 
 Early watcher jobs carry `early`; both timed env-timeout retries and overdue-registration
 recovery jobs carry `recovery`. Only the ordinary tick-start launch carries `tick-start`.
-`rebuildClone` installs the same strict evidence policy for every provenance, including tick-start and inline rebuilds.
+`rebuildClone` defaults to the same strict evidence policy for every provenance, including tick-start and inline rebuilds.
 Its async scope covers indirect legacy consumers as well as prepare, smoke, lease renewal,
 cleanup and ready publication. Keep evidence entry points connected to this scope when adding
 readers; do not add a child-specific permissive fallback. Only ENOENT means empty, including after queue admission and after waiting for the preparation lock.
@@ -5730,6 +5735,14 @@ The build lease lives in the strictly validated rebuild state. Ready, pending ad
 overlay registry/events, starvation, force request/watch, conflict wakes and pending drops
 also refuse malformed or unreadable evidence; only ENOENT is absent. Writes revalidate evidence
 before replacing or deleting it. Refusal requires operator repair of the persisted evidence.
+For deployment schema incompatibility, `WE_DAEMON_REBUILD_STRICT_EVIDENCE=0` restores legacy
+evidence readers for ordinary tick-start and inline rebuilds, including job admission and
+the `withSelfSync` state check. The override logs `strictEvidence=false (source env)`.
+Early/recovery provenance remains strict, even with this override; unknown provenance also
+remains strict. Force-watch rollback safety, job-result protocol validation and ready adoption
+proof remain enforced. `evidence-readers.test.mjs`, `daemon-rebuild-early-launch.test.mjs` and
+`daemon-self-sync.test.mjs` exercise the switch at each entry point. Ordinary strict refusal
+blocks tick-start by default: treat changes to that policy as a reviewed rollout decision.
 `daemon-rebuild/__tests__/evidence-readers.test.mjs` tables both provenances against each reader
 and corrupt JSON, EACCES and wrong shapes, at entry and after waiting for the write lock,
 asserting unchanged bytes. It also pins indirect legacy-reader inheritance and late ready
@@ -5758,8 +5771,8 @@ swap removes the original registration when ordinary cleanup is called.
 
 `daemon-rebuild/__tests__/pin-provenance.test.mjs` checks the exact per-ref audit gate
 membership of pinnedFrom, lowercase 40-hex syntax, revoked and other-ref evidence,
-and unconditional ready pin history proof. Never replace the gate with a truthy or
-format-only pin check. Tick-start uses the same strict readers as early/recovery;
+and unconditional ready pin history proof before adoption. Never replace the gate with a truthy or
+format-only pin check. Tick-start defaults to the same strict record readers as early/recovery;
 `evidence-readers.test.mjs` tables child and inline entry/locked refusal for malformed,
 wrong-type, wrong-shape and EACCES evidence, preserving pending notifications and bytes.
 Legacy records may omit backoff fields, env-timeout retryAt and lease adoptOnly.
@@ -5813,7 +5826,9 @@ before using an event as evidence. Aggregate discard notices retain their full s
 registry and event writer output through `validate`, preserving file bytes. Its corpus
 is reconstructed from writer contracts; captured deployment files can extend it.
 The `rebuild-evidence-compatibility` soak replays null-result consumption, legacy
-registry/events and changed-plan admission through the durable queue. The job tests
+registry/events and changed-plan admission through the durable queue. It also publishes a
+real smoke-passed pinned ready candidate, advances the overlay tip, and requires tick-start
+to discard it, smoke once and adopt a fresh build. The job tests
 snapshot the entire state directory on early/recovery lock contention and successful
 preparation, including starvation evidence; tick-start remains the positive control.
 
@@ -5830,11 +5845,15 @@ Ready-candidate discard escalation writes an aggregate overlay event with `need`
 `target`, `reason` and `refs` (possibly empty), rather than a single `ref`. Exercise
 `reportDiscardedCandidate` and `appendOverlayEvent` together when validating that shape;
 missing or wrongly typed identity/audit fields still refuse without changing bytes.
-Pin validation also runs after the verified reset, before adopted-state writes and ready
-cleanup. At that point HEAD may equal the exact ready target: require a matching durable
-verified swap or adopted record, then retain every registration, history and exact audit
-check. `pin-provenance.test.mjs` covers both transitions and missing, corrupt, mismatched
-and revoked evidence; real overlay-pin integration cases exercise the writer sequence.
+Pin proof is checked under the preparation write lock before adoption. After the verified
+reset, write guards continue to validate record shape, allowing adopted-state writes and
+ready cleanup even if a registration or remote tip changes. The pin verifier also recognizes
+an exact target with a matching durable verified swap or adopted record; its tests cover
+both transitions and missing, corrupt, mismatched and revoked evidence.
+The real-Git ready-adoption test asserts `readyToAdoptedMs` from the recorded pass through
+preparation and the post-reset adopted-state writer. Shipped-setting tests use the real JSON:
+early launch stays disabled with empty entries and health-watch, and env-timeout delays are
+exactly 10, 20, 40 and 40 minutes with no environment or tool overrides.
 
 ## Lane reset safety probe regressions
 

@@ -227,7 +227,7 @@ describe('the Git proof of omitted content in the candidate build', () => {
 });
 
 describe('a passed candidate blocked at finalize by a long reader tick is adopted later without re-smoking', () => {
-  it('readyBuildVerified refuses a force-pushed pinned sha and strict admission preserves its unproven evidence', async () => {
+  it.each(['moved tip', 'retired overlay', 'HEAD mismatch'])('tick-start discards a stale pinned candidate after %s and freshly rebuilds', async (stale) => {
     const { originDir, cloneDir, env } = makeFixture();
     env.WE_DAEMON_REBUILD_SKIP_UNRELATED = '0';
     env.WE_DAEMON_OVERLAY_EDGE_RESOLVE = '0';
@@ -253,28 +253,32 @@ describe('a passed candidate blocked at finalize by a long reader tick is adopte
       mainTip: gitOk(cloneDir, ['rev-parse', 'origin/main']).trim(),
     });
     expect(verify()).toBe(true);
-    pushBranch(originDir, 'lane/moving', (dir) => {
-      writeFile(dir, 'moving.txt', 'old\n');
-      writeFile(dir, 'shared.txt', 'moving\n');
-    }, { force: true });
-    gitOk(cloneDir, ['fetch', '-q', 'origin', '+refs/heads/*:refs/remotes/origin/*']);
-    expect(git(cloneDir, ['merge-base', '--is-ancestor', old, 'origin/lane/moving']).status).toBe(1);
-    expect(verify()).toBe(false);
+    if (stale === 'moved tip') {
+      pushBranch(originDir, 'lane/moving', (dir) => {
+        writeFile(dir, 'moving.txt', 'old\n');
+        writeFile(dir, 'shared.txt', 'moving\n');
+      }, { force: true });
+      gitOk(cloneDir, ['fetch', '-q', 'origin', '+refs/heads/*:refs/remotes/origin/*']);
+      expect(git(cloneDir, ['merge-base', '--is-ancestor', old, 'origin/lane/moving']).status).toBe(1);
+      expect(verify()).toBe(false);
+    } else if (stale === 'retired overlay') {
+      removeOverlay(cloneDir, 'lane/moving', { env });
+    } else {
+      gitOk(cloneDir, ['reset', '--hard', ready.adopt.finalSha]);
+    }
     // Exact and same-tree matches are re-derived from the live plan and deliberately reuse its smoke.
     // Move main to a different tree so the old ready record needs superseded-build provenance instead.
     advanceMain(originDir, (dir) => writeFile(dir, 'main-later.txt', 'later\n'));
 
-    const readyBytes = readFileSync(readyCandidatePath(cloneDir, env), 'utf8');
-    const stateBytes = readFileSync(rebuildStatePath(cloneDir, env), 'utf8');
     const freshSmoke = vi.fn(async () => PASS);
-    const result = await rebuildClone({ root: cloneDir, env, runSmoke: freshSmoke, lockOpts: LOCK_OPTS });
-    expect(result).toMatchObject({ moved: false, reason: 'state-unreadable' });
-    expect(freshSmoke).not.toHaveBeenCalled();
-    expect(gitOk(cloneDir, ['rev-parse', 'HEAD']).trim()).toBe(prevHead);
-    expect(readFileSync(readyCandidatePath(cloneDir, env), 'utf8')).toBe(readyBytes);
-    expect(readFileSync(rebuildStatePath(cloneDir, env), 'utf8')).toBe(stateBytes);
-    expect(existsSync(join(cloneDir, 'main-later.txt'))).toBe(false);
-    expect(git(cloneDir, ['merge-base', '--is-ancestor', old, 'HEAD']).status).toBe(0);
+    const result = await rebuildClone({ root: cloneDir, env, launchedBy: 'tick-start', runSmoke: freshSmoke, lockOpts: LOCK_OPTS });
+    expect(result.adopted).toBe(true);
+    expect(result.reason).not.toBe('ready-adopted');
+    expect(result.alerts).toContainEqual(expect.objectContaining({ kind: 'ready-candidate-discarded' }));
+    expect(freshSmoke).toHaveBeenCalledTimes(1);
+    expect(readReadyCandidate(cloneDir, env)).toBeNull();
+    expect(existsSync(join(cloneDir, 'main-later.txt'))).toBe(true);
+    expect(gitOk(cloneDir, ['rev-parse', 'HEAD']).trim()).not.toBe(ready.adopt.finalSha);
   });
 
   it('records it as ready, then the next rebuild adopts it even though main moved again', async () => {
@@ -287,13 +291,16 @@ describe('a passed candidate blocked at finalize by a long reader tick is adopte
     });
     expect(first.adopted).not.toBe(true);
     expect(first.reason).toBe('tick-in-progress');
-    expect(readReadyCandidate(cloneDir, env)?.adopt.finalSha).toBe(target);
+    const ready = readReadyCandidate(cloneDir, env);
+    expect(ready?.adopt.finalSha).toBe(target);
 
     endTick(); // the sibling's tick boundary
     advanceMain(originDir, (dir) => writeFile(dir, 'b.txt', 'b\n')); // the live churn: a new candidate sha
     const noSmoke = vi.fn(async () => PASS);
+    const adoptedAtMs = Date.parse(ready.passedAt) + 5000;
     const second = await rebuildClone({
       root: cloneDir, env, runSmoke: noSmoke, prState: async () => null, lockOpts: LOCK_OPTS,
+      now: () => adoptedAtMs,
     });
     expect(second.moved).toBe(true);
     expect(second.adopted).toBe(true);
@@ -303,6 +310,9 @@ describe('a passed candidate blocked at finalize by a long reader tick is adopte
     expect(noSmoke).not.toHaveBeenCalled();
     expect(existsSync(readyCandidatePath(cloneDir, env))).toBe(false);
     expect(readRebuildState(cloneDir, env).adopted?.head).toBe(target);
+    const adopted = readRebuildState(cloneDir, env).adopted;
+    expect(adopted.at).toBe(new Date(adoptedAtMs).toISOString());
+    expect(adopted.readyToAdoptedMs).toBe(5000);
   });
 
   it('a sibling process adopts it at its tick start despite the build lease the blocked mover left behind', async () => {

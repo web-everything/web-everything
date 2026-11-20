@@ -269,6 +269,22 @@ describe('withSelfSync — DEFAULT path: rebuild-driven (#4044 Module E)', () =>
     } finally { rmSync(root, { recursive: true, force: true }); }
   });
 
+  it('strict-evidence rollback lets the tick read legacy state', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'self-sync-legacy-'));
+    try {
+      const env = { WE_DAEMON_STATE_DIR: join(root, 'state'), WE_DAEMON_REBUILD_STRICT_EVIDENCE: '0' };
+      writeRebuildState(root, {}, env);
+      writeFileSync(rebuildStatePath(root, env), '{}');
+      const tick = vi.fn(() => 'ticked');
+      const w = withSelfSync({ tickOnce: tick }, {
+        root, env, onRestart: vi.fn(), log: { error: vi.fn() }, readHead: () => 'boot', readReady: () => null,
+        rebuild: async () => ({ moved: false, reason: 'up-to-date' }), acquireRead: okLock, releaseRead: vi.fn(),
+      });
+      await expect(w.tickOnce()).resolves.toBe('ticked');
+      expect(tick).toHaveBeenCalledOnce();
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  });
+
   it('a state-unreadable rebuild result logs and holds instead of ticking or restarting', async () => {
     const tick = vi.fn(), onRestart = vi.fn(), acquireRead = vi.fn(okLock), log = { error: vi.fn() };
     const w = withSelfSync({ tickOnce: tick }, {

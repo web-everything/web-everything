@@ -40,9 +40,10 @@ import { daemonJobsDir, deleteRun } from '../../operations/run-store.mjs';
 import { cloneKey, appendOverlayEvent } from '../daemon-overlays.mjs';
 import { cloneLockDirs } from '../daemon-clone-lock.mjs';
 import { lockIdFor } from '../../readiness/file-locks.mjs';
-import { readPendingAdoptionsStrict } from '../overlay-adoption.mjs';
+import { readPendingAdoptions, readPendingAdoptionsStrict } from '../overlay-adoption.mjs';
 import { recoveryDue, resolveRecovery } from './recovery.mjs';
-import { readRebuildStateStrict, readReadyCandidateStrict, alertsFilePath } from './state.mjs';
+import { readRebuildState, readReadyCandidate, readRebuildStateStrict, readReadyCandidateStrict, alertsFilePath } from './state.mjs';
+import { strictRebuildEvidence } from './evidence-context.mjs';
 import { processStartMs } from './lease.mjs';
 import { readGit } from '../proc-read.mjs';
 import { cascadePolicy } from '../policy-cascade.mjs';
@@ -190,11 +191,13 @@ export async function rebuildCloneAsJob({
   store = createJobStore(rebuildJobsDir(root, env)), reattach = reattachTick, clock, now = () => Date.now(),
   launchOnly = false, launchedBy = 'tick-start', waitInFlightTickMs = 0,
   recoverySettings = resolveRecovery({ env, log: m => log.error?.(m) }),
-  readState = readRebuildStateStrict, readPending = readPendingAdoptionsStrict,
-  readReady = readReadyCandidateStrict,
+  readState = strictRebuildEvidence(env, launchedBy) ? readRebuildStateStrict : readRebuildState,
+  readPending = strictRebuildEvidence(env, launchedBy) ? readPendingAdoptionsStrict : readPendingAdoptions,
+  readReady = strictRebuildEvidence(env, launchedBy) ? readReadyCandidateStrict : readReadyCandidate,
   codeSha, snapshot, settings = loadRebuildAsJobSettings(undefined, { env }), evict = evictSnapshots, rng,
 }) {
   const say = (m) => log.error?.(`daemon-rebuild-job: ${m}`);
+  if (!strictRebuildEvidence(env, launchedBy)) say('strictEvidence=false (source env; tick-start compatibility rollback)');
   // Refuse before preparation or reattach can erase evidence or launch an existing job.
   const unreadable = () => {
     say('state-unreadable: rebuild/ready/pending-adoptions/job evidence is unreadable or invalid; repair persisted evidence before retrying');

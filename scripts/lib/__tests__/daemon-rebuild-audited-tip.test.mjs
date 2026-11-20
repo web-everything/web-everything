@@ -12,7 +12,7 @@ import { readyBuildVerified, matchReadyCandidate, finalizeRebuild } from '../dae
 import { makeAuditedTipGate } from '../daemon-rebuild/audited-tip.mjs';
 import { addOverlay, resolveOverlayFollowTip } from '../daemon-overlays.mjs';
 import { rebuildClone } from '../daemon-rebuild.mjs';
-import { readReadyCandidateStrict, readReadyCandidate, writeReadyCandidate } from '../daemon-rebuild/state.mjs';
+import { readReadyCandidateStrict, readReadyCandidate, writeReadyCandidate, assertReadyCandidatePins } from '../daemon-rebuild/state.mjs';
 import { appendEntry, storePath } from '../../operations/ruled-weakened-store.mjs';
 import { readRebuildState } from '../daemon-rebuild/state.mjs';
 
@@ -998,7 +998,7 @@ describe('unaudited-tip evidence and policy', () => {
 });
 
 
-it.each(['early', 'recovery', 'tick-start'])('%s refuses arbitrary or unproven ready pins; allows a proven adopted pin', async launchedBy => {
+it.each(['early', 'recovery', 'tick-start'])('%s refuses malformed pins and defers readable pins to locked adoption proof', async launchedBy => {
   const f = await fixture();
   f.env.WE_DAEMON_STATE_DIR = join(f.dir, 'state');
   f.env.WE_DAEMON_OVERLAY_DIR = join(f.dir, 'overlays');
@@ -1014,15 +1014,20 @@ it.each(['early', 'recovery', 'tick-start'])('%s refuses arbitrary or unproven r
   for (const [sha, pinnedFrom, pr] of [[f.b, 'arbitrary', 42], [f.b, 'x'.repeat(1024), 42], [f.b, f.b, 42], [f.b, f.a, 42],
     [f.a, 'f'.repeat(40), 42], [f.a, f.b, 99]]) {
     writeReadyCandidate(f.root, { ...ready, adopt: { ...plan, applied: [{ ref, pr, sha, pinnedFrom }] } }, f.env);
-    expect(() => readReadyCandidateStrict(f.root, f.env)).toThrow();
-    expect(() => readReadyCandidateStrict(f.root, f.env, readFileSync, { strictPins: false })).toThrow();
-    expect((await check()).reason).toBe('state-unreadable');
-    const adopt = vi.fn(), reattach = vi.fn();
+    const malformed = !/^[a-f0-9]{40}$/.test(pinnedFrom) || sha === pinnedFrom;
+    const prove = () => assertReadyCandidatePins(f.root, readReadyCandidateStrict(f.root, f.env), f.env);
+    expect(prove).toThrow(); // readable does not mean adoptable
+    if (malformed) expect(() => readReadyCandidateStrict(f.root, f.env)).toThrow();
+    else expect(readReadyCandidateStrict(f.root, f.env).adopt.applied[0]).toEqual({ ref, pr, sha, pinnedFrom });
+    expect((await check()).reason).toBe(malformed ? 'state-unreadable' : 'ready-pending');
+    const adopt = vi.fn(async () => ({ reason: 'ready-pending' })), reattach = vi.fn();
     const store = createJobStore(join(f.dir, 'jobs'));
     expect((await rebuildCloneAsJob({ root: f.root, env: f.env, launchedBy, store, adopt, reattach,
-      log: { error() {} } })).reason).toBe('state-unreadable');
-    expect(adopt).not.toHaveBeenCalled();
-    expect(reattach).not.toHaveBeenCalled();
+      log: { error() {} } })).reason).toBe(malformed ? 'state-unreadable' : 'ready-pending');
+    if (malformed) {
+      expect(adopt).not.toHaveBeenCalled();
+      expect(reattach).not.toHaveBeenCalled();
+    } else expect(adopt).toHaveBeenCalledOnce();
     expect(store.list().records).toEqual([]);
     expect(readReadyCandidate(f.root, f.env).adopt.applied[0].pinnedFrom).toBe(pinnedFrom);
   }
@@ -1032,7 +1037,7 @@ it.each(['early', 'recovery', 'tick-start'])('%s refuses arbitrary or unproven r
   expect(readReadyCandidateStrict(f.root, f.env).adopt.applied).toEqual([{ ref, pr: 42, sha: f.a, pinnedFrom: f.b }]);
   expect((await check()).reason).toBe('ready-pending');
   // An oversized/truncated history is incomplete proof; preserve evidence for operator repair.
-  expect(() => readReadyCandidateStrict(f.root, f.env, readFileSync, { run: (args, opts) => args[0] === 'log'
+  expect(() => assertReadyCandidatePins(f.root, ready, f.env, readFileSync, { run: (args, opts) => args[0] === 'log'
     ? { status: null, error: Object.assign(new Error('history exceeds maxBuffer'), { code: 'ENOBUFS' }) }
     : spawnSync('git', args, opts) })).toThrow('Unreadable ready pin history');
   const args = { ready, plan, prevHead: ready.prevHead, treeOf: () => ready.tree, stillWanted: () => true,

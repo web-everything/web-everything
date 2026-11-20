@@ -3,7 +3,7 @@ import { test as nodeTest } from 'node:test';
 // Also register with the repository runner when this node:test suite is selected by Vitest.
 const test = process.env.VITEST ? (await import('vitest')).test : nodeTest;
 import assert from 'node:assert/strict';
-import { mkdtempSync, rmSync, appendFileSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, rmSync, appendFileSync, writeFileSync, mkdirSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { appendDaemonEvent } from '../daemon-events.mjs';
@@ -11,7 +11,7 @@ import { decideEarlyLaunch } from '../daemon-rebuild-early-launch.mjs';
 import { createEarlyLaunchWatcher, createMainMoveReader, resolveEarlyLaunch } from '../daemon-rebuild-early-watch.mjs';
 import { buildRebuildJobResult, rebuildCloneAsJob } from '../daemon-rebuild/rebuild-job.mjs';
 import { finalizeRebuild } from '../daemon-rebuild/adopt.mjs';
-import { readRebuildState } from '../daemon-rebuild/state.mjs';
+import { readRebuildState, rebuildStatePath } from '../daemon-rebuild/state.mjs';
 import { createJobStore } from '../daemon-jobs-runtime.mjs';
 import { probeEarlyRebuild } from '../../conveyor/soak/fixtures/early-rebuild-probe.mjs';
 
@@ -93,6 +93,30 @@ test('pr-merged event reader skips history, retains partial lines, filters repos
     appendFileSync(path, 'x'.repeat(256 * 1024 + 1)); assert.throws(read, /backlog/); assert.equal(read(), null);
     appendFileSync(path, '{bad}\n'); assert.throws(read);
   } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('shipped settings keep early launch off for empty entries and health-watch', () => {
+  for (const entries of [[], ['health-watch.mjs']]) {
+    assert.equal(resolveEarlyLaunch({ env: {}, entries }).enabled, false);
+  }
+});
+
+test('job tick-start honours strict-evidence rollback but early/recovery never downgrade', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'legacy-job-admission-'));
+  const env = { WE_DAEMON_STATE_DIR: join(root, 'state'), WE_DAEMON_REBUILD_STRICT_EVIDENCE: '0' };
+  try {
+    mkdirSync(env.WE_DAEMON_STATE_DIR);
+    writeFileSync(rebuildStatePath(root, env), '{}');
+    for (const launchedBy of ['tick-start', 'early', 'recovery']) {
+      let adopted = false;
+      const result = await rebuildCloneAsJob({ root, env, launchedBy, launchOnly: launchedBy !== 'tick-start',
+        store: createJobStore(join(root, launchedBy)), log: { error() {} },
+        reattach: async () => {}, evict() {},
+        adopt: async () => { adopted = true; return { moved: false, reason: 'up-to-date' }; } });
+      assert.equal(result.reason, launchedBy === 'tick-start' ? 'up-to-date' : 'state-unreadable');
+      assert.equal(adopted, launchedBy === 'tick-start');
+    }
+  } finally { rmSync(root, { recursive: true, force: true }); }
 });
 
 test('entry opt-in supports health-watch and environment rollback wins', () => {

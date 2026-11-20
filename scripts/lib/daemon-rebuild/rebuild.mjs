@@ -3,7 +3,7 @@
  * design notes it refers to as "the file header" are the header of `scripts/lib/daemon-rebuild.mjs`.
  */
 import { createRebuildReaders, RebuildEvidenceError } from './evidence-readers.mjs';
-import { withRebuildReaders } from './evidence-context.mjs';
+import { withRebuildReaders, strictRebuildEvidence } from './evidence-context.mjs';
 
 
 import { resolveRecovery } from './recovery.mjs';
@@ -114,17 +114,20 @@ function isBetweenTickLaunch(options) {
  */
 export async function rebuildClone({ emitEvent = appendDaemonEvent, ...options } = {}) {
   // Between-tick launches leave force-watch checks and rollback to the next tick.
-  const readers = createRebuildReaders({ strict: true, read: options.evidenceRead });
+  const strict = strictRebuildEvidence(options.env, options.launchedBy);
+  const readers = createRebuildReaders({ strict, read: options.evidenceRead });
+  if (!strict) (options.log ?? console).error?.('daemon-rebuild: strictEvidence=false (source env; tick-start compatibility rollback)');
   return withRebuildReaders(readers, async () => {
     const startedAtMs = Date.now();
     let result;
     try {
       const watch = await forceWatch(options, emitEvent, startedAtMs);
-      readers.validate(options.root, { ...(options.env ?? process.env), ...options.stateOpts?.env });
+      readers?.validate(options.root, { ...(options.env ?? process.env), ...options.stateOpts?.env });
       // Paying a memory-only rollback must not authorize a second force request
       // in this same call. Preserve its existing refusal/consumption path.
       const admissionReaders = watch?.blocker === 'rollback-owed'
-        ? { ...readers, forceAdoptBlocker: root => root === options.root ? watch.blocker : null } : readers;
+        ? { ...(readers ?? createRebuildReaders({ strict: true, read: options.evidenceRead })),
+          forceAdoptBlocker: root => root === options.root ? watch.blocker : null } : readers;
       result = await withRebuildReaders(admissionReaders, () => rebuildCloneWithReaders(emitEvent, options, watch, startedAtMs));
     } catch (error) {
       if (!(error instanceof RebuildEvidenceError)) throw error;

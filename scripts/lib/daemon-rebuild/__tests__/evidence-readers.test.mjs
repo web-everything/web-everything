@@ -124,6 +124,26 @@ it('absent evidence stays empty for every strict reader', () => {
   expect(readers.pending(root, env)).toEqual([]);
 });
 
+it.each(['tick-start', undefined, 'early', 'recovery'])('strict-evidence rollback is scoped to tick-start/inline: %s', async launchedBy => {
+  const { root, env } = fixture();
+  env.WE_DAEMON_REBUILD_STRICT_EVIDENCE = '0';
+  writeRebuildState(root, {}, env);
+  writeFileSync(rebuildStatePath(root, env), '{}'); // legacy reader accepts this historical empty shape
+  const prepare = vi.spyOn(preparation, 'prepareRebuild').mockResolvedValue({
+    terminal: true, result: { moved: false, reason: 'up-to-date' }, alerts: [],
+  });
+  vi.spyOn(locks, 'withWriteLock').mockImplementation(async (_root, fn) => ({ ok: true, value: await fn() }));
+  const result = await rebuildClone({ root, env, launchedBy, asJob: false, versions: null,
+    readyOnly: true, emitEvent() {}, log: { error() {} } });
+  if (launchedBy === 'early' || launchedBy === 'recovery') {
+    expect(result.reason).toBe('state-unreadable');
+    expect(prepare).not.toHaveBeenCalled();
+  } else {
+    expect(result.reason).toBe('up-to-date');
+    expect(prepare).toHaveBeenCalledOnce();
+  }
+});
+
 it('replays legacy registry metadata and ref-less audit events without rewriting them', () => {
   const { root, env } = fixture();
   const registry = overlayFilePath(root, env);

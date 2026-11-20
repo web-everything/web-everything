@@ -195,7 +195,7 @@ export function readReadyCandidate(root, env = process.env) {
 }
 
 /** Admission must distinguish absent ready evidence from unreadable or incomplete evidence. */
-export function readReadyCandidateStrict(root, env = process.env, read = readFileSync, { run = (args, opts) => spawnSync('git', args, { encoding: 'utf8', timeout: 10_000, killSignal: 'SIGKILL', maxBuffer: 1024 * 1024, stdio: ['ignore', 'pipe', 'ignore'], ...opts }) } = {}) {
+export function readReadyCandidateStrict(root, env = process.env, read = readFileSync) {
   let text;
   try { text = read(readyCandidatePath(root, env), 'utf8'); }
   catch (error) { if (error?.code === 'ENOENT') return null; throw error; }
@@ -213,29 +213,43 @@ export function readReadyCandidateStrict(root, env = process.env, read = readFil
   }))) {
     throw new Error('Invalid ready candidate');
   }
-  // pinnedFrom bypasses audit revocation. Prove the same registration and adopted
-  // second parent used by planRebuild, plus the exact branch tip being held back.
+  if (r.adopt.applied.some(a => Object.hasOwn(a, 'pinnedFrom'))
+    && (!FULL_SHA_RE.test(r.prevHead) || !FULL_SHA_RE.test(r.adopt.mainSha))) throw new Error('Invalid ready pin history bounds');
+  return r;
+}
+
+// A readable record can outlive its proof. Only adoption needs live pin proof;
+// admission and write guards must permit the locked tick to discard stale records.
+export class StaleReadyPinError extends Error {}
+export function assertReadyCandidatePins(root, r, env = process.env, read = readFileSync, { run = (args, opts) => spawnSync('git', args, { encoding: 'utf8', timeout: 10_000, killSignal: 'SIGKILL', maxBuffer: 1024 * 1024, stdio: ['ignore', 'pipe', 'ignore'], ...opts }) } = {}) {
   const pins = r.adopt.applied.filter(a => Object.hasOwn(a, 'pinnedFrom'));
   if (pins.length) {
-    if (!FULL_SHA_RE.test(r.prevHead) || !FULL_SHA_RE.test(r.adopt.mainSha)) throw new Error('Invalid ready pin history bounds');
-    const registry = JSON.parse(read(overlayFilePath(root, env), 'utf8'));
+    // Legacy-reader rollback must not turn record fields into Git options.
+    if (!pinnedApplied(r.adopt.applied) || !FULL_SHA_RE.test(r.prevHead) || !FULL_SHA_RE.test(r.adopt.mainSha)) {
+      throw new Error('Invalid ready pin history bounds');
+    }
+    let registry;
+    try { registry = JSON.parse(read(overlayFilePath(root, env), 'utf8')); }
+    catch (error) { if (error.code !== 'ENOENT') throw error; registry = { overlays: [] }; }
+    if (!Array.isArray(registry?.overlays)) throw new Error('Invalid ready pin registry');
     const git = args => run(args, { cwd: root, env: { ...process.env, ...env, GIT_OPTIONAL_LOCKS: '0' },
       encoding: 'utf8', timeout: 60_000, maxBuffer: 8 * 1024 * 1024, killSignal: 'SIGKILL' });
     const head = verifyRev(git, 'HEAD');
+    if (!head) throw new Error('Unreadable ready pin head');
     if (head !== r.prevHead) {
-      // finalizeRebuild persists its verified swap before resetting HEAD, then
-      // writes adopted state and clears ready. Revalidation also runs between
-      // those writes: the exact target may already be HEAD. Require the durable
-      // transaction/adoption to corroborate the ready plan; an arbitrary moved
-      // head or a ready record alone never establishes this transition.
-      if (head !== r.adopt.finalSha || !FULL_SHA_RE.test(head)) throw new Error('Unproven ready pin head');
+      // Recovery can encounter the exact target already at HEAD: finalizeRebuild
+      // persists its verified swap before reset, then writes adopted and clears
+      // ready. Require that durable transaction/adoption to corroborate the plan;
+      // an arbitrary moved head or a ready record alone never establishes this
+      // transition. Writer guards themselves only validate record shape.
+      if (head !== r.adopt.finalSha || !FULL_SHA_RE.test(head)) throw new StaleReadyPinError('Unproven ready pin head');
       const state = readRebuildStateStrict(root, env, read);
       const samePlan = v => v?.inputsKey === r.adopt.inputsKey && v?.mainSha === r.adopt.mainSha
         && JSON.stringify(v?.applied) === JSON.stringify(r.adopt.applied);
       const swapping = state.inProgress?.verified === true && state.inProgress.prevHead === r.prevHead
         && state.inProgress.target === head && samePlan(state.inProgress);
       const adopted = state.adopted?.head === head && samePlan(state.adopted);
-      if (!swapping && !adopted) throw new Error('Unproven ready pin transition');
+      if (!swapping && !adopted) throw new StaleReadyPinError('Unproven ready pin transition');
     }
     const history = git(['log', '--first-parent', '--format=%P%x09%ce%x09%s', r.prevHead, '--not', r.adopt.mainSha]);
     if (history.status !== 0) throw new Error('Unreadable ready pin history');
@@ -243,17 +257,17 @@ export function readReadyCandidateStrict(root, env = process.env, read = readFil
     for (const pin of pins) {
       // Follow mode disables audit revocation for every tip; it uses no pin exemption.
       // With auditing enabled, exact ref/SHA acceptance is mandatory in addition to history.
-      if (typeof auditedTip === 'function' && auditedTip(pin.ref, pin.pinnedFrom) !== true) throw new Error('Unaudited ready pin');
+      if (typeof auditedTip === 'function' && auditedTip(pin.ref, pin.pinnedFrom) !== true) throw new StaleReadyPinError('Unaudited ready pin');
       const registration = registry.overlays?.find(o => o.ref === pin.ref);
       if (!registration || (registration.pr ?? null) !== (pin.pr ?? null)
-        || verifyRev(git, `refs/remotes/origin/${pin.ref}^{commit}`) !== pin.pinnedFrom) throw new Error('Unproven ready pin registration');
+        || verifyRev(git, `refs/remotes/origin/${pin.ref}^{commit}`) !== pin.pinnedFrom) throw new StaleReadyPinError('Unproven ready pin registration');
       const recorded = String(history.stdout).split('\n').find(line => {
         const [parents, committer, subject] = line.split('\t');
         const hit = subject?.match(/^daemon-rebuild: merge overlay (\S+) (?:\(PR #(\d+)\) )?onto /);
         return hit && hit[1] === pin.ref && (hit[2] ? Number(hit[2]) : null) === (registration.pr ?? null)
           && committer === REBUILD_IDENTITY_ENV.GIT_COMMITTER_EMAIL && [2, 3].includes(parents.split(' ').length);
       });
-      if (!recorded || recorded.split('\t')[0].split(' ')[1] !== pin.sha) throw new Error('Unproven ready pin adopted head');
+      if (!recorded || recorded.split('\t')[0].split(' ')[1] !== pin.sha) throw new StaleReadyPinError('Unproven ready pin adopted head');
     }
   }
   return r;

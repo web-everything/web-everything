@@ -9,6 +9,72 @@ import { createRebuildReaders } from '../../../lib/daemon-rebuild/evidence-reade
 import { overlayFilePath, appendOverlayEvent } from '../../../lib/daemon-overlays.mjs';
 import { writeRebuildState, readRebuildState } from '../../../lib/daemon-rebuild/state.mjs';
 import { envTimeoutAppliesToPlan } from '../../../lib/daemon-rebuild/recovery.mjs';
+import { spawnSync } from 'node:child_process';
+import { addOverlay } from '../../../lib/daemon-overlays.mjs';
+import { readReadyCandidate } from '../../../lib/daemon-rebuild/state.mjs';
+import { rebuildClone } from '../../../lib/daemon-rebuild/rebuild.mjs';
+import { acquireRead, releaseRead } from '../../../lib/daemon-clone-lock.mjs';
+
+/** Real Git: publish a smoke-passed pinned candidate, move its tip, then run tick-start. */
+export async function probeStalePinnedReady() {
+  const dir = mkdtempSync(join(tmpdir(), 'stale-ready-soak-'));
+  const root = join(dir, 'clone'), author = join(dir, 'author'), origin = join(dir, 'origin.git');
+  const env = { ...process.env, WE_DAEMON_STATE_DIR: join(dir, 'state'),
+    WE_DAEMON_OVERLAY_DIR: join(dir, 'overlays'), WE_DAEMON_CLONE_LOCK_ROOT: join(dir, 'locks'),
+    WE_DAEMON_OVERLAY_FOLLOW_TIP: 'follow', WE_DAEMON_REBUILD_SKIP_UNRELATED: '0',
+    WE_DAEMON_OVERLAY_EDGE_RESOLVE: '0', WE_DAEMON_AUTO_REBASE: '0', WE_DAEMON_REBUILD_STRICT_EVIDENCE: '1' };
+  const git = (cwd, args) => {
+    const r = spawnSync('git', ['-c', 'user.name=soak', '-c', 'user.email=soak@example.invalid', ...args],
+      { cwd, encoding: 'utf8', timeout: 20_000, maxBuffer: 65536, env: { ...env, GIT_OPTIONAL_LOCKS: '0' } });
+    if (r.status !== 0) throw new Error(`fixture git ${args[0]}: ${r.stderr}`);
+    return r.stdout.trim();
+  };
+  const pass = { verdict: 'pass', attempts: 1, smoke: { results: [] } };
+  const lock = { lockRoot: env.WE_DAEMON_CLONE_LOCK_ROOT, owner: 'soak-sibling' };
+  try {
+    mkdirSync(author);
+    git(dir, ['init', '--bare', '-q', '-b', 'main', origin]);
+    git(author, ['init', '-q', '-b', 'main']);
+    git(author, ['remote', 'add', 'origin', origin]);
+    const push = (ref, file, content, base) => {
+      if (base) git(author, ['checkout', '-q', '-B', ref, base]);
+      writeFileSync(join(author, file), content);
+      git(author, ['add', '.']); git(author, ['commit', '-qm', `change ${ref}`]);
+      git(author, ['push', '-q', 'origin', `HEAD:refs/heads/${ref}`]);
+      return git(author, ['rev-parse', 'HEAD']);
+    };
+    push('main', 'shared.txt', 'base\n');
+    push('lane/moving', 'moving.txt', 'old\n', 'main');
+    push('lane/blocker', 'shared.txt', 'blocker\n', 'main');
+    git(dir, ['clone', '-q', origin, root]);
+    addOverlay(root, { ref: 'lane/moving' }, { env });
+    addOverlay(root, { ref: 'lane/blocker' }, { env });
+    const rebuild = extra => rebuildClone({ root, env, asJob: false, versions: null,
+      lockOpts: { waitMs: 30, pollMs: 5 }, log: { error() {} }, emitEvent() {},
+      runSmoke: async () => pass, ...extra });
+    if (!(await rebuild()).adopted) throw new Error('fixture could not adopt initial overlays');
+    const pin = push('lane/moving', 'shared.txt', 'moving\n', 'lane/moving');
+    push('main', 'candidate.txt', 'candidate\n', 'main');
+    const blocked = await rebuild({ runSmoke: async () => {
+      if (!acquireRead(root, lock).ok) throw new Error('fixture could not start sibling tick');
+      return pass;
+    } });
+    releaseRead(root, lock);
+    const ready = readReadyCandidate(root, env);
+    if (blocked.reason !== 'tick-in-progress' || ready?.adopt.applied.find(a => a.ref === 'lane/moving')?.pinnedFrom !== pin) {
+      throw new Error('fixture did not publish a pinned ready candidate');
+    }
+    push('lane/moving', 'new-tip.txt', 'new\n', 'lane/moving');
+    push('main', 'later.txt', 'later\n', 'main');
+    git(root, ['fetch', '-q', 'origin']);
+    let smokes = 0;
+    const result = await rebuild({ launchedBy: 'tick-start', runSmoke: async () => { smokes += 1; return pass; } });
+    return { adopted: result.adopted === true, reason: result.reason, smokes,
+      discarded: result.alerts?.some(a => a.kind === 'ready-candidate-discarded') === true,
+      readyCleared: readReadyCandidate(root, env) === null,
+      freshHead: git(root, ['rev-parse', 'HEAD']) !== ready.adopt.finalSha };
+  } finally { releaseRead(root, lock); rmSync(dir, { recursive: true, force: true }); }
+}
 
 export async function probeRebuildEvidence() {
   const root = mkdtempSync(join(tmpdir(), 'rebuild-evidence-soak-'));

@@ -2,6 +2,7 @@
  * Split out of daemon-rebuild.mjs (move-only).
  */
 import { rebuildReaders } from './evidence-context.mjs';
+import { RebuildEvidenceError } from './evidence-readers.mjs';
 
 
 import { timeoutRetryAt, resolveRecovery, envTimeoutAppliesToPlan } from './recovery.mjs';
@@ -9,6 +10,7 @@ import { timeoutRetryAt, resolveRecovery, envTimeoutAppliesToPlan } from './reco
 import { makeGit, verifyRev, OVERLAY_EDGE_RESOLVE_ENV, REBUILD_IDENTITY_ENV } from './shared.mjs';
 import {
   alertsFilePath, readRebuildState, readRebuildStateStrict, writeRebuildState, readReadyCandidate,
+  assertReadyCandidatePins, StaleReadyPinError,
 } from './state.mjs';
 import { mkdirSync, appendFileSync, statSync, unlinkSync, readFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
@@ -624,7 +626,15 @@ export async function prepareRebuild({
         }
         return overlayEvents;
       };
-      const m = matchReadyCandidate({
+      let stalePin = false;
+      try { assertReadyCandidatePins(root, ready, stEnv, readFileSync, { run }); }
+      catch (error) {
+        if (!(error instanceof StaleReadyPinError)) throw new RebuildEvidenceError(error);
+        stalePin = true;
+      }
+      // Check before every match, including exact/same-tree smoke reuse. A pin
+      // whose proof expired is discarded, never used to authorize adoption.
+      const m = stalePin ? { adopt: null, reason: 'ready-pin-stale' } : matchReadyCandidate({
         ready,
         plan,
         prevHead,

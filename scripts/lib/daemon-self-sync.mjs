@@ -127,7 +127,8 @@ export { collectImportClosure };
 import { gateMergedCommit } from './daemon-live-smoke.mjs';
 import { rebuildClone } from './daemon-rebuild.mjs';
 import { FAILURE_REASONS } from './daemon-rebuild/rebuild.mjs';
-import { readReadyCandidate, readRebuildStateStrict } from './daemon-rebuild/state.mjs';
+import { readReadyCandidate, readRebuildState, readRebuildStateStrict } from './daemon-rebuild/state.mjs';
+import { strictRebuildEvidence } from './daemon-rebuild/evidence-context.mjs';
 import { createEarlyLaunchWatcher, createMainMoveReader, resolveEarlyLaunch } from './daemon-rebuild-early-watch.mjs';
 import { createAdoptYieldProbe } from './daemon-rebuild/adopt-yield.mjs';
 import { resolveVersionedContext, isInsideVersions, currentVersion } from './daemon-version-runtime.mjs';
@@ -807,7 +808,8 @@ export function recloneConcluded(result, marker, headNow, { asJob } = {}) {
 export function withSelfSync(effects, {
   root, onRestart, sync = selfSyncCheckout, syncPoc = selfSyncCheckoutPoc, base = 'main', pocBranch, env = process.env,
   log = console, timeoutMs, readHead = readHeadSha, readOriginRef = readOriginRefSha, hasStaleRefusal, gate = gateMergedCommit,
-  mainOnly = false, rebuild: rebuildOpt, acquireRead = acquireReadLock, releaseRead = releaseReadLock, readState = readRebuildStateStrict,
+  mainOnly = false, rebuild: rebuildOpt, acquireRead = acquireReadLock, releaseRead = releaseReadLock,
+  readState = strictRebuildEvidence(env) ? readRebuildStateStrict : readRebuildState,
   readReady = readReadyCandidate, maxAdoptWaitTicks: maxAdoptWaitTicksOpt,
   entries = [process.argv[1]], diffFiles = changedFilesBetween, importClosure = collectImportClosure,
   minRestartIntervalMs = resolveRestartMinIntervalMs(env), now = Date.now,
@@ -832,6 +834,7 @@ export function withSelfSync(effects, {
   maintainObjects, maintain, hasMaintenanceRebuildJob = () => cloneHasRebuildJob(root, env),
 }) {
   const tick = effects.tickOnce;
+  if (!strictRebuildEvidence(env)) log.error?.('daemon-self-sync: strictEvidence=false (source env; tick-start compatibility rollback)');
   const unreadableHold = () => {
     log.error?.('daemon-self-sync: state-unreadable — skipping this tick; repair persisted evidence before retrying');
     return skippedTick('state-unreadable');

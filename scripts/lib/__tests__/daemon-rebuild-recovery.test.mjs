@@ -66,6 +66,16 @@ function expectHeld(f, result, held) {
 }
 
 describe('environment-timeout recovery deadlines', () => {
+  it('shipped recovery settings retry after 10, 20, 40, 40 minutes', () => {
+    const defaults = resolveRecovery({ env: {}, log() {} });
+    let held = null;
+    for (const minutes of [10, 20, 40, 40]) {
+      const retry = envTimeoutRetry(held, 1000, defaults);
+      expect(Date.parse(retry.retryAt) - 1000).toBe(minutes * 60_000);
+      held = { reason: 'smoke-env-timeout', ...retry };
+    }
+  });
+
   it.each([
     [{}, true], [{ target: 'old' }, false], [{ target: 'target' }, true],
     [{ target: null }, true], [{ inputsKey: 'old' }, false], [{ inputsKey: 'inputs' }, true],

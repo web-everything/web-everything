@@ -3,13 +3,18 @@ import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { makeAuditedTipGate, revokedAppliedTips } from '../audited-tip.mjs';
-import { readReadyCandidateStrict, readyCandidatePath, writeRebuildState, rebuildStatePath } from '../state.mjs';
+import { readReadyCandidateStrict as readReadyRecord, assertReadyCandidatePins, readyCandidatePath, writeRebuildState, rebuildStatePath } from '../state.mjs';
 import { overlayFilePath } from '../../daemon-overlays.mjs';
 import { REBUILD_IDENTITY_ENV } from '../shared.mjs';
 
 const ref = 'lane/pin', sha = 'a'.repeat(40), pin = 'b'.repeat(40), head = 'c'.repeat(40), main = 'd'.repeat(40);
 const invalid = ['arbitrary', 'e'.repeat(40), pin.toUpperCase(), 'b'.repeat(39), 'b'.repeat(41), true, 7, null, {}, [pin]];
 const roots = [];
+// Exercise schema plus the adoption proof; admission intentionally checks only schema.
+function readProvenReadyCandidate(root, env, read, options) {
+  const ready = readReadyRecord(root, env, read);
+  return assertReadyCandidatePins(root, ready, env, read, options);
+}
 afterEach(() => { for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true }); });
 function fixture(pinnedFrom = pin) {
   const root = mkdtempSync(join(tmpdir(), 'rebuild-pin-')); roots.push(root);
@@ -52,7 +57,7 @@ describe('pinnedFrom never replaces audit evidence for the applied sha', () => {
     const row = { ref: kind === 'other ref' ? 'lane/other' : ref, sha: pin, tests: 'green', audit: 'NOT WEAKENED' };
     writeFileSync(f.env.WE_FIX_READY_PATH, [row, ...(kind === 'revoked' ? [{ ...row, tests: 'red' }] : [])].map(JSON.stringify).join('\n'));
     expect(revokedAppliedTips({ applied: f.ready.adopt.applied, auditedTip: makeAuditedTipGate(f.env), auditAdopted: [ref] })).toEqual([ref]);
-    expect(() => readReadyCandidateStrict(f.root, f.env, readFileSync, { run: f.run })).toThrow();
+    expect(() => readProvenReadyCandidate(f.root, f.env, readFileSync, { run: f.run })).toThrow();
   });
 });
 
@@ -60,12 +65,12 @@ describe('strict ready pins cannot downgrade audit or history proof', () => {
   it.each(invalid)('refuses pin %j even if the caller requests strictPins:false', pinnedFrom => {
     const f = fixture(pinnedFrom);
     for (const options of [{ run: f.run }, { run: f.run, strictPins: false }]) {
-      expect(() => readReadyCandidateStrict(f.root, f.env, readFileSync, options)).toThrow();
+      expect(() => readProvenReadyCandidate(f.root, f.env, readFileSync, options)).toThrow();
     }
   });
   it('accepts a legacy ready record with a proven registered, adopted and audited pin', () => {
     const f = fixture();
-    expect(readReadyCandidateStrict(f.root, f.env, readFileSync, { run: f.run })).toEqual(f.ready);
+    expect(readProvenReadyCandidate(f.root, f.env, readFileSync, { run: f.run })).toEqual(f.ready);
   });
 });
 
@@ -86,7 +91,7 @@ function resetFixture(stage = 'inProgress') {
 
 it.each(['inProgress', 'adopted'])('strict pin proof accepts the production post-reset %s transition', stage => {
   const f = resetFixture(stage);
-  expect(readReadyCandidateStrict(f.root, f.env, readFileSync, { run: f.run })).toEqual(f.ready);
+  expect(readProvenReadyCandidate(f.root, f.env, readFileSync, { run: f.run })).toEqual(f.ready);
 });
 
 it.each([
@@ -97,7 +102,7 @@ it.each([
   const f = resetFixture(stage);
   f.record[key] = value;
   writeRebuildState(f.root, f.state, f.env);
-  expect(() => readReadyCandidateStrict(f.root, f.env, readFileSync, { run: f.run })).toThrow('Unproven ready pin transition');
+  expect(() => readProvenReadyCandidate(f.root, f.env, readFileSync, { run: f.run })).toThrow('Unproven ready pin transition');
 });
 
 it.each(['missing', 'corrupt', 'wrong-type', 'revoked', 'other-head'])('strict post-reset pin proof refuses %s evidence', fault => {
@@ -113,5 +118,5 @@ it.each(['missing', 'corrupt', 'wrong-type', 'revoked', 'other-head'])('strict p
     const prior = f.run.getMockImplementation();
     f.run.mockImplementation(args => args.includes('HEAD') ? { status: 0, stdout: '9'.repeat(40) } : prior(args));
   }
-  expect(() => readReadyCandidateStrict(f.root, f.env, readFileSync, { run: f.run })).toThrow();
+  expect(() => readProvenReadyCandidate(f.root, f.env, readFileSync, { run: f.run })).toThrow();
 });
