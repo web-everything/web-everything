@@ -29,23 +29,23 @@ function fixture(pinnedFrom = pin) {
   return { root, env, ready, run };
 }
 
-describe('pin exemptions require exact audited membership for the ref', () => {
+describe('pinnedFrom never replaces audit evidence for the applied sha', () => {
   for (const held of [false, true]) {
-    it.each(invalid)(`refuses invalid/unaudited pin %j (held=${held}) and consults the tip audit`, pinnedFrom => {
+    it.each(invalid)(`refuses invalid/unaudited pin %j (held=${held})`, pinnedFrom => {
       const f = fixture(pinnedFrom);
       const gate = vi.fn(makeAuditedTipGate(f.env));
       expect(revokedAppliedTips({ applied: f.ready.adopt.applied, auditedTip: gate, auditAdopted: [ref],
         held: held ? [{ detail: { ref, newTip: sha } }] : [] })).toEqual([ref]);
-      expect(gate).toHaveBeenCalledWith(ref, sha);
+      if (held) expect(gate).not.toHaveBeenCalled();
+      else expect(gate).toHaveBeenCalledWith(ref, sha);
     });
   }
-  it('honours a lowercase 40-hex pin accepted by the audit gate', () => {
+  it('rejects an unaudited applied sha even when its pin is audited', () => {
     const f = fixture();
     const gate = vi.fn(makeAuditedTipGate(f.env));
-    expect(revokedAppliedTips({ applied: f.ready.adopt.applied, auditedTip: gate, auditAdopted: [ref],
-      held: [{ detail: { ref, newTip: sha } }] })).toEqual([]);
-    expect(gate).toHaveBeenCalledWith(ref, pin);
-    expect(gate).not.toHaveBeenCalledWith(ref, sha);
+    expect(revokedAppliedTips({ applied: f.ready.adopt.applied, auditedTip: gate, auditAdopted: [ref] })).toEqual([ref]);
+    expect(gate).toHaveBeenCalledWith(ref, sha);
+    expect(gate).not.toHaveBeenCalledWith(ref, pin);
   });
   it.each(['other ref', 'revoked'])('does not accept evidence for %s', kind => {
     const f = fixture();

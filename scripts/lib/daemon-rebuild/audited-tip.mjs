@@ -1,10 +1,12 @@
 /** unaudited-tip — fail closed to the adopted head when audit evidence is unavailable. */
-import { readFileSync } from 'node:fs';
+import fs, { readFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { resolveOverlayFollowTip } from '../daemon-overlays.mjs';
-import { FULL_SHA_RE, verifyRev } from './shared.mjs';
+import { verifyRev } from './shared.mjs';
 import { readPlatformPreferences } from '../policy-cascade.mjs';
-import { mergeRuledWeakened, readyEvidence } from '../../operations/prototype-load.mjs';
+import { readyEvidence } from '../../operations/prototype-load.mjs';
+
+import { loadRuledWeakened } from '../../operations/prototype-load-io.mjs';
 
 const TOOL_SETTINGS = new URL('../../settings/prototype-load.json', import.meta.url);
 
@@ -26,7 +28,10 @@ export function makeAuditedTipGate(env = process.env) {
         // The operator allowlist is the same union prototype-load uses; a WEAKENED record is only ever evidence
         // when an entry binds its exact ref, sha, ruling and disclosed findings.
         const platform = readPlatformPreferences({ env, warn: () => {} });
-        snapshot.ruledWeakened = mergeRuledWeakened(platform.prefs.prototypeLoad?.ruledWeakened, tool.ruledWeakened);
+        snapshot.ruledWeakened = loadRuledWeakened({
+          platform: platform.prefs.prototypeLoad?.ruledWeakened, tool: tool.ruledWeakened,
+          fs, env: { HOME: homedir(), ...env },
+        });
       } catch { /* unaudited-tip: unreadable evidence never authorizes a moving tip. */ }
     }
     // The canonical admission judge decides (latest record for the exact ref+sha wins; a red or unruled-WEAKENED
@@ -47,8 +52,8 @@ export function tipInMain(git, mainSha, sha) {
 
 /**
  * PURE: the refs whose applied tip a build must NOT be adopted with, judged against the audit evidence NOW.
- * Mirrors the plan's own exemptions, so a build the live plan would mint is never refused here: a head applied with
- * `pinnedFrom` whose exact SHA is accepted by the audit gate for that ref, a tip the running head or main already carries or has (`carries`, `inMain`),
+ * `pinnedFrom` is never an exemption: the applied sha is judged on its own evidence. Exemptions mirror the plan:
+ * a tip the running head or main already carries or has (`carries`, `inMain`),
  * and a registration with no adopted history (`auditAdopted` lists the refs that have one; unknown list = fail closed).
  * `held` are the tips the live plan reports as held back (`overlay-unaudited-tip` alerts). No gate (follow mode) = nothing to revoke.
  */
@@ -58,14 +63,9 @@ export function revokedAppliedTips({
   return (applied ?? [])
     .filter((a) => {
       if (!a?.ref || !a.sha) return false;
-      if (typeof a.pinnedFrom === 'string' && FULL_SHA_RE.test(a.pinnedFrom)
-        && typeof auditedTip === 'function' && auditedTip(a.ref, a.pinnedFrom) === true) return false;
-      if (held.some((x) => x.detail.ref === a.ref && x.detail.newTip === a.sha)) {
-        // A live hold wins even if the evidence changed since planning; still consult
-        // the normal tip gate rather than trusting an unproven pin.
-        if (typeof auditedTip === 'function') auditedTip(a.ref, a.sha);
-        return true;
-      }
+      // A live hold on the applied sha itself always wins over any pin.
+      if (held.some((x) => x.detail.ref === a.ref && x.detail.newTip === a.sha)) return true;
+      // pinnedFrom is the rejected tip, not evidence for the applied sha: it never exempts. The applied sha is judged below.
       if (typeof auditedTip !== 'function') return false;
       if (carries(a.sha, prevHead) || carries(a.sha, mainSha) || inMain(a.sha)) return false;
       if (Array.isArray(auditAdopted) && !auditAdopted.includes(a.ref)) return false; // never adopted: the plan applies it unaudited
