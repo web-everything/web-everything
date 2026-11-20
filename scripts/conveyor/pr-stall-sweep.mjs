@@ -20,7 +20,7 @@ import { readRedTeamStatus as defaultReadRedTeamStatus, readRecoveryWitness, red
 import { pidNamespace, pidStartTime } from '../lib/pid-alive.mjs';
 import { foreignStaleOwnerDead } from '../lib/red-team-foreign-host-stale.mjs';
 import { readConfirmedBreaks } from '../lib/red-team-gate.mjs';
-import { detectRoundCap, judgeRound } from '../lib/round-judge.mjs';
+import { detectRoundCap, judgeRound, validateVerdict } from '../lib/round-judge.mjs';
 import { assessPrSweep } from '../operations/pr-sweep-core.mjs';
 import { createPrSweepReader, STALLED_AFTER_ENV, tailOf } from '../operations/pr-sweep-io.mjs';
 import { readSettings } from '../lib/settings-files.mjs';
@@ -299,16 +299,21 @@ export async function runStallSweep({ now = Date.now(), env = process.env, state
     const trigger = JUDGED_STATES[row.waitingOn];
     let verdict = null; let list = []; let fileListFailure = null;
     if (trigger) {
+      let mismatchReason = null;
+      const mismatchVerdict = () => ({ verdict: 'escalate', reasons: [`fail-closed: ${mismatchReason}`], evidence: { failClosed: true } });
       try {
         list = await files(row.repo, row.number);
         if (!Array.isArray(list) || !list.length || !list.every((x) => typeof x === 'string' && x)) throw new Error('unreadable or empty file list');
         const cap = detectRoundCap({ comments: pr.comments, pr: row.number, head, state: row.waitingOn === 'at-round-limit' ? 'at-round-limit' : null, repo: row.repo });
+        if (cap && cap.trigger !== trigger) mismatchReason = `cap-trigger-mismatch: state=${trigger} record=${cap.trigger}`;
         // A PR in a judged state whose thread shows no cap record (e.g. a findings-less settled referral notice) still gets the judge, run for the state's own trigger with NO thread evidence (an unmatched thread may hold already-ruled findings); the judge fails closed on no evidence, never null (null = the classifier's "not an object" operator park).
-        verdict = (cap?.trigger === trigger || !cap) ? judge({ pr: row.number, repo: row.repo, head, trigger, comments: cap ? pr.comments : [], files: list, setting: breaks.value, maxGrants: judgeCfg.maxGrants }) : null;
+        verdict = judge({ pr: row.number, repo: row.repo, head, trigger, comments: cap ? pr.comments : [], files: list, setting: breaks.value, maxGrants: judgeCfg.maxGrants });
+        // Preserve malformed-output diagnostics; a mismatch needs real evidence for the state's trigger.
+        if (mismatchReason && validateVerdict(verdict).ok && (verdict.evidence?.failClosed || verdict.evidence?.rounds === 0)) verdict = mismatchVerdict();
       } catch (e) {
         base.errors.push(`judge ${row.repo}#${row.number}: ${msg(e)}`); readFailed = true;
         if (e?.code === 'file-list-over-cap') fileListFailure = e.fileList;
-        else verdict = null;
+        else verdict = mismatchReason ? mismatchVerdict() : null;
       }
     }
     const context = { row, head, verdict, files: list, card: null, settings: classifierSettings(cfg) };

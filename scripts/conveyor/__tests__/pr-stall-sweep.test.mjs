@@ -274,6 +274,66 @@ describe('the shadow pass', () => {
     expect(out.items[0]).toMatchObject({ state: 'at-round-limit', lane: 'operator', verdict: 'send-back' });
     expect(out.act).toEqual([]);
   });
+  describe('round judge follows the state trigger', () => {
+    const comment = (body, hoursAgo) => ({ user: { login: AUTOMATION_LOGINS[0] }, created_at: new Date(NOW - hoursAgo * 3600_000).toISOString(), body });
+    // The later push clears the waiting hold state, but detectRoundCap still sees its record (#7184).
+    const hold = comment('review paused: 1 referral needs a ruling\n\nWaiting on your ruling (block, card or not-real):\n- `scripts/referral.mjs:7` — referral finding\n\n<!-- review-referral-hold: abcdef0123456789 -->', 4);
+    const review = comment('🔁 review — changes requested\n\nRecorded by agent (unattended review-loop) via the declared `review-pr` operation.\n\n### Findings\n- `scripts/review.mjs:5` — review finding', 5);
+    const run = async (comments, judge = vi.fn(judgeRound), pr = PRS[1]) => {
+      const { gh } = fakeGh({ prs: [pr] });
+      const wrapped = (bin, args, o) => /\/comments\?/.test(String(args.at(-1))) ? JSON.stringify([comments]) : gh(bin, args, o);
+      const out = await runStallSweep({ now: NOW, env: {}, settings: shadow(), gh: wrapped, read: reader(strictGh(wrapped)), judge, dir: auditDir(), log: () => {} });
+      return { out, judge };
+    };
+    it('judges review-cap exactly once on a mismatch with review evidence', async () => {
+      const { out, judge } = await run([review, hold]);
+      expect(judge).toHaveBeenCalledOnce();
+      expect(judge.mock.calls[0][0]).toMatchObject({ trigger: 'review-cap', comments: [expect.objectContaining({ body: review.body }), expect.objectContaining({ body: hold.body })] });
+      expect(judge.mock.results[0].value.evidence).toMatchObject({ trigger: 'review-cap', rounds: 1, latest: [expect.objectContaining({ file: 'scripts/review.mjs' })] });
+      expect(out.items[0]).toMatchObject({ state: 'at-round-limit', verdict: judge.mock.results[0].value.verdict });
+      expect(out.items[0].reason).not.toContain('not an object');
+    });
+    it.each([
+      ['real judge without review evidence', judgeRound],
+      ['fail-closed judge', () => ({ verdict: 'escalate', reasons: ['fail-closed: unavailable'], evidence: { failClosed: true } })],
+      ['grant without a review round', a => ({ ...judgeRound(a), verdict: 'grant', k: 1 })],
+    ])('fails closed with an explicit mismatch reason: %s', async (_name, implementation) => {
+      const { out, judge } = await run([hold], vi.fn(implementation));
+      expect(judge).toHaveBeenCalledOnce();
+      expect(out.items[0]).toMatchObject({ state: 'at-round-limit', lane: 'operator', verdict: 'escalate', reason: expect.stringContaining('cap-trigger-mismatch: state=review-cap record=referral-hold') });
+      expect(out.items[0].reason).not.toContain('not an object');
+      expect(out.act).toEqual([]);
+    });
+    it('fails closed with an explicit mismatch reason when the judge throws', async () => {
+      const { out, judge } = await run([review, hold], vi.fn(() => { throw new Error('judge unavailable'); }));
+      expect(judge).toHaveBeenCalledOnce();
+      expect(out.items[0]).toMatchObject({ lane: 'operator', verdict: 'escalate', reason: expect.stringContaining('cap-trigger-mismatch: state=review-cap record=referral-hold') });
+      expect(out.items[0].reason).not.toContain('not an object');
+      expect(out.act).toEqual([]);
+    });
+    it('keeps matching triggers unchanged', async () => {
+      const { out, judge } = await run([review]);
+      expect(judge).toHaveBeenCalledOnce();
+      expect(judge.mock.calls[0][0]).toMatchObject({ trigger: 'review-cap', comments: [expect.objectContaining({ body: review.body })] });
+      expect(out.items[0].verdict).toBe(judge.mock.results[0].value.verdict);
+      expect(out.items[0].reason).not.toContain('cap-trigger-mismatch');
+    });
+    it('keeps the no-cap path on empty thread evidence', async () => {
+      const settled = comment('review paused: 1 referral needs a ruling\n\n<!-- review-referral-hold: abcdef0123456789 -->', 2);
+      const { out, judge } = await run([review, settled], vi.fn(judgeRound), { ...PRS[0], labels: [] });
+      expect(judge).toHaveBeenCalledOnce();
+      expect(judge.mock.calls[0][0]).toMatchObject({ trigger: 'referral-hold', comments: [] });
+      expect(out.items[0]).toMatchObject({ lane: 'operator', verdict: 'send-back' });
+      expect(out.items[0].reason).not.toContain('cap-trigger-mismatch');
+    });
+    it.each([null, { verdict: 'invalid' }])('still reports malformed judge output %j on a mismatch', async verdict => {
+      const { out, judge } = await run([review, hold], vi.fn(() => verdict));
+      expect(judge).toHaveBeenCalledOnce();
+      expect(out.items[0]).toMatchObject({ lane: 'operator', reason: expect.stringContaining('no valid round-judge verdict') });
+      expect(out.items[0].reason).toContain(verdict === null ? 'not an object' : 'is not one of');
+      expect(out.act).toEqual([]);
+    });
+  });
   it('one unreadable PR row makes the whole pass plan nothing', async () => {
     const fresh = { ...PRS[0], number: 13, headRefOid: 'not-a-sha', updatedAt: new Date(NOW).toISOString(), labels: [] };
     const { gh } = fakeGh({ prs: [...PRS, fresh] }); const dir = auditDir();
