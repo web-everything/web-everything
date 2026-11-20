@@ -9,6 +9,7 @@ import { runInNewContext } from 'node:vm';
 import { SHARD_RUN_SCRIPT, localPhaseReason, localPhaseBypassDetail, phaseAdmissionPlan, phaseRunLocation, shouldConfirmRemoteRed, remoteInfrastructureFailure } from '../lib/verify-remote-routing.mjs';
 import { shellQuote, isShardWrapperCommand } from '../lib/verify-lane-gate.mjs';
 import { runLaneGate } from '../conveyor/verify-dispatch.mjs';
+import localPolicy from '../conveyor/soak/breaks/verify-request-local-policy.mjs';
 
 const source = readFileSync(new URL('../verify-lane.mjs', import.meta.url), 'utf8');
 const admissionStart = source.indexOf('async function acquireAdmission(');
@@ -50,6 +51,29 @@ const commandShapes = [
   ['npx still refuses shard execution', `npx ${relativeShard}`, null],
   ['npm options cannot impersonate script arguments', "npm run check:standards --script-shell=scripts/lib/verify-shard-run.mjs", null],
   ['admission wrapper', 'node scripts/readiness/heavy-admission.mjs run -- npx vitest run a.test.mjs'],
+  ...[
+    'scripts/readiness/heavy-admission.mjs',
+    './scripts/readiness/heavy-admission.mjs',
+    "'scripts/readiness/heavy-admission.mjs'",
+    'scripts/readiness/../readiness/heavy-admission.mjs',
+    "scripts/'readiness'/heavy-admission.mjs",
+    'scripts/readiness/heavy-admis\\sion.mjs',
+    shellQuote(resolve('scripts/readiness/heavy-admission.mjs')),
+  ].map(path => [
+    `nested admission shard refuses local execution: ${path}`,
+    `node ${path} run -- ${relativeShard}`, null,
+  ]),
+  ['nested admission with local still refuses shard execution', `node scripts/readiness/heavy-admission.mjs run --local -- ${relativeShard}`, null],
+  ['doubly nested admission refuses shard execution', `node scripts/readiness/heavy-admission.mjs run -- node scripts/readiness/heavy-admission.mjs run -- ${relativeShard}`, null],
+  ['oversized admission nesting refuses with an unwrapped-gate fallback', `${'node scripts/readiness/heavy-admission.mjs run -- '.repeat(33)}${relativeShard}`, null],
+  ['nested node option terminators refuse shard execution', `node -- scripts/readiness/heavy-admission.mjs run -- ${relativeShard.replace('node ', 'node -- ')}`, null],
+  ['nested prefixed shard refuses execution', `node scripts/readiness/heavy-admission.mjs run -- env ${relativeShard}`, null],
+  ...shardPathVariants.map(path => [
+    `nested shard path refuses execution: ${path}`,
+    `node scripts/readiness/heavy-admission.mjs run -- node ${path} --shards=2 --parallel=2 --budget-ms=1000 -- ${selectedTests}`, null,
+  ]),
+  ['nested admission shard input is data', "node scripts/readiness/heavy-admission.mjs run -- npx vitest related scripts/lib/verify-shard-run.mjs --run"],
+  ['nested admission standards input is data', "node scripts/readiness/heavy-admission.mjs run -- npm run check:standards -- --files='scripts/lib/verify-shard-run.mjs'"],
   ['shard wrapper', shardCommand, selectedTests],
   ...shardPathVariants.map(path => [
     `shard path ${path}`, `node ${path} --shards=2 --parallel=2 --budget-ms=1000 -- ${selectedTests}`, selectedTests,
@@ -93,6 +117,31 @@ function parseCli(context, local, childArgs) {
 }
 
 describe('verify-lane --local', () => {
+  it('supersedes in-flight requests when local policy changes and retains identical retries (daemon soak)', async () => {
+    expect(localPolicy.judge(await localPolicy.run())).toEqual([]);
+  });
+
+  it.each([false, true])('preserves a replacement policy if the old dispatched run finishes before supersession (local=%s)', local => {
+    const start = source.indexOf('const onDisk = readMarker();');
+    const end = source.indexOf('// Reuse the on-disk start body', start);
+    expect(start).toBeGreaterThan(-1);
+    expect(end).toBeGreaterThan(start);
+    const emit = vi.fn(() => { throw new Error('superseded exit'); });
+    const context = {
+      DISPATCHED_RUN: true, FORCE_LOCAL: local, headSha: 'head', exitCode: 0, redCauseFields: {}, emit,
+      readMarker: () => ({ status: 'running', sha: 'head', ...(!local ? { local: true } : {}) }),
+    };
+    expect(() => runInNewContext(source.slice(start, end), context)).toThrow('superseded exit');
+    expect(emit).toHaveBeenCalledWith(expect.objectContaining({ status: 'superseded' }), 3);
+    emit.mockClear();
+    for (const policy of local ? [true] : [false, undefined]) {
+      runInNewContext(source.slice(start, end), { ...context,
+        readMarker: () => ({ status: 'running', sha: 'head', local: policy }),
+      });
+    }
+    expect(emit).not.toHaveBeenCalled();
+  });
+
   it.each([false, true])('request marker preserves parsed --local through daemon dispatch to the executing CLI (local=%s)', async local => {
     const startLine = source.split('\n').find(line => line.startsWith("if (MODE !== 'run') writeMarker("));
     const context = {

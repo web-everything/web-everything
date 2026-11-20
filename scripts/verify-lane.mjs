@@ -920,7 +920,8 @@ async function timedRunGate(phase, command, args, { outcomeKey } = {}) {
       } else {
         // Apply edits from the end so earlier token offsets remain valid. Only executable positions
         // count: a quoted test name or echo argument containing wrapper text is never rewritten.
-        for (const words of segments.reverse()) {
+        const commands = segments.reverse().map(words => ({ words, depth: 0 }));
+        for (const { words, depth } of commands) {
           const start = words.findIndex(t => !/^[A-Za-z_][A-Za-z0-9_]*=/.test(t.value));
           if (start < 0) continue;
           const mentionsWrapper = word => word.value.includes('verify-shard-run.mjs');
@@ -945,9 +946,21 @@ async function timedRunGate(phase, command, args, { outcomeKey } = {}) {
           const scriptIndex = start + (words[start + 1]?.value === '--' ? 2 : 1);
           const isWrapper = word => word && resolve(REPO, word.value).endsWith('/scripts/lib/verify-shard-run.mjs');
           if (!isWrapper(words[scriptIndex])) {
+            // Admission forwards the argv after --. Inspect that executable as well: a shard
+            // below it discards our held slot, even if the outer admission says --local.
+            // Keep suite input paths as data by applying the same command classification.
+            if (words[scriptIndex] && resolve(REPO, words[scriptIndex].value).endsWith('/scripts/readiness/heavy-admission.mjs')
+              && words.slice(scriptIndex + 1).some(mentionsWrapper)) {
+              // Bound repeated suffix scans; the refusal directs the caller to an unwrapped gate.
+              if (depth >= 32) refusal();
+              const separator = words.findIndex((word, i) => i > scriptIndex && word.value === '--');
+              if (separator >= 0) commands.push({ words: words.slice(separator + 1), depth: depth + 1 });
+              else refusal();
+            }
             if (words[scriptIndex]?.value.startsWith('-') && words.slice(scriptIndex + 1).some(mentionsWrapper)) refusal();
             continue;
           }
+          if (depth > 0) refusal();
           const options = words.slice(scriptIndex + 1, scriptIndex + 4).map(t => t.value);
           const keys = options.map(option => /^--(shards|parallel|budget-ms)=\d+$/.exec(option)?.[1]);
           if (keys.length !== 3 || keys.some(key => !key) || new Set(keys).size !== 3
@@ -1261,11 +1274,15 @@ if (MODE === 'run') {
 //        newer run's record (compare-and-set on the sha). A slow GREEN run at X must NOT stamp green over a
 //        RED record for Y.
 const onDisk = readMarker();
-if (onDisk && !onDisk.corrupt && onDisk.sha && onDisk.sha !== headSha) {
+// A dispatched run may finish before the next supersession sweep. Its verdict cannot answer
+// a replacement request with a different execution policy, even at the very same HEAD/tree.
+const policySuperseded = DISPATCHED_RUN && onDisk && !onDisk.corrupt
+  && (onDisk.local === true) !== FORCE_LOCAL;
+if (onDisk && !onDisk.corrupt && onDisk.sha && (onDisk.sha !== headSha || policySuperseded)) {
   emit(
     {
       sha: headSha, status: 'superseded', reason: 'superseded', exitCode, ...redCauseFields,
-      detail: `suites finished (exit ${exitCode}) for ${headSha.slice(0, 8)}, but the on-disk marker now belongs to ${String(onDisk.sha).slice(0, 8)} (an overlapping verify-lane run) — refusing to overwrite it; no marker written for this run.`,
+      detail: `suites finished (exit ${exitCode}) for ${headSha.slice(0, 8)}, but the on-disk marker now belongs to ${String(onDisk.sha).slice(0, 8)}${policySuperseded ? ' with a different local policy' : ''} (an overlapping verify-lane run) — refusing to overwrite it; no marker written for this run.`,
     },
     3,
   );

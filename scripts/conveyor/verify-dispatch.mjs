@@ -266,21 +266,22 @@ export function countDispatchesInFlight(inFlight) {
 }
 
 /** #65 — is a re-stamped marker the SAME request this in-flight run already serves: same sha, same gate command,
- *  and the same (known) working-tree hash? An agent that re-runs `verify-lane request` after a wait timeout does
+ *  execution policy and the same (known) working-tree hash? An agent that re-runs `verify-lane request` after a wait timeout does
  *  exactly this; the running gate already answers it, so killing it only throws away minutes of gate work.
- * @param {{sha?:string, suites?:string, treeHash?:string|null}} entry
- * @param {{sha?:string, suites?:string, treeHash?:string|null}} marker
+ * @param {{sha?:string, suites?:string, treeHash?:string|null, local?:boolean}} entry
+ * @param {{sha?:string, suites?:string, treeHash?:string|null, local?:boolean}} marker
  * @returns {boolean}
  */
 export function sameVerifyRequest(entry, marker) {
   return !!entry?.sha && entry.sha === marker?.sha && entry.suites === marker?.suites
+    && (entry.local === true) === (marker.local === true)
     && entry.treeHash != null && entry.treeHash === marker?.treeHash;
 }
 
 /** Whether a pending marker belongs to a different request than this in-flight run AND that request may kill it,
- *  per the declared `supersede` setting (#65): `newer` (default) kills only for a different sha, gate or tree —
+ *  per the declared `supersede` setting (#65): `newer` (default) kills only for a different sha, gate, policy or tree —
  *  never an identical re-request; `never` kills nothing; `any` is the old behaviour (every re-stamp kills).
- * @param {{runId:string, requestStartedAt:string|null, sha?:string, suites?:string, treeHash?:string|null}} entry
+ * @param {{runId:string, requestStartedAt:string|null, sha?:string, suites?:string, treeHash?:string|null, local?:boolean}} entry
  * @param {object|null} marker
  * @param {string|null} headSha
  * @param {'newer'|'never'|'any'} [policy]
@@ -824,6 +825,7 @@ export async function runVerifyDispatch({ dryRun = false, spawnGate = spawnGateB
     started += 1;
     const runId = randomUUID();
     const entry = { pool, lane, dir, runId, pid: null, sha: headSha, suites: marker.suites, treeHash: marker.treeHash ?? null,
+      local: marker.local === true,
       requestStartedAt: marker.startedAt ?? null, startedMs: Date.now(), logPath: null };
     // #4135 — job mode: the gate runs as a DETACHED DURABLE JOB (we:scripts/conveyor/verify-gate-job.mjs) whose own
     // supervisor process owns the ceilings, the kill and the settlement, so this sweep only queues it and returns.
