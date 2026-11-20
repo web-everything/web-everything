@@ -4719,6 +4719,14 @@ evidence. Legacy or unverified foreign-host leases fail closed. Refusal output p
 command for recovery after the operator confirms the worker stopped.
 Reaper wiring tests must retain the real `applyReclaimSafety` function and inject only its
 probe; identity stubs hide a missing safety gate. Cover both dry-run and actual release.
+Reclaim probes must list effective Git config (including local/worktree includes) and refuse
+lane-defined clean, smudge or process filters before status; hardening pins do not disable them.
+`lane-lease-reclaim-safety.test.mjs` covers filter refusal, config-read failures and inherited
+config overrides. The lease-expiry soak also checks that a real included clean filter cannot
+write its execution marker during reaper planning or branch corroboration. Refuse gitlinks
+before status can enter a submodule with its own filters. Unreadable config or index evidence
+stays `stale-but-dirty`; inspect and repair lane config or inspect submodules separately before
+retrying reclamation.
 Verify-lane renewal tests compare timestamps observed during the running gate, and non-running
 reset/check/print-gate modes must preserve lease bytes.
 Review lane setup uses one hardened environment for the config scrub, origin validation and fetch.

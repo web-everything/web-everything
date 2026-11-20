@@ -78,7 +78,7 @@
  * RESERVED (permanent memory, #2350) leases are NEVER reaped, on every axis.
  */
 
-import { probeLaneReclaim } from '../lib/lane-lease-liveness.mjs';
+import { probeLaneReclaim, probeLaneStatus } from '../lib/lane-lease-liveness.mjs';
 import { readGit } from '../lib/proc-read.mjs';
 import { laneGitHardeningEnv } from '../lib/lane-git-hardening.mjs';
 
@@ -375,18 +375,7 @@ export function laneBranchItemNum(dir, { git = defaultGitSymbolicRef } = {}) {
 /** Default {@link laneQuietSincePr} clean-tree reader: raw `git status --porcelain` output, or `null` on any
  *  failure (unreadable dir) — the caller then treats "can't confirm clean" as unknown, never as clean. */
 function defaultGitStatusPorcelain(dir) {
-  try {
-    return readGit(['status', '--porcelain'], {
-      cwd: dir,
-      env: laneGitEnv(),
-      encoding: 'utf8',
-      stdio: ['ignore', 'pipe', 'pipe'],
-      timeout: resolveChildTimeoutMs(),
-      killSignal: 'SIGKILL',
-    });
-  } catch {
-    return null;
-  }
+  return probeLaneStatus(dir);
 }
 
 /**
