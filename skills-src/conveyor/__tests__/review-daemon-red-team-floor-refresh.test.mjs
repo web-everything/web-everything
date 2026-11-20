@@ -90,6 +90,7 @@ it.each(['corrupt', 'unreadable'])('R907 a %s operator store disables floor rais
   tick();
 
   const floor = queueRun.mock.calls[1][0].floor;
+  expect(floor.maxProbesPerTick).toBe(6);
   const capacity = { lanes: 12, startsCeiling: 12, remainingStarts: 1, budget: { left: 12 } };
   queueModule.applyRedTeamQueueFloor(capacity, { floor, cpuIdlePct: 100 });
   expect.soft(passedMinimums()).toEqual([12, 0]);
@@ -133,7 +134,8 @@ it('R907 a floor loader exception after a successful tick disables both capacity
   expect(tick()).toBe(recovery);
   expect(queueRun).toHaveBeenCalledTimes(2);
   const floor = queueRun.mock.calls[1][0].floor;
-  expect(floor).toBeNull();
+  // No capacity raise evidence survives; probes fail closed to zero.
+  expect(floor).toEqual({ maxProbesPerTick: 0 });
   const capacity = { lanes: 12, startsCeiling: 12, remainingStarts: 1, budget: { left: 12 } };
   queueModule.applyRedTeamQueueFloor(capacity, { floor, cpuIdlePct: 100 });
   expect(capacity.remainingStarts).toBe(1);
@@ -207,4 +209,20 @@ it('production maintenance retains planner skips while re-keying heads and defer
   expect(persisted[5]).toEqual(entries[5]);
   expect(log.error.mock.calls.flat().join(' ')).toContain('live PR unreadable; admission deferred');
   expect(queueRun).not.toHaveBeenCalled();
+});
+
+it('a throwing floor loader fails closed to zero probes, never the default six, and logs loudly', async () => {
+  vi.spyOn(queueModule, 'loadRedTeamQueueFloor').mockImplementation(() => { throw new Error('floor unreadable'); });
+  const { cliReviewTickOpts } = await import('../review-daemon.mjs');
+  const opts = cliReviewTickOpts({ log });
+  opts.redTeamOnSkip({
+    repo: 'web-everything/web-everything',
+    plan: { refusals: [{ kind: 'already-reviewed-head', prNumber: 9071, headSha: 'a'.repeat(40) }] },
+    rawPrs: [{ number: 9071, headRefOid: 'a'.repeat(40), labels: [], comments: [] }],
+    lastDispatch: new Map(), paused: false,
+    capacity: { lanes: 12, startsCeiling: 12, remainingStarts: 1, budget: { left: 12 }, take: vi.fn() },
+  });
+  expect(queueRun).toHaveBeenCalledTimes(1);
+  expect(queueRun.mock.calls[0][0].floor).toEqual({ maxProbesPerTick: 0 });
+  expect(log.error.mock.calls.flat().join(' ')).toContain('probes OFF this tick');
 });
