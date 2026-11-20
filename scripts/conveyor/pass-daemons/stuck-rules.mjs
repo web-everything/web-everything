@@ -11,6 +11,10 @@ const refusal = line => /(?:not enqueued|not woken):\s*(.+)/.exec(line)?.[1]
 const pending = line => /review:(?:human|pending)\b|review-status[:= ]+pending\b/.test(line);
 const headBound = (line, head) => [...line.matchAll(/\b(?:head|sha)(?:[=: ]+)([a-f0-9]{7,40})\b/gi)]
   .some(m => head.startsWith(m[1]) && m[1].length >= 12);
+const checksRunning = reason => {
+  const check = reason.indexOf('check(s)');
+  return check !== -1 && reason.includes('running', check + 'check(s)'.length);
+};
 
 export function evaluateStuck({ now, prs, logs, claims } = {}) {
   const stamp = time(now), out = [];
@@ -20,7 +24,8 @@ export function evaluateStuck({ now, prs, logs, claims } = {}) {
       || !Array.isArray(pr.labels) || !pr.labels.every(l => typeof l === 'string')) continue;
     // All mentions count, including a wake/progress line that ends a refusal streak.
     const subject = new RegExp(`#${pr.number}(?!\\d)`);
-    const qualified = new RegExp(`([\\w.-]+/[\\w.-]+)(?: PR )?#${pr.number}(?!\\d)`);
+    // Start only at a token boundary: retrying inside a long slashless token is quadratic.
+    const qualified = new RegExp(`(?<![\\w.-])([\\w.-]+/[\\w.-]+)(?: PR )?#${pr.number}(?!\\d)`);
     const mentions = daemon => {
       const rows = logs?.[daemon];
       if (!Array.isArray(rows) || rows.some(r => !r || typeof r.line !== 'string' || !Number.isFinite(time(r.at)))) return [];
@@ -39,7 +44,7 @@ export function evaluateStuck({ now, prs, logs, claims } = {}) {
       let start = drain.length - 1;
       while (start > 0 && refusal(normal(drain[start - 1].line)) === reason) start--;
       if (stamp - drain[start].at >= 30 * 60000) add('R-a', /head moved/.test(reason) ? 'A'
-        : /check\(s\).*running|red-team|re-stamp/.test(reason) ? 'B' : 'NEW', [drain[start], lastDrain]);
+        : checksRunning(reason) || /red-team|re-stamp/.test(reason) ? 'B' : 'NEW', [drain[start], lastDrain]);
     }
     if (pr.labels.some(l => ['red-team:blocked', 'status:ci-red'].includes(l))
       && /reconcile-refused nothing-owed\b/.test(fix.at(-1)?.line ?? '')) add('R-b', 'C', [fix.at(-1)]);

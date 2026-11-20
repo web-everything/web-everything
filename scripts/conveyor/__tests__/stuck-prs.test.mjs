@@ -1,6 +1,7 @@
 // @vitest-environment node
 import { test } from 'vitest';
 import assert from 'node:assert/strict';
+import { execFileSync } from 'node:child_process';
 import { mkdtempSync, writeFileSync, rmSync, readFileSync, mkdirSync, utimesSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -21,6 +22,21 @@ const pr = (number, labels = [], extra = {}) => ({ number, headSha: sha, labels,
 const evaluate = (prs, logs = {}, claims = [], time = now) => evaluateStuck({ now: time, prs, logs, claims });
 const rule = (records, name) => records.filter(r => r.rule === name);
 const ready = pr(7204, ['review:accepted', 'red-team:clear']);
+
+test.each([
+  ['unqualified token', '"a".repeat(262144) + " #7204 — not woken: unknown refusal"'],
+  ['incomplete qualified name', '"other/" + "a".repeat(262144) + " #7204 — not woken: unknown refusal"'],
+  ['repeated check names without running', '"#7204 — not woken: " + "check(s) ".repeat(32768) + "held"'],
+])('long log parsing stays bounded and preserves evidence: %s', (_, expression) => {
+  // Isolate the evaluator so a backtracking regression cannot hang the test worker.
+  const source = `import { evaluateStuck } from ${JSON.stringify(new URL('../pass-daemons/stuck-rules.mjs', import.meta.url).href)};
+    const line = ${expression};
+    const records = evaluateStuck({ now: ${JSON.stringify(now)}, prs: [${JSON.stringify(ready)}],
+      logs: { drain: [{ at: ${JSON.stringify(at)}, line }] }, claims: [] });
+    if (records.find(r => r.rule === 'R-a' && r.cause === 'NEW' && r.evidence[0] === line)) console.log('ok');`;
+  assert.equal(execFileSync(process.execPath, ['--input-type=module', '-e', source],
+    { encoding: 'utf8', timeout: 3000, maxBuffer: 1024 }).trim(), 'ok');
+});
 
 test('R-a: captured not-woken run reaches 30 minutes; first same-reason timestamp and ET', () => {
   const records = rule(evaluate([ready], { drain: [row(drain), row(drain, now)] }), 'R-a');
@@ -46,6 +62,22 @@ test('R-b negative: no owed label, newer progress, or another PR is the subject'
   assert.deepEqual(evaluate([pr(7042, ['red-team:blocked'])], { fix: [row(nothing), row('PR #7042 dispatched', now)] }), []);
   assert.deepEqual(evaluate([pr(7123, ['red-team:blocked'])], { fix: [row(nothing)] }), []);
   assert.deepEqual(evaluate([pr(7042, ['red-team:blocked'])], { fix: [row(nothing.replace('web-everything/web-everything', 'frontierui/frontierui'))] }), []);
+});
+test('qualified PR mentions retain repository token boundaries', () => {
+  for (const repo of ['web-everything/web-everything', 'other/web-everything',
+    'prefix-web-everything/web-everything', '.web-everything/web-everything']) {
+    const records = evaluate([pr(7042, ['red-team:blocked'])],
+      { fix: [row(nothing.replace('web-everything/web-everything', repo))] });
+    assert.equal(records.length, repo === 'web-everything/web-everything' ? 1 : 0);
+  }
+});
+
+test('R-a check wait classification requires running after the check name', () => {
+  for (const [reason, cause] of [['check(s) still running', 'B'], ['running before check(s)', 'NEW'],
+    ['check(s) held', 'NEW'], ['red-team pending', 'B'], ['re-stamp needed', 'B']]) {
+    const records = rule(evaluate([ready], { drain: [row(`#7204 — not woken: ${reason}`)] }), 'R-a');
+    assert.equal(records[0].cause, cause);
+  }
 });
 test('R-c: explicitly dead fix or ci-heal claim; captured held line is evidence context', () => {
   for (const kind of ['fix', 'ci-heal']) assert.equal(rule(evaluate([pr(7171)], { fix: [row(held)] },
