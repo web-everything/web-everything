@@ -446,6 +446,40 @@ describe('gateReadyItems: "your review" is re-checked against the live PR (#5768
       gateComments({ broken: true, impact }).slice(0, 1)), log: () => {} });
     expect(kept.find(i => i.pr === 5768)).toMatchObject({ kind: 'confirmed-break-owed-send-back' });
   });
+  describe('owed send-back follows the break policy', () => {
+    const cardPolicy = { broken: 'send-back', degraded: 'card', unconfirmed: 'advisory' };
+    const queued = (impact, count = 1) => {
+      const [res, rec] = gateComments({ outcome: GATE_OUTCOMES.CARD_QUEUED, broken: true, impact, count });
+      const idx = Array.from({ length: count }, (_, i) => `#${i + 1}`).join(', ');
+      return [res, { ...rec, body: `${rec.body}\n- ${count} finding(s) filed as a follow-up card (${idx}).` }];
+    };
+    const run = (comments, readPolicy) => gateReadyItems(items(), report, { gh: gate({ headRefOid: head, labels: [] }, comments),
+      log: () => {}, fixClaimLive: () => false, ...(readPolicy ? { readPolicy } : {}) });
+    const kind = async (comments, readPolicy) => (await run(comments, readPolicy)).kept.find(i => i.pr === 5768).kind;
+    it('#7181: two degraded breaks with the gate card-queued record raise no alarm under degraded=card', async () => {
+      const comments = queued('degraded', 2);
+      expect(await kind(comments, () => cardPolicy)).not.toBe('confirmed-break-owed-send-back');
+    });
+    it('an unreadable setting falls back to the strict policy (alarm)', async () => {
+      const comments = queued('degraded', 2);
+      expect(await kind(comments, () => { throw new Error('unreadable'); })).toBe('confirmed-break-owed-send-back');
+    });
+    it('a card-queued record for an older head does not settle the current head', async () => {
+      const [res] = gateComments({ broken: true, impact: 'degraded' });
+      const id = redTeamResultId(parseRedTeamComment(res.body));
+      const old = { user: { login: 'web-everything' }, created_at: '2026-10-10T02:05:00Z',
+        body: `${redTeamGateMarker(5768, '2'.repeat(40), GATE_OUTCOMES.CARD_QUEUED, id)}\n- 1 finding(s) filed as a follow-up card (#1).` };
+      expect(await kind([res, old], () => cardPolicy)).toBe('confirmed-break-owed-send-back');
+    });
+    it('a broken break with only a card record still alarms', async () => {
+      const comments = queued('broken');
+      expect(await kind(comments, () => cardPolicy)).toBe('confirmed-break-owed-send-back');
+    });
+    it('a degraded break with a card record still alarms when the policy is send-back', async () => {
+      const comments = queued('degraded');
+      expect(await kind(comments, () => ({ ...cardPolicy, degraded: 'send-back' }))).toBe('confirmed-break-owed-send-back');
+    });
+  });
   it('an incomplete re-check (unverifiable finding) is red-team-undecided, never all gates pass', async () => {
     const comments = gateComments().slice(0, 1).map(c => ({ ...c, body: c.body.replace(/\n$/, '') +
       '\n\n1. [unverifiable] (edge-case, broken) `scripts/x.mjs:3` — could not be re-checked\n' }));
