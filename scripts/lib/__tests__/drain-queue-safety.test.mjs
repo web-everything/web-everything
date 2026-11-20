@@ -4,6 +4,7 @@ import { join } from 'node:path';
 import { homedir } from 'node:os';
 import { describe, expect, it, vi } from 'vitest';
 import * as queueSafety from '../drain-queue-safety.mjs';
+import { assertCapability } from '../repo-profile.mjs';
 import { readDrainQueueSafety, redTeamEnqueueHold, dequeueSentBack, sendBackReason, decideMqSameHead, readMqTimeline, mqSameHeadGuard, createMqSameHeadRefreshStore, createMqSameHeadRefreshOptions, mqSameHeadRefreshStatePath } from '../drain-queue-safety.mjs';
 import { renderRedTeamComment } from '../../operations/review-extra-seats.mjs';
 import { parseRedTeamComment, redTeamGateMarker, redTeamMarker, redTeamResultId } from '../red-team-gate.mjs';
@@ -110,8 +111,10 @@ describe('merge-queue same-head failure admission', () => {
       f.requests = () => f.exec.mock.calls.filter(([, args]) => args.includes('PUT'));
       try { test(f); } finally { rmSync(dir, { recursive: true, force: true }); }
     }
-    it.each(['allowed', 'moved base/head', 'unreadable evidence', 'red-team hold', 'workflow hold', 'license disabled', 'approval hold'])(
+    it.each(['unsupported repo', 'capability off repo', 'allowed', 'moved base/head', 'unreadable evidence', 'red-team hold', 'workflow hold', 'license disabled', 'approval hold'])(
       'whole production refresh path ignores seeded stale memo: %s', outcome => fixture(f => {
+        // Dispatch now admits before recovery; use a real supported profile for the positive cases.
+        const repo = 'web-everything/web-everything';
         const memoDir = mkdtempSync(join(process.env.TMPDIR, 'refresh-memo-'));
         const memoPath = join(memoDir, 'stale.json');
         // The spy models gh-throttle's memo lookup independently of the child environment.
@@ -170,7 +173,7 @@ describe('merge-queue same-head failure admission', () => {
           source.slice(holdStart, holdEnd) + '\nreturn approvedHeadHold;')(...Object.values(dependencies));
         const start = source.indexOf('  function enqueueWithSameHeadGuard(');
         const end = source.indexOf('  // xym8nt4 — post-approval', start);
-        const wiring = { ...dependencies, DRY_RUN: false, mqSameHeadRefreshStore: f.store,
+        const wiring = { ...dependencies, assertCapability, DRY_RUN: false, mqSameHeadRefreshStore: f.store,
           execFileSyncThrottled: exec, createMqLiveReader: (reader = exec) => queueSafety.createMqLiveReader(reader),
           readCompletePrComments, readPinnedChangedFiles,
           readDrainQueueSafety: () => ({ value: { waitForRedTeamBeforeEnqueue: true } }),
@@ -200,6 +203,15 @@ describe('merge-queue same-head failure admission', () => {
         try {
           const enqueue = new Function(...Object.keys(wiring), source.slice(start, end)
             + '\nreturn enqueueWithSameHeadGuard;')(...Object.values(wiring));
+          if (['unsupported repo', 'capability off repo'].includes(outcome)) {
+            expect(enqueue({ repo: outcome === 'unsupported repo' ? 'unknown/repo' : 'longshore', num: pr }, head, {}, approvedHeadHold)).toMatchObject({
+              enqueued: false, kind: 'unsupported-repo', reason: expect.stringContaining('operator must enable'),
+            });
+            expect(exec).not.toHaveBeenCalled();
+            expect(calls.filter(c => c.args.includes('PUT'))).toHaveLength(0);
+            expect(existsSync(f.path)).toBe(false);
+            return;
+          }
           expect(enqueue({ repo, num: pr }, head, {}, approvedHeadHold).kind).toBe('mq-same-head-failed');
           expect(calls.length).toBeGreaterThan(3);
           expect(calls.filter(({ args }) => args.some(arg => /actions\/runs\/(100|101)$/.test(arg))))

@@ -1166,6 +1166,8 @@ export function runReviewLabelCli({
   // #5649 — the ledger sink for the `approval` row beside a `clear-human` verdict; injected only by tests (a refused
   // append), production writes through the same `appendVerdict` the verdict row uses.
   appendApproval = appendVerdict,
+  // Verdict append seam also exercises thrown transport failures before the label swap.
+  appendLedgerVerdict = appendVerdict,
   closeConfirmRuns = closeConfirmRunsAfterClearance,
   // The fix daemon's wake signal after a `review:changes` write; injected by tests so no run touches a real mailbox.
   signalFix = signalFixDispatch,
@@ -1205,6 +1207,9 @@ export function runReviewLabelCli({
   // its (never compared) diff stamped. With it, a live head or a derived net diff that differs is refused BEFORE any write.
   const expectFingerprintFlag = argv.find((a) => a === '--expect-fingerprint' || a.startsWith('--expect-fingerprint='));
   const expectedFingerprint = expectFingerprintFlag?.slice('--expect-fingerprint='.length).toLowerCase();
+  const pinnedClearHuman = to === 'clear-human' && expectHeadFlag !== undefined;
+  if (pinnedClearHuman && (!/^[0-9a-f]{40}$/.test(expectedHead || '')
+    || argv.some(a => a === '--new-head' || a.startsWith('--new-head=')))) fail('clear-human requires --expect-head=<full 40-hex SHA> and no --new-head');
   const pinnedAccept = to === 'accepted' && (expectHeadFlag !== undefined || expectFingerprintFlag !== undefined);
   if (expectFingerprintFlag !== undefined && to !== 'accepted') fail('--expect-fingerprint is only valid with --to=accepted');
   if (pinnedAccept && (!/^[0-9a-f]{40}$/.test(expectedHead || '') || !/^[0-9a-f]{64}$/.test(expectedFingerprint || '') || newHeadArg)) {
@@ -1234,7 +1239,7 @@ export function runReviewLabelCli({
   }
   const pinnedRearm = to === 'rearm' && expectHeadFlag !== undefined;
   const pinnedPlainRearm = pinnedRearm && onlyIf !== 'missing';
-  if (expectHeadFlag !== undefined && !guardedRestamp && !pinnedAccept && !pinnedRearm && onlyIf !== 'missing') fail('--expect-head requires guarded restamp, re-arm or a pinned accept');
+  if (expectHeadFlag !== undefined && !guardedRestamp && !pinnedAccept && !pinnedClearHuman && !pinnedRearm && onlyIf !== 'missing') fail('--expect-head requires guarded restamp, re-arm, pinned accept or clear-human');
   if (onlyIf === 'missing' && (!/^[0-9a-f]{40}$/.test(expectedHead || '') || newHeadArg)) fail('missing re-arm requires --expect-head=<full 40-hex SHA>');
   if (pinnedRearm && !/^[0-9a-f]{40}$/.test(expectedHead || '')) fail('re-arm requires --expect-head=<full 40-hex SHA>');
   if (onlyIf !== null && to !== 'rearm') {
@@ -1414,7 +1419,7 @@ export function runReviewLabelCli({
   if (to === 'rearm' && !prCommentsReadable) refuseRearm('comments unreadable — cannot prove no human clearance');
   if (to === 'rearm' && !/^[0-9a-f]{7,40}$/i.test(headSha.trim())) refuseRearm('head unreadable — cannot prove no human clearance');
 
-  if ((guardedRestamp || pinnedAccept || pinnedRearm || onlyIf === 'missing') && headSha !== expectedHead) fail('live head differs from --expect-head', 1);
+  if ((guardedRestamp || pinnedAccept || pinnedClearHuman || pinnedRearm || onlyIf === 'missing') && headSha !== expectedHead) fail('live head differs from --expect-head', 1);
   if (expectNoReadiness && hasReviewLabel(currentLabels, READY_TO_MERGE_LABEL)) {
     fail('missing review handoff refused: producer readiness appeared after the caller observation', 1);
   }
@@ -1987,12 +1992,12 @@ export function runReviewLabelCli({
       assertMandatoryReferralsCleared(fresh, { repo, pr, ...referralOptions });
     } catch (e) { fail(ghErr(e, 'CI-heal carry state unreadable'), 1); }
   }
-  // A pinned accept (held item 177) re-reads the head BEFORE the first durable write too — the shadow ledger row below
+  // A pinned accept (held item 177) or clear-human (#7332) re-reads the head BEFORE the first durable write too — the shadow ledger row below
   // is a write — so a push after the first read leaves no ledger row and no comment, not only no label.
-  if (pinnedAccept) {
+  if (pinnedAccept || pinnedClearHuman) {
     let live = null;
     try { live = provider.readPrState(repo, pr).headRefOid; } catch (e) { fail(ghErr(e, 'gh pr view failed'), 1); }
-    if (live !== expectedHead) fail('live head differs from --expect-head; nothing written', 1);
+    if (live !== expectedHead) fail(pinnedClearHuman ? 'live head differs from --expect-head' : 'live head differs from --expect-head; nothing written', 1);
   }
 
   // Check the pin before each write. At the label write, reuse the clearance check's
@@ -2040,7 +2045,7 @@ export function runReviewLabelCli({
   let clearingLedgerMiss = false;
   let clearingLedgerError;
   try {
-    const appended = appendVerdict(buildVerdictRecord({
+    const appended = appendLedgerVerdict(buildVerdictRecord({
       repo,
       pr: Number(pr),
       verdict: ledgerVerdict,
@@ -2094,7 +2099,11 @@ export function runReviewLabelCli({
       }
     }
   } catch (e) {
-    process.stderr.write(`review-set-label: verdict-ledger append failed (#3007 shadow, non-fatal) — ${String((e && e.message) || e).split('\n')[0]}\n`);
+    if (to === 'clear-human') {
+      clearingLedgerMiss = true;
+      clearingLedgerError = String((e && e.message) || e).split('\n')[0];
+    }
+    process.stderr.write(`review-set-label: verdict-ledger append failed (#3007 shadow, ${clearingLedgerMiss ? 'fatal' : 'non-fatal'}) — ${String((e && e.message) || e).split('\n')[0]}\n`);
   }
   // Outside the try on purpose: a stubbed or real `process.exit` must never be swallowed by the non-fatal catch above.
   if (clearingLedgerMiss) {

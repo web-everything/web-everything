@@ -704,7 +704,11 @@ describe('unaudited-tip: a pending ready candidate never outlives its audit evid
     expect(matchReadyCandidate(args({ plan: cleared, auditedTip: none })).reason).toBe('ready-audit-revoked');
     expect(matchReadyCandidate(args({ plan: cleared, auditedTip: none, carries: (sha, build) => sha === 'b1' && build === 'H' })).match).toBe('superseded');
     expect(matchReadyCandidate(args({ plan: cleared, auditedTip: none, carries: (sha, build) => sha === 'b1' && build === 'M2' })).match).toBe('superseded');
-    expect(matchReadyCandidate(args({ ready: candidate([{ ref, sha: 'a1', pinnedFrom: 'b1' }]), plan: cleared, auditedTip: none })).match).toBe('superseded');
+    const auditedPin = 'b'.repeat(40);
+    // pinnedFrom never exempts, audited or not: the applied sha is judged on its own evidence
+    expect(matchReadyCandidate(args({ ready: candidate([{ ref, sha: 'a1', pinnedFrom: auditedPin }]), plan: cleared,
+      auditedTip: (_ref, sha) => sha === auditedPin })).reason).toBe('ready-audit-revoked');
+    expect(matchReadyCandidate(args({ ready: candidate([{ ref, sha: 'a1', pinnedFrom: 'b1' }]), plan: cleared, auditedTip: none })).reason).toBe('ready-audit-revoked');
     expect(matchReadyCandidate(args({ plan: cleared, auditedTip: null })).match).toBe('superseded'); // follow mode: no gate
   });
 

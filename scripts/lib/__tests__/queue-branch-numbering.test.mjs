@@ -1249,7 +1249,7 @@ describe('Git-quoted backlog names', () => {
 it('probes on every live queue pass and repairs when inline numbering will not run', () => {
   const source = readFileSync('scripts/merge-ai-prs.mjs', 'utf8');
   expect(source).toContain('if (mergeStrategy.enqueues(null) && !DRY_RUN) numbered = probeQueuedLand(process.cwd());');
-  expect(source).toContain('if (queuedHashOnMain && !landedLocal && !DRY_RUN) numbered = repairHashOnMain(');
+  expect(source).toContain('if (!localWriteRefusal && queuedHashOnMain && !landedLocal && !DRY_RUN) numbered = repairHashOnMain(');
   expect(source).toContain('(numberingOnBranch || queuedHashOnMain) ? { minNext: fallbackMinNext(');
   expect(source).toContain('if (landedLocal && !DRY_RUN) {\n    if (queuedHashOnMain)');
 });

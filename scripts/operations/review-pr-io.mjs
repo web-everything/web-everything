@@ -1059,8 +1059,17 @@ const STALE_CACHE_SUFFIX = / \(stale-cache cache-age-ms=[^()]*\)$/;
 function onlyVerdictDependentPending(ci, reviewedHead) {
   if (ci?.allowed !== false || ci.headSha !== reviewedHead || typeof ci.reason !== 'string') return false;
   if (!AFFECTED_ROW_REFUSALS.includes(ci.reason.replace(STALE_CACHE_SUFFIX, ''))) return false;
+  // A derived gate that already FAILED stays red until this very review lands, so it cannot hold the label either:
+  // review-gate always, merge-gate only when its failure carries the review-hold annotation (never a real hold).
+  const annotatedMergeGate = Array.isArray(ci.checks)
+    && ci.checks.some(row => row?.name === 'merge-gate' && row.mergeGateReviewHold);
+  // Only the plain `failure` conclusion qualifies: timed-out, cancelled and action-required runs are infra or setup
+  // faults, not the gate's by-design red.
+  const derivedRed = row => String(row?.reason).toLowerCase() === 'failure'
+    && (row.name === 'review-gate' || (row.name === 'merge-gate' && annotatedMergeGate));
   return Array.isArray(ci.affected) && ci.affected.length > 0
-    && ci.affected.every(row => VERDICT_DEPENDENT_CHECKS.includes(row?.name) && ['missing', 'pending'].includes(row?.reason));
+    && ci.affected.every(row => VERDICT_DEPENDENT_CHECKS.includes(row?.name)
+      && (['missing', 'pending'].includes(row?.reason) || derivedRed(row)));
 }
 
 /**
