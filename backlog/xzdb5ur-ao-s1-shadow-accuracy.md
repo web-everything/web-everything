@@ -39,3 +39,12 @@ One line per class: either the handling, or `n/a: <why>`.
 ## Duplicate admission
 
 New card: follow-up accuracy gaps of the AO S1 shadow scanner, no existing card covers them
+
+## Report-validation hardening (audit round 3 on the --measure report check)
+
+1. Reject empty names and statuses outside the known vitest set (a clean sample can otherwise be recorded).
+2. Establish full-run evidence: refuse interrupted, pending, partial-suite or stale reports (completeness or revision check).
+3. Detect runtime errors through fields the installed vitest JSON reporter really emits.
+4. Reject contradictory reports (a passed suite holding failed assertions).
+5. Validate `--selected-json` and bind it to the diff, so extra test names cannot hide escapes.
+Also: check the 512 KB cap before reading a file fully, and add shrink-mode (non-sensitive path) cases to the shadow on/off invariance tests.
