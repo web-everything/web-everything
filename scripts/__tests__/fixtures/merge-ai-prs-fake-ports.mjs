@@ -24,8 +24,10 @@ if (a[0] === 'api') {
   if (path.includes('/reviews')) out([[]]);
   if (path.includes('/files')) out([[{filename:'README.md',status:'modified'}]]);
   if (pr.unreadableCheckRows && path.includes('/' + pr.unreadableCheckRows + '?')) out([{}]);
-  if (path.includes('/check-runs')) out(pr.checkRuns || [{check_runs:pr.statusCheckRollup.filter(c => c.name)}]);
-  if (path.includes('/status?')) out([{statuses:pr.statusCheckRollup.filter(c => c.context)}]);
+  // Complete pages carry the server's total_count: the strict reader attests rows only when delivered === total.
+  const runRows = pr.statusCheckRollup.filter(c => c.name), statusRows = pr.statusCheckRollup.filter(c => c.context);
+  if (path.includes('/check-runs')) out(pr.checkRuns || [{total_count:runRows.length,check_runs:runRows}]);
+  if (path.includes('/status?')) out([{total_count:statusRows.length,statuses:statusRows}]);
   if (a[1] === 'graphql') {
     const q = a.find(x => x.startsWith('query=')) || '';
     if (q.includes('timelineItems(')) out({ data: { repository: { pullRequest: { timelineItems: {

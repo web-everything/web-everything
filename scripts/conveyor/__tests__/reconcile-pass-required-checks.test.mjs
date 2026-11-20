@@ -48,8 +48,9 @@ it.each(['complete', 'short-incomplete', 'status-failure', 'status-error', 'stat
     const checks = args.some(arg => arg.includes('/check-runs'));
     if (shape === (checks ? 'check-unreadable' : 'status-unreadable')) throw new Error('unreadable feed');
     return JSON.stringify(checks
-      ? [{ check_runs: runs.slice(0, 100) }, { check_runs: runs.slice(100) }]
-      : [{ statuses: [{ context: 'legacy', state: ['status-failure', 'status-error', 'status-pending'].includes(shape) ? shape.slice(7) : 'success' }] }]);
+      // Complete pages carry the server's total_count (same on every page): rows are attested only when delivered === total.
+      ? [{ total_count: runs.length, check_runs: runs.slice(0, 100) }, { total_count: runs.length, check_runs: runs.slice(100) }]
+      : [{ total_count: 1, statuses: [{ context: 'legacy', state: ['status-failure', 'status-error', 'status-pending'].includes(shape) ? shape.slice(7) : 'success' }] }]);
   });
   let observed;
   const plan = runReconcilePass({ ...xxOptions(),
