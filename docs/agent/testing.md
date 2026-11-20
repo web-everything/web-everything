@@ -4581,7 +4581,10 @@ operator ops store (`ruled-weakened-add`). Another head cannot supply the audit.
 
 ## Bounded red-team probe fairness
 
-`red-team-dispatch-queue.test.mjs` pins the two-probe limit per repository and
+`red-team-dispatch-queue.test.mjs` pins a default of six probes per repository per tick,
+a hard ceiling of 50, and invalid/unreadable-setting fallback to six. The operator
+`redTeamQueue.maxProbesPerTick` leaf overrides the settings-file value. Historical
+two-probe rotation fixtures explicitly set their cap to two. The tests also pin
 least-recently-probed turns persisted as optional `lastProbeTurn` entry fields.
 Keep historical entries without the field loadable, reject malformed turns, and
 exercise five still-blocked entries across three ticks with a reload between ticks.
@@ -4599,6 +4602,13 @@ still list them. Changed live heads are re-keyed in place with attempts and bloc
 unreadable evidence keeps entries, logs the failure, and defers admission. Reconciliation
 runs inside the dispatch transaction so a thrown runner rolls back eviction and re-keying.
 Planner skips retain the existing bounded, fair probe rotation.
+Partial inventories never sync, enqueue, evict or re-key candidates: only known blocked
+entries with a live OPEN read matching the stored head may be probed, using head-bound
+refusals and raw PRs from those reads. Runnable entries wait for a complete inventory.
+Only the paged reader's partial-inventory error enables this recovery; other failures skip it.
+The `red-team-probe-cap-starvation` soak break reopens ten blocked entries between
+ticks and requires multiple probes in one tick and all ten within two default ticks;
+its presence probe executes behavior rather than matching source text.
 The `red-team-queue-verdict-evict` break also replays decided-head eviction: use
 `isPublishableRedTeamResult(redTeamForHead(...))` over complete trusted comments,
 then require readable carry/status/outbox evidence with no settlement owed and a
