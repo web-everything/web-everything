@@ -24,9 +24,20 @@ function derFinding(bytes,tick) {
     const cached=cache.get(offset);
     if(cached)return cached.next<=end?cached:null;
     if(offset+2>end)return null;
-    const tag=bytes[offset++];
+    const header=offset,tag=bytes[offset++];
+    // Fragment tags are ignored by the consumer, including high-tag-number
+    // encodings. Retain the first octet for its class/constructed bits.
+    if((tag&31)===31) {
+      let continuation;
+      do {
+        tick();
+        if(offset>=end)return null;
+        continuation=bytes[offset++]&128;
+      } while(continuation);
+    }
+    if(offset>=end)return null;
     let length=bytes[offset++];
-    const header=offset-2,start=offset;
+    const start=offset;
     if(length===128) {
       if(!(tag&32))return null; // BER indefinite lengths require a constructed tag.
       while(offset+2<=end) {
@@ -35,7 +46,7 @@ function derFinding(bytes,tick) {
           cache.set(header,node);return node;
         }
         const child=tlv(offset,end,depth+1);
-        if(!child||child.tag===0)return null;
+        if(!child)return null;
         offset=child.next;
       }
       return null; // An unfinished BER container is not a complete key.
@@ -46,7 +57,9 @@ function derFinding(bytes,tick) {
       length=0;
       for(let i=0;i<count;i++)length=length*256+bytes[offset++];
     }
-    if(offset+length>end||tag===0)return null;
+    // A nonempty tag-zero fragment is accepted by OpenSSL; a bare EOC is
+    // only valid as the terminator handled above, never as a definite child.
+    if(offset+length>end||(tag===0&&length===0))return null;
     const node={tag,start:offset,end:offset+length,next:offset+length};
     cache.set(header,node);return node;
   };
@@ -63,8 +76,10 @@ function derFinding(bytes,tick) {
   const octets=(node,depth=0)=>{
     tick();
     if(depth>LIMITS.derDepth)throw EXHAUSTED;
-    if(node?.tag===4)return node.end-node.start;
-    if(node?.tag!==36)return -1;
+    if(!node||(depth===0&&node.tag!==4&&node.tag!==36))return -1;
+    // Only the envelope must be OCTET STRING. OpenSSL collects primitive
+    // fragment contents regardless of tag and recursively flattens containers.
+    if(!(node.tag&32))return node.end-node.start;
     const parts=children(node);
     if(!parts)return -1;
     let size=0;

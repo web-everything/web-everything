@@ -8,10 +8,11 @@ import {credentialBufferFinding,manifestEntry} from '../forge-exec-manifest.mjs'
 
 const FINDING='private-key-structure';
 const encode=(tag,body,indefinite=false)=>{
-  if(indefinite)return Buffer.concat([Buffer.from([tag,128]),body,Buffer.from([0,0])]);
+  const tagBytes=Array.isArray(tag)?tag:[tag];
+  if(indefinite)return Buffer.concat([Buffer.from([...tagBytes,128]),body,Buffer.from([0,0])]);
   const length=body.length<128?[body.length]:[...Buffer.from(body.length.toString(16).padStart(
     Math.ceil(body.length.toString(16).length/2)*2,'0'),'hex')];
-  return Buffer.concat([Buffer.from([tag,...(body.length<128?length:[128+length.length,...length])]),body]);
+  return Buffer.concat([Buffer.from([...tagBytes,...(body.length<128?length:[128+length.length,...length])]),body]);
 };
 // Independent definite-length reader used only to transform consumer-generated DER.
 const read=(bytes,offset=0)=>{
@@ -97,6 +98,60 @@ const fixtures=()=>{
 };
 
 describe('Forge key structure consumer compatibility',()=>{
+  it('I2 consumer-accepted UTF8String fragment blocks raw/base64/hex and manifest admission',()=>{
+    const bytes=Buffer.from('3030020100300506032b657024240c220420'+'01'.repeat(32),'hex');
+    const imported=createPrivateKey({key:bytes,format:'der',type:'pkcs8'});
+    expect(imported.asymmetricKeyType).toBe('ed25519');
+    expect(imported.export({format:'der',type:'pkcs8'}))
+      .toEqual(Buffer.from('302e020100300506032b657004220420'+'01'.repeat(32),'hex'));
+    for(const view of wrappers(bytes)) {
+      expect.soft(keyStructurePrecheck(view)).toBe(true);
+      expect.soft(keyStructureFinding(view,{precheck:false})).toBe(FINDING);
+      expect.soft(keyStructureFinding(view)).toBe(FINDING);
+      expect.soft(credentialBufferFinding(view)).toBe(FINDING);
+    }
+    for(const encoding of ['base64','hex']) {
+      expect.soft(()=>manifestEntry(Buffer.from('docs/token.md'),Buffer.from(bytes.toString(encoding)),false,true))
+        .toThrow(expect.objectContaining({code:'excluded-source-file',message:expect.stringContaining(FINDING)}));
+    }
+  });
+
+  it.each(['pkcs8','encrypted pkcs8','sec1'])(
+    'I2 %s collects arbitrary fragment tags through nested containers like the consumer',family=>{
+      const type=family==='sec1'?'sec1':'pkcs8';
+      const {privateKey}=family==='sec1'?generateKeyPairSync('ec',{namedCurve:'prime256v1'}):
+        generateKeyPairSync('ed25519');
+      const passphrase=family==='encrypted pkcs8'?'test':undefined;
+      const primitive=privateKey.export({format:'der',type,
+        ...(passphrase?{cipher:'aes-256-cbc',passphrase}:{})});
+      const index=family==='pkcs8'?2:1;
+      const payload=parts(read(primitive).body)[index].body;
+      for(const tag of [0,2,12,16,128,192,[31,12],[159,129,0]]) {
+        for(const indefinite of [false,true])for(const container of [null,48,172,[191,129,0]]) {
+          const split=Math.ceil(payload.length/2);
+          const fragments=Buffer.concat([encode(tag,Buffer.alloc(0)),
+            encode(tag,payload.subarray(0,split)),encode(tag,payload.subarray(split))]);
+          // Empty tag zero is EOC, not a data fragment; retain nonempty tag-zero witnesses.
+          const contents=tag===0?Buffer.concat([encode(tag,payload.subarray(0,split)),
+            encode(tag,payload.subarray(split))]):fragments;
+          const bytes=replaceField(primitive,index,encode(36,
+            container===null?contents:encode(container,contents,indefinite),indefinite));
+          const imported=createPrivateKey({key:bytes,format:'der',type,passphrase});
+          expect(imported.export({format:'der',type})).toEqual(privateKey.export({format:'der',type}));
+          for(const view of wrappers(bytes)) {
+            expect(keyStructurePrecheck(view)).toBe(true);
+            expect(keyStructureFinding(view,{precheck:false})).toBe(FINDING);
+            expect(keyStructureFinding(view)).toBe(FINDING);
+            expect(credentialBufferFinding(view)).toBe(FINDING);
+          }
+          for(const encoding of ['base64','hex']) {
+            expect(()=>manifestEntry(Buffer.from('docs/token.md'),Buffer.from(bytes.toString(encoding)),false,true))
+              .toThrow(expect.objectContaining({code:'excluded-source-file',message:expect.stringContaining(FINDING)}));
+          }
+        }
+      }
+    });
+
   it.each(['primitive','constructed','indefinite constructed','nested fragments','indefinite nested fragments'])(
     'I2 encrypted PKCS8 %s ciphertext imports and is blocked through manifest admission',variant=>{
       const {privateKey}=generateKeyPairSync('ed25519');
@@ -127,7 +182,7 @@ describe('Forge key structure consumer compatibility',()=>{
   it('I2 encrypted PKCS8 rejects empty or malformed constructed ciphertext',()=>{
     const algorithm=encode(48,Buffer.concat([encode(6,Buffer.from([42,3])),encode(48,Buffer.alloc(0))]));
     for(const ciphertext of [encode(36,Buffer.alloc(0)),encode(36,encode(4,Buffer.alloc(0))),
-      encode(36,encode(2,Buffer.from([7]))),encode(36,Buffer.from([4,2,7])),
+      encode(36,Buffer.from([2,2,7])),encode(36,Buffer.from([4,2,7])),
       encode(36,encode(4,Buffer.from([7])),true).subarray(0,-1)]) {
       const bytes=encode(48,Buffer.concat([algorithm,ciphertext]));
       expect(keyStructureFinding(bytes,{precheck:false})).toBeNull();
@@ -135,11 +190,11 @@ describe('Forge key structure consumer compatibility',()=>{
     }
   });
 
-  it('I2 encrypted PKCS8 excessive constructed ciphertext nesting fails closed',()=>{
+  it.each([36,48,172,[191,129,0]].map(tag=>[tag]))('I2 excessive ciphertext container %j nesting fails closed',tag=>{
     const algorithm=encode(48,Buffer.concat([encode(6,Buffer.from([42,3])),encode(48,Buffer.alloc(0))]));
     let ciphertext=encode(4,Buffer.from([7]));
-    for(let depth=0;depth<66;depth++)ciphertext=encode(36,ciphertext);
-    const bytes=encode(48,Buffer.concat([algorithm,ciphertext]));
+    for(let depth=0;depth<66;depth++)ciphertext=encode(tag,ciphertext);
+    const bytes=encode(48,Buffer.concat([algorithm,encode(36,ciphertext)]));
     const exhausted='private-key-scan-budget-exhausted-use-local';
     expect(keyStructureFinding(bytes,{precheck:false})).toBe(exhausted);
     expect(keyStructureFinding(bytes)).toBe(exhausted);
@@ -178,14 +233,27 @@ describe('Forge key structure consumer compatibility',()=>{
       expect(keyStructureFinding(view),name).toBe(FINDING);
   });
 
-  it('I2 rejects incomplete BER, misplaced EOC, primitive indefinite and non-octet fragments',()=>{
+  it('I2 rejects incomplete BER, misplaced EOC, primitive indefinite and malformed fragments',()=>{
     const scalar=encode(48,Buffer.concat([encode(2,Buffer.from([1])),encode(4,Buffer.from([7]))]),true);
     const badOctets=encode(48,Buffer.concat([encode(2,Buffer.from([1])),
-      encode(36,encode(2,Buffer.from([7])),true)]),true);
+      encode(36,Buffer.from([2,2,7]),true)]),true);
     for(const bytes of [scalar.subarray(0,-1),scalar.subarray(0,-2),badOctets,
       Buffer.from([48,128,2,1,1,4,128,7,0,0,0,0]),
       Buffer.from([48,128,2,1,1,0,0,4,1,7,0,0])])
       expect(keyStructureFinding(bytes)).toBeNull();
+  });
+
+  it('I2 keeps the OCTET STRING envelope and rejects malformed high tags and bare EOC',()=>{
+    const prefix=Buffer.from('020100300506032b6570','hex');
+    const payload=Buffer.from('0420'+'01'.repeat(32),'hex');
+    for(const field of [encode(12,payload),encode(48,encode(12,payload)),
+      encode(36,Buffer.from([31,128])),encode(36,Buffer.from([31,1])),
+      encode(36,Buffer.concat([Buffer.from([0,0]),encode(12,payload)])),
+      encode(36,Buffer.from([12,128,7,0,0]))]) {
+      const bytes=encode(48,Buffer.concat([prefix,field]));
+      expect(keyStructureFinding(bytes,{precheck:false})).toBeNull();
+      expect(keyStructureFinding(bytes)).toBeNull();
+    }
   });
 
   it('I2 fails closed on excessive BER nesting with the operator local fallback',()=>{
