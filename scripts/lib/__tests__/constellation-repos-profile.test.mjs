@@ -271,3 +271,57 @@ describe('repoProfileForLanePath', () => {
     expect(repoProfileForLanePath('')).toBeNull();
   });
 });
+
+import { repoHasCapability, assertCapability } from '../repo-profile.mjs';
+it('explicit capability checks fail closed for missing, malformed or unreadable registered profiles', () => {
+  for (const resolveProfile of [() => null, () => false, () => ({}), () => ({ capabilities: { review: 'false' } }),
+    () => { throw new Error('unreadable profile'); }]) {
+    expect(repoHasCapability('frontier-ui/frontierui', 'review', { resolveProfile })).toBe(false);
+    expect(repoHasCapability('longshoreai/longshore', 'review', { resolveProfile })).toBe(false);
+  }
+  expect(repoHasCapability('outside/repo', 'review', { resolveProfile: () => false })).toBe(false);
+  expect(repoHasCapability('outside/repo', 'review')).toBe(false);
+  expect(repoHasCapability('we', 'unknown')).toBe(false);
+});
+
+
+import { CONSTELLATION_REPOS, PENDING_REPOS } from '../constellation-repos.mjs';
+it("pins today's complete registered repo set and its exact capabilities", () => {
+  const expected = {
+    we: { review: true, fix: true, ciHeal: true, build: 'direct' },
+    frontierui: { review: true, fix: true, ciHeal: true, build: 'couple' },
+    'plateau-app': { review: true, fix: true, ciHeal: true, build: 'couple' },
+    longshore: { review: false, fix: false, ciHeal: false, build: 'none' },
+  };
+  expect(Object.fromEntries(Object.entries({ ...CONSTELLATION_REPOS, ...PENDING_REPOS })
+    .map(([key, { slug }]) => {
+      expect(repoProfile(slug)?.capabilities).toEqual(expected[key]);
+      return [key, repoProfile(key)?.capabilities];
+    }))).toEqual(expected);
+});
+it.each(['review', 'fix', 'ciHeal', 'build'])('denies unknown repos the %s capability', capability => {
+  expect(repoProfile('outside/repo')).toBeNull();
+  expect(repoHasCapability('outside/repo', capability)).toBe(false);
+});
+
+it.each([false, 'false', 1, {}])('refuses malformed/off dispatch capability %j', value => {
+  const options = { resolveProfile: () => ({ capabilities: { fix: value } }) };
+  expect(repoHasCapability('we', 'fix', options)).toBe(false);
+  expect(assertCapability('we', 'fix', options)).toMatchObject({ kind: 'unsupported-repo' });
+});
+it('allows strict true and refuses unknown dispatch targets', () => {
+  expect(assertCapability('we', 'fix')).toBeNull();
+  expect(assertCapability('outside/repo', 'fix')).toMatchObject({ kind: 'unsupported-repo' });
+});
+
+it.each(['review', 'fix', 'ciHeal', 'build'])('requires exact capability values for %s', capability => {
+  const values = [true, false, 'false', 'true', 1, 0, '', null, undefined, {}, 'none', 'direct', 'couple', 'other'];
+  const accepted = capability === 'build' ? ['direct', 'couple'] : [true];
+  values.forEach(value => {
+    const options = { resolveProfile: () => ({ capabilities: { [capability]: value } }) };
+    const allowed = accepted.includes(value);
+    expect(repoHasCapability('we', capability, options), `value: ${JSON.stringify(value)}`).toBe(allowed);
+    expect(assertCapability('we', capability, options) === null).toBe(allowed);
+    expect(repoHasCapability('outside/repo', capability, options)).toBe(false);
+  });
+});

@@ -72,6 +72,8 @@ export function planGateCatchUp({ repo, refusals = [], rawPrs = [], now = Date.n
       || state.result.findings.some(f => !Array.isArray(disposition.rulings.get(f.index))
         || !['open', 'held'].includes(disposition.dispositions.get(f.index)?.state))) continue;
     if (!plan.sendBack.length || (state.sendBackOutcome && !state.reopened)) continue;
+    // Send-backs are safety maintenance even in mixed plans. The live gate admits
+    // new card work separately, after recording the send-back.
     // Use the shared trusted reader: a carried result takes its carry comment's creation time.
     const at = Date.parse(commentCreatedAt(hit?.comment));
     if (!Number.isFinite(at) || now - at < graceMin * 60_000) continue;

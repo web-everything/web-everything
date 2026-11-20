@@ -825,6 +825,7 @@
   "scripts/lib/__tests__/antigravity-judge-spawn.integration.test.mjs": 0,
   "scripts/lib/__tests__/antigravity-judge-spawn.test.mjs": 4.13,
   "scripts/lib/__tests__/antigravity-run-evidence.test.mjs": 0.04,
+  "scripts/lib/__tests__/external-juror-liveness.test.mjs": 2,
   "scripts/lib/__tests__/approval-prevention-notice.test.mjs": 0.03,
   "scripts/lib/__tests__/approved-human-surface-hold.test.mjs": 0.02,
   "scripts/lib/__tests__/archive-closed-review-runs.test.mjs": 0.48,
@@ -1975,9 +1976,11 @@
  "soak": {
   "scripts/conveyor/soak/breaks/accepted-pr-stale-accept-row-never-executed.soak.test.mjs": 15.28,
   "scripts/conveyor/soak/breaks/catch-up-clean-first-snapshot-first.soak.test.mjs": 4.65,
+  "scripts/conveyor/soak/breaks/same-head-hold-clean-head-never-resolves.soak.test.mjs": 2,
   "scripts/conveyor/soak/breaks/run-store-stray-entry.soak.test.mjs": 2,
   "scripts/conveyor/soak/breaks/red-team-queue-verdict-evict.soak.test.mjs": 4.12,
   "scripts/conveyor/soak/breaks/host-handoff-cache-write-race.soak.test.mjs": 2,
+  "scripts/conveyor/soak/breaks/red-team-reservation-route-exhaustion.soak.test.mjs": 2,
   "scripts/conveyor/soak/breaks/fix-dispatch-plan-eats-budget.soak.test.mjs": 1,
   "scripts/conveyor/soak/breaks/admission-warn-sticky-pressure-holds-idle-host.soak.test.mjs": 0.3,
   "scripts/conveyor/soak/breaks/agy-juror-shared-checkout-reset.soak.test.mjs": 1.85,
@@ -2312,6 +2315,9 @@
   "scripts/conveyor/soak/breaks/wip-cap-counts-worker-prs.soak.test.mjs": 0.01,
   "scripts/conveyor/soak/breaks/withdrawn-operator-block-directs-takeover.soak.test.mjs": 0.53,
   "scripts/conveyor/soak/breaks/worker-push-during-fix-claim.soak.test.mjs": 93.82,
-  "scripts/conveyor/soak/daemon-soak.soak.test.mjs": 450.96
+  "scripts/conveyor/soak/daemon-soak.soak.test.mjs": 450.96,
+  "scripts/conveyor/soak/breaks/pinnedfrom-audited-exemption.soak.test.mjs": 0.1,
+  "scripts/conveyor/soak/breaks/agy-juror-first-output.soak.test.mjs": 2,
+  "scripts/conveyor/soak/breaks/daemon-git-developer-dir.soak.test.mjs": 1
  }
 }

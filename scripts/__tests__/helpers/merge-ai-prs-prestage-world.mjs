@@ -6,6 +6,7 @@ import { createPrestageWorld } from '../fixtures/merge-ai-prs-prestage-world.mjs
 
 const script = join(dirname(fileURLToPath(import.meta.url)), '..', '..', 'merge-ai-prs.mjs');
 const sha = 'a'.repeat(40);
-const world = createPrestageWorld((argv, options) => runInProcess(argv, { ...options, ports: prestagePorts }));
+const prestageWorld = createPrestageWorld((argv, options) => runInProcess(argv, { ...options, ports: prestagePorts }));
+const world = (fn, options) => prestageWorld(fn, { slug: 'web-everything/web-everything', ...options });
 
 export { script, sha, world };
