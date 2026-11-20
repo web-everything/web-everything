@@ -116,6 +116,7 @@ import {
 import { assertMainNotStale, dispatchReview, isReviewCodePath, planReviewDispatch } from './review-dispatch.mjs';
 import { runReport } from './completion-cli.mjs';
 import { writeReviewJobDone, writeReviewJobStarted } from './review-job-envelope.mjs';
+import { reviewSeatLaunchEnv } from '../lib/review-seat-caps.mjs';
 import { workerWrapperEnabledFor } from './worker-wrapper-launch.mjs';
 import { tryReadCompletion } from './completion-store.mjs';
 import { rateAndRecordReviewJob } from '../conveyor/run-rating.mjs';
@@ -443,7 +444,7 @@ export function createReviewJobIo({ root = REPO_ROOT, env = process.env, dir = r
   readSeatRecords = () => createRedTeamIo({ root, env }).readRecords({ strict: true }),
   readWitness = key => readRecoveryWitness({ ...key, env, readScorecards: readSeatRecords }), recoveryProbe = defaultRecoveryProbe(),
   queueBaseline = () => resolveLiveQueueBaseline({ checkoutRoot: root, env }),
-  seatAvailable = provider => createRedTeamIo({ root, env }).cliAvailable(provider),
+  seatAvailable = provider => createRedTeamIo({ root, env }).cliAvailable(provider), spawnSpeculative = spawn,
   log = line => writeLineSync(2, `[${new Date().toISOString()}] ${line}`),
 } = {}) {
   const laneSourceArgv = reviewLaneSourceArgv(reviewLaneSource({ origin, reference }, env));
@@ -766,11 +767,11 @@ export function createReviewJobIo({ root = REPO_ROOT, env = process.env, dir = r
       for (const f of [handle.readSink, handle.passFile, handle.reservedFile]) { try { rmSync(f, { force: true }); } catch { /* fresh */ } }
       const fd = openSync(handle.logFile, 'w');
       try {
-        const child = spawn(process.execPath, [
+        const child = spawnSpeculative(process.execPath, [
           ...heapCapArgs('review-extra-seats'),
           'scripts/operations/review-extra-seats.mjs', 'red-team-speculate', `--pr=${pr}`, `--repo=${repo}`, `--lane=${lanePath}`,
           `--read-sink=${handle.readSink}`, `--out=${handle.passFile}`, `--wait-ms=${waitMs}`,
-        ], { cwd: root, env, stdio: ['ignore', fd, fd], detached: true });
+        ], { cwd: root, env: reviewSeatLaunchEnv(env), stdio: ['ignore', fd, fd], detached: true });
         child.unref();
         if (!child.pid) return null;
         return { ...handle, pid: child.pid, startedAt: Date.now() };
@@ -1523,7 +1524,7 @@ export function dispatchReviewJob({
   dir = reviewJobsDir(env, root),
   spawnJob = defaultSpawnJob,
   readCompletion = (slug) => { try { return tryReadCompletion(slug); } catch { return null; } },
-  resolveSettingsEnv = () => resolveGhShimSettingsEnv(undefined),
+  resolveSettingsEnv = () => resolveGhShimSettingsEnv(undefined, { env }),
   isAlive = pidAlive,
   checkoutExists = existsSync, home = homedir(), expectedHead, io = createReviewJobIo({ root, env, origin, reference }),
 } = {}) {
@@ -1557,7 +1558,7 @@ export function dispatchReviewJob({
     && !(ci.affected ?? []).some(row => ['wrong-head', 'malformed', 'missing'].includes(row.reason));
   if (!ci?.allowed && !waived) return { pr: planned.pr, repo: planned.repo, headSha: ci?.headSha ?? null, skipped: formatReviewCiSkip(ci), ci };
   const settingsEnv = resolveSettingsEnv() || {};
-  const childEnv = { ...env, ...settingsEnv };
+  const childEnv = reviewSeatLaunchEnv(env, settingsEnv);
   // The dispatcher's own actor id (if it happens to run inside a session) must never leak into the job — the
   // job mints its own per round.
   delete childEnv[ACTOR_ENV];
