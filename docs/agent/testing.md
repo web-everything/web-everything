@@ -5628,3 +5628,8 @@ spawn error message) in probe diagnostics rather than reporting zero counts as p
 remaining files. Only ENOENT proves absent metadata. Existing checkouts with failed
 status/history/ahead probes remain ineligible and block growth/recovery; keep the
 negative cases in `lane-pool-acquire-skips-unpushed.test.mjs` alongside this coverage.
+
+The private deadline replay in `lane-acquire-default-wait.mjs` executes the production
+acquire loop in a VM. When that loop adds a dependency, update the replay's context too:
+import pure policy helpers and inject private IO for lease/history checks on growth and
+recovery candidates. Keep explicit output bounds on Git and CLI children in soak replays.

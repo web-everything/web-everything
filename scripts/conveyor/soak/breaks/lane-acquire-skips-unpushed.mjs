@@ -10,7 +10,7 @@ const REPO_ROOT = resolve(fileURLToPath(import.meta.url), '../../../../..');
 export async function replay(root = REPO_ROOT) {
   const base = mkdtempSync(join(tmpdir(), 'soak-acquire-unpushed-'));
   try {
-    const git = (args, cwd = base) => execFileSync('git', args, { cwd, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }).trim();
+    const git = (args, cwd = base) => execFileSync('git', args, { cwd, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], maxBuffer: 64 * 1024 * 1024 }).trim();
     const reference = join(base, 'reference'), origin = join(base, 'origin.git'), pool = join(base, 'pool');
     const bin = join(base, 'bin'), trace = join(base, 'fetches');
     mkdirSync(reference); mkdirSync(bin); writeFileSync(trace, '');
@@ -18,7 +18,7 @@ export async function replay(root = REPO_ROOT) {
     writeFileSync(join(reference, 'file.txt'), 'base\n'); git(['add', '.'], reference);
     git(['-c', 'user.name=t', '-c', 'user.email=t@t', 'commit', '-qm', 'base'], reference);
     git(['clone', '-q', '--bare', reference, origin]);
-    const realGit = execFileSync('which', ['git'], { encoding: 'utf8' }).trim();
+    const realGit = execFileSync('which', ['git'], { encoding: 'utf8', maxBuffer: 64 * 1024 }).trim();
     writeFileSync(join(bin, 'git'), `#!${process.execPath}\n` +
       `const cp=require('node:child_process'),fs=require('node:fs'),args=process.argv.slice(2);\n` +
       `if(process.cwd().endsWith('/lane-1')&&args.includes('fetch'))fs.appendFileSync(process.env.SOAK_FETCH_TRACE,'fetch\\n');\n` +
@@ -28,7 +28,7 @@ export async function replay(root = REPO_ROOT) {
     const env = { ...process.env, PATH: `${bin}:${process.env.PATH}`, SOAK_FETCH_TRACE: trace,
       LANE_POOL_ROOT: pool, LANE_POOL_ACQUIRE_DEFAULT_WAIT_MS: '0', LANE_POOL_NO_RECOVER: '1',
       WE_NEEDS_YOU_FEED: join(base, 'needs-you.jsonl') };
-    const cli = argv => spawnSync(process.execPath, [join(root, 'scripts/lane-pool.mjs'), ...argv, ...args], { env, encoding: 'utf8', timeout: 30_000 });
+    const cli = argv => spawnSync(process.execPath, [join(root, 'scripts/lane-pool.mjs'), ...argv, ...args], { env, encoding: 'utf8', timeout: 30_000, maxBuffer: 64 * 1024 * 1024 });
     const provision = cli(['provision', '--count=1']);
     if (provision.status !== 0) throw new Error(`fixture provision: ${provision.stderr}`);
     const dir = join(pool, 'skipsoak', 'lane-1');

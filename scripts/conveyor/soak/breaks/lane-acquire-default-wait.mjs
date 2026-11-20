@@ -15,6 +15,7 @@ import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { runInNewContext } from 'node:vm';
+import { leaseDisqualifiesAcquire } from '../../../lib/lane-lease.mjs';
 
 const REPO_ROOT = resolve(fileURLToPath(import.meta.url), '..', '..', '..', '..', '..');
 const MARKER = 'scripts/lane-pool.mjs';
@@ -41,6 +42,8 @@ export async function replayAcquireDeadline({ waitMs = 30, reaperMs = 0, free = 
     acquireDefaultWaitMs: waitMs, acquireDefaultWaitInvalid: false,
     ACQUIRE_POLL_MS: 1000, LIST_LOCK_ORPHAN_GRACE_MS: 1000,
     laneDir: (repo, n) => `${repo.poolDir}/lane-${n}`, isHistoryQuarantined: () => false,
+    // Growth/recovery retry candidates pass the same lease/history gates as free-list hints.
+    leaseDisqualifiesAcquire, readLease: () => null, requireReadableLaneHistory() {},
     listScanTimeoutMs: () => 120_000, listCacheTtlMs: () => 0,
     lastListWasLockPartial: false, lastScanPartial: false,
     laneEligibilityProbeFailed: false,
