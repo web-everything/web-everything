@@ -160,7 +160,6 @@ describe('merge-queue same-head retry for evidence-backed flakes', () => {
     const base = f.exec;
     f.exec = vi.fn((command, args, opts) => {
       const endpoint = args.find(arg => typeof arg === 'string' && arg.startsWith(`repos/${repo}/`)) ?? '';
-      if (endpoint.includes('/actions/runs/900/jobs?filter=latest')) return JSON.stringify({ total_count: 1, jobs: [{ name: 'test-shard (5)', status: 'completed', conclusion: 'success', steps: [{ name: 'Unit suite shard 1/9 (coverage, no per-shard bar)', status: 'completed', conclusion: 'success' }] }] });
       if (endpoint.includes(`/commits/${head}/check-runs`)) return JSON.stringify({ total_count: f.headChecks.length, check_runs: f.headChecks });
       if (/\/actions\/runs\/7$/.test(endpoint)) return JSON.stringify({ id: 7, path: f.headRunPath ?? '.github/workflows/ci.yml', head_sha: head });
       if (/\/actions\/jobs\/44$/.test(endpoint)) return JSON.stringify({ id: 44, run_id: 7, name: 'test-shard (2)', head_sha: f.job44Sha ?? head });
@@ -182,20 +181,6 @@ describe('merge-queue same-head retry for evidence-backed flakes', () => {
     tweak(f);
     test(f);
   });
-
-  it('a light push cannot make a pre-ejection queue execution into post-ejection flake proof', () => setup(f => {
-    expect(f.guard().hold).toBe(true);
-  }, f => {
-    const base = f.exec;
-    const queue = { ...f.mainRuns[0], id: 850, event: 'merge_group',
-      head_branch: 'gh-readonly-queue/main/pr-1', created_at: new Date(REMOVED_AT - 600_000).toISOString() };
-    f.exec = vi.fn((command, args, opts) => {
-      const endpoint = args[1] ?? '';
-      if (endpoint.includes('/runs/900/jobs?')) return JSON.stringify({ total_count: 0, jobs: [] });
-      if (endpoint.includes('event=merge_group&head_sha=')) return JSON.stringify({ total_count: 1, workflow_runs: [queue] });
-      return base(command, args, opts);
-    });
-  }));
 
   it('re-enqueues once when the failing test passed on the PR head CI and on a later main run', () => setup(f => {
     const result = f.guard();
@@ -357,7 +342,7 @@ describe('merge-queue exact-test extra retry after two failed_checks removals', 
     f.reports[902] = report('passed', 'an unrelated test');
     f.runJobs = { 7: f.headChecks.filter(c => c.name.startsWith('test-shard')).map(c => f.jobs[c.id]),
       900: [1, 2].map(n => ({ id: 950 + n, run_id: 900, name: `test-shard (${n})`, head_sha: mainSha,
-        status: 'completed', conclusion: 'success', steps: [{ name: `Unit suite shard ${n}/9 (coverage, no per-shard bar)`, status: 'completed', conclusion: 'success' }] })) };
+        status: 'completed', conclusion: 'success' })) };
     const page = (endpoint, key, rows) => {
       const query = new URLSearchParams(endpoint.split('?')[1]);
       const start = (Number(query.get('page') ?? 1) - 1) * 100;
@@ -449,40 +434,12 @@ describe('merge-queue exact-test extra retry after two failed_checks removals', 
     expect(f.log.mock.calls.some(([line]) => /^mq-same-head-retry:/.test(line))).toBe(false);
   };
 
-  it('exact-test retry refuses a light push backed by stale queue execution', () => exactFixture(f => {
-    f.runJobs[900].forEach(job => {
-      job.steps[0].conclusion = 'skipped';
-      job.steps.push({ name: 'Card-only unit scope receipt', status: 'completed', conclusion: 'success' });
-    });
-    const base = f.exec;
-    const queue = { ...f.runs[900], id: 850, event: 'merge_group', head_branch: 'gh-readonly-queue/main/pr-1',
-      created_at: iso(removedAt - 4 * 3_600_000), updated_at: iso(removedAt - 3 * 3_600_000) };
-    f.exec = vi.fn((command, args, opts) => args[1]?.includes('event=merge_group&head_sha=')
-      ? JSON.stringify({ total_count: 1, workflow_runs: [queue] }) : base(command, args, opts));
-    expectExactHold(f);
-  }));
-
   it('#6903 allows exact-test retry 2/2 from structured reports without classifying over-long log lines', () => exactFixture(f => {
     expect(f.logs[31].split('\n')[0].length).toBeGreaterThan(512);
     expectExtraRetry(f);
   }));
 
-  it('exact-test retry accepts a scheduled main success with matching run evidence', () => exactFixture(f => {
-    f.runs[900].event = 'schedule';
-    expectExtraRetry(f);
-    expect(f.exec.mock.calls.filter(([, args]) => args.some(arg => arg.includes('/actions/workflows/ci.yml/runs')))
-      .every(([, args]) => args.every(arg => !arg.includes('event=push')))).toBe(true);
-  }));
-
   const closedCases = [
-    ['newer main run has an unknown event despite older push success', f => {
-      f.mainRuns.push({ ...f.runs[900], id: 901, event: undefined, conclusion: 'failure',
-        created_at: iso(removedAt + 700_000) });
-    }],
-    ['newer scheduled failure invalidates older push success', f => {
-      f.mainRuns.push({ ...f.runs[900], id: 901, event: 'schedule', conclusion: 'failure',
-        created_at: iso(removedAt + 700_000) });
-    }],
     ...['failure', 'timed_out'].map(conclusion => [`newest main run is ${conclusion} after an older success`, f => {
       f.mainRuns.push({ ...f.runs[900], id: 901, conclusion, created_at: iso(removedAt + 700_000) });
     }]),
@@ -738,7 +695,7 @@ describe('merge-queue exact-test extra retry after two failed_checks removals', 
         f.artifacts[runId].push(artifact(id, n, runId, sha));
         f.reports[id] = report('passed', `unrelated test ${n}`);
         f.runJobs[runId].push({ id, name: `test-shard (${n})`, run_id: runId, head_sha: sha,
-          status: 'completed', conclusion: 'success', steps: [{ name: `Unit suite shard ${n}/9 (coverage, no per-shard bar)`, status: 'completed', conclusion: 'success' }] });
+          status: 'completed', conclusion: 'success' });
       }
     }
     for (const rows of [f.mqChecks, f.headChecks]) {

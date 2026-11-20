@@ -515,59 +515,8 @@ function assertionMatches(report, file, id) {
     .flatMap(result => result.assertionResults.filter(assertion => normaliseTestId(assertion) === id));
 }
 
-/** Light pushes cannot renew execution evidence. Bounded reads share the caller's IO budget.
- * Missing/oversized evidence leaves the retry held for fresh main CI or operator inspection.
- */
-export function readMainExecutionEvidence({ run, readJson, now, maxAgeMs }) {
-  if (run?.event !== 'push' || run.conclusion !== 'success') return run;
-  const rows = (endpoint, key, maxPages = 1) => {
-    const rows = []; let total;
-    for (let pageNumber = 1; pageNumber <= maxPages; pageNumber++) {
-      const page = readJson(`${endpoint}${pageNumber === 1 ? '' : `&page=${pageNumber}`}`);
-      if (!Number.isSafeInteger(page?.total_count) || page.total_count < 0 || page.total_count > 100 * maxPages
-        || total !== undefined && total !== page.total_count || !Array.isArray(page[key])
-        || page[key].length !== Math.min(100, page.total_count - rows.length))
-        throw Error('main execution evidence incomplete; wait for fresh main CI or inspect manually');
-      total = page.total_count; rows.push(...page[key]);
-      if (rows.length === total) return rows;
-    }
-    throw Error('main execution evidence oversized; wait for fresh main CI or inspect manually');
-  };
-  const executed = candidate => {
-    const jobs = rows(`actions/runs/${candidate.id}/jobs?filter=latest&per_page=100`, 'jobs', 5);
-    if (jobs.some(job => typeof job?.name !== 'string')) throw Error('invalid main execution jobs');
-    const shards = jobs.filter(job => /^test-shard \([1-9][0-9]*\)$/.test(job.name));
-    if (new Set(shards.map(job => job.name)).size !== shards.length) throw Error('ambiguous main execution shards');
-    return shards.length > 0 && shards.every(job => {
-      if (job.status !== 'completed' || job.conclusion !== 'success' || !Array.isArray(job.steps)) return false;
-      // Light shards succeed via a receipt while their test steps are skipped. Job success alone is not execution.
-      if (job.steps.some(step => step?.name === 'Card-only unit scope receipt' && step.conclusion !== 'skipped')) return false;
-      const tests = job.steps.filter(step => /^Unit suite (?:shard [1-9][0-9]*\/[1-9][0-9]* |no-coverage group \()/.test(step?.name));
-      return tests.some(step => step.status === 'completed' && step.conclusion === 'success')
-        && tests.every(step => step.status === 'completed' && ['success', 'skipped'].includes(step.conclusion));
-    });
-  };
-  if (executed(run)) return run;
-  if (!mqOid(run.head_sha)) throw Error('light push has no resolvable queue SHA');
-  const candidates = rows(`actions/workflows/ci.yml/runs?event=merge_group&head_sha=${run.head_sha}&per_page=100`, 'workflow_runs');
-  if (candidates.some(candidate => !Number.isSafeInteger(candidate?.id) || candidate.id <= 0
-    || candidate.path !== '.github/workflows/ci.yml' || candidate.event !== 'merge_group'
-    || !candidate.head_branch?.startsWith('gh-readonly-queue/main/')
-    || candidate.id >= run.id || mqOid(candidate.head_sha) !== mqOid(run.head_sha))
-    || new Set(candidates.map(candidate => candidate.id)).size !== candidates.length) throw Error('invalid queue execution evidence');
-  const queue = candidates.sort((a, b) => b.id - a.id)[0];
-  const created = Date.parse(queue?.created_at), updated = Date.parse(queue?.updated_at);
-  if (!queue || queue.status !== 'completed' || queue.conclusion !== 'success'
-    || !Number.isFinite(now) || !Number.isFinite(created) || !Number.isFinite(updated)
-    || !Number.isFinite(maxAgeMs) || maxAgeMs <= 0
-    || created > updated || updated > now || !Number.isFinite(Date.parse(run.created_at))
-    || updated > Date.parse(run.created_at) || now - updated > maxAgeMs || !executed(queue))
-    throw Error('queue execution stale or unreadable; wait for fresh main CI or inspect manually');
-  return { ...queue, reusedQueue: true };
-}
-
 /** Reports, job steps, annotations and a bounded summary. Incomplete evidence retains the hold. */
-function readMqExactTestEvidence({ repo, pr, head, timeline, exec, now, retryPolicy }) {
+function readMqExactTestEvidence({ repo, pr, head, timeline, exec, now }) {
   try {
     if (timeline.error || timeline.hasPreviousPage !== false || !mqOid(head)) return null;
     const removals = timeline.nodes.filter(event => event?.__typename === 'RemovedFromMergeQueueEvent'
@@ -720,34 +669,31 @@ function readMqExactTestEvidence({ repo, pr, head, timeline, exec, now, retryPol
       return hits.length === 1 && hits[0].status === 'passed';
     };
     if (!exactPassed(headRunId, head, headChecks)) return null;
-    const mainEndpoint = 'actions/workflows/ci.yml/runs?branch=main&per_page=100';
-    const mainPage = json(mainEndpoint), allRuns = mainPage?.workflow_runs;
-    const runs = Array.isArray(allRuns) ? allRuns.filter(r => ['push', 'schedule'].includes(r?.event)) : allRuns;
+    const mainEndpoint = 'actions/workflows/ci.yml/runs?branch=main&event=push&per_page=100';
+    const mainPage = json(mainEndpoint), runs = mainPage?.workflow_runs;
     const conclusions = new Set([...passing, 'failure', 'cancelled', 'timed_out', 'startup_failure', 'action_required', 'stale']);
     const unfinished = new Set(['queued', 'in_progress', 'waiting', 'requested', 'pending']);
-    if (!Number.isSafeInteger(mainPage?.total_count) || mainPage.total_count < 0 || !Array.isArray(allRuns)
-      || allRuns.length !== Math.min(mainPage.total_count, 100) || allRuns.some(r => typeof r?.event !== 'string')
-      || new Set(runs.map(r => r?.id)).size !== runs.length
+    if (!Number.isSafeInteger(mainPage?.total_count) || mainPage.total_count < 0 || !Array.isArray(runs)
+      || runs.length !== Math.min(mainPage.total_count, 100) || new Set(runs.map(r => r?.id)).size !== runs.length
       || runs.some(r => !Number.isSafeInteger(r?.id) || r.id <= 0 || r.path !== '.github/workflows/ci.yml'
-        || !['push', 'schedule'].includes(r.event) || r.head_branch !== 'main' || !mqOid(r.head_sha)
+        || r.event !== 'push' || r.head_branch !== 'main' || !mqOid(r.head_sha)
         || !Number.isFinite(Date.parse(r.created_at))
         || (r.status === 'completed' ? !conclusions.has(r.conclusion) || !Number.isFinite(Date.parse(r.updated_at))
           : !unfinished.has(r.status) || r.conclusion !== null))) return null;
     runs.sort(newestRunFirst);
     const ignored = new Set(['cancelled', 'startup_failure', 'stale', 'action_required']);
-    let main = runs.find(r => r.status === 'completed' && !ignored.has(r.conclusion));
-    main = readMainExecutionEvidence({ run: main, readJson: json, now, maxAgeMs: retryPolicy.mqReusedMainGreenMaxAgeMs });
+    const main = runs.find(r => r.status === 'completed' && !ignored.has(r.conclusion));
     if (!main || main.conclusion !== 'success' || Date.parse(main.created_at) <= removedAt
       || Date.parse(main.created_at) > now || Date.parse(main.updated_at) > now) return null;
     // A newer main run that has not finished is unresolved evidence about main: keep the hold.
     if (runs.some(r => r.status !== 'completed' && newestRunFirst(r, main) < 0)) return null;
-    if (!main.reusedQueue && now - Date.parse(main.updated_at) > MQ_MAIN_GREEN_MAX_AGE_MS) {
+    if (now - Date.parse(main.updated_at) > MQ_MAIN_GREEN_MAX_AGE_MS) {
       const mainHead = mqOid(json('git/ref/heads/main')?.object?.sha);
       if (!mainHead || runs.find(run => mqOid(run.head_sha) === mainHead)?.id !== main.id) return null;
     }
     const mainRun = json(`actions/runs/${main.id}`);
-    if (mainRun?.id !== main.id || mainRun.path !== '.github/workflows/ci.yml' || mainRun.event !== main.event
-      || mainRun.head_branch !== main.head_branch || mqOid(mainRun.head_sha) !== mqOid(main.head_sha)
+    if (mainRun?.id !== main.id || mainRun.path !== '.github/workflows/ci.yml' || mainRun.event !== 'push'
+      || mainRun.head_branch !== 'main' || mqOid(mainRun.head_sha) !== mqOid(main.head_sha)
       || mainRun.status !== 'completed' || mainRun.conclusion !== 'success'
       || mainRun.created_at !== main.created_at || mainRun.updated_at !== main.updated_at
       || !exactPassed(main.id, mqOid(main.head_sha))
@@ -1036,7 +982,7 @@ function readMqBaseRetryEvidence({ repo, pr, head, timeline, exec, rerunScope, d
     if (attempts.reason) infra = false;
     else if (!logReason && attempts.confirmed) infra = true;
     // These queries need only their first page, regardless of the workflow's history size.
-    const mainEndpoint = `repos/${repo}/actions/workflows/ci.yml/runs?branch=main`;
+    const mainEndpoint = `repos/${repo}/actions/workflows/ci.yml/runs?branch=main&event=push`;
     const readRunPage = (endpoint, limit, allowEmpty = false) => {
       if (budget-- <= 0) throw new Error('retry evidence budget exhausted');
       const result = JSON.parse(exec('gh', ['api', endpoint],
@@ -1053,15 +999,14 @@ function readMqBaseRetryEvidence({ repo, pr, head, timeline, exec, rerunScope, d
           throw new Error('invalid retry evidence identity');
         ids.add(run.id);
       }
-      if (runs.some(run => typeof run.event !== 'string')) throw new Error('missing retry evidence event');
-      return runs.filter(run => ['push', 'schedule'].includes(run.event));
+      return runs;
     };
     const newest = readRunPage(`${mainEndpoint}&per_page=100`, 100, true);
     const runs = readRunPage(`${mainEndpoint}&status=completed&created=<${new Date(removedAt).toISOString()}&per_page=100`, 100, true);
     const conclusions = new Set([...passing, ...infraConclusions, 'failure', 'action_required', 'stale']);
     const unfinished = new Set(['queued', 'in_progress', 'waiting', 'requested', 'pending']);
     if ([...newest, ...runs].some(run => run.path !== '.github/workflows/ci.yml' || run.head_branch !== 'main'
-      || !['push', 'schedule'].includes(run.event) || (run.status === 'completed' ? !conclusions.has(run.conclusion)
+      || run.event !== 'push' || (run.status === 'completed' ? !conclusions.has(run.conclusion)
         : !unfinished.has(run.status) || run.conclusion !== null)
       || !Number.isFinite(timestamp(run.created_at))
       || (run.status === 'completed' && !Number.isFinite(timestamp(run.updated_at))))) return null;
@@ -1072,18 +1017,11 @@ function readMqBaseRetryEvidence({ repo, pr, head, timeline, exec, rerunScope, d
     newest.sort(newestRunFirst);
     // R780: timed_out is red (decides, declines); cancelled and the rest stay skipped.
     const ignored = new Set([...infraConclusions].filter(c => c !== 'timed_out').concat('stale', 'action_required'));
-    let deciding = newest.find(run => run.status === 'completed' && !ignored.has(run.conclusion));
-    deciding = readMainExecutionEvidence({ run: deciding, now, maxAgeMs: retryPolicy.mqReusedMainGreenMaxAgeMs,
-      readJson: endpoint => {
-        if (budget-- <= 0) throw Error('retry evidence budget exhausted');
-        return JSON.parse(exec('gh', ['api', `repos/${repo}/${endpoint}`], {
-          encoding: 'utf8', timeout: 60_000, maxBuffer: 4 * 1024 * 1024,
-          stdio: ['ignore', 'pipe', 'pipe'], throttle: { maxAttempts: 1 } }));
-      } });
-    let stale = deciding && (!Number.isFinite(now) || now - timestamp(deciding.updated_at) > (deciding.reusedQueue ? retryPolicy.mqReusedMainGreenMaxAgeMs : MQ_MAIN_GREEN_MAX_AGE_MS));
+    const deciding = newest.find(run => run.status === 'completed' && !ignored.has(run.conclusion));
+    let stale = deciding && (!Number.isFinite(now) || now - timestamp(deciding.updated_at) > MQ_MAIN_GREEN_MAX_AGE_MS);
     // Freshness is judged by main HEAD: when nothing merged, the newest run for the CURRENT head decides regardless of
     // age. Any unreadable piece keeps the age rule (fail closed); a cancelled/failed/unfinished run for the head never counts.
-    if (stale && !deciding.reusedQueue && Number.isFinite(now) && deciding.conclusion === 'success') {
+    if (stale && Number.isFinite(now) && deciding.conclusion === 'success') {
       try {
         if (budget-- <= 0) throw new Error('retry evidence budget exhausted');
         const mainHead = mqOid(JSON.parse(exec('gh', ['api', `repos/${repo}/git/ref/heads/main`],
@@ -1289,9 +1227,9 @@ export function readDrainQueueSafety({ env = process.env, tool, platform, log = 
   }
   const positive = v => typeof v === 'number' && Number.isFinite(v) && v > 0;
   const r = cascadePolicy('drain', tool ?? (env.VITEST || env.WE_UNDER_TEST ? {} : readSettings().drain), {
-    env, platform, standard: { mqReusedMainGreenMaxAgeMs: MQ_MAIN_GREEN_MAX_AGE_MS, mqAggregateJobs: MQ_AGGREGATE_JOBS, mqInfraSignatures: MQ_INFRA_SIGNATURES, mqCancelledRetryMax: 2, queueRebuildMax: 3, waitForRedTeamBeforeEnqueue: true, dequeueOnSendBack: true, redTeamPendingBackoffSec: 300, redTeamPendingMaxMin: 45 },
-    valid: { mqReusedMainGreenMaxAgeMs: v => positive(v) && v <= MQ_MAIN_GREEN_MAX_AGE_MS, mqAggregateJobs: validMqAggregateJobs, mqInfraSignatures: validMqInfraSignatures, mqCancelledRetryMax: v => Number.isSafeInteger(v) && v >= 1 && v <= 2, queueRebuildMax: v => Number.isSafeInteger(v) && v > 0, waitForRedTeamBeforeEnqueue: v => typeof v === 'boolean', dequeueOnSendBack: v => typeof v === 'boolean', redTeamPendingBackoffSec: positive, redTeamPendingMaxMin: positive },
-    envValues: { mqReusedMainGreenMaxAgeMs: numberEnv('WE_DRAIN_MQ_REUSED_MAIN_GREEN_MAX_AGE_MS'), mqAggregateJobs, mqInfraSignatures, mqCancelledRetryMax: numberEnv('WE_DRAIN_MQ_CANCELLED_RETRY_MAX'), queueRebuildMax: numberEnv('WE_DRAIN_QUEUE_REBUILD_MAX'), waitForRedTeamBeforeEnqueue: booleanEnv('WE_DRAIN_WAIT_FOR_RED_TEAM_BEFORE_ENQUEUE'), dequeueOnSendBack: booleanEnv('WE_DRAIN_DEQUEUE_ON_SEND_BACK'), redTeamPendingBackoffSec: numberEnv('WE_DRAIN_RED_TEAM_PENDING_BACKOFF_SEC'), redTeamPendingMaxMin: numberEnv('WE_DRAIN_RED_TEAM_PENDING_MAX_MIN') },
+    env, platform, standard: { mqAggregateJobs: MQ_AGGREGATE_JOBS, mqInfraSignatures: MQ_INFRA_SIGNATURES, mqCancelledRetryMax: 2, queueRebuildMax: 3, waitForRedTeamBeforeEnqueue: true, dequeueOnSendBack: true, redTeamPendingBackoffSec: 300, redTeamPendingMaxMin: 45 },
+    valid: { mqAggregateJobs: validMqAggregateJobs, mqInfraSignatures: validMqInfraSignatures, mqCancelledRetryMax: v => Number.isSafeInteger(v) && v >= 1 && v <= 2, queueRebuildMax: v => Number.isSafeInteger(v) && v > 0, waitForRedTeamBeforeEnqueue: v => typeof v === 'boolean', dequeueOnSendBack: v => typeof v === 'boolean', redTeamPendingBackoffSec: positive, redTeamPendingMaxMin: positive },
+    envValues: { mqAggregateJobs, mqInfraSignatures, mqCancelledRetryMax: numberEnv('WE_DRAIN_MQ_CANCELLED_RETRY_MAX'), queueRebuildMax: numberEnv('WE_DRAIN_QUEUE_REBUILD_MAX'), waitForRedTeamBeforeEnqueue: booleanEnv('WE_DRAIN_WAIT_FOR_RED_TEAM_BEFORE_ENQUEUE'), dequeueOnSendBack: booleanEnv('WE_DRAIN_DEQUEUE_ON_SEND_BACK'), redTeamPendingBackoffSec: numberEnv('WE_DRAIN_RED_TEAM_PENDING_BACKOFF_SEC'), redTeamPendingMaxMin: numberEnv('WE_DRAIN_RED_TEAM_PENDING_MAX_MIN') },
   });
   log(formatCascadeSourcesLine('drain', r));
   // Retired: this switch let the drain enqueue an owed head with NO red-team result once the deadline passed. It is no

@@ -858,7 +858,6 @@ describe('merge-queue same-head failure admission', () => {
         if (args.some(arg => arg.includes('timelineItems'))) return response(timeline(...f.events));
         if (args.includes('mergeStateStatus,headRefOid')) return JSON.stringify(f.live);
         const endpoint = args.find(arg => arg.startsWith(`repos/${repo}/`));
-        if (endpoint?.includes('/jobs?filter=latest')) return JSON.stringify({ total_count: 1, jobs: [{ name: 'test-shard (1)', status: 'completed', conclusion: 'success', steps: [{ name: 'Unit suite shard 1/9 (coverage, no per-shard bar)', status: 'completed', conclusion: 'success' }] }] });
         if (endpoint?.includes('/check-runs')) {
           f.checkReads = (f.checkReads ?? 0) + 1;
           if (f.checkError) throw new Error('check-runs unavailable');

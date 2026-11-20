@@ -36,12 +36,6 @@ function fixture(runs, events = [removal()], mainHead = null) {
       return JSON.stringify({ headRefOid: head, mergeStateStatus: 'CLEAN' });
     }
     const endpoint = args.find(arg => arg.startsWith(`repos/${repo}/`));
-    if (endpoint?.includes('/jobs?')) return JSON.stringify({ total_count: 1, jobs: [{ name: 'test-shard (1)', status: 'completed', conclusion: 'success', steps: [
-      { name: 'Card-only unit scope receipt', status: 'completed', conclusion: runs[0]?.light ? 'success' : 'skipped' },
-      { name: 'Unit suite shard 1/9 (coverage, no per-shard bar)', status: 'completed', conclusion: runs[0]?.light ? 'skipped' : 'success' },
-      { name: 'Unit suite no-coverage group (scripts tests that cannot reach a covered file)', status: 'completed', conclusion: 'skipped' },
-    ] }] });
-    if (endpoint?.includes('head_sha=')) return JSON.stringify({ total_count: 1, workflow_runs: [{ ...run(90, 'success', '2026-11-01T09:00:00Z', '2026-11-01T09:30:00Z'), head_sha: 'd'.repeat(40), head_branch: 'gh-readonly-queue/main/pr-1', event: 'merge_group' }] });
     if (endpoint === `repos/${repo}/git/ref/heads/main` && mainHead) return JSON.stringify({ object: { sha: mainHead } });
     if (endpoint?.startsWith(`repos/${repo}/commits/${mergeCommit}/check-runs?`)) {
       return JSON.stringify({ total_count: 1, check_runs: [{
@@ -51,7 +45,6 @@ function fixture(runs, events = [removal()], mainHead = null) {
     }
     if (endpoint?.startsWith(`repos/${repo}/actions/workflows/ci.yml/runs?`)) {
       const query = new URLSearchParams(endpoint.split('?')[1]);
-      expect(query.has('event')).toBe(false);
       let selected = [...runs].sort((a, b) => Date.parse(b.created_at) - Date.parse(a.created_at) || b.id - a.id);
       if (query.get('status')) selected = selected.filter(item => item.status === query.get('status'));
       const before = query.get('created');
@@ -78,11 +71,6 @@ describe('same-head retry uses fresh completed main CI evidence', () => {
   });
   afterEach(() => vi.useRealTimers());
 
-  it('refuses a fresh light push whose reused queue evidence is older than two hours', () => {
-    const f = fixture([{ ...run(102), head_sha: 'd'.repeat(40), light: true }], [removal()], 'd'.repeat(40));
-    expect(f.guard().hold).toBe(true);
-  });
-
   it('accepts a recent completed green run while the newest main push is in progress', () => {
     const f = fixture([pending(), run(102)]);
     expect(f.guard().hold).toBe(false);
@@ -98,26 +86,6 @@ describe('same-head retry uses fresh completed main CI evidence', () => {
     expect(f.declineLog()).toContain('102');
     expect(f.declineLog()).toContain('failure');
     expect(f.declineLog()).toContain(failedName);
-  });
-
-  it('a newer scheduled failure invalidates an older push success', () => {
-    const f = fixture([{ ...run(103, 'failure'), event: 'schedule' },
-      run(102, 'success', '2026-11-01T13:00:00Z', '2026-11-01T13:10:00Z')]);
-    expect(f.guard().hold).toBe(true);
-    expect(f.declineLog()).toContain('main CI is not green');
-    expect(f.declineLog()).toContain('103');
-  });
-
-  it('fails closed when a newer run has no event, despite older push success', () => {
-    const f = fixture([{ ...run(103, 'failure'), event: undefined }, run(102)]);
-    expect(f.guard().hold).toBe(true);
-    expect(f.retryLog()).toBeUndefined();
-  });
-
-  it('accepts scheduled main success as green evidence', () => {
-    const f = fixture([{ ...run(103), event: 'schedule' }]);
-    expect(f.guard().hold).toBe(false);
-    expect(f.retryLog()).toContain('103');
   });
 
   it.each(['cancelled', 'startup_failure', 'stale', 'action_required'])(

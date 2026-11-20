@@ -31,7 +31,6 @@ function probe(name, steps, aggregateLog = 'Process completed with exit code 1.\
     if (args.includes('mergeStateStatus,headRefOid'))
       return JSON.stringify({ mergeStateStatus: 'CLEAN', headRefOid: head });
     const endpoint = args.find(arg => arg.startsWith(`repos/${repo}/`));
-    if (endpoint?.includes('/jobs?filter=latest')) return JSON.stringify({ total_count: 1, jobs: [{ name: 'test-shard (1)', status: 'completed', conclusion: 'success', steps: [{ name: 'Unit suite shard 1/9 (coverage, no per-shard bar)', status: 'completed', conclusion: 'success' }] }] });
     if (endpoint?.includes('/check-runs?'))
       return JSON.stringify({ total_count: checks.length, check_runs: checks });
     if (endpoint === `repos/${repo}/actions/jobs/9022`)

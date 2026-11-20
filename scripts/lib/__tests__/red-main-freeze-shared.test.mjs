@@ -486,8 +486,8 @@ describe('red-main-remediation CLI → shared copy, end to end (PR 4715 review)'
     const freeze = readSharedFreeze({ board: fx.board, branch: BRANCH });
     expect(freeze).toMatchObject({ frozen: false });
     const redRuns = [
-      { event: 'push', databaseId: 1, status: 'completed', conclusion: 'success', createdAt: '2026-10-11T00:00:00Z', updatedAt: '2026-10-11T00:00:00Z', headSha: 'a'.repeat(40) },
-      { event: 'push', databaseId: 2, status: 'completed', conclusion: 'failure', createdAt: '2026-10-11T01:00:00Z', updatedAt: '2026-10-11T01:00:00Z', headSha: 'b'.repeat(40) },
+      { databaseId: 1, status: 'completed', conclusion: 'success', createdAt: '2026-10-11T00:00:00Z', updatedAt: '2026-10-11T00:00:00Z', headSha: 'a'.repeat(40) },
+      { databaseId: 2, status: 'completed', conclusion: 'failure', createdAt: '2026-10-11T01:00:00Z', updatedAt: '2026-10-11T01:00:00Z', headSha: 'b'.repeat(40) },
     ];
     const mainCi = readMainCiFact({ repo: 'o/r', defaultBranch: 'main', exec: () => JSON.stringify(redRuns) });
     expect(combineRedMain(freeze, mainCi, PR)).toMatchObject({ frozen: true, reason: expect.stringMatching(/main CI red/) });
@@ -579,7 +579,7 @@ describe('red-main-remediation CLI → shared copy, end to end (PR 4715 review)'
 
 describe('merge-gate reads main\'s OWN CI status from GitHub (operator ruling 2026-10-11, PR 4715)', () => {
   const RED_SHA = 'b'.repeat(40);
-  const run = (conclusion, createdAt, headSha = RED_SHA, status = 'completed') => ({ event: 'push', databaseId: Date.parse(createdAt), status, conclusion, createdAt, updatedAt: createdAt, headSha });
+  const run = (conclusion, createdAt, headSha = RED_SHA, status = 'completed') => ({ databaseId: Date.parse(createdAt), status, conclusion, createdAt, updatedAt: createdAt, headSha });
   const RED_RUNS = [run('success', '2026-10-11T00:00:00Z', 'a'.repeat(40)), run('failure', '2026-10-11T01:00:00Z')];
   const GREEN_RUNS = [run('failure', '2026-10-11T00:00:00Z'), run('success', '2026-10-11T01:00:00Z', 'c'.repeat(40))];
   const CLEAR = { source: `${BRANCH}:${SHARED_FREEZE_FILE}`, frozen: false, reason: null, publishedAt: 't0' };
@@ -603,15 +603,6 @@ describe('merge-gate reads main\'s OWN CI status from GitHub (operator ruling 20
   it('shared copy CLEAR but main\'s own CI is RED → HOLD (a failing freeze publisher can never hide a red main)', () => {
     expect(row({ runs: RED_RUNS })).toMatchObject({ status: 'hold' });
     expect(row({ runs: RED_RUNS }).reason).toMatch(/main CI red since bbbbbbbbb/);
-  });
-
-  it('a newer scheduled failure overrides an older push success', () => {
-    const runs = [RED_RUNS[0], { ...RED_RUNS[1], event: 'schedule' }];
-    expect(readMainCiFact({ repo: 'o/r', exec: ghRuns(runs) })).toMatchObject({ red: true });
-  });
-
-  it('fails closed when no run has a known main event', () => {
-    expect(readMainCiFact({ repo: 'o/r', exec: ghRuns([{ ...GREEN_RUNS[1], event: undefined }]) })).toHaveProperty('error');
   });
 
   it('shared clear and main CI green → pass', () => {
@@ -705,8 +696,7 @@ describe('merge-gate reads main\'s OWN CI status from GitHub (operator ruling 20
     let seen;
     readMainCiFact({ repo: 'o/r', defaultBranch: 'trunk', exec: (cmd, args, opts) => { seen = { cmd, args, opts }; return '[]'; } });
     expect(seen.cmd).toBe('gh');
-    expect(seen.args).not.toContain('--event');
-    expect(seen.args).toEqual(expect.arrayContaining(['run', 'list', '--repo', 'o/r', '--workflow', 'ci.yml', '--branch', 'trunk']));
+    expect(seen.args).toEqual(expect.arrayContaining(['run', 'list', '--repo', 'o/r', '--workflow', 'ci.yml', '--branch', 'trunk', '--event', 'push']));
     expect(seen.args[seen.args.indexOf('--json') + 1]).toMatch(/\bevent\b.*\battempt\b/);
     expect(seen.opts).toMatchObject({ timeout: expect.any(Number), maxBuffer: expect.any(Number) });
   });
