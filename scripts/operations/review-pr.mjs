@@ -1,5 +1,6 @@
 import { carbonNonShadowAllowed } from '../lib/review-seat-settings.mjs';
 import { redTeamCardOnly, redTeamEnabled, redTeamOwedFor } from '../lib/review-red-team-policy.mjs';
+import { resolveExternalJurorSettings } from '../lib/review-seat-settings.mjs';
 import { readRedTeamProbes } from '../lib/red-team-gate.mjs';
 import { isCardOnlyDiff } from '../ci-card-only.mjs';
 import { advisoryLabelOutcome } from '../lib/review-advisory-outcome.mjs';
@@ -772,10 +773,10 @@ export const ANTIGRAVITY_REVIEW_ENV_VAR = 'REVIEW_PR_ANTIGRAVITY_REVIEW';
  * @param {{isOnProbation?: Function}} [deps] - injectable, mirroring `correctnessAdvisoryFromEnv`'s own seam.
  * @returns {boolean}
  */
-export function antigravityReviewFromEnv(env = process.env, { isOnProbation = defaultAntigravityReviewProbationCheck } = {}) {
+export function antigravityReviewFromEnv(env = process.env, { isOnProbation = defaultAntigravityReviewProbationCheck, ...options } = {}) {
   if (!carbonNonShadowAllowed(ANTIGRAVITY_MODEL, { env })) return false;
-  if (env && Object.hasOwn(env, ANTIGRAVITY_REVIEW_ENV_VAR)) return env[ANTIGRAVITY_REVIEW_ENV_VAR] === '1';
-  return isOnProbation();
+  const mode = resolveExternalJurorSettings({ ...options, env }).value.antigravityReview;
+  return mode === 'probation' ? isOnProbation() : mode === 'on';
 }
 
 /**
@@ -807,6 +808,9 @@ export function seatSettingsForRun(record, settings) {
 }
 
 const OPTIONAL_SEATS = Object.freeze([ADVISORY_JUDGE_SEAT, CORRECTNESS_ADVISORY_SEAT, ANTIGRAVITY_REVIEW_SEAT, AGY_CORRECTNESS_SEAT]);
+
+// Commit 5517171b5d0143e44359f4c6ead42c74e5876a68 first persisted read.seatSteps/minNonClaudeSeats.
+export const REVIEW_SEAT_POLICY_PERSISTED_AT = '2026-10-17T01:48:10.000Z';
 
 /**
  * Rebuild a saved run's roster for a resume at ANY cursor position, independently of current flags and minimums.
@@ -845,17 +849,25 @@ export function reviewSeatOptionsForRun(record, settings, live = {}) {
   const seated = (seat, i) => (saved ? saved.includes(seat.step)
     : reached.includes(seat.step) || prefilled.includes(seat.step) || (i > furthest && liveFlags[seat.step]));
   const [codexAdvisory, correctnessAdvisory, antigravityReview, agyCorrectnessAdvisory] = OPTIONAL_SEATS.map(seated);
+  // Before roster/minimum persistence, reviews had no diversity requirement. Do not apply a
+  // new minimum only when the persisted read-step start proves the panel predates that policy.
+  // Schema v1 spans the cutover; absent/invalid timing cannot prove age and keeps the live minimum.
+  const startedAt = record.stepTimings?.find((timing) => timing?.step === 'read')?.startedAt;
+  const historicalMinimum = !Object.hasOwn(read, 'seatSteps') && !Object.hasOwn(read, 'minNonClaudeSeats')
+    && typeof startedAt === 'string' && Number.isFinite(Date.parse(startedAt))
+    && Date.parse(startedAt) < Date.parse(REVIEW_SEAT_POLICY_PERSISTED_AT);
   return {
     securitySeat: securitySeatFromRun(record),
     cardOnlyLight: read.cardOnlyLight === true,
     codexAdvisory, correctnessAdvisory, antigravityReview,
-    ...(Number.isSafeInteger(read.minNonClaudeSeats) && read.minNonClaudeSeats >= 0 ? { minNonClaudeSeats: read.minNonClaudeSeats } : {}),
+    ...(Number.isSafeInteger(read.minNonClaudeSeats) && read.minNonClaudeSeats >= 0
+      ? { minNonClaudeSeats: read.minNonClaudeSeats } : historicalMinimum ? { minNonClaudeSeats: 0 } : {}),
     seatSettings: { ...(settings ?? {}), agyCorrectnessAdvisory, preserveSavedRoster: true },
   };
 }
 
 /**
- * The real (non-injected) probation check `antigravityReviewFromEnv` defaults to: is the seated Antigravity
+ * Default check for advisorySeats.antigravityReview=probation: is the seated Antigravity
  * identity declared `'probation'` or `'trusted'` for the `'advisory-review'` role? Named and exported
  * separately, mirroring `defaultCodexAdvisoryProbationCheck`, so a test can assert ON it directly without
  * stubbing the whole default parameter chain.
@@ -1869,6 +1881,7 @@ export function buildReviewAntigravityJudgeRequest({ read, aim = '' }) {
     // #3383 — PINS THIS SEAT TO ANTIGRAVITY, independent of the run's `--provider` flag, exactly like both
     // existing Codex seats pin themselves to `codex`. See `createDefaultJudge`.
     providerName: 'antigravity',
+    gracefulOnUnavailable: true,
   };
 }
 
@@ -2410,7 +2423,7 @@ export function reviewPrOperation({
 } = {}) {
   if (!Number.isSafeInteger(minNonClaudeSeats) || minNonClaudeSeats < 0) throw new TypeError('review-pr: invalid minNonClaudeSeats');
   // New reviews always include a separate Codex session. Saved runs keep their original step roster;
-  // the reducer reports their shortfall rather than inventing an answer during resume.
+  // their saved minimum still applies rather than inventing an answer during resume.
   if (!seatSettings?.preserveSavedRoster) {
     if (Number(codexAdvisory) + Number(correctnessAdvisory) < minNonClaudeSeats) codexAdvisory = true;
     if (Number(codexAdvisory) + Number(correctnessAdvisory) < minNonClaudeSeats) correctnessAdvisory = true;
@@ -2958,6 +2971,9 @@ export function reviewPrOperation({
         const skippedSeats = [];
         for (const seat of seats) {
           const answer = seat.answer && typeof seat.answer === 'object' ? seat.answer : {};
+          if (answer.skipped && !ADVISORY_SEAT_STEPS.includes(seat.step)) {
+            throw new Error(`blocked-on-infra: mandatory seat ${seat.step} skipped; retry when the provider recovers`);
+          }
           // #x6t2z6h — REFUSE A WRONGLY-TYPED `findings`, for exactly the reason #x0p5k2q refuses a silent
           // juror. `normalizeFindings` coerces a non-array to `[]`, so a juror that NARRATED its blockers
           // instead of filling the schema — the commonest way a forced-tool-call seat fails — arrived here as
@@ -3061,6 +3077,7 @@ export function reviewPrOperation({
           && Array.isArray(s.answer.findings)).length;
         const nonClaudeSeatShortfall = nonClaudeSeats < minNonClaudeSeats
           ? `⚠️ NON-CLAUDE SEAT SHORTFALL: ${nonClaudeSeats}/${minNonClaudeSeats} advisory seats answered; review diversity minimum was not met.` : null;
+        if (nonClaudeSeatShortfall) throw new Error(`blocked-on-infra: ${nonClaudeSeatShortfall} Retry when providers recover.`);
         const lensProviders = Object.fromEntries([
           ...seats.filter((s) => s.provider).map((s) => [s.lens, s.provider]),
           // Card 84 — a mandatory seat that ran on agy (`review.seatProvider.<lens>: agy`) or had an agy shadow says
