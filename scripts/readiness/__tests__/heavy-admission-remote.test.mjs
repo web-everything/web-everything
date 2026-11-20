@@ -56,7 +56,7 @@ function mockShellSpawn(onSpawn = () => {}) {
 
 // Keep this a selected run: the shell-looking text is a test-name value, not an unknown positional filter.
 const argv = ['npm', 'run', 'test:unit', '--', 'a file.test.mjs', '-t', '$(must-stay-literal)'];
-const remoteDefaults = { enabled: false, mode: 'above-threshold', loadPerCoreThreshold: 3, clientPath: null,
+const remoteDefaults = { enabled: false, mode: 'above-threshold', loadPerCoreThreshold: 3, clientPath: null, manifest: 'legacy',
   slotUnitsByKind:{FULL:"auto",soak:"auto",standards:"auto"},elasticSlots:{enabled:true},autoSlotUnits:3,
   maxConcurrent:8, backoffMs:120000, backoffFailures:3, maxLoadPerCore:0.8, minFreeRamPct:15, stuckMinSlots:2, stuckAgeMs:600000, stuckSignalEveryMs:600000, busyWaitMs:600000, busyBackoffMs:45000, transport:'rsync', bundle:{ mainMaxAgeMin:10 } };
 const testRoots=[];
@@ -195,7 +195,8 @@ describe('remote admission policy', () => {
     const lockRoot = join(pool, '.admission', 'heavy');
     const remoteRoot = join(pool, '.admission', 'remote');
     mkdirSync(pool);
-    const preferences = join(root, 'preferences.json');
+    mkdirSync(join(root, '.claude'));
+    const preferences = join(root, '.claude', 'platform-preferences.json');
     writeFileSync(preferences, JSON.stringify({ heavyAdmission: {
       remote: { enabled: true, mode: 'always' }, fastScale: { maxSlots: 1 },
     } }));
@@ -213,7 +214,7 @@ describe('remote admission policy', () => {
       expect(existsSync(join(remoteRoot, 'slot-0.unconfirmed'))).toBe(false);
     });
     try {
-      await expect(main(['run', `--repo=${root}`, '--', ...argv], { remoteExec, readTelemetry: healthyRead }))
+      await expect(main(['run', `--repo=${root}`, '--', ...argv], { home: root, remoteExec, readTelemetry: healthyRead }))
         .rejects.toBe(exited);
       expect(remoteExec).toHaveBeenCalledTimes(1);
       expect(localExec).toHaveBeenCalledTimes(1);
@@ -234,7 +235,8 @@ describe('remote admission policy', () => {
     ['serial retry local-only by design', ['npx','vitest','run','scripts/example.test.mjs','--maxWorkers=1','--minWorkers=1','--no-file-parallelism']],
   ])('runs %s locally with a reason and no remote staging',async(_name,command)=>{
     const root=mkdtempSync(join(process.env.TMPDIR,'standards-fallback-')),pool=join(root,'pool');mkdirSync(pool);
-    const preferences=join(root,'preferences.json');
+    mkdirSync(join(root,'.claude'));
+    const preferences=join(root,'.claude','platform-preferences.json');
     writeFileSync(preferences,JSON.stringify({heavyAdmission:{remote:{enabled:true,mode:'always'}}}));
     const exited=new Error('test exit'),transport=vi.fn(),stage=vi.fn();
     const exit=vi.spyOn(process,'exit').mockImplementation(()=>{throw exited;});
@@ -246,7 +248,7 @@ describe('remote admission policy', () => {
     const localExec = mockShellSpawn();
     try {
       await expect(main(['run',`--repo=${root}`,'--',...command],{
-        readTelemetry:healthyRead,
+        home:root, readTelemetry:healthyRead,
         remoteExec:async options=>adaptLegacyRemoteResult(await runRemote({...options,exec:transport,fs:{mkdtemp:stage}})),
       })).rejects.toBe(exited);
       expect(localExec).toHaveBeenCalledTimes(1);
@@ -294,7 +296,8 @@ describe('remote admission policy', () => {
     const root = mkdtempSync(join(tmpdir(), 'remote-main-'));
     const pool = join(root, 'pool');
     mkdirSync(pool);
-    const prefs = join(root, 'preferences.json');
+    mkdirSync(join(root, '.claude'));
+    const prefs = join(root, '.claude', 'platform-preferences.json');
     writeFileSync(prefs, JSON.stringify({ heavyAdmission: { remote: { enabled: true, mode: 'always' } } }));
     const exited = new Error('test exit');
     const exit = vi.spyOn(process, 'exit').mockImplementation(() => { throw exited; });
@@ -303,7 +306,7 @@ describe('remote admission policy', () => {
       CI: '', WE_HEAVY_ADMISSION: 'on', WE_HEAVY_ADMISSION_HELD: '', WE_HEAVY_ADMISSION_CONTAINER: '', WE_HEAVY_ADMISSION_CONTAINER_NODE_MODULES: '', WE_VERIFY_REMOTE_REPORT: join(root, 'verify-report.jsonl'),...gateEnv })) vi.stubEnv(key, value);
     try {
       const remoteExec = vi.fn(async () => ({ mode: 'remote', code: 23, run: 'run-123456' }));
-      await expect(main(['run', `--repo=${root}`, '--', ...command], { remoteExec, readTelemetry:healthyRead })).rejects.toBe(exited);
+      await expect(main(['run', `--repo=${root}`, '--', ...command], { home: root, remoteExec, readTelemetry:healthyRead })).rejects.toBe(exited);
       expect(remoteExec).toHaveBeenCalledWith(expect.objectContaining({ argv:expected, cwd: root, signal: expect.any(AbortSignal) }));
       expect(exit).toHaveBeenCalledWith(23);
       expect(JSON.parse(readFileSync(join(root, 'verify-report.jsonl'), 'utf8'))).toEqual({ location: 'remote', receiptId: 'run-123456', exitCode: 23 });
@@ -342,7 +345,8 @@ describe('remote admission policy', () => {
     const pool = join(root, 'pool');
     const lockRoot = join(pool, '.admission', 'heavy');
     mkdirSync(pool);
-    const prefs = join(root, 'preferences.json');
+    mkdirSync(join(root, '.claude'));
+    const prefs = join(root, '.claude', 'platform-preferences.json');
     writeFileSync(prefs, JSON.stringify({ heavyAdmission: {
       ...(enableRemote ? { remote: { enabled: true, mode: 'always' } } : {}),
       fastScale: { maxSlots: 1 },
@@ -363,7 +367,7 @@ describe('remote admission policy', () => {
       : mockShellSpawn(onLocalExec);
     try {
       const remoteExec = vi.fn(async () => ({ mode: 'remote', code: 23, run: 'run-123456' }));
-      await expect(main(['run', `--repo=${root}`, ...flags, '--', ...argv], { remoteExec, readTelemetry:healthyRead })).rejects.toBe(exited);
+      await expect(main(['run', `--repo=${root}`, ...flags, '--', ...argv], { home: root, remoteExec, readTelemetry:healthyRead })).rejects.toBe(exited);
       expect(remoteExec).not.toHaveBeenCalled();
       expect(localExec).toHaveBeenCalledTimes(1);
       const command = argv.map(shellQuoteWord).join(' ');
