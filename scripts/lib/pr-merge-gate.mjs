@@ -12,12 +12,11 @@
  * non-drain merge is never silent.
  */
 import { execFileSync } from 'node:child_process';
-import { readFileSync } from 'node:fs';
-import { join } from 'node:path';
+import { posix } from 'node:path';
+import { configDefaults } from 'vitest/config';
 import ts from 'typescript';
 import micromatch from 'micromatch';
-import { parseVitestGlobs } from './test-result-cache.mjs';
-import { DEFAULT_REPO_ROOT, liveSuiteFiles, loadHermeticSettings } from './hermetic-tests.mjs';
+import { liveSuiteFiles, parseHermeticSettings, SETTINGS_PATH } from './hermetic-tests.mjs';
 
 /** The `gh pr merge` method flag (default `--merge` = the --no-ff history the drain wants). Pure. */
 export function mergeMethodFlag(method) {
@@ -200,20 +199,81 @@ export function scanTestTampering({ diffText = '', readFile } = {}) {
   const findings = [];
   const files = parseUnifiedDiff(diffText);
   // Move evidence is deliberately stricter than ordinary same-file churn: complete parseable hunks,
-  // static describe/title paths and identical executable bodies (formatting/comments may differ).
+  // static describe/title paths and identical complete callbacks and registration context (formatting/comments may differ).
   // Unknown evidence receives no credit: the existing HOLD asks a human to review the full diff.
   const records = { removed: new Map(), added: new Map() };
   let oversized = String(diffText).length > 1024 * 1024;
-  let complete = !oversized && !files.some((f) => /(?:^|\/)vitest[^/]*config\.|hermetic-tests\.settings\.json$/.test(f.path || ''));
-  const total = (side) => files.filter((f) => isTestPath(f.path))
-    .reduce((sum, f) => sum + f[side].filter((line) => TEST_CASE_OPENER_RE.test(line)).length, 0);
-  if (total('removed') > total('added')) complete = false;
+  let evidenceLimit = '1 MiB';
+  const changedPaths = [...String(diffText).matchAll(/^diff --git a\/(.+) b\/(.+)$/gm)].flatMap((m) => [m[1], m[2]]);
+  let complete = !oversized && typeof readFile === 'function' && !changedPaths.some((path) =>
+    /(?:^|\/)vitest[.-]|hermetic[^/]*settings|(?:^|\/)package\.json$|^\.github\/workflows\//.test(path));
+  let include = [], exclude = [];
+  try {
+    // Parse data only. Never execute reviewed config; unknown spreads/expressions retain HOLD.
+    const config = readFile('vitest.config.ts', 'head');
+    if (typeof config !== 'string') throw new Error('unreadable config');
+    if (config.length > 1024 * 1024) { oversized = true; throw new Error('oversized config'); }
+    const tree = ts.createSourceFile('vitest.config.ts', config, ts.ScriptTarget.Latest, true);
+    if (tree.parseDiagnostics.length) throw new Error('invalid config');
+    const exports = tree.statements.filter(ts.isExportAssignment);
+    if (exports.length !== 1 || exports[0].isExportEquals) throw new Error('unknown config export');
+    let root = exports[0].expression;
+    if (ts.isCallExpression(root) && root.expression.getText(tree) === 'defineConfig' && root.arguments.length === 1) root = root.arguments[0];
+    if (!ts.isObjectLiteralExpression(root) || root.properties.some(ts.isSpreadAssignment)) throw new Error('dynamic config export');
+    const tests = root.properties.filter((n) => ts.isPropertyAssignment(n) && n.name.getText(tree) === 'test');
+    const test = tests.length === 1 ? tests[0].initializer : null;
+    if (!test || !ts.isObjectLiteralExpression(test) || test.properties.some(ts.isSpreadAssignment)) throw new Error('missing or dynamic test config');
+    const property = (name) => test.properties.filter((n) => ts.isPropertyAssignment(n) && n.name.getText(tree) === name);
+    const globs = (name) => {
+      const props = property(name);
+      if (props.length !== 1 || !ts.isArrayLiteralExpression(props[0].initializer)) throw new Error('unknown globs');
+      return props[0].initializer.elements.flatMap((n) => {
+        if (ts.isStringLiteralLike(n)) return [n.text];
+        if (name === 'exclude' && ts.isSpreadElement(n)) {
+          if (n.expression.getText(tree) === 'configDefaults.exclude') return configDefaults.exclude;
+          if (n.expression.getText(tree) === 'LIVE_SUITE') return liveSuiteFiles(parseHermeticSettings(readFile(SETTINGS_PATH, 'head')));
+        }
+        throw new Error('dynamic glob');
+      });
+    };
+    include = globs('include'); exclude = [...configDefaults.exclude, ...globs('exclude')];
+    // Every literal setup path, including conditional branches, is sensitive.
+    const setup = new Set();
+    function setupPaths(n, seen = new Set()) {
+      if (ts.isStringLiteralLike(n)) { setup.add(posix.normalize(n.text)); return; }
+      if (ts.isArrayLiteralExpression(n)) { for (const e of n.elements) setupPaths(e, seen); return; }
+      if (ts.isSpreadElement(n) || ts.isParenthesizedExpression(n)) { setupPaths(n.expression, seen); return; }
+      if (ts.isConditionalExpression(n)) { setupPaths(n.whenTrue, seen); setupPaths(n.whenFalse, seen); return; }
+      if (ts.isIdentifier(n) && !seen.has(n.text)) {
+        const declarations = [];
+        function findDeclaration(node) {
+          if (ts.isVariableDeclaration(node) && node.name.getText(tree) === n.text && node.initializer) declarations.push(node.initializer);
+          ts.forEachChild(node, findDeclaration);
+        }
+        findDeclaration(tree);
+        if (declarations.length === 1) { setupPaths(declarations[0], new Set([...seen, n.text])); return; }
+      }
+      throw new Error('unknown setup path');
+    }
+    for (const name of ['setupFiles', 'globalSetup']) for (const p of property(name)) setupPaths(p.initializer);
+    if (changedPaths.some((p) => setup.has(p))) complete = false;
+  } catch { complete = false; }
+  const counts = { removed: new Map(), added: new Map() };
+  const printer = ts.createPrinter({ removeComments: true });
+  const print = (n, tree) => printer.printNode(ts.EmitHint.Unspecified, n, tree);
+  const signature = (fn, tree) => {
+    const empty = ts.factory.createBlock([], true);
+    const declaration = ts.isArrowFunction(fn)
+      ? ts.factory.updateArrowFunction(fn, fn.modifiers, fn.typeParameters, fn.parameters, fn.type, fn.equalsGreaterThanToken, empty)
+      : ts.factory.updateFunctionExpression(fn, fn.modifiers, fn.asteriskToken, fn.name, fn.typeParameters, fn.parameters, fn.type, empty);
+    return print(declaration, tree);
+  };
+  const protectedNames = new Set(['it', 'test', 'describe', 'expect', 'vi']);
   const normalize = (s) => s.replace(/\s+/g, ' ').trim();
   const remember = (side, key, value) => {
     if (!records[side].has(key)) records[side].set(key, []);
     records[side].get(key).push(value);
   };
-  const fullFiles = typeof readFile === 'function';
   const staticTitle = (node) => {
     if (node && ts.isStringLiteralLike(node)) return node.text;
     if (node && ts.isBinaryExpression(node) && node.operatorToken.kind === ts.SyntaxKind.PlusToken) {
@@ -233,38 +293,152 @@ export function scanTestTampering({ diffText = '', readFile } = {}) {
       if (line.changed) changed.add(offset);
       offset += line.text.length + 1;
     }
+    // Reject protected bindings, except an inert, test-local const named `it` needed by #7140.
+    let bindingsSafe = true;
+    function binding(name) {
+      if (ts.isIdentifier(name) && protectedNames.has(name.text)) bindingsSafe = false;
+      else if (ts.isObjectBindingPattern(name) || ts.isArrayBindingPattern(name))
+        for (const e of name.elements) if (ts.isBindingElement(e)) binding(e.name);
+    }
+    function bindings(n) {
+      if (ts.isImportDeclaration(n)) {
+        const c = n.importClause;
+        if (c?.name) binding(c.name);
+        if (c?.namedBindings && ts.isNamespaceImport(c.namedBindings)) binding(c.namedBindings.name);
+        if (c?.namedBindings && ts.isNamedImports(c.namedBindings)) for (const e of c.namedBindings.elements) {
+          if (protectedNames.has(e.name.text) && !(n.moduleSpecifier.text === 'vitest' &&
+              (!e.propertyName || e.propertyName.text === e.name.text))) bindingsSafe = false;
+        }
+      } else if (ts.isVariableDeclaration(n) || ts.isParameter(n) || ts.isBindingElement(n) ||
+          ts.isFunctionDeclaration(n) || ts.isClassDeclaration(n) || ts.isFunctionExpression(n)) {
+        if (n.name) {
+          let inertDataIt = false;
+          if (ts.isVariableDeclaration(n) && ts.isIdentifier(n.name) && n.name.text === 'it' &&
+              (n.parent.flags & ts.NodeFlags.Const)) {
+            let fn = n.parent;
+            while (fn && !ts.isFunctionLike(fn)) fn = fn.parent;
+            if (fn && ts.isCallExpression(fn.parent) && /^(?:it|test)$/.test(fn.parent.expression.getText(tree))) {
+              inertDataIt = true;
+              const reads = (node) => {
+                if (ts.isIdentifier(node) && node.text === 'it' && node !== n.name &&
+                    !(ts.isPropertyAccessExpression(node.parent) && node.parent.expression === node &&
+                      !['skip', 'only', 'each'].includes(node.parent.name.text) &&
+                      !(ts.isCallExpression(node.parent.parent) && node.parent.parent.expression === node.parent))) inertDataIt = false;
+                ts.forEachChild(node, reads);
+              };
+              reads(fn.body);
+            }
+          }
+          if (!inertDataIt) binding(n.name);
+        }
+      }
+      if ((ts.isBinaryExpression(n) && n.operatorToken.kind >= ts.SyntaxKind.FirstAssignment &&
+          n.operatorToken.kind <= ts.SyntaxKind.LastAssignment) ||
+          ((ts.isPrefixUnaryExpression(n) || ts.isPostfixUnaryExpression(n)) &&
+            [ts.SyntaxKind.PlusPlusToken, ts.SyntaxKind.MinusMinusToken].includes(n.operator))) {
+        const target = ts.isBinaryExpression(n) ? n.left : n.operand;
+        function writes(n) {
+          if (ts.isIdentifier(n) && protectedNames.has(n.text)) bindingsSafe = false;
+          ts.forEachChild(n, writes);
+        }
+        writes(target);
+      }
+      ts.forEachChild(n, bindings);
+    }
+    bindings(tree);
+    function unsafe(n) {
+      if (ts.isCallExpression(n) && (/(?:^|\.)skip$|^vi\.hoisted$/.test(n.expression.getText(tree)) ||
+          /^(?:Object\.(?:assign|defineProperty|defineProperties)|Reflect\.set)$/.test(n.expression.getText(tree)) &&
+          n.arguments.some((a) => /^(?:globalThis|global|window)$/.test(a.getText(tree))))) bindingsSafe = false;
+      if (ts.isElementAccessExpression(n) && /^(?:globalThis|global|window)$/.test(n.expression.getText(tree))) bindingsSafe = false;
+      ts.forEachChild(n, unsafe);
+    }
+    unsafe(tree);
+    function hiddenHook(n) {
+      if (ts.isCallExpression(n) && /^(?:beforeEach|afterEach|beforeAll|afterAll|onTestFinished|vi\.(?:mock|hoisted|setConfig))$/.test(n.expression.getText(tree)) &&
+          !ts.isExpressionStatement(n.parent)) bindingsSafe = false;
+      ts.forEachChild(n, hiddenHook);
+    }
+    hiddenHook(tree);
+    const helperEffects = [];
+    const seenHelpers = new Set();
+    function helper(path, depth = 0) {
+      if (depth > 8) { oversized = true; evidenceLimit = 'helper depth 8'; throw new Error('helper depth limit'); }
+      if (seenHelpers.has(path)) throw new Error('cyclic or duplicate helper');
+      seenHelpers.add(path);
+      const source = readFile(path, side === 'removed' ? 'base' : 'head');
+      if (typeof source !== 'string') throw new Error('unreadable helper');
+      if (source.length > 128 * 1024) { oversized = true; evidenceLimit = '128 KiB helper'; throw new Error('helper size limit'); }
+      const t = ts.createSourceFile(path, source, ts.ScriptTarget.Latest, true);
+      if (t.parseDiagnostics.length) throw new Error('invalid helper');
+      // Helpers may not supply or patch the protected Vitest bindings.
+      function protect(n) {
+        if (ts.isIdentifier(n) && (protectedNames.has(n.text) || n.text === 'skip')) throw new Error('protected helper');
+        if (ts.isCallExpression(n) && /^(?:beforeEach|afterEach|beforeAll|afterAll|onTestFinished)$/.test(n.expression.getText(t)) &&
+            !ts.isExpressionStatement(n.parent)) throw new Error('hidden helper hook');
+        ts.forEachChild(n, protect);
+      }
+      protect(t);
+      for (const n of t.statements) {
+        if (ts.isImportDeclaration(n) && n.moduleSpecifier.text?.startsWith('.')) {
+          const target = posix.normalize(posix.join(posix.dirname(path), n.moduleSpecifier.text));
+          if (files.some((f) => f.path === target && !f.removed.length && f.added.length)) helper(target, depth + 1);
+        }
+      }
+      for (const n of t.statements) {
+        if (ts.isImportDeclaration(n) || ts.isExportDeclaration(n) || ts.isFunctionDeclaration(n) ||
+            ts.isVariableStatement(n) && (n.declarationList.flags & ts.NodeFlags.Const)) continue;
+        helperEffects.push(print(n, t));
+      }
+    }
+    if (side === 'added') for (const n of tree.statements) {
+      if (!ts.isImportDeclaration(n) || !n.moduleSpecifier.text?.startsWith('.')) continue;
+      const target = posix.normalize(posix.join(posix.dirname(path), n.moduleSpecifier.text));
+      if (files.some((f) => f.path === target && !f.removed.length && f.added.length)) helper(target);
+    }
+    // Compatibility with #7140: registration effects may move only in identical order,
+    // including setup/cleanup extracted into a new helper. New or changed hooks retain HOLD.
+    function effects(container) {
+      return container.statements.filter((n) => {
+        if (ts.isImportDeclaration(n) || ts.isExportDeclaration(n) || ts.isFunctionDeclaration(n) ||
+            ts.isVariableStatement(n) && (n.declarationList.flags & ts.NodeFlags.Const)) return false;
+        return !(ts.isExpressionStatement(n) && ts.isCallExpression(n.expression) &&
+          /^(?:it|test|describe)(?:\.|$)/.test(n.expression.expression.getText(tree)));
+      }).map((n) => print(n, tree));
+    }
     function hasSuiteExit(node) {
       // Returns/throws in test callbacks or helper functions do not exit the enclosing suite.
       if (ts.isFunctionLike(node)) return false;
       if (ts.isReturnStatement(node) || ts.isThrowStatement(node)) return true;
       return !!ts.forEachChild(node, hasSuiteExit);
     }
-    function visit(node, parents = [], disabled = false, container = tree) {
-      // Parameterized declarations are not counted by the legacy opener counter. In full-file
-      // evidence retain their static titles for collisions, but never award them move credit.
-      const parameterized = fullFiles && ts.isCallExpression(node) && ts.isCallExpression(node.expression) &&
+    function visit(node, parents = [], disabled = false, container = tree, context = [...helperEffects, ...effects(tree)]) {
+      // Parameterized moves require the complete table expression to match as well.
+      const parameterized = ts.isCallExpression(node) && ts.isCallExpression(node.expression) &&
         /^(?:it|test)\.each$/.test(node.expression.expression.getText(tree));
       if (ts.isCallExpression(node) && (parameterized || /^(?:describe|it|test)(?:\.(?:skip|todo|only))?$/.test(node.expression.getText(tree)))) {
         if (!ts.isExpressionStatement(node.parent) || node.parent.parent !== container) { complete = false; return; }
         const callee = node.expression.getText(tree);
         const [title, fn] = node.arguments;
-        const titleText = fullFiles ? staticTitle(title) : title && ts.isStringLiteralLike(title) ? title.text : null;
+        const titleText = staticTitle(title);
         if (titleText === null || !fn ||
             !(ts.isArrowFunction(fn) || ts.isFunctionExpression(fn))) { complete = false; return; }
         const key = [...parents, normalize(titleText)];
         // Calling a generator returns an iterator without running its assertions (or suite setup).
-        const blocked = disabled || parameterized || !!fn.asteriskToken || callee.includes('.');
+        const blocked = disabled || !bindingsSafe || !!fn.asteriskToken || (!parameterized && callee.includes('.')) || node.arguments.length !== 2 ||
+          (parameterized && node.expression.arguments.length !== 1);
         if (callee.startsWith('describe')) {
           // Direct nesting alone does not prove registration: a prior (even conditional)
           // exit can leave declarations unreachable. Refuse credit throughout such a suite.
           const suiteBlocked = blocked || hasSuiteExit(fn.body);
-          ts.forEachChild(fn.body, (child) => visit(child, key, suiteBlocked, fn.body));
+          ts.forEachChild(fn.body, (child) => visit(child, [...key, signature(fn, tree)], suiteBlocked, fn.body, [...context, ...effects(fn.body)]));
           return;
         }
         const start = tree.getLineStarts()[tree.getLineAndCharacterOfPosition(node.getStart(tree)).line];
         // Compare parsed statements, not whitespace-stripped tokens: `return\nexpect(...)`
         // skips the assertion even though it has the same tokens as `return expect(...)`.
-        const body = ts.createPrinter({ removeComments: true }).printNode(ts.EmitHint.Unspecified, fn.body, tree);
+        const body = (parameterized ? print(node.expression, tree) : callee) + signature(fn, tree) + print(fn.body, tree);
+        if (changed.has(start)) counts[side].set(path, (counts[side].get(path) || 0) + 1);
         let assertions = 0;
         let trivial = false;
         function assertion(n) {
@@ -278,14 +452,16 @@ export function scanTestTampering({ diffText = '', readFile } = {}) {
         }
         assertion(fn.body);
         remember(side, JSON.stringify(key), { path, changed: changed.has(start),
-          body, valid: !blocked && assertions > 0 && !trivial });
+          body, context: context.join('\n'), valid: !blocked && context.every((s) =>
+            /^(?:beforeEach|afterEach|beforeAll|afterAll)\(/.test(s) || /^vi\.(?:mock|setConfig)\(/.test(s) ||
+            /^process\.env\.WE_BOARD_NOW = NOW;?$/.test(s) || /^let\s/.test(s)) && assertions > 0 && !trivial });
         return;
       }
       if (ts.isCallExpression(node) && /^(?:describe|it|test)\b/.test(node.expression.getText(tree))) {
         complete = false; // e.g. .each / computed titles: cannot prove unique case identity
         return;
       }
-      ts.forEachChild(node, (child) => visit(child, parents, disabled, container));
+      ts.forEachChild(node, (child) => visit(child, parents, disabled, container, context));
     }
     visit(tree);
   }
@@ -297,7 +473,7 @@ export function scanTestTampering({ diffText = '', readFile } = {}) {
     for (const line of String(diffText).split('\n')) {
       if (line.startsWith('diff --git ')) {
         const match = line.match(/^diff --git a\/(.+) b\/(.+)$/);
-        file = match ? { base: match[1], head: match[2], absent: {}, baseLines: new Set(), headLines: new Set() } : null;
+        file = match ? { base: match[1], head: match[2], absent: {}, baseLines: new Map(), headLines: new Map() } : null;
         if (file) evidence.push(file);
         else complete = false;
       } else if (file) {
@@ -308,8 +484,8 @@ export function scanTestTampering({ diffText = '', readFile } = {}) {
           const match = line.match(/^@@ -(\d+)(?:,\d+)? \+(\d+)(?:,\d+)? @@/);
           if (!match) { complete = false; continue; }
           oldLine = Number(match[1]); newLine = Number(match[2]);
-        } else if (line.startsWith('-')) file.baseLines.add(oldLine++);
-        else if (line.startsWith('+')) file.headLines.add(newLine++);
+        } else if (line.startsWith('-')) file.baseLines.set(oldLine++, line.slice(1));
+        else if (line.startsWith('+')) file.headLines.set(newLine++, line.slice(1));
         else if (line.startsWith(' ')) { oldLine++; newLine++; }
       }
     }
@@ -322,52 +498,27 @@ export function scanTestTampering({ diffText = '', readFile } = {}) {
           if (typeof text !== 'string') throw new Error('unreadable full file');
           evidenceSize += text.length;
           if (evidenceSize > 1024 * 1024) { oversized = true; throw new Error('oversized full-file evidence'); }
-          collect(f.head, text.split('\n').map((text, i) => ({ text, changed: f[`${side}Lines`].has(i + 1) })), bucket);
+          const sourceLines = text.split('\n');
+          for (const [number, expected] of f[`${side}Lines`]) {
+            if (sourceLines[number - 1] !== expected) throw new Error('diff/tree mismatch');
+          }
+          collect(f.head, sourceLines.map((text, i) => ({ text, changed: f[`${side}Lines`].has(i + 1) })), bucket);
         }
       } catch { complete = false; } // No partial credit: retain the human HOLD on any failed read/parse.
     }
-  } else {
-    // Keep context (for suite ancestry and existing-title collisions), but never join separate hunks.
-    let path = null;
-    let old = [], next = [];
-    const flush = () => {
-      if (complete && path && isTestPath(path)) {
-        try { collect(path, old, 'removed'); collect(path, next, 'added'); }
-        catch { complete = false; } // Parser failure retains the existing human HOLD.
-      }
-      old = []; next = [];
-    };
-    for (const line of String(diffText).split('\n')) {
-      if (line.startsWith('diff --git ')) { flush(); path = line.match(/ b\/(.+)$/)?.[1]; }
-      else if (line.startsWith('@@')) {
-        flush();
-        // Without the file prefix a syntactically valid test may still sit inside an unseen describe,
-        // skipped suite, conditional or comment. Never infer a root scope from a mid-file fragment.
-        if (path && isTestPath(path) && !/^@@ -[01](?:,\d+)? \+[01](?:,\d+)? @@/.test(line)) complete = false;
-      }
-      else if (line.startsWith('+++') || line.startsWith('---')) continue;
-      else if (line.startsWith('-')) old.push({ text: line.slice(1), changed: true });
-      else if (line.startsWith('+')) next.push({ text: line.slice(1), changed: true });
-      else if (line.startsWith(' ')) {
-        old.push({ text: line.slice(1), changed: false }); next.push({ text: line.slice(1), changed: false });
-      }
-    }
-    flush();
   }
   const credits = new Map();
   if (complete && records.removed.size && records.added.size) {
     try {
       // Only credit destinations selected by the checked-in unit config. Integration-only / scheduled
       // suites conservatively retain HOLD; a filename alone is not evidence CI executes it.
-      const { include, exclude } = parseVitestGlobs(readFileSync(join(DEFAULT_REPO_ROOT, 'vitest.config.ts'), 'utf8'));
-      const live = liveSuiteFiles(loadHermeticSettings());
       for (const [key, removed] of records.removed) {
         const added = records.added.get(key);
         if (removed.length !== 1 || added?.length !== 1) continue;
         const [a] = removed, [b] = added;
-        if (!a.changed || !b.changed || a.path === b.path || !a.valid || !b.valid || a.body !== b.body) continue;
+        if (!a.changed || !b.changed || a.path === b.path || !a.valid || !b.valid || a.body !== b.body || a.context !== b.context) continue;
         if (!isTestPath(b.path) || /(^|\/)(?:node_modules|\.git|dist|coverage)(\/|$)/.test(b.path) ||
-            !micromatch.isMatch(b.path, include) || micromatch.isMatch(b.path, [...exclude, ...live])) continue;
+            !micromatch.isMatch(b.path, include) || micromatch.isMatch(b.path, exclude)) continue;
         credits.set(a.path, (credits.get(a.path) || 0) + 1);
       }
     } catch { /* Unreadable/unknown config: no move credits; retain human HOLD. */ }
@@ -380,7 +531,7 @@ export function scanTestTampering({ diffText = '', readFile } = {}) {
       const added = records.added.get(key);
       if (removed.length !== 1 || added?.length !== 1) continue;
       const [a] = removed, [b] = added;
-      if (a.changed && b.changed && a.path === b.path) retained.set(a.path, (retained.get(a.path) || 0) + 1);
+      if (a.changed && b.changed && a.path === b.path && a.valid && b.valid && a.body === b.body && a.context === b.context) retained.set(a.path, (retained.get(a.path) || 0) + 1);
     }
   }
   for (const f of files) {
@@ -401,9 +552,9 @@ export function scanTestTampering({ diffText = '', readFile } = {}) {
     const removedCases = f.removed.filter((l) => TEST_CASE_OPENER_RE.test(l)).length;
     const addedCases = f.added.filter((l) => TEST_CASE_OPENER_RE.test(l)).length;
     const netRemoved = credits.size
-      ? removedCases - (retained.get(f.path) || 0) - (credits.get(f.path) || 0)
+      ? (counts.removed.get(f.path) || 0) - (retained.get(f.path) || 0) - (credits.get(f.path) || 0)
       : removedCases - addedCases;
-    if (netRemoved > 0) findings.push({ path: f.path, kind: 'tests-removed', detail: `net ${netRemoved} test case(s) removed${oversized ? '; move evidence exceeds 1 MiB: human review of full diff required' : ''}` });
+    if (netRemoved > 0) findings.push({ path: f.path, kind: 'tests-removed', detail: `net ${netRemoved} test case(s) removed${oversized ? `; move evidence exceeds ${evidenceLimit}: human review of full diff required` : ''}` });
   }
   const reasons = findings.map((x) => `${x.kind}: ${x.path} (${x.detail})`);
   return { tampered: findings.length > 0, findings, reasons };

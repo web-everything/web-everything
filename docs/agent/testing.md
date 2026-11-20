@@ -5580,3 +5580,18 @@ string concatenations are resolved as titles. Generator callbacks and suites con
 returns or throws receive no move credit; exits inside nested callbacks/helpers do not exit a suite. A failed read, parse, or evidence-size limit retains
 the existing human HOLD. Replay mid-file splits and failure paths in
 `scripts/lib/__tests__/pr-merge-gate.test.mjs` through heavy admission.
+
+
+## Merge-gate move evidence
+
+Move credit uses full reviewed-tree files and config through the same commit-pinned resolver as
+its diff. Missing config, dynamic globs/setup paths, default-excluded destinations, execution-setting
+changes, or mismatched changed lines retain human HOLD. Count changed declarations with the AST
+when spending credits; line counts cannot share that accounting unit.
+
+The #7140 compatibility exception preserves identical registration effects (setup/cleanup hooks,
+`vi.mock`, `vi.setConfig`, and the board clock assignment), including effects and mutable setup declarations extracted into a newly
+added relative helper. Their registration order must match. Unmatched effects, explicit skip/hoist calls and protected bindings refuse
+credit. A test-local `const it` used only for property reads is data; invoking it refuses credit.
+Parameterized moves also compare their complete table expression. New helper evidence is bounded
+at 128 KiB per helper and depth 8; exceeding either bound asks for human review of the full diff.

@@ -1,6 +1,14 @@
 import { describe, it, expect } from 'vitest';
-import { scanTestTampering } from '../pr-merge-gate.mjs';
+import { scanTestTampering as rawScan } from '../pr-merge-gate.mjs';
 
+const config = `export default { test: {
+    include: ['scripts/**/__tests__/**/*.test.mjs'],
+    exclude: [...configDefaults.exclude, 'scripts/__tests__/stdout-flush.test.mjs'],
+    setupFiles: ['./test/setup.mjs'],
+} };`;
+// Reviewed-tree config is an explicit fixture, never the worker checkout's config.
+const scanTestTampering = (input) => rawScan({ ...input, readFile: input.readFile && ((file, side) =>
+  file === 'vitest.config.ts' ? config : input.readFile(file, side)) });
 const path = (name) => `scripts/lib/__tests__/${name}.test.mjs`;
 const testCase = (title, body = 'expect(actual()).toBe(1);', mode = '') =>
   `it${mode}('${title}', () => { ${body} });`;
@@ -14,7 +22,21 @@ function patch(file, before = '', after = '', context = '') {
 }
 const source = (cases) => patch(path('big'), suite(cases), suite([]));
 const destination = (cases, file = path('shard')) => patch(file, '', suite(cases));
-const scan = (...diffs) => scanTestTampering({ diffText: diffs.join('\n') });
+const scan = (...diffs) => {
+  const diffText = diffs.join('\n');
+  const files = new Map();
+  let file, oldFile, before = [], after = [];
+  const save = () => { if (file) { files.set(`base:${oldFile}`, before.join('\n')); files.set(`head:${file}`, after.join('\n')); } };
+  for (const line of diffText.split('\n')) {
+    if (line.startsWith('diff --git ')) { save(); file = line.match(/ b\/(.+)$/)?.[1]; oldFile = line.match(/^diff --git a\/(.+) b\//)?.[1]; before = []; after = []; }
+    else if (line.startsWith('---') || line.startsWith('+++') || line.startsWith('@@')) continue;
+    else if (line.startsWith('-')) before.push(line.slice(1));
+    else if (line.startsWith('+')) after.push(line.slice(1));
+    else if (line.startsWith(' ')) { before.push(line.slice(1)); after.push(line.slice(1)); }
+  }
+  save();
+  return scanTestTampering({ diffText, readFile: (p, side) => files.get(`${side}:${p}`) });
+};
 const removed = (...diffs) => scan(...diffs).findings.filter((f) => f.kind === 'tests-removed');
 
 describe('merge gate case moves', () => {
@@ -273,4 +295,150 @@ describe('full-file declaration shapes from #7140', () => {
     const unknown = "it(title, () => { expect(actual()).toBe(1); });";
     expect(scanTestTampering(input(unknown + '\n' + moved, unknown, [moved])).tampered).toBe(true);
   });
+});
+
+
+describe('round two move-credit trust boundaries', () => {
+  const one = testCase('one');
+  it('counts declarations rather than opener lines when spending credits', () => {
+    expect(removed(source([one + testCase('two'), testCase('deleted')]),
+      destination([one, testCase('two'), testCase('unrelated')]))).toHaveLength(1);
+  });
+  it.each(['({ skip = true }) =>', '(ctx = disabled) =>', '(ctx) =>'])
+    ('holds changed callback parameters and defaults: %s', (params) => {
+      expect(removed(source([one]), destination([one.replace('() =>', params)]))).toHaveLength(1);
+    });
+  it.each(['{ skip: true }', '{ timeout: 10 }', '1000'])
+    ('holds extra case and ancestor suite arguments: %s', (options) => {
+      expect(removed(source([one]), destination([one.replace('});', `}, ${options});`)]))).toHaveLength(1);
+      expect(removed(source([one]), destination([one]).replace(/\n\+\}\);$/, `\n+}, ${options});`))).toHaveLength(1);
+      // Identical options are deliberately outside the admitted two-argument subset.
+      const extra = one.replace('});', `}, ${options});`);
+      expect(removed(source([extra]), destination([extra]))).toHaveLength(1);
+    });
+  it.each([
+    "const it = fake;", "function expect() {}", "import { test } from 'other';",
+    "import { vi as expect } from 'vitest';", "const { describe } = fake;",
+    "expect = fake;", "({ expect } = fake);", "globalThis.it = fake;",
+    "globalThis['test'] = fake;", "Object.assign(globalThis, { it: fake });",
+    "function helper(vi) {}", "const x = beforeEach(helper);",
+    "beforeEach(() => ctx.skip());", "afterEach(cleanup);", "beforeAll(setup);",
+    "afterAll(cleanup);", "onTestFinished(cleanup);", "context.skip();",
+    "vi.mock('target');", "vi.hoisted(() => {});", "activateSkipping();",
+  ])('holds added binding/hook/effect in source or destination: %s', (effect) => {
+    for (const side of ['source', 'destination']) {
+      const from = side === 'source' ? patch(path('big'), effect + '\n' + suite([one]), suite([])) : source([one]);
+      const to = side === 'destination' ? patch(path('shard'), '', effect + '\n' + suite([one])) : destination([one]);
+      expect(removed(from, to)).toHaveLength(1);
+    }
+  });
+  it('holds identical skip hooks and protected bindings on both sides', () => {
+    for (const effect of ['beforeEach(() => ctx.skip());', 'const it = fake;', "vi.hoisted(() => {});"]) {
+      expect(removed(patch(path('big'), effect + '\n' + suite([one]), effect + '\n' + suite([])),
+        patch(path('shard'), '', effect + '\n' + suite([one])))).toHaveLength(1);
+    }
+  });
+  it('preserves identical setup and cleanup effects without permitting a changed hook', () => {
+    const effect = 'beforeEach(() => reset());';
+    expect(scan(patch(path('big'), effect + '\n' + suite([one]), effect + '\n' + suite([])),
+      patch(path('shard'), '', effect + '\n' + suite([one]))).findings).toEqual([]);
+  });
+  it.each(['node_modules', 'dist', 'cypress', '.idea', '.git', '.cache', '.output', '.temp'])
+    ('honours Vitest default excluded directory %s', (dir) => {
+      expect(removed(source([one]), destination([one], `scripts/${dir}/__tests__/shard.test.mjs`))).toHaveLength(1);
+    });
+  it.each(['vitest.config.mts', 'vitest.setup.ts', 'vitest.shared.ts', 'scripts/hermetic-tests.settings.json',
+    'package.json', '.github/workflows/unit.yml', 'test/setup.mjs'])
+    ('holds moves beside changed test execution settings: %s', (file) => {
+      expect(removed(source([one]), destination([one]), patch(file, 'old', 'new'))).toHaveLength(1);
+    });
+  it.each(['base', 'head'])('holds when diff text and %s tree disagree', (side) => {
+    const input = midFileSplit();
+    const read = input.readFile;
+    input.readFile = (p, s) => {
+      const text = read(p, s);
+      return s === side && typeof text === 'string' ? text.replaceAll('toBe(1)', 'toBe(2)') : text;
+    };
+    expect(scanTestTampering(input).tampered).toBe(true);
+  });
+  it.each(['unreadable', 'excluded', 'dynamic', 'setup', 'spread', 'root'])('holds on reviewed config %s', (mode) => {
+    const input = midFileSplit();
+    const read = input.readFile;
+    input.readFile = (p, side) => p === 'vitest.config.ts'
+      ? mode === 'unreadable' ? undefined : mode === 'root' ? config.replace('export default', 'const unused =') + '\nexport default unknown;' : mode === 'setup' ? config.replace("['./test/setup.mjs']", 'unknownSetup')
+        : mode === 'spread' ? config.replace('test: {', 'test: { ...unknown,') : mode === 'dynamic' ? config.replace("['scripts/**/__tests__/**/*.test.mjs']", '[...unknown]')
+        : config.replace('...configDefaults.exclude', "...configDefaults.exclude, '**/*'") : read(p, side);
+    expect(rawScan(input).tampered).toBe(true);
+  });
+  it('holds without a reviewed-tree resolver', () => {
+    expect(rawScan({ diffText: source([one]) + '\n' + destination([one]) }).tampered).toBe(true);
+  });
+});
+
+
+describe('move-credit helper bounds and preservation', () => {
+  const one = testCase('one');
+  it('holds a changed ancestor callback default', () => {
+    expect(removed(source([one]), destination([one]).replace("describe('suite', () =>", "describe('suite', (ctx = disabled) =>"))).toHaveLength(1);
+  });
+  it('does not retain a local case with newly added skip options beside a credited move', () => {
+    expect(removed(patch(path('big'), suite([one, testCase('two')]),
+      suite([one.replace('});', '}, { skip: true });')])), destination([testCase('two')]))).toHaveLength(1);
+  });
+  it('holds an oversized extracted helper with a human-review fallback', () => {
+    const helper = 'scripts/lib/__tests__/helpers/world.mjs';
+    const result = removed(source([one]), patch(path('shard'), '',
+      "import { data } from './helpers/world.mjs';\n" + suite([one])),
+    patch(helper, '', "export const data = '" + 'x'.repeat(128 * 1024) + "';"));
+    expect(result).toHaveLength(1);
+    expect(result[0].detail).toContain('128 KiB helper: human review of full diff required');
+  });
+  it('holds when an extracted helper exceeds the depth bound', () => {
+    const helpers = Array.from({ length: 10 }, (_, i) => patch(`scripts/lib/__tests__/helpers/h${i}.mjs`, '',
+      (i < 9 ? `import './h${i + 1}.mjs';\n` : '') + 'export const data = 1;'));
+    const result = removed(source([one]), patch(path('shard'), '', "import './helpers/h0.mjs';\n" + suite([one])), ...helpers);
+    expect(result[0].detail).toContain('helper depth 8: human review of full diff required');
+  });
+  it('holds a new extracted helper containing a hidden registration hook', () => {
+    expect(removed(source([one]), patch(path('shard'), '', "import './helpers/world.mjs';\n" + suite([one])),
+      patch('scripts/lib/__tests__/helpers/world.mjs', '', "import { beforeEach } from 'vitest';\nconst hook = beforeEach(disable);"))).toHaveLength(1);
+  });
+});
+
+
+describe('strict registration context compatibility', () => {
+  const one = testCase('one');
+  it('holds identical hooks that change registration order', () => {
+    const hooks = ['beforeEach(first);', 'beforeEach(second);'];
+    expect(removed(patch(path('big'), hooks.join('\n') + '\n' + suite([one]), suite([])),
+      patch(path('shard'), '', [...hooks].reverse().join('\n') + '\n' + suite([one])))).toHaveLength(1);
+  });
+  it('holds test-setting files renamed out of their sensitive path', () => {
+    const workflow = patch('.github/workflows/tests.yml', 'old', 'new')
+      .replace('b/.github/workflows/tests.yml', 'b/notes.yml');
+    expect(removed(source([one]), destination([one]), workflow)).toHaveLength(1);
+  });
+  it('accepts an unchanged test-local data const it and refuses calling it', () => {
+    const data = testCase('one', 'const it = lookup(); expect(it.status).toBe(1);');
+    expect(scan(source([data]), destination([data])).findings).toEqual([]);
+    const invoked = testCase('one', 'const it = lookup(); it(); expect(actual()).toBe(1);');
+    expect(removed(source([invoked]), destination([invoked]))).toHaveLength(1);
+  });
+});
+
+
+describe('unchanged mutable setup declarations', () => {
+  it('holds changed mutable setup beside a moved case', () => {
+    const one = testCase('one');
+    expect(removed(patch(path('big'), 'let enabled = true;\n' + suite([one]), suite([])),
+      patch(path('shard'), '', 'let enabled = false;\n' + suite([one])))).toHaveLength(1);
+  });
+});
+
+
+it('keeps extracted helper effects before importer effects in registration order', () => {
+  const one = testCase('one');
+  expect(removed(patch(path('big'), 'beforeEach(first);\nbeforeEach(second);\n' + suite([one]), suite([])),
+    patch(path('shard'), '', "import './helpers/world.mjs';\nbeforeEach(first);\n" + suite([one])),
+    patch('scripts/lib/__tests__/helpers/world.mjs', '', "import { beforeEach } from 'vitest';\nbeforeEach(second);"))).toHaveLength(1);
 });

@@ -4350,7 +4350,7 @@ export function computeNetDiffChangedFiles({ exec, remote = 'origin', base = 'ma
  *   pass it to share ONE fetch + candidate probe with `computeNetDiffChangedFiles` instead of resolving twice.
  * @returns {{text:string, base:string|null, rev:string|null, scored:boolean, reason?:'exec-contract'|'ref-unresolved'|'diff-failed'|'basis-mismatch'}}
  */
-export function computeNetDiffText({ exec, remote = 'origin', base = 'main', rev, fetchExtraRefs = [], basis: sharedBasis = null, pinRev = false } = {}) {
+export function computeNetDiffText({ exec, remote = 'origin', base = 'main', rev, fetchExtraRefs = [], basis: sharedBasis = null, pinRev = false, pinTrees = false } = {}) {
   const unscored = { text: '', base: null, rev: null, scored: false };
   if (typeof exec !== 'function' || !rev) return unscored;
   // #2890-review-r2 finding 1 — refuse a basis resolved for a DIFFERENT request rather than answering about the
@@ -4393,6 +4393,16 @@ export function computeNetDiffText({ exec, remote = 'origin', base = 'main', rev
     // Deliberately NOT `--text`: unlike the single-file write-time diff, this is a whole-PR diff and forcing
     // binary blobs into it would splat megabytes of asset bytes into the reviewer-facing text (see
     // `diff-hunks.mjs`, where `--text` is right precisely because the payload is one bounded file).
+    if (pinTrees) {
+      const resolve = (ref) => {
+        const sha = String(exec('git', ['rev-parse', '--verify', '--end-of-options', `${ref}^{commit}`],
+          { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }) || '').trim();
+        if (!/^[0-9a-f]{40}$/i.test(sha)) throw new Error('unresolved commit');
+        return sha;
+      };
+      diffBase = resolve(diffBase);
+      candidate = resolve(candidate);
+    }
     const text = String(exec('git', ['diff', '--no-ext-diff', '--end-of-options', diffBase, candidate], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }) || '');
     return { text, base: diffBase, rev: candidate, scored: true, ...(revSha ? { revSha } : {}) };
   } catch (err) {
@@ -4446,10 +4456,10 @@ export function readNetDiffAtHead({ exec, headSha, headRef = null, netDiff = com
  * @returns {{changedFiles:string[], diffLines:number, humanBasisFiles:string[], cumulativeDiffLines:number,
  *   scored:boolean, netDiffText:{text:string,scored:boolean,reason?:string}, diffHunks:string|null}}
  */
-export function computeNetDiffSignals({ exec, remote = 'origin', base = 'main', baseRev = null, rev, fetchExtraRefs = [] } = {}) {
+export function computeNetDiffSignals({ exec, remote = 'origin', base = 'main', baseRev = null, rev, fetchExtraRefs = [], pinTrees = false } = {}) {
   const basis = resolveNetDiffBasis({ exec, remote, base, rev, fetchExtraRefs });
   const net = computeNetDiffChangedFiles({ exec, remote, base, baseRev, rev, fetchExtraRefs, basis });
-  const netDiffText = computeNetDiffText({ exec, remote, base, rev, fetchExtraRefs, basis });
+  const netDiffText = computeNetDiffText({ exec, remote, base, rev, fetchExtraRefs, basis, pinTrees });
   return {
     changedFiles: net.changedFiles,
     diffLines: net.diffLines,
@@ -6506,7 +6516,7 @@ export async function main(argv, { env = process.env, stdout = process.stdout, e
       if (v.headRef && (isLocalRepo(v.repo) || escCwd)) {
         const exec = (cmd, args, opts) => execFileSync(cmd, args, { cwd: escCwd, ...opts });
         diffExec = exec;
-        const sig = computeNetDiffSignals({ exec, rev: v.headRef, baseRev: v.base, fetchExtraRefs: [v.headRef] });
+        const sig = computeNetDiffSignals({ exec, rev: v.headRef, baseRev: v.base, fetchExtraRefs: [v.headRef], pinTrees: true });
         changedFiles = sig.changedFiles;
         diffLines = sig.diffLines;
         humanBasisFiles = sig.humanBasisFiles;
@@ -6632,7 +6642,7 @@ export async function main(argv, { env = process.env, stdout = process.stdout, e
       // rather than re-fetched, so this scan and the escalation score can never disagree on what changed.
       const gaming = scanTestTampering({
         diffText: netDiffText.text,
-        readFile: diffExec && netDiffText.scored && netDiffText.base && netDiffText.rev
+        readFile: diffExec && netDiffText.scored && /^[0-9a-f]{40}$/i.test(netDiffText.base || '') && /^[0-9a-f]{40}$/i.test(netDiffText.rev || '')
           ? (path, side) => diffExec('git', ['show', '--no-ext-diff', '--end-of-options',
             `${side === 'base' ? netDiffText.base : netDiffText.rev}:${path}`],
           { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], maxBuffer: 1024 * 1024 })

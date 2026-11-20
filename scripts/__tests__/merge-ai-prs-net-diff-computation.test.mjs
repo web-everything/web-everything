@@ -968,3 +968,34 @@ describe('computeNetDiffPaths (#2901/#1031 — NET changed-file list as plain pa
     expect(calls.length).toBe(0);
   });
 });
+
+
+describe('move-credit commit pins', () => {
+  const baseSha = '1'.repeat(40), headSha = '2'.repeat(40);
+  function runner(badRef = '') {
+    const calls = [];
+    return { calls, exec: (cmd, args) => {
+      calls.push(args);
+      if (args[0] === 'fetch') return '';
+      if (args[0] === 'merge-base') return baseSha;
+      if (args[0] === 'rev-parse') return args.at(-1).includes(badRef || 'never-match') ? ''
+        : args.at(-1) === `${baseSha}^{commit}` ? baseSha : headSha;
+      if (args[0] === 'diff') return args.includes('--numstat') ? '1\t0\tfile.mjs\n' : 'pinned diff';
+      if (args[0] === 'log') return '';
+      throw new Error('unexpected Git read');
+    } };
+  }
+  it('resolves both sides to full commit SHAs before the diff consumed by move credit', () => {
+    const { calls, exec } = runner();
+    const result = computeNetDiffSignals({ exec, rev: 'lane/moving', pinTrees: true });
+    expect(result.netDiffText).toMatchObject({ base: baseSha, rev: headSha, text: 'pinned diff', scored: true });
+    const diff = calls.findIndex((a) => a[0] === 'diff' && !a.includes('--numstat'));
+    expect(calls[diff].slice(-2)).toEqual([baseSha, headSha]);
+    expect(calls.slice(0, diff).filter((a) => a[0] === 'rev-parse')).toHaveLength(2);
+  });
+  it.each(['origin/lane/moving', baseSha])('refuses move evidence when commit pin is unreadable: %s', (badRef) => {
+    const { calls, exec } = runner(badRef);
+    expect(computeNetDiffSignals({ exec, rev: 'lane/moving', pinTrees: true }).netDiffText.scored).toBe(false);
+    expect(calls.some((a) => a[0] === 'diff' && !a.includes('--numstat'))).toBe(false);
+  });
+});
