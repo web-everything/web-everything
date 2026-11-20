@@ -45,6 +45,8 @@ function fixture(options = {}) {
   const calls = [], records = [], readyWrites = [], sleeps = [], reads = [], cloneRoots = [];
   let clock = 0;
   let remoteTip = candidateSha;
+  // Being behind main does not imply a merge was published (urgent conflict loads keep the receipt SHA).
+  let publishedSha = candidateSha;
   let tipReads = 0;
   let establishedAdvanced = false;
   const lateChanges = [];
@@ -162,7 +164,7 @@ function fixture(options = {}) {
         if (args.at(-1) === 'HEAD^{commit}') return options.badHead ? fail(1) : SHA;
         return options.missingCandidate ? fail(1, '', '') : SHA;
       }
-      expect(args.slice(2)).toEqual(['merge-base', '--is-ancestor', options.behind ? MERGE : candidateSha, 'HEAD']);
+      expect(args.slice(2)).toEqual(['merge-base', '--is-ancestor', publishedSha, 'HEAD']);
       if (options.missingCandidate && (options.missingForever || sleeps.length === 0)) return fail(128, '', 'Not a valid commit name');
       if (options.adoptionError) return fail(options.adoptionError);
       return options.timeout ? fail(1) : '';
@@ -251,7 +253,7 @@ function fixture(options = {}) {
       return options.remote || '';
     }
     if (args[0] === 'commit-tree') return MERGE;
-    if (args[0] === 'push') { remoteTip = MERGE; return ''; }
+    if (args[0] === 'push') { remoteTip = publishedSha = MERGE; return ''; }
     throw new Error(`unexpected command ${cmd} ${args}`);
   };
   const combinedTest = vi.fn(async (input) => typeof options.combinedTest === 'function'
@@ -3311,7 +3313,8 @@ describe('default test check-run reader (production wiring)', () => {
   const REPO_SLUG = 'web-everything/web-everything';
   const run = (o = {}) => ({ id: 1, head_sha: SHA, name: 'test', status: 'completed', conclusion: 'success', app: { id: 15368 }, check_suite: { id: 7 }, ...o });
   const wf = (o = {}) => ({ check_suite_id: 7, head_sha: SHA, path: '.github/workflows/ci.yml', ...o });
-  function ghFixture({ checks = { total_count: 1, check_runs: [run()] }, runs = { total_count: 1, workflow_runs: [wf()] }, fail = null, checksRaw, runsRaw, repositoryRaw, ...options } = {}) {
+  const conflictPr = { number: 42, state: 'open', head: { sha: SHA, ref: BASE.branch, repo: { full_name: REPO_SLUG } }, mergeable_state: 'dirty', mergeable: false };
+  function ghFixture({ checks = { total_count: 1, check_runs: [run()] }, runs = { total_count: 1, workflow_runs: [wf()] }, fail = null, checksRaw, runsRaw, repositoryRaw, pr = null, listedPr = pr, ...options } = {}) {
     const gh = [];
     const combinedIO = { fs: {},
       handles: (cmd, args) => cmd === 'gh' || (cmd === 'git' && args[0] === 'remote' && args[1] === 'get-url'),
@@ -3320,6 +3323,8 @@ describe('default test check-run reader (production wiring)', () => {
         gh.push(args.join(' '));
         const bad = () => { throw Object.assign(new Error('gh: HTTP 500'), { status: 1, stdout: '', stderr: 'HTTP 500' }); };
         if (args[0] === 'repo' && args[1] === 'view') return fail === 'repo' ? bad() : repositoryRaw ?? JSON.stringify({ nameWithOwner: REPO_SLUG, url: `https://github.com/${REPO_SLUG}` });
+        if (args[1]?.includes('/pulls?')) return JSON.stringify(listedPr ? [listedPr] : []);
+        if (args[1]?.endsWith('/pulls/42')) return fail === 'mergeability' ? bad() : JSON.stringify(pr);
         if (args[0] === 'api' && args[1].includes('/check-runs') && fail === 'overflow') throw Object.assign(new Error('maxBuffer exceeded'), { code: 'ENOBUFS' });
         if (args[0] === 'api' && args[1].includes('/check-runs')) return fail === 'checks' ? bad() : checksRaw ?? JSON.stringify(checks);
         if (args[0] === 'api' && args[1].includes('/actions/runs')) return fail === 'runs' ? bad() : runsRaw ?? JSON.stringify(runs);
@@ -3349,6 +3354,80 @@ describe('default test check-run reader (production wiring)', () => {
     const marker = { sha: SHA, fuiSha: SHA, fuiRepo: 'https://github.com/frontier-ui/frontierui', suite: 'full', shards: 1, result: 'green', startedAt: new Date(-2000).toISOString(), finishedAt: new Date(-1000).toISOString(), host: 'test-host', repo: `https://github.com/${REPO_SLUG}`, steps: ['fetch-main-history', 'install-fui', 'install', 'unit:unit:1/1', 'coverage', 'hostPaths', 'integration', 'standards'] };
     return JSON.stringify({ ...marker, sig: urgentSignature(marker, urgentKey) });
   };
+  it.each([
+    ['dirty', conflictPr],
+    ['mergeable false', { ...conflictPr, mergeable_state: 'blocked' }],
+  ])('loads a conflicting exact head with a signed receipt (%s) and records conflict evidence', async (_, pr) => {
+    const f = ghFixture({ pr, urgentLedger: urgentReceipt(), checks: { total_count: 0, check_runs: [] } });
+    expect(await f.run({ urgent: true, reason: 'Critical daemon repair' })).toMatchObject({ ok: true });
+    expect(f.readyWrites.at(-1).testCheck).toMatchObject({ source: 'urgent-local-full', conflict: true });
+    expect(f.records).toContainEqual(expect.objectContaining({ type: 'prototype-load.urgent', conflict: { pr: 42, mergeableState: pr.mergeable_state } }));
+    expect(f.gh).toContain(`api repos/${REPO_SLUG}/pulls?head=web-everything%3Alane%2Fnew&state=open&per_page=2 --hostname github.com`);
+  });
+  it.each([false, true])('admits the receipt-bound conflicting head behind main without synthesizing a merge (dry run: %s)', async dryRun => {
+    const f = ghFixture({ pr: conflictPr, urgentLedger: urgentReceipt(), checks: { total_count: 0, check_runs: [] },
+      behind: true, mergeConflict: true, diff: 'M\0x\0D\0main-only.mjs\0' });
+    const result = await f.run({ urgent: true, reason: 'Critical daemon repair', dryRun });
+    expect(result).toMatchObject({ ok: true, effectiveRef: BASE.branch, effectiveSha: SHA,
+      mainCheck: { contains: false, own: ['x'], effectivePaths: ['x'] } });
+    expect(result.wouldMerge).toBeUndefined();
+    expect(f.calls.some(c => ['commit-tree', 'push'].includes(c.args[0]))).toBe(false);
+    expect(f.calls.some(c => c.cmd === 'node' && c.args.includes('--check'))).toBe(true);
+    expect(mutations(f, 'add')).toHaveLength(dryRun ? 0 : 1);
+    if (!dryRun) {
+      expect(result.adopted).toBe(true);
+      expect(f.calls).toContainEqual(expect.objectContaining({ cmd: 'git',
+        args: ['-C', result.clone, 'merge-base', '--is-ancestor', SHA, 'HEAD'] }));
+      expect(f.readyWrites.at(-1).testCheck).toMatchObject({ source: 'urgent-local-full', conflict: true });
+      expect(f.records).toContainEqual(expect.objectContaining({ type: 'prototype-load.urgent',
+        registration: { clone: expect.any(String), ref: BASE.branch, sha: SHA },
+        conflict: { pr: 42, mergeableState: 'dirty' } }));
+    }
+  });
+
+  it('still refuses a receipt-bound main conflict when the target overlay conflicts', async () => {
+    const f = ghFixture({ pr: conflictPr, urgentLedger: urgentReceipt(), checks: { total_count: 0, check_runs: [] },
+      behind: true, mergeConflict: true, conflicts: [BASE.branch] });
+    expect(await f.run({ urgent: true, reason: 'Critical daemon repair' })).toMatchObject({ ok: false, stopReason: 'check-conflict' });
+    expect(mutations(f, 'add')).toHaveLength(0);
+  });
+
+  it('does not bypass the main conflict guard on passing CI alone', async () => {
+    const f = ghFixture({ pr: conflictPr, behind: true, mergeConflict: true });
+    expect(await f.run({ urgent: true, reason: 'Critical daemon repair' })).toMatchObject({ ok: false, stopReason: 'behind-main-conflict' });
+    expect(mutations(f, 'add')).toHaveLength(0);
+  });
+
+  it.each([
+    ['unknown', { pr: { ...conflictPr, mergeable_state: 'unknown', mergeable: null } }],
+    ['missing', { pr: { ...conflictPr, mergeable_state: undefined, mergeable: undefined } }],
+    ['unreadable', { pr: conflictPr, fail: 'mergeability' }],
+    ['list head mismatch', { pr: conflictPr, listedPr: { ...conflictPr, head: { ...conflictPr.head, sha: TREE } } }],
+    ['detail head mismatch', { listedPr: conflictPr, pr: { ...conflictPr, head: { ...conflictPr.head, sha: TREE } } }],
+  ])('keeps existing urgent rules without the conflict exception for %s mergeability', async (_, options) => {
+    // Existing rule (receipt fallback only when the CI API is unreachable): a missing test check still refuses.
+    const f = ghFixture({ ...options, urgentLedger: urgentReceipt(), checks: { total_count: 0, check_runs: [] } });
+    expect(await f.run({ urgent: true, reason: 'Critical daemon repair' })).toMatchObject({ ok: false, detail: 'ci-test-check-missing' });
+    expect(f.readyWrites).toEqual([]); expect(mutations(f, 'add')).toHaveLength(0);
+  });
+  it('refuses a conflicting head without a valid receipt and still vetoes completed CI failure', async () => {
+    const missing = ghFixture({ pr: conflictPr, checks: { total_count: 0, check_runs: [] } });
+    expect(await missing.run({ urgent: true, reason: 'Critical daemon repair' })).toMatchObject({ ok: false, detail: 'no-urgent-marker' });
+    const failed = ghFixture({ pr: conflictPr, urgentLedger: urgentReceipt(), checks: { total_count: 1, check_runs: [run({ conclusion: 'failure' })] } });
+    expect(await failed.run({ urgent: true, reason: 'Critical daemon repair' })).toMatchObject({ ok: false, detail: 'ci-failed-urgent' });
+    expect(mutations(failed, 'add')).toHaveLength(0);
+  });
+  // The conflict exemption covers only "no check named test at all"; every other CI refusal still stops a conflicting head.
+  it.each([
+    ['a foreign-app test check', { checks: { total_count: 1, check_runs: [run({ app: { id: 999 } })] } }, 'ci-test-check-missing'],
+    ['an unbound workflow', { runs: { total_count: 1, workflow_runs: [wf({ path: '.github/workflows/other.yml' })] } }, 'ci-workflow-unbound'],
+    ['incomplete checks', { checks: { total_count: 2, check_runs: [run()] } }, 'ci-checks-unreadable'],
+    ['an unreadable checks API', { fail: 'checks' }, 'ci-checks-unreadable'],
+  ])('still refuses a conflicting head with a valid receipt on %s', async (_, options, detail) => {
+    const f = ghFixture({ pr: conflictPr, urgentLedger: urgentReceipt(), ...options });
+    expect(await f.run({ urgent: true, reason: 'Critical daemon repair' })).toMatchObject({ ok: false, detail });
+    expect(f.readyWrites).toEqual([]); expect(mutations(f, 'add')).toHaveLength(0);
+  });
   it.each(['failure', 'cancelled', 'timed_out', 'action_required', 'startup_failure'])(
     'urgent refuses a pending suite plus another suite completed with %s', async conclusion => {
       const f = ghFixture({ urgentLedger: urgentReceipt(), checks: { total_count: 2, check_runs: [
