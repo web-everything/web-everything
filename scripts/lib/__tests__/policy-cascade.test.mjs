@@ -300,10 +300,10 @@ describe('operator-db capacity layer above environment (R907/R915)', () => {
     expect(r.sources.maxLiveReviewRounds).toBe('operator-db');
     expect(formatCascadeSourcesLine('reviewConcurrency', r)).toContain('maxLiveReviewRounds=5 (operator-db)');
   });
-  it('invalid operator override fails closed instead of accepting a looser env cap', () => {
+  it('invalid operator leaf falls back to the valid env cap', () => {
     const r = resolveCascade({ ...layers, operatorOverride: { maxLiveReviewRounds: 'bad' } });
-    expect(r.value.maxLiveReviewRounds).toBe(1);
-    expect(r.sources.maxLiveReviewRounds).toBe('standard');
+    expect(r.value.maxLiveReviewRounds).toBe(4);
+    expect(r.sources.maxLiveReviewRounds).toBe('env');
     expect(r.invalid).toContain('operator-db.maxLiveReviewRounds="bad"');
   });
   it('no operator layer preserves the full existing result', () => {
@@ -416,7 +416,7 @@ describe('R907 malformed review capacity evidence', () => {
     ['below hard floor', 'reviewConcurrency.maxLiveReviewRounds', 0],
     ['unknown key', 'reviewConcurrency.unknown', 1],
     ['non-allowlisted guard', 'reviewConcurrency.enabled', false],
-  ])('%s fails closed for both cascade results and daemon budget', (_label, key, value) => {
+  ])('%s drops only the bad key for both cascade results and daemon budget', (_label, key, value) => {
     const path = file({ [key]: value });
     operatorEnv(path);
     const log = vi.fn();
@@ -424,13 +424,13 @@ describe('R907 malformed review capacity evidence', () => {
       const r = cascadePolicy('reviewConcurrency', { maxLiveReviewRounds: configured }, {
         standard: { maxLiveReviewRounds: 3 }, platform: null, env: {}, log,
       });
-      const expected = configured === 1 ? 1 : 3;
+      const expected = configured;
       expect(r.value.maxLiveReviewRounds).toBe(expected);
       expect(r.layered.maxLiveReviewRounds).toBe(expected);
     }
     const budget = liveReviewRoundBudget({ env: { WE_REVIEW_MAX_LIVE_ROUNDS: '8' },
       listCommands: () => '', toolPath: file({ maxLiveReviewRounds: 8 }) });
-    expect(budget).toMatchObject({ max: 3, live: 0, left: 3 });
+    expect(budget).toMatchObject({ max: 8, live: 0, left: 8 });
     expect(log.mock.calls.flat().join(' ')).toMatch(/operator-db-(unreadable|invalid)/);
   });
   it('R907 ignores a caller-supplied env store path without a file seam', () => {

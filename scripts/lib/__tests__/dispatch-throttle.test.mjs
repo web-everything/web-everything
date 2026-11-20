@@ -12,13 +12,13 @@ import { runReconcileCiHealDispatch } from '../../operations/ci-heal-pr-dispatch
 const claim = (kind, pr) => ({ meta: { kind, pr, repo: 'we' } });
 
 describe('declared settings', () => {
-  it('defaults: fix cap 2, 2.0 load/core, heavy cap 3; env overrides; junk falls back', () => {
-    expect(resolveFixDispatchMaxConcurrent({ env: {} })).toBe(2);
+  it('defaults: fix cap 6, 2.0 load/core, heavy cap 3; env overrides; junk falls back', () => {
+    expect(resolveFixDispatchMaxConcurrent({ env: {} })).toBe(6);
     expect(resolveMaxLoadPerCore({ env: {} })).toBe(2);
     expect(resolveHeavyAdmissionCap({ env: {} })).toBe(3);
     expect(resolveFixDispatchMaxConcurrent({ env: { WE_FIX_DISPATCH_MAX_CONCURRENT: '4' } })).toBe(4);
     expect(resolveMaxLoadPerCore({ env: { WE_MAX_LOAD_PER_CORE: '1.5' } })).toBe(1.5);
-    expect(resolveFixDispatchMaxConcurrent({ env: { WE_FIX_DISPATCH_MAX_CONCURRENT: '0' } })).toBe(2);
+    expect(resolveFixDispatchMaxConcurrent({ env: { WE_FIX_DISPATCH_MAX_CONCURRENT: '0' } })).toBe(6);
     expect(resolveMaxLoadPerCore({ env: { WE_MAX_LOAD_PER_CORE: 'x' } })).toBe(2);
   });
   it('heavy cap resolves from the declared file, env still wins', () => {
@@ -41,7 +41,7 @@ describe('createDispatchThrottle', () => {
     expect(countLiveFixSessions([claim('fix', 1), claim('ci-heal', 2), claim('fixing', 3), claim('build', 4)])).toBe(2);
   });
   it('refuses fix-cap at the cap, counting launches admitted in the same pass', () => {
-    const t = createDispatchThrottle({ ...idle, env: {}, listClaims: () => [claim('fix', 1)] });
+    const t = createDispatchThrottle({ ...idle, env: { WE_FIX_DISPATCH_MAX_CONCURRENT: '2' }, listClaims: () => [claim('fix', 1)] });
     expect(t.tryAdmit('fix').admit).toBe(true);
     expect(t.tryAdmit('ci-heal')).toMatchObject({ admit: false, kind: 'fix-cap' });
   });
@@ -53,7 +53,7 @@ describe('createDispatchThrottle', () => {
 
 describe('wired into the dispatchers', () => {
   const hot = () => createDispatchThrottle({ sample: () => ({ ok: false }), loadavg: () => 36, cpuCount: () => 12, env: {}, listClaims: () => [] });
-  const full = () => createDispatchThrottle({ sample: () => ({ ok: false }), loadavg: () => 1, cpuCount: () => 12, env: {}, listClaims: () => [claim('fix', 1), claim('ci-heal', 2)] });
+  const full = () => createDispatchThrottle({ sample: () => ({ ok: false }), loadavg: () => 1, cpuCount: () => 12, env: { WE_FIX_DISPATCH_MAX_CONCURRENT: '2' }, listClaims: () => [claim('fix', 1), claim('ci-heal', 2)] });
   it('fix dispatch defers with fix-cap / host-load and never dispatches', () => {
     for (const [mk, kind] of [[full, 'fix-cap'], [hot, 'host-load']]) {
       const dispatch = vi.fn();

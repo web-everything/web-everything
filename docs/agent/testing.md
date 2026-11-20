@@ -5528,3 +5528,20 @@ Park opens ready for review; draft-promotion still handles older drafts.
 Check mode fetches origin main before evaluating canonical audit evidence. A failed fetch reports
 `main not refreshed: <reason>` and refuses even when local evidence would pass against stale refs.
 `open-pr-audit-gate.test.mjs` covers both refresh outcomes, aggregation and an unconfirmed check child.
+
+
+## Instant capacity settings (R1103)
+
+`instant-capacity-settings.test.mjs` tests every new operator capacity leaf through its real
+consumer, including endpoint writes, oversized/type rejection, live rereads and invalid/missing/
+unreadable-store fallback. Instant leaves retain their bounded lower setting; existing
+unreadable-store safety holds remain separate. Unknown or invalid JSON leaves are warned and
+dropped individually, never allowed to erase valid siblings. The reader accepts nested objects
+and dotted keys, refuses unsafe path segments, and the writer publishes canonical dotted keys.
+Policy readers must identify capacity bounds by the full policy key: short names such as `cap`
+are shared by several policies. Never memoize the operator layer for a long-running daemon.
+R1103 heavy-admission cap/fastSlots resolve operator → env → file → platform → built-in,
+including the shared pool. Other shared-pool policies retain host-owned platform authority.
+Forge's flat deployment must ship the builtin-only operator reader beside `forge-slots.mjs`.
+The no-Node Python bootstrap also reads the two Forge leaves with the same 1..128 bound;
+its subprocess fixtures redirect the account-home lookup in the copied script, never in production.

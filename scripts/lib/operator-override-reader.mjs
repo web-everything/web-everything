@@ -5,12 +5,40 @@ import { dirname, join } from 'node:path';
 
 // A stored expiry beyond the cap is refused at write time and read time, so the generic setter cannot bypass 72h.
 const epochMs = v => Number.isSafeInteger(v) && v > 0 && v <= Date.now() + 72 * 3600000;
+const number = (min, max) => v => Number.isFinite(v) && v >= min && v <= max;
 const integer = (min, max) => v => Number.isInteger(v) && v >= min && v <= max;
+// Instant settings retain the bounded lower layer when operator evidence is unavailable.
+const instant = (min, max, fallback, direction = 'cap', validate = integer) =>
+  Object.freeze({ ...capacityLeaf(validate(min, max), direction, fallback), fallbackToLower: true });
 const capacityLeaf = (validate, direction, failClosedFallback) => Object.freeze({ validate, direction, failClosedFallback });
 // R1040/R1045: pure capacity raises are accepted up to these hard bounds; lowering stays allowed.
 // These are operator limits, not defaults or fail-closed fallbacks, and grant no guard-leaf authority.
 export const OPERATOR_CAPACITY_MAX = Object.freeze({ fix: 24, review: 16, redTeam: 24 });
 export const CAPACITY_LEAVES = Object.freeze({
+  'ciHeal.reserve': instant(0, 24, 6),
+  'lanes.maxConcurrent': instant(1, 48, 12),
+  'resourceGate.fixCap.raiseQueueOver': instant(0, 100, 5, 'threshold'),
+  'resourceGate.fixCap.raiseStepPerPass': instant(1, 24, 2),
+  'resourceGate.fixCap.raiseMaxSwapUsedPct': instant(0, 200, 60, 'cap', number),
+  'resourceGate.fixCap.raiseMaxHeavyWaitMinutes': instant(0, 120, 15, 'cap', number),
+  'redTeam.queue.cap': instant(0, 24, 12),
+  'redTeam.queue.minConcurrentIdlePct': instant(0, 100, 10, 'threshold'),
+  'redTeam.queue.reviewStartsPerTickWhileIdle': instant(0, 24, 0),
+  'heavyAdmission.cap': instant(1, 32, 2),
+  'heavyAdmission.fastSlots': instant(0, 16, 1),
+  'deliveryCapacity.openPrCap': instant(1, 200, 18),
+  'deliveryCapacity.maxStartsPerCheck': instant(0, 48, 8),
+  'deliveryCapacity.softOverCapStarts': instant(0, 24, 2),
+  'reviewSeats.codex': instant(0, 10000, 80),
+  'reviewSeats.agy-claude': instant(0, 10000, 300),
+  'reviewSeats.agy-gemini': instant(0, 10000, 0),
+  'reviewSeats.extraSeatsDailyCap': instant(0, 10000, 40),
+  'forgeSlots.forge': instant(1, 128, 14),
+  'forgeSlots.forge-b': instant(1, 128, 8),
+  'ghThrottle.cap': instant(1, 50, 6),
+  'ghThrottle.perCallerMax': instant(1, 50, 4),
+  'fixDispatchMaxConcurrent': instant(1, 16, 6),
+
   'reviewConcurrency.maxLiveReviewRounds': capacityLeaf(integer(1, OPERATOR_CAPACITY_MAX.review), 'cap', 3),
   'host.maxReviewDispatchPerTick': capacityLeaf(integer(1, OPERATOR_CAPACITY_MAX.review), 'cap', 2),
   'fix.conflictFixesPerPass': capacityLeaf(integer(0, OPERATOR_CAPACITY_MAX.fix), 'cap', 1),
@@ -72,16 +100,25 @@ export function readOperatorOverrides({ file, log = console.error, normalize = t
   }
   const values = {};
   const invalidPolicies = new Set();
-  for (const [key, value] of Object.entries(data)) {
+  // Accept both canonical dotted writer output and nested operator-authored JSON.
+  // Never expand unsafe segments, or recurse into an object supplied as a known numeric leaf.
+  function* entries(object, prefix = '') {
+    for (const [part, value] of Object.entries(object)) {
+      const key = prefix ? `${prefix}.${part}` : part;
+      const unsafe = key.split('.').some(k => ['__proto__', 'constructor', 'prototype'].includes(k));
+      if (!unsafe && !Object.hasOwn(CAPACITY_LEAVES, key) && value && typeof value === 'object' && !Array.isArray(value)) {
+        if (Object.keys(value).length) yield* entries(value, key);
+        else yield [key, value];
+      } else yield [key, value];
+    }
+  }
+  for (const [key, value] of entries(data)) {
     const known = Object.hasOwn(CAPACITY_LEAVES, key);
     if (!known || !CAPACITY_LEAVES[key].validate(value)) {
       const policy = key.split('.')[0];
       invalidPolicies.add(policy);
-      warn(log, `operator-override: operator-db-invalid ${key} (${known ? 'invalid type or outside hard range' : 'guard leaves need the signed-attestation slice'}); repair the store before using this policy`);
+      warn(log, `operator-override: operator-db-invalid ${key} (${known ? 'invalid type or outside hard range' : 'guard leaves need the signed-attestation slice'}); dropping this key and retaining valid leaves`);
     } else values[key] = value;
-  }
-  for (const key of Object.keys(values)) {
-    if (invalidPolicies.has('*') || invalidPolicies.has(key.split('.')[0])) delete values[key];
   }
   if (normalize && values['resourceGate.fixCap.ceiling'] < values['resourceGate.fixCap.floor']) {
     values['resourceGate.fixCap.floor'] = values['resourceGate.fixCap.ceiling'];

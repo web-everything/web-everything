@@ -40,13 +40,13 @@ describe('lock-free operator override reader', () => {
     expect(CAPACITY_LEAVES[key]).toMatchObject({ direction: 'cap', failClosedFallback: 1 });
   });
 
-  it.each([11, 24])('rejects persisted exemption %i and invalidates the whole fix policy', value => {
+  it.each([11, 24])('rejects persisted exemption %i without erasing a valid fix sibling', value => {
     writeFileSync(file, JSON.stringify({
       'fix.conflictFixesPerPass': 24,
       'fix.conflictFixExemptPerPass': value,
     }));
     expect(readOperatorOverrides({ file, log: () => {} })).toEqual({
-      readable: true, values: {}, invalidPolicies: ['fix'],
+      readable: true, values: { 'fix.conflictFixesPerPass': 24 }, invalidPolicies: ['fix'],
     });
   });
 
@@ -88,14 +88,14 @@ describe('lock-free operator override reader', () => {
     }
   });
 
-  it('rejects oversized capacity values and invalidates their whole policy', () => {
+  it('drops oversized capacity values and retains valid policy siblings', () => {
     writeFileSync(file, JSON.stringify({
       'resourceGate.fixCap.floor': 2,
       'resourceGate.fixCap.ceiling': 25,
       'host.maxReviewDispatchPerTick': 3,
     }));
     expect(readOperatorOverrides({ file, log: () => {} })).toEqual({
-      readable: true, values: { 'host.maxReviewDispatchPerTick': 3 }, invalidPolicies: ['resourceGate'],
+      readable: true, values: { 'resourceGate.fixCap.floor': 2, 'host.maxReviewDispatchPerTick': 3 }, invalidPolicies: ['resourceGate'],
     });
   });
 
@@ -108,7 +108,7 @@ describe('lock-free operator override reader', () => {
     }));
     expect(readOperatorOverrides({ file, log: () => {} })).toEqual({
       readable: true,
-      values: { 'resourceGate.fixCap.floor': 3, 'resourceGate.fixCap.ceiling': 3 },
+      values: { 'reviewConcurrency.maxLiveReviewRounds': 2, 'resourceGate.fixCap.floor': 3, 'resourceGate.fixCap.ceiling': 3 },
       invalidPolicies: ['reviewConcurrency'],
     });
   });

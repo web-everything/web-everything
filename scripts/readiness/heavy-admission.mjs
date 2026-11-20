@@ -144,6 +144,8 @@
  *     slots, but full suites cannot take fast slots. Fast capacity can scale with short-kind demand when a
  *     fresh resource snapshot permits it. Status and release scan every slot that scaling may hand out.
  */
+import { CAPACITY_LEAVES } from '../lib/operator-override-reader.mjs';
+import { resolveCapacityLeaf } from '../lib/policy-cascade.mjs';
 import '../lib/tools-root-guard.mjs';
 import { pinDeveloperDir } from '../lib/lane-git-hardening.mjs';
 pinDeveloperDir();
@@ -277,7 +279,7 @@ export const RUN_WAIT_HOST_POLL_MS = 5_000;
 const ADMISSION_MAX_SLOTS = 256;
 const admissionInt = (min) => (v) => Number.isInteger(v) && v >= min && v <= ADMISSION_MAX_SLOTS;
 const ADMISSION_VALID = {
-  cap: admissionInt(1), fastSlots: admissionInt(0), onTimeout: (v) => v === 'defer' || v === 'run',
+  cap: CAPACITY_LEAVES['heavyAdmission.cap'].validate, fastSlots: CAPACITY_LEAVES['heavyAdmission.fastSlots'].validate, onTimeout: (v) => v === 'defer' || v === 'run',
   runWaitMs: (v) => isValidRunWaitMs(v),
   wholeSuite: (v) => v === 'refuse' || v === 'allow',
   'fastScale.maxSlots': (v) => v === null || admissionInt(0)(v),
@@ -374,7 +376,8 @@ export function privateAdmissionPool(env, checkoutRoot) {
 
 /**
  * PURE: valid leaves override standard → platform → tool → env. Capacity and priority (everything but onTimeout) of
- * the shared host pool come from standard → platform only: process env and checkout-local tool settings would
+ * the shared host pool come from standard → platform only, except R1103 cap/fastSlots (operator → env → file):
+ * process env and checkout-local tool settings for other pool policies would
  * give two callers of one pool different caps or queue ordering. A private pool (see {@link privateAdmissionPool})
  * keeps both local override layers, except remote.clientPath and remote.manifest are always platform-only.
  */
@@ -404,7 +407,7 @@ export function resolveAdmissionPolicy({ platform, tool, env = {}, checkoutRoot 
         ignored.push(`tool.${leaf}=${clientPathForLog(v)} (only platform preferences may select executable client code)`);
         continue;
       }
-      if (layer === 'tool' && !PER_CALLER_LEAVES.has(leaf) && !isPrivate) {
+      if (layer === 'tool' && !['cap', 'fastSlots'].includes(leaf) && !PER_CALLER_LEAVES.has(leaf) && !isPrivate) {
         ignored.push(`tool.${leaf}=${oneLine(JSON.stringify(v))} (checkout-local settings would diverge from the shared host pool; set heavyAdmission.${leaf} in platform-preferences)`);
         continue;
       }
@@ -424,7 +427,7 @@ export function resolveAdmissionPolicy({ platform, tool, env = {}, checkoutRoot 
     const name = ADMISSION_ENV[leaf];
     const raw = name ? env[name] : undefined;
     if (raw !== undefined) {
-      if (!PER_CALLER_LEAVES.has(leaf) && !isPrivate) {
+      if (!['cap', 'fastSlots'].includes(leaf) && !PER_CALLER_LEAVES.has(leaf) && !isPrivate) {
         ignored.push(`env ${name}=${oneLine(raw)} (a per-process value would diverge from the shared host pool; set heavyAdmission.${leaf} in platform-preferences)`);
       } else {
         const v = parseAdmissionEnv(leaf, raw);
@@ -435,6 +438,11 @@ export function resolveAdmissionPolicy({ platform, tool, env = {}, checkoutRoot 
     const keys = leaf.split('.');
     const target = keys.slice(0, -1).reduce((v, key) => v[key], settings);
     target[keys.at(-1)] = value;
+  }
+  for (const leaf of ['cap', 'fastSlots']) {
+    const resolved = resolveCapacityLeaf(`heavyAdmission.${leaf}`, { standard: settings[leaf], env });
+    settings[leaf] = resolved.value;
+    if (resolved.source === 'operator-db') sources[leaf] = resolved.source;
   }
   if (invalidPlatformManifest) {
     settings.remote.enabled = false;

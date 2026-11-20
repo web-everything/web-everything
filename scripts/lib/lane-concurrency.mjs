@@ -30,12 +30,12 @@
  * at 182% CPU during the incident) without assuming every lane is CPU-idle. Overridable per machine via
  * `WE_MAX_CONCURRENT_LANES`.
  *
- * PURE. No fs, no clock, no process beyond reading the injected `env` object — safe to import from either
- * module's pure core, not just its IO shell.
+ * Settings IO reads the host override on every resolution; capToConcurrency remains pure.
  */
 
-/** Conservative default — see the file header for the reasoning behind 8 on the host. */
-export const DEFAULT_MAX_CONCURRENT_LANES = 8;
+/** Conservative default — see the file header for the host capacity policy. */
+import { resolveCapacityLeaf } from './policy-cascade.mjs';
+export const DEFAULT_MAX_CONCURRENT_LANES = 12;
 
 /** The env var a machine overrides the default with (mirrors `WE_HEAVY_ADMISSION_CAP`). */
 export const MAX_CONCURRENT_LANES_ENV = 'WE_MAX_CONCURRENT_LANES';
@@ -51,7 +51,8 @@ export const MAX_CONCURRENT_LANES_ENV = 'WE_MAX_CONCURRENT_LANES';
  */
 export function resolveMaxConcurrentLanes(env = process.env) {
   const n = Number(env?.[MAX_CONCURRENT_LANES_ENV]);
-  return Number.isFinite(n) && n >= 1 ? Math.floor(n) : DEFAULT_MAX_CONCURRENT_LANES;
+  return resolveCapacityLeaf('lanes.maxConcurrent', { standard: DEFAULT_MAX_CONCURRENT_LANES, env,
+    envValue: Number.isFinite(n) && n >= 1 ? Math.floor(n) : undefined }).value;
 }
 
 /**

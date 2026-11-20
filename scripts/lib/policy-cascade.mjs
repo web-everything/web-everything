@@ -122,7 +122,7 @@ function setLeaf(obj, parts, value) {
  * @returns {{value:unknown, sources:Record<string,string>, leafValues:Record<string,unknown>, invalid:string[]}}
  *   `sources` names the layer of every effective leaf, keyed by its dotted path ('' for a scalar policy).
  */
-export function resolveCascade({ standard, platform, tool, envValues = {}, valid = {}, operatorOverride, capacityLeaves, log = console.error } = {}) {
+export function resolveCascade({ standard, platform, tool, envValues = {}, valid = {}, operatorOverride, capacityLeaves, capacitySpecs = {}, log = console.error } = {}) {
   const check = (path, v) => (typeof valid === 'function' ? valid(v) : ((valid?.[path.join('.')] ?? valid?.[path[0]])?.(v) ?? true));
   const eff = new Map();
   const at = (path) => (path.length ? `.${path.join('.')}` : '');
@@ -157,9 +157,9 @@ export function resolveCascade({ standard, platform, tool, envValues = {}, valid
   const defaults = leaves(standard);
   const paths = capacityLeaves ?? [...defaults.values()].map(({ path }) => path.join('.')).filter(leaf =>
     Object.keys(CAPACITY_LEAVES).some(key => (key === leaf || key.endsWith(`.${leaf}`))));
-  const specKeyFor = leaf => Object.keys(CAPACITY_LEAVES).find(key => key === leaf || key.endsWith(`.${leaf}`));
+  const specKeyFor = leaf => capacitySpecs[leaf] ?? (Object.hasOwn(CAPACITY_LEAVES, leaf) ? leaf
+    : Object.keys(CAPACITY_LEAVES).find(key => key.endsWith(`.${leaf}`)));
   const operatorEntries = [];
-  let operatorInvalid = operatorOverride !== undefined && operatorOverride !== null && !isObj(operatorOverride);
   for (const { path: rawPath, v } of leaves(operatorOverride ?? undefined).values()) {
     // Preserve dotted schema keys used by flat readers; otherwise expand dotted override paths.
     const path = rawPath.flatMap(k => k.split('.'));
@@ -168,18 +168,17 @@ export function resolveCascade({ standard, platform, tool, envValues = {}, valid
     const specKey = specKeyFor(flat);
     if (actual.some(k => UNSAFE.has(k)) || !paths.includes(flat) || !specKey || !CAPACITY_LEAVES[specKey].validate(v) || !check(actual, v)) {
       invalid.push(`operator-db${at(actual)}=${JSON.stringify(v)}`);
-      operatorInvalid = true;
       continue;
     }
     operatorEntries.push({ actual, v });
   }
-  if (!operatorInvalid) for (const { actual, v } of operatorEntries) {
+  for (const { actual, v } of operatorEntries) {
     eff.set(actual.join(SEP), { path: actual, v, layer: 'operator-db' });
   }
-  if (operatorOverride === null || operatorInvalid) {
+  if (operatorOverride === null) {
     for (const leaf of paths) {
       const specKey = specKeyFor(leaf);
-      if (!specKey) continue;
+      if (!specKey || CAPACITY_LEAVES[specKey].fallbackToLower) continue;
       const path = eff.has(leaf) ? [leaf] : leaf.split('.');
       const key = path.join(SEP);
       const entry = eff.get(key);
@@ -258,19 +257,20 @@ export function cascadePolicy(policy, tool, { standard, envValues, valid, platfo
   if (plat === undefined) { try { plat = platformPreference(policy, { env }); } catch { plat = undefined; } }
   if (operatorOverride === undefined) operatorOverride = readOperatorPolicy(policy, { env, log });
   const capacityLeaves = capacityPolicyLeaves(policy);
-  const resolved = resolveCascade({ standard, platform: plat, tool, envValues, valid, operatorOverride, capacityLeaves, log });
+  const capacitySpecs = Object.fromEntries(capacityLeaves.map(leaf => [leaf, `${policy}.${leaf}`]));
+  const resolved = resolveCascade({ standard, platform: plat, tool, envValues, valid, operatorOverride, capacityLeaves, capacitySpecs, log });
   logCascadeSources(policy, resolved, { env, ...(log ? { log } : {}) });
   // `layered`: platform under tool only (no standard, no env) — the drop-in replacement for a reader's tool block.
   const layered = resolveCascade({ standard: operatorOverride === null && capacityLeaves.length ? standard : undefined,
-    platform: plat, tool, valid, operatorOverride, capacityLeaves, log }).value;
+    platform: plat, tool, valid, operatorOverride, capacityLeaves, capacitySpecs, log }).value;
   return { ...resolved, platform: plat, layered };
 }
 
 /** Read each call, filtering the exact policy prefix. Null means unreadable; {} means missing/empty.
  * Tests isolate the store through the explicit file seam, never environment flags. */
 export function readOperatorPolicy(policy, { file, log } = {}) {
-  const { readable, values, invalidPolicies = [] } = readOperatorOverrides({ ...(file !== undefined ? { file } : {}), ...(log ? { log } : {}) });
-  if (!readable || invalidPolicies.includes(policy) || invalidPolicies.includes('*')) return null;
+  const { readable, values } = readOperatorOverrides({ ...(file !== undefined ? { file } : {}), ...(log ? { log } : {}) });
+  if (!readable) return null;
   const prefix = `${policy}.`;
   return Object.fromEntries(Object.entries(values).filter(([key]) => key.startsWith(prefix)).map(([key, value]) => [key.slice(prefix.length), value]));
 }
@@ -299,4 +299,17 @@ export function resolveCardNumbering({ env = process.env, readFile = readFileSyn
 /** The closed capacity paths for a policy (relative dotted keys). */
 export function capacityPolicyLeaves(policy) {
   return Object.keys(CAPACITY_LEAVES).filter(key => key.startsWith(`${policy}.`)).map(key => key.slice(policy.length + 1));
+}
+
+/** Bounded scalar adapter for instant settings. All lower layers are validated before the operator
+ * layer is applied; an unreadable store contributes no value. Provenance uses the shared source log. */
+export function resolveCapacityLeaf(key, { standard = CAPACITY_LEAVES[key].failClosedFallback,
+  tool, envValue, env = process.env, log } = {}) {
+  const spec = CAPACITY_LEAVES[key];
+  const { values } = readOperatorOverrides({ ...(log ? { log } : {}) });
+  const resolved = resolveCascade({ standard: { [key]: standard }, tool: { [key]: tool },
+    envValues: { [key]: envValue }, valid: spec.validate,
+    operatorOverride: { [key]: values[key] }, capacityLeaves: [key], ...(log ? { log } : {}) });
+  logCascadeSources(key, resolved, { env, ...(log ? { log } : {}) });
+  return { value: resolved.value[key], source: resolved.sources[key] };
 }

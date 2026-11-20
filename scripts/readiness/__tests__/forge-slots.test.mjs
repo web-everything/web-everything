@@ -16,6 +16,10 @@ afterEach(() => { for (const dir of scratch.splice(0)) rmSync(dir, {recursive: t
 function fixture(config = settings) {
   const dir = mkdtempSync(join(tmpdir(), 'forge-slots-')); scratch.push(dir);
   for (const file of ['forge-slots.mjs', 'forge-slots.sh']) cpSync(join(source, file), join(dir, file));
+  writeFileSync(join(dir, 'operator-override-reader.mjs'),
+    readFileSync(join(source, '../lib/operator-override-reader.mjs'), 'utf8').replaceAll('userInfo().homedir', JSON.stringify(dir)));
+  writeFileSync(join(dir, 'forge-slots.sh'),
+    readFileSync(join(source, 'forge-slots.sh'), 'utf8').replaceAll('pwd.getpwuid(os.getuid()).pw_dir', JSON.stringify(dir)));
   writeFileSync(join(dir, 'forge-slots.json'), JSON.stringify(config));
   return dir;
 }
@@ -104,6 +108,25 @@ describe('Forge slot settings', () => {
   });
   for (const python of [false, true]) {
     const reader = python ? 'Python fallback without Node' : 'Node CLI';
+    it.each([
+      [{ 'forgeSlots.forge': 28 }, '28\n'],
+      [{ forgeSlots: { forge: 28 } }, '28\n'],
+      [{ 'forgeSlots.forge': 129 }, '3\n'],
+      [{ 'forgeSlots.forge': true }, '3\n'],
+      [null, '3\n'],
+    ])(`${reader}: bounded operator store %j precedes env and survives bad evidence`, (store, expected) => {
+      const dir = fixture(); mkdirSync(join(dir, '.claude'));
+      writeFileSync(join(dir, '.claude', 'operator-overrides.json'), store === null ? '{' : JSON.stringify(store));
+      const result = run(dir, { FORGE_HOST: 'forge', FORGE_EXEC_SLOTS: '3' }, python);
+      expect(result.status, result.stderr).toBe(0); expect(result.stdout).toBe(expected);
+    });
+    it(`${reader}: valid operator leaf survives unreadable lower settings`, () => {
+      const dir = fixture(); mkdirSync(join(dir, '.claude'));
+      writeFileSync(join(dir, '.claude', 'operator-overrides.json'), JSON.stringify({ 'forgeSlots.forge': 28 }));
+      rmSync(join(dir, 'forge-slots.json'));
+      const result = run(dir, { FORGE_HOST: 'forge' }, python);
+      expect(result.status, result.stderr).toBe(0); expect(result.stdout).toBe('28\n');
+    });
     it(`${reader}: copied flat deployment reads the same JSON and FORGE_HOST`, () => {
       const result = run(fixture(), {FORGE_HOST: 'forge'}, python);
       expect(result.status, result.stderr).toBe(0); expect(result.stdout).toBe('14\n');
@@ -112,7 +135,7 @@ describe('Forge slot settings', () => {
       const dir = fixture(), checkout = join(dir, 'checkout');
       mkdirSync(join(checkout, 'settings'), {recursive: true});
       mkdirSync(join(checkout, 'readiness'));
-      for (const file of ['forge-slots.mjs', 'forge-slots.sh']) cpSync(join(dir, file), join(checkout, 'readiness', file));
+      for (const file of ['forge-slots.mjs', 'forge-slots.sh', 'operator-override-reader.mjs']) cpSync(join(dir, file), join(checkout, 'readiness', file));
       cpSync(join(dir, 'forge-slots.json'), join(checkout, 'settings', 'forge-slots.json'));
       symlinkSync(checkout, join(dir, 'deployment'), 'dir');
       const result = run(join(dir, 'deployment', 'readiness'), {FORGE_HOST: 'forge'}, python);

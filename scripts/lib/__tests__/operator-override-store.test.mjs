@@ -43,6 +43,16 @@ beforeEach(async () => {
 afterEach(() => { vi.unstubAllEnvs(); rmSync(dir, { recursive: true, force: true }); });
 
 const ranges = [
+  ['ciHeal.reserve', 0, 24], ['lanes.maxConcurrent', 1, 48],
+  ['resourceGate.fixCap.raiseQueueOver', 0, 100], ['resourceGate.fixCap.raiseStepPerPass', 1, 24],
+  ['resourceGate.fixCap.raiseMaxSwapUsedPct', 0, 200], ['resourceGate.fixCap.raiseMaxHeavyWaitMinutes', 0, 120],
+  ['redTeam.queue.cap', 0, 24], ['redTeam.queue.minConcurrentIdlePct', 0, 100],
+  ['redTeam.queue.reviewStartsPerTickWhileIdle', 0, 24],
+  ['heavyAdmission.cap', 1, 32], ['heavyAdmission.fastSlots', 0, 16],
+  ['deliveryCapacity.openPrCap', 1, 200], ['deliveryCapacity.maxStartsPerCheck', 0, 48], ['deliveryCapacity.softOverCapStarts', 0, 24],
+  ['reviewSeats.codex', 0, 10000], ['reviewSeats.agy-claude', 0, 10000], ['reviewSeats.agy-gemini', 0, 10000], ['reviewSeats.extraSeatsDailyCap', 0, 10000],
+  ['forgeSlots.forge', 1, 128], ['forgeSlots.forge-b', 1, 128],
+  ['ghThrottle.cap', 1, 50], ['ghThrottle.perCallerMax', 1, 50], ['fixDispatchMaxConcurrent', 1, 16],
   ['fix.conflictFixesPerPass', 0, 24],
   ['fix.conflictFixExemptPerPass', 0, 10],
   ['reviewConcurrency.maxLiveReviewRounds', 1, 16],
@@ -77,7 +87,7 @@ describe('capacity-only operator store', () => {
   });
   it.each(ranges)('%s declares a safe direction and finite fail-closed fallback', key => {
     const leaf = store.CAPACITY_LEAVES[key];
-    expect(leaf.direction).toBe(key.endsWith('raiseMinMemFreePct') ? 'threshold' : 'cap');
+    expect(leaf.direction).toBe(['resourceGate.fixCap.raiseMinMemFreePct', 'resourceGate.fixCap.raiseQueueOver', 'redTeam.queue.minConcurrentIdlePct', 'deliveryCapacity.holdUntil'].includes(key) ? 'threshold' : 'cap');
     expect(Number.isFinite(leaf.failClosedFallback)).toBe(true);
     expect(leaf.validate(leaf.failClosedFallback)).toBe(true);
     if (key === 'reviewConcurrency.maxLiveReviewRounds') expect(leaf.failClosedFallback).toBe(3);
@@ -89,7 +99,7 @@ describe('capacity-only operator store', () => {
     expect(store.readOperatorOverrides({ file }).values[key]).toBe(max);
   });
   it.each(ranges)('%s rejects wrong types and values outside its hard range before any write', (key, min, max) => {
-    for (const value of [min - 1, max + 1, String(min), null, true, NaN, Infinity, ...(key.endsWith('Pct') ? [] : [min + 0.5])]) {
+    for (const value of [min - 1, max + 1, String(min), null, true, NaN, Infinity, ...(['resourceGate.fixCap.raiseMinMemFreePct', 'resourceGate.fixCap.raiseMaxSwapUsedPct', 'resourceGate.fixCap.raiseMaxHeavyWaitMinutes'].includes(key) ? [] : [min + 0.5])]) {
       expect(() => write(value, { key })).toThrow(key);
     }
     expect(readdirSync(dir)).toEqual([]);

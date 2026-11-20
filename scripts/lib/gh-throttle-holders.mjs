@@ -9,19 +9,20 @@ import { ghCommandWords } from './gh-argv.mjs';
 export { ghCommandWords } from './gh-argv.mjs';
 
 export const GH_HOLDER_DEFAULTS = Object.freeze({ maxHoldSeconds: 90, reapGraceSeconds: 15, perCallerMax: 4 });
-const cached = new WeakMap();
+
 export function loadGhThrottleSettings({ file, env = process.env } = {}) {
   const settings = file ?? readDeclaredSettings().settings;
   const number = (key) => env[key] == null || env[key] === '' ? undefined : Number(env[key]);
   return cascadePolicy('ghThrottle', settings?.ghThrottle, {
     env, standard: GH_HOLDER_DEFAULTS,
     envValues: { maxHoldSeconds: number('WE_GH_THROTTLE_MAX_HOLD_SECONDS'), perCallerMax: number('WE_GH_THROTTLE_PER_CALLER_MAX') },
-    valid: (v) => Number.isFinite(v) && v >= 0 && Number.isInteger(v),
+    valid: { perCallerMax: v => Number.isInteger(v) && v >= 1 && v <= 50,
+      cap: v => Number.isInteger(v) && v >= 1 && v <= 50,
+      maxHoldSeconds: v => Number.isInteger(v) && v >= 0, reapGraceSeconds: v => Number.isInteger(v) && v >= 0 },
   });
 }
 export function ghHolderPolicy(env = process.env) {
-  if (!cached.has(env)) cached.set(env, loadGhThrottleSettings({ env }).value);
-  return cached.get(env);
+  return loadGhThrottleSettings({ env }).value;
 }
 
 // Telemetry records command vocabulary only. Endpoints, flags, fields, headers and positional

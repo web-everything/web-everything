@@ -18,17 +18,17 @@ const idle = { sample: () => ({ ok: false }), loadavg: () => 1, cpuCount: () => 
 // Live incident 2026-10-07: PR #4235 failed its own required check, but two review-fix sessions held the whole
 // fixer cap, so its ci-heal was deferred pass after pass and no one owned it.
 describe('ci-heal reserve slot', () => {
-  it('defaults to 2; env overrides; junk falls back', () => {
-    expect(resolveCiHealReserve({ env: {} })).toBe(2);
+  it('defaults to 6; env overrides; junk falls back', () => {
+    expect(resolveCiHealReserve({ env: {} })).toBe(6);
     expect(resolveCiHealReserve({ env: { WE_CI_HEAL_RESERVE: '2' } })).toBe(2);
     expect(resolveCiHealReserve({ env: { WE_CI_HEAL_RESERVE: '0' } })).toBe(0);
-    expect(resolveCiHealReserve({ env: { WE_CI_HEAL_RESERVE: 'x' } })).toBe(2);
+    expect(resolveCiHealReserve({ env: { WE_CI_HEAL_RESERVE: 'x' } })).toBe(6);
   });
   it('a live or same-pass ci-heal uses a slot up, with a logged reason that names who holds them', () => {
     const free = createCiHealReserve({ ...idle, env: { WE_CI_HEAL_RESERVE: '1' }, listClaims: () => [claim('fix', 1), claim('fix', 2)] });
     expect(free.tryAdmit()).toMatchObject({ admit: true });
     expect(free.tryAdmit()).toMatchObject({ admit: false, kind: 'fix-cap', why: expect.stringMatching(/reserved ci-heal/) });
-    const live = createCiHealReserve({ ...idle, env: {}, listClaims: () => [claim('fix', 1), claim('ci-heal', 2), claim('ci-heal', 3)] });
+    const live = createCiHealReserve({ ...idle, env: { WE_CI_HEAL_RESERVE: '2' }, listClaims: () => [claim('fix', 1), claim('ci-heal', 2), claim('ci-heal', 3)] });
     const refused = live.tryAdmit();
     expect(refused.admit).toBe(false);
     expect(refused.why).toMatch(/held by ci-heal #2, #3/);

@@ -29,7 +29,7 @@ import { resolveHandoffSettings } from './handoff-settings.mjs';
  *   threshold (e.g. `WE_FIX_CAP_RAISE_MAX_SWAP_USED_PCT`). Every leaf's source is logged once per
  *   process per distinct set ({@link logGateSettingsOnce}).
  */
-import { failClosedCapacity, OPERATOR_CAPACITY_MAX } from './operator-override-reader.mjs';
+import { CAPACITY_LEAVES, failClosedCapacity, OPERATOR_CAPACITY_MAX } from './operator-override-reader.mjs';
 import { readOperatorPolicy } from './policy-cascade.mjs';
 import { readFileSync } from 'node:fs';
 import os, { homedir } from 'node:os';
@@ -60,7 +60,7 @@ export const RESOURCE_GATE_STANDARD = Object.freeze({
     holdCpuIdleBelowPct: 10,
   }),
 });
-const FIX_CAP_SIGNAL_LEAVES = ['raiseMinMemFreePct', 'raiseMaxSwapUsedPct', 'raiseMaxHeavyWaitMinutes', 'lowerBelowMemFreePct',
+const FIX_CAP_SIGNAL_LEAVES = ['raiseQueueOver', 'raiseStepPerPass', 'raiseMinMemFreePct', 'raiseMaxSwapUsedPct', 'raiseMaxHeavyWaitMinutes', 'lowerBelowMemFreePct',
   'lowerAboveSwapUsedPct', 'lowerAboveHeavyWaitMinutes', 'lowerBy', 'lowerMinimum', 'holdCpuIdleBelowPct'];
 const envNameOf = (leaf) => `WE_FIX_CAP_${leaf.replace(/[A-Z]/g, (c) => `_${c}`).toUpperCase()}`;
 export const RESOURCE_GATE_ENV = Object.freeze({
@@ -81,6 +81,8 @@ const VALID = {
   'fixCap.lowerBelowMemFreePct': pct, 'fixCap.lowerAboveSwapUsedPct': pct, 'fixCap.lowerAboveHeavyWaitMinutes': minutes,
   'fixCap.lowerBy': int(0), 'fixCap.lowerMinimum': int(1), 'fixCap.holdCpuIdleBelowPct': pct,
 };
+for (const leaf of ['raiseQueueOver', 'raiseStepPerPass', 'raiseMaxSwapUsedPct', 'raiseMaxHeavyWaitMinutes'])
+  VALID[`fixCap.${leaf}`] = CAPACITY_LEAVES[`resourceGate.fixCap.${leaf}`].validate;
 const LEAVES = Object.keys(VALID);
 const isObj = (v) => v !== null && typeof v === 'object' && !Array.isArray(v);
 const leafOf = (block, leaf) => {
