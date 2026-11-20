@@ -8,7 +8,8 @@ import { effectiveBuilder } from './routing-settings.mjs';
 import { resolveFixExecutorChain, pickChainRung } from './fix-executor-chain.mjs';
 import { recordCapacityDecision, observeCapacity } from './provider-capacity-io.mjs';
 import { readCodexQuota, readCodexBurnRate } from './codex-usage-ledger.mjs';
-import { capacityCalendar, renderCalendar } from '../operations/capacity-calendar.mjs';
+import { renderCalendar } from '../operations/capacity-calendar.mjs';
+import { capacityCalendar } from '../operations/capacity-calendar-io.mjs';
 
 const now = Date.parse('2026-11-19T12:00:00Z'), hour = 3600000;
 const cap = (provider, used, hours, extra = {}) => ({ provider, windows: used === null ? [] : [{ name: 'seven_day', usedPercent: used,

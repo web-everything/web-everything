@@ -68,6 +68,7 @@ describe('runner freshness policy', () => {
         "agent-activity",
         "ai-routing",
         "brief-mode",
+        "capacity-calendar",
         "ci-heal-reset",
         "claim",
         "clear-claim",

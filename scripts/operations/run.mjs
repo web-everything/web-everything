@@ -93,6 +93,7 @@ import { daemonStatusOperation, DAEMON_STATUS_OP } from './daemon-status.mjs';
 import { collectDaemonStatus } from './daemon-status-io.mjs';
 import { heavyQueueOperation, HEAVY_QUEUE_OP } from './heavy-queue.mjs';
 import { capacityCalendarOperation, finishCapacityCalendar } from './capacity-calendar.mjs';
+import { capacityCalendar } from './capacity-calendar-io.mjs';
 import { hostCapacityOperation, HOST_CAPACITY_OP, finishHostCapacity } from './host-capacity.mjs';
 import { collectHostCapacity } from '../readiness/host-capacity.mjs';
 import { collectHeavyQueue } from './heavy-queue-io.mjs';
@@ -511,7 +512,7 @@ export const OPERATIONS = Object.freeze({
     sinks: {},
   }),
   // R258 — measured CPU/memory capacity; read-only, no effect sinks.
-  'capacity-calendar': () => ({ declaration: capacityCalendarOperation(), sinks: {}, finish: finishCapacityCalendar }),
+  'capacity-calendar': () => ({ declaration: capacityCalendarOperation({ collect: capacityCalendar }), sinks: {}, finish: finishCapacityCalendar }),
   [HOST_CAPACITY_OP]: () => ({
     declaration: hostCapacityOperation({ collect: collectHostCapacity }),
     sinks: {},

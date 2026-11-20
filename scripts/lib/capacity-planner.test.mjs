@@ -2,7 +2,8 @@ import { describe, it, expect } from 'vitest';
 import { planCapacity, planHorizon, workingSlot, resetSlot, HOUR } from './capacity-planner.mjs';
 import { chooseBuilder, readProviderCapacity, PROVIDER_DEFAULTS, scoreProvider, burnWindows } from './provider-capacity.mjs';
 import { resolveRoutingSettings } from './routing-settings.mjs';
-import { capacityCalendar, renderCalendar, renderHorizon, capacityCalendarOperation } from '../operations/capacity-calendar.mjs';
+import { renderCalendar, renderHorizon, capacityCalendarOperation } from '../operations/capacity-calendar.mjs';
+import { capacityCalendar } from '../operations/capacity-calendar-io.mjs';
 import { validateInput } from '../operations/registry.mjs';
 const now = Date.parse('2026-11-19T15:00:00Z'); // Thursday 10am ET
 const bucket = (count, hours) => ({ count, expiresAt: new Date(now + hours * HOUR).toISOString() });
@@ -105,7 +106,7 @@ describe('accounts, config and horizon', () => {
     expect(h.days[1].entries[0]).toMatchObject({ shortfall: true, bankedConsumed: [], expectedDemand: 100 });
   });
   it('calendar flags are optional, default false, and accept explicit booleans only', () => {
-    const { input } = capacityCalendarOperation();
+    const { input } = capacityCalendarOperation({ collect: () => ({}) });
     expect(input.horizon).toMatchObject({ type: 'boolean', required: false, default: false });
     expect(input).not.toHaveProperty('json');
     expect(validateInput(input, {})).toMatchObject({ ok: true, value: { horizon: false } });
@@ -120,7 +121,7 @@ describe('accounts, config and horizon', () => {
     const assigned = readProviderCapacity({ now, readers, settings: { providers, claudeUsageAccount: 'claude-b' } }).filter(c => c.provider === 'claude');
     expect(assigned.map(c => c.known)).toEqual([false, true]);
     expect(renderCalendar(capacityCalendar({ capacities: cs, settings: {}, now, horizon: true }))).toMatch(/account unknown/);
-    expect(capacityCalendarOperation().input.horizon.type).toBe('boolean');
+    expect(capacityCalendarOperation({ collect: () => ({}) }).input.horizon.type).toBe('boolean');
   });
   it('operator seed only wins against missing or older live Codex readings; aliases share quota', () => {
     const asOf = Date.parse('2026-11-19T12:31:00Z');

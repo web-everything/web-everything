@@ -63,6 +63,27 @@ async function load() { return import('./dynamic.mjs'); }`, {
     expect(importGraph(entry).external).toEqual(['node:fs']);
   });
 
+  it('includes imported JSON as validated data and retains adjacent writer edges', () => {
+    const entry = fixture(`import data from './config.json' with { type: 'json' };
+import 'node:fs';`, {
+      'config.json': JSON.stringify({ example: "import 'node:child_process'", nested: { enabled: true } }),
+    });
+    expect(importGraph(entry)).toEqual({
+      files: [join(entry, '..', 'config.json'), entry].sort(), external: ['node:fs'],
+    });
+  });
+
+  it.each(['{ "broken": }', "import 'node:fs';"])(
+    'refuses invalid imported JSON instead of treating it as an empty graph: %s', source => {
+      const entry = fixture("import data from './config.json' with { type: 'json' };", { 'config.json': source });
+      expect(() => importGraph(entry)).toThrow(SyntaxError);
+    });
+
+  it('refuses missing imported JSON', () => {
+    const entry = fixture("import data from './missing.json' with { type: 'json' };");
+    expect(() => importGraph(entry)).toThrow(/ENOENT/);
+  });
+
   it('refuses an unreadable real dependency instead of returning a partial graph', () => {
     const entry = fixture("import './missing.mjs';");
     expect(() => importGraph(entry)).toThrow(/ENOENT/);

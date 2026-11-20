@@ -1,21 +1,6 @@
-/** Read-only quota calendar and burn planner. `run.mjs capacity-calendar [--json]` also exposes this report. */
-import { pathToFileURL } from 'node:url';
+/** Read-only quota calendar declaration; the runner supplies all host observations. */
 import { op } from './registry.mjs';
 import { compute } from './step-kinds.mjs';
-import { BUILD_KINDS, resolveRoutingSettings } from '../lib/routing-settings.mjs';
-import { observeCapacity } from '../lib/provider-capacity-io.mjs';
-import { planCapacity, planHorizon } from '../lib/capacity-planner.mjs';
-import { scoreProvider, burnWindows, planLine } from '../lib/provider-capacity.mjs';
-
-export function capacityCalendar({ env = process.env, now = Date.now(), settings = resolveRoutingSettings({ env }).capacity,
-  capacities = observeCapacity({ env, now, settings }), horizon = false } = {}) {
-  return { at: new Date(now).toISOString(), settings, providers: capacities.map(cap => ({ ...cap,
-    planner: planCapacity(cap, settings, { now, queuedDemand: settings.queuedDemand ?? 0, demandRatePerHour: settings.demandRatePerHour }),
-    scores: Object.fromEntries(BUILD_KINDS.map(kind => [kind, scoreProvider(cap, kind, { ...settings, now })])),
-  })), plan: planLine(capacities, settings, now), burns: burnWindows(capacities, { ...settings, now }),
-    needsOperatorInput: operatorInputs(capacities, settings),
-    ...(horizon ? { horizon: planHorizon({ capacities, config: settings, now }) } : {}) };
-}
 export function operatorInputs(capacities, settings) {
   const missing = [];
   for (const c of capacities) {
@@ -48,13 +33,12 @@ export function renderCalendar(report) {
 export function renderHorizon(horizon) {
   return ['14-day horizon: date | provider/account | available % | expected demand %', ...horizon.days.flatMap(day => day.entries.map(e => `${day.date} | ${e.provider}/${e.account ?? '-'} | ${e.available ?? 'unknown'} | ${e.expectedDemand ?? 'unknown'}`)), ...horizon.recommendations.map(r => `${r.date}: ${r.command}`), ...(horizon.needsOperatorInput ?? []).map(message => `needs operator input: ${message}`)].join('\n');
 }
-export const capacityCalendarOperation = () => op('capacity-calendar', { input: {
-  horizon: { type: 'boolean', required: false, default: false },
-}, verdictFrom: 'read',
-  read: compute({ reads: ['input.horizon'], fn: ({ input }) => capacityCalendar({ horizon: input?.horizon ?? false }) }),
-});
-export const finishCapacityCalendar = ({ run, code, lines, json }) => json || !run?.verdict ? { code, lines } : { code, lines: [renderCalendar(run.verdict)] };
-if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
-  const report = capacityCalendar({ horizon: process.argv.includes('--horizon') });
-  console.log(process.argv.includes('--json') ? JSON.stringify(report) : renderCalendar(report));
+export function capacityCalendarOperation({ collect } = {}) {
+  if (typeof collect !== 'function') throw new TypeError('capacity-calendar needs a collect reader');
+  return op('capacity-calendar', {
+    input: { horizon: { type: 'boolean', required: false, default: false } },
+    verdictFrom: 'read',
+    read: compute({ reads: ['input.horizon'], fn: ({ input }) => collect({ horizon: input?.horizon ?? false }) }),
+  });
 }
+export const finishCapacityCalendar = ({ run, code, lines, json }) => json || !run?.verdict ? { code, lines } : { code, lines: [renderCalendar(run.verdict)] };
