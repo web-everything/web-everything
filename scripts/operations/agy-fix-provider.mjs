@@ -1,12 +1,12 @@
 import { deriveAgyFixAdmission } from '../lib/agy-fix-admission.mjs';
 import { runConfinedAgyBuild } from '../lib/agy-confined-build.mjs';
-/** Gemini repair port: macOS sandbox-exec confines native file tools, then the launcher audits patches. */
-export const AGY_FIX_CONFINEMENT = Object.freeze({
-  mode: 'sandboxed', boundary: 'workspace', mechanism: 'sandbox-exec',
-});
+import { AGY_BUILD_CONFINEMENT, assertAgyBuildConfinement } from '../lib/agy-sandbox.mjs';
+/** Gemini repair port stays unavailable until the worker's full boundary is enforced. */
+export const AGY_FIX_CONFINEMENT = AGY_BUILD_CONFINEMENT;
 export const AGY_FIX_PROVIDER = Object.freeze({
   name: 'antigravity', vendor: 'antigravity', confinement: AGY_FIX_CONFINEMENT,
   async spawn({ prompt, model, effort, sessionSlug, kind, size, scope }, { resolveLane, runTask = runConfinedAgyBuild }) {
+    assertAgyBuildConfinement();
     if (!deriveAgyFixAdmission({}, { taskKind: kind, size, scope }))
       throw new Error('antigravity fix refused: kind/size/scope unavailable or outside repair admission; use the next fix provider');
     const result = await runTask({ task: prompt, laneDir: resolveLane(), model, effort, kind, size, scope });

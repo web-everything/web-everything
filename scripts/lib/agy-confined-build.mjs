@@ -1,4 +1,4 @@
-/** R1062/S7: sandbox-exec confines the process's own file writes, plus patch/transcript checks.
+/** R1062/S7 prototype: production is unavailable until service/credential isolation is enforced.
  * The launcher alone applies admitted hunks; agy's git operations remain forbidden. */
 import { execFileSync, spawn } from 'node:child_process';
 import { createHash } from 'node:crypto';
@@ -8,7 +8,7 @@ import { basename, dirname, isAbsolute, join, resolve } from 'node:path';
 import { escapingSymlinks, gitControlFiles, snapshotCheckout, changedControl, changedCheckouts,
   stateChangingToolCalls, READ_ONLY_AGY_TOOLS, scrubPaths, MODULE_REPO_ROOT } from './agy-review-juror.mjs';
 import { buildScratchCloneArgv, summarizeAgyEvents, runAgyDirectExec } from '../gemini-direct-task.mjs';
-import { AGY_STATE_WRITE_DIRS, buildSandboxEnv, buildSandboxProfile, sandboxedSpawnArgv, sandboxSecretPaths } from './agy-sandbox.mjs';
+import { AGY_BUILD_CONFINEMENT, assertAgyBuildConfinement, AGY_STATE_WRITE_DIRS, buildSandboxEnv, buildSandboxProfile, sandboxedSpawnArgv, sandboxSecretPaths } from './agy-sandbox.mjs';
 import { readAgyHold, saveAgyHold } from './antigravity-run-evidence.mjs';
 import { resolveCascade, formatCascadeSourcesLine } from './policy-cascade.mjs';
 import { isAdmissibleTargetPath, isAdmissibleTargetScope } from './agy-fix-admission.mjs';
@@ -115,6 +115,7 @@ function canonicalPath(path) {
 }
 
 export async function defaultSpawnAgy(options) {
+  assertAgyBuildConfinement();
   const homeDir = realpathSync(homedir());
   const temp = realpathSync(tmpdir());
   const requested = options.cli ?? 'agy';
@@ -244,6 +245,10 @@ export async function runConfinedAgyBuild({ task, laneDir, scope, kind, size, mo
       return result('refused', [
       'Antigravity build requires macOS sandbox-exec; use another fix provider or request human review',
     ]);
+    // Injectable fake workers exercise patch auditing only. The native launcher also
+    // guards itself, so wrapping it in a callback cannot bypass this refusal.
+    if (spawnAgy === defaultSpawnAgy && AGY_BUILD_CONFINEMENT.mode !== 'sandboxed')
+      return result('refused', [AGY_BUILD_CONFINEMENT.reason]);
     laneDir = resolve(laneDir);
     const before = { [laneDir]: snapshotCheckout(laneDir, snapExec) };
     if (before[laneDir].unreadable) return result('refused', ['real lane snapshot unreadable']);

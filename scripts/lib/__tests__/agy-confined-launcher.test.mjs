@@ -15,6 +15,12 @@ vi.mock('node:os', async importOriginal => {
   return { ...original, homedir: () => host.home ?? original.homedir() };
 });
 vi.mock('node:child_process', async importOriginal => ({ ...await importOriginal(), spawn: vi.fn() }));
+// Preserve coverage of the dormant launcher's file-IO mechanics with a fake HOME.
+// Only this test module replaces the production refusal; agy-sandbox.test.mjs
+// exercises every public launch entry with the real, unmocked guard.
+vi.mock('../agy-sandbox.mjs', async importOriginal => ({
+  ...await importOriginal(), assertAgyBuildConfinement: () => {},
+}));
 
 const roots = [];
 afterEach(() => {
@@ -47,7 +53,7 @@ function fixture() {
   return { root, options };
 }
 
-it('production launcher consults persisted quota holds and refuses before sandbox launch', async () => {
+it('prototype launcher consults persisted quota holds and refuses before sandbox launch', async () => {
   const { options } = fixture();
   saveAgyHold(agyRunEvidence({ requestedModel: options.model, stderr: 'RESOURCE_EXHAUSTED Resets in 1h' }));
   const result = await defaultSpawnAgy(options);
@@ -55,7 +61,7 @@ it('production launcher consults persisted quota holds and refuses before sandbo
   expect(spawn).not.toHaveBeenCalled();
 });
 
-it.each(['direct', 'homebrew-symlink', 'missing-login'])('production sandbox callback resolves %s grants, records quota and scrubs environment', async installation => {
+it.each(['direct', 'homebrew-symlink', 'missing-login'])('prototype sandbox callback resolves %s grants, records quota and scrubs environment', async installation => {
   const { options } = fixture();
   const homebrewPrefix = join(host.home, 'brew');
   if (installation === 'homebrew-symlink') {

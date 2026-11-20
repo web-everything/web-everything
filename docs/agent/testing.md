@@ -4993,6 +4993,15 @@ comparison against daemon observations; fixtures prove IO counts without live Gi
 
 ## Confined Antigravity build adapter (R1062 / S7 / R37)
 
+Production launches are unavailable. The SBPL prototype starts from `(allow default)`:
+direct file restrictions do not isolate Mach/XPC services, launchd agent sockets, shared log
+state, or the real-HOME OAuth token from a worker with network egress. `AGY_BUILD_CONFINEMENT`
+therefore declares `unavailable`, and both the fix provider and native launcher refuse before
+launch side effects. Direct builds with the default worker refuse before Git or scratch work;
+settings and explicit provider selection cannot enable them. Routing falls back to the next
+provider. Re-enabling requires an enforced service/credential boundary and independent live
+probes; the old direct-file probes do not establish that boundary.
+
 `agy-confined-build.test.mjs` uses temporary local Git repositories and injected fake agy
 execution; it never launches agy. Admission requires kind, numeric size and literal repo-relative
 file/directory scope prefixes (at most 20 entries). For direct `runConfinedAgyBuild` calls only, allowed kinds require size at/below
@@ -5014,14 +5023,14 @@ or rewritten transcripts. The launcher applies the admitted patch without stagin
 Voided/refused builds advance to another provider; oversized requests need operator review or
 an explicit settings change. The broad dispatch availability gate still requires sandboxed
 providers; production execution remains unavailable even for explicitly scoped launches until
-an enforced filesystem boundary confines native file tools. Clone/transcript checks only detect
+the full service and credential boundary is enforced. Clone/transcript checks only detect
 escapes afterward and cannot undo damage. The named outside-write refusal test must assert both
 real-lane and untracked host targets remain unchanged with no worker launched. Only injected fake
 workers exercise patch admission; they are not evidence of production confinement. Run the focused adapter and
 `operations/__tests__/fix-run.test.mjs` fixtures through the host heavy-admission queue.
 
-Slice B supersedes the production-unavailable note above: macOS builds launch through
-`/usr/bin/sandbox-exec` using the operator's real HOME login, exactly as the existing agy review seat does.
+The inactive Slice B prototype below was previously enabled and is now blocked by the production
+guard. Its launcher uses `/usr/bin/sandbox-exec` with the operator's real HOME login.
 The scrubbed environment retains only PATH, USER, LOGNAME, SHELL, LANG, LC_* and TERM;
 HOME is the real home and TMPDIR/TMP/TEMP point to a launcher-created private temp directory.
 No token or settings are copied and no private HOME is created or deleted.
@@ -5058,7 +5067,10 @@ uses a fake home and temporary directories: clone/temp/log writes succeed; sibli
 and other `.gemini` writes fail with EPERM; real-HOME login reads succeed and every named secret-root
 read fails with EPERM. Arbitrary home files and `.env*` files inside allowed roots also refuse;
 clone reads succeed, and extra denies override clone access. It runs system sh/cat/ls without touching real home secrets or launching agy.
-`agy-confined-launcher.test.mjs` checks real HOME preservation, no copied state, private temp cleanup,
+`agy-sandbox.test.mjs` also tests the unmocked production refusal at routing availability,
+explicit provider selection, direct build and direct native launcher entrypoints, with no Git,
+scratch allocation or task execution. `agy-confined-launcher.test.mjs` replaces only that guard
+inside its test module to retain coverage of the inactive prototype: real HOME preservation, no copied state, private temp cleanup,
 redirected-log refusal, and a REAL fake-home launcher probe for login/log and clone read access, secret/arbitrary-home read denial, `.env*` denial and other-home write denial.
 The injected build tests separately cover unsupported hosts and missing sandbox-exec without launching a worker.
 The scoped files are agy-sandbox, agy-confined-launcher, agy-confined-build and agy-fix-admission;

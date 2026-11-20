@@ -1,10 +1,49 @@
 // @vitest-environment node
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import { spawnSync } from 'node:child_process';
 import { existsSync, readFileSync, mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { basename, join } from 'node:path';
 import { AGY_STATE_WRITE_DIRS, buildSandboxEnv, buildSandboxProfile, sandboxedSpawnArgv, sandboxSecretPaths } from '../agy-sandbox.mjs';
+import { defaultSpawnAgy, runConfinedAgyBuild } from '../agy-confined-build.mjs';
+import { AGY_FIX_PROVIDER } from '../../operations/agy-fix-provider.mjs';
+import { fixLauncherAvailable } from '../../operations/dispatch-providers/fix.mjs';
+
+describe('unverified service and credential confinement refuses production', () => {
+  it('does not advertise filesystem-only SBPL as workspace confinement', () => {
+    expect(AGY_FIX_PROVIDER.confinement.mode).toBe('unavailable');
+    expect(fixLauncherAvailable('antigravity', {
+      taskKind: 'doc-fix', size: 1, scope: ['docs'], exists: () => true,
+    })).toBe(false);
+  });
+  it('refuses explicit provider selection before lane resolution or task execution', async () => {
+    const resolveLane = vi.fn(() => '/unused-lane');
+    const runTask = vi.fn(async () => ({ status: 'ok' }));
+    await expect(AGY_FIX_PROVIDER.spawn({ prompt: 'repair', kind: 'doc-fix', size: 1, scope: ['docs'] },
+      { resolveLane, runTask })).rejects.toThrow(/confinement unavailable.*use another provider/);
+    expect(resolveLane).not.toHaveBeenCalled();
+    expect(runTask).not.toHaveBeenCalled();
+  });
+  it('refuses a direct native launcher call before even reading launch options', async () => {
+    const readCli = vi.fn(() => { throw new Error('launch options accessed'); });
+    await expect(defaultSpawnAgy({ get cli() { return readCli(); } }))
+      .rejects.toThrow(/confinement unavailable.*use another provider/);
+    expect(readCli).not.toHaveBeenCalled();
+  });
+  it('refuses direct builds on Darwin with sandbox-exec before any git or scratch work', async () => {
+    const exec = vi.fn(() => { throw new Error('git must not run'); });
+    const mkTempDir = vi.fn(() => { throw new Error('scratch must not be allocated'); });
+    const result = await runConfinedAgyBuild({ task: 'repair', laneDir: '/unused-lane',
+      kind: 'doc-fix', size: 1, scope: ['docs'], deps: {
+        platform: 'darwin', sandboxExists: () => true, exec, mkTempDir,
+        readFile: () => '{}', env: { WE_AGY_BUILD_MAX_SIZE: '100' }, log: () => {},
+      } });
+    expect(result).toMatchObject({ status: 'refused', applied: [],
+      reasons: [expect.stringMatching(/confinement unavailable.*use another provider/)] });
+    expect(exec).not.toHaveBeenCalled();
+    expect(mkTempDir).not.toHaveBeenCalled();
+  });
+});
 
 const roots = [];
 afterEach(() => { for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true }); });

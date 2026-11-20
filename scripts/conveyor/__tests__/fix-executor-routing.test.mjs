@@ -511,16 +511,16 @@ describe('fallback chain routing', () => {
       .toMatchObject({ executor: 'claude', rung: 'claude', reason: expect.stringContaining('argon launcher unavailable') });
   });
   it.each([
-    [{ taskKind: 'doc-fix', size: 1, scope: ['we:docs'] }, 'antigravity'],
-    [{ taskKind: 'fix', size: 1, scope: ['we:docs/a.md'] }, 'antigravity'],
-    [{ taskKind: 'test-fix', size: 1, scope: ['we:tests'] }, 'antigravity'],
-    [{ taskKind: 'feature', size: 1, scope: ['we:docs'] }, 'antigravity'], // R1062: size-1 builds are admitted
+    [{ taskKind: 'doc-fix', size: 1, scope: ['we:docs'] }, 'claude'],
+    [{ taskKind: 'fix', size: 1, scope: ['we:docs/a.md'] }, 'claude'],
+    [{ taskKind: 'test-fix', size: 1, scope: ['we:tests'] }, 'claude'],
+    [{ taskKind: 'feature', size: 1, scope: ['we:docs'] }, 'claude'],
     [{ taskKind: 'doc-fix', size: 3, scope: ['we:docs'] }, 'claude'],
     [{ taskKind: 'doc-fix', scope: ['we:docs'] }, 'claude'],
     [{ taskKind: 'doc-fix', size: 1, scope: [] }, 'claude'],
     [{ taskKind: 'doc-fix', size: 1, scope: ['we:../escape'] }, 'claude'],
     [{ taskKind: 'doc-fix', size: 1, scope: ['fui:docs'] }, 'claude'],
-  ])('selects Argon only with derivable repair evidence %j', (item, executor) => {
+  ])('falls back while confinement is unavailable even with derivable repair evidence %j', (item, executor) => {
     const head = 'a'.repeat(40);
     const decision = routeFixExecutor({ repo: 'we', pr: 42, itemNum: '7', headRefOid: head, scope: item.scope }, {
       setting, chain, criticalFor: () => false, launcherAvailable: fixLauncherAvailable,
@@ -528,8 +528,7 @@ describe('fallback chain routing', () => {
       readRouted: () => ({ 'we#42': Array.from({ length: 3 }, () => ({ head, outcome: 'failed' })) }),
     });
     expect(decision.executor).toBe(executor);
-    if (executor === 'antigravity') expect(decision.agyAdmission).toEqual({ kind: item.taskKind === 'fix' ? 'doc-fix' : item.taskKind,
-      size: 1, scope: item.scope.map(p => p.slice(3)) });
+    expect(decision).not.toHaveProperty('agyAdmission');
   });
   it.each(['docs/agent', 'docs/agent/testing.md', 'scripts/hooks/check.mjs', 'scripts/lib/new-policy.mjs'])
   ('skips Argon when item scope %s widens the launch scope or is critical', path => {

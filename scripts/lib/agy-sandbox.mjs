@@ -2,6 +2,15 @@ import { isAbsolute, join, normalize } from 'node:path';
 
 // Exactly what agy needs for state writes; extend only with measured evidence.
 export const AGY_STATE_WRITE_DIRS = ['.gemini/antigravity-cli/log'];
+// Direct file denies are insufficient for an untrusted worker with shell tools.
+// No setting or environment override may promote this prototype to production.
+export const AGY_BUILD_CONFINEMENT = Object.freeze({
+  mode: 'unavailable',
+  reason: 'antigravity build refused: confinement unavailable: Mach/XPC services, agent sockets, shared state and real-HOME OAuth with network egress are not isolated; use another provider or request operator review',
+});
+export function assertAgyBuildConfinement() {
+  if (AGY_BUILD_CONFINEMENT.mode !== 'sandboxed') throw new Error(AGY_BUILD_CONFINEMENT.reason);
+}
 export const sandboxSecretPaths = home => ['.ssh', '.aws', '.gnupg', '.netrc', '.secrets', '.config/gh',
   'Library/Keychains', '.plateau'].map(p => join(home, p));
 const safePath = p => {
@@ -11,7 +20,7 @@ const safePath = p => {
 };
 const inside = (p, root) => p === root || p.startsWith(`${root}/`);
 
-/** Confines the process's own file writes and home reads. Mach/XPC/LaunchServices-mediated writes
+/** Inactive prototype: confines the process's own file writes and home reads. Mach/XPC/LaunchServices-mediated writes
  * (defaults, open, osascript, launchctl) are out of scope; this is not a service sandbox.
  * Service-mediated secret reads (securityd, gh auth token, ssh-agent) are also out of scope;
  * direct file denies do not isolate Mach/XPC services or agent sockets.
