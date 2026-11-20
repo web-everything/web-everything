@@ -2640,6 +2640,14 @@ async function cmdAcquire(repo) {
     // The lane is claimed. Repair missing alternates NOW, before any dirty/ahead refusal below: it only adds a file, so it is
     // safe on a dirty lane, and a lane that is refused for its work still stops re-downloading the repository.
     ensureAlternatesFor(repo, n);
+    // Preserve history evidence/repair/quarantine before an unknown ahead count can refuse this lane.
+    // Keep this after the claim so a live foreign lease is never repaired, and roll back on failure.
+    try {
+      requireReadableLaneHistory(repo, n, { allowRepair: !flags['no-reset'] && !targetWasReserved });
+    } catch (e) {
+      restoreLeaseAfterRefusedClaim(dir, preExisting);
+      fail(msgOf(e));
+    }
     // #3390 — the explicit-lane path is the ONLY claim route that reaches the destructive reset below with no
     // #2267 dirty/ahead check at all: auto-pick's own candidate source (`isLaneAcquirable`, via the cached
     // scan) never selects a dirty/ahead candidate to begin with, and `refreshLane` calls `laneDirtyOrAhead`
@@ -2863,11 +2871,15 @@ async function cmdAcquire(repo) {
         .filter((n) => !excluded.has(n) && !holdRefused.has(n) && n !== selfLane && !isHistoryQuarantined(repo, n))
         .sort((a, b) => a - b);
       for (const pick of pickable) {
+        let historyChecked = false;
         if (usingFreeList || retryingCandidates) {
           // Preserve the history evidence/repair/quarantine path before eligibility can skip this hint.
           const candidateNow = Date.now();
           if (leaseDisqualifiesAcquire(readLease(laneDir(repo, pick)), candidateNow, ttlMs)) continue;
-          try { requireReadableLaneHistory(repo, pick); } catch (e) {
+          try {
+            requireReadableLaneHistory(repo, pick);
+            historyChecked = true;
+          } catch (e) {
             log(`  lane-${pick}: ${msgOf(e)}`);
             sawProvisionFailure = true;
             sawNonHoldProvisionFailure = true;
@@ -2891,7 +2903,7 @@ async function cmdAcquire(repo) {
         try {
           // Probe before --no-reset's safety check too: otherwise unreadable history is merely refused
           // there and retried on every acquire instead of being persistently quarantined.
-          requireReadableLaneHistory(repo, pick);
+          if (!historyChecked) requireReadableLaneHistory(repo, pick);
           // `--no-reset` skips every dirty/ahead check inside provisionClaimedLane, but a lane named by the (possibly
           // event-refreshed) free list may have changed since it was published: auto-pick may only hand out a lane
           // PROVEN clean and fully pushed right now. A failed probe is not proof, so it is refused too. The bar is the
@@ -3050,7 +3062,6 @@ async function cmdAcquire(repo) {
   // would silently re-run `fetchOriginPruneWithRetry`/`checkout -B`/`ensureDeps` a second time for no reason.
   if (flags.lane !== undefined) {
     try {
-      requireReadableLaneHistory(repo, chosen, { allowRepair: !flags['no-reset'] && !targetWasReserved });
       provisionClaimedLane(repo, chosen, targetWasReserved, {
         beforeFetch: () => assertReadableLaneEvidence(repo, chosen),
         beforeReset: getShas => assertNoUnpushedLaneWork(repo, chosen, getShas),
