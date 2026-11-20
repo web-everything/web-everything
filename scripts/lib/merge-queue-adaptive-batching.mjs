@@ -477,10 +477,14 @@ export function createAdaptiveBatching({ repo, exec = execFileSync, statePath = 
     },
     gate(num, { priorityClass = 'normal' } = {}) {
       if (!settings.enabled) return { admit: true };
+      // Unknown state may contain isolation. Keep the loaded hold even if the
+      // admission calculation expires it: that release must first be persisted.
+      let isolationPossible = true;
       try {
         const facts = readQueueFacts({ repo, exec });
         if (facts.error) {
           const state = load();
+          isolationPossible = state.isolate.length > 0;
           // Releasing isolation requires readable queue evidence. Retry next pass.
           if (state.isolate.length > 0) {
             const reason = 'queue unreadable; isolation hold retained — retry next drain pass';
@@ -495,6 +499,7 @@ export function createAdaptiveBatching({ repo, exec = execFileSync, statePath = 
           throw new Error(facts.error);
         }
         const state = load();
+        isolationPossible = state.isolate.length > 0;
         const enqueueEligibility = new Map();
         // Bound live reads to 100 suspects; omitted/unknown evidence retains the hold.
         if (state.isolate.length > 100) say('merge-queue batching: suspect read cap 100 exceeded; isolation hold retained — operator must inspect remaining suspects');
@@ -512,13 +517,21 @@ export function createAdaptiveBatching({ repo, exec = execFileSync, statePath = 
           } catch { /* unreadable suspect keeps today's isolation hold */ }
         }
         const result = admitEnqueue({ state, num, nowMs: nowMs(), settings, inQueue: facts.inQueue, priorityClass, enqueueEligibility });
+        isolationPossible ||= result.state.isolate.length > 0;
         persist(result.state);
         const g = result.state.groups.find(g => g.id === result.groupId);
         say(`merge-queue batching: ${result.mode} → ${result.admit
           ? `admit #${num} into group ${result.groupId ?? 'native-queue'} (${g?.prs.length ?? 1}/${result.mode === 'grouped' ? settings.groupSize : 1})`
           : `defer #${num} (${result.reason})`}`);
         return result;
-      } catch (e) { warn(e); return { admit: true, error: errorText(e) }; }
+      } catch (e) {
+        if (isolationPossible) {
+          const reason = 'isolation reservation unavailable; hold retained — retry next drain pass';
+          say(`merge-queue batching: defer #${num} (${reason}): ${errorText(e)}`);
+          return { admit: false, reason, error: errorText(e) };
+        }
+        warn(e); return { admit: true, error: errorText(e) };
+      }
     },
     observe({ mergedNums = [] } = {}) {
       const summary = { events: [], dequeued: [], cancelled: [] };

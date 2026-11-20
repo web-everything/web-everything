@@ -15,6 +15,7 @@ import {
   fastDrainArgs, summarizeFastDrain, resolveEnqueueOnEventSetting, createEnqueueOnEvent, wakeWorthy,
 } from '../enqueue-on-event.mjs';
 import * as enqueueModule from '../enqueue-on-event.mjs';
+import * as deliveryIdentity from '../github-app-identity.mjs';
 import { overlayFilePath, WE_DAEMON_OVERLAY_DIR_ENV } from '../daemon-overlays.mjs';
 import { WE_DAEMON_STATE_DIR_ENV } from '../daemon-rebuild/state.mjs';
 import { readCompletePrComments } from '../../conveyor/pr-comments-complete.mjs';
@@ -3083,7 +3084,9 @@ describe('urgent label actor verification', () => {
 
   it.each([
     ['operator', [event(2, 'chalbert')], true],
-    ['delivery App', [event(2, 'web-everything')], true],
+    ['bare automation login without App id', [event(2, 'web-everything')], false],
+    ['bot login without App id', [event(2, 'web-everything[bot]')], false],
+    ['bot login with another App id', [{ ...event(2, 'web-everything[bot]'), performed_via_github_app: { id: 999 } }], false],
     ['latest id wins over timestamps and array order', [event(9, 'outsider', '2020-01-01'), event(8, 'chalbert', '2030-01-01')], false],
     ['trusted latest id', [event(9, 'chalbert', '2020-01-01'), event(8, 'outsider', '2030-01-01')], true],
     ['no actor', [event(2, null)], false],
@@ -3100,6 +3103,29 @@ describe('urgent label actor verification', () => {
     expect(exec.mock.calls[0][1]).toEqual(['api', `repos/${REPO}/issues/1/events?per_page=100&page=1`]);
     expect(exec.mock.calls[0][2]).toMatchObject({ timeout: 10000, maxBuffer: 1024 * 1024, throttle: { maxAttempts: 1 } });
     expect(result.prs.find(pr => pr.num === 999).urgentLabelVerified).not.toBe(true);
+  });
+
+  it.each([
+    ['worker', true], ['merger', true], ['ledger', true],
+    ['reviewer', false], ['observer', false],
+  ])('verifies configured %s App id independently of bot login (%s)', async (role, verified) => {
+    const identity = vi.spyOn(deliveryIdentity, 'readDeliveryIdentity').mockReturnValue({ roles: { [role]: { appId: '123' } } });
+    try {
+      const { result } = await listing(() => JSON.stringify([
+        { ...event(2, 'unlisted-app[bot]'), performed_via_github_app: { id: 123 } },
+      ]));
+      expect(result.prs.find(pr => pr.num === 1).urgentLabelVerified).toBe(verified);
+    } finally { identity.mockRestore(); }
+  });
+
+  it('rejects another App even with the delivery bot login', async () => {
+    const identity = vi.spyOn(deliveryIdentity, 'readDeliveryIdentity').mockReturnValue({ roles: { worker: { appId: '123' } } });
+    try {
+      const { result } = await listing(() => JSON.stringify([
+        { ...event(2, 'web-everything[bot]'), performed_via_github_app: { id: 999 } },
+      ]));
+      expect(result.prs.find(pr => pr.num === 1).urgentLabelVerified).toBe(false);
+    } finally { identity.mockRestore(); }
   });
 
   it('read failure keeps priority plain and names the fallback', async () => {

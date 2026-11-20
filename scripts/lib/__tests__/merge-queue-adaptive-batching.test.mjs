@@ -726,10 +726,10 @@ describe('replay CLI', () => {
 });
 
 describe('IO error boundaries', () => {
-  it('keeps corrupt state untouched and fails open on gate write errors', () => {
+  it('keeps corrupt state untouched and holds unknown isolation, failing open on non-isolation write errors', () => {
     const h = ioHarness();
     const corrupt = createAdaptiveBatching({ repo: 'owner/repo', exec: h.exec, settings: settings(), readFile: () => '{', writeFile: () => { throw new Error('must not overwrite'); }, log: () => {} });
-    expect(corrupt.gate(1)).toMatchObject({ admit: true, error: expect.any(String) });
+    expect(corrupt.gate(1)).toMatchObject({ admit: false, error: expect.any(String) });
     const cannotWrite = createAdaptiveBatching({ repo: 'owner/repo', exec: h.exec, statePath: 'state.json', settings: settings(), readFile: () => JSON.stringify(empty()), mkdir: () => {}, writeFile: () => { throw new Error('disk full'); }, log: () => {} });
     expect(cannotWrite.gate(1)).toMatchObject({ admit: true, error: 'disk full' });
   });

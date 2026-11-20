@@ -86,7 +86,8 @@ import { readCompletePrComments } from '../conveyor/pr-comments-complete.mjs';
 import { execFileSyncThrottled } from './gh-throttle.mjs';
 import { readOverlays, readOverlayState } from './daemon-overlays.mjs';
 import { readRebuildState } from './daemon-rebuild/state.mjs';
-import { isTrustedMarkerAuthor } from './marker-authorship.mjs';
+import { isOperatorAuthored } from './marker-authorship.mjs';
+import { readDeliveryIdentity } from './github-app-identity.mjs';
 
 export const ENQUEUE_ON_EVENT_POLICY = 'mergeQueue.enqueueOnEvent';
 export const ENQUEUE_ON_EVENT_ENV = 'WE_ENQUEUE_ON_EVENT';
@@ -545,6 +546,9 @@ export async function readCatchUpCandidates({ repo, defaultBranch = 'main', env 
   // At most 20 urgent candidates × 3 REST pages (60 calls) per listing. Partial
   // histories never prove authorship; the operator can inspect/reapply the label.
   const urgent = open.filter(p => p.labels.some(label => label.name === 'priority:urgent'));
+  const { roles } = readDeliveryIdentity({ env });
+  const deliveryAppIds = new Set(['worker', 'merger', 'ledger']
+    .map(role => roles[role]?.appId).filter(id => id != null && id !== '').map(String));
   for (const [index, p] of urgent.entries()) {
     p.urgentLabelVerified = false;
     if (index < 20) {
@@ -563,7 +567,9 @@ export async function readCatchUpCandidates({ repo, defaultBranch = 'main', env 
           }
           if (!complete) break;
           if (events.length < 100) {
-            p.urgentLabelVerified = isTrustedMarkerAuthor({ user: latest?.actor });
+            const appId = latest?.performed_via_github_app?.id;
+            p.urgentLabelVerified = isOperatorAuthored({ user: latest?.actor })
+              || ((typeof appId === 'number' || typeof appId === 'string') && deliveryAppIds.has(String(appId)));
             break;
           }
         }

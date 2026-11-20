@@ -1,5 +1,5 @@
 // @vitest-environment node
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import { readFileSync } from 'node:fs';
 import {
   STANDARD_BATCHING_SETTINGS, initialBatchingState, admitEnqueue, observeQueue, createAdaptiveBatching,
@@ -215,4 +215,36 @@ it('released retry cannot reuse a persisted multi-PR reservation', () => {
     7183, new Map([[7155, false]]));
   expect(held).toMatchObject({ admit: false, mode: 'strict',
     reason: '#7183 has a grouped reservation; wait for its prior reservation to expire' });
+});
+
+
+describe('isolation reservation persistence failures', () => {
+  it.each([
+    ['active', () => isolation(), false],
+    ['expired during admission', () => ({ ...isolation(), isolateSinceMs: { 7155: -120 * 60_000 } }), false],
+    ['absent', () => initialBatchingState(), true],
+    ['active with failed rename', () => isolation(), false, true],
+  ])('isolation %s with failed reservation persistence', (_name, makeState, admit, failRename = false) => {
+    const writeFile = vi.fn(() => { if (!failRename) throw new Error('disk full'); });
+    const shell = createAdaptiveBatching({ repo: 'owner/repo', settings,
+      withLock: (_path, fn) => fn(), nowMs: () => nowMs,
+      readFile: () => JSON.stringify(makeState()), mkdir: () => {}, writeFile,
+      rename: () => { throw new Error('disk full'); }, log: () => {},
+      exec: (_cmd, args) => args.includes('graphql')
+        ? JSON.stringify({ data: { repository: { mergeQueue: { entries: { nodes: [] } } } } })
+        : JSON.stringify({ state: 'OPEN', labels: [{ name: 'red-team:pending' }] }),
+    });
+    const result = shell.gate(7183);
+    expect(writeFile).toHaveBeenCalledOnce();
+    expect(result).toMatchObject({ admit, error: 'disk full' });
+    if (!admit) expect(result.reason).toMatch(/isolation.*retry/i);
+  });
+
+  it('refuses admission when isolation cannot be ruled out from unreadable state', () => {
+    const shell = createAdaptiveBatching({ repo: 'owner/repo', settings, dryRun: true,
+      readFile: () => '{', log: () => {},
+      exec: () => JSON.stringify({ data: { repository: { mergeQueue: { entries: { nodes: [] } } } } }),
+    });
+    expect(shell.gate(7183)).toMatchObject({ admit: false, reason: expect.stringMatching(/isolation.*retry/i) });
+  });
 });
