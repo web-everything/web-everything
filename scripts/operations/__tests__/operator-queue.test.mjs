@@ -204,7 +204,7 @@ describe('operator queue read safety', () => {
     expect(execFileSync).toHaveBeenCalledTimes(5);
     expect(execFileSync).toHaveBeenNthCalledWith(4, 'gh', [
       'api', '--paginate', '--method', 'GET', '-F', 'per_page=100', 'repos/o/n/issues/1/comments',
-      '--jq', '.[] | [.body, .created_at, .user.login, .node_id, .html_url] | @tsv',
+      '--jq', '.[] | [.body, .created_at, .user.login, .node_id, .html_url, .updated_at] | @tsv',
     ], expect.objectContaining({ encoding: 'utf8', maxBuffer: 32 * 1024 * 1024 }));
     expect(process.exitCode).toBeUndefined();
   });

@@ -1517,7 +1517,7 @@ describe('defaultListPrComments — argv shape + @tsv round-trip incl. author.lo
     let capturedArgv;
     defaultListPrComments({ number: 42, repo: 'o/n', exec: (cmd, argv) => { capturedArgv = argv; return ''; } });
     expect(capturedArgv).toEqual(['api', '--paginate', '--method', 'GET', '-F', 'per_page=100', 'repos/o/n/issues/42/comments',
-      '--jq', '.[] | [.body, .created_at, .user.login, .node_id, .html_url] | @tsv']);
+      '--jq', '.[] | [.body, .created_at, .user.login, .node_id, .html_url, .updated_at] | @tsv']);
   });
 
   it("falls back to gh's own {owner}/{repo} template when repo is omitted", () => {

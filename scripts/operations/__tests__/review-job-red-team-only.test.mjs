@@ -251,6 +251,37 @@ function runStoredRecovery(input, { status, prior, saved, failComment = false, f
 }
 
 describe('red-team-only head clearance', () => {
+  it('#7167 F3 clearance-read errors cannot reach the completed-accept exception', () => {
+    const readWitness = vi.fn(() => ({ newest: payload() }));
+    const io = productionJobIo({ readHeadClearance: () => { throw Error('clearance unreadable'); }, readWitness });
+    expect(() => io.readRedTeamOnlyPayload({ repo, pr, head })).toThrow(/clearance.*inspect/);
+    expect(readWitness).not.toHaveBeenCalled();
+  });
+
+  it.each(['after', 'equal', 'invalid', 'missing', 'before'])(
+    '#7167 F6 earlier comment edit metadata must precede clearance: %s', kind => {
+    const at = new Date(20_000).toISOString();
+    const editedAt = kind === 'invalid' ? 'unreadable' : kind === 'missing' ? ''
+      : new Date(kind === 'after' ? 30_000 : kind === 'equal' ? 20_000 : 10_000).toISOString();
+    const exec = vi.fn((_file, args) => {
+      if (args.includes('graphql')) return JSON.stringify({ data: { repository: { pullRequest: { comments: { totalCount: 2 } } } } });
+      if (args.some(a => a.includes('/reviews?'))) return '[]';
+      expect(args).toContain('--jq');
+      return [`manifest baseline mismatch\t${new Date(10_000).toISOString()}\tweb-everything\tIC_hold\t\t${editedAt}`,
+        `<!-- reviewed-sha: ${head} --><!-- cleared-human: operator -->\t${at}\tweb-everything\tIC_clear\t\t${at}`].join('\n');
+    });
+    const readWitness = vi.fn(() => ({ newest: payload() }));
+    const io = productionJobIo({ exec, readWitness });
+    if (kind === 'before') {
+      io.readRedTeamOnlyPayload({ repo, pr, head });
+      expect(readWitness).toHaveBeenCalledWith({ repo, pr, head, clearance: { sha: head, at } });
+    } else {
+      expect(() => io.readRedTeamOnlyPayload({ repo, pr, head })).toThrow(/clearance.*inspect/);
+      expect(readWitness).not.toHaveBeenCalled();
+    }
+    expect(exec.mock.calls.find(([, args]) => args.includes('--jq'))[1].at(-1)).toContain('.updated_at');
+  });
+
   it.each(['cleared', 'absent', 'other-head', 'late-write', 'label', 'no-verdict', 'refused', 'refused-advisory', 'refused-without-clearance', 'read-error'])(
     'plumbs %s clearance through the witness and job', kind => {
       const dir = mkdtempSync(join(tmpdir(), 'red-team-clearance-'));
@@ -275,7 +306,7 @@ describe('red-team-only head clearance', () => {
           readHeadClearance, readWitness: key => readRecoveryWitness({ ...key,
           env: { WE_SHARED_RUNS_DIR: dir }, readScorecards: () => [], now: 30_000,
           list: () => ['review-pr-parked'], read: () => parked,
-          stat: () => ({ mtimeMs: kind === 'late-write' ? 20_001 : 20_000 }) }) });
+          stat: () => ({ mtimeMs: kind === 'late-write' ? 20_001 : 17_000 }) }) });
         const io = fakeIo({ readRedTeamOnlyPayload: production.readRedTeamOnlyPayload, redTeamStatus: production.redTeamStatus });
         const result = runReviewJob({ repo, pr, redTeamOnly: true }, io);
         expect(readHeadClearance).toHaveBeenCalledWith({ repo, pr, head });
@@ -284,7 +315,7 @@ describe('red-team-only head clearance', () => {
           expect(result.outcome).toBe('red-team-only');
           expect(io.runRedTeam).toHaveBeenCalled();
         } else {
-          expect(result).toMatchObject({ outcome: 'blocked-on-infra', label: expect.stringContaining('review-unfinished') });
+          expect(result).toMatchObject({ outcome: 'blocked-on-infra', label: expect.stringContaining(kind === 'read-error' ? 'clearance unreadable' : 'review-unfinished') });
           expect(io.runRedTeam).not.toHaveBeenCalled();
         }
       } finally { rmSync(dir, { recursive: true, force: true }); }
@@ -295,9 +326,9 @@ describe('red-team-only head clearance', () => {
       const at = new Date(20_000).toISOString();
       const sha = kind === 'other-head' ? 'b'.repeat(40) : head;
       const body = `<!-- reviewed-sha: ${sha} --><!-- cleared-human: operator -->`;
-      const comments = [`${body}\t${at}\t${kind === 'untrusted' ? 'stranger' : 'web-everything'}\tIC_clear`];
-      if (kind === 'later-comment') comments.push(`Please hold\t${at}\tstranger\tIC_later`);
-      if (kind === 'later-hold') comments.push(`manifest baseline mismatch\t${at}\tweb-everything\tIC_later`);
+      const comments = [`${body}\t${at}\t${kind === 'untrusted' ? 'stranger' : 'web-everything'}\tIC_clear\t\t${at}`];
+      if (kind === 'later-comment') comments.push(`Please hold\t${at}\tstranger\tIC_later\t\t${at}`);
+      if (kind === 'later-hold') comments.push(`manifest baseline mismatch\t${at}\tweb-everything\tIC_later\t\t${at}`);
       const exec = vi.fn((_file, args) => {
         if (args.includes('graphql')) return JSON.stringify({ data: { repository: { pullRequest: { comments: { totalCount: comments.length } } } } });
         if (args.some(a => a.includes('/reviews?'))) {
@@ -308,7 +339,13 @@ describe('red-team-only head clearance', () => {
         return comments.join('\n');
       });
       const readWitness = vi.fn(() => ({ newest: payload() }));
-      productionJobIo({ exec, readWitness }).readRedTeamOnlyPayload({ repo, pr, head });
+      const read = () => productionJobIo({ exec, readWitness }).readRedTeamOnlyPayload({ repo, pr, head });
+      if (['later-comment', 'later-hold', 'later-review', 'reviews-error', 'oversized-reviews'].includes(kind)) {
+        expect(read).toThrow(/clearance.*inspect/);
+        expect(readWitness).not.toHaveBeenCalled();
+        return;
+      }
+      read();
       const clearance = readWitness.mock.calls[0][0].clearance;
       if (kind === 'clear') expect(clearance).toEqual({ sha: head, at });
       else expect(clearance).toBeFalsy();
@@ -371,7 +408,7 @@ describe('red-team-only quarantined head review', () => {
         if (kind === 'other-effect') loopPayload.effects[0].type = 'review.other';
         if (kind === 'other-head') loopPayload.findings.read.netBasis.rev = 'b'.repeat(40);
         const path = writeRun(loopPayload, join(dir, 'runs-quarantine'));
-        utimesSync(path, 20, kind === 'late' ? 21 : 20);
+        utimesSync(path, 17, kind === 'late' ? 21 : 17);
         // The remaining active review belongs to an older head.
         writeRun({ ...newRunRecord({ id: 'review-pr-old', op: 'review-pr', input: { repo, pr } }),
           ...payload(), findings: { read: { netBasis: { rev: 'c'.repeat(40) } } } }, env.WE_SHARED_RUNS_DIR);
@@ -403,7 +440,7 @@ describe('red-team-only review job', () => {
         writeRun({ ...newRunRecord({ id: 'review-pr-auto', op: 'review-pr', input: { repo, pr } }),
           ...payload() }, env.WE_SHARED_RUNS_DIR);
         recordRedTeamStatus({ repo, pr, loopPayload: payload(), status: 'finished', result: 'ran' }, { env });
-        const production = productionJobIo({ env, readSeatRecords: () => [
+        const production = productionJobIo({ env, readHeadClearance: () => null, readSeatRecords: () => [
           { dispatchKind: 'review-seat', seat: 'red-team', repo, pr, rev: head, status: 'ok' },
         ] });
         const io = fakeIo({ planRedTeamMode: production.planRedTeamMode,
@@ -438,7 +475,7 @@ describe('red-team-only review job', () => {
       writeRun({ ...newRunRecord({ id: 'review-pr-race', op: 'review-pr', input: { repo, pr } }),
         ...payload() }, env.WE_SHARED_RUNS_DIR);
       recordRedTeamStatus({ repo, pr, loopPayload: payload(), status: 'finished', result: 'ran' }, { env });
-      const production = productionJobIo({ env, readWitness: key => readable
+      const production = productionJobIo({ env, readHeadClearance: () => null, readWitness: key => readable
         ? readRecoveryWitness({ ...key, env, readScorecards: () => [
           { dispatchKind: 'review-seat', seat: 'red-team', repo, pr, rev: head, status: 'ok' },
         ] }) : { ok: false, reason: 'scorecard store unreadable' } });

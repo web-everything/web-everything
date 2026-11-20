@@ -262,17 +262,18 @@ const unfinishedReview = run => !run.verdict || run.pending != null || hasOpenEf
 const advisoryParkedReview = (run, head, allowRefused = false) => {
   if (run.findings?.read?.netBasis?.rev !== head
     || !['accept', 'prevention-outstanding', 'needs-human'].includes(verdictOf(run))
+    || (verdictOf(run) === 'needs-human' && !redTeamOwedFor(run))
     || !Array.isArray(run.effects)) return false;
   if (run.outcome === 'refused' && (!allowRefused || !run.effects.some(effect => effect?.status === 'refused'))) return false;
   if (run.pending != null && !(run.pending.kind === 'effect' && run.pending.step === 'advise')) return false;
   return run.effects.every(effect => effect?.status === 'applied'
     || ((['declared', 'pending', 'in-flight', 'failed'].includes(effect?.status) || (allowRefused && effect?.status === 'refused'))
       && typeof effect.type === 'string'
-      && (effect.type.startsWith('review.advisory-') || effect.type === 'review.scoped-rereview-shadow')));
+      && ['review.advisory-note', 'review.advisory-label', 'review.scoped-rereview-shadow'].includes(effect.type)));
 };
 const clearedParkedReview = (run, head, at, clearance) => {
   const clearedAt = typeof clearance?.at === 'number' ? clearance.at : Date.parse(clearance?.at);
-  return clearance?.sha === head && Number.isFinite(clearedAt) && Number.isFinite(at) && at <= clearedAt
+  return clearance?.sha === head && Number.isFinite(clearedAt) && Number.isFinite(at) && at + RUN_MTIME_SLACK_MS < clearedAt
     && advisoryParkedReview(run, head, true);
 };
 // An unfinished run that already ACCEPTED a readable sha other than the live head only waits on bookkeeping effects
@@ -679,13 +680,24 @@ function clearedQuarantinedReview({ repo, pr, head, clearance, runsDir, scanSett
   if (clearance?.sha !== head || !Number.isFinite(clearedAt)) return null;
   try { stat(dir); } catch (error) { if (error.code === 'ENOENT') return null; throw error; }
   let selected = null, conflict = false;
-  const scan = createNewestRunFinder({ ids: list(dir).filter(id => id.startsWith('review-pr-')),
-    stat: id => stat(join(dir, `${id}.json`)), read: id => read(id, dir), scanSettings, warn });
+  const ids = list(dir).filter(id => id.startsWith('review-pr-')).sort();
+  const identities = new Map();
+  const identity = metadata => JSON.stringify([metadata.mtimeMs, metadata.dev, metadata.ino, metadata.size, metadata.ctimeMs, metadata.birthtimeMs]);
+  const scan = createNewestRunFinder({ ids,
+    stat: id => {
+      const metadata = stat(join(dir, `${id}.json`));
+      identities.set(id, identity(metadata));
+      return metadata;
+    }, read: id => read(id, dir), scanSettings, warn });
   const end = scan((run, id, at) => {
-    if (run.id !== id) throw Error('quarantined review identity unreadable; hold and inspect quarantine evidence');
+    try {
+      assertReviewRunEvidence(run);
+      const match = NAME_RE.exec(id);
+      if (run.id !== id || (match && (run.op !== 'review-pr' || Number(run.input?.pr) !== Number(match[1])))) throw Error('filename and payload disagree');
+    } catch (cause) { throw Error('quarantined review identity unreadable; hold and inspect quarantine evidence', { cause }); }
     if (run.op !== 'review-pr' || run.input?.repo !== repo || Number(run.input?.pr) !== Number(pr)
       || run.findings?.read?.netBasis?.rev !== head) return false;
-    if (at > clearedAt || run.carriedFrom != null || !supersededRecordEffects(run)
+    if (!(at + RUN_MTIME_SLACK_MS < clearedAt) || run.carriedFrom != null || !supersededRecordEffects(run)
       || (!['accept', 'prevention-outstanding'].includes(verdictOf(run)) && !redTeamOwedFor(run))) conflict = true;
     // Two different panels cannot stand in for one another without an operator choosing the evidence.
     if (selected && JSON.stringify([selected.run.verdict, selected.run.findings]) !== JSON.stringify([run.verdict, run.findings])) conflict = true;
@@ -693,6 +705,10 @@ function clearedQuarantinedReview({ repo, pr, head, clearance, runsDir, scanSett
     return false; // Prove the whole bounded scan, including errors and conflicting candidates.
   });
   if (end?.ok === false) throw Error('quarantined review scan-capped; hold and inspect quarantine evidence');
+  if (JSON.stringify(ids) !== JSON.stringify(list(dir).filter(id => id.startsWith('review-pr-')).sort())
+    || ids.some(id => identity(stat(join(dir, `${id}.json`))) !== identities.get(id))) {
+    throw Error('quarantined review changed during scan; hold and inspect quarantine evidence');
+  }
   if (conflict) throw Error('quarantined review conflict; hold and inspect quarantine evidence');
   return selected;
 }

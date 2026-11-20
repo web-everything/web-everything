@@ -420,8 +420,18 @@ export function createReviewJobIo({ root = REPO_ROOT, env = process.env, dir = r
     });
     const reviews = readCompletePrReviews({ repo, pr, env,
       exec: (args, options) => exec('gh', args, { ...options, cwd: root, env }) });
-    if (!Array.isArray(comments) || !Array.isArray(reviews)) return null;
+    if (!Array.isArray(comments) || !Array.isArray(reviews)) throw Error('clearance evidence unreadable; hold and inspect thread');
     const record = latestAcceptRecord(comments, reviews, { sha: head });
+    if (record) {
+      const clearedAt = Date.parse(record.at);
+      const editedEarlierComment = comments.slice(0, record.index).some(comment => {
+        const updatedAt = Date.parse(comment.updatedAt ?? comment.updated_at);
+        return !Number.isFinite(updatedAt) || !Number.isFinite(clearedAt) || updatedAt >= clearedAt;
+      });
+      if (record.laterBodyDerivedHold || record.laterVerdict || editedEarlierComment) {
+        throw Error('clearance superseded or comments edited; hold and inspect thread before fresh clearance');
+      }
+    }
     return record?.humanCleared === true && !record.laterBodyDerivedHold && !record.laterVerdict
       && !record.reviewsUnreadable && Number.isFinite(Date.parse(record.at))
       ? { sha: record.sha, at: record.at } : null;
@@ -435,7 +445,8 @@ export function createReviewJobIo({ root = REPO_ROOT, env = process.env, dir = r
   const repoIds = new Map();
   const readClearedWitness = key => {
     let clearance;
-    try { clearance = readHeadClearance(key); } catch { /* No clearance authority on a read miss. */ }
+    try { clearance = readHeadClearance(key); }
+    catch (cause) { throw Error('clearance unreadable or withheld; hold and inspect thread before recovery', { cause }); }
     return readWitness({ ...key, clearance });
   };
   const restoreAdmission = ({ repo, pr, head }) => {

@@ -54,6 +54,15 @@ const MECH_AFTER_REPARK = fx.labelsAfterRepark.map((l) => (l === 'review:human' 
 const OLD = fx.acceptedHead;
 const NEW = fx.newHead;
 
+it.each(['Clearance revoked: manifest baseline mismatch.', 'review paused: clearance revoked.'])(
+  '#7167 S2 a trusted revocation quoting the old clearance marker still holds: %s', hold => {
+  const body = `${hold} Previous clearance:\n<!-- reviewed-sha: ${OLD} -->\n<!-- cleared-human: chalbert -->`;
+  const record = latestAcceptRecord([{ author: { login: 'chalbert' }, body }]);
+  expect(record.laterBodyDerivedHold || record.laterVerdict).toBe(true);
+  expect(decideAcceptCarryForward({ setting: 'on', record, headSha: NEW, headDiff: record.diff }))
+    .toMatchObject({ action: 'none', reason: expect.stringMatching(/hold/) });
+});
+
 describe('#4535 replay — merge-queue refresh fcc29ce1 → 143107a87, net diff unchanged', () => {
   const record = latestAcceptRecord(fx.comments);
 
