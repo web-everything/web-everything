@@ -3,47 +3,12 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import { spawnSync } from 'node:child_process';
 import { existsSync, readFileSync, mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { basename, join } from 'node:path';
+import { createServer } from 'node:net';
+import { dirname, join } from 'node:path';
 import { AGY_STATE_WRITE_DIRS, buildSandboxEnv, buildSandboxProfile, sandboxedSpawnArgv, sandboxSecretPaths } from '../agy-sandbox.mjs';
 import { defaultSpawnAgy, runConfinedAgyBuild } from '../agy-confined-build.mjs';
 import { AGY_FIX_PROVIDER } from '../../operations/agy-fix-provider.mjs';
 import { fixLauncherAvailable } from '../../operations/dispatch-providers/fix.mjs';
-
-describe('unverified service and credential confinement refuses production', () => {
-  it('does not advertise filesystem-only SBPL as workspace confinement', () => {
-    expect(AGY_FIX_PROVIDER.confinement.mode).toBe('unavailable');
-    expect(fixLauncherAvailable('antigravity', {
-      taskKind: 'doc-fix', size: 1, scope: ['docs'], exists: () => true,
-    })).toBe(false);
-  });
-  it('refuses explicit provider selection before lane resolution or task execution', async () => {
-    const resolveLane = vi.fn(() => '/unused-lane');
-    const runTask = vi.fn(async () => ({ status: 'ok' }));
-    await expect(AGY_FIX_PROVIDER.spawn({ prompt: 'repair', kind: 'doc-fix', size: 1, scope: ['docs'] },
-      { resolveLane, runTask })).rejects.toThrow(/confinement unavailable.*use another provider/);
-    expect(resolveLane).not.toHaveBeenCalled();
-    expect(runTask).not.toHaveBeenCalled();
-  });
-  it('refuses a direct native launcher call before even reading launch options', async () => {
-    const readCli = vi.fn(() => { throw new Error('launch options accessed'); });
-    await expect(defaultSpawnAgy({ get cli() { return readCli(); } }))
-      .rejects.toThrow(/confinement unavailable.*use another provider/);
-    expect(readCli).not.toHaveBeenCalled();
-  });
-  it('refuses direct builds on Darwin with sandbox-exec before any git or scratch work', async () => {
-    const exec = vi.fn(() => { throw new Error('git must not run'); });
-    const mkTempDir = vi.fn(() => { throw new Error('scratch must not be allocated'); });
-    const result = await runConfinedAgyBuild({ task: 'repair', laneDir: '/unused-lane',
-      kind: 'doc-fix', size: 1, scope: ['docs'], deps: {
-        platform: 'darwin', sandboxExists: () => true, exec, mkTempDir,
-        readFile: () => '{}', env: { WE_AGY_BUILD_MAX_SIZE: '100' }, log: () => {},
-      } });
-    expect(result).toMatchObject({ status: 'refused', applied: [],
-      reasons: [expect.stringMatching(/confinement unavailable.*use another provider/)] });
-    expect(exec).not.toHaveBeenCalled();
-    expect(mkTempDir).not.toHaveBeenCalled();
-  });
-});
 
 const roots = [];
 afterEach(() => { for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true }); });
@@ -71,7 +36,7 @@ describe('pure sandbox profile', () => {
   it('refuses missing transcript containment evidence', () => {
     expect(() => buildSandboxProfile({ ...fixture(), transcriptDir: undefined })).toThrow('unsafe sandbox path');
   });
-  it('grants exactly clone, private temp, measured log directory and devices; network remains allowed', () => {
+  it('grants exactly clone, private temp, measured log directory and devices; network is denied', () => {
     const f = fixture();
     const profile = buildSandboxProfile(f);
     expect(AGY_STATE_WRITE_DIRS).toEqual(['.gemini/antigravity-cli/log']);
@@ -79,7 +44,7 @@ describe('pure sandbox profile', () => {
     const writeRule = profile.split('\n').find(line => line.startsWith('(allow file-write*'));
     expect(writeRule).toBe(`(allow file-write* ${[f.cloneDir, f.privateTempDir, join(f.homeDir, '.gemini/antigravity-cli/log')]
       .map(p => `(subpath ${JSON.stringify(p)})`).join(' ')} (literal "/dev/null") (literal "/dev/tty") (literal "/dev/dtracehelper"))`);
-    expect(profile).not.toContain('deny network');
+    expect(profile).toContain('(deny network*)');
   });
   it('denies reads of every secret root and workspace operations, plus extra denied paths', () => {
     const f = fixture();
@@ -99,7 +64,7 @@ describe('pure sandbox profile', () => {
     const rules = profile.split('\n');
     const homeDeny = `(deny file-read* (subpath ${JSON.stringify(f.homeDir)}))`;
     const allow = rules.find(line => line.startsWith('(allow file-read*'));
-    expect(allow).toBe(`(allow file-read* ${[f.cloneDir, f.privateTempDir, join(f.homeDir, '.gemini'), agyBinDir, homebrewPrefix]
+    expect(allow).toBe(`(allow file-read* ${[f.cloneDir, f.privateTempDir, join(f.homeDir, '.gemini'), agyBinDir, homebrewPrefix, dirname(realpathSync(process.execPath)), '/usr/bin', ...(realpathSync(process.execPath).match(/^(.*)\/(?:Cellar|Caskroom)\//)?.[1] ? [realpathSync(process.execPath).match(/^(.*)\/(?:Cellar|Caskroom)\//)[1]] : []), '/usr', '/bin', '/System', '/Library', '/private/var/db', '/private/preboot/Cryptexes/OS', '/dev/null', '/dev/urandom', '/dev/random', '/dev/dtracehelper']
       .map(p => `(subpath ${JSON.stringify(p)})`).join(' ')})`);
     expect(rules.indexOf(homeDeny)).toBeGreaterThan(-1);
     expect(rules.indexOf(allow)).toBeGreaterThan(rules.indexOf(homeDeny));
@@ -169,87 +134,104 @@ describe('pure sandbox profile', () => {
   });
 });
 
-it.skipIf(process.platform !== 'darwin' || !existsSync('/usr/bin/sandbox-exec'))(
-  'REAL sandbox allows clone/temp/log writes and real-HOME login reads, denies outside writes and secret reads with EPERM', () => {
+describe('agy sandbox is deny-default', () => {
+  it('starts with version and deny default, never allow default, and denies network', () => {
+    const profile = buildSandboxProfile(fixture());
+    expect(profile.startsWith('(version 1)\n(deny default)\n')).toBe(true);
+    expect(profile).not.toContain('(allow default)');
+    expect(profile).toContain('(deny network*)');
+    expect(profile).not.toMatch(/\(allow (?:network|mach-lookup)/);
+  });
+  it('restricts process-exec to literal resolved node/npm/git/agy binaries', () => {
     const f = fixture();
-    const denied = join(f.cloneDir, 'extra-denied');
-    mkdirSync(denied);
-    writeFileSync(join(denied, 'secret'), 'fixture secret');
-    mkdirSync(join(f.homeDir, '.gemini/antigravity-cli/conversations'));
-    mkdirSync(join(f.homeDir, '.gemini/antigravity-cli/brain'));
-    writeFileSync(join(f.homeDir, '.gemini/antigravity-cli/conversations/secret'), 'real conversation');
-    const profileFile = join(f.root, 'profile.sb');
-    writeFileSync(profileFile, buildSandboxProfile({ ...f, extraDeniedPaths: [denied] }), { mode: 0o600 });
-    const run = (script, ...args) => {
-      const [, ...argv] = sandboxedSpawnArgv(profileFile, ['/bin/sh', '-c', script, 'probe', ...args]);
-      return spawnSync('/usr/bin/sandbox-exec', argv, { cwd: f.cloneDir, encoding: 'utf8', timeout: 10_000 });
-    };
-    const inside = join(f.cloneDir, 'allowed');
-    const cloneWrite = run('printf allowed > "$1"', inside);
-    expect(cloneWrite.status, cloneWrite.stderr).toBe(0);
-    expect(existsSync(inside)).toBe(true);
-    const cloneRead = run('/bin/cat "$1"', inside);
-    expect(cloneRead.status).toBe(0);
-    expect(cloneRead.stdout).toBe('allowed');
-    expect(run('/bin/ls "$1"', f.cloneDir).status).toBe(0);
-    const siblingTemp = realpathSync(mkdtempSync(join(tmpdir(), 'we-agy-sibling-test-')));
-    roots.push(siblingTemp);
-    const siblingFile = join(siblingTemp, 'other-worker-data');
-    for (const allowed of [join(f.privateTempDir, 'allowed'),
-      join(f.homeDir, '.gemini/antigravity-cli/log/session')]) {
-      expect(run('printf allowed > "$1"', allowed).status, allowed).toBe(0);
-      expect(existsSync(allowed)).toBe(true);
-      const read = run('/bin/cat "$1"', allowed);
-      expect(read.status, allowed).toBe(0);
-      expect(read.stdout).toBe('allowed');
-    }
-    const osTempTarget = join(realpathSync(tmpdir()), `${basename(f.root)}-blocked`);
-    roots.push(osTempTarget);
-    mkdirSync(join(f.homeDir, '.gemini/config'));
-    const sibling = join(f.homeDir, '.gemini-like');
-    mkdirSync(sibling);
-    for (const outside of [osTempTarget, siblingFile, join(f.root, 'blocked'), join(f.laneDir, 'blocked'),
-      ...['settings.json', 'bin/x', 'builtin/x', 'installation_id', 'sibling', 'settings.json.123.tmp', 'log-sibling', 'conversations/x', 'brain/x', 'conversation_summaries.db', 'conversation_summaries.db-wal', 'conversation_summaries.db-shm', 'conversation_summaries.db-journal', 'jetbox_summaries_proto.pb', 'jetski_state.pbtxt', 'history.jsonl', 'cli.log'].map(p => join(f.homeDir, '.gemini/antigravity-cli', p)),
-      join(sibling, 'blocked'), join(f.homeDir, '.gemini/other-state'),
-      join(f.homeDir, 'blocked'), join(f.homeDir, '.gemini/config/blocked'),
-      ...['projects.json', 'projects.json.123.tmp', 'projects.json.123.tmp.extra'].map(p => join(f.homeDir, '.gemini', p))]) {
-      const write = run('printf blocked > "$1"', outside);
-      expect(write.error).toBeUndefined();
-      expect(write.status, outside).not.toBe(0);
-      expect(write.stderr).toMatch(/EPERM|Operation not permitted/i);
-      expect(existsSync(outside)).toBe(false);
-    }
-    // These files exist: a missing-file error would not prove read confinement.
-    for (const path of [join(f.homeDir, 'personal-notes'), join(f.cloneDir, '.env'),
-      join(f.privateTempDir, '.env.local'), join(f.homeDir, '.gemini/.env.credentials')]) {
-      writeFileSync(path, 'fixture secret');
-      const read = run('/bin/cat "$1"', path);
-      expect(read.error).toBeUndefined();
-      expect(read.status, path).not.toBe(0);
-      expect(read.stderr).toMatch(/EPERM|Operation not permitted/i);
-      expect(read.stdout).toBe('');
-    }
-    const realLogin = run('/bin/cat "$1"', join(f.homeDir, '.gemini/antigravity-cli/antigravity-oauth-token'));
-    expect(realLogin.status).toBe(0);
-    for (const root of [...sandboxSecretPaths(f.homeDir), f.workspaceOps, denied]) {
-      writeFileSync(join(root, 'secret'), 'fixture secret');
-      const read = run('/bin/cat "$1"', join(root, 'secret'));
-      expect(read.error).toBeUndefined();
-      expect(read.status, root).not.toBe(0);
-      expect(read.stderr).toMatch(/EPERM|Operation not permitted/i);
-      expect(read.stdout).not.toContain('fixture secret');
-    }
-  },
-);
+    const executables = { node: realpathSync(process.execPath), npm: '/opt/toolchain/npm', git: '/usr/bin/git', agy: '/opt/agy/bin/agy' };
+    const profile = buildSandboxProfile({ ...f, executables });
+    expect(profile.split('\n').filter(line => line.startsWith('(allow process-exec')))
+      .toEqual(Object.values(executables).map(p => `(allow process-exec (literal ${JSON.stringify(p)}))`));
+    expect(profile).not.toMatch(/\(allow process-exec\s*\)/);
+  });
+  it.each([{ shell: '/bin/sh' }, { node: '/' }, { node: 'relative' }, null])('rejects invalid executable policy %j', executables => {
+    expect(() => buildSandboxProfile({ ...fixture(), executables })).toThrow(/executable|unsafe sandbox path/);
+  });
+  it('keeps production unavailable until the real sandbox is proven', () => {
+    expect(AGY_FIX_PROVIDER.confinement.mode).toBe('unavailable');
+    expect(fixLauncherAvailable('antigravity', { taskKind: 'doc-fix', size: 1, scope: ['docs'], exists: () => true })).toBe(false);
+  });
+});
 
-it('documents that direct write and home-read confinement excludes service-mediated writes and secret reads', () => {
-  for (const path of ['../agy-sandbox.mjs', '../../../docs/agent/testing.md']) {
-    const text = readFileSync(new URL(path, import.meta.url), 'utf8');
-    expect(text).toContain("process's own file writes and home reads");
-    expect(text).toContain('Mach/XPC/LaunchServices-mediated writes');
-    expect(text).toContain('Service-mediated secret reads');
-    for (const channel of ['securityd', 'gh auth token', 'ssh-agent']) expect(text).toContain(channel);
-    for (const command of ['defaults', 'open', 'osascript', 'launchctl']) expect(text).toContain(command);
-    expect(text).toContain('out of scope');
+it('production launcher refuses before accessing launch options while real proof is blocked', async () => {
+  const readCli = vi.fn();
+  await expect(defaultSpawnAgy({ get cli() { return readCli(); } })).rejects.toThrow(/confinement unavailable.*operator review/);
+  expect(readCli).not.toHaveBeenCalled();
+});
+
+it('production provider refuses explicit selection before resolving a lane or executing a task', async () => {
+  const resolveLane = vi.fn(); const runTask = vi.fn();
+  await expect(AGY_FIX_PROVIDER.spawn({ prompt: 'repair', kind: 'doc-fix', size: 1, scope: ['docs'] }, { resolveLane, runTask }))
+    .rejects.toThrow(/confinement unavailable.*operator review/);
+  expect(resolveLane).not.toHaveBeenCalled(); expect(runTask).not.toHaveBeenCalled();
+});
+it('production build refuses Darwin before git or scratch work until live proof', async () => {
+  const exec = vi.fn(); const mkTempDir = vi.fn();
+  const result = await runConfinedAgyBuild({ task: 'repair', laneDir: '/unused-lane', kind: 'doc-fix', size: 1, scope: ['docs'],
+    deps: { platform: 'darwin', sandboxExists: () => true, exec, mkTempDir, readFile: () => '{}', env: {}, log: () => {} } });
+  expect(result).toMatchObject({ status: 'refused', applied: [], reasons: [expect.stringMatching(/confinement unavailable.*operator review/)] });
+  expect(exec).not.toHaveBeenCalled(); expect(mkTempDir).not.toHaveBeenCalled();
+});
+
+// Seatbelt and sandbox-exec are macOS-only; never substitute a mocked security probe.
+const realProbe = it.skipIf(process.platform !== 'darwin');
+function probeFixture() {
+  const f = fixture();
+  const node = realpathSync(process.execPath);
+  const profileFile = join(f.root, 'profile.sb');
+  writeFileSync(profileFile, buildSandboxProfile({ ...f, agyBinDir: dirname(node), executables: { node } }));
+  // `env -i` re-applies the scrubbed environment: the test-cache tracer injects NODE_OPTIONS into every spawn.
+  const env = buildSandboxEnv(process.env, f.privateTempDir, f.homeDir);
+  return { ...f, run: code => spawnSync('/usr/bin/env', ['-i', ...Object.entries(env).map(([k, v]) => `${k}=${v}`),
+    '/usr/bin/sandbox-exec', '-f', profileFile, node, '-e', code], {
+    cwd: f.cloneDir, encoding: 'utf8', timeout: 10_000,
+  }) };
+}
+function expectProbe(result) {
+  expect(result.error, result.stderr).toBeUndefined();
+  expect(result.status, result.stderr).toBe(0);
+}
+realProbe('REAL deny-default node can execute and write clone/private temp/log files', () => {
+  const f = probeFixture();
+  for (const dir of [f.cloneDir, f.privateTempDir, join(f.homeDir, '.gemini/antigravity-cli/log')]) {
+    const target = join(dir, 'allowed');
+    expectProbe(f.run(`require('node:fs').writeFileSync(${JSON.stringify(target)}, 'allowed'); console.log('ran-node')`));
+    expect(readFileSync(target, 'utf8')).toBe('allowed');
   }
+});
+realProbe('REAL deny-default node cannot read planted fake-HOME ssh/secrets or clone .env', () => {
+  const f = probeFixture();
+  for (const path of [join(f.homeDir, '.ssh/secret'), join(f.homeDir, '.secrets/secret'), join(f.cloneDir, '.env')]) {
+    writeFileSync(path, 'planted secret');
+    expectProbe(f.run(`try { require('node:fs').readFileSync(${JSON.stringify(path)}); process.exit(9); } catch (e) { if (e.code !== 'EPERM' && e.code !== 'EACCES') throw e; }`));
+  }
+});
+realProbe('REAL deny-default node cannot write outside clone/temp/log grants', () => {
+  const f = probeFixture();
+  for (const dir of [f.root, f.laneDir, f.homeDir]) {
+    const path = join(dir, 'blocked');
+    expectProbe(f.run(`try { require('node:fs').writeFileSync(${JSON.stringify(path)}, 'blocked'); process.exit(9); } catch (e) { if (e.code !== 'EPERM' && e.code !== 'EACCES') throw e; }`));
+    expect(existsSync(path)).toBe(false);
+  }
+});
+realProbe('REAL deny-default node cannot connect TCP to a listening loopback server', async () => {
+  const server = createServer(socket => socket.destroy());
+  await new Promise((resolve, reject) => { server.once('error', reject); server.listen(0, '127.0.0.1', resolve); });
+  try {
+    const f = probeFixture();
+    expectProbe(f.run(`const s = require('node:net').connect(${server.address().port}, '127.0.0.1');
+      s.on('connect', () => { s.destroy(); process.exit(9); });
+      s.on('error', e => { if (!['EPERM', 'EACCES'].includes(e.code)) { console.error(e); process.exit(8); } });`));
+  } finally { await new Promise(resolve => server.close(resolve)); }
+});
+realProbe('REAL deny-default node cannot execute an unlisted shell', () => {
+  const f = probeFixture();
+  expectProbe(f.run(`const r = require('node:child_process').spawnSync('/bin/sh', ['-c', 'exit 0']);
+    if (!r.error || !['EPERM', 'EACCES'].includes(r.error.code)) { console.error(r); process.exit(9); }`));
 });

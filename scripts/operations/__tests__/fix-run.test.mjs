@@ -2249,7 +2249,7 @@ it('refuses the production Antigravity worker before running untrusted review in
 it('declares unavailable confinement and refuses scoped builds before the task runs', async () => {
   const { resolveFixProvider } = await import('../fix-run.mjs');
   const provider = await resolveFixProvider('antigravity');
-  expect(provider.confinement).toMatchObject({ mode: 'unavailable', reason: expect.stringContaining('Mach/XPC') });
+  expect(provider.confinement).toMatchObject({ mode: 'unavailable', reason: expect.stringContaining('deny-default') });
   expect(fixLauncherAvailable('antigravity')).toBe(false);
   expect(fixLauncherAvailable('antigravity', { taskKind: 'doc-fix', size: 1, scope: ['docs'] })).toBe(false);
   const runTask = vi.fn();

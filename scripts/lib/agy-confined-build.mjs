@@ -135,19 +135,36 @@ export async function defaultSpawnAgy(options) {
       if (canonicalPath(path) !== path)
         throw new Error('agy log directory is redirected; use another provider or request operator review');
     }
+    const executables = { node: realpathSync(process.execPath), agy: cli };
+    for (const name of ['npm', 'git']) {
+      const tool = (process.env.PATH ?? '').split(':').filter(isAbsolute).map(p => join(p, name))
+        .find(p => { try { accessSync(p, constants.X_OK); return true; } catch { return false; } });
+      if (!tool) throw new Error(`sandbox executable ${name} unavailable; use another provider or request operator review`);
+      executables[name] = realpathSync(tool);
+    }
     const privateTempDir = mkdtempSync(join(profileDir, 'tmp-'));
-    const profile = buildSandboxProfile({ transcriptDir: realpathSync(dirname(options.logFile)), cloneDir: realpathSync(options.dir), homeDir, privateTempDir,
+    const profile = buildSandboxProfile({ executables, transcriptDir: realpathSync(dirname(options.logFile)), cloneDir: realpathSync(options.dir), homeDir, privateTempDir,
       laneDir: realpathSync(options.laneDir), workspaceDir, agyBinDir: dirname(cli),
       homebrewPrefix: cli.match(/^(.*)\/(?:Cellar|Caskroom)\//)?.[1],
       workspaceOps: canonicalPath(join(homeDir, 'workspace/.operations')),
       deniedPaths: sandboxSecretPaths(homeDir).map(canonicalPath) });
+    if (typeof profile !== 'string' || !profile.startsWith('(version 1)\n(deny default)\n')
+      || profile.includes('(allow default)'))
+      throw new Error('invalid sandbox profile: deny-default required; use another provider or request operator review');
     const profileFile = join(profileDir, 'profile.sb');
     writeFileSync(profileFile, profile, { mode: 0o600, flag: 'wx' });
-    return await runAgyDirectExec({ ...options, exclusiveLog: true, cli, readHold: readAgyHold, saveHold: saveAgyHold, spawnFn: (bin, args, opts) => {
+    let attempted = false;
+    const outcome = await runAgyDirectExec({ ...options, exclusiveLog: true, cli, readHold: readAgyHold, saveHold: saveAgyHold, spawnFn: (bin, args, opts) => {
+      attempted = true;
       const [, ...argv] = sandboxedSpawnArgv(profileFile, [bin, ...args]);
       return spawn('/usr/bin/sandbox-exec', argv, { ...opts,
         env: buildSandboxEnv(process.env, privateTempDir, homeDir) });
     } });
+    // Direct exec reports spawn errors as outcomes. Promote failed sandbox launches to refusal,
+    // preserving quota holds without retrying the worker outside sandbox-exec.
+    if (attempted && outcome.code !== 0 && outcome.fallbackDecision === 'none')
+      throw new Error('sandboxed agy launch failed; use another provider or request operator review');
+    return outcome;
   } finally { rmSync(profileDir, { recursive: true, force: true }); }
 }
 

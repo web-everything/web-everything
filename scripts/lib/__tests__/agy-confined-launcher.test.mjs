@@ -6,6 +6,7 @@ import { spawn } from 'node:child_process';
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, renameSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
+import { buildSandboxProfile } from '../agy-sandbox.mjs';
 import { defaultSpawnAgy } from '../agy-confined-build.mjs';
 import { agyRunEvidence, readAgyHold, saveAgyHold } from '../antigravity-run-evidence.mjs';
 
@@ -15,18 +16,19 @@ vi.mock('node:os', async importOriginal => {
   return { ...original, homedir: () => host.home ?? original.homedir() };
 });
 vi.mock('node:child_process', async importOriginal => ({ ...await importOriginal(), spawn: vi.fn() }));
-// Preserve coverage of the dormant launcher's file-IO mechanics with a fake HOME.
-// Only this test module replaces the production refusal; agy-sandbox.test.mjs
-// exercises every public launch entry with the real, unmocked guard.
-vi.mock('../agy-sandbox.mjs', async importOriginal => ({
-  ...await importOriginal(), assertAgyBuildConfinement: () => {},
-}));
+vi.mock('../agy-sandbox.mjs', async importOriginal => {
+  const original = await importOriginal();
+  return { ...original, assertAgyBuildConfinement: () => {}, buildSandboxProfile: vi.fn(original.buildSandboxProfile) };
+});
 
+const { buildSandboxProfile: actualProfile } = await vi.importActual('../agy-sandbox.mjs');
 const roots = [];
 afterEach(() => {
   host.home = null;
   vi.unstubAllEnvs();
   vi.clearAllMocks();
+  buildSandboxProfile.mockReset();
+  buildSandboxProfile.mockImplementation(actualProfile);
   for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true });
 });
 function fixture() {
@@ -208,48 +210,44 @@ it('refuses a redirected log directory with operator fallback and cleans launche
   expect(existsSync(host.home)).toBe(true);
 });
 
-it.skipIf(process.platform !== 'darwin' || !existsSync('/usr/bin/sandbox-exec'))(
-  'REAL launcher uses real-HOME login, allows log writes, denies other home reads/writes and cleans only private temp', async () => {
-    const { options } = fixture();
-    mkdirSync(join(host.home, '.gemini/antigravity-cli/log'));
-    const login = join(host.home, '.gemini/antigravity-cli/antigravity-oauth-token');
-    writeFileSync(login, 'fixture-login');
-    mkdirSync(join(host.home, '.ssh'));
-    writeFileSync(join(host.home, '.ssh/probe'), 'fixture-secret');
-    writeFileSync(join(host.home, 'personal-notes'), 'fixture-secret');
-    writeFileSync(join(options.dir, 'clone-probe'), 'fixture-clone');
-    writeFileSync(join(options.dir, '.env.local'), 'fixture-secret');
-    writeFileSync(options.cli, `#!/bin/sh
-/bin/cat "$HOME/.gemini/antigravity-cli/antigravity-oauth-token" || exit 2
-printf logged > "$HOME/.gemini/antigravity-cli/log/probe" || exit 3
-if (printf blocked > "$HOME/.gemini/other"); then exit 4; fi
-printf '\nother-home-write-denied\n'
-if /bin/cat "$HOME/.ssh/probe"; then exit 5; fi
-if /bin/cat "$HOME/personal-notes"; then exit 6; fi
-if /bin/cat .env.local; then exit 7; fi
-/bin/cat clone-probe || exit 8
-printf '\nhome-secret-reads-denied\n'
-`);
-    const actual = await vi.importActual('node:child_process');
-    let privateTemp;
-    spawn.mockImplementation((bin, args, opts) => {
-      expect(opts.env.HOME).toBe(host.home);
-      privateTemp = opts.env.TMPDIR;
-      return actual.spawn(bin, args, opts);
+it.each([undefined, '(version 1)\n(allow default)\n', '(version 1)\n(deny default) garbage'])('refuses unknown/invalid builder output %j before spawning', async profile => {
+  const { options } = fixture();
+  buildSandboxProfile.mockReturnValueOnce(profile);
+  await expect(defaultSpawnAgy(options)).rejects.toThrow(/deny-default|invalid sandbox profile/);
+  expect(spawn).not.toHaveBeenCalled();
+});
+it.each(['throw', 'error', 'exit'])('sandbox-exec failure (%s) throws with no unconfined retry', async failure => {
+  const { options } = fixture();
+  spawn.mockImplementation(() => {
+    if (failure === 'throw') throw new Error('sandbox-exec unavailable');
+    const child = new EventEmitter();
+    child.stdout = new PassThrough(); child.stderr = new PassThrough(); child.stdin = new PassThrough();
+    queueMicrotask(() => {
+      if (failure === 'error') child.emit('error', new Error('sandbox-exec failed'));
+      else { child.stderr.write('sandbox-exec: invalid profile'); child.emit('close', 65); }
     });
-    const result = await defaultSpawnAgy(options);
-    expect(result.code, result.stderr).toBe(0);
-    expect(result.stdout).toContain('fixture-login');
-    expect(result.stdout).toContain('other-home-write-denied');
-    expect(result.stdout).toContain('home-secret-reads-denied');
-    expect(result.stdout).toContain('fixture-clone');
-    expect(result.stdout).not.toContain('fixture-secret');
-    expect(result.stderr).toMatch(/EPERM|Operation not permitted/i);
-    expect(readFileSync(join(host.home, '.gemini/antigravity-cli/log/probe'), 'utf8')).toBe('logged');
-    expect(existsSync(join(host.home, '.gemini/other'))).toBe(false);
-    expect(readFileSync(login, 'utf8')).toBe('fixture-login');
-    expect(privateTemp).toBeTruthy();
-    expect(existsSync(privateTemp)).toBe(false);
-    expect(existsSync(host.home)).toBe(true);
-  },
-);
+    return child;
+  });
+  await expect(defaultSpawnAgy(options)).rejects.toThrow(/sandbox.*failed.*use another provider/i);
+  expect(spawn).toHaveBeenCalledOnce();
+  expect(spawn.mock.calls[0][0]).toBe('/usr/bin/sandbox-exec');
+});
+
+// macOS-only real launcher probe; uses fake HOME credentials and the real sandbox-exec.
+it.skipIf(process.platform !== 'darwin')('REAL launcher executes node agy fixture within deny-default profile', async () => {
+  const { options } = fixture();
+  mkdirSync(join(host.home, '.gemini/antigravity-cli/log'));
+  const node = realpathSync(process.execPath);
+  writeFileSync(options.cli, `#!${node}\nconst fs = require('node:fs');
+    fs.writeFileSync('allowed', 'clone');
+    fs.writeFileSync(process.env.HOME + '/.gemini/antigravity-cli/log/probe', 'logged');
+    console.log('confined-fixture');`);
+  const actual = await vi.importActual('node:child_process');
+  // `env -i` re-applies the launcher's scrubbed env: the test-cache tracer injects NODE_OPTIONS into every spawn.
+  spawn.mockImplementation((cmd, args, opts) => actual.spawn('/usr/bin/env',
+    ['-i', ...Object.entries(opts.env).map(([k, v]) => `${k}=${v}`), cmd, ...args], opts));
+  const result = await defaultSpawnAgy(options);
+  expect(result.code, result.stderr).toBe(0);
+  expect(result.stdout).toContain('confined-fixture');
+  expect(readFileSync(join(options.dir, 'allowed'), 'utf8')).toBe('clone');
+});
