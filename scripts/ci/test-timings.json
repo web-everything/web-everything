@@ -1911,6 +1911,7 @@
   "skills-src/conveyor/__tests__/reconcile-fix-dispatch-daemon.test.mjs": 4.36,
   "skills-src/conveyor/__tests__/review-daemon-app-auth.test.mjs": 0.1,
   "skills-src/conveyor/__tests__/review-daemon-interval.test.mjs": 0.02,
+  "skills-src/conveyor/__tests__/review-daemon-partial-list-red-team.test.mjs": 5.42,
   "skills-src/conveyor/__tests__/review-daemon-red-team-floor-refresh.test.mjs": 11.34,
   "skills-src/conveyor/__tests__/review-daemon-red-team-on-skip.test.mjs": 0.76,
   "skills-src/conveyor/__tests__/review-daemon-shared-plan.test.mjs": 0.12,
@@ -1971,7 +1972,6 @@
   "webtraits/__tests__/surfaceIntentResolver.test.ts": 0.02,
   "wrapper-conformance/__tests__/runner.test.ts": 0.01
  },
- "integration": {},
  "soak": {
   "scripts/conveyor/soak/breaks/accepted-pr-stale-accept-row-never-executed.soak.test.mjs": 15.28,
   "scripts/conveyor/soak/breaks/added-seats-concurrent-head-binding.soak.test.mjs": 4.67,
@@ -2225,6 +2225,7 @@
   "scripts/conveyor/soak/breaks/red-team-gate-send-back-failed-never-retried.soak.test.mjs": 1.5,
   "scripts/conveyor/soak/breaks/red-team-label-deadlock.soak.test.mjs": 2.53,
   "scripts/conveyor/soak/breaks/red-team-never-started-on-reviewed-head.soak.test.mjs": 9.63,
+  "scripts/conveyor/soak/breaks/red-team-probe-cap-starvation.soak.test.mjs": 2,
   "scripts/conveyor/soak/breaks/red-team-queue-stale-eviction.soak.test.mjs": 4.12,
   "scripts/conveyor/soak/breaks/red-team-queue-verdict-evict.soak.test.mjs": 4.12,
   "scripts/conveyor/soak/breaks/red-team-renamed-host-dead-owner-never-reaped.soak.test.mjs": 1.4,
@@ -2323,5 +2324,6 @@
   "scripts/conveyor/soak/breaks/withdrawn-operator-block-directs-takeover.soak.test.mjs": 0.53,
   "scripts/conveyor/soak/breaks/worker-push-during-fix-claim.soak.test.mjs": 93.82,
   "scripts/conveyor/soak/daemon-soak.soak.test.mjs": 450.96
- }
+ },
+ "integration": {}
 }
