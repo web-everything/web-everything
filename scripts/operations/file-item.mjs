@@ -29,12 +29,14 @@
  *     four kinds performs open-ended authorship), so it is not removed, only routed correctly: the calling
  *     agent composes the text and passes it as ordinary string inputs, exactly as it already does for
  *     `scaffold` today. This operation starts from "the text already exists."
- *   - LANDING (commit / `verify` / `open-pr`) is NOT folded in here. Those are already declared operations
+ *   - LANDING (`verify` / `open-pr`) is NOT folded in here. Those are already declared operations
  *     (`we:scripts/operations/verify.mjs`, `we:scripts/operations/open-pr.mjs`) that apply to every
  *     constellation-repo change, not just a filed card — folding them in would duplicate machinery this file's
  *     own header warns against re-deriving. The skill that owns this operation
  *     (`we:skills-src/file-item/SKILL.md`) states the three-call sequence: `file-item`, then `verify`, then
- *     `open-pr`.
+ *     `open-pr`. Card preservation is separate: after clearance, `cardBranch` publishes only the new card
+ *     to the shared UTC-day batch branch without changing the worker's branch or index. Publication failure
+ *     is a warning with the local card retained, never a failed filing or permission to release the lane.
  *   - AN IMMEDIATE DISPATCH ATTEMPT. A freshly-filed item almost never passes `planTick`'s own readiness gate
  *     the instant it is born (unsized epics/decisions can never build at all; a story usually still needs a
  *     lane scope decided and any `blockedBy` cleared) — so a same-call dispatch attempt would be a no-op in
@@ -56,6 +58,7 @@
  *
  * PURE. No fs, no clock, no process, no network. `./file-item-io.mjs` is the only place it touches the world.
  */
+import { localDateString } from '../lib/local-date.mjs';
 import { OPERATOR_TASK_INPUT, OPERATOR_TASK_READS } from '../backlog/operator-task.mjs';
 import { op } from './registry.mjs';
 import { overlapScore } from '../capability-search.mjs';
@@ -146,6 +149,7 @@ export const FILE_ITEM_OP = 'file-item';
 
 /** The second effect this operation can declare, beside `scaffold`'s own `scaffold.write`. */
 export const FILE_ITEM_QUEUE_EFFECT = 'file-item.queue-add';
+export const FILE_ITEM_CARD_BRANCH_EFFECT = 'file-item.card-branch';
 
 /**
  * Kinds `we:scripts/conveyor/tick-core.mjs#planTick` can NEVER dispatch a build for, whatever their frontmatter
@@ -193,7 +197,7 @@ export function planQueueing(verdict, input = {}) {
  * Build the declaration. Both readers/sinks are injected — `./file-item-io.mjs` supplies the real bindings,
  * reusing `we:scripts/operations/scaffold-io.mjs`'s own reader + write sink rather than re-deriving either.
  */
-export function fileItemOperation({ readScaffoldContext, searchDuplicates } = {}) {
+export function fileItemOperation({ readScaffoldContext, searchDuplicates, now = () => new Date() } = {}) {
   if (typeof readScaffoldContext !== 'function') {
     throw new TypeError(
       'file-item: needs a `readScaffoldContext()` reader — the io is INJECTED so the declaration stays '
@@ -305,6 +309,16 @@ export function fileItemOperation({ readScaffoldContext, searchDuplicates } = {}
           payload: { num: view.verdict.num },
         }];
       },
+    }),
+
+    cardBranch: effectStep({
+      reads: ['verdict'],
+      effects: (view) => [{
+        type: FILE_ITEM_CARD_BRANCH_EFFECT,
+        // Replay checks the remote card bytes before appending; it cannot duplicate an applied card.
+        idempotent: true,
+        payload: { rel: view.verdict.rel, content: view.verdict.content, batchDate: localDateString(now(), 'UTC') },
+      }],
     }),
   });
 }
