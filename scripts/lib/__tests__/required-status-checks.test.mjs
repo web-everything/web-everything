@@ -20,9 +20,10 @@ import { getRequiredStatusChecks, defaultReadRequiredStatusChecks, readRequiredS
 import { ghRestGetJson } from '../gh-rest-read.mjs';
 import { readSettings } from '../settings-files.mjs';
 
+const fixtureApp = 42; // Synthetic app identity shared by both policy producers.
 it.each([
-  ['ruleset integration_id', [{ type: 'required_status_checks', parameters: { required_status_checks: [{ context: 'merge-gate', integration_id: 42 }] } }], { protected: false }, 42],
-  ['classic app_id', [], { protected: true, protection: { required_status_checks: { contexts: ['merge-gate'], checks: [{ context: 'merge-gate', app_id: 42 }] } } }, 42],
+  ['ruleset integration_id', [{ type: 'required_status_checks', parameters: { required_status_checks: [{ context: 'merge-gate', integration_id: fixtureApp }] } }], { protected: false }, fixtureApp],
+  ['classic app_id', [], { protected: true, protection: { required_status_checks: { contexts: ['merge-gate'], checks: [{ context: 'merge-gate', app_id: fixtureApp }] } } }, fixtureApp],
   ['classic contexts without identity', [], { protected: true, protection: { required_status_checks: { contexts: ['merge-gate'] } } }, undefined],
 ])('includeAppIds preserves %s', (_name, rules, branch, appId) => {
   const result = readRequiredStatusChecksDetailed({ repo: 'o/r', includeAppIds: true,
