@@ -3,18 +3,18 @@ bornAs: xovnemq
 kind: story
 size: 3
 status: open
-scope: ["we:scripts/settings/host-path-baseline.json", "we:scripts/conveyor/flows/", "we:skills-src/conveyor/launchd/"]
+scope: ["we:scripts/lib/host-path-baseline.json", "we:scripts/conveyor/flows/", "we:skills-src/conveyor/launchd/"]
 dateOpened: "2026-10-13"
 tags: []
 ---
 
 # Shrink the host-local path baseline to zero
 
-Operator rule 2026-10-13: no host-local path is ever committed. we:scripts/lint-host-paths.mjs ratchets tracked files against we:scripts/settings/host-path-baseline.json (72 files at filing: flows, launchd plist examples, tests, fixtures, cards, reports). Replace each real home path with a name resolved on the host (env var or $HOME) or an obvious placeholder (/Users/x/), shrinking the baseline entry in the same commit, until the baseline is empty.
+Operator rule 2026-10-13: no host-local path is ever committed. we:scripts/lint-host-paths.mjs ratchets tracked files against we:scripts/lib/host-path-baseline.json (72 files at filing: flows, launchd plist examples, tests, fixtures, cards, reports). Replace each real home path with a name resolved on the host (env var or $HOME) or an obvious placeholder (/Users/x/), shrinking the baseline entry in the same commit, until the baseline is empty.
 
 ## Acceptance
 
-- [A1] **Executable** — the `files` map in we:scripts/settings/host-path-baseline.json has 72 entries today and is empty after; `node` we:scripts/lint-host-paths.mjs stays green throughout.
+- [A1] **Executable** — the `files` map in we:scripts/lib/host-path-baseline.json has 72 entries today and is empty after; `node` we:scripts/lint-host-paths.mjs stays green throughout.
 
 Hint: a card that loosens a refusal needs two Must lines — what happens on error (refuse), and every input kind besides source code (docs, config, data) that the loosening must still treat cautiously.
 
