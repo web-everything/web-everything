@@ -174,8 +174,8 @@ function classifyUnsafe(o = {}) {
   const rawSettings = o.settings; // read once: a getter must not validate one value and serve another
   const cfg = classifySettings(rawSettings === undefined ? {} : rawSettings);
   // Every other input is read ONCE into plain data (getters run once, here): what is validated is what is used.
-  const { row, head = '', verdict = null, files = [], card = null, grantsSoFar, redTeam } = strictClone({ row: o.row, head: o.head, verdict: o.verdict ?? null,
-    files: o.files ?? [], card: o.card ?? null, grantsSoFar: o.grantsSoFar, redTeam: o.redTeam });
+  const { row, head = '', verdict = null, files = [], card = null, grantsSoFar, redTeam, triggerMismatch = null } = strictClone({ row: o.row, head: o.head, verdict: o.verdict ?? null,
+    files: o.files ?? [], card: o.card ?? null, grantsSoFar: o.grantsSoFar, redTeam: o.redTeam, triggerMismatch: o.triggerMismatch ?? null });
   if (!isRec(row) || typeof row.repo !== 'string' || !/^[\w-]+\/[\w-][\w.-]*$/.test(row.repo) || repoKeyForSlug(row.repo) === null
     || !Number.isSafeInteger(row.number) || row.number <= 0 || typeof row.waitingOn !== 'string' || !row.waitingOn) {
     throw new Error('unreadable row');
@@ -251,6 +251,7 @@ function classifyUnsafe(o = {}) {
 
   const trigger = JUDGED_STATES[state];
   if (!trigger) return operator('unclassified', `fail-closed: unknown waiting state ${JSON.stringify(state)}`);
+  if (verdict === null && typeof triggerMismatch === 'string' && triggerMismatch) return operator('no-verdict', `fail-closed: trigger-mismatch: ${triggerMismatch.slice(0, 120)}`);
   return judged({ head, verdict, trigger, files, card, grantsSoFar, acts, out, operator, cfg });
 }
 
