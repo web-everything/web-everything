@@ -872,6 +872,27 @@ export function decideRestampHumanClearance({ comments, headSha, headDiff } = {}
   return { actor: clearance ? clearance.actor : 'the operator', sha: humanClearedSha, ...(sourceId ? { sourceId } : {}) };
 }
 
+/**
+ * we:scripts/review-set-label.mjs#reviewLoopWritePlan — pure write plan (#7140).
+ * A redundant plain accept ends a human
+ * clearance chain, so keep only the independently posted advisory when BOTH the
+ * current clearance's SHA and strict diff match. Unknown evidence retains the
+ * existing verdict/label behavior; findings always proceed.
+ */
+export function reviewLoopWritePlan({ to, comments, headSha, headDiff } = {}) {
+  let preserve = false;
+  if (to === 'accepted' && Array.isArray(comments) && typeof headSha === 'string' && headSha) {
+    try {
+      const clearedSha = parseLatestHumanClearedSha(comments);
+      const clearance = latestHumanClearanceComment(comments);
+      const fingerprint = normalizeDiffFingerprint(headDiff);
+      preserve = !!clearedSha && clearedSha.toLowerCase() === headSha.toLowerCase()
+        && !!fingerprint && parseReviewedDiff(clearance ? [clearance] : []) === fingerprint;
+    } catch { /* Unreadable clearance: post as today. */ }
+  }
+  return { advisory: true, verdict: !preserve, label: !preserve };
+}
+
 // ── APPROVAL-TIME PREVENTION FILING (operator, 2026-09-27) ──────────────────────────────────────────────────
 // "prevention outstanding should be filed by default on approval." See `we:scripts/lib/approval-prevention-
 // notice.mjs`'s header for the full ruling, the three gaps it closes, and why a `prevention-outstanding`
@@ -1665,6 +1686,23 @@ export function runReviewLabelCli({
   if (pinnedAccept) {
     if (!diffScored) fail('pinned accept unproven: the net diff of --expect-head is unscored', 1);
     if (normalizeDiffFingerprint(reviewedDiff) !== expectedFingerprint) fail('net diff of --expect-head differs from --expect-fingerprint', 1);
+  }
+
+  // The loop's advisory is a separate write. Do not follow it with an accept
+  // that would erase a current same-head human clearance (#7140). A full page
+  // needs the shared paged reader: a later finding/accept may supersede it.
+  if (to === 'accepted') {
+    let comments = prCommentsReadable ? prComments : null;
+    if (comments?.length >= PR_COMMENTS_PAGE_SIZE) {
+      try { comments = provider.readComments(repo, pr); } catch { comments = null; }
+    }
+    const plan = reviewLoopWritePlan({ to, comments, headSha, headDiff: reviewedDiff });
+    if (!plan.verdict) {
+      emit(`${JSON.stringify({ ...successResult({ pr: Number(pr), to, decision,
+        labels: currentLabels.map(l => typeof l === 'string' ? l : l.name) }),
+        skipped: 'current human clearance covers the same head and reviewed diff' })}\n`);
+      return;
+    }
   }
 
   // card xu7kxtt (#5472) — the proof a re-stamp needs to cross a `review:human` re-hold: the latest trusted accept is

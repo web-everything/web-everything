@@ -1,0 +1,26 @@
+{
+  "pr": 7140,
+  "headSha": "d58066c5",
+  "reviewedDiff": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+  "note": "Replay of the reported ordering and short SHA; the fingerprint is representative, not recovered from GitHub.",
+  "comments": [
+    {
+      "id": "human-clearance-7140",
+      "time": "07:23:54",
+      "author": { "login": "chalbert" },
+      "body": "✅ review — `review:human` cleared via the sanctioned path\n\n<!-- reviewed-sha: d58066c5 -->\n<!-- reviewed-diff: ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff -->\n<!-- cleared-human: operator -->"
+    },
+    {
+      "time": "07:30:06",
+      "viewerDidAuthor": true,
+      "author": { "login": "plateau-reviewer[bot]" },
+      "body": "<!-- review-status:reviewing -->"
+    },
+    {
+      "time": "07:32:55",
+      "viewerDidAuthor": true,
+      "author": { "login": "plateau-reviewer[bot]" },
+      "body": "✅ review — accepted\n\n<!-- reviewed-sha: d58066c5 -->\n<!-- reviewed-diff: ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff -->"
+    }
+  ]
+}
