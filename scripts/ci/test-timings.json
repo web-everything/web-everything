@@ -2080,6 +2080,7 @@
   "scripts/conveyor/soak/breaks/fixer-stuck-never-reclaimed.soak.test.mjs": 1.09,
   "scripts/conveyor/soak/breaks/fixer-wait-loop-undetected.soak.test.mjs": 0.46,
   "scripts/conveyor/soak/breaks/fixing-tag-unverified-launch.soak.test.mjs": 2,
+  "scripts/conveyor/soak/breaks/forge-manifest-untracked-shipped.soak.test.mjs": 0.3,
   "scripts/conveyor/soak/breaks/forge-sweep-scan-bound-refusal.soak.test.mjs": 1.09,
   "scripts/conveyor/soak/breaks/forge-timeout-cancel-wait-too-short.soak.test.mjs": 0.16,
   "scripts/conveyor/soak/breaks/fresh-stamp-commit-graph-repair.soak.test.mjs": 9.01,
