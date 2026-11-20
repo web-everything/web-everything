@@ -17,6 +17,7 @@ import { fenceUntrusted, FENCED_DATA_RULE } from './mandate-fence.mjs';
 // The juror's SAFE_GIT is private; keep its pins at every git boundary, including injected exec.
 const SAFE_GIT = ['-c', 'core.fsmonitor=false', '-c', 'core.hooksPath=/dev/null', '-c', 'core.untrackedCache=false',
   '-c', 'core.attributesFile=/dev/null', '-c', 'core.pager=cat', '-c', 'diff.external='];
+const isPositiveInteger = v => typeof v === 'number' && Number.isFinite(v) && Number.isInteger(v) && v > 0;
 const DEFAULTS = { allowedKinds: ['doc-fix', 'test-fix'], maxSize: 1, kindMaxSize: 3 };
 // Measured live 2026-11-18 (agy 1.5.11): the native edit tool is `edit_file` and the plain read is `read_file`, both with a `Path` parameter.
 const WRITE_TOOLS = new Set(['write_to_file', 'replace_file_content', 'multi_replace_file_content', 'edit_file']);
@@ -248,10 +249,11 @@ export async function runConfinedAgyBuild({ task, laneDir, scope, kind, size, mo
         kindMaxSize: env.WE_AGY_BUILD_KIND_MAX_SIZE === undefined ? undefined
           : env.WE_AGY_BUILD_KIND_MAX_SIZE.trim() ? Number(env.WE_AGY_BUILD_KIND_MAX_SIZE) : NaN,
       }, valid: { allowedKinds: v => Array.isArray(v) && v.length > 0 && v.every(k => typeof k === 'string' && /^[a-z][a-z0-9-]*$/.test(k)),
-        kindMaxSize: v => Number.isInteger(v) && v > 0,
-        maxSize: v => typeof v === 'number' && Number.isFinite(v) && v >= 0 } });
+        kindMaxSize: isPositiveInteger,
+        maxSize: isPositiveInteger } });
     log(formatCascadeSourcesLine('agyBuild', resolved));
-    if (resolved.invalid.length || typeof kind !== 'string' || !kind.trim() || !Number.isFinite(size) || size < 0
+    if (resolved.invalid.length || !isPositiveInteger(resolved.value.maxSize)
+      || !isPositiveInteger(resolved.value.kindMaxSize) || typeof kind !== 'string' || !kind.trim() || !Number.isFinite(size) || size < 0
       || !Array.isArray(scope) || !scope.length || scope.length > 20 || !Array.from(scope).every(isAdmissibleTargetScope)
       || typeof laneDir !== 'string' || !laneDir.trim() || typeof task !== 'string' || !task.trim())
       return result('refused', ['missing or invalid kind/size/scope/task/lane; use another fix provider or request human review']);

@@ -1,10 +1,15 @@
 // Shared admission/apply decision table; fixture data, never filesystem targets.
 export const admissibleTargets = [
-  'tests/helper.cjs', 'src/__tests__/helper.js', 'src/foo-unit.test.ts',
+  'blocks/selection/__tests__/contract.test.ts', 'blocks/resource-cache/contract.spec.ts',
   'docs/guide.md', 'README.md', 'docs/x/y.md', 'notes.mdx', 'docs/notes.txt',
-  'scripts/lib/__tests__/foo.test.mjs', 'src/__tests__/a.test.ts', 'src/a.spec.ts',
 ];
 export const refusedTargets = [
+  'tests/helper.cjs', 'src/__tests__/helper.js', 'src/foo-unit.test.ts',
+  'scripts/lib/__tests__/foo.test.mjs', 'src/__tests__/a.test.ts', 'src/a.spec.ts',
+  'scripts/lib/__tests__/pr-merge-gate-ledger.test.mjs',
+  'scripts/lib/__tests__/audit-settings.test.mjs',
+  'scripts/lib/__tests__/helpers/codex-sandbox-fixture.mjs',
+
   'src/__tests__/__fixtures__/payload.js', 'tests/__fixtures__/payload.cjs',
   'src/__tests__/__fixture__/payload.ts', 'src/__tests__/fixtures/payload.js',
   'docs/a.test.mjs', 'docs/__tests__/a.test.ts',

@@ -59,12 +59,12 @@ describe('repair scope admission', () => {
       .toEqual({ kind: 'doc-fix', size: 1, scope: ['docs/guide.md'] });
   });
   it('admits a test item inside its declared launch scope', () => {
-    expect(deriveAgyFixAdmission({ taskKind: 'test-fix', size: 1, scope: ['src/__tests__/a.test.ts'] },
-      { scope: ['src/__tests__/a.test.ts'] })?.kind).toBe('test-fix');
+    expect(deriveAgyFixAdmission({ taskKind: 'test-fix', size: 1, scope: ['blocks/selection/__tests__/a.test.ts'] },
+      { scope: ['blocks/selection/__tests__/a.test.ts'] })?.kind).toBe('test-fix');
   });
   it('refuses a test item outside the launch scope', () => {
-    expect(deriveAgyFixAdmission({ size: 1, scope: ['src/a.test.ts'] },
-      { scope: ['src/b.test.ts'] })).toBeNull();
+    expect(deriveAgyFixAdmission({ size: 1, scope: ['blocks/selection/a.test.ts'] },
+      { scope: ['blocks/selection/b.test.ts'] })).toBeNull();
   });
   it('refuses explicit critical metadata even for ordinary scope', () => {
     expect(admit({ size: 1, scope: ['docs/guide.md'], humanRequired: true })).toBeNull();
@@ -145,10 +145,11 @@ it('admits existing docs directories only as scopes, never as applied files', ()
   expect(isAdmissibleTargetPath('docs/agent')).toBe(false);
 });
 
-it('keeps tests directory scopes admissible while refusing them as applied files', () => {
-  expect(isAdmissibleTargetScope('tests')).toBe(true);
+it('admits only allowlisted tests directory scopes while refusing them as applied files', () => {
+  expect(isAdmissibleTargetScope('tests')).toBe(false);
   expect(isAdmissibleTargetPath('tests')).toBe(false);
-  expect(admit({ size: 1, scope: ['tests'] })).toEqual({ kind: 'test-fix', size: 1, scope: ['tests'] });
+  expect(admit({ size: 1, scope: ['tests'] })).toBeNull();
+  expect(isAdmissibleTargetScope('blocks/selection/__tests__')).toBe(true);
 });
 
 it('marks every agy-build settings key direct-only while repair dispatch stays size 1', () => {
@@ -159,3 +160,20 @@ it('marks every agy-build settings key direct-only while repair dispatch stays s
   expect(text).toContain('Repair dispatch always requires `size === 1`');
   expect(admit({ taskKind: 'doc-fix', size: 3, scope: ['docs'] })).toBeNull();
 });
+
+it.each([
+  [{ humanRequired: true }, { humanRequired: false }],
+  [{ risk: 'high' }, { risk: 'low' }],
+  [{ tags: ['security'] }, { tags: [] }],
+  [{ risk: 'low' }, { risk: 'high' }],
+  [{ humanRequired: false }, { humanRequired: true }],
+  [{ tags: [] }, { tags: ['security'] }],
+])('restriction metadata can only tighten launch %j with item %j', (launch, item) => {
+  expect(deriveAgyFixAdmission({ size: 1, scope: ['docs/guide.md'], ...item },
+    { scope: ['docs'], ...launch })).toBeNull();
+});
+it.each(['guard', 'gate', 'ledger', 'audit', 'sandbox', 'settings', 'merge'])(
+  'refuses enforcement name %s even under an allowlisted subject', name => {
+    expect(isAdmissibleTargetPath(`blocks/selection/${name}.test.ts`)).toBe(false);
+    expect(isAdmissibleTargetScope(`blocks/selection/${name}/__tests__`)).toBe(false);
+  });

@@ -129,13 +129,13 @@ describe('agy build fail-closed admission', () => {
   it('allows explicit setting widening and env overrides above settings', async () => {
     const f = fixture();
     expect((await f.run(undefined, { input: { kind: 'feature', size: 2 },
-      settings: { allowedKinds: ['feature'], maxSize: 0 } })).status).toBe('ok');
+      settings: { allowedKinds: ['feature'], maxSize: 1 } })).status).toBe('ok');
     expect((await f.run(undefined, { input: { kind: 'feature', size: 2 },
       env: { WE_AGY_BUILD_KINDS: 'feature', WE_AGY_BUILD_MAX_SIZE: '2' } })).status).toBe('ok');
   });
   it.each([
     { settings: { maxSize: 2 } },
-    { settings: { maxSize: 0 }, env: { WE_AGY_BUILD_MAX_SIZE: '2' } },
+    { settings: { maxSize: 1 }, env: { WE_AGY_BUILD_MAX_SIZE: '2' } },
   ])('maxSize widening admits a kind outside allowedKinds: %j', async options => {
     const f = fixture();
     expect(await f.run(undefined, { ...options, input: { kind: 'feature', size: 2 } }))
@@ -189,7 +189,7 @@ describe('launcher-owned atomic application', () => {
     expect(lstatSync(join(f.lane, 'docs/reference')).isSymbolicLink()).toBe(true);
   });
   it.each([false, true])('refuses JavaScript files under __fixtures__ at admission and application (tracked=%s)', async tracked => {
-    const path = 'src/__tests__/__fixtures__/payload.js';
+    const path = 'blocks/selection/__tests__/__fixtures__/payload.js';
     const f = fixture();
     if (tracked) {
       mkdirSync(dirname(join(f.lane, path)), { recursive: true });
@@ -200,7 +200,7 @@ describe('launcher-owned atomic application', () => {
     expect(await f.run(dir => {
       mkdirSync(dirname(join(dir, path)), { recursive: true });
       writeFileSync(join(dir, path), 'after\n');
-    }, { input: { scope: ['src/__tests__'] } })).toMatchObject({ status: 'voided', applied: [] });
+    }, { input: { scope: ['blocks/selection/__tests__'] } })).toMatchObject({ status: 'voided', applied: [] });
     expect(git(f.lane, 'status', '--porcelain')).toBe('');
   });
   it('never executes a clean filter planted after the control hash', async () => {
@@ -380,7 +380,7 @@ describe('launcher-owned atomic application', () => {
     ['test-fix', 'docs', 'docs/__tests__/deep/bun.lock'],
     ['doc-fix', 'docs', 'docs/scripts/settings/config.json'],
     ['doc-fix', 'notes.md', 'notes.md/code.js'],
-    ['test-fix', 'sample.test.ts', 'sample.test.ts/code.js'],
+    ['test-fix', 'blocks/selection/sample.test.ts', 'blocks/selection/sample.test.ts/code.js'],
   ])('voids %s scope %s applying forbidden or misclassified %s atomically', async (kind, scope, path) => {
     for (const tracked of [false, true]) {
       const f = fixture();
@@ -401,17 +401,17 @@ describe('launcher-owned atomic application', () => {
   });
   it.each([false, true])('voids an admissible test outside item scope (tracked=%s)', async tracked => {
     const f = fixture();
-    const path = 'src/b.test.ts';
+    const path = 'blocks/selection/b.test.ts';
     if (tracked) {
-      mkdirSync(join(f.lane, 'src'));
+      mkdirSync(join(f.lane, 'blocks/selection'), { recursive: true });
       writeFileSync(join(f.lane, path), 'before\n');
       commit(f.lane);
     }
     expect(isAdmissibleTargetPath(path)).toBe(true);
     expect(await f.run(dir => {
-      mkdirSync(join(dir, 'src'), { recursive: true });
+      mkdirSync(join(dir, 'blocks/selection'), { recursive: true });
       writeFileSync(join(dir, path), 'changed\n');
-    }, { input: { kind: 'test-fix', scope: ['src/a.test.ts'] } }))
+    }, { input: { kind: 'test-fix', scope: ['blocks/selection/a.test.ts'] } }))
       .toMatchObject({ status: 'voided', applied: [] });
     expect(f.commands.some(a => a.includes('apply'))).toBe(false);
     expect(git(f.lane, 'status', '--porcelain')).toBe('');
@@ -730,4 +730,19 @@ it.each(['', 'unreadable\0'])('voids incomplete final-patch path evidence %j', a
     .toMatchObject({ status: 'voided', applied: [] });
   expect(f.commands.some(a => a.includes('apply') && !a.includes('--numstat'))).toBe(false);
   expect(git(f.lane, 'status', '--porcelain')).toBe('');
+});
+
+it.each(['maxSize', 'kindMaxSize'].flatMap(key =>
+  [1, 1000000].flatMap(size => [
+    ...[{ unexpected: 1 }, 0, -1, 1.5, '2', null].map(value =>
+      [key, size, { settings: { [key]: value } }]),
+    ...['NaN', 'Infinity', '0', '-1', '1.5', 'invalid'].map(value =>
+      [key, size, { env: { [key === 'maxSize' ? 'WE_AGY_BUILD_MAX_SIZE' : 'WE_AGY_BUILD_KIND_MAX_SIZE']: value } }]),
+  ])))('refuses invalid %s for size %s with a human fallback: %j', async (_key, size, options) => {
+  const f = fixture();
+  const result = await f.run(undefined, { ...options, input: { size } });
+  expect(result).toMatchObject({ status: 'refused', applied: [] });
+  expect(result.reasons.join(' ')).toMatch(/provider|human|operator/);
+  expect(f.spawnAgy).not.toHaveBeenCalled();
+  expect(f.commands).toEqual([]);
 });
