@@ -264,13 +264,25 @@ describe('refresh-timings atomic replacement', () => {
 describe('refresh-timings landed queue evidence (finding 9)', () => {
   const sha = 'a'.repeat(40);
   const queue = { databaseId: 44, event: 'merge_group', headBranch: 'gh-readonly-queue/main/pr-1', headSha: sha };
-  function fixture({ landed = false, mainPush = false, headSha = sha } = {}) {
+  function fixture({ landed = false, mainPush = false, headSha = sha, receipt = 'unquarantined\n', missing = false, suite = 'unit' } = {}) {
     const calls = [];
     const exec = (cmd, args) => {
       calls.push([cmd, args]);
       if (cmd === 'git') {
         expect(args).toEqual(['merge-base', '--is-ancestor', sha, 'origin/main']);
         if (!landed) throw Error('not reachable or ancestry unavailable');
+        return '';
+      }
+      if (args.includes('--pattern=quarantine-reuse-*')) {
+        const target = args[args.indexOf('--dir') + 1];
+        const jobs = yaml.safeLoad(readFileSync(join(REPO_ROOT, '.github/workflows/ci.yml'), 'utf8')).jobs;
+        for (const [kind, job, key] of [['unit', 'test-shard', 'shard'], ['integration', 'integration-part', 'group'], ['soak', 'soak-shard', 'shard']]) {
+          for (const id of jobs[job].strategy.matrix[key]) {
+            const folder = join(target, `quarantine-reuse-${kind}-${id}`);
+            mkdirSync(folder);
+            if (!(missing && kind === suite)) writeFileSync(join(folder, 'quarantine-reuse'), kind === suite ? receipt : 'unquarantined\n');
+          }
+        }
         return '';
       }
       if (args[1] === 'list') return JSON.stringify([{ ...queue, headSha }, ...(mainPush
@@ -286,6 +298,24 @@ describe('refresh-timings landed queue evidence (finding 9)', () => {
     await expect(downloadReports('latest', '/scratch/reports', f)).rejects.toThrow(/No valid CI run ID/);
     expect(f.calls.some(([, args]) => args[1] === 'download' || args[0] === 'api')).toBe(false);
     if (kind !== 'not landed') expect(f.calls.some(([cmd]) => cmd === 'git')).toBe(false);
+  });
+  it.each(['unit', 'integration', 'soak'])('refuses queue timings with missing or quarantined %s receipts', async suite => {
+    for (const bad of [{ missing: true }, { receipt: 'unknown-or-quarantined\n' }, { receipt: '' }, { receipt: 'unknown\n' }]) {
+      const f = fixture({ landed: true, suite, ...bad });
+      await expect(downloadReports('latest', '/scratch/reports', f)).rejects.toThrow(/No valid CI run ID/);
+      expect(f.calls.some(([, args]) => args.includes('--pattern=timing-unit-*'))).toBe(false);
+      const receiptCall = f.calls.find(([, args]) => args.includes('--pattern=quarantine-reuse-*'));
+      expect(() => readdirSync(receiptCall[1].at(-1))).toThrow();
+    }
+  });
+  it('fails closed when queue receipt download is unreadable', async () => {
+    const f = fixture({ landed: true });
+    const base = f.exec;
+    f.exec = (cmd, args) => {
+      if (args.includes('--pattern=quarantine-reuse-*')) throw Error('download failed');
+      return base(cmd, args);
+    };
+    await expect(downloadReports('latest', '/scratch/reports', f)).rejects.toThrow(/No valid CI run ID/);
   });
   it('accepts a queue SHA reachable from origin/main', async () => {
     const f = fixture({ landed: true });

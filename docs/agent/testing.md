@@ -5701,3 +5701,14 @@ to isolate the reset-time status/ahead probes. Cover both transient recovery and
 refusal, and assert no checkout/reset/clean follows a failed probe. The bounded process
 reader wraps the original stderr in `ProcReadError.cause`; preserve that stderr (or the
 spawn error message) in probe diagnostics rather than reporting zero counts as proof.
+
+## Main CI schedules and timing receipts
+
+Merge admission and both same-head retry evidence paths judge main's push and scheduled
+`ci.yml` runs together. A newer scheduled failure invalidates an older push success;
+PR events are excluded even when their head branch is named `main`.
+Queue timing candidates also require `unquarantined` execution receipts from every unit,
+integration and soak matrix leg, matching the queue reuse proof. Missing or unreadable
+receipts skip the candidate; the bounded search retains the explicit `--run=<id>` fallback.
+Scoped regressions live in `red-main-freeze-shared.test.mjs`, `drain-mq-retry-main-green.test.mjs`,
+`drain-queue-safety-same-head-retry.test.mjs` and `refresh-timings.test.mjs`.

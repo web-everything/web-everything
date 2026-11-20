@@ -5,8 +5,8 @@ import { mainRedState } from '../../conveyor/main-ci-red-core.mjs';
 import { readMainCiFact } from '../../merge-gate-check.mjs';
 
 const repo = 'owner/repo';
-const green = { databaseId: 1, headSha: 'aaaaaaa', status: 'completed', conclusion: 'success', createdAt: '2026-11-10T00:00:00Z' };
-const failure = (id = 2) => ({ databaseId: id, headSha: 'bbbbbbb', status: 'completed', conclusion: 'failure', createdAt: `2026-11-10T${String(id).padStart(2, '0')}:00:00Z` });
+const green = { event: 'push', databaseId: 1, headSha: 'aaaaaaa', status: 'completed', conclusion: 'success', createdAt: '2026-11-10T00:00:00Z' };
+const failure = (id = 2) => ({ event: 'push', databaseId: id, headSha: 'bbbbbbb', status: 'completed', conclusion: 'failure', createdAt: `2026-11-10T${String(id).padStart(2, '0')}:00:00Z` });
 const page = (conclusions, total = conclusions.length) => ({ total_count: total,
   jobs: conclusions.map((conclusion, id) => ({ id, name: `test-shard-${id}`, status: conclusion == null ? 'in_progress' : 'completed', conclusion, run_attempt: 1 })) });
 const jobsExec = (data) => vi.fn((bin, args) => {

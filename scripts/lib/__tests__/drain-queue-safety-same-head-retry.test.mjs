@@ -439,7 +439,22 @@ describe('merge-queue exact-test extra retry after two failed_checks removals', 
     expectExtraRetry(f);
   }));
 
+  it('exact-test retry accepts a scheduled main success with matching run evidence', () => exactFixture(f => {
+    f.runs[900].event = 'schedule';
+    expectExtraRetry(f);
+    expect(f.exec.mock.calls.filter(([, args]) => args.some(arg => arg.includes('/actions/workflows/ci.yml/runs')))
+      .every(([, args]) => args.every(arg => !arg.includes('event=push')))).toBe(true);
+  }));
+
   const closedCases = [
+    ['newer main run has an unknown event despite older push success', f => {
+      f.mainRuns.push({ ...f.runs[900], id: 901, event: undefined, conclusion: 'failure',
+        created_at: iso(removedAt + 700_000) });
+    }],
+    ['newer scheduled failure invalidates older push success', f => {
+      f.mainRuns.push({ ...f.runs[900], id: 901, event: 'schedule', conclusion: 'failure',
+        created_at: iso(removedAt + 700_000) });
+    }],
     ...['failure', 'timed_out'].map(conclusion => [`newest main run is ${conclusion} after an older success`, f => {
       f.mainRuns.push({ ...f.runs[900], id: 901, conclusion, created_at: iso(removedAt + 700_000) });
     }]),

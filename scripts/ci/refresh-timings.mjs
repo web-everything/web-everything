@@ -122,7 +122,29 @@ export async function refreshFromDir({ dir, timingsFile = TIMINGS_FILE, repoRoot
   }
 }
 
-/** Search past light successes. At most 100 candidates/20 artifact reads; explicit --run is the fallback. */
+/** Match the queue reuse proof: every CI test leg must have executed without quarantine. */
+async function unquarantinedQueueRun(run, exec, options) {
+  let scratch;
+  try {
+    const jobs = yaml.safeLoad(readFileSync(join(REPO_ROOT, '.github/workflows/ci.yml'), 'utf8'))?.jobs;
+    const names = [['unit', 'test-shard', 'shard'], ['integration', 'integration-part', 'group'], ['soak', 'soak-shard', 'shard']]
+      .flatMap(([suite, job, key]) => {
+        const ids = jobs?.[job]?.strategy?.matrix?.[key];
+        if (!Array.isArray(ids) || !ids.length || new Set(ids).size !== ids.length
+          || ids.some(id => !/^[a-z0-9-]+$/.test(String(id)))) throw new Error('Invalid receipt matrix');
+        return ids.map(id => `quarantine-reuse-${suite}-${id}`);
+      });
+    scratch = await mkdtemp(join(tmpdir(), 'timing-receipts-'));
+    exec('gh', ['run', 'download', String(run.databaseId), '--pattern=quarantine-reuse-*', '--dir', scratch], options);
+    for (const name of names) {
+      if (await readFile(join(scratch, name, 'quarantine-reuse'), 'utf8') !== 'unquarantined\n') return false;
+    }
+    return true;
+  } catch { return false; } // Missing, expired or unknown receipts leave this candidate ineligible.
+  finally { if (scratch) await rm(scratch, { recursive: true, force: true }); }
+}
+
+/** Search past light successes. At most 100 candidates/20 artifact inventories and receipt downloads; explicit --run is the fallback. */
 async function fullTimingRuns(count, exec, error) {
   const options = { cwd: REPO_ROOT, encoding: 'utf8', timeout: 120_000, maxBuffer: 1024 * 1024 };
   const found = JSON.parse(exec('gh', ['run', 'list', '--workflow=ci.yml', '--status=success', '--limit=100', '--json=databaseId,event,headBranch,headSha'], options));
@@ -147,6 +169,7 @@ async function fullTimingRuns(count, exec, error) {
     const artifacts = page.artifacts.filter(a => typeof a?.name === 'string' && a.name.startsWith('timing-unit-'));
     if (artifacts.length !== expected.length || new Set(artifacts.map(a => a.name)).size !== expected.length
       || artifacts.some(a => !expected.includes(a.name) || a.expired !== false)) continue;
+    if (run.event === 'merge_group' && !await unquarantinedQueueRun(run, exec, options)) continue;
     chosen.push(run);
     if (chosen.length === count) break;
   }
