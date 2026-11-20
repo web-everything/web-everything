@@ -188,13 +188,25 @@ import { readSharedOpenPrs, readShaCache, writeShaCache, snapshotOpenCount, next
 import { listOpenPrsPagedHydratedComplete as listOpenPrsPagedHydrated, resolvePrListPaging, parseListOutput } from './lib/pr-list-paged.mjs'; // refuses a short inventory (rows < totalCount)
 import { withListRetry } from './lib/gh-list-retry.mjs'; // 504 incident 2026-11-03 — retry a transient 5xx list with backoff; a persistent failure throws + raises gh-list-failed
 import { markPrSnapshotDirty } from './lib/pr-snapshot-store.mjs';
-import { backfillOpenReviewRuns } from './lib/review-run-index.mjs';
+import { backfillAllReviewRuns, backfillOpenReviewRuns } from './lib/review-run-index.mjs';
 /** Optional discovery hints must never reject the drain's open-PR context. */
 export function backfillDrainReviewRuns(context, {
-  backfill = backfillOpenReviewRuns, resolveDir = resolveRunsDir, localSlug,
+  backfill = backfillOpenReviewRuns, backfillAll = backfillAllReviewRuns, resolveDir = resolveRunsDir, localSlug,
 } = {}) {
-  try { backfill(context, { runsDir: resolveDir(), localSlug }); }
-  catch { /* The unchanged bounded evidence scan remains authoritative. */ }
+  // Reserve half the shared tick budget for full-store progress, even if the open
+  // pass repeatedly exhausts its allocation or cannot report its spend.
+  const TICK_PARSE_BUDGET = 50;
+  const OPEN_PARSE_BUDGET = 25;
+  let used = OPEN_PARSE_BUDGET; // Unknown spend consumes the entire assigned allocation.
+  try {
+    const spent = backfill(context, { runsDir: resolveDir(), localSlug, maxParses: OPEN_PARSE_BUDGET });
+    used = Number.isSafeInteger(spent?.parsed) && spent.parsed >= 0 ? spent.parsed : OPEN_PARSE_BUDGET;
+  } catch { /* The unchanged bounded evidence scan remains authoritative. */ }
+  const left = TICK_PARSE_BUDGET - used;
+  if (left > 0) {
+    try { backfillAll({ runsDir: resolveDir(), maxParsesPerCall: left }); }
+    catch { /* The full backfill is a hint too: the capped scan stays authoritative. */ }
+  }
   return context;
 }
 import { resolveRunsDir } from './operations/run-store.mjs';

@@ -154,7 +154,8 @@ function readFastDrainRoundRecord({ path, repo, now = Date.now(), env = process.
 
 export function readFastDrainRoundSnapshot(options) {
   const snap = readFastDrainRoundRecord(options);
-  if (!Array.isArray(snap?.rows)
+  if ((options?.requireDefaultBranch && (typeof snap?.defaultBranch !== 'string' || !snap.defaultBranch.trim()))
+      || !Array.isArray(snap?.rows)
       || !snap.rows.every(row => Number.isInteger(row?.number) && row.number > 0
         && typeof row.headRefOid === 'string' && row.headRefOid.length > 0
         && typeof row.baseRefName === 'string' && row.baseRefName.length > 0

@@ -349,8 +349,13 @@ export function createPrototypeLoader({ exec, fs, now, sleep, env, settings, com
       retired: [], retireRefused: [], ...(input.replace ? { replace: input.replace } : {}),
       settings: { sources: policy.sources, values: policy.value, log: formatCascadeSourcesLine('prototypeLoad', policy), errors: platform.errors } };
     let stage = 'bad-input';
+    let readinessStep = 'readiness-unreadable';
     let pendingAdoption = null;
-    const stop = (reason, details = {}) => { Object.assign(out, details, { stopReason: reason }); return out; };
+    const stop = (reason, details = {}) => {
+      Object.assign(out, reason === 'no-ready' ? { detail: 'readiness-unreadable',
+        fallback: 'Repair unreadable readiness evidence and retry.' } : {}, details, { stopReason: reason });
+      return out;
+    };
     // Once the replacement is registered, failures name the retained contained registrations.
     const keptNote = () => {
       if (!out.registered) return '';
@@ -518,6 +523,8 @@ export function createPrototypeLoader({ exec, fs, now, sleep, env, settings, com
       // Only an exact-sha successful `test` check-run can produce fresh readiness.
       // Injected runners must return {sha, name, status, conclusion}; missing integration fails closed.
       let urgentCiFailed = false;
+      let ciRefusal = null;
+      const noCi = (detail, fallback) => { ciRefusal = { detail, fallback }; return null; };
       const readTestCheck = testCheck || (({ sha }) => {
         let apiUnavailable = false;
         const gh = (args) => {
@@ -531,9 +538,11 @@ export function createPrototypeLoader({ exec, fs, now, sleep, env, settings, com
         };
         const origin = resolveOriginRepository({ git: (args) => git(...args), gh });
         if (!origin.repo) {
-          if (apiUnavailable) return null;
+          if (apiUnavailable) return noCi('ci-api-unavailable', 'Restore repository API access and retry.');
+          noCi('ci-repository-unreadable', 'Repair the origin repository identity and retry.');
           throw new Error('unreadable CI repository');
         }
+        noCi('ci-checks-unreadable', 'Repair the check-runs reader and retry with complete evidence (at most 100 checks).');
         const result = origin.gh(['api', `repos/${origin.repo}/commits/${sha}/check-runs?per_page=100`]);
         if (result.code !== 0) return null;
         const data = JSON.parse(result.stdout);
@@ -541,7 +550,7 @@ export function createPrototypeLoader({ exec, fs, now, sleep, env, settings, com
         urgentCiFailed = input.urgent && Array.isArray(data?.check_runs) && data.check_runs.some(r =>
           r?.head_sha === sha && r.status === 'completed'
           && ['failure', 'cancelled', 'timed_out', 'action_required', 'startup_failure'].includes(r.conclusion));
-        if (urgentCiFailed) return null;
+        if (urgentCiFailed) return noCi('ci-failed-urgent', 'Repair failed CI on this SHA and wait for passing CI.');
         // Oversized/incomplete evidence refuses; operator completes or repairs the reader.
         if (!Number.isInteger(data?.total_count) || data.total_count < 0 || data.total_count > 100
           || !Array.isArray(data.check_runs) || data.check_runs.length !== data.total_count
@@ -551,8 +560,9 @@ export function createPrototypeLoader({ exec, fs, now, sleep, env, settings, com
             || (r.status === 'completed' ? !['success', 'failure', 'neutral', 'cancelled', 'skipped', 'timed_out', 'action_required', 'startup_failure', 'stale'].includes(r.conclusion) : r.conclusion !== null)))
           throw new Error('malformed, incomplete or oversized CI checks');
         const evidence = testCheckEvidence(data, sha);
-        if (!evidence) return null;
+        if (!evidence) return noCi('ci-test-check-missing', 'Complete the GitHub Actions test check on this SHA and retry.');
         // Bind the check to the expected workflow file via its suite -> workflow run; any failed read refuses.
+        noCi('ci-workflows-unreadable', 'Repair the workflow-runs reader and retry with complete evidence (at most 100 runs).');
         const runs = origin.gh(['api', `repos/${origin.repo}/actions/runs?head_sha=${sha}&per_page=100`]);
         if (runs.code !== 0) return null;
         const runsData = JSON.parse(runs.stdout);
@@ -561,22 +571,28 @@ export function createPrototypeLoader({ exec, fs, now, sleep, env, settings, com
           || runsData.workflow_runs.some(r => !r || !Number.isSafeInteger(r.check_suite_id) || !validSha(r.head_sha) || typeof r.path !== 'string'))
           throw new Error('malformed, incomplete or oversized CI workflows');
         const bound = testWorkflowBound(evidence, runsData, sha, config.testWorkflowPath);
-        if (input.urgent && !bound) throw new Error('unbound CI workflow');
-        return bound ? evidence : null;
+        if (!bound) {
+          noCi('ci-workflow-unbound', 'Bind every test check suite to the configured workflow on this SHA and retry.');
+          if (input.urgent) throw new Error('unbound CI workflow');
+          return null;
+        }
+        ciRefusal = null;
+        return evidence;
       });
       if (input.urgent && !urgentReason(input.reason)) return stop('no-ready', { detail: 'no-urgent-marker', fallback: 'Supply --reason with at least 10 characters after trimming, or wait for passing CI.' });
       let checkRun;
       try { checkRun = await readTestCheck({ sha: input.sha, branch: input.branch }); }
       catch (e) { return stop('no-ready', { detail: 'ci-evidence-unreadable', error: String(e.message || e),
-        fallback: 'Repair the CI evidence reader or wait for complete, readable CI evidence (at most 100 checks and workflow runs), then retry.' }); }
+        fallback: 'Repair the CI evidence reader or wait for complete, readable CI evidence (at most 100 checks and workflow runs), then retry.', ...ciRefusal }); }
       if (urgentCiFailed || (checkRun?.sha === input.sha && checkRun.name === 'test' && checkRun.status === 'completed' && checkRun.conclusion !== 'success'))
-        return stop('no-ready', { detail: 'ci-test-failed', fallback: 'Repair the failed CI test gate on this SHA and wait for passing CI.' });
+        return stop('no-ready', { detail: urgentCiFailed ? 'ci-failed-urgent' : 'ci-test-failed', fallback: 'Repair the failed CI test gate on this SHA and wait for passing CI.' });
       if (input.urgent && checkRun != null && !(checkRun.sha === input.sha && checkRun.name === 'test'
         && (['queued', 'in_progress'].includes(checkRun.status)
           || (checkRun.appId === TEST_CHECK_APP_ID && checkRun.status === 'completed' && checkRun.conclusion === 'success'))))
         return stop('no-ready', { detail: 'ci-evidence-unreadable', fallback: 'Repair the CI evidence reader and retry with complete evidence.' });
       if (checkRun?.sha !== input.sha || checkRun.name !== 'test' || checkRun.appId !== TEST_CHECK_APP_ID || checkRun.status !== 'completed' || checkRun.conclusion !== 'success') {
-        if (!input.urgent) return stop('no-ready', { detail: 'no-passing-test-check', fallback: 'Complete the test check-run on this SHA and retry; repair the reader if evidence is unavailable, incomplete or exceeds 100 checks. --tests-run/--audit are labels only.' });
+        if (!input.urgent) return stop('no-ready', { detail: 'no-passing-test-check', fallback: 'Complete the test check-run on this SHA and retry; repair the reader if evidence is unavailable, incomplete or exceeds 100 checks. --tests-run/--audit are labels only.', ...ciRefusal });
+        if (ciRefusal && ciRefusal.detail !== 'ci-api-unavailable') return stop('no-ready', ciRefusal);
         let ledger, shards, expectedSteps, origin;
         try {
           origin = normalizeUrgentRepo(requireGit('remote', 'get-url', 'origin'));
@@ -603,9 +619,10 @@ export function createPrototypeLoader({ exec, fs, now, sleep, env, settings, com
         ...(out.gate?.ruledWeakened ? { auditRuling: out.gate.ruledWeakened.ruling, auditDisclosed: canonical.findings } : {}) };
       out.gate ||= { source: 'canonical-check-run', record: producedReady };
       stage = 'no-ready';
+      readinessStep = 'branch-tip-unreadable';
       requireGit('fetch', 'origin', input.branch);
       const tip = requireGit('rev-parse', `origin/${input.branch}`);
-      if (tip !== input.sha) return stop('no-ready', { gate: { ...out.gate, reason: 'sha-not-branch-tip', tip }, fallback: `${input.sha} is not the tip of ${input.branch}: the branch tip is ${tip}. Load the tip (re-run tests and audit if the code changed) or push the branch back to the tested sha.` });
+      if (tip !== input.sha) return stop('no-ready', { detail: 'sha-not-branch-tip', gate: { ...out.gate, reason: 'sha-not-branch-tip', tip }, fallback: `${input.sha} is not the tip of ${input.branch}: the branch tip is ${tip}. Load the tip (re-run tests and audit if the code changed) or push the branch back to the tested sha.` });
       stage = 'check-unverifiable';
       requireGit('fetch', 'origin', 'main', input.branch);
       const own = changedPaths(requireGit('diff', '--name-status', '-z', `origin/main...${input.sha}`));
@@ -788,9 +805,10 @@ export function createPrototypeLoader({ exec, fs, now, sleep, env, settings, com
       stage = 'register-failed';
       const registeredAt = now();
       stage = 'no-ready';
+      readinessStep = 'branch-tip-unreadable';
       requireGit('fetch', 'origin', out.effectiveRef);
       const movedTip = requireGit('rev-parse', `origin/${out.effectiveRef}`);
-      if (movedTip !== out.effectiveSha) return stop('no-ready', { detail: 'sha-moved', tip: movedTip });
+      if (movedTip !== out.effectiveSha) return stop('no-ready', { detail: 'sha-moved', tip: movedTip, fallback: 'Retest and audit the current branch tip, then retry.' });
       stage = 'register-failed';
       let urgentIntent;
       const appendUrgent = record => {
@@ -934,7 +952,7 @@ export function createPrototypeLoader({ exec, fs, now, sleep, env, settings, com
       if (unswapped) return unswapped;
       out.ok = true;
       return out;
-    } catch (e) { return stop(stage, { error: String(e.message || e), fallback: `Inspect the failed step evidence and rerun after resolving it.${keptNote()}` }); }
+    } catch (e) { return stop(stage, { ...(stage === 'no-ready' ? { detail: readinessStep } : {}), error: String(e.message || e), fallback: `Inspect the failed step evidence and rerun after resolving it.${keptNote()}` }); }
     finally {
       const record = { at: new Date(now()).toISOString(), ...out };
       try { const file = expand(config.recordPath); fs.mkdirSync(dirname(file), { recursive: true }); fs.appendFileSync(file, `${JSON.stringify(record)}\n`, 'utf8'); }
