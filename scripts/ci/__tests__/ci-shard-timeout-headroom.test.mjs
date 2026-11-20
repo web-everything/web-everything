@@ -14,9 +14,11 @@ const soakConfig = readFileSync(new URL('../../../vitest.soak.config.ts', import
 // Worst observed (run 38604669331, slow runner): unit shard 2 = ~14 min of tests, daemon-soak baseline = 615s.
 const WORST_UNIT_SHARD_MIN = 14;
 const WORST_SOAK_BASELINE_MIN = 10.25;
-// 2026-11-18 samples: test-shard (3) up to 24 min, integration up to 19 min, soak shards up to 17 min.
+// 2026-11-18 samples: test-shard (3) up to 24 min, soak shards up to 17 min.
 const WORST_TEST_SHARD_MIN = 24;
-const WORST_INTEGRATION_MIN = 19;
+// TT3 run 44443900759: the slowest integration part took 9.9 min before lane-pool was split further.
+// The former unsplit integration job took up to 19 min; `integration` is now only a shell aggregator.
+const WORST_INTEGRATION_PART_MIN = 10;
 
 describe('CI job caps keep headroom over a slow runner', () => {
   it('test-shard cap is at least 1.5x the slowest observed shard', () => {
@@ -27,8 +29,14 @@ describe('CI job caps keep headroom over a slow runner', () => {
     expect(jobs['test-shard']['timeout-minutes']).toBeGreaterThanOrEqual(WORST_TEST_SHARD_MIN * 1.6);
   });
 
-  it('integration cap keeps at least 1.6x headroom over the slowest recent run', () => {
-    expect(jobs.integration['timeout-minutes']).toBeGreaterThanOrEqual(WORST_INTEGRATION_MIN * 1.6);
+  it('every integration part keeps at least 1.6x headroom over the slowest recent part', () => {
+    const parts = jobs['integration-part'];
+    expect(parts['timeout-minutes']).toBe('${{ matrix.timeout }}');
+    expect(parts.strategy.matrix.include.map((entry) => entry.group)).toEqual(parts.strategy.matrix.group);
+    expect(parts.strategy.matrix.include.length).toBeGreaterThan(0);
+    for (const entry of parts.strategy.matrix.include) {
+      expect(entry.timeout, entry.group).toBeGreaterThanOrEqual(WORST_INTEGRATION_PART_MIN * 1.6);
+    }
   });
 
   it('soak-shard cap is at least 1.5x the slowest observed shard', () => {
