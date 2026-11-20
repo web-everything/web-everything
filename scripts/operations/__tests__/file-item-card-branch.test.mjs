@@ -7,6 +7,7 @@ import { createCardBranchSink, createFileItemSinks } from '../file-item-io.mjs';
 import { fileItemOperation } from '../file-item.mjs';
 import { advanceWhileRunning, startRun, runStatus } from '../engine.mjs';
 import { applyPendingEffects } from '../effect-executor.mjs';
+import { runOperationCli, renderOutcome } from '../cli-adapter.mjs';
 import { createRegistry } from '../registry.mjs';
 import { createMemoryRunStore } from '../run-store.mjs';
 
@@ -15,7 +16,7 @@ const EFFECT = 'file-item.card-branch';
 const now = () => new Date('2026-11-20T23:30:00-05:00');
 const ref = 'refs/heads/lane/card-batch-2026-11-21';
 const dirs = [];
-afterEach(() => { vi.restoreAllMocks(); dirs.splice(0).forEach(dir => rmSync(dir, { recursive: true, force: true })); });
+afterEach(() => { vi.restoreAllMocks(); vi.useRealTimers(); dirs.splice(0).forEach(dir => rmSync(dir, { recursive: true, force: true })); });
 
 function fixture() {
   const dir = mkdtempSync(join(tmpdir(), 'file-item-card-branch-'));
@@ -23,7 +24,7 @@ function fixture() {
   const origin = join(dir, 'origin.git');
   const lane = join(dir, 'lane');
   const git = (args, opts = {}) => execFileSync('git', [
-    '-c', 'user.name=Card Fixture', '-c', 'user.email=cards@example.invalid',
+    '-c', 'user.name=Card Fixture', '-c', 'user.email=cards@card-fixture.dev',
     '-c', 'commit.gpgsign=false', '-c', 'gc.auto=0', '-c', 'maintenance.auto=false', ...args,
   ], { cwd: lane, encoding: 'utf8', stdio: ['pipe', 'pipe', 'pipe'], ...opts }).trim();
   git(['init', '--bare', '--initial-branch=main', origin], { cwd: dir });
@@ -38,7 +39,7 @@ function fixture() {
   git(['add', 'worker-only.txt']);
   git(['commit', '-m', 'Private worker change']);
   git(['config', 'user.name', 'Card Fixture']);
-  git(['config', 'user.email', 'cards@example.invalid']);
+  git(['config', 'user.email', 'cards@card-fixture.dev']);
   git(['config', 'commit.gpgsign', 'false']);
   const warning = vi.spyOn(console, 'warn').mockImplementation(() => {});
   const sinks = createFileItemSinks({ root: lane, queuePath: () => join(dir, 'queue.json'), now });
@@ -48,6 +49,7 @@ function fixture() {
 async function file(ctx, title = 'Preserve worker discoveries', input = {}) {
   const registry = createRegistry();
   registry.register(fileItemOperation({
+    now,
     readScaffoldContext: () => ({ existingIds: [], today: '2026-11-20', dir: join(ctx.lane, 'backlog') }),
     searchDuplicates: () => ({ backlog: [] }),
   }));
@@ -60,8 +62,9 @@ async function file(ctx, title = 'Preserve worker discoveries', input = {}) {
     const applied = await applyPendingEffects(run, { registry, sinks: ctx.sinks, store });
     expect(applied.error).toBeNull();
     run = advanceWhileRunning(applied.run, { registry });
+    if (applied.warning) break;
   }
-  expect(runStatus(run, { registry })).toBe('complete');
+  expect(runStatus(run, { registry })).toBe(run.effects.at(-1)?.result?.pushed === false ? 'awaiting-effect' : 'complete');
   return { run, card: run.verdict.rel, result: run.effects.find(e => e.type === EFFECT)?.result };
 }
 
@@ -91,6 +94,32 @@ describe('file-item durable card branch (real bare origin, no network)', () => {
     const second = await file(ctx, 'Retain another discovery');
     expect(remote(ctx, ['rev-parse', `${ref}^`])).toBe(tip);
     for (const card of [first.card, second.card]) expect(remote(ctx, ['show', `${ref}:${card}`])).toContain('Retain');
+  });
+
+  it('appends to the existing daily batch after main advances and the lane refreshes origin/main', async () => {
+    const ctx = fixture();
+    const first = await file(ctx);
+    const originalBaseline = ctx.git(['rev-parse', 'origin/main']);
+    const writer = join(ctx.dir, 'main-writer');
+    ctx.git(['clone', ctx.origin, writer]);
+    writeFileSync(join(writer, 'main-only.txt'), 'Independent main advancement');
+    ctx.git(['add', 'main-only.txt'], { cwd: writer });
+    ctx.git(['commit', '-m', 'Advance main independently'], { cwd: writer });
+    ctx.git(['push', 'origin', 'HEAD:main'], { cwd: writer });
+    ctx.git(['fetch', 'origin', 'main']);
+    expect(ctx.git(['rev-parse', 'origin/main'])).not.toBe(originalBaseline);
+    expect(ctx.git(['merge-base', 'origin/main', first.result.sha])).toBe(originalBaseline);
+
+    const second = await file(ctx, 'Retain discovery after main advances');
+    expect(second.result).toMatchObject({ pushed: true, branch: first.result.branch });
+    expect(remote(ctx, ['rev-parse', `${ref}^`])).toBe(first.result.sha);
+    for (const card of [first.card, second.card]) {
+      expect(remote(ctx, ['show', `${ref}:${card}`])).toContain('Retain');
+    }
+    expect(remote(ctx, ['diff', '--name-only', originalBaseline, ref]).split('\n').sort())
+      .toEqual([first.card, second.card].sort());
+    expect(remote(ctx, ['ls-tree', '--name-only', ref])).not.toMatch(/main-only.txt|worker-only.txt/);
+    expect(ctx.warning).not.toHaveBeenCalled();
   });
 
   it('push rejection keeps filing successful and the card on disk, with stderr and result warnings', async () => {
@@ -138,8 +167,8 @@ describe('file-item durable card branch (real bare origin, no network)', () => {
 
   it('publishes even when conveyor clearance is opted out, and replay adds no duplicate commit', async () => {
     const ctx = fixture();
-    const { card, result } = await file(ctx, 'Retain an unqueued discovery', { queue: 'false' });
-    const replay = await ctx.sinks[EFFECT]({ rel: card });
+    const { run, result } = await file(ctx, 'Retain an unqueued discovery', { queue: 'false' });
+    const replay = await ctx.sinks[EFFECT](run.effects.at(-1).payload);
     expect(replay).toMatchObject({ pushed: true, alreadyPresent: true, sha: result.sha });
     expect(remote(ctx, ['rev-parse', ref])).toBe(result.sha);
   });
@@ -192,9 +221,9 @@ describe('file-item durable card branch (real bare origin, no network)', () => {
 
   it('does not overwrite an existing remote card with different bytes', async () => {
     const ctx = fixture();
-    const { card, result } = await file(ctx);
+    const { run, card, result } = await file(ctx);
     writeFileSync(join(ctx.lane, card), 'different card bytes');
-    const conflict = await ctx.sinks[EFFECT]({ rel: card });
+    const conflict = await ctx.sinks[EFFECT]({ ...run.effects.at(-1).payload, content: 'different card bytes' });
     expect(conflict).toMatchObject({ pushed: false, warning: expect.stringMatching(/WARNING/) });
     expect(remote(ctx, ['rev-parse', ref])).toBe(result.sha);
     expect(readFileSync(join(ctx.lane, card), 'utf8')).toBe('different card bytes');
@@ -223,8 +252,151 @@ describe('file-item durable card branch (real bare origin, no network)', () => {
     const cardBranch = vi.fn(async () => ({ pushed: true, fixture: true }));
     ctx.sinks = createFileItemSinks({ root: ctx.lane, cardBranch, queuePath: () => join(ctx.dir, 'queue.json') });
     const { card, result } = await file(ctx);
-    expect(cardBranch).toHaveBeenCalledWith({ rel: card }, expect.any(Object));
+    expect(cardBranch).toHaveBeenCalledWith({ rel: card, content: expect.any(String), batchDate: '2026-11-21' }, expect.any(Object));
     expect(result).toEqual({ pushed: true, fixture: true });
     expect(() => remote(ctx, ['rev-parse', '--verify', ref])).toThrow();
   });
+
+  it.each(['author', 'committer', 'missing', 'unreadable'])('refuses %s identity before commit-tree and retains the card', async role => {
+    const ctx = fixture();
+    let committed = false;
+    const git = (args, options) => {
+      if (args.includes('commit-tree')) committed = true;
+      if (args[0] === 'var') {
+        if (role === 'unreadable') throw new Error('identity probe unavailable');
+        if (role === 'missing') return '';
+        if (args[1] === `GIT_${role.toUpperCase()}_IDENT`) return 'test <test@test.com> 1 +0000';
+      }
+      return execFileSync('git', args, options);
+    };
+    ctx.sinks[EFFECT] = createCardBranchSink({ root: ctx.lane, git });
+    const { card, result } = await file(ctx);
+    expect(result).toMatchObject({ pushed: false, warning: expect.stringMatching(/validating commit identity/) });
+    expect(committed).toBe(false);
+    expect(readFileSync(join(ctx.lane, card), 'utf8')).toContain('Retain');
+    expect(() => remote(ctx, ['rev-parse', '--verify', ref])).toThrow();
+  });
+
+  it('publishes validated verdict bytes despite a disk edit after the guarded write', async () => {
+    const ctx = fixture();
+    const publish = ctx.sinks[EFFECT];
+    ctx.sinks[EFFECT] = (payload, context) => {
+      writeFileSync(join(ctx.lane, payload.rel), 'unguarded edited bytes');
+      return publish(payload, context);
+    };
+    const { run, card, result } = await file(ctx);
+    expect(result.pushed).toBe(true);
+    expect(remote(ctx, ['show', `${ref}:${card}`])).toBe(run.verdict.content.trim());
+    expect(readFileSync(join(ctx.lane, card), 'utf8')).toBe('unguarded edited bytes');
+  });
+
+  it('CLI warns without failing and --resume retries only publication from persisted state', async () => {
+    const ctx = fixture();
+    const registry = createRegistry();
+    const declaration = fileItemOperation({ now,
+      readScaffoldContext: () => ({ existingIds: [], today: '2026-11-20', dir: join(ctx.lane, 'backlog') }),
+      searchDuplicates: () => ({ backlog: [] }),
+    });
+    registry.register(declaration);
+    const memory = createMemoryRunStore();
+    // Model a file store: symbol brands must not be needed after persistence.
+    const store = { write: run => memory.write(JSON.parse(JSON.stringify(run))), read: id => memory.read(id) };
+    const options = { declaration, registry, store, sinks: ctx.sinks, newRunId: () => 'retry-publication' };
+    writeFileSync(join(ctx.origin, 'hooks/pre-receive'), '#!/bin/sh\nexit 1\n', { mode: 0o755 });
+    const first = await runOperationCli({ ...options, argv: ['--title=Retry publication', '--kind=task', '--digest=Retain discoveries'] });
+    expect(first).toMatchObject({ code: 0, stopped: 'effect-warning' });
+    expect(first.lines.join(' ')).toMatch(/WARNING.*--resume=retry-publication/);
+    const json = renderOutcome({ outcome: { run: first.run, stopped: first.stopped, applied: [], error: null }, json: true });
+    expect(json.code).toBe(0);
+    expect(JSON.parse(json.lines[0])).toMatchObject({ stopped: 'effect-warning', warning: expect.stringMatching(/WARNING/) });
+    expect(first.run.effects.map(e => e.status)).toEqual(['applied', 'applied', 'pending']);
+    const card = first.run.verdict.rel;
+    expect(readFileSync(join(ctx.lane, card), 'utf8')).toContain('Retain');
+    rmSync(join(ctx.origin, 'hooks/pre-receive'));
+    const second = await runOperationCli({ ...options, argv: ['--resume=retry-publication'] });
+    expect(second).toMatchObject({ code: 0, stopped: 'complete' });
+    expect(second.run.effects.map(e => e.attempts)).toEqual([1, 1, 2]);
+    expect(remote(ctx, ['show', `${ref}:${card}`])).toContain('Retain');
+  });
+
+  it('replays the persisted UTC batch date after midnight without a second branch', async () => {
+    const ctx = fixture();
+    const { run, result } = await file(ctx);
+    const payload = JSON.parse(JSON.stringify(run.effects.at(-1).payload));
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date('2026-11-22T01:00:00Z'));
+    const replay = await createCardBranchSink({ root: ctx.lane })(payload);
+    expect(replay).toMatchObject({ pushed: true, alreadyPresent: true, sha: result.sha });
+    expect(remote(ctx, ['for-each-ref', '--format=%(refname)', 'refs/heads/lane/'])).toBe(ref);
+  });
+
+  it.each(['unrelated ancestry', 'non-card diff', 'space-prefixed card path'])('skips an unsafe existing batch with %s and retains the card', async kind => {
+    const ctx = fixture();
+    let tree = ctx.git(['rev-parse', kind === 'non-card diff' ? 'HEAD^{tree}' : 'origin/main^{tree}']);
+    if (kind === 'space-prefixed card path') {
+      ctx.git(['read-tree', 'origin/main']);
+      mkdirSync(join(ctx.lane, ' backlog'));
+      writeFileSync(join(ctx.lane, ' backlog/hidden.md'), 'unrelated path');
+      ctx.git(['add', ' backlog/hidden.md']);
+      tree = ctx.git(['write-tree']);
+    }
+    const tip = ctx.git(['commit-tree', tree, ...(kind !== 'unrelated ancestry' ? ['-p', ctx.git(['rev-parse', 'origin/main'])] : []), '-m', 'Unsafe batch']);
+    ctx.git(['push', 'origin', `${tip}:${ref}`]);
+    const { card, result } = await file(ctx);
+    expect(result).toMatchObject({ pushed: false, warning: expect.stringMatching(/validating remote batch history/) });
+    expect(remote(ctx, ['rev-parse', ref])).toBe(tip);
+    expect(readFileSync(join(ctx.lane, card), 'utf8')).toContain('Retain');
+  });
+
+  it('publishes to the inspected fetch URL when origin has a different pushurl', async () => {
+    const ctx = fixture();
+    const other = join(ctx.dir, 'other.git');
+    ctx.git(['init', '--bare', other]);
+    ctx.git(['config', 'remote.origin.pushurl', other]);
+    const { card, result } = await file(ctx);
+    expect(result.pushed).toBe(true);
+    expect(remote(ctx, ['show', `${ref}:${card}`])).toContain('Retain');
+    expect(ctx.git(['--git-dir', other, 'for-each-ref'])).toBe('');
+  });
+
+  it('disables inherited push.followTags for annotated tags reachable from the card commit', async () => {
+    const ctx = fixture();
+    ctx.git(['config', 'push.followTags', 'true']);
+    const git = (args, options) => {
+      if (args.includes('push')) ctx.git(['tag', '-a', 'private-tag', args.at(-1).split(':')[0], '-m', 'Private tag']);
+      return execFileSync('git', args, options);
+    };
+    ctx.sinks[EFFECT] = createCardBranchSink({ root: ctx.lane, git });
+    const { result } = await file(ctx);
+    expect(result.pushed).toBe(true);
+    expect(ctx.git(['tag', '--list'])).toBe('private-tag');
+    expect(remote(ctx, ['tag', '--list'])).toBe('');
+  });
+
+  it('old rel-only persisted payloads warn rather than rereading unvalidated bytes', async () => {
+    const ctx = fixture();
+    const { card } = await file(ctx);
+    const result = await ctx.sinks[EFFECT]({ rel: card });
+    expect(result).toMatchObject({ pushed: false, warning: expect.stringMatching(/legacy payloads need content and batchDate/) });
+  });
+
+  it('oversized remote history evidence warns with the preserve-lane fallback and never pushes', async () => {
+    const ctx = fixture();
+    await file(ctx);
+    let pushes = 0;
+    const git = (args, options) => {
+      if (args.includes('diff')) {
+        expect(options.maxBuffer).toBe(1024 * 1024);
+        throw Object.assign(new Error('output exceeded maxBuffer'), { code: 'ENOBUFS' });
+      }
+      if (args.includes('push')) pushes++;
+      return execFileSync('git', args, options);
+    };
+    ctx.sinks[EFFECT] = createCardBranchSink({ root: ctx.lane, git });
+    const { card, result } = await file(ctx, 'Preserve oversized evidence');
+    expect(result).toMatchObject({ pushed: false, warning: expect.stringMatching(/ENOBUFS.*Preserve the lane and retry/) });
+    expect(pushes).toBe(0);
+    expect(readFileSync(join(ctx.lane, card), 'utf8')).toContain('Retain');
+  });
+
 });

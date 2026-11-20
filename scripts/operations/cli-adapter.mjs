@@ -1033,7 +1033,7 @@ function stampFinish(run, stepIndex, clock) {
  *   `stampStart`/`stampFinish` below and `we:scripts/operations/run-record.mjs#withStepStart`.
  * @returns {Promise<{run: object, stopped: string, error: (Error|null), applied: string[], step?: string,
  *   priorConfirm?: ({step: string, value: *}|null), inFlight?: string[]}>}
- *   `stopped` is one of `'complete'`, `'confirm'`, `'stuck'`, `'effect-halted'`, `'effect-refused'`, `'effect-in-flight'` or
+ *   `stopped` is one of `'complete'`, `'confirm'`, `'stuck'`, `'effect-halted'`, `'effect-refused'`, `'effect-warning'`, `'effect-in-flight'` or
  *   `'step-refused'` — the last one is a declaration fn (a `compute`, `judge`, `confirm` or `effect` step)
  *   throwing deterministically once its answer is already committed to the record (#3063). `step` and
  *   `priorConfirm` ride only on `step-refused`, because that is the one stop `renderOutcome` cannot describe
@@ -1226,6 +1226,9 @@ export async function driveRun({
       const outcome = await applyPendingEffects(current, { sinks, store, attemptedBy });
       current = outcome.run;
       applied.push(...outcome.applied);
+      if (outcome.warning) {
+        return { run: current, stopped: 'effect-warning', warning: outcome.warning, error: null, applied };
+      }
       // Permanent guard refusals must reach advance so the engine can settle the run.
       if (outcome.error && outcome.halted?.status !== 'refused') {
         return { run: current, stopped: 'effect-halted', error: outcome.error, applied };
@@ -1463,6 +1466,9 @@ export function outcomePayload({ run, stopped, error = null, applied = [], owned
     // no `effects` either, there was no way to recover a parked run's handle over HTTP at all. Reading the
     // record answers the same on every route.
     inFlight: run.effects.filter((e) => e.status === 'in-flight').map((e) => e.key),
+    ...(stopped === 'effect-warning' ? { warning: redactSpawnText(
+      run.effects.find(e => e.status === 'pending' && e.result?.warning)?.result.warning ?? 'Effect needs retry',
+    ) } : {}),
     // Dispatch callers need the persisted receipt, including its handle, to confirm a launch.
     // Keys alone prove neither a successful spawn nor which process owns the work.
     // Sink errors can embed argv/settings credentials. This boundary serves CLI and HTTP alike.
@@ -1530,7 +1536,7 @@ export function renderOutcome({ outcome, json = false, declaration = null }) {
   if (json) {
     return {
       // A dispatch park is a SUCCESSFUL stop, exactly like a confirm suspend — the run did what was asked.
-      code: stopped === 'complete' || stopped === 'confirm' || stopped === 'effect-in-flight' ? 0 : 1,
+      code: stopped === 'complete' || stopped === 'confirm' || stopped === 'effect-in-flight' || stopped === 'effect-warning' ? 0 : 1,
       lines: [JSON.stringify(outcomePayload({ ...outcome, ownedBy }), null, 2)],
     };
   }
@@ -1622,6 +1628,12 @@ export function renderOutcome({ outcome, json = false, declaration = null }) {
         ...ownerLines,
       ],
     };
+  }
+  if (stopped === 'effect-warning') {
+    return { code: 0, lines: [
+      `run ${run.id} — WARNING: ${redactSpawnText(outcome.warning)}`,
+      `Card retained; retry publication with --resume=${run.id}.`,
+    ] };
   }
   if (stopped === 'effect-halted') {
     return {

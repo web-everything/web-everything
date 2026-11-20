@@ -58,6 +58,7 @@
  *
  * PURE. No fs, no clock, no process, no network. `./file-item-io.mjs` is the only place it touches the world.
  */
+import { localDateString } from '../lib/local-date.mjs';
 import { OPERATOR_TASK_INPUT, OPERATOR_TASK_READS } from '../backlog/operator-task.mjs';
 import { op } from './registry.mjs';
 import { overlapScore } from '../capability-search.mjs';
@@ -196,7 +197,7 @@ export function planQueueing(verdict, input = {}) {
  * Build the declaration. Both readers/sinks are injected — `./file-item-io.mjs` supplies the real bindings,
  * reusing `we:scripts/operations/scaffold-io.mjs`'s own reader + write sink rather than re-deriving either.
  */
-export function fileItemOperation({ readScaffoldContext, searchDuplicates } = {}) {
+export function fileItemOperation({ readScaffoldContext, searchDuplicates, now = () => new Date() } = {}) {
   if (typeof readScaffoldContext !== 'function') {
     throw new TypeError(
       'file-item: needs a `readScaffoldContext()` reader — the io is INJECTED so the declaration stays '
@@ -316,7 +317,7 @@ export function fileItemOperation({ readScaffoldContext, searchDuplicates } = {}
         type: FILE_ITEM_CARD_BRANCH_EFFECT,
         // Replay checks the remote card bytes before appending; it cannot duplicate an applied card.
         idempotent: true,
-        payload: { rel: view.verdict.rel },
+        payload: { rel: view.verdict.rel, content: view.verdict.content, batchDate: localDateString(now(), 'UTC') },
       }],
     }),
   });

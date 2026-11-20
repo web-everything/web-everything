@@ -347,7 +347,7 @@ describe('the declaration end to end', () => {
     expect(queued).toHaveLength(1);
     expect(queued[0].num).toBe(run.verdict.num);
     expect(run.effects.map(e => e.type)).toEqual([SCAFFOLD_EFFECT, FILE_ITEM_QUEUE_EFFECT, FILE_ITEM_CARD_BRANCH_EFFECT]);
-    expect(run.effects.at(-1).payload).toEqual({ rel: run.verdict.rel });
+    expect(run.effects.at(-1).payload).toEqual({ rel: run.verdict.rel, content: run.verdict.content, batchDate: expect.stringMatching(/^\d{4}-\d{2}-\d{2}$/) });
     // The verdict is scaffold's own shape, unchanged — a caller of `scaffold` and a caller of `file-item`
     // read the identical fields off `run.verdict` for the same input.
     expect(run.verdict.kind).toBe('task');
