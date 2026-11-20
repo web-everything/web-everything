@@ -6,14 +6,15 @@ same recorded FUI SHA. The downloaded, unexpired sibling record must match the q
 latest `run_attempt`, `queue-reuse-record` producer and successful conclusion. Queue sibling records publish only after full CI and unquarantined
 execution receipts from every unit, integration and soak leg; missing/unknown receipts publish no record.
 Reusing pushes export and record that verified FUI SHA for their remaining sibling checkouts.
-Queue completion (`updated_at`) must be known, non-future and within two hours.
+The latest producing queue attempt's `run_started_at` must be known, non-future and within two hours;
+a later job completion or `updated_at` change never renews reuse.
 `mainPushSkip.maxAgeMs` (platform/tool policy) and `WE_CI_MAIN_PUSH_SKIP_MAX_AGE_MS`
 (environment; CI repository variable of the same name) can shorten this limit; invalid
 or larger values are rejected, retaining the lower-layer value (two hours by default).
 Effective values and sources are logged. Unknown or old evidence runs full CI.
 The hourly schedule is isolated from push concurrency and always runs full CI.
 A reused main push deliberately fails the non-required `main-execution` job: the
-unmodified drain reads the overall run conclusion and must never count reuse as fresh
+drain reads the overall run conclusion and must never count reuse as fresh
 main-green. Required `test`, `smoke` and `daemon-soak` checks keep their PR/MQ behavior.
 Wait for the hourly backstop or next full run for fresh evidence.
 `scripts/ci/__tests__/main-push-green-evidence.test.mjs` probes the real exported drain
@@ -5731,3 +5732,8 @@ path and its age bound. The reused-main-green age setting may only shorten the t
 standard; oversized values are ignored and logged by the policy cascade. Keep production-shaped
 light fixtures and negative age tests in `main-execution-evidence.test.mjs` and
 `drain-mq-retry-main-green.test.mjs`.
+
+The tip required-check fallback also requires the completed `main-execution` marker
+(success or conditional skip). A failed or absent marker supplies no fresh push evidence.
+Hourly evidence is restricted to the live main head SHA; an unreadable head retains the hold.
+`main-red-evidence-regressions.test.mjs` covers these negative paths and attempt-start expiry.

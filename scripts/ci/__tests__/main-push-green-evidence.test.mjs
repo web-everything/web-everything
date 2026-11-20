@@ -26,7 +26,7 @@ function evidence(conclusion) {
     throw Error(`Unexpected fixture IO: ${args.join(' ')}`);
   };
   const result = mqSameHeadGuard({ repo: 'fixture/repo', pr: 1, head, exec, now, quarantine: { readList: null } });
-  expect(reads.some(p => p.includes('branch=main&event=push'))).toBe(true);
+  expect(reads.some(p => p.includes('branch=main'))).toBe(true);
   return result;
 }
 

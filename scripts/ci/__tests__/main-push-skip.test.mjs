@@ -8,19 +8,19 @@ const input = () => ({ sha, before: 'c'.repeat(40), event: 'push', ref: 'refs/he
 const decide = async value => (await import('../main-push-skip.mjs')).decideMainPushSkip(value);
 describe('exact-SHA main push reuse', () => {
   it.each([undefined, null, '', 'invalid', '2026-11-20T09:59:59Z', '2026-11-20T12:00:01Z'])(
-    'runs full for old, unknown or future queue completion %s', async stamp => {
-      const x = input(); x.runs.workflow_runs[0].updated_at = stamp;
+    'runs full for old, unknown or future queue attempt start %s', async stamp => {
+      const x = input(); x.runs.workflow_runs[0].run_started_at = stamp;
       expect(await decide(x)).toMatchObject({ skip: false, reason: expect.stringContaining('full CI') });
     });
-  it('uses queue completion rather than creation or the current push time', async () => {
+  it('uses queue attempt start rather than creation or the current push time', async () => {
     const x = input(); x.runs.workflow_runs[0].created_at = '2020-01-01T00:00:00Z';
     expect((await decide(x)).skip).toBe(true);
-    x.runs.workflow_runs[0].updated_at = '2026-11-20T09:00:00Z';
-    x.runs.workflow_runs[1].updated_at = '2026-11-20T12:00:00Z';
+    x.runs.workflow_runs[0].run_started_at = '2026-11-20T09:00:00Z';
+    x.runs.workflow_runs[1].run_started_at = '2026-11-20T12:00:00Z';
     expect((await decide(x)).skip).toBe(false);
   });
   it('allows the two-hour boundary but an environment limit can shorten it', async () => {
-    const x = input(); x.runs.workflow_runs[0].updated_at = '2026-11-20T10:00:00Z';
+    const x = input(); x.runs.workflow_runs[0].run_started_at = '2026-11-20T10:00:00Z';
     expect((await decide(x)).skip).toBe(true);
     x.env.WE_CI_MAIN_PUSH_SKIP_MAX_AGE_MS = '3600000';
     expect((await decide(x)).skip).toBe(false);
@@ -29,7 +29,7 @@ describe('exact-SHA main push reuse', () => {
     'rejects invalid or oversized age limit %j and retains two hours', async setting => {
       const x = input(); x.env.WE_CI_MAIN_PUSH_SKIP_MAX_AGE_MS = setting;
       expect((await decide(x)).skip).toBe(true);
-      x.runs.workflow_runs[0].updated_at = '2026-11-20T09:59:59Z';
+      x.runs.workflow_runs[0].run_started_at = '2026-11-20T09:59:59Z';
       expect((await decide(x)).skip).toBe(false);
     });
   it('applies a shorten-only platform setting', async () => {

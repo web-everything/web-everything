@@ -10,7 +10,7 @@ const sha = 'a'.repeat(40), fui = 'b'.repeat(40);
 it.each([['mismatched artifact content', { WRONG_SHA: 'd'.repeat(40) }], ['expired artifact', { EXPIRED: '1' }], ['record from an older attempt', { OLD_ATTEMPT: '1' }]])('CLI fails closed on %s', (_, negative) => {
   const dir = mkdtempSync(join(tmpdir(), 'main-skip-'));
   try {
-    const fresh = JSON.parse(recorded); fresh.workflow_runs[0].updated_at = new Date(Date.now() - 60000).toISOString();
+    const fresh = JSON.parse(recorded); fresh.workflow_runs[0].run_started_at = new Date(Date.now() - 60000).toISOString();
     writeFileSync(join(dir, 'runs.json'), JSON.stringify(fresh));
     writeFileSync(join(dir, 'gh'), `#!/usr/bin/env node
 if (process.env.API_ERROR) process.exit(1);

@@ -331,8 +331,15 @@ export function tipRequiredVerdict(tip) {
  *   latestRed?:object, redSinceMs?:number, windowTruncated?:boolean, latestGreen?:object}}
  */
 export function mainRedState(runs, { tip } = {}) {
-  const s = completedMainRedState(runs);
   const verdict = tipRequiredVerdict(tip);
+  const marker = (Array.isArray(tip?.checkRuns) ? tip.checkRuns : []).filter(check => check?.name === 'main-execution')
+    .sort((a, b) => b.id - a.id)[0];
+  // Full pushes skip this conditional marker; reused pushes fail it. Required summaries alone
+  // (including historical pushes without the marker) cannot certify fresh execution.
+  const executionKnown = marker?.status === 'completed' && ['success', 'skipped'].includes(marker.conclusion);
+  if (verdict === 'green' && !executionKnown) return completedMainRedState(Array.isArray(runs)
+    ? runs.filter(run => run?.headSha !== tip.sha || run.event === 'schedule') : runs);
+  const s = completedMainRedState(runs);
   if (verdict === 'green') return {
     status: 'green', latestGreen: { sha: tip.sha, runId: null, createdAt: null, updatedAt: null }, via: 'tip-required-checks',
   };

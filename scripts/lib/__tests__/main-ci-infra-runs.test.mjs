@@ -103,7 +103,7 @@ describe('readMainCiFact infrastructure evidence', () => {
   ])('reports the expected red verdict for %s', (_label, data, red) => {
     const apiExec = jobsExec(data);
     const exec = vi.fn((bin, args, options) => {
-      if (args[0] === 'run') return JSON.stringify([failure(), green]);
+      if (args[0] === 'run') return JSON.stringify([failure(), green].map(run => ({ ...run, event: 'push' })));
       return apiExec(bin, args, options);
     });
     expect(readMainCiFact({ repo, exec }).red).toBe(red);

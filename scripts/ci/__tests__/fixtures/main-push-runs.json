@@ -5,6 +5,7 @@
       "id": 100,
       "run_attempt": 1,
       "updated_at": "2026-11-20T11:00:00Z",
+      "run_started_at": "2026-11-20T10:30:00Z",
       "head_sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
       "head_branch": "gh-readonly-queue/main/pr-1",
       "path": ".github/workflows/ci.yml",

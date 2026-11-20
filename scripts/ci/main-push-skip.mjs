@@ -42,11 +42,11 @@ export function decideMainPushSkip(input = {}) {
     if (others.some(r => !success(r) || r.id > queue.id && r.check_suite?.app?.id !== 15368)) return full('another run invalidates queue success');
     if (!oid(queueFuiSha) || !oid(fuiTip) || oid(queueFuiSha) !== oid(fuiTip)) return full('FUI sibling proof missing or changed');
     const { value: { maxAgeMs } } = readMainPushSkipPolicy(input);
-    // Workflow runs expose completion as updated_at, not created_at (reruns retain creation).
-    const completedAt = typeof queue.updated_at === 'string' ? Date.parse(queue.updated_at) : NaN;
+    // Bound reuse by the latest producing attempt's start; later job completions cannot renew it.
+    const startedAt = typeof queue.run_started_at === 'string' ? Date.parse(queue.run_started_at) : NaN;
     const now = input.now ?? Date.now();
-    if (!Number.isFinite(now) || !Number.isFinite(completedAt) || completedAt > now || now - completedAt > maxAgeMs)
-      return full('queue execution completion unknown or outside reuse age limit');
+    if (!Number.isFinite(now) || !Number.isFinite(startedAt) || startedAt > now || now - startedAt > maxAgeMs)
+      return full('queue execution start unknown or outside reuse age limit');
     return { skip: true, reason: `exact SHA passed queue run ${queue.id}; FUI sibling unchanged`, fuiSha: oid(queueFuiSha) };
   } catch { return full('unreadable input'); }
 }
