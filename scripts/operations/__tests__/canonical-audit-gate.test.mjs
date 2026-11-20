@@ -33,7 +33,8 @@ function fixture({ records = [green], auditText, audit = {}, tool = {}, writerSe
     const error = new Error('missing'); error.code = 'ENOENT'; throw error;
   };
   const result = checkCanonicalAuditForOpen({ repo: '/repo', ref, sha: 'aaaaaaa', env, readFile, fetchMain, ancestor, liveFingerprint,
-    exec: (cmd, args) => { calls.push([cmd, args]); return execOverride ? execOverride(args, resolved) : resolved; } });
+    exec: (cmd, args) => { calls.push([cmd, args]); return execOverride ? execOverride(args, resolved)
+      : args.includes('origin/main^{commit}') ? base : resolved; } });
   return { result, reads, calls };
 }
 describe('canonical audit before opening a PR', () => {
@@ -127,8 +128,8 @@ describe('canonical audit before opening a PR', () => {
     expect(result.message).toContain('malformed');
     expect(result.message).toContain(`codex-audit --base=origin/main --head=${sha}`);
   });
-  it.each(['before', 'after', 'waived'])('malformed evidence refuses in the %s path', path => {
-    const malformed = { ...weak, at: 'invalid' };
+  it.each(['before', 'after', 'carried', 'waived'])('malformed evidence refuses in the %s path', path => {
+    const malformed = { ...weak, at: 'invalid', ...(path === 'carried' ? { head: other, fingerprint: 'd'.repeat(64) } : {}) };
     const records = path === 'before' ? [malformed, green] : [green, malformed];
     expect(fixture({ records, tool: path === 'waived' ? { ruledWeakened: [waiver] } : {}, liveFingerprint: () => 'd'.repeat(64) }).result)
       .toMatchObject({ ok: false, reason: 'canonical-audit-missing', record: null });
@@ -136,10 +137,42 @@ describe('canonical audit before opening a PR', () => {
   it.each([
     { at: 'invalid' }, { findings: 'missing guard' }, { findings: ['NOT WEAKENED'] },
     { base: null }, { head: other.toUpperCase(), verdict: 'unknown' },
-  ])('skips malformed evidence for a different head, even with the live fingerprint: %j', patch => {
-    const poisoned = { ...weak, head: other, fingerprint: 'd'.repeat(64), ...patch };
+  ])('carried malformed refuses: a different head with the live fingerprint cannot expose an older pass: %j', patch => {
+    const poisoned = { ...weak, head: other, base: 'e'.repeat(40), fingerprint: 'd'.repeat(64), ...patch };
+    expect(fixture({ records: [green, poisoned], liveFingerprint: () => 'd'.repeat(64) }).result)
+      .toMatchObject({ ok: false, reason: 'canonical-audit-missing', record: null });
+  });
+  it('skips malformed foreign evidence only with a different base and fingerprint', () => {
+    const poisoned = { ...weak, head: other.toUpperCase(), base: 'e'.repeat(40),
+      fingerprint: 'F'.repeat(64), findings: 'missing guard' };
     expect(fixture({ records: [green, poisoned], liveFingerprint: () => 'd'.repeat(64) }).result)
       .toMatchObject({ ok: true, record: green });
+  });
+  it.each([
+    { head: undefined }, { head: null }, { head: 'short' }, { head: other + '\n' },
+    { fingerprint: undefined }, { fingerprint: null }, { fingerprint: 12 },
+    { fingerprint: 'unreadable' }, { fingerprint: 'f'.repeat(64) + '\n' },
+    { base: undefined }, { base: 'short' },
+    { head: sha }, { head: sha.toUpperCase() }, { base }, { base: base.toUpperCase() },
+    { fingerprint: 'd'.repeat(64).toUpperCase() },
+  ])('refuses malformed foreign evidence with ambiguous or admission-relevant identity: %j', patch => {
+    const poisoned = { ...weak, head: other, base: 'e'.repeat(40), fingerprint: 'f'.repeat(64),
+      findings: 'missing guard', ...patch };
+    expect(fixture({ records: [green, poisoned], liveFingerprint: () => 'd'.repeat(64) }).result)
+      .toMatchObject({ ok: false, reason: 'canonical-audit-missing', record: null });
+  });
+  it.each([null, 'bad', 'd'.repeat(64) + '\n'])('refuses malformed evidence when the live fingerprint is unreadable: %j', fp => {
+    const poisoned = { ...weak, head: other, base: 'e'.repeat(40), fingerprint: 'f'.repeat(64), at: 'invalid' };
+    expect(fixture({ records: [green, poisoned], liveFingerprint: () => fp }).result)
+      .toMatchObject({ ok: false, reason: 'canonical-audit-missing', record: null });
+  });
+  it.each(['fetch', 'base', 'fingerprint'])('refuses malformed evidence when the live %s lookup fails', lookup => {
+    const poisoned = { ...weak, head: other, base: 'e'.repeat(40), fingerprint: 'f'.repeat(64), at: 'invalid' };
+    expect(fixture({ records: [green, poisoned],
+      fetchMain: () => { if (lookup === 'fetch') throw new Error('offline'); },
+      execOverride: (args, resolved) => args.includes('origin/main^{commit}') ? (lookup === 'base' ? 'bad' : base) : resolved,
+      liveFingerprint: () => { if (lookup === 'fingerprint') throw new Error('diff unavailable'); return 'd'.repeat(64); },
+    }).result).toMatchObject({ ok: false, reason: 'canonical-audit-missing', record: null });
   });
   it.each([
     null, [], { ...weak, head: 'short' }, { ...weak, base: null },
@@ -249,8 +282,9 @@ describe('R1053 additive audit records', () => {
     deps.runCodex = () => 'NOT WEAKENED';
     expect(await auditMain(['--base=origin/main', `--head=${sha}`], deps)).toBe(0);
     expect(fixture({ records }).result.ok).toBe(true);
-    const poisoned = { ...scoped, head: other, preExisting: [{ ...entry, line: `${entry.line}\u2028WEAKENED` }] };
-    expect(fixture({ records: [poisoned, ...records] }).result.ok).toBe(true);
+    const poisoned = { ...scoped, head: other, base: 'e'.repeat(40), fingerprint: 'f'.repeat(64),
+      preExisting: [{ ...entry, line: `${entry.line}\u2028WEAKENED` }] };
+    expect(fixture({ records: [poisoned, ...records], liveFingerprint: () => 'd'.repeat(64) }).result.ok).toBe(true);
     expect(fixture({ records: [...records, { ...poisoned, head: sha }] }).result.ok).toBe(false);
   });
   it.each(['exact', 'carried'])('both consumers apply tightened policy to a valid saved B2 exemption (%s)', kind => {

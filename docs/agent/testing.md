@@ -5493,3 +5493,32 @@ Park opens ready for review; draft-promotion still handles older drafts.
 Check mode fetches origin main before evaluating canonical audit evidence. A failed fetch reports
 `main not refreshed: <reason>` and refuses even when local evidence would pass against stale refs.
 `open-pr-audit-gate.test.mjs` covers both refresh outcomes, aggregation and an unconfirmed check child.
+
+## Malformed canonical audit carry evidence (R1053)
+
+PR admission may isolate a malformed audit only after proving its full head and base differ
+from the live head and refreshed main, and its valid fingerprint differs from the live net diff.
+Missing or unreadable identities and failed live lookups refuse with `canonical-audit-missing`.
+Compare hex identities without case sensitivity and reject trailing separators. Keep the
+malformed record in the fingerprint lookup input until that comparison finishes; dropping it
+first can hide the reason a live fingerprint must be computed.
+
+`canonical-audit-gate.test.mjs` restores the carried-malformed refusal and exercises the real
+`checkCanonicalAuditForOpen` entry point with invalid timestamps/findings, matching fingerprints,
+different fingerprints, matching bases, unreadable identities, and failed live lookups.
+The unrelated poisoned-record fixture supplies both a different base and fingerprint explicitly.
+
+Operator send-back IC_kwDORBt1-c8AAAABot6jlw, item 3, PR body evidence:
+the same direct Node probe called the real admission function with an older exact-head green
+record and a newer foreign-head WEAKENED record whose findings were a string. Both records
+held the live fingerprint. Git/settings ports were injected; no repository or remote was changed.
+Observed before the source repair and after it, respectively:
+
+```json
+{"scenario":"malformed WEAKENED, foreign head, same live fingerprint","ok":true,"reason":null}
+{"scenario":"malformed WEAKENED, foreign head, same live fingerprint","ok":false,"reason":"canonical-audit-missing"}
+```
+
+The pre-fix regression run reported 19 failed and 108 passed tests. Per proof-only dispatch
+policy, the test file is not rerun locally after repair; the launcher's verify verdict supplies
+the after-test evidence. The direct admission probe above was repeated after repair.

@@ -25,8 +25,8 @@ function validPreExisting(f) {
   try { return findingKey({ file: parts[0], symbol: parts[1], class: parts[2] }) === f.key; } catch { return false; }
 }
 
-// The shared evaluator skips unusable records. Corrupt evidence for the opening head
-// must refuse before that skip can expose an older pass (including a carried pass).
+// The shared evaluator skips unusable records. Corrupt evidence that might affect
+// admission must refuse before that skip can expose an older pass (including a carried pass).
 function wellFormedAudit(record) {
   if (!record || typeof record !== 'object' || Array.isArray(record)
     || !validSha(record.head) || !validSha(record.base)
@@ -92,21 +92,6 @@ export function checkCanonicalAuditForOpen({ repo = process.cwd(), ref, sha, env
     } catch {
       return refuse('canonical-audit-missing', 'the audit record file has an unreadable/truncated line');
     }
-    let malformedHead = false;
-    records = records.filter(record => {
-      if (wellFormedAudit(record)) return true;
-      // Only a full, unambiguous foreign head can be isolated. Unknown identities still fail closed.
-      if (typeof record?.head === 'string' && /^[a-f0-9]{40}(?![\s\S])/i.test(record.head)
-        && record.head.toLowerCase() !== fullSha) {
-        warn(`ignoring malformed canonical audit record for another head ${record.head.toLowerCase()}`);
-        return false;
-      }
-      malformedHead = true;
-      return false;
-    });
-    if (malformedHead) {
-      return refuse('canonical-audit-missing', 'the audit record file has a malformed record; inspect and repair the audit record file');
-    }
     policy = resolveAuditSettings({ fileRead: readFile, platformRead: readFile, env, log: warn });
     for (const name of ['releaseStage', 'preExistingMode', 'preExistingExemptionEnabled']) warn(`audit.${name}=${policy.value[name]} source=${policy.sources[name]}`);
   } catch {
@@ -126,9 +111,29 @@ export function checkCanonicalAuditForOpen({ repo = process.cwd(), ref, sha, env
       return fp;
     } catch (e) { throw Object.assign(new Error(`live diff fingerprint unavailable (${String(e?.message || e).slice(0, 120)})`), { fingerprintLookup: true }); }
   });
+  const malformed = new Set(records.filter(record => !wellFormedAudit(record)));
+  const malformedRefusal = () => refuse('canonical-audit-missing', 'the audit record file has a malformed record; inspect and repair the audit record file');
+  const fullHead = value => typeof value === 'string' && /^[a-f0-9]{40}(?![\s\S])/i.test(value);
+  const fullFingerprint = value => typeof value === 'string' && /^[a-f0-9]{64}(?![\s\S])/i.test(value);
+  // Foreign heads can still carry a veto through an identical net diff. Unknown
+  // head/base/fingerprint identities cannot prove that corrupt evidence is unrelated.
+  if ([...malformed].some(record => !fullHead(record?.head) || record.head.toLowerCase() === fullSha
+    || !fullHead(record?.base) || !fullFingerprint(record?.fingerprint))) return malformedRefusal();
   let evidence;
   try {
     const fp = liveFingerprint(records);
+    if (malformed.size) {
+      if (!fullFingerprint(fp) || [...malformed].some(record => record.fingerprint.toLowerCase() === fp.toLowerCase())) return malformedRefusal();
+      fetchMain();
+      const liveBase = git('rev-parse', '--verify', '--end-of-options', 'origin/main^{commit}').toLowerCase();
+      if (!fullHead(liveBase) || [...malformed].some(record => record.base.toLowerCase() === liveBase)) return malformedRefusal();
+      // Only now is every malformed record provably foreign to this admission.
+      records = records.filter(record => {
+        if (!malformed.has(record)) return true;
+        warn(`ignoring unrelated malformed canonical audit record for another head ${record.head.toLowerCase()}`);
+        return false;
+      });
+    }
     evidence = canonicalAuditEvidence(records, fullSha, covers, fp, { auditPolicy: policy.value });
     if (!evidence.ok && evidence.reason === 'weakened') {
       for (const entry of config.ruledWeakened) {
