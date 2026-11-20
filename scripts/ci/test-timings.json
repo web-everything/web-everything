@@ -1341,6 +1341,7 @@
   "scripts/lib/__tests__/review-round-rules.replay.test.mjs": 0.05,
   "scripts/lib/__tests__/review-round-rules.test.mjs": 0.06,
   "scripts/lib/__tests__/review-runner-core.test.mjs": 0.02,
+  "scripts/lib/__tests__/review-seat-caps.test.mjs": 0.1,
   "scripts/lib/__tests__/review-settings.test.mjs": 1.6,
   "scripts/lib/__tests__/review-shadow-budget.test.mjs": 0.09,
   "scripts/lib/__tests__/review-shadow-model.test.mjs": 0.2,

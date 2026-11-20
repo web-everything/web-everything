@@ -55,7 +55,9 @@ export default {
       const repo = CONSTELLATION_REPOS.we.slug, head = 'a'.repeat(40), nextHead = 'b'.repeat(40);
       scratch = mkdtempSync(join(tmpdir(), 'soak-red-team-skip-'));
       const env = { WE_SHARED_RUNS_DIR: join(scratch, 'runs'), WE_RED_TEAM_SKIP_CARD_ONLY: '1',
-        WE_REVIEW_RED_TEAM: '1', WE_REVIEW_EXTRA_SEATS: '1' };
+        WE_REVIEW_RED_TEAM: '1', WE_REVIEW_EXTRA_SEATS: '1',
+        // Exercise CLI unavailability with budget remaining, independently of default-disabled providers.
+        WE_REVIEW_SEAT_CAP_CODEX: '1', WE_REVIEW_SEAT_CAP_AGY_GEMINI: '1', WE_REVIEW_SEAT_CAP_AGY_CLAUDE: '1' };
       const payload = (path = 'backlog/5872.md') => ({ runId: 'soak-skip', stopped: 'complete',
         verdict: { verdict: 'accept', loop: { outcome: 'converged' }, findings: [], admittedFindings: [] },
         findings: { read: { title: 'Soak fixture', body: '', diffText: `diff --git a/${path} b/${path}\n+update\n`,
@@ -155,8 +157,9 @@ export default {
           pr: 9310 + index, redTeam, loopPayload: codePayload });
       }
       const codeResult = await runRedTeam({ repo, pr: 9300, loopPayload: codePayload, env }, producerIo);
-      check(providerChecks > 0 && codeResult.status === 'skipped' && codeResult.policy !== 'card-only',
-        'code PR: skipCardOnly=true must still check providers and never produce policy');
+      check(providerChecks > 0 && codeResult.status === 'skipped' && codeResult.policy !== 'card-only'
+        && codeResult.deferredByCap !== true,
+        'code PR: skipCardOnly=true must still check unavailable CLIs with budget remaining and never produce policy or a cap deferral');
       for (const result of ['skipped', { status: 'skipped', policy: 'card-only' }]) {
         check(!redTeamSkipNeedsSettlement({ head, status: 'finished', result, skipCardOnly: true, loopPayload: codePayload }),
           'code PR: persisted skipCardOnly=true incorrectly admitted historical policy settlement');
