@@ -20,6 +20,35 @@ const mqOid = value => typeof value === 'string' && /^[a-f0-9]{40}(?![\s\S])/i.t
 const MQ_MERGE_CONFLICT_RETRY_CAP = 3;
 const MQ_MAIN_GREEN_MAX_AGE_MS = 2 * 60 * 60 * 1000;
 const MQ_INFRA_MAX_JOBS = 10;
+
+/** A light main success proves the SHA; full test evidence may live on its queue/backstop run. */
+function fullMainEvidenceRun(main, json, completeArtifacts = null) {
+  const artifacts = completeArtifacts ?? json(`actions/runs/${main.id}/artifacts?per_page=100`);
+  if (!Array.isArray(artifacts?.artifacts) || artifacts.total_count !== artifacts.artifacts.length
+    || artifacts.total_count > 500) throw new Error('incomplete main artifacts; operator must inspect main CI');
+  if (artifacts.artifacts.some(a => typeof a?.name === 'string' && a.name.startsWith('timing-unit-'))) return main;
+  const page = json(`actions/workflows/ci.yml/runs?head_sha=${main.head_sha}&per_page=100`);
+  if (!Array.isArray(page?.workflow_runs) || page.total_count !== page.workflow_runs.length || page.total_count > 100
+    || new Set(page.workflow_runs.map(r => r?.id)).size !== page.workflow_runs.length)
+    throw new Error('incomplete same-SHA evidence; operator must inspect full CI');
+  const sources = page.workflow_runs.filter(r => Number.isSafeInteger(r?.id) && r.id > 0
+    && r.path === '.github/workflows/ci.yml' && mqOid(r.head_sha) === mqOid(main.head_sha)
+    && r.status === 'completed' && r.conclusion === 'success'
+    && ((r.event === 'merge_group' && r.head_branch?.startsWith('gh-readonly-queue/main/'))
+      || (r.event === 'schedule' && r.head_branch === 'main'))).sort((a, b) => b.id - a.id);
+  for (const source of sources.slice(0, 5)) {
+    const inventory = json(`actions/runs/${source.id}/artifacts?per_page=100`);
+    if (!Array.isArray(inventory?.artifacts) || inventory.total_count !== inventory.artifacts.length || inventory.total_count > 100)
+      throw new Error('incomplete full CI artifacts; operator must inspect full CI');
+    if (!inventory.artifacts.some(a => typeof a?.name === 'string' && a.name.startsWith('timing-unit-'))) continue;
+    const detail = json(`actions/runs/${source.id}`);
+    if (['id', 'path', 'head_sha', 'event', 'head_branch', 'status', 'conclusion'].some(key => detail?.[key] !== source[key]))
+      throw new Error('unreadable full CI identity');
+    return detail;
+  }
+  throw new Error('no full same-SHA evidence within five sources; wait for backstop CI or inspect full CI');
+}
+
 const MQ_SUMMARY_TAIL_BYTES = 64 * 1024;
 const MQ_INFRA_LOG_BYTES = 4 * 1024 * 1024;
 
@@ -669,17 +698,18 @@ function readMqExactTestEvidence({ repo, pr, head, timeline, exec, now }) {
       return hits.length === 1 && hits[0].status === 'passed';
     };
     if (!exactPassed(headRunId, head, headChecks)) return null;
-    const mainEndpoint = 'actions/workflows/ci.yml/runs?branch=main&event=push&per_page=100';
+    const mainEndpoint = 'actions/workflows/ci.yml/runs?branch=main&per_page=100';
     const mainPage = json(mainEndpoint), runs = mainPage?.workflow_runs;
     const conclusions = new Set([...passing, 'failure', 'cancelled', 'timed_out', 'startup_failure', 'action_required', 'stale']);
     const unfinished = new Set(['queued', 'in_progress', 'waiting', 'requested', 'pending']);
     if (!Number.isSafeInteger(mainPage?.total_count) || mainPage.total_count < 0 || !Array.isArray(runs)
       || runs.length !== Math.min(mainPage.total_count, 100) || new Set(runs.map(r => r?.id)).size !== runs.length
       || runs.some(r => !Number.isSafeInteger(r?.id) || r.id <= 0 || r.path !== '.github/workflows/ci.yml'
-        || r.event !== 'push' || r.head_branch !== 'main' || !mqOid(r.head_sha)
+        || !['push', 'schedule', 'workflow_dispatch'].includes(r.event) || r.head_branch !== 'main' || !mqOid(r.head_sha)
         || !Number.isFinite(Date.parse(r.created_at))
         || (r.status === 'completed' ? !conclusions.has(r.conclusion) || !Number.isFinite(Date.parse(r.updated_at))
           : !unfinished.has(r.status) || r.conclusion !== null))) return null;
+    runs.splice(0, runs.length, ...runs.filter(r => ['push', 'schedule'].includes(r.event)));
     runs.sort(newestRunFirst);
     const ignored = new Set(['cancelled', 'startup_failure', 'stale', 'action_required']);
     const main = runs.find(r => r.status === 'completed' && !ignored.has(r.conclusion));
@@ -692,12 +722,14 @@ function readMqExactTestEvidence({ repo, pr, head, timeline, exec, now }) {
       if (!mainHead || runs.find(run => mqOid(run.head_sha) === mainHead)?.id !== main.id) return null;
     }
     const mainRun = json(`actions/runs/${main.id}`);
-    if (mainRun?.id !== main.id || mainRun.path !== '.github/workflows/ci.yml' || mainRun.event !== 'push'
+    if (mainRun?.id !== main.id || mainRun.path !== '.github/workflows/ci.yml' || !['push', 'schedule'].includes(mainRun.event)
       || mainRun.head_branch !== 'main' || mqOid(mainRun.head_sha) !== mqOid(main.head_sha)
       || mainRun.status !== 'completed' || mainRun.conclusion !== 'success'
       || mainRun.created_at !== main.created_at || mainRun.updated_at !== main.updated_at
-      || !exactPassed(main.id, mqOid(main.head_sha))
       || readMqMergeState({ repo, pr, head, exec }) !== 'CLEAN') return null;
+    const rows = pages(`actions/runs/${main.id}/artifacts`, 'artifacts');
+    const full = fullMainEvidenceRun(mainRun, json, { total_count: rows.length, artifacts: rows });
+    if (!exactPassed(full.id, mqOid(main.head_sha))) return null;
     return { mainGreen: true, mainRunId: main.id, infra: 'exact-test', failedNames: failed.map(c => c.name), mergeState: 'CLEAN' };
   } catch { return null; }
 }
@@ -982,7 +1014,7 @@ function readMqBaseRetryEvidence({ repo, pr, head, timeline, exec, rerunScope, d
     if (attempts.reason) infra = false;
     else if (!logReason && attempts.confirmed) infra = true;
     // These queries need only their first page, regardless of the workflow's history size.
-    const mainEndpoint = `repos/${repo}/actions/workflows/ci.yml/runs?branch=main&event=push`;
+    const mainEndpoint = `repos/${repo}/actions/workflows/ci.yml/runs?branch=main`;
     const readRunPage = (endpoint, limit, allowEmpty = false) => {
       if (budget-- <= 0) throw new Error('retry evidence budget exhausted');
       const result = JSON.parse(exec('gh', ['api', endpoint],
@@ -1006,10 +1038,12 @@ function readMqBaseRetryEvidence({ repo, pr, head, timeline, exec, rerunScope, d
     const conclusions = new Set([...passing, ...infraConclusions, 'failure', 'action_required', 'stale']);
     const unfinished = new Set(['queued', 'in_progress', 'waiting', 'requested', 'pending']);
     if ([...newest, ...runs].some(run => run.path !== '.github/workflows/ci.yml' || run.head_branch !== 'main'
-      || run.event !== 'push' || (run.status === 'completed' ? !conclusions.has(run.conclusion)
+      || !['push', 'schedule', 'workflow_dispatch'].includes(run.event) || (run.status === 'completed' ? !conclusions.has(run.conclusion)
         : !unfinished.has(run.status) || run.conclusion !== null)
       || !Number.isFinite(timestamp(run.created_at))
       || (run.status === 'completed' && !Number.isFinite(timestamp(run.updated_at))))) return null;
+    runs.splice(0, runs.length, ...runs.filter(r => ['push', 'schedule'].includes(r.event)));
+    newest.splice(0, newest.length, ...newest.filter(r => ['push', 'schedule'].includes(r.event)));
     runs.sort(newestRunFirst);
     const before = runs.find(run => run.status === 'completed' && timestamp(run.created_at) < removedAt
       && timestamp(run.updated_at) < removedAt);
@@ -1099,6 +1133,12 @@ function readMqBaseRetryEvidence({ repo, pr, head, timeline, exec, rerunScope, d
         const headIdentity = new Map();
         flaky = headGreen && failed.every(check => shardArtifact(check) !== undefined || derivedAggregate(check));
         if (flaky) {
+          const fullMain = fullMainEvidenceRun(deciding, endpoint => {
+            if (--budget < 0) throw new Error('retry evidence budget exhausted');
+            return JSON.parse(exec('gh', ['api', `repos/${repo}/${endpoint}`],
+              { encoding: 'utf8', timeout: 60_000, maxBuffer: 4 * 1024 * 1024,
+                stdio: ['ignore', 'pipe', 'pipe'], throttle: { maxAttempts: 1 } }));
+          });
           flaky = readQuarantineCover({ repo, commit: oid, failed, exec, flake: { passed: (file, name, check) => {
             const shard = shardArtifact(check);
             const headRuns = [newestSuccess.get(localJob(check.name))].filter(Boolean);
@@ -1118,7 +1158,7 @@ function readMqBaseRetryEvidence({ repo, pr, head, timeline, exec, rerunScope, d
             if (headIdentity.get(identityKey) !== true) return false;
             return shard !== undefined && headRuns.length === 1 && headRuns[0].conclusion === 'success'
               && passedIn(readReport(runOf(headRuns[0]), shard, head), file, name)
-              && passedIn(readReport(deciding.id, shard, deciding.head_sha), file, name);
+              && passedIn(readReport(fullMain.id, shard, deciding.head_sha), file, name);
           } } }) === true;
         }
         if (!flaky && headGreen && !flakeReason) flakeReason = 'per-test pass proof missing, unreadable, expired or not from this shard (fails closed)';

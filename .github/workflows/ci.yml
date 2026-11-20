@@ -50,22 +50,26 @@ on:
   # and always runs the full soak (daemon-soak-scope: not a pull_request ⇒ run=true).
   merge_group:
   workflow_dispatch:
+  schedule:
+    - cron: '23 * * * *'
 
 concurrency:
-  group: ci-${{ github.ref }}
+  group: ci-${{ github.ref }}-${{ github.event_name == 'schedule' && 'schedule' || 'events' }}
   # #5000: never cancel a run on main. A merge every few minutes cancelled 85 of 100 main runs (2026-10-03),
   # hiding main's red/green for hours. PR branches still cancel superseded runs.
-  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+  cancel-in-progress: ${{ github.event_name != 'schedule' && github.ref != 'refs/heads/main' }}
 
 permissions:
   contents: read
+  actions: read
+  checks: read
 
 jobs:
   # CARD-ONLY LIGHT PATH (actions-queue-relief, 2026-10-03). A PR that changes only `backlog/**` runs the
   # independent `standards` job's `check:standards` (the backlog/card guards) but NOT the unit shards, coverage merge,
   # integration suite, docs build or Playwright lane. Detection is `scripts/ci-card-only.mjs` (tested):
   # PRs permit cards/docs; merge_group permits only cards against its validated ancestor base.
-  # A push to main, manual dispatch, empty or unreadable diff runs the full suite. Fail closed: if this job fails, `light` is
+  # A proven exact-SHA queue push can also be light; dispatch/schedule and unknown evidence run full CI. Fail closed: if this job fails, `light` is
   # empty (not 'true'), and `test` / `smoke` below fail on `needs.changes.result != 'success'`.
   #
   # REQUIRED CHECKS STILL REPORT FROM REAL RUNNING JOBS: `test` and `smoke` keep running as jobs (they do
@@ -76,7 +80,10 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     outputs:
-      light: ${{ steps.detect.outputs.light }}
+      light: ${{ steps.detect.outputs.light == 'true' || steps.main-skip.outputs.skip == 'true' }}
+      fui-sha: ${{ steps.fui-tip.outputs.tip }}
+      skip: ${{ steps.main-skip.outputs.skip }}
+      skip-reason: ${{ steps.main-skip.outputs.reason }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -107,6 +114,45 @@ jobs:
           fi
           node scripts/ci-card-only.mjs --event="$EVENT_NAME" --base="$BASE_SHA" --base-ref="$BASE_REF" --fresh-main-sha="$FRESH_MAIN_SHA" --head=HEAD >> "$GITHUB_OUTPUT"
 
+      - name: Mint FUI read token (GitHub App)
+        id: fui-app-token
+        if: ${{ github.event_name == 'merge_group' || (github.event_name == 'push' && github.ref == 'refs/heads/main') }}
+        continue-on-error: true
+        uses: actions/create-github-app-token@v2
+        with:
+          app-id: ${{ vars.WE_APP_ID }}
+          private-key: ${{ secrets.WE_APP_PRIVATE_KEY }}
+          owner: frontier-ui
+          repositories: frontierui
+          permission-contents: read
+      - name: Record queue FUI sibling tip
+        id: fui-tip
+        if: ${{ github.event_name == 'merge_group' }}
+        env:
+          FUI_TOKEN: ${{ steps.fui-app-token.outputs.token }}
+        run: node scripts/ci/main-push-skip.mjs --record-fui >> "$GITHUB_OUTPUT"
+      - name: Prepare sibling record
+        if: ${{ github.event_name == 'merge_group' && steps.fui-tip.outputs.tip != '' }}
+        run: echo recorded > "$RUNNER_TEMP/fui-sibling-record"
+      - uses: actions/upload-artifact@v4
+        if: ${{ github.event_name == 'merge_group' && steps.fui-tip.outputs.tip != '' }}
+        with:
+          name: fui-sibling-${{ steps.fui-tip.outputs.tip }}
+          path: ${{ runner.temp }}/fui-sibling-record
+      - name: Reuse exact-SHA merge queue CI
+        id: main-skip
+        if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          FUI_TOKEN: ${{ steps.fui-app-token.outputs.token }}
+          HEAD_SHA: ${{ github.sha }}
+          BEFORE_SHA: ${{ github.event.before }}
+          RUN_ID: ${{ github.run_id }}
+          EVENT_NAME: ${{ github.event_name }}
+          REF: ${{ github.ref }}
+          REPO: ${{ github.repository }}
+        run: node scripts/ci/main-push-skip.mjs --sha="$HEAD_SHA" --before="$BEFORE_SHA" --run-id="$RUN_ID" --event="$EVENT_NAME" --ref="$REF" --repo="$REPO" >> "$GITHUB_OUTPUT"
+
   # Sharded unit suite (#2682). The 2000+ vitest suite runs split across N parallel runners
   # (`vitest run --shard=i/N`) to cut the `test` gate's wall-clock. Each shard runs WITH coverage but
   # with its per-shard thresholds disabled (`test:coverage:shard`) — a single shard exercises only
@@ -116,6 +162,7 @@ jobs:
   # FILE, so every file (incl. the poolMatchGlobs singleFork one) lands in exactly one shard.
   # Review can start when standards and the first shard are green.
   standards:
+    needs: changes
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
@@ -143,6 +190,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: frontier-ui/frontierui
+          ref: ${{ needs.changes.outputs.fui-sha || '' }}
           token: ${{ steps.fui-app-token.outputs.token || secrets.FUI_READ_TOKEN }}
           path: frontierui
 
@@ -239,6 +287,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: frontier-ui/frontierui
+          ref: ${{ needs.changes.outputs.fui-sha || '' }}
           token: ${{ steps.fui-app-token.outputs.token || secrets.FUI_READ_TOKEN }}
           path: frontierui
 
@@ -373,6 +422,8 @@ jobs:
     timeout-minutes: 5
     steps:
       - name: Gate on shard results
+        env:
+          MAIN_SKIP_REASON: ${{ needs.changes.outputs.skip-reason }}
         run: |
           if [ "${{ needs.changes.result }}" != "success" ]; then
             echo "::error::Changes detection did not succeed."
@@ -391,7 +442,7 @@ jobs:
             exit 1
           fi
           if [ "${{ needs.changes.outputs.light }}" = "true" ]; then
-            echo "Card-only PR: unit shards and coverage merge intentionally omitted."
+            echo "Light CI: unit shards and coverage merge intentionally omitted. $MAIN_SKIP_REASON"
             exit 0
           fi
           if [ "${{ needs.test-shard.result }}" != "success" ]; then
@@ -474,6 +525,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: frontier-ui/frontierui
+          ref: ${{ needs.changes.outputs.fui-sha || '' }}
           token: ${{ steps.fui-app-token.outputs.token || secrets.FUI_READ_TOKEN }}
           path: frontierui
 
@@ -570,7 +622,7 @@ jobs:
   #                 scope job itself failed (fail closed), otherwise red unless EVERY shard succeeded. Full coverage is preserved — sharding only changes WHERE
   #                 each scenario runs, never WHETHER it runs; every scenario still runs on every daemon PR.
   daemon-soak-scope:
-    if: ${{ github.event_name == 'pull_request' || github.event_name == 'merge_group' || github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && github.ref == 'refs/heads/main') }}
+    if: ${{ github.event_name == 'pull_request' || github.event_name == 'merge_group' || github.event_name == 'workflow_dispatch' || github.event_name == 'schedule' || (github.event_name == 'push' && github.ref == 'refs/heads/main') }}
     runs-on: ubuntu-latest
     timeout-minutes: 5
     outputs:
@@ -612,9 +664,9 @@ jobs:
   # with the baseline's daemon worlds. `fail-fast: false` mirrors `test-shard`: one shard's break
   # failing must not hide a sibling shard's own result.
   soak-shard:
-    needs: daemon-soak-scope
+    needs: [changes, daemon-soak-scope]
     # R1068: shards run in the merge queue / on main / on dispatch, never on a pull_request push (~28k CI min/day).
-    if: needs.daemon-soak-scope.outputs.run == 'true' && github.event_name != 'pull_request'
+    if: needs.daemon-soak-scope.outputs.run == 'true' && github.event_name != 'pull_request' && needs.changes.outputs.skip != 'true'
     runs-on: ubuntu-latest
     # Measured 2026-10-14: time-balanced shards finish in ~8-14 min on main (shard 3: 13m24s and 13m48s on two
     # green main runs), so the old 15-min cap sat ~1 min above a healthy run. PR #5187's shard 3 was CANCELLED at
@@ -656,12 +708,14 @@ jobs:
   # (its `needs` dep failing, or the matrix simply not running) is not `success`, so a broken shard can never
   # silently read as satisfied, same guard the `test` aggregator above uses for `test-shard`.
   daemon-soak:
-    needs: [daemon-soak-scope, soak-shard]
-    if: ${{ (github.event_name == 'pull_request' || github.event_name == 'merge_group' || github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && github.ref == 'refs/heads/main')) && !cancelled() }}
+    needs: [changes, daemon-soak-scope, soak-shard]
+    if: ${{ (github.event_name == 'pull_request' || github.event_name == 'merge_group' || github.event_name == 'workflow_dispatch' || github.event_name == 'schedule' || (github.event_name == 'push' && github.ref == 'refs/heads/main')) && !cancelled() }}
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
       - name: Gate on shard results
+        env:
+          MAIN_SKIP_REASON: ${{ needs.changes.outputs.skip-reason }}
         run: |
           # R1068: on a pull_request the soak is deferred to the merge queue (shards do not run there), so the
           # required check succeeds at once. Every other event (merge_group, push, dispatch) falls through to the
@@ -677,6 +731,10 @@ jobs:
           if [ "${{ needs.daemon-soak-scope.result }}" != "success" ]; then
             echo "daemon-soak-scope did not succeed (result: ${{ needs.daemon-soak-scope.result }}) — cannot tell whether daemon code was touched."
             exit 1
+          fi
+          if [ "${{ github.event_name }}" = "push" ] && [ "${{ needs.changes.result }}" = "success" ] && [ "${{ needs.changes.outputs.skip }}" = "true" ]; then
+            echo "Reused queue CI: $MAIN_SKIP_REASON"
+            exit 0
           fi
           case "${{ needs.daemon-soak-scope.outputs.run }}" in
             true) ;;
@@ -749,6 +807,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: frontier-ui/frontierui
+          ref: ${{ needs.changes.outputs.fui-sha || '' }}
           token: ${{ steps.fui-app-token.outputs.token || secrets.FUI_READ_TOKEN }}
           path: frontierui
 

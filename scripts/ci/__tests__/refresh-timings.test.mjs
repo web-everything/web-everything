@@ -262,17 +262,18 @@ describe('refresh-timings atomic replacement', () => {
 });
 
 describe('refresh-timings CI artifact download trust boundary', () => {
-  const recorder = (runList = '[{"databaseId":4242}]') => {
+  const recorder = (runList = '[{"databaseId":4242,"event":"push","headBranch":"main"}]') => {
     const calls = [];
-    const exec = (cmd, args, options) => { calls.push({ cmd, args, options }); return args[1] === 'list' ? runList : ''; };
+    const exec = (cmd, args, options) => { calls.push({ cmd, args, options }); return args[1] === 'list' ? runList : args[0] === 'api' ? JSON.stringify({ total_count: expectedUnitShards().length, artifacts: expectedUnitShards().map(n => ({ name: `timing-unit-${n}`, expired: false })) }) : ''; };
     return { calls, exec };
   };
 
-  it('latest selects only the newest successful ci.yml push on main, then downloads unit artifacts by argv', async () => {
+  it('latest selects the newest successful full ci.yml run, then downloads unit artifacts by argv', async () => {
     const { calls, exec } = recorder();
     await downloadReports('latest', '/scratch/reports', { exec });
     expect(calls.map(({ cmd, args }) => [cmd, args])).toEqual([
-      ['gh', ['run', 'list', '--workflow=ci.yml', '--branch=main', '--status=success', '--event=push', '--limit=1', '--json=databaseId']],
+      ['gh', ['run', 'list', '--workflow=ci.yml', '--status=success', '--limit=100', '--json=databaseId,event,headBranch']],
+      ['gh', ['api', 'repos/{owner}/{repo}/actions/runs/4242/artifacts?per_page=100']],
       ['gh', ['run', 'download', '4242', '--pattern=timing-unit-*', '--dir', '/scratch/reports']],
     ]);
     for (const { options } of calls) expect(options).toMatchObject({ cwd: REPO_ROOT, timeout: 120_000, maxBuffer: 1024 * 1024 });
@@ -338,7 +339,8 @@ describe('rolling timing refresh', () => {
   function rollingExec(samples, calls) {
     return (cmd, args, options) => {
       calls.push({ cmd, args, options });
-      if (args[1] === 'list') return JSON.stringify(samples.map((_, i) => ({ databaseId: 100 + i })));
+      if (args[1] === 'list') return JSON.stringify(samples.map((_, i) => ({ databaseId: 100 + i, event: 'push', headBranch: 'main' })));
+      if (args[0] === 'api') return JSON.stringify({ total_count: expectedUnitShards().length, artifacts: expectedUnitShards().map(n => ({ name: `timing-unit-${n}`, expired: false })) });
       const index = Number(args[2]) - 100;
       const target = args.at(-1);
       const sample = samples[index];
@@ -355,9 +357,9 @@ describe('rolling timing refresh', () => {
     expect(readFileSync(timingsFile, 'utf8')).toBe(original);
     calls.length = 0;
     expect(await main(['--runs=5'], { exec: rollingExec([1000, 3000, 2000, 4000, 99000], calls), timingsFile, repoRoot })).toBe(0);
-    expect(calls[0].args).toEqual(['run', 'list', '--workflow=ci.yml', '--branch=main', '--status=success', '--event=push', '--limit=5', '--json=databaseId']);
-    expect(calls.slice(1).map(c => c.args.slice(0, 4))).toEqual([100, 101, 102, 103, 104].map(id => ['run', 'download', String(id), '--pattern=timing-unit-*']));
-    expect(new Set(calls.slice(1).map(c => c.args.at(-1))).size).toBe(5);
+    expect(calls[0].args).toEqual(['run', 'list', '--workflow=ci.yml', '--status=success', '--limit=100', '--json=databaseId,event,headBranch']);
+    expect(calls.filter(c => c.args[1] === 'download').map(c => c.args.slice(0, 4))).toEqual([104, 103, 102, 101, 100].map(id => ['run', 'download', String(id), '--pattern=timing-unit-*']));
+    expect(new Set(calls.filter(c => c.args[1] === 'download').map(c => c.args.at(-1))).size).toBe(5);
     expect(calls.every(c => c.cmd === 'gh' && c.options.timeout === 120000 && c.options.maxBuffer === 1024 * 1024 && !c.options.shell)).toBe(true);
     expect(JSON.parse(readFileSync(timingsFile, 'utf8')).unit).toEqual(Object.fromEntries(files.map(file => [file, 3])));
   });
@@ -372,7 +374,7 @@ describe('rolling timing refresh', () => {
     const measured = `${JSON.stringify({ unit: Object.fromEntries(files.map(file => [file, 1])), soak: {} }, null, 1)}\n`;
     writeFileSync(timingsFile, measured);
     expect(await main(['--min-stale=1.9'], { exec: rollingExec([1000], calls), timingsFile, repoRoot })).toBe(0);
-    expect(calls[0].args).toContain('--limit=5');
+    expect(calls[0].args).toContain('--limit=100');
     expect(readFileSync(timingsFile, 'utf8')).toBe(measured);
   });
 

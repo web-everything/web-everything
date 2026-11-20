@@ -165,13 +165,15 @@ describe('merge-queue same-head retry for evidence-backed flakes', () => {
       if (/\/actions\/jobs\/44$/.test(endpoint)) return JSON.stringify({ id: 44, run_id: 7, name: 'test-shard (2)', head_sha: f.job44Sha ?? head });
       if (/\/actions\/jobs\/41$/.test(endpoint)) return JSON.stringify({ id: 41, run_id: f.headJobRunId ?? 7, name: 'test-shard (5)', head_sha: head });
       if (command === 'funzip') return opts.input ?? '';
-      const art = /\/actions\/runs\/(7|900)\/artifacts/.exec(endpoint);
-      if (art) return JSON.stringify({ total_count: 1, artifacts: [{ id: art[1] === '7' ? 701 : 9001, name: /name=(timing-unit-\d)/.exec(endpoint)[1], expired: false,
+      const art = /\/actions\/runs\/(7|890|900)\/artifacts/.exec(endpoint);
+      if (art && art[1] === '900' && f.fullRuns) return JSON.stringify({ total_count: 0, artifacts: [] });
+      if (art) return JSON.stringify({ total_count: 1, artifacts: [{ id: art[1] === '7' ? 701 : 9001, name: (/name=(timing-unit-\d)/.exec(endpoint)?.[1] ?? 'timing-unit-5'), expired: false,
         workflow_run: { id: Number(art[1]), head_sha: art[1] === '7' ? (f.artifactHeadSha ?? head) : mainSha } }] });
       if (endpoint.endsWith('/actions/artifacts/701/zip')) return JSON.stringify(f.headJson);
       if (endpoint.endsWith('/actions/artifacts/9001/zip')) return JSON.stringify(f.mainJson);
+      if (endpoint.endsWith('/actions/runs/890')) return JSON.stringify(f.fullRuns[0]);
       if (endpoint.includes('/actions/workflows/ci.yml/runs')) {
-        const runs = endpoint.includes('created=<') ? [] : f.mainRuns;
+        const runs = endpoint.includes('head_sha=') ? f.fullRuns : endpoint.includes('created=<') ? [] : f.mainRuns;
         return JSON.stringify({ total_count: runs.length, workflow_runs: runs });
       }
       return base(command, args, opts);
@@ -181,6 +183,16 @@ describe('merge-queue same-head retry for evidence-backed flakes', () => {
     tweak(f);
     test(f);
   });
+
+  it.each(['merge_group', 'schedule'])('uses full %s same-SHA reports for flake proof behind a light push', event => setup(f => {
+    expect(f.guard().hold).toBe(false);
+  }, f => { f.fullRuns = [{ ...f.mainRuns[0], id: 890, event,
+    head_branch: event === 'merge_group' ? 'gh-readonly-queue/main/pr-1' : 'main' }]; }));
+
+  it('holds when full queue reports belong to another SHA', () => setup(f => {
+    expect(f.guard().hold).toBe(true);
+  }, f => { f.fullRuns = [{ ...f.mainRuns[0], id: 890, event: 'merge_group',
+    head_sha: prior, head_branch: 'gh-readonly-queue/main/pr-1' }]; }));
 
   it('re-enqueues once when the failing test passed on the PR head CI and on a later main run', () => setup(f => {
     const result = f.guard();
@@ -367,7 +379,7 @@ describe('merge-queue exact-test extra retry after two failed_checks removals', 
         return page(endpoint, 'check_runs', f.headChecks);
       if (path.endsWith('/actions/workflows/ci.yml/runs')) {
         const query = new URLSearchParams(endpoint.split('?')[1]);
-        const runs = f.mainRuns.filter(r => (!query.has('status') || r.status === query.get('status'))
+        const runs = (query.has('head_sha') ? (f.evidenceRuns ?? []) : f.mainRuns).filter(r => (!query.has('status') || r.status === query.get('status'))
           && (!query.has('created') || Date.parse(r.created_at) < Date.parse(query.get('created').slice(1))));
         return JSON.stringify({ total_count: runs.length, workflow_runs: runs });
       }
@@ -406,6 +418,32 @@ describe('merge-queue exact-test extra retry after two failed_checks removals', 
       quarantine: { readList: () => ({ ok: false, error: 'no quarantine' }), now: () => NOW } });
     test(f);
   }
+
+  it.each(['merge_group', 'schedule'])('uses same-SHA %s timing artifacts behind a skipped-success push', event => exactFixture(f => {
+    f.runs[890] = { ...f.runs[900], id: 890, event,
+      head_branch: event === 'merge_group' ? 'gh-readonly-queue/main/pr-1' : 'main' };
+    f.evidenceRuns = [f.runs[890]];
+    f.artifacts[890] = f.artifacts[900].map(a => ({ ...a, workflow_run: { ...a.workflow_run, id: 890 } }));
+    delete f.artifacts[900];
+    f.runJobs[890] = f.runJobs[900].map(j => ({ ...j, run_id: 890 }));
+    expectExtraRetry(f);
+  }));
+
+  it('holds on oversized same-SHA full-run evidence rather than accepting a partial inventory', () => exactFixture(f => {
+    f.artifacts[900] = [];
+    f.evidenceRuns = Array.from({ length: 101 }, (_, n) => ({ ...f.runs[900], id: 1000 + n, event: 'schedule' }));
+    expect(f.guard().hold).toBe(true);
+  }));
+
+  it('bounds same-SHA full-source searches to five; an unseen sixth source cannot clear the hold', () => exactFixture(f => {
+    f.evidenceRuns = Array.from({ length: 6 }, (_, n) => ({ ...f.runs[900], id: 890 + n, event: 'schedule' }));
+    f.artifacts[890] = f.artifacts[900];
+    f.artifacts[900] = [];
+    expect(f.guard().hold).toBe(true);
+    const reads = f.exec.mock.calls.flatMap(([, args]) => args.filter(a => /runs\/89[0-5]\/artifacts/.test(a)));
+    expect(reads).toHaveLength(5);
+    expect(reads.some(a => a.includes('/890/'))).toBe(false);
+  }));
 
   const expectExtraRetry = f => {
     const result = f.guard();
