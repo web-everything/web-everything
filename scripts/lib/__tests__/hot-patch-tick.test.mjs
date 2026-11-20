@@ -1,12 +1,16 @@
 /** Tick contract exercised against a real local clone and actual Git ancestry. */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, rmSync, writeFileSync, readFileSync, existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { hotPatchLedgerPath, readHotPatch, runHotPatchTick, CI_UNKNOWN_MS,
-  HOT_PATCH_MAX_OPEN_MS, HOT_PATCH_OVERLAY_REASON, hotPatchWakeDue, markHotPatchWoke, WAKE_FLOOR_MS } from '../hot-patch.mjs';
+  HOT_PATCH_MAX_OPEN_MS, HOT_PATCH_OVERLAY_REASON, HOT_PATCH_ALLOWLIST, WAKE_FLOOR_MS } from '../hot-patch.mjs';
+import * as hotPatch from '../hot-patch.mjs';
+import { overlayFilePath, readOverlays as diskOverlays, removeOverlay as diskRemove } from '../daemon-overlays.mjs';
+import { cloneKeyOf } from '../daemon-last-good.mjs';
+import { hotPatchCiVerdict } from '../hot-patch-ci.mjs';
 import { readRebuildRequest } from '../daemon-clone-lock.mjs';
 
 const at = 1700000000000;
@@ -22,11 +26,13 @@ const fixture = fn => async () => {
   };
   git(['init', '-q', '-b', 'main', origin], home);
   writeFileSync(join(origin, 'README.md'), 'base\n');
+  mkdirSync(dirname(join(origin, HOT_PATCH_ALLOWLIST[0])), { recursive: true });
+  writeFileSync(join(origin, HOT_PATCH_ALLOWLIST[0]), '// base\n');
   git(['add', '.'], origin); git(['commit', '-qm', 'base'], origin);
   git(['clone', '-q', origin, root], home);
   const good = git(['rev-parse', 'HEAD']);
   git(['checkout', '-qb', 'lane/repair']);
-  writeFileSync(join(root, 'README.md'), 'patch\n'); git(['commit', '-qam', 'patch']);
+  writeFileSync(join(root, HOT_PATCH_ALLOWLIST[0]), '// patch\n'); git(['commit', '-qam', 'patch']);
   const sha = git(['rev-parse', 'HEAD']);
   git(['update-ref', 'refs/remotes/origin/lane/repair', sha]);
   const env = { ...gitEnv, HOME: home, WE_DAEMON_STATE_DIR: join(home, 'state'),
@@ -35,7 +41,7 @@ const fixture = fn => async () => {
   mkdirSync(env.WE_DAEMON_STATE_DIR);
   const preGood = { head: good, inputsKey: 'c'.repeat(40), mainSha: good, applied: [] };
   const overlay = { ref: 'lane/repair', pr: 42, pinned: true, reason: HOT_PATCH_OVERLAY_REASON,
-    addedAt: new Date(at).toISOString(), addedBy: null };
+    addedAt: new Date(at).toISOString(), addedBy: null, expectedSha: sha };
   // Current pid with a provably different start denotes a completed/reused requester, never a guessed dead pid.
   const start = at;
   assert(Number.isFinite(start));
@@ -112,7 +118,7 @@ test('later build containing the patch also rolls back via merge-base --is-ances
   assert.deepEqual(f.rollbacks, [f.preGood]); assert(!f.contains(f.sha));
 }));
 test('rollback ledger remains while HEAD still contains sha; retires once both HEAD and overlay are clear', fixture(async f => {
-  await f.tick({ ...red, rollbackToGood: async () => ({ ok: false }) });
+  await assert.rejects(() => f.tick({ ...red, rollbackToGood: async () => ({ ok: false }) }), /rollback/i);
   assert(f.contains(f.sha)); assert.deepEqual(f.overlays(), []);
   assert(readHotPatch(f.env).rollbackPending);
   f.git(['reset', '--hard', f.good]);
@@ -145,50 +151,51 @@ test('no action while request pid and start are still alive', fixture(async f =>
   assert.deepEqual(f.order, []); assert.deepEqual(f.rollbacks, []);
   assert.equal(readHotPatch(f.env).requestStart, f.start);
 }));
-test('unreadable ledger plus R1100 hot-patch overlay removes it and requests rebuild', fixture(async f => {
+test('R3.10 unreadable ledger preserves reason-only and foreign tags, alerts once', fixture(async f => {
+  writeFileSync(hotPatchLedgerPath(f.env), '{bad');
+  const reasonOnly = { ...f.overlay };
+  const sibling = join(f.root, '..', 'other-clone');
+  mkdirSync(sibling);
+  const foreign = { ...f.overlay, hotPatch: { sha: f.sha,
+    loadedAt: f.record.loadedAt, ledgerKey: cloneKeyOf(hotPatchLedgerPath(f.env)) } };
+  mkdirSync(f.env.WE_DAEMON_OVERLAY_DIR, { recursive: true });
+  writeFileSync(overlayFilePath(f.root, f.env), JSON.stringify({ clone: f.root, overlays: [reasonOnly] }));
+  writeFileSync(overlayFilePath(sibling, f.env), JSON.stringify({ clone: sibling, overlays: [foreign] }));
+  const removals = [];
+  await f.tick({ readOverlays: target => diskOverlays(target, { env: f.env }),
+    removeOverlay: async (...args) => {
+      removals.push({ root: args[0], ref: args[1] });
+      return diskRemove(...args);
+    } });
+  assert.deepEqual(removals, []);
+  assert.deepEqual(diskOverlays(f.root, { env: f.env }), [reasonOnly]);
+  assert.deepEqual(diskOverlays(sibling, { env: f.env }), [foreign]);
+  assert.equal(f.events.filter(e => e.kind === 'hot-patch-needs-you').length, 1);
+  assert.equal(readRebuildRequest(f.root, { env: f.env, lockRoot: f.env.WE_DAEMON_CLONE_LOCK_ROOT, nowMs: at + 1 }), null);
+}));
+test('R3.10 correctly tagged orphan is removed and requests rebuild', fixture(async f => {
+  f.replaceOverlay({ ...f.overlay, hotPatch: { sha: f.sha, loadedAt: f.record.loadedAt,
+    ledgerKey: cloneKeyOf(hotPatchLedgerPath(f.env)) } });
   writeFileSync(hotPatchLedgerPath(f.env), '{bad');
   await f.tick();
-  assert(f.order.includes('remove')); assert.deepEqual(f.overlays(), []);
-  assert(readRebuildRequest(f.root, { env: f.env, lockRoot: f.env.WE_DAEMON_CLONE_LOCK_ROOT, nowMs: at + 1 }),
-    'orphan overlay removal must leave a real rebuild request');
-  assert.deepEqual(f.rollbacks, []);
+  assert.deepEqual(f.overlays(), []);
+  assert(readRebuildRequest(f.root, { env: f.env, lockRoot: f.env.WE_DAEMON_CLONE_LOCK_ROOT, nowMs: at + 1 }));
 }));
-
-test('wake refuses sibling clone, missing root, and incomplete overlay registration', fixture(async f => {
-  const options = { root: f.root, env: f.env, plan: { applied: [{ ref: f.record.branch, sha: f.sha }] },
-    lastFinishedMs: at - WAKE_FLOOR_MS, now: at };
-  assert.equal(hotPatchWakeDue(options), true);
-  assert.equal(hotPatchWakeDue({ ...options, root: join(f.root, 'sibling') }), false);
-  assert.equal(hotPatchWakeDue({ ...options, root: undefined }), false);
+test('claimHotPatchWake refuses sibling, missing root, and incomplete registration', fixture(async f => {
+  const plan = { applied: [{ ref: f.record.branch, sha: f.sha }] };
+  assert.equal(typeof hotPatch.claimHotPatchWake, 'function');
+  assert.equal(await hotPatch.claimHotPatchWake(f.env, join(f.root, 'sibling'), plan, at - WAKE_FLOOR_MS), false);
+  assert.equal(await hotPatch.claimHotPatchWake(f.env, undefined, plan, at - WAKE_FLOOR_MS), false);
   f.save({ ...f.record, overlay: null });
-  assert.equal(hotPatchWakeDue(options), false);
+  assert.equal(await hotPatch.claimHotPatchWake(f.env, f.root, plan, at - WAKE_FLOOR_MS), false);
 }));
-for (const change of ['rollback', 'retired', 'replaced']) test(`wake marker re-reads ledger after acquiring lock: ${change}`, fixture(async f => {
-  const changed = { ...f.record, ...(change === 'rollback' ? { rollbackPending: 'ci-red' } : { sha: 'e'.repeat(40) }) };
-  assert.equal(await markHotPatchWoke(f.env, f.sha, () => at, async (_root, fn) => {
-    if (change === 'retired') rmSync(hotPatchLedgerPath(f.env)); else f.save(changed);
-    return fn(() => true);
-  }), false);
-  assert.deepEqual(readHotPatch(f.env), change === 'retired' ? null : changed);
-}));
-test('wake marker under global lock preserves rollback intent from a concurrent tick', fixture(async f => {
-  let entered;
-  const started = new Promise(resolve => { entered = resolve; });
-  let release;
-  const gate = new Promise(resolve => { release = resolve; });
-  const tick = f.tick({ ...red, lock: async (_root, fn) => {
-    entered(); await gate; return fn(() => true);
-  }, rollbackToGood: async () => {} });
-  await started;
-  const wake = markHotPatchWoke(f.env, f.sha, () => at);
-  release();
-  await tick;
-  assert.equal(await wake, false);
-  assert.equal(readHotPatch(f.env).rollbackPending, 'ci-red');
-}));
-test('lost wake lock never writes wokeAt', fixture(async f => {
-  await assert.rejects(() => markHotPatchWoke(f.env, f.sha, () => at, async (_root, fn) => fn(() => false)), /write lock lost/);
-  assert.deepEqual(readHotPatch(f.env), f.record);
+test('claimHotPatchWake serializes concurrent claims and persists a single wake', fixture(async f => {
+  assert.equal(typeof hotPatch.claimHotPatchWake, 'function');
+  const claim = () => hotPatch.claimHotPatchWake(f.env, f.root,
+    { applied: [{ ref: f.record.branch, sha: f.sha }] }, at - WAKE_FLOOR_MS);
+  const results = await Promise.all([claim(), claim()]);
+  assert.deepEqual(results.sort(), [false, true]);
+  assert(readHotPatch(f.env).wokeAt);
 }));
 test('lost tick lock after overlay removal stops rollback and retirement', fixture(async f => {
   let held = true;
@@ -254,11 +261,11 @@ test('crash recovery preserves overlay not matching intended PR', fixture(async 
   assert(readHotPatch(f.env).rollbackPending);
 }));
 
-test('remote overlay tip moving rolls back even while PR evidence still reports original SHA', fixture(async f => {
+test('pinned expected SHA ignores a moving remote tip while PR evidence still reports original SHA', fixture(async f => {
   f.git(['update-ref', `refs/remotes/origin/${f.record.branch}`, f.good]);
   await f.tick();
-  assert.deepEqual(f.rollbacks, [f.preGood]);
-  assert.equal(readHotPatch(f.env), null);
+  assert.deepEqual(f.rollbacks, []);
+  assert.deepEqual(readHotPatch(f.env), f.record);
 }));
 test('tick uses remote-tracking overlay identity when clone has no local overlay branch', fixture(async f => {
   f.git(['checkout', '--detach']);
@@ -266,4 +273,52 @@ test('tick uses remote-tracking overlay identity when clone has no local overlay
   await f.tick();
   assert.deepEqual(readHotPatch(f.env), f.record);
   assert.deepEqual(f.rollbacks, []);
+}));
+
+test('R3.8a/R3.11 failed rollback throws, retains ledger, and raises an operator alert', fixture(async f => {
+  await assert.rejects(() => f.tick({ ...red, rollbackToGood: async () => ({ ok: false }) }), /rollback/i);
+  assert(readHotPatch(f.env).rollbackPending);
+  assert.equal(f.git(['rev-parse', 'HEAD']), f.sha);
+  assert(f.events.some(e => e.kind === 'hot-patch-needs-you'));
+}));
+test('R3.8b squash-equivalent patch on HEAD cannot retire and must roll back', fixture(async f => {
+  f.git(['checkout', '-B', 'squashed', f.good]);
+  f.git(['cherry-pick', '--no-commit', f.sha]);
+  f.git(['commit', '-qm', 'squashed copy with different metadata']);
+  assert.notEqual(f.git(['rev-parse', 'HEAD']), f.sha);
+  assert.equal(f.contains(f.sha), false);
+  f.save({ ...f.record, rollbackPending: 'ci-red' });
+  let failure;
+  await f.tick({ ...red, rollbackToGood: async good => {
+    assert(readHotPatch(f.env), 'must not retire before rollback');
+    f.rollbacks.push(good);
+    return { ok: false };
+  } }).catch(error => { failure = error; });
+  assert.deepEqual(f.rollbacks, [f.preGood], 'squash-equivalent patch requires rollback');
+  assert(failure, 'unsuccessful rollback must throw');
+  assert.match(failure.message, /rollback/i);
+  assert(readHotPatch(f.env));
+}));
+test('R3.9 rollback writes durable rejection before retiring ledger', fixture(async f => {
+  await f.tick(red);
+  const path = join(f.env.WE_DAEMON_STATE_DIR, 'hot-patch-rejected.json');
+  assert(existsSync(path), 'rollback must leave durable rejection evidence');
+  const records = JSON.parse(readFileSync(path, 'utf8'));
+  const entry = (Array.isArray(records) ? records : [records]).find(r => r.sha === f.sha);
+  assert(entry);
+  assert.match(entry.patchId, /^[a-f0-9]{40}$/);
+  assert.equal(entry.pr, 42);
+  assert.equal(entry.reason, 'ci-red');
+  assert.equal(new Date(entry.at).toISOString(), entry.at);
+  assert.equal(readHotPatch(f.env), null);
+}));
+test('R3.6 red CI followed by unavailable workflow rolls back on the same tick', fixture(async f => {
+  await f.tick({ ciVerdict: () => hotPatchCiVerdict({ repo: 'web-everything/web-everything', sha: f.sha,
+    required: ['daemon-soak', 'soak-replay-gate'], fetchJson: async path => {
+      if (path.includes('soak-replay-gate.yml')) throw Error('offline');
+      if (path.includes('/workflows/')) return { workflow_runs: [{ id: 1, check_suite_id: 1, head_sha: f.sha }] };
+      if (path.includes('/check-suites/')) return { id: 1, head_sha: f.sha, app: { id: 15368, slug: 'github-actions' } };
+      return { jobs: [{ name: 'daemon-soak', status: 'completed', conclusion: 'failure' }] };
+    } }) });
+  assert.deepEqual(f.rollbacks, [f.preGood]);
 }));

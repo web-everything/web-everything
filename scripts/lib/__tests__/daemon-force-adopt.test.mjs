@@ -927,3 +927,15 @@ describe('global hot-patch admission exclusion', () => {
     expect(readForceWatch(root, env)).toBeNull();
   });
 });
+
+it('R3 guard scopes a readable ledger to clone A but unreadable evidence blocks A and B', () => {
+  mkdirSync(env.WE_DAEMON_STATE_DIR, { recursive: true });
+  const ledger = join(env.WE_DAEMON_STATE_DIR, 'hot-patch.json');
+  const sibling = join(root, 'sibling');
+  writeFileSync(ledger, JSON.stringify({ root }));
+  expect(forceBlockedReason(sibling, env)).toBeNull();
+  expect(forceBlockedReason(root, env)).toBe('hot-patch-open');
+  writeFileSync(ledger, '{bad');
+  expect(forceBlockedReason(sibling, env)).toBe('hot-patch-open');
+  expect(forceBlockedReason(root, env)).toBe('hot-patch-open');
+});

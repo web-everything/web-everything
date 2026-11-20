@@ -6,6 +6,7 @@ import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { HOT_PATCH_ALLOWLIST, hotPatchLedgerPath, readHotPatch, requestHotPatch } from '../hot-patch.mjs';
+import { forceBlockedReason } from '../daemon-force-adopt.mjs';
 import { cloneKey } from '../daemon-overlays.mjs';
 
 const at = 1700000000000;
@@ -39,7 +40,7 @@ const fixture = fn => async () => {
   mkdirSync(env.WE_DAEMON_STATE_DIR);
   const preGood = { head: good, inputsKey: 'c'.repeat(40), mainSha: good, applied: [] };
   const overlay = { ref: 'lane/repair', pr: 42, pinned: true, reason: 'R1100 hot-patch',
-    addedAt: new Date(at).toISOString(), addedBy: null };
+    addedAt: new Date(at).toISOString(), addedBy: null, expectedSha: sha };
   const calls = [], effects = [];
   const run = (cmd, args, opts) => {
     calls.push({ cmd, args, opts });
@@ -250,4 +251,37 @@ test('force-watch opening during registration still blocks our verified reservat
   } }), /force-watch blocked during registration: watch-already-open/);
   assert(!f.effects.includes('rebuild'));
   assert.equal(readHotPatch(f.env), null);
+}));
+
+test('R3.3 hostile GH_REPO cannot redirect admission and is stripped from child env', fixture(async f => {
+  const ghCalls = [];
+  await requestHotPatch({ ...f.request, env: { ...f.env, GH_REPO: 'evil/fork', GH_HOST: 'evil.test', GH_ENTERPRISE_TOKEN: 'fixture' },
+    ghJson: async args => { ghCalls.push(args); return { baseRefName: 'main', state: 'OPEN', headRefOid: f.sha, headRefName: 'lane/repair' }; } });
+  assert.equal(ghCalls.length, 1);
+  assert.equal(ghCalls[0][ghCalls[0].indexOf('--repo') + 1], 'web-everything/web-everything');
+  for (const call of f.calls.filter(c => c.opts)) {
+    for (const key of ['GH_REPO', 'GH_HOST', 'GH_ENTERPRISE_TOKEN']) assert.equal(call.opts.env[key], undefined, key);
+  }
+}));
+test('R3.9 request refuses a durably rejected SHA before overlay registration', fixture(async f => {
+  const patch = spawnSync('git', ['show', f.sha], { cwd: f.root, encoding: 'utf8' });
+  assert.equal(patch.status, 0);
+  const id = spawnSync('git', ['patch-id', '--stable'], { cwd: f.root, input: patch.stdout, encoding: 'utf8' });
+  assert.equal(id.status, 0);
+  writeFileSync(join(f.env.WE_DAEMON_STATE_DIR, 'hot-patch-rejected.json'), JSON.stringify([{
+    sha: f.sha, patchId: id.stdout.split(/\s+/)[0], pr: 42, reason: 'ci-red', at: new Date(at).toISOString(),
+  }]));
+  await assert.rejects(() => requestHotPatch(f.request), /hot-patch refused:.*reject/i);
+  assert(!f.effects.includes('overlay'));
+  assert(!f.effects.includes('rebuild'));
+}));
+
+test('guard seam exempts only our verified ledger during overlay registration', fixture(async f => {
+  const result = await requestHotPatch({ ...f.request, addOverlay: async (...args) => {
+    assert.equal(readHotPatch(f.env).sha, f.sha);
+    assert.equal(forceBlockedReason(f.root, f.env), 'hot-patch-open');
+    return f.request.addOverlay(...args);
+  } });
+  assert.equal(result.ok, true);
+  assert(f.effects.includes('rebuild'));
 }));

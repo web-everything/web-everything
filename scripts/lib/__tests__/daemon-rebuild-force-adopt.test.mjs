@@ -23,6 +23,7 @@ import { cloneKeyOf } from '../daemon-last-good.mjs';
 import { gitRun } from '../main-staleness.mjs';
 import { withWriteLock, cloneLockDirs } from '../daemon-clone-lock.mjs';
 import { rollbackToGood } from '../daemon-rebuild/rebuild.mjs';
+import * as hotPatchModule from '../hot-patch.mjs';
 import { hotPatchLedgerPath, readHotPatch, HOT_PATCH_MAX_OPEN_MS, HOT_PATCH_OVERLAY_REASON } from '../hot-patch.mjs';
 // Pre-dates daemonRebuild.skipUnrelated: these tests assert a smoke runs for non-code moves, so pin the knob off.
 process.env.WE_DAEMON_REBUILD_SKIP_UNRELATED = '0';
@@ -976,6 +977,13 @@ describe('shared hot-patch rollback wiring', () => {
 
   it('corrupt ledger reaches orphan-overlay cleanup through the real rebuildClone wrapper', async () => {
     const { cloneDir, env } = isolationFixture();
+    const tagged = { ...readOverlays(cloneDir, { env })[0], expectedSha: headOf(cloneDir),
+      hotPatch: { sha: headOf(cloneDir), loadedAt: readHotPatch(env).loadedAt, ledgerKey: cloneKeyOf(hotPatchLedgerPath(env)) } };
+    const { overlayFilePath } = await import('../daemon-overlays.mjs');
+    const file = overlayFilePath(cloneDir, env);
+    const state = JSON.parse(readFileSync(file, 'utf8'));
+    state.overlays = [tagged];
+    writeFileSync(file, JSON.stringify(state));
     writeFileSync(hotPatchLedgerPath(env), '{corrupt');
     const emitEvent = vi.fn(async () => true);
     await tick(cloneDir, env, { versions: {}, adoptOnly: true, emitEvent });
@@ -1060,4 +1068,25 @@ describe('shared hot-patch rollback wiring', () => {
     gitOk(cloneDir, ['reset', '--hard', good]);
     expect(await rollbackToGood({ ...args, expectHead: sha })).toEqual({ ok: true });
   });
+});
+
+it('R3.11 wrapper reports a thrown hot-patch tick in result, event file, and ET log without changing adoption', async () => {
+  const { cloneDir, base, env: original } = makeFixture();
+  const env = { ...original, WE_DAEMON_EVENTS: join(base, 'events.jsonl') };
+  const before = headOf(cloneDir);
+  const log = { error: vi.fn(), log: vi.fn() };
+  const spy = vi.spyOn(hotPatchModule, 'runHotPatchTick').mockRejectedValue(Error('injected tick failure'));
+  let result;
+  try { result = await tick(cloneDir, env, { versions: {}, adoptOnly: true, log }); }
+  finally { spy.mockRestore(); }
+  expect(result.moved).toBe(false);
+  expect(result.adopted).not.toBe(true);
+  expect(headOf(cloneDir)).toBe(before);
+  expect(result.alerts).toEqual(expect.arrayContaining([expect.objectContaining({ kind: 'hot-patch-tick-failed' })]));
+  expect(existsSync(env.WE_DAEMON_EVENTS)).toBe(true);
+  const events = readFileSync(env.WE_DAEMON_EVENTS, 'utf8').trim().split('\n').map(line => JSON.parse(line));
+  expect(events.some(e => e.kind === 'hot-patch-needs-you')).toBe(true);
+  const logs = [...log.error.mock.calls, ...log.log.mock.calls].flat().join('\n');
+  expect(logs).toMatch(/ALERT hot-patch tick failed/);
+  expect(logs).toMatch(/(?:-0[45]:00|E[DS]T)/);
 });

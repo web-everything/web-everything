@@ -82,7 +82,7 @@ it.each([[20, 1100, 'rebuild-job-spaced', 100], [0, 1100, 'rebuild-job-started',
 );
 
 it.each(['before-reattach', 'during-reattach'])('never starts or restarts a job with ready evidence %s', async phase => {
-  const env = { WE_DAEMON_STATE_DIR: join(root, 'state') };
+  const env = { WE_DAEMON_STATE_DIR: join(root, 'state'), WE_DAEMON_CLONE_LOCK_ROOT: join(root, 'locks') };
   mkdirSync(join(root, 'jobs'));
   const store = createJobStore(join(root, 'jobs'));
   const old = enqueueJob({ store, kindDef: REBUILD_JOB_KIND, codeSha: 'a'.repeat(40), input: { root } });
@@ -113,8 +113,7 @@ describe('hot-patch one-shot wake through the rebuild-job-spaced cooldown', () =
     const modulePath = join(process.cwd(), 'scripts/lib/hot-patch.mjs');
     const moduleUrl = pathToFileURL(modulePath).href;
     hotPatch = existsSync(modulePath) ? await import(/* @vite-ignore */ moduleUrl) : {};
-    expect(hotPatch.hotPatchWakeDue, 'hotPatchWakeDue is missing').toBeTypeOf('function');
-    env = { WE_DAEMON_STATE_DIR: join(root, 'state') };
+    env = { WE_DAEMON_STATE_DIR: join(root, 'state'), WE_DAEMON_CLONE_LOCK_ROOT: join(root, 'locks') };
     mkdirSync(env.WE_DAEMON_STATE_DIR);
     mkdirSync(join(root, 'jobs'));
     store = createJobStore(join(root, 'jobs'));
@@ -129,18 +128,20 @@ describe('hot-patch one-shot wake through the rebuild-job-spaced cooldown', () =
     plan = { finalSha: sha, applied: [{ ref: ledger.branch, sha }] };
     writeFileSync(hotPatch.hotPatchLedgerPath(env), JSON.stringify(ledger));
   });
-  const tick = (elapsed = 120000, extra = {}) => rebuildCloneAsJob({
+  const tick = (elapsed = 120000, extra = {}) => {
+    vi.spyOn(Date, 'now').mockReturnValue(finished + elapsed);
+    return rebuildCloneAsJob({
     root, env, store, entries: ['scripts/review-daemon.mjs'],
     adopt: async () => ({ reason: 'needs-build', plan }),
     reattach: async () => ({}), evict: () => ({}), log: { error() {} }, codeSha: 'a'.repeat(40),
     now: () => finished + elapsed, rng: () => 0,
     settings: { entries: [], minIntervalMs: 900000, minIntervalJitterPct: 0 }, ...extra,
-  });
-  it('skips the 900000ms cooldown exactly once and persists wokeAt after enqueue', async () => {
+  }); };
+  it('skips the 900000ms cooldown exactly once and persists wokeAt before enqueue', async () => {
     expect(hotPatch.WAKE_FLOOR_MS).toBe(120000);
     const create = vi.spyOn(store, 'create');
     create.mockImplementationOnce(record => {
-      expect(hotPatch.readHotPatch(env).wokeAt).toBeUndefined();
+      expect(hotPatch.readHotPatch(env).wokeAt).toBeTruthy();
       // Call the real store on the same directory to observe the persistence boundary.
       return createJobStore(store.dir).create(record);
     });
@@ -178,36 +179,21 @@ describe('hot-patch one-shot wake through the rebuild-job-spaced cooldown', () =
     expect((await tick()).reason).toBe('rebuild-job-spaced');
     expect(store.list().records).toHaveLength(1);
   });
-  it('a persistent wake-marker failure alerts with its reason after three attempts and preserves enqueue', async () => {
-    vi.spyOn(store, 'create').mockImplementationOnce(record => {
-      const queued = createJobStore(store.dir).create(record);
-      writeFileSync(hotPatch.hotPatchLedgerPath(env), '{unreadable after enqueue');
-      return queued;
-    });
-    const error = vi.fn();
-    const markWoke = vi.fn((...args) => hotPatch.markHotPatchWoke(...args));
-    expect((await tick(120000, { log: { error }, markWoke })).reason).toBe('rebuild-job-started');
-    expect(store.list().records).toHaveLength(2);
-    expect(markWoke).toHaveBeenCalledTimes(3);
-    expect(error).toHaveBeenCalledWith(expect.stringMatching(/ALERT hot-patch wake marker failed after 3 attempts.*ledger/i));
+  it('R3.2 a throwing wake claim keeps every tick spaced and never queues within cooldown', async () => {
+    const claimHotPatchWake = vi.fn(async () => { throw Error('disk busy'); });
+    const create = vi.spyOn(store, 'create');
+    expect((await tick(120000, { claimHotPatchWake })).reason).toBe('rebuild-job-spaced');
+    expect((await tick(300000, { claimHotPatchWake })).reason).toBe('rebuild-job-spaced');
+    expect(create).not.toHaveBeenCalled();
+    expect(claimHotPatchWake).toHaveBeenCalledTimes(2);
+    expect(claimHotPatchWake).toHaveBeenCalledWith(env, root, plan, finished);
   });
-  it('transient wake-marker failure retries and stops on success', async () => {
-    const error = vi.fn();
-    const markWoke = vi.fn().mockImplementationOnce(() => { throw Error('disk busy'); })
-      .mockImplementation((...args) => hotPatch.markHotPatchWoke(...args));
-    expect((await tick(120000, { log: { error }, markWoke })).reason).toBe('rebuild-job-started');
-    expect(markWoke).toHaveBeenCalledTimes(2);
+  it('R3.1 two ticks three minutes apart consume only one wake even if enqueue throws', async () => {
+    const create = vi.spyOn(store, 'create').mockImplementationOnce(() => { throw Error('disk full'); });
+    expect((await tick(120000)).reason).toBe('rebuild-job-queue-failed');
+    expect((await tick(300000)).reason).toBe('rebuild-job-spaced');
+    expect(create).toHaveBeenCalledTimes(1);
     expect(hotPatch.readHotPatch(env).wokeAt).toBeTruthy();
-    expect(error.mock.calls.some(([message]) => message.includes('ALERT'))).toBe(false);
-  });
-  it('enqueue failure leaves wokeAt unset so a later tick can retry', async () => {
-    vi.spyOn(store, 'create').mockImplementationOnce(() => {
-      expect(hotPatch.readHotPatch(env).wokeAt).toBeUndefined();
-      throw Error('disk full');
-    });
-    expect((await tick()).reason).toBe('rebuild-job-queue-failed');
-    expect(hotPatch.readHotPatch(env).wokeAt).toBeUndefined();
-    expect((await tick()).reason).toBe('rebuild-job-started');
-    expect(hotPatch.readHotPatch(env).wokeAt).toBeTruthy();
+    expect(store.list().records).toHaveLength(1);
   });
 });

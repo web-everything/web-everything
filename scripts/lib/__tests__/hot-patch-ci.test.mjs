@@ -2,7 +2,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { hotPatchCiVerdict, requiredChecksForMain } from '../hot-patch-ci.mjs';
-import { FALLBACK_REQUIRED_STATUS_CHECKS } from '../required-status-checks.mjs';
+import { decideHotPatch } from '../hot-patch.mjs';
 const sha = 'a'.repeat(40), repo = 'web-everything/web-everything';
 // Fixtures ported from hot-patch-verify-source.test.mjs on origin/lane/hot-patch-s2.
 const run = (id, conclusion = 'success', extra = {}) => ({ id, name: 'test', head_sha: sha,
@@ -121,12 +121,37 @@ for (const payload of [null, {}, { workflow_runs: [] }, { workflow_runs: [{}] }]
   });
 }
 
-test('failed and partial protection reads preserve every observed name plus the fallback floor', () => {
-  const expected = [...new Set([...FALLBACK_REQUIRED_STATUS_CHECKS, 'unmapped-extra'])];
-  assert.deepEqual(requiredChecksForMain(() => { throw Object.assign(Error('offline'), { partialChecks: ['unmapped-extra'] }); }), expected);
-  assert.deepEqual(requiredChecksForMain(() => ({ partialChecks: ['unmapped-extra'], checks: [] })), expected);
-  assert.deepEqual(requiredChecksForMain(() => { throw Error('offline'); }), [...FALLBACK_REQUIRED_STATUS_CHECKS]);
+test('R3.5 unreadable or partial required policy stays unknown despite all four jobs succeeding', async () => {
+  for (const read of [() => { throw Error('offline'); },
+    () => { throw Object.assign(Error('partial'), { partialChecks: ['test'] }); },
+    () => ({ checks: ['test'], partialChecks: ['smoke'] })]) {
+    const required = requiredChecksForMain(read);
+    const result = await verdict({ required, fetchJson: async path => {
+      if (path.includes('/workflows/')) return { workflow_runs: [run(1)] };
+      if (path.includes('/check-suites/')) return suite(1);
+      return { jobs: ['test', 'smoke', 'daemon-soak', 'soak-replay-gate'].map(name => job(name)) };
+    } });
+    assert.equal(result.state, 'unknown');
+    assert.equal(result.reason, 'Required-check policy unreadable');
+    assert.equal(required, null);
+  }
   assert.deepEqual(requiredChecksForMain(() => ({ checks: ['test'] })), ['test']);
+});
+test('R3.6 daemon-soak red survives later soak-replay-gate fetch failure', async () => {
+  const result = await verdict({ required: ['daemon-soak', 'soak-replay-gate'], fetchJson: async path => {
+    if (path.includes('soak-replay-gate.yml')) throw Error('offline');
+    if (path.includes('/workflows/')) return { workflow_runs: [run(1)] };
+    if (path.includes('/check-suites/')) return suite(1);
+    return { jobs: [job('daemon-soak', 'failure')] };
+  } });
+  assert.equal(result.state, 'red');
+});
+test('R3.7 bogus job status is unknown and expires to ci-unknown after 31 minutes', async () => {
+  const ci = await verdict({ jobs: { 1: [job('test', null, { status: 'bogus' })] } });
+  assert.equal(ci.state, 'unknown');
+  const loaded = 1700000000000;
+  assert.equal(decideHotPatch({ record: { sha, loadedAt: new Date(loaded).toISOString() }, ci,
+    pr: { state: 'OPEN', headRefOid: sha }, now: loaded + 31 * 60000 }), 'ci-unknown');
 });
 for (const phase of ['runs', 'jobs']) {
   test(`${phase} pagination discovers a later failure instead of accepting first-page success`, async () => {
