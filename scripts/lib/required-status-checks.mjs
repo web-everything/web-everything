@@ -221,10 +221,11 @@ function readRulesPaged(restGet, path, o) {
  *
  * Reads go through `restGet` (default `ghRestGetJson`, ETag-conditional: after the cache TTL an unchanged answer is
  * a free 304). An injected `gh` text reader, or the personal-routed CLI path, keeps the plain `gh api` calls.
- * @param {{repo?: string, branch?: string, gh?: Function, restGet?: Function}} o
- * @returns {{checks: string[], classic: string[]}}
+ * `includeAppIds` also retains ruleset integration ids and classic app ids for identity-sensitive consumers.
+ * @param {{repo?: string, branch?: string, gh?: Function, restGet?: Function, includeAppIds?: boolean}} o
+ * @returns {{checks: string[], classic: string[], requiredCheckApps?: Array<{context:string,appId?:number}>}}
  */
-export function readRequiredStatusChecksDetailed({ repo, branch = 'main', gh, restGet = ghRestGetJson, readOnly = false } = {}) {
+export function readRequiredStatusChecksDetailed({ repo, branch = 'main', gh, restGet = ghRestGetJson, readOnly = false, includeAppIds = false } = {}) {
   const base = `repos/${repo || '{owner}/{repo}'}`;
   const useRest = !gh && !resolvePersonalRouteEnabled();
   const text = gh ?? readRequiredChecksGh;
@@ -232,6 +233,7 @@ export function readRequiredStatusChecksDetailed({ repo, branch = 'main', gh, re
   const restOpts = { op: 'required-checks', context: repo ? '' : process.cwd(),
     ...(readOnly ? { env: { ...process.env, WE_GH_ETAG_CACHE: '0' } } : {}) };
   let rulesChecks = [];
+  let requiredCheckApps = [];
   let rulesError;
   let rulesFailed = false; // a flag, not `rulesError`'s truthiness: a `throw undefined` is still a failed read
   try {
@@ -241,6 +243,9 @@ export function readRequiredStatusChecksDetailed({ repo, branch = 'main', gh, re
       ? readRulesPaged(restGet, `${base}/rules/branches/${branch}`, restOpts)
       : flattenRulePages(JSON.parse(text(['api', '--paginate', '--slurp', `${base}/rules/branches/${branch}?per_page=100`]).trim()));
     rulesChecks = requiredChecksFromRules(rules);
+    if (includeAppIds) requiredCheckApps = rules.filter(rule => rule?.type === 'required_status_checks')
+      .flatMap(rule => rule.parameters?.required_status_checks ?? [])
+      .map(check => ({ context: check?.context, appId: check?.integration_id }));
   } catch (error) {
     rulesError = error;
     rulesFailed = true;
@@ -256,6 +261,12 @@ export function readRequiredStatusChecksDetailed({ repo, branch = 'main', gh, re
       ? restGet(`${base}/branches/${branch}`, restOpts).json // a blank body parses to null → shape error below
       : JSON.parse(text(['api', `${base}/branches/${branch}`]).trim()); // blank body = failed read, same as the rules read
     checks = requiredChecksFromBranch(branchJson);
+    if (includeAppIds) {
+      const classicChecks = branchJson.protection?.required_status_checks?.checks ?? [];
+      requiredCheckApps.push(...classicChecks.map(check => ({ context: check?.context, appId: check?.app_id })),
+        ...checks.filter(context => !classicChecks.some(check => check?.context === context))
+          .map(context => ({ context, appId: undefined })));
+    }
   } catch (error) {
     // The ruleset read fine: its set is partial, never live, but stays required on whatever the caller falls back to.
     if (!rulesFailed) throw withPartialChecks(error, rulesChecks);
@@ -267,7 +278,7 @@ export function readRequiredStatusChecksDetailed({ repo, branch = 'main', gh, re
     // Both sources read fine and neither requires a check: an authoritative "nothing required", which selects the
     // repo's declared policy exactly as a protection denial does — never the untrusted `fallback`.
     if (!union.length) throw Object.assign(new Error('required-status-checks: no required checks in rules or branch protection'), { noRequiredChecks: true });
-    return { checks: union, classic: checks };
+    return { checks: union, classic: checks, ...(includeAppIds ? { requiredCheckApps } : {}) };
   }
   // Rulesets can require checks classic protection lacks, and an unreadable ruleset does not mean its requirements
   // disappeared — so after ANY rules failure the classic set is partial and never returned as live: throw the rules

@@ -129,13 +129,28 @@ export { gitRunner };
  *                                       tip (reusing #2222's `applyCollisionHealToIndex`), so the rebuild that
  *                                       already runs to shed the manifest also clears an `ids must be unique` dup
  *                                       against `<base>` — otherwise the rebuilt tip stays red and never merges.
+ * @param {boolean} [o.forceRefresh=false] Rebuild a current tree for the drain's ledger-bounded failed-gate repair.
+ * @param {string|null} [o.expectedHead=null] Pin the fetched commit and condition the push on this remote head.
  * @param {string} [o.cwd]              run every git invocation in THIS directory instead of `process.cwd()`
  *                                       (#2263) — routes the plumbing through a SIBLING clone (e.g. `../frontierui`)
  *                                       for a remote-repo candidate, so the local-only rebase-drop can rebuild a
  *                                       non-local lane tip too, given that repo's own clone is provisioned.
  * @param {(cmd:string,args:string[],opts?:object)=>{status:number,stdout:string,stderr:string}} [o.run] injected runner.
+ * Returned errors include pushAttempted; false confirms no push was invoked, while throws remain unknown.
  */
-export function rebaseDropManifest({
+export function rebaseDropManifest(options = {}) {
+  let pushAttempted = false;
+  const run = options.run ?? gitRunner;
+  const result = rebuildDropManifest({ ...options, run: (bin, args, config) => {
+    if (bin === 'git' && args[0] === 'push') pushAttempted = true;
+    return run(bin, args, config);
+  } });
+  // Only a completed return before any push is proof of a retryable pre-mutation error.
+  // A throwing runner remains unknown to callers; never turn it into permission to retry.
+  return result.action === 'error' ? { ...result, pushAttempted } : result;
+}
+
+function rebuildDropManifest({
   laneRef,
   base = 'origin/main',
   remote = 'origin',
@@ -145,6 +160,8 @@ export function rebaseDropManifest({
   message,
   tmpIndex = '.git/rebase-drop-index',
   healCollision = false,
+  forceRefresh = false,
+  expectedHead = null,
   cwd,
   run = gitRunner,
 } = {}) {
@@ -155,12 +172,19 @@ export function rebaseDropManifest({
   // bare name fail with "not something we can merge" and the whole auto-rebase is inert. Fetch the lane ref
   // first (so the remote-tracking ref is current), then feed the RESOLVED `<remote>/<laneRef>` to the merge
   // inputs. The PUSH still targets the bare `refs/heads/<laneRef>` (that part was always correct).
-  const mergeRef = readRef || `${remote}/${laneRef}`;
+  let mergeRef = readRef || `${remote}/${laneRef}`;
   if (fetch) {
     const f = run('git', ['fetch', remote, laneRef], { cwd });
     if (f.status !== 0) return { action: 'error', reason: `fetch ${laneRef} failed (${(f.stderr || '').split('\n')[0]})` };
   }
 
+  if (expectedHead !== null) {
+    const tip = run('git', ['rev-parse', '--verify', `${mergeRef}^{commit}`], { cwd });
+    if (!/^[0-9a-f]{40}$/.test(expectedHead) || tip.status !== 0 || String(tip.stdout).trim() !== expectedHead)
+      return { action: 'error', reason: 'fetched branch head is not the judged head; re-read before refreshing' };
+    // Use the immutable commit throughout; another fetch must not change the tree under this rebuild.
+    mergeRef = expectedHead;
+  }
   const mt = run('git', ['merge-tree', '--write-tree', base, mergeRef], { cwd });
   let parsed = parseMergeTree(mt.stdout, mt.status);
   if (!parsed.tree) {
@@ -237,7 +261,7 @@ export function rebaseDropManifest({
   // — so it still gets rebuilt to drop it). Over-conservative direction: when uncertain, rebuild.
   const curTreeOid = String(run('git', ['rev-parse', `${mergeRef}^{tree}`], { cwd }).stdout || '').trim();
   const isAncestor = run('git', ['merge-base', '--is-ancestor', base, mergeRef], { cwd }).status === 0;
-  if (isAncestor && curTreeOid && curTreeOid === resolvedTree) {
+  if (!forceRefresh && isAncestor && curTreeOid && curTreeOid === resolvedTree) {
     const curCommit = String(run('git', ['rev-parse', mergeRef], { cwd }).stdout || '').trim();
     // Guard: only claim 'current' if we can actually resolve the tip's commit sha; otherwise fall through to
     // the normal rebuild rather than return a bogus result.
@@ -273,7 +297,7 @@ export function rebaseDropManifest({
   if (refusal) return { action: 'error', reason: refusal.message };
 
   // Fast-forward push (newCommit descends from laneRef) to the guard-safe lane/* ref — no checkout.
-  const push = run('git', ['push', remote, `${newCommit}:refs/heads/${laneRef}`], { cwd });
+  const push = run('git', ['push', ...(expectedHead ? [`--force-with-lease=refs/heads/${laneRef}:${expectedHead}`] : []), remote, `${newCommit}:refs/heads/${laneRef}`], { cwd });
   if (push.status !== 0) return { action: 'error', reason: `push to ${laneRef} failed (${(push.stderr || '').split('\n')[0]})` };
 
   return { action: 'rebased', newCommit, dropped: disp === 'manifest-only', droppedEvidence, healed, base, laneRef };

@@ -171,8 +171,11 @@ describe('merge-queue same-head failure admission', () => {
         };
         const approvedHeadHold = new Function(...Object.keys(dependencies),
           source.slice(holdStart, holdEnd) + '\nreturn approvedHeadHold;')(...Object.values(dependencies));
-        const start = source.indexOf('  function enqueueWithSameHeadGuard(');
+        // Include the shared mutation authorization helper called by same-head recovery.
+        const start = source.indexOf('  function queueHeadMutationAllowed(');
         const end = source.indexOf('  // xym8nt4 — post-approval', start);
+        expect(start).toBeGreaterThan(-1);
+        expect(end).toBeGreaterThan(start);
         const wiring = { ...dependencies, assertCapability, DRY_RUN: false, mqSameHeadRefreshStore: f.store,
           execFileSyncThrottled: exec, createMqLiveReader: (reader = exec) => queueSafety.createMqLiveReader(reader),
           readCompletePrComments, readPinnedChangedFiles,

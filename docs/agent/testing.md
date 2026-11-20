@@ -5672,6 +5672,58 @@ Check mode fetches origin main before evaluating canonical audit evidence. A fai
 `main not refreshed: <reason>` and refuses even when local evidence would pass against stale refs.
 `open-pr-audit-gate.test.mjs` covers both refresh outcomes, aggregation and an unconfirmed check child.
 
+
+## Failed required merge-gate refresh
+
+`mergeQueue.refreshOnStaleMergeGate` also admits the newest completed-failure check run on the
+pinned head from the live required app. Exercise it through the existing stale-gate refresh and
+real drain CLI, including each queue/review/workflow/group/claim/approved-head hold. The existing
+refresh ledger and atomic claims bound rebuilds per head. Failed-gate rebuilds also reserve a
+durable PR claim, so a later head cannot reset the attempt budget. A confirmed admission hold
+releases that claim; a successful or uncertain mutation retains it for operator inspection.
+`drain.staleGateUpdateBranchMax` caps attempts per pass (standard 2, 0 disables this trigger),
+resolved through the policy cascade with `WE_DRAIN_STALE_GATE_UPDATE_BRANCH_MAX` as the env override.
+The setting lives in `scripts/settings/merge-queue.json`; recovery uses the existing
+`merge-queue-enqueue.mjs` / `refreshStalePr` rebuild, not an update-branch API request.
+The judged head is checked against the live branch tip and again after fetch; the rebuild uses
+that immutable commit and pushes its descendant with an explicit expected-head lease.
+A current branch must still produce a new head, since label events cannot refresh this required gate.
+The soak break `stale-failed-merge-gate-blocks-drain` drives that production CLI with private transport
+fixtures; its single source marker detects presence only. Truncated check history or unreadable app
+identity keeps the PR skipped and asks the operator to inspect and refresh the branch manually.
+Recovery ordering is explicit: verified legacy stale-hold recovery runs before the failed-gate
+rebuild, preserving its rerun and head-bound evidence when both arms qualify. If legacy evidence
+is unavailable or ineligible, the independent required-app failure evidence can still qualify.
+Confirmed pre-mutation refusals release the head and PR claims and refund the shared pass budget;
+unknown outcomes and attempted pushes retain the claim and budget. The rebuild reports whether
+push was attempted, and the refresh wrapper exposes confirmed pre-push errors separately.
+Callers must supply a shared `failedGateBudget`; a missing budget throws instead of silently
+allocating a per-PR allowance. Settings readers are injectable; test environment flags never
+override the failed-gate settings-file kill switch.
+
+Acceptance coverage: `merge-queue-stale-merge-gate.test.mjs` pins legacy priority and independent evidence;
+`merge-queue-enqueue.test.mjs` pins multi-PR default/explicit/zero budgets, cross-head exhaustion,
+listing/live mismatch, required app identity and bounded history; `merge-ai-prs-prestage.test.mjs`
+pins forks, bases, labels, merge states, other failing checks, moved branch tips, card ownership,
+human approval, fix claims, zero-disable wiring and startup-failure admission through the real drain.
+`required-status-checks.test.mjs` pins the ruleset and classic app-ID producers.
+
+Prevention for PR #7184: new recovery arms must declare their ordering and test overlaps with
+each existing arm, plus unavailable evidence. Test held candidates before an eligible one and
+three eligible candidates through the real drain to defend the pass-wide cap. Pin pre-push versus
+uncertain push failures through every wrapper. A head-mutating retry needs a durable bound independent of the current SHA,
+and the acceptance contract must name both its settings declaration and multi-candidate test.
+Shared admission changes must exercise each existing caller. Run changed test files and their
+soak fixture in the diff-selected verification gate; fixture capability checks must remain real.
+
+## Failed merge-gate drain refresh fixtures
+
+The prestage world keeps `WE_SHARED_RUNS_DIR` inside its temporary root. A missing-result
+red-team guard needs head-bound scheduled work; an accepted label alone schedules nothing.
+Live fix claims need `meta.who`, and approved human-surface fixtures must name an active human
+surface such as `webeverything.config.json` (the drain engine is agent-reviewable). The in-process Node port models
+only the `review-set-label.mjs` acceptance-restamp subprocess after the real guarded refresh
+rebases; assert its new-head argument and retain the original BLOCKED skip across passes.
 ## CI workflow self-test (ci-self.yml)
 
 An edit to `ci.yml` is never run by its own PR: the ruleset pins the workflow from main. Before a
@@ -5716,3 +5768,9 @@ in review evidence. For retryable warnings, `effect-executor.test.mjs` must defe
 refusal and safe replay; `cli-adapter.test.mjs` must defend warning stops, fallback text and credential
 redaction in JSON and text output. These checks are deliberate contract pins when the behavior already
 exists; the stale-baseline and reverted-history cases must discriminate the publication repair.
+## Drain recovery fixture maintenance
+
+Recovery settings tests inject settings or their reader for isolation; process test flags must
+still honor declared kill switches. When a source-extracted CLI fixture calls a shared helper,
+include that helper in the extracted source and keep assertions for every authorization stage.
+Soak breaks needing a supported repository resolve its slug from `CONSTELLATION_REPOS`.

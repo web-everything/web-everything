@@ -18,6 +18,7 @@ import { readApprovedHumanSurfaceHold, refreshApprovedHeadChecked, resolveSkipRe
 import { createMqLiveReader } from '../drain-queue-safety.mjs';
 import { assertCapability } from '../repo-profile.mjs';
 import { SETTINGS_DIR } from '../settings-files.mjs';
+import { refreshOntoMain } from '../../conveyor/ci-red-recovery-watch.mjs';
 import { execFileSync } from 'node:child_process';
 import { readFileSync, mkdtempSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -646,4 +647,35 @@ describe('refreshStalePr rerun uses the repo REST endpoint, never `gh run`', () 
   it('refuses a rerun with no repo (fail closed)', async () => {
     expect(await refreshStalePr({ ...base, repo: null, execGh: () => '' })).toMatchObject({ ok: false });
   });
+});
+
+
+it.each([null, { state: 'pending-unknown', confirmed: false }])('failed-gate refresh forces a new head despite an earlier label claim %j', async gateRefreshPending => {
+  const refresh = vi.fn((_ref, options) => ({ ok: true, action: options.forceRefresh ? 'rebased' : 'current', newCommit: 'b'.repeat(40) }));
+  const out = await refreshStalePr({ laneRef: 'lane/x', prNumber: 7, repo: 'o/r',
+    runConclusion: 'failure', forceRefresh: true, gateRefreshPending, expectedHead: 'a'.repeat(40), readTip: () => 'a'.repeat(40), refresh });
+  expect(out).toMatchObject({ ok: true, action: 'rebased', newCommit: 'b'.repeat(40) });
+  expect(refresh).toHaveBeenCalledWith('lane/x', expect.objectContaining({ forceRefresh: true, expectedHead: 'a'.repeat(40) }));
+});
+
+it.each([false, true, undefined])('preserves pre-push versus uncertain failure through both refresh wrappers: %s', async pushAttempted => {
+  const out = await refreshStalePr({ laneRef: 'lane/x', prNumber: 7, repo: 'o/r', forceRefresh: true,
+    refresh: (laneRef, options) => refreshOntoMain(laneRef, { ...options,
+      readIsCrossRepository: () => false,
+      rebase: () => ({ action: 'error', reason: 'transport failure', ...(pushAttempted === undefined ? {} : { pushAttempted }) }),
+    }),
+  });
+  expect(out).toMatchObject({ ok: false, action: pushAttempted === false ? 'pre-push-error' : 'error' });
+});
+
+
+it('an approved human head refuses forced gate rebuilding without looking up a rerun', async () => {
+  const { refreshApprovedHeadChecked } = await import('../approved-human-surface-hold.mjs');
+  const rebuild = vi.fn();
+  const readRunId = vi.fn(() => { throw Error('a forced rebuild must not need a rerun'); });
+  expect(await refreshApprovedHeadChecked({readHold:()=>true,readRunId,prNumber:7,repo:'o/r',refresh:refreshStalePr,
+    options:{laneRef:'lane/x',expectedHead:'a'.repeat(40),readTip:()=>'a'.repeat(40),forceRefresh:true,refresh:rebuild}}))
+    .toMatchObject({ok:false,action:'held-current'});
+  expect(rebuild).not.toHaveBeenCalled();
+  expect(readRunId).not.toHaveBeenCalled();
 });

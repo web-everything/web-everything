@@ -8,7 +8,9 @@ vi.setConfig({ testTimeout: 120_000 });
 import { mkdirSync, writeFileSync, readFileSync, readdirSync } from 'node:fs';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { CONSTELLATION_REPOS } from '../lib/constellation-repos.mjs';
 import { canConsumePrestagedAdmission, prestageFixClaimHeld } from '../merge-ai-prs.mjs';
+import { recordRedTeamStatus } from '../lib/drain-red-team-evidence.mjs';
 import { reserve } from '../readiness/file-locks.mjs';
 import { fixDispatchResource } from '../conveyor/fix-claim-store.mjs';
 import { readLiveFixClaim } from '../conveyor/fix-procedure.mjs';
@@ -449,3 +451,135 @@ describe('real drain pre-stage path', () => {
     expect(next.calls.some(a => a[0] === 'pr' && a[1] === 'list' || a.some(x => x.includes('pullRequests(')))).toBe(true);
   }));
 });
+
+
+const failedGatePr = pr => {
+  pr.failedGate = true;
+  pr.statusCheckRollup = [{name:'test',status:'COMPLETED',conclusion:'SUCCESS',head_sha:sha},
+    {name:'merge-gate',status:'COMPLETED',conclusion:'FAILURE',head_sha:sha}];
+  pr.labels.push({ name:'red-team:clear' });
+};
+const repairEnv = { WE_MERGE_QUEUE_REFRESH_ON_STALE_MERGE_GATE:'on',
+  WE_MERGE_QUEUE_SKIP_REBASE_APPROVED_HUMAN_SURFACE:'off' };
+const refreshPushes = calls => calls.filter(a => a[0] === 'git' && a[1] === 'push');
+describe('failed-gate trigger through the real drain', () => {
+  it('shares the default two-refresh budget across three eligible PRs in a real drain pass', () => world(async ({pr,run}) => {
+    failedGatePr(pr);
+    const prs = [42, 43, 44].map(number => ({ ...structuredClone(pr), number, id: `PR_${number}`, headRefName: `lane/readme-${number}` }));
+    const out = await run(false, { prs, only: null, env: repairEnv });
+    expect(out.report.skipped.map(row => row.num)).toEqual(expect.arrayContaining([42, 43, 44]));
+    expect(refreshPushes(out.calls), JSON.stringify(out.report)).toHaveLength(2);
+    expect(new Set(refreshPushes(out.calls).map(call => call.at(-1))).size).toBe(2);
+    expect(out.report.revalidationAborted.some(row => row.reason.includes('budget exhausted'))).toBe(true);
+  }));
+  it('zero per-pass budget disables the failed-gate rebuild', () => world(async ({pr,run}) => {
+    failedGatePr(pr);
+    const out = await run(false, {env:{...repairEnv,WE_DRAIN_STALE_GATE_UPDATE_BRANCH_MAX:'0'}});
+    expect(refreshPushes(out.calls)).toEqual([]);
+  }));
+  it.each([false, true])('startup_failure uses shared admission (red-team hold: %s)', held => world(async ({pr,run}) => {
+    pr.startupFailure = true;
+    pr.statusCheckRollup = [{name:'test',status:'COMPLETED',conclusion:'SUCCESS',head_sha:sha}];
+    if (held) pr.labels.push({name:'red-team:blocked'});
+    const out = await run(false, {env:repairEnv});
+    expect(refreshPushes(out.calls), JSON.stringify(out.report)).toHaveLength(held ? 0 : 1);
+    expect(out.report.merged).toEqual([]);
+    expect(out.report.revalidationAborted[0].reason).toContain(held ? 'red-team:blocked' : 'rebased');
+  }));
+  it('rebuilds through refreshStalePr and preserves the original BLOCKED skip, once per head', () => world(async ({pr,run,slug}) => {
+    failedGatePr(pr);
+    const first = await run(false, {env:repairEnv});
+    expect(first.report.merged).toEqual([]);
+    expect(first.report.toMerge).toEqual([]);
+    expect(first.report.skipped).toEqual([expect.objectContaining({num:42, reason:expect.stringContaining('merge state BLOCKED')})]);
+    expect(first.report.revalidationAborted).toEqual([expect.objectContaining({reason:expect.stringContaining('rebased')})]);
+    expect(first.calls.filter(a => a[0] === 'node')).toEqual([[
+      'node', expect.stringMatching(/\/review-set-label\.mjs$/), '42', `--repo=${slug}`,
+      '--to=restamp', '--actor=drain', '--channel=drain-rebase',
+      `--reason=head moved to ${'b'.repeat(40)} by this drain's own content-preserving rebase`,
+      `--new-head=${'b'.repeat(40)}`,
+    ]]);
+    expect(refreshPushes(first.calls), JSON.stringify(first.report) + first.stderr).toHaveLength(1);
+    expect(first.calls).toContainEqual(['git', 'ls-remote', 'origin', `refs/heads/${pr.headRefName}`]);
+    expect(refreshPushes(first.calls)[0]).toContain(`--force-with-lease=refs/heads/${pr.headRefName}:${sha}`);
+    expect(first.calls.some(a => a[0] === 'git' && a[1] === 'merge-tree')).toBe(true);
+    const second = await run(false, {env:repairEnv});
+    expect(refreshPushes(second.calls)).toEqual([]);
+    expect(second.calls.filter(a => a[0] === 'node')).toEqual([]);
+    expect(second.report.skipped).toEqual(first.report.skipped);
+  }));
+  it.each([
+    ['fork', pr => { pr.isCrossRepository = true; }],
+    ['remote head moved after admission', pr => { pr.remoteHead = 'd'.repeat(40); }],
+    ['head moved during fetch', pr => { pr.fetchedHead = 'd'.repeat(40); }],
+    ['non-default base', pr => { pr.baseRefName = 'release'; }],
+    ['missing ready-to-merge', pr => { pr.labels = pr.labels.filter(l => l.name !== 'ready-to-merge'); }],
+    ['missing review:accepted', pr => { pr.labels = pr.labels.filter(l => l.name !== 'review:accepted'); }],
+    ['not MERGEABLE', pr => { pr.mergeable = 'CONFLICTING'; }],
+    ['not BLOCKED', pr => { pr.mergeStateStatus = 'UNSTABLE'; }],
+    ['another required failure', pr => { pr.statusCheckRollup[0].conclusion = 'FAILURE'; }],
+    ['red-team:blocked', pr => pr.labels.push({name:'red-team:blocked'})],
+    ['red-team:pending', pr => pr.labels.push({name:'red-team:pending'})],
+    ['missing red-team:clear', pr => { pr.labels = pr.labels.filter(l => l.name !== 'red-team:clear'); }],
+    ['unknown queue history', pr => { pr.unknownMqHistory = true; }],
+    ['exhausted queue history', pr => { pr.mqTimeline = [{__typename:'RemovedFromMergeQueueEvent',reason:'failed_checks',
+      beforeCommit:{oid:'b'.repeat(40),parents:{nodes:[{oid:'c'.repeat(40)},{oid:sha}]}}}]; }],
+    ['review hold', pr => { pr.labels = pr.labels.filter(l => l.name !== 'review:accepted'); pr.labels.push({name:'review:pending'}); }],
+    ['send-back hold', pr => pr.labels.push({name:'review:changes'})],
+    ['GitHub review hold', pr => { pr.reviewDecision = 'CHANGES_REQUESTED'; }],
+    ['workflow edit without license', pr => { pr.workflowEdit = true; }],
+  ])('keeps the existing %s guard', (_name, change) => world(async ({pr,run}) => {
+    failedGatePr(pr); change(pr);
+    const out = await run(false, {env:{...repairEnv,WE_DRAIN_WORKFLOW_EDIT_HUMAN:pr.workflowEdit ? 'on' : 'off'}});
+    expect(refreshPushes(out.calls)).toEqual([]);
+    expect(out.calls.some(a => a[0] === 'git' && a[1] === 'commit-tree')).toBe(false);
+  }));
+  it('refuses missing red-team evidence when the existing evidence gate is enabled', () => world(async ({pr,run,dir,slug}) => {
+    failedGatePr(pr);
+    recordRedTeamStatus({repo:slug, pr:42, head:sha, status:'queued',
+      loopPayload:{verdict:{verdict:'accept'},findings:{read:{netBasis:{rev:sha}}}}},
+      {env:{WE_SHARED_RUNS_DIR:join(dir,'runs')}, publish:false});
+    const out = await run(false, {env:{...repairEnv,WE_DRAIN_WAIT_FOR_RED_TEAM_BEFORE_ENQUEUE:'on'}});
+    expect(refreshPushes(out.calls), JSON.stringify(out.report)).toEqual([]);
+    expect(out.calls.some(a => a[0] === 'git' && a[1] === 'commit-tree' || a[0] === 'node')).toBe(false);
+    expect(out.report.revalidationAborted).toEqual([expect.objectContaining({reason:expect.stringContaining('queue head mutation authorization refused')})]);
+  }));
+  it('refuses a live fix claim', () => world(async ({pr,run,dir}) => {
+    failedGatePr(pr);
+    reserve(join(dir,'coord','fix-dispatch-claims'), fixDispatchResource({repo:'we',pr:42,kind:'fixing'}), 'fixer', Date.now(), new Date().toISOString(), process.pid, 'unknown', 15, {who:'fixer',claimedAt:new Date().toISOString()});
+    const out = await run(false,{env:repairEnv});
+    expect(refreshPushes(out.calls), JSON.stringify(out.report)).toEqual([]);
+    expect(out.calls.some(a => a[0] === 'git' && a[1] === 'commit-tree' || a[0] === 'node')).toBe(false);
+    expect(out.report.skipped).toEqual([expect.objectContaining({reason:expect.stringContaining('merge state BLOCKED')})]);
+    expect(out.report.revalidationAborted).toEqual([expect.objectContaining({reason:expect.stringContaining('live PR admission refused')})]);
+  }, {slug:CONSTELLATION_REPOS.we.slug}));
+});
+
+
+it.each(['source', 'combined', 'unreadable'])('failed-gate trigger holds %s card-group state without consuming the retry', role => world(async ({pr,run,dir,slug}) => {
+  failedGatePr(pr);
+  const state = join(dir,'groups.json');
+  writeFileSync(state, role === 'unreadable' ? '{broken' : JSON.stringify({groups:[{id:'fixture',repo:slug,
+    pr:role === 'combined' ? 42 : 77,branch:role === 'combined' ? pr.headRefName : 'lane/card-group-fixture',createdAt:Date.now(),
+    sources:[{num:role === 'source' ? 42 : 99,headSha:sha}],files:['backlog/xfixture.md']}],failed:{},lastReconcileAt:Date.now()}));
+  const env = {...repairEnv,WE_DRAIN_CARD_GROUP_STATE:state};
+  const out = await run(false, {env});
+  expect(refreshPushes(out.calls)).toEqual([]);
+  expect(out.calls.some(a => a[0] === 'git' && a[1] === 'commit-tree' || a[0] === 'node'), JSON.stringify(out.calls)).toBe(false);
+  expect(out.report.revalidationAborted).toEqual([expect.objectContaining({reason:expect.stringContaining('card group')})]);
+  // A hold must leave the once-per-head repair available when ownership is released or state repaired.
+  writeFileSync(state, JSON.stringify({groups:[],failed:{},lastReconcileAt:Date.now()}));
+  const released = await run(false, {env});
+  expect(refreshPushes(released.calls)).toHaveLength(1);
+  expect(released.report.merged).toEqual([]);
+}));
+
+it('failed-gate trigger retains an approved human-surface head through refreshApprovedHeadChecked', () => world(async ({pr,run}) => {
+  failedGatePr(pr); pr.humanSurface = true;
+  pr.comments[0].body += '\n<!-- cleared-human: operator -->';
+  const out = await run(false, {env:{...repairEnv,WE_MERGE_QUEUE_SKIP_REBASE_APPROVED_HUMAN_SURFACE:'on'}});
+  expect(refreshPushes(out.calls)).toEqual([]);
+  expect(out.calls.some(a => a[0] === 'git' && a[1] === 'commit-tree' || a[0] === 'node')).toBe(false);
+  expect(out.report.skipped).toEqual([expect.objectContaining({reason:expect.stringContaining('merge state BLOCKED')})]);
+  expect(out.report.revalidationAborted[0].reason).toContain('approved head retained');
+}));
