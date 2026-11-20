@@ -1,5 +1,5 @@
 import { describe, it, expect, vi } from 'vitest';
-import { decideSetLabel, runReviewLabelCli, buildVerdictComment } from '../review-set-label.mjs';
+import { decideSetLabel, runReviewLabelCli, buildVerdictComment, REVIEW_LABEL_TARGETS } from '../review-set-label.mjs';
 import { gateOutcomesForHead, sendBackStepOutcome, gateRoundGrants, GATE_OUTCOMES, redTeamGateMarker } from '../lib/red-team-gate.mjs';
 import { buildRoundExtensionComment } from '../conveyor/round-extension-mark.mjs';
 import { OPERATOR_LOGINS } from '../lib/marker-authorship.mjs';
@@ -58,6 +58,43 @@ function expectRefused(result, labels = ['review:changes']) {
 }
 
 describe('accept refuses a red-team send-back without writes', () => {
+  it('enumerates every acceptance target: accepted refuses; clear-human and restamp are explicit hardening exemptions (x6nxokb)', () => {
+    const contexts = [
+      { currentLabels: ['review:pending'] },
+      { currentLabels: ['review:human'] },
+      { currentLabels: ['review:accepted'] },
+      { currentLabels: ['review:held-mechanical'], humanCarry: { action: 'carry', human: true, reason: 'operator clearance' } },
+    ];
+    const policies = {
+      accepted: 'refused',
+      // Existing operator ceremony and carry-forward policy; broadening the guard
+      // to these targets is the explicitly deferred x6nxokb hardening work.
+      'clear-human': 'operator ceremony exemption',
+      restamp: 'existing acceptance / operator carry exemption',
+    };
+    const acceptanceTargets = REVIEW_LABEL_TARGETS.filter(to => contexts.some(context =>
+      decideSetLabel({ to, ...context, reason: 'test verdict' }).addLabel === 'review:accepted'));
+    expect(acceptanceTargets.sort()).toEqual(Object.keys(policies).sort());
+    acceptanceTargets.forEach(to => contexts.forEach(context => {
+      const base = decideSetLabel({ to, ...context, reason: 'test verdict' });
+      if (!base.allowed || base.addLabel !== 'review:accepted') return;
+      const guarded = decideSetLabel({ to, ...context, reason: 'test verdict', sentBackSameHead: true });
+      if (policies[to] === 'refused') {
+        expect(guarded).toMatchObject({ allowed: false, addLabel: '', removeLabels: [] });
+        expect(guarded.reason).toMatch(/send.back/i);
+      } else {
+        expect(guarded).toEqual(base);
+      }
+    }));
+  });
+
+  // Planned post-merge live test (the CLI runs from deployed daemon clones):
+  // create a trusted same-head sent-back record with review:changes, attempt
+  // re-accept, and observe refusal plus preserved review:changes. Then observe
+  // the real fix daemon dispatching a fix for this repo/PR/head, with a durable
+  // claim/session id and ET timestamps after the refusal. No pickup means failure.
+  it.todo('same-head re-accept preserves changes and triggers fix-daemon pickup');
+
   it('pure decision refuses from pending too, while rearm remains unaffected', () => {
     expect(decideSetLabel({ to: 'accepted', currentLabels: ['review:pending'], sentBackSameHead: true })).toMatchObject({ allowed: false, addLabel: '', removeLabels: [] });
     expect(decideSetLabel({ to: 'rearm', currentLabels: ['review:changes'], sentBackSameHead: true }).addLabel).toBe('review:pending');
@@ -119,8 +156,49 @@ describe('accept refuses a red-team send-back without writes', () => {
   });
 
   it('reads the full thread so a send-back beyond the embedded page still holds', () => {
-    const comments = Array.from({ length: PR_COMMENTS_PAGE_SIZE }, (_, i) => ({ id: i, body: 'ordinary comment' }));
-    expectRefused(accept({ comments, readComments: () => [...comments, record()] }));
+    const comments = Array.from({ length: PR_COMMENTS_PAGE_SIZE }, (_, i) => ({ author: { login: 'web-everything' }, body: `ordinary comment ${i}` }));
+    const thread = [...comments.map(c => ({ ...c, author: { login: 'web-everything[bot]' } })), record()];
+    const readGrantScope = vi.fn(() => null);
+    expectRefused(accept({ comments, readComments: () => thread, readGrantScope }));
+    expect(readGrantScope).toHaveBeenCalledWith({ repo: 'o/n', pr: { number: PR, headRefOid: HEAD, comments: thread } });
+  });
+
+  describe.each(['initial', 'fresh'])('%s embedded page completeness', stage => {
+    it.each([
+      ['author', 'web-everything[bot]'],
+      ['user', 'WEB-EVERYTHING[BoT]'],
+      ['author', 'WEB-EVERYTHING'],
+    ])('accepts a complete thread with REST %s login %s and no send-back', (field, login) => {
+      const comments = Array.from({ length: PR_COMMENTS_PAGE_SIZE }, (_, i) => ({
+        author: { login: 'web-everything' }, body: `ordinary comment ${i}`,
+      }));
+      const thread = comments.map(c => ({ body: c.body, [field]: { login } }));
+      const result = accept({ comments: stage === 'initial' ? comments : [], freshComments: comments, readComments: () => thread });
+      expect(result.exitCode).toBe(0);
+      expect(result.labels).toEqual(['review:accepted']);
+      expect(result.setLabels).toHaveBeenCalledTimes(1);
+    });
+
+    it.each(['body', 'author'])('still refuses a full-length thread with a missing %s match', mismatch => {
+      const comments = Array.from({ length: PR_COMMENTS_PAGE_SIZE }, (_, i) => ({
+        author: { login: 'web-everything' }, body: `ordinary comment ${i}`,
+      }));
+      const thread = comments.map(c => ({ ...c, author: { login: 'web-everything[bot]' } }));
+      thread[0] = mismatch === 'body' ? { ...thread[0], body: 'different comment' } : { ...thread[0], author: { login: 'mallory' } };
+      expectRefused(accept({ comments: stage === 'initial' ? comments : [], freshComments: comments, readComments: () => thread }));
+    });
+  });
+
+  it('accepts a complete normalized thread on the post-comment re-read', () => {
+    const comments = Array.from({ length: PR_COMMENTS_PAGE_SIZE }, (_, i) => ({
+      author: { login: 'web-everything' }, body: `ordinary comment ${i}`,
+    }));
+    const thread = comments.map(c => ({ body: c.body, user: { login: 'Web-Everything[bot]' } }));
+    const result = accept({ comments: [], postCommentState: { comments }, readComments: () => thread });
+    expect(result.exitCode).toBe(0);
+    expect(result.labels).toEqual(['review:accepted']);
+    expect(result.posted).toHaveLength(1);
+    expect(result.setLabels).toHaveBeenCalledTimes(1);
   });
 
   it('a superseded cap plus a grant and later send-back still refuses', () => {
@@ -162,7 +240,6 @@ describe('accept refuses a red-team send-back without writes', () => {
   it('re-reads a full fresh thread and refuses a send-back arriving past its embedded page', () => {
     const comments = Array.from({ length: PR_COMMENTS_PAGE_SIZE }, () => ({ body: 'ordinary' }));
     let reads = 0;
-  let afterPost = {};
     expectRefused(accept({ comments, readComments: () => reads++ ? [...comments, record()] : comments }));
     expect(reads).toBe(2);
   });

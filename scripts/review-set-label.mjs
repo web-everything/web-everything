@@ -107,6 +107,16 @@ import { sleepSyncMs } from './readiness/drain-lock.mjs';
 
 export const CHANGES_VERDICT_PREFIX = '🔁 review — changes requested';
 
+// GraphQL omits the bot suffix that REST includes. Normalize only the completeness
+// comparison; marker authority is still checked against the original comments.
+function sameThreadComment(left, right) {
+  const loginKey = comment => {
+    const login = comment.author?.login ?? comment.user?.login;
+    return typeof login === 'string' ? login.toLowerCase().replace(/\[bot\]$/, '') : login;
+  };
+  return left.body === right.body && loginKey(left) === loginKey(right);
+}
+
 /** Share the same verdict selection between the re-arm writer and orphan recovery. */
 export function latestChangesVerdict(comments) {
   let latest = null, latestAt = -Infinity;
@@ -1493,8 +1503,7 @@ export function runReviewLabelCli({
       if (!valid(page) || typeof head !== 'string' || !/^[0-9a-f]{40}$/i.test(head)) throw new Error('send-back evidence unreadable');
       const thread = page.length < PR_COMMENTS_PAGE_SIZE ? page : provider.readComments(repo, pr);
       if (!valid(thread) || thread.length < page.length
-        || !page.every(c => thread.some(full => full.body === c.body
-          && (full.author?.login ?? full.user?.login) === (c.author?.login ?? c.user?.login)))) {
+        || !page.every(c => thread.some(full => sameThreadComment(full, c)))) {
         throw new Error('send-back thread incomplete');
       }
       const standingRuling = readGrantScope({ repo, pr: { number: Number(pr), headRefOid: head, comments: thread } }) ?? null;
