@@ -27,6 +27,34 @@ describe('clear-human closes open confirm runs (live: #6381 #6595 #6637 #6633)',
   afterEach(() => rmSync(dir, { recursive: true, force: true }));
   const put = r => writeFileSync(join(dir, `${r.id}.json`), JSON.stringify(r));
 
+  it('ids restricts settlement to indexed runs and leaves an unlisted stuck run untouched', () => {
+    put(ledgerRun('listed'));
+    put(ledgerRun('unlisted'));
+    const calls = [];
+    const out = closeConfirmRunsAfterClearance({ repo: REPO, pr: 7, headSha: HEAD, dir,
+      ids: ['review-pr-listed'], resumeEffect: id => { calls.push(id); return true; } });
+    expect(calls).toEqual(['review-pr-listed']);
+    expect(out).toEqual({ closed: ['review-pr-listed'], failed: [] });
+  });
+
+  it('ids does not resume a pending effect other than ledgerEvents', () => {
+    put(ledgerRun('otherstep', { step: 'advisoryLabel' }));
+    const calls = [];
+    const resume = id => { calls.push(id); return true; };
+    const out = closeConfirmRunsAfterClearance({ repo: REPO, pr: 7, headSha: HEAD, dir,
+      ids: ['review-pr-otherstep'], resume, resumeEffect: resume });
+    expect(calls).toEqual([]);
+    expect(out).toEqual({ closed: [], failed: [] });
+  });
+
+  it('empty ids never falls back to scanning the run store', () => {
+    put(ledgerRun('unlisted'));
+    const calls = [];
+    expect(closeConfirmRunsAfterClearance({ repo: REPO, pr: 7, headSha: HEAD, dir, ids: [],
+      resumeEffect: id => { calls.push(id); return true; } })).toEqual({ closed: [], failed: [] });
+    expect(calls).toEqual([]);
+  });
+
   it('human accept settles the needs-human run', () => {
     put(ledgerRun('91368953'));
     const calls = [];

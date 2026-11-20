@@ -1097,6 +1097,7 @@ export function redTeamRulingHeld({ repo, pr, headSha, labels, comments, setting
  * #6381 #6595 #6637 #6633). Answer it `abstain` (writes nothing) through the operation's own resume path. A run on another
  * head, another PR, or with any other pending ask is never touched. If the abstain was already recorded but its
  * ledger-events effect was interrupted, resume without another answer, provided no other effect type is open.
+ * Optional ids restrict reads to indexed run files; omitted ids retain the full directory scan.
  * Best effort: a failure never undoes the clearance.
  */
 const defaultAbstainResume = id => {
@@ -1109,11 +1110,14 @@ const defaultEffectResume = id => {
     'review-pr', `--resume=${id}`], { encoding: 'utf8', timeout: 120_000 });
   return res.status === 0;
 };
-export function closeConfirmRunsAfterClearance({ repo, pr, headSha, dir = resolveRunsDir(), resume = defaultAbstainResume, resumeEffect = defaultEffectResume } = {}) {
+export function closeConfirmRunsAfterClearance({ repo, pr, headSha, ids, dir = resolveRunsDir(), resume = defaultAbstainResume, resumeEffect = defaultEffectResume } = {}) {
   const out = { closed: [], failed: [] };
   if (!/^[0-9a-f]{40}$/i.test(String(headSha || ''))) return out;
   let names;
-  try { names = readdirSync(dir); } catch { return out; }
+  try {
+    names = ids === undefined ? readdirSync(dir)
+      : (Array.isArray(ids) ? ids : []).filter(id => typeof id === 'string' && !/[\\/]/.test(id)).map(id => `${id}.json`);
+  } catch { return out; }
   for (const name of names) {
     if (!name.startsWith('review-pr-') || !name.endsWith('.json')) continue;
     let text;
