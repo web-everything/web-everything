@@ -1585,13 +1585,13 @@ function probeTick(f, floor, extra = {}) {
   return run.mock.calls[0][0].plan.refusals;
 }
 
-function probeFloor(source, value, present = true) {
+function probeFloor(source, value, present = true, log = vi.fn()) {
   const configuration = { redTeam: { queue: source === 'file' && present ? { maxProbesPerTick: value } : {} } };
   const store = join(operatorRoot, 'probe-overrides.json');
   // JSON stores encode non-finite numbers as null. Direct-floor tests below also exercise raw NaN/Infinity.
   writeFileSync(store, JSON.stringify(source === 'operator' && present ? { 'redTeamQueue.maxProbesPerTick': value } : {}));
   return loadRedTeamQueueFloor({ env: operatorEnv(store), file: 'probe-settings.json',
-    readFile: () => JSON.stringify(configuration), log: vi.fn() });
+    readFile: () => JSON.stringify(configuration), log });
 }
 
 describe('probe cap resolution through queue admission', () => {
@@ -1599,10 +1599,10 @@ describe('probe cap resolution through queue admission', () => {
     ['settings-only nondefault', 9, undefined, 9],
     ['lower operator overrides higher settings', 9, 3, 3],
     ['higher operator overrides lower settings', 3, 9, 9],
-    ['oversized settings clamps at hard ceiling', 500, undefined, 50],
+    ['oversized settings fails closed to zero', 500, undefined, 0],
     ['operator at hard ceiling overrides settings', 3, 50, 50],
     ['oversized operator fails closed to zero', 9, 500, 0],
-    ['invalid settings uses finite default', '9', undefined, 6],
+    ['invalid settings fails closed to zero', '9', undefined, 0],
     ['invalid operator fails closed to zero despite otherwise valid settings', 9, '3', 0],
   ])('%s determines the actual bounded probe count', (_name, fileCap, operatorCap, expected) => {
     const store = join(operatorRoot, 'probe-cap-precedence.json');
@@ -1614,7 +1614,7 @@ describe('probe cap resolution through queue admission', () => {
   });
 
   it.each([
-    ['settings', 'falls back to six actual probes', 6],
+    ['settings', 'fails closed to zero actual probes', 0],
     ['operator', 'fails closed to zero actual probes', 0],
   ])('unreadable %s %s', (source, _behavior, expected) => {
     const store = join(operatorRoot, 'probe-cap-unreadable.json');
@@ -1656,7 +1656,7 @@ describe('probe cap setting', () => {
   });
 
   it.each([
-    ['file', 'clamps at the hard ceiling 50', 50],
+    ['file', 'fails closed to zero', 0],
     ['operator', 'fails closed to zero', 0],
   ])('%s setting 500 %s', (source, _behavior, expected) => {
     const floor = probeFloor(source, 500);
@@ -1678,16 +1678,75 @@ describe('probe cap setting', () => {
   });
 });
 
+describe('settings probe cap availability', () => {
+  it.each([
+    ['missing redTeam', {}],
+    ['missing queue', { redTeam: {} }],
+    ['missing key', { redTeam: { queue: {} } }],
+  ])('%s defaults to six probes and logs the default source', (_name, configuration) => {
+    const log = vi.fn();
+    const floor = loadRedTeamQueueFloor({ env: {}, file: 'probe-settings.json',
+      readFile: () => JSON.stringify(configuration), log });
+    expect(floor.maxProbesPerTick).toBe(6);
+    expect(probeTick(savedProbeQueue(), floor)).toHaveLength(6);
+    expect(log.mock.calls.flat().join(' ')).toContain('source: default');
+  });
+
+  it.each([
+    ['ENOENT', () => { throw Object.assign(new Error('missing'), { code: 'ENOENT' }); }],
+    ['EACCES', () => { throw Object.assign(new Error('denied'), { code: 'EACCES' }); }],
+    ['read throws', () => { throw new Error('read failed'); }],
+    ['unparseable', () => '{'],
+  ])('%s settings disables probes and logs settings unreadable loudly', (_name, readFile) => {
+    const log = vi.fn();
+    const floor = loadRedTeamQueueFloor({ env: {}, file: 'probe-settings.json', readFile, log });
+    expect(floor.maxProbesPerTick).toBe(0);
+    expect(probeTick(savedProbeQueue(), floor)).toHaveLength(0);
+    const messages = log.mock.calls.flat().join(' ');
+    expect(messages).toContain('probes OFF');
+    expect(messages).toContain('settings unreadable');
+  });
+
+  it.each([0, 9, 50])('valid operator cap %i overrides unreadable settings', cap => {
+    const store = join(operatorRoot, 'probe-settings-unreadable.json');
+    writeFileSync(store, JSON.stringify({ 'redTeamQueue.maxProbesPerTick': cap }));
+    const log = vi.fn();
+    const floor = loadRedTeamQueueFloor({ env: operatorEnv(store), file: 'probe-settings.json',
+      readFile: () => { throw new Error('read failed'); }, log });
+    expect(floor.maxProbesPerTick).toBe(cap);
+    expect(probeTick(savedProbeQueue({ count: 60 }), floor)).toHaveLength(cap);
+    expect(log.mock.calls.flat().join(' ')).toContain('source: operator-db');
+  });
+
+  it.each([1, 6, 50])('valid settings cap %i supplies that many probes', cap => {
+    const log = vi.fn();
+    const floor = probeFloor('file', cap, true, log);
+    expect(floor.maxProbesPerTick).toBe(cap);
+    expect(probeTick(savedProbeQueue({ count: 60 }), floor)).toHaveLength(cap);
+    expect(log.mock.calls.flat().join(' ')).toContain('source: scripts/settings/red-team-queue.json');
+  });
+
+  it('direct floor oversized cap still clamps at 50 and absent cap still defaults to six', () => {
+    expect(probeTick(savedProbeQueue({ count: 60 }), { maxProbesPerTick: 500 })).toHaveLength(50);
+    expect(probeTick(savedProbeQueue(), {})).toHaveLength(6);
+  });
+});
+
 describe('invalid probe cap', () => {
   const invalid = [-1, 2.5, '7', NaN, Infinity, null, true];
+  const invalidSettings = [...invalid, 500];
   describe.each([
-    ['file', 'falls back to exactly six finite probes', 6],
+    ['file', 'fails closed to zero probes', 0],
     ['operator', 'fails closed to zero probes', 0],
   ])('%s setting', (source, behavior, expected) => {
-    it.each(invalid)(`%s ${behavior}`, value => {
-      const floor = probeFloor(source, value);
+    it.each(invalidSettings)(`%s ${behavior} and logs loudly`, value => {
+      const log = vi.fn();
+      const floor = probeFloor(source, value, true, log);
       expect(probeTick(savedProbeQueue(), floor)).toHaveLength(expected);
       expect(floor.maxProbesPerTick).toBe(expected);
+      const messages = log.mock.calls.flat().join(' ');
+      expect(messages).toContain('probes OFF');
+      expect(messages).toMatch(/invalid/i);
     });
   });
   it.each(invalid)('raw floor value %s also falls back to six probes', value => {

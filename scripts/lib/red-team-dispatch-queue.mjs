@@ -98,8 +98,9 @@ export function loadRedTeamQueueFloor({ env = process.env,
   file = join(dirname(fileURLToPath(import.meta.url)), '..', 'settings', 'red-team-queue.json'), readFile = readFileSync,
   log = () => {} } = {}) {
   let settings;
+  let settingsUnreadable = false;
   try { settings = JSON.parse(readFile(file, 'utf8'))?.redTeam?.queue; }
-  catch { /* Unavailable settings never create extra capacity. */ }
+  catch { settingsUnreadable = true; }
   const minimumEnv = env.WE_RED_TEAM_QUEUE_MIN_CONCURRENT;
   const idleEnv = env.WE_RED_TEAM_QUEUE_MIN_CONCURRENT_IDLE_PCT;
   const reviewStartsEnv = env.WE_RED_TEAM_QUEUE_REVIEW_STARTS_WHILE_IDLE;
@@ -117,8 +118,26 @@ export function loadRedTeamQueueFloor({ env = process.env,
   const validIdle = value => Number.isInteger(value) && value >= 0 && value <= 100;
   // An invalid override never replaces a valid file threshold with a looser one: it is ignored.
   const idle = idleEnv !== undefined && validIdle(parseEnv(idleEnv)) ? parseEnv(idleEnv) : settings?.minConcurrentIdlePct;
-  const maxProbesPerTick = probeCap(operator?.maxProbesPerTick ?? settings?.maxProbesPerTick);
-  note(log, `maxProbesPerTick=${maxProbesPerTick} (source: ${operator?.maxProbesPerTick !== undefined ? 'operator-db' : 'scripts/settings/red-team-queue.json; invalid/missing defaults to 6'}; hard ceiling 50)`);
+  let maxProbesPerTick;
+  let probeSource;
+  if (operator?.maxProbesPerTick !== undefined) {
+    maxProbesPerTick = operator.maxProbesPerTick;
+    probeSource = 'operator-db';
+  } else if (settingsUnreadable) {
+    maxProbesPerTick = 0;
+    probeSource = 'scripts/settings/red-team-queue.json; settings unreadable; fail closed, probes OFF';
+  } else if (!Object.hasOwn(settings ?? {}, 'maxProbesPerTick')) {
+    maxProbesPerTick = DEFAULT_MAX_PROBES;
+    probeSource = 'default; settings key absent';
+  } else if (!Number.isInteger(settings.maxProbesPerTick)
+    || settings.maxProbesPerTick < 0 || settings.maxProbesPerTick > MAX_PROBES_CEILING) {
+    maxProbesPerTick = 0;
+    probeSource = 'scripts/settings/red-team-queue.json; invalid maxProbesPerTick; fail closed, probes OFF';
+  } else {
+    maxProbesPerTick = settings.maxProbesPerTick;
+    probeSource = 'scripts/settings/red-team-queue.json';
+  }
+  note(log, `maxProbesPerTick=${maxProbesPerTick} (source: ${probeSource}; hard ceiling 50)`);
   const floor = {
     maxProbesPerTick,
     // A missing threshold means the default 10; a present but invalid one disables the floor (never a looser guess).
