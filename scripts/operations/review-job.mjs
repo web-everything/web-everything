@@ -424,15 +424,20 @@ export function createReviewJobIo({ root = REPO_ROOT, env = process.env, dir = r
     const record = latestAcceptRecord(comments, reviews, { sha: head });
     if (record) {
       const clearedAt = Date.parse(record.at);
-      const editedEarlierComment = comments.slice(0, record.index).some(comment => {
+      const editedComment = comments.slice(0, record.index + 1).some((comment, index) => {
         const updatedAt = Date.parse(comment.updatedAt ?? comment.updated_at);
-        return !Number.isFinite(updatedAt) || !Number.isFinite(clearedAt) || updatedAt >= clearedAt;
+        return !Number.isFinite(updatedAt) || !Number.isFinite(clearedAt)
+          || (index === record.index ? updatedAt !== clearedAt : updatedAt >= clearedAt);
       });
-      if (record.laterBodyDerivedHold || record.laterVerdict || editedEarlierComment) {
+      if (record.laterBodyDerivedHold || record.laterVerdict || editedComment) {
         throw Error('clearance superseded or comments edited; hold and inspect thread before fresh clearance');
       }
     }
-    return record?.humanCleared === true && !record.laterBodyDerivedHold && !record.laterVerdict
+    // Recovery accepts only an entire marker-only clearance, never markers quoted inside contrary prose.
+    // Other comment shapes retain the hold and require a fresh explicit clearance before recovery.
+    const clearanceBody = /^<!-- reviewed-sha: [0-9a-f]{40} -->\s*(?:<!-- reviewed-diff: [0-9a-f]{64} -->\s*)?(?:<!-- reviewed-contribution: [0-9a-f]{64} -->\s*)?<!-- cleared-human: [^<>\r\n]+ -->\s*(?![\s\S])/;
+    return record?.humanCleared === true && !!record.actor?.trim() && clearanceBody.test(comments[record.index].body)
+      && !record.laterBodyDerivedHold && !record.laterVerdict
       && !record.reviewsUnreadable && Number.isFinite(Date.parse(record.at))
       ? { sha: record.sha, at: record.at } : null;
   },

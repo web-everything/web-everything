@@ -5533,3 +5533,22 @@ Park opens ready for review; draft-promotion still handles older drafts.
 Check mode fetches origin main before evaluating canonical audit evidence. A failed fetch reports
 `main not refreshed: <reason>` and refuses even when local evidence would pass against stale refs.
 `open-pr-audit-gate.test.mjs` covers both refresh outcomes, aggregation and an unconfirmed check child.
+
+## Advisory recovery clearance (round-2 audit)
+
+`drain-red-team-evidence.test.mjs` and `review-job-red-team-only.test.mjs` pin recovery's
+fail-closed boundaries: a completed accept cannot release a newer advisory run; refused
+outcomes/effects always hold. Clearance compares active record identity before and after
+the payload read (including same-mtime replacement). Quarantine recovery requires no pending
+step and every effect applied; any same-PR record with an unknown or different head holds
+for operator inspection. Finish recording or inspect the conflicting evidence before retrying.
+
+Recovery's clearance reader deliberately accepts only a complete marker-only comment with a
+nonempty actor, an exact reviewed SHA and optional diff/contribution markers. Quoted markers
+and prose retain the hold; this narrower recovery authority does not change the shared carry
+parser. The clearance comment itself must have readable edit metadata equal to its creation
+time; earlier comments must have readable edit times strictly before clearance. Missing,
+invalid or changed metadata requires thread inspection and fresh clearance. Keep the negative
+fixtures failing against the pre-fix implementation before changing these boundaries.
+Liveness-only `review-recovery-witness.test.mjs` fixtures inject explicit absent clearance;
+thread authority stays covered by the production-reader cases in `review-job-red-team-only.test.mjs`.

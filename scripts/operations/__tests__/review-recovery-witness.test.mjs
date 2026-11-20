@@ -68,7 +68,8 @@ function fixture({ status = 'running', foreign = false, seats = [], ageMs } = {}
   const readWitness = () => evidence.readRecoveryWitness({ ...key, runsDir: env.WE_SHARED_RUNS_DIR, readScorecards: () => seats });
   const decide = () => recovery.planRedTeamRecovery(readWitness(), { now: Date.now(), probe, deadlineMs: 1000 });
   const abandon = () => recovery.abandonStaleRedTeamRun(key, { readWitness, probe, deadlineMs: 1000 });
-  const io = createReviewJobIo({ env, root: dir, readWitness, recoveryProbe: probe });
+  // Liveness fixtures supply explicit absent clearance; thread authority is tested in review-job-red-team-only.
+  const io = createReviewJobIo({ readHeadClearance: () => null, env, root: dir, readWitness, recoveryProbe: probe });
   const admit = () => io.redTeamStatus({ repo, pr, loopPayload: readWitness().newest, status: 'queued', redTeamMode: seats.some(seat => seat.status === 'ok') ? 'resume' : 'fresh' });
   return { dir, env, key, path, run, seats, probe, readWitness, decide, abandon, io, admit };
 }
@@ -131,7 +132,7 @@ describe('recovery probe process state', () => {
     else if (reason === 'start-mismatch') Object.assign(f.probe, { isAlive: () => true, readPidStart: () => 'different-start' });
     else f.probe.isAlive = () => { throw Error('owner unprobeable'); };
     const log = vi.fn();
-    const io = createReviewJobIo({ env: f.env, root: f.dir, readWitness: f.readWitness, recoveryProbe: f.probe, log });
+    const io = createReviewJobIo({ readHeadClearance: () => null, env: f.env, root: f.dir, readWitness: f.readWitness, recoveryProbe: f.probe, log });
     // Admission still requires the existing abandonment guard to be satisfied first.
     expect(() => io.redTeamStatus({ repo, pr, loopPayload: f.readWitness().newest, status: 'queued', redTeamMode: 'fresh' }))
       .toThrow('recovery evidence changed');
@@ -204,7 +205,7 @@ it('default recovery witness reads the writer run store when OPERATION_RUNS_DIR 
     expect(recovery.planRedTeamRecovery(readWitness(), { probe: f.probe, deadlineMs: 1000 }))
       .toMatchObject({ mode: 'fresh', abandon: true });
     expect(recovery.abandonStaleRedTeamRun(f.key, { readWitness, probe: f.probe, deadlineMs: 1000 }).ok).toBe(true);
-    const io = createReviewJobIo({ env: f.env, root: f.dir, readWitness, recoveryProbe: f.probe });
+    const io = createReviewJobIo({ readHeadClearance: () => null, env: f.env, root: f.dir, readWitness, recoveryProbe: f.probe });
     expect(io.redTeamStatus({ repo, pr, loopPayload: readWitness().newest, status: 'queued', redTeamMode: 'fresh' }))
       .toHaveProperty('redTeamAdmission.queued.status', 'queued');
     expect(evidence.readRecoveryWitness({ ...f.key, runsDir: f.env.WE_SHARED_RUNS_DIR, readScorecards: () => [] }).newest).toBeNull();
@@ -346,7 +347,7 @@ it.each([false, true])('C: production payload preserves carry conflict unless an
     run.findings.read.netBasis.rev = 'c'.repeat(40);
     writeFileSync(f.run, JSON.stringify(run));
   }
-  const io = createReviewJobIo({ env: f.env, root: f.dir, readSeatRecords: () => [] });
+  const io = createReviewJobIo({ readHeadClearance: () => null, env: f.env, root: f.dir, readSeatRecords: () => [] });
   const stored = io.readRedTeamOnlyPayload({ repo, pr, head });
   if (exact) {
     expect(stored.carryConflict).toBeUndefined();

@@ -258,23 +258,23 @@ const unfinishedSince = run => {
 const hasOpenEffect = run => run.outcome === 'refused'
   || run.effects?.some(effect => ['pending', 'in-flight', 'refused'].includes(effect?.status));
 const unfinishedReview = run => !run.verdict || run.pending != null || hasOpenEffect(run);
-// Advisory bookkeeping can be parked behind a completed same-head accept. Refusals still need clearance.
-const advisoryParkedReview = (run, head, allowRefused = false) => {
+// Only explicit head clearance can park advisory bookkeeping. Refusals always hold.
+const advisoryParkedReview = (run, head) => {
   if (run.findings?.read?.netBasis?.rev !== head
     || !['accept', 'prevention-outstanding', 'needs-human'].includes(verdictOf(run))
     || (verdictOf(run) === 'needs-human' && !redTeamOwedFor(run))
     || !Array.isArray(run.effects)) return false;
-  if (run.outcome === 'refused' && (!allowRefused || !run.effects.some(effect => effect?.status === 'refused'))) return false;
+  if (run.outcome === 'refused') return false;
   if (run.pending != null && !(run.pending.kind === 'effect' && run.pending.step === 'advise')) return false;
   return run.effects.every(effect => effect?.status === 'applied'
-    || ((['declared', 'pending', 'in-flight', 'failed'].includes(effect?.status) || (allowRefused && effect?.status === 'refused'))
+    || (['declared', 'pending', 'in-flight', 'failed'].includes(effect?.status)
       && typeof effect.type === 'string'
       && ['review.advisory-note', 'review.advisory-label', 'review.scoped-rereview-shadow'].includes(effect.type)));
 };
 const clearedParkedReview = (run, head, at, clearance) => {
   const clearedAt = typeof clearance?.at === 'number' ? clearance.at : Date.parse(clearance?.at);
   return clearance?.sha === head && Number.isFinite(clearedAt) && Number.isFinite(at) && at + RUN_MTIME_SLACK_MS < clearedAt
-    && advisoryParkedReview(run, head, true);
+    && advisoryParkedReview(run, head);
 };
 // An unfinished run that already ACCEPTED a readable sha other than the live head only waits on bookkeeping effects
 // for a superseded head: it cannot hold the live head. A run still deciding or rejecting (it may send the PR back),
@@ -420,7 +420,7 @@ const withSettleBounds = (failure, bounds) => Object.defineProperty(failure, 'se
 // unread record was written at least the mtime slack before that time and the newest run reviewed `newestHead`
 // (a carried head's source). Anything else holds as `scan-capped`.
 // One scan serves both tie orders, so a caller's fallback shares this scan's parse budget.
-function reviewRunLookup({ repo, pr, head, runsDir, list, read, stat, tieBreak = 'id-asc', scanSettings, warn, now = Date.now(), clearance, allowCompletedAccept = false }) {
+function reviewRunLookup({ repo, pr, head, runsDir, list, read, stat, tieBreak = 'id-asc', scanSettings, warn, now = Date.now(), clearance }) {
   if (!TIE_ORDERS.includes(tieBreak)) throw new TypeError('unknown run tieBreak');
   // A run with a read start outranks a start-less one; start-less runs are ordered by the checks below.
   const newerBy = order => (candidate, selected) => {
@@ -443,10 +443,8 @@ function reviewRunLookup({ repo, pr, head, runsDir, list, read, stat, tieBreak =
   const indexReadErrors = new Map();
   const indexReads = new Map(); // bounded by the shared payload budget
   const indexIdentities = new Map();
-  const currentIdentity = (id, metadataReader = stat) => {
-    const metadata = metadataReader(join(runsDir, `${id}.json`));
-    return JSON.stringify([metadata.mtimeMs, metadata.dev, metadata.ino, metadata.size, metadata.ctimeMs, metadata.birthtimeMs]);
-  };
+  const metadataIdentity = metadata => JSON.stringify([metadata.mtimeMs, metadata.dev, metadata.ino, metadata.size, metadata.ctimeMs, metadata.birthtimeMs]);
+  const currentIdentity = id => metadataIdentity(stat(join(runsDir, `${id}.json`)));
   const discardChangedRead = (id, identity) => {
     if (indexIdentities.get(id) !== identity) {
       indexReads.delete(id);
@@ -461,8 +459,6 @@ function reviewRunLookup({ repo, pr, head, runsDir, list, read, stat, tieBreak =
   let hardHold = false;
   const runScan = (indexedIds, allCandidates = false) => {
     const slots = Object.fromEntries(TIE_ORDERS.map(order => [order, { newer: newerBy(order), newest: null, exact: null, unfinished: null, unfinishedExact: null, since: -Infinity, active: -Infinity, undecided: true }]));
-    const parked = [];
-    let completedAccept = false;
     const recordUnfinished = hit => {
       const { run, at } = hit;
       for (const slot of Object.values(slots)) {
@@ -475,7 +471,7 @@ function reviewRunLookup({ repo, pr, head, runsDir, list, read, stat, tieBreak =
       }
     };
     const startless = []; // ids and mtimes only, never payloads
-    const mtimes = new Map();
+    const mtimes = new Map(), identities = new Map();
     let count = 0, newestSettled = false, boundary = -Infinity;
     // The read window is fixed in one order (equal mtimes by ascending id) for every caller: the tie
     // order only ranks matches in the slots. Otherwise equal mtimes straddling the cap would put
@@ -485,6 +481,7 @@ function reviewRunLookup({ repo, pr, head, runsDir, list, read, stat, tieBreak =
         // Metadata orders the same liveness bounds as the ordinary scan.
         const metadata = stat(join(runsDir, `${id}.json`));
         mtimes.set(id, metadata.mtimeMs);
+        identities.set(id, metadataIdentity(metadata));
         return metadata;
       }, read: id => {
         const identity = indexedIds || indexReads.has(id) ? currentIdentity(id) : undefined;
@@ -535,28 +532,21 @@ function reviewRunLookup({ repo, pr, head, runsDir, list, read, stat, tieBreak =
             if (run.findings?.read?.netBasis?.rev === head && slot.newer(hit, slot.exact)) slot.exact = hit;
 
           }
-          if (allowCompletedAccept && run.findings?.read?.netBasis?.rev === head
-            && ['accept', 'prevention-outstanding'].includes(verdictOf(run)) && run.pending == null
-            && run.outcome !== 'refused' && Array.isArray(run.effects)
-            && run.effects.every(effect => effect?.status === 'applied')
-            && run.effects.some(effect => effect.type === 'review.label-swap' && effect.status === 'applied')) completedAccept = true;
-          if (unfinishedReview(run) && !supersededUnfinished(run, head) && !clearedParkedReview(run, head, at, clearance)) {
-            if (allowCompletedAccept && advisoryParkedReview(run, head)) parked.push(hit);
-            else recordUnfinished(hit);
-          }
+          // Re-stat after reading: an old mtime must never clear a concurrently replaced record.
+          const cleared = clearedParkedReview(run, head, at, clearance)
+            && currentIdentity(id) === identities.get(id);
+          if (unfinishedReview(run) && !supersededUnfinished(run, head) && !cleared) recordUnfinished(hit);
         }
       }
       // Equal starts share one start time, so either tie order gives the same bound.
       const { exact, newest } = slots[tieBreak];
       boundary = nextAt;
       if (newest !== null && reviewStartedAt(newest) > nextAt + RUN_MTIME_SLACK_MS) newestSettled = true;
-      return (!indexedIds || allCandidates) && exact !== null && reviewStartedAt(exact) > nextAt + RUN_MTIME_SLACK_MS
-        && (parked.length === 0 || completedAccept);
+      return (!indexedIds || allCandidates) && exact !== null && reviewStartedAt(exact) > nextAt + RUN_MTIME_SLACK_MS;
     }); } catch (error) {
       if (error !== budgetExhausted) throw error;
       end = RUN_SCAN_CAPPED;
     }
-    if (!completedAccept) parked.forEach(recordUnfinished);
     scan = { slots, startless, count, end, newestSettled, boundary };
   };
   const failureFor = (order, exactHead, writtenAfter, newestHead) => {
@@ -664,15 +654,8 @@ function reviewRunLookup({ repo, pr, head, runsDir, list, read, stat, tieBreak =
 }
 
 /** Raw, head-scoped evidence only. Never select an older accepting verdict over a newer rejection. */
-const supersededRecordEffects = run => {
-  if (run.outcome === 'refused' || !Array.isArray(run.effects)) return false;
-  if (run.pending != null && !(run.pending.kind === 'effect' && run.pending.step === 'record')) return false;
-  const recordIndex = run.pending?.stepIndex ?? run.stepTimings?.find(row => row.step === 'record')?.stepIndex;
-  const allowed = { 'review.label-swap': ['failed', 'pending', 'declared'],
-    'verdict-ledger.append': ['declared', 'pending'], 'review.notice': ['declared', 'pending'] };
-  return run.effects.every(effect => effect?.status === 'applied'
-    || (Number.isInteger(recordIndex) && effect?.stepIndex === recordIndex && allowed[effect.type]?.includes(effect.status)));
-};
+const completedRecordEffects = run => run.outcome !== 'refused' && run.pending == null
+  && Array.isArray(run.effects) && run.effects.every(effect => effect?.status === 'applied');
 
 function clearedQuarantinedReview({ repo, pr, head, clearance, runsDir, scanSettings, warn,
   dir = join(dirname(runsDir), 'runs-quarantine'), list = listRunIds, read = readRun, stat = statSync }) {
@@ -695,9 +678,10 @@ function clearedQuarantinedReview({ repo, pr, head, clearance, runsDir, scanSett
       const match = NAME_RE.exec(id);
       if (run.id !== id || (match && (run.op !== 'review-pr' || Number(run.input?.pr) !== Number(match[1])))) throw Error('filename and payload disagree');
     } catch (cause) { throw Error('quarantined review identity unreadable; hold and inspect quarantine evidence', { cause }); }
-    if (run.op !== 'review-pr' || run.input?.repo !== repo || Number(run.input?.pr) !== Number(pr)
-      || run.findings?.read?.netBasis?.rev !== head) return false;
-    if (!(at + RUN_MTIME_SLACK_MS < clearedAt) || run.carriedFrom != null || !supersededRecordEffects(run)
+    if (run.op !== 'review-pr' || run.input?.repo !== repo || Number(run.input?.pr) !== Number(pr)) return false;
+    // Same-PR evidence on an unknown or different head needs operator inspection, never silent exclusion.
+    if (run.findings?.read?.netBasis?.rev !== head) { conflict = true; return false; }
+    if (!(at + RUN_MTIME_SLACK_MS < clearedAt) || run.carriedFrom != null || !completedRecordEffects(run)
       || (!['accept', 'prevention-outstanding'].includes(verdictOf(run)) && !redTeamOwedFor(run))) conflict = true;
     // Two different panels cannot stand in for one another without an operator choosing the evidence.
     if (selected && JSON.stringify([selected.run.verdict, selected.run.findings]) !== JSON.stringify([run.verdict, run.findings])) conflict = true;
@@ -726,7 +710,7 @@ export function readRecoveryWitness({ repo, pr, head, env = process.env, runsDir
   const records = readScorecards();
   const seats = records.filter(r => r.dispatchKind === 'review-seat' && r.seat === 'red-team'
     && r.repo === repo && Number(r.pr) === Number(pr) && r.rev === head);
-  const lookup = reviewRunLookup({ repo, pr, head, runsDir, list, read, stat, tieBreak: 'id-desc', scanSettings, warn, now, clearance, allowCompletedAccept: true });
+  const lookup = reviewRunLookup({ repo, pr, head, runsDir, list, read, stat, tieBreak: 'id-desc', scanSettings, warn, now, clearance });
   // Preserve the existing policy-only carry surface; it never supplies a stale recovery payload.
   // The fallback reuses this scan (one parse budget and the same read window) but ranks equal
   // starts in the drain's ascending id order.

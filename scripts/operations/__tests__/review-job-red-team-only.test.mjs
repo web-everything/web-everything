@@ -310,7 +310,7 @@ describe('red-team-only head clearance', () => {
         const io = fakeIo({ readRedTeamOnlyPayload: production.readRedTeamOnlyPayload, redTeamStatus: production.redTeamStatus });
         const result = runReviewJob({ repo, pr, redTeamOnly: true }, io);
         expect(readHeadClearance).toHaveBeenCalledWith({ repo, pr, head });
-        if (['cleared', 'refused-advisory'].includes(kind)) {
+        if (kind === 'cleared') {
           expect(redTeamOwedFor(parked)).toBe(true);
           expect(result.outcome).toBe('red-team-only');
           expect(io.runRedTeam).toHaveBeenCalled();
@@ -321,12 +321,19 @@ describe('red-team-only head clearance', () => {
       } finally { rmSync(dir, { recursive: true, force: true }); }
     });
 
-  it.each(['clear', 'untrusted', 'other-head', 'later-comment', 'later-hold', 'later-review', 'reviews-error', 'oversized-reviews'])(
+  it.each(['clear', 'quoted-clearance', 'contrary-prefix', 'contrary-suffix', 'empty-actor', 'blank-actor', 'edited-clearance', 'missing-edit-time', 'invalid-edit-time', 'untrusted', 'other-head', 'later-comment', 'later-hold', 'later-review', 'reviews-error', 'oversized-reviews'])(
     'default reader requires trusted complete clearance evidence: %s', kind => {
       const at = new Date(20_000).toISOString();
       const sha = kind === 'other-head' ? 'b'.repeat(40) : head;
-      const body = `<!-- reviewed-sha: ${sha} --><!-- cleared-human: operator -->`;
-      const comments = [`${body}\t${at}\t${kind === 'untrusted' ? 'stranger' : 'web-everything'}\tIC_clear\t\t${at}`];
+      const marker = `<!-- reviewed-sha: ${sha} --><!-- cleared-human: operator -->`;
+      const body = kind === 'quoted-clearance' ? `Do not proceed; human approval is still required.\n> ${marker}`
+        : kind === 'contrary-prefix' ? `Do not proceed; human approval is still required.\n${marker}`
+        : kind === 'contrary-suffix' ? `${marker}\nDo not proceed; human approval is still required.`
+        : kind === 'empty-actor' ? marker.replace('operator', '')
+        : kind === 'blank-actor' ? marker.replace('operator', '   ') : marker;
+      const updatedAt = kind === 'edited-clearance' ? new Date(30_000).toISOString()
+        : kind === 'missing-edit-time' ? '' : kind === 'invalid-edit-time' ? 'invalid' : at;
+      const comments = [`${body.replaceAll('\n', '\\n')}\t${at}\t${kind === 'untrusted' ? 'stranger' : 'web-everything'}\tIC_clear\t\t${updatedAt}`];
       if (kind === 'later-comment') comments.push(`Please hold\t${at}\tstranger\tIC_later\t\t${at}`);
       if (kind === 'later-hold') comments.push(`manifest baseline mismatch\t${at}\tweb-everything\tIC_later\t\t${at}`);
       const exec = vi.fn((_file, args) => {
@@ -340,7 +347,7 @@ describe('red-team-only head clearance', () => {
       });
       const readWitness = vi.fn(() => ({ newest: payload() }));
       const read = () => productionJobIo({ exec, readWitness }).readRedTeamOnlyPayload({ repo, pr, head });
-      if (['later-comment', 'later-hold', 'later-review', 'reviews-error', 'oversized-reviews'].includes(kind)) {
+      if (['edited-clearance', 'missing-edit-time', 'invalid-edit-time', 'later-comment', 'later-hold', 'later-review', 'reviews-error', 'oversized-reviews'].includes(kind)) {
         expect(read).toThrow(/clearance.*inspect/);
         expect(readWitness).not.toHaveBeenCalled();
         return;
@@ -354,7 +361,7 @@ describe('red-team-only head clearance', () => {
 
 describe('red-team-only completed accept with later advisory run', () => {
   it.each(['accept', 'alone', 'other-head', 'label', 'empty-effects', 'no-applied-label'])(
-    'admits only advisory bookkeeping backed by a completed same-head accept: %s', kind => {
+    'holds later advisory bookkeeping despite a completed accept: %s', kind => {
       const dir = mkdtempSync(join(tmpdir(), 'red-team-completed-accept-'));
       const env = { WE_SHARED_RUNS_DIR: dir };
       try {
@@ -375,19 +382,14 @@ describe('red-team-only completed accept with later advisory run', () => {
             stat: path => ({ mtimeMs: path.includes('completed') ? 12_000 : 20_000 }) }) });
         const io = fakeIo({ readRedTeamOnlyPayload: production.readRedTeamOnlyPayload, redTeamStatus: production.redTeamStatus });
         const result = runReviewJob({ repo, pr, redTeamOnly: true }, io);
-        if (kind === 'accept') {
-          expect(result.outcome).toBe('red-team-only');
-          expect(io.runRedTeam.mock.calls[0][0].loopPayload).toEqual(parked);
-        } else {
-          expect(result).toMatchObject({ outcome: 'blocked-on-infra', label: expect.stringContaining('review-unfinished') });
-          expect(io.runRedTeam).not.toHaveBeenCalled();
-        }
+        expect(result).toMatchObject({ outcome: 'blocked-on-infra', label: expect.stringContaining('review-unfinished') });
+        expect(io.runRedTeam).not.toHaveBeenCalled();
       } finally { rmSync(dir, { recursive: true, force: true }); }
     });
 });
 
 describe('red-team-only quarantined head review', () => {
-  it.each(['accept', 'no-clearance', 'other-head', 'late', 'changes', 'other-pr', 'read-error', 'refused-outcome', 'refused-label', 'other-step', 'other-effect'])(
+  it.each(['accept', 'unfinished-record', 'no-clearance', 'other-head', 'late', 'changes', 'other-pr', 'read-error', 'refused-outcome', 'refused-label', 'other-step', 'other-effect'])(
     'uses only cleared exact-head quarantine evidence through production admission: %s', kind => {
       const dir = mkdtempSync(join(tmpdir(), 'red-team-quarantine-'));
       const env = { WE_SHARED_RUNS_DIR: join(dir, 'runs') };
@@ -400,6 +402,10 @@ describe('red-team-only quarantined head review', () => {
             { key: 'ledger', type: 'verdict-ledger.append', stepIndex: 3, index: 1, status: 'declared' },
             { key: 'notice', type: 'review.notice', stepIndex: 3, index: 2, status: 'declared' },
           ] };
+        if (kind === 'accept') {
+          loopPayload.pending = null;
+          loopPayload.effects.forEach(effect => { effect.status = 'applied'; });
+        }
         if (kind === 'refused-outcome') loopPayload.outcome = 'refused';
         if (kind === 'refused-label') Object.assign(loopPayload.effects[0], {
           status: 'refused', attempts: 1, error: 'SELF-CLEAR REFUSED — nothing was changed (#2844)',
@@ -423,7 +429,7 @@ describe('red-team-only quarantined head review', () => {
           expect(io.runRedTeam.mock.calls[0][0].loopPayload).toEqual(loopPayload);
         } else {
           expect(io.runRedTeam).not.toHaveBeenCalled();
-          if (['late', 'changes', 'read-error', 'refused-outcome', 'refused-label', 'other-step', 'other-effect'].includes(kind))
+          if (['unfinished-record', 'other-head', 'late', 'changes', 'read-error', 'refused-outcome', 'refused-label', 'other-step', 'other-effect'].includes(kind))
             expect(result).toMatchObject({ outcome: 'blocked-on-infra', label: expect.stringContaining('quarantin') });
           else expect(result).toMatchObject({ outcome: 'red-team-not-owed', reason: 'stored review does not match live head' });
         }
