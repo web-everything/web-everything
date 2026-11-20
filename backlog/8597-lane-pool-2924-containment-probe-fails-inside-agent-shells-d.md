@@ -1,16 +1,17 @@
 ---
+bornAs: x9eyphi
 kind: task
 status: active
 scaffoldedBy: "fix-cap-raise"
 dateScaffolded: "2026-11-20"
-scope: ["we:scripts/lib/ci-heal-reserve.mjs"]
+scope: ["we:scripts/lane-pool.mjs"]
 dateOpened: "2026-11-20"
 tags: []
 ---
 
-# Fail-open guard code in ci-heal reserve, dispatch throttle, resource gate and claim readers
+# lane-pool #2924 containment probe fails inside agent shells despite a clean lane
 
-Seven pre-existing fail-open items found by the R1103 audits: we:scripts/lib/ci-heal-reserve.mjs:45 claim-read errors count as zero holders; we:scripts/conveyor/fix-claim-store.mjs:92 returns empty on directory errors; we:scripts/lib/ci-heal-reserve.mjs:53 and we:scripts/lib/dispatch-throttle.mjs:197 gate exceptions admit; we:scripts/lib/dispatch-throttle.mjs:113 and we:scripts/lib/resource-policy.mjs:89 unavailable host or CPU readings admit; we:scripts/lib/dispatch-throttle.mjs:192 and we:scripts/lib/resource-gate.mjs:400 claim-read failure means zero live sessions; we:scripts/conveyor/tick-core.mjs:2241 load gate defaults to open after probe failure; we:scripts/lib/ci-heal-reserve.mjs:40 dedup ignores repo and we:scripts/lib/ci-heal-reserve.mjs:30 occupancy cache is not atomic; also we:scripts/lib/policy-cascade.mjs:83 swallows platform-preference read and parse errors (a restrictive platform limit can be silently lost) and we:scripts/lib/policy-cascade.mjs:71 reads platform preferences with an unbounded readFileSync (a FIFO or oversized file can block or exhaust). Each should refuse or hold when evidence is unavailable.
+Inside agent shells every acquire (auto-pick and --lane=7/8) is refused with 'no longer provably safe to reset (0 uncommitted, 0 ahead, provably-pushed=true)' while the same acquire works from the operator shell (lane-13 at 06:51 ET). A probe step must be erroring silently; check PATH and DEVELOPER_DIR in the agent env.
 
 ## Acceptance
 

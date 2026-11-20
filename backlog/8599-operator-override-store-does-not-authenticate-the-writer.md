@@ -1,16 +1,17 @@
 ---
+bornAs: xsys1u5
 kind: task
 status: active
 scaffoldedBy: "fix-cap-raise"
 dateScaffolded: "2026-11-20"
-scope: ["we:scripts/lane-pool.mjs"]
+scope: ["we:scripts/lib/operator-override-store.mjs"]
 dateOpened: "2026-11-20"
 tags: []
 ---
 
-# lane-pool #2924 containment probe fails inside agent shells despite a clean lane
+# Operator override store does not authenticate the writer
 
-Inside agent shells every acquire (auto-pick and --lane=7/8) is refused with 'no longer provably safe to reset (0 uncommitted, 0 ahead, provably-pushed=true)' while the same acquire works from the operator shell (lane-13 at 06:51 ET). A probe step must be erroring silently; check PATH and DEVELOPER_DIR in the agent env.
+we:scripts/lib/operator-override-store.mjs:13 persists any capacity limit given nonempty actor and reason strings, overriding stricter env settings; no operator identity or approval is checked. Needs a signed-attestation or approval slice. Out of scope for the R1103 leaves PR-1.
 
 ## Acceptance
 

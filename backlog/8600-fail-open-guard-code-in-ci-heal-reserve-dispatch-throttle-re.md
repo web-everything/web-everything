@@ -1,16 +1,17 @@
 ---
+bornAs: xwxdolm
 kind: task
 status: active
 scaffoldedBy: "fix-cap-raise"
 dateScaffolded: "2026-11-20"
-scope: ["we:scripts/lane-pool.mjs"]
+scope: ["we:scripts/lib/ci-heal-reserve.mjs"]
 dateOpened: "2026-11-20"
 tags: []
 ---
 
-# lane-pool auto-pick keeps choosing lanes with unpushed work
+# Fail-open guard code in ci-heal reserve, dispatch throttle, resource gate and claim readers
 
-Auto-pick tried lane-69 and lane-71 (390 and 172 unpushed commits) instead of skipping to clean free lanes (7, 8, 13, 14, 17). Acquire should rank candidates by safe-to-reset and skip unsafe ones without claiming them.
+Seven pre-existing fail-open items found by the R1103 audits: we:scripts/lib/ci-heal-reserve.mjs:45 claim-read errors count as zero holders; we:scripts/conveyor/fix-claim-store.mjs:92 returns empty on directory errors; we:scripts/lib/ci-heal-reserve.mjs:53 and we:scripts/lib/dispatch-throttle.mjs:197 gate exceptions admit; we:scripts/lib/dispatch-throttle.mjs:113 and we:scripts/lib/resource-policy.mjs:89 unavailable host or CPU readings admit; we:scripts/lib/dispatch-throttle.mjs:192 and we:scripts/lib/resource-gate.mjs:400 claim-read failure means zero live sessions; we:scripts/conveyor/tick-core.mjs:2241 load gate defaults to open after probe failure; we:scripts/lib/ci-heal-reserve.mjs:40 dedup ignores repo and we:scripts/lib/ci-heal-reserve.mjs:30 occupancy cache is not atomic; also we:scripts/lib/policy-cascade.mjs:83 swallows platform-preference read and parse errors (a restrictive platform limit can be silently lost) and we:scripts/lib/policy-cascade.mjs:71 reads platform preferences with an unbounded readFileSync (a FIFO or oversized file can block or exhaust). Each should refuse or hold when evidence is unavailable.
 
 ## Acceptance
 

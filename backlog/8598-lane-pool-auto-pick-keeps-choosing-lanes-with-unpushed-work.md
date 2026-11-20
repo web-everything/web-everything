@@ -1,16 +1,17 @@
 ---
+bornAs: xhrhn0m
 kind: task
 status: active
 scaffoldedBy: "fix-cap-raise"
 dateScaffolded: "2026-11-20"
-scope: ["we:scripts/lib/operator-override-store.mjs"]
+scope: ["we:scripts/lane-pool.mjs"]
 dateOpened: "2026-11-20"
 tags: []
 ---
 
-# Operator override store does not authenticate the writer
+# lane-pool auto-pick keeps choosing lanes with unpushed work
 
-we:scripts/lib/operator-override-store.mjs:13 persists any capacity limit given nonempty actor and reason strings, overriding stricter env settings; no operator identity or approval is checked. Needs a signed-attestation or approval slice. Out of scope for the R1103 leaves PR-1.
+Auto-pick tried lane-69 and lane-71 (390 and 172 unpushed commits) instead of skipping to clean free lanes (7, 8, 13, 14, 17). Acquire should rank candidates by safe-to-reset and skip unsafe ones without claiming them.
 
 ## Acceptance
 

@@ -42,7 +42,7 @@ export function exercise(runReviewJob) {
 export default {
   id: 'added-seats-concurrent-head-binding',
   title: 'added seats overlap the review loop and discard evidence on a moved head',
-  card: 'xbizuci added seats concurrency',
+  card: '5852 added seats concurrency',
   fixedBy: { sha: 'HEAD', where: 'working tree', paths: ['scripts/operations/review-job.mjs', 'scripts/operations/review-extra-seats.mjs'] },
   fixPresent(root) {
     const probe = `import { exercise } from ${JSON.stringify(import.meta.url)};
