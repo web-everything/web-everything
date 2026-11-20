@@ -78,9 +78,9 @@ async function probeHydration(root) {
       readPrs: () => [{ ...pr, rowsComplete: shape === 'complete' }],
       readChecks: args => defaultReadChecks(args, { exec: (_file, argv) => {
         reads++;
-        if (argv.some(arg => arg.includes('/check-runs'))) return JSON.stringify([{ check_runs: rows }]);
+        if (argv.some(arg => arg.includes('/check-runs'))) return JSON.stringify([{ total_count: 100, check_runs: rows }]);
         if (shape === 'unreadable-status') throw new Error('status page unavailable');
-        return JSON.stringify([{ statuses: [] }]);
+        return JSON.stringify([{ total_count: 0, statuses: [] }]);
       } }),
     });
     const expected = shape === 'unreadable-status' ? 0 : 1;
