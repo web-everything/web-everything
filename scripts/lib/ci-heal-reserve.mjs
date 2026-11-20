@@ -19,14 +19,22 @@ export function resolveCiHealReserve({ env = process.env } = {}) {
 /** ONE per pass. `tryAdmit()` -> `{admit:true, reserved:true}` | `{admit:false, kind, why}`. */
 export function createCiHealReserve({
   listClaims = () => [], env = process.env, loadavg = () => os.loadavg()[0], cpuCount = () => os.cpus().length, sample,
+  resolveReserve = () => resolveCiHealReserve({ env }),
   // x6nuodj: the host gate decides through admit({kind:'ci-heal'}) (legacy gateHost is the logged comparison).
   gate = () => gateLaunch({ kind: 'ci-heal', gate: 'ci-heal-reserve', env, loadavg, cpuCount, ...(sample ? { sample } : {}) }),
 } = {}) {
+  // An injected resolver result must be a non-negative integer. Otherwise use the lower resolver's value, and 0 (off) if
+  // that is also invalid; never an unbounded reserve.
+  const valid = (v) => Number.isInteger(v) && v >= 0 && v <= 12; // 12 = the reserve ceiling (ciHeal.reserve leaf)
+  const reserve = (() => {
+    try { const v = resolveReserve(); if (valid(v)) return v; } catch { /* invalid */ }
+    try { const v = resolveCiHealReserve({ env }); if (valid(v)) return v; } catch { /* invalid */ }
+    return 0;
+  })();
   let liveHeal = null;
   let holders = [];
   return {
     tryAdmit() {
-      const reserve = resolveCiHealReserve({ env });
       if (liveHeal === null) {
         try {
           const seen = new Set();

@@ -76,7 +76,8 @@ import {
 import { readLiveFixClaim, withAltBranchHint } from '../conveyor/fix-procedure.mjs';
 import { briefWithContextPack } from '../conveyor/fix-context-pack.mjs'; // ci-heal context pack: failing checks + log staged in the brief
 import { codeqlBriefSection } from '../lib/codeql-gate.mjs';
-import { createCiHealReserve } from '../lib/ci-heal-reserve.mjs';
+import { createCiHealReserve, resolveCiHealReserve } from '../lib/ci-heal-reserve.mjs';
+import { resolveCapacityLeaf } from '../lib/capacity-leaf.mjs';
 import { listFixDispatchClaims } from '../conveyor/fix-claim-store.mjs';
 import { flushOwedWrites } from '../conveyor/ci-heal-owed.mjs';
 import { describeDispatchFailure } from '../lib/describe-spawn-failure.mjs';
@@ -439,7 +440,7 @@ export async function runReconcileCiHealDispatch({
   queueAdmission = null,
   dispatchThrottle = null, // fix-cap / host-load defer-only gate (dispatch-throttle.mjs); null = no gate
   // A PR's own red CI is owed a ci-heal owner: when the shared cap is full of review fixes, one reserved slot past it.
-  ciHealReserve = dispatchThrottle ? createCiHealReserve({ listClaims: () => listFixDispatchClaims(undefined, { liveOnly: true }) }) : null,
+  ciHealReserve = dispatchThrottle ? createCiHealReserve({ listClaims: () => listFixDispatchClaims(undefined, { liveOnly: true }), resolveReserve: () => resolveCapacityLeaf('ciHeal.reserve', { lower: resolveCiHealReserve() }).value }) : null,
   flushOwed = (key) => flushOwedWrites({ repo: key }),
   pollAttempts = pollHealAttempts,
   retryTimeout = dispatchTimeoutRetry,
