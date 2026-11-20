@@ -751,6 +751,7 @@
   "WE_REVIEW_CHURN_SAME_TREE": {"class": "drop", "why": "Caller override is not required by the agent; keep the owning tool default."},
   "WE_REVIEW_CURRENT_LEVEL": {"class": "drop", "why": "Caller override is not required by the agent; keep the owning tool default."},
   "WE_REVIEW_DAEMON_INTERVAL_MS": {"class": "drop", "why": "Caller override is not required by the agent; keep the owning tool default."},
+  "WE_REVIEW_EXTRA_SEATS_CONCURRENT": {"class": "drop", "why": "Preserve the ambient concurrent or sequential review-seat setting; caller-bag scheduling changes stay excluded. Evidence: scripts/lib/review-speculative-red-team.mjs:145."},
   "WE_REVIEW_EXTRA_SEATS_DAILY_CAP": {"class": "drop", "why": "Preserve the ambient review-seat daily budget; caller-bag budget changes stay excluded. Evidence: scripts/lib/review-seat-caps.mjs:9."},
   "WE_REVIEW_FACTS": {"class": "drop", "why": "Caller override is not required by the agent; keep the owning tool default."},
   "WE_REVIEW_HUMAN_SURFACE_USES_NET_DIFF": {"class": "drop", "why": "Caller override is not required by the agent; keep the owning tool default."},
