@@ -5183,3 +5183,11 @@ Park opens ready for review; draft-promotion still handles older drafts.
 Check mode fetches origin main before evaluating canonical audit evidence. A failed fetch reports
 `main not refreshed: <reason>` and refuses even when local evidence would pass against stale refs.
 `open-pr-audit-gate.test.mjs` covers both refresh outcomes, aggregation and an unconfirmed check child.
+
+## Local-only overlay withdrawal evidence
+
+`daemon-overlay-operator-withdrawal.test.mjs` uses real Git histories to verify that every other registered
+overlay has a locally resolvable tip and a common ancestor with the withdrawn tip before a negative ancestry
+result proves independence. A stale tracking tip with truncated history can return ancestry status 1 without
+that proof; refuse and ask the operator to fetch the clone's overlays first. Missing tips and unreadable
+merge-base/ancestry evidence also refuse without recording retirement. Keep this path fetch-free.

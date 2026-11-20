@@ -539,9 +539,21 @@ export function proveOverlayWithdrawal({ root, ref, tip, reason, localOnly = fal
   for (const other of others) {
     if (!safeRegistrationRef(other.ref)) return { action: 'keep', reason: 'unreadable-stack-evidence' };
     if (!localOnly) requireGit('fetch', 'origin', `+refs/heads/${other.ref}:refs/remotes/origin/${other.ref}`);
-    const otherTip = requireGit('rev-parse', '--verify', `refs/remotes/origin/${other.ref}^{commit}`);
+    const unknownRelationship = () => ({ action: 'keep',
+      reason: `cannot prove no registered overlay depends on ${ref}; fetch the clone's overlays first` });
+    const resolved = git('rev-parse', '--verify', `refs/remotes/origin/${other.ref}^{commit}`);
+    if (localOnly && (resolved.code !== 0 || !validSha(resolved.stdout.trim()))) return unknownRelationship();
+    if (resolved.code !== 0) throw new Error('git rev-parse failed; inspect stacked dependents before unloading manually');
+    const otherTip = resolved.stdout.trim();
     if (!validSha(otherTip)) return { action: 'keep', reason: 'stacked-dependents' };
+    if (localOnly) {
+      // A negative ancestry result alone can mean disconnected/truncated local history.
+      // Require a common ancestor before treating an uncached relationship as independent.
+      const base = git('merge-base', tip, otherTip);
+      if (base.code !== 0 || !validSha(base.stdout.trim())) return unknownRelationship();
+    }
     const ancestry = git('merge-base', '--is-ancestor', tip, otherTip);
+    if (localOnly && ![0, 1].includes(ancestry.code)) return unknownRelationship();
     if (![0, 1].includes(ancestry.code)) throw new Error('ancestry unverifiable; inspect stacked dependents before unloading manually');
     if (ancestry.code === 0) return { action: 'keep', reason: 'stacked-dependents' };
   }

@@ -80,12 +80,46 @@ describe('operator withdrawal of an unregistered live overlay', () => {
     expect(await withdrawUnregisteredOverlay({ ...f.args, acceptUncontained: undefined })).toMatchObject({ retired: true });
     expect(f.events().at(-1)).not.toHaveProperty('acceptUncontained');
   });
-  it('refuses unreadable dependent tracking evidence without fetching', async () => {
+  it('refuses an unresolvable dependent tip with a fetch-first fallback', async () => {
     const f = fixture();
     addOverlay(f.root, { ref: 'lane/missing' }, { env: f.env });
     const before = f.events();
-    await expect(withdrawUnregisteredOverlay(f.args)).rejects.toThrow(/stacked dependents/);
+    await expect(withdrawUnregisteredOverlay(f.args)).rejects.toThrow(
+      "cannot prove no registered overlay depends on lane/withdraw; fetch the clone's overlays first");
     expect(f.events()).toEqual(before);
+  });
+  it('refuses a stale tracking ref with no cached relationship and truncated local history', async () => {
+    const f = fixture();
+    addOverlay(f.root, { ref: 'lane/top' }, { env: f.env });
+    const stale = f.git('commit-tree', 'HEAD^{tree}', '-p', 'refs/remotes/origin/main', '-m', 'old top');
+    f.git('update-ref', 'refs/remotes/origin/lane/top', stale);
+    // The remote may have advanced to depend on the withdrawn tip. Locally the stale
+    // tip's history is truncated: --is-ancestor returns 1 without proving independence.
+    writeFileSync(join(f.root, '.git', 'shallow'), `${stale}\n`);
+    const ancestry = spawnSync('git', ['merge-base', '--is-ancestor', f.tip, stale], { cwd: f.root, encoding: 'utf8' });
+    expect(ancestry.status).toBe(1);
+    const before = f.events();
+    const run = vi.fn((cmd, args, opts) => {
+      if (['fetch', 'ls-remote'].includes(args[0])) throw new Error('withdrawal must be fetch-free');
+      return spawnSync(cmd, args, opts);
+    });
+    await expect(withdrawUnregisteredOverlay({ ...f.args, deps: { ...f.args.deps, run } })).rejects.toThrow(
+      "cannot prove no registered overlay depends on lane/withdraw; fetch the clone's overlays first");
+    expect(f.events()).toEqual(before);
+  });
+  it.each(['merge-base', 'ancestry'])('refuses unreadable local %s evidence for a resolvable overlay', async stage => {
+    const f = fixture();
+    addOverlay(f.root, { ref: 'lane/other' }, { env: f.env });
+    const otherTip = f.git('rev-parse', 'refs/remotes/origin/main');
+    f.git('update-ref', 'refs/remotes/origin/lane/other', otherTip);
+    const run = (cmd, args, opts) => {
+      if (args[0] === 'merge-base' && args.at(-1) === otherTip
+        && (args[1] === '--is-ancestor') === (stage === 'ancestry')) return { status: 128, stdout: '' };
+      return spawnSync(cmd, args, opts);
+    };
+    await expect(withdrawUnregisteredOverlay({ ...f.args, deps: { ...f.args.deps, run } })).rejects.toThrow(
+      "cannot prove no registered overlay depends on lane/withdraw; fetch the clone's overlays first");
+    expect(f.events()).toEqual([]);
   });
   it('refuses unreadable containment even with explicit acceptance', async () => {
     const f = fixture();
@@ -94,10 +128,13 @@ describe('operator withdrawal of an unregistered live overlay', () => {
     await expect(withdrawUnregisteredOverlay({ ...f.args, deps: { ...f.args.deps, run } })).rejects.toThrow(/containment unreadable/);
     expect(f.events()).toEqual([]);
   });
-  it('accepts an independent registered overlay using only local evidence', async () => {
+  it('accepts resolvable independent registered overlays using only local evidence', async () => {
     const f = fixture();
     addOverlay(f.root, { ref: 'lane/independent' }, { env: f.env });
     f.git('update-ref', 'refs/remotes/origin/lane/independent', f.git('rev-parse', 'refs/remotes/origin/main'));
+    addOverlay(f.root, { ref: 'lane/second' }, { env: f.env });
+    const secondTip = f.git('commit-tree', 'HEAD^{tree}', '-p', 'refs/remotes/origin/main', '-m', 'independent');
+    f.git('update-ref', 'refs/remotes/origin/lane/second', secondTip);
     const run = vi.fn((cmd, args, opts) => {
       if (['fetch', 'ls-remote'].includes(args[0])) throw new Error('withdrawal must be fetch-free');
       return spawnSync(cmd, args, opts);
