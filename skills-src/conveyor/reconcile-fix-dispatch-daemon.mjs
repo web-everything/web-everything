@@ -52,7 +52,7 @@ import { execFileSync } from 'node:child_process';
 import { resolveChildTimeoutMs } from '../../scripts/lib/bounded-child.mjs';
 import { decideParkToHuman } from '../../scripts/lib/review-escalation.mjs';
 import { hostname } from 'node:os';
-import { Worker, isMainThread, workerData } from 'node:worker_threads';
+import { Worker, isMainThread, workerData, parentPort } from 'node:worker_threads';
 import { dirname, resolve } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
@@ -102,7 +102,7 @@ import { getRequiredStatusChecks } from '../../scripts/lib/required-status-check
 
 /** The checkout this daemon runs from — its heavy-admission root is the host-wide `<workspace>/.lanes` one. */
 const DAEMON_REPO_ROOT = resolve(fileURLToPath(import.meta.url), '..', '..', '..');
-import { sweepHungCiRecovery, sweepCiRedRecovery, sweepMissingRunRecovery, defaultReadOpenPrs, createFileApplyLedger } from '../../scripts/conveyor/ci-red-recovery-watch.mjs';
+import { sweepHungCiRecovery, sweepCiRedRecovery, resolveApplyBudgetMs, sweepMissingRunRecovery, defaultReadOpenPrs, createFileApplyLedger } from '../../scripts/conveyor/ci-red-recovery-watch.mjs';
 import { runRulingResolvesStandDownPass } from '../../scripts/conveyor/ruling-resolved-stand-down.mjs';
 import { resolveReviewSettings, resolveReviewSettingSource } from '../../scripts/lib/review-settings.mjs';
 import { CONSTELLATION_REPOS, repoKeyForSlug } from '../../scripts/lib/constellation-repos.mjs';
@@ -183,12 +183,12 @@ export async function runDaemonLoop({
 /** Independent start-to-start cadence. Pending/indeterminate work stays held until settlement;
  * missed intervals are refused, never queued for catch-up. maxPasses counts due slots. */
 export async function runCiHealLoop({ passOnce, sleep, now = Date.now, intervalMs = DEFAULT_INTERVAL_MS,
-  log = () => {}, heartbeat = () => true, maxPasses = Infinity, shouldStop = () => false }) {
+  log = () => {}, heartbeat = () => true, onLeaseLost = () => {}, maxPasses = Infinity, shouldStop = () => false }) {
   if (typeof passOnce !== 'function' || typeof sleep !== 'function') throw new TypeError('ci-heal requires passOnce and sleep');
   if (!Number.isFinite(intervalMs) || intervalMs <= 0) throw new TypeError('invalid ci-heal intervalMs');
   let inFlight = false, passes = 0;
   while (passes < maxPasses && !shouldStop()) {
-    if (await heartbeat() !== true) return { passes, stoppedReason: 'lease-lost' };
+    if (await heartbeat() !== true) { onLeaseLost(); return { passes, stoppedReason: 'lease-lost' }; }
     if (shouldStop()) break;
     const started = now();
     if (inFlight !== false) log('ci-heal-pass-skipped overlap');
@@ -1162,9 +1162,66 @@ const { rotation: fixPassRotation, prCursors: fixPassPrCursors } = loadFixPassCu
  *   work. `hungCi`/`mainRedRebase`/`notes` (mechanical git/gh passes, no Claude session involved) keep running
  *   unpaused — the login break does not touch them.
  */
+// Shared only by this daemon's two threads. Dispatch phases never wait on one another:
+// a busy phase is a logged overlap skip. Charges remain until ALL overlapping passes end.
+export function createFixPassCoordination(buffer = new SharedArrayBuffer(16), log = console.error) {
+  const state = new Int32Array(buffer); // fenced, active passes, dispatch owner, charged seconds
+  const refused = why => ({ dispatched: [], refusals: [{ kind: 'admission-held', why }] });
+  return {
+    buffer,
+    fence() { Atomics.store(state, 0, 1); },
+    fenced: () => Atomics.load(state, 0) !== 0,
+    enterPass() { Atomics.add(state, 1, 1); return () => Atomics.sub(state, 1, 1); },
+    async withPass(tick) {
+      // Do not reset on entry: a finishing pass must never erase a concurrent charge.
+      Atomics.add(state, 1, 1);
+      try { return await tick(); }
+      finally { Atomics.sub(state, 1, 1); }
+    },
+    dispatch(tick) {
+      if (Atomics.compareExchange(state, 2, 0, 1) !== 0) {
+        log('ci-heal-pass-skipped overlap');
+        return refused('dispatch phase busy; retry next pass');
+      }
+      const release = () => Atomics.store(state, 2, 0);
+      try {
+        if (Atomics.load(state, 0)) { release(); return refused('lease fenced; restart daemon'); }
+        const result = tick();
+        if (result && typeof result.then === 'function') return result.finally(release);
+        release(); return result;
+      } catch (error) { release(); throw error; }
+    },
+    queueBudget(baseline) {
+      return { tryAdmit(kind, options) {
+        // Called ONLY inside dispatch(), so read/project/charge is one critical section.
+        if (Atomics.load(state, 0) || Atomics.load(state, 2) !== 1) return { admit: false, kind, why: 'admission fenced' };
+        const budget = createQueueBudget(baseline, { extraMinutes: Atomics.load(state, 3) / 60 });
+        if (!baseline || (baseline.bypassed !== true && !budget.active)) {
+          log('fix-admission-held queue evidence unreadable; retry next pass');
+          return { admit: false, kind, why: 'queue evidence unreadable; retry next pass' };
+        }
+        const decision = budget.tryAdmit(kind, options);
+        const charge = Math.ceil(budget.addedMinutes() * 60);
+        if (!Number.isSafeInteger(charge) || charge > 2147483647) {
+          log('fix-admission-held queue projection oversized; restart daemon after checking queue');
+          return { admit: false, kind, why: 'queue projection oversized; restart daemon after checking queue' };
+        }
+        if (decision.admit) Atomics.store(state, 3, charge);
+        return decision;
+      } };
+    },
+    // Reset only at an idle dispatch boundary. No writer can be using the projection here.
+    resetIfIdle() {
+      if (Atomics.compareExchange(state, 2, 0, 1) !== 0) return;
+      try { if (Atomics.load(state, 1) === 0) Atomics.store(state, 3, 0); }
+      finally { Atomics.store(state, 2, 0); }
+    },
+  };
+}
+const fixPassCoordination = createFixPassCoordination(workerData?.admissionBuffer);
 export async function runTickAllRepos({
   repos = FIX_DISPATCH_DAEMON_REPOS, fixTick, ciHealTick, hungCiTick, mainRedRebaseTick, missingRunTick, promoteDraftTick, rulingStandDownTick, notesTick, notesDryRun,
-  authGateOverride, ciHealOwnLoop = false, ciHealOnly = false,
+  admissionCoordinator, dispatchAllowed = () => true, authGateOverride, ciHealOwnLoop = false, ciHealOnly = false,
   fixSettings = resolveFixSettings(),
   // Opt-in IO for injected ticks; historical fixtures never acquire a live snapshot.
   readPrs,
@@ -1207,6 +1264,10 @@ export async function runTickAllRepos({
   // Off under a test run unless injected (the real pass reads GitHub).
   orphanGuardTick = process.env.VITEST ? null : runOrphanFixRoundPass,
 } = {}) {
+  admissionCoordinator ??= process.env.VITEST ? null : fixPassCoordination;
+  admissionCoordinator?.resetIfIdle();
+  const endPass = admissionCoordinator?.enterPass();
+  try {
   const persistCursors = budgetRotation === fixPassRotation && prCursors === fixPassPrCursors;
   const cursorsBefore = persistCursors ? JSON.stringify([budgetRotation, prCursors]) : null;
   let yieldedForAdoption = false;
@@ -1269,8 +1330,9 @@ export async function runTickAllRepos({
       return result;
     };
     // shouldYield is only threaded when a probe exists, so probe-less ticks see the exact pre-S1 option shape.
-    const result = tick({ ...options, deadlineAt: phaseStarts[phase] + budgets[phase].budgetMs,
+    const invoke = () => tick({ ...options, deadlineAt: phaseStarts[phase] + budgets[phase].budgetMs,
       cursor: cursors[options.repo], now, ...(typeof adoptYieldProbe === 'function' ? { shouldYield } : {}) });
+    const result = admissionCoordinator && ['fix', 'ci-heal'].includes(phase) ? admissionCoordinator.dispatch(invoke) : invoke();
     return result && typeof result.then === 'function' ? result.then(record) : record(result);
   };
   const finishPhase = (name, start) => {
@@ -1300,7 +1362,7 @@ export async function runTickAllRepos({
   // card xiqtf7w — before any fresh dispatch: a PR a merged PR declares it supersedes gets its terminal
   // stand-down now, so this tick's fix/ci-heal halves (and the review daemon) already read it as stood down.
   // No Claude session is spawned, so the auth gate never pauses it.
-  const supersede = timed('supersede', () => (ciHealOnly ? { repos: [] } : supersedeTick ? runSupersedeAllRepos({ repos, tick: supersedeTick })
+  const supersede = timed('supersede', () => (supersedeTick ? runSupersedeAllRepos({ repos, tick: supersedeTick })
     : (realTick ? runSupersedeAllRepos({ repos }) : { repos: [] })));
   const rulingStandDown = await timedAsync('ruling-stand-down', async () => {
     const setting = resolveReviewSettings().rulingResolvesStandDown;
@@ -1324,7 +1386,9 @@ export async function runTickAllRepos({
   // every repo's fix and CI-heal dispatch, so each dispatch in the pass sees the demand of the ones before it.
   // Only read when a real tick runs (an injected test tick never needs it) AND dispatch is not paused (card
   // x5kagse — no reason to read live queue capacity for a pass that is about to dispatch nothing at all).
-  const queueAdmission = (authGate.paused || (fixTick && ciHealTick)) ? null : createQueueBudget(resolveLiveQueueBaseline({ checkoutRoot: DAEMON_REPO_ROOT }));
+  const queueAdmission = (authGate.paused || (fixTick && ciHealTick)) ? null
+    : (admissionCoordinator ? admissionCoordinator.queueBudget(resolveLiveQueueBaseline({ checkoutRoot: DAEMON_REPO_ROOT }))
+      : createQueueBudget(resolveLiveQueueBaseline({ checkoutRoot: DAEMON_REPO_ROOT })));
   // ONE throttle per pass shared by fix + ci-heal: live fix/ci-heal cap and host-load gate (defer-only).
   // xn025gx (R2 fix-slot-count): a session parked on verify gives its slot back; a decided resume keeps one. Setting off →
   // the same live-claim list as before.
@@ -1348,7 +1412,10 @@ export async function runTickAllRepos({
         entries = plan.dispatch ?? [];
         return plan;
       },
-      dispatch: createRoutedCiHealDispatch({ dispatch: dispatchCiHeal,
+      dispatch: createRoutedCiHealDispatch({ dispatch: (...args) => {
+        if (admissionCoordinator?.fenced() || dispatchAllowed() !== true) throw new Error('ci-heal dispatch fenced: lease lost');
+        return dispatchCiHeal(...args);
+      },
         staleBaseGate: createStaleBaseGate(),
         route: (planned) => fixExecutorRoute({ ...entries.find((e) => e.kind === 'ci-heal' && e.prNumber === planned.pr), ...planned }),
         createSinks: createDispatchSinks, launchCodex: fixDetachedProvider,
@@ -1359,6 +1426,9 @@ export async function runTickAllRepos({
   };
   const ciHealPhase = async () => {
     if (ciHealOwnLoop) return pausedDispatchResult();
+    if (ciHealOnly && !supersedeEvidenceClear(supersede, repos)) {
+      return { ...pausedDispatchResult(), refusals: [{ kind: 'supersede-unknown', why: 'supersede evidence incomplete or hold unpublished; retry next pass' }] };
+    }
     const ciHeal = await timedAsync('ci-heal', async () => (ciHealOwnLoop || authGate.paused ? pausedDispatchResult()
       : await runReconcileCiHealDispatchAllRepos({ repos: budgetRepos('ci-heal', repos), tick: boundedPrTick('ci-heal', ciHealTick ?? routedCiHealTick), ...(ciHealTick ? {} : { queueAdmission, dispatchThrottle }),
       ...(planCache ? { reconcile: planCache.reconcile } : {}) })));
@@ -1527,7 +1597,7 @@ export async function runTickAllRepos({
   // x5uqim1 follow-up (#4075/#3383) — the FOURTH half this daemon now owns: see
   // {@link runMainRedRebaseAllRepos}'s own docblock for why this daemon, specifically, is where it lives (same
   // reason `hungCi` already does — the pass's own `daemon-manifest.mjs` entry has no launchd job installed).
-  const mainRedRebase = stepTimed('main-red-rebase', () => runMainRedRebaseAllRepos({ repos: budgetRepos('main-red-rebase', stepRepos.get('main-red-rebase')), tick: boundedPrTick('main-red-rebase', sharedTick('main-red-rebase', options => (mainRedRebaseTick ?? sweepCiRedRecovery)({ ...options, applyBudgetMs: Math.max(0, options.deadlineAt - now()) }))) }));
+  const mainRedRebase = stepTimed('main-red-rebase', () => runMainRedRebaseAllRepos({ repos: budgetRepos('main-red-rebase', stepRepos.get('main-red-rebase')), tick: boundedPrTick('main-red-rebase', sharedTick('main-red-rebase', options => (mainRedRebaseTick ?? sweepCiRedRecovery)({ ...options, applyBudgetMs: Math.min(resolveApplyBudgetMs(), Math.max(0, options.deadlineAt - now())) }))) }));
   planCache?.markTouched(mainRedRebase);
   // xi4od2p (#4075/#3383) — the SIXTH half this daemon now owns: see {@link runMissingRunRecoveryAllRepos}'s
   // own docblock for why this daemon, specifically, is where it lives (same reason `hungCi`/`mainRedRebase`
@@ -1593,6 +1663,7 @@ export async function runTickAllRepos({
     phasePrCounts, budgets, passBudgetSettings: passBudgets,
     skippedSteps, phaseMs, passMs: now() - passStart, // how long each half of this pass took (see formatPassTiming)
   };
+  } finally { endPass?.(); }
 }
 
 /** The real `tagDispatchStatus` effect for {@link buildCliDaemonEffects}: a fresh fix/ci-heal dispatch is
@@ -1735,7 +1806,7 @@ export function fixQueueLengthOf(...results) {
 /** The fix/ci-heal dispatch throttle, counting the cap with R2's active-only claim list. x6nuodj: the cap is dynamic
  *  (floor..ceiling, raised when the CPU is free and the queue is long) and the host gate decides through admit(). */
 export function buildFixThrottle({ slotClaims = defaultSlotCountedFixClaims, queueLength = () => lastFixQueueLength, ...rest } = {}) {
-  return createResourceFixThrottle({ ...rest, queueLength, listClaims: () => slotClaims() });
+  return createResourceFixThrottle({ ...rest, freshClaims: true, queueLength, listClaims: () => slotClaims({ listClaims: () => listFixDispatchClaims(undefined, { liveOnly: true, strict: true }) }) });
 }
 /**
  * main()'s three exits: SIGTERM/SIGINT (`shutdown`), restart-onto-new-code (`restartOntoNewCode`) and `runDaemonLoop`
@@ -1987,20 +2058,44 @@ export function fixDaemonPrEventsOptions({ handoffDir } = {}) {
  * Termination stops its pending timer and any future admission before releasing the lease. */
 export function startCiHealWorker({ owner, ciHealIntervalMs = DEFAULT_INTERVAL_MS, createWorker = (url, options) => new Worker(url, options),
   onLeaseLost = () => {}, log = console } = {}) {
-  const worker = createWorker(new URL(import.meta.url), { workerData: { ciHealOwnLoop: true, owner, ciHealIntervalMs } });
+  const worker = createWorker(new URL(import.meta.url), { execArgv: process.execArgv, env: { ...process.env, WE_DAEMON_MANAGED_CLONE: '1', GIT_OPTIONAL_LOCKS: '0' },
+    workerData: { ciHealOwnLoop: true, owner, ciHealIntervalMs, admissionBuffer: fixPassCoordination.buffer } });
   worker.on('error', error => { log.error(`ci-heal-loop-failed ${redactedFirstLine(error)}`); onLeaseLost(); });
   worker.on('exit', () => onLeaseLost());
-  return { stop: () => worker.terminate() };
+  worker.on('message', message => { if (message === 'ci-heal-fenced') { fixPassCoordination.fence(); worker.terminate(); onLeaseLost(); } });
+  return { stop: () => { fixPassCoordination.fence(); return worker.terminate(); } };
+}
+
+export function supersedeEvidenceClear(result, repos) {
+  return repos.every(repo => {
+    const row = result?.repos?.find(row => row?.repo === repo);
+    return row && !row.error && !row.bodyEditFailures && Array.isArray(row.holds) && Array.isArray(row.applied)
+      && row.holds.every(hold => row.applied.some(a => a.pr === hold.pr && a.ok === true && a.labeled === true));
+  });
+}
+
+export function buildCiHealWorkerEffects({ heartbeat, onRestart, tick = runCiHealPass, coordination = fixPassCoordination,
+  selfSync = withSelfSync, refresh = refreshLiveFixDispatchClaims, auth = withGithubAppAuth } = {}) {
+  let adoptYieldProbe;
+  return selfSync(auth(withFixDispatchClaimRefresh({
+    setAdoptYieldProbe: probe => { adoptYieldProbe = probe; },
+    tickOnce: () => tick({ adoptYieldProbe,
+    tagDispatchStatus: defaultTagDispatchStatus,
+    dispatchAllowed: () => { if (coordination.fenced() || heartbeat() !== true) { coordination.fence(); onRestart(); return false; } return true; },
+  }) }, { refresh }), FIX_DISPATCH_APP_AUTH_OPTS), {
+    root: DAEMON_REPO_ROOT, onRestart, hasStaleRefusal: hasStaleMainRefusal,
+  });
 }
 
 if (!isMainThread && workerData?.ciHealOwnLoop) {
   installDaemonLog();
   const effects = buildCliDaemonEffects({ owner: workerData.owner });
-  const auth = withGithubAppAuth({ tickOnce: () => runCiHealPass({ tagDispatchStatus: defaultTagDispatchStatus }) }, FIX_DISPATCH_APP_AUTH_OPTS);
+  const stop = () => { fixPassCoordination.fence(); parentPort.postMessage('ci-heal-fenced'); process.exit(0); };
+  const wrapped = buildCiHealWorkerEffects({ heartbeat: effects.heartbeat, onRestart: stop });
   console.error(`ci-heal-loop: intervalMs=${workerData.ciHealIntervalMs} source=standard`);
-  runCiHealLoop({ intervalMs: workerData.ciHealIntervalMs, passOnce: async () => effects.onTick(await auth.tickOnce()),
-    sleep: realSleep, now: Date.now, heartbeat: effects.heartbeat, log: line => console.error(line),
-  }).catch(error => { console.error(`ci-heal-loop-failed ${redactedFirstLine(error)}`); process.exitCode = 1; });
+  runCiHealLoop({ intervalMs: workerData.ciHealIntervalMs, passOnce: async () => effects.onTick(await wrapped.tickOnce()),
+    sleep: realSleep, now: Date.now, heartbeat: effects.heartbeat, onLeaseLost: stop, log: line => console.error(line),
+  }).catch(error => { console.error(`ci-heal-loop-failed ${redactedFirstLine(error)}`); stop(); });
 }
 
 const IS_CLI = process.argv[1] && resolve(process.argv[1]) === resolve(fileURLToPath(import.meta.url));

@@ -133,7 +133,7 @@ import { fixDetachedProvider } from '../operations/dispatch-providers/fix.mjs';
 import { removePromptFile } from '../operations/fix-run.mjs';
 import { listBuildDispatchClaims } from './build-dispatch-claim.mjs';
 import { runReconcilePass, resolveLaneHead } from './reconcile-pass.mjs';
-import { readUnsupported, recordUnsupported } from './unsupported-repo.mjs';
+import { recordUnsupported } from './unsupported-repo.mjs';
 import { readPrsFromFile } from './open-pr-fetch.mjs';
 import { CONFLICT_LABEL } from './parked-pr-conflict-watch.mjs';
 import { resolveChildTimeoutMs } from '../lib/bounded-child.mjs';
@@ -1971,15 +1971,13 @@ export function runReconcileFixDispatch({
       'fix', 'fix', 'Fix dispatch requires a repo-specific brief and gate; the existing worker is WE-only.',
     );
     const refusals = [...fixRefusals, ...ciHealRefusals];
-    const reviews = readUnsupported({ path: unsupportedPath }).filter((row) => row.repo === repoKey && row.action === 'review');
-    recordUnsupported({ repo: repoKey, rows: [...reviews, ...refusals], path: unsupportedPath });
+    recordUnsupported({ repo: repoKey, rows: refusals, actions: ['fix', 'ci-heal'], path: unsupportedPath });
     return { handled: fixRefusals.length, deferred: [], nextCursor: null, dispatched: [], refusals, reconcileRefusals: reconciled.refusals.length, reconcileRefusalDetails: reconciled.refusals };
   }
   // `fix` IS supported here — still durably record any ci-heal refusals (a separate capability, possibly still
   // off), preserving prior `review` rows exactly as above.
   if (ciHealRefusals.length) {
-    const reviews = readUnsupported({ path: unsupportedPath }).filter((row) => row.repo === repoKey && row.action === 'review');
-    recordUnsupported({ repo: repoKey, rows: [...reviews, ...ciHealRefusals], path: unsupportedPath });
+    recordUnsupported({ repo: repoKey, rows: ciHealRefusals, actions: ['fix', 'ci-heal'], path: unsupportedPath });
   }
   const mqRefreshRefusals = [];
   let mqDiffReads = 0;

@@ -320,7 +320,7 @@ export function readLiveHeavyWaitMinutes({ env = process.env } = {}) {
  * In `shadow` mode the cap is the legacy static cap; the computed one is still logged.
  */
 export function createResourceFixThrottle({
-  sendBackReservedSlots,
+  sendBackReservedSlots, freshClaims = false,
   listClaims = () => [], env = process.env, alive = isPidAlive, queueLength = null, settings, root, nowMs = () => Date.now(),
   readSnap = () => readSnapshot(root ? { root } : {}), readHeavyWait = () => readLiveHeavyWaitMinutes({ env }), gate, log = (line) => process.stderr.write(line),
   resolveFloor = () => { const r = loadHostOverloadSettings({ env, log: () => {} }); return { snapshotClockSkewMs: r.settings.host.capacity.snapshotClockSkewMs, snapshotMaxFreshMs: r.settings.host.capacity.snapshotMaxFreshMs, metric: r.settings.host.capacity.memoryMetric, floorMb: r.settings.host.capacity.memAvailableFloorMb, source: r.sources['host.capacity.memAvailableFloorMb'] ?? 'standard' }; },
@@ -391,7 +391,14 @@ export function createResourceFixThrottle({
       }
     },
     tryAdmit(kind = 'fix', { sendBack = false } = {}) {
-      if (live === null) { try { live = countLiveFixSessions(listClaims(), { alive }); } catch { live = 0; } }
+      if (freshClaims || live === null) {
+        try {
+          const claims = listClaims();
+          if (!Array.isArray(claims)) throw new Error('incomplete claims');
+          // Keep local reservations as a conservative floor, but always observe sibling claims.
+          live = Math.max(live ?? 0, countLiveFixSessions(claims, { alive }));
+        } catch { return { admit: false, kind: 'claims-unreadable', why: 'live fix claims unreadable; retry next pass, no claim taken' }; }
+      }
       // R553/R559 hard floor, before any cap arithmetic. The memory reading is re-read on EVERY admission (never the
       // pass-start copy) and the floor comes from THIS process's own policy cascade, never from the sampler's snapshot.
       // Below the floor, under corroborated warn/critical, stale, or unreadable on either side → refuse.

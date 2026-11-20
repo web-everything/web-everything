@@ -1,15 +1,18 @@
-import { execFileSync } from 'node:child_process';
+import { spawnSync } from 'node:child_process';
 import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
+import { RESOURCE_GATE_STANDARD } from '../../../scripts/lib/resource-gate.mjs';
+import { listFixDispatchClaims } from '../../../scripts/conveyor/fix-claim-store.mjs';
+import { writeFileSync, mkdirSync } from 'node:fs';
 import { afterEach, expect, it, vi } from 'vitest';
-import { runCiHealLoop, runCiHealPass, runDaemonLoop, runTickAllRepos, resolveFixPassBudgets, formatPassPhaseTiming, buildDaemonExits, startCiHealWorker } from '../reconcile-fix-dispatch-daemon.mjs';
+import { runCiHealLoop, runCiHealPass, runDaemonLoop, runTickAllRepos, resolveFixPassBudgets, formatPassPhaseTiming, buildDaemonExits, startCiHealWorker, buildCiHealWorkerEffects, createFixPassCoordination, buildFixThrottle } from '../reconcile-fix-dispatch-daemon.mjs';
 
-afterEach(() => { vi.useRealTimers(); vi.restoreAllMocks(); });
+afterEach(() => { vi.useRealTimers(); vi.restoreAllMocks(); vi.unstubAllEnvs(); });
 const empty = () => ({ dispatched: [], refusals: [], applied: [], rows: [], notes: [], comments: [] });
 const fixture = extra => ({ repos: ['a', 'b'], fixTick: empty, ciHealTick: empty,
   hungCiTick: empty, mainRedRebaseTick: empty, missingRunTick: empty, promoteDraftTick: empty,
-  notesTick: empty, awaitVerifyTick: empty, stuckFixerTick: empty, supersedeTick: empty,
+  notesTick: empty, awaitVerifyTick: empty, stuckFixerTick: empty, supersedeTick: ({ repo }) => ({ repo, holds: [], applied: [] }),
   allowStandDownAutoProceed: false, budgetRotation: {}, prCursors: {}, ...extra });
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
 
@@ -119,12 +122,16 @@ it('production CLI worker admissions continue during a synchronous main-thread c
   const dir = mkdtempSync(join(process.env.TMPDIR || tmpdir(), 'ci-heal-worker-wiring-'));
   const path = join(dir, 'admissions.jsonl');
   try {
-    execFileSync(process.execPath, [
+    const child = spawnSync(process.execPath, [
       '--import', join(process.cwd(), 'skills-src/conveyor/__tests__/fixtures/ci-heal-worker-register.mjs'),
       join(process.cwd(), 'skills-src/conveyor/reconcile-fix-dispatch-daemon.mjs'),
     ], { timeout: 15000, maxBuffer: 65536, stdio: ['ignore', 'pipe', 'pipe'],
       env: { ...process.env, CI_HEAL_WORKER_PROBE_FILE: path } });
-    const events = readFileSync(path, 'utf8').trim().split('\n').map(line => JSON.parse(line));
+    expect(child.status, String(child.stderr || child.error || child.stdout)).toBe(0);
+    let recorded;
+    try { recorded = readFileSync(path, 'utf8'); }
+    catch (error) { throw new Error(`worker probe missing: ${String(child.stderr)} ${String(child.stdout)}`, { cause: error }); }
+    const events = recorded.trim().split('\n').map(line => JSON.parse(line));
     const start = events.find(row => row.event === 'block-start');
     const end = events.find(row => row.event === 'block-end');
     expect(start).toBeDefined(); expect(end).toBeDefined();
@@ -134,3 +141,141 @@ it('production CLI worker admissions continue during a synchronous main-thread c
     expect(during.every(row => row.threadId > 0 && row.pid === start.pid)).toBe(true);
   } finally { rmSync(dir, { recursive: true, force: true }); }
 }, 20000);
+
+// Audit findings 1–3: exercise composition, including wrapper refusal and ordering.
+it.each(['quarantined', 'reclone', 'adoption-yield', 'head-moved'])('worker never dispatches when self-sync refuses %s', async reason => {
+  const tick = vi.fn(), refresh = vi.fn();
+  const worker = buildCiHealWorkerEffects({ tick, refresh, heartbeat: () => true,
+    auth: effects => effects, selfSync: () => ({ tickOnce: () => ({ reason }) }) });
+  expect(await worker.tickOnce()).toEqual({ reason });
+  expect(refresh).not.toHaveBeenCalled(); expect(tick).not.toHaveBeenCalled();
+});
+
+it('worker refreshes claims before each independent pass, including while a main tick is pending', async () => {
+  const calls = [];
+  const worker = buildCiHealWorkerEffects({ tick: () => calls.push('dispatch'), heartbeat: () => true,
+    refresh: () => { calls.push('refresh'); return { refreshed: [] }; },
+    selfSync: effects => effects, auth: effects => effects });
+  await worker.tickOnce(); await worker.tickOnce();
+  expect(calls).toEqual(['refresh', 'dispatch', 'refresh', 'dispatch']);
+});
+
+it('worker starts managed even when the parent has no managed-clone environment', () => {
+  vi.stubEnv('WE_DAEMON_MANAGED_CLONE', undefined);
+  startCiHealWorker({ createWorker: (_url, options) => {
+    expect(options.env.WE_DAEMON_MANAGED_CLONE).toBe('1');
+    expect(options.env.GIT_OPTIONAL_LOCKS).toBe('0');
+    return { on() {}, terminate() {} };
+  } });
+});
+
+it('each admission re-reads sibling claims and refuses unreadable claim evidence', () => {
+  let claims = [];
+  const now = Date.now();
+  const throttle = buildFixThrottle({ slotClaims: () => { if (claims === null) throw Error('unreadable'); return claims; },
+    settings: { cutover: 'enforce', fixCap: { ...RESOURCE_GATE_STANDARD.fixCap, floor: 2, ceiling: 2 } },
+    sendBackReservedSlots: 0, env: {}, gate: () => ({ admit: true }), log() {},
+    readSnap: () => ({ sampledAt: new Date(now).toISOString(), freshUntil: new Date(now + 1000).toISOString(), memory: { metric: 'available', availableMb: 10000, pressureLevel: 1 } }),
+    resolveFloor: () => ({ metric: 'available', floorMb: 1 }), nowMs: () => now });
+  expect(throttle.tryAdmit('fix').admit).toBe(true);
+  claims = [{ meta: { kind: 'fix' } }, { meta: { kind: 'ci-heal' } }];
+  expect(throttle.tryAdmit('ci-heal')).toMatchObject({ admit: false, kind: 'fix-cap' });
+  claims = null;
+  expect(throttle.tryAdmit('fix')).toMatchObject({ admit: false, kind: 'claims-unreadable' });
+});
+
+it('strict live claim reads refuse corrupt persisted old state instead of counting zero', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'heal-claims-'));
+  try {
+    mkdirSync(join(dir, 'old')); writeFileSync(join(dir, 'old', 'lock.json'), '{');
+    expect(() => listFixDispatchClaims(dir, { strict: true, liveOnly: true })).toThrow('incomplete fix claim');
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+it('concurrent phases cannot consume the same fixer seat and log an overlap skip', async () => {
+  const log = vi.fn(), main = createFixPassCoordination(undefined, log);
+  const worker = createFixPassCoordination(main.buffer, log);
+  let release; const pending = main.dispatch(() => new Promise(resolve => { release = resolve; }));
+  const dispatch = vi.fn();
+  expect(worker.dispatch(dispatch).refusals[0].kind).toBe('admission-held');
+  expect(dispatch).not.toHaveBeenCalled(); expect(log).toHaveBeenCalledWith('ci-heal-pass-skipped overlap');
+  release(); await pending;
+});
+
+it('fix and healer budgets share charges across overlapping passes and fail closed on unknown or oversized projections', async () => {
+  const main = createFixPassCoordination(), worker = createFixPassCoordination(main.buffer);
+  const baseline = { slots: 1, backlogMinutes: 0, maxWaitMinutes: 15, standardMinutes: { selected: 5, standards: 5 } };
+  await main.withPass(async () => {
+    expect(main.dispatch(() => main.queueBudget(baseline).tryAdmit('fix')).admit).toBe(true);
+    await worker.withPass(() => {
+      expect(worker.dispatch(() => worker.queueBudget(baseline).tryAdmit('ci-heal')).admit).toBe(false);
+      expect(worker.dispatch(() => worker.queueBudget(null).tryAdmit('ci-heal'))).toMatchObject({ admit: false, why: expect.stringContaining('retry next pass') });
+      expect(worker.dispatch(() => worker.queueBudget({ bypassed: 'unknown' }).tryAdmit('ci-heal')).admit).toBe(false);
+      expect(worker.dispatch(() => worker.queueBudget({ ...baseline, maxWaitMinutes: 1e12, standardMinutes: { selected: 1e10, standards: 1 } }).tryAdmit('fix'))).toMatchObject({ admit: false, why: expect.stringContaining('restart daemon after checking queue') });
+    });
+  });
+  main.resetIfIdle();
+  expect(main.dispatch(() => main.queueBudget(baseline).tryAdmit('ci-heal')).admit).toBe(true);
+});
+
+it.each([
+  { error: 'unreadable' }, { bodyEditFailures: 1 },
+  { holds: [{ pr: 1 }], applied: [{ pr: 1, ok: false }] },
+  { holds: [{ pr: 1 }], applied: [{ pr: 1, ok: true, labeled: false }] },
+])('healer refuses incomplete supersede evidence %j', async evidence => {
+  const ciHealTick = vi.fn(empty);
+  const result = await runCiHealPass(fixture({ ciHealTick,
+    supersedeTick: ({ repo }) => ({ repo, holds: [], applied: [], ...evidence }) }));
+  expect(ciHealTick).not.toHaveBeenCalled();
+  expect(result.refusals).toContainEqual(expect.objectContaining({ kind: 'supersede-unknown' }));
+});
+
+it('worker publishes supersede holds before healer planning', async () => {
+  const calls = [];
+  await runCiHealPass(fixture({ supersedeTick: ({ repo }) => { calls.push('hold'); return { repo, holds: [{ pr: 1 }], applied: [{ pr: 1, ok: true, labeled: true }] }; },
+    ciHealTick: () => { calls.push('heal'); return empty(); } }));
+  expect(calls).toEqual(['hold', 'hold', 'heal', 'heal']);
+});
+
+it('lease loss fences pending asynchronous work before it can dispatch again', async () => {
+  vi.useFakeTimers();
+  const coordination = createFixPassCoordination();
+  let alive = true; const dispatch = vi.fn(); const lost = vi.fn(() => coordination.fence());
+  const loop = runCiHealLoop({ sleep, maxPasses: 3, heartbeat: () => alive, onLeaseLost: lost,
+    passOnce: async () => { await sleep(150000); coordination.dispatch(dispatch); } });
+  await vi.advanceTimersByTimeAsync(1); alive = false;
+  await vi.advanceTimersByTimeAsync(150000); await loop;
+  expect(lost).toHaveBeenCalledTimes(1); expect(dispatch).not.toHaveBeenCalled();
+});
+
+it('dispatch boundary refuses lease loss after asynchronous preparation', async () => {
+  let alive = true, allowed;
+  const restart = vi.fn();
+  const worker = buildCiHealWorkerEffects({ heartbeat: () => alive, onRestart: restart, coordination: createFixPassCoordination(),
+    tick: options => { allowed = options.dispatchAllowed; }, refresh: () => ({}),
+    selfSync: effects => effects, auth: effects => effects });
+  await worker.tickOnce(); expect(allowed()).toBe(true); alive = false;
+  expect(allowed()).toBe(false); expect(restart).toHaveBeenCalled();
+});
+
+it('phase allowance never extends the configured recovery apply budget', async () => {
+  vi.stubEnv('WE_RECOVERY_APPLY_BUDGET_MS', '5');
+  const tick = vi.fn(empty);
+  await runTickAllRepos(fixture({ mainRedRebaseTick: tick }));
+  expect(tick.mock.calls.every(([options]) => options.applyBudgetMs === 5)).toBe(true);
+});
+
+it('worker carries the self-sync adoption probe into its own pass', async () => {
+  const probe = () => true, tick = vi.fn();
+  const worker = buildCiHealWorkerEffects({ tick, heartbeat: () => true, refresh: () => ({}), auth: effects => effects,
+    selfSync: effects => { effects.setAdoptYieldProbe(probe); return effects; } });
+  await worker.tickOnce();
+  expect(tick.mock.calls[0][0].adoptYieldProbe).toBe(probe);
+});
+
+it('worker fence notification terminates outstanding work before waiting for worker exit', () => {
+  const handlers = {}, terminate = vi.fn(), onLeaseLost = vi.fn();
+  startCiHealWorker({ onLeaseLost, createWorker: () => ({ on: (key, fn) => { handlers[key] = fn; }, terminate }) });
+  handlers.message('ci-heal-fenced');
+  expect(terminate).toHaveBeenCalledTimes(1); expect(onLeaseLost).toHaveBeenCalledTimes(1);
+});

@@ -5536,7 +5536,15 @@ that event loop cannot prove an independent cadence: ci-heal runs in a worker th
 the same PID and lease. Its scheduler tests inject time and sleep; the soak cadence probe
 observes two simulated hours with forty-minute main ticks. Worker shutdown must settle
 before lease release. Keep the worker's phase cursors in their separate file so independent
-writers cannot overwrite each other's fairness state.
+writers cannot overwrite each other's fairness state. Both threads use self-sync and claim-refresh
+wrappers; the worker starts with the managed-clone environment already set. Dispatch phases
+share an exclusive non-waiting guard, fresh fail-closed claim reads, and queue charges retained
+until overlapping passes end. Replay corrupt claims, concurrent capacity/queue demand,
+incomplete supersede publication, a tighter recovery apply budget, and lease loss during
+pending work. A lost lease fences dispatch and exits the worker immediately. Unsupported-work
+writers must hold the shared ledger lock across read-modify-write, including preservation of
+other actions for the same repository. Callers replace only their named action scope;
+corrupt records or inconsistent action scopes refuse replacement.
 
 The ci-heal loop suite also launches the production CLI with a test-only Node loader
 that substitutes IO function bodies and scales the interval. The startup call, worker

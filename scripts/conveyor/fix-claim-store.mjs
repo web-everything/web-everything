@@ -81,20 +81,21 @@ export function fixDispatchSessionName({ repo, pr, kind = 'fix' }) {
  * `fix-dispatch-claim.mjs#refreshLiveFixDispatchClaims` simply never refreshes it, and it recovers on its own plain TTL exactly
  * as before this fix.
  * @param {string} [lockRoot]
- * @param {{liveOnly?:boolean, nowMs?:number, leaseMinutes?:number}} [o]  `liveOnly` skips TTL-expired claims (#4295)
+ * `strict` refuses unreadable/incomplete evidence for concurrent admission readers.
+ * @param {{strict?:boolean, liveOnly?:boolean, nowMs?:number, leaseMinutes?:number}} [o]  `liveOnly` skips TTL-expired claims (#4295)
  * @returns {Array<{owner:string, path:string, pid:number|null, heartbeatAt:string, meta:{repo:string, pr:number, kind:string, headSha:string|null}}>}
  */
 export function listFixDispatchClaims(lockRoot = fixDispatchClaimRoot(), {
-  liveOnly = false, nowMs = Date.now(), leaseMinutes = DEFAULT_FIX_DISPATCH_CLAIM_TTL_MINUTES,
+  strict = false, liveOnly = false, nowMs = Date.now(), leaseMinutes = DEFAULT_FIX_DISPATCH_CLAIM_TTL_MINUTES,
 } = {}) {
   let dirNames;
-  try { dirNames = readdirSync(lockRoot); } catch { return []; }
+  try { dirNames = readdirSync(lockRoot); } catch (error) { if (strict && error.code !== 'ENOENT') throw error; return []; }
   const out = [];
   for (const dirName of dirNames) {
     let raw = '';
-    try { raw = readFileSync(join(lockRoot, dirName, 'lock.json'), 'utf8'); } catch { /* skip: no entry file */ }
+    try { raw = readFileSync(join(lockRoot, dirName, 'lock.json'), 'utf8'); } catch (error) { if (strict) throw error; }
     const entry = parseLockEntry(raw);
-    if (!entry || !entry.meta || !entry.meta.repo || !entry.meta.pr || !entry.meta.kind) continue;
+    if (!entry || !entry.meta || !entry.meta.repo || !entry.meta.pr || !entry.meta.kind) { if (strict) throw new Error('incomplete fix claim'); continue; }
     // #4295 — `liveOnly` drops a TTL-expired claim (a stale leftover must not hold a build/fix out).
     if (liveOnly && isLeaseExpired(entry, nowMs, leaseMinutes)) continue;
     out.push(entry);

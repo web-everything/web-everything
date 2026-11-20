@@ -68,7 +68,7 @@ import { assertCapability, repoProfile, briefTokensForRepo } from '../lib/repo-p
 import { resolvePrWorkUnit } from '../conveyor/pr-work-unit.mjs';
 import { freeLaneNumbers, fetchPrDiffPaths, queueBudgetFrom, queueCapWhy, fixerTableFor } from '../conveyor/reconcile-fix-dispatch.mjs'; // queueBudgetFrom/queueCapWhy: card xkyw1x4
 import { runReconcilePass } from '../conveyor/reconcile-pass.mjs';
-import { readUnsupported, recordUnsupported } from '../conveyor/unsupported-repo.mjs';
+import { recordUnsupported } from '../conveyor/unsupported-repo.mjs';
 import { readPrsFromFile } from '../conveyor/open-pr-fetch.mjs';
 import {
   acquireFixDispatchClaim, releaseFixDispatchClaim, fixDispatchClaimOwner, stampBorrowedRunnerPid,
@@ -496,7 +496,6 @@ export async function runReconcileCiHealDispatch({
 
   // Preserve any already-recorded `fix`/`review` unsupported rows for this repo — a DIFFERENT stage this file
   // knows nothing about — and replace only its own `ci-heal` rows with what THIS pass just computed.
-  const otherRows = readUnsupported({ path: unsupportedPath }).filter((row) => row.repo === repoKey && row.action !== 'ci-heal');
 
   const timeoutResults = [];
   for (const entry of (reconciled.dispatch ?? []).filter((row) => row.kind === 'ci-timeout-rerun')) {
@@ -523,11 +522,11 @@ export async function runReconcileCiHealDispatch({
       kind: 'unsupported-repo', repo: repoKey, prNumber: entry.prNumber, action: 'ci-heal',
       why: 'CI-heal dispatch requires a repo-specific brief and gate; the existing worker is WE-only.',
     }));
-    recordUnsupported({ repo: repoKey, rows: [...otherRows, ...refusals], path: unsupportedPath });
+    recordUnsupported({ repo: repoKey, rows: refusals, actions: ['ci-heal'], path: unsupportedPath });
     return { handled: refusals.length, deferred: [], nextCursor: null, dispatched: timeoutResults.filter(r => r.status === 'requested'), refusals: [...refusals, ...timeoutResults.filter(r => r.status !== 'requested')], timeoutFollowups, reconcileRefusals: reconciled.refusals.length, reconcileRefusalDetails: reconciled.refusals, owedFlush };
   }
   // `ci-heal` IS supported here — clear any stale `ci-heal` unsupported rows, preserving `fix`/`review` rows.
-  recordUnsupported({ repo: repoKey, rows: otherRows, path: unsupportedPath });
+  recordUnsupported({ repo: repoKey, rows: [], actions: ['ci-heal'], path: unsupportedPath });
 
   const resolveDiffPaths = fetchDiffPaths ?? ((pr) => fetchPrDiffPaths(pr, { root, repo: repoKey }));
   const lanes = [...(typeof pickFreeLanes === 'function' ? pickFreeLanes() : freeLaneNumbers({ root, lanePoolRepo: profile.lanePoolRepo }))];
