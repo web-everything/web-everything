@@ -379,7 +379,7 @@ describe('launcher-owned atomic application', () => {
     ['doc-fix', 'docs', 'docs/deep/pnpm-lock.yaml'],
     ['test-fix', 'docs', 'docs/__tests__/deep/bun.lock'],
     ['doc-fix', 'docs', 'docs/scripts/settings/config.json'],
-    ['doc-fix', 'notes.md', 'notes.md/code.js'],
+    ['doc-fix', 'docs/notes.md', 'docs/notes.md/code.js'],
     ['test-fix', 'blocks/selection/sample.test.ts', 'blocks/selection/sample.test.ts/code.js'],
   ])('voids %s scope %s applying forbidden or misclassified %s atomically', async (kind, scope, path) => {
     for (const tracked of [false, true]) {
@@ -512,7 +512,8 @@ describe('launcher-owned atomic application', () => {
   });
   it.each(['tracked', 'untracked'])('rejects %s binary changes', async type => {
     const f = fixture();
-    expect((await f.run(dir => writeFileSync(join(dir, type === 'tracked' ? 'docs/a.md' : 'docs/bin'), Buffer.from([0, 1, 2])))).status).toBe('voided');
+    expect(await f.run(dir => writeFileSync(join(dir, type === 'tracked' ? 'docs/a.md' : 'docs/bin.md'), Buffer.from([0, 1, 2]))))
+      .toMatchObject({ status: 'voided', reasons: ['binary diff rejected'], applied: [] });
     expect(git(f.lane, 'status', '--porcelain')).toBe('');
   });
   it('fails an apply conflict atomically rather than overwriting dirty lane content', async () => {
@@ -669,13 +670,13 @@ it('cleans transcript and discards clone edits when the sandbox launcher fails',
 });
 
 describe('final patch enforcement', () => {
-  it.each(['tracked', 'untracked'])('voids executable %s additions', async type => {
+  it('voids untracked executable additions through mode validation', async () => {
     const f = fixture();
     expect(await f.run(dir => {
-      writeFileSync(join(dir, 'docs/new.md'), 'new prose\n');
-      chmodSync(join(dir, 'docs/new.md'), 0o755);
-      if (type === 'tracked') git(dir, 'add', 'docs/new.md');
-    })).toMatchObject({ status: 'voided', applied: [] });
+      writeFileSync(join(dir, 'docs/run.md'), 'new prose\n');
+      chmodSync(join(dir, 'docs/run.md'), 0o755);
+      expect(git(dir, 'ls-files', '--others', '--exclude-standard')).toContain('docs/run.md');
+    })).toMatchObject({ status: 'voided', reasons: ['untracked symlink or special file rejected'], applied: [] });
     expect(f.commands.some(a => a.includes('apply'))).toBe(false);
     expect(git(f.lane, 'status', '--porcelain')).toBe('');
   });

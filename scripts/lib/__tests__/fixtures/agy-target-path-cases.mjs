@@ -1,9 +1,18 @@
 // Shared admission/apply decision table; fixture data, never filesystem targets.
 export const admissibleTargets = [
   'blocks/selection/__tests__/contract.test.ts', 'blocks/resource-cache/contract.spec.ts',
-  'docs/guide.md', 'README.md', 'docs/x/y.md', 'notes.mdx', 'docs/notes.txt',
+  'docs/guide.md', 'docs/x/y.md', 'docs/notes.txt',
 ];
 export const refusedTargets = [
+  'README.md', 'notes.mdx', 'other/guide.md',
+  'skills-src/review/review-agent-system-prompt.md', 'skills-src/review/guide.md',
+  'scripts/conveyor/briefs/x.md', 'docs/conveyor-brief.md', 'docs/conveyor/guide.md',
+  'docs/briefs/x.md', 'docs/worker-brief/x.md', 'docs/worker-brief.md',
+  'CLAUDE.md', 'docs/AGENTS.md', 'docs/CLAUDE.md', 'docs/some-prompt.md',
+  'docs/Some-PROMPT.md', 'docs/agent/guide.md', 'docs/skills-src/guide.md',
+  '.claude/guide.md', 'docs/.claude/guide.md',
+  'blocks/selection/prompt.test.ts', 'blocks/selection/brief.test.ts',
+
   'tests/helper.cjs', 'src/__tests__/helper.js', 'src/foo-unit.test.ts',
   'scripts/lib/__tests__/foo.test.mjs', 'src/__tests__/a.test.ts', 'src/a.spec.ts',
   'scripts/lib/__tests__/pr-merge-gate-ledger.test.mjs',

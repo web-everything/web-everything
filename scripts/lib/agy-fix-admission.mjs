@@ -5,12 +5,16 @@ import { criticalWorkVerdict } from './critical-work.mjs';
 
 // Node paths avoid Vite treating a dynamic new URL as an eager checkout-wide asset glob.
 const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), '../..');
-const isDoc = p => /\.(md|mdx|txt|rst)$/.test(p);
+// Only ordinary documentation beneath these directories is eligible; prose elsewhere is unknown scope.
+export const AGY_DOC_DIRECTORY_PREFIXES = Object.freeze(['docs/']);
+const inDocDirectory = p => AGY_DOC_DIRECTORY_PREFIXES.some(prefix => p.startsWith(prefix));
+const isDoc = p => inDocDirectory(p) && /\.(md|mdx|txt|rst)$/.test(p);
 const isDirectory = p => {
   try { return statSync(resolve(repoRoot, p)).isDirectory(); }
   catch { return false; }
 };
-const isDocScope = p => isDoc(p) || p === 'docs' || p.startsWith('docs/') && isDirectory(p);
+const isDocScope = p => isDoc(p) || AGY_DOC_DIRECTORY_PREFIXES.some(prefix => p === prefix.slice(0, -1))
+  || inDocDirectory(p) && isDirectory(p);
 // Only tests of these ordinary block contracts may be repaired by this provider.
 export const AGY_TEST_SUBJECT_PREFIXES = Object.freeze(['blocks/selection/', 'blocks/resource-cache/']);
 const inferTestSubject = p => p.replace(/(^|\/)(?:__tests__|tests)(?:\/|$)/g, '$1')
@@ -34,6 +38,12 @@ function admissible(p, scope) {
     // Any dot-segment is refused: .gitignore/.gitattributes inside docs change how git enumerates and filters files
     // (an ignore rule hides untracked files from the launcher's whole-run path check; audit).
     || p.split('/').some(s => !s || s === '.' || s === '..' || s.startsWith('.'))) return false;
+  // Instructions and worker inputs are enforcement surfaces even when stored as documentation.
+  if (/(^|\/)(skills-src|\.claude)(\/|$)/i.test(p)
+    || /^docs\/agent(?:\/|$)/i.test(p)
+    || /conveyor|brief/i.test(p)
+    || /^(?:AGENTS|CLAUDE)\.md$/i.test(p.split('/').at(-1))
+    || /prompt/i.test(p.split('/').at(-1))) return false;
   if (/^(\.github|scripts\/settings|backlog|agent-memory-src)(\/|$)/.test(p)
     || /(^|\/)(soak|breaks)(\/|$)/.test(p)
     || /\.(json|yml|yaml|toml)$/.test(p) || /\.real\.test\.mjs$/.test(p)

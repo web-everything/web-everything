@@ -105,6 +105,8 @@ const CRITICAL_PATH_PREFIXES = Object.freeze({
     'scripts/operations/agy-fix-provider.mjs', 'scripts/settings/agy-build.json',
     'scripts/lib/__tests__/agy-confined-', 'scripts/lib/__tests__/agy-sandbox.test.mjs',
     'scripts/lib/__tests__/agy-fix-admission.test.mjs',
+    // Shared fixture data controls the admission/application regression assertions.
+    'scripts/lib/__tests__/fixtures/',
     '.githooks/',
   ]),
   irreversible: Object.freeze([

@@ -335,3 +335,16 @@ describe('criticalWorkVerdict + isCriticalMiss — every security-proxy arm (PR 
     expect(isCriticalMiss(row, { tags: ['security'] })).toBe(true);
   });
 });
+
+describe('admission/application fixture trust boundary', () => {
+  it.each([
+    'scripts/lib/__tests__/fixtures/agy-target-path-cases.mjs',
+    'scripts/lib/__tests__/fixtures/future/nested-case.json',
+  ])('marks fixture %s critical, including repo-prefixed scope', path => {
+    expect(criticalWorkVerdict({ filesTouched: [path] }).critical).toBe(true);
+    expect(criticalWorkVerdict({ filesTouched: [`we:${path}`] }).critical).toBe(true);
+  });
+  it('does not match a similarly named fixture directory', () => {
+    expect(criticalWorkVerdict({ filesTouched: ['scripts/lib/__tests__/fixtures-other/case.mjs'] }).critical).toBe(false);
+  });
+});

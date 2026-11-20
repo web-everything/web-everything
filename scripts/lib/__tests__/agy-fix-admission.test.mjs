@@ -6,6 +6,8 @@ import { fileURLToPath } from 'node:url';
 import { criticalWorkVerdict } from '../critical-work.mjs';
 import { deriveAgyFixAdmission, isAdmissibleTargetPath, isAdmissibleTargetScope } from '../agy-fix-admission.mjs';
 
+import * as admission from '../agy-fix-admission.mjs';
+
 import { admissibleTargets, refusedTargets } from './fixtures/agy-target-path-cases.mjs';
 
 const admit = item => deriveAgyFixAdmission(item, { scope: item.scope });
@@ -177,3 +179,11 @@ it.each(['guard', 'gate', 'ledger', 'audit', 'sandbox', 'settings', 'merge'])(
     expect(isAdmissibleTargetPath(`blocks/selection/${name}.test.ts`)).toBe(false);
     expect(isAdmissibleTargetScope(`blocks/selection/${name}/__tests__`)).toBe(false);
   });
+
+it('exports a frozen directory allowlist for documentation admission', () => {
+  expect(admission.AGY_DOC_DIRECTORY_PREFIXES).toEqual(['docs/']);
+  expect(Object.isFrozen(admission.AGY_DOC_DIRECTORY_PREFIXES)).toBe(true);
+});
+it.each(refusedTargets)('refuses forbidden file %s as a scope too', path => {
+  expect(isAdmissibleTargetScope(path)).toBe(false);
+});

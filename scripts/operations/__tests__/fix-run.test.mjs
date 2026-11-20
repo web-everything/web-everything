@@ -2215,7 +2215,7 @@ async function withAgyConfinementFixture(run) {
   try { return await run(); } finally { guard.mockRestore(); }
 }
 
-it.each([['doc-fix', 'docs'], ['fix', 'blocks/selection/contract.test.ts'], ['feature', 'README.md']])('prototype fix provider passes %s kind, size and %s scope to a fake worker', async (kind, path) => withAgyConfinementFixture(async () => {
+it.each([['doc-fix', 'docs'], ['fix', 'blocks/selection/contract.test.ts'], ['feature', 'docs/guide.md']])('prototype fix provider passes %s kind, size and %s scope to a fake worker', async (kind, path) => withAgyConfinementFixture(async () => {
   const {resolveFixProvider} = await import('../fix-run.mjs');
   const provider = await resolveFixProvider('antigravity');
   const runTask = vi.fn(async ()=>({status:'ok',finalMessage:'done',stdout:'trace'}));
