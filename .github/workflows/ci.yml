@@ -205,6 +205,10 @@ jobs:
         # Keep --expect=9 in coverage-merge and the /9 unit-suite divisors in lockstep.
         shard: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
     steps:
+      - name: Start shard resource timer
+        if: ${{ needs.changes.outputs.light != 'true' }}
+        continue-on-error: true
+        run: echo "SHARD_START_SECONDS=$(cut -d. -f1 /proc/uptime)" >> "$GITHUB_ENV"
       # Keep the fast-check name green for an intentionally empty unit-test scope.
       - name: Card-only unit scope receipt
         if: ${{ needs.changes.outputs.light == 'true' }}
@@ -324,9 +328,15 @@ jobs:
         continue-on-error: true
         working-directory: web-everything
         run: |
-          cpu_count=$(nproc)
+          cpu_count=$(nproc 2>/dev/null) || cpu_count=null
+          [[ $cpu_count =~ ^[0-9]+$ ]] || cpu_count=null
           memory_peak=$(cat /sys/fs/cgroup/memory.peak 2>/dev/null) || memory_peak=unavailable
-          wall_seconds=$(cut -d. -f1 /proc/uptime)
+          [[ $memory_peak =~ ^[0-9]+$ ]] || memory_peak=unavailable
+          end_seconds=$(cut -d. -f1 /proc/uptime 2>/dev/null) || end_seconds=
+          wall_seconds=null
+          if [[ ${SHARD_START_SECONDS:-} =~ ^[0-9]+$ && $end_seconds =~ ^[0-9]+$ ]] && (( 10#$end_seconds >= 10#$SHARD_START_SECONDS )); then
+            wall_seconds=$((10#$end_seconds - 10#$SHARD_START_SECONDS))
+          fi
           printf 'nproc: %s\nmemory.peak: %s\nwall time (seconds): %s\n' "$cpu_count" "$memory_peak" "$wall_seconds" >> "$GITHUB_STEP_SUMMARY"
           printf '{"nproc":%s,"memory.peak":"%s","wall_seconds":%s}\n' "$cpu_count" "$memory_peak" "$wall_seconds" > shard-resources.json
 
@@ -640,6 +650,9 @@ jobs:
       matrix:
         shard: [1, 2, 3, 4, 5, 6, 7, 8]
     steps:
+      - name: Start shard resource timer
+        continue-on-error: true
+        run: echo "SHARD_START_SECONDS=$(cut -d. -f1 /proc/uptime)" >> "$GITHUB_ENV"
       - uses: actions/checkout@v4
         with:
           # quarantine-skip proves the PR's changed files against its merge base: depth 50 plus blobless main
@@ -664,9 +677,15 @@ jobs:
         if: always()
         continue-on-error: true
         run: |
-          cpu_count=$(nproc)
+          cpu_count=$(nproc 2>/dev/null) || cpu_count=null
+          [[ $cpu_count =~ ^[0-9]+$ ]] || cpu_count=null
           memory_peak=$(cat /sys/fs/cgroup/memory.peak 2>/dev/null) || memory_peak=unavailable
-          wall_seconds=$(cut -d. -f1 /proc/uptime)
+          [[ $memory_peak =~ ^[0-9]+$ ]] || memory_peak=unavailable
+          end_seconds=$(cut -d. -f1 /proc/uptime 2>/dev/null) || end_seconds=
+          wall_seconds=null
+          if [[ ${SHARD_START_SECONDS:-} =~ ^[0-9]+$ && $end_seconds =~ ^[0-9]+$ ]] && (( 10#$end_seconds >= 10#$SHARD_START_SECONDS )); then
+            wall_seconds=$((10#$end_seconds - 10#$SHARD_START_SECONDS))
+          fi
           printf 'nproc: %s\nmemory.peak: %s\nwall time (seconds): %s\n' "$cpu_count" "$memory_peak" "$wall_seconds" >> "$GITHUB_STEP_SUMMARY"
           printf '{"nproc":%s,"memory.peak":"%s","wall_seconds":%s}\n' "$cpu_count" "$memory_peak" "$wall_seconds" > shard-resources.json
 
@@ -678,6 +697,45 @@ jobs:
           name: shard-resources-soak-${{ matrix.shard }}
           path: shard-resources.json
           if-no-files-found: ignore
+
+  # One-PR acceptance evidence for the four-worker experiment; existing required checks stay unchanged.
+  worker-count-acceptance:
+    name: PR shards finish below 1050 seconds with no new failures
+    needs: [test-shard, daemon-soak-scope, soak-shard]
+    if: ${{ always() && github.event.pull_request.number == 7202 }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      actions: read
+    steps:
+      - uses: actions/github-script@v7
+        with:
+          script: |
+            const soak = '${{ needs.daemon-soak-scope.outputs.run }}';
+            if (!['true', 'false'].includes(soak)) throw new Error('Missing soak scope evidence');
+            const expected = [
+              ...Array.from({ length: 10 }, (_, i) => `test-shard (${i + 1})`),
+              ...(soak === 'true' ? Array.from({ length: 8 }, (_, i) => `soak-shard (${i + 1})`) : []),
+            ];
+            const jobs = await github.paginate(github.rest.actions.listJobsForWorkflowRun, {
+              ...context.repo, run_id: context.runId, filter: 'latest', per_page: 100,
+            });
+            const measured = jobs.filter(job => job.name.startsWith('test-shard (')
+              || (soak === 'true' && job.name.startsWith('soak-shard (')));
+            if (measured.length !== expected.length) throw new Error('Incomplete or unexpected shard inventory');
+            let longest = 0;
+            for (const name of expected) {
+              const matches = jobs.filter(job => job.name === name);
+              if (matches.length !== 1) throw new Error(`Missing or duplicate shard: ${name}`);
+              const job = matches[0];
+              const seconds = (Date.parse(job.completed_at) - Date.parse(job.started_at)) / 1000;
+              if (job.status !== 'completed' || job.conclusion !== 'success'
+                || !Number.isFinite(seconds) || seconds < 0 || seconds >= 1050) {
+                throw new Error(`${name}: conclusion=${job.conclusion}, wall_seconds=${seconds}; require success below 1050s`);
+              }
+              longest = Math.max(longest, seconds);
+            }
+            core.info(`All ${expected.length} shards succeeded; long pole ${longest}s < 1050s`);
 
   # THE required `daemon-soak` check (name unchanged from before the split — see the header above for why that
   # matters). Skips green in ~10s when `daemon-soak-scope` SUCCEEDED and found no daemon code touched, same as the

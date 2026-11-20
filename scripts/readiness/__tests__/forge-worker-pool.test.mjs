@@ -10,6 +10,7 @@ import {buildManifest, verifyReceipt} from '../remote-exec.mjs';
 import {scanMaterializedGuards} from './fixtures/forge-git-guards.mjs';
 import {cachedPublicGitExec} from './fixtures/forge-public-git.mjs';
 import {runSweepFixture, idleWorkerEvidence} from './fixtures/forge-sweep.mjs';
+import {resolveMaxTestWorkers} from '../../../vitest.shared';
 
 // Simulate only filesystem ownership; retain real directory modes/inodes and
 // run every production identity/ownership check on the supplied evidence.
@@ -90,7 +91,12 @@ describe('per-user worker reservations',()=>{
     request.env.WE_VITEST_MAX_WORKERS='1';
     expect((await runner.run(request)).code).toBe(0);
     expect(calls).toHaveBeenCalled();
-    for(const [call] of calls.mock.calls)expect(call.env).toMatchObject({WE_VITEST_MAX_WORKERS:'24',FORGE_SLOT_CPUS:'24'});
+    for(const [call] of calls.mock.calls){
+      expect(call.env).toMatchObject({WE_VITEST_MAX_WORKERS:'24',FORGE_SLOT_CPUS:'24'});
+      expect(call.env.CI).toBeUndefined();
+      expect(resolveMaxTestWorkers(call.env,24)).toBe(24);
+      expect(resolveMaxTestWorkers({...call.env,CI:'true'},24)).toBe(24);
+    }
     await runner.finish({...p,nonce});
     expect(await fs.readdir(join(root,'receipts'))).not.toContain('worker-active-1');
   });

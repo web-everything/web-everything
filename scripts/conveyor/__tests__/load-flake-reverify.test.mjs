@@ -7,6 +7,7 @@ import { runBounded } from '../../lib/bounded-child.mjs';
 import { RUNNER_LOCK_ROOT } from '../../../skills-src/conveyor/runner-lock.mjs';
 import { runLoadFlakeReverify, planLoadFlakeReverify, defaultReverifyIo, reverifyConfig, VERIFY_ENV_ALLOWLIST } from '../load-flake-reverify.mjs';
 import { buildLoadFlakeHoldComment, buildLoadFlakeResolvedComment } from '../stand-down.mjs';
+import { resolveMaxTestWorkers } from '../../../vitest.shared';
 // Pass-through spies: the suite never observes or writes the host's resource state unless a test stubs a decision.
 vi.mock('../../lib/resource-admission.mjs', async (importOriginal) => {
   const actual = await importOriginal();
@@ -228,6 +229,11 @@ describe('stale verification and push isolation (PR #3945 advisory, round 3)', (
 
 
 describe('verify environment allowlist', () => {
+  it('preserves a local load limiter through the producer into the Vitest resolver', () => {
+    const env = scrubVerifyEnv({ WE_VITEST_MAX_WORKERS: '2' });
+    expect(env.CI).toBeUndefined();
+    expect(resolveMaxTestWorkers(env, 12)).toBe(2);
+  });
   it('keeps only required knobs and replaces home and temp with scratch paths', () => {
     expect(scrubVerifyEnv({ PATH: '/bin', FAKE_API_KEY: 'x', OPENAI_API_KEY: 'x', SSH_AUTH_SOCK: '/s',
       AWS_ACCESS_KEY_ID: 'x', GH_TOKEN: 'x', HOME: '/Users/real', npm_config__authToken: 'x',

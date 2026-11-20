@@ -72,12 +72,19 @@ npm run test:unit -- --reporter=default --reporter=json --outputFile.json=covera
 `,
     // Non-failing measurement step (index 3): nproc, memory.peak, wall time. Never gates a shard.
     `
-cpu_count=$(nproc)
+cpu_count=$(nproc 2>/dev/null) || cpu_count=null
+[[ $cpu_count =~ ^[0-9]+$ ]] || cpu_count=null
 memory_peak=$(cat /sys/fs/cgroup/memory.peak 2>/dev/null) || memory_peak=unavailable
-wall_seconds=$(cut -d. -f1 /proc/uptime)
+[[ $memory_peak =~ ^[0-9]+$ ]] || memory_peak=unavailable
+end_seconds=$(cut -d. -f1 /proc/uptime 2>/dev/null) || end_seconds=
+wall_seconds=null
+if [[ \${SHARD_START_SECONDS:-} =~ ^[0-9]+$ && $end_seconds =~ ^[0-9]+$ ]] && (( 10#$end_seconds >= 10#$SHARD_START_SECONDS )); then
+wall_seconds=$((10#$end_seconds - 10#$SHARD_START_SECONDS))
+fi
 printf 'nproc: %s\\nmemory.peak: %s\\nwall time (seconds): %s\\n' "$cpu_count" "$memory_peak" "$wall_seconds" >> "$GITHUB_STEP_SUMMARY"
 printf '{"nproc":%s,"memory.peak":"%s","wall_seconds":%s}\\n' "$cpu_count" "$memory_peak" "$wall_seconds" > shard-resources.json
 `,
+    'echo "SHARD_START_SECONDS=$(cut -d. -f1 /proc/uptime)" >> "$GITHUB_ENV"',
   ],
   'coverage-merge': [
     `
@@ -211,15 +218,16 @@ function mirroredRunContext(job, text) {
   const setup = setupRuns.includes(text);
   const directory = text === 'npm ci\nnpm run build:tools' ? 'frontierui'
     : setup || job === 'standards' || (job === 'coverage-merge' && index === 1)
-      || (job === 'test-shard' && index > 0) || (job === 'integration-part' && index === 1) ? 'web-everything' : undefined;
+      || (job === 'test-shard' && index > 0 && index < 4) || (job === 'integration-part' && index === 1) ? 'web-everything' : undefined;
   const condition = job === 'test-shard' ? (setup ? fullUnit : [
     "${{ needs.changes.outputs.light == 'true' }}",
     "${{ needs.changes.outputs.light != 'true' && (matrix.shard != 10) }}",
     "${{ needs.changes.outputs.light != 'true' && (matrix.shard == 10) }}",
     "${{ always() && needs.changes.outputs.light != 'true' }}",
+    fullUnit,
   ][index]) : job === 'integration-part' && (setup || index === 1) ? fullIntegration : undefined;
   return {
-    'working-directory': directory, if: condition, shell: undefined, 'continue-on-error': job === 'test-shard' && index === 3 ? true : undefined,
+    'working-directory': directory, if: condition, shell: undefined, 'continue-on-error': job === 'test-shard' && (index === 3 || index === 4) ? true : undefined,
     env: job === 'changes' ? {
       EVENT_NAME: '${{ github.event_name }}', BASE_SHA: '${{ github.event.pull_request.base.sha }}',
       MG_BASE_SHA: '${{ github.event.merge_group.base_sha }}', BASE_REF: '${{ github.event.pull_request.base.ref }}',
