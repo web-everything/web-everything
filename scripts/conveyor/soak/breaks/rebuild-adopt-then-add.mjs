@@ -9,7 +9,9 @@
  * still discard the build.
  */
 import { execFileSync } from 'node:child_process';
-import { resolve } from 'node:path';
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join, resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 
 const REPO_ROOT = resolve(fileURLToPath(import.meta.url), '..', '..', '..', '..', '..');
@@ -25,6 +27,60 @@ const base = (over = {}) => ({
 });
 const gone = { stillWanted: (ref) => ref !== 'lane/a', registered: (ref) => ref !== 'lane/a' };
 const omitsLive = { liveApplied: [{ ref: 'lane/review-seat-fairness-m1', sha: SHA('b') }], carries: () => false };
+
+/** Replay the production registration, complete-chain reader and removal writer contracts, rather than
+ * declaring independence/authorship in matcher stubs. GitHub IO alone is injected; no network is needed. */
+export async function registryContractViolations(sourceRoot = REPO_ROOT) {
+  const from = (file) => import(pathToFileURL(resolve(sourceRoot, file)).href);
+  const { addOverlay, appendOverlayEvent, readOverlays, makePrBaseChain } = await from('scripts/lib/daemon-overlays.mjs');
+  const { readyOverlayDependencies, readOverlayEventLog } = await from('scripts/lib/daemon-rebuild/prepare.mjs');
+  const { matchReadyCandidate, classifyOverlayRemoval } = await from(ADOPT);
+  const { OPERATOR_LOGINS } = await from('scripts/lib/marker-authorship.mjs');
+  const root = mkdtempSync(join(tmpdir(), 'soak-adopt-registry-'));
+  const env = { ...process.env, WE_DAEMON_OVERLAY_DIR: join(root, 'overlays') };
+  const violations = [];
+  try {
+    addOverlay(root, { ref: 'lane/a', pr: 100 }, { env });
+    addOverlay(root, { ref: 'lane/review-seat-fairness-m1', pr: 99 }, { env });
+    const chainOf = makePrBaseChain({ root, env, slug: 'test/repo', gh: () => ({ baseRefName: 'main' }) });
+    const overlays = readOverlays(root, { env });
+    const dependencies = readyOverlayDependencies
+      ? await readyOverlayDependencies({ applied: base().ready.adopt.applied, overlays, chainOf, tipOf: () => SHA('a') })
+      : new Map(overlays.map((o) => [o.ref, o.dependsOn ?? null]));
+    const match = matchReadyCandidate(base({ ...omitsLive, readdable: (ref) => overlays.some((o) => o.ref === ref),
+      dependsOn: (ref) => dependencies.get(ref) ?? null }));
+    if (!match.adopt) violations.push({ invariant: 'real-registration-adopts', detail: match.reason });
+
+    addOverlay(root, { ref: 'lane/a', dependsOn: [] }, { env });
+    addOverlay(root, { ref: 'lane/a', stackBases: ['lane/review-seat-fairness-m1'] }, { env });
+    if (Object.hasOwn(readOverlays(root, { env }).find((o) => o.ref === 'lane/a'), 'dependsOn')) {
+      violations.push({ invariant: 'reregistration-clears-independence', detail: 'stale declaration survived changed stack' });
+    }
+    appendOverlayEvent(root, { kind: 'added', ref: 'lane/a', at: '2026-11-18T20:00:00Z' }, { env });
+    // Exercise the CLI's credential-to-writer adapter with hermetic executables, not an asserted actor.
+    const bin = join(root, 'bin');
+    mkdirSync(bin);
+    writeFileSync(join(bin, 'git'), `#!/usr/bin/env node
+const args = process.argv.slice(2);
+process.stdout.write(args.includes('ls-remote') ? ${JSON.stringify(`${SHA('a')}\trefs/heads/lane/a\n`)} : 'fixture-origin\\n');
+`, { mode: 0o755 });
+    writeFileSync(join(bin, 'gh'), `#!/usr/bin/env node
+if (process.argv[2] !== 'api' || process.argv[3] !== 'user') process.exit(1);
+process.stdout.write(${JSON.stringify(`${OPERATOR_LOGINS[0]}\n`)});
+`, { mode: 0o755 });
+    const output = execFileSync(process.execPath, [resolve(sourceRoot, 'scripts/daemon-overlay.mjs'), 'remove', `--clone=${root}`,
+      '--ref=lane/a', '--reason=no longer wanted', '--json'], {
+      env: { ...env, PATH: `${bin}:${env.PATH ?? ''}`, GH_TOKEN: 'stub', HOME: root }, timeout: 10_000, stdio: 'pipe', encoding: 'utf8',
+    });
+    const events = readOverlayEventLog(root, env);
+    if (JSON.parse(output).removed !== true || events.at(-1)?.kind !== 'removed' || events.at(-1)?.tip !== SHA('a')) {
+      violations.push({ invariant: 'real-removal-writer', detail: 'CLI did not record removal of the expected tip' });
+    }
+    const removal = classifyOverlayRemoval({ ref: 'lane/a', sha: SHA('a'), events });
+    if (removal !== 'benign') violations.push({ invariant: 'real-removal-adopts', detail: removal });
+    return violations;
+  } finally { rmSync(root, { recursive: true, force: true }); }
+}
 
 export const CASES = [
   { id: 'benign-removal-adopts', args: { ...gone, removalSafety: () => 'benign' }, adopts: true, rebuildAfter: ['lane/a'] },
@@ -51,18 +107,21 @@ const m = matchReadyCandidate({
   nowMs: Date.parse('2026-11-18T22:50:00Z'), maxAgeMs: 3600000,
   stillWanted: (r) => r !== 'lane/a', registered: (r) => r !== 'lane/a', removalSafety: () => 'benign',
 });
-console.log(m.adopt ? 'yes' : 'no');
+const { registryContractViolations } = await import(process.argv[2]);
+const contracts = await registryContractViolations(process.argv[3]);
+console.log(m.adopt && contracts.length === 0 ? 'yes' : 'no');
 `;
 
 export default {
   id: 'rebuild-adopt-then-add',
   title: 'a smoke-passed rebuild candidate is adopted when the overlay set moved for a benign reason (adopt, then add)',
   card: 'live 2026-11-18: review daemon discarded two passing candidates (17:28 and 18:06 ET) and never adopted',
-  fixedBy: { sha: 'pending', where: 'lane/rebuild-adopt-then-add', paths: [ADOPT, 'scripts/lib/daemon-rebuild/prepare.mjs'] },
+  fixedBy: { sha: 'pending', where: 'lane/rebuild-adopt-then-add', paths: [ADOPT, 'scripts/lib/daemon-rebuild/prepare.mjs',
+    'scripts/lib/daemon-overlays.mjs', 'scripts/daemon-overlay.mjs'] },
   fixPresent(root) {
     try {
       const url = pathToFileURL(resolve(root, ADOPT)).href;
-      const out = execFileSync(process.execPath, ['--input-type=module', '-e', PROBE, url], { encoding: 'utf8', timeout: 20_000 });
+      const out = execFileSync(process.execPath, ['--input-type=module', '-e', PROBE, url, import.meta.url, root], { encoding: 'utf8', timeout: 20_000 });
       return out.trim() === 'yes';
     } catch { return false; }
   },
@@ -70,6 +129,7 @@ export default {
     const violations = [];
     try {
       const { matchReadyCandidate } = await import(pathToFileURL(resolve(sourceRoot, ADOPT)).href);
+      violations.push(...await registryContractViolations(sourceRoot));
       for (const c of CASES) {
         const m = matchReadyCandidate({ ...base(), ...c.args });
         log?.(`${c.id}: ${m.adopt ? 'adopt' : m.reason}`);

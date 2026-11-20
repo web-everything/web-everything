@@ -22,7 +22,7 @@ import {
   rebuildClone, readRebuildState, rebuildStatePath, readReadyCandidate, readyCandidatePath, matchReadyCandidate,
 } from '../daemon-rebuild.mjs';
 import { acquireRead, releaseRead } from '../daemon-clone-lock.mjs';
-import { addOverlay, appendOverlayEvent, readOverlays, removeOverlay, overlayFilePath } from '../daemon-overlays.mjs';
+import { addOverlay, appendOverlayEvent, readOverlays, removeOverlay, overlayFilePath, makePrBaseChain } from '../daemon-overlays.mjs';
 import { overlayRetiredByOperator, readyBuildVerified } from '../daemon-rebuild/adopt.mjs';
 import * as adoption from '../daemon-rebuild/adopt.mjs';
 import { OPERATOR_LOGINS } from '../marker-authorship.mjs';
@@ -110,6 +110,47 @@ afterEach(() => {
 });
 
 describe('the Git proof of omitted content in the candidate build', () => {
+  it('next tick restores an omitted registered overlay after adopting a candidate with a real registration', async () => {
+    const { originDir, cloneDir, env } = makeFixture();
+    env.WE_DAEMON_REBUILD_SKIP_UNRELATED = '0';
+    env.WE_DAEMON_OVERLAY_EDGE_RESOLVE = '0';
+    const omitted = 'lane/review-seat-fairness-m1';
+    pushBranch(originDir, omitted, (dir) => writeFile(dir, 'omitted.txt', 'live overlay\n'));
+    addOverlay(cloneDir, { ref: omitted, pr: 99 }, { env });
+    const chain = makePrBaseChain({ root: cloneDir, env, slug: 'test/repo', gh: (args) => {
+      if (args[0] === 'pr' && args[1] === 'view') return { baseRefName: 'main' };
+      if (args[0] === 'api') return { data: { repository: { pullRequest: { timelineItems: { nodes: [] } } } } };
+      throw new Error(`unexpected GitHub query: ${args.join(' ')}`);
+    } });
+    const options = { root: cloneDir, env, prState: async () => 'OPEN', prBaseChain: chain, lockOpts: LOCK_OPTS };
+    expect(await rebuildClone({ ...options, runSmoke: async () => PASS })).toMatchObject({ adopted: true });
+
+    // Build an older plan with a carried overlay, while the running build keeps the omitted overlay.
+    removeOverlay(cloneDir, omitted, { env });
+    pushBranch(originDir, 'lane/carried', (dir) => writeFile(dir, 'carried.txt', 'carried overlay\n'));
+    addOverlay(cloneDir, { ref: 'lane/carried', pr: 100 }, { env });
+    expect(readOverlays(cloneDir, { env })[0]).not.toHaveProperty('dependsOn');
+    const { runSmoke, endTick } = passWhileSiblingStartsTick(cloneDir, env);
+    let candidate;
+    try {
+      expect(await rebuildClone({ ...options, runSmoke })).toMatchObject({ reason: 'tick-in-progress' });
+      candidate = readReadyCandidate(cloneDir, env).adopt.finalSha;
+    } finally { endTick(); }
+    addOverlay(cloneDir, { ref: omitted, pr: 99 }, { env });
+    advanceMain(originDir, (dir) => writeFile(dir, 'later.txt', 'later\n'));
+    const noSmoke = vi.fn(async () => PASS);
+    expect(await rebuildClone({ ...options, runSmoke: noSmoke })).toMatchObject({ reason: 'ready-adopted' });
+    expect(gitOk(cloneDir, ['rev-parse', 'HEAD']).trim()).toBe(candidate);
+    expect(existsSync(join(cloneDir, 'omitted.txt'))).toBe(false);
+    expect(noSmoke).not.toHaveBeenCalled();
+    const restoreSmoke = vi.fn(async () => PASS);
+    expect(await rebuildClone({ ...options, runSmoke: restoreSmoke })).toMatchObject({ adopted: true });
+    expect(readFileSync(join(cloneDir, 'omitted.txt'), 'utf8')).toBe('live overlay\n');
+    expect(readFileSync(join(cloneDir, 'carried.txt'), 'utf8')).toBe('carried overlay\n');
+    expect(readRebuildState(cloneDir, env).adopted.applied.map((a) => a.ref)).toContain(omitted);
+    expect(restoreSmoke).toHaveBeenCalledOnce();
+  }, 30_000);
+
   it('accepts equivalent content without requiring overlay ancestry, but rejects extra merged content', () => {
     const { originDir, cloneDir } = makeFixture();
     const overlay = pushBranch(originDir, 'lane/omitted', (dir) => writeFile(dir, 'overlay.txt', 'overlay\n'));

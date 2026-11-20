@@ -57,6 +57,21 @@ describe(`superseded-omits-live-overlay: ${seat} (18:06 ET discard)`, () => {
 });
 
 describe('addOverlay dependsOn', () => {
+  it('invalidates an unstated declaration on re-registration, including a changed stack', async () => {
+    const { mkdtempSync, rmSync } = await import('node:fs');
+    const { tmpdir } = await import('node:os');
+    const { join } = await import('node:path');
+    const { addOverlay, readOverlays } = await import('../../daemon-overlays.mjs');
+    const root = mkdtempSync(join(tmpdir(), 'overlay-deps-update-'));
+    const env = { ...process.env, WE_DAEMON_OVERLAY_DIR: join(root, 'overlays') };
+    try {
+      for (const update of [{ stackBases: ['lane/base'] }, {}]) {
+        addOverlay(root, { ref: 'lane/x', dependsOn: [] }, { env });
+        addOverlay(root, { ref: 'lane/x', ...update }, { env });
+        expect(readOverlays(root, { env })[0]).not.toHaveProperty('dependsOn');
+      }
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  });
   it('stores a declared list (explicit [] asserts independence) and leaves an undeclared entry undeclared', async () => {
     const { mkdtempSync, rmSync } = await import('node:fs');
     const { tmpdir } = await import('node:os');
@@ -85,6 +100,50 @@ describe('classifyOverlayRemoval hardening', () => {
   const added = { kind: 'added', ref: 'lane/a', at: '2026-11-18T20:00:00Z' };
   const gone = (e) => ({ kind: 'removed', ref: 'lane/a', reason: 'no longer wanted', tip, at: '2026-11-18T21:00:00Z', ...e });
   const classify = (events, extra = {}) => classifyOverlayRemoval({ ref: 'lane/a', sha: tip, events, ...extra });
+  it('authenticated manual removal rejects a different applied tip', () => {
+    const op = { actor: OPERATOR_LOGINS[0], source: 'removeRegistration' };
+    expect(classify([added, gone(op)])).toBe('benign');
+    expect(classify([added, gone({ ...op, tip: SHA('9') })])).toBe('unknown');
+  });
+  it.each(['operator', 'outsider', 'unreadable'])('classifies the real removeRegistration writer with %s credentials', async (identity) => {
+    const { mkdtempSync, rmSync } = await import('node:fs');
+    const { tmpdir } = await import('node:os');
+    const { join } = await import('node:path');
+    const { addOverlay, appendOverlayEvent } = await import('../../daemon-overlays.mjs');
+    const { removeRegistration } = await import('../../../daemon-overlay.mjs');
+    const { readOverlayEventLog } = await import('../prepare.mjs');
+    const root = mkdtempSync(join(tmpdir(), 'removal-contract-'));
+    const env = { ...process.env, WE_DAEMON_OVERLAY_DIR: join(root, 'overlays') };
+    try {
+      addOverlay(root, { ref: 'lane/a' }, { env });
+      appendOverlayEvent(root, added, { env });
+      expect(removeRegistration({ root, ref: 'lane/a', by: OPERATOR_LOGINS[0], actor: OPERATOR_LOGINS[0], reason: 'no longer wanted', env,
+        deps: { tip: () => tip, viewerLogin: () => {
+          if (identity === 'unreadable') throw new Error('unavailable');
+          return identity === 'operator' ? OPERATOR_LOGINS[0].toUpperCase() : 'outsider';
+        } } }).removed).toBe(true);
+      expect(classify(readOverlayEventLog(root, env))).toBe(identity === 'operator' ? 'benign' : 'unknown');
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  });
+  it('classifies the real authenticated auto-retire writer and rejects a different tip', async () => {
+    const { mkdtempSync, rmSync } = await import('node:fs');
+    const { tmpdir } = await import('node:os');
+    const { join } = await import('node:path');
+    const { addOverlay, appendOverlayEvent } = await import('../../daemon-overlays.mjs');
+    const { retireRegistration } = await import('../../../daemon-overlay.mjs');
+    const { readOverlayEventLog } = await import('../prepare.mjs');
+    const root = mkdtempSync(join(tmpdir(), 'retire-contract-'));
+    const env = { ...process.env, WE_DAEMON_OVERLAY_DIR: join(root, 'overlays') };
+    try {
+      addOverlay(root, { ref: 'lane/a' }, { env });
+      appendOverlayEvent(root, added, { env });
+      expect(await retireRegistration({ root, ref: 'lane/a', expectedTip: tip, actor: OPERATOR_LOGINS[0], env,
+        deps: { tip: () => tip, prove: () => ({ action: 'retire', tip, reason: 'retired' }) } })).toMatchObject({ retired: true });
+      const events = readOverlayEventLog(root, env);
+      expect(classify(events)).toBe('benign');
+      expect(classifyOverlayRemoval({ ref: 'lane/a', sha: SHA('9'), events })).toBe('unknown');
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  });
   it('a manual removed event is benign only with an authenticated actor and recorded source', () => {
     expect(classify([added, gone()])).toBe('unknown');
     expect(classify([added, gone({ actor: 'someone-else', source: 'removeRegistration' })])).toBe('unknown');

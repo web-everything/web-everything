@@ -288,7 +288,7 @@ export function addOverlay(root, {
       if (bases) next.stackBases = bases;
       if (conflictOverride) next.conflictOverride = conflictOverride;
       if (deps) next.dependsOn = deps;
-      else if (dependsOn !== undefined) delete next.dependsOn; // a malformed update voids the old declaration (unknown)
+      else delete next.dependsOn; // re-registration may change the tip/stack: independence must be restated
       list[idx] = next;
     }
     return writeOverlays(root, list, { env });
