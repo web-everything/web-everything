@@ -7,11 +7,12 @@ const ROOT = resolve(fileURLToPath(import.meta.url), '../../../../..');
 const SOURCE = 'skills-src/conveyor/review-daemon.mjs';
 
 // Runs in a fresh process per scenario: module queue state and operator policy are both isolated.
-async function exercise(root, kind) {
-  const { createRequire, syncBuiltinESMExports } = await import('node:module');
-  const { mkdtempSync, mkdirSync, writeFileSync, rmSync } = await import('node:fs');
-  const { join } = await import('node:path');
-  const { pathToFileURL } = await import('node:url');
+// The child supplies its native loader; Vitest must not rewrite imports inside the serialized function.
+async function exercise(root, kind, load) {
+  const { createRequire, syncBuiltinESMExports } = await load('node:module');
+  const { mkdtempSync, mkdirSync, writeFileSync, rmSync } = await load('node:fs');
+  const { join } = await load('node:path');
+  const { pathToFileURL } = await load('node:url');
   const os = createRequire(import.meta.url)('node:os');
   const directory = mkdtempSync(join(os.tmpdir(), 'red-team-reserve-soak-'));
   // The operator reader deliberately ignores HOME. Redirect the account database seam in this
@@ -34,7 +35,7 @@ async function exercise(root, kind) {
     process.env.WE_REVIEW_MAX_LIVE_ROUNDS = '8';
     process.env.WE_UNDER_TEST = '1';
     writeFileSync(process.env.WE_RED_TEAM_QUEUE_FILE, JSON.stringify(entries));
-    const { cliReviewTickOpts, runReviewTick } = await import(pathToFileURL(join(root, 'skills-src/conveyor/review-daemon.mjs')).href);
+    const { cliReviewTickOpts, runReviewTick } = await load(pathToFileURL(join(root, 'skills-src/conveyor/review-daemon.mjs')).href);
     const production = cliReviewTickOpts({ log: { error() {} }, listCommands: () => '',
       readLivePr: () => ({ state: kind === 'terminal' ? 'MERGED' : 'OPEN',
         isDraft: false, headRefOid: head, comments: [] }) });
@@ -66,7 +67,7 @@ export default {
   async run({ sourceRoot = ROOT } = {}) {
     const violations = [];
     for (const kind of ['runnable', 'blocked', 'terminal']) {
-      const code = `const report = await (${exercise.toString()})(${JSON.stringify(sourceRoot)}, ${JSON.stringify(kind)}); process.stdout.write(JSON.stringify(report));`;
+      const code = `const load = specifier => import(specifier); const report = await (${exercise.toString()})(${JSON.stringify(sourceRoot)}, ${JSON.stringify(kind)}, load); process.stdout.write(JSON.stringify(report));`;
       const result = spawnSync(process.execPath, ['--input-type=module', '-e', code], {
         encoding: 'utf8', timeout: 30_000, maxBuffer: 1024 * 1024,
         env: { ...process.env, WE_UNDER_TEST: '1' },
