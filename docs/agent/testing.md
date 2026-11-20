@@ -5276,10 +5276,16 @@ in their child environment; either inherited flag makes selection unlimited. Kee
 controls asserting complete selection under each flag.
 Before graph-reachable tests replace changed-file targets, require every changed target
 in the tracked inventory; an absent target (including a committed deletion) forces the full suite.
+Readiness also requires each changed non-test target to reach at least one graph test;
+an unrelated changed test cannot mask a target with no reachable tests. Missing or
+unreadable graph sources force readiness to the full suite. The local bounded gate
+skips ENOENT sources while retaining edges from their surviving importers; other
+read errors retain the plain `vitest related` fallback.
 
 `selection-replay.mjs` compares import-only and static selection on the current tracked
 tree. PR diff test paths are only related-test proxies. Supply `--evidence=relative.json`
-with failing/related test lists to assess misses; absent evidence is labelled incomplete.
+with failing/related test lists to assess misses; absent evidence is labelled incomplete
+and its expected count and miss lists are `null`.
 A historical miss cannot be attributed to the parser merely because it happened:
 probe the actual imports. The current merge-gate-hold-class test is a direct importer
 and is reached even with all new static edge kinds disabled.

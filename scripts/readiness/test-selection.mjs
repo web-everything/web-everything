@@ -58,7 +58,7 @@ import { fileURLToPath } from 'node:url';
 import { dirname, resolve, join } from 'node:path';
 import { isBlastRadiusPath, isStatutePath, isGateSelfPath } from '../lib/review-escalation.mjs';
 import { writeAllSync } from '../lib/write-all-sync.mjs';
-import { buildReverseImportGraph, selectRelatedTests, isVitestTestFile } from '../lib/related-test-selection.mjs';
+import { buildReverseImportGraph, selectRelatedTests, isVitestTestFile, testDepths } from '../lib/related-test-selection.mjs';
 import { loadCiSelection } from '../lib/ci-selection-settings.mjs';
 import { admittedArgv } from './heavy-admission.mjs';
 
@@ -339,7 +339,7 @@ export function changedFilesSince({ base = 'origin/main', runGit } = {}) {
  * @param {{base?: string, runGit: (args: string[]) => string, env?: Record<string,string|undefined>}} args
  * @returns {SelectionDecision & {changedFiles: string[]|null}}
  */
-export function selectTests({ base = 'origin/main', runGit, env = process.env, files, readFile, maxTests, maxDepth } = {}) {
+export function selectTests({ base = 'origin/main', runGit, env = process.env, files, readFile, maxTests, maxDepth, selectionPolicy } = {}) {
   const flagEnabled = selectionFlagEnabled(env);
   const changedFiles = changedFilesSince({ base, runGit });
   if (changedFiles === null) {
@@ -357,13 +357,16 @@ export function selectTests({ base = 'origin/main', runGit, env = process.env, f
     const absentTargets = changedFiles.filter(path => !inventory.has(path));
     if (absentTargets.length) return { ...decision, mode: 'full',
       reasons: [`changed dependency target(s) absent from tracked inventory (${absentTargets.join(', ')}) — full suite (deleted dependencies cannot be resolved)`] };
-    const settings = loadCiSelection({ env });
+    const settings = loadCiSelection({ ...selectionPolicy, env });
     const reverse = buildReverseImportGraph({ files, readFile, staticEdges: settings.staticEdges });
     if (reverse.unreadable) return { ...decision, mode: 'full',
       reasons: [`${reverse.unreadable} unreadable graph source(s) — full suite (incomplete dependency evidence)`] };
+    if (reverse.missing) return { ...decision, mode: 'full',
+      reasons: [`${reverse.missing} missing graph source(s) — full suite (incomplete dependency evidence)`] };
+    const unreachable = changedFiles.filter(path => !isVitestTestFile(path) && testDepths([path], reverse).size === 0);
+    if (unreachable.length) return { ...decision, mode: 'full',
+      reasons: [`graph selection yielded zero tests for non-test changed files (${unreachable.join(', ')}) — full suite`] };
     const selection = selectRelatedTests({ changedFiles, reverse, env, maxTests, maxDepth, settings });
-    if (selection.fullTestCount === 0 && changedFiles.some(path => !isVitestTestFile(path))) return { ...decision, mode: 'full',
-      reasons: ['graph selection yielded zero tests for non-test changed files — full suite'] };
     return { ...decision, selection, partial: selection.partial,
       selectedFiles: selection.tests ?? selection.reachableTests,
       reasons: [...decision.reasons, `${selection.partial ? 'partial: ' : ''}${selection.reason}`] };

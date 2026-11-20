@@ -14,7 +14,10 @@ export function replaySelections({ records, files, readFile, aliases }) {
   const old = buildReverseImportGraph({ files, readFile, staticEdges: { spawnPath: false, alias: false, literalRead: false } });
   const current = buildReverseImportGraph({ files, readFile, aliases });
   return records.map(({ pr, changedFiles, testFiles, evidenceComplete = false }) => {
-    const expected = [...new Set(testFiles ?? changedFiles.filter(isVitestTestFile))];
+    // Changed tests seed themselves at depth zero; they cannot measure missed dependencies.
+    if (!evidenceComplete || !Array.isArray(testFiles))
+      return { pr, evidenceComplete: false, expectedCount: null, oldMissed: null, newMissed: null };
+    const expected = [...new Set(testFiles)];
     const missing = reverse => {
       const selected = testDepths(changedFiles, reverse);
       return expected.filter(test => !selected.has(test));
@@ -38,7 +41,7 @@ export function runReplayCli(argv, { runGh, runGit, readFile = readFileSync, pri
   });
   const rows = replaySelections({ records, files: lines(runGit(['ls-files'])), readFile: path => readFile(path, 'utf8') });
   for (const row of rows) print(JSON.stringify(row));
-  if (rows.some(row => !row.evidenceComplete)) print('incomplete: diff tests only; supply failing/related test evidence with --evidence. Current-tree replay.');
+  if (rows.some(row => !row.evidenceComplete)) print('incomplete: miss counts unavailable; supply failing/related test evidence with --evidence. Current-tree replay.');
   return rows;
 }
 

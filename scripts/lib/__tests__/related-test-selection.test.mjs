@@ -3,10 +3,22 @@
  * @description #5128 — bounded selection keeps direct importers; all fixtures live in memory.
  */
 import { describe, expect, it, vi } from 'vitest';
+import * as fs from 'node:fs';
 import { replaySelections, runReplayCli } from '../../readiness/selection-replay.mjs';
-import { selectTests } from '../../readiness/test-selection.mjs';
-import { buildReverseImportGraph, resolveSpecifier, testDepths, selectRelatedTests, isVitestTestFile, resolvedImportsOf } from '../related-test-selection.mjs';
-import { loadCiSelection } from '../ci-selection-settings.mjs';
+import { selectTests as selectTestsWithPolicy } from '../../readiness/test-selection.mjs';
+import { DEFAULT_SELECTION, buildReverseImportGraph, resolveSpecifier, testDepths, selectRelatedTests, isVitestTestFile, resolvedImportsOf } from '../related-test-selection.mjs';
+import { ciSelectionValidators, loadCiSelection as loadCiSelectionWithPolicy } from '../ci-selection-settings.mjs';
+
+vi.mock('node:fs', async importOriginal => {
+  const actual = await importOriginal();
+  const observed = Object.fromEntries(['readFileSync', 'readFile', 'existsSync', 'statSync', 'accessSync', 'realpathSync']
+    .map(key => [key, Object.assign(vi.fn(actual[key]), actual[key])]));
+  return { ...actual, ...observed, default: { ...actual.default, ...observed } };
+});
+
+const emptyPolicy = { platform: {}, tool: {}, operatorOverride: {} };
+const loadCiSelection = options => loadCiSelectionWithPolicy({ ...emptyPolicy, ...options });
+const selectTests = options => selectTestsWithPolicy({ selectionPolicy: emptyPolicy, ...options });
 
 const graph = files => buildReverseImportGraph({ files: Object.keys(files), readFile: path => files[path] });
 function hubFiles() {
@@ -134,6 +146,8 @@ describe('#5128 — bounded related-test selection', () => {
     const files = hubFiles();
     const reverse = buildReverseImportGraph({ files: [...Object.keys(files), 'gone.mjs'],
       readFile: path => { if (path === 'gone.mjs') throw Object.assign(new Error('ENOENT'), { code: 'ENOENT' }); return files[path]; } });
+    expect(reverse.missing).toBe(1);
+    expect(reverse.unreadable).toBe(0);
     expect(selectRelatedTests({ env: {}, changedFiles: ['hub.mjs', 'changed.test.mjs'], reverse, maxTests: 5, maxDepth: 2 }))
       .toMatchObject({ status: 'selection-truncated', depth: 1, tests: ['changed.test.mjs', 'direct0.test.mjs', 'direct1.test.mjs'] });
   });
@@ -202,6 +216,31 @@ describe('S1 static edges', () => {
     expect(reach("spawn('node', ['scripts/child.mjs']); readFileSync('scripts/child.mjs'); import 'we:scripts/child.mjs'",
       undefined, {}, { staticEdges: { spawnPath: false, literalRead: false, alias: false } }).size).toBe(0);
   });
+  it('retains sibling alias keys without reading sibling repositories', () => {
+    const files = { 'consumer.test.mjs': "import '@external/x'; import '@frontierui/plugs/x'; import '@frontierui/plugs/absent'",
+      'plugs/x.ts': '' };
+    const reads = [];
+    const nativeReaders = [fs.readFileSync, fs.readFile, fs.existsSync, fs.statSync, fs.accessSync, fs.realpathSync];
+    const implementations = nativeReaders.map(reader => reader.getMockImplementation());
+    for (const reader of nativeReaders) reader.mockClear().mockImplementation(path => {
+      reads.push(String(path));
+      throw new Error(`unexpected native filesystem access: ${path}`);
+    });
+    try {
+      const reverse = buildReverseImportGraph({ files: Object.keys(files), aliases: {
+        '@external/*': ['../external/src/*'], '@frontierui/plugs/*': ['../frontierui/plugs/*'],
+      }, readFile: vi.fn(path => {
+        reads.push(path);
+        expect(Object.hasOwn(files, path)).toBe(true);
+        return files[path];
+      }) });
+      for (const target of ['@external/x', '@frontierui/plugs/x', '@frontierui/plugs/absent', 'plugs/x.ts']) {
+        expect(testDepths([target], reverse).has('consumer.test.mjs')).toBe(true);
+      }
+      expect(reads.sort()).toEqual(Object.keys(files).sort());
+      for (const reader of nativeReaders) expect(reader).not.toHaveBeenCalled();
+    } finally { nativeReaders.forEach((reader, i) => reader.mockImplementation(implementations[i])); }
+  });
   it('preserves the observed merge-gate-hold-class direct imports, including multiple named imports', () => {
     expect(reach(`// @vitest-environment node
       import { isCandidacyHold, deferCandidacyHoldsOnPrEvent } from '../merge-gate-hold-class.mjs';
@@ -229,7 +268,11 @@ describe('S1 static edges', () => {
     expect(replaySelections({ records: [{ pr: '7094', changedFiles: ['scripts/child.mjs'], testFiles: ['edge.test.mjs'], evidenceComplete: true }],
       files: Object.keys(files), readFile: p => files[p] })[0]).toMatchObject({ oldMissed: ['edge.test.mjs'], newMissed: [], evidenceComplete: true });
     const io = { runGh: () => 'scripts/child.mjs', runGit: () => Object.keys(files).join('\n'), readFile: p => files[p], print: () => {} };
-    expect(runReplayCli(['7094'], io)[0].evidenceComplete).toBe(false);
+    const printed = [];
+    const incomplete = runReplayCli(['7094'], { ...io,
+      runGh: () => 'scripts/child.mjs\nedge.test.mjs', print: line => printed.push(line) })[0];
+    expect(incomplete).toMatchObject({ evidenceComplete: false, expectedCount: null, oldMissed: null, newMissed: null });
+    expect(JSON.parse(printed[0])).toMatchObject({ oldMissed: null, newMissed: null });
     expect(() => runReplayCli(['7094', '--evidence=e.json'], { ...io, readFile: () => '{' })).toThrow();
     expect(() => runReplayCli(['$(bad)'], io)).toThrow();
   });
@@ -274,6 +317,17 @@ describe('readiness graph selection fails closed', () => {
     expect(result).not.toHaveProperty('selection');
   });
 
+  it.each([
+    ['docs/x.mjs', 'docs/x.test.mjs'],
+    ['docs/x.mjs', 'unrelated.test.mjs'],
+    ['docs/x.mjs', 'docs/y.mjs'],
+  ])('runs the full suite when a mixed diff leaves a target unreachable: %j', (...changed) => {
+    const files = { 'docs/x.mjs': '', 'docs/x.test.mjs': '', 'unrelated.test.mjs': '',
+      'docs/y.mjs': '', 'docs/y.test.mjs': "import './y.mjs'" };
+    expect(select(files, undefined, changed.join('\n'))).toMatchObject({ mode: 'full', partial: false,
+      reasons: [expect.stringContaining('zero tests for non-test changed files (docs/x.mjs)')] });
+  });
+
   it('resolves a side-effect import with an inline comment and selects its test', () => {
     const files = { 'docs/x.mjs': '', 'docs/__tests__/x.test.mjs': 'import /* c */ "../x.mjs"' };
     expect(resolvedImportsOf('docs/__tests__/x.test.mjs', files['docs/__tests__/x.test.mjs'], new Set(Object.keys(files))))
@@ -281,26 +335,34 @@ describe('readiness graph selection fails closed', () => {
     expect(select(files)).toMatchObject({ mode: 'shrink', selectedFiles: ['docs/__tests__/x.test.mjs'] });
   });
 
-  it('counts injected EACCES sources and runs the full suite despite a surviving test edge', () => {
+  it.each(['EACCES', 'EIO', 'ENOENT'])('counts injected %s sources and runs the full suite despite a surviving test edge', code => {
     const files = { 'docs/x.mjs': '', 'direct.test.mjs': 'import "./docs/x.mjs"',
       'denied.mjs': '', 'denied.test.mjs': '' };
     const readFile = path => {
-      if (path.startsWith('denied')) throw Object.assign(new Error('permission denied'), { code: 'EACCES' });
+      if (path.startsWith('denied')) throw Object.assign(new Error('injected read error'), { code });
       return files[path];
     };
     const reverse = buildReverseImportGraph({ files: Object.keys(files), readFile });
-    expect(reverse.unreadable).toBe(2);
+    expect(reverse.unreadable).toBe(code === 'ENOENT' ? 0 : 2);
+    expect(reverse.missing).toBe(code === 'ENOENT' ? 2 : 0);
     expect(Object.keys(reverse)).not.toContain('unreadable');
     expect(testDepths(['docs/x.mjs'], reverse).has('direct.test.mjs')).toBe(true);
     const result = select(files, readFile);
     expect(result).toMatchObject({ mode: 'full', partial: false,
-      reasons: [expect.stringContaining('2 unreadable graph source(s)')] });
+      reasons: [expect.stringContaining(`2 ${code === 'ENOENT' ? 'missing' : 'unreadable'} graph source(s)`)] });
     expect(result).not.toHaveProperty('selection');
   });
 
   it('keeps a changed test selected when it has no imports', () => {
     expect(select({ 'docs/x.test.mjs': '' }, undefined, 'docs/x.test.mjs'))
       .toMatchObject({ mode: 'shrink', selectedFiles: ['docs/x.test.mjs'] });
+  });
+
+  it('shrinks a mixed diff when every changed non-test target reaches a test', () => {
+    const files = { 'docs/x.mjs': '', 'docs/y.mjs': '', 'docs/x.test.mjs': '',
+      'docs/shared.test.mjs': "import './x.mjs'; import './y.mjs'" };
+    expect(select(files, undefined, 'docs/x.mjs\ndocs/y.mjs\ndocs/x.test.mjs'))
+      .toMatchObject({ mode: 'shrink', selectedFiles: ['docs/shared.test.mjs', 'docs/x.test.mjs'] });
   });
 });
 
@@ -313,6 +375,50 @@ describe('CI static edge policy', () => {
       platform: layer === 'platform' ? { staticEdges } : {}, tool: layer === 'file' ? undefined : {},
       readFile: () => JSON.stringify({ ci: { selection: { staticEdges } } }) });
   };
+
+  const policyCases = [
+    { key: 'maxTests', valid: { maxTests: 7 }, invalid: { maxTests: -1 }, local: 7, ci: 7 },
+    { key: 'maxTestsInCi', valid: { maxTestsInCi: 0 }, invalid: { maxTestsInCi: 1 }, local: 0, ci: 0 },
+    { key: 'staticEdges', valid: { staticEdges: allEdges }, invalid: { staticEdges: 'bad' }, local: allEdges, ci: allEdges },
+    ...Object.keys(allEdges).map(edge => ({ key: `staticEdges.${edge}`,
+      valid: { staticEdges: { ...allEdges, [edge]: false } }, invalid: { staticEdges: { ...allEdges, [edge]: 'bad' } },
+      local: false, ci: true })),
+  ];
+  const policyMatrix = policyCases.flatMap(policy => ['env', 'file', 'platform'].flatMap(layer =>
+    ['', 'CI', 'GITHUB_ACTIONS'].map(flag => ({ ...policy, layer, flag }))));
+  const get = (value, key) => key.split('.').reduce((v, part) => v[part], value);
+  it.each(policyMatrix)('validates $key through $layer with CI flag "$flag"', ({ key, valid, invalid, local, ci, layer, flag }) => {
+    const loadBlock = block => loadCiSelection({ platform: layer === 'platform' ? block : {}, operatorOverride: {},
+      tool: layer === 'file' ? undefined : {}, readFile: () => JSON.stringify({ ci: { selection: block } }),
+      env: { ...(flag ? { [flag]: 'true' } : {}), ...(layer === 'env' ? { WE_CI_SELECTION: JSON.stringify(block) } : {}) } });
+    expect(get(loadBlock(valid), key)).toEqual(flag ? ci : local);
+    expect(get(loadBlock(invalid), key)).toEqual(get(DEFAULT_SELECTION, key));
+  });
+
+  it('covers every validator and default policy key in the policy matrix', () => {
+    expect(policyCases.map(({ key }) => key).sort()).toEqual(Object.keys(ciSelectionValidators()).sort());
+    expect(policyCases.map(({ key }) => key).sort()).toEqual([
+      ...Object.keys(DEFAULT_SELECTION), ...Object.keys(DEFAULT_SELECTION.staticEdges).map(key => `staticEdges.${key}`),
+    ].sort());
+  });
+
+  it.each(['CI', 'GITHUB_ACTIONS'])('selectTests loads policy and ignores an environment cap under %s', flag => {
+    const files = { 'docs/hub.mjs': '', 'direct.test.mjs': "import './docs/hub.mjs'",
+      'mid.mjs': "import './docs/hub.mjs'", 'deep.test.mjs': "import './mid.mjs'" };
+    expect(selectTests({ env: { WE_DIFF_TEST_SELECTION: '1', [flag]: 'true', WE_CI_SELECTION: '{"maxTestsInCi":1}' },
+      files: Object.keys(files), readFile: p => files[p],
+      runGit: args => args[0] === 'merge-base' ? 'abc' : 'docs/hub.mjs', maxTests: 1, maxDepth: 1 }))
+      .toMatchObject({ mode: 'shrink', partial: false, selectedFiles: ['deep.test.mjs', 'direct.test.mjs'] });
+  });
+
+  it.each(['env', 'file'])('invalid %s values retain nondefault lower-layer policy', layer => {
+    const lower = { maxTests: 13, staticEdges: { ...allEdges, literalRead: false } };
+    const invalid = { maxTests: -1, maxTestsInCi: 1, staticEdges: 'bad' };
+    expect(loadCiSelection({ platform: lower, tool: layer === 'env' ? lower : undefined,
+      readFile: () => JSON.stringify({ ci: { selection: invalid } }),
+      env: layer === 'env' ? { WE_CI_SELECTION: JSON.stringify(invalid) } : {} }))
+      .toEqual({ ...lower, maxTestsInCi: 0 });
+  });
 
   it.each(cases)('ignores disabling %s via %s under either CI flag', (edge, layer) => {
     for (const flag of ['CI', 'GITHUB_ACTIONS']) {

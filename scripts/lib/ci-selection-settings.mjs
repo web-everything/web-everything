@@ -10,21 +10,26 @@ import { readFileSync } from 'node:fs';
 import { cascadePolicy } from './policy-cascade.mjs';
 import { DEFAULT_SELECTION } from './related-test-selection.mjs';
 
+/** Validators are shared with the policy coverage matrix so every new policy key requires a test. */
+export function ciSelectionValidators(env = {}) {
+  const integer = v => Number.isSafeInteger(v) && v >= 0;
+  const edgeEnabled = v => typeof v === 'boolean' && (!(env.CI || env.GITHUB_ACTIONS) || v);
+  const bools = v => v && typeof v === 'object' && ['spawnPath', 'alias', 'literalRead'].every(k => edgeEnabled(v[k]));
+  return { maxTests: integer, maxTestsInCi: v => v === DEFAULT_SELECTION.maxTestsInCi,
+    staticEdges: bools, 'staticEdges.spawnPath': edgeEnabled,
+    'staticEdges.alias': edgeEnabled, 'staticEdges.literalRead': edgeEnabled };
+}
+
 /** Invalid leaves retain the lower layer; in CI an env/file value can never switch an edge kind off or truncate. */
-export function loadCiSelection({ env = process.env, readFile = readFileSync, tool, platform, log } = {}) {
+export function loadCiSelection({ env = process.env, readFile = readFileSync, tool, platform, operatorOverride, log } = {}) {
   if (tool === undefined) {
     try { tool = JSON.parse(readFile(new URL('../settings/ci-selection.json', import.meta.url), 'utf8')).ci.selection; }
     catch { tool = {}; }
   }
   let override = {};
   try { override = JSON.parse(env.WE_CI_SELECTION || '{}'); } catch { /* defaults */ }
-  const integer = v => Number.isSafeInteger(v) && v >= 0;
-  const edgeEnabled = v => typeof v === 'boolean' && (!(env.CI || env.GITHUB_ACTIONS) || v);
-  const bools = v => v && typeof v === 'object' && ['spawnPath', 'alias', 'literalRead'].every(k => edgeEnabled(v[k]));
-  const resolved = cascadePolicy('ci.selection', tool, { standard: DEFAULT_SELECTION, platform, env,
+  const resolved = cascadePolicy('ci.selection', tool, { standard: DEFAULT_SELECTION, platform, operatorOverride, env,
     envValues: override && typeof override === 'object' ? override : {},
-    valid: { maxTests: integer, maxTestsInCi: v => v === DEFAULT_SELECTION.maxTestsInCi,
-      staticEdges: bools, 'staticEdges.spawnPath': edgeEnabled,
-      'staticEdges.alias': edgeEnabled, 'staticEdges.literalRead': edgeEnabled }, ...(log ? { log } : {}) });
+    valid: ciSelectionValidators(env), ...(log ? { log } : {}) });
   return resolved.value;
 }

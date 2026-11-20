@@ -1030,7 +1030,7 @@ describe('#verify-phase-admission', () => {
 
 // #5128 — graph reads and tracked-file discovery stay injected; no real repository graph.
 describe('#5128 — bounded related-test selection', () => {
-  function boundedGate(maxTests = 3, withReader = true, unreadableGraph = 0) {
+  function boundedGate(maxTests = 3, withReader = true, unreadableGraph = 0, readErrorCode) {
     const files = { 'scripts/hub.mjs': '', 'scripts/mid.mjs': "import './hub.mjs'",
       'scripts/direct.test.mjs': "import './hub.mjs'" };
     for (let i = 0; i < 6; i++) files[`scripts/deep${i}.test.mjs`] = "import './mid.mjs'";
@@ -1039,7 +1039,8 @@ describe('#5128 — bounded related-test selection', () => {
     return resolveDefaultGate({ env: TODAY, fileConfig: { relatedMaxTests: maxTests, relatedDepth: 2 },
       runGit: args => args[0] === 'ls-files' && args.includes('--cached') ? Object.keys(files).join('\n') : git(args),
       ...(withReader ? { readRepoFile: path => {
-        if (path === 'scripts/hub.mjs' && ++hubReads === unreadableGraph) throw new Error('injected read error');
+        if (path === 'scripts/hub.mjs' && ++hubReads === unreadableGraph)
+          throw Object.assign(new Error('injected read error'), { code: readErrorCode });
         return files[path];
       } } : {}),
     });
@@ -1070,6 +1071,16 @@ describe('#5128 — bounded related-test selection', () => {
     expect(gate.testCommand).toBe("npx vitest related 'scripts/hub.mjs' --run --passWithNoTests");
     expect(gate.decision).not.toHaveProperty('selection');
     expect(gate.decision.partial).toBe(false);
+  });
+
+  it.each([1, 2])('keeps bounded selection when graph %s skips an ENOENT-deleted source', unreadableGraph => {
+    const gate = boundedGate(3, true, unreadableGraph, 'ENOENT');
+    expect(gate.testCommand).toBe("npx vitest run 'scripts/direct.test.mjs' --passWithNoTests");
+    expect(gate.decision.selection).toMatchObject({ status: 'selection-truncated', tests: ['scripts/direct.test.mjs'] });
+  });
+
+  it.each(['EACCES', 'EIO'])('keeps plain vitest related on %s instead of narrowing with incomplete evidence', code => {
+    expect(boundedGate(3, true, 1, code).decision).not.toHaveProperty('selection');
   });
 
   it('recognizes a requester without the limit (older base) as the default gate, not a whole-gate fallback', () => {

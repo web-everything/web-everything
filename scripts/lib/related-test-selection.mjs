@@ -167,8 +167,9 @@ export function specifierBasesResolvingTo(path) {
 }
 
 /**
- * The reverse-import graph: `Map<imported file, Set<importing file>>`. Unreadable files (a tracked file deleted in the
- * working tree, whose imports are gone with it) are counted in non-enumerable `unreadable`. Only source files are READ, but any tracked
+ * The reverse-import graph: `Map<imported file, Set<importing file>>`. ENOENT sources (tracked files deleted in the
+ * working tree) are counted in non-enumerable `missing`; other read errors are counted in `unreadable`.
+ * Only source files are READ, but any tracked
  * file can be an import TARGET, so a test that imports a changed JSON fixture still has its edge.
  * @param {{files: string[], readFile: (path: string) => string}} args
  */
@@ -178,15 +179,20 @@ export function buildReverseImportGraph({ files, readFile, ...options }) {
   const fileSet = new Set(files.filter((f) => !f.startsWith('node_modules/') && !f.includes('/node_modules/')));
   const reverse = new Map();
   let unreadable = 0;
+  let missing = 0;
   for (const file of sources) {
     let text;
-    try { text = String(readFile(file)); } catch { unreadable++; continue; }
+    try { text = String(readFile(file)); } catch (error) {
+      if (error?.code === 'ENOENT') missing++; else unreadable++;
+      continue;
+    }
     for (const target of resolvedImportsOf(file, text, fileSet, options)) {
       if (!reverse.has(target)) reverse.set(target, new Set());
       reverse.get(target).add(file);
     }
   }
   Object.defineProperty(reverse, 'unreadable', { value: unreadable });
+  Object.defineProperty(reverse, 'missing', { value: missing });
   return reverse;
 }
 
