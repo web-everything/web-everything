@@ -472,7 +472,7 @@ describe('runTickAllRepos — R242 shared snapshot and empty-work skips', () => 
         ? { repo: 'repo-a', allowStandDownAutoProceed: false, cursor: undefined, deadlineAt: expect.any(Number), now: expect.any(Function) }
         : step === 'main-red-rebase'
           // The daemon wires a per-repo file-backed fairness ledger into the main-red rebase sweep only.
-          ? { repo: 'repo-a', apply: true, applyLedger: { read: expect.any(Function), write: expect.any(Function) } }
+          ? { repo: 'repo-a', apply: true, applyBudgetMs: expect.any(Number), applyLedger: { read: expect.any(Function), write: expect.any(Function) } }
           : ['hung-ci', 'missing-run'].includes(step)
             ? { repo: 'repo-a', apply: true } : ['ci-heal', 'promote-draft', 'notes'].includes(step)
               ? { repo: 'repo-a', cursor: undefined, deadlineAt: expect.any(Number), now: expect.any(Function) } : { repo: 'repo-a' });
@@ -645,7 +645,7 @@ describe('runTickAllRepos — R242 shared snapshot and empty-work skips', () => 
         ? { repo: 'repo-a', allowStandDownAutoProceed: false, cursor: undefined, deadlineAt: expect.any(Number), now: expect.any(Function) }
         : step === 'main-red-rebase'
           // The daemon wires a per-repo file-backed fairness ledger into the main-red rebase sweep only.
-          ? { repo: 'repo-a', apply: true, applyLedger: { read: expect.any(Function), write: expect.any(Function) } }
+          ? { repo: 'repo-a', apply: true, applyBudgetMs: expect.any(Number), applyLedger: { read: expect.any(Function), write: expect.any(Function) } }
           : ['hung-ci', 'missing-run'].includes(step)
             ? { repo: 'repo-a', apply: true } : ['ci-heal', 'promote-draft', 'notes'].includes(step)
               ? { repo: 'repo-a', cursor: undefined, deadlineAt: expect.any(Number), now: expect.any(Function) } : { repo: 'repo-a' });
@@ -752,7 +752,7 @@ describe('runTickAllRepos — R242 shared snapshot and empty-work skips', () => 
         ? { repo: 'repo-a', allowStandDownAutoProceed: false, cursor: undefined, deadlineAt: expect.any(Number), now: expect.any(Function) }
         : step === 'main-red-rebase'
           // The daemon wires a per-repo file-backed fairness ledger into the main-red rebase sweep only.
-          ? { repo: 'repo-a', apply: true, applyLedger: { read: expect.any(Function), write: expect.any(Function) } }
+          ? { repo: 'repo-a', apply: true, applyBudgetMs: expect.any(Number), applyLedger: { read: expect.any(Function), write: expect.any(Function) } }
           : ['hung-ci', 'missing-run'].includes(step)
             ? { repo: 'repo-a', apply: true } : ['ci-heal', 'promote-draft', 'notes'].includes(step)
               ? { repo: 'repo-a', cursor: undefined, deadlineAt: expect.any(Number), now: expect.any(Function) } : { repo: 'repo-a' });
@@ -2621,6 +2621,24 @@ describe('fix pass budgets', () => {
     ]);
   });
 
+  it('main-red-rebase honors its pass budget', async () => {
+    let clock = 0;
+    const seen = [];
+    const mainRedRebaseTick = opts => { seen.push(opts.applyBudgetMs); clock += 5000; return { dispatch: [], refusals: [], applied: [] }; };
+    const result = await runTickAllRepos(fixture({ repos: ['a'], now: () => clock, mainRedRebaseTick,
+      passBudgets: resolveFixPassBudgets({ env: {}, file: { fixPassBudget: { mainRedRebaseMs: 1000 } } }) }));
+    expect(seen).toEqual([1000]);
+    expect(result.budgets['main-red-rebase']).toMatchObject({ budgetMs: 1000, hit: true });
+    expect(formatPassPhaseTiming(result).join('\n')).toContain('pass-timing phase=main-red-rebase ms=5000 budgetMs=1000 budgetHit=true');
+  });
+
+  it('mainRedRebaseMs defaults to 170000, clamps to its max, and falls back on invalid values', () => {
+    expect(resolveFixPassBudgets({ env: {}, file: {} }).mainRedRebaseMs).toEqual({ value: 170000, source: 'standard' });
+    expect(resolveFixPassBudgets({ env: {}, file: { fixPassBudget: { mainRedRebaseMs: 9999999 } } }).mainRedRebaseMs.value).toBe(600000);
+    expect(resolveFixPassBudgets({ env: {}, file: { fixPassBudget: { mainRedRebaseMs: 'bad' } } }).mainRedRebaseMs)
+      .toEqual({ value: 170000, source: 'standard' });
+  });
+
   it('wires the notes deadline, clock and saved PR cursor through to the notes reader', async () => {
     const now = () => 0;
     const notesTick = vi.fn(() => ({ notes: [], prsByNumber: new Map() }));
@@ -2794,6 +2812,7 @@ describe('fix pass budgets', () => {
       fixMs: { value: 300000, source: 'standard' },
       notesMs: { value: 300000, source: 'standard' },
       orphanGuardMs: { value: 300000, source: 'standard' },
+      mainRedRebaseMs: { value: 170000, source: 'standard' },
     });
     expect(resolveFixPassBudgets({ env: {}, file: { fixPassBudget: { ciHealMs: 1 } } }).ciHealMs.value).toBe(1000);
     expect(resolveFixPassBudgets({ env: {}, file: { fixPassBudget: { ciHealMs: 9999999 } } }).ciHealMs.value).toBe(900000);

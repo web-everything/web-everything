@@ -1,8 +1,12 @@
 {
   "$comment": "Per-pass soft budgets. Code clamps operator values to the R812 outer limits; unfinished work retries next pass.",
   "fixPassBudget": {
-    "stuckFixersMs": 120000,
-    "ciHealMs": 180000,
-    "promoteDraftMs": 120000
+    "fixMs": 120000,
+    "notesMs": 90000,
+    "orphanGuardMs": 60000,
+    "stuckFixersMs": 60000,
+    "ciHealMs": 120000,
+    "promoteDraftMs": 60000,
+    "mainRedRebaseMs": 90000
   }
 }

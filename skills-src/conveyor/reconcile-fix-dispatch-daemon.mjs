@@ -986,6 +986,7 @@ const FIX_PASS_LIMITS = {
   stuckFixersMs: { defaultMs: 120000, maxMs: 600000, env: 'WE_FIX_BUDGET_STUCK_FIXERS_MS', phase: 'stuck-fixers' },
   ciHealMs: { defaultMs: 180000, maxMs: 900000, env: 'WE_FIX_BUDGET_CI_HEAL_MS', phase: 'ci-heal' },
   promoteDraftMs: { defaultMs: 120000, maxMs: 600000, env: 'WE_FIX_BUDGET_PROMOTE_DRAFT_MS', phase: 'promote-draft' },
+  mainRedRebaseMs: { defaultMs: 170000, maxMs: 600000, env: 'WE_FIX_BUDGET_MAIN_RED_REBASE_MS', phase: 'main-red-rebase' },
 };
 
 /** `file` accepts a settings path or injected parsed data. Invalid overrides reset to standard,
@@ -1446,7 +1447,7 @@ export async function runTickAllRepos({
   // x5uqim1 follow-up (#4075/#3383) — the FOURTH half this daemon now owns: see
   // {@link runMainRedRebaseAllRepos}'s own docblock for why this daemon, specifically, is where it lives (same
   // reason `hungCi` already does — the pass's own `daemon-manifest.mjs` entry has no launchd job installed).
-  const mainRedRebase = stepTimed('main-red-rebase', () => runMainRedRebaseAllRepos({ repos: stepRepos.get('main-red-rebase'), tick: sharedTick('main-red-rebase', mainRedRebaseTick ?? sweepCiRedRecovery) }));
+  const mainRedRebase = stepTimed('main-red-rebase', () => runMainRedRebaseAllRepos({ repos: stepRepos.get('main-red-rebase'), applyBudgetMs: budgets['main-red-rebase'].budgetMs, tick: sharedTick('main-red-rebase', mainRedRebaseTick ?? sweepCiRedRecovery) }));
   planCache?.markTouched(mainRedRebase);
   // xi4od2p (#4075/#3383) — the SIXTH half this daemon now owns: see {@link runMissingRunRecoveryAllRepos}'s
   // own docblock for why this daemon, specifically, is where it lives (same reason `hungCi`/`mainRedRebase`
