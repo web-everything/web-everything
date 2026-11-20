@@ -1971,6 +1971,7 @@
   "webtraits/__tests__/surfaceIntentResolver.test.ts": 0.02,
   "wrapper-conformance/__tests__/runner.test.ts": 0.01
  },
+ "integration": {},
  "soak": {
   "scripts/conveyor/soak/breaks/forge-manifest-untracked-shipped.soak.test.mjs": 0.3,
   "scripts/conveyor/soak/breaks/catch-up-clean-first-snapshot-first.soak.test.mjs": 4.65,
@@ -2296,6 +2297,7 @@
   "scripts/conveyor/soak/breaks/recycled-pid-bg-spare-fix-claim.soak.test.mjs": 74.9,
   "scripts/conveyor/soak/breaks/red-team-dead-owner-never-redispatched.soak.test.mjs": 4.35,
   "scripts/conveyor/soak/breaks/red-team-skip-never-settles.soak.test.mjs": 4.42,
+  "scripts/conveyor/soak/breaks/redteam-not-owed-after-confirm-accept.soak.test.mjs": 1.0,
   "scripts/conveyor/soak/breaks/redteam-pending-label-never-settles.soak.test.mjs": 2.02,
   "scripts/conveyor/soak/breaks/review-churn-never-skips-changed-code.soak.test.mjs": 0.86,
   "scripts/conveyor/soak/breaks/review-hold-red-draft-deadlock.soak.test.mjs": 1.36,
