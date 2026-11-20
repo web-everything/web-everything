@@ -1298,7 +1298,8 @@ it('xxh4zw8 hydrates shared-file input and preserves attribution timestamps and 
   try {
     const path = join(dir, 'prs.json');
     writeFileSync(path, JSON.stringify([xxPr()]));
-    const exec = vi.fn(() => xxRuns().map(row => JSON.stringify(row)).join('\n'));
+    const exec = vi.fn((_file, args) => JSON.stringify(args.some(arg => arg.includes('/check-runs'))
+      ? [{ check_runs: xxRuns() }] : [{ statuses: [] }]));
     const plan = runReconcilePass({ ...xxOptions(), readPrs: () => readPrsFromFile(path),
       readChecks: args => defaultReadChecks(args, { exec }),
       enrichMainRed: (prs, opts) => {
@@ -1311,8 +1312,8 @@ it('xxh4zw8 hydrates shared-file input and preserves attribution timestamps and 
       } });
     expect(plan.dispatch.map(d => d.kind)).toEqual(['ci-heal']);
     expect(exec.mock.calls[0][1]).toContain('--paginate');
-    expect(exec.mock.calls[0][1]).toContain(`repos/web-everything/web-everything/commits/${XX_HEAD}/check-runs`);
-    expect(exec.mock.calls[0][1].at(-1)).toContain('completed_at');
+    expect(exec.mock.calls[0][1]).toContain(`repos/web-everything/web-everything/commits/${XX_HEAD}/check-runs?per_page=100&filter=all`);
+    expect(exec.mock.calls[1][1]).toContain(`repos/web-everything/web-everything/commits/${XX_HEAD}/status?per_page=100`);
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
 
@@ -1426,7 +1427,7 @@ it('xxh4zw8 hydration collapses superseded cancellations and unreadable conclusi
   }
 });
 
-it('xxh4zw8 malformed JSON-lines read is refused and failed identical-head reads are deduplicated', async () => {
+it('xxh4zw8 malformed paged JSON read is refused and failed identical-head reads are deduplicated', async () => {
   const { runReconcilePass, defaultReadChecks } = await import('../reconcile-pass.mjs');
   const exec = vi.fn(() => '{not-json');
   const plan = runReconcilePass({ ...xxOptions(), readPrs: () => [xxPr(), { ...xxPr(), number: 3337 }],

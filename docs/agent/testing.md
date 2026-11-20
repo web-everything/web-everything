@@ -5119,6 +5119,11 @@ gate-only red. Its transport fixtures serve both paginated REST endpoints, witho
 provenance to flattened PR facts. Keep default-reader regressions for green tests plus a red
 review gate and incomplete/unreadable responses from either endpoint; the latter must report
 unknown via the existing read warning rather than claim CI is green.
+Reconcile hydration preserves complete current-head snapshots even at or above 100 rows.
+Its fallback uses the same paginated check-run and commit-status reader, carrying that
+reader's provenance through normalization. The required-checks pass suite and the
+`review-ci-ignores-incomplete-rows` soak cover preservation, successful hydration and
+unreadable feeds; bare injected arrays still cannot attest completeness.
 External agy review jurors bound silent launches with `review.externalJurors.firstOutputMs`
 (default 120000; 0 disables). A silent kill records `provider-unresponsive` and uses the
 existing quota evidence store's root for a hold across every backend, for `cooldownMs`

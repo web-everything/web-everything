@@ -5,7 +5,8 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 
 const ROOT = resolve(fileURLToPath(import.meta.url), '../../../../..');
 const PATHS = ['scripts/conveyor/reconcile-core.mjs', 'scripts/lib/review-ci-gate.mjs',
-  'scripts/lib/review-timing.mjs', 'scripts/conveyor/ci-heal-verdict-recheck.mjs'];
+  'scripts/lib/review-timing.mjs', 'scripts/conveyor/ci-heal-verdict-recheck.mjs',
+  'scripts/conveyor/reconcile-pass.mjs'];
 const HEAD = 'c'.repeat(40);
 
 export default {
@@ -46,5 +47,45 @@ export async function probe(root) {
   if (reviews({ rowsComplete: false, rowsHead: HEAD }) !== 0) violations.push('incomplete rows: review dispatched');
   if (reviews({ rowsComplete: true, rowsHead: 'd'.repeat(40) }) !== 0) violations.push('rows for another head: review dispatched');
   if (reviews({ rowsComplete: true }) !== 0) violations.push('rows without a head binding: review dispatched');
+  violations.push(...await probeHydration(root));
+  return violations;
+}
+
+/** Exercise the production hydration shell as well as its downstream planner. All external IO is injected. */
+async function probeHydration(root) {
+  const { runReconcilePass, defaultReadChecks } = await import(pathToFileURL(join(root, PATHS[4])).href);
+  const same = rows => rows;
+  const options = { readOnly: true, repo: 'we', readAgents: () => [], enrich: same,
+    readRequiredChecks: () => ({ checks: ['test'], source: 'live' }),
+    enrichMainRed: prs => ({ prs, mainRedWindows: [] }),
+    ...Object.fromEntries(['excuseMergeGateHolds', 'enrichAlreadyLanded', 'enrichBaseRef', 'enrichConflictDisposition',
+      'enrichSystemFix', 'enrichEscalationBase', 'enrichFixClaims', 'enrichTimeouts', 'enrichReferralHolds',
+      'enrichLedgerHolds', 'enrichReferralAutoResolve', 'enrichRulings', 'enrichCodeQL', 'enrichScopeBloat',
+      'enrichOwedMainRule', 'enrichMechanicalRound', 'enrichStandingRulingGrants', 'enrichVerifyGreen'].map(key => [key, same])),
+    resolveMainSha: () => null, readPriority: () => null, stepLog: () => {},
+    env: { VITEST: 'true', WE_REVIEW_START_AFTER: 'ci-green', WE_REVIEW_START_BEFORE_CI: 'false' },
+    now: Date.parse('2026-11-18T12:00:00Z'),
+  };
+  const rows = Array.from({ length: 100 }, (_, i) => ({ id: i + 1,
+    name: i ? `optional-${i}` : 'test', head_sha: HEAD, status: 'completed', conclusion: 'success' }));
+  const pr = { number: 7160, state: 'OPEN', isDraft: false, headRefName: 'lane/x', headRefOid: HEAD,
+    baseRefName: 'main', labels: ['review:pending'], comments: [], mergeStateStatus: 'CLEAN',
+    statusCheckRollup: rows, rowsComplete: true, rowsHead: HEAD };
+  const violations = [];
+  for (const shape of ['complete', 'truncated', 'unreadable-status']) {
+    let reads = 0;
+    const plan = runReconcilePass({ ...options,
+      readPrs: () => [{ ...pr, rowsComplete: shape === 'complete' }],
+      readChecks: args => defaultReadChecks(args, { exec: (_file, argv) => {
+        reads++;
+        if (argv.some(arg => arg.includes('/check-runs'))) return JSON.stringify([{ check_runs: rows }]);
+        if (shape === 'unreadable-status') throw new Error('status page unavailable');
+        return JSON.stringify([{ statuses: [] }]);
+      } }),
+    });
+    const expected = shape === 'unreadable-status' ? 0 : 1;
+    if (plan.dispatch.filter(d => d.kind === 'review').length !== expected) violations.push(`${shape} 100-row rollup: expected ${expected} reviews`);
+    if (reads !== (shape === 'complete' ? 0 : 2)) violations.push(`${shape} 100-row rollup: unexpected hydration read count ${reads}`);
+  }
   return violations;
 }
