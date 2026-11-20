@@ -5023,7 +5023,8 @@ policy cascade, injected settings IO, invalid layers and legacy environment prec
 `review-red-team.test.mjs` exercises the launcher with both builder companies, unknown
 builder evidence, `review.redTeam.routeByBuilder=false`, daily-cap fallback and a raced
 reservation. Keep the pinned-head co-author read ahead of routing; the scratch checkout
-is created only after provider selection. Standard daily caps are Codex 600, agy-gemini 0
+is created only after provider selection. Standard daily caps are Codex 80 (the tool
+settings explicitly raise it to 600), agy-gemini 0
 (off; operator opt-in through `review.seatDailyCaps.agy-gemini` or `enabledProviders`), agy-claude 10 (red-team emergency only). Codex builders prefer agy-gemini;
 if disabled or capped, use Codex and log same-vendor acceptance. Claude builders prefer
 Codex, then agy-gemini at cap. Unknown builders and `routeByBuilder=false` retain policy
@@ -5036,6 +5037,10 @@ CLIs with ordinary budget left (no emergency).
 Pin historical cap-warning fixtures to their original cap. Provider-unavailable fixtures
 need explicit positive provider budgets: cap checks precede CLI probes, and a zero cap
 marks the result retryable rather than a completed unavailable-CLI result.
+Red-team routing fakes inject `readSeatSettings` with empty tool/platform layers when
+asserting standard caps, so live settings cannot change their budgets. Keep cap source
+labels aligned with the settings cascade and assert the final skipped log contains the
+returned budget refusal, while retaining reservation-count and no-launch assertions.
 
 R1077 audit: builder preference stays within the resolved policy chain or inherited
 red-team roster; operator routing overrides win, and policy model/effort validation
