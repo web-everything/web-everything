@@ -145,6 +145,8 @@
  *     fresh resource snapshot permits it. Status and release scan every slot that scaling may hand out.
  */
 import '../lib/tools-root-guard.mjs';
+import { pinDeveloperDir } from '../lib/lane-git-hardening.mjs';
+pinDeveloperDir();
 import { constants, existsSync, mkdirSync, mkdtempSync, rmdirSync, readdirSync, readFileSync, realpathSync, statSync, writeFileSync, unlinkSync, appendFileSync, renameSync } from 'node:fs';
 import { lstat, mkdir, open, rename, unlink } from 'node:fs/promises';
 import { execSync, execFile, spawn } from 'node:child_process';
@@ -249,7 +251,7 @@ export const ADMISSION_POLICY_STANDARD = Object.freeze({
   // main-fix-queue-priority — a red-main repair waiter (P0) is admitted to the next free slot ahead of all others.
   priority: Object.freeze({ mode: 'enforce', repairPatterns: DEFAULT_REPAIR_PATTERNS }),
   // transport (R593): 'rsync' (default, rollback value) | 'git-bundle' (ship a verified git bundle; needs a runner advertising gitBundle:1).
-  remote: Object.freeze({ enabled: false, mode: 'above-threshold', loadPerCoreThreshold: 3, clientPath: null, transport: 'rsync',
+  remote: Object.freeze({ enabled: false, mode: 'above-threshold', loadPerCoreThreshold: 3, clientPath: null, transport: 'rsync', manifest: 'legacy',
     // R559: bundle mode needs the Forge mirror's public main fetched within this many minutes (else it falls back to rsync).
     bundle: Object.freeze({ mainMaxAgeMin: 10 }),
     maxConcurrent: 8, slotUnitsByKind: Object.freeze({ FULL: 'auto', soak: 'auto', standards: 'auto' }),
@@ -288,6 +290,7 @@ const ADMISSION_VALID = {
   'priority.mode': (v) => ADMISSION_PRIORITY_MODES.includes(v),
   'priority.repairPatterns': validRepairPatterns,
   'remote.clientPath': (v) => v === null || typeof v === 'string',
+  'remote.manifest': (v) => v === 'tracked' || v === 'legacy',
   'remote.transport': (v) => v === 'rsync' || v === 'git-bundle',
   'remote.bundle.mainMaxAgeMin': (v) => Number.isFinite(v) && v > 0 && v <= 1440,
   'remote.enabled': (v) => typeof v === 'boolean',
@@ -373,7 +376,7 @@ export function privateAdmissionPool(env, checkoutRoot) {
  * PURE: valid leaves override standard → platform → tool → env. Capacity and priority (everything but onTimeout) of
  * the shared host pool come from standard → platform only: process env and checkout-local tool settings would
  * give two callers of one pool different caps or queue ordering. A private pool (see {@link privateAdmissionPool})
- * keeps both local override layers, except remote.clientPath is always platform-only.
+ * keeps both local override layers, except remote.clientPath and remote.manifest are always platform-only.
  */
 export function resolveAdmissionPolicy({ platform, tool, env = {}, checkoutRoot } = {}) {
   const isPrivate = privateAdmissionPool(env, checkoutRoot);
@@ -381,6 +384,7 @@ export function resolveAdmissionPolicy({ platform, tool, env = {}, checkoutRoot 
     remote: { ...ADMISSION_POLICY_STANDARD.remote, elasticSlots: { ...ADMISSION_POLICY_STANDARD.remote.elasticSlots }, bundle: { ...ADMISSION_POLICY_STANDARD.remote.bundle } },
     priority: { ...ADMISSION_POLICY_STANDARD.priority, repairPatterns: [...ADMISSION_POLICY_STANDARD.priority.repairPatterns] } };
   const sources = {}; const invalid = []; const ignored = [];
+  let invalidPlatformManifest = false;
   for (const [leaf, valid] of Object.entries(ADMISSION_VALID)) {
     let value = admissionLeaf(settings, leaf);
     sources[leaf] = 'standard';
@@ -388,10 +392,14 @@ export function resolveAdmissionPolicy({ platform, tool, env = {}, checkoutRoot 
       let v;
       try { v = admissionLeaf(block, leaf); }
       catch (error) {
-        if (leaf !== 'remote.clientPath' && !leaf.startsWith('remote.slotUnits') && !leaf.startsWith('remote.elasticSlots') && leaf !== 'remote.autoSlotUnits') throw error;
+        if (leaf !== 'remote.clientPath' && leaf !== 'remote.manifest' && !leaf.startsWith('remote.slotUnits') && !leaf.startsWith('remote.elasticSlots') && leaf !== 'remote.autoSlotUnits') throw error;
         v = Symbol('unreadable admission setting'); // invalid even in the trusted platform layer
       }
       if (v === undefined) continue;
+      if (layer === 'tool' && leaf === 'remote.manifest') {
+        ignored.push(`tool.${leaf}=${oneLine(JSON.stringify(v))} (only platform preferences may select manifest validation)`);
+        continue;
+      }
       if (layer === 'tool' && leaf === 'remote.clientPath') {
         ignored.push(`tool.${leaf}=${clientPathForLog(v)} (only platform preferences may select executable client code)`);
         continue;
@@ -407,6 +415,7 @@ export function resolveAdmissionPolicy({ platform, tool, env = {}, checkoutRoot 
       if (valid(v)) { value = v; sources[leaf] = layer; }
       else {
         invalid.push(`${layer}.${leaf}=${leaf === 'remote.clientPath' ? clientPathForLog(v) : oneLine(JSON.stringify(v))}`);
+        if (layer === 'platform' && leaf === 'remote.manifest') invalidPlatformManifest = true;
         if (leaf === 'remote.slotUnitsByKind') { value = {}; sources[leaf] = layer; }
         if (leaf === 'remote.elasticSlots.enabled') { value = false; sources[leaf] = layer; }
         if (leaf === 'remote.autoSlotUnits') { value = 1; sources[leaf] = layer; }
@@ -427,41 +436,58 @@ export function resolveAdmissionPolicy({ platform, tool, env = {}, checkoutRoot 
     const target = keys.slice(0, -1).reduce((v, key) => v[key], settings);
     target[keys.at(-1)] = value;
   }
-  return { settings, sources, invalid, ignored };
+  if (invalidPlatformManifest) {
+    settings.remote.enabled = false;
+    sources['remote.enabled'] = 'platform (invalid remote.manifest; local execution required)';
+  }
+  return { settings, sources, invalid, ignored, ...(invalidPlatformManifest ? { manifestFailClosed: true } : {}) };
 }
 
 const admissionPolicyCache = new Map();
 const platformLastGood = new Map(); // path → last successfully parsed heavyAdmission block (survives a torn write)
-const PLATFORM_FILE_MAX_BYTES = 256 * 1024;
+// The host platform bag grew past 256 KiB on 2026-11-19 and every fresh process then read the standard layer
+// (remote.enabled=false); the bound is a sanity limit, not a policy limit.
+const PLATFORM_FILE_MAX_BYTES = 4 * 1024 * 1024;
+function readPlatformPreferences(path) {
+  if (!path) throw new Error('canonical host preferences path unavailable');
+  if (statSync(path).size > PLATFORM_FILE_MAX_BYTES) throw new Error(`file larger than ${PLATFORM_FILE_MAX_BYTES} bytes`);
+  return JSON.parse(readFileSync(path, 'utf8'));
+}
 /**
  * IO: the shared platform/tool settings, cached for ten seconds per path and environment. Never throws.
  * On the shared host pool the platform file is the ONE capacity and priority source; every caller reads the SAME file:
  * the real user's `~/.claude/platform-preferences.json`, never a path derived from the caller's `$HOME`, and
  * `WE_PLATFORM_PREFERENCES` is honoured only for a private pool (or under test), and cannot select executable
- * remote client code. A read that fails keeps the last
- * good value and is not cached, so a torn write is retried by the next caller instead of pinning the standard.
+ * remote client code or manifest validation. `home` injects the canonical host file's directory for tests.
+ * remote.manifest always comes from an existing, valid canonical file; every failed read requires local
+ * execution. A valid canonical object that omits the key selects the standard manifest default.
+ * Other settings keep their last good values after a failed read. Failures are not cached, so a torn write
+ * is retried by the next caller instead of pinning the standard.
  */
 export function loadAdmissionPolicy({ env = process.env, repoRoot, checkoutRoot, home } = {}) {
-  let platform; let tool; let path; let envSelected = false; const errors = []; const ignored = []; let readFailed = false;
+  let platform; let tool; let path; let hostPath; let envSelected = false; const errors = []; const ignored = []; let readFailed = false;
+  let platformFile; let platformReadError;
+  let canonicalManifestReadFailed = false;
   try { repoRoot ??= fileURLToPath(new URL('../../', import.meta.url)); }
   catch (e) { errors.push(`tool: ${String(e?.message ?? e).split('\n')[0]}`); }
   checkoutRoot ??= repoRoot;
   const overrideOk = privateAdmissionPool(env, checkoutRoot) || isUnderTest(env) || isUnderTest(process.env);
   try {
     envSelected = Boolean(overrideOk && env.WE_PLATFORM_PREFERENCES);
-    path = envSelected ? env.WE_PLATFORM_PREFERENCES : join(home ?? realHomeDir(), '.claude', 'platform-preferences.json');
+    hostPath = join(home ?? realHomeDir(), '.claude', 'platform-preferences.json');
+    path = envSelected ? env.WE_PLATFORM_PREFERENCES : hostPath;
   }
   catch (e) { errors.push(`platform: ${String(e?.message ?? e).split('\n')[0]}`); }
-  const key = JSON.stringify([path, envSelected, repoRoot, checkoutRoot, env.LANE_POOL_ROOT, ...Object.values(ADMISSION_ENV).map((name) => env[name])]);
+  const key = JSON.stringify([path, hostPath, envSelected, repoRoot, checkoutRoot, env.LANE_POOL_ROOT, ...Object.values(ADMISSION_ENV).map((name) => env[name])]);
   const nowMs = Date.now();
   const cached = admissionPolicyCache.get(key);
   if (cached && nowMs < cached.expiresAt) return cached.policy;
   if (path) try {
-    if (statSync(path).size > PLATFORM_FILE_MAX_BYTES) throw new Error(`file larger than ${PLATFORM_FILE_MAX_BYTES} bytes`);
-    const file = JSON.parse(readFileSync(path, 'utf8'));
-    if (admissionObject(file) && Object.hasOwn(file, 'heavyAdmission')) platform = file.heavyAdmission;
+    platformFile = readPlatformPreferences(path);
+    if (admissionObject(platformFile) && Object.hasOwn(platformFile, 'heavyAdmission')) platform = platformFile.heavyAdmission;
     platformLastGood.set(path, platform);
   } catch (e) {
+    platformReadError = e;
     if (e?.code !== 'ENOENT') {
       readFailed = true;
       errors.push(`platform: ${String(e?.message ?? e).split('\n')[0]}`);
@@ -474,12 +500,36 @@ export function loadAdmissionPolicy({ env = process.env, repoRoot, checkoutRoot,
     platform = { ...platform, remote };
     ignored.push(`platform.remote.clientPath=${clientPathForLog(clientPath)} (ignored: preferences selected via WE_PLATFORM_PREFERENCES; only the host preferences file may select executable client code)`);
   }
+  {
+    // Resolve manifest evidence once for every caller. Last-good settings may not supply this decision.
+    const { manifest, ...remote } = platform?.remote ?? {};
+    if (envSelected && manifest !== undefined) ignored.push(`platform.remote.manifest=${oneLine(JSON.stringify(manifest))} (ignored: redirected preferences; only the canonical host preferences file may select manifest validation)`);
+    let hostManifest;
+    try {
+      if (!envSelected && platformReadError) throw platformReadError;
+      const host = envSelected ? readPlatformPreferences(hostPath) : platformFile;
+      if (!admissionObject(host) || (Object.hasOwn(host, 'heavyAdmission') && !admissionObject(host.heavyAdmission))
+        || (host.heavyAdmission && Object.hasOwn(host.heavyAdmission, 'remote') && !admissionObject(host.heavyAdmission.remote)))
+        throw new Error('invalid canonical preferences object');
+      hostManifest = host.heavyAdmission?.remote?.manifest;
+    } catch (e) {
+      readFailed = true;
+      canonicalManifestReadFailed = true;
+      errors.push(`canonical platform manifest: ${String(e?.message ?? e).split('\n')[0]}`);
+    }
+    platform = { ...platform, remote: { ...remote, ...(hostManifest !== undefined ? { manifest: hostManifest } : {}) } };
+  }
   if (repoRoot) try {
     const settingsDir = join(repoRoot, 'scripts', 'settings');
     const declared = readDeclaredSettings({ dir: settingsDir, legacyPath: join(dirname(settingsDir), basename(LEGACY_SETTINGS_PATH)) });
     if (Object.hasOwn(declared.settings, 'heavyAdmission')) tool = declared.settings.heavyAdmission;
   } catch (e) { errors.push(`tool: ${String(e?.message ?? e).split('\n')[0]}`); }
   const policy = resolveAdmissionPolicy({ platform, tool, env, checkoutRoot });
+  if (canonicalManifestReadFailed) {
+    policy.manifestFailClosed = true;
+    policy.settings.remote.enabled = false;
+    policy.sources['remote.enabled'] = 'platform (canonical remote.manifest unavailable; local execution required)';
+  }
   policy.ignored.push(...ignored);
   policy.invalid.push(...errors);
   for (const [k, entry] of admissionPolicyCache) if (nowMs >= entry.expiresAt) admissionPolicyCache.delete(k);
@@ -495,7 +545,8 @@ export function formatAdmissionPolicy({ settings, sources, ignored = [], invalid
     ...Object.keys(ADMISSION_POLICY_STANDARD.remote)
       .filter(key => key !== 'clientPath' || settings.remote?.clientPath != null)
       .map(key => key === 'elasticSlots' ? 'remote.elasticSlots.enabled' : key === 'bundle' ? 'remote.bundle.mainMaxAgeMin' : `remote.${key}`)]
-    .map((leaf) => `${leaf}=${leaf === 'remote.clientPath' ? clientPathForLog(admissionLeaf(settings, leaf)) : admissionObject(admissionLeaf(settings, leaf)) ? JSON.stringify(admissionLeaf(settings, leaf)) : admissionLeaf(settings, leaf)} (${sources[leaf] ?? 'standard'})`);
+    // The policy line shows at most 960 path characters so the whole line stays under 2,000.
+    .map((leaf) => `${leaf}=${leaf === 'remote.clientPath' ? clientPathForLog(admissionLeaf(settings, leaf)).slice(0, 960) : admissionObject(admissionLeaf(settings, leaf)) ? JSON.stringify(admissionLeaf(settings, leaf)) : admissionLeaf(settings, leaf)} (${sources[leaf] ?? 'standard'})`);
   return `heavy-admission policy · ${values.join(', ')}${ignored.length ? ` · ignored: ${ignored.join('; ')}` : ''}${invalid.length ? ` · invalid: ${invalid.join('; ')}` : ''}`;
 }
 
@@ -786,10 +837,10 @@ export function decideRemote({ policy, loadPerCore, argv, cwd, runnerBundleOk = 
   const remote = policy.settings.remote;
   const enabled = `remote.enabled=${remote.enabled} (${policy.sources['remote.enabled'] ?? 'standard'})`;
   if (!remote.enabled) return { remote: false, reason: enabled };
-  if (remote.mode === 'always') return withNeedsGit({ remote: true, reason: `${enabled}; mode=always` }, argv, cwd, bundleKeepsRemote(remote, runnerBundleOk));
+  if (remote.mode === 'always') return withNeedsGit({ remote: true, reason: `${enabled}; mode=always` }, argv, cwd, bundleKeepsRemote(remote, runnerBundleOk), remote.manifest);
   if (!Number.isFinite(loadPerCore)) return { remote: false, reason: `${enabled}; load-unreadable` };
   const above = loadPerCore > remote.loadPerCoreThreshold;
-  return withNeedsGit({ remote: above, reason: `${enabled}; loadPerCore=${loadPerCore} ${above ? '>' : '<='} ${remote.loadPerCoreThreshold}` }, argv, cwd, bundleKeepsRemote(remote, runnerBundleOk));
+  return withNeedsGit({ remote: above, reason: `${enabled}; loadPerCore=${loadPerCore} ${above ? '>' : '<='} ${remote.loadPerCoreThreshold}` }, argv, cwd, bundleKeepsRemote(remote, runnerBundleOk), remote.manifest);
 }
 
 /** R593: routing reads the runner capability cache the client wrote at its last prepare; unreadable means no. */
@@ -812,11 +863,15 @@ export function writeRunnerCapabilities({ root, host, capabilities, clock = Date
 
 /** R501: a remote decision for a run naming a git-spawning test file becomes local with the named reason `needs-git`. */
 /** R593: git-needing tests stay remote only when transport=git-bundle AND the runner recently advertised gitBundle:1. */
-function bundleKeepsRemote(remote, runnerBundleOk) { return remote.transport === 'git-bundle' && runnerBundleOk === true; }
-function withNeedsGit(decision, argv, cwd, bundleOk = false) {
+function bundleKeepsRemote(remote, runnerBundleOk) { return remote.manifest === 'legacy' && remote.transport === 'git-bundle' && runnerBundleOk === true; }
+function withNeedsGit(decision, argv, cwd, bundleOk = false, manifestMode = 'legacy') {
   if (!decision.remote || bundleOk) return decision;
-  let route; try { route = routeNeedsGit({ argv, cwd: cwd ?? process.cwd() }); } catch { return decision; }
-  return route.local ? { remote: false, needsGit: true, reason: `${decision.reason}; ${route.reason}: ${route.files.join(', ')}` } : decision;
+  let route; try { route = routeNeedsGit({ argv, cwd: cwd ?? process.cwd() }); } catch {
+    if (manifestMode === 'legacy') return decision;
+    route = {local:true,reason:'needs-git',files:[]};
+  }
+  const manifestRefusal = manifestMode === 'tracked' ? 'bundle-local' : undefined;
+  return route.local ? { remote: false, needsGit: true, ...(manifestRefusal ? {manifestRefusal} : {}), reason: `${decision.reason}; ${manifestRefusal ?? route.reason}: ${route.files.join(', ')}` } : decision;
 }
 
 const LEGACY_REMOTE_PRE_EXECUTION_REASONS = Object.freeze([
@@ -1029,6 +1084,9 @@ export function createRemoteExec({
       return { mode: 'not-started', terminated: true, reason: `remote client override: ${reason}` };
     };
     if (client.reason) return ignored(client.reason);
+    // An installed older client may ignore manifestMode. Only the built-in
+    // client is known to enforce this checkout's tracked boundary.
+    if (policy.settings.remote.manifest === 'tracked') return ignored('tracked manifest requires built-in client');
     let remote;
     try {
       remote = await importClient(pathToFileURL(client.clientPath).href);
@@ -1246,10 +1304,14 @@ export async function runWithRemoteDecision({
   const runnerBundleOk = readRunnerBundleCapability({ root: join(dirname(lockRoot ?? admissionLockRoot(cwd, env)), 'remote'), host, clock, unknownOk: !externalClient });
   let decision = decideRemote({ policy, loadPerCore: load, argv, cwd, runnerBundleOk });
   if (!decision.remote && !decision.needsGit && policy.settings.remote.enabled && policy.settings.remote.mode === 'above-threshold'
-    && Number.isFinite(load) && isOverloaded()) decision = withNeedsGit({ remote: true, reason: `${decision.reason}; host overloaded` }, argv, cwd, policy.settings.remote.transport === 'git-bundle' && runnerBundleOk);
+    && Number.isFinite(load) && isOverloaded()) decision = withNeedsGit({ remote: true, reason: `${decision.reason}; host overloaded` }, argv, cwd, bundleKeepsRemote(policy.settings.remote, runnerBundleOk), policy.settings.remote.manifest);
   onDecision?.(decision);
   log(`heavy-admission: ${decision.remote ? 'remote' : 'local'} (${decision.reason})\n`);
-  if (decision.needsGit) recordRemoteFallback({lockRoot, reason: 'needs-git', cwd, argv, env, clock});
+  if (decision.needsGit) recordRemoteFallback({lockRoot, reason: decision.manifestRefusal ?? 'needs-git', cwd, argv, env, clock});
+  if (decision.manifestRefusal) {
+    const {logManifestVerdict} = await import('./forge-manifest-tracked.mjs');
+    await logManifestVerdict({env,mode:policy.settings.remote.manifest,error:{code:decision.manifestRefusal}});
+  }
   if (!decision.remote) return { handled: false };
   const remoteRoot = join(dirname(lockRoot), 'remote');
   const localFallback = (reason, detail = null) => {
@@ -1475,7 +1537,7 @@ export async function runWithRemoteDecision({
     });
     const dispatch = () => {
       executionRun = null;
-      return Promise.resolve(remoteExec({ argv, cwd, env, host, signal: controller.signal, cancelSignal: cancelController.signal, transport: policy.settings.remote.transport, bundleMainMaxAgeMs: policy.settings.remote.bundle.mainMaxAgeMin * 60_000,
+      return Promise.resolve(remoteExec({ argv, cwd, env, host, signal: controller.signal, cancelSignal: cancelController.signal, transport: policy.settings.remote.manifest === 'tracked' ? 'rsync' : policy.settings.remote.transport, manifestMode: policy.settings.remote.manifest, bundleMainMaxAgeMs: policy.settings.remote.bundle.mainMaxAgeMin * 60_000,
       onWarning: (reason, detail) => recordRemoteFallback({lockRoot, reason, detail, cwd, argv, env, clock}),
       onCapabilities: capabilities => writeRunnerCapabilities({ root: remoteRoot, host, capabilities, clock }), onRun: (run, metadata) => {
         if (recordMarkerRun(executionMarker, {owner, run, nonce:metadata?.nonce, slot:metadata?.slot})) executionRun = run;
@@ -3131,7 +3193,7 @@ function parseFlags(argv) {
 }
 
 // @test-only-export-ok: exercise CLI routing through the real decision before slot acquisition.
-export async function main(argv, { remoteExec, readTelemetry } = {}) {
+export async function main(argv, { remoteExec, readTelemetry, home } = {}) {
   // `run`'s command tail lives after a literal `--` and must never be parsed as this CLI's OWN flags (a
   // `--coverage` meant for the wrapped command would otherwise be read as a flag of THIS script).
   const dashDashIdx = argv.indexOf('--');
@@ -3139,7 +3201,7 @@ export async function main(argv, { remoteExec, readTelemetry } = {}) {
   const { flags, positionals } = parseFlags(preArgv);
   // Resolve before lock-root derivation so relative --repo uses the same shared pool and execution cwd.
   const repo = resolve(typeof flags.repo === 'string' ? flags.repo : process.cwd());
-  const policy = loadAdmissionPolicy({ env: process.env, checkoutRoot: repo });
+  const policy = loadAdmissionPolicy({ env: process.env, checkoutRoot: repo, home });
   const privatePool = privateAdmissionPool(process.env, repo);
   const cap = flags.cap != null && privatePool ? Number(flags.cap) : policy.settings.cap;
   if (flags.cap != null && !privatePool) {

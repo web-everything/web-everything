@@ -4,17 +4,19 @@
  * (no new panel), then the same event-driven hold.
  */
 import { createHash } from 'node:crypto';
-import { mkdirSync, readdirSync, readFileSync, renameSync, statSync, unlinkSync, writeFileSync } from 'node:fs';
-import { dirname, join, resolve } from 'node:path';
+import { closeSync, constants, fstatSync, mkdirSync, openSync, readFileSync, readSync, renameSync, statSync, unlinkSync, writeFileSync } from 'node:fs';
+import { basename, dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { referralCardReadable } from '../lib/referral-card-readable.mjs';
 import { liveReferralState } from '../lib/referral-live-context.mjs';
-import { resolveRunsDir, tryReadRun } from '../operations/run-store.mjs';
+import { isValidRunId, resolveRunsDir, reportInvalidRunEntry, runFileEntries, tryReadRun } from '../operations/run-store.mjs';
+import { validateRunRecord } from '../operations/run-record.mjs';
 import { parseOperatorRulingComment, readReferralRecords, REFERRAL_RECORD_MARKER, activeReferrals,
-  referralRecordState, AUTO_POLICY_ACTOR, findingIdentityTable } from '../lib/jury-core.mjs';
+  referralRecordState, AUTO_POLICY_ACTOR, findingIdentityTable, VERDICTS } from '../lib/jury-core.mjs';
 import { isOperatorAuthored, isTrustedMarkerAuthor } from '../lib/marker-authorship.mjs';
 import { REARM_COMMENT_MARKER } from './rearm-review.mjs';
 import { execFileSyncThrottled } from '../lib/gh-throttle.mjs';
+import { readCompletePrComments } from './pr-comments-complete.mjs';
 import { rulingNeeded } from '../lib/ruling-ledger.mjs';
 import { parseReviewedSha } from '../lib/review-escalation.mjs';
 import { cascadePolicy, platformPreference } from '../lib/policy-cascade.mjs';
@@ -24,6 +26,7 @@ import { createActionStore } from '../operations/action-store.mjs';
 import { actionResource } from '../operations/action-record.mjs';
 import { isQuotaError } from '../lib/provider-quota-hold.mjs';
 import { isBodyFileRefusal } from '../operations/review-pr-io.mjs';
+import { parseAdvisories, advisoryCoversHead, ADVISORY_OUTCOMES } from '../lib/advisory-labels.mjs';
 import { reverifyStaleReferrals } from './referral-reverify.mjs';
 
 /** Maximum drives of a saved run before its resume budget is exhausted. Shared with the driver. */
@@ -50,8 +53,9 @@ const sha = value => typeof value === 'string' && /^[a-f0-9]{40}$/.test(value);
 const hash = value => createHash('sha256').update(JSON.stringify(value)).digest('hex');
 
 /** Completed-panel evidence, or an incomplete attempt that can spend a no-verdict retry but prove no verdict.
- * A run suspended at human confirmation has completed its panel, although the operation is pending. */
-export function reviewRunEvidence(run) {
+ * A run suspended at human confirmation has completed its panel, although the operation is pending.
+ * Misnamed-record recovery requires a recognized review verdict as well as completion timing. */
+export function reviewRunEvidence(run, { requireVerdict = false } = {}) {
   if (run?.op !== 'review-pr') return null;
   const read = run.findings?.read;
   const suspendedReferralEffect = !run.resumeOf && run.pending?.kind === 'effect' && run.pending.step === 'mandatoryReferrals';
@@ -118,10 +122,11 @@ export function reviewRunEvidence(run) {
       });
   } catch { /* unreadable step or seat evidence cannot establish a quota-only attempt */ }
   if (!sha(head) || !Number.isFinite(startedAt)) return null;
-  if (!Number.isFinite(completedAt)) {
+  if (!Number.isFinite(completedAt) || (requireVerdict && !Object.values(VERDICTS).includes(verdict?.verdict))) {
     // Crashes before/during advise still consumed a retry. Keep them in the cached projection, without
     // inventing a completed panel or clean referral evidence for acceptance/carry readers.
     return { id: run.id, repo: read.repo, pr: Number(read.pr), head, startedAt, completedAt: null,
+      ...(requireVerdict ? { misnamed: true } : {}),
       ...(suspendedReferralEffect ? { suspendedReferralEffect: true } : {}),
       ...(retryableRecordEffect ? { retryableRecordEffect: true } : {}),
       ...(ciHeldRecordRetry ? { ciHeldRecordRetry } : {}),
@@ -184,9 +189,59 @@ function writeEvidenceDiskCache(file, entries) {
     renameSync(tmp, file);
   } catch { try { unlinkSync(tmp); } catch { /* best effort: the cache is only a speed-up */ } }
 }
+// Stray records are untrusted. Oversized/unreadable files retain the invalid-entry alert for operator repair.
+export const INVALID_RUN_EVIDENCE_MAX_BYTES = 16 * 1024 * 1024;
 export function readReviewRunEvidence({ dir = resolveRunsDir(), readRun = tryReadRun, memo = evidenceCache, persist = true } = {}) {
-  let names;
-  try { names = readdirSync(dir); } catch (e) { if (e.code === 'ENOENT') return []; throw e; }
+  const entries = runFileEntries(dir, { includeInvalid: true, reportInvalid: path => {
+    if (!basename(path).startsWith('review-pr-')) reportInvalidRunEntry(path);
+  } });
+  const invalidEvidence = entries.flatMap(name => {
+    if (!name.startsWith('review-pr-') || isValidRunId(name.slice(0, -5))) return [];
+    let fd;
+    const path = join(dir, name);
+    try {
+      // Nonblocking open avoids hanging on a FIFO before we can reject its descriptor's type.
+      fd = openSync(path, constants.O_RDONLY | constants.O_NONBLOCK);
+      const stat = fstatSync(fd);
+      if (!stat.isFile()) throw new Error('not a regular file');
+      if (stat.size > INVALID_RUN_EVIDENCE_MAX_BYTES) throw new Error('oversized record');
+      const buffer = Buffer.alloc(INVALID_RUN_EVIDENCE_MAX_BYTES + 1);
+      let length = 0;
+      while (length < buffer.length) {
+        const bytes = readSync(fd, buffer, length, buffer.length - length, null);
+        if (bytes === 0) break;
+        length += bytes;
+      }
+      if (length > INVALID_RUN_EVIDENCE_MAX_BYTES) throw new Error('oversized record');
+      const run = JSON.parse(buffer.toString('utf8', 0, length));
+      // Recovery tolerates the bad id only; malformed run state must never clear a hold.
+      const errors = validateRunRecord(run).errors.filter(error => !error.startsWith('invalid run id '));
+      if (errors.length) throw new Error(errors.join('; '));
+      if (!Number.isSafeInteger(Number(run?.input?.pr)) || Number(run.input.pr) <= 0) throw new Error('no PR number');
+      // The verdict payload must be well formed: the pipeline always writes pendingReferrals (an array) on a
+      // needs-human verdict, so a missing or non-array list means the record is unreadable, never evidence.
+      // Every payload the projection may read is validated, so a valid one can never mask a malformed one.
+      for (const payload of [run.verdict, run.findings?.referralVerdict, run.resumeOf?.verdict, run.findings?.record?.verdict]) {
+        if (!payload || typeof payload !== 'object') continue;
+        for (const key of ['pendingReferrals', 'blockedReferrals']) {
+          if (payload[key] !== undefined && !Array.isArray(payload[key])) throw new Error(`verdict ${key} is not a list`);
+        }
+        // Element shapes the pipeline writes: pendingReferrals are non-empty reason strings, blockedReferrals are objects.
+        if (payload.pendingReferrals?.some(item => typeof item !== 'string' || !item.trim())) throw new Error('verdict pendingReferrals holds a malformed element');
+        if (payload.blockedReferrals?.some(item => !item || typeof item !== 'object' || Array.isArray(item))) throw new Error('verdict blockedReferrals holds a malformed element');
+        if (payload.verdict === VERDICTS.NEEDS_HUMAN && !Array.isArray(payload.pendingReferrals)) throw new Error('needs-human verdict without pendingReferrals');
+      }
+      // A stray record's timing alone cannot prove a verdict or supersede a persistence-failure hold.
+      const evidence = reviewRunEvidence(run, { requireVerdict: true });
+      reportInvalidRunEntry(path);
+      return evidence ? [evidence] : [];
+    } catch (error) {
+      reportInvalidRunEntry(path, { severity: 'high', reason: error.message });
+      return [];
+    }
+    finally { if (fd !== undefined) closeSync(fd); }
+  });
+  const names = entries.filter(name => isValidRunId(name.slice(0, -5)));
   const file = join(dir, REVIEW_EVIDENCE_CACHE_FILE);
   let disk = null;
   let dirty = false;
@@ -196,7 +251,7 @@ export function readReviewRunEvidence({ dir = resolveRunsDir(), readRun = tryRea
   // daemon had written even one new record) — ~140 MB of transient heap per pass, several passes per tick. A warm
   // process now parses its few missed records directly and leaves the file alone; the file is read (and rewritten)
   // only when this call misses every record or more than EVIDENCE_DISK_MIN_MISSES of them. Same evidence either way.
-  const rows = names.filter(n => n.startsWith('review-pr-') && n.endsWith('.json')).map(name => {
+  const rows = names.filter(n => n.startsWith('review-pr-')).map(name => {
     const path = join(dir, name);
     const stat = statSync(path);
     return { name, path, key: `${stat.mtimeMs}:${stat.size}` };
@@ -226,7 +281,7 @@ export function readReviewRunEvidence({ dir = resolveRunsDir(), readRun = tryRea
     disk ??= readEvidenceDiskCache(file);
     if (dirty || Object.keys(disk).some(n => !kept[n])) writeEvidenceDiskCache(file, kept);
   }
-  return out;
+  return [...out, ...invalidEvidence];
 }
 
 /** The events on the PR thread that wake a parked review, each tagged with what woke it. `ruling` (a reviewer's or
@@ -319,7 +374,7 @@ function latestReviewAttempt(history) {
  * @returns {{id: string, head: string}|null}
  */
 export function findResumableParkedRun(pr, runs, { repo, cardReadable, ciHeldRecordRetryMax = 0 } = {}) {
-  const history = runs.filter(r => r.repo === repo && r.pr === Number(pr.number));
+  const history = runs.filter(r => !r.misnamed && r.repo === repo && r.pr === Number(pr.number));
   const last = latestReviewAttempt(history);
   const ciHeldRetry = ciHeldRecordRetryMax > 0 && ciHeldRecordRetryCountersValid(last?.ciHeldRecordRetry)
     && last.ciHeldRecordRetry.attempts <= ciHeldRecordRetryMax
@@ -353,7 +408,8 @@ const REPO_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..', '..');
 function evaluateReferralHold(pr, runs, { repo, now = Date.now(), env = process.env,
   // The SAME reader the review gate uses, so a `card` ruling naming a card that does not exist yet keeps the hold.
   cardReadable = ref => referralCardReadable(ref, REPO_ROOT) } = {}) {
-  const attempts = runs.filter(r => r.repo === repo && r.pr === Number(pr.number));
+  // Misnamed incomplete evidence spends no-verdict retries, but cannot supersede a referral hold.
+  const attempts = runs.filter(r => !r.misnamed && r.repo === repo && r.pr === Number(pr.number));
   const last = latestReviewAttempt(attempts);
   const history = attempts.filter(r => Number.isFinite(r.completedAt))
     .sort((a, b) => b.completedAt - a.completedAt);
@@ -517,6 +573,7 @@ export function decideSameHeadHold(pr, runs, { repo, env = process.env, now = Da
   // died before `advise` too, or a failing review would be resumed every tick.
   const attemptsSinceWake = history.filter(r => Number.isFinite(r.startedAt) && r.startedAt >= wake).length;
   return { kind: 'same-head', head, episode: hash([repo, pr.number, head, wake, 'same-head']), count, attemptsSinceWake,
+    reviewStartedAt: Number.isFinite(last.startedAt) ? last.startedAt : null,
     why, retryAt, persistenceFailed: false, exhausted: false,
     ...(noVerdict ? { noVerdict: { exhausted: noVerdictExhausted, releasesSpent: Math.max(0, Math.min(spent, releases)),
       releases, source: retry?.source ?? 'standard' } } : {}) };
@@ -607,7 +664,7 @@ const findingLoc = f => `${f?.file ?? 'no file'}${Number.isInteger(f?.line) ? `:
  * `seatDisabled` (importing the seat policy closes a cycle): an unruled finding of a since-disabled seat keeps the
  * pause, the conservative side. Outcomes:
  * - `send-back`: some live-head finding is ruled `block` (operator or policy or reviewer) and none is pending.
- * - `resume`: every live-head finding is ruled `card` or `not-real`.
+ * - `resume`: every live-head finding is ruled `card` or `not-real`, or a same-head hold has no referral finding.
  * - `stay` (fail closed, with `why`): anything unreadable, pending, missing, malformed, or not on the live head.
  * Never accepts and never touches `review:human`: the caller acts on the outcome.
  * @returns {null | {outcome:'send-back'|'resume'|'stay', head:string|null, why:string,
@@ -625,6 +682,46 @@ export function decideReferralHoldAutoResolve(pr, hold, { repo,
   if (hold.persistenceFailed) return stay('the referral save failed on this head; its own retry budget owns the pause');
   if (hold.noVerdict) return stay('no verdict ever landed on this head; the no-verdict retries own the pause');
   if (hold.cause) return stay(`the verdict ledger cannot answer for this PR (${hold.cause})`);
+  if (!Array.isArray(pr.comments)) return stay('the comment thread is unreadable; read the full thread before resuming');
+  if ((pr.comments.length >= GH_LIST_COMMENT_CAP && pr.commentsComplete !== true) || pr.commentsComplete === false) return stay('the comment thread may be truncated; read the full thread before resuming');
+  // Zero findings is proof only when the head's finished review left its advisory: that is the evidence the review ran
+  // and raised nothing. Without it (a lost write-back) the pause stays; onClean is honoured like any clean resume.
+  const noFinding = why => {
+    if (hold.kind !== 'same-head') return stay(why);
+    // The newest advisory comment itself must carry exactly one outcome line, and it must be `accept`: parseAdvisories
+    // reads a missing outcome as `accept` and a body can embed extra outcome lines, so the comment text is checked here.
+    const trusted = pr.comments.filter(isTrustedMarkerAuthor);
+    const adv = parseAdvisories(trusted)[0];
+    const body = String(trusted[adv?.index]?.body ?? '');
+    // Every line that mentions an advisory outcome counts (a duplicate or malformed one keeps the hold), and the single
+    // one must be a well-formed explicit accept.
+    const outcomes = body.split(/\r?\n/).filter(l => /advisory\s+outcome/i.test(l))
+      .map(l => (/^\*\*Advisory outcome:\*\* `accept`(?:\s.*)?$/.test(l) ? 'accept' : 'malformed'));
+    // parseAdvisories skips a comment missing a Verdict or Net basis line, so a newer malformed advisory note must not be
+    // passed over: the newest advisory-note comment on the thread has to be the parsed one.
+    const notes = trusted.map((c, i) => ({ i, at: Date.parse(c?.createdAt) || 0, note: String(c?.body ?? '').includes('ADVISORY REVIEW, NOT A RECORDED VERDICT') }))
+      .filter(n => n.note).sort((a, b) => b.at - a.at || b.i - a.i);
+    // Tie the advisory to the held review: exactly one finished attempt since the wake (the advisory is that review's
+    // write-back, not an older one), and the advisory cannot predate the PR or the held review's start.
+    const prAt = Date.parse(pr.createdAt);
+    const sameReview = hold.count === 1 && hold.attemptsSinceWake === 1 && Number.isFinite(prAt) && adv?.time >= prAt
+      && Number.isFinite(hold.reviewStartedAt) && adv.time >= hold.reviewStartedAt;
+    // An unreadable comment (non-string body) could hide a pending referral, and a second `Net basis` line could name another head.
+    const readable = pr.comments.every(c => c && typeof c.body === 'string');
+    const basisLines = body.split(/\r?\n/).filter(l => /net\s+basis/i.test(l)).length;
+    // The advisory note must LEAD the comment (a quoted or fenced example inside another comment is not a review).
+    const leads = body.trimStart().startsWith('**⚠️ THIS IS AN ADVISORY REVIEW, NOT A RECORDED VERDICT.**');
+    // Only a `review:human` PR is released this way (its next step is the human /review); a non-human PR would be sent to another panel.
+    const human = (Array.isArray(pr.labels) ? pr.labels : []).some(l => (typeof l === 'string' ? l : l?.name) === 'review:human');
+    // Producer footers are never fenced: any code fence in the note means its fields may be quoted examples.
+    const fenced = body.includes('```') || body.includes('~~~');
+    const clean = adv && human && !fenced && leads && readable && basisLines === 1 && sameReview && notes[0]?.i === adv.index && advisoryCoversHead(adv, head) && String(adv.head).toLowerCase() === head.toLowerCase()
+      && outcomes.length === 1 && outcomes[0] === ADVISORY_OUTCOMES.ACCEPT && adv.outcome === ADVISORY_OUTCOMES.ACCEPT;
+    if (!clean) return stay(`${why}, and no clean advisory accept names the full live head`);
+    if (policy.onClean !== 'resume') return stay(`no referral finding exists, but referralHoldAutoResolve.onClean=${policy.onClean} (source: ${source('onClean')}) keeps the pause`);
+    return { outcome: 'resume', head, findings: [], counts: {},
+      why: `no referral finding exists on head ${head.slice(0, 9)}; no ruling is owed` };
+  };
   let live;
   try { live = liveReferralState(pr, { repo, pr: Number(pr.number), cardReadable }); }
   catch (e) { return stay(`the referral state is unreadable (${String(e?.message ?? e).split('\n')[0]})`); }
@@ -635,7 +732,7 @@ export function decideReferralHoldAutoResolve(pr, hold, { repo,
       + (named.length ? ` (${named.join(', ')})` : ` (${live.pendingReasons.join(', ')})`));
   }
   const records = live.records.filter(r => r.head === head && r.repo === repo && r.pr === Number(pr.number));
-  if (!records.length) return stay('no referral record names the live head');
+  if (!records.length) return noFinding('no referral record names the live head');
   const findings = [];
   for (const record of records) {
     const state = referralRecordState(record, { repo, pr: Number(pr.number), head, body: typeof pr.body === 'string' ? pr.body : '',
@@ -662,7 +759,7 @@ export function decideReferralHoldAutoResolve(pr, hold, { repo,
         actor: named.operator ? named.actor : 'reviewer', rationale: named.rationale ?? named.reason ?? '' });
     }
   }
-  if (!findings.length) return stay('the live-head records name no active referral');
+  if (!findings.length) return noFinding('the live-head records name no active referral');
   const counts = {};
   for (const f of findings) counts[f.result] = (counts[f.result] ?? 0) + 1;
   const blocked = findings.filter(f => f.result === 'block');
@@ -707,9 +804,10 @@ export function enrichPrsWithReferralHoldAutoResolve(prs, { repo, env = process.
   });
 }
 
-function defaultReadComments({ repo, number }) {
-  return JSON.parse(execFileSyncThrottled('gh', ['pr', 'view', String(number), ...(repo ? ['--repo', repo] : []), '--json', 'comments'],
-    { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: 30_000, maxBuffer: 32 * 1024 * 1024 })).comments;
+// The verified paginated reader proves completeness (count, unique ids, bodies) and throws without proof, so a thread
+// it returns is complete; a failed proof throws and enrichment keeps the list snapshot (incomplete, hold stays).
+export function defaultReadComments({ repo, number }, read = readCompletePrComments) {
+  return { comments: read(number, { repo }), complete: true };
 }
 
 export function enrichPrsWithReferralHolds(prs, { repo, now = Date.now(), env = process.env, readRuns = readReviewRunEvidence,
@@ -720,8 +818,12 @@ export function enrichPrsWithReferralHolds(prs, { repo, now = Date.now(), env = 
     if (Array.isArray(pr.comments) && pr.comments.length >= GH_LIST_COMMENT_CAP
       && runs.some(r => r.repo === repo && r.pr === Number(pr.number) && r.head === pr.headRefOid)) {
       try {
-        const full = readComments({ repo, number: pr.number });
-        if (Array.isArray(full)) pr = { ...pr, comments: full };
+        const read = readComments({ repo, number: pr.number });
+        // A reader may report { comments, complete }; a bare array is complete only when it is below the
+        // list cap (a capped page, such as `gh pr view --json comments`, may hide later events and stays incomplete).
+        const full = Array.isArray(read) ? read : read?.comments;
+        const complete = Array.isArray(read) ? read.length < GH_LIST_COMMENT_CAP : read?.complete === true;
+        if (Array.isArray(full)) pr = { ...pr, comments: full, commentsComplete: complete };
       }
       catch { /* Keep the list snapshot when the full thread is unavailable. */ }
     }

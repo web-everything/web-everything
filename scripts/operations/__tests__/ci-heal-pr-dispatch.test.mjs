@@ -146,6 +146,61 @@ describe('oldest owed CI-heal first', () => {
       expect(result.refusals.map(r => [r.pr, r.kind])).toEqual([[5082, 'fix-cap'], [5087, 'fix-cap']]);
     } finally { rmSync(dir, { recursive: true, force: true }); }
   });
+
+  it('ci-heal refusal is always logged', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'ci-heal-refusal-log-'));
+    const plan = planReconcile({ requiredChecks: ['test'], prs: [5087, 5082].map(number => ({
+      number, state: 'OPEN', headRefName: `lane/${number}`, headRefOid: 'a'.repeat(40),
+      labels: [{ name: 'ci:failed' }], comments: [],
+      statusCheckRollup: [{ name: 'test', status: 'COMPLETED', conclusion: 'FAILURE' }],
+    })) });
+    const err = vi.spyOn(console, 'error').mockImplementation(() => {});
+    try {
+      await runReconcileCiHealDispatch({ root: '/repo', reconcile: () => plan,
+        checkStaleness: FRESH, dispatch: vi.fn(), dispatchThrottle: {
+          tryAdmit: () => ({ admit: false, kind: 'fix-cap', why: 'reserve slots full' }), recheckHost: () => ({ admit: true }),
+        },
+        ciHealReserve: createCiHealReserve({ env: { WE_CI_HEAL_RESERVE: '0' }, gate: () => ({ admit: true }) }),
+        pickFreeLanes: () => [1, 2], resolveWorkUnit: () => ({ itemNum: null, scope: [] }),
+        resolveProfile: () => ({ capabilities: { ciHeal: true } }), unsupportedPath: join(dir, 'u.json'),
+        flushOwed: () => ({}), pollAttempts: () => [], flushTimeouts: async () => [], timeoutHold: () => null,
+        salvage: async () => null, currentBuild: () => null,
+        fixLoop: { killed: () => false, readRows: () => [], append: vi.fn() },
+      });
+      const lines = err.mock.calls.map(c => String(c[0]));
+      expect(lines.some(l => /refused fix-cap PR #5082: .*fixer cap full/.test(l))).toBe(true);
+      expect(lines.some(l => /refused fix-cap PR #5087: /.test(l))).toBe(true);
+    } finally { err.mockRestore(); rmSync(dir, { recursive: true, force: true }); }
+  });
+
+  it('logs Phase B refusals (held, dispatch-failed) and not a false refusal for a dispatched PR', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'ci-heal-refusal-log-b-'));
+    const plan = planReconcile({ requiredChecks: ['test'], prs: [5087, 5082, 5017].map(number => ({
+      number, state: 'OPEN', headRefName: `lane/${number}`, headRefOid: 'a'.repeat(40),
+      labels: [{ name: 'ci:failed' }], comments: [],
+      statusCheckRollup: [{ name: 'test', status: 'COMPLETED', conclusion: 'FAILURE' }],
+    })) });
+    const err = vi.spyOn(console, 'error').mockImplementation(() => {});
+    const dispatch = vi.fn(async planned => {
+      if (planned.pr === 5017) return { held: true, reason: 'already in flight' };
+      if (planned.pr === 5082) throw new Error('boom');
+      return { pr: planned.pr };
+    });
+    try {
+      await runReconcileCiHealDispatch({ root: '/repo', reconcile: () => plan,
+        checkStaleness: FRESH, dispatch, dispatchThrottle: { tryAdmit: () => ({ admit: true }), recheckHost: () => ({ admit: true }) },
+        pickFreeLanes: () => [1, 2, 3], resolveWorkUnit: () => ({ itemNum: null, scope: [] }),
+        resolveProfile: () => ({ capabilities: { ciHeal: true } }), unsupportedPath: join(dir, 'u.json'),
+        flushOwed: () => ({}), pollAttempts: () => [], flushTimeouts: async () => [], timeoutHold: () => null,
+        salvage: async () => null, currentBuild: () => null,
+        fixLoop: { killed: () => false, readRows: () => [], append: vi.fn() },
+      });
+      const lines = err.mock.calls.map(c => String(c[0]));
+      expect(lines.some(l => /refused held PR #5017: already in flight/.test(l))).toBe(true);
+      expect(lines.some(l => /refused dispatch-failed PR #5082/.test(l))).toBe(true);
+      expect(lines.some(l => /refused unknown/.test(l))).toBe(false);
+    } finally { err.mockRestore(); rmSync(dir, { recursive: true, force: true }); }
+  });
 });
 
 const TEMPLATE = 'heal #{{ITEM_NUM}} pr={{PR_NUM}} ref={{LANE_REF}} lane={{LANE}} slug={{SESSION_SLUG}} scope={{SCOPE}} why={{REASON}}';
@@ -327,14 +382,22 @@ describe('dispatchCiHeal (#3852)', () => {
 // composition (read the reconcile plan → capability-gate → lane → dispatch), same durable `unsupported-repo`
 // ledger, one dispatch kind over.
 describe('runReconcileCiHealDispatch — repo capability gate (#3967 multi-repo slice 7)', () => {
-  it('a repo whose profile has `ciHeal:false` refuses every planned ci-heal `unsupported-repo`, never touching a lane or dispatch sink', async () => {
+  it.each([false, true])('ciHeal:false refuses fixers while timeout reruns and lifecycle flushes survive (timeout-only=%s)', async (timeoutOnly) => {
     const dir = mkdtempSync(join(tmpdir(), 'ci-heal-refusals-'));
     const unsupportedPath = join(dir, 'rows.json');
     const calls = [];
     try {
       const options = {
         root: '/repo', repo: 'plateauapp/plateau-app', unsupportedPath,
-        reconcile: () => ({ dispatch: [{ kind: 'ci-heal', prNumber: 50, headRefName: 'lane/x' }, { kind: 'fix', prNumber: 51 }], refusals: [] }),
+        flushOwed: () => { calls.push('flush'); return {}; },
+        flushTimeouts: async () => { calls.push('timeouts'); return []; },
+        pollAttempts: () => [],
+        reconcile: () => ({ dispatch: [
+          ...(!timeoutOnly ? [{ kind: 'ci-heal', prNumber: 50, headRefName: 'lane/x' }] : []),
+          { kind: 'ci-timeout-rerun', prNumber: 52, timeoutRetry: { eligible: true, jobs: [{ run: 10, job: 20 }] } },
+          { kind: 'fix', prNumber: 51 },
+        ], refusals: [] }),
+        retryTimeout: () => { calls.push('rerun'); return { status: 'requested' }; },
         pickFreeLanes: () => { calls.push('pool'); return [2]; },
         dispatch: () => { calls.push('dispatch'); },
         resolveWorkUnit: () => ({ itemNum: null, scope: [] }),
@@ -344,10 +407,12 @@ describe('runReconcileCiHealDispatch — repo capability gate (#3967 multi-repo 
         checkStaleness: FRESH,
       };
       const result = await runReconcileCiHealDispatch(options);
-      expect(result.dispatched).toEqual([]);
-      expect(result.refusals).toEqual([{ kind: 'unsupported-repo', repo: 'plateau-app', prNumber: 50, action: 'ci-heal', why: expect.any(String) }]);
-      expect(calls).toEqual([]); // never touched the lane pool or a dispatch sink — only `fix` was in the plan's non-ci-heal row
-      expect(readUnsupported({ path: unsupportedPath })).toHaveLength(1);
+      expect(result.dispatched).toEqual([{status: 'requested', kind: 'ci-timeout-rerun', pr: 52}]);
+      expect(result.refusals).toEqual((timeoutOnly ? [] : [50]).map(prNumber => ({
+        kind: 'unsupported-repo', repo: 'plateau-app', prNumber, action: 'ci-heal', why: expect.any(String),
+      })));
+      expect(calls).toEqual(['flush', 'timeouts', 'rerun']); // Timeout recovery is lifecycle work.
+      expect(readUnsupported({ path: unsupportedPath })).toHaveLength(timeoutOnly ? 0 : 1);
       await expect(runReconcileCiHealDispatch({ repo: 'unknown/repo' })).rejects.toThrow(/not a constellation repo/);
     } finally { rmSync(dir, { recursive: true, force: true }); }
   });
