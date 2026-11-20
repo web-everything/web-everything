@@ -191,17 +191,18 @@ it('accepts the live sampler shape without optional swap growth and matches reso
   expect(assessResourceStatus({ snapshot: live, nowMs }).freshness).toBe('stale');
   expect(read('snapshot').unknown).toBe(true);
 });
-it('ignores unrelated dotted filename keys but refuses namespace taint and unreadable settings layers', () => {
+it.each(['feature', 'legacy'])('ignores unrelated dotted filename keys but refuses namespace taint and unreadable %s settings layers', layer => {
   const dir = join(root, 'settings'); mkdirSync(dir);
   const legacyPath = join(root, 'legacy.json');
   put(join(dir, 'resource-pool.json'), { resourcePool: { mode: 'shadow' } });
-  put(join(dir, 'baseline.json'), { files: { 'scripts/file.mjs': 1 } });
+  const file = layer === 'legacy' ? legacyPath : join(dir, 'baseline.json');
+  put(file, { files: { 'scripts/file.mjs': 1 } });
   const read = () => readPoolSettingsChecked({ dir, legacyPath });
   const load = () => loadPoolSettings({ read, platform: {}, operatorOverride: {}, env: {}, log: () => {} });
   expect(load().unknown).toBe(false);
-  put(join(dir, 'baseline.json'), { 'resourcePool.mode': 'enforce' });
+  put(file, { 'resourcePool.mode': 'enforce' });
   expect(load().unknown).toBe(true);
-  put(join(dir, 'baseline.json'), '{broken');
+  put(file, '{broken');
   expect(load().unknown).toBe(true);
 });
 it.each([['fix-123', 3], ['review-123', 2], ['redteam-123', 2], ['build-123', 4], ['blocker-123', 1], ['lane-46', 4]])('classifies lease session %s as C%s without lane-number guesses', (session, priority) => {

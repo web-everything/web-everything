@@ -4,7 +4,7 @@
  */
 import { readdirSync, readFileSync, statSync } from 'node:fs';
 import { hostname } from 'node:os';
-import { dirname, join } from 'node:path';
+import { basename, dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { resolveCoordinationRoot } from '../operations/coordination-root.mjs';
 import { fixDispatchClaimRoot, DEFAULT_FIX_DISPATCH_CLAIM_TTL_MINUTES } from '../conveyor/fix-claim-store.mjs';
@@ -22,7 +22,7 @@ import { readSnapshot } from './resource-sampler.mjs';
 import { appendResourceLog, loadResourcePolicy } from './resource-admission.mjs';
 import { parseLockEntry, isLeaseExpired } from '../readiness/file-locks.mjs';
 import { cascadePolicy, platformPreference, readOperatorPolicy, formatCascadeSourcesLine } from './policy-cascade.mjs';
-import { readSettingsChecked, readSettings } from './settings-files.mjs';
+import { readSettingsChecked, readSettings, SETTINGS_DIR, LEGACY_SETTINGS_PATH } from './settings-files.mjs';
 import { daemonCloneForLabel } from './daemon-clone-registry.mjs';
 import { liveReviewRoundBudget } from '../../skills-src/conveyor/review-daemon.mjs';
 import { pidStartTime, pidNamespace } from './pid-alive.mjs';
@@ -81,13 +81,13 @@ const holder = (kind, row, priority, resource = 'studio.units', id = row.path ??
 /** Dotted filename keys in unrelated settings are data, not resourcePool policy paths.
  * Keep all read/parse/duplicate errors closed; waive only dotted-key taint from a
  * readable layer proven unable to own this namespace (including dotted aliases). */
-export function readPoolSettingsChecked({ dir = join(ROOT, 'scripts/settings'),
-  legacyPath = join(ROOT, 'scripts/dispatch-settings.json') } = {}) {
+export function readPoolSettingsChecked({ dir = SETTINGS_DIR,
+  legacyPath = LEGACY_SETTINGS_PATH } = {}) {
   const checked = readSettingsChecked({ namespace: 'resourcePool', dir, legacyPath });
   checked.taint = checked.taint.filter(t => {
     if (t.reason !== 'dotted key') return true;
     try {
-      const path = t.source === 'dispatch-settings.json' ? legacyPath
+      const path = t.source === basename(LEGACY_SETTINGS_PATH) ? legacyPath
         : /^settings\/[a-z0-9-]+\.json$/.test(t.source) ? join(dir, t.source.slice(9)) : null;
       const data = json(path);
       return Object.keys(data).some(k => k === 'resourcePool' || k.startsWith('resourcePool.'));

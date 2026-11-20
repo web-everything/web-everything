@@ -71,6 +71,8 @@ export const NON_READ_OPERATIONS = Object.freeze([
   'agent-activity', 'item-activity', 'daemon-status', 'heavy-queue', 'host-capacity', 'delivery-capacity','review-seat-caps', 'gate-health', 'telemetry-summary',
   'graduation-progress-report', 'graduate-chain', 'judge-sweep-facts', 'route-pr-outcome', 'dispatch-lane', 'claim', 'open-pr', 'explore', 'stage-pr-view',
   'docket-refresh', 'restart-runner', 'priority-sync', 'live-state', 'live-work', 'sessions', 'record-referral-ruling', 'extend-rounds',
+  // The resource-pool CLI appends shadow evidence through its finish sink.
+  'resource-pool',
   'free-scope', 'operator-session-bootstrap', 'maintenance', 'perf-snapshot', 'pre-pr-check', 'resource-status', 'worker-capacity', 'prototype-load', 'codex-audit',
   'unpark', 'retry-prepare', 'rearm', 'refresh', 'grant-rounds', 'clear-claim', 'ci-heal-reset', 'routing-override', 'update-branch',
   'urgent-verify', 'urgent-sweep',
