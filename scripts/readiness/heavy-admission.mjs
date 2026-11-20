@@ -3105,12 +3105,16 @@ export async function runUnderAdmission({
   kind = null, command, cwd = process.cwd(), exec = defaultExec, log = (m) => process.stderr.write(m),
   now = () => Date.now(), sleep = (ms) => new Promise((r) => setTimeout(r, ms)),
   bypass = null, env = process.env, policy = loadAdmissionPolicy({ env }), waitMs = 0, waitSource = 'standard', location = null,
-  runCeilingMs = 0, hostAdmission,
+  runCeilingMs = 0, hostAdmission, requireAdmission = false,
 }) {
   if (wholeSuiteRefused({ command, policy, env, log })) return { exitCode: 125 };
   // The child always runs with the re-entrancy flag, so anything it runs that is itself wrapped passes through.
   const childEnv = { ...env, [ADMISSION_HELD_ENV]: '1' };
   if (bypass) {
+    if (requireAdmission) {
+      log(`✗ heavy-admission run: --require-admission refused: admission bypassed (${bypass}); the command was NOT run.\n`);
+      return { exitCode: 126, admission: { ok: false, slot: null, timedOut: false, waitedMs: 0, bypassed: bypass } };
+    }
     let exitCode = 0;
     try {
       const bypassOpts = { cwd, stdio: 'inherit', env: bypass === 'held' ? env : childEnv };
@@ -3129,6 +3133,13 @@ export async function runUnderAdmission({
   const runKind = kind ?? classifyAdmissionCommandKind(command, env);
   const admission = await acquireSlotBlocking({ lockRoot, cap, owner, lane, num, repo, kind: runKind, command, ceilingMs, leaseMinutes, now, sleep, log, env, policy, canDefer: true, waitMs, waitSource, location, hostAdmission });
   if (admission.deferred) return { exitCode: ADMISSION_DEFERRED_EXIT, admission };
+  // A successful acquire is required even when policy permits an unslotted timeout run
+  // or admission was disabled after the CLI's initial bypass check.
+  if (requireAdmission && admission.ok !== true) {
+    const reason = admission.timedOut ? `timed out after ${admission.waitedMs}ms` : admission.disabled ? 'admission disabled' : 'no slot acquired';
+    log(`✗ heavy-admission run: --require-admission refused: ${reason}; the command was NOT run.\n`);
+    return { exitCode: 126, admission };
+  }
   if (admission.timedOut) {
     log(`⚠ heavy-command admission: timed out after ${admission.waitedMs}ms waiting for capacity (cap=${cap}) — proceeding unslotted.\n`);
   } else if (admission.waitedMs > 0) {
@@ -3448,7 +3459,7 @@ export async function main(argv, { remoteExec, readTelemetry, hostAdmission, hom
         }
       }
     }
-    const runOpts = { lockRoot, cap, owner, policy, lane: lane ?? (/lane-(\d+)/.exec(repo) || [])[1] ?? null, num, repo, ceilingMs, command, cwd: repo, bypass, kind: typeof flags.kind === 'string' ? flags.kind : null, waitMs, waitSource, runCeilingMs, hostAdmission, ...(forceLocal ? { location: 'local' } : {}) };
+    const runOpts = { lockRoot, cap, owner, policy, lane: lane ?? (/lane-(\d+)/.exec(repo) || [])[1] ?? null, num, repo, ceilingMs, command, cwd: repo, bypass, kind: typeof flags.kind === 'string' ? flags.kind : null, waitMs, waitSource, runCeilingMs, hostAdmission, requireAdmission: flags['require-admission'] === true, ...(forceLocal ? { location: 'local' } : {}) };
     if (useContainer) runOpts.exec = (cmd, o) => execContainerized(cmd, { ...o, nodeModulesVolume: useNodeModulesVolume });
     // A bypass (CI pass-through, held re-entry, admission off) takes no slot and records no duration, so it needs no reason.
     if (!remoteDecided && !bypass) recordLocalReason({ lockRoot, reason: localReasonFor({ useContainer, forceLocal, bypass, decisionReason: localDecisionReason }), detail: localDecisionReason, cwd: repo ?? process.cwd(), argv: argv.slice(dashDashIdx + 1), env: process.env, clock: Date.now });

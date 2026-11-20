@@ -3,7 +3,7 @@ import { readFileSync } from 'node:fs';
 import yaml from 'js-yaml';
 import { ciUnitPlan, ciGatePlan, urgentMarker, urgentLedger, urgentSignature, urgentKeyPath, normalizeUrgentRepo, urgentFuiRepo } from '../urgent-verify-marker.mjs';
 import { createUrgentDeps, urgentVerify } from '../urgent-verify.mjs';
-import { admissionLockRoot, poolRootOf } from '../../readiness/heavy-admission.mjs';
+import { admissionLockRoot, poolRootOf, runUnderAdmission } from '../../readiness/heavy-admission.mjs';
 import { resolveOperation } from '../run.mjs';
 import { parseOperationArgv } from '../cli-adapter.mjs';
 
@@ -762,5 +762,45 @@ describe('urgent-verify signing isolation', () => {
     expect(r.status).toBe(126);
     expect(r.stderr).toMatch(/require-admission refused: admission bypassed \(no-pool\)/);
     expect(existsSync(marker)).toBe(false);
+  });
+  it.each([
+    ['required timeout', true, true, 'run', 126],
+    ['ordinary timeout', false, true, 'run', 0],
+    ['required deferral', true, true, 'defer', 75],
+    ['required admission', true, false, 'run', 0],
+  ])('heavy-admission CLI preserves the slot requirement: %s', (_name, required, occupied, onTimeout, expectedExit) => {
+    const root = realpathSync(mkdtempSync(pjoin(tmpdir(), 'uv-admission-')));
+    tempParents.push(root);
+    const marker = pjoin(root, 'ran'), cli = pjoin(process.cwd(), 'scripts/readiness/heavy-admission.mjs');
+    const argv = ['run', '--local', '--cap=1', '--kind=FULL', '--ceiling-ms=0', '--wait-ms=0',
+      ...(required ? ['--require-admission'] : []), '--', process.execPath, '-e',
+      `require('fs').writeFileSync(${JSON.stringify(marker)}, 'ran')`];
+    // Use the real CLI and semaphore with a live holder; only host telemetry is a fixture.
+    const bootstrap = `import { main, admissionLockRoot, tryAcquireSlot } from ${JSON.stringify(pathToFileURL(cli).href)};
+      if (${occupied}) {
+        const held = tryAcquireSlot({ lockRoot: admissionLockRoot(process.cwd(), process.env), cap: 1, owner: 'fixture-holder',
+          nowMs: Date.now(), nowIso: new Date().toISOString() });
+        if (!held.ok) throw new Error('fixture did not acquire its slot');
+      }
+      await main(${JSON.stringify(argv)}, { hostAdmission: () => ({ admitted: true, reason: 'fixture host' }) });`;
+    const r = spawnSyncReal(process.execPath, ['--input-type=module', '-e', bootstrap], {
+      cwd: root, encoding: 'utf8', timeout: 15000, maxBuffer: 1024 * 1024,
+      env: { PATH: process.env.PATH, HOME: root, LANE_POOL_ROOT: root,
+        WE_PLATFORM_PREFERENCES: pjoin(root, 'no-preferences'), WE_HEAVY_ADMISSION_ON_TIMEOUT: onTimeout },
+    });
+    expect(r.error).toBeUndefined();
+    expect(r.status, r.stderr).toBe(expectedExit);
+    expect(existsSync(marker)).toBe(expectedExit === 0);
+    if (expectedExit === 126) expect(r.stderr).toMatch(/require-admission refused.*timed out.*NOT run/);
+  });
+  it.each(['off', 'held', 'ci', 'no-pool', null])('required admission refuses runner bypass/disabled acquisition: %s', async bypass => {
+    const root = realpathSync(mkdtempSync(pjoin(tmpdir(), 'uv-admission-')));
+    tempParents.push(root);
+    const exec = vi.fn(), log = vi.fn();
+    const result = await runUnderAdmission({ lockRoot: root, cap: 1, owner: 'required-fixture',
+      command: 'fixture-command', requireAdmission: true, bypass, env: { WE_HEAVY_ADMISSION: 'off' }, exec, log });
+    expect(result.exitCode).toBe(126);
+    expect(exec).not.toHaveBeenCalled();
+    expect(log).toHaveBeenCalledWith(expect.stringContaining('the command was NOT run'));
   });
 });
