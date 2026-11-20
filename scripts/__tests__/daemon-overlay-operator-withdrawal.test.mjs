@@ -136,9 +136,64 @@ describe('operator withdrawal of an unregistered live overlay', () => {
       return spawnSync(cmd, args, opts);
     });
     await expect(withdrawUnregisteredOverlay({ ...f.args, deps: { ...f.args.deps, run } })).rejects.toThrow(
-      "cannot prove no registered overlay depends on lane/withdraw; fetch the clone's overlays first");
+      "history is shallow; cannot prove no registered overlay depends on lane/withdraw");
     expect(f.events()).toEqual(before);
   });
+  it('refuses a depth-limited shallow clone even with explicit acceptance', async () => {
+    const f = fixture();
+    const root = join(f.root, 'clone');
+    const cloned = spawnSync('git', ['clone', '--depth=2', '--branch=main', `file://${f.root}`, root], { encoding: 'utf8' });
+    expect(cloned.status, cloned.stderr).toBe(0);
+    const env = { ...f.env, WE_DAEMON_OVERLAY_DIR: join(root, 'store') };
+    const runGit = (...args) => spawnSync('git', args, { cwd: root, env, encoding: 'utf8' });
+    expect(runGit('rev-parse', '--is-shallow-repository').stdout.trim()).toBe('true');
+    expect(runGit('update-ref', 'refs/remotes/origin/main', f.git('rev-parse', 'refs/remotes/origin/main')).status).toBe(0);
+    await expect(withdrawUnregisteredOverlay({ ...f.args, root, env })).rejects.toThrow(
+      'history is shallow; cannot prove no registered overlay depends on lane/withdraw');
+    expect(() => readFileSync(overlayFilePath(root, env).replace(/\.json$/, '.events.jsonl'))).toThrow();
+  });
+  it.each([false, true])('refuses a fetched dependent with a shallow merge parent despite a common ancestor (reported shallow: %s)', async reportedShallow => {
+    const f = fixture();
+    addOverlay(f.root, { ref: 'lane/top' }, { env: f.env });
+    const base = f.git('rev-parse', 'refs/remotes/origin/main');
+    const boundary = f.git('commit-tree', 'HEAD^{tree}', '-p', f.tip, '-m', 'hidden descent');
+    const top = f.git('commit-tree', 'HEAD^{tree}', '-p', boundary, '-p', base, '-m', 'dependent merge');
+    const before = f.events();
+    f.args.deps.fetchMainAndOverlays.mockImplementation(() => {
+      f.git('update-ref', 'refs/remotes/origin/lane/top', top);
+      writeFileSync(join(f.root, '.git', 'shallow'), `${boundary}\n`);
+      expect(f.git('merge-base', f.tip, top)).toBe(base);
+      expect(spawnSync('git', ['merge-base', '--is-ancestor', f.tip, top], { cwd: f.root }).status).toBe(1);
+      return { ok: true, goneRefs: [] };
+    });
+    const run = (cmd, args, opts) => args[1] === '--is-shallow-repository'
+      ? { status: 0, stdout: `${reportedShallow}\n` } : spawnSync(cmd, args, opts);
+    await expect(withdrawUnregisteredOverlay({ ...f.args, deps: { ...f.args.deps, run } })).rejects.toThrow(
+      'history is shallow; cannot prove no registered overlay depends on lane/withdraw');
+    expect(f.args.deps.fetchMainAndOverlays).toHaveBeenCalledTimes(1);
+    expect(f.events()).toEqual(before);
+  });
+  it.each(['query fails', 'query throws', 'query malformed', 'path fails', 'path empty', 'file unreadable'])(
+    'refuses unknown shallow history state: %s', async failure => {
+      const f = fixture();
+      const before = f.events();
+      const run = (cmd, args, opts) => {
+        if (args[1] === '--is-shallow-repository') {
+          if (failure === 'query throws') throw new Error('unreadable state');
+          if (failure === 'query fails') return { status: 128, stdout: '' };
+          if (failure === 'query malformed') return { status: 0, stdout: 'unknown' };
+        }
+        if (args[1] === '--git-path') {
+          if (failure === 'path fails') return { status: 128, stdout: '' };
+          if (failure === 'path empty') return { status: 0, stdout: '' };
+          if (failure === 'file unreadable') return { status: 0, stdout: '.git' };
+        }
+        return spawnSync(cmd, args, opts);
+      };
+      await expect(withdrawUnregisteredOverlay({ ...f.args, deps: { ...f.args.deps, run } })).rejects.toThrow(
+        /cannot prove no registered overlay depends on lane\/withdraw.*retry/);
+      expect(f.events()).toEqual(before);
+    });
   it.each(['merge-base', 'ancestry'])('refuses unreadable local %s evidence for a resolvable overlay', async stage => {
     const f = fixture();
     addOverlay(f.root, { ref: 'lane/other' }, { env: f.env });
@@ -162,6 +217,7 @@ describe('operator withdrawal of an unregistered live overlay', () => {
   });
   it('accepts freshly fetched independent registered overlays', async () => {
     const f = fixture();
+    expect(f.git('rev-parse', '--is-shallow-repository')).toBe('false');
     addOverlay(f.root, { ref: 'lane/independent' }, { env: f.env });
     f.git('update-ref', 'refs/remotes/origin/lane/independent', f.git('rev-parse', 'refs/remotes/origin/main'));
     addOverlay(f.root, { ref: 'lane/second' }, { env: f.env });

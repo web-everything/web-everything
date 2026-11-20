@@ -116,7 +116,7 @@ import { resolve, dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { spawnSync } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
-import { mkdirSync, writeFileSync, readFileSync, statSync, rmSync, renameSync, mkdtempSync } from 'node:fs';
+import { mkdirSync, writeFileSync, readFileSync, statSync, lstatSync, rmSync, renameSync, mkdtempSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import {
   addOverlay, removeOverlay, readOverlayState, readOverlays, appendOverlayEvent, overlayFilePath, recordEdgeResolution, allowConflictGate,
@@ -180,6 +180,30 @@ export async function withdrawUnregisteredOverlay({ root, ref, tip, actor, reaso
     } catch { /* Unknown freshness cannot authorize withdrawal. */ }
     if (fetched?.ok !== true || !Array.isArray(fetched.goneRefs) || fetched.goneRefs.length > 0)
       throw new Error("could not refresh the clone's overlays; restore remote access and overlay refs, then retry withdrawal");
+    // Fetch does not unshallow history. Check the same Git context used below for
+    // dependent ancestry, including its shallow file even if Git reports false.
+    let shallow;
+    try {
+      const state = git(['rev-parse', '--is-shallow-repository']);
+      if (state.error || state.status !== 0 || !['true', 'false'].includes(state.stdout?.trim()))
+        throw new Error('unreadable shallow state');
+      shallow = state.stdout.trim() === 'true';
+      if (!shallow) {
+        const path = git(['rev-parse', '--git-path', 'shallow']);
+        if (path.error || path.status !== 0 || !path.stdout?.trim()) throw new Error('unreadable shallow path');
+        const shallowPath = resolve(root, path.stdout.trim());
+        let exists = true;
+        try { lstatSync(shallowPath); }
+        catch (error) {
+          if (error.code !== 'ENOENT') throw error;
+          exists = false;
+        }
+        if (exists) shallow = readFileSync(shallowPath).length > 0;
+      }
+    } catch {
+      throw new Error(`history state unreadable; cannot prove no registered overlay depends on ${ref}; restore complete clone history and retry withdrawal`);
+    }
+    if (shallow) throw new Error(`history is shallow; cannot prove no registered overlay depends on ${ref}; restore complete clone history and retry withdrawal`);
     const proof = proveOverlayWithdrawal({ root, ref, tip, reason, env, localOnly: true,
       git: (...args) => { const r = git(args); return { code: r.error ? null : r.status, stdout: r.stdout ?? '' }; } });
     if (proof.action !== 'retire') throw new Error(`${proof.reason}; inspect stacked dependents and restore local tracking refs before retrying withdrawal`);

@@ -5192,3 +5192,7 @@ does not prove freshness: an independent cached tip can hide a fresh remote stac
 missing or incomplete fetch results (including nonempty `goneRefs`) without recording retirement; tell the
 operator to restore remote access and overlay refs before retrying. Freshly fetched independent overlays
 permit withdrawal. Missing tips, truncated history and unreadable merge-base/ancestry evidence still refuse.
+After refresh, check shallow status and the Git-resolved shallow file in the same clone used for dependent
+ancestry. A common ancestor can survive through a second merge parent while a shallow boundary hides the
+dependency. The depth-limited clone and shallow merge-parent fixtures cover both signals independently;
+unreadable status/path/file evidence refuses without retirement. Restore complete clone history before retrying.
