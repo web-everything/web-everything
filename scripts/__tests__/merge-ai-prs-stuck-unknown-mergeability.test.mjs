@@ -314,7 +314,7 @@ process.exit(0);
 `;
 const cliGit = `#!/usr/bin/env node
 const a = process.argv.slice(2);
-if (a[0] === 'remote' && a[1] === 'get-url') process.stdout.write('git@github.com:fixture/drain-unknown.git\\n');
+if (a[0] === 'remote' && a[1] === 'get-url') process.stdout.write('git@github.com:web-everything/web-everything.git\\n');
 if (a[0] === 'diff') process.exit(1);
 process.exit(0);
 `;
@@ -332,7 +332,7 @@ function withCli(test) {
     const preferences = join(dir, 'preferences.json');
     const marks = () => existsSync(path) ? JSON.parse(readFileSync(path, 'utf8')) : [];
     const seed = rows => writeFileSync(path, JSON.stringify(rows));
-    const repo = 'fixture/drain-unknown';
+    const repo = 'web-everything/web-everything';
     const preload = 'data:text/javascript,' + encodeURIComponent("import os from 'node:os'; import { syncBuiltinESMExports } from 'node:module'; os.homedir = () => process.env.UNKNOWN_HOME; syncBuiltinESMExports();");
     const run = ({ numbers = [42], fresh = 'MERGEABLE', listed = 'MERGEABLE', nudgeFresh = null, wrongNumber = false, unreadable = false, failMerge = null, unready = false, flags = [], json = true, env = {}, mainFixPr = null, alertAfterMinutes = 30, redRequired = false, queueEnabled = false } = {}) => {
       writeFileSync(deliverySettings, JSON.stringify({ mergeDelivery: { strategy: 'drain-direct' },
@@ -344,7 +344,7 @@ function withCli(test) {
         files: [{ path: `backlog/leaf-${number}.md`, additions: 1, deletions: 0, changeType: 'ADDED' }] }));
       writeFileSync(fixture, JSON.stringify({ prs, fresh, nudgeFresh, wrongNumber, unreadable, failMerge }));
       const mainFixFile = join(dir, 'main-fix.json');
-      if (mainFixPr) writeFileSync(mainFixFile, JSON.stringify({ repo: 'drain-unknown', pr: mainFixPr, prs: [mainFixPr], setAt: Date.now(), expiresAt: Date.now() + 3_600_000 }));
+      if (mainFixPr) writeFileSync(mainFixFile, JSON.stringify({ repo: 'we', pr: mainFixPr, prs: [mainFixPr], setAt: Date.now(), expiresAt: Date.now() + 3_600_000 }));
       else rmSync(mainFixFile, { force: true });
       writeFileSync(preferences, JSON.stringify({ 'drain.stuckUnknownMergeability': { afterMinutes: alertAfterMinutes } }));
       for (const suffix of ['.attempts', '.calls', ...numbers.map(n => '.merged-' + n)]) rmSync(fixture + suffix, { force: true });
@@ -415,9 +415,9 @@ describe('persistent UNKNOWN real drain wiring', () => {
   }), 180_000);
 
   it.each([false, true])('prunes departed marks and alerts on a complete fetch (still open=%s)', unready => withCli(({ run, seed, marks, repo }) => {
-    seed([{ repo, num: 42, since: Date.now() - 80 * MINUTE }, { repo: 'fixture/other', num: 42, since: Date.now() }]);
+    seed([{ repo, num: 42, since: Date.now() - 80 * MINUTE }, { repo: 'frontier-ui/frontierui', num: 42, since: Date.now() }]);
     const out = run({ numbers: unready ? [42] : [], unready });
-    expect(marks()).toEqual([{ repo: 'fixture/other', num: 42, since: expect.any(Number) }]);
+    expect(marks()).toEqual([{ repo: 'frontier-ui/frontierui', num: 42, since: expect.any(Number) }]);
     expect(out.result.alerts ?? []).not.toContainEqual(expect.objectContaining({ repo, num: 42 }));
     expect(out.stderr).not.toContain('"kind":"stuck-unknown-mergeability"');
   }), 90_000);

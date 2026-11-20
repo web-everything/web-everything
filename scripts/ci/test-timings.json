@@ -1042,6 +1042,7 @@
   "scripts/lib/__tests__/enqueue-on-event-pending-expiry.test.mjs": 0.04,
   "scripts/lib/__tests__/enqueue-on-event.test.mjs": 3.52,
   "scripts/lib/__tests__/exec-output-guard.test.mjs": 2.06,
+  "scripts/lib/__tests__/external-juror-liveness.test.mjs": 2,
   "scripts/lib/__tests__/fast-drain-round-lock.test.mjs": 0.35,
   "scripts/lib/__tests__/fast-drain-scope.test.mjs": 9.03,
   "scripts/lib/__tests__/finding-class-policy.test.mjs": 0.01,
@@ -1971,6 +1972,7 @@
  "soak": {
   "scripts/conveyor/soak/breaks/accepted-pr-stale-accept-row-never-executed.soak.test.mjs": 15.28,
   "scripts/conveyor/soak/breaks/admission-warn-sticky-pressure-holds-idle-host.soak.test.mjs": 0.3,
+  "scripts/conveyor/soak/breaks/agy-juror-first-output.soak.test.mjs": 2,
   "scripts/conveyor/soak/breaks/agy-juror-shared-checkout-reset.soak.test.mjs": 1.85,
   "scripts/conveyor/soak/breaks/already-done-burst-unattributed.soak.test.mjs": 0.49,
   "scripts/conveyor/soak/breaks/already-done-recheck-burst-no-cooldown.soak.test.mjs": 1.68,
