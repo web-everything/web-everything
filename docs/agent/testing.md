@@ -4775,6 +4775,12 @@ object), the consumer's separate missing-head fetch, and the failed missing-head
 Only a missing local commit triggers the bounded second fetch; preserve the verified base's
 FETCH_HEAD with `--no-write-fetch-head` and never retry the base fetch.
 
+Producer CLI shims must also recognize the leading `-c key=value` pairs, return distinct
+base/head commits, and match FETCH_HEAD to the qualified tracking ref. In `--check` mode,
+assert the canonical audit's `fetch origin main` separately from the pinned base refspec
+fetch: each runs once. Keep failed-base-fetch coverage at the CLI boundary, asserting a
+soak blocker before push, create or size admission even when capacity is available.
+
 Real-drain CLI fixtures must model that pinned boundary too: full head commit IDs,
 Git's leading `-c key=value` options, distinct base/head identities, matching tracking-ref
 and FETCH_HEAD reads, and numstat plus content for the declared PR files. A shim that

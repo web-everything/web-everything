@@ -8,11 +8,12 @@ import { pathToFileURL } from 'node:url';
 // Execute the actual CLI/checkpoint in a child. Loader substitutes only external gate/forge ports;
 // Git effects are recorded instead of executed. No real Git, forge, card filing or operator state.
 function run({ check = true, fail = false, override = '', count = 15, exempt = false,
-  body = 'Description', earlyPr = false } = {}) {
+  body = 'Description', earlyPr = false, failPinnedFetch = false } = {}) {
   const dir = mkdtempSync(join(tmpdir(), 'pr-land-preflight-'));
   const trace = join(dir, 'effects.jsonl');
   const root = resolve('scripts');
   const sha = 'a'.repeat(40);
+  const base = 'b'.repeat(40);
   const record = `import { appendFileSync } from 'node:fs'; const effect = value => appendFileSync(${JSON.stringify(trace)}, JSON.stringify(value) + '\\n');`;
   const stubs = {
     './operations/canonical-audit-gate.mjs': 'export const checkCanonicalAuditForOpen = () => ({ ok: true });',
@@ -51,12 +52,30 @@ function run({ check = true, fail = false, override = '', count = 15, exempt = f
       effect([cmd, args]);
       if (cmd === 'node') return ''; // locus linter is read-only and independently tested
       if (cmd !== 'git') throw new Error('unexpected external effect: ' + cmd);
-      if (args[0] === 'rev-parse') return args.includes('--absolute-git-dir') ? ${JSON.stringify(dir)} : ${JSON.stringify(sha)};
-      if (args[0] === 'log') return 'fix: admission';
-      if (args[0] === 'remote') return 'https://github.com/web-everything/web-everything.git';
-      if (args[0] === 'diff') return args.includes('--name-status') ? 'M\\tblocks/example.ts' : ${JSON.stringify(exempt ? 'scripts/conveyor/worker.mjs' : 'blocks/example.ts')};
-      if (args[0] === 'push') return '';
-      if (args[0] === 'show') throw new Error('no ready config');
+      const gitArgs = a => ['-c', '-C'].includes(a[0]) ? gitArgs(a.slice(2)) : a;
+      const a = gitArgs(args);
+      if (args[0] === '-c') {
+        if (a[0] === 'fetch') {
+          if (a.at(-1) !== '+refs/heads/main:refs/remotes/origin/main') throw new Error('unexpected pinned fetch');
+          if (${failPinnedFetch}) throw new Error('fixture pinned base unavailable');
+          return '';
+        }
+        if (a[0] === 'rev-parse') {
+          const ref = a.at(-1).replace(/\\^\\{commit\\}$/, '');
+          if (['refs/remotes/origin/main', 'FETCH_HEAD'].includes(ref)) return ${JSON.stringify(base)};
+          if (ref === ${JSON.stringify(sha)}) return ${JSON.stringify(sha)};
+          throw new Error('unexpected pinned commit');
+        }
+        if (['merge-base', 'diff'].includes(a[0]) &&
+          (a.at(-2) !== ${JSON.stringify(base)} || a.at(-1) !== ${JSON.stringify(sha)})) throw new Error('unexpected pinned diff basis');
+        if (a[0] === 'merge-base') return ${JSON.stringify(base)};
+      }
+      if (a[0] === 'rev-parse') return a.includes('--absolute-git-dir') ? ${JSON.stringify(dir)} : ${JSON.stringify(sha)};
+      if (a[0] === 'log') return 'fix: admission';
+      if (a[0] === 'remote') return 'https://github.com/web-everything/web-everything.git';
+      if (a[0] === 'diff') return a.includes('--name-status') ? 'M\\tblocks/example.ts' : ${JSON.stringify(exempt ? 'scripts/conveyor/worker.mjs' : 'blocks/example.ts')};
+      if (a[0] === 'push') return '';
+      if (a[0] === 'show') throw new Error('no ready config');
       return '';
     }; syncBuiltinESMExports(); register(${JSON.stringify(pathToFileURL(loader).href)});`);
   try {
@@ -72,6 +91,16 @@ function run({ check = true, fail = false, override = '', count = 15, exempt = f
 }
 
 describe('pr-land pre-push checkpoint', () => {
+  it.each([true, false])('refuses a failed pinned base fetch before publication, check=%s', check => {
+    const { status, result, effects } = run({ check, count: 0, failPinnedFetch: true });
+    expect(status).toBe(3);
+    expect(result.reason).toBe('soak-declaration');
+    expect(result.detail).toContain('pinned diff unavailable');
+    const fetches = effects.filter(([cmd, args]) => cmd === 'git' && args.includes('fetch'));
+    expect(fetches).toHaveLength(1);
+    expect(fetches[0][1].slice(-5)).toEqual(['fetch', '--quiet', '--end-of-options', 'origin', '+refs/heads/main:refs/remotes/origin/main']);
+    expect(effects.some(([cmd, args]) => cmd === 'create' || cmd === 'size-admission' || args?.includes('push'))).toBe(false);
+  });
   it.each([false, true])('refuses an empty create body when the early PR exists=%s and no PR exists at create', earlyPr => {
     const { status, result, effects } = run({ check: false, count: 0, body: '', earlyPr });
     expect(status).toBe(3);

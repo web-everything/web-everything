@@ -79,7 +79,24 @@ function defaultProducer({ direct = false, dry = false, check = false, failMain 
     cp.execFileSync = (cmd, args) => {
       fs.appendFileSync(${JSON.stringify(trace)}, JSON.stringify([cmd, args]) + '\\n');
       if (cmd !== 'git') throw new Error('unexpected process: ' + cmd);
-      const a = args[0] === '-C' ? args.slice(2) : args;
+      const gitArgs = a => ['-c', '-C'].includes(a[0]) ? gitArgs(a.slice(2)) : a;
+      const a = gitArgs(args);
+      if (args[0] === '-c') {
+        if (a[0] === 'fetch') {
+          if (a.at(-1) !== '+refs/heads/main:refs/remotes/origin/main') throw new Error('unexpected pinned fetch');
+          if (${failMain}) throw new Error('fixture main remote unavailable');
+          return '';
+        }
+        if (a[0] === 'rev-parse') {
+          const ref = a.at(-1).replace(/\\^\\{commit\\}$/, '');
+          if (['refs/remotes/origin/main', 'FETCH_HEAD'].includes(ref)) return ${JSON.stringify(base)};
+          if (ref === ${JSON.stringify(sha)}) return ${JSON.stringify(sha)};
+          throw new Error('unexpected pinned commit');
+        }
+        if (['merge-base', 'diff'].includes(a[0]) &&
+          (a.at(-2) !== ${JSON.stringify(base)} || a.at(-1) !== ${JSON.stringify(sha)})) throw new Error('unexpected pinned diff basis');
+        if (a[0] === 'show') throw new Error('no ready config');
+      }
       if (a[0] === 'rev-parse') return ${JSON.stringify(sha)};
       if (a[0] === 'fetch' && a.join(' ') === 'fetch origin main') {
         if (${failMain}) throw new Error('fixture main remote unavailable');
@@ -130,17 +147,27 @@ function defaultProducer({ direct = false, dry = false, check = false, failMain 
   } finally { rmSync(dir, { recursive: true, force: true }); }
 }
 
+// Canonical audit refresh and pinned scoring each fetch their own evidence once.
+// The wrapper stubs child preflight, so only the direct CLI also resolves a pinned basis.
+function expectMainRefreshes(effects, direct) {
+  const fetches = effects.filter(([cmd, args]) => cmd === 'git' && args.includes('fetch'));
+  expect(fetches).toHaveLength(direct ? 2 : 1);
+  expect(fetches[0][1].slice(-3)).toEqual(['fetch', 'origin', 'main']);
+  if (direct) expect(fetches[1][1].slice(-5)).toEqual([
+    'fetch', '--quiet', '--end-of-options', 'origin', '+refs/heads/main:refs/remotes/origin/main',
+  ]);
+  return fetches[0];
+}
+
 describe('default canonical checker integration', () => {
   it.each([false, true])('check calls the default Git fetch port before accepting audit evidence, direct=%s', direct => {
     const record = { head: sha, base, questionHash: QUESTION_HASH, at: '2026-11-17T00:00:00Z', verdict: 'NOT WEAKENED', findings: [] };
     const { result, effects } = defaultProducer({ direct, check: true, records: [record] });
-    const fetches = effects.filter(([cmd, args]) => cmd === 'git' && args.includes('fetch'));
-    expect(fetches).toHaveLength(1);
-    expect(fetches[0][1].slice(-3)).toEqual(['fetch', 'origin', 'main']);
-    const fetchIndex = effects.indexOf(fetches[0]);
+    const fetchIndex = effects.indexOf(expectMainRefreshes(effects, direct));
     expect(effects.findIndex(([cmd, args]) => cmd === 'git' && args.includes('--is-ancestor'))).toBeGreaterThan(fetchIndex);
     expect(result.reason).not.toBe('canonical-audit-missing');
     expect(result.blockers?.some(b => b.gate === 'canonical-audit')).not.toBe(true);
+    expect(result.blockers?.some(b => b.gate === 'soak-declaration')).not.toBe(true);
     if (!direct) expect(result.outcome).toBe('checked');
     expect(effects.some(([cmd, args]) => cmd === 'publication' || args.includes('push') || args.includes('create'))).toBe(false);
   });
@@ -151,7 +178,8 @@ describe('default canonical checker integration', () => {
     expect(result.detail).toContain('main not refreshed: fixture main remote unavailable');
     if (direct) expect(status).toBe(3);
     else expect(result.outcome).toBe('refused');
-    expect(effects.filter(([cmd, args]) => cmd === 'git' && args.includes('fetch'))).toHaveLength(1);
+    expectMainRefreshes(effects, direct);
+    if (direct) expect(result.blockers.some(b => b.gate === 'soak-declaration' && b.detail.includes('pinned diff unavailable'))).toBe(true);
     expect(effects.some(([cmd, args]) => cmd === 'git' && args.includes('--is-ancestor'))).toBe(false);
     expect(effects.some(([cmd, args]) => cmd === 'publication' || args.includes('push') || args.includes('create'))).toBe(false);
   });
