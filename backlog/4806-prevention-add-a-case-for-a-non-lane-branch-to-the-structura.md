@@ -4,10 +4,8 @@ kind: story
 size: 3
 parent: "4075"
 status: open
-scope: ["we:scripts/conveyor/missing-run-push.mjs", "we:scripts/conveyor/__tests__/missing-run-push.test.mjs", "we:scripts/conveyor/soak/breaks/missing-run-structural-deferral-loops.mjs", "we:scripts/conveyor/soak/breaks/missing-run-structural-deferral-loops.soak.test.mjs", "we:scripts/conveyor/soak/breaks/__tests__/missing-run-structural-deferral-loops*.test.mjs"]
+
 dateOpened: "2026-10-01"
-preparedDate: "2026-10-03"
-preparedAgainstSha: "10730be79e6a135d93ff84847a46f27fa23bc977"
 tags: []
 ---
 
@@ -72,3 +70,12 @@ Use the injected-executor unit probe to demonstrate zero external commands on no
 ## Follow-ups
 
 None required for this bounded prevention item. Broader retry-policy changes and general-purpose linting are outside scope; preserve existing transient conflict/claim behavior.
+
+## Findings (standalone worker, 2026-11-20)
+
+The build-dispatch daemon held #4806 with:
+
+> worker-declined: Not prepared: #4806 — could-not-prepare. The shared-admission refusal at 'we:scripts/conveyor/missing-run-push.mjs:107' freely defers both exhausted budgets and unreadable evidence. The card requires every deferral to be transient while excluding broader retry-policy changes. A decision is needed: classify those admission refusals and change their accounting, or explicitly exempt them from this guarantee. No files changed or stamps applied. No tests run.
+
+`scope:` was cleared above so this card is picked up by the existing unshaped-item auto-prepare path;
+a prepare pass re-scopes it against the finding.
