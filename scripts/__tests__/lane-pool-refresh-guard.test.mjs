@@ -76,7 +76,7 @@ function abandonLease(lane) {
   // Expiry alone no longer permits takeover; abandoned fixtures need a dead holder too.
   const file = join(lane, '.git', '.lane-lease');
   const lease = JSON.parse(readFileSync(file, 'utf8'));
-  writeFileSync(file, `${JSON.stringify({ ...lease, pid: 2147483646 })}\n`);
+  writeFileSync(file, `${JSON.stringify({ ...lease, pid: 2147483646 }, null, 2)}\n`);
   return readFileSync(file, 'utf8');
 }
 

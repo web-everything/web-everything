@@ -2338,12 +2338,12 @@ function laneHoldRefuses(dir, action, { byHolder = false, unpushed } = {}) {
 }
 
 /**
- * #3383 — undo a claim that the acquire then refused: put back the lease that was there before when it was a live one
- * (a holder re-acquiring its own lane keeps its hold), otherwise remove the lease the claim just wrote.
+ * #3383 — undo a claim that the acquire then refused: put back the prior lease, including an expired one
+ * protecting unpushed work; remove the new claim only when there was no prior lease.
  */
 function restoreLeaseAfterRefusedClaim(dir, preExisting) {
   try {
-    if (preExisting && !isLeaseStale(preExisting, Date.now(), ttlMsFromFlags())) writeLeaseAtomic(LEASE_MARKER(dir), JSON.stringify(preExisting, null, 2) + '\n');
+    if (preExisting) writeLeaseAtomic(LEASE_MARKER(dir), JSON.stringify(preExisting, null, 2) + '\n');
     // journal-exempt: drops only the claim THIS refused acquire just wrote — the lane never changed hands.
     else withLaneLeaseGuard(LEASE_MARKER(dir), () => rmSync(LEASE_MARKER(dir), { force: true }));
   } catch { /* the refusal still stands; a stale lease ages out on its own */ }
