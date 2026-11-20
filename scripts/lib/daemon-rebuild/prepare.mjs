@@ -13,7 +13,7 @@ import {
 } from './lease.mjs';
 import {
   staleAlertDetail, matchReadyCandidate, readyBuildVerified, finalizeRebuild, dropSuspectOverlays,
-  overlayGraduated, overlayRetiredByOperator, reportDiscardedCandidate,
+  overlayGraduated, overlayRetiredByOperator, reportDiscardedCandidate, classifyOverlayRemoval,
 } from './adopt.mjs';
 import { hostname } from 'node:os';
 import { forceRequestFor, forceBlockedReason, dropReadyCandidate, forcedWatchStatus } from '../daemon-force-adopt.mjs';
@@ -28,6 +28,7 @@ import {
 import { fetchMainAndOverlays, recordedEdgeSha } from './edge-fetch.mjs';
 import { planRebuild } from './plan.mjs';
 import { readPendingDrops } from '../overlay-drop-pending.mjs';
+import { isSafeBranchName } from '../daemon-self-sync.mjs';
 import { detectOverlayStale } from './overlay-prune.mjs';
 import { makeAuditedTipGate, tipInMain } from './audited-tip.mjs';
 import { carriedBeyondMain } from '../../operations/prototype-retire.mjs';
@@ -44,6 +45,32 @@ export function readOverlayEventLog(root, env) {
     const file = overlayFilePath(root, env).replace(/\.json$/, '.events.jsonl');
     return readFileSync(file, 'utf8').split('\n').filter((line) => line.trim()).map((line) => JSON.parse(line));
   } catch { return []; }
+}
+
+/** Resolve dependency evidence for the candidate's exact tips from the tick-start registrations.
+ * Normal callers do not declare dependsOn: a completely resolved live PR base chain supplies it instead.
+ * makePrBaseChain.fresh contains only complete lookups, never cached/partial/failed chains. Such a lookup
+ * describes the current tip, so it cannot assert independence of an older carried tip. Explicit declarations
+ * and recorded stack bases are always respected; malformed evidence never falls back to an empty list. */
+export async function readyOverlayDependencies({ applied, overlays, chainOf, tipOf }) {
+  const result = new Map();
+  const valid = (xs) => Array.isArray(xs) && xs.every(isSafeBranchName);
+  for (const a of applied ?? []) {
+    const entry = overlays.find((o) => o?.ref === a.ref);
+    if (!entry || (Object.hasOwn(entry, 'dependsOn') && !valid(entry.dependsOn))
+      || (Object.hasOwn(entry, 'stackBases') && !valid(entry.stackBases))) continue;
+    if (!Object.hasOwn(entry, 'dependsOn') && entry.pr != null && !chainOf.fresh?.has(entry.pr)) {
+      try { await chainOf(entry.pr); } catch { /* Unknown chains supply no independence proof. */ }
+    }
+    const fresh = chainOf.fresh?.get(entry.pr);
+    const current = a.sha && tipOf(a.ref) === a.sha;
+    const deps = entry.dependsOn ?? (current && valid(fresh) ? fresh : null);
+    if (!valid(deps)) continue;
+    // A declaration of [] cannot override a known stack dependency.
+    if (fresh !== undefined && !valid(fresh)) continue;
+    result.set(a.ref, [...new Set([...deps, ...(entry.stackBases ?? []), ...(fresh ?? [])])]);
+  }
+  return result;
 }
 
 /** Record pr-merged drop evidence without changing drop policy. Unknown proof fails closed. */
@@ -597,6 +624,10 @@ export async function prepareRebuild({
         }
         return overlayEvents;
       };
+      const liveApplied = liveOverlaysOf(prevHead, plan.mainSha);
+      const dependencies = !mainOnly && liveApplied.length ? await readyOverlayDependencies({
+        applied: ready.adopt?.applied, overlays: overlaysBefore, chainOf, tipOf: wantedTip,
+      }) : new Map();
       const m = matchReadyCandidate({
         ready,
         plan,
@@ -619,7 +650,7 @@ export async function prepareRebuild({
         tipInMain: (sha) => tipInMain(git, plan.mainSha, sha),
         // the overlays the RUNNING build applies: its own rebuild-committed merge records above main (hard data — an
         // empty list for a plain-main HEAD), plus the recorded adopted set when HEAD is that adopted build
-        liveApplied: liveOverlaysOf(prevHead, plan.mainSha),
+        liveApplied,
         carries: (sha, build) => git(['merge-base', '--is-ancestor', sha, build]).status === 0,
         leftForMain: (a, build) => overlayGraduated({
           readyAt: ready.at ?? ready.passedAt,
@@ -647,6 +678,22 @@ export async function prepareRebuild({
           const readyMs = Date.parse(ready.at ?? ready.passedAt ?? '');
           return Number.isFinite(retiredMs) && Number.isFinite(readyMs) && retiredMs < readyMs;
         },
+        // Adopt the build that passed, then add: benign removals (merged/no longer wanted) and still-registered overlays the
+        // build omits queue an incremental rebuild instead of discarding the build; safety/unknown removals still discard.
+        // A mainOnly rebuild wants no overlay at all, so a candidate carrying any is never adopted for a removed one.
+        removalSafety: mainOnly ? () => 'unknown' : (ref, sha) => classifyOverlayRemoval({
+          ref, sha, decisions: plan.decisions, events: readOverlayEvents(), inMain: (s) => tipInMain(git, plan.mainSha, s),
+        }),
+        // Registered NOW (the on-disk registry, not the tick-start snapshot): a removal made during planning is not re-added.
+        readdable: (ref) => {
+          if (!wantedRefs.has(ref) || !registeredRefs.has(ref)) return false;
+          try {
+            const live = readOverlayState(root, { env });
+            return !live.corrupt && live.overlays.some((o) => o?.ref === ref);
+          } catch { return false; }
+        },
+        // Explicit snapshot declaration or complete current PR chain; unknown/malformed still refuses.
+        dependsOn: (ref) => dependencies.get(ref) ?? null,
         // R508: a forced record is only adoptable while its rollback watch is intact (read under this write lock).
         forcedWatch: (sha) => forcedWatchStatus(root, stEnv, sha),
       });
@@ -682,6 +729,7 @@ export async function prepareRebuild({
           target: m.adopt.finalSha, match: m.match, passedAt: ready.passedAt, passedBy: `${ready.pid ?? '?'}@${ready.host ?? '?'}`,
           ...(m.dropRefs.length ? { dropping: m.dropRefs.map((s) => s.ref) } : {}),
           ...(m.retired?.length ? { retiredInMain: m.retired } : {}),
+          ...(m.rebuildAfter?.length ? { rebuildAfter: m.rebuildAfter } : {}),
         });
         writeState();
         const fin = await finalizeRebuild({
