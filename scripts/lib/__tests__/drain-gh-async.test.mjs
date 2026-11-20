@@ -6,6 +6,7 @@ import { join } from 'node:path';
 import { execDrainAsync } from '../drain-gh-async.mjs';
 import { runEnqueueCandidates } from '../drain-concurrency.mjs';
 import { readGhSlotHolders } from '../gh-throttle-holders.mjs';
+import { keepAliveScript } from '../test-keepalive.mjs';
 
 it('runs overlapping subprocess reads through the real throttle and isolates a subprocess failure', async () => {
   const root = mkdtempSync(join(tmpdir(), 'drain-async-'));
@@ -61,7 +62,7 @@ it('kills the real gh on timeout and releases its throttle slot', async () => {
     writeFileSync(join(bin, 'gh'), `#!/usr/bin/env node
 require('node:fs').writeFileSync(process.env.DRAIN_TEST_PID, String(process.pid));
 process.on('SIGTERM', () => {});
-setInterval(() => {}, 1000);
+${keepAliveScript({ maxLifetimeMs: 30_000 })}
 `, { mode: 0o755 });
     const lockRoot = join(root, 'throttle');
     const env = { ...process.env, PATH: `${bin}:${process.env.PATH}`, VITEST: 'true',
