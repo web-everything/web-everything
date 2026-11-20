@@ -6,7 +6,8 @@ import { resolveCardNumbering } from '../policy-cascade.mjs';
 import { cardLedgerCheckpoint } from '../../backlog/card-ledger-checkpoint.mjs';
 import { chmodSync, closeSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readSync, realpathSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 import { publicSigningIdentity, readBoundedTransportFile, stageOnTransportBranch } from '../git-transport-branch.mjs';
 import { provisionCardLedgerSigningKey } from '../../backlog/card-ledger-signing-key.mjs';
 
@@ -927,10 +928,12 @@ describe('card ledger filesystem boundaries', () => {
       expect(close).toHaveBeenCalledWith(fd);
       // Vitest workers share a descriptor table: another thread can reuse fd even between
       // closeSync and fstatSync. Prove real closure with the default close in an isolated process.
+      // Resolve through a filesystem path: Vite rewrites new URL(relative, import.meta.url) as an HTTP asset URL.
+      const transportUrl = pathToFileURL(join(dirname(fileURLToPath(import.meta.url)), '../git-transport-branch.mjs')).href;
       const probe = spawnSync(process.execPath, ['--input-type=module', '-e', `
         import assert from 'node:assert/strict';
         import { readSync, fstatSync } from 'node:fs';
-        import { readBoundedTransportFile } from ${JSON.stringify(new URL('../git-transport-branch.mjs', import.meta.url).href)};
+        import { readBoundedTransportFile } from ${JSON.stringify(transportUrl)};
         let fd;
         assert.throws(() => readBoundedTransportFile(process.argv[1], Number(process.argv[2]), {
           read(descriptor, ...args) { fd = descriptor; return readSync(descriptor, ...args); },

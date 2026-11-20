@@ -124,7 +124,6 @@ describe('the Git proof of omitted content in the candidate build', () => {
     } });
     const options = { root: cloneDir, env, prState: async () => 'OPEN', prBaseChain: chain, lockOpts: LOCK_OPTS };
     expect(await rebuildClone({ ...options, runSmoke: async () => PASS })).toMatchObject({ adopted: true });
-    expect(chain.fresh.get(99)).toEqual([]);
 
     // Build an older plan with a carried overlay, while the running build keeps the omitted overlay.
     removeOverlay(cloneDir, omitted, { env });
@@ -136,12 +135,15 @@ describe('the Git proof of omitted content in the candidate build', () => {
     try {
       expect(await rebuildClone({ ...options, runSmoke })).toMatchObject({ reason: 'tick-in-progress' });
       candidate = readReadyCandidate(cloneDir, env).adopt.finalSha;
-      expect(chain.fresh.get(100)).toEqual([]);
     } finally { endTick(); }
     addOverlay(cloneDir, { ref: omitted, pr: 99 }, { env });
     advanceMain(originDir, (dir) => writeFile(dir, 'later.txt', 'later\n'));
     const noSmoke = vi.fn(async () => PASS);
     expect(await rebuildClone({ ...options, runSmoke: noSmoke })).toMatchObject({ reason: 'ready-adopted' });
+    // Singleton plans need no stack lookup. Check fresh independence evidence once both
+    // registrations reach planning/adoption, where the live PR chains are actually requested.
+    expect(chain.fresh.get(99)).toEqual([]);
+    expect(chain.fresh.get(100)).toEqual([]);
     expect(gitOk(cloneDir, ['rev-parse', 'HEAD']).trim()).toBe(candidate);
     expect(existsSync(join(cloneDir, 'omitted.txt'))).toBe(false);
     expect(noSmoke).not.toHaveBeenCalled();
