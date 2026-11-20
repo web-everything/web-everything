@@ -27,6 +27,21 @@ export const validateChecks = (data, sha) => {
       || (c.status === 'completed' ? typeof c.conclusion !== 'string' : c.conclusion !== null)))
     throw new Error('unreadable, incomplete or oversized CI checks (maximum 100); repair reader or inspect CI manually');
 };
+export function latestActionFailure(data, sha) {
+  const latest = new Map();
+  for (const c of data.check_runs) {
+    const key = JSON.stringify([c.app.id, c.check_suite?.id, c.name]);
+    if (!latest.has(key) || c.id > latest.get(key).id) latest.set(key, c);
+  }
+  return [...latest.values()].find(c => c.app.id === TEST_CHECK_APP_ID && failedCheck(c, sha));
+}
+export function hotPatchCiEvidence(data, sha, required) {
+  validateChecks(data, sha);
+  if (!Array.isArray(required) || !required.includes('test') || required.some(n => typeof n !== 'string' || !n))
+    throw Error('unreadable required CI jobs');
+  if (!testWorkflowBound(testCheckEvidence(data, sha), data.workflows, sha, data.testWorkflowPath))
+    throw Error('unreadable hot-patch CI binding');
+}
 export function createSweepDeps({ home = homedir(), io = fs, exec = execFileSync, ghExec = execFileSyncThrottled, retire = retireRegistration, recover = recoverDrops, readState = readOverlayState, env = process.env } = {}) {
   const read = name => {
     const path = urgentLedger(home, name);
@@ -250,13 +265,14 @@ export async function urgentSweep(_input = {}, deps = createSweepDeps()) {
         const hotPatch = validSha(r.sha) && r.ref === `hotpatch/${r.sha}`;
         let decisionReason, prEvidence, mergedAtSha = false;
         let age = now - loadedAt;
-        let data, boundFailure, anyFailure, unload = false, requiredSucceeded = false, unloadReason, evidenceError, ciEvidenceError;
+        let data, boundFailure, hotFailure, anyFailure, unload = false, requiredSucceeded = false, unloadReason, evidenceError, ciEvidenceError;
         try {
           data = await deps.checks(r);
           anyFailure = Array.isArray(data?.check_runs) && data.check_runs.some(c => failedCheck(c, r.sha));
           validateChecks(data, r.sha);
+          if (hotPatch) hotFailure = latestActionFailure(data, r.sha);
           // GitHub cannot run CI without a merge ref. Resume normal monitoring as soon as checks appear.
-          if (r.conflict && data.total_count === 0) {
+          if (!hotPatch && r.conflict && data.total_count === 0) {
             if (age >= 24 * 60 * 60 * 1000 && !conflictEscalated.has(id)) {
               await escalate(`${id}-conflict-unresolved`, r.ref, 'conflict load still unresolved');
               await deps.settle({ id, ref: r.ref, sha: r.sha, at: deps.now(), status: 'monitoring-ci', conflictEscalated: true });
@@ -281,6 +297,7 @@ export async function urgentSweep(_input = {}, deps = createSweepDeps()) {
             const required = await deps.required(r, data?.testWorkflowPath);
             if (!Array.isArray(required) || !required.includes('test') || required.some(n => typeof n !== 'string' || !n))
               throw new Error('unreadable required CI jobs');
+            if (hotPatch) hotPatchCiEvidence(data, r.sha, required);
             const checks = latestChecks.filter(c =>
               c?.app?.id === TEST_CHECK_APP_ID && c.head_sha === r.sha && typeof c.name === 'string'
               && Number.isSafeInteger(c.id) && Number.isSafeInteger(c.check_suite?.id)
@@ -315,8 +332,8 @@ export async function urgentSweep(_input = {}, deps = createSweepDeps()) {
               if (!mergedAtSha && age >= 24 * 60 * 60 * 1000) decisionReason = prEvidence.merged ? 'ci-expired' : 'expired';
             }
           } catch (e) { evidenceError = e; }
-          if (boundFailure) decisionReason = 'ci-failed';
-          else if (!decisionReason && ciEvidenceError && age >= 30 * 60 * 1000) decisionReason = 'ci-unknown';
+          if (hotFailure) decisionReason = 'ci-failed';
+          else if (!decisionReason && evidenceError && age >= 30 * 60 * 1000) decisionReason = 'ci-unknown';
           unload = Boolean(decisionReason);
           if (unload && decisionReason !== 'ci-failed') unloadReason = `Unloaded ${r.sha}: ${decisionReason}. Inspect evidence and repair before reloading.`;
         }
@@ -361,7 +378,7 @@ export async function urgentSweep(_input = {}, deps = createSweepDeps()) {
         }
         if (unload) {
           // Commit negative evidence before the guarded mutation; a write failure keeps the overlay.
-          const failed = boundFailure;
+          const failed = hotPatch ? hotFailure : boundFailure;
           await deps.settle({ id, status: 'unload-decision', at: deps.now(), trackingId: r.trackingId,
             clone: r.clone, ref: r.ref, sha: r.sha, registration: r.registration,
             reason: decisionReason ?? (unloadReason ? 'ci-expired' : 'ci-failed'),

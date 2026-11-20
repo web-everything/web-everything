@@ -771,8 +771,45 @@ describe('hot-patch retirement decision authorization', () => {
       } };
     return { f, args, decision, ref };
   }
+  const boundChecks = (conclusion = 'success') => ({ total_count: 1, check_runs: [{ id: 91, name: 'test', head_sha: tip,
+    app: { id: 15368 }, check_suite: { id: 7 }, status: 'completed', conclusion }],
+    workflows: { total_count: 1, workflow_runs: [{ check_suite_id: 7, head_sha: tip, path: '.github/workflows/ci.yml' }] } });
+  it.each(['required-reader', 'pr-reader'])('unloads ci-unknown with bound checks but failed %s', async kind => {
+    const { f, args } = retirement('ci-unknown', 31 * 60_000, null);
+    args.deps.readUrgentChecks = () => boundChecks();
+    args.deps.readUrgentRequired = () => { if (kind === 'required-reader') throw Error('required unavailable'); return ['test']; };
+    args.deps.readUrgentPr = () => { if (kind === 'pr-reader') throw Error('PR unavailable'); return { number: 42, state: 'open', merged: false, head: { sha: tip } }; };
+    expect(await retireRegistration(args)).toMatchObject({ retired: true });
+    expect(f.list()).toEqual([]);
+  });
+  it.each([0, 31 * 60_000])('refuses stale ci-failed when the guarded reread is green at %i', async age => {
+    const { f, args, decision, ref } = retirement('ci-failed', age, null);
+    decision.check = { head_sha: tip, status: 'completed', conclusion: 'failure' };
+    args.deps.readUrgentChecks = () => boundChecks();
+    args.deps.readUrgentRequired = () => ['test'];
+    args.deps.readUrgentPr = () => ({ number: 42, state: 'open', merged: false, head: { sha: tip } });
+    expect(await retireRegistration(args)).toMatchObject({ retired: false, refused: 'urgent-decision-required' });
+    expect(f.list()).toEqual([ref]);
+  });
+  it.each([0, 31 * 60_000])('unreadable ci-failed reread only withdraws at unknown deadline: %i', async age => {
+    const { f, args, decision, ref } = retirement('ci-failed', age, null);
+    decision.check = { head_sha: tip, status: 'completed', conclusion: 'failure' };
+    expect(await retireRegistration(args)).toMatchObject(age ? { retired: true } : { retired: false, refused: 'urgent-decision-required' });
+    expect(f.list()).toEqual(age ? [] : [ref]);
+  });
+  it('unloads cached transitive dependents and alerts when a hot patch withdraws', async () => {
+    const { f, args, ref } = retirement('ci-unknown', 31 * 60_000, null);
+    addOverlay(f.clone, { ref: 'lane/top', stackBases: [ref] }, { env: f.env });
+    addOverlay(f.clone, { ref: 'lane/top-two', stackBases: ['lane/top'] }, { env: f.env });
+    expect(await retireRegistration(args)).toMatchObject({ retired: true });
+    expect(f.list()).toEqual([]);
+    expect(f.events()).toContainEqual(expect.objectContaining({ kind: 'hot-patch-dependents-unloaded', ref,
+      dependents: ['lane/top', 'lane/top-two'] }));
+  });
   it.each(['green', 'red', 'pending'])('refuses ci-unknown when CI is readable now: %s', async verdict => {
     const { f, args, ref } = retirement('ci-unknown', 31 * 60_000, null);
+    args.deps.readUrgentRequired = () => ['test'];
+    args.deps.readUrgentPr = () => ({ number: 42, state: 'open', merged: false, head: { sha: tip } });
     args.deps.readUrgentChecks = () => ({ total_count: 1, check_runs: [{ id: 81, name: 'test', head_sha: tip,
       app: { id: 15368 }, check_suite: { id: 7 }, status: verdict === 'pending' ? 'queued' : 'completed',
       conclusion: verdict === 'pending' ? null : verdict === 'red' ? 'failure' : 'success' }],

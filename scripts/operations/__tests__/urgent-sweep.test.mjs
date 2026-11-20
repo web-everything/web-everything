@@ -1023,7 +1023,7 @@ describe('hot-patch sweep (R1100)', () => {
     f.d.pr = vi.fn(() => openPr());
     return f;
   }
-  it.each(['unrelated', 'foreign-app', 'unbound', 'malformed', 'required-unreadable'])('refuses %s failure as hot-patch withdrawal evidence', async kind => {
+  it.each(['foreign-app', 'malformed'])('refuses %s failure as hot-patch withdrawal evidence', async kind => {
     const failed = check(kind === 'unrelated' ? 'daemon-soak' : 'test', 'failure',
       kind === 'foreign-app' ? { app: { id: 99 } } : kind === 'unbound' ? { check_suite: { id: 8 } } : {});
     const f = hotFixture([failed]);
@@ -1032,6 +1032,20 @@ describe('hot-patch sweep (R1100)', () => {
     await f.run();
     expect(f.d.remove).not.toHaveBeenCalled();
     expect(f.d.escalate).toHaveBeenCalled();
+  });
+  it('unloads pending CI after 31 minutes when PR evidence is unreadable', async () => {
+    const f = hotFixture([check('test', null, { status: 'in_progress' })]);
+    f.d.pr.mockImplementation(() => { throw Error('PR unavailable'); });
+    f.d.now = () => new Date(Date.parse(load.at) + 31 * 60_000).toISOString();
+    decisionBeforeRemoval(f, 'ci-unknown');
+    expect(await f.run()).toMatchObject({ results: [{ status: 'unloaded-pending-adoption' }] });
+    expect(f.d.remove).toHaveBeenCalledTimes(1);
+  });
+  it('unloads an Actions failure even when required-job reading fails', async () => {
+    const f = hotFixture([check('daemon-soak', 'failure', { check_suite: { id: 8 } })]);
+    f.d.required.mockImplementation(() => { throw Error('required jobs unavailable'); });
+    decisionBeforeRemoval(f, 'ci-failed');
+    expect(await f.run()).toMatchObject({ results: [{ status: 'unloaded-pending-adoption' }] });
   });
   it('ignores superseded hot-patch failure with a newer successful rerun', async () => {
     const f = hotFixture([check('test', 'failure'), ...required.map(n => check(n))]);
@@ -1075,12 +1089,6 @@ describe('hot-patch sweep (R1100)', () => {
     const failed = kind === 'bound test' ? check('test', 'failure')
       : check('daemon-soak', 'failure', { check_suite: { id: 8 } });
     const f = hotFixture([...greenRows, failed]);
-    if (kind === 'unbound daemon-soak') {
-      expect(await f.run()).toMatchObject({ results: [{ status: 'needs-you' }] });
-      expect(f.d.remove).not.toHaveBeenCalled();
-      expect(f.state.some(r => r.status === 'unload-decision')).toBe(false);
-      return;
-    }
     decisionBeforeRemoval(f, 'ci-failed');
     expect(await f.run()).toMatchObject({ results: [{ status: 'unloaded-pending-adoption' }] });
     expect(f.d.remove).toHaveBeenCalledTimes(1);
@@ -1100,7 +1108,7 @@ describe('hot-patch sweep (R1100)', () => {
       f.d.now = () => new Date(Date.parse(load.at) + minutes * 60_000).toISOString();
       decisionBeforeRemoval(f, 'ci-unknown');
       const result = await f.run();
-      const shouldUnload = kind === 'CI unreadable' && minutes >= 30;
+      const shouldUnload = minutes >= 30;
       expect(f.d.remove).toHaveBeenCalledTimes(shouldUnload ? 1 : 0);
       if (shouldUnload) expect(result).toMatchObject({ results: [{ status: 'unloaded-pending-adoption' }] });
       else {

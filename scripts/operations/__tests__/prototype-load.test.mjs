@@ -3695,6 +3695,12 @@ describe('hot-patch urgent admission (R1100)', () => {
     f.fs.readFileSync = (p, ...args) => p.includes('/coordination/') ? lockFs.readFileSync(redirect(p), ...args) : originalRead(p, ...args);
     return { ...f, gh, run: (input = {}) => f.run({ branch, urgent: true, reason: 'R1100 hot-patch PR #42', ...input }) };
   }
+  it('refuses clean admission whose stackBases includes a hotpatch', async () => {
+    const f = hotFixture({ options: { checkRaw: JSON.stringify({ check: { ok: true, clean: true,
+      candSha: SHA, stackBases: [`hotpatch/${TREE}`] }, wouldRegister: true }) } });
+    expect(await f.run()).toMatchObject({ ok: false, registered: false, detail: 'hot-patch-stack-refused' });
+    expect(f.calls.some(c => c.cmd === 'node' && c.args[1] === 'add' && !c.args.includes('--check'))).toBe(false);
+  });
   it.each(['queued', 'in_progress', 'completed'])('accepts bound Actions test %s without a receipt and records hotPatch.pr', async status => {
     const f = hotFixture({ rows: [{ id: 1, head_sha: SHA, name: 'test', status, conclusion: status === 'completed' ? 'success' : null,
       app: { id: 15368 }, check_suite: { id: 7 } }] });

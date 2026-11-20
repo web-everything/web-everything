@@ -263,8 +263,10 @@ export async function stackAwareOverlayCheck({
 }) {
   const options = { root, ref, pr, existingOverlays, env, originUrl };
   const { bases, via } = await stackBases(options);
-  const full = await preview(options);
   const evidence = { stackBases: bases, stackVia: via };
+  if (bases.some(base => /^hotpatch\/[a-f0-9]{40}$/.test(base)))
+    return { ok: false, reason: 'hot-patch-stack-refused', ...evidence };
+  const full = await preview(options);
   if (!full.ok || full.clean || bases.length === 0) return { ...full, ...evidence };
   const sa = await preview({ ...options, existingOverlays: existingOverlays.filter(o => !bases.includes(o.ref)) });
   if (!sa.ok) return { ...full, ...evidence };
@@ -506,6 +508,32 @@ export function proveOverlayWithdrawal({ root, ref, tip, reason, env = process.e
     return result.stdout.trim();
   };
   const state = readOverlayState(root, { env });
+  if (/^hotpatch\/[a-f0-9]{40}$/.test(ref)) {
+    const dependents = new Set();
+    const others = state.overlays.filter(r => r.ref !== ref);
+    for (const other of others) {
+      try {
+        requireGit('fetch', 'origin', `+refs/heads/${ref}:refs/remotes/origin/${ref}`);
+        requireGit('fetch', 'origin', `+refs/heads/${other.ref}:refs/remotes/origin/${other.ref}`);
+        const ancestry = git('merge-base', '--is-ancestor', tip, `refs/remotes/origin/${other.ref}`);
+        if (ancestry.code !== 1) dependents.add(other.ref);
+      } catch { dependents.add(other.ref); }
+    }
+    // Close over cached dependency edges too, including transitive and unreadable edges.
+    for (let changed = true; changed;) {
+      changed = false;
+      for (const other of others) {
+        const bases = other.stackBases ?? [], via = other.stackVia ?? {};
+        const unknown = !Array.isArray(bases) || typeof via !== 'object' || via === null
+          || !Object.values(via).every(Array.isArray);
+        if (unknown || [...(Array.isArray(bases) ? bases : []), ...Object.values(via || {}).flat()]
+          .some(base => base === ref || dependents.has(base))) {
+          if (!dependents.has(other.ref)) { dependents.add(other.ref); changed = true; }
+        }
+      }
+    }
+    return { action: 'retire', tip, reason, dependents: others.filter(r => dependents.has(r.ref)) };
+  }
   if (state.corrupt) return { action: 'keep', reason: 'stacked-or-unreadable' };
   if (state.overlays.some((r) => r.stackVia !== undefined && (!r.stackVia
     || typeof r.stackVia !== 'object' || Array.isArray(r.stackVia)
@@ -562,6 +590,7 @@ export async function retireRegistration({ root, ref, expectedTip, expectedEntry
     if (mode === 'urgent-failed' && (!expectedEntry || expectedEntry.ref !== ref || !/^[a-f0-9]{40}$/.test(expectedTip ?? ''))) return refuse('urgent-snapshot-required');
     if (!entry) return refuse('not-registered');
     if (expectedEntry !== undefined && !isDeepStrictEqual(registrationIdentity(entry), registrationIdentity(expectedEntry))) return refuse('registration-changed');
+    let dependentWithdrawals = [];
     if (mode === 'urgent-failed') {
       let records;
       try { records = await deps.readUrgentLoads?.(); } catch { return refuse('urgent-tracking-unreadable'); }
@@ -581,33 +610,35 @@ export async function retireRegistration({ root, ref, expectedTip, expectedEntry
       // Only immutable hot-patch loads may use the shorter unknown clock or PR lifecycle evidence.
       const hotPatch = validSha(load.sha) && load.ref === `hotpatch/${load.sha}`;
       let hotNegative = false;
-      if (hotPatch && ['ci-unknown', 'expired', 'pr-head-moved', 'pr-closed'].includes(decision?.reason)) {
-        // Re-read under the add guard: a persisted decision is intent, not current evidence.
-        const { createSweepDeps, validateChecks } = await import('./operations/urgent-sweep.mjs');
+      let currentFailure = false;
+      if (hotPatch && ['ci-unknown', 'ci-failed', 'expired', 'pr-head-moved', 'pr-closed'].includes(decision?.reason)) {
+        // The add guard covers all readers and mutation: persisted evidence alone is never current authority.
+        const { createSweepDeps, hotPatchCiEvidence, validateChecks, latestActionFailure } = await import('./operations/urgent-sweep.mjs');
         const readers = () => createSweepDeps({ env, home: env.HOME });
-        if (decision.reason === 'ci-unknown' && at - loadedAt >= 30 * 60 * 1000) {
-          let readable = false;
-          try {
-            const checks = await (deps.readUrgentChecks ?? (r => readers().checks(r)))(load);
-            validateChecks(checks, load.sha);
-            readable = testWorkflowBound(testCheckEvidence(checks, load.sha), checks.workflows, load.sha, checks.testWorkflowPath);
-          } catch { /* Still unknown: the bounded timeout authorizes withdrawal. */ }
-          hotNegative = !readable;
-        } else if (decision.reason !== 'ci-unknown') {
-          try {
-            const pr = await (deps.readUrgentPr ?? (r => readers().pr(r)))(load);
-            const prMatches = Number.isSafeInteger(load.hotPatch?.pr) && load.hotPatch.pr > 0
-              && pr?.number === load.hotPatch.pr && ['open', 'closed'].includes(pr.state)
-              && typeof pr.merged === 'boolean' && validSha(pr.head?.sha);
-            hotNegative = prMatches && (
-              decision.reason === 'expired' && at - loadedAt >= 24 * 60 * 60 * 1000
-                && !(pr.merged && pr.head.sha === load.sha)
-              || decision.reason === 'pr-head-moved' && pr.head.sha !== load.sha
-              || decision.reason === 'pr-closed' && pr.state === 'closed' && pr.merged === false);
-          } catch { /* Unknown PR evidence cannot authorize a lifecycle withdrawal. */ }
-        }
+        let unknown = false, pr;
+        try {
+          const checks = await (deps.readUrgentChecks ?? (r => readers().checks(r)))(load);
+          validateChecks(checks, load.sha);
+          currentFailure = Boolean(latestActionFailure(checks, load.sha));
+          const required = await (deps.readUrgentRequired ?? ((r, path) => readers().required(r, path)))(load, checks.testWorkflowPath);
+          hotPatchCiEvidence(checks, load.sha, required);
+        } catch { unknown = true; }
+        try {
+          pr = await (deps.readUrgentPr ?? (r => readers().pr(r)))(load);
+          if (!Number.isSafeInteger(load.hotPatch?.pr) || load.hotPatch.pr <= 0
+            || pr?.number !== load.hotPatch.pr || !['open', 'closed'].includes(pr.state)
+            || typeof pr.merged !== 'boolean' || !validSha(pr.head?.sha)) throw Error('unreadable PR');
+        } catch { unknown = true; pr = null; }
+        const unknownEligible = at - loadedAt >= 30 * 60 * 1000;
+        if (decision.reason === 'ci-unknown') hotNegative = unknown && unknownEligible;
+        else if (decision.reason === 'ci-failed') hotNegative = currentFailure || (unknown && unknownEligible);
+        else if (pr) hotNegative = (
+          decision.reason === 'expired' && at - loadedAt >= 24 * 60 * 60 * 1000
+            && !(pr.merged && pr.head.sha === load.sha)
+          || decision.reason === 'pr-head-moved' && pr.head.sha !== load.sha
+          || decision.reason === 'pr-closed' && pr.state === 'closed' && pr.merged === false);
       }
-      const negative = hotNegative || (decision?.reason === 'ci-failed'
+      const negative = hotNegative || (!hotPatch && decision?.reason === 'ci-failed'
         ? decision.check?.head_sha === load.sha && decision.check.status === 'completed'
           && ['failure', 'cancelled', 'timed_out', 'action_required', 'startup_failure'].includes(decision.check.conclusion)
         : decision?.reason === 'ci-expired' && Number.isFinite(loadedAt) && at - loadedAt >= 24 * 60 * 60 * 1000);
@@ -617,6 +648,7 @@ export async function retireRegistration({ root, ref, expectedTip, expectedEntry
       try { withdrawal = proveOverlayWithdrawal({ root, ref, tip: expectedTip, reason: 'urgent-failed', env }); }
       catch { return refuse('stacked-or-unreadable'); }
       if (withdrawal.action !== 'retire') return refuse(withdrawal.reason);
+      dependentWithdrawals = withdrawal.dependents ?? [];
     }
     let proof = prove(entry);
     if (proof.action === 'keep' && ['unique-commits-not-on-main', 'pr-open'].includes(proof.reason) && mode === 'urgent-failed') {
@@ -630,6 +662,15 @@ export async function retireRegistration({ root, ref, expectedTip, expectedEntry
     }
     if (proof.action !== 'retire') return refuse('not-proved', { proof });
     if (proof.tip !== expectedTip) return refuse('tip-moved', { proof, tipNow: proof.tip });
+    if (dependentWithdrawals.length) {
+      const unloaded = [];
+      for (const dependent of dependentWithdrawals) {
+        const result = removeOverlay(root, dependent.ref, { env, why: 'hot-patch-base-withdrawn', expectedOverlay: dependent });
+        if (result.removed) unloaded.push(dependent.ref);
+      }
+      appendOverlayEvent(root, { kind: 'hot-patch-dependents-unloaded', ref, dependents: unloaded,
+        alert: true, by, reason: 'Hot-patch base withdrawn; dependent or unverifiable overlays unloaded. Inspect before reloading.' }, { env });
+    }
     addPending(root, env, { kind: 'retire', ref, entry, tip: expectedTip, ...(proof.evidence?.refGone === true ? { refGone: true } : {}), at: new Date().toISOString() });
     let removed;
     try {

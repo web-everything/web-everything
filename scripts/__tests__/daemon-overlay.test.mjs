@@ -639,6 +639,13 @@ describe('stackAwareOverlayCheck', () => {
   const via = { chain: ['lane/b'], ancestry: [] };
   const options = { root: '/unused', ref: 'lane/c', pr: 4915, existingOverlays, env: {}, originUrl: '/origin' };
 
+  it('refuses stacking on a hotpatch even when the preview would be clean', async () => {
+    const ref = `hotpatch/${'a'.repeat(40)}`;
+    const preview = vi.fn().mockResolvedValue({ ok: true, clean: true });
+    expect(await stackAwareOverlayCheck({ ...options, preview,
+      stackBases: () => ({ bases: [ref], via: { chain: [ref], ancestry: [] } }),
+    })).toMatchObject({ ok: false, reason: 'hot-patch-stack-refused' });
+  });
   it('runs only one preview with no bases', async () => {
     const preview = vi.fn().mockResolvedValue(full);
     const stackBases = vi.fn().mockReturnValue({ bases: [], via });

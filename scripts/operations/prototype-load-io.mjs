@@ -793,6 +793,9 @@ export function createPrototypeLoader({ exec, fs, now, sleep, env, settings, com
         out.check = replaceCheck(out.clone, out.effectiveRef, out.effectiveSha, input.replace);
         if (out.check.ok === false && out.check.reason === 'not-contained') return stop('replace-not-contained');
       }
+      if (out.check.stackBases?.some(ref => /^hotpatch\/[a-f0-9]{40}$/.test(ref)))
+        return stop('check-unverifiable', { detail: 'hot-patch-stack-refused',
+          fallback: 'Unload the hot patch and rebase onto main before registering another overlay.' });
       const established = [...new Set(rows.map((r) => r.ref))].filter((ref) => ref !== input.replace);
       const contained = [], blocking = [];
       const overlapping = [], combinedChanged = new Set(effectivePaths);
