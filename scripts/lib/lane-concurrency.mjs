@@ -24,8 +24,8 @@
  * following the SAME env-var-configurable convention `heavy-admission.mjs` already established
  * (`WE_HEAVY_ADMISSION_CAP`).
  *
- * DEFAULT — 12. lanes.maxConcurrent resolves operator override > WE_MAX_CONCURRENT_LANES > preferences
- * file > built-in, with integer bounds 1..24. Invalid evidence keeps the stricter lower/built-in cap.
+ * DEFAULT — 12. lanes.maxConcurrent resolves a valid operator override above the minimum env/file/built-in cap.
+ * Integer bounds are 1..24. Invalid evidence keeps the stricter lower/built-in cap.
  *
  * The resolver rereads settings on every call; capToConcurrency remains pure.
  */
@@ -39,14 +39,15 @@ export const DEFAULT_MAX_CONCURRENT_LANES = 12;
 export const MAX_CONCURRENT_LANES_ENV = 'WE_MAX_CONCURRENT_LANES';
 
 /**
- * Resolve the concurrent-lane cap through the bounded capacity cascade. Zero, fractional and
- * oversized values are invalid; invalid evidence cannot raise the lower/file bound above the built-in.
+ * Resolve the concurrent-lane cap through the bounded capacity cascade. Fractions floor conservatively;
+ * invalid evidence cannot raise the lower/file bound above the built-in.
  * @param {NodeJS.ProcessEnv} [env]
  * @returns {number}
  */
 export function resolveMaxConcurrentLanes(env = process.env) {
   const e = env?.[MAX_CONCURRENT_LANES_ENV];
-  return resolveCapacityLeaf('lanes.maxConcurrent', { env, envValue: e === undefined ? undefined : Number(e) }).value;
+  return resolveCapacityLeaf('lanes.maxConcurrent', { env,
+    envValue: typeof e === 'string' && e.trim() ? Number(e) : undefined }).value;
 }
 
 /**

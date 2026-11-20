@@ -24,6 +24,32 @@ beforeEach(() => {
 afterEach(() => rmSync(dir, { recursive: true, force: true }));
 
 describe('lock-free operator override reader', () => {
+  describe.each([
+    ['ciHeal.reserve', 12], ['lanes.maxConcurrent', 24],
+  ])('%s store validation', (key, max) => {
+    const [policy, leaf] = key.split('.');
+    it.each([
+      ['unknown sibling', { [key]: max, [`${policy}.unknown`]: 1 }],
+      ['invalid other policy', { [key]: max, 'host.maxReviewDispatchPerTick': 'bad' }],
+      ['unknown other policy', { [key]: max, 'other.unknown': 1 }],
+      ['scalar block', { [key]: max, [policy]: max }],
+      ['dotted/nested conflict', { [key]: 1, [policy]: { [leaf]: max } }],
+      ['nested/dotted conflict', { [policy]: { [leaf]: 1 }, [key]: max }],
+      ['fractional leaf', { [key]: 1.5 }],
+      ['wrong type', { [key]: '2' }],
+    ])('refuses %s', (_, data) => {
+      writeFileSync(file, JSON.stringify(data));
+      const result = readOperatorOverrides({ file, log: () => {} });
+      expect(result.values).not.toHaveProperty(key);
+      expect(result.invalidPolicies?.length > 0 || !result.readable).toBe(true);
+    });
+    it('catches a 6000-level store inside the read-error boundary', () => {
+      writeFileSync(file, `{"${key}":${max},"deep":${'{"x":'.repeat(6000)}1${'}'.repeat(6000)}}`);
+      expect(readOperatorOverrides({ file, log: () => { throw Error('logger'); } }))
+        .toEqual({ readable: false, values: {} });
+    });
+  });
+
   it.each([
     ['fix.conflictFixesPerPass', 24],
     ['fix.conflictFixExemptPerPass', 10],
@@ -40,13 +66,13 @@ describe('lock-free operator override reader', () => {
     expect(CAPACITY_LEAVES[key]).toMatchObject({ direction: 'cap', failClosedFallback: 1 });
   });
 
-  it.each([11, 24])('rejects persisted exemption %i while retaining its valid sibling', value => {
+  it.each([11, 24])('rejects persisted exemption %i and invalidates the whole fix policy', value => {
     writeFileSync(file, JSON.stringify({
       'fix.conflictFixesPerPass': 24,
       'fix.conflictFixExemptPerPass': value,
     }));
     expect(readOperatorOverrides({ file, log: () => {} })).toEqual({
-      readable: true, values: { 'fix.conflictFixesPerPass': 24 }, invalidPolicies: ['fix'],
+      readable: true, values: {}, invalidPolicies: ['fix'],
     });
   });
 
@@ -88,14 +114,14 @@ describe('lock-free operator override reader', () => {
     }
   });
 
-  it('rejects oversized capacity values while retaining valid siblings and other policies', () => {
+  it('rejects oversized capacity values and invalidates their whole policy', () => {
     writeFileSync(file, JSON.stringify({
       'resourceGate.fixCap.floor': 2,
       'resourceGate.fixCap.ceiling': 25,
       'host.maxReviewDispatchPerTick': 3,
     }));
     expect(readOperatorOverrides({ file, log: () => {} })).toEqual({
-      readable: true, values: { 'resourceGate.fixCap.floor': 2, 'host.maxReviewDispatchPerTick': 3 }, invalidPolicies: ['resourceGate'],
+      readable: true, values: { 'host.maxReviewDispatchPerTick': 3 }, invalidPolicies: ['resourceGate'],
     });
   });
 
@@ -108,7 +134,7 @@ describe('lock-free operator override reader', () => {
     }));
     expect(readOperatorOverrides({ file, log: () => {} })).toEqual({
       readable: true,
-      values: { 'reviewConcurrency.maxLiveReviewRounds': 2, 'resourceGate.fixCap.floor': 3, 'resourceGate.fixCap.ceiling': 3 },
+      values: { 'resourceGate.fixCap.floor': 3, 'resourceGate.fixCap.ceiling': 3 },
       invalidPolicies: ['reviewConcurrency'],
     });
   });
@@ -121,19 +147,6 @@ describe('lock-free operator override reader', () => {
       expect(failClosedCapacity(key, 4, { codeDefault: 2, log }))
         .toBe(stricter(4, 2, failClosedFallback));
     }
-  });
-
-  it.each(['unknown', 'host.unknown', 'host.maxReviewDispatchPerTick.forbidden', '__proto__.polluted'])
-  ('drops %s without erasing nested valid siblings', bad => {
-    writeFileSync(file, JSON.stringify({
-      host: { maxReviewDispatchPerTick: 8 },
-      'reviewConcurrency.maxLiveReviewRounds': 12,
-      [bad]: 1,
-    }));
-    expect(readOperatorOverrides({ file, log: () => {} }).values).toEqual({
-      'host.maxReviewDispatchPerTick': 8, 'reviewConcurrency.maxLiveReviewRounds': 12,
-    });
-    expect({}.polluted).toBeUndefined();
   });
 });
 

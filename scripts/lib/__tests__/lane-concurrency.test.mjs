@@ -13,8 +13,8 @@ describe('resolveMaxConcurrentLanes', () => {
     expect(resolveMaxConcurrentLanes({})).toBe(DEFAULT_MAX_CONCURRENT_LANES);
   });
 
-  it('reads a valid override from the env var', () => {
-    expect(resolveMaxConcurrentLanes({ [MAX_CONCURRENT_LANES_ENV]: '20' })).toBe(20);
+  it('keeps an env raise within the built-in bound', () => {
+    expect(resolveMaxConcurrentLanes({ [MAX_CONCURRENT_LANES_ENV]: '20' })).toBe(12);
   });
 
   it('clamps to a floor of 1 — a cap of 0 or negative would wedge all new dispatch', () => {
@@ -26,8 +26,8 @@ describe('resolveMaxConcurrentLanes', () => {
     expect(resolveMaxConcurrentLanes({ [MAX_CONCURRENT_LANES_ENV]: 'not-a-number' })).toBe(DEFAULT_MAX_CONCURRENT_LANES);
   });
 
-  it('rejects a fractional override', () => {
-    expect(resolveMaxConcurrentLanes({ [MAX_CONCURRENT_LANES_ENV]: '8.9' })).toBe(DEFAULT_MAX_CONCURRENT_LANES);
+  it('floors a fractional override', () => {
+    expect(resolveMaxConcurrentLanes({ [MAX_CONCURRENT_LANES_ENV]: '8.9' })).toBe(8);
   });
 });
 

@@ -63,38 +63,45 @@ export function readOperatorOverrides({ file, log = console.error, normalize = t
       return { readable: false, values: {} };
     }
   }
-  let data;
   try {
-    data = JSON.parse(readFileSync(file, 'utf8'));
+    const data = JSON.parse(readFileSync(file, 'utf8'));
     if (!data || typeof data !== 'object' || Array.isArray(data)) throw Error('not a JSON object');
+    const values = {};
+    const invalidPolicies = new Set();
+    const seen = new Set();
+    // Accept dotted writer output and nested operator-authored JSON. Numeric leaves are atomic;
+    // reject duplicate paths, and bound traversal inside the read-error boundary.
+    function* entries(object, prefix = '', depth = 0) {
+      if (depth > 16) throw Error('operator store exceeds maximum depth 16');
+      for (const [part, value] of Object.entries(object)) {
+        const key = prefix ? `${prefix}.${part}` : part;
+        const unsafe = key.split('.').some(k => ['__proto__', 'constructor', 'prototype'].includes(k));
+        if (!unsafe && !Object.hasOwn(CAPACITY_LEAVES, key) && value && typeof value === 'object'
+          && !Array.isArray(value) && Object.keys(value).length) yield* entries(value, key, depth + 1);
+        else yield [key, value];
+      }
+    }
+    for (const [key, value] of entries(data)) {
+      const known = Object.hasOwn(CAPACITY_LEAVES, key);
+      if (seen.has(key) || !known || !CAPACITY_LEAVES[key].validate(value)) {
+        invalidPolicies.add(key.split('.')[0]);
+        warn(log, `operator-override: operator-db-invalid ${key} (${seen.has(key) ? 'duplicate dotted/nested path' : known ? 'invalid type or outside hard range' : 'guard leaves need the signed-attestation slice'}); repair the store before using this policy`);
+      } else values[key] = value;
+      seen.add(key);
+    }
+    for (const key of Object.keys(values)) {
+      // Preserve other policies' whole-policy refusal from main. These two bounded leaves
+      // require a wholly valid store before any operator override can apply.
+      if (invalidPolicies.has('*') || invalidPolicies.has(key.split('.')[0])
+        || (invalidPolicies.size && ['ciHeal.reserve', 'lanes.maxConcurrent'].includes(key))) delete values[key];
+    }
+    if (normalize && values['resourceGate.fixCap.ceiling'] < values['resourceGate.fixCap.floor']) {
+      values['resourceGate.fixCap.floor'] = values['resourceGate.fixCap.ceiling'];
+    }
+    return { readable: true, values, ...(invalidPolicies.size ? { invalidPolicies: [...invalidPolicies] } : {}) };
   } catch (error) {
     if (error?.code === 'ENOENT') return { readable: true, values: {} };
     warn(log, `operator-override: operator-db-unreadable store (${error.message}); using code value`);
     return { readable: false, values: {} };
   }
-  const values = {};
-  const invalidPolicies = new Set();
-  // Accept dotted writer output and nested operator-authored JSON. Numeric leaves are atomic;
-  // an object at a known leaf is invalid, and unsafe paths must never be expanded.
-  function* entries(object, prefix = '') {
-    for (const [part, value] of Object.entries(object)) {
-      const key = prefix ? `${prefix}.${part}` : part;
-      const unsafe = key.split('.').some(k => ['__proto__', 'constructor', 'prototype'].includes(k));
-      if (!unsafe && !Object.hasOwn(CAPACITY_LEAVES, key) && value && typeof value === 'object'
-        && !Array.isArray(value) && Object.keys(value).length) yield* entries(value, key);
-      else yield [key, value];
-    }
-  }
-  for (const [key, value] of entries(data)) {
-    const known = Object.hasOwn(CAPACITY_LEAVES, key);
-    if (!known || !CAPACITY_LEAVES[key].validate(value)) {
-      const policy = key.split('.')[0];
-      invalidPolicies.add(policy);
-      warn(log, `operator-override: operator-db-invalid ${key} (${known ? 'invalid type or outside hard range' : 'guard leaves need the signed-attestation slice'}); dropping this key and retaining valid siblings`);
-    } else values[key] = value;
-  }
-  if (normalize && values['resourceGate.fixCap.ceiling'] < values['resourceGate.fixCap.floor']) {
-    values['resourceGate.fixCap.floor'] = values['resourceGate.fixCap.ceiling'];
-  }
-  return { readable: true, values, ...(invalidPolicies.size ? { invalidPolicies: [...invalidPolicies] } : {}) };
 }

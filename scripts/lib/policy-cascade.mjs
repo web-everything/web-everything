@@ -305,23 +305,28 @@ export function capacityPolicyLeaves(policy) {
  * Other policies retain resolveCascade/readOperatorPolicy's existing whole-policy invalid handling. */
 const BOUNDED_CAPACITY_LEAVES = new Set(['ciHeal.reserve', 'lanes.maxConcurrent']);
 
-/** Override > env > preferences file > built-in. A valid operator leaf wins even beside invalid
- * siblings; otherwise invalid evidence caps the lower-layer result at the built-in value. */
+/** Only a wholly valid operator store can raise these caps. Otherwise retain the minimum
+ * file/env/built-in bound, conservatively flooring fractions; ci-heal zero means off. */
 export function resolveCapacityLeaf(key, { envValue, env = process.env, log } = {}) {
   if (!BOUNDED_CAPACITY_LEAVES.has(key)) throw Error(`unsupported bounded capacity leaf: ${key}`);
   const spec = CAPACITY_LEAVES[key];
   const [policy, leaf] = key.split('.');
-  const { prefs, errors } = readPlatformPreferences({ env });
+  const { prefs } = readPlatformPreferences({ env });
   const block = prefs[policy];
-  const fileValue = isObj(block) ? block[leaf] : block;
+  // A policy is an object, never a scalar shorthand for its capacity leaf.
+  const fileValue = isObj(block) ? block[leaf] : undefined;
   const { readable, values, invalidPolicies = [] } = readOperatorOverrides({ ...(log ? { log } : {}) });
-  const invalidLower = errors.length > 0
-    || [fileValue, envValue].some(v => v !== undefined && !spec.validate(v));
-  const closed = !readable || invalidPolicies.includes(policy) || invalidPolicies.includes('*') || invalidLower;
-  const operatorOverride = Object.hasOwn(values, key) ? { [key]: values[key] } : closed ? null : {};
+  const valid = v => spec.validate(v) || (key === 'ciHeal.reserve' && v === 0);
+  const floor = v => typeof v === 'number' && Number.isFinite(v) && valid(Math.floor(v)) ? Math.floor(v) : undefined;
+  const fileCap = floor(fileValue);
+  const envCap = floor(envValue);
+  const lower = Math.min(spec.failClosedFallback, fileCap ?? Infinity);
+  const closed = !readable || invalidPolicies.length > 0;
+  const operatorOverride = closed ? null : Object.hasOwn(values, key) ? { [key]: values[key] } : {};
   const resolved = resolveCascade({
-    standard: { [key]: spec.failClosedFallback }, platform: { [key]: fileValue },
-    envValues: { [key]: envValue }, valid: spec.validate, operatorOverride, capacityLeaves: [key],
+    standard: { [key]: spec.failClosedFallback },
+    platform: { [key]: fileCap <= spec.failClosedFallback ? fileCap : undefined },
+    envValues: { [key]: envCap <= lower ? envCap : undefined }, valid, operatorOverride, capacityLeaves: [key],
     ...(log ? { log } : {}),
   });
   logCascadeSources(key, resolved, { env, ...(log ? { log } : {}) });

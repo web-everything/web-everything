@@ -2111,7 +2111,8 @@ async function main(argv) {
   // #xupukxa — resolve the concurrency ceiling from env exactly like dispatch-plan.mjs's own IO shell, unless
   // the caller's piped-in bookkeeping already named one explicitly (an operator override rides through
   // `config.maxConcurrentLanes` on STDIN same as any other config knob).
-  if (config.maxConcurrentLanes == null) config.maxConcurrentLanes = resolveMaxConcurrentLanes(process.env);
+  config.maxConcurrentLanes = Number.isInteger(config.maxConcurrentLanes) && config.maxConcurrentLanes >= 1
+    ? Math.min(24, config.maxConcurrentLanes) : resolveMaxConcurrentLanes(process.env);
 
   const stateArgs = ['--json'];
   const planArgs = ['--json'];
