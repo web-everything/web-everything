@@ -856,14 +856,30 @@ describe('headNeverReviewedFromRuns complete bounded proof', () => {
     expect(scan(f)).toBe(true);
     expect(f.read).toHaveBeenCalledTimes(2);
   });
-  it.each(['live head', 'corrupt', 'unreadable'])('another PR filename with %s payload refuses proof', kind => {
+  it.each(['live head', 'corrupt'])('another PR filename with %s payload refuses proof', kind => {
     const other = `review-pr-pr${pr + 1}-00000000-0000-0000-0000-000000000000`;
     const f = scanFixture({ [other]: kind === 'corrupt' ? {} : run(payload('accept')) });
-    if (kind === 'unreadable') f.read.mockImplementation(() => { throw Error('unreadable payload'); });
     expect(scan(f)).toBe(false);
     expect(f.read).toHaveBeenCalledTimes(1);
     expect(scan(f)).toBe(false);
     expect(f.read).toHaveBeenCalledTimes(1);
+  });
+  it.each(['live head', 'other PR'])('another PR filename retries unreadable payload then caches recovered %s evidence', kind => {
+    const other = `review-pr-pr${pr + 1}-00000000-0000-0000-0000-000000000000`;
+    const f = scanFixture({ [other]: run({ ...payload('accept'),
+      input: { repo, pr: kind === 'live head' ? pr : pr + 1 } }) });
+    f.scanSettings.file.runs.scan.maxParses = 1;
+    const unreadable = () => { throw Error('unreadable payload'); };
+    f.read.mockImplementationOnce(unreadable).mockImplementationOnce(unreadable);
+    expect(scan(f)).toBe(false);
+    expect(f.read).toHaveBeenCalledTimes(1);
+    expect(scan(f)).toBe(false);
+    expect(f.read).toHaveBeenCalledTimes(2);
+    expect(scan(f)).toBe(kind === 'other PR');
+    expect(f.read).toHaveBeenCalledTimes(3);
+    expect(f.read.mock.calls.map(([id]) => id)).toEqual([other, other, other]);
+    expect(scan(f)).toBe(kind === 'other PR');
+    expect(f.read).toHaveBeenCalledTimes(3);
   });
   it('payload repo and PR determine relevance regardless of the named PR', () => {
     const other = `review-pr-pr${pr + 1}-00000000-0000-0000-0000-000000000000`;
