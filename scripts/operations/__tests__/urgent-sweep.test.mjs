@@ -1023,7 +1023,42 @@ describe('hot-patch sweep (R1100)', () => {
     f.d.pr = vi.fn(() => openPr());
     return f;
   }
-  it.each(['foreign-app', 'malformed'])('refuses %s failure as hot-patch withdrawal evidence', async kind => {
+  it.each(['test', 'unknown-job', 'review-gatekeeper', 'prefix-review-gate'])('unloads review-gate red plus failing %s', async name => {
+    const f = hotFixture([...required.map(n => check(n)), check('review-gate', 'failure'), check(name, 'failure')]);
+    decisionBeforeRemoval(f, 'ci-failed');
+    expect(await f.run()).toMatchObject({ results: [{ status: 'unloaded-pending-adoption' }] });
+    expect(f.d.remove).toHaveBeenCalledTimes(1);
+  });
+  it('unloads an unknown failing check from another app', async () => {
+    const f = hotFixture([...required.map(n => check(n)), check('unknown-job', 'failure', { app: { id: 99 } })]);
+    decisionBeforeRemoval(f, 'ci-failed');
+    expect(await f.run()).toMatchObject({ results: [{ status: 'unloaded-pending-adoption' }] });
+  });
+  it.each(['review-gate', 'merge-gate', 'review-gate (matrix)', 'merge-gate (1)'])('keeps %s red alone through the unknown-CI deadline', async name => {
+    const f = hotFixture([...required.map(n => check(n)), check(name, 'failure')]);
+    f.d.now = () => new Date(Date.parse(load.at) + 31 * 60_000).toISOString();
+    expect(await f.run()).toMatchObject({ results: [{ status: 'monitoring-green' }] });
+    expect(f.d.remove).not.toHaveBeenCalled();
+  });
+  it.each(['file', 'reader'])('defaults unreadable %s settings: ignores review-gate but unloads failing test-shard', async source => {
+    const deps = createSweepDeps({ io: { readFileSync() { throw Error('unreadable'); } } });
+    for (const failure of [false, true]) {
+      const f = hotFixture([...required.map(n => check(n)), check('review-gate', 'failure'), ...(failure ? [check('test-shard (1)', 'failure')] : [])]);
+      f.d.vetoIgnoreChecks = source === 'file' ? deps.vetoIgnoreChecks : () => { throw Error('reader unavailable'); };
+      if (failure) decisionBeforeRemoval(f, 'ci-failed');
+      expect(await f.run()).toMatchObject({ results: [{ status: failure ? 'unloaded-pending-adoption' : 'monitoring-green' }] });
+      expect(f.d.remove).toHaveBeenCalledTimes(failure ? 1 : 0);
+    }
+  });
+  it('uses the prototype-load setting for a custom ignored check', async () => {
+    const deps = createSweepDeps({ io: { readFileSync: p => p.endsWith('/prototype-load.json')
+      ? JSON.stringify({ hotPatch: { vetoIgnoreChecks: ['custom-gate'] } }) : '{}' } });
+    const f = hotFixture([...required.map(n => check(n)), check('custom-gate (1)', 'failure')]);
+    f.d.vetoIgnoreChecks = deps.vetoIgnoreChecks;
+    expect(await f.run()).toMatchObject({ results: [{ status: 'monitoring-green' }] });
+    expect(f.d.remove).not.toHaveBeenCalled();
+  });
+  it.each(['malformed'])('refuses %s failure as hot-patch withdrawal evidence', async kind => {
     const failed = check(kind === 'unrelated' ? 'daemon-soak' : 'test', 'failure',
       kind === 'foreign-app' ? { app: { id: 99 } } : kind === 'unbound' ? { check_suite: { id: 8 } } : {});
     const f = hotFixture([failed]);

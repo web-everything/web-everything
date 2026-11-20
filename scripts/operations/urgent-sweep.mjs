@@ -5,13 +5,14 @@ import { createHash } from 'node:crypto';
 import { homedir } from 'node:os';
 import { dirname, join, isAbsolute, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { readPlatformPreferences, resolveCascade } from '../lib/policy-cascade.mjs';
+import { readPlatformPreferences, resolveCascade, formatCascadeSourcesLine } from '../lib/policy-cascade.mjs';
 import { execFileSyncThrottled } from '../lib/gh-throttle.mjs';
 import { readOverlayState } from '../lib/daemon-overlays.mjs';
 import { retireRegistration, recoverDrops } from '../daemon-overlay.mjs';
 import { resolveOriginRepository } from './prototype-retire.mjs';
 import { safeRegistrationRef, validSha, TEST_CHECK_APP_ID, testCheckEvidence, testWorkflowBound } from './prototype-load.mjs';
 import { ciGatePlan, urgentLedger, normalizeUrgentRepo } from './urgent-verify-marker.mjs';
+import { readHotPatchVetoPolicy, hotPatchIgnoresCheck, DEFAULT_VETO_IGNORE_CHECKS } from './prototype-load-io.mjs';
 import { writeEscalationPacket } from './land-advance-escalations.mjs';
 
 const failedCheck = (c, sha) => c?.head_sha === sha && c.status === 'completed'
@@ -27,15 +28,16 @@ export const validateChecks = (data, sha) => {
       || (c.status === 'completed' ? typeof c.conclusion !== 'string' : c.conclusion !== null)))
     throw new Error('unreadable, incomplete or oversized CI checks (maximum 100); repair reader or inspect CI manually');
 };
-export function latestActionFailure(data, sha) {
+// The guarded retirement re-read also calls these helpers without an explicit list.
+export function latestActionFailure(data, sha, vetoIgnoreChecks = readHotPatchVetoPolicy().value.hotPatch.vetoIgnoreChecks) {
   const latest = new Map();
   for (const c of data.check_runs) {
     const key = JSON.stringify([c.app.id, c.check_suite?.id, c.name]);
     if (!latest.has(key) || c.id > latest.get(key).id) latest.set(key, c);
   }
-  return [...latest.values()].find(c => c.app.id === TEST_CHECK_APP_ID && failedCheck(c, sha));
+  return [...latest.values()].find(c => !hotPatchIgnoresCheck(c.name, vetoIgnoreChecks) && failedCheck(c, sha));
 }
-export function hotPatchCiEvidence(data, sha, required, now) {
+export function hotPatchCiEvidence(data, sha, required, now, vetoIgnoreChecks = readHotPatchVetoPolicy().value.hotPatch.vetoIgnoreChecks) {
   validateChecks(data, sha);
   if (!Array.isArray(required) || !required.includes('test') || required.some(n => typeof n !== 'string' || !n))
     throw Error('unreadable required CI jobs');
@@ -45,8 +47,8 @@ export function hotPatchCiEvidence(data, sha, required, now) {
     const key = JSON.stringify([c.app.id, c.check_suite?.id, c.name]);
     if (!latest.has(key) || c.id > latest.get(key).id) latest.set(key, c);
   }
-  if ([...latest.values()].some(c => c.app.id === TEST_CHECK_APP_ID
-    && c.status === 'completed' && c.conclusion !== 'success') || data.check_runs.some(c => c.app.id === TEST_CHECK_APP_ID && failedCheck(c, sha) && latest.get(JSON.stringify([c.app.id, c.check_suite?.id, c.name])).status !== 'completed' && (!Number.isFinite(Date.parse(c.completed_at)) || now - Date.parse(c.completed_at) >= 30 * 60_000)))
+  if ([...latest.values()].some(c => !hotPatchIgnoresCheck(c.name, vetoIgnoreChecks) && c.app.id === TEST_CHECK_APP_ID
+    && c.status === 'completed' && c.conclusion !== 'success') || data.check_runs.some(c => !hotPatchIgnoresCheck(c.name, vetoIgnoreChecks) && c.app.id === TEST_CHECK_APP_ID && failedCheck(c, sha) && latest.get(JSON.stringify([c.app.id, c.check_suite?.id, c.name])).status !== 'completed' && (!Number.isFinite(Date.parse(c.completed_at)) || now - Date.parse(c.completed_at) >= 30 * 60_000)))
     throw Error('unknown hot-patch CI conclusion; inspect checks or unload manually');
   if (!testWorkflowBound(testCheckEvidence(data, sha), data.workflows, sha, data.testWorkflowPath))
     throw Error('unreadable hot-patch CI binding');
@@ -65,6 +67,11 @@ export function createSweepDeps({ home = homedir(), io = fs, exec = execFileSync
     io.appendFileSync(path, `${JSON.stringify(record)}\n`, { mode: 0o600 });
   };
   return {
+    vetoIgnoreChecks: () => {
+      const policy = readHotPatchVetoPolicy({ fs: io, env: { ...env, HOME: home } });
+      console.info(formatCascadeSourcesLine('prototypeLoad', policy));
+      return policy.value.hotPatch.vetoIgnoreChecks;
+    },
     loads: () => read('urgent-loads'), state: () => read('urgent-sweep-state'), now: () => new Date().toISOString(),
     required: (r, path = '.github/workflows/ci.yml') => ciGatePlan(String(exec('git', ['show', `${r.sha}:${path}`],
       { cwd: r.clone, env, encoding: 'utf8', timeout: 30000, maxBuffer: 1024 * 1024 }))).requiredJobs,
@@ -272,6 +279,13 @@ export async function urgentSweep(_input = {}, deps = createSweepDeps()) {
         if (!Number.isFinite(loadedAt) || !Number.isFinite(now) || now < loadedAt)
           throw new Error('unreadable urgent load timestamp; inspect CI or unload manually');
         const hotPatch = validSha(r.sha) && r.ref === `hotpatch/${r.sha}`;
+        let vetoIgnoreChecks = DEFAULT_VETO_IGNORE_CHECKS;
+        if (hotPatch && deps.vetoIgnoreChecks) {
+          try {
+            vetoIgnoreChecks = readHotPatchVetoPolicy({ settings: { hotPatch: { vetoIgnoreChecks: await deps.vetoIgnoreChecks() } },
+              platform: { prefs: {}, errors: [] } }).value.hotPatch.vetoIgnoreChecks;
+          } catch { /* Unreadable settings retain the gate defaults. */ }
+        }
         let decisionReason, prEvidence, mergedAtSha = false;
         let age = now - loadedAt;
         let data, boundFailure, hotFailure, anyFailure, unload = false, requiredSucceeded = false, unloadReason, evidenceError, ciEvidenceError;
@@ -279,7 +293,7 @@ export async function urgentSweep(_input = {}, deps = createSweepDeps()) {
           data = await deps.checks(r);
           anyFailure = Array.isArray(data?.check_runs) && data.check_runs.some(c => failedCheck(c, r.sha));
           validateChecks(data, r.sha);
-          if (hotPatch) hotFailure = latestActionFailure(data, r.sha);
+          if (hotPatch) hotFailure = latestActionFailure(data, r.sha, vetoIgnoreChecks);
           // GitHub cannot run CI without a merge ref. Resume normal monitoring as soon as checks appear.
           if (!hotPatch && r.conflict && data.total_count === 0) {
             if (age >= 24 * 60 * 60 * 1000 && !conflictEscalated.has(id)) {
@@ -302,11 +316,11 @@ export async function urgentSweep(_input = {}, deps = createSweepDeps()) {
               if (!latestByCheck.has(key) || c.id > latestByCheck.get(key).id) latestByCheck.set(key, c);
             }
             const latestChecks = [...latestByCheck.values()];
-            anyFailure = latestChecks.some(c => failedCheck(c, r.sha));
+            anyFailure = latestChecks.some(c => failedCheck(c, r.sha) && !(hotPatch && hotPatchIgnoresCheck(c.name, vetoIgnoreChecks)));
             const required = await deps.required(r, data?.testWorkflowPath);
             if (!Array.isArray(required) || !required.includes('test') || required.some(n => typeof n !== 'string' || !n))
               throw new Error('unreadable required CI jobs');
-            if (hotPatch) hotPatchCiEvidence(data, r.sha, required, now);
+            if (hotPatch) hotPatchCiEvidence(data, r.sha, required, now, vetoIgnoreChecks);
             const checks = latestChecks.filter(c =>
               c?.app?.id === TEST_CHECK_APP_ID && c.head_sha === r.sha && typeof c.name === 'string'
               && Number.isSafeInteger(c.id) && Number.isSafeInteger(c.check_suite?.id)

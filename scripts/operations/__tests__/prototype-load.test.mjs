@@ -14,7 +14,7 @@ import { runInNewContext } from 'node:vm';
 import { withBareOrigin } from './helpers/real-repo.mjs';
 import { findingsHash } from '../ruled-weakened-store.mjs';
 import { recordWaivers } from '../ruled-weakened-record.mjs';
-import { createPrototypeLoader, defaultDeps } from '../prototype-load-io.mjs';
+import { createPrototypeLoader, defaultDeps, readHotPatchVetoPolicy } from '../prototype-load-io.mjs';
 import { netDiffFingerprint } from '../../lib/net-diff-fingerprint.mjs';
 import { resolveDaemonKey, changedPaths, comparePaths, nextMergeRef, prototypeLoadOperation, PROTOTYPE_LOAD_EFFECT } from '../prototype-load.mjs';
 import { urgentSignature } from '../urgent-verify-marker.mjs';
@@ -3706,6 +3706,41 @@ describe('hot-patch urgent admission (R1100)', () => {
     f.fs.readFileSync = (p, ...args) => p.includes('/coordination/') ? lockFs.readFileSync(redirect(p), ...args) : originalRead(p, ...args);
     return { ...f, gh, run: (input = {}) => f.run({ branch, urgent: true, reason: 'R1100 hot-patch PR #42', ...input }) };
   }
+  const vetoRun = (name, id, conclusion = 'failure') => ({ id, head_sha: SHA, name, status: 'completed', conclusion,
+    app: { id: 15368 }, check_suite: { id: 7 } });
+  const pendingTest = () => ({ ...vetoRun('test', 1), status: 'in_progress', conclusion: null });
+  it.each(['test', 'unknown-job', 'review-gatekeeper', 'prefix-review-gate'])('vetoes review-gate red plus failing %s at admission and final re-read', async name => {
+    for (const final of [false, true]) {
+      const rows = [pendingTest(), vetoRun('review-gate', 2)];
+      const failed = [...rows, vetoRun(name, 3)];
+      const f = hotFixture({ rows: final ? rows : failed, ...(final ? { finalRows: failed } : {}) });
+      expect(await f.run()).toMatchObject({ ok: false, registered: false,
+        detail: final ? 'hot-patch-admission-changed' : 'ci-failed-urgent' });
+      expect(mutations(f, 'add')).toHaveLength(0);
+    }
+  });
+  it.each(['review-gate', 'merge-gate', 'review-gate (matrix)', 'merge-gate (1)'])('admits with only %s red through the final re-read', async name => {
+    const f = hotFixture({ rows: [pendingTest(), vetoRun(name, 2)] });
+    expect(await f.run()).toMatchObject({ ok: true, registered: true });
+  });
+  it.each([undefined, null, [], 'review-gate', [null], ['']])('defaults an invalid or missing veto list: %j', async value => {
+    const f = hotFixture({ rows: [pendingTest(), vetoRun('review-gate', 2)], options: { settings: { hotPatch: { vetoIgnoreChecks: value } } } });
+    expect(await f.run()).toMatchObject({ ok: true });
+  });
+  it('defaults unreadable settings: ignores review-gate but still vetoes test-shard', async () => {
+    const policy = readHotPatchVetoPolicy({ fs: { readFileSync() { throw Error('unreadable'); } } });
+    expect(policy.value.hotPatch.vetoIgnoreChecks).toEqual(['review-gate', 'merge-gate']);
+    for (const failure of [false, true]) {
+      const rows = [pendingTest(), vetoRun('review-gate', 2), ...(failure ? [vetoRun('test-shard', 3)] : [])];
+      const f = hotFixture({ rows, options: { settings: policy.value } });
+      expect(await f.run()).toMatchObject({ ok: !failure, registered: !failure });
+    }
+  });
+  it('uses a configured veto ignore list with exact and matrix matching', async () => {
+    const f = hotFixture({ rows: [pendingTest(), vetoRun('custom-gate (1)', 2)],
+      options: { settings: { hotPatch: { vetoIgnoreChecks: ['custom-gate'] } } } });
+    expect(await f.run()).toMatchObject({ ok: true });
+  });
   it('refuses clean admission whose stackBases includes a hotpatch', async () => {
     const f = hotFixture({ options: { checkRaw: JSON.stringify({ check: { ok: true, clean: true,
       candSha: SHA, stackBases: [`hotpatch/${TREE}`] }, wouldRegister: true }) } });

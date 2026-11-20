@@ -56,6 +56,28 @@ const CHILD_PROCESS_NOTE = 'child processes may outlive the timeout; heavy-admis
 const WAIT_ADOPTION_CAP_MS = 160000;
 const COMBINED_TEST_DEFAULTS = Object.freeze({ waitMs: 600000, timeoutMs: 1200000, maxBuffer: 16 * 1024 * 1024 });
 
+export const DEFAULT_VETO_IGNORE_CHECKS = Object.freeze(['review-gate', 'merge-gate']);
+/** Shared by admission and urgent-sweep; malformed or unreadable configuration uses the gate defaults. */
+export function readHotPatchVetoPolicy({ fs = nodeFs, env = process.env, settings, platform } = {}) {
+  const standard = { hotPatch: { vetoIgnoreChecks: [...DEFAULT_VETO_IGNORE_CHECKS] } };
+  try {
+    const tool = settings ?? JSON.parse(fs.readFileSync(join(repo, 'scripts/settings/prototype-load.json'), 'utf8'));
+    platform ??= readPlatformPreferences({ env, readFile: (p, encoding) => fs.readFileSync(p, encoding) });
+    if (platform.errors.length) throw Error('unreadable platform settings');
+    const vetoLayer = layer => layer?.hotPatch && Object.hasOwn(layer.hotPatch, 'vetoIgnoreChecks')
+      ? { hotPatch: { vetoIgnoreChecks: layer.hotPatch.vetoIgnoreChecks } } : {};
+    const policy = resolveCascade({ standard, platform: vetoLayer(platform.prefs.prototypeLoad), tool: vetoLayer(tool) });
+    const names = policy.value.hotPatch?.vetoIgnoreChecks;
+    if (!Array.isArray(names) || !names.length || names.some(n => typeof n !== 'string' || !n.trim() || n !== n.trim()))
+      throw Error('invalid hotPatch.vetoIgnoreChecks');
+    return policy;
+  } catch {
+    return resolveCascade({ standard });
+  }
+}
+export const hotPatchIgnoresCheck = (name, names) => typeof name === 'string'
+  && names.some(n => name === n || name.startsWith(`${n} (`));
+
 /** Keep runner diagnostics safe for both terminal output and persisted evidence. */
 function sanitizeCombinedOutput(value, env, worktree, preserveLines = false) {
   let message = String(value).replace(ANSI_SEQUENCE, '').replace(/[\p{Cc}\p{Cf}]/gu, (char) => preserveLines && /[\t\n]/.test(char) ? char : '');
@@ -264,6 +286,8 @@ export function createPrototypeLoader({ exec, fs, now, sleep, env, settings, com
   const withoutMode = ({ canonicalAuditMode: ignored, ...layer } = {}) => layer;
   const policy = resolveCascade({ standard: { combinedTest: COMBINED_TEST_DEFAULTS },
     platform: withoutMode(platform.prefs.prototypeLoad), tool: withoutMode(tool) });
+  const vetoPolicy = readHotPatchVetoPolicy({ fs, env, settings: tool, platform });
+  const vetoIgnoreChecks = vetoPolicy.value.hotPatch.vetoIgnoreChecks;
   const config = { ...policy.value, ruledWeakened: loadRuledWeakened({
     platform: platform.prefs.prototypeLoad?.ruledWeakened, tool: tool.ruledWeakened, fs, env }) };
   // Explicit allowlist: no operator bypasses, credentials, git config injection or NODE_OPTIONS.
@@ -374,7 +398,8 @@ export function createPrototypeLoader({ exec, fs, now, sleep, env, settings, com
       stopReason: null, branch: input.branch, sha: input.sha, effectiveRef: input.branch, effectiveSha: input.sha,
       dryRun: !!input.dryRun, stale: [], staleTolerated: [], removed: [], removedTips: {}, why: input.why || '',
       retired: [], retireRefused: [], ...(input.replace ? { replace: input.replace } : {}),
-      settings: { sources: policy.sources, values: policy.value, log: formatCascadeSourcesLine('prototypeLoad', policy), errors: platform.errors } };
+      settings: { sources: policy.sources, values: policy.value, log: formatCascadeSourcesLine('prototypeLoad', policy), errors: platform.errors,
+        hotPatchVeto: { values: vetoPolicy.value, sources: vetoPolicy.sources, log: formatCascadeSourcesLine('prototypeLoad', vetoPolicy) } } };
     let stage = 'bad-input';
     let hotPatchReservation;
     let readinessStep = 'readiness-unreadable';
@@ -621,6 +646,7 @@ export function createPrototypeLoader({ exec, fs, now, sleep, env, settings, com
         // Any observed exact-SHA failure vetoes urgent loading, independently of suite selection or binding.
         urgentCiFailed = input.urgent && Array.isArray(data?.check_runs) && data.check_runs.some(r =>
           r?.head_sha === sha && r.status === 'completed'
+          && !(hotPatchMode && hotPatchIgnoresCheck(r.name, vetoIgnoreChecks))
           && ['failure', 'cancelled', 'timed_out', 'action_required', 'startup_failure'].includes(r.conclusion));
         if (urgentCiFailed) return noCi('ci-failed-urgent', 'Repair failed CI on this SHA and wait for passing CI.');
         // Oversized/incomplete evidence refuses; operator completes or repairs the reader.
