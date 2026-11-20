@@ -337,7 +337,7 @@ describe('audit regression: measure CLI report evidence', () => {
         expect(exit).toHaveBeenLastCalledWith(valid ? 0 : 1);
         expect(output.recorded).toEqual(recorded);
         expect(recorded.hadReport).toBe(valid);
-        const escapes = flag === '1' && report.includes('escaped.test.mjs') && !(selected ?? '').includes('escaped.test.mjs');
+        const escapes = flag === '1' && (report ?? '').includes('escaped.test.mjs') && !(selected ?? '').includes('escaped.test.mjs');
         if (!valid) {
           expect(recorded).toMatchObject({ falseGreen: null, status: 'report-invalid', failedCount: null, escaped: null });
           expect(output.falseGreen).toMatchObject({ falseGreen: null, failedCount: null, escaped: null });
