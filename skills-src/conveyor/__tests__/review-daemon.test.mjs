@@ -807,6 +807,67 @@ describe('runReviewTick — #3383 bug 3: dispatch is capped by acquirableLanes, 
   const owedPlan = (entries, refusals = []) => ({ dispatch: entries, refusals });
   const reviewsPlan = (n) => owedPlan(Array.from({ length: n }, (_, i) => ({ kind: 'review', prNumber: 100 + i, attempts: 0 })));
 
+  describe('red team keeps reserved review slots', () => {
+    const budgetFor = async (options = {}) => {
+      const { liveReviewRoundBudget } = await import('../review-daemon.mjs');
+      return liveReviewRoundBudget({ env: {}, listCommands: () => '',
+        readFile: () => JSON.stringify({ maxLiveReviewRounds: 12 }),
+        readOverrides: () => ({ readable: true, values: {} }), queueSize: 12, ...options });
+    };
+    const tick = budget => runReviewTick({ reconcile: () => reviewsPlan(12), liveReviewBudget: budget,
+      dispatch: ({ pr }) => ({ agentId: `agent-${pr}` }),
+      readPrs: () => Array.from({ length: 12 }, (_, i) => ({ number: 100 + i, labels: ['review:pending'] })),
+      readAgents: () => [], hostAdmission: () => ({ admitted: true, maxPerTick: 40 }),
+      acquirableLanes: () => 40, holdReconcile: () => [], tagRound: () => {}, tagStatus: () => {}, statusCandidates: () => [] });
+
+    it.each([12, 8, 4, 3, 0])('ordinary reviews stop at the reserve with %i raw slots left', async left => {
+      const { redTeamQueueAdmitCount } = await import('../../../scripts/lib/red-team-dispatch-queue.mjs');
+      const budget = await budgetFor();
+      budget.left = left;
+      const out = tick(budget);
+      expect(out.dispatched).toHaveLength(Math.max(0, left - 4));
+      expect(budget.left).toBe(Math.min(left, 4));
+      expect(redTeamQueueAdmitCount({ lanes: 40, remainingStarts: 40, budget })).toBe(Math.min(left, 4));
+      expect(out.pendingNotDispatched[0].reasons.join(' ')).toContain(`live review rounds ${12 - Math.min(left, 4)} of maxLiveReviewRounds=12`);
+      expect(out.pendingNotDispatched[0].reasons.join(' ')).toContain('red-team reserve 4');
+    });
+
+    it.each([0, 1, 8, 99, 'x', -1, 1.5, undefined])('bounds operator reserve %j with default 4', async value => {
+      const budget = await budgetFor({ readOverrides: () => ({ readable: true,
+        values: { 'redTeam.queue.reservedSlots': value } }) });
+      const reserve = Number.isInteger(value) && value >= 0 && value <= 8 ? value : 4;
+      expect(budget).toMatchObject({ reserve, max: 12, left: 12 });
+      expect(tick(budget).dispatched).toHaveLength(12 - reserve);
+      if (!reserve) expect(budget.reason).not.toContain('red-team reserve');
+    });
+
+    it.each([
+      ['unreadable', () => ({ readable: false, values: { 'redTeam.queue.reservedSlots': 0 } })],
+      ['throws', () => { throw Error('unreadable'); }],
+    ])('defaults to 4 when operator store %s', async (_name, readOverrides) => {
+      expect(await budgetFor({ readOverrides })).toMatchObject({ reserve: 4 });
+    });
+
+    it.each([0, undefined, -1, 1.5, '12'])('lends all slots to reviews with empty or unknown queue %j', async queueSize => {
+      const budget = await budgetFor({ queueSize });
+      expect(budget.reserve).toBe(0);
+      expect(budget.reason).not.toContain('red-team reserve');
+      expect(tick(budget).dispatched).toHaveLength(12);
+      expect(budget.left).toBe(0);
+    });
+
+    it.each([[2, 12, 2], [20, 3, 3]])('clamps reserve to queue %i and max %i', async (queueSize, max, reserve) => {
+      const budget = await budgetFor({ queueSize, readFile: () => JSON.stringify({ maxLiveReviewRounds: max }) });
+      expect(budget.reserve).toBe(reserve);
+    });
+
+    it('keeps unknown process evidence closed with the existing early-return shape', async () => {
+      const budget = await budgetFor({ listCommands: () => { throw Error('ps unavailable'); } });
+      expect(budget).toEqual({ left: 0, reason: expect.stringContaining('live review rounds unknown') });
+      expect(tick(budget).dispatched).toHaveLength(0);
+    });
+  });
+
   it('defaults to unbounded (Infinity) when acquirableLanes is omitted — every pre-existing caller is unaffected', () => {
     const dispatch = vi.fn(({ pr }) => ({ agentId: `agent-${pr}` }));
     const out = runReviewTick({ reconcile: () => reviewsPlan(5), dispatch, tagRound: () => {}, tagStatus: () => {}, statusCandidates: () => [] });
