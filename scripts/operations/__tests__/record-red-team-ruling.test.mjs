@@ -2307,10 +2307,32 @@ describe('block and not-real rulings', () => {
 describe('R671 v1 acting judge red-team blocks', () => {
   const attribution = 'Ruled by acting judge (R10), not the operator';
   const identity = { login: 'web-everything', type: 'Bot' };
-  const judgeRead = (over = {}) => read({ identity,
+  const coverageFinding = { summary: 'coverage gap', category: 'edge-case', impactIfUnfixed: 'broken',
+    file: 'backlog/x.md', line: 24, confirmedByRecheck: true, findingClass: 'coverage-or-style', classBasis: 'missing coverage' };
+  const judgeRead = (over = {}) => read({ identity, comments: [redTeam(HEAD, [coverageFinding]), capped()], scope: { value: { anyState: true } },
     judgeActorPolicy: { value: { enabled: true, actor: 'judge:r10' } }, ...over });
   const judgeInput = (ruling = 'block', over = {}) => input({ actor: 'judge:r10', ruling, card: undefined, ...over });
   const preExisting = { mainSha: 'a'.repeat(40), probe: 'node probe.mjs', mainResult: 'null', prResult: 'null' };
+  it.each([
+    ['fix-now', { findingClass: 'live-reproduced' }, {}],
+    ['unclassified', { findingClass: undefined }, {}],
+    ['unknown class', { findingClass: 'unknown' }, {}],
+    ['missing basis', { classBasis: undefined }, {}],
+    ['reachable security', { securityReachableToday: true }, {}],
+    ['security class even when policy defers it', { findingClass: 'security-reachable-today' },
+      { 'security-reachable-today': 'defer-card', allowSecurityDefer: true }],
+    ['retained fix-now class', { alsoClasses: ['live-reproduced'] }, {}],
+    ['coverage class overridden to fix-now', {}, { 'coverage-or-style': 'fix-now' }],
+  ])('judge card refuses %s in any selected finding; operator cards remain allowed', (_name, fields, findingClassPolicy) => {
+    const comments = [redTeam(HEAD, [coverageFinding, { ...coverageFinding, ...fields, line: 25 }]), capped()];
+    const context = judgeRead({ comments, findingClassPolicy, isMainAncestor: () => true });
+    for (const card of [CARD, undefined]) {
+      const request = judgeInput('card', { card, break: '1,2', preExisting });
+      expect(() => planRedTeamRuling(context, request))
+        .toThrow('judge card refuses a fix-now or security break; only coverage-class findings can be carded');
+    }
+    expect(planRedTeamRuling(read({ comments, findingClassPolicy, scope: { value: { anyState: true } } }), input({ break: '1,2' })).indices).toEqual([1, 2]);
+  });
   it('judge card preserves pre-existing evidence in the plan and durable reason; refuses missing evidence and non-ancestors', () => {
     const context = judgeRead({ isMainAncestor: sha => sha === preExisting.mainSha });
     const request = judgeInput('card', { card: CARD, preExisting: JSON.stringify(preExisting) });
@@ -2355,9 +2377,9 @@ describe('R671 v1 acting judge red-team blocks', () => {
   });
   const liveJudgeRead = runGit => createRecordRedTeamRulingReader({
     runGit, assertFresh: () => {}, log: () => {},
-    readThread: () => ({ headRefOid: HEAD, comments: thread(), labels: [{ name: 'review:human' }] }),
+    readThread: () => ({ headRefOid: HEAD, comments: [redTeam(HEAD, [coverageFinding]), capped()], labels: [{ name: 'review:human' }] }),
     readSetting: () => ({ value: CONFIRMED_BREAKS_DEFAULTS }),
-    readScope: () => ({ value: { anyState: false }, sources: {} }),
+    readScope: () => ({ value: { anyState: true }, sources: {} }),
     readStandingRulingScope: () => null, resolveIdentity: () => identity, resolveCard: () => card,
   })({ repo, pr: PR, actor: 'judge:r10', card: CARD });
   it('rejects matching historical evidence when current main subsequently fixed the defect, at planning and effect time', () => {

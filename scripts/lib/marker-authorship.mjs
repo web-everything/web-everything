@@ -223,8 +223,8 @@ export function assertJudgeAuthority(read, input) {
     if (!evidence || typeof evidence !== 'object' || Array.isArray(evidence)
       || typeof evidence.mainSha !== 'string' || !/^[0-9a-f]{40}$/i.test(evidence.mainSha)
       || typeof evidence.probe !== 'string' || !evidence.probe.trim()
-      || [evidence.mainResult, evidence.prResult].some(value => value == null || !String(value).trim())
-      || String(evidence.mainResult) !== String(evidence.prResult))
+      || [evidence.mainResult, evidence.prResult].some(value => typeof value !== 'string' || !value.trim())
+      || evidence.mainResult !== evidence.prResult)
       throw new Error('pre-existing evidence is incomplete or inconsistent; ask the operator');
     // The IO verifier also binds this SHA to the current authoritative main tip, not a historical ancestor.
     if (typeof read.isMainAncestor !== 'function') throw new Error('mainSha ancestor of origin/main cannot be verified');

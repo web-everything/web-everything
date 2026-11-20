@@ -153,6 +153,20 @@ describe('judge may card a pre-existing break with evidence (judge path v2)', as
   it('refuses when main and PR results differ', () => {
     expect(() => assertJudgeAuthority(read(), card({ preExisting: { ...evidence, prResult: 'key' } }))).toThrow(/pre-existing/);
   });
+  it.each([
+    ['objects', { main: true }, { pr: true }],
+    ['arrays', ['same'], ['same']],
+    ['numbers', 42, 42],
+    ['mixed types', 42, '42'],
+    ['empty strings', '', ''],
+    ['whitespace', ' ', ' '],
+    ['missing main', undefined, 'null'],
+    ['null PR', 'null', null],
+    ['different whitespace', 'null', ' null '],
+  ])('refuses non-string, blank, or non-identical results: %s', (_name, mainResult, prResult) => {
+    expect(() => assertJudgeAuthority(read(), card({ preExisting: { ...evidence, mainResult, prResult } })))
+      .toThrow(/pre-existing/);
+  });
   it('refuses incomplete evidence', () => {
     expect(() => assertJudgeAuthority(read(), card({ preExisting: { ...evidence, probe: '' } }))).toThrow(/pre-existing/);
   });

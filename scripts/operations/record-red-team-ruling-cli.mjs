@@ -10,7 +10,9 @@
  *     node scripts/operations/record-red-team-ruling-cli.mjs --pr=<n> --repo=<o/r> --break=<#n|file:line> \
  *       --ruling=card --card=<we:backlog/ref.md> --actor=<login> --channel='<where>' --reason='<operator words>' [--preview]
  */
-import { delimiter, resolve } from 'node:path';
+import * as realFs from 'node:fs';
+import { homedir as realHomedir } from 'node:os';
+import { delimiter, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { createRegistry } from './registry.mjs';
 import { createFileRunStore, createMemoryRunStore, newRunId } from './run-store.mjs';
@@ -19,8 +21,25 @@ import { runOperationCli, buildCliSpec, parseOperationArgv } from './cli-adapter
 import { writeAllSync } from '../lib/write-all-sync.mjs';
 import { recordRedTeamRulingEntry } from './record-red-team-ruling-io.mjs';
 
-export function assertJudgeShimOnPath(env, actor) {
-  if (actor === 'judge:r10' && !String(env.PATH ?? '').split(delimiter).some(path => path.includes('gh-shim.d'))) {
+export function assertJudgeShimOnPath(env, actor, { homedir = realHomedir, fs = realFs } = {}) {
+  if (actor !== 'judge:r10') return;
+  let valid = false;
+  try {
+    const root = fs.realpathSync(join(homedir(), '.claude/github-app-token/gh-shim.d'));
+    valid = String(env.PATH ?? '').split(delimiter).some(component => {
+      if (!component) return false;
+      try {
+        const path = fs.realpathSync(component);
+        const rel = relative(root, path);
+        if (!rel || rel === '..' || rel.startsWith(`..${sep}`) || isAbsolute(rel) || !fs.statSync(path).isDirectory()) return false;
+        const gh = join(path, 'gh');
+        if (!fs.statSync(gh).isFile()) return false;
+        fs.accessSync(gh, fs.constants.X_OK);
+        return true;
+      } catch { return false; }
+    });
+  } catch { /* Unreadable shim evidence fails closed. */ }
+  if (!valid) {
     throw new Error('App gh shim (gh-shim.d) must be on PATH for judge:r10; prepend ~/.claude/github-app-token/gh-shim.d/<id>');
   }
 }
