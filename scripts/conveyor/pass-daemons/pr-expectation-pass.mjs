@@ -21,6 +21,9 @@ import { ghRepoSlug, DEFAULT_REPO_KEY } from '../../lib/constellation-repos.mjs'
 import { daemonEventsPath, appendDaemonEvent } from '../../lib/daemon-events.mjs';
 import { readSettingsChecked } from '../../lib/settings-files.mjs';
 import { readPlatformPreferences } from '../../lib/policy-cascade.mjs';
+// Load shared readers at startup, outside the first pass's execution deadline.
+import { ghJson } from '../../operations/coroner-pr-postmortem.mjs';
+import { listOpenPrs } from './pr-postmortem-pass.mjs';
 import { resolveExpectationSettings, deriveActions, evaluateExpectations, missKey,
   validSha, validObservation } from './pr-expectations.mjs';
 
@@ -214,11 +217,9 @@ export async function runExpectationPass({ repo = ghRepoSlug(DEFAULT_REPO_KEY), 
       try { evidence = json(evidenceFile); if (!object(evidence?.prs)) throw Error('unknown fixture'); }
       catch { fail(); evidence = { prs: {} }; }
     } else {
-      const { ghJson } = await import('../../operations/coroner-pr-postmortem.mjs');
       gh ??= ghJson;
       let calls = 0;
       read = args => { if (++calls > 128) throw Error('tick budget; operator inspection required'); return gh(args); };
-      const { listOpenPrs } = await import('./pr-postmortem-pass.mjs');
       const listed = pr ? [{ number: pr }] : listOpenPrs(repo, { gh: read });
       const numbers = [...new Set([...listed.map(p => p.number), ...Object.keys(state.prs).map(Number)])]
         .filter(n => !pr || n === pr).sort((a, b) => a - b);

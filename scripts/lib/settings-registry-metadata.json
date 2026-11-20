@@ -1,6 +1,18 @@
 {
   "$comment": "Add metadata for every non-$comment top-level declared key and CAPACITY_LEAVES key. Descriptions live only here (max 160 characters). owner is the primary declaring file; the generator lists every declaring file. Record capacity aliases under leaves ($ means the scalar itself). Arrays count as one leaf. toSettle preserves pass-table values; pass C instant means its env-only column indicates an override, not proof of live reload. Pass A was an unquantified baseline inventory of declared settings, platform files, capacity leaves, operator prefs keys and env vars; numeric discovery evidence starts at B. R1076: behavior belongs in product settings; this inventory does not convert constants.",
   "settings": {
+    "expectations": {
+      "description": "Observe-only PR expectation triggers, deadlines and proposed responses; responses are recorded but never executed.",
+      "owner": "scripts/settings/expectations.json",
+      "changeVia": "pr",
+      "instant": false
+    },
+    "mode": {
+      "description": "Expectation babysitter mode: off or observe. WE_EXPECTATIONS_MODE overrides the repository default.",
+      "owner": "scripts/settings/expectations.json",
+      "changeVia": "env",
+      "instant": false
+    },
     "heavyAdmissionCap": {
       "description": "Maximum concurrent heavy commands admitted on the host.",
       "owner": "scripts/dispatch-settings.json",
