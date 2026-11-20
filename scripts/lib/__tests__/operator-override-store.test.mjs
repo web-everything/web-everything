@@ -114,7 +114,9 @@ describe('capacity-only operator store', () => {
   });
   it.each(ranges)('%s declares a safe direction and finite fail-closed fallback', key => {
     const leaf = store.CAPACITY_LEAVES[key];
-    expect(leaf.direction).toBe(key.endsWith('raiseMinMemFreePct') || key.endsWith('builderFloor') || key.endsWith('.reserve') ? 'threshold' : 'cap');
+    // Pool reserves protect a minimum; ciHeal.reserve caps extra healer slots.
+    const poolReserve = key.startsWith('resourcePool.class.') && key.endsWith('.reserve');
+    expect(leaf.direction).toBe(key === 'resourceGate.fixCap.raiseMinMemFreePct' || key === 'resourcePool.builderFloor' || poolReserve ? 'threshold' : 'cap');
     expect(Number.isFinite(leaf.failClosedFallback)).toBe(true);
     expect(leaf.validate(leaf.failClosedFallback)).toBe(true);
     if (key === 'reviewConcurrency.maxLiveReviewRounds') expect(leaf.failClosedFallback).toBe(3);
