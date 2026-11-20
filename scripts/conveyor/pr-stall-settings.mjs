@@ -12,7 +12,7 @@ export const STALL_SWEEP_DIR_ENV = 'WE_PR_STALL_SWEEP_DIR';
 /** The standard values; the classifier's policies are leaves of the same block, checked by its validators. */
 export const STALL_SWEEP_DEFAULTS = Object.freeze({ mode: 'off', intervalMinutes: 15, maxActionsPerSweep: 3, maxActionsPerHour: 6,
   maxActionsPerPrHead: 1, digest: true, actionModes: Object.freeze({ 'restart-red-team': 'shadow' }), ...CLASSIFY_DEFAULTS });
-const SCALARS = ['mode', 'digest', 'intervalMinutes', 'maxActionsPerSweep', 'maxActionsPerHour', 'maxActionsPerPrHead', 'maxRedTeamRestartsPerHead', 'staleHoldAutoResume', 'grantCeiling', 'maxFixListLines'];
+const SCALARS = ['mode', 'digest', 'intervalMinutes', 'maxActionsPerSweep', 'maxActionsPerHour', 'maxActionsPerPrHead', 'maxRedTeamRestartsPerHead', 'staleHoldAutoResume', 'grantCeiling', 'maxFixListLines', 'findingsPendingMinutes'];
 const SETTINGS_FILE = join(ROOT, 'scripts/settings/pr-stall-sweep.json');
 const envName = (k) => `WE_PR_STALL_SWEEP_${k.replace(/[A-Z]/g, (c) => `_${c}`).toUpperCase()}`;
 const msg = (e) => String(e?.message ?? e).split('\n')[0].slice(0, 200);
