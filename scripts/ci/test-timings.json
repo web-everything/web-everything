@@ -1385,6 +1385,7 @@
   "scripts/lib/__tests__/ruling-ledger.test.mjs": 0.35,
   "scripts/lib/__tests__/run-abandoned.test.mjs": 0.06,
   "scripts/lib/__tests__/run-cli-batch.test.mjs": 1.24,
+  "scripts/lib/__tests__/runtime-admission.test.mjs": 0.04,
   "scripts/lib/__tests__/rust-scan-bridge.test.mjs": 0.24,
   "scripts/lib/__tests__/salvage-index.test.mjs": 5.09,
   "scripts/lib/__tests__/same-gap-judge.test.mjs": 0.05,
@@ -2009,6 +2010,7 @@
   "wrapper-conformance/__tests__/runner.test.ts": 0.01
  },
  "soak": {
+  "scripts/conveyor/soak/breaks/runtime-admission-infra-retention.soak.test.mjs": 0.1,
   "scripts/conveyor/soak/breaks/forge-manifest-untracked-shipped.soak.test.mjs": 0.3,
   "scripts/conveyor/soak/breaks/catch-up-clean-first-snapshot-first.soak.test.mjs": 4.65,
   "scripts/conveyor/soak/breaks/rebuild-job-ready-candidate-starvation.soak.test.mjs": 2,
