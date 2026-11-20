@@ -1,4 +1,5 @@
 import { defineConfig } from 'vitest/config';
+import { integrationFilesForGroup } from './scripts/ci/integration-groups.mjs';
 import { hermeticGitEnv, maxTestWorkers, weAlias } from './vitest.shared';
 import { liveSuiteFiles, loadHermeticSettings } from './scripts/lib/hermetic-tests.mjs';
 
@@ -61,7 +62,7 @@ export default defineConfig({
     // Real env (no sandbox strip) but hermetic (card xcu4cqf): real git and real subprocesses, never live GitHub,
     // remote refs of the real checkout, or real host state.
     env: { WE_TEST_SANDBOX: '0', WE_TEST_HERMETIC: '1', ...hermeticGitEnv() },
-    include: [
+    include: integrationFilesForGroup([
       'scripts/__tests__/stdout-flush.test.mjs',
       'scripts/__tests__/rust-scan-stdout-flush-parity.test.mjs',
       'scripts/__tests__/rust-scan-secret-scrub-parity.test.mjs',
@@ -149,7 +150,7 @@ export default defineConfig({
       'scripts/conveyor/__tests__/sim-world-git.test.mjs',
       'scripts/conveyor/__tests__/sim-scenario-approved-conflict-grace.test.mjs',
       'scripts/conveyor/__tests__/sim-scenario-lane-starvation.test.mjs',
-    ].filter((f) => !LIVE_SUITE.has(f)),
+    ].filter((f) => !LIVE_SUITE.has(f)), process.env.WE_INTEGRATION_GROUP),
     poolMatchGlobs: [
       ['scripts/__tests__/stdout-flush.test.mjs', 'forks'],
       // These parity checks scan the real repository (and build/run the Rust scanner). Separate Vitest pools

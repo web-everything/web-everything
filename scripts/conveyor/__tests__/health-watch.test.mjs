@@ -1153,6 +1153,9 @@ describe('round 3: probe-error scrub and active-card silences', () => {
 // ── review-seat-cap-near-limit (card xn2wf9t) — the per-provider daily-cap warning, record-only by design ──────
 
 describe('tick() — review-seat-cap-near-limit: reads the scorecard store, opens record-only (never notifies)', () => {
+  // Pin the historical 65/80 incident independently of the current settings defaults.
+  beforeEach(() => { vi.stubEnv('WE_REVIEW_SEAT_CAP_CODEX', '80'); });
+  afterEach(() => { vi.unstubAllEnvs(); });
   const base = () => {
     const lockRoot = join(dir, 'locks-seatcap'); mkdirSync(lockRoot, { recursive: true });
     const syncDir = join(dir, 'sync-seatcap'); mkdirSync(syncDir, { recursive: true });
@@ -1175,7 +1178,7 @@ describe('tick() — review-seat-cap-near-limit: reads the scorecard store, open
 
   it('a provider near its own cap opens ONE episode, names it, and stays suppressed (shadow, never notify)', async () => {
     const stateRoot = join(dir, 'state-seatcap-hot');
-    // 65/80 (the default codex cap) = 81.25% — over the 80% warn line.
+    // 65/80 (the pinned historical codex cap) = 81.25% — over the 80% warn line.
     const codexRows = Array.from({ length: 65 }, (_, i) => seatRow('codex', `c${i}`));
     const flags = {
       ...base(), 'state-root': stateRoot, 'logs-dir': join(dir, 'logs-seatcap-hot'),

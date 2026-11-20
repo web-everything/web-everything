@@ -13,8 +13,10 @@
  *       only a list stamped `mode: quarantine` skips anything. Unreadable list / `stop` / no stamp ⇒ prints nothing to
  *       skip (CI runs everything — the safe direction). The main-fix PR / main always skip nothing: the fix PRs the
  *       list publishes always count, `--fix-prs` only adds to them.
- *   node scripts/lib/red-main-quarantine-io.mjs add --actor=<red-main-safety-net|operator> --broken-sha=<sha>
+ *   node scripts/lib/red-main-quarantine-io.mjs add --actor=<red-main-safety-net|operator|orchestrator> --broken-sha=<sha>
  *       --owner=<who> --reason=<why> --tests=<id,id> [--job=<CI job>] [--area=<dir/>] [--ttl-min=<n>]
+ *       orchestrator requires orchestrator.authority.redMainQuarantine=true (also for remove/prune).
+ *   node scripts/lib/red-main-quarantine-io.mjs remove --actor=<..> --tests=<id,id>
  *   node scripts/lib/red-main-quarantine-io.mjs prune --actor=<..> --main-green=<true|false|unknown>
  *   node scripts/lib/red-main-quarantine-io.mjs show
  */
@@ -25,6 +27,7 @@ import { dirname, join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { fileURLToPath } from 'node:url';
 import { readFromTransportBranch, stageOnTransportBranch, assertPushRef } from './git-transport-branch.mjs';
+import { resolveOrchestratorAuthority } from './orchestrator-authority-settings.mjs';
 import { cascadePolicy } from './policy-cascade.mjs';
 import { writeJsonAtomic } from './atomic-json-file.mjs';
 import { execFileSyncThrottled } from './gh-throttle.mjs';
@@ -33,7 +36,7 @@ import { resolveRedMainMode, RED_MAIN_HOLD_SETTINGS_FILE } from './red-main-hold
 import { mainRedState } from '../conveyor/main-ci-red-core.mjs';
 import {
   QUARANTINE_BRANCH, QUARANTINE_REF, QUARANTINE_LIST_PATH, QUARANTINE_EVENTS_PATH,
-  validateQuarantineList, addEntries, pruneOnGreen, testsToSkip, canWriteQuarantine, vitestExcludeArgs,
+  validateQuarantineList, addEntries, removeEntries, pruneOnGreen, testsToSkip, canWriteQuarantine, quarantineWriterError, vitestExcludeArgs,
   setFixPrs, setMode, activeEntries, parseVitestFailures, planSafetyNet, QUARANTINE_SAFETY_NET_DEFAULTS, REPEAT_RUN_LIMIT,
 } from './red-main-quarantine.mjs';
 
@@ -59,8 +62,9 @@ export function readQuarantine({ board = process.cwd(), run = gitRead } = {}) {
 }
 
 /** Apply one change (computed against the freshly fetched tip inside the transport) and push it. */
-export function writeQuarantineChange({ board = process.cwd(), actor, change, message, run = git, ...seams }) {
-  if (!canWriteQuarantine(actor)) throw new Error(`red-main-quarantine: writer "${actor}" refused`);
+export function writeQuarantineChange({ board = process.cwd(), actor, change, message, run = git, env, platform, tool, ...seams }) {
+  const orchestratorAuthority = resolveOrchestratorAuthority({ env, platform, tool }).redMainQuarantine;
+  if (!canWriteQuarantine(actor, { orchestratorAuthority })) throw new Error(`red-main-quarantine: ${quarantineWriterError(actor)}`);
   assertPushRef(QUARANTINE_BRANCH, QUARANTINE_REF); // the ONE ref; nothing else is ever pushed
   let events = [];
   let refused = null;
@@ -68,7 +72,7 @@ export function writeQuarantineChange({ board = process.cwd(), actor, change, me
     path: QUARANTINE_LIST_PATH,
     content: ({ existing }) => {
       const cur = existing ? JSON.parse(existing) : { version: 1, entries: [] };
-      const r = change(cur);
+      const r = change(cur, { orchestratorAuthority });
       if (!r.ok && r.ok !== undefined) { refused = r.error; return existing ?? JSON.stringify(cur, null, 2) + '\n'; }
       events = r.events;
       return JSON.stringify(r.list, null, 2) + '\n';
@@ -631,18 +635,33 @@ export function skipForList(r, { now, prNumber = null, fixPrs = [], onMain = fal
  * CLI path (the `--dir` pass-through, the skip on a refused write, the `rerun` field in the output) has a test.
  * @returns {object} the object the CLI prints as JSON
  */
-export function runAddCommand(f, { now = Date.now(), write = writeQuarantineChange, rerun = rerunRedMainFailedJobs } = {}) {
+export function runAddCommand(f, { now = Date.now(), write = writeQuarantineChange, rerun = rerunRedMainFailedJobs, env, platform, tool } = {}) {
+  const orchestratorAuthority = resolveOrchestratorAuthority({ env, platform, tool }).redMainQuarantine;
+  if (!canWriteQuarantine(f.actor, { orchestratorAuthority })) throw new Error(quarantineWriterError(f.actor));
   const tests = String(f.tests ?? '').split(',').filter(Boolean);
   const ttlMs = f['ttl-min'] ? Number(f['ttl-min']) * 60_000 : undefined;
   // One spelling end to end: the list validator is lowercase-only and git/GitHub shas are lowercase, so an uppercase
   // --broken-sha is normalized here, before it reaches either the list write or the run match.
   const brokenSha = typeof f['broken-sha'] === 'string' ? f['broken-sha'].toLowerCase() : f['broken-sha'];
   const out = write({
-    actor: f.actor, message: `quarantine: add ${tests.join(', ')} (broken ${String(brokenSha).slice(0, 9)}, by ${f.actor})`,
-    change: (cur) => addEntries(cur, { tests, brokenSha, owner: f.owner, reason: f.reason, actor: f.actor, now, ...(ttlMs ? { ttlMs } : {}), area: f.area ?? null, job: f.job }),
+    env, platform, tool, actor: f.actor, message: `quarantine: add ${tests.join(', ')} (broken ${String(brokenSha).slice(0, 9)}, by ${f.actor})`,
+    change: (cur) => addEntries(cur, { tests, brokenSha, owner: f.owner, reason: f.reason, actor: f.actor, orchestratorAuthority, now, ...(ttlMs ? { ttlMs } : {}), area: f.area ?? null, job: f.job }),
   });
   const result = out?.ok === false ? undefined : rerun({ brokenSha, ...(f.dir ? { dir: f.dir } : {}) });
   return result ? { ...out, rerun: result } : out;
+}
+
+/** Shared CLI removal/prune wiring, with the same authority resolution as add. */
+export function runRemovalCommand(f, { prune = false, now = Date.now(), write = writeQuarantineChange, env, platform, tool } = {}) {
+  const orchestratorAuthority = resolveOrchestratorAuthority({ env, platform, tool }).redMainQuarantine;
+  if (!canWriteQuarantine(f.actor, { orchestratorAuthority })) throw new Error(quarantineWriterError(f.actor));
+  const mainGreen = f['main-green'] === 'true' ? true : f['main-green'] === 'false' ? false : null;
+  const tests = String(f.tests ?? '').split(',').filter(Boolean);
+  return write({ env, platform, tool, actor: f.actor,
+    message: `quarantine: ${prune ? `prune (main green: ${mainGreen})` : `remove ${tests.join(', ')}`} (by ${f.actor})`,
+    change: cur => prune ? pruneOnGreen(cur, { mainGreen, now, actor: f.actor, orchestratorAuthority })
+      : removeEntries(cur, { tests, now, actor: f.actor, orchestratorAuthority }),
+  });
 }
 
 function cli(argv) {
@@ -666,13 +685,12 @@ function cli(argv) {
     writeAllSync(1, JSON.stringify(runAddCommand(f, { now })) + '\n');
     return;
   }
-  if (cmd === 'prune') {
-    const mg = f['main-green'] === 'true' ? true : f['main-green'] === 'false' ? false : null;
-    const out = writeQuarantineChange({ actor: f.actor, message: `quarantine: prune (main green: ${mg})`, change: (cur) => pruneOnGreen(cur, { mainGreen: mg, now, actor: f.actor }) });
+  if (cmd === 'prune' || cmd === 'remove') {
+    const out = runRemovalCommand(f, { now, prune: cmd === 'prune' });
     writeAllSync(1, JSON.stringify(out) + '\n');
     return;
   }
-  process.stderr.write('usage: red-main-quarantine-io.mjs <skip|show|add|prune> [--flags]\n');
+  process.stderr.write('usage: red-main-quarantine-io.mjs <skip|show|add|remove|prune> [--flags]\n');
   process.exit(2);
 }
 

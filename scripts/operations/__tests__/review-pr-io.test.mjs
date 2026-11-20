@@ -4439,11 +4439,33 @@ describe('strict accept publish wait ignores verdict-dependent required checks',
     expect(f.runNode).not.toHaveBeenCalled();
   });
   it.each([
-    ['failed', { name: 'review-gate', status: 'completed', conclusion: 'failure', head_sha: head }],
     ['on another head', { name: 'review-gate', status: 'completed', conclusion: 'success', head_sha: 'e'.repeat(40) }],
     ['malformed', { name: 'review-gate', head_sha: head }],
-  ])('still holds when review-gate is %s (only missing/pending are exempt)', async (_label, row) => {
+  ])('still holds when review-gate is %s', async (_label, row) => {
     const f = await run([ok('test'), row], { requiredChecks: withReviewGate });
+    await expect(f.publish()).rejects.toMatchObject({ notApplied: true, message: 'review held: CI still pending on reviewed head' });
+    expect(f.runNode).not.toHaveBeenCalled();
+  });
+  // Derived gates stay red until this very review lands, so a FAILED derived gate cannot hold the label.
+  const failed = name => ({ name, status: 'completed', conclusion: 'failure', head_sha: head });
+  it('publishes when review-gate and an annotated merge-gate are red and all real checks are green', async () => {
+    const checks = [ok('test'), failed('review-gate'), { ...failed('merge-gate'), mergeGateReviewHold: { holds: ['review-hold-labels'] } }];
+    const f = await run(checks, { requiredChecks: ['test', 'review-gate', 'merge-gate'] });
+    await expect(f.publish()).resolves.toEqual({ ok: true });
+    expect(f.runNode).toHaveBeenCalledTimes(1);
+  });
+  it.each(['cancelled', 'timed_out', 'action_required'])('still holds when review-gate ended %s', async conclusion => {
+    const f = await run([ok('test'), { ...failed('review-gate'), conclusion }], { requiredChecks: withReviewGate });
+    await expect(f.publish()).rejects.toMatchObject({ notApplied: true, message: 'review held: CI still pending on reviewed head' });
+    expect(f.runNode).not.toHaveBeenCalled();
+  });
+  it('still holds when merge-gate is red without the review-hold annotation', async () => {
+    const f = await run([ok('test'), failed('review-gate'), failed('merge-gate')], { requiredChecks: ['test', 'review-gate', 'merge-gate'] });
+    await expect(f.publish()).rejects.toMatchObject({ notApplied: true, message: 'review held: CI still pending on reviewed head' });
+    expect(f.runNode).not.toHaveBeenCalled();
+  });
+  it('still holds when a real check is red beside a red review-gate', async () => {
+    const f = await run([failed('test'), failed('review-gate')], { requiredChecks: withReviewGate });
     await expect(f.publish()).rejects.toMatchObject({ notApplied: true, message: 'review held: CI still pending on reviewed head' });
     expect(f.runNode).not.toHaveBeenCalled();
   });

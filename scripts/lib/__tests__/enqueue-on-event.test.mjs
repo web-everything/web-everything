@@ -14,6 +14,7 @@ import {
   CATCH_UP_QUERY, ENQUEUE_ON_EVENT_DEFAULTS, readPendingChangePaths, readCatchUpCandidates, readyAtQuery, planCatchUp,
   fastDrainArgs, summarizeFastDrain, resolveEnqueueOnEventSetting, createEnqueueOnEvent, wakeWorthy,
 } from '../enqueue-on-event.mjs';
+import { readFastDrainRoundSnapshot, readFastDrainRoundListing } from '../fast-drain-scope.mjs';
 import * as enqueueModule from '../enqueue-on-event.mjs';
 import { overlayFilePath, WE_DAEMON_OVERLAY_DIR_ENV } from '../daemon-overlays.mjs';
 import { WE_DAEMON_STATE_DIR_ENV } from '../daemon-rebuild/state.mjs';
@@ -1956,6 +1957,8 @@ describe('timeout catch-up back-off', () => {
 describe('concurrent catch-up rounds', () => {
   const concurrent = (extra = {}) => catchUpSetup({
     manualFinish: true,
+    // These concurrency contracts model a round whose snapshot has already been published.
+    readRoundSnapshot: () => ({ repo: REPO, writtenAt: 1000, rows: [], defaultBranch: 'main' }),
     resolveSetting: () => ({ ...CATCH_UP_SETTING, catchUp: { ...CATCH_UP_SETTING.catchUp, concurrency: 3, busyIntervalSeconds: 60 } }),
     readCapacity: () => ({ capacity: 8, source: 'test' }),
     readCandidates: async () => ({ ok: true, queued: 0, prs: [1, 2, 3, 4, 5].map(n => candidate(n, n)) }),
@@ -2885,4 +2888,235 @@ it('catch-up miss backoff uses a nondefault TTL from the resolved setting', asyn
   await f.handle.catchUp();
   f.advance(600_000); await f.handle.catchUp();
   expect(f.calls).toHaveLength(2);
+});
+
+
+describe('catch-up clean-first and snapshot-first settings', () => {
+  it.each(['cleanFirst', 'snapshotFirst'])('resolves and logs %s through standard, platform and tool layers', leaf => {
+    const standard = resolveSetting();
+    expect(standard.catchUp[leaf]).toBe(true);
+    expect(standard.line).toContain(`catchUp.${leaf}=true (standard)`);
+    const platform = resolveSetting({}, { platform: { catchUp: { [leaf]: false } } });
+    expect(platform.catchUp[leaf]).toBe(false);
+    expect(platform.sources[`catchUp.${leaf}`]).toBe('platform');
+    expect(platform.line).toContain(`catchUp.${leaf}=false (platform)`);
+    const tool = resolveSetting({ catchUp: { [leaf]: false } }, { platform: { catchUp: { [leaf]: true } } });
+    expect(tool.catchUp[leaf]).toBe(false);
+    expect(tool.sources[`catchUp.${leaf}`]).toBe('tool');
+    expect(tool.line).toContain(`catchUp.${leaf}=false (tool)`);
+    for (const invalid of ['false', null, 0, {}]) {
+      expect(resolveSetting({ catchUp: { [leaf]: invalid } }).catchUp[leaf]).toBe(true);
+      const fallback = resolveSetting({ catchUp: { [leaf]: invalid } }, { platform: { catchUp: { [leaf]: false } } });
+      expect(fallback.catchUp[leaf]).toBe(false);
+      expect(fallback.sources[`catchUp.${leaf}`]).toBe('platform');
+      expect(fallback.invalid).toContain(`catchUp.${leaf}=${JSON.stringify(invalid)}`);
+    }
+  });
+
+  it('declares both defaults in the settings file and resolves their tool provenance', () => {
+    const declared = JSON.parse(readFileSync(join(process.cwd(), 'scripts/settings/merge-queue.json'), 'utf8'));
+    expect(declared.mergeQueue.enqueueOnEvent.catchUp).toMatchObject({ cleanFirst: true, snapshotFirst: true, concurrency: 3 });
+    const setting = resolveEnqueueOnEventSetting({ env: {} });
+    expect(setting.catchUp).toMatchObject({ cleanFirst: true, snapshotFirst: true });
+    expect(setting.sources).toMatchObject({ 'catchUp.cleanFirst': 'tool', 'catchUp.snapshotFirst': 'tool' });
+  });
+});
+
+describe('planCatchUp clean-first within priority and demotion groups', () => {
+  const prs = [
+    candidate(1, 1, { mergeStateStatus: 'BLOCKED', itemIds: ['urgent'] }),
+    candidate(2, 2), candidate(3, 3, { mergeStateStatus: 'HAS_HOOKS', itemIds: ['urgent'] }),
+    candidate(4, 4, { mergeStateStatus: 'UNSTABLE' }), candidate(5, 5, { mergeStateStatus: 'BEHIND' }),
+    candidate(6, 6, { mergeStateStatus: undefined }), candidate(7, 7, { mergeStateStatus: 'UNKNOWN' }),
+  ];
+  const input = { prs, queued: 0, capacity: 2, buildPriority: ['urgent'], deprioritize: [3] };
+  it('puts CLEAN and HAS_HOOKS first within a class without undoing miss demotion', () => {
+    const plan = planCatchUp(input);
+    expect(plan.run.map(p => p.num)).toEqual([2, 1]);
+    expect(plan.later).toEqual([4, 5, 6, 7, 3]);
+    expect(plan.skipped).toEqual([]);
+    // With no prior miss, build priority stays intact inside the clean partition.
+    expect(planCatchUp({ ...input, deprioritize: [] }).run.map(p => p.num)).toEqual([3, 2]);
+  });
+  it('keeps the existing priority/miss order when cleanFirst is disabled', () => {
+    const plan = planCatchUp({ ...input, cleanFirst: false });
+    expect([...plan.run.map(p => p.num), ...plan.later]).toEqual([1, 2, 4, 5, 6, 7, 3]);
+  });
+  it.each(['priority-then-first-accept', 'oldest-ready'])('matches the old sequential ordering byte-for-byte with cleanFirst:false (%s)', order => {
+    const mixed = [
+      candidate(99, 900, { mergeStateStatus: 'BLOCKED', itemIds: ['urgent'] }),
+      candidate(7, 0), candidate(8, 30, { mergeStateStatus: 'HAS_HOOKS' }),
+      candidate(9, 20, { mergeStateStatus: 'BLOCKED', itemIds: ['urgent'] }),
+      candidate(10, 10, { firstAcceptedAt: 40 }), candidate(11, 10),
+      candidate(12, 10, { mergeStateStatus: 'UNKNOWN' }),
+      candidate(13, null, { mergeStateStatus: 'BLOCKED' }),
+    ];
+    const missed = new Set([99, 8]);
+    const held = new Set([7, 8]);
+    // Reference the original three stable sorts, before cleanFirst existed.
+    const old = [...mixed];
+    const cls = pr => pr.num === 99 ? 0 : 3;
+    const build = pr => pr.itemIds?.includes('urgent') ? 0 : Infinity;
+    const age = pr => (order === 'oldest-ready' ? pr.readyAt : pr.firstAcceptedAt ?? pr.readyAt) ?? Infinity;
+    old.sort((a, b) => (order === 'oldest-ready' ? 0 : cls(a) - cls(b) || build(a) - build(b))
+      || age(a) - age(b) || a.num - b.num);
+    old.sort((a, b) => Number(missed.has(a.num)) - Number(missed.has(b.num)));
+    old.sort((a, b) => Number(held.has(a.num)) - Number(held.has(b.num)));
+    const plan = planCatchUp({ prs: mixed, queued: 0, capacity: 3, order, cleanFirst: false,
+      repo: REPO, priority: { mode: 'enforce' }, mainFix: { repo: 'we', pr: 99 },
+      buildPriority: ['urgent'], deprioritize: missed, now: 1000,
+      declines: new Map([...held].map(num => [num, { reason: 'held', at: 1000 }])) });
+    expect(JSON.stringify(plan)).toBe(JSON.stringify({
+      run: old.slice(0, 3).map(({ num, readyAt }) => ({ num, readyAt })),
+      later: old.slice(3).map(pr => pr.num), skipped: [], skippedUnchanged: [],
+    }));
+  });
+  it('keeps a recently missed CLEAN P0 behind an unmissed CLEAN P3 with one slot', () => {
+    const plan = planCatchUp({ repo: REPO, priority: { mode: 'enforce' }, mainFix: { repo: 'we', pr: 99 },
+      prs: [candidate(99, 0), candidate(7, 900)], queued: 0, capacity: 1, deprioritize: [99] });
+    expect(plan.run.map(p => p.num)).toEqual([7]);
+    expect(plan.later).toEqual([99]);
+  });
+  it('keeps older CLEAN P3 ahead of newer CLEAN P0 under oldest-ready', () => {
+    const plan = planCatchUp({ repo: REPO, priority: { mode: 'enforce' }, mainFix: { repo: 'we', pr: 99 },
+      prs: [candidate(99, 900, { itemIds: ['urgent'] }), candidate(7, 0)],
+      queued: 0, capacity: 1, order: 'oldest-ready', buildPriority: ['urgent'] });
+    expect(plan.run.map(p => p.num)).toEqual([7]);
+    expect(plan.later).toEqual([99]);
+  });
+  it('selects BLOCKED P0 incident fix #99 over ordinary CLEAN #7 with one slot', () => {
+    const plan = planCatchUp({ repo: REPO, priority: { mode: 'enforce' }, mainFix: { repo: 'we', pr: 99 },
+      prs: [candidate(7, 0), candidate(99, 900, { mergeStateStatus: 'BLOCKED' })], queued: 0, capacity: 1 });
+    expect(plan.run.map(p => p.num)).toEqual([99]);
+    expect(plan.later).toEqual([7]);
+  });
+  it.each(['CLEAN', 'HAS_HOOKS'])('selects %s before BLOCKED within the same priority class', mergeStateStatus => {
+    const plan = planCatchUp({ priority: { mode: 'enforce' }, queued: 0, capacity: 1,
+      prs: [candidate(99, 0, { mergeStateStatus: 'BLOCKED' }), candidate(7, 900, { mergeStateStatus })] });
+    expect(plan.run.map(p => p.num)).toEqual([7]);
+    expect(plan.later).toEqual([99]);
+  });
+  it.each(['recent miss', 'known hold'])('keeps a CLEAN PR with a %s behind a non-missed BLOCKED PR', demotion => {
+    const plan = planCatchUp({ priority: { mode: 'enforce' }, queued: 0, capacity: 1, now: 1000,
+      prs: [candidate(7, 0), candidate(99, 900, { mergeStateStatus: 'BLOCKED' })],
+      ...(demotion === 'recent miss' ? { deprioritize: [7] }
+        : { declines: new Map([[7, { reason: 'held', at: 1000 }]]) }) });
+    expect(plan.run.map(p => p.num)).toEqual([99]);
+    expect(plan.later).toEqual([7]);
+  });
+  it('treats unreadable merge state as not clean and retains it', () => {
+    const unreadable = candidate(1, 0, { mergeStateStatus: {} });
+    const plan = planCatchUp({ prs: [unreadable, candidate(2, 1)], queued: 0, capacity: 1 });
+    expect(plan.run.map(p => p.num)).toEqual([2]);
+    expect(plan.later).toEqual([1]);
+  });
+});
+
+describe('catch-up snapshot-first scheduling', () => {
+  const flush = async () => { for (let i = 0; i < 60; i++) await Promise.resolve(); };
+  const fixture = (extra = {}) => catchUpSetup({
+    manualFinish: true,
+    resolveSetting: () => ({ ...CATCH_UP_SETTING, catchUp: { ...CATCH_UP_SETTING.catchUp, concurrency: 3 } }),
+    readCandidates: async () => ({ ok: true, queued: 0, prs: [1, 2, 3].map(n => candidate(n, n)) }),
+    ...extra,
+  });
+
+  it('waits for the snapshot, then fills the configured concurrency while the writer is active', async () => {
+    vi.useFakeTimers();
+    const f = fixture();
+    const round = f.handle.catchUp();
+    try {
+      await flush();
+      expect(f.calls).toHaveLength(1);
+      const path = f.calls[0].args.find(a => a.startsWith('--listing-snapshot=')).split('=')[1];
+      await vi.advanceTimersByTimeAsync(1000);
+      expect(f.calls).toHaveLength(1);
+      const snapshot = { repo: REPO, writtenAt: 1000, rows: [], defaultBranch: 'main' };
+      writeFileSync(path, JSON.stringify(snapshot));
+      expect(readFastDrainRoundSnapshot({ path, repo: REPO, now: 1000, env: {}, requireDefaultBranch: true })).toEqual(snapshot);
+      await vi.advanceTimersByTimeAsync(1000);
+      expect(f.calls).toHaveLength(3);
+      expect(f.calls.every(c => c.args.includes(`--listing-snapshot=${path}`))).toBe(true);
+      for (const call of f.calls.slice(1)) {
+        const num = Number(call.args.find(a => a.startsWith('--only=')).slice(7));
+        const listLive = vi.fn(() => { throw Error('released child listed live'); });
+        await readFastDrainRoundListing({ path, repo: REPO, onlyPr: num, now: 1000, env: {}, requireDefaultBranch: true,
+          listLive, readTarget: async () => ({ number: num, state: 'OPEN' }), log: () => {} });
+        expect(listLive).not.toHaveBeenCalled();
+      }
+      f.children.forEach(c => c.finish());
+      expect(await round).toHaveLength(3);
+    } finally {
+      f.handle.kill();
+      f.children.forEach(c => c.emit('close', 143));
+      vi.useRealTimers();
+    }
+  });
+
+  it.each(['error', 'timeout'])('starts the next writer after %s leaves the active set empty without a snapshot', async failure => {
+    vi.useFakeTimers();
+    const f = fixture({ timeoutMs: 1000, readRoundSnapshot: () => null });
+    const round = f.handle.catchUp();
+    try {
+      await flush();
+      expect(f.calls).toHaveLength(1);
+      if (failure === 'error') f.children[0].emit('error', Error('writer failed before publishing'));
+      else {
+        f.children[0].kill = () => f.children[0].emit('close', 143);
+        await vi.advanceTimersByTimeAsync(1000);
+      }
+      await flush();
+      expect(f.calls).toHaveLength(2);
+      f.children[1].finish();
+      await flush();
+      expect(f.calls).toHaveLength(3);
+      f.children[2].finish();
+      expect(await round).toHaveLength(3);
+    } finally {
+      f.handle.kill();
+      f.children.forEach(c => c.emit('close', 143));
+      vi.useRealTimers();
+    }
+  });
+
+  it.each(['invalid', 'unreadable', 'missing defaultBranch', 'check throws'])('keeps catch-up serial when the snapshot is %s, then starts the next writer', async mode => {
+    vi.useFakeTimers();
+    const f = fixture(mode === 'check throws' ? { readRoundSnapshot: () => { throw Error('unreadable'); } } : {});
+    const round = f.handle.catchUp();
+    try {
+      await flush();
+      expect(f.calls).toHaveLength(1);
+      const path = f.calls[0].args.find(a => a.startsWith('--listing-snapshot=')).slice(19);
+      if (mode === 'invalid') writeFileSync(path, '{}');
+      if (mode === 'missing defaultBranch') writeFileSync(path, JSON.stringify({ repo: REPO, writtenAt: 1000, rows: [] }));
+      if (mode === 'unreadable') mkdirSync(path); // A directory cannot be read as a snapshot on any host.
+      await vi.advanceTimersByTimeAsync(1000);
+      expect(f.calls).toHaveLength(1);
+      if (mode === 'check throws') expect(f.lines).toContain('enqueue-on-event: round snapshot check threw; keeping catch-up serial');
+      for (let i = 0; i < 3; i++) {
+        expect(f.calls).toHaveLength(i + 1);
+        f.children[i].finish();
+        await flush();
+      }
+      expect(await round).toHaveLength(3);
+    } finally {
+      f.handle.kill();
+      f.children.forEach(c => c.emit('close', 143));
+      vi.useRealTimers();
+    }
+  });
+
+  it('retains normal concurrency when snapshot-first is disabled', async () => {
+    const f = fixture({
+      resolveSetting: () => ({ ...CATCH_UP_SETTING, catchUp: { ...CATCH_UP_SETTING.catchUp,
+        concurrency: 3, snapshotFirst: false } }),
+    });
+    const round = f.handle.catchUp();
+    try {
+      await flush();
+      expect(f.calls).toHaveLength(3);
+      f.children.forEach(c => c.finish());
+      await round;
+    } finally { f.handle.kill(); f.children.forEach(c => c.emit('close', 143)); }
+  });
 });

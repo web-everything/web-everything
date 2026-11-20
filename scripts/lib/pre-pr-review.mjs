@@ -278,7 +278,7 @@ function authoriseBypass({ role, actor = '', operatorInstruction = '' }) {
 /**
  * The whole open-pr pre-check, over a lane checkout. IO only through `cwd` git. Returns the decision plus the risk.
  */
-export function checkPrePrReview({ cwd, base = 'main', sha = 'HEAD', env = process.env, skip = '', actor = '', operatorInstruction = '', settings, role, recordDir } = {}) {
+export function checkPrePrReview({ cwd, base = 'main', sha = 'HEAD', env = process.env, skip = '', actor = '', operatorInstruction = '', settings, role, recordDir, readOnly = false } = {}) {
   const loaded = settings ? { settings, error: '' } : loadPrePrSettings();
   const { settings: s } = loaded;
   const settingsError = loaded.error || '';
@@ -302,7 +302,7 @@ export function checkPrePrReview({ cwd, base = 'main', sha = 'HEAD', env = proce
   const decision = decidePrePrReview({ settings: s, risk, receipt: readReceipt(cwd), headTree, baseSha, skip: auth.ok ? skip : '', lane: resolve(cwd) });
   if (wantsSkip && !auth.ok && decision.action === 'refuse') decision.message = `bypass refused — ${auth.refusal}. ${decision.message}`;
   if (decision.why === 'bypass') {
-    recordBypass(cwd, { reason: skip, head: sha, risk, actor, operatorInstruction, ...(recordDir ? { recordDir } : {}) });
+    if (!readOnly) recordBypass(cwd, { reason: skip, head: sha, risk, actor, operatorInstruction, ...(recordDir ? { recordDir } : {}) });
     decision.bypass = { reason: skip.trim(), actor: actor.trim(), operatorInstruction: operatorInstruction.trim() };
   }
   return { ...decision, risk, headTree, baseSha, sha, settings: s, ...(settingsError ? { settingsError } : {}) };

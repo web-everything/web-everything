@@ -281,3 +281,10 @@ describe('PR merge watcher installer selection', () => {
     for (const pass of ['unknown', '']) expect(() => installPlan({ pass })).toThrow('unknown installable pass');
   });
 });
+
+it('launchd sweep pins installed CLT, preserves explicit directories, and omits absent CLT', () => {
+  const cfg = { pass: 'test', repoRoot: '/repo', nodePath: '/bin/node', home: '/home/test' };
+  expect(buildLaunchdPlist({ ...cfg, exists: () => true })).toContain('<key>DEVELOPER_DIR</key><string>/Library/Developer/CommandLineTools</string>');
+  expect(buildLaunchdPlist({ ...cfg, developerDir: '/nonexistent/fake', exists: () => false })).toContain('<key>DEVELOPER_DIR</key><string>/nonexistent/fake</string>');
+  expect(buildLaunchdPlist({ ...cfg, exists: () => false })).not.toContain('<key>DEVELOPER_DIR</key>');
+});

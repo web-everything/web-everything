@@ -11,7 +11,7 @@ const raw = readFileSync(new URL('../../../.github/workflows/ci.yml', import.met
 const { jobs } = yaml.load(raw);
 const fetchMain = 'sh scripts/ci/fetch-main-history.sh';
 // Historical full-history WE checkouts; `test` is intentionally gone from this roster.
-const historyJobs = ['changes', 'standards', 'integration', 'daemon-soak-scope', 'soak-shard'];
+const historyJobs = ['changes', 'standards', 'integration-part', 'daemon-soak-scope', 'soak-shard'];
 
 describe('ci.yml shallow checkouts with blobless main history', () => {
   it('no job uses a full-depth WE checkout; test-shard and soak-shard are depth 50 plus blobless main', () => {

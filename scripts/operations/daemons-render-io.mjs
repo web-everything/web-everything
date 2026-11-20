@@ -2,6 +2,7 @@
  * @file scripts/operations/daemons-render-io.mjs
  * @description File effects and CLI for rendering daemon plists; installed plists are read-only.
  */
+import { pinDeveloperDir } from '../lib/lane-git-hardening.mjs';
 import { execFileSync } from 'node:child_process';
 import { constants, closeSync, mkdirSync, openSync, readFileSync, realpathSync, writeFileSync } from 'node:fs';
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
@@ -77,7 +78,7 @@ export function main(argv, { log = console.log, installedReader = readInstalled 
   const home = options['host-home'] ?? process.env.HOME;
   const nodePath = options.node ?? process.execPath;
   if (!home || !isAbsolute(home) || !isAbsolute(nodePath)) throw new Error('host home and node must be absolute paths');
-  const host = { home, nodePath, path: `${dirname(nodePath)}:/usr/bin:/bin:/usr/sbin:/sbin` };
+  const host = { home, nodePath, developerDir: pinDeveloperDir({ DEVELOPER_DIR: process.env.DEVELOPER_DIR }).DEVELOPER_DIR, path: `${dirname(nodePath)}:/usr/bin:/bin:/usr/sbin:/sbin` };
   const files = renderAll(readTable(), host);
   if (options.out) writeOutDir(options.out, files, { home });
   let incomplete = false;

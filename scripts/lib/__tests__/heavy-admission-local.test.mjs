@@ -19,13 +19,16 @@ function setup(extraEnv = {}) {
   const pool = join(root, 'pool'); mkdirSync(pool);
   const prefs = join(root, 'preferences.json');
   writeFileSync(prefs, JSON.stringify({ heavyAdmission: { remote: { enabled: true, mode: 'always' }, fastScale: { maxSlots: 1 } } }));
+  // Redirected preferences need a valid canonical host file for the manifest decision; never read the real one.
+  const home = join(root, 'home'); mkdirSync(join(home, '.claude'), { recursive: true });
+  writeFileSync(join(home, '.claude', 'platform-preferences.json'), '{}');
   const exited = new Error('test exit');
   const exit = vi.spyOn(process, 'exit').mockImplementation(() => { throw exited; });
   const stderr = vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
   for (const [k, v] of Object.entries({ LANE_POOL_ROOT: pool, WE_PLATFORM_PREFERENCES: prefs, CI: '', WE_HEAVY_ADMISSION: 'on',
     WE_HEAVY_ADMISSION_HELD: '', WE_FORGE_GATE_DISPATCH: '', WE_HEAVY_ADMISSION_CONTAINER: '', WE_HEAVY_ADMISSION_CONTAINER_NODE_MODULES: '',
     WE_HEAVY_ADMISSION_RUN_WAIT_MS: '0', WE_VERIFY_REMOTE_REPORT: join(root, 'verify.jsonl'), ...extraEnv })) vi.stubEnv(k, v);
-  return { root, lockRoot: join(pool, '.admission', 'heavy'), exited, exit, stderr, remoteExec: vi.fn(async () => ({ mode: 'remote', code: 23, run: 'run-123456' })) };
+  return { root, home, lockRoot: join(pool, '.admission', 'heavy'), exited, exit, stderr, remoteExec: vi.fn(async () => ({ mode: 'remote', code: 23, run: 'run-123456' })) };
 }
 const teardown = (s) => { vi.mocked(execSync).mockReset(); s.exit.mockRestore(); s.stderr.mockRestore(); vi.unstubAllEnvs(); };
 
@@ -37,7 +40,7 @@ describe('heavy-admission run --local', () => {
       throw Object.assign(new Error('local exit'), { status: 17 });
     });
     try {
-      await expect(main(['run', `--repo=${s.root}`, '--local', '--', ...argv], { remoteExec: s.remoteExec, readTelemetry: healthy })).rejects.toBe(s.exited);
+      await expect(main(['run', `--repo=${s.root}`, '--local', '--', ...argv], { remoteExec: s.remoteExec, readTelemetry: healthy, home: s.home })).rejects.toBe(s.exited);
       expect(s.remoteExec).not.toHaveBeenCalled();
       expect(execSync).toHaveBeenCalledWith(argv.map(shellQuoteWord).join(' '), expect.objectContaining({ cwd: s.root }));
       expect(heldRow).toHaveLength(1);
@@ -54,7 +57,7 @@ describe('heavy-admission run --local', () => {
     for (let i = 0; i < 3; i++) tryAcquireSlot({ lockRoot: s.lockRoot, cap: 2, owner: `other-${i}`, nowMs: now, nowIso: new Date(now).toISOString(), pid: process.pid, slots: [0, 1, 2] });
     expect(heldSlots({ lockRoot: s.lockRoot, cap: 2, fastSlots: 1 })).toHaveLength(3);
     try {
-      await expect(main(['run', `--repo=${s.root}`, '--local', '--wait-ms=300', '--', ...argv], { remoteExec: s.remoteExec, readTelemetry: healthy })).rejects.toBe(s.exited);
+      await expect(main(['run', `--repo=${s.root}`, '--local', '--wait-ms=300', '--', ...argv], { remoteExec: s.remoteExec, readTelemetry: healthy, home: s.home })).rejects.toBe(s.exited);
       expect(execSync).not.toHaveBeenCalled();
       expect(s.remoteExec).not.toHaveBeenCalled();
       expect(s.exit).toHaveBeenCalledWith(ADMISSION_DEFERRED_EXIT);
@@ -64,7 +67,7 @@ describe('heavy-admission run --local', () => {
   it('without --local behaviour is unchanged: remote dispatch still happens, and no env default turns local on', async () => {
     const s = setup({ WE_HEAVY_ADMISSION_LOCAL: '1', WE_HEAVY_LOCAL: '1' });
     try {
-      await expect(main(['run', `--repo=${s.root}`, '--', ...argv], { remoteExec: s.remoteExec, readTelemetry: healthy })).rejects.toBe(s.exited);
+      await expect(main(['run', `--repo=${s.root}`, '--', ...argv], { remoteExec: s.remoteExec, readTelemetry: healthy, home: s.home })).rejects.toBe(s.exited);
       expect(s.remoteExec).toHaveBeenCalledTimes(1);
       expect(execSync).not.toHaveBeenCalled();
       expect(s.exit).toHaveBeenCalledWith(23);

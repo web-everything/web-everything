@@ -135,7 +135,7 @@ function roundSnapshotTtl(env) {
 }
 
 /** A round cache is advisory context only: reject incomplete, foreign or expired evidence. */
-export function readFastDrainRoundSnapshot({ path, repo, now = Date.now(), env = process.env,
+export function readFastDrainRoundSnapshot({ path, repo, now = Date.now(), env = process.env, requireDefaultBranch = false,
   read = (p) => { if (statSync(p).size > 64 * 1024 * 1024) throw new Error('snapshot too large'); return readFileSync(p, 'utf8'); },
 } = {}) {
   const { seconds: ttlSec } = roundSnapshotTtl(env);
@@ -143,7 +143,8 @@ export function readFastDrainRoundSnapshot({ path, repo, now = Date.now(), env =
     const raw = read(path);
     if (typeof raw !== 'string' || Buffer.byteLength(raw) > 64 * 1024 * 1024) return null;
     const snap = JSON.parse(raw);
-    if (snap?.repo !== repo || typeof snap.writtenAt !== 'number' || !Number.isFinite(snap.writtenAt)
+    if (snap?.repo !== repo || (requireDefaultBranch && (typeof snap.defaultBranch !== 'string' || !snap.defaultBranch.trim()))
+      || typeof snap.writtenAt !== 'number' || !Number.isFinite(snap.writtenAt)
       || now < snap.writtenAt || now - snap.writtenAt >= ttlSec * 1000 || !Array.isArray(snap.rows)
       || !snap.rows.every(row => Number.isInteger(row?.number) && row.number > 0
         && typeof row.headRefOid === 'string' && row.headRefOid.length > 0

@@ -8,7 +8,8 @@ import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { pathToFileURL } from 'node:url';
 
-const REPO = 'example-org/example-repo';
+// The scenario must pass review capability admission before testing stale-accept recovery.
+const REPO = 'web-everything/web-everything';
 const HEAD = 'b'.repeat(40);
 
 export default {

@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import { assertCapability, repoProfile } from '../lib/repo-profile.mjs';
 import { safeAdoptYield } from '../lib/daemon-rebuild/adopt-yield.mjs';
 import { isTerminalStatus } from '../lib/backlog-status.cjs';
 /**
@@ -266,6 +267,7 @@ export function ownedCards(cards, view = {}) {
  *   here would have silently produced an empty `dispatched` array for the daemon composing this pass in.
  */
 export function runReconcilePromoteDraftDispatch({
+  resolveProfile = repoProfile,
   root = process.cwd(),
   repo = null,
   reconcile = runReconcilePass,
@@ -410,6 +412,8 @@ export function runReconcilePromoteDraftDispatch({
       });
       continue;
     }
+    const refusal = assertCapability(repoSlug, 'review', { resolveProfile });
+    if (refusal) { refusals.push({ pr: entry.prNumber, ...refusal }); continue; }
     try {
       ghProvider.ready(entry.prNumber);
       dispatched.push({ pr: entry.prNumber, kind: 'promote-draft', ...(stacked ? { stackedOn: entry.baseRefName } : {}) });

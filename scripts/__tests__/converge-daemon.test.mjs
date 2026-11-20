@@ -458,3 +458,17 @@ describe('systemdMain() — the install orchestration (#3197)', () => {
     expect(io._.errs.join('')).toMatch(/usage: converge-daemon-install\.mjs/);
   });
 });
+
+describe('launchd developer directory', () => {
+  const cfg = resolveInstallConfig(ENV, HOME, '/usr/bin/node');
+  it('pins CLT when installed and developer directory is unset', () => {
+    expect(renderPlist({ ...cfg, exists: () => true })).toContain('<key>DEVELOPER_DIR</key><string>/Library/Developer/CommandLineTools</string>');
+  });
+  it('preserves an explicit fake directory even if CLT is absent', () => {
+    const explicit = resolveInstallConfig({ ...ENV, DEVELOPER_DIR: '/nonexistent/fake' }, HOME, '/usr/bin/node');
+    expect(renderPlist({ ...explicit, exists: () => false })).toContain('<key>DEVELOPER_DIR</key><string>/nonexistent/fake</string>');
+  });
+  it('omits the pin when CLT is absent', () => {
+    expect(renderPlist({ ...cfg, exists: () => false })).not.toContain('<key>DEVELOPER_DIR</key>');
+  });
+});

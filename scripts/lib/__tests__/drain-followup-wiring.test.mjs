@@ -53,7 +53,7 @@ const fakeGit = `#!/usr/bin/env node
 const fs = require('node:fs');
 const path = require('node:path');
 const a = process.argv.slice(2);
-if (a[0] === 'remote' && a[1] === 'get-url') process.stdout.write('git@github.com:fixture/drain-fu.git\\n');
+if (a[0] === 'remote' && a[1] === 'get-url') process.stdout.write('git@github.com:web-everything/web-everything.git\\n');
 if (a[0] === 'diff') process.exit(1);
 if (a[0] === 'rev-parse' && a[1] === '--git-dir') process.stdout.write('.git\\n');
 if (a[0] === 'rev-parse' && a[1] === '--git-common-dir') process.stdout.write('/fake-common/.git\\n');

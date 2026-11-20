@@ -194,7 +194,7 @@ import { VERIFY_FILENAME, keepMarkerAfterReset, readVerifyMarker } from './lib/l
 import { checkLaneHold, laneHoldJournalFields, clearLaneAwaitRecords } from './lib/lane-hold-io.mjs';
 import { resolveLaneHoldSettings } from './lib/lane-lease.mjs';
 import { applyLaneDietConfig, laneDietConfigState } from './lib/lane-git-diet.mjs';
-import { dropGitLocationEnv, laneGitHardeningEnv, scrubGitLocationEnv, scrubGitRepoEnv, scrubRiskyLaneConfig, LANE_CONFIG_LIST_ARGS } from './lib/lane-git-hardening.mjs';
+import { pinDeveloperDir, dropGitLocationEnv, laneGitHardeningEnv, scrubGitLocationEnv, scrubGitRepoEnv, scrubRiskyLaneConfig, LANE_CONFIG_LIST_ARGS } from './lib/lane-git-hardening.mjs';
 import { laneMaskingConfig, laneRedirectConfig, wellFormedConfigList, withHonestReportingPins } from './lib/health-watch-lane-scan.mjs';
 import { readGitIdentity, laneIdentityReport, ensureLaneHooksPath, resolveGitIdentityPlaceholders, GIT_IDENTITY_FIX_HINT } from './lib/git-identity.mjs';
 
@@ -234,6 +234,7 @@ const isReadOnlyGit = (args) => READ_ONLY_GIT.has(args[0]) || (args[0] === 'remo
 // No inherited GIT_DIR / GIT_REFERENCE_BACKEND-style redirect either: a lane write must never land in another repository.
 // The process drops it too: lane-whois's status proof, lane-history's snapshot and lane-salvage's refs build their
 // git env from process.env (tested in lane-pool-git-diet.test.mjs).
+pinDeveloperDir();
 dropGitLocationEnv(process.env);
 const LANE_GIT_ENV = scrubGitLocationEnv(process.env);
 const readOnlyGitEnv = (args) => ({ env: laneGitHardeningEnv(isReadOnlyGit(args) ? { ...LANE_GIT_ENV, GIT_OPTIONAL_LOCKS: '0' } : LANE_GIT_ENV) });
@@ -1560,12 +1561,57 @@ function refreshLane(repo, n, { force = false } = {}) {
  * @param {{leasedOnly?: boolean}} [opts]
  */
 // History quarantine is metadata only: never move/delete the clone, and never gate release/reap on it.
+export const HOST_WIDE_GIT_FAILURE_PATTERNS = Object.freeze([
+  /\b(?:exit|status|code)(?:\s+(?:status|code))?[\s:=]+69\b/i,
+  /agreed to the Xcode license/i, /xcodebuild\s+-license/i, /xcode-select/i, /Xcode license/i,
+  /Library not loaded/i, /\bdyld\b/i, /No space left on device/i, /Too many open files/i,
+  /cannot fork/i, /Resource temporarily unavailable/i,
+]);
+export const isHostWideGitFailure = (text) => HOST_WIDE_GIT_FAILURE_PATTERNS.some(pattern => pattern.test(String(text)));
+
 const historyQuarantinePath = (repo, n) => join(repo.poolDir, '.quarantine-state', `lane-${n}.json`);
 function historyQuarantine(repo, n) {
   const file = historyQuarantinePath(repo, n);
   try {
     const record = JSON.parse(readFileSync(file, 'utf8'));
     if (typeof record.reason !== 'string' || !record.reason) throw new Error('missing reason');
+    if (isHostWideGitFailure(Object.hasOwn(record, 'lastError') ? record.firstError : `${record.reason} ${record.firstError ?? ''}`)
+        && (!Object.hasOwn(record, 'lastError') || isHostWideGitFailure(record.lastError))) {
+      try {
+        const dir = laneDir(repo, n);
+        const lines = readFileSync(file.replace(/\.json$/, '.evidence.jsonl'), 'utf8').split('\n');
+        let evidenceCount = 0;
+        for (const line of lines) {
+          let evidence;
+          try { evidence = JSON.parse(line); } catch { continue; }
+          if (!evidence || !Object.hasOwn(evidence, 'sha') || !Object.hasOwn(evidence, 'refs')) {
+            throw new Error('incomplete quarantine evidence');
+          }
+          evidenceCount++;
+          const requireCommit = (sha) => {
+            if (typeof sha !== 'string' || !/^(?:[a-f0-9]{40}|[a-f0-9]{64})$/.test(sha)) {
+              throw new Error('invalid quarantine evidence sha');
+            }
+            git(['cat-file', '-e', `${sha}^{commit}`], dir);
+          };
+          if (evidence.sha) requireCommit(evidence.sha);
+          else if (evidence.sha !== null && evidence.sha !== '') throw new Error('invalid quarantine evidence sha');
+          if (evidence.refs !== null && typeof evidence.refs !== 'string') throw new Error('invalid quarantine evidence refs');
+          for (const ref of (evidence.refs ?? '').split('\n').filter(Boolean)) {
+            const match = /^(\S+) (refs\/\S+)$/.exec(ref);
+            if (!match) throw new Error('invalid quarantine evidence ref');
+            requireCommit(match[1]);
+            git(['rev-parse', '--verify', `${match[2]}^{commit}`], dir);
+          }
+        }
+        if (!evidenceCount) throw new Error('missing quarantine evidence');
+        git(['--version'], dir);
+        probeLaneHistory(dir);
+        unlinkSync(file);
+        journalLaneEvent(dir, { action: 'quarantine-auto-released', reason: record.reason });
+        return null;
+      } catch { /* Still unreadable: retain quarantine and its original diagnostic. */ }
+    }
     return record;
   } catch (e) {
     if (e.code === 'ENOENT') return null;
@@ -1603,11 +1649,12 @@ function probeLaneHistory(dir) {
 
 function requireReadableLaneHistory(repo, n, { allowRepair = !flags['no-reset'] } = {}) {
   const dir = laneDir(repo, n);
-  let firstError;
+  let firstError, lastError;
   // Exactly one retry, including timeouts/output-limit errors. Preserve the initial diagnostic.
   for (let attempt = 0; attempt < 2; attempt++) {
     try { probeLaneHistory(dir); return; } catch (e) {
-      firstError ??= msgOf(e).replace(/[\x00-\x1f\x7f]/g, ' ').trim().slice(0, 2000);
+      lastError = msgOf(e).replace(/[\x00-\x1f\x7f]/g, ' ').trim().slice(0, 2000);
+      firstError ??= lastError;
     }
     if (attempt === 0) {
       const sha = tryGit(['rev-parse', '--verify', '--quiet', 'HEAD'], dir);
@@ -1634,8 +1681,8 @@ function requireReadableLaneHistory(repo, n, { allowRepair = !flags['no-reset'] 
   const file = historyQuarantinePath(repo, n);
   const reason = `history unreadable after two probes: ${firstError}`;
   mkdirSync(join(repo.poolDir, '.quarantine-state'), { recursive: true });
-  writeFileSync(file, JSON.stringify({ lane: n, reason, at: new Date().toISOString(), firstError }) + '\n');
-  throw new Error(`lane-${n} QUARANTINED: ${reason}; inspect/repair history (or probe limits), then remove ${file} manually`);
+  writeFileSync(file, JSON.stringify({ lane: n, reason, at: new Date().toISOString(), firstError, lastError }) + '\n');
+  throw new Error(`lane-${n} QUARANTINED: ${reason}; host-wide git failures auto-clear on the next acquire/reclaim once git works; for real history corruption, inspect/repair history, then remove ${file} manually`);
 }
 
 function laneStatus(repo, n, { leasedOnly = false, statusCache = null } = {}) {
@@ -1650,7 +1697,7 @@ function laneStatus(repo, n, { leasedOnly = false, statusCache = null } = {}) {
   if (quarantine) return {
     lane: n, path: dir, exists: true, deps: depsReady(dir), lease: lease || null, leased,
     ...(readError ? { readError } : {}), status: 'QUARANTINED', reason: quarantine.reason,
-    recovery: `Inspect/repair history (or probe limits), then remove ${historyQuarantinePath(repo, n)} manually`,
+    recovery: `Host-wide git failures auto-clear on the next acquire/reclaim once git works; for real history corruption, inspect/repair history, then remove ${historyQuarantinePath(repo, n)} manually`,
   };
   if (leasedOnly && !leased) {
     return {
@@ -2528,7 +2575,7 @@ async function cmdAcquire(repo) {
     const dir = laneDir(repo, n);
     if (!existsSync(dir)) fail(`lane-${n} does not exist (${dir})`);
     const quarantine = historyQuarantine(repo, n);
-    if (quarantine) fail(`lane-${n} QUARANTINED: ${quarantine.reason}; inspect/repair history (or probe limits), then remove ${historyQuarantinePath(repo, n)} manually`);
+    if (quarantine) fail(`lane-${n} QUARANTINED: ${quarantine.reason}; host-wide git failures auto-clear on the next acquire/reclaim once git works; for real history corruption, inspect/repair history, then remove ${historyQuarantinePath(repo, n)} manually`);
     // #2350 — a RESERVED lane is off-limits to an ordinary acquire, INCLUDING the OWNING session's own plain
     // re-acquire. Without this pre-claim guard, `tryClaimLane`'s `leaseOwnedBy` self-refresh would rewrite the
     // marker as an ordinary (non-reserved) lease and then the reset path below would `reset --hard` the lane —
@@ -5272,6 +5319,8 @@ function cmdReclaim(repo) {
   if (!Number.isInteger(n) || n < 1) {
     fail('reclaim needs --lane=<positive integer> — it never scans a whole pool itself (that is `lane-whois.mjs`\'s job; a caller picks ONE `finished-reclaimable` lane at a time)');
   }
+  const quarantine = historyQuarantine(repo, n);
+  if (quarantine) fail(`lane-${n} QUARANTINED: ${quarantine.reason}; host-wide git failures auto-clear on the next acquire/reclaim once git works; for real history corruption, inspect/repair history, then remove ${historyQuarantinePath(repo, n)} manually`);
   const dryRun = !!flags['dry-run'];
   const override = !!flags.override;
   const automaticRecovery = process.env.WE_LANE_RECOVERY_BACKUP !== undefined;

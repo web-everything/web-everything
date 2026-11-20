@@ -65,7 +65,7 @@ import {
   cwdFlagValue, driveRun, hasJsonFlag, outcomePayload, parseOperationArgv, renderOutcome, runOperationCli,
 } from './cli-adapter.mjs';
 import { startRun, runStatus, rewindRunToStep } from './engine.mjs';
-import { createFileRunStore, newRunId } from './run-store.mjs';
+import { createFileRunStore, newRunId, newReviewRunId } from './run-store.mjs';
 import { REPO_ROOT as SCAFFOLD_ROOT } from './scaffold-io.mjs';
 import { resolveOperation, createCliJudgeFactory } from './run.mjs';
 import { appendEntry } from '../conveyor/learnings-drop.mjs';
@@ -564,7 +564,7 @@ export async function runReviewLoopCliOnce(options) {
  * @param {{read: Function, write: Function}} o.store
  * @param {Record<string, Function>} o.sinks
  * @param {(o: {cwd: (string|null), model: (string|null), provider: (string|null)}) => Function} o.makeJudge
- * @param {() => string} o.mintRunId
+ * @param {(pr: number) => string} [o.mintRunId]
  * @param {(pending: object|null, run: object) => ({value: string}|null)} [o.autoConfirm] - injected so a test
  *   can supply a stub; the real caller always passes {@link reviewLoopAutoConfirm}.
  * @param {(entry: object, opts: object) => {record: object, path: string}} [o.appendLearning] - injected so a
@@ -580,7 +580,7 @@ export async function runReviewLoopCliOnce(options) {
  * @returns {Promise<{code: number, lines: string[], run: (object|null), stopped: string}>}
  */
 export async function runReviewLoopOnce({
-  declaration, registry, argv, store, sinks, makeJudge, mintRunId, autoConfirm = reviewLoopAutoConfirm,
+  declaration, registry, argv, store, sinks, makeJudge, mintRunId = newReviewRunId, autoConfirm = reviewLoopAutoConfirm,
   appendLearning = appendEntry, session = 'review-loop', fileItem = fileItemForPreventionViaLandingJob,
   findFiledPrevention = findFiledPreventionCard, findResumableRun = () => null, now = () => new Date().toISOString(),
   findFiledRoundCards = findFiledRoundCardsCard,
@@ -818,7 +818,7 @@ export async function runReviewLoopOnce({
     } else {
       run = startRun({
         op: declaration.name,
-        id: parsed.control.runId || mintRunId(),
+        id: parsed.control.runId || mintRunId(parsed.input.pr),
         // #xu2pp2m — see `applyUnattendedActorDefault`: this driver is the UNATTENDED one, so an unnamed actor
         // is an agent, never `review-pr`'s own human-terminal `'operator'` default.
         input: applyUnattendedActorDefault(parsed.input, argv),
@@ -1217,7 +1217,7 @@ if (IS_CLI) {
     store,
     sinks,
     makeJudge: createCliJudgeFactory(),
-    mintRunId: () => newRunId(declaration.name),
+    mintRunId: () => newReviewRunId(prFlag),
     findResumableRun: defaultFindResumableRun,
     parallelJudges: parallelSeatsEnabled(),
     seatLanes: Number.isInteger(prFlag) && prFlag > 0 ? createSeatLaneProvider({ pr: prFlag, repo: argvFlag(argv, 'repo') }) : null,

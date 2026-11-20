@@ -349,8 +349,8 @@ describe('pr-land pure helpers (#2138 Fork 5 / #2153)', () => {
     expect(prCreateBodyGuard('## Real body').code).toBeUndefined();
     // every code is a registered pr-land reason (routes to `refused`)
     for (const b of ['Fixes #1', '']) expect(HOME_REASONS[prCreateBodyGuard(b).code]).toBe('refused');
-    // the create-path emit uses the guard's code, never a hard-coded 'empty-body'
-    expect(src).toMatch(/if \(!bodyGuard\.ok\) emit\(\{ repo: REPO, merged: false, reason: bodyGuard\.code,/);
+    // The pre-push collector uses the guard code and the checkpoint emits it.
+    expect(src).toContain("if (!bodyGuard.ok) collect('body', bodyGuard.code, bodyGuard.reason)");
   });
 
   describe('#6774 round 3 — landTimeBodyGate (the land-time live-body decision, behavioural)', () => {
@@ -581,12 +581,12 @@ describe('resolveParkLabel + planPrLand park mode — #2622 held-for-review open
   });
 });
 
-// ── draft-first PRs (operator-approved 2026-09-27) — `--park` opens a draft by default; `--no-draft` opts out ──
-describe('resolveDraft — draft-first PRs, scoped to park mode only', () => {
-  it('park mode, no opt-out → draft', () => {
-    expect(resolveDraft({ mode: 'park', optOut: false })).toBe(true);
+// Park always opens ready for review; --no-draft remains compatible.
+describe('resolveDraft — every mode opens ready for review', () => {
+  it('park mode opens ready without an opt-out', () => {
+    expect(resolveDraft({ mode: 'park', optOut: false })).toBe(false);
   });
-  it('park mode WITH --no-draft → not a draft (human-opened/special-cased escape hatch)', () => {
+  it('--no-draft remains a harmless no-op', () => {
     expect(resolveDraft({ mode: 'park', optOut: true })).toBe(false);
   });
   it('land / label-on-green / open-only are NEVER drafted, opt-out or not — their poll loop has no DRAFT branch', () => {
@@ -595,14 +595,14 @@ describe('resolveDraft — draft-first PRs, scoped to park mode only', () => {
       expect(resolveDraft({ mode, optOut: true })).toBe(false);
     }
   });
-  it('buildCreateArgs threaded through resolveDraft carries --draft exactly when park+no-opt-out', () => {
+  it('buildCreateArgs threaded through resolveDraft never carries --draft', () => {
     const draft = resolveDraft({ mode: 'park', optOut: false });
     expect(buildCreateArgs({ base: 'main', head: 'lane/x', title: 't', body: 'b', draft }))
-      .toEqual(['pr', 'create', '--base', 'main', '--head', 'lane/x', '--title', 't', '--body', 'b', '--draft']);
+      .toEqual(['pr', 'create', '--base', 'main', '--head', 'lane/x', '--title', 't', '--body', 'b']);
   });
 });
 
-describe('pr-land.mjs source wiring — draft-first PRs applied at the park create call (operator-approved 2026-09-27)', () => {
+describe('pr-land.mjs source wiring — ready-for-review create params', () => {
   const src = readFileSync(resolve(process.cwd(), 'scripts/pr-land.mjs'), 'utf8');
   it('the create params carry `draft` computed via resolveDraft, threaded from PLAN.mode and the --no-draft flag', () => {
     expect(src).toMatch(/const DRAFT_OPT_OUT = !!flags\['no-draft'\];/);
@@ -701,7 +701,7 @@ describe('pr-land contract guards (source-level, mirrors gated-push-wiring)', ()
     // assertion tautological (#2833 finding 3). "#2833's stall guard" lives only in the guard's emit() detail, so
     // moving the guard below the push actually flips this comparison and fails the test (house precedent: the
     // #2622 assertion anchors on `reason: 'bad-park'`, a body-unique token).
-    const GUARD_BODY = "this is #2833's stall guard";
+    const GUARD_BODY = "collect('verify', verdict.reason, verdict.detail)";
     expect(src).toContain(GUARD_BODY);
     expect(src.indexOf(GUARD_BODY)).toBeLessThan(src.indexOf('Publish the source commit to the lane ref'));
     // #2833 finding 5 — the require-verified / break-glass options are resolved through the SHARED
@@ -1028,8 +1028,8 @@ describe('resolveDraft — a red-main fix PR always opens ready (card xu1nixv, i
     expect(resolveDraft({ mode: 'park', optOut: false, ref: 'lane/main-fix-7c731a95e', title: 'x' })).toBe(false);
     expect(resolveDraft({ mode: 'park', optOut: false, ref: 'lane/main-red-soak', title: 'WE #xh6ij2v: fix — fix red main — orphan-adopt soak' })).toBe(false);
   });
-  it('any other parked PR stays draft-first (the card PR "a red main gets an owner" included)', () => {
-    expect(resolveDraft({ mode: 'park', optOut: false, ref: 'lane/main-red-owner-card', title: 'backlog: file xu1nixv — a red main gets an owner' })).toBe(true);
+  it('other parked PRs also open ready for review', () => {
+    expect(resolveDraft({ mode: 'park', optOut: false, ref: 'lane/main-red-owner-card', title: 'backlog: file xu1nixv — a red main gets an owner' })).toBe(false);
     expect(isMainFixPr({ ref: 'lane/foo', title: 'fix(drain): main tip refresh' })).toBe(false);
   });
 });
@@ -1053,9 +1053,9 @@ describe('decideReadyOnOpen — only flagged PRs skip the draft step (fail close
     expect(decideReadyOnOpen({ body: marker, changedFiles: guard }).ready).toBe(false);
     expect(decideReadyOnOpen({ body: marker, changedFiles: guard, guardConfigPaths: 'nope' }).ready).toBe(false);
   });
-  it('resolveDraft honours readyOnOpen but never drafts outside park', () => {
+  it('resolveDraft opens ready regardless of readyOnOpen', () => {
     expect(resolveDraft({ mode: 'park', optOut: false, readyOnOpen: true })).toBe(false);
-    expect(resolveDraft({ mode: 'park', optOut: false, readyOnOpen: false })).toBe(true);
+    expect(resolveDraft({ mode: 'park', optOut: false, readyOnOpen: false })).toBe(false);
   });
 });
 describe('applyLabelWithRetry — a park label is retried before it is reported missing', () => {

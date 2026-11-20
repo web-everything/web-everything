@@ -21,6 +21,76 @@ function fixture(rows = required.map(n => check(n))) {
   return { d, state, settlements: () => [...new Map(state.filter(r => r.status !== 'sweep-cursor').map(r => [r.id, r])).values()], events, loads, run: () => urgentSweep({}, d) };
 }
 describe('urgent CI sweep', () => {
+  it('exempts absent CI for a conflict load from normal timers, then resumes monitoring when CI runs', async () => {
+    const f = fixture([]);
+    f.loads[0] = { ...load, conflict: { pr: 42, mergeableState: 'dirty' } };
+    f.d.now = () => '2026-11-18T18:00:00Z';
+    expect(await f.run()).toMatchObject({ results: [{ status: 'pending' }] });
+    expect(f.d.remove).not.toHaveBeenCalled();
+    expect(f.d.escalate).not.toHaveBeenCalled();
+    f.d.now = () => '2026-11-19T12:00:00Z';
+    expect(await f.run()).toMatchObject({ results: [{ status: 'pending' }] });
+    expect(f.d.remove).not.toHaveBeenCalled();
+    f.d.checks.mockReturnValue({ total_count: 1, check_runs: [check('test', null, { status: 'queued' })], workflows });
+    expect(await f.run()).toMatchObject({ results: [{ status: 'unloaded-pending-adoption' }] });
+    expect(f.d.remove).toHaveBeenCalledTimes(1);
+  });
+  it.each([
+    [24 * 60 * 60 * 1000 - 1, false, false],
+    [24 * 60 * 60 * 1000, true, false],
+    [72 * 60 * 60 * 1000 - 1, true, false],
+    [72 * 60 * 60 * 1000, true, true],
+    [17 * 24 * 60 * 60 * 1000, true, true],
+  ])('bounds a zero-check conflict load at age %i ms (24h escalation, 72h guarded unload)', async (age, alerted, unloaded) => {
+    const f = fixture([]);
+    f.loads[0] = { ...load, conflict: { pr: 42, mergeableState: 'dirty' } };
+    f.d.now = () => new Date(Date.parse(load.at) + age).toISOString();
+    f.d.remove.mockImplementation(() => {
+      expect(f.state.at(-1)).toMatchObject({ status: 'unload-decision', reason: 'ci-expired',
+        trackingId: load.trackingId, registration: load.registration });
+      return { retired: true };
+    });
+    expect(await f.run()).toMatchObject({ results: [{ status: unloaded ? 'unloaded-pending-adoption' : 'pending' }] });
+    expect(f.d.escalate.mock.calls.filter(([p]) => p.evidence.includes('conflict load still unresolved'))).toHaveLength(alerted ? 1 : 0);
+    expect(f.d.escalate.mock.calls.some(([p]) => p.evidence.includes('urgent load has no CI verdict after 6h'))).toBe(false);
+    expect(f.d.remove).toHaveBeenCalledTimes(unloaded ? 1 : 0);
+    if (unloaded) {
+      expect(f.d.remove).toHaveBeenCalledWith(f.loads[0], { ref: load.registration.ref });
+      expect(f.settlements()[0]).toMatchObject({ unloadReason: expect.stringContaining('conflict load still unresolved after 72h') });
+    }
+    await urgentSweep({}, { ...f.d });
+    expect(f.d.escalate.mock.calls.filter(([p]) => p.evidence.includes('conflict load still unresolved'))).toHaveLength(alerted ? 1 : 0);
+    expect(f.d.remove).toHaveBeenCalledTimes(unloaded ? 1 : 0);
+  });
+  it('escalates each conflict tracking id once even when the same SHA is loaded again', async () => {
+    const f = fixture([]);
+    f.loads[0] = { ...load, conflict: { pr: 42, mergeableState: 'dirty' } };
+    f.d.now = () => '2026-11-19T12:00:00Z';
+    await f.run();
+    f.loads.push({ ...f.loads[0], trackingId: 'second-load' });
+    await urgentSweep({}, { ...f.d });
+    const alerts = f.d.escalate.mock.calls.filter(([p]) => p.evidence.includes('conflict load still unresolved'));
+    expect(alerts).toHaveLength(2);
+    expect(new Set(alerts.map(([p]) => p.id)).size).toBe(2);
+    expect(f.d.remove).not.toHaveBeenCalled();
+  });
+  it('keeps a 72h conflict load and escalates when guarded retirement refuses', async () => {
+    const f = fixture([]);
+    f.loads[0] = { ...load, conflict: { pr: 42, mergeableState: 'dirty' } };
+    f.d.now = () => '2026-11-21T12:00:00Z';
+    f.d.remove.mockReturnValue({ retired: false, refused: 'registration-changed' });
+    expect(await f.run()).toMatchObject({ ok: false, results: [{ status: 'needs-you', detail: 'overlay removal refused: registration-changed' }] });
+    expect(f.events).toEqual([]);
+    expect(f.settlements()[0]).toMatchObject({ status: 'unload-decision' });
+    expect(f.d.escalate).toHaveBeenCalledWith(expect.objectContaining({ evidence: ['overlay removal refused: registration-changed'] }));
+  });
+  it('still unloads and escalates completed CI failure for a conflict load', async () => {
+    const f = fixture([check('test', 'failure')]);
+    f.loads[0] = { ...load, conflict: { pr: 42, mergeableState: 'dirty' } };
+    expect(await f.run()).toMatchObject({ results: [{ status: 'unloaded-pending-adoption' }] });
+    expect(f.d.remove).toHaveBeenCalledTimes(1);
+    expect(f.d.escalate).toHaveBeenCalled();
+  });
   it('unloads a 17-day-old zero-check load, escalates once and tracks adoption', async () => {
     const f = fixture([]);
     f.loads[0] = { ...load, at: '2026-11-01T12:00:00Z' };

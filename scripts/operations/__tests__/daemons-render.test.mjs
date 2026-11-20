@@ -209,3 +209,9 @@ describe('daemon renderer', () => {
     expect(log.mock.calls.flat().join('\n')).not.toContain(host.home);
   });
 });
+
+it('renders the host developer directory while preserving a task override', () => {
+  expect(renderPlist(task, { ...host, developerDir: '/Library/Developer/CommandLineTools' })).toContain('<string>/Library/Developer/CommandLineTools</string>');
+  expect(renderPlist({ ...task, env: { DEVELOPER_DIR: '/nonexistent/fake' } }, { ...host, developerDir: '/Library/Developer/CommandLineTools' })).toContain('<string>/nonexistent/fake</string>');
+  expect(renderPlist(task, host)).not.toContain('<key>DEVELOPER_DIR</key>');
+});
