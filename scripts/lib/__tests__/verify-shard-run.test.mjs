@@ -13,7 +13,7 @@ import { keepAliveScript } from '../test-keepalive.mjs';
 import { pidIdentity } from '../pid-alive.mjs';
 import { createFailureCollector } from '../verify-failures.mjs';
 import { verifyFinishBody } from '../lane-verify.mjs';
-import { splitVitestArgs, runShards, executeShard, inventoryVerdict, parseShardCli, streamedInventory, SHARD_REPORT_MAX_BYTES, SHARD_UNSETTLED_EXIT } from '../verify-shard-run.mjs';
+import { splitVitestArgs, runShards, executeShard, inventoryVerdict, parseShardCli, streamedInventory, SHARD_REPORT_MAX_BYTES, SHARD_UNSETTLED_EXIT, SHARD_LOCAL_ENV } from '../verify-shard-run.mjs';
 
 describe('shard split', () => {
   it('balances deterministically, covers files once, and preserves flags including values', () => {
@@ -725,5 +725,69 @@ describe('local shard wait budget (verify.localShardWaitMs)', () => {
     const { code, lines } = await run({ exitCode: SHARD_UNSETTLED_EXIT });
     expect(code).toBe(SHARD_UNSETTLED_EXIT);
     expect(lines.join('')).toMatch(/host-load deferral.*waited/);
+  });
+});
+
+// verify-lane --local keeps the wrapper (PR #7188): its completeness check must still apply, on this host only.
+describe('forced local shards (verify-lane --local)', () => {
+  const heldLocal = { [SHARD_LOCAL_ENV]: '1', WE_HEAVY_ADMISSION_HELD: '1' };
+  async function run(env, reportFiles = files => files, { parallel = 2 } = {}) {
+    const calls = [], lines = [];
+    let active = 0, peak = 0;
+    const code = await runShards({ argv: ['npx', 'vitest', 'run', 'a.test.mjs', 'b.test.mjs', '--passWithNoTests'], shards: 2, parallel, budgetMs: 60000 }, {
+      discover: () => null, env, now: () => 0, log: s => lines.push(s), tmpdir: () => '/scratch',
+      fs: { mkdtempSync: () => '/scratch/shards', rmSync: () => {}, readFileSync: () => { throw Error('missing'); } },
+      needsGit: () => true,
+      acquireLocal: async () => { throw Error('forced-local shards must not take a second slot'); }, releaseLocal: () => {},
+      execute: async options => {
+        calls.push(options);
+        peak = Math.max(peak, ++active);
+        await new Promise(resolve => setImmediate(resolve));
+        active--;
+        return { exitCode: 0, reportText: JSON.stringify({ testResults: reportFiles(options.files).map(name => ({ name,
+          status: 'passed', assertionResults: [{ status: 'passed' }] })) }) };
+      },
+    });
+    return { code, calls, peak, output: lines.join('') };
+  }
+
+  it('a successful partial execution is never green: the unreported file stays INVENTORY-INCOMPLETE', async () => {
+    // A selected file that never reports (e.g. excluded at run time) leaves only the other file's evidence.
+    const { code, calls, output } = await run(heldLocal, files => files.filter(file => file !== 'b.test.mjs'));
+    expect(code).toBe(SHARD_UNSETTLED_EXIT);
+    expect(output).toMatch(/verify-shard 2\/2: INVENTORY-INCOMPLETE/);
+    expect(output).not.toMatch(/GREEN/);
+    expect(calls.length).toBeGreaterThan(2);
+  });
+
+  it('runs every attempt on this host under the held slot, one shard at a time, and passes on complete evidence', async () => {
+    const { code, calls, peak, output } = await run(heldLocal);
+    expect(code).toBe(0);
+    expect(output).toMatch(/GREEN \(all 2 shards, 2 files executed and passed\)/);
+    expect(calls).toHaveLength(2);
+    expect(peak).toBe(1);
+    for (const call of calls) {
+      expect(call.command).toBe('npx');
+      expect(call.args.slice(0, 2)).toEqual(['vitest', 'run']);
+      expect(call.args.join(' ')).not.toContain('heavy-admission');
+      expect(call.env.WE_HEAVY_ADMISSION_HELD).toBe('1');
+    }
+  });
+
+  it.each([
+    ['no held slot', { [SHARD_LOCAL_ENV]: '1' }],
+    ['an unrecognized value', { [SHARD_LOCAL_ENV]: 'true', WE_HEAVY_ADMISSION_HELD: '1' }],
+    ['an empty value', { [SHARD_LOCAL_ENV]: '', WE_HEAVY_ADMISSION_HELD: '1' }],
+  ])('refuses to run with %s (fail closed, nothing executed)', async (_name, env) => {
+    const { code, calls, output } = await run(env);
+    expect(code).toBe(1);
+    expect(calls).toHaveLength(0);
+    expect(output).toMatch(/verify-shards: RED \(internal error: .*WE_VERIFY_SHARD_LOCAL/);
+  });
+
+  it('without the forced-local env the default route is unchanged (admission decides)', async () => {
+    const { code, calls } = await run({}, files => files, { parallel: 1 });
+    expect(code).toBe(0);
+    expect(calls.every(call => call.command === 'node' && call.args[1] === 'run')).toBe(true);
   });
 });
