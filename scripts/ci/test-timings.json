@@ -2018,7 +2018,10 @@
   "webcases/__tests__/requirementValidator.test.ts": 0.01,
   "webtraits/__tests__/intentProfileResolver.test.ts": 0.01,
   "webtraits/__tests__/surfaceIntentResolver.test.ts": 0.02,
-  "wrapper-conformance/__tests__/runner.test.ts": 0.01
+  "wrapper-conformance/__tests__/runner.test.ts": 0.01,
+  "scripts/lib/__tests__/daemon-rebuild-early-launch.test.mjs": 1,
+  "scripts/lib/__tests__/daemon-rebuild-early-timing.test.mjs": 1,
+  "scripts/lib/__tests__/daemon-rebuild-recovery.test.mjs": 1
  },
  "soak": {
   "scripts/conveyor/soak/breaks/runtime-admission-infra-retention.soak.test.mjs": 0.1,
@@ -2384,4 +2387,7 @@
   "scripts/conveyor/soak/breaks/watchdog-pr-list-transient-retry.soak.test.mjs": 3
  },
  "integration": {}
+  "scripts/conveyor/soak/breaks/rebuild-launch-before-next-tick.soak.test.mjs": 2,
+  "scripts/conveyor/soak/breaks/rebuild-held-recovery.soak.test.mjs": 1,
+  "scripts/conveyor/soak/breaks/rebuild-evidence-compatibility.soak.test.mjs": 1,
 }

@@ -6,7 +6,7 @@ import { mkdirSync, appendFileSync } from 'node:fs';
 import { dirname } from 'node:path';
 import { hostname } from 'node:os';
 import { removeOverlay, appendOverlayEvent } from '../daemon-overlays.mjs';
-import { alertsFilePath, readRebuildState, writeRebuildState, clearReadyCandidate } from './state.mjs';
+import { alertsFilePath, readRebuildState, writeRebuildState, clearReadyCandidate, appliedShape } from './state.mjs';
 import { verifyRev, makeGit } from './shared.mjs';
 import { resolveOverlayConflict } from './overlay-strategies.mjs';
 import { releaseBuildLease } from './lease.mjs';
@@ -55,6 +55,7 @@ export function matchReadyCandidate({
   tipInMain = () => false,
 }) {
   if (!ready) return { adopt: null, reason: 'none' };
+  if (!appliedShape(ready.adopt?.applied)) return { adopt: null, reason: 'invalid-ready-applied' };
   // The live plan could not persist its audit pin. No ready/fallback path may replace that history with a build
   // lacking the pin (even a same-tree candidate or a record claiming pinnedFrom for a different sha).
   if (plan.reason === 'pinned-overlay-hold-marker-failed') return { adopt: null, reason: plan.reason };
@@ -90,7 +91,7 @@ export function matchReadyCandidate({
     // Literal reasons (no template): the reason-classification test reads them statically.
     if (watch !== 'ok') return { adopt: null, reason: watch === 'unreadable' ? 'forced-watch-unreadable' : watch === 'owed' ? 'forced-watch-owed' : 'forced-watch-missing' };
   }
-  const applied = ready.adopt.applied || [];
+  const applied = ready.adopt.applied;
   if (ready.kind === 'fallback') {
     if (!allowFallback) return { adopt: null, reason: 'fallback-not-allowed' };
     if (!applied.every((a) => stillWanted(a.ref))) return { adopt: null, reason: 'overlay-no-longer-wanted' };
@@ -354,9 +355,9 @@ export function staleAlertDetail(result, state) {
     reason: result.reason,
     mainSha: result.plan.mainSha,
     target: result.plan.finalSha,
-    retryAt: result.reason === 'smoke-harness-broken-backoff' || result.reason === 'smoke-harness-broken'
+    retryAt: state.held?.reason === 'smoke-env-timeout' ? state.held.retryAt ?? null : result.reason === 'smoke-harness-broken-backoff' || result.reason === 'smoke-harness-broken'
       || state.rejected?.inputsKey === result.plan.inputsKey ? (state.rejected?.retryAt ?? null) : null,
-    attempts: state.rejected?.attempts ?? null,
+    attempts: state.held?.reason === 'smoke-env-timeout' ? state.held.attempts ?? null : state.rejected?.attempts ?? null,
     ...(state.held ? { broken: {
       failed: state.held.failed,
       detail: state.held.details?.[0]?.name === 'daemon-entries-boot'
@@ -384,7 +385,7 @@ export async function finalizeRebuild(options) {
 }
 
 async function finalizeRebuildLocked({
-  root, env, log, run, stateOpts, now, plan, prevHead, lease, onAdopted, auditedTip = null,
+  root, env, log, run, stateOpts, now, plan, prevHead, lease, onAdopted, auditedTip = null, readyPassedAt,
 }) {
   const stEnv = { ...env, ...(stateOpts?.env || {}) };
   const git = makeGit({ run, cwd: root, env });
@@ -442,6 +443,7 @@ async function finalizeRebuildLocked({
     if (!state.adopted || state.adopted.inputsKey !== plan.inputsKey || state.held) {
       state.adopted = {
         head: plan.finalSha, inputsKey: plan.inputsKey, mainSha: plan.mainSha, applied: plan.applied, at: nowIso(),
+        ...(Number.isFinite(Date.parse(readyPassedAt)) ? { readyToAdoptedMs: Math.max(0, nowMs() - Date.parse(readyPassedAt)) } : {}),
       };
       state.rejected = null;
       state.held = null;
@@ -513,6 +515,7 @@ async function finalizeRebuildLocked({
     }
     state.adopted = {
       head: plan.finalSha, inputsKey: plan.inputsKey, mainSha: plan.mainSha, applied: plan.applied, at: nowIso(),
+      ...(Number.isFinite(Date.parse(readyPassedAt)) ? { readyToAdoptedMs: Math.max(0, nowMs() - Date.parse(readyPassedAt)) } : {}),
     };
     state.rejected = null;
     state.held = null;

@@ -227,7 +227,7 @@ describe('the Git proof of omitted content in the candidate build', () => {
 });
 
 describe('a passed candidate blocked at finalize by a long reader tick is adopted later without re-smoking', () => {
-  it('readyBuildVerified refuses a force-pushed pinned sha and rebuildClone freshly smokes the current plan', async () => {
+  it.each(['moved tip', 'retired overlay', 'HEAD mismatch'])('tick-start discards a stale pinned candidate after %s and freshly rebuilds', async (stale) => {
     const { originDir, cloneDir, env } = makeFixture();
     env.WE_DAEMON_REBUILD_SKIP_UNRELATED = '0';
     env.WE_DAEMON_OVERLAY_EDGE_RESOLVE = '0';
@@ -253,26 +253,32 @@ describe('a passed candidate blocked at finalize by a long reader tick is adopte
       mainTip: gitOk(cloneDir, ['rev-parse', 'origin/main']).trim(),
     });
     expect(verify()).toBe(true);
-    pushBranch(originDir, 'lane/moving', (dir) => {
-      writeFile(dir, 'moving.txt', 'old\n');
-      writeFile(dir, 'shared.txt', 'moving\n');
-    }, { force: true });
-    gitOk(cloneDir, ['fetch', '-q', 'origin', '+refs/heads/*:refs/remotes/origin/*']);
-    expect(git(cloneDir, ['merge-base', '--is-ancestor', old, 'origin/lane/moving']).status).toBe(1);
-    expect(verify()).toBe(false);
+    if (stale === 'moved tip') {
+      pushBranch(originDir, 'lane/moving', (dir) => {
+        writeFile(dir, 'moving.txt', 'old\n');
+        writeFile(dir, 'shared.txt', 'moving\n');
+      }, { force: true });
+      gitOk(cloneDir, ['fetch', '-q', 'origin', '+refs/heads/*:refs/remotes/origin/*']);
+      expect(git(cloneDir, ['merge-base', '--is-ancestor', old, 'origin/lane/moving']).status).toBe(1);
+      expect(verify()).toBe(false);
+    } else if (stale === 'retired overlay') {
+      removeOverlay(cloneDir, 'lane/moving', { env });
+    } else {
+      gitOk(cloneDir, ['reset', '--hard', ready.adopt.finalSha]);
+    }
     // Exact and same-tree matches are re-derived from the live plan and deliberately reuse its smoke.
     // Move main to a different tree so the old ready record needs superseded-build provenance instead.
     advanceMain(originDir, (dir) => writeFile(dir, 'main-later.txt', 'later\n'));
 
     const freshSmoke = vi.fn(async () => PASS);
-    const result = await rebuildClone({ root: cloneDir, env, runSmoke: freshSmoke, lockOpts: LOCK_OPTS });
+    const result = await rebuildClone({ root: cloneDir, env, launchedBy: 'tick-start', runSmoke: freshSmoke, lockOpts: LOCK_OPTS });
     expect(result.adopted).toBe(true);
     expect(result.reason).not.toBe('ready-adopted');
-    expect(result.alerts).toContainEqual(expect.objectContaining({ kind: 'ready-candidate-discarded', detail: expect.objectContaining({ reason: 'unverified-build' }) }));
+    expect(result.alerts).toContainEqual(expect.objectContaining({ kind: 'ready-candidate-discarded' }));
     expect(freshSmoke).toHaveBeenCalledTimes(1);
+    expect(readReadyCandidate(cloneDir, env)).toBeNull();
+    expect(existsSync(join(cloneDir, 'main-later.txt'))).toBe(true);
     expect(gitOk(cloneDir, ['rev-parse', 'HEAD']).trim()).not.toBe(ready.adopt.finalSha);
-    expect(readFileSync(join(cloneDir, 'main-later.txt'), 'utf8')).toBe('later\n');
-    expect(git(cloneDir, ['merge-base', '--is-ancestor', old, 'HEAD']).status).toBe(0);
   });
 
   it('records it as ready, then the next rebuild adopts it even though main moved again', async () => {
@@ -285,13 +291,16 @@ describe('a passed candidate blocked at finalize by a long reader tick is adopte
     });
     expect(first.adopted).not.toBe(true);
     expect(first.reason).toBe('tick-in-progress');
-    expect(readReadyCandidate(cloneDir, env)?.adopt.finalSha).toBe(target);
+    const ready = readReadyCandidate(cloneDir, env);
+    expect(ready?.adopt.finalSha).toBe(target);
 
     endTick(); // the sibling's tick boundary
     advanceMain(originDir, (dir) => writeFile(dir, 'b.txt', 'b\n')); // the live churn: a new candidate sha
     const noSmoke = vi.fn(async () => PASS);
+    const adoptedAtMs = Date.parse(ready.passedAt) + 5000;
     const second = await rebuildClone({
       root: cloneDir, env, runSmoke: noSmoke, prState: async () => null, lockOpts: LOCK_OPTS,
+      now: () => adoptedAtMs,
     });
     expect(second.moved).toBe(true);
     expect(second.adopted).toBe(true);
@@ -301,6 +310,9 @@ describe('a passed candidate blocked at finalize by a long reader tick is adopte
     expect(noSmoke).not.toHaveBeenCalled();
     expect(existsSync(readyCandidatePath(cloneDir, env))).toBe(false);
     expect(readRebuildState(cloneDir, env).adopted?.head).toBe(target);
+    const adopted = readRebuildState(cloneDir, env).adopted;
+    expect(adopted.at).toBe(new Date(adoptedAtMs).toISOString());
+    expect(adopted.readyToAdoptedMs).toBe(5000);
   });
 
   it('a sibling process adopts it at its tick start despite the build lease the blocked mover left behind', async () => {
@@ -538,6 +550,7 @@ describe('a passed candidate blocked at finalize by a long reader tick is adopte
     ['missing event log', { log: 'missing' }, false],
   ])('historical merge retirement: %s', async (_name, options, accepted) => {
     const { originDir, cloneDir, env } = makeFixture();
+    env.WE_DAEMON_REBUILD_STRICT_EVIDENCE = '1';
     env.WE_DAEMON_REBUILD_SKIP_UNRELATED = '0';
     const ref = 'lane/review-seat-fairness-m1';
     const sha = pushBranch(originDir, ref, (dir) => writeFile(dir, 'live.txt', 'live\n'));
@@ -582,7 +595,19 @@ describe('a passed candidate blocked at finalize by a long reader tick is adopte
     const matching = vi.spyOn(adoption, 'matchReadyCandidate');
     const noSmoke = vi.fn(async () => PASS);
     try {
+      const preserved = options.log === 'unreadable' ? [
+        readyCandidatePath(cloneDir, env), rebuildStatePath(cloneDir, env),
+        overlayFilePath(cloneDir, env).replace(/\.json$/, '.events.jsonl'),
+      ].map(file => [file, readFileSync(file, 'utf8')]) : [];
       const result = await rebuildClone({ root: cloneDir, env, adoptOnly: true, runSmoke: noSmoke, lockOpts: LOCK_OPTS });
+      if (options.log === 'unreadable') {
+        expect(result).toMatchObject({ moved: false, reason: 'state-unreadable' });
+        expect(matching).not.toHaveBeenCalled();
+        expect(noSmoke).not.toHaveBeenCalled();
+        expect(gitOk(cloneDir, ['rev-parse', 'HEAD']).trim()).toBe(liveHead);
+        for (const [file, bytes] of preserved) expect(readFileSync(file, 'utf8')).toBe(bytes);
+        return;
+      }
       expect(matching).toHaveBeenCalledOnce();
       if (options.registered) {
         expect(readOverlays(cloneDir, { env }).map((overlay) => overlay.ref)).toContain(ref);
@@ -653,7 +678,7 @@ describe('a passed candidate blocked at finalize by a long reader tick is adopte
     const file = readyCandidatePath(cloneDir, env);
     mkdirSync(dirname(file), { recursive: true });
     writeFileSync(file, JSON.stringify({
-      kind: 'candidate', prevHead: head, tree: 'x', passedAt: new Date().toISOString(),
+      kind: 'candidate', forced: false, prevHead: head, tree: 'x', passedAt: new Date().toISOString(),
       adopt: {
         finalSha: evil, inputsKey: 'forged', mainSha: evil, applied: [],
       },
@@ -688,7 +713,7 @@ describe('a passed candidate blocked at finalize by a long reader tick is adopte
     const file = readyCandidatePath(cloneDir, env);
     mkdirSync(dirname(file), { recursive: true });
     writeFileSync(file, JSON.stringify({
-      kind: 'candidate', prevHead: gitOk(cloneDir, ['rev-parse', 'HEAD']).trim(), tree: 'x', passedAt: new Date().toISOString(),
+      kind: 'candidate', forced: false, prevHead: gitOk(cloneDir, ['rev-parse', 'HEAD']).trim(), tree: 'x', passedAt: new Date().toISOString(),
       adopt: {
         finalSha: forged, inputsKey: 'forged', mainSha, applied: [{ ref: 'lane/ok', pr: null, sha: ovSha }],
       },
@@ -715,7 +740,7 @@ describe('a passed candidate blocked at finalize by a long reader tick is adopte
     const mainSha = advanceMain(originDir, (dir) => writeFile(dir, 'w.txt', 'w\n'));
     const file = readyCandidatePath(cloneDir, env);
     writeFileSync(file, JSON.stringify({
-      kind: 'candidate', prevHead: built, tree: 'x', passedAt: new Date().toISOString(),
+      kind: 'candidate', forced: false, prevHead: built, tree: 'x', passedAt: new Date().toISOString(),
       adopt: {
         finalSha: old, inputsKey: 'forged', mainSha: old, applied: [],
       },
@@ -803,7 +828,7 @@ describe('a passed candidate blocked at finalize by a long reader tick is adopte
 
 describe('matchReadyCandidate — pure', () => {
   const base = {
-    kind: 'candidate', prevHead: 'H', tree: 'T1', passedAt: new Date(1_000_000).toISOString(),
+    kind: 'candidate', forced: false, prevHead: 'H', tree: 'T1', passedAt: new Date(1_000_000).toISOString(),
     adopt: {
       finalSha: 'S1', inputsKey: 'K1', mainSha: 'M1', applied: [{ ref: 'lane/a', sha: 'a1' }],
     },

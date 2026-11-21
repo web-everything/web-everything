@@ -33,6 +33,8 @@
  * `conflict-dropped` (clause 5(c)) for what a rebuild does on its own — one JSON line per event, never
  * rewritten, so the history survives even though the list itself is mutated in place.
  */
+import { rebuildReaders } from './daemon-rebuild/evidence-context.mjs';
+
 
 import {
   readFileSync, writeFileSync, renameSync, mkdirSync, appendFileSync, rmdirSync, statSync,
@@ -97,6 +99,7 @@ function eventsFilePath(root, env = process.env) {
  * @returns {{clone:string|null, overlays:Array<object>, corrupt:boolean}}
  */
 export function readOverlayState(root, { env = process.env } = {}) {
+  if (rebuildReaders()) return rebuildReaders().overlays(root, env);
   const file = overlayFilePath(root, env);
   let raw;
   try {
@@ -187,6 +190,7 @@ function readOverlaysForWrite(root, env) {
  * @returns {Array<object>} the same `list`, for chaining
  */
 export function writeOverlays(root, list, { env = process.env } = {}) {
+  rebuildReaders()?.validate(root, env);
   const file = overlayFilePath(root, env);
   mkdirSync(dirname(file), { recursive: true });
   const payload = JSON.stringify({ clone: resolveCloneRoot(root), overlays: list }, null, 2);

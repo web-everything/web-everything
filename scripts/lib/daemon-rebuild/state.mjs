@@ -1,11 +1,16 @@
 /** @file scripts/lib/daemon-rebuild/state.mjs — Per-clone state files.
  * Split out of daemon-rebuild.mjs (move-only).
  */
+import { makeAuditedTipGate } from './audited-tip.mjs';
+import { rebuildReaders } from './evidence-context.mjs';
+
 
 import { existsSync, readFileSync, mkdirSync, writeFileSync, renameSync, unlinkSync } from 'node:fs';
 import { overlayFilePath, cloneKey } from '../daemon-overlays.mjs';
 import { daemonStateDir } from '../daemon-last-good.mjs';
 import { join, dirname } from 'node:path';
+import { spawnSync } from 'node:child_process';
+import { FULL_SHA_RE, REBUILD_IDENTITY_ENV, verifyRev } from './shared.mjs';
 
 /**
  * Is `root` a daemon-managed clone — one the rebuild moves with `reset --hard`? True once it has a rebuild
@@ -52,16 +57,81 @@ const EMPTY_STATE = Object.freeze({
 });
 
 /**
- * Read the per-clone rebuild state, never throwing — a missing or corrupt file reads as the empty state (fail
- * closed to "nothing adopted, nothing rejected, nothing in progress", never a crash).
+ * Read the per-clone rebuild state, never throwing — a missing or corrupt file reads as the empty state. Legacy, best-effort consumers only;
+ * admission must use the strict reader and retain its snapshot.
  * @param {string} root
  * @param {NodeJS.ProcessEnv} [env]
  * @returns {{adopted:object|null, rejected:object|null, inProgress:object|null, quarantine:object|null,
  *   unverified:{head:string, prevHead:string}|null, building:object|null, smokePassed:Array<{key:string, tree:string, passedAt:string}>|null}}
  */
 export function readRebuildState(root, env = process.env) {
+  return rebuildReaders() ? rebuildReaders().state(root, env) : readState(root, env, false);
+}
+
+/** Launch admission: only ENOENT means empty; unreadable/corrupt evidence throws for refusal. */
+export function readRebuildStateStrict(root, env = process.env, read = readFileSync) {
+  return readState(root, env, true, read);
+}
+
+const object = v => v !== null && typeof v === 'object' && !Array.isArray(v);
+const string = v => typeof v === 'string' && v.length > 0;
+const date = v => string(v) && Number.isFinite(Date.parse(v));
+const positive = v => Number.isSafeInteger(v) && v > 0;
+const strings = v => Array.isArray(v) && v.every(string);
+export const appliedShape = v => Array.isArray(v) && v.every(r => object(r) && string(r.ref) && string(r.sha)
+  && (!Object.hasOwn(r, 'pinnedFrom') || string(r.pinnedFrom)));
+const applied = appliedShape;
+const pinnedApplied = v => appliedShape(v) && v.every(r => !Object.hasOwn(r, 'pinnedFrom')
+  || (FULL_SHA_RE.test(r.pinnedFrom) && FULL_SHA_RE.test(r.sha) && r.sha !== r.pinnedFrom));
+const fields = (v, required, optional = {}) => object(v)
+  && Object.entries(required).every(([k, valid]) => valid(v[k]))
+  && Object.entries(optional).every(([k, valid]) => !(k in v) || valid(v[k]));
+const boolean = v => typeof v === 'boolean';
+const nullable = valid => v => v === null || valid(v);
+const backoff = { retryAt: nullable(date), attempts: positive };
+// Admission requires identity/audit evidence. Legacy records omit backoff and false
+// flags; validate those fields when present, and require deadlines for scheduled retries.
+// Other incomplete files require operator repair; only ENOENT creates EMPTY_STATE.
+export const rebuildStateSchema = {
+  // A legacy env-timeout hold has no retryAt (the live incident that this recovery exists for): it is valid evidence
+  // and is treated as due by recovery. A present retryAt must still be a date or null.
+  held: v => fields(v, { reason: string, since: date, updatedAt: date }, {
+    ...backoff, inputsKey: string, target: nullable(string),
+  }),
+  rejected: v => fields(v, { inputsKey: string, reason: string, at: date }, { ...backoff,
+    harnessBroken: boolean, externalOnly: boolean, envLoad: boolean, dispatchSmoke: boolean })
+    && (!(v.harnessBroken || v.externalOnly || v.envLoad) || date(v.retryAt)),
+  // A force watch can hold only lastGood.head. Its rollback writes no plan keys;
+  // interrupted recovery explicitly writes null for those same unknown keys.
+  // Keep the head, timestamp and applied evidence mandatory, without inventing a plan.
+  adopted: v => fields(v, { head: string, applied, at: date }, { inputsKey: nullable(string), mainSha: nullable(string) }),
+  // Pre-smoke-before-reset records lack verified: recovery must roll them back,
+  // rather than refusing the evidence before it can inspect that absent marker.
+  inProgress: v => fields(v, { pid: positive, host: string, startedAt: date, prevHead: string, target: string,
+    applied }, { inputsKey: string, mainSha: string, verified: boolean }),
+  quarantine: v => fields(v, { prevHead: string, reason: string }),
+  unverified: v => fields(v, { head: string, prevHead: string }),
+  // `adoptOnly` is written only for adopt-only leases (legacy shape); absent means a real-job lease.
+  building: v => fields(v, { token: string, pid: positive, host: string, startedAt: date,
+    target: string, inputsKey: string, path: string }, { adoptOnly: boolean }),
+  busySkippedTrees: strings,
+  forceUnverifiedTrees: strings,
+  smokePassed: v => Array.isArray(v) && v.every(r => fields(r, { key: string, tree: string, passedAt: date })),
+  pinnedNotified: v => object(v) && Object.values(v).every(string),
+};
+
+function readState(root, env, strict, read = readFileSync) {
   try {
-    const parsed = JSON.parse(readFileSync(rebuildStatePath(root, env), 'utf8'));
+    const parsed = JSON.parse(read(rebuildStatePath(root, env), 'utf8'));
+    if (strict && (!parsed || typeof parsed !== 'object' || Array.isArray(parsed))) {
+      throw new Error('Invalid rebuild state object');
+    }
+    if (strict) for (const [key, valid] of Object.entries(rebuildStateSchema)) {
+      if (!Object.hasOwn(parsed, key) || (parsed[key] !== null && !valid(parsed[key]))) {
+        throw new Error(`Invalid rebuild state ${key}`);
+      }
+    }
+    if (strict) return parsed; // Preserve the one validated snapshot, without legacy coercion.
     return {
       adopted: parsed?.adopted ?? null,
       rejected: parsed?.rejected ?? null,
@@ -75,17 +145,21 @@ export function readRebuildState(root, env = process.env) {
       smokePassed: parsed?.smokePassed ?? null,
       pinnedNotified: parsed?.pinnedNotified ?? null,
     };
-  } catch {
+  } catch (error) {
+    if (strict && error?.code !== 'ENOENT') throw error;
     return { ...EMPTY_STATE };
   }
 }
 
 /** Atomic write — `<file>.tmp-<pid>` then `renameSync`, same posture as `daemon-overlays.mjs#writeOverlays`. */
 export function writeRebuildState(root, state, env = process.env) {
+  rebuildReaders()?.validate(root, env);
   const file = rebuildStatePath(root, env);
   mkdirSync(dirname(file), { recursive: true });
   const tmp = `${file}.tmp-${process.pid}`;
-  writeFileSync(tmp, JSON.stringify(state, null, 2), 'utf8');
+  // Preserve producer record shapes, including absent backoff and false flags.
+  const persisted = { ...EMPTY_STATE, ...state };
+  writeFileSync(tmp, JSON.stringify(persisted, null, 2), 'utf8');
   renameSync(tmp, file);
 }
 
@@ -111,6 +185,7 @@ export function readyCandidatePath(root, env = process.env) {
 
 /** The recorded ready candidate, or `null` (missing/corrupt reads as none — never throws). */
 export function readReadyCandidate(root, env = process.env) {
+  if (rebuildReaders()) return rebuildReaders().ready(root, env);
   try {
     const r = JSON.parse(readFileSync(readyCandidatePath(root, env), 'utf8'));
     return r && typeof r === 'object' && r.adopt?.finalSha && r.prevHead ? r : null;
@@ -119,12 +194,92 @@ export function readReadyCandidate(root, env = process.env) {
   }
 }
 
+/** Admission must distinguish absent ready evidence from unreadable or incomplete evidence. */
+export function readReadyCandidateStrict(root, env = process.env, read = readFileSync) {
+  let text;
+  try { text = read(readyCandidatePath(root, env), 'utf8'); }
+  catch (error) { if (error?.code === 'ENOENT') return null; throw error; }
+  const r = JSON.parse(text);
+  if (!fields(r, { prevHead: string, tree: string, passedAt: date, kind: v => ['candidate', 'fallback'].includes(v),
+    forced: boolean, adopt: v => fields(v, { finalSha: string, inputsKey: string, mainSha: string, applied: pinnedApplied }) }, {
+    at: date, token: string, pid: positive, host: string, forInputsKey: string,
+    dropRefs: v => Array.isArray(v) && v.every(r => fields(r,
+      { ref: string, sha: string, pr: v => v === null || positive(v) })),
+    failed: v => typeof v === 'string',
+  }) || (r.kind === 'fallback' && !fields(r, {
+    forInputsKey: string, dropRefs: v => Array.isArray(v) && v.every(r => fields(r,
+      { ref: string, sha: string, pr: v => v === null || positive(v) })),
+    failed: v => typeof v === 'string',
+  }))) {
+    throw new Error('Invalid ready candidate');
+  }
+  if (r.adopt.applied.some(a => Object.hasOwn(a, 'pinnedFrom'))
+    && (!FULL_SHA_RE.test(r.prevHead) || !FULL_SHA_RE.test(r.adopt.mainSha))) throw new Error('Invalid ready pin history bounds');
+  return r;
+}
+
+// A readable record can outlive its proof. Only adoption needs live pin proof;
+// admission and write guards must permit the locked tick to discard stale records.
+export class StaleReadyPinError extends Error {}
+export function assertReadyCandidatePins(root, r, env = process.env, read = readFileSync, { run = (args, opts) => spawnSync('git', args, { encoding: 'utf8', timeout: 10_000, killSignal: 'SIGKILL', maxBuffer: 1024 * 1024, stdio: ['ignore', 'pipe', 'ignore'], ...opts }) } = {}) {
+  const pins = r.adopt.applied.filter(a => Object.hasOwn(a, 'pinnedFrom'));
+  if (pins.length) {
+    // Legacy-reader rollback must not turn record fields into Git options.
+    if (!pinnedApplied(r.adopt.applied) || !FULL_SHA_RE.test(r.prevHead) || !FULL_SHA_RE.test(r.adopt.mainSha)) {
+      throw new Error('Invalid ready pin history bounds');
+    }
+    let registry;
+    try { registry = JSON.parse(read(overlayFilePath(root, env), 'utf8')); }
+    catch (error) { if (error.code !== 'ENOENT') throw error; registry = { overlays: [] }; }
+    if (!Array.isArray(registry?.overlays)) throw new Error('Invalid ready pin registry');
+    const git = args => run(args, { cwd: root, env: { ...process.env, ...env, GIT_OPTIONAL_LOCKS: '0' },
+      encoding: 'utf8', timeout: 60_000, maxBuffer: 8 * 1024 * 1024, killSignal: 'SIGKILL' });
+    const head = verifyRev(git, 'HEAD');
+    if (!head) throw new Error('Unreadable ready pin head');
+    if (head !== r.prevHead) {
+      // Recovery can encounter the exact target already at HEAD: finalizeRebuild
+      // persists its verified swap before reset, then writes adopted and clears
+      // ready. Require that durable transaction/adoption to corroborate the plan;
+      // an arbitrary moved head or a ready record alone never establishes this
+      // transition. Writer guards themselves only validate record shape.
+      if (head !== r.adopt.finalSha || !FULL_SHA_RE.test(head)) throw new StaleReadyPinError('Unproven ready pin head');
+      const state = readRebuildStateStrict(root, env, read);
+      const samePlan = v => v?.inputsKey === r.adopt.inputsKey && v?.mainSha === r.adopt.mainSha
+        && JSON.stringify(v?.applied) === JSON.stringify(r.adopt.applied);
+      const swapping = state.inProgress?.verified === true && state.inProgress.prevHead === r.prevHead
+        && state.inProgress.target === head && samePlan(state.inProgress);
+      const adopted = state.adopted?.head === head && samePlan(state.adopted);
+      if (!swapping && !adopted) throw new StaleReadyPinError('Unproven ready pin transition');
+    }
+    const history = git(['log', '--first-parent', '--format=%P%x09%ce%x09%s', r.prevHead, '--not', r.adopt.mainSha]);
+    if (history.status !== 0) throw new Error('Unreadable ready pin history');
+    const auditedTip = makeAuditedTipGate(env);
+    for (const pin of pins) {
+      // Follow mode disables audit revocation for every tip; it uses no pin exemption.
+      // Audit the applied SHA; pinnedFrom is the held tip, proved by registration below.
+      if (typeof auditedTip === 'function' && auditedTip(pin.ref, pin.sha) !== true) throw new StaleReadyPinError('Unaudited ready pin');
+      const registration = registry.overlays?.find(o => o.ref === pin.ref);
+      if (!registration || (registration.pr ?? null) !== (pin.pr ?? null)
+        || verifyRev(git, `refs/remotes/origin/${pin.ref}^{commit}`) !== pin.pinnedFrom) throw new StaleReadyPinError('Unproven ready pin registration');
+      const recorded = String(history.stdout).split('\n').find(line => {
+        const [parents, committer, subject] = line.split('\t');
+        const hit = subject?.match(/^daemon-rebuild: merge overlay (\S+) (?:\(PR #(\d+)\) )?onto /);
+        return hit && hit[1] === pin.ref && (hit[2] ? Number(hit[2]) : null) === (registration.pr ?? null)
+          && committer === REBUILD_IDENTITY_ENV.GIT_COMMITTER_EMAIL && [2, 3].includes(parents.split(' ').length);
+      });
+      if (!recorded || recorded.split('\t')[0].split(' ')[1] !== pin.sha) throw new StaleReadyPinError('Unproven ready pin adopted head');
+    }
+  }
+  return r;
+}
+
 export function writeReadyCandidate(root, record, env = process.env) {
+  rebuildReaders()?.validate(root, env);
   try {
     const file = readyCandidatePath(root, env);
     mkdirSync(dirname(file), { recursive: true });
     const tmp = `${file}.tmp-${process.pid}`;
-    writeFileSync(tmp, JSON.stringify(record, null, 2), 'utf8');
+    writeFileSync(tmp, JSON.stringify({ forced: false, ...record }, null, 2), 'utf8');
     renameSync(tmp, file);
     return true;
   } catch {
@@ -133,5 +288,6 @@ export function writeReadyCandidate(root, record, env = process.env) {
 }
 
 export function clearReadyCandidate(root, env = process.env) {
+  rebuildReaders()?.validate(root, env);
   try { unlinkSync(readyCandidatePath(root, env)); } catch { /* already gone */ }
 }

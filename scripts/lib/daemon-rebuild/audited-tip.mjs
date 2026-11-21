@@ -52,8 +52,8 @@ export function tipInMain(git, mainSha, sha) {
 
 /**
  * PURE: the refs whose applied tip a build must NOT be adopted with, judged against the audit evidence NOW.
- * Mirrors the plan's own exemptions, so a build the live plan would mint is never refused here: a head applied with
- * `pinnedFrom` is never an exemption: the applied sha is judged on its own evidence, a tip the running head or main already carries or has (`carries`, `inMain`),
+ * `pinnedFrom` is never an exemption: the applied sha is judged on its own evidence. Exemptions mirror the plan:
+ * a tip the running head or main already carries or has (`carries`, `inMain`),
  * and a registration with no adopted history (`auditAdopted` lists the refs that have one; unknown list = fail closed).
  * `held` are the tips the live plan reports as held back (`overlay-unaudited-tip` alerts). No gate (follow mode) = nothing to revoke.
  */

@@ -4,12 +4,15 @@ import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync } from 'nod
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { spawnSync } from 'node:child_process';
+import { rebuildCloneAsJob } from '../daemon-rebuild/rebuild-job.mjs';
+import { createJobStore } from '../daemon-jobs-runtime.mjs';
 import { planRebuild } from '../daemon-rebuild/plan.mjs';
 import { makeGit } from '../daemon-rebuild/shared.mjs';
 import { readyBuildVerified, matchReadyCandidate, finalizeRebuild } from '../daemon-rebuild/adopt.mjs';
 import { makeAuditedTipGate } from '../daemon-rebuild/audited-tip.mjs';
 import { addOverlay, resolveOverlayFollowTip } from '../daemon-overlays.mjs';
 import { rebuildClone } from '../daemon-rebuild.mjs';
+import { readReadyCandidateStrict, readReadyCandidate, writeReadyCandidate, assertReadyCandidatePins, StaleReadyPinError } from '../daemon-rebuild/state.mjs';
 import { appendEntry, storePath } from '../../operations/ruled-weakened-store.mjs';
 import { readRebuildState } from '../daemon-rebuild/state.mjs';
 
@@ -66,6 +69,25 @@ async function fixture() {
 }
 
 describe('unaudited-tip plans', () => {
+  it.each(['missing', 'held-tip-only'])('validates audited applied A while holding unaudited B after main advances; rejects %s evidence for A', async (remainingEvidence) => {
+    const f = await fixture();
+    f.env.WE_DAEMON_OVERLAY_DIR = join(f.dir, 'overlays');
+    addOverlay(f.root, { ref, pr: 42 }, { env: f.env });
+    gitOk(f.root, ['update-ref', 'HEAD', f.adopted.finalSha]);
+    const main = gitOk(f.root, ['commit-tree', `${f.base}^{tree}`, '-p', f.base, '-m', 'advance main']);
+    gitOk(f.root, ['update-ref', 'refs/remotes/origin/main', main]);
+    const plan = await f.plan();
+    expect(plan.ok).toBe(true);
+    expect(plan.mainSha).toBe(main);
+    expect(plan.applied).toEqual([{ ref, pr: 42, sha: f.a, pinnedFrom: f.b }]);
+    const ready = { prevHead: f.adopted.finalSha, adopt: plan };
+    expect(assertReadyCandidatePins(f.root, ready, f.env)).toBe(ready);
+
+    // The held tip's evidence cannot substitute for evidence of the applied SHA.
+    f.save(...(remainingEvidence === 'held-tip-only' ? [record(f.b)] : []));
+    expect(() => assertReadyCandidatePins(f.root, ready, f.env)).toThrow(StaleReadyPinError);
+    expect(() => assertReadyCandidatePins(f.root, ready, f.env)).toThrow('Unaudited ready pin');
+  });
   it.each(['throw', 'nonzero', 'empty', 'pad-throw'])(
     'retains the audit pin and refuses candidates when the hold-marker write fails: %s', async (failure) => {
       const f = await fixture();
@@ -993,3 +1015,54 @@ describe('unaudited-tip evidence and policy', () => {
     expect(makeAuditedTipGate({ ...f.env, WE_FIX_READY_PATH: join(f.dir, 'missing') })(ref, 'abc')).toBe(false);
   });
 });
+
+
+it.each(['early', 'recovery', 'tick-start'])('%s refuses malformed pins and defers readable pins to locked adoption proof', async launchedBy => {
+  const f = await fixture();
+  f.env.WE_DAEMON_REBUILD_STRICT_EVIDENCE = '1';
+  f.env.WE_DAEMON_STATE_DIR = join(f.dir, 'state');
+  f.env.WE_DAEMON_OVERLAY_DIR = join(f.dir, 'overlays');
+  addOverlay(f.root, { ref, pr: 42 }, { env: f.env });
+  gitOk(f.root, ['reset', '--hard', f.adopted.finalSha]);
+  const main = gitOk(f.root, ['commit-tree', `${f.base}^{tree}`, '-p', f.base, '-m', 'advance main']);
+  gitOk(f.root, ['update-ref', 'refs/remotes/origin/main', main]);
+  const plan = await f.plan();
+  const ready = { prevHead: f.adopted.finalSha, tree: gitOk(f.root, ['rev-parse', `${plan.finalSha}^{tree}`]),
+    passedAt: new Date().toISOString(), kind: 'candidate', forced: false, adopt: plan };
+  const check = () => rebuildClone({ root: f.root, env: f.env, launchedBy, readyOnly: true, asJob: false,
+    versions: null, log: { error() {} } });
+  for (const [sha, pinnedFrom, pr] of [[f.b, 'arbitrary', 42], [f.b, 'x'.repeat(1024), 42], [f.b, f.b, 42], [f.b, f.a, 42],
+    [f.a, 'f'.repeat(40), 42], [f.a, f.b, 99]]) {
+    writeReadyCandidate(f.root, { ...ready, adopt: { ...plan, applied: [{ ref, pr, sha, pinnedFrom }] } }, f.env);
+    const malformed = !/^[a-f0-9]{40}$/.test(pinnedFrom) || sha === pinnedFrom;
+    const prove = () => assertReadyCandidatePins(f.root, readReadyCandidateStrict(f.root, f.env), f.env);
+    expect(prove).toThrow(); // readable does not mean adoptable
+    if (malformed) expect(() => readReadyCandidateStrict(f.root, f.env)).toThrow();
+    else expect(readReadyCandidateStrict(f.root, f.env).adopt.applied[0]).toEqual({ ref, pr, sha, pinnedFrom });
+    expect((await check()).reason).toBe(malformed ? 'state-unreadable' : 'ready-pending');
+    const adopt = vi.fn(async () => ({ reason: 'ready-pending' })), reattach = vi.fn();
+    const store = createJobStore(join(f.dir, 'jobs'));
+    expect((await rebuildCloneAsJob({ root: f.root, env: f.env, launchedBy, store, adopt, reattach,
+      log: { error() {} } })).reason).toBe(malformed ? 'state-unreadable' : 'ready-pending');
+    if (malformed) {
+      expect(adopt).not.toHaveBeenCalled();
+      expect(reattach).not.toHaveBeenCalled();
+    } else expect(adopt).toHaveBeenCalledOnce();
+    expect(store.list().records).toEqual([]);
+    expect(readReadyCandidate(f.root, f.env).adopt.applied[0].pinnedFrom).toBe(pinnedFrom);
+  }
+  // Legacy pin provenance is accepted only with current audit membership as well as history proof.
+  f.save(record(f.a), record(f.b));
+  writeReadyCandidate(f.root, ready, f.env);
+  expect(readReadyCandidateStrict(f.root, f.env).adopt.applied).toEqual([{ ref, pr: 42, sha: f.a, pinnedFrom: f.b }]);
+  expect((await check()).reason).toBe('ready-pending');
+  // An oversized/truncated history is incomplete proof; preserve evidence for operator repair.
+  expect(() => assertReadyCandidatePins(f.root, ready, f.env, readFileSync, { run: (args, opts) => args[0] === 'log'
+    ? { status: null, error: Object.assign(new Error('history exceeds maxBuffer'), { code: 'ENOBUFS' }) }
+    : spawnSync('git', args, opts) })).toThrow('Unreadable ready pin history');
+  const args = { ready, plan, prevHead: ready.prevHead, treeOf: () => ready.tree, stillWanted: () => true,
+    verifyBuilt: () => true, auditedTip: makeAuditedTipGate(f.env), nowMs: Date.now(), maxAgeMs: 60000 };
+  expect(matchReadyCandidate(args).adopt).toBeTruthy();
+  expect(matchReadyCandidate({ ...args, ready: { ...ready, adopt: { ...plan, applied: [{ ref, sha: f.b }] } } }).reason)
+    .toBe('ready-audit-revoked');
+}, 180_000); // six real rebuild checks over real git fixtures: far slower than the default under host load
