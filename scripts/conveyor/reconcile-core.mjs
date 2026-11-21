@@ -3705,10 +3705,10 @@ export function planReconcile({
     // Repair, send-back and ruling owners above keep priority over an advisory, including an unreadable one.
     // One advisory per mechanical head; it is not a repair round and does not apply the red-team seat's hold.
     let unreadableHeadMoveAdvisory = false;
-    if (phase === 'needs-human' && !withPhase.labels.includes(ADVISORY_LABELS.CHANGES)) {
+    if (advisoryReviewOnHumanHandoff === 'on' && phase === 'needs-human' && !withPhase.labels.includes(ADVISORY_LABELS.CHANGES)) {
       const moved = advisoryHeadMoveState(pr);
       unreadableHeadMoveAdvisory = Boolean(moved.unreadable);
-      if (moved.owed && advisoryReviewOnHumanHandoff === 'on') {
+      if (moved.owed) {
         const rowsBefore = dispatch.length;
         const buffered = [];
         const bufferRefusal = (...args) => buffered.push(args);

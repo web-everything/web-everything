@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import { advisoryHeadMoveState, planReconcile } from '../reconcile-core.mjs';
 import { ADVISORY_NOTE_MARKER } from '../advisory-round-count.mjs';
+import { buildFixEndComment } from '../fix-procedure.mjs';
 
 import { buildReviewedShaMarker, buildClearedHumanMarker } from '../../lib/review-escalation.mjs';
 
@@ -27,6 +28,35 @@ const sendBack = () => ({ id: 'op-send-back', author: { login: 'chalbert' }, cre
 const red = [{ name: 'gate', status: 'completed', conclusion: 'failure' }];
 
 describe('review:human advisory re-run on a moved head', () => {
+  it.each(['off', undefined])('unreadable advisory with setting %s and green CI still gets the ordinary review', setting => {
+    const result = run({ comments: [unreadable()] }, { advisoryReviewOnHumanHandoff: setting });
+    expect(result.dispatch.map(({ kind, headRefOid, advisoryReview }) => ({ kind, headRefOid, advisoryReview })))
+      .toEqual([{ kind: 'review', headRefOid: HEAD, advisoryReview: undefined }]);
+    expect(result.refusals).toEqual([]);
+  });
+  it.each(['off', undefined])('readable moved-head advisory preserves ordinary review with setting %s', setting => {
+    const result = run({}, { advisoryReviewOnHumanHandoff: setting });
+    expect(result.dispatch.map(({ kind, headRefOid, advisoryReview }) => ({ kind, headRefOid, advisoryReview })))
+      .toEqual([{ kind: 'review', headRefOid: HEAD, advisoryReview: undefined }]);
+    expect(result.refusals).toEqual([]);
+  });
+  it.each(['on', 'off', undefined])('unreadable history skips fix-pushed review only with reruns enabled (setting %s)', setting => {
+    // The advisory lacks its Net basis, but its reviewed-sha still lets the release path identify the old head.
+    // A completely headless note would make latestHeadReview null and never exercise the added guard.
+    const comments = [{ ...unreadable(), body: `${unreadable().body}\n${buildReviewedShaMarker(OLD)}` },
+      { author, createdAt: '2026-11-20T11:00:00Z', body: buildFixEndComment({ who: 'fix-session', headSha: HEAD }) }];
+    expect(advisoryHeadMoveState(pr({ comments }))).toEqual({ owed: false, unreadable: true });
+    const result = run({ comments }, { advisoryReviewOnHumanHandoff: setting });
+    if (setting === 'on') {
+      expect(result.dispatch).toEqual([]);
+      expect(result.refusals.map(r => r.kind)).toEqual(['advisory-unreadable']);
+    } else {
+      expect(result.dispatch.map(({ kind, headRefOid, advisoryReview }) => ({ kind, headRefOid,
+        advisoryReview: { head: advisoryReview?.head, reason: advisoryReview?.reason } })))
+        .toEqual([{ kind: 'review', headRefOid: HEAD, advisoryReview: { head: HEAD, reason: 'fix-pushed' } }]);
+      expect(result.refusals).toEqual([]);
+    }
+  });
   it.each([
     ['newest-first Git reader', [mainMerge(HEAD), own(OLD)]],
     ['oldest-first API reader', [own(OLD), mainMerge(HEAD)]],

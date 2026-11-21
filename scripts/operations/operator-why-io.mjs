@@ -57,7 +57,7 @@ export function createWhyReader({
         facts.pr.comments = comments;
         // Decided by the planner's own helper (here, in the io module, so operator-why.mjs stays free of acting imports).
         facts.advisoryHeadMove = safe('advisory head move', () => advisoryHeadMoveState(facts.pr), null);
-        facts.advisoryReviewOnHumanHandoff = facts.advisoryHeadMove?.owed
+        facts.advisoryReviewOnHumanHandoff = (facts.advisoryHeadMove?.owed || facts.advisoryHeadMove?.unreadable)
           ? safe('advisory setting', () => readOwnershipSettings()?.advisoryReviewOnHumanHandoff?.value, 'off') : 'off';
         facts.standDown = safe('stand-down', () => { const c = latestUnresolvedStandDown(comments); return c ? { ...c, reason: standDownReason(c.body) ?? 'unknown' } : null; }, null);
         facts.roundExtensions = safe('round extensions', () => countGrantedRoundExtensions(comments, { repo, pr }), null);

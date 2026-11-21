@@ -48,12 +48,18 @@ describe('why first-match owner rules', () => {
   });
   it('why says so when the advisory is unreadable', () => {
     const pr = staleAdvisoryPr({ comments: [{ author: { login: 'web-everything' }, body: `${ADVISORY_NOTE_MARKER}\n\nno basis` }] });
-    const out = explainWhy({ ...base, pr, advisoryHeadMove: advisoryHeadMoveState(pr) });
+    const out = explainWhy({ ...base, pr, advisoryHeadMove: advisoryHeadMoveState(pr), advisoryReviewOnHumanHandoff: 'on' });
     expect(out.owner).toBe('operator');
     expect(out.waitingFor).toMatch(/advisory unreadable/);
   });
   it.each(['off', undefined])('why keeps human ownership when advisory setting is %s', advisoryReviewOnHumanHandoff => {
     const pr = staleAdvisoryPr();
+    const out = explainWhy({ ...base, pr, advisoryHeadMove: advisoryHeadMoveState(pr), advisoryReviewOnHumanHandoff });
+    expect(out.owner).toBe('operator');
+    expect(out.waitingFor).toBe('human review / park');
+  });
+  it.each(['off', undefined])('why does not claim an unreadable rerun was refused when setting is %s', advisoryReviewOnHumanHandoff => {
+    const pr = staleAdvisoryPr({ comments: [{ author: { login: 'web-everything' }, body: `${ADVISORY_NOTE_MARKER}\n\nno basis` }] });
     const out = explainWhy({ ...base, pr, advisoryHeadMove: advisoryHeadMoveState(pr), advisoryReviewOnHumanHandoff });
     expect(out.owner).toBe('operator');
     expect(out.waitingFor).toBe('human review / park');
@@ -134,8 +140,10 @@ it('injects all external reads and preserves failed-source gaps', () => {
   expect(read({ pr: 0, item: '5754', repo: base.repo }).card.queued).toBe(true);
 });
 
-it.each(['on', 'off', 'unreadable'])('why honours advisory setting %s through the real io seam (commits requested)', setting => {
-  const pr = staleAdvisoryPr();
+it.each(['readable', 'unreadable'].flatMap(history => ['on', 'off', 'unreadable'].map(setting => ({ history, setting }))))
+('why honours setting $setting with $history history through the real io seam (commits requested)', ({ history, setting }) => {
+  const pr = staleAdvisoryPr(history === 'unreadable'
+    ? { comments: [{ author: { login: 'web-everything' }, body: `${ADVISORY_NOTE_MARKER}\n\nno basis` }] } : {});
   const run = (cmd, args) => {
     const joined = [cmd, ...(args ?? [])].join(' ');
     if (!/ pr view /.test(` ${joined} `)) return '';
@@ -155,8 +163,11 @@ it.each(['on', 'off', 'unreadable'])('why honours advisory setting %s through th
   });
   const facts = read({ pr: 5017, item: '', repo: base.repo });
   const out = explainWhy(facts);
-  expect(out.owner).toBe(setting === 'on' ? 'review daemon' : 'operator');
-  expect(out.waitingFor).toBe(setting === 'on' ? 'advisory re-run on f7c7dcd37' : 'human review / park');
+  expect(facts.advisoryReviewOnHumanHandoff).toBe(setting === 'on' ? 'on' : 'off');
+  expect(out.owner).toBe(setting === 'on' && history === 'readable' ? 'review daemon' : 'operator');
+  expect(out.waitingFor).toBe(setting === 'on'
+    ? history === 'readable' ? 'advisory re-run on f7c7dcd37' : 'human review / park (advisory unreadable, no re-run dispatched)'
+    : 'human review / park');
   if (setting === 'unreadable') expect(facts.gaps).toContainEqual({ source: 'advisory setting', error: 'settings unavailable' });
 });
 

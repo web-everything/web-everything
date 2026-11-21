@@ -42,6 +42,26 @@ export default {
     // PR #7263 review: unreadable history may stop reviews, never the CI repair or operator send-back.
     const tip = "Merge branch 'main' into lane/x";
     const unreadable = { author, createdAt: '2026-11-20T10:00:00Z', body: `${ADVISORY_NOTE_MARKER}\n\nno basis` };
+    const { buildFixEndComment } = await import(pathToFileURL(join(sourceRoot, 'scripts/conveyor/fix-procedure.mjs')).href);
+    const { buildReviewedShaMarker } = await import(pathToFileURL(join(sourceRoot, 'scripts/lib/review-escalation.mjs')).href);
+    const released = [{ ...unreadable, body: `${unreadable.body}\n${buildReviewedShaMarker(OLD)}` },
+      { author, createdAt: '2026-11-20T11:00:00Z', body: buildFixEndComment({ who: 'fix-session', headSha: HEAD }) }];
+    for (const setting of ['on', 'off', undefined]) {
+      const options = { advisoryReviewOnHumanHandoff: setting };
+      const ordinary = plan(OLD, tip, { comments: [unreadable] }, options);
+      const pushed = plan(OLD, tip, { comments: released }, options);
+      for (const [name, result] of [['ordinary', ordinary], ['fix-pushed', pushed]]) {
+        if (setting === 'on') {
+          if (result.dispatch.length || result.refusals.length !== 1 || result.refusals[0].kind !== 'advisory-unreadable') {
+            violations.push(`unreadable ${name} history must refuse reviews with reruns enabled`);
+          }
+        } else if (result.dispatch.length !== 1 || result.dispatch[0].kind !== 'review'
+          || result.dispatch[0].advisoryReview?.reason !== (name === 'fix-pushed' ? 'fix-pushed' : undefined)
+          || result.refusals.length) {
+          violations.push(`unreadable ${name} history changed existing review dispatch with setting ${setting ?? 'default'}`);
+        }
+      }
+    }
     const gitOrder = plan(OLD, tip, { commits: [commit(HEAD, tip), commit(OLD, 'fix: it')] }, { roundCap: 0 });
     const gitRows = gitOrder.dispatch.filter(d => d.kind === 'review' && d.advisoryReview?.reason === 'head-moved-advisory');
     if (gitRows.length !== 1 || gitRows[0].advisoryReview.head !== HEAD) violations.push('newest-first Git commit history suppressed the live-head advisory');
@@ -61,7 +81,6 @@ export default {
       body: '🔁 review — changes requested\n\nRecorded by chalbert via console.\n\nMUST FIX: repair the export.' };
     const sendBack = plan(OLD, tip, { comments: [unreadable, request], statusCheckRollup: red });
     if (sendBack.dispatch.length !== 1 || sendBack.dispatch[0].mode !== 'operator-send-back') violations.push('unreadable advisory suppressed operator send-back');
-    const { buildReviewedShaMarker } = await import(pathToFileURL(join(sourceRoot, 'scripts/lib/review-escalation.mjs')).href);
     const coveredState = plan(OLD, tip, { comments: [unreadable, { author,
       body: `✅ review — accepted\n${buildReviewedShaMarker(HEAD)}` }] });
     if (coveredState.refusals.some(r => r.kind === 'advisory-unreadable')) violations.push('covered head reported unreadable history');
