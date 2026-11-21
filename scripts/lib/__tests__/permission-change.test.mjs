@@ -55,6 +55,10 @@ describe('replay of PR #4359 (Codex writable roots widened)', () => {
 });
 
 describe('permissionChangeKind', () => {
+  it.each([null, '', 'diff --git a/scripts/lib/agent-launch.mjs b/scripts/lib/agent-launch.mjs\n@@ -1 +1 @@\n-allowAll\n+allowAll2\n'])('B7 launcher changes always hold (%j)', hunks => {
+    expect(SANDBOX_BEARING_FILES).toContain('scripts/lib/agent-launch.mjs');
+    expect(permissionChangeKind('scripts/lib/agent-launch.mjs', hunks)).not.toBeNull();
+  });
   const hunk = (body) => `diff --git a/${WF} b/${WF}\n--- a/${WF}\n+++ b/${WF}\n@@ -1,3 +1,3 @@\n${body}\n`;
   it.each([
     ['-  contents: read\n+  contents: write'],

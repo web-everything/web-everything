@@ -112,8 +112,7 @@ import { resolveBuildPolicy, appendBuildRequirements, renderCodexTaskRules } fro
 import { runBuildSelfReview, renderSelfReviewNotes, boundedSelfReviewDiff, assertNoLaneFilterDrivers } from './lib/build-self-review.mjs';
 import { pinDeveloperDir, laneGitConfigArgs, hardenLaneGitArgs, laneGitHardeningEnv, scrubGitRepoEnv } from './lib/lane-git-hardening.mjs';
 import { spawn as nodeSpawn, execFileSync } from 'node:child_process';
-import { userInfo } from 'node:os';
-import { buildAgentArgs, buildAgentPath, launchAgent } from './lib/agent-launch.mjs';
+import { buildAgentArgs, launchAgent } from './lib/agent-launch.mjs';
 import { readProcStart } from './lib/daemon-jobs-runtime.mjs';
 import {
   mkdtempSync, existsSync, readFileSync, writeFileSync, appendFileSync, mkdirSync, readdirSync, rmSync, openSync, closeSync, renameSync,
@@ -251,6 +250,12 @@ export function assertResumeRequest({ resumeThreadId, ephemeral = false, outputS
 
 /** R650: directory of refusing vitest/playwright/npx shims, prepended to PATH inside Codex runs only. */
 export const CODEX_SHIM_DIR = resolve(process.env.WE_CODEX_SHIM_DIR || join(dirname(new URL(import.meta.url).pathname), 'codex-shims'));
+/** PATH with the shim dir first (deduped). */
+export function codexShimPath(env = process.env) {
+  const rest = String(env.PATH ?? '').split(':').filter((d) => d && d !== CODEX_SHIM_DIR);
+  return [CODEX_SHIM_DIR, ...rest].join(':');
+}
+
 export function buildCodexDirectTaskDescriptor({
   cwd,
   outputLastMessageFile,
@@ -273,7 +278,7 @@ export function buildCodexDirectTaskDescriptor({
   // #4194 — REVIEW MODE runs Codex under its own `read-only` sandbox: a review seat reads the checkout and reports
   // findings; it must never edit anything. Every other caller keeps `workspace-write`, unchanged.
   const descriptor = { agent: 'codex', cwd, sandbox: review ? 'read-only' : 'workspace-write', processGroup: true,
-    config: {}, inheritEnv: env === process.env ? { ...env } : env, inheritEnvComplete: true };
+    config: {}, env: env === process.env ? { ...env } : env };
   if (outputSchemaFile !== undefined) {
     if (typeof outputSchemaFile !== 'string' || !outputSchemaFile.trim()) {
       throw new TypeError('codex-direct-task: `outputSchemaFile` must be a non-empty path when given');
@@ -312,9 +317,8 @@ export function buildCodexDirectTaskDescriptor({
     }
     descriptor.config['sandbox_workspace_write.network_access'] = true;
     if (writableRoots.length) descriptor.config['sandbox_workspace_write.writable_roots'] = writableRoots;
-    // R650: pathPrefix precedes real tools; gh auth/throttle shims retain first priority.
-    descriptor.config['shell_environment_policy.set.PATH'] = buildAgentPath({ parentPaths: [env.PATH, process.env.PATH],
-      home: userInfo().homedir, pathPrefix: CODEX_SHIM_DIR, nodePath: process.execPath });
+    // R650: preserve main's shell PATH and caller directory order.
+    descriptor.config['shell_environment_policy.set.PATH'] = codexShimPath(env);
     descriptor.pathPrefix = CODEX_SHIM_DIR;
     if (tempRoot) {
       descriptor.tempRoot = tempRoot;

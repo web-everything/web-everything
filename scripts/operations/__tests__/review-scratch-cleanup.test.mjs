@@ -1,6 +1,6 @@
 import { it, expect, afterEach } from 'vitest';
 import { spawn, spawnSync } from 'node:child_process';
-import { mkdtempSync, readdirSync, existsSync, rmSync, mkdirSync, writeFileSync, readFileSync } from 'node:fs';
+import { mkdtempSync, readdirSync, existsSync, rmSync, mkdirSync, writeFileSync, readFileSync, symlinkSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
@@ -70,6 +70,8 @@ it.each(['codex', 'agy-gemini'].flatMap(provider =>
   const tmp = mkdtempSync(join(tmpdir(), 'we-seat-model-cleanup-')); roots.push(tmp);
   const dir = join(tmp, 'checkout'); mkdirSync(dir);
   const scripts = join(tmp, 'scripts'); mkdirSync(scripts);
+  const bin = join(tmp, 'bin'); mkdirSync(bin);
+  symlinkSync(process.execPath, join(bin, 'codex'));
   const pidFile = join(tmp, 'model-pid');
   const heartbeat = join(tmp, 'model-heartbeat');
   const termCheckout = join(tmp, 'term-checkout-present');
@@ -92,7 +94,7 @@ it.each(['codex', 'agy-gemini'].flatMap(provider =>
       const until = Date.now() + 150; while (Date.now() < until) {}
       writeFileSync(${JSON.stringify(termCheckout)}, String(existsSync(${JSON.stringify(dir)})));
     });
-    const work = ${execName}({ dir: ${JSON.stringify(dir)}, task: 'inert test',
+    const work = ${execName}({ env: { ...process.env, PATH: ${JSON.stringify(bin)} + ':' + process.env.PATH }, dir: ${JSON.stringify(dir)}, task: 'inert test',
       model: ${JSON.stringify(provider === 'codex' ? 'gpt-5.4' : 'gemini-4-argon-high')}, effort: 'high',
       review: true, timeoutMs: 60000, stream: false, logFile: ${JSON.stringify(join(tmp, 'model.log'))},
       // Binary lookup is a separate boundary from spawning in the closed-grammar launcher.

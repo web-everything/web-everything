@@ -1,5 +1,5 @@
-import { describe, it, expect, vi } from 'vitest';
-import { readFileSync, writeFileSync, mkdtempSync, mkdirSync, rmSync, existsSync } from 'node:fs';
+import { describe, it, expect, vi, beforeEach, afterEach, afterAll } from 'vitest';
+import { readFileSync, writeFileSync, mkdtempSync, mkdirSync, rmSync, existsSync, symlinkSync, realpathSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
 import { EventEmitter } from 'node:events';
 import { tmpdir } from 'node:os';
@@ -16,7 +16,13 @@ import * as codexTasks from '../../codex-direct-task.mjs';
 import { renderWorkerBrief } from '../../worker-brief.mjs';
 
 const THREAD_ID = '01a1941d-8f2e-7242-8cfe-788d55f26a75';
-const resolveBinaryFn = () => '/fixture/bin/codex';
+const fixtureBin = mkdtempSync(join(tmpdir(), 'safeguards-binary-'));
+const binary = realpathSync(process.execPath);
+symlinkSync(binary, join(fixtureBin, 'codex'));
+const resolveBinaryFn = () => binary;
+beforeEach(() => vi.stubEnv('PATH', `${fixtureBin}:${process.env.PATH}`));
+afterEach(() => vi.unstubAllEnvs());
+afterAll(() => rmSync(fixtureBin, { recursive: true, force: true }));
 
 const resolve = options => resolveBuildPolicy({ env: {}, tool: {}, platform: {}, ...options });
 

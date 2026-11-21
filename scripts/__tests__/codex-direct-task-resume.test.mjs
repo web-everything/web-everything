@@ -4,8 +4,8 @@
  * Kept apart from codex-direct-task.test.mjs, which another open PR holds.
  */
 import { EventEmitter } from 'node:events';
-import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { describe, it, expect, vi, beforeEach, afterEach, afterAll } from 'vitest';
+import { mkdtempSync, rmSync, symlinkSync, realpathSync } from 'node:fs';
 import { spawnSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { join, resolve, dirname } from 'node:path';
@@ -13,13 +13,17 @@ import { fileURLToPath } from 'node:url';
 import { assertResumeThreadId, parseResumeFlag, buildCodexDirectTaskArgv, codexDirectTask } from '../codex-direct-task.mjs';
 
 const THREAD_ID = '01a1941d-8f2e-7242-8cfe-788d55f26a75';
-const resolveBinaryFn = () => '/fixture/bin/codex';
+const fixtureBin = mkdtempSync(join(tmpdir(), 'resume-binary-'));
+const binary = realpathSync(process.execPath);
+symlinkSync(binary, join(fixtureBin, 'codex'));
+const resolveBinaryFn = () => binary;
+afterAll(() => rmSync(fixtureBin, { recursive: true, force: true }));
 
 const SCRIPT = resolve(dirname(fileURLToPath(import.meta.url)), '..', 'codex-direct-task.mjs');
 
 beforeEach(() => {
   vi.stubEnv('WE_BUILD_SELF_REVIEW_ENABLED', 'false');
-  vi.stubEnv('PATH', `${dirname(process.execPath)}:/usr/bin:/bin:/usr/sbin:/sbin:/opt/homebrew/bin:/usr/local/bin`);
+  vi.stubEnv('PATH', `${fixtureBin}:${dirname(process.execPath)}:/usr/bin:/bin:/usr/sbin:/sbin:/opt/homebrew/bin:/usr/local/bin`);
 });
 afterEach(() => vi.unstubAllEnvs());
 

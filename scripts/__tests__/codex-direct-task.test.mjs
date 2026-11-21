@@ -7,12 +7,13 @@
  */
 
 import { EventEmitter } from 'node:events';
+import { URL as NodeURL } from 'node:url';
 import { createHash } from 'node:crypto';
-import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-import { mkdtempSync, mkdirSync, rmSync, readFileSync, writeFileSync, statSync, symlinkSync } from 'node:fs';
+import { describe, it, expect, vi, beforeEach, afterEach, afterAll } from 'vitest';
+import { mkdtempSync, mkdirSync, rmSync, readFileSync, writeFileSync, statSync, symlinkSync, realpathSync } from 'node:fs';
 import fsPromises from 'node:fs/promises';
 import { execFileSync, spawn, spawnSync } from 'node:child_process';
-import { tmpdir, userInfo } from 'node:os';
+import { tmpdir } from 'node:os';
 import { dirname, join, relative, resolve } from 'node:path';
 import { keepAliveScript } from '../lib/test-keepalive.mjs';
 import { admissionLockRoot } from '../readiness/heavy-admission.mjs';
@@ -35,7 +36,7 @@ import {
   parseRolloutQuota,
   readRolloutQuota,
   collectAndClearRolloutQuota,
-  buildCodexDirectTaskArgv, buildCodexDirectTaskDescriptor, CODEX_SHIM_DIR,
+  buildCodexDirectTaskArgv, buildCodexDirectTaskDescriptor, CODEX_SHIM_DIR, codexShimPath,
   buildCodexPrompt,
   buildScratchCloneArgv,
   planDepsInstall,
@@ -51,34 +52,34 @@ import {
   codexDirectTask as realCodexDirectTask,
 } from '../codex-direct-task.mjs';
 
-import { buildAgentInvocation, buildAgentPath } from '../lib/agent-launch.mjs';
-import { defaultShimDir } from '../lib/gh-app-shim.mjs';
+import { buildAgentInvocation } from '../lib/agent-launch.mjs';
 
-const FAKE_CODEX_BINARY = '/fixture/bin/codex';
+const fixtureBin = realpathSync(mkdtempSync(join(tmpdir(), 'direct-task-binary-')));
+const FAKE_CODEX_BINARY = join(fixtureBin, 'fixture-codex');
+// Keep Codex distinct from Node so CLI spawn mocks still run the real detached launcher.
+writeFileSync(FAKE_CODEX_BINARY, '#!/bin/sh\nexit 1\n', { mode: 0o755 });
+symlinkSync(FAKE_CODEX_BINARY, join(fixtureBin, 'codex'));
+afterAll(() => rmSync(fixtureBin, { recursive: true, force: true }));
 // Pair every injected agent spawn with a resolver, including repair turns.
 const withFixtureBinary = opts => opts.spawnFn
   ? { ...opts, resolveBinaryFn: () => FAKE_CODEX_BINARY } : opts;
 const runCodexDirectExec = opts => realRunCodexDirectExec(withFixtureBinary(opts));
 const codexDirectTask = opts => realCodexDirectTask(withFixtureBinary(opts));
 
-// CLI subprocesses have no IO argument: supply only binary-lookup filesystem evidence
-// in their existing preload, leaving every other filesystem operation real.
+// CLI subprocesses have no IO argument: map the fixed lookup to the executable on
+// fixture PATH, leaving file identity, permissions and every other filesystem operation real.
 const fixtureBinaryPreload = `
   import binaryFs from 'node:fs';
-  const originalBinaryFs = { realpathSync: binaryFs.realpathSync, statSync: binaryFs.statSync, accessSync: binaryFs.accessSync };
+  const originalBinaryFs = { realpathSync: binaryFs.realpathSync };
   binaryFs.realpathSync = Object.assign((file, ...args) => file === '/usr/bin/codex'
     ? ${JSON.stringify(FAKE_CODEX_BINARY)} : originalBinaryFs.realpathSync(file, ...args), originalBinaryFs.realpathSync);
-  binaryFs.statSync = (file, ...args) => file === ${JSON.stringify(FAKE_CODEX_BINARY)}
-    ? { isFile: () => true } : originalBinaryFs.statSync(file, ...args);
-  binaryFs.accessSync = (file, ...args) => file === ${JSON.stringify(FAKE_CODEX_BINARY)}
-    ? undefined : originalBinaryFs.accessSync(file, ...args);
 `;
 
 // Historical orchestration fixtures isolate the new independently tested self-review.
 beforeEach(() => {
   vi.stubEnv('WE_BUILD_SELF_REVIEW_ENABLED', 'false');
   // Agent-spawn fixtures use a fixed parent PATH; custom gh guards are covered by launcher tests.
-  vi.stubEnv('PATH', `${dirname(process.execPath)}:/usr/bin:/bin:/usr/sbin:/sbin:/opt/homebrew/bin:/usr/local/bin`);
+  vi.stubEnv('PATH', `${fixtureBin}:${dirname(process.execPath)}:/usr/bin:/bin:/usr/sbin:/sbin:/opt/homebrew/bin:/usr/local/bin`);
 });
 afterEach(() => vi.unstubAllEnvs());
 
@@ -1128,7 +1129,7 @@ describe('runCodexDirectExec / codexDirectTask — the orchestrator, over an inj
   });
 
   it('spawns codex with the exact built argv and launcher-owned PATH, writes the task to stdin, and logs raw stdout to the log file', async () => {
-    vi.stubEnv('PATH', '/ambient-attacker:/usr/bin:/bin');
+    vi.stubEnv('PATH', `/caller-guard:${fixtureBin}:/usr/bin:/bin`);
     const dir = mkdtempSync(join(tmpdir(), 'we-codex-direct-test-'));
     const logFile = join(dir, 'events.jsonl');
     const stdout = '{"type":"thread.started","thread_id":"t1"}\n{"type":"turn.completed","usage":{}}\n';
@@ -1140,11 +1141,7 @@ describe('runCodexDirectExec / codexDirectTask — the orchestrator, over an inj
       expect(seen.opts.shell).toBe(false);
       const expectedArgv = buildCodexDirectTaskArgv({ cwd: dir, outputSchemaFile,
         outputLastMessageFile: join(dir, '.git', 'codex-direct-task-last-message.txt') });
-      const expectedPath = buildAgentPath({ parentPaths: [process.env.PATH], home: userInfo().homedir,
-        pathPrefix: CODEX_SHIM_DIR, nodePath: process.execPath, binary: FAKE_CODEX_BINARY });
-      const pathIndex = expectedArgv.findIndex(arg => arg.startsWith('shell_environment_policy.set.PATH='));
-      expect(pathIndex).toBeGreaterThan(0);
-      expectedArgv[pathIndex] = `shell_environment_policy.set.PATH=${JSON.stringify(expectedPath)}`;
+      const expectedPath = codexShimPath(process.env);
       expect(seen.argv).toEqual(expectedArgv);
       expect(seen.opts.env.PATH).toBe(expectedPath);
       expect(seen.stdin).toContain('do the thing');
@@ -1254,7 +1251,7 @@ describe('runCodexDirectExec / codexDirectTask — the orchestrator, over an inj
           expect(seen.opts.env).not.toBe(env);
           expect(seen.opts.env.LANE_POOL_ROOT).toBe(env.LANE_POOL_ROOT);
           expect(seen.opts.env.WE_UNDER_TEST).toBe('1');
-          expect(seen.opts.env).not.toHaveProperty('TMPDIR');
+          expect(seen.opts.env).toEqual(env);
           expect(flagValue(seen.argv, '-s')).toBe('read-only');
           expect(seen.argv.some((v) => /sandbox_workspace_write|shell_environment_policy/.test(v))).toBe(false);
         } else {
@@ -1639,6 +1636,7 @@ describe('direct CLI flags reach the actual spawn and JSON result', () => {
       import { writeFileSync } from 'node:fs';
       import { syncBuiltinESMExports } from 'node:module';
       import { EventEmitter } from 'node:events';
+import { URL as NodeURL } from 'node:url';
       cp.execFileSync = (_bin, args) => args.includes('--absolute-git-dir') ? ${JSON.stringify(join(dir, 'metadata'))} : args.includes('rev-parse') ? 'sha' : '';
       cp.spawn = (_bin, argv) => {
         writeFileSync(${JSON.stringify(argvFile)}, JSON.stringify(argv));
@@ -1680,6 +1678,7 @@ describe('direct CLI flags reach the actual spawn and JSON result', () => {
     const preload = `import cp from 'node:child_process';
       import { syncBuiltinESMExports } from 'node:module';
       import { EventEmitter } from 'node:events';
+import { URL as NodeURL } from 'node:url';
       cp.execFileSync = (_bin, args) => args.includes('--absolute-git-dir') ? ${JSON.stringify(join(dir, 'metadata'))} : args.includes('rev-parse') ? 'sha' : '';
       cp.spawn = (_bin, argv) => {
         const child = new EventEmitter();
@@ -1717,6 +1716,7 @@ describe('direct CLI flags reach the actual spawn and JSON result', () => {
     const preload = `import cp from 'node:child_process';
       import { syncBuiltinESMExports } from 'node:module';
       import { EventEmitter } from 'node:events';
+import { URL as NodeURL } from 'node:url';
       cp.execFileSync = (bin, args) => {
         if (bin === 'npm' && args.includes('check:standards') && !${gateGreen}) throw Object.assign(new Error('standards red'), { status: 1 });
         return args.includes('--absolute-git-dir') ? ${JSON.stringify(join(dir, 'metadata'))} : args.includes('rev-parse') ? 'sha' : '';
@@ -2848,6 +2848,7 @@ describe('detached jobs', () => {
       import cp from 'node:child_process';
       import { syncBuiltinESMExports } from 'node:module';
       import { EventEmitter } from 'node:events';
+import { URL as NodeURL } from 'node:url';
       import { join } from 'node:path';
       import { writeFileSync } from 'node:fs';
       const spawn = cp.spawn;
@@ -2945,6 +2946,7 @@ describe('detached jobs', () => {
         import cp from 'node:child_process';
         import { syncBuiltinESMExports } from 'node:module';
         import { EventEmitter } from 'node:events';
+import { URL as NodeURL } from 'node:url';
         import { writeFileSync } from 'node:fs';
         import { join } from 'node:path';
         const { spawn, execFileSync } = cp;
@@ -3044,6 +3046,7 @@ describe('detached jobs', () => {
         import cp from 'node:child_process';
         import { syncBuiltinESMExports } from 'node:module';
         import { EventEmitter } from 'node:events';
+import { URL as NodeURL } from 'node:url';
         import { join } from 'node:path';
         const { spawn, execFileSync } = cp;
         const isGate = bin => bin === 'npm' || bin === 'node';
@@ -3313,6 +3316,7 @@ describe('detached jobs', () => {
       import cp from 'node:child_process';
       import { syncBuiltinESMExports } from 'node:module';
       import { EventEmitter } from 'node:events';
+import { URL as NodeURL } from 'node:url';
       const scenario = JSON.parse(process.env.TEST_JOB_SCENARIO);
       if (scenario.transcriptMode) {
         process.env.WE_CODEX_TRANSCRIPT_CHECK_MODE = scenario.transcriptMode;
@@ -3961,30 +3965,40 @@ describe('R731 slice 1 — a scratch clone is deleted only when it is clean', ()
 });
 
 
-describe('Codex shell and launcher share the restricted child PATH', () => {
-  it('retains the ambient gh shim and R650 shim, removes caller directories, and includes the resolved agent directory', () => {
-    const shim = defaultShimDir(userInfo().homedir);
-    vi.stubEnv('PATH', `/ambient-attacker:${shim}`);
-    const descriptor = buildCodexDirectTaskDescriptor({ cwd: process.cwd(), env: { PATH: '/caller-attacker' } });
-    const invocation = buildAgentInvocation(descriptor, { resolveBinary: () => FAKE_CODEX_BINARY });
-    const shellPath = JSON.parse(invocation.args.find(arg => arg.startsWith('shell_environment_policy.set.PATH=')).split('=').slice(1).join('='));
-    expect(shellPath).toBe(invocation.options.env.PATH);
-    expect(shellPath).toBe(buildAgentPath({ parentPaths: ['/caller-attacker', process.env.PATH],
-      home: userInfo().homedir, pathPrefix: CODEX_SHIM_DIR, nodePath: process.execPath, binary: FAKE_CODEX_BINARY }));
-    expect(shellPath.split(':').slice(0, 2)).toEqual([shim, CODEX_SHIM_DIR]);
-    expect(shellPath.split(':')).toContain(dirname(FAKE_CODEX_BINARY));
-    expect(shellPath).not.toMatch(/caller-attacker|ambient-attacker/);
+describe('B4 golden argv from main c18c5279b4', () => {
+  const golden = JSON.parse(readFileSync(new NodeURL('./fixtures/agent-launch-main-argv.json', import.meta.url), 'utf8'));
+  it.each(golden.cases)('$name matches every main argv token and its order', ({ options, argv }) => {
+    const expected = argv.map(token => token.replaceAll(golden.shimDir, CODEX_SHIM_DIR));
+    expect(buildCodexDirectTaskArgv(options)).toEqual(expected);
   });
-  it('finalizes both PATHs from snapshots before a resolver mutates the descriptor or ambient PATH', () => {
-    const shim = defaultShimDir(userInfo().homedir);
-    vi.stubEnv('PATH', shim);
-    const descriptor = buildCodexDirectTaskDescriptor({ cwd: process.cwd(), env: { PATH: '/caller-attacker' } });
+  it('refuses relative PATH in non-review mode before spawning', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'codex-relative-path-'));
+    const spawnFn = vi.fn(), resolveBinaryFn = vi.fn();
+    try {
+      await expect(realRunCodexDirectExec({ dir, task: 't', logFile: join(dir, 'log'), env: { PATH: '.:/usr/bin' }, spawnFn, resolveBinaryFn })).rejects.toThrow(/PATH/);
+      expect(spawnFn).not.toHaveBeenCalled(); expect(resolveBinaryFn).not.toHaveBeenCalled();
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+});
+
+describe('Codex shell and launcher preserve main PATH', () => {
+  it('keeps caller directories in order and excludes ambient-only directories', () => {
+    vi.stubEnv('PATH', '/ambient-only');
+    const env = { PATH: `/caller-guard:${fixtureBin}:/caller-tools` };
+    const descriptor = buildCodexDirectTaskDescriptor({ cwd: process.cwd(), env });
+    const invocation = buildAgentInvocation(descriptor, { resolveBinary: () => FAKE_CODEX_BINARY });
+    const expected = `${CODEX_SHIM_DIR}:/caller-guard:${fixtureBin}:/caller-tools`;
+    expect(invocation.options.env.PATH).toBe(expected);
+    expect(invocation.args).toContain(`shell_environment_policy.set.PATH=${JSON.stringify(expected)}`);
+  });
+  it('snapshots shell PATH and env before a resolver mutates either source', () => {
+    const env = { PATH: fixtureBin };
+    const descriptor = buildCodexDirectTaskDescriptor({ cwd: process.cwd(), env });
     const invocation = buildAgentInvocation(descriptor, { resolveBinary: () => {
-      process.env.PATH = '/mutated'; descriptor.config['shell_environment_policy.set.PATH'] = '/mutated';
+      process.env.PATH = '/mutated'; env.PATH = '/mutated'; descriptor.config['shell_environment_policy.set.PATH'] = '/mutated';
       return FAKE_CODEX_BINARY;
     } });
+    expect(invocation.options.env.PATH).toBe(`${CODEX_SHIM_DIR}:${fixtureBin}`);
     expect(invocation.args).toContain(`shell_environment_policy.set.PATH=${JSON.stringify(invocation.options.env.PATH)}`);
-    expect(invocation.options.env.PATH.split(':')[0]).toBe(shim);
-    expect(invocation.options.env.PATH).not.toContain('/mutated');
   });
 });

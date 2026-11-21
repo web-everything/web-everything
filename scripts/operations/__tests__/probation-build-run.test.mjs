@@ -750,7 +750,7 @@ describe('standalone task types and workers', () => {
       git('init', '--quiet');
       git('-c', 'user.email=t@t', '-c', 'user.name=t', 'commit', '--quiet', '--allow-empty', '-m', 'base');
       writeFileSync(join(dir, 'task.md'), 'Return JSON.');
-      // Keep fixture output out of the child env: unknown ARGV_OUT is deliberately not forwarded.
+      // Embed fixture output in the fake executable.
       const argvOut = join(dir, 'argv.txt');
       const binary = join(dir, 'bin', 'codex');
       writeFileSync(binary, `#!${process.execPath}
@@ -762,7 +762,7 @@ describe('standalone task types and workers', () => {
         process.stdin.on('end', () => console.log('{"type":"turn.completed"}'));
       `, { mode: 0o755 });
       // CLI fixtures supply binary-lookup filesystem evidence, as direct-task's CLI tests do.
-      // Production still ignores PATH when selecting the agent binary.
+      // The caller PATH and the fixed lookup must identify this same executable.
       const preload = join(dir, 'binary-lookup.mjs');
       writeFileSync(preload, `import fs from 'node:fs';
         import { syncBuiltinESMExports } from 'node:module';
@@ -775,7 +775,7 @@ describe('standalone task types and workers', () => {
         .map(a => a === '/lanes/22/scripts/codex-direct-task.mjs' ? resolve('scripts/codex-direct-task.mjs')
           : a === '--dir=/lanes/22' ? `--dir=${join(dir, 'lane')}` : a);
       execFileSync(process.execPath, ['--import', preload, ...argv], { stdio: 'pipe', timeout: 60_000, env: { ...process.env,
-        CODEX_HOME: join(dir, 'codex-home'),
+        PATH: `${join(dir, 'bin')}:${process.env.PATH}`, CODEX_HOME: join(dir, 'codex-home'),
         WE_CODEX_USAGE_LEDGER: join(dir, 'usage.jsonl'), CONVEYOR_STATE_ROOT: join(dir, 'state') } });
       const seen = readFileSync(argvOut, 'utf8').split('\n');
       expect(seen[seen.indexOf('-s') + 1]).toBe('read-only');

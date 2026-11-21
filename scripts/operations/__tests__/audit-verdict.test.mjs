@@ -1088,8 +1088,7 @@ describe('R473 structured concurrency evidence', () => {
     it('the floor-settings scan is live and reads every quoted form', () => {
       expect(FLOOR_MODULES.length).toBeGreaterThan(100);
       expect(floorSettings).toEqual(expect.arrayContaining(['scripts/settings/red-team.json', 'scripts/settings/github-auth.json',
-        'scripts/settings/stand-down.json', 'scripts/settings/fix.json', 'scripts/review-settings.json', 'scripts/lib/delivery-platform-preferences.json',
-        'scripts/lib/agent-launch-env-registry.json']));
+        'scripts/settings/stand-down.json', 'scripts/settings/fix.json', 'scripts/review-settings.json', 'scripts/lib/delivery-platform-preferences.json']));
     });
     it.each(floorSettings)('every settings file a floor module names is on the floor: E2 in %s never ships (PR #6381 self-review)', async file => {
       neverShips(await compute([finding({ class: 'E2', file })], options()));

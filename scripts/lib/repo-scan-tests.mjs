@@ -43,14 +43,6 @@ const skipped = (file) => /(?:^|\/)(?:__tests__|__fixtures__|node_modules)(?:\/|
 /** @type {readonly RepoScanTest[]} */
 export const REPO_SCAN_TESTS = Object.freeze([
   {
-    test: 'scripts/__tests__/agent-launch-env-registry.test.mjs',
-    scope: 'full',
-    why: 'classifies the complete literal environment-read inventory under scripts and symlinked skills; empty or incomplete evidence must fail, so changed-file scoping cannot establish registry completeness',
-    matches: (f) => !skipped(f) && inTree(f, ['scripts', '.claude/skills', 'skills-src']),
-    inputs: ['scripts/lib/agent-launch-env-registry.json', 'scripts/lib/agent-launch.mjs',
-      'scripts/__tests__/fixtures/agent-launch-env.mjs', 'scripts/__tests__/agent-launch-env-registry.test.mjs'],
-  },
-  {
     test: 'scripts/__tests__/agent-launch-structure.test.mjs',
     scope: 'full',
     why: 'compares literal agent launch counts across scripts and symlinked skills with the complete S1 baseline, including extra sites in already approved files',
