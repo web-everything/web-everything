@@ -3,6 +3,7 @@ import { mkdtempSync, rmSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { dispatchTimeoutRetry, timeoutGithubEffects, flushTimeoutFollowups } from '../ci-heal-pr-dispatch.mjs';
 import { timeoutKey } from '../../conveyor/timeout-retry-state.mjs';
+import { executeOwedCiReruns } from '../../conveyor/owed-ci-rerun-executor.mjs';
 
 const dirs = [];
 afterEach(() => { for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true }); });
@@ -88,6 +89,46 @@ describe('stale freeze rerun durable budget', () => {
 });
 
 describe('stale freeze shared head cap and followup state', () => {
+  it.each(['rejected', 'ambiguous', 'confirmed'])('spent %s requests do not starve the eleventh PR on the next pass', async status => {
+    const opts = fixture();
+    opts.effects.request.mockReturnValue({ status });
+    const rows = Array.from({ length: 11 }, (_, i) => ({ kind: 'ci-timeout-rerun', prNumber: 7266 + i,
+      timeoutRetry: { ...evidence, pr: 7266 + i } }));
+    const execute = () => executeOwedCiReruns({ rows, repo, checkStaleness: () => ({ fresh: true }),
+      dispatchRetry: retry => dispatchTimeoutRetry(retry, opts) });
+    expect((await execute()).skippedOverCap).toBe(1);
+    expect(opts.effects.request).toHaveBeenCalledTimes(10);
+    opts.effects.request.mockReturnValue({ status: 'confirmed' });
+    const next = await execute();
+    expect(next.requested).toEqual([7276]);
+    expect(next.refused).toHaveLength(10);
+    expect(next.refused.every(r => r.reason.startsWith('stale-freeze-rerun-spent;'))).toBe(true);
+    expect(next.skippedOverCap).toBe(0);
+    expect(opts.effects.request).toHaveBeenCalledTimes(11);
+  });
+  it('exhausted head caps also leave slots for later PRs, including legacy reservations', async () => {
+    const opts = fixture();
+    writeFileSync(join(opts.dir, `${timeoutKey(evidence)}.json`), JSON.stringify({ version: 1, evidence,
+      requests: [40, 41].map(run => ({ signature: `stale-main-freeze:${run}`, target: { run, job: 123, attempt: 1 }, status: 'rejected' })) }));
+    const rows = [evidence, { ...evidence, pr: 7267 }].map(timeoutRetry => ({
+      kind: 'ci-timeout-rerun', prNumber: timeoutRetry.pr, timeoutRetry }));
+    const out = await executeOwedCiReruns({ rows, repo, max: 1, checkStaleness: () => ({ fresh: true }),
+      dispatchRetry: retry => dispatchTimeoutRetry(retry, opts) });
+    expect(out.requested).toEqual([7267]);
+    expect(out.refused[0].reason).toMatch(/^stale-freeze-head-cap;/);
+    expect(out.skippedOverCap).toBe(0);
+    expect(opts.effects.request).toHaveBeenCalledTimes(1);
+  });
+  it('fresh API rejections still consume the per-pass cap', async () => {
+    const opts = fixture(); opts.effects.request.mockReturnValue({ status: 'rejected' });
+    const rows = [evidence, { ...evidence, pr: 7267 }].map(timeoutRetry => ({
+      kind: 'ci-timeout-rerun', prNumber: timeoutRetry.pr, timeoutRetry }));
+    const out = await executeOwedCiReruns({ rows, repo, max: 1, checkStaleness: () => ({ fresh: true }),
+      dispatchRetry: retry => dispatchTimeoutRetry(retry, opts) });
+    expect(out.refused).toEqual([{ pr: 7266, reason: 'retry-api-rejected' }]);
+    expect(out.skippedOverCap).toBe(1);
+    expect(opts.effects.request).toHaveBeenCalledTimes(1);
+  });
   it.each(['confirmed', 'rejected'])('caps %s stale-freeze reservations at two across run ids', async status => {
     const opts = fixture(); opts.effects.request.mockReturnValue({ status });
     for (const run of [42, 43]) {

@@ -9,6 +9,7 @@ export default {
   card: 'stale automatic main-CI freeze recovery',
   fixedBy: { sha: 'HEAD', where: 'merge-gate classification and existing rerun executor', paths: [
     'scripts/lib/merge-gate-hold-class.mjs', 'scripts/conveyor/reconcile-core.mjs', 'scripts/operations/ci-heal-pr-dispatch.mjs',
+    'scripts/conveyor/owed-ci-rerun-executor.mjs',
   ] },
   fixPresent(root) {
     const probe = spawnSync(process.execPath, ['--input-type=module', '-e', `
@@ -70,6 +71,30 @@ export default {
         if (tick === 1 && !result.refused.some(r => r.reason.includes('stale-freeze-rerun-spent'))) violations.push('spent rerun lacked operator fallback');
       }
       if (writes !== 1) violations.push(`expected one request across ticks/reloads, got ${writes}`);
+      // Eleven eligible PRs exceed the default cap. API rejections spend the first ten
+      // reservations permanently; later ticks must still reach the eleventh PR.
+      let apiRecovered = false;
+      const attempted = [];
+      for (const tick of [0, 1]) {
+        const prs = Array.from({ length: 11 }, (_, i) => {
+          const candidate = { ...pr, number: 7300 + i,
+            statusCheckRollup: [{ ...pr.statusCheckRollup[0], conclusion: 'failure' }] };
+          return excusePrMergeGateHolds([candidate], { repo, mergeGateSetting: 'on', readMainCi,
+            readFreeze: () => ({ frozen: false }),
+            readMergeGateVerdict: args => readMergeGateVerdict({ ...args, cache: new Map(),
+              runGh: argv => argv.at(-1).endsWith('/logs') ? log.replace('#7266:', `#${candidate.number}:`) : JSON.stringify(job) }) })[0];
+        });
+        const plan = planReconcile({ prs, agents: [], requiredChecks: ['merge-gate'], reviewTiming: { startAfter: 'ci-green' } });
+        const result = await executeOwedCiReruns({ rows: plan.dispatch, repo, checkStaleness: () => ({ fresh: true }),
+          dispatchRetry: evidence => dispatchTimeoutRetry(evidence, { repo, dir, readMainCi,
+            effects: { observe: () => ({ repo, head, runHead: head, open: true, run: 42, job: 123, jobRun: 42,
+              attempt: 1, jobAttempt: 1, jobName: 'merge-gate', status: 'completed', conclusion: 'failure' }),
+            request: evidence => { attempted.push(evidence.pr); return { status: apiRecovered ? 'confirmed' : 'rejected' }; } } }) });
+        if (tick === 0 && (result.skippedOverCap !== 1 || attempted.length !== 10)) violations.push('rejected API requests did not respect ten-request cap');
+        if (tick === 1 && (result.requested.join(',') !== '7310' || result.skippedOverCap !== 0)) violations.push('spent stale-freeze requests starved the eleventh PR');
+        apiRecovered = true;
+      }
+      if (attempted.join(',') !== Array.from({ length: 11 }, (_, i) => 7300 + i).join(',')) violations.push('starvation recovery retried a spent reservation or missed an eligible PR');
       return { violations };
     } finally { rmSync(dir, { recursive: true, force: true }); }
   },

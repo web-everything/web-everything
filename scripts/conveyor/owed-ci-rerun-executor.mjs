@@ -35,8 +35,6 @@ export async function executeOwedCiReruns({ rows = [], repo, dispatchRetry = dis
     const cap = Number.isFinite(max) ? Math.max(1, Math.min(25, Math.floor(max))) : 10;
     const owed = rows.filter(row => row?.kind === 'ci-timeout-rerun')
       .sort((a, b) => Number(a.prNumber) - Number(b.prNumber));
-    result.skippedOverCap = Math.max(0, owed.length - cap);
-    if (result.skippedOverCap) safeLog(`owed-ci-rerun: ${result.skippedOverCap} over cap ${cap}; still owed next review tick`);
     // The rerun is a stateless API request (no file in the PR or the clone is written), so the daemon's own clone
     // being N commits behind must not refuse it (2026-11-21 live). It only needs origin/main to be readable
     // (fail-closed when offline); the head is re-observed by dispatchRetry just before the POST.
@@ -51,14 +49,24 @@ export async function executeOwedCiReruns({ rows = [], repo, dispatchRetry = dis
       result.skippedOverCap = 0;
       return result;
     }
-    for (const row of owed.slice(0, cap)) {
+    let used = 0;
+    for (const row of owed) {
+      if (used >= cap) { result.skippedOverCap++; continue; }
+      used++;
       const pr = row.prNumber;
       try {
         const out = await dispatchRetry(row.timeoutRetry, { repo });
+        // These refusals are decided under the durable reservation lock before any remote IO.
+        // Spent rows can recur every tick (or become spent since planning); they must not starve
+        // later PRs. Fresh rejections, unknown outcomes and errors still consume a slot.
+        if (row.timeoutRetry?.staleFreeze === true && out?.status === 'refused'
+          && typeof out.reason === 'string'
+          && ['stale-freeze-rerun-spent', 'stale-freeze-head-cap'].includes(out.reason?.split(';')[0])) used--;
         if (out?.status === 'requested') result.requested.push(pr);
         else result.refused.push({ pr, reason: out?.reason ?? out?.why ?? 'unknown timeout retry result' });
       } catch (error) { result.refused.push({ pr, reason: String(error?.message ?? error) }); }
     }
+    if (result.skippedOverCap) safeLog(`owed-ci-rerun: ${result.skippedOverCap} over cap ${cap}; still owed next review tick`);
   } catch (error) { safeLog(`owed-ci-rerun: execution failed: ${String(error?.message ?? error)}`); }
   return result;
 }

@@ -5919,6 +5919,11 @@ rejected or ambiguous requests, and rechecks main plus the live PR/job identity 
 If the reservation is spent or uncertain, inspect merge-gate and the durable timeout retry record before an
 operator retry; automatic ticks must not clear it. `merge-gate-stale-freeze.test.mjs`, `stale-freeze-rerun.test.mjs`
 and the `merge-gate-stale-main-freeze` soak break cover classification, refusal, restart and three-tick recovery.
+The executor's per-pass cap counts attempts, excluding only stale-freeze refusals for an already-spent run
+or exhausted head cap. Those refusals happen under the reservation lock before remote IO, remain visible
+for operator inspection, and must leave capacity for later PRs. Fresh API rejections and unknown results
+still consume capacity. Replay eleven eligible PRs across two passes: reject the first ten requests,
+then recover the API and require the eleventh PR to run without retrying any spent reservation.
 
 ## Stale automatic main-freeze recovery
 
