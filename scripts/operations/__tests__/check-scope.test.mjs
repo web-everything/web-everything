@@ -3,6 +3,7 @@ import { mkdtempSync, writeFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { checkScope } from '../check-scope.mjs';
+import { assessFreeScope, registerScope } from '../free-scope.mjs';
 import { collectFreeScope, readRegistry, OPEN_PR_LIMIT } from '../free-scope-io.mjs';
 import { PROSE_SCOPE_GLOBS, isProseScopeFile } from '../../lib/prose-scope-globs.mjs';
 
@@ -45,6 +46,26 @@ describe('checkScope shared admission', () => {
     expect(run({ agents: [{ ...agent, files: ['we:./'] }] }).ok).toBe(false);
     expect(run({ agents: [{ ...agent, files: ['we:scripts/..'] }] }).ok).toBe(false);
     expect(run({ agents: [agent] }, { declaredFiles: ['we:'] }).ok).toBe(false);
+  });
+  it.each(['we:', 'we:.', 'we:./', 'we:scripts/..', 'we:scripts/../', 'web-everything:'])
+  ('reports a registered repository-root claim %s as an overlap', root => {
+    const agents = registerScope([], { agent: 'root-holder', files: [root] }, new Date(now).toISOString());
+    expect(run({ agents })).toMatchObject({ ok: false,
+      overlaps: [{ file: 'we:scripts/a.mjs', agent: 'root-holder' }] });
+    expect(run({ agents }, { declaredFiles: ['plateau-app:scripts/a.mjs'] })).toEqual({ ok: true, overlaps: [] });
+  });
+  it('agrees with the existing assessor for a root claim written by registerScope', () => {
+    const agents = registerScope([], { agent: 'root-holder', files: ['we:'] }, new Date(now).toISOString());
+    expect(agents[0].files).toEqual(['we:']);
+    expect(assessFreeScope({ files: ['scripts/a.mjs'], agents, nowMs: now }).status).toBe('occupied');
+    expect(run({ agents })).toEqual({ ok: false,
+      overlaps: [{ file: 'we:scripts/a.mjs', agent: 'root-holder' }], reason: expect.stringContaining('held by agent root-holder') });
+  });
+  it.each(['we:', 'we:.', 'we:./', 'we:scripts/..', 'web-everything:'])
+  ('reports a declared repository-root scope %s overlapping a registered descendant', root => {
+    const agents = registerScope([], { agent: 'file-holder', files: ['scripts/a.mjs'] }, new Date(now).toISOString());
+    expect(run({ agents }, { declaredFiles: [root] })).toEqual({ ok: false,
+      overlaps: [{ file: 'we:', agent: 'file-holder' }], reason: expect.stringContaining('held by agent file-holder') });
   });
   it('allows prose-only scopes without collecting evidence', () => {
     const collect = vi.fn(() => { throw new Error('must not read'); });
