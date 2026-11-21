@@ -4,6 +4,7 @@
  * thread and re-plan before leaving the bounced PR without a fixer.
  */
 import { readFileSync } from 'node:fs';
+import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { runReconcileFixDispatch } from '../../reconcile-fix-dispatch.mjs';
 import { planReconcile } from '../../reconcile-core.mjs';
@@ -21,7 +22,11 @@ export default {
     where: 'lane/fix-refusal-fresh-reread',
     paths: ['scripts/conveyor/reconcile-core.mjs', 'scripts/conveyor/reconcile-fix-dispatch.mjs'],
   },
-  fixPresent() { return this.judge(this.run()).length === 0; },
+  fixPresent(root) {
+    // Detect the shipped seam independently of the scenario's success or failure.
+    return readFileSync(join(root, 'scripts/conveyor/reconcile-fix-dispatch.mjs'), 'utf8')
+      .includes('export function readFreshFixPr(');
+  },
   run() {
     const sendBack = JSON.parse(readFileSync(new URL('../../__tests__/fixtures/pr7312-red-team-send-back.json', import.meta.url), 'utf8'));
     const pr = { number: 7312, state: 'OPEN', isDraft: false,

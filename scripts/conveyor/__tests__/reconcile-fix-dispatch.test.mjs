@@ -2694,6 +2694,20 @@ describe('bounced no-findings fresh evidence', () => {
     expect(dispatch).not.toHaveBeenCalled();
     expect(result.reconcileRefusalDetails[0].kind).toBe('no-findings');
   });
+  it.each([
+    { state: 'CLOSED' }, { state: 'MERGED' }, { state: 'UNKNOWN' },
+    { state: undefined }, { isDraft: true }, { isDraft: undefined },
+  ])('fresh non-open or draft evidence with a red-team send-back keeps refusal and does not dispatch (%j)', over => {
+    const reader = vi.fn(number => pr(number, { comments: [sendBack], commentsComplete: true, ...over }));
+    const { result, dispatch, reconcile } = run(reader);
+    expect(reader).toHaveBeenCalledTimes(1);
+    expect(reconcile).toHaveBeenCalledTimes(1);
+    expect(dispatch).not.toHaveBeenCalled();
+    expect(result.dispatched).toEqual([]);
+    expect(result.reconcileRefusalDetails[0]).toMatchObject({
+      kind: 'no-findings', head, readAt: new Date(now).toISOString(),
+    });
+  });
   it('throwing reader refuses with no dispatch', () => {
     const reader = vi.fn(() => { throw Error('read failed'); });
     const { result, dispatch } = run(reader);

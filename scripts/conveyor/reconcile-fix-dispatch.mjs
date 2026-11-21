@@ -2004,7 +2004,7 @@ export function runReconcileFixDispatch({
       const fresh = readFreshPr(refusal.prNumber, { repo: repoKey, root, clock });
       if (!fresh || fresh.number !== refusal.prNumber || fresh.commentsComplete !== true
           || fresh.failed === true || fresh.deferred === true || fresh.discoveryIncomplete === true
-          || typeof fresh.state !== 'string' || typeof fresh.isDraft !== 'boolean'
+          || fresh.state !== 'OPEN' || fresh.isDraft !== false
           || typeof fresh.headRefName !== 'string' || typeof fresh.baseRefName !== 'string'
           || typeof fresh.mergeStateStatus !== 'string' || !Array.isArray(fresh.labels)
           || !Array.isArray(fresh.statusCheckRollup)
