@@ -3730,7 +3730,7 @@
     {
       "where": "scripts/lib/provider-routing.mjs:163",
       "identifier": "AGY_GEMINI_SIMPLE_MODEL",
-      "current": "gemini-3.8-flash-high",
+      "current": "gemini-4-hydrogen-medium",
       "proposedKey": "providerRouting.agyGeminiSimpleModel",
       "range": "model id",
       "impact": "M",

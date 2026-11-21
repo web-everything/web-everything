@@ -155,7 +155,7 @@ describe('operator routing overrides', () => {
   });
 
   it('applies operation provider disables after resolving an inherited task-type route', () => {
-    const policy = applyRoutingOverrides(DEFAULT_ROUTING_POLICY, { fix: { disabledProviders: ['codex'] } });
+    const policy = applyRoutingOverrides(DEFAULT_ROUTING_POLICY, { fix: { disabledProviders: ['agy-gemini'] } });
     expect(resolveOperationRoute({ operation: 'fix', taskType: 'doc-fix', policy })).toMatchObject({
       provider: 'claude', fallback: [],
     });
@@ -280,7 +280,7 @@ describe('operator routing overrides', () => {
     expect(rows).toHaveLength(3);
     expect(rows.map(r => r.detail.cleared).sort()).toEqual([false, false, true]);
     expect(rows).toEqual(expect.arrayContaining([expect.objectContaining({ kind: 'routing-override-applied', detail: expect.objectContaining({
-      operation: 'review-seat', taskType: 'red-team', provider: 'agy-gemini', model: 'flash', source: 'platform', cleared: false,
+      operation: 'review-seat', taskType: 'red-team', provider: 'agy-gemini', model: 'neon', source: 'platform', cleared: false,
     }) })]));
   });
 
@@ -335,7 +335,7 @@ describe('operator routing overrides', () => {
     const base = structuredClone(DEFAULT_ROUTING_POLICY);
     for (const task of [`extra-juror:${EXTRA_JUROR_MANDATE}`, ...ROUTED_ADVISORY_LENSES]) {
       base.operations[`review-seat:${task}`] = routeKind === 'inherited' ? { inherit: true }
-        : { provider: 'codex', model: 'sol', fallback: [{ provider: 'agy-gemini', model: 'flash' }] };
+        : { provider: 'codex', model: 'sol', fallback: [{ provider: 'agy-gemini', model: 'neon' }] };
     }
     const policy = applyRoutingOverrides(base, {
       'review-seat:standards-conformance': { provider: 'agy-gemini', model: 'pro', fallback: [] },

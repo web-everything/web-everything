@@ -101,7 +101,7 @@ test('red-team overlay cannot select emergency agy-claude while ordinary budget 
   assert.ok(logs.some(line => line.includes('agy-claude unavailable')));
 });
 
-for (const fallback of [[], [{ provider: 'agy-gemini', model: 'flash', effort: 'high' }]]) {
+for (const fallback of [[], [{ provider: 'agy-gemini', model: 'neon', effort: 'high' }]]) {
   test.each(['high', 'xhigh'])(`red-team emergency overlay preserves ordinary routing without a matching repository fallback (%s, ${fallback.length} fallbacks)`, async effort => {
     const policy = structuredClone(DEFAULT_ROUTING_POLICY);
     policy.operations['review-seat:red-team'] = {
@@ -473,9 +473,9 @@ test('unpromoted Carbon cannot escape an operator route with no allowed fallback
 test('builder preference preserves policy model and effort in both directions', async () => {
   const policy = structuredClone(DEFAULT_ROUTING_POLICY);
   policy.operations['review-seat:red-team'] = { provider: 'codex', model: 'sol', effort: 'xhigh',
-    fallback: [{ provider: 'agy-gemini', model: 'flash', effort: 'medium' }] };
+    fallback: [{ provider: 'agy-gemini', model: 'neon', effort: 'medium' }] };
   for (const [builder, provider, model, effort] of [
-    ['codex', 'agy-gemini', policy.aliases['agy-gemini'].flash, 'medium'],
+    ['codex', 'agy-gemini', policy.aliases['agy-gemini'].neon, 'medium'],
     ['claude', 'codex', policy.aliases.codex.sol, 'xhigh'],
   ]) {
     const actual = await builderSeat(builder, { readRoutingPolicy: () => policy }, {

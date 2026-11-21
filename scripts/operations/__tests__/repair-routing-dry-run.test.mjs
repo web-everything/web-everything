@@ -13,10 +13,12 @@ it('passes resolved effort to the actual Codex, Gemini and native Claude argv bu
   expect(buildCodexDirectTaskArgv({ cwd: '/tmp/lane', ...testFix })).toEqual(expect.arrayContaining(['-m', 'gpt-6.1-sol', 'model_reasoning_effort=low']));
   // Exercise Gemini argv with an explicit policy fixture, independent of the live test-fix route.
   const geminiPolicy = structuredClone(DEFAULT_ROUTING_POLICY);
-  geminiPolicy.operations['build:test-fix'] = { provider: 'agy-gemini', model: 'gemini-3.8-flash', effort: 'low', fallback: [] };
+  geminiPolicy.operations['build:test-fix'] = { provider: 'agy-gemini', model: 'gemini-4-hydrogen-low', effort: 'low', fallback: [] };
   const gemini = resolveOperationRoute({ operation: 'build', taskType: 'test-fix', policy: geminiPolicy });
   expect(buildWorkerArgv({ worker: { ...gemini, launcher: 'scripts/gemini-direct-task.mjs' }, weRoot: '/we', dir: '/lane', taskFile: '/task' })).toContain('--effort=low');
-  expect(buildAgyDirectTaskArgv(gemini)).toEqual(expect.arrayContaining(['--model', 'gemini-3.8-flash', '--effort', 'low']));
+  const geminiArgv = buildAgyDirectTaskArgv(gemini);
+  expect(geminiArgv).toEqual(expect.arrayContaining(['--model', 'gemini-4-hydrogen-low']));
+  expect(geminiArgv).not.toContain('--effort'); // The Gemini 4 model id carries the effort.
   const native = resolveOperationRoute({ operation: 'build', gateClosed: true });
   // Codex builds use medium; the native Claude fallback retains its own high effort.
   expect(buildAgentArgv({ payload: { prompt: 'repair', launchKind: 'fix' }, table: native })).toEqual(expect.arrayContaining(['--model', 'sonnet', '--effort', 'high']));

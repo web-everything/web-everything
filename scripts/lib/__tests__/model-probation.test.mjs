@@ -165,13 +165,13 @@ describe('IO shell — readRegistry/writeRegistry', () => {
 });
 
 
-describe('S0.1 — Flash delivery on small kinds', () => {
+describe('S0.1 — Hydrogen delivery on small kinds', () => {
   const kinds = ['doc-fix', 'prevention-card', 'prepare-card'];
   const policy = DEFAULT_ROUTING_POLICY;
 
-  it('registers Flash on probation for delivery only, owned by 3383 since 2026-11-21', () => {
+  it.each(['medium', 'low'])('registers Hydrogen %s on probation for delivery only, owned by 3383 since 2026-11-21', effort => {
     const registry = readRegistry();
-    const identity = { provider: 'antigravity', model: 'gemini-3.8-flash' };
+    const identity = { provider: 'antigravity', model: `gemini-4-hydrogen-${effort}` };
     expect(findEntry(registry, identity)).toMatchObject({
       roles: { delivery: 'probation' }, owner: '3383', since: '2026-11-21',
     });
@@ -184,20 +184,20 @@ describe('S0.1 — Flash delivery on small kinds', () => {
     expect(settings.allowedKinds).toEqual(kinds);
   });
 
-  it.each(kinds)('routes %s to agy-gemini Flash through both operation and task-type policy', kind => {
+  it.each(kinds)('routes %s to agy-gemini Hydrogen through both operation and task-type policy', kind => {
     for (const operation of [kind, 'worker', ...(kind === 'doc-fix' ? ['build'] : [])]) {
       const route = resolveOperationRoute({ operation, taskType: kind, policy });
-      expect(route).toMatchObject({ provider: 'agy-gemini', model: 'gemini-3.8-flash' });
+      expect(route).toMatchObject({ provider: 'agy-gemini', model: 'gemini-4-hydrogen-medium' });
     }
   });
 
-  it('never draws Flash for the security lens, including its fallback', () => {
+  it('never draws Hydrogen for the security lens, including its fallback', () => {
     const route = resolveOperationRoute({ operation: 'review-seat', taskType: 'mandatory:security', policy });
     expect(route).toMatchObject({ provider: 'agy-claude', model: 'claude-sonnet-5-5-high', effort: 'high' });
-    expect([route, ...route.fallback].every(seat => !seat.model.includes('flash'))).toBe(true);
+    expect([route, ...route.fallback].every(seat => !seat.model.includes('hydrogen'))).toBe(true);
   });
 
-  it.each(kinds)('never draws Flash for %s on merge-path, security or unknown shapes', kind => {
+  it.each(kinds)('never draws Hydrogen for %s on merge-path, security or unknown shapes', kind => {
     const shapes = [
       { filesTouched: ['scripts/lib/pr-merge-gate.mjs'] },
       { filesTouched: ['scripts/merge-ai-prs.mjs'] },
@@ -209,7 +209,7 @@ describe('S0.1 — Flash delivery on small kinds', () => {
       expect(gateClosed).toBe(true);
       const route = resolveOperationRoute({ operation: kind, gateClosed, policy });
       expect(route).toMatchObject({ provider: 'claude', model: 'claude-sonnet-5-5' });
-      expect([route, ...route.fallback].every(seat => !seat.model.includes('flash'))).toBe(true);
+      expect([route, ...route.fallback].every(seat => !seat.model.includes('hydrogen'))).toBe(true);
     }
   });
 });

@@ -188,14 +188,16 @@ export function criticalWorkVerdict(work = {}) {
 
   const groups = Object.entries(CRITICAL_PATH_PREFIXES)
     .filter(([name, prefixes]) => files.some((f) => {
-      if (prefixes.some((prefix) => f.startsWith(prefix))) return true;
-      if (name === 'gateSelf' && POLICY_TIER_HOMES.has(f)) return true;
+      // A declared directory covers protected descendants too; no filesystem read is needed.
+      const covers = (path, prefix) => path.startsWith(prefix) || prefix.startsWith(`${path.replace(/\/$/, '')}/`);
+      if (prefixes.some((prefix) => covers(f, prefix))) return true;
+      if (name === 'gateSelf' && [...POLICY_TIER_HOMES].some(home => covers(f, home))) return true;
       // #4200 — ONLY `irreversible` recurs identically per repo (`.github/workflows/`, the deploy/land
       // mechanisms this rule exists to catch); `statute`/`gateSelf` name WE's OWN governance/gate files with
       // no sibling-repo equivalent, so they deliberately stay WE-relative-only, unchanged.
       if (name !== 'irreversible') return false;
       const relative = repoRelativeForm(f);
-      return relative != null && prefixes.some((prefix) => relative.startsWith(prefix));
+      return relative != null && prefixes.some((prefix) => covers(relative, prefix));
     }))
     .map(([group]) => group);
   if (groups.length) {

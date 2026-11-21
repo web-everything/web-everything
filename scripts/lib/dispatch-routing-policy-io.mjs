@@ -8,6 +8,7 @@ import { decideDispatchRoute, MARKER_KINDS } from './dispatch-contracts.mjs';
 import { BUILD_KINDS, effectiveBuilder, resolveRoutingSettings } from './routing-settings.mjs';
 import { providerQuotaHold } from './provider-quota-hold.mjs';
 import { resolveRoutingOverrideRoute } from './dispatch-routing-override-route.mjs';
+import { assertAgyHydrogenBuildAdmission } from './agy-sandbox.mjs';
 import { taskTypeFor } from './dispatch-task-type.mjs';
 function initialPolicy(env) {
   return trustedSnapshot(env.WE_DISPATCH_ROUTING_SNAPSHOT) ?? DEFAULT_ROUTING_POLICY;
@@ -178,6 +179,10 @@ export function resolveDispatchRoute(dispatch, options = {}) {
   }
   if (pinned) routingPolicy = { ...routingPolicy, operations: { ...routingPolicy.operations, [dispatch.kind]: routingPolicy.operations[routeKey] } };
   const result = decideDispatchRoute(dispatch, { ...options, availability, ciHealNativeFallback, routingPolicy });
+  if (['agy-gemini', 'antigravity'].includes(result.policyRoute?.provider) && /^gemini-.*(?:hydrogen|flash)/.test(result.model ?? '')) {
+    try { assertAgyHydrogenBuildAdmission({ ...dispatch, taskType: result.taskType }, result.model); }
+    catch (error) { return { ...result, outcome: 'refused', probationWorker: null, refusal: error.message }; }
+  }
   // Task-type and legacy prepare routes can supply their own fallbacks. Enforce
   // the same boundary on the final route the launcher will actually consume.
   if (inputs.length && result.policyRoute) {

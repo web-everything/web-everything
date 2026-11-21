@@ -174,8 +174,7 @@ export function isOnProbation(registry, o) {
 }
 
 /** PURE convenience: is `{provider, model}` eligible for REAL work in `role` — `probation` or `trusted`?
- *  @test-only-export-ok: same rationale as `isOnProbation` above — public API for a future delivery-side
- *  eligibility check, not yet wired to a permanent caller. */
+ *  Enforced for Hydrogen delivery by agy-sandbox.mjs at routing and launch. */
 export function isDispatchEligible(registry, o) {
   const status = statusFor(registry, o);
   return status === 'probation' || status === 'trusted';

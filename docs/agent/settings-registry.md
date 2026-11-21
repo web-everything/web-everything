@@ -559,7 +559,7 @@ Prioritised for throughput and stuck-work impact, favouring capacity and concurr
 | M | prepReview.maxBlockRounds | PREP_REVIEW_MAX_BLOCK_ROUNDS | 1 | 0–5 | yes | B | scripts/conveyor/prep-review.mjs:39 |
 | M | probation.gateTimeoutMs | GATE_TIMEOUT_MS | 20 min (copied at probation-heal-run.mjs:250) | 10-90 min | yes | I | scripts/operations/probation-build-run.mjs:117 |
 | M | probation.turnTimeoutMs | PROBATION_TURN_TIMEOUT_MS | 30 min | 5–120 min | yes | H | scripts/lib/probation-launcher.mjs:38 |
-| M | providerRouting.agyGeminiSimpleModel | AGY_GEMINI_SIMPLE_MODEL | gemini-3.8-flash-high | model id | yes | G | scripts/lib/provider-routing.mjs:163 |
+| M | providerRouting.agyGeminiSimpleModel | AGY_GEMINI_SIMPLE_MODEL | gemini-4-hydrogen-medium | model id | yes | G | scripts/lib/provider-routing.mjs:163 |
 | M | readiness.proposer.{model,maxTokens} | MODEL (+max_tokens 1024) | claude-opus-4-8 | model ids / 256-8192 | no | C | scripts/readiness/model-proposer.mjs:20 |
 | M | rebase.unownedAttemptCap | UNOWNED_REBASE_ATTEMPT_CAP | 3 | 1-10 | yes | G | scripts/conveyor/unowned-rebase-attempt-count.mjs:51 |
 | M | reconcile.acceptLabelGraceMs | ACCEPT_LABEL_GRACE_MS | 15 min | 2-60 min | yes | I | scripts/conveyor/reconcile-core.mjs:1436 |
