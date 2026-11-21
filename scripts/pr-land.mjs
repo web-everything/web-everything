@@ -693,12 +693,13 @@ export function classifyChecks(rows) {
  * into the rubric, which floors SIZE at it. Together with `humanBasisFiles` that makes EVERY signal cumulative,
  * so a stacked lane's self-declared `base` can no longer de-inflate the size or blast-radius the producer stamps.
  * `computeNetDiffSignals` supplies it off the already-resolved basis; omitting it is the pre-#3317 behaviour.
+ * `netDiffScored` must explicitly confirm both the basis and text were scored; absent evidence requires human review.
  * @param {{changedFiles?:string[], diffLines?:number, humanBasisFiles?:string[]|null, cumulativeDiffLines?:number|null,
- *          dismissedFindings?:number, crossRepo?:boolean, currentLabels?:Array, diffHunks?:string|null}} o
+ *          dismissedFindings?:number, crossRepo?:boolean, currentLabels?:Array, diffHunks?:string|null, netDiffScored?:boolean}} o
  * @returns {{label:string|null, apply:boolean, reasons:string[], humanRequired:boolean}}
  */
 export function resolveProducerReviewLabel({
-  changedFiles = [], diffLines = 0, humanBasisFiles = null, cumulativeDiffLines = null, dismissedFindings = 0, crossRepo = false, currentLabels = [], diffHunks = null, basisNarrowed = true, deviation = null, sizeAdmission = null,
+  changedFiles = [], diffLines = 0, humanBasisFiles = null, cumulativeDiffLines = null, dismissedFindings = 0, crossRepo = false, currentLabels = [], diffHunks = null, basisNarrowed = true, deviation = null, sizeAdmission = null, netDiffScored = false, netDiffReason = null,
 } = {}) {
   // #3343 — `basisNarrowed` comes from `computeNetDiffSignals`: `false` means the cumulative file set is the
   // un-narrowed base TIP, so it may name files only upstream touched. It never relaxes the human gate (see
@@ -708,6 +709,11 @@ export function resolveProducerReviewLabel({
   // existing size signal and review:pending path, preserving stronger human review.
   const forceSizeReview = ['over', 'unknown'].includes(sizeAdmission?.status);
   const score = scoreEscalation({ changedFiles, diffLines: forceSizeReview ? Math.max(400, diffLines) : diffLines, humanBasisFiles, cumulativeDiffLines, dismissedFindings, crossRepo, diffHunks, basisNarrowed, deviation });
+  if (netDiffScored !== true) {
+    score.humanRequired = true;
+    score.careLevel = 'high';
+    score.reasons.push(`net diff unverified (${netDiffReason || 'unscored'}); restore diff access and rerun pr-land, or obtain human review of the full diff`);
+  }
   const label = score.humanRequired ? REVIEW_LABELS.human : forceSizeReview ? REVIEW_LABELS.pending : producerReviewLabel(score);
   // #2635 — expose the advisory care-level too, so the caller can recompute the jury roster (`resolveJuryPlan`)
   // for the SAME care band this rubric scored, then bind + reconcile it against the pre-registered roster.
@@ -1235,7 +1241,19 @@ async function runCli() {
   // "successful" fetch, sweeping already-landed upstream commits (e.g. a gate-fix another lane merged onto
   // `main` between this lane's claim and its PR-open, live repro: PR #324) into the score as if the PR itself
   // touched them.
+  const assertPrHeadMatches = () => {
+    // Read before publishing readiness and again at the scoring point. emit exits, including inside best-effort callers.
+    if (prNum) {
+      let prHeadSha = null;
+      try { prHeadSha = forge.viewPr(prNum, 'headRefOid')?.headRefOid; } catch { /* unread evidence refuses below */ }
+      if (!/^[0-9a-f]{40}$/i.test(prHeadSha || '') || prHeadSha.toLowerCase() !== refSha.toLowerCase()) {
+        emit({ repo: REPO, merged: false, reason: 'pr-head-mismatch', pr: Number(prNum),
+          sha: refSha, prHeadSha, detail: 'PR head is unreadable or differs from the local scoring head; refresh the ref and rerun pr-land.' }, 3);
+      }
+    }
+  };
   const applyReviewEscalationLabel = () => {
+    assertPrHeadMatches();
     const exec = (cmd, args, opts) => execFileSync(cmd, args, { cwd: REPO, ...opts });
     // xnsk54v — prefer the SCRATCH manifest (--manifest-file, the new off-tree carrier); fall back to the
     // legacy tree-committed `.lane-manifest.json` off the ref for a lane that still commits it. Loaded BEFORE
@@ -1256,9 +1274,10 @@ async function runCli() {
     // also calls. It resolves the basis ONCE (one `git fetch`, one candidate probe) and feeds both the
     // changed-file shape and the diff TEXT off it: the first cut called them independently and re-ran the whole
     // of `resolveNetDiffBasis`, measured 5 → 11 git subprocesses and 1 → 2 network fetches per PR open; sharing
-    // brings that to 6 subprocesses and 1 fetch. Assembling it here instead would leave that sharing — and the
+    // keeps one fetch; diff and numstat each also probe the clone paths for attribute isolation. Assembling it here instead would leave that sharing — and the
     // `diffHunks` mapping below — pinned by nothing a test can observe at this call site.
     const sig = computeNetDiffSignals({ exec, remote: REMOTE, base: BASE, baseRev, rev: refSha });
+    if (sig.netDiffText.scored) process.stderr.write(`pr-land net-diff basis: base=${sig.netDiffText.base} head=${sig.netDiffText.rev}\n`);
     const changedFiles = sig.changedFiles;
     const diffLines = sig.diffLines;
     // #2390-review-fix — the CUMULATIVE origin/main…head basis the gate-self/human trigger scores over; a
@@ -1272,9 +1291,8 @@ async function runCli() {
     // #2890 — that same basis's TEXT (not just the changed-file/line-count shape above). #2890-review-fix
     // finding 1 — the shared derivation applies `diffHunksFrom`, so this is the text when it was really
     // computed and `null` when it was NOT; never a raw `.text`, which is `''` on every failure path and so
-    // indistinguishable from a genuinely content-free diff. Still best-effort — an unresolvable basis degrades
-    // to `null` and never blocks a green land — but the signal now SAYS it is absent instead of impersonating
-    // an empty diff.
+    // indistinguishable from a genuinely content-free diff. An unverified basis or text requires human review
+    // below; null hunks must never impersonate an empty diff.
     const diffHunks = sig.diffHunks;
     const crossRepo = manifest && Array.isArray(manifest.repos) ? manifest.repos.length > 1 : false;
     const dismissedFindings = manifest && Number.isFinite(Number(manifest.dismissedFindings)) ? Number(manifest.dismissedFindings) : 0;
@@ -1284,7 +1302,7 @@ async function runCli() {
     // un-narrowed base TIP. `scored:false` means nothing was measured at all, which is a different fact from a
     // measurement taken on the wrong basis — don't stamp the un-narrowed reason on an empty score.
     const basisNarrowed = sig.scored ? sig.basisNarrowed !== false : true;
-    const rubric = resolveProducerReviewLabel({ changedFiles, diffLines, humanBasisFiles, cumulativeDiffLines, dismissedFindings, crossRepo, currentLabels, diffHunks, basisNarrowed, deviation: parseDeviationDisclosure(BODY), sizeAdmission: sizeAdmission });
+    const rubric = resolveProducerReviewLabel({ changedFiles, diffLines, humanBasisFiles, cumulativeDiffLines, dismissedFindings, crossRepo, currentLabels, diffHunks, basisNarrowed, deviation: parseDeviationDisclosure(BODY), sizeAdmission: sizeAdmission, netDiffScored: sig.scored === true && sig.netDiffText.scored === true, netDiffReason: sig.netDiffText.reason });
 
     // #2635 — BIND + RECONCILE the jury roster against the REAL diff. The pre-registered roster (the item's
     // charter roster) rides the lane manifest when a prepare-time slice recorded it (`preRegisteredLenses`);
@@ -1474,6 +1492,7 @@ async function runCli() {
   if (PLAN.labelWhenGreen) {
     const deferredRefusal = deferredLabelRefusal({ forge, prNum, sha: refSha, deferred: DEFERRED_TO_CI });
     if (deferredRefusal) emit({ repo: REPO, merged: false, ...deferredRefusal }, 3);
+    assertPrHeadMatches();
     applyLabel();
   }
 

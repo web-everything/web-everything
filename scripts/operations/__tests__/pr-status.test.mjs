@@ -427,7 +427,7 @@ describe('run.mjs pr-status --json — the real CLI, end to end (#3555, no gh ne
     const stdout = execFileSync(
       process.execPath,
       [RUN_MJS, 'pr-status', '--repo=o/r', '--pr=42', '--json'],
-      { encoding: 'utf8', env: { ...process.env, ...overlay.env, PATH: `${binDir}:${process.env.PATH}` } },
+      { encoding: 'utf8', env: { ...process.env, ...overlay.env, PATH: `${binDir}:${overlay.env.PATH}` } },
     );
     const result = JSON.parse(stdout);
     expect(result.verdict.prs[0].state).toBe('green');
@@ -440,7 +440,7 @@ describe('run.mjs pr-status --json — the real CLI, end to end (#3555, no gh ne
     const stdout = execFileSync(
       process.execPath,
       [RUN_MJS, 'pr-status', '--repo=o/r', '--pr=777', '--json'],
-      { encoding: 'utf8', env: { ...process.env, ...overlay.env, PATH: `${binDir}:${process.env.PATH}` } },
+      { encoding: 'utf8', env: { ...process.env, ...overlay.env, PATH: `${binDir}:${overlay.env.PATH}` } },
     );
     const result = JSON.parse(stdout);
     expect(result.verdict.prs).toHaveLength(1);

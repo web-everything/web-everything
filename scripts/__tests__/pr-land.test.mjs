@@ -5,8 +5,12 @@
  *   check-classification that decides merge-vs-wait-vs-abort. The live gh/git driver is the I/O boundary.
  */
 import { describe, it, expect, vi, afterEach } from 'vitest';
-import { readFileSync } from 'node:fs';
-import { resolve } from 'node:path';
+import { readFileSync, mkdtempSync, writeFileSync, rmSync } from 'node:fs';
+import { resolve, join } from 'node:path';
+import { spawnSync } from 'node:child_process';
+import { tmpdir } from 'node:os';
+import { pathToFileURL } from 'node:url';
+import { drainScoredGit } from './fixtures/drain-scored-git.mjs';
 import { pushFailedDetail, mergeMethodFlag, buildCreateArgs, prCreateBodyGuard, liveBodyLandGuard, buildMergeArgs, buildRenumberHealArgs, buildRegenArgs, buildAddLabelArgs, classifyChecks, planPrLand, pollVerdict, isPostLandTreeDirty, postLandSkips, postLandReport, scopeHealChangedPaths, resolveProducerReviewLabel, resolveRosterReconcile, resolveParkLabel, withAuthorStamp, composePrBody, PARK_LABELS, decideHoldReadyStrip, isAcceptedAtHead, resolveDraft, isMainFixPr, decideReadyOnOpen, applyLabelWithRetry, unlabelledHandOffLabel, landTimeBodyGate } from '../pr-land.mjs';
 import { HOME_REASONS } from '../operations/pr-land-reasons.mjs';
 import { REVIEW_LABELS, REVIEW_LABEL_META, READY_TO_MERGE_LABEL, scoreEscalation } from '../lib/review-escalation.mjs';
@@ -14,6 +18,90 @@ import { buildAuthorActorMarker, parseAuthorActorId } from '../lib/review-indepe
 import { PANEL_LENSES } from '../lib/review-core.mjs';
 
 afterEach(() => vi.unstubAllEnvs());
+
+it('open-only runCli labels a failed net-diff read review:human and emits the review label', () => {
+  // A scored leaf control is necessary: omitting netDiffScored also fails closed,
+  // so the failed-read assertion alone cannot catch that wiring mutation.
+  function run(failDiff) {
+    const dir = mkdtempSync(join(tmpdir(), 'pr-land-net-diff-'));
+    const trace = join(dir, 'effects.jsonl');
+    const root = pathToFileURL(resolve('scripts') + '/').href;
+    const sha = 'a'.repeat(40);
+    const record = `import { appendFileSync } from 'node:fs';
+      const effect = value => appendFileSync(${JSON.stringify(trace)}, JSON.stringify(value) + '\\n');`;
+    // Substitute unrelated admission/forge effects; keep runCli, the shared Git
+    // net-diff computation and the producer rubric intact (as in pr-land-preflight).
+    const stubs = {
+      './operations/canonical-audit-gate.mjs': 'export const checkCanonicalAuditForOpen = () => ({ ok: true });',
+      './lib/lane-verify.mjs': 'export const readVerifyMarker = () => null; export const verifyGateDecision = () => ({ ok: true });',
+      './conveyor/fix-procedure.mjs': 'export const pushRefusal = () => null; export const repoKeyForCheckout = () => "we";',
+      './lib/pr-size-admission.mjs': 'export const createSizeAdmissionRunner = () => async request => ({ body: request.body, status: "small" });',
+      './lib/forge-land-provider.mjs': `${record}
+        export const createGhLandProvider = () => ({
+          listOpenByHead: () => [{ number: 7 }],
+          viewPr: () => ({ headRefOid: ${JSON.stringify(sha)}, labels: [], comments: [], body: 'Update a leaf card.' }),
+          ensureLabel: () => {},
+          addLabel: (pr, label) => effect(['add-label', pr, label]),
+          removeLabel: (pr, label) => effect(['remove-label', pr, label]),
+          editBody: () => {},
+        });`,
+    };
+    const loader = join(dir, 'loader.mjs');
+    const preload = join(dir, 'preload.mjs');
+    writeFileSync(loader, `const stubs = ${JSON.stringify(stubs)};
+      export async function resolve(specifier, context, next) {
+        if (context.parentURL === ${JSON.stringify(root + 'pr-land.mjs')} && stubs[specifier]) {
+          const original = new URL(specifier, context.parentURL).href;
+          return { url: 'data:text/javascript,' + encodeURIComponent('export * from ' + JSON.stringify(original) + ';' + stubs[specifier]), shortCircuit: true };
+        }
+        return next(specifier, context);
+      }`);
+    writeFileSync(preload, `import cp from 'node:child_process';
+      import { syncBuiltinESMExports, register } from 'node:module';
+      ${record}
+      const scoredGit = ${drainScoredGit.toString()};
+      cp.execFileSync = (cmd, args) => {
+        effect([cmd, args]);
+        if (cmd === 'node') return ''; // independently tested locus linter
+        if (cmd !== 'git') throw new Error('unexpected external effect: ' + cmd);
+        while (args[0] === '-c') args = args.slice(2);
+        if (args[0] === 'diff' && ${failDiff}) {
+          effect(['diff-failed']); throw Object.assign(new Error('net-diff read unavailable'), { status: 128 });
+        }
+        if (args[0] === 'rev-parse' && args.includes('--absolute-git-dir') && !args.includes('--git-common-dir')) return ${JSON.stringify(dir)};
+        const result = scoredGit(args, { gitDir: ${JSON.stringify(dir)}, head: ${JSON.stringify(sha)} });
+        if (result) {
+          if (result.status) throw Object.assign(new Error(result.stderr), result);
+          return result.stdout;
+        }
+        if (args[0] === 'remote') return 'https://github.com/web-everything/web-everything.git';
+        if (args[0] === 'show') throw new Error('no manifest');
+        if (['push', 'fetch', 'log'].includes(args[0])) return '';
+        throw new Error('unexpected git command: ' + args.join(' '));
+      };
+      syncBuiltinESMExports(); register(${JSON.stringify(pathToFileURL(loader).href)});`);
+    try {
+      const child = spawnSync(process.execPath, ['--import', preload, resolve('scripts/pr-land.mjs'),
+        `--repo=${dir}`, '--ref=lane/net-diff', '--no-wait', '--json', '--body=Update a leaf card.'], {
+        cwd: dir, encoding: 'utf8', timeout: 30_000, maxBuffer: 2 * 1024 * 1024,
+        env: { ...process.env, TMPDIR: dir, WE_COORDINATION_ROOT: dir, WE_POLICY_CASCADE_LOG: '0', WE_REVIEW_LEDGER_MODE: 'off' },
+      });
+      expect(child.status, child.stderr + child.stdout).toBe(0);
+      return { result: JSON.parse(child.stdout.trim()),
+        effects: readFileSync(trace, 'utf8').trim().split('\n').map(JSON.parse) };
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  }
+
+  const failed = run(true);
+  expect(failed.effects).toContainEqual(['diff-failed']);
+  expect(failed.effects).toContainEqual(['add-label', 7, 'review:human']);
+  expect(failed.result).toMatchObject({ reason: 'opened', merged: false, pr: 7, reviewLabel: 'review:human' });
+
+  const scored = run(false);
+  expect(scored.effects).not.toContainEqual(['add-label', 7, 'review:human']);
+  expect(scored.result).toMatchObject({ reason: 'opened', merged: false, pr: 7 });
+  expect(scored.result).not.toHaveProperty('reviewLabel');
+}, 90_000);
 
 // ── #2844 · the AUTHOR STAMP pr-land writes at PR-open ─────────────────────────────────────────────────────────
 // PR #1100 review: this half had ZERO coverage. `withAuthorStamp` was module-private and read a module-scope
@@ -68,16 +156,34 @@ describe('#2844 — pr-land stamps the PR author into the body at open', () => {
 });
 
 describe('resolveProducerReviewLabel — #2307 deterministic review-escalation label AT PR-OPEN', () => {
+  it('omitted net-diff scoring evidence fails closed even with a supplied leaf diff', () => {
+    const v = resolveProducerReviewLabel({ changedFiles: ['backlog/leaf.md'], diffLines: 2, diffHunks: '@@ -1 +1 @@\n-old\n+new\n' });
+    expect(v.label).toBe(REVIEW_LABELS.human);
+    expect(v.humanRequired).toBe(true);
+    expect(v.reasons.join(' ')).toContain('net diff unverified (unscored)');
+    expect(v.reasons.join(' ')).toContain('human review of the full diff');
+  });
+
+  it.each([undefined, null, false, 1, 'true'])('netDiffScored=%s cannot verify a diff without explicit true', netDiffScored => {
+    expect(resolveProducerReviewLabel({ changedFiles: ['backlog/leaf.md'], diffLines: 2, netDiffScored }))
+      .toMatchObject({ label: REVIEW_LABELS.human, humanRequired: true });
+  });
+
+  it('explicitly scored leaf diff needs no review hold', () => {
+    expect(resolveProducerReviewLabel({ changedFiles: ['backlog/leaf.md'], diffLines: 2, netDiffScored: true }))
+      .toMatchObject({ label: null, humanRequired: false });
+  });
+
   it('a DECLARATIVE-LEASH diff (the roster — the encoded policy itself) → review:human, applied', () => {
     vi.stubEnv('WE_HUMAN_REVIEW_SURFACES', 'broad'); // Restore-path integration through the producer.
-    const v = resolveProducerReviewLabel({ changedFiles: ['scripts/lib/gate-config.mjs'], diffLines: 10 });
+    const v = resolveProducerReviewLabel({ netDiffScored: true, changedFiles: ['scripts/lib/gate-config.mjs'], diffLines: 10 });
     expect(v.label).toBe(REVIEW_LABELS.human);
     expect(v.apply).toBe(true);
     expect(v.humanRequired).toBe(true);
     expect(v.reasons.join(' ')).toMatch(/gate-self/);
   });
   it('#2771/#2785 — a policy-tier DERIVATION-CODE diff → review:pending (the committee), never review:human', () => {
-    const v = resolveProducerReviewLabel({ changedFiles: ['scripts/lib/review-escalation.mjs'], diffLines: 10 });
+    const v = resolveProducerReviewLabel({ netDiffScored: true, changedFiles: ['scripts/lib/review-escalation.mjs'], diffLines: 10 });
     expect(v.label).toBe(REVIEW_LABELS.pending);
     expect(v.apply).toBe(true);
     expect(v.humanRequired).toBe(false);
@@ -85,40 +191,40 @@ describe('resolveProducerReviewLabel — #2307 deterministic review-escalation l
   });
   it('#2771 Fork A — a STATUTE diff is UNCHANGED by the narrowing: still review:human', () => {
     vi.stubEnv('WE_HUMAN_REVIEW_SURFACES', 'broad'); // Restore-path integration through the producer.
-    const v = resolveProducerReviewLabel({ changedFiles: ['docs/agent/platform-decisions.md'], diffLines: 10 });
+    const v = resolveProducerReviewLabel({ netDiffScored: true, changedFiles: ['docs/agent/platform-decisions.md'], diffLines: 10 });
     expect(v.label).toBe(REVIEW_LABELS.human);
     expect(v.humanRequired).toBe(true);
     expect(v.reasons.join(' ')).toMatch(/statute/);
   });
   it('an escalating non-gate-self diff (blast-radius) → review:pending, applied', () => {
-    const v = resolveProducerReviewLabel({ changedFiles: ['scripts/pr-land.mjs'], diffLines: 10 });
+    const v = resolveProducerReviewLabel({ netDiffScored: true, changedFiles: ['scripts/pr-land.mjs'], diffLines: 10 });
     expect(v.label).toBe(REVIEW_LABELS.pending);
     expect(v.apply).toBe(true);
     expect(v.humanRequired).toBe(false);
   });
   it('a leaf diff with no escalation signal → no review label at all', () => {
-    const v = resolveProducerReviewLabel({ changedFiles: ['backlog/2307-x.md'], diffLines: 10 });
+    const v = resolveProducerReviewLabel({ netDiffScored: true, changedFiles: ['backlog/2307-x.md'], diffLines: 10 });
     expect(v.label).toBe(null);
     expect(v.apply).toBe(false);
   });
   it('cross-repo + dismissed-findings signals off the manifest also escalate (review:pending)', () => {
-    expect(resolveProducerReviewLabel({ crossRepo: true }).label).toBe(REVIEW_LABELS.pending);
-    expect(resolveProducerReviewLabel({ dismissedFindings: 2 }).label).toBe(REVIEW_LABELS.pending);
+    expect(resolveProducerReviewLabel({ netDiffScored: true, crossRepo: true }).label).toBe(REVIEW_LABELS.pending);
+    expect(resolveProducerReviewLabel({ netDiffScored: true, dismissedFindings: 2 }).label).toBe(REVIEW_LABELS.pending);
   });
   it('a PR that already carries the verdict label is NOT re-applied (idempotent — never a double-apply)', () => {
-    const v = resolveProducerReviewLabel({ changedFiles: ['scripts/pr-land.mjs'], diffLines: 10, currentLabels: [REVIEW_LABELS.pending] });
+    const v = resolveProducerReviewLabel({ netDiffScored: true, changedFiles: ['scripts/pr-land.mjs'], diffLines: 10, currentLabels: [REVIEW_LABELS.pending] });
     expect(v.label).toBe(REVIEW_LABELS.pending);
     expect(v.apply).toBe(false);
   });
   it('#2890 — accepts diffHunks and is otherwise unaffected by it (pure plumbing, no detector reads it yet)', () => {
     const hunks = '@@ -1,2 +1,2 @@\n-old\n+new\n';
-    const withHunks = resolveProducerReviewLabel({ changedFiles: ['scripts/pr-land.mjs'], diffLines: 10, diffHunks: hunks });
-    const withoutHunks = resolveProducerReviewLabel({ changedFiles: ['scripts/pr-land.mjs'], diffLines: 10 });
+    const withHunks = resolveProducerReviewLabel({ netDiffScored: true, changedFiles: ['scripts/pr-land.mjs'], diffLines: 10, diffHunks: hunks });
+    const withoutHunks = resolveProducerReviewLabel({ netDiffScored: true, changedFiles: ['scripts/pr-land.mjs'], diffLines: 10 });
     expect(withHunks.label).toBe(withoutHunks.label);
     expect(withHunks.apply).toBe(withoutHunks.apply);
     expect(withHunks.humanRequired).toBe(withoutHunks.humanRequired);
     expect(withHunks.reasons).toEqual(withoutHunks.reasons);
-    expect(() => resolveProducerReviewLabel({ diffHunks: undefined })).not.toThrow();
+    expect(() => resolveProducerReviewLabel({ netDiffScored: true, diffHunks: undefined })).not.toThrow();
   });
   it('#2890-review-fix finding 1 — the producer-side default is null (NOT COMPUTED), never the fail-open \'\'', () => {
     // `scoreEscalation` is what a follow-on detector reads, so the producer wrapper must not re-introduce the
@@ -943,22 +1049,22 @@ describe('resolveProducerReviewLabel — the basis trust question (#3343)', () =
   const statute = ['docs/agent/platform-decisions.md'];
 
   it('threads `basisNarrowed:false` onto the verdict as `basisUntrusted`, so a human clearing the label can see the scored file set was not provably this PR\'s', () => {
-    const v = resolveProducerReviewLabel({ changedFiles: ['backlog/a.md'], humanBasisFiles: ['backlog/a.md'], diffLines: 4, basisNarrowed: false });
+    const v = resolveProducerReviewLabel({ netDiffScored: true, changedFiles: ['backlog/a.md'], humanBasisFiles: ['backlog/a.md'], diffLines: 4, basisNarrowed: false });
     expect(v.basisUntrusted).toBe(true);
     expect(v.reasons.some((r) => r.startsWith('basis un-narrowed'))).toBe(true);
   });
 
   it('NEGATIVE DIRECTION — an un-narrowed basis still labels a genuine statute edit `review:human`; the flag never buys a PR its way past the gate', () => {
     vi.stubEnv('WE_HUMAN_REVIEW_SURFACES', 'broad'); // Restore-path integration through the producer.
-    const v = resolveProducerReviewLabel({ changedFiles: statute, humanBasisFiles: statute, diffLines: 12, basisNarrowed: false });
+    const v = resolveProducerReviewLabel({ netDiffScored: true, changedFiles: statute, humanBasisFiles: statute, diffLines: 12, basisNarrowed: false });
     expect(v.humanRequired).toBe(true);
     expect(v.label).toBe('review:human');
   });
 
   it('defaults to TRUSTED — a caller supplying no `basisNarrowed` produces the same verdict as before', () => {
-    expect(resolveProducerReviewLabel({ changedFiles: statute, humanBasisFiles: statute, diffLines: 12 }))
-      .toEqual(resolveProducerReviewLabel({ changedFiles: statute, humanBasisFiles: statute, diffLines: 12, basisNarrowed: true }));
-    expect(resolveProducerReviewLabel({ changedFiles: statute, humanBasisFiles: statute, diffLines: 12 }).basisUntrusted).toBe(false);
+    expect(resolveProducerReviewLabel({ netDiffScored: true, changedFiles: statute, humanBasisFiles: statute, diffLines: 12 }))
+      .toEqual(resolveProducerReviewLabel({ netDiffScored: true, changedFiles: statute, humanBasisFiles: statute, diffLines: 12, basisNarrowed: true }));
+    expect(resolveProducerReviewLabel({ netDiffScored: true, changedFiles: statute, humanBasisFiles: statute, diffLines: 12 }).basisUntrusted).toBe(false);
   });
 });
 
