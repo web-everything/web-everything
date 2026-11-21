@@ -10,7 +10,7 @@ import { ensureFreshGithubAppEnv, FLEET_APP_AUTH_OPTS, isGithubAppAuthGuardError
 import { isPidAlive } from '../lib/dispatch-throttle.mjs';
 import { acquireRead, releaseRead, defaultOwner, cloneLockDirs, HEARTBEAT_INTERVAL_MS } from '../lib/daemon-clone-lock.mjs';
 import { cloneDispatchBlock } from '../lib/daemon-self-sync.mjs';
-import { readEnumOverride } from '../lib/capacity-leaf.mjs';
+import { readEnumOverride } from '../lib/operator-enum-store.mjs';
 import { readCloneIdentity } from '../lib/daemon-background-build.mjs';
 import { planClaudeAuthDispatchGate } from './claude-auth-health.mjs';
 import { resolveCoordinationRoot } from '../operations/coordination-root.mjs';
