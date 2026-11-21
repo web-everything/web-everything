@@ -15,11 +15,14 @@ export function operatorOverrideOperation(name, { readOverrides = () => ({ reada
   });
   const clear = name === 'operator-override-clear';
   return op(name, {
-    input: { key: 'string', ...(!clear ? { value: 'number' } : {}), reason: 'string', actor: 'string' },
+    input: { key: 'string', ...(!clear ? { value: 'string' } : {}), reason: 'string', actor: 'string' },
     verdictFrom: 'plan',
     plan: compute({ reads: ['input'], fn: ({ input }) => {
       for (const key of ['reason', 'actor']) if (!input[key]?.trim()) throw Error(`--${key} must be non-empty`);
-      return { ...input, clear };
+      // Numeric text becomes a number; anything else stays text. The writer decides per key (an enum key accepts only
+      // its declared values, a numeric key accepts only an in-range number), so a wrong type is refused there, fail closed.
+      const numeric = !clear && typeof input.value === 'string' && input.value.trim() !== '' && Number.isFinite(Number(input.value));
+      return { ...input, ...(numeric ? { value: Number(input.value) } : {}), clear };
     } }),
     write: effect({ reads: ['verdict'], effects: view => [{ type: OPERATOR_OVERRIDE_EFFECT,
       idempotent: true, payload: view.verdict }] }),

@@ -16,6 +16,7 @@ import { join, resolve, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { spawnSync } from 'node:child_process';
 import { daemonAppEnv } from './fixtures/daemon-app-env.mjs';
+import { pinnedLeafDiffFixture } from './fixtures/pinned-leaf-diff-fixture.mjs';
 import { buildManifest, manifestBodyBlock } from '../readiness/lane-manifest.mjs';
 import { deriveResolutionBasis, graduatedToFromBody } from '../lib/review-render.mjs';
 
@@ -496,10 +497,10 @@ describe('round listing freshness at the CLI boundary', () => {
     const dir = mkdtempSync(join(tmpdir(), 'drain-round-cli-'));
     try {
       const row = (number, item, blockedBy = []) => ({ number, title: `PR ${number}`, state: 'OPEN',
-        headRefName: `lane/${number}`, headRefOid: `sha${number}`, baseRefName: 'main', updatedAt: '2026-01-01T00:00:00Z',
+        headRefName: `lane/leaf-${number}`, headRefOid: number.toString(16).padStart(40, '0'), baseRefName: 'main', updatedAt: '2026-01-01T00:00:00Z',
         isDraft: false, mergeable: 'MERGEABLE', mergeStateStatus: 'CLEAN', files: [],
         labels: [{ name: 'ready-to-merge' }], statusCheckRollup: [{ __typename: 'CheckRun', name: 'test', status: 'COMPLETED', conclusion: 'SUCCESS', checkSuite: { workflowRun: { workflow: { name: 'test' } } } }],
-        body: manifestBodyBlock(buildManifest({ item, blockedBy, repos: [{ repo: 'we', ref: `lane/${number}` }] })) });
+        body: manifestBodyBlock(buildManifest({ item, blockedBy, repos: [{ repo: 'we', ref: `lane/leaf-${number}` }] })) });
       const target = row(42, 42, ['43']);
       const sibling = row(43, 43);
       const snapshot = join(dir, 'round.json');
@@ -540,7 +541,12 @@ if (a[0] === 'pr' && a[1] === 'view' && a.includes('id')) out = { id: 'PR_43' };
 fs.writeSync(1, typeof out === 'string' ? out : JSON.stringify(out));
 `);
       // All git operations are local fixture responses, including the CLI's identity probe.
-      writeFileSync(join(dir, 'git'), '#!/bin/sh\nif [ "$1" = remote ]; then echo https://github.com/web-everything/web-everything.git; exit 0; fi\nexit 1\n');
+      writeFileSync(join(dir, 'git'), `#!/usr/bin/env node
+const a = process.argv.slice(2);
+if (a[0] === 'remote') { process.stdout.write('https://github.com/web-everything/web-everything.git'); process.exit(0); }
+${pinnedLeafDiffFixture}
+process.exit(1);
+`);
       for (const name of ['gh', 'git']) chmodSync(join(dir, name), 0o755);
       const result = spawnSync(process.execPath, [resolve(dirname(fileURLToPath(import.meta.url)), '..', 'merge-ai-prs.mjs'),
         '--only=42', '--this-repo', '--label=ready-to-merge', ...(!sendBack ? ['--dry-run'] : []), ...(!reconcile ? ['--no-reconcile-labels'] : []), '--no-drain-lease', '--no-red-main-freeze', '--json', `--listing-snapshot=${snapshot}`], {
@@ -736,4 +742,23 @@ describe('fresh queue rollup completeness', () => {
     expect(retained(fresh)).toBe(fresh);
     if (kind === 'oversized connection') expect(exec).toHaveBeenCalledTimes(10);
   });
+});
+
+
+it('listing hydrates heavy fields with bounded concurrency: live defaultBranch is read once per process across concurrent gates', async () => {
+  const { createLiveDefaultBranchReader } = await import('../lib/default-branch-cache.mjs');
+  const source = readFileSync(join(dirname(fileURLToPath(import.meta.url)), '..', 'merge-ai-prs.mjs'), 'utf8');
+  const start = source.indexOf('  const verifyDefaultBranch = createLiveDefaultBranchReader({');
+  const end = source.indexOf('\n  });', start) + '\n  });'.length;
+  expect(start).toBeGreaterThanOrEqual(0);
+  expect(end).toBeGreaterThan(start);
+  const cache = new Map();
+  const read = vi.fn(async () => { await Promise.resolve(); return { stdout: 'trunk\n' }; });
+  const verifyDefaultBranch = new Function('createLiveDefaultBranchReader', 'defaultBranchByRepo', 'execFileP',
+    `${source.slice(start, end)}; return verifyDefaultBranch;`)(
+    options => createLiveDefaultBranchReader({ ...options, writeCache: () => {} }), cache, read);
+  expect(await Promise.all([verifyDefaultBranch('fixture/repo'), verifyDefaultBranch('fixture/repo')])).toEqual(['trunk', 'trunk']);
+  expect(await verifyDefaultBranch('fixture/repo')).toBe('trunk');
+  expect(cache.get('fixture/repo')).toBe('trunk');
+  expect(read).toHaveBeenCalledTimes(1);
 });
