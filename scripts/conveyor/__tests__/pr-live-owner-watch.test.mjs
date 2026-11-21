@@ -1,5 +1,5 @@
 /** @file R863 ownership, safety, durable budgets, smells and health cadence regressions. */
-import { describe, it, expect, vi, afterEach } from 'vitest';
+import { describe, it, expect, vi, afterEach, beforeAll } from 'vitest';
 import { mkdtempSync, rmSync, readFileSync, writeFileSync, readSync, mkdirSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
@@ -343,6 +343,13 @@ describe('health-watch registration', () => {
 });
 
 describe('portable feed IO and settings', () => {
+  let reviewJob, dispatchManualPass;
+  beforeAll(async () => {
+    // Cold transforms of the production dispatch graph belong to bounded suite setup,
+    // not the first adapter's 5-second assertion budget. Keep circular roots sequential.
+    ({ dispatchManualPass } = await import('../../operations/manual-daemon-pass-io.mjs'));
+    reviewJob = await import('../../operations/review-job.mjs');
+  }, 30_000);
   const dirs = []; afterEach(() => dirs.splice(0).forEach(dir => rmSync(dir, { recursive: true, force: true })));
   async function localIo(adapters = {}, now = NOW, dir, actEnabled = true, extraEnv = {}) {
     if (!dir) { dir = mkdtempSync(join(process.env.TMPDIR || tmpdir(), 'live-owner-')); dirs.push(dir); }
@@ -564,7 +571,6 @@ describe('portable feed IO and settings', () => {
     expect(adapters.dispatchManualPass).not.toHaveBeenCalled();
   });
   it('review rechecks live head after reconcile and records the expected head on a refused intent', async () => {
-    const { dispatchManualPass } = await import('../../operations/manual-daemon-pass-io.mjs');
     let liveHead = pr().headRefOid;
     const dispatchReviewByMode = vi.fn(), readGhText = commentGh();
     const adapters = await reviewAdapters({
@@ -715,8 +721,7 @@ describe('portable feed IO and settings', () => {
     expect(() => feedTail(path, { read })).toThrow(/short tail read.*operator must inspect full input/);
   });
   it.each(['review-dispatch', 'red-team-dispatch'])('%s job refuses a head changed after the manual precheck through the production dispatcher', async action => {
-    const real = await import('../../operations/review-job.mjs');
-    const { dispatchManualPass } = await import('../../operations/manual-daemon-pass-io.mjs');
+    const real = reviewJob;
     const spawnJob = vi.fn(() => ({ pid: 4242 })), seen = [], outcomes = [];
     // The job-side live head moved after the precheck; nothing here can launch a real job.
     const jobOpts = { io: { liveHead: () => 'b'.repeat(40) }, spawnJob, checkoutExists: () => false,

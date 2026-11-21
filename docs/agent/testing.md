@@ -4428,6 +4428,10 @@ mutation enters handled-ID state. Run these and the affected lock/self-sync regr
 circular dependencies: starting them together with `Promise.all` deadlocks vite-node evaluation
 before adapter construction. Keep the portable IO cases in `pr-live-owner-watch.test.mjs` at the
 default timeout; injected dispatchers and lock identity probes keep their exercised IO local.
+Load the real manual dispatcher and review job sequentially in the portable IO suite's bounded
+`beforeAll` hook. The adapter tests share that production graph, including the job-side head
+refusal cases; cold transforms must finish before the first adapter's five-second test budget
+starts. Keep assertion timeouts unchanged and do not replace the real job dispatcher with a stub.
 
 Stalled living owners escalate to a rate-limited NEEDS-YOU event; activity age never proves death
 or permits claim takeover. The portable IO regressions exercise production evidence, planning,
