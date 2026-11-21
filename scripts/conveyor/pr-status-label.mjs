@@ -71,14 +71,19 @@ function requiredCiRed(pr, labels, requiredChecks, settings) {
 
 /** PURE: every required check passed at the live head. Unknown list, missing, pending or other-head checks are not green. */
 function requiredCiGreen(pr, requiredChecks, settings) {
-  if (!Array.isArray(requiredChecks) || !requiredChecks.length) return false;
+  if (!Array.isArray(requiredChecks) || !requiredChecks.length
+    || Array.from(requiredChecks).some(n => typeof n !== 'string' || !n.trim())) return false;
   const checks = Array.isArray(pr?.statusCheckRollup) ? pr.statusCheckRollup : [];
   const head = String(pr?.headRefOid ?? '').toLowerCase();
   const names = requiredChecks.filter(n => !(settings.reviewGateSignal === 'review' && n === 'review-gate'));
   const required = withoutImpliedRequiredChecks(names, checks);
-  return required.every((name) => checks.some((c) => (c.name ?? c.context) === name
-    && !(c.headSha && String(c.headSha).toLowerCase() !== head)
-    && ((c.status === 'COMPLETED' && ['SUCCESS', 'SKIPPED', 'NEUTRAL'].includes(c.conclusion)) || c.state === 'SUCCESS')));
+  const green = (c) => !(c.headSha && String(c.headSha).toLowerCase() !== head)
+    && ((c.status === 'COMPLETED' && ['SUCCESS', 'SKIPPED', 'NEUTRAL'].includes(c.conclusion)) || c.state === 'SUCCESS');
+  // Every run of a required check must be green: an older success never masks a newer pending rerun.
+  return required.every((name) => {
+    const runs = checks.filter((c) => (c.name ?? c.context) === name);
+    return runs.length > 0 && runs.every(green);
+  });
 }
 
 /** PURE: classify a planner refusal using only this caller's required checks. */

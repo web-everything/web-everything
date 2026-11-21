@@ -28,6 +28,10 @@ describe('ready-to-merge needs green checks and a clear red team', () => {
     const other = 'b'.repeat(40);
     expect(derive(pr([], [ok('test', { headSha: other }), ok('smoke', { headSha: other })]))).not.toBe('ready-to-merge');
   });
+  it('an older success never masks a newer pending rerun, and sparse lists fail closed', () => {
+    expect(derive(pr([], [ok('test'), pending('test'), ok('smoke')]))).toBe('awaiting-ci');
+    expect(derive(pr([], [ok('test')]), { requiredChecks: [, 'test'] })).not.toBe('ready-to-merge');
+  });
   it('all green with a clear red team is still ready-to-merge', () => {
     expect(derive(pr(['red-team:clear'], [ok('test', { headSha: HEAD }), ok('smoke')]))).toBe('ready-to-merge');
   });
