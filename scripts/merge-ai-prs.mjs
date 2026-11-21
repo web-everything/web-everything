@@ -259,7 +259,6 @@ import { resolveCascade, platformPreference } from './lib/policy-cascade.mjs'; /
 import { readSettings as readDeclaredDrainSettings } from './lib/settings-files.mjs'; // drain order: the tool layer (`drain` block of the declared settings)
 import { CONSTELLATION_REPOS, canonicalizeSlug, repoKeyForSlug } from './lib/constellation-repos.mjs';
 import { readLiveFixClaim, readLiveDrainClaim } from './conveyor/fix-procedure.mjs';
-import { fixDispatchClaimRoot } from './conveyor/fix-dispatch-claim.mjs';
 import { PREP_REVIEW_HEADLINE, prepNoteCoversHead } from './conveyor/prep-review.mjs'; // card x5f2daz — the light prepare-PR review record
 import { prepareItemFromRef } from './operations/prepare-pr.mjs';
 import { applyHumanClearanceCarry, latestHumanClearance, sanitizeActor } from './lib/human-clearance-carry.mjs'; // #xnqxtdy
@@ -5295,7 +5294,9 @@ export async function main(argv, { env = process.env, stdout = process.stdout, e
   const honourDispatchClaims = resolveHonourDispatchClaims(env, {
     platform: platformPreference('drain'), tool: readDeclaredDrainSettings()?.drain,
   });
-  process.stderr.write(`merge-ai-prs: drain.honourDispatchClaims=${honourDispatchClaims.value} (${honourDispatchClaims.source}) claimRoot=${fixDispatchClaimRoot()}\n`);
+  // Lazy: a static import would drag the dispatch-lane chain into fix-run's static graph.
+  const claimRoot = await import('./conveyor/fix-dispatch-claim.mjs').then(m => m.fixDispatchClaimRoot(), () => '(unresolved)');
+  process.stderr.write(`merge-ai-prs: drain.honourDispatchClaims=${honourDispatchClaims.value} (${honourDispatchClaims.source}) claimRoot=${claimRoot}\n`);
   const shadowClaimRows = new Set();
   const passClaimReader = drainClaimReaderFor(honourDispatchClaims.value, { onShadow: row => {
     const key = `${row.repo}#${row.pr}@${row.site}`;
