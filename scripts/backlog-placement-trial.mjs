@@ -98,7 +98,18 @@ export function runTrial(dir) {
   return { total: cards.length, byTarget, byRule, cards };
 }
 
-if (import.meta.url === `file://${process.argv[1]}`) {
+function isCliEntryPoint() {
+  if (!process.argv[1]) return false;
+  try {
+    // Normalize both paths, including symlinks and URL-escaped filename characters.
+    return fs.realpathSync(new URL(import.meta.url)) === fs.realpathSync(process.argv[1]);
+  } catch {
+    // Importers may supply an argv[1] that does not name a file.
+    return false;
+  }
+}
+
+if (isCliEntryPoint()) {
   const arg = (n, d) => process.argv.find((a) => a.startsWith(`--${n}=`))?.slice(n.length + 3) ?? d;
   const dir = arg('dir', 'backlog');
   // Snapshot identities before creating an output, which may itself end in .md.

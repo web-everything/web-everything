@@ -8,6 +8,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { spawnSync } from 'node:child_process';
+import { pathToFileURL } from 'node:url';
 import { classifyCard, runTrial } from '../backlog-placement-trial.mjs';
 
 const card = (title, body = '', front = 'kind: story') => `---\n${front}\n---\n# ${title}\n${body}\n`;
@@ -53,6 +54,62 @@ describe('runTrial', () => {
     expect(Object.values(r.byTarget).reduce((a, b) => a + b, 0)).toBe(3);
     expect(new Set(r.cards.map((c) => c.id)).size).toBe(3);
     for (const [f, t] of Object.entries(files)) expect(fs.readFileSync(path.join(dir, f), 'utf8')).toBe(t);
+  });
+});
+
+describe('CLI entry point', () => {
+  const script = path.resolve('scripts/backlog-placement-trial.mjs');
+
+  it.each(['physical', 'directory-symlink', 'file-symlink', 'relative', 'encoded', 'preserve-symlinks-main'])(
+    'executes through a %s path for valid and missing inputs',
+    (variant) => {
+      const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'bpt-entry-'));
+      try {
+        fs.mkdirSync(path.join(dir, 'backlog'));
+        const original = card('daemon lane drain');
+        fs.writeFileSync(path.join(dir, 'backlog', '1.md'), original);
+        let entry = fs.realpathSync(script);
+        if (variant === 'directory-symlink') {
+          fs.symlinkSync(path.dirname(entry), path.join(dir, 'checkout'));
+          entry = path.join(dir, 'checkout', path.basename(entry));
+        }
+        if (['file-symlink', 'relative', 'preserve-symlinks-main'].includes(variant)) {
+          fs.symlinkSync(entry, path.join(dir, 'entry.mjs'));
+          entry = variant === 'relative' ? './entry.mjs' : path.join(dir, 'entry.mjs');
+        }
+        if (variant === 'encoded') {
+          entry = path.join(dir, 'entry space # % é.mjs');
+          fs.copyFileSync(script, entry);
+        }
+        const flags = variant === 'preserve-symlinks-main' ? ['--preserve-symlinks-main'] : [];
+        const options = { cwd: dir, encoding: 'utf8', timeout: 10_000, maxBuffer: 1024 * 1024 };
+        const missing = spawnSync(process.execPath, [...flags, entry, '--dir=missing', '--out=report.json'], options);
+        expect(missing.error).toBeUndefined();
+        expect(missing.status).toBe(1);
+        expect(missing.stderr).toContain('ENOENT');
+        expect(fs.existsSync(path.join(dir, 'report.json'))).toBe(false);
+        const valid = spawnSync(process.execPath, [...flags, entry, '--dir=backlog', '--out=report.json'], options);
+        expect(valid.error).toBeUndefined();
+        expect(valid.status).toBe(0);
+        expect(valid.stdout).toContain('cards: 1');
+        expect(JSON.parse(fs.readFileSync(path.join(dir, 'report.json'), 'utf8'))).toEqual(runTrial(path.join(dir, 'backlog')));
+        expect(fs.readFileSync(path.join(dir, 'backlog', '1.md'), 'utf8')).toBe(original);
+      } finally {
+        fs.rmSync(dir, { recursive: true, force: true });
+      }
+    },
+  );
+
+  it.each(['absent', 'nonexistent', 'other-file'])('does not run the CLI on import with %s argv[1]', (variant) => {
+    const setup = variant === 'absent' ? 'process.argv.length = 1;' :
+      `process.argv[1] = ${JSON.stringify(variant === 'nonexistent' ? `${script}.missing` : path.resolve('package.json'))};`;
+    const result = spawnSync(process.execPath, ['--input-type=module', '--eval',
+      `${setup} await import(${JSON.stringify(pathToFileURL(script).href)}); console.log('imported');`],
+    { encoding: 'utf8', timeout: 10_000, maxBuffer: 1024 * 1024 });
+    expect(result.error).toBeUndefined();
+    expect(result.status).toBe(0);
+    expect(result.stdout).toBe('imported\n');
+    expect(result.stderr).toBe('');
   });
 });
 
