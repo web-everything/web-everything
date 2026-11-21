@@ -265,9 +265,24 @@ const unfinishedSince = run => {
 // PR #6584: a run whose clearing effect hit a permanent guard refusal (`refused` effect, `outcome: 'refused'`) has
 // `pending: null` but never applied its verdict's label. It is NOT a finished review: it holds like open work (fails
 // closed), so a refused accept can never count as completed accept evidence.
-const hasOpenEffect = run => run.outcome === 'refused'
-  || run.effects?.some(effect => ['pending', 'in-flight', 'refused'].includes(effect?.status));
-const unfinishedReview = run => !run.verdict || run.pending != null || hasOpenEffect(run);
+// #7202: a run that applied everything (write-up, label swap, ledger append) and died inside the post-record,
+// ADDITIVE-ONLY `review.ledger-events` effect decided nothing more: its marker is already on GitHub. It is finished
+// only when that ONE effect is `pending` (never in-flight/refused), every other effect is applied, the run is not
+// refused, and the verdict is a recognised string. Anything missing or unknown stays unfinished (fails closed).
+// Accept-class only, and only when the confirmation also accepted, and the write-up and label swap are present and applied.
+const trailingLedgerOnly = run => {
+  if (run?.outcome === 'refused' || run?.pending?.kind !== 'effect' || run.pending.step !== 'ledgerEvents') return false;
+  if (!['accept', 'prevention-outstanding'].includes(verdictOf(run)) || run.findings?.confirm !== 'accept' || !Array.isArray(run.effects)) return false;
+  for (const type of ['review.write-up', 'review.label-swap', 'verdict-ledger.append']) {
+    if (!run.effects.some(effect => effect?.type === type && effect.status === 'applied')) return false;
+  }
+  const open = run.effects.filter(effect => effect?.step === 'ledgerEvents' || effect?.type === 'review.ledger-events');
+  if (open.length !== 1 || open[0].type !== 'review.ledger-events' || open[0].step !== 'ledgerEvents' || open[0].status !== 'pending') return false;
+  return run.effects.every(effect => effect === open[0] || effect?.status === 'applied');
+};
+const hasOpenEffect = run => !trailingLedgerOnly(run) && (run.outcome === 'refused'
+  || run.effects?.some(effect => ['pending', 'in-flight', 'refused'].includes(effect?.status)));
+const unfinishedReview = run => !run.verdict || (run.pending != null && !trailingLedgerOnly(run)) || hasOpenEffect(run);
 // An unfinished run that already ACCEPTED a readable sha other than the live head only waits on bookkeeping effects
 // for a superseded head: it cannot hold the live head. A run still deciding or rejecting (it may send the PR back),
 // or with an unreadable head (cleanRev null), stays unfinished (fail closed). Only the gate decision changes.
@@ -302,10 +317,11 @@ const settleKind = run => {
   const verdict = verdictOf(run);
   if (typeof verdict !== 'string' || verdict === '') return 'hard';
   if (verdict === 'needs-human') return 'undecided';
-  if (ACCEPT_VERDICTS.includes(verdict)) return run.pending != null ? 'undecided' : 'accept';
+  const pendingOpen = run.pending != null && !trailingLedgerOnly(run);
+  if (ACCEPT_VERDICTS.includes(verdict)) return pendingOpen ? 'undecided' : 'accept';
   // Only the one rejection this pipeline records is a supersedable rejection; any other string ('Accept ', 'rejected',
   // 'bogus') is a shape this reader does not recognise and fails closed like a non-string one.
-  return verdict === 'changes' && run.pending == null ? 'reject' : 'hard';
+  return verdict === 'changes' && !pendingOpen ? 'reject' : 'hard';
 };
 // What the complete read keeps of a record: never its payload. Cached per (read function, dir, id) with the mtime and
 // size it was read at, so a settle attempt that keeps holding does not re-parse the whole store every tick; a rewrite

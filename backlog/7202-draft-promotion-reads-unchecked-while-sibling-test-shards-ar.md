@@ -2,9 +2,10 @@
 bornAs: xo9rd3s
 kind: story
 size: 2
-status: open
+status: resolved
 scope: ["we:scripts/conveyor/draft-promotion-rule.mjs"]
 dateOpened: "2026-10-25"
+dateResolved: "2026-11-21"
 tags: []
 ---
 
