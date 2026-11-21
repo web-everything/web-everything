@@ -3,9 +3,14 @@ import { mkdirSync, writeFileSync, readFileSync, readdirSync } from 'node:fs';
 import { join } from 'node:path';
 import { withRealRepo } from './helpers/real-repo.mjs';
 import { explainWhy, lastMentionLine, whyOperation } from '../operator-why.mjs';
+import { ADVISORY_NOTE_MARKER } from '../../conveyor/advisory-round-count.mjs';
 import { createWhyReader } from '../operator-why-io.mjs';
 
 const base = { subject: { kind: 'pr', id: 5017 }, repo: 'web-everything/web-everything', pr: { state: 'OPEN', labels: [] }, logs: [], checks: [], gaps: [] };
+const HEAD7 = 'f7c7dcd37' + '0'.repeat(31), OLD7 = '1c2cf7cc9' + '0'.repeat(31);
+const staleAdvisoryPr = (extra = {}) => ({ state: 'OPEN', labels: ['review:human'], headRefOid: HEAD7,
+  commits: [{ oid: OLD7, messageHeadline: 'fix' }, { oid: HEAD7, messageHeadline: 'ci: recover missing PR checks', messageBody: 'Conveyor-Missing-Run-Recovery: x' }],
+  comments: [{ author: { login: 'web-everything' }, body: `${ADVISORY_NOTE_MARKER}\n\n**Verdict:** accept\n\nok\n\n---\n\nNet basis: \`${'c'.repeat(40)}..${OLD7}\` — 1 net changed file(s) vs current main` }], ...extra });
 const item = { ...base, subject: { kind: 'item', id: '5754' }, card: { status: 'open' } };
 describe('why first-match owner rules', () => {
   const rows = [
@@ -32,6 +37,16 @@ describe('why first-match owner rules', () => {
     if (op) for (const flag of ['--preview', '--actor=<login>', '--channel=<where>', '--reason="<why>"']) expect(out.suggestedOp).toContain(flag);
     expect(out.sections.map(s => s.name)).toEqual(['state', 'checks', 'daemons', 'holds', 'queue', 'owner']);
     expect(out.screen.split('\n').length).toBeLessThanOrEqual(40);
+  });
+  it('why names review daemon when advisory is stale', () => {
+    const out = explainWhy({ ...base, pr: staleAdvisoryPr() });
+    expect(out.owner).toBe('review daemon');
+    expect(out.waitingFor).toBe('advisory re-run on f7c7dcd37');
+  });
+  it('why says so when the advisory is unreadable', () => {
+    const out = explainWhy({ ...base, pr: staleAdvisoryPr({ comments: [{ author: { login: 'web-everything' }, body: `${ADVISORY_NOTE_MARKER}\n\nno basis` }] }) });
+    expect(out.owner).toBe('operator');
+    expect(out.waitingFor).toMatch(/advisory unreadable/);
   });
   for (const [name, extra, owner, op] of [
     ['build hold', { buildHolds: [{ reason: 'manual' }] }, 'nobody (parked: manual)', 'unpark'],
