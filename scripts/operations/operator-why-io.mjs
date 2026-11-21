@@ -8,6 +8,7 @@ import { readField } from '../backlog/frontmatter.mjs';
 import { cardForPr } from './pr-ownership-io.mjs';
 import { checksArgv, parseJsonLines } from './pr-status-io.mjs';
 import { defaultReadRequiredStatusChecks } from '../lib/required-status-checks.mjs';
+import { advisoryHeadMoveState } from '../conveyor/reconcile-core.mjs';
 import { readCompletePrComments } from '../conveyor/pr-comments-complete.mjs';
 import { latestUnresolvedStandDown } from '../conveyor/stand-down-answer-core.mjs';
 import { standDownReason } from '../conveyor/stand-down.mjs';
@@ -48,10 +49,12 @@ export function createWhyReader({
     const key = repoKeyForSlug(repo) ?? repo;
     const allPrs = safe(pr ? 'open PRs' : 'linked PRs', () => { const rows = listPrs(repo, { state: pr ? 'open' : 'all' }); if (!Array.isArray(rows)) throw new Error('expected PR array'); if (rows.length >= 10000) gaps.push({ source: pr ? 'open PRs' : 'linked PRs', error: 'listing may be truncated' }); return rows; }, []);
     if (pr) {
-      facts.pr = safe('PR state', () => JSON.parse(run('gh', ['pr', 'view', String(pr), '--repo', repo, '--json', 'number,state,isDraft,labels,headRefOid,mergeable,statusCheckRollup'], { encoding: 'utf8', timeout: 60000, maxBuffer: 32 * 1024 * 1024 })), {});
+      facts.pr = safe('PR state', () => JSON.parse(run('gh', ['pr', 'view', String(pr), '--repo', repo, '--json', 'number,state,isDraft,labels,headRefOid,mergeable,statusCheckRollup,commits'], { encoding: 'utf8', timeout: 60000, maxBuffer: 32 * 1024 * 1024 })), {});
       const comments = safe('comments', () => readComments(pr, repo), null);
       if (comments) {
         facts.pr.comments = comments;
+        // Decided by the planner's own helper (here, in the io module, so operator-why.mjs stays free of acting imports).
+        facts.advisoryHeadMove = safe('advisory head move', () => advisoryHeadMoveState(facts.pr), null);
         facts.standDown = safe('stand-down', () => { const c = latestUnresolvedStandDown(comments); return c ? { ...c, reason: standDownReason(c.body) ?? 'unknown' } : null; }, null);
         facts.roundExtensions = safe('round extensions', () => countGrantedRoundExtensions(comments, { repo, pr }), null);
       }
