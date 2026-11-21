@@ -3511,12 +3511,12 @@ export function defaultLaneRefForPr(pr, { exec = execFileSyncThrottled, env = pr
  * `dispatch-lane-defaults.test.mjs` now pins the argv and the opts, and the wake CLI test proves the same argv
  * across a real process boundary. `session-reaper-cli.test.mjs` pins the OPT-IN side the same way (#3435).
  *
- * @param {{exec?: Function, env?: object, all?: boolean}} [io] - injected ONLY so the argv and opts can be
+ * @param {{exec?: Function, env?: object, all?: boolean, fresh?: boolean}} [io] - injected ONLY so the argv and opts can be
  *   asserted. `all` defaults to `false` — every existing caller keeps today's active-sessions-only behavior
  *   unchanged; pass `all: true` ONLY from a caller whose job requires seeing completed sessions too.
  */
-export function defaultListAgents({ exec = execFileSync, env = process.env, all = false } = {}) {
-  const out = cachedClaudeAgents({ all, env, fetch: () => exec('claude', ['agents', '--json', ...(all ? ['--all'] : [])], {
+export function defaultListAgents({ exec = execFileSync, env = process.env, all = false, fresh = false } = {}) {
+  const out = cachedClaudeAgents({ all, env, fresh, fetch: () => exec('claude', ['agents', '--json', ...(all ? ['--all'] : [])], {
     encoding: 'utf8',
     stdio: ['ignore', 'pipe', 'pipe'],
     maxBuffer: 8 * 1024 * 1024,

@@ -680,7 +680,7 @@ it.each([false, true])('default claim refresh keeps a live wrapped fixing claim 
     });
     writeCompletion(record, completions);
     const result = refreshLiveFixDispatchClaims({ lockRoot: claimRoot, nowMs: T0 + 1000, nowIso: () => iso(T0 + 1000), hungInfoFor: () => null, awaitingVerifyFor: () => null, prHeadFor: () => null });
-    expect(list).toHaveBeenCalledWith({ all: true });
+    expect(list).toHaveBeenCalledWith({ all: true, fresh: true });
     expect(result.refreshed).toHaveLength(1);
     expect(result.released ?? []).toEqual([]);
     expect(readFixDispatchClaim(key).heartbeatAt).toBe(iso(T0 + 1000));

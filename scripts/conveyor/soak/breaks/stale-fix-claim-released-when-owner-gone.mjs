@@ -51,10 +51,9 @@ export default {
   card: 'stale fix claim release',
   fixedBy: { sha: 'HEAD', where: 'working tree', paths: [CLAIMS] },
   fixPresent(root) {
-    // Run the probe from this module's file in a clean node child (vitest transforms inline function source).
-    const self = fileURLToPath(import.meta.url);
+    // Presence must stay true on behavioural regressions so run()/judge fails normally.
     const result = spawnSync(process.execPath, ['--input-type=module', '-e',
-      `import(${JSON.stringify(pathToFileURL(self).href)}).then(m => m.default.run({ sourceRoot: ${JSON.stringify(root)} })).then(report => process.exit(report.violations.length ? 1 : 0)).catch(() => process.exit(1));`],
+      `import(${JSON.stringify(pathToFileURL(resolve(root, CLAIMS)).href)}).then(m => process.exit(typeof m.STALE_GONE_GRACE_MS === 'number' && typeof m.refreshLiveFixDispatchClaims === 'function' ? 0 : 1)).catch(() => process.exit(1));`],
     { timeout: 15000, maxBuffer: 65536, encoding: 'utf8' });
     return !result.error && result.status === 0;
   },

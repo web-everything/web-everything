@@ -1,8 +1,11 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdtempSync, rmSync, mkdirSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import * as claims from '../fix-dispatch-claim.mjs';
+import * as dispatchIo from '../../operations/dispatch-lane-io.mjs';
+import * as workers from '../../operations/worker-wrapper-launch.mjs';
+import soakBreak from '../soak/breaks/stale-fix-claim-released-when-owner-gone.mjs';
 import { heartbeat } from '../../readiness/file-locks.mjs';
 
 const T0 = Date.parse('2026-11-20T12:00:00Z');
@@ -11,7 +14,7 @@ const iso = ms => new Date(ms).toISOString();
 const key = { repo: 'we', pr: 7171, kind: 'fix' };
 const owner = 'dispatcher-A';
 const name = claims.fixDispatchSessionName(key);
-const other = { name: 'advisory-7171', state: 'working', sessionId: 'owner-session', pid: 123 };
+const other = { name: 'advisory-7171', state: 'working', sessionId: 'unrelated-session', pid: 123 };
 let lockRoot;
 let recordEvent;
 
@@ -21,7 +24,7 @@ beforeEach(() => {
   claims.acquireFixDispatchClaim({ ...key, owner, sessionId: 'owner-session', lockRoot,
     nowMs: T0, nowIso: iso(T0) });
 });
-afterEach(() => rmSync(lockRoot, { recursive: true, force: true }));
+afterEach(() => { vi.restoreAllMocks(); rmSync(lockRoot, { recursive: true, force: true }); });
 
 const read = () => claims.readFixDispatchClaim({ ...key, lockRoot });
 function stamp(meta) {
@@ -58,7 +61,7 @@ describe('stale fix claim release evidence', () => {
   });
 
   it('stale fix claim is released when its owner run is provably gone: readable listing lacks owner after grace', () => {
-    // A different name is unrelated even when its PR suffix, sessionId and pid look relevant.
+    // Absence requires no matching name or bound sessionId.
     expectRelease(refresh(), 'session-gone');
   });
 
@@ -72,6 +75,121 @@ describe('stale fix claim release evidence', () => {
     expect(refresh().released).toBeUndefined();
     expect(read()).toEqual(before);
     expect(recordEvent).not.toHaveBeenCalled();
+  });
+
+  it('retains a bound session under any name after grace', () => {
+    const before = read();
+    expect(refresh({ listAgentsAll: () => [{ ...other, sessionId: 'owner-session' }] }).released).toBeUndefined();
+    expect(read()).toEqual(before);
+    expect(recordEvent).toHaveBeenCalledWith(expect.objectContaining({ kind: 'stale-claim-quarantined' }));
+  });
+
+  it.each(['listing', 'row'])('fails closed on incomplete %s metadata', location => {
+    const rows = [{ ...other }];
+    Object.defineProperty(location === 'listing' ? rows : rows[0], 'incomplete', { value: [{ reason: 'unreadable' }] });
+    const before = read();
+    expect(refresh({ listAgentsAll: () => rows }).released).toBeUndefined();
+    expect(read()).toEqual(before);
+  });
+
+  it.each(['wrapped', 'default', 'malformed default'])('preserves incomplete evidence from the %s default source', source => {
+    const rows = [{ ...other }];
+    Object.defineProperty(rows, 'incomplete', { value: [{ reason: 'torn record' }] });
+    vi.spyOn(dispatchIo, 'defaultListAgents').mockReturnValue(source === 'malformed default' ? null : source === 'default' ? rows : [other]);
+    vi.spyOn(workers, 'listWrappedWorkerAgents').mockReturnValue(source === 'wrapped' ? rows : []);
+    const before = read();
+    expect(refresh({ listAgentsAll: undefined }).released).toBeUndefined();
+    expect(read()).toEqual(before);
+    expect(dispatchIo.defaultListAgents).toHaveBeenCalledWith({ all: true, fresh: true });
+  });
+
+  it('requests fresh default evidence instead of cached absence', () => {
+    vi.spyOn(dispatchIo, 'defaultListAgents').mockImplementation(options => options.fresh
+      ? [{ ...other, sessionId: 'owner-session' }] : [other]);
+    vi.spyOn(workers, 'listWrappedWorkerAgents').mockReturnValue([]);
+    expect(refresh({ listAgentsAll: undefined }).released).toBeUndefined();
+    expect(read()).not.toBeNull();
+    expect(dispatchIo.defaultListAgents).toHaveBeenCalledWith({ all: true, fresh: true });
+  });
+
+  it('passes fresh through defaultListAgents to bypass the agents cache', () => {
+    const exec = vi.fn().mockReturnValue(JSON.stringify([other]));
+    const env = { WE_CLAUDE_AGENTS_CACHE_TTL_MS: '60000', CLAUDE_CONFIG_DIR: lockRoot };
+    dispatchIo.defaultListAgents({ exec, env, fresh: true });
+    exec.mockReturnValue(JSON.stringify([{ ...other, name: 'fresh-owner' }]));
+    expect(dispatchIo.defaultListAgents({ exec, env, fresh: true })[0].name).toBe('fresh-owner');
+    expect(exec).toHaveBeenCalledTimes(2);
+  });
+
+  it.each([GRACE - 1, GRACE])('retains an old claim with a heartbeat only %i ms old', age => {
+    const entry = read();
+    heartbeat(lockRoot, claims.fixDispatchResource(key), owner, iso(T0 + GRACE + 1 - age), entry.pid, entry.meta);
+    const before = read();
+    expect(refresh().released).toBeUndefined();
+    expect(read()).toEqual(before);
+  });
+
+  it('retains an absent claim until its configured lease expires', () => {
+    claims.releaseFixDispatchClaim({ ...key, owner, lockRoot });
+    claims.acquireFixDispatchClaim({ ...key, owner, lockRoot, leaseMinutes: 90, nowMs: T0, nowIso: iso(T0) });
+    expect(read().meta.leaseMinutes).toBe(90);
+    expect(refresh({ nowMs: T0 + 90 * 60_000 }).released).toBeUndefined();
+    expectRelease(refresh({ nowMs: T0 + 90 * 60_000 + 1 }), 'session-gone');
+  });
+
+  it.each(['unreadable', 0, -1])('fails closed on malformed configured lease %s', leaseMinutes => {
+    stamp({ ...read().meta, leaseMinutes });
+    const before = read();
+    expect(refresh().released).toBeUndefined();
+    expect(read()).toEqual(before);
+  });
+
+  it('fails closed on an unreadable last heartbeat', () => {
+    const entry = read();
+    heartbeat(lockRoot, claims.fixDispatchResource(key), owner, 'unreadable', entry.pid, entry.meta);
+    const before = read();
+    expect(refresh().released).toBeUndefined();
+    expect(read()).toEqual(before);
+  });
+
+  it('retains fixing claims whose holders have no agent rows', () => {
+    const fixing = { ...key, kind: 'fixing' };
+    claims.releaseFixDispatchClaim({ ...key, owner, lockRoot });
+    claims.acquireFixDispatchClaim({ ...fixing, owner, lockRoot, nowMs: T0, nowIso: iso(T0) });
+    const entry = claims.readFixDispatchClaim({ ...fixing, lockRoot });
+    heartbeat(lockRoot, claims.fixDispatchResource(fixing), owner, entry.heartbeatAt, entry.pid, { ...entry.meta, who: 'fixer' });
+    expect(refresh().released).toBeUndefined();
+    expect(claims.readFixDispatchClaim({ ...fixing, lockRoot })).not.toBeNull();
+  });
+
+  it('malformed runnerPid still allows a live session heartbeat', () => {
+    stamp({ ...read().meta, runnerPid: 'unreadable' });
+    expect(refresh({ listAgentsAll: () => [{ name, state: 'working', sessionId: 'owner-session' }] }).refreshed).toHaveLength(1);
+    expect(read().heartbeatAt).toBe(iso(T0 + GRACE + 1));
+  });
+
+  it.each([false, true])('propagates listing diagnostics without releasing (default=%s)', useDefault => {
+    const error = new Error('listing unavailable: wrapped store unreadable');
+    const before = read();
+    const fail = () => { throw error; };
+    if (useDefault) {
+      vi.spyOn(dispatchIo, 'defaultListAgents').mockReturnValue([other]);
+      vi.spyOn(workers, 'listWrappedWorkerAgents').mockImplementation(fail);
+    }
+    expect(() => refresh({ listAgentsAll: useDefault ? undefined : fail })).toThrow(error);
+    expect(read()).toEqual(before);
+  });
+
+  it('soak presence remains true when the exported behaviour regresses', () => {
+    const moduleDir = join(lockRoot, 'scripts/conveyor');
+    mkdirSync(moduleDir, { recursive: true });
+    writeFileSync(join(moduleDir, 'fix-dispatch-claim.mjs'), `
+      export const STALE_GONE_GRACE_MS = 1800000;
+      export function refreshLiveFixDispatchClaims() { throw new Error('regression'); }
+    `);
+    expect(soakBreak.fixPresent(lockRoot)).toBe(true);
+    writeFileSync(join(moduleDir, 'fix-dispatch-claim.mjs'), 'export const STALE_GONE_GRACE_MS = 1800000;');
+    expect(soakBreak.fixPresent(lockRoot)).toBe(false);
   });
 
   it('records the release event for a dead runner identity', () => {
@@ -103,7 +221,6 @@ describe('stale fix claim release evidence', () => {
     ['empty listing', () => []],
     ['non-array listing', () => ({ agents: [other] })],
     ['null listing', () => null],
-    ['throwing listing', () => { throw new Error('listing unavailable'); }],
     ['incomplete agent row', () => [{}]],
     ['partially malformed listing', () => [other, null]],
   ])('fails closed with unknown evidence: %s', (_label, listAgentsAll) => {
@@ -143,7 +260,7 @@ describe('stale fix claim release evidence', () => {
     expect(recordEvent).toHaveBeenCalledTimes(2);
   });
 
-  it('does not mistake an advisory row with another name for the owner during grace', () => {
+  it('retains an unrelated advisory row during grace', () => {
     const before = read();
     expect(refresh({ nowMs: T0 + GRACE - 1 }).released).toBeUndefined();
     expect(read()).toEqual(before);
