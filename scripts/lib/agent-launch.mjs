@@ -1,7 +1,8 @@
 /**
  * Closed-grammar process boundary: snapshot plain data, then build argv and directly exec.
  * Caller env passes through except runtime injection variables (undefined omitted,
- * invalid values refused), with optional PATH prefix and task TMP roots.
+ * invalid values refused, env Git config that widens transport policy refused), with
+ * optional PATH prefix and task TMP roots.
  * Other environment narrowing is deferred to S1e.
  * Codex must resolve to the same executable on caller PATH as the fixed installation lookup.
  * io.spawn/io.resolveBinary are trusted test seams, never descriptor capabilities.
@@ -80,8 +81,33 @@ function envRecord(value) {
   for (const [key, entry] of Object.entries(value)) {
     if (entry !== undefined && (typeof entry !== 'string' || entry.includes('\0'))) fail(`env.${key} must be a NUL-free string or undefined`);
   }
+  transportPolicy(value);
   return Object.fromEntries(Object.entries(value).filter(([key, entry]) => entry !== undefined
     && !RUNTIME_INJECTION_ENV.has(key) && !key.endsWith('_OPTIONS') && !/^(?:LD_|DYLD_)/.test(key)));
+}
+// Tighten-only: env-supplied Git config may restrict Git's built-in transport defaults
+// (ext never, unknown user, these always) but never widen them. Config files stay S1e.
+const SAFE_TRANSPORTS = new Set(['http', 'https', 'git', 'ssh', 'file']);
+function widensTransport(key, value) {
+  const first = key.indexOf('.'), last = key.lastIndexOf('.');
+  const section = (first < 0 ? key : key.slice(0, first)).toLowerCase();
+  if (section === 'include' || section === 'includeif') return true; // indirection to an unread file
+  if (section !== 'protocol' || key.slice(last + 1).toLowerCase() !== 'allow') return false;
+  const policy = typeof value === 'string' ? value.toLowerCase() : undefined;
+  if (policy === 'never') return false;
+  const name = first === last ? undefined : key.slice(first + 1, last); // subsections are case-sensitive
+  if (policy === 'always') return !SAFE_TRANSPORTS.has(name);
+  if (policy === 'user') return name === undefined || name === 'ext';
+  return true; // unparseable policy: fail closed
+}
+function transportPolicy(env) {
+  const widened = reason => fail(`env ${reason} widens Git transport policy; restrict it (never) or remove it and retry`);
+  for (const [key, entry] of Object.entries(env)) {
+    const index = /^GIT_CONFIG_KEY_(.*)$/.exec(key)?.[1];
+    if (index !== undefined && entry !== undefined && widensTransport(entry, env[`GIT_CONFIG_VALUE_${index}`])) widened(key);
+  }
+  if (env.GIT_CONFIG_PARAMETERS !== undefined && /protocol|include/i.test(env.GIT_CONFIG_PARAMETERS)) widened('GIT_CONFIG_PARAMETERS');
+  if (env.GIT_ALLOW_PROTOCOL !== undefined && env.GIT_ALLOW_PROTOCOL.split(':').some(p => p && !SAFE_TRANSPORTS.has(p))) widened('GIT_ALLOW_PROTOCOL');
 }
 function configValue(key, value) {
   switch (key) {

@@ -91,11 +91,16 @@ describe('B1/B2 caller environment follows main except runtime injection, withou
               cwd: root, env: childEnv, encoding: 'utf8', timeout: 2000, maxBuffer: 8192,
             });
             const expected = policy === 'always' || (policy === 'user' && fromUser === '1');
+            const label = `${key}=${policy}, fromUser=${fromUser}, review=${review}`;
+            // Widening values (bare protocol.allow user/always, an unknown protocol to always) are refused.
+            if (policy !== 'never' && (key === 'protocol.allow' || (transport === 'fixture' && policy === 'always'))) {
+              refused(buildCodexDirectTaskDescriptor({ cwd: root, env, review }), /widens Git transport policy/);
+              continue;
+            }
             const parent = probe(env);
             const io = seam();
             io.spawn.mockImplementation((_file, _args, options) => probe(options.env));
             const child = launchAgent(buildCodexDirectTaskDescriptor({ cwd: root, env, review }), io);
-            const label = `${key}=${policy}, fromUser=${fromUser}, review=${review}`;
             for (const result of [parent, child]) {
               expect(result.error, label).toBeUndefined();
               expect(result.status, label).toBe(expected ? 0 : 128);
@@ -108,6 +113,52 @@ describe('B1/B2 caller environment follows main except runtime injection, withou
         }
       }
     }
+  });
+  // Tighten-only transport guarantee: env-supplied Git config may restrict, never widen,
+  // Git's built-in transport defaults (ext never, unknown user, http/https/git/ssh/file always).
+  const pair = (...kv) => Object.fromEntries([['GIT_CONFIG_COUNT', String(kv.length / 2)],
+    ...kv.flatMap((v, i) => (i % 2 ? [] : [[`GIT_CONFIG_KEY_${i / 2}`, v], [`GIT_CONFIG_VALUE_${i / 2}`, kv[i + 1]]]))]);
+  it.each([
+    ['protocol.ext.allow=user', pair('protocol.ext.allow', 'user')],
+    ['protocol.ext.allow=always', pair('protocol.ext.allow', 'always')],
+    ['case-folded section and variable', pair('PROTOCOL.ext.ALLOW', 'User')],
+    ['bare protocol.allow=user', pair('protocol.allow', 'user')],
+    ['bare protocol.allow=always', pair('protocol.allow', 'always')],
+    ['ext=user behind a protocol.allow=never pair', pair('protocol.allow', 'never', 'protocol.ext.allow', 'user')],
+    ['protocol.allow=user behind ext=never', pair('protocol.ext.allow', 'never', 'protocol.allow', 'user')],
+    ['unknown protocol widened to always', pair('protocol.fixture.allow', 'always')],
+    ['unknown-case subsection widened to always', pair('protocol.EXT.allow', 'always')],
+    ['unparseable policy value', pair('protocol.http.allow', 'sometimes')],
+    ['include.path indirection', pair('include.path', '/caller/gitconfig')],
+    ['includeIf indirection', pair('includeIf.gitdir:/.path', '/caller/gitconfig')],
+    ['stray key beyond the count', { GIT_CONFIG_COUNT: '0', GIT_CONFIG_KEY_3: 'protocol.ext.allow', GIT_CONFIG_VALUE_3: 'user' }],
+    ['GIT_CONFIG_PARAMETERS transport pair', { GIT_CONFIG_PARAMETERS: "'protocol.ext.allow'='user'" }],
+    ['GIT_CONFIG_PARAMETERS include', { GIT_CONFIG_PARAMETERS: "'include.path'='/caller/gitconfig'" }],
+    ['GIT_ALLOW_PROTOCOL ext', { GIT_ALLOW_PROTOCOL: 'ext' }],
+    ['GIT_ALLOW_PROTOCOL ext among safe', { GIT_ALLOW_PROTOCOL: 'https:ext' }],
+    ['GIT_ALLOW_PROTOCOL unknown protocol', { GIT_ALLOW_PROTOCOL: 'https:fixture' }],
+  ])('refuses caller env that widens Git transport policy before spawn: %s', (_name, extra) => {
+    for (const review of [false, true]) {
+      refused(buildCodexDirectTaskDescriptor({ cwd, env: { PATH: bin, ...extra }, review }), /widens Git transport policy/);
+    }
+    refused({ ...base(), env: { PATH: bin, ...extra } }, /widens Git transport policy/);
+    refused({ ...claude(), env: { PATH: bin, ...extra } }, /widens Git transport policy/);
+  });
+  it.each([
+    ['protocol.file.allow=user (lane-pool)', pair('protocol.file.allow', 'user')],
+    ['protocol.ext.allow=never', pair('protocol.ext.allow', 'never')],
+    ['protocol.allow=never', pair('protocol.allow', 'never')],
+    ['protocol.https.allow=user', pair('protocol.https.allow', 'user')],
+    ['protocol.ssh.allow=always', pair('protocol.ssh.allow', 'always')],
+    ['protocol.fixture.allow=user', pair('protocol.fixture.allow', 'user')],
+    ['protocol.version is not a transport policy', pair('protocol.version', '2')],
+    ['unrelated pins', pair('core.hooksPath', '', 'fetch.fsckObjects', 'true')],
+    ['GIT_ALLOW_PROTOCOL safe allowlist', { GIT_ALLOW_PROTOCOL: 'https:http:git:ssh:file' }],
+    ['GIT_CONFIG_PARAMETERS unrelated', { GIT_CONFIG_PARAMETERS: "'soak.parameter'='inherited'" }],
+  ])('passes caller env that keeps or tightens Git transport policy verbatim: %s', (_name, extra) => {
+    const env = { PATH: bin, ...extra };
+    const io = seam(); launchAgent({ ...base(), env }, io);
+    expect(io.spawn.mock.calls[0][2].env).toEqual(env);
   });
   it('refuses legacy inherit fields, env accessors and env proxies before IO', () => {
     refused({ ...base(), inheritEnv: {} }, /inheritEnv/);
