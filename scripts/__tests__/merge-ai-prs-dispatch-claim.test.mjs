@@ -174,7 +174,7 @@ describe('main prestage dispatch-claim lock wiring', () => {
     ['off', 'ci-heal'], ['off', 'fix'],
     ['shadow', 'ci-heal'], ['shadow', 'fix'],
   ])('%s: main rechecks a %s claim acquired after the prestage PR read', async (mode, kind) => {
-    let armed = false, sawPrestageRead = false, acquired, claimSnapshot, root;
+    let armed = false, sawPrestageRead = false, acquired, claimSnapshot, root, repoViewsAfterClaim = 0;
     const world = createPrestageWorld((argv, options) => runInProcess(argv, { ...options,
       env: { ...options.env, WE_DRAIN_HONOUR_DISPATCH_CLAIMS: mode },
       ports: { ...prestagePorts, gh: (args, env) => {
@@ -185,12 +185,17 @@ describe('main prestage dispatch-claim lock wiring', () => {
         }
         // This live default-branch read is in main's beforeEnqueue hook: the
         // prestage readPr (including attachLiveFixClaim) has already completed.
-        // Arriving here proves that the earlier claim check did not stop us.
+        // The full drain's verifyDefaultBranch issues the same read later, so
+        // on its own this hook does not prove which site took the claim; the
+        // on-mode branch below counts the reads that follow the claim.
         // Leave the real lock, claim reader, and enqueue callback untouched.
-        if (armed && sawPrestageRead && !acquired && args[0] === 'repo' && args[1] === 'view') {
-          acquired = acquireFixDispatchClaim({ repo: 'we', pr: 42, kind,
-            owner: 'studio:14073', nowMs: NOW, lockRoot: root });
-          claimSnapshot = snapshot(root);
+        if (armed && sawPrestageRead && args[0] === 'repo' && args[1] === 'view') {
+          if (acquired) repoViewsAfterClaim += 1;
+          else {
+            acquired = acquireFixDispatchClaim({ repo: 'we', pr: 42, kind,
+              owner: 'studio:14073', nowMs: NOW, lockRoot: root });
+            claimSnapshot = snapshot(root);
+          }
         }
         return result;
       } },
@@ -219,6 +224,10 @@ describe('main prestage dispatch-claim lock wiring', () => {
         expect(enqueues).toHaveLength(0);
         expect(result.report.prestaged).not.toBe(true);
         expect(result.stderr).toContain('drain-prestage: cache miss/stale — full fast drain');
+        // The claim was taken in beforeEnqueue, so the lock recheck refused it:
+        // the full drain that followed read the default branch again. A claim
+        // first taken by the full drain itself would leave this at zero.
+        expect(repoViewsAfterClaim).toBeGreaterThan(0);
         // The lock refusal falls back to the ordinary fresh re-read, which
         // must also honour the claim instead of enqueueing the same PR there.
         expect(result.report.revalidationAborted).toEqual(expect.arrayContaining([
@@ -232,6 +241,36 @@ describe('main prestage dispatch-claim lock wiring', () => {
             .map(line => JSON.parse(line.split('claim-held-shadow: ')[1]));
           expect(rows).toEqual([expect.objectContaining({ repo: 'we', pr: 42, kind, site: 'prestage-lock', holder: 'studio:14073' })]);
         }
+      }
+    }, { slug: 'web-everything/web-everything' });
+  }, 120_000);
+
+  it.each(['on', 'shadow'])('%s: a missing claim store fails closed at the prestage read', async mode => {
+    const world = createPrestageWorld((argv, options) => runInProcess(argv, { ...options,
+      env: { ...options.env, WE_DRAIN_HONOUR_DISPATCH_CLAIMS: mode }, ports: prestagePorts }));
+    await world(async ({ pr: candidate, run, coord }) => {
+      vi.spyOn(Date, 'now').mockReturnValue(NOW);
+      await run();
+      candidate.statusCheckRollup[0] = { name: 'test', status: 'COMPLETED', conclusion: 'SUCCESS', head_sha: candidate.headRefOid };
+      candidate.mergeStateStatus = 'CLEAN';
+      const result = await run(true);
+      // No claim was ever taken here: the store was never created.
+      expect(() => statSync(join(coord, 'fix-dispatch-claims'))).toThrow(expect.objectContaining({ code: 'ENOENT' }));
+      const enqueues = result.calls.filter(args => args.some(arg => arg.includes('enqueuePullRequest')));
+      if (mode === 'on') {
+        expect(enqueues).toHaveLength(0);
+        expect(result.report.prestaged).not.toBe(true);
+        expect(result.stderr).toContain('drain-prestage: cache miss/stale — full fast drain');
+        expect(result.report.revalidationAborted).toEqual([expect.objectContaining({ num: 42,
+          reason: expect.stringMatching(/^claim-held: fixing claim on we#42 .*\(uncertain: store-missing\)/) })]);
+      } else {
+        // Shadow observes the fail-closed hold at both sites and keeps the legacy enqueue.
+        expect(enqueues).toHaveLength(1);
+        expect(result.report).toMatchObject({ prestaged: true, enqueueOutcomes: [{ num: 42, outcome: 'enqueued' }] });
+        const rows = result.stderr.split('\n').filter(line => line.includes('claim-held-shadow: '))
+          .map(line => JSON.parse(line.split('claim-held-shadow: ')[1]));
+        expect(rows).toEqual(['prestage', 'prestage-lock'].map(site =>
+          expect.objectContaining({ repo: 'we', pr: 42, kind: 'fixing', site, uncertain: 'store-missing' })));
       }
     }, { slug: 'web-everything/web-everything' });
   }, 120_000);
