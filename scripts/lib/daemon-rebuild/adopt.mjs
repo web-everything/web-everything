@@ -11,7 +11,7 @@ import { verifyRev, makeGit } from './shared.mjs';
 import { resolveOverlayConflict } from './overlay-strategies.mjs';
 import { releaseBuildLease } from './lease.mjs';
 import { ensureSafeToMove, knownInputsOf } from './local-state.mjs';
-import { revokedAppliedTips, tipInMain as gitTipInMain } from './audited-tip.mjs';
+import { revokedAppliedTips, tipInMain as gitTipInMain, pathBEvidenceGit } from './audited-tip.mjs';
 import { OPERATOR_LOGINS } from '../marker-authorship.mjs';
 import { readPendingDrops } from '../overlay-drop-pending.mjs';
 
@@ -247,6 +247,7 @@ export const RULED_LEGACY_PR_MERGED_DROPS = Object.freeze([
 export function overlayGraduated({ ref, sha, build, registered, events, git, readyAt } = {}) {
   try {
     if (!ref || !sha || !build || registered(ref) !== false || !Array.isArray(events)) return false;
+    git = pathBEvidenceGit(git);
     // Diagnostics (needs-you notes, main-sync/test telemetry, shadows) never change registration, so they must not mask
     // the drop proof. Every OTHER kind (known or future) stays lifecycle evidence: unknown kinds fail closed.
     const diagnostic = (kind) => typeof kind === 'string' && [
@@ -287,8 +288,6 @@ export function overlayGraduated({ ref, sha, build, registered, events, git, rea
       if (!/^[a-f0-9]{40}$/.test(mergeSha)) return false;
       if (git(['merge-base', '--is-ancestor', mergeSha, build])?.status !== 0) return false;
     }
-    // Custom drivers can discard overlay changes while reporting an unchanged merge tree.
-    if (git(['config', '--get-regexp', '^merge\\..*\\.driver$'])?.status !== 1) return false;
     const tree = git(['rev-parse', `${build}^{tree}`]);
     const mergedTree = git(['merge-tree', '--write-tree', '--no-messages', build, sha]);
     if (tree?.status !== 0 || mergedTree?.status !== 0
