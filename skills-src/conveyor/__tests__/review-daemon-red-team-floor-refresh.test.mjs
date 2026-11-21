@@ -35,10 +35,14 @@ beforeEach(async () => {
   vi.spyOn(labels, 'syncResultOnHeadLabels').mockImplementation(({ rawPrs }) => ({ rawPrs }));
   const { cliReviewTickOpts } = await import('../review-daemon.mjs');
   log = { error: vi.fn() };
-  production = cliReviewTickOpts({ log });
-  // Construction also reads unrelated operator policies for the live-review budget.
-  // Count only reads performed by the red-team-on-skip ticks below.
-  storeRead.mockClear();
+  // Start the daemon only after a case has seeded its persisted queue. CLI construction now
+  // restores that queue eagerly, so writing the file after construction cannot seed its memory.
+  production = { redTeamOnSkip: input => {
+    production = cliReviewTickOpts({ log, listCommands: () => '' });
+    // Count only floor-policy reads, excluding construction's live-review budget policies.
+    storeRead.mockClear();
+    return production.redTeamOnSkip(input);
+  } };
 });
 
 afterEach(() => {
