@@ -1464,8 +1464,6 @@
   "scripts/lib/__tests__/worker-deadline.test.mjs": 0.56,
   "scripts/lib/__tests__/world-capsule.test.mjs": 0.08,
   "scripts/lib/container-exec/__tests__/build-test-unit-deps.test.mjs": 0.01,
-  "scripts/lib/daemon-rebuild/__tests__/adopt-then-add.test.mjs": 0.05,
-  "scripts/lib/daemon-rebuild/__tests__/audited-tip-drivers.test.mjs": 0.45,
   "scripts/lib/daemon-rebuild/__tests__/operator-retirement.test.mjs": 1.31,
   "scripts/lib/daemon-rebuild/__tests__/overlay-stale.test.mjs": 1.34,
   "scripts/lib/daemon-rebuild/__tests__/preview.test.mjs": 0.49,
