@@ -496,6 +496,7 @@ export function createVerifyGateJobs({
     return {
       pool: input.pool, lane: input.lane, dir: input.dir, runId: input.runId, sha: input.headSha,
       suites: input.suites ?? null, treeHash: input.treeHash ?? null, requestStartedAt: input.requestStartedAt ?? null,
+      local: input.local === true,
       jobId: r.id, pid, startedMs: prev?.startedMs ?? queuedMs(r, now), keptFor: prev?.keptFor,
       ...(heldBy ? { heldBy } : {}),
     };
@@ -510,7 +511,7 @@ export function createVerifyGateJobs({
       return enqueueJob({
         store, kindDef: VERIFY_GATE_JOB_KIND, codeSha: readHead(), now: now(),
         input: { pool, lane, dir, headSha, runId, suites: marker?.suites ?? null, treeHash: marker?.treeHash ?? null,
-          requestStartedAt: marker?.startedAt ?? null },
+          local: marker?.local === true, requestStartedAt: marker?.startedAt ?? null },
       });
     },
     /**

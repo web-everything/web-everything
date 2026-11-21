@@ -16,9 +16,9 @@ For repo defaults, edit the owner file through a PR and rebuild the consuming da
 
 ## Summary
 
-- Top-level keys: 160 (162 declaration rows).
-- Declared leaves: 590 (platform copies counted separately).
-- Instant top-level keys: 0; not instant: 160.
+- Top-level keys: 161 (163 declaration rows).
+- Declared leaves: 592 (platform copies counted separately).
+- Instant top-level keys: 0; not instant: 161.
 - Instant capacity leaves: 15.
 - Constants to settle: 312.
 - Instant gaps: 28.
@@ -101,7 +101,7 @@ Operator-prefs layer: ~/.plateau/platform-preferences.json is the requested oper
 | description | scripts/settings/node-heap-cap.json | 1 | "V8 old-space caps for review child processes and the revie… | pr | no | Documentation of V8 old-space memory caps. |
 | directionAwareHuman | scripts/settings/direction-aware-human.json | 1 | "shadow" | pr | no | Direction-aware human review classification mode. |
 | draftPromotion | scripts/settings/draft-promotion.json | 1 | {"absentRequiredChecksNotApplicable":["merge-gate"]} | pr | no | Required-check exceptions for draft promotion. |
-| drain | scripts/settings/drain-card-group.json, scripts/settings/drain-mq-retry.json | 6 | {"group":{"enabled":true,"maxSize":8,"eligibility":"card-on… | pr | no | Merge drain grouping, recovery and infrastructure classification policy. |
+| drain | scripts/settings/drain-async-shadow.json, scripts/settings/drain-card-group.json, scripts/settings/drain-mq-retry.json | 7 | {"asyncShadow":"shadow","group":{"enabled":true,"maxSize":8… | pr | no | Merge drain grouping, recovery and infrastructure classification policy. |
 | drainFactsSource | scripts/settings/drain-facts-source.json | 1 | {"source":"store-first"} | pr | no | Preferred source of merge drain facts. |
 | drainFollowupJob | scripts/settings/drain-followup-job.json | 1 | "on" | pr | no | Enable follow-up drain jobs. |
 | enabled | scripts/settings/review-red-team-on-skip.json | 1 | true | pr | no | Enable recovery of missing red-team results on reviewed heads. |
@@ -165,6 +165,7 @@ Operator-prefs layer: ~/.plateau/platform-preferences.json is the requested oper
 | prepare | scripts/settings/prepare.json | 7 | {"retryUnstampedOnce":true,"autoSize":true,"runner":"codex"… | pr | no | Preparation retries, sizing, runner and per-tick PR listing budgets. |
 | prepareStaleHours | scripts/settings/coroner-postmortem.json | 1 | 24 | pr | no | Age in hours at which preparation is treated as stale. |
 | prevention | scripts/settings/prevention-batch.json | 4 | {"$comment":"batchFiling enables rolling prevention PRs; fa… | pr | no | Prevention card batching and filing limits. |
+| providerCapacity | scripts/settings/provider-capacity.json | 1 | {"providers":[{"id":"codex","launcher":"codex","tier":3,"al… | pr | no | Provider/account quota windows, readers, reserves, banked resets and minimum tiers for capacity-based routing. |
 | quarantine | scripts/settings/card-ledger-trust.json | 1 | [] | pr | no | Quarantined card-ledger identities. |
 | raisedByMigrate | scripts/settings/raised-by-migrate.json | 1 | {"maxPrsPerRun":10} | pr | no | Maximum PRs attempted per raised-by migration apply run. |
 | readyRecordPath | scripts/settings/prototype-load.json | 1 | "~/workspace/.operations/coordination/fix-ready.jsonl" | pr | no | Fix readiness coordination record location. |
