@@ -2206,10 +2206,11 @@ describe('runTickAllRepos — one reconcile plan per repo per pass', () => {
     const second = await realRunTickAllRepos(options);
     expect(visited).toEqual([1, 2]);
     expect(tick.mock.calls[1][0].cursor).toEqual(cursor);
-    expect(second.phasePrCounts['orphan-guard']).toEqual({ handled: 1, deferred: 1 });
+    expect(second.phasePrCounts['orphan-guard']).toEqual({ handled: 1, deferred: 2 });
+    expect(second.budgets['orphan-guard'].skipped).toEqual([{ repo: cursor.repo, pr: 3 }, { repo: cursor.repo, pr: 1 }]);
     await realRunTickAllRepos(options);
     expect(visited).toEqual([1, 2, 3]);
-    expect(cursors['orphan-guard']).toBeUndefined();
+    expect(cursors['orphan-guard']).toEqual({ repo: cursor.repo, pr: 1 });
   });
 
   it.each(['keys', 'slugs'])('bounds orphan-guard between repos and resumes the skipped repo next pass (%s)', async form => {

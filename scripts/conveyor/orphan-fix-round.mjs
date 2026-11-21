@@ -284,52 +284,58 @@ export async function runOrphanFixRoundPass({
 } = {}) {
   const enabled = orphanGuardEnabled(env);
   const rows = [], deferred = [];
-  let handled = 0, redispatched = false, deferring = false, resuming = cursor != null;
+  let handled = 0, redispatched = false, deferring = false;
+  const entries = [];
+  let cursorRepo = cursor?.repo;
   for (const { key, slug } of repos) {
-    if (resuming && slug !== cursor.repo && key !== cursor.repo) continue;
-    resuming = false;
+    if (key === cursor?.repo) cursorRepo = slug;
     let prs;
     try { prs = listBounced(slug); } catch (e) { rows.push({ repo: slug, decision: 'error', reason: `listing failed: ${String(e?.message ?? e).split('\n')[0]}` }); continue; }
-    for (const p of [...(prs ?? [])].sort((a, b) => a.number - b.number)) {
-      if ((slug === cursor?.repo || key === cursor?.repo) && p.number < cursor.pr) continue;
-      if (deferring || (handled > 0 && now() >= deadlineAt)) {
+    for (const p of prs ?? []) entries.push({ key, slug, p });
+  }
+  // Rotate the complete inventory: resuming must never hide unchecked PRs from the daemon.
+  entries.sort((a, b) => a.slug < b.slug ? -1 : a.slug > b.slug ? 1 : a.p.number - b.p.number);
+  const start = cursor == null ? 0 : entries.findIndex(({ slug, p }) =>
+    slug > cursorRepo || (slug === cursorRepo && p.number >= cursor.pr));
+  const ordered = start > 0 ? [...entries.slice(start), ...entries.slice(0, start)] : entries;
+  for (const { key, slug, p } of ordered) {
+    if (deferring || (handled > 0 && now() >= deadlineAt)) {
+      deferring = true;
+      deferred.push({ repo: slug, pr: p.number });
+      continue;
+    }
+    handled += 1;
+    const row = { repo: slug, pr: p.number };
+    try {
+      const owned = await isOwned(key, p.number);
+      const comments = owned ? [] : await readComments(p.number, slug);
+      const plan = planOrphanFixRound({ pr: { ...p, comments }, owned, nowMs, graceMs, repo: slug, cardReadable });
+      if (plan.decision === 'none') continue;
+      if (plan.decision === 'redispatch' && redispatched) {
         deferring = true;
         deferred.push({ repo: slug, pr: p.number });
         continue;
       }
-      handled += 1;
-      const row = { repo: slug, pr: p.number };
-      try {
-        const owned = await isOwned(key, p.number);
-        const comments = owned ? [] : await readComments(p.number, slug);
-        const plan = planOrphanFixRound({ pr: { ...p, comments }, owned, nowMs, graceMs, repo: slug, cardReadable });
-        if (plan.decision === 'none') continue;
-        if (plan.decision === 'redispatch' && redispatched) {
-          deferring = true;
-          deferred.push({ repo: slug, pr: p.number });
-          continue;
-        }
-        Object.assign(row, { decision: plan.decision, reason: plan.reason });
-        rows.push(row);
-        if (!enabled) { row.result = 'report-only (WE_ORPHAN_FIX_GUARD=0)'; continue; }
-        if (plan.decision === 'redispatch') {
-          const refusal = assertCapability(slug, 'fix', { resolveProfile });
-          if (refusal) { row.result = `not-done: ${refusal.why}`; continue; }
-          redispatched = true;
-        }
-        const labels = labelNames(p.labels);
-        const r = plan.decision === 'rearm' ? await rearm({ slug, pr: p.number, head: p.headRefOid })
-          : plan.decision === 'redispatch' ? await redispatch({ slug, pr: p.number, reconcile })
-            : await escalate({ slug, pr: p.number, labels });
-        if (!r?.ok) { row.result = `not-done: ${r?.why ?? '?'}`; continue; }
-        row.result = plan.decision === 'rearm' ? 're-armed' : plan.decision === 'redispatch' ? 're-dispatched' : 'escalated';
-        try { postComment({ slug, pr: p.number, body: buildOrphanGuardComment({ decision: plan.decision, reason: plan.reason, prNumber: p.number }) }); }
-        catch (e) { row.result += ` (marker comment failed: ${String(e?.message ?? e).split('\n')[0]})`; }
-      } catch (e) {
-        if (!rows.includes(row)) rows.push(row);
-        row.decision ??= 'error';
-        row.result = `error: ${String(e?.message ?? e).split('\n')[0]}`;
+      Object.assign(row, { decision: plan.decision, reason: plan.reason });
+      rows.push(row);
+      if (!enabled) { row.result = 'report-only (WE_ORPHAN_FIX_GUARD=0)'; continue; }
+      if (plan.decision === 'redispatch') {
+        const refusal = assertCapability(slug, 'fix', { resolveProfile });
+        if (refusal) { row.result = `not-done: ${refusal.why}`; continue; }
+        redispatched = true;
       }
+      const labels = labelNames(p.labels);
+      const r = plan.decision === 'rearm' ? await rearm({ slug, pr: p.number, head: p.headRefOid })
+        : plan.decision === 'redispatch' ? await redispatch({ slug, pr: p.number, reconcile })
+          : await escalate({ slug, pr: p.number, labels });
+      if (!r?.ok) { row.result = `not-done: ${r?.why ?? '?'}`; continue; }
+      row.result = plan.decision === 'rearm' ? 're-armed' : plan.decision === 'redispatch' ? 're-dispatched' : 'escalated';
+      try { postComment({ slug, pr: p.number, body: buildOrphanGuardComment({ decision: plan.decision, reason: plan.reason, prNumber: p.number }) }); }
+      catch (e) { row.result += ` (marker comment failed: ${String(e?.message ?? e).split('\n')[0]})`; }
+    } catch (e) {
+      if (!rows.includes(row)) rows.push(row);
+      row.decision ??= 'error';
+      row.result = `error: ${String(e?.message ?? e).split('\n')[0]}`;
     }
   }
   return { enabled, rows, handled, deferred, nextCursor: deferred[0] ?? null };

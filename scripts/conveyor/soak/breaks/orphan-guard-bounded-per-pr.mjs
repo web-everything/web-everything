@@ -68,7 +68,7 @@ export function probe(checkout) {
     const second = await runOrphanFixRoundPass({ ...capped.options, cursor: first.nextCursor });
     deepStrictEqual(capped.calls, [1, 2], 'second pass must continue at the deferred PR');
     assertPass(second, 2);
-    deepStrictEqual(second.deferred, [at(3)]);
+    deepStrictEqual(second.deferred, [at(3), at(1)]);
 
     // No redispatch is planned here, so only the deadline can stop the next PR read.
     const idle = fixture({ deadlineAt: 10, advance: 10, noFix: true });
@@ -93,7 +93,7 @@ export function probe(checkout) {
     strictEqual(resumed.handled, 1, 'expired pass must still handle one PR');
     deepStrictEqual(timed.calls, [1, 2]);
     deepStrictEqual(timed.reads, [1, 2]);
-    deepStrictEqual(resumed.deferred, [at(3)]);
+    deepStrictEqual(resumed.deferred, [at(3), at(1)]);
   `, checkout, ghRepoSlug('we')], { encoding: 'utf8', timeout: 15_000, maxBuffer: 1024 * 1024 });
   return { violations: child.status === 0 ? [] : [
     `bounded orphan-guard replay failed: ${child.error?.message ?? child.stderr ?? child.signal ?? child.status}`,

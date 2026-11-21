@@ -453,9 +453,62 @@ describe('runOrphanFixRoundPass — IO shell', () => {
     expect(first).toMatchObject({ handled: 1, deferred: [{ repo: repos[0].slug, pr: 2 }, { repo: repos[0].slug, pr: 3 }],
       nextCursor: { repo: repos[0].slug, pr: 2 } });
     const second = await runOrphanFixRoundPass({ ...s, cursor: first.nextCursor });
-    expect(second).toMatchObject({ handled: 1, nextCursor: { repo: repos[0].slug, pr: 3 } });
+    expect(second).toMatchObject({ handled: 1, deferred: [{ repo: repos[0].slug, pr: 3 }, { repo: repos[0].slug, pr: 1 }],
+      nextCursor: { repo: repos[0].slug, pr: 3 } });
     const third = await runOrphanFixRoundPass({ ...s, cursor: second.nextCursor });
-    expect(third).toMatchObject({ handled: 1, deferred: [], nextCursor: null });
+    expect(third).toMatchObject({ handled: 1, deferred: [{ repo: repos[0].slug, pr: 1 }, { repo: repos[0].slug, pr: 2 }],
+      nextCursor: { repo: repos[0].slug, pr: 1 } });
+  });
+
+  it.each([[1, Infinity], [1, 0], [3, Infinity], [3, 0]])('rotates every repo and PR around the deadline cursor without losing coverage (first %s, budget %s)', async (progress, budget) => {
+    const repos = [{ key: 'b', slug: 'org/b' }, { key: 'a', slug: 'org/a' }];
+    const at = (repo, pr) => ({ repo: `org/${repo}`, pr });
+    const all = [at('a', 1), at('a', 2), at('b', 1), at('b', 2)];
+    const visited = [];
+    const listed = [];
+    const s = seams([], { repos: (function* () { yield* repos; })(),
+      listBounced: slug => { listed.push(slug); return [2, 1].map(number => ({ number })); },
+      now: () => visited.length, deadlineAt: progress,
+      isOwned: async (key, pr) => { expect(listed).toHaveLength(2); visited.push(at(key, pr)); return true; } });
+    const first = await runOrphanFixRoundPass(s);
+    expect(visited).toEqual(all.slice(0, progress));
+    expect(first.deferred).toEqual(all.slice(progress));
+    visited.length = 0;
+    listed.length = 0;
+    const second = await runOrphanFixRoundPass({ ...s, repos, cursor: first.nextCursor, deadlineAt: budget });
+    const rotated = [...all.slice(progress), ...all.slice(0, progress)];
+    expect(visited).toEqual(budget === Infinity ? rotated : [rotated[0]]);
+    expect(second.deferred).toEqual(budget === Infinity ? [] : rotated.slice(1));
+    expect(second.handled).toBe(visited.length);
+    expect([...visited, ...second.deferred]).toEqual(rotated);
+    expect(second.nextCursor).toEqual(second.deferred[0] ?? null);
+  });
+
+  it.each([
+    [{ repo: 'org/b', pr: 1 }, ['b2', 'a1', 'a2']],
+    [{ repo: 'b', pr: 1 }, ['b2', 'a1', 'a2']],
+    [{ repo: 'org/aa', pr: 9 }, ['b2', 'a1', 'a2']],
+    [{ repo: 'org/z', pr: 9 }, ['a1', 'a2', 'b2']],
+  ])('resumes a missing cursor at its sorted successor or wraps: %j', async (cursor, expected) => {
+    const visited = [];
+    await runOrphanFixRoundPass(seams([], {
+      repos: [{ key: 'b', slug: 'org/b' }, { key: 'a', slug: 'org/a' }], cursor,
+      listBounced: slug => (slug === 'org/a' ? [2, 1] : [2]).map(number => ({ number })),
+      isOwned: async (key, pr) => { visited.push(`${key}${pr}`); return true; },
+    }));
+    expect(visited).toEqual(expected);
+  });
+
+  it('reports an earlier repo listing failure even when resuming in a later repo', async () => {
+    const result = await runOrphanFixRoundPass(seams([], {
+      repos: [{ key: 'a', slug: 'org/a' }, { key: 'b', slug: 'org/b' }],
+      cursor: { repo: 'org/b', pr: 2 },
+      listBounced: slug => { if (slug === 'org/a') throw new Error('unreadable'); return [{ number: 2 }]; },
+      isOwned: async () => true,
+    }));
+    expect(result.rows).toEqual([{ repo: 'org/a', decision: 'error', reason: 'listing failed: unreadable' }]);
+    expect(result.handled).toBe(1);
+    expect(result.deferred).toEqual([]);
   });
 
   it('redispatch uses the injected reconcile without running a fresh reconcile pass', async () => {
