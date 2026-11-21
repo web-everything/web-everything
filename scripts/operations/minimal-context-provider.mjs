@@ -32,8 +32,10 @@
  * `deliver-item-wrapper.mjs`'s own convention) so every export here is unit-testable with no real subprocess.
  */
 import { execFileSync } from 'node:child_process';
+import { dirname, resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { claudeSpawnAlias } from '../lib/dispatch-routing-policy.mjs';
-import { mkdirSync, writeFileSync } from 'node:fs';
+import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 
 // #3383 — the delivery-telemetry recorder. Imported here, in the ONE module all six dispatch wrappers share,
 // so `lane.acquire` and `verify.gate` spans are captured for EVERY dispatch kind from a single edit rather
@@ -141,25 +143,25 @@ export function laneHasCommitAhead({ lane, base = 'origin/main', run: runFn = ru
  *  agent needs to build/edit + report; extend it here, in the one place, if a future brief needs more. */
 export const RESTRICTED_PROVIDER_TOOLS = 'Bash,Edit,Write,Read,Glob,Grep';
 
-/** Repo guards restored explicitly for restricted fix/ci-heal sessions. Bash's guard owns destructive-git
- * and bypass refusals; permissions allow tool use without prompts, while these hooks still enforce safety.
- * No SessionStart bootstrap or delivery completion-record Stop hook belongs to this dispatch path. */
-export const LEAN_FIX_HOOKS_SETTINGS = Object.freeze({
-  hooks: {
-    PreToolUse: [
-      {
-        matcher: 'Edit|Write',
-        hooks: [
-          { type: 'command', command: 'node scripts/guard-lane.mjs' },
-          { type: 'command', command: 'node scripts/lint-locus-prefix.mjs --pre' },
-          { type: 'command', command: 'node scripts/backlog-guard.mjs --pre' },
-        ],
-      },
-      { matcher: 'Bash', hooks: [{ type: 'command', command: 'node scripts/guard-bash.mjs' }] },
-    ],
-  },
-  permissions: { allow: RESTRICTED_PROVIDER_TOOLS.split(',') },
-});
+/** Derive restricted repair hooks from this checkout at call time; never silently omit repo guards.
+ * Agent|Task and Monitor guards are nontrivial and outside the six-tool repair surface. */
+export function LEAN_FIX_HOOKS_SETTINGS(settingsPath = resolve(dirname(fileURLToPath(import.meta.url)), '../../.claude/settings.json')) {
+  const { hooks } = JSON.parse(readFileSync(settingsPath, 'utf8'));
+  const pre = hooks?.PreToolUse;
+  const stop = hooks?.Stop;
+  const validEntry = (entry) => Array.isArray(entry?.hooks) && entry.hooks.length > 0
+    && entry.hooks.every(hook => hook.type === 'command' && typeof hook.command === 'string' && hook.command.trim());
+  if (!Array.isArray(pre) || !['Edit|Write', 'Bash'].every(matcher => pre.some(entry => entry.matcher === matcher))
+      || !Array.isArray(stop) || stop.length === 0) {
+    throw new Error('missing required PreToolUse matchers or Stop hooks');
+  }
+  const selected = pre.filter(entry => entry.matcher === 'Edit|Write' || entry.matcher === 'Bash');
+  if (![...selected, ...stop].every(validEntry)) throw new Error('incomplete repair hook entries');
+  return {
+    hooks: { PreToolUse: selected, Stop: stop },
+    permissions: { allow: RESTRICTED_PROVIDER_TOOLS.split(',') },
+  };
+}
 
 // ================================================================================================
 // 1. The `CLAUDE_RESTRICTED_PROVIDER` argv shape — VERIFIED against the real CLI (v2.1.266) while building

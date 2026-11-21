@@ -1535,8 +1535,8 @@ export function createDispatchSinks({
   releaseLane = (reservation) => releaseReservedLane(reservation, { root }),
   extraArgs = [],
   // #x8mpubm — resolved ONCE per dispatch, here at the sink (the one place real fs/env effects belong in this
-  // file), never inside `defaultClaudeProvider`/`buildAgentArgv` themselves, both of which stay side-effect-free
-  // by default so every OTHER existing test of either keeps working unchanged. `resolveGhShimSettingsEnv`
+  // file), never inside `defaultClaudeProvider`/`buildAgentArgv` themselves, which only read repo configuration.
+  // `resolveGhShimSettingsEnv`
   // itself never throws and is a no-op (fs untouched) on any host that has not opted into App auth — see
   // `we:scripts/lib/gh-app-shim.mjs`'s own header.
   // #x36vidg — plus the Bash timeouts (`resolveDispatchSettingsEnv`), so every dispatch carries `--settings`.
@@ -2628,7 +2628,15 @@ export function buildAgentArgv({
   const sessionEnv = workerMarkerSettingsEnv(settingsEnv);
   const leanFix = payload.launchKind === 'fix' || payload.launchKind === 'ci-heal';
   const sessionSettings = worktreeSettings ? { env: sessionEnv, worktree: worktreeSettings } : { env: sessionEnv };
-  if (leanFix) Object.assign(sessionSettings, LEAN_FIX_HOOKS_SETTINGS);
+  if (leanFix) {
+    const forbidden = extraArgs.map(String).find(arg =>
+      /^--(?:settings|tools|setting-sources|bare|safe-mode|dangerously-skip-permissions)(?:=|$)/.test(arg));
+    if (forbidden) throw notApplied(`dispatch-lane: lean repair extraArgs cannot override ${forbidden.split('=')[0]}`);
+    try { Object.assign(sessionSettings, LEAN_FIX_HOOKS_SETTINGS()); }
+    catch (error) {
+      throw notApplied(`dispatch-lane: cannot load lean repair hooks from .claude/settings.json; restore the repo settings before retrying: ${error.message}`);
+    }
+  }
   // #3857 — the decided model goes FIRST as exactly one `--model <id>`; a hand-set one in `extraArgs` is
   // honoured only with a reason (see {@link resolveWorkerModel}), and never left riding alongside.
   let args = extraArgs.map(String);

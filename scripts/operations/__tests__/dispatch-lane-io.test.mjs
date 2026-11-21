@@ -1,12 +1,20 @@
 import { describe, it, expect, vi, afterEach } from 'vitest';
+import * as fs from 'node:fs';
 import { createHash } from 'node:crypto';
 import { mkdtempSync, mkdirSync, writeFileSync, chmodSync, rmSync, existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join, resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { buildAgentArgv, createTickReader, createDispatchSinks, reserveBuildLane, resolveDispatchSettingsEnv, DISPATCH_BASH_TIMEOUT_ENV } from '../dispatch-lane-io.mjs';
+import { LEAN_FIX_HOOKS_SETTINGS } from '../minimal-context-provider.mjs';
 import { spawnPreventionLandingJob } from '../../lib/prevention-landing-job.mjs';
 import { NO_PROMPT_COMMAND_RULES } from '../../lib/no-prompt-command-rules.mjs';
 import { shapeDispatchRead, DISPATCH_EFFECT } from '../dispatch-lane.mjs';
+
+vi.mock('../minimal-context-provider.mjs', async (importOriginal) => {
+  const actual = await importOriginal();
+  return { ...actual, LEAN_FIX_HOOKS_SETTINGS: vi.fn(actual.LEAN_FIX_HOOKS_SETTINGS) };
+});
 
 describe('lean repair background argv', () => {
   const options = (launchKind) => ({
@@ -53,7 +61,10 @@ describe('lean repair background argv', () => {
     }
   });
 
-  it('fix and ci-heal settings retain guard hooks and exclude SessionStart and delivery Stop hooks', () => {
+  it('fix and ci-heal settings copy canonical pinned guards and Stop verbatim', () => {
+    const canonical = JSON.parse(fs.readFileSync(resolve(dirname(fileURLToPath(import.meta.url)), '../../../.claude/settings.json'), 'utf8'));
+    const expectedPre = canonical.hooks.PreToolUse.filter(entry => ['Edit|Write', 'Bash'].includes(entry.matcher));
+    const canonicalCommands = Object.values(canonical.hooks).flatMap(entries => entries.flatMap(entry => entry.hooks.map(hook => hook.command)));
     for (const kind of ['fix', 'ci-heal']) {
       const argv = buildAgentArgv(options(kind));
       expect(argv.filter(arg => arg === '--settings')).toHaveLength(1);
@@ -61,18 +72,67 @@ describe('lean repair background argv', () => {
       expect(settings.env).toEqual({ PATH: '/fixture/bin', WE_CONVEYOR_WORKER: '1' });
       expect(settings.worktree).toEqual({ bgIsolation: 'none' });
       expect(settings.permissions?.allow).toEqual(['Bash', 'Edit', 'Write', 'Read', 'Glob', 'Grep']);
-      expect(settings.hooks?.PreToolUse).toEqual(expect.arrayContaining([
-        { matcher: 'Bash', hooks: [{ type: 'command', command: 'node scripts/guard-bash.mjs' }] },
-        { matcher: 'Edit|Write', hooks: [
-          { type: 'command', command: 'node scripts/guard-lane.mjs' },
-          { type: 'command', command: 'node scripts/lint-locus-prefix.mjs --pre' },
-          { type: 'command', command: 'node scripts/backlog-guard.mjs --pre' },
-        ] },
-      ]));
-      expect(settings.hooks).not.toHaveProperty('SessionStart');
-      expect(settings.hooks).not.toHaveProperty('Stop');
+      expect(settings.hooks).toEqual({ PreToolUse: expectedPre, Stop: canonical.hooks.Stop });
+      const commands = Object.values(settings.hooks).flatMap(entries => entries.flatMap(entry => entry.hooks.map(hook => hook.command)));
+      for (const command of commands) {
+        expect(canonicalCommands).toContain(command);
+        expect(command).not.toMatch(/^node scripts\//);
+        expect(command).toContain('$HOME/workspace/.guard-main/scripts/hooks/run-pinned-guard.mjs');
+      }
+      for (const [matcher, guards] of [
+        ['Bash', ['guard-bash.mjs']],
+        ['Edit|Write', ['guard-lane.mjs', 'lint-locus-prefix.mjs --pre', 'lint-invisible-characters.mjs',
+          'check-memory.mjs --pre', 'backlog-guard.mjs --pre', 'guard-backward-edge.mjs']],
+      ]) {
+        const matched = settings.hooks.PreToolUse.filter(entry => entry.matcher === matcher).flatMap(entry => entry.hooks);
+        for (const guard of guards) expect(matched.some(hook => hook.command.includes(`scripts/${guard};`))).toBe(true);
+      }
     }
   });
+
+  it.each(['--settings', '--tools', '--setting-sources', '--bare', '--safe-mode', '--dangerously-skip-permissions'])(
+    'refuses %s boundary overrides for fix and ci-heal, while build and resume retain their behavior', (flag) => {
+      for (const extraArgs of [[flag, 'override'], [`${flag}=override`]]) {
+        for (const kind of ['fix', 'ci-heal']) {
+          expect(() => buildAgentArgv({ ...options(kind), extraArgs })).toThrow(expect.objectContaining({ notApplied: true }));
+          expect(buildAgentArgv({ ...options(kind), extraArgs, resumeSessionId: 'existing-session' }))
+            .toEqual(['--bg', '--resume', 'existing-session', 'Repair this PR.']);
+        }
+        expect(buildAgentArgv({ ...options('build'), extraArgs })).toEqual(expect.arrayContaining(extraArgs));
+      }
+    },
+  );
+
+  it.each(['unreadable', 'invalid JSON', 'missing hooks', 'missing Edit|Write', 'missing Bash', 'missing Stop', 'empty guard'])(
+    'fails closed at argv build time on %s repo settings; build and resume remain available', (fault) => {
+      const settingsUrl = resolve(dirname(fileURLToPath(import.meta.url)), '../../../.claude/settings.json');
+      const canonicalText = fs.readFileSync(settingsUrl, 'utf8');
+      const canonical = JSON.parse(canonicalText);
+      if (fault === 'missing hooks') delete canonical.hooks;
+      if (fault === 'missing Stop') delete canonical.hooks.Stop;
+      if (fault === 'missing Edit|Write' || fault === 'missing Bash') {
+        canonical.hooks.PreToolUse = canonical.hooks.PreToolUse.filter(entry => entry.matcher !== fault.slice(8));
+      }
+      if (fault === 'empty guard') canonical.hooks.PreToolUse.find(entry => entry.matcher === 'Bash').hooks = [];
+      const dir = mkdtempSync(join(tmpdir(), 'lean-hooks-'));
+      const faultPath = join(dir, 'settings.json');
+      if (fault !== 'unreadable') writeFileSync(faultPath, fault === 'invalid JSON' ? '{' : JSON.stringify(canonical));
+      const read = vi.mocked(LEAN_FIX_HOOKS_SETTINGS).getMockImplementation();
+      vi.mocked(LEAN_FIX_HOOKS_SETTINGS).mockImplementation(() => read(faultPath));
+      try {
+        for (const kind of ['fix', 'ci-heal']) {
+          expect(() => buildAgentArgv(options(kind))).toThrow(expect.objectContaining({
+            notApplied: true, message: expect.stringContaining('restore the repo settings before retrying'),
+          }));
+        }
+        expect(() => buildAgentArgv(options('build'))).not.toThrow();
+        expect(buildAgentArgv({ ...options('fix'), resumeSessionId: 'existing-session' }))
+          .toEqual(['--bg', '--resume', 'existing-session', 'Repair this PR.']);
+      } finally { vi.mocked(LEAN_FIX_HOOKS_SETTINGS).mockImplementation(read); rmSync(dir, { recursive: true, force: true }); }
+      // A fresh read must recover immediately once the canonical settings are available again.
+      expect(() => buildAgentArgv(options('fix'))).not.toThrow();
+    },
+  );
 });
 
 describe('the tick reader handoff', () => {
