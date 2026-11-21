@@ -849,7 +849,7 @@ it('resolves the default exit rulings path when settings are absent', async () =
     return JSON.stringify({ key: 'review.loop.exit.pr1' });
   });
   expect(readExitRulingPrs({ readFile }).prs).toEqual(new Set([1]));
-  expect(readFile).toHaveBeenLastCalledWith(join(homedir(), 'workspace/.operations/handoff/rulings-history.jsonl'), 'utf8');
+  expect(readFile.mock.lastCall).toEqual([join(homedir(), 'workspace/.operations/handoff/rulings-history.jsonl'), 'utf8']);
 });
 
 it('resolves the exit rulings path from optional tool settings', async () => {
