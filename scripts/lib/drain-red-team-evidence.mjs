@@ -269,10 +269,13 @@ const unfinishedSince = run => {
 // ADDITIVE-ONLY `review.ledger-events` effect decided nothing more: its marker is already on GitHub. It is finished
 // only when that ONE effect is `pending` (never in-flight/refused), every other effect is applied, the run is not
 // refused, and the verdict is a recognised string. Anything missing or unknown stays unfinished (fails closed).
-const RECOGNISED_VERDICTS = ['accept', 'prevention-outstanding', 'changes', 'needs-human'];
+// Accept-class only, and only when the confirmation also accepted, and the write-up and label swap are present and applied.
 const trailingLedgerOnly = run => {
   if (run?.outcome === 'refused' || run?.pending?.kind !== 'effect' || run.pending.step !== 'ledgerEvents') return false;
-  if (!RECOGNISED_VERDICTS.includes(verdictOf(run)) || !Array.isArray(run.effects)) return false;
+  if (!['accept', 'prevention-outstanding'].includes(verdictOf(run)) || run.findings?.confirm !== 'accept' || !Array.isArray(run.effects)) return false;
+  for (const type of ['review.write-up', 'review.label-swap']) {
+    if (!run.effects.some(effect => effect?.type === type && effect.status === 'applied')) return false;
+  }
   const open = run.effects.filter(effect => effect?.step === 'ledgerEvents' || effect?.type === 'review.ledger-events');
   if (open.length !== 1 || open[0].type !== 'review.ledger-events' || open[0].step !== 'ledgerEvents' || open[0].status !== 'pending') return false;
   return run.effects.every(effect => effect === open[0] || effect?.status === 'applied');

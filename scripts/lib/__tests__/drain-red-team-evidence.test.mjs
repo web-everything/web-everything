@@ -1150,12 +1150,28 @@ describe('bounded review evidence scans', () => {
     const done = [eff('write-up', 'applied'), eff('label-swap', 'applied'), eff('verdict-ledger.append', 'applied'), eff('notice', 'applied')];
     const ledger = status => eff('ledgerEvents', status);
     const run = (f, extra = {}) => ({ op: 'review-pr', input: { repo: f.repo, pr: f.pr }, ...payload(f.head),
+      findings: { confirm: 'accept', read: { netBasis: { rev: f.head } } },
       pending: { kind: 'effect', step: 'ledgerEvents' }, effects: [...done, ledger('pending')], ...startedAt(4999 * 10_000 - 1000), ...extra });
     const read = (f, rec) => readDrainRedTeamEvidence({ ...f, ...big, read: id => (id === 'review-pr-4999' ? rec : null) });
     const holds = (f, rec) => expect(read(f, rec)).toMatchObject({ ok: false, reason: 'review-unfinished' });
+    // The run is read as the newest finished review of the live head, not merely "not unfinished".
+    const accepted = (f, rec) => {
+      const result = read(f, rec);
+      expect(result.ok).not.toBe(false);
+      expect(result.reason).toBeUndefined();
+      expect(result.newest ?? result.loopPayload).toEqual(rec);
+    };
+    const accepting = f => ({ ...payload(f.head), findings: { confirm: 'accept', read: { netBasis: { rev: f.head } } } });
     it('does not hold the live head when only the additive ledger effect is pending', () => {
       const f = fixture();
-      expect(read(f, run(f))).not.toMatchObject({ reason: 'review-unfinished' });
+      accepted(f, run(f, accepting(f)));
+    });
+    it('holds when the write-up or label swap is absent, or the confirmation did not accept', () => {
+      const f = fixture();
+      holds(f, run(f, { ...accepting(f), effects: [ledger('pending')] }));
+      holds(f, run(f, { ...accepting(f), effects: [eff('label-swap', 'applied'), ledger('pending')] }));
+      holds(f, run(f, { ...accepting(f), effects: [eff('write-up', 'applied'), ledger('pending')] }));
+      for (const confirm of ['changes', 'abstain', undefined]) holds(f, run(f, { ...accepting(f), findings: { confirm, read: { netBasis: { rev: f.head } } } }));
     });
     it('still holds for every other open shape', () => {
       const f = fixture();
@@ -1174,11 +1190,10 @@ describe('bounded review evidence scans', () => {
       holds(f, run(f, { verdict: {} }));
       holds(f, run(f, { verdict: '' }));
     });
-    it('a changes run with only the ledger effect open is a finished rejection, not accept evidence', () => {
+    it('a changes or needs-human run with only the ledger effect open still holds', () => {
       const f = fixture();
-      const rec = run(f, { verdict: { verdict: 'changes' } });
-      expect(read(f, rec)).not.toMatchObject({ reason: 'review-unfinished' });
-      expect(read(f, rec)).not.toMatchObject({ ok: true });
+      holds(f, run(f, { verdict: { verdict: 'changes' } }));
+      holds(f, run(f, { verdict: { verdict: 'needs-human' } }));
     });
   });
   const statusFile = f => join(redTeamStatusDir(f.env), `${encodeURIComponent(f.repo)}-${f.pr}-${f.head}.json`);

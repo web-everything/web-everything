@@ -28,7 +28,7 @@ export default {
       const done = ['write-up', 'label-swap', 'verdict-ledger.append', 'notice'].map(s => eff(s, 'applied'));
       const ledger = status => eff('ledgerEvents', status, 'review.ledger-events');
       const base = { op: 'review-pr', input: { repo: 'web-everything/web-everything', pr: 7202 },
-        verdict: { verdict: 'accept' }, findings: { read: { netBasis: { rev: head } } },
+        verdict: { verdict: 'accept' }, findings: { confirm: 'accept', read: { netBasis: { rev: head } } },
         stepTimings: [{ step: 'read', startedAt: new Date(4999 * 10_000 - 1000).toISOString() }] };
       const replay = (name, extra, expectHold) => {
         const rec = { ...base, pending: { kind: 'effect', step: 'ledgerEvents' }, effects: [...done, ledger('pending')], ...extra };
@@ -38,9 +38,15 @@ export default {
           stat: path => ({ mtimeMs: Number(path.match(/review-pr-(\d+)/)[1]) * 10_000 }),
           read: id => (id === 'review-pr-4999' ? rec : null) });
         const held = result?.reason === 'review-unfinished';
-        if (held !== expectHold) violations.push(`${name}: expected ${expectHold ? 'hold' : 'no hold'}, got ${JSON.stringify(result?.reason)}`);
+        if (expectHold) {
+          if (!held) violations.push(`${name}: expected review-unfinished, got ${JSON.stringify(result?.reason)}`);
+        } else if (result?.ok === false || result?.reason !== undefined || JSON.stringify(result?.newest ?? result?.loopPayload) !== JSON.stringify(rec)) {
+          violations.push(`${name}: expected the run read as finished evidence, got ${JSON.stringify(result?.reason ?? result?.ok)}`);
+        }
       };
       replay('ledger effect only pending', {}, false);
+      replay('confirmation abstained', { findings: { confirm: 'abstain', read: { netBasis: { rev: head } } } }, true);
+      replay('label swap absent', { effects: [eff('write-up', 'applied'), ledger('pending')] }, true);
       replay('label swap also pending', { effects: [eff('write-up', 'applied'), eff('label-swap', 'pending'), ledger('pending')] }, true);
       replay('ledger effect in flight', { effects: [...done, ledger('in-flight')] }, true);
       replay('ledger effect refused', { effects: [...done, ledger('refused')] }, true);
