@@ -1,4 +1,5 @@
 import { NO_PROMPT_SESSION_KINDS } from '../lib/no-prompt-command-rules.mjs';
+import { LEAN_FIX_HOOKS_SETTINGS, RESTRICTED_PROVIDER_TOOLS } from './minimal-context-provider.mjs';
 import { appendBuildRequirements, resolveBuildPolicy } from '../lib/build-policy.mjs';
 import { applyTestsFirstPolicy } from '../lib/tests-first-policy.mjs';
 import { readPreparePolicy } from '../conveyor/prepare-policy-settings.mjs';
@@ -2625,6 +2626,9 @@ export function buildAgentArgv({
   // env, so `markWorkerEnv` on the spawn call never reaches the session, and the #x36vidg wait-poll guard read
   // every dispatched session as the operator's own. See `workerMarkerSettingsEnv`.
   const sessionEnv = workerMarkerSettingsEnv(settingsEnv);
+  const leanFix = payload.launchKind === 'fix' || payload.launchKind === 'ci-heal';
+  const sessionSettings = worktreeSettings ? { env: sessionEnv, worktree: worktreeSettings } : { env: sessionEnv };
+  if (leanFix) Object.assign(sessionSettings, LEAN_FIX_HOOKS_SETTINGS);
   // #3857 — the decided model goes FIRST as exactly one `--model <id>`; a hand-set one in `extraArgs` is
   // honoured only with a reason (see {@link resolveWorkerModel}), and never left riding alongside.
   let args = extraArgs.map(String);
@@ -2670,7 +2674,8 @@ export function buildAgentArgv({
     // xgqz204: never omitted any more — it always carries at least the worker marker (see above).
     // #x9fbg1x — `worktree` rides in the SAME object, never a second `--settings` flag (the CLI would only
     // honour the last one anyway).
-    '--settings', JSON.stringify(worktreeSettings ? { env: sessionEnv, worktree: worktreeSettings } : { env: sessionEnv }),
+    '--settings', JSON.stringify(sessionSettings),
+    ...(leanFix ? ['--restricted', '--tools', RESTRICTED_PROVIDER_TOOLS, '--strict-mcp-config', '--disable-slash-commands'] : []),
     ...(systemPromptFile ? ['--append-system-prompt-file', String(systemPromptFile)] : []),
     ...(table ? [...effortArgs, ...modelArgs] : []),
     ...args,

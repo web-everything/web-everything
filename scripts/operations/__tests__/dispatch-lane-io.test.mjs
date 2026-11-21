@@ -3,10 +3,77 @@ import { createHash } from 'node:crypto';
 import { mkdtempSync, mkdirSync, writeFileSync, chmodSync, rmSync, existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { createTickReader, createDispatchSinks, reserveBuildLane, resolveDispatchSettingsEnv, DISPATCH_BASH_TIMEOUT_ENV } from '../dispatch-lane-io.mjs';
+import { buildAgentArgv, createTickReader, createDispatchSinks, reserveBuildLane, resolveDispatchSettingsEnv, DISPATCH_BASH_TIMEOUT_ENV } from '../dispatch-lane-io.mjs';
 import { spawnPreventionLandingJob } from '../../lib/prevention-landing-job.mjs';
 import { NO_PROMPT_COMMAND_RULES } from '../../lib/no-prompt-command-rules.mjs';
 import { shapeDispatchRead, DISPATCH_EFFECT } from '../dispatch-lane.mjs';
+
+describe('lean repair background argv', () => {
+  const options = (launchKind) => ({
+    payload: { launchKind, num: '3037', sessionSlug: 'repair-3037', prompt: 'Repair this PR.' },
+    settingsEnv: { PATH: '/fixture/bin' },
+    worktreeSettings: { bgIsolation: 'none' },
+  });
+
+  it('fix and ci-heal --bg argv carries the restricted lean flags and a routed --model', () => {
+    for (const kind of ['fix', 'ci-heal']) {
+      const argv = buildAgentArgv(options(kind));
+      expect(argv).toContain('--restricted');
+      expect(argv[argv.indexOf('--tools') + 1]).toBe('Bash,Edit,Write,Read,Glob,Grep');
+      expect(argv).toContain('--strict-mcp-config');
+      expect(argv).toContain('--disable-slash-commands');
+      expect(argv).toContain('--model');
+      expect(argv[argv.indexOf('--model') + 1]).toMatch(/^[^-].+/);
+    }
+  });
+
+  it('fix resume stays a bare --bg --resume <id> <prompt>', () => {
+    expect(buildAgentArgv({
+      ...options('fix'), resumeSessionId: 'existing-session', extraArgs: ['--verbose'],
+      systemPromptFile: 'brief.md', table: { model: 'sonnet' },
+    })).toEqual(['--bg', '--resume', 'existing-session', 'Repair this PR.']);
+  });
+
+  it('non-fix background argv stays byte-identical without --restricted', () => {
+    const argv = buildAgentArgv({ ...options('build'), table: { model: 'sonnet', effort: 'high' } });
+    expect(argv).not.toContain('--restricted');
+    expect(argv).toEqual([
+      '--bg', '-n', 'repair-3037', '--settings',
+      JSON.stringify({ env: { PATH: '/fixture/bin', WE_CONVEYOR_WORKER: '1' }, worktree: { bgIsolation: 'none' } }),
+      '--effort', 'high', '--model', 'sonnet', 'Repair this PR.',
+    ]);
+  });
+
+  it('fix and ci-heal argv and settings reference nothing under the user home config (portable)', () => {
+    for (const kind of ['fix', 'ci-heal']) {
+      const text = JSON.stringify(buildAgentArgv({ ...options(kind), systemPromptFile: '/repo/.operations/brief.md' }));
+      expect(text).not.toMatch(/\.claude\/(CLAUDE\.md|projects|settings)/);
+      expect(text).not.toMatch(/\/memory\b|MEMORY\.md|SessionStart/);
+      expect(text).not.toContain(process.env.HOME ?? '\u0000no-home');
+    }
+  });
+
+  it('fix and ci-heal settings retain guard hooks and exclude SessionStart and delivery Stop hooks', () => {
+    for (const kind of ['fix', 'ci-heal']) {
+      const argv = buildAgentArgv(options(kind));
+      expect(argv.filter(arg => arg === '--settings')).toHaveLength(1);
+      const settings = JSON.parse(argv[argv.indexOf('--settings') + 1]);
+      expect(settings.env).toEqual({ PATH: '/fixture/bin', WE_CONVEYOR_WORKER: '1' });
+      expect(settings.worktree).toEqual({ bgIsolation: 'none' });
+      expect(settings.permissions?.allow).toEqual(['Bash', 'Edit', 'Write', 'Read', 'Glob', 'Grep']);
+      expect(settings.hooks?.PreToolUse).toEqual(expect.arrayContaining([
+        { matcher: 'Bash', hooks: [{ type: 'command', command: 'node scripts/guard-bash.mjs' }] },
+        { matcher: 'Edit|Write', hooks: [
+          { type: 'command', command: 'node scripts/guard-lane.mjs' },
+          { type: 'command', command: 'node scripts/lint-locus-prefix.mjs --pre' },
+          { type: 'command', command: 'node scripts/backlog-guard.mjs --pre' },
+        ] },
+      ]));
+      expect(settings.hooks).not.toHaveProperty('SessionStart');
+      expect(settings.hooks).not.toHaveProperty('Stop');
+    }
+  });
+});
 
 describe('the tick reader handoff', () => {
   const at = '2026-10-06T12:00:00.000Z';

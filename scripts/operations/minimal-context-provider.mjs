@@ -141,6 +141,26 @@ export function laneHasCommitAhead({ lane, base = 'origin/main', run: runFn = ru
  *  agent needs to build/edit + report; extend it here, in the one place, if a future brief needs more. */
 export const RESTRICTED_PROVIDER_TOOLS = 'Bash,Edit,Write,Read,Glob,Grep';
 
+/** Repo guards restored explicitly for restricted fix/ci-heal sessions. Bash's guard owns destructive-git
+ * and bypass refusals; permissions allow tool use without prompts, while these hooks still enforce safety.
+ * No SessionStart bootstrap or delivery completion-record Stop hook belongs to this dispatch path. */
+export const LEAN_FIX_HOOKS_SETTINGS = Object.freeze({
+  hooks: {
+    PreToolUse: [
+      {
+        matcher: 'Edit|Write',
+        hooks: [
+          { type: 'command', command: 'node scripts/guard-lane.mjs' },
+          { type: 'command', command: 'node scripts/lint-locus-prefix.mjs --pre' },
+          { type: 'command', command: 'node scripts/backlog-guard.mjs --pre' },
+        ],
+      },
+      { matcher: 'Bash', hooks: [{ type: 'command', command: 'node scripts/guard-bash.mjs' }] },
+    ],
+  },
+  permissions: { allow: RESTRICTED_PROVIDER_TOOLS.split(',') },
+});
+
 // ================================================================================================
 // 1. The `CLAUDE_RESTRICTED_PROVIDER` argv shape — VERIFIED against the real CLI (v2.1.266) while building
 //    `deliver-item-wrapper.mjs`: `--restricted` (never `--bare`, which requires a real API key and cannot use
