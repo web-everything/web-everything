@@ -592,9 +592,13 @@ function latestResult(records, pr, sha) {
   if (!/^[0-9a-f]{40}$/.test(sha)) return null;
   const results = records.map(r => ({ ...r, parsed: parseRedTeamComment(recordBody(r)) }))
     .filter(r => r.parsed?.pr === Number(pr) && r.parsed.rev === sha).sort(threadOrder);
-  // A policy skip is no re-check of a confirmed break; retain that result and its gate actions.
-  return results.reduce((latest, r) => r.parsed.policyClear && latest?.parsed.findings.some(f => f.confirmed)
-    ? latest : r, null);
+  // A policy skip is no re-check of any earlier confirmed break. Keep its result and gate actions even when
+  // incomplete markers or other non-policy results intervene; stored seals are checked by the disposition.
+  let confirmedBreak = null;
+  return results.reduce((latest, r) => {
+    if (r.parsed.findings.some(f => f.confirmed)) confirmedBreak = r;
+    return r.parsed.policyClear && confirmedBreak ? confirmedBreak : r;
+  }, null);
 }
 
 /**

@@ -574,3 +574,21 @@ Red team not required on this head: card-only diff.`, '2026-10-10T03:04:41Z'),
   expect(disposition.result.findings.some(f => f.confirmed)).toBe(true);
   expect(disposition.sendBack.map(f => f.index)).toContain(1);
 });
+
+
+it.each([
+  ['incomplete marker', `<!-- we:red-team-advisory pr=4722 rev=${HEAD} -->`],
+  ['completed clean review', renderRedTeamComment({ pr: 4722, rev: HEAD, findings: [],
+    provider: 'codex', model: 'm', recheckStatus: 'ok', foldedVerdict: 'accept' })],
+])('a policy-clear after an intervening %s cannot bury an earlier confirmed break', (_name, body) => {
+  const comments = [
+    bot(BODY_4722),
+    bot(body, '2026-10-10T03:04:41Z'),
+    bot(`<!-- we:red-team-advisory pr=4722 rev=${HEAD} -->
+Red team not required on this head: card-only diff.`, '2026-10-10T04:04:41Z'),
+  ];
+  const disposition = readRedTeamDisposition({ comments, pr: 4722, head: HEAD, env: {}, sealed: null });
+  expect(disposition.result.policyClear).not.toBe(true);
+  expect(disposition.result.findings.some(f => f.confirmed)).toBe(true);
+  expect(disposition.sendBack.map(f => f.index)).toContain(1);
+});
