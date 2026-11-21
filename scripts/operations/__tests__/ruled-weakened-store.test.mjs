@@ -1,7 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import fs from 'node:fs';
 import { join } from 'node:path';
-import { appendEntry, readStore, storePath, validateEntry } from '../ruled-weakened-store.mjs';
+import { appendEntry, readStore, storePath, validateEntry, withdrawnRevocations } from '../ruled-weakened-store.mjs';
 import { createPrototypeLoader, loadRuledWeakened } from '../prototype-load-io.mjs';
 import { readyEvidence } from '../prototype-load.mjs';
 import { resolveOperation } from '../run.mjs';
@@ -59,6 +59,36 @@ describe('ops ruled-weakened evidence', () => {
     append();
     requests(withdrawn({ at }));
     expect(union({ platform: [entry()], tool: [entry()] })).toEqual([]);
+  });
+  describe('legacy {withdrawn:true,ref,sha} request lines', () => {
+    const legacy = (over = {}) => ({ withdrawn: true, ref: 'lane/fix', sha: SHA, reason: 'declined', ...over });
+    const revocations = () => {
+      const warn = vi.fn();
+      return { warn, isRevoked: withdrawnRevocations({ fs, env, warn }) };
+    };
+    it('ruled-weakened-store treats a legacy {withdrawn:true,ref,sha} line as a WITHDRAWN request and emits no warning', () => {
+      requests(legacy());
+      const { warn, isRevoked } = revocations();
+      expect(warn).not.toHaveBeenCalled();
+      expect(isRevoked(entry())).toBe(true);
+      append();
+      expect(union()).toEqual([]);
+    });
+    it.each([{ ref: undefined }, { sha: undefined }, { ref: ' ' }, { sha: 'short' }, { withdrawn: 'true' }, { withdrawn: false }])(
+      'still treats a malformed legacy line as malformed: %j', over => {
+        requests(legacy(over));
+        const { warn, isRevoked } = revocations();
+        expect(warn).toHaveBeenCalledTimes(1);
+        expect(warn.mock.calls[0][0]).toMatch(/line 1/);
+        expect(isRevoked(entry())).toBe(false);
+      });
+    it('a withdrawn line never counts as an approval', () => {
+      requests(legacy());
+      const { isRevoked } = revocations();
+      expect(isRevoked(entry())).toBe(true);
+      expect(gate(union())).toBeNull();
+      expect(union({ platform: [entry()], tool: [entry()] })).toEqual([]);
+    });
   });
   it('revokes at equal timestamps and revokes undated platform/tool waivers even for older WITHDRAWN', () => {
     append();

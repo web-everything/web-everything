@@ -49,7 +49,10 @@ export function withdrawnRevocations({ env = process.env, fs = nodeFs, warn = co
   body.split(/\r?\n/).forEach((line, i) => {
     if (!line.trim()) return;
     try {
-      const request = JSON.parse(line);
+      let request = JSON.parse(line);
+      // Legacy withdrawal shape {withdrawn:true,ref,sha,reason}: exactly this shape reads as WITHDRAWN.
+      if (request && typeof request === 'object' && !Array.isArray(request)
+        && request.withdrawn === true && !Object.hasOwn(request, 'ruling')) request = { ...request, ruling: 'WITHDRAWN' };
       if (!request || typeof request !== 'object' || Array.isArray(request)
         || !nonblank(request.ref) || typeof request.sha !== 'string' || !/^[a-f0-9]{40}$/i.test(request.sha)
         || !nonblank(request.ruling)) throw Error('invalid request');
