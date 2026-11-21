@@ -327,21 +327,27 @@ export function formatPlans(plans, { checkOnly, dryRun, noun = 'skill' }) {
   return lines.join('\n');
 }
 
-async function main() {
-  const args = parseArgs(process.argv.slice(2));
-  const destRoot = deployRoot();
-  const srcRoot = process.env.WE_SKILLS_SRC_ROOT ? path.resolve(process.env.WE_SKILLS_SRC_ROOT) : SRC_ROOT;
-  if (!fs.existsSync(srcRoot)) throw new Error(`sync-skills-deploy: missing skills-src at ${srcRoot}`);
+/** Root-selection decisions are deterministic given env, args, home and the injectable existence probe. */
+export function resolveRoots(env = process.env, args = { roots: [] }, home = os.homedir(), exists = fs.existsSync) {
+  const srcRoot = env.WE_SKILLS_SRC_ROOT ? path.resolve(env.WE_SKILLS_SRC_ROOT) : SRC_ROOT;
+  if (!exists(srcRoot)) throw new Error(`sync-skills-deploy: missing skills-src at ${srcRoot}`);
   // Extra roots: --root=<dir> (repeatable) and WE_SKILLS_EXTRA_ROOTS (path-delimited, e.g. plateau-ops/skills).
-  const envRoots = (process.env.WE_SKILLS_EXTRA_ROOTS || '').split(path.delimiter).filter(Boolean);
-  const defaultOps = path.join(os.homedir(), 'workspace', 'plateau-ops', 'skills'); // default second home
+  const envRoots = (env.WE_SKILLS_EXTRA_ROOTS || '').split(path.delimiter).filter(Boolean);
+  const defaultOps = path.join(home, 'workspace', 'plateau-ops', 'skills'); // default second home
   // Explicit roots (--root / env) MUST exist: a missing one is an error, never a silent skip. Only the
   // default second home is optional.
   const explicit = [...envRoots, ...args.roots];
-  const missing = explicit.filter((r) => !fs.existsSync(r));
+  const missing = explicit.filter((r) => !exists(r));
   if (missing.length) throw new Error(`sync-skills-deploy: source root(s) not found: ${missing.join(', ')}`);
-  const extraRoots = [...(process.env.WE_SKILLS_SRC_ROOT ? [] : [defaultOps]), ...explicit]
-    .filter((r, i, a) => fs.existsSync(r) && a.indexOf(r) === i);
+  const extraRoots = [...(env.WE_SKILLS_SRC_ROOT ? [] : [defaultOps]), ...explicit]
+    .filter((r, i, a) => exists(r) && a.indexOf(r) === i);
+  return { srcRoot, extraRoots };
+}
+
+async function main() {
+  const args = parseArgs(process.argv.slice(2));
+  const destRoot = deployRoot();
+  const { srcRoot, extraRoots } = resolveRoots(process.env, args, os.homedir());
 
   const plans = buildPlans({ srcRoot, extraRoots, destRoot, only: args.only, all: args.all, prune: args.prune });
   const drifted = plans.filter((p) => p.actions.length > 0);
@@ -376,6 +382,7 @@ async function main() {
 
   // #2579 review — `--check` exits 1 on ANY pending divergence, stale files included. Keying only on
   // `drifted` meant a deploy tree carrying untracked leftovers reported "no drift" and exited 0.
+  // Sync and --dry-run retain exit 0 for reported untracked skills; --json ok:false signals incomplete sync.
   if (args.check && !nothingPending) process.exitCode = 1;
 }
 

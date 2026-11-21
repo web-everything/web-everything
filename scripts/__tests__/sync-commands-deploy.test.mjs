@@ -99,6 +99,20 @@ describe('--check on the real CLI against a scratch deploy dir (#3767)', () => {
     timeout: 20_000,
   });
 
+  it.each([
+    { roots: ['--root=/extra'] },
+    { roots: ['--root='] },
+    { roots: ['--root=/a', '--root=/b'] },
+  ])(
+    'rejects unsupported --root arguments ($roots) before deploying', ({ roots }) => {
+      const r = run('--all', ...roots);
+      expect(r.status).toBe(2);
+      expect(r.stderr.trim()).toBe('Error: sync-commands-deploy: --root is not supported (single source root)');
+      expect(r.stdout).toBe('');
+      expect(fs.readdirSync(tmp)).toEqual([]);
+    },
+  );
+
   it('exits 0 and reports nothing once the deploy target equals the source', () => {
     expect(run('--all').status).toBe(0);
     const r = run('--check');

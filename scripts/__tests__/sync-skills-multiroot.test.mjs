@@ -5,12 +5,13 @@
  *   --check reports an untracked (never-committed) new skill as drift. Each root is a real tmp git repo.
  */
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
-import { mkdtempSync, rmSync, mkdirSync, writeFileSync, existsSync } from 'node:fs';
+import { mkdtempSync, rmSync, mkdirSync, writeFileSync, existsSync, readFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join, dirname } from 'node:path';
+import { join, dirname, delimiter, resolve } from 'node:path';
 import { execFileSync, spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { buildPlans, parseArgs } from '../sync-skills-deploy.mjs';
+import * as skillsSync from '../sync-skills-deploy.mjs';
 
 const MODULE_PATH = join(dirname(fileURLToPath(import.meta.url)), '..', 'sync-skills-deploy.mjs');
 let tmp;
@@ -34,6 +35,144 @@ function gitRepoWithSkills(name, skills, { commit = true } = {}) {
   }
   return { repo, root };
 }
+
+// Never inherit developer root overrides or a real home in CLI fixtures.
+function runCli(args, overrides = {}) {
+  const env = { ...process.env, HOME: join(tmp, 'home'), WE_SKILLS_DEPLOY_DIR: join(tmp, 'dest'), ...overrides };
+  delete env.WE_SKILLS_EXTRA_ROOTS;
+  delete env.WE_SKILLS_SRC_ROOT;
+  Object.assign(env, overrides);
+  return spawnSync(process.execPath, [MODULE_PATH, ...args], { env, encoding: 'utf8', timeout: 20_000 });
+}
+
+describe('resolveRoots branch contract', () => {
+  it('selects the repository source and the exact default ops root when present', () => {
+    const home = join(tmp, 'home');
+    const ops = join(home, 'workspace', 'plateau-ops', 'skills');
+    expect(skillsSync.resolveRoots({}, parseArgs([]), home, () => true))
+      .toEqual({ srcRoot: skillsSync.SRC_ROOT, extraRoots: [ops] });
+  });
+
+  it('skips an absent optional default ops root', () => {
+    expect(skillsSync.resolveRoots({}, parseArgs([]), tmp, (p) => p === skillsSync.SRC_ROOT))
+      .toEqual({ srcRoot: skillsSync.SRC_ROOT, extraRoots: [] });
+  });
+
+  it('excludes the default ops root when WE_SKILLS_SRC_ROOT is set', () => {
+    expect(skillsSync.resolveRoots({ WE_SKILLS_SRC_ROOT: './fixture' }, parseArgs([]), tmp, () => true))
+      .toEqual({ srcRoot: resolve('./fixture'), extraRoots: [] });
+  });
+
+  it('combines path-delimited env roots and repeatable CLI roots, removing exact duplicates', () => {
+    const env = { WE_SKILLS_SRC_ROOT: tmp, WE_SKILLS_EXTRA_ROOTS: ['/env-a', '', '/env-b'].join(delimiter) };
+    expect(skillsSync.resolveRoots(env, parseArgs(['--root=/env-a', '--root=/cli']), tmp, () => true))
+      .toEqual({ srcRoot: tmp, extraRoots: ['/env-a', '/env-b', '/cli'] });
+  });
+
+  it('refuses a missing primary root before planning', () => {
+    expect(() => skillsSync.resolveRoots({ WE_SKILLS_SRC_ROOT: tmp }, parseArgs([]), tmp, () => false))
+      .toThrow(`sync-skills-deploy: missing skills-src at ${tmp}`);
+  });
+
+  it.each(['env', 'CLI'])('refuses a missing explicit %s root', (kind) => {
+    const missing = join(tmp, 'missing');
+    const env = kind === 'env' ? { WE_SKILLS_EXTRA_ROOTS: missing } : {};
+    const args = parseArgs(kind === 'CLI' ? [`--root=${missing}`] : []);
+    expect(() => skillsSync.resolveRoots(env, args, tmp, (p) => p !== missing))
+      .toThrow(`sync-skills-deploy: source root(s) not found: ${missing}`);
+  });
+});
+
+describe('default roots and fail-closed CLI wiring', () => {
+  it('discovers the default HOME/workspace/plateau-ops/skills root when present', () => {
+    gitRepoWithSkills('home/workspace/plateau-ops', ['ops-probe']);
+    const r = runCli(['--check', '--all', '--json', '--only=ops-probe']);
+    expect(r.status).toBe(1);
+    expect(r.stderr).toBe('');
+    expect(JSON.parse(r.stdout)).toMatchObject({ checked: 1, drifted: 1, skills: [{ name: 'ops-probe' }] });
+    expect(existsSync(join(tmp, 'dest', 'ops-probe'))).toBe(false);
+  });
+
+  it('skips the default ops root when absent without attempting Git discovery there', () => {
+    const r = runCli(['--check', '--json', '--only=']);
+    expect(r.status).toBe(0);
+    expect(r.stderr).toBe('');
+    expect(JSON.parse(r.stdout)).toMatchObject({ ok: true, checked: 0, skills: [] });
+  });
+
+  it('suppresses an existing default ops root when WE_SKILLS_SRC_ROOT is set', () => {
+    gitRepoWithSkills('home/workspace/plateau-ops', ['alpha']);
+    const primary = gitRepoWithSkills('we', ['alpha']);
+    const r = runCli(['--all', '--check', '--json'], { WE_SKILLS_SRC_ROOT: primary.root });
+    expect(r.status).toBe(1);
+    expect(r.stderr).toBe('');
+    expect(JSON.parse(r.stdout)).toMatchObject({ checked: 1, skills: [{ name: 'alpha' }] });
+  });
+
+  it('refuses a missing WE_SKILLS_EXTRA_ROOTS entry before deploying anything', () => {
+    const primary = gitRepoWithSkills('we', ['alpha']);
+    const missing = join(tmp, 'missing');
+    const r = runCli(['--all'], { WE_SKILLS_SRC_ROOT: primary.root, WE_SKILLS_EXTRA_ROOTS: missing });
+    expect(r.status).toBe(1);
+    expect(r.stderr.trim()).toBe(`sync-skills-deploy: source root(s) not found: ${missing}`);
+    expect(existsSync(join(tmp, 'dest'))).toBe(false);
+  });
+
+  it.each(['env', 'CLI'])('refuses a non-Git extra root supplied by %s before deploying anything', (kind) => {
+    const primary = gitRepoWithSkills('we', ['alpha']);
+    const extra = join(tmp, 'non-git');
+    mkdirSync(extra);
+    const r = runCli(['--all', ...(kind === 'CLI' ? [`--root=${extra}`] : [])], {
+      WE_SKILLS_SRC_ROOT: primary.root,
+      ...(kind === 'env' ? { WE_SKILLS_EXTRA_ROOTS: extra } : {}),
+    });
+    expect(r.status).toBe(1);
+    expect(r.stderr).toContain(`sync-skills-deploy: extra root "${extra}" is not inside a git repo; refusing`);
+    expect(existsSync(join(tmp, 'dest'))).toBe(false);
+  });
+});
+
+describe('untracked skills CLI contract in every mode', () => {
+  it.each([
+    { flags: [], exit: 0, applied: true },
+    { flags: ['--all'], exit: 0, applied: true },
+    { flags: ['--only=fresh'], exit: 0, applied: true },
+    { flags: ['--all', '--prune'], exit: 0, applied: true },
+    { flags: ['--all', '--dry-run'], exit: 0, applied: false },
+    { flags: ['--all', '--check'], exit: 1, applied: false },
+  ])('$flags reports ok:false and never deploys or prunes an untracked skill (exit $exit)', ({ flags, exit, applied }) => {
+    const primary = gitRepoWithSkills('we', ['alpha']);
+    mkdirSync(join(primary.root, 'fresh'));
+    writeFileSync(join(primary.root, 'fresh', 'SKILL.md'), '# fresh\n');
+    const dest = join(tmp, 'dest');
+    // An existing operator file must survive even --prune; a fresh SKILL.md must never be copied.
+    mkdirSync(join(dest, 'fresh'), { recursive: true });
+    writeFileSync(join(dest, 'fresh', 'mine.md'), 'operator notes');
+    const env = { WE_SKILLS_SRC_ROOT: primary.root };
+    const r = runCli([...flags, '--json'], env);
+    expect(r.status).toBe(exit);
+    expect(r.stderr).toBe('');
+    const report = JSON.parse(r.stdout);
+    expect(report).toMatchObject({ ok: false, untrackedSkills: ['fresh'], applied });
+    expect(report.skills.find((s) => s.name === 'fresh')).toMatchObject({ untracked: true, actions: [], stale: [] });
+    expect(existsSync(join(dest, 'fresh', 'SKILL.md'))).toBe(false);
+    expect(readFileSync(join(dest, 'fresh', 'mine.md'), 'utf8')).toBe('operator notes');
+    if (flags.includes('--all')) expect(existsSync(join(dest, 'alpha', 'SKILL.md'))).toBe(applied);
+    const text = runCli(flags, env);
+    expect(text.status).toBe(exit);
+    expect(text.stdout).toContain('UNTRACKED fresh');
+    expect(existsSync(join(dest, 'fresh', 'SKILL.md'))).toBe(false);
+    expect(readFileSync(join(dest, 'fresh', 'mine.md'), 'utf8')).toBe('operator notes');
+  });
+
+  it('reports ok:true and an empty untrackedSkills list after a tracked-only sync', () => {
+    const primary = gitRepoWithSkills('we', ['alpha']);
+    const r = runCli(['--all', '--json'], { WE_SKILLS_SRC_ROOT: primary.root });
+    expect(r.status).toBe(0);
+    expect(JSON.parse(r.stdout)).toMatchObject({ ok: true, untrackedSkills: [], applied: true });
+    expect(readFileSync(join(tmp, 'dest', 'alpha', 'SKILL.md'), 'utf8')).toBe('# alpha\n');
+  });
+});
 
 describe('multi-root source list', () => {
   it('parseArgs accepts repeatable --root=<dir>', () => {
