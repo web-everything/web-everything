@@ -1,4 +1,8 @@
 import { describe, it, expect } from 'vitest';
+import { readFileSync } from 'node:fs';
+import { DEFAULT_ROUTING_POLICY, resolveOperationRoute } from '../dispatch-routing-policy.mjs';
+import { criticalWorkVerdict } from '../critical-work.mjs';
+import { dirname, join } from 'node:path';
 import {
   PROBATION_STATUSES, PROBATION_ROLES, DEFAULT_STATUS, NEVER_BLOCKING_ROLES,
   identityKey, validateProbationEntry, normalizeRegistry, findEntry, statusFor,
@@ -157,5 +161,55 @@ describe('IO shell — readRegistry/writeRegistry', () => {
   });
   it('liveStatusFor reads the real antigravity entry too, independent of the codex identity', () => {
     expect(liveStatusFor({ provider: 'antigravity', model: 'gemini-4-argon-high', role: 'advisory-review' })).toBe('probation');
+  });
+});
+
+
+describe('S0.1 — Flash delivery on small kinds', () => {
+  const kinds = ['doc-fix', 'prevention-card', 'prepare-card'];
+  const policy = DEFAULT_ROUTING_POLICY;
+
+  it('registers Flash on probation for delivery only, owned by 3383 since 2026-11-21', () => {
+    const registry = readRegistry();
+    const identity = { provider: 'antigravity', model: 'gemini-3.8-flash' };
+    expect(findEntry(registry, identity)).toMatchObject({
+      roles: { delivery: 'probation' }, owner: '3383', since: '2026-11-21',
+    });
+    expect(isDispatchEligible(registry, { ...identity, role: 'delivery' })).toBe(true);
+    expect(statusFor(registry, { ...identity, role: 'advisory-review' })).toBe('unvalidated');
+  });
+
+  it('agy-build allows exactly the three small delivery kinds', () => {
+    const settings = JSON.parse(readFileSync(join(dirname(PROBATION_REGISTRY_PATH), '../settings/agy-build.json'), 'utf8'));
+    expect(settings.allowedKinds).toEqual(kinds);
+  });
+
+  it.each(kinds)('routes %s to agy-gemini Flash through both operation and task-type policy', kind => {
+    for (const operation of [kind, 'worker', ...(kind === 'doc-fix' ? ['build'] : [])]) {
+      const route = resolveOperationRoute({ operation, taskType: kind, policy });
+      expect(route).toMatchObject({ provider: 'agy-gemini', model: 'gemini-3.8-flash' });
+    }
+  });
+
+  it('never draws Flash for the security lens, including its fallback', () => {
+    const route = resolveOperationRoute({ operation: 'review-seat', taskType: 'mandatory:security', policy });
+    expect(route).toMatchObject({ provider: 'agy-claude', model: 'claude-sonnet-5-5-high', effort: 'high' });
+    expect([route, ...route.fallback].every(seat => !seat.model.includes('flash'))).toBe(true);
+  });
+
+  it.each(kinds)('never draws Flash for %s on merge-path, security or unknown shapes', kind => {
+    const shapes = [
+      { filesTouched: ['scripts/lib/pr-merge-gate.mjs'] },
+      { filesTouched: ['scripts/merge-ai-prs.mjs'] },
+      { filesTouched: ['docs/ordinary.md'], tags: ['security'] },
+      { filesTouched: [] },
+    ];
+    for (const shape of shapes) {
+      const gateClosed = criticalWorkVerdict(shape).critical;
+      expect(gateClosed).toBe(true);
+      const route = resolveOperationRoute({ operation: kind, gateClosed, policy });
+      expect(route).toMatchObject({ provider: 'claude', model: 'claude-sonnet-5-5' });
+      expect([route, ...route.fallback].every(seat => !seat.model.includes('flash'))).toBe(true);
+    }
   });
 });

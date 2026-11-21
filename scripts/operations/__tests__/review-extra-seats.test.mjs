@@ -274,7 +274,7 @@ describe('card x6ov12s — quota hold self-probe', () => {
   const NOW = Date.parse('2026-09-29T14:00:00-04:00');
   const q = {
     dispatchKind: REVIEW_SEAT_DISPATCH_KIND, provider: 'codex', status: 'ok',
-    quotaUsedPercent: 99, quotaResetsAt: '2026-10-03T17:11:00-04:00', scoredAt: '2026-09-28T22:31:00-04:00',
+    quotaUsedPercent: 100, quotaResetsAt: '2026-10-03T17:11:00-04:00', scoredAt: '2026-09-28T22:31:00-04:00',
   };
 
   it('probeDue requires a row for that provider and a full interval since its timestamp', () => {
@@ -304,12 +304,12 @@ describe('card x6ov12s — quota hold self-probe', () => {
 
   it('quotaHoldOrProbe preserves the exact hold reason until the probe is due', () => {
     const now = Date.parse(q.scoredAt) + DEFAULT_PROBE_INTERVAL_MS - 1;
-    expect(quotaHold([q], 'codex', now)).toMatch(/99%/);
+    expect(quotaHold([q], 'codex', now)).toMatch(/100%/);
     expect(quotaHoldOrProbe([q], 'codex', now, {})).toBe(quotaHold([q], 'codex', now));
   });
 
   it('soak-break: the live incident stays held without the probe, but the probe admits it', () => {
-    expect(quotaHold([q], 'codex', NOW)).toMatch(/99%.*2026-10-03T21:11:00.000Z/);
+    expect(quotaHold([q], 'codex', NOW)).toMatch(/100%.*2026-10-03T21:11:00.000Z/);
     expect(quotaHoldOrProbe([q], 'codex', NOW, {})).toBeNull();
   });
 
@@ -345,7 +345,7 @@ describe('#4194 cost controls — kill switch, cap, quota', () => {
     expect(quotaHold([q], 'codex', NOW)).toMatch(/quota exhausted/);
     expect(quotaHold([q], 'codex', NOW + 2 * 60 * 60 * 1000)).toBeNull();
     expect(quotaHold([q, { ...q, status: 'ok', scoredAt: '2026-09-26T14:40:00Z' }], 'codex', NOW)).toBeNull();
-    expect(quotaHold([{ ...q, status: 'ok', quotaUsedPercent: 99, quotaResetsAt: '2026-09-26T18:00:00Z' }], 'codex', NOW)).toMatch(/99%/);
+    expect(quotaHold([{ ...q, status: 'ok', quotaUsedPercent: 100, quotaResetsAt: '2026-09-26T18:00:00Z' }], 'codex', NOW)).toMatch(/100%/);
     expect(quotaHold([q], 'gemini', NOW)).toBeNull();
     // live-caught: codex reports resets_at in epoch SECONDS
     expect(toIsoInstant(1790430415)).toBe(new Date(1790430415 * 1000).toISOString());
@@ -623,10 +623,10 @@ describe('#4194 runExtraSeats — the arc, with fakes', () => {
     const now = Date.parse('2026-09-29T14:00:00-04:00');
     const records = [{
       dispatchKind: REVIEW_SEAT_DISPATCH_KIND, provider: 'codex', status: 'ok',
-      quotaUsedPercent: 99, quotaResetsAt: '2026-10-03T17:11:00-04:00', scoredAt: '2026-09-28T22:31:00-04:00',
+      quotaUsedPercent: 100, quotaResetsAt: '2026-10-03T17:11:00-04:00', scoredAt: '2026-09-28T22:31:00-04:00',
     }];
     const { io, calls, rows } = fakeSeatIo({ now: () => now, readRecords: () => records });
-    expect(quotaHold(records, 'codex', now)).toMatch(/99%/);
+    expect(quotaHold(records, 'codex', now)).toMatch(/100%/);
     const r = await runExtraSeats({ pr: 5, repo: REPO, lanePath: '/lane', loopPayload: LOOP_PAYLOAD, env: {} }, io);
     expect(r.status).toBe('ran');
     expect(calls.filter((c) => c[0] === 'seat' && c[1].provider === 'codex')).toHaveLength(1);

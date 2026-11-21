@@ -16,6 +16,7 @@ export function finishAiRouting({ run, code, lines, json }) {
   return { code, lines: !json && result?.inputs ? [
     `settings: ${JSON.stringify(result.settings)}`,
     ...Object.entries(result.inputs).map(([role, inputs]) => `${role}: ${JSON.stringify(inputs)}`),
+    ...Object.entries(result.deliveryRoutes ?? {}).map(([kind, route]) => `${kind}: ${JSON.stringify(route)}`),
     `sources: ${JSON.stringify(result.sources)}`,
     `invalid: ${JSON.stringify(result.invalid)}`,
   ] : lines };

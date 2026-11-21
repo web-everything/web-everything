@@ -159,11 +159,11 @@ describe('x00g3tt — the red team fires on ACCEPT only', () => {
 
   it('card x6ov12s — a held-but-probe-due codex is still admitted to the red-team pass (both call sites wired)', async () => {
     // Same live-incident shape as review-extra-seats.test.mjs's runExtraSeats case: codex's last row would
-    // still hold under the plain `quotaHold` reader (99% gauge, resetsAt days out); this call site must read
+    // still hold under the plain `quotaHold` reader (100% gauge, resetsAt days out); this call site must read
     // it through `quotaHoldOrProbe` too, so a full probe interval past that row's own `scoredAt` admits it.
     const heldRow = {
       dispatchKind: 'review-seat', provider: 'codex', status: 'ok',
-      quotaUsedPercent: 99, quotaResetsAt: '2026-10-03T17:11:00-04:00', scoredAt: '2026-09-28T22:31:00-04:00',
+      quotaUsedPercent: 100, quotaResetsAt: '2026-10-03T17:11:00-04:00', scoredAt: '2026-09-28T22:31:00-04:00',
     };
     const now = Date.parse(heldRow.scoredAt) + DEFAULT_PROBE_INTERVAL_MS;
     const { io, calls } = fakeIo({

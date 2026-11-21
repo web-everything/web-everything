@@ -282,6 +282,7 @@ describe('review-round regressions (PR 3209)', () => {
   });
   it('an explicit Codex build route stays on the mechanical wrapper when probation launch is off', () => {
     const policy = copy(); policy.operations.build = { provider: 'codex', model: 'default', fallback: [] };
+    policy.operations['build:doc-fix'] = policy.operations.build;
     const routing = decideDispatchRoute({ kind: 'build', scopePaths: ['we:docs/a.md'], size: 1, risk: 'low' }, { routingPolicy: policy });
     const request = { launchKind: 'build', policyRoute: routing.policyRoute, probationWorker: routing.probationWorker, reportModel: vi.fn() };
     const wrapper = vi.fn(() => 'pid:9'); const agent = vi.fn(() => 'claude-session');
@@ -382,9 +383,10 @@ it.each(['fix', 'ci-heal'])('%s retries Astra high before Claude only on definit
 
 it('routes all mechanical documentation and filing entries at medium effort', () => {
   const policy = copy();
-  for (const entry of [policy.operations.build, policy.operations['build:doc-fix'], ...['doc-fix', 'prevention-card', 'prepare-card'].flatMap(k => [policy.operations[k], policy.taskTypes[k]])]) {
-    expect(entry.provider).toBe('codex'); expect(entry.model).toBe('sol');
-    expect(entry.effort.codex).toBe('medium');
+  expect(policy.operations.build).toMatchObject({ provider: 'codex', model: 'sol' });
+  for (const entry of [policy.operations['build:doc-fix'], ...['doc-fix', 'prevention-card', 'prepare-card'].flatMap(k => [policy.operations[k], policy.taskTypes[k]])]) {
+    expect(entry.provider).toBe('agy-gemini'); expect(entry.model).toBe('flash');
+    expect(entry.effort['agy-gemini']).toBe('medium');
   }
   for (const entry of ['prevention-card', 'prepare-card'].flatMap(k => [policy.operations[k], policy.taskTypes[k]])) {
     expect(Object.values(entry.effort).every(e => e === 'medium')).toBe(true);

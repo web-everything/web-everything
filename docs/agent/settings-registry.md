@@ -61,7 +61,7 @@ Operator-prefs layer: ~/.plateau/platform-preferences.json is the requested oper
 | advisorySeats | scripts/settings/review.json | 1 | {"antigravityReview":"probation"} | pr | no | Provider advisory review seating policy. |
 | aiRouting | scripts/settings/ai-routing.json | 0 | {} | pr | no | AI role routing overrides; empty preserves existing resolvers. |
 | alertAfterMinutes | scripts/settings/forge-share.json | 1 | 60 | pr | no | Duration before low remote execution share raises an alert. |
-| allowedKinds | scripts/settings/agy-build.json | 1 | ["doc-fix"] | env | no | Doc-fix only; test-fix refused until #8606 regardless of settings. Production confinement unavailable; repair size 1. |
+| allowedKinds | scripts/settings/agy-build.json | 1 | ["doc-fix","prevention-card","prepare-card"] | env | no | Small delivery kinds; test-fix refused until #8606 regardless of settings. Production confinement unavailable; repair size 1. |
 | allowedSigners | scripts/settings/card-ledger-trust.json | 1 | [] | pr | no | Trusted card-ledger signers. |
 | archive | scripts/settings/archive-retention.json | 1 | {"runsBatchCap":5000} | pr | no | Archive retention and bounded archive batch policy. |
 | audit | scripts/settings/codex-audit.json | 10 | {"verdict":{"mode":"model"},"preExisting":{"mode":"block","… | pr | no | Audit verdict, pre-existing finding and protected path policy. |
@@ -374,7 +374,7 @@ Prioritised for throughput and stuck-work impact, favouring capacity and concurr
 | H | prepReview.budgetUsd | PREP_REVIEW_BUDGET_USD | $0.25 | $0.05–$2 | yes | B | scripts/conveyor/prep-review.mjs:41 |
 | H | prepReview.maxPerTick | PREP_REVIEW_MAX_PER_TICK | 3 | 0–20 | yes | B | scripts/conveyor/prep-review.mjs:470 |
 | H | prepareFailure.infraRetryBudget | INFRA_RETRY_BUDGET | 2 | 0–10 | yes | D | scripts/conveyor/prepare-failure-policy.mjs:12 |
-| H | providerQuota.codexFullPercent | CODEX_QUOTA_FULL_PERCENT | 98% | 80–100% | yes | B | scripts/lib/provider-quota-hold.mjs:3 |
+| H | providerQuota.codexFullPercent | CODEX_QUOTA_FULL_PERCENT | 100% | 80–100% | yes | B | scripts/lib/provider-quota-hold.mjs:3 |
 | H | providerQuota.unknownResetCooloffMs | QUOTA_COOLOFF_MS | 1 h | 5 min–6 h | yes | B | scripts/lib/provider-quota-hold.mjs:2 |
 | H | reconcileFixDaemon.intervalMs | DEFAULT_INTERVAL_MS | 120000 | 15000-600000 | yes | G | skills-src/conveyor/reconcile-fix-dispatch-daemon.mjs:138 |
 | H | referralPersistence.retryDelaysMs | REFERRAL_RETRY_MS | 15, 30, 60 min | 1–6 increasing delays, each 1–120 min | yes | B | scripts/conveyor/review-referral-hold.mjs:48 |

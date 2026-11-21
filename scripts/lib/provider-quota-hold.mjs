@@ -1,6 +1,6 @@
 /** Shared pre-launch quota hold; pure and independent of launcher imports. */
 export const QUOTA_COOLOFF_MS = 60 * 60 * 1000;
-export const CODEX_QUOTA_FULL_PERCENT = 98;
+export const CODEX_QUOTA_FULL_PERCENT = 100;
 
 export function isQuotaError(text) {
   if (typeof text !== 'string') return false;
