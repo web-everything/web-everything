@@ -3,6 +3,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { isDeepStrictEqual } from 'node:util';
 import { randomUUID } from 'node:crypto';
 import { buildChangeEvidence } from './record.mjs';
 import { execFileSyncThrottled } from '../gh-throttle.mjs';
@@ -88,6 +89,18 @@ function publish({ io, dir, record, retire }) {
   const rows = before.trim() ? before.trim().split('\n').map(line => JSON.parse(line)) : [];
   const indexed = rows.some(row => row.file === name);
   const existed = io.existsSync(file);
+  if (existed) {
+    // Recollect first, then reconcile a crash only if the persisted statement agrees.
+    // Recorder/time metadata may differ across retries; subject, policy and verdict may not.
+    const saved = JSON.parse(io.readFileSync(file, 'utf8'));
+    const normalize = value => JSON.parse(JSON.stringify(value, (k, v) =>
+      ['recordedAt', 'recorder', 'evaluatedAt'].includes(k) ? undefined : v));
+    const expected = structuredClone(record);
+    if (!Number.isFinite(Date.parse(saved.predicate?.recordedAt))) throw Error('invalid existing record timestamp; operator must inspect record');
+    expected.predicate.id = expected.predicate.id.replace(record.predicate.recordedAt.slice(0, 10), saved.predicate.recordedAt.slice(0, 10));
+    if (!isDeepStrictEqual(normalize(saved), normalize(expected)))
+      throw Error('existing record differs from verified subject, policy or verdict; operator must inspect record and retry backfill');
+  }
   let appended = false;
   try {
     if (!existed) atomic(io, file, `${JSON.stringify(record, null, 2)}\n`);
@@ -116,17 +129,29 @@ export async function writeChangeEvidenceForMerged({ merged = [], queueFollowUps
   const missing = (item, error) => failures.push({ kind: 'change-evidence-missing', repo: item.repo, pr: item.num,
     daemon: 'merge-ai-prs', detail: { reason: clean(error.message), fallback: 'retry pending next pass or run --backfill --since=YYYY-MM-DD' } });
   try {
+    // An immutable inbox entry survives lock contention and concurrent drain callers.
+    // Never read/modify the shared pending ledger outside its lock.
+    const inbox = path.join(coordination, 'change-evidence-incoming');
+    const incoming = [...merged, ...queueFollowUps].map(item => ({ ...item, ...identity(item, repo) }));
+    if (incoming.length) atomic(io, path.join(inbox, `${randomUUID()}.json`), JSON.stringify(incoming));
     withLedgerAppendLock(`change-evidence:${coordination}`, () => {
       const pendingFile = path.join(coordination, 'change-evidence-pending.json');
       let pending = JSON.parse(optional(io, pendingFile, '[]'));
       if (!Array.isArray(pending)) throw Error('invalid change-evidence pending ledger; operator must repair it');
-      const candidates = new Map([...pending, ...merged, ...queueFollowUps].map(item => {
+      const batches = io.existsSync(inbox) ? io.readdirSync(inbox).filter(name => name.endsWith('.json')) : [];
+      const queued = batches.flatMap(name => {
+        const batch = JSON.parse(io.readFileSync(path.join(inbox, name), 'utf8'));
+        if (!Array.isArray(batch)) throw Error('invalid incoming evidence batch; operator must repair it');
+        return batch;
+      });
+      const candidates = new Map([...pending, ...queued].map(item => {
         const id = identity(item, repo); return [key(id), { ...item, ...id }];
       }));
       pending = [...candidates.values()];
       const save = () => atomic(io, pendingFile, `${JSON.stringify(pending, null, 2)}\n`);
       if (!pending.length) return;
       save();
+      for (const name of batches) io.unlinkSync(path.join(inbox, name));
       const reads = sharedReads ?? reader(gh, maxCalls, maxPages);
       const bytes = configBytes ?? io.readFileSync(POLICY), config = JSON.parse(String(bytes));
       for (const item of candidates.values()) {
@@ -151,6 +176,7 @@ export async function writeChangeEvidenceForMerged({ merged = [], queueFollowUps
 }
 
 export async function backfillChangeEvidence({ since, repo = DEFAULT_REPO, gh = defaultGh, maxCalls = 256, maxPages = 10, ...options } = {}) {
+  // utc-day-slice-ok: validates the supplied UTC calendar date, not the operator's current day.
   if (!/^\d{4}-\d{2}-\d{2}$/.test(since ?? '') || new Date(since).toISOString().slice(0, 10) !== since) throw Error('expected --since=YYYY-MM-DD');
   if ((options.mode ?? resolveChangeEvidenceMode().value.mode) === 'off') return [];
   const listing = reader(gh, 1, maxPages);

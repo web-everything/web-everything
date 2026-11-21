@@ -5933,3 +5933,22 @@ contract. Set `cliMain` in `prFileContract` for callable entries so repeated arg
 the loaded graph. Resetting the entire daemon graph twice inside the CLI test exceeded its
 60-second deadline on a coverage shard. Keep the file/standalone output comparison and zero-GitHub
 assertions intact; consumers without callable entries retain the fresh-import path.
+
+
+## Change-evidence merge-time snapshots
+
+`change-evidence-writer.test.mjs` pins #7289's clause evidence and exercises wrong-app
+checks, policy kind/tier exclusions, self-review, unrelated SHA markers, incomplete
+restamps, revocation, post-merge backfills, corrupt persisted statements, lock contention
+and the dry-run drain hook. Run this file through heavy admission. The shipped merge
+policy lists check App IDs/slugs and review producer logins. Historical v0.1 policies
+without these fields retain the pinned GitHub Actions and reviewer/merger defaults;
+explicit empty lists trust nobody. Review producers must also be distinct from the author.
+Acceptance SHA binding uses its own reviewed-sha plus a matching prevention marker,
+never time proximity alone. Legacy rebase carries remain asserted: complete markers and
+an earlier acceptance are required, but #7289 has different diff/contribution hashes and
+cannot prove content preservation or bind a unique review ID without a protocol change.
+An immutable incoming batch is persisted before the writer lock, then transferred into
+the pending ledger under lock so confirmed merges survive contention. Existing statement
+files are reconciled against freshly collected subject, policy, clauses and verdict before
+indexing or retirement; mismatches stay pending for operator inspection and backfill.

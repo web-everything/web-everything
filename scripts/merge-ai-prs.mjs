@@ -8214,7 +8214,7 @@ export async function main(argv, { env = process.env, stdout = process.stdout, e
   // Capability refusal skips that work, so it must also keep the follow-ups pending for the operator.
   const queueFollowUpsClean = !localWriteRefusal && (!landedLocal || localSynced) && !numbered?.warning &&!(resolveOnLandReport.failed || []).length && !derived.warning && !(derived.failed || []).length;
   mergeStrategy.confirmQueueFollowUps(queueFollowUps, { complete: queueFollowUpsClean });
-  try { await writeChangeEvidenceForMerged({ merged, queueFollowUps }); }
+  if (!DRY_RUN) try { await writeChangeEvidenceForMerged({ merged, queueFollowUps }); }
   catch (error) { process.stderr.write(`change-evidence-missing: ${String(error.message).replace(/[\x00-\x1f\x7f-\x9f]/g, ' ')}\n`); }
 
   // #2222 — a healed tip is a PENDING rebuild (CI re-running on the renumbered tree), so it counts as progress

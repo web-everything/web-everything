@@ -20,6 +20,7 @@
       "acceptKinds": [
         "ci-check"
       ],
+      "trustedProducers": [{ "id": 15368, "slug": "github-actions" }],
       "requiredChecks": [
         "test",
         "smoke",
@@ -31,6 +32,7 @@
     },
     "reviewed": {
       "required": true,
+      "trustedProducers": ["plateau-reviewer[bot]", "plateau-merger[bot]"],
       "description": "an accepted independent review covers the final head (a drain re-stamp after a content-preserving rebase counts)",
       "acceptKinds": [
         "review-verdict",
