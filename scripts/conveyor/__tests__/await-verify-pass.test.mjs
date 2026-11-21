@@ -4,6 +4,9 @@ import { execFileSync } from 'node:child_process';
 import { mkdtempSync, writeFileSync, rmSync, lstatSync, existsSync, utimesSync, readdirSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+// Load the cyclic dispatch graph during collection so default IO construction does not
+// cold-import it inside a timed test (see docs/agent/testing.md, drain fixture imports).
+import '../../operations/dispatch-abort.mjs';
 import { computeWorkingTreeHash } from '../../lib/verify-lane-gate.mjs';
 import { verifyFinishBody, verificationInfrastructureFailure } from '../../lib/lane-verify.mjs';
 import { laneGitHardeningEnv, hardenLaneGitArgs, laneFilterDrivers, LANE_CONFIG_LIST_ARGS, LANE_GIT_CONFIG_PINS } from '../../lib/lane-git-hardening.mjs';

@@ -107,7 +107,8 @@ describe('Carbon promotion settings and advisory guards', () => {
     vi.stubEnv('WE_REVIEW_SHADOW_AGY_PROMOTED', 'true');
     const selectedModel = carbon ? 'gemini-4-carbon-high' : model;
     const carbonShadow = carbon && mode === 'shadow';
-    const enabled = Number(geminiCap) > 0 && (!carbonShadow || Number(carbonCap) > 0);
+    // R1062a: a Carbon shadow ignores the live Gemini cap and follows only its own switch
+    const enabled = carbonShadow ? Number(carbonCap) > 0 : Number(geminiCap) > 0;
     const result = await run([{ ...ok, servedModel: selectedModel }], { mode, model: selectedModel, onEscape: 'skip' });
     expect(result.models).toEqual(enabled ? [selectedModel] : []);
     if (!enabled) {
@@ -145,10 +146,9 @@ describe('Carbon promotion settings and advisory guards', () => {
 
     const carbonModel = 'gemini-4-carbon-high';
     const carbon = await run([{ ...ok, servedModel: carbonModel }], { model: carbonModel });
-    expect(carbon.models).toEqual([]);
+    // R1062a: a Carbon shadow sits outside the live agy-gemini cap
+    expect(carbon.models).toEqual([carbonModel]);
     expect(carbon.value.findings).toEqual(claudeAnswer.findings);
-    expect(carbon.rows[0]).toMatchObject({ model: carbonModel, status: 'skipped', verdictAgree: null });
-    expect(carbon.value.shadow.reasons).toEqual(['agy-gemini seat cap 0']);
   });
   it.each(['claude', 'skip'])('skips counted Carbon at cap zero with onEscape=%s and never uses its answer', async onEscape => {
     vi.stubEnv('WE_REVIEW_SEAT_CAP_AGY_GEMINI', '0');
