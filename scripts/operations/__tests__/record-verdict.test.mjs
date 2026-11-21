@@ -44,7 +44,7 @@ describe('the declaration', () => {
   it('takes a run id and NOT a PR number — the subject is read, never retyped', () => {
     const decl = ops(() => ({ record: run(), body: 'x' }));
     expect(decl.name).toBe(RECORD_VERDICT_OP);
-    expect(Object.keys(decl.input)).toEqual(['runId', 'to', 'actor', 'operatorInstruction', 'repoRoot']);
+    expect(Object.keys(decl.input)).toEqual(['runId', 'to', 'actor', 'operatorInstruction', 'expectedHead', 'repoRoot']);
     expect(Object.keys(decl.input)).not.toContain('pr');
     expect(Object.keys(decl.input)).not.toContain('repo');
   });
@@ -116,6 +116,22 @@ describe('buildRequest — the applier\'s rules, applied here', () => {
   });
 
   // The applier's own refusals reach the caller unchanged — not re-worded, not re-derived.
+  it('carries the explicitly approved head into a clearance request', () => {
+    const expectedHead = 'Ab'.repeat(20);
+    const out = buildRequest({ facts: { ...facts, expectedHead: 'b'.repeat(40) }, to: 'clear-human', body: 'b', actor: 'operator',
+      operatorInstruction: 'clear this head', expectedHead }, validateRequest);
+    expect(out.request.expectedHead).toBe(expectedHead);
+    expect(validateRequest(out.request).ok).toBe(true);
+  });
+
+  it.each([undefined, '', 'a'.repeat(39), 'g'.repeat(40), `${'a'.repeat(40)}\n`])(
+    'refuses an absent or malformed approved head (%j)', (expectedHead) => {
+      expect(() => buildRequest({ facts: { ...facts, expectedHead: 'b'.repeat(40) },
+        to: 'clear-human', body: 'b', actor: 'operator', operatorInstruction: 'clear it', expectedHead },
+      validateRequest)).toThrow(/expectedHead/);
+    },
+  );
+
   it('surfaces the APPLIER\'s refusal for a clear-human with no operator instruction', () => {
     expect(() => buildRequest({ facts, to: 'clear-human', body: 'b', actor: 'a' }, validateRequest)).toThrow(/operatorInstruction/);
   });

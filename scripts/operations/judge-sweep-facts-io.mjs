@@ -197,7 +197,7 @@ export function createJudgeSweepFactsReader({ gh = operatorGh, now = () => Date.
   readStallThresholds = resolveStallThresholds,
   checkoutState = readCheckoutState, readFresh = readFromFreshOrigin,
   cardReadable = ref => referralCardReadable(ref, rootDir(), { readOnPr: () => {
-    // Remote card verification would break this operation's list + comments-only call budget.
+    // Remote card verification would break this operation's bounded evidence call budget.
     throw failure('remote referral card requires operator verification');
   } }),
 } = {}) {
@@ -225,7 +225,8 @@ export function createJudgeSweepFactsReader({ gh = operatorGh, now = () => Date.
       return String(gh(args, { encoding: 'utf8', timeout: 60_000, maxBuffer: 32 * 1024 * 1024 }));
     };
     const argv = listArgv({ repo });
-    argv[argv.length - 1] += ',baseRefOid,updatedAt,files,changedFiles,author,assignees,body,createdAt,statusCheckRollup,isDraft';
+    // Assignees supply ownership; heavy evidence is read only for cap-near PRs below.
+    argv[argv.length - 1] += ',assignees,isDraft';
     const listing = JSON.parse(boundedGh(argv));
     if (!Array.isArray(listing) || listing.length >= LIST_LIMIT) throw failure('open PR listing incomplete (limit 200); use an exhaustive operator listing');
     let ledger = [], fixRows = [], jobs = [];
@@ -254,10 +255,6 @@ export function createJudgeSweepFactsReader({ gh = operatorGh, now = () => Date.
       const liveJobs = jobs.filter(j => j.repo === repo && j.pr === p.number);
       const fixerRunning = liveJobs.some(j => ['fix-run', 'ci-heal'].includes(j.kind));
       const owner = p.assignees[0]?.login ?? (liveJobs.length ? liveJobs[0].kind : null);
-      const inCi = reduceCheckState((p.statusCheckRollup ?? []).map(c => c.status ? c : {
-        ...c, name: c.context, status: c.state === 'PENDING' ? 'IN_PROGRESS' : 'COMPLETED',
-        conclusion: c.state === 'ERROR' ? 'failure' : String(c.state ?? '').toLowerCase(),
-      })).state === 'pending';
       const evidenceErrors = [...errors];
       const unscopedWorker = jobs.some(j => j.pr === p.number && !j.repo);
       if (unscopedWorker) evidenceErrors.push('worker repository unknown');
@@ -274,11 +271,10 @@ export function createJudgeSweepFactsReader({ gh = operatorGh, now = () => Date.
       }
       const lastDispatch = fixes.find(r => ['ci-heal', 'fix', 'rearm'].includes(r.kind));
       const minutesSince = at => Number.isFinite(Date.parse(at)) ? Math.max(0, (start - Date.parse(at)) / 60_000) : null;
-      const lastCommit = Array.isArray(p.commits) ? p.commits.at(-1) : null;
       const result = { number: p.number, title: p.title, labels, headSha, round, cap: baseCap,
         infraFailStreak: errors.includes('fix-loop ledger unreadable') ? null : infraFailStreak,
         isDraft: typeof p.isDraft === 'boolean' ? p.isDraft : null,
-        minutesSinceHeadChange: minutesSince(lastCommit?.committedDate),
+        minutesSinceHeadChange: null,
         minutesSinceFixDispatch: minutesSince(lastDispatch?.at),
         redTeam: { state: 'unknown', latestResultId: null, latestOutcome: null }, latestVerdict: null,
         suspendedReferralRun: null, openReferrals: null, openSendBacks: null, lastFixLoop, humanRequired: null,
@@ -287,11 +283,48 @@ export function createJudgeSweepFactsReader({ gh = operatorGh, now = () => Date.
         minutesSinceUpdate: Math.max(0, (start - Date.parse(p.updatedAt)) / 60_000),
         fixerRunning: errors.includes('live jobs unreadable') || unscopedWorker ? null : fixerRunning,
         owner: (errors.includes('live jobs unreadable') || unscopedWorker) && !owner ? 'unknown' : owner,
-        inCi, evidenceErrors, verdictHistory: [] };
+        inCi: null, detail: 'skipped', evidenceErrors, verdictHistory: [] };
+      // Unknown rounds must be inspected. Labels cannot exempt a PR from detail reads.
+      if (round !== null && round < baseCap - 2) {
+        evidenceErrors.push('detail skipped below cap-near threshold; inspect PR evidence and rerun a narrower/operator query');
+      } else {
+        try {
+          const detail = JSON.parse(boundedGh(['pr', 'view', String(p.number), '--repo', repo, '--json',
+            'headRefOid,baseRefOid,files,changedFiles,body,createdAt,statusCheckRollup,commits']));
+          if (!/^[a-f0-9]{40}$/i.test(detail?.headRefOid ?? '') || detail.headRefOid.toLowerCase() !== headSha) {
+            throw failure('detail head identity differs from listing');
+          }
+          if (typeof detail.body !== 'string' || !Number.isFinite(Date.parse(detail.createdAt))
+            || !Array.isArray(detail.statusCheckRollup) || !Array.isArray(detail.commits)) {
+            throw failure('detail fields incomplete');
+          }
+          // Retain selection and ownership from the list, accepting only the detail fields requested.
+          p = { ...p, baseRefOid: detail.baseRefOid, files: detail.files, changedFiles: detail.changedFiles,
+            body: detail.body, createdAt: detail.createdAt, statusCheckRollup: detail.statusCheckRollup, commits: detail.commits };
+          result.detail = 'read';
+          const lastCommit = Array.isArray(p.commits) ? p.commits.at(-1) : null;
+          if (lastCommit) {
+            if (typeof lastCommit.oid === 'string' && lastCommit.oid.toLowerCase() === headSha) {
+              result.minutesSinceHeadChange = minutesSince(lastCommit.committedDate);
+            } else evidenceErrors.push('last commit does not identify the listed head');
+          }
+          const checks = reduceCheckState(p.statusCheckRollup.map(c => c?.status ? c : {
+            ...c, name: c?.context, status: c?.state === 'PENDING' ? 'IN_PROGRESS' : 'COMPLETED',
+            conclusion: c?.state === 'ERROR' ? 'failure' : String(c?.state ?? '').toLowerCase(),
+          }));
+          if (checks.counts.unreadable) evidenceErrors.push('status check evidence unreadable');
+          else result.inCi = checks.state === 'pending';
+        } catch {
+          result.detail = 'error';
+          evidenceErrors.push('PR detail unreadable, head changed, or budget exhausted; inspect PR evidence and rerun a narrower/operator query');
+        }
+      }
+      // Comment verification and local suspended-run inspection are independent of detail availability.
       // Mandatory referrals can appear only in comments, even while a fixer or CI runs.
       const redTeamJudgmentLabel = labels.some(l => RED_TEAM_JUDGMENT_LABELS.has(l));
       try {
         const readCommentEvidence = () => {
+          if (calls >= MAX_CALLS) throw failure('128-call budget exhausted');
           const comments = readComments({ number: p.number, repo, exec: commentsExec });
           if (!Array.isArray(comments) || comments.some(c => typeof c?.body !== 'string' || !c.author?.login || !Number.isFinite(Date.parse(c.createdAt)))) throw failure('comments incomplete');
           return comments;
@@ -386,7 +419,7 @@ export function createJudgeSweepFactsReader({ gh = operatorGh, now = () => Date.
           }
         }
       } catch { evidenceErrors.push('suspended referral run evidence unreadable; inspect run store'); }
-      if (labels.includes('review:human')) {
+      if (result.detail === 'read' && labels.includes('review:human')) {
         try {
           // A retarget or base advance can change the net files without changing the head.
           // Unknown base identity cannot reuse a prior non-human result.

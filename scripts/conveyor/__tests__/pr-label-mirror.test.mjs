@@ -5,7 +5,7 @@ import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { planMirror, renderPlan, runMirrorReport, runMirrorApply, planLabelInputRows, readLabelTimeline, addApplyLabel, main, readSelfLogin } from '../pr-label-mirror.mjs';
 import { buildDerivedRows } from '../../review-ledger-check.mjs';
-import { buildVerdictRecord, buildLedgerEvent } from '../../lib/verdict-ledger.mjs';
+import { buildVerdictRecord, buildLedgerEvent, ledgerEventId } from '../../lib/verdict-ledger.mjs';
 import { derivePrState } from '../../lib/pr-state.mjs';
 import { deriveReferrals, ledgerFindingKey } from '../../lib/pr-state/referrals.mjs';
 import { RULING_NEEDED_LABEL_META } from '../../lib/ruling-ledger.mjs';
@@ -395,6 +395,62 @@ describe('#5649 runMirrorApply', () => {
 
 describe('#5649 planLabelInputRows', () => {
   const base = { repo: REPO, pr: 7, selfLogin: 'me' };
+  it.each(['2026-10-12T11:00:00Z', '2026-10-12T10:00:00Z'])('uses the highest numeric event id for the latest label change (time %s)', time => {
+    const items = [
+      { ...tl('review:human', 'added', 'op', time), id: 'LE_lADODvxD1M8AAAAE1v8yAQ', eventId: '9007199254740993' },
+      { ...tl('review:human', 'removed', 'op'), id: 'UNLE_lADODvxD1M8AAAAE1v8yAA', eventId: '9007199254740992' },
+    ];
+    expect(planLabelInputRows({ ...base, items, liveLabels: ['review:human'] })).toMatchObject([
+      { change: 'added', timelineId: 'LE_lADODvxD1M8AAAAE1v8yAQ' },
+    ]);
+  });
+  it.each([undefined, 'opaque', '12.5', '', '42\n', '0x2a'])('falls back safely for opaque node ids with invalid eventId %s', eventId => {
+    const items = [
+      { ...tl('review:human', 'removed', 'op', '2026-10-12T11:00:00Z'), id: 'UNLE_opaque', eventId },
+      { ...tl('review:human', 'added', 'op', '2026-10-12T10:00:00Z'), id: 'LE_opaque', eventId: '42' },
+    ];
+    expect(planLabelInputRows({ ...base, items, liveLabels: [] })).toMatchObject([{ change: 'removed', timelineId: 'UNLE_opaque' }]);
+    items[1].createdAt = items[0].createdAt;
+    expect(planLabelInputRows({ ...base, items, liveLabels: ['review:human'] })).toMatchObject([{ change: 'added' }]);
+  });
+  it('uses database id order for a reversed removal/re-add baseline so an older approval cannot clear the new hold', () => {
+    const at = '2026-10-12T12:00:00Z';
+    const approval = buildLedgerEvent({ type: 'approval', repo: REPO, pr: 7, at, source: 'test', approval: 'clear-human' });
+    const items = [
+      { ...tl('review:human', 'added', 'op', at), id: 'LE_new', eventId: '102' },
+      { ...tl('review:human', 'removed', 'op', at), id: 'UNLE_old', eventId: '101' },
+    ];
+    const [hold] = planLabelInputRows({ ...base, items, liveLabels: ['review:human'], events: [approval], observedEvents: [] });
+    expect(hold.clearanceBaseline).toEqual([ledgerEventId(approval)]);
+    expect(derivePrState([approval, hold], { ...FACTS, repo: REPO, pr: 7 }).holds.map(h => h.code))
+      .toContain('label-input:review:human');
+  });
+  it('queries supported label-event fields and handles opaque ids without databaseId', async () => {
+    const read = args => {
+      const query = args.find(arg => arg.startsWith('query='));
+      // Pin the entire event selections: GitHub exposes no databaseId on either event type.
+      for (const type of ['LabeledEvent', 'UnlabeledEvent']) {
+        expect(query).toContain(`... on ${type} { id createdAt actor { __typename login } label { name } }`);
+      }
+      expect(query).not.toContain('databaseId');
+      return JSON.stringify({ data: { repository: { pullRequest: { timelineItems: {
+        pageInfo: { hasPreviousPage: false }, nodes: [
+          { __typename: 'UnlabeledEvent', id: 'UNLE_lADODvxD1M8AAAAE1v8yAA', createdAt: '2026-10-12T12:00:00Z',
+            actor: { login: 'op', __typename: 'User' }, label: { name: 'review:human' } },
+          { __typename: 'LabeledEvent', id: 'LE_lADODvxD1M8AAAAE1v8yAQ', createdAt: '2026-10-12T12:00:00Z',
+            actor: { login: 'op', __typename: 'User' }, label: { name: 'review:human' } },
+        ],
+      } } } } });
+    };
+    const timeline = await readLabelTimeline({ repo: REPO, pr: 7, read });
+    expect(timeline.status).toBe('ok');
+    expect(timeline.items.map(({ id, eventId }) => ({ id, eventId }))).toEqual([
+      { id: 'UNLE_lADODvxD1M8AAAAE1v8yAA', eventId: undefined },
+      { id: 'LE_lADODvxD1M8AAAAE1v8yAQ', eventId: undefined },
+    ]);
+    expect(planLabelInputRows({ ...base, items: timeline.items, liveLabels: ['review:human'] }))
+      .toMatchObject([{ change: 'added', timelineId: 'LE_lADODvxD1M8AAAAE1v8yAQ' }]);
+  });
   it('only the latest change per label counts, and only while it matches the live labels', () => {
     const items = [tl('review:human', 'added', 'op', '2026-10-12T09:00:00Z'), tl('review:human', 'removed', 'op', '2026-10-12T09:30:00Z')];
     expect(planLabelInputRows({ ...base, items, liveLabels: ['review:human'] })).toEqual([]); // stale: label is back, last change was a removal
@@ -446,13 +502,13 @@ describe('#5649 planLabelInputRows', () => {
   });
   it('distinct same-second timeline IDs survive deduplication and a retry retains the original baseline', () => {
     const approval = buildLedgerEvent({ type: 'approval', repo: REPO, pr: 7, at: '2026-10-12T12:00:00.100Z', source: 'review-set-label', approval: 'clear-human' });
-    const first = { ...tl('review:human', 'added', 'operator', '2026-10-12T12:00:00Z'), id: 'event-one' };
+    const first = { ...tl('review:human', 'added', 'operator', '2026-10-12T12:00:00Z'), id: '1' };
     const opts = { ...base, liveLabels: ['review:human'], items: [first] };
     const [old] = planLabelInputRows(opts);
     expect(planLabelInputRows({ ...opts, events: [approval, old] })).toEqual([]);
-    const next = { ...first, id: 'event-two' };
+    const next = { ...first, id: '2' };
     const [newHold] = planLabelInputRows({ ...opts, items: [first, next], events: [approval, old] });
-    expect(newHold.timelineId).toBe('event-two');
+    expect(newHold.timelineId).toBe('2');
     const state = derivePrState([approval, old, newHold], { ...FACTS, repo: REPO, pr: 7, now: Date.parse('2026-10-12T13:00:00Z') }, {});
     expect(state.holds.map(h => h.code)).toContain('label-input:review:human');
     const { timelineId: _id, clearanceBaseline: _baseline, ...legacy } = old;
