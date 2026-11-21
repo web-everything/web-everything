@@ -4,6 +4,7 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { ghRepoSlug } from '../../../lib/constellation-repos.mjs';
 
 const root = fileURLToPath(new URL('../../../../', import.meta.url));
 
@@ -16,11 +17,11 @@ export function probe(checkout) {
       import { mkdirSync, writeFileSync } from 'node:fs';
       import { join } from 'node:path';
       import { pathToFileURL } from 'node:url';
-      const [checkout, dir] = process.argv.slice(1);
+      const [checkout, dir, repo] = process.argv.slice(1);
       const { createActionStore, CoordinationUnavailableError } = await import(
         pathToFileURL(join(checkout, 'scripts/operations/action-store.mjs')));
-      const resource = 'web-everything/web-everything#pr:2345';
-      const other = 'web-everything/web-everything#pr:7';
+      const resource = repo + '#pr:2345';
+      const other = repo + '#pr:7';
       const alias = 'chalbert/web-everything#pr:2345';
       const stale = (store, name) => {
         const path = join(store.dir, name);
@@ -49,7 +50,7 @@ export function probe(checkout) {
         throws(() => store.claim({ resource, kind: 'fix', owner: 'replay' }), CoordinationUnavailableError);
         strictEqual(store.attempts(resource).length, 0, 'refusal must allocate no attempt');
       });
-    `, checkout, dir], { encoding: 'utf8', timeout: 15_000, maxBuffer: 1024 * 1024 });
+    `, checkout, dir, ghRepoSlug('we')], { encoding: 'utf8', timeout: 15_000, maxBuffer: 1024 * 1024 });
     return { violations: child.status === 0 ? [] : [
       `resource-scoped stale-directory replay failed: ${child.error?.message ?? child.stderr ?? child.signal ?? child.status}`,
     ] };
