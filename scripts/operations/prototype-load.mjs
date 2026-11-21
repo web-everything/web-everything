@@ -170,8 +170,10 @@ export function canonicalAuditEvidence(records, sha, covers = () => true, liveFp
   // Ask covers() once per base: a flaky second answer must never let the pass loop disagree with this check.
   const coverMemo = new Map();
   const covered = (base) => { if (!coverMemo.has(base)) coverMemo.set(base, !!covers(base)); return coverMemo.get(base); };
-  const ruled = (record) => {
-    const gate = auditOptions.ruledWeakened;
+  // Admission may supply several independently validated exact-head rulings.
+  // Preserve the single-ruling contract for existing readiness callers.
+  const rulings = Array.isArray(auditOptions.ruledWeakened) ? auditOptions.ruledWeakened : [auditOptions.ruledWeakened];
+  const ruled = (record) => rulings.some(gate => {
     return gate?.ruledWeakened && record.questionHash === QUESTION_HASH
       // The ruled audit is the gate record's own (exact sha), or the carried audit of the same net diff: readiness
       // appended by an earlier carry names the NEW sha, and must keep binding to the audit it was carried from.
@@ -180,7 +182,7 @@ export function canonicalAuditEvidence(records, sha, covers = () => true, liveFp
       && Array.isArray(record.findings)
       && JSON.stringify(record.findings) === JSON.stringify(gate.ruledWeakened.findings)
       && covered(record.base);
-  };
+  });
   // Unruled own WEAKENED stops before git; a matching ruling still needs canonical base coverage.
   if (own.some((d) => d.record.verdict === 'WEAKENED' && !ruled(d.record))) return { ok: false, reason: 'weakened' };
   // Round 3: a live-head WEAKENED that findAudit cannot use (contradictory findings, unparsable time) must not vanish

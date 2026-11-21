@@ -110,35 +110,28 @@ export function checkCanonicalAuditForOpen({ repo = process.cwd(), ref, sha, env
     const fp = liveFingerprint(records);
     evidence = canonicalAuditEvidence(records, fullSha, covers, fp);
     if (!evidence.ok && evidence.reason === 'weakened') {
+      const rulings = [];
       for (const entry of config.ruledWeakened) {
-        // Preserve the existing exact-head waiver path; historical waivers are checked separately below.
-        if (entry.ref !== ref || !validSha(entry.sha) || entry.sha.toLowerCase() !== fullSha
+        if (entry.ref !== ref || !validSha(entry.sha)
           || !/^R\d+(?:\+R\d+)*$/.test(entry.ruling) || !Array.isArray(entry.findings)
           || !entry.findings.length || !entry.findings.every(f => typeof f === 'string' && f.trim())) continue;
-        const waived = canonicalAuditEvidence(records, fullSha, covers, fp, { ruledWeakened: {
-          ruledWeakened: { ruling: entry.ruling, findings: entry.findings }, record: { sha: fullSha, fingerprint: null },
-        } });
-        if (waived.ok) { evidence = waived; break; }
-      }
-    }
-    if (!evidence.ok && evidence.reason === 'weakened') {
-      for (const entry of config.ruledWeakened) {
-        if (entry.ref !== ref || !validSha(entry.sha) || entry.sha.toLowerCase() === fullSha
-          || !/^R\d+(?:\+R\d+)*$/.test(entry.ruling) || !Array.isArray(entry.findings)
-          || !entry.findings.length || !entry.findings.every(f => typeof f === 'string' && f.trim())
-          || !carriesAcross(entry.fingerprint, fp)) continue;
-        const carry = carryFor(entry.sha.toLowerCase());
-        if (!carry.ok || !carriesAcross(entry.fingerprint, carry.fingerprint)) continue;
-        const waived = canonicalAuditEvidence(records, fullSha, covers, carry.fingerprint, { ruledWeakened: {
+        if (entry.sha.toLowerCase() !== fullSha) {
+          if (!carriesAcross(entry.fingerprint, fp)) continue;
+          const carry = carryFor(entry.sha.toLowerCase());
+          if (!carry.ok || !carriesAcross(entry.fingerprint, carry.fingerprint)) continue;
+        }
+        rulings.push({
           ruledWeakened: { ruling: entry.ruling, findings: entry.findings },
           // Bind this ruling to its own head; a fingerprint-wide ruling would also waive sibling vetoes.
           record: { sha: entry.sha, fingerprint: null },
-        } });
-        // Only the named historical verdict may be admitted by this waiver.
-        if (waived.ok && waived.record.head.toLowerCase() === entry.sha.toLowerCase()
-          && carriesAcross(waived.record.fingerprint, carry.fingerprint)) {
-          evidence = waived; carryRuling = entry.ruling; break;
-        }
+        });
+      }
+      // All valid waivers participate in the same veto evaluation. Never combine
+      // findings or remove records: canonical precedence still judges every audit.
+      evidence = canonicalAuditEvidence(records, fullSha, covers, fp, { ruledWeakened: rulings });
+      if (evidence.ok && evidence.record.verdict === 'WEAKENED') {
+        carryRuling = rulings.find(gate => gate.record.sha.toLowerCase() === evidence.record.head.toLowerCase()
+          && JSON.stringify(gate.ruledWeakened.findings) === JSON.stringify(evidence.record.findings))?.ruledWeakened.ruling ?? null;
       }
     }
   } catch (e) {

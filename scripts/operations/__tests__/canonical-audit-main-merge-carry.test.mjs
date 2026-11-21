@@ -110,13 +110,39 @@ describe('canonical main merge carry with real git objects', () => {
     expect(result.reason).toBe(fingerprint === 'bad' ? 'canonical-audit-missing' : 'canonical-audit-weakened');
     expect(result.carried).toBeUndefined();
   });
-  it('accepts an intermediate WEAKENED without a fingerprint only with its own matching waiver', () => {
+  it.each([false, true])('accepts separately waived intermediate WEAKENED audits (fingerprinted: %s)', fingerprinted => {
     const f = fixture({ hops: 2 });
     const intermediate = f.git('rev-parse', 'HEAD~1');
-    f.records.push({ ...f.audit, head: intermediate, fingerprint: undefined, at: '2026-11-20T01:00:00Z' });
+    f.records.push({ ...f.audit, head: intermediate, fingerprint: fingerprinted ? f.audit.fingerprint : undefined,
+      findings: ['intermediate finding'], at: '2026-11-20T01:00:00Z' });
     expect(f.run().ok).toBe(false);
-    f.waivers.push({ ...f.waiver, sha: intermediate });
+    f.waivers.push({ ...f.waiver, sha: intermediate, ruling: 'R124', findings: ['intermediate finding'] });
     expect(f.run().ok).toBe(true);
+    f.waivers.shift();
+    expect(f.run()).toMatchObject({ ok: false, reason: 'canonical-audit-weakened' });
+  });
+  it('honors exact-head waivers together across bases without pooling findings', () => {
+    const f = fixture();
+    f.records.push({ ...f.audit, head: f.head(), base: f.base, findings: ['first finding'], at: '2026-11-20T01:00:00Z' },
+      { ...f.audit, head: f.head(), base: f.main, findings: ['second finding'], at: '2026-11-20T01:00:00Z' });
+    f.waivers.push({ ...f.waiver, sha: f.head(), ruling: 'R124', findings: ['first finding', 'second finding'] });
+    expect(f.run().ok).toBe(false);
+    f.waivers.at(-1).findings = ['first finding'];
+    expect(f.run().ok).toBe(false);
+    f.waivers.push({ ...f.waiver, sha: f.head(), ruling: 'R125', findings: ['second finding'] });
+    const result = f.run();
+    expect(result).toMatchObject({ ok: true, record: f.records.at(-1) });
+    expect(result.carried).toBeUndefined();
+  });
+  it('retains an unwaived sibling veto when both merge-chain audits are waived', () => {
+    const f = fixture({ hops: 2 });
+    const intermediate = f.git('rev-parse', 'HEAD~1');
+    f.records.push({ ...f.audit, head: intermediate, findings: ['intermediate finding'], at: '2026-11-20T01:00:00Z' });
+    f.waivers.push({ ...f.waiver, sha: intermediate, ruling: 'R124', findings: ['intermediate finding'] });
+    expect(f.run()).toMatchObject({ ok: true, record: f.records.at(-1), carried: { from: intermediate, ruling: 'R124' } });
+    const sibling = f.git('commit-tree', f.git('rev-parse', `${f.A}^{tree}`), '-p', f.base, '-m', 'sibling');
+    f.records.push({ ...f.audit, head: sibling, at: '2026-11-20T02:00:00Z' });
+    expect(f.run()).toMatchObject({ ok: false, reason: 'canonical-audit-weakened' });
   });
   it.each([undefined, true])('ignores an intermediate WEAKENED for an unaccepted question hash (fingerprinted: %s)', fingerprinted => {
     const f = fixture({ hops: 2, pass: true });

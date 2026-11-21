@@ -32,7 +32,7 @@ const isoTime = at => typeof at === 'string'
   && /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})$/.test(at) ? Date.parse(at) : NaN;
 
 /** Admission-time revocations for every waiver layer. Unreadable evidence revokes all waivers. */
-export function withdrawnRevocations({ env = process.env, fs = nodeFs, warn = console.warn } = {}) {
+export function withdrawnRevocations({ env = process.env, fs = nodeFs, warn = console.warn, scopeRef, warnOther = console.warn } = {}) {
   // Use the same HOME validation as the store; never fall back to an ambient home.
   storePath(env);
   const path = join(env.HOME, 'workspace/.operations/handoff/waiver-requests.jsonl');
@@ -46,18 +46,42 @@ export function withdrawnRevocations({ env = process.env, fs = nodeFs, warn = co
     return () => true;
   }
   const withdrawn = new Map();
-  body.split(/\r?\n/).forEach((line, i) => {
-    if (!line.trim()) return;
+  const lines = body.split(/\r?\n/);
+  // A damaged line only blocks when it names scopeRef or its ref cannot be read (fail closed); others use warnOther.
+  const damaged = (i, count, request) => {
+    const named = request && typeof request === 'object' && !Array.isArray(request) && nonblank(request.ref) && !/[\r\n]/.test(request.ref);
+    const other = scopeRef !== undefined && named && bareRef(request.ref) !== bareRef(scopeRef);
+    const span = count > 1 ? `lines ${i + 1}-${i + count}` : `line ${i + 1}`;
+    (other ? warnOther : warn)(`WARNING: waiver request log ${span}: malformed JSON or invalid request; ignored`);
+  };
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+    if (!line.trim()) continue;
+    let count = 1, parsed, rejoined = false;
+    try { parsed = JSON.parse(line); } catch {
+      // A record split by a raw newline inside a string: rejoin with an escaped newline (at most 3 following lines).
+      for (let k = 1; k <= 3 && i + k < lines.length; k++) {
+        try { parsed = JSON.parse(lines.slice(i, i + k + 1).join('\\n')); count = k + 1; break; } catch { /* keep trying */ }
+      }
+      // A rejoined record only attributes the damage (which ref it blocks); it is never an approval or a revocation.
+      if (parsed !== undefined) rejoined = true;
+    }
+    const first = i;
+    i += count - 1;
     try {
-      const request = JSON.parse(line);
+      if (parsed === undefined || rejoined) throw Error('unparseable');
+      let request = parsed;
+      // Legacy withdrawal shape {withdrawn:true,ref,sha,reason}: exactly this shape reads as WITHDRAWN.
+      if (request && typeof request === 'object' && !Array.isArray(request)
+        && request.withdrawn === true && !Object.hasOwn(request, 'ruling')) request = { ...request, ruling: 'WITHDRAWN' };
       if (!request || typeof request !== 'object' || Array.isArray(request)
         || !nonblank(request.ref) || typeof request.sha !== 'string' || !/^[a-f0-9]{40}$/i.test(request.sha)
         || !nonblank(request.ruling)) throw Error('invalid request');
-      if (request.ruling !== 'WITHDRAWN') return;
+      if (request.ruling !== 'WITHDRAWN') continue;
       const key = revocationKey(request), time = isoTime(request.at);
       withdrawn.set(key, Math.max(withdrawn.get(key) ?? -Infinity, Number.isFinite(time) ? time : Infinity));
-    } catch { warn(`WARNING: waiver request log line ${i + 1}: malformed JSON or invalid request; ignored`); }
-  });
+    } catch { damaged(first, count, parsed); }
+  }
   return entry => {
     const time = withdrawn.get(revocationKey(entry));
     return time !== undefined && !(isoTime(entry.at) > time);
