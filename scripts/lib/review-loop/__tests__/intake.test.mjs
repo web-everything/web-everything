@@ -67,7 +67,11 @@ it('CLI pins numstat and lists would-splits read-only for one PR and all open PR
     expect(output).toEqual(['fail split-required lines=585 round=1', '#7181 fail split-required lines=585 round=1']);
     expect(reader).toHaveBeenCalledWith(7181, expect.objectContaining({ repo: 'frontier-ui/frontierui' }));
     expect(gh.mock.calls.every(([args]) => ['pr', 'repo'].includes(args[0]) && ['view', 'list'].includes(args[1]))).toBe(true);
-    await expect(main(['--open'], { gh: () => Array(1000).fill(pr), git })).rejects.toThrow('operator');
+    const prCalls = gh.mock.calls.filter(([args]) => args[0] === 'pr');
+    expect(prCalls.length).toBe(2);
+    expect(prCalls.every(([args]) => args[args.indexOf('--repo') + 1] === 'frontier-ui/frontierui')).toBe(true);
+    const full = args => args[0] === 'repo' ? { nameWithOwner: 'frontier-ui/frontierui' } : Array(1000).fill(pr);
+    await expect(main(['--open'], { gh: full, git })).rejects.toThrow('operator');
   } finally { reader.mockRestore(); process.exitCode = exitCode; }
 });
 

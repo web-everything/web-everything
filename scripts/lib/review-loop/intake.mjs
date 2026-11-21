@@ -77,10 +77,11 @@ export async function main(argv, { gh, git, log = console.log } = {}) {
   gh ??= args => { if (++calls > 128) throw Error('intake call budget exhausted; operator must inspect remaining PRs'); return JSON.parse(runGhSync(args, { encoding: 'utf8', timeout: 60000, maxBuffer: 8 * 1024 * 1024 })); };
   const number = argv.find(a => /^--pr=\d+$/.test(a))?.slice(5);
   const fields = 'number,headRefOid,baseRefName';
-  const prs = number ? [gh(['pr', 'view', number, '--json', fields])] : gh(['pr', 'list', '--state', 'open', '--limit', '1000', '--json', fields]);
-  if (!Array.isArray(prs) || prs.length >= 1000) throw Error('incomplete intake listing; operator must inspect open PRs');
   const { ghRepoSlug } = await import('../constellation-repos.mjs');
   const repo = ghRepoSlug(gh(['repo', 'view', '--json', 'nameWithOwner']).nameWithOwner);
+  const prs = number ? [gh(['pr', 'view', number, '--repo', repo, '--json', fields])]
+    : gh(['pr', 'list', '--repo', repo, '--state', 'open', '--limit', '1000', '--json', fields]);
+  if (!Array.isArray(prs) || prs.length >= 1000) throw Error('incomplete intake listing; operator must inspect open PRs');
   const params = readIntakeSettings();
   for (const pr of prs) {
     try { pr.comments = readCompletePrComments(pr.number, { gh, repo }); pr.round = sharedRoundAttempts(pr); }
