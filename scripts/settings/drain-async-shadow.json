@@ -1,0 +1,6 @@
+{
+  "$comment": "drain.asyncShadow: 'shadow' or 'off'. Read-only async-drain enqueue timing observation (R425; it never changes admission or enqueue decisions). Resolve explicit createAsyncShadow mode option, then WE_ASYNC_DRAIN (off|shadow), then this tool setting; an invalid value falls to the next layer and finally off. Shadow writes bounded rows (1 MB, 24 h retention) under <coordination>/drain-async-shadow/. Set to off to opt out.",
+  "drain": {
+    "asyncShadow": "shadow"
+  }
+}

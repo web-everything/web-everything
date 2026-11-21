@@ -2,6 +2,7 @@
 import { appendFileSync, mkdirSync, readFileSync, renameSync, statSync, unlinkSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { resolveCoordinationRoot } from '../operations/coordination-root.mjs';
+import { readSettings } from './settings-files.mjs';
 
 const keyOf = ({ repo, num, headSha }) => `${repo}#${num}@${headSha}`;
 const prKeyOf = ({ repo, num }) => `${repo}#${num}`;
@@ -28,10 +29,17 @@ export function summarize(lines) {
   };
 }
 
-/** WE_ASYNC_DRAIN defaults to off; set shadow explicitly to collect timing data. */
+const validMode = value => value === 'off' || value === 'shadow';
+const toolAsyncShadowMode = () => { try { return readSettings()?.drain?.asyncShadow; } catch { return undefined; } };
+
+/**
+ * Mode: explicit option, then WE_ASYNC_DRAIN, then the tool setting drain.asyncShadow (scripts/settings/
+ * drain-async-shadow.json, shadow); an invalid layer falls through, and nothing valid means off. Observation only.
+ */
 export function createAsyncShadow({
   env = process.env,
-  mode = env.WE_ASYNC_DRAIN || 'off',
+  toolMode = toolAsyncShadowMode(),
+  mode = [env.WE_ASYNC_DRAIN, toolMode].find(validMode) ?? 'off',
   dir = join(resolveCoordinationRoot({ env }), 'drain-async-shadow'),
   now = Date.now,
   maxBytes = 1_000_000,
