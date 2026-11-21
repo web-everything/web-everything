@@ -958,15 +958,36 @@ async function runCli() {
     return soakPrecheckAtOpen({ title: createParams.title, body: CREATE_BODY, files });
   }
 
+  // Read-only decision: does origin already hold exactly refSha at the lane ref? (shared by the dry-run preview and the real push step)
+  function pushSkipDecision() {
+    const remoteHeadRef = `refs/heads/${REF}`;
+    const remoteTipLine = tryGit(['ls-remote', REMOTE, remoteHeadRef]);
+    const remoteTipMatch = /^([0-9a-f]{40})\t([^\r\n]+)$/i.exec(remoteTipLine ?? '');
+    const remoteTip = remoteTipMatch?.[2] === remoteHeadRef ? remoteTipMatch[1] : null;
+    const validRefSha = /^[0-9a-f]{40}$/i.test(refSha);
+    // ls-remote reads only the FIRST fetch URL, while push goes to every push URL (pushurl, pushInsteadOf,
+    // or several remote.<name>.url values). Skip only when git itself resolves exactly one fetch URL and
+    // exactly one, identical, push URL. `remote get-url` applies insteadOf/pushInsteadOf rewrites and ignores
+    // a GIT_CONFIG override that `git config` alone would honour. Any read failure fails closed (never skip).
+    let splitPushConfig;
+    try {
+      const urls = args => gitC(['remote', 'get-url', ...args, '--all', REMOTE]).split('\n').map(s => s.trim()).filter(Boolean);
+      const fetchUrls = urls([]), pushUrls = urls(['--push']);
+      splitPushConfig = !(fetchUrls.length === 1 && pushUrls.length === 1 && fetchUrls[0] === pushUrls[0]);
+    } catch { splitPushConfig = true; }
+    return { remoteTip, validRefSha, alreadyPublished: validRefSha && remoteTip === refSha && !splitPushConfig };
+  }
+
   if (DRY_RUN) {
     const createArgs = buildCreateArgs(createParams);
+    const pushPreview = pushSkipDecision();
     const soak = soakCreatePrecheck();
     emit({
       repo: REPO, merged: false, reason: 'dry-run', ref: REF, base: BASE, method: METHOD,
       plan: [
         `node scripts/lint-locus-prefix.mjs ${buildLocusLintArgs({ root: REPO, range: `${REMOTE}/${BASE}..${refSha}` }).join(' ')}   # #2331 producer locus-prefix re-check (fail fast on the #2170 review-append leak) — swept in --root, the clone holding the commits (#3342)`,
         `soak precheck (if no PR exists yet): ${soak.ok ? soak.skipped || soak.reason : `REFUSE: ${soak.message}`}`,
-        `git push ${REMOTE} ${SRC}:refs/heads/${REF}   # publish the lane clone's ${SRC} (${refSha.slice(0, 8)}) to the lane ref`,
+        pushPreview.alreadyPublished ? `push skipped: ${REMOTE} already at ${refSha}` : `git push ${REMOTE} ${SRC}:refs/heads/${REF}   # publish the lane clone's ${SRC} (${refSha.slice(0, 8)}) to the lane ref`,
         prCreateBodyGuard(BODY).ok ? `gh ${createArgs.join(' ')}` : `REFUSE (if no PR exists yet): ${prCreateBodyGuard(BODY).reason}  # #2332 fail-fast — an existing PR for this head is exempt`,
         PLAN.waitForChecks ? 'poll: gh pr view <pr> mergeStateStatus + gh pr checks <pr> --required  (wait until green; abort on red)'
           : PLAN.mode === 'park' ? '(--park: skip check-wait — the PR is HELD for review, not landed by this run)'
@@ -1125,7 +1146,19 @@ async function runCli() {
     detail: ['all pre-push gates passed', ...info].join('\n') }, 0);
 
   // 2. Publish the source commit to the lane ref on origin (guard-safe: lane/*). Never force, no local branch.
-  try { gitC(['push', REMOTE, `${refSha}:refs/heads/${REF}`]); }
+  // Only an exact, readable remote tip can authorize skipping the guarded push.
+  // Failed/malformed remote reads retain the normal push path and its pre-push guard.
+  const { remoteTip, validRefSha, alreadyPublished } = pushSkipDecision();
+  if (alreadyPublished) {
+    process.stderr.write(`pr-land [${REPO}] · push skipped: ${REMOTE} already at ${refSha}\n`);
+  } else if (validRefSha && remoteTip) {
+    try { gitC(['merge-base', '--is-ancestor', remoteTip, refSha]); }
+    catch {
+      emit({ repo: REPO, merged: false, reason: 'push-failed',
+        detail: pushFailedDetail(`non-fast-forward: ${REMOTE}/${REF} (${remoteTip}) is ahead, diverged, or its ancestry cannot be verified`, { SRC, REF, REMOTE }) }, 3);
+    }
+  }
+  try { if (!alreadyPublished) gitC(['push', REMOTE, `${refSha}:refs/heads/${REF}`]); }
   catch (e) { emit({ repo: REPO, merged: false, reason: 'push-failed', detail: pushFailedDetail(e.message || e, { SRC, REF, REMOTE }) }, 3); }
 
   // 2b. (#2291 — pruned) The PRE-CHECK id-collision self-heal (#2222) that used to run here is now DEAD wiring:
