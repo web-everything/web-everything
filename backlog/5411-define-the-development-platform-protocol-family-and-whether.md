@@ -6,7 +6,7 @@ parent: "5407"
 status: open
 dateOpened: "2026-10-08"
 tags: []
-relatedTo: ["5409", "x25bedj"]
+relatedTo: ["5409", "8623"]
 ---
 
 # Define the development-platform protocol family and whether it shares the delivery protocol home

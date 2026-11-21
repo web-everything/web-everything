@@ -1,52 +1,60 @@
 ---
+bornAs: xcwzfo3
 kind: decision
 parent: "5407"
 status: open
 dateOpened: "2026-11-20"
 tags: [decision-filing, everstandards]
-relatedTo: ["5407", "634"]
+relatedTo: ["5407"]
 ---
 
-# Should WE use workflow profiles, with no expressions and Durable compensation?
+# What does Ship 0.1 cover: metrics shapes or protocols too?
 
 Operator ask (2026-11-20 20:59 ET): “note all as full decision item and run with preparation”.
 
-Decision id: D8b (decisions page, 2026-11-20 20:58 ET)
+Decision id: D13 (decisions page, 2026-11-20 20:58 ET)
 Placement: everstandards
 move-to: everstandards
 
 ## Digest
 
-Affirm three compatible defaults: WE Workflow/Lifecycle become profiles or pointers; the shared core has no expression language; Durable includes compensation. WE keeps its repo and format.
+Keep Ship 0.1 to delivery metrics shapes—capacity, planning and readout—with work-item, role, handoff and verdict protocols in 0.2+. Freeze until Plateau’s delivery view reads live data through it (committee C3).
 
 Needs prep: proposed call only; this filing is neither ratification nor a completed preparation pass.
 
 ## Context
 
-[handoff design]() §6 defines named closed-outcome guards, identifies R939 as delegated rather than operator affirmation, and puts BPMN/saga compensation in Durable. WE profile adoption amends the #634 line and requires a WE ruling.
+[handoff design]() §4.2–4.3 lists settings, calibration, plan, readout, levers, forecast and promises, plus L1–L3 classes. [handoff design]() “Ship modules” / §6 distinguishes release scope from spec order: flow core → protocols → metrics.
 
 Design refs are relative to the operator handoff; WE evidence uses its repo locus.
 
-## Supported by default
+## Recommended path at a glance
 
-**Yes to all three (default).** (a) WE profiles/pointers; (b) no expressions in core, only named closed-outcome classifiers; (c) built-in compensation/undo steps in Durable.
+| Fork | Default | Main alternative | Confidence |
+| --- | --- | --- | --- |
+| 1 — The 0.1 compatibility promise | (a) | (b) | Provisional; needs prep |
 
-Why no fork: The three concerns can all hold at once.
+## Fork 1 — The 0.1 compatibility promise
 
-Skeptic: Initial filing-stage objection, not an independent pass: A classifier plugin could smuggle in an evaluator; compensation could promise impossible global rollback. Define classifier boundaries and compensation failure semantics; UI back/undo is distinct from durable saga compensation.
+Fork-existence: A version cannot promise metrics-only scope and also include unsettled protocol obligations. Later modules can coexist in later versions.
+
+- (a) **Metrics only in 0.1 (default); protocols in 0.2+.** Retain C3’s live Plateau consumer freeze.
+- (b) Shapes and protocols together. Broader first release, but binds 0.1 to unsettled flow/protocol contracts.
+
+Skeptic: Initial filing-stage objection, not an independent pass: Metrics-first could freeze engine-specific shapes. Retain the C3 proof, follow D8’s authoring order and document pre-1.0 migrations; release numbers do not override dependencies.
 Screen: pending the later independent standard/implementation and merit/prioritization screen.
 
 
 ## Consequences / what ratifying unlocks
 
-An explicit WE profile ruling and operator affirmation of R939, plus Durable compensation requirements.
+A bounded release target and live-consumer acceptance condition; #5407 protocols remain tracked.
 
-Operator answers: “D8b yes” accepts the stated default; otherwise name the concern and replacement option. No answer is recorded here.
+Operator answers: “D13 yes” accepts the stated default; otherwise name the concern and replacement option. No answer is recorded here.
 
 ## Prep still needed
 
 - Prior art: verify primary references and known implementations; reuse existing research first.
-- Evidence: Audit #634/R939 lineage, inspect current guard APIs and show closed outcomes; survey compensation failure/retry semantics.
+- Evidence: Reconcile C3 with live-data needs; inspect schema/engine coupling and map 0.2 protocol dependencies.
 - Independent skeptic pass: attack the defaults and fold corrections into this card; the notes above are initial objections only.
 - Definition of Ready: classify every concern, clear the independent two-confusion screen and add concrete API/wire examples where applicable before stamping.
 

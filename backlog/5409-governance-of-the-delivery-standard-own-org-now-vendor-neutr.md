@@ -7,7 +7,7 @@ status: open
 dateOpened: "2026-10-08"
 relatedReport: reports/2026-11-17-delivery-standard-governance.md
 tags: []
-relatedTo: ["5403", "x25bedj", "x7ubblz"]
+relatedTo: ["5403", "8623", "8627"]
 ---
 
 # Governance of the delivery standard: own org now, vendor-neutral core, later foundation move

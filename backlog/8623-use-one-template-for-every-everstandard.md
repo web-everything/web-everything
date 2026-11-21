@@ -1,29 +1,30 @@
 ---
+bornAs: x25bedj
 kind: decision
 parent: "5407"
 status: open
 dateOpened: "2026-11-20"
 tags: [decision-filing, everstandards]
-relatedTo: ["5405", "186"]
+relatedTo: ["5407", "5409"]
 ---
 
-# Which namespace and domain identify schemas, events and predicates?
+# Use one template for every everstandard?
 
 Operator ask (2026-11-20 20:59 ET): “note all as full decision item and run with preparation”.
 
-Decision id: D11 (decisions page, 2026-11-20 20:58 ET)
+Decision id: D6 (decisions page, 2026-11-20 20:58 ET)
 Placement: everstandards
 move-to: everstandards
 
 ## Digest
 
-Choose a public namespace before publication. The page leaves the choice to the operator; private relative ids allow drafting without claiming a domain. No particular public domain is recommended by the source.
+Use a common template: numbered MUST/SHOULD requirements, generated schemas, registries, conformance vectors and module maturity. Stable requires two independent passing implementations.
 
 Needs prep: proposed call only; this filing is neither ratification nor a completed preparation pass.
 
 ## Context
 
-[handoff design]() “Operator decisions” / “Ship migration” and [handoff design]() §4.1/4.5 tie identifiers to #5405 and #186. The brief says shipevermore.dev was free on 8 October but not rechecked; this is not current clearance.
+[handoff design]() “Template in 3 lines” and “Template detail” specify spec/, model/, schemas/, registries/, conformance/, bindings/ and examples/. Candidate needs vectors and one passing implementation; Stable needs two. D9 excludes wholesale WE migration.
 
 Design refs are relative to the operator handoff; WE evidence uses its repo locus.
 
@@ -31,30 +32,30 @@ Design refs are relative to the operator handoff; WE evidence uses its repo locu
 
 | Fork | Default | Main alternative | Confidence |
 | --- | --- | --- | --- |
-| 1 — Public identifier authority | (a) | (b) | Provisional; needs prep |
+| 1 — Normative authoring baseline | (a) | (b) | Provisional; needs prep |
 
-## Fork 1 — Public identifier authority
+## Fork 1 — Normative authoring baseline
 
-Fork-existence: One released schema/event/predicate needs one canonical namespace; competing canonical identities require aliases. Relative private ids are a holding state, not a second public authority.
+Fork-existence: Each repo needs one canonical source and maturity rule; unrelated per-standard templates cannot simultaneously be the required common baseline. Optional renderers remain compatible.
 
-- (a) **Keep ids relative while private; operator chooses after checks (page position, no domain pick).** Gate publication on a resolved namespace.
-- (b) Choose one shared everstandards domain now. Common stewardship, pending ownership/availability and legal checks.
-- (c) Use standard-specific domains such as shipevermore.dev. Clear branding, but extra permanence/migration obligations and unverified availability.
+- (a) **One template for every everstandard (default).** Markdown + BCP 14, JSON Schema 2020-12 generated from model/, RFC 8126 registries, class × level plus features.
+- (b) Independent templates per standard. Domain freedom but inconsistent authoring/conformance conventions.
+- (c) Require ReSpec/Bikeshed now. Better publication machinery with authoring constraints the source design defers.
 
-Skeptic: Initial filing-stage objection, not an independent pass: Deferral can leak relative ids into a release. Require ownership, trademark evidence and an absolute-id migration as publication gates; privacy alone is not a namespace plan.
+Skeptic: Initial filing-stage objection, not an independent pass: A common template could flatten domain differences. Keep module-specific requirements, profiles and bindings extensible; WE retains its authoring format.
 Screen: pending the later independent standard/implementation and merit/prioritization screen.
 
 
 ## Consequences / what ratifying unlocks
 
-Private drafting can continue; public release waits for the namespace ruling and #186 evidence.
+Consistent schema generation and maturity rules; restructure only after D6–D8 settle.
 
-Operator answers: “D11 yes” accepts the stated default; otherwise name the concern and replacement option. No answer is recorded here.
+Operator answers: “D6 yes” accepts the stated default; otherwise name the concern and replacement option. No answer is recorded here.
 
 ## Prep still needed
 
 - Prior art: verify primary references and known implementations; reuse existing research first.
-- Evidence: Check current domain/mark availability and ownership; compare URI permanence and bring a concrete recommendation with migration examples.
+- Evidence: Compare real standards templates, verify the two-implementation exit rule and specify source/schema drift checks.
 - Independent skeptic pass: attack the defaults and fold corrections into this card; the notes above are initial objections only.
 - Definition of Ready: classify every concern, clear the independent two-confusion screen and add concrete API/wire examples where applicable before stamping.
 

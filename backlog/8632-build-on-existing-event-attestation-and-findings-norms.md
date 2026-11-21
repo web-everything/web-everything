@@ -1,59 +1,53 @@
 ---
+bornAs: xrwfs5j
 kind: decision
 parent: "5407"
 status: open
 dateOpened: "2026-11-20"
 tags: [decision-filing, everstandards]
-relatedTo: ["5402"]
+relatedTo: ["5407"]
 ---
 
-# Keep Ship’s private draft seed or reset the repo to empty?
+# Build on existing event, attestation and findings norms?
 
 Operator ask (2026-11-20 20:59 ET): “note all as full decision item and run with preparation”.
 
-Decision id: D14 (decisions page, 2026-11-20 20:58 ET)
+Decision id: D7 (decisions page, 2026-11-20 20:58 ET)
 Placement: everstandards
 move-to: everstandards
 
 ## Digest
 
-Keep the seed reportedly on Ship main at 20:47 ET as a private working draft, with no further seeding. Restructure after D6–D8 settle. This does not authorize publication or additional content.
+Adopt existing norms in distinct layers: CloudEvents/CDEvents for events, in-toto for attestations, SARIF for findings, and OpenTelemetry/DORA as mappings. Ship adds only its delivery-specific delta.
 
 Needs prep: proposed call only; this filing is neither ratification nor a completed preparation pass.
 
 ## Context
 
-The page records draft schemas/checker on main at 20:47 and the earlier operator instruction “nothing should be seeded yet”. [handoff design]() §4.6 predates that page; [handoff design]() “Ship migration” / §6 keeps the repo frozen and PR #1 unmerged.
+[handoff design]() “Norms” adopts CloudEvents 1.0, in-toto Attestation v1, SARIF 2.1.0, BCP 14, JSON Schema 2020-12, SemVer and RFC 8126. OTel semantic conventions and DORA are bindings, not core field names; AsyncAPI waits for a live channel.
 
 Design refs are relative to the operator handoff; WE evidence uses its repo locus.
 
-## Recommended path at a glance
+## Supported by default
 
-| Fork | Default | Main alternative | Confidence |
-| --- | --- | --- | --- |
-| 1 — Disposition of the seed | (a) | (b) | Provisional; needs prep |
+**Support all listed norms in their own layers (default).** CloudEvents + CDEvents carry events; Ship adds claim, handoff, verdict and lever. in-toto carries verdict/run evidence; SARIF carries findings; OTel/DORA are mapped views.
 
-## Fork 1 — Disposition of the seed
+Why no fork: These formats address separate layers and can coexist.
 
-Fork-existence: Main cannot both retain the current seed and be reset to empty. Keeping evidence does not authorize further seeding.
-
-- (a) **Keep as a private working draft (default).** Freeze content; restructure only after D6–D8.
-- (b) Reset to empty. Literal compliance with the earlier instruction, but discards the working baseline.
-
-Skeptic: Initial filing-stage objection, not an independent pass: Retention might be mistaken for retroactive approval or permission to continue. Record the mismatch, keep the freeze and require later template/release calls before another step.
+Skeptic: Initial filing-stage objection, not an independent pass: Layering norms can add wrappers without interoperability. Require concrete mappings and round trips; do not rename core fields to OTel/DORA vocabulary.
 Screen: pending the later independent standard/implementation and merit/prioritization screen.
 
 
 ## Consequences / what ratifying unlocks
 
-An explicit disposition separate from #5402’s repo-home call and public release.
+A small delivery vocabulary with interoperable envelopes, evidence and findings.
 
-Operator answers: “D14 yes” accepts the stated default; otherwise name the concern and replacement option. No answer is recorded here.
+Operator answers: “D7 yes” accepts the stated default; otherwise name the concern and replacement option. No answer is recorded here.
 
 ## Prep still needed
 
 - Prior art: verify primary references and known implementations; reuse existing research first.
-- Evidence: Verify seeded tree/privacy in the later prep pass and enumerate its template restructuring delta.
+- Evidence: Check upstream versions/licences and map the four missing delivery concepts with lossless examples.
 - Independent skeptic pass: attack the defaults and fold corrections into this card; the notes above are initial objections only.
 - Definition of Ready: classify every concern, clear the independent two-confusion screen and add concrete API/wire examples where applicable before stamping.
 

@@ -7,7 +7,7 @@ status: open
 dateOpened: "2026-10-08"
 tags: []
 relatedReport: reports/2026-11-17-licence-open-delivery-standard-and-kernel.md
-relatedTo: ["098", "5409", "x25bedj", "x7ubblz"]
+relatedTo: ["098", "5409", "8623", "8627"]
 ---
 
 # Licence for the open delivery standard and kernel: Apache-2.0, AGPL or Fair Source

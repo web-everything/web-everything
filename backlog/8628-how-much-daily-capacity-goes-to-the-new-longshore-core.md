@@ -1,59 +1,53 @@
 ---
+bornAs: x8fzhda
 kind: decision
-parent: "5407"
+parent: "5488"
 status: open
 dateOpened: "2026-11-20"
-tags: [decision-filing, everstandards]
-relatedTo: ["5407"]
+tags: [decision-filing, plateau-app]
+relatedTo: ["5488"]
 ---
 
-# What does Ship 0.1 cover: metrics shapes or protocols too?
+# How much daily capacity goes to the new Longshore core?
 
 Operator ask (2026-11-20 20:59 ET): “note all as full decision item and run with preparation”.
 
-Decision id: D13 (decisions page, 2026-11-20 20:58 ET)
-Placement: everstandards
-move-to: everstandards
+Decision id: D5 (decisions page, 2026-11-20 20:58 ET)
+Placement: plateau-app
+move-to: plateau-app
 
 ## Digest
 
-Keep Ship 0.1 to delivery metrics shapes—capacity, planning and readout—with work-item, role, handoff and verdict protocols in 0.2+. Freeze until Plateau’s delivery view reads live data through it (committee C3).
+Default to two lanes of disjoint Longshore work under delivery.otherRepos while async-daemon, blocker and builder priorities continue. Capacity is an operator setting, not a new standards invariant.
 
 Needs prep: proposed call only; this filing is neither ratification nor a completed preparation pass.
 
 ## Context
 
-[handoff design]() §4.2–4.3 lists settings, calibration, plan, readout, levers, forecast and promises, plus L1–L3 classes. [handoff design]() “Ship modules” / §6 distinguishes release scope from spec order: flow core → protocols → metrics.
+[handoff design]() §3–5 puts legacy and kernel work side by side and proposes two disjoint lanes. The decisions page says they do not overlap WE files.
 
 Design refs are relative to the operator handoff; WE evidence uses its repo locus.
 
-## Recommended path at a glance
+## Supported by default
 
-| Fork | Default | Main alternative | Confidence |
-| --- | --- | --- | --- |
-| 1 — The 0.1 compatibility promise | (a) | (b) | Provisional; needs prep |
+**Two Longshore lanes by default.** Zero, one or more lanes remain supported settings; admission and declared touch sets constrain actual dispatch.
 
-## Fork 1 — The 0.1 compatibility promise
+Why no fork: Alternate lane counts can coexist as settings.
 
-Fork-existence: A version cannot promise metrics-only scope and also include unsettled protocol obligations. Later modules can coexist in later versions.
-
-- (a) **Metrics only in 0.1 (default); protocols in 0.2+.** Retain C3’s live Plateau consumer freeze.
-- (b) Shapes and protocols together. Broader first release, but binds 0.1 to unsettled flow/protocol contracts.
-
-Skeptic: Initial filing-stage objection, not an independent pass: Metrics-first could freeze engine-specific shapes. Retain the C3 proof, follow D8’s authoring order and document pre-1.0 migrations; release numbers do not override dependencies.
+Skeptic: Initial filing-stage objection, not an independent pass: Two lanes might steal host/model capacity from urgent fixes. The allocation stays subordinate to admission and priority policy; it never authorizes oversubscription.
 Screen: pending the later independent standard/implementation and merit/prioritization screen.
 
 
 ## Consequences / what ratifying unlocks
 
-A bounded release target and live-consumer acceptance condition; #5407 protocols remain tracked.
+A concrete capacity setting without unpausing the builder or overriding shared-resource ceilings.
 
-Operator answers: “D13 yes” accepts the stated default; otherwise name the concern and replacement option. No answer is recorded here.
+Operator answers: “D5 yes” accepts the stated default; otherwise name the concern and replacement option. No answer is recorded here.
 
 ## Prep still needed
 
 - Prior art: verify primary references and known implementations; reuse existing research first.
-- Evidence: Reconcile C3 with live-data needs; inspect schema/engine coupling and map 0.2 protocol dependencies.
+- Evidence: Validate host/model headroom and disjoint touch sets; identify the setting owner and override procedure.
 - Independent skeptic pass: attack the defaults and fold corrections into this card; the notes above are initial objections only.
 - Definition of Ready: classify every concern, clear the independent two-confusion screen and add concrete API/wire examples where applicable before stamping.
 

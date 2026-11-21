@@ -1,51 +1,60 @@
 ---
+bornAs: x419g86
 kind: decision
 parent: "5407"
 status: open
 dateOpened: "2026-11-20"
-tags: [decision-filing, web-standards]
-relatedTo: ["5407"]
+tags: [decision-filing, everstandards]
+relatedTo: ["5402"]
 ---
 
-# Does Web Everything keep its own format and align shared conventions?
+# Keep Ship’s private draft seed or reset the repo to empty?
 
 Operator ask (2026-11-20 20:59 ET): “note all as full decision item and run with preparation”.
 
-Decision id: D9 (decisions page, 2026-11-20 20:58 ET)
-Placement: stays in WE
+Decision id: D14 (decisions page, 2026-11-20 20:58 ET)
+Placement: everstandards
+move-to: everstandards
 
 ## Digest
 
-Keep WE’s format and align shared conventions: MUST/SHOULD wording, vector/manifest shapes and maturity mapping. The page inventories 60 plugs, 81 blocks and 100 intents already checked by WE tooling.
+Keep the seed reportedly on Ship main at 20:47 ET as a private working draft, with no further seeding. Restructure after D6–D8 settle. This does not authorize publication or additional content.
 
 Needs prep: proposed call only; this filing is neither ratification nor a completed preparation pass.
 
 ## Context
 
-[handoff design]() “How WE writes standards today” and “Template detail” retain JSON + njk, EARS and typed contracts. Proposed mapping: concept≈pre-Draft, draft≈Draft, experimental≈Candidate, active≈Stable (R942 corrected).
+The page records draft schemas/checker on main at 20:47 and the earlier operator instruction “nothing should be seeded yet”. [handoff design]() §4.6 predates that page; [handoff design]() “Ship migration” / §6 keeps the repo frozen and PR #1 unmerged.
 
 Design refs are relative to the operator handoff; WE evidence uses its repo locus.
 
-## Supported by default
+## Recommended path at a glance
 
-**Keep and align (default).** Retain WE authoring, share BCP 14 wording/vector shape and publish a maturity mapping.
+| Fork | Default | Main alternative | Confidence |
+| --- | --- | --- | --- |
+| 1 — Disposition of the seed | (a) | (b) | Provisional; needs prep |
 
-Why no fork: Two formats can share conventions without wholesale migration.
+## Fork 1 — Disposition of the seed
 
-Skeptic: Initial filing-stage objection, not an independent pass: Alignment may be superficial while L0–L2 and L1–L3 differ. Publish and test a mapping; do not silently equate different level names or treat unverified active status as two independent implementations.
+Fork-existence: Main cannot both retain the current seed and be reset to empty. Keeping evidence does not authorize further seeding.
+
+- (a) **Keep as a private working draft (default).** Freeze content; restructure only after D6–D8.
+- (b) Reset to empty. Literal compliance with the earlier instruction, but discards the working baseline.
+
+Skeptic: Initial filing-stage objection, not an independent pass: Retention might be mistaken for retroactive approval or permission to continue. Record the mismatch, keep the freeze and require later template/release calls before another step.
 Screen: pending the later independent standard/implementation and merit/prioritization screen.
 
 
 ## Consequences / what ratifying unlocks
 
-Interoperability without migrating WE’s definitions; shared conformance work proceeds under D17.
+An explicit disposition separate from #5402’s repo-home call and public release.
 
-Operator answers: “D9 yes” accepts the stated default; otherwise name the concern and replacement option. No answer is recorded here.
+Operator answers: “D14 yes” accepts the stated default; otherwise name the concern and replacement option. No answer is recorded here.
 
 ## Prep still needed
 
 - Prior art: verify primary references and known implementations; reuse existing research first.
-- Evidence: Inventory vector/manifest differences and validate level/maturity translations against actual evidence.
+- Evidence: Verify seeded tree/privacy in the later prep pass and enumerate its template restructuring delta.
 - Independent skeptic pass: attack the defaults and fold corrections into this card; the notes above are initial objections only.
 - Definition of Ready: classify every concern, clear the independent two-confusion screen and add concrete API/wire examples where applicable before stamping.
 

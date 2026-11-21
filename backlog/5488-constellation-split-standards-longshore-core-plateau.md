@@ -5,7 +5,7 @@ parent: "2445"
 status: open
 dateOpened: "2026-10-08"
 tags: []
-relatedTo: ["5785", "xctsi6q", "x8fzhda", "x7ubblz", "xx623wo"]
+relatedTo: ["5785", "8629", "8628", "8627", "8634"]
 ---
 
 # Constellation split: standards, Longshore core, Plateau

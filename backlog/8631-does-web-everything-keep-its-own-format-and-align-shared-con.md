@@ -1,52 +1,52 @@
 ---
+bornAs: xjeammk
 kind: decision
-parent: "5488"
+parent: "5407"
 status: open
 dateOpened: "2026-11-20"
-tags: [decision-filing, plateau-app]
-relatedTo: ["5488"]
+tags: [decision-filing, web-standards]
+relatedTo: ["5407"]
 ---
 
-# How much daily capacity goes to the new Longshore core?
+# Does Web Everything keep its own format and align shared conventions?
 
 Operator ask (2026-11-20 20:59 ET): “note all as full decision item and run with preparation”.
 
-Decision id: D5 (decisions page, 2026-11-20 20:58 ET)
-Placement: plateau-app
-move-to: plateau-app
+Decision id: D9 (decisions page, 2026-11-20 20:58 ET)
+Placement: stays in WE
 
 ## Digest
 
-Default to two lanes of disjoint Longshore work under delivery.otherRepos while async-daemon, blocker and builder priorities continue. Capacity is an operator setting, not a new standards invariant.
+Keep WE’s format and align shared conventions: MUST/SHOULD wording, vector/manifest shapes and maturity mapping. The page inventories 60 plugs, 81 blocks and 100 intents already checked by WE tooling.
 
 Needs prep: proposed call only; this filing is neither ratification nor a completed preparation pass.
 
 ## Context
 
-[handoff design]() §3–5 puts legacy and kernel work side by side and proposes two disjoint lanes. The decisions page says they do not overlap WE files.
+[handoff design]() “How WE writes standards today” and “Template detail” retain JSON + njk, EARS and typed contracts. Proposed mapping: concept≈pre-Draft, draft≈Draft, experimental≈Candidate, active≈Stable (R942 corrected).
 
 Design refs are relative to the operator handoff; WE evidence uses its repo locus.
 
 ## Supported by default
 
-**Two Longshore lanes by default.** Zero, one or more lanes remain supported settings; admission and declared touch sets constrain actual dispatch.
+**Keep and align (default).** Retain WE authoring, share BCP 14 wording/vector shape and publish a maturity mapping.
 
-Why no fork: Alternate lane counts can coexist as settings.
+Why no fork: Two formats can share conventions without wholesale migration.
 
-Skeptic: Initial filing-stage objection, not an independent pass: Two lanes might steal host/model capacity from urgent fixes. The allocation stays subordinate to admission and priority policy; it never authorizes oversubscription.
+Skeptic: Initial filing-stage objection, not an independent pass: Alignment may be superficial while L0–L2 and L1–L3 differ. Publish and test a mapping; do not silently equate different level names or treat unverified active status as two independent implementations.
 Screen: pending the later independent standard/implementation and merit/prioritization screen.
 
 
 ## Consequences / what ratifying unlocks
 
-A concrete capacity setting without unpausing the builder or overriding shared-resource ceilings.
+Interoperability without migrating WE’s definitions; shared conformance work proceeds under D17.
 
-Operator answers: “D5 yes” accepts the stated default; otherwise name the concern and replacement option. No answer is recorded here.
+Operator answers: “D9 yes” accepts the stated default; otherwise name the concern and replacement option. No answer is recorded here.
 
 ## Prep still needed
 
 - Prior art: verify primary references and known implementations; reuse existing research first.
-- Evidence: Validate host/model headroom and disjoint touch sets; identify the setting owner and override procedure.
+- Evidence: Inventory vector/manifest differences and validate level/maturity translations against actual evidence.
 - Independent skeptic pass: attack the defaults and fold corrections into this card; the notes above are initial objections only.
 - Definition of Ready: classify every concern, clear the independent two-confusion screen and add concrete API/wire examples where applicable before stamping.
 

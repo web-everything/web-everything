@@ -1,52 +1,61 @@
 ---
+bornAs: x6hbdjq
 kind: decision
 parent: "5407"
 status: open
 dateOpened: "2026-11-20"
 tags: [decision-filing, everstandards]
-relatedTo: ["5407"]
+relatedTo: ["5405", "186"]
 ---
 
-# Build on existing event, attestation and findings norms?
+# Which namespace and domain identify schemas, events and predicates?
 
 Operator ask (2026-11-20 20:59 ET): “note all as full decision item and run with preparation”.
 
-Decision id: D7 (decisions page, 2026-11-20 20:58 ET)
+Decision id: D11 (decisions page, 2026-11-20 20:58 ET)
 Placement: everstandards
 move-to: everstandards
 
 ## Digest
 
-Adopt existing norms in distinct layers: CloudEvents/CDEvents for events, in-toto for attestations, SARIF for findings, and OpenTelemetry/DORA as mappings. Ship adds only its delivery-specific delta.
+Choose a public namespace before publication. The page leaves the choice to the operator; private relative ids allow drafting without claiming a domain. No particular public domain is recommended by the source.
 
 Needs prep: proposed call only; this filing is neither ratification nor a completed preparation pass.
 
 ## Context
 
-[handoff design]() “Norms” adopts CloudEvents 1.0, in-toto Attestation v1, SARIF 2.1.0, BCP 14, JSON Schema 2020-12, SemVer and RFC 8126. OTel semantic conventions and DORA are bindings, not core field names; AsyncAPI waits for a live channel.
+[handoff design]() “Operator decisions” / “Ship migration” and [handoff design]() §4.1/4.5 tie identifiers to #5405 and #186. The brief says shipevermore.dev was free on 8 October but not rechecked; this is not current clearance.
 
 Design refs are relative to the operator handoff; WE evidence uses its repo locus.
 
-## Supported by default
+## Recommended path at a glance
 
-**Support all listed norms in their own layers (default).** CloudEvents + CDEvents carry events; Ship adds claim, handoff, verdict and lever. in-toto carries verdict/run evidence; SARIF carries findings; OTel/DORA are mapped views.
+| Fork | Default | Main alternative | Confidence |
+| --- | --- | --- | --- |
+| 1 — Public identifier authority | (a) | (b) | Provisional; needs prep |
 
-Why no fork: These formats address separate layers and can coexist.
+## Fork 1 — Public identifier authority
 
-Skeptic: Initial filing-stage objection, not an independent pass: Layering norms can add wrappers without interoperability. Require concrete mappings and round trips; do not rename core fields to OTel/DORA vocabulary.
+Fork-existence: One released schema/event/predicate needs one canonical namespace; competing canonical identities require aliases. Relative private ids are a holding state, not a second public authority.
+
+- (a) **Keep ids relative while private; operator chooses after checks (page position, no domain pick).** Gate publication on a resolved namespace.
+- (b) Choose one shared everstandards domain now. Common stewardship, pending ownership/availability and legal checks.
+- (c) Use standard-specific domains such as shipevermore.dev. Clear branding, but extra permanence/migration obligations and unverified availability.
+
+Skeptic: Initial filing-stage objection, not an independent pass: Deferral can leak relative ids into a release. Require ownership, trademark evidence and an absolute-id migration as publication gates; privacy alone is not a namespace plan.
 Screen: pending the later independent standard/implementation and merit/prioritization screen.
 
 
 ## Consequences / what ratifying unlocks
 
-A small delivery vocabulary with interoperable envelopes, evidence and findings.
+Private drafting can continue; public release waits for the namespace ruling and #186 evidence.
 
-Operator answers: “D7 yes” accepts the stated default; otherwise name the concern and replacement option. No answer is recorded here.
+Operator answers: “D11 yes” accepts the stated default; otherwise name the concern and replacement option. No answer is recorded here.
 
 ## Prep still needed
 
 - Prior art: verify primary references and known implementations; reuse existing research first.
-- Evidence: Check upstream versions/licences and map the four missing delivery concepts with lossless examples.
+- Evidence: Check current domain/mark availability and ownership; compare URI permanence and bring a concrete recommendation with migration examples.
 - Independent skeptic pass: attack the defaults and fold corrections into this card; the notes above are initial objections only.
 - Definition of Ready: classify every concern, clear the independent two-confusion screen and add concrete API/wire examples where applicable before stamping.
 
