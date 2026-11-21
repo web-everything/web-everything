@@ -117,6 +117,7 @@ import { freeScopeOperation, FREE_SCOPE_OP } from './free-scope.mjs';
 import { prototypeLoadOperation, PROTOTYPE_LOAD_OP, PROTOTYPE_LOAD_EFFECT } from './prototype-load.mjs';
 import { createPrototypeLoader, defaultDeps as prototypeLoadDeps } from './prototype-load-io.mjs';
 import { collectFreeScope } from './free-scope-io.mjs';
+import { checkScope } from './check-scope.mjs';
 import { reviewSeatCapsOperation, REVIEW_SEAT_CAPS_OP } from './review-seat-caps.mjs';
 import { readSeatCapUsage } from './review-extra-seats.mjs';
 import { liveStateOperation, LIVE_STATE_OP } from './live-state.mjs';
@@ -623,6 +624,20 @@ export const OPERATIONS = Object.freeze({
   [FREE_SCOPE_OP]: () => ({
     declaration: freeScopeOperation({ collect: collectFreeScope }),
     sinks: {},
+  }),
+  // check-scope (S0 R1055, warn-only): which open PRs / agent claims share these files? 0 clear, 1 overlap, 2 unknown (fail closed).
+  'check-scope': () => ({
+    declaration: op('check-scope', {
+      input: { files: { type: 'string' } }, verdictFrom: 'assess',
+      verify: effect({ reads: ['input.files'], effects: ({ input }) => [{ type: 'check-scope.run', payload: input, idempotent: true }] }),
+      assess: compute({ reads: ['findings.verify'], fn: ({ findings }) => findings.verify?.effects?.[0]?.result ?? { ok: false, overlaps: [], reason: 'scope check did not run' } }),
+    }),
+    sinks: { 'check-scope.run': input => checkScope({ declaredFiles: String(input.files || '') }) },
+    finish: ({ run, lines }) => {
+      const v = run?.verdict;
+      if (!v) return { code: 2, lines: ['unknown: scope check did not run'] };
+      return { code: v.ok ? 0 : (v.overlaps?.length ? 1 : 2), lines: [JSON.stringify(v)] };
+    },
   }),
   'urgent-verify': () => ({
     declaration: op('urgent-verify', {
