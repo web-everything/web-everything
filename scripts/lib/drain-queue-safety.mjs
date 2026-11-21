@@ -176,9 +176,11 @@ export function decideMqSameHead({ pr, head, timeline, mergeState, retryEvidence
   // Evidence-backed flake: the same failing test(s) passed on the PR head's CI and on a later main run. Once per head.
   const flakeRetry = retryEvidence?.infra === 'flaky-test' && retryEvidence.mainGreen === true
     && retryEvidence.mergeState === 'CLEAN' && failedChecksRemovals === 1 && reenqueuedAfterFailure === 0;
+  const unreadableRetry = retryEvidence?.infra === 'unreadable-log' && retryEvidence.mainGreen === true
+    && retryEvidence.mergeState === 'CLEAN' && failedChecksRemovals === 1 && reenqueuedAfterFailure === 0;
   const exactTestRetry = retryEvidence?.infra === 'exact-test' && retryEvidence.mainGreen === true
     && retryEvidence.mergeState === 'CLEAN' && failedChecksRemovals === 2 && reenqueuedAfterFailure === 1;
-  if (failedChecksRemovals > 0 && !cancelledRetry && !quarantineRetry && !flakeRetry && !exactTestRetry && !(retryEvidence?.mainGreen === true
+  if (failedChecksRemovals > 0 && !cancelledRetry && !quarantineRetry && !flakeRetry && !unreadableRetry && !exactTestRetry && !(retryEvidence?.mainGreen === true
     && ['infra', 'main-red', 'rerun-green'].includes(retryEvidence.infra) && retryEvidence.mergeState === 'CLEAN'))
     // A re-entry after a failed removal never authorizes the author-recovery route (it ends differently
     // from a plain "— failed_checks" hold), so a spent first retry stays with the operator.
@@ -196,6 +198,7 @@ export function decideMqSameHead({ pr, head, timeline, mergeState, retryEvidence
     ? hold((cancelledRetry ? `failed_checks cancelled/regroup retry ${reenqueuedAfterFailure + 1}/${cancelledMax} (no failed required job; cancelled: ${retryEvidence.cancelledNames.join(', ')}; aggregate derived: ${retryEvidence.derivedNames.join(', ') || 'none'}; PR CLEAN)`
       : quarantineRetry ? 'failed_checks quarantine retry 1/1 (every failing test quarantined, PR CLEAN)'
       : flakeRetry ? 'failed_checks flake retry 1/1 (failing test(s) passed on the PR head CI and on a later main run, PR CLEAN)'
+      : unreadableRetry ? 'failed_checks unreadable-log retry 1/1 (failed job log unreadable, main green, PR CLEAN)'
       : exactTestRetry ? 'failed_checks exact-test retry 2/2 (sole failing test passed on the PR head CI, same head, PR CLEAN, main green)'
       : `failed_checks infra retry ${failedChecksRemovals}/2 (main green, PR CLEAN, ${retryEvidence.infra}${retryEvidence.infra === 'rerun-green' ? ' — rerun-confirmed flake' : ''})`) + retryDetails).line
       .replace(/^mq-same-head-failed:/, 'mq-same-head-retry:')
@@ -897,6 +900,7 @@ function readMqBaseRetryEvidence({ repo, pr, head, timeline, exec, rerunScope, d
     let logReason = null;
     const patterns = retryPolicy.mqInfraSignatures.map(source => new RegExp(source));
     const logVerdicts = new Map();
+    const unreadable = new Set();
     const derived = new Set();
     if (noLogInfra) {
       // No log reads: the job conclusions themselves are the evidence.
@@ -937,8 +941,8 @@ function readMqBaseRetryEvidence({ repo, pr, head, timeline, exec, rerunScope, d
           } catch { /* Unknown metadata requires ordinary log evidence below. */ }
         }
         if (cancelledRegroup) continue; // Only validated dependency failures qualify; logs cannot substitute.
+        if (budget <= 2) throw new Error('retry evidence budget exhausted');
         try {
-          if (budget <= 2) throw new Error('retry evidence budget exhausted');
           budget--;
           const text = exec('gh', ['api', `repos/${repo}/actions/jobs/${jobId}/logs`], {
             encoding: 'utf8', timeout: 60_000, maxBuffer: MQ_INFRA_LOG_BYTES,
@@ -956,8 +960,13 @@ function readMqBaseRetryEvidence({ repo, pr, head, timeline, exec, rerunScope, d
           logVerdicts.set(check.id, matched);
           if (!matched && truncatedLine)
             logReason = `non-infrastructure job log within ${MQ_INFRA_LINE_CHARS}-character line scan limit; operator must inspect failed jobs and enqueue manually`;
-        } catch {
-          logReason = 'job log evidence unreadable or incomplete; operator must inspect failed jobs and enqueue manually';
+        } catch (error) {
+          unreadable.add(check.id);
+          if (['merge-gate', 'review-gate'].includes(localJob(check.name))
+            || error?.code != null && !Number.isInteger(error.code)
+            || /maxBuffer|timed out/i.test(String(error?.message))
+            || ![check.output?.title, check.output?.summary].every(value => typeof value === 'string' && !value.trim()))
+            logReason = 'job log evidence unreadable or incomplete; operator must inspect failed jobs and enqueue manually';
           logVerdicts.set(check.id, false);
         }
       }
@@ -974,9 +983,15 @@ function readMqBaseRetryEvidence({ repo, pr, head, timeline, exec, rerunScope, d
     }
     if (!intrinsic.length && !noLogInfra)
       logReason = 'only derived aggregate failures; operator must inspect failed jobs and enqueue manually';
+    const unreadableOnly = !blocked && !logReason && unreadable.size > 0
+      && !hasAggregateCandidates && derived.size === 0 && !attempts.reason
+      && attempts.candidates.length === intrinsic.length
+      && intrinsic.every(c => unreadable.has(c.id));
+    if (unreadable.size > 0 && !unreadableOnly)
+      logReason = 'job log evidence unreadable or incomplete; operator must inspect failed jobs and enqueue manually';
     let infra = !logReason && (noLogInfra || intrinsic.every(check => (!hasAggregateCandidates && summaryInfra(check)) || logVerdicts.get(check.id) === true));
     const rerun = requestMqReruns({ attempts, repo, exec, scope: rerunScope,
-      eligible: !infra && !logReason && !hasAggregateCandidates, dryRun,
+      eligible: !infra && !logReason && !hasAggregateCandidates && unreadable.size === 0, dryRun,
       spend: () => { if (budget <= 2) throw new Error('retry evidence budget exhausted'); budget--; } });
     if (rerun.reason) logReason = rerun.reason;
     if (attempts.reason) infra = false;
@@ -1126,6 +1141,7 @@ function readMqBaseRetryEvidence({ repo, pr, head, timeline, exec, rerunScope, d
     }
     // A pending-rerun freeze proof needs main settled: any unfinished main run keeps the verdict unknown.
     return { mainGreen: !!deciding && !stale && deciding.conclusion === 'success'
+        && (!unreadableOnly || deciding === newest[0] && stale === false)
         && !(freezePending && (newest.some(run => run.status !== 'completed')
           || !newest.some(run => run.id === freezeRunId && run.run_attempt === freezeAttempt && run.status === 'completed' && run.conclusion === 'success'))),
       mainRunId: deciding?.id ?? null,
@@ -1133,7 +1149,7 @@ function readMqBaseRetryEvidence({ repo, pr, head, timeline, exec, rerunScope, d
         : `newest completed run ${deciding.id} ${stale ? 'stale (older than 2h); wait for fresh main CI before retrying' : `concluded ${deciding.conclusion}`}`,
       failedNames,
       derivedNames,
-      infra: blocked ? null : infra ? (attempts.confirmed ? 'rerun-green' : 'infra') : flaky ? 'flaky-test' : !hasAggregateCandidates && !logReason && mainRed ? 'main-red' : null,
+      infra: blocked ? null : infra ? (attempts.confirmed ? 'rerun-green' : 'infra') : flaky ? 'flaky-test' : unreadableOnly ? 'unreadable-log' : !hasAggregateCandidates && !logReason && mainRed ? 'main-red' : null,
       logReason,
       flakeReason: flaky ? null : flakeReason,
       mergeState };
@@ -1154,7 +1170,7 @@ function mqRetryDeclineReasonBase(evidence, holdLine) {
   if (['quarantined', 'cancelled-regroup'].includes(evidence.infra))
     return `PR is not CLEAN (${typeof evidence.mergeState === 'string' && /^[A-Z_]{1,32}$/.test(evidence.mergeState) ? evidence.mergeState : 'unknown'})`;
   if (evidence.mainGreen !== true) return `main CI is not green (${evidence.mainGreenReason ?? 'no completed run'})`;
-  if (!['infra', 'main-red', 'flaky-test', 'exact-test'].includes(evidence.infra))
+  if (!['infra', 'main-red', 'flaky-test', 'exact-test', 'unreadable-log'].includes(evidence.infra))
     return `non-infrastructure failed check(s): ${(evidence.failedNames ?? []).join(', ') || 'unknown'}; main was not red at removal`;
   if (evidence.mergeState !== 'CLEAN') return `PR is not CLEAN (${typeof evidence.mergeState === 'string' && /^[A-Z_]{1,32}$/.test(evidence.mergeState) ? evidence.mergeState : 'unknown'})`;
   return 'retry conditions not met';

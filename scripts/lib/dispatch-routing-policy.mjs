@@ -145,13 +145,25 @@ export function applyRoutingOverrides(base, overrides = {}) {
   return validateRoutingPolicy(policy);
 }
 
+/** Share effective provider controls with capacity selection before it picks a winner. */
+export function operationRoutingEntry({ operation, taskType, size, designQuestion, wellScoped, policy = DEFAULT_ROUTING_POLICY } = {}) {
+  let entry = policy.operations[`${operation}:${taskType}`] ?? policy.operations[operation] ?? policy.operations[String(operation).split(':')[0]];
+  const disabledProviders = new Set([...(entry?.disabledProviders ?? []),
+    ...(entry?.inherit ? policy.operations[operation]?.disabledProviders ?? [] : [])]);
+  if (['prepare', 'prepare-item'].includes(operation) && policy.smallPrepare && Number.isFinite(size) && size > 0 && size <= policy.smallPrepare.maxSize && designQuestion === false && wellScoped === true) entry = policy.smallPrepare.route;
+  else if (['prepare', 'prepare-item'].includes(operation) && (size >= 5 || designQuestion === true)) entry = policy.operations['prepare-decision'];
+  for (const provider of entry?.disabledProviders ?? []) disabledProviders.add(provider);
+  if (!entry || entry.inherit) entry = policy.taskTypes[taskType] ?? entry ?? policy.operations['*'];
+  for (const provider of entry.disabledProviders ?? []) disabledProviders.add(provider);
+  return { entry, disabledProviders };
+}
+
 /** Null retains the evidence/tier decision, or omits the optional agy advisory seat.
  * Constrained inheritance requires an explicit route, except added seats with filtered candidates.
  * Availability is supplied by the launch boundary. */
 export function resolveOperationRoute({ operation, taskType, size, designQuestion, wellScoped, available, availability = {}, gateClosed = false, vetoes = [], policy = DEFAULT_ROUTING_POLICY, aiRouting, operatorKeys } = {}) {
   if (aiRouting !== undefined && !Array.isArray(operatorKeys)) fail('aiRouting requires operatorKeys from the policy snapshot');
-  let entry = policy.operations[`${operation}:${taskType}`] ?? policy.operations[operation] ?? policy.operations[String(operation).split(':')[0]];
-  const disabledProviders = new Set(entry?.disabledProviders ?? []);
+  let { entry, disabledProviders } = operationRoutingEntry({ operation, taskType, size, designQuestion, wellScoped, policy });
   const optionalAdvisory = (taskType ? `${operation}:${taskType}` : operation) === OPTIONAL_ADVISORY_SEAT;
   const inheritRoute = () => {
     // Added-seat callers pass this same candidate list to selectReviewSeatProvider after null.
@@ -161,11 +173,6 @@ export function resolveOperationRoute({ operation, taskType, size, designQuestio
     if (disabledProviders.size && !optionalAdvisory && !filteredAddedSeat) fail(`${operation}: inherited route cannot enforce disabled providers; configure an explicit provider and fallback`);
     return null;
   };
-  if (['prepare', 'prepare-item'].includes(operation) && policy.smallPrepare && Number.isFinite(size) && size > 0 && size <= policy.smallPrepare.maxSize && designQuestion === false && wellScoped === true) entry = policy.smallPrepare.route;
-  else if (['prepare', 'prepare-item'].includes(operation) && (size >= 5 || designQuestion === true)) entry = policy.operations['prepare-decision'];
-  for (const provider of entry?.disabledProviders ?? []) disabledProviders.add(provider);
-  if (!entry || entry.inherit) entry = policy.taskTypes[taskType] ?? entry ?? policy.operations['*'];
-  for (const provider of entry.disabledProviders ?? []) disabledProviders.add(provider);
   const lookupKeys = [`${operation}:${taskType}`, operation, String(operation).split(':')[0], '*'];
   let overlaid = false;
   if (aiRouting !== undefined && ![...lookupKeys, ...(entry === policy.operations['prepare-decision'] ? ['prepare-decision'] : [])].some(key => operatorKeys.includes(key))) {

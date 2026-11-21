@@ -15,7 +15,7 @@ const listingFailure = (repo, num = 7) => ({ ...okDryRun(num), failedRepos: [{ r
 function batchIo({ prs = [7, 8], dryRunFor }) {
   const env = { GITHUB_ACTIONS: 'true', GITHUB_REF: 'refs/heads/main', GITHUB_EVENT_NAME: 'schedule',
     GITHUB_RUN_ID: '123456', GITHUB_REPOSITORY: OWN, GITHUB_TOKEN: 'read-only-fixture' };
-  return { env, now: () => now, mkdirSync: vi.fn(), writeFileSync: vi.fn(),
+  return { env, now: () => now, random: () => 0, mkdirSync: vi.fn(), writeFileSync: vi.fn(),
     execFileSync: vi.fn((cmd, args) => {
       if (cmd === 'git') return mainSha + '\n';
       if (cmd === 'gh') return JSON.stringify(prs.map(number => ({ number, labels: [{ name: 'ready-to-merge' }] })));
@@ -96,5 +96,60 @@ describe('drain-classify-only: cross-repo listing failure degrades to unknown', 
     expect(out.failed).toBe(1);
     expect(out.written).toBe(0);
     expect(err).toMatch(/all 2 PR\(s\) unknown/);
+  });
+});
+
+describe('drain-classify-only: batch deadline and rotation', () => {
+  const CHILD_MS = 10 * 60_000;
+  function clockIo({ prs, perChildMs, random = 0 }) {
+    let t = now;
+    const io = batchIo({ prs, dryRunFor: okDryRun });
+    io.random = () => random;
+    io.now = () => t;
+    const base = io.execFileSync;
+    io.execFileSync = vi.fn((cmd, args, opts) => {
+      if (cmd !== 'git' && cmd !== 'gh') t += perChildMs;
+      return base(cmd, args, opts);
+    });
+    return io;
+  }
+  const files = io => Object.keys(written(io)).sort();
+
+  it('batch stops starting PRs when remaining budget is under one child timeout and keeps finished verdicts', () => {
+    const io = clockIo({ prs: [1, 2, 3, 4, 5, 6, 7, 8], perChildMs: 6 * 60_000 });
+    const [out] = quiet(() => runBatch(batchArgv, io));
+    expect(out.failed).toBe(0);
+    expect(out.written).toBe(2);
+    expect(out.skipped).toBe(6);
+    // finished verdicts kept; unstarted PRs get an explicit unknown verdict, never a silent gap
+    const w = written(io);
+    expect(Object.keys(w)).toHaveLength(8);
+    expect(Object.values(w).filter(v => v.decision === 'unknown')).toHaveLength(6);
+  });
+
+  it('no subprocess may run past the batch deadline (per-exec timeout is capped by the remaining budget)', () => {
+    const io = clockIo({ prs: [1, 2], perChildMs: 8 * 60_000 });
+    quiet(() => runBatch(batchArgv, io));
+    const timeouts = io.execFileSync.mock.calls.filter(c => c[0] !== 'gh').map(c => c[2].timeout);
+    // 20 min budget, the dry-run advances the clock 8 min; each PR runs rev-parse, dry-run, rev-parse.
+    // PR 1: 10,10,10 min (20, 20, 12 left). PR 2 starts with 12 left: 10, 10, then 4 min left for the last read.
+    expect(timeouts).toEqual([10, 10, 10, 10, 10, 4].map(m => m * 60_000));
+  });
+
+  it('rotates the start index so PRs past the first batch get a turn on the next run', () => {
+    const prs = Array.from({ length: 12 }, (_, i) => i + 1);
+    const a = clockIo({ prs, perChildMs: 6 * 60_000, random: 0 });
+    const b = clockIo({ prs, perChildMs: 6 * 60_000, random: 0.5 });
+    quiet(() => runBatch(batchArgv, a));
+    quiet(() => runBatch(batchArgv, b));
+    const classified = io => Object.entries(written(io)).filter(([, v]) => v.decision !== 'unknown').map(([k]) => k);
+    expect(classified(a)).toEqual(['verdicts/pr-1.json', 'verdicts/pr-2.json']);
+    expect(classified(b)).toEqual(['verdicts/pr-7.json', 'verdicts/pr-8.json']);
+  });
+
+  it('a fast batch still classifies every PR up to the cap', () => {
+    const io = clockIo({ prs: [7, 8], perChildMs: 1000 });
+    const [out] = quiet(() => runBatch(batchArgv, io));
+    expect(out).toEqual({ written: 2, failed: 0 });
   });
 });

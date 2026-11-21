@@ -1,13 +1,14 @@
 /** The only filesystem boundary for routing policy: reload, retain last-good, and forward snapshots. */
 import { readFileSync } from 'node:fs';
 import { ROUTING_POLICY_PATH, trustedSnapshot } from './dispatch-routing-policy-source.mjs';
-import { validateRoutingPolicy, applyRoutingOverrides, DEFAULT_ROUTING_POLICY, resolveOperationRoute as resolvePureRoute, resolvePolicyModel as resolvePureModel, operationEffort } from './dispatch-routing-policy.mjs';
+import { validateRoutingPolicy, applyRoutingOverrides, DEFAULT_ROUTING_POLICY, resolveOperationRoute as resolvePureRoute, resolvePolicyModel as resolvePureModel, operationEffort, defaultPolicyModel, operationRoutingEntry } from './dispatch-routing-policy.mjs';
 import { readPlatformPreferences } from './policy-cascade.mjs';
 import { appendDaemonEvent } from './daemon-events.mjs';
 import { decideDispatchRoute, MARKER_KINDS } from './dispatch-contracts.mjs';
-import { BUILD_KINDS, effectiveBuilder } from './routing-settings.mjs';
+import { BUILD_KINDS, effectiveBuilder, resolveRoutingSettings } from './routing-settings.mjs';
 import { providerQuotaHold } from './provider-quota-hold.mjs';
 import { resolveRoutingOverrideRoute } from './dispatch-routing-override-route.mjs';
+import { taskTypeFor } from './dispatch-task-type.mjs';
 function initialPolicy(env) {
   return trustedSnapshot(env.WE_DISPATCH_ROUTING_SNAPSHOT) ?? DEFAULT_ROUTING_POLICY;
 }
@@ -79,14 +80,53 @@ export function resolveDispatchRoute(dispatch, options = {}) {
   // evidence router removes quota fields; neither a backend nor its checker may run while held.
   const rawRecords = Array.isArray(options.scorecards) ? options.scorecards : options.scorecards?.records;
   const records = Array.isArray(rawRecords) ? rawRecords.filter(row => row && typeof row === 'object') : [];
-  const availability = { ...options.availability };
+  const availability = { ...(dispatch.kind === 'ci-heal' ? options.ciHealAvailability : {}), ...options.availability };
   for (const provider of ['antigravity', 'codex']) {
     const hold = providerQuotaHold(records, provider, options.now ?? Date.now());
     if (hold) availability[provider] = hold;
   }
   // routing.builder=claude: Codex is held for build kinds only; audit and review seats still use it.
   // Resolve the builder once, so an `auto` quota reading cannot change between the refusal and the hold.
-  const builder = BUILD_KINDS.includes(dispatch?.kind) ? effectiveBuilder() : null;
+  const taskType = dispatch.kind === 'fix' ? dispatch.takeover ? 'takeover' : dispatch.rulingNotAddressed ? 'ruling-not-addressed'
+    : dispatch.taskType : dispatch.taskType;
+  const routeKey = taskType ? `${dispatch.kind}:${taskType}` : dispatch.kind;
+  let routingPolicy = options.routingPolicy ?? readRoutingPolicy();
+  // Scoped explicit routes are policy pins; capacity must never replace or refuse them.
+  const pinned = taskType && routingPolicy.operations[routeKey]?.provider;
+  const policyTaskType = taskTypeFor({ kind: dispatch.kind, cause: dispatch.cause ?? null,
+    scopePaths: Array.isArray(dispatch.scopePaths) ? dispatch.scopePaths.map(String) : [] }).taskType
+    ?? (dispatch.kind === 'prepare-item' ? 'prepare' : null);
+  const { disabledProviders } = operationRoutingEntry({ ...dispatch, operation: dispatch.kind, taskType: policyTaskType, policy: routingPolicy });
+  const pinnedSettings = pinned && BUILD_KINDS.includes(dispatch?.kind) ? resolveRoutingSettings({ env: options.env ?? process.env, repo: options.repo, declared: options.declared }) : null;
+  const builder = pinnedSettings ? { builder: pinnedSettings.builder, settings: pinnedSettings }
+    : BUILD_KINDS.includes(dispatch?.kind) ? effectiveBuilder({ kind: dispatch.kind, env: options.env ?? process.env, now: options.now ?? Date.now(), records, capacity: options.capacity, routeKey, queuedDemand: options.queuedDemand ?? options.queuedDispatches?.filter(d => BUILD_KINDS.includes(d.kind)).length ?? 1, demandRatePerHour: options.demandRatePerHour,
+    repo: options.repo, declared: options.declared, quota: options.quota, record: options.record, disabledProviders: [...disabledProviders], availability, modelAliases: routingPolicy.aliases,
+  }) : null;
+  if (builder?.decision?.provider === null) return { outcome: 'refused', refusal: 'no eligible capacity; wait for quota reset or clear provider hold', auditTrail: [] };
+  const inputs = builder?.decision?.inputs ?? [];
+  const launcher = input => input.launcher ?? (input.provider.startsWith('agy-') ? 'antigravity' : input.provider);
+  for (const provider of new Set(inputs.map(input => input.provider))) {
+    const candidates = inputs.filter(input => input.provider === provider);
+    if (candidates.every(input => launcher(input) !== provider && !input.eligible)) availability[provider] = `capacity: ${candidates.map(input => !input.allowed ? 'disallowed' : !input.fit ? 'tier-excluded' : input.label).join(', ')}`;
+  }
+  for (const provider of new Set(inputs.map(launcher))) {
+    const candidates = inputs.filter(input => launcher(input) === provider);
+    // A model alias may share a launcher with an eligible model. Keep that
+    // launcher open; model eligibility is enforced below on its fallback list.
+    if (candidates.every(input => !input.eligible)) availability[provider] = `capacity: ${candidates.map(input => input.label).join(', ')}`;
+  }
+  const eligibleRoute = route => {
+    const candidates = inputs.filter(input => input.provider === route.provider || launcher(input) === route.provider);
+    if (!candidates.length) return false;
+    const model = resolvePureModel(route.provider, route.model, routingPolicy);
+    const exact = candidates.filter(input => input.model === model);
+    return (exact.length ? exact : candidates.filter(input => input.provider === route.provider)).some(input => input.eligible);
+  };
+  // Capacity exclusions also bind legacy/unknown fallbacks, independently of
+  // whether a scored winner replaces the primary provider below.
+  if (inputs.length) routingPolicy = { ...routingPolicy, operations: Object.fromEntries(Object.entries(routingPolicy.operations).map(([key, entry]) =>
+    [key, (key === dispatch.kind || key.startsWith(`${dispatch.kind}:`)) && entry.fallback
+      ? { ...entry, fallback: entry.fallback.filter(eligibleRoute) } : entry])) };
   const claudeBuilds = builder?.builder === 'claude';
   // Only the marker kinds read deliveryAgent (dispatch-contracts ignores it elsewhere), so only they count as explicit.
   const explicitCodex = MARKER_KINDS.includes(dispatch?.kind) && String(dispatch?.deliveryAgent ?? '').trim().toLowerCase() === 'codex';
@@ -103,7 +143,50 @@ export function resolveDispatchRoute(dispatch, options = {}) {
     ? (availability.claude || options.ciHealAvailability?.claude || providerQuotaHold(records, 'claude', options.now ?? Date.now()) || null)
     : null;
   const ciHealNativeFallback = claudeBuilds && dispatch?.kind === 'ci-heal' && !ciHealNativeHold;
-  return decideDispatchRoute(dispatch, { ...options, availability, ciHealNativeFallback, routingPolicy: options.routingPolicy ?? readRoutingPolicy() });
+  if (BUILD_KINDS.includes(dispatch.kind) && (builder?.decision?.reason === 'capacity-score' || builder?.decision?.reason === 'unknown-emergency')) {
+    // Native model aliases execute through their configured launcher. Antigravity
+    // keeps its distinct policy providers (agy-claude / agy-gemini).
+    const provider = ['claude', 'codex'].includes(builder.decision.launcher) ? builder.decision.launcher : builder.builder;
+    let inheritedRoute;
+    const sameRoute = (a, b) => a.provider === b.provider
+      && resolvePureModel(a.provider, a.model, routingPolicy) === resolvePureModel(b.provider, b.model, routingPolicy);
+    const project = (entry, parent = {}) => {
+      const existing = { ...parent, ...entry };
+      // Materialise the inherited evidence/tier route before replacing it. In
+      // particular, critical fixes must retain their Claude model and effort.
+      if (!existing.provider) inheritedRoute ??= decideDispatchRoute(dispatch, { ...options, availability, ciHealNativeFallback, routingPolicy });
+      const previous = existing.provider ? existing : inheritedRoute?.outcome === 'routed' && inheritedRoute.model
+        ? { provider: inheritedRoute.executed, model: inheritedRoute.model,
+          effort: inheritedRoute.effort ?? existing.effort } : null;
+      const fallback = (existing.fallback ?? []).filter(eligibleRoute);
+      const next = { ...existing, provider, fallback,
+        ...(existing.provider !== provider || builder.decision.provider !== provider || !eligibleRoute(existing)
+          ? { model: builder.decision.model ?? defaultPolicyModel(provider) } : {}) };
+      if (previous && eligibleRoute(previous) && !sameRoute(previous, next) && !fallback.some(route => sameRoute(route, previous))) {
+        const { provider, model, effort } = previous;
+        next.fallback = [{ provider, model, effort }, ...fallback];
+      }
+      if (parent.disabledProviders || entry?.disabledProviders) next.disabledProviders = [...new Set([...(parent.disabledProviders ?? []), ...(entry?.disabledProviders ?? [])])];
+      delete next.inherit;
+      return next;
+    };
+    // Capacity changes provider selection only; preserve every operation's controls and effort.
+    routingPolicy = { ...routingPolicy, operations: { ...routingPolicy.operations,
+      [dispatch.kind]: project(routingPolicy.operations[dispatch.kind]),
+      ...Object.fromEntries(Object.keys(routingPolicy.operations).filter(k => k.startsWith(`${dispatch.kind}:`) && routingPolicy.operations[k].inherit).map(k => [k, project(routingPolicy.operations[k], routingPolicy.operations[dispatch.kind])])),
+    } };
+  }
+  if (pinned) routingPolicy = { ...routingPolicy, operations: { ...routingPolicy.operations, [dispatch.kind]: routingPolicy.operations[routeKey] } };
+  const result = decideDispatchRoute(dispatch, { ...options, availability, ciHealNativeFallback, routingPolicy });
+  // Task-type and legacy prepare routes can supply their own fallbacks. Enforce
+  // the same boundary on the final route the launcher will actually consume.
+  if (inputs.length && result.policyRoute) {
+    if (!eligibleRoute(result.policyRoute)) return { ...result, outcome: 'refused',
+      refusal: 'no eligible capacity for the policy model; wait for quota reset or update provider settings' };
+    result.policyRoute = { ...result.policyRoute, fallback: result.policyRoute.fallback.filter(eligibleRoute) };
+  }
+  // Account attribution is informational in the capacity decision log, never a launcher instruction.
+  return result;
 }
 export function routingPolicyEnv() {
   return { WE_DISPATCH_ROUTING_SNAPSHOT: JSON.stringify(readRoutingPolicy()) };

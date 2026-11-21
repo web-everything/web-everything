@@ -163,6 +163,8 @@ export const LOCK_HOLDERS = Object.freeze(['scripts/lib/atomic-json-file.mjs', '
   'scripts/lib/daemon-overlays.mjs', 'scripts/lib/lane-repair.mjs', 'scripts/lib/overlay-adoption.mjs', 'scripts/lib/we-scan-cache.mjs',
   'scripts/readiness/forge-exec-run.mjs', 'scripts/lib/review-shadow-budget.mjs', 'scripts/readiness/reservations.mjs',
   'scripts/readiness/prepare-hold-state.mjs',
+  // Capacity events dedupe across dispatchers with an exclusive-create receipt.
+  'scripts/lib/provider-capacity-io.mjs',
   // Binary maintenance serializes scheduled ticks with an exclusive lock directory.
   'scripts/operations/agy-upgrade-check.mjs',
   // The urgent-load verifier takes an exclusive lock directory and `wx` receipt files (found by the hold scan).
