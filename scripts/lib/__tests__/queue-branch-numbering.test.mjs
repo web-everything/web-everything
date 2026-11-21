@@ -435,13 +435,54 @@ describe('queue branch numbering', () => {
     expect(out).toMatchObject({ action: 'skip', reason: expect.stringContaining('not valid against origin/main') });
     noWrites(x);
   });
-  it.each([['collides with a different path on main', 'backlog/040-other.md'], ['duplicate numeric name', 'backlog/041-foo.md\nbacklog/041-bar.md']])('numbered names must be valid against origin/main before push (tracked filename %s)', (_label, listing) => {
+  it.each([
+    ['copies a card on main', 'backlog/040-main.md\nbacklog/040-other.md'],
+    ['copies a card before its original in the listing', 'backlog/040-other.md\nbacklog/040-main.md'],
+    ['duplicate numeric name', 'backlog/041-foo.md\nbacklog/041-bar.md'],
+    ['padded alias of an existing number', 'backlog/040-main.md\nbacklog/40-other.md'],
+    ['two renamed paths for one existing card', 'backlog/040-renamed.md\nbacklog/040-other.md'],
+  ])('numbered names must be valid against origin/main before push (tracked filename %s)', (_label, listing) => {
     const x = setup();
     const orig = x.exec.getMockImplementation();
     x.exec.mockImplementation((cmd, args, o) => (args[0] === 'ls-files' && x.number.mock.calls.length ? listing : orig(cmd, args, o)));
     const out = prepareBranchBeforeEnqueue(x.args);
     expect(out).toMatchObject({ action: 'skip', reason: expect.stringContaining('numbered card name(s) not valid against origin/main') });
     noWrites(x);
+  });
+  it.each(['040', '40'])('allows a slug rename preserving card number %s beside a newly numbered card', (id) => {
+    const x = setup();
+    const orig = x.exec.getMockImplementation();
+    x.exec.mockImplementation((cmd, args, o) => (args[0] === 'ls-files' && x.number.mock.calls.length
+      ? `backlog/${id}-renamed.md\nbacklog/041-foo.md` : orig(cmd, args, o)));
+    expect(prepareBranchBeforeEnqueue(x.args)).toMatchObject({ action: 'numbered', newHead: 'new' });
+    expect(x.exec.mock.calls.some(([, args]) => args[0] === 'push')).toBe(true);
+  });
+  it.each(['stale', 'fresh', 'fetch failure', 'unreadable count'])('refreshes the separate code clone before trusting its origin/main (%s)', (mode) => {
+    const x = setup();
+    x.args.codeRoot = '/code-clone/scripts/lib';
+    const orig = x.exec.getMockImplementation();
+    let fetched = false;
+    x.exec.mockImplementation((cmd, args, o) => {
+      if (o.cwd === x.args.codeRoot) {
+        if (args[0] === 'fetch') {
+          if (mode === 'fetch failure') throw new Error('code fetch failed');
+          fetched = true;
+        }
+        if (args[0] === 'rev-list') return fetched ? (mode === 'stale' ? '5\n' : mode === 'unreadable count' ? '' : '0\n') : '0\n';
+      }
+      return orig(cmd, args, o);
+    });
+    const out = prepareBranchBeforeEnqueue(x.args);
+    if (mode === 'fresh') {
+      expect(out.action).toBe('numbered');
+      expect(fetched).toBe(true);
+      const codeOps = x.exec.mock.calls.filter(([, , o]) => o.cwd === x.args.codeRoot).map(([, args]) => args[0]);
+      expect(codeOps).toEqual(['fetch', 'rev-list']);
+    } else {
+      expect(out).toMatchObject({ action: 'skip', reason: expect.stringContaining(mode === 'stale' ? 'drain code checkout is 5 commit(s) behind' : mode === 'fetch failure' ? 'code fetch failed' : 'freshness unreadable') });
+      expect(x.number).not.toHaveBeenCalled();
+      noWrites(x);
+    }
   });
   it('refuses when the code checkout (restamp script location) is stale although the data checkout is fresh', () => {
     const x = setup();

@@ -397,6 +397,8 @@ export function prepareBranchBeforeEnqueue({ c, traceHeadSha, cwd = process.cwd(
         // when it is stale, which used to leave a pushed, renumbered, red PR. Any unreadable input refuses.
         // Both the data checkout (cwd) and the checkout this module (and so the restamp script) loads from.
         for (const [label, root] of [['drain checkout', cwd], ['drain code checkout', codeRoot]]) {
+          // The allocation fetch above refreshed only cwd; code may live in a separate clone.
+          if (root !== cwd) git(['fetch', 'origin', '+refs/heads/main:refs/remotes/origin/main'], root);
           const behind = git(['rev-list', '--count', 'HEAD..origin/main'], root);
           if (!/^\d+$/.test(behind)) throw new Error(`${label} freshness unreadable (${shownText(behind).slice(0, 80)})`);
           if (Number(behind) > 0) throw new Error(`${label} is ${behind} commit(s) behind origin/main; the restamp would refuse, so nothing was committed or pushed`);
@@ -415,12 +417,12 @@ export function prepareBranchBeforeEnqueue({ c, traceHeadSha, cwd = process.cwd(
         const mainNums = paths(mainFiles).filter((p) => /^backlog\/[^/]+\.md$/.test(p)).map(cardId).filter(isNum).map(Number);
         const mainMax = mainNums.reduce((m, v) => Math.max(m, v), 0);
         const badNumbers = (n.assigned || []).filter((a) => !/^\d+$/.test(String(a.nnn)) || Number(a.nnn) <= mainMax || mainNums.includes(Number(a.nnn)));
-        // Validate the resulting tracked filenames too: new numeric cards must be unique and not collide with main.
-        const mainSet = new Set(paths(mainFiles));
+        // A number is a permanent card identity; changing its slug is allowed when only one path survives.
+        // Include unchanged main paths so a copy cannot hide a duplicate behind an existing filename.
         const seen = new Set();
-        const badNames = paths(tracked()).filter((p) => /^backlog\/[^/]+\.md$/.test(p) && !mainSet.has(p) && isNum(cardId(p))).filter((p) => {
+        const badNames = paths(tracked()).filter((p) => /^backlog\/[^/]+\.md$/.test(p) && isNum(cardId(p))).filter((p) => {
           const id = Number(cardId(p));
-          const bad = mainNums.includes(id) || seen.has(id);
+          const bad = seen.has(id);
           seen.add(id);
           return bad;
         });
