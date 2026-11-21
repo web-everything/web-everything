@@ -74,6 +74,7 @@
 
 import { readFileSync, statSync } from 'node:fs';
 import { cascadePolicy } from '../../scripts/lib/policy-cascade.mjs';
+import { readOperatorOverrides } from '../../scripts/lib/operator-override-reader.mjs';
 import { executeOwedCiReruns } from '../../scripts/conveyor/owed-ci-rerun-executor.mjs';
 import { createPlannerFactCache } from '../../scripts/conveyor/planner-fact-cache.mjs';
 import { logDaemonHeap } from '../../scripts/lib/daemon-heap-log.mjs';
@@ -729,9 +730,10 @@ export function runReviewTick({
     try { host = hostAdmission() ?? host; } catch (e) { host = { admitted: false, reason: `host admission unknown: ${String(e?.message ?? e).split('\n')[0]}` }; }
   }
   const hostLimit = !host.admitted ? 0 : Number.isFinite(host.maxPerTick) ? Math.max(0, host.maxPerTick) : Infinity;
-  const remainingReviewCapacity = () => liveReviewBudget && Number.isFinite(liveReviewBudget.left)
+  const remainingLiveCapacity = () => liveReviewBudget && Number.isFinite(liveReviewBudget.left)
     ? Math.max(0, liveReviewBudget.left) : Infinity;
-  const initialReviewCapacity = remainingReviewCapacity();
+  const remainingReviewCapacity = () => Math.max(0, remainingLiveCapacity() - (liveReviewBudget?.reserve ?? 0));
+  const initialReviewCapacity = remainingLiveCapacity();
   const dispatchable = [];
   let occupiedLanes = 0;
   const dispatched = [];
@@ -874,7 +876,7 @@ export function runReviewTick({
   if (reservedRecoveryStarts === 0) recoverRedTeam(Math.max(0, hostLimit - occupiedLanes));
   // Compute deferrals after confirmed starts, so skipped attempts neither spend capacity nor leave later
   // eligible PRs outside a preselected batch. Only an actual lane shortfall uses the starvation diagnostic.
-  const liveCap = remainingReviewCapacity();
+  const liveCap = remainingLiveCapacity();
   const earlierDispatches = Number.isFinite(liveReviewBudget?.max) && Number.isFinite(liveReviewBudget?.live)
     ? Math.max(0, liveReviewBudget.max - liveReviewBudget.live - initialReviewCapacity) : 0;
   // Never clamp: an overrun (10 live of max 8) must still read "10 of 8".
@@ -886,7 +888,7 @@ export function runReviewTick({
     : liveReviewBudget?.reason;
   if (capReason && earlierDispatches > 0) capReason += `; ${earlierDispatches} seat(s) taken by dispatches earlier in this tick`;
   const hostBound = !paused && (!host.admitted || hostLimit - occupiedLanes <= 0);
-  const capBound = !paused && !hostBound && liveCap === 0;
+  const capBound = !paused && !hostBound && remainingReviewCapacity() === 0;
   const deferredTotal = reviews.length - dispatchable.length;
   const deferredForHost = hostBound ? deferredTotal : 0;
   const deferredForCap = capBound ? deferredTotal : 0;
@@ -1499,18 +1501,47 @@ export function cliReviewTickOpts({ log = console, factCache = null, listCommand
     }
     return livePrs.get(key);
   };
+  const queueOff = () => ['off', '0', 'false', 'no'].includes(String(process.env.WE_RED_TEAM_DISPATCH_QUEUE ?? '').trim().toLowerCase());
+  // Restore persisted work before the first budget read after a daemon restart.
+  if (!queueOff() && !redTeamDispatchQueue) {
+    try { log.error(`review-daemon: red-team queue on (source: ${process.env.WE_RED_TEAM_DISPATCH_QUEUE === undefined ? 'default' : 'env WE_RED_TEAM_DISPATCH_QUEUE'})`); }
+    catch { /* Diagnostics must not interrupt admission. */ }
+    redTeamDispatchQueue = createRedTeamDispatchQueue({ log: line => log.error(line) });
+  }
+  let inventoryComplete = true;
+  let queueReadFailed = false;
+  const queueSize = () => {
+    if (queueOff() || !inventoryComplete) return 0;
+    try {
+      return redTeamDispatchQueue.entries().filter(entry => {
+        // Persisted blocks are validated by the queue reader and consume probe turns, not worker slots.
+        if (entry.blocked !== undefined) return false;
+        if (!livePrs.has(entry.key)) return true; // Restored work, before this tick's reconciliation.
+        const pr = livePrs.get(entry.key);
+        return pr?.state === 'OPEN' && pr.isDraft !== true && pr.headRefOid === entry.head && Array.isArray(pr.comments);
+      }).length;
+    } catch (error) {
+      if (!queueReadFailed) {
+        queueReadFailed = true;
+        try { log.error(`review-daemon: red-team reserve queue unreadable; lending reserve back: ${String(error?.message ?? error).split('\n')[0]}`); }
+        catch { /* Diagnostics must not interrupt admission. */ }
+      }
+      return undefined;
+    }
+  };
   const options = {
     log: line => log.error(line),
     acquirableLanes: defaultAcquirableLaneNumbers, recoveryAcquirableLanes: defaultRecoveryLaneNumbers,
     readPrs: factCache ? opts => defaultReadPrs({ ...opts, factCache }) : defaultReadPrs, readAgents: defaultReadAgents,
     hostAdmission: defaultReviewHostAdmission,
     // `listCommands` is a test seam: the default lists the host's real processes (`ps`), which a hermetic test must not.
-    liveReviewBudget: liveReviewRoundBudget(listCommands ? { listCommands } : {}),
-    reconcileRedTeamQueue: ({ inventoryComplete = true } = {}) => {
+    liveReviewBudget: liveReviewRoundBudget({ queueSize, ...(listCommands ? { listCommands } : {}) }),
+    reconcileRedTeamQueue: ({ inventoryComplete: complete = true } = {}) => {
       livePrs.clear();
-      if (['off', '0', 'false', 'no'].includes(String(process.env.WE_RED_TEAM_DISPATCH_QUEUE ?? '').trim().toLowerCase())) return;
+      inventoryComplete = complete;
+      if (queueOff()) return;
       redTeamDispatchQueue ??= createRedTeamDispatchQueue({ log: line => log.error(line) });
-      if (!inventoryComplete) return;
+      if (!complete) return;
       // Maintenance evicts terminal PRs and re-keys changed live heads.
       redTeamDispatchQueue.reconcile({ readLivePr: readQueuePr });
     },
@@ -1934,7 +1965,7 @@ const REVIEW_CONCURRENCY_PATH = join(dirname(fileURLToPath(import.meta.url)), '.
  *  `review-loop-cli.mjs` processes (a round is one job, or one bare loop). An unreadable `ps` fails closed (no new
  *  review this tick). Revert condition: see the settings file's comment. */
 export function liveReviewRoundBudget({ env = process.env, listCommands = () => execFileSync('ps', ['-Aww', '-o', 'pid=,ppid=,command='], { encoding: 'utf8', timeout: 10_000, maxBuffer: 32 * 1024 * 1024 }),
-  toolPath = REVIEW_CONCURRENCY_PATH, readFile = readFileSync } = {}) {
+  toolPath = REVIEW_CONCURRENCY_PATH, readFile = readFileSync, queueSize, readOverrides = readOperatorOverrides } = {}) {
   const validMax = v => Number.isSafeInteger(v) && v >= 1 && v <= 16;
   // Invalid overrides fall back to the committed cap; unreadable/invalid defaults hold all new rounds.
   let defaultMax = 0;
@@ -1971,7 +2002,24 @@ export function liveReviewRoundBudget({ env = process.env, listCommands = () => 
   } catch {
     return { left: 0, reason: `live review rounds unknown (ambiguous script path or runtime option); maxLiveReviewRounds=${max} (${src})` };
   }
-  return { left: Math.max(0, max - live), live, max, countedJobPids, reason: `live review rounds ${live} of maxLiveReviewRounds=${max} (${src})` };
+  let reservedSlots = 4;
+  try {
+    const overrides = readOverrides();
+    const value = overrides?.values?.['redTeam.queue.reservedSlots'];
+    if (overrides?.readable !== false && Number.isInteger(value) && value >= 0 && value <= 8) reservedSlots = value;
+  } catch { /* unreadable override uses the default reserve */ }
+  // CLI supplies a reader so maintenance/dispatch can change runnable membership within this tick.
+  // Keep the process snapshot and shared `left` balance intact across those queue changes.
+  const reserve = () => {
+    const size = typeof queueSize === 'function' ? queueSize() : queueSize;
+    return Number.isInteger(size) && size > 0 ? Math.min(reservedSlots, size, max) : 0;
+  };
+  return { left: Math.max(0, max - live), live, max, countedJobPids,
+    get reserve() { return reserve(); },
+    get reason() {
+      const slots = reserve();
+      return `live review rounds ${live} of maxLiveReviewRounds=${max} (${src})${slots > 0 ? `; red-team reserve ${slots}` : ''}`;
+    } };
 }
 
 export function buildCliDaemonEffects({
