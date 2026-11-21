@@ -50,5 +50,9 @@
   {
     "file": "scripts/conveyor/soak/breaks/review-live-round-cap-accounting.mjs",
     "reason": "This soak scenario must use real registered repository slugs so review-capability admission reaches the injected declining and healthy round-cap outcomes."
+  },
+  {
+    "file": "scripts/conveyor/soak/breaks/stall-classify-unpublished-findings-ruling-needed.mjs",
+    "reason": "This soak scenario must use the real registered repository slug so the stall classifier accepts the row and reaches the unpublished-findings path."
   }
 ]

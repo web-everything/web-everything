@@ -1,6 +1,24 @@
 {
   "$comment": "Add metadata for every non-$comment top-level declared key and CAPACITY_LEAVES key. Descriptions live only here (max 160 characters). owner is the primary declaring file; the generator lists every declaring file. Record capacity aliases under leaves ($ means the scalar itself). Arrays count as one leaf. toSettle preserves pass-table values; pass C instant means its env-only column indicates an override, not proof of live reload. Pass A was an unquantified baseline inventory of declared settings, platform files, capacity leaves, operator prefs keys and env vars; numeric discovery evidence starts at B. R1076: behavior belongs in product settings; this inventory does not convert constants.",
   "settings": {
+    "allowedKinds": {
+      "description": "Doc-fix only; test-fix refused until #8606 regardless of settings. Production confinement unavailable; repair size 1.",
+      "owner": "scripts/settings/agy-build.json",
+      "changeVia": "env",
+      "instant": false
+    },
+    "kindMaxSize": {
+      "description": "Maximum direct confined agy build size for allowedKinds; repair dispatch remains size 1.",
+      "owner": "scripts/settings/agy-build.json",
+      "changeVia": "env",
+      "instant": false
+    },
+    "maxSize": {
+      "description": "Maximum direct confined agy build size for any kind; repair dispatch remains size 1.",
+      "owner": "scripts/settings/agy-build.json",
+      "changeVia": "env",
+      "instant": false
+    },
     "heavyAdmissionCap": {
       "description": "Maximum concurrent heavy commands admitted on the host.",
       "owner": "scripts/dispatch-settings.json",
@@ -982,6 +1000,11 @@
     }
   },
   "capacityLeaves": {
+    "redTeam.queue.reservedSlots": {
+      "description": "Live review slots reserved while runnable red-team work is queued; default 4, lent back when the queue is empty or unknown.",
+      "range": "integer 0–8",
+      "unit": "slots"
+    },
     "ciHeal.reserve": {
       "description": "Delivery slots held back for CI-heal work.",
       "range": "integer 0–12",
