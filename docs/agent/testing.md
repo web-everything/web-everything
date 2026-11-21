@@ -4753,8 +4753,9 @@ The declared `ruled-weakened-add` CLI uses an array field with `repeatable: true
 ## Lane lease heartbeats
 
 Use `lane-lease-heartbeat.mjs` for best-effort atomic renewal from any lane subdirectory.
-Owned `acquire --lane=N --adopt` may skip canonical-origin resolution, but must still
-probe local history without repair; missing ancestors quarantine the lane. Stale-lease
+`acquire --lane=N --adopt` from a lane cwd has no metadata-only path: owner and foreign
+callers alike must resolve a canonical origin. Lease guard and holder-PID tests use the
+full origin-validated acquire. Stale-lease
 PID/dirty refusals precede takeover; unleased reclaim retains its preservation-report contract.
 Apply lease-holder safety only when a marker exists. Unleased recovery and salvage retain their
 backup, preservation and liveness checks; dirty content alone must not skip those checks.
