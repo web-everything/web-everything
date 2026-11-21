@@ -13,9 +13,12 @@ it('runs the real shape child and reuses its head-and-base result from an owner-
     const head = ctx.head(), cacheDir = join(ctx.tmp, 'conveyor');
     const options = {
       checkoutState: () => ({ behind: 0 }),
-      gh: () => JSON.stringify([{ number: 1, title: 'cache fixture', headRefOid: head, baseRefOid: head,
+      baseCap: 3,
+      gh: args => { const value = { number: 1, title: 'cache fixture', headRefOid: head, baseRefOid: head,
         labels: [{ name: 'review:human' }], assignees: [], updatedAt: '2026-10-22T13:00:00Z',
-        files: [{ path: 'README.md' }], changedFiles: 1 }]),
+        body: '', createdAt: '2026-10-22T13:00:00Z', statusCheckRollup: [], commits: [],
+        files: [{ path: 'README.md' }], changedFiles: 1 };
+        return JSON.stringify(args[1] === 'list' ? [value] : value); },
       now: () => Date.parse('2026-10-22T13:01:00Z'), readLedgerRows: () => [],
       readFixRows: () => [], readJobs: () => [], readComments: () => [],
     };
