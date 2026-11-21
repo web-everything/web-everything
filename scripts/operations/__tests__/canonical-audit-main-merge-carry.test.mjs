@@ -80,6 +80,13 @@ describe('canonical main merge carry with real git objects', () => {
   it('refuses a failed main refresh', () => { const f = fixture(); expect(f.run({ fetchMain: () => { throw Error('offline'); } }).ok).toBe(false); });
   it('refuses a failed cat-file read', () => { const f = fixture(); const blob = f.git('rev-parse', `${f.head()}:${timings}`); rmSync(join(f.repo, '.git/objects', blob.slice(0, 2), blob.slice(2))); expect(f.run().ok).toBe(false); });
   it('refuses the head own newer WEAKENED', () => { const f = fixture(); f.records.push({ ...f.audit, head: f.head(), at: '2026-11-20T01:00:00Z' }); expect(f.run().ok).toBe(false); });
+  it('preserves the newer unwaived sibling WEAKENED veto despite identical findings and fingerprint', () => {
+    const f = fixture();
+    expect(f.run().ok).toBe(true);
+    const sibling = f.git('commit-tree', f.git('rev-parse', `${f.A}^{tree}`), '-p', f.base, '-m', 'sibling');
+    f.records.push({ ...f.audit, head: sibling, at: '2026-11-20T01:00:00Z' });
+    expect(f.run()).toMatchObject({ ok: false, reason: 'canonical-audit-weakened' });
+  });
   it('refuses a waiver for another ref', () => { const f = fixture(); f.waiver.ref = 'lane/other'; expect(f.run().ok).toBe(false); });
   it('refuses a revoked waiver on a later check', () => { const f = fixture(); expect(f.run().ok).toBe(true); f.revoke(); expect(f.run().ok).toBe(false); });
   it('refuses a five-hop chain with an operator fallback', () => { const f = fixture({ hops: 5 }); const r = f.run(); expect(r.ok).toBe(false); expect(r.message).toMatch(/audit|operator/i); });

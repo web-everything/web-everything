@@ -6,7 +6,7 @@ import { dirname, resolve, join } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { createPrLandRunner } from '../open-pr-io.mjs';
 import { classifySubmit } from '../open-pr.mjs';
-import { admitCanonicalAudit } from '../../pr-land.mjs';
+import { admitCanonicalAudit, prCreateBodyGuard } from '../../pr-land.mjs';
 import { checkCanonicalAuditForOpen } from '../canonical-audit-gate.mjs';
 import { QUESTION_HASH } from '../codex-audit.mjs';
 import { blocker } from '../../lib/open-pr-preflight.mjs';
@@ -94,8 +94,35 @@ describe('combined open-pr preflight', () => {
     const bodies = args.filter(a => a.startsWith('--body='));
     expect(bodies).toHaveLength(duplicate ? 2 : 1);
     if (duplicate) expect(bodies[0]).toBe('--body=First inline body');
-    expect(bodies.at(-1)).toContain(`--body=Inline review body\n<!-- audit-carry: carried-across-main-merge ${base}..${sha} -->`);
+    expect(bodies.at(-1)).toContain(`--body=Inline review body <!-- audit-carry: carried-across-main-merge ${base}..${sha} -->`);
+    // Use pr-land's ordinary flag regex so a multiline annotation cannot silently discard the body.
+    const flags = {};
+    for (const arg of args) {
+      const match = arg.match(/^--([^=]+)(?:=(.*))?$/);
+      if (match) flags[match[1]] = match[2] ?? true;
+    }
+    expect(flags.body).toContain('Inline review body <!-- audit-carry:');
+    expect(prCreateBodyGuard(flags.body)).toEqual({ ok: true });
     expect(args.some(a => a.startsWith('--body-file='))).toBe(false);
+  });
+  it.each(['', ' \n\t'])('leaves an empty body file untouched so carry cannot bypass the body gate: %j', body => {
+    const dir = mkdtempSync(join(tmpdir(), 'audit-carry-empty-body-'));
+    const path = join(dir, 'body.md');
+    writeFileSync(path, body);
+    const spawn = vi.fn((_cmd, args) => {
+      expect(args).toContain(`--body-file=${path}`);
+      const guard = prCreateBodyGuard(readFileSync(path, 'utf8'));
+      expect(guard).toMatchObject({ ok: false, code: 'empty-body' });
+      return { status: 3, stdout: JSON.stringify({ reason: guard.code }) };
+    });
+    const run = createPrLandRunner({ env: {}, spawn, prepGate: () => ({ ok: true }),
+      prePrReview: () => ({ action: 'pass' }),
+      canonicalAudit: () => ({ ok: true, carried: { from: base, to: sha, fingerprint: 'f'.repeat(64) } }) });
+    try {
+      expect(run({ argv: ['--ref=lane/audit', `--body-file=${path}`] })).toMatchObject({ outcome: 'refused', reason: 'empty-body' });
+      expect(spawn).toHaveBeenCalledOnce();
+      expect(readFileSync(path, 'utf8')).toBe(body);
+    } finally { rmSync(dir, { recursive: true, force: true }); }
   });
   it('fails closed if the check child dies or returns an opened payload', () => {
     for (const child of [{ error: new Error('spawn failed') }, { status: 0, stdout: '{"pr":7}' },

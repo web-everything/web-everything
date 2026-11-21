@@ -96,18 +96,23 @@ export const OPEN_PR_TIMEOUT_MS = 30 * 60 * 1000;
 function withBypassInBody(argv, b, cwd) {
   return withNoteInBody(argv, renderBypassNote(b), cwd);
 }
-function withNoteInBody(argv, note, cwd) {
+function withNoteInBody(argv, note, cwd, { preserveEmpty = false } = {}) {
   const i = argv.findLastIndex((a) => a.startsWith('--body-file='));
   if (i < 0) {
     const bodyIndex = argv.findLastIndex((a) => a.startsWith('--body='));
     if (bodyIndex < 0) throw new Error('the request has no --body-file or --body, so the bypass cannot be recorded in the PR body');
-    return { argv: argv.map((a, j) => (j === bodyIndex ? a + note : a)), cleanup: () => {} };
+    if (preserveEmpty && !argv[bodyIndex].slice('--body='.length).trim()) return { argv, cleanup: () => {} };
+    // pr-land's flag parser does not accept multiline inline values.
+    const inlineNote = note.replace(/[\r\n]+/g, ' ').trim();
+    return { argv: argv.map((a, j) => (j === bodyIndex ? `${a} ${inlineNote}` : a)), cleanup: () => {} };
   }
+  const body = readFileSync(bodyFilePath(argv[i].slice('--body-file='.length), cwd), 'utf8');
+  if (preserveEmpty && !body.trim()) return { argv, cleanup: () => {} };
   const dir = mkdtempSync(join(tmpdir(), 'open-pr-bypass-'));
   const cleanup = () => rmSync(dir, { recursive: true, force: true });
   try {
     const out = join(dir, 'body.md');
-    writeFileSync(out, readFileSync(bodyFilePath(argv[i].slice('--body-file='.length), cwd), 'utf8') + note);
+    writeFileSync(out, body + note);
     return { argv: argv.map((a, j) => (j === i ? `--body-file=${out}` : a)), cleanup };
   } catch (e) { cleanup(); throw e; }
 }
@@ -251,7 +256,7 @@ export function createPrLandRunner({ canonicalAudit = checkCanonicalAuditForOpen
       if (!collectOnly && argv.some(a => a.startsWith('--body-file=') || a.startsWith('--body='))) {
         const previousCleanup = cleanupBody;
         try {
-          const noted = withNoteInBody(argv, `\n<!-- audit-carry: carried-across-main-merge ${c.from}..${c.to} -->\nMain-merge audit carry preserves the lane diff; CI still runs on the merged head.\n`, cwd);
+          const noted = withNoteInBody(argv, `\n<!-- audit-carry: carried-across-main-merge ${c.from}..${c.to} -->\nMain-merge audit carry preserves the lane diff; CI still runs on the merged head.\n`, cwd, { preserveEmpty: true });
           argv = noted.argv;
           cleanupBody = () => { noted.cleanup(); previousCleanup(); };
         } catch (e) {

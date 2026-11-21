@@ -131,7 +131,8 @@ export function checkCanonicalAuditForOpen({ repo = process.cwd(), ref, sha, env
         if (!carry.ok || !carriesAcross(entry.fingerprint, carry.fingerprint)) continue;
         const waived = canonicalAuditEvidence(records, fullSha, covers, carry.fingerprint, { ruledWeakened: {
           ruledWeakened: { ruling: entry.ruling, findings: entry.findings },
-          record: { sha: entry.sha, fingerprint: entry.fingerprint },
+          // Bind this ruling to its own head; a fingerprint-wide ruling would also waive sibling vetoes.
+          record: { sha: entry.sha, fingerprint: null },
         } });
         // Only the named historical verdict may be admitted by this waiver.
         if (waived.ok && waived.record.head.toLowerCase() === entry.sha.toLowerCase()
