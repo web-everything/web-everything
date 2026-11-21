@@ -1489,10 +1489,20 @@ describe('request with an explicit --gate when the default selection is blocked'
 
   it('accepts an affected-test gate and stamps the request', () => {
     blockDefault();
-    const r = request('npx vitest related src/a.test.ts --run');
+    const r = request('npx vitest run src/a.test.ts');
     expect(r.status).toBe(0);
     expect(JSON.parse(r.stdout)).toMatchObject({ status: 'requested' });
-    expect(JSON.parse(readFileSync(marker(), 'utf8'))).toMatchObject({ status: 'running', suites: "npx vitest run 'src/a.test.ts' --passWithNoTests --testTimeout=15000 --hookTimeout=30000" });
+    expect(JSON.parse(readFileSync(marker(), 'utf8'))).toMatchObject({ status: 'running', suites: 'npx vitest run src/a.test.ts' });
+  });
+
+  it('refuses an affected-test gate rewritten to include --passWithNoTests and records no marker', () => {
+    blockDefault();
+    const r = request('npx vitest related src/a.test.ts --run');
+    expect(r.stderr).toContain('explicit related gate capped');
+    expect(r.status).toBe(3);
+    expect(JSON.parse(r.stdout)).toMatchObject({ status: 'gate-refused', reason: 'explicit-gate-not-affected-test',
+      detail: expect.stringContaining('--passWithNoTests') });
+    expect(existsSync(marker())).toBe(false);
   });
 
   it('a dispatcher child (--run-id) re-checks at run time: a gate accepted for a docs-only diff does not run once the tree reaches package.json', () => {

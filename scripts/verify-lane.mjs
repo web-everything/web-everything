@@ -469,7 +469,7 @@ if (typeof flags.gate === 'string') {
       const scripts = readCheckoutScripts();
       return runsWholeUnitTier(policy, scripts) && GATE === 'npm run test:unit' + (scripts.includes('check:standards') ? ' && npm run check:standards' : '');
     } catch { return false; } })();
-    const refusal = capRefusal || (defaultBlocked && !policyFull && !resolvedGate ? explicitGateRefusal(flags.gate) : null);
+    const refusal = capRefusal || (defaultBlocked && !policyFull && !resolvedGate ? explicitGateRefusal(flags.gate) || explicitGateRefusal(GATE) : null);
     if (refusal) {
       // A dispatched child must leave a TERMINAL record (red, exit 3) — leaving the `running` request as it was would
       // make the dispatcher re-spawn this same refusal on every sweep. A plain `request` records nothing.

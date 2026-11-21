@@ -27,6 +27,12 @@ it('a hub change with ≤ relatedMaxTests graph tests runs `vitest run <list>`, 
   expect(plan.command).not.toContain('vitest related');
   expect(plan.decision.selection.tests).toEqual([own]);
 });
+it.each([0, -3, 'abc', NaN, null])('relatedMaxTests=%s never means "run no tests"', max => {
+  const plan = gates.resolveDefaultGate(fixture({ max }));
+  expect(plan.command).toContain(`npx vitest run`);
+  expect(plan.command).toContain(own);
+  expect(plan.command).not.toMatch(/^echo|vitest related/);
+});
 it('complete selection returns a sorted tests list', () => {
   expect(selectRelatedTests({ changedFiles: [hub], reverse: new Map([[hub, new Set(['z.test.mjs', 'a.test.mjs'])]]), maxTests: 4, maxDepth: 2 }).tests).toEqual(['a.test.mjs', 'z.test.mjs']);
 });
