@@ -7,10 +7,10 @@
  *   • The CLI — the only writer of the state file. If a verb is not idempotent, a second identical run silently
  *     rewrites a date or duplicates a row, and the board starts lying about when work moved.
  *
- * The CLI tests SPAWN the real script against a temp state + out path with `--no-gh`, so nothing here touches the
- * network or the repo's own board. `WE_BOARD_NOW` freezes the stamp so renders are comparable byte-for-byte.
+ * The CLI tests call main directly and spawn each verb once against temp state + out paths
+ * with `--no-gh`, so nothing here touches the network or the repo's own board. `WE_BOARD_NOW` freezes the stamp so renders are comparable byte-for-byte.
  */
-import { describe, it, expect, beforeEach, afterAll } from 'vitest';
+import { describe, it, expect, beforeEach, afterAll, vi } from 'vitest';
 import { PR_STATUS_STATES } from '../conveyor/pr-status-label.mjs';
 import { spawnSync } from 'node:child_process';
 import { chmodSync, copyFileSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync, rmSync, existsSync, symlinkSync } from 'node:fs';
@@ -19,6 +19,7 @@ import { dirname, join } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { outputMixRepo } from '../lib/__tests__/helpers/output-mix-repo.mjs';
 import {
+  main,
   classifyPr,
   ciFailed,
   ciPending,
@@ -86,13 +87,38 @@ beforeEach(() => {
   writeFileSync(statePath, JSON.stringify(SEED, null, 2));
 });
 
-/** Run the real CLI. Never throws — exit code + stdout are the assertion surface. */
+/** Keep a process smoke for every verb; repeat cases call the same CLI main without reloading its graph. */
+const spawnedVerbs = new Set();
 function cli(...args) {
-  const r = spawnSync(process.execPath, [CLI, `--state=${statePath}`, `--out=${outPath}`, '--no-gh', ...args], {
-    encoding: 'utf8',
-    env: { ...process.env, WE_BOARD_NOW: NOW, WE_BOARD_NO_GH: '1', WE_BOARD_NO_GIT: '1' },
-  });
-  return { code: r.status, out: r.stdout.trim(), err: r.stderr.trim() };
+  const argv = [`--state=${statePath}`, `--out=${outPath}`, '--no-gh', ...args];
+  const verb = args[0]?.split('=')[0] ?? 'render';
+  if (!spawnedVerbs.has(verb)) {
+    spawnedVerbs.add(verb);
+    const r = spawnSync(process.execPath, [CLI, ...argv], {
+      encoding: 'utf8',
+      env: { ...process.env, WE_BOARD_NOW: NOW, WE_BOARD_NO_GH: '1', WE_BOARD_NO_GIT: '1' },
+    });
+    expect(r.error).toBeUndefined();
+    return { code: r.status, out: r.stdout.trim(), err: r.stderr.trim() };
+  }
+  let out = '', err = '';
+  const saved = { ...process.env };
+  const log = vi.spyOn(console, 'log').mockImplementation((...xs) => { out += xs.join(' ') + '\n'; });
+  const error = vi.spyOn(console, 'error').mockImplementation((...xs) => { err += xs.join(' ') + '\n'; });
+  const stdout = vi.spyOn(process.stdout, 'write').mockImplementation(s => { out += s; return true; });
+  try {
+    Object.assign(process.env, { WE_BOARD_NOW: NOW, WE_BOARD_NO_GH: '1', WE_BOARD_NO_GIT: '1' });
+    const code = main(argv);
+    return { code, out: out.trim(), err: err.trim() };
+  } finally {
+    log.mockRestore();
+    error.mockRestore();
+    stdout.mockRestore();
+    for (const key of ['WE_BOARD_NOW', 'WE_BOARD_NO_GH', 'WE_BOARD_NO_GIT']) {
+      if (saved[key] === undefined) delete process.env[key];
+      else process.env[key] = saved[key];
+    }
+  }
 }
 
 const state = () => JSON.parse(readFileSync(statePath, 'utf8'));
@@ -1451,7 +1477,7 @@ describe('degradation when gh answers only half the question', () => {
   const run = () =>
     spawnSync(process.execPath, [CLI, `--state=${statePath}`, `--out=${outPath}`], {
       encoding: 'utf8',
-      env: { ...process.env, WE_BOARD_NOW: NOW, WE_BOARD_NO_GH: '', PATH: `${bin}:${process.env.PATH}` },
+      env: { ...process.env, WE_BOARD_NOW: NOW, WE_BOARD_NO_GH: '', WE_BOARD_NO_GIT: '1', PATH: `${bin}:${process.env.PATH}` },
     });
 
   it('says what it could not read instead of rendering the gap as a fact', () => {

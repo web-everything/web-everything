@@ -290,30 +290,46 @@ export function withWakeIntent(io, { stamp }) {
 export function superviseAwaitVerifyLoop({ spawnLoop = () => spawnAwaitVerifyLoop(), log = console, setTimer = setTimeout, now = Date.now, minGapMs = 60_000 } = {}) {
   let child = null;
   let stopped = false;
+  let halted = false; // paused by `halt()`; a later explicit `start()` resumes, timers never do
   let lastStart = 0;
+  // A timer must never add a second child: it restarts only when halted is off AND no child is alive.
+  const restart = () => (halted || child ? null : start());
   const start = () => {
     if (stopped) return null;
+    halted = false;
     lastStart = now();
     try { child = spawnLoop(); } catch (e) {
       child = null;
       // A spawn that throws (EMFILE/EAGAIN) has no 'exit' to arm the restart, so arm the same rate-limited retry here.
       log.error(`reconcile-fix-dispatch-daemon: await-verify loop spawn failed: ${String(e?.message ?? e)}; retrying in ${Math.round(minGapMs / 1000)}s`);
-      const retry = setTimer(start, minGapMs);
+      const retry = setTimer(restart, minGapMs);
       retry?.unref?.();
     }
     const mine = child;
-    mine?.on?.('error', (e) => log.error(`reconcile-fix-dispatch-daemon: await-verify loop error: ${String(e?.message ?? e)}`));
+    let retryArmed = false;
+    const retry = () => {
+      if (stopped || halted || retryArmed) return;
+      retryArmed = true;
+      const t = setTimer(restart, Math.max(0, minGapMs - (now() - lastStart)));
+      t?.unref?.();
+    };
+    mine?.on?.('error', (e) => {
+      if (child === mine) child = null;
+      log.error(`reconcile-fix-dispatch-daemon: await-verify loop error: ${String(e?.message ?? e)}`);
+      retry();
+    });
     mine?.on?.('exit', (code) => {
       if (child === mine) child = null;
-      if (stopped || code === 0) return;
+      if (stopped || halted || code === 0) return;
       log.error(`reconcile-fix-dispatch-daemon: await-verify loop exited (${code}); the tick runs the pass until it is back`);
-      const t = setTimer(start, Math.max(0, minGapMs - (now() - lastStart)));
-      t?.unref?.();
+      retry();
     });
     return mine;
   };
   const stop = () => { stopped = true; try { child?.kill?.('SIGTERM'); } catch { /* already gone */ } };
-  return { start, stop, current: () => child };
+  /** Stop the child (SIGTERM) without ending supervision: only an explicit `start()` brings it back. */
+  const halt = () => { halted = true; const c = child; child = null; try { c?.kill?.('SIGTERM'); } catch { /* already gone */ } };
+  return { start, stop, halt, current: () => child };
 }
 export const wokenJournalPath = (env = process.env) => join(resolveCoordinationRoot({ env }), 'await-verify-woken.json');
 /**
