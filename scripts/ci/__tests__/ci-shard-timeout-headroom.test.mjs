@@ -15,6 +15,8 @@ const soakConfig = readFileSync(new URL('../../../vitest.soak.config.ts', import
 const WORST_UNIT_SHARD_MIN = 14;
 // 2026-11-21 (main red @ b784af27e): the baseline took 925s on a green run and hit the 17-min cap on a slow runner.
 const WORST_SOAK_BASELINE_MIN = 15.5;
+// Checkout + npm ci + cache restore + teardown that run inside the soak-shard job but outside the vitest test.
+const SOAK_JOB_SETUP_TEARDOWN_MIN = 3;
 // 2026-11-18 samples: test-shard (3) up to 24 min, soak shards up to 17 min.
 const WORST_TEST_SHARD_MIN = 24;
 // TT3 run 44443900759: the slowest integration part took 9.9 min before lane-pool was split further.
@@ -45,10 +47,15 @@ describe('CI job caps keep headroom over a slow runner', () => {
   });
 
   it('the soak vitest timeout leaves 1.5x headroom over the slowest baseline and still fires before the job cap', () => {
-    const m = /testTimeout:\s*Number\(process\.env\.WE_SOAK_TEST_TIMEOUT_MS\)\s*\|\|\s*(\d+)\s*\*\s*60_000/.exec(soakConfig);
-    expect(m, 'vitest.soak.config.ts testTimeout default not found').not.toBeNull();
+    const m = /testTimeout:\s*Math\.min\(\s*Number\(process\.env\.WE_SOAK_TEST_TIMEOUT_MS\)\s*\|\|\s*(\d+)\s*\*\s*60_000,\s*(\d+)\s*\*\s*60_000\s*\)/
+      .exec(soakConfig);
+    expect(m, 'vitest.soak.config.ts clamped testTimeout default not found').not.toBeNull();
     const testTimeoutMin = Number(m[1]);
+    const clampMin = Number(m[2]);
+    const jobCapMin = jobs['soak-shard']['timeout-minutes'];
     expect(testTimeoutMin).toBeGreaterThanOrEqual(WORST_SOAK_BASELINE_MIN * 1.5);
-    expect(testTimeoutMin).toBeLessThan(jobs['soak-shard']['timeout-minutes']);
+    expect(testTimeoutMin).toBeLessThanOrEqual(clampMin);
+    // The env knob can never push the test past the job cap minus setup/teardown, so a hung scenario fails loudly.
+    expect(clampMin).toBeLessThanOrEqual(jobCapMin - SOAK_JOB_SETUP_TEARDOWN_MIN);
   });
 });

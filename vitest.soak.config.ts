@@ -47,7 +47,9 @@ export default defineConfig({
     // main went red @ b784af27e when a slow runner hit the 1020s cap (1030s). 24 min is ~1.5x the slowest seen
     // and stays under the 30-min `soak-shard` job cap (setup ~2 min).
     // Knob: WE_SOAK_TEST_TIMEOUT_MS.
-    testTimeout: Number(process.env.WE_SOAK_TEST_TIMEOUT_MS) || 24 * 60_000,
+    // The knob is CLAMPED to 27 min: whatever it is set to, a hung scenario still fails loudly before the 30-min job
+    // cap cancels the job (setup + teardown need ~3 min).
+    testTimeout: Math.min(Number(process.env.WE_SOAK_TEST_TIMEOUT_MS) || 24 * 60_000, 27 * 60_000),
     hookTimeout: 5 * 60_000,
   },
 });
