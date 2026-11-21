@@ -237,6 +237,60 @@ test('live pass uses only gh GET/query reads and emits only expectation-missed',
 }));
 const liveOptions = paths => ({ repo: 'example/widgets', settings, now: at(0),
   stateFile: paths.stateFile, env: { WE_DAEMON_EVENTS: paths.eventsFile }, log() {}, emitEvent: () => true });
+test.each(['success', 'failure', 'cancelled', 'timed_out', 'neutral', 'skipped', 'action_required', 'stale'])(
+  'completed red-team %s settles the pending expectation after its label clears', conclusion => scratch(async paths => {
+    const io = githubRead(); let completed = false;
+    const opts = { ...liveOptions(paths), pr: 7, gh(args) {
+      if (args[1].includes('/timeline?')) return [
+        { event: 'labeled', label: { name: 'red-team:pending' }, created_at: at(0), id: 1 },
+        ...(completed ? [{ event: 'unlabeled', label: { name: 'red-team:pending' }, created_at: at(5), id: 2 }] : []),
+      ];
+      if (args[1].includes('/check-runs?')) return { total_count: 1, check_runs: [{
+        name: 'red-team', head_sha: sha, status: completed ? 'completed' : 'in_progress',
+        started_at: at(0), completed_at: completed ? at(5) : null,
+        conclusion: completed ? conclusion : null, id: 3,
+      }] };
+      const response = io.gh(args);
+      if (args[1] === 'graphql') response.data.repository.pullRequest.labels.nodes = completed ? [] : [{ name: 'red-team:pending' }];
+      return response;
+    } };
+    const first = await runExpectationPass(opts);
+    assert.equal(first.results.find(r => r.expectationId === 'red-team-no-verdict')?.status, 'pending');
+    completed = true;
+    const result = await runExpectationPass({ ...opts, now: at(61) });
+    assert.equal(result.incomplete, false);
+    const verdict = result.results.find(r => r.expectationId === 'red-team-no-verdict');
+    assert.equal(verdict?.status, 'met');
+    assert.equal(verdict.reactionAt, at(5)); assert.equal(verdict.late, false);
+    assert.equal(result.delivered, 0);
+  }));
+test.each(['review-gate', 'Review Gate', 'CI / review-gate (labels)'])(
+  '%s and unit checks cannot satisfy review-started or update restart', name => scratch(async paths => {
+    writeFileSync(paths.eventsFile, ['worker-push', 'update-branch'].map(action => JSON.stringify(observation(action))).join('\n') + '\n');
+    const io = githubRead();
+    const result = await runExpectationPass({ ...liveOptions(paths), pr: 7, now: at(16), gh(args) {
+      if (args[1].includes('/check-runs?')) return { total_count: 2, check_runs: ['unit', name].map((checkName, id) => ({
+        name: checkName, head_sha: sha, status: 'completed', conclusion: id ? 'failure' : 'success',
+        started_at: at(1), completed_at: at(2), id,
+      })) };
+      return io.gh(args);
+    } });
+    assert.equal(result.incomplete, false);
+    for (const id of ['push-no-review', 'update-no-restart'])
+      assert.equal(result.results.find(r => r.expectationId === id)?.status, 'missed');
+  }));
+test('real review dispatch still satisfies review-started', () => {
+  const io = githubRead();
+  const collected = collectExpectationEvidence({ repo: 'example/widgets', pr: 7, now: at(16), read(args) {
+    if (args[1].includes('/check-runs?')) return { total_count: 1, check_runs: [{
+      name: 'AI review', head_sha: sha, status: 'in_progress', started_at: at(1), id: 1,
+    }] };
+    return io.gh(args);
+  } });
+  const result = evaluateExpectations({ settings, actions: [observation('worker-push')],
+    evidence: { eventsReadable: true, prs: { 7: collected } }, now: at(16) });
+  assert.equal(result.find(r => r.expectationId === 'push-no-review')?.status, 'met');
+});
 test('historical actions outside the collected set do not make the live pass incomplete', () => scratch(async paths => {
   writeFileSync(paths.eventsFile, JSON.stringify({ ...observation('worker-push'), pr: 99 }) + '\n');
   const io = githubRead();

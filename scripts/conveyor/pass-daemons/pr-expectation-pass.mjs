@@ -155,10 +155,13 @@ export function collectExpectationEvidence({ repo, pr, read, now }) {
       || !['queued', 'in_progress', 'completed'].includes(check.status)) throw Error('unknown check');
     const gate = /merge[- ]gate/i.test(check.name);
     const redTeam = /(^|[^a-z0-9])red[- ]team([^a-z0-9]|$)/i.test(check.name);
-    const review = !redTeam && /(^|[^a-z0-9])review([^a-z0-9]|$)/i.test(check.name);
+    const review = !redTeam && !/review[- ]gate/i.test(check.name)
+      && /(^|[^a-z0-9])review([^a-z0-9]|$)/i.test(check.name);
     if (check.started_at) add(gate ? 'merge-gate-started' : redTeam ? 'red-team-started'
       : review ? 'review-started' : 'ci-started', check.started_at, check.html_url ?? `check:${check.id}`, true);
     if (check.status === 'completed' && !['success', 'failure', 'cancelled', 'timed_out', 'neutral', 'skipped', 'action_required', 'stale'].includes(check.conclusion)) throw Error('unknown check conclusion');
+    if (redTeam && check.status === 'completed')
+      add('red-team-verdict', check.completed_at, check.html_url ?? `check:${check.id}`, true);
     if (gate && check.conclusion === 'success') add('merge-gate-pass', check.completed_at, check.html_url ?? `check:${check.id}`, true);
     if (!gate && !review && !redTeam && ['failure', 'timed_out'].includes(check.conclusion))
       add('ci-red', check.completed_at, check.html_url ?? `check:${check.id}`, true);
