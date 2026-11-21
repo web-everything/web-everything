@@ -73,7 +73,27 @@ describe('canonical main merge carry with real git objects', () => {
   it.each(['bad', 'f'.repeat(64)])('refuses an invalid or differing waiver fingerprint %s', fp => { const f = fixture(); f.waiver.fingerprint = fp; expect(f.run().ok).toBe(false); });
   it('refuses a code conflict resolved with a new hunk', () => { expect(fixture({ conflict: true }).run().ok).toBe(false); });
   it('refuses deleted test-timings.json', () => { const f = fixture(); f.amend(timings, null); expect(f.run().ok).toBe(false); });
-  it('refuses changed test-timings.json mode', () => { const f = fixture(); chmodSync(join(f.repo, timings), 0o755); f.amend('touch.txt', 'x'); expect(f.run().ok).toBe(false); });
+  it('refuses changed test-timings.json mode through the timings guard even with matching fingerprints', () => {
+    const f = fixture();
+    chmodSync(join(f.repo, timings), 0o755);
+    f.amend(timings, readFileSync(join(f.repo, timings), 'utf8'));
+    expect(f.git('diff', '--name-only', f.A, f.head())).toBe(`main-0.txt\n${timings}`);
+    const originalFingerprint = f.audit.fingerprint;
+    // Match the evidence to the mode-only diff so fingerprint mismatch cannot cause refusal.
+    f.audit.fingerprint = f.waiver.fingerprint = netDiffFingerprint(f.repo, f.main, f.head());
+    const timingReads = [];
+    const result = f.run({ exec: (cmd, args, options) => {
+      if (args.includes('ls-tree') && args.at(-1) === timings) timingReads.push(args.at(-3));
+      return execFileSync(cmd, args, options);
+    } });
+    expect(timingReads).toEqual([f.head(), f.A, f.main]);
+    expect(result).toMatchObject({ ok: false, reason: 'canonical-audit-weakened' });
+    // Restoring only the mode clears the timings guard and permits the same carry.
+    chmodSync(join(f.repo, timings), 0o644);
+    f.amend(timings, readFileSync(join(f.repo, timings), 'utf8'));
+    f.audit.fingerprint = f.waiver.fingerprint = originalFingerprint;
+    expect(f.run().ok).toBe(true);
+  });
   it('refuses swapped parents', () => { const f = fixture(); f.parents([f.main, f.A]); expect(f.run().ok).toBe(false); });
   it('refuses three parents', () => { const f = fixture(); const sibling = f.git('commit-tree', f.git('rev-parse', `${f.A}^{tree}`), '-p', f.base, '-m', 'sibling'); f.parents([f.A, f.main, sibling]); expect(f.run().ok).toBe(false); });
   it('refuses parent two outside origin/main', () => { const f = fixture(); f.git('update-ref', 'refs/remotes/origin/main', f.base); expect(f.run().ok).toBe(false); });
