@@ -131,6 +131,13 @@ describe('resource actions', () => {
     expect(() => actions.claim({ resource, kind: 'fix', owner: 'a' })).toThrow(CoordinationUnavailableError);
     expect(() => actions.list()).toThrow(CoordinationUnavailableError);
   });
+  it('an undecodable or unparseable directory name refuses every claim (could alias this resource)', () => {
+    for (const name of ['bad%ZZ', 'not-a-resource']) {
+      fs.mkdirSync(join(actions.dir, name), { recursive: true });
+      expect(() => actions.claim({ resource, kind: 'fix', owner: 'a' })).toThrow(CoordinationUnavailableError);
+      fs.rmdirSync(join(actions.dir, name));
+    }
+  });
   it('keeps completed effects observed until their postcondition, and only warns on age', async () => {
     actions = createActionStore({ now, maxObservedAgeMs: 5 });
     await guardedDispatch({ resource, kind: 'fix', owner: 'a', actions, now, effect: () => 'agent' });

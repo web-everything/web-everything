@@ -42,8 +42,9 @@ export function createActionStore({ root = resolveCoordinationRoot(), fs = nativ
   // Directories of other resources are not scanned, so they cannot block this claim.
   const assertNoAliasDirs = (resource) => io(dir, () => {
     for (const name of ensure()) {
-      let key = null;
-      try { key = parseResource(decodeURIComponent(name)).resource; } catch { /* unrelated or unparseable name */ }
+      let key;
+      // An undecodable or unparseable name could be an alias of THIS resource: refuse (fail closed).
+      try { key = parseResource(decodeURIComponent(name)).resource; } catch { throw new Error('Undecodable resource directory'); }
       if (key === resource && encodeURIComponent(key) !== name) throw new Error('Noncanonical resource directory');
     }
   });
