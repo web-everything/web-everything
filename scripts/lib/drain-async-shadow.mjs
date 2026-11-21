@@ -34,12 +34,13 @@ const toolAsyncShadowMode = () => { try { return readSettings()?.drain?.asyncSha
 
 /**
  * Mode: explicit option, then WE_ASYNC_DRAIN, then the tool setting drain.asyncShadow (scripts/settings/
- * drain-async-shadow.json, shadow); an invalid layer falls through, and nothing valid means off. Observation only.
+ * drain-async-shadow.json, shadow). A set but invalid WE_ASYNC_DRAIN, an invalid tool setting, or nothing at all means off. Observation only.
  */
 export function createAsyncShadow({
   env = process.env,
   toolMode = toolAsyncShadowMode(),
-  mode = [env.WE_ASYNC_DRAIN, toolMode].find(validMode) ?? 'off',
+  // A SET env value is final: an invalid one disables observation (it never falls through to the tool setting).
+  mode = env.WE_ASYNC_DRAIN ? (validMode(env.WE_ASYNC_DRAIN) ? env.WE_ASYNC_DRAIN : 'off') : validMode(toolMode) ? toolMode : 'off',
   dir = join(resolveCoordinationRoot({ env }), 'drain-async-shadow'),
   now = Date.now,
   maxBytes = 1_000_000,
