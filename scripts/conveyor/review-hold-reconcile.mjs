@@ -448,7 +448,7 @@ if (IS_CLI) {
         if (r.carry) writeLineSync(2, `  PR #${r.num}: accept carry-forward ${r.carry}${r.detail ? ` — ${r.detail}` : ''}${r.error ? ` (${r.error})` : ''}`);
         if (r.ruling) writeLineSync(2, `  PR #${r.num}: ${dryRun ? 'would ' : ''}${r.ruling} advisory:ruling-needed${r.error ? ` (FAILED: ${r.error})` : ''}`);
         if (r.flagged?.length) {
-          writeLineSync(2, `  🚩 PR #${r.num}: carries contradictory review:* verdict labels (${r.flagged.join(',')}) — #2766/#2767 shape; not auto-resolved (${r.flagReason || 'unresolved'}${r.fetchError ? `, fetch error: ${r.fetchError}` : ''}). Resolve via review-set-label.mjs --to=clear-human or --to=changes.`);
+          writeLineSync(2, `  🚩 PR #${r.num}: carries contradictory review:* verdict labels (${r.flagged.join(',')}) — #2766/#2767 shape; not auto-resolved (${r.flagReason || 'unresolved'}${r.fetchError ? `, fetch error: ${r.fetchError}` : ''}). Resolve via review-set-label.mjs --to=clear-human --expect-head=<full 40-hex head SHA> or --to=changes.`);
         }
       }
       writeAllSync(1, `${JSON.stringify({ checked: true, changed: results.length, results })}\n`);

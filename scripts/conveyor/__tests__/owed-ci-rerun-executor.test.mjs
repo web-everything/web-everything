@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { executeOwedCiReruns, resolveOwedRerunMax } from '../owed-ci-rerun-executor.mjs';
+import { executeOwedCiReruns, probeOriginMain, resolveOwedRerunMax } from '../owed-ci-rerun-executor.mjs';
 import { runReviewTick, buildCliDaemonEffects } from '../../../skills-src/conveyor/review-daemon.mjs';
 vi.mock('../../lib/review-facts.mjs', async original => ({ ...await original(), warmReviewFacts: async () => ({ skipped: 'test' }) }));
 const FRESH = () => ({ fresh: true, behind: 0 });
@@ -34,15 +34,40 @@ describe('owed rerun executor', () => {
     expect(out).toEqual({ requested: [10], refused: [{ pr: 8, reason: 'lost' }, { pr: 9, reason: 'unknown timeout retry result' }], skippedOverCap: 10 });
     await expect(executeOwedCiReruns({ rows: null, log: () => { throw Error('log'); } })).resolves.toEqual({ requested: [], refused: [], skippedOverCap: 0 });
   });
-  it('refuses every owed row with the shared stale-checkout reason without requesting reruns', async () => {
+  it('owed-ci-rerun-survives-stale-daemon-clone: a clone N commits behind still requests the rerun via origin/main', async () => {
+    const git = vi.fn(args => args[0] === 'fetch' ? { status: 0, stdout: '', stderr: '' }
+      : { status: 0, stdout: `${'a'.repeat(40)}\n`, stderr: '' });
+    const dispatchRetry = vi.fn(async () => ({ status: 'requested' }));
+    // Default probe, real one, with an injected git: the clone's own `main` is never compared.
+    const out = await executeOwedCiReruns({ rows: rows.slice(0, 2), repo, root: '/test-checkout', dispatchRetry,
+      checkStaleness: r => probeOriginMain(r, git) });
+    expect(dispatchRetry).toHaveBeenCalledTimes(2);
+    expect(out.requested).toEqual([19, 20].sort((a, b) => a - b));
+    expect(git.mock.calls.every(([args]) => !args.includes('main..origin/main') && args[0] !== 'merge')).toBe(true);
+    // A behind-clone verdict from any probe no longer refuses.
+    const behind = await executeOwedCiReruns({ rows: rows.slice(0, 1), repo, dispatchRetry, checkStaleness: () => ({ fresh: true, behind: 2 }) });
+    expect(behind.requested).toHaveLength(1);
+  });
+  it.each([[{}], [{ fresh: false }], [null], [{ action: 'warn', behind: 2 }]])('refuses unless the probe positively reports fresh (%j)', async verdict => {
     const dispatchRetry = vi.fn();
-    const checkStaleness = vi.fn(() => ({ action: 'warn', behind: 2, dirty: true }));
-    const out = await executeOwedCiReruns({ rows, repo, root: '/test-checkout', checkStaleness, dispatchRetry });
-    expect(checkStaleness).toHaveBeenCalledWith('/test-checkout');
+    const out = await executeOwedCiReruns({ rows: rows.slice(0, 1), repo, dispatchRetry, checkStaleness: () => verdict });
     expect(dispatchRetry).not.toHaveBeenCalled();
-    expect(out.requested).toEqual([]);
-    expect(out.refused).toHaveLength(rows.length);
-    expect(out.refused.every(row => /behind origin\/main.*refusing/.test(row.reason))).toBe(true);
+    expect(out.refused).toHaveLength(1);
+  });
+  it('probeOriginMain is offline when FETCH_HEAD does not match the origin/main tracking ref', () => {
+    const git = args => args[0] === 'fetch' ? { status: 0, stdout: '', stderr: '' }
+      : { status: 0, stdout: `${(args[2].startsWith('FETCH_HEAD') ? 'c' : 'd').repeat(40)}\n`, stderr: '' };
+    expect(probeOriginMain('/r', git)).toEqual({ offline: true });
+  });
+  it('probeOriginMain fails closed when the fetch fails, the rev is unreadable or the sha is malformed, and hardens the env', () => {
+    const ok = { status: 0, stdout: `${'b'.repeat(40)}\n`, stderr: '' };
+    expect(probeOriginMain('/r', () => ({ status: 1, stdout: '', stderr: '' }))).toEqual({ offline: true });
+    expect(probeOriginMain('/r', args => args[0] === 'fetch' ? ok : { status: 1, stdout: '', stderr: '' })).toEqual({ offline: true });
+    expect(probeOriginMain('/r', args => args[0] === 'fetch' ? ok : { status: 0, stdout: 'zzz\n', stderr: '' })).toEqual({ offline: true });
+    vi.stubEnv('GIT_DIR', '/evil');
+    const seen = [];
+    expect(probeOriginMain('/r', (args, opts) => { seen.push(opts); return ok; })).toEqual({ fresh: true, sha: 'b'.repeat(40) });
+    expect(seen.every(o => o.cwd === '/r' && o.env.GIT_DIR === undefined && o.env.GIT_NO_REPLACE_OBJECTS === '1')).toBe(true);
   });
   it.each([['999', 25], ['0', 1], ['bad', 10], [undefined, 10], ['4', 4]])('bounds environment max %s to %s', (value, expected) => {
     expect(resolveOwedRerunMax({ WE_OWED_RERUN_MAX_PER_PASS: value, WE_POLICY_CASCADE_LOG: '0' })).toBe(expected);

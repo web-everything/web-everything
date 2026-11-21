@@ -649,8 +649,8 @@ describe('adding a required check never stalls reviews (live 2026-10-07, `integr
     const { reviewCiGate } = await import('../review-ci-gate.mjs');
     const { reduceCheckState } = await import('../../operations/pr-status.mjs');
     const req = ['test', 'integration'];
-    expect(reviewCiGate({ headSha: 'a'.repeat(40), requiredChecks: req, checks: [ok('test')] }).allowed).toBe(true);
-    expect(reviewCiGate({ headSha: 'a'.repeat(40), requiredChecks: req, checks: [] }).allowed).toBe(false);
+    expect(reviewCiGate({ headSha: 'a'.repeat(40), rowsComplete: true, rowsHead: 'a'.repeat(40), requiredChecks: req, checks: [ok('test')] }).allowed).toBe(true);
+    expect(reviewCiGate({ headSha: 'a'.repeat(40), rowsComplete: true, rowsHead: 'a'.repeat(40), requiredChecks: req, checks: [] }).allowed).toBe(false);
     expect(reduceCheckState([ok('test')], req).state).toBe('green');
   });
 });

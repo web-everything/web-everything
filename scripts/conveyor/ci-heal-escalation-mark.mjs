@@ -63,6 +63,7 @@ import { summarize } from '../lib/check-state-predicate.mjs';
 import { readSharedFreeze } from '../lib/red-main-freeze-shared.mjs';
 import { runGhSync } from '../lib/gh-throttle.mjs';
 import { HUMAN_REVIEW_HOLD_GATES } from '../lib/merge-gate-verdict.mjs';
+import { readReviewChecks } from '../lib/review-ci-gate-io.mjs';
 
 /**
  * we:scripts/conveyor/ci-heal-escalation-mark.mjs#CI_HEAL_ESCALATION_MARKER — the stable FIRST LINE of the
@@ -370,7 +371,8 @@ export function needsHumanGateOnlyRefusal({ headSha, pr, requiredChecks }) {
   if (!Array.isArray(requiredChecks) || !requiredChecks.length) return null;
   // A cancelled, stale, running, or missing required check may need human help.
   // Gate-only red describes failures, not whether the rest of CI finished green.
-  if (!ciGreenForEscalation({ rollup: pr?.statusCheckRollup, requiredChecks })) return null;
+  if (!ciGreenForEscalation({ rollup: pr?.statusCheckRollup, requiredChecks, headSha: pr?.headRefOid,
+    rowsComplete: pr?.rowsComplete, rowsHead: pr?.rowsHead })) return null;
   const { gateOnlyRed, red } = gateOnlyRedStates({ rollup: pr?.statusCheckRollup, requiredChecks });
   if (!gateOnlyRed) return null;
   return `Refusing needs-human: only ${red.join(', ')} is red on this head. This is not a CI break; ordinary review is owed.`;
@@ -456,7 +458,9 @@ async function checkEscalationRecordable({ pr, repo, headSha, outcome, settings 
   if (!readPr) facts = classifyPrChecks(facts, { pr, repo }, prChecksOptions);
   const refusal = facts?.readError && expectedOutcome === 'needs-human'
     ? null : refusalFor({ headSha, pr: facts, requiredChecks: checks });
-  return { refusal, ...(facts?.readError ? { warning: warningFor(facts.readError) } : {}) };
+  const incomplete = !readPr && facts?.rowsComplete !== true;
+  return { refusal, ...(facts?.readError ? { warning: warningFor(facts.readError) }
+    : incomplete ? { warning: warningFor(new Error('check rows incomplete for this head')) } : {}) };
 }
 
 /** Share the not-a-ci-break setting and readers; failed reads permit needs-human with a warning. */
@@ -467,10 +471,15 @@ export async function checkNeedsHumanEscalable(options = {}) {
 function defaultReadPrChecks({ pr, repo }, { runGh = runGhSync } = {}) {
   const args = ['pr', 'view', String(pr), '--json', 'number,labels,headRefOid,statusCheckRollup,url'];
   if (repo) args.push(`--repo=${repo}`);
-  const raw = runGh(args, { stdio: ['ignore', 'pipe', 'pipe'], encoding: 'utf8', timeout: resolveChildTimeoutMs(), killSignal: 'SIGKILL', maxBuffer: 64 * 1024 * 1024 });
+  const run = argv => runGh(argv, { stdio: ['ignore', 'pipe', 'pipe'], encoding: 'utf8', timeout: resolveChildTimeoutMs(), killSignal: 'SIGKILL', maxBuffer: 64 * 1024 * 1024 });
+  const raw = run(args);
   const parsed = JSON.parse(String(raw || '{}'));
   const slug = /^https:\/\/github\.com\/([^/]+\/[^/]+)\//.exec(parsed.url ?? '')?.[1] ?? null;
-  return { ...parsed, slug };
+  if (!(repo ?? slug) || !parsed.headRefOid) throw new Error('missing repository or head for complete check read');
+  // A flattened PR rollup cannot attest completeness. Both paginated check-run
+  // and legacy-status reads must succeed before forwarding head provenance.
+  const rows = readReviewChecks({ repo: repo ?? slug, headSha: parsed.headRefOid, run });
+  return { ...parsed, slug, statusCheckRollup: rows, rowsComplete: rows.rowsComplete, rowsHead: rows.rowsHead };
 }
 
 function classifyPrChecks(parsed, { pr, repo }, {
