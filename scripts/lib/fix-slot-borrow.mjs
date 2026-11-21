@@ -66,7 +66,7 @@ export function chooseFixExecutor({ setting = { value: 'codex-first', source: 'd
   const claude = (reason) => ({ executor: 'claude', reason, source });
   if (setting.value === 'claude') return claude('fix.executor=claude');
   if (setting.value === 'provider-routing') return claude('existing provider routing');
-  const available = typeof launcherAvailable === 'function' ? launcherAvailable : executor => executor === 'codex' ? launcherAvailable : true;
+  const available = typeof launcherAvailable === 'function' ? executor => launcherAvailable(executor, entry) : executor => executor === 'codex' ? launcherAvailable : true;
   if (chain && setting.value === 'codex-first' && !entry.mainFix) {
     const trigger = entry.takeover ? 'takeover' : entry.rulingNotAddressed ? 'ruling-not-addressed'
       : entry.strongerModel || (entry.round ?? 1) >= 3 ? 'stronger-model' : null;
@@ -121,7 +121,7 @@ export function createRoutedCiHealDispatch({ dispatch, route, createSinks, launc
         const handle = launchCodex({ ...request, repairKind: 'ci-heal', cwd: options.root, promptFile, ref: planned.laneRef,
           mergeOnto: mergeOntoFor(planned),
           repo: profile.slug, laneRepo: profile.lanePoolRepo, claimRepo: options.repo ?? planned.repo ?? 'we',
-          scope: planned.scope.join(','), policyRoute: decision.policyRoute ?? { provider: 'codex' } });
+          scope: planned.scope.join(','), ...(decision.agyAdmission ? { taskKind: decision.agyAdmission.kind, size: decision.agyAdmission.size } : {}), policyRoute: decision.policyRoute ?? { provider: 'codex' } });
         request.reportWrapped?.(Number(String(handle).replace(/^pid:/, '')));
         return handle;
       } catch (error) { removePrompt(promptFile); throw error; }
