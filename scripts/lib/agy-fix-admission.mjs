@@ -91,5 +91,7 @@ export function deriveAgyFixAdmission(item = {}, launch = {}) {
   if (typeof taskKind !== 'string' || !/^[a-z][a-z0-9-]*$/.test(taskKind)) return null;
   const kind = taskKind === 'fix' && scope.every(isDocScope) ? 'doc-fix'
     : taskKind === 'fix' && scope.every(isTestScope) ? 'test-fix' : taskKind;
+  // #8606: no agy-authored test may execute on the host before review, regardless of settings.
+  if (kind !== 'doc-fix' || !scope.every(isDocScope)) return null;
   return { kind, size, scope };
 }

@@ -122,6 +122,22 @@ describe('resource actions', () => {
     expect(run(denied).held).toBe(true);
     expect(calls).toBe(0);
   });
+  it('a legacy-alias directory with a 0-byte attempt blocks only its own resource, never others', () => {
+    const stale = join(actions.dir, 'chalbert%2Fweb-everything%23pr%3A2345');
+    fs.mkdirSync(stale, { recursive: true });
+    fs.writeFileSync(join(stale, 'attempt-000001.json'), '');
+    const other = actionResource('we', { type: 'pr', id: 7 });
+    expect(actions.claim({ resource: other, kind: 'fix', owner: 'a' }).ok).toBe(true);
+    expect(() => actions.claim({ resource, kind: 'fix', owner: 'a' })).toThrow(CoordinationUnavailableError);
+    expect(() => actions.list()).toThrow(CoordinationUnavailableError);
+  });
+  it('an undecodable or unparseable directory name refuses every claim (could alias this resource)', () => {
+    for (const name of ['bad%ZZ', 'not-a-resource']) {
+      fs.mkdirSync(join(actions.dir, name), { recursive: true });
+      expect(() => actions.claim({ resource, kind: 'fix', owner: 'a' })).toThrow(CoordinationUnavailableError);
+      fs.rmdirSync(join(actions.dir, name));
+    }
+  });
   it('keeps completed effects observed until their postcondition, and only warns on age', async () => {
     actions = createActionStore({ now, maxObservedAgeMs: 5 });
     await guardedDispatch({ resource, kind: 'fix', owner: 'a', actions, now, effect: () => 'agent' });

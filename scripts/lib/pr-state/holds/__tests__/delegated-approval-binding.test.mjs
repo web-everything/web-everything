@@ -1,7 +1,7 @@
 import { describe, it, expect } from 'vitest';
 import { derivePrState } from '../../../pr-state.mjs';
 import { buildVerdictRecord, buildLedgerEvent, ledgerEventId, VERDICTS } from '../../../verdict-ledger.mjs';
-import { approvalBindsHold } from '../verdict.mjs';
+import { approvalBindsHold, approvalValid } from '../verdict.mjs';
 import { planLabelInputRows } from '../../../../conveyor/pr-label-mirror.mjs';
 import { HOLD_LABELS } from '../label-input.mjs';
 
@@ -321,10 +321,10 @@ describe.each(['clear-human', 'judge'])('%s approval binding', approval => {
     expect(approvalBindsHold(approvalRow, id, HEAD.toUpperCase())).toBe(true);
   });
 
-  it('preserves operator approval with an abbreviated head witness', () => {
+  it('refuses operator approval with an abbreviated head witness', () => {
     const hold = label(1);
     expect(codes([hold, approve({ delegation: null, headSha: HEAD.slice(0, 7) })]))
-      .not.toContain('label-input:review:human');
+      .toContain('label-input:review:human');
   });
 
   it.each([
@@ -333,5 +333,31 @@ describe.each(['clear-human', 'judge'])('%s approval binding', approval => {
     ['empty basis', { basis: [] }],
   ])('rejects delegated approval with %s at construction', (_name, invalid) => {
     expect(() => approve({ headSha: HEAD, basis: [ledgerEventId(label(1))], ...invalid })).toThrow();
+  });
+});
+
+describe('undelegated approval head binding', () => {
+  const approval = headSha => ev('approval', 5, { approval: 'clear-human', headSha });
+  it('accepts the witnessed head and preserves legacy rows without headSha', () => {
+    expect(approvalValid(approval(HEAD), at(300), HEAD)).toBe(true);
+    expect(approvalValid(approval(undefined), at(300), OLD_HEAD)).toBe(true);
+    expect(approvalValid(approval(HEAD), at(300))).toBe(true);
+  });
+  it.each([OLD_HEAD, null, 'bad'])('refuses a witnessed approval at a different or unreadable head %s', head => {
+    expect(approvalValid(approval(HEAD), at(300), head)).toBe(false);
+  });
+  it('keeps a label hold when a later undelegated approval witnessed another head', () => {
+    expect(codes([label(1), approval(OLD_HEAD)])).toContain('label-input:review:human');
+    expect(codes([label(1), approval(HEAD)])).not.toContain('label-input:review:human');
+    expect(codes([label(1), approval(undefined)])).not.toContain('label-input:review:human');
+  });
+  it('keeps a human verdict hold when a companion approval witnessed another head', () => {
+    const clear = buildVerdictRecord({ repo, pr: PR, verdict: VERDICTS.CLEAR_HUMAN, at: at(4), source: 'test', headSha: HEAD });
+    expect(codes([human(), clear, approval(OLD_HEAD)])).toContain('verdict:human');
+  });
+  it('does not let the mirror discard an addition cleared only at another head', () => {
+    const items = [{ label: 'review:human', change: 'added', actor: 'op', createdAt: at(1) }];
+    expect(planLabelInputRows({ repo, pr: PR, items, liveLabels: ['review:human'], events: [approval(OLD_HEAD)],
+      headSha: HEAD, now: at(300) })).toHaveLength(1);
   });
 });

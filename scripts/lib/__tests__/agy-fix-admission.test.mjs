@@ -60,9 +60,10 @@ describe('repair scope admission', () => {
     expect(deriveAgyFixAdmission({ size: 1, scope: ['we:docs/guide.md'] }, { scope: 'we:docs' }))
       .toEqual({ kind: 'doc-fix', size: 1, scope: ['docs/guide.md'] });
   });
-  it('admits a test item inside its declared launch scope', () => {
-    expect(deriveAgyFixAdmission({ taskKind: 'test-fix', size: 1, scope: ['blocks/selection/__tests__/a.test.ts'] },
-      { scope: ['blocks/selection/__tests__/a.test.ts'] })?.kind).toBe('test-fix');
+  it('test-fix is refused until #8606', () => {
+    for (const taskKind of ['test-fix', 'fix', 'doc-fix', 'feature'])
+      expect(admit({ taskKind, size: 1, scope: ['blocks/selection/__tests__/a.test.ts'] })).toBeNull();
+    expect(admit({ taskKind: 'test-fix', size: 1, scope: ['docs/guide.md'] })).toBeNull();
   });
   it('refuses a test item outside the launch scope', () => {
     expect(deriveAgyFixAdmission({ size: 1, scope: ['blocks/selection/a.test.ts'] },
@@ -77,10 +78,13 @@ describe('repair scope admission', () => {
   ])('refuses explicit %s on mismatched scope %s even at size 1', (taskKind, path) => {
     expect(admit({ taskKind, size: 1, scope: [path] })).toBeNull();
   });
-  it.each(admissibleTargets)('admits allowlisted path %s independently of kind', path => {
+  it.each(admissibleTargets)('restricts allowlisted path %s to doc-fix admission', path => {
     expect(isAdmissibleTargetPath(path)).toBe(true);
-    for (const taskKind of ['doc-fix', 'test-fix', 'fix', 'feature'])
-      expect(admit({ taskKind, size: 1, scope: [`we:${path}`] })).not.toBeNull();
+    for (const taskKind of ['doc-fix', 'test-fix', 'fix', 'feature']) {
+      const result = admit({ taskKind, size: 1, scope: [`we:${path}`] });
+      if (path.startsWith('docs/') && ['doc-fix', 'fix'].includes(taskKind)) expect(result).not.toBeNull();
+      else expect(result).toBeNull();
+    }
   });
   it.each(refusedTargets)('refuses non-allowlisted scope %s for every kind', path => {
     expect(isAdmissibleTargetPath(path)).toBe(false);
@@ -161,6 +165,19 @@ it('marks every agy-build settings key direct-only while repair dispatch stays s
   expect(text).toContain('For direct `runConfinedAgyBuild` calls only');
   expect(text).toContain('Repair dispatch always requires `size === 1`');
   expect(admit({ taskKind: 'doc-fix', size: 3, scope: ['docs'] })).toBeNull();
+});
+
+it('settings admit doc-fix only and cannot widen repair size', () => {
+  const settings = JSON.parse(readFileSync(new URL('../../settings/agy-build.json', import.meta.url), 'utf8'));
+  expect(settings.allowedKinds).toEqual(['doc-fix']);
+  expect(admit({ taskKind: 'doc-fix', size: 3, scope: ['docs'] })).toBeNull();
+});
+
+it('pins frozen production confinement as unavailable', async () => {
+  const { AGY_BUILD_CONFINEMENT, assertAgyBuildConfinement } = await import('../agy-sandbox.mjs');
+  expect(AGY_BUILD_CONFINEMENT.mode).toBe('unavailable');
+  expect(Object.isFrozen(AGY_BUILD_CONFINEMENT)).toBe(true);
+  expect(assertAgyBuildConfinement).toThrow(/use another provider or request operator review/);
 });
 
 it.each([

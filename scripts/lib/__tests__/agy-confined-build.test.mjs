@@ -263,9 +263,11 @@ describe('launcher-owned atomic application', () => {
       expect(git(f.lane, 'status', '--porcelain')).toBe('');
     } finally { writer?.kill(); if (exited) await exited; }
   });
-  it.each(admissibleTargets)('admits and applies allowlisted path %s inside scope', async path => {
+  it.each(admissibleTargets)('limits repair admission to docs while direct prototype applies allowlisted path %s inside scope', async path => {
     const f = fixture();
-    expect(deriveAgyFixAdmission({ taskKind: 'feature', size: 1, scope: [path] }, { scope: [path] })).not.toBeNull();
+    const admission = deriveAgyFixAdmission({ taskKind: 'doc-fix', size: 1, scope: [path] }, { scope: [path] });
+    if (path.startsWith('docs/')) expect(admission).toEqual({ kind: 'doc-fix', size: 1, scope: [path] });
+    else expect(admission).toBeNull();
     expect(await f.run(dir => {
       mkdirSync(dirname(join(dir, path)), { recursive: true });
       writeFileSync(join(dir, path), 'new content\n');

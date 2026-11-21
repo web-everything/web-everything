@@ -1513,7 +1513,7 @@ export function renderConvertedAdvisoryNote({
       + 'covered this content).',
     '',
     '**This PR still needs the human ceremony.** Clearing `review:human` requires the operator to run '
-      + `\`/review ${pr}\` or \`we:scripts/review-set-label.mjs --to=clear-human --actor=… `
+      + `\`/review ${pr}\` or \`we:scripts/review-set-label.mjs --to=clear-human --expect-head=<full 40-hex head SHA> --actor=… `
       + '--reason="<the operator instruction>"` — nothing above this line performs, substitutes for, or '
       + 'shortcuts that ceremony.',
     '',
@@ -2397,7 +2397,7 @@ export function buildContradictoryVerdictHealComment({ humanClearedSha = null, h
       + 'normal way once reviewed:',
     '',
     '```',
-    'node scripts/review-set-label.mjs <pr> --repo=<owner/name> --to=clear-human --actor="<you>" --reason="<why>"',
+    'node scripts/review-set-label.mjs <pr> --repo=<owner/name> --to=clear-human --expect-head=<full 40-hex head SHA> --actor="<you>" --reason="<why>"',
     '```',
   ].join('\n');
 }
@@ -2850,7 +2850,7 @@ export function buildClearanceRevocationComment({ clearance, reason, pr, repo } 
     '**To re-clear** (after checking the new head is what you cleared):',
     '',
     '```',
-    `node scripts/review-set-label.mjs ${pr} --repo=${repo} --to=clear-human --actor="<you>" --reason="<your instruction>"`,
+    `node scripts/review-set-label.mjs ${pr} --repo=${repo} --to=clear-human --expect-head=<full 40-hex head SHA> --actor="<you>" --reason="<your instruction>"`,
     '```',
     '',
     'If this keeps happening on a head you never pushed, the cause is the drain\'s own rebase moving the tree '

@@ -543,11 +543,11 @@ describe('runFixCli', () => {
     expect(m.spawn).toHaveBeenCalledOnce();
   });
   it.each([
-    ['doc-fix', 1, ['we:docs'], false], ['feature', 1, ['we:docs'], false],
+    ['doc-fix', 1, ['we:docs'], true], ['feature', 1, ['we:docs'], false],
     ['doc-fix', 1, ['scripts/operations/fix-run.mjs'], false], ['test-fix', 1, ['src'], false],
     ['feature', 1, ['src/main.ts'], false],
     ['doc-fix', 3, ['we:docs'], false], ['doc-fix', 1, [], false],
-  ])('real detached dispatch refuses unavailable confinement for item %s size %s scope %j', async (taskKind, size, scope, admitted) => {
+  ])('real detached dispatch admitted by scope with a fixture gate: %s size %s scope %j', async (taskKind, size, scope, admitted) => withAgyConfinementFixture(async () => {
     const m = mk(['aaa', 'aaa']);
     const { resolveFixProvider } = await import('../fix-run.mjs');
     const provider = await resolveFixProvider('antigravity');
@@ -572,7 +572,7 @@ describe('runFixCli', () => {
       expect(chooseFixExecutor({ setting: { value: 'codex-first' }, chain: { value: ['codex', 'codex-alt', 'argon', 'claude'] },
         codexUnproductive: 4, launcherAvailable: () => true }).executor).toBe('claude');
     }
-  });
+  }));
   it('records a no-change Argon outcome and resolves its provider', async () => {
     const m = mk(['aaa','aaa']), recordRouted = vi.fn(()=>({}));
     const resolveProvider = vi.fn(m.io.resolveProvider);
@@ -2215,12 +2215,28 @@ async function withAgyConfinementFixture(run) {
   try { return await run(); } finally { guard.mockRestore(); }
 }
 
-it.each([['doc-fix', 'docs'], ['fix', 'blocks/selection/contract.test.ts'], ['feature', 'docs/guide.md']])('prototype fix provider passes %s kind, size and %s scope to a fake worker', async (kind, path) => withAgyConfinementFixture(async () => {
+it.each([['doc-fix', 'docs'], ['fix', 'docs/guide.md']])('prototype fix provider passes %s kind, size and %s scope to a fake worker', async (kind, path) => withAgyConfinementFixture(async () => {
   const {resolveFixProvider} = await import('../fix-run.mjs');
   const provider = await resolveFixProvider('antigravity');
   const runTask = vi.fn(async ()=>({status:'ok',finalMessage:'done',stdout:'trace'}));
   expect(await provider.spawn({prompt:'edit',kind,size:1,scope:[path],model:'gemini-4-argon-high',effort:'high',sessionSlug:'fix-7'}, {resolveLane:()=>'/lane',runTask})).toEqual({finalMessage:'done',stdout:'trace'});
   expect(runTask).toHaveBeenCalledWith({task:'edit',laneDir:'/lane',kind,size:1,scope:[path],model:'gemini-4-argon-high',effort:'high'});
+}));
+
+it('provider forwards normalized admission scope to runTask', async () => withAgyConfinementFixture(async () => {
+  const { resolveFixProvider } = await import('../fix-run.mjs');
+  const provider = await resolveFixProvider('antigravity');
+  const runTask = vi.fn(async () => ({ status: 'ok' }));
+  await provider.spawn({ prompt: 'edit', kind: 'doc-fix', size: 1, scope: ['we:docs/guide.md'] },
+    { resolveLane: () => '/lane', runTask });
+  expect(runTask).toHaveBeenCalledWith(expect.objectContaining({ scope: ['docs/guide.md'] }));
+}));
+
+it('default provider task refuses even with the test gate bypassed', async () => withAgyConfinementFixture(async () => {
+  const { resolveFixProvider } = await import('../fix-run.mjs');
+  const provider = await resolveFixProvider('antigravity');
+  await expect(provider.spawn({ kind: 'doc-fix', size: 1, scope: ['docs'] }, { resolveLane: () => '/lane' }))
+    .rejects.toThrow('confinement unavailable');
 }));
 
 it('every fix executor declares confinement or is unavailable for dispatch', () => {
