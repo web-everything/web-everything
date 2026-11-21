@@ -516,7 +516,7 @@ describe('FUI origin binding', () => {
 });
 
 describe('urgent-verify approved gh-shim dirs on PATH', () => {
-  const realHome = '/home/u';
+  const realHome = '/host-home';
   const approvedA = `${realHome}/.claude/github-app-token/gh-shim.d/fd5c03c434fc6486`;
   const approvedB = `${realHome}/.claude/github-app-token/gh-shim`;
   it('keeps the approved shim dirs on the child PATH (gh identity routing is unchanged)', () => {
