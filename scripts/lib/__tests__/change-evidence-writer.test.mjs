@@ -23,7 +23,7 @@ function harness() {
   const coordination = fs.mkdtempSync(path.join(process.env.TMPDIR || os.tmpdir(), 'change-evidence-')); dirs.push(coordination);
   const x = input(), emit = vi.fn();
   const gh = vi.fn(args => {
-    if (args[0] === 'pr') return args[1] === 'list' ? [{ number: pr.number }] : x.pr;
+    if (args[0] === 'pr') return args[1] === 'list' ? [{ number: pr.number, mergedAt: '2026-11-21T15:00:00Z' }, { number: 1, mergedAt: '2026-11-20T23:59:59Z' }] : x.pr;
     const endpoint = args[1];
     if (endpoint.includes('/events?')) return x.events;
     if (endpoint.includes('/comments?')) return x.comments;
@@ -139,7 +139,9 @@ it('a capped page fails closed with operator fallback', async () => {
 it('backfills a bounded merged PR listing through the same writer', async () => {
   const h = harness(); await backfillChangeEvidence({ ...h.options, since: '2026-11-21' });
   expect(fs.existsSync(h.file)).toBe(true);
-  expect(h.gh.mock.calls[0][0]).toContain('merged:>=2026-11-21');
+  expect(h.gh.mock.calls[0][0]).not.toContain('--search');
+  expect(h.pending()).toEqual([]);
+  expect(fs.readdirSync(h.dir).filter(n => /^1-/.test(n))).toEqual([]); // merged before the window: not collected
 });
 it('backfill never emits daemon events and its call budget scales with the merge count', async () => {
   const h = harness(), original = h.gh.getMockImplementation();

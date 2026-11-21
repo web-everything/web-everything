@@ -30,7 +30,7 @@ export function resolveChangeEvidenceMode({ tool = readSettings().changeEvidence
 function atomic(io, file, bytes) {
   io.mkdirSync(path.dirname(file), { recursive: true });
   const tmp = `${file}.${randomUUID()}.tmp`;
-  try { io.writeFileSync(tmp, bytes, { flag: 'wx' }); io.renameSync(tmp, file); }
+  try { io.writeFileSync(tmp, bytes); io.renameSync(tmp, file); }
   finally { if (io.existsSync(tmp)) io.unlinkSync(tmp); }
 }
 function optional(io, file, fallback) {
@@ -180,8 +180,10 @@ export async function backfillChangeEvidence({ since, repo = DEFAULT_REPO, gh = 
   if (!/^\d{4}-\d{2}-\d{2}$/.test(since ?? '') || new Date(since).toISOString().slice(0, 10) !== since) throw Error('expected --since=YYYY-MM-DD');
   if ((options.mode ?? resolveChangeEvidenceMode().value.mode) === 'off') return [];
   const listing = reader(gh, 1, maxPages);
-  const prs = listing.read(['pr', 'list', '--repo', repo, '--state', 'merged', '--search', `merged:>=${since}`, '--limit', '1000', '--json', 'number']);
-  if (!Array.isArray(prs) || prs.length >= 1000) throw Error('merged listing capped; operator must backfill a narrower window');
+  const listed = listing.read(['pr', 'list', '--repo', repo, '--state', 'merged', '--limit', '1000', '--json', 'number,mergedAt']);
+  if (!Array.isArray(listed) || listed.length >= 1000) throw Error('merged listing capped; operator must backfill a narrower window');
+  // No search-backed listing (#no-label-search): filter the merged list by merge time, UTC start of the day.
+  const prs = listed.filter(pr => typeof pr.mergedAt === 'string' && pr.mergedAt >= `${since}T00:00:00Z`);
   // Root cause of the first live backfill failing ~20 of 30: ONE 256-call budget shared by every merge (about 9 reads
   // each). The backfill budget scales with the number of merges. Backfill never emits to the live daemon-events log
   // (only the drain hook at merge time does); failures stay on stderr and in the pending ledger.
