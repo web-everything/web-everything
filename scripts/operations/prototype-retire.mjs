@@ -83,6 +83,10 @@ export function carriedBeyondMain({ git, ref, mainRef = 'origin/main' }) {
   const unique = lines(uniqueRes.stdout);
   const merges = lines(mergesRes.stdout);
   if (![...unique, ...merges].every((sha) => SHA.test(sha))) return { ok: false, reason: 'history-unreadable' };
+  // Attribute-selected custom drivers can discard changes and fabricate tree equality.
+  if (git(['config', '--get-regexp', '^merge\\..*\\.driver$'])?.code !== 1) {
+    return { ok: false, reason: 'merge-driver-unverifiable' };
+  }
   // A merge counts as carrying nothing of its own only when git recomputes the same tree from its parents.
   const uncleanMerges = merges.filter((merge) => {
     const parents = lines(git(['rev-list', '--parents', '-n', '1', merge]).stdout)[0]?.split(/\s+/).slice(1) || [];

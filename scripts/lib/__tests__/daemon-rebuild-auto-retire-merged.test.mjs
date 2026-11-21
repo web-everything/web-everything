@@ -4,6 +4,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { rebuildClone, readRebuildState } from '../daemon-rebuild.mjs';
+import { proveRetirement } from '../../daemon-overlay.mjs';
 import { addOverlay, readOverlays } from '../daemon-overlays.mjs';
 
 vi.setConfig({ testTimeout: 60_000 });
@@ -16,7 +17,7 @@ const git = (cwd, args) => {
   return result.stdout.trim();
 };
 
-async function fixture({ second = false } = {}) {
+async function fixture({ second = false, attributes = false } = {}) {
   const base = mkdtempSync(join(tmpdir(), 'we-auto-retire-'));
   temps.push(base);
   const origin = join(base, 'origin.git'), root = join(base, 'clone'), author = join(base, 'author');
@@ -24,6 +25,7 @@ async function fixture({ second = false } = {}) {
   mkdirSync(root);
   git(root, ['init', '-q', '-b', 'main']);
   writeFileSync(join(root, 'worker.txt'), 'initial\n');
+  if (attributes) writeFileSync(join(root, '.gitattributes'), 'worker.txt merge=discard\n');
   git(root, ['add', '.']);
   git(root, ['commit', '-qm', 'initial']);
   git(root, ['remote', 'add', 'origin', origin]);
@@ -92,6 +94,55 @@ describe('rebuild retirement before established overlay hold', () => {
     expect(result.reason).toBe('established-overlay-conflict');
     expect(readOverlays(f.root, { env: f.env })).toHaveLength(1);
     expect(readRebuildState(f.root, f.env).held).toMatchObject({ reason: 'established-overlay-conflict' });
+    expect(f.runSmoke).not.toHaveBeenCalled();
+  });
+
+  it.each(['in-main', 'pr-merged'])('allows only landed proof reasons: %s', async (reason) => {
+    const f = await fixture();
+    const result = await rebuildClone({ ...f.options, deps: {
+      prove: () => ({ ...approved(f.tip), reason }), tip: () => f.tip,
+    } });
+    expect(result.reason).toBe('established-overlay-retired');
+    expect(readOverlays(f.root, { env: f.env })).toEqual([]);
+  });
+
+  it.each(['redundant-merge-sibling', 'superseded', 'pr-squash-merged', 'unknown', undefined])(
+    'keeps the hold for a disallowed retire reason: %s', async (reason) => {
+      const f = await fixture();
+      const result = await rebuildClone({ ...f.options, deps: {
+        prove: () => ({ ...approved(f.tip), reason }),
+      } });
+      expect(result.reason).toBe('established-overlay-conflict');
+      expect(readOverlays(f.root, { env: f.env })).toHaveLength(1);
+      expect(readRebuildState(f.root, f.env).held).toMatchObject({ reason: 'established-overlay-conflict' });
+      expect(f.runSmoke).not.toHaveBeenCalled();
+    });
+
+  it('real retirement proof keeps a MERGED snapshot with remaining work and ignores inherited merge drivers', async () => {
+    const f = await fixture({ attributes: true });
+    const config = join(f.env.WE_DAEMON_STATE_DIR, 'host.gitconfig');
+    writeFileSync(config, '[merge "discard"]\n  driver = true\n');
+    const env = { ...f.env, GIT_CONFIG_GLOBAL: config, GIT_CONFIG_SYSTEM: config };
+    const gh = vi.fn((args) => {
+      if (args[0] === 'repo') return { status: 0, stdout: JSON.stringify({
+        nameWithOwner: 'test/repo', url: 'https://github.com/test/repo',
+      }) };
+      expect(args.slice(0, 2)).toEqual(['pr', 'list']);
+      return { status: 0, stdout: JSON.stringify([{ number: 7, state: 'MERGED', headRefName: f.ref }]) };
+    });
+    const run = (cmd, args, opts) => {
+      if (cmd === 'gh') return gh(args);
+      expect(cmd).toBe('git');
+      return spawnSync(cmd, args, { ...opts, maxBuffer: 1024 * 1024 });
+    };
+    const prove = vi.fn((entry) => proveRetirement({ root: f.root, entry, env, run }));
+    const result = await rebuildClone({ ...f.options, deps: { prove } });
+    expect(prove).toHaveBeenCalledOnce();
+    expect(gh).toHaveBeenCalled();
+    expect(prove.mock.results[0].value).toMatchObject({ action: 'keep', reason: 'unique-commits-not-on-main',
+      evidence: { contentInMain: false } });
+    expect(result.reason).toBe('established-overlay-conflict');
+    expect(readOverlays(f.root, { env: f.env })).toHaveLength(1);
     expect(f.runSmoke).not.toHaveBeenCalled();
   });
 

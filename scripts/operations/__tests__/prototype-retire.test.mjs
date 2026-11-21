@@ -323,6 +323,34 @@ describe('planRetirements', () => {
   });
 });
 
+describe('retirement merge driver guard', () => {
+  it('rejects attribute-selected drivers even when they fabricate content-in-main tree equality', () => {
+    const r = repo();
+    r.commit('.gitattributes', 'worker.txt merge=discard\n');
+    r.commit('worker.txt', 'initial\n');
+    const initial = r.ok('rev-parse', 'HEAD');
+    r.ok('checkout', '-qB', 'overlay', initial);
+    const tip = r.commit('worker.txt', 'overlay work\n');
+    r.setRemote('lane/worker', tip);
+    r.ok('checkout', '-qB', 'main', initial);
+    r.setRemote('main', r.commit('worker.txt', 'main work\n'));
+    r.ok('config', 'merge.discard.driver', 'true');
+    expect(r.ok('merge-tree', '--write-tree', '--no-messages', 'origin/main', tip).split('\n')[0])
+      .toBe(r.ok('rev-parse', 'origin/main^{tree}'));
+    expect(carriedBeyondMain({ git: r.git, ref: 'lane/worker' }))
+      .toEqual({ ok: false, reason: 'merge-driver-unverifiable' });
+  });
+
+  it.each([0, 2, undefined])('refuses configured or unreadable merge-driver evidence (exit %s)', (code) => {
+    const r = repo();
+    r.setRemote('main', r.ok('rev-parse', 'HEAD'));
+    r.setRemote('lane/worker', r.ok('rev-parse', 'HEAD'));
+    const git = (args) => args[0] === 'config' ? { code, stdout: '' } : r.git(args);
+    expect(carriedBeyondMain({ git, ref: 'lane/worker' }))
+      .toEqual({ ok: false, reason: 'merge-driver-unverifiable' });
+  });
+});
+
 describe('planRetirements redundant merge siblings (fake git/gh)', () => {
   const baseRef = 'lane/live';
   const ref = `${baseRef}-m2`;

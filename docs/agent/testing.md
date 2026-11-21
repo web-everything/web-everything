@@ -5920,3 +5920,9 @@ Inject `deps.prove` and `deps.tip` through `rebuildClone` to exercise the real g
 without GitHub; `deps.retireRegistration` can replace the entire operation. A successful retirement
 ends the tick before applying the old plan; remaining unproved refs still hold. Keep coverage for
 proof refusal/throws, a mismatched tip, partial retirement, and read-only preparation.
+
+Rebuild auto-retirement accepts only `retire` proofs with reason `pr-merged` or `in-main`; all other
+proofs keep the established-overlay hold. Hold-only fixtures disable `deps.retireRegistration`
+explicitly. The auto-retire suite also runs real `proveRetirement` with injected GitHub MERGED
+evidence, checking remaining work and isolation from global/system merge drivers. Retirement
+tree proofs refuse configured or unreadable custom merge-driver settings before running merge-tree.

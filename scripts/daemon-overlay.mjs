@@ -116,7 +116,7 @@ import { fileURLToPath } from 'node:url';
 import { spawnSync } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import { mkdirSync, writeFileSync, readFileSync, statSync, rmSync, renameSync, mkdtempSync } from 'node:fs';
-import { tmpdir } from 'node:os';
+import { tmpdir, devNull } from 'node:os';
 import {
   addOverlay, removeOverlay, readOverlayState, readOverlays, appendOverlayEvent, overlayFilePath, recordEdgeResolution, allowConflictGate,
   readOverrideViewerLogin, registrationIdentity,
@@ -287,7 +287,9 @@ export function remoteTip({ root, ref, env = process.env, run = spawnSync }) {
 
 /** Run `fn(git, scratch)` in a scratch bare repo that borrows root's objects and fetches `refspecs` from root's origin. */
 function withScratchFetch({ root, refspecs, optionalRefspecs = [], env, run, prefix }, fn) {
-  const opts = (cwd) => ({ cwd, encoding: 'utf8', timeout: 120_000, env: { ...env, GIT_OPTIONAL_LOCKS: '0' } });
+  const opts = (cwd) => ({ cwd, encoding: 'utf8', timeout: 120_000, env: { ...env, GIT_OPTIONAL_LOCKS: '0',
+    ...(cwd !== root ? { GIT_CONFIG_GLOBAL: devNull, GIT_CONFIG_SYSTEM: devNull, GIT_CONFIG_NOSYSTEM: '1' } : {}),
+  } });
   const url = run('git', ['-C', root, 'remote', 'get-url', 'origin'], opts(root));
   const common = run('git', ['-C', root, 'rev-parse', '--path-format=absolute', '--git-common-dir'], opts(root));
   if (url?.status !== 0 || common?.status !== 0) return { ok: false, reason: 'root-unreadable' };

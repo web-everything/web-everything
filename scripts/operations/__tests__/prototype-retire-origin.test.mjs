@@ -36,6 +36,7 @@ function proof(prs, row = { ref: REF }, activity = deletedAt(TIP)) {
     throw new Error(`unexpected gh call: ${args.join(' ')}`);
   });
   const git = vi.fn((args) => {
+    if (args[0] === 'config') return { code: 1, stdout: '' };
     if (args[0] === 'remote') return { code: 0, stdout: `https://github.com/${REPO}.git` };
     if (args[0] === 'fetch') return { code: 1, stdout: '' }; // deleted origin branch
     expect(args).toEqual(['merge-base', '--is-ancestor', MERGE, 'origin/main']);
@@ -47,6 +48,7 @@ function proof(prs, row = { ref: REF }, activity = deletedAt(TIP)) {
       return { status: result.code, stdout: result.stdout };
     }
     expect(cmd).toBe('git');
+    if (args[0] === 'config') return { status: 1, stdout: '' };
     if (args.includes('remote')) return { status: 0, stdout: 'https://github.com/web-everything/web-everything.git' };
     if (args.includes('--git-common-dir')) return { status: 0, stdout: '/injected/objects-only' };
     if (args[0] === 'ls-remote' || args[0] === 'init') return { status: 0, stdout: '' };
@@ -79,6 +81,7 @@ describe('loader planner keeps the loaded base as proof context for a redundant 
     const fetched = [];
     const git = vi.fn((args) => {
       const key = args.join(' ');
+      if (args[0] === 'config') return { code: 1, stdout: '' };
       if (args[0] === 'remote') return { code: 0, stdout: `https://github.com/${REPO}.git` };
       if (args[0] === 'fetch') {
         fetched.push(args[2]);
@@ -140,6 +143,7 @@ it('CLI re-proof fetches and passes the registered base for a redundant merge si
         ? [{ number: 42, state: 'OPEN', headRefName: REF, isCrossRepository: false }] : []) };
     }
     expect(cmd).toBe('git');
+    if (args[0] === 'config') return { status: 1, stdout: '' };
     if (args.includes('remote')) return { status: 0, stdout: `https://github.com/${REPO}.git` };
     if (args.includes('--git-common-dir')) return { status: 0, stdout: root };
     if (args[0] === 'init' || args[0] === 'fetch') return { status: 0, stdout: '' };
@@ -186,6 +190,7 @@ it('CLI re-proof keeps the sibling\'s own outcome when the registered base is go
         return { status: 0, stdout: JSON.stringify(args[args.indexOf('--head') + 1] === REF
           ? [{ number: 42, state: 'MERGED', headRefName: REF }] : []) };
       }
+      if (args[0] === 'config') return { status: 1, stdout: '' };
       if (args.includes('remote')) return { status: 0, stdout: `https://github.com/${REPO}.git` };
       if (args.includes('--git-common-dir')) return { status: 0, stdout: root };
       // git fetch exits non-zero for a ref missing on origin; a combined refspec list would fail whole.
@@ -335,6 +340,7 @@ function repositoryProof({ fetched, originCode = 0, originUrl = ORIGIN_URL, repo
       : [merged({ headRepository: { nameWithOwner: target === REPO ? REPO : ORIGIN_REPO } })]) };
   });
   p.git.mockImplementation((args) => {
+    if (args[0] === 'config') return { code: 1, stdout: '' };
     if (args[0] === 'remote') return { code: originCode, stdout: originUrl };
     if (args[0] === 'fetch') return { code: fetched ? 0 : 1, stdout: '' };
     if (args[0] === 'rev-parse') return { code: 0, stdout: TIP };
@@ -348,6 +354,7 @@ function repositoryProof({ fetched, originCode = 0, originUrl = ORIGIN_URL, repo
       const r = p.gh(args);
       return { status: r.code, stdout: r.stdout };
     }
+    if (args[0] === 'config') return { status: 1, stdout: '' };
     if (args.includes('remote')) return { status: originCode, stdout: originUrl };
     if (args.includes('--git-common-dir')) return { status: 0, stdout: '/injected/objects-only' };
     if (args[0] === 'ls-remote' || args[0] === 'init') return { status: 0, stdout: '' };

@@ -485,9 +485,15 @@ export async function prepareRebuild({
         const entry = overlaysBefore.find((o) => o.ref === item.ref);
         const expectedTip = verifyRev(git, `refs/remotes/origin/${item.ref}^{commit}`);
         if (!entry || !expectedTip) { remainingLost.push(item); continue; }
-        const retire = deps.retireRegistration ?? (await import('../../daemon-overlay.mjs')).retireRegistration;
+        const retirement = await import('../../daemon-overlay.mjs');
+        const retire = deps.retireRegistration ?? retirement.retireRegistration;
+        const prove = deps.prove ?? ((entry) => retirement.proveRetirement({ root, entry, env }));
         const result = await retire({ root, ref: item.ref, expectedTip, expectedEntry: entry,
-          by: 'rebuild-auto-retire', env, deps });
+          by: 'rebuild-auto-retire', env, deps: { ...deps, prove: (entry) => {
+            const proof = prove(entry);
+            return proof?.action === 'retire' && ['pr-merged', 'in-main'].includes(proof.reason)
+              ? proof : { ...proof, action: 'keep', reason: 'auto-retire-reason-not-allowed' };
+          } } });
         if (result?.retired === true) {
           retired.push(item.ref);
           alert('established-overlay-retired', { ref: item.ref, reason: result.reason });

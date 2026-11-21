@@ -83,9 +83,9 @@ function fixture() {
   return { clone, env, init, cOld, p, h, overlays, pushNewcomer, runGit, push };
 }
 
-// Existing hold fixtures describe unmerged overlays; keep retirement hermetic and explicitly unproved.
+// These fixtures test established-overlay holds with retirement explicitly refused.
 const rebuildClone = (options) => realRebuildClone({ ...options,
-  deps: { prove: () => ({ action: 'keep', reason: 'pr-open' }) } });
+  deps: { retireRegistration: () => ({ retired: false, refused: 'fixture-retirement-disabled' }) } });
 
 const passSmoke = () => vi.fn(async () => ({
   verdict: 'pass', attempts: 1, smoke: { results: [{ name: 'reconcile-dry-run', ok: true, ms: 148_000 }, { name: 'lane-acquire-release', ok: true, ms: 32_000 }] },
