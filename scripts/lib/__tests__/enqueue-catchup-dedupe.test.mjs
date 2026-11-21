@@ -41,8 +41,10 @@ describe('catch-up decline memory', () => {
     const declines = new Map([[1, decline({ at: now - 31 * 60_000, ttlMs: 30 * 60_000 })]]);
     expect(plan({ prs: fresh, declines }).run.map(p => p.num)).toEqual([1, 2]);
   });
-  it.each(['mq-same-head-failed', 'sent-back', 'bornas-collision'])('re-checks %s when main CI newest completed run changes', reason => {
-    expect(plan({ mainCiRunId: 101, declines: new Map([[42, decline({ reason })]]) }).run).toHaveLength(1);
+  describe.each(['mq-same-head-failed', 'sent-back', 'bornas-collision'])('%s main-CI-scoped memory', reason => {
+    it('re-checks when main CI newest completed run changes', () => {
+      expect(plan({ mainCiRunId: 101, declines: new Map([[42, decline({ reason })]]) }).run).toHaveLength(1);
+    });
   });
   describe.each(['red-team-pending'])('%s head-scoped memory', reason => {
     it.each([101, undefined, null])('skips across main CI run %s, even without a stored main run', mainCiRunId => {
@@ -62,13 +64,15 @@ describe('catch-up decline memory', () => {
   it.each(['headRefOid', 'labelsDigest', 'lastCheckCompletedAt', 'checksDigest'])('missing %s evidence fails open', field => {
     expect(plan({ prs: [pr(42, { [field]: null })] }).run).toHaveLength(1);
   });
-  it.each(['mq-same-head-failed', 'sent-back', 'bornas-collision'])('missing main CI evidence fails open for %s', reason => {
-    for (const mainCiRunId of [undefined, null, 0, -1, 1.5, '100']) {
-      expect(plan({ mainCiRunId, declines: new Map([[42, decline({ reason })]]) }).run).toHaveLength(1);
-    }
-    for (const mainCiRunId of [undefined, null]) {
-      expect(plan({ declines: new Map([[42, decline({ reason, mainCiRunId })]]) }).run).toHaveLength(1);
-    }
+  describe.each(['mq-same-head-failed', 'sent-back', 'bornas-collision'])('%s missing main CI evidence', reason => {
+    it('fails open', () => {
+      for (const mainCiRunId of [undefined, null, 0, -1, 1.5, '100']) {
+        expect(plan({ mainCiRunId, declines: new Map([[42, decline({ reason })]]) }).run).toHaveLength(1);
+      }
+      for (const mainCiRunId of [undefined, null]) {
+        expect(plan({ declines: new Map([[42, decline({ reason, mainCiRunId })]]) }).run).toHaveLength(1);
+      }
+    });
   });
   it('puts no-hold PRs first, retaining existing order in each partition', () => {
     const result = plan({ prs: [pr(4), pr(3), pr(2), pr(1)], mainCiRunId: 101,
