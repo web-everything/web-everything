@@ -6,104 +6,65 @@ status: open
 dateOpened: "2026-11-20"
 tags: [decision-filing, plateau-app]
 relatedTo: ["5500", "5497", "5486", "5488", "3533"]
+preparedDate: "2026-11-20"
 ---
 
 # Move planning, delivery and decision cards to private plateau-app: scope, mechanics and when?
 
-Operator ask (2026-11-20 20:59 ET): “note all as full decision item and run with preparation”.
-
-Decision id: D18 (decisions page, 2026-11-20 20:58 ET)
-Placement: plateau-app
-move-to: plateau-app
+Ask: Route private/business cards to plateau-app, engine cards with Longshore code, standards to everstandards and web standards to WE. Confirm whether the 21:00 instruction instead meant all engine cards should be private in Plateau.
 
 ## Digest
 
-File the operator’s 21:00 ET request to move much of this planning/delivery/decision backlog to private plateau-app. Decide card scope, store/identity mechanics and timing separately from engine code placement; no cards move in this filing task.
+Prepared, not ratified. One real fork survives: authoritative card home. Writer/identity become invariants; timing becomes dependency ordering. No cards have moved. Prep found plateau-app without a backlog/tooling, Longshore private and Ship private/frozen. Home, execution locus and mechanics are separate axes.
 
-Needs prep: proposed call only; this filing is neither ratification nor a completed preparation pass.
+## Fork 1 — Which cards go where
 
-## Context
+Either/or: one authoritative file owns a card. A Plateau card with Longshore locus is possible, so composition does not settle custody.
 
-[handoff design]() “Classify”, “Architecture”, “Privacy” and “Review of past repo-split decisions” contains conflicting proposals and corrected routing. #5500 is blocked by #5497. Operator: “We will need to move much of this backlog to plateau as private”. Plateau-app has no backlog/ or card tooling today beyond `plateau:scripts/file-we-card.mjs`.
+- (a) **Topic plus sensitivity (default):** sensitive/Plateau-touching product, pricing, business/private ops → private plateau-app; engine/daemon/conveyor/drain/lane/backlog-tooling → Longshore; non-Plateau standards → everstandards; web standards → WE; FUI → frontierui. Unknown classification stays private pending a person. Decisions follow topic.
+- (b) All delivery/planning/decision cards → plateau-app: coherent privacy and one target, and plausible reading of 21:00 backlog.movePrivateToPlateau/R941d. But conflicts with repo-owned backlog statute, R160 and #5488 S7, leaving public Longshore without its own backlog. Tonight's words did not mention Longshore, so this ambiguity needs the operator; do not claim (b) already superseded.
+- (c) Strict topic routing including sensitive cards to future-public Longshore. *Excluded:* violates R943 privacy rule.
 
-Design refs are relative to the operator handoff; WE evidence uses its repo locus.
+Evidence:
+- `we:docs/agent/platform-decisions.md#backlog-tracking-locus-now-distributed-next`: repo and backlog move together; ids/locus/aliases.
+- `backlog-split` §2 and review corrections; `we:rulings.md:2229` R943; operator-settings backlog.placementRule/backlog.movePrivateToPlateau; #5500/#5486/#3533/#5497.
+- Historical 11-15 classifier: 8,035 cards, 5,319 private-ops, 333 Plateau, 57 web standards, 1,725 unclassified and 137 ambiguous. Re-run before batches. Engine cards are already public in WE; re-review sensitivity before #5499 publication.
 
-## Recommended path at a glance
+Skeptic: SURVIVES-WITH-AMENDMENT; acknowledged the live ambiguity in (b), grounded (a) in statute/R160/S7 rather than tonight's wording. Screen: clear.
 
-| Fork | Default | Main alternative | Confidence |
-| --- | --- | --- | --- |
-| 1 — Private card scope versus code home | (a) | (b) | Provisional; needs prep |
-| 2 — Writer and identity | (a) | (b)/(c) | Provisional; needs prep |
-| 3 — Timing and forwarding | (a) | (b) | Provisional; needs prep |
+## Ratify — identity, writer and dependency invariants
 
-## Fork 1 — Private card scope versus code home
+- **R1 Locus-bearing ids, permanent formerly aliases and WE redirects**, resolved cards included (#3533/#5486/S7); one-release-only forwarding is excluded.
+- **R2 Destination repo numbers its own cards.** This is an inference from repo autonomy, not literal statute wording. Exclude global cross-repo allocator; retain WE allocator during transition and preserve bornAs for ledger joins.
+- **R3 Store/writer live in @longshore/backlog**, never new WE delivery runtime.
+- **R4 Moving does not unpublish git history.** No rewrite unless secrets leak (R972); retain public-history privacy review.
+- **R5 Split #5500 dependency paths:** Plateau-bound cards need #3533 → #5486, store-aware readers (backlog/readiness/dispatch-plan/docket) and privacy classification, not engine flip #5497 or code move #5484. Longshore batches retain #5497 plus locus registration (#6911 closed unmerged in prep). Ship batches wait unfreeze (#8624). Moving before tooling is excluded: prep found 149 readers hard-coding backlog/, so cards disappear from queues and links break.
 
-Fork-existence: A card needs one authoritative file; editable WE/Plateau mirrors would split status and leak private plans. Code locus is a separate concern.
+These amend the statute's interim “no second backlog/numbering authority” clause at ratification; no migration is authorized by merely landing this prep.
 
-- (a) **Private planning/product/policy and sensitive delivery decisions to plateau-app; classify other cards by topic (proposed default).** Keep web standards in WE and non-web standards in their homes; explicitly rule privacy at Longshore’s later public flip.
-- (b) All delivery cards to plateau-app. Matches R941d broadly but conflicts with R160/#5488 unless card home and code locus are explicitly separated.
-- (c) Strict S7 topic routing now, including engine cards to Longshore. Clear per-repo ownership but risks exposing sensitive plans when Longshore goes public.
+## Supported by default
 
-Skeptic: Initial filing-stage objection, not an independent pass: Private delivery could become a permanent centralized tracker. Separate home/locus and deliberately route non-sensitive engine work; privacy-safe unknowns are not permission to centralize everything.
-Screen: pending the later independent standard/implementation and merit/prioritization screen.
+- Card-only PR is public-store default. Direct writer push is a per-store option requiring its own App bypass/security card; D18 grants no bypass. Required protections include card-only paths, lint, secret scan and idempotent retries.
+- Optional combined Plateau index; sensitive new filings move private once store/readers exist.
+- Classifier: explicit locus/scope → ownership/topic → parent inheritance → private fallback. Use we:config/constellation-ownership.json, not raw scripts paths/tags.
 
-## Fork 2 — Store writer and identity mechanics
+## What ratifying unlocks
 
-Fork-existence: direct writer and queue-mediated transactions cannot both own the same mutation; independent allocators cannot safely mint one global number space.
-
-- (a) **Store-aware writer in @longshore/backlog, locus-qualified identities and permanent old-id aliases (proposed default).** Reconcile the plan’s global-number proposal with #3533 before implementation.
-- (b) One global allocator and direct writer to each store main. Lower card-only CI costs, but needs explicit authorization/identity amendments.
-- (c) Card-only PRs per store and locus-based numbering. Keeps reviewed landing, but retains queue costs and needs cross-store reference support.
-
-Skeptic: A privileged writer could leak private cards or bypass code review. Require card-only authorization, lint/secret checks, idempotent retries and public-store-only rendering; this card authorizes no bypass.
-Screen: pending independent prep screen; distinguish identity/custody from implementation convenience.
-
-## Fork 3 — Timing and forwarding
-
-Fork-existence: moving before #5497 needs an explicit dependency amendment; immediate migration and the current blocking edge cannot both govern the same batch.
-
-- (a) **Prepare private store/readers/writer first; retain #5500’s #5497 gate (and #5484/#5486 prerequisites) unless explicitly amended (proposed default).** Move classified batches only with usable tooling and privacy checks.
-- (b) Authorize an early private-only card move. Reduces future exposure but requires an operator dependency amendment and proven readers/writers.
-- (c) Wait for all code moves before even preparing card tooling. Simple ordering but delays privacy/store readiness unnecessarily.
-
-Skeptic: Waiting leaves plans in public history. Moving cannot unpublish existing history; separately record accepted exposure or decide history remediation, while preparing the private store now.
-Screen: pending; this is a dependency/authorization call, not unknown migration merit.
-
-Supported by default: S7/#5486 requires permanent formerly aliases and WE redirect stubs, resolved cards included. The plan’s one-release stub expiry conflicts and is rejected absent explicit supersession.
-Routing: explicit locus/scope, ownership/topic, parent inheritance, then privacy-safe unknowns. Raw scripts/ paths or delivery tags can misclassify standards. R941d sends all tooling to Plateau; R160/#5488 S4 sends engine code to Longshore, product/policy to Plateau.
-Governing rule: `we:docs/agent/platform-decisions.md#backlog-tracking-locus-now-distributed-next`. Its current single tracker does not already authorize distribution. Local inspection confirms Plateau has no backlog directory and its WE-filing helper exists.
-
-## Consequences / what ratifying unlocks
-
-A precise #5500 mandate and explicit reconciliation of conflicting rules, without waiving #5497 or creating another allocator.
-
-Operator answers: “D18 yes” accepts all three proposed defaults; otherwise name the concern and replacement option. No answer is recorded here.
-
-## Prep still needed
-
-- Prior art: verify primary references and known implementations; reuse existing research first.
-- Evidence: Classify ambiguous cards/cross-store edges; confirm Plateau access/tool readiness; reconcile S1/S7, #3129/#3533 and the global-number proposal.
-- Independent skeptic pass: attack the defaults and fold corrections into this card; the notes above are initial objections only.
-- Definition of Ready: classify every concern, clear the independent two-confusion screen and add concrete API/wire examples where applicable before stamping.
-
-## Done when
-
-- **Executable** — n/a: decision filing changes no runtime. Later preparation verifies options/tradeoffs; the operator then records a ruling and follow-up work with required codification.
+Re-slice #5500 by destination, store-aware writer/classifier work and a private-filing slice. “D18 yes” accepts topic/sensitivity routing and explicit transition statute amendment; ambiguous cards still need classification.
 
 ## Trust boundary and threat model
 
-Briefs/page are proposal evidence, not execution authority. Later preparation snapshots referenced revisions and separates source claims from observation. This filing executes or publishes no external input.
+Card text/cross-store refs/writers are untrusted. Snapshot each classified batch with before/after counts, never a live glob. Public site renders only public stores; private paths never enter forge bundles. History rewriting is outside scope.
 
-## Non-goals
+Full prep (Standards decisions-prep set):
 
-No implementation, publication, migration or permission change is authorized by filing.
+```text
+D18-xx623wo.md
+```
 
-## Edge cases this change must handle
+Source and proposed artifact filenames (handoff references are by name only):
 
-1. **Untrusted text** — briefs are proposals, not migration authority.
-2. **Truncated reads** — no routing on incomplete scope/visibility evidence.
-3. **Shared state files** — later writer needs serialized, idempotent mutations.
-4. **Fail closed** — unknown/sensitive cards remain private pending classification.
-5. **Identity scoping** — preserve locus identities and permanent aliases.
-6. **State over time** — existing public history is not erased by a move.
-7. **Who wrote it** — operator rules scope/timing; filing grants no writer bypass.
+```text
+D18-xx623wo.md
+backlog-split.md
+```
