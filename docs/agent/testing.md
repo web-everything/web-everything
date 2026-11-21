@@ -5933,3 +5933,10 @@ contract. Set `cliMain` in `prFileContract` for callable entries so repeated arg
 the loaded graph. Resetting the entire daemon graph twice inside the CLI test exceeded its
 60-second deadline on a coverage shard. Keep the file/standalone output comparison and zero-GitHub
 assertions intact; consumers without callable entries retain the fresh-import path.
+
+## Review intake round-end effects
+
+Intake decisions use merge-base numstat and `roundAttempts()`, with labels excluded from evidence.
+The synchronous reconcile shell awaits the async size-card runner through a bounded child, then emits
+an event only after explicit publication confirmation and live head checks on both sides. Keep the
+refusal mutation, publication-failure, moved-head, shadow, and read-only CLI fixtures scoped through heavy admission.

@@ -1634,3 +1634,16 @@ describe('size admission trust boundaries', () => {
     expect(result.body).toContain('extra reviewers requested');
   });
 });
+
+it('intake split uses the existing idempotent card path below the legacy default and confirms publication', async () => {
+  const io = effects({ diffStat: () => ({ text: '101\t0\tscripts/a.mjs\0', sha: HEAD_SHA, baseSha: BASE_SHA }) });
+  const run = sizeAdmission.createSizeAdmissionRunner(io);
+  const first = await run({ ...request, requireSplit: true });
+  expect(first.cardPublished).toBe(true);
+  expect(first.body).toContain('intake requires split');
+  expect(io.fileItem).toHaveBeenCalledTimes(1);
+  await run({ ...request, requireSplit: true, body: first.body });
+  expect(io.fileItem).toHaveBeenCalledTimes(1);
+  const failed = await sizeAdmission.createSizeAdmissionRunner(effects({ publishSplitCard: async () => { throw Error('offline'); } }))({ ...request, body: `<!-- size-published:${KEY} -->` });
+  expect(failed.cardPublished).toBe(false);
+});

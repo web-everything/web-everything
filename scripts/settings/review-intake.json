@@ -1,0 +1,22 @@
+{
+  "intake": {
+    "maxLines": 300,
+    "countRule": "non-test-non-data",
+    "exemptPaths": [
+      "docs/**",
+      "**/*.md",
+      "*.md",
+      "backlog/**"
+    ],
+    "generatedPaths": [],
+    "overCapAction": "split-after-rounds",
+    "roundsBeforeSplit": 1,
+    "urgentExempt": true,
+    "atomicExempt": [
+      "generated",
+      "rename-only"
+    ],
+    "trackOverrides": true,
+    "enforce": "shadow"
+  }
+}

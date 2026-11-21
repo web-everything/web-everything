@@ -1,3 +1,5 @@
+import { readIntake, readIntakeSettings } from '../lib/review-loop/intake.mjs';
+import { applyIntakeEffectsSync } from '../lib/review-loop/round-end-gates.mjs';
 import { greenLedgerDir, hasGreenLedger } from '../lib/lane-verify.mjs';
 import { unread } from './dispatch-eligibility.mjs';
 import { isDrainTransientPath } from '../lib/transient-paths.mjs';
@@ -1717,7 +1719,7 @@ export function enrichPrsWithLedgerHolds(prs, { readOnly = false, repo, now = Da
  * @returns {{dispatch:Array<object>, refusals:Array<object>, notes:Array<object>, prs:number, agents:number}}
  */
 export function runReconcilePass({
-  readOnly = false,
+  readOnly = false, loadIntake = readIntakeSettings, intakeReader = readIntake, intakeEffects = applyIntakeEffectsSync,
   readPrs = defaultReadPrs, readAgents = defaultReadAgents, enrich = enrichAgents,
   excuseMergeGateHolds = excusePrMergeGateHolds, readMergeGateVerdict = defaultReadMergeGateVerdict,
   readFreeze = readSharedFreeze, mergeGateSetting,
@@ -1921,7 +1923,11 @@ export function runReconcilePass({
     mainRedPriority: readPriority(),
     ...(readOnly ? { shadowDeps: { mode: 'off', appendLine: () => {}, readLocals: () => undefined } } : {}),
   };
+  const intakeParams = loadIntake({ env });
+  Object.assign(plannerInput, { intakeEnforce: intakeParams.enforce,
+    readIntake: (pr, round) => intakeReader({ ...pr, round }, { params: intakeParams }) });
   const plan = step('plan', () => planReconcile(plannerInput));
+  if (!readOnly) intakeEffects(plan);
   const { prs: _prs, agents: _agents, repo: _repo, now: _now, durableCounts: _counts, ...plannerOptions } = plannerInput;
   return { ...plan, ...(readOnly ? { enrichedPrs: prs, agentList: agents, agentsIncomplete: Object.hasOwn(agents, 'incomplete'), plannerOptions } : {}), owedTriggers: hydrated.owedTriggers, notes: [...hydrated.notes, ...plan.notes], refusals: [...hydrated.refusals, ...plan.refusals], prs: rawPrs.length, agents: agents.length,
     openPrFiles: rawPrs.map((pr) => ({ pr: pr.number, files: Array.isArray(pr.files) && pr.files.length < 100
