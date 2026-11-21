@@ -237,8 +237,8 @@ export function createJudgeSweepFactsReader({ gh = operatorGh, now = () => Date.
     let exitPrs = new Set();
     try {
       const rulings = readExitRulings();
-      if (rulings.errors.includes('exit rulings unreadable')) errors.push('exit rulings unreadable');
-      else exitPrs = rulings.prs;
+      errors.push(...rulings.errors);
+      exitPrs = rulings.prs;
     } catch { errors.push('exit rulings unreadable'); }
     try { ledger = readLedgerRows(repo); if (!Array.isArray(ledger)) throw failure('ledger shape'); } catch { errors.push('verdict ledger unreadable'); }
     try { fixRows = readFixRows(); if (!Array.isArray(fixRows)) throw failure('fix ledger shape'); } catch { errors.push('fix-loop ledger unreadable'); }
