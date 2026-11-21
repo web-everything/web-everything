@@ -80,6 +80,24 @@ describe('canonical main merge carry with real git objects', () => {
   it('refuses a failed main refresh', () => { const f = fixture(); expect(f.run({ fetchMain: () => { throw Error('offline'); } }).ok).toBe(false); });
   it('refuses a failed cat-file read', () => { const f = fixture(); const blob = f.git('rev-parse', `${f.head()}:${timings}`); rmSync(join(f.repo, '.git/objects', blob.slice(0, 2), blob.slice(2))); expect(f.run().ok).toBe(false); });
   it('refuses the head own newer WEAKENED', () => { const f = fixture(); f.records.push({ ...f.audit, head: f.head(), at: '2026-11-20T01:00:00Z' }); expect(f.run().ok).toBe(false); });
+  it.each([undefined, 'bad', 'f'.repeat(64)])('refuses an intermediate unwaived WEAKENED with fingerprint %s', fingerprint => {
+    const f = fixture({ hops: 4 });
+    expect(f.run().ok).toBe(true);
+    const intermediate = f.git('rev-parse', 'HEAD~2');
+    f.records.push({ ...f.audit, head: intermediate, fingerprint, at: '2026-11-20T01:00:00Z' });
+    const result = f.run();
+    expect(result.ok).toBe(false);
+    expect(result.reason).toBe(fingerprint === 'bad' ? 'canonical-audit-missing' : 'canonical-audit-weakened');
+    expect(result.carried).toBeUndefined();
+  });
+  it('accepts an intermediate WEAKENED without a fingerprint only with its own matching waiver', () => {
+    const f = fixture({ hops: 2 });
+    const intermediate = f.git('rev-parse', 'HEAD~1');
+    f.records.push({ ...f.audit, head: intermediate, fingerprint: undefined, at: '2026-11-20T01:00:00Z' });
+    expect(f.run().ok).toBe(false);
+    f.waivers.push({ ...f.waiver, sha: intermediate });
+    expect(f.run().ok).toBe(true);
+  });
   it('preserves the newer unwaived sibling WEAKENED veto despite identical findings and fingerprint', () => {
     const f = fixture();
     expect(f.run().ok).toBe(true);

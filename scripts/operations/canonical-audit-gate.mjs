@@ -150,11 +150,27 @@ export function checkCanonicalAuditForOpen({ repo = process.cwd(), ref, sha, env
   if (evidence.ok && evidence.record?.head === fullSha) return { ok: true, reason: null, message: '', record: evidence.record, sha: fullSha };
   if (evidence.ok) {
     const carry = carryFor(evidence.record?.head?.toLowerCase());
-    if (carry.ok && carriesAcross(evidence.record?.fingerprint, carry.fingerprint)) return {
-      ok: true, reason: null, message: '', record: evidence.record, sha: fullSha,
-      carried: { kind: 'carried-across-main-merge', from: carry.from, to: carry.to,
-        mainParent: carry.mainParent, fingerprint: carry.fingerprint, ruling: carryRuling },
-    };
+    if (carry.ok && carriesAcross(evidence.record?.fingerprint, carry.fingerprint)) {
+      // A merge head's own negative evidence must not disappear just because it
+      // lacks the fingerprint used to select carried records.
+      const intermediateHeads = new Set(carry.chain.filter(head => head !== fullSha));
+      const unwaived = records.find(record => intermediateHeads.has(record.head.toLowerCase())
+        && record.verdict === 'WEAKENED' && !config.ruledWeakened.some(entry =>
+          entry.ref === ref && validSha(entry.sha) && entry.sha.toLowerCase() === record.head.toLowerCase()
+          && /^R\d+(?:\+R\d+)*$/.test(entry.ruling) && Array.isArray(entry.findings)
+          && entry.findings.length > 0 && entry.findings.every(f => typeof f === 'string' && f.trim())
+          && canonicalAuditEvidence([record], record.head, covers, null, { ruledWeakened: {
+            ruledWeakened: { ruling: entry.ruling, findings: entry.findings },
+            record: { sha: entry.sha, fingerprint: null },
+          } }).ok));
+      if (unwaived) return { ok: false, reason: 'canonical-audit-weakened', record: null, sha: fullSha,
+        message: `Main-merge carry refused: intermediate head ${unwaived.head} has an unwaived WEAKENED audit. Ask the operator to resolve this evidence or restore a non-revoked waiver matching that head's ref, sha and exact findings.` };
+      return {
+        ok: true, reason: null, message: '', record: evidence.record, sha: fullSha,
+        carried: { kind: 'carried-across-main-merge', from: carry.from, to: carry.to,
+          mainParent: carry.mainParent, fingerprint: carry.fingerprint, ruling: carryRuling },
+      };
+    }
   }
   const eligible = records.some(r => r.head.toLowerCase() !== fullSha && carryFor(r.head.toLowerCase()).ok
     && carriesAcross(r.fingerprint, carryFor(r.head.toLowerCase()).fingerprint));

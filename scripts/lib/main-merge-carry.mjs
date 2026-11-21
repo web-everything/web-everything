@@ -34,8 +34,10 @@ export function mainMergeCarry({ repo, auditedSha, head, exec = execFileSync, en
       return { mode: match[1], bytes: raw('cat-file', 'blob', `${sha}:${path}`) };
     };
     const equal = (a, b) => a === null ? b === null : b !== null && a.mode === b.mode && a.bytes.equals(b.bytes);
+    const chain = [];
     let current = head, mainParent;
     for (let hops = 0; hops < 4; hops++) {
+      chain.push(current);
       // Read the immutable commit itself: revision walkers may honor legacy grafts.
       const header = git('cat-file', 'commit', current).split('\n\n')[0];
       const parents = header.split('\n').filter(l => l.startsWith('parent ')).map(l => l.slice(7));
@@ -61,7 +63,7 @@ export function mainMergeCarry({ repo, auditedSha, head, exec = execFileSync, en
         const union = mergeTimingsJson(original.bytes.toString('utf8'), ours.bytes.toString('utf8'), theirs.bytes.toString('utf8'));
         if (union === null || !child.bytes.equals(Buffer.from(union))) return { ok: false };
       }
-      if (p1 === auditedSha) return { ok: true, from: auditedSha, to: head, mainParent, fingerprint };
+      if (p1 === auditedSha) return { ok: true, from: auditedSha, to: head, mainParent, fingerprint, chain };
       current = p1;
     }
     return { ok: false };

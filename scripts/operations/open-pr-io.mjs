@@ -96,7 +96,7 @@ export const OPEN_PR_TIMEOUT_MS = 30 * 60 * 1000;
 function withBypassInBody(argv, b, cwd) {
   return withNoteInBody(argv, renderBypassNote(b), cwd);
 }
-function withNoteInBody(argv, note, cwd, { preserveEmpty = false } = {}) {
+function withNoteInBody(argv, note, cwd, { preserveEmpty = true } = {}) {
   const i = argv.findLastIndex((a) => a.startsWith('--body-file='));
   if (i < 0) {
     const bodyIndex = argv.findLastIndex((a) => a.startsWith('--body='));

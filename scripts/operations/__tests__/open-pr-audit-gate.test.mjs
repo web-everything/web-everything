@@ -105,6 +105,21 @@ describe('combined open-pr preflight', () => {
     expect(prCreateBodyGuard(flags.body)).toEqual({ ok: true });
     expect(args.some(a => a.startsWith('--body-file='))).toBe(false);
   });
+  it.each(['', '   ', ' \n\t'].flatMap(body => [false, true].map(bypass => ({ body, bypass }))))(
+    'preserves empty inline bodies through carry and bypass annotation: %j', ({ body, bypass }) => {
+      const spawn = vi.fn((_cmd, args) => {
+        expect(args).toContain(`--body=${body}`);
+        const guard = prCreateBodyGuard(args.findLast(a => a.startsWith('--body=')).slice('--body='.length));
+        expect(guard).toMatchObject({ ok: false, code: 'empty-body' });
+        return { status: 3, stdout: JSON.stringify({ reason: guard.code }) };
+      });
+      const run = createPrLandRunner({ env: {}, spawn, prepGate: () => ({ ok: true }),
+        prePrReview: () => ({ action: 'pass', ...(bypass ? { bypass: { actor: 'operator', reason: 'approved', operatorInstruction: 'approved' } } : {}) }),
+        canonicalAudit: () => ({ ok: true, carried: { from: base, to: sha, fingerprint: 'f'.repeat(64) } }) });
+      expect(run({ argv: ['--ref=lane/audit', '--body=Earlier body', `--body=${body}`] }))
+        .toMatchObject({ outcome: 'refused', reason: 'empty-body' });
+      expect(spawn).toHaveBeenCalledOnce();
+    });
   it.each(['', ' \n\t'])('leaves an empty body file untouched so carry cannot bypass the body gate: %j', body => {
     const dir = mkdtempSync(join(tmpdir(), 'audit-carry-empty-body-'));
     const path = join(dir, 'body.md');
