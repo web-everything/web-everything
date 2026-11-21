@@ -27,6 +27,32 @@ const sendBack = () => ({ id: 'op-send-back', author: { login: 'chalbert' }, cre
 const red = [{ name: 'gate', status: 'completed', conclusion: 'failure' }];
 
 describe('review:human advisory re-run on a moved head', () => {
+  it.each([
+    ['newest-first Git reader', [mainMerge(HEAD), own(OLD)]],
+    ['oldest-first API reader', [own(OLD), mainMerge(HEAD)]],
+    ['live head in the middle', [own(OLD), mainMerge(HEAD), own('c'.repeat(40))]],
+  ])('finds the mechanical live head with %s commit ordering', (_name, commits) => {
+    expect(reviews(run({ commits }, { roundCap: 0 }))).toEqual([
+      expect.objectContaining({ advisoryReview: { head: HEAD, reason: 'head-moved-advisory' } }),
+    ]);
+  });
+  it.each([
+    ['absent live head', [mainMerge(OLD)]],
+    ['authored live head before older mechanical commit', [own(HEAD), mainMerge(OLD)]],
+  ])('does not infer a mechanical head from %s', (_name, commits) => {
+    expect(advisoryHeadMoveState(pr({ commits }))).toEqual({ owed: false });
+    expect(reviews(run({ commits }))).toEqual([]);
+  });
+  it.each(['on', 'off'])('unreadable advisory preserves missing-required-job rebase repair when advisory reruns are %s', setting => {
+    const result = run({ comments: [unreadable()] }, {
+      requiredChecks: ['gate', 'new-job'], advisoryReviewOnHumanHandoff: setting,
+    });
+    expect(result.dispatch).toEqual([
+      expect.objectContaining({ kind: 'fix', mode: 'stale-base-rebase' }),
+    ]);
+    expect(result.dispatch.some(row => row.kind === 'review')).toBe(false);
+    expect(result.refusals.some(row => row.kind === 'advisory-unreadable')).toBe(false);
+  });
   it('unreadable advisory preserves ci-heal for completed red required CI', () => {
     const result = run({ comments: [advisory(OLD, 'no basis recorded')],
       statusCheckRollup: [{ name: 'gate', status: 'completed', conclusion: 'failure' }] });

@@ -42,6 +42,18 @@ export default {
     // PR #7263 review: unreadable history may stop reviews, never the CI repair or operator send-back.
     const tip = "Merge branch 'main' into lane/x";
     const unreadable = { author, createdAt: '2026-11-20T10:00:00Z', body: `${ADVISORY_NOTE_MARKER}\n\nno basis` };
+    const gitOrder = plan(OLD, tip, { commits: [commit(HEAD, tip), commit(OLD, 'fix: it')] }, { roundCap: 0 });
+    const gitRows = gitOrder.dispatch.filter(d => d.kind === 'review' && d.advisoryReview?.reason === 'head-moved-advisory');
+    if (gitRows.length !== 1 || gitRows[0].advisoryReview.head !== HEAD) violations.push('newest-first Git commit history suppressed the live-head advisory');
+    for (const setting of ['on', 'off']) {
+      const missingJob = plan(OLD, tip, { comments: [unreadable] }, {
+        requiredChecks: ['gate', 'new-job'], advisoryReviewOnHumanHandoff: setting,
+      });
+      if (missingJob.dispatch.length !== 1 || missingJob.dispatch[0].mode !== 'stale-base-rebase') {
+        violations.push(`unreadable advisory suppressed missing-job rebase repair with advisory reruns ${setting}`);
+      }
+      if (missingJob.refusals.some(r => r.kind === 'advisory-unreadable')) violations.push(`advisory refusal took ownership of missing-job repair (${setting})`);
+    }
     const red = [{ name: 'gate', status: 'completed', conclusion: 'failure' }];
     const heal = plan(OLD, tip, { comments: [unreadable], statusCheckRollup: red });
     if (heal.dispatch.length !== 1 || heal.dispatch[0].kind !== 'ci-heal') violations.push('unreadable advisory suppressed red-CI heal');

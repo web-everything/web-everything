@@ -1639,7 +1639,7 @@ export function advisoryHeadMoveState(pr) {
   const trusted = (Array.isArray(pr?.comments) ? pr.comments : []).filter(isTrustedMarkerAuthor);
   const hasNote = trusted.some(c => String(c?.body ?? '').trimStart().startsWith(ADVISORY_NOTE_MARKER));
   const commits = Array.isArray(pr?.commits) ? pr.commits : [];
-  const tip = commits.at(-1);
+  const tip = commits.find(commit => String(commit?.oid ?? '').toLowerCase() === headSha);
   const mechanical = Boolean(tip) && String(tip.oid ?? '').toLowerCase() === headSha
     && (isMechanicalMergeCommit(tip) || isDrainBookkeepingCommit(tip) || /^Conveyor-[A-Za-z-]+:/m.test(String(tip.messageBody ?? '')));
   if (advisoryIsCurrent || alreadyReviewed || parseLatestHumanClearedSha(trusted) === headSha) return { owed: false };
@@ -3704,12 +3704,10 @@ export function planReconcile({
 
     // Repair, send-back and ruling owners above keep priority over an advisory, including an unreadable one.
     // One advisory per mechanical head; it is not a repair round and does not apply the red-team seat's hold.
+    let unreadableHeadMoveAdvisory = false;
     if (phase === 'needs-human' && !withPhase.labels.includes(ADVISORY_LABELS.CHANGES)) {
       const moved = advisoryHeadMoveState(pr);
-      if (moved.unreadable) {
-        refuse('advisory-unreadable', { ...withPhase, why: 'the newest advisory on this review:human PR cannot be read, so no review is dispatched; a person must read the thread' });
-        continue;
-      }
+      unreadableHeadMoveAdvisory = Boolean(moved.unreadable);
       if (moved.owed && advisoryReviewOnHumanHandoff === 'on') {
         const rowsBefore = dispatch.length;
         const buffered = [];
@@ -3739,7 +3737,7 @@ export function planReconcile({
     // A released fix does not supersede a conflict still owed its existing repair route and cap.
     const lastReview = latestHeadReview(pr);
     const release = releasedFixClaim(pr);
-    if (OWED[phase] && lastReview && release && release.releasedAtMs > lastReview.at
+    if (OWED[phase] && !unreadableHeadMoveAdvisory && lastReview && release && release.releasedAtMs > lastReview.at
       && !withPhase.labels.includes(CONFLICT_LABEL) && String(pr?.mergeStateStatus ?? '').toUpperCase() !== 'DIRTY'
       && release.index > lastReview.index
       && !sameHeadSha(lastReview.head, pr.headRefOid)
@@ -4054,6 +4052,11 @@ export function planReconcile({
     // All three checks (the head guard, no-findings, the cap) live in {@link dispatchReviewRow} — the ONE copy,
     // shared with the ci-red-parallel review above (PR #2783 review: the review decision was duplicated here).
     if (OWED[phase] === 'review') {
+      // Unreadable history blocks the advisory, while missing-job and other repair owners above still run.
+      if (unreadableHeadMoveAdvisory) {
+        refuse('advisory-unreadable', { ...withPhase, why: 'the newest advisory on this review:human PR cannot be read, so no review is dispatched; a person must read the thread' });
+        continue;
+      }
       dispatchReviewRow({ pr, requiredChecks, withPhase, base, attempts: roundAttempts(), roundCap: effectiveRoundCap, refuse, refuseCapExhausted, dispatch, now });
       continue;
     }
