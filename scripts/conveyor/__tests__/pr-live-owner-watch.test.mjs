@@ -1,11 +1,16 @@
 /** @file R863 ownership, safety, durable budgets, smells and health cadence regressions. */
-import { describe, it, expect, vi, beforeAll, afterEach } from 'vitest';
+import { describe, it, expect, vi, afterEach, beforeAll } from 'vitest';
 import { mkdtempSync, rmSync, readFileSync, writeFileSync, readSync, mkdirSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { classifyOwner, planActions, processLive, selfAudit, detectSmells, runLiveOwnerWatchPass, probeLiveOwnerWatch, LIVE_OWNER_DEFAULTS } from '../pr-live-owner-watch.mjs';
 import { feedTail, resolveLiveOwnerSettings, createLiveOwnerWatchIo } from '../pr-live-owner-watch-io.mjs';
 import { keepAliveScript } from '../../lib/test-keepalive.mjs';
+// Collect the cyclic dispatch graph before per-case deadlines start. The first review
+// adapter otherwise pays for its cold Vite transforms inside the 5-second assertion budget.
+import * as reviewJob from '../../operations/review-job.mjs';
+import { dispatchManualPass } from '../../operations/manual-daemon-pass-io.mjs';
+import { durableCountsFrom } from '../reconcile-pass.mjs';
 
 const NOW = Date.parse('2026-11-10T18:00:00Z'), MIN = 60_000;
 const ago = minutes => new Date(NOW - minutes * MIN).toISOString();
@@ -343,14 +348,14 @@ describe('health-watch registration', () => {
 });
 
 describe('portable feed IO and settings', () => {
+  // Load the real dispatchers before timing individual adapter assertions. Their cold
+  // import graph can exceed a test's 5s budget under the sharded CI workload.
+  // These roots share circular dependencies: like createLiveOwnerWatchIo, finish
+  // each import before starting the next to avoid a vite-node evaluation deadlock.
   beforeAll(async () => {
-    // The real adapters lazily load these large module graphs. Keep cold transform/import
-    // setup outside the individual tests' assertion budget without replacing the adapters.
-    await Promise.all([
-      import('../../operations/manual-daemon-pass-io.mjs'),
-      import('../../operations/review-job.mjs'),
-      import('../reconcile-pass.mjs'),
-    ]);
+    await import('../../operations/manual-daemon-pass-io.mjs');
+    await import('../../operations/review-job.mjs');
+    await import('../reconcile-pass.mjs');
   }, 30_000);
   const dirs = []; afterEach(() => dirs.splice(0).forEach(dir => rmSync(dir, { recursive: true, force: true })));
   async function localIo(adapters = {}, now = NOW, dir, actEnabled = true, extraEnv = {}) {
@@ -462,7 +467,7 @@ describe('portable feed IO and settings', () => {
       reconcileReview: () => ({ dispatch: [{ kind: 'review', prNumber: 863 }], refusals: [] }) });
     expect((await io.execute({ pr: pr(), action: 'review-dispatch' })).ok).toBe(true);
     expect(dispatchManualPass.mock.calls[0][0]).toEqual({ daemon: 'review', repo: pr().repo, pr: 863, expectedHead: pr().headRefOid });
-  });
+  }, 15_000); // ~1.9s locally, but it spawns real children and blew the 5000ms default on loaded CI shards; sized from CI, not local
   it('dead red-team adapter abandons, replans recovery and forwards redTeamMode', async () => {
     const order = [], dispatchManualPass = vi.fn(input => { order.push('dispatch'); return { jobPid: 123 }; });
     const { io } = await localIo({ dispatchManualPass, readGhText: commentGh(), readRedTeamStatus: () => ({ status: 'running' }),
@@ -547,7 +552,6 @@ describe('portable feed IO and settings', () => {
 
   async function reviewAdapters(overrides = {}) {
     const { planReconcile, resolveRoundCap } = await import('../reconcile-core.mjs');
-    const { durableCountsFrom } = await import('../reconcile-pass.mjs');
     return { readAgents: () => [], readGhText: commentGh(), dispatchManualPass: vi.fn(),
       reconcileReview: options => {
         const prs = options.readPrs();
@@ -573,7 +577,6 @@ describe('portable feed IO and settings', () => {
     expect(adapters.dispatchManualPass).not.toHaveBeenCalled();
   });
   it('review rechecks live head after reconcile and records the expected head on a refused intent', async () => {
-    const { dispatchManualPass } = await import('../../operations/manual-daemon-pass-io.mjs');
     let liveHead = pr().headRefOid;
     const dispatchReviewByMode = vi.fn(), readGhText = commentGh();
     const adapters = await reviewAdapters({
@@ -622,18 +625,18 @@ describe('portable feed IO and settings', () => {
   it('PR list retries ETIMEDOUT once and recovers without losing the inventory', async () => {
     const readGhText = vi.fn().mockImplementationOnce(() => { throw Object.assign(Error('spawnSync gh ETIMEDOUT'), { code: 'ETIMEDOUT' }); })
       .mockReturnValueOnce(JSON.stringify([pr()]));
-    const { io } = await localIo({ readGhText });
+    const { io } = await localIo({ readGhText, sleepMs: vi.fn() });
     expect(io.listPRs()).toEqual([pr()]);
     expect(readGhText).toHaveBeenCalledTimes(2);
   });
   it('PR list holds after one failed timeout retry with an inventory inspection fallback', async () => {
     const readGhText = vi.fn(() => { throw Object.assign(Error('spawnSync gh ETIMEDOUT'), { code: 'ETIMEDOUT' }); });
-    const { io } = await localIo({ readGhText });
+    const { io } = await localIo({ readGhText, sleepMs: vi.fn() });
     const h = harness([], { listPRs: io.listPRs });
     const result = await h.run();
     expect(result.considered).toBe(0);
-    expect(result.held).toContainEqual({ reason: expect.stringMatching(/PR list unavailable after one timeout retry.*ETIMEDOUT.*operator must inspect inventory/) });
-    expect(readGhText).toHaveBeenCalledTimes(2); expect(h.io.execute).not.toHaveBeenCalled();
+    expect(result.held).toContainEqual({ reason: expect.stringMatching(/PR list unavailable after 2 retries.*ETIMEDOUT.*operator must inspect inventory/) });
+    expect(readGhText).toHaveBeenCalledTimes(3); expect(h.io.execute).not.toHaveBeenCalled();
   });
 
   it('stale-base gate and optional validator use injected existing entry points', async () => {
@@ -724,16 +727,14 @@ describe('portable feed IO and settings', () => {
     expect(() => feedTail(path, { read })).toThrow(/short tail read.*operator must inspect full input/);
   });
   it.each(['review-dispatch', 'red-team-dispatch'])('%s job refuses a head changed after the manual precheck through the production dispatcher', async action => {
-    const real = await import('../../operations/review-job.mjs');
-    const { dispatchManualPass } = await import('../../operations/manual-daemon-pass-io.mjs');
     const spawnJob = vi.fn(() => ({ pid: 4242 })), seen = [], outcomes = [];
     // The job-side live head moved after the precheck; nothing here can launch a real job.
     const jobOpts = { io: { liveHead: () => 'b'.repeat(40) }, spawnJob, checkoutExists: () => false,
       stackCheck: () => ({ base: null }), readCompletion: () => null };
     const record = result => { outcomes.push(result); return result; };
-    const loadReviewJob = async () => ({ ...real,
-      dispatchReviewByMode: opts => { seen.push(opts); return record(real.dispatchReviewByMode({ ...opts, ...jobOpts })); },
-      dispatchReviewJob: opts => { seen.push(opts); return record(real.dispatchReviewJob({ ...opts, ...jobOpts })); } });
+    const loadReviewJob = async () => ({ ...reviewJob,
+      dispatchReviewByMode: opts => { seen.push(opts); return record(reviewJob.dispatchReviewByMode({ ...opts, ...jobOpts })); },
+      dispatchReviewJob: opts => { seen.push(opts); return record(reviewJob.dispatchReviewJob({ ...opts, ...jobOpts })); } });
     const { io } = await localIo({ loadReviewJob, readGhText: commentGh(), readAgents: () => [],
       // Keep the stub loader even if production passes none, so this test never reaches a real launcher.
       dispatchManualPass: (input, opts) => dispatchManualPass(input, { ...opts, load: opts.load ?? loadReviewJob }),

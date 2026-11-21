@@ -4,11 +4,10 @@ kind: decision
 parent: "3383"
 status: open
 dateOpened: "2026-10-10"
-preparedDate: "2026-10-10"
-preparedAgainstSha: "75be239bfe71416cb2de79d80d25578d0e70918c"
-relatedTo: ["5452", "4601", "4086", "5767", "4609", "3007", "2626", "4282", "5712"]
+relatedTo: ["5452", "4601", "4086", "5767", "4609", "3007", "2626", "4282", "5712", "5488", "8629"]
 relatedReport: reports/2026-10-10-event-stream-state-manager.md
 tags: [conveyor, daemons, event-driven, state-store, decision-prep]
+preparedDate: "2026-11-20"
 ---
 
 # One event stream and one state manager for all daemons, the operator pages and the tools
@@ -507,3 +506,51 @@ One line per class: either the handling, or `n/a: <why>`.
 5. **Identity scoping** — subjects are `{kind, id}` per tenant and repo; action keys include the head commit (Fork 3).
 6. **State over time** — retention per class as settings; judgments kept forever (Supported by default).
 7. **Who wrote it** — every event carries a producer stamped by the sequencer; appends are permitted per type (Forks 1, 3).
+
+## Update 2026-11-20 (D4, decisions page)
+
+Ask: Confirm one shared store, a file journal for initial shadow runs, then Plateau-hosted Cloudflare storage. All store code stays open in Longshore.
+
+### Digest
+
+October's eight prepared forks above remain the evidence base. **No new real fork**: staging composes with the existing design. Ratify open adapter custody; delegate kernel-home change from Frontier UI to #5488. Amend Fork 3's envelope with the CloudEvents sequence binding.
+
+### Ratify — store adapters are open; Plateau hosts
+
+- (a) **Longshore holds sequencer core, in-memory, journal and DO adapters (default).** Plateau operates hosted tenants, credentials, billing and private plugins.
+- (b) DO adapter only in private Plateau. *Excluded:* prevents open multi-host self-hosting and contradicts the open primitive boundary (#098).
+
+Evidence:
+- `longshore-end-state-2026-11-20` §1.1/1.7/4; `we:scripts/conveyor/pr-events-worker/core.mjs:277/:419`, `we:__tests__/core.test.mjs:7-34`, `wrangler.toml:19-21` separate storage from core.
+- Existing transaction assumptions (`we:scripts/conveyor/pr-events-worker/core.mjs:271-314`) require journal-specific cross-process lock and torn-tail recovery proof, beyond in-memory tests.
+
+Skeptic: SURVIVES-WITH-AMENDMENT; added disk-safety tests, kept host-local journals and explicit multi-host refusal. Screen: clear.
+
+### Supported by default
+
+- Journal shadow → DO authority, never two authorities. Enable only after both pass the shared core suite, identical snapshot restore, strictly increasing/non-reused seq and dedupe tombstones outliving rows; add lock/crash recovery tests for the journal.
+- Store-by-name: a single-host tenant may choose journal authority; validator refuses it for multiple registered hosts. WE is multi-host; host-local kinds retain a journal after DO cutover.
+- Envelope binds to [CloudEvents](https://raw.githubusercontent.com/cloudevents/spec/main/cloudevents/spec.md): required id/source/specversion/type. Its [sequence extension](https://raw.githubusercontent.com/cloudevents/spec/main/cloudevents/extensions/sequence.md) is a lexicographic string, so zero-pad seq and scope source to tenant stream; credential-stamp producer identity (fetched 2026-11-20).
+- October retention prerequisite is partly fulfilled: runtime rows 5,000/30 days; tombstones 60 days/20,000 keys (`we:scripts/conveyor/pr-events-worker/core.mjs:17/:64-69`, November prep snapshot). Per-class retention for non-GitHub kinds is still owed.
+- Envelope/registry/replay definitions stay Ship's; Apache code licence follows #5403. Kernel home follows #5488, superseding October placement only if ratified.
+
+### What ratifying unlocks
+
+Local tap shadow through the journal, port DO adapter, then per-kind cutovers. “D4 yes” affirms custody/staging; #5488 separately settles home.
+
+### Trust boundary and threat model
+
+Observational shadow data never grants ownership. Keep credential/type authorization and October failure/restore rules; verify journal safety before authority.
+
+Full prep (Standards decisions-prep set):
+
+```text
+D4-5785.md
+```
+
+Source and proposed artifact filenames (handoff references are by name only):
+
+```text
+D4-5785.md
+longshore-end-state-2026-11-20.md
+```

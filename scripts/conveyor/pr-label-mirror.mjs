@@ -98,6 +98,8 @@ export async function readLabelTimeline({ repo, pr, read = readGh, maxPages = TI
   try {
     if (!REPO_RE.test(String(repo)) || !Number.isInteger(Number(pr))) return { status: 'unreadable', reason: 'bad-target' };
     const [owner, name] = repo.split('/');
+    // These GraphQL event types expose only an opaque node id, not databaseId.
+    // Preserve connection order for same-second changes; the planner falls back to time/index.
     const actor = 'id createdAt actor { __typename login } label { name }';
     const items = [];
     let before = null;
@@ -150,8 +152,16 @@ export function planLabelInputRows({ repo, pr, items = [], liveLabels = [], self
   // landing during that refresh must also beat a historical addition in the same second.
   const observedIds = new Set(observedEvents.map(ledgerEventId));
   const latest = new Map();
-  items.map((it, i) => ({ it, i })).sort((a, b) => Date.parse(a.it.createdAt) - Date.parse(b.it.createdAt) || a.i - b.i)
-    .forEach(({ it }) => { if (HOLD_LABELS.includes(it.label)) latest.set(it.label, it); });
+  // Id order only when EVERY item carries a decimal id: a mixed comparator is not transitive.
+  const allNumeric = items.every(it => /^[0-9]+(?![\s\S])/.test(String(it.eventId)));
+  const ordered = items.map((it, i) => ({ it, i })).sort((a, b) => {
+    if (allNumeric) {
+      const left = BigInt(a.it.eventId), right = BigInt(b.it.eventId);
+      return left < right ? -1 : left > right ? 1 : a.i - b.i;
+    }
+    return Date.parse(a.it.createdAt) - Date.parse(b.it.createdAt) || a.i - b.i;
+  }).map(({ it }) => it);
+  ordered.forEach(it => { if (HOLD_LABELS.includes(it.label)) latest.set(it.label, it); });
   const rows = [];
   for (const it of latest.values()) {
     if ((it.change === 'added') !== live.has(it.label)) continue; // the PR has moved on since this change
@@ -163,14 +173,14 @@ export function planLabelInputRows({ repo, pr, items = [], liveLabels = [], self
       // A same-second removal followed by this addition is evidence for a reapplication during
       // the observation window. Preserve that hold conservatively; timestamps cannot link an
       // arbitrary removal to a particular concurrent clearance within the same second.
-      || items.slice(0, items.indexOf(it)).some(previous => previous.label === it.label && previous.change === 'removed'
+      || ordered.slice(0, ordered.indexOf(it)).some(previous => previous.label === it.label && previous.change === 'removed'
         && second(previous.createdAt) === second(e.at) && second(it.createdAt) === second(e.at))).map(ledgerEventId);
     // A delayed observation must not move an old addition after its clearing ceremony in append order.
     // This also covers the interval between clear-human's approval append and its live label swap.
     // GitHub timestamps describe a whole second. Only a strictly later second proves a clearance
-    // followed this addition. Same-second ambiguity tightens; connection order keeps a re-add latest.
+    // followed this addition. Same-second ambiguity tightens; event id order keeps a re-add latest.
     if (it.change === 'added' && clearances.some((e) => Math.floor(Date.parse(e.at) / 1000) > Math.floor(Date.parse(it.createdAt) / 1000)
-      && ((approvalValid(e, now) && !e.delegation) || ((e.type === EVENT_TYPES.VERDICT || e.type === undefined)
+      && ((approvalValid(e, now, headSha) && !e.delegation) || ((e.type === EVENT_TYPES.VERDICT || e.type === undefined)
         && verdictClears(e.verdict) && acceptanceCovers(e, headSha))))) continue;
     const dup = events.some((e) => e?.type === EVENT_TYPES.LABEL_INPUT && e.pr === pr && String(e.repo).toLowerCase() === String(repo).toLowerCase()
       && e.label === it.label && e.change === it.change && (it.id && e.timelineId ? it.id === e.timelineId
