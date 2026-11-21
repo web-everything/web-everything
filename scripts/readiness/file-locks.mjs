@@ -239,6 +239,14 @@ export function acquireLockDir(lockRoot, path, entry, { afterMkdir = null } = {}
 /** Name of the owner's own heartbeat file inside its lock dir (see {@link heartbeatOwn}). */
 const heartbeatFileFor = (owner) => `hb.${createHash('sha256').update(String(owner)).digest('hex').slice(0, 16)}`;
 
+/** Inspect only this owner's heartbeat evidence without modifying the store. */
+export function ownHeartbeatState(lockRoot, path, owner) {
+  try {
+    const beat = readFileSync(join(lockDirFor(lockRoot, path), heartbeatFileFor(owner)), 'utf8').trim();
+    return Number.isFinite(Date.parse(beat)) ? 'ok' : 'unreadable';
+  } catch (error) { return error?.code === 'ENOENT' ? 'absent' : 'unreadable'; }
+}
+
 /** Read the lock entry for `path` (or `null` if the dir/entry is absent or corrupt). Impure read. When the owner
  *  has refreshed through {@link heartbeatOwn}, `heartbeatAt` is the later of the entry's and that file's. */
 export function readLockEntry(lockRoot, path) { return readEntryInDir(lockDirFor(lockRoot, path)); }
