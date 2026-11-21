@@ -315,7 +315,6 @@
   "scripts/__tests__/prototype-tracker-data.test.mjs": 0.03,
   "scripts/__tests__/prototype-tracker-render-real.test.mjs": 0.4,
   "scripts/__tests__/prototype-tracker-render.test.mjs": 0.01,
-  "scripts/__tests__/providers-skill.test.mjs": 0.01,
   "scripts/__tests__/prune-landed-lanes.test.mjs": 0.02,
   "scripts/__tests__/push-if-green-numbers-pending-hashes.test.mjs": 0.54,
   "scripts/__tests__/push-if-green.test.mjs": 0.51,
