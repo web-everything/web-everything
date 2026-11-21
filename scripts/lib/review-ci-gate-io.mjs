@@ -5,7 +5,7 @@ import { resolveTimingPolicy } from './review-timing-settings.mjs';
 /** Fresh repo-explicit review eligibility, with injectable read-only GitHub IO. */
 import { readGh } from './proc-read.mjs';
 import { getRequiredStatusChecks } from './required-status-checks.mjs';
-import { excuseMergeGateRows, latestFailingMergeGate, loadMergeGateHoldSetting, readMergeGateVerdict as defaultReadMergeGateVerdict } from './merge-gate-hold-class.mjs';
+import { excuseMergeGateRows, latestFailingMergeGate, loadMergeGateHoldSetting, readLatestMainCi, readMergeGateVerdict as defaultReadMergeGateVerdict } from './merge-gate-hold-class.mjs';
 import { readSharedFreeze } from './red-main-freeze-shared.mjs';
 import { reviewCiGate } from './review-ci-gate.mjs';
 
@@ -38,6 +38,7 @@ export const readReviewChecks = ({ repo, headSha, run = gh }) => [
 export function readReviewCiGate({ repo, pr, readHead, readLabels,
   readHeadAndLabels = readReviewHeadAndLabels,
   readMergeGateVerdict = defaultReadMergeGateVerdict, readFreeze = readSharedFreeze, mergeGateSetting,
+  readMainCi = readLatestMainCi,
   readVerifyGreen = hasGreenLedger, coordinationRoot,
   log = line => console.error(line),
   readChecks = readReviewChecks, readRequired = getRequiredStatusChecks, policy = resolveTimingPolicy().review } = {}) {
@@ -94,6 +95,7 @@ export function readReviewCiGate({ repo, pr, readHead, readLabels,
         checks = excuseMergeGateRows(checks, { prNumber: Number(pr), headSha,
           labels: readLabels ? readLabels({ repo, pr }) : labels, setting,
           readVerdict: args => readMergeGateVerdict({ ...args, repo }), freeze: () => readFreeze(),
+          readMainCi: () => readMainCi({ repo }), repo,
         }).rows;
       }
     } catch { /* Unreadable excusal evidence preserves the original failed checks. */ }

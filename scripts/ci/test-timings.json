@@ -569,6 +569,7 @@
   "scripts/conveyor/__tests__/overlap-yield-net-diff.test.mjs": 0.03,
   "scripts/conveyor/__tests__/owed-ci-rerun-executor.test.mjs": 0.03,
   "scripts/lib/__tests__/merge-gate-stale-freeze.test.mjs": 0.03,
+  "scripts/lib/__tests__/review-ci-gate-stale-freeze.test.mjs": 0.05,
   "scripts/operations/__tests__/stale-freeze-rerun.test.mjs": 0.03,
   "scripts/conveyor/__tests__/parked-pr-conflict-watch.test.mjs": 1.57,
   "scripts/conveyor/__tests__/parked-pr-progress-watch.test.mjs": 2.49,
