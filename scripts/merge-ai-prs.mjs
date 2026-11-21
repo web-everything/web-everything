@@ -5295,7 +5295,7 @@ export async function main(argv, { env = process.env, stdout = process.stdout, e
     platform: platformPreference('drain'), tool: readDeclaredDrainSettings()?.drain,
   });
   // Lazy: a static import would drag the dispatch-lane chain into fix-run's static graph.
-  const claimRoot = await import('./conveyor/fix-dispatch-claim.mjs').then(m => m.fixDispatchClaimRoot(), () => '(unresolved)');
+  const claimRoot = await import('./conveyor/fix-dispatch-claim.mjs').then(m => m.fixDispatchClaimRoot?.() ?? '(unresolved)').catch(() => '(unresolved)');
   process.stderr.write(`merge-ai-prs: drain.honourDispatchClaims=${honourDispatchClaims.value} (${honourDispatchClaims.source}) claimRoot=${claimRoot}\n`);
   const shadowClaimRows = new Set();
   const passClaimReader = drainClaimReaderFor(honourDispatchClaims.value, { onShadow: row => {
