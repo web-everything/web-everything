@@ -7,11 +7,11 @@ import { tmpdir } from 'node:os';
 const script = resolve('scripts/lane-pool.mjs');
 let root, primary, lane, origin, pool, marker, first, tip;
 const git = (cwd, ...args) => execFileSync('git', args, { cwd, encoding: 'utf8', maxBuffer: 1024 * 1024 }).trim();
-beforeEach(() => {
+function setupFixture(objectFormat = 'sha1') {
   root = mkdtempSync(join(process.env.TMPDIR || tmpdir(), 'lane-branch-'));
   primary = join(root, 'primary');
   mkdirSync(primary);
-  git(primary, 'init', '--quiet', '--initial-branch=main');
+  git(primary, 'init', '--quiet', '--initial-branch=main', `--object-format=${objectFormat}`);
   writeFileSync(join(primary, 'file.txt'), 'first\n');
   git(primary, 'add', '.');
   git(primary, '-c', 'user.name=Test', '-c', 'user.email=test@example.com', 'commit', '--quiet', '-m', 'first');
@@ -27,7 +27,8 @@ beforeEach(() => {
   git(root, 'clone', '--quiet', '--reference', primary, origin, lane);
   marker = join(lane, '.git', '.lane-lease');
   writeFileSync(marker, JSON.stringify({ session: 'dispatcher', holder: 'holder', acquiredAt: new Date().toISOString(), ttlMinutes: 120 }));
-});
+}
+beforeEach(() => setupFixture());
 afterEach(() => rmSync(root, { recursive: true, force: true }));
 
 function run(overrides = {}, poolName = 'fixture', env = {}, command = 'branch', options = {}) {
@@ -57,6 +58,27 @@ it.each([undefined, 'sha', 'origin/main'])('lane-pool branch creates a lane bran
   expect(result.status, result.stderr).toBe(0);
   expect(git(lane, 'branch', '--show-current')).toBe('lane/test');
   expect(git(lane, 'rev-parse', 'HEAD')).toBe(from === 'sha' ? first : tip);
+  expect(git(primary, 'branch', '--show-current')).toBe('main');
+  expect(git(primary, 'branch', '--list', 'lane/test')).toBe('');
+  expect(readFileSync(marker, 'utf8')).toBe(lease);
+});
+it.each([undefined, 'sha', 'origin/main'])('creates a SHA-256 lane branch from %s', from => {
+  rmSync(root, { recursive: true, force: true });
+  setupFixture('sha256');
+  expect(tip).toMatch(/^[a-f0-9]{64}$/);
+  const lease = readFileSync(marker, 'utf8');
+  const target = from === 'sha' ? first : tip;
+  const options = { from: from === 'sha' ? first : from };
+  const refs = git(lane, 'show-ref');
+  const dryRun = run({ ...options, 'dry-run': true });
+  expect(dryRun.status, dryRun.stderr).toBe(0);
+  expect(dryRun.stdout).toContain(`would create lane/test at ${target}`);
+  expect(git(lane, 'show-ref')).toBe(refs);
+  expect(git(lane, 'branch', '--show-current')).toBe('main');
+  const result = run(options);
+  expect(result.status, result.stderr).toBe(0);
+  expect(git(lane, 'branch', '--show-current')).toBe('lane/test');
+  expect(git(lane, 'rev-parse', 'HEAD')).toBe(target);
   expect(git(primary, 'branch', '--show-current')).toBe('main');
   expect(git(primary, 'branch', '--list', 'lane/test')).toBe('');
   expect(readFileSync(marker, 'utf8')).toBe(lease);

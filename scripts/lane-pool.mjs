@@ -5671,7 +5671,7 @@ function cmdBranch(repo) {
   let commit;
   try { commit = branchGit(['rev-parse', '--verify', `${from}^{commit}`]); }
   catch { refuse('--from does not resolve to a commit'); }
-  if (!/^[a-fA-F0-9]{40}$/.test(commit)) refuse('--from commit unreadable');
+  if (!/^(?:[a-fA-F0-9]{40}|[a-fA-F0-9]{64})$/.test(commit)) refuse('--from commit unreadable');
   const current = readLease(dir, () => refuse('lease unreadable before switch'));
   if (!current || current.holder !== lease.holder
     || !Number.isFinite(Date.parse(current.acquiredAt))
