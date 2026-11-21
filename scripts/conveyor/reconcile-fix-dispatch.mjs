@@ -85,7 +85,7 @@ import { withOperatorAnswer } from './stand-down-answer-core.mjs';
 import { fixerRulingBrief, renderRulingNotAddressed } from '../lib/ruling-ledger.mjs';
 import { withSalvageHint } from '../lib/salvage-index.mjs';
 import { repoKeyForSlug, CONSTELLATION_REPOS, ghRepoSlug } from '../lib/constellation-repos.mjs';
-import { repoProfile, briefTokensForRepo } from '../lib/repo-profile.mjs';
+import { assertCapability, repoProfile, briefTokensForRepo } from '../lib/repo-profile.mjs';
 import { resolvePrWorkUnit, isSafeFallbackScopeEntry } from './pr-work-unit.mjs';
 import { resolveFixScopePolicy, resolveOperatorPriorityPrs, createRegionReader, createLiveRegionOverlap, createHolderStateReader, landingHolderDecision, stripProseScope } from './fix-scope-policy.mjs';
 import { DEFAULT_FIX_DISPATCH_CLAIM_TTL_MINUTES } from './fix-claim-store.mjs';
@@ -1958,11 +1958,11 @@ export function runReconcileFixDispatch({
 
   // CI-heal is a capability of its own — refused independently of whatever `fix` decides below (see this
   // function's own docblock).
-  const ciHealRefusals = profile?.capabilities?.ciHeal ? [] : unsupportedFor(
+  const ciHealRefusals = !assertCapability(repoKey, 'ciHeal', { resolveProfile: () => profile }) ? [] : unsupportedFor(
     'ci-heal', 'ci-heal', 'CI-heal dispatch requires a repo-specific brief and gate; the existing worker is WE-only.',
   );
 
-  if (!profile?.capabilities?.fix) {
+  if (assertCapability(repoKey, 'fix', { resolveProfile: () => profile })) {
     // This repo's fix stage is off entirely: every `fix` entry is unsupported, never touching the lane pool or
     // a dispatch sink. Durable ledger write mirrors the pre-slice-5 blanket branch exactly — preserve any
     // already-recorded `review` rows for this repo (a DIFFERENT stage this file knows nothing about), replace
@@ -2478,8 +2478,6 @@ export function planFixDispatchClaimStatus({
   assertMainNotStale(root, checkStaleness, FIX_STALE_GUARD_OPTS);
   const reconciled = reconcile({ repo, ...(prsFile ? { readPrs: () => readPrsFromFile(prsFile) } : {}) });
   const dispatchEntries = Array.isArray(reconciled.dispatch) ? reconciled.dispatch : [];
-  const profile = resolveProfile(repoKey);
-  if (!profile?.capabilities?.fix) return { repo: repoKey, entries: [] };
   const { planned } = planFixesFromReconcile(dispatchEntries, findItemFn, loadItems, resolveFallbackScope, repoKey, fetchItemlessDiffPaths, resolveCardScopeAtRef);
   const entries = planned.map((entry) => ({
     pr: entry.pr, itemNum: entry.itemNum, headRefOid: entry.headRefOid,

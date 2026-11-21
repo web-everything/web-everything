@@ -21,6 +21,19 @@ const root = resolve(dirname(fileURLToPath(import.meta.url)), '../..');
 const MULTI = 'scripts/__tests__/multi-repo-checks.test.mjs';
 
 describe('selectScanTests', () => {
+  it('scopes capability admission scans to production sources and widens when the rule changes', () => {
+    const test = 'scripts/__tests__/capability-dispatch-only.test.mjs';
+    const entry = REPO_SCAN_TESTS.find(e => e.test === test);
+    for (const path of ['scripts/conveyor/new.mjs', 'scripts/operations/new.ts', 'skills-src/conveyor/new.js', 'scripts/merge-ai-prs.mjs']) {
+      const selected = selectScanTests({ changedFiles: [path] });
+      expect(selected.scoped).toContain(entry);
+      expect(selected.scopedFiles).toContain(path);
+    }
+    for (const path of ['scripts/lib/new.mjs', 'scripts/conveyor/__tests__/new.test.mjs', 'scripts/operations/new.spec.ts', 'docs/new.md']) {
+      expect(selectScanTests({ changedFiles: [path] }).scoped).not.toContain(entry);
+    }
+    expect(selectScanTests({ changedFiles: [test] }).widened).toContain(entry);
+  });
   it.each(['mjs', 'cjs', 'js', 'mts', 'cts', 'ts', 'sh', 'bash', 'py'])('ruling-label reference guard covers new production .%s scripts', ext => {
     const { full } = selectScanTests({ changedFiles: [`scripts/new-writer.${ext}`] });
     expect(full.map(e => e.test)).toContain('scripts/conveyor/__tests__/pr-label-mirror.test.mjs');

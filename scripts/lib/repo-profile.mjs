@@ -139,6 +139,25 @@ export function repoProfile(keyOrSlugOrPrefix, { home = homedir() } = {}) {
   });
 }
 
+/** Explicit targets honor registered profiles too; unknown repos have no capabilities. */
+export function repoHasCapability(repo, capability, { resolveProfile = repoProfile } = {}) {
+  if (resolveProfileKey(repo) === null || !['review', 'fix', 'ciHeal', 'build'].includes(capability)) return false;
+  try {
+    const profile = resolveProfile(repoKeyForSlug(repo) ?? repo);
+    if (profile == null) return false;
+    const value = profile.capabilities?.[capability];
+    return capability === 'build' ? value === 'direct' || value === 'couple' : value === true;
+  } catch { return false; }
+}
+
+/** Refuse new work unless the repo explicitly enables the capability; lifecycle work needs no admission. */
+export function assertCapability(repo, capability, options) {
+  return repoHasCapability(repo, capability, options) ? null : {
+    kind: 'unsupported-repo', repo, capability,
+    why: `${capability} capability unavailable — operator must enable it before dispatch`,
+  };
+}
+
 /**
  * The gate command a dispatched fix / ci-heal agent runs in its lane (`{{GATE_COMMAND}}`) for a constellation
  * repo. xpnhz4o — it is `node <WE root>/scripts/verify-lane.mjs run --repo=.`: WE's own diff-selected gate

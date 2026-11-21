@@ -7,7 +7,7 @@ import { findHostPaths, scanHostPaths } from './lib/host-path-scan.mjs';
 import { readGit } from './lib/proc-read.mjs';
 
 const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), '..');
-const baselinePath = 'scripts/settings/host-path-baseline.json';
+const baselinePath = 'scripts/lib/host-path-baseline.json';
 const decoder = new TextDecoder('utf-8', { fatal: true });
 const listTrackedFiles = root => readGit(['ls-files', '-z'], { cwd: root }).split('\0').filter(Boolean);
 

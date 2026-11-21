@@ -1,7 +1,7 @@
 /** Host overload policy: standard → platform preferences → tool → environment.
  * Invalid/unreadable policy refuses background work. All reads are bounded; sources go to stderr.
  */
-import { openSync, readSync, closeSync } from 'node:fs';
+import { openSync, readSync, closeSync, fstatSync } from 'node:fs';
 import { homedir, userInfo } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -13,10 +13,13 @@ export function boundedText(path, maxBytes = 256 * 1024) {
     const bytes = Buffer.alloc(maxBytes + 1);
     let count = 0;
     while (count < bytes.length) { const n = readSync(fd, bytes, count, bytes.length - count, null); if (!n) break; count += n; }
-    if (count > maxBytes) throw Error('bounded read exceeded');
+    if (count > maxBytes) throw Object.assign(Error('bounded read exceeded'), { bytes: Math.max(count, fstatSync(fd).size) });
     return bytes.subarray(0, count).toString('utf8');
   } finally { closeSync(fd); }
 }
+export const DEFAULT_PREFS_MAX_BYTES = 2 * 1024 * 1024;
+/** Ceiling for the configurable limit: the read allocates its limit up front, so it must stay small. */
+export const MAX_PREFS_MAX_BYTES = 16 * 1024 * 1024;
 export const DEFAULT_HOST_MAX_WAIT_MS = 15 * 60 * 1000;
 export const DEFAULT_MIN_MEMORY_HEADROOM_MB = 2048;
 export const DEFAULT_SNAPSHOT_MAX_FRESH_MS = 20000;
@@ -91,10 +94,20 @@ export function resolveHostOverloadSettings({ platform = {}, tool = {}, env = pr
   log(`policy-cascade · host-overload: ${Object.keys(leaves).map((k) => `${k}=${r.value[k]} (${r.sources[k]})`).join(', ')}`);
   return { settings, sources: r.sources };
 }
-export function loadHostOverloadSettings({ env = process.env, log, toolPath = join(dirname(fileURLToPath(import.meta.url)), '../settings/host-overload.json') } = {}) {
+export function loadHostOverloadSettings({ env = process.env, log = (s) => process.stderr.write(`${s}\n`), prefsMaxBytes = DEFAULT_PREFS_MAX_BYTES, toolPath = join(dirname(fileURLToPath(import.meta.url)), '../settings/host-overload.json') } = {}) {
+  const limit = env.WE_HOST_OVERLOAD_PREFS_MAX_BYTES === undefined ? prefsMaxBytes : Number(env.WE_HOST_OVERLOAD_PREFS_MAX_BYTES);
+  if (!Number.isSafeInteger(limit) || limit <= 0 || limit > MAX_PREFS_MAX_BYTES) throw Error('host-overload invalid WE_HOST_OVERLOAD_PREFS_MAX_BYTES');
+  log(`policy-cascade · host-overload: prefsMaxBytes=${limit} (${env.WE_HOST_OVERLOAD_PREFS_MAX_BYTES === undefined ? (prefsMaxBytes === DEFAULT_PREFS_MAX_BYTES ? 'standard' : 'setting') : 'env'})`);
+  const readPrefs = (path) => {
+    try { return boundedText(path, limit); }
+    catch (e) {
+      if (e.bytes > limit) throw Error(`platform-preferences too large (${e.bytes} > ${limit} bytes): ${path}; prune audit waivers or raise WE_HOST_OVERLOAD_PREFS_MAX_BYTES and retry`);
+      throw e;
+    }
+  };
   const canonical = {};
   const p = readPlatformPreferences({ env, readFile: (path) => {
-    const text = boundedText(path);
+    const text = readPrefs(path);
     // Preserve sibling leaves across the canonical reader's legacy/default files too.
     // Validate each file before merging, so later overrides cannot conceal invalid policy.
     Object.assign(canonical, flatten(JSON.parse(text), 'platform'));
@@ -103,7 +116,7 @@ export function loadHostOverloadSettings({ env = process.env, log, toolPath = jo
   if (p.errors.length) throw Error(`host-overload: ${p.errors.join(', ')}`);
   let legacy = {};
   // Existing host preferences use this location; the canonical cascade file wins when both are present.
-  try { legacy = flatten(JSON.parse(boundedText(env.WE_PLATFORM_PREFERENCES || join(homedir(), '.claude', 'platform-preferences.json'))), 'platform legacy'); }
+  try { legacy = flatten(JSON.parse(readPrefs(env.WE_PLATFORM_PREFERENCES || join(homedir(), '.claude', 'platform-preferences.json'))), 'platform legacy'); }
   catch (e) { if (e.code !== 'ENOENT') throw e; }
   let tool = {};
   try { tool = JSON.parse(boundedText(toolPath)); } catch (e) { if (e.code !== 'ENOENT') throw e; }

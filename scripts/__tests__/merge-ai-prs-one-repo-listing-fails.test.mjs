@@ -54,6 +54,8 @@ describe('merge-ai-prs CLI - one failing repo does not kill the pass', () => {
     writeFileSync(join(shimDir, 'gh'), FAKE_GH); chmodSync(join(shimDir, 'gh'), 0o755);
     repoDir = mkdtempSync(join(tmpdir(), 'merge-ai-prs-one-fail-repo-'));
     execFileSync('git', ['init', '-q'], { cwd: repoDir });
+    // Local follow-up capability admission needs the real constellation identity; no network access.
+    execFileSync('git', ['remote', 'add', 'origin', 'https://github.com/web-everything/web-everything.git'], { cwd: repoDir });
     mkdirSync(join(repoDir, 'backlog'), { recursive: true });
   });
   afterAll(() => {

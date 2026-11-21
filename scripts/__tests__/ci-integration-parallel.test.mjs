@@ -12,14 +12,17 @@ const job = (name) => {
 };
 
 describe('ci.yml: integration suite runs as its own parallel job', () => {
-  it('integration needs only `changes`, so it starts beside the shards', () => {
-    expect(job('integration')).toMatch(/^    needs: changes$/m);
-    expect(job('integration')).toContain('npm run test:integration:vitest');
+  it('integration-part needs only `changes`, so the parts start beside the shards', () => {
+    expect(job('integration-part')).toMatch(/^    needs: changes$/m);
+    expect(job('integration-part')).toContain('npm run test:integration:vitest');
   });
-  it('the integration job runs even on card-only PRs (never job-skipped) and fails closed', () => {
+  it('the integration parts run even on card-only PRs (never job-skipped) and the aggregate fails closed', () => {
+    expect(job('integration-part')).toMatch(/if: \$\{\{ !cancelled\(\) \}\}/);
     const j = job('integration');
-    expect(j).toMatch(/if: \$\{\{ !cancelled\(\) \}\}/);
+    expect(j).toMatch(/needs: \[changes, integration-part\]/);
+    expect(j).toMatch(/if: \$\{\{ always\(\) \}\}/);
     expect(j).toContain('needs.changes.result');
+    expect(j).toContain('needs.integration-part.result');
   });
   it('`test` no longer runs the suite itself but still goes red when integration is not success', () => {
     const t = job('test');

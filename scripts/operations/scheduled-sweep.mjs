@@ -25,6 +25,7 @@
  *
  *   Usage: node scripts/operations/scheduled-sweep.mjs run <pr-movement|coroner|opus> [--dry-run] [--json] [--ignore-quiet]
  */
+import { pinDeveloperDir } from '../lib/lane-git-hardening.mjs';
 import { existsSync, mkdirSync, readFileSync, writeFileSync, copyFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
@@ -129,7 +130,8 @@ export function renderSweepReport({ job, at, attention = [], sections = [] }) {
 // ── launchd templates + install plan (pure) ───────────────────────────────────────────────────────────────────
 
 const esc = (s) => String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;');
-export function buildLaunchdPlist({ pass, repoRoot, nodePath, home }) {
+export function buildLaunchdPlist({ pass, repoRoot, nodePath, home, developerDir, exists = existsSync }) {
+  const env = pinDeveloperDir({ DEVELOPER_DIR: developerDir }, { exists });
   const label = `com.we.conveyor-pass-daemon.${pass}`;
   const log = `${home}/workspace/.operations/logs/${pass}.log`;
   return `<?xml version="1.0" encoding="UTF-8"?>
@@ -151,7 +153,7 @@ export function buildLaunchdPlist({ pass, repoRoot, nodePath, home }) {
 	<key>StandardErrorPath</key><string>${esc(log)}</string>
 	<key>EnvironmentVariables</key>
 	<dict>
-		<key>WE_DAEMON_RESTART_MIN_INTERVAL_MS</key><string>120000</string>
+${env.DEVELOPER_DIR ? `\t\t<key>DEVELOPER_DIR</key><string>${esc(env.DEVELOPER_DIR)}</string>\n` : ''}		<key>WE_DAEMON_RESTART_MIN_INTERVAL_MS</key><string>120000</string>
 		<key>PATH</key><string>${esc(dirname(nodePath))}:${esc(home)}/.claude/github-app-token/gh-shim:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
 	</dict>
 </dict>
@@ -165,7 +167,7 @@ export function installPlan({ repoRoot, nodePath, home, apply = false, pass: sel
   if (selected !== undefined && !passes.includes(selected)) throw Error('unknown installable pass');
   const files = passes.filter(pass => selected === undefined || pass === selected).map(pass => ({
     pass, path: `${home}/Library/LaunchAgents/com.we.conveyor-pass-daemon.${pass}.plist`,
-    xml: buildLaunchdPlist({ pass, repoRoot, nodePath, home }),
+    xml: buildLaunchdPlist({ pass, repoRoot, nodePath, home, developerDir: process.env.DEVELOPER_DIR }),
   }));
   return {
     writes: apply ? files : [],

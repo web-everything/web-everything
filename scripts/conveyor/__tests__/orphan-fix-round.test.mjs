@@ -450,6 +450,21 @@ describe('runOrphanFixRoundPass — IO shell', () => {
     expect(refused.postComment).not.toHaveBeenCalled();
   });
 
+  it('capability-off refuses redispatch while rearm and escalation still run', async () => {
+    const resolveProfile = () => ({ capabilities: { fix: false } });
+    const denied = seams([VERDICT, BEGIN, RESTACK, END], { resolveProfile });
+    const out = await runOrphanFixRoundPass(denied);
+    expect(out.rows[0].result).toContain('capability unavailable');
+    expect(denied.redispatch).not.toHaveBeenCalled();
+    const rearmed = seams([VERDICT, EVIDENCE, BEGIN, RESTACK, END], { resolveProfile });
+    await runOrphanFixRoundPass(rearmed);
+    expect(rearmed.rearm).toHaveBeenCalledOnce();
+    const mark = t => c(t, `${ORPHAN_GUARD_MARKER} — re-dispatched a fixer\n\n…`);
+    const escalated = seams([VERDICT, mark('2026-10-10T12:00:00Z'), mark('2026-10-10T14:00:00Z'), BEGIN, END], { resolveProfile });
+    await runOrphanFixRoundPass(escalated);
+    expect(escalated.escalate).toHaveBeenCalledOnce();
+  });
+
   it('WE_ORPHAN_FIX_GUARD=0 reports without acting; an owned PR is never even read', async () => {
     const off = seams([VERDICT, EVIDENCE, BEGIN, END], { env: { WE_ORPHAN_FIX_GUARD: '0' } });
     const r = await runOrphanFixRoundPass(off);

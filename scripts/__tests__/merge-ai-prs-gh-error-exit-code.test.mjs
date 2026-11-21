@@ -9,6 +9,7 @@
  *   fake `gh` on PATH so no network/real `gh` is touched, following the `review-set-label.test.mjs` shim pattern.
  */
 import { daemonAppEnv } from './fixtures/daemon-app-env.mjs';
+import { openPrPageFixture } from './fixtures/open-pr-page-fixture.mjs';
 import { describe, it, expect, beforeAll, afterAll } from 'vitest';
 import { execFileSync, spawnSync } from 'node:child_process';
 import { mkdtempSync, mkdirSync, writeFileSync, chmodSync, rmSync } from 'node:fs';
@@ -17,16 +18,17 @@ import { join, resolve, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { randomUUID } from 'node:crypto';
 
-// A minimal `gh` stub: `repo view --json defaultBranchRef` → "main"; `pr list` → `[]`, unless
+// A minimal `gh` stub: branch reads → "main"; paged/legacy PR lists → empty, unless
 // GH_FAIL_LIST=1, which fails it the way a rate-limited/unauthenticated `gh` does (non-zero exit + stderr).
 // Anything else (there is nothing else on this bare, unlabelled, no-candidate sweep) → a harmless `[]`.
 const FAKE_GH = `#!/usr/bin/env node
 const a = process.argv.slice(2);
+const openPrPageFixture = ${openPrPageFixture};
 if (a[0] === 'repo' && a[1] === 'view') { process.stdout.write('main'); process.exit(0); }
-if (a[0] === 'pr' && a[1] === 'list') {
+if ((a[0] === 'pr' && a[1] === 'list') || (a[0] === 'api' && a[1] === 'graphql')) {
   if (process.env.GH_FAIL_LIST === '1') { process.stderr.write('GraphQL: API rate limit already exceeded for installation ID 1.\\n'); process.exit(1); }
   if (process.env.GH_FAIL_LIST === 'auth') { process.stderr.write('HTTP 401: Bad credentials (https://api.github.com/graphql)\\n'); process.exit(1); }
-  process.stdout.write('[]');
+  process.stdout.write(a[0] === 'api' ? JSON.stringify(openPrPageFixture([], a.find(v => v.startsWith('query=')) || '')) : '[]');
   process.exit(0);
 }
 process.stdout.write('[]');
@@ -42,8 +44,7 @@ describe('merge-ai-prs CLI — #3383 gh-error exit code split from the dup-id tr
     shimDir = mkdtempSync(join(tmpdir(), 'merge-ai-prs-gh-shim-'));
     writeFileSync(join(shimDir, 'gh'), FAKE_GH);
     chmodSync(join(shimDir, 'gh'), 0o755);
-    // A throwaway git repo (no real remote reached — localRepoSlug() fails soft to null on a bad/absent
-    // origin) so the CLI's own `git remote get-url origin` probe never touches the real webeverything checkout.
+    // A throwaway repo; supported tripwire cases declare an origin below, without contacting it.
     repoDir = mkdtempSync(join(tmpdir(), 'merge-ai-prs-gh-repo-'));
     execFileSync('git', ['init', '-q'], { cwd: repoDir });
     mkdirSync(join(repoDir, 'backlog'), { recursive: true });
@@ -57,13 +58,20 @@ describe('merge-ai-prs CLI — #3383 gh-error exit code split from the dup-id tr
   // `--no-drain-lease` + `--no-red-main-freeze` bypass the two unrelated gates (#2449 whole-process lease,
   // #2681 red-main stop-the-line) that would otherwise touch this machine's real `~/.claude/drain-locks` state
   // ahead of the listing/tripwire code under test.
-  const runCli = (extraEnv = {}) => spawnSync('node', [script, '--this-repo', '--no-drain-lease', '--no-red-main-freeze', '--json'], {
+  const runCli = (extraEnv = {}, extraArgs = [], refused = false) => {
+    // Preserve the legacy unnamed-repo error fixtures; named repos use the shared paged reader.
+    const named = !extraEnv.GH_FAIL_LIST && !refused;
+    if (named) execFileSync('git', ['remote', 'add', 'origin', 'https://github.com/web-everything/web-everything.git'], { cwd: repoDir });
+    try { return spawnSync('node', [script, '--this-repo', '--no-drain-lease', '--no-red-main-freeze', '--json', ...extraArgs], {
     cwd: repoDir,
     encoding: 'utf8',
     env: { ...process.env, ...daemonAppEnv(repoDir), PATH: `${shimDir}:${process.env.PATH}`,
       WE_GH_THROTTLE_LOCK_ROOT: join(repoDir, `throttle-${randomUUID()}`),
       WE_GH_THROTTLE_GH_BIN: join(shimDir, 'gh'), WE_GH_THROTTLE_RETRY_MAX_ATTEMPTS: '1', ...extraEnv },
-  });
+    }); } finally {
+      if (named) execFileSync('git', ['remote', 'remove', 'origin'], { cwd: repoDir });
+    }
+  };
 
   it('a `gh pr list` failure exits 4 with reason:gh-error, distinct from the dup-id tripwire\'s exit 3', () => {
     const r = runCli({ GH_FAIL_LIST: '1' });
@@ -112,4 +120,21 @@ describe('merge-ai-prs CLI — #3383 gh-error exit code split from the dup-id tr
       rmSync(join(repoDir, 'backlog', '100-b.md'), { force: true });
     }
   });
+
+  it.each([false, true])('refused checkout reports an unknown tripwire and exits 2 even with stale duplicate files (watch=%s)', watch => {
+    writeFileSync(join(repoDir, 'backlog', '100-a.md'), '');
+    writeFileSync(join(repoDir, 'backlog', '100-b.md'), '');
+    try {
+      const r = runCli({}, watch ? ['--watch', '--max-idle=1'] : [], true);
+      expect(r.status).toBe(2);
+      const payload = JSON.parse(r.stdout.trim());
+      expect(payload).toMatchObject({ ok: false, duplicateIdCheck: { status: 'unknown', reason: 'checkout-sync-refused' } });
+      expect(payload.duplicateIdsOnMain).toBeUndefined();
+      if (watch) expect(payload.passes).toBe(1);
+    } finally {
+      rmSync(join(repoDir, 'backlog', '100-a.md'), { force: true });
+      rmSync(join(repoDir, 'backlog', '100-b.md'), { force: true });
+    }
+  });
+
 });

@@ -133,6 +133,7 @@
  * `markdown-it`/ephemeral-clone-CLI-test regression that discipline exists to prevent).
  */
 
+import { resolveExternalJurorSettings } from './review-seat-settings.mjs';
 import { agyRunEvidence, readAgyHold, saveAgyHold, agyEvidenceError } from './antigravity-run-evidence.mjs';
 import { hasAntigravityEffortSuffix } from './antigravity-model-effort.mjs';
 import { spawn as nodeSpawn } from 'node:child_process';
@@ -626,6 +627,8 @@ export async function antigravityJudgeSpawn({
   env = process.env,
   cli = ANTIGRAVITY_CLI,
   timeoutMs = JUDGE_TIMEOUT_MS,
+  firstOutputMs,
+  cooldownMs,
   spawnFn = nodeSpawn,
   mkTempDir = (prefix) => mkdtempSync(prefix),
   writeFile = writeFileSync,
@@ -644,6 +647,14 @@ export async function antigravityJudgeSpawn({
   toolPolicy = 'none',
   role = 'advisory-review',
 } = {}) {
+  if (firstOutputMs === undefined || cooldownMs === undefined) {
+    const settings = resolveExternalJurorSettings({ env }).value;
+    if (firstOutputMs === undefined) firstOutputMs = settings.firstOutputMs;
+    if (cooldownMs === undefined) cooldownMs = settings.cooldownMs;
+  }
+  if (!Number.isSafeInteger(firstOutputMs) || firstOutputMs < 0 || !Number.isSafeInteger(cooldownMs) || cooldownMs <= 0) {
+    throw new TypeError('antigravity-judge-spawn: invalid firstOutputMs/cooldownMs');
+  }
   if (toolPolicy !== 'none' && toolPolicy !== 'read-cwd') {
     throw new TypeError(`antigravity-judge-spawn: \`toolPolicy\` must be none|read-cwd, got ${JSON.stringify(toolPolicy)}`);
   }
@@ -694,11 +705,13 @@ export async function antigravityJudgeSpawn({
       let err = '';
       let timer = null;
       let grace = null;
+      let firstTimer = null;
       let killed = false;
       let settled = false;
       const settle = (r) => {
         if (settled) return;
         settled = true;
+        if (firstTimer) clearTimeout(firstTimer);
         if (timer) clearTimeout(timer);
         if (grace) clearTimeout(grace);
         resolve(r);
@@ -716,9 +729,24 @@ export async function antigravityJudgeSpawn({
         }, timeoutMs);
         if (typeof timer.unref === 'function') timer.unref();
       }
-      child.stdout?.on('data', (d) => { out += d; });
-      child.stderr?.on('data', (d) => { err += d; });
+      if (firstOutputMs > 0) {
+        const arm = remaining => {
+          // Node timers overflow above 2^31-1; safe-integer settings still mean the requested window.
+          const chunk = Math.min(remaining, 2 ** 31 - 1);
+          firstTimer = setTimeout(() => {
+            if (remaining > chunk) { arm(remaining - chunk); return; }
+            // Settle before kill: fake and real children may report close immediately.
+            settle({ stdout: out, stderr: err, code: null, unresponsive: true });
+            try { child.kill('SIGKILL'); } catch { /* already gone */ }
+          }, chunk);
+        };
+        arm(firstOutputMs);
+      }
+      const observe = d => { if (d.length > 0 && firstTimer) { clearTimeout(firstTimer); firstTimer = null; } };
+      child.stdout?.on('data', (d) => { observe(d); out += d; });
+      child.stderr?.on('data', (d) => { observe(d); err += d; });
       child.on('error', (e) => {
+        if (firstTimer) clearTimeout(firstTimer);
         if (timer) clearTimeout(timer);
         if (grace) clearTimeout(grace);
         reject(new Error(`antigravity-judge-spawn: \`${cli}\` failed to run: ${e.message}`));
@@ -755,7 +783,9 @@ export async function antigravityJudgeSpawn({
   // unparseable run is recorded too — exactly the run most worth capturing. Best-effort, never throws
   // (`recordAntigravityRunScorecard`'s own header) — a recording failure can never turn an otherwise-completed
   // judge call into a failed one.
-  const evidence = { ...agyRunEvidence({ ...result, requestedModel: model }), effort: effectiveEffort };
+  const evidence = { ...agyRunEvidence({ ...result, requestedModel: model }), effort: effectiveEffort,
+    ...(result.unresponsive ? { quotaState: 'provider-unresponsive', fallbackDecision: 'skip-provider-unresponsive',
+      firstOutputMs, cooldownMs, quotaResetsAt: new Date(Math.min(8640000000000000, Date.now() + cooldownMs)).toISOString() } : {}) };
   let holdError;
   try { saveHold(evidence); } catch (error) { holdError = error; }
   recordScorecard({

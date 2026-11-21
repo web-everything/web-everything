@@ -7,7 +7,7 @@
  * every run first retires registrations proved merged, in main, or superseded (prototype-retire.mjs).
  * Real deps bind only in defaultDeps.
  */
-import { readStore, storePath } from './ruled-weakened-store.mjs';
+import { readStore, storePath, withdrawnRevocations } from './ruled-weakened-store.mjs';
 import { requestForceAdopt } from '../lib/daemon-force-adopt.mjs';
 import { execFileSync } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
@@ -23,7 +23,7 @@ import { execFileSyncThrottled } from '../lib/gh-throttle.mjs';
 import { readOverlayState, cloneKey } from '../lib/daemon-overlays.mjs';
 import { clearPendingAdoption, recordPendingAdoption, OVERLAY_ADOPTION_MAX_PENDING, OVERLAY_ADOPTION_TTL_MS } from '../lib/overlay-adoption.mjs';
 import { isGraphSourceFile, isVitestTestFile } from '../lib/related-test-selection.mjs';
-import { safeRef, safeRegistrationRef, validSha, jsonLines, testCheckEvidence, testWorkflowBound, TEST_CHECK_APP_ID, readyEvidence, readyRecordSpeaksFor, mergeRuledWeakened, canonicalAuditEvidence, changedPaths, comparePaths, nextMergeRef, refusal, resolveDaemonKey } from './prototype-load.mjs';
+import { safeRef, safeRegistrationRef, validSha, jsonLines, testCheckEvidence, testWorkflowBound, TEST_CHECK_APP_ID, readyEvidence, waiverForHead, readyRecordSpeaksFor, mergeRuledWeakened, canonicalAuditEvidence, changedPaths, comparePaths, nextMergeRef, refusal, resolveDaemonKey } from './prototype-load.mjs';
 import { DISPATCH_PATH_DEFAULTS, matchDispatchPaths, runRealDispatchSmoke } from '../lib/daemon-load-overlay.mjs';
 import { netDiffFingerprint, carriesAcross } from '../lib/net-diff-fingerprint.mjs';
 import { mergeRefBase, planRetirements, planFetchFailed, resolveOriginRepository } from './prototype-retire.mjs';
@@ -224,12 +224,14 @@ export function defaultDeps() {
 }
 /** Preserve tool/platform precedence and matching; ops contributes only validated entries. */
 export function loadRuledWeakened({ platform, tool, fs, env, warn = console.warn }) {
-  const merged = mergeRuledWeakened(platform, tool, warn);
+  const isRevoked = withdrawnRevocations({ fs, env, warn });
+  const merged = mergeRuledWeakened(platform, tool, warn).filter(e => !isRevoked(e));
   const store = readStore({ path: storePath(env), fs, warn });
   if (store.error) warn(`WARNING: ruled-weakened store unreadable: ${store.error}; no ops waivers loaded. Restore store readability and retry.`);
   const key = e => JSON.stringify([e.ref, e.sha.toLowerCase(), e.ruling]);
   const seen = new Set(merged.map(key));
   for (const entry of store.entries) {
+    if (isRevoked(entry)) continue;
     if (!seen.has(key(entry))) { seen.add(key(entry)); merged.push({ ...entry, layer: 'ops' }); }
   }
   return merged;
@@ -513,16 +515,19 @@ export function createPrototypeLoader({ exec, fs, now, sleep, env, settings, com
         fetchMain();
         return ancestor(base, 'origin/main');
       } catch { return false; } };
-      const liveFp = liveFingerprint(auditRecords);
+      const liveFp = liveFingerprint([...auditRecords, ...config.ruledWeakened]);
+      const waiver = !out.gate?.ruledWeakened ? waiverForHead(config.ruledWeakened, input, liveFp) : null;
+      const auditGate = out.gate;
       out.canonicalAudit = { mode: 'refuse', ...canonicalAuditEvidence(auditRecords, input.sha, covers, liveFp,
-        { ruledWeakened: out.gate }) };
+        { ruledWeakened: auditGate }) };
       if (!out.canonicalAudit.ok) return stop('no-canonical-audit', {
-        fallback: `Run node scripts/operations/run.mjs codex-audit --base=origin/main --head=${input.sha}, then retry prototype-load. WEAKENED requires a matching ruledWeakened entry and fix-ready disclosure.` });
-      if (out.gate?.ruledWeakened) console.warn(`WARNING: RULED-WEAKENED EXCEPTION ${out.gate.ruledWeakened.ruling}: loading ${input.branch}@${input.sha} despite audit WEAKENED (source layer: ${out.gate.ruledWeakened.layer || 'tool'}). Disclosed findings: ${out.gate.ruledWeakened.findings.join(' | ')}`);
+        fallback: waiver ? `waiver exists but no fix-ready record. Run scripts/operations/fix-ready-record.mjs with auditRuling and auditDisclosed matching the waiver, then retry prototype-load.` : `Run node scripts/operations/run.mjs codex-audit --base=origin/main --head=${input.sha}, then retry prototype-load. WEAKENED requires a matching ruledWeakened entry and fix-ready disclosure.` });
+      if (auditGate?.ruledWeakened) console.warn(`WARNING: RULED-WEAKENED EXCEPTION ${auditGate.ruledWeakened.ruling}: loading ${input.branch}@${input.sha} despite audit WEAKENED (source layer: ${auditGate.ruledWeakened.layer || 'tool'}). Disclosed findings: ${auditGate.ruledWeakened.findings.join(' | ')}`);
       stage = 'no-ready';
       // Only an exact-sha successful `test` check-run can produce fresh readiness.
       // Injected runners must return {sha, name, status, conclusion}; missing integration fails closed.
       let urgentCiFailed = false;
+      let prConflict, conflict, noTestCheckAtAll = false;
       let ciRefusal = null;
       const noCi = (detail, fallback) => { ciRefusal = { detail, fallback }; return null; };
       const readTestCheck = testCheck || (({ sha }) => {
@@ -542,6 +547,23 @@ export function createPrototypeLoader({ exec, fs, now, sleep, env, settings, com
           noCi('ci-repository-unreadable', 'Repair the origin repository identity and retry.');
           throw new Error('unreadable CI repository');
         }
+        if (input.urgent) {
+          try {
+            const head = encodeURIComponent(`${origin.repo.split('/')[0]}:${input.branch}`);
+            const listed = origin.gh(['api', `repos/${origin.repo}/pulls?head=${head}&state=open&per_page=2`]);
+            const prs = listed.code === 0 ? JSON.parse(listed.stdout) : null;
+            if (Array.isArray(prs) && prs.length === 1 && Number.isSafeInteger(prs[0]?.number)
+              && prs[0].head?.sha === sha && prs[0].head?.ref === input.branch
+              && prs[0].head?.repo?.full_name === origin.repo) {
+              const result = origin.gh(['api', `repos/${origin.repo}/pulls/${prs[0].number}`]);
+              const pr = result.code === 0 ? JSON.parse(result.stdout) : null;
+              if (pr?.number === prs[0].number && pr.state === 'open' && pr.head?.sha === sha
+                && pr.head?.ref === input.branch && pr.head?.repo?.full_name === origin.repo
+                && (pr.mergeable_state === 'dirty' || pr.mergeable === false))
+                prConflict = { pr: pr.number, mergeableState: pr.mergeable_state ?? null };
+            }
+          } catch { /* Unknown mergeability retains the existing urgent rules. */ }
+        }
         noCi('ci-checks-unreadable', 'Repair the check-runs reader and retry with complete evidence (at most 100 checks).');
         const result = origin.gh(['api', `repos/${origin.repo}/commits/${sha}/check-runs?per_page=100`]);
         if (result.code !== 0) return null;
@@ -560,7 +582,10 @@ export function createPrototypeLoader({ exec, fs, now, sleep, env, settings, com
             || (r.status === 'completed' ? !['success', 'failure', 'neutral', 'cancelled', 'skipped', 'timed_out', 'action_required', 'startup_failure', 'stale'].includes(r.conclusion) : r.conclusion !== null)))
           throw new Error('malformed, incomplete or oversized CI checks');
         const evidence = testCheckEvidence(data, sha);
-        if (!evidence) return noCi('ci-test-check-missing', 'Complete the GitHub Actions test check on this SHA and retry.');
+        // Only "no check named test at all" can be the no-CI-run signature of a conflicting head; a test check
+        // from another app, or on another sha, is mis-bound evidence and must keep refusing.
+        if (!evidence) { noTestCheckAtAll = !data.check_runs.some(r => r.name === 'test');
+          return noCi('ci-test-check-missing', 'Complete the GitHub Actions test check on this SHA and retry.'); }
         // Bind the check to the expected workflow file via its suite -> workflow run; any failed read refuses.
         noCi('ci-workflows-unreadable', 'Repair the workflow-runs reader and retry with complete evidence (at most 100 runs).');
         const runs = origin.gh(['api', `repos/${origin.repo}/actions/runs?head_sha=${sha}&per_page=100`]);
@@ -592,7 +617,10 @@ export function createPrototypeLoader({ exec, fs, now, sleep, env, settings, com
         return stop('no-ready', { detail: 'ci-evidence-unreadable', fallback: 'Repair the CI evidence reader and retry with complete evidence.' });
       if (checkRun?.sha !== input.sha || checkRun.name !== 'test' || checkRun.appId !== TEST_CHECK_APP_ID || checkRun.status !== 'completed' || checkRun.conclusion !== 'success') {
         if (!input.urgent) return stop('no-ready', { detail: 'no-passing-test-check', fallback: 'Complete the test check-run on this SHA and retry; repair the reader if evidence is unavailable, incomplete or exceeds 100 checks. --tests-run/--audit are labels only.', ...ciRefusal });
-        if (ciRefusal && ciRefusal.detail !== 'ci-api-unavailable') return stop('no-ready', ciRefusal);
+        // A confirmed merge conflict never gets a CI run, so a missing test check is expected there; every other
+        // CI refusal (unreadable, unbound, failed) still blocks the urgent path.
+        if (ciRefusal && ciRefusal.detail !== 'ci-api-unavailable'
+          && !(prConflict && noTestCheckAtAll && ciRefusal.detail === 'ci-test-check-missing')) return stop('no-ready', ciRefusal);
         let ledger, shards, expectedSteps, origin;
         try {
           origin = normalizeUrgentRepo(requireGit('remote', 'get-url', 'origin'));
@@ -604,6 +632,10 @@ export function createPrototypeLoader({ exec, fs, now, sleep, env, settings, com
         const urgent = urgentMarker({ ...input, ledger, shards, expectedSteps, repo: origin, readKey: readUrgentKey, now: now() });
         if (!urgent.ok) return stop('no-ready', urgent);
         checkRun = urgent.evidence;
+        if (prConflict) {
+          conflict = prConflict;
+          checkRun = { ...checkRun, conflict: true };
+        }
       }
       const canonical = out.canonicalAudit.record;
       // R503: with only same-sha evidence no live fingerprint is computed (liveFp is null), yet the record we append
@@ -616,7 +648,7 @@ export function createPrototypeLoader({ exec, fs, now, sleep, env, settings, com
       const producedFp = liveFp || (stored.length === 1 ? stored[0] : null);
       const producedReady = { at: new Date(now()).toISOString(), ref: input.branch, sha: input.sha, tests: 'green',
         audit: canonical.verdict, testCheck: checkRun, ...(producedFp ? { fingerprint: producedFp } : {}),
-        ...(out.gate?.ruledWeakened ? { auditRuling: out.gate.ruledWeakened.ruling, auditDisclosed: canonical.findings } : {}) };
+        ...(auditGate?.ruledWeakened ? { auditRuling: auditGate.ruledWeakened.ruling, auditDisclosed: canonical.findings } : {}) };
       out.gate ||= { source: 'canonical-check-run', record: producedReady };
       stage = 'no-ready';
       readinessStep = 'branch-tip-unreadable';
@@ -658,7 +690,10 @@ export function createPrototypeLoader({ exec, fs, now, sleep, env, settings, com
       const contains = ancestor('origin/main', input.sha);
       out.mainCheck = { contains, own };
       let comparison = input.sha;
-      if (!contains) {
+      // `conflict` is set only after exact-head GitHub evidence and a signed full-suite receipt.
+      // Keep that tested head intact: merging main would either refuse its known conflict or
+      // publish a different, unreceipted tree. The target overlay checks below still must pass.
+      if (!contains && !conflict) {
         const merge = git('merge-tree', '--write-tree', 'origin/main', input.sha);
         if (merge.code === 1) {
           const files = merge.stdout.split(/\r?\n/).flatMap((line) => /^\d{6} [a-f0-9]+ [123]\t(.+)$/.exec(line)?.slice(1) || []);
@@ -672,7 +707,9 @@ export function createPrototypeLoader({ exec, fs, now, sleep, env, settings, com
         out.wouldMerge = { ref, tree };
         // Prove the resulting tree before publishing it; a refused main guard never pushes.
       }
-      const effectivePaths = changedPaths(requireGit('diff', '--name-status', '-z', 'origin/main', comparison));
+      // An unmerged conflict head lacks main-only changes; those are not candidate reversions.
+      // Use its merge-base delta for overlap checks, while the overlay guard proves composition.
+      const effectivePaths = conflict ? own : changedPaths(requireGit('diff', '--name-status', '-z', 'origin/main', comparison));
       const difference = comparePaths(own, effectivePaths);
       out.mainCheck = { ...out.mainCheck, effectivePaths, ...difference };
       if (difference.outside.length || difference.missing.length) return stop('reverts-main', { offendingPaths: difference.outside, missingPaths: difference.missing });
@@ -818,6 +855,7 @@ export function createPrototypeLoader({ exec, fs, now, sleep, env, settings, com
       };
       if (input.urgent) {
         urgentIntent = { trackingId: randomUUID(), at: new Date(now()).toISOString(), type: 'prototype-load.urgent', ref: input.branch, sha: input.sha, clone: out.clone, repo: normalizeUrgentRepo(requireGit('remote', 'get-url', 'origin')), registration: { clone: out.clone, ref: out.effectiveRef, sha: out.effectiveSha }, reason: input.reason, marker: checkRun.marker ?? null };
+        if (conflict) urgentIntent.conflict = conflict;
         // Persist intent before any registration mutation; failure refuses admission.
         appendUrgent(urgentIntent);
       }

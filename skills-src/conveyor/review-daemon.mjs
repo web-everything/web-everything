@@ -82,6 +82,7 @@ import { fileURLToPath } from 'node:url';
 import { execFileSync } from 'node:child_process';
 import { hostname } from 'node:os';
 import { runReconcilePass, defaultReadPrs, defaultReadAgents, isConflictingPr } from '../../scripts/conveyor/reconcile-pass.mjs';
+import { PrListUnreadableError } from '../../scripts/lib/pr-list-paged.mjs';
 import { promoteDraftsThenReplan, promoteDraftsGuarded, rearmStaleAcceptanceGuarded, rearmStaleAcceptsThenReplan } from '../../scripts/conveyor/review-tick-promote.mjs'; // card xemxk3h
 import { notifyReferralHold } from '../../scripts/conveyor/review-referral-hold.mjs';
 // card x29vm8a — a scope-bloated PR (stale base) is refreshed onto main through the SAME mechanical path the ci-red
@@ -129,7 +130,7 @@ import { planClaudeAuthDispatchGate } from '../../scripts/conveyor/claude-auth-h
 import { runSessionReaperPass, makeReapedLedger, makePidDeadResolver, REPO_ROOT as SESSION_REAPER_REPO_ROOT, DEFAULT_IDLE_REAP_THRESHOLD_MS } from '../../scripts/conveyor/session-reaper.mjs';
 import { mintSessionSlug } from '../../scripts/conveyor/session-slug.mjs';
 import { freeLaneNumbers } from '../../scripts/conveyor/reconcile-fix-dispatch.mjs';
-import { repoProfile } from '../../scripts/lib/repo-profile.mjs';
+import { assertCapability, repoProfile } from '../../scripts/lib/repo-profile.mjs';
 import { CONSTELLATION_REPOS, repoKeyForSlug } from '../../scripts/lib/constellation-repos.mjs';
 import { forEachRepo } from '../../scripts/lib/for-each-repo.mjs';
 import { withGithubAppAuth, FLEET_APP_AUTH_OPTS } from '../../scripts/lib/github-app-auth-env.mjs';
@@ -389,6 +390,7 @@ export function runReviewTick({
   reconcile = runReconcilePass,
   dispatch = dispatchReviewByMode,
   redTeamOnSkip = null,
+  redTeamPartialInventory = null,
   reconcileRedTeamQueue = null,
   tagRound = tagReviewRound,
   tagStatus = tagReviewStatus,
@@ -452,6 +454,7 @@ export function runReviewTick({
   log = () => {},
   // Clock for the operator-hold snapshot's `observedAt` (injectable so tests stay deterministic).
   now = Date.now,
+  resolveProfile = repoProfile,
   dispatchState = reviewDispatchState,
   isPidAlive = pidAlive,
   diagnoseJob = diagnoseEndedJob,
@@ -461,9 +464,7 @@ export function runReviewTick({
   // over the whole repo, not scoped to whatever this tick's discovery found owed, so a `reconcile` failure
   // below must never suppress it. Isolated in its own try/catch, same "one bad entry never aborts the rest"
   // discipline as every other step in this tick — a `gh` hiccup here must not cost a review dispatch.
-  // Maintenance also runs on paused ticks and before any reconcile/read failure can return early.
-  try { reconcileRedTeamQueue?.({ repo }); }
-  catch (e) { log(`review-daemon: red-team queue reconciliation failed: ${String(e?.message ?? e)}`); }
+  // Maintenance also runs on paused ticks; discovery must first establish whether membership may change.
   const sharedReads = typeof readPrs === 'function' && typeof readAgents === 'function';
   let rawPrs = null;
   let rawPrsError = null;
@@ -471,6 +472,10 @@ export function runReviewTick({
   if (sharedReads) {
     try { rawPrs = readPrs({ repo }); } catch (e) { rawPrsError = e; rawPrsFailed = true; }
   }
+  // Never mutate queue membership using an incomplete inventory.
+  const inventoryComplete = !rawPrsFailed && (!sharedReads || Array.isArray(rawPrs));
+  try { reconcileRedTeamQueue?.({ repo, ...(!inventoryComplete ? { inventoryComplete: false } : {}) }); }
+  catch (e) { log(`review-daemon: red-team queue reconciliation failed: ${String(e?.message ?? e)}`); }
   let holdReconcileResults = [];
   let holdReconcileError = null;
   try {
@@ -514,10 +519,21 @@ export function runReviewTick({
     // never "0 owed". Surface it on the reconcile-failed channel (tick line flags it) so the tick retries visibly.
     if (plan?.deferred === true) throw new Error(`open-PR read deferred — owed unknown this tick: ${String(plan.message ?? plan.reason ?? 'deferred').split('\n')[0]}`);
   } catch (e) {
+    let recovery;
+    const partialInventory = rawPrsError?.code === 'pr-list-truncated'
+      || (rawPrsError instanceof PrListUnreadableError && rawPrsError.stage === 'page' && rawPrsError.page === 'inventory');
+    if (!paused && rawPrsFailed && partialInventory
+      && typeof redTeamPartialInventory === 'function') {
+      try {
+        recovery = redTeamPartialInventory({ repo, reconcile, readAgents, defaultBranch,
+          hostAdmission, recoveryAcquirableLanes, liveReviewBudget });
+      } catch (error) { log(`review-daemon: ${repo} partial-inventory recovery failed: ${String(error?.message ?? error)}`); }
+    }
     return {
       reviewsOwed: 0, dispatched: [], failed: [], refusals: 0, deferredForLanes: 0,
       reconcileError: describeReconcileError(e), staleStatusSwept: [], staleConflictStatusCleared: [],
       holdReconcile: holdReconcileResults, holdReconcileError,
+      ...(recovery !== undefined ? { redTeamOnSkip: recovery } : {}),
     };
   }
   // Refresh stale status labels (including legacy status:awaiting-base) before promotion/dispatch
@@ -569,7 +585,11 @@ export function runReviewTick({
   let replanError = null;
   if (typeof promoteDrafts === 'function') {
     const out = promoteDraftsThenReplan({
-      plan, rawPrs, repo, promote: promoteDrafts,
+      plan, rawPrs, repo, promote: options => {
+        const refusal = assertCapability(repo, 'review', { resolveProfile });
+        if (refusal) return { rows: options.prNumbers.map(pr => ({ repo, pr, action: 'skip', why: refusal.why })) };
+        return promoteDrafts(options);
+      },
       replan: (prs) => (sharedReads && prs
         ? reconcile({ repo, defaultBranch, readPrs: () => prs, readAgents: () => rawAgents })
         : reconcile({ repo, defaultBranch })),
@@ -733,6 +753,8 @@ export function runReviewTick({
   if (typeof refreshScopeBloat === 'function') {
     for (const row of plan.refusals ?? []) {
       if (row.kind !== 'scope-bloat' || !row.scopeBloat?.stale || row.scopeBloat.refresh || !row.headRefName || !row.headRefOid) continue;
+      const refusal = assertCapability(repo, 'review', { resolveProfile });
+      if (refusal) { failed.push({ prNumber: row.prNumber, error: refusal.why }); continue; }
       // A refresh that THROWS is normalized into a failed result and goes down the same path as one that returns: it is
       // remembered in this process AND gets the durable per-head marker, because the fix daemon (another process) reads
       // only the thread and would otherwise wait forever on a refresh it cannot see was tried.
@@ -780,8 +802,9 @@ export function runReviewTick({
         row.kind === 'nothing-owed' && row.phase === 'queued'
           ? { ...row, kind: 'already-reviewed-head', headSha: row.headRefOid }
           : row);
+      // Safety reconciliation must run even when this repo cannot start new reviews.
       redTeamOnSkipResult = redTeamOnSkip({ repo, plan: { ...plan, refusals: recoveryRefusals }, rawPrs,
-        capacity, paused });
+        capacity, paused, resolveProfile });
     } catch { log(`review-daemon: ${repo} red-team recovery failed`); }
     finally {
       // Recovery reports the same start through multiple counters; count it only once, even on error.
@@ -805,6 +828,12 @@ export function runReviewTick({
     if (reserved) liveReviewBudget.left--;
     try {
       const subject = (Array.isArray(rawPrs) ? rawPrs : []).find(p => Number(p?.number) === Number(d.prNumber));
+      const refusal = assertCapability(repo, 'review', { resolveProfile });
+      if (refusal) {
+        if (reserved) liveReviewBudget.left++;
+        notStarted.push({ prNumber: d.prNumber, reason: refusal.why });
+        continue;
+      }
       const result = dispatch({ pr: d.prNumber, repo,
         ...(d.advisoryReview?.ciWaived === true ? { advisoryCiWaiver: { head: d.advisoryReview.head, reason: d.advisoryReview.reason } } : {}),
         ...(Array.isArray(lanes) ? { preferLane: lanes[occupiedLanes] } : {}),
@@ -1157,7 +1186,7 @@ export function runReviewTickAllRepos({ repos = REVIEW_DAEMON_REPOS, tick = runR
  */
 export async function runConvertAdvisoryTick({
   reconcile = runReconcilePass, convertAdvisory = dispatchConvertAdvisory, repo = WE_SLUG,
-  readPrs = null, readAgents = null, dryRun = false, plans = null,
+  readPrs = null, readAgents = null, dryRun = false, plans = null, resolveProfile = repoProfile,
 } = {}) {
   const sharedReads = typeof readPrs === 'function' && typeof readAgents === 'function';
   let plan;
@@ -1188,6 +1217,8 @@ export async function runConvertAdvisoryTick({
   for (const d of entries) {
     // One bad entry never aborts the rest — the SAME per-PR isolation `runReviewTick`'s own dispatch loop uses.
     try {
+      const refusal = assertCapability(repo, 'review', { resolveProfile });
+      if (refusal) { skipped.push({ prNumber: d.prNumber, reason: refusal.why }); continue; }
       const pr = prsByNumber.get(Number(d.prNumber));
       const result = await convertAdvisory(d, {
         repo, comments: pr?.comments ?? null, labels: pr?.labels ?? null, dryRun,
@@ -1271,13 +1302,17 @@ export async function runConvertAdvisoryTickAllRepos({
  */
 export async function runPrepReviewStage({
   repo = WE_SLUG, readPrs = defaultReadPrs, tick = runPrepReviewTick, env = process.env,
-  root = resolve(fileURLToPath(import.meta.url), '..', '..', '..'), makeDeps = makePrepReviewDeps,
+  root = resolve(fileURLToPath(import.meta.url), '..', '..', '..'), makeDeps = makePrepReviewDeps, resolveProfile = repoProfile,
 } = {}) {
   const mode = resolvePrepReviewMode(env);
   // `off` still runs the tick: it reviews nothing, but it removes a stale `review:prep` from a PR that has grown past its
   // card, which would otherwise hide the normal review from every `review:*` consumer.
   try {
-    return await tick({ repo, readPrs, deps: makeDeps({ root, env }) });
+    const refusal = assertCapability(repo, 'review', { resolveProfile });
+    const deps = makeDeps({ root, env });
+    // Off suppresses judging/publication but preserves stale-label and stage-hold cleanup.
+    const result = await tick({ repo, readPrs, deps: refusal ? { ...deps, mode: 'off' } : deps });
+    return refusal ? { ...result, capabilityRefusal: refusal } : result;
   } catch (e) {
     return { mode, reviewed: [], skipped: [], failed: [], readError: String((e && e.message) || e).split('\n')[0] };
   }
@@ -1464,19 +1499,47 @@ export function cliReviewTickOpts({ log = console, factCache = null, listCommand
     }
     return livePrs.get(key);
   };
-  return {
+  const options = {
     log: line => log.error(line),
     acquirableLanes: defaultAcquirableLaneNumbers, recoveryAcquirableLanes: defaultRecoveryLaneNumbers,
     readPrs: factCache ? opts => defaultReadPrs({ ...opts, factCache }) : defaultReadPrs, readAgents: defaultReadAgents,
     hostAdmission: defaultReviewHostAdmission,
     // `listCommands` is a test seam: the default lists the host's real processes (`ps`), which a hermetic test must not.
     liveReviewBudget: liveReviewRoundBudget(listCommands ? { listCommands } : {}),
-    reconcileRedTeamQueue: () => {
+    reconcileRedTeamQueue: ({ inventoryComplete = true } = {}) => {
       livePrs.clear();
       if (['off', '0', 'false', 'no'].includes(String(process.env.WE_RED_TEAM_DISPATCH_QUEUE ?? '').trim().toLowerCase())) return;
       redTeamDispatchQueue ??= createRedTeamDispatchQueue({ log: line => log.error(line) });
+      if (!inventoryComplete) return;
       // Maintenance evicts terminal PRs and re-keys changed live heads.
       redTeamDispatchQueue.reconcile({ readLivePr: readQueuePr });
+    },
+    redTeamPartialInventory: ({ repo, reconcile, readAgents, defaultBranch, hostAdmission,
+      recoveryAcquirableLanes, liveReviewBudget }) => {
+      if (['off', '0', 'false', 'no'].includes(String(process.env.WE_RED_TEAM_DISPATCH_QUEUE ?? '').trim().toLowerCase())) return;
+      redTeamDispatchQueue ??= createRedTeamDispatchQueue({ log: line => log.error(line) });
+      const rawPrs = redTeamDispatchQueue.confirmedBlocked({ repo, readLivePr: readQueuePr });
+      if (!rawPrs.length) return;
+      // Use the normal planner, including its draft/hold/accepted-head guards.
+      const plan = reconcile({ repo, defaultBranch, readPrs: () => rawPrs, readAgents });
+      if (plan?.deferred) return;
+      const refusals = (plan.refusals ?? []).map(row => row.kind === 'nothing-owed' && row.phase === 'queued'
+        ? { ...row, kind: 'already-reviewed-head', headSha: row.headRefOid } : row)
+        .filter(row => row.kind === 'already-reviewed-head'
+          && rawPrs.some(pr => pr.number === Number(row.prNumber) && pr.headRefOid === row.headSha));
+      let host, lanes = 0;
+      try { host = hostAdmission(); } catch { /* Unknown host evidence allows no starts. */ }
+      try {
+        const available = recoveryAcquirableLanes({ repo });
+        lanes = Array.isArray(available) ? available.length : available;
+      } catch { /* Unknown lane evidence allows no starts. */ }
+      const limit = host?.admitted === true && Number.isFinite(host.maxPerTick)
+        ? Math.max(0, Math.floor(host.maxPerTick)) : 0;
+      const capacity = { lanes: Number.isFinite(lanes) ? Math.max(0, Math.floor(lanes)) : 0,
+        remainingStarts: limit, startsCeiling: limit, budget: liveReviewBudget,
+        take: () => host?.take?.(1) };
+      return options.redTeamOnSkip({ repo, plan: { ...plan, dispatch: [], refusals }, rawPrs,
+        inventoryComplete: false, capacity, paused: false });
     },
     redTeamOnSkip: o => {
       let rawPrs = o.rawPrs;
@@ -1486,10 +1549,16 @@ export function cliReviewTickOpts({ log = console, factCache = null, listCommand
       } catch { /* Label repair must never block red-team recovery. */ }
       try {
         runGateCatchUp({ repo: o.repo, refusals: o.plan?.refusals, rawPrs,
-          history: redTeamGateRetryHistory, log: line => log.error(line) });
+          history: redTeamGateRetryHistory,
+          resolveProfile: o.resolveProfile,
+          log: line => log.error(line) });
       } catch { /* Gate catch-up must never block the capacity queue. */ }
       const options = { ...o, rawPrs,
-        dispatch: d => dispatchReviewJob(d), log: line => log.error(line) };
+        dispatch: d => {
+          const refusal = assertCapability(o.repo, 'review', { resolveProfile: o.resolveProfile });
+          if (refusal) return { skipped: refusal.why };
+          return dispatchReviewJob(d);
+        }, log: line => log.error(line) };
       // Operator escape hatch: WE_RED_TEAM_DISPATCH_QUEUE=off runs the recovery directly, with no queue filtering or IO.
       const queueSetting = process.env.WE_RED_TEAM_DISPATCH_QUEUE;
       const queueWord = String(queueSetting ?? '').trim().toLowerCase();
@@ -1514,7 +1583,12 @@ export function cliReviewTickOpts({ log = console, factCache = null, listCommand
           if (line.startsWith('review-daemon: red-team queue floor minConcurrent=')) floorLine = line;
           else options.log(line);
         } });
-      } catch { /* Unreadable floor evidence disables raises for this tick. */ }
+      } catch {
+        // Unreadable floor evidence disables raises for this tick and fails closed on probes (never the default 6).
+        floor = { maxProbesPerTick: 0 };
+        try { options.log('review-daemon: red-team queue floor loader failed; maxProbesPerTick=0 (probes OFF this tick)'); }
+        catch { /* Diagnostics must not interrupt recovery. */ }
+      }
       if (floorLine !== lastRedTeamQueueFloorLine) {
         if (floorLine !== undefined) {
           try { options.log(floorLine); } catch { /* Diagnostics must not interrupt recovery. */ }
@@ -1541,6 +1615,7 @@ export function cliReviewTickOpts({ log = console, factCache = null, listCommand
     tagRound: (o) => tagReviewRound({ ...o, provider: factsProvider }),
     tagStatus: (o) => tagReviewStatus({ ...o, provider: factsProvider }),
   };
+  return options;
 }
 
 /**
@@ -2072,6 +2147,7 @@ export function buildCliDaemonEffects({
       }
       const pr = result.prepReview;
       if (pr) {
+        if (pr.capabilityRefusal) log.error(`review-daemon: prep-review held — ${pr.capabilityRefusal.why}`);
         for (const r of (pr.reviewed ?? [])) log.error(`review-daemon: ${WE_SLUG}#${r.prNumber} prep-review (${pr.mode}) ${r.outcome}${r.findings?.length ? `: ${r.findings.join(',')}` : ''}${r.addLabels?.length ? `; labelled ${r.addLabels.join(',')}` : ''}`);
         for (const f of (pr.failed ?? [])) log.error(`review-daemon: ${WE_SLUG}#${f.prNumber ?? '?'} prep-review failed (non-fatal): ${f.error}`);
         for (const x of (pr.stripped ?? [])) log.error(`review-daemon: ${WE_SLUG}#${x.prNumber} prep-review: removed a stale review:prep (the PR now carries more than the card)`);
