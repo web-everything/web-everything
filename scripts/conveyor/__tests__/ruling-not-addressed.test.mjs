@@ -10,6 +10,7 @@ import { renderRulingNotAddressed, RULING_NOT_ADDRESSED_MARKER } from '../../lib
 import { H1, H2, H3, H4, repo, record, recordComment, ignoredRulingThread, iso } from './ruling-fixtures.mjs';
 
 const basePr = (headRefOid, comments) => ({ number: 3794, state: 'OPEN', headRefName: 'lane/xcs4nce-policy', headRefOid,
+  rowsComplete: true, rowsHead: headRefOid,
   labels: [{ name: 'review:human' }, { name: 'advisory:changes' }], mergeStateStatus: 'CLEAN',
   statusCheckRollup: [{ name: 'test', status: 'COMPLETED', conclusion: 'SUCCESS' }], comments });
 const plan = (headRefOid, comments) => {
