@@ -48,8 +48,12 @@ export function hotPatchCiEvidence(data, sha, required, now, vetoIgnoreChecks = 
     const key = JSON.stringify([c.app.id, c.check_suite?.id, c.name]);
     if (!latest.has(key) || c.id > latest.get(key).id) latest.set(key, c);
   }
+  // Conditional optional jobs may skip normally; required jobs (including matrix
+  // instances) still need pending or successful evidence.
   if ([...latest.values()].some(c => !hotPatchIgnoresCheck(c.name, vetoIgnoreChecks) && c.app.id === TEST_CHECK_APP_ID
-    && c.status === 'completed' && c.conclusion !== 'success') || data.check_runs.some(c => !hotPatchIgnoresCheck(c.name, vetoIgnoreChecks) && c.app.id === TEST_CHECK_APP_ID && failedCheck(c, sha) && latest.get(JSON.stringify([c.app.id, c.check_suite?.id, c.name])).status !== 'completed' && (!Number.isFinite(Date.parse(c.completed_at)) || now - Date.parse(c.completed_at) >= 30 * 60_000)))
+    && c.status === 'completed' && c.conclusion !== 'success'
+    && !(c.conclusion === 'skipped' && !required.some(n => c.name === n || c.name.startsWith(`${n} (`))))
+    || data.check_runs.some(c => !hotPatchIgnoresCheck(c.name, vetoIgnoreChecks) && c.app.id === TEST_CHECK_APP_ID && failedCheck(c, sha) && latest.get(JSON.stringify([c.app.id, c.check_suite?.id, c.name])).status !== 'completed' && (!Number.isFinite(Date.parse(c.completed_at)) || now - Date.parse(c.completed_at) >= 30 * 60_000)))
     throw Error('unknown hot-patch CI conclusion; inspect checks or unload manually');
   if (!testWorkflowBound(testEvidence, data.workflows, sha, data.testWorkflowPath))
     throw Error('unreadable hot-patch CI binding');

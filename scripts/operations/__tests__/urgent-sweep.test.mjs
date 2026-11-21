@@ -1031,6 +1031,47 @@ describe('hot-patch sweep (R1100)', () => {
     f.d.pr = vi.fn(() => openPr());
     return f;
   }
+  it.each(['visual', 'soak-shard', 'soak-shard (1)', 'optional-job'])('keeps healthy required CI with skipped optional %s after 31 minutes', async name => {
+    const f = hotFixture([...required.map(n => check(n)), check(name, 'skipped')]);
+    f.d.now = () => new Date(Date.parse(load.at) + 31 * 60_000).toISOString();
+    expect(await f.run()).toMatchObject({ results: [{ status: 'monitoring-green' }] });
+    expect(f.d.remove).not.toHaveBeenCalled();
+    expect(f.d.escalate).not.toHaveBeenCalled();
+    expect(f.state.some(r => r.status === 'unload-decision')).toBe(false);
+  });
+  it('keeps pending required CI with skipped optional jobs after 31 minutes', async () => {
+    const f = hotFixture([...required.map(n => check(n, null, { status: 'in_progress' })), check('visual', 'skipped')]);
+    f.d.now = () => new Date(Date.parse(load.at) + 31 * 60_000).toISOString();
+    expect(await f.run()).toMatchObject({ results: [{ status: 'pending' }] });
+    expect(f.d.remove).not.toHaveBeenCalled();
+  });
+  it.each(['changes', 'test-shard', 'test-shard (1)', 'test'])('still unloads skipped required %s after 31 minutes', async name => {
+    const f = hotFixture([...required.map(n => check(n)), check(name, 'skipped')]);
+    f.d.now = () => new Date(Date.parse(load.at) + 31 * 60_000).toISOString();
+    decisionBeforeRemoval(f, 'ci-unknown');
+    expect(await f.run()).toMatchObject({ results: [{ status: 'unloaded-pending-adoption' }] });
+    expect(f.d.remove).toHaveBeenCalledTimes(1);
+  });
+  it.each(['neutral', 'stale', 'unrecognized'])('still unloads optional %s evidence after 31 minutes', async conclusion => {
+    const f = hotFixture([...required.map(n => check(n)), check('visual', conclusion)]);
+    f.d.now = () => new Date(Date.parse(load.at) + 31 * 60_000).toISOString();
+    decisionBeforeRemoval(f, 'ci-unknown');
+    expect(await f.run()).toMatchObject({ results: [{ status: 'unloaded-pending-adoption' }] });
+    expect(f.d.remove).toHaveBeenCalledTimes(1);
+  });
+  it('still unloads a failed optional job alongside an optional skip', async () => {
+    const f = hotFixture([...required.map(n => check(n)), check('visual', 'skipped'), check('soak-shard', 'failure')]);
+    f.d.now = () => new Date(Date.parse(load.at) + 31 * 60_000).toISOString();
+    decisionBeforeRemoval(f, 'ci-failed');
+    expect(await f.run()).toMatchObject({ results: [{ status: 'unloaded-pending-adoption' }] });
+    expect(f.d.remove).toHaveBeenCalledTimes(1);
+  });
+  it('uses the latest optional job conclusion when a rerun skips a previous failure', async () => {
+    const f = hotFixture([...required.map(n => check(n)), check('visual', 'failure'), check('visual', 'skipped')]);
+    f.d.now = () => new Date(Date.parse(load.at) + 31 * 60_000).toISOString();
+    expect(await f.run()).toMatchObject({ results: [{ status: 'monitoring-green' }] });
+    expect(f.d.remove).not.toHaveBeenCalled();
+  });
   it('keeps bound pending shards without test loaded past the unknown-evidence deadline', async () => {
     const f = hotFixture([check('changes'), check('test-shard (1)'), check('test-shard (2)', null, { status: 'in_progress' })]);
     f.d.now = () => new Date(Date.parse(load.at) + 31 * 60_000).toISOString();
