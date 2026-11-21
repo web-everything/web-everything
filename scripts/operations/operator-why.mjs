@@ -1,6 +1,7 @@
 /** Operator decision 2026-10-13: manual intervention without a worker. Pure read-only explanation. */
 import { op } from './registry.mjs';
 import { compute } from './step-kinds.mjs';
+import { advisoryHeadMoveState } from '../conveyor/reconcile-core.mjs';
 import { CONSTELLATION_REPOS, DEFAULT_REPO_KEY } from '../lib/constellation-repos.mjs';
 
 export const WHY_OP = 'why';
@@ -35,6 +36,7 @@ export function explainWhy(facts) {
   const sentAt = Date.parse(latest?.createdAt ?? ''), headAt = Date.parse(f.headCommittedDate ?? '');
   const sentBack = isPr && has('review:human') && latest?.decision === 'changes' && !latest.otherHead && Number.isFinite(sentAt) && Number.isFinite(headAt) && sentAt >= headAt;
   const fixRefusal = log('fix');
+  const headMove = isPr && has('review:human') && !has('advisory:changes') ? advisoryHeadMoveState(f.pr) : { owed: false };
   const rules = [
     [isPr && /^(merged|closed)$/i.test(f.pr?.state ?? ''), () => row('nobody', 'nothing (closed)')],
     [isPr && f.standDown, () => row('operator', `stand-down answer (${f.standDown.reason ?? 'unknown'})`, `node scripts/conveyor/stand-down-answer.mjs ${subject.id} --preview --repo=${f.repo} ${audit}`)],
@@ -43,6 +45,8 @@ export function explainWhy(facts) {
       if (live) return row(`fix daemon (${live.session ?? live.owner ?? 'unknown'})`, `fix round in progress: ${live.session ?? live.owner ?? 'unknown'}`);
       return row('fix daemon', /refus|skip|cap/i.test(fixRefusal) ? fixRefusal : 'fix dispatch', /round[- ]?(?:cap|limit)|max.*round/i.test(fixRefusal) ? command('grant-rounds', '--kind=fix --n=1') : /refus|skip/i.test(fixRefusal) ? command('rearm') : null);
     }],
+    [isPr && has('review:human') && headMove.owed, () => row('review daemon', `advisory re-run on ${headMove.head.slice(0, 9)}`)],
+    [isPr && has('review:human') && headMove.unreadable, () => row('operator', 'human review / park (advisory unreadable, no re-run dispatched)', command('unpark'))],
     [isPr && has('review:human'), () => row('operator', 'human review / park', /round[- ]?(?:cap|limit)|max.*round/i.test(log('fix')) ? command('grant-rounds', '--kind=fix --n=1') : command('unpark'))],
     [isPr && claim, () => claim.live === true ? row(`fix daemon (${claim.session ?? claim.owner ?? 'unknown'})`, 'fix round in progress')
       : claim.live === false ? row('nobody (stale fix claim)', 'stale fix claim', command('clear-claim', `--kind=${claim.kind ?? 'fix'}`)) : row('unknown', 'fix claim liveness unavailable')],
