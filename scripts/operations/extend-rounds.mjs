@@ -37,7 +37,7 @@ export function planRoundExtension(read, input) {
   if (granted + by > MAX_TOTAL_ROUND_EXTENSIONS) {
     throw new Error(`this PR already has ${granted} extra round(s); +${by} would pass the ${MAX_TOTAL_ROUND_EXTENSIONS}-round ceiling`);
   }
-  assertRoundGrantAllowed({ repo, pr, comments: read.comments, files: read.files,
+  assertRoundGrantAllowed({ repo, pr, comments: read.comments, commentsTotal: read.commentsTotal, files: read.files,
     headRefOid: read.headRefOid, despite, despiteDesign: read.despiteDesign });
   const validDespite = despite !== undefined;
   const record = { version: 1, repo, pr, by, actor: String(actor).toLowerCase(),

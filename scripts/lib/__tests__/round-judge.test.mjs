@@ -328,7 +328,9 @@ describe('helpers', () => {
   it('isGuardPath', () => {
     expect(isGuardPath('scripts/lib/red-team-gate.mjs')).toBe(true);
     expect(isGuardPath('.github/workflows/ci.yml')).toBe(true);
-    expect(isGuardPath('scripts/lib/round-judge.mjs')).toBe(false);
+    expect(isGuardPath('scripts/lib/round-judge.mjs')).toBe(true);
+    expect(isGuardPath('scripts/lib/round-grant-guard.mjs')).toBe(true);
+    expect(isGuardPath('scripts/lib/ordinary-helper.mjs')).toBe(false);
   });
   it('formatJudgeLine', () => {
     expect(formatJudgeLine(7, { verdict: 'grant', k: 2, reasons: ['a', 'b'] })).toBe('round-judge-shadow: #7 verdict=grant(+2) reasons=a;b');

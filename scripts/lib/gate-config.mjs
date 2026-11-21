@@ -146,6 +146,22 @@ export const TRUST_CHAIN = [
     homes: ['scripts/lib/review-escalation.mjs'],
   },
   {
+    role: 'round-grant-admission',
+    file: 'round-grant-guard.mjs',
+    tier: 'policy',
+    leash: 'code',
+    desc: 'the shared round-grant guard decides whether a grant may fire from complete evidence and the round judgement',
+    homes: ['scripts/lib/round-grant-guard.mjs'],
+  },
+  {
+    role: 'round-grant-judge',
+    file: 'round-judge.mjs',
+    tier: 'policy',
+    leash: 'code',
+    desc: 'the round judge derives convergence and fail-closed verdicts that decide whether a round grant may fire',
+    homes: ['scripts/lib/round-judge.mjs'],
+  },
+  {
     role: 'disposition-router',
     file: 'review-core.mjs',
     tier: 'policy',

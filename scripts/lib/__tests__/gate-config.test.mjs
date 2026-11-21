@@ -190,6 +190,21 @@ describe('TRUST_CHAIN — the declarative-leash / derivation-code split (#2771/#
   });
 });
 
+describe('TRUST_CHAIN — round-grant admission policy', () => {
+  it.each(['round-grant-guard.mjs', 'round-judge.mjs'])(
+    '%s is registered as policy derivation with a code leash', file => {
+      const path = `scripts/lib/${file}`;
+      expect(TRUST_CHAIN.find(member => member.file === file)).toMatchObject({
+        tier: 'policy', leash: 'code', homes: [path],
+      });
+      expect(isTrustChainPath(path)).toBe(true);
+      expect(isPolicyCorePath(path)).toBe(true);
+      expect(isPolicyDerivationPath(path)).toBe(true);
+      expect(isPolicySpecPath(path)).toBe(false);
+      expect(isEngineTierPath(path)).toBe(false);
+    });
+});
+
 describe('ENGINE_BASENAMES / isEngineTierPath — #2412 layer 4\'s "is this the lander?" question', () => {
   it('ENGINE_BASENAMES is derived from, and agrees with, every tier:\'engine\' TRUST_CHAIN entry', () => {
     const derived = TRUST_CHAIN.filter((m) => m.tier === 'engine').map((m) => m.file);

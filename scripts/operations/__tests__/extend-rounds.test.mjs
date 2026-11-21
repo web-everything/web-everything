@@ -28,6 +28,11 @@ describe('operator round extension', () => {
   ])('refuses invalid input %j', (override, error) => {
     expect(() => planRoundExtension(read, { ...input, ...override })).toThrow(error);
   });
+  it('refuses an incomplete operator read and directs the operator to inspect the full thread', () => {
+    const comments = Array.from({ length: 100 }, () => automation('ordinary discussion'));
+    expect(() => planRoundExtension({ ...read, comments, commentsTotal: 150 }, input))
+      .toThrow(/incomplete.*operator must inspect the full thread and retry/);
+  });
   it('refuses closed PRs', () => {
     expect(() => planRoundExtension({ ...read, state: 'CLOSED' }, input)).toThrow(/open/i);
   });
@@ -147,7 +152,7 @@ describe('non-converging stop at the grant point (R469 / D-R451)', () => {
     const gh = vi.fn(args => JSON.stringify(args[0] === 'pr'
       ? { state: 'OPEN', files: [{ path: 'src/q.mjs' }], headRefOid: 'a'.repeat(40) } : pages));
     const thread = readExtensionThread(input.repo, input.pr, { gh });
-    expect(thread).toMatchObject({ state: 'OPEN', files: ['src/q.mjs'], headRefOid: 'a'.repeat(40), comments });
+    expect(thread).toMatchObject({ state: 'OPEN', files: ['src/q.mjs'], headRefOid: 'a'.repeat(40), comments, commentsTotal: comments.length });
     expect(gh).toHaveBeenCalledTimes(2);
     const graphqlArgs = gh.mock.calls.find(([args]) => args[0] === 'api')[0];
     expect(graphqlArgs.slice(0, 4)).toEqual(['api', 'graphql', '--paginate', '--slurp']);
@@ -171,6 +176,10 @@ describe('non-converging stop at the grant point (R469 / D-R451)', () => {
   });
   it('accepts a complete empty comment thread', () => {
     expect(assembleComments([page([], 0)])).toEqual([]);
+    const gh = args => JSON.stringify(args[0] === 'pr' ? { state: 'OPEN' } : [page([], 0)]);
+    const thread = readExtensionThread(input.repo, input.pr, { gh });
+    expect(thread.commentsTotal).toBe(thread.comments.length);
+    expect(thread.commentsTotal).toBe(0);
   });
 
   it('refuses a grant when the round judge says non-converging', () => {

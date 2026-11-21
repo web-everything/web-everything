@@ -50,7 +50,7 @@ export function readNonconvergenceDesign(path, { root = handoffHome() } = {}) {
 }
 
 /** Prove that slurped GraphQL pages form a complete comment thread before judging any rounds. */
-export function assembleComments(pages) {
+function assembleCommentHistory(pages) {
   const refuse = () => { throw new Error('round extension refused: incomplete or malformed comments history; operator must inspect the full thread and retry'); };
   if (!Array.isArray(pages) || pages.length === 0) refuse();
   const comments = [];
@@ -75,16 +75,21 @@ export function assembleComments(pages) {
     comments.push(...connection.nodes);
   }
   if (comments.length !== total) refuse();
-  return comments;
+  return { comments, commentsTotal: total };
+}
+
+/** Preserve the array-only API for callers that do not need the verified connection total. */
+export function assembleComments(pages) {
+  return assembleCommentHistory(pages).comments;
 }
 
 export function readExtensionThread(repo, pr, { despiteDesign, gh: runGh = gh } = {}) {
   const [owner, name] = repo.split('/');
   const query = 'query($owner:String!,$name:String!,$number:Int!,$endCursor:String){repository(owner:$owner,name:$name){pullRequest(number:$number){comments(first:100,after:$endCursor){totalCount pageInfo{hasNextPage endCursor} nodes{author{login} body createdAt viewerDidAuthor}}}}}';
-  const comments = assembleComments(JSON.parse(runGh(['api', 'graphql', '--paginate', '--slurp',
+  const { comments, commentsTotal } = assembleCommentHistory(JSON.parse(runGh(['api', 'graphql', '--paginate', '--slurp',
     '-f', `query=${query}`, '-F', `owner=${owner}`, '-F', `name=${name}`, '-F', `number=${pr}`])));
   const thread = JSON.parse(runGh(['pr', 'view', String(pr), '--repo', repo, '--json', 'state,files,headRefOid']));
-  return { ...thread, comments, files: thread.files?.map((file) => file.path) ?? [],
+  return { ...thread, comments, commentsTotal, files: thread.files?.map((file) => file.path) ?? [],
     ...(validNonconvergenceDesignPath(despiteDesign)
       ? { despiteDesign: readNonconvergenceDesign(despiteDesign) } : {}) };
 }
