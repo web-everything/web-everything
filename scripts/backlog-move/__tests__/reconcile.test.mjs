@@ -2,7 +2,7 @@
 import { describe, it, expect } from 'vitest';
 import { buildManifest, verifyManifest, transform, digest } from '../manifest.mjs';
 import { reconcile } from '../reconcile.mjs';
-import { parseArgs, main } from '../cli.mjs';
+import { parseArgs, main, assertWriterToken } from '../cli.mjs';
 
 const sha = 'a'.repeat(40), mainSha = 'b'.repeat(40), destSha = 'c'.repeat(40);
 const sourcePath = 'backlog/083-agent-file-lock-coordination.md';
@@ -99,6 +99,7 @@ function harness({ absent = true, fail, changed = false, collision = false, alte
     expect(args.slice(0, 2)).toEqual(['api', '--method=GET']);
     if (fail) throw Object.assign(new Error('remote unavailable'), { stderr: 'HTTP 503' });
     const endpoint = args[2];
+    if (endpoint === 'user') return 'test-login\n';
     if (endpoint.endsWith('/plateau-app')) return JSON.stringify({ default_branch: 'main' });
     if (endpoint.includes('/commits/')) return JSON.stringify({ sha: destSha });
     expect(endpoint).toContain(`ref=${destSha}`);
@@ -115,12 +116,16 @@ describe('read-only CLI', () => {
     expect(parseArgs(['status', '--manifest', 'saved.json'])).toMatchObject({ command: 'status', manifest: 'saved.json' });
     for (const args of [[...planArgs, '--write'], [...planArgs, '--push'], ['plan'], [...planArgs, '--cards', '1']]) expect(() => parseArgs(args)).toThrow();
   });
-  it('refuses without an App token env before any IO, including personal tokens', () => {
-    for (const env of [{}, { GH_TOKEN: 'ghp_personal' }]) {
-      let called = false;
-      expect(() => main(planArgs, { env, run: () => { called = true; } })).toThrow(/App token/);
-      expect(called).toBe(false);
-    }
+  it('any write path refuses without an App token, including personal tokens', () => {
+    for (const env of [{}, { GH_TOKEN: 'ghp_personal' }]) expect(() => assertWriterToken(env)).toThrow(/App token/);
+    expect(assertWriterToken({ GH_TOKEN: 'ghs_fixture' })).toBe('ghs_fixture');
+  });
+  it('dry run uses the ambient gh identity, says so, and hardens git env', () => {
+    const io = harness(), logs = []; io.log = (s) => logs.push(s); io.env = {};
+    expect(main(planArgs, io)).toBe(0);
+    expect(logs).toEqual(['read-only dry run: using gh identity test-login']);
+    const git = io.calls.find((c) => c.bin === 'git').opts.env;
+    expect(git.GIT_NO_LAZY_FETCH).toBe('1'); expect(git.GIT_NO_REPLACE_OBJECTS).toBe('1');
   });
   it('prints pinned source/destination facts, inbound links and ET without writes', () => {
     const io = harness(); expect(main(planArgs, io)).toBe(0);

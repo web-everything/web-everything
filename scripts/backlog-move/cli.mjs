@@ -30,12 +30,16 @@ export function parseArgs(args) {
   }
   return parsed;
 }
+/** Slice 3 (the writer) must call this first; slice 1 has no write path. Refuses without a GitHub App token. */
+export function assertWriterToken(env = process.env) {
+  const token = env.WE_GH_APP_TOKEN || env.GH_TOKEN;
+  if (!/^ghs_[a-zA-Z0-9_]+$/.test(token || '')) throw new Error('GitHub App token required for any write path: GH_TOKEN (ghs_) or WE_GH_APP_TOKEN');
+  return token;
+}
 export function main(args, io = {}) {
   const options = parseArgs(args), env = { ...(io.env ?? process.env) };
-  const token = env.WE_GH_APP_TOKEN || env.GH_TOKEN;
-  if (!/^ghs_[a-zA-Z0-9_]+$/.test(token || '')) throw new Error('GitHub App token required: GH_TOKEN (ghs_) or WE_GH_APP_TOKEN');
   delete env.GIT_DIR; delete env.GIT_WORK_TREE;
-  env.GH_TOKEN = token; env.GITHUB_TOKEN = token; env.GIT_NO_LAZY_FETCH = '1'; env.GIT_NO_REPLACE_OBJECTS = '1';
+  env.GIT_NO_LAZY_FETCH = '1'; env.GIT_NO_REPLACE_OBJECTS = '1';
   // Direct, bounded GETs: gh-throttle persists locks/logs/memos, incompatible with this slice's zero writes.
   const run = io.run ?? execFileSync;
   const execute = (bin, argv) => run(bin, argv, { env, timeout: 15_000, maxBuffer: 8 * 1024 * 1024, stdio: ['ignore', 'pipe', 'pipe'] });
@@ -78,6 +82,9 @@ export function main(args, io = {}) {
       if (path !== row.sourcePath && (text.includes(row.sourcePath.split('/')[1]) || new RegExp(`(^|[^a-zA-Z0-9])#${id}(?![a-zA-Z0-9])`).test(text))) inbound.get(row.sourcePath).push(path);
     }
   }
+  let login = 'unknown';
+  try { login = String(execute('gh', ['api', '--method=GET', 'user', '--jq', '.login'])).trim() || 'unknown'; } catch { /* App tokens cannot read /user */ }
+  (io.log ?? console.error)(`read-only dry run: using gh identity ${login}`);
   let calls = 0;
   const api = (endpoint, allow404 = false) => {
     if (++calls > 128) throw new Error('GitHub call bound exceeded; inspect manually or use smaller batch');
