@@ -35,7 +35,7 @@ const isWorkflowTouchHold = r => r.id === 'review-acceptance' && r.status === 'h
 const manualFreeze = r => r.id === 'red-main-freeze' && r.status === 'hold'
   && /^main is RED \(freeze: manual freeze: .+\)$/.test(r.reason ?? '');
 
-const automaticFreeze = r => r.id === 'red-main-freeze' && blocking(r) && !manualFreeze(r)
+const automaticFreeze = r => r.id === 'red-main-freeze' && r.status === 'hold' && !manualFreeze(r)
   && /^main is RED \(freeze: main CI red since [0-9a-f]{9,40}\)$/.test(r.reason ?? '');
 
 export function mainCiGreenAfter(main, completedAt) {
@@ -46,14 +46,14 @@ export function mainCiGreenAfter(main, completedAt) {
 /** Fresh, bounded read: never select an older success by filtering the latest run's status. */
 export function readLatestMainCi({ repo, runGh = runGhSync } = {}) {
   try {
-    const data = JSON.parse(runGh(['api', `repos/${repo}/actions/workflows/ci.yml/runs?branch=main&per_page=1`], {
+    const data = JSON.parse(runGh(['api', `repos/${repo}/actions/workflows/ci.yml/runs?branch=main&event=push&per_page=10`], {
       encoding: 'utf8', timeout: 30_000, maxBuffer: 1024 * 1024, stdio: ['ignore', 'pipe', 'pipe'],
       throttle: { op: 'merge-gate-main-ci', repo },
     }));
     const runs = data?.workflow_runs;
-    const run = Array.isArray(runs) && runs.length === 1 ? runs[0] : null;
-    if (run?.head_branch !== 'main' || run.status !== 'completed'
-      || !['success', 'failure', 'cancelled', 'timed_out', 'neutral', 'skipped', 'action_required', 'startup_failure'].includes(run.conclusion)
+    const run = Array.isArray(runs) && runs.length > 0 && runs.length <= 10 ? runs[0] : null;
+    if (!run || runs.some(r => r?.head_branch !== 'main' || r.event !== 'push' || r.status !== 'completed')
+      || run.conclusion !== 'success'
       || !Number.isFinite(Date.parse(run.updated_at))) return { error: 'latest main CI incomplete or unreadable' };
     return { status: run.status, conclusion: run.conclusion, completed_at: run.updated_at };
   } catch (e) { return { error: String(e?.message ?? e) }; }
@@ -226,6 +226,8 @@ export function excuseMergeGateRows(rows, { prNumber, headSha, labels, readVerdi
     const mainCiNow = validRun && holds?.length === 1 && automaticFreeze(holds[0]) ? readMainCi?.() : undefined;
     const classification = classifyMergeGateHold({ results: verdict.results, prLabels: labels, freeze: currentFreeze, verdictCompletedAt: verdict.completed_at, mainCiGreen: verdict.mainCiGreen, mainCiNow });
     if (classification.rerun) {
+      const sharedFreeze = typeof freeze === 'function' ? freeze() : freeze;
+      if (!sharedFreeze || sharedFreeze.error || sharedFreeze.frozen !== false || verdict.evaluatorOnlyFailure !== true) return unchanged;
       const replacement = { ...row, mergeGateReviewHold: { holds: ['red-main-freeze'], jobId },
         mergeGateStaleFreeze: { repo, pr: prNumber, head: headSha, run: verdict.run_id, job: jobId,
           attempt: verdict.run_attempt, completedAt: verdict.completed_at } };
@@ -246,6 +248,18 @@ export function excuseMergeGateRows(rows, { prNumber, headSha, labels, readVerdi
   } catch { return unchanged; }
 }
 
+function evaluatorOnlyFailure(job) {
+  // The evaluator must be the sole failed step in the gate's own completed job.
+  const steps = job.steps;
+  if (job.name !== 'merge-gate' || job.status !== 'completed' || job.conclusion !== 'failure'
+    || !Array.isArray(steps) || !steps.length
+    || steps.some(s => s.status !== 'completed' || !['success', 'failure', 'skipped'].includes(s.conclusion))) return false;
+  const failed = steps.filter(s => s.conclusion === 'failure');
+  if (failed.length !== 1 || failed[0].name !== "Evaluate the drain's merge gates"
+    || steps.filter(s => s.name === failed[0].name).length !== 1) return false;
+  return true;
+}
+
 function parseWorkflowProtection(job, log, prNumber) {
   const lines = String(log).split(/\r?\n/).map(l => l.replace(/^\d{4}-\d\d-\d\dT\S+\s/, ''));
   const table = parsePrResultTable(log, prNumber);
@@ -260,14 +274,7 @@ function parseWorkflowProtection(job, log, prNumber) {
   }
   const tableWorkflowHold = table.results.some(isWorkflowTouchHold);
   if (!tableWorkflowHold) return null;
-  // The evaluator must be the sole failed step in the gate's own completed job.
-  const steps = job.steps;
-  if (job.name !== 'merge-gate' || job.status !== 'completed' || job.conclusion !== 'failure'
-    || !Array.isArray(steps) || !steps.length
-    || steps.some(s => s.status !== 'completed' || !['success', 'failure', 'skipped'].includes(s.conclusion))) return { error: 'unreadable workflow-protection job' };
-  const failed = steps.filter(s => s.conclusion === 'failure');
-  if (failed.length !== 1 || failed[0].name !== "Evaluate the drain's merge gates"
-    || steps.filter(s => s.name === failed[0].name).length !== 1) return { error: 'workflow-protection evaluator is not the sole failed step' };
+  if (!evaluatorOnlyFailure(job)) return { error: 'workflow-protection evaluator is not the sole failed step' };
   return { ...table, workflowEditProtection: true };
 }
 
@@ -289,7 +296,7 @@ export function readMergeGateVerdict({ repo, jobId, prNumber, runGh = runGhSync,
       cache.set(key, { job, log });
     }
     const { job, log } = cache.get(key);
-    return { ...(parseWorkflowProtection(job, log, prNumber) ?? parsePrResultTable(log, prNumber)), head_sha: job.head_sha, completed_at: job.completed_at,
+    return { ...(parseWorkflowProtection(job, log, prNumber) ?? parsePrResultTable(log, prNumber)), head_sha: job.head_sha, completed_at: job.completed_at, evaluatorOnlyFailure: evaluatorOnlyFailure(job),
       ...(job.run_id !== undefined ? { run_id: job.run_id, run_attempt: job.run_attempt } : {}) };
   } catch (e) { return { error: String(e?.message ?? e) }; }
 }

@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { mkdtempSync, rmSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
-import { dispatchTimeoutRetry, timeoutGithubEffects } from '../ci-heal-pr-dispatch.mjs';
+import { dispatchTimeoutRetry, timeoutGithubEffects, flushTimeoutFollowups } from '../ci-heal-pr-dispatch.mjs';
 import { timeoutKey } from '../../conveyor/timeout-retry-state.mjs';
 
 const dirs = [];
@@ -84,5 +84,37 @@ describe('stale freeze rerun durable budget', () => {
     opts.effects.request = timeoutGithubEffects({ exec }).request;
     expect((await dispatchTimeoutRetry(evidence, opts)).status).toBe('requested');
     expect(exec.mock.calls[0].slice(0, 2)).toEqual(['gh', ['api', '--include', '--method', 'POST', 'repos/owner/repo/actions/runs/' + evidence.run + '/rerun-failed-jobs']]);
+  });
+});
+
+describe('stale freeze shared head cap and followup state', () => {
+  it.each(['confirmed', 'rejected'])('caps %s stale-freeze reservations at two across run ids', async status => {
+    const opts = fixture(); opts.effects.request.mockReturnValue({ status });
+    for (const run of [42, 43]) {
+      opts.effects.observe.mockReturnValue({ ...observed, run, jobRun: run });
+      await dispatchTimeoutRetry({ ...evidence, run, signature: `stale-main-freeze:${run}`, jobs: [{ ...evidence.jobs[0], run }] }, opts);
+    }
+    expect((await dispatchTimeoutRetry({ ...evidence, run: 44, jobs: [{ ...evidence.jobs[0], run: 44 }] }, opts)).reason).toMatch(/stale-freeze-head-cap.*inspect/);
+    expect(opts.effects.request).toHaveBeenCalledTimes(2);
+    const state = JSON.parse(readFileSync(join(opts.dir, `${timeoutKey(evidence)}.json`), 'utf8'));
+    expect(state.requests.every(r => r.staleFreeze === true)).toBe(true);
+  });
+  it('preserves the per-head cap for old unmarked stale-freeze reservations', async () => {
+    const opts = fixture();
+    writeFileSync(join(opts.dir, `${timeoutKey(evidence)}.json`), JSON.stringify({ version: 1, evidence,
+      requests: [40, 41].map(run => ({ signature: `stale-main-freeze:${run}`, target: { run, job: 123, attempt: 1 }, status: 'confirmed' })) }));
+    expect((await dispatchTimeoutRetry(evidence, opts)).reason).toMatch(/stale-freeze-head-cap.*inspect/);
+    expect(opts.effects.request).not.toHaveBeenCalled();
+  });
+  it('two confirmed stale-freeze reservations survive an ordinary timeout followup flush', async () => {
+    const opts = fixture();
+    for (const run of [42, 43]) {
+      opts.effects.observe.mockReturnValue({ ...observed, run, jobRun: run });
+      expect((await dispatchTimeoutRetry({ ...evidence, run, signature: `stale-main-freeze:${run}`, jobs: [{ ...evidence.jobs[0], run }] }, opts)).status).toBe('requested');
+    }
+    const flushed = await flushTimeoutFollowups(opts);
+    expect(flushed).toHaveLength(1);
+    expect(flushed[0].reason).toBeUndefined();
+    expect(opts.fileFollowup).not.toHaveBeenCalled();
   });
 });

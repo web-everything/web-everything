@@ -5807,3 +5807,13 @@ rejected or ambiguous requests, and rechecks main plus the live PR/job identity 
 If the reservation is spent or uncertain, inspect merge-gate and the durable timeout retry record before an
 operator retry; automatic ticks must not clear it. `merge-gate-stale-freeze.test.mjs`, `stale-freeze-rerun.test.mjs`
 and the `merge-gate-stale-main-freeze` soak break cover classification, refusal, restart and three-tick recovery.
+
+## Stale automatic main-freeze recovery
+
+The stale-freeze annotation requires the verdict job's own `head_sha` to match the PR head;
+a `pull_request_target` job on a different base head is insufficient evidence. Test both head
+bindings and the sole failed evaluator step. Persisted retry requests with the historical
+`stale-main-freeze:` signature must retain their spend when adding request markers.
+Run the stale-freeze soak with `vitest.soak.config.ts` through heavy-admission: the default
+unit config excludes `*.soak.test.mjs`. The regression must pass unconditionally and observe
+a successful rerun on a later tick, rather than only an accepted rerun request.

@@ -896,7 +896,7 @@ export function readTimeoutHold({ repo, pr, head, dir = timeoutStateDir() }) {
 async function fileTimeoutFollowup(path, { root, fileFollowup } = {}) {
   let payload;
   timeoutTransaction(path, null, (state) => {
-    if (state.evidence.infraCancelled || confirmedTimeouts(state) < 2 || state.card?.filed) return;
+    if (state.evidence.staleFreeze || state.evidence.infraCancelled || confirmedTimeouts(state) < 2 || state.card?.filed) return;
     if (state.card?.filingPid) {
       try { process.kill(state.card.filingPid, 0); return; }
       catch (error) { if (error.code !== 'ESRCH') return; }
@@ -1004,19 +1004,25 @@ export async function dispatchTimeoutRetry(evidence, {
   };
   let reservation;
   const selected = timeoutTransaction(path, initial, (state) => {
+    // Preserve spend from stale-freeze records written before the per-request marker existed.
+    for (const request of state.requests) {
+      if (request.signature?.startsWith('stale-main-freeze:')) request.staleFreeze = true;
+    }
     // Reserve once per head + run, including rejected/ambiguous requests and newer job attempts.
     // Old persisted timeout state shares this lock; never reinterpret it as an unused reservation.
     if (evidence.staleFreeze && state.requests.some(r => r.target.run === evidence.run && !r.released)) return { spent: true };
+    if (evidence.staleFreeze && state.requests.filter(r => r.staleFreeze && !r.released).length >= 2) return { staleExhausted: true };
     if (!evidence.staleFreeze && confirmedTimeouts(state) >= (evidence.infraCancelled ? (evidence.cap ?? 6) : 2)) return { exhausted: true, card: state.card?.payload.num };
     const pending = state.requests.find((r) => r.status === 'pending');
     if (pending) return { pending: structuredClone(pending) };
     const target = evidence.jobs.find((j) => !state.requests.some((r) => r.status === 'confirmed'
       && r.target.run === j.run && r.target.job === j.job && r.target.attempt === j.attempt));
     if (!target) return { waiting: true };
-    reservation = { id: state.requests.length, signature: evidence.signature, target, status: 'pending', reservedAt: new Date(now()).toISOString(), outcome: 'reserved; API outcome unknown' };
+    reservation = { id: state.requests.length, ...(evidence.staleFreeze ? { staleFreeze: true } : {}), signature: evidence.signature, target, status: 'pending', reservedAt: new Date(now()).toISOString(), outcome: 'reserved; API outcome unknown' };
     state.requests.push(reservation);
     return { target };
   });
+  if (selected.staleExhausted) return refuse('stale-freeze-head-cap; inspect merge-gate and the retry record before operator retry');
   if (selected.spent) return refuse('stale-freeze-rerun-spent; inspect merge-gate and the retry record before operator retry');
   if (selected.exhausted) {
     await fileTimeoutFollowup(path, { root, fileFollowup });
