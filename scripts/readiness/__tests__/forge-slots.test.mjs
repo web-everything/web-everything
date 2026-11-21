@@ -285,6 +285,7 @@ grp.getgrnam = lambda name: types.SimpleNamespace(gr_gid=3000+int(name.rsplit('-
       const prepare = setup.slice(setup.indexOf('sudoers_pending=$(mktemp'), setup.indexOf('if ! command -v rsync'));
       const enable = setup.slice(setup.lastIndexOf('systemctl enable --now forge-exec-egress.timer'))
         .replace('/usr/local/libexec/forge-egress.sh apply', 'bash "$(dirname -- "$0")/forge-egress.sh" apply')
+        .replace('/usr/local/libexec/forge-exec-run.mjs egress-self-check', 'node egress-self-check')
         .replace('# Final enable:', '[[ "$STAGE" != before-enable ]] || exit 37\n# Final enable:')
         .replace('import os, sys\nroot =', `import os, sys
 if os.environ['STAGE'] == 'publish-failure':
