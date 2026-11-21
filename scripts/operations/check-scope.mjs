@@ -10,7 +10,8 @@ export function normalizeQualified(qualified) {
   const colon = qualified.indexOf(':');
   const path = posix.normalize(qualified.slice(colon + 1));
   if (path === '..' || path.startsWith('../') || path.startsWith('/')) throw new Error(`scope path escapes the repo: ${qualified}`);
-  return `${qualified.slice(0, colon + 1)}${path}`;
+  // The repo root stays `we:` (not `we:.`): the assessor matches the empty path as covering every descendant.
+  return `${qualified.slice(0, colon + 1)}${path === '.' ? '' : path}`;
 }
 
 export function checkScope({ declaredFiles, excludeAgent, excludeOwner, collect = collectFreeScope, now = Date.now } = {}) {

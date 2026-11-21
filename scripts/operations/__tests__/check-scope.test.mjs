@@ -40,6 +40,12 @@ describe('checkScope shared admission', () => {
     expect(run({ agents: [agent] }, { excludeAgent: agent.agent, excludeOwner: 'holder' }).ok).toBe(true);
     expect(run({ agents: [agent] }, { excludeAgent: agent.agent, excludeOwner: 'other' }).ok).toBe(false);
   });
+  it('keeps repository-root claims and scopes overlapping everything beneath them', () => {
+    expect(run({ agents: [{ ...agent, files: ['we:'] }] }).ok).toBe(false);
+    expect(run({ agents: [{ ...agent, files: ['we:./'] }] }).ok).toBe(false);
+    expect(run({ agents: [{ ...agent, files: ['we:scripts/..'] }] }).ok).toBe(false);
+    expect(run({ agents: [agent] }, { declaredFiles: ['we:'] }).ok).toBe(false);
+  });
   it('allows prose-only scopes without collecting evidence', () => {
     const collect = vi.fn(() => { throw new Error('must not read'); });
     expect(checkScope({ declaredFiles: ['we:docs/a/b.md', 'backlog/card.md'], collect })).toEqual({ ok: true, overlaps: [] });
