@@ -11,6 +11,22 @@ function dispatch(file, args = [], options = {}) {
   if (file === process.execPath && basename(args[0] || '') === 'gh-throttle.mjs') {
     return active.throttle(args.slice(1), { spawn: childProcessMock.spawnSync });
   }
+  if (file === process.execPath && basename(args[0] || '') === 'drain-gh-async.mjs') {
+    // Model the worker boundary in-process, keeping the real sync throttle and fake gh port.
+    // The first two worker arguments are its path and serialized gh execution bounds.
+    const env = options.env ?? process.env;
+    try {
+      const stdout = active.runGhSync(args.slice(2), {
+        ...JSON.parse(args[1]), env, maxBuffer: 64 * 1024 * 1024,
+        stdio: ['inherit', 'pipe', 'pipe'],
+        throttle: { caller: 'merge-ai-prs.mjs', bin: 'gh',
+          env: Object.fromEntries(Object.entries(env).filter(([key]) => key !== 'WE_GH_READ_MEMO_DIR')) },
+      });
+      return { status: 0, stdout, stderr: '' };
+    } catch (error) {
+      return { status: error.status || 1, stdout: '', stderr: `${error.stderr ?? ''}${error.message}\n` };
+    }
+  }
   const port = active.ports[basename(file)];
   if (!port) {
     const error = new Error(`Unexpected CLI subprocess: ${file} ${args.join(' ')}`);
@@ -79,7 +95,9 @@ export async function runInProcess(argv, { cwd, env, ports }) {
   try {
     // Recreate module-scoped paths, caches and settings just as a fresh CLI process would.
     vi.resetModules();
-    active.throttle = (await import('../../lib/gh-throttle.mjs')).runGhCliPassthrough;
+    const throttle = await import('../../lib/gh-throttle.mjs');
+    active.throttle = throttle.runGhCliPassthrough;
+    active.runGhSync = throttle.runGhSync;
     const { main } = await import('../../merge-ai-prs.mjs');
     try {
       await main(argv, { env: process.env, stdout: { write(value) { stdout += value; } },
