@@ -15,7 +15,7 @@ const pr = { number: 1, headRefOid: 'a'.repeat(40), labels: [], isDraft: false, 
 const hiccup = () => Object.assign(new Error('spawnSync gh ETIMEDOUT'), { code: 'ETIMEDOUT' });
 async function make(readGhText) {
   const dir = mkdtempSync(join(tmpdir(), 'soak-wd-')); writeFileSync(join(dir, 'p.json'), '{}');
-  const env = { GH_REPO: 'o/r', WE_PLATFORM_PREFERENCES_FILE: join(dir, 'p.json'), WE_COORDINATION_ROOT: join(dir, 'c'),
+  const env = { GH_REPO: 'web-everything/web-everything', WE_PLATFORM_PREFERENCES_FILE: join(dir, 'p.json'), WE_COORDINATION_ROOT: join(dir, 'c'),
     WE_LIVE_OWNER_WATCH_DIR: join(dir, 'w'), WE_NEEDS_YOU_FEED: join(dir, 'f.jsonl'), WE_POLICY_CASCADE_LOG: '0' };
   const calls = { n: 0 };
   const io = await createLiveOwnerWatchIo({ env, home: dir, root: dir, now: Date.now(), adapters: {

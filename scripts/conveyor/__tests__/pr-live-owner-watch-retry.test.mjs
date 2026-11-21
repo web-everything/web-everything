@@ -30,7 +30,7 @@ describe('watchdog retries PR list with backoff before evidence-unavailable', ()
     const io = await makeIo({ readGhText, sleepMs });
     expect(io.listPRs()).toEqual([{ ...pr(), repo: REPO }]);
     expect(readGhText).toHaveBeenCalledTimes(3);
-    expect(sleepMs.mock.calls.map(c => c[0])).toEqual([5000, 20000]);
+    expect(sleepMs.mock.calls.map(c => c[0])).toEqual([1000, 4000]);
   });
   it('three consecutive failures still raise, fail closed', async () => {
     const readGhText = vi.fn(() => { throw transient(); });
@@ -39,7 +39,8 @@ describe('watchdog retries PR list with backoff before evidence-unavailable', ()
     expect(readGhText).toHaveBeenCalledTimes(3);
   });
   it('a non-transient error (auth, 4xx) raises at once without sleeping', async () => {
-    for (const msg of ['HTTP 401: Bad credentials', 'HTTP 403: forbidden', 'HTTP 404: Not Found']) {
+    for (const msg of ['HTTP 401: Bad credentials', 'HTTP 403: forbidden', 'HTTP 404: Not Found', 'HTTP 410: Gone',
+      'Unexpected token < in JSON at position 0', 'unrecognized permanent gh failure']) {
       const readGhText = vi.fn(() => { throw Error(msg); });
       const sleepMs = vi.fn();
       const io = await makeIo({ readGhText, sleepMs });
@@ -52,7 +53,9 @@ describe('watchdog retries PR list with backoff before evidence-unavailable', ()
     const readGhText = vi.fn(() => { throw transient(); });
     const sleepMs = vi.fn();
     const io = await makeIo({ readGhText, sleepMs }, { WE_LIVE_OWNER_WATCH_CONFIG: JSON.stringify({ tickBudgetMs: 3000 }) });
-    expect(() => io.listPRs()).toThrow();
-    expect(sleepMs).not.toHaveBeenCalled();
+    expect(() => io.listPRs()).toThrow(/tick budget/);
+    // 1 s fits the 3 s budget; the 4 s second backoff (plus margin) does not, so it is never slept.
+    expect(sleepMs.mock.calls.map(c => c[0])).toEqual([1000]);
+    expect(readGhText).toHaveBeenCalledTimes(2);
   });
 });
