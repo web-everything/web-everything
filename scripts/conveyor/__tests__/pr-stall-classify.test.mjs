@@ -14,7 +14,8 @@ const HEAD = 'ABCDEF0123456789ABCDEF0123456789ABCDEF01';
 const ACTOR = { 'system:fix-stood-down': 'system', 'system:ledger-write-miss': 'system', 'system:stale-hold': 'system', 'red-team-sent-back-cleared': 'nobody',
   'awaiting-review': 'reviewer', 'human-review-pending-advisory': 'reviewer', 'red-team-pending': 'red-team', 'drain-skip:red-team-pending': 'red-team',
   fixing: 'fixer', 'sent-back-red-team': 'fixer', draft: 'fixer', 'ci-failed': 'fixer', 'awaiting-ci': 'ci', 'ready-to-merge': 'drain',
-  'in-merge-queue': 'drain', 'drain-skip:queue-file-overlap': 'drain', 'drain-skip:overlap-yield': 'drain', 'drain-skip:ready-not-reached': 'drain' };
+  'in-merge-queue': 'drain', 'drain-skip:queue-file-overlap': 'drain', 'drain-skip:overlap-yield': 'drain', 'drain-skip:ready-not-reached': 'drain',
+  'drain-skip:conflicting': 'fixer', 'drain-skip:checks-pending': 'ci' };
 const row = (waitingOn, o = {}) => ({ repo: REPO, number: 77, waitingOn, actor: ACTOR[waitingOn] ?? 'operator', stalled: true, liveJob: null,
   why: 'x', evidence: ['e1', 'e2', 'e3', 'e4'], next: { summary: 's', command: `next-for ${waitingOn}` }, ...o });
 const finding = (cls, file = 'scripts/foo.mjs') => ({ file, line: 3, summary: `${cls}: the claim must be released before the push`, cls, priorAppearances: 0 });
@@ -68,6 +69,7 @@ const FIXED = {
   'ci-failed': ['system', 'tooling-card'], 'awaiting-ci': ['system', 'tooling-card'], 'ready-to-merge': ['system', 'tooling-card'],
   'in-merge-queue': ['system', 'tooling-card'], 'drain-skip:queue-file-overlap': ['system', 'tooling-card'],
   'drain-skip:ready-not-reached': ['system', 'tooling-card'], 'drain-skip:overlap-yield': ['system', 'tooling-card'],
+  'drain-skip:conflicting': ['system', 'tooling-card'], 'drain-skip:checks-pending': ['system', 'tooling-card'],
   'drain-skip:escalated': ['operator', 'unclassified'], 'drain-skip:unknown': ['operator', 'unclassified'],
   'ruling-needed:dispute': ['operator', 'ruling-needed:dispute'], 'needs-decision:note': ['operator', 'needs-decision:note'],
   'draft-withdrawn': ['operator', 'draft-withdrawn'], 'needs-you': ['operator', 'needs-you'], 'human-review': ['operator', 'human-review'],
@@ -725,5 +727,24 @@ describe('stall classify waits for published findings', () => {
   });
   it('an unknown pending age fails closed', () => {
     expect(empty(undefined)).toMatchObject({ lane: 'operator' });
+  });
+});
+
+describe('drain waits for a conflict or pending checks have a known owner', () => {
+  it('a conflicting PR belongs to the fixer and gets a tooling card with no live job', () => {
+    expect(at('drain-skip:conflicting', { row: { actor: 'fixer' } })).toMatchObject({ lane: 'system', action: 'tooling-card', smell: 'fixer-stuck' });
+    expect(at('drain-skip:conflicting', { row: { actor: 'fixer', liveJob: 'fix' } })).toBeNull();
+    expect(at('drain-skip:conflicting', { row: { actor: 'operator' } }).reason).toContain('does not fit');
+  });
+  it('pending checks belong to CI; only a stalled wait escalates', () => {
+    expect(at('drain-skip:checks-pending', { row: { actor: 'ci' } })).toMatchObject({ lane: 'system', action: 'tooling-card', smell: 'ci-job-hung' });
+    expect(at('drain-skip:checks-pending', { row: { actor: 'ci', stalled: false } })).toBeNull();
+    expect(at('drain-skip:checks-pending', { row: { actor: 'ci', liveJob: 'ci' } })).toBeNull();
+  });
+  it('every kind the drain can emit is mapped or fails closed visibly', () => {
+    for (const [s, actor] of [['drain-skip:conflicting', 'fixer'], ['drain-skip:checks-pending', 'ci']]) {
+      expect(at(s, { row: { actor } }), s).toMatchObject({ lane: 'system', action: 'tooling-card' });
+    }
+    expect(at('drain-skip:future-kind', { row: { actor: 'drain' } }).reason).toContain('unknown waiting state');
   });
 });
