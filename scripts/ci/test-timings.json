@@ -2257,6 +2257,7 @@
   "scripts/conveyor/soak/breaks/redteam-label-settles-from-check.soak.test.mjs": 2,
   "scripts/conveyor/soak/breaks/review-timing-optional-red-drops-reviewer-liveness.soak.test.mjs": 8.8,
   "scripts/conveyor/soak/breaks/added-seats-concurrent-head-binding.soak.test.mjs": 4.67,
+  "scripts/conveyor/soak/breaks/drain-numbering-preflight-before-push.soak.test.mjs": 2,
   "scripts/conveyor/soak/breaks/parked-watch-skips-draft-withdrawn.soak.test.mjs": 4.5,
   "scripts/conveyor/soak/breaks/review-timing-refused-review-strands-heal.soak.test.mjs": 8.81,
   "scripts/conveyor/soak/daemon-soak.soak.test.mjs": 450.96,
