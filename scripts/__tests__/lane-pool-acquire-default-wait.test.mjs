@@ -29,21 +29,23 @@ describe('default acquire scan startup policy', () => {
     },
   );
 
-  function probe({ now = 100, deadline = 100, lockAt = now, hit = null, limit = null } = {}) {
+  function probe({ now = 100, deadline = 100, lockAt = now, hit = null, limit = null, probeFailed = false } = {}) {
     const scan = vi.fn(() => { now = 1000; return ['/lane']; });
     const release = vi.fn();
+    const writeCache = vi.fn();
     const run = () => runInNewContext(`${cachedList}\nacquirableListCachedRaw({}, opts)`, {
       opts: { limit, scanTimeoutMs: 120_000, cacheTtlMs: 5000, scanStartDeadlineMs: deadline },
       Date: { now: () => now },
       lastListWasLockPartial: false, lastScanPartial: false,
+      laneEligibilityProbeFailed: probeFailed,
       readListCache: () => hit,
       tryTakeListLock: () => { now = lockAt; return true; },
       scanAcquirable: scan, releaseListLock: release,
-      readLockOwner: () => null, writeListCache: vi.fn(),
+      readLockOwner: () => null, writeListCache: writeCache,
       LIST_LOCK_ORPHAN_GRACE_MS: 1000,
       process: { env: {} },
     });
-    return { run, scan, release };
+    return { run, scan, release, writeCache };
   }
 
   it.each([null, 1])('refuses a new scan at the default deadline (limit %s)', (limit) => {
@@ -64,6 +66,14 @@ describe('default acquire scan startup policy', () => {
     const p = probe({ now: 99 });
     expect(p.run()).toEqual(['/lane']);
     expect(p.scan).toHaveBeenCalledWith({}, expect.objectContaining({ scanTimeoutMs: 120_000 }));
+    expect(p.release).toHaveBeenCalledOnce();
+    expect(p.writeCache).toHaveBeenCalledWith({}, ['/lane']);
+  });
+
+  it('returns proven candidates without caching a scan with failed eligibility evidence', () => {
+    const p = probe({ now: 99, probeFailed: true });
+    expect(p.run()).toEqual(['/lane']);
+    expect(p.writeCache).not.toHaveBeenCalled();
     expect(p.release).toHaveBeenCalledOnce();
   });
 
@@ -109,6 +119,15 @@ describe('acquire deadline integration with private IO', () => {
   it.each(['scanTimeout', 'lockContention'])('never grows or recovers after %s', async (scanFailure) => {
     const result = await replayAcquireDeadline({ scanFailure, recovery: true });
     expect(result.error).not.toBeNull();
+    expect(result.claimed).toBeNull();
+    expect(result.grown).toBe(0);
+    expect(result.recovered).toBe(0);
+  });
+
+  it('never grows or recovers after a completed scan with failed local eligibility evidence', async () => {
+    const result = await replayAcquireDeadline({ eligibilityFailure: true, recovery: true });
+    expect(result.error).toContain('local eligibility probe failed');
+    expect(result.scans).toBe(1);
     expect(result.claimed).toBeNull();
     expect(result.grown).toBe(0);
     expect(result.recovered).toBe(0);

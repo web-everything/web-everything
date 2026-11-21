@@ -46,6 +46,8 @@ export default {
     }
     const oldHead = pr.headRefOid;
     pr.headRefOid = 'b'.repeat(40);
+    // Model a complete check read on the pushed head before testing recovery review.
+    pr.rowsHead = pr.headRefOid;
     const stale = planReconcile({ ...options, advisoryFixCap: 0, roundCapAction: 'person' });
     if (stale.dispatch.length !== 1 || stale.dispatch[0].advisoryReview?.head !== pr.headRefOid
         || stale.dispatch[0].advisoryReview?.ciWaived !== true)
@@ -66,6 +68,7 @@ export default {
       violations.push('recovery reviews must retain the referral guard');
     pr.comments.pop();
     pr.headRefOid = oldHead;
+    pr.rowsHead = oldHead;
     // Genuine required CI failures still belong to ci-heal, even with an admitted advisory.
     pr.statusCheckRollup.filter(r => r.name === 'test').at(-1).conclusion = 'FAILURE';
     if (!planReconcile(options).dispatch.some(d => d.kind === 'ci-heal'))

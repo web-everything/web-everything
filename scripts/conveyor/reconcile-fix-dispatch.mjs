@@ -1,3 +1,4 @@
+import { deriveAgyFixAdmission } from '../lib/agy-fix-admission.mjs';
 import { renderNoPromptCommandRules, assertBriefTaskContent } from '../lib/no-prompt-command-rules.mjs';
 import { safeAdoptYield } from '../lib/daemon-rebuild/adopt-yield.mjs';
 import { admitMqFailureRoute } from './mq-failure-intake.mjs';
@@ -1298,10 +1299,20 @@ function claudeOnlyInputs(planned, { fixSettings, loadLadder, readRouted = readR
 
 /** The executor for a planned fix or ci-heal entry: the fix-dispatch daemon's `fixExecutorRoute`. */
 export function routeFixExecutor(planned, { setting, chain, fixSettings, loadLadder, launcherAvailable, readRouted,
+  loadFixItems = () => defaultLoadItems(REPO_ROOT),
   criticalFor = p => criticalWorkVerdict({ taskType: p.kind === 'ci-heal' ? 'ci-heal' : 'fix', filesTouched: p.scope ?? [] }).critical }) {
   let critical = true;
   try { critical = criticalFor(planned); } catch { /* unknown verdict fails closed */ }
-  return chooseFixExecutor({ ...claudeOnlyInputs(planned, { fixSettings, loadLadder, readRouted }), setting, chain, critical, launcherAvailable });
+  if (!chain?.value?.includes('argon'))
+    return chooseFixExecutor({ ...claudeOnlyInputs(planned, { fixSettings, loadLadder, readRouted }), setting, chain, critical, launcherAvailable });
+  let item;
+  try { item = planned.itemNum ? loadFixItems().find(i => String(i.num) === String(planned.itemNum)
+    || String(i.bornAs) === String(planned.itemNum)) : planned; } catch { item = null; }
+  const admission = item && deriveAgyFixAdmission(item, planned);
+  const available = executor => (executor !== 'antigravity' || !!admission)
+    && (typeof launcherAvailable === 'function' ? launcherAvailable(executor, { ...planned, ...admission, taskKind: admission?.kind }) : executor !== 'codex' || !!launcherAvailable);
+  const decision = chooseFixExecutor({ ...claudeOnlyInputs(planned, { fixSettings, loadLadder, readRouted }), setting, chain, critical, launcherAvailable: available });
+  return { ...decision, ...(decision.executor === 'antigravity' ? { agyAdmission: admission } : {}) };
 }
 
 /** Every Claude fix gets an explicit policy model, including send-backs without a ladder route.
@@ -1633,6 +1644,7 @@ export function dispatchFix(planned, {
           pr: planned.pr, num: planned.itemNum, sessionSlug, cwd: root,
           ref: planned.laneRef, repo: ghRepoSlug(repo), laneRepo: tokens.LANE_REPO, scope: planned.scope.join(','),
           promptFile, claimRepo: repo,
+          ...(decision.agyAdmission ? { taskKind: decision.agyAdmission.kind, size: decision.agyAdmission.size } : {}),
           mergeOnto: mergeOntoFor(planned),
           policyRoute: decision.policyRoute ?? { provider: decision.executor === 'codex' ? 'codex' : 'antigravity-claude' },
         });
