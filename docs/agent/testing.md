@@ -1,5 +1,27 @@
 # Testing — Three-Tier Strategy
 
+Main push CI can reuse a successful `ci.yml` merge-group run only for the exact SHA,
+with a trusted check-suite app, no other non-success (including older-id reruns), a proven fast-forward and the
+same recorded FUI SHA. The downloaded, unexpired sibling record must match the queue SHA, run id,
+latest `run_attempt`, `queue-reuse-record` producer and successful conclusion. Queue sibling records publish only after full CI and unquarantined
+execution receipts from every unit, integration and soak leg; missing/unknown receipts publish no record.
+Reusing pushes export and record that verified FUI SHA for their remaining sibling checkouts.
+The latest producing queue attempt's `run_started_at` must be known, non-future and within two hours;
+a later job completion or `updated_at` change never renews reuse.
+`mainPushSkip.maxAgeMs` (platform/tool policy) and `WE_CI_MAIN_PUSH_SKIP_MAX_AGE_MS`
+(environment; CI repository variable of the same name) can shorten this limit; invalid
+or larger values are rejected, retaining the lower-layer value (two hours by default).
+Effective values and sources are logged. Unknown or old evidence runs full CI.
+The hourly schedule is isolated from push concurrency and always runs full CI.
+A reused main push deliberately fails the non-required `main-execution` job: the
+drain reads the overall run conclusion and must never count reuse as fresh
+main-green. Required `test`, `smoke` and `daemon-soak` checks keep their PR/MQ behavior.
+Wait for the hourly backstop or next full run for fresh evidence.
+`scripts/ci/__tests__/main-push-green-evidence.test.mjs` probes the real exported drain
+guard with injected skipped-push evidence and a successful full-push control.
+Timing refresh accepts queue runs only with main ancestry or a matching main push SHA.
+`scripts/ci/__tests__/main-push-skip*.test.mjs` covers the decision, CLI and workflow.
+
 ## Review PR fetch isolation (R37)
 
 Review PR transport runs in a fresh temporary bare repository with empty global/system
@@ -5824,6 +5846,32 @@ refusal, and assert no checkout/reset/clean follows a failed probe. The bounded 
 reader wraps the original stderr in `ProcReadError.cause`; preserve that stderr (or the
 spawn error message) in probe diagnostics rather than reporting zero counts as proof.
 
+## Main CI schedules and timing receipts
+
+Merge admission and both same-head retry evidence paths judge main's push and scheduled
+`ci.yml` runs together. A newer scheduled failure invalidates an older push success;
+PR events are excluded even when their head branch is named `main`.
+Queue timing candidates also require `unquarantined` execution receipts from every unit,
+integration and soak matrix leg, matching the queue reuse proof. Missing or unreadable
+receipts skip the candidate; the bounded search retains the explicit `--run=<id>` fallback.
+Scoped regressions live in `red-main-freeze-shared.test.mjs`, `drain-mq-retry-main-green.test.mjs`,
+`drain-queue-safety-same-head-retry.test.mjs` and `refresh-timings.test.mjs`.
+
+## Main-green execution proof (PR #7224)
+
+Successful unit-shard jobs alone do not prove tests ran: light pushes report success via
+`Card-only unit scope receipt` while unit steps are skipped. Drain readers require successful
+unit-step evidence on every shard; missing or unknown steps use the same-SHA queue evidence
+path and its age bound. The reused-main-green age setting may only shorten the two-hour
+standard; oversized values are ignored and logged by the policy cascade. Keep production-shaped
+light fixtures and negative age tests in `main-execution-evidence.test.mjs` and
+`drain-mq-retry-main-green.test.mjs`.
+
+The tip required-check fallback also requires the completed `main-execution` marker
+(success or conditional skip). A failed or absent marker supplies no fresh push evidence.
+Hourly evidence is restricted to the live main head SHA; an unreadable head retains the hold.
+`main-red-evidence-regressions.test.mjs` covers these negative paths and attempt-start expiry.
+
 ## Async drain worker CLI fixtures
 
 The in-process merge drain harness ports `node drain-gh-async.mjs <bounds> <gh args>`
@@ -5869,6 +5917,41 @@ Keep full commit IDs consistent across listings, live reads, check runs and save
 refresh records. Resolve the diff at the listed head when a capped commits read
 or a later push intentionally makes the commits tip or live head differ.
 
+## Main push reuse: planned 24-hour acceptance check
+
+`main-push-reuse-24h` is the named post-merge acceptance report for PR #7224.
+Its scripted checker and fixture tests are tracked by
+[#x0002e6](/backlog/x0002e6-script-main-push-reuse-24h-acceptance-report/).
+The acceptance-to-test mapping gate is tracked by
+[#5668](/backlog/5668-prevention-add-a-deterministic-card-gate-requiring-each-beha/).
+The operator collects a complete 24-hour window after deployment, plus the preceding
+24-hour baseline, with UTC window boundaries and immutable run IDs/attempts for every
+`ci.yml` push, merge-group and scheduled run. Include exact head SHAs, reuse decisions
+and referenced queue run IDs, job start/completion times, execution receipts, runner
+minutes, and red-main observation timestamps. Incomplete inventories, missing hourly
+runs or missing measurements leave acceptance pending; they cannot produce a pass.
+
+The report asserts all four outcomes, and lists the run IDs behind each calculation:
+
+- Zero full main-push executions where the exact SHA had eligible queue-green evidence
+  at the push decision time (including the FUI, age, attempt and quarantine checks).
+- A full scheduled backstop execution in each of the 24 hourly slots, with completed
+  unit, integration and soak execution receipts; a skipped or cancelled run fails.
+- Red-main detection p90 at most 80 minutes, measured from each independently established
+  break reaching main to the first recorded red-main detection. Use nearest-rank p90.
+  With no observed breaks, report this metric as unmeasured and schedule an approved
+  incident drill; do not infer zero latency from an empty sample.
+- Total CI runner-minutes per day at least 30% below the baseline, including queue,
+  push and backstop work and all attempts. Report both totals, the calculation
+  `1 - post / baseline`, and merge counts to expose workload differences. A missing
+  or zero baseline leaves the comparison unmeasured.
+
+Tier 1 fixtures do not certify these production targets. The shared reused-push
+contract is in `scripts/ci/__tests__/main-red-evidence-regressions.test.mjs`;
+scheduled quarantine input is covered by
+`scripts/conveyor/__tests__/red-main-quarantine-auto.test.mjs`. Extra Actions/check
+permissions belong on the jobs that read evidence, as pinned by
+`scripts/ci/__tests__/main-push-skip-workflow.test.mjs`.
 ## Journal stale-remover scheduling
 
 The validation/unlink regression in `scripts/lib/__tests__/delivery-policy.test.mjs`
@@ -5926,6 +6009,19 @@ staging the JSON request. The applier carries that pin to `review-set-label` as 
 
 The static shadow returns per-file unknown evidence: unknown tests always join the selection, and unknown sources add every test reaching them. Ambiguity alone is not partial; only changed unreadable, oversized or deleted modules make the graph partial. Unchanged unreadable or oversized files remain unknown, widen reach, and appear in `unknownFiles`/`reasons` without setting partial. Literal paths anywhere in a source add edges. Existing full-suite classifiers and untracked/deleted non-test paths without importers escalate the shadow to full; listing failures do likewise. Symlinks and paths outside ROOT are never read. Test filesystem admission separately from parser bounds: oversized metadata must cause zero source reads, while exactly-at-cap files remain readable. Measure rows bind `head` (40 hex) and `base`, and record shadow mode, unknown count, selected/total tests and reasons; full shadow mode has no `shadowEscaped` tests. Sorted repo-relative `staticTests` preserves pure edge reach (including unknown widening) before escalation; measure rows record `staticTestCount` alongside `totalTests` and `mode`, and `shadowEscapedStatic` measures failures outside that reach even in full mode. Missing static evidence yields null counts/escapes. None of these fields changes the real decision; `staticTests` is diagnostic only.
 
+## Reused push consumers (PR #7224)
+
+An intentional CI failure needs an explicit policy in every `workflow_run` consumer.
+`main-push-reuse-deploy.test.mjs` inventories those consumers and executes deploy's
+pre-checkout reuse proof: only the main-execution marker may fail, every job must be
+complete in the first attempt, and a partial inventory refuses deployment. The existing
+same-repository push, exact-SHA ancestry and required-check gates still apply.
+
+Red-main readers remove proven reuse per run across the whole history before choosing
+the failure window. A tip's marker never excuses a different run, even on the same SHA.
+`main-red-reused-history.test.mjs` covers this through the production probe, including
+the 30-read bound, incomplete evidence and reruns. The `reused-main-push-history` soak
+scenario exercises persisted alerts and the drain freeze signal across consecutive reuse.
 ## Conflict watcher CLI contracts
 
 The conflict watcher's `runConflictWatchCli` is shared by its executable guard and PR snapshot

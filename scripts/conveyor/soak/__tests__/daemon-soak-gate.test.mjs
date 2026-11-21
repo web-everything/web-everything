@@ -32,9 +32,11 @@ function gateScript() {
   return body.join('\n');
 }
 
-function runGate({ scopeResult, run, shardResult, event = 'merge_group' }) {
+function runGate({ scopeResult, run, shardResult, event = 'merge_group', skip = 'false', changesResult = 'success' }) {
   const values = {
     'github.event_name': event,
+    'needs.changes.result': changesResult,
+    'needs.changes.outputs.skip': skip,
     'needs.daemon-soak-scope.result': scopeResult,
     'needs.daemon-soak-scope.outputs.run': run,
     'needs.soak-shard.result': shardResult,
@@ -47,6 +49,18 @@ function runGate({ scopeResult, run, shardResult, event = 'merge_group' }) {
 }
 
 describe('daemon-soak aggregator gate (ci.yml) fails closed', () => {
+  it('only a literal true verified push skips soak shards, and failed detection/scope still fails closed', () => {
+    for (const event of ['push', 'merge_group', 'schedule', 'workflow_dispatch']) {
+      for (const skip of ['true', 'false', '', 'TRUE']) {
+        expect(runGate({ event, skip, scopeResult: 'success', run: 'true', shardResult: 'skipped' }) === 0)
+          .toBe(event === 'push' && skip === 'true');
+      }
+    }
+    for (const changesResult of ['failure', 'skipped', '']) expect(runGate({ event: 'push', skip: 'true',
+      changesResult, scopeResult: 'success', run: 'true', shardResult: 'skipped' })).not.toBe(0);
+    expect(runGate({ event: 'push', skip: 'true', scopeResult: 'failure', run: 'true', shardResult: 'skipped' })).not.toBe(0);
+  });
+
   // R1068: soak shards run only in merge_group / main push / dispatch; on a pull_request the aggregator succeeds.
   it('passes on pull_request with no shards, whatever the scope says', () => {
     for (const run of ['', 'false', 'true']) {

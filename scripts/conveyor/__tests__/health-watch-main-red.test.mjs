@@ -34,17 +34,30 @@ const input = (overrides = {}) => ({
 });
 const plan = (overrides = {}) => planMainRedAlert(input(overrides));
 const kinds = (result) => result.items.map((item) => item.kind);
-const passingTip = () => ({
-  sha: TIP_SHA, runStatus: 'completed', requiredChecks: ['test'], checksTotal: 1,
-  checkRuns: [{ id: 1, name: 'test', status: 'completed', conclusion: 'success' }],
-});
+// ci.yml skips this conditional failure job when a push actually executes CI.
+const executionMarker = () => ({ id: 0, name: 'main-execution', status: 'completed', conclusion: 'skipped' });
+const passingTip = (overrides = {}) => {
+  const tip = {
+    sha: TIP_SHA, runStatus: 'completed', requiredChecks: ['test'],
+    checkRuns: [{ id: 1, name: 'test', status: 'completed', conclusion: 'success' }],
+    ...overrides,
+  };
+  // Preserve deliberately empty/unreadable check evidence. Count the marker in
+  // complete pages, while retaining explicit malformed totals for negative cases.
+  if (Array.isArray(tip.checkRuns) && tip.checkRuns.length
+    && !tip.checkRuns.some(check => check.name === 'main-execution')) {
+    tip.checkRuns = [...tip.checkRuns, executionMarker()];
+  }
+  if (!Object.hasOwn(overrides, 'checksTotal')) tip.checksTotal = tip.checkRuns?.length;
+  return tip;
+};
 
 describe('planMainRedAlert — healthy main stays quiet while tip checks are unproven', () => {
   it.each([
-    ['pending', { ...passingTip(), checkRuns: [{ name: 'test', status: 'in_progress', conclusion: null }] }],
-    ['empty', { ...passingTip(), checksTotal: 0, checkRuns: [] }],
+    ['pending', passingTip({ checkRuns: [{ name: 'test', status: 'in_progress', conclusion: null }] })],
+    ['empty', passingTip({ checksTotal: 0, checkRuns: [] })],
     ['null', null],
-    ['skipped', { ...passingTip(), checkRuns: [{ name: 'test', status: 'completed', conclusion: 'skipped' }] }],
+    ['skipped', passingTip({ checkRuns: [{ name: 'test', status: 'completed', conclusion: 'skipped' }] })],
   ])('emits no items for a %s tip without an outstanding red alert', (_name, tip) => {
     const result = plan({ runs: greenRuns(), tip });
     expect(result.items).toEqual([]);
@@ -55,11 +68,11 @@ describe('planMainRedAlert — healthy main stays quiet while tip checks are unp
 
 describe('planMainRedAlert — recovery with skipped checks', () => {
   it.each(['workflow-SHA', 'tip-required-checks'])('clears the alert with disabled optional visual skipped via %s', (via) => {
-    const tip = { ...passingTip(), requiredChecks: via === 'workflow-SHA' ? ['not-on-page'] : ['test'],
-      checksTotal: 2, checkRuns: [
+    const tip = passingTip({ requiredChecks: via === 'workflow-SHA' ? ['not-on-page'] : ['test'],
+      checksTotal: 3, checkRuns: [
       ...passingTip().checkRuns,
       { id: 2, name: 'visual', status: 'completed', conclusion: 'skipped' },
-    ] };
+    ] });
     const recovered = plan({ prev: plan().next, tip,
       runs: via === 'workflow-SHA' ? greenRuns() : redRuns() });
     expect(kinds(recovered)).toEqual(['main-green']);
@@ -69,9 +82,9 @@ describe('planMainRedAlert — recovery with skipped checks', () => {
 
   it('preserves the alert when a required check is skipped despite a successful tip workflow', () => {
     const red = plan();
-    const tip = { ...passingTip(), checkRuns: [
+    const tip = passingTip({ checkRuns: [
       { id: 1, name: 'test', status: 'completed', conclusion: 'skipped' },
-    ] };
+    ] });
     const result = plan({ prev: red.next, runs: greenRuns(), tip });
     expect(kinds(result)).toEqual(['main-status-unknown']);
     expect(result.next.fingerprint).toBe(red.next.fingerprint);
@@ -82,13 +95,12 @@ describe('planMainRedAlert — recovery requires affirmative conclusions or opti
   describe.each(['workflow-SHA', 'tip-required-checks'])('%s recovery', (via) => {
     const recoveryInput = (check) => ({
       runs: via === 'workflow-SHA' ? greenRuns() : redRuns(),
-      tip: {
-        ...passingTip(),
+      tip: passingTip({
         // Keep the workflow-SHA case independent of required-check recovery.
         requiredChecks: via === 'workflow-SHA' ? ['not-on-page'] : ['test'],
-        checksTotal: 2,
+        checksTotal: 3,
         checkRuns: [...passingTip().checkRuns, { id: 2, name: 'smoke', ...check }],
-      },
+      }),
     });
 
     it.each([
@@ -130,17 +142,16 @@ describe('planMainRedAlert — recovery requires affirmative conclusions or opti
 
     it.each([
       ['missing', undefined],
-      ['larger than the returned page', 2],
+      ['larger than the returned page', 3],
       ['smaller than the returned page', 0],
       ['a string instead of a number', '1'],
     ])('fails closed once when checksTotal is %s, preserving the outstanding alert', (_name, checksTotal) => {
       const observation = {
         runs: via === 'workflow-SHA' ? greenRuns() : redRuns(),
-        tip: {
-          ...passingTip(),
+        tip: passingTip({
           requiredChecks: via === 'workflow-SHA' ? ['not-on-page'] : ['test'],
           checksTotal,
-        },
+        }),
       };
       if (checksTotal === undefined) delete observation.tip.checksTotal;
       const state = mainRedState(observation.runs, { tip: observation.tip });
@@ -243,13 +254,14 @@ describe('runMainRedAlert — feed deduplication after publish succeeds and stat
 });
 
 describe('planMainRedAlert — proven tip recovery regressions', () => {
-  const successfulChecks = (count) => Array.from({ length: count }, (_, index) => ({
-    id: index + 1, name: `check-${index + 1}`, status: 'completed', conclusion: 'success',
-  }));
+  // Include the marker within the requested page size to keep 99/100/101 boundaries exact.
+  const successfulChecks = (count) => Array.from({ length: count }, (_, index) => index === count - 1
+    ? executionMarker()
+    : { id: index + 1, name: `check-${index + 1}`, status: 'completed', conclusion: 'success' });
 
   it.each([100, 101])('fails closed once after an alert for %i successful checks with only matching-SHA recovery proof', (count) => {
     // No required check appears in this possibly truncated page, so only the workflow SHA matches.
-    const tip = { ...passingTip(), checksTotal: count, checkRuns: successfulChecks(count) };
+    const tip = passingTip({ checksTotal: count, checkRuns: successfulChecks(count) });
     const state = mainRedState(greenRuns(), { tip });
     expect(state.status).toBe('green');
     expect(state.via).not.toBe('tip-required-checks');
@@ -271,7 +283,7 @@ describe('planMainRedAlert — proven tip recovery regressions', () => {
   });
 
   it.each([1, 99])('clears an alert for %i successful checks with matching-SHA recovery proof below the page limit', (count) => {
-    const tip = { ...passingTip(), checksTotal: count, checkRuns: successfulChecks(count) };
+    const tip = passingTip({ checksTotal: count, checkRuns: successfulChecks(count) });
     const state = mainRedState(greenRuns(), { tip });
     expect(state.status).toBe('green');
     expect(state.via).not.toBe('tip-required-checks');
@@ -283,8 +295,8 @@ describe('planMainRedAlert — proven tip recovery regressions', () => {
     expect(green.next.unknownEmitted).toBe(false);
   });
 
-  it.each([1, 99])('clears an alert via tip-required-checks with %i successful checks (a complete page)', (count) => {
-    const tip = { ...passingTip(), requiredChecks: ['check-1'], checksTotal: count, checkRuns: successfulChecks(count) };
+  it.each([2, 99])('clears an alert via tip-required-checks with %i successful checks (a complete page)', (count) => {
+    const tip = passingTip({ requiredChecks: ['check-1'], checksTotal: count, checkRuns: successfulChecks(count) });
     const state = mainRedState(redRuns(), { tip });
     expect(state.status).toBe('green');
     expect(state.via).toBe('tip-required-checks');
@@ -296,7 +308,7 @@ describe('planMainRedAlert — proven tip recovery regressions', () => {
   });
 
   it.each([100, 101])('fails closed once after an alert for %i checks even via tip-required-checks', (count) => {
-    const tip = { ...passingTip(), requiredChecks: ['check-1'], checksTotal: count, checkRuns: successfulChecks(count) };
+    const tip = passingTip({ requiredChecks: ['check-1'], checksTotal: count, checkRuns: successfulChecks(count) });
     const state = mainRedState(redRuns(), { tip });
     expect(state.status).toBe('green');
     expect(state.via).toBe('tip-required-checks');
@@ -316,8 +328,8 @@ describe('planMainRedAlert — proven tip recovery regressions', () => {
     expect.soft(repeated.next.unknownEmitted).toBe(true);
   });
 
-  it.each([1, 99])('clears an alert for %i checks below the page limit via tip-required-checks', (count) => {
-    const tip = { ...passingTip(), requiredChecks: ['check-1'], checksTotal: count, checkRuns: successfulChecks(count) };
+  it.each([2, 99])('clears an alert for %i checks below the page limit via tip-required-checks', (count) => {
+    const tip = passingTip({ requiredChecks: ['check-1'], checksTotal: count, checkRuns: successfulChecks(count) });
     const state = mainRedState(redRuns(), { tip });
     expect(state.status).toBe('green');
     expect(state.via).toBe('tip-required-checks');
@@ -333,23 +345,22 @@ describe('planMainRedAlert — proven tip recovery regressions', () => {
   });
 
   it.each([
-    ['queued required check', { ...passingTip(), runStatus: 'in_progress',
+    ['queued required check', passingTip({ runStatus: 'in_progress',
       checkRuns: [{ id: 1, name: 'test', status: 'queued', conclusion: null }],
-    }],
-    ['in-progress required check', { ...passingTip(), runStatus: 'in_progress',
+    })],
+    ['in-progress required check', passingTip({ runStatus: 'in_progress',
       checkRuns: [{ id: 1, name: 'test', status: 'in_progress', conclusion: null }],
-    }],
-    ['pending non-required check without required-check success', { ...passingTip(), checksTotal: 2, checkRuns: [
+    })],
+    ['pending non-required check without required-check success', passingTip({ checksTotal: 3, checkRuns: [
       { id: 1, name: 'test', status: 'completed', conclusion: 'neutral' },
       { id: 2, name: 'smoke', status: 'in_progress', conclusion: null },
-    ] }],
-    ['unreadable requiredChecks', { ...passingTip(), requiredChecks: null }],
-    ['missing requiredChecks', { ...passingTip(), requiredChecks: undefined }],
-    ['malformed requiredChecks', { ...passingTip(), requiredChecks: 'test' }],
-    ['historical green SHA with completed non-red tip checks', {
-      ...passingTip(), sha: 'd'.repeat(40),
+    ] })],
+    ['unreadable requiredChecks', passingTip({ requiredChecks: null })],
+    ['missing requiredChecks', passingTip({ requiredChecks: undefined })],
+    ['malformed requiredChecks', passingTip({ requiredChecks: 'test' })],
+    ['historical green SHA with completed non-red tip checks', passingTip({ sha: 'd'.repeat(40),
       checkRuns: [{ id: 1, name: 'test', status: 'completed', conclusion: 'neutral' }],
-    }],
+    })],
   ])('fails closed once after an alert for %s, then clears only on proven recovery', (_name, tip) => {
     const red = plan();
     // Historical workflow success is still reported, but the tip has not proved success.
@@ -374,10 +385,10 @@ describe('planMainRedAlert — proven tip recovery regressions', () => {
   });
 
   it('allows a matching latest green SHA with every tip check completed and non-red', () => {
-    const tip = { ...passingTip(), checksTotal: 2, checkRuns: [
+    const tip = passingTip({ checksTotal: 3, checkRuns: [
       { id: 1, name: 'test', status: 'completed', conclusion: 'neutral' },
       { id: 2, name: 'smoke', status: 'completed', conclusion: 'success' },
-    ] };
+    ] });
     const state = mainRedState(greenRuns(), { tip });
     expect(state.via).not.toBe('tip-required-checks');
     expect(state.latestGreen.sha).toBe(tip.sha);
@@ -675,15 +686,15 @@ describe('planMainRedAlert — fail closed on unknown main status', () => {
   it.each([
     ['null tip', null],
     ['unreadable tip', undefined],
-    ['unreadable tip checks', { ...passingTip(), checkRuns: null }],
-    ['missing tip checks', { ...passingTip(), checksTotal: 0, checkRuns: [] }],
-    ['red required check on the tip', { ...passingTip(),
+    ['unreadable tip checks', passingTip({ checkRuns: null })],
+    ['missing tip checks', passingTip({ checksTotal: 0, checkRuns: [] })],
+    ['red required check on the tip', passingTip({
       checkRuns: [{ id: 1, name: 'test', status: 'completed', conclusion: 'failure' }],
-    }],
-    ['red non-required check on the tip', { ...passingTip(), checksTotal: 2, checkRuns: [
+    })],
+    ['red non-required check on the tip', passingTip({ checksTotal: 3, checkRuns: [
       ...passingTip().checkRuns,
       { id: 2, name: 'smoke', status: 'completed', conclusion: 'failure' },
-    ] }],
+    ] })],
   ])('never clears an emitted red on old green runs with %s; reports unknown once', (_name, tip) => {
     const red = plan();
     const unknown = plan({ prev: red.next, runs: greenRuns(), tip, now: START + 31 * MINUTE });

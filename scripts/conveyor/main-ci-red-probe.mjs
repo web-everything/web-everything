@@ -9,6 +9,7 @@ import { getRequiredStatusChecks } from '../lib/required-status-checks.mjs';
 import { isGhDeferred } from '../lib/gh-deferred.mjs';
 import { resolveChildTimeoutMs } from '../lib/bounded-child.mjs';
 import { CONSTELLATION_REPOS } from '../lib/constellation-repos.mjs';
+import { withoutReusedMainPushes } from '../lib/main-ci-reuse-runs.mjs';
 import {
   mainCiRedSettings, mainRedState, classifyRun, hexSha, parseVitestFailures,
   classifyFlakeRun, findMergeGroupFlakeEvidence, mainCiRedSettingSource,
@@ -116,6 +117,9 @@ export function probeMainCiRuns({ exec = execFileSyncThrottled, repoSlug = DEFAU
     const deeper = list(settings.mainCiRedRunLimitMax);
     if (Array.isArray(deeper)) runs = deeper;
   }
+  // Prove reuse for the whole inventory before selecting failures, owners or logs.
+  // A tip marker says nothing about an earlier push, or another run on the same SHA.
+  runs = withoutReusedMainPushes(runs, { repo: repoSlug, exec });
   const sorted = [...runs].sort((a, b) => Date.parse(b.createdAt) - Date.parse(a.createdAt));
   const failing = { jobs: [], tests: [] };
   // One job read per run, however many passes below look at it. `null` = unreadable (stays red: never promoted on a blind read).

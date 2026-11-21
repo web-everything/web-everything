@@ -126,6 +126,21 @@ describe('planSafetyNet — pure rules', () => {
 
 describe('runSafetyNet — replay of 2026-10-10 (first red 2cb94418d)', () => {
   const at = T('2026-10-10T18:56:00Z');
+  it('a reused-push failure preserves scheduled test failure evidence for auto-quarantine', () => {
+    const reused = { ...RED, databaseId: 38077022021, createdAt: '2026-10-10T18:55:00Z' };
+    const scheduled = { ...RED, event: 'schedule' };
+    const { r, calls } = net({ mode: QUARANTINE, now: at, mainCiRuns: {
+      runs: [reused, scheduled, GREEN], failing: FAILING,
+      tip: { sha: FIRST_RED, runStatus: 'completed', requiredChecks: ['test'], checkRuns: [
+        { id: 1, name: 'test', status: 'completed', conclusion: 'success' },
+        { id: 2, name: 'main-execution', status: 'completed', conclusion: 'failure' },
+      ] },
+    } });
+    expect(r.plan).toMatchObject({ action: 'add', tests: [TEST_FILE] });
+    expect(calls.writes).toHaveLength(1);
+    const result = calls.writes[0].change({ version: 1, entries: [] });
+    expect(result.list.entries.map(entry => entry.brokenSha)).toEqual([FIRST_RED]);
+  });
   it('SHADOW (redMainMode stop): logs that it WOULD add exactly record-referral-ruling.test.mjs; writes nothing', () => {
     const { r, calls } = net({ mainCiRuns: { runs: RED_RUNS, failing: FAILING, priority: null }, now: at });
     expect(r).toMatchObject({ mode: 'stop', shadow: true, applied: false });

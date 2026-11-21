@@ -33,7 +33,11 @@ describe('FUI sibling checkout uses a GitHub App token', () => {
 
     it(`${f}: each FUI checkout is preceded by a guarded, least-privilege app-token step`, () => {
       const mints = all.filter((s) => /uses:\s*actions\/create-github-app-token@/.test(s));
-      expect(mints.length).toBe(checkouts.length);
+      const checkoutMints = checkouts.map(c => all[all.indexOf(c) - 1]);
+      const proofMints = mints.filter(m => !checkoutMints.includes(m));
+      // CI also resolves/records the sibling for queue reuse without checking out its private tree.
+      expect(proofMints).toHaveLength(f === 'ci.yml' ? 1 : 0);
+      expect(mints.length).toBe(checkouts.length + proofMints.length);
       for (const m of mints) {
         expect(m).toMatch(/id:\s*fui-app-token/);
         // The shard also skips card-only changes. Both bare and wrapped expressions must
@@ -41,9 +45,14 @@ describe('FUI sibling checkout uses a GitHub App token', () => {
         const condition = m.match(/^\s*if:\s*(.+)$/m)?.[1]
           .replace(/^\$\{\{\s*|\s*\}\}$/g, '').trim();
         expect(condition).toBeDefined();
-        expect(condition).not.toContain('||');
-        expect(condition.split('&&').map(clause => clause.trim().replace(/^\((.*)\)$/, '$1').trim()))
-          .toContain("vars.WE_APP_ID != ''");
+        if (proofMints.includes(m)) {
+          expect(condition).toBe("github.event_name == 'merge_group' || (github.event_name == 'push' && github.ref == 'refs/heads/main')");
+          expect(m).toMatch(/continue-on-error:\s*true/); // unavailable proof falls back to full CI
+        } else {
+          expect(condition).not.toContain('||');
+          expect(condition.split('&&').map(clause => clause.trim().replace(/^\((.*)\)$/, '$1').trim()))
+            .toContain("vars.WE_APP_ID != ''");
+        }
         expect(m).toMatch(/app-id:\s*\$\{\{\s*vars\.WE_APP_ID\s*\}\}/);
         expect(m).toMatch(/private-key:\s*\$\{\{\s*secrets\.WE_APP_PRIVATE_KEY\s*\}\}/);
         expect(m).toMatch(/owner:\s*frontier-ui/);

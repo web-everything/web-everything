@@ -28,6 +28,27 @@ const prEvent = (n) => ({ pull_request: { number: n, base: { ref: 'main' } } });
 
 const run = (o) => quarantineSkip({ env: {}, now: NOW, mode: Q, read: READ, changed: [], readEvent: () => o.event, flags: { event: 'pull_request', ref: `refs/pull/${o.pr}/merge`, 'event-path': '/e.json' }, ...o });
 
+it('only certifies known empty quarantine skips for queue reuse (finding 2)', () => {
+  const flags = { event: 'merge_group', ref: 'refs/heads/gh-readonly-queue/main/pr-4990-abc123' };
+  expect(run({ flags }).reuseSafe).toBe(false);
+  expect(run({ flags, changed: [TEST_FILE] }).reuseSafe).toBe(true);
+  expect(run({ flags, changed: null }).reuseSafe).toBe(false);
+  expect(run({ flags, read: { ok: false } }).reuseSafe).toBe(false);
+  expect(run({ flags, mode: { value: 'stop' } }).reuseSafe).toBe(true);
+  expect(run({ flags, mode: { value: 'stop' }, read: { ok: false } }).reuseSafe).toBe(false);
+});
+
+it('writes a receipt only for proven unquarantined execution; unknown and skipped remain unusable (finding 2)', async () => {
+  const { recordQuarantineReuse } = await import('../quarantine-skip.mjs');
+  const root = mkdtempSync(join(tmpdir(), 'quarantine-reuse-'));
+  try {
+    for (const out of [{ reuseSafe: true, line: '' }, { reuseSafe: false, line: '--exclude=a.test.mjs' }, { line: '' }]) {
+      recordQuarantineReuse(out, { GITHUB_EVENT_NAME: 'merge_group', RUNNER_TEMP: root });
+      expect(readFileSync(join(root, 'quarantine-reuse'), 'utf8')).toBe(out.reuseSafe === true ? 'unquarantined\n' : 'unknown-or-quarantined\n');
+    }
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
 it.each(['named', 'untagged-named', 'changed', 'main', 'fix', 'multiple-named', 'file', 'multiple-files', 'untagged-file', 'wrong-job', 'expired'])('soak excludes only active job-matched file entries: %s', (scenario) => {
   const file = 'scripts/conveyor/soak/daemon-soak.soak.test.mjs', job = 'soak-shard (1)';
   const whole = ['file', 'multiple-files', 'untagged-file', 'wrong-job', 'expired'].includes(scenario);

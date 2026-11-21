@@ -7,7 +7,8 @@ const jobs = yaml.load(readFileSync(new URL('../../../.github/workflows/ci.yml',
 it('the default fast checks exist and standards can finish independently of the aggregate CI gate', () => {
   // Only WE's ci.yml publishes these names; every other repo waits on its own required checks.
   expect(REVIEW_TIMING_DEFAULTS.fastChecks).toEqual({ we: ['standards', 'test-shard (1)'] });
-  expect(jobs.standards.needs).toBeUndefined();
+  // The sibling pin comes from changes; shards and aggregate checks remain independent.
+  expect(jobs.standards.needs).toBe('changes');
   expect(jobs.standards.steps.some(s => s.run === 'npm run check:standards')).toBe(true);
   expect(jobs['test-shard'].strategy.matrix.shard).toContain(1);
 });

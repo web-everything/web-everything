@@ -3,6 +3,7 @@ import { readFileSync, writeFileSync, mkdirSync, mkdtempSync, rmSync } from 'nod
 import { resolve, join, dirname } from 'node:path';
 import { tmpdir } from 'node:os';
 import { execFileSync } from 'node:child_process';
+import yaml from 'js-yaml';
 import { classifyCardOnly, isCardPath, isCardOnlyDiff, isDocsPath, classifyLight, resolveCardOnlyBase, SAFE_BASE_REF } from '../ci-card-only.mjs';
 import { REVIEW_HOLD_LABELS } from '../lib/review-escalation.mjs';
 
@@ -216,12 +217,12 @@ describe('fresh main basis (#5619: frozen event base.sha after the drain merged 
   });
   it('ci.yml passes event values through env, quoted, and only a fresh fetch yields FRESH_MAIN_SHA', () => {
     const yml = readFileSync(resolve(import.meta.dirname, '../../.github/workflows/ci.yml'), 'utf8');
-    const step = yml.slice(yml.indexOf('- name: Is this a card-only PR?'), yml.indexOf('# Sharded unit suite'));
-    expect(step).toContain('BASE_REF: ${{ github.event.pull_request.base.ref }}');
-    expect(step).toContain('BASE_SHA: ${{ github.event.pull_request.base.sha }}');
-    expect(step.slice(step.indexOf('run: |'))).not.toContain('${{'); // no expression interpolated into the script
-    expect(step).toContain('if sh scripts/ci/fetch-main-history.sh; then');
-    expect(step).toContain('--base-ref="$BASE_REF" --fresh-main-sha="$FRESH_MAIN_SHA"');
+    const step = yaml.safeLoad(yml).jobs.changes.steps.find(step => step.id === 'detect');
+    expect(step.env.BASE_REF).toBe('${{ github.event.pull_request.base.ref }}');
+    expect(step.env.BASE_SHA).toBe('${{ github.event.pull_request.base.sha }}');
+    expect(step.run).not.toContain('${{'); // no expression interpolated into the script
+    expect(step.run).toContain('if sh scripts/ci/fetch-main-history.sh; then');
+    expect(step.run).toContain('--base-ref="$BASE_REF" --fresh-main-sha="$FRESH_MAIN_SHA"');
   });
 });
 
@@ -334,10 +335,9 @@ describe('merge_group card-only light path', () => {
 
   it('workflow passes merge_group.base_sha via env and uses it as the detector base', () => {
     const yml = readFileSync(resolve(import.meta.dirname, '../../.github/workflows/ci.yml'), 'utf8');
-    const step = yml.slice(yml.indexOf('- name: Is this a card-only PR?'), yml.indexOf('# Sharded unit suite'));
-    expect.soft(step).toContain('MG_BASE_SHA: ${{ github.event.merge_group.base_sha }}');
-    const script = step.slice(step.indexOf('run: |') + 'run: |'.length).trimEnd()
-      .split('\n').slice(1).map(line => line.replace(/^          /, '')).join('\n');
+    const step = yaml.safeLoad(yml).jobs.changes.steps.find(step => step.id === 'detect');
+    expect.soft(step.env.MG_BASE_SHA).toBe('${{ github.event.merge_group.base_sha }}');
+    const script = step.run;
     const cwd = mkdtempSync(join(tmpdir(), 'ci-group-workflow-'));
     try {
       writeFileSync(join(cwd, 'node'), '#!/bin/sh\nprintf "%s\n" "$@" > "$CAPTURE"\n', { mode: 0o755 });

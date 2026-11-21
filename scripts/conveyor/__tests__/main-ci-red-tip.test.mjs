@@ -29,8 +29,8 @@ const completions = [
 function replay(time = '19:24:34') {
   const snapshot = runsAsOf(runs, at(time));
   return { runs: snapshot, tip: { sha: TIP_SHA, runStatus: snapshot.find((r) => r.headSha === TIP_SHA).status,
-    requiredChecks, redCheckRuns, checkRuns: completions.map(([name, done], id) => at(done) <= at(time)
-      ? check(name, 'success', id) : { name, id, status: 'in_progress', conclusion: null }) } };
+    requiredChecks, redCheckRuns, checkRuns: [check('main-execution', 'skipped'), ...completions.map(([name, done], id) => at(done) <= at(time)
+      ? check(name, 'success', id) : { name, id, status: 'in_progress', conclusion: null })] } };
 }
 
 describe('main CI truth follows the tip (2026-10-11 incident)', () => {
@@ -76,7 +76,7 @@ describe('main CI truth follows the tip (2026-10-11 incident)', () => {
   });
   it('uses the highest check id for a same-sha rerun, regardless of list order', () => {
     const tip = { sha: RED_SHA, runStatus: 'completed', requiredChecks, checkRuns: [
-      check('test', 'success', 2), check('test', 'failure', 1),
+      check('main-execution', 'skipped'), check('test', 'success', 2), check('test', 'failure', 1),
       check('test-shard (3)', 'failure', 1), check('test-shard (3)', 'success', 2),
     ] };
     expect(mainRedState(replay().runs, { tip })).toMatchObject({ status: 'green', via: 'tip-required-checks' });
