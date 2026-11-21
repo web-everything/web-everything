@@ -1,4 +1,5 @@
 ---
+bornAs: x48yat4
 kind: story
 size: 5
 status: open
