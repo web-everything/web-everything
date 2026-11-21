@@ -163,6 +163,9 @@ describe('canonical main merge carry with real git objects', () => {
     f.waivers.push({ ...f.waiver, sha: intermediate, findings: ['first finding'] });
     expect(f.run()).toMatchObject({ ok: false, reason: 'canonical-audit-weakened' });
     f.waivers.push({ ...f.waiver, sha: intermediate, findings: ['second finding'] });
+    // ref+sha+ruling is the waiver identity: reusing R123 cannot add separate findings.
+    expect(f.run()).toMatchObject({ ok: false, reason: 'canonical-audit-weakened' });
+    f.waivers.at(-1).ruling = 'R124';
     expect(f.run()).toMatchObject({ ok: true, carried: { from: f.A } });
   });
   it('preserves the newer unwaived sibling WEAKENED veto despite identical findings and fingerprint', () => {
