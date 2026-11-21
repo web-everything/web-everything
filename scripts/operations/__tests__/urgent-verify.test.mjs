@@ -265,10 +265,10 @@ describe('CI gate mirroring fails closed', () => {
     step.with.script = step.with.script.replace('longest >= 1050', 'longest >= 99999');
     expect(() => ciGatePlan(yaml.safeDump(changed))).toThrow('update the urgent verification mirror');
   });
-  it('pins the four-worker rollout default and refuses a drift back to two', () => {
-    expect(real.jobs['test-shard'].env.WE_VITEST_MAX_WORKERS).toBe("${{ vars.WE_VITEST_MAX_WORKERS || '4' }}");
+  it('pins the two-worker default and refuses a drift up to four', () => {
+    expect(real.jobs['test-shard'].env.WE_VITEST_MAX_WORKERS).toBe("${{ vars.WE_VITEST_MAX_WORKERS || '2' }}");
     const changed = yaml.safeLoad(workflow);
-    changed.jobs['test-shard'].env.WE_VITEST_MAX_WORKERS = "${{ vars.WE_VITEST_MAX_WORKERS || '2' }}";
+    changed.jobs['test-shard'].env.WE_VITEST_MAX_WORKERS = "${{ vars.WE_VITEST_MAX_WORKERS || '4' }}";
     expect(() => ciGatePlan(yaml.safeDump(changed))).toThrow('test-shard execution context; update the urgent verification mirror');
   });
   it.each([undefined, false])('refuses to make the timing diagnostic blocking (%j)', value => {

@@ -2186,6 +2186,7 @@
   "scripts/conveyor/soak/breaks/postmortem-poison-merge.soak.test.mjs": 0.01,
   "scripts/conveyor/soak/breaks/pr-scoped-gate-red-never-healed.soak.test.mjs": 0.64,
   "scripts/conveyor/soak/breaks/prepare-pr-limit-stale-branch-park.soak.test.mjs": 0.12,
+  "scripts/conveyor/soak/breaks/prepare-repeat-refusal-readmitted-after-30min.soak.test.mjs": 0.5,
   "scripts/conveyor/soak/breaks/prevention-card-lands-in-daemon-clone.soak.test.mjs": 8.8,
   "scripts/conveyor/soak/breaks/promote-draft-blocked-by-stale-clone-and-silent.soak.test.mjs": 0.87,
   "scripts/conveyor/soak/breaks/promote-draft-cross-repo.soak.test.mjs": 0.41,
@@ -2413,6 +2414,7 @@
   "scripts/conveyor/soak/breaks/timings-advisory-merge.soak.test.mjs": 2,
   "scripts/conveyor/soak/breaks/superseded-omits-retired-merged-overlay.soak.test.mjs": 2,
   "scripts/conveyor/soak/breaks/smoke-queue-force-priority.soak.test.mjs": 1,
+  "scripts/conveyor/soak/breaks/capacity-routing-ignores-expiring-quota.soak.test.mjs": 0.1,
   "scripts/conveyor/soak/breaks/daemon-git-developer-dir.soak.test.mjs": 1,
   "scripts/conveyor/soak/breaks/watchdog-pr-list-transient-retry.soak.test.mjs": 3,
   "scripts/conveyor/soak/breaks/mq-unreadable-log-single-retry.soak.test.mjs": 1
