@@ -44,7 +44,8 @@ export default {
     const unreadable = { author, createdAt: '2026-11-20T10:00:00Z', body: `${ADVISORY_NOTE_MARKER}\n\nno basis` };
     const { buildFixEndComment } = await import(pathToFileURL(join(sourceRoot, 'scripts/conveyor/fix-procedure.mjs')).href);
     const { buildReviewedShaMarker } = await import(pathToFileURL(join(sourceRoot, 'scripts/lib/review-escalation.mjs')).href);
-    const released = [{ ...unreadable, body: `${unreadable.body}\n${buildReviewedShaMarker(OLD)}` },
+    // Keep a structured old-head basis but no readable verdict; advisory text cannot supply a reviewed-sha stamp.
+    const released = [{ ...advisory(OLD), body: advisory(OLD).body.replace('**Verdict:** accept', '**Verdict unavailable**') },
       { author, createdAt: '2026-11-20T11:00:00Z', body: buildFixEndComment({ who: 'fix-session', headSha: HEAD }) }];
     for (const setting of ['on', 'off', undefined]) {
       const options = { advisoryReviewOnHumanHandoff: setting };

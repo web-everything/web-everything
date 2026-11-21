@@ -2,6 +2,8 @@ import { describe, expect, it } from 'vitest';
 import { advisoryHeadMoveState, planReconcile } from '../reconcile-core.mjs';
 import { ADVISORY_NOTE_MARKER } from '../advisory-round-count.mjs';
 import { buildFixEndComment } from '../fix-procedure.mjs';
+import { reviewedHeadsOf } from '../mechanical-round-cap.mjs';
+import { latestAdvisory } from '../../lib/advisory-labels.mjs';
 
 import { buildReviewedShaMarker, buildClearedHumanMarker } from '../../lib/review-escalation.mjs';
 
@@ -41,9 +43,12 @@ describe('review:human advisory re-run on a moved head', () => {
     expect(result.refusals).toEqual([]);
   });
   it.each(['on', 'off', undefined])('unreadable history skips fix-pushed review only with reruns enabled (setting %s)', setting => {
-    // The advisory lacks its Net basis, but its reviewed-sha still lets the release path identify the old head.
-    // A completely headless note would make latestHeadReview null and never exercise the added guard.
-    const comments = [{ ...unreadable(), body: `${unreadable().body}\n${buildReviewedShaMarker(OLD)}` },
+    // A missing verdict makes the advisory unreadable, but its structured basis still identifies the old head.
+    // reviewed-sha stamps inside advisory text are intentionally ignored, so cannot exercise this guard.
+    const headed = { ...advisory(), body: advisory().body.replace('**Verdict:** accept', '**Verdict unavailable**') };
+    expect(latestAdvisory([headed])).toBeUndefined();
+    expect(reviewedHeadsOf(headed)).toEqual([OLD]);
+    const comments = [headed,
       { author, createdAt: '2026-11-20T11:00:00Z', body: buildFixEndComment({ who: 'fix-session', headSha: HEAD }) }];
     expect(advisoryHeadMoveState(pr({ comments }))).toEqual({ owed: false, unreadable: true });
     const result = run({ comments }, { advisoryReviewOnHumanHandoff: setting });
@@ -54,6 +59,21 @@ describe('review:human advisory re-run on a moved head', () => {
       expect(result.dispatch.map(({ kind, headRefOid, advisoryReview }) => ({ kind, headRefOid,
         advisoryReview: { head: advisoryReview?.head, reason: advisoryReview?.reason } })))
         .toEqual([{ kind: 'review', headRefOid: HEAD, advisoryReview: { head: HEAD, reason: 'fix-pushed' } }]);
+      expect(result.refusals).toEqual([]);
+    }
+  });
+  it.each(['on', 'off', undefined])('an embedded reviewed-sha cannot authorize fix-pushed review (setting %s)', setting => {
+    const headless = { ...unreadable(), body: `${unreadable().body}\n${buildReviewedShaMarker(OLD)}` };
+    expect(reviewedHeadsOf(headless)).toEqual([]);
+    const comments = [headless,
+      { author, createdAt: '2026-11-20T11:00:00Z', body: buildFixEndComment({ who: 'fix-session', headSha: HEAD }) }];
+    const result = run({ comments }, { advisoryReviewOnHumanHandoff: setting });
+    if (setting === 'on') {
+      expect(result.dispatch).toEqual([]);
+      expect(result.refusals.map(r => r.kind)).toEqual(['advisory-unreadable']);
+    } else {
+      expect(result.dispatch.map(({ kind, headRefOid, advisoryReview }) => ({ kind, headRefOid, advisoryReview })))
+        .toEqual([{ kind: 'review', headRefOid: HEAD, advisoryReview: undefined }]);
       expect(result.refusals).toEqual([]);
     }
   });
