@@ -96,6 +96,7 @@ import { RESOURCE_STATUS_OP } from '../resource-status.mjs';
 import { WORKER_CAPACITY_OP } from '../worker-capacity.mjs';
 import { PRE_PR_CHECK_OP } from '../pre-pr-check.mjs';
 import { FREE_SCOPE_OP } from '../free-scope.mjs';
+import { CHECK_SCOPE_OP } from '../check-scope-operation.mjs';
 import { MAINTENANCE_OP } from '../maintenance.mjs';
 import { REVIEW_SEAT_CAPS_OP } from '../review-seat-caps.mjs';
 import { LIVE_STATE_OP } from '../live-state.mjs';
@@ -512,8 +513,9 @@ describe('#3036 read-only is a property of the DECLARING MODULE — the part tha
     // Both declare ledger-writing effects inline in run.mjs; neither is read-only.
     'urgent-verify': 'run.mjs',
     'urgent-sweep': 'run.mjs',
-    // S0 check-scope: reads PR/registry evidence only (no ledger); declared inline in run.mjs.
-    'check-scope': 'run.mjs',
+    // S0 check-scope — READ-ONLY and genuinely so: both steps are `compute`, the declaring module imports only
+    // `registry.mjs` and `step-kinds.mjs`, and every gh/registry/git read lives in `check-scope.mjs` behind the injected reader.
+    'check-scope': 'check-scope-operation.mjs',
     // Card 359 — READ-ONLY: snapshot reads are injected from operator-session-bootstrap-io.mjs.
     'operator-session-bootstrap': 'operator-session-bootstrap.mjs',
     // Card xvz55jf (epic #3931) — READ-ONLY and genuinely so: both steps are `compute`, the declaring module's
@@ -639,7 +641,7 @@ describe('#3036 read-only is a property of the DECLARING MODULE — the part tha
   it('every operation registered as read-only declares in a module that reaches nothing that can act', () => {
     const readOnly = Object.keys(OPERATIONS).filter((name) => isReadOnlyOperation(resolveOperation(name).declaration));
     // Pinned, not derived: adding a read-only operation must be a deliberate edit here.
-    expect(readOnly.sort()).toEqual(['capacity-calendar', 'why', 'health-respond', 'operator-session-bootstrap', 'operator-override-show', ADOPTION_MATRIX_OP, JUDGE_SWEEP_FACTS_OP, PR_TRACE_OP, AGENT_ACTIVITY_OP, AI_ROUTING_OP, BRIEF_MODE_OP, DAEMON_STATUS_OP, DISPATCH_ELIGIBILITY_OP, GATE_HEALTH_OP, GRADUATION_PROGRESS_REPORT_OP, FREE_SCOPE_OP, HEAVY_QUEUE_OP, HOST_CAPACITY_OP, DELIVERY_CAPACITY_OP, ITEM_ACTIVITY_OP, LAND_ADVANCE_OP, LIVE_STATE_OP, LIVE_WORK_OP, PR_OWNERSHIP_OP, PR_SWEEP_OP, PR_STATUS_OP, PR_RECONCILE_OP, PRE_PR_CHECK_OP, RESOURCE_STATUS_OP, WORKER_CAPACITY_OP, REVIEW_SEAT_CAPS_OP, ROUTE_PR_OUTCOME_OP, RUNNER_ACTIVITY_OP, SESSIONS_OP, STALE_STATE_OP, SUGGEST_NEXT_OP, TELEMETRY_SUMMARY_OP, VERIFY_OP, PR_SIZE_OP, DELIVERY_FLOW_OP].sort());
+    expect(readOnly.sort()).toEqual(['capacity-calendar', 'why', 'health-respond', 'operator-session-bootstrap', 'operator-override-show', ADOPTION_MATRIX_OP, JUDGE_SWEEP_FACTS_OP, PR_TRACE_OP, AGENT_ACTIVITY_OP, AI_ROUTING_OP, BRIEF_MODE_OP, DAEMON_STATUS_OP, DISPATCH_ELIGIBILITY_OP, GATE_HEALTH_OP, GRADUATION_PROGRESS_REPORT_OP, FREE_SCOPE_OP, CHECK_SCOPE_OP, HEAVY_QUEUE_OP, HOST_CAPACITY_OP, DELIVERY_CAPACITY_OP, ITEM_ACTIVITY_OP, LAND_ADVANCE_OP, LIVE_STATE_OP, LIVE_WORK_OP, PR_OWNERSHIP_OP, PR_SWEEP_OP, PR_STATUS_OP, PR_RECONCILE_OP, PRE_PR_CHECK_OP, RESOURCE_STATUS_OP, WORKER_CAPACITY_OP, REVIEW_SEAT_CAPS_OP, ROUTE_PR_OUTCOME_OP, RUNNER_ACTIVITY_OP, SESSIONS_OP, STALE_STATE_OP, SUGGEST_NEXT_OP, TELEMETRY_SUMMARY_OP, VERIFY_OP, PR_SIZE_OP, DELIVERY_FLOW_OP].sort());
     for (const name of readOnly) {
       const { external } = importGraph(resolvePath(OPS_DIR, DECLARING_MODULE[name]));
       expect(external, `\`${name}\` declares in ${DECLARING_MODULE[name]}, which must import nothing that can act`)

@@ -121,6 +121,7 @@ import { prototypeLoadOperation, PROTOTYPE_LOAD_OP, PROTOTYPE_LOAD_EFFECT } from
 import { createPrototypeLoader, defaultDeps as prototypeLoadDeps } from './prototype-load-io.mjs';
 import { collectFreeScope } from './free-scope-io.mjs';
 import { checkScope } from './check-scope.mjs';
+import { checkScopeOperation, CHECK_SCOPE_OP } from './check-scope-operation.mjs';
 import { reviewSeatCapsOperation, REVIEW_SEAT_CAPS_OP } from './review-seat-caps.mjs';
 import { readSeatCapUsage } from './review-extra-seats.mjs';
 import { liveStateOperation, LIVE_STATE_OP } from './live-state.mjs';
@@ -631,13 +632,11 @@ export const OPERATIONS = Object.freeze({
     sinks: {},
   }),
   // check-scope (S0 R1055, warn-only): which open PRs / agent claims share these files? 0 clear, 1 overlap, 2 unknown (fail closed).
-  'check-scope': () => ({
-    declaration: op('check-scope', {
-      input: { files: { type: 'string' } }, verdictFrom: 'assess',
-      verify: effect({ reads: ['input.files'], effects: ({ input }) => [{ type: 'check-scope.run', payload: input, idempotent: true }] }),
-      assess: compute({ reads: ['findings.verify'], fn: ({ findings }) => findings.verify?.effects?.[0]?.result ?? { ok: false, overlaps: [], reason: 'scope check did not run' } }),
-    }),
-    sinks: { 'check-scope.run': input => checkScope({ declaredFiles: String(input.files || '') }) },
+  // Evidence is read by a `compute` step and nothing is stored as an applied effect, so every invocation re-reads
+  // current PRs and claims; a saved verdict can never stand in for a fresh read.
+  [CHECK_SCOPE_OP]: () => ({
+    declaration: checkScopeOperation({ check: checkScope }),
+    sinks: {},
     finish: ({ run, lines }) => {
       const v = run?.verdict;
       if (!v) return { code: 2, lines: ['unknown: scope check did not run'] };

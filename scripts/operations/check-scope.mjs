@@ -1,44 +1,84 @@
-/** Shared, non-throwing admission over the existing free-scope snapshot and assessor. */
+/** Shared, non-throwing admission over the existing free-scope snapshot and assessor. Every unknown input fails closed. */
 import { posix } from 'node:path';
-import { assessFreeScope, qualifyFile, partitionRegistry } from './free-scope.mjs';
+import { alias, assessFreeScope, qualifyFile, partitionRegistry, DEFAULT_TTL_HOURS } from './free-scope.mjs';
 import { collectFreeScope } from './free-scope-io.mjs';
-import { isProseScopeFile } from '../lib/prose-scope-globs.mjs';
+import { CONSTELLATION_REPOS, repoKeyForSlug } from '../lib/constellation-repos.mjs';
 
-/** Collapse `a/../b` segments so a dotted path cannot dodge a claim; a path escaping the repo refuses (fail closed). */
-export function normalizeQualified(qualified) {
-  if (!qualified) return qualified;
+/** The latest instant a `Date` can hold; an expiry past it cannot be rendered by the assessor. */
+const MAX_TIME_MS = 8.64e15;
+const CONTROL = /[\u0000-\u001f\u007f]/;
+
+/**
+ * One scope entry in the assessor's canonical form `<repo key>:<normalized path>`. Refuses (throws) a blank or empty
+ * entry, an unknown repo, a comma or control character, and a path escaping the repo. A repo root stays `we:` (never
+ * `we:.`): the assessor matches the empty path as covering every descendant.
+ */
+export function canonicalScope(raw) {
+  if (typeof raw !== 'string') throw new TypeError('scope entry must be a string');
+  const qualified = qualifyFile(raw);
+  if (!qualified) throw new Error(`empty scope entry: ${JSON.stringify(raw)}`);
   const colon = qualified.indexOf(':');
-  const path = posix.normalize(qualified.slice(colon + 1));
-  if (path === '..' || path.startsWith('../') || path.startsWith('/')) throw new Error(`scope path escapes the repo: ${qualified}`);
-  // The repo root stays `we:` (not `we:.`): the assessor matches the empty path as covering every descendant.
-  return `${qualified.slice(0, colon + 1)}${path === '.' ? '' : path}`;
+  const name = qualified.slice(0, colon);
+  const key = repoKeyForSlug(alias(name));
+  if (!key || !Object.hasOwn(CONSTELLATION_REPOS, key)) throw new Error(`scope names an unknown repository "${name}": ${raw}`);
+  const rest = qualified.slice(colon + 1);
+  if (CONTROL.test(rest) || rest.includes(',')) throw new Error(`scope path holds a comma or control character: ${JSON.stringify(raw)}`);
+  const path = posix.normalize(rest || '.');
+  if (path === '..' || path.startsWith('../') || path.startsWith('/')) throw new Error(`scope path escapes the repo: ${raw}`);
+  return `${key}:${path === '.' ? '' : path}`;
+}
+/** Kept for callers of the earlier name; `canonicalScope` is the one implementation. */
+export const normalizeQualified = canonicalScope;
+
+const positive = value => typeof value === 'number' && Number.isFinite(value) && value > 0;
+const inRange = ms => Number.isFinite(ms) && Math.abs(ms) <= MAX_TIME_MS;
+
+/** A persisted claim must be well formed AND have an expiry the partitioner can compute; anything else is corrupt. */
+function validateEntry(entry) {
+  const startedMs = Date.parse(entry?.startedAt);
+  if (!entry || typeof entry !== 'object' || typeof entry.agent !== 'string' || !entry.agent.trim()
+    || !Array.isArray(entry.files) || !entry.files.length || entry.files.some(f => typeof f !== 'string' || !f.trim())
+    || !Number.isFinite(startedMs)
+    || (entry.owner !== undefined && typeof entry.owner !== 'string')
+    || (entry.ttlHours !== undefined && !positive(entry.ttlHours))
+    || (entry.staleAfterMinutes !== undefined && !positive(entry.staleAfterMinutes))
+    || (entry.lastSeenAt !== undefined && !Number.isFinite(Date.parse(entry.lastSeenAt)))) {
+    throw new Error('corrupt scope registry entry');
+  }
+  // Overflow (`ttlHours: 1e308`) would make the partitioner read a live claim as stale: refuse, never ignore.
+  if (!inRange(startedMs + (entry.ttlHours ?? DEFAULT_TTL_HOURS) * 3600e3)) throw new Error('corrupt scope registry entry: expiry out of range');
+  if (entry.staleAfterMinutes !== undefined) {
+    const seen = Number.isFinite(Date.parse(entry.lastSeenAt)) ? Date.parse(entry.lastSeenAt) : startedMs;
+    if (!inRange(seen + entry.staleAfterMinutes * 60e3)) throw new Error('corrupt scope registry entry: heartbeat out of range');
+  }
 }
 
 export function checkScope({ declaredFiles, excludeAgent, excludeOwner, collect = collectFreeScope, now = Date.now } = {}) {
   try {
-    const files = [...new Set((Array.isArray(declaredFiles) ? declaredFiles : declaredFiles.split(','))
-      .map(file => normalizeQualified(qualifyFile(file))).filter(file => file && !isProseScopeFile(file)))];
-    if (!files.length) return { ok: true, overlaps: [] };
+    const declared = Array.isArray(declaredFiles) ? declaredFiles : typeof declaredFiles === 'string' ? declaredFiles.split(',') : null;
+    if (!declared) throw new TypeError('no scope declared');
+    const files = [...new Set(declared.map(canonicalScope))];
+    if (!files.length) throw new Error('no scope declared');
+    // The inherited exclusion matches by name alone when no owner is given, which could hide another owner's claim.
+    const excluding = excludeAgent !== undefined && excludeAgent !== null && excludeAgent !== '';
+    if (excluding && (typeof excludeAgent !== 'string' || !excludeAgent.trim() || typeof excludeOwner !== 'string' || !excludeOwner.trim())) {
+      throw new Error('excludeAgent needs a non-empty excludeOwner');
+    }
     const nowMs = typeof now === 'function' ? now() : now;
-    const snapshot = collect({ files: files.join(','), now: () => nowMs });
-    if (!Array.isArray(snapshot.prs) || !Array.isArray(snapshot.agents) || !Array.isArray(snapshot.unreadable)) {
+    if (!Number.isFinite(nowMs)) throw new Error('invalid clock reading');
+    // Read exactly the repositories the scope names: PRs in another repo cannot hold these files, and a repo left unread cannot clear them.
+    const repos = [...new Set(files.map(file => CONSTELLATION_REPOS[file.slice(0, file.indexOf(':'))].slug))];
+    const snapshot = collect({ files: files.join(','), repos, requireRegistry: true, now: () => nowMs });
+    if (!snapshot || !Array.isArray(snapshot.prs) || !Array.isArray(snapshot.agents) || !Array.isArray(snapshot.unreadable)
+      || !Array.isArray(snapshot.repos) || repos.some(repo => !snapshot.repos.includes(repo))) {
       throw new Error('incomplete scope snapshot');
     }
-    for (const entry of snapshot.agents) {
-      if (!entry || typeof entry.agent !== 'string' || !entry.agent.trim() || !Array.isArray(entry.files)
-        || !entry.files.length || entry.files.some(f => typeof f !== 'string' || !f.trim())
-        || !Number.isFinite(Date.parse(entry.startedAt))
-        || (entry.ttlHours !== undefined && !(Number.isFinite(entry.ttlHours) && entry.ttlHours > 0))
-        || (entry.staleAfterMinutes !== undefined && !(Number.isFinite(entry.staleAfterMinutes) && entry.staleAfterMinutes > 0))
-        || (entry.lastSeenAt !== undefined && !Number.isFinite(Date.parse(entry.lastSeenAt)))) {
-        throw new Error('corrupt scope registry entry');
-      }
-    }
     if (snapshot.status === 'unknown') throw new Error('unknown scope snapshot');
-    // Registry claims written by older tools may hold dotted paths; normalize them the same way (escape = refuse).
-    snapshot.agents = snapshot.agents.map(entry => ({ ...entry, files: entry.files.map(f => normalizeQualified(qualifyFile(f))) }));
-    const verdict = assessFreeScope({ ...snapshot, files, nowMs, excludeAgent, excludeOwner });
-    const { live } = partitionRegistry(snapshot.agents, nowMs);
+    // Validate each persisted claim, then canonicalize its files the same way (an empty or escaping claim = refuse).
+    const agents = snapshot.agents.map(entry => { validateEntry(entry); return { ...entry, files: entry.files.map(canonicalScope) }; });
+    const verdict = assessFreeScope({ files, prs: snapshot.prs, agents, unreadable: snapshot.unreadable, nowMs,
+      ...(excluding ? { excludeAgent, excludeOwner } : {}) });
+    const { live } = partitionRegistry(agents, nowMs);
     const overlaps = verdict.files.filter(row => row.state === 'occupied').flatMap(row => row.holders.map(holder => {
       if (holder.type === 'pr') return { file: row.file, pr: { number: holder.number, repo: holder.repo } };
       const entry = live.find(e => e.agent === holder.agent);
