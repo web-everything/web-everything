@@ -7,7 +7,7 @@ import { coordinationPaths, resolveCoordinationRoot } from './coordination-root.
 import { tryLease } from './coordination-lock.mjs';
 import { CoordinationUnavailableError, parseResource, assertActionRecord, transitionRecord, milliseconds, withResult, isExpired, LEASE_MS, reconcile as inspect } from './action-record.mjs';
 export { CoordinationUnavailableError } from './action-record.mjs';
-export function createActionStore({ root = resolveCoordinationRoot(), fs = nativeFs, now = Date.now, leaseMs = LEASE_MS, absenceGraceMs, maxObservedAgeMs = 24 * 60 * 60_000, isPidAlive, wait, onEvent = (e) => process.stderr.write(`action-store: ${JSON.stringify(e)}\n`) } = {}) {
+export function createActionStore({ root = resolveCoordinationRoot(), fs = nativeFs, now = Date.now, leaseMs = LEASE_MS, absenceGraceMs, maxObservedAgeMs = 24 * 60 * 60_000, isPidAlive, wait } = {}) {
   const dir = coordinationPaths(root).actions;
   const io = (path, fn) => { try { return fn(); } catch (e) { throw e instanceof CoordinationUnavailableError ? e : new CoordinationUnavailableError(path, e); } };
   const resourceDir = (r) => join(dir, encodeURIComponent(parseResource(r).resource));
@@ -31,18 +31,21 @@ export function createActionStore({ root = resolveCoordinationRoot(), fs = nativ
     if (records.some((r, i) => r.attempt !== i + 1 || (i < records.length - 1 && r.state !== 'terminal'))) throw new Error('Inconsistent action attempt history');
     return records;
   });
-  // A stale directory whose key no longer canonicalizes (e.g. an old repo slug) belongs to no live resource:
-  // skip it with an event instead of blocking every other resource. Corrupt attempts in a CANONICAL directory still fail closed.
   const list = () => ensure().flatMap((name) => {
     return io(join(dir, name), () => {
-      let resource;
-      try { resource = parseResource(decodeURIComponent(name)).resource; } catch { resource = null; }
-      if (resource === null || encodeURIComponent(resource) !== name) {
-        onEvent({ type: 'skipped-noncanonical-resource-directory', name });
-        return [];
-      }
+      const resource = parseResource(decodeURIComponent(name)).resource;
+      if (encodeURIComponent(resource) !== name) throw new Error('Noncanonical resource directory');
       return attempts(resource);
     });
+  });
+  // Legacy-alias directories (old repo slug) of THIS resource are its own unresolved history: fail closed.
+  // Directories of other resources are not scanned, so they cannot block this claim.
+  const assertNoAliasDirs = (resource) => io(dir, () => {
+    for (const name of ensure()) {
+      let key = null;
+      try { key = parseResource(decodeURIComponent(name)).resource; } catch { /* unrelated or unparseable name */ }
+      if (key === resource && encodeURIComponent(key) !== name) throw new Error('Noncanonical resource directory');
+    }
   });
   const write = (record) => io(pathFor(record.resource, record.attempt), () => {
     assertActionRecord(record);
@@ -91,7 +94,7 @@ export function createActionStore({ root = resolveCoordinationRoot(), fs = nativ
     const identity = parseResource(resource);
     const allocate = () => {
       // Only this resource's own history gates its claim; unrelated directories are not scanned.
-      ensure();
+      assertNoAliasDirs(identity.resource);
       const rows = attempts(identity.resource), latest = rows.at(-1);
       if (latest && latest.state !== 'terminal') {
         if (isExpired(latest, now()) && reconcilePort) {

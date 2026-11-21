@@ -122,19 +122,14 @@ describe('resource actions', () => {
     expect(run(denied).held).toBe(true);
     expect(calls).toBe(0);
   });
-  it('does not let a stale noncanonical directory with a 0-byte attempt block other resources', () => {
-    const events = [];
-    const store = createActionStore({ now, leaseMs: 10, onEvent: (e) => events.push(e) });
-    const stale = join(store.dir, 'chalbert%2Fweb-everything%23pr%3A2345');
+  it('a legacy-alias directory with a 0-byte attempt blocks only its own resource, never others', () => {
+    const stale = join(actions.dir, 'chalbert%2Fweb-everything%23pr%3A2345');
     fs.mkdirSync(stale, { recursive: true });
     fs.writeFileSync(join(stale, 'attempt-000001.json'), '');
     const other = actionResource('we', { type: 'pr', id: 7 });
-    expect(store.claim({ resource: other, kind: 'fix', owner: 'a' }).ok).toBe(true);
-    expect(() => store.list()).not.toThrow();
-    expect(events.some((e) => e.type === 'skipped-noncanonical-resource-directory')).toBe(true);
-    expect(store.claim({ resource, kind: 'fix', owner: 'a' }).ok).toBe(true);
-    fs.writeFileSync(store.pathFor(resource, 1), '');
-    expect(() => store.attempts(resource)).toThrow(CoordinationUnavailableError);
+    expect(actions.claim({ resource: other, kind: 'fix', owner: 'a' }).ok).toBe(true);
+    expect(() => actions.claim({ resource, kind: 'fix', owner: 'a' })).toThrow(CoordinationUnavailableError);
+    expect(() => actions.list()).toThrow(CoordinationUnavailableError);
   });
   it('keeps completed effects observed until their postcondition, and only warns on age', async () => {
     actions = createActionStore({ now, maxObservedAgeMs: 5 });
