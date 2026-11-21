@@ -12,7 +12,8 @@ const REQUIRED_LABELS = ['review:human', 'advisory:accepted', 'red-team:clear'];
 export function planAuditOwed({ repo, rawPrs, check, seen = new Set() }) {
   const owed = [];
   for (const row of Array.isArray(rawPrs) ? rawPrs : []) {
-    if (String(row?.state).toUpperCase() !== 'OPEN' || row.isDraft) continue;
+    // The open-PR reader (`gh pr list --state open`, PR_LIST_JSON_FIELDS) has no `state` field: only an explicit non-OPEN state skips.
+    if (!row || (row.state != null && String(row.state).toUpperCase() !== 'OPEN') || row.isDraft) continue;
     const pr = Number(row.number), head = row.headRefOid;
     if (!Number.isSafeInteger(pr) || pr <= 0
       || typeof head !== 'string' || !/^[a-f0-9]{40}(?![\s\S])/i.test(head)

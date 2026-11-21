@@ -28,8 +28,8 @@ for (const label of labels) test(`missing ${label} is not owed`, () => {
   assert.deepEqual(owed({ rawPrs: [pr({ labels: labels.filter(value => value !== label) })],
     check: () => assert.fail('ineligible PR must not be checked') }), []);
 });
-test('draft, closed, merged, and unknown state PRs are not owed', () => {
-  for (const extra of [{ isDraft: true }, { state: 'CLOSED' }, { state: 'MERGED' }, { state: undefined }]) {
+test('draft, closed, and merged PRs are not owed', () => {
+  for (const extra of [{ isDraft: true }, { state: 'CLOSED' }, { state: 'MERGED' }]) {
     assert.deepEqual(owed({ rawPrs: [pr(extra)] }), []);
   }
 });
@@ -88,4 +88,13 @@ test('shadow hook off performs no checks; logging failure never blocks or marks 
   assert.doesNotThrow(() => runAutoAuditShadow({ repo, rawPrs: [pr()], mode: 'shadow', seen,
     check: () => ({ ok: false }), log: { error: () => { throw Error('sink failed'); } } }));
   assert.equal(seen.size, 0);
+});
+
+test('real defaultReadPrs row shape (no state field) is still owed; explicit non-OPEN and drafts are not', () => {
+  const row = { number: 17, title: 't', headRefName: 'lane/audit', headRefOid: head, baseRefName: 'main',
+    labels: labels.map(name => ({ name })), isDraft: false, comments: [], files: [] };
+  assert.equal('state' in row, false);
+  assert.deepEqual(owed({ rawPrs: [row] }), expected('owed'));
+  assert.deepEqual(owed({ rawPrs: [{ ...row, state: 'CLOSED' }] }), []);
+  assert.deepEqual(owed({ rawPrs: [{ ...row, isDraft: true }] }), []);
 });
