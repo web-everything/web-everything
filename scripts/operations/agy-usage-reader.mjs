@@ -73,6 +73,7 @@ export function collectAgyUsage({ home = homedir(), timeoutMs = 45000, spawnFn =
   return new Promise((resolve, reject) => {
     const child = spawnFn('sh', ['-c', 'cat | script -q /dev/null agy'], { cwd: home, detached: true, stdio: ['pipe', 'pipe', 'pipe'] });
     let leaked = false, screen = '', loginScreen = '', bytes = 0, requested = false, stopping = false, settled = false;
+    let startupReady = false, started = false;
     const timers = [];
     const later = (fn, ms) => timers.push(setTimeout(fn, ms));
     const finish = (error, value) => {
@@ -91,6 +92,18 @@ export function collectAgyUsage({ home = homedir(), timeoutMs = 45000, spawnFn =
       error ? reject(error) : resolve(value);
     };
     const send = value => { if (!settled) child.stdin.write(value); };
+    const startIfSignedIn = () => {
+      if (settled || started || !startupReady) return;
+      const frame = stripVTControlCharacters(loginScreen.split(new RegExp(FRAME_BREAK, 'g')).at(-1));
+      // A painting/partial startup is unresolved: only the current prompt footer AND rule authorize keys.
+      if (!/\? for shortcuts/.test(frame) || !/─{3,}/.test(frame)) return;
+      started = true;
+      send('\x1b');
+      later(() => {
+        if (settled) return;
+        requested = true; screen = ''; send('/usage\r');
+      }, stepMs);
+    };
     child.on('error', error => finish(error));
     child.stdin.on('error', error => finish(error));
     const receive = data => {
@@ -108,6 +121,7 @@ export function collectAgyUsage({ home = homedir(), timeoutMs = 45000, spawnFn =
       if (/not signed in/i.test(loginText) && /Select login method/i.test(loginText)) {
         return finish(null, { at: new Date(now()).toISOString(), status: 'signed-out' });
       }
+      startIfSignedIn();
       if (!requested || stopping) return;
       let parsed;
       try { parsed = parseAgyUsage(screen, now()); } catch { return; }
@@ -124,14 +138,7 @@ export function collectAgyUsage({ home = homedir(), timeoutMs = 45000, spawnFn =
       try { finish(null, parseAgyUsage(screen, now())); } catch (error) { finish(error); }
     });
     later(() => finish(new Error('agy usage timed out; inspect agy startup or increase timeoutMs and retry')), timeoutMs);
-    later(() => {
-      if (settled) return;
-      send('\x1b');
-      later(() => {
-        if (settled) return;
-        requested = true; screen = ''; send('/usage\r');
-      }, stepMs);
-    }, startupMs);
+    later(() => { startupReady = true; startIfSignedIn(); }, startupMs);
   });
 }
 

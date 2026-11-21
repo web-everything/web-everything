@@ -132,33 +132,70 @@ describe('PTY collection', () => {
     await vi.advanceTimersByTimeAsync(45000);
     expect(h.writes).toEqual([]);
   });
-  it('never sends /usage when login arrives after startup Escape and before /usage', async () => {
+  it('waits without keys for split login markers arriving across the startup delay', async () => {
     const h = processFixture();
-    await vi.advanceTimersByTimeAsync(3001);
+    h.child.stdout.write('Not signed in\n');
+    await vi.advanceTimersByTimeAsync(4000);
+    expect(h.writes).toEqual([]);
+    h.child.stderr.write('Select login method');
+    expect(await h.promise).toEqual({ at: new Date(NOW).toISOString(), status: 'signed-out' });
+    await vi.advanceTimersByTimeAsync(45000);
+    expect(h.writes).toEqual([]);
+    expect(vi.getTimerCount()).toBe(0);
+  });
+  it.each(['', '? for shortcuts', '────────────────',
+    '? for shortcuts\x1b[2J────────────────'])('types nothing until timeout for unresolved startup %j', async screen => {
+    const h = processFixture();
+    const assertion = expect(h.promise).rejects.toThrow('agy usage timed out');
+    h.child.stdout.write(screen);
+    await vi.advanceTimersByTimeAsync(45000);
+    await assertion;
+    expect(h.writes).toEqual([]);
+  });
+  it('waits for both signed-in markers and the minimum startup delay', async () => {
+    const h = processFixture();
+    h.child.stdout.write('? for shortcuts');
+    await vi.advanceTimersByTimeAsync(1000);
+    expect(h.writes).toEqual([]);
+    h.child.stdout.write('\n────────────────\n');
+    await vi.advanceTimersByTimeAsync(1999);
+    expect(h.writes).toEqual([]);
+    await vi.advanceTimersByTimeAsync(1);
     expect(h.writes).toEqual(['\x1b']);
-    h.child.stderr.write('Not signed in\nSelect login method');
+    await vi.advanceTimersByTimeAsync(300);
+    h.child.stdout.write(SCREEN);
+    await h.promise;
+    expect(h.writes).toEqual(['\x1b', '/usage\r', '\x03', '\x03']);
+  });
+  it('cancels /usage when login replaces a resolved signed-in prompt after Escape', async () => {
+    const h = processFixture();
+    h.child.stdout.write(SIGNED_IN);
+    await vi.advanceTimersByTimeAsync(3000);
+    expect(h.writes).toEqual(['\x1b']);
+    h.child.stderr.write('\x1b[2JNot signed in\nSelect login method');
     expect(await h.promise).toEqual({ at: new Date(NOW).toISOString(), status: 'signed-out' });
     await vi.advanceTimersByTimeAsync(45000);
     expect(h.writes).toEqual(['\x1b']);
-    expect(vi.getTimerCount()).toBe(0);
   });
-  it('preserves a login marker across the /usage screen reset', async () => {
+  it('rechecks the last frame when the minimum startup delay elapses', async () => {
     const h = processFixture();
-    await vi.advanceTimersByTimeAsync(3001);
-    h.child.stdout.write('Not signed in\n');
-    await vi.advanceTimersByTimeAsync(299);
-    expect(h.writes).toEqual(['\x1b', '/usage\r']);
-    h.child.stdout.write('Select login method');
-    const result = expect(h.promise).resolves.toEqual({ at: new Date(NOW).toISOString(), status: 'signed-out' });
+    const assertion = expect(h.promise).rejects.toThrow('timed out');
+    h.child.stdout.write(SIGNED_IN);
+    h.child.stdout.write('\x1b[2Jstill painting');
     await vi.advanceTimersByTimeAsync(45000);
-    await result;
-    expect(h.writes).toEqual(['\x1b', '/usage\r']);
+    await assertion;
+    expect(h.writes).toEqual([]);
   });
   it('resolves parsed usage when the fake PTY replays the signed-in capture', async () => {
     const h = processFixture();
     const resolved = vi.fn();
     h.promise.then(resolved);
     await vi.advanceTimersByTimeAsync(4500);
+    expect(h.writes).toEqual([]);
+    h.child.stdout.write(SIGNED_IN);
+    expect(h.writes).toEqual(['\x1b']);
+    await vi.advanceTimersByTimeAsync(300);
+    expect(h.writes).toEqual(['\x1b', '/usage\r']);
     h.child.stdout.write(SIGNED_IN);
     await vi.advanceTimersByTimeAsync(0);
     expect(resolved).toHaveBeenCalledWith({
@@ -199,6 +236,7 @@ describe('PTY collection', () => {
   });
   it('uses home cwd, sends Esc then usage and two interrupts without agy settings writes', async () => {
     const h = processFixture();
+    h.child.stdout.write(SIGNED_IN);
     await vi.advanceTimersByTimeAsync(3300);
     h.child.stdout.write(SCREEN);
     await vi.advanceTimersByTimeAsync(300);
@@ -236,6 +274,7 @@ describe('PTY collection', () => {
     const kill = vi.fn(() => { throw Object.assign(new Error('nope'), { code: 'EPERM' }); });
     const h = processFixture({ kill });
     const assertion = expect(h.promise).rejects.toThrow('cleanup incomplete');
+    h.child.stdout.write(SIGNED_IN);
     await vi.advanceTimersByTimeAsync(3300);
     h.child.stdout.write(SCREEN);
     await assertion;
@@ -255,6 +294,7 @@ describe('PTY collection', () => {
     const h = processFixture();
     const assertion = expect(h.promise).rejects.toThrow('timed out');
     h.child.stdout.write(SCREEN);
+    h.child.stdout.write(SIGNED_IN);
     await vi.advanceTimersByTimeAsync(3300);
     h.child.stdout.write(SCREEN.slice(0, -2));
     await vi.advanceTimersByTimeAsync(41700);

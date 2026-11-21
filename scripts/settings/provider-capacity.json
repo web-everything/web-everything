@@ -185,7 +185,12 @@
           }
         ],
         "capacityUnit": "percent-of-window",
-        "readers": [],
+        "readers": [
+          {
+            "type": "plateau-usage-file",
+            "file": "agy-usage.json"
+          }
+        ],
         "reservePercent": 10,
         "model": "claude-sonnet-5-5-high",
         "emergencyOnly": true,
