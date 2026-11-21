@@ -233,6 +233,7 @@ import { REQUIRED_WORKFLOWS_UNSATISFIED, resolveRefreshOnUnsatisfiedWorkflows, h
 import { recordEnqueueOutcome } from './lib/drain-poison-guard.mjs';
 import { createAsyncShadow } from './lib/drain-async-shadow.mjs';
 import { appendDaemonEvent } from './lib/daemon-events.mjs';
+import { writeChangeEvidenceForMerged } from './lib/change-evidence/writer.mjs';
 import { createDrainMergeStrategy, resolveDrainMergePolicy, queueEnqueueModeFromPolicy, createQueueRequiredChecksOf } from './lib/drain-merge-strategy.mjs'; // xtpxusq — merge-delivery strategy (drain-direct | github-merge-queue)
 // #3215 — the drain applies holds of its own (a fresh park, a #2409 stale-acceptance re-park); this is the
 // same ledger `review-set-label.mjs` already writes through for the review seam, never a second format.
@@ -8213,6 +8214,8 @@ export async function main(argv, { env = process.env, stdout = process.stdout, e
   // Capability refusal skips that work, so it must also keep the follow-ups pending for the operator.
   const queueFollowUpsClean = !localWriteRefusal && (!landedLocal || localSynced) && !numbered?.warning &&!(resolveOnLandReport.failed || []).length && !derived.warning && !(derived.failed || []).length;
   mergeStrategy.confirmQueueFollowUps(queueFollowUps, { complete: queueFollowUpsClean });
+  try { await writeChangeEvidenceForMerged({ merged, queueFollowUps }); }
+  catch (error) { process.stderr.write(`change-evidence-missing: ${String(error.message).replace(/[\x00-\x1f\x7f-\x9f]/g, ' ')}\n`); }
 
   // #2222 — a healed tip is a PENDING rebuild (CI re-running on the renumbered tree), so it counts as progress
   // for the watch's idle accounting exactly like a rebase-drop rebuild — it lands on a later pass.

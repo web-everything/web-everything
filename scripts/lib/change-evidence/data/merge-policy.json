@@ -1,0 +1,68 @@
+{
+  "configType": "https://everstandards.dev/ship/change-evidence/merge-policy/v0.1",
+  "id": "https://github.com/web-everything/web-everything/blob/main/scripts/lib/change-evidence/data/merge-policy.json",
+  "version": "2026-11-21",
+  "org": "web-everything",
+  "description": "The web-everything project's merge policy as data (standards.governanceConfigurable, standards.pilotsOwnProjects): required checks come from the live GitHub ruleset on main (snapshot digest below); review and approval come from the house review loop, which records them as PR comments and labels, not as GitHub reviews (the ruleset has no pull_request rule). Tiers: CI runs agent-written tests on GitHub's runners (replayed); review verdicts and labels are written by the house bots (asserted).",
+  "sources": [
+    {
+      "uri": "https://api.github.com/repos/web-everything/web-everything/rules/branches/main",
+      "digest": {
+        "sha256": "61cb373362818f9015f38b0183a37a193f0346ab2706743e930492fb826c5f71"
+      },
+      "note": "required_status_checks: test, smoke, daemon-soak, soak-replay-gate, merge-gate; merge_queue: merge_method MERGE, grouping ALLGREEN; fetched 2026-11-21"
+    }
+  ],
+  "clauses": {
+    "tested": {
+      "required": true,
+      "description": "every required check succeeded on the commit that landed",
+      "acceptKinds": [
+        "ci-check"
+      ],
+      "requiredChecks": [
+        "test",
+        "smoke",
+        "daemon-soak",
+        "soak-replay-gate",
+        "merge-gate"
+      ],
+      "minTier": "replayed"
+    },
+    "reviewed": {
+      "required": true,
+      "description": "an accepted independent review covers the final head (a drain re-stamp after a content-preserving rebase counts)",
+      "acceptKinds": [
+        "review-verdict",
+        "review-restamp"
+      ],
+      "minTier": "asserted"
+    },
+    "approved": {
+      "required": true,
+      "description": "review:accepted was applied by an approver who is not the author, and was still present at merge",
+      "acceptKinds": [
+        "approval-label"
+      ],
+      "approvers": [
+        "https://github.com/apps/plateau-reviewer"
+      ],
+      "separationOfDuties": true,
+      "minTier": "asserted"
+    }
+  },
+  "tiers": {
+    "ci-check": "replayed",
+    "review-verdict": "asserted",
+    "review-restamp": "asserted",
+    "approval-label": "asserted"
+  },
+  "oscal": {
+    "catalog": "NIST SP 800-53 Rev. 5",
+    "controls": [
+      "cm-3",
+      "cm-4",
+      "sa-11"
+    ]
+  }
+}

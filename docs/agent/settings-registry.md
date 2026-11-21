@@ -16,9 +16,9 @@ For repo defaults, edit the owner file through a PR and rebuild the consuming da
 
 ## Summary
 
-- Top-level keys: 161 (163 declaration rows).
-- Declared leaves: 589 (platform copies counted separately).
-- Instant top-level keys: 0; not instant: 161.
+- Top-level keys: 162 (164 declaration rows).
+- Declared leaves: 590 (platform copies counted separately).
+- Instant top-level keys: 1; not instant: 161.
 - Instant capacity leaves: 15.
 - Constants to settle: 312.
 - Instant gaps: 28.
@@ -80,6 +80,7 @@ Operator-prefs layer: ~/.plateau/platform-preferences.json is the requested oper
 | cards | scripts/settings/card-dedupe.json | 2 | {"$comment":"Repo override (operator go 2026-10-10): dedupe… | pr | no | Mechanical finding deduplication and similarity threshold. |
 | careExemptPaths | scripts/settings/review.json | 1 | ["scripts/ci/test-timings.json","data/generated/**","src/_d… | pr | no | Narrow paths exempted from care classification, retaining human gates. |
 | carryAcrossRebase | scripts/settings/review.json | 1 | "on" | pr | no | Carry review state across eligible rebases. |
+| changeEvidence | scripts/settings/change-evidence.json | 1 | {"mode":"shadow"} | pr | yes | Merged change evidence mode: off skips collection; shadow and on write local shadow records only. |
 | ci | scripts/settings/timeout-evidence.json | 1 | {"timeoutEvidenceConcurrency":4} | pr | no | Concurrency of timeout-evidence child readers. |
 | ciGhostRerun | scripts/settings/ci-ghost-rerun.json | 5 | {"thresholdMin":15,"maxPerWindow":1,"maxPerHead":1,"windowH… | pr | no | Age, frequency and cancellation bounds for ghost CI recovery. |
 | ciHeal | scripts/settings/ci-heal.json | 2 | {"staleBaseRefreshFirst":"on","loop":"off"} | pr | no | Try a stale-base refresh before waking a CI fixer. |
