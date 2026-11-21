@@ -70,7 +70,7 @@ import { isAllowlistedLitterPath } from './lane-litter.mjs';
 import { isCardOnlyDiff, isCardPath, isDocsPath } from '../ci-card-only.mjs';
 import { queueLaneOf } from '../readiness/heavy-queue-projection.mjs';
 import { scanCommands } from './repo-scan-tests.mjs';
-import { buildReverseImportGraph, selectRelatedTests } from './related-test-selection.mjs';
+import { buildReverseImportGraph, selectRelatedTests, isVitestTestFile, testDepths } from './related-test-selection.mjs';
 
 const defaultFileConfig = loadVerifySettingsFile();
 
@@ -511,12 +511,8 @@ function resolveGateFromBase({ base, runGit, env, scripts, fileExists, readRepoF
     // `--passWithNoTests`: a diff whose files no test reaches (docs, a backlog card) is a pass, not a failure.
     // Deletions or excluded untracked scratch can leave no target, and `vitest related` with no
     // positional file is an error (a false red); there is nothing for vitest to run, so say so and skip it.
-    let vitestCmd = selection?.status === 'selection-truncated'
-      ? `npx vitest run ${selection.tests.map(shellQuote).join(' ')} --passWithNoTests${timeoutFlags}`
-      : targets.length
-      ? `npx vitest related ${targets.map(shellQuote).join(' ')} --run --passWithNoTests${timeoutFlags}`
-      : `echo ${shellQuote('verify-lane: no remaining changed file for vitest to relate — vitest half skipped (deletions or excluded untracked scratch)')}`;
-    if (selection?.status === 'selection-truncated' && settings.shardMinTests > 0
+    let vitestCmd = explicitTestCommand(selection.tests, timeoutFlags);
+    if (settings.shardMinTests > 0
       && selection.tests.length >= settings.shardMinTests) {
       const shards = { count: Math.ceil(selection.tests.length / settings.shardSize), size: settings.shardSize, parallel: settings.shardParallel };
       selection.shards = shards;
@@ -540,31 +536,105 @@ function resolveGateFromBase({ base, runGit, env, scripts, fileExists, readRepoF
 
 const graphCache = new WeakMap();
 
-/**
- * #5128 — the bounded related-test selection, or null when it does not apply (limit off, no reader injected, no
- * target, or git/graph trouble — null keeps the plain `vitest related` gate, the pre-#5128 behaviour). The graph is
- * cached per injected reader, so the #66 variant matching re-resolves cheaply. A truncated list that is empty or too
- * long for one command line also falls back to `vitest related`.
- */
-function relatedSelection({ targets, runGit, readRepoFile, settings }) {
-  if (typeof readRepoFile !== 'function' || !(settings.relatedMaxTests > 0) || !targets.length) return null;
+/** A bounded command; an empty selection must never become an unfiltered unit run. */
+function explicitTestCommand(tests, flags = '') {
+  tests = tests.filter(path => !path.startsWith('-'));
+  return tests.length ? `npx vitest run ${tests.map(shellQuote).join(' ')} --passWithNoTests${flags}`
+    : `echo ${shellQuote('verify-lane: no selected or named test suites; CI owns exhaustive verification')}`;
+}
+
+/** Changed tests and one direct importer per source get first claim on the cap; named guards are additional. */
+export function cappedFallbackSelection({ targets, reverse = new Map(), settings, reason = 'graph unavailable' }) {
+  const priority = [...new Set(targets.filter(f => !f.startsWith('-') && isVitestTestFile(f)))].sort();
+  const direct = [];
+  for (const file of targets.filter(f => !isVitestTestFile(f))) {
+    const tests = [...testDepths([file], reverse)].filter(([, d]) => d <= 1).map(([t]) => t).filter(t => !t.startsWith('-')).sort();
+    if (tests.length && !tests.some(t => priority.includes(t))) priority.push(tests[0]);
+    direct.push(...tests);
+  }
+  const candidates = [...new Set([...priority, ...direct.sort()])].slice(0, settings.relatedMaxTests);
+  // Bound argv bytes as well as count. Unusable graph paths cannot displace the named guard suites.
+  const guards = [...new Set((settings.alwaysRunTests ?? []).filter(t => !t.startsWith('-')))].sort();
+  const tests = [...guards];
+  for (const file of candidates) if (!tests.includes(file)
+    && Buffer.byteLength([...tests, file].map(shellQuote).join(' ')) < 30000) tests.push(file);
+  tests.sort();
+  return { status: 'capped-fallback', tests, selectedTestCount: tests.length, fullTestCount: null,
+    directTestCount: direct.length, maxTests: settings.relatedMaxTests, maxDepth: 1, depth: 1,
+    droppedCount: null, hubs: [], reason: `${reason}; capped fallback plus named suites; CI owns exhaustive coverage` };
+}
+
+export function relatedSelection({ targets, runGit, readRepoFile, settings, forceFallback = false }) {
+  settings = { ...settings, relatedMaxTests: settings.relatedMaxTests > 0 ? settings.relatedMaxTests : defaultFileConfig.relatedMaxTests || 40 };
+  let reverse = new Map();
   try {
-    let reverse = graphCache.get(readRepoFile);
+    if (typeof readRepoFile !== 'function') throw new Error('graph reader unavailable');
+    reverse = graphCache.get(readRepoFile);
     if (!reverse) {
       const files = gitPathLines(runGit(['ls-files', '--cached', '--others', '--exclude-standard']), { trim: true });
-      reverse = buildReverseImportGraph({ files, readFile: readRepoFile });
+      let unreadable = false;
+      reverse = buildReverseImportGraph({ files, readFile: p => { try { return readRepoFile(p); } catch (e) { unreadable = true; throw e; } } });
+      if (unreadable) throw new Error('graph incomplete');
       graphCache.set(readRepoFile, reverse);
     }
     const selection = selectRelatedTests({ changedFiles: targets, reverse, maxTests: settings.relatedMaxTests,
       maxDepth: settings.relatedDepth });
-    if (selection.status === 'selection-truncated'
-      && (!selection.tests.length || Buffer.byteLength(selection.tests.join(' '), 'utf8') > 32_000)) {
-      return { ...selection, status: 'complete', tests: null, reason: `${selection.reason}; list unusable — kept vitest related` };
-    }
+    selection.tests = selection.tests.filter(path => !path.startsWith('-'));
+    selection.selectedTestCount = selection.tests.length;
+    if (forceFallback || !selection.tests.length || Buffer.byteLength(selection.tests.map(shellQuote).join(' ')) > 32000)
+      return cappedFallbackSelection({ targets, reverse, settings, reason: forceFallback ? 'gate ceiling' : 'graph list unusable' });
     return selection;
   } catch {
-    return null;
+    return cappedFallbackSelection({ targets, reverse: reverse ?? new Map(), settings });
   }
+}
+
+/** Parse only literal shell words, never evaluate shell input; preserve a composed standards tail verbatim. */
+export function capExplicitRelatedGate({ gate, uncapped = false, runGit, readRepoFile, env = process.env, fileConfig = defaultFileConfig }) {
+  if (uncapped) return { command: gate, gateUncapped: true };
+  const match = /^(?:npx\s+)?vitest\s+related\s+/.exec(gate);
+  if (!match) return { command: gate };
+  const rest = gate.slice(match[0].length);
+  const words = [];
+  let word = '', quote = null, tail = '';
+  for (let i = 0; i < rest.length; i++) {
+    const c = rest[i];
+    if (quote) { if (c === quote) quote = null; else if (quote === '"' && /[$`\\]/.test(c)) throw new Error('related gate requires literal paths'); else word += c; }
+    else if (c === "'" || c === '"') quote = c;
+    else if (c === '\\') { if (++i >= rest.length) throw new Error('incomplete gate escape'); word += rest[i]; }
+    else if (rest.slice(i, i + 2) === '&&') { tail = rest.slice(i); break; }
+    else if (/\s/.test(c)) { if (word) words.push(word); word = ''; }
+    else if (/[|;&<>$`]/.test(c)) throw new Error('related gate requires literal paths');
+    else word += c;
+  }
+  if (quote) throw new Error('incomplete related gate quote');
+  if (word) words.push(word);
+  const targets = [], options = [];
+  // Discovery/filter values are not source targets. Preserve literal argv and refuse
+  // unknown flags rather than silently changing the requested verification.
+  const valueOptions = new Set(['--config', '--project', '--testNamePattern', '-t', '--exclude']);
+  for (let i = 0; i < words.length; i++) {
+    const token = words[i];
+    if (token === '--run') continue;
+    if (/^--bail(?:=\d+)?$/.test(token)) { options.push(token); continue; }
+    const equals = token.indexOf('=');
+    const name = equals < 0 ? token : token.slice(0, equals);
+    if (valueOptions.has(name)) {
+      const value = equals < 0 ? words[++i] : token.slice(equals + 1);
+      if (!value || value.startsWith('-')) throw new Error(`related gate option ${name} requires a literal value`);
+      options.push(name, value);
+    } else if (token.startsWith('-')) {
+      throw new Error(`unsupported related gate option ${token}; use supported options or --gate-uncapped`);
+    } else targets.push(token);
+  }
+  if (!targets.length) throw new Error('related gate names no target file');
+  targets.sort();
+  const settings = resolveVerifySettings({ fileConfig, env }).values;
+  const selection = relatedSelection({ targets, runGit, readRepoFile, settings });
+  if (options.length && !selection.tests.length) throw new Error('related gate options require selected or named test suites; supply an explicit affected-test gate');
+  const flags = scaledTimeoutFlags(settings.testTimeoutFactor) + (options.length ? ` ${options.map(shellQuote).join(' ')}` : '');
+  return { command: explicitTestCommand(selection.tests, flags) + (tail ? ` ${tail}` : ''), selection,
+    notice: `explicit related gate capped (${targets.length} → ${selection.tests.length} tests)` };
 }
 
 /**
@@ -964,7 +1034,7 @@ export function buildVerifyPhases({ admissionWaitMs, vitestMs, scanMs, standards
     // #5128 — what the related-test selection ran and why; `status: 'selection-truncated'` means farther tests were left to CI.
     selection: decision?.selection ? {
       ...(decision.selection.shards ? { shards: decision.selection.shards } : {}),
-      status: decision.selection.status, fullTestCount: decision.selection.fullTestCount,
+      status: decision.selection.status, tests: decision.selection.tests?.length ?? decision.selection.selectedTestCount, fullTestCount: decision.selection.fullTestCount,
       selectedTestCount: decision.selection.selectedTestCount, directTestCount: decision.selection.directTestCount,
       droppedCount: decision.selection.droppedCount, depth: decision.selection.depth, maxDepth: decision.selection.maxDepth,
       maxTests: decision.selection.maxTests, hubs: decision.selection.hubs, reason: decision.selection.reason,
