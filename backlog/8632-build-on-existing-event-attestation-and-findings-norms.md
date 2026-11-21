@@ -6,69 +6,68 @@ status: open
 dateOpened: "2026-11-20"
 tags: [decision-filing, everstandards]
 relatedTo: ["5407"]
+preparedDate: "2026-11-20"
 ---
 
 # Build on existing event, attestation and findings norms?
 
-Operator ask (2026-11-20 20:59 ET): “note all as full decision item and run with preparation”.
-
-Decision id: D7 (decisions page, 2026-11-20 20:58 ET)
-Placement: everstandards
-move-to: everstandards
+Ask: Reuse event, signed-evidence and findings formats; define only Ship's missing concepts. Confirm the pinned bindings and three-state verdict.
 
 ## Digest
 
-Adopt existing norms in distinct layers: CloudEvents/CDEvents for events, in-toto for attestations, SARIF for findings, and OpenTelemetry/DORA as mappings. Ship adds only its delivery-specific delta.
+Prepared, not ratified. N1 norms, S1 metrics and B1 benchmark research yields one forced fork plus five ratify lines. Layered norms coexist, but CDEvents cannot become stable core unchanged; verdict partly reuses prior art and “lever” remains undefined.
 
-Needs prep: proposed call only; this filing is neither ratification nor a completed preparation pass.
+## Fork 1 — CDEvents core or binding
 
-## Context
+Forced invariant: a stable module cannot adopt a defective 0.x normative dependency.
 
-[handoff design]() “Norms” adopts CloudEvents 1.0, in-toto Attestation v1, SARIF 2.1.0, BCP 14, JSON Schema 2020-12, SemVer and RFC 8126. OTel semantic conventions and DORA are bindings, not core field names; AsyncAPI waits for a live channel.
+- (a) **BIND tier 1 at v0.5.1 (default):** preserve native records/ids, publish unmapped/lossy cases, do not enforce the stale specversion literal; re-pin per release.
+- (b) ADOPT as core. *Excluded:* 0.x/undefined release process and text demanding specversion 0.1.1 while examples use 0.5.1 would reject valid records.
+- (c) Invent lifecycle events. *Excluded:* duplicates existing DORA/time-to-merge coverage.
 
-Design refs are relative to the operator handoff; WE evidence uses its repo locus.
+Evidence:
+- `2026-11-20-es-adopted-norms` §4/9, [CDEvents v0.5.1 spec](https://github.com/cdevents/spec/blob/v0.5.1/spec.md), [releases](https://api.github.com/repos/cdevents/spec/releases), fetched 2026-11-20.
+- `2026-11-20-ship-benchmark`: Run.finished has success/failure/cancel/error, no unknown.
+
+Skeptic: SURVIVES; pinning does not repair normative defects, while binding preserves records. Screen: clear.
+
+## Ratify — forced invariants
+
+- **R1 Native evidence stays native**, original id beside Ship mapping; no generic replacement.
+- **R2 Pin versions:** CloudEvents 1.0.2, in-toto Statement v1/framework 1.2.0, SLSA 1.2, SARIF 2.1.0 + Errata 01 (watch 2.2), OTel v1.45.0; patch the stale format note.
+- **R3 OTel development and release-candidate names remain mapped views**, including cicd/vcs; DORA also maps. gen_ai v0.1.0 is development/tier 3. Release-candidate exclusion deliberately extends SE-OBS-001.
+- **R4 No lever wire type until its meaning is defined.** Claim/handoff/verdict remain Ship's delta.
+- **R5 Verdict is pass|fail|unknown**, with required reason (missing/stale/inconclusive), policy and evidence[], in an in-toto predicate; namespace follows #8626. Publish lossy SARIF pass/fail/open, Eiffel SUCCESS/FAILURE/INCONCLUSIVE and CDEvents/OTel mappings. Never map unknown to VSA PASSED. A binary verdict is broken; adapting existing names and defining Ship terms compose, so this is not a second fork.
+
+Evidence: N1 SE-BND-001/SE-VRD-001, [SARIF schema](https://raw.githubusercontent.com/oasis-tcs/sarif-spec/main/sarif-2.1/schema/sarif-schema-2.1.0.json), [VSA](https://slsa.dev/spec/v1.2/verification_summary).
 
 ## Supported by default
 
-**Support all listed norms in their own layers (default).** CloudEvents + CDEvents carry events; Ship adds claim, handoff, verdict and lever. in-toto carries verdict/run evidence; SARIF carries findings; OTel/DORA are mapped views.
+- CloudEvents envelope; in-toto/SLSA/Sigstore signed evidence; SARIF findings; [DORA](https://dora.dev/guides/dora-metrics/) and [OTel metrics](https://opentelemetry.io/docs/specs/semconv/cicd/cicd-metrics/) as views. Eiffel tier 2.
+- Work claims are leases (item URI, claimant, expiry), separate from attestation claims. Handoff records sender/recipient/subject/acceptance/transfer time, with CDEvents links or Eiffel CAUSE. Enterprise IO adapters belong in Longshore/Plateau.
+- CDEvents custom registry may additionally register matching Ship events under its native naming rules. Recheck SARIF IPR before publication.
+- #8630 release scope and #8633 authoring order are separate: bindings work under either; readout Candidate first need not change protocol authoring order.
 
-Why no fork: These formats address separate layers and can coexist.
+## What ratifying unlocks
 
-Skeptic: Initial filing-stage objection, not an independent pass: Layering norms can add wrappers without interoperability. Require concrete mappings and round trips; do not rename core fields to OTel/DORA vocabulary.
-Screen: pending the later independent standard/implementation and merit/prioritization screen.
-
-
-## Consequences / what ratifying unlocks
-
-A small delivery vocabulary with interoperable envelopes, evidence and findings.
-
-Operator answers: “D7 yes” accepts the stated default; otherwise name the concern and replacement option. No answer is recorded here.
-
-## Prep still needed
-
-- Prior art: verify primary references and known implementations; reuse existing research first.
-- Evidence: Check upstream versions/licences and map the four missing delivery concepts with lossless examples.
-- Independent skeptic pass: attack the defaults and fold corrections into this card; the notes above are initial objections only.
-- Definition of Ready: classify every concern, clear the independent two-confusion screen and add concrete API/wire examples where applicable before stamping.
-
-## Done when
-
-- **Executable** — n/a: decision filing changes no runtime. Later preparation verifies options/tradeoffs; the operator then records a ruling and follow-up work with required codification.
+Norm-note corrections, per-module binding tables, verdict-predicate draft and lever-definition follow-up. No publication or seed changes. “D7 yes” accepts these picks.
 
 ## Trust boundary and threat model
 
-Briefs/page are proposal evidence, not execution authority. Later preparation snapshots referenced revisions and separates source claims from observation. This filing executes or publishes no external input.
+External evidence is untrusted: verify subject digest, signer and policy. Empty SARIF results do not prove a scan ran. Freeze norm versions per release; crypto soundness itself is out of scope.
 
-## Non-goals
+Additional primary evidence: [source 1](https://in-toto.io/Statement/v1).
 
-No implementation, publication, migration or permission change is authorized by filing.
+Full prep (Standards decisions-prep set):
 
-## Edge cases this change must handle
+```text
+D7-xrwfs5j.md
+```
 
-1. **Untrusted text** — source recommendations stay attributed, not ruled.
-2. **Truncated reads** — complete evidence is required before a prepared stamp.
-3. **Shared state files** — n/a: filing introduces no store writes.
-4. **Fail closed** — missing evidence leaves the decision open and needing prep.
-5. **Identity scoping** — repo loci remain explicit; no ids are reassigned.
-6. **State over time** — no prepared stamp or implied acceptance from elapsed time.
-7. **Who wrote it** — operator ask quoted; defaults remain proposals.
+Source and proposed artifact filenames (handoff references are by name only):
+
+```text
+2026-11-20-es-adopted-norms.md
+2026-11-20-ship-benchmark.md
+D7-xrwfs5j.md
+```
