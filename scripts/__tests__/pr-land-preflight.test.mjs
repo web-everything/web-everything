@@ -8,7 +8,7 @@ import { pathToFileURL } from 'node:url';
 // Execute the actual CLI/checkpoint in a child. Loader substitutes only external gate/forge ports;
 // Git effects are recorded instead of executed. No real Git, forge, card filing or operator state.
 function run({ check = true, fail = false, override = '', count = 15, exempt = false,
-  body = 'Description', earlyPr = false } = {}) {
+  body = 'Description', earlyPr = false, labelOnGreen = false, headEvidence = 'matching' } = {}) {
   const dir = mkdtempSync(join(tmpdir(), 'pr-land-preflight-'));
   const trace = join(dir, 'effects.jsonl');
   const root = resolve('scripts');
@@ -28,8 +28,13 @@ function run({ check = true, fail = false, override = '', count = 15, exempt = f
       export const createGhLandProvider = () => ({ listOpenByHead: () => {
         effect(['pr-lookup']); return ++lookups === 1 && ${earlyPr} ? [{ number: 7 }] : []; },
         create: p => { effect(['create', p]); return 'https://example.test/pull/7'; },
-        viewPr: () => ({ labels: [], comments: [], body: 'Description' }),
-        ensureLabel: () => {}, addLabel: () => {}, removeLabel: () => {} });`,
+        viewPr: (pr, fields) => {
+          if (fields === 'headRefOid' && ${JSON.stringify(headEvidence)} === 'unreadable') throw new Error('head unreadable');
+          return { labels: [], comments: [], body: 'Description', mergeable: 'MERGEABLE', mergeStateStatus: 'CLEAN',
+            headRefOid: ${JSON.stringify(headEvidence === 'missing' ? null : headEvidence === 'different' ? 'b'.repeat(40) : sha)} };
+        },
+        requiredChecks: () => [{ name: 'test', bucket: 'pass' }],
+        ensureLabel: () => {}, addLabel: (pr, label) => effect(['add-label', label]), removeLabel: () => {} });`,
     './lib/pr-size-admission.mjs': `${record} export const createSizeAdmissionRunner = () => async request => {
       effect(['size-admission']); return { body: request.body, status: 'small' }; };`,
     './conveyor/fix-procedure.mjs': 'export const pushRefusal = () => null; export const repoKeyForCheckout = () => "we";',
@@ -61,7 +66,7 @@ function run({ check = true, fail = false, override = '', count = 15, exempt = f
     }; syncBuiltinESMExports(); register(${JSON.stringify(pathToFileURL(loader).href)});`);
   try {
     const child = spawnSync(process.execPath, ['--import', preload, join(root, 'pr-land.mjs'), `--repo=${dir}`,
-      '--ref=lane/preflight', '--title=fix: admission', `--body=${body}`, '--no-wait', '--json',
+      '--ref=lane/preflight', '--title=fix: admission', `--body=${body}`, labelOnGreen ? '--label-on-green' : '--no-wait', '--json',
       ...(check ? ['--check'] : []), ...(override === 'forceOpen' ? ['--force-open', '--reason=operator'] : [])],
     { cwd: dir, env: { ...process.env, TMPDIR: dir, WE_POLICY_CASCADE_LOG: '0' },
       encoding: 'utf8', timeout: 30_000, maxBuffer: 2 * 1024 * 1024 });
@@ -72,6 +77,20 @@ function run({ check = true, fail = false, override = '', count = 15, exempt = f
 }
 
 describe('pr-land pre-push checkpoint', () => {
+  it.each(['different', 'missing', 'unreadable'])('green checks with %s PR head evidence refuse before ready-to-merge is ever applied', headEvidence => {
+    const { status, result, effects } = run({ check: false, count: 0, labelOnGreen: true, headEvidence });
+    expect(status).toBe(3);
+    expect(result.reason).toBe('pr-head-mismatch');
+    expect(effects.filter(([cmd, label]) => cmd === 'add-label' && label === 'ready-to-merge')).toEqual([]);
+  });
+
+  it('green checks with matching PR head evidence reach the ready-to-merge write', () => {
+    const { status, result, effects } = run({ check: false, count: 0, labelOnGreen: true });
+    expect(status).toBe(0);
+    expect(result.reason).toBe('labelled-on-green');
+    expect(effects.filter(([cmd, label]) => cmd === 'add-label' && label === 'ready-to-merge')).toHaveLength(1);
+  });
+
   it.each([false, true])('refuses an empty create body when the early PR exists=%s and no PR exists at create', earlyPr => {
     const { status, result, effects } = run({ check: false, count: 0, body: '', earlyPr });
     expect(status).toBe(3);
