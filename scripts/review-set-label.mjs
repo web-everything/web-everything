@@ -101,10 +101,21 @@ import {
 // #4140 — `decideRestampHumanClearance` names the carried clearance's actor from TRUSTED comments only, so a later
 // untrusted `cleared-human` marker cannot rename it (the other three parsers it reaches gate themselves).
 import { isTrustedMarkerAuthor, AUTOMATION_LOGINS } from './lib/marker-authorship.mjs';
+import { GATE_OUTCOMES, readRedTeamDisposition } from './lib/red-team-gate.mjs';
 import { REARM_COMMENT_MARKER } from './conveyor/rearm-review.mjs';
 import { sleepSyncMs } from './readiness/drain-lock.mjs';
 
 export const CHANGES_VERDICT_PREFIX = '🔁 review — changes requested';
+
+// GraphQL omits the bot suffix that REST includes. Normalize only the completeness
+// comparison; marker authority is still checked against the original comments.
+function sameThreadComment(left, right) {
+  const loginKey = comment => {
+    const login = comment.author?.login ?? comment.user?.login;
+    return typeof login === 'string' ? login.toLowerCase().replace(/\[bot\]$/, '') : login;
+  };
+  return left.body === right.body && loginKey(left) === loginKey(right);
+}
 
 /** Share the same verdict selection between the re-arm writer and orphan recovery. */
 export function latestChangesVerdict(comments) {
@@ -381,7 +392,7 @@ export { decideParkToHuman, findContradictoryReviewVerdicts, decideContradictory
  * fix-agent `rearm` (#2644, was `decideRearm`), and the #2895 gate-self `clear-human`. Every return carries
  * `keepsHuman` — whether the swap leaves `review:human` in place.
  *   • `accepted` — INVARIANT 2: REFUSED on a `review:human` PR (only a human's /review may clear the gate);
- *     otherwise adds `review:accepted`, drops the parked `review:pending` AND a stale `review:changes` (#2974 —
+ *     a same-head red-team send-back refuses the accept without writes; otherwise adds `review:accepted`, drops the parked `review:pending` AND a stale `review:changes` (#2974 —
  *     a bounce that was fixed and re-verdicted straight to `accepted` must not still read as awaiting changes).
  *   • `changes` — a bounce lands nothing, so it is allowed regardless of the PR's state, with ONE refusal:
  *     #3334's reasonless bounce (a KNOWN zero finding count and no stated reason — see `isReasonlessBounce`).
@@ -399,7 +410,7 @@ export { decideParkToHuman, findContradictoryReviewVerdicts, decideContradictory
  *     a gate re-derive. REFUSED unless a live `review:accepted` is already on the PR: a re-stamp may only carry
  *     an acceptance ACROSS a head move, never manufacture one.
  * @param {{to:('accepted'|'changes'|'rearm'|'clear-human'), currentLabels?:Array, findingCount?:number|null,
- *   reason?:string, humanOnlyHold?:boolean, redTeamRulingHold?:boolean, requireLive?:(null|'accepted'|'missing')}} o - `currentLabels` is the observed label array (string or `{name}` shape, per
+ *   reason?:string, humanOnlyHold?:boolean, redTeamRulingHold?:boolean, sentBackSameHead?:boolean, requireLive?:(null|'accepted'|'missing')}} o - `currentLabels` is the observed label array (string or `{name}` shape, per
  *   `hasReviewLabel`). `findingCount` and `reason` are the #3334 decision inputs: how many findings the juror
  *   raised (tri-state — `null` is UNKNOWN and never refuses) and the reason the caller stated, if any. They are
  *   ARGUMENTS, never fetched: this function is pure and stays pure. `requireLive` (#4333, `rearm` only) is the
@@ -409,7 +420,7 @@ export { decideParkToHuman, findContradictoryReviewVerdicts, decideContradictory
  *   its CLI also binds OPEN state and the pushed head before writing and verifies the result afterward.
  * @returns {{allowed:boolean, addLabel:string, removeLabels:string[], keepsHuman:boolean, reason:string}}
  */
-export function decideSetLabel({ to, currentLabels, findingCount = null, reason = '', requireLive = null, humanCarry = null, humanOnlyHold = false, redTeamRulingHold = false, acceptanceStillCoversHead = false, humanClearedHead = false, operatorRestamp = false } = {}) {
+export function decideSetLabel({ to, currentLabels, findingCount = null, reason = '', requireLive = null, humanCarry = null, humanOnlyHold = false, redTeamRulingHold = false, sentBackSameHead = false, acceptanceStillCoversHead = false, humanClearedHead = false, operatorRestamp = false } = {}) {
   // we:scripts/review-set-label.mjs#decideSetLabel — only the targets in the closed set are valid.
   if (!REVIEW_LABEL_TARGETS.includes(to)) {
     throw new Error(
@@ -687,6 +698,13 @@ export function decideSetLabel({ to, currentLabels, findingCount = null, reason 
   // narrower and is tracked separately (`backlog/xy5uey0-…md`, needs `redteam:accepted` to earn its own
   // SHA-marker producer, #2896) rather than fixed by blanket-stripping here.
   if (to === 'accepted') {
+    if (sentBackSameHead) {
+      return {
+        allowed: false, addLabel: '', removeLabels: [],
+        keepsHuman: isHuman,
+        reason: 'accept refused — same-head red-team send-back stands or its evidence is unreadable; push the fix or retry the evidence read before accepting; nothing was changed',
+      };
+    }
     return {
       allowed: true,
       addLabel: REVIEW_LABELS.accepted,
@@ -1498,6 +1516,26 @@ export function runReviewLabelCli({
   // `restamp` stamps the markers — carrying them across a head the drain moved is the entire point — but it is
   // EXCLUDED from the independence check: no clearer is asserting anything, so there is nobody to be
   // independent OF. The acceptance it carries already passed that check when it was earned.
+  const sameHeadSendBack = (page, head) => {
+    try {
+      const valid = thread => Array.isArray(thread) && thread.every(c => c !== null
+        && typeof c === 'object' && !Array.isArray(c) && typeof c.body === 'string');
+      if (!valid(page) || typeof head !== 'string' || !/^[0-9a-f]{40}$/i.test(head)) throw new Error('send-back evidence unreadable');
+      const thread = page.length < PR_COMMENTS_PAGE_SIZE ? page : provider.readComments(repo, pr);
+      if (!valid(thread) || thread.length < page.length
+        || !page.every(c => thread.some(full => sameThreadComment(full, c)))) {
+        throw new Error('send-back thread incomplete');
+      }
+      const standingRuling = readGrantScope({ repo, pr: { number: Number(pr), headRefOid: head, comments: thread } }) ?? null;
+      // One stateless rule: the merge path's own reader (redTeamQueueReason without the label check).
+      const d = readRedTeamDisposition({ comments: thread, pr, head, repo, standingRuling });
+      return d.outcome === GATE_OUTCOMES.SENT_BACK && d.sendBack.length > 0;
+    } catch {
+      // Unknown evidence must never erase a send-back. Retry the read or push the fix.
+      return true;
+    }
+  };
+  const sentBackSameHead = to === 'accepted' && sameHeadSendBack(prCommentsReadable ? prComments : null, headSha);
   const stampsAcceptance = to === 'accepted' || to === 'clear-human' || to === 'restamp';
   const independence = (stampsAcceptance && to !== 'restamp')
     // #3067 WIRED HERE — the module's own header named this as the owed follow-up: the pure decider grew
@@ -1607,6 +1645,7 @@ export function runReviewLabelCli({
     requireLive: onlyIf,
     humanOnlyHold,
     redTeamRulingHold,
+    sentBackSameHead,
     acceptanceStillCoversHead: parseReviewedSha(prComments.filter(isTrustedMarkerAuthor)) === headSha,
     humanClearedHead: to === 'rearm' && headEverHumanCleared(rearmThread, headSha.trim()),
     operatorRestamp: to === 'restamp' && actorArg.trim().toLowerCase() === 'operator',
@@ -2061,6 +2100,23 @@ export function runReviewLabelCli({
   };
   recheckMissingRearm();
 
+  // Validate the fresh state before ANY write (ledger, comment or label swap).
+  // Check acceptance before the ledger and comment, then recheck at the swap for intervening changes.
+  if (to === 'accepted') {
+    let fresh;
+    try {
+      fresh = provider.readPrState(repo, pr);
+      if (fresh.headRefOid !== headSha) throw new Error('head changed before acceptance; hold retained');
+      assertMandatoryReferralsCleared(fresh, { repo, pr, ...referralOptions });
+    } catch (e) { fail(ghErr(e, 'acceptance evidence unreadable'), 1); }
+    const freshDecision = decideSetLabel({ to, currentLabels: fresh.labels,
+      sentBackSameHead: sameHeadSendBack(fresh.comments, fresh.headRefOid) });
+    if (!freshDecision.allowed) {
+      emit(`${JSON.stringify(refusalResult({ pr: Number(pr), decision: freshDecision }))}\n`);
+      process.exit(1);
+    }
+  }
+
   const ledgerVerdict = verdictForLabelTarget(to);
   let clearingLedgerMiss = false;
   let clearingLedgerError;
@@ -2140,6 +2196,11 @@ export function runReviewLabelCli({
         const fresh = provider.readPrState(repo, pr);
         if (fresh.headRefOid !== headSha && !(to === 'restamp' && newHeadArg && !mandatoryReferralState(fresh.comments).records.length)) throw new Error('head changed before acceptance; hold retained');
         assertMandatoryReferralsCleared(fresh, { repo, pr, ...referralOptions });
+        if (to === 'accepted') {
+          const freshDecision = decideSetLabel({ to, currentLabels: fresh.labels,
+            sentBackSameHead: sameHeadSendBack(fresh.comments, fresh.headRefOid) });
+          if (!freshDecision.allowed) throw new Error(freshDecision.reason);
+        }
         // PR #5273: the human-surface sweep can park `review:human` after the first read; this clearance supersedes
         // that park at this head, so remove it too. Any other concurrent hold keeps the first read's view.
         if (to === 'clear-human' && !removals.includes(REVIEW_LABELS.human)
