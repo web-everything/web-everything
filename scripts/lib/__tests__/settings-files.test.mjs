@@ -444,6 +444,13 @@ describe('the real layout (we:scripts/settings/ + legacy dispatch-settings.json)
     expect(real.duplicates).toEqual([]);
   });
 
+  it('declares catch-up ordering and first-listing defaults in merge-queue settings', () => {
+    for (const leaf of ['cleanFirst', 'snapshotFirst']) {
+      expect(real.settings.mergeQueue.enqueueOnEvent.catchUp[leaf]).toBe(true);
+      expect(real.owners[`mergeQueue.enqueueOnEvent.catchUp.${leaf}`]).toBe('settings/merge-queue.json');
+    }
+  });
+
   it('feature files are kebab-case <feature>.json objects', () => {
     for (const f of readdirSync(SETTINGS_DIR)) expect(f).toMatch(FEATURE_FILE_RE);
   });
@@ -454,7 +461,11 @@ describe('the real layout (we:scripts/settings/ + legacy dispatch-settings.json)
     expect(extra, `new keys in scripts/dispatch-settings.json: ${extra.join(', ')} — ${LEGACY_FILE_GUARD_HINT}`).toEqual([]);
   });
 
-  it('names every script that still reads the legacy file directly (those readers never see scripts/settings/)', () => {
+  it('names every direct legacy-file reader, distinguishing declaration inventories from legacy-only runtime readers', () => {
+    // Inventories inspect individual files for ownership, but also read scripts/settings/ through the checked
+    // loader. Keep them out of LEGACY_ONLY_READERS: overlay-dropped uses that list to warn about lost settings.
+    // settings-registry.test.mjs covers feature-file values, shared ownership and fail-closed checked reads.
+    const declarationInventories = ['scripts/lib/settings-registry.mjs'];
     const root = join(SETTINGS_DIR, '..', '..');
     const stripComments = (src) => src.replace(/\/\*[\s\S]*?\*\//g, '').replace(/^\s*\/\/.*$/gm, '');
     const direct = [];
@@ -471,7 +482,7 @@ describe('the real layout (we:scripts/settings/ + legacy dispatch-settings.json)
       }
     };
     walk(join(root, 'scripts'));
-    expect(direct.sort(), 'a script reads scripts/dispatch-settings.json directly: read it through readSettings() (scripts/lib/settings-files.mjs) or list it in LEGACY_ONLY_READERS').toEqual([...LEGACY_ONLY_READERS].sort());
+    expect(direct.sort(), 'an unclassified script reads scripts/dispatch-settings.json directly: runtime readers should use readSettings() (scripts/lib/settings-files.mjs); classify declaration inventories separately from LEGACY_ONLY_READERS').toEqual([...LEGACY_ONLY_READERS, ...declarationInventories].sort());
   });
 
   it('the legacy-file guard message does not promise that every reader sees scripts/settings/', () => {

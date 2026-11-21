@@ -49,7 +49,7 @@ describe('shared review seats across repos', () => {
 
   it('does not spend a repo\'s turn on ticks with no free seat (seats 1,0,0 repeating over three repos)', async () => {
     const runAll = await fresh();
-    const three = ['fixture/a', 'fixture/b', 'fixture/c'];
+    const three = ['web-everything/web-everything', 'frontier-ui/frontierui', 'plateauapp/plateau-app'];
     const opts = { ...options(), repos: three };
     const seen = [];
     for (const left of [1, 0, 0, 1, 0, 0, 1, 0, 0]) {
@@ -70,7 +70,7 @@ describe('shared review seats across repos', () => {
 
   it('moves past a repo whose seat was spent without a dispatch (failed start, recovery, throw after take)', async () => {
     const runAll = await fresh();
-    const three = ['fixture/a', 'fixture/b', 'fixture/c'];
+    const three = ['web-everything/web-everything', 'frontier-ui/frontierui', 'plateauapp/plateau-app'];
     const first = [];
     // Each repo spends the one seat but reports no dispatch: the turn must still pass to the next repo.
     for (let i = 0; i < 3; i++) {
@@ -89,7 +89,7 @@ describe('shared review seats across repos', () => {
 
   it('a non-seat failure on a tick with no free seat does not spend the repo turn', async () => {
     const runAll = await fresh();
-    const three = ['fixture/a', 'fixture/b', 'fixture/c'];
+    const three = ['web-everything/web-everything', 'frontier-ui/frontierui', 'plateauapp/plateau-app'];
     const noSeat = { repos: three, log() {}, hostAdmission: () => ({ admitted: true, maxPerTick: 0 }),
       tick: () => ({ reviewsOwed: 1, dispatched: [], failed: [{ prNumber: 1, error: 'pause notice: x' }], refusals: 0 }) };
     runAll(noSeat); runAll(noSeat);
@@ -101,7 +101,7 @@ describe('shared review seats across repos', () => {
 
   it('moves past a repo that kept a live-review seat on a live-job skip (seat pool without a host take)', async () => {
     const runAll = await fresh();
-    const three = ['fixture/a', 'fixture/b', 'fixture/c'];
+    const three = ['web-everything/web-everything', 'frontier-ui/frontierui', 'plateauapp/plateau-app'];
     const order = [];
     for (let i = 0; i < 3; i++) {
       const shared = { live: 7, max: 8, left: 1, reason: 'live review rounds 7 of maxLiveReviewRounds=8 (tool)' };

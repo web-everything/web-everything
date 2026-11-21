@@ -13,7 +13,7 @@ import { tmpdir } from 'node:os';
 import { pathToFileURL } from 'node:url';
 import { execFile, execFileSync } from 'node:child_process';
 import { join } from 'node:path';
-import { afterEach, beforeEach, describe, it, expect } from 'vitest';
+import { afterEach, beforeEach, describe, it, expect, vi } from 'vitest';
 
 import {
   RUN_RECORD_VERSION,
@@ -28,6 +28,7 @@ import {
   validateRunRecord,
   isPollableHandle,
 } from '../run-record.mjs';
+import * as daemonEvents from '../../lib/daemon-events.mjs';
 import { inFlight, inFlightEntries } from '../effect-executor.mjs';
 import {
   createFileRunStore,
@@ -72,6 +73,8 @@ describe('the pure core', () => {
     expect(isValidRunId('run-8f14e45f')).toBe(true);
     expect(() => newRunRecord({ id: '../escape', op: 'x' })).toThrow(/invalid run id/);
     expect(() => runPath('../escape', dir)).toThrow(/invalid run id/);
+    expect(() => tryReadRun('../escape', dir)).toThrow(/invalid run id/);
+    expect(() => readRun('../escape', dir)).toThrow(/invalid run id/);
   });
 
   it('reports EVERY validation error, not just the first', () => {
@@ -267,6 +270,42 @@ describe('a corrupt record is REFUSED, never read as absent', () => {
     expect(parsed.ok).toBe(false);
     expect(parsed.corrupt).toBe(true);
     expect(parsed.reason).toMatch(pattern);
+  });
+
+  it('skips tombstones and stray JSON, reporting each unexpected path only once across listings', () => {
+    const alert = vi.spyOn(daemonEvents, 'appendDaemonEvent').mockResolvedValue(true);
+    try {
+      writeRun(sample(), dir);
+      for (const name of ['x y.json', 'review-pr-abc.abandoned.json', 'record.tmp']) {
+        writeFileSync(join(dir, name), '{}');
+      }
+      expect(listRunIds(dir)).toEqual(['run-sample']);
+      expect(listRunIds(join(dir, '.'))).toEqual(['run-sample']);
+      expect(alert).toHaveBeenCalledTimes(1);
+      expect(alert).toHaveBeenCalledWith({ kind: 'run-store-invalid-entry', detail: { path: join(dir, 'x y.json') } });
+    } finally { alert.mockRestore(); }
+  });
+
+  it('retries throws, rejections and failed deliveries, suppressing concurrent and delivered alerts', async () => {
+    const alert = vi.spyOn(daemonEvents, 'appendDaemonEvent').mockImplementationOnce(() => { throw new Error('unavailable'); })
+      .mockRejectedValueOnce(new Error('unavailable')).mockResolvedValueOnce(false).mockResolvedValue(true);
+    try {
+      writeFileSync(join(dir, 'x y.json'), '{}');
+      expect(listRunIds(dir)).toEqual([]);
+      expect(listRunIds(dir)).toEqual([]);
+      expect(listRunIds(dir)).toEqual([]);
+      expect(alert).toHaveBeenCalledTimes(2);
+      await new Promise(resolve => setImmediate(resolve));
+      expect(listRunIds(dir)).toEqual([]);
+      expect(alert).toHaveBeenCalledTimes(3);
+      await new Promise(resolve => setImmediate(resolve));
+      expect(listRunIds(dir)).toEqual([]);
+      expect(listRunIds(dir)).toEqual([]);
+      expect(alert).toHaveBeenCalledTimes(4);
+      await new Promise(resolve => setImmediate(resolve));
+      expect(listRunIds(dir)).toEqual([]);
+      expect(alert).toHaveBeenCalledTimes(4);
+    } finally { alert.mockRestore(); }
   });
 
   it('tryReadRun THROWS on a corrupt file rather than returning null (which would restart the run)', () => {

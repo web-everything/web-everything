@@ -54,11 +54,11 @@ describe('clear-human CLI hold ceremony', () => {
     vi.stubEnv('WE_VERDICT_LEDGER_BOARD', '');
   });
   afterEach(() => { vi.unstubAllEnvs(); vi.restoreAllMocks(); rmSync(dir, { recursive: true, force: true }); });
-  function run(hold, currentLabels = labels, comments = [], thread = comments, identity = { login: 'chalbert', type: 'User' }) {
+  function run(hold, currentLabels = labels, comments = [], thread = comments, identity = { login: 'chalbert', type: 'User' }, extraArgv = [], heads = []) {
     const provider = {
       currentRepo: () => 'o/n', name: 'stub',
       readPostingIdentity: vi.fn(() => { if (identity instanceof Error) throw identity; return identity; }),
-      readPrState: () => ({ state: 'OPEN', headRefOid: head, headRefName: 'lane/x', baseRefName: 'release', labels: currentLabels, comments, body: '' }),
+      readPrState: () => ({ state: 'OPEN', headRefOid: heads.length ? heads.shift() : head, headRefName: 'lane/x', baseRefName: 'release', labels: currentLabels, comments, body: '' }),
       readComments: () => thread,
       readLabels: () => currentLabels, setLabels: vi.fn(), postComment: vi.fn(),
     };
@@ -68,10 +68,28 @@ describe('clear-human CLI hold ceremony', () => {
     vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
     let exitCode = 0;
     try {
-      runReviewLabelCli({ argv: ['7', '--repo=o/n', '--to=clear-human', '--actor=operator', '--reason=reviewed the workflow'], allowClearHuman: true, defaultActor: 'test', usage: 'test', provider, readHumanOnlyHold, buildComment: buildVerdictComment, successResult: o => ({ ok: true, ...o }), refusalResult: ({ decision }) => ({ error: decision.reason }), emit: s => chunks.push(s) });
+      runReviewLabelCli({ argv: ['7', '--repo=o/n', '--to=clear-human', '--actor=operator', '--reason=reviewed the workflow', ...extraArgv], allowClearHuman: true, defaultActor: 'test', usage: 'test', provider, readHumanOnlyHold, buildComment: buildVerdictComment, successResult: o => ({ ok: true, ...o }), refusalResult: ({ decision }) => ({ error: decision.reason }), emit: s => chunks.push(s) });
     } catch (e) { if (typeof e.exitCode === 'number') exitCode = e.exitCode; else throw e; }
     return { provider, readHumanOnlyHold, exitCode, payload: JSON.parse(chunks.join('') || '{}') };
   }
+  it('clear-human accepts a valid head pin', () => {
+    const r = run(true, labels, [], [], undefined, [`--expect-head=${head}`]);
+    expect(r.exitCode).toBe(0);
+    expect(r.provider.setLabels).toHaveBeenCalled();
+  });
+  it.each([
+    ['mismatch on initial read', [`--expect-head=${'b'.repeat(40)}`], []],
+    ['head moves on pre-write re-read', [`--expect-head=${head}`], [head, 'b'.repeat(40)]],
+    ['malformed pin', ['--expect-head=abc'], []],
+    ['empty new-head with pin', [`--expect-head=${head}`, '--new-head='], []],
+    ['bare new-head with pin', [`--expect-head=${head}`, '--new-head'], []],
+    ['new-head with pin', [`--expect-head=${head}`, `--new-head=${head}`], []],
+  ])('clear-human refuses %s without writing', (_name, args, heads) => {
+    const r = run(true, labels, [], [], undefined, args, [...heads]);
+    expect(r.exitCode).not.toBe(0);
+    expect(r.provider.setLabels).not.toHaveBeenCalled();
+    expect(r.provider.postComment).not.toHaveBeenCalled();
+  });
   it.each([
     ['automation credentials', { login: 'web-everything', type: 'User' }],
     ['an allowlisted Bot', { login: 'chalbert', type: 'Bot' }],

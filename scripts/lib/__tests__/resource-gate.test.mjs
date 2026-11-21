@@ -196,17 +196,18 @@ describe('settings — one resourceGate block through the policy cascade, with s
       tool: { fixCap: { holdCpuIdleBelowPct: 12 } },
       env: { WE_FIX_DISPATCH_MAX_CONCURRENT: '8', WE_RESOURCE_CUTOVER: 'enforce', WE_FIX_CAP_RAISE_MAX_SWAP_USED_PCT: '50' }, legacyFloor: 2,
     });
-    expect(r.settings).toEqual({ cutover: 'enforce', fixCap: { floor: 8, ceiling: 12, ceilingAboveFloor: 4, raiseQueueOver: 3, raiseStepPerPass: 2,
+    expect(r.settings).toEqual({ cutover: 'enforce', fixCap: { floor: 8, ceiling: 16, ceilingAboveFloor: 4, raiseQueueOver: 3, raiseStepPerPass: 2,
       raiseMinMemFreePct: 40, raiseMaxSwapUsedPct: 50, raiseMaxHeavyWaitMinutes: 15,
       lowerBelowMemFreePct: 15, lowerAboveSwapUsedPct: 90, lowerAboveHeavyWaitMinutes: 45, lowerBy: 4, lowerMinimum: 2,
       holdCpuIdleBelowPct: 12 } });
     expect(r.sources).toMatchObject({ cutover: 'env WE_RESOURCE_CUTOVER', 'fixCap.floor': 'env WE_FIX_DISPATCH_MAX_CONCURRENT',
-      'fixCap.ceiling': 'floor + 4', 'fixCap.raiseQueueOver': 'platform', 'fixCap.holdCpuIdleBelowPct': 'tool', 'fixCap.raiseStepPerPass': 'standard',
+      'fixCap.ceiling': 'standard', 'fixCap.raiseQueueOver': 'platform', 'fixCap.holdCpuIdleBelowPct': 'tool', 'fixCap.raiseStepPerPass': 'standard',
       'fixCap.raiseMaxSwapUsedPct': 'env WE_FIX_CAP_RAISE_MAX_SWAP_USED_PCT' });
     expect(r.invalid).toEqual(['platform.fixCap.ceiling="lots"']);
   });
   it('defaults: enforce; floor = the legacy static cap; a ceiling below the floor is raised to it', () => {
     expect(RESOURCE_GATE_STANDARD.cutover).toBe('enforce');
+    expect(resolveResourceGateSettings().settings.fixCap.ceiling).toBe(16);
     const r = resolveResourceGateSettings({ tool: { fixCap: { ceiling: 3 } }, env: {}, legacyFloor: 6 });
     expect(r.settings.fixCap).toMatchObject({ floor: 6, ceiling: 6 });
     expect(r.sources['fixCap.floor']).toBe('standard (fixDispatchMaxConcurrent)');

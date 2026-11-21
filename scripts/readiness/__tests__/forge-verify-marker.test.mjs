@@ -9,6 +9,8 @@ let scratch,repo;
 const verify=resolve('scripts/verify-lane.mjs'),client=new URL('../remote-exec.mjs',import.meta.url).href;
 beforeEach(()=>{
   scratch=mkdtempSync(join(process.env.TMPDIR,'forge-marker-'));repo=join(scratch,'mac');mkdirSync(repo);
+  mkdirSync(join(scratch,'.claude'));
+  writeFileSync(join(scratch,'.claude','platform-preferences.json'),'{}');
   const git=(...args)=>{const r=spawnSync('git',args,{cwd:repo,encoding:'utf8'});expect(r.status,r.stderr).toBe(0);};
   git('init','-q');
   writeFileSync(join(repo,'package.json'),'{}');writeFileSync(join(repo,'package-lock.json'),'{}');
@@ -25,6 +27,12 @@ it('real verify-lane runGate hands WE_FORGE_GATE_DISPATCH=1 without a held local
   // Only telemetry IO is fake: verify's real policy, health check and admission plan still run.
   const loader=join(scratch,'telemetry-loader.mjs'),preload=join(scratch,'preload.mjs');
   const telemetry=new URL('../forge-telemetry.mjs',import.meta.url).href;
+  const admission=new URL('../heavy-admission.mjs',import.meta.url).href;
+  const admissionSource=`
+export * from ${JSON.stringify(admission+'?actual')};
+import {loadAdmissionPolicy as load} from ${JSON.stringify(admission+'?actual')};
+export const loadAdmissionPolicy=options=>load({...options,home:${JSON.stringify(scratch)}});
+`;
   const telemetrySource=`
 export * from ${JSON.stringify(telemetry+'?actual')};
 import {easternTimestamp} from ${JSON.stringify(new URL('../forge-exec-run.mjs',import.meta.url).href)};
@@ -32,6 +40,7 @@ export async function readForgeTelemetry(){return {sampledAtET:easternTimestamp(
 `;
   writeFileSync(loader,`export async function load(url,context,next) {
     if(url===${JSON.stringify(telemetry)})return {format:'module',shortCircuit:true,source:${JSON.stringify(telemetrySource)}};
+    if(url===${JSON.stringify(admission)})return {format:'module',shortCircuit:true,source:${JSON.stringify(admissionSource)}};
     return next(url,context);
   }`);
   writeFileSync(preload,`import {register} from 'node:module';register(${JSON.stringify(pathToFileURL(loader).href)},import.meta.url);`);
@@ -42,6 +51,7 @@ import {writeFileSync} from 'node:fs';
 const evidence={held:process.env.WE_HEAVY_ADMISSION_HELD??null,dispatch:process.env.WE_FORGE_GATE_DISPATCH};
 writeFileSync(${JSON.stringify(wire)},JSON.stringify(evidence));
 await main(['run','--repo='+process.cwd(),'--','npm','run','check:standards'],{
+  home:${JSON.stringify(scratch)},
   remoteExec:async options=>{
     writeFileSync(${JSON.stringify(wire)},JSON.stringify({...evidence,argv:options.argv}));
     return {mode:'remote',code:0,run:'r-fixture'};
@@ -89,6 +99,7 @@ const exec=async call=>{
   throw new Error('Unexpected transport');
 };
 const result=await main({argv:['npm','run','check:standards'],cwd:process.cwd(),env:process.env,exec,
+  home:${JSON.stringify(scratch)},
   listFiles:async()=>['package.json','package-lock.json'],lockRoot:${JSON.stringify(join(scratch,'heavy'))},
   readTelemetry:async()=>({sampledAtET:(await import(${JSON.stringify(new URL('../forge-exec-run.mjs',import.meta.url).href)})).easternTimestamp(Date.now()),cores:8,loadPerCore:0.1,memFreePct:90,activeRuns:0,recent:[]}),
   local:async()=>19,log:()=>{},stderr:()=>{}});

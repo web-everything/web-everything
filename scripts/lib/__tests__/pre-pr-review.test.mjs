@@ -158,13 +158,14 @@ describe('lane sandbox: checkPrePrReview + open-pr runner', () => {
     const r = checkPrePrReview({ cwd: dir, env: { WE_CONVEYOR_WORKER: '1' }, settings: enforce });
     expect(r).toMatchObject({ action: 'pass', why: 'low-risk' });
   });
-  it('the open-pr runner refuses before spawning pr-land, and a recorded bypass admits', () => {
+  it('the open-pr runner collects a refusal through check-only pr-land, and a recorded bypass admits', () => {
     commit({ 'scripts/big.mjs': 'x\n'.repeat(400) });
     process.env.WE_PRE_PR_BYPASS_DIR = join(dir, 'bypass-records');
     const spawned = [];
     let sentBody = ''; // the temp body copy is removed once the spawn returns, so read it inside the spawn
     const spawn = (...a) => {
       spawned.push(a);
+      if (a[1].includes('--check')) return { status: 0, stdout: '{"reason":"check-ok"}' };
       const bf = a[1].find((x) => x.startsWith('--body-file='));
       if (bf) sentBody = readFileSync(bf.slice(12), 'utf8');
       return { status: 0, stdout: '{"pr":1,"url":"u"}\n', stderr: '' };
@@ -173,14 +174,16 @@ describe('lane sandbox: checkPrePrReview + open-pr runner', () => {
     const argv = ['--ref=lane/x', '--base=main', '--body-file=/tmp/b.md', '--label-on-green'];
     const out = run({ argv });
     expect(out).toMatchObject({ outcome: 'refused', reason: 'pre-pr-review-missing' });
-    expect(spawned).toHaveLength(0);
+    expect(spawned).toHaveLength(1); expect(spawned[0][1]).toContain('--check');
     // worker bypass is refused, even with an actor and an instruction
     const w = createPrLandRunner({ canonicalAudit: () => ({ ok: true }), prepGate: () => ({ ok: true }), readPrepBody: () => '', prePrReview: enforcedCheck, spawn, cwd: dir, env: { WE_CONVEYOR_WORKER: '1' } });
     expect(w({ argv, skipPrePrReview: 'x', actor: 'nic', operatorInstruction: 'ok it' })).toMatchObject({ outcome: 'refused', reason: 'pre-pr-review-missing' });
     // an interactive bypass with no operator instruction is refused
     expect(run({ argv, skipPrePrReview: 'emergency hotfix' })).toMatchObject({ outcome: 'refused' });
     expect(run({ argv, skipPrePrReview: 'emergency hotfix', actor: 'nic' })).toMatchObject({ outcome: 'refused' });
-    expect(spawned).toHaveLength(0);
+    expect(spawned).toHaveLength(4);
+    expect(spawned.every(([, args]) => args.includes('--check'))).toBe(true);
+    spawned.length = 0;
     const body = join(dir, 'b.md'); writeFileSync(body, 'body\n');
     const argv2 = ['--ref=lane/x', '--base=main', `--body-file=${body}`, '--label-on-green'];
     const ok = run({ argv: argv2, skipPrePrReview: 'emergency hotfix', actor: 'nic', operatorInstruction: 'operator said: ship the hotfix' });
@@ -206,7 +209,7 @@ describe('gate hardening (PR #4271 review)', () => {
   const bypassTmp = () => readdirSync(tmpdir()).filter((n) => n.startsWith('open-pr-bypass-'));
   const OPERATOR = { PATH: process.env.PATH };
   const enforceSettings = () => ({ settings: { ...S, mode: 'enforce' }, error: '' });
-  const okSpawn = (spawned) => (...a) => { spawned.push(a); return { status: 0, stdout: '{"pr":1,"url":"u"}\n', stderr: '' }; };
+  const okSpawn = (spawned) => (...a) => { spawned.push(a); return { status: 0, stdout: a[1].includes('--check') ? '{"reason":"check-ok"}' : '{"pr":1,"url":"u"}\n', stderr: '' }; };
   beforeEach(() => {
     dir = realpathSync(mkdtempSync(join(tmpdir(), 'pre-pr-h-')));
     git('init', '-q', '-b', 'main'); commit({ 'README.md': 'x\n' });
@@ -216,35 +219,35 @@ describe('gate hardening (PR #4271 review)', () => {
   afterEach(() => { rmSync(dir, { recursive: true, force: true }); delete process.env.WE_PRE_PR_BYPASS_DIR; });
 
   describe('fail closed', () => {
-    it('refuses before spawning pr-land when the enforced pre-review check throws', () => {
+    it('refuses after check-only pr-land when the enforced pre-review check throws', () => {
       const spawned = [];
       const run = createPrLandRunner({ canonicalAudit: () => ({ ok: true }), prepGate: () => ({ ok: true }), readPrepBody: () => '', prePrReview: () => { throw new Error('boom'); }, loadSettings: enforceSettings, spawn: okSpawn(spawned), cwd: dir, env: OPERATOR });
       expect(run({ argv: ['--ref=lane/x', '--base=main'] })).toMatchObject({ outcome: 'refused', reason: 'pre-pr-review-error', detail: expect.stringMatching(/boom.*fail closed/s) });
-      expect(spawned).toHaveLength(0);
+      expect(spawned).toHaveLength(1); expect(spawned[0][1]).toContain('--check');
     });
-    it('refuses before spawning pr-land when the check returns no usable decision (null, {}, an unknown action)', () => {
+    it('refuses after check-only pr-land when the check returns no usable decision (null, {}, an unknown action)', () => {
       for (const result of [null, undefined, {}, { action: 'bogus' }, { action: 'PASS' }]) {
         const spawned = [];
         const run = createPrLandRunner({ canonicalAudit: () => ({ ok: true }), prepGate: () => ({ ok: true }), readPrepBody: () => '', prePrReview: () => result, loadSettings: enforceSettings, spawn: okSpawn(spawned), cwd: dir, env: OPERATOR });
         expect(run({ argv: ['--ref=lane/x', '--base=main'] }), JSON.stringify(result)).toMatchObject({ outcome: 'refused', reason: 'pre-pr-review-error' });
-        expect(spawned).toHaveLength(0);
+        expect(spawned).toHaveLength(1); expect(spawned[0][1]).toContain('--check');
       }
     });
-    it('refuses (never throws, never spawns) when even the settings read on the failure path throws', () => {
+    it('refuses without publishing when settings also fail when even the settings read on the failure path throws', () => {
       const spawned = [];
       const run = createPrLandRunner({ canonicalAudit: () => ({ ok: true }), prepGate: () => ({ ok: true }), readPrepBody: () => '',
         prePrReview: () => { throw new Error('boom'); }, loadSettings: () => { throw new Error('settings exploded'); },
         spawn: okSpawn(spawned), cwd: dir, env: OPERATOR,
       });
       expect(run({ argv: ['--ref=lane/x', '--base=main'] })).toMatchObject({ outcome: 'refused', reason: 'pre-pr-review-error', detail: expect.stringMatching(/boom.*settings exploded/s) });
-      expect(spawned).toHaveLength(0);
+      expect(spawned).toHaveLength(1); expect(spawned[0][1]).toContain('--check');
     });
     it('refuses a thrown check when the mode on the failure path is anything but advise/off (unknown means enforce)', () => {
       for (const loadSettings of [() => ({ settings: {} }), () => ({ settings: { mode: 'enforse' } }), () => ({})]) {
         const spawned = [];
         const run = createPrLandRunner({ canonicalAudit: () => ({ ok: true }), prepGate: () => ({ ok: true }), readPrepBody: () => '', prePrReview: () => { throw new Error('boom'); }, loadSettings, spawn: okSpawn(spawned), cwd: dir, env: OPERATOR });
         expect(run({ argv: ['--ref=lane/x', '--base=main'] })).toMatchObject({ outcome: 'refused', reason: 'pre-pr-review-error' });
-        expect(spawned).toHaveLength(0);
+        expect(spawned).toHaveLength(1); expect(spawned[0][1]).toContain('--check');
       }
     });
     it('under advise/off a thrown check proceeds, loudly', () => {
@@ -264,7 +267,7 @@ describe('gate hardening (PR #4271 review)', () => {
       const spawned = [];
       const run = createPrLandRunner({ canonicalAudit: () => ({ ok: true }), prepGate: () => ({ ok: true }), readPrepBody: () => '', prePrReview: enforcedCheck, loadSettings: () => ({ settings: { ...S, mode: "enforce" }, error: "" }), spawn: okSpawn(spawned), cwd: dir, env: OPERATOR });
       expect(run({ argv: ['--ref=lane/x', '--base=no-such-base'] })).toMatchObject({ outcome: 'refused', reason: 'pre-pr-review-error' });
-      expect(spawned).toHaveLength(0);
+      expect(spawned).toHaveLength(1); expect(spawned[0][1]).toContain('--check');
     });
     it('a settings file that cannot be trusted warns on stderr (the gate result carries settingsError)', () => {
       const err = vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
@@ -282,7 +285,7 @@ describe('gate hardening (PR #4271 review)', () => {
       const body = join(dir, 'b.md'); writeFileSync(body, 'body\n');
       expect(run({ argv: ['--ref=lane/x', '--base=main', `--body-file=${body}`], skipPrePrReview: 'hotfix', actor: 'nic', operatorInstruction: 'ship it' }))
         .toMatchObject({ outcome: 'refused', reason: 'pre-pr-review-error' });
-      expect(spawned).toHaveLength(0);
+      expect(spawned).toHaveLength(1); expect(spawned[0][1]).toContain('--check');
     });
   });
 
@@ -295,7 +298,7 @@ describe('gate hardening (PR #4271 review)', () => {
     const body = join(dir, 'b.md'); writeFileSync(body, 'body\n');
     expect(run({ argv: ['--ref=lane/x', '--base=main', `--body-file=${body}`], skipPrePrReview: 'hotfix', actor: 'nic', operatorInstruction: 'ship it' }))
       .toMatchObject({ outcome: 'refused', reason: 'pre-pr-review-error' });
-    expect(spawned).toHaveLength(0);
+    expect(spawned).toHaveLength(1); expect(spawned[0][1]).toContain('--check');
   });
 
   it('a --dry-run is never gated: a refusing or throwing check is not consulted and pr-land is still spawned', () => {

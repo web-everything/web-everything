@@ -5,8 +5,9 @@ import { join } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 
 const SOURCE = 'skills-src/conveyor/review-daemon.mjs';
-const DECLINING_REPO = 'review-cap-fixture/declining';
-const HEALTHY_REPO = 'review-cap-fixture/healthy';
+// Use registered review-capable identities so dispatch admission reaches the injected outcomes.
+const DECLINING_REPO = 'web-everything/web-everything';
+const HEALTHY_REPO = 'frontier-ui/frontierui';
 
 export default {
   id: 'review-live-round-cap-accounting',

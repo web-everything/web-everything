@@ -16,6 +16,7 @@ import { prioritizeMainFix as prioritizeCardsTest } from '../merge-queue-hook.mj
 import { afterEach, describe, it, expect, vi } from 'vitest';
 import { readApprovedHumanSurfaceHold, refreshApprovedHeadChecked, resolveSkipRebaseApprovedHumanSurface } from '../approved-human-surface-hold.mjs';
 import { createMqLiveReader } from '../drain-queue-safety.mjs';
+import { assertCapability } from '../repo-profile.mjs';
 import { SETTINGS_DIR } from '../settings-files.mjs';
 import { execFileSync } from 'node:child_process';
 import { readFileSync, mkdtempSync, writeFileSync } from 'node:fs';
@@ -326,6 +327,7 @@ describe('R761 step 0 — fail-open guards', () => {
     const calls = [], warnings = [], rebases = [], reruns = [];
     const candidate = { num: 7, repo: REPO, headSha: head };
     const dependencies = {
+      assertCapability,
       approvedHeadSetting: resolveSkipRebaseApprovedHumanSurface({
         env: { WE_MERGE_QUEUE_SKIP_REBASE_APPROVED_HUMAN_SURFACE: override },
         readFile: () => {

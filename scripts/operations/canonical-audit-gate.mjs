@@ -25,7 +25,7 @@ function wellFormedAudit(record) {
 }
 
 export function checkCanonicalAuditForOpen({ repo = process.cwd(), ref, sha, env = process.env,
-  readFile = readFileSync, exec = execFileSync, fetchMain: fetchMainOpt, ancestor: ancestorOpt,
+  readFile = readFileSync, exec = execFileSync, fetchMain: fetchMainOpt, refreshMain = false, ancestor: ancestorOpt,
   liveFingerprint: liveFingerprintOpt, warn = message => console.warn(message),
 } = {}) {
   const git = (...args) => String(exec('git', ['-C', repo, ...args], {
@@ -37,6 +37,20 @@ export function checkCanonicalAuditForOpen({ repo = process.cwd(), ref, sha, env
     message: 'cannot resolve the PR source to a full 40-hex sha; resolve it with git rev-parse, then run node scripts/operations/run.mjs codex-audit --base=origin/main --head=<fullsha>' };
   const refuse = (reason, detail) => ({ ok: false, reason, record: null, sha: fullSha,
     message: `${detail}. Run node scripts/operations/run.mjs codex-audit --base=origin/main --head=${fullSha}, then retry opening the PR.` });
+  let fetchAttempted = false, fetched = false, fetchError;
+  const fetchMain = () => {
+    if (!fetchAttempted) {
+      fetchAttempted = true;
+      try { (fetchMainOpt || (() => git('fetch', 'origin', 'main')))(); fetched = true; }
+      catch (error) { fetchError = String(error?.stderr || error?.message || error).trim(); }
+    }
+    if (!fetched) throw new Error(`main not refreshed: ${fetchError || 'origin/main fetch unavailable; retry when main can be read'}`);
+  };
+  // A preflight may read refs but must never admit evidence against an unrefreshed main.
+  if (refreshMain) {
+    try { fetchMain(); }
+    catch (error) { return refuse('canonical-audit-missing', error.message); }
+  }
   let records, config;
   try {
     // Same settings source and path resolution as the audit writer (codex-audit-io.mjs): the file beside
@@ -63,14 +77,6 @@ export function checkCanonicalAuditForOpen({ repo = process.cwd(), ref, sha, env
   } catch {
     return refuse('canonical-audit-missing', `no canonical codex-audit record for ${fullSha} (audit evidence or settings unreadable)`);
   }
-  let fetchAttempted = false, fetched = false;
-  const fetchMain = () => {
-    if (!fetchAttempted) {
-      fetchAttempted = true;
-      try { (fetchMainOpt || (() => git('fetch', 'origin', 'main')))(); fetched = true; } catch { /* no coverage */ }
-    }
-    if (!fetched) throw new Error('origin/main fetch unavailable; retry when main can be read');
-  };
   const ancestor = ancestorOpt || ((base, head) => { git('merge-base', '--is-ancestor', base, head); return true; });
   const covers = base => { try { fetchMain(); return ancestor(base, 'origin/main'); } catch { return false; } };
   const liveFingerprint = liveFingerprintOpt || (evidence => {
@@ -85,12 +91,24 @@ export function checkCanonicalAuditForOpen({ repo = process.cwd(), ref, sha, env
       return fp;
     } catch (e) { throw Object.assign(new Error(`live diff fingerprint unavailable (${String(e?.message || e).slice(0, 120)})`), { fingerprintLookup: true }); }
   });
+  // Unknown means no carry: any git failure, a non-merge head, or an unrelated audited head refuses.
+  const mergesIn = (auditedHead) => {
+    try {
+      if (!validSha(auditedHead) || auditedHead.toLowerCase() === fullSha) return false;
+      // Exactly two parents: the audited head first, the second already inside origin/main (a merge FROM main).
+      const parts = git('rev-list', '--parents', '-n', '1', fullSha).split(/\s+/).filter(Boolean).map(s => s.toLowerCase());
+      if (parts.length !== 3 || parts[0] !== fullSha || parts[1] !== auditedHead.toLowerCase() || !validSha(parts[2])) return false;
+      fetchMain();
+      return ancestor(parts[2], 'origin/main');
+    } catch { return false; }
+  };
   let evidence;
   try {
     const fp = liveFingerprint(records);
     evidence = canonicalAuditEvidence(records, fullSha, covers, fp);
     if (!evidence.ok && evidence.reason === 'weakened') {
       for (const entry of config.ruledWeakened) {
+        // Waivers stay exact-head only: a carried head needs its own waiver.
         if (entry.ref !== ref || !validSha(entry.sha) || entry.sha.toLowerCase() !== fullSha
           || !/^R\d+(?:\+R\d+)*$/.test(entry.ruling) || !Array.isArray(entry.findings)
           || !entry.findings.length || !entry.findings.every(f => typeof f === 'string' && f.trim())) continue;
@@ -107,6 +125,9 @@ export function checkCanonicalAuditForOpen({ repo = process.cwd(), ref, sha, env
   }
   // Evaluate every head's veto first, then require this head's own passing evidence to open.
   if (evidence.ok && evidence.record?.head === fullSha) return { ok: true, reason: null, message: '', record: evidence.record, sha: fullSha };
+  // Merge-from-main carry (R503 reuse): evidence.ok for another head already means its stored net-diff fingerprint
+  // equals the live one. It admits only when the live head is a merge commit that contains that audited head.
+  if (evidence.ok && mergesIn(evidence.record?.head)) return { ok: true, reason: null, message: '', record: evidence.record, sha: fullSha };
   return evidence.reason === 'weakened'
     ? refuse('canonical-audit-weakened', `latest canonical audit for ${fullSha} is WEAKENED and no ruledWeakened waiver matches ref+sha+findings`)
     : refuse('canonical-audit-missing', `no canonical codex-audit record for ${fullSha} with coverage of origin/main`);

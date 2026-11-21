@@ -76,7 +76,7 @@ export function renderPlist(task, host) {
   for (const [source, target] of [['workingDir', 'WorkingDirectory'], ['runAtLoad', 'RunAtLoad'], ['keepAlive', 'KeepAlive'], ['startInterval', 'StartInterval'], ['throttleInterval', 'ThrottleInterval'], ['processType', 'ProcessType'], ['stdout', 'StandardOutPath'], ['stderr', 'StandardErrorPath']]) {
     if (task[source] !== undefined) plist[target] = typeof task[source] === 'string' ? expand(task[source]) : task[source];
   }
-  plist.EnvironmentVariables = Object.fromEntries(Object.entries({ ...task.env, PATH: host.path }).sort(([a], [b]) => a < b ? -1 : a > b ? 1 : 0).map(([key, value]) => [key, key === 'PATH' ? value : expand(value)]));
+  plist.EnvironmentVariables = Object.fromEntries(Object.entries({ ...(host.developerDir ? { DEVELOPER_DIR: host.developerDir } : {}), ...task.env, PATH: host.path }).sort(([a], [b]) => a < b ? -1 : a > b ? 1 : 0).map(([key, value]) => [key, key === 'PATH' ? value : expand(value)]));
   return HEADER + xmlValue(plist) + '</plist>\n';
 }
 

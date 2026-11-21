@@ -75,3 +75,16 @@ describe('what the job does with the speculative pass', () => {
     }
   });
 });
+
+
+describe('review.extraSeats.concurrent', () => {
+  it('defaults on and resolves environment over tool over platform over standard', async () => {
+    const { resolveConcurrentSeats, loadConcurrentSeats } = await import('../review-speculative-red-team.mjs');
+    expect(resolveConcurrentSeats()).toMatchObject({ enabled: true, source: 'standard' });
+    expect(resolveConcurrentSeats({ platform: false })).toMatchObject({ enabled: false, source: 'platform' });
+    expect(resolveConcurrentSeats({ platform: false, tool: true })).toMatchObject({ enabled: true, source: 'tool' });
+    expect(resolveConcurrentSeats({ platform: true, tool: true, env: { WE_REVIEW_EXTRA_SEATS_CONCURRENT: 'off' } })).toMatchObject({ enabled: false, source: 'env' });
+    expect(resolveConcurrentSeats({ tool: 'invalid', platform: false })).toMatchObject({ enabled: false, source: 'platform', invalid: [expect.any(String)] });
+    expect(loadConcurrentSeats({ env: {}, toolFile: 'tool', platformFile: 'platform', readFile: p => JSON.stringify(p === 'tool' ? { extraSeats: { concurrent: false } } : {}) })).toMatchObject({ enabled: false, source: 'tool' });
+  });
+});

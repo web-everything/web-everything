@@ -16,6 +16,7 @@ import { join, resolve, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { spawnSync } from 'node:child_process';
 import { daemonAppEnv } from './fixtures/daemon-app-env.mjs';
+import { pinnedLeafDiffFixture } from './fixtures/pinned-leaf-diff-fixture.mjs';
 import { buildManifest, manifestBodyBlock } from '../readiness/lane-manifest.mjs';
 import { deriveResolutionBasis, graduatedToFromBody } from '../lib/review-render.mjs';
 
@@ -316,8 +317,8 @@ describe('withResolutionBasis — the drain park/skip comment (#2447)', () => {
 
 describe('buildDrainVerdicts — carries the graduatedTo sources the escalation pass derives the basis from (#2447)', () => {
   const green = [{ name: 'test', conclusion: 'SUCCESS' }];
-  const ghPr = (number, body) => ({ number, title: 't', body, headRefName: `lane/${number}-x`, statusCheckRollup: green, mergeable: 'MERGEABLE', mergeStateStatus: 'CLEAN', labels: [{ name: 'ready-to-merge' }] });
-  const verdictFor = (pr, manifest) => buildDrainVerdicts({ prsByRepo: new Map([[null, [pr]]]), readOf: () => ({ commits: [{ oid: 'abc' }], manifest }), repos: [null] })[0];
+  const ghPr = (number, body) => ({ baseRefName: 'main', number, title: 't', body, headRefName: `lane/${number}-x`, statusCheckRollup: green, mergeable: 'MERGEABLE', mergeStateStatus: 'CLEAN', labels: [{ name: 'ready-to-merge' }] });
+  const verdictFor = (pr, manifest) => buildDrainVerdicts({ defaultBranchOf: () => 'main', prsByRepo: new Map([[null, [pr]]]), readOf: () => ({ commits: [{ oid: 'abc' }], manifest }), repos: [null] })[0];
 
   it('attaches the manifest graduatedTo and the body note, which derive the banner for a backlog-only diff', () => {
     const manifest = buildManifest({ item: 2403, repos: [{ repo: 'we', ref: 'lane/2403-x' }], graduatedTo: '6b5874f7' });
@@ -367,7 +368,7 @@ describe('classifyPr — base is not the default branch: held with a named reaso
   it('base is not <default>: a PR on the default branch is unaffected; an unresolved default still holds a lane/* base', () => {
     const onDefault = verdictFor(ghPr(12, 'main'), () => 'main');
     expect(onDefault.decision).toBe('merge');
-    expect(onDefault.reason).toBe(classifyPr(ghPr(12, 'main')).reason);
+    expect(onDefault.reason).toBe(classifyPr(ghPr(12, 'main'), { defaultBranch: 'main' }).reason);
     // stack.reviewWhileBaseOpen (2026-10-10): a stacked lane PR now runs CI, so its `test` can be green. A failed
     // default-branch read must not let it land into its lane base: a lane/* base is held fail-closed.
     const stacked = verdictFor(ghPr(13, 'lane/mechanical-dispatcher'), () => null);
@@ -404,8 +405,8 @@ describe('fast-drain round listing snapshot', () => {
     expect(live).not.toHaveBeenCalled();
     expect(target).toHaveBeenCalledOnce();
     expect(result[0].headRefOid).toBe('new');
-    expect(classifyPr(old).decision).toBe('merge');
-    expect(classifyPr(result[0])).toMatchObject({ decision: 'skip', reviewHeld: true });
+    expect(classifyPr(old, { defaultBranch: 'main' }).decision).toBe('merge');
+    expect(classifyPr(result[0], { defaultBranch: 'main' })).toMatchObject({ decision: 'skip', reviewHeld: true });
     expect(log).toHaveBeenCalledWith(expect.stringContaining('served-from-snapshot'));
   });
   it.each([
@@ -455,8 +456,8 @@ describe('fast-drain round listing snapshot', () => {
     const { result } = await probe(snap(), { readTarget: async () => ({ ...old, state: 'OPEN', headRefOid: 'moved',
       statusCheckRollup: [{ name: 'test', status: 'COMPLETED', conclusion: 'FAILURE' }],
     }) });
-    expect(classifyPr(old).decision).toBe('merge');
-    expect(classifyPr(result[0])).toMatchObject({ decision: 'skip', reason: 'required check "test" is not green' });
+    expect(classifyPr(old, { defaultBranch: 'main' }).decision).toBe('merge');
+    expect(classifyPr(result[0], { defaultBranch: 'main' })).toMatchObject({ decision: 'skip', reason: 'required check "test" is not green' });
   });
   it('continues with live rows when the snapshot cannot be written', async () => {
     const { result, live, target } = await probe(null, { write: () => { throw new Error('EACCES'); } });
@@ -489,21 +490,21 @@ describe('fast-drain round listing snapshot', () => {
 
 describe('round listing freshness at the CLI boundary', () => {
   it('never places round snapshot rows in the live context cache', () => {
-    expect(buildLiveListingsByRepo([{ repo: 'fixture/repo', rows: [{ number: 42 }], listing: 'snapshot' }]).has('fixture/repo')).toBe(false);
+    expect(buildLiveListingsByRepo([{ repo: 'web-everything/web-everything', rows: [{ number: 42 }], listing: 'snapshot' }]).has('web-everything/web-everything')).toBe(false);
   });
 
   const run = (listing, { sendBack, reconcile = true, omitSibling = false, failListing = false, snapshotAgeMs = 0 } = {}) => {
     const dir = mkdtempSync(join(tmpdir(), 'drain-round-cli-'));
     try {
       const row = (number, item, blockedBy = []) => ({ number, title: `PR ${number}`, state: 'OPEN',
-        headRefName: `lane/${number}`, headRefOid: `sha${number}`, baseRefName: 'main', updatedAt: '2026-01-01T00:00:00Z',
+        headRefName: `lane/leaf-${number}`, headRefOid: number.toString(16).padStart(40, '0'), baseRefName: 'main', updatedAt: '2026-01-01T00:00:00Z',
         isDraft: false, mergeable: 'MERGEABLE', mergeStateStatus: 'CLEAN', files: [],
         labels: [{ name: 'ready-to-merge' }], statusCheckRollup: [{ __typename: 'CheckRun', name: 'test', status: 'COMPLETED', conclusion: 'SUCCESS', checkSuite: { workflowRun: { workflow: { name: 'test' } } } }],
-        body: manifestBodyBlock(buildManifest({ item, blockedBy, repos: [{ repo: 'we', ref: `lane/${number}` }] })) });
+        body: manifestBodyBlock(buildManifest({ item, blockedBy, repos: [{ repo: 'we', ref: `lane/leaf-${number}` }] })) });
       const target = row(42, 42, ['43']);
       const sibling = row(43, 43);
       const snapshot = join(dir, 'round.json');
-      writeFileSync(snapshot, JSON.stringify({ repo: 'fixture/repo', writtenAt: Date.now() - snapshotAgeMs, defaultBranch: 'main', rows: [target, ...(sendBack && !omitSibling ? [sibling] : [])] }));
+      writeFileSync(snapshot, JSON.stringify({ repo: 'web-everything/web-everything', writtenAt: Date.now() - snapshotAgeMs, defaultBranch: 'main', rows: [target, ...(sendBack && !omitSibling ? [sibling] : [])] }));
       if (sendBack) {
         // Neither PR has a follow-up entry. Only live rows know that manually queued #43 is now held.
         // Keep the target held but selected, so an empty candidate set does not trigger a label-lag re-poll.
@@ -531,7 +532,7 @@ else if (a[0] === 'api' && a[1] === 'graphql') {
     out = { data: { repository: { mergeQueue: { entries: { nodes: fs.existsSync(process.env.QUEUE_REMOVED) ? [] : [{ pullRequest: { id: 'PR_43', number: 43 } }], pageInfo: { hasNextPage: false } } } } } };
   } else {
     if (process.env.FAIL_LISTING === '1') { fs.writeSync(2, 'fixture live listing unavailable'); process.exit(1); }
-    const local = a.some(v => v.includes('repository(owner:"fixture",name:"repo")'));
+    const local = a.some(v => v.includes('repository(owner:"web-everything",name:"web-everything")'));
     const nodes = (local ? rows : []).map(r => ({ ...r, labels: { nodes: r.labels }, commits: { nodes: [{ commit: { statusCheckRollup: { contexts: { nodes: r.statusCheckRollup } } } }] } }));
     out = { data: { repository: { pullRequests: { nodes, totalCount: nodes.length, pageInfo: { hasNextPage: false, endCursor: null } } } } };
   }
@@ -540,7 +541,12 @@ if (a[0] === 'pr' && a[1] === 'view' && a.includes('id')) out = { id: 'PR_43' };
 fs.writeSync(1, typeof out === 'string' ? out : JSON.stringify(out));
 `);
       // All git operations are local fixture responses, including the CLI's identity probe.
-      writeFileSync(join(dir, 'git'), '#!/bin/sh\nif [ "$1" = remote ]; then echo https://github.com/fixture/repo.git; exit 0; fi\nexit 1\n');
+      writeFileSync(join(dir, 'git'), `#!/usr/bin/env node
+const a = process.argv.slice(2);
+if (a[0] === 'remote') { process.stdout.write('https://github.com/web-everything/web-everything.git'); process.exit(0); }
+${pinnedLeafDiffFixture}
+process.exit(1);
+`);
       for (const name of ['gh', 'git']) chmodSync(join(dir, name), 0o755);
       const result = spawnSync(process.execPath, [resolve(dirname(fileURLToPath(import.meta.url)), '..', 'merge-ai-prs.mjs'),
         '--only=42', '--this-repo', '--label=ready-to-merge', ...(!sendBack ? ['--dry-run'] : []), ...(!reconcile ? ['--no-reconcile-labels'] : []), '--no-drain-lease', '--no-red-main-freeze', '--json', `--listing-snapshot=${snapshot}`], {
@@ -559,23 +565,27 @@ fs.writeSync(1, typeof out === 'string' ? out : JSON.stringify(out));
     const { payload, stderr, calls } = run('snapshot');
     expect(stderr).toContain('served-from-snapshot');
     expect(calls.some(a => a[0] === 'api' && a[1] === 'graphql' && a.some(v => v.includes('pullRequests(states:OPEN')))).toBe(true);
-    expect(calls.some(a => a[0] === 'pr' && a[1] === 'view' && a[2] === '43' && a.includes('fixture/repo'))).toBe(true);
+    expect(calls.some(a => a[0] === 'pr' && a[1] === 'view' && a[2] === '43' && a.includes('web-everything/web-everything'))).toBe(true);
     expect(payload.deferred).toEqual(expect.arrayContaining([expect.objectContaining({ num: 42, waitOn: expect.arrayContaining([43]) })]));
   });
-  it('re-lists fresh snapshot context live without resolving the stored default branch', () => {
+  it('re-lists fresh snapshot context then verifies the default branch live exactly once', () => {
     const { stderr, calls } = run('snapshot');
     expect(stderr).toContain('served-from-snapshot');
     const localListings = calls.filter(a => a[0] === 'api' && a[1] === 'graphql'
-      && a.some(v => v.includes('repository(owner:"fixture",name:"repo")') && v.includes('pullRequests(states:OPEN')));
+      && a.some(v => v.includes('repository(owner:"web-everything",name:"web-everything")') && v.includes('pullRequests(states:OPEN')));
     expect(localListings).toHaveLength(1);
-    expect(calls.some(a => a[0] === 'repo' && a[1] === 'view')).toBe(false);
+    const branchReads = calls.filter(a => a[0] === 'repo' && a[1] === 'view');
+    expect(branchReads).toHaveLength(1);
+    const branchIndex = calls.indexOf(branchReads[0]);
+    expect(calls.every((a, i) => !(a[0] === 'api' && a[1] === 'graphql'
+      && a.some(v => v.includes('pullRequests(states:OPEN'))) || i < branchIndex)).toBe(true);
     expect(calls.some(a => a[0] === 'pr' && a[1] === 'view' && a[2] === '42')).toBe(true);
   });
   it('discovers blockers live after an expired round is refreshed too', () => {
     const { payload, stderr, calls } = run('snapshot', { snapshotAgeMs: 60_001 });
     expect(stderr).toContain('listed-live');
     const liveListings = calls.filter(a => a[0] === 'api' && a[1] === 'graphql'
-      && a.some(v => v.includes('repository(owner:"fixture",name:"repo")') && v.includes('pullRequests(states:OPEN')));
+      && a.some(v => v.includes('repository(owner:"web-everything",name:"web-everything")') && v.includes('pullRequests(states:OPEN')));
     expect(liveListings).toHaveLength(2);
     expect(payload.deferred).toEqual(expect.arrayContaining([expect.objectContaining({ num: 42, waitOn: expect.arrayContaining([43]) })]));
   });
@@ -601,7 +611,7 @@ fs.writeSync(1, typeof out === 'string' ? out : JSON.stringify(out));
     expect(calls.filter(a => a[0] === 'pr' && a[1] === 'comment' && a[2] === '43')).toHaveLength(1);
     // No second candidate listing is needed when the context already listed this repo live.
     const liveListings = calls.filter(a => a[0] === 'api' && a[1] === 'graphql'
-      && a.some(v => v.includes('repository(owner:"fixture",name:"repo")') && v.includes('pullRequests(states:OPEN')));
+      && a.some(v => v.includes('repository(owner:"web-everything",name:"web-everything")') && v.includes('pullRequests(states:OPEN')));
     expect(liveListings).toHaveLength(1);
   });
 
@@ -624,17 +634,34 @@ it('shadow policy retains pre-enqueue renaming by default (#6121)', async () => 
   expect(resolveCardNumbering({ env: {}, platform: {} })).toMatchObject({ value: { mode: 'rename-before-enqueue', ledgerAuth: 'none', shadow: true } });
 });
 
-it('retries a failed default-branch read on a later call and caches the successful read', async () => {
-  const source = readFileSync(join(dirname(fileURLToPath(import.meta.url)), '..', 'merge-ai-prs.mjs'), 'utf8');
-  const start = source.indexOf('  const resolveDefaultBranch = async (repo) => {');
-  const end = source.indexOf('\n  let [listings]', start);
-  expect(start).toBeGreaterThan(-1);
-  expect(end).toBeGreaterThan(start);
+
+it('a failed live default-branch read holds admission, then the same reader recovers on a later sweep', async () => {
+  const { createLiveDefaultBranchReader } = await import('../lib/default-branch-cache.mjs');
+  const read = vi.fn().mockRejectedValueOnce(new Error('transient read failure')).mockResolvedValueOnce('trunk\n');
+  const map = new Map(), repo = 'fixture/repo';
+  const verify = createLiveDefaultBranchReader({ map, readLive: read, writeCache: () => {} });
+  const pr = { number: 12, title: 't', body: 'what changed and why', headRefName: 'lane/12-x',
+    baseRefName: 'trunk', statusCheckRollup: [{ name: 'test', conclusion: 'SUCCESS' }],
+    mergeable: 'MERGEABLE', mergeStateStatus: 'CLEAN', labels: [{ name: 'ready-to-merge' }] };
+  const verdict = () => buildDrainVerdicts({ prsByRepo: new Map([[repo, [pr]]]),
+    readOf: () => ({ commits: [{ oid: 'abc' }], manifest: null }), repos: [repo],
+    defaultBranchOf: r => map.get(r) ?? null })[0];
+
+  expect(await verify(repo)).toBeNull();
+  expect(verdict()).toMatchObject({ decision: 'skip', reason: expect.stringContaining('deferring merge/enqueue') });
+  expect(read).toHaveBeenCalledOnce();
+  expect(await verify(repo)).toBe('trunk');
+  expect(verdict().decision).toBe('merge');
+  expect(await verify(repo)).toBe('trunk');
+  expect(read).toHaveBeenCalledTimes(2);
+});
+
+it('retries a failed default-branch hint read on a later call and caches the successful hint', async () => {
+  const { resolveCachedDefaultBranch } = await import('../lib/default-branch-cache.mjs');
   const cache = new Map();
-  const read = vi.fn().mockRejectedValueOnce(new Error('transient read failure'))
-    .mockResolvedValueOnce({ stdout: 'trunk\n' });
-  const resolveDefaultBranch = new Function('defaultBranchByRepo', 'execFileP', 'listingSnapshot', 'AS_JSON',
-    `${source.slice(start, end)}; return resolveDefaultBranch;`)(cache, read, null, true);
+  const read = vi.fn().mockImplementationOnce(() => { throw new Error('transient read failure'); })
+    .mockReturnValueOnce('trunk');
+  const resolveDefaultBranch = repo => resolveCachedDefaultBranch({ repo, map: cache, readCache: read });
   await resolveDefaultBranch('fixture/repo');
   expect(cache.has('fixture/repo')).toBe(false);
   await resolveDefaultBranch('fixture/repo');
@@ -715,4 +742,23 @@ describe('fresh queue rollup completeness', () => {
     expect(retained(fresh)).toBe(fresh);
     if (kind === 'oversized connection') expect(exec).toHaveBeenCalledTimes(10);
   });
+});
+
+
+it('listing hydrates heavy fields with bounded concurrency: live defaultBranch is read once per process across concurrent gates', async () => {
+  const { createLiveDefaultBranchReader } = await import('../lib/default-branch-cache.mjs');
+  const source = readFileSync(join(dirname(fileURLToPath(import.meta.url)), '..', 'merge-ai-prs.mjs'), 'utf8');
+  const start = source.indexOf('  const verifyDefaultBranch = createLiveDefaultBranchReader({');
+  const end = source.indexOf('\n  });', start) + '\n  });'.length;
+  expect(start).toBeGreaterThanOrEqual(0);
+  expect(end).toBeGreaterThan(start);
+  const cache = new Map();
+  const read = vi.fn(async () => { await Promise.resolve(); return { stdout: 'trunk\n' }; });
+  const verifyDefaultBranch = new Function('createLiveDefaultBranchReader', 'defaultBranchByRepo', 'execFileP',
+    `${source.slice(start, end)}; return verifyDefaultBranch;`)(
+    options => createLiveDefaultBranchReader({ ...options, writeCache: () => {} }), cache, read);
+  expect(await Promise.all([verifyDefaultBranch('fixture/repo'), verifyDefaultBranch('fixture/repo')])).toEqual(['trunk', 'trunk']);
+  expect(await verifyDefaultBranch('fixture/repo')).toBe('trunk');
+  expect(cache.get('fixture/repo')).toBe('trunk');
+  expect(read).toHaveBeenCalledTimes(1);
 });

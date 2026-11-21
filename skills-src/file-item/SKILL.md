@@ -67,8 +67,15 @@ bare `scripts/operations/file-item.mjs` or bare `file-item.mjs`.
 
 ## Landing the card
 
-`file-item` only writes to the lane's own working tree — same as `scaffold`, it does not commit or open a PR.
-Land the new card the normal way, from the SAME lane:
+After writing and the queue decision, `file-item` also preserves the card on origin's
+`lane/card-batch-<YYYY-MM-DD>` (UTC) branch. It commits only the card using a temporary index,
+appends to the remote branch, and pushes immediately; one push race is retried after refetching.
+The lane's branch, HEAD, index and other dirty files stay untouched. This does not open a PR.
+
+Check the `file-item.card-branch` effect result: `pushed: true` confirms preservation.
+A missing card, unknown Git state or failed push produces a **WARNING** on stderr and in that
+result, without failing filing or deleting the local card. Preserve the lane and retry publication
+before release when warned. To land the card through the normal review flow, from the SAME lane:
 
 1. `git add backlog/<the new file>.md && git commit -m "..."` (tight pathspec — the card only, unless this is
    riding along with real code in the same lane).

@@ -1,5 +1,6 @@
 import { describe, it, expect, vi } from 'vitest';
-import { assertOperatorCliFresh } from '../main-staleness.mjs';
+import { isPreWriteRefusal } from '../../operations/review-pr-io.mjs';
+import { assertOperatorCliFresh, isStaleMainRefusalMessage } from '../main-staleness.mjs';
 
 const root = '/operator-code';
 const candidate = '/operator-data';
@@ -91,19 +92,28 @@ describe('operator CLI fresh-checkout fallback (drain re-stamp, PR #4880)', () =
     expect(call()).toEqual({ reexecedFrom: candidate, status: 7 });
   });
 
-  it.each([
-    () => ({ error: new Error('ENOENT') }),
-    () => { throw new Error('spawn failed'); },
-  ])('preserves the refusal on spawn errors', (spawn) => {
+  const expectOutcomeUnknown = (spawn) => {
     const { o, call } = fixture({ spawn: vi.fn(spawn) });
-    expect(call).toThrow(refusal);
+    let error;
+    try { call(); } catch (e) { error = e; }
+    expect(error).toBeInstanceOf(Error);
+    expect(error.message).toContain("re-run's outcome is unknown");
+    expect(error.message).not.toContain('Nothing was changed');
+    expect(isStaleMainRefusalMessage(error.message)).toBe(true);
+    expect(isPreWriteRefusal(error.message)).toBe(false);
+    expect(o.spawn).toHaveBeenCalledTimes(1);
     expect(o.exit).not.toHaveBeenCalled();
+  };
+
+  it.each([
+    ['reported error', () => ({ error: new Error('ENOENT') })],
+    ['thrown error', () => { throw new Error('spawn failed'); }],
+  ])('keeps the re-run outcome unknown after %s', (_, spawn) => {
+    expectOutcomeUnknown(spawn);
   });
 
-  it('maps a signalled child to failure', () => {
-    const { o, call } = fixture({ spawn: vi.fn(() => ({ status: null, signal: 'SIGTERM' })) });
-    expect(call()).toEqual({ reexecedFrom: candidate, status: 1 });
-    expect(o.exit).toHaveBeenCalledWith(1);
+  it('keeps the re-run outcome unknown after a signal death', () => {
+    expectOutcomeUnknown(() => ({ status: null, signal: 'SIGTERM' }));
   });
 
   it('leaves a fresh root unchanged', () => {
@@ -176,12 +186,28 @@ describe('operator CLI same-checkout fresh lane fallback', () => {
     ['entry missing', { exists: () => false }],
     ['lane code dirty', { dirtyState: ' M scripts/current.mjs' }],
     ['lane status unreadable', { dirtyStatus: 1 }],
-    ['child has no exit code', { spawn: vi.fn(() => ({ status: null, signal: 'SIGTERM' })) }],
-    ['child spawn fails', { spawn: vi.fn(() => { throw new Error('spawn failed'); }) }],
-    ['child reports error', { spawn: vi.fn(() => ({ error: new Error('ENOENT') })) }],
   ])('preserves refusal and releases when %s', (_, options) => {
     const { o, call } = sameCheckout(options);
     expect(call).toThrow(refusal);
+    expectReleased(o);
+    expect(o.exit).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ['signal death', () => ({ status: null, signal: 'SIGTERM' })],
+    ['non-integer status', () => ({ status: undefined })],
+    ['negative status', () => ({ status: -1 })],
+    ['spawn throws', () => { throw new Error('spawn failed'); }],
+    ['reported error', () => ({ error: new Error('ENOENT') })],
+  ])('releases the lease and keeps the outcome unknown after %s', (_, spawn) => {
+    const { o, call } = sameCheckout({ spawn: vi.fn(spawn) });
+    let error;
+    try { call(); } catch (e) { error = e; }
+    expect(error).toBeInstanceOf(Error);
+    expect(error.message).toContain("re-run's outcome is unknown");
+    expect(error.message).not.toContain('Nothing was changed');
+    expect(isStaleMainRefusalMessage(error.message)).toBe(true);
+    expect(isPreWriteRefusal(error.message)).toBe(false);
     expectReleased(o);
     expect(o.exit).not.toHaveBeenCalled();
   });

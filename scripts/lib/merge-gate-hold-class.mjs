@@ -12,6 +12,7 @@ import { FAILING_CONCLUSIONS } from '../operations/pr-status.mjs';
 import { PLATFORM_PREFERENCES_PATH } from './merge-delivery-policy.mjs';
 import { readDeclaredSettings } from './settings-files.mjs';
 import { runGhSync } from './gh-throttle.mjs';
+import { ciJobLogApiArgs } from './gh-ci-log.mjs';
 
 const statuses = new Set(['pass', 'hold', 'fail-closed', 'queue', 'enqueue', 'skipped-by-policy']);
 const gates = new Set(GATE_IDS);
@@ -243,7 +244,11 @@ export function readMergeGateVerdict({ repo, jobId, prNumber, runGh = runGhSync,
       const options = { encoding: 'utf8', timeout: 30_000, maxBuffer: 32 * 1024 * 1024,
         stdio: ['ignore', 'pipe', 'pipe'], throttle: { op: 'merge-gate-verdict', repo } };
       const job = JSON.parse(runGh(['api', path], options));
-      const log = String(runGh(['api', `${path}/logs`], options));
+      // gh >= 2.10x refuses a raw log carrying terminal escapes unless told otherwise (no verdict = no annotation).
+      // Colour (SGR) codes are stripped before parsing so an ANSI-wrapped row reads exactly like its plain form;
+      // any other escape (cursor/erase CSI included) is ambiguous evidence and fails closed.
+      const log = String(runGh(ciJobLogApiArgs(`${path}/logs`), options)).replace(/\u001b\[[0-9;]*m/g, '');
+      if (log.includes('\u001b')) throw new Error('job log carries an unrecognised terminal escape sequence');
       cache.set(key, { job, log });
     }
     const { job, log } = cache.get(key);

@@ -1,0 +1,45 @@
+/** A pinnedFrom exempts a held applied tip from audit revocation only when it is an audited exact 40-hex sha. */
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { makeAuditedTipGate, revokedAppliedTips } from '../../../lib/daemon-rebuild/audited-tip.mjs';
+
+const SOURCE = 'scripts/lib/daemon-rebuild/audited-tip.mjs';
+const ref = 'lane/pin', sha = 'a'.repeat(40), pin = 'b'.repeat(40);
+export default {
+  id: 'pinnedfrom-audited-exemption',
+  title: 'pinnedFrom (arbitrary, unaudited or audited) never exempts an applied tip that has no audit evidence of its own',
+  card: 'pinnedfrom-audited',
+  fixedBy: { sha: 'HEAD', where: 'lane/pinnedfrom-audited', paths: [SOURCE] },
+  // Behavioural and independent of run(): one narrow probe of the fixed behaviour (an arbitrary pin does not exempt),
+  // so a regression in the other run() assertions still fails the test instead of flipping it to an expected failure.
+  fixPresent() {
+    const dir = mkdtempSync(join(tmpdir(), 'soak-pinnedfrom-probe-'));
+    try {
+      const env = { WE_FIX_READY_PATH: join(dir, 'a.jsonl'), WE_PLATFORM_PREFERENCES_FILE: join(dir, 'p.json'),
+        WE_DAEMON_OVERLAY_FOLLOW_TIP: 'audited-only' };
+      writeFileSync(env.WE_PLATFORM_PREFERENCES_FILE, '{}');
+      writeFileSync(env.WE_FIX_READY_PATH, '');
+      return revokedAppliedTips({ applied: [{ ref, sha, pinnedFrom: 'arbitrary' }],
+        auditedTip: makeAuditedTipGate(env), auditAdopted: [ref] }).length === 1;
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  },
+  run() {
+    const dir = mkdtempSync(join(tmpdir(), 'soak-pinnedfrom-'));
+    const violations = [];
+    try {
+      const env = { WE_FIX_READY_PATH: join(dir, 'audited.jsonl'), WE_PLATFORM_PREFERENCES_FILE: join(dir, 'p.json'),
+        WE_DAEMON_OVERLAY_FOLLOW_TIP: 'audited-only' };
+      writeFileSync(env.WE_PLATFORM_PREFERENCES_FILE, '{}');
+      writeFileSync(env.WE_FIX_READY_PATH, JSON.stringify({ ref, sha: pin, tests: 'green', audit: 'NOT WEAKENED' }) + '\n');
+      const held = [{ detail: { ref, newTip: pin } }];
+      const check = (pinnedFrom) => revokedAppliedTips({ applied: [{ ref, sha, pinnedFrom }],
+        auditedTip: makeAuditedTipGate(env), auditAdopted: [ref], held });
+      if (check('arbitrary').length !== 1) violations.push('an arbitrary pinnedFrom exempted a held tip');
+      if (check('e'.repeat(40)).length !== 1) violations.push('an unaudited 40-hex pinnedFrom exempted a held tip');
+      if (check(pin).length !== 1) violations.push('an audited pinnedFrom exempted an applied sha with no evidence');
+      return { violations };
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  },
+  judge(report) { return report.violations; },
+};

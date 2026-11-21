@@ -6,7 +6,7 @@ import { join, dirname } from 'node:path';
 import { tmpdir } from 'node:os';
 import { fileURLToPath, URL as NodeURL } from 'node:url';
 import { describe, it, expect, vi } from 'vitest';
-import { CANONICAL_QUESTION, QUESTION_HASH, main, findAudit, isAcceptedQuestionHash, resolvePriorQuestionHashes, MAX_PRIOR_WINDOW_MS } from '../codex-audit.mjs';
+import { CANONICAL_QUESTION, EXHAUSTIVE_INSTRUCTION, QUESTION_HASH, main, findAudit, isAcceptedQuestionHash, resolvePriorQuestionHashes, MAX_PRIOR_WINDOW_MS } from '../codex-audit.mjs';
 import { createAuditDeps } from '../codex-audit-io.mjs';
 
 // Lets one test swap the text codex-audit.mjs reads for its settings file; every other read passes through.
@@ -76,6 +76,12 @@ describe('canonical audit', () => {
     expect(f.records).toEqual([{ at: AT, base: BASE, head: HEAD, baseRef: 'origin/main',
       questionHash: QUESTION_HASH, verdict, findings: ['scripts/example.mjs:12 why'] }]);
     expect(f.deps.runCodex.mock.calls[0][0]).toContain(CANONICAL_QUESTION);
+    // R1081: the exhaustive-list instruction follows the hashed question, so the hash and old records are unchanged.
+    expect(f.deps.runCodex.mock.calls[0][0]).toContain(`${CANONICAL_QUESTION}\n\n${EXHAUSTIVE_INSTRUCTION}\n\n`);
+    expect(CANONICAL_QUESTION).not.toContain(EXHAUSTIVE_INSTRUCTION);
+    // Pin the text: reversing the requirement (e.g. "stop at the first finding") must fail this test.
+    expect(EXHAUSTIVE_INSTRUCTION).toBe('List EVERY finding you can find in this one exhaustive pass; do not stop at the first finding.');
+    expect(f.deps.runCodex.mock.calls[0][0]).toContain('List EVERY finding you can find in this one exhaustive pass; do not stop at the first finding.');
     expect(f.deps.runCodex.mock.calls[0][0]).toContain(`git diff ${BASE}...${HEAD}`);
     expect(f.deps.resolveSha.mock.calls).toEqual([['origin/main'], [HEAD]]);
     expect(f.deps.appendRecord.mock.invocationCallOrder[0]).toBeGreaterThan(f.deps.runCodex.mock.invocationCallOrder[0]);

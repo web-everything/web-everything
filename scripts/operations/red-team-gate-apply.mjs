@@ -1,4 +1,5 @@
-import { syncRedTeamStatusLabels } from '../lib/red-team-status-labels.mjs';
+import { assertCapability } from '../lib/repo-profile.mjs';
+import { settleGhFor, syncRedTeamStatusLabels } from '../lib/red-team-status-labels.mjs';
 import { signalFixDispatch } from '../lib/fix-handoff.mjs';
 /**
  * @file scripts/operations/red-team-gate-apply.mjs
@@ -102,6 +103,7 @@ export function buildRedTeamCardInput({ repo, pr, head, findings }) {
     + 'found these, Claude\'s re-check confirmed them, and the setting `redTeam.confirmedBreaks` files their class as a follow-up '
     + 'card instead of blocking the PR:\n\n' + findings.map(findingLine).join('\n');
   return {
+    repo,
     title: `Red-team follow-ups${classes.length ? ` [${classes.join(', ')}]` : ''} from ${repo}#${pr} (head ${String(head).slice(0, 9)})`,
     kind: 'story', size: '2',
     digest: qualifyLocusRefs(digest, files),
@@ -273,7 +275,7 @@ export function createRedTeamGateIo({ env = process.env, root = REPO_ROOT } = {}
   const safety = readDrainQueueSafety({ env, log: line => process.stderr.write(`${line}\n`) });
   return {
     publishNeedsYou: isUnderTest(env) || isUnderTest(process.env) ? () => {} : item => publishAttention(item),
-    syncStatusLabels: ({ repo, pr, head }) => head ? syncRedTeamStatusLabels({ repo, pr, head, env,
+    syncStatusLabels: ({ repo, pr, head }) => head ? syncRedTeamStatusLabels({ repo, pr, head, env, gh: settleGhFor(env),
       log: line => process.stderr.write(`${line}\n`) }) : null,
     signalFix: signalFixDispatch,
     dequeueSentBack: args => safety.value.dequeueOnSendBack ? dequeueSentBack({ ...args, exec: (cmd, argv, opts) => execFileSync(cmd, argv, { ...opts, env }), log: line => process.stderr.write(`${line}\n`) }) : { dequeued: false },
@@ -304,7 +306,12 @@ export function createRedTeamGateIo({ env = process.env, root = REPO_ROOT } = {}
       type: EVENT_TYPES.SEND_BACK, repo, pr, at: new Date().toISOString(), source: 'red-team-gate',
       declaredActor: RED_TEAM_GATE_ACTOR, channel: RED_TEAM_GATE_CHANNEL, cause: 'changes',
     })]),
-    fileCard: (input) => spawnPreventionLandingJob(input, { sessionPrefix: 'red-team-card' }),
+    fileCard: (input) => {
+      // Re-read admission at the effect boundary too: the live gate may find cards absent from the tick snapshot.
+      const refusal = assertCapability(input.repo, 'review');
+      if (refusal) return { ok: false, error: refusal.why };
+      return spawnPreventionLandingJob(input, { sessionPrefix: 'red-team-card' });
+    },
     postComment: ({ repo, pr, body }) => gh(['pr', 'comment', String(pr), `--repo=${repo}`, '--body-file', '-'], body),
     log: (line) => process.stderr.write(`${line}\n`),
   };
