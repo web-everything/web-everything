@@ -186,6 +186,7 @@ describe('runner freshness policy', () => {
         "brief-mode",
         "build-priority-set",
         "capacity-calendar",
+        "check-scope",
         "ci-heal-reset",
         "claim",
         "clear-claim",
