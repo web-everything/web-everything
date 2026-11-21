@@ -140,7 +140,9 @@ const FLOOR_SETTINGS = Object.freeze([
   // Read by the fix dispatch daemon, a lock user (landed on main since).
   'scripts/settings/fix-pass-budget.json',
   // Read by the live-owner watch IO, a lock user (landed on main since).
-  'scripts/conveyor/pr-live-owner-watch.settings.json']);
+  'scripts/conveyor/pr-live-owner-watch.settings.json',
+  // The agent-launch approval list, named by permission-change.mjs (a floor module).
+  'scripts/lib/agent-launch-approved.json']);
 /**
  * The lock primitives: the modules that take an exclusive hold (file-locks.mjs reserves a lock entry, with-lock.mjs
  * wraps it, coordination-lock.mjs takes the coordination lease). Any import of one makes a module a lock user (PR #6381
