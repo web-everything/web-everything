@@ -5734,6 +5734,43 @@ an empty store or admission refusal cannot prove the child deadline works. Its f
 probe recognizes both the original child timeout and the remaining pass budget. Use the
 injected clock for modeled delays; the daemon unit suite retains the real process-tree check.
 
+
+## Resource pool shadow inventory (R1094 S1)
+
+The pool adapter validates source directories and records before calling tolerant legacy readers.
+An empty directory is zero holders; a missing directory or malformed record is unknown. Never
+replace this with a bare legacy list call: several readers swallow these errors as `[]`. Review
+job listing must remain read-only (the default listing can prune dead records). Overlapping
+claim/job/run/verification observations are counted conservatively rather than deduplicated by
+guessed identity. The injected clock keeps snapshot freshness checks pure.
+
+Resource-pool live readers use `liveReviewRoundBudget` for host process liveness, rather
+than enumerating the shared run archive. Review jobs use `reviewJobsDir` with the
+registered review daemon clone (or its explicit environment override), not the observer's
+lane. Old sampler snapshots may omit `swapGrowthMb`; freshness follows resource-status,
+including its boundary and policy grace. Dotted filename-key taint is waived only after
+reading the offending layer and proving it cannot own the resourcePool namespace;
+read/parse errors and namespace collisions remain unknown. Lease classes derive from
+explicit purpose, then session/item kind, with C4 as the unclassified default.
+
+Red-team pool completeness compares only status files within the canonical
+`MAX_AGE_MS` mtime window. Apply that exclusion before JSON/size validation so
+aged-out attempt metadata cannot poison the live inventory; corrupt or oversized
+recent evidence remains unknown. Pin the inclusive age boundary in fixtures.
+Derive the fixture clock from the stored `statSync(...).mtimeMs` after `utimesSync`,
+since filesystem timestamp rounding can move a requested boundary just outside the window.
+
+
+## Resource pool shadow read boundary
+
+`collectResourcePool` only reads evidence; inject settings, paths, caps and source reads to
+exercise it without filesystem access. Shadow JSONL append/rotation belongs to the
+`finishResourcePool` log sink bound by `scripts/operations/run.mjs`, including JSON CLI
+runs; off mode skips that sink. Validate recent red-team evidence with `buildSlotReport`
+before treating a source as complete. Missing PIDs retain holders; unexpected PID probe
+errors close the source, and only ESRCH or a proven identity mismatch releases capacity.
+
+
 ## Review-run filename discovery (R1099)
 
 `review-run-names.fs.test.mjs` covers 6,000 real files, full-scan parity across PR-keyed names,

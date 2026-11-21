@@ -986,6 +986,59 @@
       "changeVia": "pr",
       "instant": false
     },
+    "resourcePool": {
+      "description": "Shadow resource ledger mode, builder floor and per-class reserves and maxima; S1 treats enforce as shadow.",
+      "owner": "scripts/settings/resource-pool.json",
+      "changeVia": "pr",
+      "instant": false,
+      "leaves": {
+        "builderFloor": {
+          "range": "integer 0–64",
+          "unit": "units",
+          "note": "also instant via resourcePool.builderFloor"
+        },
+        "classes.1.reserve": {
+          "range": "integer 0–64",
+          "unit": "units",
+          "note": "also instant via resourcePool.class.1.reserve"
+        },
+        "classes.1.max": {
+          "range": "integer 0–64",
+          "unit": "units",
+          "note": "also instant via resourcePool.class.1.max"
+        },
+        "classes.2.reserve": {
+          "range": "integer 0–64",
+          "unit": "units",
+          "note": "also instant via resourcePool.class.2.reserve"
+        },
+        "classes.2.max": {
+          "range": "integer 0–64",
+          "unit": "units",
+          "note": "also instant via resourcePool.class.2.max"
+        },
+        "classes.3.reserve": {
+          "range": "integer 0–64",
+          "unit": "units",
+          "note": "also instant via resourcePool.class.3.reserve"
+        },
+        "classes.3.max": {
+          "range": "integer 0–64",
+          "unit": "units",
+          "note": "also instant via resourcePool.class.3.max"
+        },
+        "classes.4.reserve": {
+          "range": "integer 0–64",
+          "unit": "units",
+          "note": "also instant via resourcePool.class.4.reserve"
+        },
+        "classes.4.max": {
+          "range": "integer 0–64",
+          "unit": "units",
+          "note": "also instant via resourcePool.class.4.max"
+        }
+      }
+    },
     "deliveryPriority": {
       "description": "Delivery priority mode, aging, P0 concurrency and unblock weight.",
       "owner": "scripts/lib/delivery-priority-settings.json",
@@ -994,6 +1047,51 @@
     }
   },
   "capacityLeaves": {
+    "resourcePool.builderFloor": {
+      "description": "Protected builder capacity floor in shadow allocation decisions.",
+      "range": "integer 0–64",
+      "unit": "units"
+    },
+    "resourcePool.class.1.reserve": {
+      "description": "Reserved units for class 1 repair work in shadow allocation decisions.",
+      "range": "integer 0–64",
+      "unit": "units"
+    },
+    "resourcePool.class.1.max": {
+      "description": "Maximum units for class 1 repair work in shadow allocation decisions.",
+      "range": "integer 0–64",
+      "unit": "units"
+    },
+    "resourcePool.class.2.reserve": {
+      "description": "Reserved units for class 2 review work in shadow allocation decisions.",
+      "range": "integer 0–64",
+      "unit": "units"
+    },
+    "resourcePool.class.2.max": {
+      "description": "Maximum units for class 2 review work in shadow allocation decisions.",
+      "range": "integer 0–64",
+      "unit": "units"
+    },
+    "resourcePool.class.3.reserve": {
+      "description": "Reserved units for class 3 fix work in shadow allocation decisions.",
+      "range": "integer 0–64",
+      "unit": "units"
+    },
+    "resourcePool.class.3.max": {
+      "description": "Maximum units for class 3 fix work in shadow allocation decisions.",
+      "range": "integer 0–64",
+      "unit": "units"
+    },
+    "resourcePool.class.4.reserve": {
+      "description": "Reserved units for class 4 builder work in shadow allocation decisions.",
+      "range": "integer 0–64",
+      "unit": "units"
+    },
+    "resourcePool.class.4.max": {
+      "description": "Maximum units for class 4 builder work in shadow allocation decisions.",
+      "range": "integer 0–64",
+      "unit": "units"
+    },
     "redTeam.queue.reservedSlots": {
       "description": "Live review slots reserved while runnable red-team work is queued; default 4, lent back when the queue is empty or unknown.",
       "range": "integer 0–8",
