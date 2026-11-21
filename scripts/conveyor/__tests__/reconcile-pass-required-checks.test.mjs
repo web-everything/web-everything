@@ -26,6 +26,77 @@ const xxOptions = () => ({ repo: 'we', readPrs: () => [xxPr()], readAgents: () =
   enrichAlreadyLanded: prs => prs, enrichBaseRef: prs => prs, enrichSystemFix: prs => prs,
   enrichFixClaims: prs => prs, resolveMainSha: () => null });
 
+it.each([{}, { rowsComplete: null, rowsHead: null }].flatMap(provenance =>
+  ['complete', 'unreadable', 'duplicate', 'short'].map(shape => ({ provenance, shape }))))(
+  'hydrates short legacy rollups before review admission: %j', async ({ provenance, shape }) => {
+  const { runReconcilePass, defaultReadChecks } = await import('../reconcile-pass.mjs');
+  const row = { id: 1, name: 'test', status: 'completed', conclusion: 'success', head_sha: XX_HEAD };
+  const pr = { ...xxPr(), ...provenance, isDraft: false, labels: ['review:pending'], statusCheckRollup: [row] };
+  const exec = vi.fn((_file, args) => {
+    if (args.some(arg => arg.includes('/check-runs'))) return JSON.stringify([{ total_count: 1, check_runs: [row] }]);
+    if (shape === 'unreadable') throw new Error('status feed unavailable');
+    const status = { id: 1, context: 'legacy', state: 'success' };
+    return JSON.stringify(shape === 'complete' ? [{ total_count: 0, statuses: [] }]
+      : [{ total_count: 2, statuses: shape === 'duplicate' ? [status, { ...status }] : [status] }]);
+  });
+  let observed;
+  const plan = runReconcilePass({ ...xxOptions(), readPrs: () => [pr],
+    readRequiredChecks: () => ({ checks: ['test'], source: 'live' }),
+    readChecks: args => defaultReadChecks(args, { exec }),
+    enrichMainRed: prs => { observed = prs[0]; return { prs, mainRedWindows: [] }; },
+    env: { VITEST: 'true', WE_REVIEW_START_AFTER: 'ci-green' } });
+  expect(exec).toHaveBeenCalledTimes(2);
+  expect(observed).toMatchObject({ rowsComplete: shape === 'complete', rowsHead: shape === 'complete' ? XX_HEAD : null });
+  expect(plan.dispatch.filter(d => d.kind === 'review')).toHaveLength(shape === 'complete' ? 1 : 0);
+});
+
+it.each([100, 101])('preserves complete current-head %s-row snapshots without rereading', async count => {
+  const { runReconcilePass } = await import('../reconcile-pass.mjs');
+  const pr = { ...xxPr(), isDraft: false, labels: ['review:pending'], rowsComplete: true, rowsHead: XX_HEAD,
+    statusCheckRollup: Array.from({ length: count }, (_, i) => ({
+      name: i ? `optional-${i}` : 'test', status: 'COMPLETED', conclusion: 'SUCCESS', head_sha: XX_HEAD,
+    })) };
+  const readChecks = vi.fn(() => { throw new Error('complete snapshot needs no reread'); });
+  const plan = runReconcilePass({ ...xxOptions(), readPrs: () => [pr], readChecks,
+    readRequiredChecks: () => ({ checks: ['test'], source: 'live' }),
+    env: { VITEST: 'true', WE_REVIEW_START_AFTER: 'ci-green' } });
+  expect(plan.dispatch.filter(d => d.kind === 'review')).toHaveLength(1);
+  expect(readChecks).not.toHaveBeenCalled();
+});
+
+it.each(['complete', 'short-incomplete', 'status-failure', 'status-error', 'status-pending', 'status-unreadable', 'check-unreadable'])('restores truncated evidence only after both REST feeds complete: %s', async shape => {
+  const { runReconcilePass, defaultReadChecks } = await import('../reconcile-pass.mjs');
+  const runs = Array.from({ length: 101 }, (_, i) => ({ id: i + 1, name: i ? `optional-${i}` : 'test',
+    status: 'completed', conclusion: 'success', head_sha: XX_HEAD }));
+  const exec = vi.fn((_file, args) => {
+    const checks = args.some(arg => arg.includes('/check-runs'));
+    if (shape === (checks ? 'check-unreadable' : 'status-unreadable')) throw new Error('unreadable feed');
+    return JSON.stringify(checks
+      // Complete pages carry the server's total_count (same on every page): rows are attested only when delivered === total.
+      ? [{ total_count: runs.length, check_runs: runs.slice(0, 100) }, { total_count: runs.length, check_runs: runs.slice(100) }]
+      : [{ total_count: 1, statuses: [{ id: 1, context: 'legacy', state: ['status-failure', 'status-error', 'status-pending'].includes(shape) ? shape.slice(7) : 'success' }] }]);
+  });
+  let observed;
+  const plan = runReconcilePass({ ...xxOptions(),
+    readPrs: () => [{ ...xxPr(), isDraft: false, labels: ['review:pending'], rowsComplete: false, rowsHead: null,
+      ...(shape === 'short-incomplete' ? { statusCheckRollup: [runs[0], { name: 'legacy', status: 'COMPLETED', conclusion: 'SUCCESS' }] } : {}) }],
+    readRequiredChecks: () => ({ checks: ['test', 'legacy'], source: 'live' }),
+    readChecks: args => defaultReadChecks(args, { exec }),
+    enrichMainRed: prs => { observed = prs[0]; return { prs, mainRedWindows: [] }; },
+    env: { VITEST: 'true', WE_REVIEW_START_AFTER: 'ci-green' } });
+  expect(plan.dispatch.filter(d => d.kind === 'review')).toHaveLength(['complete', 'short-incomplete'].includes(shape) ? 1 : 0);
+  expect(observed.rowsComplete).toBe(!shape.endsWith('unreadable'));
+  expect(observed.rowsHead).toBe(shape.endsWith('unreadable') ? null : XX_HEAD);
+  if (shape === 'complete') {
+    expect(observed.statusCheckRollup).toHaveLength(102);
+    expect(observed.statusCheckRollup.find(row => row.name === 'legacy')).toMatchObject({
+      __typename: 'StatusContext', context: 'legacy', state: 'success', status: 'COMPLETED', conclusion: 'SUCCESS',
+    });
+    expect(exec.mock.calls).toHaveLength(2);
+    expect(exec.mock.calls.every(([, args]) => args.includes('--paginate') && args.includes('--slurp'))).toBe(true);
+  }
+});
+
 it.each([false, true])('Plateau #198 green checks promote with repo-local 403 fallback (hydrate: %s)', async hydrate => {
   const { mkdtempSync, rmSync } = await import('node:fs');
   const { tmpdir } = await import('node:os');
@@ -39,6 +110,7 @@ it.each([false, true])('Plateau #198 green checks promote with repo-local 403 fa
       id: i + 1, name, status: 'completed', conclusion: i < 3 ? 'success' : 'skipped',
     }));
     const pr = { ...xxPr(), number: 198, headRefName: 'lane/198-replay',
+      ...(!hydrate ? { rowsComplete: true, rowsHead: XX_HEAD } : {}),
       statusCheckRollup: hydrate ? rows.filter(row => row.name !== 'e2e') : rows };
     const readChecks = vi.fn(() => rows);
     const readRequiredChecks = args => getRequiredStatusChecks({ ...args,
@@ -94,14 +166,15 @@ it.each(['live', 'cache', 'unavailable'])('attaches rosterSource %s after hydrat
   } finally { log.mockRestore(); }
 });
 
-it('hydration that replaces the rollup rows clears the evidence completeness claim', async () => {
+it.each([{}, { rowsComplete: false, rowsHead: XX_HEAD }, { rowsComplete: true, rowsHead: 'b'.repeat(40) }])(
+  'replacement rows without complete current-head provenance clear the old claim: %j', async provenance => {
   const { runReconcilePass } = await import('../reconcile-pass.mjs');
   const stale = { ...xxPr(), statusCheckRollup: [], rowsHead: XX_HEAD, rowsComplete: true };
   let observed;
   const log = vi.spyOn(console, 'error').mockImplementation(() => {});
   try {
     runReconcilePass({ ...xxOptions(), readPrs: () => [stale], readRequiredChecks: () => ({ checks: ['test'], source: 'live' }),
-      readChecks: () => [{ id: 1, name: 'test', status: 'completed', conclusion: 'success' }],
+      readChecks: () => Object.assign([{ id: 1, name: 'test', status: 'completed', conclusion: 'success' }], provenance),
       enrichMainRed: rows => { observed = rows; return { prs: rows, mainRedWindows: [] }; } });
     expect(observed[0]).toMatchObject({ rowsComplete: false, rowsHead: null });
     expect(log.mock.calls.map(([l]) => l)).toContain('check-evidence-coverage: 0/1 PRs rowsComplete===true && rowsHead===headRefOid');

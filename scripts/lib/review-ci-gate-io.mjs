@@ -19,21 +19,36 @@ export const readReviewHeadAndLabels = ({ repo, pr, run = gh }) => JSON.parse(ru
  * Every check run PLUS every legacy commit status (`{context, state, target_url}`) for the SHA: a required context may be
  * published through either, and a reader of check runs alone would call a green commit-status context missing.
  * The combined-status endpoint already reports only the latest state per context.
+ * Attest only after both paginated reads finish. Non-enumerable provenance preserves the rows array API.
  */
-export const readReviewChecks = ({ repo, headSha, run = gh }) => [
-  ...JSON.parse(run([
+export const readReviewChecks = ({ repo, headSha, run = gh }) => {
+  const runPages = JSON.parse(run([
     'api', '--paginate', '--slurp', `repos/${repo}/commits/${headSha}/check-runs?per_page=100&filter=all`,
-  ])).flatMap(page => {
+  ]));
+  const statusPages = JSON.parse(run([
+    'api', '--paginate', '--slurp', `repos/${repo}/commits/${headSha}/status?per_page=100`,
+  ]));
+  const runs = runPages.flatMap(page => {
     if (!Array.isArray(page.check_runs)) throw new Error('unreadable check runs');
     return page.check_runs;
-  }),
-  ...JSON.parse(run([
-    'api', '--paginate', '--slurp', `repos/${repo}/commits/${headSha}/status?per_page=100`,
-  ])).flatMap(page => {
+  });
+  const statuses = statusPages.flatMap(page => {
     if (!Array.isArray(page.statuses)) throw new Error('unreadable commit statuses');
-    return page.statuses.map(({ context, state, target_url }) => ({ context, state, target_url }));
-  }),
-];
+    return page.statuses;
+  });
+  // Count distinct API identities before projecting statuses: overlapping pages can replace a missing row
+  // with a duplicate while still matching total_count. Check names are not identities (reruns share them).
+  const delivered = (pages, rows) => pages.length > 0 && pages.every(page => Number.isSafeInteger(page.total_count)
+    && page.total_count === pages[0].total_count) && rows.length === pages[0].total_count
+    && rows.every(row => Number.isSafeInteger(row?.id)) && new Set(rows.map(row => row.id)).size === rows.length;
+  // The combined-status endpoint returns one latest status per context. A context updated between pages
+  // can reappear under a new ID, so IDs alone cannot establish that this feed is complete.
+  const uniqueContexts = statuses.every(row => typeof row?.context === 'string' && row.context.length > 0)
+    && new Set(statuses.map(row => row.context)).size === statuses.length;
+  const rowsComplete = delivered(runPages, runs) && delivered(statusPages, statuses) && uniqueContexts;
+  return Object.defineProperties([...runs, ...statuses.map(({ context, state, target_url }) => ({ context, state, target_url }))],
+    { rowsComplete: { value: rowsComplete }, rowsHead: { value: headSha } });
+};
 
 export function readReviewCiGate({ repo, pr, readHead, readLabels,
   readHeadAndLabels = readReviewHeadAndLabels,
@@ -86,6 +101,8 @@ export function readReviewCiGate({ repo, pr, readHead, readLabels,
       return withSource({ allowed: false, headSha, reason: 'untrusted-required-set' });
     }
     checks ??= readChecks({ repo, headSha });
+    // Capture provenance from the complete read before any row excusal transforms the array.
+    const { rowsComplete, rowsHead } = checks;
     const currentHead = head({ repo, pr });
     if (currentHead !== headSha) return withSource({ allowed: false, headSha, currentHead, reason: 'head-changed' });
     try {
@@ -108,7 +125,7 @@ export function readReviewCiGate({ repo, pr, readHead, readLabels,
       try { verifyGreen = readVerifyGreen({ dir: greenLedgerDir({ coordinationRoot: coordinationRoot ?? resolveCoordinationRoot() }), sha: headSha }) === true; }
       catch { /* Unreadable verification waits on CI. */ }
     }
-    const gate = reviewStartGate({ headSha, repo, requiredChecks, checks, policy, verifyGreen });
+    const gate = reviewStartGate({ headSha, repo, requiredChecks, checks, rowsComplete, rowsHead, policy, verifyGreen });
     if (gate.earlyStartNote) {
       // console is wrapped by the project's daemon logger; injected loggers keep fixtures hermetic.
       try { log(gate.earlyStartNote.replace(/[\u0000-\u001f\u007f-\u009f]/g, ' ').slice(0, 2000)); }

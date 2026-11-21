@@ -25,7 +25,8 @@ describe('overlayGraduated uses the last registration lifecycle event', () => {
     'accepts an in-main auto-drop followed by %s with unchanged content proof', (kind) => {
       const proof = evidence([{ kind: 'added', ref }, drop, noise(kind)]);
       expect(overlayGraduated(proof)).toBe(true);
-      expect(proof.git).toHaveBeenCalledWith(['merge-tree', '--write-tree', '--no-messages', build, sha]);
+      expect(proof.git).toHaveBeenCalledWith(['merge-tree', '--write-tree', '--no-messages', build, sha],
+        expect.objectContaining({ env: expect.any(Object) }));
     },
   );
 

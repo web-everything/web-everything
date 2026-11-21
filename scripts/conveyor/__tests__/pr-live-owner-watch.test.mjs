@@ -353,10 +353,11 @@ describe('portable feed IO and settings', () => {
   // These roots share circular dependencies: like createLiveOwnerWatchIo, finish
   // each import before starting the next to avoid a vite-node evaluation deadlock.
   beforeAll(async () => {
+    await import('../pr-stall-sweep.mjs');
     await import('../../operations/manual-daemon-pass-io.mjs');
     await import('../../operations/review-job.mjs');
     await import('../reconcile-pass.mjs');
-  }, 30_000);
+  }, 60_000);
   const dirs = []; afterEach(() => dirs.splice(0).forEach(dir => rmSync(dir, { recursive: true, force: true })));
   async function localIo(adapters = {}, now = NOW, dir, actEnabled = true, extraEnv = {}) {
     if (!dir) { dir = mkdtempSync(join(process.env.TMPDIR || tmpdir(), 'live-owner-')); dirs.push(dir); }
