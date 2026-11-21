@@ -6,6 +6,22 @@ import { withRealRepo } from './helpers/real-repo.mjs';
 import { mkdirSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 
+it('renders signed-out agy usage file headlines for both providers', async () => {
+  await withRealRepo(({ root }) => {
+    const now = Date.parse('2026-11-19T23:00:00Z');
+    mkdirSync(join(root, '.plateau'));
+    writeFileSync(join(root, '.plateau', 'agy-usage.json'), JSON.stringify({ at: new Date(now).toISOString(), status: 'signed-out' }));
+    const settings = { providers: ['agy-gemini', 'agy-claude'].map(id => ({ id,
+      readers: [{ type: 'plateau-usage-file', file: 'agy-usage.json' }] })) };
+    const rendered = renderCalendar(capacityCalendar({ now, settings,
+      env: { HOME: root, CONVEYOR_STATE_ROOT: root, WE_CAPACITY_READERS: 'on' } }));
+    for (const id of ['agy-gemini', 'agy-claude']) {
+      expect(rendered).toContain(`${id}/${id}: signed out\n`);
+      expect(rendered).not.toContain(`${id}/${id}: unknown`);
+    }
+  });
+});
+
 it('requires an injected reader and defers collection until the compute step', () => {
   expect(() => capacityCalendarOperation()).toThrow('collect reader');
   const report = { providers: [] };

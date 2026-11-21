@@ -19,6 +19,30 @@ const choose = (capacities, settings = {}, kind = 'fix') => chooseBuilder({ kind
 const repo = { routing: { builder: 'auto', capacity: { claudeUsageAccount: 'claude-a' } } };
 const chain = capacities => resolveFixExecutorChain({ repo, platform: {}, env: {}, capacity: capacities, now, quota: () => null, record: () => {} }).value;
 
+test('fresh signed-out agy usage file marks both providers without adding usage windows', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'capacity-signed-out-'));
+  try {
+    mkdirSync(join(dir, '.plateau'));
+    const file = join(dir, '.plateau', 'agy-usage.json');
+    const settings = { staleHours: 6, providers: ['agy-gemini', 'agy-claude'].map(id => ({ id,
+      readers: [{ type: 'plateau-usage-file', file: 'agy-usage.json' }] })) };
+    for (const at of [new Date(now).toISOString(), new Date(now - 6 * hour).toISOString(),
+      new Date(now - 6 * hour - 1).toISOString(), new Date(now + 1).toISOString(), 'invalid', null]) {
+      // Even contradictory usage fields cannot turn a signed-out observation into quota.
+      writeFileSync(file, JSON.stringify({ at, status: 'signed-out',
+        five_hour: { used_percentage: 20, resets_at: now + hour } }));
+      const capacities = observeCapacity({ env: { HOME: dir, CONVEYOR_STATE_ROOT: dir, WE_CAPACITY_READERS: 'on' },
+        now, settings, records: [] });
+      assert.equal(capacities.length, 2);
+      for (const c of capacities) {
+        assert.equal(c.signedOut === true, typeof at === 'string' && Date.parse(at) <= now && now - Date.parse(at) <= 6 * hour);
+        assert.deepEqual(c.windows, []);
+        assert.equal(c.known, false);
+      }
+    }
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
 test('shared setup disables capacity host readers by default', () => {
   assert.equal(process.env.WE_CAPACITY_READERS, 'off');
   assert.ok(observeCapacity({ now }).every(c => !c.known && !c.held && c.currentRatePerHour === null));

@@ -51,6 +51,8 @@ export function readProviderCapacity({ env = {}, now = Date.now(), readers = {},
       const timestampMissing = raw?.at == null && raw?.asOf == null && raw?.mtime == null;
       const liveUsable = Number.isFinite(at) ? at <= now && now - at <= s.staleHours * HOUR
         : timestampMissing && Boolean(raw) && owner.readers?.some(r => r.type === 'codex-rollout');
+      const signedOut = raw?.status === 'signed-out' && Number.isFinite(epoch(raw.at))
+        && epoch(raw.at) <= now && now - epoch(raw.at) <= s.staleHours * HOUR;
       const add = (name, w, source = 'live') => {
         const usedPercent = w?.usedPercent ?? w?.used_percent ?? w?.used_percentage;
         const resetsAt = epoch(w?.resetsAt ?? w?.resets_at);
@@ -62,7 +64,7 @@ export function readProviderCapacity({ env = {}, now = Date.now(), readers = {},
             lengthHours: w.lengthHours ?? (w.window_minutes > 0 ? w.window_minutes / 60 : null) ?? configured?.lengthHours ?? lengths[name] ?? null });
         }
       };
-      if (liveUsable) {
+      if (liveUsable && raw?.status !== 'signed-out') {
         if (owner.readers?.some(r => r.type === 'codex-rollout')) {
           const name = (w, fallback) => w?.window_minutes > 0
             ? def.windows?.find(x => x.lengthHours * 60 === w.window_minutes)?.name
@@ -86,7 +88,7 @@ export function readProviderCapacity({ env = {}, now = Date.now(), readers = {},
       let held = false;
       try { held = Boolean(readers.hold?.(owner.id, now)); } catch { held = true; }
       return { ...def, provider: entry.id, account: account.id, configuredWindows: def.windows, windows, held, health: held ? 0 : 1,
-        operatorReadingStale, known: windows.some(w => Number.isFinite(w.usedPercent)), now };
+        ...(signedOut ? { signedOut: true } : {}), operatorReadingStale, known: windows.some(w => Number.isFinite(w.usedPercent)), now };
     });
   });
 }

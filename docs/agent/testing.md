@@ -1110,6 +1110,12 @@ writes, so they do not replace a sibling process's records.
 
 ## Antigravity quota hold evidence
 
+The usage reader's login regression uses the raw ANSI capture in
+`scripts/operations/__tests__/fixtures/agy-login-screen.raw.txt`. With fake timers,
+assert resolution before startup, zero stdin writes, cleared timers and descendant
+cleanup: Escape or an interrupt sent as text can select a login method. Signed-out
+snapshots carry only `at` and `status`, never quota windows.
+
 Exercise holds with an injected temporary `dir` in
 `scripts/lib/__tests__/antigravity-run-evidence.test.mjs`. Explicit Claude and Gemini
 requests read their own backend folders; default or unrecognized models scan

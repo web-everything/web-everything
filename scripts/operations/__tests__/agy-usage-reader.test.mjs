@@ -1,9 +1,12 @@
 import { EventEmitter } from 'node:events';
 import { PassThrough } from 'node:stream';
+import { readFileSync } from 'node:fs';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { collectAgyUsage, descendantPids, parseAgyUsage, readAgyUsageSettings, runAgyUsageReader } from '../agy-usage-reader.mjs';
 
 const NOW = Date.parse('2026-11-18T12:00:00Z');
+const LOGIN = readFileSync('scripts/operations/__tests__/fixtures/agy-login-screen.raw.txt', 'utf8');
+const SIGNED_IN = readFileSync('scripts/operations/__tests__/fixtures/agy-usage-signed-in.raw.txt', 'utf8');
 const SCREEN = `GEMINI MODELS
 Models within this group: Gemini 4 Carbon, Gemini 4 Argon, Gemini 4 Hydrogen, ...
 Weekly Limit Remaining
@@ -17,6 +20,25 @@ const settings = { minIntervalMinutes: 15, timeoutMs: 45000 };
 afterEach(() => vi.useRealTimers());
 
 describe('Gemini usage parser', () => {
+  it('parses the signed-in capture with an unused five-hour window and a weekly countdown', () => {
+    expect(parseAgyUsage(SIGNED_IN, NOW)).toEqual({
+      at: new Date(NOW).toISOString(), session: null, spend_limit: null,
+      five_hour: { used_percentage: 0, resets_at: NOW / 1000 + 5 * 3600 },
+      seven_day: { used_percentage: 6, resets_at: NOW / 1000 + (153 * 60 + 58) * 60 },
+    });
+  });
+  it.each([['Five Hour', 'five_hour', 5], ['Weekly', 'seven_day', 168]])(
+    'uses the default length for an unused %s window with Quota available and no countdown', (label, key, hours) => {
+      const screen = SCREEN.replace(new RegExp(`(${label} Limit Remaining\\n\\[bar\\] )[^\\n]+\\nRefreshes in[^\\n]+`), '$1100.00%\nQuota available');
+      expect(parseAgyUsage(screen, NOW)[key]).toEqual({ used_percentage: 0, resets_at: NOW / 1000 + hours * 3600 });
+    });
+  it.each(['Five Hour', 'Weekly'])('rejects partial %s quota without a countdown even with Quota available', label => {
+    const screen = SCREEN.replace(new RegExp(`(${label} Limit Remaining\\n\\[bar\\] )[^\\n]+\\nRefreshes in[^\\n]+`), '$194.00%\nQuota available');
+    expect(() => parseAgyUsage(screen, NOW)).toThrow();
+  });
+  it('rejects a full window without either a countdown or Quota available', () => {
+    expect(() => parseAgyUsage(SCREEN.replace('Refreshes in 167h 59m', ''), NOW)).toThrow();
+  });
   it('takes the last full frame after a screen clear, not the first', () => {
     const stale = SCREEN.replace('100.00%', '40.00%');
     expect(parseAgyUsage(`${stale}\x1b[2J\x1b[H${SCREEN}`, NOW).seven_day.used_percentage).toBe(0);
@@ -94,6 +116,49 @@ function processFixture(options = {}) {
 }
 
 describe('PTY collection', () => {
+  it('resolves parsed usage when the fake PTY replays the signed-in capture', async () => {
+    const h = processFixture();
+    const resolved = vi.fn();
+    h.promise.then(resolved);
+    await vi.advanceTimersByTimeAsync(4500);
+    h.child.stdout.write(SIGNED_IN);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(resolved).toHaveBeenCalledWith({
+      at: new Date(NOW).toISOString(), session: null, spend_limit: null,
+      five_hour: { used_percentage: 0, resets_at: NOW / 1000 + 5 * 3600 },
+      seven_day: { used_percentage: 6, resets_at: NOW / 1000 + (153 * 60 + 58) * 60 },
+    });
+    expect(await h.promise).toEqual(resolved.mock.calls[0][0]);
+    expect(h.writes).toEqual(['\x1b', '/usage\r', '\x03', '\x03']);
+    expect(h.kill).toHaveBeenCalledWith(-1234, 'SIGKILL');
+    expect(vi.getTimerCount()).toBe(0);
+  });
+  it('resolves the raw login screen before startup, writes no keys and kills descendants', async () => {
+    const h = processFixture({ descendants: () => [1236, 1235] });
+    const resolved = vi.fn();
+    h.promise.then(resolved);
+    await vi.advanceTimersByTimeAsync(100);
+    // Exercise chunked output, including the two login markers arriving separately.
+    const split = LOGIN.indexOf('Select login method');
+    h.child.stdout.write(LOGIN.slice(0, split));
+    expect(h.kill).not.toHaveBeenCalled();
+    h.child.stdout.write(LOGIN.slice(split));
+    await vi.advanceTimersByTimeAsync(0);
+    expect(resolved).toHaveBeenCalledWith({ at: new Date(NOW).toISOString(), status: 'signed-out' });
+    expect(h.kill.mock.calls).toEqual([[1236, 'SIGKILL'], [1235, 'SIGKILL'], [-1234, 'SIGKILL']]);
+    expect(vi.getTimerCount()).toBe(0);
+    await vi.advanceTimersByTimeAsync(45000);
+    expect(h.writes).toEqual([]);
+  });
+  it.each(['not signed in', 'Select login method'])('does not classify a lone %s marker as signed out', async marker => {
+    const h = processFixture();
+    const assertion = expect(h.promise).rejects.toThrow('exited before complete usage');
+    h.child.stderr.write(marker);
+    expect(h.kill).not.toHaveBeenCalled();
+    h.child.emit('close');
+    await assertion;
+    expect(h.writes).toEqual([]);
+  });
   it('uses home cwd, sends Esc then usage and two interrupts without agy settings writes', async () => {
     const h = processFixture();
     await vi.advanceTimersByTimeAsync(3300);
@@ -185,6 +250,35 @@ function fileFixture(previous) {
 }
 
 describe('snapshot persistence', () => {
+  it('atomically writes the login fixture result without any usage fields', async () => {
+    const pty = processFixture({ descendants: () => [1235] });
+    const h = fileFixture();
+    h.collect.mockImplementation(() => pty.promise);
+    const result = runAgyUsageReader(h);
+    pty.child.stderr.write(LOGIN);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(h.io.rename).toHaveBeenCalled();
+    expect(await result).toEqual({ at: new Date(NOW).toISOString(), status: 'signed-out' });
+    const [temporary, data, flags] = h.io.writeFile.mock.calls[0];
+    const written = JSON.parse(data);
+    expect(written).toEqual({ at: new Date(NOW).toISOString(), status: 'signed-out' });
+    for (const field of ['five_hour', 'seven_day', 'used_percentage']) expect(data).not.toContain(field);
+    expect(flags).toEqual({ flag: 'wx', mode: 0o600 });
+    expect(h.io.rename).toHaveBeenCalledWith(temporary, '/trusted-home/.plateau/agy-usage.json');
+    expect(pty.writes).toEqual([]);
+    expect(pty.kill).toHaveBeenCalledWith(1235, 'SIGKILL');
+  });
+  it('throttles a recent signed-out record without treating it as usage', async () => {
+    const h = fileFixture(JSON.stringify({ at: new Date(NOW - 899999).toISOString(), status: 'signed-out' }));
+    expect(await runAgyUsageReader(h)).toEqual({ skipped: true });
+    expect(h.collect).not.toHaveBeenCalled();
+    expect(h.io.writeFile).not.toHaveBeenCalled();
+  });
+  it.each([NOW - 900000, NOW + 1, 'invalid'])('retries signed-out records with expired or invalid timestamps: %s', async at => {
+    const h = fileFixture(JSON.stringify({ at: typeof at === 'number' ? new Date(at).toISOString() : at, status: 'signed-out' }));
+    await runAgyUsageReader(h);
+    expect(h.collect).toHaveBeenCalledOnce();
+  });
   it('skips a snapshot younger than fifteen minutes without spawning or writing', async () => {
     const h = fileFixture(JSON.stringify(complete(NOW - 899999)));
     expect(await runAgyUsageReader(h)).toEqual({ skipped: true });
