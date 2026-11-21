@@ -102,20 +102,27 @@ it.each(['codex', 'agy-gemini'].flatMap(provider =>
   const code = `import { createExtraSeatsIo, killActiveSeats } from ${JSON.stringify(moduleUrl)};
     import { ownReviewScratch } from ${JSON.stringify(helper)};
     ownReviewScratch(${JSON.stringify(dir)}, killActiveSeats);
+    ${mode === 'exit' ? "process.once('message', message => { if (message === 'exit') process.exit(1); });" : ''}
     const work = createExtraSeatsIo({ root: ${JSON.stringify(tmp)} }).runSeat({
       provider: ${JSON.stringify(provider)}, dir: ${JSON.stringify(dir)}, taskFile: 'unused',
       model: 'unused', effort: 'high', timeoutMs: ${mode === 'outer-wall' ? -85000 : 60000} });
-    ${mode === 'exit' ? `const { existsSync } = await import('node:fs');
-      const timer = setInterval(() => { if (existsSync(${JSON.stringify(pidFile)})) process.exit(1); }, 20);` : ''}
     await work;
   `;
   let stderr = '';
-  const launcher = spawn(process.execPath, ['--input-type=module', '-e', code], { stdio: ['ignore', 'ignore', 'pipe'] });
+  const launcher = spawn(process.execPath, ['--input-type=module', '-e', code], {
+    stdio: ['ignore', 'ignore', 'pipe', ...(mode === 'exit' ? ['ipc'] : [])],
+  });
   launcher.stderr.on('data', d => { stderr += d; });
+  const state = () => JSON.stringify({ provider, mode, exitCode: launcher.exitCode, signalCode: launcher.signalCode,
+    wrapperReady: existsSync(wrapperReady), modelPid: existsSync(pidFile), heartbeat: existsSync(heartbeat),
+    termCheckout: existsSync(termCheckout), stderr: stderr.slice(-4000) });
   let modelPid;
   try {
-    await waitFor(() => existsSync(pidFile) && existsSync(wrapperReady) && existsSync(heartbeat), () => stderr);
+    await waitFor(() => existsSync(pidFile) && existsSync(wrapperReady) && existsSync(heartbeat), state);
     modelPid = Number(readFileSync(pidFile, 'utf8'));
+    // A PID file alone precedes heartbeat initialization. Trigger the synchronous
+    // exit only after the parent observed the fully started model and its wrapper.
+    if (mode === 'exit') launcher.send('exit');
     if (mode.startsWith('SIG')) launcher.kill(mode);
     if (mode === 'repeated-signals') {
       launcher.kill('SIGTERM');
@@ -123,10 +130,11 @@ it.each(['codex', 'agy-gemini'].flatMap(provider =>
       launcher.kill('SIGINT');
       launcher.kill('SIGHUP');
     }
-    await waitFor(() => launcher.exitCode !== null || launcher.signalCode !== null, () => stderr);
+    await waitFor(() => launcher.exitCode !== null || launcher.signalCode !== null, state);
+    if (mode === 'exit') expect(launcher.exitCode, state()).toBe(1);
     // An explicit synchronous exit may leave scratch for the TTL sweeper, but must
     // still stop the model. Signal and timeout paths finish cleanup before exiting.
-    await waitFor(() => existsSync(termCheckout), () => `wrapper never received SIGTERM; ${stderr}`);
+    await waitFor(() => existsSync(termCheckout), () => `wrapper never received SIGTERM; ${state()}`);
     expect(readFileSync(termCheckout, 'utf8'), stderr).toBe('true');
     await new Promise(r => setTimeout(r, 100));
     const beat = readFileSync(heartbeat, 'utf8');
