@@ -239,6 +239,8 @@ const liveOptions = paths => ({ repo: 'example/widgets', settings, now: at(0),
   stateFile: paths.stateFile, env: { WE_DAEMON_EVENTS: paths.eventsFile }, log() {}, emitEvent: () => true });
 test.each(['success', 'failure', 'cancelled', 'timed_out', 'neutral', 'skipped', 'action_required', 'stale'])(
   'completed red-team %s settles the pending expectation after its label clears', conclusion => scratch(async paths => {
+    // scratch seeds ready-to-merge; this scenario starts only red-team:pending.
+    writeFileSync(paths.eventsFile, '');
     const io = githubRead(); let completed = false;
     const opts = { ...liveOptions(paths), pr: 7, gh(args) {
       if (args[1].includes('/timeline?')) return [
