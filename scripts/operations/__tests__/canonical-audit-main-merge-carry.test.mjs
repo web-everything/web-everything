@@ -118,6 +118,53 @@ describe('canonical main merge carry with real git objects', () => {
     f.waivers.push({ ...f.waiver, sha: intermediate });
     expect(f.run().ok).toBe(true);
   });
+  it.each([undefined, true])('ignores an intermediate WEAKENED for an unaccepted question hash (fingerprinted: %s)', fingerprinted => {
+    const f = fixture({ hops: 2, pass: true });
+    expect(f.run().ok).toBe(true);
+    const intermediate = f.git('rev-parse', 'HEAD~1');
+    f.records.push({ ...f.audit, head: intermediate, fingerprint: fingerprinted ? f.audit.fingerprint : undefined,
+      verdict: 'WEAKENED', findings: ['foreign finding'],
+      questionHash: '0'.repeat(64), at: '2026-11-20T01:00:00Z' });
+    expect(f.run()).toMatchObject({ ok: true, carried: { from: f.A } });
+  });
+  it.each([false, true])('ignores a superseded fingerprintless intermediate WEAKENED (backdated pass: %s)', backdated => {
+    const f = fixture({ hops: 2, pass: true });
+    const intermediate = f.git('rev-parse', 'HEAD~1');
+    const weak = { ...f.audit, head: intermediate, fingerprint: undefined, verdict: 'WEAKENED',
+      findings: ['obsolete finding'], at: '2026-11-20T01:00:00Z' };
+    const pass = { ...weak, verdict: 'NOT WEAKENED', findings: [],
+      at: backdated ? '2026-11-20T00:30:00Z' : '2026-11-20T02:00:00Z' };
+    f.records.push(weak, pass);
+    expect(f.run()).toMatchObject({ ok: true, carried: { from: f.A } });
+  });
+  it('keeps an intermediate WEAKENED on another base active after a passing re-audit', () => {
+    const f = fixture({ hops: 2, pass: true });
+    const intermediate = f.git('rev-parse', 'HEAD~1');
+    f.records.push({ ...f.audit, head: intermediate, fingerprint: undefined, verdict: 'WEAKENED',
+      findings: ['still active'], at: '2026-11-20T01:00:00Z' });
+    f.records.push({ ...f.audit, head: intermediate, base: f.main, fingerprint: undefined,
+      at: '2026-11-20T02:00:00Z' });
+    expect(f.run()).toMatchObject({ ok: false, reason: 'canonical-audit-weakened' });
+  });
+  it('keeps a later-appended intermediate WEAKENED active despite a backdated timestamp', () => {
+    const f = fixture({ hops: 2, pass: true });
+    const intermediate = f.git('rev-parse', 'HEAD~1');
+    f.records.push({ ...f.audit, head: intermediate, fingerprint: undefined, at: '2026-11-20T02:00:00Z' });
+    f.records.push({ ...f.audit, head: intermediate.toUpperCase(), base: f.base.toUpperCase(),
+      fingerprint: undefined, verdict: 'WEAKENED', findings: ['active finding'], at: '2026-11-20T01:00:00Z' });
+    expect(f.run()).toMatchObject({ ok: false, reason: 'canonical-audit-weakened' });
+  });
+  it('requires each intermediate base to have its own matching waiver', () => {
+    const f = fixture({ hops: 2, pass: true });
+    const intermediate = f.git('rev-parse', 'HEAD~1');
+    const weak = { ...f.audit, head: intermediate, fingerprint: undefined, verdict: 'WEAKENED',
+      findings: ['first finding'], at: '2026-11-20T01:00:00Z' };
+    f.records.push(weak, { ...weak, base: f.main, findings: ['second finding'] });
+    f.waivers.push({ ...f.waiver, sha: intermediate, findings: ['first finding'] });
+    expect(f.run()).toMatchObject({ ok: false, reason: 'canonical-audit-weakened' });
+    f.waivers.push({ ...f.waiver, sha: intermediate, findings: ['second finding'] });
+    expect(f.run()).toMatchObject({ ok: true, carried: { from: f.A } });
+  });
   it('preserves the newer unwaived sibling WEAKENED veto despite identical findings and fingerprint', () => {
     const f = fixture();
     expect(f.run().ok).toBe(true);

@@ -151,15 +151,24 @@ export function checkCanonicalAuditForOpen({ repo = process.cwd(), ref, sha, env
   if (evidence.ok) {
     const carry = carryFor(evidence.record?.head?.toLowerCase());
     if (carry.ok && carriesAcross(evidence.record?.fingerprint, carry.fingerprint)) {
-      // A merge head's own negative evidence must not disappear just because it
-      // lacks the fingerprint used to select carried records.
+      // Judge each merge head/base, including fingerprintless evidence, with
+      // canonical eligibility and precedence. Different bases may have separate waivers.
       const intermediateHeads = new Set(carry.chain.filter(head => head !== fullSha));
-      const unwaived = records.find(record => intermediateHeads.has(record.head.toLowerCase())
-        && record.verdict === 'WEAKENED' && !config.ruledWeakened.some(entry =>
-          entry.ref === ref && validSha(entry.sha) && entry.sha.toLowerCase() === record.head.toLowerCase()
+      const intermediateDecisions = new Map();
+      for (const record of records) {
+        const head = record.head.toLowerCase(), base = record.base.toLowerCase();
+        if (!intermediateHeads.has(head)) continue;
+        const key = `${head}:${base}`;
+        if (!intermediateDecisions.has(key)) intermediateDecisions.set(key, { head, records: [] });
+        intermediateDecisions.get(key).records.push(record);
+      }
+      const unwaived = [...intermediateDecisions.values()].find(({ head, records: headRecords }) =>
+        canonicalAuditEvidence(headRecords, head, covers).reason === 'weakened'
+        && !config.ruledWeakened.some(entry =>
+          entry.ref === ref && validSha(entry.sha) && entry.sha.toLowerCase() === head
           && /^R\d+(?:\+R\d+)*$/.test(entry.ruling) && Array.isArray(entry.findings)
           && entry.findings.length > 0 && entry.findings.every(f => typeof f === 'string' && f.trim())
-          && canonicalAuditEvidence([record], record.head, covers, null, { ruledWeakened: {
+          && canonicalAuditEvidence(headRecords, head, covers, null, { ruledWeakened: {
             ruledWeakened: { ruling: entry.ruling, findings: entry.findings },
             record: { sha: entry.sha, fingerprint: null },
           } }).ok));
