@@ -414,6 +414,7 @@ const MAIN_CI_RUNS = 30;
 export function readMainCiFact({ repo, defaultBranch = 'main', exec = execFileSync, workflow = MAIN_CI_RED_DEFAULTS.mainCiRedWorkflow }) {
   const source = `${workflow}@${defaultBranch}`;
   let runs;
+  let head;
   try {
     // Include the hourly backstop; PR events with a branch named main are excluded below.
     runs = JSON.parse(exec('gh', ['run', 'list', '--repo', repo, '--workflow', workflow, '--branch', defaultBranch, '--limit', String(MAIN_CI_RUNS),
@@ -424,10 +425,8 @@ export function readMainCiFact({ repo, defaultBranch = 'main', exec = execFileSy
     runs = runs.filter((r) => ['push', 'schedule'].includes(r.event));
     if (runs.some(r => r.event === 'schedule')) {
       try {
-        const head = ghJson(['api', `repos/${repo}/git/ref/heads/${defaultBranch}`], exec)?.object?.sha;
+        head = ghJson(['api', `repos/${repo}/git/ref/heads/${defaultBranch}`], exec)?.object?.sha;
         if (!SHA_RE.test(head)) throw new Error('main head unknown');
-        // A delayed schedule on an older commit must never clear a different head's failure.
-        runs = runs.filter(r => r.event !== 'schedule' || r.headSha === head);
       } catch (e) { return { source, error: `main CI head unreadable: ${firstLine(e)}` }; }
     }
     // A RE-RUN puts a finished run back in progress, and an in-progress run is ignored, so the run before it (maybe
@@ -444,7 +443,24 @@ export function readMainCiFact({ repo, defaultBranch = 'main', exec = execFileSy
       if (!jobPages.has(key)) jobPages.set(key, exec(command, args, options));
       return jobPages.get(key);
     };
+    const pushes = runs.filter(r => r.event === 'push');
     runs = withoutReusedMainPushes(runs, { repo, exec: readJobs });
+    // Keep historical recovery in its original execution window. Proven reuse
+    // contributes no execution, but a different intervening run prevents a delayed
+    // backstop from clearing that run. Never relabel the backstop as current HEAD.
+    const executions = runs;
+    runs = runs.filter(r => {
+      if (r.event !== 'schedule' || r.headSha === head) return true;
+      const started = Date.parse(r.createdAt);
+      if (!SHA_RE.test(r.headSha) || !Number.isFinite(started)) return false;
+      // A reused push still establishes when this SHA reached main. It cannot
+      // supply green execution, but its later full backstop can recover older red.
+      const reachedMain = Math.max(-Infinity, ...pushes.filter(push => push.headSha === r.headSha
+        && Date.parse(push.createdAt) <= started).map(push => Date.parse(push.createdAt)));
+      return !executions.some(other => other.headSha !== r.headSha
+        && (!Number.isFinite(Date.parse(other.createdAt))
+          || (Date.parse(other.createdAt) >= reachedMain && Date.parse(other.createdAt) <= started)));
+    });
     try { markInfraOnlyRuns(runs, { repo, exec: readJobs }); } catch { /* unreadable job evidence stays red */ }
   }
   const st = mainRedState(runs);

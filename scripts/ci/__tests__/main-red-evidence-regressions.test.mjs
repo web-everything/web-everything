@@ -115,6 +115,59 @@ it('hourly failure newer than real push success keeps merge admission red', () =
 it('hourly success proves green for its own current head', () => {
   expect(fact([run(10, head, 'failure'), run(11, head, 'success', 'schedule')])).toMatchObject({ red: false });
 });
+it('moving main preserves historical backstop recovery after a proven reused push', () => {
+  const rows = [
+    run(12, head, 'failure'),
+    run(11, old, 'success', 'schedule'),
+    run(10, old, 'failure'),
+  ];
+  expect(fact(rows, head, { '12/1': reusedJobs() })).toMatchObject({ red: false, firstRedSha: null });
+  expect(mainRedState(withoutReusedMainPushes(rows, { repo: 'fixture/repo', exec: (_, args) => {
+    if (args[1].includes('/12/')) return JSON.stringify(reusedJobs());
+    throw Error('not reused');
+  } }))).toMatchObject({ status: 'green', latestGreen: { runId: 11, sha: old } });
+});
+it('historical recovery keeps a later real failure in its own red window', () => {
+  expect(fact([run(12, head, 'failure'), run(11, old, 'success', 'schedule'), run(10, old, 'failure')]))
+    .toMatchObject({ red: true, firstRedSha: head, redShas: [head] });
+});
+it('delayed historical recovery cannot clear a different historical SHA failure behind reuse', () => {
+  expect(fact([run(14, head, 'failure'), run(13, old, 'success', 'schedule'),
+    run(12, 'c'.repeat(40), 'failure'), run(10, old, 'failure')], head, { '14/1': reusedJobs() }))
+    .toMatchObject({ red: true });
+});
+it('historical recovery can follow reused pushes without becoming their execution evidence', () => {
+  expect(fact([run(10, old, 'failure'), run(12, head, 'failure'), run(13, old, 'success', 'schedule')],
+    head, { '12/1': reusedJobs() })).toMatchObject({ red: false });
+});
+it('backstop on a reused commit still recovers older red after another reused commit lands', () => {
+  expect(fact([run(13, head, 'failure'), run(12, old, 'success', 'schedule'),
+    run(11, old, 'failure'), run(10, 'c'.repeat(40), 'failure')], head,
+  { '13/1': reusedJobs(), '11/1': reusedJobs() })).toMatchObject({ red: false });
+});
+it('historical backstop remains execution evidence when its push has left the inventory', () => {
+  expect(fact([run(12, head, 'failure'), run(11, old, 'success', 'schedule')], head,
+    { '12/1': reusedJobs() })).toMatchObject({ red: false });
+});
+it.each(['same-time different SHA', 'missing timestamp', 'unknown intervening push time'])
+('historical recovery fails closed with %s', mode => {
+  const rows = [run(10, old, 'failure'), run(11, old, 'success', 'schedule'), run(12, head, 'failure')];
+  if (mode === 'same-time different SHA') rows.push({ ...run(10, 'c'.repeat(40), 'failure'), databaseId: 9 });
+  if (mode === 'missing timestamp') rows[1].createdAt = undefined;
+  if (mode === 'unknown intervening push time') rows.push({ ...run(9, 'c'.repeat(40), 'failure'), createdAt: undefined });
+  const result = fact(rows, head, { '12/1': reusedJobs() });
+  expect(result.red).toBe(true);
+});
+it('historical backstop reruns remain undecided after main moves', () => {
+  expect(fact([run(10, old, 'failure'),
+    { ...run(11, old, null, 'schedule'), status: 'in_progress', attempt: 2 },
+    run(12, head, 'failure')], head, { '12/1': reusedJobs() }).error).toMatch(/being re-run/);
+});
+it('delayed historical recovery cannot hide a current-head backstop failure behind reuse', () => {
+  expect(fact([run(13, old, 'success', 'schedule'), run(12, head, 'failure', 'schedule'),
+    run(11, head, 'failure'), run(10, old, 'success')], head, { '11/1': reusedJobs() }))
+    .toMatchObject({ red: true, firstRedSha: head, redShas: [head] });
+});
 it('newer-created schedule on an older SHA cannot clear current-head failure', () => {
   expect(fact([run(10, head, 'failure'), run(11, old, 'success', 'schedule')])).toMatchObject({ red: true });
 });
