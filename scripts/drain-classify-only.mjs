@@ -21,6 +21,16 @@ export function heldBeforeAdmission(result, matches) {
 
 /** Only evidence exposed by the existing dry-run is asserted. */
 export function resultToVerdictInputs(result, ctx) {
+  if (result?.dryRun === true && result.ok === true && Array.isArray(result.failedRepos) && result.failedRepos.length &&
+      result.failedRepos.every(f => f && typeof f.repo === 'string' && /^[\w.-]+\/[\w.-]+$/.test(f.repo) &&
+        f.repo.toLowerCase() !== String(ctx.repo).toLowerCase() && f.retryable === false)) {
+    // Only OTHER repos' permanent (non-retryable) listing failures (the read-only Actions token cannot list them):
+    // everything else in the result must still validate, then this PR degrades to unknown.
+    resultToVerdictInputs({ ...result, failedRepos: undefined }, ctx);
+    const err = new Error('incomplete dry-run; run the local drain');
+    err.unknownReason = `cross-repo listing failed for ${result.failedRepos.map(f => f.repo).join(', ')}`.replace(/[^\w ,./-]/g, '?');
+    throw err;
+  }
   if (result?.dryRun !== true || result.ok !== true ||
       (result.failedRepos !== undefined && (!Array.isArray(result.failedRepos) || result.failedRepos.length))) {
     throw new Error('incomplete dry-run; run the local drain');
@@ -149,19 +159,32 @@ export function runBatch(argv = process.argv.slice(2), io = {}) {
   }
   if (!prs.length) return { written: 0, failed: 0 };
   (io.mkdirSync || mkdirSync)(flags['verdict-dir'], { recursive: true });
-  let written = 0, failed = 0;
+  let written = 0, failed = 0, unknown = 0;
   for (const pr of prs) {
     try {
       if (!/^[1-9]\d*$/.test(pr)) throw new Error('invalid PR number');
       runCli([`--only=${pr}`, `--verdict-out=${flags['verdict-dir']}/pr-${pr}.json`, ...(flags.repo ? [`--repo=${flags.repo}`] : [])], io);
       written++;
     } catch (error) {
+      if (error.unknownReason) {
+        // Never mergeable: decision 'unknown' fails verify(); the local drain decides.
+        const unknownVerdict = { schema: 'drain-verdict/2', repo: flags.repo || env.GITHUB_REPOSITORY, pr: Number(pr), decision: 'unknown',
+          reason: error.unknownReason, provenance: { runId: env.GITHUB_RUN_ID, event: env.GITHUB_EVENT_NAME, ref: env.GITHUB_REF, workflow: 'drain-verdict' }, computedAt: new Date((io.now || Date.now)()).toISOString() };
+        try {
+          (io.writeFileSync || writeFileSync)(`${flags['verdict-dir']}/pr-${pr}.json`, `${JSON.stringify(unknownVerdict, null, 2)}\n`);
+          unknown++;
+          process.stderr.write(`#${pr}: unknown (${error.unknownReason})\n`);
+          continue;
+        } catch { /* fall through to a hard failure */ }
+      }
       failed++;
       process.stderr.write(`#${String(pr).replace(/[^\w-]/g, '?')}: ${String(error.message).replace(/[\x00-\x1f\x7f]/g, ' ')}\n`);
     }
   }
   if (!written && !failed) failed = 1;
-  return { written, failed };
+  // Every PR unknown would hide an outage behind a green run: fail with a summary.
+  if (unknown && !written) process.stderr.write(`all ${unknown} PR(s) unknown; run the local drain\n`);
+  return unknown ? { written, failed, unknown } : { written, failed };
 }
 
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
