@@ -62,7 +62,7 @@ import {
 import { runReconcileFixDispatch, writePrivateBorrowedPrompt, routeFixExecutor } from '../../scripts/conveyor/reconcile-fix-dispatch.mjs';
 import { runAwaitVerifyPassDefault, formatAwaitVerifyLines } from '../../scripts/conveyor/await-verify-pass.mjs';
 // xn025gx (fixer proposal A1 + A2 part 1, rulings P1/P2) — the fast push-on-green loop and the active-only fix slot.
-import { withCiHealCycleLock, spawnCiHealLoop } from '../../scripts/conveyor/ci-heal-loop.mjs';
+import { withCiHealCycleLock, spawnCiHealLoop, createCiHealLoopController } from '../../scripts/conveyor/ci-heal-loop.mjs';
 import { runTickAwaitVerify, defaultSlotCountedFixClaims, superviseAwaitVerifyLoop, formatReleaseLines } from '../../scripts/conveyor/await-verify-loop.mjs';
 import { runFixerStuckReclaimPass, formatFixerStuckReclaimLines } from '../../scripts/conveyor/fixer-stuck-reclaim.mjs'; // card xccgzu5
 import { runReconcileCiHealDispatch, dispatchCiHeal } from '../../scripts/operations/ci-heal-pr-dispatch.mjs';
@@ -1951,12 +1951,15 @@ async function main() {
   // (launchd KeepAlive brings it back), instead of refusing every dispatch until someone re-syncs by hand.
   const selfRoot = resolve(fileURLToPath(import.meta.url), '..', '..', '..');
   // Webhook-driven wake (flag WE_PR_EVENTS, default OFF → effects unchanged) — see we:scripts/lib/pr-events.mjs.
-  const effects = withPrEvents(withSelfSync(withGithubAppAuth(withFixDispatchClaimRefresh(buildCliDaemonEffects({ owner, ciHealLoop })), FIX_DISPATCH_APP_AUTH_OPTS), {
+  // Re-read ciHeal.loop every tick: on starts the child, off stops it (no daemon restart needed to flip the setting).
+  const ciHealControl = createCiHealLoopController({ supervisor: ciHealLoop });
+  const cliEffects = buildCliDaemonEffects({ owner, ciHealLoop });
+  const effects = withPrEvents(withSelfSync(withGithubAppAuth(withFixDispatchClaimRefresh({ ...cliEffects, tickOnce: () => { ciHealControl.tick(); return cliEffects.tickOnce(); } }), FIX_DISPATCH_APP_AUTH_OPTS), {
     root: selfRoot, onRestart: exits.restartOntoNewCode, hasStaleRefusal: hasStaleMainRefusal,
   }), fixDaemonPrEventsOptions());
   // withSelfSync sets WE_DAEMON_MANAGED_CLONE while constructing; start children after it so the spawn env carries it.
   awaitLoop.start();
-  ciHealLoop.start();
+  ciHealControl.tick();
   const { stoppedReason } = await runDaemonLoop(effects);
   exits.loopEnded(stoppedReason);
 }

@@ -69,6 +69,24 @@ export function resolveCiHealLoop({ env = process.env, settings = readSettings()
 }
 export const resolveCiHealLoopEnabled = options => resolveCiHealLoop(options).enabled;
 
+/**
+ * Re-reads `ciHeal.loop` every daemon tick and reconciles the child with it: on starts one if none runs, off stops it
+ * gracefully, an unreadable store or a throwing resolver counts as off. Each change of value or source is logged once.
+ */
+export function createCiHealLoopController({ supervisor, resolve = resolveCiHealLoop, log = line => console.error(line) } = {}) {
+  let last = null;
+  return {
+    tick() {
+      let resolved;
+      try { resolved = resolve(); } catch { resolved = { enabled: false, source: 'resolve-error' }; }
+      const key = `${resolved.enabled}|${resolved.source}`;
+      if (key !== last) { last = key; log(`ci-heal-loop: ciHeal.loop=${resolved.enabled ? 'on' : 'off'} source=${resolved.source}`); }
+      if (resolved.enabled) { if (!supervisor.current()) supervisor.start(); } else if (supervisor.current()) supervisor.halt();
+      return resolved;
+    },
+  };
+}
+
 /** The single spawn point: null (nothing spawned) unless `ciHeal.loop` is on. */
 export function spawnCiHealLoop({ env = process.env, settings, readOverride, spawnFn = nodeSpawn, parentPid = process.pid, log = line => console.error(line) } = {}) {
   const resolved = resolveCiHealLoop({ env, ...(settings ? { settings } : {}), ...(readOverride ? { readOverride } : {}) });

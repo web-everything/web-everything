@@ -6,7 +6,7 @@
 import { describe, it, expect, vi } from 'vitest';
 import { runTickAllRepos, buildCliDaemonEffects, buildDaemonExits } from '../reconcile-fix-dispatch-daemon.mjs';
 import { superviseAwaitVerifyLoop } from '../../../scripts/conveyor/await-verify-loop.mjs';
-import { resolveCiHealLoopEnabled, resolveCiHealLoop, spawnCiHealLoop } from '../../../scripts/conveyor/ci-heal-loop.mjs';
+import { resolveCiHealLoopEnabled, resolveCiHealLoop, spawnCiHealLoop, createCiHealLoopController } from '../../../scripts/conveyor/ci-heal-loop.mjs';
 
 const noOverride = () => ({ ok: false, reason: 'not-set' });
 const quiet = () => ({ dispatched: [], refusals: [], actions: [], notes: [], rows: [] });
@@ -114,5 +114,64 @@ describe('ci-heal child loop wiring (async slice s2)', () => {
     expect(timers[0].ms).toBe(60000);
     timers[0].fn();
     expect(spawnLoop).toHaveBeenCalledTimes(2);
+  });
+
+  describe('the supervisor re-reads ciHeal.loop every tick', () => {
+    const make = (answers) => {
+      const kills = [];
+      const lines = [];
+      const spawnLoop = vi.fn(() => ({ pid: 100 + spawnLoop.mock.calls.length, on: () => {}, kill: sig => kills.push(sig) }));
+      const supervisor = superviseAwaitVerifyLoop({ spawnLoop, log: { error: vi.fn() }, setTimer: () => ({ unref() {} }), now: () => 0 });
+      let i = 0;
+      const resolve = vi.fn(() => answers[Math.min(i++, answers.length - 1)]);
+      const controller = createCiHealLoopController({ supervisor, resolve, log: line => lines.push(line) });
+      return { controller, supervisor, spawnLoop, kills, lines };
+    };
+    const on = { enabled: true, source: 'override' };
+    const off = { enabled: false, source: 'override' };
+
+    it('off to on starts the child once and logs the change with its source', () => {
+      const t = make([off, on, on]);
+      t.controller.tick();
+      expect(t.spawnLoop).not.toHaveBeenCalled();
+      t.controller.tick();
+      expect(t.spawnLoop).toHaveBeenCalledOnce();
+      expect(t.lines).toContain('ci-heal-loop: ciHeal.loop=on source=override');
+    });
+
+    it('never double-spawns while a child is alive', () => {
+      const t = make([on]);
+      t.controller.tick(); t.controller.tick(); t.controller.tick();
+      expect(t.spawnLoop).toHaveBeenCalledOnce();
+    });
+
+    it('on to off stops the child gracefully (SIGTERM), logs it, and a later on starts a fresh one', () => {
+      const t = make([on, off, off, on]);
+      t.controller.tick();
+      t.controller.tick();
+      expect(t.kills).toEqual(['SIGTERM']);
+      expect(t.supervisor.current()).toBeNull();
+      expect(t.lines).toContain('ci-heal-loop: ciHeal.loop=off source=override');
+      t.controller.tick();
+      expect(t.kills).toHaveLength(1);
+      t.controller.tick();
+      expect(t.spawnLoop).toHaveBeenCalledTimes(2);
+    });
+
+    it('an unreadable store resolves to off (fail closed) and stops a running child', () => {
+      const t = make([on, { enabled: false, source: 'override-unreadable' }]);
+      t.controller.tick();
+      t.controller.tick();
+      expect(t.kills).toEqual(['SIGTERM']);
+      expect(t.lines).toContain('ci-heal-loop: ciHeal.loop=off source=override-unreadable');
+    });
+
+    it('a resolver that throws counts as off', () => {
+      const t = make([on]);
+      t.controller.tick();
+      const throwing = createCiHealLoopController({ supervisor: t.supervisor, resolve: () => { throw new Error('boom'); }, log: () => {} });
+      throwing.tick();
+      expect(t.kills).toEqual(['SIGTERM']);
+    });
   });
 });
