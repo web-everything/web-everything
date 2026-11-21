@@ -22,8 +22,11 @@ export function heldBeforeAdmission(result, matches) {
 /** Only evidence exposed by the existing dry-run is asserted. */
 export function resultToVerdictInputs(result, ctx) {
   if (result?.dryRun === true && result.ok === true && Array.isArray(result.failedRepos) && result.failedRepos.length &&
-      result.failedRepos.every(f => f && typeof f.repo === 'string' && f.repo !== ctx.repo)) {
-    // Only OTHER repos' listings failed (the read-only Actions token cannot list them): degrade this PR to unknown.
+      result.failedRepos.every(f => f && typeof f.repo === 'string' && /^[\w.-]+\/[\w.-]+$/.test(f.repo) &&
+        f.repo.toLowerCase() !== String(ctx.repo).toLowerCase() && f.retryable === false)) {
+    // Only OTHER repos' permanent (non-retryable) listing failures (the read-only Actions token cannot list them):
+    // everything else in the result must still validate, then this PR degrades to unknown.
+    resultToVerdictInputs({ ...result, failedRepos: undefined }, ctx);
     const err = new Error('incomplete dry-run; run the local drain');
     err.unknownReason = `cross-repo listing failed for ${result.failedRepos.map(f => f.repo).join(', ')}`.replace(/[^\w ,./-]/g, '?');
     throw err;

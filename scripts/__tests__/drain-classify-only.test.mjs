@@ -10,7 +10,7 @@ const OWN = 'o/r', OTHER = 'frontierui/plateau-app';
 const batchArgv = ['--batch', '--verdict-dir=verdicts'];
 const okDryRun = num => ({ ok: true, dryRun: true, heldCoupleMembers: 0, skipped: [], parked: [], skipReasons: [],
   toMerge: [{ num, repo: OWN, headSha }] });
-const listingFailure = repo => ({ ...okDryRun(7), ok: true, toMerge: [], failedRepos: [{ repo, kind: 'listing', text: `FAILED open-PR listing for ${repo}`, retryable: false }] });
+const listingFailure = (repo, num = 7) => ({ ...okDryRun(num), failedRepos: [{ repo, kind: 'listing', text: `FAILED open-PR listing for ${repo}`, retryable: false }] });
 
 function batchIo({ prs = [7, 8], dryRunFor }) {
   const env = { GITHUB_ACTIONS: 'true', GITHUB_REF: 'refs/heads/main', GITHUB_EVENT_NAME: 'schedule',
@@ -55,6 +55,26 @@ describe('drain-classify-only: cross-repo listing failure degrades to unknown', 
     const provenance = v.provenance;
     const live = { repo: v.repo, pr: 7, headSha, mainSha, provenance };
     expect(verify(v, live, { now }).ok).toBe(false);
+    // Non-vacuous: the same artifact completed to a fully valid shape is refused ONLY because of decision 'unknown'.
+    const complete = decision => ({ ...v, decision, headSha, mainSha,
+      localOnly: Object.fromEntries(['red-main-freeze', 'card-group', 'manifest-baseline', 'couple-whole', 'test-gaming-scan'].map(k => [k, 'unknown'])) });
+    const withoutReason = decision => { const c = complete(decision); delete c.reason; return c; };
+    expect(verify(withoutReason('enqueue'), live, { now }).ok).toBe(true);
+    expect(verify(withoutReason('unknown'), live, { now }).ok).toBe(false);
+  });
+
+  it('a retryable (outage/rate-limit) or malformed cross-repo failure is not downgraded to unknown', () => {
+    for (const dry of [
+      n => ({ ...listingFailure(OTHER), failedRepos: [{ repo: OTHER, retryable: true }] }),
+      n => ({ ...listingFailure(OTHER), failedRepos: [{ repo: '', retryable: false }] }),
+      n => ({ ...listingFailure(OTHER), failedRepos: [{ repo: OWN.toUpperCase(), retryable: false }] }),
+      n => ({ ...listingFailure(OTHER), toMerge: undefined }),
+    ]) {
+      const io = batchIo({ prs: [7], dryRunFor: dry });
+      const [out] = quiet(() => runBatch(batchArgv, io));
+      expect(out).toMatchObject({ written: 0, failed: 1 });
+      expect(io.writeFileSync).not.toHaveBeenCalled();
+    }
   });
 
   it('a listing failure on the run own repo still fails the PR (exit 1, nothing unknown)', () => {
@@ -71,7 +91,7 @@ describe('drain-classify-only: cross-repo listing failure degrades to unknown', 
   });
 
   it('every PR unknown fails the run with a summary', () => {
-    const io = batchIo({ dryRunFor: n => listingFailure(OTHER) && { ...listingFailure(OTHER), toMerge: [] } });
+    const io = batchIo({ dryRunFor: n => listingFailure(OTHER, n) });
     const [out, err] = quiet(() => runBatch(batchArgv, io));
     expect(out.failed).toBe(1);
     expect(out.written).toBe(0);
