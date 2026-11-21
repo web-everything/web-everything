@@ -14,6 +14,7 @@ const advisory = (head = OLD, body = `Net basis: \`${'c'.repeat(40)}..${head}\` 
 const own = (oid, extra = {}) => ({ oid, messageHeadline: 'fix: the thing', messageBody: '', authors: [{ login: 'chalbert' }], ...extra });
 const mainMerge = oid => own(oid, { messageHeadline: "Merge branch 'main' into lane/x" });
 const pr = (extra = {}) => ({ number: 7230, state: 'OPEN', headRefName: 'lane/x', headRefOid: HEAD,
+  rowsComplete: true, rowsHead: extra.headRefOid ?? HEAD,
   labels: ['review:human'], mergeStateStatus: 'CLEAN',
   statusCheckRollup: [{ name: 'gate', status: 'completed', conclusion: 'success' }],
   commits: [own(OLD), mainMerge(HEAD)], comments: [advisory()], ...extra });

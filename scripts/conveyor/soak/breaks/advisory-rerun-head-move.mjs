@@ -26,6 +26,7 @@ export default {
     const commit = (oid, messageHeadline) => ({ oid, messageHeadline, messageBody: '', authors: [{ login: 'someone' }] });
     const plan = (head, tip, extra = {}, options = {}) => planReconcile({
       prs: [{ number: 7230, state: 'OPEN', headRefName: 'lane/x', headRefOid: HEAD, labels: [{ name: 'review:human' }],
+        rowsComplete: true, rowsHead: extra.headRefOid ?? HEAD,
         mergeStateStatus: 'CLEAN', statusCheckRollup: [{ name: 'gate', status: 'completed', conclusion: 'success' }],
         commits: [commit(OLD, 'fix: it'), commit(HEAD, tip)], comments: [advisory(head)], ...extra }],
       agents: [], requiredChecks: ['gate'], reviewTiming: { startAfter: 'ci-green' }, now: Date.parse('2026-11-20T12:00:00Z'),
