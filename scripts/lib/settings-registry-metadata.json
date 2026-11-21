@@ -770,6 +770,24 @@
       "changeVia": "pr",
       "instant": false
     },
+    "mode": {
+      "description": "Audit-on-ready observation mode (shadow or on); both only log audit debt without dispatching in slice S1.1.",
+      "owner": "scripts/settings/review-auto-audit.json",
+      "changeVia": "pr",
+      "instant": false
+    },
+    "maxPerTick": {
+      "description": "Reserved per-tick audit dispatch limit for later audit-on-ready execution slices.",
+      "owner": "scripts/settings/review-auto-audit.json",
+      "changeVia": "pr",
+      "instant": false
+    },
+    "maxAttemptsPerHead": {
+      "description": "Reserved per-head audit attempt limit for later audit-on-ready execution slices.",
+      "owner": "scripts/settings/review-auto-audit.json",
+      "changeVia": "pr",
+      "instant": false
+    },
     "reviewNoVerdictRetry": {
       "description": "Bounded cooldown releases when a review verdict never lands.",
       "owner": "scripts/settings/review-no-verdict-retry.json",

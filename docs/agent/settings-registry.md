@@ -16,9 +16,9 @@ For repo defaults, edit the owner file through a PR and rebuild the consuming da
 
 ## Summary
 
-- Top-level keys: 161 (163 declaration rows).
-- Declared leaves: 590 (platform copies counted separately).
-- Instant top-level keys: 0; not instant: 161.
+- Top-level keys: 164 (166 declaration rows).
+- Declared leaves: 593 (platform copies counted separately).
+- Instant top-level keys: 0; not instant: 164.
 - Instant capacity leaves: 15.
 - Constants to settle: 312.
 - Instant gaps: 28.
@@ -135,8 +135,10 @@ Operator-prefs layer: ~/.plateau/platform-preferences.json is the requested oper
 | loadGovernor | scripts/settings/load-governor.json | 10 | {"enabled":true,"targetLoadPerCore":2,"resumeBelowPerCore":… | pr | no | Host load targets, pause priorities and resumption thresholds. |
 | loaderCli | scripts/settings/prototype-load.json | 1 | "scripts/daemon-overlay.mjs" | pr | no | CLI used to load daemon overlays. |
 | mainFixCapacity | scripts/settings/main-fix-capacity.json | 1 | {"pastFixCap":true} | pr | no | Allow main-fix work beyond the ordinary fix cap. |
+| maxAttemptsPerHead | scripts/settings/review-auto-audit.json | 1 | 2 | pr | no | Reserved per-head audit attempt limit for later audit-on-ready execution slices. |
 | maxLiveReviewRounds | scripts/settings/review-concurrency.json | 1 | 8 | pr | no | Maximum concurrent host review rounds. |
 | maxLoadPerCore | scripts/dispatch-settings.json | 1 | 2 | pr | no | Host load ceiling per CPU core for dispatch admission. |
+| maxPerTick | scripts/settings/review-auto-audit.json | 1 | 1 | pr | no | Reserved per-tick audit dispatch limit for later audit-on-ready execution slices. |
 | maxSize | scripts/settings/agy-build.json | 1 | 1 | env | no | Maximum direct confined agy build size for any kind; repair dispatch remains size 1. |
 | memFreeMinPct | scripts/dispatch-settings.json | 1 | 15 | pr | no | Minimum free memory percentage for dispatch admission. |
 | mergeDelivery | scripts/lib/delivery-platform-preferences.json | 5 | {"strategy":"drain-direct","batchSize":3,"maxGroupWaitMinut… | pr | no | Merge strategy, batch size, wait time and call concurrency. |
@@ -146,6 +148,7 @@ Operator-prefs layer: ~/.plateau/platform-preferences.json is the requested oper
 | mergeQueue | scripts/settings/approved-human-surface-hold.json, scripts/settings/human-only-enqueue.json, scripts/settings/merge-queue-numbering.json, scripts/settings/merge-queue-obsolete-runs.json, scripts/settings/merge-queue-refresh.json, scripts/settings/merge-queue.json | 31 | {"skipRebaseApprovedHumanSurface":"on","humanOnly":{"approv… | pr | no | Enqueue, human approval, card numbering and obsolete-run cancellation policy. |
 | mergeQueueBatching | scripts/settings/merge-queue-batching.json | 3 | {"enabled":true,"groupSize":3,"maxGroupsInFlight":8} | pr | no | Merge queue group size and groups in flight. |
 | minNonClaudeSeats | scripts/settings/review.json | 1 | 1 | pr | no | Minimum number of non-Claude review seats. |
+| mode | scripts/settings/review-auto-audit.json | 1 | "shadow" | pr | no | Audit-on-ready observation mode (shadow or on); both only log audit debt without dispatching in slice S1.1. |
 | modes | scripts/settings/delivery-routes.json | 4 | {"debug":"DEBUG MODE (R817/R823/R826/R852). Diagnose on the… | pr | no | Instructions defining the available delivery modes. |
 | openPrCap | scripts/settings/open-pr-cap.json | 2 | {"excludeCardOnly":true,"excludeAccepted":true} | pr | no | Population exclusions for the open PR cap. |
 | operatorCli | scripts/settings/operator-cli.json | 1 | {"freshFallback":"on"} | pr | no | Allow a fresh operator CLI fallback. |
