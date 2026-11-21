@@ -116,9 +116,20 @@ describe('ops ruled-weakened evidence', () => {
         requests(full.replace('\\n', '\n'));
         const { warn, warnOther } = scoped('lane/fix');
         expect(warn).not.toHaveBeenCalled();
-        expect(warnOther).not.toHaveBeenCalled();
+        expect(warnOther).toHaveBeenCalledTimes(1);
         append();
         expect(union()).toEqual([]);
+      });
+      it('a rejoined record with a newline inside ref or ruling is damaged and blocks; a rejoin is reported', () => {
+        for (const over of [{ ref: 'lane/\nfix' }, { ruling: 'WITHDRAWN\n' }]) {
+          requests(JSON.stringify({ ruling: 'WITHDRAWN', ref: 'lane/fix', sha: SHA, findings: 'a\nb', ...over }).replace('\\n', '\n'));
+          const { warn } = scoped('lane/fix');
+          expect(warn).toHaveBeenCalledTimes(1);
+          fs.rmSync(join(home, 'workspace'), { recursive: true, force: true });
+        }
+        const split = JSON.stringify({ ruling: 'WITHDRAWN', ref: 'lane/fix', sha: SHA, findings: 'a\nb' }).replace('\\n', '\n');
+        requests(split);
+        expect(scoped('lane/fix').warnOther).toHaveBeenCalledTimes(1);
       });
       it('a split record whose join does not parse stays unattributable and blocks', () => {
         requests('{"ref":"lane/other","sha":"' + SHA + '","findings":"a', 'b', 'c', 'd', 'e', 'never closed');

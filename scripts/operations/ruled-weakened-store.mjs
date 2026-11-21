@@ -49,7 +49,7 @@ export function withdrawnRevocations({ env = process.env, fs = nodeFs, warn = co
   const lines = body.split(/\r?\n/);
   // A damaged line only blocks when it names scopeRef or its ref cannot be read (fail closed); others use warnOther.
   const damaged = (i, count, request) => {
-    const named = request && typeof request === 'object' && !Array.isArray(request) && nonblank(request.ref);
+    const named = request && typeof request === 'object' && !Array.isArray(request) && nonblank(request.ref) && !/[\r\n]/.test(request.ref);
     const other = scopeRef !== undefined && named && bareRef(request.ref) !== bareRef(scopeRef);
     const span = count > 1 ? `lines ${i + 1}-${i + count}` : `line ${i + 1}`;
     (other ? warnOther : warn)(`WARNING: waiver request log ${span}: malformed JSON or invalid request; ignored`);
@@ -62,6 +62,11 @@ export function withdrawnRevocations({ env = process.env, fs = nodeFs, warn = co
       // A record split by a raw newline inside a string: rejoin with an escaped newline (at most 3 following lines).
       for (let k = 1; k <= 3 && i + k < lines.length; k++) {
         try { parsed = JSON.parse(lines.slice(i, i + k + 1).join('\\n')); count = k + 1; break; } catch { /* keep trying */ }
+      }
+      if (parsed !== undefined) {
+        warnOther(`WARNING: waiver request log lines ${i + 1}-${i + count}: record split by a raw newline; rejoined`);
+        // A newline inside an identity field would defeat ref/sha/ruling matching: treat as damaged, never as a record.
+        if (parsed && typeof parsed === 'object' && ['ref', 'sha', 'ruling'].some(f => typeof parsed[f] === 'string' && /[\r\n]/.test(parsed[f]))) parsed = { ...parsed, ruling: undefined };
       }
     }
     const first = i;
