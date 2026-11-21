@@ -673,7 +673,7 @@ describe('verify-lane.mjs source wiring — the default gate actually calls reso
   it('xpnhz4o — prints describeGate before running, and `run` mode records no marker', () => {
     const src = readFileSync(resolve(process.cwd(), 'scripts/verify-lane.mjs'), 'utf8');
     expect(src).toMatch(/process\.stderr\.write\(describeGate\(resolved\)/);
-    expect(src).toMatch(/if \(MODE !== 'run'\) writeMarker\(verifyStartBody/);
+    expect(src).toMatch(/if \(MODE !== 'run'\) writeMarker\(\{ \.\.\.verifyStartBody/);
     expect(src).toMatch(/const preStart = MODE === 'run' \? null : readMarker\(\)/);
   });
 
