@@ -174,7 +174,7 @@ export function runBatch(argv = process.argv.slice(2), io = {}) {
   const deadline = batchStart + BATCH_BUDGET_MS;
   for (const pr of prs) {
     try {
-      if (!/^[1-9]\d*$/.test(pr)) throw new Error('invalid PR number');
+      if (!/^[1-9]\d*$/.test(pr) || !Number.isSafeInteger(Number(pr))) throw new Error('invalid PR number');
       // Never start a PR that could not finish inside the job budget; finished verdicts are already on disk and
       // the unstarted PR gets an explicit 'unknown' verdict (never mergeable), not a silent gap.
       if (deadline - (io.now || Date.now)() < CHILD_TIMEOUT_MS) {

@@ -15,7 +15,7 @@ const listingFailure = (repo, num = 7) => ({ ...okDryRun(num), failedRepos: [{ r
 function batchIo({ prs = [7, 8], dryRunFor }) {
   const env = { GITHUB_ACTIONS: 'true', GITHUB_REF: 'refs/heads/main', GITHUB_EVENT_NAME: 'schedule',
     GITHUB_RUN_ID: '123456', GITHUB_REPOSITORY: OWN, GITHUB_TOKEN: 'read-only-fixture' };
-  return { env, now: () => now, mkdirSync: vi.fn(), writeFileSync: vi.fn(),
+  return { env, now: () => now, random: () => 0, mkdirSync: vi.fn(), writeFileSync: vi.fn(),
     execFileSync: vi.fn((cmd, args) => {
       if (cmd === 'git') return mainSha + '\n';
       if (cmd === 'gh') return JSON.stringify(prs.map(number => ({ number, labels: [{ name: 'ready-to-merge' }] })));
@@ -131,9 +131,9 @@ describe('drain-classify-only: batch deadline and rotation', () => {
     const io = clockIo({ prs: [1, 2], perChildMs: 8 * 60_000 });
     quiet(() => runBatch(batchArgv, io));
     const timeouts = io.execFileSync.mock.calls.filter(c => c[0] !== 'gh').map(c => c[2].timeout);
-    expect(Math.max(...timeouts)).toBeLessThanOrEqual(CHILD_MS);
-    // the second PR starts with 12 min left; its later subprocesses see less than a full child timeout
-    expect(timeouts.some(ms => ms < CHILD_MS)).toBe(true);
+    // 20 min budget, the dry-run advances the clock 8 min; each PR runs rev-parse, dry-run, rev-parse.
+    // PR 1: 10,10,10 min (20, 20, 12 left). PR 2 starts with 12 left: 10, 10, then 4 min left for the last read.
+    expect(timeouts).toEqual([10, 10, 10, 10, 10, 4].map(m => m * 60_000));
   });
 
   it('rotates the start index so PRs past the first batch get a turn on the next run', () => {
