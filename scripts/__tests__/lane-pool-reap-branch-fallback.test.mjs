@@ -64,6 +64,7 @@ function backdateLease(laneDirPath, minutesAgo) {
   const file = LEASE_FILE(laneDirPath);
   const lease = JSON.parse(readFileSync(file, 'utf8'));
   lease.acquiredAt = new Date(Date.now() - minutesAgo * 60_000).toISOString();
+  lease.pid = 2147483646; // abandoned holder, independent of the live test runner
   writeFileSync(file, JSON.stringify(lease, null, 2) + '\n');
 }
 
@@ -145,6 +146,9 @@ describe('lane-pool #xkk4lv7 — deadLeasePlan\'s branch-based fallback reclaims
 
   it('the SAME branch/merged-PR shape but a FRESH lease (seconds old, well within TTL) is NOT reaped — the pre-existing TTL gate is UNCHANGED by this fix (test plan #7)', () => {
     const { dir, headSha } = acquireOnBranch(1, 7002);
+    const file = LEASE_FILE(dir);
+    const lease = JSON.parse(readFileSync(file, 'utf8'));
+    writeFileSync(file, JSON.stringify({ ...lease, pid: 2147483646 }));
     // The PR merged long ago (an old-merged branch, exactly round-3's scenario), but THIS lease is fresh.
     const mergedAt = new Date(Date.now() - 10 * 24 * 3600_000).toISOString();
     const env = fakeGhOnPath('lane/7002-mechanical-pass', mergedAt, headSha);
@@ -152,6 +156,23 @@ describe('lane-pool #xkk4lv7 — deadLeasePlan\'s branch-based fallback reclaims
     const r = runPool(['acquire', '--lane=2', '--session=fresh', '--no-reset', ...poolArgs()], env);
     expect(r.code).toBe(0);
     expect(existsSync(LEASE_FILE(dir))).toBe(true); // NOT reaped — deadLeasePlan's own TTL gate never fired
+  });
+
+  it('keeps a TTL-stale live holder even when its branch PR is merged and its tree is clean', () => {
+    const { dir, headSha } = acquireOnBranch(1, 7007);
+    backdateLease(dir, DEFAULT_LEASE_TTL_MINUTES + 60);
+    const file = LEASE_FILE(dir);
+    const lease = JSON.parse(readFileSync(file, 'utf8'));
+    const before = JSON.stringify({ ...lease, pid: process.pid });
+    writeFileSync(file, before);
+    const mergedAt = new Date(Date.now() - (QUIET_MINUTES + 60) * 60_000).toISOString();
+    const env = fakeGhOnPath('lane/7007-mechanical-pass', mergedAt, headSha);
+
+    const r = runPool(['acquire', '--lane=2', '--session=fresh', '--no-reset', ...poolArgs()], env);
+    expect(r.code, r.err).toBe(0);
+    expect(readFileSync(file, 'utf8')).toBe(before);
+    expect(r.err).toContain('stale-but-live');
+    expect(r.err).not.toMatch(/reaped lane-1/);
   });
 
   it('a TTL-STALE lease whose lane ALSO carries new commits beyond the merge point is NEVER reaped as pr-merged on the branch axis', () => {

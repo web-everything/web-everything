@@ -52,8 +52,7 @@
  * Everything above the "IO SHELL" banner is pure and unit-tested in `__tests__/poc-land.test.mjs`.
  */
 
-import { randomBytes } from 'node:crypto';
-import { existsSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, readFileSync, writeFileSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -61,7 +60,8 @@ import { gitRun } from '../lib/git-run.mjs';
 import { readRegistry, findPocBranch, normalizeBranchRef, branchesForRepo, DEFAULT_POC_REPO } from '../lib/poc-branches.mjs';
 import { withPocLandLock, localRepoSlug } from '../readiness/drain-lock.mjs';
 import { createChecksRunner } from './verify-io.mjs';
-import { LEASE_FILENAME, renewedLease } from '../lib/lane-lease.mjs';
+import { renewLaneLease as defaultRenewLease } from '../lib/lane-lease-heartbeat.mjs';
+export { defaultRenewLease };
 import { writeAllSync, writeLineSync } from '../lib/write-all-sync.mjs';
 
 /** The bound the ruling names: three attempts, then STOP and surface. Not a forever loop, and never a
@@ -200,35 +200,6 @@ function gitIn(cwd, run) {
     const r = run('git', args, { cwd });
     return { ok: r.status === 0, stdout: String(r.stdout ?? '').trim(), stderr: String(r.stderr ?? '').trim() };
   };
-}
-
-/**
- * The default lease renewal (#3383): rewrite this lane's `.lane-lease` with `renewedAt = now`
- * (`we:scripts/lib/lane-lease.mjs#renewedLease`), so a landing whose gate waits in the heavy-command queue for
- * hours is not reclaimed and reset under it. A checkout that is not a lane (no lease file) is left alone.
- * Best-effort: a renewal failure never fails the landing. Returns whether a lease was renewed. `fs` is injected
- * only so a test can kill the write midway.
- */
-export function defaultRenewLease({ cwd, run = gitRun, now = () => new Date(), fs = { writeFileSync, renameSync, rmSync } } = {}) {
-  try {
-    const gd = run('git', ['rev-parse', '--absolute-git-dir'], { cwd });
-    if (gd.status !== 0) return false;
-    const file = join(String(gd.stdout).trim(), LEASE_FILENAME);
-    if (!existsSync(file)) return false;
-    const next = renewedLease(JSON.parse(readFileSync(file, 'utf8')), now().toISOString());
-    if (!next) return false;
-    // Atomic temp+rename, the same shape as `we:scripts/lane-pool.mjs#writeLeaseAtomic`: a plain overwrite killed
-    // between its truncate and its write leaves a torn lease, which every reader treats as NO lease — making this
-    // lane reclaimable mid-landing, the very incident this renewal exists to prevent.
-    const tmp = `${file}.tmp-${process.pid}-${randomBytes(4).toString('hex')}`;
-    try {
-      fs.writeFileSync(tmp, `${JSON.stringify(next, null, 2)}\n`, { flag: 'wx' });
-      fs.renameSync(tmp, file);
-    } finally {
-      fs.rmSync(tmp, { force: true });
-    }
-    return true;
-  } catch { return false; }
 }
 
 /** The default gate: the item's own tests/build via the SINGLE home, reached through the runner

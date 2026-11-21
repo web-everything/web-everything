@@ -18,6 +18,7 @@ import { spawnSync, execFileSync } from 'node:child_process';
 import { readFileSync, writeFileSync, mkdtempSync, rmSync, existsSync } from 'node:fs';
 import { resolve, join } from 'node:path';
 import { tmpdir } from 'node:os';
+import { emptyCwdsArgs } from './fixtures/empty-lane-cwds.mjs';
 
 const SCRIPT = resolve(process.cwd(), 'scripts/lane-pool.mjs');
 
@@ -26,7 +27,7 @@ function git(args, cwd) {
 }
 
 function runPool(args, extraEnv = {}) {
-  const r = spawnSync('node', [SCRIPT, ...args], { encoding: 'utf8', env: withGhStub({ ...process.env, ...extraEnv }) });
+  const r = spawnSync('node', [...emptyCwdsArgs, SCRIPT, ...args], { encoding: 'utf8', env: withGhStub({ ...process.env, ...extraEnv }) });
   return { code: r.status ?? 1, out: String(r.stdout || ''), err: String(r.stderr || '') };
 }
 
@@ -68,6 +69,15 @@ function provisionOne() {
   );
   expect(r.code).toBe(0);
   return join(poolRoot, 'guardtest', 'lane-1');
+}
+
+function abandonLease(lane) {
+  // acquire stamps its long-lived caller (this test worker), which is still alive.
+  // Expiry alone no longer permits takeover; abandoned fixtures need a dead holder too.
+  const file = join(lane, '.git', '.lane-lease');
+  const lease = JSON.parse(readFileSync(file, 'utf8'));
+  writeFileSync(file, `${JSON.stringify({ ...lease, pid: 2147483646 }, null, 2)}\n`);
+  return readFileSync(file, 'utf8');
 }
 
 describe('lane-pool refresh/provision dirty-or-ahead guard (#2267)', () => {
@@ -283,6 +293,7 @@ describe('lane-pool refresh/provision dirty-or-ahead guard (#2267)', () => {
       );
       expect(acq.code).toBe(0);
       const lane = acq.out.trim().split('\n').pop();
+      const leaseBefore = abandonLease(lane);
       writeFileSync(join(lane, 'built-and-tested.txt'), 'four files worth of real work\n');
 
       const reclaim = runPool(
@@ -293,8 +304,8 @@ describe('lane-pool refresh/provision dirty-or-ahead guard (#2267)', () => {
         { LANE_POOL_ROOT: poolRoot },
       );
       expect(reclaim.code).not.toBe(0);
-      expect(reclaim.err).toMatch(/would destroy that work/);
-      expect(reclaim.err).toMatch(/--force/);
+      expect(reclaim.err).toContain('stale-but-dirty');
+      expect(readFileSync(join(lane, '.git', '.lane-lease'), 'utf8')).toBe(leaseBefore);
       expect(readFileSync(join(lane, 'built-and-tested.txt'), 'utf8')).toContain('four files worth of real work');
     });
 
@@ -309,6 +320,7 @@ describe('lane-pool refresh/provision dirty-or-ahead guard (#2267)', () => {
       );
       expect(acq.code).toBe(0);
       const lane = acq.out.trim().split('\n').pop();
+      const leaseBefore = abandonLease(lane);
       writeFileSync(join(lane, 'file.txt'), 'v1\nunpushed commit\n');
       git(['add', 'file.txt'], lane);
       git(['-c', 'user.email=t@t.com', '-c', 'user.name=t', 'commit', '--quiet', '-m', 'unpushed'], lane);
@@ -328,9 +340,10 @@ describe('lane-pool refresh/provision dirty-or-ahead guard (#2267)', () => {
       const leaseFile = join(lane, '.git', '.lane-lease');
       const left = existsSync(leaseFile) ? JSON.parse(readFileSync(leaseFile, 'utf8')) : null;
       expect(left?.session).not.toBe('intruder');
+      expect(readFileSync(leaseFile, 'utf8')).toBe(leaseBefore);
     });
 
-    it('--force still reclaims a TTL-stale, dirty lane (documented override, unchanged end state)', () => {
+    it('--force refuses a TTL-stale, dirty lane with a dead holder, preserving its lease and work', () => {
       provisionOne();
       const acq = runPool(
         [
@@ -341,6 +354,7 @@ describe('lane-pool refresh/provision dirty-or-ahead guard (#2267)', () => {
       );
       expect(acq.code).toBe(0);
       const lane = acq.out.trim().split('\n').pop();
+      const leaseBefore = abandonLease(lane);
       writeFileSync(join(lane, 'stale-residue.txt'), 'abandoned garbage, for real this time\n');
 
       const reclaim = runPool(
@@ -350,11 +364,13 @@ describe('lane-pool refresh/provision dirty-or-ahead guard (#2267)', () => {
         ],
         { LANE_POOL_ROOT: poolRoot },
       );
-      expect(reclaim.code).toBe(0);
-      expect(existsSync(join(lane, 'stale-residue.txt'))).toBe(false);
+      expect(reclaim.code).not.toBe(0);
+      expect(reclaim.err).toContain('stale-but-dirty');
+      expect(readFileSync(join(lane, '.git', '.lane-lease'), 'utf8')).toBe(leaseBefore);
+      expect(readFileSync(join(lane, 'stale-residue.txt'), 'utf8')).toBe('abandoned garbage, for real this time\n');
     });
 
-    it('does not block reclaiming a TTL-stale lease whose tree is already clean', () => {
+    it('does not block reclaiming a TTL-stale lease with a dead holder and a clean tree', () => {
       provisionOne();
       const acq = runPool(
         [
@@ -364,6 +380,8 @@ describe('lane-pool refresh/provision dirty-or-ahead guard (#2267)', () => {
         { LANE_POOL_ROOT: poolRoot },
       );
       expect(acq.code).toBe(0);
+      const lane = acq.out.trim().split('\n').pop();
+      abandonLease(lane);
 
       const reclaim = runPool(
         [
@@ -373,6 +391,30 @@ describe('lane-pool refresh/provision dirty-or-ahead guard (#2267)', () => {
         { LANE_POOL_ROOT: poolRoot },
       );
       expect(reclaim.code).toBe(0);
+      expect(JSON.parse(readFileSync(join(lane, '.git', '.lane-lease'), 'utf8')).session).toBe('intruder');
+    });
+
+    it.each([false, true])('refuses a TTL-stale clean lane whose holder is still alive (force=%s)', force => {
+      const lane = provisionOne();
+      const acq = runPool(
+        ['acquire', '--lane=1', `--origin=${originDir}`, `--reference=${referenceDir}`, '--name=guardtest',
+          '--branch=main', '--no-install', '--no-reset', '--session=holder', '--ttl-minutes=0'],
+        { LANE_POOL_ROOT: poolRoot },
+      );
+      expect(acq.code).toBe(0);
+      const leaseBefore = readFileSync(join(lane, '.git', '.lane-lease'), 'utf8');
+      expect(JSON.parse(leaseBefore).pid).toBe(process.pid);
+      const headBefore = git(['rev-parse', 'HEAD'], lane);
+
+      const reclaim = runPool(
+        ['acquire', '--lane=1', `--origin=${originDir}`, `--reference=${referenceDir}`, '--name=guardtest',
+          '--branch=main', '--no-install', '--session=intruder', ...(force ? ['--force'] : [])],
+        { LANE_POOL_ROOT: poolRoot },
+      );
+      expect(reclaim.code).not.toBe(0);
+      expect(reclaim.err).toContain('stale-but-live');
+      expect(readFileSync(join(lane, '.git', '.lane-lease'), 'utf8')).toBe(leaseBefore);
+      expect(git(['rev-parse', 'HEAD'], lane)).toBe(headBefore);
     });
   });
 });
