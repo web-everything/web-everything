@@ -104,7 +104,7 @@ describe('Forge key structure slice 1',()=>{
     const json=JSON.stringify(privateKey.export({format:'jwk'}));
     const comment='// note'+lineEnd;
     const message=Buffer.from('line terminator regression');
-    for(const object of [json.replace(',',','+comment),json.replace('{','{'+comment),json.replace(':',comment+':')]) {
+    for(const object of [json.replace(',',','+comment),json.replace(/\{/,'{'+comment),json.replace(':',comment+':')]) {
       const reconstructed=createPrivateKey({key:runInNewContext('('+object+')'),format:'jwk'});
       expect(verify(null,message,publicKey,sign(null,message,reconstructed))).toBe(true);
       const source=Buffer.from('export default '+object+';');
@@ -285,12 +285,12 @@ describe('Forge key structure slice 1',()=>{
       const single=JSON.stringify(key).replaceAll('"',"'");
       const unquoted=JSON.stringify(key).replace(/"(kty|k|d)":/g,'$1:');
       for(const text of [inspect(key),single,unquoted,inspect({nested:key}),
-        inspect(key).replace('{','{ /* note */').replace('}',', }'),
+        inspect(key).replace(/\{/,'{ /* note */').replace(/\}/,', }'),
         single.replace('kty','k\\u0074y'),
         unquoted.replace('kty','\\u006bty'),
         JSON.stringify(key).replace('oct','\\x6fct'),
         single.replace('oct','o\\\nct'),
-        inspect(key).replace('}',", k: '', "+keyType+": 'RSA' }")]) {
+        inspect(key).replace(/\}/,", k: '', "+keyType+": 'RSA' }")]) {
         blocked(Buffer.from(text));
         blocked(Buffer.from(Buffer.from(text).toString('base64')));
         blocked(Buffer.from('an unclosed "string, '+text));
