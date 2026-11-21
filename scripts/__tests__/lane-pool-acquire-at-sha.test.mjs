@@ -193,6 +193,57 @@ describe('acquire at an exact pushed branch tip', () => {
     expect(git(['rev-parse', 'HEAD'], lane)).toBe(workerHead);
     expect(readFileSync(join(lane, 'file.txt'), 'utf8')).toBe('worker edit');
   });
+  describe('the push guard of a pinned lane is the integration branch guard', () => {
+    // The lane's real tracked-hook install (core.hooksPath=.githooks, cwd-relative): whatever guard the
+    // pinned checkout restores is the one that runs on push.
+    const OLD_GUARD = "import { readFileSync } from 'node:fs';\n" +
+      "const stdin = readFileSync(0, 'utf8');\n" +
+      "if (process.env.MAIN_PUSH_OK !== '1' && /\\srefs\\/heads\\/main\\s/.test(stdin)) { process.stderr.write('pre-push BLOCKED: main\\n'); process.exit(1); }\n";
+    const PRE_PUSH = `#!/bin/sh\nexec '${process.execPath}' scripts/guard-git-push.mjs "$@"\n`;
+    function writeGuard({ guard = readFileSync(resolve('scripts/guard-git-push.mjs'), 'utf8'), prePush = PRE_PUSH, prePushMode = 0o755 } = {}) {
+      mkdirSync(join(reference, '.githooks'), { recursive: true });
+      mkdirSync(join(reference, 'scripts', 'lib'), { recursive: true });
+      writeFileSync(join(reference, '.githooks', 'pre-commit'), '#!/bin/sh\nexit 0\n'); chmodSync(join(reference, '.githooks', 'pre-commit'), 0o755);
+      writeFileSync(join(reference, '.githooks', 'pre-push'), prePush); chmodSync(join(reference, '.githooks', 'pre-push'), prePushMode);
+      writeFileSync(join(reference, 'scripts', 'guard-git-push.mjs'), guard);
+      writeFileSync(join(reference, 'scripts', 'lib', 'lane-lease.mjs'), readFileSync(resolve('scripts/lib/lane-lease.mjs'), 'utf8'));
+      git(['add', '.']);
+    }
+    function seed(target) {
+      git(['checkout', '--quiet', '--detach', initial]);
+      writeGuard(); git(['commit', '-m', 'main push guard', '--quiet']);
+      initial = git(['rev-parse', 'HEAD']); git(['push', '--quiet', '--force', 'origin', 'HEAD:main']);
+      writeGuard(target); writeFileSync(join(reference, 'file.txt'), 'target'); git(['add', '.']);
+      git(['commit', '-m', 'target push guard', '--quiet']);
+      tip = git(['rev-parse', 'HEAD']); git(['push', '--quiet', '--force', 'origin', 'HEAD:lane/target']);
+    }
+    function workerPush() {
+      writeFileSync(join(lane, 'file.txt'), 'worker edit');
+      git(['commit', '-am', 'worker edit', '--quiet', '--no-verify'], lane);
+      return spawnSync('git', ['push', 'origin', 'HEAD:refs/heads/lane/target'], { cwd: lane, encoding: 'utf8', env: { ...process.env, MAIN_PUSH_OK: '' } });
+    }
+    it.each([
+      ['an older guard that predates pins', { guard: OLD_GUARD }],
+      ['a pre-push that no longer runs the guard', { prePush: '#!/bin/sh\nexit 0\n' }],
+      ['a non-executable pre-push', { prePushMode: 0o644 }],
+    ])('a branch with %s cannot be pinned, so its runner cannot push lane/*', (_label, target) => {
+      seed(target);
+      const r = acquire();
+      if (r.status === 0 && git(['rev-parse', 'HEAD'], lane) === tip) workerPush();
+      expect(git(['rev-parse', 'refs/heads/lane/target'], origin)).toBe(tip);
+      refused(r);
+      expect(r.stderr).toMatch(/push guard/);
+    });
+    it('a pinned branch carrying the integration guard rejects a HEAD:refs/heads/lane/target push through the lane hooks', () => {
+      seed({});
+      expect(acquire().status).toBe(0);
+      expect(git(['config', 'core.hooksPath'], lane)).toBe('.githooks');
+      const r = workerPush();
+      expect(r.status).not.toBe(0);
+      expect(r.stderr).toMatch(/pre-push BLOCKED: this pinned runner cannot push/);
+      expect(git(['rev-parse', 'refs/heads/lane/target'], origin)).toBe(tip);
+    });
+  });
   it('bash guard rejects destructive operations from a foreign pinned-lane holder', () => {
     expect(acquire(tip, [], { CLAUDE_CODE_SESSION_ID: 'pinned-owner' }).status).toBe(0);
     writeFileSync(join(lane, 'file.txt'), 'precious edit');

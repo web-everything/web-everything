@@ -8,8 +8,9 @@ import { assertRunnerFreshness } from '../runner-freshness.mjs';
 
 const live = { session: 'holder', acquiredAt: new Date().toISOString(), ttlMinutes: 240 };
 const sha = 'a'.repeat(40);
-function run({ lease = { ...live, at: sha, branch: 'lane/target' }, rawLease, head = sha, tip = sha, unreadable = false, fetchFails = false, attached = false, symbolic = false, symbolicUnreadable = false, headUnreadable = false, env = {} } = {}) {
+function run({ lease = { ...live, at: sha, branch: 'lane/target' }, rawLease, head = sha, tip = sha, unreadable = false, fetchFails = false, attached = false, symbolic = false, symbolicUnreadable = false, headUnreadable = false, env = {}, scrubbed = { removed: [], kept: [] } } = {}) {
   const calls = [];
+  const scrubs = [];
   const check = () => assertRunnerFreshness({ declaration: { name: 'open-pr' }, moduleUrl: 'file:///pool/repo/lane-1/scripts/operations/run.mjs' }, {
     env: { LANE_POOL_ROOT: '/pool', ...env },
     filesystem: {
@@ -31,8 +32,9 @@ function run({ lease = { ...live, at: sha, branch: 'lane/target' }, rawLease, he
       if (args[0] === 'check-ref-format') return '';
       throw new Error('unexpected git read: ' + args.join(' '));
     },
+    scrubConfig: dir => { scrubs.push({ dir, before: calls.length }); return scrubbed; },
   });
-  return { check, calls };
+  return { check, calls, scrubs };
 }
 describe('open-pr pinned runner lease', () => {
   it.each([
@@ -71,7 +73,22 @@ describe('open-pr pinned runner lease', () => {
   });
   it('accepts HEAD == lease at == freshly fetched branch tip even after main moves', () => {
     const f = run(); expect(f.check()).toMatchObject({ exempt: true });
-    expect(f.calls).toContainEqual(['fetch', '--quiet', 'origin', '+refs/heads/lane/target:refs/remotes/origin/lane/target']);
+    expect(f.calls).toContainEqual(['fetch', '--upload-pack=git-upload-pack', '--quiet', 'origin', '+refs/heads/lane/target:refs/remotes/origin/lane/target']);
+    // The transport scrub runs on the lane, before the fetch.
+    expect(f.scrubs).toEqual([{ dir: '/pool/repo/lane-1', before: f.calls.findIndex(args => args[0] === 'fetch') }]);
+  });
+  it.each([
+    ['a scrub that could not remove a lane URL rewrite', ['url.https://evil.invalid/.insteadof (permission denied)']],
+    ['an unreadable lane config listing', ['config list failed (fatal: bad config)']],
+    ['a kept origin remote helper', ['remote.origin.vcs']],
+    ['a kept origin proxy', ['remote.origin.proxy']],
+  ])('fails closed without fetching on %s', (_name, kept) => {
+    const f = run({ scrubbed: { removed: [], kept } });
+    expect(f.check).toThrow(/transport config could not be scrubbed/);
+    expect(f.calls.some(args => args[0] === 'fetch')).toBe(false);
+  });
+  it('accepts the origin transport keys the fetch overrides or never reads', () => {
+    expect(run({ scrubbed: { removed: [], kept: ['remote.origin.uploadpack', 'remote.origin.pushurl', 'remote.origin.receivepack'] } }).check()).toEqual({ exempt: true });
   });
   it('refuses an attached HEAD carrying a valid pinned lease', () => expect(run({ attached: true }).check).toThrow(/attached/));
   it.each([{ at: sha }, { branch: 'lane/target' }, { at: null }, { branch: null }])(

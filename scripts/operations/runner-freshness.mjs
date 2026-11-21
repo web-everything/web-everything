@@ -6,7 +6,7 @@ import { fileURLToPath } from 'node:url';
 import { randomUUID } from 'node:crypto';
 import { defaultPoolRoot } from '../lib/lane-pool-paths.mjs';
 import { isLeaseStale } from '../lib/lane-lease.mjs';
-import { laneGitHardeningEnv, scrubInheritedGitEnv } from '../lib/lane-git-hardening.mjs';
+import { laneGitHardeningEnv, scrubInheritedGitEnv, scrubRiskyLaneConfig } from '../lib/lane-git-hardening.mjs';
 import { isReadOnlyOperation } from './registry.mjs';
 
 export const FRESHNESS_TTL = 5 * 60_000;
@@ -18,10 +18,13 @@ export const requiresFreshRunner = (declaration) => declaration.name === 'verify
 export function assertRunnerFreshness({ declaration, moduleUrl, zeroWrites = false }, {
   env = process.env, now = Date.now, filesystem = fs,
   // Waiting for Git alone does not wait for maintenance it detaches after a fetch.
-  git = (args, cwd, { credentialPins = true } = {}) => execFileSync('git', ['-c', 'gc.auto=0', '-c', 'maintenance.auto=false', ...args], {
+  // `protocol.ext.allow=never` beats a lane-set `always` for an `ext::` URL or `remote.origin.vcs=ext`.
+  git = (args, cwd, { credentialPins = true } = {}) => execFileSync('git', ['-c', 'gc.auto=0', '-c', 'maintenance.auto=false', '-c', 'protocol.ext.allow=never', ...args], {
     cwd, encoding: 'utf8', timeout: 15_000, stdio: ['ignore', 'pipe', 'pipe'],
     env: { ...laneGitHardeningEnv(scrubInheritedGitEnv(env), { credentialPins }), GIT_OPTIONAL_LOCKS: '0' },
   }),
+  // The lane-pool transport cleanup: removes lane-set url.*.insteadOf, includes, helpers and non-origin remotes.
+  scrubConfig = (dir) => scrubRiskyLaneConfig(dir),
   diagnostic = (line) => process.stderr.write(`${line}\n`),
 } = {}) {
   let root = dirname(fileURLToPath(moduleUrl));
@@ -76,7 +79,14 @@ export function assertRunnerFreshness({ declaration, moduleUrl, zeroWrites = fal
         head = readGit(['rev-parse', '--verify', 'HEAD']);
         if (head !== lease.at) throw new Error('pinned runner lease at differs from HEAD; reacquire the lane');
         const target = `refs/remotes/origin/${lease.branch}`;
-        readGit(['fetch', '--quiet', 'origin', `+refs/heads/${lease.branch}:${target}`]);
+        // Same transport hardening as lane-pool's own fetches: scrub lane-owned transport config first, and
+        // name the upload-pack on the command line because a lane-set remote.origin.uploadpack beats any -c.
+        const { kept = [] } = scrubConfig(root) ?? {};
+        // Origin keys the scrub keeps: upload-pack is overridden below; push keys never reach a fetch.
+        // A kept vcs/proxy (or any failed removal) could still redirect the fetch, so it refuses.
+        const unsafe = kept.filter(key => !/^remote\.origin\.(uploadpack|receivepack|pushurl)$/i.test(key));
+        if (unsafe.length) throw new Error(`lane transport config could not be scrubbed (${unsafe.length} key(s)); reacquire the lane`);
+        readGit(['fetch', '--upload-pack=git-upload-pack', '--quiet', 'origin', `+refs/heads/${lease.branch}:${target}`]);
         let symbolic = false;
         try { git(['symbolic-ref', '-q', target], root); symbolic = true; }
         catch (error) { if (error.status !== 1) throw error; }

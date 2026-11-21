@@ -3051,6 +3051,11 @@ async function cmdAcquire(repo) {
       const tip = git(['rev-parse', '--verify', target], dir).trim();
       if (!/^[a-f0-9]{40}$/.test(tip) || tip !== flags.at) throw new Error('--at must equal the fetched origin branch tip; inspect the branch and retry');
       git(['cat-file', '-e', `${flags.at}^{commit}`], dir);
+      // The lane's push hook runs from its checkout (core.hooksPath=.githooks), so pinning restores the
+      // target's own guard. Refuse any target whose guard differs from the integration branch's.
+      if (pinnedPushGuardEntries(dir, flags.at) !== pinnedPushGuardEntries(dir, `refs/remotes/origin/${repo.branch}`)) {
+        throw new Error(`pinned target push guard differs from origin/${repo.branch} (${PINNED_PUSH_GUARD_PATHS.join(', ')}); merge ${repo.branch} into ${flags.branch} and retry`);
+      }
       if (!sameLease(readLease(dir), pinnedClaim)) throw new Error('pinned claim changed before checkout; inspect the current holder');
       git(['checkout', '--no-overwrite-ignore', '--detach', flags.at, '--quiet'], dir);
       // Do not execute branch-controlled install/lifecycle scripts in the acquirer's
@@ -3655,6 +3660,14 @@ function releaseWorkRefuses(dir, label, salvage, proof, { discard = !!flags.disc
   }, { unlessRepeat: true });
   if (setExitCode) process.exitCode = 1;
   return { reason: 'unpushed-work', details: bounded };
+}
+
+// The files a lane's pre-push hook executes to refuse a pinned runner's push. Mode, type and blob must
+// match the integration branch exactly: a non-executable hook is skipped by Git, an older guard predates
+// pins. Both revisions lacking every path compares equal (a pool whose repository has no push guard).
+const PINNED_PUSH_GUARD_PATHS = ['.githooks/pre-push', 'scripts/guard-git-push.mjs', 'scripts/lib/lane-lease.mjs'];
+function pinnedPushGuardEntries(dir, rev) {
+  return git(['ls-tree', '-z', '--full-tree', rev, '--', ...PINNED_PUSH_GUARD_PATHS], dir);
 }
 
 // Every path that frees a pinned lease must first return its clone to the integration

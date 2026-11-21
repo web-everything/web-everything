@@ -1,6 +1,6 @@
 /** PR #7208: pinned lane switches preserve ignored files and recover the integration branch. */
 import { execFileSync, spawnSync } from 'node:child_process';
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -9,16 +9,81 @@ const ROOT = fileURLToPath(new URL('../../../../', import.meta.url));
 const SOURCE = 'scripts/lane-pool.mjs';
 export default {
   id: 'pinned-lane-release-recovery',
-  title: 'pinned lanes preserve replacement holders and retain claims when recovery is refused',
+  title: 'pinned lanes keep the integration push guard, preserve replacement holders and retain claims when recovery is refused',
   card: 'PR #7208',
   fixedBy: { sha: 'HEAD', where: 'lane/lane-at-sha', paths: [SOURCE] },
   fixPresent(root) {
     const source = readFileSync(join(root, SOURCE), 'utf8');
     return source.includes('function resetPinnedLaneForRelease(')
       && source.includes('pinned claim changed before checkout; inspect the current holder')
-      && source.includes("['checkout', '--no-overwrite-ignore', '--detach', flags.at");
+      && source.includes("['checkout', '--no-overwrite-ignore', '--detach', flags.at")
+      && source.includes('function pinnedPushGuardEntries(');
   },
-  async run({ root = ROOT, log } = {}) {
+  async run(options = {}) {
+    const guard = olderGuardScenario(options);
+    const recovery = await recoveryScenario(options);
+    options.log?.(`pinned lane soak: ${guard.length + recovery.violations.length} violation(s)`);
+    return { violations: [...guard, ...recovery.violations] };
+  },
+  judge(report) { return report.violations; },
+};
+
+// Live case (PR #7208 send-back): pinning a branch that predates the pin-aware push guard restored that older
+// guard through the lane's own tracked hook, so the pinned runner could push lane/*.
+const OLD_GUARD = "import { readFileSync } from 'node:fs';\n"
+  + "const stdin = readFileSync(0, 'utf8');\n"
+  + "if (process.env.MAIN_PUSH_OK !== '1' && /\\srefs\\/heads\\/main\\s/.test(stdin)) process.exit(1);\n";
+function olderGuardScenario({ root = ROOT } = {}) {
+  const scratch = mkdtempSync(join(tmpdir(), 'soak-pinned-guard-'));
+  const origin = join(scratch, 'origin.git'), reference = join(scratch, 'reference');
+  const pool = join(scratch, 'pool'), lane = join(pool, 'guard', 'lane-1');
+  const violations = [];
+  const git = (args, cwd = reference, env = {}) => execFileSync('git', ['-c', 'commit.gpgsign=false',
+    '-c', 'user.name=Soak', '-c', 'user.email=soak@example.invalid', ...args], {
+    cwd, encoding: 'utf8', timeout: 15_000, maxBuffer: 1024 * 1024, stdio: ['ignore', 'pipe', 'pipe'], env: { ...process.env, ...env },
+  }).trim();
+  const run = (command, args) => spawnSync(process.execPath, [join(root, SOURCE), command,
+    `--origin=${origin}`, `--reference=${reference}`, '--name=guard', '--session=pinned-guard',
+    '--no-install', '--no-reap', ...args], { cwd: reference, encoding: 'utf8', timeout: 60_000,
+    maxBuffer: 1024 * 1024, env: { ...process.env, LANE_POOL_ROOT: pool, LANE_POOL_AUTO_RECOVER: '0' } });
+  const writeGuard = (guardSource) => {
+    mkdirSync(join(reference, '.githooks'), { recursive: true });
+    mkdirSync(join(reference, 'scripts', 'lib'), { recursive: true });
+    writeFileSync(join(reference, '.githooks', 'pre-commit'), '#!/bin/sh\nexit 0\n', { mode: 0o755 });
+    writeFileSync(join(reference, '.githooks', 'pre-push'), `#!/bin/sh\nexec '${process.execPath}' scripts/guard-git-push.mjs "$@"\n`, { mode: 0o755 });
+    writeFileSync(join(reference, 'scripts', 'guard-git-push.mjs'), guardSource);
+    writeFileSync(join(reference, 'scripts', 'lib', 'lane-lease.mjs'), readFileSync(join(root, 'scripts/lib/lane-lease.mjs'), 'utf8'));
+    git(['add', '.']);
+  };
+  try {
+    git(['init', '--quiet', '--bare', '--initial-branch=main', origin], scratch);
+    git(['clone', '--quiet', origin, reference], scratch);
+    writeFileSync(join(reference, 'file.txt'), 'initial');
+    writeGuard(readFileSync(join(root, 'scripts/guard-git-push.mjs'), 'utf8'));
+    git(['commit', '--quiet', '-m', 'main with the pin-aware guard']);
+    git(['push', '--quiet', 'origin', 'HEAD:main']);
+    writeGuard(OLD_GUARD);
+    writeFileSync(join(reference, 'file.txt'), 'target'); git(['add', '.']);
+    git(['commit', '--quiet', '-m', 'branch from before the pin-aware guard']);
+    const at = git(['rev-parse', 'HEAD']);
+    git(['push', '--quiet', 'origin', 'HEAD:lane/target']);
+    if (run('provision', ['--count=1']).status !== 0) throw new Error('soak provision failed');
+    const acquired = run('acquire', ['--lane=1', `--at=${at}`, '--branch=lane/target']);
+    if (acquired.status === 0) {
+      violations.push('older guard: pinned acquisition accepted');
+      writeFileSync(join(lane, 'file.txt'), 'worker edit');
+      git(['commit', '--quiet', '--no-verify', '-am', 'worker edit'], lane);
+      // The lane's own tracked hook, exactly as a worker's push runs it.
+      const pushed = spawnSync('git', ['push', '--quiet', 'origin', 'HEAD:refs/heads/lane/target'],
+        { cwd: lane, encoding: 'utf8', timeout: 30_000, env: { ...process.env, MAIN_PUSH_OK: '' } });
+      if (pushed.status === 0) violations.push('older guard: pinned runner pushed lane/target');
+    }
+    if (git(['rev-parse', 'refs/heads/lane/target'], origin) !== at) violations.push('older guard: lane/target moved');
+  } finally { rmSync(scratch, { recursive: true, force: true }); }
+  return violations;
+}
+
+async function recoveryScenario({ root = ROOT, log } = {}) {
     const scratch = mkdtempSync(join(tmpdir(), 'soak-pinned-release-'));
     const origin = join(scratch, 'origin.git'), reference = join(scratch, 'reference');
     const pool = join(scratch, 'pool'), lane = join(pool, 'recovery', 'lane-1');
@@ -124,6 +189,4 @@ export default {
     } finally { rmSync(scratch, { recursive: true, force: true }); }
     log?.(`pinned release recovery: ${violations.length} violation(s)`);
     return { violations };
-  },
-  judge(report) { return report.violations; },
-};
+}

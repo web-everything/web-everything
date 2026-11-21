@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from 'vitest';
 import { execFileSync } from 'node:child_process';
-import { readFileSync, mkdirSync, renameSync, writeFileSync } from 'node:fs';
+import { existsSync, readFileSync, mkdirSync, renameSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { withBareOrigin } from './helpers/real-repo.mjs';
@@ -106,6 +106,39 @@ describe('runner freshness policy', () => {
       });
       if (exempt) expect(check()).toEqual({ exempt: true });
       else expect(check).toThrow(/Refusing open-pr pinned runner/);
+    });
+  });
+  it('pinned runner fetch never runs a lane-configured upload-pack or follows a lane URL rewrite', async () => {
+    await withBareOrigin(async ctx => {
+      ctx.git(['push', 'origin', 'HEAD:lane/target']);
+      const at = ctx.git(['rev-parse', 'HEAD']).trim();
+      const originUrl = ctx.git(['remote', 'get-url', 'origin']).trim();
+      // A decoy whose lane/target differs: following the rewrite would read the wrong tip.
+      const decoy = join(ctx.tmp, 'decoy.git');
+      execFileSync('git', ['clone', '--quiet', '--bare', originUrl, decoy]);
+      const marker = join(ctx.tmp, 'upload-pack-ran'), uploadPack = join(ctx.tmp, 'marker-upload-pack');
+      writeFileSync(uploadPack, `#!/bin/sh\necho ran > '${marker}'\nexec git-upload-pack "$@"\n`, { mode: 0o755 });
+      ctx.git(['checkout', '--detach', '--quiet', at]);
+      ctx.git(['config', 'remote.origin.uploadpack', uploadPack]);
+      ctx.git(['config', `url.${decoy}.insteadOf`, originUrl]);
+      ctx.git(['commit', '--allow-empty', '-m', 'decoy tip', '--quiet']);
+      execFileSync('git', ['-C', ctx.clone, 'push', '--quiet', '--force', decoy, 'HEAD:refs/heads/lane/target']);
+      ctx.git(['checkout', '--detach', '--quiet', at]);
+      const pool = join(ctx.tmp, 'pool'), lane = join(pool, 'repo', 'lane-1');
+      mkdirSync(join(pool, 'repo'), { recursive: true });
+      renameSync(ctx.clone, lane);
+      writeFileSync(join(lane, '.git', '.lane-lease'), JSON.stringify({ session: 'holder',
+        acquiredAt: new Date().toISOString(), ttlMinutes: 240, at, branch: 'lane/target' }));
+      const observer = recordingGit(ctx);
+      expect(assertRunnerFreshness({ declaration: resolveOperation('open-pr').declaration,
+        moduleUrl: pathToFileURL(join(lane, 'run.mjs')).href }, {
+        env: { ...process.env, ...observer.env, LANE_POOL_ROOT: pool, WE_OPERATION_ALLOW_STALE: '' },
+      })).toEqual({ exempt: true });
+      expect(existsSync(marker)).toBe(false);
+      const fetch = observer.calls().find(call => call.args.includes('fetch'));
+      expect(fetch.args).toContain('--upload-pack=git-upload-pack');
+      expect(fetch.args).toContain('protocol.ext.allow=never');
+      expect(() => execFileSync('git', ['-C', lane, 'config', '--get-regexp', '^url\\.'], { stdio: 'pipe' })).toThrow();
     });
   });
   it('scrubs repository redirection and disables lane-config executable helpers on real Git calls', async () => {
