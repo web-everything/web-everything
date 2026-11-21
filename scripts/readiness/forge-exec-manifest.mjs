@@ -1,4 +1,5 @@
 import {createHash} from 'node:crypto';
+import {keyStructureFinding} from './forge-key-structure.mjs';
 const LIMIT=4*1024*1024;
 const sha=value=>createHash('sha256').update(value).digest('hex');
 // Paths remain bytes throughout inventory, transport, hashing and verification.
@@ -207,7 +208,7 @@ export function credentialBufferFinding(content) {
   }
   // swap16 requires whole code units; a trailing byte cannot encode a token character.
   const swapped=Buffer.from(content.subarray(0,content.length-content.length%2)).swap16();
-  return textFinding(swapped.toString('utf16le'));
+  return textFinding(swapped.toString('utf16le'))??keyStructureFinding(content);
 }
 
 function entropy(text) {
