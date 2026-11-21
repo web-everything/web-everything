@@ -144,10 +144,13 @@ function gitValue(key, value) {
 const sameGitPair = ([k1, v1], [k2, v2]) => gitKey(k1) === gitKey(k2) && gitValue(k1, v1) === gitValue(k2, v2);
 // Transport candidates are also checked against the parent's policy in childGitConfig:
 // a protocol-specific exception takes precedence over Git's global protocol.allow setting.
-// Only `never` is case-normalized here: `user` can loosen Git's default for some protocols (ext), so its
-// spellings are not widened beyond the exact lowercase form this filter already accepted.
+// `never` tightens every protocol.*.allow. `user` loosens Git's default for ext (never) and, as the global
+// protocol.allow, for every unlisted protocol, so it passes only as protocol.file.allow, whose Git default is
+// already `user`; only the exact lowercase value is accepted.
+const GIT_FILE_TRANSPORT = 'protocol.file.allow';
 const tighteningGitPair = (key, value) => GIT_PINS.some(pin => sameGitPair([key, value], pin))
-  || ((gitValue(key, value) === 'never' || value === 'user') && GIT_TRANSPORT_POLICY.test(key));
+  || (gitValue(key, value) === 'never' && GIT_TRANSPORT_POLICY.test(key))
+  || (value === 'user' && gitKey(key) === GIT_FILE_TRANSPORT);
 function gitConfigPairs(env) {
   const raw = env.GIT_CONFIG_COUNT;
   if (typeof raw !== 'string' || !raw || /[^0-9]/.test(raw)) return null;
@@ -166,7 +169,7 @@ function gitConfigPairs(env) {
   return { count, kept };
 }
 // The sole indexed-config exception to GIT_*: from the parent AND the caller bag, only tightening pairs
-// pass (exact hardening pins, protocol.*.allow=never). Every other entry drops on its own; kept pairs are
+// pass (exact hardening pins, protocol.*.allow=never, protocol.file.allow=user). Every other entry drops on its own; kept pairs are
 // re-indexed, parent pairs first, so no extra entry can discard a protection and no caller pair can add one
 // that loosens.
 function childGitConfig(ambient, inherit) {

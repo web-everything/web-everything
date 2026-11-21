@@ -731,7 +731,6 @@ describe('final audit: ambient hardening pins and unregistered parent restrictio
     ['protocol.allow', 'never', 'protocol.file.allow', 'user'],
     ['PrOtOcOl.AlLoW', 'never', 'PrOtOcOl.file.AlLoW', 'user'],
     ['protocol.allow', 'never', 'protocol.ext.allow', 'user'],
-    ['protocol.allow', 'user', 'protocol.ext.allow', 'user'],
     ['protocol.https.allow', 'never', 'protocol.allow', 'user'],
     ['protocol.https.allow', 'never', 'protocol.file.allow', 'user'],
     ...['https', 'http', 'git', 'ssh'].map(protocol => ['protocol.allow', 'never', `protocol.${protocol}.allow`, 'always']),
@@ -744,17 +743,57 @@ describe('final audit: ambient hardening pins and unregistered parent restrictio
       GIT_CONFIG_KEY_1: 'core.hooksPath', GIT_CONFIG_VALUE_1: '/dev/null',
       GIT_CONFIG_KEY_2: callerKey, GIT_CONFIG_VALUE_2: callerValue,
     } }, io);
-    expect(configOf(io.spawn.mock.calls[0][2].env)).toEqual({ ...parent, GIT_CONFIG_COUNT: '2',
+    const child = configOf(io.spawn.mock.calls[0][2].env);
+    expect(child).toEqual({ ...parent, GIT_CONFIG_COUNT: '2',
       GIT_CONFIG_KEY_1: 'core.hooksPath', GIT_CONFIG_VALUE_1: '/dev/null' });
+    expect(child.GIT_CONFIG_VALUE_0).not.toBe(callerValue);
   });
-  it('caller transport prohibitions can still tighten an inherited global transport policy', () => {
-    setParent({ GIT_CONFIG_COUNT: '1', GIT_CONFIG_KEY_0: 'protocol.allow', GIT_CONFIG_VALUE_0: 'user' });
-    expect(configOf(envOf({ GIT_CONFIG_COUNT: '1', GIT_CONFIG_KEY_0: 'protocol.file.allow', GIT_CONFIG_VALUE_0: 'never' })))
-      .toMatchObject({ GIT_CONFIG_COUNT: '2', GIT_CONFIG_KEY_1: 'protocol.file.allow', GIT_CONFIG_VALUE_1: 'never' });
+  it('caller transport prohibitions can still tighten an inherited transport policy', () => {
+    setParent({ GIT_CONFIG_COUNT: '1', GIT_CONFIG_KEY_0: 'protocol.file.allow', GIT_CONFIG_VALUE_0: 'user' });
+    expect(configOf(envOf({ GIT_CONFIG_COUNT: '1', GIT_CONFIG_KEY_0: 'protocol.allow', GIT_CONFIG_VALUE_0: 'never' })))
+      .toEqual({ GIT_CONFIG_COUNT: '2', GIT_CONFIG_KEY_0: 'protocol.file.allow', GIT_CONFIG_VALUE_0: 'user',
+        GIT_CONFIG_KEY_1: 'protocol.allow', GIT_CONFIG_VALUE_1: 'never' });
   });
   it('caller remote-probe exceptions pass when the parent has no transport policy', () => {
     const caller = laneHistoryProofEnv({}, { remoteProbe: true });
     expect(configOf(envOf(caller))).toEqual(configOf(caller));
+  });
+  // `user` is tighter than Git's default only for file (default user). For ext (default never) and for the global
+  // protocol.allow it loosens, so it is dropped from either source; only protocol.file.allow=user is kept.
+  it.each(['protocol.ext.allow', 'protocol.allow', 'PROTOCOL.ALLOW', 'Protocol.ext.Allow', 'protocol.FILE.allow',
+    'protocol.https.allow', 'protocol.custom+x.allow'])('drops %s=user from the parent and from the caller bag', key => {
+    setParent({ GIT_CONFIG_COUNT: '1', GIT_CONFIG_KEY_0: key, GIT_CONFIG_VALUE_0: 'user' });
+    expect(configOf(envOf({}))).toEqual({});
+    clearEnv('GIT_CONFIG_COUNT');
+    expect(configOf(envOf({ GIT_CONFIG_COUNT: '1', GIT_CONFIG_KEY_0: key, GIT_CONFIG_VALUE_0: 'user' }))).toEqual({});
+  });
+  it('a parent protocol.allow=user is dropped and cannot shelter a caller protocol.ext.allow=user', () => {
+    setParent({ GIT_CONFIG_COUNT: '1', GIT_CONFIG_KEY_0: 'protocol.allow', GIT_CONFIG_VALUE_0: 'user' });
+    const io = seam();
+    launchAgent({ ...base(), inheritEnv: { GIT_CONFIG_COUNT: '2', GIT_CONFIG_KEY_0: 'protocol.ext.allow',
+      GIT_CONFIG_VALUE_0: 'user', GIT_CONFIG_KEY_1: 'core.hooksPath', GIT_CONFIG_VALUE_1: '/dev/null' } }, io);
+    expect(configOf(io.spawn.mock.calls[0][2].env)).toEqual({ GIT_CONFIG_COUNT: '1',
+      GIT_CONFIG_KEY_0: 'core.hooksPath', GIT_CONFIG_VALUE_0: '/dev/null' });
+  });
+  it('a caller protocol.ext.allow=user with no parent policy yields no GIT_CONFIG entry for ext', () => {
+    const child = configOf(envOf({ GIT_CONFIG_COUNT: '2', GIT_CONFIG_KEY_0: 'protocol.ext.allow', GIT_CONFIG_VALUE_0: 'user',
+      GIT_CONFIG_KEY_1: 'core.hooksPath', GIT_CONFIG_VALUE_1: '/dev/null' }));
+    expect(child).toEqual({ GIT_CONFIG_COUNT: '1', GIT_CONFIG_KEY_0: 'core.hooksPath', GIT_CONFIG_VALUE_0: '/dev/null' });
+    expect(Object.values(child).map(v => v.toLowerCase())).not.toContain('protocol.ext.allow');
+  });
+  it.each(['protocol.file.allow', 'PROTOCOL.file.ALLOW'])('keeps %s=user from either source (Git default for file)', key => {
+    const pair = { GIT_CONFIG_COUNT: '1', GIT_CONFIG_KEY_0: key, GIT_CONFIG_VALUE_0: 'user' };
+    expect(configOf(envOf(pair))).toEqual(pair);
+    setParent(pair);
+    expect(configOf(envOf({}))).toEqual(pair);
+  });
+  it('real Git cannot run an ext:: remote after a caller requests protocol.ext.allow=user', () => {
+    clearEnv('GIT_ALLOW_PROTOCOL');
+    const child = envOf({ GIT_CONFIG_COUNT: '1', GIT_CONFIG_KEY_0: 'protocol.ext.allow', GIT_CONFIG_VALUE_0: 'user' });
+    const result = spawnSync('git', ['ls-remote', 'ext::true'], { cwd, env: child, encoding: 'utf8', timeout: 5000,
+      maxBuffer: 1024 * 1024 });
+    expect(result.status, result.stderr).toBe(128);
+    expect(result.stderr).toContain("transport 'ext' not allowed");
   });
   it('real Git still refuses local transport after a caller requests a file exception', () => {
     setParent({ GIT_CONFIG_COUNT: '1', GIT_CONFIG_KEY_0: 'protocol.allow', GIT_CONFIG_VALUE_0: 'never' });
