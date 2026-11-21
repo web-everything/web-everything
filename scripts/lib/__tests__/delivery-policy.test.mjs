@@ -1033,18 +1033,21 @@ describe('policy journal', () => {
     expect(JSON.parse(readFileSync(env.WE_POLICY_EVENTS_FILE + '.lock', 'utf8')).token).toBe('stolen');
   });
 
-  it.each(['normal capacity', 'one remaining record'])('serializes stale removers across the validation/unlink gap with %s', async capacity => {
+  it.each(['normal capacity', 'one remaining record'].flatMap(capacity =>
+    [false, true].map(secondAcquiresFirst => ({ capacity, secondAcquiresFirst })),
+  ))('serializes stale removers across the validation/unlink gap with $capacity (second acquires first: $secondAcquiresFirst)', async ({ capacity, secondAcquiresFirst }) => {
     const lock = env.WE_POLICY_EVENTS_FILE + '.lock';
     if (capacity === 'one remaining record') {
       const at = new Date().toISOString();
-      const firstBytes = Buffer.byteLength(JSON.stringify({ at, key: '', event: 'interleaved', subject: 'first', reason: '' }) + '\n');
+      const subject = secondAcquiresFirst ? 'second' : 'first';
+      const recordBytes = Buffer.byteLength(JSON.stringify({ at, key: '', event: 'interleaved', subject, reason: '' }) + '\n');
       const seed = { at, subject: 'seed', padding: '' };
-      const paddingBytes = 1024 * 1024 - firstBytes - Buffer.byteLength(JSON.stringify(seed) + '\n');
+      const paddingBytes = 1024 * 1024 - recordBytes - Buffer.byteLength(JSON.stringify(seed) + '\n');
       writeFileSync(env.WE_POLICY_EVENTS_FILE, JSON.stringify({ ...seed, padding: 'x'.repeat(paddingBytes) }) + '\n');
     }
     writeFileSync(lock, 'stale');
     utimesSync(lock, 1, 1);
-    const barrier = new SharedArrayBuffer(8);
+    const barrier = new SharedArrayBuffer(12);
     const control = new Int32Array(barrier);
     const workerFile = join(dir, 'journal-reclamation-worker.mjs');
     writeFileSync(workerFile, `
@@ -1053,7 +1056,7 @@ describe('policy journal', () => {
       import { performance } from 'node:perf_hooks';
       import { parentPort, workerData } from 'node:worker_threads';
       const { recordPolicyEvent } = await import(workerData.module);
-      const { env, role, barrier } = workerData;
+      const { env, role, barrier, secondAcquiresFirst } = workerData;
       const lock = env.WE_POLICY_EVENTS_FILE + '.lock';
       const control = new Int32Array(barrier);
       const original = { open: fs.openSync, unlink: fs.unlinkSync, write: fs.writeSync };
@@ -1062,7 +1065,7 @@ describe('policy journal', () => {
       // Worker startup and parent scheduling while deliberately paused are test
       // orchestration, not lock contention. Keep real time for ordinary retries.
       Object.defineProperty(performance, 'now', { value: () => now() - barrierMs });
-      let paused = false, competing = false, survived;
+      let paused = false, competing = false, yielded = false, appended = false, survived;
       const compete = kind => {
         if (!competing) { competing = true; parentPort.postMessage({ phase: 'competing', kind }); }
       };
@@ -1078,7 +1081,19 @@ describe('policy journal', () => {
           parentPort.postMessage({ phase: 'paused' });
           wait(0); // Last identity check has completed; unlink has not run.
         }
-        return original.unlink(path, ...args);
+        const result = original.unlink(path, ...args);
+        if (role === 'first' && path === lock) {
+          // The second writer need only hold its replacement until the stale
+          // unlink completes. Waiting for the first append can exhaust its
+          // lock budget when the second writer acquires the replacement first.
+          Atomics.store(control, 1, 1);
+          Atomics.notify(control, 1);
+        }
+        if (role === 'first' && secondAcquiresFirst && String(path).endsWith('.reclaim') && !yielded) {
+          yielded = true;
+          wait(2); // Force the second writer to acquire after the guard releases.
+        }
+        return result;
       };
       fs.openSync = (path, ...args) => {
         try { return original.open(path, ...args); } catch (error) {
@@ -1090,24 +1105,27 @@ describe('policy journal', () => {
         if (role === 'second' && String(data).includes('"event":"interleaved"')) {
           const held = fs.lstatSync(lock);
           compete('replacement');
-          parentPort.postMessage({ phase: 'held' });
-          wait(1); // Hold the replacement while the first remover finishes.
+          Atomics.store(control, 2, 1);
+          Atomics.notify(control, 2);
+          wait(1); // Hold the replacement until the stale unlink completes.
           try {
             const current = fs.lstatSync(lock);
             survived = current.dev === held.dev && current.ino === held.ino;
           } catch { survived = false; }
         }
-        return original.write(fd, data, ...args);
+        const written = original.write(fd, data, ...args);
+        if (String(data).includes('"event":"interleaved"') && written === data.length) appended = true;
+        return written;
       };
       syncBuiltinESMExports();
       recordPolicyEvent({ event: 'interleaved', subject: role }, env);
-      parentPort.postMessage({ phase: 'done', survived });
+      parentPort.postMessage({ phase: 'done', appended, survived });
       process.exit(0);
     `);
     const workers = [];
     const start = role => {
       const worker = new Worker(workerFile, { workerData: {
-        module: resolve('scripts/lib/delivery-policy.mjs'), env, role, barrier,
+        module: resolve('scripts/lib/delivery-policy.mjs'), env, role, barrier, secondAcquiresFirst,
       } });
       workers.push(worker);
       const messages = new Map(), waiting = new Map();
@@ -1133,24 +1151,25 @@ describe('policy journal', () => {
       const second = start('second');
       const competition = await second('competing');
       resume(0);
-      await first('done');
-      await Promise.race([second('held'), second('done')]);
-      resume(1);
-      const completed = await second('done');
+      const [firstCompleted, completed] = await Promise.all([first('done'), second('done')]);
       if (capacity === 'normal capacity') {
+        expect(firstCompleted.appended).toBe(true);
+        expect(completed.appended).toBe(true);
         expect(completed.survived).toBe(true);
         expect(readPolicyEvents({ env }).map(event => event.subject).sort()).toEqual(['first', 'second']);
       } else {
-        // The second writer must recheck size after the first appends. Refuse
-        // its record rather than growing the journal beyond the reader's bound.
-        expect(completed.survived).toBeUndefined();
+        // Either writer may acquire first. The other must recheck size and
+        // refuse its record rather than exceed the reader's bound.
+        expect([firstCompleted.appended, completed.appended].filter(Boolean)).toHaveLength(1);
+        expect(completed.survived).toBe(completed.appended ? true : undefined);
         expect(statSync(env.WE_POLICY_EVENTS_FILE).size).toBe(1024 * 1024);
-        expect(readPolicyEvents({ env }).map(event => event.subject)).toEqual(['seed', 'first']);
+        expect(readPolicyEvents({ env }).map(event => event.subject)).toEqual(['seed', completed.appended ? 'second' : 'first']);
       }
+      if (secondAcquiresFirst) expect(completed.appended).toBe(true);
       expect(competition.kind).toBe('contended');
       expect(() => statSync(lock)).toThrow(/ENOENT/);
     } finally {
-      resume(0); resume(1);
+      resume(0); resume(1); resume(2);
       await Promise.all(workers.map(worker => worker.terminate()));
     }
   }, 15000);
