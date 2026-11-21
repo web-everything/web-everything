@@ -48,7 +48,8 @@ export function failClosedCapacity(key, value, { codeDefault, log = console.erro
   warn(log, `operator-override: operator-db-unreadable ${key}; using finite stricter value ${result}`);
   return result;
 }
-/** Enum-valued host overrides (on/off style settings): key -> the only allowed values. Anything else is refused. */
+/** Enum-valued host overrides (on/off style settings): key -> the only allowed values. Anything else is refused.
+ *  They are stored in a SEPARATE file (operator-enum-store.mjs), so the numeric capacity store stays all-numbers. */
 export const ENUM_LEAVES = Object.freeze({
   'ciHeal.loop': Object.freeze(['off', 'on']),
 });
@@ -80,10 +81,8 @@ export function readOperatorOverrides({ file, log = console.error, normalize = t
     return { readable: false, values: {} };
   }
   const values = {};
-  const enums = {};
   const invalidPolicies = new Set();
   for (const [key, value] of Object.entries(data)) {
-    if (isEnumLeaf(key) && validEnumValue(key, value)) { enums[key] = value; continue; }
     const known = Object.hasOwn(CAPACITY_LEAVES, key);
     if (!known || !CAPACITY_LEAVES[key].validate(value)) {
       const policy = key.split('.')[0];
@@ -97,5 +96,5 @@ export function readOperatorOverrides({ file, log = console.error, normalize = t
   if (normalize && values['resourceGate.fixCap.ceiling'] < values['resourceGate.fixCap.floor']) {
     values['resourceGate.fixCap.floor'] = values['resourceGate.fixCap.ceiling'];
   }
-  return { readable: true, values, ...(Object.keys(enums).length ? { enums } : {}), ...(invalidPolicies.size ? { invalidPolicies: [...invalidPolicies] } : {}) };
+  return { readable: true, values, ...(invalidPolicies.size ? { invalidPolicies: [...invalidPolicies] } : {}) };
 }
