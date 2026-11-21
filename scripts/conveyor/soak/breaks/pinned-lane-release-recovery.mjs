@@ -75,7 +75,7 @@ function olderGuardScenario({ root = ROOT } = {}) {
       git(['commit', '--quiet', '--no-verify', '-am', 'worker edit'], lane);
       // The lane's own tracked hook, exactly as a worker's push runs it.
       const pushed = spawnSync('git', ['push', '--quiet', 'origin', 'HEAD:refs/heads/lane/target'],
-        { cwd: lane, encoding: 'utf8', timeout: 30_000, env: { ...process.env, MAIN_PUSH_OK: '' } });
+        { cwd: lane, encoding: 'utf8', timeout: 30_000, maxBuffer: 1024 * 1024, env: { ...process.env, MAIN_PUSH_OK: '' } });
       if (pushed.status === 0) violations.push('older guard: pinned runner pushed lane/target');
     } else if (!/push guard differs/.test(acquired.stderr)) {
       violations.push('older guard: acquisition refused for another reason');
