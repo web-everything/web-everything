@@ -85,7 +85,8 @@ export function runEligibilityShadow({ dispatch = [], prs = [], mode = 'shadow',
       // A listed thread under one page is the whole thread (same rule as review-hold-reconcile); a full page may be
       // truncated and an unreadable one is unknown, so both stay incomplete.
       const complete = pr.commentsComplete === true
-        || (pr.commentsComplete === undefined && Array.isArray(pr.comments) &&pr.comments.length < LIST_COMMENTS_PAGE_SIZE);
+        || (pr.commentsComplete === undefined && Array.isArray(pr.comments) &&pr.comments.length < LIST_COMMENTS_PAGE_SIZE
+          && pr.comments.every(c => c && typeof c === 'object' && typeof c.body === 'string'));
       const facts = buildEligibilityFacts({ pr, comments: pr.comments, commentsComplete: complete,
         population: entry.kind, locals: readLocals(entry, pr) });
       const gate = eligibility({ ...pr, commentsComplete: complete }, facts);

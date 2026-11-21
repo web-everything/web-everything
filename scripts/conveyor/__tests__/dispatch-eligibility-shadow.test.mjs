@@ -327,5 +327,7 @@ describe('runEligibilityShadow thread completeness', () => {
     const full = Array.from({ length: 100 }, () => bot('x'));
     expect(rows([pr(6001, { comments: full, commentsComplete: undefined })])).toEqual([expect.objectContaining({ gate: 'unknown', reasons: ['thread'] })]);
     expect(rows([pr(6001, { comments: undefined, commentsComplete: undefined })])).toEqual([expect.objectContaining({ gate: 'unknown', reasons: ['thread'] })]);
+    const unreadable = [...sentBackPr().comments, { author: { login: 'x' } }];
+    expect(rows([sentBackPr(6001, { comments: unreadable, commentsComplete: undefined })])).toEqual([expect.objectContaining({ gate: 'unknown', reasons: ['thread'] })]);
   });
 });
