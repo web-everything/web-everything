@@ -1,10 +1,10 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import nodeFs, { existsSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import nodeFs, { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import * as adoption from '../adopt.mjs';
 import { prepareRebuild, readOverlayEventLog } from '../prepare.mjs';
-import { writeReadyCandidate, writeRebuildState } from '../state.mjs';
+import { readReadyCandidate, writeReadyCandidate, writeRebuildState } from '../state.mjs';
 import * as planner from '../plan.mjs';
 import * as edgeFetch from '../edge-fetch.mjs';
 import * as localState from '../local-state.mjs';
@@ -34,14 +34,23 @@ describe('prepare registration and audit identity hardening', () => {
   });
 
   it.each([
-    ['ready', 'audit'], ['skip-unrelated', 'audit'], ['ready', 'registration'], ['ready', 'corrupt registration'],
+    ['ready', 'audit'], ['skip-unrelated', 'audit'],
+    ...['registration', 'omitted registration', 'edge approval', 'replacement', 'origin tip',
+      'removal event', 'corrupt registration', 'corrupt event log', 'unreadable event log']
+      .map((changed) => ['ready', changed]),
   ])('%s adoption rechecks %s after waiting for the add guard', async (path, changed) => {
     const liveHead = 'b'.repeat(40), mainSha = 'c'.repeat(40), candidate = 'd'.repeat(40);
     const readyPath = join(root, 'fix-ready.jsonl');
     env = { ...env, WE_DAEMON_STATE_DIR: join(root, 'state'), WE_DAEMON_AUTO_REBASE: '0',
       WE_DAEMON_OVERLAY_FOLLOW_TIP: 'audited-only', WE_FIX_READY_PATH: readyPath,
-      WE_PLATFORM_PREFERENCES_FILE: join(root, 'platform.json') };
+      WE_PLATFORM_PREFERENCES_FILE: join(root, 'platform.json'), WE_DAEMON_EVENTS: join(root, 'events.jsonl') };
     writeFileSync(env.WE_PLATFORM_PREFERENCES_FILE, '{}');
+    if (changed === 'edge approval') {
+      const file = overlayFilePath(root, env);
+      const registry = JSON.parse(readFileSync(file, 'utf8'));
+      registry.overlays[0].edgeResolution = { sha, by: 'original-operator', at: added.at };
+      writeFileSync(file, JSON.stringify(registry));
+    }
     const green = { ref, sha, tests: 'green', audit: 'NOT WEAKENED' };
     writeFileSync(readyPath, JSON.stringify(green));
     const plan = { ok: true, finalSha: candidate, mainSha, inputsKey: 'plan',
@@ -55,6 +64,7 @@ describe('prepare registration and audit identity hardening', () => {
     vi.spyOn(planner, 'planRebuild').mockResolvedValue(plan);
     vi.spyOn(adoption, 'readyBuildVerified').mockReturnValue(true);
     const matching = vi.spyOn(adoption, 'matchReadyCandidate');
+    let originTip = sha;
     const run = vi.fn(args => {
       const ok = (stdout = '') => ({ status: 0, stdout, stderr: '' });
       if (args[0] === 'symbolic-ref') return ok('main');
@@ -62,7 +72,8 @@ describe('prepare registration and audit identity hardening', () => {
         const rev = args.at(-1);
         if (rev === 'HEAD') return ok(liveHead);
         if (rev === 'origin/main^{commit}') return ok(mainSha);
-        if (rev === `refs/remotes/origin/${ref}^{commit}`) return ok(sha);
+        if (rev === `refs/remotes/origin/${ref}^{commit}`) return ok(originTip);
+        if (rev === 'refs/remotes/origin/lane/omitted^{commit}') return ok(sha);
         if (rev.endsWith('^{tree}')) return ok('candidate-tree');
       }
       if (['ls-files', 'log', 'diff'].includes(args[0])) return ok();
@@ -91,7 +102,22 @@ describe('prepare registration and audit identity hardening', () => {
       if (path === 'ready') expect(matching.mock.results[0].value.adopt).toBeTruthy();
       if (changed === 'audit') writeFileSync(readyPath, [green, { ...green, tests: 'red' }].map(JSON.stringify).join('\n'));
       else if (changed === 'registration') removeOverlay(root, ref, { env, why: 'operator withdrawal during wait' });
-      else writeFileSync(overlayFilePath(root, env), '{');
+      else if (changed === 'omitted registration') addOverlay(root, { ref: 'lane/omitted' }, { env });
+      else if (changed === 'origin tip') originTip = 'e'.repeat(40);
+      else if (changed === 'removal event') appendOverlayEvent(root, { kind: 'removed', ref: 'lane/other' }, { env });
+      else if (changed === 'corrupt event log') writeFileSync(overlayFilePath(root, env).replace(/\.json$/, '.events.jsonl'), '{');
+      else if (changed === 'unreadable event log') {
+        const file = overlayFilePath(root, env).replace(/\.json$/, '.events.jsonl');
+        rmSync(file);
+        nodeFs.mkdirSync(file);
+      } else if (changed === 'edge approval' || changed === 'replacement') {
+        const file = overlayFilePath(root, env);
+        const registry = JSON.parse(readFileSync(file, 'utf8'));
+        registry.overlays[0] = { ...registry.overlays[0], ...(changed === 'edge approval'
+          ? { edgeResolution: { ...registry.overlays[0].edgeResolution, by: 'replacement-operator' } }
+          : { sha: 'e'.repeat(40), addedBy: 'replacement' }) };
+        writeFileSync(file, JSON.stringify(registry));
+      } else writeFileSync(overlayFilePath(root, env), '{');
     } finally {
       vi.mocked(overlayOperator.withAddGuardLock).mockRestore();
       release();
@@ -99,7 +125,15 @@ describe('prepare registration and audit identity hardening', () => {
     }
     const done = await pending;
     expect(done.result).toMatchObject({ moved: false, reason: changed === 'audit' ? 'ready-audit-revoked'
-      : changed === 'registration' ? 'overlay-no-longer-wanted' : 'overlay-state-corrupt' });
+      : 'registry-changed-during-wait' });
+    if (changed !== 'audit') {
+      const detail = { target: candidate, reason: 'registry-changed-during-wait' };
+      expect(done.alerts).toContainEqual({ kind: 'ready-candidate-discarded', detail });
+      expect(readReadyCandidate(root, env)).toBeNull();
+      const events = readFileSync(env.WE_DAEMON_EVENTS, 'utf8').trim().split('\n').map(JSON.parse);
+      expect(events).toContainEqual(expect.objectContaining({ kind: 'ready-candidate-discarded', detail }));
+      expect(events.some((event) => event.kind === 'ready-candidate-adopted')).toBe(false);
+    }
     expect(done.alerts.some((a) => a.kind === 'ready-candidate-adopted')).toBe(false);
     expect(run.mock.calls.some(([args]) => args[0] === 'reset')).toBe(false);
     expect(existsSync(`${overlayFilePath(root, env)}.add-guard.lock`)).toBe(false);

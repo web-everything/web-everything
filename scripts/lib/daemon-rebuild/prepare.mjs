@@ -16,6 +16,7 @@ import {
   overlayGraduated, reportDiscardedCandidate,
 } from './adopt.mjs';
 import { hostname } from 'node:os';
+import { createHash } from 'node:crypto';
 import { forceRequestFor, forceBlockedReason, dropReadyCandidate, forcedWatchStatus } from '../daemon-force-adopt.mjs';
 import { appendDaemonEvent } from '../daemon-events.mjs';
 import {
@@ -38,12 +39,48 @@ import {
   markOverlayConflictWake, readOverlayConflictWakes, clearOverlayConflictWake,
 } from '../overlay-conflict-wake.mjs';
 
-/** Read the overlay audit trail, returning no evidence when it is missing or unreadable. */
-export function readOverlayEventLog(root, env) {
+/** Read the overlay audit trail; strict snapshots propagate unreadable/corrupt evidence. */
+export function readOverlayEventLog(root, env, { strict = false } = {}) {
   try {
     const file = overlayFilePath(root, env).replace(/\.json$/, '.events.jsonl');
     return readFileSync(file, 'utf8').split('\n').filter((line) => line.trim()).map((line) => JSON.parse(line));
-  } catch { return []; }
+  } catch (error) {
+    if (strict && error?.code !== 'ENOENT') throw error;
+    return [];
+  }
+}
+
+/** Canonicalize object keys; preserve array order (overlay order and event chronology matter). */
+function canonicalSnapshot(value) {
+  if (Array.isArray(value)) return value.map(canonicalSnapshot);
+  if (value && typeof value === 'object') {
+    return Object.fromEntries(Object.keys(value).sort().map((key) => [key, canonicalSnapshot(value[key])]));
+  }
+  return value;
+}
+
+/** Snapshot every registry field, the complete retirement history, candidate failure dependencies,
+ * and current origin tips. A fresh sentinel makes even two unreadable reads compare unequal.
+ * Missing files are the registry's normal empty state; other read/parse failures refuse adoption.
+ * `refs` carries ready.failed, match.failed and dropRefs without reducing their persisted shape. */
+export function registrySnapshotHash({ root, env, git, refs = {} }) {
+  try {
+    const registry = readOverlayState(root, { env });
+    if (registry.corrupt) throw new Error('unreadable registry');
+    const events = readOverlayEventLog(root, env, { strict: true });
+    if (events.some((event) => !event || typeof event !== 'object' || Array.isArray(event))) {
+      throw new Error('invalid overlay event');
+    }
+    const tips = registry.overlays.map((entry) => {
+      if (!entry || typeof entry.ref !== 'string' || !entry.ref) throw new Error('invalid overlay');
+      const tip = verifyRev(git, `refs/remotes/origin/${entry.ref}^{commit}`);
+      if (!/^[a-f0-9]{40}$/.test(tip ?? '')) throw new Error('unreadable origin tip');
+      return [entry.ref, tip];
+    }).sort(([a], [b]) => a.localeCompare(b));
+    return createHash('sha256').update(JSON.stringify(canonicalSnapshot({ registry, events, refs, tips }))).digest('hex');
+  } catch {
+    return Symbol('registry-snapshot-unreadable');
+  }
 }
 
 /** Record pr-merged drop evidence without changing drop policy. Unknown proof fails closed. */
@@ -675,6 +712,11 @@ export async function prepareRebuild({
           return terminal({ moved: false, reason: 'untracked-collision', untracked: colliding, plan });
         }
         writeState();
+        const snapshotInputs = { root, env, git, refs: {
+          readyFailed: ready.failed ?? null, failed: m.failed ?? null,
+          dropRefs: m.dropRefs, readyDropRefs: ready.dropRefs ?? [],
+        } };
+        const snapshot = registrySnapshotHash(snapshotInputs);
         const fin = await finalizeRebuild({
           root,
           env,
@@ -683,16 +725,9 @@ export async function prepareRebuild({
           stateOpts,
           now,
           plan: m.adopt,
-          // Retirement can change the registry while finalize waits for the add guard.
-          validateAdoption: () => {
-            const current = readOverlayState(root, { env });
-            if (current.corrupt) return 'overlay-state-corrupt';
-            const currentRefs = new Set(current.overlays.map((o) => o?.ref));
-            wantedTips.clear();
-            return (m.adopt.applied ?? []).every((a) =>
-              (!registeredRefs.has(a.ref) || currentRefs.has(a.ref)) && stillWanted(a.ref, a.sha))
-              ? null : 'overlay-no-longer-wanted';
-          },
+          // One eligibility edge: any registry change across the add-guard wait discards this build.
+          validateAdoption: () => registrySnapshotHash(snapshotInputs) === snapshot
+            ? null : 'registry-changed-during-wait',
           // A separate lazy gate reads evidence only after finalize holds the add guard.
           auditedTip: makeAuditedTipGate(env),
           prevHead,
@@ -704,6 +739,14 @@ export async function prepareRebuild({
             : undefined,
         });
         const { alerts: finAlerts = [], ...finResult } = fin;
+        if (finResult.reason === 'registry-changed-during-wait') {
+          await dropReady(finResult.reason, prevHead);
+          const detail = { target: m.adopt.finalSha, reason: finResult.reason };
+          alert('ready-candidate-discarded', detail);
+          await appendDaemonEvent({ kind: 'ready-candidate-discarded', detail }, {
+            env: { WE_DAEMON_EVENTS: env?.WE_DAEMON_EVENTS },
+          });
+        }
         if (finResult.adopted) {
           alert('ready-candidate-adopted', {
             target: m.adopt.finalSha, match: m.match, passedAt: ready.passedAt, passedBy: `${ready.pid ?? '?'}@${ready.host ?? '?'}`,
