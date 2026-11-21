@@ -19,7 +19,7 @@ export default {
       const candidates = e.clearanceBaseline === undefined ? view.events.slice(i + 1)
         : view.events.filter(x => (x.type === EVENT_TYPES.APPROVAL || ((x.type === EVENT_TYPES.VERDICT || x.type === undefined) && verdictClears(x.verdict)))
           && !e.clearanceBaseline.includes(ledgerEventId(x)));
-      const later = candidates.some(x => (approvalValid(x, facts?.now) && approvalBindsHold(x, ledgerEventId(e), head))
+      const later = candidates.some(x => (approvalValid(x, facts?.now, head) && approvalBindsHold(x, ledgerEventId(e), head))
         || ((x.type === EVENT_TYPES.VERDICT || x.type === undefined) && verdictClears(x.verdict) && acceptanceCovers(x, head)));
       if (!later && !out.some(h => h.code === `label-input:${e.label}`)) out.push({ code: `label-input:${e.label}`, reason: `${e.label} added by hand (${e.sender})` });
     });
