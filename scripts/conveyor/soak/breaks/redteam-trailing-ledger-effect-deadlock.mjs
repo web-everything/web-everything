@@ -27,7 +27,8 @@ export default {
       const eff = (step, status, type) => ({ type: type ?? (step === 'verdict-ledger.append' ? step : `review.${step}`), step, status });
       const done = ['write-up', 'label-swap', 'verdict-ledger.append', 'notice'].map(s => eff(s, 'applied'));
       const ledger = status => eff('ledgerEvents', status, 'review.ledger-events');
-      const base = { op: 'review-pr', input: { repo: 'web-everything/web-everything', pr: 7202 },
+      const { CONSTELLATION_REPOS } = await import(pathToFileURL(join(sourceRoot, 'scripts/lib/constellation-repos.mjs')).href);
+      const base = { op: 'review-pr', input: { repo: CONSTELLATION_REPOS.we.slug, pr: 7202 },
         verdict: { verdict: 'accept' }, findings: { confirm: 'accept', read: { netBasis: { rev: head } } },
         stepTimings: [{ step: 'read', startedAt: new Date(4999 * 10_000 - 1000).toISOString() }] };
       const replay = (name, extra, expectHold) => {
