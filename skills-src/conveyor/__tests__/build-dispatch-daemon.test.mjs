@@ -1,3 +1,4 @@
+import { readPrepareRefusals, recordPrepareRefusal } from '../../../scripts/conveyor/prepare-refusal-stop-io.mjs';
 import { resolveCostAdmissionSettings } from '../../../scripts/lib/cost-admission.mjs';
 import { resolvePreparePolicy } from '../../../scripts/conveyor/prepare-policy-settings.mjs';
 import { runPrepareBatch } from '../../../scripts/operations/prepare-batch.mjs';
@@ -1893,6 +1894,45 @@ describe('automatic item preparation', () => {
       releasePrepareClaim: (o) => releaseBuildDispatchClaim({ ...o, lockRoot }),
     };
   }
+  it('plans a twice-refused card zero times next tick, before cost admission, across a restart', async () => {
+    const path = join(lockRoot, 'prepare-refusals.json'), start = Date.parse('2026-11-18T12:00:00Z');
+    let now = start, bookkeeping = {};
+    const effects = { ...fixture(), now: () => now, preparePolicy: () => resolvePreparePolicy(),
+      readPrepareRefusals: options => readPrepareRefusals({ path, ...options }),
+      recordPrepareRefusal: (row, options) => recordPrepareRefusal(row, { path, ...options }),
+      listPreparePrs: () => [{ number: 91, state: 'OPEN', headRefName: 'lane/5028d-prepare-x' }] };
+    const offered = []; effects.planTick = bk => {
+      const picks = planPrepareSpawns({ needsPrepare: [{ num: '5028' }], prepareHeldNums: bk.prepareHeldNums,
+        availableLanes: [1], maxConcurrentItemPrepares: 1 }).itemPrepareSpawns;
+      offered.push(...picks); return { decisions: { itemPrepareSpawns: picks }, nextState: {} }; };
+    const log = vi.spyOn(console, 'error').mockImplementation(() => {});
+    try {
+      for (let i = 0; i < 2; i++) {
+        const tick = await runBuildDispatchTick({ live: true, effects, bookkeeping });
+        expect(tick.prepare.refused).toHaveLength(1); bookkeeping = tick.nextBookkeeping; now += 3_600_000;
+      }
+      expect(offered).toHaveLength(2); offered.length = 0;
+      for (const state of [bookkeeping, {}]) {
+        const tick = await runBuildDispatchTick({ live: true, effects: { ...effects }, bookkeeping: state });
+        expect(tick.prepare.planned).toEqual([]); expect(offered).toEqual([]);
+        expect(tick.prepare.skippedRepeatRefusal).toEqual([{ num: '5028', refusals: 2, lastReason: 'open prepare PR #91 (lane/5028d-prepare-x)' }]);
+      }
+      expect(effects.dispatch).not.toHaveBeenCalled(); now = start + 24 * 3_600_000;
+      await runBuildDispatchTick({ live: true, effects }); expect(offered).toHaveLength(1);
+    } finally { log.mockRestore(); }
+  }); it('unreadable refusal state launches no prepare', async () => {
+    const effects = { ...fixture(), readPrepareRefusals: () => { throw new Error('unreadable\nstate'); } };
+    effects.planTick = vi.fn((bk, { config }) => {
+      expect(config.launchKinds).not.toContain('prepare-item');
+      return { decisions: planPrepareSpawns({ needsPrepare: [{ num: '5028' }], availableLanes: [1],
+        dispatchPaused: !config.launchKinds.includes('prepare-item') }), nextState: {} };
+    });
+    const log = vi.spyOn(console, 'error').mockImplementation(() => {});
+    try {
+      await runBuildDispatchTick({ live: true, effects }); expect(effects.dispatch).not.toHaveBeenCalled();
+      expect(log.mock.calls.filter(([line]) => line.startsWith('build-dispatch-daemon: prepare launches held:'))).toEqual([['build-dispatch-daemon: prepare launches held: unreadable state']]);
+    } finally { log.mockRestore(); }
+  });
   it('skips a prepare merged 20 minutes ago before allocating the next slot', async () => {
     const effects = fixture();
     effects.now = () => Date.parse('2026-10-16T23:00:00Z');
