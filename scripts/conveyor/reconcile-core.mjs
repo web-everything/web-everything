@@ -169,6 +169,7 @@ import {
   isLatestAdvisoryFindingAddressed, isAdvisoryMechanismStandDownSuperseded,
 } from './advisory-fix-mark.mjs';
 import { CONFLICT_LABEL } from './conflict-label.mjs';
+import { isOperatorParked } from './draft-promotion-rule.mjs';
 // advisory-after-cap (web-everything/web-everything#2766 live incident, 2026-09-27) — see the ADVISORY-FIX
 // cap-exhausted branch below for why the "is a fresh review owed on a stale advisory note" check reuses these
 // two, never a second reimplementation of "does the newest advisory comment name this PR's CURRENT head".
@@ -2884,6 +2885,10 @@ export function planReconcile({
     if (pr?.isDraft && (withPhase.check === 'green' || reviewHoldOnlyRed(pr.statusCheckRollup, requiredChecks) || mainFixPriority)) {
       if (labelNames(pr.labels).includes('review-status:draft-withdrawn')) {
         refuse('draft', { ...withPhase, why: 'draft PR is withdrawn — explicit release is required before promotion' });
+        continue;
+      }
+      if (isOperatorParked(pr.comments)) {
+        refuse('draft', { ...withPhase, why: 'draft PR is operator-parked — explicit release is required before promotion' });
         continue;
       }
       const redTeamHold = labelNames(pr.labels).find(label => ['red-team:blocked', 'red-team:pending'].includes(label));

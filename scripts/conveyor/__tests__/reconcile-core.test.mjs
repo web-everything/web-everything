@@ -31,6 +31,7 @@ import { excusePrMergeGateHolds, readMergeGateVerdict } from '../../lib/merge-ga
  *   say when.
  */
 import { describe, it, expect } from 'vitest';
+import { OPERATOR_PARK_MARKER } from '../draft-promotion-rule.mjs';
 import { FIX_BEGIN_MARKER, FIX_END_MARKER, buildFixBeginComment, buildFixEndComment } from '../fix-procedure.mjs';
 import {
   staleRequiredBaseRepair, reviewHoldOnlyRed, reviewHoldCiWaivable, planReconcile as planReconcileCore, fixWaitingSince, countFindings, bindAgents, assessLiveness, isAwaitingPermission, startedAtMs, releasedFixClaim, isReleasedClaimSession,
@@ -3628,6 +3629,18 @@ describe('#xconv1 (web-everything/web-everything#2766/#2767 unblock) — CONVERT
 // loop back: never dispatch a review for a draft, whatever label it carries, and promote (`gh pr ready`, via
 // `kind:'promote-draft'`) the moment its required checks are all green.
 describe('draft-first PRs — reconcile-core.mjs (operator-approved 2026-09-27)', () => {
+  it.each(['ordinary', 'mainFixPriority', 'mainFixPriority pending checks'])(
+    'refuses an operator-parked lane draft as draft, never promote-draft: %s', mode => {
+      const pr = pr1563({ isDraft: true, headRefName: 'lane/operator-park', labels: [],
+        statusCheckRollup: mode.endsWith('pending checks') ? pendingRollup : greenRollup,
+        comments: [{ author: { login: 'web-everything' }, body: OPERATOR_PARK_MARKER }] });
+      const mainRedPriority = mode === 'ordinary' ? null
+        : { repo: 'we', pr: 1563, firstRedSha: '7c731a95e', setAt: NOW, expiresAt: NOW + 30 * 60_000 };
+      const plan = planReconcile({ prs: [pr], agents: [], now: NOW, mainRedPriority });
+      expect(plan.dispatch).toEqual([]);
+      expect(plan.refusals).toEqual([expect.objectContaining({ kind: 'draft', prNumber: 1563, why: expect.stringContaining('operator-parked') })]);
+    },
+  );
   it('`promote-draft` is on the frozen DISPATCH_KINDS list, `draft` is on the frozen REFUSAL_KINDS list', () => {
     expect(DISPATCH_KINDS).toContain('promote-draft');
     expect(REFUSAL_KINDS).toContain('draft');

@@ -127,7 +127,7 @@ export function runDraftPromotionStep({
       if (!view || typeof view !== 'object') { row('error', 'pr view: no record returned'); continue; }
       if (view.headRefOid !== pr.headRefOid) { row('skip', `head moved since the check read (${String(pr.headRefOid).slice(0, 9)} → ${String(view.headRefOid).slice(0, 9)}) — the next step re-reads it`); continue; }
       const fresh = isDraftOwedPromotion({
-        pr: { ...pr, state: view.state, isDraft: view.isDraft, headRefName: view.headRefName, baseRefName: view.baseRefName, mergeable: view.mergeable, labels: view.labels, isCrossRepository: view.isCrossRepository },
+        pr: { ...pr, state: view.state, isDraft: view.isDraft, headRefName: view.headRefName, baseRefName: view.baseRefName, mergeable: view.mergeable, labels: view.labels, comments: view.comments, isCrossRepository: view.isCrossRepository },
         checks,
       });
       if (!fresh.owed) { row('skip', `${fresh.why} (re-read just before the write)`, fresh.reason); continue; }
