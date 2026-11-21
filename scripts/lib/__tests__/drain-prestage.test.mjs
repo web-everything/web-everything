@@ -9,7 +9,7 @@ import { aiPr } from '../../__tests__/fixtures/merge-ai-prs-fixtures.mjs';
 const roots = [];
 afterEach(() => roots.splice(0).forEach(root => rmSync(root, { recursive: true, force: true })));
 const repo = 'owner/repo', head = 'a'.repeat(40);
-const pending = () => aiPr({ number: 42, headRefOid: head, baseRefName: 'main', state: 'OPEN', isDraft: false,
+const pending = () => aiPr({ rowsComplete: true, rowsHead: head, number: 42, headRefOid: head, baseRefName: 'main', state: 'OPEN', isDraft: false,
   labels: [{ name: 'review:accepted' }, { name: 'ready-to-merge' }], mergeStateStatus: 'BLOCKED', mergeable: 'MERGEABLE',
   statusCheckRollup: [{ name: 'test', status: 'IN_PROGRESS', conclusion: null, head_sha: head }] });
 function fixture(options = {}) {
@@ -31,6 +31,17 @@ function fixture(options = {}) {
 const green = f => { f.pr.statusCheckRollup[0] = { name: 'test', status: 'COMPLETED', conclusion: 'SUCCESS', head_sha: head }; };
 
 describe('CI pre-stage', () => {
+  it.each([{}, { rowsComplete: false, rowsHead: head }, { rowsComplete: true, rowsHead: 'b'.repeat(40) }])(
+    'never admits incomplete or foreign-head check evidence (%j)', evidence => {
+      const pr = pending();
+      pr.statusCheckRollup[0] = { name: 'test', status: 'COMPLETED', conclusion: 'SUCCESS', head_sha: head };
+      delete pr.rowsComplete;
+      delete pr.rowsHead;
+      Object.assign(pr, evidence);
+      expect(prestageCi(pr, ['test'])).toBe('red');
+      expect(classifyPr(pr, { queueRequiredChecks: ['test'] }).decision).not.toBe('merge');
+    });
+
   it.each([{hasManifest:true}, {coupleCarrier:{num:43}}])('invalidates older unsafe cache entries (%j)', async candidate => {
     const f = fixture();
     const entry = f.cache.get(repo, 42, 30);
@@ -70,8 +81,8 @@ describe('CI pre-stage', () => {
   });
   it('computes the non-CI verdict while pending, without changing ordinary classification', () => {
     const p = pending();
-    expect(classifyPr(p).decision).toBe('skip');
-    const verdicts = buildDrainVerdicts({ prsByRepo: new Map([[repo, [p]]]), repos: [repo],
+    expect(classifyPr(p, { defaultBranch: 'main' }).decision).toBe('skip');
+    const verdicts = buildDrainVerdicts({ defaultBranchOf: () => 'main', prsByRepo: new Map([[repo, [p]]]), repos: [repo],
       preparePendingCi: true, isLocalRepo: () => true, queueRequiredChecksOf: () => ['test'], readOf: () => ({ commits: [] }) });
     expect(verdicts[0]).toMatchObject({ decision: 'merge', prestagePendingCi: true, testGreen: false, mergeable: 'MERGEABLE', listedHeadSha: head });
     expect(needsManifestStripBeforeMerge({ ...verdicts[0], hasManifest: true })).toBe(false);
@@ -254,7 +265,7 @@ describe('CI pre-stage', () => {
   });
   it.each(['FAILURE', 'CANCELLED', 'TIMED_OUT'])('does not prepare %s', conclusion => {
     const p = pending(); p.statusCheckRollup[0] = { name: 'test', status: 'COMPLETED', conclusion };
-    expect(classifyPr(p, { preparePendingCi: true, queueRequiredChecks: ['test'] }).decision).toBe('skip');
+    expect(classifyPr(p, { defaultBranch: 'main', preparePendingCi: true, queueRequiredChecks: ['test'] }).decision).toBe('skip');
   });
   // The drain's own `--check` gates the full drain too, so it must gate preparation and the cached enqueue.
   it.each([
@@ -264,7 +275,7 @@ describe('CI pre-stage', () => {
     const p = pending();
     if (state === 'PENDING') p.statusCheckRollup.push({ name: 'smoke', status: 'IN_PROGRESS', conclusion: null, head_sha: head });
     else if (state) p.statusCheckRollup.push({ name: 'smoke', status: 'COMPLETED', conclusion: state, head_sha: head });
-    const v = classifyPr(p, { preparePendingCi: true, queueRequiredChecks: ['test'], requiredCheck: 'smoke' });
+    const v = classifyPr(p, { defaultBranch: 'main', preparePendingCi: true, queueRequiredChecks: ['test'], requiredCheck: 'smoke' });
     expect(v.decision).toBe(decision);
     expect(!!v.prestagePendingCi).toBe(decision === 'merge');
   });
@@ -288,7 +299,7 @@ describe('CI pre-stage', () => {
     expect(f.enqueue).not.toHaveBeenCalled();
   });
   it('an empty --check never prepares, as the full drain never lands', () => {
-    expect(classifyPr(pending(), { preparePendingCi: true, queueRequiredChecks: ['test'], requiredCheck: '' }).decision).toBe('skip');
+    expect(classifyPr(pending(), { defaultBranch: 'main', preparePendingCi: true, queueRequiredChecks: ['test'], requiredCheck: '' }).decision).toBe('skip');
   });
   it('an unread --check (failed full read past the rollup cap) falls back without enqueuing', async () => {
     const f = fixture({ requiredCheck: 'test' });
@@ -309,6 +320,6 @@ describe('CI pre-stage', () => {
     p.statusCheckRollup[0].head_sha = 'other';
     expect(prestageCi(p, ['test'])).toBe('red');
     p.statusCheckRollup[0].head_sha = head; p.mergeable = 'CONFLICTING';
-    expect(classifyPr(p, { preparePendingCi: true, queueRequiredChecks: ['test'] }).decision).toBe('skip');
+    expect(classifyPr(p, { defaultBranch: 'main', preparePendingCi: true, queueRequiredChecks: ['test'] }).decision).toBe('skip');
   });
 });

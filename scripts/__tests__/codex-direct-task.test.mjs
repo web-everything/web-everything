@@ -2207,29 +2207,41 @@ describe('detached jobs', () => {
     writeJobRecord(record, { jobsDir });
     let finishCleanup;
     const gate = new Promise(resolveCleanup => { finishCleanup = resolveCleanup; });
+    let startCleanup;
+    const cleanupStarted = new Promise(resolveStarted => { startCleanup = resolveStarted; });
     const originalRm = fsPromises.rm;
-    // A frozen clock keeps the budget from being spent by real IO on a loaded host (the read, write and
-    // rename must all finish before the removal starts); it moves past the deadline only once the stuck
-    // removal begins, so the wait must return at that deadline while the removal is still pending.
-    let clock = 0;
+    // Freeze both the clock and budget timers while real read/write/rename IO finishes. A frozen `now`
+    // alone leaves real timers free to expire before cleanup starts on a loaded host.
+    vi.useFakeTimers();
     let removalSettled = false;
     const rm = vi.spyOn(fsPromises, 'rm').mockImplementation(async (...args) => {
-      clock += 1000;
+      startCleanup();
       await gate;
       const removed = await originalRm(...args);
       removalSettled = true;
       return removed;
     });
     try {
-      expect(await waitForJob({ jobId: record.id, jobsDir, isAlive: () => false, maxMs: 250, now: () => clock }))
+      let result;
+      const waiting = waitForJob({ jobId: record.id, jobsDir, isAlive: () => false, maxMs: 250 })
+        .then(value => { result = value; });
+      await cleanupStarted;
+      expect(rm).toHaveBeenCalledOnce();
+      await vi.advanceTimersByTimeAsync(249);
+      expect(result).toBeUndefined();
+      await vi.advanceTimersByTimeAsync(1);
+      await waiting;
+      expect(result)
         .toMatchObject({ status: 'running', code: 75 });
       expect(removalSettled).toBe(false);
       expect(rm).toHaveBeenCalledOnce();
       expect(readJobRecord(record.id, { jobsDir })).toMatchObject({ status: 'failed', exitCode: 1 });
+      expect(vi.getTimerCount()).toBe(0);
     } finally {
       finishCleanup();
       await Promise.all(rm.mock.results.map(result => result.value));
       rm.mockRestore();
+      vi.useRealTimers();
     }
   });
 

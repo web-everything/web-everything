@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import { readReviewChecks } from './lib/review-ci-gate-io.mjs';
 import { assertCapability } from './lib/repo-profile.mjs';
 import { resolveHandoffSettings } from './lib/handoff-settings.mjs';
 import { writeLabelWithHandoff, signalFixDispatch } from './lib/fix-handoff.mjs';
@@ -131,7 +132,9 @@ import { resolveSkipRebaseApprovedHumanSurface, readApprovedHumanSurfaceHold, re
 // are re-exported ONLY (mirrors `pr-land.mjs`'s own `forge-land-provider.mjs` split of used-here vs.
 // re-exported-only names) — every existing importer of THIS file keeps resolving all five unchanged.
 import { runRenamedPrRefresh, resolveRefreshSettings, logRefreshSettings } from './lib/renamed-pr-refresh.mjs';
-import { shaCacheRepo, resolveFastDrainScopeSetting, resolveFastDrainListingSetting, readFastDrainRoundListing, readFastDrainRoundSnapshot, mergeLiveTargetIntoRows, shouldReadContextCommits, filterToFastDrainTarget, readLegacyManifestCached, readLegacyLocalManifestAt } from './lib/fast-drain-scope.mjs';
+import { shaCacheRepo, resolveFastDrainScopeSetting, resolveFastDrainListingSetting, readFastDrainRoundListing, readFastDrainRoundDefaultBranch, mergeLiveTargetIntoRows, shouldReadContextCommits, filterToFastDrainTarget, readLegacyManifestCached, readLegacyLocalManifestAt } from './lib/fast-drain-scope.mjs';
+import { listLeanOpenPrsPaged, useFastDrainContext, readFastDrainContext, fastDrainPrKey, fastDrainListingAfterBranches } from './lib/fast-drain-context.mjs';
+import { resolveCachedDefaultBranch, createLiveDefaultBranchReader, defaultBranchHold, validDefaultBranch } from './lib/default-branch-cache.mjs';
 import { isTrustedMarkerAuthor, isOperatorAuthored } from './lib/marker-authorship.mjs';
 import { isAiGeneratedPr, hasLabel } from './lib/ai-pr-authorship.mjs';
 import { OPEN_PR_LIST_LIMIT, isDegradedOpenPrListing, filterOpenPrsByLabel } from './lib/no-search-backed-pr-list.mjs';// #2925/#xkfv491 (we:backlog/fix-review-ciheal-deadlock) — see this file's own re-export note (further down,
@@ -148,10 +151,10 @@ import { execFileSync, spawnSync } from 'node:child_process';
 import { cascadePolicy } from './lib/policy-cascade.mjs';
 import { readGit, readGh } from './lib/proc-read.mjs';
 import { GH_ARGV, PR_COMMENTS_PAGE_SIZE, parseJsonLines } from './lib/review-label-provider.mjs'; // PR #4631 round 3 — the paginated reads the carry needs
-import { existsSync, readFileSync, writeFileSync, realpathSync, statSync, mkdirSync, renameSync, unlinkSync } from 'node:fs';
+import { existsSync, readFileSync, writeFileSync, realpathSync, statSync, mkdirSync, renameSync, unlinkSync, mkdtempSync, rmSync, symlinkSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
-import { resolve, join, dirname } from 'node:path';
-import { homedir } from 'node:os';
+import { resolve, join, dirname, isAbsolute } from 'node:path';
+import { homedir, tmpdir } from 'node:os';
 import { createLabelEnsurer, isLabelNotFoundError } from './lib/label-memo.mjs';
 import { rebaseDropManifest, gitRunner } from './lib/rebase-drop-manifest.mjs';
 // fix-couple-split — a couple lands WHOLE in one pass or not at all (hold + contiguous order + carrier pre-flight).
@@ -184,8 +187,8 @@ import { autoStrandedSweepPass } from './backlog-stranded-sweep.mjs'; // xvr2o8r
 import { parseEscalationReason } from './review-detail.mjs';
 import { deriveResolutionBasis, graduatedToFromBody, renderResolutionBasisBanner } from './lib/review-render.mjs'; // #2447 — the graduatedTo resolution-basis banner (presentation only; never gates)
 import { readSharedOpenPrs, readShaCache, writeShaCache, snapshotOpenCount, nextLimit } from './lib/pr-snapshot.mjs';
-import { listOpenPrsPagedHydratedComplete as listOpenPrsPagedHydrated, resolvePrListPaging, parseListOutput } from './lib/pr-list-paged.mjs'; // refuses a short inventory (rows < totalCount)
-import { withListRetry } from './lib/gh-list-retry.mjs'; // 504 incident 2026-11-03 — retry a transient 5xx list with backoff; a persistent failure throws + raises gh-list-failed
+import { listOpenPrsPagedHydratedCompleteAsync as listOpenPrsPagedHydrated, resolvePrListPaging, parseListOutput } from './lib/pr-list-paged.mjs'; // refuses a short inventory (rows < totalCount)
+import { withListRetryAsync as withListRetry } from './lib/gh-list-retry.mjs'; // 504 incident 2026-11-03 — retry a transient 5xx list with backoff; a persistent failure throws + raises gh-list-failed
 import { markPrSnapshotDirty } from './lib/pr-snapshot-store.mjs';
 import { backfillAllReviewRuns, backfillOpenReviewRuns } from './lib/review-run-index.mjs';
 /** Optional discovery hints must never reject the drain's open-PR context. */
@@ -239,7 +242,7 @@ import { isDaemonCaller } from './lib/github-auth-policy.mjs';
 // x2e120n — per-step pass timing ("why so slow", the resident drain daemon's history.jsonl carried only a
 // pass's TOTAL ms, no breakdown). See pass-timings.mjs's own header for the full shape/rationale.
 import { buildSkipReasons, formatSkipSummary, formatSkipReasonsLine } from './lib/drain-skip-reasons.mjs';
-import { createCardGrouping, runCardGroupPass } from './lib/card-group.mjs';
+import { createCardGrouping, runCardGroupPass, readGroupState, resolveCardGroupStatePath } from './lib/card-group.mjs';
 import { readQueueFacts } from './lib/merge-queue-adaptive-batching.mjs';
 import { readQueueEntryFiles } from './lib/queue-file-overlap.mjs';
 import { createStepTimer, formatTimingsSummary, PASS_STEP_ORDER } from './lib/pass-timings.mjs';
@@ -1048,7 +1051,7 @@ export const prestageFixClaimHeld = (num, { claimKey, readClaim = readLiveFixCla
  * SKIPPED with `base is not <default> (<base>)`, AHEAD of the required-check arm: a prototype base such as
  * `lane/mechanical-dispatcher` runs no CI, so its `test` check can never report and the PR would otherwise sit
  * `checking` forever with no reason. `defaultBranch` is the caller's per-repo resolution (never a literal
- * `'main'`); when it or `baseRefName` is unknown the arm is inert and the chain behaves exactly as before.
+ * `'main'`). Missing or unreadable default/base branch evidence always fails closed, including pure callers.
  */
 export function classifyPr(pr, { requiredCheck = 'test', trustLabel = 'ready-to-merge', allowPendingReview = false, defaultBranch = null, blockOnCodeQL = DRAIN_GATE_SETTINGS.drainBlocksOnCodeQL, queueRequiredChecks = null, preparePendingCi = false } = {}) {
   const prestagePendingCi = preparePendingCi && hasLabel(pr, REVIEW_LABELS.accepted) && hasLabel(pr, 'ready-to-merge') && !pr.isDraft
@@ -1071,7 +1074,8 @@ export function classifyPr(pr, { requiredCheck = 'test', trustLabel = 'ready-to-
   // can be green and this arm is THE merge guard for it. A `lane/*` base is never a repo's default branch: held even when
   // `defaultBranch` could not be resolved this pass (fail closed), so it lands only after its base merges and the drain
   // retargets it to the default branch.
-  const offDefaultBase = base !== '' && ((typeof defaultBranch === 'string' && defaultBranch !== '' && base !== defaultBranch) || base.startsWith('lane/'));
+  const readableBase = !!base.trim();
+  const offDefaultBase = !readableBase || (validDefaultBranch(defaultBranch) && base !== defaultBranch) || base.startsWith('lane/');
   const state = String(pr?.mergeStateStatus || '').toUpperCase();
   const mergeable = String(pr?.mergeable || '').toUpperCase();
   const landableState = state === 'CLEAN' || state === 'UNSTABLE'; // UNSTABLE = mergeable, only non-required checks red
@@ -1102,7 +1106,8 @@ export function classifyPr(pr, { requiredCheck = 'test', trustLabel = 'ready-to-
       queueBlocker = `; required-checks-not-successful: ${absent.map(name => `${name} (missing)`).join(', ')}`;
       return false;
     }
-    const gate = reviewCiGate({ headSha: pr.headRefOid || '(listing head)', requiredChecks: queueRequiredChecks, checks: pr.statusCheckRollup || [] });
+    const gate = reviewCiGate({ headSha: pr.headRefOid || '(listing head)', requiredChecks: queueRequiredChecks, checks: pr.statusCheckRollup || [],
+      rowsComplete: pr.rowsComplete, rowsHead: pr.rowsHead });
     if (!gate.allowed) {
       queueBlocker = `; ${gate.reason}${gate.affected.length ? `: ${gate.affected.map(({ name, reason }) => `${name} (${reason})`).join(', ')}` : ''}`;
       return false;
@@ -1142,7 +1147,10 @@ export function classifyPr(pr, { requiredCheck = 'test', trustLabel = 'ready-to-
   else if (!certified) { decision = 'skip'; reason = `not AI-generated (a commit lacks the Co-Authored-By: Claude trailer), no "${trustLabel}" label, and not human-cleared (review:accepted)`; }
   // #3674 — ahead of the required-check arm, so a non-default base is held with its real reason (even when `test`
   // is green) instead of waiting on a check that never runs there.
-  else if (offDefaultBase) { decision = 'skip'; reason = `base is not ${defaultBranch || 'the default branch'} (${base})`; }
+  else if (offDefaultBase) { decision = 'skip'; reason = !readableBase
+    ? defaultBranchHold(base, defaultBranch) : `base is not ${defaultBranch || 'the default branch'} (${base})`; }
+  // A missing argument is unreadable evidence, never an opt-out from authorization.
+  else if (!validDefaultBranch(defaultBranch)) { decision = 'skip'; reason = defaultBranchHold(base, null); }
   else if (!testGreen && !prestagePendingCi) {
     decision = 'skip'; reason = `required check "${requiredCheck}" is not green`;
     workflowHoldRepark = canReparkWorkflowHold();
@@ -1493,7 +1501,7 @@ export async function readFreshQueueRollup(pr, { repo, exec = execFileP } = {}) 
       // The latest-per-name reducer orders runs by `id`/`completedAt`; keep them so a stale success cannot mask a newer failure.
       rows.push(...connection.nodes.map(n => (n?.__typename === 'CheckRun' && n.databaseId != null ? { ...n, id: n.databaseId } : n)));
       if (!connection.pageInfo.hasNextPage) return rows.length === total
-        ? { ...pr, statusCheckRollup: rows, rowsComplete: true } : unresolved;
+        ? { ...pr, statusCheckRollup: rows, rowsComplete: true, rowsHead: commit.oid } : unresolved;
       after = connection.pageInfo.endCursor;
       if (typeof after !== 'string' || !after || cursors.has(after)) return unresolved;
       cursors.add(after);
@@ -1510,7 +1518,7 @@ export function retainCheckedQueueHead(pr, { requiredCheck = 'test', queueRequir
   requiredNames = queueRequiredChecks, rosterSource, expectedHeadSha, holds = [], ...options } = {}) {
   if (!pr || pr.requiredCheckReadError || !Array.isArray(queueRequiredChecks) || !Array.isArray(requiredNames)) return pr;
   const required = [...new Set([...requiredNames, requiredCheck, ...queueRequiredChecks])];
-  if (resolveRequiredChecks({ rows: pr.statusCheckRollup, rowsHead: pr.headRefOid,
+  if (resolveRequiredChecks({ rows: pr.statusCheckRollup, rowsHead: pr.rowsHead,
     rowsComplete: pr.rowsComplete, requiredNames: required, rosterSource,
     head: expectedHeadSha ?? pr.headRefOid, holds }).state !== 'pass') return pr;
   return retainApprovedHumanQueueHead(pr, options);
@@ -2410,7 +2418,7 @@ export function buildDrainVerdicts({ prsByRepo, readOf, repos = [], requiredChec
     for (const p of prs) {
       const read = (typeof readOf === 'function' ? readOf(repo, p.number) : null) || {};
       p.commits = read.commits || [];
-      const v = classifyPr(p, { preparePendingCi: preparePendingCi && isLocalRepo(repo), queueRequiredChecks: queueRequiredChecksOf(repo), requiredCheck, allowPendingReview: (relief.prs || []).includes(Number(p.number)) || (relief.passWide && !!label), defaultBranch: (typeof defaultBranchOf === 'function' ? defaultBranchOf(repo) : null) || null });
+      const v = classifyPr(p, { preparePendingCi: preparePendingCi && isLocalRepo(repo), queueRequiredChecks: queueRequiredChecksOf(repo), requiredCheck, allowPendingReview: (relief.prs || []).includes(Number(p.number)) || (relief.passWide && !!label), defaultBranch: typeof defaultBranchOf === 'function' ? defaultBranchOf(repo) : null });
       // #2502 — the tip commit's SHA, threaded onto every emitted verdict and, via the `{...v}` spread used to
       // build `remaining`/`plan.ready`/`plan.deferred`, onto each of the six result buckets a caller (the
       // drain-daemon stuck detector) actually reads: toMerge/merged/skipped/parked/deferred/failed — NOT
@@ -4021,6 +4029,42 @@ export function parseNumstat(numstat) {
   return { changedFiles, diffLines };
 }
 
+// Keep injected exec's (command, argv, options) contract; isolate all net-diff Git reads.
+function netDiffGit(exec, args, opts = {}) {
+  const measuresDiff = args[0] === 'diff' || args[0] === 'log';
+  const flags = measuresDiff ? ['--no-textconv', '--no-ext-diff', '--no-color'] : [];
+  const config = ['-c', 'core.quotepath=false', '-c', 'color.ui=never',
+    '-c', 'diff.noprefix=false', '-c', 'diff.external=',
+    '-c', 'diff.srcPrefix=a/', '-c', 'diff.dstPrefix=b/', '-c', 'diff.mnemonicPrefix=false',
+    '-c', 'core.attributesFile=/dev/null'];
+  const env = { ...process.env, GIT_NO_REPLACE_OBJECTS: '1', GIT_GRAFT_FILE: '/dev/null',
+    GIT_ATTR_NOSYSTEM: '1', GIT_ATTR_SOURCE: '4b825dc642cb6eb9a060e54bf8d69288fbee4904' };
+  let diffCwd;
+  const run = () => exec('git', [...config, args[0], ...flags, ...args.slice(1)],
+    { ...opts, ...(diffCwd ? { cwd: diffCwd } : {}), env });
+  if (!measuresDiff) return run();
+
+  // GIT_ATTR_SOURCE (Git >= 2.43) excludes committed attributes, but NOT info/attributes.
+  // Give diff/log a private common directory with the same objects/refs/config and no info directory.
+  // An empty worktree/index also excludes tree attributes on older Git, which ignores GIT_ATTR_SOURCE.
+  // Never rename or rewrite the checkout's attributes: other readers may be using that checkout.
+  const [common, gitDir] = String(exec('git', [...config, 'rev-parse', '--path-format=absolute', '--git-common-dir', '--absolute-git-dir'],
+    { ...opts, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], env }) || '').trim().split('\n');
+  if (!common || !isAbsolute(common) || !gitDir || !isAbsolute(gitDir)) throw new Error('net-diff common directory unresolved');
+  const scratch = mkdtempSync(join(tmpdir(), 'net-diff-attributes-'));
+  try {
+    for (const entry of ['objects', 'refs', 'packed-refs', 'shallow', 'config', 'config.worktree', 'reftable']) {
+      symlinkSync(join(common, entry), join(scratch, entry));
+    }
+    diffCwd = scratch;
+    env.GIT_DIR = gitDir;
+    env.GIT_COMMON_DIR = scratch;
+    env.GIT_WORK_TREE = scratch;
+    env.GIT_INDEX_FILE = join(scratch, 'index');
+    return run();
+  } finally { rmSync(scratch, { recursive: true, force: true }); }
+}
+
 /**
  * #2390-review-fix — is `ancestor` a STRICT ancestor of `descendant` (an ancestor, AND not the same commit)?
  * Used to gate the stacked-lane SIZE de-inflation: a self-declared/mis-set `base` is trusted for `base…head`
@@ -4031,11 +4075,11 @@ export function parseNumstat(numstat) {
  */
 function isStrictAncestor(exec, ancestor, descendant) {
   try {
-    exec('git', ['merge-base', '--is-ancestor', '--end-of-options', ancestor, descendant], { stdio: ['ignore', 'ignore', 'ignore'] });
+    netDiffGit(exec, ['merge-base', '--is-ancestor', '--end-of-options', ancestor, descendant], { stdio: ['ignore', 'ignore', 'ignore'] });
   } catch { return false; } // non-zero exit (not an ancestor) or unresolvable → don't trust the base
   try {
-    const a = String(exec('git', ['rev-parse', '--verify', '--end-of-options', ancestor], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }) || '').trim();
-    const b = String(exec('git', ['rev-parse', '--verify', '--end-of-options', descendant], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }) || '').trim();
+    const a = String(netDiffGit(exec, ['rev-parse', '--verify', '--end-of-options', ancestor], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }) || '').trim();
+    const b = String(netDiffGit(exec, ['rev-parse', '--verify', '--end-of-options', descendant], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }) || '').trim();
     if (a && b && a === b) return false; // base == head → degenerate empty own-delta, reject
   } catch { /* can't resolve to SHAs → is-ancestor already vouched it's a distinct ancestor path */ }
   return true;
@@ -4179,7 +4223,7 @@ function basisAnswersRequest(basis, { remote, base, rev }) {
 function ancestryNetDiff(exec, baseRef, candidate) {
   let parsed;
   try {
-    parsed = parseNumstat(exec('git', ['log', '--numstat', '--diff-merges=first-parent', '--pretty=format:', '--end-of-options', `${baseRef}..${candidate}`, '--'], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }));
+    parsed = parseNumstat(netDiffGit(exec, ['log', '--numstat', '--diff-merges=first-parent', '--pretty=format:', '--end-of-options', `${baseRef}..${candidate}`, '--'], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }));
   } catch (err) {
     if (isExecContractError(err)) throw err; // let the caller's own contract short-circuit classify it
     return null; // git can't answer (old git, unresolvable range) — caller keeps the base-tip basis
@@ -4221,21 +4265,31 @@ export function resolveNetDiffBasis({ exec, remote = 'origin', base = 'main', re
   // own `'ref-unresolved'` either (that reads as "this branch is gone", which is a different fact).
   const requestedFor = { remote, base, rev: rev || null };
   if (typeof exec !== 'function' || !rev) return { ok: false, reason: 'ref-unresolved', requestedFor };
-  const baseRef = `${remote}/${base}`;
+  let baseRef;
   try {
     // ALWAYS force-update the base tracking-ref (#2373 opportunistic-fetch fix): the cumulative human-gate basis
     // below is `<remote>/<base>…head`, which a stacked `baseRev` must never be able to shrink (#2390-review-fix).
     // `--end-of-options` FIRST: `fetchExtraRefs` carries a branch name straight off the `gh` API, and a
     // dash-leading refname is legal (`git check-ref-format 'refs/heads/--output=/tmp/pwn'` exits 0), so without
     // the guard git parses it as an option — `--upload-pack=<script>` EXECUTES. Verified against git 2.50.1.
-    exec('git', ['fetch', '--quiet', '--end-of-options', remote, `+${base}:refs/remotes/${remote}/${base}`, ...fetchExtraRefs], { stdio: ['ignore', 'ignore', 'ignore'] });
+    netDiffGit(exec, ['fetch', '--quiet', '--end-of-options', remote, `+${base}:refs/remotes/${remote}/${base}`, ...fetchExtraRefs], { stdio: ['ignore', 'ignore', 'ignore'] });
   } catch (err) {
     // #2952 — a shape-violating exec fails EVERY call the same way; bail immediately rather than degrade to
     // "whatever is locally cached", which would just re-throw on the very next call below.
     if (isExecContractError(err)) return { ok: false, reason: 'exec-contract', requestedFor };
-    /* a real fetch failure degrades to whatever is locally cached — the diff attempts below still run */
+    return { ok: false, reason: 'fetch-failed', requestedFor };
   }
-  const candidates = [`${remote}/${rev}`, rev];
+  const shaRev = /^[0-9a-f]{40}$/i.test(rev);
+  try {
+    baseRef = String(netDiffGit(exec, ['rev-parse', '--verify', '--end-of-options',
+      `refs/remotes/${remote}/${base}^{commit}`], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }) || '').trim();
+    if (!/^[0-9a-f]{40}$/i.test(baseRef)) return { ok: false, reason: 'ref-unresolved', requestedFor };
+    if (shaRev) netDiffGit(exec, ['cat-file', '-e', `${rev}^{commit}`], { stdio: ['ignore', 'ignore', 'ignore'] });
+  } catch (err) {
+    return { ok: false, reason: isExecContractError(err) ? 'exec-contract' : 'ref-unresolved', requestedFor };
+  }
+  // Branch callers retain remote-first lookup; exact commit requests never try a ref alias.
+  const candidates = shaRev ? [rev] : [`${remote}/${rev}`, rev];
   for (const candidate of candidates) {
     // #2404 — narrow the LEFT side of the diff to the provable fork point (`merge-base(baseRef, candidate)`)
     // when one exists, instead of diffing straight off the base tip: a head that's behind an advanced base
@@ -4252,7 +4306,7 @@ export function resolveNetDiffBasis({ exec, remote = 'origin', base = 'main', re
       // newline in a would-be single revision arg, making it an invalid `git diff` argument (a "continue" to
       // the next candidate, or a `null` resolve if both candidates hit it — always the safe over-scoring
       // fallback, never wrong data, but avoidable).
-      const mb = String(exec('git', ['merge-base', '--end-of-options', baseRef, candidate], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }) || '').split('\n')[0].trim();
+      const mb = String(netDiffGit(exec, ['merge-base', '--end-of-options', baseRef, candidate], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }) || '').split('\n')[0].trim();
       if (mb) { diffBase = mb; basisKind = 'merge-base'; }
     } catch (err) {
       if (isExecContractError(err)) return { ok: false, reason: 'exec-contract', requestedFor };
@@ -4265,7 +4319,7 @@ export function resolveNetDiffBasis({ exec, remote = 'origin', base = 'main', re
       // Verified on git 2.50.1: unguarded, `git diff --numstat <base> '--output=<path>'` exits 0 and WRITES that
       // file, and the swallowed numstat then reads EMPTY while the candidate still resolves — a zero blast-radius
       // score for a PR about to land, the exact de-inflation the #2390-review-fix comments assert is impossible.
-      humanBasis = parseNumstat(exec('git', ['diff', '--numstat', '--end-of-options', diffBase, candidate], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }));
+      humanBasis = parseNumstat(netDiffGit(exec, ['diff', '--numstat', '--end-of-options', diffBase, candidate], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }));
     } catch (err) {
       if (isExecContractError(err)) return { ok: false, reason: 'exec-contract', requestedFor };
       continue; /* candidate doesn't resolve — try the next one */
@@ -4319,7 +4373,7 @@ export function computeNetDiffChangedFiles({ exec, remote = 'origin', base = 'ma
     // refname. Every argv position in this file that takes a caller-supplied ref is now guarded; `merge-base`
     // and `rev-parse` are hardening rather than live holes (both reject an unknown option on git 2.50.1, and
     // the surrounding catch absorbs it), while the `git diff` positions are genuinely exploitable — verified.
-    try { own = parseNumstat(exec('git', ['diff', '--numstat', '--end-of-options', baseRev, candidate], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] })); }
+    try { own = parseNumstat(netDiffGit(exec, ['diff', '--numstat', '--end-of-options', baseRev, candidate], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] })); }
     catch { own = humanBasis; /* own-delta diff failed → fall back to the cumulative basis */ }
   }
   // #3343 — the basis's `basisKind` / `basisNarrowed` are DELIBERATELY not re-exported here. This function's
@@ -4369,13 +4423,13 @@ export function computeNetDiffText({ exec, remote = 'origin', base = 'main', rev
   let revSha;
   if (pinRev) {
     try {
-      revSha = String(exec('git', ['rev-parse', '--verify', '--end-of-options', `${candidate}^{commit}`],
+      revSha = String(netDiffGit(exec, ['rev-parse', '--verify', '--end-of-options', `${candidate}^{commit}`],
         { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }) || '').trim().toLowerCase();
       if (!/^[0-9a-f]{40,64}$/.test(revSha)) return { ...unscored, reason: 'diff-failed' };
-      // Only the fork-point basis can be pinned on BOTH sides: a `base-tip` / `ancestry` basis diffs against the moving
-      // `<remote>/<base>` NAME, which is an unpinned ref read next to the stamp — it is unscored here (fail closed).
+      // Preserve pinRev's fork-point-only contract: ancestry/base-tip measurements are not
+      // interchangeable with a narrowed two-tree text diff, even with the base pinned to a SHA.
       if (basis.basisKind !== 'merge-base') return { ...unscored, reason: 'diff-failed' };
-      diffBase = String(exec('git', ['merge-base', '--end-of-options', basis.baseRef, revSha],
+      diffBase = String(netDiffGit(exec, ['merge-base', '--end-of-options', basis.baseRef, revSha],
         { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }) || '').split('\n')[0].trim();
       if (!/^[0-9a-f]{40,64}$/i.test(diffBase)) return { ...unscored, reason: 'diff-failed' };
       candidate = revSha;
@@ -4385,6 +4439,7 @@ export function computeNetDiffText({ exec, remote = 'origin', base = 'main', rev
   }
   try {
     // Same guard, same reason — this is the reviewer-facing diff TEXT, off the same caller-supplied candidate.
+    // Disable text conversion as well as external diffs: evidence must be the raw patch.
     // #2890-review-r2 finding 2b — `--no-ext-diff`. A `diff.external` in the caller's git config, or a
     // `GIT_EXTERNAL_DIFF` inherited from the developer's environment (delta, difftastic — both common), REPLACES
     // git's own diff output wholesale: verified, a one-line external driver made this return
@@ -4393,7 +4448,7 @@ export function computeNetDiffText({ exec, remote = 'origin', base = 'main', rev
     // Deliberately NOT `--text`: unlike the single-file write-time diff, this is a whole-PR diff and forcing
     // binary blobs into it would splat megabytes of asset bytes into the reviewer-facing text (see
     // `diff-hunks.mjs`, where `--text` is right precisely because the payload is one bounded file).
-    const text = String(exec('git', ['diff', '--no-ext-diff', '--end-of-options', diffBase, candidate], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }) || '');
+    const text = String(netDiffGit(exec, ['diff', '--src-prefix=a/', '--dst-prefix=b/', '--end-of-options', diffBase, candidate], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }) || '');
     return { text, base: diffBase, rev: candidate, scored: true, ...(revSha ? { revSha } : {}) };
   } catch (err) {
     // the text diff failed even though the basis resolved → caller falls back to `gh pr diff`
@@ -4446,10 +4501,10 @@ export function readNetDiffAtHead({ exec, headSha, headRef = null, netDiff = com
  * @returns {{changedFiles:string[], diffLines:number, humanBasisFiles:string[], cumulativeDiffLines:number,
  *   scored:boolean, netDiffText:{text:string,scored:boolean,reason?:string}, diffHunks:string|null}}
  */
-export function computeNetDiffSignals({ exec, remote = 'origin', base = 'main', baseRev = null, rev, fetchExtraRefs = [] } = {}) {
+export function computeNetDiffSignals({ exec, remote = 'origin', base = 'main', baseRev = null, rev, fetchExtraRefs = [], pinRev = false } = {}) {
   const basis = resolveNetDiffBasis({ exec, remote, base, rev, fetchExtraRefs });
   const net = computeNetDiffChangedFiles({ exec, remote, base, baseRev, rev, fetchExtraRefs, basis });
-  const netDiffText = computeNetDiffText({ exec, remote, base, rev, fetchExtraRefs, basis });
+  const netDiffText = computeNetDiffText({ exec, remote, base, rev, fetchExtraRefs, basis, pinRev });
   return {
     changedFiles: net.changedFiles,
     diffLines: net.diffLines,
@@ -4506,7 +4561,7 @@ export function computeNetDiffPaths({ exec, remote = 'origin', base = 'main', re
   if (!basis.ok) return { ...unscored, reason: basis.reason };
   const { diffBase, candidate } = basis;
   try {
-    const raw = exec('git', ['diff', '--name-only', '-z', '--end-of-options', `${diffBase}..${candidate}`], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
+    const raw = netDiffGit(exec, ['diff', '--name-only', '-z', '--end-of-options', `${diffBase}..${candidate}`], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
     const paths = String(raw || '').split('\0').filter(Boolean);
     return { paths, base: diffBase, rev: candidate, scored: true };
   } catch (err) {
@@ -4995,6 +5050,7 @@ export async function main(argv, { env = process.env, stdout = process.stdout, e
   // it is never listed twice (B8). For the common full-constellation drain (REPOS === the constellation) this is a
   // no-op — no extra listings.
   const CONTEXT_REPOS = resolveContextRepos(REPOS, localSlug);
+  let fastContextRows = null;
   // #2458 — THIS run's repo scope (`null` = the cwd repo → normalize to localSlug), recorded in the drain
   // lease so a differently-scoped launch can tell whether the holder actually covers its repos.
   const leaseScope = [...new Set(REPOS.map((r) => r || localSlug).filter(Boolean))].sort();
@@ -5031,6 +5087,7 @@ export async function main(argv, { env = process.env, stdout = process.stdout, e
   // (read-only, no gh call); the old 100 when there is no snapshot to size from (first pass, tests, cwd repo).
   const candidateListLimit = (repo) => { const n = repo ? snapshotOpenCount(repo) : null; return n == null ? 100 : Math.min(100, nextLimit(n)); };
   const isLocalRepo = (repo) => repo == null || repo === localSlug; // git-side ops only run against the local clone
+  const fastContextEnabled = REPOS.some(isLocalRepo) && useFastDrainContext({ onlyPr, fromGreenEvent: flags['from-green-event'], onlyRepo, localSlug, ...fastDrainListing });
   const isFastDrainTarget = (repo, p) => REPOS.includes(repo) && matchesOnlyTarget({ prNumber: p.number, onlyPr, repo, onlyRepo, isLocal: isLocalRepo(repo), repoCount: REPOS.length });
   const fastDrainPrs = (repo, prs) => filterToFastDrainTarget(prs, { onlyPr, scope: fastDrain.scope, isTarget: (p) => isFastDrainTarget(repo, p) });
   const repoTag = (repo) => (repo && repo !== localSlug ? `${repo.split('/').pop()}#` : '#'); // display prefix per PR
@@ -5257,8 +5314,13 @@ export async function main(argv, { env = process.env, stdout = process.stdout, e
       updateStuckUnknown(pruned);
       attachLiveFixClaim(data, { claimKey: repoKeyForSlug(repo ?? localSlug), readClaim: readLiveFixClaim });
       const resolved = await resolveChecks(repo, data);
+      // Flattened `gh pr view` rows carry no completeness or head provenance.
+      // Revalidation must use the same complete, head-scoped read as pre-stage.
+      const checks = readReviewChecks({ repo: repo || localSlug, headSha: data.headRefOid });
+      const hydrated = { ...resolved, statusCheckRollup: checks,
+        rowsComplete: checks.rowsComplete, rowsHead: checks.rowsHead };
       return data.mergeStateStatus === 'BEHIND' && mergeStrategy.queueOwnsFreshness(repo)
-        ? readFreshQueueRollup(resolved, { repo: repo || localSlug }) : resolved;
+        ? readFreshQueueRollup(hydrated, { repo: repo || localSlug }) : hydrated;
     } catch { return null; }
   };
   // Live 2026-10-09 — a transient UNKNOWN (GitHub recomputing after this cascade's own previous merge) is
@@ -5384,14 +5446,19 @@ export async function main(argv, { env = process.env, stdout = process.stdout, e
   // unfiltered open-PR context, and the (possibly `--label`-scoped) merge-candidate sweep.
   const ctxReadCache = new Map();   // collectOpenPrContext: (repo, num, sha + body) → { manifest, commits }
   const sweepReadCache = new Map(); // the merge-candidate loop: (repo, num, sha + body) → { commits, manifest }
-  // #3674 — each swept repo's default branch (`gh repo view --json defaultBranchRef`), resolved once per run and
-  // reused across `--watch` passes. A failed read stays unresolved (retried next pass) and leaves the
-  // non-default-base arm inert for that repo, so the chain degrades to its pre-#3674 behaviour, never to a land.
+  // Listing hints have no merge authority. Every runtime gate uses only this process's live read.
+  const defaultBranchHintsByRepo = new Map();
   const defaultBranchByRepo = new Map();
-  // #3383 — a REAL local binding (not just the `defaultBranchOf:` shorthand-property below, which only names a
-  // VALUE inside the `prepareDrainVerdicts` call's argument object and is invisible everywhere else in this
-  // closure). The stacked-PR retarget call further down needs the SAME lookup by NAME, not re-derived.
-  const defaultBranchOf = (repo) => defaultBranchByRepo.get(repo) ?? null;
+  const defaultBranchOf = repo => defaultBranchByRepo.get(repo || localSlug) ?? null;
+  const verifyDefaultBranch = createLiveDefaultBranchReader({
+    map: defaultBranchByRepo,
+    readLive: async repo => {
+      const { stdout } = await execFileP('gh', ['repo', 'view', repo, '--json', 'defaultBranchRef', '--jq', '.defaultBranchRef.name'],
+        { encoding: 'utf8', timeout: 60_000, maxBuffer: 1024 * 1024 });
+      return stdout;
+    },
+    warn: (e, repo) => process.stderr.write(`  ⚠ ${repo}: default branch unresolved live (${String(e.message || e).split('\n')[0]}) — deferring merge/enqueue; retry on the next pass\n`),
+  });
   // #2417 review — returns `{ commits, degraded }`. `degraded:true` means the gh read THREW (a swallowed transient
   // failure): the empty `[]` is a fallback, not a confirmed "no commits", so `fetchPrReadsCached` declines to cache
   // it and re-fetches next `--watch` pass rather than latching an empty read for the head-SHA lifetime. Behaviour
@@ -5441,12 +5508,29 @@ export async function main(argv, { env = process.env, stdout = process.stdout, e
   // `--only` sweep filtered out of the candidate set is still visible for the couple gate's health read.
   // #4108 (converge round 1 v3, simplicity lens) — no default: the sole call site (below) always passes
   // `liveListingsByRepo` explicitly.
+  const fetchContextReads = async (flat) => {
+    const readsRaw = await fetchPrReadsCached(flat, {
+      cache: ctxReadCache,
+      keyOf: ({ repo, p }) => prCacheKey(repo, p.number),
+      shaOf: ({ p }) => prReadCacheIdentity(p),
+      isDegraded: (v) => !!v?.degraded || !!v?.transient, // #2417 review — an error-path or non-head read is NOT cached
+      fetchOne: async ({ repo, p }) => {
+        const readCommits = shouldReadContextCommits({ onlyPr, scope: fastDrain.scope, isTarget: isFastDrainTarget(repo, p) });
+        const [manifestRes, commitsRes] = await Promise.all([readPrManifest(repo, p.headRefName, p.body, p.number, prHeadSha(p)), readCommits ? fetchPrCommits(repo, p.number, prHeadSha(p)) : { degraded: false }]);
+        return shapeOpenPrRead({ manifestRes, commitsRes, includeCommits: readCommits });
+      },
+    });
+    const out = new Map();
+    for (const { repo, p } of flat) { const k = prCacheKey(repo, p.number); out.set(k, readsRaw.get(k)?.value || {}); }
+    return out;
+  };
   const collectContext = (liveByRepo, readLiveRowsByRepo) => collectOpenPrContext({
     contextRepos: CONTEXT_REPOS,
     reconcileRan: true,
     // #999/xq985wu F3 — `--limit OPEN_PR_LIST_LIMIT` (raised off the old silent 100). This listing is the SOLE
     // cross-item ordering source on a full sweep, so a truncated page is a MERGE-SAFETY hazard.
     listOpenPrs: async (repo) => {
+      if (fastContextRows?.has(repo)) return fastContextRows.get(repo);
       // #4108 — this repo was already listed LIVE this pass for the merge-candidate set below
       // (`SWEEP_LIST_FIELDS` widens that call to cover everything this context needs too) — reuse it instead of
       // a second `gh pr list` round-trip for the SAME repo, same pass. Only covers `repo`s in `REPOS`; a repo
@@ -5465,7 +5549,7 @@ export async function main(argv, { env = process.env, stdout = process.stdout, e
       if (slug) {
         let seed = [];
         try { seed = readSharedOpenPrs({ repo: slug, fields: 'number,updatedAt,headRefOid,body,files', caller: 'merge-ai-prs.mjs' }) || []; } catch { /* live read below remains authoritative */ }
-        const listed = withListRetry(() => listOpenPrsPagedHydrated({ repo: slug, exec: execFileSyncThrottled, paging: resolvePrListPaging(),
+        const listed = await withListRetry(() => listOpenPrsPagedHydrated({ repo: slug, exec: execFileSyncThrottled, execAsync: execFileP, paging: resolvePrListPaging(),
           heavyFields: ['body', 'files'], cache: drainHeavyCacheByRepo.get(repo) || {}, seed,
           maxRows: OPEN_PR_LIST_LIMIT, execOpts: { throttle: { op: 'pr list (drain context page)' } } }), { repo: slug, op: 'drain-context-list', daemon: 'drain' });
         drainHeavyCacheByRepo.set(repo, listed.cache);
@@ -5476,22 +5560,7 @@ export async function main(argv, { env = process.env, stdout = process.stdout, e
     },
     // #2417 — fan out the per-PR manifest + commits reads across ALL repos' open PRs at once (bounded pool), cached
     // across `--watch` passes on unchanged head SHA + body. Returns key→{manifest, commits, degraded}.
-    fetchReads: async (flat) => {
-      const readsRaw = await fetchPrReadsCached(flat, {
-        cache: ctxReadCache,
-        keyOf: ({ repo, p }) => prCacheKey(repo, p.number),
-        shaOf: ({ p }) => prReadCacheIdentity(p),
-        isDegraded: (v) => !!v?.degraded || !!v?.transient, // #2417 review — an error-path or non-head read is NOT cached
-        fetchOne: async ({ repo, p }) => {
-          const readCommits = shouldReadContextCommits({ onlyPr, scope: fastDrain.scope, isTarget: isFastDrainTarget(repo, p) });
-          const [manifestRes, commitsRes] = await Promise.all([readPrManifest(repo, p.headRefName, p.body, p.number, prHeadSha(p)), readCommits ? fetchPrCommits(repo, p.number, prHeadSha(p)) : { degraded: false }]);
-          return shapeOpenPrRead({ manifestRes, commitsRes, includeCommits: readCommits });
-        },
-      });
-      const out = new Map();
-      for (const { repo, p } of flat) { const k = prCacheKey(repo, p.number); out.set(k, readsRaw.get(k)?.value || {}); }
-      return out;
-    },
+    fetchReads: fetchContextReads,
     onListingFailed: (repo) => { process.stderr.write(`  ⚠️  FAILED open-PR listing for ${repoTag(repo) || 'cwd'}: gh pr list threw — the couple gate treats the open-PR context as INCOMPLETE this pass (fail closed; #xc7p3q9 B2).\n`); },
     onListingTruncated: (repo, n) => { if (!AS_JSON) process.stderr.write(`  ⚠️  DEGRADED open-PR listing for ${repoTag(repo) || 'cwd'}: ${n} PRs hit the --limit ${OPEN_PR_LIST_LIMIT} cap — the page MAY be truncated (oldest, longest-held blockers dropped first). The cross-item merge order derived from this listing is NOT trustworthy for the early-land decision this pass (#999/xq985wu F3).\n`); },
   }).then(context => backfillDrainReviewRuns(context, { localSlug }));
@@ -5667,11 +5736,13 @@ export async function main(argv, { env = process.env, stdout = process.stdout, e
   // emit/exit), so the watch loop can call it repeatedly. A gh-list failure still hard-fails (bad env).
   const drainHeavyCacheByRepo = new Map(); // Reuse heavy fields across --watch passes.
   const sweepOnce = async () => {
+  const __t = createStepTimer();
+  const __passStart = Date.now();
   // Shared by the full cascade and the green-event shortcut, including --json callers.
   let asyncShadow;
   let shadowObserved = false;
   if (!DRY_RUN) {
-    try { asyncShadow = createAsyncShadow(); } catch { /* Timing only. */ }
+    try { asyncShadow = __t.time('setup.other', () => createAsyncShadow()); } catch { /* Timing only. */ }
   }
   const summarizeAsyncShadow = (outcomes, candidates) => {
     try {
@@ -5685,7 +5756,7 @@ export async function main(argv, { env = process.env, stdout = process.stdout, e
       if (summary) process.stderr.write(`async-drain-shadow: summary n=${summary.n} median=${summary.medianDeltaMs == null ? 'null' : summary.medianDeltaMs / 1000}s p90=${summary.p90DeltaMs == null ? 'null' : summary.p90DeltaMs / 1000}s readyNotReached=${summary.readyNotReached}\n`);
     } catch { /* Best-effort timing only. */ }
   };
-  const approvedHeadSetting = resolveSkipRebaseApprovedHumanSurface();
+  const approvedHeadSetting = __t.time('setup.policy', () => resolveSkipRebaseApprovedHumanSurface());
   if (!AS_JSON) process.stderr.write(`  merge-queue: skipRebaseApprovedHumanSurface=${approvedHeadSetting.value} (${approvedHeadSetting.source})\n`);
   const rebaseBeforeEnqueue = resolveRebaseBeforeEnqueue(process.env, {
     platform: platformPreference('drain'), tool: readDeclaredDrainSettings()?.drain,
@@ -5716,7 +5787,7 @@ export async function main(argv, { env = process.env, stdout = process.stdout, e
       return false;
     }
   };
-  const prestageSetting = resolvePrestageSettings({ log: line => process.stderr.write(`${line}\n`) });
+  const prestageSetting = __t.time('setup.policy', () => resolvePrestageSettings({ log: line => process.stderr.write(`${line}\n`) }));
   // Prepared admission is still a candidate selection: honor the same resolved repo set and
   // operator label/base filters as listOne before consuming (or invalidating) a cached preparation.
   // The entry stores labels as their sorted-name signature; a missing entry falls through to the miss path.
@@ -5726,8 +5797,8 @@ export async function main(argv, { env = process.env, stdout = process.stdout, e
   if (!DRY_RUN && flags['from-green-event'] && onlyPr != null && String(Number(onlyPr)) === String(onlyPr) && !onlyRepo && REPOS.some(isLocalRepo) && mergeStrategy.enqueues(null)
       && (!prepared || operatorSelects({ ...prepared, labels: preparedLabels }))) {
     // The global stop-the-line signal can change independently of any PR head/label.
-    const freeze = redMainBypass ? null : await readDrainFreezePass();
-    const hold = redMainBypass ? null : drainFreezeSignal({ state: freeze, mainRedState: readMainRedState(), priority: readMainRedPriority(), now: Date.now(), holdOn: resolveRedMainHoldSetting().value === 'on' });
+    const freeze = redMainBypass ? null : await __t.timeAsync('setup.opsFetch', readDrainFreezePass);
+    const hold = redMainBypass ? null : __t.time('setup.opsFetch', () => drainFreezeSignal({ state: freeze, mainRedState: readMainRedState(), priority: readMainRedPriority(), now: Date.now(), holdOn: __t.time('setup.policy', () => resolveRedMainHoldSetting()).value === 'on' }));
     const blocked = hold?.red && decideRedMainHold({ num: onlyPr, isLocal: true, signal: hold, setting: 'on' }).hold;
     passMainFix = mainFixFrom(hold);
     let prestageShadowCandidate;
@@ -5740,19 +5811,26 @@ export async function main(argv, { env = process.env, stdout = process.stdout, e
         // scope is not stale: throwing falls back without dropping it (a null read would invalidate it).
         if (!operatorSelects(pr)) throw new Error('PR outside this run\'s --label/--base selection');
         // The same full `--check` read the listing and the pre-merge re-read use: gh caps the rollup at 100 contexts.
-        return attachLiveFixClaim(await resolveChecks(null, pr), { claimKey: repoKeyForSlug(localSlug), readClaim: readLiveFixClaim });
+        const resolved = await resolveChecks(null, pr);
+        const checks = readReviewChecks({ repo: localSlug, headSha: pr.headRefOid });
+        return attachLiveFixClaim({ ...resolved, statusCheckRollup: checks,
+          rowsComplete: checks.rowsComplete, rowsHead: checks.rowsHead },
+        { claimKey: repoKeyForSlug(localSlug), readClaim: readLiveFixClaim });
       },
       withLock: fn => withLandWriteLock(fn, { runUnlockedOnContention: false }),
       fixClaimHeld: () => prestageFixClaimHeld(onlyPr, { claimKey: repoKeyForSlug(localSlug) }),
-      // The cached base was verified unchanged, and preparation required it to be the default branch.
-      beforeEnqueue: (c, sha, entry) => {
+      // Preparation's branch is only a hint; this process must verify before any enqueue authorization.
+      beforeEnqueue: async (c, sha, entry) => {
+        const liveBranch = await __t.timeAsync('gate.defaultBranch', () => verifyDefaultBranch(c.repo || localSlug));
+        const hold = defaultBranchHold(entry.baseRefName, liveBranch);
+        if (hold) throw new Error(hold);
         prestageShadowCandidate = { repo: c.repo || localSlug, num: c.num, headSha: sha };
         // Eligibility was just checked live. No label reads are added for telemetry.
         try {
           asyncShadow?.observePass({ candidates: [prestageShadowCandidate], observedPrs: [prestageShadowCandidate] });
           shadowObserved = true;
         } catch { /* Timing only. */ }
-        return announceAndRetargetBeforeLand(c, { preread: fetchPrComments(c.repo, c.num), defaultBranch: entry.baseRefName });
+        return announceAndRetargetBeforeLand(c, { preread: fetchPrComments(c.repo, c.num), defaultBranch: liveBranch });
       },
       enqueue: (c, sha, entry) => enqueueWithSameHeadGuard(c, sha, { prepared: entry.queueAdmission, comments: entry.queueAdmission.comments }, approvedHeadHold, asyncShadow),
       recordLanded: recordLandedLedgerFacts,
@@ -5770,20 +5848,57 @@ export async function main(argv, { env = process.env, stdout = process.stdout, e
   }
   // xym8nt4 — the repair PRs as of pass start, BEFORE the heal/rebase steps consult card-group membership (the
   // red-main hold below refreshes it with the freeze applied). Records only: a manual freeze is re-read there.
-  passMainFix = !redMainBypass && resolveRedMainHoldSetting().value === 'on'
-    ? mainFixFrom(drainFreezeSignal({ state: {}, mainRedState: readMainRedState(), priority: readMainRedPriority(), now: Date.now(), holdOn: true }))
+  passMainFix = !redMainBypass && __t.time('setup.policy', () => resolveRedMainHoldSetting()).value === 'on'
+    ? __t.time('setup.opsFetch', () => mainFixFrom(drainFreezeSignal({ state: {}, mainRedState: readMainRedState(), priority: readMainRedPriority(), now: Date.now(), holdOn: true })))
     : new Set();
   // Keep listing, bare-loop and review-escalation policy on one fresh snapshot per pass.
-  const workflowEditSetting = resolveDrainWorkflowEditHuman();
+  const workflowEditSetting = __t.time('setup.policy', () => resolveDrainWorkflowEditHuman());
   process.stderr.write(`policy · drainWorkflowEditHuman=${workflowEditSetting.value} (${workflowEditSetting.source})\n`);
   const workflowReadOptions = (v) => ({ files: v.listedFiles, filesComplete: v.listedFilesComplete,
     listedHeadSha: v.listedHeadSha, workflowEditSetting: workflowEditSetting.value,
     local: isLocalRepo(v.repo), defaultBranch: defaultBranchOf(v.repo) });
-  // x2e120n — this pass's own step timer + wall-clock start. See pass-timings.mjs's header for the full
+  // x2e120n — the pass timer starts at sweepOnce entry, including setup. See pass-timings.mjs's header for the full
   // rationale; the short version: attach `result.timings` + print one unconditional stderr summary line so
   // "why is a pass slow" has a real breakdown instead of a single opaque `ms`.
-  const __t = createStepTimer();
-  const __passStart = Date.now();
+  fastContextRows = null;
+  // The same full target read serves both listing paths. Comments remain at the writer-contract gate.
+  const readFullListingPr = async (repo, num, fullContext = false) => {
+    const fields = fullContext || RECONCILE ? SWEEP_LIST_FIELDS
+      : CANDIDATE_ONLY_FIELDS + (workflowEditSetting.value !== 'off' ? ',files' : '');
+    const { stdout } = await execFileP('gh', ['pr', 'view', String(num), '--repo', repo || localSlug, '--json', `${fields},updatedAt,state`],
+      { encoding: 'utf8', maxBuffer: 64 * 1024 * 1024 });
+    const pr = JSON.parse(stdout.trim() || 'null');
+    return pr ? (await resolveListedChecks(repo, [pr]))[0] : null;
+  };
+  if (fastContextEnabled) {
+    // Canonical slugs here; the rest of the drain retains its cwd/null repo sentinel.
+    const slugs = [...new Set(CONTEXT_REPOS.map(repo => repo || localSlug))];
+    const rows = await __t.timeAsync('listing', () => readFastDrainContext({ repos: slugs, targetRepo: localSlug, onlyPr,
+      readSnapshot: repo => readSharedOpenPrs({ repo, fields: `${SWEEP_LIST_FIELDS},updatedAt,rowsHead,rowsComplete`, caller: 'merge-ai-prs.mjs', cacheOnly: true }),
+      listLean: repo => listLeanOpenPrsPaged({ repo,
+        readPage: async query => {
+          const { stdout } = await execFileP('gh', ['api', 'graphql', '-f', `query=${query}`],
+            { encoding: 'utf8', maxBuffer: 64 * 1024 * 1024, timeout: 60_000, env: { ...process.env, GH_REPO: repo } });
+          return stdout;
+        },
+      }),
+      readFull: (repo, num) => readFullListingPr(repo, num, true),
+      readManifests: async entries => {
+        // Reuse the normal bounded manifest/commit reader and its identity cache; collectContext
+        // then consumes these same reads instead of repeating the legacy-manifest fan-out.
+        const flat = entries.map(({ repo, p }) => ({ repo: CONTEXT_REPOS.find(r => (r || localSlug) === repo), p }));
+        const reads = await fetchContextReads(flat);
+        return new Map(flat.map(({ repo, p }) => {
+          const r = reads.get(prCacheKey(repo, p.number));
+          if (!r || r.degraded || r.transient || r.malformed) throw new Error('manifest evidence incomplete');
+          return [fastDrainPrKey(repo || localSlug, p.number), r.manifest];
+        }));
+      },
+      readGroups: () => { const path = resolveCardGroupStatePath(); return path ? readGroupState(path) : { groups: [] }; },
+      time: (phase, fn) => __t.timeAsync(phase, fn), log: line => process.stderr.write(`${line}\n`),
+    }));
+    if (rows) fastContextRows = new Map([...new Set([...CONTEXT_REPOS, ...REPOS])].map(repo => [repo, rows.get(repo || localSlug)]));
+  }
   // #2257 — collect + classify across EVERY repo in the sweep set into ONE global candidate list. PR numbers
   // are per-repo (WE #10 ≠ FUI #10), so each verdict carries its own `repo` + head ref instead of a
   // number-keyed cross-repo map. The single list is what lets the cascade honour cross-repo `blockedBy`.
@@ -5805,6 +5920,10 @@ export async function main(argv, { env = process.env, stdout = process.stdout, e
   // SEQUENTIAL (not concurrent) full round-trips for the identical open-PR set every pass RECONCILE is on —
   // the double-listing this item closes.
   const listOne = async (repo) => {
+    if (fastContextRows?.has(repo)) {
+      const rows = fastContextRows.get(repo);
+      return { repo, rows, prs: rows.filter(operatorSelects), listing: 'live', complete: true };
+    }
     // #no-label-search (2026-09-27 live incident) — `gh pr list --label` is served by GitHub's issue-SEARCH
     // index, a separate, much smaller budget than the ordinary GraphQL list this call already is. The drain
     // failed every pass on "API rate limit already exceeded" from THAT bucket while the real GraphQL budget
@@ -5828,14 +5947,7 @@ export async function main(argv, { env = process.env, stdout = process.stdout, e
       const slug = repo || localSlug;
       let listed = {};
       const roundPath = listingSnapshot && isFastDrainTarget(repo, { number: onlyPr }) ? listingSnapshot : null;
-      const fields = RECONCILE ? SWEEP_LIST_FIELDS
-        : CANDIDATE_ONLY_FIELDS + (workflowEditSetting.value !== 'off' ? ',files' : '');
-      const readTarget = () => __t.timeAsync('listing.target', async () => {
-        const { stdout } = await execFileP('gh', ['pr', 'view', String(onlyPr), '--repo', slug, '--json', `${fields},updatedAt,state`],
-          { encoding: 'utf8', maxBuffer: 64 * 1024 * 1024 });
-        const target = JSON.parse(stdout.trim() || 'null');
-        return target ? (await resolveListedChecks(repo, [target]))[0] : null;
-      });
+      const readTarget = () => __t.timeAsync('listing.target', () => readFullListingPr(repo, onlyPr));
       const listLive = async () => {
         let snapshotSeed;
         // Snapshot rows seed heavy fields only. The open set must still be listed live:
@@ -5867,7 +5979,7 @@ export async function main(argv, { env = process.env, stdout = process.stdout, e
             // listing (60-200 s) inside the pass. The seed never decides the open set: the live listing does.
             try { seed = __t.time('listing.seed', () => readSharedOpenPrs({ repo: slug, fields: 'number,updatedAt,headRefOid,body,files', caller: 'merge-ai-prs.mjs', cacheOnly: true })) || []; } catch { seed = []; }
           }
-          listed = __t.time('listing.pages', () => withListRetry(() => listOpenPrsPagedHydrated({ repo: slug, exec: execFileSyncThrottled, paging,
+          listed = await __t.timeAsync('listing.pages', () => withListRetry(() => listOpenPrsPagedHydrated({ repo: slug, exec: execFileSyncThrottled, execAsync: execFileP, paging,
             heavyFields, needsHeavy: RECONCILE ? () => true : operatorSelects, cache: drainHeavyCacheByRepo.get(repo) || {}, seed,
             maxRows: OPEN_PR_LIST_LIMIT, execOpts: { throttle: { op: 'pr list (drain page)' } } }), { repo: slug, op: 'drain-list', daemon: 'drain' }));
           drainHeavyCacheByRepo.set(repo, listed.cache);
@@ -5881,12 +5993,12 @@ export async function main(argv, { env = process.env, stdout = process.stdout, e
         return __t.timeAsync('listing.checks', () => resolveListedChecks(repo, listed.rows));
       };
       const rows = roundPath && slug
-        ? await readFastDrainRoundListing({ path: roundPath, repo: slug, onlyPr, readTarget, requireDefaultBranch: true,
+        ? await readFastDrainRoundListing({ path: roundPath, repo: slug, onlyPr, readTarget, requireDefaultBranch: false,
           defaultBranch: async () => {
             await __t.timeAsync('listing.defaultBranch', () => resolveDefaultBranch(repo));
-            return defaultBranchByRepo.get(repo) ?? null;
+            return defaultBranchHintsByRepo.get(repo) ?? null;
           },
-          reuseDefaultBranch: name => { if (typeof name === 'string' && name.trim()) defaultBranchByRepo.set(repo, name); },
+          reuseDefaultBranch: name => { if (typeof name === 'string' && name.trim()) defaultBranchHintsByRepo.set(repo, name); },
           listLive })
         : await listLive();
       const listedRows = Array.isArray(rows) ? rows : [];
@@ -5900,24 +6012,16 @@ export async function main(argv, { env = process.env, stdout = process.stdout, e
     }
     catch (e) { return { repo, err: describeGhListError(e) }; }
   };
-  const resolveDefaultBranch = async (repo) => {
-    if (defaultBranchByRepo.has(repo)) return;
-    if (listingSnapshot && isFastDrainTarget(repo, { number: onlyPr })) {
-      const snap = readFastDrainRoundSnapshot({ path: listingSnapshot, repo: repo || localSlug });
-      if (typeof snap?.defaultBranch === 'string' && snap.defaultBranch.trim()) {
-        defaultBranchByRepo.set(repo, snap.defaultBranch);
-        return;
-      }
-    }
-    try {
-      const { stdout } = await execFileP('gh', ['repo', 'view', ...(repo ? [repo] : []), '--json', 'defaultBranchRef', '--jq', '.defaultBranchRef.name'], { encoding: 'utf8' });
-      const name = stdout.trim();
-      if (name) defaultBranchByRepo.set(repo, name);
-    } catch (e) {
-      if (!AS_JSON) process.stderr.write(`  ⚠ ${repo || 'cwd repo'}: default branch unresolved (${String(e.message || e).split('\n')[0]}) — the non-default-base hold is off for it this pass (#3674)\n`);
-    }
-  };
-  let [listings] = await __t.timeAsync('listing', () => Promise.all([mapWithConcurrency(REPOS, REPOS.length, listOne), __t.timeAsync('listing.defaultBranch', () => Promise.all(REPOS.filter(repo => !(listingSnapshot && isFastDrainTarget(repo, { number: onlyPr }))).map(resolveDefaultBranch)))]));
+  const resolveDefaultBranch = (repo) => resolveCachedDefaultBranch({
+    repo: repo || localSlug, key: repo, map: defaultBranchHintsByRepo,
+    readRound: () => listingSnapshot && isFastDrainTarget(repo, { number: onlyPr })
+      ? readFastDrainRoundDefaultBranch({ path: listingSnapshot, repo: repo || localSlug }) : null,
+  });
+  const resolveBranches = () => __t.timeAsync('listing.defaultBranch', () => Promise.all(REPOS.filter(repo => fastContextEnabled || !(listingSnapshot && isFastDrainTarget(repo, { number: onlyPr }))).map(resolveDefaultBranch)));
+  const listRepos = () => mapWithConcurrency(REPOS, REPOS.length, listOne);
+  let [listings] = await __t.timeAsync('listing', () => fastContextEnabled
+    ? fastDrainListingAfterBranches({ resolveBranches, list: async () => [await listRepos()] })
+    : Promise.all([listRepos(), resolveBranches()]));
   if (listingSnapshot) await Promise.all(REPOS.filter(repo => isFastDrainTarget(repo, { number: onlyPr })).map(resolveDefaultBranch));
   // One repo's failed listing no longer kills the pass: it is logged as failed and the other repos proceed
   // (`partitionListings`). Only when EVERY repo failed is it the old bad-env hard-fail. The failed repo is absent
@@ -5977,6 +6081,10 @@ export async function main(argv, { env = process.env, stdout = process.stdout, e
       process.stderr.write(`  ⚠ merge-queue dequeue sweep for ${repoTag(listing.repo) || 'cwd'} failed (${describeGhListError(e).text}) — retried next pass\n`);
     }
   }
+  // Issue live branch reads after ALL synchronous page work, including context/eviction fallback.
+  // A parent's round snapshot or host cache never populates the authoritative map.
+  await __t.timeAsync('gate.defaultBranch', () => Promise.all(REPOS
+    .filter(repo => prsByRepo.get(repo)?.length).map(repo => verifyDefaultBranch(repo || localSlug))));
   // #xc7p3q9 (R2) — the operator escape hatch symmetric to `--no-review-escalation`: `--assume-complete-context`
   // FORCES the context complete so a genuinely-stuck couple (e.g. a persistent read-noise fail-closed) can land
   // short of editing the script. Prints a LOUD one-line waiver. Off by default; the fail-closed gate stays live.
@@ -6506,7 +6614,8 @@ export async function main(argv, { env = process.env, stdout = process.stdout, e
       if (v.headRef && (isLocalRepo(v.repo) || escCwd)) {
         const exec = (cmd, args, opts) => execFileSync(cmd, args, { cwd: escCwd, ...opts });
         diffExec = exec;
-        const sig = computeNetDiffSignals({ exec, rev: v.headRef, baseRev: v.base, fetchExtraRefs: [v.headRef] });
+        const sig = computeNetDiffSignals({ exec, rev: /^[0-9a-f]{40}$/i.test(v.listedHeadSha || '') ? v.listedHeadSha : null, baseRev: v.base, fetchExtraRefs: [v.headRef], pinRev: true });
+        if (sig.netDiffText.scored) process.stderr.write(`net-diff #${v.num}: base=${sig.netDiffText.base} head=${sig.netDiffText.rev}\n`);
         changedFiles = sig.changedFiles;
         diffLines = sig.diffLines;
         humanBasisFiles = sig.humanBasisFiles;
@@ -6535,6 +6644,12 @@ export async function main(argv, { env = process.env, stdout = process.stdout, e
       // are always CUMULATIVE while `changedFiles` may be de-inflated to `v.base…head`; the verdict's
       // `diffHunksBasisFiles` (= `humanBasisFiles`, same basis as the hunks) is what a detector pairs them with.
       const score = scoreEscalation({ changedFiles, diffLines, humanBasisFiles, cumulativeDiffLines, dismissedFindings: v.dismissedFindings, crossRepo: v.crossRepo, diffHunks, basisNarrowed, deviation: v.deviation });
+      if (netDiffText.scored !== true) {
+        score.escalate = true;
+        score.humanRequired = true;
+        score.careLevel = 'high';
+        score.reasons.push(`net diff unverified (${netDiffText.reason || 'unscored'}); restore diff access and rerun the drain, or obtain human review of the full diff`);
+      }
       // #2766/#2767 — this PR's OWN changed-file set, stamped onto the verdict (best-effort — whatever this
       // pass already scored, never a new `gh` call) so a LATER sibling verdict in this SAME batch can ask
       // "did this PR's own commits touch the file my test-gaming finding cites?" without re-fetching — the
@@ -6627,10 +6742,13 @@ export async function main(argv, { env = process.env, stdout = process.stdout, e
       // diff-visible tamper forms; on a hit, REFUSE the auto-land and park `review:human` — a test removal is a
       // trust-chain concern the agent panel must not clear for itself; a human clears a legit removal. Best-
       // effort like the manifest gate: only when a local/sibling clone is present to read the diff text (no
-      // clone ⇒ no text ⇒ the scan is a no-op — the same fail-open the manifest baseline gate documents).
+      // clone ⇒ no text ⇒ unverified: the gate below requires review rather than trusting an empty scan).
       // #2890 — `netDiffText` was already fetched above (feeding `scoreEscalation`'s `diffHunks`); reused here
       // rather than re-fetched, so this scan and the escalation score can never disagree on what changed.
-      const gaming = scanTestTampering({ diffText: netDiffText.text });
+      const gaming = scanTestTampering({
+        netDiffText, pinnedHeadSha: v.listedHeadSha || v.headSha || null,
+        noClone: !isLocalRepo(v.repo) && !escCwd,
+      });
       // #xuboo0q — WAS THIS EXACT TAMPERING FINDING ALREADY HUMAN-CLEARED, AT THE CURRENT HEAD? Before #xuboo0q
       // this gate had no memory: it re-parked `review:human` on every drain pass that saw a tampering-shaped
       // diff, even seconds after a human ran the sanctioned `--to=clear-human` ceremony specifically to clear it
@@ -6647,7 +6765,7 @@ export async function main(argv, { env = process.env, stdout = process.stdout, e
       // PR #4631 (ruling a): did the carry below fail on a READ miss (→ the drain's own `review:held-mechanical` park,
       // which the carry sweep retries) rather than a decision (→ `review:human`)? A throw mid-carry counts as a miss.
       let carryRetryable = false;
-      if (netDiffText.scored && gaming.tampered && hasReviewLabel(v.prLabels, REVIEW_LABELS.accepted) && !v.workflowHoldRepark) { // a re-admitted workflow hold parks review:human through its own gate; never the retryable mechanical park
+      if (!gaming.evidenceIncomplete && netDiffText.scored && gaming.tampered && hasReviewLabel(v.prLabels, REVIEW_LABELS.accepted) && !v.workflowHoldRepark) { // a re-admitted workflow hold parks review:human through its own gate; never the retryable mechanical park
         try {
           const cd = JSON.parse(readGh(['pr', 'view', String(v.num), ...repoFlag(v.repo), '--json', 'headRefOid,comments'], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }).trim() || '{}');
           tamperHeadSha = typeof cd.headRefOid === 'string' ? cd.headRefOid : null;
@@ -6680,11 +6798,15 @@ export async function main(argv, { env = process.env, stdout = process.stdout, e
           }
         } catch { /* fetch miss → both stay null → shouldReparkForTestTampering fails closed (still true) */ }
       }
-      if (!v.workflowHoldRepark && shouldReparkForTestTampering({ tampered: gaming.tampered, netDiffScored: netDiffText.scored, humanClearedSha, headSha: tamperHeadSha })) {
+      // R1105: incomplete/head-mismatched evidence is an additional hold, never
+      // clearance evidence. Leave the existing human-clearance decision unchanged.
+      if (!v.workflowHoldRepark && (netDiffText.scored !== true || gaming.evidenceIncomplete || shouldReparkForTestTampering({ tampered: gaming.tampered, netDiffScored: netDiffText.scored, humanClearedSha, headSha: tamperHeadSha }))) {
         v.decision = 'skip';
         v.escalated = 'yes';
         v.humanRequired = true;
-        v.escalateReasons = gaming.reasons;
+        const tamperReasons = netDiffText.scored === true ? gaming.reasons
+          : [`net diff unverified (${netDiffText.reason || 'unscored'}); restore diff access and rerun the drain, or obtain human review of the full diff`];
+        v.escalateReasons = tamperReasons;
         // #2766/#2767 — is this PR's own tampering finding (at least partly) INHERITED from an already-
         // escalated stacked base (its own `baseRefName` IS another open PR's `headRef`, and that PR already
         // carries `review:human`)? Best-effort, off data this SAME batch already fetched (`v.changedFiles`,
@@ -6697,7 +6819,9 @@ export async function main(argv, { env = process.env, stdout = process.stdout, e
           baseFiles: stackedBase.changedFiles,
           baseAlreadyEscalated: hasReviewLabel(stackedBase.prLabels, REVIEW_LABELS.human),
         }) : null;
-        v.reason = buildTestGamingParkReason(gaming.reasons, stackedOrigin, stackedBase?.num);
+        v.reason = netDiffText.scored === true
+          ? buildTestGamingParkReason(tamperReasons, stackedOrigin, stackedBase?.num)
+          : tamperReasons.join('; ');
         if (!candidateDryRun) {
           // #2766/#2767 — MUTUAL EXCLUSIVITY. `keepHumanClearance` is `true` ONLY when the humanClearedSha
           // fetch above never ran/succeeded (`tamperHeadSha === null`, incl. a `gh` fetch miss) — the fail-
@@ -6738,8 +6862,8 @@ export async function main(argv, { env = process.env, stdout = process.stdout, e
           const posted = postDrainReasonComment(v.repo, v.num, 'park', v.reason, auditLineFor(v));
           if (posted && !AS_JSON) process.stderr.write(`  💬 ${repoTag(v.repo)}${v.num} test-gaming reason stamped on PR\n`);
         }
-        parked.push({ num: v.num, repo: v.repo || localSlug, humanRequired: true, reasons: gaming.reasons, headSha: v.headSha ?? null });
-        if (!AS_JSON) process.stderr.write(`  ⏸ ${repoTag(v.repo)}${v.num} parked — anti-test-gaming gate tripped (HUMAN required): ${gaming.reasons.join('; ')}\n`);
+        parked.push({ num: v.num, repo: v.repo || localSlug, humanRequired: true, reasons: tamperReasons, headSha: v.headSha ?? null });
+        if (!AS_JSON) process.stderr.write(`  ⏸ ${repoTag(v.repo)}${v.num} parked — anti-test-gaming gate tripped (HUMAN required): ${tamperReasons.join('; ')}\n`);
         continue;
       }
       // #2412 layer 4 — this PR's basis (the SAME set `score` scored blast-radius/gate-self over, #3317) touches

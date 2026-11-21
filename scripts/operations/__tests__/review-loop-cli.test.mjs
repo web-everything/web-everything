@@ -30,7 +30,7 @@ import { join } from 'node:path';
 import { describe, it, expect, vi, onTestFinished } from 'vitest';
 
 import { createRegistry } from '../registry.mjs';
-import { createMemoryRunStore } from '../run-store.mjs';
+import { NAME_RE, createMemoryRunStore } from '../run-store.mjs';
 import { judgeOutcome, parseOperationArgv } from '../cli-adapter.mjs';
 import { fileItemOperation } from '../file-item.mjs';
 import { REVIEW_EFFECTS, reviewPrOperation } from '../review-pr.mjs';
@@ -2328,4 +2328,15 @@ describe('acceptance refreshes the resume snapshot head', () => {
     expect(exec).toHaveBeenCalledTimes(reads);
     expect(readComments).toHaveBeenCalledTimes(reads);
   });
+});
+
+
+it('default review-loop minting keys the persisted run by its parsed PR', async () => {
+  const { declaration, registry } = registryFor({});
+  const out = await runReviewLoopOnce({
+    declaration, registry, argv: [...BASE_ARGV, '--json'], store: createMemoryRunStore(),
+    sinks: recordingSinks([]), makeJudge: cannedJudge(CLEAN_ANSWER),
+  });
+  expect(out.code).toBe(0);
+  expect(out.run.id.match(NAME_RE)?.[1]).toBe(String(out.run.input.pr));
 });

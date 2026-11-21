@@ -110,6 +110,35 @@ afterEach(() => {
 });
 
 describe('the Git proof of omitted content in the candidate build', () => {
+  it('next rebuild with default env removes content carried by a benignly removed ready overlay', async () => {
+    const { originDir, cloneDir, env } = makeFixture();
+    // Use the shipped defaults, including audited-only and unrelated-change skipping.
+    delete env.WE_DAEMON_OVERLAY_FOLLOW_TIP;
+    delete env.WE_DAEMON_REBUILD_SKIP_UNRELATED;
+    delete env.WE_DAEMON_OVERLAY_EDGE_RESOLVE;
+    const ref = 'lane/benign-removal';
+    const tip = pushBranch(originDir, ref, (dir) => writeFile(dir, 'removed.txt', 'overlay content\n'));
+    addOverlay(cloneDir, { ref, now: '2026-11-18T20:00:00Z' }, { env });
+    appendOverlayEvent(cloneDir, { kind: 'added', ref, at: '2026-11-18T20:00:00Z' }, { env });
+    const options = { root: cloneDir, env, lockOpts: LOCK_OPTS };
+    const { runSmoke, endTick } = passWhileSiblingStartsTick(cloneDir, env);
+    try {
+      expect(await rebuildClone({ ...options, runSmoke })).toMatchObject({ reason: 'tick-in-progress' });
+      expect(readReadyCandidate(cloneDir, env).adopt.applied).toEqual([expect.objectContaining({ ref, sha: tip })]);
+    } finally { endTick(); }
+    removeOverlay(cloneDir, ref, { env });
+    appendOverlayEvent(cloneDir, { kind: 'removed', ref, tip, actor: OPERATOR_LOGINS[0],
+      source: 'removeRegistration', reason: 'no longer wanted', at: '2026-11-18T21:00:00Z' }, { env });
+    advanceMain(originDir, (dir) => writeFile(dir, 'later.txt', 'later main\n'));
+    const noSmoke = vi.fn(async () => PASS);
+    expect(await rebuildClone({ ...options, runSmoke: noSmoke })).toMatchObject({ reason: 'ready-adopted' });
+    expect(readFileSync(join(cloneDir, 'removed.txt'), 'utf8')).toBe('overlay content\n');
+    expect(noSmoke).not.toHaveBeenCalled();
+    expect(await rebuildClone({ ...options, runSmoke: async () => PASS })).toMatchObject({ adopted: true });
+    expect(existsSync(join(cloneDir, 'removed.txt'))).toBe(false);
+    expect(readRebuildState(cloneDir, env).adopted.applied).toEqual([]);
+  }, 30_000);
+
   it('accepts equivalent content without requiring overlay ancestry, but rejects extra merged content', () => {
     const { originDir, cloneDir } = makeFixture();
     const overlay = pushBranch(originDir, 'lane/omitted', (dir) => writeFile(dir, 'overlay.txt', 'overlay\n'));
@@ -498,7 +527,7 @@ describe('a passed candidate blocked at finalize by a long reader tick is adopte
         .toMatchObject({ reason: 'tick-in-progress' });
       expect(readReadyCandidate(cloneDir, env)?.adopt).toMatchObject({ finalSha: candidate, applied: [] });
     } finally { endTick(); }
-    const retired = { kind: 'auto-retired', ref, tip: sha, actor: OPERATOR_LOGINS[0], reason: 'withdraw fix', at: new Date().toISOString() };
+    const retired = { kind: 'auto-retired', ref, tip: sha, actor: OPERATOR_LOGINS[0], operatorReason: true, reason: 'withdraw fix', at: new Date().toISOString() };
     expect(overlayRetiredByOperator({ ref, sha, events: [added, retired], registered: () => false })).toBe(true);
     const noSmoke = vi.fn(async () => PASS);
     const result = await rebuildClone({

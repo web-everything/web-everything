@@ -1,12 +1,13 @@
 // @vitest-environment node
 import { afterEach, expect, it } from 'vitest';
-import { mkdirSync, mkdtempSync, readFileSync, renameSync, rmSync, utimesSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, renameSync, rmSync, statSync, utimesSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { newRunRecord, readRun, writeRun } from '../../operations/run-store.mjs';
+import { newReviewRunId, newRunRecord, readRun, writeRun } from '../../operations/run-store.mjs';
 import { readDrainRedTeamEvidence, readRecoveryWitness } from '../drain-red-team-evidence.mjs';
-import { backfillAllReviewRuns, readCompleteReviewRunsForPr, appendReviewRunIndex, backfillOpenReviewRuns, backfillReviewRunIndex, readReviewRunIndex, reviewRunIndexPath } from '../review-run-index.mjs';
+import { backfillAllReviewRuns, readCompleteReviewRunsForPr, appendReviewRunIndex, backfillOpenReviewRuns, backfillReviewRunIndex, readReviewRunIndex, reviewRunIndexPath, readNamedCandidates } from '../review-run-index.mjs';
 
+import { writeJsonAtomic } from '../atomic-json-file.mjs';
 import { headNeverReviewedFromRuns } from '../review-red-team-on-skip.mjs';
 
 const roots = [];
@@ -363,10 +364,14 @@ it.each(['deleted key', 'append after deleted key', 'missing row', 'deleted evic
 function negativeFixture() {
   const f = fixture();
   f.run.findings.read.netBasis.rev = 'b'.repeat(40);
+  f.scanSettings = { file: { runs: { scan: { maxParses: 5000 } } }, platform: {}, env: {} };
   const records = [f.run, ...Array.from({ length: 401 }, (_, i) => ({ ...f.run,
     id: `review-pr-unrelated-${i}`, input: { repo: 'else/where', pr: i + 1 } }))];
   let reads = [], listings = 0;
-  const io = { list: () => { listings++; return records.map(r => r.id); }, stat: () => ({ mtimeMs: 2000 }),
+  const io = { list: () => { listings++; return records.map(r => r.id); },
+    readdir: () => records.map(r => `${r.id}.json`),
+    stat: path => ({ mtimeMs: 2000, ctimeMs: 2000, dev: 1, ino: 1,
+      size: JSON.stringify(records.find(r => path === r.id || path.endsWith(`/${r.id}.json`))).length }),
     read: id => { reads.push(id); return records.find(r => r.id === id); } };
   const fill = () => backfillAllReviewRuns({ ...f, ...io, maxParsesPerCall: 200 });
   return { f, io, records, fill, reads, listings: () => listings, reset: () => { reads.length = 0; listings = 0; } };
@@ -390,14 +395,14 @@ it('full backfill resumes from the index in bounded batches and stamps only a co
   expect(n.reads).toHaveLength(0);
   expect(readCompleteReviewRunsForPr(n.f.runsDir, 'else/where', 401, n.io)).toEqual(['review-pr-unrelated-400']);
 });
-it('complete index proves never reviewed beyond 400 ids parsing only this PR', () => {
+it('named-candidate proof beyond 400 parses all legacy ids independently of the complete index', () => {
   const n = negativeFixture(); fullNegativeIndex(n);
   expect(headNeverReviewedFromRuns({ ...n.f, ...n.io })).toBe(true);
-  expect(n.reads).toEqual([n.f.run.id]);
+  expect(n.reads).toEqual(n.records.map(r => r.id).sort());
   expect(readCompleteReviewRunsForPr(n.f.runsDir, 'absent/repo', 99, n.io)).toEqual([]);
 });
 it.each(['missing', 'corrupt', 'poisoned', 'watermark absent', 'open only', 'new unindexed', 'old unindexed', 'listing failure', 'stat failure', 'overflow', 'evicted'])(
-  '%s full proof falls back to the unchanged capped scan', kind => {
+  '%s index proof does not control the independent named-candidate proof', kind => {
     const n = negativeFixture(); fullNegativeIndex(n);
     const path = reviewRunIndexPath(n.f.runsDir);
     const index = JSON.parse(readFileSync(path));
@@ -409,15 +414,17 @@ it.each(['missing', 'corrupt', 'poisoned', 'watermark absent', 'open only', 'new
     if (kind === 'overflow') { index.fullReviewRuns.entries['o/r#7'] = []; writeFileSync(path, JSON.stringify(index)); }
     if (kind === 'evicted') { delete index.fullReviewRuns.entries['o/r#7']; index.fullReviewRuns.evicted.push('o/r#7'); writeFileSync(path, JSON.stringify(index)); }
     if (kind.includes('unindexed')) { n.records.push({ ...n.f.run, id: 'review-pr-lost' });
-      n.io.stat = () => ({ mtimeMs: kind === 'old unindexed' ? 1000 : 3000 }); }
+      n.io.stat = () => ({ mtimeMs: kind === 'old unindexed' ? 1000 : 3000,
+        ctimeMs: 3000, dev: 1, size: 100, ino: 1 }); }
     if (kind === 'listing failure') n.io.list = () => { throw Error('listing unavailable'); };
     if (kind === 'stat failure') n.io.stat = () => { throw Error('stat unavailable'); };
     expect(readCompleteReviewRunsForPr(n.f.runsDir, n.f.repo, n.f.pr, n.io)).toBeNull();
-    expect(headNeverReviewedFromRuns({ ...n.f, ...n.io })).toBe(false);
-    expect(n.reads).toHaveLength(0);
+    const unreadable = ['listing failure', 'stat failure'].includes(kind);
+    expect(headNeverReviewedFromRuns({ ...n.f, ...n.io })).toBe(!unreadable);
+    expect(n.reads).toHaveLength(unreadable ? 0 : n.records.length);
   });
 it.each(['same head', 'unknown head', 'wrong PR', 'wrong repo', 'wrong op', 'missing', 'bad evidence', 'wrong id'])(
-  'indexed %s cannot establish never reviewed', kind => {
+  'named proof validates %s evidence independently of indexed subject keys', kind => {
     const n = negativeFixture(); fullNegativeIndex(n);
     if (kind === 'same head') n.f.run.findings.read.netBasis.rev = n.f.head;
     if (kind === 'unknown head') delete n.f.run.findings.read.netBasis.rev;
@@ -427,8 +434,11 @@ it.each(['same head', 'unknown head', 'wrong PR', 'wrong repo', 'wrong op', 'mis
     if (kind === 'bad evidence') delete n.f.run.effects;
     if (kind === 'missing') n.io.read = () => { throw Error('missing'); };
     if (kind === 'wrong id') n.io.read = () => ({ ...n.f.run, id: 'review-pr-wrong' });
-    expect(headNeverReviewedFromRuns({ ...n.f, ...n.io })).toBe(false);
-    if (!['same head', 'unknown head'].includes(kind)) expect(n.listings()).toBe(2);
+    // Legacy records with a valid different subject/op no longer belong to this PR.
+    // Missing/malformed identity, a mismatched id, and live/unknown subject heads still hold.
+    const unrelated = ['wrong PR', 'wrong repo', 'wrong op'].includes(kind);
+    expect(headNeverReviewedFromRuns({ ...n.f, ...n.io })).toBe(unrelated);
+    expect(n.listings()).toBe(unrelated ? 2 : 1);
   });
 it('open-PR refresh preserves full-backfill progress and its completed proof', () => {
   const n = negativeFixture();
@@ -439,7 +449,7 @@ it('open-PR refresh preserves full-backfill progress and its completed proof', (
   expect(n.fill().complete).toBe(true);
   open(); open(); n.reset();
   expect(headNeverReviewedFromRuns({ ...n.f, ...n.io })).toBe(true);
-  expect(n.reads).toEqual([n.f.run.id]);
+  expect(n.reads).toEqual(n.records.map(r => r.id).sort());
 });
 
 it('full backfill uses the default parser and refuses corrupt payloads without stamping completeness', () => {
@@ -518,14 +528,14 @@ it.each(['completed', 'staged'])('legacy %s full backfill revalidates records be
   n.reset();
   expect(headNeverReviewedFromRuns({ ...n.f, ...n.io })).toBe(true);
 });
-it('full backfill eviction cannot turn a lost key into a proof of absence', () => {
+it('full backfill eviction refuses index absence while an independent complete scan can prove it', () => {
   const n = negativeFixture();
   n.records.push(...Array.from({ length: 112 }, (_, i) => ({ ...n.f.run,
     id: `review-pr-z-${i}`, input: { repo: 'extra/repo', pr: i + 1 } })));
   n.fill(); n.fill();
   expect(n.fill().complete).toBe(true);
   expect(readCompleteReviewRunsForPr(n.f.runsDir, n.f.repo, n.f.pr, n.io)).toBeNull();
-  expect(headNeverReviewedFromRuns({ ...n.f, ...n.io })).toBe(false);
+  expect(headNeverReviewedFromRuns({ ...n.f, ...n.io })).toBe(true);
 });
 it('full backfill retains verified progress if a file appears behind its cursor and publishes no partial proof', () => {
   const n = negativeFixture(); n.fill();
@@ -766,3 +776,101 @@ it('full backfill retains progress under churn and never publishes while an unre
   expect(reads).toBe(123);
   expect(readCompleteReviewRunsForPr(f.runsDir, f.repo, f.pr, args)).toEqual([]);
 });
+
+// These integration cases intentionally use the default lookup, list, read and stat:
+// a complete filename scan is authoritative even when it finds no exact-head record.
+// Retired journal files are inert, including conflicting and torn rows.
+const reviewRunJournalPath = dir => `${dir}-review-index.jsonl`;
+const journalReaders = [
+  { name: 'drain', reader: readDrainRedTeamEvidence },
+  { name: 'recovery', reader: readRecoveryWitness },
+];
+// Historical journal rows are inert; every live review ID remains a scan candidate.
+const journalLine = (f, id, key) => {
+  const metadata = statSync(join(f.runsDir, `${id}.json`));
+  return `${JSON.stringify({ id, key, seal: [metadata.dev, metadata.ino, metadata.size, metadata.mtimeMs, metadata.ctimeMs, metadata.birthtimeMs] })}\n`;
+};
+function journalPayload(f, run, at) {
+  writeFileSync(join(f.runsDir, `${run.id}.json`), JSON.stringify(run));
+  utimesSync(join(f.runsDir, `${run.id}.json`), at, at);
+}
+const journalBudget = maxParses => ({ file: { runs: { scan: { maxParses } } }, platform: {}, env: {} });
+
+it.each(journalReaders)('$name default name lookup keeps completed absence without an exact-head fallback', ({ reader }) => {
+  const f = fixture();
+  const differentHead = { ...f.run, findings: { read: { netBasis: { rev: 'b'.repeat(40) } } } };
+  const unrelated = { ...f.run, id: newReviewRunId(8), input: { repo: f.repo, pr: 8 } };
+  journalPayload(f, differentHead, 2);
+  journalPayload(f, unrelated, 100);
+  writeFileSync(reviewRunJournalPath(f.runsDir), journalLine(f, f.run.id, 'o/r#7') + journalLine(f, unrelated.id, 'o/r#8'));
+  const result = reader({ ...f, scanSettings: journalBudget(2), warn: () => {} });
+  expect(result.ok).not.toBe(false);
+  expect(result.loopPayload ?? result.newest ?? null).toBeNull();
+});
+
+for (const kind of ['omitted', 'conflicting', 'stale-key', 'torn', 'invalid JSON']) {
+  it.each(journalReaders)(`$name default name lookup cannot hide a newer rejection with ${kind} lines`, ({ reader }) => {
+    const f = fixture();
+    const newer = { ...f.run, id: 'review-pr-rejection', verdict: { verdict: 'changes' },
+      stepTimings: [{ step: 'read', stepIndex: 0, startedAt: new Date(50_000).toISOString() }] };
+    journalPayload(f, f.run, 2);
+    journalPayload(f, newer, 100);
+    const current = journalLine(f, newer.id, 'o/r#7'), stale = journalLine(f, newer.id, 'o/r#8');
+    const suffix = { omitted: '', conflicting: current + stale, 'stale-key': stale + current,
+      torn: stale.trimEnd(), 'invalid JSON': `{"id":"${newer.id}","key":\n` }[kind];
+    writeFileSync(reviewRunJournalPath(f.runsDir), journalLine(f, f.run.id, 'o/r#7') + suffix);
+    const result = reader({ ...f, scanSettings: journalBudget(2), warn: () => {} });
+    expect(result.ok).not.toBe(false);
+    expect(result.loopPayload ?? result.newest).toEqual(newer);
+    expect((result.loopPayload ?? result.newest).verdict).toEqual({ verdict: 'changes' });
+  });
+}
+
+for (const field of ['id', 'op', 'repo', 'pr', 'unjournaled id']) {
+  it.each(journalReaders)(`$name default name lookup refuses a mismatched ${field} payload before proving absence`, ({ reader }) => {
+    const f = fixture();
+    if (field !== 'unjournaled id') f.run.id = newReviewRunId(f.pr);
+    const impostor = structuredClone(f.run);
+    if (field === 'id' || field === 'unjournaled id') impostor.id = 'review-pr-impostor';
+    if (field === 'op') impostor.op = 'fix-pr';
+    if (field === 'repo') impostor.input.repo = 'other/repo';
+    if (field === 'pr') impostor.input.pr = 999;
+    const unrelated = { ...f.run, id: newReviewRunId(8), input: { repo: f.repo, pr: 8 } };
+    // Publish under the candidate filename even when the payload claims another id.
+    writeFileSync(join(f.runsDir, `${f.run.id}.json`), JSON.stringify(impostor));
+    utimesSync(join(f.runsDir, `${f.run.id}.json`), 2, 2);
+    journalPayload(f, unrelated, 100);
+    writeFileSync(reviewRunJournalPath(f.runsDir),
+      (field === 'unjournaled id' ? '' : journalLine(f, f.run.id, 'o/r#7')) + journalLine(f, unrelated.id, 'o/r#8'));
+    const result = reader({ ...f, scanSettings: journalBudget(2), warn: () => {} });
+    if (field === 'repo') expect(result.ok).not.toBe(false); // Names encode PR, not repository.
+    else expect(result).toMatchObject({ ok: false, reason: 'scan-capped' });
+    expect(result.loopPayload ?? result.newest ?? null).toBeNull();
+  });
+}
+
+
+it.each(journalReaders.flatMap(reader => [0, 5000].map(gapMs => ({ ...reader, gapMs }))))(
+  '$name default name lookup returns a rejection replacing an other-PR file within the 10-second allowance (gap=$gapMs ms)',
+  ({ reader, gapMs }) => {
+    const f = fixture();
+    writeRun(f.run, f.runsDir);
+    const other = { ...f.run, id: 'review-pr-replaced-other', input: { repo: f.repo, pr: 8 } };
+    writeRun(other, f.runsDir);
+    const atBefore = statSync(join(f.runsDir, `${other.id}.json`)).mtimeMs;
+    expect(readNamedCandidates(f.runsDir, f.repo, f.pr).ids).toEqual([f.run.id, other.id].sort());
+    const rejection = { ...f.run, id: other.id, verdict: { verdict: 'changes' },
+      stepTimings: [{ step: 'read', stepIndex: 0, startedAt: new Date(Date.now()).toISOString() }] };
+    const path = join(f.runsDir, `${other.id}.json`);
+    writeJsonAtomic(path, rejection); // Directly replace a legacy payload; no name can exclude it.
+    const at = (atBefore + gapMs) / 1000;
+    utimesSync(path, at, at);
+    expect(Math.abs(statSync(path).mtimeMs - atBefore)).toBeLessThan(10_000);
+    expect(readNamedCandidates(f.runsDir, f.repo, f.pr)).toMatchObject({
+      ids: [f.run.id, other.id].sort(), legacy: 2,
+    });
+    const result = reader({ ...f, scanSettings: journalBudget(2), warn: () => {} });
+    expect(result.ok).not.toBe(false);
+    expect(result.loopPayload ?? result.newest).toEqual(rejection);
+  },
+);

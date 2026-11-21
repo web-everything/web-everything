@@ -1,3 +1,4 @@
+import { pinnedLeafDiffFixture } from './fixtures/pinned-leaf-diff-fixture.mjs';
 /**
  * RED contract for merge-ai-prs.mjs (no production changes in this task):
  * - revalidateWithUnknownRetry accepts repo?, num?, onPersistentUnknown and nudge.
@@ -27,6 +28,7 @@ import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { daemonAppEnv } from './fixtures/daemon-app-env.mjs';
 import { openPrPageFixture } from './fixtures/open-pr-page-fixture.mjs';
+import { completeCheckReadFixture } from './fixtures/complete-check-read-fixture.mjs';
 import { prioritizeMainFix } from '../lib/merge-queue-hook.mjs';
 
 const REPO = 'example/web';
@@ -285,6 +287,9 @@ const { prs, fresh, nudgeFresh, wrongNumber, unreadable, failMerge } = JSON.pars
 const openPrPageFixture = ${openPrPageFixture};
 const landed = n => fs.existsSync(f + '.merged-' + n);
 const out = x => { fs.writeSync(1, JSON.stringify(x)); process.exit(0); };
+const completeCheckReadFixture = ${completeCheckReadFixture};
+const checkPages = completeCheckReadFixture(prs, a);
+if (checkPages !== undefined) out(checkPages);
 fs.appendFileSync(f + '.calls', JSON.stringify(a) + '\\n');
 if (a[0] === 'repo' && a[1] === 'view') { process.stdout.write('main'); process.exit(0); }
 if (a[0] === 'pr' && a[1] === 'list') out(prs.filter(p => !landed(p.number)));
@@ -315,7 +320,7 @@ process.exit(0);
 const cliGit = `#!/usr/bin/env node
 const a = process.argv.slice(2);
 if (a[0] === 'remote' && a[1] === 'get-url') process.stdout.write('git@github.com:web-everything/web-everything.git\\n');
-if (a[0] === 'diff') process.exit(1);
+${pinnedLeafDiffFixture}
 process.exit(0);
 `;
 

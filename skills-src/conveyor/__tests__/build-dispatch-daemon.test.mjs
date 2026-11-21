@@ -4,6 +4,8 @@ import { runPrepareBatch } from '../../../scripts/operations/prepare-batch.mjs';
 import { recordPrepareFailure, readFailureState, releaseDuePrepareRetries, takePrepareRouteHolds, requeuePrepareRouteHold, completePrepareFailures } from '../../../scripts/conveyor/prepare-failure-policy.mjs';
 import { planPrepareSpawns } from '../../../scripts/conveyor/tick-core.mjs';
 import { cliEffects } from '../build-dispatch-daemon.mjs';
+import { readBuildPrioritySettings } from '../../../scripts/lib/build-queue.mjs';
+import { shapeQueue } from '../../../scripts/readiness/conveyor-state.mjs';
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { chmodSync, mkdtempSync, mkdirSync, rmSync, writeFileSync, appendFileSync, readFileSync, statSync, existsSync, renameSync, utimesSync, readdirSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
@@ -1132,10 +1134,10 @@ describe('cliRetryInfraBlocked — passes the primary store path to the child re
     writeFileSync(file, '[]');
     const calls = [];
     const exec = (cmd, args, opts) => { calls.push({ cmd, args, opts }); return '{"retried":["7"]}'; };
-    const r = cliRetryInfraBlocked({ exec, env: { PATH: '/bin' }, home });
-    expect(r).toEqual({ retried: ['7'] });
+    const r = cliRetryInfraBlocked({ readEntries: () => [{ num: '7', groupMembers: [] }], exec, env: { PATH: '/bin' }, home });
+    expect(r).toEqual({ retried: ['7'], resumed: [], surfaced: [], waiting: [], failed: [], rearmed: [] });
     expect(calls).toHaveLength(1);
-    expect(calls[0].args.slice(-1)).toEqual(['retry']);
+    expect(calls[0].args.slice(-2)).toEqual(['retry', '--num=7']);
     expect(calls[0].opts.env).toMatchObject({ PATH: '/bin', CONVEYOR_INFRA_FILE: file });
   });
 
@@ -1143,12 +1145,38 @@ describe('cliRetryInfraBlocked — passes the primary store path to the child re
     mkdirSync(join(home, 'workspace', 'webeverything', '.conveyor'), { recursive: true });
     writeFileSync(join(home, 'workspace', 'webeverything', '.conveyor', 'infra-blocked.json'), '[]');
     const calls = [];
-    cliRetryInfraBlocked({ exec: (c, a, o) => { calls.push(o); return '{}'; }, env: { CONVEYOR_INFRA_FILE: '/custom/path.json' }, home });
+    cliRetryInfraBlocked({ readEntries: () => [{ num: '7', groupMembers: [] }], exec: (c, a, o) => { calls.push(o); return '{}'; }, env: { CONVEYOR_INFRA_FILE: '/custom/path.json' }, home });
     expect(calls[0].env.CONVEYOR_INFRA_FILE).toBe('/custom/path.json');
   });
 
+  it('preserves an error response and earlier results while processing two following healthy infra entries', () => {
+    const exec = vi.fn()
+      .mockReturnValueOnce(JSON.stringify({ error: 'retry probe failed', retried: ['7'],
+        failed: [{ num: '7', detail: 'retry probe failed' }] }))
+      .mockReturnValueOnce(JSON.stringify({ retried: ['8'], resumed: [{ num: '8', pr: 88 }] }))
+      .mockReturnValueOnce(JSON.stringify({ retried: ['9'], resumed: [{ num: '9', pr: 99 }] }));
+    const result = cliRetryInfraBlocked({ now: () => 0, exec,
+      readEntries: () => ['7', '8', '9'].map(num => ({ num, groupMembers: [] })), env: {}, home });
+    expect(exec.mock.calls.map(([, args]) => args.at(-1))).toEqual(['--num=7', '--num=8', '--num=9']);
+    expect(result).toEqual({ error: 'retry probe failed', retried: ['7', '8', '9'],
+      resumed: [{ num: '8', pr: 88 }, { num: '9', pr: 99 }], surfaced: [], waiting: [],
+      failed: [{ num: '7', detail: 'retry probe failed' }], rearmed: [] });
+  });
+
+  it('retains every child error separately from infra recovery array aggregation', () => {
+    const exec = vi.fn()
+      .mockReturnValueOnce(JSON.stringify({ error: 'first error', retried: ['7'] }))
+      .mockReturnValueOnce(JSON.stringify({ error: 'second error', retried: ['8'] }))
+      .mockReturnValueOnce(JSON.stringify({ retried: ['9'] }));
+    const result = cliRetryInfraBlocked({ now: () => 0, exec,
+      readEntries: () => ['7', '8', '9'].map(num => ({ num, groupMembers: [] })), env: {}, home });
+    expect(exec).toHaveBeenCalledTimes(3);
+    expect(result.error).toBe('first error\nsecond error');
+    expect(result.retried).toEqual(['7', '8', '9']);
+  });
+
   it('a throwing exec is captured as `{error}`, never thrown', () => {
-    const r = cliRetryInfraBlocked({ exec: () => { throw new Error('boom'); }, env: {}, home });
+    const r = cliRetryInfraBlocked({ readEntries: () => [{ num: '7', groupMembers: [] }], exec: () => { throw new Error('boom'); }, env: {}, home });
     expect(r.error).toMatch(/boom/);
   });
 });
@@ -1160,15 +1188,36 @@ describe('cliRetryInfraBlocked — bounds the child so a slow retry can never st
 
   it('passes `timeout` (and a `killSignal`) through to exec, defaulting to INFRA_RETRY_TIMEOUT_MS', () => {
     let capturedOpts;
-    cliRetryInfraBlocked({ exec: (c, a, o) => { capturedOpts = o; return '{}'; }, env: {}, home: '/x' });
+    cliRetryInfraBlocked({ now: () => 0, readEntries: () => [{ num: '7', groupMembers: [] }], exec: (c, a, o) => { capturedOpts = o; return '{}'; }, env: {}, home: '/x' });
     expect(capturedOpts.timeout).toBe(INFRA_RETRY_TIMEOUT_MS);
     expect(capturedOpts.killSignal).toBe('SIGTERM');
   });
 
   it('an explicit `timeoutMs` override reaches exec as its `timeout` option', () => {
     let capturedOpts;
-    cliRetryInfraBlocked({ exec: (c, a, o) => { capturedOpts = o; return '{}'; }, env: {}, home: '/x', timeoutMs: 5000 });
+    cliRetryInfraBlocked({ now: () => 0, readEntries: () => [{ num: '7', groupMembers: [] }], exec: (c, a, o) => { capturedOpts = o; return '{}'; }, env: {}, home: '/x', timeoutMs: 5000 });
     expect(capturedOpts.timeout).toBe(5000);
+  });
+
+  it('shares one elapsed deadline across multiple infra retries and retains excess entries for the next tick', () => {
+    let elapsed = 0;
+    const entries = ['7', '8', '9', '10'].map(num => ({ num, groupMembers: [] }));
+    const before = structuredClone(entries);
+    const timeouts = [];
+    const exec = vi.fn((cmd, args, opts) => {
+      timeouts.push(opts.timeout);
+      elapsed += Math.min(40, opts.timeout);
+      return JSON.stringify({ retried: [args.at(-1).slice('--num='.length)] });
+    });
+    const result = cliRetryInfraBlocked({ now: () => elapsed, timeoutMs: 100, exec,
+      readEntries: () => { elapsed += 10; return entries; } });
+    expect(elapsed).toBe(100);
+    expect(timeouts).toEqual([90, 50, 10]);
+    expect(exec).toHaveBeenCalledTimes(3);
+    expect(result.retried).toEqual(['7', '8', '9']);
+    expect(result.timedOut).toBe(true);
+    expect(result.waiting).toEqual([{ num: '10', reason: 'infra-retry-deadline; retained for next tick', waitSec: 0 }]);
+    expect(entries).toEqual(before);
   });
 
   // Simulates real `execFileSync` timeout semantics without a real subprocess: if the caller's bound is
@@ -1188,14 +1237,14 @@ describe('cliRetryInfraBlocked — bounds the child so a slow retry can never st
         err.signal = 'SIGTERM';
         throw err;
       }
-      return JSON.stringify({ retried: [], resumed: [], surfaced: [], waiting: [] });
+      return JSON.stringify({ retried: [], resumed: [], surfaced: [], waiting: [], failed: [], rearmed: [] });
     };
   }
 
   it('a retry that would otherwise run 5x the bound is cut short near the bound, not left to run to completion', () => {
     const exec = fakeExecRespectingTimeout(250); // "would take" 250ms unbounded
     const start = Date.now();
-    const result = cliRetryInfraBlocked({ exec, env: {}, home: '/x', timeoutMs: 50 });
+    const result = cliRetryInfraBlocked({ readEntries: () => [{ num: '7', groupMembers: [] }], exec, env: {}, home: '/x', timeoutMs: 50 });
     const elapsed = Date.now() - start;
     expect(elapsed).toBeLessThan(200); // well short of the full 250ms the slow retry would have taken
     expect(result.timedOut).toBe(true);
@@ -1203,8 +1252,8 @@ describe('cliRetryInfraBlocked — bounds the child so a slow retry can never st
 
   it('a retry well under the bound completes normally and is unaffected', () => {
     const exec = fakeExecRespectingTimeout(10);
-    const result = cliRetryInfraBlocked({ exec, env: {}, home: '/x', timeoutMs: 50 });
-    expect(result).toEqual({ retried: [], resumed: [], surfaced: [], waiting: [] });
+    const result = cliRetryInfraBlocked({ readEntries: () => [{ num: '7', groupMembers: [] }], exec, env: {}, home: '/x', timeoutMs: 50 });
+    expect(result).toEqual({ retried: [], resumed: [], surfaced: [], waiting: [], failed: [], rearmed: [] });
     expect(result.timedOut).toBeUndefined();
   });
 
@@ -4353,6 +4402,95 @@ describe('grouped PREPARE daemon ticks', () => {
     expect(launches.find(r => r.num !== stale.num).groupMembers).toHaveLength(3);
   });
 
+  describe('builder-only mode gates prepares', () => {
+    const only = ids => ({ ids, source: 'runtime', mode: 'only', only: true });
+    const launchedNums = effects => effects.dispatch.mock.calls.flatMap(([a]) => [a.num, ...(a.groupMembers ?? [])]);
+    it('only mode gates prepare launches', async () => {
+      const effects = fixture({ spawns: [rows[0], rows[1]] });
+      effects.readRuntimePriority = () => only(['7202']);
+      const tick = await runBuildDispatchTick({ live: true, effects });
+      expect(launchedNums(effects)).toEqual(['7202']);
+      expect(tick.prepare.skippedInPlanning).toEqual([{ num: '7201', reason: 'not-in-runtime-only-list' }]);
+    });
+    it('keeps listed ids preparing and leaves non-only modes alone', async () => {
+      const effects = fixture({ spawns: [rows[0]] });
+      effects.readRuntimePriority = () => only(['7201']);
+      await runBuildDispatchTick({ live: true, effects });
+      expect(launchedNums(effects)).toContain('7201');
+    });
+    it.each([
+      ['bornAs on both records', { bornAs: 'xabcdef0' }, { bornAs: 'xabcdef0' }],
+      ['bornAs on queue only', { bornAs: 'xabcdef0' }, {}],
+      ['bornAs on spawn only', {}, { bornAs: 'xabcdef0' }],
+      ['durable card id', { id: 'xabcdef0-prepare-card' }, {}],
+    ])('prepares a card listed by its %s', async (_label, queueIdentity, spawnIdentity) => {
+      const queue = [{ ...rows[0], ...queueIdentity }, rows[1]];
+      const effects = fixture({ queue, spawns: [{ ...rows[0], ...spawnIdentity }, rows[1]] });
+      effects.readRuntimePriority = () => only(['xabcdef0']);
+      const tick = await runBuildDispatchTick({ live: true, effects });
+      expect(launchedNums(effects)).toEqual(['7201']);
+      expect(tick.prepare.skippedInPlanning).toEqual([{ num: '7202', reason: 'not-in-runtime-only-list' }]);
+    });
+    it('leaves a non-only mode alone', async () => {
+      const lift = fixture({ spawns: [rows[0]] });
+      lift.readRuntimePriority = () => ({ ids: ['7299'], source: 'runtime', mode: 'lift', only: false });
+      await runBuildDispatchTick({ live: true, effects: lift });
+      expect(launchedNums(lift)).toContain('7201');
+    });
+    it.each([
+      ['bornAs', { bornAs: 'xabcdef0' }],
+      ['durable id', { id: 'xabcdef0-prepare-card' }],
+    ])('retains %s admission through production queue shaping and minimal prepare picks', async (_label, identity) => {
+      const cards = [{ ...rows[0], ...identity }, rows[1]];
+      const queue = shapeQueue(cards);
+      const effects = fixture({ queue });
+      effects.loadGroupingCards = vi.fn(async () => cards);
+      effects.readRuntimePriority = () => only(['xabcdef0']);
+      effects.planTick = bk => ({ decisions: { admission: { queue, cleared: [],
+        held: queue.map(r => ({ num: r.num, reason: 'needs-prepare' })) },
+      spawnPrepareItems: planPrepareSpawns({ needsPrepare: queue, prepareHeldNums: bk.prepareHeldNums,
+        availableLanes: [1, 2], maxConcurrentItemPrepares: 2 }).itemPrepareSpawns }, nextState: {} });
+      const tick = await runBuildDispatchTick({ live: true, effects });
+      expect(launchedNums(effects)).toEqual(['7201']);
+      expect(tick.prepare.skippedInPlanning).toEqual([{ num: '7202', reason: 'not-in-runtime-only-list' }]);
+      expect(effects.loadGroupingCards).toHaveBeenCalledTimes(1);
+    });
+    it.each(['missing', 'throws', 'malformed aliases'])('fails closed for lost aliases when the card snapshot %s while numeric ids still prepare', async mode => {
+      const queue = shapeQueue(rows.slice(0, 2));
+      const effects = fixture({ queue, spawns: queue.map(({ num }) => ({ num })) });
+      if (mode === 'throws') effects.loadGroupingCards = vi.fn(async () => { throw new Error('backlog unavailable'); });
+      if (mode === 'malformed aliases') effects.loadGroupingCards = vi.fn(async () => [
+        { ...rows[0], bornAs: 'xabcdef0\n', id: 'xabcdef0/invalid-card' },
+      ]);
+      effects.readRuntimePriority = () => only(['xabcdef0', '7202']);
+      const tick = await runBuildDispatchTick({ live: true, effects });
+      expect(launchedNums(effects)).toEqual(['7202']);
+      expect(tick.prepare.skippedInPlanning).toEqual([{ num: '7201', reason: 'not-in-runtime-only-list' }]);
+      if (effects.loadGroupingCards) expect(effects.loadGroupingCards).toHaveBeenCalledTimes(1);
+    });
+    it('fails closed when the list is unreadable or malformed', async () => {
+      for (const reader of [() => ({ ids: [], source: 'runtime-malformed', only: true, held: true }), () => { throw new Error('boom'); }]) {
+        const effects = fixture({ spawns: [rows[0], rows[1]] });
+        effects.readRuntimePriority = reader;
+        await runBuildDispatchTick({ live: true, effects });
+        expect(effects.dispatch).not.toHaveBeenCalled();
+      }
+    });
+    it('expired runtime list is ignored', async () => {
+      const read = ageHours => readBuildPrioritySettings({ env: {}, read: () => ({}), runtimePath: '/x', now: () => Date.parse('2026-11-20T18:00:00Z'),
+        readRuntime: () => JSON.stringify({ ids: ['7202'], mode: 'only', setBy: 't', at: new Date(Date.parse('2026-11-20T18:00:00Z') - ageHours * 3600e3).toISOString(), ttlHours: 5 }) });
+      expect(read(1)).toMatchObject({ only: true, ids: ['7202'] });
+      const expired = read(10);
+      expect(expired.only).toBeFalsy();
+      expect(expired.runtime.line).toMatch(/^runtime list expired at \d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2} ET/);
+      const effects = fixture({ spawns: [rows[0]] });
+      effects.readRuntimePriority = () => expired;
+      const log = vi.spyOn(console, 'error').mockImplementation(() => {});
+      try { await runBuildDispatchTick({ live: true, effects }); expect(log.mock.calls.flat().join('\n')).toContain('runtime list expired at'); } finally { log.mockRestore(); }
+      expect(launchedNums(effects)).toContain('7201');
+    });
+  });
+
   it('uses enriched minimal queue rows for the per-group prepare pool', async () => {
     const queue = rows.slice(0, 4).map(({ num, scope }) => ({ num, scope, preparedDate: null }));
     const effects = fixture({ queue, spawns: [queue[0]] });
@@ -5001,5 +5139,23 @@ describe('prepare discovery under repository PR volume', () => {
       expect(existsSync(path) ? JSON.parse(readFileSync(path, 'utf8')).items?.['4413'] : undefined).toBeUndefined();
       expect(listBuildBackoffs({ path })).toEqual([]);
     } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+});
+
+describe('cliSpawnHoldLand runtime admission', () => {
+  it('refuses a restricted lead and rechecks the full group before the detached spawn', async () => {
+    const { withRuntimeAdmissionTick } = await import('../../../scripts/lib/runtime-admission.mjs');
+    spawnCalls.length = 0;
+    await withRuntimeAdmissionTick(() => ({ only: true, ids: [] }), async () => {
+      expect(await cliSpawnHoldLand({ num: '12', route: 'already-done' }))
+        .toMatchObject({ spawned: false, reason: 'runtime-only' });
+      return {};
+    });
+    await withRuntimeAdmissionTick(() => ({ only: true, ids: ['12'] }), async () => {
+      expect(await cliSpawnHoldLand({ num: '12', groupMembers: ['13'], route: 'already-done' }))
+        .toMatchObject({ outcome: 'runtime-refused' });
+      return {};
+    });
+    expect(spawnCalls).toEqual([]);
   });
 });

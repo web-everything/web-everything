@@ -17,8 +17,10 @@ import { reviewLoopAutoConfirm } from '../../lib/review-loop-policy.mjs';
  */
 
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
+import { drainScoredGit } from '../../__tests__/fixtures/drain-scored-git.mjs';
 import { mkdtempSync, symlinkSync, mkdirSync, readFileSync, readdirSync, rmSync, existsSync, writeFileSync, realpathSync, statSync } from 'node:fs';
 import { checkBodyFileLocation, bodyFileRoots } from '../../review-set-label.mjs';
+import { assertOperatorCliFresh, OPERATOR_CLI_STALE_MARKER, STALE_MAIN_REFUSAL_MARKER } from '../../lib/main-staleness.mjs';
 import { execFileSync, spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { tmpdir } from 'node:os';
@@ -1009,6 +1011,72 @@ describe('the label sink', () => {
 
   // A child that never started (spawn refused) wrote nothing; one that ran and was killed or exited stays UNKNOWN.
   const gateOk = async () => ({ allowed: true, headSha: 'a'.repeat(40), reason: 'required-checks-successful' });
+  const staleRefusal = (spawn) => {
+    try {
+      assertOperatorCliFresh(root, {
+        label: 'review-set-label', skipUnderVitest: false,
+        env: { WE_OPERATOR_CLI_FRESH_FALLBACK: spawn ? 'on' : 'off' },
+        ...(spawn ? { spawn, cwd: root, argv: [process.execPath, `${root}/scripts/review-set-label.mjs`],
+          exists: () => true, write: () => {} } : {}),
+        run: (args, opts) => ({ status: 0, stdout: args[0] === 'rev-list' ? (opts.cwd === root ? '2' : '0')
+          : args[0] === 'rev-parse' ? `${root}/fresh` : '' }),
+        listBehindFiles: () => ['scripts/review-set-label.mjs'],
+      });
+    } catch (error) { return error.message; }
+    throw new Error('fixture did not reach the stale guard');
+  };
+
+  it('recognises the real operator stale refusal as proven pre-write', () => {
+    expect(isPreWriteRefusal(staleRefusal())).toBe(true);
+  });
+
+  it('records the stale label refusal as failed and resumes only the label with fresh code', async () => {
+    const registry = createRegistry();
+    registry.register(op('stale-label-retry', {
+      record: effectStep({ effects: () => [
+        { type: REVIEW_EFFECTS.WRITE_UP, payload: { bodyFile: payload.bodyFile, body: '# verdict' }, idempotent: true },
+        { type: REVIEW_EFFECTS.LABEL, payload, idempotent: false },
+      ] }),
+    }));
+    const store = createMemoryRunStore();
+    const run = advanceWhileRunning(startRun({ op: 'stale-label-retry', id: 'stale-label', registry }), { registry });
+    const staleNode = vi.fn(() => { throw Object.assign(new Error('exit 1'), { stdout: JSON.stringify({ error: staleRefusal() }) }); });
+    const first = createReviewPrSinks({ root, runStore: store, publishGate: gateOk, runNode: staleNode });
+    const writeUp = vi.fn(first[REVIEW_EFFECTS.WRITE_UP]);
+    first[REVIEW_EFFECTS.WRITE_UP] = writeUp;
+    const halted = await applyPendingEffects(run, { store, sinks: first });
+    expect(halted.error).toMatchObject({ notApplied: true });
+    expect(store.read(run.id).effects.map(e => e.status)).toEqual(['applied', 'failed']);
+    expect(staleNode).toHaveBeenCalledTimes(1);
+
+    const freshNode = vi.fn(() => '{"ok":true,"pr":7,"to":"accepted"}');
+    const resumed = await applyPendingEffects(store.read(run.id), { store, sinks: {
+      ...createReviewPrSinks({ root, runStore: store, publishGate: gateOk, runNode: freshNode }),
+      [REVIEW_EFFECTS.WRITE_UP]: writeUp,
+    } });
+    expect(resumed.run.effects.map(e => e.status)).toEqual(['applied', 'applied']);
+    expect(writeUp).toHaveBeenCalledTimes(1);
+    expect(freshNode).toHaveBeenCalledTimes(1);
+    expect(freshNode.mock.calls[0][0]).toContain('--to=accepted');
+  });
+
+  it.each(['transport', 'missing no-write suffix', 'missing operator marker', 'missing stale marker',
+    'fresh child signal death', 'fresh child error'])(
+    '%s failure stays UNKNOWN', async kind => {
+      const text = kind === 'fresh child signal death' ? staleRefusal(() => ({ status: null, signal: 'SIGTERM' }))
+        : kind === 'fresh child error' ? staleRefusal(() => ({ error: new Error('child failed') }))
+        : kind === 'transport' ? 'fatal: unable to access'
+        : kind === 'missing no-write suffix' ? staleRefusal().replace('Nothing was changed.', '')
+          : staleRefusal().replace(kind === 'missing operator marker' ? OPERATOR_CLI_STALE_MARKER : STALE_MAIN_REFUSAL_MARKER, '');
+      expect(isPreWriteRefusal(text)).toBe(false);
+      const sinks = createReviewPrSinks({ root, publishGate: gateOk,
+        runNode: () => { throw Object.assign(new Error('exit 1'), { stdout: JSON.stringify({ error: text }) }); } });
+      const error = await sinks[REVIEW_EFFECTS.LABEL](payload, CTX).catch(e => e);
+      expect(error.message).toContain('outcome is UNKNOWN');
+      expect(error.notApplied).toBeUndefined();
+      expect(sinks[REVIEW_EFFECTS.LABEL].provablyNotApplied({ error: error.message })).toBe(false);
+    },
+  );
   it.each(['ENOENT', 'EAGAIN', 'ENOMEM', 'E2BIG'])('a single home that could not be started (%s) is notApplied', async (code) => {
     const sinks = createReviewPrSinks({ root, publishGate: gateOk,
       runNode: () => { throw Object.assign(new Error(`spawnSync node ${code}`), { code, status: null, signal: null }); } });
@@ -3637,7 +3705,7 @@ describe('#5135 fix range read wiring', () => {
     const calls = [];
     const exec = (file, args) => {
       calls.push(args);
-      return args[0] === 'rev-parse' ? head : '';
+      return drainScoredGit(args, { gitDir: tmpdir(), head, files: [] })?.stdout || '';
     };
     const result = readPr({ pr: 7, repo: 'o/n', exec, originRepo: () => 'o/n', readView: () => ({
       number: 7, title: 't', body: '', headRefName: 'lane/x', labels: [], files: [],
@@ -3864,11 +3932,12 @@ describe('card 5470: the advise step declares the shadow effect in on mode too',
 // ── Held item 177 — the stack-aware read and the STACK_HOLD sink ──────────────────────────────────────────────────────
 describe('held item 177: readPr judges a stacked top against its stack base', () => {
   const HEAD = 'a'.repeat(40);
-  const TREE = 'b'.repeat(40);
+  const MAIN_BASE = 'b'.repeat(40); // drainScoredGit's pinned main basis
+  const TREE = 'e'.repeat(40);
   const STACK_DIFF = 'diff --git a/own.mjs b/own.mjs\n--- a/own.mjs\n+++ b/own.mjs\n@@ -1 +1 @@\n-old\n+new\n';
   const view = () => ({ number: 7, title: 't', body: '', headRefName: 'lane/x', labels: [], files: [], comments: [] });
   // The main-basis diff is whatever the git stub prints; empty here, so a stack read is distinguishable from it.
-  const exec = (_file, args) => (args[0] === 'rev-parse' ? HEAD : '');
+  const exec = (_file, args) => drainScoredGit(args, { gitDir: tmpdir(), head: HEAD, files: [] })?.stdout || '';
   const stack = (over = {}) => ({ pr: 4624, ref: 'lane/red-main-contain', head: 'c'.repeat(40), contained: 'd'.repeat(40), tree: TREE, topHead: HEAD, ...over });
   const read = (over = {}) => {
     const calls = { stack: [], text: [], files: [] };
@@ -3895,6 +3964,7 @@ describe('held item 177: readPr judges a stacked top against its stack base', ()
     expect(out.stackBase).toBeUndefined();
     expect(out.diff.text).not.toBe(STACK_DIFF);
     expect(calls.text).toEqual([]);
+    expect(out.net).toMatchObject({ base: MAIN_BASE, paths: [], scored: true });
   });
   it.each([
     ['no stack', { readStack: () => null }],
@@ -3907,6 +3977,8 @@ describe('held item 177: readPr judges a stacked top against its stack base', ()
     expect(out.stackBase).toBeUndefined();
     expect(out.diff.text).not.toBe(STACK_DIFF);
     expect(out.net.base).not.toBe(TREE);
+    expect(out.diff).toMatchObject({ text: '', base: MAIN_BASE, scored: true });
+    expect(out.net).toMatchObject({ base: MAIN_BASE, paths: [], scored: true });
   });
 });
 
@@ -4386,7 +4458,7 @@ describe('strict accept publish wait ignores verdict-dependent required checks',
       root,
       env: { WE_REVIEW_START_EARLY: 'on', WE_REVIEW_START_AFTER: 'push', WE_REVIEW_START_EARLY_PUBLISH_WAIT_MS: '250', WE_REVIEW_START_EARLY_POLL_MS: '100' },
       runNode, sleep, now: () => time, out: () => {}, readPublishHead: () => head,
-      publishGate: async () => decorate({ ...reviewCiGate({ headSha: head, requiredChecks, checks }), requiredChecks, checks }),
+      publishGate: async () => decorate({ ...reviewCiGate({ headSha: head, rowsComplete: true, rowsHead: head, requiredChecks, checks }), requiredChecks, checks }),
     });
     await sinks[REVIEW_EFFECTS.WRITE_UP]({ bodyFile: 'v.md', body: '# verdict' }, { runId: 'r' });
     const publish = () => sinks[REVIEW_EFFECTS.LABEL]({ repo: 'o/n', pr: 7, to: 'accepted', actor: 'operator', bodyFile: 'v.md', reviewedHead: head }, { runId: 'r' });

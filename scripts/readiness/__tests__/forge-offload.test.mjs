@@ -849,6 +849,12 @@ fs.copyFileSync('a.test.mjs','node_modules/fixture/value');
   // only as an rsync --copy-dest basis, and Forge still verifies every byte.
   describe('presync',()=>{
     const gitDir=()=>join(repo,'.git');
+    // Pin canonical legacy policy so these compatibility tests never read host policy.
+    const presync=options=>remote.presync({home:root,...options});
+    beforeEach(async()=>{
+      await fs.mkdir(join(root,'.claude'));
+      await fs.writeFile(join(root,'.claude','platform-preferences.json'),JSON.stringify({heavyAdmission:{remote:{manifest:'legacy'}}}));
+    });
     // Fake transport around the real runner: presync rsync mirrors the stage
     // into a local cache dir; run rsync honours --copy-dest like real rsync,
     // or plants wrong bytes when tamper is set.
@@ -888,9 +894,37 @@ fs.copyFileSync('a.test.mjs','node_modules/fixture/value');
     }
     const runRsync=calls=>calls.filter(c=>c.file==='rsync'&&c.args.at(-1).includes('/work/'));
     const presyncRsync=calls=>calls.filter(c=>c.file==='rsync'&&c.args.at(-1).includes('/presync/'));
+    it.each(['direct','redirected'].flatMap(mode=>
+      ['missing','tracked','invalid','malformed','oversized','invalid object','unreadable'].map(fault=>[mode,fault])))('presync is a no-op for %s canonical %s policy despite a usable base and dirty/untracked bytes',async(mode,fault)=>{
+      const f=await setup(),t=presyncTransport(f);
+      await fs.writeFile(join(repo,'scratch.txt'),'private untracked bytes');
+      const path=join(root,'.claude','platform-preferences.json');
+      if(fault==='tracked'||fault==='invalid')await fs.writeFile(path,JSON.stringify({heavyAdmission:{remote:{manifest:fault==='tracked'?'tracked':'trackd'}}}));
+      if(fault==='missing')await fs.rm(path);
+      if(fault==='malformed')await fs.writeFile(path,'{');
+      if(fault==='oversized')await fs.writeFile(path,JSON.stringify({padding:'x'.repeat(4*1024*1024+1)}));
+      if(fault==='invalid object')await fs.writeFile(path,'[]');
+      if(fault==='unreadable'){await fs.rm(path);await fs.mkdir(path);}
+      const redirected=join(root,'redirected.json');
+      await fs.writeFile(redirected,JSON.stringify({heavyAdmission:{remote:{manifest:'legacy',enabled:true}}}));
+      const round=await presync({cwd:repo,exec:t.transport,sshOptions:[],env:{...process.env,WE_PLATFORM_PREFERENCES:mode==='redirected'?redirected:undefined}});
+      expect(round).toEqual({status:'skipped',reason:fault==='tracked'?'tracked-manifest':expect.stringContaining(fault==='invalid'?'invalid remote.manifest':'canonical remote.manifest unavailable')});
+      expect(t.calls).toEqual([]);
+      expect(await remote.readPresyncState(gitDir())).toBeNull();
+      await expect(fs.stat(join(gitDir(),'forge-presync.lock'))).rejects.toMatchObject({code:'ENOENT'});
+    },30_000);
+    it.each(['legacy','no key'])('legacy presync still ships dirty and untracked delta leaves with %s canonical policy',async policyCase=>{
+      const f=await setup(),t=presyncTransport(f);
+      if(policyCase==='no key')await fs.writeFile(join(root,'.claude','platform-preferences.json'),'{}');
+      await fs.writeFile(join(repo,'scratch.txt'),'legacy untracked bytes');
+      expect(await presync({cwd:repo,exec:t.transport,sshOptions:[],env:{...process.env,WE_PLATFORM_PREFERENCES:undefined}})).toMatchObject({status:'synced',count:2});
+      const state=await remote.readPresyncState(gitDir());
+      expect(await fs.readFile(join(t.cacheRoot,state.key,'scratch.txt'),'utf8')).toBe('legacy untracked bytes');
+      expect(await fs.readFile(join(t.cacheRoot,state.key,'a.test.mjs'),'utf8')).toBe('changed');
+    },30_000);
     it('ships only delta leaves with no env, then the run claims them as a checksum basis and verifies',async()=>{
       const f=await setup(),t=presyncTransport(f);
-      const round=await remote.presync({cwd:repo,exec:t.transport,sshOptions:[],env:{GITHUB_TOKEN:'ghs_secret',ANTHROPIC_API_KEY:'sk-secret',PATH:process.env.PATH}});
+      const round=await presync({cwd:repo,exec:t.transport,sshOptions:[],env:{GITHUB_TOKEN:'ghs_secret',ANTHROPIC_API_KEY:'sk-secret',PATH:process.env.PATH}});
       expect(round).toMatchObject({status:'synced',count:1,bytes:7});
       const state=await remote.readPresyncState(gitDir());
       expect(state.baseManifestDigest).toBe(f.base.manifestDigest);
@@ -912,7 +946,7 @@ fs.copyFileSync('a.test.mjs','node_modules/fixture/value');
     },30_000);
     it('catches a wrong cached basis with the Forge manifest check and retries a full ship',async()=>{
       const f=await setup(),t=presyncTransport(f,{tamper:true});
-      expect((await remote.presync({cwd:repo,exec:t.transport,sshOptions:[]})).status).toBe('synced');
+      expect((await presync({cwd:repo,exec:t.transport,sshOptions:[]})).status).toBe('synced');
       const result=await remote.runRemote({argv:f.request.argv,cwd:repo,exec:t.transport,log:vi.fn(),sshOptions:[]});
       // Never a pass on the wrong bytes: the delta run is refused, the full ship runs clean.
       expect(result).toMatchObject({mode:'remote',code:0});
@@ -923,7 +957,7 @@ fs.copyFileSync('a.test.mjs','node_modules/fixture/value');
     },30_000);
     it.each(['other base','edited after presync','other host','corrupt state','no state'])('offers no basis for a stale or mismatched presync: %s',async fault=>{
       const f=await setup(),t=presyncTransport(f);
-      expect((await remote.presync({cwd:repo,exec:t.transport,sshOptions:[]})).status).toBe('synced');
+      expect((await presync({cwd:repo,exec:t.transport,sshOptions:[]})).status).toBe('synced');
       const path=join(gitDir(),'forge-presync.json'),state=JSON.parse(await fs.readFile(path,'utf8'));
       if(fault==='other base')state.baseManifestDigest='0'.repeat(64);
       if(fault==='other host')state.host='elsewhere';
@@ -939,7 +973,7 @@ fs.copyFileSync('a.test.mjs','node_modules/fixture/value');
     it.each(['rsync fails','cache dir refused','ssh throws'])('records a presync failure and leaves the run unchanged: %s',async fault=>{
       const f=await setup(),t=presyncTransport(f,{presyncCopyCode:fault==='rsync fails'?23:0,mkdirCode:fault==='cache dir refused'?1:0});
       const transport=fault==='ssh throws'?vi.fn(async call=>{if(call.file==='ssh')throw new Error('ssh down');return t.transport(call);}):t.transport;
-      const round=await remote.presync({cwd:repo,exec:transport,sshOptions:[]});
+      const round=await presync({cwd:repo,exec:transport,sshOptions:[]});
       expect(round.status).toBe('failed');
       const state=await remote.readPresyncState(gitDir());
       expect(state.error).toEqual(expect.any(String));
@@ -952,11 +986,11 @@ fs.copyFileSync('a.test.mjs','node_modules/fixture/value');
     it('holds one round per lane and takes over only a dead holder lock',async()=>{
       const f=await setup(),t=presyncTransport(f),lock=join(gitDir(),'forge-presync.lock');
       await fs.writeFile(lock,`${process.pid}\n`);
-      expect(await remote.presync({cwd:repo,exec:t.transport,sshOptions:[]})).toEqual({status:'busy'});
+      expect(await presync({cwd:repo,exec:t.transport,sshOptions:[]})).toEqual({status:'busy'});
       expect(t.calls.some(c=>c.file!=='git')).toBe(false);
       const dead=spawnSync(process.execPath,['-e','process.stdout.write(String(process.pid))']).stdout.toString();
       await fs.writeFile(lock,`${dead}\n`);
-      expect((await remote.presync({cwd:repo,exec:t.transport,sshOptions:[]})).status).toBe('synced');
+      expect((await presync({cwd:repo,exec:t.transport,sshOptions:[]})).status).toBe('synced');
     },30_000);
     it('reuses a cached base manifest only when it hashes to the freshly advertised digest',async()=>{
       const f=await setup(),t=presyncTransport(f);

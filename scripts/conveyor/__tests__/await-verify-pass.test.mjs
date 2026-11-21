@@ -4,6 +4,9 @@ import { execFileSync } from 'node:child_process';
 import { mkdtempSync, writeFileSync, rmSync, lstatSync, existsSync, utimesSync, readdirSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+// Load the cyclic dispatch graph during collection so default IO construction does not
+// cold-import it inside a timed test (see docs/agent/testing.md, drain fixture imports).
+import '../../operations/dispatch-abort.mjs';
 import { computeWorkingTreeHash } from '../../lib/verify-lane-gate.mjs';
 import { verifyFinishBody, verificationInfrastructureFailure } from '../../lib/lane-verify.mjs';
 import { laneGitHardeningEnv, hardenLaneGitArgs, laneFilterDrivers, LANE_CONFIG_LIST_ARGS, LANE_GIT_CONFIG_PINS } from '../../lib/lane-git-hardening.mjs';
@@ -377,7 +380,7 @@ describe('runAwaitVerifyPass', () => {
       expect(rows[0].result).toMatch(/^error: session listing incomplete \(claude agents listing failed: claude agents timed out\)/);
       expect(h.calls.push).toEqual([]);
       expect(h.store.size).toBe(1);
-    });
+    }, 15_000); // ~1.8s locally, but it spawns real children and blew the 5000ms default on loaded CI shards (#7179 shard 8); sized from CI, not local
   });
   it('logs one line per action and a waiting count', async () => {
     expect(formatAwaitVerifyLines({ rows: [{ action: 'wait' }, { action: 'push', repo: 'r', pr: 1, sha: SHA, reason: 'green', result: 'pushed' }] }))

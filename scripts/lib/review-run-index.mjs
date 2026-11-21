@@ -6,6 +6,7 @@ import { mkdirSync, readdirSync, readFileSync, statSync, writeFileSync } from 'n
 import { createHash, randomUUID } from 'node:crypto';
 import { basename, dirname, join } from 'node:path';
 import { isValidRunId, parseRunRecord } from '../operations/run-record.mjs';
+import { NAME_RE, listRunIds } from '../operations/run-store.mjs';
 import { withFileLock, writeJsonAtomic } from './atomic-json-file.mjs';
 
 /** Shared scan/backfill guard: even unrelated malformed evidence prevents a negative proof. */
@@ -33,6 +34,33 @@ const reviewId = id => isValidRunId(id) && id.startsWith('review-pr-');
 const keyOf = (repo, pr) => typeof repo === 'string' && /^[\w.-]+\/[\w.-]+$/.test(repo)
   && Number.isSafeInteger(Number(pr)) && Number(pr) > 0 ? `${repo}#${Number(pr)}` : null;
 export const reviewRunIndexPath = runsDir => join(dirname(runsDir), `${basename(runsDir)}-review-index.json`);
+/** Filename discovery is a complete candidate set only while the names stay stable.
+ * One top-level readdir, no name or metadata exclusion. All review ids require parsing.
+ * Claims and archived evidence require operator restoration before proving absence. */
+export function readNamedCandidates(runsDir, repo, pr, { list = listRunIds, readdir = readdirSync } = {}) {
+  try {
+    if (!keyOf(repo, pr)) return null;
+    const names = readdir(runsDir).sort();
+    if (names.some(name => /^\.review-pr-.*\.archiving-/.test(name))) return null;
+    if (names.includes('archive')) {
+      const archiveDir = join(runsDir, 'archive', 'review-pr');
+      try {
+        // Flat archives have no verified repo/PR key. Any review filename may
+        // hide this PR's evidence; restore it before proving absence.
+        if (readdir(archiveDir).some(name => name.startsWith('review-pr-') && name.endsWith('.json'))) return null;
+      } catch (error) { if (error.code !== 'ENOENT') return null; }
+      try {
+        if (readdir(join(archiveDir, ...repo.split('/'), String(Number(pr)))).length) return null;
+      } catch (error) { if (error.code !== 'ENOENT') return null; }
+    }
+    const all = list === listRunIds
+      ? names.filter(name => name.endsWith('.json')).map(name => name.slice(0, -5)).filter(reviewId)
+      : list(runsDir).filter(reviewId).sort();
+    const legacy = all.filter(id => !NAME_RE.test(id)).length;
+    return Object.defineProperty({ ids: all, source: 'names', legacy, mismatch: 0 }, 'snapshot', { value: JSON.stringify([names, all]) });
+  } catch { return null; }
+}
+
 function readJson(path, maxBytes = MAX_BYTES) {
   if (statSync(path).size > maxBytes) throw Error('review index oversized');
   return JSON.parse(readFileSync(path, 'utf8'));

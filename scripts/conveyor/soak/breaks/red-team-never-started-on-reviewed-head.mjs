@@ -95,6 +95,7 @@ export default {
       const setting = { enabled: true, retryCooldownMin: 30 };
       const tick = phase => {
         const rawPrs = cases.map(c => ({ number: c.number, headRefOid: head, state: 'OPEN',
+          rowsComplete: true, rowsHead: head,
           headRefName: 'lane/soak-accepted', baseRefName: 'main', mergeStateStatus: 'CLEAN',
           statusCheckRollup: [{ name: 'gate', status: 'completed', conclusion: 'success' }],
           comments: [{ body: buildReviewedShaMarker(head), author: { login: 'web-everything' } }, ...(c.comments ?? [])],

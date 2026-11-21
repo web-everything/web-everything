@@ -216,10 +216,14 @@ export const LOCK_HOLDERS = Object.freeze(['scripts/lib/atomic-json-file.mjs', '
   // review head index (an exclusive create) and the fix-ready record (an exclusive create and a lock file name).
   'scripts/conveyor/soak/breaks/infra-lock-waiter-busy-spins.mjs', 'scripts/lib/review-head-index.mjs',
   'scripts/operations/fix-ready-record.mjs',
+  // The urgent-verify receipt writer (an exclusive create and a lock directory).
+  'scripts/operations/urgent-verify.mjs',
   // Ghost recovery owns an operation lock as well as reserving the shared rerun budget.
   'scripts/operations/ci-ghost-rerun.mjs',
   // The ETag eviction stamp writer uses an exclusive `wx` create.
   'scripts/lib/gh-rest-read.mjs',
+  // The runtime build-priority writer serializes installs with an exclusive `wx` lock file.
+  'scripts/operations/build-priority-set-io.mjs',
   // The freeze last-good cache writer reserves its temp file with an exclusive `wx` create before the rename.
   'scripts/lib/freeze-last-good.mjs']);
 /** The imported names that take, renew or give up a hold (`withFileLock`, `withAddGuardLock`, `acquireFixDispatchClaim`,
@@ -247,6 +251,8 @@ export const LOCK_USERS = Object.freeze([
   'scripts/conveyor/auto-round-grant-io.mjs', 'scripts/conveyor/await-verify-loop.mjs',
   'scripts/conveyor/await-verify.mjs', 'scripts/conveyor/build-dispatch-claim.mjs',
   'scripts/conveyor/build-dispatch-hold-router.mjs', 'scripts/conveyor/build-dispatch-orphan-adopt.mjs',
+  // The CI-heal child reserves its cycle lock through file-locks.mjs.
+  'scripts/conveyor/ci-heal-loop.mjs',
   'scripts/conveyor/fix-claim-store.mjs', 'scripts/conveyor/fix-dispatch-claim.mjs',
   'scripts/conveyor/fix-procedure.mjs', 'scripts/conveyor/fixer-stuck-reclaim.mjs',
   'scripts/conveyor/health-responder.mjs', 'scripts/conveyor/land-overlap-yield.mjs',

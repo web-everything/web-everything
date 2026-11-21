@@ -1,3 +1,4 @@
+import { pinnedLeafDiffFixture } from './fixtures/pinned-leaf-diff-fixture.mjs';
 /** #4389 — exercise the real drain with hermetic git/gh shims; no real PRs are touched. */
 import { daemonAppEnv } from './fixtures/daemon-app-env.mjs';
 import { describe, it, expect } from 'vitest';
@@ -8,6 +9,7 @@ import { tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { openPrPageFixture } from './fixtures/open-pr-page-fixture.mjs';
+import { completeCheckReadFixture } from './fixtures/complete-check-read-fixture.mjs';
 import * as drain from '../merge-ai-prs.mjs';
 
 // Cover the 6x load cap (even if load rises later), an explicit override, and fixture cleanup.
@@ -26,6 +28,9 @@ const openPrPageFixture = ${openPrPageFixture};
 const prs = JSON.parse(fs.readFileSync(process.env.ISOLATION_FIXTURE, 'utf8'));
 const landed = n => fs.existsSync(process.env.ISOLATION_FIXTURE + '.merged-' + n);
 const out = x => { process.stdout.write(JSON.stringify(x)); process.exit(0); };
+const completeCheckReadFixture = ${completeCheckReadFixture};
+const checkPages = completeCheckReadFixture(prs, a);
+if (checkPages !== undefined) out(checkPages);
 if (a[0] === 'repo' && a[1] === 'view') { process.stdout.write('main'); process.exit(0); }
 if (a[0] === 'pr' && a[1] === 'list') out(prs.filter(p => !landed(p.number)));
 // The drain's candidate listing reads small GraphQL pages (pr-list-paged.mjs); the shared fixture serves them.
@@ -45,9 +50,10 @@ if (a[0] === 'pr' && a[1] === 'merge') {
 process.exit(0);
 `;
 const fakeGit = `#!/usr/bin/env node
-const a = process.argv.slice(2);
+let a = process.argv.slice(2);
+while (a[0] === '-c') a = a.slice(2); // the net-diff wrapper prepends hardening -c flags
 if (a[0] === 'remote' && a[1] === 'get-url') process.stdout.write('git@github.com:web-everything/web-everything.git\\n');
-if (a[0] === 'diff') process.exit(1);
+${pinnedLeafDiffFixture}
 process.exit(0);
 `;
 
@@ -56,14 +62,15 @@ function runCli({ failAll = false, watch = false } = {}) {
   try {
     const bin = join(dir, 'bin');
     mkdirSync(bin);
+    mkdirSync(join(dir, '.git'));
     for (const [name, code] of [['gh', fakeGh], ['git', fakeGit]]) writeFileSync(join(bin, name), code, { mode: 0o755 });
     const fixture = join(dir, 'prs.json');
     writeFileSync(fixture, JSON.stringify([2879, 2880].map(number => ({
       number, title: `independent leaf ${number}`, body: 'A real summary.', headRefName: `lane/leaf-${number}`,
-      baseRefName: 'main', headRefOid: `sha-${number}`, mergeable: 'MERGEABLE', mergeStateStatus: 'CLEAN',
+      baseRefName: 'main', headRefOid: number.toString(16).padStart(40, '0'), mergeable: 'MERGEABLE', mergeStateStatus: 'CLEAN',
       statusCheckRollup: [{ name: 'test', conclusion: 'SUCCESS', status: 'COMPLETED' }],
       labels: [{ name: 'ready-to-merge' }], comments: [],
-      commits: [{ oid: `sha-${number}`, authors: [{ name: 'Claude', email: 'noreply@anthropic.com' }] }],
+      commits: [{ oid: number.toString(16).padStart(40, '0'), authors: [{ name: 'Claude', email: 'noreply@anthropic.com' }] }],
       files: [{ path: `backlog/leaf-${number}.md`, additions: 1, deletions: 0, changeType: 'ADDED' }],
     }))));
     // Keep the real lock implementation, but isolate its os.homedir()-based state from the resident drain.
@@ -77,6 +84,11 @@ function runCli({ failAll = false, watch = false } = {}) {
     });
     expect(r.error, r.stderr).toBeUndefined();
     const result = JSON.parse(r.stdout.trim().split('\n').at(-1));
+    for (const number of [2879, 2880]) {
+      expect(r.stderr).toContain(`net-diff #${number}: base=${'b'.repeat(40)} head=${number.toString(16).padStart(40, '0')}`);
+    }
+    expect(r.stderr).not.toContain('net diff unverified');
+    if (!watch) expect(result.parked, r.stderr).toEqual([]);
     const attempts = readFileSync(fixture + '.attempts', 'utf8').trim().split('\n').map(Number);
     if (process.env.DRAIN_ISOLATION_PROOF) console.log(JSON.stringify({ watch, failAll, status: r.status, attempts, result }));
     return { status: r.status, result, attempts };

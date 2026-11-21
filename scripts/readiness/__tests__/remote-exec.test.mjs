@@ -15,7 +15,7 @@ import { createHash } from 'node:crypto';
 import * as filesystem from 'node:fs/promises';
 import {
   isAllowedCommand, filterEnv, validateRunId,
-  runRemote as timedRunRemote, main as runRemoteCli, parseArgs,
+  runRemote as timedRunRemote, main as remoteCliMain, parseArgs,
 } from '../remote-exec.mjs';
 import { createRunner, digestInput, digestArgv } from '../forge-exec-run.mjs';
 import * as remoteManifestAPI from '../remote-exec.mjs';
@@ -57,6 +57,14 @@ const forbiddenEnv = {
 };
 let cwd;
 const auxiliary=[];
+// CLI enablement requires canonical manifest evidence, even when the key is omitted.
+const runRemoteCli = options => {
+  const home = mkdtempSync(join(process.env.TMPDIR, 'remote-cli-policy-'));
+  auxiliary.push(home);
+  mkdirSync(join(home, '.claude'));
+  writeFileSync(join(home, '.claude', 'platform-preferences.json'), '{}');
+  return remoteCliMain({ home, ...options });
+};
 beforeEach(() => {
   // Task scratch must stay under the launcher-provided TMPDIR.
   cwd = realpathSync(mkdtempSync(join(process.env.TMPDIR, 'remote-exec-test-')));
@@ -2059,20 +2067,20 @@ describe('explicit remote CLI decision', () => {
     ['remote failure', {mode:'remote', code:23}, 23],
   ])('%s exits without a local rerun even when remote defaults are disabled', async (_name, result, code) => {
     const remoteExec = vi.fn(async () => result), local = vi.fn();
-    expect(await remoteManifestAPI.main({argv,cwd,lockRoot:join(cwd,'heavy'), remoteExec, local, log:vi.fn()})).toBe(code);
+    expect(await runRemoteCli({argv,cwd,lockRoot:join(cwd,'heavy'), remoteExec, local, log:vi.fn()})).toBe(code);
     expect(remoteExec).toHaveBeenCalledTimes(1);
     expect(local).not.toHaveBeenCalled();
   });
   it('thrown remote execution exits 124 without a local rerun', async () => {
     const local = vi.fn();
-    await expect(remoteManifestAPI.main({argv,cwd,lockRoot:join(cwd,'heavy'), remoteExec:async () => {throw new Error('disconnected');}, local, log:vi.fn()})).resolves.toBe(124);
+    await expect(runRemoteCli({argv,cwd,lockRoot:join(cwd,'heavy'), remoteExec:async () => {throw new Error('disconnected');}, local, log:vi.fn()})).resolves.toBe(124);
     expect(local).not.toHaveBeenCalled();
   });
   it('timeout exits 124 without a local rerun', async () => {
     vi.useFakeTimers();
     const local = vi.fn();
     try {
-      const pending = remoteManifestAPI.main({argv,cwd,lockRoot:join(cwd,'heavy'), timeoutMs:10, remoteExec:() => new Promise(() => {}), local, log:vi.fn()});
+      const pending = runRemoteCli({argv,cwd,lockRoot:join(cwd,'heavy'), timeoutMs:10, remoteExec:() => new Promise(() => {}), local, log:vi.fn()});
       await vi.dynamicImportSettled();
       // An unconfirmed remote still exits 124 after the default 180s cancellation wait.
       await vi.advanceTimersByTimeAsync(180010);
@@ -2082,14 +2090,14 @@ describe('explicit remote CLI decision', () => {
   });
   it.each(['not-started', 'cancelled'])('confirmed %s may enter local admission', async mode => {
     const local = vi.fn(async () => 7);
-    expect(await remoteManifestAPI.main({argv,cwd,lockRoot:join(cwd,'heavy'), remoteExec:async () => ({mode, terminated:true}), local, log:vi.fn()})).toBe(7);
+    expect(await runRemoteCli({argv,cwd,lockRoot:join(cwd,'heavy'), remoteExec:async () => ({mode, terminated:true}), local, log:vi.fn()})).toBe(7);
     expect(local).toHaveBeenCalledTimes(1);
     expect(local).toHaveBeenCalledWith(argv);
   });
   it('returns the local exit code after an ignored-test-file prelaunch refusal', async () => {
     const remoteExec = vi.fn(async () => ({mode:'not-started', terminated:true, reason:'ignored-test-file'}));
     const local = vi.fn(async () => 7), log = vi.fn();
-    expect(await remoteManifestAPI.main({argv,cwd,lockRoot:join(cwd,'heavy'), remoteExec, local, log})).toBe(7);
+    expect(await runRemoteCli({argv,cwd,lockRoot:join(cwd,'heavy'), remoteExec, local, log})).toBe(7);
     expect(remoteExec).toHaveBeenCalledTimes(1);
     expect(local).toHaveBeenCalledWith(argv);
     expect(log).toHaveBeenCalledWith(expect.stringContaining('ignored-test-file'));

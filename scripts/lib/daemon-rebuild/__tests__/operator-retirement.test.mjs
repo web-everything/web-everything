@@ -16,11 +16,15 @@ import { removeRegistration, retireRegistration } from '../../../daemon-overlay.
 import { createPrototypeLoader } from '../../../operations/prototype-load-io.mjs';
 import { OPERATOR_LOGINS } from '../../marker-authorship.mjs';
 
+const AUTOMATIC_RETIREMENT_REASONS = Object.freeze([
+  'in-main', 'pr-merged', 'pr-squash-merged', 'redundant-merge-sibling', 'superseded', 'urgent-failed', 'pr-closed',
+]);
+
 const ref = 'lane/overlay-fix';
 const sha = 'a'.repeat(40);
 const added = { kind: 'added', ref, at: '2026-11-14T10:00:00Z' };
 const actor = OPERATOR_LOGINS[0];
-const removed = { kind: 'auto-retired', ref, tip: sha, by: 'operator', actor, reason: 'retire fix', at: '2026-11-14T11:00:00Z' };
+const removed = { kind: 'auto-retired', ref, tip: sha, by: 'operator', actor, operatorReason: true, reason: 'retire fix', at: '2026-11-14T11:00:00Z' };
 // The last appended add is older than retirement; the earlier appended add is newer.
 const outOfOrderAdds = [{ ...added, at: '2026-11-14T12:00:00Z' }, added, removed];
 
@@ -89,6 +93,23 @@ describe('operator retirement of a live overlay', () => {
     expect(readOverlayEventLog(root, env)).toEqual([added]);
   });
 
+  it('ordinary in-main retirement with an allowlisted actor cannot authorize omission', async () => {
+    expect(await retireRegistration({ root, ref, expectedTip: sha, actor, env, deps: {
+      prove: () => ({ action: 'retire', tip: sha, reason: 'in-main' }), tip: () => sha,
+    } })).toMatchObject({ retired: true });
+    const event = readOverlayEventLog(root, env).at(-1);
+    expect(event).toMatchObject({ actor, reason: 'in-main' });
+    expect(adoption.overlayRetiredByOperator({ ref, sha, registered: () => false, events: [added, event] })).toBe(false);
+    refused();
+  });
+  it.each(['in-main', 'pr-merged', 'pr-squash-merged', 'redundant-merge-sibling', 'superseded', 'urgent-failed', 'pr-closed'])('rejects persisted automatic %s evidence even with operatorReason', reason => {
+    removeOverlay(root, ref, { env });
+    refused(match([added, { ...removed, reason }]));
+  });
+  it.each([undefined, false, 'true'])('requires exact boolean operatorReason, received %s', operatorReason => {
+    removeOverlay(root, ref, { env });
+    refused(match([added, { ...removed, operatorReason }]));
+  });
   it('automatic retireRegistration supplies no operator proof', async () => {
     expect(await retireRegistration({ root, ref, expectedTip: sha, env, by: 'prototype-load', deps: {
       prove: () => ({ action: 'retire', tip: sha, reason: 'in-main' }), tip: () => sha,
@@ -124,6 +145,46 @@ describe('operator retirement of a live overlay', () => {
     refused(match([added, removed, { ...removed, kind: 'auto-retired', actor: undefined }]));
   });
 
+  it('accepts explicit live-tip withdrawal of an auto-rebased replacement without an added event', () => {
+    removeOverlay(root, ref, { env });
+    const events = [
+      { kind: 'auto-rebase-registered', ref: 'lane/original', new: ref, newSha: sha, at: added.at },
+      { ...removed, actor: undefined, operatorReason: undefined },
+      { ...removed, acceptedOmission: true, at: '2026-11-14T12:00:00Z' },
+    ];
+    expect(match(events)).toMatchObject({ adopt: { finalSha: 'candidate' }, retired: [ref] });
+  });
+
+  it.each([
+    ['missing registration time', { at: undefined }],
+    ['invalid registration time', { at: 'invalid' }],
+    ['retirement before registration', { at: '2026-11-14T12:00:00Z' }],
+    ['retirement at registration time', { at: removed.at }],
+    ['wrong replacement', { new: 'lane/other' }],
+    ['unknown registration kind', { kind: 'mystery' }],
+  ])('refuses auto-rebase withdrawal with %s', (_name, override) => {
+    removeOverlay(root, ref, { env });
+    refused(match([
+      { kind: 'auto-rebase-registered', ref: 'lane/original', new: ref, newSha: sha, at: added.at, ...override },
+      { ...removed, acceptedOmission: true },
+    ]));
+  });
+
+  it('a later auto-rebase registration vetoes retirement even after hand removal', () => {
+    removeOverlay(root, ref, { env });
+    refused(match([added, removed,
+      { kind: 'auto-rebase-registered', ref: 'lane/original', new: ref, newSha: sha, at: '2026-11-14T12:00:00Z' },
+    ]));
+  });
+
+  it('checks every mixed registration timestamp despite append order', () => {
+    removeOverlay(root, ref, { env });
+    refused(match([
+      { kind: 'auto-rebase-registered', ref: 'lane/original', new: ref, newSha: sha, at: '2026-11-14T12:00:00Z' },
+      added, removed,
+    ]));
+  });
+
   it('still discards a candidate after hand removal without a record', () => {
     removeOverlay(root, ref, { env });
     refused();
@@ -137,7 +198,8 @@ describe('operator retirement of a live overlay', () => {
       // The real prepare phase reads both registry snapshots and the on-disk audit trail.
       // Git, planning and move/build effects are stubbed; no checkout or network is touched.
       env = { ...env, WE_DAEMON_STATE_DIR: join(root, 'state'),
-        WE_DAEMON_EVENTS: join(root, 'daemon-events.jsonl'), WE_DAEMON_AUTO_REBASE: '0' };
+        WE_DAEMON_EVENTS: join(root, 'daemon-events.jsonl'), WE_DAEMON_AUTO_REBASE: '0',
+        WE_DAEMON_OVERLAY_FOLLOW_TIP: 'audited-only' };
       const liveHead = 'b'.repeat(40);
       const mainSha = 'c'.repeat(40);
       const candidate = 'd'.repeat(40);
@@ -189,15 +251,22 @@ describe('operator retirement of a live overlay', () => {
         mainOnly: false, adoptOnly: true, prBaseChain: () => [] });
       expect(matching).toHaveBeenCalledOnce();
       expect(matching.mock.calls[0][0].liveApplied).toEqual([{ ref, sha }]);
-      expect(retirement).toHaveBeenCalledOnce();
-      // A same-tick drop clears registeredRefs but must retain overlaysBefore's veto.
-      expect(retirement.mock.calls[0][0].registered(ref))
-        .toBe(removal === 're-registered' || removal === 'removed-by-plan');
+      if (removal === 're-registered') {
+        // Audit enforcement preserves the registered overlay's identity before retirement exemptions.
+        expect(matching.mock.calls[0][0].auditedTip).toBeTypeOf('function');
+        expect(matching.mock.calls[0][0].registered(ref)).toBe(true);
+        expect(retirement).not.toHaveBeenCalled();
+      } else {
+        expect(retirement).toHaveBeenCalledOnce();
+        // A same-tick drop clears registeredRefs but must retain overlaysBefore's veto.
+        expect(retirement.mock.calls[0][0].registered(ref)).toBe(removal === 'removed-by-plan');
+      }
       const result = matching.mock.results[0].value;
       if (removal === 'operator-retired' || removal === 'retirement-recorded-during-plan') {
         expect(result).toMatchObject({ adopt: { finalSha: candidate }, retired: [ref] });
         expect(finalize).toHaveBeenCalledOnce();
       } else {
+        // Re-registration under audit enforcement must retain the running overlay's adopted identity.
         refused(result);
         expect(finalize).not.toHaveBeenCalled();
       }
@@ -212,6 +281,79 @@ describe('operator retirement of a live overlay', () => {
     expect(events.at(-1)).not.toHaveProperty('actor');
     expect(Number.isFinite(Date.parse(events.at(-1).at))).toBe(true);
     refused(match(events));
+  });
+
+  it.each([
+    'mainOnly benign removal', 'benign manual removal', 'removed during planning', 'auto-drop contract',
+    'audited omission', 'explicitly pinned omission', 're-registered pinned during planning',
+  ])('prepareRebuild adapter: %s', async (mode) => {
+    env = { ...env, WE_DAEMON_STATE_DIR: join(root, 'state'), WE_DAEMON_AUTO_REBASE: '0',
+      WE_DAEMON_OVERLAY_FOLLOW_TIP: mode === 'audited omission' ? 'audited-only' : 'follow' };
+    const liveHead = 'b'.repeat(40), mainSha = 'c'.repeat(40), candidate = 'd'.repeat(40);
+    const carried = 'lane/carried';
+    const mainOnly = mode === 'mainOnly benign removal';
+    const removedCarried = mainOnly || mode === 'benign manual removal';
+    const pinnedOmission = ['explicitly pinned omission', 're-registered pinned during planning'].includes(mode);
+    if (mode === 'explicitly pinned omission') addOverlay(root, { ref, pinned: true }, { env });
+    addOverlay(root, { ref: carried, pr: 100 }, { env });
+    appendOverlayEvent(root, { ...added, ref: carried }, { env });
+    if (removedCarried) {
+      removeOverlay(root, carried, { env });
+      appendOverlayEvent(root, { kind: 'removed', ref: carried, tip: sha, actor,
+        source: 'removeRegistration', reason: 'no longer wanted', at: removed.at }, { env });
+    }
+    const plan = { ok: true, finalSha: 'e'.repeat(40), mainSha, inputsKey: 'new-plan', applied: [], decisions: [], alerts: [] };
+    if (mode === 'audited omission') plan.auditAdopted = [ref];
+    if (mode === 'auto-drop contract') plan.decisions.push({ ref: carried, action: 'remove', reason: 'pr-merged' });
+    writeRebuildState(root, { adopted: { head: liveHead, mainSha, applied: removedCarried || mode === 'auto-drop contract' ? [] : [{ ref, sha }] } }, env);
+    writeReadyCandidate(root, { kind: 'candidate', prevHead: liveHead, passedAt: '2026-11-15T10:00:00Z', tree: 'candidate-tree',
+      adopt: { finalSha: candidate, mainSha, inputsKey: 'ready-plan', applied: pinnedOmission ? [] : [{ ref: carried, sha }] } }, env);
+    vi.spyOn(localState, 'ensureSafeToMove').mockReturnValue({ safe: true, untracked: [] });
+    vi.spyOn(repair, 'repairCloneRefs').mockReturnValue({ ok: true, pruned: [], reportedNew: [] });
+    vi.spyOn(edgeFetch, 'fetchMainAndOverlays').mockReturnValue({ ok: true, goneRefs: [] });
+    vi.spyOn(planner, 'planRebuild').mockImplementation(async () => {
+      if (mode === 'removed during planning') removeOverlay(root, ref, { env });
+      if (mode === 're-registered pinned during planning') {
+        removeOverlay(root, ref, { env });
+        addOverlay(root, { ref, pinned: true }, { env });
+      }
+      return plan;
+    });
+    vi.spyOn(adoption, 'readyBuildVerified').mockReturnValue(true);
+    vi.spyOn(lease, 'claimBuildLease').mockReturnValue(null);
+    const matching = vi.spyOn(adoption, 'matchReadyCandidate');
+    vi.spyOn(adoption, 'finalizeRebuild').mockResolvedValue({ moved: true, head: candidate });
+    const run = (args) => {
+      const ok = (stdout = '') => ({ status: 0, stdout, stderr: '' });
+      if (args[0] === 'symbolic-ref') return ok('main');
+      if (args[0] === 'rev-parse') {
+        const rev = args.at(-1);
+        if (rev === 'HEAD') return ok(liveHead);
+        if (rev === 'origin/main^{commit}') return ok(mainSha);
+        if (rev === `${plan.finalSha}^{tree}`) return ok('plan-tree');
+        if (rev === `refs/remotes/origin/${carried}^{commit}`) return ok(sha);
+      }
+      if (args[0] === 'ls-files' || args[0] === 'log') return ok();
+      if (args[0] === 'merge-base') return { status: args[2] === sha
+        && ((mode === 'auto-drop contract' && args[3] === mainSha)) ? 0 : 1, stdout: '', stderr: '' };
+      if (['merge-tree', 'config'].includes(args[0])) return { status: 1, stdout: '', stderr: '' };
+      throw new Error(`unexpected Git: ${args.join(' ')}`);
+    };
+    await prepareRebuild({ root, env, run, now: () => Date.parse('2026-11-15T10:01:00Z'), mainOnly, adoptOnly: true });
+    expect(matching).toHaveBeenCalledOnce();
+    if (pinnedOmission) {
+      const hooks = matching.mock.calls[0][0];
+      expect(hooks.registered(ref)).toBe(true);
+      expect(hooks.auditedTip).not.toBeTypeOf('function');
+      expect(readOverlays(root, { env }).find((o) => o.ref === ref)?.pinned).toBe(true);
+      expect(adoption.finalizeRebuild).not.toHaveBeenCalled();
+    }
+    const match = matching.mock.results[0].value;
+    if (['benign manual removal', 'auto-drop contract'].includes(mode)) expect(match.adopt).toBeTruthy();
+    else expect(match).toMatchObject({ adopt: null, reason: mainOnly ? 'overlay-no-longer-wanted' : `superseded-omits-live-overlay: ${ref}` });
+    if (mode === 'auto-drop contract') {
+      expect(adoption.classifyOverlayRemoval({ ref: carried, sha, events: readOverlayEventLog(root, env), inMain: () => true })).toBe('benign');
+    }
   });
 
   it.each([
@@ -236,6 +378,33 @@ describe('operator retirement of a live overlay', () => {
     expect(match([added, { ...removed, actor: actor.toUpperCase() }])).toMatchObject({
       adopt: { finalSha: 'candidate' }, retired: [ref],
     });
+  });
+
+  it.each([undefined, false, 'true'])('refuses missing registration history without explicit omission acceptance (%s)', acceptedOmission => {
+    removeOverlay(root, ref, { env });
+    refused(match([{ ...removed, liveApplied: true, acceptedOmission }]));
+  });
+
+  it.each([undefined, false, 'true'])('refuses missing registration history without recorded live-tip proof (%s)', liveApplied => {
+    removeOverlay(root, ref, { env });
+    refused(match([{ ...removed, acceptedOmission: true, liveApplied }]));
+  });
+
+  it('accepts exact-tip explicit withdrawal without registration history', () => {
+    removeOverlay(root, ref, { env });
+    expect(match([{ ...removed, acceptedOmission: true, liveApplied: true }])).toMatchObject({
+      adopt: { finalSha: 'candidate' }, retired: [ref],
+    });
+  });
+
+  it.each([
+    ['unknown add time', { ...added, at: undefined }],
+    ['later add time', { ...added, at: '2026-11-14T12:00:00Z' }],
+    ['equal add time', { ...added, at: removed.at }],
+    ['out-of-order adds', outOfOrderAdds[0]],
+  ])('explicit omission acceptance preserves the registration chronology veto (%s)', (_name, registration) => {
+    removeOverlay(root, ref, { env });
+    refused(match([registration, added, { ...removed, acceptedOmission: true, liveApplied: true }]));
   });
 
   it('removal without an actor still removes but supplies no retirement proof', () => {
@@ -271,7 +440,7 @@ describe('operator retirement of a live overlay', () => {
       const source = readFileSync(join(dirname(fileURLToPath(import.meta.url)), '../adopt.mjs'), 'utf8')
         .match(/export (function overlayRetiredByOperator\([\s\S]*?\n\})/)[1];
       expect(source).toContain('added.every(');
-      const mutant = new Function('OPERATOR_LOGINS', `return (${source.replace('added.every(', replacement)});`)(OPERATOR_LOGINS);
+      const mutant = new Function('OPERATOR_LOGINS', 'AUTOMATIC_RETIREMENT_REASONS', `return (${source.replace('added.every(', replacement)});`)(OPERATOR_LOGINS, AUTOMATIC_RETIREMENT_REASONS);
       expect(mutant({ ref, sha, events: outOfOrderAdds, registered: () => false })).toBe(true);
       expect(() => refusesRetirementOlderThanAnyPrecedingAdd(mutant)).toThrow();
     },

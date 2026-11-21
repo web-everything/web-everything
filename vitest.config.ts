@@ -176,6 +176,10 @@ export default defineConfig({
     exclude: [
       ...configDefaults.exclude,
       ...LIVE_SUITE,
+      // Real-git matrices still exceed 120s after fixture sharing. Soak entry modules keep
+      // their full coverage in the merge queue, alongside the other long-running regressions.
+      'scripts/__tests__/lane-pool-release-unpushed-guard.test.mjs',
+      'scripts/__tests__/lane-pool-git-diet.test.mjs',
       // R1063a: merge CLI process smoke belongs to the scheduled real-process tier.
       'scripts/__tests__/merge-ai-prs-*.real.test.mjs',
       // #3061 real-CLI regression proof (`check-standards.mjs`/`lane-review.mjs`, captured through a real

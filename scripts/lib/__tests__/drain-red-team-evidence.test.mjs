@@ -70,7 +70,7 @@ describe('status persistence and check publication share one claim', () => {
     const gh = vi.spyOn(ghThrottle, 'runGhSync').mockImplementation(() => { throw Error('real gh forbidden'); });
     try {
       const result = recordRedTeamStatus({ ...f, loopPayload: payload(f.head), status }, {
-        env: f.env, postCheckRun: ({ payload: check }) => {
+        env: f.env, appWriterProbe: () => {}, postCheckRun: ({ payload: check }) => {
           expect(readRedTeamPublicationHold(f)).toMatch(/not confirmed published/);
           checks.push(check);
           return { ok: true };
@@ -349,6 +349,37 @@ describe('status persistence and check publication share one claim', () => {
       expect(out).toEqual({ published: true });
       expect(probes).toEqual([expect.objectContaining({ ok: false, reason: expect.stringMatching(/lock failed/) })]);
     } finally { rmSync(lockDir, { recursive: true, force: true }); }
+  });
+
+  it('refuses before any status POST when the WE App token does not resolve (no orphan hold)', () => {
+    const f = fixture(), posts = [];
+    const input = { ...f, loopPayload: payload(f.head), status: 'running' };
+    const out = recordRedTeamStatus(input, { env: f.env, gh: () => '', log: () => {},
+      appWriterProbe: () => { throw Error('REFUSING personal-auth fallback'); },
+      postCheckRun: args => { posts.push(['check', args]); return { ok: true }; },
+      postPublicationHold: hold => { posts.push(['hold', hold]); return { ok: true }; } });
+    expect(out).toMatchObject({ published: false, reason: expect.stringContaining('WE App token unavailable') });
+    expect(posts).toEqual([]);
+  });
+
+  it('a refusal is loud: it emits red-team-writer-refused-no-app-token for the daemon', () => {
+    const f = fixture();
+    const events = join(f.runsDir, '..', 'events.jsonl');
+    const env = { ...f.env, WE_DAEMON_EVENTS: events };
+    const out = recordRedTeamStatus({ ...f, loopPayload: payload(f.head), status: 'running' }, { env, gh: () => '', log: () => {},
+      appWriterProbe: () => { throw Error('no token'); }, postCheckRun: () => ({ ok: true }), postPublicationHold: () => ({ ok: true }) });
+    expect(out).toMatchObject({ published: false, refused: true });
+    const line = JSON.parse(readFileSync(events, 'utf8').trim());
+    expect(line).toMatchObject({ kind: 'red-team-writer-refused-no-app-token', pr: f.pr, detail: { head: f.head } });
+  });
+
+  it('the normal App path still holds, posts the check, and clears', () => {
+    const f = fixture(), order = [];
+    const input = { ...f, loopPayload: payload(f.head), status: 'running' };
+    expect(recordRedTeamStatus(input, { env: f.env, gh: () => '', log: () => {}, appWriterProbe: () => {},
+      postCheckRun: () => { order.push('check'); return { ok: true }; },
+      postPublicationHold: hold => { order.push(hold.held ? 'hold' : 'clear'); return { ok: true }; } })).toEqual({ published: true });
+    expect(order).toEqual(['hold', 'check', 'clear']);
   });
 
   it('sets a GitHub-visible hold before any check post, keeps it across later failures, and clears it only on confirmation', () => {
@@ -1112,6 +1143,59 @@ describe('bounded review evidence scans', () => {
     it('holds for an unfinished run whose head is unreadable', () => {
       const f = fixture();
       expect(read(f, run(f, 'not-a-sha'))).toMatchObject({ ok: false, reason: 'review-unfinished' });
+    });
+  });
+  describe('trailing ledger-events effect only (#7202 shape)', () => {
+    const eff = (step, status, type) => ({ type: type ?? (step === 'ledgerEvents' ? 'review.ledger-events' : step === 'verdict-ledger.append' ? step : `review.${step}`), step, status });
+    const done = [eff('write-up', 'applied'), eff('label-swap', 'applied'), eff('verdict-ledger.append', 'applied'), eff('notice', 'applied')];
+    const ledger = status => eff('ledgerEvents', status);
+    const run = (f, extra = {}) => ({ op: 'review-pr', input: { repo: f.repo, pr: f.pr }, ...payload(f.head),
+      findings: { confirm: 'accept', read: { netBasis: { rev: f.head } } },
+      pending: { kind: 'effect', step: 'ledgerEvents' }, effects: [...done, ledger('pending')], ...startedAt(4999 * 10_000 - 1000), ...extra });
+    const read = (f, rec) => readDrainRedTeamEvidence({ ...f, ...big, read: id => (id === 'review-pr-4999' ? rec : null) });
+    const holds = (f, rec) => expect(read(f, rec)).toMatchObject({ ok: false, reason: 'review-unfinished' });
+    // The run is read as the newest finished review of the live head, not merely "not unfinished".
+    const accepted = (f, rec) => {
+      const result = read(f, rec);
+      expect(result.ok).not.toBe(false);
+      expect(result.reason).toBeUndefined();
+      expect(result.newest ?? result.loopPayload).toEqual(rec);
+    };
+    const accepting = f => ({ ...payload(f.head), findings: { confirm: 'accept', read: { netBasis: { rev: f.head } } } });
+    it('does not hold the live head when only the additive ledger effect is pending', () => {
+      const f = fixture();
+      accepted(f, run(f, accepting(f)));
+    });
+    it('holds when the write-up or label swap is absent, or the confirmation did not accept', () => {
+      const f = fixture();
+      holds(f, run(f, { ...accepting(f), effects: [ledger('pending')] }));
+      holds(f, run(f, { ...accepting(f), effects: [eff('label-swap', 'applied'), ledger('pending')] }));
+      holds(f, run(f, { ...accepting(f), effects: [eff('write-up', 'applied'), ledger('pending')] }));
+      holds(f, run(f, { effects: [eff('write-up', 'applied'), eff('label-swap', 'applied'), ledger('pending')] }));
+      holds(f, run(f, { effects: [eff('write-up', 'applied'), eff('label-swap', 'applied'), eff('verdict-ledger.append', 'pending'), ledger('pending')] }));
+      for (const confirm of ['changes', 'abstain', undefined]) holds(f, run(f, { ...accepting(f), findings: { confirm, read: { netBasis: { rev: f.head } } } }));
+    });
+    it('still holds for every other open shape', () => {
+      const f = fixture();
+      holds(f, run(f, { effects: [eff('write-up', 'applied'), eff('label-swap', 'pending'), ledger('pending')] }));
+      holds(f, run(f, { effects: [...done, ledger('in-flight')] }));
+      holds(f, run(f, { effects: [...done, ledger('refused')] }));
+      holds(f, run(f, { effects: [...done, ledger('weird')] }));
+      holds(f, run(f, { effects: [...done, ledger('pending')], outcome: 'refused' }));
+      holds(f, run(f, { effects: [...done, ledger('pending'), eff('notice2', 'pending')] }));
+      holds(f, run(f, { effects: [...done, ledger('pending'), ledger('pending')] }));
+      holds(f, run(f, { effects: [...done, eff('ledgerEvents', 'pending', 'review.label')] }));
+      holds(f, run(f, { pending: { kind: 'confirm', step: 'ledgerEvents' } }));
+      holds(f, run(f, { pending: { kind: 'effect', step: 'confirm' } }));
+      holds(f, run(f, { effects: undefined }));
+      holds(f, run(f, { verdict: null }));
+      holds(f, run(f, { verdict: {} }));
+      holds(f, run(f, { verdict: '' }));
+    });
+    it('a changes or needs-human run with only the ledger effect open still holds', () => {
+      const f = fixture();
+      holds(f, run(f, { verdict: { verdict: 'changes' } }));
+      holds(f, run(f, { verdict: { verdict: 'needs-human' } }));
     });
   });
   const statusFile = f => join(redTeamStatusDir(f.env), `${encodeURIComponent(f.repo)}-${f.pr}-${f.head}.json`);

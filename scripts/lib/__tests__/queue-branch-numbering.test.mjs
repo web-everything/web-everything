@@ -6,6 +6,13 @@ import { handNumberedNewItems } from '../../check-standards-rules.mjs';
 import { BRANCH_NUMBERING_CI_CONTRACT, mainAcceptsBranchNumbering, drainNumberedPairs, trustedDrainAuthors, assertWorktreeCard, exemptDrainNumberedItems, resolveQueueNumbering, hashBacklogFiles, isMergeGroupCiRun, mergeGroupHashRefusals, prepareBranchBeforeEnqueue, reservationPlan, finishBranchPreparation } from '../queue-branch-numbering.mjs';
 import { appendDaemonEvent } from '../daemon-events.mjs';
 
+const numberingIo = vi.hoisted(() => ({ git: null }));
+vi.mock('../proc-read.mjs', async (original) => {
+  const actual = await original();
+  return { ...actual, readGit: (args, options) => numberingIo.git
+    ? numberingIo.git(args, options) : actual.readGit(args, options) };
+});
+
 vi.mock('../card-number-ledger.mjs', () => ({ appendCardLedgerRows: vi.fn(() => new Map()) }));
 vi.mock('../daemon-events.mjs', () => ({ appendDaemonEvent: vi.fn(async () => true) }));
 
@@ -208,10 +215,11 @@ describe('queue branch numbering', () => {
     expect(reservationPlan(files, [], () => true)).toEqual({ reservations: [], minNext: 11 });
     expect(reservationPlan(files, [reservation], () => true)).toEqual({ reservations: [reservation], minNext: 5840 });
   });
-  function setup({ pending = true, state = '{"reservations":[]}', head = 'old' } = {}) {
+  function setup({ pending = true, state = '{"reservations":[]}', head = 'old', behind = '0' } = {}) {
     let numbered = false;
     const exec = vi.fn((_, args) => {
       const sparsePath = sparseMetadataPath(args); if (sparsePath) return sparsePath;
+      if (args[0] === 'rev-list') { if (behind instanceof Error) throw behind; return `${behind}\n`; }
       if (args[0] === 'ls-remote') return `${head}\trefs/heads/topic\n`;
       if (args[0] === 'ls-files') return pending && !numbered ? 'backlog/xabc123-foo.md' : 'backlog/041-foo.md';
       if (args[0] === 'ls-tree') return args.includes('--name-only') ? 'backlog/040-main.md' : treeEntry('backlog/xabc123-foo.md') + treeEntry('src/not-materialized.js');
@@ -309,6 +317,45 @@ describe('queue branch numbering', () => {
     expect(x.fs.writeFileSync).toHaveBeenCalled();
     for (const [, , options] of x.exec.mock.calls) expect(options.env).toMatchObject({ GIT_CONFIG_COUNT: '1', GIT_CONFIG_KEY_0: 'core.hooksPath', GIT_CONFIG_VALUE_0: '/dev/null' });
   });
+  it("real deferred numbering reuses a reservation below main's highest number without pushing a reservation", () => {
+    const cwd = mkdtempSync(join(tmpdir(), 'queue-reused-reservation-'));
+    const oid = 'a'.repeat(40);
+    const git = vi.fn((args) => {
+      if (args[0] === 'remote') return 'origin\n';
+      if (args[0] === 'ls-files') return args[1] === 'backlog/*.md'
+        ? 'backlog/xabc123-foo.md\n' : '';
+      if (args[0] === 'ls-tree') return 'backlog/042-main.md\0backlog/043-main.md\0';
+      if (args[0] === 'ls-remote') return `${oid}\trefs/card-ids/xabc123\n${oid}\trefs/number-reservations/041\n`;
+      if (args[0] === 'cat-file') return JSON.stringify({
+        id: 'xabc123', num: '041', owner: 'earlier-host', timestamp: '2026-11-21T00:00:00.000Z',
+      }) + '\n';
+      if (args[0] === 'rm') { rmSync(join(cwd, args.at(-1))); return ''; }
+      if (['fetch', 'update-ref', 'grep', 'add', 'commit'].includes(args[0])) return '';
+      throw Error(`unexpected numbering command ${args[0]}`);
+    });
+    const execFile = (cmd, args, options) => {
+      expect(cmd).toBe('git');
+      return git(args, options);
+    };
+    const spawn = (cmd, args) => ({ status: 1, stdout: execFile(cmd, args), stderr: '', signal: null });
+    try {
+      mkdirSync(join(cwd, 'backlog'));
+      mkdirSync(join(cwd, '.claude/skills/batch-backlog-items'), { recursive: true });
+      writeFileSync(join(cwd, 'backlog/xabc123-foo.md'), '---\nkind: task\n---\nFoo\n');
+      vi.stubEnv('WE_DRAIN_READS_SOURCE', 'git');
+      vi.stubEnv('WE_JIT_READ_SOURCE', 'worktree');
+      numberingIo.git = git;
+      const result = numberPendingHashes(cwd, { minNext: 44, execFile, spawn });
+      expect(result).toMatchObject({ committed: true, assigned: [{ hash: 'xabc123', nnn: '041' }] });
+      expect(readFileSync(join(cwd, 'backlog/041-foo.md'), 'utf8')).toContain('bornAs: xabc123');
+      expect(git).toHaveBeenCalledWith(['cat-file', 'blob', oid], expect.any(Object));
+      expect(git.mock.calls.some(([args]) => ['push', 'hash-object'].includes(args[0]))).toBe(false);
+    } finally {
+      numberingIo.git = null;
+      vi.unstubAllEnvs();
+      rmSync(cwd, { recursive: true, force: true });
+    }
+  });
   it.each(['worktree', undefined])('refuses branch numbering with read source %s before push or state write', readSource => {
     const x = setup();
     x.args.number = vi.fn(() => ({ committed: true, assigned: [{ hash: 'xabc123', nnn: '041' }],
@@ -392,6 +439,156 @@ describe('queue branch numbering', () => {
     }
     const x = setup(); x.args.lock = () => ({ ran: false });
     expect(prepareBranchBeforeEnqueue(x.args).reason).toContain('mutex');
+  });
+  const noWrites = (x) => {
+    expect(x.exec.mock.calls.some(([, args]) => args[0] === 'push')).toBe(false);
+    expect(x.fs.writeFileSync).not.toHaveBeenCalled();
+  };
+  it('branch numbering refuses before push when drain checkout is stale or restamp would refuse', () => {
+    const x = setup({ behind: '38' });
+    const out = prepareBranchBeforeEnqueue(x.args);
+    expect(out).toMatchObject({ action: 'skip', reason: expect.stringContaining('38 commit(s) behind origin/main') });
+    expect(x.number).not.toHaveBeenCalled();
+    noWrites(x);
+    // finishBranchPreparation turns the refusal into a needs-you event and no enqueue.
+    const emit = vi.fn(() => Promise.resolve());
+    const revalidationAborted = [];
+    expect(finishBranchPreparation(out, { c: x.args.c, revalidationAborted, needsAcceptanceRestamp: () => false, restampAcceptance: vi.fn(), log: { write: vi.fn() }, emit })).toBe(false);
+    expect(emit).toHaveBeenCalledWith(expect.objectContaining({ kind: 'needs-you', pr: 4, daemon: 'drain' }));
+    expect(revalidationAborted[0].reason).toContain('behind origin/main');
+  });
+  it.each(['', 'garbage', '-1'])('refuses when the behind count is unreadable (%j)', (behind) => {
+    const x = setup({ behind });
+    expect(prepareBranchBeforeEnqueue(x.args)).toMatchObject({ action: 'skip', reason: expect.stringContaining('refused') });
+    noWrites(x);
+  });
+  it('refuses when a git read fails during the freshness check', () => {
+    const x = setup({ behind: new Error('fatal: bad revision') });
+    expect(prepareBranchBeforeEnqueue(x.args)).toMatchObject({ action: 'skip', reason: expect.stringContaining('bad revision') });
+    expect(x.number).not.toHaveBeenCalled();
+    noWrites(x);
+  });
+  it('proceeds on a fresh checkout with valid numbers', () => {
+    const x = setup({ behind: '0' });
+    expect(prepareBranchBeforeEnqueue(x.args)).toMatchObject({ action: 'numbered', newHead: 'new' });
+    expect(x.exec.mock.calls.some(([, args]) => args[0] === 'push')).toBe(true);
+  });
+  it.each([['taken on main', '040'], ['below main highest', '010'], ['not a number', 'abc']])('numbered names must be valid against origin/main before push (%s)', (_label, nnn) => {
+    const x = setup();
+    const real = x.args.number;
+    x.args.number = vi.fn((...a) => ({ ...real(...a), assigned: [{ hash: 'xabc123', nnn }] }));
+    const out = prepareBranchBeforeEnqueue(x.args);
+    expect(out).toMatchObject({ action: 'skip', reason: expect.stringContaining('not valid against origin/main') });
+    noWrites(x);
+  });
+  it.each([
+    ['copies a card on main', 'backlog/040-main.md\nbacklog/040-other.md'],
+    ['copies a card before its original in the listing', 'backlog/040-other.md\nbacklog/040-main.md'],
+    ['duplicate numeric name', 'backlog/041-foo.md\nbacklog/041-bar.md'],
+    ['padded alias of an existing number', 'backlog/040-main.md\nbacklog/40-other.md'],
+    ['two renamed paths for one existing card', 'backlog/040-renamed.md\nbacklog/040-other.md'],
+  ])('numbered names must be valid against origin/main before push (tracked filename %s)', (_label, listing) => {
+    const x = setup();
+    const orig = x.exec.getMockImplementation();
+    x.exec.mockImplementation((cmd, args, o) => (args[0] === 'ls-files' && x.number.mock.calls.length ? listing : orig(cmd, args, o)));
+    const out = prepareBranchBeforeEnqueue(x.args);
+    expect(out).toMatchObject({ action: 'skip', reason: expect.stringContaining('numbered card name(s) not valid against origin/main') });
+    noWrites(x);
+  });
+  it.each(['040', '40'])('refuses an independent collision added on main after branching (%s)', (id) => {
+    const x = setup();
+    const orig = x.exec.getMockImplementation();
+    x.exec.mockImplementation((cmd, args, o) => {
+      // The PR never contained main's 040 card, so it cannot delete it on merge.
+      if (args[0] === 'diff') return `backlog/${id}-other.md\0backlog/041-foo.md\0`;
+      if (args[0] === 'ls-files') return `backlog/${id}-other.md\0backlog/${x.number.mock.calls.length ? '041' : 'xabc123'}-foo.md\0`;
+      return orig(cmd, args, o);
+    });
+    const out = prepareBranchBeforeEnqueue(x.args);
+    expect(out).toMatchObject({ action: 'skip', reason: expect.stringContaining('numbered card name(s) not valid against origin/main') });
+    noWrites(x);
+    const emit = vi.fn();
+    expect(finishBranchPreparation(out, { c: x.args.c, revalidationAborted: [], needsAcceptanceRestamp: () => false,
+      restampAcceptance: vi.fn(), log: { write: vi.fn() }, emit })).toBe(false);
+    expect(emit).toHaveBeenCalledWith(expect.objectContaining({ kind: 'needs-you', pr: 4 }));
+  });
+  it('refuses when branch deletion evidence cannot be read', () => {
+    const x = setup();
+    const orig = x.exec.getMockImplementation();
+    x.exec.mockImplementation((cmd, args, o) => {
+      if (args[0] === 'diff') throw new Error('merge base unavailable');
+      return orig(cmd, args, o);
+    });
+    expect(prepareBranchBeforeEnqueue(x.args)).toMatchObject({ action: 'skip', reason: expect.stringContaining('merge base unavailable') });
+    noWrites(x);
+  });
+  it.each(['040', '40'])('allows a slug rename preserving card number %s beside a newly numbered card', (id) => {
+    const x = setup();
+    const orig = x.exec.getMockImplementation();
+    x.exec.mockImplementation((cmd, args, o) => {
+      if (args[0] === 'diff') {
+        expect(args).toEqual(['diff', '--no-renames', '--name-only', '--diff-filter=AD', '-z', 'origin/main...HEAD', '--', 'backlog/']);
+        expect(o.cwd).toBe('/tmp/fake/tree');
+        return `backlog/040-main.md\0backlog/${id}-renamed.md\0backlog/041-foo.md\0`;
+      }
+      return args[0] === 'ls-files' && x.number.mock.calls.length
+        ? `backlog/${id}-renamed.md\nbacklog/041-foo.md` : orig(cmd, args, o);
+    });
+    expect(prepareBranchBeforeEnqueue(x.args)).toMatchObject({ action: 'numbered', newHead: 'new' });
+    expect(x.exec.mock.calls.some(([, args]) => args[0] === 'push')).toBe(true);
+  });
+  it.each([
+    ['unchanged shared filename', 'backlog/040-main.md', 'backlog/040-main.md', '', 'numbered'],
+    ['main renamed a shared card', 'backlog/040-renamed.md', 'backlog/040-main.md', '', 'numbered'],
+    ['branch deleted a shared card', 'backlog/040-main.md', '', 'backlog/040-main.md\0', 'numbered'],
+    ['branch rename collides with a new main path', 'backlog/040-new-on-main.md', 'backlog/40-renamed.md', 'backlog/040-main.md\0backlog/40-renamed.md\0', 'skip'],
+  ])('validates surviving merge paths: %s', (_label, mainName, branchName, changed, action) => {
+    const x = setup();
+    const orig = x.exec.getMockImplementation();
+    x.exec.mockImplementation((cmd, args, o) => {
+      if (args[0] === 'diff') return `${changed}backlog/041-foo.md\0`;
+      if (args[0] === 'ls-tree' && args.includes('--name-only')) return `${mainName}\0`;
+      if (args[0] === 'ls-files') return `${branchName}\0backlog/${x.number.mock.calls.length ? '041' : 'xabc123'}-foo.md\0`;
+      return orig(cmd, args, o);
+    });
+    expect(prepareBranchBeforeEnqueue(x.args)).toMatchObject({ action });
+    if (action === 'skip') noWrites(x);
+    else expect(x.exec.mock.calls.some(([, args]) => args[0] === 'push')).toBe(true);
+  });
+  it.each(['stale', 'fresh', 'fetch failure', 'unreadable count'])('refreshes the separate code clone before trusting its origin/main (%s)', (mode) => {
+    const x = setup();
+    x.args.codeRoot = '/code-clone/scripts/lib';
+    const orig = x.exec.getMockImplementation();
+    let fetched = false;
+    x.exec.mockImplementation((cmd, args, o) => {
+      if (o.cwd === x.args.codeRoot) {
+        if (args[0] === 'fetch') {
+          if (mode === 'fetch failure') throw new Error('code fetch failed');
+          fetched = true;
+        }
+        if (args[0] === 'rev-list') return fetched ? (mode === 'stale' ? '5\n' : mode === 'unreadable count' ? '' : '0\n') : '0\n';
+      }
+      return orig(cmd, args, o);
+    });
+    const out = prepareBranchBeforeEnqueue(x.args);
+    if (mode === 'fresh') {
+      expect(out.action).toBe('numbered');
+      expect(fetched).toBe(true);
+      const codeOps = x.exec.mock.calls.filter(([, , o]) => o.cwd === x.args.codeRoot).map(([, args]) => args[0]);
+      expect(codeOps).toEqual(['fetch', 'rev-list']);
+    } else {
+      expect(out).toMatchObject({ action: 'skip', reason: expect.stringContaining(mode === 'stale' ? 'drain code checkout is 5 commit(s) behind' : mode === 'fetch failure' ? 'code fetch failed' : 'freshness unreadable') });
+      expect(x.number).not.toHaveBeenCalled();
+      noWrites(x);
+    }
+  });
+  it('refuses when the code checkout (restamp script location) is stale although the data checkout is fresh', () => {
+    const x = setup();
+    const orig = x.exec.getMockImplementation();
+    x.exec.mockImplementation((cmd, args, o) => (args[0] === 'rev-list' && o.cwd !== '/clone' ? '5\n' : orig(cmd, args, o)));
+    expect(prepareBranchBeforeEnqueue(x.args)).toMatchObject({ action: 'skip', reason: expect.stringContaining('drain code checkout is 5 commit(s) behind') });
+    expect(x.number).not.toHaveBeenCalled();
+    noWrites(x);
   });
   it('leaves a numeric unresolved manifest card final without committing or pushing', () => {
     const x = setup({ pending: false });
@@ -801,6 +998,7 @@ it.each([false, true])('permits confined convenience links and refuses escaping 
     const exec = vi.fn((_cmd, args) => {
       const sparsePath = sparseMetadataPath(args); if (sparsePath) return sparsePath;
       if (args[0] === 'ls-remote') return 'head\trefs/heads/lane/example';
+      if (args[0] === 'rev-list') return '0';
       if (args[0] === 'ls-files') {
         const card = existsSync(join(tree, 'backlog/xabc123-card.md')) ? 'backlog/xabc123-card.md' : 'backlog/041-card.md';
         return args.includes('backlog/') ? card : `${card}\n.claude/skills`;
@@ -920,7 +1118,7 @@ it.each([false, true])('numbers a hash card beside unchanged raised-by ledgers i
     const statePath = join(root, 'state.json');
     const lock = (fn, options) => withNumberingLock(fn, { ...options, lockRoot: join(root, 'locks') });
     const envBefore = { ...process.env };
-    const result = prepareBranchBeforeEnqueue({ cwd, c, traceHeadSha: old, statePath, lock });
+    const result = prepareBranchBeforeEnqueue({ cwd, c, traceHeadSha: old, statePath, lock, codeRoot: cwd });
     expect(process.env).toEqual(envBefore);
     expect(result, result.reason).toMatchObject({ action: 'numbered', assigned: [{ hash: 'xabc123', nnn: '011' }] });
     expect(existsSync(sentinel)).toBe(false);
@@ -939,7 +1137,7 @@ it.each([false, true])('numbers a hash card beside unchanged raised-by ledgers i
     expect(git('diff', '--no-renames', '--name-only', old, result.newHead).split('\n')).toEqual(['backlog/011-foo.md', 'backlog/xabc123-foo.md']);
     if (humanOnly) expect(git('show', `${result.newHead}:.github/workflows/ci.yml`)).toBe(git('show', `${old}:.github/workflows/ci.yml`));
     expect(JSON.parse(readFileSync(statePath, 'utf8')).reservations[0].nnns).toEqual([11]);
-    expect(prepareBranchBeforeEnqueue({ cwd, c, traceHeadSha: result.newHead, statePath, lock })).toEqual({ action: 'final' });
+    expect(prepareBranchBeforeEnqueue({ cwd, c, traceHeadSha: result.newHead, statePath, lock, codeRoot: cwd })).toEqual({ action: 'final' });
     expect(git('worktree', 'list', '--porcelain').match(/^worktree /gm)).toHaveLength(1);
     expect(git('rev-parse', 'HEAD')).toBe(old);
   } finally { rmSync(root, { recursive: true, force: true }); }

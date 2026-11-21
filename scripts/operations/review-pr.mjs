@@ -1320,7 +1320,7 @@ export function shapeReadFinding(raw, { pr, repo, careLevel } = {}) {
       + 'reachable from this operation at all. THE ROUTE THAT WORKS is a DIFFERENT SESSION: run `review-pr` '
       + 'from a session that did not open this PR, so its own session id is the clearing actor and the '
       + `independence bar is genuinely met. There is no flag on this operation that lifts this — ${repo}#${pr} `
-      + 'can also be cleared by the human ceremony `review-set-label.mjs --to=clear-human --actor=… '
+      + 'can also be cleared by the human ceremony `review-set-label.mjs --to=clear-human --expect-head=<full 40-hex head SHA> --actor=… '
       + '--reason="<the operator instruction>"`, which is run by hand and quotes an instruction (#2895).',
     );
   }
@@ -2161,7 +2161,7 @@ export function planRecordDecision(view) {
       `review-pr.record: refusing to record \`${to}\` on ${repo}#${pr} — ${decision.reason}. `
       + 'The refusal is `decideSetLabel` in `we:scripts/review-set-label.mjs` (INVARIANT 2, #2470/#2644); '
       + 'this operation does not carry a route around it. A gate-self PR is cleared only by the human '
-      + 'ceremony `review-set-label.mjs --to=clear-human --actor=… --reason="<the operator instruction>"` '
+      + 'ceremony `review-set-label.mjs --to=clear-human --expect-head=<full 40-hex head SHA> --actor=… --reason="<the operator instruction>"` '
       + '(#2895), which quotes an instruction and is therefore not a declarable step.',
     );
   }
@@ -2366,7 +2366,7 @@ export function renderAdvisoryNote({ read, verdict } = {}) {
     basis,
     '',
     '**This PR still needs the human ceremony.** Clearing `review:human` requires the operator to run '
-      + `\`/review ${read.pr}\` or \`we:scripts/review-set-label.mjs --to=clear-human --actor=… `
+      + `\`/review ${read.pr}\` or \`we:scripts/review-set-label.mjs --to=clear-human --expect-head=<full 40-hex head SHA> --actor=… `
       + '--reason="<the operator instruction>"` — nothing above this line performs, substitutes for, or '
       + 'shortcuts that ceremony.',
     '',
@@ -2377,7 +2377,8 @@ export function renderAdvisoryNote({ read, verdict } = {}) {
 
 // Shared by every acceptance publication path, including comment-only effects.
 function acceptanceRedTeamOwed(verdict, read) {
-  return redTeamOwedFor({ verdict, findings: { read } })
+  // Every caller is an accepted publication, so a prevention-outstanding verdict here was accepted at confirm.
+  return redTeamOwedFor({ verdict, findings: { read, confirm: 'accept' } })
     && !(readRedTeamProbes({ env: process.env }).value.skipCardOnly && redTeamCardOnly(read))
     && redTeamEnabled(process.env);
 }

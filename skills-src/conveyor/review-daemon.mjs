@@ -74,6 +74,7 @@
 
 import { readFileSync, statSync } from 'node:fs';
 import { cascadePolicy } from '../../scripts/lib/policy-cascade.mjs';
+import { readOperatorOverrides } from '../../scripts/lib/operator-override-reader.mjs';
 import { executeOwedCiReruns } from '../../scripts/conveyor/owed-ci-rerun-executor.mjs';
 import { createPlannerFactCache } from '../../scripts/conveyor/planner-fact-cache.mjs';
 import { logDaemonHeap } from '../../scripts/lib/daemon-heap-log.mjs';
@@ -82,6 +83,7 @@ import { fileURLToPath } from 'node:url';
 import { execFileSync } from 'node:child_process';
 import { hostname } from 'node:os';
 import { runReconcilePass, defaultReadPrs, defaultReadAgents, isConflictingPr } from '../../scripts/conveyor/reconcile-pass.mjs';
+import { PrListUnreadableError } from '../../scripts/lib/pr-list-paged.mjs';
 import { promoteDraftsThenReplan, promoteDraftsGuarded, rearmStaleAcceptanceGuarded, rearmStaleAcceptsThenReplan } from '../../scripts/conveyor/review-tick-promote.mjs'; // card xemxk3h
 import { notifyReferralHold } from '../../scripts/conveyor/review-referral-hold.mjs';
 // card x29vm8a — a scope-bloated PR (stale base) is refreshed onto main through the SAME mechanical path the ci-red
@@ -389,6 +391,7 @@ export function runReviewTick({
   reconcile = runReconcilePass,
   dispatch = dispatchReviewByMode,
   redTeamOnSkip = null,
+  redTeamPartialInventory = null,
   reconcileRedTeamQueue = null,
   tagRound = tagReviewRound,
   tagStatus = tagReviewStatus,
@@ -462,9 +465,7 @@ export function runReviewTick({
   // over the whole repo, not scoped to whatever this tick's discovery found owed, so a `reconcile` failure
   // below must never suppress it. Isolated in its own try/catch, same "one bad entry never aborts the rest"
   // discipline as every other step in this tick — a `gh` hiccup here must not cost a review dispatch.
-  // Maintenance also runs on paused ticks and before any reconcile/read failure can return early.
-  try { reconcileRedTeamQueue?.({ repo }); }
-  catch (e) { log(`review-daemon: red-team queue reconciliation failed: ${String(e?.message ?? e)}`); }
+  // Maintenance also runs on paused ticks; discovery must first establish whether membership may change.
   const sharedReads = typeof readPrs === 'function' && typeof readAgents === 'function';
   let rawPrs = null;
   let rawPrsError = null;
@@ -472,6 +473,10 @@ export function runReviewTick({
   if (sharedReads) {
     try { rawPrs = readPrs({ repo }); } catch (e) { rawPrsError = e; rawPrsFailed = true; }
   }
+  // Never mutate queue membership using an incomplete inventory.
+  const inventoryComplete = !rawPrsFailed && (!sharedReads || Array.isArray(rawPrs));
+  try { reconcileRedTeamQueue?.({ repo, ...(!inventoryComplete ? { inventoryComplete: false } : {}) }); }
+  catch (e) { log(`review-daemon: red-team queue reconciliation failed: ${String(e?.message ?? e)}`); }
   let holdReconcileResults = [];
   let holdReconcileError = null;
   try {
@@ -515,10 +520,21 @@ export function runReviewTick({
     // never "0 owed". Surface it on the reconcile-failed channel (tick line flags it) so the tick retries visibly.
     if (plan?.deferred === true) throw new Error(`open-PR read deferred — owed unknown this tick: ${String(plan.message ?? plan.reason ?? 'deferred').split('\n')[0]}`);
   } catch (e) {
+    let recovery;
+    const partialInventory = rawPrsError?.code === 'pr-list-truncated'
+      || (rawPrsError instanceof PrListUnreadableError && rawPrsError.stage === 'page' && rawPrsError.page === 'inventory');
+    if (!paused && rawPrsFailed && partialInventory
+      && typeof redTeamPartialInventory === 'function') {
+      try {
+        recovery = redTeamPartialInventory({ repo, reconcile, readAgents, defaultBranch,
+          hostAdmission, recoveryAcquirableLanes, liveReviewBudget });
+      } catch (error) { log(`review-daemon: ${repo} partial-inventory recovery failed: ${String(error?.message ?? error)}`); }
+    }
     return {
       reviewsOwed: 0, dispatched: [], failed: [], refusals: 0, deferredForLanes: 0,
       reconcileError: describeReconcileError(e), staleStatusSwept: [], staleConflictStatusCleared: [],
       holdReconcile: holdReconcileResults, holdReconcileError,
+      ...(recovery !== undefined ? { redTeamOnSkip: recovery } : {}),
     };
   }
   // Refresh stale status labels (including legacy status:awaiting-base) before promotion/dispatch
@@ -714,9 +730,10 @@ export function runReviewTick({
     try { host = hostAdmission() ?? host; } catch (e) { host = { admitted: false, reason: `host admission unknown: ${String(e?.message ?? e).split('\n')[0]}` }; }
   }
   const hostLimit = !host.admitted ? 0 : Number.isFinite(host.maxPerTick) ? Math.max(0, host.maxPerTick) : Infinity;
-  const remainingReviewCapacity = () => liveReviewBudget && Number.isFinite(liveReviewBudget.left)
+  const remainingLiveCapacity = () => liveReviewBudget && Number.isFinite(liveReviewBudget.left)
     ? Math.max(0, liveReviewBudget.left) : Infinity;
-  const initialReviewCapacity = remainingReviewCapacity();
+  const remainingReviewCapacity = () => Math.max(0, remainingLiveCapacity() - (liveReviewBudget?.reserve ?? 0));
+  const initialReviewCapacity = remainingLiveCapacity();
   const dispatchable = [];
   let occupiedLanes = 0;
   const dispatched = [];
@@ -859,7 +876,7 @@ export function runReviewTick({
   if (reservedRecoveryStarts === 0) recoverRedTeam(Math.max(0, hostLimit - occupiedLanes));
   // Compute deferrals after confirmed starts, so skipped attempts neither spend capacity nor leave later
   // eligible PRs outside a preselected batch. Only an actual lane shortfall uses the starvation diagnostic.
-  const liveCap = remainingReviewCapacity();
+  const liveCap = remainingLiveCapacity();
   const earlierDispatches = Number.isFinite(liveReviewBudget?.max) && Number.isFinite(liveReviewBudget?.live)
     ? Math.max(0, liveReviewBudget.max - liveReviewBudget.live - initialReviewCapacity) : 0;
   // Never clamp: an overrun (10 live of max 8) must still read "10 of 8".
@@ -871,7 +888,7 @@ export function runReviewTick({
     : liveReviewBudget?.reason;
   if (capReason && earlierDispatches > 0) capReason += `; ${earlierDispatches} seat(s) taken by dispatches earlier in this tick`;
   const hostBound = !paused && (!host.admitted || hostLimit - occupiedLanes <= 0);
-  const capBound = !paused && !hostBound && liveCap === 0;
+  const capBound = !paused && !hostBound && remainingReviewCapacity() === 0;
   const deferredTotal = reviews.length - dispatchable.length;
   const deferredForHost = hostBound ? deferredTotal : 0;
   const deferredForCap = capBound ? deferredTotal : 0;
@@ -1484,19 +1501,76 @@ export function cliReviewTickOpts({ log = console, factCache = null, listCommand
     }
     return livePrs.get(key);
   };
-  return {
+  const queueOff = () => ['off', '0', 'false', 'no'].includes(String(process.env.WE_RED_TEAM_DISPATCH_QUEUE ?? '').trim().toLowerCase());
+  // Restore persisted work before the first budget read after a daemon restart.
+  if (!queueOff() && !redTeamDispatchQueue) {
+    try { log.error(`review-daemon: red-team queue on (source: ${process.env.WE_RED_TEAM_DISPATCH_QUEUE === undefined ? 'default' : 'env WE_RED_TEAM_DISPATCH_QUEUE'})`); }
+    catch { /* Diagnostics must not interrupt admission. */ }
+    redTeamDispatchQueue = createRedTeamDispatchQueue({ log: line => log.error(line) });
+  }
+  let inventoryComplete = true;
+  let queueReadFailed = false;
+  const queueSize = () => {
+    if (queueOff() || !inventoryComplete) return 0;
+    try {
+      return redTeamDispatchQueue.entries().filter(entry => {
+        // Persisted blocks are validated by the queue reader and consume probe turns, not worker slots.
+        if (entry.blocked !== undefined) return false;
+        if (!livePrs.has(entry.key)) return true; // Restored work, before this tick's reconciliation.
+        const pr = livePrs.get(entry.key);
+        return pr?.state === 'OPEN' && pr.isDraft !== true && pr.headRefOid === entry.head && Array.isArray(pr.comments);
+      }).length;
+    } catch (error) {
+      if (!queueReadFailed) {
+        queueReadFailed = true;
+        try { log.error(`review-daemon: red-team reserve queue unreadable; lending reserve back: ${String(error?.message ?? error).split('\n')[0]}`); }
+        catch { /* Diagnostics must not interrupt admission. */ }
+      }
+      return undefined;
+    }
+  };
+  const options = {
     log: line => log.error(line),
     acquirableLanes: defaultAcquirableLaneNumbers, recoveryAcquirableLanes: defaultRecoveryLaneNumbers,
     readPrs: factCache ? opts => defaultReadPrs({ ...opts, factCache }) : defaultReadPrs, readAgents: defaultReadAgents,
     hostAdmission: defaultReviewHostAdmission,
     // `listCommands` is a test seam: the default lists the host's real processes (`ps`), which a hermetic test must not.
-    liveReviewBudget: liveReviewRoundBudget(listCommands ? { listCommands } : {}),
-    reconcileRedTeamQueue: () => {
+    liveReviewBudget: liveReviewRoundBudget({ queueSize, ...(listCommands ? { listCommands } : {}) }),
+    reconcileRedTeamQueue: ({ inventoryComplete: complete = true } = {}) => {
       livePrs.clear();
-      if (['off', '0', 'false', 'no'].includes(String(process.env.WE_RED_TEAM_DISPATCH_QUEUE ?? '').trim().toLowerCase())) return;
+      inventoryComplete = complete;
+      if (queueOff()) return;
       redTeamDispatchQueue ??= createRedTeamDispatchQueue({ log: line => log.error(line) });
+      if (!complete) return;
       // Maintenance evicts terminal PRs and re-keys changed live heads.
       redTeamDispatchQueue.reconcile({ readLivePr: readQueuePr });
+    },
+    redTeamPartialInventory: ({ repo, reconcile, readAgents, defaultBranch, hostAdmission,
+      recoveryAcquirableLanes, liveReviewBudget }) => {
+      if (['off', '0', 'false', 'no'].includes(String(process.env.WE_RED_TEAM_DISPATCH_QUEUE ?? '').trim().toLowerCase())) return;
+      redTeamDispatchQueue ??= createRedTeamDispatchQueue({ log: line => log.error(line) });
+      const rawPrs = redTeamDispatchQueue.confirmedBlocked({ repo, readLivePr: readQueuePr });
+      if (!rawPrs.length) return;
+      // Use the normal planner, including its draft/hold/accepted-head guards.
+      const plan = reconcile({ repo, defaultBranch, readPrs: () => rawPrs, readAgents });
+      if (plan?.deferred) return;
+      const refusals = (plan.refusals ?? []).map(row => row.kind === 'nothing-owed' && row.phase === 'queued'
+        ? { ...row, kind: 'already-reviewed-head', headSha: row.headRefOid } : row)
+        .filter(row => row.kind === 'already-reviewed-head'
+          && rawPrs.some(pr => pr.number === Number(row.prNumber) && pr.headRefOid === row.headSha));
+      let host, lanes = 0;
+      try { host = hostAdmission(); } catch { /* Unknown host evidence allows no starts. */ }
+      try {
+        const available = recoveryAcquirableLanes({ repo });
+        lanes = Array.isArray(available) ? available.length : available;
+      } catch { /* Unknown lane evidence allows no starts. */ }
+      const limit = host?.admitted === true && Number.isFinite(host.maxPerTick)
+        ? Math.max(0, Math.floor(host.maxPerTick)) : 0;
+      const capacity = { lanes: Number.isFinite(lanes) ? Math.max(0, Math.floor(lanes)) : 0,
+        remainingStarts: limit, startsCeiling: limit, budget: liveReviewBudget,
+        take: () => host?.take?.(1) };
+      return options.redTeamOnSkip({ repo, plan: { ...plan, dispatch: [], refusals }, rawPrs,
+        inventoryComplete: false, capacity, paused: false });
     },
     redTeamOnSkip: o => {
       let rawPrs = o.rawPrs;
@@ -1540,7 +1614,12 @@ export function cliReviewTickOpts({ log = console, factCache = null, listCommand
           if (line.startsWith('review-daemon: red-team queue floor minConcurrent=')) floorLine = line;
           else options.log(line);
         } });
-      } catch { /* Unreadable floor evidence disables raises for this tick. */ }
+      } catch {
+        // Unreadable floor evidence disables raises for this tick and fails closed on probes (never the default 6).
+        floor = { maxProbesPerTick: 0 };
+        try { options.log('review-daemon: red-team queue floor loader failed; maxProbesPerTick=0 (probes OFF this tick)'); }
+        catch { /* Diagnostics must not interrupt recovery. */ }
+      }
       if (floorLine !== lastRedTeamQueueFloorLine) {
         if (floorLine !== undefined) {
           try { options.log(floorLine); } catch { /* Diagnostics must not interrupt recovery. */ }
@@ -1567,6 +1646,7 @@ export function cliReviewTickOpts({ log = console, factCache = null, listCommand
     tagRound: (o) => tagReviewRound({ ...o, provider: factsProvider }),
     tagStatus: (o) => tagReviewStatus({ ...o, provider: factsProvider }),
   };
+  return options;
 }
 
 /**
@@ -1885,7 +1965,7 @@ const REVIEW_CONCURRENCY_PATH = join(dirname(fileURLToPath(import.meta.url)), '.
  *  `review-loop-cli.mjs` processes (a round is one job, or one bare loop). An unreadable `ps` fails closed (no new
  *  review this tick). Revert condition: see the settings file's comment. */
 export function liveReviewRoundBudget({ env = process.env, listCommands = () => execFileSync('ps', ['-Aww', '-o', 'pid=,ppid=,command='], { encoding: 'utf8', timeout: 10_000, maxBuffer: 32 * 1024 * 1024 }),
-  toolPath = REVIEW_CONCURRENCY_PATH, readFile = readFileSync } = {}) {
+  toolPath = REVIEW_CONCURRENCY_PATH, readFile = readFileSync, queueSize, readOverrides = readOperatorOverrides } = {}) {
   const validMax = v => Number.isSafeInteger(v) && v >= 1 && v <= 16;
   // Invalid overrides fall back to the committed cap; unreadable/invalid defaults hold all new rounds.
   let defaultMax = 0;
@@ -1922,7 +2002,24 @@ export function liveReviewRoundBudget({ env = process.env, listCommands = () => 
   } catch {
     return { left: 0, reason: `live review rounds unknown (ambiguous script path or runtime option); maxLiveReviewRounds=${max} (${src})` };
   }
-  return { left: Math.max(0, max - live), live, max, countedJobPids, reason: `live review rounds ${live} of maxLiveReviewRounds=${max} (${src})` };
+  let reservedSlots = 4;
+  try {
+    const overrides = readOverrides();
+    const value = overrides?.values?.['redTeam.queue.reservedSlots'];
+    if (overrides?.readable !== false && Number.isInteger(value) && value >= 0 && value <= 8) reservedSlots = value;
+  } catch { /* unreadable override uses the default reserve */ }
+  // CLI supplies a reader so maintenance/dispatch can change runnable membership within this tick.
+  // Keep the process snapshot and shared `left` balance intact across those queue changes.
+  const reserve = () => {
+    const size = typeof queueSize === 'function' ? queueSize() : queueSize;
+    return Number.isInteger(size) && size > 0 ? Math.min(reservedSlots, size, max) : 0;
+  };
+  return { left: Math.max(0, max - live), live, max, countedJobPids,
+    get reserve() { return reserve(); },
+    get reason() {
+      const slots = reserve();
+      return `live review rounds ${live} of maxLiveReviewRounds=${max} (${src})${slots > 0 ? `; red-team reserve ${slots}` : ''}`;
+    } };
 }
 
 export function buildCliDaemonEffects({

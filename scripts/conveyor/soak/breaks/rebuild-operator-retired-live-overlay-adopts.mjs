@@ -4,13 +4,15 @@
  * omitting it was discarded as `superseded-omits-live-overlay`. Intentional retirement of the exact live tip
  * must permit adoption and report the retired ref; removal without that evidence must still discard.
  *
- * Scenario: real `retireRegistration` records the retirement, then real `overlayRetiredByOperator` supplies the
+ * Scenario: real `withdrawUnregisteredOverlay` records the retirement, then real `overlayRetiredByOperator` supplies the
  * `retiredByOperator` predicate to `matchReadyCandidate`. PRE-fix the proven case discards; FIXED it adopts,
  * while missing-tip and missing-record cases still discard.
  */
 
 import { existsSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
+import { spawnSync } from 'node:child_process';
+import { REBUILD_IDENTITY_ENV } from '../../../lib/daemon-rebuild/shared.mjs';
 import { join } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 
@@ -28,37 +30,50 @@ export default {
   async run({ log } = {}) {
     const root = REPO_ROOT;
     const { matchReadyCandidate, overlayRetiredByOperator } = await import(pathToFileURL(join(root, 'scripts/lib/daemon-rebuild/adopt.mjs')).href);
-    const { retireRegistration } = await import(pathToFileURL(join(root, 'scripts/daemon-overlay.mjs')).href);
-    const { addOverlay, appendOverlayEvent, readOverlays } = await import(pathToFileURL(join(root, 'scripts/lib/daemon-overlays.mjs')).href);
+    const { withdrawUnregisteredOverlay, removeRegistration, retireRegistration } = await import(pathToFileURL(join(root, 'scripts/daemon-overlay.mjs')).href);
+    const { runDaemonLoadOverlay } = await import(pathToFileURL(join(root, 'scripts/lib/daemon-load-overlay.mjs')).href);
+    const { addOverlay, appendOverlayEvent, readOverlays, removeOverlay } = await import(pathToFileURL(join(root, 'scripts/lib/daemon-overlays.mjs')).href);
     const { readOverlayEventLog } = await import(pathToFileURL(join(root, 'scripts/lib/daemon-rebuild/prepare.mjs')).href);
     const { OPERATOR_LOGINS } = await import(pathToFileURL(join(root, 'scripts/lib/marker-authorship.mjs')).href);
     const actor = OPERATOR_LOGINS[0];
     const violations = [];
     const t0 = Date.parse('2026-11-15T10:00:00Z');
     const ref = 'lane/operator-retired-overlay';
-    const sha = 'a'.repeat(40);
     const reason = 'retire the live overlay';
     const ready = {
       kind: 'candidate', prevHead: 'H', tree: 'T1', passedAt: new Date(t0).toISOString(),
       adopt: { finalSha: 'S1', inputsKey: 'K1', mainSha: 'M1', applied: [] },
     };
     const scratch = mkdtempSync(join(tmpdir(), 'operator-retirement-soak-'));
-    const env = { ...process.env, WE_DAEMON_OVERLAY_DIR: join(scratch, 'overlays') };
+    const env = { ...process.env, ...REBUILD_IDENTITY_ENV, WE_DAEMON_OVERLAY_DIR: join(scratch, 'overlays') };
+    const git = (...args) => {
+      const result = spawnSync('git', ['-c', 'commit.gpgsign=false', ...args], { cwd: scratch, env, encoding: 'utf8', timeout: 5000, maxBuffer: 1024 * 1024 });
+      if (result.status !== 0) throw new Error(result.stderr || 'soak git fixture failed');
+      return result.stdout.trim();
+    };
     try {
+      git('init', '-q', '-b', 'main');
+      git('commit', '--allow-empty', '-qm', 'base');
+      git('update-ref', 'refs/remotes/origin/main', git('rev-parse', 'HEAD'));
+      git('checkout', '-qb', ref);
+      git('commit', '--allow-empty', '-qm', 'overlay');
+      const sha = git('rev-parse', 'HEAD');
+      git('checkout', '-q', 'main');
+      git('merge', '--no-ff', '-m', `daemon-rebuild: merge overlay ${ref} onto main`, ref);
       addOverlay(scratch, { ref }, { env });
       appendOverlayEvent(scratch, { kind: 'added', ref, at: '2026-11-14T10:00:00Z' }, { env });
-      const expectedEntry = readOverlays(scratch, { env }).find((entry) => entry.ref === ref);
-      const removal = await retireRegistration({ root: scratch, ref, expectedTip: sha, expectedEntry, by: 'operator', actor, env,
-        deps: { prove: () => ({ action: 'retire', tip: sha, reason }), tip: () => sha } });
+      removeOverlay(scratch, ref, { env });
+      const removal = await withdrawUnregisteredOverlay({ reason, acceptOmission: true, root: scratch, ref, tip: sha, actor, env,
+        deps: { resolveOperatorIdentity: () => ({ login: actor, type: 'User' }) } });
       const events = readOverlayEventLog(scratch, env);
       const removed = events.at(-1);
-      if (!removal.retired || removed?.kind !== 'auto-retired' || removed.ref !== ref || removed.tip !== sha || removed.reason !== reason || removed.actor !== actor || removed.operatorReason !== true) {
+      if (!removal.retired || removed?.kind !== 'auto-retired' || removed.ref !== ref || removed.tip !== sha || removed.reason !== reason || removed.actor !== actor || removed.operatorReason !== true || removed.acceptedOmission !== true) {
         violations.push({ invariant: 'sanctioned-removal-missing-proof', detail: `reasoned removal did not record the exact live tip: ${JSON.stringify({ removal, event: removed })}` });
       }
-      const m = (history) => matchReadyCandidate({
+      const m = (history, live = { ref, sha }) => matchReadyCandidate({
         ready, plan: { finalSha: 'S2', inputsKey: 'K2', mainSha: 'M2', applied: [] }, prevHead: 'H',
         treeOf: () => 'T2', stillWanted: () => true, verifyBuilt: () => true,
-        liveApplied: [{ ref, sha }], carries: () => false,
+        liveApplied: [live], carries: () => false,
         retiredByOperator: (a) => overlayRetiredByOperator?.({ ...a, events: history,
           registered: (r) => readOverlays(scratch, { env }).some((o) => o.ref === r) }) ?? false,
         nowMs: t0 + 60_000, maxAgeMs: 3_600_000,
@@ -71,6 +86,8 @@ export default {
       }
       for (const [name, history] of [
         ['removed-with-allowlisted-actor', events.map((e) => e.kind === 'auto-retired' ? { ...e, kind: 'removed' } : e)],
+        ['missing-operator-authority', events.map((e) => e.kind === 'auto-retired' ? { ...e, operatorReason: undefined } : e)],
+        ['automatic-in-main-with-actor', events.map((e) => e.kind === 'auto-retired' ? { ...e, reason: 'in-main' } : e)],
         ['missing-actor', events.map((e) => e.kind === 'auto-retired' ? { ...e, actor: undefined } : e)],
         ['non-operator-actor', events.map((e) => e.kind === 'auto-retired' ? { ...e, actor: 'unregistered[bot]' } : e)],
         ['missing-tip', events.map((e) => e.kind === 'auto-retired' ? { ...e, tip: undefined } : e)],
@@ -83,6 +100,66 @@ export default {
           violations.push({ invariant: 'unproven-retirement-adopted', detail: `${name} must keep the live-overlay omission refusal: ${JSON.stringify(result)}` });
         }
       }
+      // runAutoRebase registers the replacement under the original ref, with no `added` event.
+      const replacement = `${ref}-auto-1`;
+      git('checkout', '-qb', replacement);
+      git('commit', '--allow-empty', '-qm', 'auto-rebase replacement');
+      const replacementSha = git('rev-parse', 'HEAD');
+      git('checkout', '-q', 'main');
+      git('merge', '--no-ff', '-m', `daemon-rebuild: merge overlay ${replacement} onto main`, replacement);
+      addOverlay(scratch, { ref: replacement, stackBases: [ref] }, { env });
+      appendOverlayEvent(scratch, { kind: 'auto-rebase-registered', ref, new: replacement,
+        newSha: replacementSha, at: '2026-11-14T11:00:00Z' }, { env });
+      removeOverlay(scratch, replacement, { env });
+      appendOverlayEvent(scratch, { kind: 'removed', ref: replacement, tip: replacementSha }, { env });
+      const liveReplacement = { ref: replacement, sha: replacementSha };
+      if (m(readOverlayEventLog(scratch, env), liveReplacement).adopt !== null)
+        violations.push({ invariant: 'actorless-auto-rebase-removal-adopted', detail: 'replacement removal alone must refuse omission' });
+      await withdrawUnregisteredOverlay({ reason, acceptOmission: true, root: scratch, ref: replacement,
+        tip: replacementSha, actor, env, deps: { resolveOperatorIdentity: () => ({ login: actor, type: 'User' }) } });
+      const replacementEvents = readOverlayEventLog(scratch, env);
+      const replacementResult = m(replacementEvents, liveReplacement);
+      log?.(`auto-rebase replacement withdrawal -> adopt=${!!replacementResult.adopt} reason=${replacementResult.reason ?? ''}`);
+      if (replacementEvents.some(e => e.kind === 'added' && e.ref === replacement)
+        || replacementResult.adopt !== ready.adopt || replacementResult.retired?.[0] !== replacement)
+        violations.push({ invariant: 'auto-rebase-withdrawal-discarded', detail: JSON.stringify(replacementResult) });
+      // The supported loader writes the registry without any registration event.
+      const loadedRef = `${ref}-loaded`;
+      git('checkout', '-qb', loadedRef);
+      git('commit', '--allow-empty', '-qm', 'loader overlay');
+      const loadedSha = git('rev-parse', 'HEAD');
+      git('checkout', '-q', 'main');
+      git('update-ref', `refs/remotes/origin/${loadedRef}`, loadedSha);
+      const loaded = await runDaemonLoadOverlay({
+        clone: scratch, ref: loadedRef, pr: 7199, env, versions: null,
+        settings: { dispatchSmoke: 'off' },
+        admit: async ({ register }) => { register(null); return { registered: true }; },
+        rebuild: async () => {
+          git('merge', '--no-ff', '-m', `daemon-rebuild: merge overlay ${loadedRef} onto main`, loadedRef);
+          return { moved: true, adopted: true, head: git('rev-parse', 'HEAD') };
+        },
+      });
+      if (!loaded.adopted || readOverlayEventLog(scratch, env).some(e => e.ref === loadedRef || e.new === loadedRef))
+        violations.push({ invariant: 'loader-fixture-invalid', detail: 'loader must install without a registration event' });
+      removeRegistration({ root: scratch, ref: loadedRef, env });
+      const liveLoaded = { ref: loadedRef, sha: loadedSha };
+      if (m(readOverlayEventLog(scratch, env), liveLoaded).adopt !== null)
+        violations.push({ invariant: 'loader-removal-adopted', detail: 'removal alone must refuse omission' });
+      await withdrawUnregisteredOverlay({ reason, acceptOmission: true, root: scratch, ref: loadedRef,
+        tip: loadedSha, actor, env, deps: { resolveOperatorIdentity: () => ({ login: actor, type: 'User' }) } });
+      const loadedEvents = readOverlayEventLog(scratch, env);
+      const loadedResult = m(loadedEvents, liveLoaded);
+      log?.(`loader withdrawal without registration event -> adopt=${!!loadedResult.adopt} reason=${loadedResult.reason ?? ''}`);
+      if (loadedResult.adopt !== ready.adopt || loadedResult.retired?.[0] !== loadedRef)
+        violations.push({ invariant: 'loader-withdrawal-discarded', detail: JSON.stringify(loadedResult) });
+      if (m(loadedEvents.map(e => ({ ...e, acceptedOmission: undefined })), liveLoaded).adopt !== null)
+        violations.push({ invariant: 'loader-withdrawal-without-acceptance-adopted', detail: 'missing registration history requires explicit omission acceptance' });
+      addOverlay(scratch, { ref }, { env });
+      await retireRegistration({ root: scratch, ref, expectedTip: sha, actor, env,
+        deps: { prove: () => ({ action: 'retire', tip: sha, reason: 'in-main' }), tip: () => sha } });
+      const automatic = readOverlayEventLog(scratch, env);
+      if (m(automatic).adopt !== null)
+        violations.push({ invariant: 'automatic-retirement-authorized-omission', detail: 'ordinary in-main retirement with operator attribution must refuse omission' });
       return { violations };
     } finally {
       rmSync(scratch, { recursive: true, force: true });

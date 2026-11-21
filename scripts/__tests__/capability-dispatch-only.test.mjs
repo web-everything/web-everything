@@ -161,6 +161,7 @@ const remainingUnguardedWrites = [
   {"file":"scripts/merge-ai-prs.mjs","description":"Remove lifecycle/hold/stale label","call":"execFileSync('gh', ['pr', 'edit', String(p.number), ...repoFlag(repo), '--remove-label', rm])"},
   {"file":"scripts/merge-ai-prs.mjs","description":"Opaque gh argv forwarding boundary (includes existing readers)","call":"createMqLiveReader((_file, argv, options) => readGh(argv, options))('gh', args)"},
   {"file":"scripts/merge-ai-prs.mjs","description":"Opaque gh argv forwarding boundary (includes existing readers)","call":"execFileP('gh', listArgs)"},
+  {"file":"scripts/merge-ai-prs.mjs","description":"Lean open-PR inventory GraphQL query read (field-bearing API calls remain conservatively inventoried)","call":"execFileP('gh', ['api', 'graphql', '-f', `query=${query}`])"},
   {"file":"scripts/merge-ai-prs.mjs","description":"Remove lifecycle/hold/stale label","call":"execFileSync('gh', ['pr', 'edit', String(v.num), ...repoFlag(v.repo), '--remove-label', READY_TO_MERGE_LABEL])"},
   {"file":"scripts/merge-ai-prs.mjs","description":"Remove lifecycle/hold/stale label","call":"execFileSync('gh', ['pr', 'edit', String(v.num), ...repoFlag(v.repo), '--remove-label', staleLabel])"},
   {"file":"scripts/merge-ai-prs.mjs","description":"Remove lifecycle/hold/stale label","call":"execFileSync('gh', ['pr', 'edit', String(v.num), ...repoFlag(v.repo), '--remove-label', staleLabel])"},

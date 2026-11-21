@@ -1,0 +1,82 @@
+{
+  "list": [
+    {
+      "databaseId": 1,
+      "status": "completed",
+      "conclusion": "success",
+      "createdAt": "2026-11-01T00:00:00Z",
+      "startedAt": "2026-11-01T00:00:10Z",
+      "updatedAt": "2026-11-01T00:02:10Z"
+    },
+    {
+      "databaseId": 2,
+      "status": "completed",
+      "conclusion": "success",
+      "createdAt": "2026-11-01T00:00:00Z",
+      "startedAt": "2026-11-01T00:00:30Z",
+      "updatedAt": "2026-11-01T00:04:30Z"
+    }
+  ],
+  "views": {
+    "1": {
+      "jobs": [
+        {
+          "name": "integration",
+          "status": "completed",
+          "conclusion": "success",
+          "startedAt": "2026-11-01T00:00:30Z",
+          "completedAt": "2026-11-01T00:01:30Z",
+          "databaseId": 100,
+          "steps": [],
+          "url": "https://github.com/example/repo/actions/runs/1/job/100"
+        }
+      ]
+    },
+    "2": {
+      "jobs": [
+        {
+          "name": "integration",
+          "status": "completed",
+          "conclusion": "success",
+          "startedAt": "2026-11-01T00:00:50Z",
+          "completedAt": "2026-11-01T00:02:50Z",
+          "databaseId": 200,
+          "steps": [],
+          "url": "https://github.com/example/repo/actions/runs/2/job/200"
+        }
+      ]
+    }
+  },
+  "apiJobs": {
+    "1": {
+      "total_count": 1,
+      "jobs": [
+        {
+          "id": 100,
+          "run_id": 1,
+          "name": "integration",
+          "status": "completed",
+          "conclusion": "success",
+          "created_at": "2026-11-01T00:00:20Z",
+          "started_at": "2026-11-01T00:00:30Z",
+          "completed_at": "2026-11-01T00:01:30Z"
+        }
+      ]
+    },
+    "2": {
+      "total_count": 1,
+      "jobs": [
+        {
+          "id": 200,
+          "run_id": 2,
+          "name": "integration",
+          "status": "completed",
+          "conclusion": "success",
+          "created_at": "2026-11-01T00:00:20Z",
+          "started_at": "2026-11-01T00:00:50Z",
+          "completed_at": "2026-11-01T00:02:50Z"
+        }
+      ]
+    }
+  }
+}
