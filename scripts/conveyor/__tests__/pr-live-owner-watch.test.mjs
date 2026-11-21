@@ -616,18 +616,18 @@ describe('portable feed IO and settings', () => {
   it('PR list retries ETIMEDOUT once and recovers without losing the inventory', async () => {
     const readGhText = vi.fn().mockImplementationOnce(() => { throw Object.assign(Error('spawnSync gh ETIMEDOUT'), { code: 'ETIMEDOUT' }); })
       .mockReturnValueOnce(JSON.stringify([pr()]));
-    const { io } = await localIo({ readGhText });
+    const { io } = await localIo({ readGhText, sleepMs: vi.fn() });
     expect(io.listPRs()).toEqual([pr()]);
     expect(readGhText).toHaveBeenCalledTimes(2);
   });
   it('PR list holds after one failed timeout retry with an inventory inspection fallback', async () => {
     const readGhText = vi.fn(() => { throw Object.assign(Error('spawnSync gh ETIMEDOUT'), { code: 'ETIMEDOUT' }); });
-    const { io } = await localIo({ readGhText });
+    const { io } = await localIo({ readGhText, sleepMs: vi.fn() });
     const h = harness([], { listPRs: io.listPRs });
     const result = await h.run();
     expect(result.considered).toBe(0);
-    expect(result.held).toContainEqual({ reason: expect.stringMatching(/PR list unavailable after one timeout retry.*ETIMEDOUT.*operator must inspect inventory/) });
-    expect(readGhText).toHaveBeenCalledTimes(2); expect(h.io.execute).not.toHaveBeenCalled();
+    expect(result.held).toContainEqual({ reason: expect.stringMatching(/PR list unavailable after 2 retries.*ETIMEDOUT.*operator must inspect inventory/) });
+    expect(readGhText).toHaveBeenCalledTimes(3); expect(h.io.execute).not.toHaveBeenCalled();
   });
 
   it('stale-base gate and optional validator use injected existing entry points', async () => {
