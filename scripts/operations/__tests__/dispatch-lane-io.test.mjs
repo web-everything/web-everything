@@ -16,6 +16,14 @@ vi.mock('../minimal-context-provider.mjs', async (importOriginal) => {
   return { ...actual, LEAN_FIX_HOOKS_SETTINGS: vi.fn(actual.LEAN_FIX_HOOKS_SETTINGS) };
 });
 
+// Remote runners (Forge file copies) do not carry .claude/; fall back to a committed copy of its hooks.
+const here = dirname(fileURLToPath(import.meta.url));
+const realSettings = resolve(here, '../../../.claude/settings.json');
+const CANONICAL_SETTINGS = existsSync(realSettings) ? realSettings : resolve(here, 'fixtures/lean-hooks-claude-settings.json');
+vi.mocked(LEAN_FIX_HOOKS_SETTINGS).mockImplementation(((actual) => (p = CANONICAL_SETTINGS) => actual(p))(
+  vi.mocked(LEAN_FIX_HOOKS_SETTINGS).getMockImplementation(),
+));
+
 describe('lean repair background argv', () => {
   const options = (launchKind) => ({
     payload: { launchKind, num: '3037', sessionSlug: 'repair-3037', prompt: 'Repair this PR.' },
@@ -62,7 +70,7 @@ describe('lean repair background argv', () => {
   });
 
   it('fix and ci-heal settings copy canonical pinned guards and Stop verbatim', () => {
-    const canonical = JSON.parse(fs.readFileSync(resolve(dirname(fileURLToPath(import.meta.url)), '../../../.claude/settings.json'), 'utf8'));
+    const canonical = JSON.parse(fs.readFileSync(CANONICAL_SETTINGS, 'utf8'));
     const expectedPre = canonical.hooks.PreToolUse.filter(entry => ['Edit|Write', 'Bash'].includes(entry.matcher));
     const canonicalCommands = Object.values(canonical.hooks).flatMap(entries => entries.flatMap(entry => entry.hooks.map(hook => hook.command)));
     for (const kind of ['fix', 'ci-heal']) {
@@ -105,8 +113,7 @@ describe('lean repair background argv', () => {
 
   it.each(['unreadable', 'invalid JSON', 'missing hooks', 'missing Edit|Write', 'missing Bash', 'missing Stop', 'empty guard'])(
     'fails closed at argv build time on %s repo settings; build and resume remain available', (fault) => {
-      const settingsUrl = resolve(dirname(fileURLToPath(import.meta.url)), '../../../.claude/settings.json');
-      const canonicalText = fs.readFileSync(settingsUrl, 'utf8');
+      const canonicalText = fs.readFileSync(CANONICAL_SETTINGS, 'utf8');
       const canonical = JSON.parse(canonicalText);
       if (fault === 'missing hooks') delete canonical.hooks;
       if (fault === 'missing Stop') delete canonical.hooks.Stop;
