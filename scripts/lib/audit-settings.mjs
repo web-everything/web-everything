@@ -61,6 +61,7 @@ export const AUDITOR_FLOOR = Object.freeze(['scripts/operations/audit-verdict.mj
 /** Modules the auditor imports or launches directly that no other floor entry names (the source-scan test pins each). */
 const AUDITOR_IMPORTS = Object.freeze(['scripts/lib/net-diff-fingerprint.mjs', 'scripts/lib/under-test.mjs',
   // The audit launcher's imports, and the transcript-check settings its policy reads.
+  'scripts/lib/agent-launch.mjs', 'scripts/lib/agent-launch-env-registry.json',
   'scripts/lib/codex-transcript-policy.mjs', 'scripts/lib/codex-transcript-check.mjs', 'scripts/settings/codex-transcript-check.json',
   'scripts/lib/build-policy.mjs', 'scripts/lib/build-self-review.mjs', 'scripts/lib/lane-git-hardening.mjs',
   'scripts/lib/codex-usage-ledger.mjs', 'scripts/lib/codex-model-routing.mjs', 'scripts/lib/codex-task-route.mjs']);
