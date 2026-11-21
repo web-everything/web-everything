@@ -68,6 +68,7 @@ describe('runner freshness policy', () => {
         "agent-activity",
         "ai-routing",
         "brief-mode",
+        "build-priority-set",
         "ci-heal-reset",
         "claim",
         "clear-claim",
@@ -146,7 +147,7 @@ describe('runner freshness policy', () => {
         "worker-capacity",
       ]
     `);
-    for (const name of ['close-items', 'reopen-items', 'graduate-chain', 'prototype-load', 'routing-override']) {
+    for (const name of ['close-items', 'reopen-items', 'graduate-chain', 'prototype-load', 'routing-override', 'build-priority-set']) {
       expect(isReadOnlyOperation(resolveOperation(name).declaration), name).toBe(false);
     }
     for (const name of names) {
