@@ -101,7 +101,11 @@ jobs:
         working-directory: web-everything
         env:
           GH_TOKEN: ${{ github.token }}
-        run: echo "base=$(node scripts/ci/measure-base.mjs measure-covered.txt)" >> "$GITHUB_OUTPUT"
+        run: |
+          set -eu
+          base=$(node scripts/ci/measure-base.mjs measure-covered.txt)
+          test -n "$base"
+          echo "base=$base" >> "$GITHUB_OUTPUT"
 
       - name: Record false-green signal (#2681)
         if: ${{ steps.report.outcome == 'success' }}
@@ -118,9 +122,15 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: false-green-signal
-          path: |
-            web-everything/false-green-log.json
-            web-everything/measure-covered.txt
+          path: web-everything/false-green-log.json
+          if-no-files-found: warn
+
+      - name: Upload covered merges
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: measure-covered
+          path: web-everything/measure-covered.txt
           if-no-files-found: warn
 
       # Free byproduct of the shadow run above: per-test durations are already in vitest-full.json, this

@@ -32,16 +32,22 @@ describe('test-selection measure produces data (advisory)', () => {
     const base = job.steps.find(s => s.id === 'base');
     const rec = job.steps.find(s => String(s.run ?? '').includes('test-selection.mjs --measure'));
     expect(base.run).toContain('node scripts/ci/measure-base.mjs measure-covered.txt');
-    expect(base.run).toContain('base=$(');
-    expect(base.run).toContain('$GITHUB_OUTPUT');
+    expect(base.run.trim().split('\n').map(line => line.trim())).toEqual([
+      'set -eu',
+      'base=$(node scripts/ci/measure-base.mjs measure-covered.txt)',
+      'test -n "$base"',
+      'echo "base=$base" >> "$GITHUB_OUTPUT"',
+    ]);
     expect(base.env.GH_TOKEN).toBe('${{ github.token }}');
     expect(job.steps.indexOf(base)).toBeLessThan(job.steps.indexOf(rec));
     expect(rec.run).toContain('--base=${{ steps.base.outputs.base }}');
     expect(workflow.permissions.actions).toBe('read');
     expect(workflow.concurrency['cancel-in-progress']).toBe("${{ github.ref != 'refs/heads/main' }}");
     const artifact = job.steps.find(s => s.with?.name === 'false-green-signal');
-    expect(artifact.with.path).toContain('web-everything/false-green-log.json');
-    expect(artifact.with.path).toContain('web-everything/measure-covered.txt');
+    expect(artifact.with.path).toBe('web-everything/false-green-log.json');
+    const covered = job.steps.find(s => s.with?.name === 'measure-covered');
+    expect(covered.with.path).toBe('web-everything/measure-covered.txt');
+    expect(covered.if).toBe('always()');
   });
 
   it('is still gated on the repo variable (or manual dispatch)', () => {
