@@ -10,6 +10,7 @@ import { isUnderTest } from '../lib/under-test.mjs';
 import { laneGitHardeningEnv, laneHistoryProofEnv, LANE_GIT_CONFIG_PINS, LANE_HISTORY_CONFIG_PINS } from '../lib/lane-git-hardening.mjs';
 import { buildCodexDirectTaskDescriptor, CODEX_SHIM_DIR } from '../codex-direct-task.mjs';
 import { clearEnv, clearRestrictiveEnv } from './fixtures/agent-launch-env.mjs';
+import { createAuditDeps } from '../operations/codex-audit-io.mjs';
 
 const SID = '12345678-1234-4234-8234-123456789abc';
 const cwd = process.cwd();
@@ -30,6 +31,164 @@ beforeEach(() => {
   vi.stubEnv('PATH', fixedPath());
 });
 afterEach(() => vi.unstubAllEnvs());
+
+describe('PR #7170 A-finding security regressions', () => {
+  const childEnv = (extra = {}) => {
+    const io = seam();
+    launchAgent({ ...base(), ...extra }, io);
+    return io.spawn.mock.calls[0][2].env;
+  };
+  const setParent = env => { for (const [key, value] of Object.entries(env)) vi.stubEnv(key, value); };
+  beforeEach(() => {
+    for (const key of Object.keys(process.env).filter(key => key.startsWith('GIT_CONFIG_'))) clearEnv(key);
+    for (const key of ['GIT_INDEX_FILE', 'GH_CONFIG_DIR', 'WE_HEAVY_ADMISSION', 'WE_PR_LIMIT_OFF',
+      'WE_PLATFORM_PREFERENCES_FILE', 'WE_POLICY_CONFIG', 'WE_PLATFORM_PREFERENCES']) clearEnv(key);
+  });
+  it('F8: preserves config isolation and prevents real Git from reading global aliases or hooks', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'agent-global-isolation-'));
+    try {
+      writeFileSync(join(dir, '.gitconfig'), '[alias]\n  isolation-probe = !echo exposed\n[core]\n  hooksPath = .githooks\n');
+      setParent({ HOME: dir, GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: '/dev/null', GIT_CONFIG_SYSTEM: '/dev/null' });
+      const env = childEnv();
+      expect(env).toMatchObject({ GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: '/dev/null', GIT_CONFIG_SYSTEM: '/dev/null' });
+      for (const key of ['alias.isolation-probe', 'core.hooksPath']) {
+        const probe = source => spawnSync('git', ['config', '--global', '--get', key], {
+          cwd: dir, env: source, encoding: 'utf8', timeout: 5000, maxBuffer: 1024 * 1024,
+        });
+        expect(probe({ HOME: dir, PATH: env.PATH }).stdout.trim()).not.toBe('');
+        const result = probe(env);
+        expect(result.error).toBeUndefined(); expect(result.status, result.stderr).toBe(1);
+        expect(result.stdout).toBe('');
+      }
+      setParent({ GIT_CONFIG_GLOBAL: '/untrusted/global' });
+      expect(childEnv()).not.toHaveProperty('GIT_CONFIG_GLOBAL');
+      clearEnv('GIT_CONFIG_GLOBAL');
+      expect(childEnv({ inheritEnv: { GIT_CONFIG_GLOBAL: '/untrusted/global' } })).not.toHaveProperty('GIT_CONFIG_GLOBAL');
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+  it('F9: retains normalized Git boolean restrictions and drops interactive prompting', () => {
+    const restrictions = { GIT_NO_REPLACE_OBJECTS: 'true', GIT_NO_LAZY_FETCH: 'yes', GIT_REF_PARANOIA: 'on', GIT_TERMINAL_PROMPT: 'false' };
+    setParent(Object.fromEntries(Object.entries(restrictions).map(([k, v]) => [k, ` ${v.toUpperCase()} `])));
+    expect(childEnv()).toMatchObject(restrictions);
+    vi.stubEnv('GIT_TERMINAL_PROMPT', '1');
+    expect(childEnv()).not.toHaveProperty('GIT_TERMINAL_PROMPT');
+  });
+  it.each(['GIT_INDEX_FILE', 'GH_CONFIG_DIR'])('F10/F14: preserves ambient %s isolation, drops caller-only redirects and refuses relative paths', key => {
+    const isolated = join(tmpdir(), key === 'GIT_INDEX_FILE' ? 'scratch-index' : 'isolated-gh');
+    vi.stubEnv(key, isolated);
+    expect(childEnv()[key]).toBe(isolated);
+    clearEnv(key);
+    expect(childEnv({ inheritEnv: { [key]: isolated } })).not.toHaveProperty(key);
+    vi.stubEnv(key, 'relative/isolation');
+    refused(base(), new RegExp(`${key} must be absolute`));
+  });
+  it('F10: the codex-audit-io scratch index reaches the launched review child', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'agent-audit-index-'));
+    try {
+      const deps = createAuditDeps({ cwd: dir, scratchRoot: dir, spawnSync: (file, args, options) => {
+        if (file === 'git') return { status: 0, stdout: '.git/index\n' };
+        expect(options.env.GIT_INDEX_FILE).toMatch(/codex-audit-.*\/index$/);
+        setParent(options.env); // This is the environment of the audit's launcher subprocess.
+        const io = seam();
+        launchAgent(buildCodexDirectTaskDescriptor({ cwd: dir, review: true, env: { ...process.env } }), io);
+        expect(io.spawn.mock.calls[0][2].env.GIT_INDEX_FILE).toBe(options.env.GIT_INDEX_FILE);
+        return { status: 0, stdout: JSON.stringify({ exitCode: 0, timedOut: false, lastMessage: 'reviewed' }) };
+      } });
+      expect(deps.runCodex('audit fixture')).toBe('reviewed');
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+  it('F5: retains parent empty hooksPath and protocol user restrictions without allowing caller hook resets or global user', () => {
+    const parent = { GIT_CONFIG_COUNT: '2', GIT_CONFIG_KEY_0: 'core.hooksPath', GIT_CONFIG_VALUE_0: '',
+      GIT_CONFIG_KEY_1: 'protocol.https.allow', GIT_CONFIG_VALUE_1: 'user' };
+    setParent(parent);
+    const env = childEnv();
+    expect(env).toMatchObject(parent);
+    const dir = mkdtempSync(join(tmpdir(), 'agent-hooks-isolation-'));
+    try {
+      const run = (args, source) => spawnSync('git', args, {
+        cwd: dir, env: source, encoding: 'utf8', timeout: 5000, maxBuffer: 1024 * 1024,
+      });
+      const isolated = { PATH: env.PATH, HOME: dir, GIT_CONFIG_GLOBAL: '/dev/null', GIT_CONFIG_NOSYSTEM: '1' };
+      expect(run(['init', '--quiet'], isolated).status).toBe(0);
+      expect(run(['config', '--local', 'core.hooksPath', '.githooks'], isolated).status).toBe(0);
+      expect(run(['config', '--get', 'core.hooksPath'], isolated).stdout.trim()).toBe('.githooks');
+      const result = run(['config', '--get', 'core.hooksPath'], env);
+      expect(result.error).toBeUndefined(); expect(result.status, result.stderr).toBe(0);
+      expect(result.stdout.trim()).toBe('');
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+    clearEnv('GIT_CONFIG_COUNT');
+    expect(childEnv({ inheritEnv: { ...parent, GIT_CONFIG_KEY_1: 'protocol.allow' } })).not.toHaveProperty('GIT_CONFIG_COUNT');
+    setParent({ GIT_CONFIG_COUNT: '1', GIT_CONFIG_KEY_0: 'protocol.allow', GIT_CONFIG_VALUE_0: 'user' });
+    expect(childEnv()).not.toHaveProperty('GIT_CONFIG_COUNT');
+  });
+  it('F13: refuses to lose the first executable parent gh guard and accepts an explicit guard prefix', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'agent-gh-guard-'));
+    try {
+      const guard = join(dir, 'guard'), real = join(dir, 'real');
+      for (const where of [guard, real]) {
+        mkdirSync(where); writeFileSync(join(where, 'gh'), '#!/bin/sh\nexit 0\n', { mode: 0o755 });
+      }
+      vi.stubEnv('PATH', `${guard}:${real}`);
+      const io = seam();
+      expect(() => launchAgent(base(), io)).toThrow(/child gh would resolve outside the parent gh guard; install it as an approved shim dir or pass it as pathPrefix/);
+      expect(io.spawn).not.toHaveBeenCalled();
+      expect(childEnv({ pathPrefix: guard }).PATH.split(':')[0]).toBe(guard);
+      // An explicitly selected prefix is allowed even when it provides a different gh.
+      expect(childEnv({ pathPrefix: real }).PATH.split(':')[0]).toBe(real);
+      vi.stubEnv('PATH', fixedPath());
+      expect(childEnv().PATH).toBe(fixedPath());
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+  it.each([
+    ['WE_JUDGE_ACTOR_ENABLED', 'true', 'false'],
+    ['WE_JUDGE_NOT_REAL_MODE', 'evidence-required', 'open'],
+    ['WE_CARD_RULING_FILE_MODE', 'two-step', 'one-call'],
+    ['WE_CARD_RULING_ALLOW_NON_REGRESSION', 'off', 'on'],
+  ])('F15: %s refuses invalid values from either source before spawn', (key, restrictive, relaxing) => {
+    clearEnv(key);
+    refused({ ...base(), inheritEnv: { [key]: 'invalid' } }, new RegExp(`${key} has an invalid value; repair the environment`));
+    vi.stubEnv(key, 'invalid');
+    refused(base(), new RegExp(`${key} has an invalid value; repair the environment`));
+    vi.stubEnv(key, relaxing);
+    expect(childEnv()).not.toHaveProperty(key);
+    clearEnv(key);
+    expect(childEnv({ inheritEnv: { [key]: relaxing } })).not.toHaveProperty(key);
+    vi.stubEnv(key, restrictive);
+    expect(childEnv()[key]).toBe(restrictive);
+  });
+  it('F4: refuses restoring conflicting ambient bypass settings over caller restrictions', () => {
+    setParent({ WE_HEAVY_ADMISSION: 'off', WE_PR_LIMIT_OFF: '1' });
+    for (const inheritEnv of [{ WE_HEAVY_ADMISSION: 'on', WE_PR_LIMIT_OFF: '0' }, { WE_PR_LIMIT_OFF: '0' }]) {
+      refused({ ...base(), inheritEnv }, /inheritEnv\.(WE_HEAVY_ADMISSION|WE_PR_LIMIT_OFF) conflicts with the parent environment/);
+    }
+  });
+  it('F4: a complete caller environment excludes omitted ambient bypasses and validates the flag', () => {
+    setParent({ WE_HEAVY_ADMISSION: 'off', WE_PR_LIMIT_OFF: '1' });
+    const env = childEnv({ inheritEnv: {}, inheritEnvComplete: true });
+    expect(env).not.toHaveProperty('WE_HEAVY_ADMISSION'); expect(env).not.toHaveProperty('WE_PR_LIMIT_OFF');
+    expect(childEnv({ inheritEnv: { ...process.env }, inheritEnvComplete: true })).toEqual(childEnv());
+    refused({ ...base(), inheritEnvComplete: 'true' }, /inheritEnvComplete must be boolean/);
+    const d = buildCodexDirectTaskDescriptor({ cwd, env: {} });
+    expect(d.inheritEnvComplete).toBe(true);
+    const io = seam(); launchAgent(d, io);
+    expect(io.spawn.mock.calls[0][2].env).not.toHaveProperty('WE_HEAVY_ADMISSION');
+    expect(io.spawn.mock.calls[0][2].env).not.toHaveProperty('WE_PR_LIMIT_OFF');
+  });
+  it.each(['WE_PLATFORM_PREFERENCES_FILE', 'WE_POLICY_CONFIG', 'WE_PLATFORM_PREFERENCES'])(
+    'F3: refuses caller-only %s policy sources and forwards matching parent evidence', key => {
+      const source = join(tmpdir(), 'authoritative-policy.json');
+      refused({ ...base(), inheritEnv: { [key]: source } }, new RegExp(`inheritEnv\.${key}`));
+      vi.stubEnv(key, source);
+      expect(childEnv({ inheritEnv: { [key]: source } })[key]).toBe(source);
+      refused({ ...base(), inheritEnv: { [key]: source + '.other' } }, /conflicts with the parent environment/);
+    });
+  it('HOME: preserves isolated caller HOME, falling back to ambient HOME', () => {
+    const ambientHome = join(tmpdir(), 'parent-home'), callerHome = join(tmpdir(), 'caller-home');
+    vi.stubEnv('HOME', ambientHome);
+    expect(childEnv({ inheritEnv: { HOME: callerHome } }).HOME).toBe(callerHome);
+    expect(childEnv().HOME).toBe(ambientHome);
+  });
+});
 
 describe('closed grammar rejection: the PR #7022 attack classes', () => {
   it('1 refuses shell wrappers as agent or nested invocation data', () => {
@@ -104,9 +263,9 @@ describe('closed grammar rejection: the PR #7022 attack classes', () => {
     for (const key of ['BASH_ENV', 'ENV', 'ZDOTDIR', 'SHELL']) expect(env).not.toHaveProperty(key);
     refused({ ...base(), env: { BASH_ENV: '/hostile' } }, /env/);
   });
-  it('13 uses the real account home despite HOME override', () => {
+  it('13 preserves ambient HOME while refusing a raw HOME descriptor field', () => {
     vi.stubEnv('HOME', '/hostile');
-    expect(buildAgentInvocation(base(), seam()).options.env.HOME).toBe(userInfo().homedir);
+    expect(buildAgentInvocation(base(), seam()).options.env.HOME).toBe('/hostile');
     refused({ ...base(), HOME: '/hostile' }, /HOME/);
   });
   it('14 snapshots once before resolver mutation and detaches aliased nested arrays', () => {
@@ -176,9 +335,9 @@ describe('built invocation positive controls', () => {
     const io = seam(); expect(launchAgent(d, io)).toBe('child');
     expect(io.spawn).toHaveBeenCalledWith(process.execPath, expected, expect.objectContaining({ shell: false, detached: true, cwd, stdio: ['pipe', 'pipe', 'pipe'] }));
     expect(isAbsolute(io.spawn.mock.calls[0][0])).toBe(true);
-    // A PATH-only caller bag retains ambient metadata (including unknown names) and restrictions.
+    // direct-task supplies a complete env, so omitted ambient metadata stays excluded.
     const env = io.spawn.mock.calls[0][2].env;
-    expect(env).toMatchObject({ USER: 'parent-user', WE_DAEMON_MANAGED_CLONE: '1', SEC1_POSITIVE_CONTROL: 'parent-unknown' });
+    for (const key of ['USER', 'WE_DAEMON_MANAGED_CLONE', 'SEC1_POSITIVE_CONTROL']) expect(env).not.toHaveProperty(key);
     expect(Object.keys(env).every(k => ['PATH', 'HOME'].includes(k)
       || Object.hasOwn(process.env, k))).toBe(true);
   });
@@ -256,7 +415,8 @@ describe('three-class environment boundary', () => {
     const markers = { WE_GH_DAEMON_CALLER: 'daemon', XPC_SERVICE_NAME: 'com.we.test', VITEST: 'true',
       WE_UNDER_TEST: '1', LANE_POOL_ROOT: '/isolated/pool', WE_GH_AUTH_PERSONAL_FALLBACK: 'refuse' };
     for (const [key, value] of Object.entries(markers)) vi.stubEnv(key, value);
-    const env = buildAgentInvocation({ ...base(), inheritEnv: Object.fromEntries(Object.keys(markers).map(k => [k, blank])) }, seam()).options.env;
+    refused({ ...base(), inheritEnv: Object.fromEntries(Object.keys(markers).map(k => [k, blank])) }, /conflicts with the parent environment/);
+    const env = buildAgentInvocation({ ...base(), inheritEnv: {} }, seam()).options.env;
     expect(env).toMatchObject(markers);
     expect(isDaemonCaller(env)).toBe(true);
     expect(isUnderTest(env)).toBe(true);
@@ -287,7 +447,8 @@ describe('three-class environment boundary', () => {
       expect(bag[name]).toBe(marker);
       expect(predicate({ [name]: bag[name] })).toBe(true);
       vi.stubEnv(name, marker);
-      for (const inheritEnv of [{}, { [name]: '' }, { [name]: 'bag-identity' }]) {
+      for (const value of ['', 'bag-identity']) refused({ ...base(), inheritEnv: { [name]: value } }, /conflicts with the parent environment/);
+      for (const inheritEnv of [{}, { [name]: marker }]) {
         const env = buildAgentInvocation({ ...base(), inheritEnv }, seam()).options.env;
         expect(env[name]).toBe(marker);
         expect(predicate({ [name]: env[name] })).toBe(true);
@@ -303,11 +464,12 @@ describe('three-class environment boundary', () => {
         expect(buildAgentInvocation({ ...base(), inheritEnv: { [name]: value } }, seam()).options.env[name], name).toBe(value);
         vi.stubEnv(name, value);
         for (const relaxed of ['', ' \t ', 'sec1-unknown-relaxation']) {
-          expect(buildAgentInvocation({ ...base(), inheritEnv: { [name]: relaxed } }, seam()).options.env[name], name).toBe(value);
+          refused({ ...base(), inheritEnv: { [name]: relaxed } }, /conflicts with the parent environment|has an invalid value/);
         }
       }
       vi.stubEnv(name, 'sec1-unknown-relaxation');
-      expect(buildAgentInvocation({ ...base(), inheritEnv: { [name]: 'sec1-unknown-relaxation' } }, seam()).options.env, name).not.toHaveProperty(name);
+      if (rule.invalidFailsClosed) refused({ ...base(), inheritEnv: { [name]: 'sec1-unknown-relaxation' } }, /has an invalid value/);
+      else expect(buildAgentInvocation({ ...base(), inheritEnv: { [name]: 'sec1-unknown-relaxation' } }, seam()).options.env, name).not.toHaveProperty(name);
       clearEnv(name);
     }
   });
@@ -319,12 +481,14 @@ describe('three-class environment boundary', () => {
   });
   it('keeps ambient identity and neutral metadata with an explicit bag', () => {
     vi.stubEnv('WE_GH_DAEMON_CALLER', 'host-daemon'); vi.stubEnv('USER', 'host-user');
-    const env = buildAgentInvocation({ ...base(), inheritEnv: { WE_GH_DAEMON_CALLER: 'bag-daemon', LC_MESSAGES: 'C' } }, seam()).options.env;
+    refused({ ...base(), inheritEnv: { WE_GH_DAEMON_CALLER: 'bag-daemon' } }, /conflicts with the parent environment/);
+    const env = buildAgentInvocation({ ...base(), inheritEnv: { LC_MESSAGES: 'C' } }, seam()).options.env;
     expect(env).toMatchObject({ WE_GH_DAEMON_CALLER: 'host-daemon', LC_MESSAGES: 'C' });
     expect(env.USER).toBe('host-user');
   });
   it('ignores plain drop and unknown bag names while preserving unknown ambient names', () => {
-    const dropped = Object.keys(registry).filter(key => registry[key].class === 'drop' && !key.includes('*'));
+    const dropped = Object.keys(registry).filter(key => registry[key].class === 'drop' && !key.includes('*')
+      && !registry[key].invalidFailsClosed && !registry[key].bagMismatch);
     const unknown = ['SEC1_UNKNOWN', 'SEC1_UNREGISTERED'];
     for (const key of dropped) clearEnv(key);
     const bag = Object.fromEntries([...dropped, ...unknown].map(key => [key, 'hostile']));
@@ -334,7 +498,7 @@ describe('three-class environment boundary', () => {
     const ambient = buildAgentInvocation(base(), seam()).options.env;
     for (const key of unknown) expect(ambient[key], key).toBe('hostile');
     for (const env of [ambient, explicit]) {
-      expect(env.HOME).toBe(userInfo().homedir);
+      expect(env.HOME).toBe(env === explicit ? 'hostile' : process.env.HOME);
       expect(env.PATH).toBe(fixedPath());
     }
   });
@@ -394,7 +558,7 @@ describe('restrictive PATH projection', () => {
     const io = seam(); io.resolveBinary.mockReturnValue('/agent-install/codex');
     const env = buildAgentInvocation(d, io).options.env;
     expect(env.PATH).toBe(`${legacy}:${checkout}:${fixedPath()}:/agent-install`);
-    expect(env.HOME).toBe(home);
+    expect(env.HOME).toBe('/hostile-home');
   });
   it('resolves bare gh to the first parent shim ahead of a real-gh fixture without using host HOME', () => {
     const dir = mkdtempSync(join(tmpdir(), 'agent-gh-path-'));
@@ -459,8 +623,8 @@ describe('value-gated auth vars forward only their tightening values', () => {
   });
   it('a relaxing bag value cannot override an ambient tightening one', () => {
     vi.stubEnv('WE_GH_AUTH_PERSONAL_FALLBACK', 'refuse'); vi.stubEnv('WE_GITHUB_AUTH', 'app');
-    expect(envOf({ WE_GH_AUTH_PERSONAL_FALLBACK: 'allow', WE_GITHUB_AUTH: 'personal' }))
-      .toMatchObject({ WE_GH_AUTH_PERSONAL_FALLBACK: 'refuse', WE_GITHUB_AUTH: 'app' });
+    expect(() => envOf({ WE_GH_AUTH_PERSONAL_FALLBACK: 'allow', WE_GITHUB_AUTH: 'personal' }))
+      .toThrow(/conflicts with the parent environment/);
   });
 });
 
@@ -471,9 +635,9 @@ describe('value-gated restrictions reach exact-string consumers', () => {
     const envOf = inheritEnv => buildAgentInvocation({ ...base(), inheritEnv }, seam()).options.env;
     expect(envOf(Object.fromEntries(names.map(n => [n, ' 1 '])))).toMatchObject(Object.fromEntries(names.map(n => [n, '1'])));
     for (const name of names) vi.stubEnv(name, '1');
-    expect(envOf(Object.fromEntries(names.map(n => [n, ' true '])))).toMatchObject(Object.fromEntries(names.map(n => [n, '1'])));
+    expect(() => envOf(Object.fromEntries(names.map(n => [n, ' true '])))).toThrow(/conflicts with the parent environment/);
     vi.stubEnv('WE_JUDGE_NOT_REAL_MODE', 'off');
-    expect(envOf({ WE_JUDGE_NOT_REAL_MODE: 'evidence-required' }).WE_JUDGE_NOT_REAL_MODE).toBe('off');
+    expect(() => envOf({ WE_JUDGE_NOT_REAL_MODE: 'evidence-required' })).toThrow(/conflicts with the parent environment/);
   });
   it('snapshots restrictive shim paths before resolver mutation', () => {
     const shim = defaultShimDir(userInfo().homedir);
@@ -498,7 +662,10 @@ describe('registry identity predicates match the gh shim daemon reader', () => {
       const projected = buildAgentInvocation({ ...base(), inheritEnv: { [name]: value } }, seam()).options.env;
       expect(isDaemonCaller(projected)).toBe(isDaemonCaller({ [name]: value }));
       vi.stubEnv(name, name === 'XPC_SERVICE_NAME' ? 'com.we.parent' : 'parent');
-      expect(isDaemonCaller(buildAgentInvocation({ ...base(), inheritEnv: { [name]: value } }, seam()).options.env)).toBe(true);
+      if (value !== (name === 'XPC_SERVICE_NAME' ? 'com.we.parent' : 'parent')) {
+        refused({ ...base(), inheritEnv: { [name]: value } }, /conflicts with the parent environment/);
+      }
+      expect(isDaemonCaller(buildAgentInvocation({ ...base(), inheritEnv: {} }, seam()).options.env)).toBe(true);
       clearEnv(name);
     }
   });
@@ -758,10 +925,9 @@ describe('final audit: ambient hardening pins and unregistered parent restrictio
     const caller = laneHistoryProofEnv({}, { remoteProbe: true });
     expect(configOf(envOf(caller))).toEqual(configOf(caller));
   });
-  // `user` is tighter than Git's default only for file (default user). For ext (default never) and for the global
-  // protocol.allow it loosens, so it is dropped from either source; only protocol.file.allow=user is kept.
+  // Global user and unknown protocols could loosen Git defaults and stay excluded.
   it.each(['protocol.ext.allow', 'protocol.allow', 'PROTOCOL.ALLOW', 'Protocol.ext.Allow', 'protocol.FILE.allow',
-    'protocol.https.allow', 'protocol.custom+x.allow'])('drops %s=user from the parent and from the caller bag', key => {
+    'protocol.custom+x.allow'])('drops %s=user from the parent and from the caller bag', key => {
     setParent({ GIT_CONFIG_COUNT: '1', GIT_CONFIG_KEY_0: key, GIT_CONFIG_VALUE_0: 'user' });
     expect(configOf(envOf({}))).toEqual({});
     clearEnv('GIT_CONFIG_COUNT');
@@ -781,7 +947,7 @@ describe('final audit: ambient hardening pins and unregistered parent restrictio
     expect(child).toEqual({ GIT_CONFIG_COUNT: '1', GIT_CONFIG_KEY_0: 'core.hooksPath', GIT_CONFIG_VALUE_0: '/dev/null' });
     expect(Object.values(child).map(v => v.toLowerCase())).not.toContain('protocol.ext.allow');
   });
-  it.each(['protocol.file.allow', 'PROTOCOL.file.ALLOW'])('keeps %s=user from either source (Git default for file)', key => {
+  it.each(['protocol.file.allow', 'PROTOCOL.file.ALLOW', 'protocol.http.allow', 'protocol.https.allow', 'protocol.git.allow', 'protocol.ssh.allow'])('keeps %s=user from either source (Git default for file)', key => {
     const pair = { GIT_CONFIG_COUNT: '1', GIT_CONFIG_KEY_0: key, GIT_CONFIG_VALUE_0: 'user' };
     expect(configOf(envOf(pair))).toEqual(pair);
     setParent(pair);
@@ -808,8 +974,9 @@ describe('final audit: ambient hardening pins and unregistered parent restrictio
   it('forwards unregistered ambient WE_PR_LIMIT_WE=0 and arbitrary values but drops unknown bag names', () => {
     for (const name of ['WE_PR_LIMIT_WE', 'SEC1_ARBITRARY_UNKNOWN', 'SEC1_BAG_UNKNOWN']) clearEnv(name);
     setParent({ WE_PR_LIMIT_WE: '0', SEC1_ARBITRARY_UNKNOWN: ' verbatim\nvalue ' });
-    expect(envOf({ SEC1_BAG_UNKNOWN: 'bag', SEC1_ARBITRARY_UNKNOWN: 'replacement' }))
-      .toMatchObject({ WE_PR_LIMIT_WE: '0', SEC1_ARBITRARY_UNKNOWN: ' verbatim\nvalue ' });
+    expect(() => envOf({ SEC1_BAG_UNKNOWN: 'bag', SEC1_ARBITRARY_UNKNOWN: 'replacement' }))
+      .toThrow(/inheritEnv.SEC1_ARBITRARY_UNKNOWN conflicts with the parent environment/);
+    expect(envOf({})).toMatchObject({ WE_PR_LIMIT_WE: '0', SEC1_ARBITRARY_UNKNOWN: ' verbatim\nvalue ' });
     expect(envOf({ SEC1_BAG_UNKNOWN: 'bag' })).not.toHaveProperty('SEC1_BAG_UNKNOWN');
   });
   it('never forwards unregistered FOO_TOKEN or LD_FOO from either source', () => {
@@ -825,7 +992,7 @@ describe('final audit: transport allowlist and bag-only limits', () => {
   const envOf = inheritEnv => buildAgentInvocation({ ...base(), ...(inheritEnv ? { inheritEnv } : {}) }, seam()).options.env;
   it('forwards the parent GIT_ALLOW_PROTOCOL and ignores a caller value that could add ext', () => {
     vi.stubEnv('GIT_ALLOW_PROTOCOL', 'https');
-    expect(envOf({ GIT_ALLOW_PROTOCOL: 'https:ext' }).GIT_ALLOW_PROTOCOL).toBe('https');
+    expect(() => envOf({ GIT_ALLOW_PROTOCOL: 'https:ext' })).toThrow(/conflicts with the parent environment/);
     clearEnv('GIT_ALLOW_PROTOCOL');
     expect(envOf({ GIT_ALLOW_PROTOCOL: 'ext' })).not.toHaveProperty('GIT_ALLOW_PROTOCOL');
   });
@@ -835,6 +1002,6 @@ describe('final audit: transport allowlist and bag-only limits', () => {
     expect(envOf({ WE_TMP_LEAK_MAX: '0' }).WE_TMP_LEAK_MAX).toBe('0');
     vi.stubEnv('WE_GH_THROTTLE_CAP', '8');
     expect(envOf({ WE_GH_THROTTLE_CAP: '3' }).WE_GH_THROTTLE_CAP).toBe('3');
-    expect(envOf({ WE_GH_THROTTLE_CAP: '20' }).WE_GH_THROTTLE_CAP).toBe('8');
+    expect(() => envOf({ WE_GH_THROTTLE_CAP: '20' })).toThrow(/conflicts with the parent environment/);
   });
 });

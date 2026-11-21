@@ -73,20 +73,25 @@ function scanTree(dirs, scanRoot = root) {
 function validRule(rule) {
   if (!['forward-restrictive', 'forward', 'drop'].includes(rule.class)
     || typeof rule.why !== 'string' || !rule.why.trim()
-    || Object.keys(rule).some(k => !['class', 'why', 'value', 'restrictiveValues', 'restrictivePrefixes', 'tighterThan', 'precedence', 'relaxOnly', 'ambientOnly', 'never'].includes(k))) return false;
+    || Object.keys(rule).some(k => !['class', 'why', 'value', 'restrictiveValues', 'restrictivePrefixes', 'tighterThan', 'precedence', 'relaxOnly', 'ambientOnly', 'never', 'relaxingValues', 'invalidFailsClosed', 'bagMismatch'].includes(k))) return false;
   const predicate = rule.restrictiveValues !== undefined || rule.restrictivePrefixes !== undefined || rule.tighterThan !== undefined;
   if (rule.never !== undefined && (rule.never !== true || rule.class !== 'drop' || predicate)) return false;
   const restrictive = rule.class === 'forward-restrictive' || predicate;
   if (predicate && rule.class === 'forward') return false;
-  if (rule.value !== undefined && (rule.value !== 'absolute-path' || !restrictive || predicate)) return false;
+  if (rule.value !== undefined && (rule.value !== 'absolute-path' || (!restrictive && rule.class !== 'forward') || predicate)) return false;
   if (rule.precedence !== undefined && (!restrictive || !['ambient', 'bag'].includes(rule.precedence))) return false;
-  if (rule.ambientOnly !== undefined && (rule.ambientOnly !== true || rule.class !== 'forward-restrictive' || rule.precedence !== 'ambient')) return false;
+  if (rule.ambientOnly !== undefined && (rule.ambientOnly !== true || !(rule.class === 'forward-restrictive' && rule.precedence === 'ambient'
+    || rule.class === 'forward' && rule.value === 'absolute-path' && rule.precedence === undefined))) return false;
+  if (rule.bagMismatch !== undefined && (rule.bagMismatch !== 'refuse' || rule.never)) return false;
+  if (rule.invalidFailsClosed !== undefined && (rule.invalidFailsClosed !== true || !rule.restrictiveValues || !rule.relaxingValues || rule.never)) return false;
+  if (rule.relaxingValues !== undefined && (!rule.invalidFailsClosed || !Array.isArray(rule.relaxingValues)
+    || !rule.relaxingValues.length || rule.relaxingValues.some(v => rule.restrictiveValues?.includes(v)))) return false;
   if (rule.relaxOnly !== undefined && (rule.relaxOnly !== true || rule.class !== 'drop' || predicate)) return false;
-  for (const key of ['restrictiveValues', 'restrictivePrefixes']) {
+  for (const key of ['restrictiveValues', 'restrictivePrefixes', 'relaxingValues']) {
     const values = rule[key];
     if (values !== undefined && (!Array.isArray(values) || !values.length || new Set(values).size !== values.length
       || !values.every(v => typeof v === 'string' && v && v === v.trim()
-        && (key !== 'restrictiveValues' || v === v.toLowerCase())))) return false;
+        && (key === 'restrictivePrefixes' || v === v.toLowerCase())))) return false;
   }
   if (rule.tighterThan !== undefined) {
     const t = rule.tighterThan;
@@ -99,7 +104,10 @@ function validRule(rule) {
   }
   return true;
 }
-beforeEach(() => clearRestrictiveEnv(registry));
+beforeEach(() => {
+  clearRestrictiveEnv(registry);
+  vi.stubEnv('PATH', `${dirname(process.execPath)}:/usr/bin:/bin:/usr/sbin:/sbin:/opt/homebrew/bin:/usr/local/bin`);
+});
 afterEach(() => vi.unstubAllEnvs());
 
 describe('agent environment registry drift', () => {
@@ -145,6 +153,8 @@ describe('agent environment registry drift', () => {
       expect(registry[name]).toMatchObject({ class: 'forward-restrictive', precedence: 'ambient', ambientOnly: true });
     }
     expect(validRule({ class: 'drop', why: 'danger', never: true })).toBe(true);
+    expect(validRule({ class: 'forward', why: 'isolation', value: 'absolute-path', ambientOnly: true })).toBe(true);
+    expect(validRule({ class: 'drop', why: 'gate', restrictiveValues: ['true'], relaxingValues: ['false'], invalidFailsClosed: true })).toBe(true);
     expect(validRule({ class: 'drop', why: 'limit', tighterThan: { default: 50, unit: 'count', evidence: 'a:1', zeroIsStrict: true } })).toBe(true);
   });
   it('rejects malformed, incomplete, contradictory and unknown restrictive schemas', () => {
@@ -167,6 +177,10 @@ describe('agent environment registry drift', () => {
         ...[false, 'true', 1, null].map(zeroIsStrict => ({ default: 2, unit: 'count', evidence: 'a:1', zeroIsStrict })),
         { default: 2, unit: 'count', evidence: 'a:1', minimum: 1, zeroIsStrict: true }].map(tighterThan => ({ ...base, tighterThan })),
       { ...base, restrictiveValues: ['1'], tighterThan: { default: 2, unit: 'count', evidence: 'a:1' } },
+      { ...base, bagMismatch: 'drop' }, { class: 'drop', why: 'danger', never: true, bagMismatch: 'refuse' },
+      { ...base, invalidFailsClosed: true }, { ...base, relaxingValues: ['false'] },
+      { ...base, restrictiveValues: ['true'], relaxingValues: ['true'], invalidFailsClosed: true },
+      { ...base, restrictiveValues: ['true'], relaxingValues: ['FALSE'], invalidFailsClosed: true },
     ]) expect(validRule(invalid), JSON.stringify(invalid)).toBe(false);
   });
   it('requires an explicit tightening or relax-only decision for every value-dependent reason', () => {
@@ -203,6 +217,9 @@ const restrictions = Object.entries(registry).filter(([, r]) => r.class === 'for
   || r.restrictiveValues || r.restrictivePrefixes || r.tighterThan);
 const childEnv = inheritEnv => buildAgentInvocation({ agent: 'claude', cwd: root, print: true, inheritEnv },
   { resolveBinary: () => process.execPath }).options.env;
+function refusesBag(name, value) {
+  expect(() => childEnv({ [name]: value })).toThrow(new RegExp(`inheritEnv\\.${name} conflicts with the parent environment|${name} has an invalid value`));
+}
 describe('exhaustive restrictive registry projection', () => {
   it.each([
     ['DIFF_COVERAGE_BASE', 'sec1-nonexistent-coverage-base', 'HEAD'],
@@ -218,13 +235,15 @@ describe('exhaustive restrictive registry projection', () => {
     if (registry[name].ambientOnly) expect(childEnv({ [name]: parent })).not.toHaveProperty(name);
     else expect(childEnv({ [name]: parent })[name]).toBe(parent);
     vi.stubEnv(name, parent);
-    for (const inheritEnv of [{}, { [name]: '' }, { [name]: bag }]) expect(childEnv(inheritEnv)[name]).toBe(parent);
+    expect(childEnv({})[name]).toBe(parent);
+    for (const value of ['', bag]) refusesBag(name, value);
   });
   it('rejects bag-only empty scan scopes instead of silently skipping default verification', () => {
     for (const ambient of [undefined, '']) {
       if (ambient === undefined) clearEnv('VERIFY_SCAN_FILES');
       else vi.stubEnv('VERIFY_SCAN_FILES', ambient);
       for (const value of ['[]', '["caller-selected.mjs"]']) {
+        if (ambient !== undefined) { refusesBag('VERIFY_SCAN_FILES', value); continue; }
         const env = childEnv({ VERIFY_SCAN_FILES: value });
         if (ambient === undefined) expect(env).not.toHaveProperty('VERIFY_SCAN_FILES');
         else expect(env.VERIFY_SCAN_FILES).toBe('');
@@ -237,6 +256,7 @@ describe('exhaustive restrictive registry projection', () => {
       if (ambient === undefined) clearEnv('DIFF_COVERAGE_BASE');
       else vi.stubEnv('DIFF_COVERAGE_BASE', ambient);
       for (const value of ['HEAD', 'refs/heads/caller-selected', 'sec1-nonexistent-coverage-base']) {
+        if (ambient !== undefined) { refusesBag('DIFF_COVERAGE_BASE', value); continue; }
         const env = childEnv({ DIFF_COVERAGE_BASE: value });
         if (ambient === undefined) expect(env).not.toHaveProperty('DIFF_COVERAGE_BASE');
         else expect(env.DIFF_COVERAGE_BASE).toBe('');
@@ -246,7 +266,9 @@ describe('exhaustive restrictive registry projection', () => {
   it('keeps invalid-base coverage failing and the parent scan scope pinned in the actual readers', () => {
     vi.stubEnv('DIFF_COVERAGE_BASE', 'sec1-nonexistent-coverage-base');
     vi.stubEnv('VERIFY_SCAN_FILES', '["parent.mjs"]');
-    const env = childEnv({ DIFF_COVERAGE_BASE: 'HEAD', VERIFY_SCAN_FILES: '[]' });
+    refusesBag('DIFF_COVERAGE_BASE', 'HEAD');
+    refusesBag('VERIFY_SCAN_FILES', '[]');
+    const env = childEnv({});
     expect(scanDiffBranchCoverage(root, { base: env.DIFF_COVERAGE_BASE })).toMatchObject({ status: 'fail', base: 'sec1-nonexistent-coverage-base' });
     expect(scanScope(env)).toEqual(new Set(['parent.mjs']));
   });
@@ -257,7 +279,7 @@ describe('exhaustive restrictive registry projection', () => {
       if (rule.ambientOnly) expect(childEnv({ [name]: marker })).not.toHaveProperty(name);
       else expect(childEnv({ [name]: marker })[name]).toBe(marker);
       vi.stubEnv(name, marker);
-      for (const bag of ['', 'bag-marker']) expect(childEnv({ [name]: bag })[name]).toBe(marker);
+      for (const bag of ['', 'bag-marker']) refusesBag(name, bag);
     }
   });
   it.each(restrictions)('%s cannot be relaxed by the bag', (name, rule) => {
@@ -276,32 +298,39 @@ describe('exhaustive restrictive registry projection', () => {
       else expect(childEnv({ [name]: parent })[name], 'bag-only restriction').toBe(parent);
       if (numeric) {
         vi.stubEnv(name, 'invalid');
-        expect(childEnv({ [name]: parent })[name], 'invalid ambient survives and cannot authorize a bag limit').toBe('invalid');
+        refusesBag(name, parent);
+        expect(childEnv({})[name], 'invalid ambient survives when not conflicted').toBe('invalid');
       }
       vi.stubEnv(name, parent);
       expect(childEnv({})[name], 'omitted bag restriction').toBe(parent);
-      for (const value of (rule.value ? [''] : relaxing)) expect(childEnv({ [name]: value })[name], value).toBe(parent);
+      for (const value of (rule.value ? [''] : relaxing)) {
+        if (value === parent) expect(childEnv({ [name]: value })[name]).toBe(parent);
+        else refusesBag(name, value);
+      }
       if (rule.value) {
-        expect(childEnv({ [name]: '/bag/shared' })[name]).toBe(rule.precedence === 'bag' ? '/bag/shared' : parent);
+        if (rule.precedence === 'bag') expect(childEnv({ [name]: '/bag/shared' })[name]).toBe('/bag/shared');
+        else refusesBag(name, '/bag/shared');
         for (const bad of ['relative-root', ' ', '\t']) expect(() => childEnv({ [name]: bad })).toThrow(new RegExp(name));
         vi.stubEnv(name, 'relative-parent');
         expect(() => childEnv({ [name]: '/bag/shared' })).toThrow(new RegExp(name));
       } else if (numeric) {
         const other = String(Math.max(Number(parent) * 2, numeric.default / 2));
         if (Number(other) < numeric.default && (numeric.unit !== 'count' || Number.isInteger(Number(other)))) {
-          expect(childEnv({ [name]: other })[name]).toBe(parent);
+          refusesBag(name, other);
           vi.stubEnv(name, other);
           expect(childEnv({ [name]: parent })[name]).toBe(parent);
         }
       } else {
         const other = rule.restrictiveValues?.at(-1) ?? (rule.restrictivePrefixes ? rule.restrictivePrefixes.at(-1) + 'bag' : 'bag-identity');
-        expect(childEnv({ [name]: other })[name]).toBe(parent);
+        if (other === parent) expect(childEnv({ [name]: other })[name]).toBe(parent);
+        else refusesBag(name, other);
       }
     }
     clearEnv(name);
     // Presence-only identities accept every nonempty marker; predicates reject unknown values.
     for (const value of (numeric || rule.restrictiveValues || rule.restrictivePrefixes ? relaxing : [''])) {
-      expect(childEnv({ [name]: value }), value).not.toHaveProperty(name);
+      if (rule.invalidFailsClosed) expect(() => childEnv({ [name]: value })).toThrow(new RegExp(`${name} has an invalid value`));
+      else expect(childEnv({ [name]: value }), value).not.toHaveProperty(name);
     }
   });
   it.each([
@@ -319,12 +348,12 @@ describe('exhaustive restrictive registry projection', () => {
     vi.stubEnv(name, String(registry[name].tighterThan.default));
     expect(childEnv({ [name]: value })[name]).toBe(expected);
     vi.stubEnv(name, value);
-    expect(childEnv({ [name]: 'unlimited' })[name]).toBe(value);
+    refusesBag(name, 'unlimited');
   });
   it.each([['1g', '512m'], ['512m', '1g']])('compares byte quantities across units: parent %s, bag %s', (parent, bag) => {
     vi.stubEnv('WE_HEAVY_ADMISSION_CONTAINER_MEMORY', parent);
-    expect(childEnv({ WE_HEAVY_ADMISSION_CONTAINER_MEMORY: bag }).WE_HEAVY_ADMISSION_CONTAINER_MEMORY)
-      .toBe(parent === '512m' ? parent : '536870912');
+    if (parent === '512m') refusesBag('WE_HEAVY_ADMISSION_CONTAINER_MEMORY', bag);
+    else expect(childEnv({ WE_HEAVY_ADMISSION_CONTAINER_MEMORY: bag }).WE_HEAVY_ADMISSION_CONTAINER_MEMORY).toBe('536870912');
   });
   it.each([
     ['WE_GH_THROTTLE_WRITE_BUDGET_PER_MIN', ['0', '0.5']],
@@ -345,7 +374,7 @@ describe('exhaustive restrictive registry projection', () => {
       clearEnv(name);
       expect(childEnv({ [name]: String(parent) })).not.toHaveProperty(name);
       vi.stubEnv(name, String(parent));
-      for (const bag of ['', 'invalid', String(parent * 2)]) expect(childEnv({ [name]: bag })[name]).toBe(String(parent));
+      for (const bag of ['', 'invalid', String(parent * 2)]) refusesBag(name, bag);
       expect(childEnv({})[name]).toBe(String(parent));
     }
   });
@@ -356,6 +385,9 @@ describe('exhaustive restrictive registry projection', () => {
   ])('respects resolved gh cap: ambient %s, bag %s => %s despite tool cap 10', (parent, bag, expected) => {
     if (parent === undefined) clearEnv('WE_GH_THROTTLE_CAP');
     else vi.stubEnv('WE_GH_THROTTLE_CAP', parent);
+    if (parent !== undefined && bag !== undefined && parent !== bag && expected === parent) {
+      refusesBag('WE_GH_THROTTLE_CAP', bag); return;
+    }
     const env = childEnv(bag === undefined ? {} : { WE_GH_THROTTLE_CAP: bag });
     if (expected === undefined) {
       expect(env).not.toHaveProperty('WE_GH_THROTTLE_CAP');
@@ -396,7 +428,7 @@ describe('exhaustive restrictive registry projection', () => {
       expect(finishRunTmpRoot({ root: dir, policy, log: () => {} })).toMatchObject({ failed: true, exceeded: true, count: 1 });
     } finally { rmSync(dir, { recursive: true, force: true }); }
     vi.stubEnv('WE_TMP_LEAK_MAX', '0');
-    expect(childEnv({ WE_TMP_LEAK_MAX: '100' }).WE_TMP_LEAK_MAX).toBe('0');
+    refusesBag('WE_TMP_LEAK_MAX', '100');
   });
   it.each(Object.entries(registry).filter(([, r]) => r.tighterThan))('%s accepts zero only when its reader makes zero strict', (name, rule) => {
     const strict = rule.tighterThan.zeroIsStrict === true;
@@ -407,11 +439,13 @@ describe('exhaustive restrictive registry projection', () => {
       else expect(bagOnly).not.toHaveProperty(name);
       const parent = String(rule.tighterThan.default);
       vi.stubEnv(name, parent);
+      if (!strict) { refusesBag(name, value); vi.stubEnv(name, value); refusesBag(name, 'unlimited'); continue; }
       const bag = childEnv({ [name]: value });
-      expect(bag[name]).toBe(strict ? '0' : parent);
+      if (strict) expect(bag[name]).toBe('0');
+      else expect(bag[name]).toBe(parent);
       vi.stubEnv(name, value);
-      const ambient = childEnv({ [name]: 'unlimited' });
-      expect(ambient[name]).toBe(value);
+      refusesBag(name, 'unlimited');
+      expect(childEnv({})[name]).toBe(value);
     }
   });
   it('pins the zero-strict sweep to readers: zero wait/backoff and no extra fast slots, never disabled gh caps', () => {
@@ -488,9 +522,8 @@ describe('parent parity minus never; caller bag stays tighten-only', () => {
       clearEnv(name);
       expect(childEnv({ [name]: 'caller-selected' })).not.toHaveProperty(name);
       vi.stubEnv(name, 'parent-selected');
-      for (const bag of [undefined, {}, { [name]: 'caller-selected' }]) {
-        expect(childEnv(bag)[name]).toBe('parent-selected');
-      }
+      for (const bag of [undefined, {}]) expect(childEnv(bag)[name]).toBe('parent-selected');
+      refusesBag(name, 'caller-selected');
     });
   it.each(parityRules)('ambient parity: %s reaches the child verbatim', (pattern, rule) => {
     const name = sampleName(pattern);
@@ -520,7 +553,8 @@ describe('parent parity minus never; caller bag stays tighten-only', () => {
           continue;
         }
         const env = project();
-        if (name === 'PATH' || name === 'HOME') expect(env[name]).not.toBe(value);
+        if (name === 'HOME') expect(env.HOME).toBe(source === 'bag' ? value : process.env.HOME);
+        else if (name === 'PATH') expect(env.PATH).not.toBe(value);
         else expect(env, `${name} from ${source}`).not.toHaveProperty(name);
       }
     }
@@ -545,8 +579,8 @@ describe('parent parity minus never; caller bag stays tighten-only', () => {
       'LESSOPEN', 'LESSCLOSE', 'SSH_ASKPASS', 'SUDO_ASKPASS', 'WE_GH_THROTTLE_GH_BIN', 'WE_FUI_ROOT',
       'GIT_SSH', 'GIT_SSH_COMMAND', 'GIT_EXEC_PATH', 'GIT_PROXY_COMMAND', 'GIT_ASKPASS', 'GIT_EXTERNAL_DIFF',
       'GIT_EDITOR', 'GIT_SEQUENCE_EDITOR', 'GIT_PAGER', 'GIT_TEMPLATE_DIR', 'GIT_CONFIG_COUNT',
-      'GIT_CONFIG_KEY_0', 'GIT_CONFIG_VALUE_0', 'GIT_CONFIG_GLOBAL', 'GIT_CONFIG_SYSTEM', 'GIT_CONFIG_NOSYSTEM',
-      'GIT_CONFIG_PARAMETERS', 'GIT_DIR', 'GIT_WORK_TREE', 'GIT_INDEX_FILE', 'GIT_OBJECT_DIRECTORY',
+      'GIT_CONFIG_KEY_0', 'GIT_CONFIG_VALUE_0',
+      'GIT_CONFIG_PARAMETERS', 'GIT_DIR', 'GIT_WORK_TREE', 'GIT_OBJECT_DIRECTORY',
       'GIT_ALTERNATE_OBJECT_DIRECTORIES', 'GIT_FUTURE_EXEC_REDIRECT',
       'CUSTOM_TOKEN', 'CUSTOM_SECRET', 'CUSTOM_SECRETS', 'CUSTOM_PASSWORD', 'CUSTOM_API_KEY', 'CUSTOM_PRIVATE_KEY',
       'GH_TOKEN', 'GITHUB_TOKEN', 'GH_ENTERPRISE_TOKEN', 'AWS_ACCESS_KEY_ID', 'AWS_SECRET_ACCESS_KEY',
@@ -589,7 +623,8 @@ describe('parent parity minus never; caller bag stays tighten-only', () => {
   });
   it('finding 2: ambient WE_GH_THROTTLE_PER_CALLER_MAX=1e0 stays verbatim and caps the reader at one', () => {
     vi.stubEnv('WE_GH_THROTTLE_PER_CALLER_MAX', '1e0');
-    for (const bag of [undefined, {}, { WE_GH_THROTTLE_PER_CALLER_MAX: '2' }, { WE_GH_THROTTLE_PER_CALLER_MAX: '0.5' }]) {
+    for (const value of ['2', '0.5']) refusesBag('WE_GH_THROTTLE_PER_CALLER_MAX', value);
+    for (const bag of [undefined, {}]) {
       const env = childEnv(bag);
       expect(env.WE_GH_THROTTLE_PER_CALLER_MAX).toBe('1e0');
       expect(loadGhThrottleSettings({ file: {}, env }).value.perCallerMax).toBe(1);
@@ -601,19 +636,21 @@ describe('parent parity minus never; caller bag stays tighten-only', () => {
     const readFile = path => JSON.stringify(path === source ? { transcriptCheck: { mode: 'fail' } } : {});
     const parent = resolveTranscriptCheckPolicy({ env: { WE_PLATFORM_PREFERENCES_FILE: source }, tool: {}, readFile });
     expect(parent).toMatchObject({ mode: 'fail', sources: { mode: 'platform' } });
-    for (const bag of [undefined, {}, { WE_PLATFORM_PREFERENCES_FILE: '/caller/relaxation.json' }]) {
+    refusesBag('WE_PLATFORM_PREFERENCES_FILE', '/caller/relaxation.json');
+    for (const bag of [undefined, {}, { WE_PLATFORM_PREFERENCES_FILE: source }]) {
       const env = childEnv(bag);
       expect(env.WE_PLATFORM_PREFERENCES_FILE).toBe(source);
       expect(resolveTranscriptCheckPolicy({ env, tool: {}, readFile })).toMatchObject({ mode: 'fail', sources: { mode: 'platform' } });
     }
     clearEnv('WE_PLATFORM_PREFERENCES_FILE');
-    expect(childEnv({ WE_PLATFORM_PREFERENCES_FILE: source })).not.toHaveProperty('WE_PLATFORM_PREFERENCES_FILE');
+    expect(() => childEnv({ WE_PLATFORM_PREFERENCES_FILE: source })).toThrow(/inheritEnv.WE_PLATFORM_PREFERENCES_FILE.*parent policy source/);
   });
   it('finding 4: ambient WE_FIX_LOOP_MAX_SESSIONS=1 retains the one-session repair limit', () => {
     vi.stubEnv('WE_FIX_LOOP_MAX_SESSIONS', '1');
     const readers = { readPlatform: () => ({}), readRepo: () => ({}), readMainRuns: () => [] };
     expect(fixLoopConfig({}, readers).maxSessions).toBe(3);
-    for (const bag of [undefined, {}, { WE_FIX_LOOP_MAX_SESSIONS: '3' }]) {
+    refusesBag('WE_FIX_LOOP_MAX_SESSIONS', '3');
+    for (const bag of [undefined, {}]) {
       const env = childEnv(bag);
       expect(env.WE_FIX_LOOP_MAX_SESSIONS).toBe('1');
       expect(fixLoopConfig(env, readers).maxSessions).toBe(1);
@@ -621,7 +658,8 @@ describe('parent parity minus never; caller bag stays tighten-only', () => {
   });
   it('finding 5: ambient WE_DAEMON_MANAGED_CLONE=1 keeps stale code behind the smoke-gated rebuild', () => {
     vi.stubEnv('WE_DAEMON_MANAGED_CLONE', '1');
-    const env = childEnv({ WE_DAEMON_MANAGED_CLONE: '0' });
+    refusesBag('WE_DAEMON_MANAGED_CLONE', '0');
+    const env = childEnv({});
     expect(env.WE_DAEMON_MANAGED_CLONE).toBe('1');
     // Run the actual chokepoint with injected stale evidence and no git writes.
     vi.stubEnv('WE_DAEMON_MANAGED_CLONE', env.WE_DAEMON_MANAGED_CLONE);
@@ -632,7 +670,8 @@ describe('parent parity minus never; caller bag stays tighten-only', () => {
   });
   it('finding 6: ambient WE_GUARD_LISTING_MAX_BYTES keeps the smaller listing refusal threshold', () => {
     vi.stubEnv('WE_GUARD_LISTING_MAX_BYTES', '4');
-    for (const bag of [undefined, {}, { WE_GUARD_LISTING_MAX_BYTES: '268435456' }]) {
+    refusesBag('WE_GUARD_LISTING_MAX_BYTES', '268435456');
+    for (const bag of [undefined, {}]) {
       expect(childEnv(bag).WE_GUARD_LISTING_MAX_BYTES).toBe('4');
     }
   });

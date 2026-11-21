@@ -75,7 +75,11 @@ const fixtureBinaryPreload = `
 `;
 
 // Historical orchestration fixtures isolate the new independently tested self-review.
-beforeEach(() => vi.stubEnv('WE_BUILD_SELF_REVIEW_ENABLED', 'false'));
+beforeEach(() => {
+  vi.stubEnv('WE_BUILD_SELF_REVIEW_ENABLED', 'false');
+  // Agent-spawn fixtures use a fixed parent PATH; custom gh guards are covered by launcher tests.
+  vi.stubEnv('PATH', `${dirname(process.execPath)}:/usr/bin:/bin:/usr/sbin:/sbin:/opt/homebrew/bin:/usr/local/bin`);
+});
 afterEach(() => vi.unstubAllEnvs());
 
 /** A fixture `--dir` standing for a WE checkout: the default full gate needs its scripts/verify-lane.mjs. */
@@ -1473,7 +1477,8 @@ describe('runCodexDirectExec / codexDirectTask — the orchestrator, over an inj
       if (mode !== 'missing') writeFileSync(rollout, fixture);
       // A different run must never be inspected, even when this run has no rollout.
       writeFileSync(join(sessions, 'rollout-other.jsonl'), fixture);
-      vi.stubEnv('WE_COORDINATION_ROOT', join(dir, 'process-coordination'));
+      // F4 requires caller policy sources to agree with the parent environment.
+      vi.stubEnv('WE_COORDINATION_ROOT', join(dir, 'coordination'));
       const { fn: spawnFn } = fakeSpawn('{"type":"thread.started","thread_id":"t1"}\n{"type":"turn.completed","usage":{}}\n');
       const execFn = (bin, args) => args.includes('--absolute-git-dir') ? join(dir, 'git-metadata') : args.includes('rev-parse') ? 'sha0\n' : '';
       const collectQuotaFn = vi.fn(() => {

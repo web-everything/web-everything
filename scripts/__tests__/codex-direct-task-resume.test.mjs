@@ -17,7 +17,10 @@ const resolveBinaryFn = () => '/fixture/bin/codex';
 
 const SCRIPT = resolve(dirname(fileURLToPath(import.meta.url)), '..', 'codex-direct-task.mjs');
 
-beforeEach(() => vi.stubEnv('WE_BUILD_SELF_REVIEW_ENABLED', 'false'));
+beforeEach(() => {
+  vi.stubEnv('WE_BUILD_SELF_REVIEW_ENABLED', 'false');
+  vi.stubEnv('PATH', `${dirname(process.execPath)}:/usr/bin:/bin:/usr/sbin:/sbin:/opt/homebrew/bin:/usr/local/bin`);
+});
 afterEach(() => vi.unstubAllEnvs());
 
 function fakeSpawn(stdout) {

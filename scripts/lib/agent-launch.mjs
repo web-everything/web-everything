@@ -7,7 +7,7 @@
  * Environment threat model: ambient process.env, including unknown names, inherits
  * parent parity (main parity) minus the registry's never list; value gates and
  * absolute-path validation still apply. Ambient indexed Git config passes only as
- * a complete set of exact hardening pins; caller Git config is always ignored.
+ * a complete set of hardening pins and supported transport restrictions.
  * Caller inheritEnv is tighten-only: registry classes, parent precedence, and numeric
  * ceilings constrain it. A positive bag limit needs an ambient ceiling; a documented
  * strict zero cannot relax configured policy. Ambient quantities survive verbatim.
@@ -28,7 +28,7 @@ const ENV_REGISTRY = JSON.parse(readFileSync(join(dirname(fileURLToPath(import.m
 const ENV_PREFIXES = Object.entries(ENV_REGISTRY).filter(([pattern]) => pattern.endsWith('*'));
 const ENV_SUFFIXES = Object.entries(ENV_REGISTRY).filter(([pattern]) => pattern.startsWith('*'));
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
-const COMMON = ['agent', 'cwd', 'processGroup', 'pathPrefix', 'tempRoot', 'inheritEnv'];
+const COMMON = ['agent', 'cwd', 'processGroup', 'pathPrefix', 'tempRoot', 'inheritEnv', 'inheritEnvComplete'];
 const CODEX = ['sandbox', 'outputSchemaFile', 'outputLastMessageFile', 'ephemeral', 'addDirs', 'model', 'config', 'resumeThreadId'];
 const CLAUDE = ['print', 'sessionId', 'resumeId', 'model', 'outputFormat', 'verbose', 'prompt'];
 const fail = reason => { throw new TypeError(`agent-launch: ${reason}`); };
@@ -145,13 +145,14 @@ const sameGitPair = ([k1, v1], [k2, v2]) => gitKey(k1) === gitKey(k2) && gitValu
 // Transport candidates are also checked against the parent's policy in childGitConfig:
 // a protocol-specific exception takes precedence over Git's global protocol.allow setting.
 // `never` tightens every protocol.*.allow. `user` loosens Git's default for ext (never) and, as the global
-// protocol.allow, for every unlisted protocol, so it passes only as protocol.file.allow, whose Git default is
-// already `user`; only the exact lowercase value is accepted.
-const GIT_FILE_TRANSPORT = 'protocol.file.allow';
-const tighteningGitPair = (key, value) => GIT_PINS.some(pin => sameGitPair([key, value], pin))
+// protocol.allow, for every unlisted protocol. For http(s), git, ssh and file it tightens or equals
+// Git's default; only the exact lowercase value is accepted.
+const GIT_USER_TRANSPORT = /^protocol\.(https?|git|ssh|file)\.allow$/;
+const tighteningGitPair = (key, value, parent) => GIT_PINS.some(pin => sameGitPair([key, value], pin))
   || (gitValue(key, value) === 'never' && GIT_TRANSPORT_POLICY.test(key))
-  || (value === 'user' && gitKey(key) === GIT_FILE_TRANSPORT);
-function gitConfigPairs(env) {
+  || (value === 'user' && GIT_USER_TRANSPORT.test(gitKey(key)))
+  || (parent && gitKey(key) === 'core.hookspath' && value === '');
+function gitConfigPairs(env, parent = false) {
   const raw = env.GIT_CONFIG_COUNT;
   if (typeof raw !== 'string' || !raw || /[^0-9]/.test(raw)) return null;
   const count = Number(raw);
@@ -164,16 +165,17 @@ function gitConfigPairs(env) {
     // Git's parse failure into a successful child operation. Empty values (helper resets) are valid.
     if (typeof key !== 'string' || typeof value !== 'string'
       || key.match(/^[a-z0-9-]+\.(?:[^\n]*\.)?[a-z][a-z0-9-]*$/i)?.[0] !== key) return null;
-    if (tighteningGitPair(key, value)) kept.push([key, value]);
+    if (tighteningGitPair(key, value, parent)) kept.push([key, value]);
   }
   return { count, kept };
 }
 // The sole indexed-config exception to GIT_*: from the parent AND the caller bag, only tightening pairs
-// pass (exact hardening pins, protocol.*.allow=never, protocol.file.allow=user). Every other entry drops on its own; kept pairs are
+// pass (hardening pins, protocol.*.allow=never, supported protocol-specific user policies,
+// and parent-only empty hooksPath). Every other entry drops on its own; kept pairs are
 // re-indexed, parent pairs first, so no extra entry can discard a protection and no caller pair can add one
 // that loosens.
 function childGitConfig(ambient, inherit) {
-  const parent = gitConfigPairs(ambient);
+  const parent = gitConfigPairs(ambient, true);
   if (Object.hasOwn(ambient, 'GIT_CONFIG_COUNT') && !parent) {
     fail('ambient GIT_CONFIG_COUNT and indexed keys/values must form a complete valid configuration; repair the parent environment and retry');
   }
@@ -195,16 +197,23 @@ function childGitConfig(ambient, inherit) {
   kept.forEach(([k, v], i) => { out[`GIT_CONFIG_KEY_${i}`] = k; out[`GIT_CONFIG_VALUE_${i}`] = v; });
   return out;
 }
-function inheritedEnv(inherit, ambient) {
+function inheritedEnv(inherit, ambient, complete) {
   const out = Object.create(null);
   Object.assign(out, childGitConfig(ambient, inherit));
   const checked = (rule, value, key) => rule.value === 'absolute-path' ? absolute(value, key)
     : rule.tighterThan ? String(quantity(value, rule.tighterThan))
     : rule.restrictiveValues?.includes(value.trim().toLowerCase()) ? value.trim().toLowerCase() : value;
+  const validateGate = (rule, value, key) => {
+    const normalized = value.trim().toLowerCase();
+    if (rule?.invalidFailsClosed && !rule.restrictiveValues.includes(normalized)
+      && !rule.relaxingValues.includes(normalized)) fail(`${key} has an invalid value; repair the environment`);
+  };
   for (const [key, value] of Object.entries(ambient)) {
+    if (complete && !Object.hasOwn(inherit, key)) continue;
     const rule = envRule(key);
     if (!rule) { out[key] = value; continue; }
     if (rule.never) continue;
+    validateGate(rule, value, key);
     if (rule.restrictiveValues || rule.restrictivePrefixes) {
       if (classOf(rule, value) === 'forward-restrictive') out[key] = checked(rule, value, key);
     } else {
@@ -214,9 +223,18 @@ function inheritedEnv(inherit, ambient) {
   }
   for (const [key, value] of Object.entries(inherit)) {
     const rule = envRule(key);
-    if (!rule || rule.never) continue;
+    const conflict = () => {
+      if (Object.hasOwn(out, key) && ambient[key] !== value) fail(`inheritEnv.${key} conflicts with the parent environment`);
+    };
+    if (!rule) { conflict(); continue; }
+    if (rule.never) continue;
+    validateGate(rule, value, key);
+    if (rule.bagMismatch === 'refuse' && ambient[key] !== value) {
+      conflict();
+      fail(`inheritEnv.${key} differs from the parent policy source; set it in the parent environment`);
+    }
     // Parent verification selectors are evidence, not caller capabilities.
-    if (rule?.ambientOnly) continue;
+    if (rule.ambientOnly) { conflict(); continue; }
     const hasParent = Object.hasOwn(ambient, key);
     const ceiling = rule.tighterThan && hasParent ? quantity(ambient[key], rule.tighterThan) : NaN;
     // Env beats configured policy: a code default cannot authorize a positive bag-only
@@ -225,10 +243,10 @@ function inheritedEnv(inherit, ambient) {
     const strictZero = !hasParent && rule.tighterThan?.zeroIsStrict
       && quantity(value, rule.tighterThan) === 0;
     const cls = strictZero ? 'forward-restrictive' : classOf(rule, value, ceiling);
-    if (cls !== 'forward' && cls !== 'forward-restrictive') continue;
+    if (cls !== 'forward' && cls !== 'forward-restrictive') { conflict(); continue; }
     const candidate = checked(rule, value, key);
     if (!rule.tighterThan && cls === 'forward-restrictive' && out[key] !== undefined && out[key] !== ''
-      && (rule.precedence ?? 'ambient') === 'ambient') continue;
+      && (rule.precedence ?? 'ambient') === 'ambient') { conflict(); continue; }
     out[key] = candidate;
   }
   return out;
@@ -254,6 +272,7 @@ function argsFrom(d) {
   choice(d.agent, ['claude', 'codex'], 'agent');
   for (const key of Object.keys(d)) if (![...COMMON, ...(d.agent === 'codex' ? CODEX : CLAUDE)].includes(key)) fail(`unknown field ${key}`);
   absolute(d.cwd, 'cwd'); flag(d.processGroup, 'processGroup');
+  flag(d.inheritEnvComplete, 'inheritEnvComplete');
   for (const key of ['pathPrefix', 'tempRoot']) if (d[key] !== undefined) absolute(d[key], key);
   if (d.inheritEnv !== undefined) envRecord(d.inheritEnv);
   if (d.model !== undefined && (!/^[a-z0-9][a-z0-9._:/-]*$/i.test(text(d.model, 'model')) || /\s/.test(d.model))) fail('model must be a model name');
@@ -322,19 +341,35 @@ export function buildAgentPath({ parentPaths, home, pathPrefix, nodePath, binary
 /** Pure argv projection, retained for direct-task's existing argv consumers. */
 export function buildAgentArgs(descriptor) { return argsFrom(snapshot(descriptor)); }
 
+// Compare executable identities without executing gh or considering relative PATH entries.
+function firstGh(path) {
+  for (const dir of String(path ?? '').split(':').filter(isAbsolute)) {
+    try {
+      const file = realpathSync(join(dir, 'gh'));
+      if (!statSync(file).isFile()) continue;
+      accessSync(file, constants.X_OK);
+      return file;
+    } catch { /* Try the next absolute directory. */ }
+  }
+}
+
 /** Snapshot is the first operation, including before any test seam executes. */
 export function buildAgentInvocation(descriptor, io) {
   const d = snapshot(descriptor);
   argsFrom(d); // Validate the entire snapshot before any IO seam executes.
   // Copy trusted process.env before any IO seam can mutate it; it is not a plain record itself.
   const ambient = snapshot({ ...process.env });
-  const forwarded = inheritedEnv(d.inheritEnv ?? {}, ambient);
+  const forwarded = inheritedEnv(d.inheritEnv ?? {}, ambient, d.inheritEnvComplete === true);
   try { if (!statSync(d.cwd).isDirectory()) fail('cwd must be an existing directory'); }
   catch { fail('cwd must be an existing directory'); }
   const file = absolute((io?.resolveBinary ?? resolveBinary)(d.agent), 'resolved binary');
   const home = userInfo().homedir;
   const env = { ...forwarded, PATH: buildAgentPath({ parentPaths: [d.inheritEnv?.PATH, ambient.PATH],
-    home, pathPrefix: d.pathPrefix, nodePath: process.execPath, binary: file }), HOME: home };
+    home, pathPrefix: d.pathPrefix, nodePath: process.execPath, binary: file }), HOME: d.inheritEnv?.HOME ?? ambient.HOME };
+  const parentGh = firstGh(d.inheritEnv?.PATH ?? ambient.PATH), childGh = firstGh(env.PATH);
+  if (parentGh && parentGh !== childGh && !(d.pathPrefix && childGh && firstGh(d.pathPrefix) === childGh)) {
+    fail('child gh would resolve outside the parent gh guard; install it as an approved shim dir or pass it as pathPrefix');
+  }
   if (d.tempRoot !== undefined) for (const key of ['TMPDIR', 'TMP', 'TEMP']) env[key] = d.tempRoot;
   // The launcher owns both child PATHs; finalize after fixed binary resolution so the agent dir agrees.
   if (d.config && Object.hasOwn(d.config, 'shell_environment_policy.set.PATH')) {

@@ -273,7 +273,7 @@ export function buildCodexDirectTaskDescriptor({
   // #4194 — REVIEW MODE runs Codex under its own `read-only` sandbox: a review seat reads the checkout and reports
   // findings; it must never edit anything. Every other caller keeps `workspace-write`, unchanged.
   const descriptor = { agent: 'codex', cwd, sandbox: review ? 'read-only' : 'workspace-write', processGroup: true,
-    config: {}, inheritEnv: env === process.env ? { ...env } : env };
+    config: {}, inheritEnv: env === process.env ? { ...env } : env, inheritEnvComplete: true };
   if (outputSchemaFile !== undefined) {
     if (typeof outputSchemaFile !== 'string' || !outputSchemaFile.trim()) {
       throw new TypeError('codex-direct-task: `outputSchemaFile` must be a non-empty path when given');
