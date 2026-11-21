@@ -6,7 +6,7 @@ import { withNumberingLock } from '../readiness/drain-lock.mjs';
 import { userInfo } from 'node:os';
 import { dirname, join } from 'node:path';
 import { randomUUID } from 'node:crypto';
-import { CAPACITY_LEAVES, operatorOverridesPath, validateKey } from './operator-override-reader.mjs';
+import { CAPACITY_LEAVES, operatorOverridesPath, validateKey, isEnumLeaf, validEnumValue } from './operator-override-reader.mjs';
 import { readStrictStore, validateStrictStoreText } from './capacity-leaf.mjs';
 export * from './operator-override-reader.mjs';
 
@@ -19,14 +19,15 @@ function publish({ file = operatorOverridesPath(), key, value, reason, actor,
   io = { appendFileSync, writeFileSync, renameSync }, lockWaitMs = 5000 }, clear) {
   validateKey(key);
   validateAttribution({ reason, actor });
-  if (!clear && !CAPACITY_LEAVES[key].validate(value)) throw Error(`operator-override: invalid ${key}: type or value outside hard range`);
+  if (!clear && isEnumLeaf(key) && !validEnumValue(key, value)) throw Error(`operator-override: invalid ${key}: value must be one of the declared enum values`);
+  if (!clear && !isEnumLeaf(key) && !CAPACITY_LEAVES[key].validate(value)) throw Error(`operator-override: invalid ${key}: type or value outside hard range`);
   if (!Number.isSafeInteger(lockWaitMs) || lockWaitMs < 0 || lockWaitMs > 5000)
     throw Error('operator-override: lockWaitMs must be an integer in 0..5000; retry with the default bounded wait');
   const locked = withNumberingLock(() => {
     const current = readStrictStore({ file });
     if (!current.ok && current.reason !== 'absent')
       throw Error(`operator-override: unreadable or invalid store (${current.reason}); repair it before writing`);
-    const values = current.ok ? current.values : {};
+    const values = current.ok ? { ...current.values, ...current.enums } : {};
     const before = { ...values };
     if (clear) delete values[key]; else values[key] = value;
     if (values['resourceGate.fixCap.ceiling'] < values['resourceGate.fixCap.floor'])
