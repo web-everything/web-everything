@@ -2067,6 +2067,7 @@
   "scripts/conveyor/soak/breaks/catch-up-clean-first-snapshot-first.soak.test.mjs": 4.65,
   "scripts/conveyor/soak/breaks/check-evidence-mapped-pending-rows.soak.test.mjs": 0.5,
   "scripts/conveyor/soak/breaks/ci-heal-acquire-false-escalation.soak.test.mjs": 2.66,
+  "scripts/conveyor/soak/breaks/ci-heal-child-follows-loop-setting.soak.test.mjs": 1,
   "scripts/conveyor/soak/breaks/ci-heal-empty-scope.soak.test.mjs": 72.92,
   "scripts/conveyor/soak/breaks/ci-heal-loop-stale-label-review-gate.soak.test.mjs": 65.71,
   "scripts/conveyor/soak/breaks/ci-heal-owner-inherits-observer-role.soak.test.mjs": 1.4,
