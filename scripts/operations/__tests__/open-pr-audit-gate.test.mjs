@@ -1,15 +1,17 @@
 import { describe, it, expect, vi } from 'vitest';
 import { readFileSync, mkdtempSync, writeFileSync, rmSync } from 'node:fs';
-import { execFileSync } from 'node:child_process';
+import { spawnSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { dirname, resolve, join } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { createPrLandRunner } from '../open-pr-io.mjs';
 import { classifySubmit } from '../open-pr.mjs';
-import { admitCanonicalAudit } from '../../pr-land.mjs';
+import { admitCanonicalAudit, prCreateBodyGuard } from '../../pr-land.mjs';
 import { checkCanonicalAuditForOpen } from '../canonical-audit-gate.mjs';
 import { QUESTION_HASH } from '../codex-audit.mjs';
 import { blocker } from '../../lib/open-pr-preflight.mjs';
+import { normalizeDiffFingerprint } from '../../lib/review-escalation.mjs';
+import { renderBypassNote } from '../../lib/pre-pr-review.mjs';
 
 const sha = 'a'.repeat(40);
 const base = 'b'.repeat(40);
@@ -40,6 +42,133 @@ describe('combined open-pr preflight', () => {
     expect(spawn.mock.calls[0][1]).toContain('--check');
     expect(spawn.mock.calls[0][1].some(a => a.startsWith('--body-file='))).toBe(false);
   });
+  it('prints carry provenance and passes a body copy with the audit-carry marker', () => {
+    const dir = mkdtempSync(join(process.env.TMPDIR || tmpdir(), 'open-carry-'));
+    const body = join(dir, 'body.md'); writeFileSync(body, 'Review body\n');
+    const carried = { kind: 'carried-across-main-merge', from: base, to: sha, fingerprint: 'f'.repeat(64), ruling: 'R123' };
+    const output = vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
+    let copied;
+    try {
+      const run = createPrLandRunner({ env: {}, canonicalAudit: () => ({ ok: true, sha, carried }),
+        prePrReview: () => ({ action: 'pass' }), prepGate: () => ({ ok: true }),
+        spawn: (_cmd, args) => {
+          copied = args.find(a => a.startsWith('--body-file=')).slice('--body-file='.length);
+          expect(readFileSync(copied, 'utf8')).toContain(`<!-- audit-carry: carried-across-main-merge ${base}..${sha} -->`);
+          return { status: 0, stdout: '{"pr":7}' };
+        } });
+      run({ argv: ['--ref=lane/audit', `--body-file=${body}`] });
+      expect(output).toHaveBeenCalledWith(`carried-across-main-merge ${base.slice(0, 8)}..${sha.slice(0, 8)} fp ffffffff ruling R123\n`);
+      expect(readFileSync(body, 'utf8')).toBe('Review body\n');
+      expect(() => readFileSync(copied)).toThrow();
+    } finally { output.mockRestore(); rmSync(dir, { recursive: true, force: true }); }
+  });
+  it('annotates the last duplicate --body-file consumed by pr-land', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'audit-carry-duplicate-body-'));
+    const first = join(dir, 'first.md'), last = join(dir, 'last.md');
+    writeFileSync(first, 'First body\n');
+    writeFileSync(last, 'Last body\n');
+    let copied;
+    const spawn = vi.fn((_cmd, args) => {
+      const files = args.filter(a => a.startsWith('--body-file='));
+      expect(files).toHaveLength(2);
+      expect(files[0]).toBe(`--body-file=${first}`);
+      copied = files.at(-1).slice('--body-file='.length);
+      expect(readFileSync(copied, 'utf8')).toContain(`Last body\n\n<!-- audit-carry: carried-across-main-merge ${base}..${sha} -->`);
+      return { status: 0, stdout: '{"pr":7}' };
+    });
+    const run = createPrLandRunner({ env: {}, spawn, prepGate: () => ({ ok: true }),
+      prePrReview: () => ({ action: 'pass' }),
+      canonicalAudit: () => ({ ok: true, carried: { from: base, to: sha, fingerprint: 'f'.repeat(64) } }) });
+    try {
+      expect(run({ argv: ['--ref=lane/audit', `--body-file=${first}`, `--body-file=${last}`] }).outcome).toBe('opened');
+      expect(spawn).toHaveBeenCalledTimes(1);
+      expect(readFileSync(first, 'utf8')).toBe('First body\n');
+      expect(readFileSync(last, 'utf8')).toBe('Last body\n');
+      expect(() => readFileSync(copied)).toThrow();
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+  it('refuses the last duplicate body file when only the first passes prep', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'open-pr-prep-duplicate-body-'));
+    const first = join(dir, 'first.md'), last = join(dir, 'last.md');
+    writeFileSync(first, `PREP:
+Acceptance: Preflight checks the published body.
+Pre-mortem: Duplicate arguments select the wrong body.
+Files: scripts/operations/open-pr-io.mjs
+Tests: Targeted open-pr audit gate regression.
+`);
+    writeFileSync(last, 'Body missing preparation.\n');
+    const spawn = vi.fn(() => ({ status: 0, stdout: '{"reason":"check-ok"}' }));
+    const output = vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
+    const run = createPrLandRunner({ env: {}, spawn, prepMode: 'enforce',
+      prePrReview: () => ({ action: 'pass' }), canonicalAudit: () => ({ ok: true }) });
+    try {
+      expect(run({ argv: ['--ref=lane/audit', '--check', `--body-file=${first}`, `--body-file=${last}`] }))
+        .toMatchObject({ outcome: 'refused', reason: 'prep-block-missing' });
+      expect(spawn).toHaveBeenCalledOnce();
+      expect(spawn.mock.calls[0][1]).toContain('--check');
+    } finally { output.mockRestore(); rmSync(dir, { recursive: true, force: true }); }
+  });
+  it.each(['', ' \n\t'])('leaves an empty body file untouched so carry cannot bypass the body gate: %j', body => {
+    const dir = mkdtempSync(join(tmpdir(), 'audit-carry-empty-body-'));
+    const path = join(dir, 'body.md');
+    writeFileSync(path, body);
+    const spawn = vi.fn((_cmd, args) => {
+      expect(args).toContain(`--body-file=${path}`);
+      const guard = prCreateBodyGuard(readFileSync(path, 'utf8'));
+      expect(guard).toMatchObject({ ok: false, code: 'empty-body' });
+      return { status: 3, stdout: JSON.stringify({ reason: guard.code }) };
+    });
+    const run = createPrLandRunner({ env: {}, spawn, prepGate: () => ({ ok: true }),
+      prePrReview: () => ({ action: 'pass' }),
+      canonicalAudit: () => ({ ok: true, carried: { from: base, to: sha, fingerprint: 'f'.repeat(64) } }) });
+    try {
+      expect(run({ argv: ['--ref=lane/audit', `--body-file=${path}`] })).toMatchObject({ outcome: 'refused', reason: 'empty-body' });
+      expect(spawn).toHaveBeenCalledOnce();
+      expect(readFileSync(path, 'utf8')).toBe(body);
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+  it('logs carry provenance without a body file and leaves argv untouched', () => {
+    const output = vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
+    try {
+      const { run, spawn } = runner(() => ({ ok: true, carried: { from: base, to: sha, fingerprint: 'f'.repeat(64) } }));
+      expect(run({ argv: ['--ref=lane/audit'] }).outcome).toBe('opened');
+      expect(spawn.mock.calls[0][1].slice(1)).toEqual(['--ref=lane/audit', '--json']);
+      expect(output).toHaveBeenCalledWith(`carried-across-main-merge ${base.slice(0, 8)}..${sha.slice(0, 8)} fp ffffffff ruling none\n`);
+    } finally { output.mockRestore(); }
+  });
+  it('preserves main bypass refusal when no body file is supplied', () => {
+    const spawn = vi.fn();
+    const run = createPrLandRunner({ env: {}, spawn, prepGate: () => ({ ok: true }),
+      prePrReview: () => ({ action: 'pass', bypass: { actor: 'operator', reason: 'approved', operatorInstruction: 'approved' } }),
+      canonicalAudit: () => ({ ok: true }) });
+    expect(run({ argv: ['--ref=lane/audit'] })).toMatchObject({ outcome: 'refused', reason: 'pre-pr-review-bypass-unrecorded',
+      detail: 'bypass refused — the request has no --body-file, so the bypass cannot be recorded in the PR body' });
+    expect(spawn).not.toHaveBeenCalled();
+  });
+  it.each(['', 'Author body\n'])('annotates the last duplicate body file consumed by pr-land for bypass: %j', body => {
+    const dir = mkdtempSync(join(tmpdir(), 'bypass-main-body-'));
+    const first = join(dir, 'first.md'), last = join(dir, 'last.md');
+    writeFileSync(first, 'First body\n'); writeFileSync(last, body);
+    const bypass = { actor: 'operator', reason: 'approved', operatorInstruction: 'approved' };
+    let copied;
+    const spawn = vi.fn((_cmd, args) => {
+      const files = args.filter(a => a.startsWith('--body-file='));
+      expect(files).toHaveLength(2);
+      expect(files[0]).toBe(`--body-file=${first}`);
+      copied = files.at(-1).slice('--body-file='.length);
+      expect(readFileSync(copied, 'utf8')).toBe(body + renderBypassNote(bypass));
+      return { status: 0, stdout: '{"pr":7}' };
+    });
+    const run = createPrLandRunner({ env: {}, spawn, prepGate: () => ({ ok: true }),
+      prePrReview: () => ({ action: 'pass', bypass }), canonicalAudit: () => ({ ok: true }) });
+    try {
+      expect(run({ argv: ['--ref=lane/audit', `--body-file=${first}`, `--body-file=${last}`] }).outcome).toBe('opened');
+      expect(spawn).toHaveBeenCalledOnce();
+      expect(readFileSync(first, 'utf8')).toBe('First body\n');
+      expect(readFileSync(last, 'utf8')).toBe(body);
+      expect(() => readFileSync(copied)).toThrow();
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
   it('fails closed if the check child dies or returns an opened payload', () => {
     for (const child of [{ error: new Error('spawn failed') }, { status: 0, stdout: '{"pr":7}' },
       { status: 0, stdout: '{"reason":"opened","pr":7,"blockers":[]}' }]) {
@@ -58,7 +187,7 @@ function runner(canonicalAudit) {
 
 // Keep both producers' default checker. Replace only filesystem/process effects in a child,
 // never the checker or evaluator; no real Git, credentials, network, or .git writes.
-function defaultProducer({ direct = false, dry = false, check = false, failMain = false, records = [] } = {}) {
+function defaultProducer({ direct = false, dry = false, check = false, failMain = false, carry = false, records = [] } = {}) {
   const dir = mkdtempSync(join(tmpdir(), 'default-audit-gate-'));
   const trace = join(dir, 'effects.jsonl');
   const preload = join(dir, 'effects.mjs');
@@ -79,13 +208,16 @@ function defaultProducer({ direct = false, dry = false, check = false, failMain 
     cp.execFileSync = (cmd, args) => {
       fs.appendFileSync(${JSON.stringify(trace)}, JSON.stringify([cmd, args]) + '\\n');
       if (cmd !== 'git') throw new Error('unexpected process: ' + cmd);
-      const a = args[0] === '-C' ? args.slice(2) : args;
+      const stripped = args[0] === '-c' ? args.slice(2) : args;
+      const a = stripped[0] === '-C' ? stripped.slice(2) : stripped;
       if (a[0] === 'rev-parse') return ${JSON.stringify(sha)};
       if (a[0] === 'fetch' && a.join(' ') === 'fetch origin main') {
         if (${failMain}) throw new Error('fixture main remote unavailable');
         return '';
       }
       if (a[0] === 'fetch') throw new Error("couldn't find remote ref");
+      if (${carry} && a[0] === 'cat-file' && a[1] === 'commit') return 'parent ${base}\\nparent ${'c'.repeat(40)}\\n\\nmerge';
+      if (${carry} && a[0] === 'ls-tree') return '';
       if (a[0] === 'merge-base') return a.includes('--is-ancestor') ? '' : ${JSON.stringify(base)};
       if (a[0] === 'diff') return a.includes('--name-only') ? 'docs/guide.md\\n'
         : a.includes('--name-status') ? 'M\\tdocs/guide.md\\n'
@@ -116,17 +248,13 @@ function defaultProducer({ direct = false, dry = false, check = false, failMain 
     `);
   }
   try {
-    let status = 0, stdout;
-    try {
-      stdout = execFileSync(process.execPath, ['--import', preload, entry, ...argv], {
-        cwd: dir, env: { ...process.env, WE_PLATFORM_PREFERENCES_FILE: prefs, WE_POLICY_CASCADE_LOG: '0' },
-        encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: 30_000, maxBuffer: 1024 * 1024,
-      });
-    } catch (error) {
-      status = error.status; stdout = String(error.stdout || '');
-      if (!stdout.trim()) throw new Error(`producer exited ${status}: ${String(error.stderr || error.message)}`);
-    }
-    return { status, result: JSON.parse(stdout.trim()), effects: readFileSync(trace, 'utf8').trim().split('\n').map(line => JSON.parse(line)) };
+    const child = spawnSync(process.execPath, ['--import', preload, entry, ...argv], {
+      cwd: dir, env: { ...process.env, WE_PLATFORM_PREFERENCES_FILE: prefs, WE_POLICY_CASCADE_LOG: '0' },
+      encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: 30_000, maxBuffer: 1024 * 1024,
+    });
+    if (child.error || !child.stdout?.trim()) throw new Error(`producer exited ${child.status}: ${child.stderr || child.error}`);
+    return { status: child.status, stderr: child.stderr, result: JSON.parse(child.stdout.trim()),
+      effects: readFileSync(trace, 'utf8').trim().split('\n').map(line => JSON.parse(line)) };
   } finally { rmSync(dir, { recursive: true, force: true }); }
 }
 
@@ -175,6 +303,16 @@ describe('default canonical checker integration', () => {
     expect(effects.filter(([cmd]) => cmd === 'publication')).toHaveLength(1);
     expect(effects.find(([cmd]) => cmd === 'publication')[1]).toContain(`--sha=${sha}`);
     expect(effects.some(([, args]) => args.includes('fetch') && args.some(arg => arg.includes('refs/heads/lane/audit')))).toBe(false);
+  });
+  it('direct CLI preserves carry provenance in its notice and PR creation body', () => {
+    const fingerprint = normalizeDiffFingerprint('diff --git a/docs/guide.md b/docs/guide.md\n+documentation only\n');
+    const record = { head: base, base: 'c'.repeat(40), fingerprint, questionHash: QUESTION_HASH,
+      at: '2026-11-17T00:00:00Z', verdict: 'NOT WEAKENED', findings: [] };
+    const { status, result, stderr } = defaultProducer({ direct: true, dry: true, carry: true, records: [record] });
+    expect(status).toBe(0);
+    expect(result.reason).toBe('dry-run');
+    expect(stderr).toContain(`carried-across-main-merge bbbbbbbb..aaaaaaaa fp ${fingerprint.slice(0, 8)} ruling none\n`);
+    expect(result.plan.find(line => line.startsWith('gh '))).toContain(`<!-- audit-carry: carried-across-main-merge ${base}..${sha} -->`);
   });
   it('direct pr-land default checker admits an audited unpublished local head in dry-run', () => {
     const record = { head: sha, base, questionHash: QUESTION_HASH, at: '2026-11-17T00:00:00Z', verdict: 'NOT WEAKENED', findings: [] };
@@ -232,8 +370,9 @@ describe('direct pr-land canonical gate seam', () => {
   });
   it('the direct CLI gates before its dry-run return and before publishing', () => {
     const source = readFileSync(resolve(dirname(fileURLToPath(import.meta.url)), '..', '..', 'pr-land.mjs'), 'utf8');
-    const gate = source.indexOf('  admitCanonicalAudit({ repo: REPO');
+    const gate = source.indexOf('  const canonicalAudit = admitCanonicalAudit({ repo: REPO');
     expect(gate).toBeGreaterThan(0);
+    expect(source.slice(gate, source.indexOf('  // Derive a title', gate))).toContain('CREATE_BODY = canonicalAudit.body');
     expect(gate).toBeLessThan(source.indexOf('  if (DRY_RUN) {', gate));
     expect(gate).toBeLessThan(source.indexOf('  // 2. Publish', gate));
   });

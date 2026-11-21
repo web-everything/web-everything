@@ -46,13 +46,17 @@ export function withdrawnRevocations({ env = process.env, fs = nodeFs, warn = co
     return () => true;
   }
   const withdrawn = new Map();
+  const damagedRefs = new Set();
+  let unknownDamage = false;
   const lines = body.split(/\r?\n/);
   // A damaged line only blocks when it names scopeRef or its ref cannot be read (fail closed); others use warnOther.
   const damaged = (i, count, request) => {
     const named = request && typeof request === 'object' && !Array.isArray(request) && nonblank(request.ref) && !/[\r\n]/.test(request.ref);
+    if (named) damagedRefs.add(bareRef(request.ref));
+    else unknownDamage = true;
     const other = scopeRef !== undefined && named && bareRef(request.ref) !== bareRef(scopeRef);
     const span = count > 1 ? `lines ${i + 1}-${i + count}` : `line ${i + 1}`;
-    (other ? warnOther : warn)(`WARNING: waiver request log ${span}: malformed JSON or invalid request; ignored`);
+    (other ? warnOther : warn)(`WARNING: waiver request log ${span}: malformed JSON or invalid request; waivers blocked for affected refs. Repair the request log and retry`);
   };
   for (let i = 0; i < lines.length; i++) {
     const line = lines[i];
@@ -83,6 +87,7 @@ export function withdrawnRevocations({ env = process.env, fs = nodeFs, warn = co
     } catch { damaged(first, count, parsed); }
   }
   return entry => {
+    if (unknownDamage || damagedRefs.has(bareRef(entry.ref))) return true;
     const time = withdrawn.get(revocationKey(entry));
     return time !== undefined && !(isoTime(entry.at) > time);
   };

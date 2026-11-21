@@ -1,5 +1,6 @@
 import { describe, it, expect } from 'vitest';
 import { checkCanonicalAuditForOpen } from '../canonical-audit-gate.mjs';
+import { normalizeDiffFingerprint } from '../../lib/review-escalation.mjs';
 import { QUESTION_HASH } from '../codex-audit.mjs';
 import { dirname, join, resolve } from 'node:path';
 import { homedir } from 'node:os';
@@ -66,17 +67,22 @@ describe('canonical audit before opening a PR', () => {
       .toMatchObject({ ok: false, reason: 'canonical-audit-missing', record: null });
   });
   describe('merge-from-main carries the audit', () => {
-    const fp = 'd'.repeat(64);
+    const fp = normalizeDiffFingerprint('fixture diff');
     const carried = { ...green, head: other, fingerprint: fp };
     const git = ({ parents = `${sha} ${other} ${'e'.repeat(40)}` } = {}) => (args, resolved) => {
-      if (args.includes('rev-list')) { if (parents instanceof Error) throw parents; return parents; }
+      if (args.includes('cat-file') && args.includes('commit')) {
+        if (parents instanceof Error) throw parents;
+        return `tree ${resolved}\n${parents.split(' ').slice(1).map(p => `parent ${p}`).join('\n')}\n\nfixture`;
+      }
+      if (args.includes('ls-tree')) return ''; // all three fixture trees predate the generated files
+      if (args.includes('diff')) return 'fixture diff';
       return resolved;
     };
     it('accepts the audited head carried across a merge with an equal fingerprint', () => {
       expect(fixture({ records: [carried], liveFingerprint: () => fp, execOverride: git() }).result)
         .toMatchObject({ ok: true, sha, record: carried });
     });
-    it('does not carry a waiver recorded for the audited head', () => {
+    it('does not carry a waiver without a fingerprint recorded for the audited head', () => {
       const weakCarried = { ...weak, head: other, fingerprint: fp };
       expect(fixture({ records: [weakCarried], tool: { ruledWeakened: [{ ...waiver, sha: other }] }, liveFingerprint: () => fp, execOverride: git() }).result)
         .toMatchObject({ ok: false });
@@ -91,7 +97,7 @@ describe('canonical audit before opening a PR', () => {
       ['an octopus merge', { execOverride: git({ parents: `${sha} ${other} ${'e'.repeat(40)} ${'f'.repeat(40)}` }) }],
       ['unreadable parents', { execOverride: git({ parents: new Error('boom') }) }],
       ['a different fingerprint', { execOverride: git(), liveFingerprint: () => 'f'.repeat(64) }],
-      ['an unreadable fingerprint', { execOverride: git(), liveFingerprint: false }],
+      ['an unreadable fingerprint', { execOverride: (args, resolved) => { if (args.includes('diff')) throw new Error('unreadable diff'); return git()(args, resolved); }, liveFingerprint: false }],
     ])('refuses %s', (_n, over) => {
       expect(fixture({ records: [carried], liveFingerprint: () => fp, ...over }).result)
         .toMatchObject({ ok: false, reason: 'canonical-audit-missing', record: null });

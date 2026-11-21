@@ -80,7 +80,7 @@
  * state, which auto-retries with backoff and resume-opens the PR once infra recovers (nothing is stranded; the
  * drain stays the sole writer to main). A non-zero exit means `main` was left UNTOUCHED.
  */
-import { checkCanonicalAuditForOpen } from './operations/canonical-audit-gate.mjs';
+import { checkCanonicalAuditForOpen, auditCarryNotice, auditCarryNote } from './operations/canonical-audit-gate.mjs';
 import { defaultShimDir, resolveOrgAwareShimDir, pathWithOrgAwareShim } from './lib/gh-app-shim.mjs';
 import { publicationTitle, readMainCard } from './operations/machine-pr-title.mjs';
 import { producerBuildContext, checkpointBuildPr } from './operations/build-pr-authorship.mjs';
@@ -99,9 +99,16 @@ export function admitPrSize(request, effects = {}) {
 }
 
 /** Pre-create admission also runs before the direct CLI's dry-run branch. */
-export function admitCanonicalAudit(request, { check = checkCanonicalAuditForOpen, refuse } = {}) {
+export function admitCanonicalAudit(request, { check = checkCanonicalAuditForOpen, refuse, write = text => process.stderr.write(text) } = {}) {
   const gate = check(request);
   if (!gate.ok) refuse({ repo: request.repo, merged: false, reason: gate.reason, detail: gate.message }, 3);
+  if (gate.ok && gate.carried) {
+    write(auditCarryNotice(gate.carried));
+    if (typeof request.body === 'string' && request.body.trim()) {
+      const note = auditCarryNote(gate.carried);
+      return { ...gate, body: request.body.includes(note) ? request.body : request.body + note };
+    }
+  }
   return gate;
 }
 
@@ -916,9 +923,11 @@ async function runCli() {
   };
   if (!refSha) emit({ repo: REPO, merged: false, reason: 'no-such-src', detail: `source commit "${SRC}" not found — pass --sha=<commit> or run from a checkout whose HEAD carries the lane work` }, 3);
 
-  admitCanonicalAudit({ repo: REPO, ref: REF, sha: refSha, refreshMain: CHECK }, {
+  const canonicalAudit = admitCanonicalAudit({ repo: REPO, ref: REF, sha: refSha, refreshMain: CHECK, body: CREATE_BODY }, {
     refuse: DRY_RUN ? emit : result => collect('canonical-audit', result.reason, result.detail, refSha),
   });
+
+  if (canonicalAudit.ok && canonicalAudit.body !== undefined) CREATE_BODY = canonicalAudit.body;
 
   // Derive a title when none was passed: `--fill` can't autofill for a lane/* head (it's remote-only, so
   // gh can't diff it locally). Use the source commit's subject — a meaningful, always-available title —
