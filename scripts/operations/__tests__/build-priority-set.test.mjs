@@ -6,7 +6,7 @@ import { resolveOperation } from '../run.mjs';
 import { hasJsonFlag, runOperationCli } from '../cli-adapter.mjs';
 import { createMemoryRunStore } from '../run-store.mjs';
 import { createRegistry } from '../registry.mjs';
-import { readBuildPrioritySettings } from '../../lib/build-queue.mjs';
+import { decideRuntimeAdmission, readBuildPrioritySettings } from '../../lib/build-queue.mjs';
 
 const dirs = [];
 const at = '2026-11-20T12:00:00.000Z';
@@ -59,6 +59,35 @@ it('round-trips the installed list through readBuildPrioritySettings', async () 
   expect(readBuildPrioritySettings({ runtimePath: f.path, env: {}, now: Date.parse(at) })).toMatchObject({
     ids: ['42', '43'], source: 'runtime', mode: 'only', only: true, runtime: { expired: false, setBy: 'operator' },
   });
+});
+
+it.each(['only', 'lift'])('refuses padded IDs before installation or preview in %s mode', async mode => {
+  for (const ids of ['042', '00042', '00', '42,043', '42,042', ' 042 ']) {
+    for (const preview of [false, true]) {
+      const f = fixture();
+      const previous = JSON.stringify({ ids: ['42'], mode: 'only', setBy: 'operator', at, ttlHours: 2 });
+      fs.writeFileSync(f.path, previous);
+      const result = await f.command([
+        ...flags.filter(s => !s.startsWith('--ids=') && !s.startsWith('--mode=')),
+        `--ids=${ids}`, `--mode=${mode}`, ...(preview ? ['--preview'] : []),
+      ]);
+      expect(result.code).not.toBe(0);
+      expect(result.lines.join('\n')).toContain('without leading zeroes');
+      expect(f.readCard).not.toHaveBeenCalled();
+      expect(f.readPrs).not.toHaveBeenCalled();
+      expect(fs.readFileSync(f.path, 'utf8')).toBe(previous);
+      untouched(f, ['build-priority.runtime.json']);
+    }
+  }
+});
+
+it('keeps a canonical installed card admitted when intersecting the environment priority', async () => {
+  const f = fixture();
+  expect((await f.command(changed('ids', ' 42 '))).code).toBe(0);
+  const settings = readBuildPrioritySettings({ runtimePath: f.path,
+    env: { WE_BUILD_PRIORITY: '42' }, now: Date.parse(at) });
+  expect(settings.ids).toEqual(['42']);
+  expect(decideRuntimeAdmission({ num: 42 }, 'build', settings).admitted).toBe(true);
 });
 
 it('registers the operation in run.mjs', () => { expect(resolveOperation('build-priority-set').declaration.name).toBe('build-priority-set'); });

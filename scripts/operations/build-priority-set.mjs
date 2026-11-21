@@ -20,6 +20,10 @@ export function validateBuildPriorityInput(input) {
       || normalized.source !== 'tool' || normalized.ids.length !== ids.length) {
     throw new Error('build-priority-set: --ids must be nonempty, unique numeric backlog ids');
   }
+  // Runtime/environment intersections compare strings, even though card filenames may be padded.
+  if (ids.some(id => /^0\d/.test(id))) {
+    throw new Error('build-priority-set: --ids must use numeric backlog ids without leading zeroes');
+  }
   return { actor, reason, ids: normalized.ids, mode: input.mode, ttlHours };
 }
 
