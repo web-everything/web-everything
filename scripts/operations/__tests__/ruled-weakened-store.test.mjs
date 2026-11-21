@@ -82,6 +82,50 @@ describe('ops ruled-weakened evidence', () => {
         expect(warn.mock.calls[0][0]).toMatch(/line 1/);
         expect(isRevoked(entry())).toBe(false);
       });
+    describe('scoped refusal', () => {
+      const scoped = (scopeRef) => {
+        const warn = vi.fn(), warnOther = vi.fn();
+        withdrawnRevocations({ fs, env, warn, warnOther, scopeRef });
+        return { warn, warnOther };
+      };
+      const damagedFor = ref => ({ ref, sha: SHA, ruling: null, findings: ['x'] });
+      it('a damaged line for another ref does not block (reported only)', () => {
+        requests(damagedFor('lane/other'));
+        const { warn, warnOther } = scoped('lane/fix');
+        expect(warn).not.toHaveBeenCalled();
+        expect(warnOther).toHaveBeenCalledTimes(1);
+      });
+      it('a damaged line for the same ref blocks', () => {
+        requests(damagedFor('lane/fix (description)'));
+        const { warn, warnOther } = scoped('lane/fix');
+        expect(warn).toHaveBeenCalledTimes(1);
+        expect(warnOther).not.toHaveBeenCalled();
+      });
+      it('an unattributable line blocks', () => {
+        requests('{"ref": truncated', '{"findings":"no ref","sha":1}');
+        const { warn } = scoped('lane/fix');
+        expect(warn).toHaveBeenCalledTimes(2);
+      });
+      it('without a scope every damaged line blocks', () => {
+        requests(damagedFor('lane/other'));
+        const { warn } = scoped(undefined);
+        expect(warn).toHaveBeenCalledTimes(1);
+      });
+      it('rejoins a record split by a raw newline inside a string (shaped like lines 222/223)', () => {
+        const full = JSON.stringify({ ruling: 'WITHDRAWN', ref: 'lane/fix', sha: SHA, findings: 'a\nb', reason: 'r' });
+        requests(full.replace('\\n', '\n'));
+        const { warn, warnOther } = scoped('lane/fix');
+        expect(warn).not.toHaveBeenCalled();
+        expect(warnOther).not.toHaveBeenCalled();
+        append();
+        expect(union()).toEqual([]);
+      });
+      it('a split record whose join does not parse stays unattributable and blocks', () => {
+        requests('{"ref":"lane/other","sha":"' + SHA + '","findings":"a', 'b', 'c', 'd', 'e', 'never closed');
+        const { warn } = scoped('lane/fix');
+        expect(warn).toHaveBeenCalled();
+      });
+    });
     it('a withdrawn line never counts as an approval', () => {
       requests(legacy());
       const { isRevoked } = revocations();
