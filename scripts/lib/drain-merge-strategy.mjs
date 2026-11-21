@@ -42,6 +42,7 @@ import { labelSignature } from './drain-prestage.mjs';
 import { readRedTeamGateSource, readRedTeamCheckFact, resolveWeAppId } from './red-team-check-run.mjs';
 import { readRedTeamPublicationHold, readDrainRedTeamEvidence, settleUnknownEvidenceByComment } from './drain-red-team-evidence.mjs';
 import { readDrainQueueSafety, redTeamClearProof, redTeamClearHoldReason, redTeamEnqueueHold, redTeamLabelHoldReason, dequeueSentBack, sendBackReason, queueLabels } from './drain-queue-safety.mjs';
+import { redTeamEnabled } from './review-red-team-policy.mjs';
 import { readRedTeamDeadlineAction, RED_TEAM_DEADLINE_OVERRIDE } from './red-team-gate.mjs';
 import { publishAttention } from '../operations/needs-you-feed.mjs';
 import { isUnderTest } from './under-test.mjs';
@@ -366,11 +367,14 @@ export function createDrainMergeStrategy({
     const reason = sendBackReason(labels);
     if (reason) dequeueSentBack({ repo: slugOf(repo), pr: num, reason, exec, log: say });
   };
+  // The A0 proof applies only while the red-team gate is on (setting) and the kill switches are not thrown.
+  const proofRequired = () => !!safety.value.waitForRedTeamBeforeEnqueue && redTeamEnabled(env);
   // Labels trigger the re-read; only a trusted, live-head record can supply the missing clearance.
   const recheckQueued = (repo, num, live) => {
     if (dryRun || !safety.value.dequeueOnSendBack) return;
     const sentBack = Array.isArray(live?.labels) ? sendBackReason(live.labels) : null;
     if (sentBack) return dequeueSentBack({ repo: slugOf(repo), pr: num, reason: sentBack, exec, log: say });
+    if (!proofRequired()) return;
     if (Array.isArray(live?.labels) && queueLabels(live.labels).includes('red-team:clear')) return;
     let proof = false;
     try {
@@ -395,7 +399,7 @@ export function createDrainMergeStrategy({
     /** Live open rows are unfiltered by ready-to-merge; also covers entries not in our follow-up file. */
     dequeueSendBacks(rows = [], repo = null) {
       if (dryRun || !enqueueMode || !safety.value.dequeueOnSendBack || !isLocalRepo(repo)) return;
-      const candidates = rows.filter(row => !Array.isArray(row.labels) || sendBackReason(row.labels) || !queueLabels(row.labels).includes('red-team:clear'));
+      const candidates = rows.filter(row => !Array.isArray(row.labels) || sendBackReason(row.labels) || (proofRequired() && !queueLabels(row.labels).includes('red-team:clear')));
       // Discover membership once, before any per-PR read. An incomplete discovery retries next pass;
       // never replace it with an API sweep of every non-ready open PR.
       const queue = candidates.length ? readQueueFacts({ repo: slugOf(repo), exec: (cmd, args, opts) => exec(cmd, args, { ...opts, timeout: 60_000 }) }) : null;

@@ -1,6 +1,6 @@
 /** Queue admission and removal share this policy and head-bound red-team evidence. */
 import { inspectMqReruns, requestMqReruns } from './drain-mq-flake-rerun.mjs';
-import { redTeamOwedOnHead } from './review-red-team-policy.mjs';
+import { redTeamEnabled, redTeamOwedOnHead } from './review-red-team-policy.mjs';
 import { execFileSync } from 'node:child_process';
 import { execFileSyncThrottled } from './gh-throttle.mjs';
 import { mkdirSync, readFileSync } from 'node:fs';
@@ -1306,8 +1306,11 @@ export function redTeamEnqueueHold({ ok, reason, loopPayload, comments, pr, head
   if (ok === false) return `post-accept red team evidence unknown (${reason}); hold and inspect run evidence`;
   if (pendingOnly) return 'post-accept red team result is not published yet (stored evidence not sealed); hold until the sweep publishes it';
   if (isPublishableRedTeamResult(disposition.result)) return null;
-  if (!postAcceptRedTeamOwed(loopPayload, env, { scheduled, inFlight, recorded, skipCardOnly }))
+  if (!postAcceptRedTeamOwed(loopPayload, env, { scheduled, inFlight, recorded, skipCardOnly })) {
+    // Kill switch thrown (WE_REVIEW_RED_TEAM / WE_REVIEW_EXTRA_SEATS off): enqueue without a result still works.
+    if (!redTeamEnabled(env)) return null;
     return redTeamClearProof({ comments, pr, head }).ok ? null : redTeamClearHoldReason(head);
+  }
   return 'post-accept red team has no recorded result on the live head';
 }
 

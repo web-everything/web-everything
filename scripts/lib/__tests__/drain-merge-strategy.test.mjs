@@ -1842,9 +1842,21 @@ describe('queue safeguard overrides and untracked queue entries', () => {
       expect(h.calls.some(c => c.some(a => String(a).includes('enqueuePullRequest')))).toBe(status === 'red-team:clear');
     }
   });
-  it.each(['WE_DRAIN_WAIT_FOR_RED_TEAM_BEFORE_ENQUEUE', 'WE_REVIEW_RED_TEAM', 'WE_REVIEW_EXTRA_SEATS'])('%s off preserves enqueue with producer policy-clear', key => {
-    const h = harness({ strategy: 'github-merge-queue', labels: ['review:accepted', 'ready-to-merge'], env: { ...process.env, [key]: '0' }, liveComments: [policyClear(5283)] });
+  it.each(['WE_DRAIN_WAIT_FOR_RED_TEAM_BEFORE_ENQUEUE', 'WE_REVIEW_RED_TEAM', 'WE_REVIEW_EXTRA_SEATS'])('%s off preserves enqueue without a red-team result', key => {
+    const h = harness({ strategy: 'github-merge-queue', labels: ['review:accepted', 'ready-to-merge'], env: { ...process.env, [key]: '0' } });
     expect(h.s.enqueue({ num: 5283 }, HEAD)).toMatchObject({ enqueued: true });
+  });
+  it('A0: with the red-team gate on, enqueue without proof on the head is held as unknown(missing)', () => {
+    const h = harness({ strategy: 'github-merge-queue', labels: ['review:accepted', 'ready-to-merge'], liveComments: [], evidence: { loopPayload: null, scheduled: false } });
+    const out = h.s.enqueue({ num: 5283 }, HEAD);
+    expect(out).toMatchObject({ enqueued: false });
+    expect(JSON.stringify(out) + h.logs.join('')).toContain('unknown(missing)');
+  });
+  it.each(['WE_REVIEW_RED_TEAM', 'WE_REVIEW_EXTRA_SEATS'])('A0: %s off leaves a queued PR without proof alone', key => {
+    const h = harness({ strategy: 'github-merge-queue', queued: true, liveComments: [], env: { ...process.env, [key]: '0' },
+      initial: { pending: [{ num: 5283, headSha: HEAD }], followedUp: [] } });
+    h.s.dequeueSendBacks([{ number: 5283, labels: ['ready-to-merge'] }]);
+    expect(h.calls.some(c => c.some(a => String(a).includes('dequeuePullRequest')))).toBe(false);
   });
   it.each(['sweep', 'follow-up'])('dequeues a queued PR without red-team:clear or live-head proof (%s)', path => {
     const h = harness({ strategy: 'github-merge-queue', queued: true, liveComments: [],

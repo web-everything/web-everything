@@ -2027,7 +2027,7 @@ function a0Queue({ comments = pr7289.comments, liveHead = pr7289.head, labels = 
   };
   const strategy = createDrainMergeStrategy({ localSlug: repo, exec, env: { WE_UNDER_TEST: '1' },
     resolved: { policy: { strategy: 'github-merge-queue' }, note: null },
-    queueSafety: { value: { dequeueOnSendBack: true, queueRebuildMax: 3 } },
+    queueSafety: { value: { dequeueOnSendBack: true, queueRebuildMax: 3, waitForRedTeamBeforeEnqueue: true } },
     statePath: join(tmpdir(), 'a0-hermetic-state.json'),
     readFile: () => JSON.stringify({ pending: [{ repo, num: 7289, headSha: pr7289.earlierHead }], followedUp: [] }),
     writeFile: () => {}, writeState: () => {}, cancelObsoleteRuns: () => {},
