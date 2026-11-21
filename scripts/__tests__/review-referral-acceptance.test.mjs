@@ -59,7 +59,7 @@ describe('current-head mandatory referral acceptance', () => {
     const exit = vi.spyOn(process, 'exit').mockImplementation(code => { throw Object.assign(new Error('exit'), { exitCode: code }); });
     let code;
     try {
-      runReviewLabelCli({ argv: [String(pr), `--repo=${repo}`, `--to=${to}`, '--actor=operator', '--reason=approve reviewed head'],
+      runReviewLabelCli({ argv: [String(pr), `--repo=${repo}`, `--to=${to}`, '--actor=operator', '--reason=approve reviewed head', ...(to === 'clear-human' ? [`--expect-head=${head}`] : [])],
         allowClearHuman: true, defaultActor: 'operator', emit: line => output.push(line),
         provider: { readPostingIdentity: () => ({ login: 'chalbert', type: 'User' }), readPrState: () => state, readLabels: () => state.labels,
           postComment: () => writes.push('comment'), setLabels: (_, __, { add, remove }) => {

@@ -18,7 +18,7 @@
  * SO THE INPUT IS A RUN ID, NOT A VERDICT. Everything factual is read back out of the run record the review
  * itself wrote: `input.pr`, `input.repo`, the juror's `sessionId` from telemetry, and the staged write-up on
  * disk. The operator supplies only what is genuinely a decision — which verdict, and (for `clear-human`) the
- * instruction authorising it. There is no `--pr` flag to get wrong.
+ * instruction authorising it and the exact head approved. There is no `--pr` flag to get wrong.
  *
  * IT DOES NOT RE-DECIDE ANYTHING. The request's shape and every refusal on it live in
  * `we:scripts/apply-review-request.mjs` (`validateRequest`, `APPLIABLE_TARGETS`, `CLEARANCE_FIELD`) and are
@@ -122,7 +122,7 @@ export function describeNoWriteUp(record) {
  * overriding a panel. It IS surfaced (`disagreesWithPanel`) so the record shows the override happened rather
  * than hiding it.
  */
-export function buildRequest({ facts, to, body, operatorInstruction, actor }, validate) {
+export function buildRequest({ facts, to, body, operatorInstruction, expectedHead, actor }, validate) {
   // ── THE #3334 REFUSAL, ON THIS ROUTE, BEFORE A REQUEST FILE EXISTS ──────────────────────────────────────────
   // The applier WILL run the single home and the single home WILL refuse this — but that happens in CI, after a
   // push, on a host the operator is not watching. Refusing here means the operator learns at the moment of the
@@ -149,6 +149,7 @@ export function buildRequest({ facts, to, body, operatorInstruction, actor }, va
     body,
     ...(facts.sessionId ? { sessionId: facts.sessionId } : {}),
     ...(operatorInstruction ? { operatorInstruction } : {}),
+    ...(expectedHead !== undefined ? { expectedHead } : {}),
   };
   const checked = validate(request);
   if (!checked.ok) throw new Error(`record-verdict: ${checked.error}`);
@@ -179,6 +180,9 @@ export function recordVerdictOperation({ readRun } = {}, { validateRequest, appl
       actor: { type: 'string', required: false, default: 'claude-review-pr' },
       // Required by the applier for `clear-human` and refused on anything else — its rule, enforced there.
       operatorInstruction: { type: 'string', required: false },
+      // Explicit operator-approved pin; never infer clearance authority from a stored or live head.
+      // The applier owns validation and the live-head comparison at the eventual write.
+      expectedHead: { type: 'string', required: false },
       // #3261 — WHICH CHECKOUT carries the target repo's transport branch. Each repo owns its own notes, so a
       // verdict for a sibling repo must be staged on THAT repo's board; this names the checkout to push from.
       // Optional: omitted means the driver's own checkout, which is right for the common same-repo case. The
@@ -204,12 +208,13 @@ export function recordVerdictOperation({ readRun } = {}, { validateRequest, appl
     }),
 
     plan: compute({
-      reads: ['input.to', 'input.actor', 'input.operatorInstruction', 'findings.read'],
+      reads: ['input.to', 'input.actor', 'input.operatorInstruction', 'input.expectedHead', 'findings.read'],
       fn: (view) => buildRequest({
         facts: view.findings.read,
         to: view.input.to,
         body: view.findings.read.body,
         operatorInstruction: view.input.operatorInstruction,
+        expectedHead: view.input.expectedHead,
         actor: view.input.actor,
       }, validateRequest),
     }),

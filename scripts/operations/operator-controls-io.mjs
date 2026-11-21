@@ -139,7 +139,11 @@ export function createOperatorControlsSinks({ root = CONTROL_ROOT, coord = resol
       if (i.item) {
         if (p.steps.some(s => s.startsWith('releaseBuild'))) await releaseHold({ repo: 'we', num: Number(i.item), lockRoot: join(coord, 'build-dispatch-holds') });
         if (p.steps.some(s => s.startsWith('clearBuild'))) await clearFailure(Number(i.item), { path: join(coord, 'build-dispatch-failures.json') });
-      } else child('scripts/review-set-label.mjs', [String(i.pr), '--to=clear-human', ...attribution, `--reason=${i.reason}`]);
+      } else {
+        const latest = await readContext(name, i);
+        if (controlFingerprint(name, latest, i) !== p.fingerprint) throw new Error('state changed since operator plan; re-run');
+        child('scripts/review-set-label.mjs', [String(i.pr), '--to=clear-human', `--expect-head=${latest.head}`, ...attribution, `--reason=${i.reason}`]);
+      }
     } else if (name === 'retry-prepare') {
       const path = join(coord, 'prepare-failures.json');
       const source = pathExists(path) ? readText(path) : null;
