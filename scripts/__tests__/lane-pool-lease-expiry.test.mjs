@@ -71,12 +71,13 @@ it.each(['live', 'dirty'])('forced refresh preserves a stale %s lease before fet
   if (kind === 'dirty') expect(readFileSync(join(lane, 'work'), 'utf8')).toBe('precious work');
 });
 
-it('owner acquire recovers a dead writer guard', () => {
-  seed();
+it('owner acquire recovers a dead writer guard and keeps the workflow-lane mark', () => {
+  seed({ workflowLane: true });
   writeFileSync(`${marker()}.lock`, '2147483646\n');
   const result = run(ownerAcquire());
   expect(result.status, result.stderr).toBe(0);
   expect(readLease().session).toBe('owner');
+  expect(readLease().workflowLane).toBe(true);
   expect(existsSync(`${marker()}.lock`)).toBe(false);
 });
 
