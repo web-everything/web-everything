@@ -140,6 +140,9 @@ export function checkCanonicalAuditForOpen({ repo = process.cwd(), ref, sha, env
       const isAncestor = h => { try { git('merge-base', '--is-ancestor', h, fullSha); return true; } catch { return false; } };
       const newest = [...records].reverse().find(r => isAncestor(String(r.head).toLowerCase()));
       const head = newest && String(newest.head).toLowerCase();
+      // A non-passing verdict on any commit INSIDE the carried delta (between the audited head and this head) vetoes.
+      const between = x => x !== head && isAncestor(x) && (() => { try { git('merge-base', '--is-ancestor', head, x); return true; } catch { return false; } })();
+      if (head && records.some(r => r.verdict !== 'NOT WEAKENED' && between(String(r.head).toLowerCase()))) throw new Error('weakened commit inside the delta');
       const audited = head && canonicalAuditEvidence(records, head, covers, newest.fingerprint ?? null);
       if (audited?.ok && audited.record?.head === head && testOnlyAdditiveDelta(repo, head, fullSha, { exec }).ok) {
         const et = new Date(now()).toLocaleString('en-US', { timeZone: 'America/New_York', hour12: false });

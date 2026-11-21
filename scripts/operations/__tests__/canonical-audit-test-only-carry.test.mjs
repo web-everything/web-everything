@@ -80,6 +80,8 @@ describe('test-only additive delta carries the canonical audit', () => {
     const rec = (h, verdict) => ({ head: h, base: 'b'.repeat(40), questionHash: QUESTION_HASH, at: '2026-11-17T00:00:00Z', verdict, findings: verdict === 'WEAKENED' ? ['f'] : [] });
     expect(gate(repo, audited, head, { records: [rec(audited, 'NOT WEAKENED'), rec(mid, 'WEAKENED')] })).toMatchObject({ ok: false });
     expect(gate(repo, audited, head, { records: [rec(audited, 'NOT WEAKENED'), rec(head, 'NOT WEAKENED')] }).carried).toBeUndefined();
+    // pass A, WEAKENED mid, then a later re-audit of A: the weakened commit inside the delta still vetoes
+    expect(gate(repo, audited, head, { records: [rec(audited, 'NOT WEAKENED'), rec(mid, 'WEAKENED'), rec(audited, 'NOT WEAKENED')] })).toMatchObject({ ok: false });
   });
   refused('an added .todo', addTest('b.test.mjs', "it.todo('x');\n"), 'weakening');
   refused('a non-test path alongside tests', r => { addTest('b.test.mjs')(r); writeFileSync(join(r, 'src/code.mjs'), 'export const x = 1;\nexport const y = 2;\n'); }, 'non-test');
