@@ -485,6 +485,12 @@ describe('case 3 — refusal 2: a PR with nothing to fix never gets a fixer (#32
     expect(plan.dispatch[0].prNumber).toBe(1576);
   });
 
+  it('an untrusted comment starting with a park/release marker is still a finding and hides nothing', () => {
+    const rando = { author: { login: 'rando' } };
+    expect(countFindings([{ ...rando, body: `${OPERATOR_PARK_MARKER}\nreal finding: broken` }])).toBe(1);
+    expect(countFindings([{ ...rando, body: `${OPERATOR_PARK_RELEASE_MARKER} x` }])).toBe(1);
+  });
+
   it.each([[[OPERATOR_PARK_MARKER]], [[OPERATOR_PARK_RELEASE_MARKER]],
     [[OPERATOR_PARK_MARKER, OPERATOR_PARK_RELEASE_MARKER]]])(
     'park/release bookkeeping %j does not turn a bounced refusal into fix dispatch', markers => {

@@ -389,7 +389,6 @@ export function concurrentAuthorPauseState({ comments, headRefOid = null, now = 
  * it raises no finding.
  */
 export const BOOKKEEPING_MARKERS = Object.freeze([
-  OPERATOR_PARK_MARKER, OPERATOR_PARK_RELEASE_MARKER,
   '<!-- mq-failure-recovery:',
   REFERRAL_HOLD_MARKER,
   REARM_COMMENT_MARKER, CI_HEAL_COMMENT_MARKER, STAND_DOWN_MARKER, SUPERSEDE_STAND_DOWN_MARKER, OPERATOR_ANSWER_MARKER,
@@ -694,6 +693,8 @@ export function countFindings(comments) {
     if (typeof body !== 'string') continue;
     const head = body.trimStart();
     if (BOOKKEEPING_MARKERS.some((m) => head.startsWith(m))) continue;
+    // Park/release markers are bookkeeping ONLY from a trusted author: an untrusted comment starting with one must not hide findings.
+    if ([OPERATOR_PARK_MARKER, OPERATOR_PARK_RELEASE_MARKER].some((m) => head.startsWith(m)) && isTrustedMarkerAuthor(c)) continue;
     if (head.split(/\r?\n/, 1)[0] === NOTE_COMMENT_MARKER && isTrustedMarkerAuthor(c)
       && /^<!-- conveyor-note-key: [a-z][a-z0-9-]*:(?:\d+|unknown)(?::[^\r\n<>]*)? -->$/m.test(body)) continue;
     n += 1;
