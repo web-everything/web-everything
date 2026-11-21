@@ -1,3 +1,4 @@
+import { deriveAgyFixAdmission } from '../../lib/agy-fix-admission.mjs';
 /**
  * @file scripts/operations/dispatch-providers/fix.mjs
  * @description THE `fix` LAUNCH KIND'S MECHANICAL DISPATCH PROVIDER (#3640) — copied from the template
@@ -74,7 +75,8 @@ export const FIX_RUN_CONFINEMENT = Object.freeze({
 export const FIX_RUN_SCRIPT = join(REPO_ROOT, 'scripts', 'operations', 'fix-run.mjs');
 
 /** Card 87 follow-up — can a borrowed fix launch on `executor` from this checkout? Claude never needs the run script. */
-export function fixLauncherAvailable(executor, { exists = existsSync, runScript = FIX_RUN_SCRIPT } = {}) {
+export function fixLauncherAvailable(executor, { exists = existsSync, runScript = FIX_RUN_SCRIPT, ...repair } = {}) {
+  if (executor === 'antigravity' && !deriveAgyFixAdmission({}, repair)) return false;
   return executor === 'claude' || (FIX_RUN_EXECUTORS.includes(executor)
     && FIX_RUN_CONFINEMENT[executor]?.mode === 'sandboxed' && exists(runScript));
 }
@@ -129,6 +131,8 @@ export function fixDetachedProvider(request, {
   if (request.laneRepo) argv.push(`--lane-repo=${request.laneRepo}`);
   if (request.claimRepo) argv.push(`--claim-repo=${request.claimRepo}`);
   if (request.scope) argv.push(`--scope=${request.scope}`);
+  if (request.taskKind) argv.push(`--task-kind=${request.taskKind}`);
+  if (request.size !== undefined) argv.push(`--size=${request.size}`);
   if (typeof request.repairKind === 'string' && request.repairKind.trim()) argv.push(`--repair-kind=${request.repairKind}`);
   // build-path-codex-isolation — the run record's ONE executor field comes from here: the vendor this wrapper
   // is actually told to run, never the router's recommendation (see dispatch-lane-io.mjs#dispatchExecutorFor).
