@@ -515,6 +515,36 @@ describe('FUI origin binding', () => {
   });
 });
 
+describe('urgent-verify approved gh-shim dirs on PATH', () => {
+  const realHome = '/host-home';
+  const approvedA = `${realHome}/.claude/github-app-token/gh-shim.d/fd5c03c434fc6486`;
+  const approvedB = `${realHome}/.claude/github-app-token/gh-shim`;
+  it('keeps the approved shim dirs on the child PATH (gh identity routing is unchanged)', () => {
+    const spawnSync = vi.fn(() => ({ status: 0, stdout: 'x' }));
+    const d = createUrgentDeps({ cwd: '/repo', home: '/h', env: { PATH: `${approvedA}:/usr/bin:${approvedB}:/bin`, HOME: '/h' }, spawnSync });
+    d.head();
+    expect(spawnSync.mock.calls[0][2].env.PATH).toBe(`${approvedA}:/usr/bin:${approvedB}:/bin`);
+  });
+  it('still probes non-approved lookalike dirs (wrong shape, non-hex key, extra gh dir)', () => {
+    const odd = ['/repo/.claude/github-app-token/gh-shim.d/0123456789abcdef', `${realHome}/.claude/github-app-token/gh-shim-evil`, '/h/.claude/other/gh-shim', '/h/.claude/github-app-token/gh-shim.d/notakey', '/h/.claude/github-app-token/gh-shim.d/fd5c03c434fc6486/extra', '/opt/evil-gh'];
+    const accessed = [];
+    const fs = { accessSync: p => { accessed.push(String(p)); throw new Error('ENOENT'); }, statSync: () => ({ isFile: () => false }) };
+    const d = createUrgentDeps({ isolated: true, cwd: '/repo', home: '/h', fs, env: { PATH: odd.join(':'), HOME: '/h' }, spawnSync: vi.fn() });
+    expect(() => d.isolate('a'.repeat(40))).toThrow(/required system tool/);
+    for (const dir of odd) expect(accessed).toContain(`${dir}/git`);
+  });
+  it('isolation never probes (accessSync) the approved shim dir', () => {
+    const accessed = [];
+    // Every tool exists in /sys, so isolation proceeds past the probe for git, node, npm and sh alike.
+    const fs = { accessSync: p => { accessed.push(String(p)); if (!String(p).startsWith('/sys/')) throw new Error('ENOENT'); }, statSync: () => ({ isFile: () => true }),
+      readdirSync: () => { throw new Error('stop after the probe'); } };
+    const d = createUrgentDeps({ isolated: true, cwd: '/repo', home: '/h', fs, env: { PATH: `${approvedA}:${approvedB}:/sys`, HOME: '/h' }, spawnSync: vi.fn() });
+    expect(() => d.isolate('a'.repeat(40))).toThrow(/stop after the probe/);
+    for (const tool of ['git', 'node', 'npm', 'sh']) expect(accessed).toContain(`/sys/${tool}`);
+    expect(accessed.some(p => p.startsWith(approvedA) || p.startsWith(approvedB))).toBe(false);
+  });
+});
+
 describe('urgent-verify blocker fixes', () => {
   it('appends the checkout node_modules/.bin after system PATH so it cannot shadow system tools', () => {
     const spawnSync = vi.fn(() => ({ status: 0, stdout: 'x' }));
