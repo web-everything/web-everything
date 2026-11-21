@@ -587,7 +587,7 @@ systemctl enable forge-exec-egress.service
 systemctl start forge-exec-egress.service
 systemctl enable --now forge-exec-egress.timer
 restore_egress_timer=false
-# Verify the source runner sees coverage for every target UID, after the new
+# Verify the installed runner sees coverage for every target UID, after the new
 # service and timer are installed. A restored old timer on an earlier failure
 # cannot expose new slots: their directories and sudoers are still unpublished.
 FORGE_EGRESS_UIDS="${slot_uids[*]}" /usr/local/libexec/forge-egress.sh apply

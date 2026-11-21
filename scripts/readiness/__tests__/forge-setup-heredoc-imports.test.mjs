@@ -77,6 +77,9 @@ it('checks every UID with the source runner and fails closed before sudoers publ
   expect(egress.command).toContain('"$(cd -- "$(dirname -- "$0")" && pwd)" "${slot_uids[@]}"');
   expect(egress.body).toContain("pathToFileURL(path.join(dir, 'forge-exec-run.mjs')).href");
   expect(source.indexOf("<<'EGRESS_CHECK'")).toBeLessThan(source.indexOf("<<'ENABLE_SLOTS'"));
+  // No test seams (testRoot etc.) may reach the production factory: they disable the real nft probe.
+  expect(egress.body).toContain('createRunner();');
+  expect(egress.body).not.toMatch(/createRunner\(\s*[^\s)]/);
   // Inject only the runner factory; execute the actual argv slicing and probe loop.
   const body = egress.body
     .replace(/^import[^\n]+;\n/gm, '')
@@ -84,7 +87,9 @@ it('checks every UID with the source runner and fails closed before sudoers publ
   const run = new (Object.getPrototypeOf(async function () {}).constructor)('process', 'createRunner', body);
   const argv = ['node', '-', '/repo/scripts/readiness', '101', '102', '103'];
   const egressReady = vi.fn().mockResolvedValue(undefined);
-  await run({argv}, () => ({egressReady}));
+  const factoryArgs = [];
+  await run({argv}, (...args) => { factoryArgs.push(args); return {egressReady}; });
+  expect(factoryArgs).toEqual([[]]);
   expect(egressReady.mock.calls).toEqual([[101], [102], [103]]);
   egressReady.mockReset().mockResolvedValueOnce(undefined).mockRejectedValueOnce(new Error('uncovered UID'));
   await expect(run({argv}, () => ({egressReady}))).rejects.toThrow('uncovered UID');
