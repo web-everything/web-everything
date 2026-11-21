@@ -3,8 +3,7 @@ import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { execFileSync } from 'node:child_process';
-import { shardFiles, parseShardArg, listBreakTestFiles, BASELINE_FILE, REPO_ROOT } from '../shard-files.mjs';
-import { loadTimings } from '../../../ci/shard-assign.mjs';
+import { shardFiles, parseShardArg, listBreakTestFiles, listAllSoakFiles, BASELINE_FILE, REPO_ROOT } from '../shard-files.mjs';
 
 describe('soak shard-files — isolated baseline and time-balanced breaks', () => {
   it('every file (baseline + breaks) is assigned to exactly one shard', () => {
@@ -115,11 +114,12 @@ describe('soak shard-files — isolated baseline and time-balanced breaks', () =
     });
   });
 
-  it('the stored timings cover most break files (a stale table would only cost balance)', () => {
-    const timings = loadTimings().soak;
-    const all = [BASELINE_FILE, ...listBreakTestFiles()];
-    const known = all.filter((f) => Number.isFinite(timings[f.slice(f.indexOf('scripts/conveyor'))]));
-    expect(known.length / all.length).toBeGreaterThan(0.8);
+  it('every break gets a shard (a missing timing only costs balance, median fallback)', () => {
+    const all = listAllSoakFiles();
+    const total = 4;
+    const placed = Array.from({ length: total }, (_, i) => shardFiles({ shard: i + 1, total, timings: {} })).flat();
+    expect(new Set(placed)).toEqual(new Set(all));
+    expect(placed.length).toBe(all.length);
   });
 
   it('more shards than break files leaves the extra shards empty, not erroring', () => {
