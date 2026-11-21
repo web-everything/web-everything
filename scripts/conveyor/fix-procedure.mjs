@@ -57,9 +57,10 @@ import { execFileSync } from 'node:child_process';
 import { readGit } from '../lib/proc-read.mjs';
 import { createHash, randomBytes, timingSafeEqual } from 'node:crypto';
 import { hostname } from 'node:os';
+import { statSync } from 'node:fs';
 import { resolve } from 'node:path';
 
-import { isLeaseExpired, readLockEntry, heartbeat, releaseLockDir, reserve } from '../readiness/file-locks.mjs';
+import { isLeaseExpired, readLockEntry, heartbeat, releaseLockDir, reserve, lockDirFor } from '../readiness/file-locks.mjs';
 import {
   fixDispatchClaimRoot, fixDispatchResource, listFixDispatchClaims, readFixDispatchClaim,
   fixDispatchSessionName, DEFAULT_FIX_DISPATCH_CLAIM_TTL_MINUTES,
@@ -138,6 +139,42 @@ export function isLiveFixClaim(entry, nowMs = Date.now()) {
 export function readLiveFixClaim({ repo, pr, lockRoot = fixDispatchClaimRoot(), nowMs = Date.now() } = {}) {
   const entry = readFixDispatchClaim({ repo: repoKeyOf(repo), pr: Number(pr), kind: FIXING_KIND, lockRoot });
   return isLiveFixClaim(entry, nowMs) ? entry : null;
+}
+
+/** Drain-only, read-only hold across fixer and dispatch claims. Unreadable evidence holds until repaired. */
+export function readLiveDrainClaim({ repo, pr, lockRoot = fixDispatchClaimRoot(), nowMs = Date.now(), probe = statSync } = {}) {
+  let repoKey;
+  try { repoKey = repoKeyOf(repo); } catch (error) { throw new TypeError(error.message, { cause: error }); }
+  const held = [];
+  for (const kind of [FIXING_KIND, 'fix', 'ci-heal']) {
+    const resource = fixDispatchResource({ repo: repoKey, pr: Number(pr), kind });
+    const entry = readFixDispatchClaim({ repo: repoKey, pr: Number(pr), kind, lockRoot });
+    let uncertain = false;
+    if (entry) {
+      if (!Number.isFinite(Date.parse(entry.heartbeatAt))) uncertain = 'invalid-heartbeat';
+      else if (kind === FIXING_KIND ? !isLiveFixClaim(entry, nowMs)
+        : isLeaseExpired(entry, nowMs, DEFAULT_FIX_DISPATCH_CLAIM_TTL_MINUTES)) continue;
+    } else {
+      try {
+        probe(lockDirFor(lockRoot, resource));
+        uncertain = 'unreadable-entry';
+      } catch (error) {
+        if (error?.code !== 'ENOENT') uncertain = `probe-error:${error?.code ?? 'unknown'}`;
+        else {
+          try { probe(lockRoot); continue; }
+          catch (rootError) {
+            uncertain = rootError?.code === 'ENOENT' ? 'store-missing' : `probe-error:${rootError?.code ?? 'unknown'}`;
+          }
+        }
+      }
+    }
+    const owner = entry?.owner ?? null;
+    const holder = entry?.meta?.who ?? owner ?? `(${kind} claim)`;
+    held.push({ kind, owner, holder, claimedAt: entry?.meta?.claimedAt ?? null,
+      heartbeatAt: entry?.heartbeatAt ?? null, uncertain,
+      entry: { ...entry, meta: { ...entry?.meta, who: holder } } });
+  }
+  return held.length ? { ...held[0], heldKinds: held.map(claim => claim.kind) } : null;
 }
 
 /**

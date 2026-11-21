@@ -4431,6 +4431,9 @@ default timeout; injected dispatchers and lock identity probes keep their exerci
 The fixture statically imports the real review-job module during collection and supplies it through
 `loadReviewJob`. Keep that cyclic graph out of per-test dynamic loading; the head-change cases reuse
 the same module and still exercise the production dispatchers with a fake job spawner.
+Collect the review-job, manual-pass and reconcile-pass graph with static fixture imports so the
+first review adapter case does not spend its five-second deadline on cold Vite transforms.
+Retain the production lazy imports and the real dispatcher head-change refusal assertions.
 
 Stalled living owners escalate to a rate-limited NEEDS-YOU event; activity age never proves death
 or permits claim takeover. The portable IO regressions exercise production evidence, planning,
