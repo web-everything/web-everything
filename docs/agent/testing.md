@@ -3614,6 +3614,18 @@ unavailable exclusion, and queue a cooperating writer through the same exclusion
 
 ### Security condition test shape
 
+The S1 agent-launch boundary builds argv from a plain-data snapshot, not caller argv/options.
+Keep the fourteen attack classes named in `scripts/__tests__/agent-launch.test.mjs`;
+inject `io.spawn`/`io.resolveBinary` only as trusted test IO. The literal-call scanner is
+a migration tripwire, not a security boundary. Direct-task resume fixtures must use UUIDs.
+Pair injected direct-task `spawnFn` with `resolveBinaryFn` (including repair turns);
+CLI preloads must also supply binary-lookup evidence. Never require an installed agent
+or add a CLI/env override for fixtures. Test lookup with explicit temporary directories
+through `findAgentBinary`; production retains its private fixed installation list.
+
+The literal launch tripwire pins counts per approved file; adding a site to an
+already approved file must fail too.
+
 Every new bypass-widening condition needs one negative test per conjunct. Security
 checks must not be hidden behind `!testRoot` guards; inject identity, ownership,
 and other system evidence so hermetic tests exercise the production checks.
@@ -5298,6 +5310,43 @@ old and new runners discover only `slot-N`. Sudoers is prepared privately and
 published only after the installed runner verifies every target UID's egress.
 Keep failure cases before runner replacement as well as during final publication;
 restoring an old refresh timer must never make the staged slots discoverable.
+
+## Launcher main-parity fixtures (SEC1 S1)
+
+Child env = caller record verbatim; refused before spawn: non-string/NUL values,
+empty/=/NUL keys. The launcher snapshots the caller's `env` record and omits undefined
+values. Invalid keys refuse even when their values are undefined.
+Node serializes env entries as `key=value`; an unchecked `=` in a key can therefore
+change the variable name seen by the child. Keep refusal
+coverage for both agents and Codex review/edit modes, with the offending key in the
+diagnostic and zero resolver/spawn calls. The real-Git `ext::` regression must prove
+its local marker payload runs with the raw malformed env, then cannot run through
+the launcher. Removing the key check must redden both refusal and behavioral cases.
+Runtime loader variables and Git transport settings pass through unchanged.
+Environment narrowing is deferred to S1e (`designs/sec1-s1e-env-narrowing-prep-2026-11-20.md`);
+#7022 remains open. Keep the real Node preload fixture as a parity pin: the caller's
+`NODE_OPTIONS` still executes the local payload. The launcher never merges the ambient environment. The differential
+matrix in `agent-launch.test.mjs` compares review and edit runs with main's env formula,
+including runtime loader variables, Git config pairs/parameters and protocol allowlists,
+HOME, Git/gh isolation, policy sources, roots, gates, and retry limits.
+Pin undefined omission, null refusal and reported/spawned
+argv equality at the direct-task boundary as well.
+Edit PATH is the heavy-admission shim followed by the caller PATH in its original
+order, minus empty entries and that shim; review PATH and TMP remain untouched.
+Test a read-only descriptor with an explicit `tempRoot` directly, so the sandbox guard
+must preserve caller TMP even when the caller supplies a temp root.
+Both Codex PATHs match main. The checked-in six-case argv golden comes from
+`c18c5279b4` and pins token order. Relative edit PATH entries refuse before spawn.
+
+Fixed binary lookup must agree with the first executable Codex on the final child
+PATH by realpath, but spawn the lookup's named path (`join(dir, agent)`) so a dispatcher
+symlink sees `codex` as its name. Pin that behavior with an executable dispatcher fixture.
+Refuse a wrapper, a relative entry before the match, or a missing match.
+Use executable fixtures and pair injected spawn with binary evidence; never
+require an installed agent. Keep the admission refusal/throw cases and the launcher
+in the permission-change and auditor floors. The approval-count JSON also belongs to
+the permission-change file list and path matcher; pin its unreadable and edited hunks.
+Run the affected launcher, literal-tripwire and direct-task suites through heavy-admission.
 
 ## Verify failed-file recovery
 
