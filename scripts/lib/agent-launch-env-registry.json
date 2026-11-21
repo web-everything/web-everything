@@ -818,6 +818,7 @@
   "WE_STANDARDS_CACHE_DIR": {"class": "drop", "why": "Redirects a resource, policy source, or executable; retain the owning tool default."},
   "WE_STAND_DOWN_LAPSE_ON_NEW_HEAD": {"class": "drop", "why": "Value-dependent: retains stand-down holds across head changes; other values stay dropped. Evidence: scripts/conveyor/stand-down.mjs:198.", "restrictiveValues": ["off"]},
   "WE_STATE_DAEMON_ROOT": {"class": "drop", "why": "Redirects a resource, policy source, or executable; retain the owning tool default."},
+  "WE_STATIC_EDGES_SHADOW": {"class": "drop", "why": "Caller override is not required by the agent; keep the owning tool default."},
   "WE_STRANDED_SWEEP_LOG_LIMIT": {"class": "drop", "why": "Caller override is not required by the agent; keep the owning tool default."},
   "WE_SWEEP_BUILD_CAP": {"class": "drop", "why": "Caller override is not required by the agent; keep the owning tool default."},
   "WE_SWEEP_REPO": {"class": "drop", "why": "Caller override is not required by the agent; keep the owning tool default."},
