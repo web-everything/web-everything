@@ -186,8 +186,8 @@ import { autoStrandedSweepPass } from './backlog-stranded-sweep.mjs'; // xvr2o8r
 import { parseEscalationReason } from './review-detail.mjs';
 import { deriveResolutionBasis, graduatedToFromBody, renderResolutionBasisBanner } from './lib/review-render.mjs'; // #2447 — the graduatedTo resolution-basis banner (presentation only; never gates)
 import { readSharedOpenPrs, readShaCache, writeShaCache, snapshotOpenCount, nextLimit } from './lib/pr-snapshot.mjs';
-import { listOpenPrsPagedHydratedComplete as listOpenPrsPagedHydrated, resolvePrListPaging, parseListOutput } from './lib/pr-list-paged.mjs'; // refuses a short inventory (rows < totalCount)
-import { withListRetry } from './lib/gh-list-retry.mjs'; // 504 incident 2026-11-03 — retry a transient 5xx list with backoff; a persistent failure throws + raises gh-list-failed
+import { listOpenPrsPagedHydratedCompleteAsync as listOpenPrsPagedHydrated, resolvePrListPaging, parseListOutput } from './lib/pr-list-paged.mjs'; // refuses a short inventory (rows < totalCount)
+import { withListRetryAsync as withListRetry } from './lib/gh-list-retry.mjs'; // 504 incident 2026-11-03 — retry a transient 5xx list with backoff; a persistent failure throws + raises gh-list-failed
 import { markPrSnapshotDirty } from './lib/pr-snapshot-store.mjs';
 import { backfillAllReviewRuns, backfillOpenReviewRuns } from './lib/review-run-index.mjs';
 /** Optional discovery hints must never reject the drain's open-PR context. */
@@ -4391,6 +4391,7 @@ export function computeNetDiffText({ exec, remote = 'origin', base = 'main', rev
   }
   try {
     // Same guard, same reason — this is the reviewer-facing diff TEXT, off the same caller-supplied candidate.
+    // Disable text conversion as well as external diffs: evidence must be the raw patch.
     // #2890-review-r2 finding 2b — `--no-ext-diff`. A `diff.external` in the caller's git config, or a
     // `GIT_EXTERNAL_DIFF` inherited from the developer's environment (delta, difftastic — both common), REPLACES
     // git's own diff output wholesale: verified, a one-line external driver made this return
@@ -4399,7 +4400,7 @@ export function computeNetDiffText({ exec, remote = 'origin', base = 'main', rev
     // Deliberately NOT `--text`: unlike the single-file write-time diff, this is a whole-PR diff and forcing
     // binary blobs into it would splat megabytes of asset bytes into the reviewer-facing text (see
     // `diff-hunks.mjs`, where `--text` is right precisely because the payload is one bounded file).
-    const text = String(exec('git', ['diff', '--no-ext-diff', '--end-of-options', diffBase, candidate], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }) || '');
+    const text = String(exec('git', ['diff', '--no-ext-diff', '--no-textconv', '--end-of-options', diffBase, candidate], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }) || '');
     return { text, base: diffBase, rev: candidate, scored: true, ...(revSha ? { revSha } : {}) };
   } catch (err) {
     // the text diff failed even though the basis resolved → caller falls back to `gh pr diff`
@@ -4452,10 +4453,10 @@ export function readNetDiffAtHead({ exec, headSha, headRef = null, netDiff = com
  * @returns {{changedFiles:string[], diffLines:number, humanBasisFiles:string[], cumulativeDiffLines:number,
  *   scored:boolean, netDiffText:{text:string,scored:boolean,reason?:string}, diffHunks:string|null}}
  */
-export function computeNetDiffSignals({ exec, remote = 'origin', base = 'main', baseRev = null, rev, fetchExtraRefs = [] } = {}) {
+export function computeNetDiffSignals({ exec, remote = 'origin', base = 'main', baseRev = null, rev, fetchExtraRefs = [], pinRev = false } = {}) {
   const basis = resolveNetDiffBasis({ exec, remote, base, rev, fetchExtraRefs });
   const net = computeNetDiffChangedFiles({ exec, remote, base, baseRev, rev, fetchExtraRefs, basis });
-  const netDiffText = computeNetDiffText({ exec, remote, base, rev, fetchExtraRefs, basis });
+  const netDiffText = computeNetDiffText({ exec, remote, base, rev, fetchExtraRefs, basis, pinRev });
   return {
     changedFiles: net.changedFiles,
     diffLines: net.diffLines,
@@ -5495,7 +5496,7 @@ export async function main(argv, { env = process.env, stdout = process.stdout, e
       if (slug) {
         let seed = [];
         try { seed = readSharedOpenPrs({ repo: slug, fields: 'number,updatedAt,headRefOid,body,files', caller: 'merge-ai-prs.mjs' }) || []; } catch { /* live read below remains authoritative */ }
-        const listed = withListRetry(() => listOpenPrsPagedHydrated({ repo: slug, exec: execFileSyncThrottled, paging: resolvePrListPaging(),
+        const listed = await withListRetry(() => listOpenPrsPagedHydrated({ repo: slug, exec: execFileSyncThrottled, execAsync: execFileP, paging: resolvePrListPaging(),
           heavyFields: ['body', 'files'], cache: drainHeavyCacheByRepo.get(repo) || {}, seed,
           maxRows: OPEN_PR_LIST_LIMIT, execOpts: { throttle: { op: 'pr list (drain context page)' } } }), { repo: slug, op: 'drain-context-list', daemon: 'drain' });
         drainHeavyCacheByRepo.set(repo, listed.cache);
@@ -5921,7 +5922,7 @@ export async function main(argv, { env = process.env, stdout = process.stdout, e
             // listing (60-200 s) inside the pass. The seed never decides the open set: the live listing does.
             try { seed = __t.time('listing.seed', () => readSharedOpenPrs({ repo: slug, fields: 'number,updatedAt,headRefOid,body,files', caller: 'merge-ai-prs.mjs', cacheOnly: true })) || []; } catch { seed = []; }
           }
-          listed = __t.time('listing.pages', () => withListRetry(() => listOpenPrsPagedHydrated({ repo: slug, exec: execFileSyncThrottled, paging,
+          listed = await __t.timeAsync('listing.pages', () => withListRetry(() => listOpenPrsPagedHydrated({ repo: slug, exec: execFileSyncThrottled, execAsync: execFileP, paging,
             heavyFields, needsHeavy: RECONCILE ? () => true : operatorSelects, cache: drainHeavyCacheByRepo.get(repo) || {}, seed,
             maxRows: OPEN_PR_LIST_LIMIT, execOpts: { throttle: { op: 'pr list (drain page)' } } }), { repo: slug, op: 'drain-list', daemon: 'drain' }));
           drainHeavyCacheByRepo.set(repo, listed.cache);
@@ -6556,7 +6557,7 @@ export async function main(argv, { env = process.env, stdout = process.stdout, e
       if (v.headRef && (isLocalRepo(v.repo) || escCwd)) {
         const exec = (cmd, args, opts) => execFileSync(cmd, args, { cwd: escCwd, ...opts });
         diffExec = exec;
-        const sig = computeNetDiffSignals({ exec, rev: v.headRef, baseRev: v.base, fetchExtraRefs: [v.headRef] });
+        const sig = computeNetDiffSignals({ exec, rev: v.headRef, baseRev: v.base, fetchExtraRefs: [v.headRef], pinRev: true });
         changedFiles = sig.changedFiles;
         diffLines = sig.diffLines;
         humanBasisFiles = sig.humanBasisFiles;
@@ -6680,7 +6681,10 @@ export async function main(argv, { env = process.env, stdout = process.stdout, e
       // clone ⇒ no text ⇒ the scan is a no-op — the same fail-open the manifest baseline gate documents).
       // #2890 — `netDiffText` was already fetched above (feeding `scoreEscalation`'s `diffHunks`); reused here
       // rather than re-fetched, so this scan and the escalation score can never disagree on what changed.
-      const gaming = scanTestTampering({ diffText: netDiffText.text });
+      const gaming = scanTestTampering({
+        netDiffText, pinnedHeadSha: v.listedHeadSha || v.headSha || null,
+        noClone: !isLocalRepo(v.repo) && !escCwd,
+      });
       // #xuboo0q — WAS THIS EXACT TAMPERING FINDING ALREADY HUMAN-CLEARED, AT THE CURRENT HEAD? Before #xuboo0q
       // this gate had no memory: it re-parked `review:human` on every drain pass that saw a tampering-shaped
       // diff, even seconds after a human ran the sanctioned `--to=clear-human` ceremony specifically to clear it
@@ -6697,7 +6701,7 @@ export async function main(argv, { env = process.env, stdout = process.stdout, e
       // PR #4631 (ruling a): did the carry below fail on a READ miss (→ the drain's own `review:held-mechanical` park,
       // which the carry sweep retries) rather than a decision (→ `review:human`)? A throw mid-carry counts as a miss.
       let carryRetryable = false;
-      if (netDiffText.scored && gaming.tampered && hasReviewLabel(v.prLabels, REVIEW_LABELS.accepted) && !v.workflowHoldRepark) { // a re-admitted workflow hold parks review:human through its own gate; never the retryable mechanical park
+      if (!gaming.evidenceIncomplete && netDiffText.scored && gaming.tampered && hasReviewLabel(v.prLabels, REVIEW_LABELS.accepted) && !v.workflowHoldRepark) { // a re-admitted workflow hold parks review:human through its own gate; never the retryable mechanical park
         try {
           const cd = JSON.parse(readGh(['pr', 'view', String(v.num), ...repoFlag(v.repo), '--json', 'headRefOid,comments'], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }).trim() || '{}');
           tamperHeadSha = typeof cd.headRefOid === 'string' ? cd.headRefOid : null;
@@ -6730,7 +6734,9 @@ export async function main(argv, { env = process.env, stdout = process.stdout, e
           }
         } catch { /* fetch miss → both stay null → shouldReparkForTestTampering fails closed (still true) */ }
       }
-      if (!v.workflowHoldRepark && shouldReparkForTestTampering({ tampered: gaming.tampered, netDiffScored: netDiffText.scored, humanClearedSha, headSha: tamperHeadSha })) {
+      // R1105: incomplete/head-mismatched evidence is an additional hold, never
+      // clearance evidence. Leave the existing human-clearance decision unchanged.
+      if (!v.workflowHoldRepark && (gaming.evidenceIncomplete || shouldReparkForTestTampering({ tampered: gaming.tampered, netDiffScored: netDiffText.scored, humanClearedSha, headSha: tamperHeadSha }))) {
         v.decision = 'skip';
         v.escalated = 'yes';
         v.humanRequired = true;

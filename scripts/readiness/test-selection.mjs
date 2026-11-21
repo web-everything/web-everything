@@ -59,6 +59,7 @@ import { dirname, resolve, join } from 'node:path';
 import { isBlastRadiusPath, isStatutePath, isGateSelfPath } from '../lib/review-escalation.mjs';
 import { writeAllSync } from '../lib/write-all-sync.mjs';
 import { admittedArgv } from './heavy-admission.mjs';
+import { shadowSelection } from '../lib/static-selection-edges.mjs';
 
 // ── the flag (NOT defaulted — DoD) ───────────────────────────────────────────────────────────────────────────
 
@@ -337,7 +338,7 @@ export function changedFilesSince({ base = 'origin/main', runGit } = {}) {
  * @param {{base?: string, runGit: (args: string[]) => string, env?: Record<string,string|undefined>}} args
  * @returns {SelectionDecision & {changedFiles: string[]|null}}
  */
-export function selectTests({ base = 'origin/main', runGit, env = process.env } = {}) {
+export function selectTests({ base = 'origin/main', runGit, env = process.env, shadow } = {}) {
   const flagEnabled = selectionFlagEnabled(env);
   const changedFiles = changedFilesSince({ base, runGit });
   if (changedFiles === null) {
@@ -347,7 +348,12 @@ export function selectTests({ base = 'origin/main', runGit, env = process.env } 
       reasons: ['could not compute the pinned-merge-base diff — full suite (never shrink on an unknown diff)'],
     };
   }
-  return { changedFiles, ...decideSelection({ changedFiles, flagEnabled }) };
+  const decision = { changedFiles, ...decideSelection({ changedFiles, flagEnabled }) };
+  if (typeof shadow === 'function') {
+    try { decision.shadow = shadow({ changedFiles }); }
+    catch { decision.shadow = { tests: [], partial: true }; }
+  }
+  return decision;
 }
 
 // ── the LOCAL agent-gate policy (xpnhz4o) — a DIFFERENT, wider shrink than the CI one above ─────────────────
@@ -486,6 +492,140 @@ export function assessFalseGreen({ failedTestFiles = [], selectedTestFiles = [],
   };
 }
 
+/** The suite-level statuses vitest's json reporter emits. Anything else is malformed evidence. */
+const SUITE_STATUSES = new Set(['passed', 'failed']);
+/**
+ * The assertion-level statuses of a COMPLETED run. vitest's json reporter also emits `pending` — a test in run
+ * mode with no result, i.e. one that never executed (a bailed or interrupted run) — which is incomplete evidence.
+ */
+const ASSERTION_STATUSES = new Set(['passed', 'failed', 'todo', 'skipped', 'disabled']);
+/** Top-level vitest json counters; when present each must be a non-negative integer. */
+const REPORT_COUNTERS = ['numTotalTestSuites', 'numPassedTestSuites', 'numFailedTestSuites', 'numPendingTestSuites',
+  'numTotalTests', 'numPassedTests', 'numFailedTests', 'numPendingTests', 'numTodoTests'];
+/**
+ * True for a code point a suite name must never carry: C0/C1 controls and DEL, the Unicode line/paragraph
+ * separators, and invisible format characters (soft hyphen, zero-width and bidi marks, word joiners, BOM).
+ */
+function isUnsafeNameCodePoint(code) {
+  return code <= 0x1f || (code >= 0x7f && code <= 0x9f) || code === 0xad
+    || (code >= 0x200b && code <= 0x200f) || code === 0x2028 || code === 0x2029
+    || (code >= 0x202a && code <= 0x202e) || (code >= 0x2060 && code <= 0x2064) || code === 0xfeff;
+}
+const hasUnsafeNameChar = (name) => [...name].some((ch) => isUnsafeNameCodePoint(ch.codePointAt(0)));
+const isAbsoluteName = (name) => name.startsWith('/') || name.startsWith('\\') || /^[A-Za-z]:[\\/]/.test(name);
+
+/**
+ * A vitest suite name → its repo-relative path. Strips the checkout ROOT only as an anchored prefix; a name
+ * from another checkout keeps its absolute form (validateVitestReport rejects it). Pure apart from ROOT.
+ */
+function suiteRelPath(name) {
+  const text = String(name);
+  return normalizePath(text.startsWith(`${ROOT}/`) ? text.slice(ROOT.length + 1) : text);
+}
+
+/**
+ * Validate a vitest json report before measuring false greens. Fails closed on any malformed or incomplete
+ * evidence: a missing or empty suite list (unless `allowEmpty`); a suite name that is blank, padded, carries
+ * control, separator or invisible characters, is not NFKC-normalized, is absolute outside this checkout, has a
+ * `..`, `.` or empty segment, normalizes to nothing, or repeats another suite (case-folded); a suite status
+ * other than `passed`/`failed`; malformed assertions, a never-run (`pending`) assertion, or a `passed` suite
+ * with a failed assertion; malformed counters, pending tests, or totals and `success` that contradict the
+ * listed suites; and declared or malformed runtime-error fields. A named failed suite is valid without
+ * assertions. Pure apart from ROOT.
+ * @param {unknown} report
+ * @param {{allowEmpty?: boolean}} [options] allowEmpty — accept a zero-suite report (a `vitest related` run
+ *   that resolved no tests); a full-run report is never empty.
+ * @returns {{ok: boolean, reason: string|null}}
+ */
+export function validateVitestReport(report, { allowEmpty = false } = {}) {
+  const isObject = (value) => value !== null && typeof value === 'object' && !Array.isArray(value);
+  const fail = (reason) => ({ ok: false, reason });
+  if (!isObject(report)) return fail('report must be an object');
+  if (!Array.isArray(report.testResults)) return fail('testResults must be an array');
+  if (report.testResults.length === 0 && !allowEmpty) return fail('testResults must be a non-empty array');
+  const runtimeErrorProblem = (value) => {
+    if (value.numRuntimeErrorTestSuites !== undefined
+      && !(Number.isInteger(value.numRuntimeErrorTestSuites) && value.numRuntimeErrorTestSuites >= 0)) {
+      return 'numRuntimeErrorTestSuites must be a non-negative integer';
+    }
+    if (value.unhandledErrors !== undefined && !Array.isArray(value.unhandledErrors)) {
+      return 'unhandledErrors must be an array';
+    }
+    if (value.numRuntimeErrorTestSuites > 0 || Boolean(value.runtimeError) || Boolean(value.testExecError)
+      || (Array.isArray(value.unhandledErrors) && value.unhandledErrors.length > 0)) {
+      return 'declares runtime errors';
+    }
+    return null;
+  };
+  const reportProblem = runtimeErrorProblem(report);
+  if (reportProblem) return fail(`report ${reportProblem}`);
+  for (const key of REPORT_COUNTERS) {
+    if (report[key] !== undefined && !(Number.isInteger(report[key]) && report[key] >= 0)) {
+      return fail(`report ${key} must be a non-negative integer`);
+    }
+  }
+  if (report.success !== undefined && typeof report.success !== 'boolean') return fail('report success must be a boolean');
+  if (report.numPendingTests > 0) return fail('report declares pending (never-run) tests — the run is incomplete');
+  const seen = new Set();
+  let failedSuites = 0;
+  let assertionTotal = 0;
+  let assertionFailed = 0;
+  let allHaveAssertions = true;
+  for (const [index, entry] of report.testResults.entries()) {
+    const at = `test result ${index}`;
+    if (!isObject(entry) || typeof entry.name !== 'string' || typeof entry.status !== 'string') {
+      return fail(`${at}: every test result must have a string name and status`);
+    }
+    const { name, status } = entry;
+    if (name.trim() === '' || name !== name.trim()) return fail(`${at}: suite name is blank or padded`);
+    if (hasUnsafeNameChar(name)) return fail(`${at}: suite name contains control, separator or invisible characters`);
+    if (name !== name.normalize('NFKC')) return fail(`${at}: suite name is not NFKC-normalized`);
+    if (isAbsoluteName(name) && !name.startsWith(`${ROOT}/`)) return fail(`${at}: suite name is outside this checkout`);
+    const relative = suiteRelPath(name);
+    if (relative === '' || relative === '.') return fail(`${at}: suite name normalizes to an empty path`);
+    const segments = relative.split('/');
+    if (segments.includes('..')) return fail(`${at}: suite name has a '..' segment`);
+    if (segments.includes('') || segments.includes('.')) return fail(`${at}: suite name has an empty or '.' segment`);
+    // Case-folded: the same file under two spellings is one suite on a case-insensitive file system.
+    const key = relative.toLowerCase();
+    if (seen.has(key)) return fail(`${at}: duplicate suite name`);
+    seen.add(key);
+    if (!SUITE_STATUSES.has(status)) return fail(`${at}: suite status must be 'passed' or 'failed'`);
+    if (status === 'failed') failedSuites += 1;
+    if (entry.assertionResults === undefined) allHaveAssertions = false;
+    else {
+      if (!Array.isArray(entry.assertionResults)) return fail(`${at}: assertionResults must be an array`);
+      for (const assertion of entry.assertionResults) {
+        if (!isObject(assertion) || typeof assertion.status !== 'string') {
+          return fail(`${at}: every assertion must have a string status`);
+        }
+        if (assertion.status === 'pending') return fail(`${at}: an assertion never ran (pending) — the run is incomplete`);
+        if (!ASSERTION_STATUSES.has(assertion.status)) return fail(`${at}: every assertion must have a known status`);
+      }
+      const failedHere = entry.assertionResults.filter((a) => a.status === 'failed').length;
+      if (status === 'passed' && failedHere > 0) return fail(`${at}: a passed suite reports a failed assertion`);
+      assertionTotal += entry.assertionResults.length;
+      assertionFailed += failedHere;
+    }
+    const entryProblem = runtimeErrorProblem(entry);
+    if (entryProblem) return fail(`${at} ${entryProblem}`);
+  }
+  // Cross-check the reporter's own totals against the per-suite evidence (when it emitted them).
+  if (report.success === true && failedSuites > 0) return fail('report claims success but lists failed suites');
+  if (report.success === false && failedSuites === 0) {
+    return fail('report declares failure but no suite failed — errors outside the suites leave the run incomplete');
+  }
+  if (allHaveAssertions) {
+    if (report.numTotalTests !== undefined && report.numTotalTests !== assertionTotal) {
+      return fail('report numTotalTests does not match the listed assertions');
+    }
+    if (report.numFailedTests !== undefined && report.numFailedTests !== assertionFailed) {
+      return fail('report numFailedTests does not match the listed failed assertions');
+    }
+  }
+  return { ok: true, reason: null };
+}
+
 /** Normalize a path for set-membership: strip a leading `./`, collapse backslashes. Pure. */
 function normalizePath(p) {
   return String(p || '').replace(/\\/g, '/').replace(/^\.\//, '').trim();
@@ -544,7 +684,7 @@ function parseFlags(argv) {
 /** Every test-file name in a vitest `--reporter=json` output object (pass OR fail). Tolerant of shape drift. */
 function allFilesFromVitestJson(report) {
   if (!report || !Array.isArray(report.testResults)) return [];
-  return report.testResults.filter((f) => f.name).map((f) => normalizePath(String(f.name).replace(`${ROOT}/`, '')));
+  return report.testResults.filter((f) => f.name).map((f) => suiteRelPath(f.name));
 }
 
 /** The FAILING test-file list from a vitest `--reporter=json` output object. Tolerant of shape drift. */
@@ -553,7 +693,7 @@ function failedFilesFromVitestJson(report) {
   const out = [];
   for (const f of report.testResults) {
     const status = f.status || (Array.isArray(f.assertionResults) && f.assertionResults.some((a) => a.status === 'failed') ? 'failed' : 'passed');
-    if (status === 'failed' && f.name) out.push(normalizePath(String(f.name).replace(`${ROOT}/`, '')));
+    if (status === 'failed' && f.name) out.push(suiteRelPath(f.name));
   }
   return out;
 }
@@ -576,27 +716,43 @@ function vitestRelatedSelectedFiles(changedFiles) {
   } catch { /* a non-zero exit (e.g. a related test failed) still writes the report — read it below */ }
   const report = readJsonFile(out, null);
   try { rmSync(out, { force: true }); } catch { /* best-effort cleanup */ }
-  return report ? allFilesFromVitestJson(report) : null;
+  // A malformed related report returns null, so the caller falls back to the conservative approximation.
+  return report && validateVitestReport(report, { allowEmpty: true }).ok ? allFilesFromVitestJson(report) : null;
 }
 
 function runCli(argv) {
   const flags = parseFlags(argv);
   const base = typeof flags.base === 'string' ? flags.base : 'origin/main';
-  const decision = selectTests({ base, runGit: realGit, env: process.env });
+  const shadow = flags.measure && (process.env.WE_STATIC_EDGES_SHADOW || selectionFlagEnabled(process.env))
+    ? ({ changedFiles }) => shadowSelection({
+      changedFiles,
+      files: realGit(['ls-files', '-z']).split('\0').filter(Boolean),
+      readFile: (file) => readFileSync(resolve(ROOT, file), 'utf8'),
+    }) : undefined;
+  const decision = selectTests({ base, runGit: realGit, env: process.env, shadow });
 
   // --measure: run the shadow compare against a FULL-run vitest json report and record the false-green sample.
   // A false-green = a full-suite FAILURE that falls OUTSIDE what `vitest related` on the diff would have run.
   if (flags.measure) {
     const report = typeof flags['vitest-json'] === 'string' ? readJsonFile(flags['vitest-json'], null) : null;
-    const failedTestFiles = failedFilesFromVitestJson(report);
+    let validation = validateVitestReport(report);
+    // A caller-supplied `--selected-json` is evidence too: a malformed one would inflate or garble the selected
+    // set and hide escapes, so it invalidates the measurement rather than being silently replaced.
+    let selReport = null;
+    if (validation.ok && decision.mode === 'shrink' && typeof flags['selected-json'] === 'string') {
+      selReport = readJsonFile(flags['selected-json'], null);
+      const selValidation = validateVitestReport(selReport, { allowEmpty: true });
+      if (!selValidation.ok) validation = { ok: false, reason: `selected-json: ${selValidation.reason}` };
+    }
+    const hadReport = validation.ok;
+    const failedTestFiles = hadReport ? failedFilesFromVitestJson(report) : [];
     // The TRUE selected set is the TEST files `vitest related <changedFiles>` resolves — not the changed source
     // files. Prefer a caller-supplied `--selected-json` (a vitest-related report), else compute it here, else
     // fall back to the changed-file approximation (conservatively biased — it over-reports escapes, never under)
     // and flag it `approx`. Only meaningful for a SHRINK decision; a FULL decision covers everything (no escape).
     let selectedTestFiles = [];
     let approx = false;
-    if (decision.mode === 'shrink') {
-      const selReport = typeof flags['selected-json'] === 'string' ? readJsonFile(flags['selected-json'], null) : null;
+    if (hadReport && decision.mode === 'shrink') {
       if (selReport) selectedTestFiles = allFilesFromVitestJson(selReport);
       else {
         const computed = flags['no-related'] ? null : vitestRelatedSelectedFiles(decision.selectedFiles);
@@ -604,7 +760,14 @@ function runCli(argv) {
         else { selectedTestFiles = decision.selectedFiles; approx = true; }
       }
     }
-    const fg = assessFalseGreen({ failedTestFiles, selectedTestFiles, mode: decision.mode });
+    const fg = hadReport
+      ? assessFalseGreen({ failedTestFiles, selectedTestFiles, mode: decision.mode })
+      : { falseGreen: null, failedCount: null, escaped: null, selectedCount: selectedTestFiles.length, mode: decision.mode };
+    if (decision.shadow && !hadReport) decision.shadow.partial = true;
+    const shadowFields = decision.shadow ? {
+      shadow: decision.shadow,
+      shadowEscaped: hadReport ? [...new Set(failedTestFiles)].filter((file) => !decision.shadow.tests.includes(file)).sort() : null,
+    } : {};
     const sample = {
       at: new Date().toISOString(),
       mode: decision.mode,
@@ -614,12 +777,15 @@ function runCli(argv) {
       failedCount: fg.failedCount,
       falseGreen: fg.falseGreen,
       escaped: fg.escaped,
-      hadReport: report != null,
+      hadReport,
+      ...(!hadReport ? { status: 'report-invalid', reason: validation.reason } : {}),
+      ...shadowFields,
       approx, // true ⇒ selectedTestFiles is the changed-file approximation, not the real `vitest related` set
     };
     recordFalseGreen(sample);
-    writeAllSync(1, JSON.stringify({ decision, falseGreen: fg, recorded: sample }, null, 2) + '\n');
-    process.exit(0);
+    writeAllSync(1, JSON.stringify({ decision, falseGreen: fg, ...shadowFields, recorded: sample }, null, 2) + '\n');
+    process.exit(hadReport ? 0 : 1);
+    return;
   }
 
   // --decide (default): print the decision as JSON (CI / callers consume this).

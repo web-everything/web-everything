@@ -1186,6 +1186,21 @@ describe('capacity operator CLI declarations and real store wiring', () => {
       expect(rows).toHaveLength(2); expect(rows[1]).toMatchObject({ old: 7, new: null, reason: 'over', actor: 'on-call human', osUser: userInfo().username, source: 'operator-cli' });
     } finally { operatorFixture.file = undefined; vi.unstubAllEnvs(); rmSync(dir, { recursive: true, force: true }); }
   });
+  it('set accepts a declared enum value for an enum key and refuses text elsewhere', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'operator-cli-enum-'));
+    const file = join(dir, 'operator-overrides.json');
+    operatorFixture.file = file;
+    try {
+      const enumFlags = ['--key=ciHeal.loop', '--value=on', '--reason=enable child loop', '--actor=on-call human'];
+      expect((await invoke('operator-override-set', enumFlags)).code).toBe(0);
+      const enumFile = join(dir, 'operator-enum-overrides.json');
+      expect(JSON.parse(readFileSync(enumFile, 'utf8'))).toEqual({ 'ciHeal.loop': 'on' });
+      expect(existsSync(file)).toBe(false); // the numeric capacity store never holds an enum row
+      expect((await invoke('operator-override-set', enumFlags.map(f => f.startsWith('--value=') ? '--value=maybe' : f))).code).not.toBe(0);
+      expect((await invoke('operator-override-set', flags.map(f => f.startsWith('--value=') ? '--value=on' : f))).code).not.toBe(0);
+      expect(JSON.parse(readFileSync(enumFile, 'utf8'))).toEqual({ 'ciHeal.loop': 'on' });
+    } finally { operatorFixture.file = undefined; vi.unstubAllEnvs(); rmSync(dir, { recursive: true, force: true }); }
+  });
   it.each([
     ['reason', ''], ['reason', '   '], ['actor', ''], ['actor', '   '],
     ['key', 'mergeQueue.refreshOnStaleMergeGate'], ['value', '0'], ['value', '17'], // 17: just past the 1..16 range
