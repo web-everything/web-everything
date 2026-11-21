@@ -61,7 +61,7 @@ it('allows an existing relative directory origin for scratch fetch and remoteTip
     .toMatchObject({ ok: true, contained: false, newTip: f.tip });
 });
 
-describe('scratch proof rejects inherited renormalization', () => {
+describe('scratch and remote-tip proofs isolate inherited Git environment', () => {
   const clean = "sed 's/.*/GOOD/'";
   it.each(['parameters', 'indexed'])('%s config cannot fabricate contentInMain', (source) => {
     const f = fixture();
@@ -76,25 +76,40 @@ describe('scratch proof rejects inherited renormalization', () => {
       return { code: r.status, stdout: r.stdout };
     };
     expect(carriedBeyondMain({ git: rawGit, ref: 'lane/test' })).toMatchObject({ ok: true, contentInMain: true });
+    const scrubbedKeys = ['GIT_TEMPLATE_DIR', 'GIT_SSH_COMMAND', 'GIT_SSH', 'GIT_REPLACE_REF_BASE'];
+    Object.assign(env, Object.fromEntries(scrubbedKeys.map(key => [key, 'inherited-untrusted-value'])),
+      { GIT_NO_REPLACE_OBJECTS: '0' });
     const scratchCalls = [];
     const run = (cmd, args, opts) => {
-      if (opts.cwd !== f.root) scratchCalls.push({ args, env: opts.env });
+      if (opts.cwd !== f.root || args.includes('ls-remote')) scratchCalls.push({ args, env: opts.env });
       if (cmd === 'gh') return { status: 1, stdout: '' };
       return spawnSync(cmd, args, opts);
     };
     const result = proveRetirement({ root: f.root, entry: { ref: 'lane/test' }, env, run });
     expect(result).toMatchObject({ action: 'keep', evidence: { contentInMain: false } });
+    expect(remoteTip({ root: f.root, ref: 'lane/test', env, run })).toBe(f.tip);
     expect(scratchCalls.length).toBeGreaterThan(0);
     for (const call of scratchCalls) {
       expect(Object.keys(call.env).filter(k => /^GIT_CONFIG_(PARAMETERS|COUNT|KEY_.*|VALUE_.*)$/.test(k))).toEqual([]);
+      for (const key of scrubbedKeys) expect(call.env, key).not.toHaveProperty(key);
+      expect(call.env.GIT_NO_REPLACE_OBJECTS).toBe('1');
     }
+    for (const command of ['init', 'fetch', 'merge-tree', 'ls-remote'])
+      expect(scratchCalls.some(call => call.args.includes(command)), command).toBe(true);
+    expect(scratchCalls.find(call => call.args.includes('init')).args).toContain('--template=');
     expect(scratchCalls.find(c => c.args.includes('merge-tree')).args.slice(0, 2))
       .toEqual(['-c', 'merge.renormalize=false']);
   });
 });
 
-it.each(['https://example.test/repo.git', 'ssh://example.test/repo.git', 'ext::sh', 'file:///missing', 'missing', 'file.txt'])
-  ('pins transport and object checks on fetch and ls-remote: %s', origin => {
+it.each([
+  ['https://example.test/repo.git', 'https'], ['ssh://example.test/repo.git', 'ssh'],
+  ['git@example.test:repo.git', 'ssh'], ['example.test:repo.git', 'ssh'], ['.', 'file'],
+  ['ext::sh', null], ['file:///missing', null], ['missing', null], ['file.txt', null],
+  ['http://example.test/repo.git', null], ['git://example.test/repo.git', null],
+  ['unknown://example.test/repo.git', null], ['', null],
+])
+  ('allows only the origin transport and pins object checks on fetch and ls-remote: %s', (origin, allowed) => {
     const f = fixture();
     writeFileSync(join(f.root, 'file.txt'), 'ordinary file');
     const calls = [];
@@ -113,8 +128,11 @@ it.each(['https://example.test/repo.git', 'ssh://example.test/repo.git', 'ext::s
     const transports = calls.filter(args => args.includes('fetch') || args.includes('ls-remote'));
     expect(transports).toHaveLength(2);
     for (const args of transports) {
-      for (const pin of ['protocol.allow=never', 'protocol.https.allow=always', 'protocol.ssh.allow=always',
-        'protocol.ext.allow=never', 'protocol.file.allow=never', 'transfer.fsckObjects=true',
+      expect(args.filter(arg => /^protocol\..*\.allow=always$/.test(arg)))
+        .toEqual(allowed ? [`protocol.${allowed}.allow=always`] : []);
+      for (const transport of ['https', 'http', 'git', 'ssh', 'ext', 'file'])
+        expect(args).toContain(`protocol.${transport}.allow=${transport === allowed ? 'always' : 'never'}`);
+      for (const pin of ['protocol.allow=never', 'transfer.fsckObjects=true',
         'fetch.fsckObjects=true', 'receive.fsckObjects=true']) expect(args).toContain(pin);
     }
   });

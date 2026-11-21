@@ -171,7 +171,7 @@ it('CLI re-proof fetches and passes the registered base for a redundant merge si
       evidence: { baseRef: REF, basePr: 42, baseTip: OTHER },
     });
     for (const [, args] of run.mock.calls.filter(([, args]) => args.includes('fetch'))) {
-      for (const pin of ['protocol.allow=never', 'protocol.https.allow=always', 'protocol.ssh.allow=always',
+      for (const pin of ['protocol.allow=never', 'protocol.https.allow=always', 'protocol.ssh.allow=never',
         'protocol.ext.allow=never', 'protocol.file.allow=never', 'transfer.fsckObjects=true',
         'fetch.fsckObjects=true', 'receive.fsckObjects=true']) expect(args).toContain(pin);
     }

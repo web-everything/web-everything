@@ -275,24 +275,33 @@ export async function stackAwareOverlayCheck({
   };
 }
 
+/** Isolate proof processes without changing the environment contract of shared lane helpers. */
+function scratchGitEnv(env) {
+  const out = scrubInheritedGitEnv(env);
+  for (const key of ['GIT_TEMPLATE_DIR', 'GIT_SSH_COMMAND', 'GIT_SSH', 'GIT_REPLACE_REF_BASE']) delete out[key];
+  return { ...out, GIT_NO_REPLACE_OBJECTS: '1' };
+}
+
 /** Explicit transport/integrity policy, including when scratch config ignores the host's defaults. */
 function scratchTransportArgs(root, url) {
-  let localDirectory = false;
+  let transport;
+  if (/^https:\/\//i.test(url)) transport = 'https';
+  else if (/^ssh:\/\//i.test(url) || /^(?:[^/@:\s]+@)?[^/:\s]+:(?![:/]).+$/.test(url)) transport = 'ssh';
   // A URL (including ext:: and file://) is never the local-path exception.
-  if (url && !/^[a-z][a-z0-9+.-]*:|^[^/]*:/i.test(url)) {
-    try { localDirectory = statSync(resolve(root, url)).isDirectory(); } catch { /* deny file transport */ }
+  else if (url && !/^[a-z][a-z0-9+.-]*:|^[^/]*:/i.test(url)) {
+    try { if (statSync(resolve(root, url)).isDirectory()) transport = 'file'; } catch { /* deny file transport */ }
   }
   return [
-    '-c', 'protocol.allow=never', '-c', 'protocol.https.allow=always',
-    '-c', 'protocol.ssh.allow=always', '-c', 'protocol.ext.allow=never',
-    '-c', `protocol.file.allow=${localDirectory ? 'always' : 'never'}`,
+    '-c', 'protocol.allow=never',
+    ...['https', 'http', 'git', 'ssh', 'ext', 'file'].flatMap(name =>
+      ['-c', `protocol.${name}.allow=${name === transport ? 'always' : 'never'}`]),
     '-c', 'transfer.fsckObjects=true', '-c', 'fetch.fsckObjects=true', '-c', 'receive.fsckObjects=true',
   ];
 }
 
 /** `git ls-remote` tip of `refs/heads/<ref>` on root's origin: a sha, `null` when the ref is absent, `undefined` when unreadable. */
 export function remoteTip({ root, ref, env = process.env, run = spawnSync }) {
-  const opts = { cwd: root, encoding: 'utf8', timeout: 30_000, env: { ...env, GIT_OPTIONAL_LOCKS: '0' } };
+  const opts = { cwd: root, encoding: 'utf8', timeout: 30_000, env: { ...scratchGitEnv(env), GIT_OPTIONAL_LOCKS: '0' } };
   const url = run('git', ['-C', root, 'remote', 'get-url', 'origin'], opts);
   if (url?.status !== 0) return undefined;
   const origin = String(url.stdout).trim();
@@ -304,7 +313,7 @@ export function remoteTip({ root, ref, env = process.env, run = spawnSync }) {
 
 /** Run `fn(git, scratch)` in a scratch bare repo that borrows root's objects and fetches `refspecs` from root's origin. */
 function withScratchFetch({ root, refspecs, optionalRefspecs = [], env, run, prefix }, fn) {
-  const opts = (cwd) => ({ cwd, encoding: 'utf8', timeout: 120_000, env: { ...(cwd === root ? env : scrubInheritedGitEnv(env)), GIT_OPTIONAL_LOCKS: '0',
+  const opts = (cwd) => ({ cwd, encoding: 'utf8', timeout: 120_000, env: { ...(cwd === root ? env : scratchGitEnv(env)), GIT_OPTIONAL_LOCKS: '0',
     ...(cwd !== root ? { GIT_CONFIG_GLOBAL: devNull, GIT_CONFIG_SYSTEM: devNull, GIT_CONFIG_NOSYSTEM: '1' } : {}),
   } });
   const url = run('git', ['-C', root, 'remote', 'get-url', 'origin'], opts(root));
@@ -315,7 +324,7 @@ function withScratchFetch({ root, refspecs, optionalRefspecs = [], env, run, pre
   const fetchOrigin = transport.includes('protocol.file.allow=always') ? resolve(root, origin) : origin;
   const scratch = mkdtempSync(join(tmpdir(), prefix));
   try {
-    if (run('git', ['init', '--bare', '-q', scratch], opts(scratch))?.status !== 0) return { ok: false, reason: 'scratch-init-failed' };
+    if (run('git', ['init', '--bare', '--template=', '-q', scratch], opts(scratch))?.status !== 0) return { ok: false, reason: 'scratch-init-failed' };
     mkdirSync(join(scratch, 'objects', 'info'), { recursive: true });
     writeFileSync(join(scratch, 'objects', 'info', 'alternates'), `${join(String(common.stdout).trim(), 'objects')}\n`, 'utf8');
     const fetched = run('git', [...transport, 'fetch', '--no-tags', '-q', fetchOrigin, ...refspecs], opts(scratch));
