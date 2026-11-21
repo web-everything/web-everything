@@ -4428,6 +4428,9 @@ mutation enters handled-ID state. Run these and the affected lock/self-sync regr
 circular dependencies: starting them together with `Promise.all` deadlocks vite-node evaluation
 before adapter construction. Keep the portable IO cases in `pr-live-owner-watch.test.mjs` at the
 default timeout; injected dispatchers and lock identity probes keep their exercised IO local.
+The fixture statically imports the real review-job module during collection and supplies it through
+`loadReviewJob`. Keep that cyclic graph out of per-test dynamic loading; the head-change cases reuse
+the same module and still exercise the production dispatchers with a fake job spawner.
 
 Stalled living owners escalate to a rate-limited NEEDS-YOU event; activity age never proves death
 or permits claim takeover. The portable IO regressions exercise production evidence, planning,
