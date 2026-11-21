@@ -29,11 +29,14 @@
 import { readFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { isTrustedMarkerAuthor } from '../lib/marker-authorship.mjs';
 import { isGithubStacked, stackReviewWhileBaseOpen } from '../lib/stack-review-while-open.mjs';
 
 export const DRAFT_PROMOTION_ENV = Object.freeze({ loop: 'WE_DRAFT_PROMOTION_LOOP', intervalSeconds: 'WE_DRAFT_PROMOTION_INTERVAL_SECONDS' });
 export const DRAFT_PROMOTION_DEFAULTS = Object.freeze({ loop: false, intervalSeconds: 60 });
 export const WITHDRAWN_LABEL = 'review-status:draft-withdrawn';
+export const OPERATOR_PARK_MARKER = '<!-- operator-park -->';
+export const OPERATOR_PARK_RELEASE_MARKER = '<!-- operator-park-release -->';
 export const AGENT_HEAD_PREFIX = 'lane/';
 const MIN_INTERVAL_SECONDS = 15;
 
@@ -65,6 +68,17 @@ export function resolveDraftPromotionSettings(env = process.env, { path = draftP
 
 const labelNames = (labels) => (Array.isArray(labels) ? labels : []).map((l) => (typeof l === 'string' ? l : l?.name)).filter(Boolean);
 
+/** PURE. The last exact first-line park/release marker in comment order wins. */
+export function isOperatorParked(comments) {
+  let parked = false;
+  for (const comment of (Array.isArray(comments) ? comments : []).filter(isTrustedMarkerAuthor)) {
+    const firstLine = String(comment?.body ?? '').split(/\r?\n/, 1)[0].trim();
+    if (firstLine === OPERATOR_PARK_MARKER) parked = true;
+    else if (firstLine === OPERATOR_PARK_RELEASE_MARKER) parked = false;
+  }
+  return parked;
+}
+
 /**
  * PURE. Is this PR owed `gh pr ready` right now?
  * @param {{pr?:{state?:string, isDraft?:boolean, headRefName?:string, headRefOid?:string, labels?:Array},
@@ -83,6 +97,7 @@ export function isDraftOwedPromotion({ pr = {}, checks = null, reviewWhileBaseOp
   if (pr?.isCrossRepository === true) return { owed: false, why: 'cross-repository (fork) branch — a lane/ prefix there is not agent authorship' };
   if (!String(pr?.headRefName ?? '').startsWith(AGENT_HEAD_PREFIX)) return { owed: false, why: 'not an agent lane branch (draft-first covers lane/* only)' };
   if (labelNames(pr?.labels).includes(WITHDRAWN_LABEL)) return { owed: false, why: 'draft is withdrawn — explicit release is required before promotion' };
+  if (isOperatorParked(pr.comments)) return { owed: false, reason: 'operator-parked', why: 'draft PR is operator-parked — explicit release is required before promotion' };
   const redTeamHold = labelNames(pr?.labels).find(label => ['red-team:blocked', 'red-team:pending'].includes(label));
   if (redTeamHold) return { owed: false, why: `${redTeamHold} — a draft held by red team is never promoted` };
   const stacked = isGithubStacked(pr, defaultBranch);

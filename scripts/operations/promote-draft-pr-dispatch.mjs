@@ -68,6 +68,8 @@ import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { createDraftPromoteProvider } from '../lib/draft-promote-provider.mjs';
 import { runReconcilePass } from '../conveyor/reconcile-pass.mjs';
+import { isOperatorParked } from '../conveyor/draft-promotion-rule.mjs';
+import { readCompletePrComments } from '../conveyor/pr-comments-complete.mjs';
 import { reviewHoldOnlyRed } from '../conveyor/reconcile-core.mjs';
 import { readPrsFromFile } from '../conveyor/open-pr-fetch.mjs';
 import { runGhSync } from '../lib/gh-throttle.mjs';
@@ -278,6 +280,7 @@ export function runReconcilePromoteDraftDispatch({
   // read says red/pending) with no `gh` on PATH. Defaults to the real `gh api commits/<sha>/check-runs` read.
   readHeadCheckState = defaultReadHeadCheckState,
   readPrLabels = defaultReadPrLabels,
+  readComments = readCompletePrComments,
   // #3902 — strips `ready-to-merge` when the STUCK restore variant applies its review hold.
   removeLabel = defaultRemoveLabel,
   // #2811/#2821 follow-up — clear the now-stale `review-status:awaiting-ci` / `review-status:awaiting-base` label the INSTANT a draft promotes,
@@ -414,6 +417,23 @@ export function runReconcilePromoteDraftDispatch({
     }
     const refusal = assertCapability(repoSlug, 'review', { resolveProfile });
     if (refusal) { refusals.push({ pr: entry.prNumber, ...refusal }); continue; }
+    // Refresh the complete thread after planning and slow reads; absent evidence never clears a park.
+    let comments;
+    try {
+      comments = readComments(entry.prNumber, { repo: repoSlug });
+      if (!Array.isArray(comments)) throw new Error('PR comments must be an array');
+    } catch (e) {
+      refusals.push({
+        pr: entry.prNumber, kind: 'draft-state-unreadable', headSha: sha,
+        why: `could not read operator park comments before promoting; retry next tick: ${String(e?.message ?? e).split('\n')[0]}`,
+      });
+      continue;
+    }
+    if (isOperatorParked(comments)) {
+      refusals.push({ pr: entry.prNumber, kind: 'operator-parked', headSha: sha,
+        why: 'draft PR is operator-parked — explicit release is required before promotion' });
+      continue;
+    }
     try {
       ghProvider.ready(entry.prNumber);
       dispatched.push({ pr: entry.prNumber, kind: 'promote-draft', ...(stacked ? { stackedOn: entry.baseRefName } : {}) });
