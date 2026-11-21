@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { mkdtempSync, readdirSync, readFileSync, rmSync, statSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync } from 'node:fs';
 import { join } from 'node:path';
 import * as drain from '../merge-ai-prs.mjs';
 import * as procedure from '../conveyor/fix-procedure.mjs';
@@ -198,6 +198,9 @@ describe('main prestage dispatch-claim lock wiring', () => {
     await world(async ({ pr: candidate, run, coord }) => {
       vi.spyOn(Date, 'now').mockReturnValue(NOW);
       root = join(coord, 'fix-dispatch-claims');
+      // A healthy, empty claim store: a missing store is an uncertain hold by design (store-missing), which would
+      // stop main at the prestage read — before the post-read acquisition this test is about.
+      mkdirSync(root, { recursive: true });
       // Populate the cache through main while CI is pending, with no claim.
       const prepared = await run();
       expect(prepared.stderr).toContain('eligible=true');
