@@ -91,6 +91,7 @@ export const NON_GATE_CALLS = Object.freeze({
 
 /** Skip kinds that are not a gate. */
 export const NON_GATE_SKIP_KINDS = Object.freeze({
+  'claim-held': 'S6a-1 diagnostic only: no drain caller yet; classify the live claim gate when S6a-2 wires it (card 5745)',
   'merge-failed': 'the merge write itself failed (GitHub reports a failed queue merge)',
 });
 
