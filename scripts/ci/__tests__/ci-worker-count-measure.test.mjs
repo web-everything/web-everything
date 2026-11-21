@@ -8,7 +8,10 @@ import yaml from 'js-yaml';
 
 const { jobs } = yaml.load(readFileSync(resolve(process.cwd(), '.github/workflows/ci.yml'), 'utf8'));
 // R1104 / PR #7202 Acceptance 2: independent of the workflow and urgent-verify mirror.
-const ACCEPTED_CI_WORKER_DEFAULT = 4;
+// Main CI at 86b2d784d: a default of 4 workers on the shard runners made ~25 tests hit the 5 s
+// vitest timeout across 4 shards, so the accepted default stays at 2 until the A/B measurement
+// (vars.WE_VITEST_MAX_WORKERS) proves a higher value.
+const ACCEPTED_CI_WORKER_DEFAULT = 2;
 
 // Execute the workflow's actual shell, including bash's CI error policy. Proc metadata is
 // redirected to fixtures; discovered memory.peak paths are read from the real filesystem.
