@@ -1,8 +1,9 @@
 // @vitest-environment node
 import { mkdtempSync, rmSync, writeFileSync, existsSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
-import { homedir } from 'node:os';
+import { homedir, tmpdir } from 'node:os';
 import { describe, expect, it, vi } from 'vitest';
+import { createDrainMergeStrategy } from '../drain-merge-strategy.mjs';
 import * as queueSafety from '../drain-queue-safety.mjs';
 import { assertCapability } from '../repo-profile.mjs';
 import { readDrainQueueSafety, redTeamEnqueueHold, dequeueSentBack, sendBackReason, decideMqSameHead, readMqTimeline, mqSameHeadGuard, createMqSameHeadRefreshStore, createMqSameHeadRefreshOptions, mqSameHeadRefreshStatePath } from '../drain-queue-safety.mjs';
@@ -152,9 +153,9 @@ describe('merge-queue same-head failure admission', () => {
           if (args.some(a => a.includes('lastEditedAt'))) return JSON.stringify({ data: { repository: { pullRequest: {
             comments: { nodes: [], pageInfo: { hasNextPage: false } },
           } } } });
-          if (args.includes('--paginate')) return `<!-- reviewed-sha: ${outcome === 'workflow hold' ? prior : head} -->\\n<!-- cleared-human: operator -->\t2026-11-01T12:00:00Z\tchalbert\tIC_fixture\thttps://example.test/comment\n`;
+          if (args.includes('--paginate')) return `<!-- reviewed-sha: ${outcome === 'workflow hold' ? prior : head} -->\\n<!-- cleared-human: operator -->\t2026-11-01T12:00:00Z\tchalbert\tIC_fixture\thttps://example.test/comment\n` + (outcome === 'red-team hold' ? '' : `${redTeamMarker(pr, head)}\\nRed team not required on this head: card-only diff.\t2026-11-01T12:01:00Z\tweb-everything\tIC_proof\thttps://example.test/proof\n`);
           if (args.some(a => a.includes('comments{totalCount}'))) return JSON.stringify({
-            data: { repository: { pullRequest: { comments: { totalCount: 1 } } } },
+            data: { repository: { pullRequest: { comments: { totalCount: outcome === 'red-team hold' ? 1 : 2 } } } },
           });
           return original(file, args, opts);
         });
@@ -1836,19 +1837,19 @@ describe('durable head-bound red-team admission', () => {
     const findings = [{ ...broken[0], category: 'security', impactIfUnfixed }];
     expect(hold({ comments: [clean(head, 'web-everything', findings)] })).toMatch(/requiring send-back/);
   });
-  it.each(['WE_REVIEW_RED_TEAM', 'WE_REVIEW_EXTRA_SEATS'])('does not owe a pass with %s off', key => {
-    expect(hold({ scheduled: false, env: { [key]: '0' } })).toBeNull();
+  it.each(['WE_REVIEW_RED_TEAM', 'WE_REVIEW_EXTRA_SEATS'])('does not owe a pass with %s off but still requires proof', key => {
+    expect(hold({ scheduled: false, env: { [key]: '0' }, comments: [clean()] })).toBeNull();
     expect(hold({ scheduled: true, env: { [key]: '0' } })).toMatch(/no recorded result/);
   });
   it.each([5439, 5443])('labels alone do not schedule a red team for #%s', pr => {
-    expect(hold({ pr, loopPayload: null, labels: ['review:accepted', 'ready-to-merge'] })).toBeNull();
-    expect(hold({ pr, loopPayload: { verdict: { verdict: 'needs-human' } } })).toBeNull();
+    expect(hold({ pr, loopPayload: null, labels: ['review:accepted', 'ready-to-merge'], comments: [policyClear(pr)] })).toBeNull();
+    expect(hold({ pr, loopPayload: { verdict: { verdict: 'needs-human' } }, comments: [policyClear(pr)] })).toBeNull();
   });
-  it('does not owe a pass without a panel accept', () => expect(hold({ loopPayload: null, labels: ['ready-to-merge'] })).toBeNull());
+  it('allows without a panel accept when live-head proof exists', () => expect(hold({ loopPayload: null, labels: ['ready-to-merge'], comments: [clean()] })).toBeNull());
   // PR #5482 red team: the card-only exemption ignored WE_RED_TEAM_SKIP_CARD_ONLY=false and a pass already running.
-  it('exempts a card-only head only while the producer skips it; a started pass is always awaited', () => {
+  it('requires producer proof for a card-only exemption; a started pass is always awaited', () => {
     const loopPayload = { verdict: { verdict: 'accept' }, findings: { read: { netChangedFiles: ['backlog/123-card.md'], netRenameSources: [] } } };
-    expect(hold({ loopPayload })).toBeNull();
+    expect(hold({ loopPayload, comments: [policyClear()] })).toBeNull();
     expect(hold({ loopPayload, env: { WE_RED_TEAM_SKIP_CARD_ONLY: 'false' } })).toMatch(/no recorded result/);
     expect(hold({ loopPayload, env: { WE_RED_TEAM_SKIP_CARD_ONLY: 'false' }, inFlight: true })).toMatch(/no recorded result/);
     expect(hold({ loopPayload, scheduled: false, inFlight: true })).toMatch(/no recorded result/);
@@ -1999,4 +2000,115 @@ describe('confirmed dequeue', () => {
     expect(sendBackReason([])).toContain('ready-to-merge');
     expect(sendBackReason(['review:accepted', 'ready-to-merge'])).toBeNull();
   });
+});
+
+// A0: synthetic #7289 thread, including the refused carry that posted no live-head proof.
+const pr7289 = JSON.parse(readFileSync(new URL('./fixtures/pr7289-red-team.json', import.meta.url), 'utf8'));
+const policyClear = (pr = 5283, rev = head, login = 'web-everything') => ({ author: { login },
+  body: `${redTeamMarker(pr, rev)}\nRed team not required on this head: card-only diff.` });
+
+function a0Queue({ comments = pr7289.comments, liveHead = pr7289.head, labels = pr7289.labels } = {}) {
+  const repo = 'example/project', logs = [], calls = [];
+  let queued = true;
+  const exec = (_cmd, args) => {
+    calls.push(args);
+    if (args.includes('--slurp')) {
+      if (comments instanceof Error) throw comments;
+      return JSON.stringify(comments === null ? {} : [comments]);
+    }
+    if (args.some(a => a.includes('mergeQueue(branch:'))) return JSON.stringify({ data: { repository: { mergeQueue: { entries: {
+      nodes: queued ? [{ pullRequest: { id: 'PR7289', number: 7289 } }] : [], pageInfo: { hasNextPage: false },
+    } } } } });
+    if (args.some(a => a.includes('isInMergeQueue'))) return JSON.stringify({ data: { repository: { pullRequest: { isInMergeQueue: queued, headRefOid: liveHead } } } });
+    if (args.some(a => a.includes('dequeuePullRequest'))) { queued = false; return JSON.stringify({ data: { dequeuePullRequest: { clientMutationId: null } } }); }
+    if (args[0] === 'pr' && args[1] === 'view') return JSON.stringify({ state: 'OPEN', number: 7289, id: 'PR7289', labels, headRefOid: liveHead });
+    if (args[0] === 'pr' && args[1] === 'comment') return '';
+    throw new Error(`unexpected fixture call: ${args.join(' ')}`);
+  };
+  const strategy = createDrainMergeStrategy({ localSlug: repo, exec, env: { WE_UNDER_TEST: '1' },
+    resolved: { policy: { strategy: 'github-merge-queue' }, note: null },
+    queueSafety: { value: { dequeueOnSendBack: true, queueRebuildMax: 3 } },
+    statePath: join(tmpdir(), 'a0-hermetic-state.json'),
+    readFile: () => JSON.stringify({ pending: [{ repo, num: 7289, headSha: pr7289.earlierHead }], followedUp: [] }),
+    writeFile: () => {}, writeState: () => {}, cancelObsoleteRuns: () => {},
+    batching: { observe: () => ({}) }, log: { write: line => logs.push(line) },
+  });
+  return { strategy, logs, calls, queued: () => queued };
+}
+
+describe('A0 exact-head red-team clearance', () => {
+  it('pure proof accepts a completed review, policy-clear and sealed carry', () => {
+    for (const comment of [clean(), policyClear(), carry()])
+      expect(queueSafety.redTeamClearProof({ comments: [comment], pr: 5283, head })).toMatchObject({ ok: true });
+    expect(queueSafety.redTeamClearProof({ comments: [], pr: 5283, head })).toEqual({ ok: false, reason: 'unknown(missing)' });
+  });
+  const replay = over => redTeamEnqueueHold({ ...pr7289, scheduled: false, env: {}, ...over });
+  it('holds merge when red-team:clear was removed and the carry was refused', () => {
+    expect(replay()).toContain('unknown(missing)');
+  });
+  it('untrusted-login policy-clear is not proof', () => {
+    expect(hold({ scheduled: false, comments: [policyClear(5283, head, 'attacker')] })).toContain('unknown(missing)');
+  });
+  it('equal timestamps later index wins', () => {
+    const timestamp = '2026-11-21T10:00:00Z';
+    const complete = { ...policyClear(), created_at: timestamp };
+    const incomplete = { ...bot, created_at: timestamp, body: redTeamMarker(5283, head) };
+    expect(hold({ scheduled: false, comments: [complete, incomplete] })).toContain('unknown(missing)');
+    expect(hold({ scheduled: false, comments: [incomplete, complete] })).toBeNull();
+  });
+  it('proof for old head with live head new holds', () => {
+    expect(hold({ scheduled: false, comments: [clean(prior)] })).toContain('unknown(missing)');
+  });
+  it('carry naming another PR holds', () => {
+    const foreign = { ...carry(), body: carry().body.replaceAll('pr=5283', 'pr=9999') };
+    expect(hold({ scheduled: false, comments: [foreign] })).toContain('unknown(missing)');
+  });
+  it('card-only review read cannot exempt a live head without producer policy-clear', () => {
+    expect(replay({ comments: [] })).toContain('unknown(missing)');
+    expect(replay({ comments: [policyClear(7289, pr7289.head)] })).toBeNull();
+  });
+  it.each([null, undefined, {}, new Error('unreadable')])('unreadable thread holds: %s', comments => {
+    expect(hold({ scheduled: false, comments })).toContain('unknown(missing)');
+  });
+  it('throwing thread holds', () => {
+    const comment = { get body() { throw new Error('unreadable'); }, ...bot };
+    expect(hold({ scheduled: false, comments: [comment] })).toContain('unknown(missing)');
+  });
+  it.each(['sweep', 'follow-up'])('dequeues a queued PR whose head has no red-team proof (%s)', path => {
+    const f = a0Queue();
+    if (path === 'sweep') f.strategy.dequeueSendBacks([{ number: 7289, labels: pr7289.labels }]);
+    else f.strategy.collectQueueMerged({ merged: [], landedThisPass: new Set() });
+    expect(f.queued()).toBe(false);
+    expect(f.logs.join('')).toContain('unknown(missing)');
+  });
+  it.each(['sweep', 'follow-up'])('unreadable thread dequeues (%s)', path => {
+    for (const comments of [new Error('offline'), null]) {
+      const f = a0Queue({ comments });
+      if (path === 'sweep') f.strategy.dequeueSendBacks([{ number: 7289, labels: pr7289.labels }]);
+      else f.strategy.collectQueueMerged({ merged: [], landedThisPass: new Set() });
+      expect(f.queued()).toBe(false);
+      expect(f.logs.join('')).toContain('unknown(missing)');
+    }
+  });
+  it.each(['sweep', 'follow-up'])('keeps a queued PR with trusted live-head proof (%s)', path => {
+    const f = a0Queue({ comments: [policyClear(7289, pr7289.head)] });
+    if (path === 'sweep') f.strategy.dequeueSendBacks([{ number: 7289, labels: pr7289.labels }]);
+    else f.strategy.collectQueueMerged({ merged: [], landedThisPass: new Set() });
+    expect(f.queued()).toBe(true);
+  });
+});
+
+it.each(['sweep', 'follow-up'])('A0 queued clearance probe works with TMPDIR unset (%s)', path => {
+  const saved = process.env.TMPDIR;
+  delete process.env.TMPDIR;
+  try {
+    const f = a0Queue();
+    if (path === 'sweep') f.strategy.dequeueSendBacks([{ number: 7289, labels: pr7289.labels }]);
+    else f.strategy.collectQueueMerged({ merged: [], landedThisPass: new Set() });
+    expect(f.queued()).toBe(false);
+    expect(f.logs.join('')).toContain('unknown(missing)');
+  } finally {
+    if (saved === undefined) delete process.env.TMPDIR;
+    else process.env.TMPDIR = saved;
+  }
 });

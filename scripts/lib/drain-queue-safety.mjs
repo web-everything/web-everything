@@ -11,7 +11,7 @@ import { cascadePolicy, formatCascadeSourcesLine } from './policy-cascade.mjs';
 import { readSharedFreeze } from './red-main-freeze-shared.mjs';
 import { readSettings } from './settings-files.mjs';
 import { readMergeQueueState } from './merge-queue-enqueue.mjs';
-import { readRedTeamDisposition, readRedTeamProbes, redTeamHoldPendingOnly } from './red-team-gate.mjs';
+import { redTeamForHead, isPublishableRedTeamResult, readRedTeamDisposition, readRedTeamProbes, redTeamHoldPendingOnly } from './red-team-gate.mjs';
 import { readQuarantine } from './red-main-quarantine-io.mjs';
 import { activeEntries, parseVitestFailures, QUARANTINE_SAFETY_NET_DEFAULTS } from './red-main-quarantine.mjs';
 
@@ -1275,10 +1275,27 @@ export function postAcceptRedTeamOwed(loopPayload, env = process.env, evidence =
   return redTeamOwedOnHead({ read: loopPayload?.findings?.read, evidence, skipCardOnly: readRedTeamProbes({ env }).value.skipCardOnly });
 }
 
+/** Trusted, publishable evidence bound to this PR and exact live head. PURE; unreadable is absent proof. */
+export function redTeamClearProof({ comments, pr, head } = {}) {
+  try {
+    if (Array.isArray(comments)) {
+      const result = redTeamForHead(comments, pr, head);
+      if (isPublishableRedTeamResult(result)) return { ok: true, kind: result.policyClear ? 'policy-clear' : 'result' };
+    }
+  } catch { /* An unreadable thread never proves clearance. */ }
+  return { ok: false, reason: 'unknown(missing)' };
+}
+
+export const redTeamClearHoldReason = head => `post-accept red team unknown(missing) on ${String(head ?? '').slice(0, 12)}: no result, policy-clear or carry for this head; re-run the red team on the head`;
+
 export function redTeamEnqueueHold({ ok, reason, loopPayload, comments, pr, head, repo = null, standingRuling = null, env = process.env, confirmedBreaks, scheduled = false, inFlight = false, recorded = false, skipCardOnly } = {}) {
   // A recorded break still holds even if the scheduler is now disabled or the payload is unavailable.
   // `standingRuling`: the verified scope, so an automatic grant counts here exactly as in the gate (PR #5758).
-  const disposition = readRedTeamDisposition({ comments, pr, head, env, setting: confirmedBreaks, repo, standingRuling });
+  let disposition;
+  try {
+    if (!Array.isArray(comments)) return redTeamClearHoldReason(head);
+    disposition = readRedTeamDisposition({ comments, pr, head, env, setting: confirmedBreaks, repo, standingRuling });
+  } catch { return redTeamClearHoldReason(head); }
   // A hold that is only "publication pending" (PR #6622) is no break: it still holds, but after the unknown-evidence
   // reason, so a capped scan is reported as such.
   const pendingOnly = redTeamHoldPendingOnly(disposition);
@@ -1288,7 +1305,9 @@ export function redTeamEnqueueHold({ ok, reason, loopPayload, comments, pr, head
   // comment cannot release it either.
   if (ok === false) return `post-accept red team evidence unknown (${reason}); hold and inspect run evidence`;
   if (pendingOnly) return 'post-accept red team result is not published yet (stored evidence not sealed); hold until the sweep publishes it';
-  if (!postAcceptRedTeamOwed(loopPayload, env, { scheduled, inFlight, recorded, skipCardOnly }) || disposition.result) return null;
+  if (isPublishableRedTeamResult(disposition.result)) return null;
+  if (!postAcceptRedTeamOwed(loopPayload, env, { scheduled, inFlight, recorded, skipCardOnly }))
+    return redTeamClearProof({ comments, pr, head }).ok ? null : redTeamClearHoldReason(head);
   return 'post-accept red team has no recorded result on the live head';
 }
 

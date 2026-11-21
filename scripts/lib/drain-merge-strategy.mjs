@@ -41,7 +41,7 @@ import { resolveApprovalLicensesEnqueue, proveHumanOnlyLicense } from './human-o
 import { labelSignature } from './drain-prestage.mjs';
 import { readRedTeamGateSource, readRedTeamCheckFact, resolveWeAppId } from './red-team-check-run.mjs';
 import { readRedTeamPublicationHold, readDrainRedTeamEvidence, settleUnknownEvidenceByComment } from './drain-red-team-evidence.mjs';
-import { readDrainQueueSafety, redTeamEnqueueHold, redTeamLabelHoldReason, dequeueSentBack, sendBackReason, queueLabels } from './drain-queue-safety.mjs';
+import { readDrainQueueSafety, redTeamClearProof, redTeamClearHoldReason, redTeamEnqueueHold, redTeamLabelHoldReason, dequeueSentBack, sendBackReason, queueLabels } from './drain-queue-safety.mjs';
 import { readRedTeamDeadlineAction, RED_TEAM_DEADLINE_OVERRIDE } from './red-team-gate.mjs';
 import { publishAttention } from '../operations/needs-you-feed.mjs';
 import { isUnderTest } from './under-test.mjs';
@@ -366,6 +366,20 @@ export function createDrainMergeStrategy({
     const reason = sendBackReason(labels);
     if (reason) dequeueSentBack({ repo: slugOf(repo), pr: num, reason, exec, log: say });
   };
+  // Labels trigger the re-read; only a trusted, live-head record can supply the missing clearance.
+  const recheckQueued = (repo, num, live) => {
+    if (dryRun || !safety.value.dequeueOnSendBack) return;
+    const sentBack = Array.isArray(live?.labels) ? sendBackReason(live.labels) : null;
+    if (sentBack) return dequeueSentBack({ repo: slugOf(repo), pr: num, reason: sentBack, exec, log: say });
+    if (Array.isArray(live?.labels) && queueLabels(live.labels).includes('red-team:clear')) return;
+    let proof = false;
+    try {
+      const pages = readThreadPages(repo, num);
+      if (Array.isArray(pages) && pages.every(page => Array.isArray(page)))
+        proof = redTeamClearProof({ comments: pages.flat(), pr: num, head: live?.headRefOid }).ok;
+    } catch { /* Unknown complete thread means dequeue, with the same operator fallback as admission. */ }
+    if (!proof) dequeueSentBack({ repo: slugOf(repo), pr: num, reason: redTeamClearHoldReason(live?.headRefOid), exec, log: say });
+  };
   const enqueueMode = mergeActionFor(policy) === 'enqueue';
   const adaptiveBatching = () => batching ??= createAdaptiveBatching({ repo: localSlug, exec, dryRun, log: say });
   const enqueues = (repo) => enqueueMode && !!isLocalRepo(repo);
@@ -381,7 +395,7 @@ export function createDrainMergeStrategy({
     /** Live open rows are unfiltered by ready-to-merge; also covers entries not in our follow-up file. */
     dequeueSendBacks(rows = [], repo = null) {
       if (dryRun || !enqueueMode || !safety.value.dequeueOnSendBack || !isLocalRepo(repo)) return;
-      const candidates = rows.filter(row => Array.isArray(row.labels) && sendBackReason(row.labels));
+      const candidates = rows.filter(row => !Array.isArray(row.labels) || sendBackReason(row.labels) || !queueLabels(row.labels).includes('red-team:clear'));
       // Discover membership once, before any per-PR read. An incomplete discovery retries next pass;
       // never replace it with an API sweep of every non-ready open PR.
       const queue = candidates.length ? readQueueFacts({ repo: slugOf(repo), exec: (cmd, args, opts) => exec(cmd, args, { ...opts, timeout: 60_000 }) }) : null;
@@ -395,7 +409,10 @@ export function createDrainMergeStrategy({
       if (queue && !queue.entries.length) return;
       for (const row of candidates) {
         if (!queue.inQueue.has(Number(row.number))) continue;
-        try { removeSentBack(repo, row.number, readLive(repo, row.number).labels); }
+        let live;
+        try { live = readLive(repo, row.number); }
+        catch { live = null; }
+        try { recheckQueued(repo, row.number, live); }
         catch (e) { say(`  ⚠ merge-queue dequeue #${row.number} failed (${firstLine(e)}) — retried next pass`); }
       }
     },
@@ -539,7 +556,7 @@ export function createDrainMergeStrategy({
           if (!outcome.healthSmell || reason.includes('requiring send-back')) return outcome;
           // Past the deadline with NO red-team result on this exact head. The PR stays HELD: it may move only on a
           // result for this head, a proven-identical carry of one, an operator ruling through the red-team ruling path
-          // (all read by redTeamEnqueueHold above), or a card-only diff that owes no pass. Never a timed bypass.
+          // (all read by redTeamEnqueueHold above), or a producer policy-clear for this head. Never a timed bypass.
           const maxMin = safety.value.redTeamPendingMaxMin ?? 45;
           const source = deadline.sources?.deadlineAction ?? 'standard';
           // Unknown run evidence (`ok:false`, e.g. a capped scan) is never "missing": a run may exist past the cap, so
@@ -776,10 +793,10 @@ export function createDrainMergeStrategy({
       const followedUpKeys = new Set(state.followedUp);
       for (const p of state.pending) {
         let v;
-        try { v = JSON.parse(exec('gh', ['pr', 'view', String(p.num), '--repo', slugOf(p.repo), '--json', 'number,state,mergedAt,mergeCommit,labels'], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }) || '{}'); }
+        try { v = JSON.parse(exec('gh', ['pr', 'view', String(p.num), '--repo', slugOf(p.repo), '--json', 'number,state,mergedAt,mergeCommit,labels,headRefOid'], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }) || '{}'); }
         catch (e) { say(`  ⚠ ${keyOf(p.repo, p.num)} queue follow-up read failed (${firstLine(e)}) — retried next pass`); continue; }
         if (v?.state === 'OPEN') {
-          try { removeSentBack(p.repo, p.num, v.labels); }
+          try { recheckQueued(p.repo, p.num, v); }
           catch (e) { say(`  ⚠ ${keyOf(p.repo, p.num)} dequeue failed (${firstLine(e)}) — retried next pass`); }
         }
         if (v?.state === 'MERGED') { if (followedUpKeys.has(keyOf(p.repo, p.num))) drop.add(keyOf(p.repo, p.num)); else facts.push({ p, v }); }
