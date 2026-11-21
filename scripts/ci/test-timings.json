@@ -2278,6 +2278,7 @@
   "scripts/conveyor/soak/breaks/red-team-stale-refusal-burns-start-slot.soak.test.mjs": 1.5,
   "scripts/conveyor/soak/breaks/red-team-stored-break-cleared-by-comment.soak.test.mjs": 1,
   "scripts/conveyor/soak/breaks/red-team-writer-no-app-token-orphan-hold.soak.test.mjs": 3,
+  "scripts/conveyor/soak/breaks/redteam-label-settles-from-check.soak.test.mjs": 2,
   "scripts/conveyor/soak/breaks/redteam-not-owed-after-confirm-accept.soak.test.mjs": 1,
   "scripts/conveyor/soak/breaks/redteam-pending-label-never-settles.soak.test.mjs": 2.02,
   "scripts/conveyor/soak/breaks/refresh-config-before-healing.soak.test.mjs": 0.01,
@@ -2369,7 +2370,8 @@
   "scripts/conveyor/soak/breaks/wip-cap-counts-worker-prs.soak.test.mjs": 0.01,
   "scripts/conveyor/soak/breaks/withdrawn-operator-block-directs-takeover.soak.test.mjs": 0.53,
   "scripts/conveyor/soak/breaks/worker-push-during-fix-claim.soak.test.mjs": 93.82,
-  "scripts/conveyor/soak/daemon-soak.soak.test.mjs": 450.96
+  "scripts/conveyor/soak/daemon-soak.soak.test.mjs": 450.96,
+  "scripts/lib/__tests__/red-team-label-settle.test.mjs": 1
  },
  "integration": {}
 }
