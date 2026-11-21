@@ -214,6 +214,8 @@ export async function runAutoRebase({ root, ref, token, env = process.env, deps 
   const reportFailure = error => reportNeedsYou({ root, env, ref, stage, error, io, event, now });
   try {
     if (!isSafeBranchName(ref)) throw new Error('unsafe ref');
+    // A hot patch is pinned to one sha: deriving `<ref>-auto-N` would re-register it without its receipt and audit.
+    if (ref.startsWith('hotpatch/')) throw new Error('hotpatch refs are never auto-rebased; human review required');
     if (token) {
       heartbeat = setInterval(() => {
         try {

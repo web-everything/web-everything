@@ -260,6 +260,10 @@ export function addOverlay(root, {
   if (!isSafeBranchName(ref)) {
     throw new TypeError(`daemon-overlays: ref ${JSON.stringify(ref)} is not a safe branch name — refusing to add it`);
   }
+  // Hot-patch side door (P8-a): a `hotpatch/` ref names exactly one sha; derived `-auto-N` or other suffixes never register.
+  if (ref.startsWith('hotpatch/') && !/^hotpatch\/[0-9a-f]{40}$/.test(ref)) {
+    throw new TypeError(`daemon-overlays: ref ${JSON.stringify(ref)} is not exactly hotpatch/<40-hex> — refusing to add it`);
+  }
   const bases = Array.isArray(stackBases) ? stackBases.filter((b) => isSafeBranchName(b)) : null;
   return withListLock(root, env, (pause) => {
     const list = readOverlaysForWrite(root, env).slice();
