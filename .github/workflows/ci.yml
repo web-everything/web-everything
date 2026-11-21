@@ -50,6 +50,14 @@ on:
   # and always runs the full soak (daemon-soak-scope: not a pull_request ⇒ run=true).
   merge_group:
   workflow_dispatch:
+  # Called only by ci-self.yml (manual dry run of a branch's own ci.yml). github.event_name stays the
+  # caller's `workflow_dispatch`, so the existing "manual dispatch runs the full suite" rules apply.
+  workflow_call:
+    secrets:
+      WE_APP_PRIVATE_KEY:
+        required: false
+      FUI_READ_TOKEN:
+        required: false
 
 concurrency:
   group: ci-${{ github.ref }}
@@ -403,29 +411,35 @@ jobs:
             exit 1
           fi
 
-  # Real-git integration suite as its OWN job, parallel with the shards (card 6, perf sweep 2026-10-07). It used
-  # to be the last step of `test`, which `needs: test-shard`, so its 5.8-8.4 min started only after every shard
-  # finished. It never used the shards' output (only the coverage merge does), so it now needs just `changes` and
-  # runs beside them: the critical path drops from shards + (merge + standards + integration) to
-  # max(shards + merge, standards, host-paths, integration).
-  #
-  # The real-git/real-subprocess tier `vitest.config.ts` excludes (see its `test.exclude` comment) is split out
-  # so `npm run test:unit` (and everything that shells it locally) no longer pays real git/subprocess cost per lane.
-  #
-  # Check names: `integration` is its own check and is meant to be REQUIRED in branch protection alongside `test`,
-  # `smoke` and `daemon-soak`. `test` ALSO still fails when this job fails (see its "Gate on shard results" step),
-  # so nothing that is required today became skippable.
-  #
-  # Card-only PRs: like `test`/`smoke`, it stays a REAL running job (not job-level skipped) that passes in
-  # seconds, because a SKIPPED required check is not read as success by the drain's `reviewCiGate`. Fail closed:
-  # if `changes` did not succeed, the first step fails the job.
-  integration:
+  # TT3: split the real-git/real-subprocess tier into five parallel integration parts.
+  # Run 44443900759 (2026-11-18): sim-scenarios 4.5 min, scan-chain 5.6 min, parallel 9.9 min.
+  # Of parallel's ~945 s per-file time, lane-pool-* used ~771 s, daemon-rebuild* ~97 s,
+  # and the rest ~77 s. Hash lane-pool basenames into two parts to target <= ~6 min each.
+  # Each retains its existing pool settings and card-only handling. The shell aggregator's
+  # check name `integration` is unchanged, so branch protection needs no change; `test`
+  # still requires it. Failed, cancelled or skipped parts fail the aggregator closed.
+  integration-part:
     needs: changes
     if: ${{ !cancelled() }}
     runs-on: ubuntu-latest
-    # 2026-11-18 RE-SIZED 20 -> 35: runs now take 14-19 min (sampled 2026-11-18); the 20-min cap cancelled a slow runner
-    # (merge-queue group of #7083). 35 min = ~1.8x the slowest observed. Real fix: shard or speed up this job.
-    timeout-minutes: 35
+    strategy:
+      fail-fast: false
+      matrix:
+        group: [scan-chain, sim-scenarios, lane-pool-a, lane-pool-b, parallel]
+        include:
+          - group: scan-chain
+            timeout: 20
+          - group: sim-scenarios
+            timeout: 20
+          - group: lane-pool-a
+            timeout: 20
+          - group: lane-pool-b
+            timeout: 20
+          - group: parallel
+            timeout: 20
+    # Main raised the former unsplit job to 35 min after 19-minute runs.
+    # These smaller parts retain 20 min, at least 1.6x the observed 9.9-minute part.
+    timeout-minutes: ${{ matrix.timeout }}
     steps:
       - name: Gate on changes
         id: gate
@@ -497,7 +511,36 @@ jobs:
       - name: Real-git integration suite (lane-pool, operations transport)
         if: ${{ steps.gate.outputs.run == 'true' }}
         working-directory: web-everything
-        run: npm run test:integration:vitest -- $(node scripts/ci/quarantine-skip.mjs --job="integration")
+        env:
+          WE_INTEGRATION_GROUP: ${{ matrix.group }}
+        run: npm run test:integration:vitest -- --reporter=default --reporter=json --outputFile.json=coverage/timing-integration-${{ matrix.group }}.json $(node scripts/ci/quarantine-skip.mjs --job="integration")
+
+      # Per-file timing evidence only; missing reports never gate CI. One artifact per matrix group
+      # (upload-artifact@v4 refuses a duplicate name across matrix legs).
+      - name: Upload integration timings
+        if: ${{ needs.changes.outputs.light != 'true' && (always()) }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: timing-integration-${{ matrix.group }}
+          path: web-everything/coverage/timing-integration-${{ matrix.group }}.json
+          if-no-files-found: ignore
+
+  integration:
+    needs: [changes, integration-part]
+    if: ${{ always() }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Gate on integration results
+        run: |
+          if [ "${{ needs.changes.result }}" != "success" ]; then
+            echo "changes did not succeed - failing closed."
+            exit 1
+          fi
+          if [ "${{ needs.integration-part.result }}" != "success" ]; then
+            echo "integration-part did not succeed - failing closed."
+            exit 1
+          fi
 
   # #4075 DAEMON SOAK HARNESS (card x0zg44l) — `npm run test:soak`: the REAL review + fix daemons, the real
   # rebuild/self-sync + live smoke gate, a real bare remote with main moving, fake GitHub + fake sessions, the
@@ -578,7 +621,8 @@ jobs:
   # failing must not hide a sibling shard's own result.
   soak-shard:
     needs: daemon-soak-scope
-    if: needs.daemon-soak-scope.outputs.run == 'true'
+    # R1068: shards run in the merge queue / on main / on dispatch, never on a pull_request push (~28k CI min/day).
+    if: needs.daemon-soak-scope.outputs.run == 'true' && github.event_name != 'pull_request'
     runs-on: ubuntu-latest
     # Measured 2026-10-14: time-balanced shards finish in ~8-14 min on main (shard 3: 13m24s and 13m48s on two
     # green main runs), so the old 15-min cap sat ~1 min above a healthy run. PR #5187's shard 3 was CANCELLED at
@@ -627,6 +671,14 @@ jobs:
     steps:
       - name: Gate on shard results
         run: |
+          # R1068: on a pull_request the soak is deferred to the merge queue (shards do not run there), so the
+          # required check succeeds at once. Every other event (merge_group, push, dispatch) falls through to the
+          # full gate below, which fails closed.
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            echo "soak deferred to merge queue (R1068)"
+            echo "### daemon-soak: soak deferred to merge queue (R1068)" >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
           # Fail CLOSED on the scope job itself: a crashed `daemon-soak-scope` leaves `outputs.run` empty, and an
           # empty value must never read as "no daemon code touched" (that would green the required check with the
           # soak never run). Only an explicit `run=false` from a SUCCESSFUL scope job skips the soak.
@@ -635,8 +687,8 @@ jobs:
             exit 1
           fi
           case "${{ needs.daemon-soak-scope.outputs.run }}" in
-            false) echo "No daemon code touched — soak not needed."; exit 0 ;;
             true) ;;
+            false) echo "Outside a pull_request the soak always runs, but scope said run=false — refusing to skip it."; exit 1 ;;
             *) echo "daemon-soak-scope emitted no usable run output (got: '${{ needs.daemon-soak-scope.outputs.run }}')."; exit 1 ;;
           esac
           if [ "${{ needs.soak-shard.result }}" != "success" ]; then

@@ -193,6 +193,8 @@ export const LOCK_HOLDERS = Object.freeze(['scripts/lib/atomic-json-file.mjs', '
   'scripts/conveyor/health-responder-state.mjs',
   // Landed on main since: the lane dependency installer (a no-clobber link create).
   'scripts/lib/lane-deps-installer.mjs',
+  // The ruled-weakened waiver store: a locked append/prune/rewrite (an exclusive create).
+  'scripts/operations/ruled-weakened-store.mjs',
   // Landed on main since: the fetch-only mirror sync (an exclusive create, a lock directory and a lock file name).
   'scripts/lib/mirror-sync.mjs',
   // Landed on main since: the red-main quarantine rerun marker (an exclusive `wx` create).
@@ -216,6 +218,8 @@ export const LOCK_HOLDERS = Object.freeze(['scripts/lib/atomic-json-file.mjs', '
   // review head index (an exclusive create) and the fix-ready record (an exclusive create and a lock file name).
   'scripts/conveyor/soak/breaks/infra-lock-waiter-busy-spins.mjs', 'scripts/lib/review-head-index.mjs',
   'scripts/operations/fix-ready-record.mjs',
+  // The urgent-verify receipt writer (an exclusive create and a lock directory).
+  'scripts/operations/urgent-verify.mjs',
   // Ghost recovery owns an operation lock as well as reserving the shared rerun budget.
   'scripts/operations/ci-ghost-rerun.mjs',
   // The ETag eviction stamp writer uses an exclusive `wx` create.
@@ -232,6 +236,7 @@ export const LOCK_API = /^(?:reserve|(?:with|acquire|release|refresh|heartbeat|r
  * user fails the test.
  */
 export const LOCK_USERS = Object.freeze([
+  'scripts/operations/ruled-weakened-prune.mjs',
   'scripts/lib/mq-failure-ledger.mjs', 'scripts/lib/operator-override-store.mjs', 'scripts/lib/review-run-index.mjs',
   // Callers of a `with…Lock` helper (withAddGuardLock, withDaemonCloneLock, …) and of a lock user's lock API through a
   // destructured dynamic import.
@@ -246,6 +251,8 @@ export const LOCK_USERS = Object.freeze([
   'scripts/conveyor/auto-round-grant-io.mjs', 'scripts/conveyor/await-verify-loop.mjs',
   'scripts/conveyor/await-verify.mjs', 'scripts/conveyor/build-dispatch-claim.mjs',
   'scripts/conveyor/build-dispatch-hold-router.mjs', 'scripts/conveyor/build-dispatch-orphan-adopt.mjs',
+  // The CI-heal child reserves its cycle lock through file-locks.mjs.
+  'scripts/conveyor/ci-heal-loop.mjs',
   'scripts/conveyor/fix-claim-store.mjs', 'scripts/conveyor/fix-dispatch-claim.mjs',
   'scripts/conveyor/fix-procedure.mjs', 'scripts/conveyor/fixer-stuck-reclaim.mjs',
   'scripts/conveyor/health-responder.mjs', 'scripts/conveyor/land-overlap-yield.mjs',

@@ -68,7 +68,8 @@ import { runReconcileCiHealDispatch, dispatchCiHeal } from '../../scripts/operat
 import { runReconcilePromoteDraftDispatch } from '../../scripts/operations/promote-draft-pr-dispatch.mjs'; // draft-first PRs, operator-approved 2026-09-27 — see runPromoteDraftDispatchAllRepos below
 import { resolveLiveQueueBaseline } from '../../scripts/readiness/heavy-admission.mjs'; // card xkyw1x4
 import { createQueueBudget } from '../../scripts/readiness/heavy-queue-projection.mjs'; // card xkyw1x4
-import { execFileSyncThrottled } from '../../scripts/lib/gh-throttle.mjs';
+import { execFileSyncThrottled, withCommandTiming } from '../../scripts/lib/gh-throttle.mjs';
+import { ghOpLabel } from '../../scripts/lib/gh-throttle-holders.mjs';
 import { readStacksForPass } from '../../scripts/conveyor/pr-stack.mjs';
 import { applyNetScopeToReconcile } from '../../scripts/conveyor/net-scope.mjs';
 import { runReconcilePass, defaultReadPrs, defaultReadAgents, enrichAgents, enrichPrsWithCodeQL, PR_LIST_LIMIT } from '../../scripts/conveyor/reconcile-pass.mjs'; // #4191
@@ -101,7 +102,7 @@ import { getRequiredStatusChecks } from '../../scripts/lib/required-status-check
 
 /** The checkout this daemon runs from — its heavy-admission root is the host-wide `<workspace>/.lanes` one. */
 const DAEMON_REPO_ROOT = resolve(fileURLToPath(import.meta.url), '..', '..', '..');
-import { sweepHungCiRecovery, sweepCiRedRecovery, sweepMissingRunRecovery, defaultReadOpenPrs, createFileApplyLedger } from '../../scripts/conveyor/ci-red-recovery-watch.mjs';
+import { sweepHungCiRecovery, sweepCiRedRecovery, sweepMissingRunRecovery, defaultReadOpenPrs, createFileApplyLedger, resolveApplyBudgetMs } from '../../scripts/conveyor/ci-red-recovery-watch.mjs';
 import { runRulingResolvesStandDownPass } from '../../scripts/conveyor/ruling-resolved-stand-down.mjs';
 import { resolveReviewSettings, resolveReviewSettingSource } from '../../scripts/lib/review-settings.mjs';
 import { CONSTELLATION_REPOS, repoKeyForSlug } from '../../scripts/lib/constellation-repos.mjs';
@@ -986,6 +987,7 @@ const FIX_PASS_LIMITS = {
   stuckFixersMs: { defaultMs: 120000, maxMs: 600000, env: 'WE_FIX_BUDGET_STUCK_FIXERS_MS', phase: 'stuck-fixers' },
   ciHealMs: { defaultMs: 180000, maxMs: 900000, env: 'WE_FIX_BUDGET_CI_HEAL_MS', phase: 'ci-heal' },
   promoteDraftMs: { defaultMs: 120000, maxMs: 600000, env: 'WE_FIX_BUDGET_PROMOTE_DRAFT_MS', phase: 'promote-draft' },
+  mainRedRebaseMs: { defaultMs: 170000, maxMs: 600000, env: 'WE_FIX_BUDGET_MAIN_RED_REBASE_MS', phase: 'main-red-rebase' },
 };
 
 /** `file` accepts a settings path or injected parsed data. Invalid overrides reset to standard,
@@ -1059,6 +1061,30 @@ export async function saveFixPassCursors({ path, rotation, prCursors, write = wr
 // Load once for the daemon defaults; injected state stays independent.
 const { rotation: fixPassRotation, prCursors: fixPassPrCursors } = loadFixPassCursors();
 
+const gitCommandWords = new Set('fetch push rebase merge status rev-parse log diff worktree checkout reset ls-remote show-ref merge-base branch cherry-pick'.split(' '));
+
+/** Pure, bounded observation: retain only the slowest gh/git call in each phase. */
+export function createPassCallRecorder() {
+  let calls = {};
+  return {
+    reset() { calls = {}; },
+    snapshot() { return { ...calls }; },
+    record(phase, command, args, ms) {
+      try {
+        if (!['gh', 'git'].includes(command) || !Number.isFinite(ms) || ms < 0) return;
+        // Only command/subcommand words; flags, bodies, credentials and later argv never enter logs.
+        const words = [];
+        const allowedGhWords = command === 'gh' ? ghOpLabel(args.slice(0, 2)).split(' ') : [];
+        for (const [index, arg] of args.slice(0, 2).entries()) {
+          if (command === 'gh' ? arg !== allowedGhWords[index] || arg === 'unknown' : !gitCommandWords.has(arg)) break;
+          words.push(arg);
+        }
+        if (!calls[phase] || ms > calls[phase].ms) calls[phase] = { name: [command, ...words].join(' '), ms };
+      } catch { /* A malformed observation must never affect the call. */ }
+    },
+  };
+}
+
 /**
  * we:skills-src/conveyor/reconcile-fix-dispatch-daemon.mjs#runTickAllRepos — #xngv3vn (epic #3383/#4075): the
  * daemon's WHOLE per-tick unit of work, composing BOTH halves this daemon now owns — the pre-existing `fix`
@@ -1131,6 +1157,7 @@ export async function runTickAllRepos({
   readPlanFingerprint = readPlanFingerprints, readPlanClaimSet = readPlanClaims,
   // Injectable clock for the per-phase timing (live 2026-10-09: an untimed 15.7-min pass delayed PR #4624's fix).
   now = Date.now,
+  callRecorder = createPassCallRecorder(),
   passBudgets = resolveFixPassBudgets(),
   budgetRotation = fixPassRotation,
   prCursors = fixPassPrCursors,
@@ -1140,6 +1167,7 @@ export async function runTickAllRepos({
   // Off under a test run unless injected (the real pass reads GitHub).
   orphanGuardTick = process.env.VITEST ? null : runOrphanFixRoundPass,
 } = {}) {
+  callRecorder.reset();
   const persistCursors = budgetRotation === fixPassRotation && prCursors === fixPassPrCursors;
   const cursorsBefore = persistCursors ? JSON.stringify([budgetRotation, prCursors]) : null;
   let yieldedForAdoption = false;
@@ -1210,8 +1238,10 @@ export async function runTickAllRepos({
     phaseMs[name] = now() - start;
     if (budgets[name] && phaseMs[name] > budgets[name].budgetMs) budgets[name].hit = true;
   };
-  const timed = (name, fn) => { const t = phaseStarts[name] = now(); try { return fn(); } finally { finishPhase(name, t); } };
-  const timedAsync = async (name, fn) => { const t = phaseStarts[name] = now(); try { return await fn(); } finally { finishPhase(name, t); } };
+  const observe = (name, fn) => withCommandTiming({ now,
+    record: (command, args, ms) => callRecorder.record(name, command, args, ms) }, fn);
+  const timed = (name, fn) => { const t = phaseStarts[name] = now(); try { return observe(name, fn); } finally { finishPhase(name, t); } };
+  const timedAsync = async (name, fn) => { const t = phaseStarts[name] = now(); try { return await observe(name, fn); } finally { finishPhase(name, t); } };
   // card x5kagse (epic #4075/#3383) — computed ONCE per tick, shared by both dispatching halves below. Real IO
   // (`planClaudeAuthDispatchGate`'s own `claude agents --json --all` read + health read + cheap probe) runs
   // ONLY for a genuine production tick — mirrors `queueAdmission`'s own "only read when a real tick runs" rule
@@ -1446,7 +1476,7 @@ export async function runTickAllRepos({
   // x5uqim1 follow-up (#4075/#3383) — the FOURTH half this daemon now owns: see
   // {@link runMainRedRebaseAllRepos}'s own docblock for why this daemon, specifically, is where it lives (same
   // reason `hungCi` already does — the pass's own `daemon-manifest.mjs` entry has no launchd job installed).
-  const mainRedRebase = stepTimed('main-red-rebase', () => runMainRedRebaseAllRepos({ repos: stepRepos.get('main-red-rebase'), tick: sharedTick('main-red-rebase', mainRedRebaseTick ?? sweepCiRedRecovery) }));
+  const mainRedRebase = stepTimed('main-red-rebase', () => runMainRedRebaseAllRepos({ repos: stepRepos.get('main-red-rebase'), applyBudgetMs: Math.min(budgets['main-red-rebase'].budgetMs, resolveApplyBudgetMs()), tick: sharedTick('main-red-rebase', mainRedRebaseTick ?? sweepCiRedRecovery) }));
   planCache?.markTouched(mainRedRebase);
   // xi4od2p (#4075/#3383) — the SIXTH half this daemon now owns: see {@link runMissingRunRecoveryAllRepos}'s
   // own docblock for why this daemon, specifically, is where it lives (same reason `hungCi`/`mainRedRebase`
@@ -1537,7 +1567,7 @@ export async function runTickAllRepos({
     supersede, // card xiqtf7w — per repo: the supersede holds planned and posted this tick
     ...(realTick ? { factsWarm, factsStats: takeFixReadStats() } : {}), // perf C1d — where this tick's PR facts came from
     ...(yieldedForAdoption ? { yieldedForAdoption: true } : {}),
-    phasePrCounts, budgets, passBudgetSettings: passBudgets,
+    phasePrCounts, budgets, phaseSlowestCalls: callRecorder.snapshot(), passBudgetSettings: passBudgets,
     skippedSteps, phaseMs, passMs: now() - passStart, // how long each half of this pass took (see formatPassTiming)
   };
 }
@@ -1736,7 +1766,7 @@ export function formatPassTiming(result) {
 /** Keep the historical total line intact; emit each phase exactly once alongside it. */
 export function formatPassPhaseTiming(result) {
   return Object.entries(result?.phaseMs ?? {}).filter(([, ms]) => Number.isFinite(ms))
-    .map(([name, ms]) => `pass-timing phase=${name} ms=${ms} budgetMs=${result?.budgets?.[name]?.budgetMs ?? 'none'} budgetHit=${result?.budgets?.[name]?.hit ?? false} prs=${result?.phasePrCounts?.[name]?.handled ?? 0} deferred=${result?.phasePrCounts?.[name]?.deferred ?? 0}`);
+    .map(([name, ms]) => `pass-timing phase=${name} ms=${ms} budgetMs=${result?.budgets?.[name]?.budgetMs ?? 'none'} budgetHit=${result?.budgets?.[name]?.hit ?? false} prs=${result?.phasePrCounts?.[name]?.handled ?? 0} deferred=${result?.phasePrCounts?.[name]?.deferred ?? 0} slowest=${result?.phaseSlowestCalls?.[name] ? `${result.phaseSlowestCalls[name].name}:${result.phaseSlowestCalls[name].ms}` : 'none'}`);
 }
 
 /** Build the real effects for {@link runDaemonLoop}: a real tick of {@link runTickAllRepos} (`fix` +

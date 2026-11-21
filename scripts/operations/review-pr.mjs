@@ -2377,7 +2377,8 @@ export function renderAdvisoryNote({ read, verdict } = {}) {
 
 // Shared by every acceptance publication path, including comment-only effects.
 function acceptanceRedTeamOwed(verdict, read) {
-  return redTeamOwedFor({ verdict, findings: { read } })
+  // Every caller is an accepted publication, so a prevention-outstanding verdict here was accepted at confirm.
+  return redTeamOwedFor({ verdict, findings: { read, confirm: 'accept' } })
     && !(readRedTeamProbes({ env: process.env }).value.skipCardOnly && redTeamCardOnly(read))
     && redTeamEnabled(process.env);
 }

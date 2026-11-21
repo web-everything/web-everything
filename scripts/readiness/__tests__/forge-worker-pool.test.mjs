@@ -515,7 +515,7 @@ with patch.object(ctypes, 'CDLL') as libc, patch.object(os, 'listdir', return_va
   });
   it.each([true,false])('validates sudoers before installing root:root 0440 (visudo accepts: %s)',async valid=>{
     const setup=await fs.readFile(new URL('../forge-setup.sh',import.meta.url),'utf8');
-    const install=setup.slice(setup.indexOf('visudo -cf "$sudoers_pending"'),setup.indexOf('trap - EXIT'));
+    const install=setup.slice(setup.indexOf('visudo -cf "$sudoers_pending"'),setup.indexOf('if ! command -v rsync'));
     const pending=join(root,'sudoers.pending');await fs.writeFile(pending,'fixture',{mode:0o600});
     const result=spawnSync('bash',['-c',`
 set -euo pipefail
@@ -529,19 +529,19 @@ ${install}
     expect(result.status,result.stderr).toBe(valid?0:1);
     expect(result.stdout).toBe([
       `visudo:-cf ${pending}`,
-      ...(valid?[`chown:root:root ${pending}`,`chmod:440 ${pending}`,`mv:-f -- ${pending} /etc/sudoers.d/forge-exec`]:[]),
+      ...(valid?[`chown:root:root ${pending}`,`chmod:440 ${pending}`]:[]),
       '',
     ].join('\n'));
     expect((await fs.stat(pending)).mode&0o777).toBe(valid?0o440:0o600);
   });
   it.each([2,3])('refuses shrinking an installed three-slot pool to %s slots',async slots=>{
     const setup=await fs.readFile(new URL('../forge-setup.sh',import.meta.url),'utf8');
-    // Exercise the shipped guard against a private pool, before user creation
-    // or privileged setup can run. Only the installation path is redirected.
-    const guard=setup.slice(setup.indexOf('set -euo pipefail'),setup.indexOf('if ! id forge-exec'))
+    // Exercise only the shipped count guards, before the mutating egress preflight.
+    // Fail closed if systemctl ever moves ahead of that boundary.
+    const guard=setup.slice(setup.indexOf('set -euo pipefail'),setup.indexOf('# Preflight egress'))
       .replaceAll('/srv/forge-exec',root);
     await fs.mkdir(join(root,'slot-3'));
-    const result=spawnSync('bash',['-c',guard+'\nprintf "setup-continues\\n"'],{
+    const result=spawnSync('bash',['-c','systemctl() { echo "unexpected systemctl" >&2; exit 99; }\n'+guard+'\nprintf "setup-continues\\n"'],{
       encoding:'utf8',timeout:10000,env:{...process.env,FORGE_EXEC_SLOTS:String(slots)},
     });
     expect(result.status,result.stderr).toBe(slots===2?1:0);
