@@ -1894,6 +1894,81 @@ describe('automatic item preparation', () => {
       releasePrepareClaim: (o) => releaseBuildDispatchClaim({ ...o, lockRoot }),
     };
   }
+  function refusalPlanner(bk) {
+    return { decisions: { itemPrepareSpawns: planPrepareSpawns({ needsPrepare: [{ num: '5028' }],
+      prepareHeldNums: bk.prepareHeldNums, availableLanes: [1], maxConcurrentItemPrepares: 1 }).itemPrepareSpawns }, nextState: {} };
+  }
+  it('cliEffects persists refusal history and a fresh adapter holds prepares after reload through expiry', async () => {
+    vi.stubEnv('WE_COORDINATION_ROOT', lockRoot);
+    const log = vi.spyOn(console, 'error').mockImplementation(() => {});
+    try {
+      const start = Date.parse('2026-11-18T12:00:00Z'), real = cliEffects();
+      expect(real.readPrepareRefusals).toBeTypeOf('function');
+      expect(real.recordPrepareRefusal).toBeTypeOf('function');
+      real.recordPrepareRefusal({ num: '5028', reason: 'first refusal' }, { now: start });
+      real.recordPrepareRefusal({ num: '5028', reason: 'second refusal' }, { now: start + 3_600_000 });
+      expect(JSON.parse(readFileSync(join(lockRoot, 'prepare-refusals.json'), 'utf8'))).toHaveLength(2);
+      const reloaded = cliEffects(), dispatch = vi.fn();
+      const effects = { ...fixture(), dispatch, planTick: refusalPlanner,
+        readPrepareRefusals: reloaded.readPrepareRefusals, recordPrepareRefusal: reloaded.recordPrepareRefusal };
+      for (const hours of [2, 23, 24]) {
+        const tick = await runBuildDispatchTick({ live: true, effects: { ...effects, now: () => start + hours * 3_600_000 } });
+        expect(tick.prepare.planned.map(r => r.num)).toEqual(hours < 24 ? [] : ['5028']);
+        expect(tick.prepare.skippedRepeatRefusal).toEqual(hours < 24
+          ? [{ num: '5028', refusals: 2, lastReason: 'second refusal' }] : []);
+      }
+      expect(dispatch).toHaveBeenCalledTimes(1);
+      writeFileSync(join(lockRoot, 'prepare-refusals.json'), '{broken');
+      effects.planTick = vi.fn((bk, { config }) => {
+        expect(config.launchKinds).not.toContain('prepare-item');
+        return { decisions: {}, nextState: {} };
+      });
+      await runBuildDispatchTick({ live: true, effects });
+      expect(effects.planTick).toHaveBeenCalledOnce();
+      expect(dispatch).toHaveBeenCalledTimes(1);
+    } finally { log.mockRestore(); vi.unstubAllEnvs(); }
+  });
+  it.each(['matching release', 'stale release', 'stamp'])('applies %s consistently to short and repeat refusal holds', async kind => {
+    const now = Date.parse('2026-11-18T14:00:00Z');
+    const effects = { ...fixture(), now: () => now, planTick: refusalPlanner,
+      readPrepareRefusals: () => [1, 2].map(i => ({ num: '5028', reason: 'transient', at: new Date(now - i * 60_000).toISOString() })),
+      listSettledPrepares: () => kind === 'stamp' ? [] : [{ num: '5028', source: 'run:latest', startedAt: '2026-11-18T12:00:00Z', outcome: 'prepare-unstamped' }],
+      listPrepareReleases: () => [{ target: '5028', attempt: kind === 'matching release' ? 'run:latest' : 'run:old' }],
+      readPrepareStatus: () => ({ preparedDate: '2026-11-18' }) };
+    const bookkeeping = { prepareRefusals: [{ num: '5028', reason: 'transient', at: new Date(now - 60_000).toISOString() }],
+      ...(kind === 'stamp' ? { prepareGuards: [{ num: '5028', kind: 'prepare-item' }] } : {}) };
+    const log = vi.spyOn(console, 'error').mockImplementation(() => {});
+    try {
+      const tick = await runBuildDispatchTick({ live: true, effects, bookkeeping });
+      expect(tick.prepare.skippedRepeatRefusal.map(r => r.num)).toEqual(kind === 'stale release' ? ['5028'] : []);
+      expect(tick.prepare.planned.map(r => r.num)).toEqual(kind === 'matching release' ? ['5028'] : []);
+      expect(effects.dispatch).toHaveBeenCalledTimes(kind === 'matching release' ? 1 : 0);
+    } finally { log.mockRestore(); }
+  });
+  it('retains the 30-minute hold when refusal persistence fails and readmits at expiry', async () => {
+    const start = Date.parse('2026-11-18T12:00:00Z');
+    let now = start;
+    const effects = { ...fixture(), now: () => now, planTick: refusalPlanner, readPrepareRefusals: () => [],
+      recordPrepareRefusal: vi.fn(async () => { throw new Error('disk full'); }),
+      listPreparePrs: () => [{ number: 91, state: 'OPEN', headRefName: 'lane/5028d-prepare-x' }] };
+    const log = vi.spyOn(console, 'error').mockImplementation(() => {});
+    try {
+      const refused = await runBuildDispatchTick({ live: true, effects });
+      expect(refused.prepare.refused).toEqual([{ num: '5028', reason: 'open prepare PR #91 (lane/5028d-prepare-x)' }]);
+      expect(effects.recordPrepareRefusal).toHaveBeenCalledOnce();
+      expect(effects.dispatch).not.toHaveBeenCalled();
+      expect(log).toHaveBeenCalledWith('build-dispatch-daemon: refusal history write failed; retaining 30-minute hold: disk full');
+      effects.listPreparePrs = () => [];
+      now = start + 30 * 60_000 - 1;
+      const held = await runBuildDispatchTick({ live: true, effects, bookkeeping: refused.nextBookkeeping });
+      expect(held.prepare.planned).toEqual([]);
+      expect(effects.dispatch).not.toHaveBeenCalled();
+      now++;
+      const expired = await runBuildDispatchTick({ live: true, effects, bookkeeping: held.nextBookkeeping });
+      expect(expired.prepare.planned.map(r => r.num)).toEqual(['5028']);
+      expect(effects.dispatch).toHaveBeenCalledOnce();
+    } finally { log.mockRestore(); }
+  });
   it('plans a twice-refused card zero times next tick, before cost admission, across a restart', async () => {
     const path = join(lockRoot, 'prepare-refusals.json'), start = Date.parse('2026-11-18T12:00:00Z');
     let now = start, bookkeeping = {};

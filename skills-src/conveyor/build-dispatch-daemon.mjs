@@ -486,12 +486,16 @@ async function runTimedBuildDispatchTick({ bookkeeping = {}, live = false, polic
   // out of the plan while its refusal is fresh, so the slots rotate to clean cards; it is re-checked once it ages out.
   const tickNowMs = effects.now?.() ?? Date.now();
   // An operator release or a stamp lifts a cached refusal at once.
+  const refusalStillApplies = r => !completedPrepares.has(normNum(r.num)) && !released.has(normNum(r.num));
   const freshRefusals = (Array.isArray(bookkeeping.prepareRefusals) ? bookkeeping.prepareRefusals : [])
     .filter(r => r?.num != null && tickNowMs - Date.parse(r.at) < PREPARE_REFUSAL_HOLD_MS
-      && !completedPrepares.has(normNum(r.num)) && !released.has(normNum(r.num)));
+      && refusalStillApplies(r));
   const refusalHeldNums = new Set(freshRefusals.map(r => normNum(r.num)));
   let skippedRepeatRefusal = [], refusalReadError = null;
-  try { skippedRepeatRefusal = repeatedPrepareRefusals(await effects.readPrepareRefusals?.({ now: tickNowMs }) ?? [], { now: tickNowMs }); }
+  try {
+    skippedRepeatRefusal = repeatedPrepareRefusals(await effects.readPrepareRefusals?.({ now: tickNowMs }) ?? [], { now: tickNowMs })
+      .filter(refusalStillApplies);
+  }
   catch (error) {
     refusalReadError = error;
     console.error(`build-dispatch-daemon: prepare launches held: ${String(error?.message ?? error).replace(/\s+/g, ' ')}`);
