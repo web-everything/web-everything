@@ -587,14 +587,17 @@ systemctl enable forge-exec-egress.service
 systemctl start forge-exec-egress.service
 systemctl enable --now forge-exec-egress.timer
 restore_egress_timer=false
-# Verify the installed runner sees coverage for every target UID, after the new
+# Verify the source runner sees coverage for every target UID, after the new
 # service and timer are installed. A restored old timer on an earlier failure
 # cannot expose new slots: their directories and sudoers are still unpublished.
 FORGE_EGRESS_UIDS="${slot_uids[*]}" /usr/local/libexec/forge-egress.sh apply
-node --input-type=module - "${slot_uids[@]}" <<'EGRESS_CHECK'
-import {createRunner} from '/usr/local/libexec/forge-exec-run.mjs';
+node --input-type=module - "$(cd -- "$(dirname -- "$0")" && pwd)" "${slot_uids[@]}" <<'EGRESS_CHECK'
+import path from 'node:path';
+import {pathToFileURL} from 'node:url';
+const dir = process.argv[2];
+const {createRunner} = await import(pathToFileURL(path.join(dir, 'forge-exec-run.mjs')).href);
 const runner = createRunner();
-for (const uid of process.argv.slice(2)) await runner.egressReady(Number(uid));
+for (const uid of process.argv.slice(3)) await runner.egressReady(Number(uid));
 EGRESS_CHECK
 # Final enable: publish the usable directory names, then atomically replace the
 # validated sudoers file. Roll back directory publication if any operation fails.
