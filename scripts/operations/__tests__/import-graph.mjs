@@ -30,7 +30,14 @@ import { dirname, resolve } from 'node:path';
 import ts from 'typescript';
 
 function importSpecifiers(file) {
-  const tree = ts.createSourceFile(file, readFileSync(file, 'utf8'), ts.ScriptTarget.Latest, false, ts.ScriptKind.JS);
+  const source = readFileSync(file, 'utf8');
+  // Imported JSON is inert data, but must still be present and valid. Never scan
+  // strings inside it as source or silently skip an unreadable dependency.
+  if (file.endsWith('.json')) {
+    JSON.parse(source);
+    return [];
+  }
+  const tree = ts.createSourceFile(file, source, ts.ScriptTarget.Latest, false, ts.ScriptKind.JS);
   if (tree.parseDiagnostics.length) {
     const diagnostic = tree.parseDiagnostics[0];
     throw new SyntaxError(`${file}: ${ts.flattenDiagnosticMessageText(diagnostic.messageText, '\n')}`);

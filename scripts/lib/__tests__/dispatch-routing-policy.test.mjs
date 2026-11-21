@@ -1,7 +1,7 @@
 import { execFileSync } from 'node:child_process';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { describe, expect, it, vi } from 'vitest';
-import { mkdtempSync, writeFileSync, rmSync, copyFileSync, readFileSync, readdirSync } from 'node:fs';
+import { mkdtempSync, writeFileSync, rmSync, mkdirSync, copyFileSync, readFileSync, readdirSync } from 'node:fs';
 import matter from 'gray-matter';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
@@ -220,7 +220,11 @@ describe('operation routing policy', () => {
 
 
 it('a child uses the inherited last-good snapshot even while the policy file is syntactically broken', () => {
-  const dir = mkdtempSync(join(tmpdir(), 'routing-policy-child-'));
+  const parent = mkdtempSync(join(tmpdir(), 'routing-policy-child-'));
+  const dir = join(parent, 'lib');
+  mkdirSync(dir);
+  mkdirSync(join(parent, 'settings'));
+  copyFileSync('scripts/settings/provider-capacity.json', join(parent, 'settings/provider-capacity.json'));
   try {
     for (const file of ['dispatch-routing-policy-source.mjs', 'codex-model-routing.mjs', 'dispatch-routing-policy.mjs', 'dispatch-routing-providers.mjs']) copyFileSync(`scripts/lib/${file}`, join(dir, file));
     writeFileSync(join(dir, 'dispatch-routing-policy.json'), '{broken edit');
@@ -229,7 +233,7 @@ it('a child uses the inherited last-good snapshot even while the policy file is 
       encoding: 'utf8', env: { ...process.env, WE_DISPATCH_ROUTING_SNAPSHOT: JSON.stringify(readRoutingPolicy()) },
     });
     expect(JSON.parse(result)).toMatchObject({ provider: 'codex', model: 'gpt-6-astra' });
-  } finally { rmSync(dir, { recursive: true, force: true }); }
+  } finally { rmSync(parent, { recursive: true, force: true }); }
 });
 
 it('adding prepare-item to gated kinds applies the same fail-closed check to its explicit policy', () => {
@@ -447,6 +451,7 @@ it('preserves operator-protected Astra and ruling escalation routes', () => {
   for (const k of ['prepare', 'prepare-decision', 'prepare-item', 'investigate']) expect(policy.operations[k].model).toBe('astra');
   for (const k of ['design', 'diagnosis']) expect(policy.taskTypes[k].model).toBe('astra');
   expect(policy.operations['fix:ruling-escalation-stronger']).toMatchObject({ provider: 'claude', model: 'sonnet', fallback: [] });
+  expect(policy.operations['fix:takeover']).toMatchObject({ provider: 'claude', model: 'sonnet', fallback: [] });
   expect(policy.operations['fix:ruling-escalation-cross-provider']).toMatchObject({ provider: 'codex', model: 'astra', fallback: [{ provider: 'claude', model: 'sonnet', effort: 'high' }] });
 });
 
@@ -473,4 +478,22 @@ it('does not resurrect a vetoed Codex retry model at launch', () => {
     scriptExists: () => true, agent: r => { models.push(r.table.model); return 'session'; },
   });
   expect(models).toEqual(['gpt-6.1-sol', 'claude-sonnet-5-5']);
+});
+
+it('closed critical-fix gate refuses a Codex-only route even with a tier-qualified model', () => {
+  const policy = structuredClone(DEFAULT_ROUTING_POLICY);
+  policy.operations.fix = { provider: 'codex', model: 'sol', fallback: [] };
+  const out = decideDispatchRoute({ kind: 'fix', scopePaths: ['we:scripts/lib/critical-work.mjs'], size: 1, risk: 'high' },
+    { routingPolicy: policy, providerCapacity: { providers: [{ id: 'codex', model: 'gpt-6.1-sol', tier: 3 }] } });
+  expect(out.outcome).toBe('refused');
+  expect(out.refusal).toMatch(/critical-work gate/);
+});
+
+
+it.each([false, true])('scoped inheritance cannot discard parent disabledProviders (gateClosed=%s)', gateClosed => {
+  const policy = structuredClone(DEFAULT_ROUTING_POLICY);
+  policy.operations.fix = { inherit: true, disabledProviders: ['codex'] };
+  policy.operations['fix:critical-work'] = { inherit: true };
+  expect(() => resolveOperationRoute({ operation: 'fix', taskType: 'critical-work', gateClosed, policy }))
+    .toThrow(/inherited route cannot enforce disabled providers; configure an explicit provider and fallback/);
 });

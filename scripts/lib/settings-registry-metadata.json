@@ -878,6 +878,12 @@
       "changeVia": "pr",
       "instant": false
     },
+    "providerCapacity": {
+      "description": "Provider/account quota windows, readers, reserves, banked resets and minimum tiers for capacity-based routing.",
+      "owner": "scripts/settings/provider-capacity.json",
+      "changeVia": "pr",
+      "instant": false
+    },
     "routing": {
       "description": "Builder and audit provider routing based on quota and reservations.",
       "owner": "scripts/settings/routing.json",
