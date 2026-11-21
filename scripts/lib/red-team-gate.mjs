@@ -224,7 +224,7 @@ export function resolveRedTeamProbes({ file = {}, platform, env = {} } = {}) {
   }
   const pick = (o) => Object.fromEntries(Object.keys(RED_TEAM_PROBE_DEFAULTS).filter(k => o?.[k] !== undefined).map(k => [k, o[k]]));
   return resolveCascade({ standard: RED_TEAM_PROBE_DEFAULTS, platform: pick(platform), tool: pick(file?.redTeam),
-    envValues, valid: v => typeof v === 'boolean' });
+    envValues, valid: v => typeof v === 'boolean', policy: 'redTeam' });
 }
 export function readRedTeamProbes({ env = process.env, path = RED_TEAM_SETTINGS_FILE, log = () => {} } = {}) {
   let file = {};

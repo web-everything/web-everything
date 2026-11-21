@@ -57,6 +57,61 @@ import { loadBackgroundBuildSettings } from '../daemon-background-build.mjs';
 import { readDeliveryPrioritySettings } from '../../conveyor/delivery-priority-shadow.mjs';
 import { resolveHeavyAdmissionCap } from '../dispatch-throttle.mjs';
 import { liveReviewRoundBudget } from '../../../skills-src/conveyor/review-daemon.mjs';
+import { unattendedAcceptPolicy } from '../unattended-review-accept.mjs';
+import { resolveReviewCareExemptPaths, DEFAULT_CARE_EXEMPT_PATHS } from '../review-care-exempt-paths.mjs';
+import { resolveRedTeamProbes } from '../red-team-gate.mjs';
+
+describe('D15 slice 1: env may only tighten a safety key', () => {
+  const ENV_KEY = 'WE_REVIEW_UNATTENDED_ACCEPT_REQUIRES_CLEAN_REFERRALS';
+  const accept = (value) => unattendedAcceptPolicy({ env: { [ENV_KEY]: value, VITEST: 'true' }, tool: {}, platform: {}, log: () => {} });
+  it('env may only tighten a safety key: WE_REVIEW_UNATTENDED_ACCEPT_REQUIRES_CLEAN_REFERRALS=off keeps true', () => {
+    const r = accept('off');
+    expect(r.value.unattendedAcceptRequiresCleanReferrals).toBe(true);
+    expect(r.sources.unattendedAcceptRequiresCleanReferrals).toBe('standard');
+    expect(r.invalid.some(s => s.startsWith('env.unattendedAcceptRequiresCleanReferrals=false'))).toBe(true);
+  });
+  it('env value equal to the current value applies', () => {
+    const r = accept('on');
+    expect(r.value.unattendedAcceptRequiresCleanReferrals).toBe(true);
+    expect(r.invalid).toEqual([]);
+  });
+  it('an invalid env value is refused as before', () => {
+    const r = accept('banana');
+    expect(r.value.unattendedAcceptRequiresCleanReferrals).toBe(true);
+    expect(r.invalid.some(s => s.startsWith('env.'))).toBe(true);
+  });
+  it('env may only tighten: a care-exempt subset applies and a superset is refused', () => {
+    const file = '/nonexistent/care-exempt.json';
+    const subset = resolveReviewCareExemptPaths({ env: { WE_REVIEW_CARE_EXEMPT_PATHS: JSON.stringify([DEFAULT_CARE_EXEMPT_PATHS[0]]) }, file, log: () => {} });
+    expect(subset.value).toEqual([DEFAULT_CARE_EXEMPT_PATHS[0]]);
+    const superset = resolveReviewCareExemptPaths({ env: { WE_REVIEW_CARE_EXEMPT_PATHS: JSON.stringify([...DEFAULT_CARE_EXEMPT_PATHS, 'data/generated/extra/report.json']) }, file, log: () => {} });
+    expect(superset.value).toEqual([...DEFAULT_CARE_EXEMPT_PATHS]);
+    expect(superset.invalid.length).toBe(1);
+  });
+  it('env may only tighten red-team probes: skipCardOnly=false applies, recheckReadsRepo=false is refused', () => {
+    const r = resolveRedTeamProbes({ env: { WE_RED_TEAM_SKIP_CARD_ONLY: 'off', WE_RED_TEAM_RECHECK_READS_REPO: 'off' } });
+    expect(r.value.skipCardOnly).toBe(false);
+    expect(r.value.recheckReadsRepo).toBe(true);
+    expect(r.invalid.length).toBe(1);
+  });
+  it('an unclassed env leaf applies as today and is shadow-reported', () => {
+    const r = resolveRedTeamProbes({ env: { WE_RED_TEAM_STATUS_LABELS: 'off' } });
+    expect(r.value.statusLabels).toBe(false);
+    expect(r.shadow).toContain('env.statusLabels');
+  });
+  it('whole-key env object: the loosening leaf is refused, the tightening leaf is kept', () => {
+    const o = resolveCascade({ policy: 'redTeam', standard: { recheckReadsRepo: true, skipCardOnly: true, extra: 1 },
+      envValues: { recheckReadsRepo: false, skipCardOnly: false, extra: 2 }, log: () => {} });
+    expect(o.value).toEqual({ recheckReadsRepo: true, skipCardOnly: false, extra: 2 });
+    expect(o.invalid.length).toBe(1);
+  });
+  it('a type mismatch on a classed leaf counts as loosening', () => {
+    const r = resolveCascade({ policy: 'review', standard: { unattendedAcceptRequiresCleanReferrals: true },
+      envValues: { unattendedAcceptRequiresCleanReferrals: 'yes' }, log: () => {} });
+    expect(r.value.unattendedAcceptRequiresCleanReferrals).toBe(true);
+    expect(r.invalid.length).toBe(1);
+  });
+});
 
 beforeEach(() => { operatorFixture.file = join(dir, 'missing-operator-overrides.json'); });
 const dir = mkdtempSync(join(tmpdir(), 'policy-cascade-'));

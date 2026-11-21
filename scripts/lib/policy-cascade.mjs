@@ -31,6 +31,7 @@ import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { readOperatorOverrides, CAPACITY_LEAVES, failClosedCapacity } from './operator-override-reader.mjs';
 import { isUnderTest } from './under-test.mjs';
+import { classify, directionFor, isLoosening } from './settings-safe-direction.mjs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 export const PLATFORM_PREFERENCES_PATH = join(HERE, 'delivery-platform-preferences.json');
@@ -105,6 +106,14 @@ function leaves(v, prefix = [], out = new Map()) {
   return out;
 }
 
+const loosenLogged = new Set();
+
+function deleteLeaf(obj, parts) {
+  let o = obj;
+  for (const k of parts.slice(0, -1)) { if (!isObj(o?.[k])) return; o = o[k]; }
+  if (o) delete o[parts.at(-1)];
+}
+
 function setLeaf(obj, parts, value) {
   let o = obj;
   for (const k of parts.slice(0, -1)) { if (!isObj(o[k])) o[k] = {}; o = o[k]; }
@@ -122,7 +131,8 @@ function setLeaf(obj, parts, value) {
  * @returns {{value:unknown, sources:Record<string,string>, leafValues:Record<string,unknown>, invalid:string[]}}
  *   `sources` names the layer of every effective leaf, keyed by its dotted path ('' for a scalar policy).
  */
-export function resolveCascade({ standard, platform, tool, envValues = {}, valid = {}, operatorOverride, capacityLeaves, log = console.error } = {}) {
+export function resolveCascade({ standard, platform, tool, envValues = {}, valid = {}, operatorOverride, capacityLeaves, policy, log = console.error } = {}) {
+  const shadow = [];
   const check = (path, v) => (typeof valid === 'function' ? valid(v) : ((valid?.[path.join('.')] ?? valid?.[path[0]])?.(v) ?? true));
   const eff = new Map();
   const at = (path) => (path.length ? `.${path.join('.')}` : '');
@@ -150,6 +160,31 @@ export function resolveCascade({ standard, platform, tool, envValues = {}, valid
     }
     const path = k === '' ? [] : [k];
     if (!check(path, v)) { invalid.push(`env${at(path)}=${JSON.stringify(v)}`); continue; }
+    if (policy) {
+      // D15: env may only tighten a classed safety leaf; an unclassed leaf applies as before and is shadow-reported.
+      const refused = [];
+      const probes = isObj(v) ? [...leaves(v).values()].map(l => l.path) : [[]];
+      for (const rel of probes) {
+        const full = [...path, ...rel];
+        const leaf = full.join('.');
+        if (classify(policy, leaf) === 'unclassed') { shadow.push(`env.${leaf || policy}`); continue; }
+        const entry = directionFor(policy, leaf);
+        const to = rel.length ? rel.reduce((o, p) => o?.[p], v) : v;
+        const from = eff.get(full.join(SEP))?.v;
+        if (entry?.kind === 'safety' && isLoosening(entry, from, to)) {
+          const text = `env.${leaf || policy}=${JSON.stringify(to)} (loosens; env may only tighten)`;
+          invalid.push(text);
+          if (!loosenLogged.has(text)) { loosenLogged.add(text); try { log(`policy-cascade: refused ${text}`); } catch { /* never throws */ } }
+          refused.push({ rel, from });
+        }
+      }
+      if (refused.length && !isObj(v)) continue;
+      if (refused.length) {
+        v = structuredClone(v);
+        for (const { rel, from } of refused) { if (from === undefined) deleteLeaf(v, rel); else setLeaf(v, rel, from); }
+        if (!leaves(v).size) continue;
+      }
+    }
     // An env value replaces the whole top-level key (drop the nested leaves it shadows).
     for (const key of [...eff.keys()]) if (path.length && eff.get(key).path[0] === k) eff.delete(key);
     eff.set(path.join(SEP), { path, v, layer: 'env' });
@@ -193,11 +228,11 @@ export function resolveCascade({ standard, platform, tool, envValues = {}, valid
   const sources = {};
   const leafValues = {};
   for (const { path, v, layer } of eff.values()) { sources[path.join('.')] = layer; leafValues[path.join('.')] = v; }
-  if (eff.size === 1 && eff.has('')) return { value: eff.get('').v, sources, leafValues, invalid };
-  if (eff.size === 0) return { value: isObj(standard) || isObj(platform) || isObj(tool) ? {} : undefined, sources, leafValues, invalid };
+  if (eff.size === 1 && eff.has('')) return { value: eff.get('').v, sources, leafValues, invalid, shadow };
+  if (eff.size === 0) return { value: isObj(standard) || isObj(platform) || isObj(tool) ? {} : undefined, sources, leafValues, invalid, shadow };
   const value = {};
   for (const { path, v } of eff.values()) if (path.length) setLeaf(value, path, v);
-  return { value, sources, leafValues, invalid };
+  return { value, sources, leafValues, invalid, shadow };
 }
 
 const fmt = (v) => { const s = JSON.stringify(v); return s && s.length > 60 ? `${s.slice(0, 57)}...` : s; };
@@ -258,7 +293,7 @@ export function cascadePolicy(policy, tool, { standard, envValues, valid, platfo
   if (plat === undefined) { try { plat = platformPreference(policy, { env }); } catch { plat = undefined; } }
   if (operatorOverride === undefined) operatorOverride = readOperatorPolicy(policy, { env, log });
   const capacityLeaves = capacityPolicyLeaves(policy);
-  const resolved = resolveCascade({ standard, platform: plat, tool, envValues, valid, operatorOverride, capacityLeaves, log });
+  const resolved = resolveCascade({ standard, platform: plat, tool, envValues, valid, operatorOverride, capacityLeaves, policy, log });
   logCascadeSources(policy, resolved, { env, ...(log ? { log } : {}) });
   // `layered`: platform under tool only (no standard, no env) — the drop-in replacement for a reader's tool block.
   const layered = resolveCascade({ standard: operatorOverride === null && capacityLeaves.length ? standard : undefined,

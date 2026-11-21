@@ -486,8 +486,11 @@ describe('unattended live-referral gate', () => {
     expect(policy({ platform: { unattendedAcceptRequiresCleanReferrals: false } }).sources.unattendedAcceptRequiresCleanReferrals).toBe('platform');
     expect(policy({ tool: { unattendedAcceptRequiresCleanReferrals: false } }).sources.unattendedAcceptRequiresCleanReferrals).toBe('tool');
     const env = { WE_POLICY_CASCADE_LOG: '1', WE_REVIEW_UNATTENDED_ACCEPT_REQUIRES_CLEAN_REFERRALS: 'false' };
-    expect(policy({ env, log: line => lines.push(line) }).value.unattendedAcceptRequiresCleanReferrals).toBe(false);
-    expect(lines.join('\n')).toMatch(/policy-cascade.*review.*unattendedAcceptRequiresCleanReferrals=false \(env\)/);
+    // D15: env may only tighten, so env=false cannot loosen the standard true.
+    expect(policy({ env, log: line => lines.push(line) }).value.unattendedAcceptRequiresCleanReferrals).toBe(true);
+    expect(lines.join('\n')).toMatch(/policy-cascade.*review.*unattendedAcceptRequiresCleanReferrals=true \(standard\).*loosens/);
+    expect(policy({ env: { ...env, WE_REVIEW_UNATTENDED_ACCEPT_REQUIRES_CLEAN_REFERRALS: 'true' }, log: line => lines.push(line) })
+      .sources.unattendedAcceptRequiresCleanReferrals).toBe('env');
   });
 });
 

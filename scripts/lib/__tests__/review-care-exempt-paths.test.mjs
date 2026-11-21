@@ -346,8 +346,8 @@ describe('care exemption settings resolver', () => {
 
   it('resolves tool then JSON environment overrides and logs provenance', async () => {
     const log = vi.fn();
-    const readFile = () => JSON.stringify({ careExemptPaths: ['data/generated/**'] });
-    expect((await resolve({ readFile })).value).toEqual(['data/generated/**']);
+    const readFile = () => JSON.stringify({ careExemptPaths: ['data/generated/**', 'app/snapshot.json'] });
+    expect((await resolve({ readFile })).value).toEqual(['data/generated/**', 'app/snapshot.json']);
     const result = await resolve({ readFile, env: { WE_REVIEW_CARE_EXEMPT_PATHS: '["app/snapshot.json"]' }, log });
     expect(result.value).toEqual(['app/snapshot.json']);
     expect(result.sources['']).toBe('env');
@@ -361,7 +361,8 @@ describe('care exemption settings resolver', () => {
     absent: undefined };
   const expectedLayer = (tool, env) => {
     if ([tool, env].some(l => l === 'invalid' || l === 'unparseable')) return [[...DEFAULT_CARE_EXEMPT_PATHS], 'standard'];
-    if (env !== 'absent') return [env === 'valid' ? ['app/env.json'] : [], 'env'];
+    // D15: env may only tighten, so an env list that adds a path ('valid') is refused and the tool layer stays.
+    if (env !== 'absent' && env !== 'valid') return [[], 'env'];
     return [tool === 'valid' ? ['app/snapshot.json'] : [], 'tool'];
   };
   it.each(Object.keys(toolLayers).flatMap(tool => Object.keys(envLayers).map(env => [tool, env])))(

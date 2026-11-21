@@ -218,9 +218,9 @@ describe('red-team probe policy cascade', () => {
       sources: { recheckReadsRepo: 'standard', skipCardOnly: 'standard' } });
   });
   it('resolves each key independently through platform, tool and env', () => {
-    expect(resolveRedTeamProbes({ platform: { recheckReadsRepo: false, skipCardOnly: false },
-      file: { redTeam: { recheckReadsRepo: true } }, env: { WE_RED_TEAM_SKIP_CARD_ONLY: 'on' } }))
-      .toMatchObject({ value: { recheckReadsRepo: true, skipCardOnly: true }, sources: { recheckReadsRepo: 'tool', skipCardOnly: 'env' } });
+    expect(resolveRedTeamProbes({ platform: { recheckReadsRepo: false, skipCardOnly: true },
+      file: { redTeam: { recheckReadsRepo: true } }, env: { WE_RED_TEAM_SKIP_CARD_ONLY: 'off' } }))
+      .toMatchObject({ value: { recheckReadsRepo: true, skipCardOnly: false }, sources: { recheckReadsRepo: 'tool', skipCardOnly: 'env' } });
     expect(resolveRedTeamProbes({ platform: { recheckReadsRepo: false } }).sources.recheckReadsRepo).toBe('platform');
   });
   it('invalid overrides retain the lower layer', () => {
