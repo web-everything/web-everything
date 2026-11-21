@@ -5,8 +5,8 @@ size: 2
 status: open
 scope: ["we:scripts/conveyor/reconcile-pass.mjs", "we:scripts/conveyor/__tests__/reconcile-pass.test.mjs", "we:scripts/conveyor/__tests__/reconcile-pass-required-checks.test.mjs", "we:scripts/lib/required-check-workflows.mjs", "we:scripts/lib/__tests__/required-check-workflows.test.mjs", "we:scripts/check-standards.mjs", "we:scripts/__tests__/check-standards.test.mjs", "we:scripts/operations/__tests__/pr-status*.test.mjs"]
 dateOpened: "2026-10-02"
-preparedDate: "2026-10-03"
-preparedAgainstSha: "8d35ab340afcdf11f1e14ab490fdf7943f458f61"
+preparedDate: "2026-11-21"
+preparedAgainstSha: "dd4c64fb449151d3c10b8e9e1a4eaf19026c14f6"
 tags: []
 ---
 
@@ -52,6 +52,26 @@ Follow-up from the #3432 advisory (2026-10-02). A required check missing because
 - Run the scoped helper, reconciliation, reducer and standards suites with Vitest (all paths listed above are WE-relative after removing their locus). Capture actual reader call counts, diagnostic counts, and absence of promotion; a helper-only green test is insufficient.
 - Exercise the real reconciliation shell twice in separate processes with injected recorded PR/protection/workflow inputs and a temporary persistent store. Capture JSON and human output; change the base or workflow revision for a third pass and demonstrate invalidation. No GitHub writes or live PR mutation are needed.
 - Run `npm run check:standards`; separately demonstrate the wired standards validator failing on an excluded-base fixture and passing the compatible fixture. Record live comparison only if a read-only protection fetch succeeds, including provenance and revision; do not substitute a fallback result for live proof.
+
+## Acceptance
+
+Paths carry the `we:` locus; drop the prefix when running from the WE checkout.
+
+- [A1] **Executable** — `npx vitest run we:scripts/conveyor/__tests__/reconcile-pass-required-checks.test.mjs`: the new two-pass case (main-only workflow, stacked PR, required `smoke` absent) fails on `main` today (second pass re-hydrates and re-reports `check-read-failed`) and passes after: one configuration diagnostic per unchanged key, zero extra hydration reads, PR still blocked and never promoted.
+- [A2] **Executable** — `npx vitest run we:scripts/lib/__tests__/required-check-workflows.test.mjs` (new file; fails today because the module does not exist): literal name/job-ID mapping, glob/negation/`branches-ignore`, duplicate producers, unknown for dynamic/matrix/external/malformed/missing, TTL expiry and key invalidation on base, head, requirement or workflow-revision change.
+- [A3] **Executable** — `npx vitest run we:scripts/conveyor/__tests__/reconcile-pass.test.mjs we:scripts/operations/__tests__/pr-status.test.mjs`: new cases fail today and pass after: unknown/mixed/truncated (100-row) snapshots still hydrate; observed red/pending checks keep precedence; a sidecar read/write failure falls back to ordinary hydration and does not mark the diagnostic delivered; `formatReport` prints the diagnostic; docs/config/data/source/mixed diffs behave identically.
+- [A4] **Executable** — `npx vitest run we:scripts/__tests__/check-standards.test.mjs`: the wired gate fails on an excluded-base fixture (naming context, base, workflow), passes the compatible default-base fixture, reports unknown/unreadable protection as unverified, and makes no network call offline; fails today because no such check is wired.
+- [A5] **Executable** — `npm run check:standards` exits 0 on the repo after the change (main-only `we:.github/workflows/ci.yml` vs. declared default-branch requirements), and exits non-zero when run against the excluded-base fixture.
+
+## Edge cases this change must handle
+
+1. **Untrusted text** — workflow names, job names and branch globs come from YAML and are folded (`foldUntrusted`, `we:scripts/lib/jury-core.mjs`) before reaching the diagnostic or report; none reaches a shell, argv or path. Test with a newline/backtick job name.
+2. **Truncated reads** — a snapshot at the 100-row boundary always hydrates; a failed or partial workflow/protection read is unknown, never "excluded". Test the boundary and a failed read.
+3. **Shared state files** — the dedup sidecar is written with `writeJsonAtomic` and `withFileLock` (`we:scripts/lib/atomic-json-file.mjs`); two ticks racing may repeat a diagnostic but never lose one or corrupt the file. Test corrupt-file and concurrent-writer cases.
+4. **Fail closed** — any read, parse, spawn or persistence failure keeps ordinary hydration and the blocked state, with a named reason; a missing required check never becomes green and a configuration finding never enables promotion.
+5. **Identity scoping** — the key includes repo, PR number, head SHA, base, policy branch, requirement set with provenance, and workflow revision; test isolation across repos, PRs and heads, and that hash and NNN spellings resolve to one key.
+6. **State over time** — a new head, retarget, requirement change or workflow-revision change invalidates the key; evidence older than the 15-minute freshness window cannot suppress; a restart mid-write leaves a readable or ignorable sidecar.
+7. **Who wrote it** — workflow evidence is read from the target repository at the immutable revision, never from an unrelated lane checkout; evidence comes from the base revision, not the PR head, so a PR cannot waive a requirement by editing its own workflow.
 
 ## Done when
 
