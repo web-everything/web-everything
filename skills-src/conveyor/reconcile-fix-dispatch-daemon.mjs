@@ -81,7 +81,7 @@ import { resolveFixSettings, resolveFixDispatchSettings } from '../../scripts/co
 import { unlinkSync, readFileSync, mkdirSync, writeFileSync, renameSync } from 'node:fs';
 import { resolveCascade } from '../../scripts/lib/policy-cascade.mjs';
 import { stopSession } from '../../scripts/operations/dispatch-abort.mjs';
-import { runOrphanFixRoundPass } from '../../scripts/conveyor/orphan-fix-round.mjs';
+import { defaultListBounced, runOrphanFixRoundPass } from '../../scripts/conveyor/orphan-fix-round.mjs';
 import { createStaleBaseGate } from '../../scripts/conveyor/stale-base-refresh.mjs';
 import { resolveRepairExecutorChains } from '../../scripts/lib/fix-executor-chain.mjs';
 import { resolveAiRouting, aiRoutingInputs, AI_ROUTING_STANDARD } from '../../scripts/lib/ai-routing.mjs';
@@ -1170,6 +1170,7 @@ export async function runTickAllRepos({
   adoptYieldProbe,
   // Off under a test run unless injected (the real pass reads GitHub).
   orphanGuardTick = process.env.VITEST ? null : runOrphanFixRoundPass,
+  listBouncedPrs = process.env.VITEST ? null : defaultListBounced,
 } = {}) {
   callRecorder.reset();
   const persistCursors = budgetRotation === fixPassRotation && prCursors === fixPassPrCursors;
@@ -1464,19 +1465,30 @@ export async function runTickAllRepos({
   planCache?.markTouched({ dispatched: (Array.isArray(orphanGuard.rows) ? orphanGuard.rows : [])
     .filter(row => row?.decision === 'redispatch' && row.result?.startsWith('re-dispatched'))
     .map(row => ({ repo: row.repo, pr: row.pr })) });
-  // A budget-skipped repo still gets ordinary fixes. Its review:changes rows remain
-  // guarded using the fix planner's own evidence, without another PR listing.
+  // A budget-skipped repo still gets ordinary fixes. Discover its review:changes
+  // PRs live: the shared snapshot/planner may predate a newly added label.
   const unvisited = new Set(orphanGuardEvidenceUnknown ? []
     : budgets['orphan-guard'].skipped.filter(repo => typeof repo === 'string' && !orphanGuardFailed.has(repoKeyForSlug(repo))));
   const orphanGuardDeferred = requireOrphanGuard
     ? stepRepos.get('fix').filter(repo => !orphanGuardCompleted.has(repo) && !unvisited.has(repo)) : [];
+  if (requireOrphanGuard) for (const repo of stepRepos.get('fix')) {
+    if (!unvisited.has(repo)) continue;
+    try {
+      const bounced = await listBouncedPrs(CONSTELLATION_REPOS[repoKeyForSlug(repo)].slug);
+      if (!Array.isArray(bounced) || bounced.some(pr => !Number.isInteger(pr?.number) || pr.number <= 0)) {
+        throw new Error('unreadable live review:changes listing');
+      }
+      for (const pr of bounced) holdPr(repo, pr.number);
+    } catch {
+      // Unknown live evidence holds the whole repo until the next pass.
+      orphanGuardDeferred.push(repo);
+    }
+  }
   const guardedFixRepos = stepRepos.get('fix').filter(repo => !orphanGuardDeferred.includes(repo));
   const fix = stepTimed('fix', () => (authGate.paused ? pausedDispatchResult()
     : runReconcileFixDispatchAllRepos({ repos: budgetRepos('fix', guardedFixRepos), allowStandDownAutoProceed,
       tick: boundedPrTick('fix', options => sharedTick('fix', fixTick ?? runReconcileFixDispatch)({ ...options,
-        ...(requireOrphanGuard ? { excludePrs: entry => orphanGuardHeldPrs.get(repoKeyForSlug(options.repo))?.has(entry.prNumber)
-          || (unvisited.has(options.repo) && (!Array.isArray(entry.labels)
-            || entry.labels.some(label => (typeof label === 'string' ? label : label.name) === 'review:changes'))),
+        ...(requireOrphanGuard ? { excludePrs: entry => orphanGuardHeldPrs.get(repoKeyForSlug(options.repo))?.has(entry.prNumber),
         } : {}),
       })),
       ...(fixTick ? {} : { queueAdmission, dispatchThrottle, borrowGate, fixExecutorRoute }) })));

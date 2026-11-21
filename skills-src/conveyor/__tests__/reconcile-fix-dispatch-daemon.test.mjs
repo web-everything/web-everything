@@ -2156,6 +2156,7 @@ describe('runTickAllRepos — one reconcile plan per repo per pass', () => {
     });
     return { planner, dispatch, promote, checkStaleness, timeoutHold, readHeadCheckState, live,
       options: { repos: ['we'], fixSettings: { skipEmptySteps: false, standDownAutoProceed: false },
+        listBouncedPrs: () => [],
         authGateOverride: () => ({ paused: false, reason: null }), notesDryRun: true,
         now: () => elapsed,
         readPlanFingerprint: () => { elapsed += 20; return new Map([[7, 'a'], [8, 'a']]); },
@@ -2213,14 +2214,18 @@ describe('runTickAllRepos — one reconcile plan per repo per pass', () => {
     expect(cursors['orphan-guard']).toEqual({ repo: cursor.repo, pr: 1 });
   });
 
-  it.each([{ repos: ['we'] }, { repos: ['we', 'frontierui'] }])('dispatches a normal fix every pass while deferred, not-done and unvisited orphan PRs are held (%j)', async ({ repos }) => {
+  it.each([
+    { repos: ['we'], reuseReconcilePlan: true },
+    { repos: ['we', 'frontierui'], reuseReconcilePlan: true },
+    { repos: ['we', 'frontierui'], reuseReconcilePlan: false },
+  ])('holds live review:changes PRs despite stale planner labels while dispatching ordinary fixes (%j)', async ({ repos, reuseReconcilePlan }) => {
     const realFix = fixDispatch.runReconcileFixDispatch;
     const f = productionFixture();
     vi.spyOn(rulingStandDown, 'runRulingResolvesStandDownPass').mockResolvedValue({ rows: [] });
     const dispatched = vi.fn(entry => ({ pr: entry.pr }));
     const rows = [1, 2, 3].map(prNumber => ({ kind: 'fix', prNumber,
       headRefName: `repair-${prNumber}`, headRefOid: 'a'.repeat(40),
-      labels: prNumber === 3 ? ['fix:ready'] : ['review:changes'], files: [`file-${prNumber}.mjs`] }));
+      labels: ['fix:ready'], files: [`file-${prNumber}.mjs`] }));
     f.planner.mockImplementation(() => planOf({ dispatch: rows }));
     vi.mocked(fixDispatch.runReconcileFixDispatch).mockImplementation(options => realFix({
       ...options, root: '/fixture', checkStaleness: f.checkStaleness,
@@ -2230,7 +2235,9 @@ describe('runTickAllRepos — one reconcile plan per repo per pass', () => {
       tryResume: null, tryResumeRound: null, dispatch: dispatched,
     }));
     let time = 0;
-    const options = { ...f.options, repos, now: () => time, budgetRotation: {}, prCursors: {},
+    const listBouncedPrs = vi.fn(async () => [{ number: 1 }, { number: 2 }]);
+    const options = { ...f.options, repos, reuseReconcilePlan, listBouncedPrs,
+      now: () => time, budgetRotation: {}, prCursors: {},
       passBudgets: resolveFixPassBudgets({ env: {}, file: { fixPassBudget: { orphanGuardMs: 1000 } } }),
       orphanGuardTick: async ({ repos }) => {
         const visited = [];
@@ -2246,7 +2253,34 @@ describe('runTickAllRepos — one reconcile plan per repo per pass', () => {
       expect(result.refusals.filter(row => row.kind === 'orphan-guard-deferred')
         .map(row => row.prNumber).sort()).toEqual(repos.flatMap(() => [1, 2]).sort());
       expect(dispatched).toHaveBeenCalledTimes((pass + 1) * repos.length);
+      expect(listBouncedPrs).toHaveBeenCalledTimes((pass + 1) * (repos.length - 1));
+      if (repos.length > 1) expect(listBouncedPrs).toHaveBeenLastCalledWith(
+        CONSTELLATION_REPOS[repos[(pass + 1) % repos.length]].slug);
     }
+  });
+
+  it.each(['throws', 'missing', 'malformed'])('holds the whole budget-skipped repo when its live bounced listing is %s', async mode => {
+    const f = productionFixture();
+    vi.spyOn(rulingStandDown, 'runRulingResolvesStandDownPass').mockResolvedValue({ rows: [] });
+    let time = 0;
+    const listBouncedPrs = vi.fn(async () => {
+      if (mode === 'throws') throw new Error('listing unavailable');
+      return [{ number: '4715' }];
+    });
+    const result = await realRunTickAllRepos({ ...f.options, repos: ['we', 'frontierui'],
+      now: () => time, budgetRotation: {}, prCursors: {}, reuseReconcilePlan: false,
+      listBouncedPrs: mode === 'missing' ? undefined : listBouncedPrs,
+      passBudgets: resolveFixPassBudgets({ env: {}, file: { fixPassBudget: { orphanGuardMs: 1000 } } }),
+      orphanGuardTick: async ({ repos }) => {
+        for (const repo of repos) { expect(repo.key).toBe('we'); time += 1001; }
+        return { rows: [] };
+      },
+    });
+    expect(vi.mocked(fixDispatch.runReconcileFixDispatch).mock.calls.map(([options]) => options.repo)).toEqual(['we']);
+    expect(result.refusals).toContainEqual({ repo: 'frontierui', prNumber: null,
+      kind: 'orphan-guard-deferred', why: 'orphan-cap guard did not complete this repo; fix deferred until next pass' });
+    expect(listBouncedPrs).toHaveBeenCalledTimes(mode === 'missing' ? 0 : 1);
+    if (mode !== 'missing') expect(listBouncedPrs).toHaveBeenCalledWith(CONSTELLATION_REPOS.frontierui.slug);
   });
 
   it('threads adoption yield into the orphan guard only when a probe exists', async () => {
@@ -2362,6 +2396,7 @@ describe('runTickAllRepos — one reconcile plan per repo per pass', () => {
     const escalate = vi.fn(async () => { capped.labels.push('review:human'); return { ok: true }; });
     const repos = ['we', 'frontierui'].map(key => form === 'slugs' ? CONSTELLATION_REPOS[key].slug : key);
     const options = { ...f.options, repos, now: () => time, budgetRotation: {},
+      listBouncedPrs: slug => slug === CONSTELLATION_REPOS.frontierui.slug ? [capped] : [],
       passBudgets: resolveFixPassBudgets({ env: {}, file: { fixPassBudget: { orphanGuardMs: 1000 } } }),
       orphanGuardTick: options => orphanFixRound.runOrphanFixRoundPass({ ...options, env: {},
         listBounced: slug => { time += 1001; return slug === CONSTELLATION_REPOS.frontierui.slug ? [capped] : []; },
