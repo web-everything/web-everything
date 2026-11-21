@@ -62,6 +62,81 @@ function fixture(test) {
 
 const declined = f => f.log.mock.calls.map(([line]) => line).filter(line => /^mq-same-head-retry-declined:/.test(line));
 
+describe('merge-queue same-head retry for unreadable failed-job logs', () => {
+  const REMOVED_AT = Date.parse('2026-11-07T22:21:51Z');
+  const setup = test => fixture(f => {
+    f.list = { ok: false, error: 'no quarantine' };
+    f.checks = [{ ...f.checks[0], name: 'test-shard (1)',
+      details_url: `https://github.com/${repo}/actions/runs/800/job/31` }];
+    delete f.logs[31];
+    f.mainRuns = [{ id: 900, head_sha: 'c'.repeat(40), path: '.github/workflows/ci.yml',
+      head_branch: 'main', event: 'push', status: 'completed', conclusion: 'success',
+      created_at: new Date(REMOVED_AT + 600_000).toISOString(),
+      updated_at: new Date(REMOVED_AT + 660_000).toISOString() }];
+    const base = f.exec;
+    f.exec = vi.fn((command, args, opts) => {
+      const endpoint = args.find(arg => typeof arg === 'string' && arg.startsWith(`repos/${repo}/`)) ?? '';
+      if (endpoint.includes('/actions/workflows/ci.yml/runs')) {
+        const runs = endpoint.includes('created=<') ? [] : f.mainRuns;
+        return JSON.stringify({ total_count: runs.length, workflow_runs: runs });
+      }
+      return base(command, args, opts);
+    });
+    f.guard = () => mqSameHeadGuard({ repo, pr, head, exec: f.exec, log: f.log, now: REMOVED_AT + 3_600_000,
+      quarantine: { readList: () => f.list, now: () => NOW } });
+    test(f);
+  });
+  const expectHeld = f => {
+    expect(f.guard().hold).toBe(true);
+    expect(f.log.mock.calls.some(([line]) => line.startsWith('mq-same-head-retry:'))).toBe(false);
+  };
+
+  it.each(['throws', 'empty'])('allows one retry with main green and PR CLEAN when the non-gate log %s', kind => setup(f => {
+    if (kind === 'empty') f.logs[31] = ' \n';
+    expect(f.guard().hold).toBe(false);
+    expect(f.log.mock.calls[0][0]).toContain('unreadable-log retry 1/1 (failed job log unreadable, main green, PR CLEAN)');
+    expect(f.log.mock.calls[0][0]).toContain('; main run 900; failed check(s): test-shard (1)');
+  }));
+
+  it.each(['second removal', 're-queued', 're-queued and failed again'])('holds after %s: the single unreadable-log retry is spent', kind => setup(f => {
+    f.events = kind === 'second removal' ? [removed(), removed()]
+      : kind === 're-queued' ? [removed(), added] : [removed(), added, removed()];
+    expectHeld(f);
+    expect(f.log.mock.calls[0][0]).toMatch(/operator must inspect history and enqueue manually|— failed_checks$/);
+  }));
+
+  it('keeps a readable non-infrastructure failure held', () => setup(f => {
+    f.logs[31] = logOf([FILE, NAME]);
+    expectHeld(f);
+    expect(declined(f).join('\n')).toContain('non-infrastructure failed check(s)');
+  }));
+
+  it('holds when another failed job has a readable non-infrastructure log', () => setup(f => {
+    f.checks.push({ ...f.checks[0], id: 35, name: 'test-shard (2)',
+      details_url: `https://github.com/${repo}/actions/runs/800/job/35` });
+    f.logs[35] = logOf([FILE, NAME]);
+    expectHeld(f);
+  }));
+
+  it.each(['merge-gate', 'review-gate'])('keeps an unreadable %s log held with the existing reason', name => setup(f => {
+    f.checks[0].name = name;
+    expectHeld(f);
+    expect(declined(f).join('\n')).toContain('job log evidence unreadable or incomplete; operator must inspect failed jobs and enqueue manually');
+  }));
+
+  it('holds when main CI is not green', () => setup(f => {
+    f.mainRuns[0].conclusion = 'failure';
+    expectHeld(f);
+    expect(declined(f).join('\n')).toContain('main CI is not green');
+  }));
+
+  it('holds when the PR is not CLEAN', () => setup(f => {
+    f.live.mergeStateStatus = 'BEHIND';
+    expectHeld(f);
+    expect(declined(f).join('\n')).toContain('PR is not CLEAN (BEHIND)');
+  }));
+});
+
 describe('merge-queue same-head retry for quarantined failures', () => {
   it('allows one retry when every failing test is in the active quarantine', () => fixture(f => {
     const result = f.guard();
