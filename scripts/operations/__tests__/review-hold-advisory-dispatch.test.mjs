@@ -1,3 +1,4 @@
+import { completeCheckRows } from '../../lib/__tests__/helpers/complete-check-rows.mjs';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -46,13 +47,13 @@ function probe({ mode, startAfter, state = 'matching' }) {
         readHead: () => state === 'no-head' ? null : state === 'head-changed' && headReads++ ? 'b'.repeat(40) : HEAD,
         readRequired: () => ({ source: state === 'untrusted' ? 'fallback' : 'live',
           checks: state === 'unknown-required' ? [] : ['test', 'review-gate'] }),
-        readChecks: () => {
+        readChecks: ({ headSha: rowsHead }) => {
           if (state === 'unreadable') throw new Error('offline');
-          return [
+          return completeCheckRows([
             ...(state === 'missing' ? [] : [{ name: 'test', status: state === 'malformed' ? null : 'completed', conclusion: 'success',
               ...(state === 'wrong-head' ? { head_sha: 'b'.repeat(40) } : {}) }]),
             { name: 'review-gate', status: 'completed', conclusion: 'failure' },
-          ];
+          ], rowsHead);
         },
       })),
       checkoutExists: () => true, checkStaleness: () => ({ fresh: true, behind: 0 }), stackCheck: () => ({ base: null }),

@@ -19,8 +19,9 @@ import { createMemoryRunStore } from '../run-store.mjs';
 import { reviewPrOperation, REVIEW_PR_OP, REVIEW_EFFECTS } from '../review-pr.mjs';
 import { advanceReviewPrToWriteUp } from '../record-verdict-io.mjs';
 import { runRecordVerdictSelfSufficient } from '../record-verdict-cli.mjs';
+import { runOperationCli } from '../cli-adapter.mjs';
 import { recordVerdictOperation, STAGE_REQUEST_EFFECT } from '../record-verdict.mjs';
-import { validateRequest, APPLIABLE_TARGETS } from '../../apply-review-request.mjs';
+import { validateRequest, APPLIABLE_TARGETS, buildLabelArgv } from '../../apply-review-request.mjs';
 
 // Pin optional-seat requests independently of live probation defaults. Historical runs below use a zero
 // declaration minimum so the saved two-seat roster remains representable; production resumes preserve
@@ -241,6 +242,61 @@ describe('#3540 record-verdict-cli — ONE call, no separate --resume of the rev
     const reviewPrRun = reviewPrStore.read('run-cli-1');
     expect(reviewPrRun.pending).toMatchObject({ kind: 'effect', step: 'record' });
     expect(reviewPrRun.findings.stageVerdict).toMatchObject({ applied: true });
+  });
+
+  it.each(['generic', 'self-sufficient'])('forwards an explicit clearance head through the %s CLI to staged JSON', async (entry) => {
+    const { run } = await runAtConfirm({ id: 'run-cli-pinned', labels: ['review:human'] });
+    run.input.expectedHead = 'b'.repeat(40);
+    const store = createMemoryRunStore();
+    store.write(run);
+    const expectedHead = 'Ab'.repeat(20);
+    const declaration = recordVerdictOperation(
+      { readRun: ({ runId }) => ({ record: store.read(runId), body: 'staged operator review' }) },
+      { validateRequest, appliableTargets: APPLIABLE_TARGETS },
+    );
+    const registry = createRegistry();
+    registry.register(declaration);
+    const staged = [];
+    const invoke = entry === 'generic' ? runOperationCli : runRecordVerdictSelfSufficient;
+    const out = await invoke({
+      declaration, registry, store,
+      sinks: { [STAGE_REQUEST_EFFECT]: async (payload) => { staged.push(payload); return { pushed: true }; } },
+      argv: ['--runId=run-cli-pinned', '--to=clear-human', '--actor=operator',
+        '--operatorInstruction=clear this head', `--expectedHead=${expectedHead}`],
+      newRunId: () => `record-verdict-pinned-${entry}`,
+    });
+    expect(out.code).toBe(0);
+    expect(staged).toHaveLength(1);
+    const request = JSON.parse(staged[0].content);
+    expect(request).toMatchObject({ expectedHead, to: 'clear-human', operatorInstruction: 'clear this head' });
+    expect(validateRequest(request).ok).toBe(true);
+    expect(buildLabelArgv(validateRequest(request).request)).toContain(`--expect-head=${expectedHead}`);
+    expect(store.read(run.id)).toEqual(run);
+  });
+
+  it.each([undefined, '', 'abc', 'g'.repeat(40)])('stages nothing for a clearance without a usable explicit pin (%j)', async (expectedHead) => {
+    const store = createMemoryRunStore();
+    const { run: record } = await runAtConfirm({ id: 'review-pr-missing-pin', labels: ['review:human'] });
+    record.input.expectedHead = 'b'.repeat(40);
+    store.write(record);
+    const declaration = recordVerdictOperation(
+      { readRun: ({ runId }) => ({ record: store.read(runId), body: 'staged operator review' }) },
+      { validateRequest, appliableTargets: APPLIABLE_TARGETS },
+    );
+    const registry = createRegistry();
+    registry.register(declaration);
+    const staged = [];
+    const out = await runRecordVerdictSelfSufficient({
+      declaration, registry, store,
+      sinks: { [STAGE_REQUEST_EFFECT]: async (payload) => { staged.push(payload); } },
+      argv: ['--runId=review-pr-missing-pin', '--to=clear-human', '--operatorInstruction=clear it',
+        ...(expectedHead === undefined ? [] : [`--expectedHead=${expectedHead}`])],
+      newRunId: () => 'record-verdict-missing-pin',
+    });
+    expect(out.code).not.toBe(0);
+    expect(out.lines.join('\n')).toMatch(/expectedHead/);
+    expect(staged).toEqual([]);
+    expect(store.read(record.id)).toEqual(record);
   });
 
   it('leaves a `to=clear-human` call to record-verdict\'s OWN refusal, untouched by the pre-pass', async () => {
