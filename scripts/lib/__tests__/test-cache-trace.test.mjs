@@ -231,18 +231,23 @@ describe('analyzeTrace — bun cache home read', () => {
   const base = { root: '/r/lane', tmpRoots: ['/t'], home: '/h', closure: new Set(), execPath: '/custom/node-runtime' };
   const denies = (p, k = 'read') => analyzeTrace({ ...base, events: [{ k, p }] }).denies;
 
-  it('a read of ~/.bun is not a deny', () => {
-    expect(denies('/h/.bun', 'stat')).toEqual([]);
-    expect(denies('/h/.bun/install/cache/pkg@1.0.0/index.js')).toEqual([]);
+  it.each(['stat', 'exists'])('a read of ~/.bun is not a deny: a %s probe of ~/.bun and ~/.bun/install/cache', (k) => {
+    expect(denies('/h/.bun', k)).toEqual([]);
+    expect(denies('/h/.bun/install/cache', k)).toEqual([]);
   });
 
-  it('an allowed bun cache access is still traced, so a cache change invalidates the cache key', () => {
-    const out = analyzeTrace({ ...base, events: [{ k: 'read', p: '/h/.bun/install/cache/pkg/index.js' }, { k: 'stat', p: '/h/.bun' }] });
-    expect(out.traced.map((t) => t.path).sort()).toEqual(['/h/.bun', '/h/.bun/install/cache/pkg/index.js']);
+  it('an allowed probe is still traced', () => {
+    const out = analyzeTrace({ ...base, events: [{ k: 'stat', p: '/h/.bun' }, { k: 'exists', p: '/h/.bun/install/cache' }] });
+    expect(out.traced.map((t) => t.path).sort()).toEqual(['/h/.bun', '/h/.bun/install/cache']);
   });
 
-  it.each(['read', 'list', 'mod'])('the bare ~/.bun exception is a stat/exists probe only: %s stays a deny', (k) => {
+  it.each(['read', 'list', 'mod'])('the probe exception is stat/exists only: %s of either dir stays a deny', (k) => {
     expect(denies('/h/.bun', k)).toHaveLength(1);
+    expect(denies('/h/.bun/install/cache', k)).toHaveLength(1);
+  });
+
+  it.each(['read', 'stat', 'exists'])('cache contents stay denied for %s', (k) => {
+    expect(denies('/h/.bun/install/cache/pkg@1.0.0/index.js', k)).toHaveLength(1);
   });
 
   it('a cache entry symlinked to a credential file is a deny (symlinks are resolved before the allow)', () => {
@@ -251,7 +256,7 @@ describe('analyzeTrace — bun cache home read', () => {
     mkdirSync(join(home, '.ssh'));
     writeFileSync(join(home, '.ssh', 'id_rsa'), 'k');
     symlinkSync(join(home, '.ssh', 'id_rsa'), join(home, '.bun', 'install', 'cache', 'evil'));
-    const out = analyzeTrace({ ...base, home, events: [{ k: 'read', p: join(home, '.bun', 'install', 'cache', 'evil') }] });
+    const out = analyzeTrace({ ...base, home, events: [{ k: 'stat', p: join(home, '.bun', 'install', 'cache', 'evil') }] });
     expect(out.denies).toEqual([expect.stringMatching(/^home-read: /)]);
     expect(out.traced).toEqual([]);
   });
