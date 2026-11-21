@@ -16,10 +16,17 @@ export function transform(bytes, destId, bornAs) {
     throw new Error('Invalid card bytes or identity; inspect snapshot');
   if (/^(id|formerly):[ \t]*[>|]/m.test(front) || /^(id|formerly):[^\r\n]*\r?\n[ \t]+\S/m.test(front))
     throw new Error('Multiline identity requires operator inspection');
-  const newline = text.startsWith('---\r\n') ? '\r\n' : '\n';
-  const clean = front.split(/\r?\n/).filter((line) => !/^(id|formerly):/.test(line)).join(newline);
-  const end = text.indexOf(`${newline}---`, 3) + newline.length;
-  return Buffer.from(`---${newline}id: ${JSON.stringify(destId)}${newline}formerly: ${JSON.stringify(bornAs)}${newline}${clean}${newline}${text.slice(end)}`);
+  // Same delimiters splitCard parsed: opening/closing line endings may differ (mixed CRLF/LF), so capture each.
+  const parts = /^---(\r?\n)([\s\S]*?)(\r?\n)---([\s\S]*)$/.exec(text);
+  if (!parts || parts[2] !== front) throw new Error('Invalid card bytes or identity; inspect snapshot');
+  const [, open, , close, rest] = parts;
+  const identityLine = (line) => /^(id|formerly):/.test(line);
+  const lines = front.split(/(?<=\n)/);
+  let clean = lines.filter((line) => !identityLine(line)).join('');
+  // An unterminated last line that is dropped leaves the previous line's ending ahead of the closing delimiter's own.
+  const last = lines.at(-1);
+  if (identityLine(last) && !/\n$/.test(last)) clean = clean.replace(/\r?\n$/, '');
+  return Buffer.from(`---${open}id: ${JSON.stringify(destId)}${open}formerly: ${JSON.stringify(bornAs)}${open}${clean}${close}---${rest}`);
 }
 export function buildManifest({ sourceSha, cards }) {
   if (!/^[a-f0-9]{40}$/.test(sourceSha) || !Array.isArray(cards) || !cards.length) throw new Error('Pinned sourceSha and snapshots required');

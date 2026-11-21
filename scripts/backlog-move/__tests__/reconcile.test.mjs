@@ -7,6 +7,7 @@ import { parseArgs, main, assertWriterToken } from '../cli.mjs';
 const sha = 'a'.repeat(40), mainSha = 'b'.repeat(40), destSha = 'c'.repeat(40);
 const sourcePath = 'backlog/083-agent-file-lock-coordination.md';
 const bytes = Buffer.from('---\nkind: decision\n---\n\nPlacement: plateau-app\nA daemon gate.\n');
+const secondPath = 'backlog/084-second-card.md';
 const make = () => buildManifest({ sourceSha: sha, cards: [{ sourcePath, bytes }] });
 const row = () => make().cards[0];
 const crashAssertion = (fn) => expect(fn({ ...row(), state: 'copy' }, 'same', 'destDigest', false).action).toBe('reconcile-links');
@@ -70,6 +71,22 @@ describe('manifest', () => {
     }
     expect(() => verifyManifest(make(), [{ sourcePath, bytes: Buffer.concat([bytes, Buffer.from('edit')]) }])).toThrow(/digest/);
   });
+  it.each([
+    ['CRLF opening, LF closing', '---\r\nkind: decision\n---\n\nPlacement: plateau-app\n', '---\r\nid: "083"\r\nformerly: "we:#083"\r\nkind: decision\n---\n\nPlacement: plateau-app\n'],
+    ['LF opening, CRLF closing', '---\nkind: decision\r\n---\r\n\nPlacement: plateau-app\n', '---\nid: "083"\nformerly: "we:#083"\nkind: decision\r\n---\r\n\nPlacement: plateau-app\n'],
+    ['mixed front lines with a dropped trailing id', '---\nkind: decision\r\nid: "x"\n---\nPlacement: plateau-app\n', '---\nid: "083"\nformerly: "we:#083"\nkind: decision\n---\nPlacement: plateau-app\n'],
+    ['mixed front lines kept as written', '---\nid: "x"\nkind: decision\r\nplacement: plateau-app\n---\nbody\n', '---\nid: "083"\nformerly: "we:#083"\nkind: decision\r\nplacement: plateau-app\n---\nbody\n'],
+    ['pure CRLF', '---\r\nkind: decision\r\n---\r\nbody\r\n', '---\r\nid: "083"\r\nformerly: "we:#083"\r\nkind: decision\r\n---\r\nbody\r\n'],
+  ])('transform preserves card content with %s endings', (_, source, expected) => {
+    const out = transform(Buffer.from(source), '083', 'we:#083');
+    expect(out.toString()).toBe(expected);
+    expect(out.toString().match(/^---/gm)).toHaveLength(2);
+  });
+  it('the manifest records the digest of the uncorrupted mixed-ending destination bytes', () => {
+    const mixed = Buffer.from('---\r\nkind: decision\n---\n\nPlacement: plateau-app\n');
+    expect(buildManifest({ sourceSha: sha, cards: [{ sourcePath, bytes: mixed }] }).cards[0].destDigest)
+      .toBe(digest(Buffer.from('---\r\nid: "083"\r\nformerly: "we:#083"\r\nkind: decision\n---\n\nPlacement: plateau-app\n')));
+  });
   it('refuses missing snapshots, duplicate ids, malformed paths and unsure classifications', () => {
     expect(() => verifyManifest(make(), [])).toThrow();
     expect(() => buildManifest({ sourceSha: sha, cards: [{ sourcePath, bytes }, { sourcePath, bytes }] })).toThrow();
@@ -79,7 +96,7 @@ describe('manifest', () => {
   });
 });
 
-function harness({ absent = true, fail, changed = false, collision = false, alternate = false, sourceTreeFailure = false, oversized = false, incidentalStub = false, malformedListing = false, arbitraryBytes = false, coexist = false, stub = false } = {}) {
+function harness({ absent = true, fail, changed = false, collision = false, alternate = false, sourceTreeFailure = false, oversized = false, incidentalStub = false, malformedListing = false, arbitraryBytes = false, coexist = false, stub = false, second = false } = {}) {
   const calls = [], output = [], env = { GH_TOKEN: 'ghs_fixture', GIT_DIR: 'hostile', GIT_WORK_TREE: 'hostile' };
   const run = (bin, args, opts) => {
     calls.push({ bin, args, opts });
@@ -89,7 +106,7 @@ function harness({ absent = true, fail, changed = false, collision = false, alte
       if (args.includes('rev-parse')) return args.at(-1).includes('origin/main') ? mainSha : sha;
       if (args.includes('ls-tree')) {
         if (sourceTreeFailure && args.includes(mainSha)) throw new Error('tree unreadable');
-        return `${sourcePath}\0backlog/375-inbound.md\0`;
+        return `${sourcePath}\0${second ? `${secondPath}\0` : ''}backlog/375-inbound.md\0`;
       }
       if (args.at(-1).endsWith('375-inbound.md')) return Buffer.from('See #083 and 083-agent-file-lock-coordination.md');
       if (args.at(-1).startsWith(mainSha) && stub) return Buffer.from('moved to a private store');
@@ -169,6 +186,28 @@ describe('read-only CLI', () => {
   it('other destination bytes quarantine even without recognizable frontmatter', () => {
     const io = harness({ absent: false, arbitraryBytes: true }); expect(main(planArgs, io)).toBe(2);
     expect(io.output[0].cards[0]).toMatchObject({ F2: 'other', next: { action: 'quarantine' } });
+  });
+  it.each([
+    ['divergent destination bytes', { absent: false, arbitraryBytes: true }],
+    ['an unreadable remote', { fail: true }],
+  ])('a batch stopped by %s still emits every manifest row, and the output is a valid manifest for status', (_, options) => {
+    const io = harness({ ...options, second: true });
+    expect(main(['plan', '--cards', '083,084', '--source-sha', sha], io)).toBe(2);
+    const out = io.output[0];
+    expect(out.cards.map((r) => r.sourcePath)).toEqual([sourcePath, secondPath]);
+    expect(out.cards[0].next.action).not.toBe('not-observed');
+    expect(out.cards[1]).toMatchObject({ F1: null, F2: null, F3: null, next: { action: 'not-observed' } });
+    expect(out.remainingCards).toEqual(['we:#084']);
+    const again = harness({ ...options, second: true }); again.read = () => JSON.stringify(out);
+    expect(() => main(['status', '--manifest', 'saved.json'], again)).not.toThrow();
+    expect(again.output[0].manifestId).toBe(out.manifestId);
+    expect(again.output[0].cards).toHaveLength(2);
+  });
+  it('a fully observed batch has no unobserved rows', () => {
+    const io = harness({ second: true });
+    expect(main(['plan', '--cards', '083,084', '--source-sha', sha], io)).toBe(0);
+    expect(io.output[0].cards.filter((r) => r.next.action === 'not-observed')).toEqual([]);
+    expect(io.output[0].remainingCards).toEqual([]);
   });
   it('refuses oversized selection with an operator fallback', () => {
     expect(() => parseArgs(['plan', '--cards', Array.from({ length: 21 }, (_, i) => String(i)).join(','), '--source-sha', sha])).toThrow(/smaller batch/);

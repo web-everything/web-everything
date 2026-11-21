@@ -148,7 +148,10 @@ export function main(args, io = {}) {
   const timeET = new Intl.DateTimeFormat('en-CA', { timeZone: 'America/Toronto', dateStyle: 'short', timeStyle: 'long', hour12: false }).format((io.now ?? (() => new Date()))());
   (io.print ?? console.log)(JSON.stringify({ ...manifest, sourceSha, sourceMainSha, destinationMainSha, timeET,
     sourceMainObservation: 'local refs/remotes/origin/main (no fetch)',
-    remainingCards: manifest.cards.slice(cards.length).map((r) => r.bornAs), cards }, null, 2));
+    remainingCards: manifest.cards.slice(cards.length).map((r) => r.bornAs),
+    // Every manifest row is emitted so the output stays a valid manifest for `status`; rows after a stop were never observed.
+    cards: [...cards, ...manifest.cards.slice(cards.length).map((row) => ({ ...row, target: row.classification, inboundLinks: inbound.get(row.sourcePath),
+      F1: null, F2: null, F3: null, next: { action: 'not-observed', reason: 'Batch stopped before this card; no facts observed' } }))] }, null, 2));
   return cards.some((r) => ['stop', 'quarantine'].includes(r.next.action)) ? 2 : 0;
 }
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
