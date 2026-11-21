@@ -17,7 +17,7 @@ import {
   defaultReadRequiredContexts, defaultReadAttributedRequiredChecks, defaultReadHeadCommittedAt, triggerCiForPr, clearStaleCheckingLabel,
   sweepMissingRunRecovery as sweepMissingRunRecoveryWithIo, formatMissingRunReport, reconcileAcceptanceAfterRebase, defaultReadPrLabels, detectMainTransition, recordMainState,
   resolveApplyBudgetMs, resolveMaxApplyPerTick, createFileApplyLedger, normalizeApplyLedger, main,
-  mergeApplyLedgers, pruneApplyLedger, APPLY_LEDGER_TTL_MS, APPLY_LEDGER_MAX_ENTRIES, APPLY_LEDGER_SEQ_REBASE,
+  sweepExhaustedRetry, mergeApplyLedgers, pruneApplyLedger, APPLY_LEDGER_TTL_MS, APPLY_LEDGER_MAX_ENTRIES, APPLY_LEDGER_SEQ_REBASE,
 } from '../ci-red-recovery-watch.mjs';
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -312,6 +312,26 @@ describe('ci-red-recovery-watch — sweepCiRedRecovery (dry run, apply: false by
     expect(readComments.mock.calls.length).toBeLessThan(20);
     expect(refresh).toHaveBeenCalled();
     expect(result.applied.some((a) => a.action === 'rebased')).toBe(true);
+    expect(result.discoveryDeferred.length).toBeGreaterThan(0);
+    expect(result.candidates.filter((c) => c.discoveryDeferred).map((c) => c.prNumber)).toEqual(result.discoveryDeferred);
+  });
+  it('discovery-deferred PRs lead the next tick via the ledger, and the exhausted pass never reads them', () => {
+    const prs = Array.from({ length: 6 }, (_, i) => ({ ...PR_2635, number: 2900 + i, headRefName: `lane/x${i}` }));
+    const store = { seq: 0, at: {}, ts: {} };
+    const applyLedger = { read: () => JSON.parse(JSON.stringify(store)), write: (s) => Object.assign(store, JSON.parse(JSON.stringify(s))) };
+    let t = 0;
+    const readComments = vi.fn(() => { t += 100_000; return []; });
+    const opts = { readOpenPrs: () => prs, readMainRuns: () => MAIN_RUNS, readAheadBy: () => 33, readComments, applyLedger,
+      refresh: () => ({ deferred: true, ok: false, error: 'claim' }), postComment: vi.fn(), apply: true, now: () => t, discoveryBudgetMs: 150_000 };
+    const first = sweepCiRedRecovery(opts);
+    expect(first.discoveryDeferred).toEqual([2902, 2903, 2904, 2905]);
+    t = 0; readComments.mockClear();
+    const second = sweepCiRedRecovery(opts);
+    expect(second.discoveryDeferred).toEqual([2904, 2905, 2900, 2901]); // 2902/2903 were read now, 2900/2901 last tick
+    const exhaustedReads = vi.fn(() => []);
+    const ex = sweepExhaustedRetry({ settings: { enabled: true, maxRetries: 1, lookbackHours: 1 }, candidates: second.candidates, mainRuns: MAIN_RUNS,
+      readComments: exhaustedReads, repo: null });
+    expect(exhaustedReads.mock.calls.map(([n]) => n).filter((n) => second.discoveryDeferred.includes(n))).toEqual([]);
   });
 
   // Review round 2 of #6340: `started` was bumped before the refresh ran, so a refresh that came back deferred
@@ -356,7 +376,7 @@ describe('ci-red-recovery-watch — sweepCiRedRecovery (dry run, apply: false by
     const refresh = vi.fn(() => { t += 35_000; return { deferred: true, ok: false, error: 'verification failed' }; });
     sweepCiRedRecovery({
       readOpenPrs: () => { t += 200_000; return prs; }, readMainRuns: () => MAIN_RUNS, readAheadBy: () => 33, readComments: () => [],
-      refresh, postComment: vi.fn(), apply: true, now: () => t, applyBudgetMs: 170_000, maxApplyPerTick: 8,
+      refresh, postComment: vi.fn(), apply: true, now: () => t, applyBudgetMs: 170_000, maxApplyPerTick: 8, discoveryBudgetMs: Infinity,
     });
     expect(refresh).toHaveBeenCalledTimes(2); // 60 s grace: attempts at +0 s and +35 s, stopped at +70 s
   });

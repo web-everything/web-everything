@@ -298,17 +298,20 @@ export function sweepCiRedRecovery({
   // base), read only for a candidate this path could actually admit.
   // 2026-11-21 live: discovery (one comment read per owed PR) outlasted the 300 s pass deadline and the pass was
   // SIGTERMed before any refresh. Discovery now has its own budget (measured from the tick's start): once spent, and
-  // after at least one PR was fully read, the remaining PRs are left for the next tick (no reads, not planned).
-  // Least-recently-attempted PRs are discovered first (same ledger as the apply loop) so the tail is not starved.
+  // after at least one PR was read, the remaining PRs are left for the next tick: they are flagged
+  // `discoveryDeferred`, listed in the result, and never read by the exhausted-retry pass either.
+  // PRs whose comments were read are stamped (`d:<pr>`) in the ledger, so the next tick discovers the ones this
+  // tick skipped first (the apply stamps alone would miss claim-held or refused PRs and starve those behind them).
+  const discoveryKey = (c) => `d:${c.prNumber}`;
   let discoverySeen = {};
   try { if (apply && applyLedger) discoverySeen = normalizeApplyLedger(applyLedger.read()).at; } catch { /* fairness only */ }
-  const discoveryOrder = rawCandidates.map((c, i) => ({ c, i, seen: discoverySeen[String(c.prNumber)] ?? 0 }))
+  const discoveryOrder = rawCandidates.map((c, i) => ({ c, i, seen: discoverySeen[discoveryKey(c)] ?? 0 }))
     .sort((a, b) => a.seen - b.seen || a.i - b.i).map((x) => x.c);
   let discoveryReads = 0;
-  const readCommentsTimed = (prNumber, opts) => { discoveryReads += 1; return readComments(prNumber, opts); };
+  const readPrs = new Set();
+  const readCommentsTimed = (prNumber, opts) => { discoveryReads += 1; readPrs.add(prNumber); return readComments(prNumber, opts); };
   const discovered = discoveryOrder.map((c) => {
-    // Floor of 4 fully-read PRs: a few deferrals (cross-repo, claim-held) must not leave no refreshable PR in the plan.
-    if (discoveryReads >= 4 && now() - tickStartedAt >= discoveryBudgetMs) return { ...c, discoveryDeferred: true };
+    if (discoveryReads >= 1 && now() - tickStartedAt >= discoveryBudgetMs) return { ...c, discoveryDeferred: true };
     let exhaustionComments;
     if (exhaustedRetrySettings?.enabled && exhaustedRetrySettings.maxRetries > 0) {
       exhaustionComments = readCommentsTimed(c.prNumber, { repo });
@@ -345,6 +348,17 @@ export function sweepCiRedRecovery({
     return { ...withFacts, comments, rebaseAttemptsForSha: countRebaseOntoMainComments(comments, c.headSha, { mainRedWindows, mainGreen }) };
   });
   const candidates = discovered.filter((c) => !c.discoveryDeferred);
+  const discoveryDeferred = discovered.filter((c) => c.discoveryDeferred).map((c) => c.prNumber);
+  // Only stamp when discovery actually deferred someone (the only case where fairness across ticks matters).
+  if (apply && applyLedger && readPrs.size && discoveryDeferred.length) {
+    try {
+      let ledger = normalizeApplyLedger(applyLedger.read());
+      ledger = pruneApplyLedger(ledger, now());
+      ledger.seq += 1;
+      for (const pr of readPrs) { ledger.at[`d:${pr}`] = ledger.seq; ledger.ts[`d:${pr}`] = now(); }
+      applyLedger.write(ledger);
+    } catch { /* fairness only */ }
+  }
   // xd3dkzx — mainRuns (with per-check verdicts) so recovery is judged on the PR's own failing check.
   // Card xu1nixv — the red-main fix PRs (published priority record) are never told to wait for main.
   const prio = readPriority();
@@ -452,7 +466,7 @@ export function sweepCiRedRecovery({
   }
   // Keep discovery rows too: a retry can have gone green (or be missing checks) since the last tick.
   // The exhausted pass merges these with the attributed candidates instead of rebuilding ownership.
-  return { ...plan, applied, ...(ledgerError ? { applyLedgerError: ledgerError } : {}), mainRedWindows, mainLatestCheckRuns, mainRuns, mainGreen: mainGreen ? !mainGreen.red : null, candidates, prs: prList, requiredChecks: checks };
+  return { ...plan, applied, ...(ledgerError ? { applyLedgerError: ledgerError } : {}), mainRedWindows, mainLatestCheckRuns, mainRuns, mainGreen: mainGreen ? !mainGreen.red : null, candidates: discovered, ...(discoveryDeferred.length ? { discoveryDeferred } : {}), prs: prList, requiredChecks: checks };
 }
 
 // live PR #5195, 2026-10-14: read FAILED sibling logs, not just the aggregate check's 3s log.
@@ -553,6 +567,8 @@ export function sweepExhaustedRetry({ repo = null, apply = false, defaultBranch 
   }
   let mainTip;
   for (const c of candidates) {
+    // The first pass ran out of discovery budget before reading this PR: leave it for the next tick (no unbudgeted read).
+    if (c.discoveryDeferred) continue;
     const comments = c.comments ?? readComments(c.prNumber, { repo });
     const facts = c.exhaustion ?? exhaustionFacts({ comments, ciHealBudget, ciHealCap, headSha: c.headSha });
     const outcome = c.pr ? retryOutcome({ comments, pr: c.pr, requiredChecks: c.requiredChecks }) : null;
@@ -2151,6 +2167,9 @@ export async function main(argv, { sweepOptions = {}, sweepMainRed = sweepCiRedR
     }
   };
   const result = runPass('main-red', sweepMainRed, { ...options, exhaustedRetrySettings });
+  if (result.discoveryDeferred?.length) {
+    writeLine(2, `ci-red-recovery-watch: discovery budget spent — ${result.discoveryDeferred.length} PR(s) left for the next tick: ${result.discoveryDeferred.join(', ')}`);
+  }
   // Never rediscover exhausted candidates if the first pass failed: ownership facts may be incomplete.
   if (recordMainState({ repo: repoFlag, mainGreen: result.mainGreen })) {
     writeLine(2, `ci-red-recovery-watch: main turned green since the previous tick — ${result.dispatch?.length ?? 0} refresh(es) owed, ${result.applied?.filter((a) => a.ok).length ?? 0} applied this tick`);

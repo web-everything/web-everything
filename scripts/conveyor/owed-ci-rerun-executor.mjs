@@ -19,10 +19,11 @@ export function probeOriginMain(root = REPO_ROOT, run = gitRun) {
   const env = { ...process.env, GIT_NO_REPLACE_OBJECTS: '1', GIT_GRAFT_FILE: '/dev/null' };
   for (const k of ['GIT_DIR', 'GIT_WORK_TREE', 'GIT_INDEX_FILE', 'GIT_OBJECT_DIRECTORY', 'GIT_ALTERNATE_OBJECT_DIRECTORIES']) delete env[k];
   const opts = { cwd: root, env };
-  if (run(['fetch', 'origin', 'main', '--quiet'], opts).status !== 0) return { offline: true };
-  const rev = run(['rev-parse', '--verify', 'origin/main^{commit}'], opts);
-  const sha = rev.status === 0 ? rev.stdout.trim() : '';
-  return /^[0-9a-f]{40}$/.test(sha) ? { fresh: true, sha } : { offline: true };
+  if (run(['fetch', 'origin', '+refs/heads/main:refs/remotes/origin/main', '--quiet'], opts).status !== 0) return { offline: true };
+  const rev = ref => { const r = run(['rev-parse', '--verify', `${ref}^{commit}`], opts); return r.status === 0 ? r.stdout.trim() : ''; };
+  const sha = rev('origin/main');
+  // The fetched commit (FETCH_HEAD) must be the one the tracking ref names, or the ref may be stale.
+  return /^[0-9a-f]{40}$/.test(sha) && rev('FETCH_HEAD') === sha ? { fresh: true, sha } : { offline: true };
 }
 
 export async function executeOwedCiReruns({ rows = [], repo, dispatchRetry = dispatchTimeoutRetry,
@@ -43,7 +44,7 @@ export async function executeOwedCiReruns({ rows = [], repo, dispatchRetry = dis
     try {
       if (owed.length) {
         const st = probe(root);
-        if (!st || st.offline) throw new Error('main freshness unknown (offline); owed rerun deferred');
+        if (st?.fresh !== true || st.offline) throw new Error('main freshness unknown (offline); owed rerun deferred');
       }
     } catch (error) {
       result.refused = owed.map(row => ({ pr: row.prNumber, reason: String(error?.message ?? error) }));
