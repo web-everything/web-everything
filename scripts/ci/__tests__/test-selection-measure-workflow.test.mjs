@@ -28,6 +28,11 @@ describe('test-selection measure produces data (advisory)', () => {
     expect(workflow.on.push.branches).toEqual(['main']);
   });
 
+  it('measures the merged commit (base HEAD^), not an empty diff against main itself', () => {
+    const rec = job.steps.find(s => String(s.run ?? '').includes('test-selection.mjs --measure'));
+    expect(rec.run).toContain('--base=HEAD^');
+  });
+
   it('is still gated on the repo variable (or manual dispatch)', () => {
     expect(String(job.if)).toContain("vars.WE_MEASURE_TEST_SELECTION == '1'");
   });

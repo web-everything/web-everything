@@ -96,7 +96,7 @@ jobs:
       - name: Record false-green signal (#2681)
         if: ${{ steps.report.outcome == 'success' }}
         working-directory: web-everything
-        run: node scripts/readiness/test-selection.mjs --measure --vitest-json=vitest-full.json
+        run: node scripts/readiness/test-selection.mjs --measure --base=HEAD^ --vitest-json=vitest-full.json
         env:
           # Evaluate the decision AS IF the shrink were on, so the measure reflects what shrink WOULD do —
           # without any real gate depending on it (this job gates nothing).
