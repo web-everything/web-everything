@@ -3051,6 +3051,7 @@ async function cmdAcquire(repo) {
       const tip = git(['rev-parse', '--verify', target], dir).trim();
       if (!/^[a-f0-9]{40}$/.test(tip) || tip !== flags.at) throw new Error('--at must equal the fetched origin branch tip; inspect the branch and retry');
       git(['cat-file', '-e', `${flags.at}^{commit}`], dir);
+      if (!sameLease(readLease(dir), pinnedClaim)) throw new Error('pinned claim changed before checkout; inspect the current holder');
       git(['checkout', '--no-overwrite-ignore', '--detach', flags.at, '--quiet'], dir);
       // Do not execute branch-controlled install/lifecycle scripts in the acquirer's
       // context. Dependencies for a pinned checkout must be prepared during verification.
@@ -3058,16 +3059,13 @@ async function cmdAcquire(repo) {
     } catch (e) {
       // All target checks precede checkout; restore main even if checkout partially failed,
       // but refuse recovery if it would overwrite ignored local configuration.
-      try {
-        if (!sameLease(readLease(dir), pinnedClaim)) throw new Error('pinned rollback lease changed; inspect the current holder');
-        git(['checkout', '--no-overwrite-ignore', '-B', repo.branch, `origin/${repo.branch}`, '--quiet'], dir);
-        journalLaneEvent(dir, { action: 'acquire-rollback', headAfter: laneHead(dir), reason: 'pinned target refused' });
-      }
-      finally {
-        if (takeMarkerIf(dir, moved => sameLease(moved, pinnedClaim), chosen)
-          && preClaimLease && !isLeaseStale(preClaimLease, Date.now(), ttlMsFromFlags())) {
-          try { writeLeaseAtomic(LEASE_MARKER(dir), JSON.stringify(preClaimLease, null, 2) + '\n', { exclusive: true }); } catch { /* replacement holder wins */ }
-        }
+      if (!sameLease(readLease(dir), pinnedClaim)) throw new Error('pinned rollback lease changed; inspect the current holder');
+      git(['checkout', '--no-overwrite-ignore', '-B', repo.branch, `origin/${repo.branch}`, '--quiet'], dir);
+      journalLaneEvent(dir, { action: 'acquire-rollback', headAfter: laneHead(dir), reason: 'pinned target refused' });
+      // Keep the pinned lease if recovery throws: an off-main lane is not free.
+      if (takeMarkerIf(dir, moved => sameLease(moved, pinnedClaim), chosen)
+        && preClaimLease && !isLeaseStale(preClaimLease, Date.now(), ttlMsFromFlags())) {
+        try { writeLeaseAtomic(LEASE_MARKER(dir), JSON.stringify(preClaimLease, null, 2) + '\n', { exclusive: true }); } catch { /* replacement holder wins */ }
       }
       fail(msgOf(e));
     }

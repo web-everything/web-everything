@@ -80,6 +80,11 @@ describe('acquire at an exact pushed branch tip', () => {
     expect(readFileSync(join(lane, '.env'), 'utf8')).toBe('precious local configuration');
     expect(git(['rev-parse', 'HEAD'], lane)).toBe(tip);
     expect(result.stderr).toMatch(/overwritten by checkout/);
+    expect(JSON.parse(readFileSync(lease(), 'utf8'))).toMatchObject({ at: tip, branch: 'lane/target' });
+    const retry = run('acquire', ['--lane=1', '--session=next-holder'], { CLAUDE_CODE_SESSION_ID: 'next-holder' });
+    expect(retry.status).not.toBe(0);
+    expect(git(['rev-parse', 'HEAD'], lane)).toBe(tip);
+    expect(readFileSync(join(lane, '.env'), 'utf8')).toBe('precious local configuration');
   });
   it.each([false, true])('restores main after a partially failed pinned checkout (prior lease=%s)', prior => {
     if (prior) expect(run('acquire', ['--lane=1']).status).toBe(0);
@@ -167,7 +172,7 @@ describe('acquire at an exact pushed branch tip', () => {
     expect(existsSync(evidence)).toBe(false);
     expect(git(['rev-parse', 'HEAD'], lane)).toBe(tip);
   });
-  it('rejects an explicit HEAD push to main from a pinned lane after a worker commit', () => {
+  it.each(['main', 'lane/target'])('rejects an explicit HEAD push to %s from a pinned lane after a worker commit', destination => {
     expect(acquire().status).toBe(0);
     const hooks = join(lane, '.git', 'hooks');
     mkdirSync(hooks, { recursive: true });
@@ -178,7 +183,7 @@ describe('acquire at an exact pushed branch tip', () => {
     writeFileSync(join(lane, 'file.txt'), 'worker edit');
     git(['commit', '-am', 'worker edit', '--quiet'], lane);
     const workerHead = git(['rev-parse', 'HEAD'], lane);
-    const r = spawnSync('git', ['push', 'origin', 'HEAD:refs/heads/main'], {
+    const r = spawnSync('git', ['push', 'origin', `HEAD:refs/heads/${destination}`], {
       cwd: lane, encoding: 'utf8', env: { ...process.env, MAIN_PUSH_OK: '' },
     });
     expect(r.status).not.toBe(0);
@@ -213,13 +218,20 @@ describe('acquire at an exact pushed branch tip', () => {
     expect(readFileSync(lease(), 'utf8')).toBe(original);
     expect(git(['symbolic-ref', '--short', 'HEAD'], lane)).toBe('main');
   });
-  it.each([false, true])('failed pinned fetch preserves a replacement lease (prior=%s)', prior => {
+  it.each([false, true].flatMap(prior => [false, true].map(success => [success, prior])))('pinned fetch preserves a replacement lease and HEAD (successful=%s prior=%s)', (success, prior) => {
     if (prior) expect(run('acquire', ['--lane=1']).status).toBe(0);
     const replacement = { session: 'replacement', holder: 'replacement', acquiredAt: new Date().toISOString(), ttlMinutes: 240 };
-    const env = gitShim(`if (args.includes('+refs/heads/lane/target:refs/remotes/origin/lane/target')) { fs.writeFileSync('.git/.lane-lease', ${JSON.stringify(JSON.stringify(replacement))}); process.exit(1); }`);
+    const beforeHead = readFileSync(join(lane, '.git', 'HEAD'), 'utf8');
+    const env = gitShim(`if (args.includes('+refs/heads/lane/target:refs/remotes/origin/lane/target')) {
+      const status = ${success} ? cp.spawnSync(realGit, args, { stdio: 'inherit' }).status : 1;
+      fs.writeFileSync('.git/.lane-lease', ${JSON.stringify(JSON.stringify(replacement))});
+      process.exit(status ?? 1);
+    }`);
     const r = acquire(tip, [], env);
     expect(r.status).not.toBe(0);
     expect(JSON.parse(readFileSync(lease(), 'utf8'))).toEqual(replacement);
+    expect(readFileSync(join(lane, '.git', 'HEAD'), 'utf8')).toBe(beforeHead);
+    expect(git(['rev-parse', 'HEAD'], lane)).toBe(initial);
   });
   it.each([false, true].flatMap(allPools => ['head', 'commit', 'tracked', 'untracked', 'holder'].map(change => [change, allPools])))('refuses late %s changes during pinned release (all-pools=%s)', (change, allPools) => {
     expect(acquire().status).toBe(0);
