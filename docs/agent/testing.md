@@ -5587,6 +5587,13 @@ Absent counts and zero counts ignore orphan indexed entries, as Git does. Valid 
 filtered per pair to exported hardening pins and supported transport policies. Caller pairs
 cannot replace a retained parent key. When the parent has a transport policy, caller transport
 pairs pass only as `never`, including when a remote-probe pin would otherwise allow `always`.
+Preserve ambient `protocol.allow=user` and `protocol.<name>.allow=user` policies, including
+normally allowed transports: dropping them permits automatic operations that the parent refuses.
+This ambient exception does not admit caller `protocol.ext.allow=user` or other caller exceptions.
+The launcher suite's transport-policy matrix compares parent and projected-child Git refusals for
+`never`, `user` and `always` with `GIT_PROTOCOL_FROM_USER=0|1`. Local empty-ref remote helpers
+exercise transport admission without network access or repository writes; keep the global,
+protocol-specific, duplicate-key and caller-override regressions alongside that matrix.
 Other Git config sources stay excluded. Audit affirmative dangerous `why` reasons and exact
 members of never families too: exact precedence must not accidentally reopen a family.
 Never rules cover runtime/shell injection, launcher-owned paths, exec redirects,

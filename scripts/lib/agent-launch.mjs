@@ -118,8 +118,8 @@ function classOf(rule, value, ceiling) {
   }
   return rule?.class;
 }
-// The sole indexed-config exception to GIT_*: the parent's hardening pins pass, nothing else does.
-// Each entry is kept only if Git reads its (key, value) pair as a hardening pin; every other entry
+// The sole indexed-config exception to GIT_*: hardening pins and supported transport policies pass.
+// Each entry is checked as a complete (key, value) pair; every other entry
 // (core.sshCommand, core.pager, url.*.insteadOf, even a harmless user.name) is dropped on its own, and the
 // kept pins are re-indexed in their original order, so one extra entry can never discard the protections.
 const GIT_PINS = [...LANE_GIT_CONFIG_PINS, ...REMOTE_PROBE_CONFIG_PINS, ...LANE_HISTORY_CONFIG_PINS];
@@ -144,14 +144,14 @@ function gitValue(key, value) {
 const sameGitPair = ([k1, v1], [k2, v2]) => gitKey(k1) === gitKey(k2) && gitValue(k1, v1) === gitValue(k2, v2);
 // Transport candidates are also checked against the parent's policy in childGitConfig:
 // a protocol-specific exception takes precedence over Git's global protocol.allow setting.
-// `never` tightens every protocol.*.allow. `user` loosens Git's default for ext (never) and, as the global
-// protocol.allow, for every unlisted protocol, so it passes only as protocol.file.allow, whose Git default is
-// already `user`; only the exact lowercase value is accepted.
+// For caller pairs, `never` tightens every protocol.*.allow. `user` can loosen Git's defaults, so a caller
+// may add it only for file (default user). Ambient `user` policies must survive independently of defaults:
+// dropping one can reopen a normally allowed transport during non-user-initiated operations.
 const GIT_FILE_TRANSPORT = 'protocol.file.allow';
 const tighteningGitPair = (key, value) => GIT_PINS.some(pin => sameGitPair([key, value], pin))
   || (gitValue(key, value) === 'never' && GIT_TRANSPORT_POLICY.test(key))
   || (value === 'user' && gitKey(key) === GIT_FILE_TRANSPORT);
-function gitConfigPairs(env) {
+function gitConfigPairs(env, { preserveUserPolicy = false } = {}) {
   const raw = env.GIT_CONFIG_COUNT;
   if (typeof raw !== 'string' || !raw || /[^0-9]/.test(raw)) return null;
   const count = Number(raw);
@@ -164,16 +164,16 @@ function gitConfigPairs(env) {
     // Git's parse failure into a successful child operation. Empty values (helper resets) are valid.
     if (typeof key !== 'string' || typeof value !== 'string'
       || key.match(/^[a-z0-9-]+\.(?:[^\n]*\.)?[a-z][a-z0-9-]*$/i)?.[0] !== key) return null;
-    if (tighteningGitPair(key, value)) kept.push([key, value]);
+    if (tighteningGitPair(key, value)
+      || (preserveUserPolicy && GIT_TRANSPORT_POLICY.test(key) && value === 'user')) kept.push([key, value]);
   }
   return { count, kept };
 }
-// The sole indexed-config exception to GIT_*: from the parent AND the caller bag, only tightening pairs
-// pass (exact hardening pins, protocol.*.allow=never, protocol.file.allow=user). Every other entry drops on its own; kept pairs are
-// re-indexed, parent pairs first, so no extra entry can discard a protection and no caller pair can add one
-// that loosens.
+// The sole indexed-config exception to GIT_*: hardening pins and tightening transport pairs pass from
+// either source; ambient `user` transport policies also pass to preserve the parent's restrictions.
+// Kept pairs are re-indexed in order, parent pairs first, so callers cannot loosen an inherited policy.
 function childGitConfig(ambient, inherit) {
-  const parent = gitConfigPairs(ambient);
+  const parent = gitConfigPairs(ambient, { preserveUserPolicy: true });
   if (Object.hasOwn(ambient, 'GIT_CONFIG_COUNT') && !parent) {
     fail('ambient GIT_CONFIG_COUNT and indexed keys/values must form a complete valid configuration; repair the parent environment and retry');
   }
