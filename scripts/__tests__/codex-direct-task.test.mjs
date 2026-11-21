@@ -7,9 +7,10 @@
  */
 
 import { EventEmitter } from 'node:events';
+import { URL as NodeURL } from 'node:url';
 import { createHash } from 'node:crypto';
-import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-import { mkdtempSync, mkdirSync, rmSync, readFileSync, writeFileSync, statSync, symlinkSync } from 'node:fs';
+import { describe, it, expect, vi, beforeEach, afterEach, afterAll } from 'vitest';
+import { mkdtempSync, mkdirSync, rmSync, readFileSync, writeFileSync, statSync, symlinkSync, realpathSync } from 'node:fs';
 import fsPromises from 'node:fs/promises';
 import { execFileSync, spawn, spawnSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
@@ -20,7 +21,6 @@ import { CODEX_TASK_RULES, CODEX_REVIEW_TASK_RULES } from '../lib/build-policy.m
 import {
   startDetachedJob, waitForJob, readJobRecord, writeJobRecord, cliExitCode, jobIsAlive, readPidStart, readPidState,
   PID_START_TIMEOUT_MS, JOB_RECORD_INIT_DEADLINE_MS,
-  CODEX_CLI,
   DEFAULT_TIMEOUT_MS,
   DEFAULT_INSTALL_TIMEOUT_MS,
   DEFAULT_CLONE_TIMEOUT_MS,
@@ -36,7 +36,7 @@ import {
   parseRolloutQuota,
   readRolloutQuota,
   collectAndClearRolloutQuota,
-  buildCodexDirectTaskArgv,
+  buildCodexDirectTaskArgv, buildCodexDirectTaskDescriptor, CODEX_SHIM_DIR, codexShimPath,
   buildCodexPrompt,
   buildScratchCloneArgv,
   planDepsInstall,
@@ -48,12 +48,39 @@ import {
   setupScratchClone,
   captureDiff,
   runGate,
-  runCodexDirectExec,
-  codexDirectTask,
+  runCodexDirectExec as realRunCodexDirectExec,
+  codexDirectTask as realCodexDirectTask,
 } from '../codex-direct-task.mjs';
 
+import { buildAgentInvocation } from '../lib/agent-launch.mjs';
+
+const fixtureBin = realpathSync(mkdtempSync(join(tmpdir(), 'direct-task-binary-')));
+const FAKE_CODEX_BINARY = join(fixtureBin, 'fixture-codex');
+// Keep Codex distinct from Node so CLI spawn mocks still run the real detached launcher.
+writeFileSync(FAKE_CODEX_BINARY, '#!/bin/sh\nexit 1\n', { mode: 0o755 });
+symlinkSync(FAKE_CODEX_BINARY, join(fixtureBin, 'codex'));
+afterAll(() => rmSync(fixtureBin, { recursive: true, force: true }));
+// Pair every injected agent spawn with a resolver, including repair turns.
+const withFixtureBinary = opts => opts.spawnFn
+  ? { ...opts, resolveBinaryFn: () => FAKE_CODEX_BINARY } : opts;
+const runCodexDirectExec = opts => realRunCodexDirectExec(withFixtureBinary(opts));
+const codexDirectTask = opts => realCodexDirectTask(withFixtureBinary(opts));
+
+// CLI subprocesses have no IO argument: map the fixed lookup to the executable on
+// fixture PATH, leaving file identity, permissions and every other filesystem operation real.
+const fixtureBinaryPreload = `
+  import binaryFs from 'node:fs';
+  const originalBinaryFs = { realpathSync: binaryFs.realpathSync };
+  binaryFs.realpathSync = Object.assign((file, ...args) => file === '/usr/bin/codex'
+    ? ${JSON.stringify(FAKE_CODEX_BINARY)} : originalBinaryFs.realpathSync(file, ...args), originalBinaryFs.realpathSync);
+`;
+
 // Historical orchestration fixtures isolate the new independently tested self-review.
-beforeEach(() => vi.stubEnv('WE_BUILD_SELF_REVIEW_ENABLED', 'false'));
+beforeEach(() => {
+  vi.stubEnv('WE_BUILD_SELF_REVIEW_ENABLED', 'false');
+  // Agent-spawn fixtures use a fixed parent PATH; custom gh guards are covered by launcher tests.
+  vi.stubEnv('PATH', `${fixtureBin}:${dirname(process.execPath)}:/usr/bin:/bin:/usr/sbin:/sbin:/opt/homebrew/bin:/usr/local/bin`);
+});
 afterEach(() => vi.unstubAllEnvs());
 
 /** A fixture `--dir` standing for a WE checkout: the default full gate needs its scripts/verify-lane.mjs. */
@@ -80,7 +107,7 @@ describe('defaultExecFn — real child-process output buffering', () => {
 
 describe('buildCodexDirectTaskArgv — pure argv for agentic/workspace-write mode', () => {
   it('omits the schema on resume in the builder while retaining schema validation', () => {
-    const options = { cwd: '/lane', resumeThreadId: 'thread-123', outputSchemaFile: 'seat.schema.json' };
+    const options = { cwd: '/lane', resumeThreadId: '12345678-1234-4234-8234-123456789abc', outputSchemaFile: '/lane/seat.schema.json' };
     const argv = buildCodexDirectTaskArgv(options);
     expect(argv).not.toContain('--output-schema');
     expect(argv).not.toContain(options.outputSchemaFile);
@@ -93,7 +120,7 @@ describe('buildCodexDirectTaskArgv — pure argv for agentic/workspace-write mod
     expect(() => buildCodexDirectTaskArgv({ cwd: '/lane', resumeThreadId: null, outputSchemaFile: 'seat.schema.json' })).toThrow(/resumeThreadId/);
   });
   it('optionally forwards the schema file as a separate argv value without changing defaults', () => {
-    const outputSchemaFile = 'task with spaces.schema.json';
+    const outputSchemaFile = '/lane/task with spaces.schema.json';
     const argv = buildCodexDirectTaskArgv({ cwd: '/lane', review: true, outputSchemaFile });
     expect(argv.slice(argv.indexOf('--output-schema'), argv.indexOf('--output-schema') + 2)).toEqual(['--output-schema', outputSchemaFile]);
     expect(buildCodexDirectTaskArgv({ cwd: '/lane' })).not.toContain('--output-schema');
@@ -129,8 +156,13 @@ describe('buildCodexDirectTaskArgv — pure argv for agentic/workspace-write mod
     expect(flagValue(argv, '-s')).toBe('workspace-write');
     expect(flagValue(argv, '-C')).toBe('/tmp/scratch');
     expect(argv).toContain('--skip-git-repo-check');
-    // No positional prompt anywhere in argv — the task rides stdin (avoids the #3371-probe-0 stdin trap).
-    expect(argv.some((a) => a.includes('Add') || a.includes('task'))).toBe(false);
+    // Every token is an option or its value; paths/config can legitimately contain the word "task".
+    // A positional prompt must fail regardless of its wording (#3371-probe-0 stdin trap).
+    for (let i = 1; i < argv.length; i++) {
+      if (['--json', '--skip-git-repo-check'].includes(argv[i])) continue;
+      expect(['-s', '-C', '-m', '-c']).toContain(argv[i]);
+      expect(typeof argv[++i]).toBe('string');
+    }
   });
 
   it('requires a non-empty cwd', () => {
@@ -970,7 +1002,8 @@ describe('runCodexDirectExec / codexDirectTask — the orchestrator, over an inj
 
   it('awaits the async gate again after a self-review repair and omits the output schema on resume', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'we-direct-regate-'));
-    const { fn } = fakeSpawn('{"type":"thread.started","thread_id":"builder"}\n');
+    const builderId = '12345678-1234-4234-8234-123456789abc';
+    const { fn } = fakeSpawn(`{"type":"thread.started","thread_id":"${builderId}"}\n`);
     const spawnFn = vi.fn(fn);
     const outputSchemaFile = join(dir, 'seat.schema.json');
     const gateExecFn = vi.fn(async () => 'gate output');
@@ -987,10 +1020,11 @@ describe('runCodexDirectExec / codexDirectTask — the orchestrator, over an inj
       expect(report.selfReview.rounds).toBe(1);
       expect(report.gate).toMatchObject({ pass: true, steps: [{ output: 'gate output' }] });
       expect(spawnFn).toHaveBeenCalledTimes(2);
+      expect(spawnFn.mock.calls.map(([file]) => file)).toEqual([FAKE_CODEX_BINARY, FAKE_CODEX_BINARY]);
       const [initial, resumed] = spawnFn.mock.calls.map(([, argv]) => argv);
       expect(initial.slice(initial.indexOf('--output-schema'), initial.indexOf('--output-schema') + 2)).toEqual(['--output-schema', outputSchemaFile]);
       expect(resumed).toContain('resume');
-      expect(resumed).toContain('builder');
+      expect(resumed).toContain(builderId);
       expect(resumed).not.toContain('--output-schema');
     } finally {
       rmSync(dir, { recursive: true, force: true });
@@ -1094,7 +1128,8 @@ describe('runCodexDirectExec / codexDirectTask — the orchestrator, over an inj
     } finally { rmSync(dir, { recursive: true, force: true }); }
   });
 
-  it('spawns codex with the exact argv buildCodexDirectTaskArgv would produce, writes the task to stdin, and logs raw stdout to the log file', async () => {
+  it('spawns codex with the exact built argv and launcher-owned PATH, writes the task to stdin, and logs raw stdout to the log file', async () => {
+    vi.stubEnv('PATH', `/caller-guard:${fixtureBin}:/usr/bin:/bin`);
     const dir = mkdtempSync(join(tmpdir(), 'we-codex-direct-test-'));
     const logFile = join(dir, 'events.jsonl');
     const stdout = '{"type":"thread.started","thread_id":"t1"}\n{"type":"turn.completed","usage":{}}\n';
@@ -1102,8 +1137,13 @@ describe('runCodexDirectExec / codexDirectTask — the orchestrator, over an inj
     try {
       const outputSchemaFile = join(dir, 'seat.schema.json');
       const r = await runCodexDirectExec({ dir, task: 'do the thing', outputSchemaFile, logFile, stream: false, spawnFn: fn });
-      expect(seen.cli).toBe(CODEX_CLI);
-      expect(seen.argv).toEqual(buildCodexDirectTaskArgv({ cwd: dir, outputSchemaFile, outputLastMessageFile: join(dir, '.git', 'codex-direct-task-last-message.txt') }));
+      expect(seen.cli).toBe(FAKE_CODEX_BINARY);
+      expect(seen.opts.shell).toBe(false);
+      const expectedArgv = buildCodexDirectTaskArgv({ cwd: dir, outputSchemaFile,
+        outputLastMessageFile: join(dir, '.git', 'codex-direct-task-last-message.txt') });
+      const expectedPath = codexShimPath(process.env);
+      expect(seen.argv).toEqual(expectedArgv);
+      expect(seen.opts.env.PATH).toBe(expectedPath);
       expect(seen.stdin).toContain('do the thing');
       expect(seen.stdin).toMatch(/do not run `git commit`/);
       expect(r.stdout).toBe(stdout);
@@ -1208,7 +1248,10 @@ describe('runCodexDirectExec / codexDirectTask — the orchestrator, over an inj
         const { fn: spawnFn, seen } = fakeSpawn('{}\n');
         await codexDirectTask({ dir, task: 't', review, env, execFn, spawnFn, stream: false });
         if (review) {
-          expect(seen.opts.env).toBe(env);
+          expect(seen.opts.env).not.toBe(env);
+          expect(seen.opts.env.LANE_POOL_ROOT).toBe(env.LANE_POOL_ROOT);
+          expect(seen.opts.env.WE_UNDER_TEST).toBe('1');
+          expect(seen.opts.env).toEqual(env);
           expect(flagValue(seen.argv, '-s')).toBe('read-only');
           expect(seen.argv.some((v) => /sandbox_workspace_write|shell_environment_policy/.test(v))).toBe(false);
         } else {
@@ -1216,7 +1259,9 @@ describe('runCodexDirectExec / codexDirectTask — the orchestrator, over an inj
           expect(allocated).not.toContain(root);
           allocated.push(root);
           expect(statSync(root).isDirectory()).toBe(true);
-          expect(seen.opts.env).toMatchObject({ LANE_POOL_ROOT: env.LANE_POOL_ROOT, TMP: root, TEMP: root });
+          expect(seen.opts.env).toMatchObject({ TMP: root, TEMP: root });
+          // The parent's pool override reaches the child, so its admission uses the same shared slots.
+          expect(seen.opts.env.LANE_POOL_ROOT).toBe(env.LANE_POOL_ROOT);
           expect(seen.argv).toContain('sandbox_workspace_write.network_access=true');
           expect(seen.argv).toContain(`sandbox_workspace_write.writable_roots=${JSON.stringify([join(dir, 'metadata'), join(env.LANE_POOL_ROOT, '.admission', 'heavy'), join(env.LANE_POOL_ROOT, '.admission', 'remote'), root])}`);
           expect(seen.argv).toContain(`shell_environment_policy.set.TMPDIR=${JSON.stringify(root)}`);
@@ -1406,10 +1451,13 @@ describe('runCodexDirectExec / codexDirectTask — the orchestrator, over an inj
       const { fn: spawnFn } = fakeSpawn('{"type":"turn.completed","usage":{}}\n');
       const execFn = (bin, args) => args.includes('--absolute-git-dir') ? join(dir, 'git-metadata') : args.includes('rev-parse') ? 'sha0\n' : '';
       const loadTranscriptCheck = vi.fn(async () => { throw new Error('checker dependency missing'); });
+      const env = { ...process.env };
+      delete env.WE_CODEX_TRANSCRIPT_CHECK_MODE;
+      if (configuredMode !== undefined) env.WE_CODEX_TRANSCRIPT_CHECK_MODE = configuredMode;
       try {
         const report = await codexDirectTask({ task: 'fixture', dir, gate: 'none', selfReview: false,
           stream: false, execFn, spawnFn, log: vi.fn(), loadTranscriptCheck,
-          env: { ...process.env, WE_CODEX_TRANSCRIPT_CHECK_MODE: configuredMode } });
+          env });
         expect(loadTranscriptCheck).toHaveBeenCalledOnce();
         expect(report.exitCode).toBe(0);
         expect(report.transcriptCheck).toEqual({ mode, error: 'checker dependency missing' });
@@ -1426,7 +1474,8 @@ describe('runCodexDirectExec / codexDirectTask — the orchestrator, over an inj
       if (mode !== 'missing') writeFileSync(rollout, fixture);
       // A different run must never be inspected, even when this run has no rollout.
       writeFileSync(join(sessions, 'rollout-other.jsonl'), fixture);
-      vi.stubEnv('WE_COORDINATION_ROOT', join(dir, 'process-coordination'));
+      // F4 requires caller policy sources to agree with the parent environment.
+      vi.stubEnv('WE_COORDINATION_ROOT', join(dir, 'coordination'));
       const { fn: spawnFn } = fakeSpawn('{"type":"thread.started","thread_id":"t1"}\n{"type":"turn.completed","usage":{}}\n');
       const execFn = (bin, args) => args.includes('--absolute-git-dir') ? join(dir, 'git-metadata') : args.includes('rev-parse') ? 'sha0\n' : '';
       const collectQuotaFn = vi.fn(() => {
@@ -1587,6 +1636,7 @@ describe('direct CLI flags reach the actual spawn and JSON result', () => {
       import { writeFileSync } from 'node:fs';
       import { syncBuiltinESMExports } from 'node:module';
       import { EventEmitter } from 'node:events';
+import { URL as NodeURL } from 'node:url';
       cp.execFileSync = (_bin, args) => args.includes('--absolute-git-dir') ? ${JSON.stringify(join(dir, 'metadata'))} : args.includes('rev-parse') ? 'sha' : '';
       cp.spawn = (_bin, argv) => {
         writeFileSync(${JSON.stringify(argvFile)}, JSON.stringify(argv));
@@ -1599,6 +1649,7 @@ describe('direct CLI flags reach the actual spawn and JSON result', () => {
         child.kill = () => {};
         return child;
       };
+      ${fixtureBinaryPreload}
       syncBuiltinESMExports();`;
     try {
       const stdout = execFileSync(process.execPath, ['--import', `data:text/javascript,${encodeURIComponent(preload)}`,
@@ -1627,6 +1678,7 @@ describe('direct CLI flags reach the actual spawn and JSON result', () => {
     const preload = `import cp from 'node:child_process';
       import { syncBuiltinESMExports } from 'node:module';
       import { EventEmitter } from 'node:events';
+import { URL as NodeURL } from 'node:url';
       cp.execFileSync = (_bin, args) => args.includes('--absolute-git-dir') ? ${JSON.stringify(join(dir, 'metadata'))} : args.includes('rev-parse') ? 'sha' : '';
       cp.spawn = (_bin, argv) => {
         const child = new EventEmitter();
@@ -1638,6 +1690,7 @@ describe('direct CLI flags reach the actual spawn and JSON result', () => {
         child.kill = () => {};
         return child;
       };
+      ${fixtureBinaryPreload}
       syncBuiltinESMExports();`;
     try {
       const stdout = execFileSync(process.execPath, ['--import', `data:text/javascript,${encodeURIComponent(preload)}`,
@@ -1663,6 +1716,7 @@ describe('direct CLI flags reach the actual spawn and JSON result', () => {
     const preload = `import cp from 'node:child_process';
       import { syncBuiltinESMExports } from 'node:module';
       import { EventEmitter } from 'node:events';
+import { URL as NodeURL } from 'node:url';
       cp.execFileSync = (bin, args) => {
         if (bin === 'npm' && args.includes('check:standards') && !${gateGreen}) throw Object.assign(new Error('standards red'), { status: 1 });
         return args.includes('--absolute-git-dir') ? ${JSON.stringify(join(dir, 'metadata'))} : args.includes('rev-parse') ? 'sha' : '';
@@ -1677,6 +1731,7 @@ describe('direct CLI flags reach the actual spawn and JSON result', () => {
         child.kill = () => {};
         return child;
       };
+      ${fixtureBinaryPreload}
       syncBuiltinESMExports();`;
     try {
       const run = spawnSync(process.execPath, ['--import', `data:text/javascript,${encodeURIComponent(preload)}`,
@@ -2793,6 +2848,7 @@ describe('detached jobs', () => {
       import cp from 'node:child_process';
       import { syncBuiltinESMExports } from 'node:module';
       import { EventEmitter } from 'node:events';
+import { URL as NodeURL } from 'node:url';
       import { join } from 'node:path';
       import { writeFileSync } from 'node:fs';
       const spawn = cp.spawn;
@@ -2826,6 +2882,7 @@ describe('detached jobs', () => {
         child.kill = () => {};
         return child;
       };
+      ${fixtureBinaryPreload}
       syncBuiltinESMExports();
     `);
     const launcher = spawnSync(process.execPath, ['scripts/codex-direct-task.mjs', '--detach',
@@ -2889,6 +2946,7 @@ describe('detached jobs', () => {
         import cp from 'node:child_process';
         import { syncBuiltinESMExports } from 'node:module';
         import { EventEmitter } from 'node:events';
+import { URL as NodeURL } from 'node:url';
         import { writeFileSync } from 'node:fs';
         import { join } from 'node:path';
         const { spawn, execFileSync } = cp;
@@ -2929,6 +2987,7 @@ describe('detached jobs', () => {
           child.kill = () => {};
           return child;
         };
+        ${fixtureBinaryPreload}
         syncBuiltinESMExports();
       `);
       const launcher = spawnSync(process.execPath, ['scripts/codex-direct-task.mjs', '--detach',
@@ -2987,6 +3046,7 @@ describe('detached jobs', () => {
         import cp from 'node:child_process';
         import { syncBuiltinESMExports } from 'node:module';
         import { EventEmitter } from 'node:events';
+import { URL as NodeURL } from 'node:url';
         import { join } from 'node:path';
         const { spawn, execFileSync } = cp;
         const isGate = bin => bin === 'npm' || bin === 'node';
@@ -3003,6 +3063,7 @@ describe('detached jobs', () => {
           child.kill = () => {};
           return child;
         };
+        ${fixtureBinaryPreload}
         syncBuiltinESMExports();
       `);
       const launcher = spawnSync(process.execPath, ['scripts/codex-direct-task.mjs', '--detach',
@@ -3152,7 +3213,8 @@ describe('detached jobs', () => {
       const { appendFileSync, writeFileSync } = require('node:fs');
       const { spawn } = require('node:child_process');
       const { join } = require('node:path');
-      const root = process.env.CODEX_JOBS_DIR;
+      // Pin the fixture root independently of environment projection and descendant role.
+      const root = ${JSON.stringify(jobsDir)};
       const role = process.argv[2];
       writeFileSync(join(root, role + '.pid'), String(process.pid));
       const beat = () => appendFileSync(join(root, role + '.beats'), '.');
@@ -3169,6 +3231,7 @@ describe('detached jobs', () => {
         ? join(process.env.CODEX_JOBS_DIR, 'metadata') : args.includes('rev-parse') ? 'sha' : '';
       cp.spawn = (bin, args, options) => bin === process.execPath ? spawn(bin, args, options)
         : spawn(process.execPath, [${JSON.stringify(worker)}, 'worker'], options);
+      ${fixtureBinaryPreload}
       syncBuiltinESMExports();
     `);
     const options = { encoding: 'utf8', timeout: 10000, maxBuffer: 1024 * 1024,
@@ -3253,6 +3316,7 @@ describe('detached jobs', () => {
       import cp from 'node:child_process';
       import { syncBuiltinESMExports } from 'node:module';
       import { EventEmitter } from 'node:events';
+import { URL as NodeURL } from 'node:url';
       const scenario = JSON.parse(process.env.TEST_JOB_SCENARIO);
       if (scenario.transcriptMode) {
         process.env.WE_CODEX_TRANSCRIPT_CHECK_MODE = scenario.transcriptMode;
@@ -3285,6 +3349,7 @@ describe('detached jobs', () => {
         child.kill = () => { clearTimeout(completion); queueMicrotask(() => child.emit('close', null)); };
         return child;
       };
+      ${fixtureBinaryPreload}
       syncBuiltinESMExports();
       const script = resolve('scripts/codex-direct-task.mjs');
       writeFileSync(join(process.env.CODEX_JOBS_DIR, 'cli-job.json'), JSON.stringify({
@@ -3896,5 +3961,44 @@ describe('R731 slice 1 — a scratch clone is deleted only when it is clean', ()
         expect(readFileSync(join(cwd, 'half.txt'), 'utf8')).toBe('x');
       } finally { if (cwd) rmSync(cwd, { recursive: true, force: true }); }
     });
+  });
+});
+
+
+describe('B4 golden argv from main c18c5279b4', () => {
+  const golden = JSON.parse(readFileSync(new NodeURL('./fixtures/agent-launch-main-argv.json', import.meta.url), 'utf8'));
+  it.each(golden.cases)('$name matches every main argv token and its order', ({ options, argv }) => {
+    const expected = argv.map(token => token.replaceAll(golden.shimDir, CODEX_SHIM_DIR));
+    expect(buildCodexDirectTaskArgv(options)).toEqual(expected);
+  });
+  it('refuses relative PATH in non-review mode before spawning', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'codex-relative-path-'));
+    const spawnFn = vi.fn(), resolveBinaryFn = vi.fn();
+    try {
+      await expect(realRunCodexDirectExec({ dir, task: 't', logFile: join(dir, 'log'), env: { PATH: '.:/usr/bin' }, spawnFn, resolveBinaryFn })).rejects.toThrow(/PATH/);
+      expect(spawnFn).not.toHaveBeenCalled(); expect(resolveBinaryFn).not.toHaveBeenCalled();
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+});
+
+describe('Codex shell and launcher preserve main PATH', () => {
+  it('keeps caller directories in order and excludes ambient-only directories', () => {
+    vi.stubEnv('PATH', '/ambient-only');
+    const env = { PATH: `/caller-guard:${fixtureBin}:/caller-tools` };
+    const descriptor = buildCodexDirectTaskDescriptor({ cwd: process.cwd(), env });
+    const invocation = buildAgentInvocation(descriptor, { resolveBinary: () => FAKE_CODEX_BINARY });
+    const expected = `${CODEX_SHIM_DIR}:/caller-guard:${fixtureBin}:/caller-tools`;
+    expect(invocation.options.env.PATH).toBe(expected);
+    expect(invocation.args).toContain(`shell_environment_policy.set.PATH=${JSON.stringify(expected)}`);
+  });
+  it('snapshots shell PATH and env before a resolver mutates either source', () => {
+    const env = { PATH: fixtureBin };
+    const descriptor = buildCodexDirectTaskDescriptor({ cwd: process.cwd(), env });
+    const invocation = buildAgentInvocation(descriptor, { resolveBinary: () => {
+      process.env.PATH = '/mutated'; env.PATH = '/mutated'; descriptor.config['shell_environment_policy.set.PATH'] = '/mutated';
+      return FAKE_CODEX_BINARY;
+    } });
+    expect(invocation.options.env.PATH).toBe(`${CODEX_SHIM_DIR}:${fixtureBin}`);
+    expect(invocation.args).toContain(`shell_environment_policy.set.PATH=${JSON.stringify(invocation.options.env.PATH)}`);
   });
 });

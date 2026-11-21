@@ -1063,7 +1063,7 @@ describe('R473 structured concurrency evidence', () => {
         'scripts/operations/codex-audit-io.mjs', 'scripts/lib/audit-settings.mjs', 'scripts/lib/audit-path.mjs', 'scripts/lib/policy-cascade.mjs',
         'scripts/codex-direct-task.mjs']));
       expect(auditorImports).toEqual(expect.arrayContaining(['scripts/lib/audit-path.mjs', 'scripts/lib/net-diff-fingerprint.mjs',
-        'scripts/codex-direct-task.mjs', 'scripts/lib/build-self-review.mjs']));
+        'scripts/codex-direct-task.mjs', 'scripts/lib/build-self-review.mjs', 'scripts/lib/agent-launch.mjs']));
       expect(auditorImports.filter(p => !existsSync(`${repoRoot}${p}`))).toEqual([]);
     });
     it.each([...new Set([...AUDITOR_ROOTS, ...auditorImports])].sort())(
