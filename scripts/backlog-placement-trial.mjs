@@ -10,10 +10,22 @@
 import fs from 'node:fs';
 import path from 'node:path';
 
-const PLATEAU_WORDS = ['plateau', 'product', 'business', 'delivery', 'daemon', 'conveyor', 'drain', 'lane', 'ci', 'merge', 'forge', 'operator', 'coordination'];
-const STANDARDS_WORDS = ['everstandards', 'ship', 'platform-forever', 'everflow', 'move-to-everstandards'];
-const WE_WORDS = ['intents', 'blocks', 'plugs', 'adapters', 'components', 'demos'];
-const PLATEAU_SCOPE = /^we:(scripts\/(conveyor|merge-ai-prs|lane-pool|guard-)|skills-src\/conveyor)/;
+// Rules v2: score title + body text per target; highest wins; unsure when the margin is under 2.
+const MIN_MARGIN = 2;
+const TERMS = {
+  'plateau-app': [/scripts\//, /\bdaemons?\b/, /\blanes?\b/, /\bdrain(?:s|ed|ing)?\b/, /\bconveyor\b/, /\bmerge[- ]queue\b/, /\bci\b/, /\bforge\b/, /\boperators?\b/, /\breview(?:s|er|ers)?\b/, /\bgates?\b/],
+  we: [/\bsrc\//, /\bintents?\b/, /\bblocks?\b/, /\bplugs?\b/, /\badapters?\b/, /\bcomponents?\b/, /\bdemos?\b/, /\bwebtraits\b/, /\bwebbehaviors\b/],
+  'everstandards/unknown': [/\bship\b/, /\beverflow\b/, /\bplatform[- ]forever\b/, /\beverstandards\b/, /\bcdevents\b/, /\bslsa\b/],
+};
+
+/** Score one text: each term counts its occurrences, capped at 3 so one repeated word cannot dominate. */
+function scoreText(text) {
+  const out = {};
+  for (const [target, list] of Object.entries(TERMS)) {
+    out[target] = list.reduce((n, re) => n + Math.min(3, (text.match(new RegExp(re.source, 'g')) || []).length), 0);
+  }
+  return out;
+}
 
 /** Split a card into frontmatter text and body; null front when unreadable. */
 export function splitCard(text) {
@@ -55,18 +67,12 @@ export function classifyCard(text) {
   if (front === null) return { target: 'unsure', rule: 'unreadable-frontmatter', confidence: 'none' };
   const ex = explicitTarget(body);
   if (ex) return { target: ex, rule: 'explicit-placement', confidence: 'high' };
-  const words = [...listField(front, 'tags'), ...listField(front, 'areas'), ...listField(front, 'area')].map((w) => w.toLowerCase());
-  const hit = (list) => words.find((w) => list.some((x) => w === x || w.startsWith(`${x}-`)));
-  const p = hit(PLATEAU_WORDS);
-  if (p) return { target: 'plateau-app', rule: `tag-plateau:${p}`, confidence: 'medium' };
-  const s = hit(STANDARDS_WORDS);
-  if (s) return { target: 'everstandards/unknown', rule: `tag-standards:${s}`, confidence: 'medium' };
-  const w = hit(WE_WORDS);
-  if (w) return { target: 'we', rule: `tag-we:${w}`, confidence: 'medium' };
-  const scopes = listField(front, 'scope');
-  if (scopes.some((x) => PLATEAU_SCOPE.test(x))) return { target: 'plateau-app', rule: 'scope-plateau', confidence: 'medium' };
-  if (scopes.some((x) => /^we:(src|blocks|intents|plugs)\//.test(x))) return { target: 'we', rule: 'scope-we-standard', confidence: 'medium' };
-  return { target: 'unsure', rule: 'no-rule-matched', confidence: 'none' };
+  const scores = scoreText(body.toLowerCase());
+  const ranked = Object.entries(scores).sort((a, b) => b[1] - a[1]);
+  const [top, topScore] = ranked[0];
+  const margin = topScore - ranked[1][1];
+  if (margin < MIN_MARGIN) return { target: 'unsure', rule: topScore === 0 ? 'no-signal' : 'margin-under-2', confidence: 'none' };
+  return { target: top === 'plateau-app' ? 'plateau-app' : top, rule: `score-${top.split('/')[0]}`, confidence: margin >= 5 ? 'high' : 'medium' };
 }
 
 /** Run over a directory; read-only. */
