@@ -84,7 +84,7 @@ export default {
         const ruled = cli(w, ['scripts/operations/run.mjs', 'record-referral-ruling', `--pr=${pr}`, `--repo=${WE_SLUG}`,
           '--finding=all-open', '--ruling=card', `--card=we:${CARD_FILE}`, '--actor=chalbert', '--channel=soak', '--reason=Accept']);
         if (!ruled.ok || /refused|error/i.test(ruled.out)) api.violation('operator-ruling-unrecordable', `record-referral-ruling: ${ruled.out}`);
-        const cleared = cli(w, ['scripts/review-set-label.mjs', pr, `--repo=${WE_SLUG}`, '--to=clear-human', '--actor=chalbert',
+        const cleared = cli(w, ['scripts/review-set-label.mjs', pr, `--repo=${WE_SLUG}`, '--to=clear-human', `--expect-head=${w.gh.pr('we', ctx.pr).headRefOid}`, '--actor=chalbert',
           '--channel=soak', '--reason=Accept (operator): rule card on the remaining finding']);
         const labels = (w.gh.pr('we', ctx.pr).labels ?? []).map((l) => (typeof l === 'string' ? l : l.name));
         if (!cleared.ok || !labels.includes('review:accepted')) {

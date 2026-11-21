@@ -62,13 +62,27 @@ describe('startup-failure stale merge-gate refresh', () => {
   function options(extra = {}) {
     return {
       c: { num: 5006, repo: 'o/r', headRef: 'lane/test', decision: 'skip', state: 'BLOCKED', reason: 'merge state BLOCKED' },
-      pr: { headRefOid: HEAD, statusCheckRollup: [green('test'), green('merge-gate')] },
+      pr: { headRefOid: HEAD, rowsComplete: true, rowsHead: HEAD, statusCheckRollup: [green('test'), green('merge-gate')] },
       requiredChecks: ['test', 'merge-gate'], classifyPr: vi.fn(() => ({ decision: 'merge' })), setting: 'on',
       readGateRuns: vi.fn(() => [startupRun()]), readVerdict: vi.fn(), readFreeze: vi.fn(), readAcceptance: vi.fn(),
       cloneDir: '/clone', readState: () => ({}), record: vi.fn(), statePath: join(mkdtempSync(join(tmpdir(), 'sg-ledger-')), 'ledger.json'),
       refreshStalePr: vi.fn(async () => ({ ok: true, action: 'rerun', newCommit: HEAD })), ...extra,
     };
   }
+  it.each([
+    { rowsComplete: undefined, rowsHead: HEAD },
+    { rowsComplete: false, rowsHead: HEAD },
+    { rowsComplete: true, rowsHead: undefined },
+    { rowsComplete: true, rowsHead: 'b'.repeat(40) },
+  ])('does not read runs or refresh with incomplete PR row evidence %j', async provenance => {
+    const o = options();
+    Object.assign(o.pr, provenance);
+    expect(await handleStaleMergeGate(o)).toEqual({ handled: false });
+    expect(o.readGateRuns).not.toHaveBeenCalled();
+    expect(o.readVerdict).not.toHaveBeenCalled();
+    expect(o.refreshStalePr).not.toHaveBeenCalled();
+    expect(o.record).not.toHaveBeenCalled();
+  });
   it('refreshes once with runId and shares the ledger bound when newHead equals head', async () => {
     const state = {};
     const o = options({ readState: () => state, record: vi.fn((_path, key, entry) => { state[key] = entry; }) });
@@ -86,24 +100,24 @@ describe('startup-failure stale merge-gate refresh', () => {
     expect(o.readAcceptance).not.toHaveBeenCalled();
   });
   it('refreshes when the merge-gate row is missing (startup_failure leaves no check-run)', async () => {
-    const o = options({ pr: { headRefOid: HEAD, statusCheckRollup: [green('test')] } });
+    const o = options({ pr: { headRefOid: HEAD, rowsComplete: true, rowsHead: HEAD, statusCheckRollup: [green('test')] } });
     expect(await handleStaleMergeGate(o)).toMatchObject({ handled: true, reason: expect.stringContaining('startup_failure (run 123)') });
     expect(o.refreshStalePr).toHaveBeenCalledTimes(1);
   });
   it('stays refused when merge-gate is missing AND another required check is not green', async () => {
-    const o = options({ pr: { headRefOid: HEAD, statusCheckRollup: [{ name: 'test', status: 'COMPLETED', conclusion: 'FAILURE' }] } });
+    const o = options({ pr: { headRefOid: HEAD, rowsComplete: true, rowsHead: HEAD, statusCheckRollup: [{ name: 'test', status: 'COMPLETED', conclusion: 'FAILURE' }] } });
     expect(await handleStaleMergeGate(o)).toEqual({ handled: false });
     expect(o.readGateRuns).not.toHaveBeenCalled();
     expect(o.refreshStalePr).not.toHaveBeenCalled();
   });
   it('refuses the missing-row path when integration is missing even though test is green', async () => {
-    const o = options({ requiredChecks: ['test', 'integration', 'merge-gate'], pr: { headRefOid: HEAD, statusCheckRollup: [green('test')] } });
+    const o = options({ requiredChecks: ['test', 'integration', 'merge-gate'], pr: { headRefOid: HEAD, rowsComplete: true, rowsHead: HEAD, statusCheckRollup: [green('test')] } });
     expect(await handleStaleMergeGate(o)).toEqual({ handled: false });
     expect(o.refreshStalePr).not.toHaveBeenCalled();
     expect(o.readGateRuns).not.toHaveBeenCalled();
   });
   it('refuses on the allowed path when integration is missing (reviewCiGate implication fallback)', async () => {
-    const o = options({ requiredChecks: ['test', 'integration', 'merge-gate'], pr: { headRefOid: HEAD, statusCheckRollup: [green('test'), green('merge-gate')] } });
+    const o = options({ requiredChecks: ['test', 'integration', 'merge-gate'], pr: { headRefOid: HEAD, rowsComplete: true, rowsHead: HEAD, statusCheckRollup: [green('test'), green('merge-gate')] } });
     expect(await handleStaleMergeGate(o)).toEqual({ handled: false });
     expect(o.readGateRuns).not.toHaveBeenCalled();
     expect(o.refreshStalePr).not.toHaveBeenCalled();
@@ -114,7 +128,7 @@ describe('startup-failure stale merge-gate refresh', () => {
     const refreshStalePr = vi.fn(async () => ({ ok: true, action: 'rebased', newCommit: NEW }));
     await handleStaleMergeGate(options({ statePath, refreshStalePr, needsAcceptanceRestamp: () => false }));
     const again = options({ statePath, refreshStalePr, needsAcceptanceRestamp: () => false,
-      pr: { headRefOid: NEW, statusCheckRollup: [green('test')] }, readGateRuns: vi.fn(() => [startupRun({ head_sha: NEW, id: 200 })]) });
+      pr: { headRefOid: NEW, rowsComplete: true, rowsHead: NEW, statusCheckRollup: [green('test')] }, readGateRuns: vi.fn(() => [startupRun({ head_sha: NEW, id: 200 })]) });
     expect(await handleStaleMergeGate(again)).toMatchObject({ handled: false, reason: expect.stringContaining('already claimed') });
     expect(refreshStalePr).toHaveBeenCalledTimes(1);
   });
@@ -127,7 +141,7 @@ describe('startup-failure stale merge-gate refresh', () => {
     await handleStaleMergeGate(options({ statePath, refreshStalePr, warn, writeClaim, needsAcceptanceRestamp: () => false }));
     expect(warn).toHaveBeenCalledWith(expect.stringContaining('SMELL'));
     const next = options({ statePath, refreshStalePr, writeClaim, needsAcceptanceRestamp: () => false,
-      pr: { headRefOid: NEW, statusCheckRollup: [green('test')] }, readGateRuns: vi.fn(() => [startupRun({ head_sha: NEW, id: 200 })]) });
+      pr: { headRefOid: NEW, rowsComplete: true, rowsHead: NEW, statusCheckRollup: [green('test')] }, readGateRuns: vi.fn(() => [startupRun({ head_sha: NEW, id: 200 })]) });
     expect(await handleStaleMergeGate(next)).toMatchObject({ handled: false, reason: expect.stringContaining('person should look') });
     expect(refreshStalePr).toHaveBeenCalledTimes(1);
   });
@@ -380,7 +394,7 @@ describe('startup-failure stale merge-gate refresh', () => {
     expect(o.refreshStalePr).not.toHaveBeenCalled();
   });
   it.each(['test', 'merge-gate'])('never lists workflow runs when %s is failing', async name => {
-    const o = options({ pr: { headRefOid: HEAD, statusCheckRollup: [green('test'), green('merge-gate')].map(row => row.name === name ? { ...row, conclusion: 'FAILURE' } : row) } });
+    const o = options({ pr: { headRefOid: HEAD, rowsComplete: true, rowsHead: HEAD, statusCheckRollup: [green('test'), green('merge-gate')].map(row => row.name === name ? { ...row, conclusion: 'FAILURE' } : row) } });
     expect((await handleStaleMergeGate(o)).handled).toBe(false);
     expect(o.readGateRuns).not.toHaveBeenCalled();
   });

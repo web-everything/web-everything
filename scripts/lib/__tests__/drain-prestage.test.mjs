@@ -9,7 +9,7 @@ import { aiPr } from '../../__tests__/fixtures/merge-ai-prs-fixtures.mjs';
 const roots = [];
 afterEach(() => roots.splice(0).forEach(root => rmSync(root, { recursive: true, force: true })));
 const repo = 'owner/repo', head = 'a'.repeat(40);
-const pending = () => aiPr({ number: 42, headRefOid: head, baseRefName: 'main', state: 'OPEN', isDraft: false,
+const pending = () => aiPr({ rowsComplete: true, rowsHead: head, number: 42, headRefOid: head, baseRefName: 'main', state: 'OPEN', isDraft: false,
   labels: [{ name: 'review:accepted' }, { name: 'ready-to-merge' }], mergeStateStatus: 'BLOCKED', mergeable: 'MERGEABLE',
   statusCheckRollup: [{ name: 'test', status: 'IN_PROGRESS', conclusion: null, head_sha: head }] });
 function fixture(options = {}) {
@@ -31,6 +31,17 @@ function fixture(options = {}) {
 const green = f => { f.pr.statusCheckRollup[0] = { name: 'test', status: 'COMPLETED', conclusion: 'SUCCESS', head_sha: head }; };
 
 describe('CI pre-stage', () => {
+  it.each([{}, { rowsComplete: false, rowsHead: head }, { rowsComplete: true, rowsHead: 'b'.repeat(40) }])(
+    'never admits incomplete or foreign-head check evidence (%j)', evidence => {
+      const pr = pending();
+      pr.statusCheckRollup[0] = { name: 'test', status: 'COMPLETED', conclusion: 'SUCCESS', head_sha: head };
+      delete pr.rowsComplete;
+      delete pr.rowsHead;
+      Object.assign(pr, evidence);
+      expect(prestageCi(pr, ['test'])).toBe('red');
+      expect(classifyPr(pr, { queueRequiredChecks: ['test'] }).decision).not.toBe('merge');
+    });
+
   it.each([{hasManifest:true}, {coupleCarrier:{num:43}}])('invalidates older unsafe cache entries (%j)', async candidate => {
     const f = fixture();
     const entry = f.cache.get(repo, 42, 30);

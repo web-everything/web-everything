@@ -199,7 +199,7 @@ export function nextActions(pr) {
     referralRuling: { summary: 'rule on each referral (block / card / not-real); a block sends it back',
       command: `node scripts/operations/run.mjs record-referral-ruling --pr=${n} --repo=${r} --finding=all-open --ruling=<block|not-real> --actor=<your login> --channel=<where you ruled> --reason=${sh('<your words>')}   # for a card ruling use --ruling=card --card=<card id> (a card is required)` },
     redTeamRuling: { summary: 'rule on the red-team round-cap findings: send back (block) or clear (not-real)',
-      command: `${label} --to=changes --body-file=<fix-list.md> --actor=<your login> --channel=<where you ruled>   # or: ${label} --to=clear-human --actor=<your login> --reason=${sh('<your words>')}` },
+      command: `${label} --to=changes --body-file=<fix-list.md> --actor=<your login> --channel=<where you ruled>   # or: ${label} --to=clear-human --expect-head=<full 40-hex head SHA> --actor=<your login> --reason=${sh('<your words>')}` },
     roundLimit: { summary: 'grant more review rounds, or rule',
       command: `node scripts/operations/run.mjs extend-rounds --pr=${n} --repo=${r} --by=2 --actor=<your login> --channel=<where> --reason=${sh('<your words>')}` },
     answerNote: { summary: 'read the escalation note and answer it on the PR',
@@ -218,7 +218,7 @@ export function nextActions(pr) {
 
 const DRAIN_SKIP_ACTOR = Object.freeze({
   'red-team-pending': 'red-team', 'not-certified': 'operator', 'queue-file-overlap': 'drain', 'overlap-yield': 'drain',
-  'ready-not-reached': 'drain',
+  'ready-not-reached': 'drain', 'conflicting': 'fixer', 'checks-pending': 'ci',
 });
 
 // `review-gate` is the review's own mirror, not CI (operator-queue drops it too).

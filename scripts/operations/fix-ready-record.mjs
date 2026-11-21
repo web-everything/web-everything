@@ -10,6 +10,8 @@ import { homedir } from 'node:os';
 import { dirname, isAbsolute, join, parse, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { validSha, jsonLines } from './prototype-load.mjs';
+import { readStore, storePath, withdrawnRevocations } from './ruled-weakened-store.mjs';
+import { readPlatformPreferences } from '../lib/policy-cascade.mjs';
 import { loadAdoptionMatrixSettingsFile } from '../lib/adoption-matrix-settings.mjs';
 
 const RULING = /^R\d+(?:\+R\d+)*$/;
@@ -250,13 +252,63 @@ export function writeReadyRecord(input, { file = readyRecordPath(), fsApi = fs, 
 
 export function parseArgs(argv) {
   const a = {};
-  for (const arg of argv) { const m = /^--([^=]+)=(.*)$/s.exec(arg); if (m) a[m[1]] = m[2]; }
+  for (const arg of argv) {
+    if (arg === '--from-waiver') { a['from-waiver'] = true; continue; }
+    const m = /^--([^=]+)=(.*)$/s.exec(arg); if (m) a[m[1]] = m[2];
+  }
   return a;
+}
+
+/** The findings of the ONE recorded waiver for ref+sha+ruling, exactly as stored. Anything unknown, unreadable,
+ *  malformed or ambiguous is a refusal with a named reason, never a pass. */
+export function waiverFindings(waivers, { ref, sha, ruling }) {
+  if (!Array.isArray(waivers)) return { ok: false, error: 'recorded waivers are unreadable' };
+  if (!validSha(sha) || typeof ref !== 'string' || typeof ruling !== 'string') return { ok: false, error: 'no recorded waiver: ref, 40-hex sha and auditRuling are required' };
+  // A non-object entry, or a malformed entry naming this ref+sha+ruling, is damaged evidence: refuse, never skip it.
+  if (waivers.some((e) => !e || typeof e !== 'object' || Array.isArray(e))) return { ok: false, error: 'recorded waivers are unreadable: a non-object entry' };
+  const named = waivers.filter((e) => e.ref === ref && typeof e.sha === 'string' && e.sha.toLowerCase() === sha.toLowerCase() && e.ruling === ruling);
+  if (named.some((e) => !Array.isArray(e.findings) || e.findings.length === 0 || !e.findings.every((f) => typeof f === 'string' && f.trim()))) {
+    return { ok: false, error: `recorded waivers are unreadable: a malformed waiver for ${ref}@${sha} ${ruling}` };
+  }
+  const hits = named;
+  if (!hits.length) return { ok: false, error: `no recorded waiver for ${ref}@${sha} ${ruling}` };
+  const first = JSON.stringify(hits[0].findings);
+  if (hits.some((e) => JSON.stringify(e.findings) !== first)) return { ok: false, error: `ambiguous: several recorded waivers for ${ref}@${sha} ${ruling} disagree on findings` };
+  return { ok: true, findings: [...hits[0].findings] };
+}
+
+function defaultWaivers(env, settingsFile = join(here, '..', 'settings', 'prototype-load.json')) {
+  const platform = readPlatformPreferences({ env, readFile: (p, encoding) => fs.readFileSync(p, encoding) });
+  const tool = JSON.parse(fs.readFileSync(settingsFile, 'utf8'));
+  if (platform.errors.length) throw new Error(`platform preferences unreadable: ${platform.errors[0]}`);
+  // Any warning from the shared readers (malformed store or request line, unreadable log) means damaged evidence: refuse.
+  const refuseOnWarn = (m) => { throw new Error(`waiver evidence damaged: ${m}`); };
+  const store = readStore({ path: storePath(env), fs, warn: refuseOnWarn });
+  if (store.error) throw new Error(`ruled-weakened store unreadable: ${store.error}`);
+  const isRevoked = withdrawnRevocations({ fs, env, warn: refuseOnWarn });
+  // Raw, NOT de-duplicated: conflicting entries for one ref+sha+ruling must reach waiverFindings and refuse as ambiguous.
+  // A present layer that is not an array is damaged evidence, never an empty list.
+  const list = (v, name) => { if (v === undefined || v === null) return []; if (!Array.isArray(v)) throw new Error(`${name} ruledWeakened is not an array`); return v; };
+  return [...list(tool.ruledWeakened, 'tool'), ...list(platform.prefs.prototypeLoad?.ruledWeakened, 'platform'), ...store.entries]
+    .filter((e) => !(e && typeof e === 'object' && typeof e.sha === 'string' && isRevoked(e)));
 }
 
 export function main(argv = process.argv.slice(2), deps = {}) {
   const a = parseArgs(argv);
   let auditDisclosed;
+  const wantWaiver = a['from-waiver'] === true || (a.audit === 'WEAKENED' && a['auditDisclosed-file'] === undefined);
+  if (a['from-waiver'] === true && (a['auditDisclosed-file'] !== undefined || a.audit !== 'WEAKENED')) {
+    console.error('fix-ready-record: refused: --from-waiver needs --audit=WEAKENED and no --auditDisclosed-file');
+    return 1;
+  }
+  if (wantWaiver) {
+    let waivers;
+    try { waivers = deps.waivers !== undefined ? deps.waivers : defaultWaivers(deps.env ?? { ...process.env, HOME: process.env.HOME || homedir() }, deps.settingsFile); }
+    catch (e) { console.error(`fix-ready-record: refused: recorded waivers are unreadable: ${e.message}`); return 1; }
+    const w = waiverFindings(waivers, { ref: a.ref, sha: a.sha, ruling: a.auditRuling });
+    if (!w.ok) { console.error(`fix-ready-record: refused: ${w.error}`); return 1; }
+    auditDisclosed = w.findings;
+  }
   if (a['auditDisclosed-file'] !== undefined) {
     try { auditDisclosed = JSON.parse(fs.readFileSync(a['auditDisclosed-file'], 'utf8')); }
     catch (e) { console.error(`fix-ready-record: cannot read auditDisclosed-file: ${e.message}`); return 2; }

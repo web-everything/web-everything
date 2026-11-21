@@ -36,6 +36,33 @@ function io(overrides = {}) {
     readEdits: vi.fn(history), writeBody: vi.fn(), log: vi.fn(), ...overrides };
 }
 
+describe('restoreAuthorStamp — closed Markdown before a standalone stamp', () => {
+  it.each([
+    ['reported spaced link', 'See [guide] (https://example.test).'],
+    ['generated footer', 'Generated with [Claude Code] (https://claude.com/claude-code)'],
+    ['adjacent link', 'See [guide](https://example.test).'],
+    ['tab-separated link', 'See [guide]\t(https://example.test).'],
+    ['apostrophe in label', "[Author's guide](https://example.test)"],
+    ['two closed titles', '[a](https://example.test "first") [b "](https://example.test "second")'],
+    ['single-quoted title', "[guide](https://example.test 'title')"],
+    ['CRLF lines', 'See [guide] (https://example.test).\r\nBranch `hotpatch/<sha>`\r\n'],
+    ['CR lines', 'See [guide] (https://example.test).\rBranch `hotpatch/<sha>`\r'],
+    ['inline code', 'Branch `hotpatch/abc123`'],
+    ['code beside a closed link on the same line', '`hotpatch/<sha>`: [guide](https://example.test) then `<path>`'],
+    ['combined #7227 shape', '<!-- pr-size:begin -->\nSmall\n<!-- pr-size:end -->\n<!-- size-admission:abc123 -->\n<!-- policy-set: default -->\nBranch `hotpatch/<sha>`\nGenerated with [Claude Code] (https://claude.com/claude-code)'],
+  ])('restores after %s through the write path', (_name, prefix) => {
+    const marker = buildAuthorActorMarker(ID);
+    const seams = io({
+      readPr: vi.fn(() => ({ state: 'OPEN', body: 'Updated body', author: { login: 'alice' } })),
+      readEdits: vi.fn(() => [edit(`${prefix}\n\n${marker}`, 'alice', '2026-11-20T10:00:00Z', 'User')]),
+    });
+    expect(restoreAuthorStamp(seams)).toMatchObject({ action: 'restore', id: ID, marker });
+    expect(seams.writeBody).toHaveBeenCalledTimes(1);
+    expect(seams.writeBody).toHaveBeenCalledWith(6244, `Updated body\n\n${marker}\n`);
+    expect(seams.readEdits).toHaveBeenCalledTimes(2);
+  });
+});
+
 describe('planStampRestore — agreement and author-of-record provenance', () => {
   it('recovers the verbatim actor id from the #6244 author snapshot', () => {
     const result = plan();
@@ -164,9 +191,22 @@ describe('plain snapshot provenance — oldest author snapshot and agreeing ids'
     ['single backticks', '`<path>`'],
     ['double backticks containing single backticks', '`` `<path>` ``'],
     ['multiple spans', '`<path>` then ``<other>``'],
-  ])('ignores tag-like text in balanced inline code with %s', (_name, text) => {
+  ])('restores beside balanced inline code with %s', (_name, text) => {
     expect(plan({ edits: [edit(`${text}\n\n${buildAuthorActorMarker(ID)}`)] }))
       .toMatchObject({ action: 'restore', id: ID });
+  });
+
+  it('snapshot with literal <threadId> in markdown prose is parsed, not refused as unsupported HTML', () => {
+    const text = '- `--resume=<threadId>` accepts only a UUID.';
+    expect(plan({ edits: [edit(`${text}\n\n${buildAuthorActorMarker(ID)}`)] }))
+      .toMatchObject({ action: 'restore', id: ID });
+  });
+
+  it('still refuses a mixed-case tag with attributes or a bare mixed-case tag outside code', () => {
+    for (const text of ['`<threadId x="1">`', '<threadId>', '`<Details>` <Summary>']) {
+      expect(plan({ edits: [edit(`${text}\n${buildAuthorActorMarker(ID)}`)] }))
+        .toMatchObject({ action: 'refuse', reason: 'unsupported HTML edit snapshot; inspect complete GitHub history manually' });
+    }
   });
 
   it.each([
@@ -264,12 +304,11 @@ describe('plain snapshot provenance — oldest author snapshot and agreeing ids'
     expectReason(plan({ edits }), 'refuse');
   });
 
-  it.each(['```', '~~~'])('restores a standalone marker after a closed %s code fence', async (fence) => {
+  it.each(['```', '~~~'])('refuses (blunt fence rule) a marker after a closed %s code fence', async (fence) => {
     const marker = buildAuthorActorMarker(ID);
     const seams = io({ readEdits: vi.fn(() => [edit(`${fence}text\nexample\n${fence}\n\n${marker}\n`)]) });
-    expectReason(await restoreAuthorStamp(seams), 'restore');
-    expect(seams.writeBody).toHaveBeenCalledTimes(1);
-    expect(seams.writeBody).toHaveBeenCalledWith(6244, `${BODY}\n\n${marker}\n`);
+    expectReason(await restoreAuthorStamp(seams), 'refuse');
+    expect(seams.writeBody).not.toHaveBeenCalled();
   });
 
   it('refuses complete plain snapshots with a plus-prefixed forgery retained by the author without writing', async () => {
@@ -938,4 +977,176 @@ it('a new listed head bypasses the refusal memo and carries the new head identit
   headRefOid = 'b'.repeat(40);
   expect(sweepAuthorStamps(seams)[0].headSha).toBe(headRefOid);
   expect(seams.readEdits).toHaveBeenCalledTimes(2);
+});
+
+describe('planStampRestore — #7227 full-body edit dropped the stamp', () => {
+  const prBody = 'A hot-patch uses an immutable `hotpatch/<sha>` ref.\n\n<!-- pr-size:begin -->\n<!-- size-admission:29899b -->\n<!-- pr-size:end -->';
+  const dropped = () => [
+    edit(BODY, 'chalbert', '2026-11-20T19:22:58Z'),
+    edit(`${prBody}\n\n${buildAuthorActorMarker(ID)}`, AUTHOR, '2026-11-20T18:39:58Z'),
+  ];
+  it('restores when snapshots carry balanced backticked text beside a stamp', () => {
+    expect(plan({ edits: dropped() })).toMatchObject({ action: 'restore', id: ID });
+  });
+  it('restores beside a balanced one-line markdown link in the snapshot', () => {
+    const edits = [edit(`${prBody}\nGenerated with [Claude Code](https://claude.com/claude-code)\n${buildAuthorActorMarker(ID)}`)];
+    expect(plan({ edits })).toMatchObject({ action: 'restore', id: ID });
+  });
+  it('still refuses a backtick on a comment line (not code)', () => {
+    const edits = [edit(`${prBody}\n<!-- \`x\` -->\n${buildAuthorActorMarker(ID)}`)];
+    expect(plan({ edits })).toMatchObject({ action: 'refuse' });
+  });
+  it('refuses an earlier stamp by a different login', () => {
+    const edits = [edit(BODY, 'chalbert', '2026-11-20T19:22:58Z'),
+      edit(`${prBody}\n\n${buildAuthorActorMarker(ID)}`, 'mallory', '2026-11-20T18:39:58Z', 'User')];
+    expect(plan({ edits })).toMatchObject({ action: 'refuse' });
+  });
+  it('refuses a history whose stamp content was altered between snapshots', () => {
+    const edits = [edit(`${prBody}\n\n${buildAuthorActorMarker(OTHER)}`, AUTHOR, '2026-11-20T19:00:00Z'),
+      edit(`${prBody}\n\n${buildAuthorActorMarker(ID)}`, AUTHOR, '2026-11-20T18:39:58Z')];
+    expect(plan({ edits })).toMatchObject({ action: 'refuse' });
+  });
+  it('marks lost, never restores, with no earlier stamped snapshot', () => {
+    expect(plan({ edits: [edit(prBody)] })).toMatchObject({ action: 'mark-lost' });
+  });
+  it('refuses arbitrary comments and multiline link destinations', () => {
+    for (const text of ['<!-- anything -->', '[text](\n`<div>`\n)']) {
+      expect(plan({ edits: [edit(`${text}\n${buildAuthorActorMarker(ID)}`)] })).toMatchObject({ action: 'refuse' });
+    }
+  });
+});
+
+describe('planStampRestore — marker inside a markdown link title is not a stamp (R10)', () => {
+  const m = () => buildAuthorActorMarker(ID);
+  it.each([
+    ['multiline reference-link title', `[ref]: https://example.test "title\n${'MARK'}\nend"`],
+    ['reference-link title on the next line', `[ref]: https://example.test\n"title\n${'MARK'}\nend"`],
+    ['multiline inline-link title', `[text](https://example.test "title\n${'MARK'}\nend")`],
+    ['single-line title', `[ref]: https://example.test "title ${'MARK'}"`],
+    ['title closed only by an escaped quote', `[x](https://example.test "title\\")\n\`<path>\`\n${'MARK'}\nend")`],
+    ['second title on a line left open', `[a](https://example.test "ok") [b](https://example.test "open )\n\`<path>\`\n${'MARK'}\nend")`],
+    ['backtick span', `\`\n${'MARK'}\n\``],
+  ])('refuses a marker in a %s', (_n, tpl) => {
+    expect(plan({ edits: [edit(tpl.replace('MARK', m()))] })).toMatchObject({ action: 'refuse' });
+  });
+  it('refuses (blunt bracket rule) beside a closed reference definition', () => {
+    expect(plan({ edits: [edit(`[ref]: https://example.test "title"\n${m()}`)] })).toMatchObject({ action: 'refuse' });
+  });
+});
+
+describe('reference titles containing inline code cannot supply author stamps', () => {
+  const snapshot = (open = '"', close = '"', newline = '\n', nextLine = true) =>
+    `[ref]: https://example.test${nextLine ? newline : ' '}${open}${newline}\`<div>\`${newline}${buildAuthorActorMarker(ID)}${newline}${close}${newline}${newline}[ref]`;
+
+  it.each([
+    ['double quote on next line', '"', '"', '\n', true],
+    ['double quote on definition line', '"', '"', '\n', false],
+    ['single quote on next line', "'", "'", '\n', true],
+    ['single quote on definition line', "'", "'", '\n', false],
+    ['parenthesis on next line', '(', ')', '\n', true],
+    ['parenthesis on definition line', '(', ')', '\n', false],
+    ['four-space indented title', '    "', '    "', '\n', true],
+    ['tab-indented title', '\t"', '\t"', '\n', true],
+    ['mixed indentation and CR-only lines', ' \t   "', ' \t   "', '\r', true],
+    ['CRLF title', '"', '"', '\r\n', true],
+  ])('refuses a same-author marker inside a %s', (_name, open, close, newline, nextLine) => {
+    const result = planStampRestore({ state: 'OPEN', body: 'Current description', authorLogin: 'alice',
+      edits: [edit(snapshot(open, close, newline, nextLine), 'alice', '2026-11-20T10:00:00Z', 'User')] });
+    expect(result).toMatchObject({ action: 'refuse', reason: expect.stringMatching(/unsupported HTML edit snapshot/) });
+  });
+
+  it('refuses through the restoration write path without promoting a title marker', () => {
+    const seams = io({ readPr: vi.fn(() => ({ state: 'OPEN', body: 'Current description', author: { login: 'alice' } })),
+      readEdits: vi.fn(() => [edit(snapshot(), 'alice', '2026-11-20T10:00:00Z', 'User')]) });
+    expect(restoreAuthorStamp(seams)).toMatchObject({ action: 'refuse' });
+    expect(seams.writeBody).not.toHaveBeenCalled();
+  });
+
+  it('refuses an indented title through the restoration write path', () => {
+    const seams = io({ readEdits: vi.fn(() => [edit(snapshot('    "', '    "'))]) });
+    expect(restoreAuthorStamp(seams)).toMatchObject({ action: 'refuse' });
+    expect(seams.writeBody).not.toHaveBeenCalled();
+  });
+
+  it('refuses title HTML even when no marker was found, rather than recording stamp-lost', () => {
+    expect(plan({ edits: [edit(snapshot().replace(buildAuthorActorMarker(ID), 'Example title text'))] }))
+      .toMatchObject({ action: 'refuse', reason: expect.stringMatching(/unsupported HTML edit snapshot/) });
+  });
+
+  it('refuses an indented multiline title marker even without HTML or backticks', () => {
+    expect(plan({ edits: [edit(snapshot('    "', '    "').replace('`<div>`', 'Example title text'))] }))
+      .toMatchObject({ action: 'refuse' });
+  });
+
+  it('refuses (blunt bracket rule) a marker below a completed indented reference title', () => {
+    expect(plan({ edits: [edit(`[ref]: https://example.test\n    "title"\n\n${buildAuthorActorMarker(ID)}`)] }))
+      .toMatchObject({ action: 'refuse' });
+  });
+});
+
+describe('planStampRestore — ambiguous links refuse a marker (judge R10 round 2)', () => {
+  const m = () => buildAuthorActorMarker(ID);
+  it.each([
+    ['second link multiline title', `[a](https://example.test "closed") [b "](https://example.test "open )\n\`<div>\`\nMARK\nend")`],
+    ['escaped-bracket reference label', '[a\\[b\\]c]: https://example.test "t\n`<div>`\nMARK\nend"'],
+    ['title on line after URL-only definition', '[ref]: https://example.test\n"t\n`<div>`\nMARK\nend"'],
+    ['quote-cancel inline link', '[x](https://example.test/" "title )\n`<div>`\nMARK\nend")'],
+  ])('refuses a marker with brackets: %s', (_n, tpl) => {
+    expect(plan({ edits: [edit(tpl.replace('MARK', m()))] })).toMatchObject({ action: 'refuse' });
+  });
+  it('restores a standalone marker beside a closed link with an apostrophe in its label', () => {
+    expect(plan({ edits: [edit(`[Author's guide](https://example.test)\n${m()}`)] }))
+      .toMatchObject({ action: 'restore', id: ID });
+  });
+  it.each([
+    ['paren prose across lines', 'Intro\n(see below\nmore)\nMARK'],
+    ['quoted prose across lines', 'He said:\n"hello\nworld"\nMARK'],
+  ])('bracket-free prose still restores: %s', (_n, tpl) => {
+    expect(plan({ edits: [edit(tpl.replace('MARK', m()))] })).toMatchObject({ action: 'restore', id: ID });
+  });
+});
+
+describe('restoreAuthorStamp — second link title cannot supply a stamp', () => {
+  // A closed first title and a quote in the second label fooled snapshot-wide quote counting.
+  const snapshot = '[a] (https://example.test "closed") [b "] (https://example.test "open )\n`<div>`\n'
+    + buildAuthorActorMarker(ID) + '\nend")';
+
+  it.each([
+    ['reported payload', snapshot],
+    ['CRLF lines', snapshot.replaceAll('\n', '\r\n')],
+    ['CR lines', snapshot.replaceAll('\n', '\r')],
+    ['Unicode line separators', snapshot.replaceAll('\n', '\u2028')],
+    ['single-quoted titles', snapshot.replaceAll('"', "'")],
+    ['marker without HTML or inline code', snapshot.replace('`<div>`\n', '')],
+    ['HTML entities in title text', snapshot.replace('`<div>`', '&lt;div&gt;')],
+  ])('refuses %s without writing a promoted title marker', (_name, diff) => {
+    const seams = io({
+      readPr: vi.fn(() => ({ state: 'OPEN', body: 'Current description', author: { login: 'alice' } })),
+      readEdits: vi.fn(() => [edit(diff, 'alice', '2026-11-20T10:00:00Z', 'User')]),
+    });
+
+    expect(restoreAuthorStamp(seams)).toMatchObject({ action: 'refuse', contentRefusal: true });
+    expect(seams.readEdits).toHaveBeenCalledTimes(1);
+    expect(seams.writeBody).not.toHaveBeenCalled();
+  });
+});
+
+describe('planStampRestore — ambiguous backticks and fences (#7231)', () => {
+  const m = () => buildAuthorActorMarker(ID);
+  const machine = '<!-- pr-size:begin -->';
+  it.each([
+    ['tab-indented closing fence', `${machine}\n\`\`\`\nexample\n\t\`\`\`\n${m()}\n\`\`\``],
+    ['backtick info string then longer fence', `${machine}\n\`\`\` a\`b\n\`\`\`\`\n${m()}\n\`\`\`\``],
+    ['NBSP/form-feed closing suffix', `${machine}\n\`\`\`\nexample\n\`\`\`\u00a0\f\n${m()}\n\`\`\``],
+    ['tilde fence', `~~~\n${m()}\n~~~`],
+    ['unmatched backtick', `use \`x\n${m()}`],
+  ])('refuses %s', (_n, diff) => {
+    expect(plan({ edits: [edit(diff)] })).toMatchObject({ action: 'refuse' });
+  });
+  it('plain-prose control still restores', () => {
+    expect(plan({ edits: [edit(`Plain prose.\n\n${m()}`)] })).toMatchObject({ action: 'restore', id: ID });
+  });
+  it('balanced inline-code control restores', () => {
+    expect(plan({ edits: [edit(`use \`x\`\n${m()}`)] })).toMatchObject({ action: 'restore', id: ID });
+  });
 });

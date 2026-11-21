@@ -3,9 +3,10 @@ bornAs: xf4wsgl
 kind: story
 size: 3
 parent: "4075"
-status: open
+status: resolved
 scope: ["we:scripts/lib/red-team-gate.mjs", "we:scripts/operations/record-red-team-ruling.mjs", "we:scripts/lib/__tests__/red-team-gate.test.mjs", "we:scripts/operations/__tests__/record-red-team-ruling.test.mjs"]
 dateOpened: "2026-10-25"
+dateResolved: "2026-11-21"
 tags: []
 ---
 

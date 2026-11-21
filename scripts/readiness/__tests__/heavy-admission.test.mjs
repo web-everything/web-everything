@@ -85,8 +85,7 @@ describe('load admission shadow observation', () => {
     expect(observed.stdout).toBe(baseline.stdout);
     expect(JSON.parse(observed.stdout).held).toBe(false);
     expect(observed.stderr).toContain(`resource-shadow gate=heavy-admission.load-status kind=${kind ?? 'build'}`);
-    const rows = readFileSync(join(lockRoot, 'resource', 'shadow.jsonl'), 'utf8').trim().split('\n').map(JSON.parse);
-    expect(rows.at(-1)).toMatchObject({ gate: 'heavy-admission.load-status', kind: kind ?? 'build', old: { verdict: 'admit' } });
+    expect(existsSync(join(lockRoot, 'resource', 'shadow.jsonl'))).toBe(false);
   });
 });
 

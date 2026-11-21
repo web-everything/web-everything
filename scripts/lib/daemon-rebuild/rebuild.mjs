@@ -98,6 +98,7 @@ function trustedIgnoreOwners(raw, spawnerOwners, log) {
  * a smoke-passed candidate (including one already waiting on this head) retains the finalize wait.
  * @param {{root:string, env?:NodeJS.ProcessEnv, log?:Console, run?:typeof gitRun, runSmoke?:typeof runLiveSmokeWithRetry,
  *   prState?:(pr:number)=>(Promise<string|null>|string|null), lockOpts?:object, stateOpts?:{env?:NodeJS.ProcessEnv},
+ *   prBaseChain?:Function,
  *   mainOnly?:boolean, admissionWaitMs?:number, now?:()=>number, sleep?:(ms:number)=>Promise<void>,
  *   emitEvent?:Function, dispatchSmoke?:{settings?:object, run?:Function, match?:Function}}} o — injected
  *   pieces of the real dispatch smoke the candidate smoke runs for a new dispatch-touching overlay (default: #4481's).
@@ -185,7 +186,7 @@ function defaultForceWatchProbe(run, env) {
 
 async function rebuildCloneInternal({
   root, env = process.env, log = console, run = gitRun, runSmoke = runLiveSmokeWithRetry,
-  prState = (pr) => defaultPrState({ pr, root }), lockOpts = {}, stateOpts = {}, mainOnly = false,
+  prState = (pr) => defaultPrState({ pr, root }), prBaseChain, lockOpts = {}, stateOpts = {}, mainOnly = false,
   now = () => Date.now(), sleep, versions, skipCheck, entries, dispatchSmoke, readyOnly = false, adoptOnly = false,
   asJob, admissionWaitMs, spawnerOwners = defaultSpawnerOwners, readerStartTimeOf = processStartMs,
 } = {}) {
@@ -196,7 +197,7 @@ async function rebuildCloneInternal({
     return rebuildCloneAsJob({
       root, env, log, mainOnly, entries,
       adopt: (o = {}) => rebuildCloneInternal({
-        root, env, log, run, runSmoke, prState, lockOpts, stateOpts, mainOnly, now, sleep, versions, skipCheck, entries,
+        root, env, log, run, runSmoke, prState, prBaseChain, lockOpts, stateOpts, mainOnly, now, sleep, versions, skipCheck, entries,
         dispatchSmoke, admissionWaitMs, ...o, adoptOnly: true, asJob: false,
       }),
     });
@@ -268,7 +269,7 @@ async function rebuildCloneInternal({
     && pendingReady.prevHead === verifyRev(makeGit({ run, cwd: root, env }), 'HEAD');
   const startedMs = now();
   const prep = await withWriteLock(root, () => prepareRebuild({
-    root, env, log, run, prState, stateOpts, mainOnly, now, skipCheck: skipDecider, readyOnly, adoptOnly,
+    root, env, log, run, prState, prBaseChain, stateOpts, mainOnly, now, skipCheck: skipDecider, readyOnly, adoptOnly,
   }), readyOnHead ? finalizeLockOpts : admissionLockOpts);
 
   if (prep.ok) {

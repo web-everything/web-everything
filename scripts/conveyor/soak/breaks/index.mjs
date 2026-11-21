@@ -64,6 +64,7 @@
  * without triggering a real load of every break module in this directory.
  */
 
+// `red-team-reserve-first-tick.mjs` is registered by the same directory discovery.
 import { fileURLToPath } from 'node:url';
 import { dirname } from 'node:path';
 

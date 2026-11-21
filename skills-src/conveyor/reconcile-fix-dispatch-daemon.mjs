@@ -62,6 +62,7 @@ import {
 import { runReconcileFixDispatch, writePrivateBorrowedPrompt, routeFixExecutor } from '../../scripts/conveyor/reconcile-fix-dispatch.mjs';
 import { runAwaitVerifyPassDefault, formatAwaitVerifyLines } from '../../scripts/conveyor/await-verify-pass.mjs';
 // xn025gx (fixer proposal A1 + A2 part 1, rulings P1/P2) — the fast push-on-green loop and the active-only fix slot.
+import { withCiHealCycleLock, spawnCiHealLoop, createCiHealLoopController } from '../../scripts/conveyor/ci-heal-loop.mjs';
 import { runTickAwaitVerify, defaultSlotCountedFixClaims, superviseAwaitVerifyLoop, formatReleaseLines } from '../../scripts/conveyor/await-verify-loop.mjs';
 import { runFixerStuckReclaimPass, formatFixerStuckReclaimLines } from '../../scripts/conveyor/fixer-stuck-reclaim.mjs'; // card xccgzu5
 import { runReconcileCiHealDispatch, dispatchCiHeal } from '../../scripts/operations/ci-heal-pr-dispatch.mjs';
@@ -630,7 +631,8 @@ export function planNeedsHumanVoid({ note, pr, repo, verdictSettings, readRequir
   if (voidCount >= MAX_VERDICT_VOIDS_PER_HEAD) return null;
   let requiredChecks;
   try { requiredChecks = readRequiredChecks({ repo }); } catch { return null; }
-  if (!ciGreenForEscalation({ rollup: pr.statusCheckRollup, requiredChecks })) return null;
+  if (!ciGreenForEscalation({ rollup: pr.statusCheckRollup, requiredChecks, headSha: pr.headRefOid,
+    rowsComplete: pr.rowsComplete, rowsHead: pr.rowsHead })) return null;
   return { ...row, alreadyPosted: false,
     body: buildCiHealVerdictVoidComment({ headSha: head, voids: 'needs-human', cause: 'required-ci-green' }) };
 }
@@ -1124,6 +1126,8 @@ export function createPassCallRecorder() {
 export async function runTickAllRepos({
   repos = FIX_DISPATCH_DAEMON_REPOS, fixTick, ciHealTick, hungCiTick, mainRedRebaseTick, missingRunTick, promoteDraftTick, rulingStandDownTick, notesTick, notesDryRun,
   authGateOverride,
+  // s2: false while the ci-heal child loop is alive; the inline step otherwise runs under the same single-run lock.
+  ciHealInline = true, ciHealLock = false, withCiHealLock = withCiHealCycleLock,
   fixSettings = resolveFixSettings(),
   // Opt-in IO for injected ticks; historical fixtures never acquire a live snapshot.
   readPrs,
@@ -1465,9 +1469,13 @@ export async function runTickAllRepos({
   // R242 audit round 3: CI-heal must retain its historical flushOwed/flushTimeouts
   // ordering, and notes must write from fresh evidence, even on an empty snapshot.
   // Neither step participates in snapshot sharing or empty-work skipping.
-  const ciHeal = await timedAsync('ci-heal', async () => (authGate.paused ? pausedDispatchResult()
-    : await runReconcileCiHealDispatchAllRepos({ repos: budgetRepos('ci-heal', repos), tick: boundedPrTick('ci-heal', ciHealTick ?? routedCiHealTick), ...(ciHealTick ? {} : { queueAdmission, dispatchThrottle }),
-      ...(planCache ? { reconcile: planCache.reconcile } : {}) })));
+  const ciHeal = await timedAsync('ci-heal', async () => {
+    if (authGate.paused || ciHealInline === false) return pausedDispatchResult();
+    const heal = () => runReconcileCiHealDispatchAllRepos({ repos: budgetRepos('ci-heal', repos), tick: boundedPrTick('ci-heal', ciHealTick ?? routedCiHealTick), ...(ciHealTick ? {} : { queueAdmission, dispatchThrottle }),
+      ...(planCache ? { reconcile: planCache.reconcile } : {}) });
+    const result = ciHealLock ? await withCiHealLock(heal) : await heal();
+    return result?.skipped === 'busy' ? { ...pausedDispatchResult(), skipped: 'busy' } : result;
+  });
   ciHeal.budgetSkipped = budgets['ci-heal'].skipped;
   planCache?.markTouched(ciHeal);
   if (dispatchThrottle) lastFixQueueLength = fixQueueLengthOf(fix, ciHeal);
@@ -1719,7 +1727,7 @@ export function buildFixThrottle({ slotClaims = defaultSlotCountedFixClaims, que
  * returning on its own (`loopEnded`). Each stops the await-verify loop child FIRST, then releases the lease (the first two
  * then exit) — a child outliving its daemon would keep pushing and waking with no one supervising it.
  */
-export function buildDaemonExits({ awaitLoop, releaseLease, exit = (code) => process.exit(code), log = console } = {}) {
+export function buildDaemonExits({ awaitLoop, ciHealLoop, releaseLease, exit = (code) => process.exit(code), log = console } = {}) {
   let stopping = false;
   return {
     isStopping: () => stopping,
@@ -1727,6 +1735,7 @@ export function buildDaemonExits({ awaitLoop, releaseLease, exit = (code) => pro
       if (stopping) return;
       stopping = true;
       awaitLoop.stop();
+      ciHealLoop?.stop();
       log.error(`reconcile-fix-dispatch-daemon: ${signal} — releasing the lease and exiting.`);
       releaseLease();
       exit(0);
@@ -1734,6 +1743,7 @@ export function buildDaemonExits({ awaitLoop, releaseLease, exit = (code) => pro
     restartOntoNewCode: () => {
       stopping = true;
       awaitLoop.stop();
+      ciHealLoop?.stop();
       releaseLease();
       exit(0);
     },
@@ -1741,6 +1751,7 @@ export function buildDaemonExits({ awaitLoop, releaseLease, exit = (code) => pro
     // PID dies, so leaving it running would keep this process alive with no lease and nobody supervising the child.
     loopEnded: (reason) => {
       awaitLoop.stop();
+      ciHealLoop?.stop();
       if (stopping) return;
       log.error(`reconcile-fix-dispatch-daemon: loop stopped (${reason}) — releasing the lease and exiting.`);
       releaseLease();
@@ -1772,14 +1783,14 @@ export function formatPassPhaseTiming(result) {
 /** Build the real effects for {@link runDaemonLoop}: a real tick of {@link runTickAllRepos} (`fix` +
  *  `ci-heal`, #xngv3vn), a real interval sleep, and a real keyed lease heartbeat. Kept as its own factory
  *  (mirroring `buildCliTickEffects` in runner.mjs) so `main()` stays a thin wire-up. */
-export function buildCliDaemonEffects({ owner, intervalMs = DEFAULT_INTERVAL_MS, log = console, handoffDir } = {}) {
+export function buildCliDaemonEffects({ owner, intervalMs = DEFAULT_INTERVAL_MS, log = console, handoffDir, ciHealLoop } = {}) {
   let heapPass = 0;
   let adoptYieldProbe;
   return {
     intervalMs,
     // withSelfSync supplies one boot-HEAD/spacing-aware probe for this process lifetime.
     setAdoptYieldProbe: probe => { adoptYieldProbe = probe; },
-    tickOnce: () => runTickAllRepos({ tagDispatchStatus: defaultTagDispatchStatus, adoptYieldProbe }),
+    tickOnce: () => runTickAllRepos({ tagDispatchStatus: defaultTagDispatchStatus, adoptYieldProbe, ciHealInline: !ciHealLoop?.current(), ciHealLock: true }),
     // A send-back or CI-red label write signals the hand-off mailbox; this sleep wakes on it instead of the interval.
     sleep: createFixHandoffSleep(handoffDir ? { dir: handoffDir } : {}),
     heartbeat: () => heartbeatRunnerLease(RUNNER_LOCK_ROOT, owner, { key: RECONCILE_FIX_DISPATCH_LEASE_KEY }),
@@ -1931,20 +1942,26 @@ async function main() {
   // minutes, so a timer here would starve). It exits on its own when this process is gone; the supervisor restarts it
   // (at most once a minute) if it dies, and stops it by PID — ours — on shutdown/restart. Setting off → never spawned.
   const awaitLoop = superviseAwaitVerifyLoop();
-  const exits = buildDaemonExits({ awaitLoop, releaseLease: () => releaseRunnerLeaseIfOwned(RUNNER_LOCK_ROOT, owner, { key: RECONCILE_FIX_DISPATCH_LEASE_KEY }) });
+  // s2: the ci-heal child (ciHeal.loop on) heals every ciHeal.intervalSec while this tick is busy; off spawns nothing.
+  const ciHealLoop = superviseAwaitVerifyLoop({ spawnLoop: () => spawnCiHealLoop() });
+  const exits = buildDaemonExits({ awaitLoop, ciHealLoop, releaseLease: () => releaseRunnerLeaseIfOwned(RUNNER_LOCK_ROOT, owner, { key: RECONCILE_FIX_DISPATCH_LEASE_KEY }) });
   process.on('SIGTERM', () => exits.shutdown('SIGTERM'));
   process.on('SIGINT', () => exits.shutdown('SIGINT'));
   console.error(`reconcile-fix-dispatch-daemon: started on ${hostname()}:${process.pid}, tick every ${DEFAULT_INTERVAL_MS}ms.`);
   // xv6fciw — keep this daemon's dedicated clone on origin/main, and restart onto new code BETWEEN ticks
   // (launchd KeepAlive brings it back), instead of refusing every dispatch until someone re-syncs by hand.
   const selfRoot = resolve(fileURLToPath(import.meta.url), '..', '..', '..');
-  awaitLoop.start();
   // Webhook-driven wake (flag WE_PR_EVENTS, default OFF → effects unchanged) — see we:scripts/lib/pr-events.mjs.
-  const { stoppedReason } = await runDaemonLoop(
-    withPrEvents(withSelfSync(withGithubAppAuth(withFixDispatchClaimRefresh(buildCliDaemonEffects({ owner })), FIX_DISPATCH_APP_AUTH_OPTS), {
-      root: selfRoot, onRestart: exits.restartOntoNewCode, hasStaleRefusal: hasStaleMainRefusal,
-    }), fixDaemonPrEventsOptions()),
-  );
+  // Re-read ciHeal.loop every tick: on starts the child, off stops it (no daemon restart needed to flip the setting).
+  const ciHealControl = createCiHealLoopController({ supervisor: ciHealLoop });
+  const cliEffects = buildCliDaemonEffects({ owner, ciHealLoop });
+  const effects = withPrEvents(withSelfSync(withGithubAppAuth(withFixDispatchClaimRefresh({ ...cliEffects, tickOnce: () => { ciHealControl.tick(); return cliEffects.tickOnce(); } }), FIX_DISPATCH_APP_AUTH_OPTS), {
+    root: selfRoot, onRestart: exits.restartOntoNewCode, hasStaleRefusal: hasStaleMainRefusal,
+  }), fixDaemonPrEventsOptions());
+  // withSelfSync sets WE_DAEMON_MANAGED_CLONE while constructing; start children after it so the spawn env carries it.
+  awaitLoop.start();
+  ciHealControl.tick();
+  const { stoppedReason } = await runDaemonLoop(effects);
   exits.loopEnded(stoppedReason);
 }
 

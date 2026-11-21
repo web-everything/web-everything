@@ -448,12 +448,30 @@ describe('superviseAwaitVerifyLoop (the daemon\'s child lifecycle)', () => {
     expect(children).toHaveLength(2);
     children[1].h.exit(0); // stopped on purpose (setting off)
     expect(timers).toHaveLength(1);
-    children[1].h.error(new Error('EAGAIN')); // an async spawn error is logged, never thrown
-    expect(log.error).toHaveBeenCalledWith(expect.stringMatching(/await-verify loop error: EAGAIN/));
     sup.start();
     sup.stop();
     expect(children[2].kill).toHaveBeenCalledWith('SIGTERM');
     children[2].h.exit(null); // killed by us: no restart
+    expect(timers).toHaveLength(1);
+  });
+  it('an asynchronous child error clears current for inline fallback and arms one rate-limited retry even if exit follows', () => {
+    const child = fakeChild(), replacement = fakeChild(), timers = [], log = { error: vi.fn() };
+    const spawnLoop = vi.fn().mockReturnValueOnce(child).mockReturnValue(replacement);
+    let now = 1000;
+    const sup = superviseAwaitVerifyLoop({ spawnLoop, log, now: () => now,
+      setTimer: (fn, ms) => { timers.push({ fn, ms }); return { unref() {} }; } });
+    sup.start();
+    now += 10000;
+    child.h.error(new Error('EAGAIN'));
+    expect(sup.current()).toBeNull();
+    expect(log.error).toHaveBeenCalledWith(expect.stringContaining('loop error: EAGAIN'));
+    expect(timers).toEqual([{ fn: expect.any(Function), ms: 50000 }]);
+    child.h.exit(1);
+    expect(timers).toHaveLength(1);
+    timers[0].fn();
+    expect(sup.current()).toBe(replacement);
+    sup.stop();
+    replacement.h.error(new Error('stopped'));
     expect(timers).toHaveLength(1);
   });
   it('a spawn that throws is logged, leaves no child, and is retried no sooner than once a minute until it works or the daemon stops it', () => {

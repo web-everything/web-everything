@@ -494,9 +494,13 @@ describe('the diff the carry reads is pinned to ONE resolved tip sha (a branch t
     let ref = OLD_TIP;
     const calls = [];
     const exec = (cmd, args) => {
+      while (args[0] === '-c') args = args.slice(2);
       calls.push([cmd, ...args].join(' '));
       if (cmd === 'gh') return args[0] === 'api' ? '' : JSON.stringify(view()); // no formal review stands (round 11)
-      if (args[0] === 'fetch') throw new Error('offline'); // the fetch fails: the cached tracking ref is used
+      if (args[0] === 'fetch') return '';
+      if (args[0] === 'cat-file' && args[1] === '-e') return '';
+      if (args[0] === 'rev-parse' && args.includes('--git-common-dir')) return `${tmpdir()}\n${tmpdir()}\n`;
+      if (args[0] === 'rev-parse' && args.at(-1) === 'refs/remotes/origin/main^{commit}') return `${FORK}\n`;
       // a remote-tracking ref named by a sha does not exist (git: unknown revision) — the bare sha is the candidate
       if (args.some((a) => /^origin\/[0-9a-f]{40}/.test(a))) throw new Error('unknown revision');
       if (args[0] === 'merge-base') return `${FORK}\n`;
@@ -515,7 +519,7 @@ describe('the diff the carry reads is pinned to ONE resolved tip sha (a branch t
     expect(evidence.headDiffSha).toBe(NEW_TIP);
     expect(evidence.headDiffSha).toBe(evidence.headSha);
     // the text diff names the resolved head sha, never the moving ref name
-    const textDiff = calls.find((c) => c.startsWith('git diff --no-ext-diff'));
+    const textDiff = calls.find((c) => c.startsWith('git diff ') && !c.includes('--numstat'));
     expect(textDiff).toContain(NEW_TIP);
     expect(textDiff).not.toContain('origin/lane/3432');
   });
@@ -532,6 +536,7 @@ describe('the diff the carry reads is pinned to ONE resolved tip sha (a branch t
 
   it('a tip that cannot be resolved reads as unscored (no diff, so no carry can bind it)', () => {
     const exec = (cmd, args) => {
+      while (args[0] === '-c') args = args.slice(2);
       if (cmd === 'gh') return JSON.stringify(view());
       if (args[0] === 'rev-parse') throw new Error('unknown revision');
       return args[0] === 'diff' ? (args.includes('--numstat') ? '1\t1\tx.mjs\n' : DIFF) : `${FORK}\n`;
@@ -552,6 +557,7 @@ describe('the diff the carry reads is pinned to ONE resolved tip sha (a branch t
   it('a basis with no fork point (diffed against the moving base NAME) is unscored — the base side cannot be pinned', () => {
     const { exec: inner } = movingTipExec();
     const exec = (cmd, args) => {
+      while (args[0] === '-c') args = args.slice(2);
       if (args?.[0] === 'merge-base') throw new Error('no merge base');
       return inner(cmd, args);
     };
