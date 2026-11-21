@@ -1,6 +1,6 @@
 import { describe, it, expect, vi } from 'vitest';
 import { readFileSync, mkdtempSync, writeFileSync, rmSync } from 'node:fs';
-import { execFileSync } from 'node:child_process';
+import { spawnSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { dirname, resolve, join } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
@@ -10,6 +10,7 @@ import { admitCanonicalAudit, prCreateBodyGuard } from '../../pr-land.mjs';
 import { checkCanonicalAuditForOpen } from '../canonical-audit-gate.mjs';
 import { QUESTION_HASH } from '../codex-audit.mjs';
 import { blocker } from '../../lib/open-pr-preflight.mjs';
+import { normalizeDiffFingerprint } from '../../lib/review-escalation.mjs';
 import { renderBypassNote } from '../../lib/pre-pr-review.mjs';
 
 const sha = 'a'.repeat(40);
@@ -123,17 +124,17 @@ describe('combined open-pr preflight', () => {
       detail: 'bypass refused — the request has no --body-file, so the bypass cannot be recorded in the PR body' });
     expect(spawn).not.toHaveBeenCalled();
   });
-  it.each(['', 'Author body\n'])('preserves main bypass annotation of the first body file, including empty text: %j', body => {
+  it.each(['', 'Author body\n'])('annotates the last duplicate body file consumed by pr-land for bypass: %j', body => {
     const dir = mkdtempSync(join(tmpdir(), 'bypass-main-body-'));
     const first = join(dir, 'first.md'), last = join(dir, 'last.md');
-    writeFileSync(first, body); writeFileSync(last, 'Last body\n');
+    writeFileSync(first, 'First body\n'); writeFileSync(last, body);
     const bypass = { actor: 'operator', reason: 'approved', operatorInstruction: 'approved' };
     let copied;
     const spawn = vi.fn((_cmd, args) => {
       const files = args.filter(a => a.startsWith('--body-file='));
       expect(files).toHaveLength(2);
-      expect(files[1]).toBe(`--body-file=${last}`);
-      copied = files[0].slice('--body-file='.length);
+      expect(files[0]).toBe(`--body-file=${first}`);
+      copied = files.at(-1).slice('--body-file='.length);
       expect(readFileSync(copied, 'utf8')).toBe(body + renderBypassNote(bypass));
       return { status: 0, stdout: '{"pr":7}' };
     });
@@ -142,8 +143,8 @@ describe('combined open-pr preflight', () => {
     try {
       expect(run({ argv: ['--ref=lane/audit', `--body-file=${first}`, `--body-file=${last}`] }).outcome).toBe('opened');
       expect(spawn).toHaveBeenCalledOnce();
-      expect(readFileSync(first, 'utf8')).toBe(body);
-      expect(readFileSync(last, 'utf8')).toBe('Last body\n');
+      expect(readFileSync(first, 'utf8')).toBe('First body\n');
+      expect(readFileSync(last, 'utf8')).toBe(body);
       expect(() => readFileSync(copied)).toThrow();
     } finally { rmSync(dir, { recursive: true, force: true }); }
   });
@@ -165,7 +166,7 @@ function runner(canonicalAudit) {
 
 // Keep both producers' default checker. Replace only filesystem/process effects in a child,
 // never the checker or evaluator; no real Git, credentials, network, or .git writes.
-function defaultProducer({ direct = false, dry = false, check = false, failMain = false, records = [] } = {}) {
+function defaultProducer({ direct = false, dry = false, check = false, failMain = false, carry = false, records = [] } = {}) {
   const dir = mkdtempSync(join(tmpdir(), 'default-audit-gate-'));
   const trace = join(dir, 'effects.jsonl');
   const preload = join(dir, 'effects.mjs');
@@ -194,6 +195,8 @@ function defaultProducer({ direct = false, dry = false, check = false, failMain 
         return '';
       }
       if (a[0] === 'fetch') throw new Error("couldn't find remote ref");
+      if (${carry} && a[0] === 'cat-file' && a[1] === 'commit') return 'parent ${base}\\nparent ${'c'.repeat(40)}\\n\\nmerge';
+      if (${carry} && a[0] === 'ls-tree') return '';
       if (a[0] === 'merge-base') return a.includes('--is-ancestor') ? '' : ${JSON.stringify(base)};
       if (a[0] === 'diff') return a.includes('--name-only') ? 'docs/guide.md\\n'
         : a.includes('--name-status') ? 'M\\tdocs/guide.md\\n'
@@ -224,17 +227,13 @@ function defaultProducer({ direct = false, dry = false, check = false, failMain 
     `);
   }
   try {
-    let status = 0, stdout;
-    try {
-      stdout = execFileSync(process.execPath, ['--import', preload, entry, ...argv], {
-        cwd: dir, env: { ...process.env, WE_PLATFORM_PREFERENCES_FILE: prefs, WE_POLICY_CASCADE_LOG: '0' },
-        encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: 30_000, maxBuffer: 1024 * 1024,
-      });
-    } catch (error) {
-      status = error.status; stdout = String(error.stdout || '');
-      if (!stdout.trim()) throw new Error(`producer exited ${status}: ${String(error.stderr || error.message)}`);
-    }
-    return { status, result: JSON.parse(stdout.trim()), effects: readFileSync(trace, 'utf8').trim().split('\n').map(line => JSON.parse(line)) };
+    const child = spawnSync(process.execPath, ['--import', preload, entry, ...argv], {
+      cwd: dir, env: { ...process.env, WE_PLATFORM_PREFERENCES_FILE: prefs, WE_POLICY_CASCADE_LOG: '0' },
+      encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: 30_000, maxBuffer: 1024 * 1024,
+    });
+    if (child.error || !child.stdout?.trim()) throw new Error(`producer exited ${child.status}: ${child.stderr || child.error}`);
+    return { status: child.status, stderr: child.stderr, result: JSON.parse(child.stdout.trim()),
+      effects: readFileSync(trace, 'utf8').trim().split('\n').map(line => JSON.parse(line)) };
   } finally { rmSync(dir, { recursive: true, force: true }); }
 }
 
@@ -283,6 +282,16 @@ describe('default canonical checker integration', () => {
     expect(effects.filter(([cmd]) => cmd === 'publication')).toHaveLength(1);
     expect(effects.find(([cmd]) => cmd === 'publication')[1]).toContain(`--sha=${sha}`);
     expect(effects.some(([, args]) => args.includes('fetch') && args.some(arg => arg.includes('refs/heads/lane/audit')))).toBe(false);
+  });
+  it('direct CLI preserves carry provenance in its notice and PR creation body', () => {
+    const fingerprint = normalizeDiffFingerprint('diff --git a/docs/guide.md b/docs/guide.md\n+documentation only\n');
+    const record = { head: base, base: 'c'.repeat(40), fingerprint, questionHash: QUESTION_HASH,
+      at: '2026-11-17T00:00:00Z', verdict: 'NOT WEAKENED', findings: [] };
+    const { status, result, stderr } = defaultProducer({ direct: true, dry: true, carry: true, records: [record] });
+    expect(status).toBe(0);
+    expect(result.reason).toBe('dry-run');
+    expect(stderr).toContain(`carried-across-main-merge bbbbbbbb..aaaaaaaa fp ${fingerprint.slice(0, 8)} ruling none\n`);
+    expect(result.plan.find(line => line.startsWith('gh '))).toContain(`<!-- audit-carry: carried-across-main-merge ${base}..${sha} -->`);
   });
   it('direct pr-land default checker admits an audited unpublished local head in dry-run', () => {
     const record = { head: sha, base, questionHash: QUESTION_HASH, at: '2026-11-17T00:00:00Z', verdict: 'NOT WEAKENED', findings: [] };
@@ -340,8 +349,9 @@ describe('direct pr-land canonical gate seam', () => {
   });
   it('the direct CLI gates before its dry-run return and before publishing', () => {
     const source = readFileSync(resolve(dirname(fileURLToPath(import.meta.url)), '..', '..', 'pr-land.mjs'), 'utf8');
-    const gate = source.indexOf('  admitCanonicalAudit({ repo: REPO');
+    const gate = source.indexOf('  const canonicalAudit = admitCanonicalAudit({ repo: REPO');
     expect(gate).toBeGreaterThan(0);
+    expect(source.slice(gate, source.indexOf('  // Derive a title', gate))).toContain('CREATE_BODY = canonicalAudit.body');
     expect(gate).toBeLessThan(source.indexOf('  if (DRY_RUN) {', gate));
     expect(gate).toBeLessThan(source.indexOf('  // 2. Publish', gate));
   });

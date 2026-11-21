@@ -105,9 +105,9 @@ export function checkCanonicalAuditForOpen({ repo = process.cwd(), ref, sha, env
     return carryMemo.get(auditedSha);
   };
   let carryRuling = null;
-  let evidence;
+  let evidence, fp;
   try {
-    const fp = liveFingerprint(records);
+    fp = liveFingerprint(records);
     evidence = canonicalAuditEvidence(records, fullSha, covers, fp);
     if (!evidence.ok && evidence.reason === 'weakened') {
       const rulings = [];
@@ -155,22 +155,26 @@ export function checkCanonicalAuditForOpen({ repo = process.cwd(), ref, sha, env
         if (!intermediateDecisions.has(key)) intermediateDecisions.set(key, { head, records: [] });
         intermediateDecisions.get(key).records.push(record);
       }
-      const unwaived = [...intermediateDecisions.values()].find(({ head, records: headRecords }) =>
-        canonicalAuditEvidence(headRecords, head, covers).reason === 'weakened'
-        && !config.ruledWeakened.some(entry =>
+      const provenanceRulings = new Set(carryRuling ? carryRuling.split('+') : []);
+      for (const { head, records: headRecords } of intermediateDecisions.values()) {
+        if (canonicalAuditEvidence(headRecords, head, covers).reason !== 'weakened') continue;
+        const waiver = config.ruledWeakened.find(entry =>
           entry.ref === ref && validSha(entry.sha) && entry.sha.toLowerCase() === head
+          && carriesAcross(entry.fingerprint, fp) && carriesAcross(entry.fingerprint, carry.fingerprint)
           && /^R\d+(?:\+R\d+)*$/.test(entry.ruling) && Array.isArray(entry.findings)
           && entry.findings.length > 0 && entry.findings.every(f => typeof f === 'string' && f.trim())
           && canonicalAuditEvidence(headRecords, head, covers, null, { ruledWeakened: {
             ruledWeakened: { ruling: entry.ruling, findings: entry.findings },
             record: { sha: entry.sha, fingerprint: null },
-          } }).ok));
-      if (unwaived) return { ok: false, reason: 'canonical-audit-weakened', record: null, sha: fullSha,
-        message: `Main-merge carry refused: intermediate head ${unwaived.head} has an unwaived WEAKENED audit. Ask the operator to resolve this evidence or restore a non-revoked waiver matching that head's ref, sha and exact findings.` };
+          } }).ok);
+        if (!waiver) return { ok: false, reason: 'canonical-audit-weakened', record: null, sha: fullSha,
+          message: `Main-merge carry refused: intermediate head ${head} has an unwaived WEAKENED audit. Ask the operator to resolve this evidence or restore a non-revoked waiver matching that head's ref, sha, fingerprint and exact findings.` };
+        for (const ruling of waiver.ruling.split('+')) provenanceRulings.add(ruling);
+      }
       return {
         ok: true, reason: null, message: '', record: evidence.record, sha: fullSha,
         carried: { kind: 'carried-across-main-merge', from: carry.from, to: carry.to,
-          mainParent: carry.mainParent, fingerprint: carry.fingerprint, ruling: carryRuling },
+          mainParent: carry.mainParent, fingerprint: carry.fingerprint, ruling: [...provenanceRulings].join('+') || null },
       };
     }
   }
@@ -181,4 +185,12 @@ export function checkCanonicalAuditForOpen({ repo = process.cwd(), ref, sha, env
   return evidence.reason === 'weakened'
     ? refuse('canonical-audit-weakened', `latest canonical audit for ${fullSha} is WEAKENED and no ruledWeakened waiver matches ref+sha+findings`)
     : refuse('canonical-audit-missing', `no canonical codex-audit record for ${fullSha} with coverage of origin/main`);
+}
+
+/** Shared provenance text for every PR producer. */
+export function auditCarryNotice(c) {
+  return `carried-across-main-merge ${c.from.slice(0, 8)}..${c.to.slice(0, 8)} fp ${c.fingerprint.slice(0, 8)} ruling ${c.ruling ?? 'none'}\n`;
+}
+export function auditCarryNote(c) {
+  return `\n<!-- audit-carry: carried-across-main-merge ${c.from}..${c.to} -->\nMain-merge audit carry preserves the lane diff; CI still runs on the merged head.\n`;
 }

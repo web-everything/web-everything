@@ -46,7 +46,8 @@ function fixture({ union = false, hops = 1, pass = false, conflict = false } = {
   const amend = (path, text) => { if (text === null) rmSync(join(repo, path)); else put(path, text); git('add', '-A'); git('commit', '--amend', '--no-edit', '-q'); B = git('rev-parse', 'HEAD'); };
   const parents = ps => { B = git('commit-tree', git('rev-parse', `${B}^{tree}`), ...ps.flatMap(p => ['-p', p]), '-m', 'shape'); };
   return { repo, env, git, A, base, main, audit, waiver, records, waivers, run, amend, parents, head: () => B,
-    revoke: () => { withdrawn = JSON.stringify({ ref: waiver.ref, sha: A, ruling: 'WITHDRAWN' }); } };
+    revoke: () => { withdrawn = JSON.stringify({ ref: waiver.ref, sha: A, ruling: 'WITHDRAWN' }); },
+    damageWithdrawal: () => { withdrawn = '{"ref":"lane/test","ruling":"WITHDRAWN","sha":"damaged"}'; } };
 }
 describe('canonical main merge carry with real git objects', () => {
   it('carries a ruled WEAKENED audit across a merge of origin/main with an unchanged lane diff', () => {
@@ -109,6 +110,28 @@ describe('canonical main merge carry with real git objects', () => {
     expect(result.ok).toBe(false);
     expect(result.reason).toBe(fingerprint === 'bad' ? 'canonical-audit-missing' : 'canonical-audit-weakened');
     expect(result.carried).toBeUndefined();
+  });
+  it.each([undefined, 'f'.repeat(64)])('refuses an intermediate waiver with missing or mismatched fingerprint %s', fingerprint => {
+    const f = fixture({ hops: 2, pass: true });
+    const intermediate = f.git('rev-parse', 'HEAD~1');
+    f.records.push({ ...f.audit, head: intermediate, fingerprint: undefined,
+      verdict: 'WEAKENED', findings: ['intermediate finding'] });
+    f.waivers.push({ ...f.waiver, sha: intermediate, fingerprint, ruling: 'R124', findings: ['intermediate finding'] });
+    expect(f.run()).toMatchObject({ ok: false, reason: 'canonical-audit-weakened' });
+  });
+  it('never omits the intermediate waiver ruling from PASS carry provenance', () => {
+    const f = fixture({ hops: 2, pass: true });
+    const intermediate = f.git('rev-parse', 'HEAD~1');
+    f.records.push({ ...f.audit, head: intermediate, fingerprint: undefined,
+      verdict: 'WEAKENED', findings: ['intermediate finding'] });
+    f.waivers.push({ ...f.waiver, sha: intermediate, ruling: 'R124', findings: ['intermediate finding'] });
+    expect(f.run()).toMatchObject({ ok: true, carried: { from: f.A, ruling: 'R124' } });
+  });
+  it('refuses carry when withdrawal evidence is damaged', () => {
+    const f = fixture();
+    expect(f.run().ok).toBe(true);
+    f.damageWithdrawal();
+    expect(f.run()).toMatchObject({ ok: false, reason: 'canonical-audit-weakened' });
   });
   it.each([false, true])('accepts separately waived intermediate WEAKENED audits (fingerprinted: %s)', fingerprinted => {
     const f = fixture({ hops: 2 });

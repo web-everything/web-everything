@@ -14,7 +14,7 @@
  * IMPURE by construction: `child_process`.
  */
 import { blocker, mergeBlockers, formatBlockers } from '../lib/open-pr-preflight.mjs';
-import { checkCanonicalAuditForOpen } from './canonical-audit-gate.mjs';
+import { checkCanonicalAuditForOpen, auditCarryNotice, auditCarryNote } from './canonical-audit-gate.mjs';
 import { readMainCard, assertMachineTitle } from './machine-pr-title.mjs';
 import { execFileSync, spawnSync } from 'node:child_process';
 import { dirname, isAbsolute, join, sep } from 'node:path';
@@ -94,7 +94,7 @@ export const OPEN_PR_TIMEOUT_MS = 30 * 60 * 1000;
  * caller refuses it rather than opening a PR whose body does not record the bypass. `cleanup` removes the copy.
  */
 function withBypassInBody(argv, b, cwd) {
-  const i = argv.findIndex((a) => a.startsWith('--body-file='));
+  const i = argv.findLastIndex((a) => a.startsWith('--body-file='));
   if (i < 0) throw new Error('the request has no --body-file, so the bypass cannot be recorded in the PR body');
   const dir = mkdtempSync(join(tmpdir(), 'open-pr-bypass-'));
   const cleanup = () => rmSync(dir, { recursive: true, force: true });
@@ -255,11 +255,11 @@ export function createPrLandRunner({ canonicalAudit = checkCanonicalAuditForOpen
     }
     if (audit?.ok && audit.carried) {
       const c = audit.carried;
-      process.stderr.write(`carried-across-main-merge ${c.from.slice(0, 8)}..${c.to.slice(0, 8)} fp ${c.fingerprint.slice(0, 8)} ruling ${c.ruling ?? 'none'}\n`);
+      process.stderr.write(auditCarryNotice(c));
       if (!collectOnly && argv.some(a => a.startsWith('--body-file='))) {
         const previousCleanup = cleanupBody;
         try {
-          const noted = withCarryNoteInBody(argv, `\n<!-- audit-carry: carried-across-main-merge ${c.from}..${c.to} -->\nMain-merge audit carry preserves the lane diff; CI still runs on the merged head.\n`, cwd);
+          const noted = withCarryNoteInBody(argv, auditCarryNote(c), cwd);
           argv = noted.argv;
           cleanupBody = () => { noted.cleanup(); previousCleanup(); };
         } catch (e) {
