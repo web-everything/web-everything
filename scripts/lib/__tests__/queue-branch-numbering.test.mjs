@@ -208,10 +208,11 @@ describe('queue branch numbering', () => {
     expect(reservationPlan(files, [], () => true)).toEqual({ reservations: [], minNext: 11 });
     expect(reservationPlan(files, [reservation], () => true)).toEqual({ reservations: [reservation], minNext: 5840 });
   });
-  function setup({ pending = true, state = '{"reservations":[]}', head = 'old' } = {}) {
+  function setup({ pending = true, state = '{"reservations":[]}', head = 'old', behind = '0' } = {}) {
     let numbered = false;
     const exec = vi.fn((_, args) => {
       const sparsePath = sparseMetadataPath(args); if (sparsePath) return sparsePath;
+      if (args[0] === 'rev-list') { if (behind instanceof Error) throw behind; return `${behind}\n`; }
       if (args[0] === 'ls-remote') return `${head}\trefs/heads/topic\n`;
       if (args[0] === 'ls-files') return pending && !numbered ? 'backlog/xabc123-foo.md' : 'backlog/041-foo.md';
       if (args[0] === 'ls-tree') return args.includes('--name-only') ? 'backlog/040-main.md' : treeEntry('backlog/xabc123-foo.md') + treeEntry('src/not-materialized.js');
@@ -392,6 +393,54 @@ describe('queue branch numbering', () => {
     }
     const x = setup(); x.args.lock = () => ({ ran: false });
     expect(prepareBranchBeforeEnqueue(x.args).reason).toContain('mutex');
+  });
+  const noWrites = (x) => {
+    expect(x.exec.mock.calls.some(([, args]) => args[0] === 'push')).toBe(false);
+    expect(x.fs.writeFileSync).not.toHaveBeenCalled();
+  };
+  it('branch numbering refuses before push when drain checkout is stale or restamp would refuse', () => {
+    const x = setup({ behind: '38' });
+    const out = prepareBranchBeforeEnqueue(x.args);
+    expect(out).toMatchObject({ action: 'skip', reason: expect.stringContaining('38 commit(s) behind origin/main') });
+    expect(x.number).not.toHaveBeenCalled();
+    noWrites(x);
+    // finishBranchPreparation turns the refusal into a needs-you event and no enqueue.
+    const emit = vi.fn(() => Promise.resolve());
+    const revalidationAborted = [];
+    expect(finishBranchPreparation(out, { c: x.args.c, revalidationAborted, needsAcceptanceRestamp: () => false, restampAcceptance: vi.fn(), log: { write: vi.fn() }, emit })).toBe(false);
+    expect(emit).toHaveBeenCalledWith(expect.objectContaining({ kind: 'needs-you', pr: 4, daemon: 'drain' }));
+    expect(revalidationAborted[0].reason).toContain('behind origin/main');
+  });
+  it.each(['', 'garbage', '-1'])('refuses when the behind count is unreadable (%j)', (behind) => {
+    const x = setup({ behind });
+    expect(prepareBranchBeforeEnqueue(x.args)).toMatchObject({ action: 'skip', reason: expect.stringContaining('refused') });
+    noWrites(x);
+  });
+  it('refuses when a git read fails during the freshness check', () => {
+    const x = setup({ behind: new Error('fatal: bad revision') });
+    expect(prepareBranchBeforeEnqueue(x.args)).toMatchObject({ action: 'skip', reason: expect.stringContaining('bad revision') });
+    expect(x.number).not.toHaveBeenCalled();
+    noWrites(x);
+  });
+  it('proceeds on a fresh checkout with valid numbers', () => {
+    const x = setup({ behind: '0' });
+    expect(prepareBranchBeforeEnqueue(x.args)).toMatchObject({ action: 'numbered', newHead: 'new' });
+    expect(x.exec.mock.calls.some(([, args]) => args[0] === 'push')).toBe(true);
+  });
+  it.each([['taken on main', '040'], ['below main highest', '010'], ['not a number', 'abc']])('numbered names must be valid against origin/main before push (%s)', (_label, nnn) => {
+    const x = setup();
+    const real = x.args.number;
+    x.args.number = vi.fn((...a) => ({ ...real(...a), assigned: [{ hash: 'xabc123', nnn }] }));
+    const out = prepareBranchBeforeEnqueue(x.args);
+    expect(out).toMatchObject({ action: 'skip', reason: expect.stringContaining('not valid against origin/main') });
+    noWrites(x);
+  });
+  it('numbered names must be valid against origin/main before push (card-id rule on the tracked name)', () => {
+    const x = setup();
+    x.exec.mockImplementation(((orig) => (cmd, args, o) => (args[0] === 'ls-files' && x.args.number.mock.calls.length ? 'backlog/xabc123-foo.md' : orig(cmd, args, o)))(x.exec.getMockImplementation()));
+    const out = prepareBranchBeforeEnqueue(x.args);
+    expect(out.action).toBe('skip');
+    noWrites(x);
   });
   it('leaves a numeric unresolved manifest card final without committing or pushing', () => {
     const x = setup({ pending: false });
@@ -801,6 +850,7 @@ it.each([false, true])('permits confined convenience links and refuses escaping 
     const exec = vi.fn((_cmd, args) => {
       const sparsePath = sparseMetadataPath(args); if (sparsePath) return sparsePath;
       if (args[0] === 'ls-remote') return 'head\trefs/heads/lane/example';
+      if (args[0] === 'rev-list') return '0';
       if (args[0] === 'ls-files') {
         const card = existsSync(join(tree, 'backlog/xabc123-card.md')) ? 'backlog/xabc123-card.md' : 'backlog/041-card.md';
         return args.includes('backlog/') ? card : `${card}\n.claude/skills`;

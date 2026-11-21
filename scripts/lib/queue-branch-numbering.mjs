@@ -392,7 +392,13 @@ export function prepareBranchBeforeEnqueue({ c, traceHeadSha, cwd = process.cwd(
         const state = readReservations(fs, statePath);
         // Refresh the main floor while holding the same mutex as every allocation writer.
         git(['fetch', 'origin', '+refs/heads/main:refs/remotes/origin/main']);
-        const plan = reservationPlan(git(LS_BACKLOG('origin/main')), state, isOpen);
+        // Preflight BEFORE any commit or push: the later acceptance restamp runs from this checkout and refuses
+        // when it is stale, which used to leave a pushed, renumbered, red PR. Any unreadable input refuses.
+        const behind = git(['rev-list', '--count', 'HEAD..origin/main']);
+        if (!/^\d+$/.test(behind)) throw new Error(`drain checkout freshness unreadable (${shownText(behind).slice(0, 80)})`);
+        if (Number(behind) > 0) throw new Error(`drain checkout is ${behind} commit(s) behind origin/main; the restamp would refuse, so nothing was committed or pushed`);
+        const mainFiles = git(LS_BACKLOG('origin/main'));
+        const plan = reservationPlan(mainFiles, state, isOpen);
         // The drain ledger is local-only; fresh worktrees need its directory even when skills are untracked.
         fs.mkdirSync(join(worktree, '.claude/skills/batch-backlog-items'), { recursive: true });
         const n = numberInSparseWorktree(number, worktree, { minNext: plan.minNext });
@@ -401,6 +407,11 @@ export function prepareBranchBeforeEnqueue({ c, traceHeadSha, cwd = process.cwd(
         const pending = hashBacklogFiles(tracked());
         if (pending.length) throw new Error(pendingAfterNumberingReason(pending, n.held));
         if ((n.assigned?.length || n.droppedDuplicates?.length) && !n.committed) throw new Error('numbering commit failed');
+        // Numbers must be free on origin/main and above its highest, and numbered names must be card-id shaped.
+        const mainNums = paths(mainFiles).filter((p) => /^backlog\/[^/]+\.md$/.test(p)).map(cardId).filter(isNum).map(Number);
+        const mainMax = mainNums.reduce((m, v) => Math.max(m, v), 0);
+        const badNumbers = (n.assigned || []).filter((a) => !/^\d+$/.test(String(a.nnn)) || Number(a.nnn) <= mainMax || mainNums.includes(Number(a.nnn)));
+        if (badNumbers.length) throw new Error(`numbered card(s) not valid against origin/main (highest ${mainMax}): ${badNumbers.map((a) => shownText(`${a.hash}→${a.nnn}`)).join(', ')}`);
         const newHead = git(['rev-parse', 'HEAD'], worktree);
         // Persist BEFORE publication: a crash or an ambiguous push failure must never release allocated numbers.
         const nnns = (n.assigned || []).map((a) => Number(a.nnn));
