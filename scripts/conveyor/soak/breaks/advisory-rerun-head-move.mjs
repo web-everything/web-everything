@@ -4,7 +4,7 @@ import { join, resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 
 const ROOT = resolve(fileURLToPath(import.meta.url), '../../../../..');
-const PATHS = ['scripts/conveyor/reconcile-core.mjs', 'scripts/operations/operator-why.mjs'];
+const PATHS = ['scripts/conveyor/reconcile-core.mjs', 'scripts/operations/operator-why.mjs', 'scripts/conveyor/reconcile-pass.mjs'];
 const OLD = 'a'.repeat(40), HEAD = 'b'.repeat(40);
 
 export default {
@@ -42,6 +42,27 @@ export default {
     if (authored.length) violations.push('a non-merge author commit got a head-moved advisory row');
     // PR #7263 review: unreadable history may stop reviews, never the CI repair or operator send-back.
     const tip = "Merge branch 'main' into lane/x";
+    // Post-accept red team #7263: the real reader omitted commits on review:human rows.
+    const { defaultReadPrs } = await import(pathToFileURL(join(sourceRoot, PATHS[2])).href);
+    const history = ['a', 'c', 'd', 'e'].map((hex, index) => ({
+      ...advisory(hex.repeat(40)), createdAt: `2026-11-20T10:0${index}:00Z`,
+    }));
+    let commitReads = 0;
+    const listed = defaultReadPrs({ repo: 'web-everything/web-everything', readOnly: true,
+      readShared: () => [{ number: 7230, author, headRefName: 'lane/x', headRefOid: HEAD, baseRefName: 'main',
+        labels: [{ name: 'review:human' }], rowsComplete: true, rowsHead: HEAD, mergeStateStatus: 'CLEAN',
+        statusCheckRollup: [{ name: 'gate', status: 'completed', conclusion: 'success' }], comments: history }],
+      readComments: () => history,
+      readCommits: () => { commitReads++; return [commit(HEAD, tip), commit(OLD, 'fix: it')]; },
+    });
+    const production = planReconcile({ prs: listed, agents: [], requiredChecks: ['gate'], roundCap: 3,
+      reviewTiming: { startAfter: 'ci-green' }, advisoryReviewOnHumanHandoff: 'on', now: Date.parse('2026-11-20T12:00:00Z') });
+    if (commitReads !== 1 || production.dispatch.length !== 1
+      || production.dispatch[0].advisoryReview?.reason !== 'head-moved-advisory'
+      || production.dispatch[0].advisoryReview.head !== HEAD) {
+      violations.push(`production reader: commitReads=${commitReads}, dispatch=${JSON.stringify(production.dispatch)}, refusals=${JSON.stringify(production.refusals)}`);
+    }
+    log?.(`production reader beyond round cap: commitReads=${commitReads}, rows=${production.dispatch.length}\n`);
     const unreadable = { author, createdAt: '2026-11-20T10:00:00Z', body: `${ADVISORY_NOTE_MARKER}\n\nno basis` };
     const { buildFixEndComment } = await import(pathToFileURL(join(sourceRoot, 'scripts/conveyor/fix-procedure.mjs')).href);
     const { buildReviewedShaMarker } = await import(pathToFileURL(join(sourceRoot, 'scripts/lib/review-escalation.mjs')).href);

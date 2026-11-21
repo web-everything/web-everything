@@ -1,5 +1,6 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import { advisoryHeadMoveState, planReconcile } from '../reconcile-core.mjs';
+import { defaultReadPrs, enrichPrsWithReviewEvidence } from '../reconcile-pass.mjs';
 import { ADVISORY_NOTE_MARKER } from '../advisory-round-count.mjs';
 import { buildFixEndComment } from '../fix-procedure.mjs';
 import { reviewedHeadsOf } from '../mechanical-round-cap.mjs';
@@ -29,6 +30,53 @@ const clearance = () => ({ ...verdict(), body: `${verdict().body}\n${buildCleare
 const sendBack = () => ({ id: 'op-send-back', author: { login: 'chalbert' }, createdAt: '2026-11-20T11:30:00Z',
   body: `🔁 review — changes requested\n\nRecorded by chalbert via console.\n\nAt head \`${HEAD}\`: fix the export.` });
 const red = [{ name: 'gate', status: 'completed', conclusion: 'failure' }];
+
+describe('production commit hydration for moved review:human heads', () => {
+  const staleComments = () => ['a', 'c', 'd', 'e'].map((hex, index) => ({
+    ...advisory(hex.repeat(40)), createdAt: `2026-11-20T10:0${index}:00Z`,
+  }));
+  it.each(['direct', 'shared', 'paged'])('%s listing hydrates the live tip and dispatches once beyond the round cap', source => {
+    const row = pr({ author, baseRefName: 'main', commits: undefined,
+      labels: [{ name: 'review:human' }], comments: staleComments() });
+    const readCommits = vi.fn(() => [mainMerge(HEAD), own(OLD)]);
+    const prs = defaultReadPrs({ repo: 'web-everything/web-everything', readOnly: true, readCommits,
+      readComments: () => row.comments,
+      ...(source === 'direct' ? { exec: (_file, args) => {
+        if (args[0] !== 'pr' || args[1] !== 'list') throw new Error(`unexpected read: ${args.join(' ')}`);
+        return JSON.stringify([row]);
+      } } : { readShared: () => source === 'shared' ? [row] : null,
+        listPaged: () => ({ rows: [row], totalCount: 1, truncated: false, cache: {} }) }),
+    });
+    const result = run({}, { prs, roundCap: 3 });
+    expect(result.dispatch).toEqual([expect.objectContaining({ kind: 'review', headRefOid: HEAD,
+      advisoryReview: { head: HEAD, reason: 'head-moved-advisory' } })]);
+    expect(readCommits).toHaveBeenCalledTimes(1);
+    expect(readCommits).toHaveBeenCalledWith('web-everything/web-everything', row.number,
+      expect.objectContaining({ headRefName: 'lane/x', headRefOid: HEAD, baseRefName: 'main' }));
+  });
+  it.each([['review:human'], [{ name: 'review:human' }, { name: 'review:pending' }]])(
+    'hydrates human review evidence with labels %j', (...labels) => {
+      const readCommits = vi.fn(() => [mainMerge(HEAD)]);
+      const [row] = enrichPrsWithReviewEvidence([pr({ labels, commits: undefined })], { readCommits });
+      expect(readCommits).toHaveBeenCalledTimes(1);
+      expect(advisoryHeadMoveState(row).owed).toBe(true);
+    });
+  it.each([null, [], [mainMerge(OLD)], [own(HEAD)]].map(commits => ({ commits })))(
+    'does not invent a mechanical live tip from $commits', ({ commits }) => {
+      const [row] = enrichPrsWithReviewEvidence([pr({ commits: [mainMerge(HEAD)], comments: staleComments() })], {
+        readCommits: () => commits,
+      });
+      expect(row.commits).toEqual(commits);
+      expect(reviews(run(row, { roundCap: 3 }))).toEqual([]);
+    });
+  it('keeps other review dispositions and unknown labels outside commit hydration', () => {
+    const rows = ['review:accepted', 'review:changes', 'review:pending'].map(label => pr({ labels: [{ name: label }] }));
+    rows.push(pr({ labels: undefined }));
+    const readCommits = vi.fn();
+    expect(enrichPrsWithReviewEvidence(rows, { readCommits })).toEqual(rows);
+    expect(readCommits).not.toHaveBeenCalled();
+  });
+});
 
 describe('review:human advisory re-run on a moved head', () => {
   it.each(['off', undefined])('unreadable advisory with setting %s and green CI still gets the ordinary review', setting => {

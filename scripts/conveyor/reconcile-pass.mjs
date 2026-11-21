@@ -307,10 +307,12 @@ export const PR_LIST_JSON_FIELDS = 'number,title,headRefName,headRefOid,baseRefN
  *  the default page would leave the overflow unowned, which is this item's defect wearing a smaller hat. */
 export const PR_LIST_LIMIT = 200;
 
-/** Attach authorship only where the open-PR listing has no review disposition. */
+/** Attach commit evidence for missing dispositions and review:human mechanical-head advisory reruns. */
 export function enrichPrsWithReviewEvidence(prs, { repo, readCommits = fetchPrCommits } = {}) {
   return prs.map(pr => {
-    if (!Array.isArray(pr.labels) || pr.labels.some(l => (typeof l === 'string' ? l : l?.name)?.startsWith('review:'))) return pr;
+    if (!Array.isArray(pr.labels)) return pr;
+    const labels = pr.labels.map(l => typeof l === 'string' ? l : l?.name);
+    if (!labels.includes('review:human') && labels.some(label => label?.startsWith('review:'))) return pr;
     return { ...pr, state: pr.state ?? 'OPEN',
       commits: readCommits(repo, pr.number, { headRefName: pr.headRefName, headRefOid: pr.headRefOid, baseRefName: pr.baseRefName }) };
   });
