@@ -169,33 +169,46 @@ describe('dispatch claim admission at the fresh re-read', () => {
 });
 
 describe('main prestage dispatch-claim lock wiring', () => {
+  // Which drain phase issued each live default-branch read after the armed
+  // prestage PR read. verifyDefaultBranch caches per run, so the first such
+  // read belongs to main's beforeEnqueue hook when it comes before the full
+  // drain's open-PR listing, and to the full drain's gate read when it comes after.
+  function phases() {
+    const t = { armed: false, sawPrestageRead: false, fullDrainListed: false, defaultBranchReads: [] };
+    t.observe = args => {
+      if (!t.armed) return null;
+      if (args[0] === 'pr' && args[1] === 'view' && args[args.indexOf('--json') + 1]?.includes('state,isDraft,body')) t.sawPrestageRead = true;
+      if (!t.sawPrestageRead) return null;
+      if ((args[0] === 'pr' && args[1] === 'list')
+        || (args[0] === 'api' && args[1] === 'graphql' && args.some(arg => arg.includes('pullRequests(states:OPEN')))) t.fullDrainListed = true;
+      if (args[0] !== 'repo' || args[1] !== 'view' || !args.includes('defaultBranchRef')) return null;
+      t.defaultBranchReads.push(t.fullDrainListed ? 'full-drain' : 'before-enqueue');
+      return t.defaultBranchReads.at(-1);
+    };
+    return t;
+  }
+
   it.each([
     ['on', 'ci-heal'], ['on', 'fix'],
     ['off', 'ci-heal'], ['off', 'fix'],
     ['shadow', 'ci-heal'], ['shadow', 'fix'],
   ])('%s: main rechecks a %s claim acquired after the prestage PR read', async (mode, kind) => {
-    let armed = false, sawPrestageRead = false, acquired, claimSnapshot, root, repoViewsAfterClaim = 0;
+    let acquired, claimSnapshot, root, claimPhase;
+    const t = phases();
     const world = createPrestageWorld((argv, options) => runInProcess(argv, { ...options,
       env: { ...options.env, WE_DRAIN_HONOUR_DISPATCH_CLAIMS: mode },
       ports: { ...prestagePorts, gh: (args, env) => {
         const result = prestagePorts.gh(args, env);
-        if (armed && args[0] === 'pr' && args[1] === 'view'
-            && args[args.indexOf('--json') + 1]?.includes('state,isDraft,body')) {
-          sawPrestageRead = true;
-        }
-        // This live default-branch read is in main's beforeEnqueue hook: the
-        // prestage readPr (including attachLiveFixClaim) has already completed.
-        // The full drain's verifyDefaultBranch issues the same read later, so
-        // on its own this hook does not prove which site took the claim; the
-        // on-mode branch below counts the reads that follow the claim.
+        const phase = t.observe(args);
+        // Take the claim on the first live default-branch read after the
+        // prestage readPr (including attachLiveFixClaim) has completed. The
+        // assertions below require that read to be main's beforeEnqueue hook.
         // Leave the real lock, claim reader, and enqueue callback untouched.
-        if (armed && sawPrestageRead && args[0] === 'repo' && args[1] === 'view') {
-          if (acquired) repoViewsAfterClaim += 1;
-          else {
-            acquired = acquireFixDispatchClaim({ repo: 'we', pr: 42, kind,
-              owner: 'studio:14073', nowMs: NOW, lockRoot: root });
-            claimSnapshot = snapshot(root);
-          }
+        if (phase && !acquired) {
+          claimPhase = phase;
+          acquired = acquireFixDispatchClaim({ repo: 'we', pr: 42, kind,
+            owner: 'studio:14073', nowMs: NOW, lockRoot: root });
+          claimSnapshot = snapshot(root);
         }
         return result;
       } },
@@ -213,10 +226,13 @@ describe('main prestage dispatch-claim lock wiring', () => {
       expect(prepared.calls.some(args => args.some(arg => arg.includes('enqueuePullRequest')))).toBe(false);
       candidate.statusCheckRollup[0] = { name: 'test', status: 'COMPLETED', conclusion: 'SUCCESS', head_sha: candidate.headRefOid };
       candidate.mergeStateStatus = 'CLEAN';
-      armed = true;
+      t.armed = true;
       const result = await run(true);
-      expect(sawPrestageRead).toBe(true);
+      expect(t.sawPrestageRead).toBe(true);
       expect(acquired).toMatchObject({ ok: true });
+      // The claim was taken in main's beforeEnqueue, after the prestage read
+      // and before any full-drain listing, in every mode.
+      expect(claimPhase).toBe('before-enqueue');
       expect(snapshot(root)).toEqual(claimSnapshot);
       expect(result.stderr).toContain(`drain.honourDispatchClaims=${mode} (env)`);
       const enqueues = result.calls.filter(args => args.some(arg => arg.includes('enqueuePullRequest')));
@@ -224,10 +240,7 @@ describe('main prestage dispatch-claim lock wiring', () => {
         expect(enqueues).toHaveLength(0);
         expect(result.report.prestaged).not.toBe(true);
         expect(result.stderr).toContain('drain-prestage: cache miss/stale — full fast drain');
-        // The claim was taken in beforeEnqueue, so the lock recheck refused it:
-        // the full drain that followed read the default branch again. A claim
-        // first taken by the full drain itself would leave this at zero.
-        expect(repoViewsAfterClaim).toBeGreaterThan(0);
+        // Claimed in beforeEnqueue and not enqueued: the lock recheck refused it.
         // The lock refusal falls back to the ordinary fresh re-read, which
         // must also honour the claim instead of enqueueing the same PR there.
         expect(result.report.revalidationAborted).toEqual(expect.arrayContaining([
@@ -246,14 +259,23 @@ describe('main prestage dispatch-claim lock wiring', () => {
   }, 120_000);
 
   it.each(['on', 'shadow'])('%s: a missing claim store fails closed at the prestage read', async mode => {
+    const t = phases();
     const world = createPrestageWorld((argv, options) => runInProcess(argv, { ...options,
-      env: { ...options.env, WE_DRAIN_HONOUR_DISPATCH_CLAIMS: mode }, ports: prestagePorts }));
+      env: { ...options.env, WE_DRAIN_HONOUR_DISPATCH_CLAIMS: mode },
+      ports: { ...prestagePorts, gh: (args, env) => { const result = prestagePorts.gh(args, env); t.observe(args); return result; } } }));
     await world(async ({ pr: candidate, run, coord }) => {
       vi.spyOn(Date, 'now').mockReturnValue(NOW);
       await run();
       candidate.statusCheckRollup[0] = { name: 'test', status: 'COMPLETED', conclusion: 'SUCCESS', head_sha: candidate.headRefOid };
       candidate.mergeStateStatus = 'CLEAN';
+      t.armed = true;
       const result = await run(true);
+      expect(t.sawPrestageRead).toBe(true);
+      // On mode holds at the prestage read, so beforeEnqueue never runs and the
+      // only default-branch read is the full drain's. Shadow keeps the legacy
+      // path, so beforeEnqueue runs. This is also the negative control for the
+      // `before-enqueue` phase the lock-wiring cases above require.
+      expect(t.defaultBranchReads).toEqual([mode === 'on' ? 'full-drain' : 'before-enqueue']);
       // No claim was ever taken here: the store was never created.
       expect(() => statSync(join(coord, 'fix-dispatch-claims'))).toThrow(expect.objectContaining({ code: 'ENOENT' }));
       const enqueues = result.calls.filter(args => args.some(arg => arg.includes('enqueuePullRequest')));
