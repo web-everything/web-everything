@@ -5,8 +5,8 @@ size: 2
 status: open
 scope: ["we:scripts/conveyor/reconcile-pass.mjs", "we:scripts/conveyor/__tests__/reconcile-pass.test.mjs", "we:scripts/conveyor/__tests__/reconcile-pass-required-checks.test.mjs", "we:scripts/lib/required-check-workflows.mjs", "we:scripts/lib/__tests__/required-check-workflows.test.mjs", "we:scripts/check-standards.mjs", "we:scripts/__tests__/check-standards.test.mjs", "we:scripts/operations/__tests__/pr-status*.test.mjs"]
 dateOpened: "2026-10-02"
-preparedDate: "2026-10-03"
-preparedAgainstSha: "8d35ab340afcdf11f1e14ab490fdf7943f458f61"
+preparedDate: "2026-11-21"
+preparedAgainstSha: "943a9dcfdd2346bacde62c05ad228891b89233bc"
 tags: []
 ---
 
@@ -19,7 +19,8 @@ Follow-up from the #3432 advisory (2026-10-02). A required check missing because
 - Original premise/scope: the missing-required rule at `we:scripts/operations/pr-status.mjs:179` alone caused every affected tick to fetch checks and refuse; scope contained that reducer and its unit test.
 - Corrected premise: `we:scripts/operations/pr-status.mjs#reduceCheckState` computes missing names but performs no IO. Pending and failing observed checks take precedence over missing names. A direct Node probe with successful `test` and required names `test, smoke` returned `unchecked` with `missing required checks: smoke`.
 - Source evidence: `we:scripts/conveyor/reconcile-pass.mjs#hydrateChecks` creates a new cache per pass, hydrates on missing names or 100 rows, and emits `check-read-failed` for missing names only when no required red/pending evidence speaks. `we:scripts/conveyor/reconcile-pass.mjs#runReconcilePass` fetches requirements for `defaultBranch`, not each PR base. `baseRefName` is already in its PR list fields. Thus a stacked PR can inherit the default-branch requirements even when its base is excluded by CI; this is not proof that GitHub protects that stacked base with the same set.
-- `we:.github/workflows/ci.yml` restricts `pull_request.branches` to `main` and defines the `test`, `smoke`, and `daemon-soak` jobs. `we:scripts/lib/required-status-checks.mjs` supplies live/cached requirements and repository-specific declared fallbacks. No workflow-eligibility comparison exists in the inspected hydration path or standards gate. These are checkout observations, not a claim about current live branch protection or an affected live PR.
+- Premise drift (2026-11-21 review): `we:.github/workflows/ci.yml:45-46` now sets `pull_request.branches: [main, 'lane/**']`, so lane-stacked PRs ARE eligible for `test`, `smoke`, `daemon-soak`. A base-excluded PR now needs a base that is neither `main` nor `lane/**`; the goal stands as protection against that configuration (and future drift), proven with synthetic workflow fixtures, not a known live case. All `-t` test names and the helper module in Acceptance are NEW and planned (none exist yet); the build must also assert at least one test ran. Design items 5 (bounded TTL refresh) and 6 (injected/live standards validation) remain mandatory; if the build proves larger than size 2, re-size via `## Progress` evidence rather than dropping them.
+- `we:.github/workflows/ci.yml` defines the `test`, `smoke`, and `daemon-soak` jobs. `we:scripts/lib/required-status-checks.mjs` supplies live/cached requirements and repository-specific declared fallbacks. No workflow-eligibility comparison exists in the inspected hydration path or standards gate. These are checkout observations, not a claim about current live branch protection or an affected live PR.
 - Corrected scope: implement the diagnostic and read suppression in the reconciliation IO shell, with a shared proposed workflow-analysis/cache module and standards integration. Keep reducer semantics unchanged; retain its tests as regressions. The scoped workflow helper and its matching test are planned new files; the other scoped test paths exist. The old line citation is replaced by symbol references above.
 
 ## Design
@@ -58,6 +59,28 @@ Follow-up from the #3432 advisory (2026-10-02). A required check missing because
 1. The two-tick executable regression fails before implementation and passes afterward: one actionable configuration diagnostic for unchanged evidence, no repeated absence-only REST hydration, and no promotion of the blocked PR.
 2. Unknown/error/truncated inputs still take the existing cautious read path, and observed failing or pending checks retain their behavior.
 3. The standards gate and runtime use the same tested branch-filter interpretation; reported findings identify the applied policy and evidence rather than asserting protection on an unqueried base.
+
+## Edge cases this change must handle
+
+1. **Untrusted text** — workflow names, job names, branch names and PR text reach the diagnostic and sidecar key: fold newlines/backticks (`foldUntrusted`, `we:scripts/lib/jury-core.mjs`); a branch value starting `--` never reaches argv; tested with a hostile job name.
+2. **Truncated reads** — a snapshot at the 100-row boundary always hydrates normally (no suppression); a `--limit`/page hit on workflow or protection reads is an error, never "no workflows".
+3. **Shared state files** — the dedupe sidecar uses `writeJsonAtomic` + `withFileLock` (`we:scripts/lib/atomic-json-file.mjs`); two tick processes writing at once yield one valid file; a lost race may repeat a diagnostic but never suppress a needed read.
+4. **Fail closed** — an unreadable/corrupt sidecar, unparseable YAML, unmapped producer, or stale evidence means ordinary hydration, never "excluded"; the refusal reason is named.
+5. **Identity scoping** — keys carry repo + PR number + head sha + base + policy branch + required-set digest + workflow revision.
+6. **State over time** — a new head, retarget, workflow revision change or requirements change invalidates the record; the 15-minute TTL bounds stale evidence; a restart mid-write leaves the prior valid record.
+7. **Who wrote it** — workflow evidence is read only from the target repo at the pinned revision, never from a lane checkout or PR-supplied file; a sidecar record is trusted only if its key digest matches.
+
+## Acceptance
+
+Paths carry the `we:` locus; drop it to run from the WE checkout. Every named test below is new, written RED first in the build; each proof must show at least one test ran (a `-t` filter matching nothing is not a pass).
+
+- [A1] Executable: `npx vitest run we:scripts/conveyor/__tests__/reconcile-pass-required-checks.test.mjs -t "two ticks one diagnostic"` — fails before the build (repeated hydration, no diagnostic) and passes after: one configuration diagnostic per unchanged key, no absence-only REST hydration on the second tick.
+- [A2] Executable: `npx vitest run we:scripts/conveyor/__tests__/reconcile-pass-required-checks.test.mjs -t "stays blocked"` — fails before, passes after: the base-excluded PR is never promoted and the reducer still returns `unchecked` for the missing name.
+- [A3] Executable: `npx vitest run we:scripts/conveyor/__tests__/reconcile-pass-required-checks.test.mjs -t "fail closed"` — fails before, passes after: unknown producer, truncated (100-row) snapshot, corrupt/unwritable sidecar, and stale evidence all take ordinary hydration; observed red/pending checks keep precedence.
+- [A4] Executable: `npx vitest run we:scripts/lib/__tests__/required-check-workflows.test.mjs` — fails before (module absent), passes after: glob, negation order, `branches-ignore`, duplicate producers, malformed YAML, and every key-invalidation dimension.
+- [A5] Executable: `npx vitest run we:scripts/__tests__/check-standards.test.mjs -t "required check workflow"` — fails before, passes after: the gate fails on a proven excluded-base fixture, passes the compatible fixture, reports unknown/unavailable as unverified, and makes no network call offline (changed default: standards now validate required-check eligibility).
+- [A6] Executable: `npx vitest run we:scripts/operations/__tests__/pr-status.test.mjs we:scripts/conveyor/__tests__/reconcile-pass.test.mjs` — passes before and after: reducer semantics, callers of `hydrateChecks`/`formatReport`, 100-row pagination and non-CI dispatch are unchanged.
+- [A7] Executable: `npm run check:standards` — exits 0 after the build with the new validator wired in.
 
 ## Follow-ups
 
