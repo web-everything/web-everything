@@ -1,7 +1,7 @@
 import { describe, it, expect } from 'vitest';
 import { afterEach } from 'vitest';
 import { createHash } from 'node:crypto';
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
@@ -234,6 +234,26 @@ describe('analyzeTrace — bun cache home read', () => {
   it('a read of ~/.bun is not a deny', () => {
     expect(denies('/h/.bun', 'stat')).toEqual([]);
     expect(denies('/h/.bun/install/cache/pkg@1.0.0/index.js')).toEqual([]);
+  });
+
+  it('an allowed bun cache access is still traced, so a cache change invalidates the cache key', () => {
+    const out = analyzeTrace({ ...base, events: [{ k: 'read', p: '/h/.bun/install/cache/pkg/index.js' }, { k: 'stat', p: '/h/.bun' }] });
+    expect(out.traced.map((t) => t.path).sort()).toEqual(['/h/.bun', '/h/.bun/install/cache/pkg/index.js']);
+  });
+
+  it.each(['read', 'list', 'mod'])('the bare ~/.bun exception is a stat/exists probe only: %s stays a deny', (k) => {
+    expect(denies('/h/.bun', k)).toHaveLength(1);
+  });
+
+  it('a cache entry symlinked to a credential file is a deny (symlinks are resolved before the allow)', () => {
+    const home = mkdtempSync(join(tmpdir(), 'tct-home-'));
+    mkdirSync(join(home, '.bun', 'install', 'cache'), { recursive: true });
+    mkdirSync(join(home, '.ssh'));
+    writeFileSync(join(home, '.ssh', 'id_rsa'), 'k');
+    symlinkSync(join(home, '.ssh', 'id_rsa'), join(home, '.bun', 'install', 'cache', 'evil'));
+    const out = analyzeTrace({ ...base, home, events: [{ k: 'read', p: join(home, '.bun', 'install', 'cache', 'evil') }] });
+    expect(out.denies).toEqual([expect.stringMatching(/^home-read: /)]);
+    expect(out.traced).toEqual([]);
   });
 
   it.each(['/h/.bun/bin/bun', '/h/.bun/install/global/x', '/h/.bun/install/cache-evil/x', '/h/.bun/secrets', '/h/.bunx/x'])(
