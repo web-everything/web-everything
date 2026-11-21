@@ -156,7 +156,7 @@ const negatives = [
   ['N1 input JSON conflicted', { conflict: 'scripts/settings/seed.json' }],
   ['N2 closure module conflicted', { conflict: CLOSURE[1] }],
   ['N3 bad metadata', {}, f => f.json('scripts/lib/settings-registry-metadata.json', {})],
-  ['N4 generator hangs and is killed', {}, f => f.write(CLOSURE[0], 'setInterval(() => {}, 1000);')],
+  ['N4 generator hangs and is killed', {}, f => f.write(CLOSURE[0], 'setInterval(() => {}, 1000);')], // keepalive-helper-ok: candidate generator text is never executed (closure mismatch refuses first)
   ['N5 source conflict', { conflict: 'source.txt' }],
   ['N6 check disagrees', {}, f => f.write(CLOSURE[0], `import {writeFileSync} from 'node:fs';
 if(process.argv.includes('--write')) writeFileSync('${DOC}', 'unchecked'); else process.exitCode=1;`)],
