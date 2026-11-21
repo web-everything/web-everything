@@ -5808,3 +5808,10 @@ that no subsequent write occurs. New undelegated approval rows bind to their wit
 persisted rows without `headSha` retain legacy behaviour. Scoped regressions live in
 `pr-label-mirror.test.mjs`, `review-set-label.test.mjs`, and
 `delegated-approval-binding.test.mjs`; run them through heavy admission.
+
+The `record-verdict` transport takes the operator-approved head explicitly as
+`--expectedHead=<full 40-hex head SHA>` alongside `--operatorInstruction` for `--to=clear-human`.
+It never infers clearance authority from a saved review or a newly read head.
+`scripts/operations/__tests__/record-verdict.test.mjs` covers request validation;
+`scripts/operations/__tests__/record-verdict-cli.test.mjs` drives both CLI adapters through
+staging the JSON request. The applier carries that pin to `review-set-label` as `--expect-head`.
