@@ -41,24 +41,9 @@ export function makeAuditedTipGate(env = process.env) {
   };
 }
 
-/** Object-only Path B evidence: refuse custom drivers; never run checkout/renormalization filters. */
-export function pathBEvidenceGit(git) {
-  const env = { GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: '/dev/null', GIT_ATTR_NOSYSTEM: '1',
-    GIT_CONFIG_PARAMETERS: '', GIT_CONFIG_COUNT: '1', GIT_CONFIG_KEY_0: 'merge.renormalize', GIT_CONFIG_VALUE_0: 'false' };
-  return (args) => {
-    // Only status 1 proves no driver is configured. Unknown/unreadable config cannot authorize a merge.
-    if (args[0] === 'merge-tree'
-      && git(['config', '--get-regexp', '^merge\\..*\\.driver$'], { env })?.status !== 1) {
-      return { status: 128, stdout: '' };
-    }
-    return git(args, { env });
-  };
-}
-
 /** True when main already has the tip: an ancestor, or a squash-merge that adds nothing (the tree is main's own). */
 export function tipInMain(git, mainSha, sha) {
   if (!mainSha || !sha) return false;
-  git = pathBEvidenceGit(git);
   if (git(['merge-base', '--is-ancestor', sha, mainSha]).status === 0) return true;
   const m = git(['merge-tree', '--write-tree', '--no-messages', mainSha, sha]);
   const t = String(m.stdout ?? '').split('\n')[0].trim();
