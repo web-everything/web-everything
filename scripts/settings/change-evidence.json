@@ -1,0 +1,4 @@
+{
+  "$comment": "Shadow-only change evidence. on currently writes the same local shadow records; publishing is deferred.",
+  "changeEvidence": { "mode": "shadow" }
+}
