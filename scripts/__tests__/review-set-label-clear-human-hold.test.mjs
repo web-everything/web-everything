@@ -68,7 +68,7 @@ describe('clear-human CLI hold ceremony', () => {
     vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
     let exitCode = 0;
     try {
-      runReviewLabelCli({ argv: ['7', '--repo=o/n', '--to=clear-human', '--actor=operator', '--reason=reviewed the workflow', ...extraArgv], allowClearHuman: true, defaultActor: 'test', usage: 'test', provider, readHumanOnlyHold, buildComment: buildVerdictComment, successResult: o => ({ ok: true, ...o }), refusalResult: ({ decision }) => ({ error: decision.reason }), emit: s => chunks.push(s) });
+      runReviewLabelCli({ argv: ['7', '--repo=o/n', '--to=clear-human', '--actor=operator', '--reason=reviewed the workflow', ...(extraArgv.some(a => a.startsWith('--expect-head=')) ? [] : [`--expect-head=${head}`]), ...extraArgv], allowClearHuman: true, defaultActor: 'test', usage: 'test', provider, readHumanOnlyHold, buildComment: buildVerdictComment, successResult: o => ({ ok: true, ...o }), refusalResult: ({ decision }) => ({ error: decision.reason }), emit: s => chunks.push(s) });
     } catch (e) { if (typeof e.exitCode === 'number') exitCode = e.exitCode; else throw e; }
     return { provider, readHumanOnlyHold, exitCode, payload: JSON.parse(chunks.join('') || '{}') };
   }
@@ -187,7 +187,7 @@ describe('clear-human CLI hold ceremony', () => {
     vi.spyOn(process, 'exit').mockImplementation(code => { throw Object.assign(new Error('exit'), { exitCode: code }); });
     vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
     try {
-      runReviewLabelCli({ argv: ['7', '--repo=o/n', '--to=clear-human', '--actor=operator', '--reason=reviewed the workflow'], allowClearHuman: true, defaultActor: 'test', usage: 'test', provider, readHumanOnlyHold: () => true, buildComment: buildVerdictComment, successResult: o => ({ ok: true, ...o }), refusalResult: ({ decision }) => ({ error: decision.reason }), emit: () => {} });
+      runReviewLabelCli({ argv: ['7', '--repo=o/n', '--to=clear-human', '--actor=operator', '--reason=reviewed the workflow', `--expect-head=${head}`], allowClearHuman: true, defaultActor: 'test', usage: 'test', provider, readHumanOnlyHold: () => true, buildComment: buildVerdictComment, successResult: o => ({ ok: true, ...o }), refusalResult: ({ decision }) => ({ error: decision.reason }), emit: () => {} });
     } catch (e) { if (e.exitCode !== 0) throw e; }
     return live;
   }

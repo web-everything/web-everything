@@ -59,12 +59,13 @@ export function resolveBuildPriority({ platform, tool, env } = {}) {
  * IO: standard → platform → tool → runtime → valid env, bounded by runtime only-mode ids.
  * Never throws; only ENOENT omits runtime. Env cannot bypass runtime validation.
  * Runtime JSON contains ids, mode (only|lift), setBy, ISO at, and finite nonnegative ttlHours.
- * Expiry warns but keeps the list; malformed/unreadable evidence holds all new candidates.
+ * An expired list is ignored (reported in runtime.line, ET); malformed/unreadable evidence holds all new candidates.
  * @param {{env?:object, read?:Function, runtimePath?:string, readRuntime?:Function, now?:Function|number}} options
  * @returns {{ids:string[], source:string, mode?:string, only?:boolean, held?:boolean, runtime?:object}}
  */
 export function readBuildPrioritySettings({ env = process.env, read = readSettings, runtimePath, readRuntime = readFileSync, now = Date.now } = {}) {
   const envPriority = buildPriorityEnv(env).priority;
+  let expiredRuntime = null;
   { // Always validate the runtime ceiling before applying any environment override.
     try {
       const path = runtimePath ?? env.WE_BUILD_PRIORITY_RUNTIME_FILE ?? join(resolveCoordinationRoot({ env }), 'build-priority.runtime.json');
@@ -80,9 +81,16 @@ export function readBuildPrioritySettings({ env = process.env, read = readSettin
       if (!Number.isFinite(ageMs)) throw new Error('invalid runtime clock');
       const hash = createHash('sha256').update(JSON.stringify({ ids, mode: runtime.mode })).digest('hex').slice(0, 12);
       const expired = ageMs > runtime.ttlHours * 60 * 60 * 1000;
+      if (expired) {
+        // An expired list is ignored: normal planning resumes, and the expiry time is reported (ET).
+        const expiredAt = new Date(at + runtime.ttlHours * 60 * 60 * 1000).toLocaleString('sv-SE', { timeZone: 'America/New_York' });
+        expiredRuntime = { expired: true, hash, ageMs, setBy: runtime.setBy, expiredAt: `${expiredAt} ET`,
+          line: `runtime list expired at ${expiredAt} ET; list ignored` };
+        throw Object.assign(new Error('runtime list expired'), { code: 'ENOENT' });
+      }
       return { ids, source: hasEnv ? 'env' : 'runtime', mode: runtime.mode, only: runtime.mode === 'only', runtime: {
         hash, ageMs, appliedCount: ids.length, expired, setBy: runtime.setBy,
-        line: `${expired ? 'WARNING expired ' : ''}build.priority (${hasEnv ? 'runtime+env' : 'runtime'}): list=${hash} ageMs=${ageMs} applied=${ids.length}${expired ? '; list still applied; refresh runtime settings' : ''}`,
+        line: `build.priority (${hasEnv ? 'runtime+env' : 'runtime'}): list=${hash} ageMs=${ageMs} applied=${ids.length}`,
       } };
     } catch (error) {
       if (error?.code !== 'ENOENT') return { ids: [], source: 'runtime-malformed', only: true, held: true,
@@ -91,13 +99,14 @@ export function readBuildPrioritySettings({ env = process.env, read = readSettin
   }
   let tool;
   try { tool = read()?.build; } catch { /* unreadable tool settings leave the lower layers intact */ }
+  const withExpiry = r => expiredRuntime ? { ...r, runtime: expiredRuntime } : r;
   try {
-    return buildPriorityResult(cascadePolicy('build', buildPriorityLayer(tool), {
+    return withExpiry(buildPriorityResult(cascadePolicy('build', buildPriorityLayer(tool), {
       standard: { priority: [] },
       platform: buildPriorityLayer(platformPreference('build', { env })) ?? {},
       envValues: buildPriorityEnv(env), valid: BUILD_PRIORITY_VALID, env,
-    }));
-  } catch { return { ids: [], source: 'standard' }; }
+    })));
+  } catch { return withExpiry({ ids: [], source: 'standard' }); }
 }
 
 /**

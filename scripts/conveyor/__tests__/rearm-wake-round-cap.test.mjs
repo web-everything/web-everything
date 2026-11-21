@@ -11,7 +11,7 @@ const wake = hour => comment(hour, buildSameHeadWakeComment({ actor: 'chalbert',
 const rearm = hour => comment(hour, `${REARM_COMMENT_MARKER}\n\nRepaired the finding.`);
 const oldCommit = { sha: head, parents: ['b'.repeat(40)], authoredAt: at(0), subject: 'original PR work' };
 const facts = { head, commits: [oldCommit] };
-const candidate = comments => ({ number: 6877, headRefOid: head, headRefName: 'lane/wake', baseRefName: 'main',
+const candidate = comments => ({ rowsComplete: true, rowsHead: head, number: 6877, headRefOid: head, headRefName: 'lane/wake', baseRefName: 'main',
   isDraft: false, createdAt: at(0), labels: [{ name: 'review:pending' }], comments,
   files: [{ path: 'src/a.mjs' }],
   statusCheckRollup: [{ name: 'test', status: 'COMPLETED', conclusion: 'SUCCESS', headSha: head }] });

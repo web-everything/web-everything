@@ -491,7 +491,14 @@ export function removeRegistration({ root, ref, expectedTip, by = null, reason =
     }
   }
   if (result.removed && entry.pinned === true) writeRebuildRequest(root, { by, reason: reason || 'operator', ref, lockRoot: env.WE_DAEMON_CLONE_LOCK_ROOT });
-  if (result.removed) appendOverlayEvent(root, { kind: 'removed', ref, by, reason, tip }, { env });
+  if (result.removed) {
+    // The CLI supplies a credential read, never --by/--actor. Automatic callers that do not authenticate
+    // still remove the registration, but cannot authorize adopting a build carrying the removed overlay.
+    let actor = null;
+    try { actor = String(deps.viewerLogin?.() ?? '').trim().toLowerCase() || null; } catch { /* unknown identity */ }
+    appendOverlayEvent(root, { kind: 'removed', ref, by, reason, tip,
+      ...(actor ? { actor, source: 'removeRegistration' } : {}) }, { env });
+  }
   return result;
 }
 
@@ -1108,7 +1115,8 @@ export async function main(argv = process.argv.slice(2), deps = {}) {
     output = await recoverDrops({ root, env, by });
     if (output.pending.length) process.exitCode = 3;
   } else if (cmd === 'remove') {
-    output = removeRegistration({ root, ref: flags.ref, by, reason, env });
+    const viewerLogin = reason?.trim() ? await readOverrideViewerLogin() : null;
+    output = removeRegistration({ root, ref: flags.ref, by, reason, env, deps: { viewerLogin: () => viewerLogin } });
   } else if (cmd === 'approve-edge') {
     // The ONLY way an `origin/edge/<ref>` branch becomes adoptable by a rebuild: record actor + exact tip sha on
     // the registered overlay. A malformed sha, a missing actor or an unregistered ref is a usage error (exit 2).

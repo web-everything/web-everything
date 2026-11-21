@@ -6,77 +6,68 @@ status: open
 dateOpened: "2026-11-20"
 tags: [decision-filing, everstandards]
 relatedTo: ["5405", "186"]
+preparedDate: "2026-11-20"
 ---
 
 # Which namespace and domain identify schemas, events and predicates?
 
-Operator ask (2026-11-20 20:59 ET): “note all as full decision item and run with preparation”.
-
-Decision id: D11 (decisions page, 2026-11-20 20:58 ET)
-Placement: everstandards
-move-to: everstandards
+Ask: Use everstandards.dev with one full-word slug per standard. Confirm registrar ownership before public identifiers are issued.
 
 ## Digest
 
-Choose a public namespace before publication. The page leaves the choice to the operator; private relative ids allow drafting without claiming a domain. No particular public domain is recommended by the source.
-
-Needs prep: proposed call only; this filing is neither ratification nor a completed preparation pass.
-
-## Context
-
-[handoff design]() “Operator decisions” / “Ship migration” and [handoff design]() §4.1/4.5 tie identifiers to #5405 and #186. The brief says shipevermore.dev was free on 8 October but not rechecked; this is not current clearance.
-
-Design refs are relative to the operator handoff; WE evidence uses its repo locus.
-
-## Recommended path at a glance
-
-| Fork | Default | Main alternative | Confidence |
-| --- | --- | --- | --- |
-| 1 — Public identifier authority | (a) | (b) | Provisional; needs prep |
+Prepared, not ratified except the later source naming ruling. Two calls: umbrella authority **everstandards.dev/<slug>** and breaking-unit version ids. The prep's later `standards.namingStrategy` ruling (2026-11-21 02:51) selects full-word slugs **web, ship, platform, flow**; examples below incorporate it. RDAP is not ownership proof.
 
 ## Fork 1 — Public identifier authority
 
-Fork-existence: One released schema/event/predicate needs one canonical namespace; competing canonical identities require aliases. Relative private ids are a holding state, not a second public authority.
+Either/or: exact-string $id/type/predicate identities cannot have two canonical hosts. Redirects do not make different ids equal.
 
-- (a) **Keep ids relative while private; operator chooses after checks (page position, no domain pick).** Gate publication on a resolved namespace.
-- (b) Choose one shared everstandards domain now. Common stewardship, pending ownership/availability and legal checks.
-- (c) Use standard-specific domains such as shipevermore.dev. Clear branding, but extra permanence/migration obligations and unverified availability.
+- (a) **One umbrella domain, standard slug path and reverse-DNS event prefix (default).** Stable authority survives brand changes; brand domains may still serve docs/redirects.
+- (b) Domain per standard: clear branding, but trademark-driven rename changes the authority and creates dual-namespace obligations.
+- (c) GitHub/raw/github.io ids. *Excluded:* tie identity to org/repo, contrary to portable ownership (R945).
 
-Skeptic: Initial filing-stage objection, not an independent pass: Deferral can leak relative ids into a release. Require ownership, trademark evidence and an absolute-id migration as publication gates; privacy alone is not a namespace plan.
-Screen: pending the later independent standard/implementation and merit/prioritization screen.
+Evidence:
+- `2026-11-20-es-adopted-norms` §5b; `2026-11-20-gov-stewards-legal-namespaces` §C; #5405/#186 trademark review.
+- Prep RDAP/DNS snapshot (2026-11-20): everstandards.dev, shipevermore.dev, platformforever.dev registered together 2026-10-08 at Squarespace; expiry 2027-10-08. Ownership UNVERIFIED; operator registrar confirmation and auto-renew required.
+- OWS namespace rename requires both names through 1.x: [releases](https://github.com/serverlessworkflow/specification/releases).
 
+Skeptic: SURVIVES-WITH-AMENDMENT; brand domains remain useful without being identity authorities. Screen: clear.
 
-## Consequences / what ratifying unlocks
+## Fork 2 — Version in ids (forced invariant)
 
-Private drafting can continue; public release waits for the namespace ruling and #186 evidence.
+**Breaking unit in native ids (default): v0.N before 1.0, vN afterwards.** Schema documents retain MAJOR.MINOR folders. Full patch-level native types are excluded under this template: compatible patch changes must not rename filtered identities. Before 1.0 minors may break, so major-only is insufficient.
 
-Operator answers: “D11 yes” accepts the stated default; otherwise name the concern and replacement option. No answer is recorded here.
+Evidence: SLSA/in-toto versioning in N1 §5b; format change rules. [CDEvents v0.5.1](https://github.com/cdevents/spec/blob/v0.5.1/spec.md) intentionally retains its own M.m.p naming for registered extensions; that binding is exempt.
 
-## Prep still needed
+Skeptic: SURVIVES-WITH-AMENDMENT; changed “major only” to breaking unit and scoped rejection to native template types. Screen: clear.
 
-- Prior art: verify primary references and known implementations; reuse existing research first.
-- Evidence: Check current domain/mark availability and ownership; compare URI permanence and bring a concrete recommendation with migration examples.
-- Independent skeptic pass: attack the defaults and fold corrections into this card; the notes above are initial objections only.
-- Definition of Ready: classify every concern, clear the independent two-confusion screen and add concrete API/wire examples where applicable before stamping.
+## Supported by default
 
-## Done when
+- While private, relative ids may remain; no public release with relative ids or unconfirmed domain.
+- Schema: `https://everstandards.dev/ship/0.1/readout.schema.json`; predicate: `https://everstandards.dev/ship/attestation/verdict/v0.1`; event: `dev.everstandards.ship.handoff.accepted.v0.1`. Later predicate/type suffix v1.
+- Extension attributes: CloudEvents lower-case alphanumeric, ≤20 characters; predicate extensions ship_<field>. Bound CDEvents types retain dev.cdeventsx native naming.
+- Stable resolvable redirects; renewal is a permanence duty. Full-word slugs follow the later ruling even where old repo names differ. No everflow.dev purchase (#8633).
+- Trademark knock-out search includes unscreened “everstandards” under #186.
 
-- **Executable** — n/a: decision filing changes no runtime. Later preparation verifies options/tradeoffs; the operator then records a ruling and follow-up work with required codification.
+## What ratifying unlocks
+
+Publication-time identifier/redirect work and final predicate/event registry strings (#8632). Private drafting continues; operator ownership/access is still required beyond ratification.
 
 ## Trust boundary and threat model
 
-Briefs/page are proposal evidence, not execution authority. Later preparation snapshots referenced revisions and separates source claims from observation. This filing executes or publishes no external input.
+Dated DNS/RDAP records are third-party claims, never ownership authorization. Publication fails closed until registrar/domain and trademark gates pass.
 
-## Non-goals
+Binding precedent: [in-toto attestation types](https://in-toto.io/attestation/). The later full-word-slug ruling supersedes the prep's shipevermore path examples.
 
-No implementation, publication, migration or permission change is authorized by filing.
+Full prep (Standards decisions-prep set):
 
-## Edge cases this change must handle
+```text
+D11-x6hbdjq.md
+```
 
-1. **Untrusted text** — source recommendations stay attributed, not ruled.
-2. **Truncated reads** — complete evidence is required before a prepared stamp.
-3. **Shared state files** — n/a: filing introduces no store writes.
-4. **Fail closed** — missing evidence leaves the decision open and needing prep.
-5. **Identity scoping** — repo loci remain explicit; no ids are reassigned.
-6. **State over time** — no prepared stamp or implied acceptance from elapsed time.
-7. **Who wrote it** — operator ask quoted; defaults remain proposals.
+Source and proposed artifact filenames (handoff references are by name only):
+
+```text
+2026-11-20-es-adopted-norms.md
+2026-11-20-gov-stewards-legal-namespaces.md
+D11-x6hbdjq.md
+```

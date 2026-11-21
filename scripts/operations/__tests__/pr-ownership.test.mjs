@@ -14,6 +14,7 @@ const NOW = Date.parse('2026-09-24T20:00:00.000Z');
 const ago = (min) => new Date(NOW - min * 60_000).toISOString();
 const GREEN = [{ name: 'test', status: 'COMPLETED', conclusion: 'SUCCESS' }];
 const pr = (number, labels, extra = {}) => ({
+  rowsComplete: true, rowsHead: extra.headRefOid ?? `sha${number}`,
   number, headRefName: `lane/${number}-thing`, headRefOid: `sha${number}`, baseRefName: 'main',
   labels: labels.map((name) => ({ name })), mergeStateStatus: 'CLEAN', statusCheckRollup: GREEN, comments: [],
   isDraft: false, ...extra,
