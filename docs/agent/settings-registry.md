@@ -17,7 +17,7 @@ For repo defaults, edit the owner file through a PR and rebuild the consuming da
 ## Summary
 
 - Top-level keys: 157 (159 declaration rows).
-- Declared leaves: 584 (platform copies counted separately).
+- Declared leaves: 582 (platform copies counted separately).
 - Instant top-level keys: 0; not instant: 157.
 - Instant capacity leaves: 14.
 - Constants to settle: 312.
@@ -115,7 +115,7 @@ Operator-prefs layer: ~/.plateau/platform-preferences.json is the requested oper
 | fixPassBudget | scripts/settings/fix-pass-budget.json | 7 | {"fixMs":120000,"notesMs":90000,"orphanGuardMs":60000,"stuc… | pr | no | Per-pass time budgets for fixer recovery and draft promotion. |
 | fixScope | scripts/settings/fix-scope.json | 1 | {"regionMarginLines":3} | pr | no | Line margin around a finding region in fix scope. |
 | floorMb | scripts/settings/node-heap-cap.json | 1 | 1024 | pr | no | Minimum child-process V8 old-space cap in megabytes. |
-| forgeSlots | scripts/settings/forge-slots.json | 3 | {"default":8,"hosts":{"forge":14,"forge-b":8}} | pr | no | Forge execution pool size by host, with a default for unlisted hosts. |
+| forgeSlots | scripts/settings/forge-slots.json | 1 | {"default":8,"hosts":{}} | pr | no | Forge execution pool size by host, with a default for unlisted hosts. |
 | freeze | scripts/dispatch-settings.json | 1 | {"mainRed":"on"} | pr | no | Main-red dispatch freeze policy. |
 | freezeReadLastGoodTtlMin | scripts/settings/red-main-hold.json | 1 | 10 | pr | no | Lifetime in minutes of the last good freeze read. |
 | ghAuth | scripts/settings/github-auth.json | 1 | {"personalFallback":"refuse"} | pr | no | Policy for falling back to personal GitHub authentication. |
