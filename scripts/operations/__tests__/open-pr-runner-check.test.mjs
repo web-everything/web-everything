@@ -8,7 +8,7 @@ import { assertRunnerFreshness } from '../runner-freshness.mjs';
 
 const live = { session: 'holder', acquiredAt: new Date().toISOString(), ttlMinutes: 240 };
 const sha = 'a'.repeat(40);
-function run({ lease = { ...live, at: sha, branch: 'lane/target' }, rawLease, head = sha, tip = sha, unreadable = false, fetchFails = false, attached = false, symbolic = false, symbolicUnreadable = false, headUnreadable = false, env = {}, scrubbed = { removed: [], kept: [] } } = {}) {
+function run({ lease = { ...live, at: sha, branch: 'lane/target' }, rawLease, head = sha, tip = sha, unreadable = false, fetchFails = false, attached = false, symbolic = false, symbolicUnreadable = false, headUnreadable = false, env = {}, scrubbed = { removed: [], kept: [] }, originUrl = '/srv/git/origin.git' } = {}) {
   const calls = [];
   const scrubs = [];
   const check = () => assertRunnerFreshness({ declaration: { name: 'open-pr' }, moduleUrl: 'file:///pool/repo/lane-1/scripts/operations/run.mjs' }, {
@@ -26,6 +26,7 @@ function run({ lease = { ...live, at: sha, branch: 'lane/target' }, rawLease, he
         throw Object.assign(new Error('not symbolic'), { status: (symbolicUnreadable && !args.includes('HEAD')) || (headUnreadable && args.includes('HEAD')) ? 128 : 1 });
       }
       if (args.includes('--git-path')) return '.git/.lane-lease';
+      if (args[0] === 'config' && args.includes('remote.origin.url')) return originUrl;
       if (args[0] === 'fetch') { if (fetchFails) throw new Error('unreadable origin'); return ''; }
       if (args.includes('HEAD')) return head;
       if (args.includes('refs/remotes/origin/lane/target')) return tip;
@@ -86,6 +87,12 @@ describe('open-pr pinned runner lease', () => {
     const f = run({ scrubbed: { removed: [], kept } });
     expect(f.check).toThrow(/transport config could not be scrubbed/);
     expect(f.calls.some(args => args[0] === 'fetch')).toBe(false);
+  });
+  it('accepts a kept local-path origin URL but refuses a remote-helper origin URL', () => {
+    expect(run({ scrubbed: { removed: [], kept: ['remote.origin.url'] } }).check()).toEqual({ exempt: true });
+    const helper = run({ scrubbed: { removed: [], kept: ['remote.origin.url'] }, originUrl: 'fd::17' });
+    expect(helper.check).toThrow(/transport config could not be scrubbed/);
+    expect(helper.calls.some(args => args[0] === 'fetch')).toBe(false);
   });
   it('accepts the origin transport keys the fetch overrides or never reads', () => {
     expect(run({ scrubbed: { removed: [], kept: ['remote.origin.uploadpack', 'remote.origin.pushurl', 'remote.origin.receivepack'] } }).check()).toEqual({ exempt: true });

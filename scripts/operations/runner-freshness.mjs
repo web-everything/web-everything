@@ -84,7 +84,10 @@ export function assertRunnerFreshness({ declaration, moduleUrl, zeroWrites = fal
         const { kept = [] } = scrubConfig(root) ?? {};
         // Origin keys the scrub keeps: upload-pack is overridden below; push keys never reach a fetch.
         // A kept vcs/proxy (or any failed removal) could still redirect the fetch, so it refuses.
-        const unsafe = kept.filter(key => !/^remote\.origin\.(uploadpack|receivepack|pushurl)$/i.test(key));
+        // The scrub also keeps an origin URL outside https/ssh (a local path or file:// pool); only the
+        // `<helper>::<address>` form runs a remote helper, so that one refuses.
+        const unsafe = kept.filter(key => !/^remote\.origin\.(uploadpack|receivepack|pushurl)$/i.test(key)
+          && !(/^remote\.origin\.url$/i.test(key) && !/^[a-z0-9+.-]+::/i.test(readGit(['config', '--local', '--get', 'remote.origin.url']))));
         if (unsafe.length) throw new Error(`lane transport config could not be scrubbed (${unsafe.length} key(s)); reacquire the lane`);
         readGit(['fetch', '--upload-pack=git-upload-pack', '--quiet', 'origin', `+refs/heads/${lease.branch}:${target}`]);
         let symbolic = false;

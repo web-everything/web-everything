@@ -77,6 +77,8 @@ function olderGuardScenario({ root = ROOT } = {}) {
       const pushed = spawnSync('git', ['push', '--quiet', 'origin', 'HEAD:refs/heads/lane/target'],
         { cwd: lane, encoding: 'utf8', timeout: 30_000, env: { ...process.env, MAIN_PUSH_OK: '' } });
       if (pushed.status === 0) violations.push('older guard: pinned runner pushed lane/target');
+    } else if (!/push guard differs/.test(acquired.stderr)) {
+      violations.push('older guard: acquisition refused for another reason');
     }
     if (git(['rev-parse', 'refs/heads/lane/target'], origin) !== at) violations.push('older guard: lane/target moved');
   } finally { rmSync(scratch, { recursive: true, force: true }); }
