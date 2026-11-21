@@ -37,7 +37,7 @@ function outsideInlineCode(line) {
       delimiter = run[0];
       start = run.index + run[0].length;
     } else if (run[0] === delimiter) {
-      plain += line.slice(start, run.index).replace(/<[a-z][a-z0-9_-]*>/g, ' ') + ' ';
+      plain += line.slice(start, run.index).replace(/<[a-z][a-z0-9_-]*>/gi, ' ') + ' ';
       start = run.index + run[0].length;
       delimiter = undefined;
     }

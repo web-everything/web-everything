@@ -366,7 +366,8 @@ describe('portable feed IO and settings', () => {
       ...(actEnabled ? { WE_LIVE_OWNER_WATCH_ACT: '1' } : {}), ...extraEnv,
       WE_COORDINATION_ROOT: join(dir, 'coordination'), WE_LIVE_OWNER_WATCH_DIR: join(dir, 'watch'), WE_NEEDS_YOU_FEED: join(dir, 'feed.jsonl'), WE_POLICY_CASCADE_LOG: '0' };
     return { dir, io: await createLiveOwnerWatchIo({ env, home: dir, root: dir, now, adapters: {
-      lockOptions: { stamp: () => ({ runnerStart: 'fixture-birth' }), identity: () => ({ alive: true }) }, ...adapters,
+      lockOptions: { stamp: () => ({ runnerStart: 'fixture-birth' }), identity: () => ({ alive: true }) },
+      loadReviewJob: async () => reviewJob, ...adapters,
     } }) };
   }
   it('reads the existing human + JSON feed format as a byte tail', () => {
