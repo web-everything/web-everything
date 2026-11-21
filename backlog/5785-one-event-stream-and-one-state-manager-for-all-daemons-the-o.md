@@ -4,9 +4,7 @@ kind: decision
 parent: "3383"
 status: open
 dateOpened: "2026-10-10"
-preparedDate: "2026-10-10"
-preparedAgainstSha: "75be239bfe71416cb2de79d80d25578d0e70918c"
-relatedTo: ["5452", "4601", "4086", "5767", "4609", "3007", "2626", "4282", "5712"]
+relatedTo: ["5452", "4601", "4086", "5767", "4609", "3007", "2626", "4282", "5712", "5488", "8629"]
 relatedReport: reports/2026-10-10-event-stream-state-manager.md
 tags: [conveyor, daemons, event-driven, state-store, decision-prep]
 ---
@@ -507,3 +505,25 @@ One line per class: either the handling, or `n/a: <why>`.
 5. **Identity scoping** — subjects are `{kind, id}` per tenant and repo; action keys include the head commit (Fork 3).
 6. **State over time** — retention per class as settings; judgments kept forever (Supported by default).
 7. **Who wrote it** — every event carries a producer stamped by the sequencer; appends are permitted per type (Forks 1, 3).
+
+## Update 2026-11-20 (D4, decisions page)
+
+Operator ask (2026-11-20 20:59 ET): “note all as full decision item and run with preparation”.
+Decision id: D4 (decisions page, 2026-11-20 20:58 ET)
+Placement: plateau-app
+move-to: plateau-app
+
+### Digest / context
+
+**Ratify the shared state-store design (default), with a local file journal for shadow runs first and a Cloudflare Durable Object adapter afterwards.** Each tenant has one ordered stream; the hosted tenant store lives with Plateau. Source: [handoff end-state design](designs/longshore-end-state-2026-11-20.md) §1.1, §1.4, §1.7, §4–5. Existing prepared research above remains the evidence base; the October prepared stamps are unchanged.
+
+### Supported by default — staged validation, one authority
+
+Local shadow journal and hosted Durable Object are compatible stages/adapters, not simultaneous authorities. The default is “yes” to the architecture, not evidence that the implementation or operator ratification already happened. Declining ratification leaves the current per-kind authority rules in force; it does not authorize a second source of truth.
+
+The new core/adapters target Longshore; hosted credentials/tenant operation belong to Plateau. This updates the old FUI kernel-placement premise above if ratified, without moving standard envelopes or vectors into a private product. Stream order remains seq, claims/leases remain conditional writes, and a kind changes authority only after tested restore.
+
+Skeptic: A host journal can be mistaken for a cross-host authoritative store. Keep it shadow-only initially, replay the same envelope, and prove restore/order/dedupe before enabling the hosted adapter; never let local and hosted copies both decide ownership.
+Screen: pending prep of the staging/placement delta; do not imply the old prepared pass verified this new amendment.
+What ratifying unlocks: local replay/shadow work now, then the Plateau-hosted DO adapter and per-kind authority cutovers. Operator answers: “D4 yes”.
+Prep still needed: reuse the existing #5785 survey; verify journal/DO equivalence, retention/dedupe and restore tests; independently attack staging and reconcile old placement refs. No stamp, ruling or implementation is changed here.
