@@ -13,6 +13,16 @@ export const OPERATOR_CAPACITY_MAX = Object.freeze({ fix: 24, review: 16, redTea
 export const CAPACITY_LEAVES = Object.freeze({
   'ciHeal.reserve': capacityLeaf(integer(0, 12), 'cap', 2),
   'lanes.maxConcurrent': capacityLeaf(integer(1, 24), 'cap', 8),
+  // Floor/reserves protect capacity: an unreadable override must retain the larger bound.
+  'resourcePool.builderFloor': capacityLeaf(integer(0, 64), 'threshold', 4),
+  'resourcePool.class.1.reserve': capacityLeaf(integer(0, 64), 'threshold', 2),
+  'resourcePool.class.1.max': capacityLeaf(integer(0, 64), 'cap', 4),
+  'resourcePool.class.2.reserve': capacityLeaf(integer(0, 64), 'threshold', 6),
+  'resourcePool.class.2.max': capacityLeaf(integer(0, 64), 'cap', 8),
+  'resourcePool.class.3.reserve': capacityLeaf(integer(0, 64), 'threshold', 2),
+  'resourcePool.class.3.max': capacityLeaf(integer(0, 64), 'cap', 6),
+  'resourcePool.class.4.reserve': capacityLeaf(integer(0, 64), 'threshold', 4),
+  'resourcePool.class.4.max': capacityLeaf(integer(0, 64), 'cap', 64),
   'reviewConcurrency.maxLiveReviewRounds': capacityLeaf(integer(1, OPERATOR_CAPACITY_MAX.review), 'cap', 3),
   'host.maxReviewDispatchPerTick': capacityLeaf(integer(1, OPERATOR_CAPACITY_MAX.review), 'cap', 2),
   'fix.conflictFixesPerPass': capacityLeaf(integer(0, OPERATOR_CAPACITY_MAX.fix), 'cap', 1),

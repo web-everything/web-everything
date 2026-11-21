@@ -16,10 +16,10 @@ For repo defaults, edit the owner file through a PR and rebuild the consuming da
 
 ## Summary
 
-- Top-level keys: 157 (159 declaration rows).
-- Declared leaves: 584 (platform copies counted separately).
-- Instant top-level keys: 0; not instant: 157.
-- Instant capacity leaves: 14.
+- Top-level keys: 158 (160 declaration rows).
+- Declared leaves: 595 (platform copies counted separately).
+- Instant top-level keys: 0; not instant: 158.
+- Instant capacity leaves: 23.
 - Constants to settle: 312.
 - Instant gaps: 28.
 
@@ -44,6 +44,15 @@ Operator-prefs layer: ~/.plateau/platform-preferences.json is the requested oper
 | resourceGate.fixCap.ceiling | integer 1–24 | workers | yes | Maximum adaptive fix capacity. |
 | resourceGate.fixCap.floor | integer 1–24 | workers | yes | Minimum adaptive fix capacity. |
 | resourceGate.fixCap.raiseMinMemFreePct | finite number 25–60 | percent | yes | Free memory required to raise fix capacity. |
+| resourcePool.builderFloor | integer 0–64 | units | yes | Protected builder capacity floor in shadow allocation decisions. |
+| resourcePool.class.1.max | integer 0–64 | units | yes | Maximum units for class 1 repair work in shadow allocation decisions. |
+| resourcePool.class.1.reserve | integer 0–64 | units | yes | Reserved units for class 1 repair work in shadow allocation decisions. |
+| resourcePool.class.2.max | integer 0–64 | units | yes | Maximum units for class 2 review work in shadow allocation decisions. |
+| resourcePool.class.2.reserve | integer 0–64 | units | yes | Reserved units for class 2 review work in shadow allocation decisions. |
+| resourcePool.class.3.max | integer 0–64 | units | yes | Maximum units for class 3 fix work in shadow allocation decisions. |
+| resourcePool.class.3.reserve | integer 0–64 | units | yes | Reserved units for class 3 fix work in shadow allocation decisions. |
+| resourcePool.class.4.max | integer 0–64 | units | yes | Maximum units for class 4 builder work in shadow allocation decisions. |
+| resourcePool.class.4.reserve | integer 0–64 | units | yes | Reserved units for class 4 builder work in shadow allocation decisions. |
 | reviewConcurrency.maxLiveReviewRounds | integer 1–16 | rounds | yes | Maximum live host review rounds. |
 
 ## All declared settings
@@ -176,6 +185,7 @@ Operator-prefs layer: ~/.plateau/platform-preferences.json is the requested oper
 | referralHoldAutoResolve | scripts/settings/referral-hold-auto-resolve.json | 3 | {"enabled":true,"onBlock":"send-back","onClean":"resume"} | pr | no | Resolve ruled referral holds by resuming or sending back work. |
 | referralWindowMinutes | scripts/settings/referral-judge-window.json | 1 | 60 | pr | no | Time window in minutes for referral judgment. |
 | requiredChecksCache | scripts/settings/required-checks-cache.json | 1 | {"ttlMinutes":15} | pr | no | Lifetime of cached required-status-check reads. |
+| resourcePool | scripts/settings/resource-pool.json | 11 | {"mode":"shadow","builderFloor":4,"classes":{"1":{"reserve"… | pr | no | Shadow resource ledger mode, builder floor and per-class reserves and maxima; S1 treats enforce as shadow. |
 | retryCooldownMin | scripts/settings/review-red-team-on-skip.json | 1 | 30 | pr | no | Cooldown in minutes between missing red-team recovery attempts. |
 | review | scripts/settings/human-clearance-carry.json, scripts/settings/identical-net-patch.json, scripts/settings/numbering-human-clearance.json, scripts/settings/review-precedents.json | 8 | {"humanClearanceCarryForward":true,"carryEquivalence":"cont… | pr | no | Review equivalence, human clearance and precedent policy. |
 | reviewChurn | scripts/settings/review.json | 3 | {"sameTree":"shadow","capMode":"shadow","maxLoopsPerPr":8} | pr | no | Review churn detection and loop cap policy. |
@@ -219,6 +229,15 @@ Operator-prefs layer: ~/.plateau/platform-preferences.json is the requested oper
 | deliveryCapacity | pinUntil | positive safe integer ≤ now + 72 hours | epoch milliseconds | also instant via operator-override capacity leaf |
 | maxLiveReviewRounds | $ | integer 1–16 | rounds | also instant via operator-override capacity leaf |
 | redTeam | queue.minConcurrent | integer 0–24 | jobs | also instant via operator-override capacity leaf |
+| resourcePool | builderFloor | integer 0–64 | units | also instant via resourcePool.builderFloor |
+| resourcePool | classes.1.max | integer 0–64 | units | also instant via resourcePool.class.1.max |
+| resourcePool | classes.1.reserve | integer 0–64 | units | also instant via resourcePool.class.1.reserve |
+| resourcePool | classes.2.max | integer 0–64 | units | also instant via resourcePool.class.2.max |
+| resourcePool | classes.2.reserve | integer 0–64 | units | also instant via resourcePool.class.2.reserve |
+| resourcePool | classes.3.max | integer 0–64 | units | also instant via resourcePool.class.3.max |
+| resourcePool | classes.3.reserve | integer 0–64 | units | also instant via resourcePool.class.3.reserve |
+| resourcePool | classes.4.max | integer 0–64 | units | also instant via resourcePool.class.4.max |
+| resourcePool | classes.4.reserve | integer 0–64 | units | also instant via resourcePool.class.4.reserve |
 
 ## Instant gaps
 
