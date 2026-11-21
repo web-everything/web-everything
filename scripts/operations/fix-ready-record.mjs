@@ -277,7 +277,7 @@ export function waiverFindings(waivers, { ref, sha, ruling }) {
   return { ok: true, findings: [...hits[0].findings] };
 }
 
-function defaultWaivers(env, settingsFile = join(here, '..', 'settings', 'prototype-load.json')) {
+function defaultWaivers(env, settingsFile = join(here, '..', 'settings', 'prototype-load.json'), ref) {
   const platform = readPlatformPreferences({ env, readFile: (p, encoding) => fs.readFileSync(p, encoding) });
   const tool = JSON.parse(fs.readFileSync(settingsFile, 'utf8'));
   if (platform.errors.length) throw new Error(`platform preferences unreadable: ${platform.errors[0]}`);
@@ -285,7 +285,8 @@ function defaultWaivers(env, settingsFile = join(here, '..', 'settings', 'protot
   const refuseOnWarn = (m) => { throw new Error(`waiver evidence damaged: ${m}`); };
   const store = readStore({ path: storePath(env), fs, warn: refuseOnWarn });
   if (store.error) throw new Error(`ruled-weakened store unreadable: ${store.error}`);
-  const isRevoked = withdrawnRevocations({ fs, env, warn: refuseOnWarn });
+  // A damaged request line blocks only when it names this ref or its ref is unreadable; other refs' damage is reported only.
+  const isRevoked = withdrawnRevocations({ fs, env, warn: refuseOnWarn, scopeRef: ref, warnOther: console.warn });
   // Raw, NOT de-duplicated: conflicting entries for one ref+sha+ruling must reach waiverFindings and refuse as ambiguous.
   // A present layer that is not an array is damaged evidence, never an empty list.
   const list = (v, name) => { if (v === undefined || v === null) return []; if (!Array.isArray(v)) throw new Error(`${name} ruledWeakened is not an array`); return v; };
@@ -303,7 +304,7 @@ export function main(argv = process.argv.slice(2), deps = {}) {
   }
   if (wantWaiver) {
     let waivers;
-    try { waivers = deps.waivers !== undefined ? deps.waivers : defaultWaivers(deps.env ?? { ...process.env, HOME: process.env.HOME || homedir() }, deps.settingsFile); }
+    try { waivers = deps.waivers !== undefined ? deps.waivers : defaultWaivers(deps.env ?? { ...process.env, HOME: process.env.HOME || homedir() }, deps.settingsFile, a.ref); }
     catch (e) { console.error(`fix-ready-record: refused: recorded waivers are unreadable: ${e.message}`); return 1; }
     const w = waiverFindings(waivers, { ref: a.ref, sha: a.sha, ruling: a.auditRuling });
     if (!w.ok) { console.error(`fix-ready-record: refused: ${w.error}`); return 1; }

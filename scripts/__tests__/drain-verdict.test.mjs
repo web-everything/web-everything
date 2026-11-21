@@ -505,6 +505,7 @@ describe('T6: --batch owns the loop, the counting and the exit code', () => {
     io.env.GITHUB_EVENT_NAME = event;
     if (requested !== undefined) io.env.REQUESTED_PR = requested;
     io.mkdirSync = vi.fn();
+    io.random = () => 0; // the batch start is random in production; pin it so listing order is asserted
     const inner = io.execFileSync;
     io.execFileSync = vi.fn((cmd, args, opts) => {
       if (cmd === 'gh' && args[0] === 'pr') return raw ?? listing(prs);
