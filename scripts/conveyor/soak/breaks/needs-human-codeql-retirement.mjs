@@ -18,6 +18,7 @@ export default {
     const head = 'a'.repeat(40);
     const verdictSettings = { voidNeedsHumanWhenCiGreen: true };
     const pr = { number: 5033, state: 'OPEN', headRefOid: head, mergeStateStatus: 'BLOCKED',
+      rowsComplete: true, rowsHead: head,
       labels: [{ name: 'ready-to-merge' }, { name: 'review:accepted' }],
       comments: [{ author: { login: 'web-everything' }, body: buildCiHealEscalationComment({ headSha: head, outcome: 'needs-human', reason: 'CodeQL security alert' }) }],
       statusCheckRollup: [{ name: 'test', status: 'COMPLETED', conclusion: 'SUCCESS' }],

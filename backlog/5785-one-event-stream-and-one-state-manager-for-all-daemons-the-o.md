@@ -7,6 +7,7 @@ dateOpened: "2026-10-10"
 relatedTo: ["5452", "4601", "4086", "5767", "4609", "3007", "2626", "4282", "5712", "5488", "8629"]
 relatedReport: reports/2026-10-10-event-stream-state-manager.md
 tags: [conveyor, daemons, event-driven, state-store, decision-prep]
+preparedDate: "2026-11-20"
 ---
 
 # One event stream and one state manager for all daemons, the operator pages and the tools
@@ -508,22 +509,48 @@ One line per class: either the handling, or `n/a: <why>`.
 
 ## Update 2026-11-20 (D4, decisions page)
 
-Operator ask (2026-11-20 20:59 ET): “note all as full decision item and run with preparation”.
-Decision id: D4 (decisions page, 2026-11-20 20:58 ET)
-Placement: plateau-app
-move-to: plateau-app
+Ask: Confirm one shared store, a file journal for initial shadow runs, then Plateau-hosted Cloudflare storage. All store code stays open in Longshore.
 
-### Digest / context
+### Digest
 
-**Ratify the shared state-store design (default), with a local file journal for shadow runs first and a Cloudflare Durable Object adapter afterwards.** Each tenant has one ordered stream; the hosted tenant store lives with Plateau. Source: [handoff end-state design](designs/longshore-end-state-2026-11-20.md) §1.1, §1.4, §1.7, §4–5. Existing prepared research above remains the evidence base; the October prepared stamps are unchanged.
+October's eight prepared forks above remain the evidence base. **No new real fork**: staging composes with the existing design. Ratify open adapter custody; delegate kernel-home change from Frontier UI to #5488. Amend Fork 3's envelope with the CloudEvents sequence binding.
 
-### Supported by default — staged validation, one authority
+### Ratify — store adapters are open; Plateau hosts
 
-Local shadow journal and hosted Durable Object are compatible stages/adapters, not simultaneous authorities. The default is “yes” to the architecture, not evidence that the implementation or operator ratification already happened. Declining ratification leaves the current per-kind authority rules in force; it does not authorize a second source of truth.
+- (a) **Longshore holds sequencer core, in-memory, journal and DO adapters (default).** Plateau operates hosted tenants, credentials, billing and private plugins.
+- (b) DO adapter only in private Plateau. *Excluded:* prevents open multi-host self-hosting and contradicts the open primitive boundary (#098).
 
-The new core/adapters target Longshore; hosted credentials/tenant operation belong to Plateau. This updates the old FUI kernel-placement premise above if ratified, without moving standard envelopes or vectors into a private product. Stream order remains seq, claims/leases remain conditional writes, and a kind changes authority only after tested restore.
+Evidence:
+- `longshore-end-state-2026-11-20` §1.1/1.7/4; `we:scripts/conveyor/pr-events-worker/core.mjs:277/:419`, `we:__tests__/core.test.mjs:7-34`, `wrangler.toml:19-21` separate storage from core.
+- Existing transaction assumptions (`we:scripts/conveyor/pr-events-worker/core.mjs:271-314`) require journal-specific cross-process lock and torn-tail recovery proof, beyond in-memory tests.
 
-Skeptic: A host journal can be mistaken for a cross-host authoritative store. Keep it shadow-only initially, replay the same envelope, and prove restore/order/dedupe before enabling the hosted adapter; never let local and hosted copies both decide ownership.
-Screen: pending prep of the staging/placement delta; do not imply the old prepared pass verified this new amendment.
-What ratifying unlocks: local replay/shadow work now, then the Plateau-hosted DO adapter and per-kind authority cutovers. Operator answers: “D4 yes”.
-Prep still needed: reuse the existing #5785 survey; verify journal/DO equivalence, retention/dedupe and restore tests; independently attack staging and reconcile old placement refs. No stamp, ruling or implementation is changed here.
+Skeptic: SURVIVES-WITH-AMENDMENT; added disk-safety tests, kept host-local journals and explicit multi-host refusal. Screen: clear.
+
+### Supported by default
+
+- Journal shadow → DO authority, never two authorities. Enable only after both pass the shared core suite, identical snapshot restore, strictly increasing/non-reused seq and dedupe tombstones outliving rows; add lock/crash recovery tests for the journal.
+- Store-by-name: a single-host tenant may choose journal authority; validator refuses it for multiple registered hosts. WE is multi-host; host-local kinds retain a journal after DO cutover.
+- Envelope binds to [CloudEvents](https://raw.githubusercontent.com/cloudevents/spec/main/cloudevents/spec.md): required id/source/specversion/type. Its [sequence extension](https://raw.githubusercontent.com/cloudevents/spec/main/cloudevents/extensions/sequence.md) is a lexicographic string, so zero-pad seq and scope source to tenant stream; credential-stamp producer identity (fetched 2026-11-20).
+- October retention prerequisite is partly fulfilled: runtime rows 5,000/30 days; tombstones 60 days/20,000 keys (`we:scripts/conveyor/pr-events-worker/core.mjs:17/:64-69`, November prep snapshot). Per-class retention for non-GitHub kinds is still owed.
+- Envelope/registry/replay definitions stay Ship's; Apache code licence follows #5403. Kernel home follows #5488, superseding October placement only if ratified.
+
+### What ratifying unlocks
+
+Local tap shadow through the journal, port DO adapter, then per-kind cutovers. “D4 yes” affirms custody/staging; #5488 separately settles home.
+
+### Trust boundary and threat model
+
+Observational shadow data never grants ownership. Keep credential/type authorization and October failure/restore rules; verify journal safety before authority.
+
+Full prep (Standards decisions-prep set):
+
+```text
+D4-5785.md
+```
+
+Source and proposed artifact filenames (handoff references are by name only):
+
+```text
+D4-5785.md
+longshore-end-state-2026-11-20.md
+```
