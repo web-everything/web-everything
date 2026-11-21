@@ -14,7 +14,10 @@
  * script never silently makes a WE-repo-specific orchestration skill — batch-backlog-items, drain, jury,
  * pr, … — globally available in an unrelated repo; those stay project-local via the `.claude/skills`
  * symlink). Pass --all to deploy every skills-src/* entry (bootstrapping a new machine, or deliberately
- * promoting a skill to global), or --only=name1,name2 to scope to specific skills.
+ * promoting a skill to global), or --only=name1,name2 to scope to specific skills. Scoped migration:
+ * providers and review-design moved out of this repo's local skills tree into the ops root. When found
+ * in a secondary root, these two also deploy by default so existing local users retain access after a
+ * pull. Other new skills remain opt-in; --only still restricts the entire run.
  *
  * WHAT IT COPIES: per skill, only the files `git` tracks under `skills-src/<skill>/` — never a gitignored
  * runtime/local-state file (batch-backlog-items' claims.json/reservations.json/capacity.json are per-repo
@@ -51,6 +54,9 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 export const REPO_ROOT = path.resolve(__dirname, '..');
 export const SRC_ROOT = path.join(REPO_ROOT, 'skills-src');
+
+// SK1 relocation: preserve discovery after removing these formerly project-local skills.
+const RELOCATED_SKILLS = new Set(['providers', 'review-design']);
 
 export function deployRoot(env = process.env) {
   return env.WE_SKILLS_DEPLOY_DIR
@@ -275,7 +281,8 @@ export function buildPlans({ srcRoot = SRC_ROOT, extraRoots = [], destRoot, only
       plans.push({ name, srcDir, destDir, destRoot, actions: [], stale: [], pruned: prune, alreadyDeployed: fs.existsSync(destDir), untracked: true });
       continue;
     }
-    if (!only && !all && !fs.existsSync(destDir)) continue; // default: keep already-deployed skills in sync only
+    const relocated = entry.root !== srcRoot && RELOCATED_SKILLS.has(name);
+    if (!only && !all && !relocated && !fs.existsSync(destDir)) continue;
     plans.push(planSkill({ name, srcDir, destDir, trackedRel, prune, destRoot }));
   }
   return plans;

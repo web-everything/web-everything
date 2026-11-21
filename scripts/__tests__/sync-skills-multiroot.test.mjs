@@ -194,6 +194,67 @@ describe('default roots and fail-closed CLI wiring', () => {
   });
 });
 
+describe('relocated repository-local skills migration', () => {
+  it('default hook invocation deploys both relocated skills, but no unrelated new skills', () => {
+    gitRepoWithSkills('home/workspace/plateau-ops', ['providers', 'review-design', 'ops-private']);
+    expect(existsSync(join(skillsSync.SRC_ROOT, 'providers'))).toBe(false);
+    expect(existsSync(join(tmp, 'dest', 'providers'))).toBe(false);
+    // Same invocation as post-merge: no --all or --only. JSON only exposes its result.
+    const r = runCli(['--json']);
+    expect(r.stderr).toBe('');
+    expect(r.status).toBe(0);
+    expect(JSON.parse(r.stdout)).toMatchObject({
+      ok: true, checked: 2,
+      skills: [{ name: 'providers', alreadyDeployed: false }, { name: 'review-design', alreadyDeployed: false }],
+    });
+    expect(readFileSync(join(tmp, 'dest', 'providers', 'SKILL.md'), 'utf8')).toBe('# providers\n');
+    expect(readFileSync(join(tmp, 'dest', 'review-design', 'SKILL.md'), 'utf8')).toBe('# review-design\n');
+    expect(existsSync(join(tmp, 'dest', 'ops-private'))).toBe(false);
+    const repeat = runCli(['--json']);
+    expect(repeat.status).toBe(0);
+    expect(JSON.parse(repeat.stdout)).toMatchObject({ ok: true, checked: 2, drifted: 0 });
+  });
+
+  it.each([
+    { flag: '--check', exit: 1 },
+    { flag: '--dry-run', exit: 0 },
+  ])('$flag reports the pending migration without writing', ({ flag, exit }) => {
+    gitRepoWithSkills('home/workspace/plateau-ops', ['providers', 'review-design']);
+    const r = runCli([flag, '--json']);
+    expect(r.status).toBe(exit);
+    expect(r.stderr).toBe('');
+    expect(JSON.parse(r.stdout)).toMatchObject({ ok: false, checked: 2, drifted: 2, applied: false });
+    expect(existsSync(join(tmp, 'dest'))).toBe(false);
+  });
+
+  it.each(['--only=ops-private', '--only='])('respects explicit selection %s instead of migrating', (flag) => {
+    gitRepoWithSkills('home/workspace/plateau-ops', ['providers', 'review-design', 'ops-private']);
+    const r = runCli([flag, '--json']);
+    expect(r.status).toBe(0);
+    expect(existsSync(join(tmp, 'dest', 'providers'))).toBe(false);
+    expect(existsSync(join(tmp, 'dest', 'review-design'))).toBe(false);
+    expect(existsSync(join(tmp, 'dest', 'ops-private'))).toBe(flag === '--only=ops-private');
+  });
+
+  it('never deploys untracked relocated sources', () => {
+    const ops = gitRepoWithSkills('home/workspace/plateau-ops', ['ops-private']);
+    mkdirSync(join(ops.root, 'providers'));
+    writeFileSync(join(ops.root, 'providers', 'SKILL.md'), '# untracked providers\n');
+    const r = runCli(['--json']);
+    expect(r.status).toBe(0);
+    expect(JSON.parse(r.stdout)).toMatchObject({ ok: false, untrackedSkills: ['providers'] });
+    expect(existsSync(join(tmp, 'dest'))).toBe(false);
+  });
+
+  it('keeps same-named primary-root skills local until explicitly selected', () => {
+    const primary = gitRepoWithSkills('we', ['providers', 'review-design']);
+    const r = runCli(['--json'], { WE_SKILLS_SRC_ROOT: primary.root });
+    expect(r.status).toBe(0);
+    expect(JSON.parse(r.stdout)).toMatchObject({ ok: true, checked: 0 });
+    expect(existsSync(join(tmp, 'dest'))).toBe(false);
+  });
+});
+
 describe('untracked skills CLI contract in every mode', () => {
   it.each([
     { flags: [], exit: 0, applied: true },
