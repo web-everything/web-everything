@@ -77,8 +77,12 @@ describe('observeRoundCap', () => {
     const dir = tmp();
     const files = (n) => [{ path: 'x.mjs', additions: n, deletions: 0 }];
     observeRoundCap({ pr: 77, state: 'at-round-limit', subject: { headRefOid: OLD, comments: [], files: files(300) }, env: env(), dir, now: Date.UTC(2026, 9, 21) });
-    const rec = observeRoundCap({ pr: 77, subject: { ...subject(), files: files(700) }, env: env(), dir, now: Date.UTC(2026, 9, 21) });
+    const shrinking = subject();
+    // Two prior findings -> one current finding keeps the non-convergence stop out of this growth case.
+    shrinking.comments[0].body += '2. [**confirmed**] (failing-input, broken) `c.mjs:5` — gamma renderer drops rows\n';
+    const rec = observeRoundCap({ pr: 77, subject: { ...shrinking, files: files(700) }, env: env(), dir, now: Date.UTC(2026, 9, 21) });
     expect(rec.verdict).toBe('suggest-split');
+    expect(rec.evidence).toMatchObject({ latestCount: 1, prevCount: 2, trend: 'shrinking', diff: { size: 700, prevSize: 300, growth: 400 } });
   });
   it('a restart does not re-log a known cap (dedup comes from the log itself)', () => {
     const dir = tmp();

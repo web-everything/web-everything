@@ -15,6 +15,7 @@
  *   the post and never released — a failed or crashed run keeps its slot and the event stays for a person.
  *   The PR head is re-read right before the post; a moved head never gets the grant.
  */
+import { assertRoundGrantAllowed } from '../lib/round-grant-guard.mjs';
 import { createHash } from 'node:crypto';
 import { mkdirSync, readFileSync, statSync } from 'node:fs';
 import { join } from 'node:path';
@@ -92,8 +93,8 @@ export function readPrThread(repo, pr, { gh = ghApp, readComments = readComplete
   const comments = readComments(pr, { repo, exec: (_file, args) => gh(args) });
   if (!Array.isArray(comments)) throw new Error('complete comments read returned no array');
   // Keep the expected-head check fresh even when reading a long thread takes several pages.
-  const thread = JSON.parse(String(gh(['pr', 'view', String(pr), '--repo', repo, '--json', 'state,headRefOid'])));
-  return { ...thread, comments };
+  const thread = JSON.parse(String(gh(['pr', 'view', String(pr), '--repo', repo, '--json', 'state,headRefOid,files'])));
+  return { ...thread, comments, files: thread.files?.map(file => file.path) ?? [] };
 }
 /** IO: post one comment (App identity). */
 export function postPrComment(repo, pr, body, { gh = ghApp } = {}) {
@@ -132,6 +133,15 @@ export function autoRoundGrant({ repo, note, pr }, {
     return ledger(slug, note.prNumber, ({ seeded, baseline, entries: ledgerEntries, save }) => {
       let thread;
       try { thread = readThread(slug, note.prNumber); } catch (e) { return { action: 'skip', why: `thread unreadable: ${firstLine(e)}` }; }
+      const guard = (view) => {
+        try {
+          assertRoundGrantAllowed({ repo: slug, pr: note.prNumber, comments: view?.comments,
+            files: view?.files === undefined ? [] : view.files, headRefOid: view?.headRefOid });
+          return null;
+        } catch (e) { return { action: 'skip', why: `non-converging stop: ${firstLine(e)}` }; }
+      };
+      const stopped = guard(thread);
+      if (stopped) return stopped;
       const comments = thread?.comments ?? [];
       // An operator grant that landed after this note's snapshot means the note judged a cap that is no longer
       // current: the next pass re-judges it on a snapshot that includes the grant (bounded: one pass). Both counts use
@@ -191,6 +201,11 @@ export function autoRoundGrant({ repo, note, pr }, {
           finish({ outcome: 'aborted', why: 'head moved or PR closed before the post' });
           return { action: 'skip', why: 'head moved or PR closed right before the post' };
         }
+        const freshStop = guard(fresh);
+        if (freshStop) {
+          finish({ outcome: 'aborted', why: freshStop.why });
+          return freshStop;
+        }
         const record = { repo: slug, pr: note.prNumber, by: ruling.by, actor: ruling.author, channel: AUTO_GRANT_CHANNEL,
           reason: autoGrantReason({ note, head, count: verdict.count, max, rulingId: ruling.id }), at: now(), standingRuling: ruling.id, head, episode: key };
         const body = buildRoundExtensionComment(record);
@@ -200,6 +215,11 @@ export function autoRoundGrant({ repo, note, pr }, {
         if (last?.headRefOid !== head || String(last?.state).toUpperCase() !== 'OPEN') {
           finish({ outcome: 'aborted', why: 'head moved or PR closed right before the post' });
           return { action: 'skip', why: 'head moved or PR closed right before the post' };
+        }
+        const lastStop = guard(last);
+        if (lastStop) {
+          finish({ outcome: 'aborted', why: lastStop.why });
+          return lastStop;
         }
         post(slug, note.prNumber, body);
         const after = readThread(slug, note.prNumber);

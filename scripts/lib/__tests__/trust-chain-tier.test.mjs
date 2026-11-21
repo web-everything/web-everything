@@ -32,6 +32,8 @@ describe('TRUST_CHAIN_TIER_FILES — the in-scope set (#2875)', () => {
       'scripts/lib/review-independence.mjs',
       'scripts/lib/review-policy.mjs',
       'scripts/lib/review-runner-core.mjs',
+      'scripts/lib/round-grant-guard.mjs',
+      'scripts/lib/round-judge.mjs',
     ]);
   });
 
