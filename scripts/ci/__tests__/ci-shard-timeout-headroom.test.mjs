@@ -47,7 +47,8 @@ describe('CI job caps keep headroom over a slow runner', () => {
   });
 
   it('the soak vitest timeout leaves 1.5x headroom over the slowest baseline and still fires before the job cap', () => {
-    const m = /testTimeout:\s*Math\.min\(\s*Number\(process\.env\.WE_SOAK_TEST_TIMEOUT_MS\)\s*\|\|\s*(\d+)\s*\*\s*60_000,\s*(\d+)\s*\*\s*60_000\s*\)/
+    // A non-positive knob value (which vitest reads as "no timeout") must fall back to the default, never pass through.
+    const m = /testTimeout:\s*Math\.min\(\s*Number\(process\.env\.WE_SOAK_TEST_TIMEOUT_MS\)\s*>\s*0\s*\?\s*Number\(process\.env\.WE_SOAK_TEST_TIMEOUT_MS\)\s*:\s*(\d+)\s*\*\s*60_000,\s*(\d+)\s*\*\s*60_000\s*\)/
       .exec(soakConfig);
     expect(m, 'vitest.soak.config.ts clamped testTimeout default not found').not.toBeNull();
     const testTimeoutMin = Number(m[1]);
