@@ -8,10 +8,13 @@ const fullSha = v => typeof v === 'string' && /^[0-9a-f]{40}(?![\s\S])/i.test(v)
  * THE one approval-validity predicate (the verdict-based and the label-input human holds both use it). An
  * approval with a delegation is valid only while the delegation provably has not expired: a missing or
  * unparseable clock, or a missing or unparseable expiry, is NOT valid (default deny).
+ * Undelegated approvals carrying headSha must match a supplied head; legacy rows without it retain
+ * their shadow-era behaviour.
  */
-export function approvalValid(e, now) {
+export function approvalValid(e, now, head) {
   if (e?.type !== EVENT_TYPES.APPROVAL) return false;
-  if (!e.delegation) return true;
+  if (!e.delegation) return e.headSha === undefined || head === undefined
+    || (fullSha(e.headSha) && fullSha(head) && e.headSha.toLowerCase() === head.toLowerCase());
   const expires = time(e.delegation.expires), at = time(now);
   return Number.isFinite(expires) && Number.isFinite(at) && expires > at;
 }
@@ -25,7 +28,7 @@ export function approvalBindsHold(e, holdId, head) {
 }
 
 /** Does a later, valid approval bind this hold? An unknown position (-1) answers no. */
-export const approvalLiftsAfter = (events, from, now, head, holdId) => from >= 0 && events.slice(from + 1).some(e => approvalValid(e, now) && approvalBindsHold(e, holdId, head));
+export const approvalLiftsAfter = (events, from, now, head, holdId) => from >= 0 && events.slice(from + 1).some(e => approvalValid(e, now, head) && approvalBindsHold(e, holdId, head));
 
 /**
  * May a clearing verdict independently lift a hold at `head`? The label-input rule and mirror share this check.
