@@ -21,6 +21,7 @@ export default {
     const violations = [];
     for (const optional of ['CodeQL', 'merge-gate-advisory']) {
       const pr = { number: 7, state: 'OPEN', headRefOid: head, headRefName: 'lane/xabc-test',
+        rowsComplete: true, rowsHead: head,
         labels: [{ name: 'review:pending' }], comments: [], files: [{ path: 'scripts/example.mjs' }],
         statusCheckRollup: [check('standards'), check('test-shard (1)'), check('test'), check(optional, 'FAILURE')] };
       // Ticks past fix.joinWaitMaxMin (15 min): the cap used to strip the live reviewer.
