@@ -96,8 +96,10 @@ export function assertHotPatchSingleton(records, receipts) {
   const complete = completedUrgentRegistrations(records);
   if (hot.some(r => {
     const id = urgentLoadIdentity(r);
-    return !complete.has(id) || !receipts.some(s => s.id === id && s.ref === r.ref && s.sha === r.sha && s.registrationComplete === true
-      && ((s.status === 'settled-unregistered' && s.ancestryVerified === true) || s.status === 'unloaded-adopted'));
+    // A terminal unload receipt settles the load whatever the registration-completion record says (legacy loads have none).
+    return !receipts.some(s => s.id === id && s.ref === r.ref && s.sha === r.sha
+      && (s.status === 'unloaded-adopted'
+        || (s.status === 'settled-unregistered' && s.ancestryVerified === true && s.registrationComplete === true && complete.has(id))));
   })) throw Error('unsettled hot-patch load exists; inspect status and settle it before retrying');
 }
 export async function main(argv = process.argv.slice(2), { cwd = process.cwd(), env = process.env, ghJson, spawn = spawnSync,

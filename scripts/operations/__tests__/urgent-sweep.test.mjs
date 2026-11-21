@@ -1097,7 +1097,8 @@ describe('hot-patch sweep (R1100)', () => {
     const previous = f.settlements()[0];
     f.state.push({ ...previous, status, ancestryVerified: true, unloadEventSent: true, unloadEscalationSent: true });
     if (complete) f.loads.push({ ...f.loads[0], type: 'prototype-load.urgent-registration-complete' });
-    expect(() => assertHotPatchSingleton(f.d.loads(), f.state)).toThrow('unsettled hot-patch load exists');
+    if (status === 'unloaded-adopted') expect(() => assertHotPatchSingleton(f.d.loads(), f.state)).not.toThrow();
+    else expect(() => assertHotPatchSingleton(f.d.loads(), f.state)).toThrow('unsettled hot-patch load exists');
     f.d.checks.mockReturnValue({ total_count: 1, check_runs: [check('test', 'failure')], workflows });
     expect(await f.run()).toMatchObject({ results: [{ status: 'unloaded-pending-adoption' }] });
     expect(f.d.remove).toHaveBeenCalledTimes(1);
@@ -1107,7 +1108,9 @@ describe('hot-patch sweep (R1100)', () => {
     f.d.loads = () => f.loads;
     await f.run();
     f.state.push({ ...f.settlements()[0], status, ancestryVerified: true, registrationComplete: true });
-    expect(() => assertHotPatchSingleton(f.d.loads(), f.state)).toThrow('unsettled hot-patch load exists');
+    // A terminal unload receipt settles the load whatever the completion record says; settled-unregistered stays strict.
+    if (status === 'unloaded-adopted') expect(() => assertHotPatchSingleton(f.d.loads(), f.state)).not.toThrow();
+    else expect(() => assertHotPatchSingleton(f.d.loads(), f.state)).toThrow('unsettled hot-patch load exists');
     f.loads.push({ ...f.loads[0], type: 'prototype-load.urgent-registration-complete' });
     expect(() => assertHotPatchSingleton(f.d.loads(), f.state)).not.toThrow();
   });
