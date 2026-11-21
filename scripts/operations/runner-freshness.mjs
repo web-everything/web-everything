@@ -6,7 +6,7 @@ import { fileURLToPath } from 'node:url';
 import { randomUUID } from 'node:crypto';
 import { defaultPoolRoot } from '../lib/lane-pool-paths.mjs';
 import { isLeaseStale } from '../lib/lane-lease.mjs';
-import { laneGitHardeningEnv, scrubInheritedGitEnv, scrubRiskyLaneConfig } from '../lib/lane-git-hardening.mjs';
+import { laneGitHardeningEnv, scrubInheritedGitEnv, scrubRiskyLaneConfig, SAFE_REMOTE_URL_RE } from '../lib/lane-git-hardening.mjs';
 import { isReadOnlyOperation } from './registry.mjs';
 
 export const FRESHNESS_TTL = 5 * 60_000;
@@ -84,10 +84,13 @@ export function assertRunnerFreshness({ declaration, moduleUrl, zeroWrites = fal
         const { kept = [] } = scrubConfig(root) ?? {};
         // Origin keys the scrub keeps: upload-pack is overridden below; push keys never reach a fetch.
         // A kept vcs/proxy (or any failed removal) could still redirect the fetch, so it refuses.
-        // The scrub also keeps an origin URL outside https/ssh (a local path or file:// pool); only the
-        // `<helper>::<address>` form runs a remote helper, so that one refuses.
+        // The scrub also keeps an origin URL outside https/ssh (a local-path or file:// pool). Allow only those
+        // known transports, judged on EVERY value in EVERY scope: any other `<scheme>://` or `<helper>::`
+        // runs a remote helper, and a worktree-scope value can reset the local list.
+        const originUrlSafe = () => String(git(['config', '--get-all', 'remote.origin.url'], root, { credentialPins }))
+          .split('\n').filter(Boolean).every(url => SAFE_REMOTE_URL_RE.test(url) || /^(\/|file:\/\/)/i.test(url));
         const unsafe = kept.filter(key => !/^remote\.origin\.(uploadpack|receivepack|pushurl)$/i.test(key)
-          && !(/^remote\.origin\.url$/i.test(key) && !/^[a-z0-9+.-]+::/i.test(readGit(['config', '--local', '--get', 'remote.origin.url']))));
+          && !(/^remote\.origin\.url$/i.test(key) && originUrlSafe()));
         if (unsafe.length) throw new Error(`lane transport config could not be scrubbed (${unsafe.length} key(s)); reacquire the lane`);
         readGit(['fetch', '--upload-pack=git-upload-pack', '--quiet', 'origin', `+refs/heads/${lease.branch}:${target}`]);
         let symbolic = false;

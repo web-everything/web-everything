@@ -26,7 +26,11 @@ function run({ lease = { ...live, at: sha, branch: 'lane/target' }, rawLease, he
         throw Object.assign(new Error('not symbolic'), { status: (symbolicUnreadable && !args.includes('HEAD')) || (headUnreadable && args.includes('HEAD')) ? 128 : 1 });
       }
       if (args.includes('--git-path')) return '.git/.lane-lease';
-      if (args[0] === 'config' && args.includes('remote.origin.url')) return originUrl;
+      if (args[0] === 'config' && args.includes('remote.origin.url')) {
+        // Every scope's value, as `--get-all` returns them; a scope-limited read would miss a worktree value.
+        if (!args.includes('--get-all') || args.some(a => /^--(local|worktree|global|system)$/.test(a))) throw new Error('scope-limited origin read');
+        return [].concat(originUrl).join('\n') + '\n';
+      }
       if (args[0] === 'fetch') { if (fetchFails) throw new Error('unreadable origin'); return ''; }
       if (args.includes('HEAD')) return head;
       if (args.includes('refs/remotes/origin/lane/target')) return tip;
@@ -90,9 +94,18 @@ describe('open-pr pinned runner lease', () => {
   });
   it('accepts a kept local-path origin URL but refuses a remote-helper origin URL', () => {
     expect(run({ scrubbed: { removed: [], kept: ['remote.origin.url'] } }).check()).toEqual({ exempt: true });
-    const helper = run({ scrubbed: { removed: [], kept: ['remote.origin.url'] }, originUrl: 'fd::17' });
-    expect(helper.check).toThrow(/transport config could not be scrubbed/);
-    expect(helper.calls.some(args => args[0] === 'fetch')).toBe(false);
+    expect(run({ scrubbed: { removed: [], kept: ['remote.origin.url'] }, originUrl: 'file:///srv/git/origin.git' }).check()).toEqual({ exempt: true });
+  });
+  it.each([
+    ['a remote-helper address', 'fd::17'],
+    ['an unknown scheme that names a remote helper', 'fd://17'],
+    ['an ftp URL', 'ftp://example.invalid/origin.git'],
+    ['a relative path', 'origin.git'],
+    ['a second, worktree-scope helper value after a local path', ['/srv/git/origin.git', 'fd::17']],
+  ])('refuses a kept origin URL carrying %s, before any fetch', (_name, originUrl) => {
+    const f = run({ scrubbed: { removed: [], kept: ['remote.origin.url'] }, originUrl });
+    expect(f.check).toThrow(/transport config could not be scrubbed/);
+    expect(f.calls.some(args => args[0] === 'fetch')).toBe(false);
   });
   it('accepts the origin transport keys the fetch overrides or never reads', () => {
     expect(run({ scrubbed: { removed: [], kept: ['remote.origin.uploadpack', 'remote.origin.pushurl', 'remote.origin.receivepack'] } }).check()).toEqual({ exempt: true });
