@@ -2072,6 +2072,14 @@ function tryClaimLane(dir, session, nowMs, ttlMs, { allowReacquire = false } = {
     if (e.code !== 'EEXIST') throw e;
   }
   const existing = readLease(dir);
+  // A pin is a checkout restriction, not an acquire-time default. Rebuilding its lease from
+  // omitted flags would drop the push/freshness protections, especially with --no-reset.
+  // Require release (which restores the integration branch) before any new claim, including
+  // same-session refresh and stale takeover through explicit, auto-pick or salvage callers.
+  if (existing?.at !== undefined || existing?.branch !== undefined) {
+    log('  pinned lane must be released before reacquisition; use release for this lane, then acquire again');
+    return null;
+  }
   if (allowReacquire && leaseOwnedBy(existing, session)) {
     // #2997 — an IDEMPOTENT re-acquire of our own hold KEEPS the existing `holder` slug. Re-minting here would
     // silently invalidate the slug the current holder is already asserting in its commands, turning its next

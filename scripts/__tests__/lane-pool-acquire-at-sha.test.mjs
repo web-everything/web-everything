@@ -43,6 +43,41 @@ beforeEach(() => {
 });
 afterEach(() => rmSync(root, { recursive: true, force: true }));
 describe('acquire at an exact pushed branch tip', () => {
+  it.each(['no-reset', 'default', 'same-pin', 'new-pin', 'force', 'reserve', 'base'])('refuses same-session pinned reacquisition (%s) without changing the lease or HEAD', mode => {
+    const first = acquire();
+    expect(first.status, first.stderr).toBe(0);
+    const originalLease = readFileSync(lease(), 'utf8');
+    const args = {
+      'no-reset': ['--no-reset'], default: [],
+      'same-pin': [`--at=${tip}`, '--branch=lane/target'],
+      'new-pin': [`--at=${initial}`, '--branch=lane/other'],
+      force: ['--force', '--no-reset'], reserve: ['--reserve', '--no-reset'], base: ['--base=main'],
+    }[mode];
+    const retry = run('acquire', ['--lane=1', ...args]);
+    expect(retry.status, retry.stderr).not.toBe(0);
+    expect(retry.stderr).toMatch(/pinned lane must be released before reacquisition/);
+    expect(readFileSync(lease(), 'utf8')).toBe(originalLease);
+    expect(git(['rev-parse', 'HEAD'], lane)).toBe(tip);
+    expect(spawnSync('git', ['symbolic-ref', '-q', 'HEAD'], { cwd: lane }).status).not.toBe(0);
+    const released = run('release', ['--lane=1']);
+    expect(released.status, released.stderr).toBe(0);
+    const next = run('acquire', ['--lane=1']);
+    expect(next.status, next.stderr).toBe(0);
+    expect(git(['symbolic-ref', '--short', 'HEAD'], lane)).toBe('main');
+    expect(JSON.parse(readFileSync(lease(), 'utf8')).at).toBeUndefined();
+  });
+  it('refuses stale pinned takeover without dropping its protections', () => {
+    expect(acquire().status).toBe(0);
+    const pinned = JSON.parse(readFileSync(lease(), 'utf8'));
+    pinned.acquiredAt = '2000-01-01T00:00:00.000Z';
+    writeFileSync(lease(), JSON.stringify(pinned));
+    const originalLease = readFileSync(lease(), 'utf8');
+    const retry = run('acquire', ['--lane=1', '--session=next-holder', '--no-reset'], { CLAUDE_CODE_SESSION_ID: 'next-holder' });
+    expect(retry.status, retry.stderr).not.toBe(0);
+    expect(retry.stderr).toMatch(/pinned lane must be released before reacquisition/);
+    expect(readFileSync(lease(), 'utf8')).toBe(originalLease);
+    expect(git(['rev-parse', 'HEAD'], lane)).toBe(tip);
+  });
   it.each([['.env', 'target'], ['private/config.env', 'target'], ['.env', 'main']])('preserves ignored %s when %s tracks a collision', (path, destination) => {
     writeFileSync(join(reference, '.gitignore'), '.env\nprivate/\n');
     git(['add', '.gitignore']); git(['commit', '-m', 'ignore local configuration', '--quiet']);

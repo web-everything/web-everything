@@ -9,7 +9,7 @@ const ROOT = fileURLToPath(new URL('../../../../', import.meta.url));
 const SOURCE = 'scripts/lane-pool.mjs';
 export default {
   id: 'pinned-lane-release-recovery',
-  title: 'pinned lanes keep the integration push guard, preserve replacement holders and retain claims when recovery is refused',
+  title: 'pinned lanes reject reacquisition, keep the integration push guard and retain claims when recovery is refused',
   card: 'PR #7208',
   fixedBy: { sha: 'HEAD', where: 'lane/lane-at-sha', paths: [SOURCE] },
   fixPresent(root) {
@@ -17,7 +17,8 @@ export default {
     return source.includes('function resetPinnedLaneForRelease(')
       && source.includes('pinned claim changed before checkout; inspect the current holder')
       && source.includes("['checkout', '--no-overwrite-ignore', '--detach', flags.at")
-      && source.includes('function pinnedPushGuardEntries(');
+      && source.includes('function pinnedPushGuardEntries(')
+      && source.includes('pinned lane must be released before reacquisition');
   },
   async run(options = {}) {
     const guard = olderGuardScenario(options);
@@ -119,12 +120,26 @@ async function recoveryScenario({ root = ROOT, log } = {}) {
       const at = git(['rev-parse', 'HEAD']);
       git(['push', '--quiet', 'origin', 'HEAD:lane/target']);
       if (run('provision', ['--count=1']).status !== 0) throw new Error('soak provision failed');
-      for (const mode of ['discard', 'all-pools']) {
+      for (const mode of ['reacquire', 'discard', 'all-pools']) {
         if (run('acquire', ['--lane=1', `--at=${at}`, '--branch=lane/target']).status !== 0) {
           violations.push(`${mode}: acquire failed`); continue;
         }
+        if (mode === 'reacquire') {
+          const leaseFile = join(lane, '.git', '.lane-lease');
+          const originalLease = readFileSync(leaseFile, 'utf8');
+          const retry = run('acquire', ['--lane=1', '--no-reset']);
+          if (retry.status === 0) violations.push('same-session reacquire: pinned lane accepted');
+          if (!/pinned lane must be released before reacquisition/.test(retry.stderr)) {
+            violations.push('same-session reacquire: missing release guidance');
+          }
+          if (readFileSync(leaseFile, 'utf8') !== originalLease) violations.push('same-session reacquire: pin lease changed');
+          if (readFileSync(join(lane, '.git', 'HEAD'), 'utf8').trim() !== at) {
+            violations.push('same-session reacquire: detached HEAD changed');
+          }
+        }
         if (mode === 'discard') git(['commit', '--allow-empty', '-m', 'worker commit'], lane);
-        const released = run('release', mode === 'discard' ? ['--lane=1', '--discard'] : ['--all-pools']);
+        const released = run('release', mode === 'all-pools' ? ['--all-pools']
+          : mode === 'discard' ? ['--lane=1', '--discard'] : ['--lane=1']);
         if (released.status !== 0) violations.push(`${mode}: release refused`);
         if (existsSync(join(lane, '.git', '.lane-lease'))) violations.push(`${mode}: lease remains`);
         const head = readFileSync(join(lane, '.git', 'HEAD'), 'utf8').trim();
