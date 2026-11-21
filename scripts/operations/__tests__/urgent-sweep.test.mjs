@@ -51,6 +51,41 @@ describe('urgent CI sweep', () => {
     expect(f.d.checks).not.toHaveBeenCalled();
     expect(f.d.settle.mock.calls.filter(([r]) => r.status !== 'sweep-cursor')).toEqual([]);
   });
+  it.each([
+    ['settled', 'legacy', []],
+    ['monitored', 'new-intent', []],
+    ['monitored', 'legacy', ['monitoring-ci']],
+    ['monitored', 'legacy', ['explicit-false']],
+  ])('%s: a %s adopted receipt an earlier sweep demoted to a fallback escalation (after %j)', async (expected, kind, between) => {
+    // Live ledger shape for the PR 7239 hot-patch load: an earlier build of this sweep had no legacy
+    // fallback, escalated "completion unproven" and appended a demoted copy of the adopted receipt.
+    const f = fixture();
+    const { registrationCompletionRequired, ...legacyLoad } = load;
+    const urgent = { ...(kind === 'legacy' ? legacyLoad : load), ref: `hotpatch/${sha}`, hotPatch: { pr: 7239 } };
+    f.loads[0] = urgent;
+    f.d.loads = () => f.loads;
+    const adopted = { id: urgentLoadIdentity(urgent), ref: urgent.ref, sha, at: load.at, removedAt: load.at,
+      status: 'unloaded-adopted', unloadEventSent: true, unloadEscalationSent: true };
+    f.state.push(adopted);
+    if (between.includes('monitoring-ci')) f.state.push({ ...adopted, status: 'monitoring-ci' });
+    f.state.push({ ...adopted, status: 'unloaded-pending-adoption', fallbackEscalated: true,
+      ...(between.includes('explicit-false') ? { registrationComplete: false } : {}) });
+    f.d.overlayState.mockReturnValue({ corrupt: false, overlays: [] });
+    f.d.containsOverlay.mockReturnValue(false);
+    f.d.now = () => '2026-11-18T12:30:00Z';
+    const before = f.state.length;
+
+    const out = await f.run();
+
+    if (expected === 'settled') {
+      expect(out).toMatchObject({ results: [] });
+      expect(f.state.length).toBe(before);
+      expect(f.d.overlayState).not.toHaveBeenCalled();
+    } else {
+      expect(out).toMatchObject({ results: [{ status: 'needs-you', detail: expect.stringContaining('Registration completion is unproven') }] });
+    }
+    expect(f.d.escalate).not.toHaveBeenCalled();
+  });
   it.each(['settled-unregistered', 'unloaded-adopted'])('does not grandfather an absent new intent with an old-shaped %s receipt', async status => {
     const f = fixture();
     f.d.loads = () => f.loads;

@@ -181,7 +181,14 @@ export async function urgentSweep(_input = {}, deps = createSweepDeps()) {
     // Old removal-only receipts still need adoption; historical terminal receipts retain their proof.
     const records = deps.loads(), complete = completedUrgentRegistrations(records);
     const loads = new Map(records.filter(r => r.type === 'prototype-load.urgent').map(r => [identity(r), r]));
-    const latest = new Map(settlements.filter(r => r.status !== 'sweep-cursor').map(r => [r.id, r]));
+    // An earlier build of this sweep had no legacy fallback: it escalated "completion unproven" for an
+    // old adopted receipt and appended a demoted copy of it (fallbackEscalated, still no
+    // registrationComplete field). That copy records only the spurious escalation, so it never
+    // replaces the adopted receipt it directly follows. Any other receipt in between still counts.
+    const demotedCopy = (r, previous) => previous?.status === 'unloaded-adopted' && r.status === 'unloaded-pending-adoption'
+      && r.fallbackEscalated === true && !Object.hasOwn(r, 'registrationComplete') && !Object.hasOwn(previous, 'registrationComplete');
+    const latest = new Map();
+    for (const r of settlements) if (r.status !== 'sweep-cursor' && !demotedCopy(r, latest.get(r.id))) latest.set(r.id, r);
     // Before the completion protocol, terminal receipts had no registrationComplete field.
     // Only grandfather a terminal latest receipt for an old writer. New intents explicitly
     // require completion, and resumed monitoring or an explicit false never grants this fallback.
@@ -197,6 +204,8 @@ export async function urgentSweep(_input = {}, deps = createSweepDeps()) {
       && registrationFinished(r) && (!legacyTerminal.has(r.id) || latest.get(r.id) === r)).map(r => r.id));
     const absent = new Map(settlements.filter(r => r.status === 'monitoring-unregistered').map(r => [r.id, r]));
     for (const [id, r] of unloaded) if (r.status === 'unloaded-adopted' && registrationFinished(r) && unloadNotified(r)) settled.add(id);
+    // A grandfathered adopted receipt may sit behind a demoted copy in `unloaded`; settle it from `latest`.
+    for (const id of legacyTerminal) if (latest.get(id).status === 'unloaded-adopted' && unloadNotified(latest.get(id))) settled.add(id);
     const ciEscalated = new Set();
     const conflictEscalated = new Set(settlements.filter(r => r.status === 'monitoring-ci' && r.conflictEscalated === true).map(r => r.id));
     const failureEscalated = new Set(settlements.filter(r => r.status === 'monitoring-ci' && r.failureEscalated === true).map(r => r.id));
