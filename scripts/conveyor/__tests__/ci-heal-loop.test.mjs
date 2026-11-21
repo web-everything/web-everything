@@ -22,6 +22,7 @@ function fixture() {
     now: vi.fn().mockReturnValueOnce(10).mockReturnValue(25), write: vi.fn(),
     readHead: vi.fn(() => 'boot-head'), parentAlive: vi.fn(() => true),
     resolveInterval: vi.fn(() => ({ seconds: 300, source: 'standard' })), sleep: vi.fn(),
+    dispatchBlock: vi.fn(() => null), enabled: () => true, identityOf: () => 'boot-id',
   };
 }
 
@@ -99,15 +100,18 @@ describe('CI heal audit regressions', () => {
         expect(options.authGateOverride()).toBe(gate);
         expect(options.orphanGuardTick).toBeNull();
         for (const key of ['fixTick', 'hungCiTick', 'mainRedRebaseTick', 'missingRunTick', 'promoteDraftTick',
-          'rulingStandDownTick', 'notesTick', 'awaitVerifyTick', 'stuckFixerTick', 'supersedeTick']) {
+          'rulingStandDownTick', 'notesTick', 'awaitVerifyTick', 'stuckFixerTick']) {
           expect(typeof options[key]).toBe('function');
           const empty = await options[key]();
           expect(Object.values(empty).every(value => value instanceof Map ? value.size === 0 : value.length === 0)).toBe(true);
         }
+        // the real supersede-before-dispatch pass stays in the child: the tick is the shared watch, never an empty stub
+        expect(options.supersedeTick).toBe(supersedeWatch);
         return heal();
       }),
     };
-    expect(await runCiHealTick({ daemon, planAuth })).toEqual({ dispatched: ['healed'] });
+    const supersedeWatch = vi.fn();
+    expect(await runCiHealTick({ daemon, planAuth, supersedeWatch })).toEqual({ dispatched: ['healed'] });
     expect(daemon.runTickAllRepos).toHaveBeenCalledOnce();
     expect(heal).toHaveBeenCalledOnce();
   });
@@ -313,5 +317,24 @@ describe('CI heal interval', () => {
   });
   it('invalid environment override selects 300 over a valid tool interval', () => {
     expect(resolveCiHealInterval({ env: { WE_CI_HEAL_INTERVAL_SEC: '1801' }, settings: { ciHeal: { intervalSec: 60 } } }).seconds).toBe(300);
+  });
+
+  it('a quarantined or re-cloned checkout blocks the tick even when HEAD is unchanged', async () => {
+    for (const why of ['quarantine', 'reclone']) {
+      const deps = fixture();
+      deps.bootHead = 'boot-head';
+      deps.dispatchBlock = vi.fn(() => why);
+      expect(await runCiHealLoopIteration(deps)).toEqual({ skipped: why });
+      expect(deps.tick).not.toHaveBeenCalled();
+      expect(deps.locks.releaseRead).toHaveBeenCalled();
+    }
+  });
+  it('the loop re-reads ciHeal.loop before every iteration and exits cleanly when it is off', async () => {
+    const iteration = vi.fn(async () => ({}));
+    const enabled = vi.fn().mockReturnValueOnce(true).mockReturnValue(false);
+    const result = await runCiHealLoop({ iteration, enabled, root: '/clone', readHead: () => 'h', write: vi.fn(),
+      resolveInterval: () => ({ seconds: 300, source: 'standard' }), sleep: vi.fn(async () => {}) });
+    expect(iteration).toHaveBeenCalledOnce();
+    expect(result).toEqual({ exit: 'disabled' });
   });
 });
