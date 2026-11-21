@@ -6,6 +6,9 @@ import { tmpdir } from 'node:os';
 import { classifyOwner, planActions, processLive, selfAudit, detectSmells, runLiveOwnerWatchPass, probeLiveOwnerWatch, LIVE_OWNER_DEFAULTS } from '../pr-live-owner-watch.mjs';
 import { feedTail, resolveLiveOwnerSettings, createLiveOwnerWatchIo } from '../pr-live-owner-watch-io.mjs';
 import { keepAliveScript } from '../../lib/test-keepalive.mjs';
+// Collect the real dispatch graph before tests: the first review adapter's 5s budget
+// should bound its behavior, not cold Vite transformation of the review-job dependencies.
+import '../../operations/review-job.mjs';
 
 const NOW = Date.parse('2026-11-10T18:00:00Z'), MIN = 60_000;
 const ago = minutes => new Date(NOW - minutes * MIN).toISOString();
