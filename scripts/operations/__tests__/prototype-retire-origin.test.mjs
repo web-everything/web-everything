@@ -12,6 +12,12 @@ import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { overlayFilePath, readOverlays } from '../../lib/daemon-overlays.mjs';
 
+const withoutConfigPins = (args) => {
+  let start = 0;
+  while (args[start] === '-c') start += 2;
+  return args.slice(start);
+};
+
 const REPO = 'web-everything/web-everything';
 const REF = 'lane/example';
 const TIP = 'a'.repeat(40);
@@ -43,6 +49,7 @@ function proof(prs, row = { ref: REF }, activity = deletedAt(TIP)) {
     return { code: 0, stdout: '' };
   });
   const run = vi.fn((cmd, args) => {
+    args = withoutConfigPins(args);
     if (cmd === 'gh') {
       const result = gh(args);
       return { status: result.code, stdout: result.stdout };
@@ -132,6 +139,7 @@ it('CLI re-proof fetches and passes the registered base for a redundant merge si
   const baseEntry = { ref: REF, pr: 42 };
   const baseRefspec = `+refs/heads/${REF}:refs/remotes/origin/${REF}`;
   const run = vi.fn((cmd, args) => {
+    args = withoutConfigPins(args);
     if (cmd === 'gh') {
       if (args[0] === 'repo') return { status: 0, stdout: repository(REPO) };
       if (args[1] === 'view') {
@@ -155,15 +163,20 @@ it('CLI re-proof fetches and passes the registered base for a redundant merge si
   });
   try {
     expect(proveRetirement({ root, entry, env, run })).toMatchObject({ ref: entry.ref, action: 'keep', reason: 'pr-open' });
-    expect(run.mock.calls.find(([, args]) => args[0] === 'fetch')[1]).not.toContain(baseRefspec);
+    expect(run.mock.calls.find(([, args]) => args.includes('fetch'))[1]).not.toContain(baseRefspec);
     run.mockClear();
     writeFileSync(overlayFilePath(root, env), JSON.stringify({ overlays: [entry, baseEntry] }));
     expect(proveRetirement({ root, entry, env, run })).toMatchObject({
       ref: entry.ref, action: 'retire', reason: 'redundant-merge-sibling',
       evidence: { baseRef: REF, basePr: 42, baseTip: OTHER },
     });
+    for (const [, args] of run.mock.calls.filter(([, args]) => args.includes('fetch'))) {
+      for (const pin of ['protocol.allow=never', 'protocol.https.allow=always', 'protocol.ssh.allow=always',
+        'protocol.ext.allow=never', 'protocol.file.allow=never', 'transfer.fsckObjects=true',
+        'fetch.fsckObjects=true', 'receive.fsckObjects=true']) expect(args).toContain(pin);
+    }
     // The base rides its own optional fetch, so a base deleted on origin cannot fail the entry's required fetch.
-    expect(run.mock.calls.filter(([, args]) => args[0] === 'fetch').map(([, args]) => args)).toEqual([
+    expect(run.mock.calls.filter(([, args]) => args.includes('fetch')).map(([, args]) => withoutConfigPins(args))).toEqual([
       ['fetch', '--no-tags', '-q', `https://github.com/${REPO}.git`,
         '+refs/heads/main:refs/remotes/origin/main', `+refs/heads/${entry.ref}:refs/remotes/origin/${entry.ref}`],
       ['fetch', '--no-tags', '-q', `https://github.com/${REPO}.git`, baseRefspec],
@@ -183,6 +196,7 @@ it('CLI re-proof keeps the sibling\'s own outcome when the registered base is go
   const proveWith = (rows, baseOnOrigin) => {
     writeFileSync(overlayFilePath(root, env), JSON.stringify({ overlays: rows }));
     const run = vi.fn((cmd, args) => {
+      args = withoutConfigPins(args);
       if (cmd === 'gh') {
         if (args[0] === 'repo') return { status: 0, stdout: repository(REPO) };
         // The base branch was merged and deleted: its PR is MERGED and found through the merge-ref base.
@@ -213,7 +227,7 @@ it('CLI re-proof keeps the sibling\'s own outcome when the registered base is go
     expect(decision).toMatchObject({ ref: entry.ref, action: 'retire', reason: 'pr-merged' });
     expect(decision.reason).not.toBe('fetch-failed');
     // The required fetch never carried the base refspec, so its failure could not poison it.
-    const required = run.mock.calls.map(([, args]) => args).find((args) => args[0] === 'fetch');
+    const required = run.mock.calls.map(([, args]) => withoutConfigPins(args)).find((args) => args[0] === 'fetch');
     expect(required).not.toContain(baseRefspec);
   } finally {
     rmSync(root, { recursive: true, force: true });
@@ -350,6 +364,7 @@ function repositoryProof({ fetched, originCode = 0, originUrl = ORIGIN_URL, repo
     throw new Error(`unexpected git call: ${args.join(' ')}`);
   });
   p.run.mockImplementation((cmd, args) => {
+    args = withoutConfigPins(args);
     if (cmd === 'gh') {
       const r = p.gh(args);
       return { status: r.code, stdout: r.stdout };

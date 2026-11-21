@@ -131,6 +131,7 @@ import { workspaceFor } from './lib/lane-pool-paths.mjs';
 import { readOverlayStale } from './lib/daemon-rebuild/overlay-prune.mjs';
 import { edgeEnabled, registerPr } from './lib/daemon-edge.mjs';
 import { assertHumanOperator, resolveOperatorIdentity } from './lib/operator-identity.mjs';
+import { scrubInheritedGitEnv } from './lib/lane-git-hardening.mjs';
 import { REBUILD_IDENTITY_ENV } from './lib/daemon-rebuild/shared.mjs';
 
 const AUTOMATIC_RETIREMENT_REASONS = Object.freeze([
@@ -274,12 +275,28 @@ export async function stackAwareOverlayCheck({
   };
 }
 
+/** Explicit transport/integrity policy, including when scratch config ignores the host's defaults. */
+function scratchTransportArgs(root, url) {
+  let localDirectory = false;
+  // A URL (including ext:: and file://) is never the local-path exception.
+  if (url && !/^[a-z][a-z0-9+.-]*:|^[^/]*:/i.test(url)) {
+    try { localDirectory = statSync(resolve(root, url)).isDirectory(); } catch { /* deny file transport */ }
+  }
+  return [
+    '-c', 'protocol.allow=never', '-c', 'protocol.https.allow=always',
+    '-c', 'protocol.ssh.allow=always', '-c', 'protocol.ext.allow=never',
+    '-c', `protocol.file.allow=${localDirectory ? 'always' : 'never'}`,
+    '-c', 'transfer.fsckObjects=true', '-c', 'fetch.fsckObjects=true', '-c', 'receive.fsckObjects=true',
+  ];
+}
+
 /** `git ls-remote` tip of `refs/heads/<ref>` on root's origin: a sha, `null` when the ref is absent, `undefined` when unreadable. */
 export function remoteTip({ root, ref, env = process.env, run = spawnSync }) {
   const opts = { cwd: root, encoding: 'utf8', timeout: 30_000, env: { ...env, GIT_OPTIONAL_LOCKS: '0' } };
   const url = run('git', ['-C', root, 'remote', 'get-url', 'origin'], opts);
   if (url?.status !== 0) return undefined;
-  const ls = run('git', ['ls-remote', String(url.stdout).trim(), `refs/heads/${ref}`], opts);
+  const origin = String(url.stdout).trim();
+  const ls = run('git', [...scratchTransportArgs(root, origin), 'ls-remote', origin, `refs/heads/${ref}`], opts);
   if (ls?.status !== 0) return undefined;
   const match = new RegExp(`^([0-9a-f]{40})\\s+refs/heads/${ref.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}$`, 'm').exec(String(ls.stdout ?? ''));
   return match ? match[1] : null;
@@ -287,23 +304,26 @@ export function remoteTip({ root, ref, env = process.env, run = spawnSync }) {
 
 /** Run `fn(git, scratch)` in a scratch bare repo that borrows root's objects and fetches `refspecs` from root's origin. */
 function withScratchFetch({ root, refspecs, optionalRefspecs = [], env, run, prefix }, fn) {
-  const opts = (cwd) => ({ cwd, encoding: 'utf8', timeout: 120_000, env: { ...env, GIT_OPTIONAL_LOCKS: '0',
+  const opts = (cwd) => ({ cwd, encoding: 'utf8', timeout: 120_000, env: { ...(cwd === root ? env : scrubInheritedGitEnv(env)), GIT_OPTIONAL_LOCKS: '0',
     ...(cwd !== root ? { GIT_CONFIG_GLOBAL: devNull, GIT_CONFIG_SYSTEM: devNull, GIT_CONFIG_NOSYSTEM: '1' } : {}),
   } });
   const url = run('git', ['-C', root, 'remote', 'get-url', 'origin'], opts(root));
   const common = run('git', ['-C', root, 'rev-parse', '--path-format=absolute', '--git-common-dir'], opts(root));
   if (url?.status !== 0 || common?.status !== 0) return { ok: false, reason: 'root-unreadable' };
+  const origin = String(url.stdout).trim();
+  const transport = scratchTransportArgs(root, origin);
+  const fetchOrigin = transport.includes('protocol.file.allow=always') ? resolve(root, origin) : origin;
   const scratch = mkdtempSync(join(tmpdir(), prefix));
   try {
     if (run('git', ['init', '--bare', '-q', scratch], opts(scratch))?.status !== 0) return { ok: false, reason: 'scratch-init-failed' };
     mkdirSync(join(scratch, 'objects', 'info'), { recursive: true });
     writeFileSync(join(scratch, 'objects', 'info', 'alternates'), `${join(String(common.stdout).trim(), 'objects')}\n`, 'utf8');
-    const fetched = run('git', ['fetch', '--no-tags', '-q', String(url.stdout).trim(), ...refspecs], opts(scratch));
+    const fetched = run('git', [...transport, 'fetch', '--no-tags', '-q', fetchOrigin, ...refspecs], opts(scratch));
     if (fetched?.status !== 0) return { ok: false, reason: 'fetch-failed' };
     // Optional refs are fetched one at a time and their absence is tolerated: a missing optional ref must never turn a
     // fetch that would have succeeded into `fetch-failed`. Callers see the ref as unresolved and fall back.
-    for (const spec of optionalRefspecs) run('git', ['fetch', '--no-tags', '-q', String(url.stdout).trim(), spec], opts(scratch));
-    const git = (args) => { const r = run('git', args, opts(scratch)); return { code: r?.status ?? -1, stdout: String(r?.stdout ?? '') }; };
+    for (const spec of optionalRefspecs) run('git', [...transport, 'fetch', '--no-tags', '-q', fetchOrigin, spec], opts(scratch));
+    const git = (args) => { const r = run('git', args[0] === 'merge-tree' ? ['-c', 'merge.renormalize=false', ...args] : args, opts(scratch)); return { code: r?.status ?? -1, stdout: String(r?.stdout ?? '') }; };
     return fn(git);
   } finally {
     rmSync(scratch, { recursive: true, force: true });
