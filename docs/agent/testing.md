@@ -5862,7 +5862,6 @@ For fixtures with arbitrary branches, workflow files or cross-repo couples, use
 Keep full commit IDs consistent across listings, live reads, check runs and saved
 refresh records. Resolve the diff at the listed head when a capped commits read
 or a later push intentionally makes the commits tip or live head differ.
-## Lane eligibility: absent checkout versus failed probe
 
 ## Journal stale-remover scheduling
 
@@ -5873,6 +5872,9 @@ the replacement. Cover that acquisition order with a worker barrier after the
 generation guard releases, for both normal capacity and a single remaining record.
 At the size limit, assert exactly one append and the matching journal identity;
 either writer may win unless the fixture explicitly orders acquisition.
+
+## Lane eligibility: absent checkout versus failed probe
+
 `lane-pool-acquire-growth.test.mjs` covers both a removed lane directory and a removed
 `.git` entry: skip those candidates without blocking bounded growth or touching the
 remaining files. Only ENOENT proves absent metadata. Existing checkouts with failed
