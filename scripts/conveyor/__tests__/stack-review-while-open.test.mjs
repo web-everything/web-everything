@@ -70,7 +70,7 @@ describe('promotion: a stacked draft with green checks is promoted while its bas
   });
 
   const reconcile = () => ({ dispatch: [{ kind: 'promote-draft', prNumber: 4750, headRefOid: sha('a'), baseRefName: 'lane/resource-usage-service' }], refusals: [] });
-  const common = { reconcile, checkStaleness: () => {}, readHeadCheckState: () => ({ state: 'green', why: 'ok' }), readPrLabels: () => [], clearAwaitingCi: () => {} };
+  const common = { reconcile, checkStaleness: () => {}, readComments: () => [], readHeadCheckState: () => ({ state: 'green', why: 'ok' }), readPrLabels: () => [], clearAwaitingCi: () => {} };
   it('the tick promote pass un-drafts it and names its open base', () => {
     const ready = [];
     const out = runReconcilePromoteDraftDispatch({ ...common, provider: { ready: (n) => ready.push(n) }, reviewWhileBaseOpen: true });

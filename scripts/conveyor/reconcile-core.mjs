@@ -169,6 +169,7 @@ import {
   isLatestAdvisoryFindingAddressed, isAdvisoryMechanismStandDownSuperseded,
 } from './advisory-fix-mark.mjs';
 import { CONFLICT_LABEL } from './conflict-label.mjs';
+import { isOperatorParked, OPERATOR_PARK_MARKER, OPERATOR_PARK_RELEASE_MARKER } from './draft-promotion-rule.mjs';
 // advisory-after-cap (web-everything/web-everything#2766 live incident, 2026-09-27) — see the ADVISORY-FIX
 // cap-exhausted branch below for why the "is a fresh review owed on a stale advisory note" check reuses these
 // two, never a second reimplementation of "does the newest advisory comment name this PR's CURRENT head".
@@ -692,6 +693,8 @@ export function countFindings(comments) {
     if (typeof body !== 'string') continue;
     const head = body.trimStart();
     if (BOOKKEEPING_MARKERS.some((m) => head.startsWith(m))) continue;
+    // Park/release markers are bookkeeping ONLY from a trusted author: an untrusted comment starting with one must not hide findings.
+    if ([OPERATOR_PARK_MARKER, OPERATOR_PARK_RELEASE_MARKER].some((m) => head.startsWith(m)) && isTrustedMarkerAuthor(c)) continue;
     if (head.split(/\r?\n/, 1)[0] === NOTE_COMMENT_MARKER && isTrustedMarkerAuthor(c)
       && /^<!-- conveyor-note-key: [a-z][a-z0-9-]*:(?:\d+|unknown)(?::[^\r\n<>]*)? -->$/m.test(body)) continue;
     n += 1;
@@ -2884,6 +2887,14 @@ export function planReconcile({
     if (pr?.isDraft && (withPhase.check === 'green' || reviewHoldOnlyRed(pr.statusCheckRollup, requiredChecks) || mainFixPriority)) {
       if (labelNames(pr.labels).includes('review-status:draft-withdrawn')) {
         refuse('draft', { ...withPhase, why: 'draft PR is withdrawn — explicit release is required before promotion' });
+        continue;
+      }
+      if (!Array.isArray(pr.comments)) {
+        refuse('draft', { ...withPhase, why: 'draft PR comments are missing or malformed — re-read the complete thread before promotion' });
+        continue;
+      }
+      if (isOperatorParked(pr.comments)) {
+        refuse('draft', { ...withPhase, why: 'draft PR is operator-parked — explicit release is required before promotion' });
         continue;
       }
       const redTeamHold = labelNames(pr.labels).find(label => ['red-team:blocked', 'red-team:pending'].includes(label));
