@@ -28,7 +28,9 @@ export default {
     let enqueued = false;
     const exec = (_command, args) => {
       if (args.includes('--slurp')) return JSON.stringify([fixture.comments]);
-      if (args.some(a => a.includes('enqueuePullRequest'))) { enqueued = true; throw Error('unproved PR reached enqueue mutation'); }
+      // Detect the queue mutation by call shape (a graphql `query=mutation…` arg), never by naming it:
+      // only merge-queue-enqueue.mjs may spell the mutation (merge-queue-enqueue.test.mjs guards that).
+      if (args[0] === 'api' && args[1] === 'graphql' && args.some(a => a.startsWith('query=mutation'))) { enqueued = true; throw Error('unproved PR reached enqueue mutation'); }
       if (args[0] === 'pr' && args[1] === 'view') return JSON.stringify({ id: 'PR7289', number: 7289, state: 'OPEN', headRefOid: fixture.head, labels: fixture.labels });
       if (args[0] === 'pr' && ['comment', 'edit'].includes(args[1])) return '';
       if (args[0] === 'label') return '';
