@@ -427,8 +427,8 @@ async function finalizeRebuildLocked({
   }
 
   // unaudited-tip — the plan was minted BEFORE the (unlocked, minutes-long) smoke, so a red fix-ready record appended for a tip it
-  // applies during that window would still be adopted here. Only the direct smoke path passes the gate (a ready-candidate
-  // adoption was already judged by matchReadyCandidate under this same lock); no gate (follow mode) revokes nothing.
+  // applies during that window would still be adopted here. Ready and skip-unrelated paths also pass a fresh lazy gate,
+  // so revocation during the add-guard wait is caught here; no gate (follow mode) revokes nothing.
   if (typeof auditedTip === 'function') {
     const revoked = revokedAppliedTips({
       applied: plan.applied, auditedTip, prevHead, mainSha: plan.mainSha,

@@ -689,6 +689,8 @@ export async function prepareRebuild({
           stateOpts,
           now,
           plan: m.adopt,
+          // A separate lazy gate reads evidence only after finalize holds the add guard.
+          auditedTip: makeAuditedTipGate(env),
           prevHead,
           lease: { token: ready.token ?? null },
           onAdopted: m.dropRefs.length
@@ -802,6 +804,7 @@ export async function prepareRebuild({
       log?.error?.(`daemon-rebuild: skipped rebuild+smoke for ${String(plan.finalSha).slice(0, 9)} — ${d.reason} (daemonRebuild.skipUnrelated)`);
       const fin = await finalizeRebuild({
         root, env, log, run, stateOpts, now, plan, prevHead, lease: { token: null },
+        auditedTip: makeAuditedTipGate(env),
       });
       const { alerts: finAlerts = [], ...finResult } = fin;
       return {
