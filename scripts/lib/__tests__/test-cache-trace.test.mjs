@@ -1,7 +1,7 @@
 import { describe, it, expect } from 'vitest';
 import { afterEach } from 'vitest';
 import { createHash } from 'node:crypto';
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
@@ -224,5 +224,55 @@ describe('analyzeTrace — toolchain', () => {
     const base = { root: '/r/lane', tmpRoots: ['/t'], home: '/h', closure: new Set(), execPath: '/h/.nvm/versions/node/v22/bin/node' };
     const out = analyzeTrace({ ...base, events: [{ k: 'read', p: '/h/.nvm/versions/node/v22/lib/x.js' }, { k: 'read', p: '/h/.npmrc' }] });
     expect(out.denies).toEqual(['home-read: .npmrc']);
+  });
+});
+
+describe('analyzeTrace — bun cache home read', () => {
+  const base = { root: '/r/lane', tmpRoots: ['/t'], home: '/h', closure: new Set(), execPath: '/custom/node-runtime' };
+  const denies = (p, k = 'read') => analyzeTrace({ ...base, events: [{ k, p }] }).denies;
+
+  it.each(['stat', 'exists'])('a read of ~/.bun is not a deny: a %s probe of ~/.bun and ~/.bun/install/cache', (k) => {
+    expect(denies('/h/.bun', k)).toEqual([]);
+    expect(denies('/h/.bun/install/cache', k)).toEqual([]);
+  });
+
+  it('an allowed probe is still traced', () => {
+    const out = analyzeTrace({ ...base, events: [{ k: 'stat', p: '/h/.bun' }, { k: 'exists', p: '/h/.bun/install/cache' }] });
+    expect(out.traced.map((t) => t.path).sort()).toEqual(['/h/.bun', '/h/.bun/install/cache']);
+  });
+
+  it.each(['read', 'list', 'mod'])('the probe exception is stat/exists only: %s of either dir stays a deny', (k) => {
+    expect(denies('/h/.bun', k)).toHaveLength(1);
+    expect(denies('/h/.bun/install/cache', k)).toHaveLength(1);
+  });
+
+  it.each(['read', 'stat', 'exists'])('cache contents stay denied for %s', (k) => {
+    expect(denies('/h/.bun/install/cache/pkg@1.0.0/index.js', k)).toHaveLength(1);
+  });
+
+  it('a cache entry symlinked to a credential file is a deny (symlinks are resolved before the allow)', () => {
+    const home = mkdtempSync(join(tmpdir(), 'tct-home-'));
+    mkdirSync(join(home, '.bun', 'install', 'cache'), { recursive: true });
+    mkdirSync(join(home, '.ssh'));
+    writeFileSync(join(home, '.ssh', 'id_rsa'), 'k');
+    symlinkSync(join(home, '.ssh', 'id_rsa'), join(home, '.bun', 'install', 'cache', 'evil'));
+    const out = analyzeTrace({ ...base, home, events: [{ k: 'stat', p: join(home, '.bun', 'install', 'cache', 'evil') }] });
+    expect(out.denies).toEqual([expect.stringMatching(/^home-read: /)]);
+    expect(out.traced).toEqual([]);
+  });
+
+  it.each(['/h/.bun/bin/bun', '/h/.bun/install/global/x', '/h/.bun/install/cache-evil/x', '/h/.bun/secrets', '/h/.bunx/x'])(
+    'allows only the exact bun cache dir: %s stays a deny', (p) => {
+      expect(denies(p)).toHaveLength(1);
+    });
+
+  it.each(['/h/.ssh/id_rsa', '/h/.aws/credentials', '/h/.config/gh/hosts.yml', '/h/.secrets', '/h/.claude/settings.json',
+    '/h/Library/Keychains/login.keychain-db', '/h/.cargo/credentials.toml', '/h/.rustup/x', '/h/Library/Caches/x'])(
+    'credential or non-allowed home path %s is still a home-read deny', (p) => {
+      expect(denies(p)).toEqual([expect.stringMatching(/^home-read: /)]);
+    });
+
+  it('does not let a ~/.bun symlink-style path escape: dot segments are not normalised into the allow', () => {
+    expect(denies('/h/.bun/install/cache/../../../.ssh/id_rsa')).toHaveLength(1);
   });
 });
