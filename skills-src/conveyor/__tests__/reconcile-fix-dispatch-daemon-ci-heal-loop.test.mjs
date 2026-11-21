@@ -166,6 +166,18 @@ describe('ci-heal child loop wiring (async slice s2)', () => {
       expect(t.lines).toContain('ci-heal-loop: ciHeal.loop=off source=override-unreadable');
     });
 
+    it('a pending retry timer never starts a second child when one is already running', () => {
+      const timers = [];
+      const spawnLoop = vi.fn(() => ({ pid: 1, on: () => {}, kill: () => {} }));
+      const failing = vi.fn().mockImplementationOnce(() => { throw new Error('EMFILE'); }).mockImplementation(spawnLoop);
+      const supervisor = superviseAwaitVerifyLoop({ spawnLoop: failing, log: { error: vi.fn() }, setTimer: fn => { timers.push(fn); return { unref() {} }; }, now: () => 0 });
+      supervisor.start();          // throws, arms a retry timer
+      supervisor.start();          // the controller starts a child itself
+      expect(spawnLoop).toHaveBeenCalledOnce();
+      timers.forEach(fn => fn());  // the stale retry fires
+      expect(spawnLoop).toHaveBeenCalledOnce();
+    });
+
     it('a resolver that throws counts as off', () => {
       const t = make([on]);
       t.controller.tick();

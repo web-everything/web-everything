@@ -292,7 +292,8 @@ export function superviseAwaitVerifyLoop({ spawnLoop = () => spawnAwaitVerifyLoo
   let stopped = false;
   let halted = false; // paused by `halt()`; a later explicit `start()` resumes, timers never do
   let lastStart = 0;
-  const restart = () => (halted ? null : start());
+  // A timer must never add a second child: it restarts only when halted is off AND no child is alive.
+  const restart = () => (halted || child ? null : start());
   const start = () => {
     if (stopped) return null;
     halted = false;
