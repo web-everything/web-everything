@@ -5172,6 +5172,12 @@ runs only, without legacy statuses or pending runs; it cannot attest a complete
 check read. Its gate tests inject the live fallback and assert its decision and
 call cost rather than manufacturing completeness for the store.
 
+`runReconcilePass` also hydrates short rollups without this provenance. Its injected
+PR fixtures must carry both fields when modeling a complete read, including fixtures
+shared with ruling tests and stand-down or stacked-PR soak replays. Leave missing or
+incomplete evidence explicit when testing hydration and recovery; a green rollup alone
+must still invoke the injected check reader.
+
 Soak worlds enable the paged snapshot reader with a private `WE_PR_SNAPSHOT_DIR`
 under each world's cleanup root. Vitest's flattened-list fallback cannot attest
 check completeness. Replays that simulate a push must also model a complete read
