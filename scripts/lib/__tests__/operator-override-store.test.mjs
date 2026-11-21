@@ -54,6 +54,7 @@ const ranges = [
   ['resourceGate.fixCap.raiseMinMemFreePct', 25, 60],
   ['redTeamQueue.minConcurrent', 0, 24],
   ['redTeamQueue.maxProbesPerTick', 0, 50],
+  ['redTeam.queue.reservedSlots', 0, 8],
   ['deliveryCapacity.pinUnits', 1, 200],
   ['resourcePool.builderFloor', 0, 64],
   ['resourcePool.class.1.reserve', 0, 64],
