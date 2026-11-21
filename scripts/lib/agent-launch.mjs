@@ -86,8 +86,8 @@ function envRecord(value) {
     && !RUNTIME_INJECTION_ENV.has(key) && !key.endsWith('_OPTIONS') && !/^(?:LD_|DYLD_)/.test(key)));
 }
 // Tighten-only: env-supplied Git config may restrict Git's built-in transport defaults
-// (ext never, unknown user, these always) but never widen them. Config files stay S1e.
-const SAFE_TRANSPORTS = new Set(['http', 'https', 'git', 'ssh', 'file']);
+// (ext never, file and unknown user, these always) but never widen them. Config files stay S1e.
+const SAFE_TRANSPORTS = new Set(['http', 'https', 'git', 'ssh']);
 function widensTransport(key, value) {
   const first = key.indexOf('.'), last = key.lastIndexOf('.');
   const section = (first < 0 ? key : key.slice(0, first)).toLowerCase();
@@ -100,13 +100,48 @@ function widensTransport(key, value) {
   if (policy === 'user') return name === undefined || name === 'ext';
   return true; // unparseable policy: fail closed
 }
+// Git's GIT_CONFIG_PARAMETERS grammar: space-separated sq-quoted `'key'='value'` or `'key=value'`
+// entries, a literal quote spelled `'\''`. Anything else returns null (refused).
+function configParameters(text) {
+  const pairs = []; let i = 0;
+  const quoted = () => {
+    if (text[i] !== "'") return undefined;
+    let out = '';
+    for (;;) {
+      const end = text.indexOf("'", i + 1);
+      if (end < 0) return undefined;
+      out += text.slice(i + 1, end); i = end + 1;
+      if (text[i] !== '\\' || !"'!".includes(text[i + 1] ?? '') || text[i + 2] !== "'") return out;
+      out += text[i + 1]; i += 2;
+    }
+  };
+  while (i < text.length) {
+    if (/\s/.test(text[i])) { i++; continue; }
+    const key = quoted();
+    if (key === undefined) return null;
+    if (text[i] === '=') {
+      i++;
+      const value = /\s/.test(text[i] ?? ' ') ? undefined : quoted();
+      if (value === undefined && i < text.length && !/\s/.test(text[i])) return null;
+      pairs.push([key, value]);
+    } else {
+      const eq = key.indexOf('=');
+      pairs.push(eq < 0 ? [key, undefined] : [key.slice(0, eq), key.slice(eq + 1)]);
+    }
+    if (i < text.length && !/\s/.test(text[i])) return null;
+  }
+  return pairs;
+}
 function transportPolicy(env) {
   const widened = reason => fail(`env ${reason} widens Git transport policy; restrict it (never) or remove it and retry`);
   for (const [key, entry] of Object.entries(env)) {
     const index = /^GIT_CONFIG_KEY_(.*)$/.exec(key)?.[1];
     if (index !== undefined && entry !== undefined && widensTransport(entry, env[`GIT_CONFIG_VALUE_${index}`])) widened(key);
   }
-  if (env.GIT_CONFIG_PARAMETERS !== undefined && /protocol|include/i.test(env.GIT_CONFIG_PARAMETERS)) widened('GIT_CONFIG_PARAMETERS');
+  if (env.GIT_CONFIG_PARAMETERS !== undefined) {
+    const pairs = configParameters(env.GIT_CONFIG_PARAMETERS);
+    if (pairs === null || pairs.some(([key, value]) => widensTransport(key, value))) widened('GIT_CONFIG_PARAMETERS');
+  }
   if (env.GIT_ALLOW_PROTOCOL !== undefined && env.GIT_ALLOW_PROTOCOL.split(':').some(p => p && !SAFE_TRANSPORTS.has(p))) widened('GIT_ALLOW_PROTOCOL');
 }
 function configValue(key, value) {

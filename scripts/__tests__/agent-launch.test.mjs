@@ -115,7 +115,8 @@ describe('B1/B2 caller environment follows main except runtime injection, withou
     }
   });
   // Tighten-only transport guarantee: env-supplied Git config may restrict, never widen,
-  // Git's built-in transport defaults (ext never, unknown user, http/https/git/ssh/file always).
+  // Git's built-in transport defaults (ext never, file and unknown user since git 2.38.1,
+  // http/https/git/ssh always).
   const pair = (...kv) => Object.fromEntries([['GIT_CONFIG_COUNT', String(kv.length / 2)],
     ...kv.flatMap((v, i) => (i % 2 ? [] : [[`GIT_CONFIG_KEY_${i / 2}`, v], [`GIT_CONFIG_VALUE_${i / 2}`, kv[i + 1]]]))]);
   it.each([
@@ -134,6 +135,12 @@ describe('B1/B2 caller environment follows main except runtime injection, withou
     ['stray key beyond the count', { GIT_CONFIG_COUNT: '0', GIT_CONFIG_KEY_3: 'protocol.ext.allow', GIT_CONFIG_VALUE_3: 'user' }],
     ['GIT_CONFIG_PARAMETERS transport pair', { GIT_CONFIG_PARAMETERS: "'protocol.ext.allow'='user'" }],
     ['GIT_CONFIG_PARAMETERS include', { GIT_CONFIG_PARAMETERS: "'include.path'='/caller/gitconfig'" }],
+    ['GIT_CONFIG_PARAMETERS old key=value form', { GIT_CONFIG_PARAMETERS: "'Protocol.ext.Allow=USER'" }],
+    ['GIT_CONFIG_PARAMETERS widening after a safe entry', { GIT_CONFIG_PARAMETERS: "'soak.x'='y' 'protocol.allow'='always'" }],
+    ['GIT_CONFIG_PARAMETERS unparseable', { GIT_CONFIG_PARAMETERS: "'protocol.ext.allow'=user" }],
+    ['GIT_CONFIG_PARAMETERS unterminated quote', { GIT_CONFIG_PARAMETERS: "'soak.x'='y" }],
+    ['protocol.file.allow=always (file defaults to user)', pair('protocol.file.allow', 'always')],
+    ['GIT_ALLOW_PROTOCOL file (file defaults to user)', { GIT_ALLOW_PROTOCOL: 'https:file' }],
     ['GIT_ALLOW_PROTOCOL ext', { GIT_ALLOW_PROTOCOL: 'ext' }],
     ['GIT_ALLOW_PROTOCOL ext among safe', { GIT_ALLOW_PROTOCOL: 'https:ext' }],
     ['GIT_ALLOW_PROTOCOL unknown protocol', { GIT_ALLOW_PROTOCOL: 'https:fixture' }],
@@ -153,8 +160,12 @@ describe('B1/B2 caller environment follows main except runtime injection, withou
     ['protocol.fixture.allow=user', pair('protocol.fixture.allow', 'user')],
     ['protocol.version is not a transport policy', pair('protocol.version', '2')],
     ['unrelated pins', pair('core.hooksPath', '', 'fetch.fsckObjects', 'true')],
-    ['GIT_ALLOW_PROTOCOL safe allowlist', { GIT_ALLOW_PROTOCOL: 'https:http:git:ssh:file' }],
+    ['GIT_ALLOW_PROTOCOL safe allowlist', { GIT_ALLOW_PROTOCOL: 'https:http:git:ssh' }],
+    ['GIT_ALLOW_PROTOCOL empty (allows nothing)', { GIT_ALLOW_PROTOCOL: '' }],
     ['GIT_CONFIG_PARAMETERS unrelated', { GIT_CONFIG_PARAMETERS: "'soak.parameter'='inherited'" }],
+    ['GIT_CONFIG_PARAMETERS restricting', { GIT_CONFIG_PARAMETERS: "'protocol.ext.allow'='never' 'protocol.allow'='never'" }],
+    ['GIT_CONFIG_PARAMETERS old form and escaped quote', { GIT_CONFIG_PARAMETERS: "'url.x.insteadOf=https://protocol.example/' 'user.name'='O'\\''Brien'" }],
+    ['GIT_CONFIG_PARAMETERS key without value', { GIT_CONFIG_PARAMETERS: "'core.bare'=" }],
   ])('passes caller env that keeps or tightens Git transport policy verbatim: %s', (_name, extra) => {
     const env = { PATH: bin, ...extra };
     const io = seam(); launchAgent({ ...base(), env }, io);
