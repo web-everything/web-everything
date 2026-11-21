@@ -44,11 +44,12 @@ export default {
     const tip = "Merge branch 'main' into lane/x";
     // Post-accept red team #7263: the real reader omitted commits on review:human rows.
     const { defaultReadPrs } = await import(pathToFileURL(join(sourceRoot, PATHS[2])).href);
+    const { ghRepoSlug } = await import(pathToFileURL(join(sourceRoot, 'scripts/lib/constellation-repos.mjs')).href);
     const history = ['a', 'c', 'd', 'e'].map((hex, index) => ({
       ...advisory(hex.repeat(40)), createdAt: `2026-11-20T10:0${index}:00Z`,
     }));
     let commitReads = 0;
-    const listed = defaultReadPrs({ repo: 'web-everything/web-everything', readOnly: true,
+    const listed = defaultReadPrs({ repo: ghRepoSlug('we'), readOnly: true,
       readShared: () => [{ number: 7230, author, headRefName: 'lane/x', headRefOid: HEAD, baseRefName: 'main',
         labels: [{ name: 'review:human' }], rowsComplete: true, rowsHead: HEAD, mergeStateStatus: 'CLEAN',
         statusCheckRollup: [{ name: 'gate', status: 'completed', conclusion: 'success' }], comments: history }],
