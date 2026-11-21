@@ -75,7 +75,7 @@ export const NON_READ_OPERATIONS = Object.freeze([
   'resource-pool',
   'free-scope', 'operator-session-bootstrap', 'maintenance', 'perf-snapshot', 'pre-pr-check', 'resource-status', 'worker-capacity', 'prototype-load', 'codex-audit',
   'unpark', 'retry-prepare', 'rearm', 'refresh', 'grant-rounds', 'clear-claim', 'ci-heal-reset', 'routing-override', 'update-branch',
-  'urgent-verify', 'urgent-sweep',
+  'urgent-verify', 'urgent-sweep', 'build-priority-set',
 ]);
 
 /** Pre-approved commands, as `node <root>/…` prefixes (the agent's cwd is a scratch dir outside any checkout). */

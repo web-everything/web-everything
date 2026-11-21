@@ -615,6 +615,8 @@ describe('#3036 read-only is a property of the DECLARING MODULE — the part tha
     'update-branch': 'update-branch.mjs',
     // Writes operator routing preferences; listed here for module-map coverage only.
     'routing-override': 'routing-override.mjs',
+    // Local runtime-policy writer; listed for module-map coverage only.
+    'build-priority-set': 'build-priority-set.mjs',
     'operator-override-set': 'operator-override.mjs',
     'operator-override-clear': 'operator-override.mjs',
     'ruled-weakened-add': 'ruled-weakened-add.mjs',
