@@ -1,5 +1,5 @@
 /** Narrow, fail-closed resolution of append-only advisory registries; never resolves source conflicts. */
-import { copyFileSync, mkdirSync, lstatSync, mkdtempSync, readFileSync, readlinkSync, symlinkSync, writeFileSync, rmSync } from 'node:fs';
+import { copyFileSync, mkdirSync, realpathSync, lstatSync, mkdtempSync, readFileSync, readlinkSync, symlinkSync, writeFileSync, rmSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { tmpdir } from 'node:os';
 import { isDeepStrictEqual } from 'node:util';
@@ -31,7 +31,9 @@ export function regenerateFromTree({ git, tree, path }) {
       return { sha: match[2], name: match[3] };
     });
     if (required.some(item => !entries.some(({ name }) => item.endsWith('/') ? name.startsWith(item) : name === item))) return null;
-    scratch = mkdtempSync(join(process.env.TMPDIR || tmpdir(), 'we-generated-merge-'));
+    // realpath: the generator's main-module guard compares import.meta.url (real path) with argv[1]; a symlinked
+    // TMPDIR (macOS /var -> /private/var) would make it silently do nothing and exit 0.
+    scratch = realpathSync(mkdtempSync(join(process.env.TMPDIR || tmpdir(), 'we-generated-merge-')));
     for (const { sha, name } of entries) {
       const blob = git(['cat-file', 'blob', sha]);
       if (blob.status !== 0) return null;

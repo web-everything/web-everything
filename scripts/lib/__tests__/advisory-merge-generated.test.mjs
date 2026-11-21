@@ -1,7 +1,8 @@
 import { afterEach, expect, it, vi } from 'vitest';
 import { spawnSync } from 'node:child_process';
 import { pathToFileURL } from 'node:url';
-import { readFileSync, rmSync, symlinkSync } from 'node:fs';
+import { readFileSync, realpathSync, rmSync, symlinkSync } from 'node:fs';
+import { tmpdir } from 'node:os';
 import { dirname, join, posix, resolve } from 'node:path';
 import * as advisory from '../daemon-rebuild/advisory-merge.mjs';
 import { fixture, snapshot, DOC, CLOSURE } from './fixtures/generated-merge.mjs';
@@ -22,6 +23,13 @@ it('resolveAdvisoryConflicts regenerates docs/agent/settings-registry.md when bo
   expect(actual).toContain('"a":1');
   expect(actual).toContain('"b":1');
   f.generate('--check');
+});
+
+it('regenerates even when TMPDIR is a symlink (generator main-module guard needs the real path)', () => {
+  const f = setup(), link = join(f.root, '..', `tmp-link-${process.pid}`);
+  symlinkSync(realpathSync(tmpdir()), link);
+  vi.stubEnv('TMPDIR', link);
+  try { expect(advisory.resolveAdvisoryConflicts(f)).toMatchObject({ ok: true }); } finally { rmSync(link, { force: true }); }
 });
 
 it('worktree variant resolves a real doc-only merge and commits', () => {
