@@ -41,3 +41,11 @@ One line per class: either the handling, or `n/a: <why>`.
 5. **Identity scoping** — TODO: the handling, or n/a: <why>.
 6. **State over time** — TODO: the handling, or n/a: <why>.
 7. **Who wrote it** — TODO: the handling, or n/a: <why>.
+
+## Also raised by
+
+- Also raised by web-everything/web-everything#7227, advisory review of head `d52ac6f729893b0f27a7924d872e8ae6e10b38ad` on 2026-11-21: correctness/coverage, security/coverage, simplicity/COVERAGE and codex-correctness/coverage at `we:scripts/operations/__tests__/urgent-sweep.test.mjs`. Require each operational Acceptance guarantee and Risks bullet to reference a repository-qualified named integration test with an observable assertion, or a named live verification procedure and its recorded artifact path. Check the mapping before clearance; a procedure alone is a plan, not a passing live-proof receipt.
+- For that prevention gate's fixtures, cover the three hot-patch procedures: `live green hot-patch lifecycle` (actual health-watch ticks, request during running CI, adoption, green CI, merge and settlement); `live red canary unloads within five minutes` (failure-to-withdrawal elapsed time at most five minutes); and `live head move cancels CI and unloads` (push during CI, cancelled run, withdrawal). Recorded live artifacts must identify the PR and immutable patch SHA, ET timestamps, before/after daemon `rev-parse` values, and the observed terminal state. Include the replacement `hotpatch/<sha>-auto-1` ref risk with a named test asserting NEEDS-YOU escalation and no removal.
+- Negative fixtures must reject a missing mapping, a nonexistent test or artifact, a direct mocked sweep presented as full live proof, and a red-canary receipt without elapsed-time or daemon-SHA evidence. Keep planned verification distinct from completed verification. This records prevention debt only: it neither supplies PR #7227's pending live proof nor changes its current not-real rulings or human-review requirement.
+
+Idempotency key (do not edit): advisory-prevention-key:web-everything/web-everything#7227@d52ac6f729893b0f27a7924d872e8ae6e10b38ad:operational-acceptance
