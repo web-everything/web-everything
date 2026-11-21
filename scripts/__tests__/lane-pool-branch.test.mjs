@@ -248,3 +248,20 @@ it('scrubs inherited Git location and config for branch probes and switch', () =
   expect(git(primary, 'branch', '--show-current')).toBe('main');
   expect(git(primary, 'branch', '--list', 'lane/test')).toBe('');
 });
+it('never overwrites an ignored local file the target commit tracks', () => {
+  git(primary, 'checkout', '--quiet', '-b', 'withextra', first);
+  writeFileSync(join(primary, 'extra.txt'), 'tracked upstream\n');
+  git(primary, 'add', 'extra.txt');
+  git(primary, '-c', 'user.name=Test', '-c', 'user.email=test@example.com', 'commit', '--quiet', '-m', 'extra');
+  git(primary, 'push', '--quiet', origin, 'withextra');
+  git(lane, 'fetch', '--quiet', 'origin', 'withextra');
+  writeFileSync(join(lane, '.git', 'info', 'exclude'), 'extra.txt\n');
+  writeFileSync(join(lane, 'extra.txt'), 'precious local\n');
+  expect(git(lane, 'status', '--porcelain', '--untracked-files=all')).toBe('');
+  refused({ from: 'origin/withextra' }, /git switch failed/);
+  expect(readFileSync(join(lane, 'extra.txt'), 'utf8')).toBe('precious local\n');
+});
+it.each([false, true])('refuses a lane that defines a Git filter driver before any status call (dry-run: %s)', dryRun => {
+  git(lane, 'config', 'filter.sneaky.clean', 'cat');
+  refused(dryRun ? { 'dry-run': true } : {}, /filter driver/);
+});

@@ -195,7 +195,7 @@ import { VERIFY_FILENAME, keepMarkerAfterReset, readVerifyMarker } from './lib/l
 import { checkLaneHold, laneHoldJournalFields, clearLaneAwaitRecords } from './lib/lane-hold-io.mjs';
 import { resolveLaneHoldSettings } from './lib/lane-lease.mjs';
 import { applyLaneDietConfig, laneDietConfigState } from './lib/lane-git-diet.mjs';
-import { pinDeveloperDir, dropGitLocationEnv, laneGitHardeningEnv, scrubGitLocationEnv, scrubGitRepoEnv, scrubRiskyLaneConfig, LANE_CONFIG_LIST_ARGS } from './lib/lane-git-hardening.mjs';
+import { pinDeveloperDir, dropGitLocationEnv, laneGitHardeningEnv, scrubGitLocationEnv, scrubGitRepoEnv, scrubRiskyLaneConfig, laneFilterDrivers, LANE_CONFIG_LIST_ARGS } from './lib/lane-git-hardening.mjs';
 import { laneMaskingConfig, laneRedirectConfig, wellFormedConfigList, withHonestReportingPins } from './lib/health-watch-lane-scan.mjs';
 import { readGitIdentity, laneIdentityReport, ensureLaneHooksPath, resolveGitIdentityPlaceholders, GIT_IDENTITY_FIX_HINT } from './lib/git-identity.mjs';
 
@@ -5786,6 +5786,11 @@ function cmdBranch(repo) {
   if (!hold.allowed) refuse(hold.reason);
   try { branchGit(['check-ref-format', `refs/heads/${name}`]); }
   catch { refuse('invalid --name for a git branch'); }
+  // A clean filter runs on worktree content during `git status`, so a lane defining one is refused BEFORE the first
+  // status call (dry-run included). An unreadable config list is never read as "no drivers".
+  const laneConfig = releaseEvidenceGit([...LANE_CONFIG_LIST_ARGS], dir, {}, { GIT_CONFIG_NOSYSTEM: '1' });
+  if (laneConfig === null) refuse('lane config unreadable');
+  if (laneFilterDrivers(laneConfig).length) refuse('lane defines a Git filter driver; unset it before branching');
   try {
     // Unlike tryGit/status fallbacks, a failed read must never mean clean or absent.
     const branches = branchGit(['for-each-ref', '--format=%(refname)', `refs/heads/${name}`]).split('\n');
@@ -5808,7 +5813,8 @@ function cmdBranch(repo) {
     process.stdout.write(`would create ${name} at ${commit} in lane-${n}\n`);
     return;
   }
-  try { branchGit(['switch', '-c', name, commit]); }
+  // --no-overwrite-ignore: an ignored local file the target commit tracks must never be silently overwritten.
+  try { branchGit(['switch', '--no-overwrite-ignore', '-c', name, commit]); }
   catch (error) { refuse(`git switch failed: ${String(error.message).replace(/[\p{Cc}\p{Cf}\u2028\u2029]/gu, ' ')}`); }
   process.stdout.write(`${name}\n`);
 }
