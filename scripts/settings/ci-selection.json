@@ -1,0 +1,8 @@
+{
+  "$comment": "Selection: standard → platform → this file → WE_CI_SELECTION (JSON block). Invalid leaves retain lower-layer values. trace collects shadow evidence only; it never changes selection. Effective sources use policy-cascade logging (WE_POLICY_CASCADE_LOG=1).",
+  "ci": {
+    "selection": {
+      "trace": { "enabled": true, "maxEdgesPerTest": 5000 }
+    }
+  }
+}

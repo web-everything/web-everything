@@ -927,7 +927,7 @@
       "instant": false
     },
     "ci": {
-      "description": "Concurrency of timeout-evidence child readers.",
+      "description": "CI dependency selection, shadow tracing and timeout-evidence reader concurrency.",
       "owner": "scripts/settings/timeout-evidence.json",
       "changeVia": "pr",
       "instant": false
