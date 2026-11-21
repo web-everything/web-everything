@@ -966,7 +966,12 @@ async function runCli() {
     const remoteTip = remoteTipMatch?.[2] === remoteHeadRef ? remoteTipMatch[1] : null;
     const validRefSha = /^[0-9a-f]{40}$/i.test(refSha);
     // A separate push destination (pushurl / pushInsteadOf) means the fetch-side tip proves nothing about it: never skip.
-    const splitPushConfig = (tryGit(['config', '--get-regexp', `^(remote\\.${REMOTE.replace(/[^\w-]/g, '\\$&')}\\.pushurl|url\\..*\\.pushinsteadof)$`]) ?? '').trim() !== '';
+    // Fail closed: only git's exit 1 ("no matching key") proves there is none; any other read failure
+    // (128 corrupt config, 6 bad regex, spawn error) counts as a split push config.
+    let splitPushConfig;
+    try {
+      splitPushConfig = gitC(['config', '--get-regexp', `^(remote\\.${REMOTE.replace(/[^\w-]/g, '\\$&')}\\.pushurl|url\\..*\\.pushinsteadof)$`]).trim() !== '';
+    } catch (e) { splitPushConfig = e?.status !== 1; }
     return { remoteTip, validRefSha, alreadyPublished: validRefSha && remoteTip === refSha && !splitPushConfig };
   }
 

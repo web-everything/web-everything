@@ -9,7 +9,8 @@ import { pathToFileURL } from 'node:url';
 // Git effects are recorded instead of executed. No real Git, forge, card filing or operator state.
 function run({ check = true, fail = false, override = '', count = 15, exempt = false,
   body = 'Description', earlyPr = false, labelOnGreen = false, headEvidence = 'matching',
-  sha = 'a'.repeat(40), remoteTip = '', remoteError = false, ancestor = true, refusePush = false } = {}) {
+  sha = 'a'.repeat(40), remoteTip = '', remoteError = false, ancestor = true, refusePush = false,
+  pushConfig = null, dryRun = false } = {}) {
   const dir = mkdtempSync(join(tmpdir(), 'pr-land-preflight-'));
   const trace = join(dir, 'effects.jsonl');
   const root = resolve('scripts');
@@ -73,12 +74,19 @@ function run({ check = true, fail = false, override = '', count = 15, exempt = f
       }
       if (args[0] === 'push') return ${refusePush} ? execFileSync('sh', [${JSON.stringify(hook)}], { encoding: 'utf8' }) : '';
       if (args[0] === 'show') throw new Error('no ready config');
+      if (args[0] === 'config' && args[1] === '--get-regexp') {
+        // Real git: exit 1 = no matching key; any other non-zero (128 corrupt config, 6 bad regex) = unreadable.
+        const pushConfig = ${JSON.stringify(pushConfig)};
+        if (pushConfig === null) throw Object.assign(new Error('no match'), { status: 1 });
+        if (typeof pushConfig === 'number') throw Object.assign(new Error('config unreadable'), { status: pushConfig });
+        return pushConfig;
+      }
       return '';
     }; syncBuiltinESMExports(); register(${JSON.stringify(pathToFileURL(loader).href)});`);
   try {
     const child = spawnSync(process.execPath, ['--import', preload, join(root, 'pr-land.mjs'), `--repo=${dir}`,
       '--ref=lane/preflight', '--title=fix: admission', `--body=${body}`, labelOnGreen ? '--label-on-green' : '--no-wait', '--json',
-      ...(check ? ['--check'] : []), ...(override === 'forceOpen' ? ['--force-open', '--reason=operator'] : [])],
+      ...(check ? ['--check'] : []), ...(dryRun ? ['--dry-run'] : []), ...(override === 'forceOpen' ? ['--force-open', '--reason=operator'] : [])],
     { cwd: dir, env: { ...process.env, TMPDIR: dir, WE_POLICY_CASCADE_LOG: '0' },
       encoding: 'utf8', timeout: 30_000, maxBuffer: 2 * 1024 * 1024 });
     if (!child.stdout.trim()) throw new Error(`CLI ${child.status}: ${child.stderr}`);
@@ -204,5 +212,40 @@ describe('pr-land lane publish remote-tip check', () => {
     const { effects, stderr } = publish({ sha: 'a'.repeat(8), remoteTip: tip('a'.repeat(8)), refusePush: true });
     expect(pushes(effects)).toHaveLength(1);
     expect(stderr).not.toContain('push skipped');
+  });
+
+  // Acceptance: "a separate pushurl/pushInsteadOf: never skip" — and an unreadable config never skips either.
+  it.each([
+    ['remote.origin.pushurl', 'remote.origin.pushurl git@github.com:fork/web-everything.git'],
+    ['url.<base>.pushinsteadof', 'url.git@github.com:fork/.pushinsteadof https://github.com/web-everything/'],
+    ['config read exit 128 (corrupt)', 128],
+    ['config read exit 6 (bad regex)', 6],
+  ])('origin equals HEAD but %s: never skips, pushes exactly once', (_name, pushConfig) => {
+    const { status, result, effects, stderr } = publish({ remoteTip: tip(sha), pushConfig, refusePush: true });
+    expect(effects.some(([cmd, args]) => cmd === 'git' && args[0] === 'config' && args[1] === '--get-regexp')).toBe(true);
+    expect(pushes(effects)).toEqual([['git', ['push', 'origin', `${sha}:refs/heads/lane/preflight`]]]);
+    expect(status).toBe(3);
+    expect(result.reason).toBe('push-failed');
+    expect(stderr).not.toContain('push skipped');
+  });
+
+  it('dry-run plan names the skip when origin already holds HEAD', () => {
+    const { status, result, effects } = publish({ dryRun: true, remoteTip: tip(sha) });
+    expect(status).toBe(0); expect(result.reason).toBe('dry-run');
+    expect(result.plan).toContain(`push skipped: origin already at ${sha}`);
+    expect(result.plan.some(line => line.startsWith('git push '))).toBe(false);
+    expect(pushes(effects)).toEqual([]);
+  });
+
+  it.each([
+    ['origin behind', { remoteTip: tip(different) }],
+    ['pushurl configured', { remoteTip: tip(sha), pushConfig: 'remote.origin.pushurl git@github.com:fork/x.git' }],
+    ['config unreadable', { remoteTip: tip(sha), pushConfig: 128 }],
+  ])('dry-run plan keeps the push line when %s', (_name, options) => {
+    const { status, result, effects } = publish({ dryRun: true, ...options });
+    expect(status).toBe(0);
+    expect(result.plan.some(line => line.startsWith(`git push origin HEAD:refs/heads/lane/preflight`))).toBe(true);
+    expect(result.plan.some(line => line.startsWith('push skipped'))).toBe(false);
+    expect(pushes(effects)).toEqual([]);
   });
 });
