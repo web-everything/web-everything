@@ -7,7 +7,7 @@
 import { describe, it, expect, beforeEach, afterEach, beforeAll, afterAll } from 'vitest';
 import { sharedRepos } from './fixtures/shared-git-fixture.mjs';
 import { spawnSync, execFileSync } from 'node:child_process';
-import { mkdtempSync, rmSync, writeFileSync, existsSync, readdirSync, mkdirSync } from 'node:fs';
+import { mkdtempSync, rmSync, writeFileSync, readFileSync, existsSync, readdirSync, mkdirSync } from 'node:fs';
 import { resolve, join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { healLaneRefs, diagnoseLane, findBrokenRefs, looksLikeCorruption } from '../lib/lane-repair.mjs';
@@ -95,10 +95,22 @@ describe('xj1vryw — acquire heals', () => {
   });
 
   it('auto-pick hands out a healthy lane when the first candidate is corrupt', () => {
+    // Failed status evidence now skips the candidate and blocks growth/recovery. Supply actual
+    // healthy capacity rather than relying on the old fail-open scan to select and repair lane-1.
+    expect(runPool(['provision', '--count=2', ...poolArgs()]).code).toBe(0);
+    const head = git(['rev-parse', 'HEAD'], laneDir());
     writeFileSync(join(laneDir(), '.git', 'index'), 'garbage-not-an-index');
-    const r = runPool(['acquire', '--session=s-auto', '--purpose=t', ...poolArgs()]);
+    const r = runPool(['acquire', '--session=s-auto', '--purpose=t', '--no-free-list', '--no-cache', '--wait-ms=0', '--hard-max=2', ...poolArgs()]);
     expect(r.code, r.err).toBe(0);
-    expect(diagnoseLane(laneDir()).ok).toBe(true);
+    const picked = r.out.trim();
+    expect(picked).toBe(join(poolRoot, 'repair', 'lane-2'));
+    expect(diagnoseLane(picked).ok).toBe(true);
+    expect(existsSync(join(picked, '.git', '.lane-lease'))).toBe(true);
+    expect(git(['rev-parse', 'HEAD'], laneDir())).toBe(head);
+    expect(readFileSync(join(laneDir(), '.git', 'index'), 'utf8')).toBe('garbage-not-an-index');
+    expect(existsSync(join(laneDir(), '.git', '.lane-lease'))).toBe(false);
+    expect(existsSync(quarantineDir())).toBe(false);
+    expect(existsSync(join(poolRoot, 'repair', 'lane-3'))).toBe(false);
   });
 
   it('NEVER quarantines a lane held by a live lease (refresh skips it)', () => {
