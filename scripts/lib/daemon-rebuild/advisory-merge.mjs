@@ -49,7 +49,7 @@ export function regenerateFromTree({ git, tree, path }) {
     }
     return readFileSync(join(scratch, path), 'utf8');
   } catch { return null; }
-  finally { if (scratch) { try { rmSync(scratch, { recursive: true, force: true }); } catch { return null; } } }
+  finally { if (scratch) { try { rmSync(scratch, { recursive: true, force: true }); } catch { /* best-effort cleanup */ } } }
 }
 
 const object = value => value !== null && typeof value === 'object' && !Array.isArray(value);
@@ -117,9 +117,9 @@ function checkModuleSyntax(path) {
 }
 
 function readMerge(git, revisions, path, tree) {
-  if (Object.hasOwn(GENERATED_MERGE_PATHS, path)) return regenerateFromTree({ git, tree, path });
   const inputs = revisions.map(revision => git(['show', `${revision}:${path}`]));
   if (inputs.some(result => result.status !== 0)) return null;
+  if (Object.hasOwn(GENERATED_MERGE_PATHS, path)) return regenerateFromTree({ git, tree, path });
   return (path === ADVISORY_MERGE_PATHS[0] ? mergeTimingsJson : mergeRegistryLines)(
     ...inputs.map(result => String(result.stdout)));
 }
@@ -162,7 +162,7 @@ export function resolveAdvisoryConflicts({ git, cur, ovSha }) {
     return written.status === 0 && FULL_SHA_RE.test(mergedTree)
       ? { ok: true, via: 'advisory-merge', tree: mergedTree } : null;
   } catch { return null; }
-  finally { if (scratch) rmSync(scratch, { recursive: true, force: true }); }
+  finally { if (scratch) { try { rmSync(scratch, { recursive: true, force: true }); } catch { /* best-effort cleanup */ } } }
 }
 
 /** Resolves only an advisory-only in-progress merge, then completes its merge commit. */
@@ -197,6 +197,7 @@ export function resolveAdvisoryInWorktree({ git, cwd, commit = true }) {
     const originals = new Map(paths.map(path => {
       const fullPath = join(cwd, path);
       const stat = lstatSync(fullPath);
+      if (Object.hasOwn(GENERATED_MERGE_PATHS, path) && stat.isSymbolicLink()) throw new Error('generated file is a symlink');
       if (!stat.isFile() && !stat.isSymbolicLink()) throw new Error('unsupported advisory file');
       return [path, { link: stat.isSymbolicLink(),
         data: stat.isSymbolicLink() ? readlinkSync(fullPath) : readFileSync(fullPath) }];
@@ -221,14 +222,25 @@ export function resolveAdvisoryInWorktree({ git, cwd, commit = true }) {
     };
     try {
       for (const { path, text } of merged) writeFileSync(join(cwd, path), text);
+      const generatedHashes = new Map();
       for (const { path } of merged) {
         if (path.endsWith('.mjs') && !checkModuleSyntax(join(cwd, path))) return restore();
+        if (Object.hasOwn(GENERATED_MERGE_PATHS, path)) {
+          const blob = git(['hash-object', '--no-filters', '--', join(cwd, path)]);
+          const sha = String(blob.stdout ?? '').trim();
+          if (blob.status !== 0 || !FULL_SHA_RE.test(sha)) return restore();
+          generatedHashes.set(path, sha);
+        }
       }
       if (git(['add', '--', ...paths]).status !== 0) return restore();
+      for (const [path, sha] of generatedHashes) {
+        const staged = git(['rev-parse', `:${path}`]);
+        if (staged.status !== 0 || String(staged.stdout ?? '').trim() !== sha) return restore();
+      }
       const remaining = git(['diff', '--name-only', '-z', '--diff-filter=U']);
       if (remaining.status !== 0 || String(remaining.stdout ?? '') !== '') return restore();
       return !commit || git(['commit', '--no-edit']).status === 0 || restore();
     } catch { return restore(); }
   } catch { return false; }
-  finally { if (scratch) { try { rmSync(scratch, { recursive: true, force: true }); } catch { return false; } } }
+  finally { if (scratch) { try { rmSync(scratch, { recursive: true, force: true }); } catch { /* best-effort cleanup */ } } }
 }
