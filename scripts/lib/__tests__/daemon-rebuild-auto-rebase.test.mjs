@@ -454,6 +454,7 @@ describe('established overlay auto rebase', () => {
     if (setting !== undefined) env.WE_DAEMON_AUTO_REBASE = setting;
     const kick = vi.fn(() => ({ started: [ref], skipped: [] })), cleanup = vi.fn();
     const result = await prepareRebuild({ root: f.root, env, run, log: {}, now: Date.now,
+      deps: { retireRegistration: async () => ({ retired: false, refused: 'test' }) },
       prState: async () => 'OPEN', prBaseChain: async () => null,
       autoRebase: { resolveAutoRebaseSwitch, kickAutoRebase: kick, finishPendingSwaps: cleanup } });
     expect(result.result.reason).toBe('established-overlay-conflict');
@@ -1321,7 +1322,8 @@ describe('established overlay auto rebase', () => {
       }
       return { f, replacement: await job(f) };
     };
-    const prepare = (f, runFn = run) => prepareRebuild({ root: f.root, env: f.env, run: runFn, log: {}, now: Date.now, prState: async () => 'OPEN', prBaseChain: async () => null });
+    const prepare = (f, runFn = run) => prepareRebuild({ root: f.root, env: f.env, run: runFn, log: {}, now: Date.now, prState: async () => 'OPEN', prBaseChain: async () => null,
+      deps: { retireRegistration: async () => ({ retired: false, refused: 'test' }) } });
 
     it('builds with its registered repair, then cleanup retires the original', async () => {
       const { f, replacement } = await pinnedFixture();
@@ -1407,6 +1409,7 @@ describe('established overlay auto rebase', () => {
       });
       const result = await prepareRebuild({
         root: f.root, env: { ...f.env, WE_DAEMON_AUTO_REBASE: scenario === 'disabled' ? '0' : '1' },
+        deps: { retireRegistration: async () => ({ retired: false, refused: 'test' }) },
         run, log: {}, now: Date.now, prState: async () => 'OPEN', prBaseChain: async () => null,
         autoRebase: { resolveAutoRebaseSwitch, finishPendingSwaps: cleanup, kickAutoRebase: vi.fn() },
       });
@@ -1556,7 +1559,9 @@ describe('established overlay auto rebase', () => {
     writeRebuildState(f.root, { adopted: { head: live.finalSha } }, f.env);
     const kick = vi.fn(() => { throw new Error('unavailable'); });
     const cleanup = vi.fn(() => { throw new Error('unavailable'); });
-    const prepare = enabled => prepareRebuild({ root: f.root, env: { ...f.env, WE_DAEMON_AUTO_REBASE: enabled ? '1' : '0' }, run, log: {}, now: Date.now, prState: async () => 'OPEN', prBaseChain: async () => null, autoRebase: { resolveAutoRebaseSwitch: () => ({ enabled, source: 'env' }), kickAutoRebase: kick, finishPendingSwaps: cleanup } });
+    const prepare = enabled => prepareRebuild({ root: f.root, env: { ...f.env, WE_DAEMON_AUTO_REBASE: enabled ? '1' : '0' }, run, log: {}, now: Date.now, prState: async () => 'OPEN', prBaseChain: async () => null,
+      deps: { retireRegistration: async () => ({ retired: false, refused: 'test' }) },
+      autoRebase: { resolveAutoRebaseSwitch: () => ({ enabled, source: 'env' }), kickAutoRebase: kick, finishPendingSwaps: cleanup } });
     const off = await prepare(false);
     expect(off.terminal).toBe(true); expect(off.result.reason).toBe('established-overlay-conflict');
     expect(off.result.detail).not.toHaveProperty('autoRebase'); expect(kick).not.toHaveBeenCalled();
