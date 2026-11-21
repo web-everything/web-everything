@@ -1,5 +1,5 @@
 /** @file R863 ownership, safety, durable budgets, smells and health cadence regressions. */
-import { describe, it, expect, vi, afterEach } from 'vitest';
+import { describe, it, expect, vi, beforeAll, afterEach } from 'vitest';
 import { mkdtempSync, rmSync, readFileSync, writeFileSync, readSync, mkdirSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
@@ -348,6 +348,16 @@ describe('health-watch registration', () => {
 });
 
 describe('portable feed IO and settings', () => {
+  // Load the production dispatch graph outside the five-second behavioral test budget.
+  // The first review adapter test otherwise pays for these cold imports even with injected IO.
+  // Keep roots sequential, as in createLiveOwnerWatchIo: their shared cycles can deadlock vite-node.
+  beforeAll(async () => {
+    await import('../pr-stall-sweep.mjs');
+    await import('../../operations/manual-daemon-pass-io.mjs');
+    await import('../../operations/review-job.mjs');
+    await import('../reconcile-pass.mjs');
+  }, 60_000);
+
   const dirs = []; afterEach(() => dirs.splice(0).forEach(dir => rmSync(dir, { recursive: true, force: true })));
   async function localIo(adapters = {}, now = NOW, dir, actEnabled = true, extraEnv = {}) {
     if (!dir) { dir = mkdtempSync(join(process.env.TMPDIR || tmpdir(), 'live-owner-')); dirs.push(dir); }
