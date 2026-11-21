@@ -24,6 +24,13 @@ describe('providers skill', () => {
     expect(desc[1]).toMatch(/Codex/);
   });
 
+  it('keeps the safety routing: audits use --review, agy is not a read-only seat, no skip flags', () => {
+    const text = readFileSync(SKILL, 'utf8');
+    expect(text).toMatch(/audits must pass `--review`/);
+    expect(text).toMatch(/not a read-only research seat/);
+    expect(text).toMatch(/Never use skip-permission flags/);
+  });
+
   it('every we: path it links to resolves', () => {
     const text = readFileSync(SKILL, 'utf8');
     const paths = [...text.matchAll(/`we:([^`\s]+)`/g)].map((m) => m[1]);

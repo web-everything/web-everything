@@ -8,8 +8,8 @@ description: Choose or run a provider CLI for a task - which provider to use, Cl
 Routing only. The method lives in the linked files; do not restate it here.
 
 - **`claude`** - the default seat for orchestration, judgment and review.
-- **`codex exec`** - code changes and audits. Run through `we:scripts/codex-direct-task.mjs`.
-- **`agy`** (Antigravity, the Gemini CLI) - an escape hatch when Claude or Codex quota is low, and web research. Run through `we:scripts/gemini-direct-task.mjs`; see the `use-gemini` skill.
+- **`codex exec`** - code changes (workspace-write) and read-only audits. Run through `we:scripts/codex-direct-task.mjs`; audits must pass `--review`.
+- **`agy`** (Antigravity, the Gemini CLI) - an escape hatch for one delegated coding task when Claude or Codex quota is low. It edits files and has no real sandbox. Run through `we:scripts/gemini-direct-task.mjs`; see the `use-gemini` skill. It is not a read-only research seat.
 
 Capability and permission differences per CLI: `we:docs/agent/agent-cli-capability-map.md`.
 
