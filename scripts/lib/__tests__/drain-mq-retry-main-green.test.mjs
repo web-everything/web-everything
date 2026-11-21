@@ -46,6 +46,7 @@ function fixture(runs, events = [removal()], mainHead = null) {
     if (endpoint?.startsWith(`repos/${repo}/actions/workflows/ci.yml/runs?`)) {
       const query = new URLSearchParams(endpoint.split('?')[1]);
       let selected = [...runs].sort((a, b) => Date.parse(b.created_at) - Date.parse(a.created_at) || b.id - a.id);
+      if (query.get('event')) selected = selected.filter(item => item.event === query.get('event'));
       if (query.get('status')) selected = selected.filter(item => item.status === query.get('status'));
       const before = query.get('created');
       if (before?.startsWith('<')) selected = selected.filter(item => Date.parse(item.created_at) < Date.parse(before.slice(1)));
@@ -175,5 +176,25 @@ describe('same-head retry judges main freshness by main HEAD, not wall-clock', (
     const f = fixture([old(102, 'success', mainHead)]);
     expect(f.guard().hold).toBe(true);
     expect(f.declineLog()).toMatch(/stale/i);
+  });
+});
+
+describe('hourly main backstop retry evidence', () => {
+  beforeEach(() => { vi.useFakeTimers(); vi.setSystemTime(now); });
+  afterEach(() => vi.useRealTimers());
+  it('newer schedule failure invalidates a real push success', () => {
+    const scheduled = { ...run(103, 'failure', '2026-11-01T13:40:00Z'), event: 'schedule', head_sha: head };
+    expect(fixture([run(102), scheduled], [removal()], head).guard().hold).toBe(true);
+  });
+  it('schedule success is green for the current main head', () => {
+    const scheduled = { ...run(103), event: 'schedule', head_sha: head };
+    expect(fixture([scheduled], [removal()], head).guard().hold).toBe(false);
+  });
+  it('unknown main head cannot authorize a schedule success', () => {
+    expect(fixture([{ ...run(103), event: 'schedule', head_sha: head }]).guard().hold).toBe(true);
+  });
+  it('old-SHA schedule success cannot clear a current-head failure', () => {
+    const scheduled = { ...run(103, 'success', '2026-11-01T13:40:00Z'), event: 'schedule', head_sha: 'e'.repeat(40) };
+    expect(fixture([{ ...run(102, 'failure'), head_sha: head }, scheduled], [removal()], head).guard().hold).toBe(true);
   });
 });

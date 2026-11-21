@@ -1,5 +1,27 @@
 # Testing — Three-Tier Strategy
 
+Main push CI can reuse a successful `ci.yml` merge-group run only for the exact SHA,
+with a trusted check-suite app, no other non-success (including older-id reruns), a proven fast-forward and the
+same recorded FUI SHA. The downloaded, unexpired sibling record must match the queue SHA, run id,
+latest `run_attempt`, `queue-reuse-record` producer and successful conclusion. Queue sibling records publish only after full CI and unquarantined
+execution receipts from every unit, integration and soak leg; missing/unknown receipts publish no record.
+Reusing pushes export and record that verified FUI SHA for their remaining sibling checkouts.
+The latest producing queue attempt's `run_started_at` must be known, non-future and within two hours;
+a later job completion or `updated_at` change never renews reuse.
+`mainPushSkip.maxAgeMs` (platform/tool policy) and `WE_CI_MAIN_PUSH_SKIP_MAX_AGE_MS`
+(environment; CI repository variable of the same name) can shorten this limit; invalid
+or larger values are rejected, retaining the lower-layer value (two hours by default).
+Effective values and sources are logged. Unknown or old evidence runs full CI.
+The hourly schedule is isolated from push concurrency and always runs full CI.
+A reused main push deliberately fails the non-required `main-execution` job: the
+drain reads the overall run conclusion and must never count reuse as fresh
+main-green. Required `test`, `smoke` and `daemon-soak` checks keep their PR/MQ behavior.
+Wait for the hourly backstop or next full run for fresh evidence.
+`scripts/ci/__tests__/main-push-green-evidence.test.mjs` probes the real exported drain
+guard with injected skipped-push evidence and a successful full-push control.
+Timing refresh accepts queue runs only with main ancestry or a matching main push SHA.
+`scripts/ci/__tests__/main-push-skip*.test.mjs` covers the decision, CLI and workflow.
+
 ## Review PR fetch isolation (R37)
 
 Review PR transport runs in a fresh temporary bare repository with empty global/system
@@ -5753,6 +5775,32 @@ to isolate the reset-time status/ahead probes. Cover both transient recovery and
 refusal, and assert no checkout/reset/clean follows a failed probe. The bounded process
 reader wraps the original stderr in `ProcReadError.cause`; preserve that stderr (or the
 spawn error message) in probe diagnostics rather than reporting zero counts as proof.
+
+## Main CI schedules and timing receipts
+
+Merge admission and both same-head retry evidence paths judge main's push and scheduled
+`ci.yml` runs together. A newer scheduled failure invalidates an older push success;
+PR events are excluded even when their head branch is named `main`.
+Queue timing candidates also require `unquarantined` execution receipts from every unit,
+integration and soak matrix leg, matching the queue reuse proof. Missing or unreadable
+receipts skip the candidate; the bounded search retains the explicit `--run=<id>` fallback.
+Scoped regressions live in `red-main-freeze-shared.test.mjs`, `drain-mq-retry-main-green.test.mjs`,
+`drain-queue-safety-same-head-retry.test.mjs` and `refresh-timings.test.mjs`.
+
+## Main-green execution proof (PR #7224)
+
+Successful unit-shard jobs alone do not prove tests ran: light pushes report success via
+`Card-only unit scope receipt` while unit steps are skipped. Drain readers require successful
+unit-step evidence on every shard; missing or unknown steps use the same-SHA queue evidence
+path and its age bound. The reused-main-green age setting may only shorten the two-hour
+standard; oversized values are ignored and logged by the policy cascade. Keep production-shaped
+light fixtures and negative age tests in `main-execution-evidence.test.mjs` and
+`drain-mq-retry-main-green.test.mjs`.
+
+The tip required-check fallback also requires the completed `main-execution` marker
+(success or conditional skip). A failed or absent marker supplies no fresh push evidence.
+Hourly evidence is restricted to the live main head SHA; an unreadable head retains the hold.
+`main-red-evidence-regressions.test.mjs` covers these negative paths and attempt-start expiry.
 
 ## Async drain worker CLI fixtures
 

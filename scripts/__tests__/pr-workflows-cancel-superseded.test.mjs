@@ -12,6 +12,10 @@ const workflowFiles = selectWorkflowFiles(readdirSync(workflowsDir));
 // Pin the existing merge-gate exception: unwatched label events and non-PR/manual
 // runs intentionally get unique keys. No other run-specific group is exempt.
 const mergeGateGroup = "merge-gate-${{ (github.event.action == 'labeled' || github.event.action == 'unlabeled') && github.event.label.name != 'ready-to-merge' && github.event.label.name != 'gate:refresh' && !startsWith(github.event.label.name, 'review:') && !startsWith(github.event.label.name, 'red-team:') && format('unwatched-{0}', github.run_id) || github.event.pull_request.number || github.event.merge_group.head_sha || github.run_id }}";
+// The hourly CI backstop has a stable, separate group. Pin both expressions so
+// this exception cannot admit arbitrary suffixes or cancellation conditions.
+const scheduledMainGroup = "ci-${{ github.ref }}-${{ github.event_name == 'schedule' && 'schedule' || 'events' }}";
+const scheduledMainCancel = "${{ github.event_name != 'schedule' && github.ref != 'refs/heads/main' }}";
 
 function prConcurrencyViolations(text) {
   // Parse once so aliases, merge keys, flow mappings and quoted scalars all have
@@ -37,6 +41,8 @@ function prConcurrencyViolations(text) {
   if (!concurrency) return ['missing top-level concurrency'];
   const group = concurrency.group;
   const cancel = concurrency['cancel-in-progress'];
+  const scheduledMainException = hasPr && !hasTarget && events.includes('push') && events.includes('schedule')
+    && group === scheduledMainGroup && cancel === scheduledMainCancel;
   const violations = [];
   // Groups are global across workflows: require a workflow-specific literal
   // prefix ending in - or : before exactly one expression. Only bare keys
@@ -49,11 +55,12 @@ function prConcurrencyViolations(text) {
   if (hasPr && !hasTarget) prKeys.push('github.ref');
   const allowedKeys = [...prKeys, 'github.event.merge_group.head_sha', 'github.run_id'];
   const allowedGroup = prKeys.includes(keys[0]) && keys.every((key) => allowedKeys.includes(key));
-  if (group !== mergeGateGroup && !allowedGroup) {
+  if (group !== mergeGateGroup && !allowedGroup && !scheduledMainException) {
     violations.push('concurrency group must include a PR-specific key');
   }
   // Fail closed on unknown expressions: this is the documented main exception.
-  const mainException = hasPr && !hasTarget && cancel === "${{ github.ref != 'refs/heads/main' }}";
+  const mainException = (hasPr && !hasTarget && cancel === "${{ github.ref != 'refs/heads/main' }}")
+    || scheduledMainException;
   if (cancel !== true && !mainException) {
     violations.push('cancel-in-progress must be true or the main-ref exception');
   }
@@ -290,6 +297,39 @@ describe('PR concurrency checker self-tests', () => {
     const workflow = concurrencyFixture('ci-${{ github.ref }}', "${{ github.ref != 'refs/heads/main' }}")
       .replace('  pull_request:', '  push:\n    branches: [main]\n  pull_request:');
     expect(prConcurrencyViolations(workflow)).toEqual([]);
+  });
+
+  const scheduledMainFixture = concurrencyFixture(scheduledMainGroup, scheduledMainCancel)
+    .replace('  pull_request:', '  push:\n    branches: [main]\n  schedule:\n    - cron: "23 * * * *"\n  pull_request:');
+
+  it('accepts the exact scheduled main exception with stable PR cancellation and isolated backstop runs', () => {
+    expect(prConcurrencyViolations(scheduledMainFixture)).toEqual([]);
+    const evaluate = (expression, github) => Function('github', `return (${expression});`)(github);
+    const groupFor = (event_name, ref, run_id = 1) => scheduledMainGroup.replace(/\$\{\{(.*?)\}\}/g,
+      (_, expression) => evaluate(expression, { event_name, ref, run_id }));
+    const cancels = (event_name, ref) => evaluate(scheduledMainCancel.slice(3, -2), { event_name, ref });
+    expect(groupFor('schedule', 'refs/heads/main')).not.toBe(groupFor('push', 'refs/heads/main'));
+    expect(cancels('push', 'refs/heads/main')).toBe(false);
+    expect(cancels('schedule', 'refs/heads/main')).toBe(false);
+    expect(cancels('schedule', 'refs/heads/feature')).toBe(false);
+    expect(cancels('pull_request', 'refs/pull/1/merge')).toBe(true);
+    expect(groupFor('pull_request', 'refs/pull/1/merge')).not.toBe(groupFor('pull_request', 'refs/pull/2/merge'));
+    expect(groupFor('pull_request', 'refs/pull/1/merge', 1)).toBe(groupFor('pull_request', 'refs/pull/1/merge', 2));
+  });
+
+  it.each([
+    ['missing schedule trigger', '  schedule:\n    - cron: "23 * * * *"\n', ''],
+    ['missing push trigger', '  push:\n    branches: [main]\n', ''],
+    ['target event', '  pull_request:', '  pull_request_target:'],
+    ['fork-ambiguous key', 'github.ref }}', 'github.head_ref }}'],
+    ['run-specific suffix', scheduledMainGroup, `${scheduledMainGroup}-\${{ github.run_id }}`],
+    ['inverted isolation', "== 'schedule'", "!= 'schedule'"],
+    ['schedule/main group collision', "'schedule' || 'events'", "'events' || 'events'"],
+    ['main cancellation', scheduledMainCancel, 'true'],
+    ['PR cancellation disabled', scheduledMainCancel, 'false'],
+    ['unsafe cancellation disjunction', "!= 'schedule' &&", "!= 'schedule' ||"],
+  ])('refuses the scheduled exception with %s', (_name, before, after) => {
+    expect(prConcurrencyViolations(scheduledMainFixture.replace(before, after))).not.toEqual([]);
   });
 
   it.each(['false', '', '"true"', "${{ github.ref != 'refs/heads/release' }}", "${{ false && github.ref != 'refs/heads/main' }}"])(

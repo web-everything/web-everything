@@ -16,6 +16,10 @@ import { allowedCommand } from '../../readiness/forge-exec-run.mjs';
 import { runRemote } from '../../readiness/remote-exec.mjs';
 import { runScratchForgeCase, scratchGitBinding, scratchTestOutput } from '../../conveyor/soak/breaks/scratch-tests-forge-command.mjs';
 
+// These cases create real Git repos and run fetch/merge/adoption sequences, like
+// daemon-rebuild.test.mjs. Allow loaded CI shards the same finite per-test budget.
+vi.setConfig({ testTimeout: 60_000 });
+
 const temps = [];
 const temp = () => { const p = fs.mkdtempSync(join(tmpdir(), 'we-auto-test-')); temps.push(p); return p; };
 afterEach(() => { vi.restoreAllMocks(); vi.useRealTimers(); temps.splice(0).forEach(p => fs.rmSync(p, { recursive: true, force: true })); });

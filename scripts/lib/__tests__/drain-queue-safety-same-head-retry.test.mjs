@@ -367,7 +367,7 @@ describe('merge-queue exact-test extra retry after two failed_checks removals', 
         return page(endpoint, 'check_runs', f.headChecks);
       if (path.endsWith('/actions/workflows/ci.yml/runs')) {
         const query = new URLSearchParams(endpoint.split('?')[1]);
-        const runs = f.mainRuns.filter(r => (!query.has('status') || r.status === query.get('status'))
+        const runs = f.mainRuns.filter(r => (!query.has('event') || r.event === query.get('event')) && (!query.has('status') || r.status === query.get('status'))
           && (!query.has('created') || Date.parse(r.created_at) < Date.parse(query.get('created').slice(1))));
         return JSON.stringify({ total_count: runs.length, workflow_runs: runs });
       }
@@ -437,6 +437,24 @@ describe('merge-queue exact-test extra retry after two failed_checks removals', 
   it('#6903 allows exact-test retry 2/2 from structured reports without classifying over-long log lines', () => exactFixture(f => {
     expect(f.logs[31].split('\n')[0].length).toBeGreaterThan(512);
     expectExtraRetry(f);
+  }));
+
+  it('exact retry refuses a newer hourly failure after push success', () => exactFixture(f => {
+    f.mainRuns.push({ ...f.runs[900], id: 901, event: 'schedule', conclusion: 'failure', created_at: iso(removedAt + 700_000) });
+    expectExactHold(f);
+  }));
+  it('exact retry accepts an hourly success on current main head', () => exactFixture(f => {
+    f.runs[900].event = 'schedule';
+    expectExtraRetry(f);
+  }));
+  it('exact retry refuses hourly success with an unreadable main head', () => exactFixture(f => {
+    f.runs[900].event = 'schedule'; f.mainHead = null;
+    expectExactHold(f);
+  }));
+  it('exact retry never clears current red with an old-SHA hourly success', () => exactFixture(f => {
+    f.runs[900].conclusion = 'failure';
+    f.mainRuns.push({ ...f.runs[900], id: 901, event: 'schedule', head_sha: prior, conclusion: 'success', created_at: iso(removedAt + 700_000) });
+    expectExactHold(f);
   }));
 
   const closedCases = [
