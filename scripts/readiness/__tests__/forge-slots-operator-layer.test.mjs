@@ -31,6 +31,9 @@ describe('forge-slots sensitive leaves live in the operator layer', () => {
     const s = {forgeSlots: {default: 8, hosts: {}}};
     expect(() => mergeOperatorHosts(s, {hosts: []})).toThrow('forgeSlots operator hosts');
     expect(() => mergeOperatorHosts(s, 'x')).toThrow('forgeSlots operator hosts');
+    expect(() => mergeOperatorHosts(s, null)).toThrow('forgeSlots operator hosts');
+    expect(() => mergeOperatorHosts({forgeSlots: {default: 8, hosts: []}}, {hosts: {a: 2}})).toThrow('must be an object');
+    expect(() => mergeOperatorHosts({forgeSlots: {default: 8, hosts: {b: 0}}}, {hosts: {b: 2}})).toThrow();
   });
   it('CLI resolves a host size from the operator file and the default when absent', () => {
     const dir = mkdtempSync(join(tmpdir(), 'fs-op-')); scratch.push(dir);

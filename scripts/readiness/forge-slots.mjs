@@ -24,8 +24,11 @@ export function resolveForgeSlots(settings, {env = {}, host = ''} = {}) {
 
 /** Overlay the operator layer's per-host sizes (policy-cascade platform preference `forgeSlots`) on the repo settings. */
 export function mergeOperatorHosts(settings, operator) {
-  if (operator === undefined || operator === null) return settings;
-  if (typeof operator !== 'object' || Array.isArray(operator)) throw new Error('forgeSlots operator hosts must be an object');
+  if (operator === undefined) return settings;
+  const own = settings?.forgeSlots?.hosts;
+  if (own !== undefined && (!own || typeof own !== 'object' || Array.isArray(own))) throw new Error('forgeSlots.hosts must be an object');
+  for (const [name, value] of Object.entries(own ?? {})) checked(value, 'forgeSlots.hosts.' + name);
+  if (operator === null || typeof operator !== 'object' || Array.isArray(operator)) throw new Error('forgeSlots operator hosts must be an object');
   const hosts = operator.hosts;
   if (hosts === undefined) return settings;
   if (!hosts || typeof hosts !== 'object' || Array.isArray(hosts)) throw new Error('forgeSlots operator hosts must be an object');
@@ -34,7 +37,10 @@ export function mergeOperatorHosts(settings, operator) {
 
 async function operatorLayer() {
   let cascade;
-  try { cascade = await import('../lib/policy-cascade.mjs'); } catch { return undefined; } // flat Forge deployment: no cascade module
+  try { cascade = await import('../lib/policy-cascade.mjs'); } catch (error) {
+    if (error?.code === 'ERR_MODULE_NOT_FOUND' && String(error.message).includes('policy-cascade')) return undefined; // flat Forge deployment: no cascade module
+    throw error;
+  }
   const {prefs, errors} = cascade.readPlatformPreferences({warn: () => {}});
   if (errors.length) throw new Error('operator layer unreadable');
   return prefs.forgeSlots;
