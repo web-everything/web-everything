@@ -8,8 +8,9 @@ const oid = value => typeof value === 'string' && /^[a-f0-9]{40}$/i.test(value) 
 const id = value => Number.isSafeInteger(value) && value > 0;
 const full = reason => ({ skip: false, reason: `${reason}; running full CI` });
 const success = run => run.status === 'completed' && run.conclusion === 'success';
-const queueRun = runs => runs.filter(r => r.path === '.github/workflows/ci.yml'
-  && r.event === 'merge_group' && success(r)).sort((a, b) => b.id - a.id)[0];
+const ciRuns = runs => runs.filter(r => r.path === '.github/workflows/ci.yml');
+const queueRun = runs => ciRuns(runs).filter(r => r.event === 'merge_group' && success(r))
+  .sort((a, b) => b.id - a.id)[0];
 
 const MAX_AGE_MS = 2 * 60 * 60 * 1000;
 export function readMainPushSkipPolicy({ env = process.env, platform, tool, log = console.error } = {}) {
@@ -38,7 +39,7 @@ export function decideMainPushSkip(input = {}) {
     const queue = queueRun(rows);
     if (!queue || !queue.head_branch.startsWith('gh-readonly-queue/main/')
       || queue.check_suite?.app?.id !== 15368) return full('no trusted successful queue run');
-    const others = rows.filter(r => r.id !== currentRunId);
+    const others = ciRuns(rows).filter(r => r.id !== currentRunId);
     if (others.some(r => !success(r) || r.id > queue.id && r.check_suite?.app?.id !== 15368)) return full('another run invalidates queue success');
     if (!oid(queueFuiSha) || !oid(fuiTip) || oid(queueFuiSha) !== oid(fuiTip)) return full('FUI sibling proof missing or changed');
     const { value: { maxAgeMs } } = readMainPushSkipPolicy(input);
@@ -115,7 +116,8 @@ export function main(argv) {
     const runs = pages(`actions/runs?head_sha=${args.sha}`, 'workflow_runs');
     const queue = queueRun(runs.workflow_runs);
     if (!queue || !id(queue.id)) return full('no successful queue run');
-    for (const run of runs.workflow_runs.filter(r => r.id >= queue.id && r.id !== Number(args['run-id']))) {
+    // Foreign workflows neither veto CI reuse nor spend its producer-proof budget.
+    for (const run of ciRuns(runs.workflow_runs).filter(r => r.id >= queue.id && r.id !== Number(args['run-id']))) {
       if (!id(run.check_suite_id)) throw Error('unreadable check suite identity');
       run.check_suite = api(`check-suites/${run.check_suite_id}`);
     }

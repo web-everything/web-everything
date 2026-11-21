@@ -7,10 +7,18 @@ import { fileURLToPath } from 'node:url';
 import { spawnSync } from 'node:child_process';
 const recorded = readFileSync(new URL('./fixtures/main-push-runs.json', import.meta.url), 'utf8');
 const sha = 'a'.repeat(40), fui = 'b'.repeat(40);
-it.each([['mismatched artifact content', { WRONG_SHA: 'd'.repeat(40) }], ['expired artifact', { EXPIRED: '1' }], ['record from an older attempt', { OLD_ATTEMPT: '1' }]])('CLI fails closed on %s', (_, negative) => {
+it.each([['mismatched artifact content', { WRONG_SHA: 'd'.repeat(40) }], ['expired artifact', { EXPIRED: '1' }], ['record from an older attempt', { OLD_ATTEMPT: '1' }]])('CLI reuses CI alongside foreign workflows and fails closed on %s', (_, negative) => {
   const dir = mkdtempSync(join(tmpdir(), 'main-skip-'));
   try {
     const fresh = JSON.parse(recorded); fresh.workflow_runs[0].run_started_at = new Date(Date.now() - 60000).toISOString();
+    // Other workflows share the SHA inventory but cannot veto ci.yml reuse or
+    // consume check-suite reads. Deliberately omit their check_suite_id.
+    fresh.workflow_runs.push(
+      { ...fresh.workflow_runs[1], id: 102, path: '.github/workflows/test-selection-measure.yml', check_suite_id: undefined },
+      { ...fresh.workflow_runs[0], id: 103, path: '.github/workflows/merge-gate.yml', conclusion: 'skipped', check_suite_id: undefined },
+      { ...fresh.workflow_runs[0], id: 104, path: '.github/workflows/soak-replay-gate.yml', conclusion: 'cancelled', check_suite_id: undefined },
+    );
+    fresh.total_count = fresh.workflow_runs.length;
     writeFileSync(join(dir, 'runs.json'), JSON.stringify(fresh));
     writeFileSync(join(dir, 'gh'), `#!/usr/bin/env node
 if (process.env.API_ERROR) process.exit(1);

@@ -5914,6 +5914,10 @@ or a later push intentionally makes the commits tip or live head differ.
 ## Main push reuse: planned 24-hour acceptance check
 
 `main-push-reuse-24h` is the named post-merge acceptance report for PR #7224.
+Its scripted checker and fixture tests are tracked by
+[#x0002e6](/backlog/x0002e6-script-main-push-reuse-24h-acceptance-report/).
+The acceptance-to-test mapping gate is tracked by
+[#5668](/backlog/5668-prevention-add-a-deterministic-card-gate-requiring-each-beha/).
 The operator collects a complete 24-hour window after deployment, plus the preceding
 24-hour baseline, with UTC window boundaries and immutable run IDs/attempts for every
 `ci.yml` push, merge-group and scheduled run. Include exact head SHAs, reuse decisions

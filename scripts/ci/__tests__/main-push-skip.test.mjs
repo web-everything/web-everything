@@ -45,7 +45,7 @@ describe('exact-SHA main push reuse', () => {
     ['direct push', x => { x.runs.workflow_runs.shift(); x.runs.total_count--; }],
     ['failure after success', x => x.runs.workflow_runs.push({ ...x.runs.workflow_runs[0], id: 102, conclusion: 'failure' }) && x.runs.total_count++],
     ['newer queued run', x => x.runs.workflow_runs.push({ ...x.runs.workflow_runs[1], id: 102 }) && x.runs.total_count++],
-    ['newer success from another producer', x => x.runs.workflow_runs.push({ ...x.runs.workflow_runs[0], id: 102, check_suite: { app: { id: 42 } } }) && x.runs.total_count++],
+    ['newer non-queue success from another producer', x => x.runs.workflow_runs.push({ ...x.runs.workflow_runs[0], id: 102, event: 'workflow_dispatch', head_branch: 'main', check_suite: { app: { id: 42 } } }) && x.runs.total_count++],
     ['unreadable check suite', x => { delete x.runs.workflow_runs[0].check_suite; }],
     ['wrong workflow', x => { x.runs.workflow_runs[0].path = '.github/workflows/other.yml'; }],
     ['moved FUI tip', x => { x.fuiTip = 'd'.repeat(40); }],
@@ -78,6 +78,18 @@ describe('exact-SHA main push reuse', () => {
   it('excludes the current in-progress push from the newer non-success scan', async () => {
     expect((await decide(input())).skip).toBe(true);
     const x = input(); x.currentRunId = 999; expect((await decide(x)).skip).toBe(false);
+  });
+  it.each([
+    ['queued push', { event: 'push', status: 'queued', conclusion: null }],
+    ['in-progress push', { event: 'push', status: 'in_progress', conclusion: null }],
+    ['skipped queue run', { event: 'merge_group', status: 'completed', conclusion: 'skipped' }],
+    ['cancelled queue run', { event: 'merge_group', status: 'completed', conclusion: 'cancelled' }],
+    ['foreign producer success', { event: 'workflow_dispatch', status: 'completed', conclusion: 'success', check_suite: { app: { id: 42 } } }],
+  ])('ignores another workflow with a %s', async (_, fields) => {
+    const x = input();
+    x.runs.workflow_runs.push({ ...x.runs.workflow_runs[0], id: 102, path: '.github/workflows/other.yml', ...fields });
+    x.runs.total_count++;
+    expect((await decide(x)).skip).toBe(true);
   });
   it.each(['merge_group', 'push', 'workflow_dispatch', 'pull_request'])('runs full for an older-id failed or unfinished %s rerun (finding 3)', async event => {
     for (const status of ['completed', 'in_progress']) {
