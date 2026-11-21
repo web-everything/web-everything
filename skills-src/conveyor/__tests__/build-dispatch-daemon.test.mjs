@@ -4417,6 +4417,19 @@ describe('grouped PREPARE daemon ticks', () => {
       await runBuildDispatchTick({ live: true, effects });
       expect(launchedNums(effects)).toContain('7201');
     });
+    it.each([
+      ['bornAs on both records', { bornAs: 'xabcdef0' }, { bornAs: 'xabcdef0' }],
+      ['bornAs on queue only', { bornAs: 'xabcdef0' }, {}],
+      ['bornAs on spawn only', {}, { bornAs: 'xabcdef0' }],
+      ['durable card id', { id: 'xabcdef0-prepare-card' }, {}],
+    ])('prepares a card listed by its %s', async (_label, queueIdentity, spawnIdentity) => {
+      const queue = [{ ...rows[0], ...queueIdentity }, rows[1]];
+      const effects = fixture({ queue, spawns: [{ ...rows[0], ...spawnIdentity }, rows[1]] });
+      effects.readRuntimePriority = () => only(['xabcdef0']);
+      const tick = await runBuildDispatchTick({ live: true, effects });
+      expect(launchedNums(effects)).toEqual(['7201']);
+      expect(tick.prepare.skippedInPlanning).toEqual([{ num: '7202', reason: 'not-in-runtime-only-list' }]);
+    });
     it('leaves a non-only mode alone', async () => {
       const lift = fixture({ spawns: [rows[0]] });
       lift.readRuntimePriority = () => ({ ids: ['7299'], source: 'runtime', mode: 'lift', only: false });

@@ -9,14 +9,14 @@ const NOW = Date.parse('2026-11-20T18:00:00Z');
 const readList = ageHours => readBuildPrioritySettings({ env: {}, read: () => ({}), runtimePath: '/x', now: () => NOW,
   readRuntime: () => JSON.stringify({ ids: ['2'], mode: 'only', setBy: 'soak', ttlHours: 5, at: new Date(NOW - ageHours * 3600e3).toISOString() }) });
 
-async function launched(settings) {
-  const rows = ['1', '2'].map(num => ({ num, scope: [`we:scripts/soak/f${num}.mjs`] }));
+async function launched(settings, rows = ['1', '2'].map(num => ({ num, scope: [`we:scripts/soak/f${num}.mjs`] }))) {
   const dispatched = [];
   const effects = {
     planTick: () => ({ decisions: { spawnPrepareItems: rows, admission: { queue: rows, cleared: [],
       held: rows.map(r => ({ num: r.num, reason: 'needs-prepare' })) } }, nextState: {} }),
     fetchOpenPrs: () => [], listClaims: () => [], listRunStoreInFlight: () => [], killSwitch: () => ({ engaged: false }),
     listHolds: () => [], listPrepareInFlight: () => [], listPrepareClaims: () => [],
+    listPreparePrs: () => [],
     readPrepareStatus: () => ({ preparedDate: null }), readPreparedStamp: () => ({ preparedDate: null }),
     acquirePrepareClaim: () => ({ ok: true }), releasePrepareClaim: () => ({}), placePrepareHold: () => {},
     dispatch: args => { dispatched.push(args.num); return { dispatching: true, lane: 1 }; },
@@ -31,6 +31,16 @@ export async function replay() {
   const violations = [];
   const only = await launched(readList(1));
   if (only.join() !== '2') violations.push(`only mode prepared off-list ids: ${only.join()}`);
+  const aliases = readBuildPrioritySettings({ env: {}, read: () => ({}), runtimePath: '/x', now: () => NOW,
+    readRuntime: () => JSON.stringify({ ids: ['xabcdef0'], mode: 'only', setBy: 'soak', ttlHours: 5, at: new Date(NOW - 3600e3).toISOString() }) });
+  const aliasRows = [
+    { num: '7201', bornAs: 'xabcdef0', scope: ['we:scripts/soak/alias.mjs'] },
+    { num: '7202', scope: ['we:scripts/soak/off-list.mjs'] },
+  ];
+  for (let tick = 1; tick <= 2; tick++) {
+    const prepared = await launched(aliases, aliasRows);
+    if (prepared.join() !== '7201') violations.push(`alias-only tick ${tick} prepared ${prepared.join() || 'nothing'}; expected 7201`);
+  }
   if ((await launched({ ids: [], only: true, held: true })).length) violations.push('unreadable list did not fail closed');
   const expired = readList(10);
   if (expired.only || !/runtime list expired at .* ET/.test(expired.runtime?.line ?? '')) violations.push('expired list was still applied or not reported');

@@ -564,8 +564,10 @@ async function runTimedBuildDispatchTick({ bookkeeping = {}, live = false, polic
     if (settings?.runtime?.expired && settings.runtime.line) console.error(`build-dispatch-daemon: ${settings.runtime.line}`);
     if (!settings || typeof settings !== 'object' || settings.held || settings.only) {
       const reason = !settings || settings.held ? 'runtime-list-unreadable' : 'not-in-runtime-only-list';
-      const candidates = [...new Set([...(out?.decisions?.admission?.queue ?? []), ...(out?.decisions?.spawnPrepareItems ?? out?.decisions?.itemPrepareSpawns ?? [])].map(r => normNum(r.num)))];
-      for (const num of candidates) if (!decideRuntimeAdmission({ num }, 'prepare', settings).admitted) runtimeOffList.add(num);
+      const candidates = [...(out?.decisions?.admission?.queue ?? []), ...(out?.decisions?.spawnPrepareItems ?? out?.decisions?.itemPrepareSpawns ?? [])];
+      // Preserve durable aliases; a minimal duplicate must not veto an admitted full card.
+      const admitted = new Set(candidates.filter(card => decideRuntimeAdmission(card, 'prepare', settings).admitted).map(card => normNum(card.num)));
+      for (const card of candidates) if (!admitted.has(normNum(card.num))) runtimeOffList.add(normNum(card.num));
       const planned = new Set((out?.decisions?.spawnPrepareItems ?? out?.decisions?.itemPrepareSpawns ?? []).map(r => normNum(r.num)));
       for (const num of runtimeOffList) if (planned.has(num)) planningSkips.push({ num, reason });
       if (runtimeOffList.size) {
