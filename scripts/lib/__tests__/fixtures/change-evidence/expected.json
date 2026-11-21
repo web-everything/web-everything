@@ -90,6 +90,7 @@
           },
           "provenanceTier": "replayed",
           "native": {
+            "producer": "https://github.com/apps/github-actions",
             "name": "test",
             "id": 136827648978,
             "conclusion": "success",
@@ -105,6 +106,7 @@
           },
           "provenanceTier": "replayed",
           "native": {
+            "producer": "https://github.com/apps/github-actions",
             "name": "smoke",
             "id": 136827203989,
             "conclusion": "success",
@@ -120,6 +122,7 @@
           },
           "provenanceTier": "replayed",
           "native": {
+            "producer": "https://github.com/apps/github-actions",
             "name": "daemon-soak",
             "id": 136831615000,
             "conclusion": "success",
@@ -135,6 +138,7 @@
           },
           "provenanceTier": "replayed",
           "native": {
+            "producer": "https://github.com/apps/github-actions",
             "name": "soak-replay-gate",
             "id": 136827133200,
             "conclusion": "success",
@@ -150,6 +154,7 @@
           },
           "provenanceTier": "replayed",
           "native": {
+            "producer": "https://github.com/apps/github-actions",
             "name": "merge-gate",
             "id": 136827133040,
             "conclusion": "success",
@@ -165,6 +170,7 @@
           },
           "provenanceTier": "asserted",
           "native": {
+            "producer": "https://github.com/apps/plateau-reviewer",
             "actor": "https://github.com/apps/plateau-reviewer",
             "at": "2026-11-21T09:43:17Z",
             "commentId": 7060763767,
@@ -180,6 +186,7 @@
           },
           "provenanceTier": "asserted",
           "native": {
+            "producer": "https://github.com/apps/plateau-merger",
             "actor": "https://github.com/apps/plateau-merger",
             "at": "2026-11-21T10:24:16Z",
             "commentId": 7061210203,
@@ -195,6 +202,7 @@
           },
           "provenanceTier": "asserted",
           "native": {
+            "producer": "https://github.com/apps/plateau-reviewer",
             "actor": "https://github.com/apps/plateau-reviewer",
             "label": "review:accepted",
             "at": "2026-11-21T09:43:20Z",
@@ -232,6 +240,7 @@
               },
               "provenanceTier": "replayed",
               "native": {
+                "producer": "https://github.com/apps/github-actions",
                 "name": "test",
                 "id": 136827648978,
                 "conclusion": "success",
@@ -247,6 +256,7 @@
               },
               "provenanceTier": "replayed",
               "native": {
+                "producer": "https://github.com/apps/github-actions",
                 "name": "smoke",
                 "id": 136827203989,
                 "conclusion": "success",
@@ -262,6 +272,7 @@
               },
               "provenanceTier": "replayed",
               "native": {
+                "producer": "https://github.com/apps/github-actions",
                 "name": "daemon-soak",
                 "id": 136831615000,
                 "conclusion": "success",
@@ -277,6 +288,7 @@
               },
               "provenanceTier": "replayed",
               "native": {
+                "producer": "https://github.com/apps/github-actions",
                 "name": "soak-replay-gate",
                 "id": 136827133200,
                 "conclusion": "success",
@@ -292,6 +304,7 @@
               },
               "provenanceTier": "replayed",
               "native": {
+                "producer": "https://github.com/apps/github-actions",
                 "name": "merge-gate",
                 "id": 136827133040,
                 "conclusion": "success",
@@ -329,6 +342,7 @@
               },
               "provenanceTier": "asserted",
               "native": {
+                "producer": "https://github.com/apps/plateau-reviewer",
                 "actor": "https://github.com/apps/plateau-reviewer",
                 "at": "2026-11-21T09:43:17Z",
                 "commentId": 7060763767,
@@ -344,6 +358,7 @@
               },
               "provenanceTier": "asserted",
               "native": {
+                "producer": "https://github.com/apps/plateau-merger",
                 "actor": "https://github.com/apps/plateau-merger",
                 "at": "2026-11-21T10:24:16Z",
                 "commentId": 7061210203,
@@ -381,6 +396,7 @@
               },
               "provenanceTier": "asserted",
               "native": {
+                "producer": "https://github.com/apps/plateau-reviewer",
                 "actor": "https://github.com/apps/plateau-reviewer",
                 "label": "review:accepted",
                 "at": "2026-11-21T09:43:20Z",
