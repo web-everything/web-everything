@@ -247,46 +247,6 @@ describe('CI gate mirroring fails closed', () => {
     ]);
   });
   const real = yaml.safeLoad(workflow);
-  it.each(['Record shard start', 'Measure shard resources'])(
-    'refuses changed or missing %s commands rather than trusting workflow text', name => {
-      const changed = yaml.safeLoad(workflow);
-      const steps = changed.jobs['test-shard'].steps;
-      const index = steps.findIndex(step => step.name === name);
-      expect(index).toBeGreaterThanOrEqual(0);
-      steps[index].run += '\necho unmirrored-command';
-      expect(() => ciGatePlan(yaml.safeDump(changed))).toThrow('update the urgent verification mirror');
-      steps.splice(index, 1);
-      expect(() => ciGatePlan(yaml.safeDump(changed))).toThrow('update the urgent verification mirror');
-    });
-  it('pins the completed-shard timing validation script in the required test aggregator', () => {
-    const changed = yaml.safeLoad(workflow);
-    const step = changed.jobs.test.steps.find(step => step.name === 'PR shards finish below 1050 seconds with no new failures');
-    expect(step).toBeDefined();
-    step.with.script = step.with.script.replace('longest >= 1050', 'longest >= 99999');
-    expect(() => ciGatePlan(yaml.safeDump(changed))).toThrow('update the urgent verification mirror');
-  });
-  it('pins the four-worker rollout default and refuses a drift back to two', () => {
-    expect(real.jobs['test-shard'].env.WE_VITEST_MAX_WORKERS).toBe("${{ vars.WE_VITEST_MAX_WORKERS || '4' }}");
-    const changed = yaml.safeLoad(workflow);
-    changed.jobs['test-shard'].env.WE_VITEST_MAX_WORKERS = "${{ vars.WE_VITEST_MAX_WORKERS || '2' }}";
-    expect(() => ciGatePlan(yaml.safeDump(changed))).toThrow('test-shard execution context; update the urgent verification mirror');
-  });
-  it.each([undefined, false])('refuses to make the timing diagnostic blocking (%j)', value => {
-    const changed = yaml.safeLoad(workflow);
-    const step = changed.jobs.test.steps.find(step => step.name === 'PR shards finish below 1050 seconds with no new failures');
-    expect(step['continue-on-error']).toBe(true);
-    if (value === undefined) delete step['continue-on-error'];
-    else step['continue-on-error'] = value;
-    const mutatedWorkflow = yaml.safeDump(changed);
-    expect(() => ciGatePlan(mutatedWorkflow)).toThrow('update the urgent verification mirror');
-  });
-  it.each([undefined, {}, { actions: 'write' }])('refuses an unmirrored timing-check token permission %j', permissions => {
-    const changed = yaml.safeLoad(workflow);
-    if (permissions === undefined) delete changed.jobs.test.permissions;
-    else changed.jobs.test.permissions = permissions;
-    const mutatedWorkflow = yaml.safeDump(changed);
-    expect(() => ciGatePlan(mutatedWorkflow)).toThrow('test execution context; update the urgent verification mirror');
-  });
   const mirroredJobs = ['changes', 'test-shard', 'coverage-merge', 'host-paths', 'integration-part', 'integration', 'test', 'standards'];
   it.each([
     ['missing group', doc => { doc.jobs['integration-part'].strategy.matrix.group.pop(); }],
@@ -380,9 +340,7 @@ describe('CI gate mirroring fails closed', () => {
   const runSteps = Object.entries(real.jobs).filter(([job]) => mirroredJobs.includes(job))
     .flatMap(([job, spec]) => spec.steps.flatMap((step, index) => typeof step.run === 'string' ? [[job, index, step.name]] : []));
   it.each(runSteps)('refuses changed execution context for %s step %i (%s)', (job, index) => {
-    // The non-failing measurement step is mirrored as continue-on-error: true; flipping it must be refused too.
-    const coe = real.jobs[job].steps[index]['continue-on-error'] === true ? false : true;
-    for (const [key, value] of Object.entries({ 'working-directory': 'unexpected', env: { NODE_OPTIONS: '--require=unexpected' }, shell: 'bash', if: '${{ false }}', 'continue-on-error': coe })) {
+    for (const [key, value] of Object.entries({ 'working-directory': 'unexpected', env: { NODE_OPTIONS: '--require=unexpected' }, shell: 'bash', if: '${{ false }}', 'continue-on-error': true })) {
       const changed = yaml.safeLoad(workflow);
       changed.jobs[job].steps[index][key] = value;
       expect(() => ciGatePlan(yaml.safeDump(changed)), key).toThrow('unreadable-ci-gates');

@@ -22,10 +22,7 @@ export const weAlias = {
 // Each Vitest invocation defaults to max(1, min(4, floor(cpuCount / heavyCap))) workers.
 // The ceiling of 4 keeps the admission wait's fail-open third run at 3×4=12 cores on
 // the 12-core host; cpuCount / heavyCap only lowers that ceiling on small hosts.
-// GitHub CI accepts integer overrides 1–8; the workflow supplies the rollout default.
-// Local load limiters keep their existing finite >= 1, floored contract. Forge elastic
-// grants retain that contract even during CI=true dependency installation.
-// Invalid/unset values retain the cpu/heavy-cap rule above.
+// WE_VITEST_MAX_WORKERS overrides the default with any valid value >= 1 (rounded down).
 // Heavy-cap parsing matches heavy-admission.mjs#resolveCap (default 2), without importing
 // the admission module's whole import graph when loading a Vitest config.
 // Shared by the threads and forks pools; existing singleFork correctness pins stay serial.
@@ -38,11 +35,8 @@ function hostCpuCount(): number {
 }
 
 export function resolveMaxTestWorkers(env: Record<string, string | undefined> = process.env, cpuCount: number = hostCpuCount()): number {
-  const explicit = Number(env[VITEST_MAX_WORKERS_ENV]?.trim());
-  const forgeCpus = Number(env.FORGE_SLOT_CPUS);
-  const forgeGrant = Number.isInteger(forgeCpus) && forgeCpus >= 1 && explicit <= forgeCpus;
-  const ciOverrideValid = Number.isInteger(explicit) && explicit <= 8;
-  if (Number.isFinite(explicit) && explicit >= 1 && (env.CI !== 'true' || forgeGrant || ciOverrideValid)) return Math.floor(explicit);
+  const explicit = Number(env[VITEST_MAX_WORKERS_ENV]);
+  if (env[VITEST_MAX_WORKERS_ENV] !== '' && Number.isFinite(explicit) && explicit >= 1) return Math.floor(explicit);
   const capRaw = Number(env.WE_HEAVY_ADMISSION_CAP);
   const cap = Number.isFinite(capRaw) && capRaw >= 1 ? Math.floor(capRaw) : HEAVY_ADMISSION_DEFAULT_CAP;
   return Math.max(1, Math.min(DEFAULT_VITEST_MAX_WORKERS, Math.floor((Number(cpuCount) || 0) / cap)));
