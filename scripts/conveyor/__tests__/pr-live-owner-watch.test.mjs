@@ -1,5 +1,5 @@
 /** @file R863 ownership, safety, durable budgets, smells and health cadence regressions. */
-import { describe, it, expect, vi, afterEach } from 'vitest';
+import { describe, it, expect, vi, beforeAll, afterEach } from 'vitest';
 import { mkdtempSync, rmSync, readFileSync, writeFileSync, readSync, mkdirSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
@@ -343,6 +343,15 @@ describe('health-watch registration', () => {
 });
 
 describe('portable feed IO and settings', () => {
+  beforeAll(async () => {
+    // The real adapters lazily load these large module graphs. Keep cold transform/import
+    // setup outside the individual tests' assertion budget without replacing the adapters.
+    await Promise.all([
+      import('../../operations/manual-daemon-pass-io.mjs'),
+      import('../../operations/review-job.mjs'),
+      import('../reconcile-pass.mjs'),
+    ]);
+  }, 30_000);
   const dirs = []; afterEach(() => dirs.splice(0).forEach(dir => rmSync(dir, { recursive: true, force: true })));
   async function localIo(adapters = {}, now = NOW, dir, actEnabled = true, extraEnv = {}) {
     if (!dir) { dir = mkdtempSync(join(process.env.TMPDIR || tmpdir(), 'live-owner-')); dirs.push(dir); }
