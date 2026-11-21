@@ -1,12 +1,12 @@
 ---
 bornAs: x3tksez
 kind: story
-size: 2
+size: 3
 status: open
 scope: ["we:scripts/conveyor/reconcile-pass.mjs", "we:scripts/conveyor/__tests__/reconcile-pass.test.mjs", "we:scripts/conveyor/__tests__/reconcile-pass-required-checks.test.mjs", "we:scripts/lib/required-check-workflows.mjs", "we:scripts/lib/__tests__/required-check-workflows.test.mjs", "we:scripts/check-standards.mjs", "we:scripts/__tests__/check-standards.test.mjs", "we:scripts/operations/__tests__/pr-status*.test.mjs"]
 dateOpened: "2026-10-02"
-preparedDate: "2026-10-03"
-preparedAgainstSha: "8d35ab340afcdf11f1e14ab490fdf7943f458f61"
+preparedDate: "2026-11-21"
+preparedAgainstSha: "5162d6cb9bbc383cd23b82d8ebad9cf03c65ebd1"
 tags: []
 ---
 
@@ -20,6 +20,7 @@ Follow-up from the #3432 advisory (2026-10-02). A required check missing because
 - Corrected premise: `we:scripts/operations/pr-status.mjs#reduceCheckState` computes missing names but performs no IO. Pending and failing observed checks take precedence over missing names. A direct Node probe with successful `test` and required names `test, smoke` returned `unchecked` with `missing required checks: smoke`.
 - Source evidence: `we:scripts/conveyor/reconcile-pass.mjs#hydrateChecks` creates a new cache per pass, hydrates on missing names or 100 rows, and emits `check-read-failed` for missing names only when no required red/pending evidence speaks. `we:scripts/conveyor/reconcile-pass.mjs#runReconcilePass` fetches requirements for `defaultBranch`, not each PR base. `baseRefName` is already in its PR list fields. Thus a stacked PR can inherit the default-branch requirements even when its base is excluded by CI; this is not proof that GitHub protects that stacked base with the same set.
 - `we:.github/workflows/ci.yml` restricts `pull_request.branches` to `main` and defines the `test`, `smoke`, and `daemon-soak` jobs. `we:scripts/lib/required-status-checks.mjs` supplies live/cached requirements and repository-specific declared fallbacks. No workflow-eligibility comparison exists in the inspected hydration path or standards gate. These are checkout observations, not a claim about current live branch protection or an affected live PR.
+- Review correction (2026-11-21): `we:.github/workflows/ci.yml:46` now lists `pull_request.branches: [main, 'lane/**']`, so in this checkout stacked `lane/*` bases are eligible and no real excluded-base PR exists; the "main-only workflow" case is a synthetic fixture for the analyzer, and the card claims no live affected PR. `we:scripts/conveyor/reconcile-pass.mjs#hydrateChecks` already skips hydration for (a) a stacked PR under `stackedPolicy === 'await-base'` with all required names missing (notes `stacked-awaiting-base` / `stacked-base-orphaned`) and (b) a conflicting PR with all names missing. The new diagnostic must layer on these: it covers the cases they do not (non-stacked or partially-missing names, an excluded base outside the await-base policy), reuses their `notes` channel and dedup key, and never changes their skip behavior. Size raised 2→3 on this evidence (analyzer + sidecar cache + runtime wiring + standards rule across 8 scoped files). Design §6 (offline default-branch validation plus an explicit injected live mode) stays in scope as written.
 - Corrected scope: implement the diagnostic and read suppression in the reconciliation IO shell, with a shared proposed workflow-analysis/cache module and standards integration. Keep reducer semantics unchanged; retain its tests as regressions. The scoped workflow helper and its matching test are planned new files; the other scoped test paths exist. The old line citation is replaced by symbol references above.
 
 ## Design
@@ -35,7 +36,7 @@ Follow-up from the #3432 advisory (2026-10-02). A required check missing because
 
 - Deliver shared eligibility analysis, bounded evidence cache and cross-process diagnostic deduplication; wire reconciliation and standards validation in the scoped files.
 - Keep the four existing reducer states and required-name completeness rule. No workflow edits, protection changes, new merge exemptions, or change from default-branch policy to per-base policy.
-- Must: API, parse, mapping, freshness, or persistence errors retain ordinary fail-closed CI handling; known red/pending evidence survives, and missing required checks never become green.
+- Must: API, parse, mapping, freshness, or persistence errors retain ordinary fail-closed CI handling; known red/pending evidence survives, and this change adds no path by which a missing required name becomes green. Known pre-existing gap, not endorsed and not touched here: the reducer's implied-requirement rule (`integration` implied by a green `test`, `withoutImpliedRequiredChecks`) can already return green without a producer check; it is filed as the follow-up below.
 - Must: docs-only, configuration-only, data-only, source, and mixed diffs obey the same requirements. Changed-file classification cannot bypass checks or establish workflow eligibility.
 
 ## Test plan
@@ -48,10 +49,22 @@ Follow-up from the #3432 advisory (2026-10-02). A required check missing because
 
 ## Proof plan
 
-- Before implementation, add the two-tick replay in `we:scripts/conveyor/__tests__/reconcile-pass-required-checks.test.mjs` using main-only workflow evidence and a stacked PR whose required check is absent. Run `npx vitest run we:scripts/conveyor/__tests__/reconcile-pass-required-checks.test.mjs` after translating the `we:` locus to the WE checkout-relative path. Record failure on repeated hydration/missing configuration diagnosis, then the passing result after wiring.
+- Before implementation, add the two-tick replay in `we:scripts/conveyor/__tests__/reconcile-pass-required-checks.test.mjs` using main-only workflow evidence and a stacked PR whose required check is absent. Run the vitest suite for we:scripts/conveyor/__tests__/reconcile-pass-required-checks.test.mjs from the WE checkout (its path with the `we:` locus removed). Record failure on repeated hydration/missing configuration diagnosis, then the passing result after wiring.
 - Run the scoped helper, reconciliation, reducer and standards suites with Vitest (all paths listed above are WE-relative after removing their locus). Capture actual reader call counts, diagnostic counts, and absence of promotion; a helper-only green test is insufficient.
 - Exercise the real reconciliation shell twice in separate processes with injected recorded PR/protection/workflow inputs and a temporary persistent store. Capture JSON and human output; change the base or workflow revision for a third pass and demonstrate invalidation. No GitHub writes or live PR mutation are needed.
 - Run `npm run check:standards`; separately demonstrate the wired standards validator failing on an excluded-base fixture and passing the compatible fixture. Record live comparison only if a read-only protection fetch succeeds, including provenance and revision; do not substitute a fallback result for live proof.
+
+## Acceptance
+
+Each line names a test to add and observe failing before the build, then passing after. Run via the host heavy queue.
+
+- [A1] Executable: `4713 two ticks, one diagnostic` in we:scripts/conveyor/__tests__/reconcile-pass-required-checks.test.mjs. Synthetic main-only workflow fixture, non-stacked (or `stackedPolicy` not `await-base`) PR on an excluded base with one of two required names (`smoke`) missing: two passes with two fresh reader instances sharing a temp sidecar emit exactly one configuration diagnostic; the second pass makes zero absence-only hydration reads. Fails before (no diagnostic, hydrates every tick); passes after. The existing await-base and conflicting-PR skips are asserted unchanged.
+- [A2] Executable: `4713 blocked PR never promoted` in we:scripts/conveyor/__tests__/reconcile-pass-required-checks.test.mjs. With the diagnostic present the PR stays blocked (reducer still `unchecked`, missing name listed) on every tick; no promotion outcome for any diff class (docs, config, data, source, mixed — parameterized).
+- [A3] Executable: `4713 unknown and truncated fail closed` in we:scripts/lib/__tests__/required-check-workflows.test.mjs plus we:scripts/conveyor/__tests__/reconcile-pass.test.mjs. Dynamic/matrix names, external producers, malformed YAML, missing workflow, unreadable revision, a 100-row truncated snapshot, or a mixed missing set (one proven, one unknown) all fall back to ordinary hydration; observed red/pending checks keep precedence and `check-read-failed` behavior is unchanged.
+- [A4] Executable: `4713 sidecar failure and invalidation` in we:scripts/lib/__tests__/required-check-workflows.test.mjs. Corrupt cache, write failure, expired TTL (15 min), and a changed head/base/policy branch/required set/workflow revision each disable suppression and resume hydration; a diagnostic is not marked delivered before the write succeeds; keys isolate repo, PR number and head SHA.
+- [A5] Executable: `4713 reducer semantics and default policy unchanged` in we:scripts/operations/__tests__/pr-status.test.mjs and we:scripts/conveyor/__tests__/reconcile-pass.test.mjs. `reduceCheckState` outputs are identical to before; reconciliation still fetches requirements for `defaultBranch` (not per-PR base) and passes the full required set to the reducer. The reducer cases pass before and after (regression guard); the new suppression assertions in the reconcile-pass test fail before.
+- [A6] Executable: `4713 standards gate wiring` in we:scripts/__tests__/check-standards.test.mjs. Running the real gate entry on an excluded-base fixture fails with context/base/workflow evidence; the compatible default-base fixture passes; unknown producer and unavailable live protection report "unverified", never "verified"; offline mode makes no network call. Fails before (no rule exists).
+- [A7] Executable: `4713 analyzer branch-filter interpretation` in we:scripts/lib/__tests__/required-check-workflows.test.mjs. Exact names, globs, ordered negation, `branches-ignore`, unfiltered triggers, duplicate producers (all must be excluded), and job-ID fallback classify as eligible / proven-excluded / unknown as specified; an import-identity test asserts runtime and standards gate use the same module.
 
 ## Done when
 
@@ -61,6 +74,7 @@ Follow-up from the #3432 advisory (2026-10-02). A required check missing because
 
 ## Follow-ups
 
+- Pre-existing gaps found during this prepare, to be filed as their own cards by the builder (they are defects, not accepted behavior): (a) the await-base stacked skip and the conflicting-PR skip in `hydrateChecks` suppress the authoritative read on row count and missing names alone, without reader-attested completeness or proven workflow exclusion, so omitted red/pending runs go undiscovered; (b) the reducer's implied-requirement rule can return green without the implied producer. This card neither relies on nor widens them; the new analyzer's proven-exclusion test is the stricter standard the follow-ups should adopt.
 - Any change to apply per-base rather than default-branch requirements is a separate policy decision, not part of this diagnostic fix.
 - Extend producer resolution for dynamic names, reusable workflows, external contexts, path filters, or job conditions only with authoritative evidence and matching tests. They remain unknown in this slice.
 - Broader cross-process concurrent exactly-once reporting is outside this sequential-tick deduplication goal; cache loss may repeat a diagnostic but cannot permit promotion.
