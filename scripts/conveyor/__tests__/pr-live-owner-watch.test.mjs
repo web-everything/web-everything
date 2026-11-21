@@ -453,7 +453,7 @@ describe('portable feed IO and settings', () => {
       reconcileReview: () => ({ dispatch: [{ kind: 'review', prNumber: 863 }], refusals: [] }) });
     expect((await io.execute({ pr: pr(), action: 'review-dispatch' })).ok).toBe(true);
     expect(dispatchManualPass.mock.calls[0][0]).toEqual({ daemon: 'review', repo: pr().repo, pr: 863, expectedHead: pr().headRefOid });
-  }, 6000); // measured ~1.9s (real adapter, spawns children); x3 so CI load stops tripping the 5000ms default
+  }, 15_000); // ~1.9s locally, but it spawns real children and blew the 5000ms default on loaded CI shards; sized from CI, not local
   it('dead red-team adapter abandons, replans recovery and forwards redTeamMode', async () => {
     const order = [], dispatchManualPass = vi.fn(input => { order.push('dispatch'); return { jobPid: 123 }; });
     const { io } = await localIo({ dispatchManualPass, readGhText: commentGh(), readRedTeamStatus: () => ({ status: 'running' }),
