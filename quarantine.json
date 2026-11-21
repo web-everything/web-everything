@@ -1,22 +1,5 @@
 {
   "version": 1,
-  "entries": [
-    {
-      "test": "scripts/conveyor/__tests__/pr-live-owner-watch.test.mjs::portable feed IO and settings > real review adapter forwards expectedHead to the injected manual dispatcher",
-      "brokenSha": "b784af27ea3e824caa8ab3ae0286b265306a20a4",
-      "owner": "card-main-red-load-timeouts",
-      "reason": "load flakes: 5s test timeout (pr-live-owner-watch) and soak 50-tick timeout under saturated shards after #7259 reshuffle",
-      "addedAt": 1795232560338,
-      "expiresAt": 1795318960338
-    },
-    {
-      "test": "scripts/conveyor/soak/daemon-soak.soak.test.mjs::50 real daemon ticks: every invariant holds after every tick",
-      "brokenSha": "b784af27ea3e824caa8ab3ae0286b265306a20a4",
-      "owner": "card-main-red-load-timeouts",
-      "reason": "load flakes: 5s test timeout (pr-live-owner-watch) and soak 50-tick timeout under saturated shards after #7259 reshuffle",
-      "addedAt": 1795232560338,
-      "expiresAt": 1795318960338
-    }
-  ],
+  "entries": [],
   "mode": "quarantine"
 }
