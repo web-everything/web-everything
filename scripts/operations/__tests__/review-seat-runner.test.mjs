@@ -753,9 +753,10 @@ describe('carbon shadow seat vs the agy-gemini live seat cap (R1062a)', () => {
     const capped = await run('agy', 'gemini-4-carbon-high', promoted, { onEscape: 'skip' });
     expect(capped.calls).toHaveLength(0);
     expect(capped.logs.join('\n')).toContain('agy-gemini seat cap 0');
-    // control: the same promoted live seat runs once the live cap is opened, so the skip above is the cap
+    // Opening the cap still cannot authorize an unscoped Carbon role.
     const open = await run('agy', 'gemini-4-carbon-high', { ...promoted, WE_REVIEW_SEAT_CAP_AGY_GEMINI: '20' }, { onEscape: 'skip' });
-    expect(open.calls).toHaveLength(1);
+    expect(open.calls).toHaveLength(0);
+    expect(open.logs.join(' ')).toContain('non-shadow seat refused');
   });
   it('a non-carbon gemini shadow with cap 0 is still skipped', async () => {
     const { calls } = await run('shadow', 'gemini-3-pro', { WE_REVIEW_SEAT_CAP_CARBON_SHADOW: '5' });

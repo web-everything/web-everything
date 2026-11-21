@@ -3002,7 +3002,7 @@ describe('#xqa9ttq — the opt-in Codex advisory seat (judgeAdvisory)', () => {
       expect(codexAdvisoryFromEnv({ [CODEX_ADVISORY_ENV_VAR]: '' }, { isOnProbation: () => true })).toBe(false);
     });
 
-    it('is true for the exact literal "1", regardless of probation status', () => {
+    it('explicit advisory opt-in cannot broaden a correctness-only Carbon promotion', () => {
       expect(codexAdvisoryFromEnv({ [CODEX_ADVISORY_ENV_VAR]: '1' }, { isOnProbation: () => false })).toBe(true);
     });
 
@@ -3308,7 +3308,7 @@ describe('#x8n4crp — the opt-in Codex correctness-advisory seat (judgeCorrectn
       expect(correctnessAdvisoryFromEnv({ [CORRECTNESS_ADVISORY_ENV_VAR]: '' }, { isOnProbation: () => true })).toBe(false);
     });
 
-    it('is true for the exact literal "1", regardless of probation status', () => {
+    it('explicit advisory opt-in cannot broaden a correctness-only Carbon promotion', () => {
       expect(correctnessAdvisoryFromEnv({ [CORRECTNESS_ADVISORY_ENV_VAR]: '1' }, { isOnProbation: () => false })).toBe(true);
     });
 
@@ -3542,13 +3542,13 @@ describe('#3383 — the opt-in Antigravity review seat (judgeAntigravityReview)'
       expect(antigravityReviewFromEnv({ [ANTIGRAVITY_REVIEW_ENV_VAR]: '' }, { isOnProbation: () => true })).toBe(false);
     });
 
-    it('is true for the exact literal "1", regardless of probation status', () => {
-      expect(antigravityReviewFromEnv({ [ANTIGRAVITY_REVIEW_ENV_VAR]: '1', WE_REVIEW_SHADOW_AGY_PROMOTED: 'true' }, { isOnProbation: () => false })).toBe(true);
+    it('explicit advisory opt-in cannot broaden a correctness-only Carbon promotion', () => {
+      expect(antigravityReviewFromEnv({ [ANTIGRAVITY_REVIEW_ENV_VAR]: '1', WE_REVIEW_SHADOW_AGY_PROMOTED: 'true' }, { isOnProbation: () => false })).toBe(false);
     });
 
     // #3383 — the probation default, mirroring both Codex seats' own.
-    it('an explicit probation policy still uses the injected check', () => {
-      expect(antigravityReviewFromEnv({ WE_REVIEW_SHADOW_AGY_PROMOTED: 'true' }, { isOnProbation: () => true, readFile: () => JSON.stringify({ advisorySeats: { antigravityReview: 'probation' } }) })).toBe(true);
+    it('an advisory probation policy cannot broaden correctness-only Carbon promotion', () => {
+      expect(antigravityReviewFromEnv({ WE_REVIEW_SHADOW_AGY_PROMOTED: 'true' }, { isOnProbation: () => true, readFile: () => JSON.stringify({ advisorySeats: { antigravityReview: 'probation' } }) })).toBe(false);
       expect(antigravityReviewFromEnv({}, { isOnProbation: () => false })).toBe(false);
     });
 

@@ -23,11 +23,12 @@ import { carbonNonShadowAllowed } from '../lib/review-seat-settings.mjs';
  * Every answer this returns carries `seatProvider: {provider, ...}` so the run record says who actually judged.
  */
 import { runAgyReviewJuror, scrubPaths } from '../lib/agy-review-juror.mjs';
-import { appendShadowRow, buildShadowRow, compareShadowAnswers, isQuotaHeldShadow } from '../lib/review-shadow-agreement.mjs';
+import { appendShadowRow, buildShadowRow, compareShadowAnswers, isQuotaHeldShadow, validShadowAnswer } from '../lib/review-shadow-agreement.mjs';
 import { CARBON_SHADOW_CAP_ENV, resolveCarbonShadowCap, resolveProviderCap, resolveRoutingProviderCap, readReviewSeatPolicy } from '../lib/review-seat-caps.mjs';
 import { reserveShadowSession } from '../lib/review-shadow-budget.mjs';
 import { appendPromotionRow, promotionAttempt } from '../lib/review-carbon-promotion.mjs';
-import { logReviewSeat } from '../lib/review-seat-provider.mjs';
+import { readRoutingPolicy as readLiveRoutingPolicy } from '../lib/dispatch-routing-policy-io.mjs';
+import { logReviewSeat, carbonPromotionRouteAllowed, carbonPromotionRouteControls } from '../lib/review-seat-provider.mjs';
 
 /** The closed set of directive modes this runner accepts. */
 /** The settings default for a Carbon shadow's daily cap (review-seat-settings standard shadowPolicy.dailyCap). */
@@ -48,7 +49,7 @@ export const SEAT_RUN_MODES =Object.freeze(['agy', 'shadow']);
  */
 export async function runSeatWithProvider(request, {
   claudeJudge, unwrap, wrap, cwd, agyJuror = runAgyReviewJuror, appendRow = appendShadowRow, now = () => Date.now(),
-  log = (m) => console.error(m), reserveSession = reserveShadowSession, appendPromotion = appendPromotionRow, readSeatSettings = readReviewSeatPolicy,
+  log = (m) => console.error(m), reserveSession = reserveShadowSession, appendPromotion = appendPromotionRow, readSeatSettings = readReviewSeatPolicy, readRoutingPolicy = readLiveRoutingPolicy,
 }) {
   const { seatProvider: directive, ...plain } = request;
   if (!directive || !SEAT_RUN_MODES.includes(directive.mode)) {
@@ -57,6 +58,16 @@ export async function runSeatWithProvider(request, {
   const model = directive.model;
   const promoted = directive.mode === 'agy' && directive.promoted === true && plain.lens === 'correctness' && /carbon/i.test(String(model));
   const runAgy = async (runModel = model) => {
+    let promotionControls;
+    if (promoted) {
+      try {
+        const policy = readRoutingPolicy();
+        if (!carbonPromotionRouteAllowed(policy)) throw new Error('routing restrictions refuse Carbon promotion');
+        promotionControls = carbonPromotionRouteControls(policy);
+      } catch {
+        return { status: 'failed', reasons: ['live routing restrictions unavailable or refuse Carbon promotion'] };
+      }
+    }
     // Both switches apply to Carbon shadows. The daemon plist sets AGY_GEMINI=0 today;
     // enabling Carbon shadows is an explicit operator step: set that cap above 0.
     const carbonShadow = directive.mode === 'shadow' && /carbon/i.test(String(runModel));
@@ -73,13 +84,13 @@ export async function runSeatWithProvider(request, {
     }
     // R1062a: Carbon shadow seats sit outside the agy-gemini live cap (their own switch + daily cap apply above/below).
     const liveCap = !carbonShadow && /gemini|carbon/i.test(String(runModel))
-      ? (promoted ? resolveRoutingProviderCap('agy-gemini', process.env, { enabledProviders: ['agy-gemini'] }, readSeatSettings) : resolveProviderCap('agy-gemini', process.env, readSeatSettings)) : null;
+      ? (promoted ? resolveRoutingProviderCap('agy-gemini', process.env, { ...promotionControls, enabledProviders: [...(promotionControls.enabledProviders ?? []), 'agy-gemini'] }, readSeatSettings) : resolveProviderCap('agy-gemini', process.env, readSeatSettings)) : null;
     if (liveCap !== null && liveCap <= 0) {
       const reason = 'agy-gemini seat cap 0';
       logReviewSeat(log, `review-seat: agy ${directive.mode} skipped: ${reason}`);
       return { status: 'skipped', reasons: [reason] };
     }
-    if (directive.mode !== 'shadow' && !carbonNonShadowAllowed(runModel, { log })) {
+    if (directive.mode !== 'shadow' && !carbonNonShadowAllowed(runModel, { log, promoted, lens: plain.lens })) {
       const reason = 'Carbon not promoted — non-shadow seat refused';
       logReviewSeat(log, `review-seat: agy skipped: ${reason}`);
       return { status: 'skipped', reasons: [reason] };
@@ -153,15 +164,24 @@ export async function runSeatWithProvider(request, {
 
   // mode === 'agy'
   let agyRun = await runAgy();
-  if (promoted && agyRun.status === 'ok' && (typeof agyRun.sessionId !== 'string' || !agyRun.sessionId.trim() || !agyRun.value || typeof agyRun.value.summary !== 'string'
-    || !agyRun.value.summary.trim() || !Array.isArray(agyRun.value.findings)
-    || agyRun.value.findings.some(f => !f || typeof f !== 'object' || Array.isArray(f)
-      || typeof f.summary !== 'string' || !f.summary.trim()))) {
-    agyRun = { ...agyRun, status: 'failed', reasons: ['empty or unparseable Carbon answer'] };
+  if (promoted && agyRun.status === 'ok') {
+    const reasons = [];
+    if (typeof agyRun.sessionId !== 'string' || !agyRun.sessionId.trim()) reasons.push('missing Carbon session identity');
+    if (!validShadowAnswer(agyRun.value)) reasons.push('invalid Carbon answer fields or finding coordinates');
+    else if (!agyRun.value.findings.length || /review not performed|did not review|unable to review|cannot review|not reviewed/i.test(agyRun.value.summary)) {
+      reasons.push('Carbon abstained or returned no diff findings evidence');
+    }
+    if (agyRun.servedModel !== model) reasons.push('observed Carbon model identity missing or mismatched');
+    if (agyRun.timedOut === true || agyRun.telemetry?.timedOut === true) reasons.push('Carbon timed out; salvaged answer refused');
+    if (reasons.length) agyRun = { ...agyRun, status: 'failed', reasons };
   }
   if (promoted) {
-    const recorded = appendPromotion(promotionAttempt({ request: plain, directive, agyRun, at: new Date(now()).toISOString() }));
-    if (!recorded) logReviewSeat(log, 'review-seat: WARNING Carbon promotion ledger write failed');
+    let recorded = false;
+    try { recorded = appendPromotion(promotionAttempt({ request: plain, directive, agyRun, at: new Date(now()).toISOString() })) === true; } catch { /* ledger failure refuses this seat */ }
+    if (!recorded) {
+      logReviewSeat(log, 'review-seat: Carbon promotion ledger write failed; falling back to Claude');
+      agyRun = { ...agyRun, status: 'failed', reasons: [...(agyRun.reasons ?? []), 'Carbon promotion ledger write failed'] };
+    }
   }
   if (agyRun.status === 'ok' && agyRun.sessionId) {
     const t = agyRun.telemetry ?? {};
@@ -173,7 +193,7 @@ export async function runSeatWithProvider(request, {
   }
   const why = agyRun.status === 'ok' ? ['agy juror reported no session id'] : (agyRun.reasons ?? []);
   const fellBack = { provider: 'agy', model, status: agyRun.status === 'ok' ? 'voided' : agyRun.status, reasons: why };
-  if (directive.onEscape === 'skip') {
+  if (!promoted && directive.onEscape === 'skip') {
     const reason = `agy seat ${fellBack.status}: ${why.join('; ') || 'no reason given'}`.slice(0, 600);
     return wrap({ summary: `skipped: ${reason}`, findings: [], skipped: { provider: 'agy', reason: agyRun.telemetry?.quotaState === 'provider-unresponsive' ? 'provider-unresponsive' : reason }, seatProvider: fellBack }, agyRun.telemetry);
   }

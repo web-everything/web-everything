@@ -1139,6 +1139,14 @@ The append-only `agy-carbon-promotion.jsonl` lives beside the shadow ledger. Run
 verdict, later fix confirmations, explicit `not-real` false positives, timeouts/fallbacks and distinct PRs.
 This local report reads persisted runs without GitHub calls; unknown verdicts/findings stay pending.
 Fix proximity is confirmation evidence, never proof that an unconfirmed finding was false.
+Promotion is confined to the existing shadow correctness route: an explicit Claude route or a
+Gemini routing disable refuses replacement, and dispatch rechecks live controls and cap kill switches.
+An invalid `promotionReplaces` override refuses and logs. Other Carbon non-shadow roles, including
+red-team and advisory seats, remain refused regardless of the promotion flag. Counted Carbon answers
+reuse the shadow field/coordinate validator and require an observed matching served model, actual
+findings evidence, no abstention or timeout (including salvaged timeout answers), and a successful
+ledger append. Any failure falls back to Claude; empty clean answers are conservatively rechecked
+by Claude rather than counted as Carbon accepts.
 The pure `assertCrossVendorPanel` helper retains its existing cross-vendor check.
 
 The agy mandatory-seat shadows are off by default (operator 2026-10-16).

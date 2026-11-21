@@ -14,7 +14,7 @@ export function promotionAttempt({ request, directive, agyRun, at }) {
     at, repo: directive.repo, pr: directive.pr, head: directive.head, runId: request.runId,
     lens: 'correctness', model: directive.model, status: valid ? 'ok' : agyRun.status === 'ok' ? 'failed' : agyRun.status,
     reasons: (agyRun.reasons ?? []).slice(0, 5).map(r => String(r).slice(0, 300)),
-    fallback: !valid, timeout: /tim(?:e|ed)[ -]?out/i.test((agyRun.reasons ?? []).join(' ')),
+    fallback: !valid, timeout: agyRun.timedOut === true || agyRun.telemetry?.timedOut === true || /tim(?:e|ed)[ -]?out/i.test((agyRun.reasons ?? []).join(' ')),
     agyVerdict: valid ? deriveVerdict({ findings: agyRun.value.findings }) : null,
     agyFindings: valid ? normalizeFindings(agyRun.value.findings).map((f, i) => ({
       ...findingIdentityEntry(f, String(i)), line: f.line ?? null,

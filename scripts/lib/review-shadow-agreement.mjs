@@ -93,7 +93,7 @@ export function compareShadowAnswers({ claude, agy, prTable = [] }) {
 
 // Validate raw evidence before the display normalizer can coerce or drop malformed findings.
 // The reducer has no exported answer validator; require the canonical summary shape locally.
-function validShadowAnswer(answer) {
+export function validShadowAnswer(answer) {
   const object = value => value !== null && typeof value === 'object' && !Array.isArray(value);
   const text = value => typeof value === 'string' && value.trim().length > 0;
   return object(answer) && text(answer.summary) && Array.isArray(answer.findings)

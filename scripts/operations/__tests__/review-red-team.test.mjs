@@ -941,7 +941,7 @@ it('reloads red-team routing each pass, preserves explicit zero, and restores Ge
     const result = await speculateRedTeam({ pr: 6, repo: REPO, read: payload('accept').findings.read, env }, cleared.io);
     expect(result.status).toBe('skipped');
     expect(cleared.calls.filter(c => c[0] === 'seat')).toHaveLength(0);
-    overrides = { 'review-seat:red-team': { enabledProviders: ['agy-gemini'], disabledProviders: ['codex', 'agy-claude'] } };
+    overrides = { 'review-seat:red-team': { provider: 'agy-gemini', model: 'pro', enabledProviders: ['agy-gemini'], disabledProviders: ['codex', 'agy-claude'] } };
     const enabled = fakeIo({ readRoutingPolicy: reader });
     expect((await speculateRedTeam({ pr: 7, repo: REPO, read: payload('accept').findings.read, env }, enabled.io)).status).toBe('speculated');
     expect(enabled.calls.find(c => c[0] === 'seat')[1].provider).toBe('agy-gemini');
@@ -1007,15 +1007,16 @@ describe('R1077 builder company routing', () => {
     expect(calls.find(c => c[0] === 'seat')[1]).toMatchObject({ provider, model });
   });
 
-  it('routes a Codex builder to promoted Gemini when enabled through its live setting', async () => {
+  it('correctness promotion cannot authorize Carbon on the real red-team route despite a Gemini cap opt-in', async () => {
     const { io, calls } = policyIo({ readSeatSettings: () => ({ tool: { seatDailyCaps: { 'agy-gemini': 20 } }, platform: {} }) });
     const args = input(marker('codex'));
     args.env.WE_REVIEW_SHADOW_AGY_PROMOTED = 'true';
     expect((await speculateRedTeam(args, io)).status).toBe('speculated');
-    expect(calls.find(c => c[0] === 'seat')[1].provider).toBe('agy-gemini');
+    expect(calls.find(c => c[0] === 'seat')[1].provider).toBe('codex');
+    expect(calls.filter(c => c[0] === 'reserve').map(c => c[1])).toEqual(['codex']);
   });
 
-  it.each(['false', 'garbage'])('falls back before reserving unpromoted Carbon despite a Gemini cap opt-in (promotion=%s)', async promoted => {
+  it.each([undefined, 'false', 'garbage', 'true'])('falls back before reserving unpromoted Carbon despite a Gemini cap opt-in (promotion=%s)', async promoted => {
     const { io, calls } = policyIo({ readSeatSettings: () => ({ tool: { seatDailyCaps: { 'agy-gemini': 20 } }, platform: {} }) });
     const args = input(marker('codex'));
     args.env.WE_REVIEW_SHADOW_AGY_PROMOTED = promoted;
@@ -1082,7 +1083,9 @@ describe('R1077 builder company routing', () => {
 
   it.each(['codex', 'claude'])('falls back and logs when the cross-company provider for %s is capped', async builder => {
     const preferred = builder === 'codex' ? 'agy-gemini' : 'codex';
-    const { io, calls } = policyIo({ readRecords: () => [{ dispatchKind: REVIEW_SEAT_DISPATCH_KIND,
+    const flashPolicy = structuredClone(DEFAULT_ROUTING_POLICY);
+    flashPolicy.operations['review-seat:red-team'] = { provider: 'agy-gemini', model: 'flash', fallback: [{ provider: 'codex', model: 'sol', effort: 'high' }] };
+    const { io, calls } = policyIo({ readRoutingPolicy: () => flashPolicy, readRecords: () => [{ dispatchKind: REVIEW_SEAT_DISPATCH_KIND,
       provider: preferred, callId: 'spent', scoredAt: new Date(NOW).toISOString(), status: 'ok' }] });
     const args = input(marker(builder));
     args.env = { WE_REVIEW_SHADOW_AGY_PROMOTED: 'true', WE_REVIEW_SEAT_CAP_AGY_GEMINI: '20', [PROVIDER_CAP_ENV[preferred]]: '1' };
@@ -1093,7 +1096,9 @@ describe('R1077 builder company routing', () => {
   });
 
   it('retries the other provider when the preferred reservation races with another caller', async () => {
-    const { io, calls } = policyIo({ readSeatSettings: () => ({ tool: { seatDailyCaps: { 'agy-gemini': 20 } }, platform: {} }) });
+    const flashPolicy = structuredClone(DEFAULT_ROUTING_POLICY);
+    flashPolicy.operations['review-seat:red-team'] = { provider: 'agy-gemini', model: 'flash', fallback: [{ provider: 'codex', model: 'sol', effort: 'high' }] };
+    const { io, calls } = policyIo({ readRoutingPolicy: () => flashPolicy, readSeatSettings: () => ({ tool: { seatDailyCaps: { 'agy-gemini': 20 } }, platform: {} }) });
     const reserve = io.reserveCalls;
     io.reserveCalls = o => o.provider === 'agy-gemini' ? { used: o.dailyCap, callIds: [] } : reserve(o);
     const args = input(marker('codex'));

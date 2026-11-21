@@ -130,15 +130,20 @@ export function resolveShadowPromotionPrs({ env = process.env, file = REVIEW_SET
   return { value: 10, source: 'default' };
 }
 
-/** Report-only replacement target: one existing provider seat, never an extra seat. */
-export function resolveShadowPromotionReplaces({ env = process.env, file = REVIEW_SETTINGS_FILE, readFile = (p) => readFileSync(p, 'utf8') } = {}) {
+/** Manual replacement target. A present invalid override refuses promotion rather than exposing a lower grant. */
+export function resolveShadowPromotionReplaces({ env = process.env, file = REVIEW_SETTINGS_FILE,
+  readFile = p => readFileSync(p, 'utf8'), log = m => console.error(m) } = {}) {
   const valid = v => ['claude', 'codex', 'agy'].includes(v);
+  const refusal = source => {
+    log(`review.shadowSeats.antigravity: invalid promotionReplaces (${source}); promotion refused`);
+    return { value: null, source: 'refused' };
+  };
   const fromEnv = env?.WE_REVIEW_SHADOW_AGY_PROMOTION_REPLACES;
-  if (valid(fromEnv)) return { value: fromEnv, source: 'env' };
+  if (fromEnv !== undefined) return valid(fromEnv) ? { value: fromEnv, source: 'env' } : refusal('env');
   try {
     const value = JSON.parse(readFile(file))?.shadowSeats?.antigravity?.promotionReplaces;
-    if (valid(value)) return { value, source: 'settings' };
-  } catch { /* built-in */ }
+    if (value !== undefined) return valid(value) ? { value, source: 'settings' } : refusal('settings');
+  } catch (error) { if (error?.code !== 'ENOENT') return refusal('unreadable settings'); }
   return { value: 'claude', source: 'default' };
 }
 
@@ -249,7 +254,10 @@ export function resolveShadowPromoted({ env = process.env, file = REVIEW_SETTING
 }
 
 export function carbonNonShadowAllowed(model, options) {
-  return !/carbon/i.test(String(model)) || resolveShadowPromoted(options).value === true;
+  return !/carbon/i.test(String(model)) || (options?.promoted === true && options?.lens === 'correctness'
+    && resolveShadowPromoted(options).value === true
+    && resolveShadowPromotionReplaces(options).value === 'claude'
+    && resolveReviewSeatSafeguards(options).value.shadowEnabled === true);
 }
 
 const loggedExternalJurors = new Set();
