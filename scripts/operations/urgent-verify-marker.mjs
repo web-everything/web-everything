@@ -10,6 +10,9 @@ export const normalizeUrgentRepo = url => {
   return match ? `https://${match[1].toLowerCase()}/${match[1].toLowerCase() === 'github.com' ? match[2].toLowerCase() : match[2]}` : value;
 };
 export const urgentFuiRepo = 'https://github.com/frontier-ui/frontierui';
+// The repo moved from chalbert/frontierui (GitHub redirects). Accept only that one known old owner, mapped to canonical.
+const urgentFuiAliases = new Set(['https://github.com/chalbert/frontierui']);
+export const canonicalFuiRepo = repo => (urgentFuiAliases.has(repo) ? urgentFuiRepo : repo);
 export function urgentSignature(record, key) {
   if (!Buffer.isBuffer(key) || key.length !== 32) throw new Error('unreadable urgent key');
   const fields = ['sha', 'suite', 'shards', 'result', 'startedAt', 'finishedAt', 'host', 'repo', 'steps', 'fuiSha', 'fuiRepo'];
@@ -96,7 +99,7 @@ else
 echo "run=true" >> "$GITHUB_OUTPUT"
 fi
 `,
-    "npm run test:integration:vitest -- $(node scripts/ci/quarantine-skip.mjs --job=\"integration\")",
+    "npm run test:integration:vitest -- --reporter=default --reporter=json --outputFile.json=coverage/timing-integration-${{ matrix.group }}.json $(node scripts/ci/quarantine-skip.mjs --job=\"integration\")",
   ],
   integration: [
     `
@@ -165,7 +168,11 @@ const siblingActions = [
 const mirroredActions = {
   changes: [{ name: undefined, uses: 'actions/checkout@v4', with: { 'fetch-depth': 50 } }],
   standards: siblingActions,
-  'integration-part': siblingActions.map(step => ({ ...step, if: step.name === 'Mint FUI read token (GitHub App)' ? step.if : "${{ steps.gate.outputs.run == 'true' }}" })),
+  'integration-part': [...siblingActions.map(step => ({ ...step, if: step.name === 'Mint FUI read token (GitHub App)' ? step.if : "${{ steps.gate.outputs.run == 'true' }}" })),
+    { name: 'Upload integration timings', if: "${{ needs.changes.outputs.light != 'true' && (always()) }}", uses: 'actions/upload-artifact@v4', with: {
+      name: 'timing-integration-${{ matrix.group }}', path: 'web-everything/coverage/timing-integration-${{ matrix.group }}.json', 'if-no-files-found': 'ignore',
+    } },
+  ],
   integration: [],
   'test-shard': [...siblingActions.map(step => ({ ...step, if: step.name === 'Mint FUI read token (GitHub App)'
     ? "${{ needs.changes.outputs.light != 'true' && (vars.WE_APP_ID != '') }}" : "${{ needs.changes.outputs.light != 'true' }}" })),
@@ -296,7 +303,7 @@ export function ciGatePlan(workflow) {
   const download = step('coverage-merge', 'Download shard coverage');
   if (!covered || merge !== `npm run coverage:merge -- coverage-shards --threshold=80 --expect=${covered}`
     || host !== 'node scripts/lint-host-paths.mjs'
-    || integration !== 'npm run test:integration:vitest -- $(node scripts/ci/quarantine-skip.mjs --job="integration")'
+    || integration !== 'npm run test:integration:vitest -- --reporter=default --reporter=json --outputFile.json=coverage/timing-integration-${{ matrix.group }}.json $(node scripts/ci/quarantine-skip.mjs --job="integration")'
     || upload.uses !== 'actions/upload-artifact@v4' || upload.with?.name !== 'coverage-shard-${{ matrix.shard }}'
     || upload.with?.path !== 'web-everything/coverage/coverage-final.json' || upload.with?.['if-no-files-found'] !== 'error'
     || !upload.if?.includes(`matrix.shard != ${plan.length}`)
@@ -310,7 +317,7 @@ export function ciGatePlan(workflow) {
   }
   const fetchMain = runText(step('test-shard', 'Fetch main history (blobless)').run);
   if (fetchMain !== 'sh scripts/ci/fetch-main-history.sh') throw new Error('unreadable-ci-gates: main history command');
-  return { requiredJobs, fetchMain: fetchMain.split(' '), installFui: [['npm', 'ci'], ['npm', 'run', 'build:tools']], install: ['npm', 'ci'], coverage: merge.split(' '), hostPaths: host.split(' '), integration: integration.split(' -- $(')[0].split(' ') };
+  return { requiredJobs, fetchMain: fetchMain.split(' '), installFui: [['npm', 'ci'], ['npm', 'run', 'build:tools']], install: ['npm', 'ci'], coverage: merge.split(' '), hostPaths: host.split(' '), integration: integration.split(' -- ')[0].split(' ') }; // CI-only reporter flags (per-group timing JSON) stay out of the one ungrouped local run
 }
 
 export function urgentMarker({ urgent, reason, sha, ledger, shards, expectedSteps, now, repo, readKey }) {

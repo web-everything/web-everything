@@ -492,7 +492,7 @@ describe('land-human-only — the reader', () => {
       ledger: { authority: 'labels', folded: null, derived: null }, enqueueClearance: null,
       netSignals: { scored: true, changedFiles: ['.github/workflows/ci.yml'], diffLines: 2,
         humanBasisFiles: ['.github/workflows/ci.yml'], cumulativeDiffLines: 2, basisNarrowed: true,
-        netDiffText: { text: '', scored: true }, diffHunks: '' },
+        netDiffText: { text: 'diff --git a/.github/workflows/ci.yml b/.github/workflows/ci.yml\n--- a/.github/workflows/ci.yml\n+++ b/.github/workflows/ci.yml\n@@ -1 +1 @@\n-name: CI\n+name: Updated CI\n', scored: true, rev: expectedHeadSha }, diffHunks: '' },
     }));
     const reader = createLandHumanOnlyReader({ exec, credential: cred, clone: () => '/clone', gather,
       evaluate: (facts, options) => evaluatePrGates(facts, { ...options, carrySetting: { value: 'off', source: 'test' } }),

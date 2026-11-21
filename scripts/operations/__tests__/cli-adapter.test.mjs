@@ -2,7 +2,7 @@ import { describe, expect, it, vi } from 'vitest';
 import { driveRun, outcomePayload, renderOutcome } from '../cli-adapter.mjs';
 import { classifyReviewLoopOutcome } from '../review-job.mjs';
 import { advance, startRun } from '../engine.mjs';
-import { notApplied } from '../effect-executor.mjs';
+import { notApplied, retryableWarning } from '../effect-executor.mjs';
 import { createRegistry, op } from '../registry.mjs';
 import { createMemoryRunStore, isRunRecordTerminal } from '../run-store.mjs';
 import { effect } from '../step-kinds.mjs';
@@ -18,6 +18,51 @@ function fixture(prefix = []) {
   store.write(run);
   return { registry, store, run };
 }
+
+describe('effect-warning output', () => {
+  it('stops on an idempotent warning and resumes publication from a serialized pending run', async () => {
+    const context = fixture([{ type: 'publish', idempotent: true }]);
+    const publish = vi.fn(async () => retryableWarning({ warning: 'Publication needs retry' }));
+    const guard = vi.fn();
+    const note = vi.fn();
+    const sinks = { publish, 'guard.clear': guard, 'note.write': note };
+    const first = await driveRun({ ...context, sinks });
+    expect(first).toMatchObject({ stopped: 'effect-warning', warning: 'Publication needs retry', error: null });
+    expect(first.run.effects.map(e => e.status)).toEqual(['pending', 'declared', 'declared']);
+    expect(guard).not.toHaveBeenCalled();
+    expect(note).not.toHaveBeenCalled();
+    const persisted = JSON.parse(JSON.stringify(context.store.read(context.run.id)));
+    context.store.write(persisted);
+    publish.mockImplementation(async () => ({ pushed: true }));
+    const second = await driveRun({ ...context, run: persisted, sinks });
+    expect(second.stopped).toBe('complete');
+    expect(second.run.effects[0]).toMatchObject({ status: 'applied', attempts: 2 });
+    expect(publish).toHaveBeenCalledTimes(2);
+    expect(guard).toHaveBeenCalledTimes(1);
+  });
+
+  it('redacts credentials in persisted warning payloads and JSON and text rendering', () => {
+    const { run } = fixture();
+    const warning = 'Retry publication: GH_TOKEN=fixture-secret-value';
+    const outcome = { run: { ...run, effects: [{ key: 'warning#0', status: 'pending', result: { warning } }] },
+      stopped: 'effect-warning', warning, error: null, applied: [] };
+    const payload = outcomePayload(outcome);
+    expect(payload.warning).toContain('Retry publication');
+    expect(payload.warning).not.toContain('fixture-secret-value');
+    const json = renderOutcome({ outcome, json: true });
+    expect(json.code).toBe(0);
+    expect(JSON.parse(json.lines[0])).toEqual(payload);
+    const text = renderOutcome({ outcome });
+    expect(text.code).toBe(0);
+    expect(text.lines.join('\n')).toContain('WARNING: Retry publication');
+    expect(text.lines.join('\n')).toContain(`--resume=${run.id}`);
+    expect(text.lines.join('\n')).not.toContain('fixture-secret-value');
+  });
+
+  it('uses Effect needs retry when an effect-warning payload has no persisted warning', () => {
+    expect(outcomePayload({ run: fixture().run, stopped: 'effect-warning' }).warning).toBe('Effect needs retry');
+  });
+});
 
 describe('driveRun permanent guard refusal', () => {
   it('settles the first drive as terminal and never retries the refused sink on a later drive', async () => {

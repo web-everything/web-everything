@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 import { proveCardOnlyHeadMove } from '../lib/card-only-head-move.mjs';
-import { syncRedTeamStatusLabels } from '../lib/red-team-status-labels.mjs';
+import { settleGhFor, syncRedTeamStatusLabels } from '../lib/red-team-status-labels.mjs';
 import { recordRedTeamStatus, readDrainRedTeamEvidence, readRedTeamStatus, redTeamStatusDir, readRecoveryWitness, restoreRecoveryWriter, createCarriedCheckPublisher, markCarriedCheckUnpublished } from '../lib/drain-red-team-evidence.mjs';
 import { pidNamespace } from '../lib/pid-alive.mjs';
 import { writeJsonAtomic } from '../lib/atomic-json-file.mjs';
@@ -533,7 +533,7 @@ export function createReviewJobIo({ root = REPO_ROOT, env = process.env, dir = r
       }
       try {
         syncRedTeamStatusLabels({ repo: input.repo, pr: input.pr, head,
-          evidence: readEvidence(key), env, log: line => process.stderr.write(`${line}\n`) });
+          evidence: readEvidence(key), env, gh: settleGhFor(env), log: line => process.stderr.write(`${line}\n`) });
       } catch (e) { process.stderr.write(`review-job: red-team status label sync failed: ${e.message}\n`); }
       return { priorResult, ...(queued && input.redTeamMode ? { redTeamAdmission: { schema: 1, pid: process.pid, queued: stored,
         ...(input.retryCount === 1 ? { retrySpent: true } : {}),

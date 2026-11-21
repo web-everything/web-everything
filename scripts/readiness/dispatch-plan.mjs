@@ -84,6 +84,7 @@ import { scopesOverlap, normScope } from './scope-lease.mjs';
 import { isGroupingKind } from '../check-standards-rules.mjs';
 import { writeLineSync } from '../lib/write-all-sync.mjs';
 import { capToConcurrency, resolveMaxConcurrentLanes } from '../lib/lane-concurrency.mjs';
+import { resolveCapacityLeaf } from '../lib/capacity-leaf.mjs';
 // The kind-scoped pause's PURE half (epic #3383). `dispatch-pause.mjs`'s fs helpers stay out of this pure core
 // — only the pure predicate/normalizer come in, so "is THIS kind held" is decided in ONE place rather than
 // re-derived here and again in `tick-core.mjs`.
@@ -1186,7 +1187,7 @@ async function main(argv) {
   subTimings['pr-limit-check'] = Math.round(performance.now() - prLimitT0);
 
   // #xupukxa — the concurrency ceiling, env-overridable exactly like heavy-admission.mjs's own cap knob.
-  const maxConcurrentLanes = resolveMaxConcurrentLanes(process.env);
+  const maxConcurrentLanes = resolveCapacityLeaf('lanes.maxConcurrent', { lower: resolveMaxConcurrentLanes(process.env) }).value;
   const plan = dispatchPlan({ queue, leases, freeLanes, driftBlockedScope, driftGraduationItem, maxConcurrentLanes, dispatchPaused, dispatchPausedKinds, sizePolicy, preparePolicy, prLimitHeld, trace: true });
   // Surface cleared-but-not-ready ids as held entries so a clear never silently vanishes (#2613 review, 2b).
   plan.groundTruth = groundTruth;

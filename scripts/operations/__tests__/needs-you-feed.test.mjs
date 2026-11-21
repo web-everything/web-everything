@@ -3,7 +3,7 @@ import { mkdtempSync, readFileSync, writeFileSync, mkdirSync, rmSync } from 'nod
 import { tmpdir } from 'node:os';
 import { fileURLToPath } from 'node:url';
 import { join, dirname } from 'node:path';
-import { feedPath, diffFeed, itemsFromReport, parseFeedLine, appendLines, replay, unacknowledged, acknowledge, resolveSettings, runOnce, gateReadyItems, REPORT_KINDS, GATE_KINDS, assertProducerCheckout, monitorCommand, main, sidecarsOf } from '../needs-you-feed.mjs';
+import { feedPath, diffFeed, itemsFromReport, parseFeedLine, appendLines, replay, unacknowledged, acknowledge, resolveSettings, runOnce, gateReadyItems, readBreakPolicy, REPORT_KINDS, GATE_KINDS, assertProducerCheckout, monitorCommand, main, sidecarsOf } from '../needs-you-feed.mjs';
 import { renderRedTeamComment } from '../review-extra-seats.mjs';
 import { GATE_OUTCOMES, parseRedTeamComment, redTeamGateMarker, redTeamResultId } from '../../lib/red-team-gate.mjs';
 import { buildReviewedShaMarker, buildClearedHumanMarker } from '../../lib/review-escalation.mjs';
@@ -445,6 +445,123 @@ describe('gateReadyItems: "your review" is re-checked against the live PR (#5768
     const { kept } = await gateReadyItems(items(), report, { gh: gate({ headRefOid: head, labels: [] },
       gateComments({ broken: true, impact }).slice(0, 1)), log: () => {} });
     expect(kept.find(i => i.pr === 5768)).toMatchObject({ kind: 'confirmed-break-owed-send-back' });
+  });
+  describe('owed send-back follows the break policy', () => {
+    const cardPolicy = { broken: 'send-back', degraded: 'card', unconfirmed: 'advisory' };
+    const queued = (impact, count = 1) => {
+      const [res, rec] = gateComments({ outcome: GATE_OUTCOMES.CARD_QUEUED, broken: true, impact, count });
+      const idx = Array.from({ length: count }, (_, i) => `#${i + 1}`).join(', ');
+      return [res, { ...rec, body: `${rec.body}\n- ${count} finding(s) filed as a follow-up card (${idx}).` }];
+    };
+    const run = (comments, readPolicy) => gateReadyItems(items(), report, { gh: gate({ headRefOid: head, labels: [] }, comments),
+      log: () => {}, fixClaimLive: () => false, ...(readPolicy ? { readPolicy } : {}) });
+    const kind = async (comments, readPolicy) => (await run(comments, readPolicy)).kept.find(i => i.pr === 5768).kind;
+    it('#7181: two degraded breaks with the gate card-queued record raise no alarm under degraded=card', async () => {
+      const comments = queued('degraded', 2);
+      expect(await kind(comments, () => cardPolicy)).toBe('needs-you');
+    });
+    it.each([
+      ['a valid card policy', () => cardPolicy],
+      ['the strict fallback', () => { throw new Error('unreadable'); }],
+    ])('a broken break with a class deferral and a card record still alarms under %s', async (_n, readPolicy) => {
+      const body = renderRedTeamComment({ pr: 5768, rev: head, provider: 'codex', model: 'm', recheckStatus: 'ok', foldedVerdict: 'changes',
+        findings: [{ summary: 'confirmed break', category: 'edge-case', impactIfUnfixed: 'broken', file: 'scripts/x.mjs', line: 3,
+          confirmedByRecheck: true, recheckReason: 'real', findingClass: 'theoretical-race', classBasis: 'needs a rare race' }] });
+      const id = redTeamResultId(parseRedTeamComment(body));
+      const comments = [{ user: { login: 'web-everything' }, body, created_at: '2026-10-10T02:04:41Z' },
+        { user: { login: 'web-everything' }, created_at: '2026-10-10T02:05:00Z',
+          body: `${redTeamGateMarker(5768, head, GATE_OUTCOMES.CARD_QUEUED, id)}\n- 1 finding(s) filed as a follow-up card (#1).` }];
+      expect(await kind(comments, readPolicy)).toBe('confirmed-break-owed-send-back');
+    });
+    it('a throwing policy reader plus a class-deferred degraded card record alarms (nothing automatic settles)', async () => {
+      const body = renderRedTeamComment({ pr: 5768, rev: head, provider: 'codex', model: 'm', recheckStatus: 'ok', foldedVerdict: 'changes',
+        findings: [{ summary: 'confirmed break', category: 'edge-case', impactIfUnfixed: 'degraded', file: 'scripts/x.mjs', line: 3,
+          confirmedByRecheck: true, recheckReason: 'real', findingClass: 'theoretical-race', classBasis: 'needs a rare race' }] });
+      const id = redTeamResultId(parseRedTeamComment(body));
+      const comments = [{ user: { login: 'web-everything' }, body, created_at: '2026-10-10T02:04:41Z' },
+        { user: { login: 'web-everything' }, created_at: '2026-10-10T02:05:00Z',
+          body: `${redTeamGateMarker(5768, head, GATE_OUTCOMES.CARD_QUEUED, id)}\n- 1 finding(s) filed as a follow-up card (#1).` }];
+      expect(await kind(comments, () => { throw new Error('unreadable'); })).toBe('confirmed-break-owed-send-back');
+      expect(await kind(comments, () => cardPolicy)).toBe('needs-you');
+    });
+    it('a card record covering only #1 does not settle uncarded #2', async () => {
+      const [res, rec] = gateComments({ outcome: GATE_OUTCOMES.CARD_QUEUED, broken: true, impact: 'degraded', count: 2 });
+      const one = { ...rec, body: `${rec.body}\n- 1 finding(s) filed as a follow-up card (#1).` };
+      expect(await kind([res, one], () => cardPolicy)).toBe('confirmed-break-owed-send-back');
+    });
+    it.each([['missing', null], ['malformed', '{not json'], ['without findingClasses', '{}'], ['incomplete', '{"findingClasses":{"live-reproduced":"fix-now"}}']])('readBreakPolicy refuses (strict) when the class preferences are %s', (_n, content) => {
+      const dir = temp(), file = join(dir, 'prefs.json');
+      if (content !== null) writeFileSync(file, content);
+      expect(() => readBreakPolicy({ env: { WE_PLATFORM_PREFERENCES_FILE: file } })).toThrow(/unreadable/);
+    });
+    const allClasses = Object.fromEntries(['live-reproduced', 'correctness-in-normal-use', 'security-reachable-today',
+      'theoretical-race', 'attacker-same-user', 'coverage-or-style'].map(c => [c, 'fix-now']));
+    it.each([
+      ['missing settings file', null],
+      ['empty settings file', {}],
+      ['unset confirmedBreaks', { redTeam: {} }],
+      ['unset broken', { redTeam: { confirmedBreaks: { degraded: 'card', unconfirmed: 'advisory' } } }],
+      ['unset degraded', { redTeam: { confirmedBreaks: { broken: 'send-back', unconfirmed: 'advisory' } } }],
+    ])('readBreakPolicy rejects %s and retains the owed-send-back alarm with a card-queued record', async (_name, settings) => {
+      const dir = temp(), settingsPath = join(dir, 'red-team.json'), prefsPath = join(dir, 'prefs.json');
+      writeFileSync(prefsPath, JSON.stringify({ findingClasses: allClasses }));
+      if (settings !== null) writeFileSync(settingsPath, JSON.stringify(settings));
+      const readPolicy = () => readBreakPolicy({ settingsPath, env: { WE_PLATFORM_PREFERENCES_FILE: prefsPath } });
+      // Valid class preferences and no env override isolate the source-default guard.
+      // Missing broken must also fail closed even though degraded is explicitly card.
+      expect(readPolicy).toThrow(settings === null ? /ENOENT/ : 'confirmedBreaks is not set');
+      expect(await kind(queued('degraded', 2), readPolicy)).toBe('confirmed-break-owed-send-back');
+    });
+    it('readBreakPolicy with explicit settings and valid class preferences settles a card-queued degraded break', async () => {
+      const dir = temp(), settingsPath = join(dir, 'red-team.json'), prefsPath = join(dir, 'prefs.json');
+      writeFileSync(prefsPath, JSON.stringify({ findingClasses: allClasses }));
+      writeFileSync(settingsPath, JSON.stringify({ redTeam: { confirmedBreaks: cardPolicy } }));
+      const readPolicy = () => readBreakPolicy({ settingsPath, env: { WE_PLATFORM_PREFERENCES_FILE: prefsPath } });
+      expect(readPolicy()).toEqual({ ...cardPolicy, findingClasses: allClasses });
+      expect(await kind(queued('degraded', 2), readPolicy)).toBe('needs-you');
+    });
+    it('readBreakPolicy rejects malformed settings and retains the owed-send-back alarm', async () => {
+      const settingsPath = join(temp(), 'red-team.json');
+      writeFileSync(settingsPath, '{not json');
+      const readPolicy = () => readBreakPolicy({ settingsPath, env: {},
+        readPrefs: () => ({ prefs: { findingClasses: allClasses }, errors: [] }) });
+      expect(readPolicy).toThrow(SyntaxError);
+      expect(await kind(queued('degraded'), readPolicy)).toBe('confirmed-break-owed-send-back');
+    });
+    it('readBreakPolicy returns the class policy it validated (read once, no second read)', () => {
+      const dir = temp(), missing = join(dir, 'gone.json');
+      const policy = readBreakPolicy({ env: { WE_PLATFORM_PREFERENCES_FILE: missing },
+        readPrefs: () => ({ prefs: { findingClasses: allClasses }, errors: [] }) });
+      expect(policy.findingClasses).toEqual(allClasses);
+    });
+    it.each(['degraded=send-bak', 'nonsense=card', 'degraded', 'degraded=card=send-back'])('an invalid override %j is unreadable (strict), not a silent lower layer', value => {
+      expect(() => readBreakPolicy({ env: { WE_CONFIRMED: 'x', WE_RED_TEAM_CONFIRMED_BREAKS: value },
+        readPrefs: () => ({ prefs: { findingClasses: allClasses }, errors: [] }) })).toThrow(/invalid/);
+    });
+    it('an invalid value in the settings file is unreadable (strict)', () => {
+      const file = join(temp(), 'red-team.json');
+      writeFileSync(file, JSON.stringify({ redTeam: { confirmedBreaks: { degraded: 'send-bak' } } }));
+      expect(() => readBreakPolicy({ settingsPath: file, readPrefs: () => ({ prefs: { findingClasses: allClasses }, errors: [] }) })).toThrow(/invalid/);
+    });
+    it('an unreadable setting falls back to the strict policy (alarm)', async () => {
+      const comments = queued('degraded', 2);
+      expect(await kind(comments, () => { throw new Error('unreadable'); })).toBe('confirmed-break-owed-send-back');
+    });
+    it('a card-queued record for an older head does not settle the current head', async () => {
+      const [res] = gateComments({ broken: true, impact: 'degraded' });
+      const id = redTeamResultId(parseRedTeamComment(res.body));
+      const old = { user: { login: 'web-everything' }, created_at: '2026-10-10T02:05:00Z',
+        body: `${redTeamGateMarker(5768, '2'.repeat(40), GATE_OUTCOMES.CARD_QUEUED, id)}\n- 1 finding(s) filed as a follow-up card (#1).` };
+      expect(await kind([res, old], () => cardPolicy)).toBe('confirmed-break-owed-send-back');
+    });
+    it('a broken break with only a card record still alarms', async () => {
+      const comments = queued('broken');
+      expect(await kind(comments, () => cardPolicy)).toBe('confirmed-break-owed-send-back');
+    });
+    it('a degraded break with a card record still alarms when the policy is send-back', async () => {
+      const comments = queued('degraded');
+      expect(await kind(comments, () => ({ ...cardPolicy, degraded: 'send-back' }))).toBe('confirmed-break-owed-send-back');
+    });
   });
   it('an incomplete re-check (unverifiable finding) is red-team-undecided, never all gates pass', async () => {
     const comments = gateComments().slice(0, 1).map(c => ({ ...c, body: c.body.replace(/\n$/, '') +
