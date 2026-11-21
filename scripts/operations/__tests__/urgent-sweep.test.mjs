@@ -86,6 +86,56 @@ describe('urgent CI sweep', () => {
     }
     expect(f.d.escalate).not.toHaveBeenCalled();
   });
+  it.each([
+    ['settled', 'legacy', false], ['settled', 'legacy', true],
+    ['monitored', 'new-intent', true],
+  ])('%s: a %s settled-unregistered receipt an earlier sweep demoted to an absence snapshot (escalated=%s)', async (expected, kind, escalated) => {
+    // Earlier builds also refused legacy settled-unregistered receipts and appended an absence snapshot.
+    const f = fixture();
+    const { registrationCompletionRequired, ...legacyLoad } = load;
+    const urgent = kind === 'legacy' ? legacyLoad : load;
+    f.loads[0] = urgent;
+    f.d.loads = () => f.loads;
+    const id = urgentLoadIdentity(urgent);
+    f.state.push({ id, ref: urgent.ref, sha, at: load.at, status: 'settled-unregistered', ancestryVerified: true });
+    const snapshot = { id, ref: urgent.ref, sha, at: '2026-11-18T12:05:00Z', status: 'monitoring-unregistered' };
+    f.state.push(snapshot);
+    if (escalated) f.state.push({ ...snapshot, fallbackEscalated: true });
+    f.d.overlayState.mockReturnValue({ corrupt: false, overlays: [] });
+    f.d.containsOverlay.mockReturnValue(false);
+    f.d.now = () => '2026-11-18T12:30:00Z';
+    const before = f.state.length;
+
+    const out = await f.run();
+
+    if (expected === 'settled') {
+      expect(out).toMatchObject({ results: [] });
+      expect(f.state.length).toBe(before);
+      expect(f.d.checks).not.toHaveBeenCalled();
+    } else {
+      expect(out).toMatchObject({ results: [{ status: 'needs-you', detail: expect.stringContaining('Registration completion is unproven') }] });
+    }
+    expect(f.d.escalate).not.toHaveBeenCalled();
+  });
+  it('settles a legacy adopted receipt whose last notification flag landed only on a demoted copy', async () => {
+    const f = fixture();
+    const { registrationCompletionRequired, ...legacyLoad } = load;
+    f.loads[0] = legacyLoad;
+    f.d.loads = () => f.loads;
+    const adopted = { id: urgentLoadIdentity(legacyLoad), ref: load.ref, sha, at: load.at, removedAt: load.at,
+      status: 'unloaded-adopted', unloadEventSent: true, unloadEscalationSent: false };
+    f.state.push(adopted, { ...adopted, status: 'unloaded-pending-adoption', fallbackEscalated: true },
+      { ...adopted, status: 'unloaded-pending-adoption', fallbackEscalated: true, unloadEscalationSent: true });
+    f.d.overlayState.mockReturnValue({ corrupt: false, overlays: [] });
+    f.d.containsOverlay.mockReturnValue(false);
+    f.d.now = () => '2026-11-18T12:30:00Z';
+    const before = f.state.length;
+
+    expect(await f.run()).toMatchObject({ results: [] });
+    expect(f.state.length).toBe(before);
+    expect(f.d.escalate).not.toHaveBeenCalled();
+    expect(f.d.event).not.toHaveBeenCalled();
+  });
   it.each(['settled-unregistered', 'unloaded-adopted'])('does not grandfather an absent new intent with an old-shaped %s receipt', async status => {
     const f = fixture();
     f.d.loads = () => f.loads;

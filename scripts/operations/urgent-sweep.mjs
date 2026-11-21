@@ -181,12 +181,14 @@ export async function urgentSweep(_input = {}, deps = createSweepDeps()) {
     // Old removal-only receipts still need adoption; historical terminal receipts retain their proof.
     const records = deps.loads(), complete = completedUrgentRegistrations(records);
     const loads = new Map(records.filter(r => r.type === 'prototype-load.urgent').map(r => [identity(r), r]));
-    // An earlier build of this sweep had no legacy fallback: it escalated "completion unproven" for an
-    // old adopted receipt and appended a demoted copy of it (fallbackEscalated, still no
-    // registrationComplete field). That copy records only the spurious escalation, so it never
-    // replaces the adopted receipt it directly follows. Any other receipt in between still counts.
-    const demotedCopy = (r, previous) => previous?.status === 'unloaded-adopted' && r.status === 'unloaded-pending-adoption'
-      && r.fallbackEscalated === true && !Object.hasOwn(r, 'registrationComplete') && !Object.hasOwn(previous, 'registrationComplete');
+    // An earlier build of this sweep had no legacy fallback. For an old terminal receipt it reported
+    // "completion unproven" and appended a demotion: a fallbackEscalated copy of an adopted receipt,
+    // or an absence snapshot after an ancestry-verified unregistered one. Neither carries a
+    // registrationComplete field or any registration evidence, so a demotion never replaces the
+    // terminal receipt it follows. Any other receipt in between (monitoring-ci, explicit false) counts.
+    const demotedCopy = (r, previous) => previous && !Object.hasOwn(previous, 'registrationComplete') && !Object.hasOwn(r, 'registrationComplete')
+      && (previous.status === 'unloaded-adopted' && r.status === 'unloaded-pending-adoption' && r.fallbackEscalated === true
+        || previous.status === 'settled-unregistered' && previous.ancestryVerified === true && r.status === 'monitoring-unregistered');
     const latest = new Map();
     for (const r of settlements) if (r.status !== 'sweep-cursor' && !demotedCopy(r, latest.get(r.id))) latest.set(r.id, r);
     // Before the completion protocol, terminal receipts had no registrationComplete field.
@@ -205,7 +207,9 @@ export async function urgentSweep(_input = {}, deps = createSweepDeps()) {
     const absent = new Map(settlements.filter(r => r.status === 'monitoring-unregistered').map(r => [r.id, r]));
     for (const [id, r] of unloaded) if (r.status === 'unloaded-adopted' && registrationFinished(r) && unloadNotified(r)) settled.add(id);
     // A grandfathered adopted receipt may sit behind a demoted copy in `unloaded`; settle it from `latest`.
-    for (const id of legacyTerminal) if (latest.get(id).status === 'unloaded-adopted' && unloadNotified(latest.get(id))) settled.add(id);
+    // A notification checkpoint may have landed only on that copy, so it also counts.
+    for (const id of legacyTerminal) if (latest.get(id).status === 'unloaded-adopted'
+      && (unloadNotified(latest.get(id)) || notificationsComplete(unloaded.get(id)))) settled.add(id);
     const ciEscalated = new Set();
     const conflictEscalated = new Set(settlements.filter(r => r.status === 'monitoring-ci' && r.conflictEscalated === true).map(r => r.id));
     const failureEscalated = new Set(settlements.filter(r => r.status === 'monitoring-ci' && r.failureEscalated === true).map(r => r.id));
