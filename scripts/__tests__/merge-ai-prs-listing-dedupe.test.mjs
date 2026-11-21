@@ -160,6 +160,26 @@ describe('merge-ai-prs CLI — #4108 one `gh pr list` per repo per pass (RECONCI
     return text.trim().split('\n').filter(Boolean).map((l) => JSON.parse(l));
   };
 
+  it('an async listing worker failure stays a failed listing and never admits fixture PRs', async () => {
+    const gh = listingPorts.gh;
+    const spy = vi.spyOn(listingPorts, 'gh').mockImplementation((args, env) => {
+      if (args[0] === 'pr' && args[1] === 'list') {
+        return { status: 1, stdout: '', stderr: 'fixture async listing unreadable' };
+      }
+      return gh(args, env);
+    });
+    try {
+      const r = await runCli(['--repoll-delay=0'], {
+        GH_FIXTURE_PRS: JSON.stringify([openPr(4500, { labeled: true })]),
+      });
+      expect(r.status).toBe(4);
+      const payload = JSON.parse(r.stdout.trim());
+      expect(payload).toMatchObject({ ok: false, reason: 'gh-error' });
+      expect(payload.detail).toContain('fixture async listing unreadable');
+      expect(payload.toMerge).toBeUndefined();
+    } finally { spy.mockRestore(); }
+  });
+
   it('a RECONCILE-on pass (--label=ready-to-merge) issues exactly ONE `gh pr list` for the one swept repo', async () => {
     const r = await runCli([], { GH_FIXTURE_PRS: JSON.stringify([openPr(4501, { labeled: true })]) });
     expect(r.status).toBe(0);
