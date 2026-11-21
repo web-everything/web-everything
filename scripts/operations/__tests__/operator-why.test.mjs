@@ -113,6 +113,25 @@ it('injects all external reads and preserves failed-source gaps', () => {
   expect(read({ pr: 0, item: '5754', repo: base.repo }).card.queued).toBe(true);
 });
 
+it('why names review daemon when advisory is stale, through the real io seam (commits requested)', () => {
+  const pr = staleAdvisoryPr();
+  const run = (cmd, args) => {
+    const joined = [cmd, ...(args ?? [])].join(' ');
+    if (!/ pr view /.test(` ${joined} `)) return '';
+    const fields = args[args.indexOf('--json') + 1].split(',');
+    return JSON.stringify(Object.fromEntries(['number', 'state', 'isDraft', 'labels', 'headRefOid', 'mergeable', 'statusCheckRollup', 'commits']
+      .filter(k => fields.includes(k)).map(k => [k, k === 'number' ? 5017 : k === 'labels' ? [{ name: 'review:human' }] : pr[k] ?? null])));
+  };
+  const read = createWhyReader({
+    run, readAgents: () => [], readComments: () => pr.comments, readRequiredChecks: () => [], readChecks: () => [],
+    listPlists: () => [], listFiles: () => [], tail: () => ({ text: '' }), readClaims: () => [], readBuildHolds: () => [],
+    readBackoffs: () => [], readPrepareFailures: () => ({ failures: {} }), listPrs: () => [], readCard: () => null, now: () => 0,
+  });
+  const out = explainWhy(read({ pr: 5017, item: '', repo: base.repo }));
+  expect(out.owner).toBe('review daemon');
+  expect(out.waitingFor).toBe('advisory re-run on f7c7dcd37');
+});
+
 it('keeps the screen bounded while retaining all structured evidence and gaps', () => {
   const facts = { ...base, checks: Array.from({ length: 20 }, (_, i) => ({ name: `check${i}`, conclusion: 'success' })), logs: Array.from({ length: 30 }, (_, i) => ({ name: `daemon${i}`, line: 'observed' })), gaps: Array.from({ length: 20 }, (_, i) => ({ source: `read${i}`, error: 'unavailable' })) };
   const out = explainWhy(facts);

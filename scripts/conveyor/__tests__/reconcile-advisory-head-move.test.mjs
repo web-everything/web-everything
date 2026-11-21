@@ -42,7 +42,7 @@ describe('review:human advisory re-run on a moved head', () => {
   });
   it('an unreadable advisory dispatches nothing', () => {
     const result = run({ comments: [{ author, createdAt: '2026-11-20T10:00:00Z', body: `${ADVISORY_NOTE_MARKER}\n\nno basis recorded` }] });
-    expect(reviews(result)).toHaveLength(0);
+    expect(result.dispatch).toHaveLength(0);
   });
   it('no advisory at all: no head-moved row', () => {
     expect(reviews(run({ comments: [] }))).toHaveLength(0);

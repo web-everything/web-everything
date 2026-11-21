@@ -48,7 +48,7 @@ export function createWhyReader({
     const key = repoKeyForSlug(repo) ?? repo;
     const allPrs = safe(pr ? 'open PRs' : 'linked PRs', () => { const rows = listPrs(repo, { state: pr ? 'open' : 'all' }); if (!Array.isArray(rows)) throw new Error('expected PR array'); if (rows.length >= 10000) gaps.push({ source: pr ? 'open PRs' : 'linked PRs', error: 'listing may be truncated' }); return rows; }, []);
     if (pr) {
-      facts.pr = safe('PR state', () => JSON.parse(run('gh', ['pr', 'view', String(pr), '--repo', repo, '--json', 'number,state,isDraft,labels,headRefOid,mergeable,statusCheckRollup'], { encoding: 'utf8', timeout: 60000, maxBuffer: 32 * 1024 * 1024 })), {});
+      facts.pr = safe('PR state', () => JSON.parse(run('gh', ['pr', 'view', String(pr), '--repo', repo, '--json', 'number,state,isDraft,labels,headRefOid,mergeable,statusCheckRollup,commits'], { encoding: 'utf8', timeout: 60000, maxBuffer: 32 * 1024 * 1024 })), {});
       const comments = safe('comments', () => readComments(pr, repo), null);
       if (comments) {
         facts.pr.comments = comments;

@@ -303,7 +303,7 @@ export const DISPATCH_KINDS = Object.freeze(['fix', 'review', 'ci-heal', 'ci-tim
  */
 export const REFUSAL_KINDS = Object.freeze([
   'fix-join-wait',
-  'review-ci', 'review-referrals-pending',
+  'review-ci', 'review-referrals-pending', 'advisory-unreadable',
   'stood-down', 'load-flake-hold', 'load-flake-rearm-owed', 'no-findings', 'cap-exhausted',
   'live-process', 'awaiting-permission', 'liveness-unknown',
   'owed-elsewhere', 'owed-main-rule', 'owed-ci-rerun', 'nothing-owed', 'already-reviewed-head', 'already-landed',
@@ -1637,14 +1637,14 @@ export function advisoryHeadMoveState(pr) {
   if (!/^[0-9a-f]{40}$/.test(headSha)) return { owed: false };
   const trusted = (Array.isArray(pr?.comments) ? pr.comments : []).filter(isTrustedMarkerAuthor);
   const hasNote = trusted.some(c => String(c?.body ?? '').trimStart().startsWith(ADVISORY_NOTE_MARKER));
-  if (!latest) return hasNote ? { owed: false, unreadable: true } : { owed: false };
-  if (advisoryIsCurrent || alreadyReviewed || parseLatestHumanClearedSha(trusted) === headSha) return { owed: false };
-  if (unpinnedAdvisory) return { owed: false, unreadable: true };
   const commits = Array.isArray(pr?.commits) ? pr.commits : [];
   const tip = commits.at(-1);
-  if (!tip || String(tip.oid ?? '').toLowerCase() !== headSha) return { owed: false };
-  const mechanical = isMechanicalMergeCommit(tip) || isDrainBookkeepingCommit(tip)
-    || /^Conveyor-[A-Za-z-]+:/m.test(String(tip.messageBody ?? ''));
+  const mechanical = Boolean(tip) && String(tip.oid ?? '').toLowerCase() === headSha
+    && (isMechanicalMergeCommit(tip) || isDrainBookkeepingCommit(tip) || /^Conveyor-[A-Za-z-]+:/m.test(String(tip.messageBody ?? '')));
+  // Unreadable evidence on a mechanically moved head fails closed: no review of any kind dispatches.
+  if (!latest) return hasNote && mechanical ? { owed: false, unreadable: true } : { owed: false };
+  if (advisoryIsCurrent || alreadyReviewed || parseLatestHumanClearedSha(trusted) === headSha) return { owed: false };
+  if (unpinnedAdvisory) return mechanical ? { owed: false, unreadable: true } : { owed: false };
   return mechanical ? { owed: true, head: headSha, latestHead: latest.head ?? null } : { owed: false };
 }
 
@@ -3112,6 +3112,11 @@ export function planReconcile({
     // findings/cap accounting and the red-team review-unfinished hold; every other review gate still applies.
     if (phase === 'needs-human' && !withPhase.labels.includes(ADVISORY_LABELS.CHANGES)) {
       const moved = advisoryHeadMoveState(pr);
+      if (moved.unreadable) {
+        // An advisory exists but cannot be read: fail closed, no review of any kind until a person rules.
+        refuse('advisory-unreadable', { ...withPhase, why: 'the newest advisory on this review:human PR cannot be read, so no review is dispatched; a person must read the thread' });
+        continue;
+      }
       if (moved.owed) {
         const rowsBefore = dispatch.length;
         dispatchReviewRow({
