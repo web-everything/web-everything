@@ -2282,6 +2282,30 @@
       "matchSha256": "640080cfdeac80415a6282f3cad716cfd141b01747a818e15e35859fd937b24f",
       "lineSha256": "30526bb6386f1e77cb68e26f39aa26cee5c087f7b369fbc6d579acff3e20eed8",
       "reason": "R972 policy excerpts quote synthetic fixture matches; exact match and line only."
+    },
+    {
+      "path": "scripts/lib/__tests__/red-team-label-settle.test.mjs",
+      "pattern": "account-id",
+      "matchText": "WE_APP_ID: '123",
+      "matchSha256": "717fb9d9da045d004e2fc317d12ceb3e8028b4d0a41011a3fb9dca118f323064",
+      "lineSha256": "9387e24929d530eb654ab78f24c039698271919a4b1d5c1f042eccb0c3047051",
+      "reason": "Synthetic App identity exercises head-bound red-team check trust; exact fixture match and source line only."
+    },
+    {
+      "path": "scripts/lib/__tests__/red-team-label-settle.test.mjs",
+      "pattern": "account-id",
+      "matchText": "WE_APP_ID: '123",
+      "matchSha256": "717fb9d9da045d004e2fc317d12ceb3e8028b4d0a41011a3fb9dca118f323064",
+      "lineSha256": "1ca162420e67a5c8e4cebb7d8d24e50726b3321d84856e95fc964a2c668e817e",
+      "reason": "Synthetic App identity exercises head-bound red-team check trust; exact fixture match and source line only."
+    },
+    {
+      "path": "scripts/settings/privacy-terms-allowlist.json",
+      "pattern": "account-id",
+      "matchText": "WE_APP_ID: '123",
+      "matchSha256": "717fb9d9da045d004e2fc317d12ceb3e8028b4d0a41011a3fb9dca118f323064",
+      "lineSha256": "c38f6530e64420de46c9367a8a65512a14aa80a25ca18b472f2024892619b2d2",
+      "reason": "Policy excerpt quotes a synthetic test identity; exact match and source line only."
     }
   ]
 }

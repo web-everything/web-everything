@@ -53,29 +53,33 @@ function appendEvent(ev, env) {
  * @param {{repo?:string, op?:string, attempts?:number, backoffMs?:number[], sleep?:Function, streaks?:Map,
  *   persist?:boolean, threshold?:number, onEvent?:Function, env?:object, daemon?:string}} [o]
  */
-export function withListRetry(fn, { repo = '', op = 'pr-list', attempts, backoffMs, sleep = syncSleep, streaks, persist = true,
+function* listRetry(fn, { repo = '', op = 'pr-list', attempts, backoffMs, sleep = syncSleep, streaks, persist = true,
   threshold = GH_LIST_FAIL_THRESHOLD, onEvent, env = process.env, daemon } = {}) {
   backoffMs ??= listBackoffFromEnv(env);
   attempts ??= backoffMs.length + 1;
   const key = `${repo}:${op}`;
-  const map = streaks ?? (persist ? loadStreaks(env) : new Map());
-  const save = () => { if (!streaks && persist) saveStreaks(env, map); };
+  // Read persistent state only at the update, after any asynchronous list/backoff.
+  // Each read-modify-save is synchronous so parallel listings cannot overwrite one another.
+  const current = () => streaks ?? (persist ? loadStreaks(env) : new Map());
+  const save = (map) => { if (!streaks && persist) saveStreaks(env, map); };
   let lastError;
   for (let attempt = 0; attempt < attempts; attempt++) {
     try {
-      const out = fn();
-      if (map.delete(key)) save();
+      const out = yield fn;
+      const map = current();
+      if (map.delete(key)) save(map);
       return out;
     } catch (e) {
       lastError = e;
       if (!isTransientListFailure(e) || attempt === attempts - 1) break;
-      sleep(backoffMs[Math.min(attempt, backoffMs.length - 1)]);
+      yield () => sleep(backoffMs[Math.min(attempt, backoffMs.length - 1)]);
     }
   }
   if (isTransientListFailure(lastError)) {
+    const map = current();
     const consecutive = (Number(map.get(key)) || 0) + 1;
     map.set(key, consecutive);
-    save();
+    save(map);
     if (consecutive >= threshold && consecutive % threshold === 0) {
       const ev = { kind: 'gh-list-failed', repo, daemon: daemon ?? process.env.WE_DAEMON_NAME ?? undefined,
         detail: { op, consecutive, error: String(lastError?.message ?? lastError).split('\n')[0].slice(0, 300) } };
@@ -83,4 +87,31 @@ export function withListRetry(fn, { repo = '', op = 'pr-list', attempts, backoff
     }
   }
   throw lastError;
+}
+
+
+/** Synchronous callers retain the same retries, backoff and persistent failure signal. */
+export function withListRetry(fn, options) {
+  const retry = listRetry(fn, options);
+  let step = retry.next();
+  while (!step.done) {
+    let value;
+    try { value = step.value(); }
+    catch (error) { step = retry.throw(error); continue; }
+    step = retry.next(value);
+  }
+  return step.value;
+}
+
+/** Await list failures before applying the same retry policy (including async hydration). */
+export async function withListRetryAsync(fn, options) {
+  const retry = listRetry(fn, options);
+  let step = retry.next();
+  while (!step.done) {
+    let value;
+    try { value = await step.value(); }
+    catch (error) { step = retry.throw(error); continue; }
+    step = retry.next(value);
+  }
+  return step.value;
 }

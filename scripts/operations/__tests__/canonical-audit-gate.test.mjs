@@ -65,6 +65,43 @@ describe('canonical audit before opening a PR', () => {
     expect(fixture({ records: [{ ...green, head: other, fingerprint: fp }], liveFingerprint: () => fp }).result)
       .toMatchObject({ ok: false, reason: 'canonical-audit-missing', record: null });
   });
+  describe('merge-from-main carries the audit', () => {
+    const fp = 'd'.repeat(64);
+    const carried = { ...green, head: other, fingerprint: fp };
+    const git = ({ parents = `${sha} ${other} ${'e'.repeat(40)}` } = {}) => (args, resolved) => {
+      if (args.includes('rev-list')) { if (parents instanceof Error) throw parents; return parents; }
+      return resolved;
+    };
+    it('accepts the audited head carried across a merge with an equal fingerprint', () => {
+      expect(fixture({ records: [carried], liveFingerprint: () => fp, execOverride: git() }).result)
+        .toMatchObject({ ok: true, sha, record: carried });
+    });
+    it('does not carry a waiver recorded for the audited head', () => {
+      const weakCarried = { ...weak, head: other, fingerprint: fp };
+      expect(fixture({ records: [weakCarried], tool: { ruledWeakened: [{ ...waiver, sha: other }] }, liveFingerprint: () => fp, execOverride: git() }).result)
+        .toMatchObject({ ok: false });
+    });
+    it('refuses when the second parent is not in origin/main', () => {
+      expect(fixture({ records: [carried], liveFingerprint: () => fp, execOverride: git(), ancestor: () => { throw new Error('no'); } }).result)
+        .toMatchObject({ ok: false, reason: 'canonical-audit-missing' });
+    });
+    it.each([
+      ['a non-merge head', { execOverride: git({ parents: `${sha} ${other}` }) }],
+      ['an audited head that is the second parent', { execOverride: git({ parents: `${sha} ${'e'.repeat(40)} ${other}` }) }],
+      ['an octopus merge', { execOverride: git({ parents: `${sha} ${other} ${'e'.repeat(40)} ${'f'.repeat(40)}` }) }],
+      ['unreadable parents', { execOverride: git({ parents: new Error('boom') }) }],
+      ['a different fingerprint', { execOverride: git(), liveFingerprint: () => 'f'.repeat(64) }],
+      ['an unreadable fingerprint', { execOverride: git(), liveFingerprint: false }],
+    ])('refuses %s', (_n, over) => {
+      expect(fixture({ records: [carried], liveFingerprint: () => fp, ...over }).result)
+        .toMatchObject({ ok: false, reason: 'canonical-audit-missing', record: null });
+    });
+    it('refuses a carried waiver when the head is not a merge', () => {
+      const weakCarried = { ...weak, head: other, fingerprint: fp };
+      expect(fixture({ records: [weakCarried], tool: { ruledWeakened: [{ ...waiver, sha: other }] }, liveFingerprint: () => fp,
+        execOverride: git({ parents: sha }) }).result).toMatchObject({ ok: false });
+    });
+  });
   it('R995: a failed live-fingerprint lookup refuses and never falls back to an older exact-head pass', () => {
     const fp = 'd'.repeat(64);
     const records = [{ ...green, fingerprint: fp }, { ...weak, head: other, fingerprint: fp, at: '2026-11-17T01:00:00Z' }];
