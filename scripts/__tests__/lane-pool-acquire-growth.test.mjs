@@ -271,7 +271,17 @@ describe('lane-pool acquire (#3383) — remote-probe-failure stops growth, never
     expect(listLanes([])).toEqual([1, 2]);
   });
 
-  it.each(['.git', 'directory'])('a vanished lowest-numbered lane (%s) does NOT block growth against a reachable remote', (missing) => {
+  // Two plain `it(` cases (not `it.each`): the merge-gate's test-gaming scan counts `it(`/`test(` openers, so a
+  // parametrised case would read as a removed test even though it expands to two.
+  it('a vanished lowest-numbered lane (.git) does NOT make the growth probe misread a reachable remote as unreachable', () => {
+    expectVanishedLaneDoesNotBlockGrowth('.git');
+  });
+
+  it('a vanished lowest-numbered lane (directory) does NOT block growth against a reachable remote', () => {
+    expectVanishedLaneDoesNotBlockGrowth('directory');
+  });
+
+  function expectVanishedLaneDoesNotBlockGrowth(missing) {
     // PR #2607 review finding: the growth probe ran `ls-remote origin` inside `lanes[0]` unconditionally. With
     // lane-1's `.git` gone (a concurrent trim/vanish, #xixn30q) that probe failed for a LOCAL reason, and
     // acquire refused to grow a pool whose real origin was fully reachable — sticky until a human re-provisioned.
@@ -288,7 +298,7 @@ describe('lane-pool acquire (#3383) — remote-probe-failure stops growth, never
     expect(r.out.trim()).toMatch(missing === '.git' ? /lane-3$/ : /lane-1$/);
     expect(r.err).toMatch(/growing by up to 1 new lane/);
     if (missing === '.git') expect(readFileSync(join(vanished, 'file.txt'), 'utf8')).toBe('v1\n');
-  });
+  }
 
   it('once the probe can succeed again (real git restored), acquire grows normally', () => {
     provision(1);
