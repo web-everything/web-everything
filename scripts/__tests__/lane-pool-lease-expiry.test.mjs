@@ -13,7 +13,10 @@ const readLease = () => JSON.parse(readFileSync(marker(), 'utf8'));
 const run = (args, cwd = reference) => spawnSync(process.execPath, [cli, ...args], {
   cwd, env, encoding: 'utf8', timeout: 20_000,
 });
-const seed = (extra = {}) => writeFileSync(marker(), JSON.stringify({ session: 'owner',
+// Owned re-adoption through the normal, canonical-origin-checked acquire path (no reset, no reap).
+const readopt = () => ['acquire', '--lane=1', '--adopt', '--session=owner', '--no-reset', '--no-reap',
+  '--pool=fixture', `--origin=${reference}`, `--reference=${reference}`, '--no-install', '--json'];
+const seed = (extra = {}) =>writeFileSync(marker(), JSON.stringify({ session: 'owner',
   acquiredAt: '2020-01-01T00:00:00.000Z', ttlMinutes: 240, ...extra }));
 beforeEach(() => {
   root = mkdtempSync(join(tmpdir(), 'lease-expiry-'));
@@ -43,22 +46,15 @@ it.each(['live', 'dirty'])('stale %s lane refuses takeover and reclaim, even wit
   }
   if (kind === 'dirty') expect(readFileSync(join(lane, 'work'), 'utf8')).toBe('precious work');
 });
-it('re-adopts an owned lane from its cwd without a canonical origin and preserves dirty work', () => {
-  seed({ holder: 'existing-holder', workflowLane: true });
-  writeFileSync(join(lane, 'work'), 'precious work');
-  const result = run(['acquire', '--lane=1', '--adopt', '--session=owner', '--json'], lane);
-  expect(result.status, result.stderr).toBe(0);
-  expect(readLease().workflowLane).toBe(true);
-  expect(readLease().holder).toBe('existing-holder');
-  expect(readLease().pid).toBe(process.pid);
-  expect(readFileSync(join(lane, 'work'), 'utf8')).toBe('precious work');
-});
-it('foreign re-adoption still requires a canonical origin', () => {
-  seed();
-  const result = run(['acquire', '--lane=1', '--adopt', '--session=other'], lane);
+// The owned `acquire --adopt` metadata-only fast path was scoped out of PR #7179 (carded separately):
+// re-adopting from the lane's own cwd goes through canonical-origin resolution for every session.
+it.each(['owner', 'other'])('%s re-adoption from the lane cwd requires a canonical origin', session => {
+  seed({ holder: 'existing-holder' });
+  const before = readFileSync(marker(), 'utf8');
+  const result = run(['acquire', '--lane=1', '--adopt', `--session=${session}`], lane);
   expect(result.status).not.toBe(0);
   expect(result.stderr).toMatch(/canonical origin/);
-  expect(readLease().session).toBe('owner');
+  expect(readFileSync(marker(), 'utf8')).toBe(before);
 });
 
 it.each(['live', 'dirty'])('forced refresh preserves a stale %s lease before fetch or reset', kind => {
@@ -76,7 +72,7 @@ it.each(['live', 'dirty'])('forced refresh preserves a stale %s lease before fet
 it('re-adoption recovers a dead writer guard', () => {
   seed();
   writeFileSync(`${marker()}.lock`, '2147483646\n');
-  const result = run(['acquire', '--lane=1', '--adopt', '--session=owner', '--json'], lane);
+  const result = run(readopt());
   expect(result.status, result.stderr).toBe(0);
   expect(readLease().session).toBe('owner');
   expect(existsSync(`${marker()}.lock`)).toBe(false);
@@ -104,8 +100,8 @@ it('re-adoption waits for a concurrent heartbeat writer to release its guard', a
       fs.linkSync = (source, path, ...args) => { signal(path); return link(source, path, ...args); };
       syncBuiltinESMExports();`;
     const result = spawnSync(process.execPath, [`--import=data:text/javascript,${encodeURIComponent(preload)}`,
-      cli, 'acquire', '--lane=1', '--adopt', '--session=owner', '--json'], {
-      cwd: lane, env, encoding: 'utf8', timeout: 20000,
+      cli, ...readopt()], {
+      cwd: reference, env, encoding: 'utf8', timeout: 20000,
     });
     expect(result.status, result.stderr).toBe(0);
     expect(existsSync(attempted)).toBe(true);
@@ -120,7 +116,7 @@ it.each(['0', '-1', 'bad', '1.5'])('rejects an invalid declared holder PID %s be
   seed();
   const before = readFileSync(marker(), 'utf8');
   env.LANE_HOLDER_PID = pid;
-  const result = run(['acquire', '--lane=1', '--adopt', '--session=owner', '--json'], lane);
+  const result = run(readopt());
   expect(result.status).not.toBe(0);
   expect(result.stderr).toContain('LANE_HOLDER_PID');
   expect(readFileSync(marker(), 'utf8')).toBe(before);
@@ -140,9 +136,9 @@ it('an exiting acquire wrapper can name its surviving sibling as the lease holde
   try {
     seed();
     const wrapper = `require('node:child_process').execFileSync(process.execPath, ${JSON.stringify([
-      cli, 'acquire', '--lane=1', '--adopt', '--session=owner', '--json',
+      cli, ...readopt(),
     ])}, { stdio: 'pipe' });`;
-    const acquired = spawnSync(process.execPath, ['-e', wrapper], { cwd: lane,
+    const acquired = spawnSync(process.execPath, ['-e', wrapper], { cwd: reference,
       env: { ...env, LANE_HOLDER_PID: String(sibling.pid) }, encoding: 'utf8', timeout: 20000 });
     expect(acquired.status, acquired.stderr).toBe(0);
     expect(readLease().pid).toBe(sibling.pid);
@@ -153,23 +149,6 @@ it('an exiting acquire wrapper can name its surviving sibling as the lease holde
   } finally {
     await new Promise(resolve => { sibling.once('exit', resolve); sibling.kill(); });
   }
-});
-
-it('owned re-adoption refuses missing ancestor history without repair or reset', () => {
-  seed();
-  const parent = git(['rev-parse', 'HEAD'], lane).trim();
-  git(['-c', 'user.name=test', '-c', 'user.email=test@example.test',
-    'commit', '--quiet', '--allow-empty', '-m', 'local tip'], lane);
-  const object = join(lane, '.git', 'objects', parent.slice(0, 2), parent.slice(2));
-  rmSync(object);
-  writeFileSync(join(lane, 'work'), 'precious work');
-
-  const result = run(['acquire', '--lane=1', '--adopt', '--session=owner', '--json'], lane);
-  expect(result.status).not.toBe(0);
-  expect(result.stderr).toContain('QUARANTINED');
-  expect(existsSync(object)).toBe(false);
-  expect(existsSync(join(pool, 'fixture', '.quarantine-state', 'lane-1.json'))).toBe(true);
-  expect(readFileSync(join(lane, 'work'), 'utf8')).toBe('precious work');
 });
 
 it('verify-lane renews its selected cwd lease throughout a failing gate', () => {

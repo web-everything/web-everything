@@ -389,18 +389,6 @@ function resolveRepo(repoFlags = flags) {
   const env = laneGitHardeningEnv({ ...scrubGitRepoEnv(process.env), GIT_OPTIONAL_LOCKS: '0' });
   const gitOptions = { timeout: LOCAL_GIT_TIMEOUT_MS, env };
   const topLevel = tryGit(['rev-parse', '--show-toplevel'], referencePath, gitOptions) || referencePath;
-  // Only explicit owned re-adoption is metadata-only; every other path retains origin validation.
-  if (cmd === 'acquire' && repoFlags.adopt && repoFlags.lane !== undefined && !repoFlags.base && !repoFlags.reserve) {
-    const ownLane = /^lane-(\d+)$/.exec(basename(topLevel));
-    const ownPoolDir = dirname(topLevel);
-    if (ownLane && Number(repoFlags.lane) === Number(ownLane[1])
-        && dirname(ownPoolDir) === resolve(POOL_ROOT)
-        && (!repoFlags.pool || repoFlags.pool === basename(ownPoolDir))
-        && leaseOwnedBy(readLease(topLevel), defaultSession())) {
-      return { name: basename(ownPoolDir), poolDir: ownPoolDir, referencePath: topLevel,
-        branch: repoFlags.branch || 'main', originUrl: null, renewOwnLease: true };
-    }
-  }
   const needsOrigin = ['acquire', 'provision', 'refresh', 'remove', 'trim', 'reclaim'].includes(cmd)
     || (cmd === 'list' && repoFlags.acquirable);
   // GC and release can maintain leases without a trusted origin, but recovery must never forward a lane remote.
@@ -2598,7 +2586,6 @@ const touchFreeList = (repo, lane, free) => touchFreeLaneList({
 });
 
 async function cmdAcquire(repo) {
-  if (repo.renewOwnLease) { flags['no-reset'] = true; flags['no-reap'] = true; flags['no-install'] = true; }
   const assertExpectedHolder = (dir) => {
     if (flags['expect-holder'] === undefined) return;
     const expected = flags['expect-holder'];
@@ -2709,7 +2696,7 @@ async function cmdAcquire(repo) {
     }
     // The lane is claimed. Repair missing alternates NOW, before any dirty/ahead refusal below: it only adds a file, so it is
     // safe on a dirty lane, and a lane that is refused for its work still stops re-downloading the repository.
-    if (!repo.renewOwnLease) ensureAlternatesFor(repo, n);
+    ensureAlternatesFor(repo, n);
     // Preserve history evidence/repair/quarantine before an unknown ahead count can refuse this lane.
     // Keep this after the claim so a live foreign lease is never repaired, and roll back on failure.
     try {
@@ -3135,16 +3122,10 @@ async function cmdAcquire(repo) {
   // would silently re-run `fetchOriginPruneWithRetry`/`checkout -B`/`ensureDeps` a second time for no reason.
   if (flags.lane !== undefined) {
     try {
-      if (!repo.renewOwnLease) {
-        provisionClaimedLane(repo, chosen, targetWasReserved, {
-          beforeFetch: () => assertReadableLaneEvidence(repo, chosen),
-          beforeReset: getShas => assertNoUnpushedLaneWork(repo, chosen, getShas),
-        });
-      } else {
-        // Re-adopting our own lane never resets it, but it still gets the same config scrub and env/hook repair.
-        scrubClaimedLaneConfig(dir, 'before acquire hand-out');
-        writeLaneEnv(repo, chosen);
-      }
+      provisionClaimedLane(repo, chosen, targetWasReserved, {
+        beforeFetch: () => assertReadableLaneEvidence(repo, chosen),
+        beforeReset: getShas => assertNoUnpushedLaneWork(repo, chosen, getShas),
+      });
     } catch (e) {
       restoreLeaseAfterRefusedClaim(dir, preClaimLease);
       fail(e && e.message ? e.message : String(e));
