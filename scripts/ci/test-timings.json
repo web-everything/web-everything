@@ -577,6 +577,7 @@
   "scripts/conveyor/__tests__/pr-label-mirror.test.mjs": 0.36,
   "scripts/conveyor/__tests__/pr-lifecycle.test.mjs": 0.04,
   "scripts/conveyor/__tests__/pr-live-owner-lock.test.mjs": 0.09,
+  "scripts/conveyor/__tests__/pr-live-owner-watch-retry.test.mjs": 1,
   "scripts/conveyor/__tests__/pr-live-owner-watch.test.mjs": 10.27,
   "scripts/conveyor/__tests__/pr-merge-watch-pass.test.mjs": 2.02,
   "scripts/conveyor/__tests__/pr-merge-watch-regressions.test.mjs": 0.95,
@@ -2374,7 +2375,8 @@
   "scripts/conveyor/soak/breaks/timings-advisory-merge.soak.test.mjs": 2,
   "scripts/conveyor/soak/breaks/superseded-omits-retired-merged-overlay.soak.test.mjs": 2,
   "scripts/conveyor/soak/breaks/smoke-queue-force-priority.soak.test.mjs": 1,
-  "scripts/conveyor/soak/breaks/daemon-git-developer-dir.soak.test.mjs": 1
+  "scripts/conveyor/soak/breaks/daemon-git-developer-dir.soak.test.mjs": 1,
+  "scripts/conveyor/soak/breaks/watchdog-pr-list-transient-retry.soak.test.mjs": 3
  },
  "integration": {}
 }
