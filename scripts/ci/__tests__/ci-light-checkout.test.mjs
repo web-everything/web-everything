@@ -98,7 +98,7 @@ describe('test-selection-measure lives in its own workflow (R523)', () => {
   it('has its own concurrency group, never cancels, and stays non-gating and gated by the repo var', () => {
     expect(own.concurrency.group).toMatch(/^test-selection-measure-/);
     expect(own.concurrency.group).not.toMatch(/^ci-/);
-    expect(Object.keys(own.on).sort()).toEqual(['merge_group', 'pull_request', 'push', 'workflow_dispatch']);
+    expect(Object.keys(own.on).sort()).toEqual(['push', 'workflow_dispatch']);
     expect(job['continue-on-error']).toBe(true);
     expect(job['timeout-minutes']).toBe(75);
     expect(job.if).toContain("vars.WE_MEASURE_TEST_SELECTION == '1'");

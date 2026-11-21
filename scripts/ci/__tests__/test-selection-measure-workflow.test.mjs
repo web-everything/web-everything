@@ -23,6 +23,11 @@ describe('test-selection measure produces data (advisory)', () => {
     expect(shadow['continue-on-error']).toBe(true);
   });
 
+  it('triggers only on push to main and manual dispatch (not every PR push)', () => {
+    expect(Object.keys(workflow.on).sort()).toEqual(['push', 'workflow_dispatch']);
+    expect(workflow.on.push.branches).toEqual(['main']);
+  });
+
   it('is still gated on the repo variable (or manual dispatch)', () => {
     expect(String(job.if)).toContain("vars.WE_MEASURE_TEST_SELECTION == '1'");
   });

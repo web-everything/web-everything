@@ -7,9 +7,7 @@ name: Test-selection measure
 on:
   push:
     branches: [main]
-  pull_request:
-    branches: [main, 'lane/**']
-  merge_group:
+  # Not on pull_request/merge_group: the full-suite re-run is costly, so measure only the merged diff on main.
   workflow_dispatch:
 
 concurrency:
