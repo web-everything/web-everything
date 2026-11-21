@@ -44,15 +44,17 @@ export function mainCiGreenAfter(main, completedAt) {
 }
 
 /** Fresh, bounded read: never select an older success by filtering the latest run's status. */
+const MAIN_CI_QUERY = 'branch=main&event=push&per_page=10';
+const MAIN_CI_EVENT = new URLSearchParams(MAIN_CI_QUERY).get('event');
 export function readLatestMainCi({ repo, runGh = runGhSync } = {}) {
   try {
-    const data = JSON.parse(runGh(['api', `repos/${repo}/actions/workflows/ci.yml/runs?branch=main&event=push&per_page=10`], {
+    const data = JSON.parse(runGh(['api', `repos/${repo}/actions/workflows/ci.yml/runs?${MAIN_CI_QUERY}`], {
       encoding: 'utf8', timeout: 30_000, maxBuffer: 1024 * 1024, stdio: ['ignore', 'pipe', 'pipe'],
       throttle: { op: 'merge-gate-main-ci', repo },
     }));
     const runs = data?.workflow_runs;
     const run = Array.isArray(runs) && runs.length > 0 && runs.length <= 10 ? runs[0] : null;
-    if (!run || runs.some(r => r?.head_branch !== 'main' || r.event !== 'push' || r.status !== 'completed')
+    if (!run || runs.some(r => r?.head_branch !== 'main' || r.event !== MAIN_CI_EVENT || r.status !== 'completed')
       || run.conclusion !== 'success'
       || !Number.isFinite(Date.parse(run.updated_at))) return { error: 'latest main CI incomplete or unreadable' };
     return { status: run.status, conclusion: run.conclusion, completed_at: run.updated_at };
