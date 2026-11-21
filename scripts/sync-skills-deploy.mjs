@@ -14,7 +14,10 @@
  * script never silently makes a WE-repo-specific orchestration skill — batch-backlog-items, drain, jury,
  * pr, … — globally available in an unrelated repo; those stay project-local via the `.claude/skills`
  * symlink). Pass --all to deploy every skills-src/* entry (bootstrapping a new machine, or deliberately
- * promoting a skill to global), or --only=name1,name2 to scope to specific skills.
+ * promoting a skill to global), or --only=name1,name2 to scope to specific skills. Scoped migration:
+ * providers and review-design moved out of this repo's local skills tree into the ops root. When found
+ * in a secondary root, these two also deploy by default so existing local users retain access after a
+ * pull. Other new skills remain opt-in; --only still restricts the entire run.
  *
  * WHAT IT COPIES: per skill, only the files `git` tracks under `skills-src/<skill>/` — never a gitignored
  * runtime/local-state file (batch-backlog-items' claims.json/reservations.json/capacity.json are per-repo
@@ -52,6 +55,9 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 export const REPO_ROOT = path.resolve(__dirname, '..');
 export const SRC_ROOT = path.join(REPO_ROOT, 'skills-src');
 
+// SK1 relocation: preserve discovery after removing these formerly project-local skills.
+const RELOCATED_SKILLS = new Set(['providers', 'review-design']);
+
 export function deployRoot(env = process.env) {
   return env.WE_SKILLS_DEPLOY_DIR
     ? path.resolve(env.WE_SKILLS_DEPLOY_DIR)
@@ -59,9 +65,10 @@ export function deployRoot(env = process.env) {
 }
 
 export function parseArgs(argv) {
-  const args = { all: false, check: false, dryRun: false, json: false, prune: false, only: null };
+  const args = { all: false, check: false, dryRun: false, json: false, prune: false, only: null, roots: [] };
   for (const raw of argv) {
-    if (raw === '--all') args.all = true;
+    if (raw.startsWith('--root=')) args.roots.push(raw.slice('--root='.length));
+    else if (raw === '--all') args.all = true;
     else if (raw === '--check') args.check = true;
     else if (raw === '--dry-run') args.dryRun = true;
     else if (raw === '--json') args.json = true;
@@ -92,7 +99,8 @@ export function listFilesRecursive(dir) {
 
 /** The files `git` tracks under `srcDir`, as paths relative to `srcDir`. */
 export function gitTrackedFiles(srcDir, repoRoot = REPO_ROOT) {
-  const relToRepo = path.relative(repoRoot, srcDir);
+  // Git discovers physical repo paths; source roots and explicit repo roots may use symlink aliases.
+  const relToRepo = path.relative(fs.realpathSync(repoRoot), fs.realpathSync(srcDir));
   const out = execFileSync('git', ['ls-files', '--', relToRepo], { cwd: repoRoot, encoding: 'utf8' });
   return out.split('\n').filter(Boolean).map((p) => path.relative(relToRepo, p));
 }
@@ -239,28 +247,60 @@ export function listSkillNames(srcRoot = SRC_ROOT) {
 }
 
 /** Build the full set of per-skill plans for a run. Pulls `git ls-files` per skill (the only I/O git call). */
-export function buildPlans({ srcRoot = SRC_ROOT, destRoot, only = null, all = false, prune = false, repoRoot = REPO_ROOT } = {}) {
-  const allNames = listSkillNames(srcRoot);
+export function buildPlans({ srcRoot = SRC_ROOT, extraRoots = [], destRoot, only = null, all = false, prune = false, repoRoot = null } = {}) {
+  if (!repoRoot) repoRoot = fs.existsSync(srcRoot) ? gitToplevel(srcRoot) : REPO_ROOT;
+  // SK1: one home per skill. Primary root uses `repoRoot`; each extra root is its own git repo (found via
+  // `git rev-parse`; fails closed if it is not one).
+  const roots = [{ root: srcRoot, repoRoot }, ...extraRoots.map((r) => ({ root: path.resolve(r), repoRoot: gitToplevel(r) }))];
+  const home = new Map(); // name -> { root, repoRoot }
+  for (const entry of roots) {
+    for (const name of listSkillNames(entry.root)) {
+      if (home.has(name)) {
+        throw new Error(
+          `sync-skills-deploy: skill "${name}" has two homes — ${path.join(home.get(name).root, name)} and `
+          + `${path.join(entry.root, name)}. Refusing; delete one.`,
+        );
+      }
+      home.set(name, entry);
+    }
+  }
+  const allNames = [...home.keys()].sort();
   if (only) {
-    const unknown = only.filter((n) => !allNames.includes(n));
+    const unknown = only.filter((n) => !home.has(n));
     if (unknown.length) throw new Error(`sync-skills-deploy: unknown skill(s): ${unknown.join(', ')}`);
   }
   const names = only ?? allNames;
   const plans = [];
   for (const name of names) {
-    const srcDir = path.join(srcRoot, name);
+    const entry = home.get(name);
+    const srcDir = path.join(entry.root, name);
     const destDir = path.join(destRoot, name);
-    if (!only && !all && !fs.existsSync(destDir)) continue; // default: keep already-deployed skills in sync only
-    const trackedRel = gitTrackedFiles(srcDir, repoRoot);
+    const trackedRel = gitTrackedFiles(srcDir, entry.repoRoot);
+    // A never-committed skill dir is drift in every mode: it can never deploy, and silence hid it (21:33 ET gap).
+    if (!trackedRel.includes('SKILL.md')) {
+      plans.push({ name, srcDir, destDir, destRoot, actions: [], stale: [], pruned: prune, alreadyDeployed: fs.existsSync(destDir), untracked: true });
+      continue;
+    }
+    const relocated = entry.root !== srcRoot && RELOCATED_SKILLS.has(name);
+    if (!only && !all && !relocated && !fs.existsSync(destDir)) continue;
     plans.push(planSkill({ name, srcDir, destDir, trackedRel, prune, destRoot }));
   }
   return plans;
+}
+
+function gitToplevel(dir) {
+  try {
+    return execFileSync('git', ['rev-parse', '--show-toplevel'], { cwd: dir, encoding: 'utf8', maxBuffer: 1024 * 1024 }).trim();
+  } catch {
+    throw new Error(`sync-skills-deploy: extra root "${dir}" is not inside a git repo; refusing`);
+  }
 }
 
 /** #2579 review — exported so the OUTPUT contract is unit-testable. The stale-reporting gap existed
  *  precisely because nothing could assert what this function prints. */
 export function formatPlans(plans, { checkOnly, dryRun, noun = 'skill' }) {
   const drifted = plans.filter((p) => p.actions.length > 0);
+  const untracked = plans.filter((p) => p.untracked);
   // #2579 review — STALE FILES MUST BE REPORTED. Making deletion opt-in (`--prune`) was justified in this
   // file's own header by "stale files are reported by `--check`, never silently destroyed" — but `plan.stale`
   // was computed, returned, and then consumed by NOTHING, so the compensating control did not exist and the
@@ -268,7 +308,10 @@ export function formatPlans(plans, { checkOnly, dryRun, noun = 'skill' }) {
   // source does not, which is exactly the divergence this tool exists to surface.
   const withStale = plans.filter((p) => (p.stale || []).length > 0 && !p.pruned);
   const lines = [];
-  if (drifted.length === 0 && withStale.length === 0) {
+  for (const plan of untracked) {
+    lines.push(`UNTRACKED ${plan.name}: no git-tracked files at ${plan.srcDir}; commit it or it never deploys`);
+  }
+  if (drifted.length === 0 && withStale.length === 0 && untracked.length === 0) {
     lines.push(`✓ in sync — ${plans.length} ${noun}(s) checked, no drift`);
   } else {
     const verb = checkOnly ? 'DRIFT' : dryRun ? 'WOULD SYNC' : 'SYNCED';
@@ -292,12 +335,29 @@ export function formatPlans(plans, { checkOnly, dryRun, noun = 'skill' }) {
   return lines.join('\n');
 }
 
+/** Root-selection decisions are deterministic given env, args, home and the injectable existence probe. */
+export function resolveRoots(env = process.env, args = { roots: [] }, home = os.homedir(), exists = fs.existsSync) {
+  const srcRoot = env.WE_SKILLS_SRC_ROOT ? path.resolve(env.WE_SKILLS_SRC_ROOT) : SRC_ROOT;
+  if (!exists(srcRoot)) throw new Error(`sync-skills-deploy: missing skills-src at ${srcRoot}`);
+  // Extra roots: --root=<dir> (repeatable) and WE_SKILLS_EXTRA_ROOTS (path-delimited, e.g. plateau-ops/skills).
+  const envRoots = (env.WE_SKILLS_EXTRA_ROOTS || '').split(path.delimiter).filter(Boolean);
+  const defaultOps = path.join(home, 'workspace', 'plateau-ops', 'skills'); // default second home
+  // Explicit roots (--root / env) MUST exist: a missing one is an error, never a silent skip. Only the
+  // default second home is optional.
+  const explicit = [...envRoots, ...args.roots];
+  const missing = explicit.filter((r) => !exists(r));
+  if (missing.length) throw new Error(`sync-skills-deploy: source root(s) not found: ${missing.join(', ')}`);
+  const extraRoots = [...(env.WE_SKILLS_SRC_ROOT ? [] : [defaultOps]), ...explicit]
+    .filter((r, i, a) => exists(r) && a.indexOf(r) === i);
+  return { srcRoot, extraRoots };
+}
+
 async function main() {
   const args = parseArgs(process.argv.slice(2));
   const destRoot = deployRoot();
-  if (!fs.existsSync(SRC_ROOT)) throw new Error(`sync-skills-deploy: missing skills-src at ${SRC_ROOT}`);
+  const { srcRoot, extraRoots } = resolveRoots(process.env, args, os.homedir());
 
-  const plans = buildPlans({ destRoot, only: args.only, all: args.all, prune: args.prune });
+  const plans = buildPlans({ srcRoot, extraRoots, destRoot, only: args.only, all: args.all, prune: args.prune });
   const drifted = plans.filter((p) => p.actions.length > 0);
 
   if (!args.check && !args.dryRun) {
@@ -309,18 +369,19 @@ async function main() {
   // while add/update actions were still outstanding, so automation gating on `ok` would conclude the deploy
   // tree was in sync when it was not — reintroducing the silent-stale-deploy bug this item exists to close.
   const stalePending = plans.filter((p) => (p.stale || []).length > 0 && !p.pruned);
-  const nothingPending = drifted.length === 0 && stalePending.length === 0;
+  const nothingPending = drifted.length === 0 && stalePending.length === 0 && !plans.some((p) => p.untracked);
   const writesNothing = args.check || args.dryRun;
   if (args.json) {
     process.stdout.write(JSON.stringify({
-      ok: writesNothing ? nothingPending : true,
+      ok: writesNothing ? nothingPending : !plans.some((p) => p.untracked),
+      untrackedSkills: plans.filter((p) => p.untracked).map((p) => p.name),
       checked: plans.length,
       drifted: drifted.length,
       staleSkills: stalePending.length,
       staleFiles: stalePending.reduce((n, p) => n + p.stale.length, 0),
       applied: !args.check && !args.dryRun,
       skills: plans.map((p) => ({
-        name: p.name, actions: p.actions, stale: p.stale || [], alreadyDeployed: p.alreadyDeployed,
+        name: p.name, actions: p.actions, stale: p.stale || [], alreadyDeployed: p.alreadyDeployed, untracked: !!p.untracked,
       })),
     }, null, 2) + '\n');
   } else {
@@ -329,6 +390,7 @@ async function main() {
 
   // #2579 review — `--check` exits 1 on ANY pending divergence, stale files included. Keying only on
   // `drifted` meant a deploy tree carrying untracked leftovers reported "no drift" and exited 0.
+  // Sync and --dry-run retain exit 0 for reported untracked skills; --json ok:false signals incomplete sync.
   if (args.check && !nothingPending) process.exitCode = 1;
 }
 

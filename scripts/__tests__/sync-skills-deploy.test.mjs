@@ -138,10 +138,10 @@ describe('listFilesRecursive', () => {
 describe('parseArgs', () => {
   it('parses flags and --only as a list', () => {
     expect(parseArgs(['--all', '--check', '--dry-run', '--json'])).toEqual({
-      all: true, check: true, dryRun: true, json: true, prune: false, only: null,
+      all: true, check: true, dryRun: true, json: true, prune: false, only: null, roots: [],
     });
     expect(parseArgs(['--only=a,b, c'])).toEqual({
-      all: false, check: false, dryRun: false, json: false, prune: false, only: ['a', 'b', 'c'],
+      all: false, check: false, dryRun: false, json: false, prune: false, only: ['a', 'b', 'c'], roots: [],
     });
   });
 

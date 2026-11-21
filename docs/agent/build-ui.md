@@ -252,7 +252,7 @@ The build-UI work is edit-action work, so it obeys the standard delivery discipl
   design-studio product-loop epic #2676). #2708 carries the decision/trace artifact and the live integrated
   page. Its lesson for a *new* surface: build it *into* the established product chrome, not beside it.
 - Rubric the pixel review scores against: *vision-tiers.md → Design-critique rubric* (#1034), driven by
-  `skills-src/review-design`.
+  the `review-design` skill (home: plateauapp/plateau-ops `skills/review-design`, deployed by `sync-skills-deploy`).
 - Front door for the phase-2 proposal panel (the rung ladder + the blind fan-out): the `/design-committee`
   skill, `skills-src/design-committee` — right-sizes first and defaults to no panel.
 - The fork-ruling technique (plugs into phase 4): the jury-refinement method —
