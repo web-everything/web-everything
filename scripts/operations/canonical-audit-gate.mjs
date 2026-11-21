@@ -6,7 +6,7 @@ import { canonicalAuditEvidence, validSha } from './prototype-load.mjs';
 import { loadRuledWeakened } from './prototype-load-io.mjs';
 import { readPlatformPreferences } from '../lib/policy-cascade.mjs';
 import { readAuditSettings, resolveAuditRecordPath } from './codex-audit-io.mjs';
-import { netDiffFingerprint } from '../lib/net-diff-fingerprint.mjs';
+import { netDiffFingerprint, testOnlyAdditiveDelta } from '../lib/net-diff-fingerprint.mjs';
 import { findAudit, QUESTION_HASH } from './codex-audit.mjs';
 
 // The shared evaluator skips unusable records. At admission, corrupt evidence must
@@ -26,7 +26,7 @@ function wellFormedAudit(record) {
 
 export function checkCanonicalAuditForOpen({ repo = process.cwd(), ref, sha, env = process.env,
   readFile = readFileSync, exec = execFileSync, fetchMain: fetchMainOpt, refreshMain = false, ancestor: ancestorOpt,
-  liveFingerprint: liveFingerprintOpt, warn = message => console.warn(message),
+  liveFingerprint: liveFingerprintOpt, warn = message => console.warn(message), now = () => Date.now(),
 } = {}) {
   const git = (...args) => String(exec('git', ['-C', repo, ...args], {
     env, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], maxBuffer: 64 * 1024 * 1024,
@@ -128,6 +128,23 @@ export function checkCanonicalAuditForOpen({ repo = process.cwd(), ref, sha, env
   // Merge-from-main carry (R503 reuse): evidence.ok for another head already means its stored net-diff fingerprint
   // equals the live one. It admits only when the live head is a merge commit that contains that audited head.
   if (evidence.ok && mergesIn(evidence.record?.head)) return { ok: true, reason: null, message: '', record: evidence.record, sha: fullSha };
+  // Test-only additive carry: a passing audit of an ANCESTOR head carries when the delta to this head only ADDS
+  // lines to test files (see testOnlyAdditiveDelta). Never after a WEAKENED verdict; the audited head must itself
+  // pass with covered base and no own-head verdict may exist for this head.
+  if (!evidence.ok && evidence.reason !== 'weakened') {
+    try {
+      const heads = [...new Set(records.map(r => String(r.head).toLowerCase()))].filter(h => h !== fullSha);
+      for (const head of heads) {
+        const audited = canonicalAuditEvidence(records, head, covers, null);
+        if (!audited.ok || audited.record?.head !== head) continue;
+        const delta = testOnlyAdditiveDelta(repo, head, fullSha, { exec });
+        if (!delta.ok) continue;
+        const et = new Date(now()).toLocaleString('en-US', { timeZone: 'America/New_York', hour12: false });
+        warn(`carried: test-only additive delta ${head}..${fullSha} (${et} ET)`);
+        return { ok: true, reason: null, message: '', record: audited.record, sha: fullSha, carried: { head, kind: 'test-only-additive' } };
+      }
+    } catch { /* unknown means no carry */ }
+  }
   return evidence.reason === 'weakened'
     ? refuse('canonical-audit-weakened', `latest canonical audit for ${fullSha} is WEAKENED and no ruledWeakened waiver matches ref+sha+findings`)
     : refuse('canonical-audit-missing', `no canonical codex-audit record for ${fullSha} with coverage of origin/main`);
