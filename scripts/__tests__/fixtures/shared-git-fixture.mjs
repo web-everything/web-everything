@@ -125,3 +125,11 @@ function ensureGhStub() {
 export function withGhStub(env = process.env) {
   return { ...env, PATH: `${ensureGhStub()}:${env.PATH || process.env.PATH}` };
 }
+
+/** Inject complete, empty PR evidence and task-private coordination files for scoped acquires. */
+export function scopeTestEnv(base) {
+  const bin = join(base, 'scope-pr-reader');
+  writeFileSync(bin, `#!/bin/sh\nprintf '[]\\n'\n`, { mode: 0o755 });
+  return { WE_FREE_SCOPE_GH_BIN: bin, WE_AGENT_SCOPES_PATH: join(base, 'agent-scopes.json'),
+    WE_SCOPE_OVERLAP_ALLOWED_PATH: join(base, 'scope-overlap-allowed.jsonl') };
+}
