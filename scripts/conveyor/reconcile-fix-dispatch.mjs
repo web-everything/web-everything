@@ -1873,7 +1873,7 @@ export function runReconcileFixDispatch({
   dispatch = dispatchFix,
   reconcile = runReconcilePass,
   readPrs,
-  // Pass-local guard: PR numbers, or a predicate over reconciled dispatch rows.
+  // Pass-local guard: PR numbers, or a predicate over dispatch rows (also called with only prNumber).
   excludePrs = [],
   // R123 writes require caller permission, even when dispatch itself is stubbed (live smoke).
   // The production daemon forwards fix.standDownAutoProceed from the policy cascade (standard: true).
@@ -1959,7 +1959,12 @@ export function runReconcileFixDispatch({
   // will, once fix dispatch is turned on for that repo, dispatch fixes) from code that had already been proven
   // stale. Run it for every repo.
   assertMainNotStale(root, checkStaleness, FIX_STALE_GUARD_OPTS);
+  const excluded = typeof excludePrs === 'function' ? excludePrs : entry => excludePrs.includes(entry.prNumber);
   const reconciledRaw = reconcile({ repo, allowStandDownAutoProceed,
+    // Reconciliation can answer stand-downs before it returns dispatch rows. Apply the
+    // orphan hold there too; the daemon's exclusion set is keyed only by PR number.
+    ...(typeof excludePrs === 'function' || excludePrs.length > 0
+      ? { skipStandDownPrs: pr => excluded({ prNumber: pr.prNumber ?? pr.number }) } : {}),
     ...(readPrs ? { readPrs } : {}),
     ...(prsFile ? { readPrs: () => readPrsFromFile(prsFile) } : {}) });
   // A DEFERRED read (gh low budget / slot throttle / author-lookup budget) planned nothing: owed is UNKNOWN, not zero.
@@ -1971,7 +1976,6 @@ export function runReconcileFixDispatch({
   }
   const reconciled = netScope ? fixStep('net-scope', () => netScope(reconciledRaw, { root, repoKey })) : reconciledRaw;
   let dispatchEntries = Array.isArray(reconciled.dispatch) ? reconciled.dispatch : [];
-  const excluded = typeof excludePrs === 'function' ? excludePrs : entry => excludePrs.includes(entry.prNumber);
   const guardRefusals = [];
   const guardAllows = entry => {
     if (entry.kind !== 'fix' || !excluded(entry)) return true;

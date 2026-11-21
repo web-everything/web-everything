@@ -1750,6 +1750,8 @@ export function runReconcilePass({
   enrichStandDownAutoProceed = enrichPrsWithStandDownAutoProceed,
   // Planning/read-only callers must never create cursors, reservations or operator answers.
   allowStandDownAutoProceed = false,
+  // Pass-local orphan holds must retain unanswered stand-downs, before any R123 IO.
+  skipStandDownPrs = null,
   // The fixer-escalation ladder (default + local override, models from the routing policy). Injectable for tests.
   loadLadder = loadFixerLadder,
   // Card xx0055i — the `fix.*` settings (policy cascade: env > we:scripts/settings/fix.json > built-in). Injectable.
@@ -1849,9 +1851,13 @@ export function runReconcilePass({
   const covered = hydrated.prs.filter(pr => pr.rowsComplete === true && pr.rowsHead === pr.headRefOid).length;
   console.error(`check-evidence-coverage: ${covered}/${hydrated.prs.length} PRs rowsComplete===true && rowsHead===headRefOid`);
   // Evidence is applied before every downstream CI reader, including main-red attribution.
-  const autoProceedPrs = !readOnly && allowStandDownAutoProceed === true ? enrichStandDownAutoProceed(hydrated.prs, {
+  const answerablePrs = skipStandDownPrs ? hydrated.prs.filter(pr => !skipStandDownPrs(pr)) : hydrated.prs;
+  const answeredPrs = !readOnly && allowStandDownAutoProceed === true ? enrichStandDownAutoProceed(answerablePrs, {
     repo: CONSTELLATION_REPOS[repoKey].slug, requiredChecks, defaultBranch, env,
-  }) : hydrated.prs;
+  }) : answerablePrs;
+  const answeredByNumber = new Map(answeredPrs.map(pr => [pr.number, pr]));
+  const autoProceedPrs = skipStandDownPrs
+    ? hydrated.prs.map(pr => answeredByNumber.get(pr.number) ?? pr) : answeredPrs;
   let holdPrs = autoProceedPrs;
   try {
     holdPrs = excuseMergeGateHolds(autoProceedPrs, {
