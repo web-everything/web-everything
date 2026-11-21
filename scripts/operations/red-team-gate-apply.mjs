@@ -1,5 +1,5 @@
 import { assertCapability } from '../lib/repo-profile.mjs';
-import { syncRedTeamStatusLabels } from '../lib/red-team-status-labels.mjs';
+import { settleGhFor, syncRedTeamStatusLabels } from '../lib/red-team-status-labels.mjs';
 import { signalFixDispatch } from '../lib/fix-handoff.mjs';
 /**
  * @file scripts/operations/red-team-gate-apply.mjs
@@ -275,7 +275,7 @@ export function createRedTeamGateIo({ env = process.env, root = REPO_ROOT } = {}
   const safety = readDrainQueueSafety({ env, log: line => process.stderr.write(`${line}\n`) });
   return {
     publishNeedsYou: isUnderTest(env) || isUnderTest(process.env) ? () => {} : item => publishAttention(item),
-    syncStatusLabels: ({ repo, pr, head }) => head ? syncRedTeamStatusLabels({ repo, pr, head, env,
+    syncStatusLabels: ({ repo, pr, head }) => head ? syncRedTeamStatusLabels({ repo, pr, head, env, gh: settleGhFor(env),
       log: line => process.stderr.write(`${line}\n`) }) : null,
     signalFix: signalFixDispatch,
     dequeueSentBack: args => safety.value.dequeueOnSendBack ? dequeueSentBack({ ...args, exec: (cmd, argv, opts) => execFileSync(cmd, argv, { ...opts, env }), log: line => process.stderr.write(`${line}\n`) }) : { dequeued: false },

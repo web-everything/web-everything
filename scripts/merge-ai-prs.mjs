@@ -186,8 +186,8 @@ import { autoStrandedSweepPass } from './backlog-stranded-sweep.mjs'; // xvr2o8r
 import { parseEscalationReason } from './review-detail.mjs';
 import { deriveResolutionBasis, graduatedToFromBody, renderResolutionBasisBanner } from './lib/review-render.mjs'; // #2447 — the graduatedTo resolution-basis banner (presentation only; never gates)
 import { readSharedOpenPrs, readShaCache, writeShaCache, snapshotOpenCount, nextLimit } from './lib/pr-snapshot.mjs';
-import { listOpenPrsPagedHydratedComplete as listOpenPrsPagedHydrated, resolvePrListPaging, parseListOutput } from './lib/pr-list-paged.mjs'; // refuses a short inventory (rows < totalCount)
-import { withListRetry } from './lib/gh-list-retry.mjs'; // 504 incident 2026-11-03 — retry a transient 5xx list with backoff; a persistent failure throws + raises gh-list-failed
+import { listOpenPrsPagedHydratedCompleteAsync as listOpenPrsPagedHydrated, resolvePrListPaging, parseListOutput } from './lib/pr-list-paged.mjs'; // refuses a short inventory (rows < totalCount)
+import { withListRetryAsync as withListRetry } from './lib/gh-list-retry.mjs'; // 504 incident 2026-11-03 — retry a transient 5xx list with backoff; a persistent failure throws + raises gh-list-failed
 import { markPrSnapshotDirty } from './lib/pr-snapshot-store.mjs';
 import { backfillAllReviewRuns, backfillOpenReviewRuns } from './lib/review-run-index.mjs';
 /** Optional discovery hints must never reject the drain's open-PR context. */
@@ -5542,7 +5542,7 @@ export async function main(argv, { env = process.env, stdout = process.stdout, e
       if (slug) {
         let seed = [];
         try { seed = readSharedOpenPrs({ repo: slug, fields: 'number,updatedAt,headRefOid,body,files', caller: 'merge-ai-prs.mjs' }) || []; } catch { /* live read below remains authoritative */ }
-        const listed = withListRetry(() => listOpenPrsPagedHydrated({ repo: slug, exec: execFileSyncThrottled, paging: resolvePrListPaging(),
+        const listed = await withListRetry(() => listOpenPrsPagedHydrated({ repo: slug, exec: execFileSyncThrottled, execAsync: execFileP, paging: resolvePrListPaging(),
           heavyFields: ['body', 'files'], cache: drainHeavyCacheByRepo.get(repo) || {}, seed,
           maxRows: OPEN_PR_LIST_LIMIT, execOpts: { throttle: { op: 'pr list (drain context page)' } } }), { repo: slug, op: 'drain-context-list', daemon: 'drain' });
         drainHeavyCacheByRepo.set(repo, listed.cache);
@@ -5968,7 +5968,7 @@ export async function main(argv, { env = process.env, stdout = process.stdout, e
             // listing (60-200 s) inside the pass. The seed never decides the open set: the live listing does.
             try { seed = __t.time('listing.seed', () => readSharedOpenPrs({ repo: slug, fields: 'number,updatedAt,headRefOid,body,files', caller: 'merge-ai-prs.mjs', cacheOnly: true })) || []; } catch { seed = []; }
           }
-          listed = __t.time('listing.pages', () => withListRetry(() => listOpenPrsPagedHydrated({ repo: slug, exec: execFileSyncThrottled, paging,
+          listed = await __t.timeAsync('listing.pages', () => withListRetry(() => listOpenPrsPagedHydrated({ repo: slug, exec: execFileSyncThrottled, execAsync: execFileP, paging,
             heavyFields, needsHeavy: RECONCILE ? () => true : operatorSelects, cache: drainHeavyCacheByRepo.get(repo) || {}, seed,
             maxRows: OPEN_PR_LIST_LIMIT, execOpts: { throttle: { op: 'pr list (drain page)' } } }), { repo: slug, op: 'drain-list', daemon: 'drain' }));
           drainHeavyCacheByRepo.set(repo, listed.cache);
