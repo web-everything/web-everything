@@ -344,6 +344,7 @@
   "scripts/__tests__/sweep-reference-liveness.test.mjs": 0.02,
   "scripts/__tests__/sync-commands-deploy.test.mjs": 0.8,
   "scripts/__tests__/sync-skills-deploy.test.mjs": 0.28,
+  "scripts/__tests__/sync-skills-multiroot.test.mjs": 0.5,
   "scripts/__tests__/target-registry.test.mjs": 0.08,
   "scripts/__tests__/telemetry-machine.test.mjs": 0.03,
   "scripts/__tests__/telemetry-summary.test.mjs": 0.04,
