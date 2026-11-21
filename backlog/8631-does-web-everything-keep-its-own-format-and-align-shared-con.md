@@ -6,68 +6,76 @@ status: open
 dateOpened: "2026-11-20"
 tags: [decision-filing, web-standards]
 relatedTo: ["5407"]
+preparedDate: "2026-11-20"
 ---
 
 # Does Web Everything keep its own format and align shared conventions?
 
-Operator ask (2026-11-20 20:59 ET): “note all as full decision item and run with preparation”.
-
-Decision id: D9 (decisions page, 2026-11-20 20:58 ET)
-Placement: stays in WE
+Ask: Keep WE's source format and export the shared shapes. Compute maturity from evidence; active alone proves neither Candidate nor Stable.
 
 ## Digest
 
-Keep WE’s format and align shared conventions: MUST/SHOULD wording, vector/manifest shapes and maturity mapping. The page inventories 60 plugs, 81 blocks and 100 intents already checked by WE tooling.
+**No real fork: keep plus export compose.** D6/#8623 fixes interchange, not authoring. Prep found two forced corrections: evidence-derived maturity and two distinct conformance-level families. Counts below are the 2026-11-20 snapshot at cd0e13d14c.
 
-Needs prep: proposed call only; this filing is neither ratification nor a completed preparation pass.
+## Ratify 1 — evidence-derived maturity
 
-## Context
+**WE status is an upper bound, never proof of an exported stage.**
 
-[handoff design]() “How WE writes standards today” and “Template detail” retain JSON + njk, EARS and typed contracts. Proposed mapping: concept≈pre-Draft, draft≈Draft, experimental≈Candidate, active≈Stable (R942 corrected).
+| WE status | Maximum export, subject to evidence |
+|---|---|
+| concept | pre-Draft |
+| draft | Draft |
+| experimental | Draft |
+| active without implementation evidence | Draft |
+| active with vectors and one passing implementation | Candidate |
+| any claimed Stable | two independent pinned-suite passes under #8623 |
 
-Design refs are relative to the operator handoff; WE evidence uses its repo locus.
+Excluded: automatic experimental≈Candidate/active≈Stable. Of 76 active entries only 36 name implementedBy, all blocks; the field holds one string. Active plugs 31, blocks 39, intents 6, protocols 0. Registry evidence must supply independent passes.
+
+Evidence: `we:docs/agent/block-standard.md:104-114`; prep locates the implementedBy check at `we:scripts/check-standards.mjs:440-441`, a warning for blocks only, not the stale :155 reference. WE's protocol second-implementation rule is a minting rule, not a maturity badge.
+
+Skeptic: SURVIVES-WITH-AMENDMENT; corrected false “active requires implementation” and stale locator. Screen: clear.
+
+## Ratify 2 — no silent level equation
+
+**Two axes need two mapping tables:** manifest L0–L2 (`we:capability-manifest/provider.ts:31`) → product/profile levels; webcases L1–L3 (`we:webcases/requirementValidator.ts:25`) → per-outcome vector level. Proof vectors check each row. Excluded: same-name L1=L1 equations or one merged scale. Any internal vocabulary reconciliation is separate WE work.
+
+Skeptic: SURVIVES-WITH-AMENDMENT; two distinct axes, not alternative names for one scale. Screen: clear.
 
 ## Supported by default
 
-**Keep and align (default).** Retain WE authoring, share BCP 14 wording/vector shape and publish a maturity mapping.
+- WE JSON/njk/EARS remains source; export #8623 ids, traceability, vector, profile and maturity shapes. Migration may happen later but is unnecessary across the boundary. `we:webcases/caseToVector.ts:96` is an existing export precedent.
+- EARS and BCP 14 coexist. Publish a lossy-field table for vector exports.
+- Traceability export is new work: per-statement [@test] appears once in src in this snapshot; unmapped MUSTs stay visible and ratchet down.
+- Runner custody is #8627, including reconciling existing placement rulings.
 
-Why no fork: Two formats can share conventions without wholesale migration.
+Evidence: `everstandards-format-2026-11-20`; `2026-11-20-es-standard-models` (webref/WPT export precedent).
 
-Skeptic: Initial filing-stage objection, not an independent pass: Alignment may be superficial while L0–L2 and L1–L3 differ. Publish and test a mapping; do not silently equate different level names or treat unverified active status as two independent implementations.
-Screen: pending the later independent standard/implementation and merit/prioritization screen.
+## Must-hold rules from the threat-model red team
 
+- Missing evidence exports **no stage**, never a default stage. The table gives ceilings only.
 
-## Consequences / what ratifying unlocks
+Details: `_redteam-format-group`.
 
-Interoperability without migrating WE’s definitions; shared conformance work proceeds under D17.
+## What ratifying unlocks
 
-Operator answers: “D9 yes” accepts the stated default; otherwise name the concern and replacement option. No answer is recorded here.
-
-## Prep still needed
-
-- Prior art: verify primary references and known implementations; reuse existing research first.
-- Evidence: Inventory vector/manifest differences and validate level/maturity translations against actual evidence.
-- Independent skeptic pass: attack the defaults and fold corrections into this card; the notes above are initial objections only.
-- Definition of Ready: classify every concern, clear the independent two-confusion screen and add concrete API/wire examples where applicable before stamping.
-
-## Done when
-
-- **Executable** — n/a: decision filing changes no runtime. Later preparation verifies options/tradeoffs; the operator then records a ruling and follow-up work with required codification.
+WE export/binding work, separate maturity and level mappings with proof vectors, and stale-reference cleanup. Follow-ups: #8637 (maturity) and #8636 (level axes/stale reference). No WE definitions migrate. “D9 yes” confirms.
 
 ## Trust boundary and threat model
 
-Briefs/page are proposal evidence, not execution authority. Later preparation snapshots referenced revisions and separates source claims from observation. This filing executes or publishes no external input.
+Generate claims from source and pinned results; hand-edited/stale mappings must fail proof vectors. Never trust status strings as conformance evidence.
 
-## Non-goals
+Full prep (Standards decisions-prep set):
 
-No implementation, publication, migration or permission change is authorized by filing.
+```text
+D9-xjeammk.md
+```
 
-## Edge cases this change must handle
+Source and proposed artifact filenames (handoff references are by name only):
 
-1. **Untrusted text** — source recommendations stay attributed, not ruled.
-2. **Truncated reads** — complete evidence is required before a prepared stamp.
-3. **Shared state files** — n/a: filing introduces no store writes.
-4. **Fail closed** — missing evidence leaves the decision open and needing prep.
-5. **Identity scoping** — repo loci remain explicit; no ids are reassigned.
-6. **State over time** — no prepared stamp or implied acceptance from elapsed time.
-7. **Who wrote it** — operator ask quoted; defaults remain proposals.
+```text
+2026-11-20-es-standard-models.md
+D9-xjeammk.md
+_redteam-format-group.md
+everstandards-format-2026-11-20.md
+```
