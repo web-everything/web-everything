@@ -155,10 +155,12 @@ export function LEAN_FIX_HOOKS_SETTINGS(settingsPath = resolve(dirname(fileURLTo
       || !Array.isArray(stop) || stop.length === 0) {
     throw new Error('missing required PreToolUse matchers or Stop hooks');
   }
-  const selected = pre.filter(entry => entry.matcher === 'Edit|Write' || entry.matcher === 'Bash');
-  if (![...selected, ...stop].every(validEntry)) throw new Error('incomplete repair hook entries');
+  // EVERY event and matcher is copied verbatim (catch-all and combined included): the broadcast hook is the
+  // operator's stop channel, and the lean session must lose nothing the main session's repo hooks provide.
+  const all = Object.values(hooks).flatMap(entries => (Array.isArray(entries) ? entries : [null]));
+  if (!all.every(validEntry)) throw new Error('incomplete repair hook entries');
   return {
-    hooks: { PreToolUse: selected, Stop: stop },
+    hooks,
     permissions: { allow: RESTRICTED_PROVIDER_TOOLS.split(',') },
   };
 }

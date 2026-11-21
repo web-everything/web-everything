@@ -2630,7 +2630,7 @@ export function buildAgentArgv({
   const sessionSettings = worktreeSettings ? { env: sessionEnv, worktree: worktreeSettings } : { env: sessionEnv };
   if (leanFix) {
     const forbidden = extraArgs.map(String).find(arg =>
-      /^--(?:settings|tools|setting-sources|bare|safe-mode|dangerously-skip-permissions)(?:=|$)/.test(arg));
+      /^--(?:settings|tools|setting-sources|bare|safe-mode|dangerously-skip-permissions|permission-mode|add-dir|mcp-config)(?:=|$)/.test(arg));
     if (forbidden) throw notApplied(`dispatch-lane: lean repair extraArgs cannot override ${forbidden.split('=')[0]}`);
     try { Object.assign(sessionSettings, LEAN_FIX_HOOKS_SETTINGS()); }
     catch (error) {

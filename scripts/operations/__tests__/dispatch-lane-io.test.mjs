@@ -64,7 +64,7 @@ describe('lean repair background argv', () => {
     for (const kind of ['fix', 'ci-heal']) {
       const text = JSON.stringify(buildAgentArgv({ ...options(kind), systemPromptFile: '/repo/.operations/brief.md' }));
       expect(text).not.toMatch(/\.claude\/(CLAUDE\.md|projects|settings)/);
-      expect(text).not.toMatch(/\/memory\b|MEMORY\.md|SessionStart/);
+      expect(text).not.toMatch(/\/memory\b|MEMORY\.md/);
       expect(text).not.toContain(process.env.HOME ?? '\u0000no-home');
     }
   });
@@ -80,8 +80,11 @@ describe('lean repair background argv', () => {
       expect(settings.env).toEqual({ PATH: '/fixture/bin', WE_CONVEYOR_WORKER: '1' });
       expect(settings.worktree).toEqual({ bgIsolation: 'none' });
       expect(settings.permissions?.allow).toEqual(['Bash', 'Edit', 'Write', 'Read', 'Glob', 'Grep']);
-      expect(settings.hooks).toEqual({ PreToolUse: expectedPre, Stop: canonical.hooks.Stop });
-      const commands = Object.values(settings.hooks).flatMap(entries => entries.flatMap(entry => entry.hooks.map(hook => hook.command)));
+      // Every event and matcher, verbatim: nothing filtered (PostToolUse, broadcast and catch-alls included).
+      expect(settings.hooks).toEqual(canonical.hooks);
+      expect(Object.keys(settings.hooks)).toEqual(Object.keys(canonical.hooks));
+      expect(expectedPre.length).toBeGreaterThan(0);
+      const commands = ['PreToolUse', 'Stop'].flatMap(event => settings.hooks[event].flatMap(entry => entry.hooks.map(hook => hook.command)));
       for (const command of commands) {
         expect(canonicalCommands).toContain(command);
         expect(command).not.toMatch(/^node scripts\//);
@@ -98,7 +101,7 @@ describe('lean repair background argv', () => {
     }
   });
 
-  it.each(['--settings', '--tools', '--setting-sources', '--bare', '--safe-mode', '--dangerously-skip-permissions'])(
+  it.each(['--settings', '--tools', '--setting-sources', '--bare', '--safe-mode', '--dangerously-skip-permissions', '--permission-mode', '--add-dir', '--mcp-config'])(
     'refuses %s boundary overrides for fix and ci-heal, while build and resume retain their behavior', (flag) => {
       for (const extraArgs of [[flag, 'override'], [`${flag}=override`]]) {
         for (const kind of ['fix', 'ci-heal']) {
