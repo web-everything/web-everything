@@ -48,6 +48,7 @@ const PROTECTION_PATH_RES = [
 
 // Every script-like extension, not just `.mjs`: a grant spelled in `.ts`/`.js`/`.sh` widens a sandbox the same way.
 const SANDBOX_FILE_RE = /(^|\/)(scripts\/.+\.(mjs|cjs|js|mts|ts|sh|bash|py)|\.codex\/[^/]+\.(toml|json|ya?ml)|\.claude\/settings[^/]*\.json)$/;
+const AGENT_LAUNCH_APPROVAL_RE = /(^|\/)scripts\/lib\/agent-launch-approved\.json$/;
 const TEST_OR_DOC_RE = /(^|\/)(__tests__|__fixtures__)\/|\.(test|spec)\.(mjs|cjs|js|mts|ts)$|\.md$/;
 /** Config files that are nothing BUT grants: with no readable hunks, any touch holds. */
 const SANDBOX_CONFIG_RE = /(^|\/)(\.codex\/[^/]+|\.claude\/settings[^/]*\.json)$/;
@@ -83,6 +84,7 @@ export const SANDBOX_BEARING_FILES = [
   'scripts/conveyor/health-smells/dispatch-permission-stall.mjs',
   'scripts/gemini-direct-task.mjs',
   'scripts/lib/agent-launch.mjs',
+  'scripts/lib/agent-launch-approved.json',
   'scripts/lib/agy-review-juror.mjs',
   'scripts/lib/antigravity-judge-spawn.mjs',
   'scripts/lib/gh-app-shim.mjs',
@@ -382,6 +384,8 @@ export function permissionChangeKind(file, hunks) {
   const p = String(file || '');
   if (PROTECTION_PATH_RES.some((re) => re.test(p))) return 'branch-protection-config';
   if (WORKFLOW_RE.test(p)) return touchesWorkflowPermissions(hunks) ? 'workflow-permissions' : null; // unreadable: fail closed
+  // Every entry grants literal-launch capacity; JSON keys need not spell sandbox tokens.
+  if (AGENT_LAUNCH_APPROVAL_RE.test(p)) return 'sandbox-widening';
   if (SANDBOX_FILE_RE.test(p) && !TEST_OR_DOC_RE.test(p)) {
     // Unreadable hunks (the net diff was not scored, no clone, a pure rename): a file that is nothing but grants, or
     // one on the sandbox-bearing list, fails closed; any other code file says nothing by its path alone.

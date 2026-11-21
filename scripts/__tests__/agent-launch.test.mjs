@@ -33,6 +33,11 @@ function mainCodexShimPath(env) {
   return [CODEX_SHIM_DIR, ...rest].join(':');
 }
 const matrix = [
+  ...['NODE_OPTIONS', 'NODE_PATH', 'JAVA_TOOL_OPTIONS', 'CUSTOM_OPTIONS', 'LD_PRELOAD',
+    'DYLD_INSERT_LIBRARIES', 'PYTHONPATH', 'PERL5OPT', 'RUBYOPT'].map(key => [key, { [key]: 'caller-value' }]),
+  ['Git config parameters', { GIT_CONFIG_PARAMETERS: "'protocol.ext.allow'='user'" }],
+  ['Git transport pair', { GIT_CONFIG_COUNT: '1', GIT_CONFIG_KEY_0: 'protocol.ext.allow', GIT_CONFIG_VALUE_0: 'always' }],
+  ['Git protocol allowlist', { GIT_ALLOW_PROTOCOL: 'https:ext' }],
   ['HOME', { HOME: '/caller-home' }],
   ['GH_CONFIG_DIR', { GH_CONFIG_DIR: '/caller/gh' }],
   ['GIT_INDEX_FILE', { GIT_INDEX_FILE: '/caller/index' }],
@@ -61,7 +66,7 @@ const invalidEnvKeys = [
   ['BAD\0KEY', 'value'],
   ['', 'value'],
 ];
-describe('B1/B2 caller environment follows main except runtime injection, without any ambient merge', () => {
+describe('B1/B2 caller environment follows main verbatim, without any ambient merge', () => {
   for (const [path, descriptor] of envLaunchPaths) {
     it.each(invalidEnvKeys.flatMap(([key, value]) => [[key, value], [key, undefined]]))(
       `refuses malformed env key %j with value %j before spawn (${path})`, (key, value) => {
@@ -122,102 +127,25 @@ describe('B1/B2 caller environment follows main except runtime injection, withou
     const io = seam(); launchAgent({ ...base(), env }, io);
     expect(io.spawn.mock.calls[0][2].env).toEqual({ PATH: bin, EMPTY: '', HOME: '/caller-home' });
   });
-  for (const review of [false, true]) it(`preserves ambient user restrictions for normally allowed transports (review=${review})`, () => {
-    // Local remote helpers implement only capabilities/list, so permitted operations
-    // succeed without a network connection or a Git repository.
-    const helper = '#!/bin/sh\nread command || exit 1\n[ "$command" = capabilities ] || exit 1\nprintf "\\n"\nread command || exit 1\n[ "$command" = list ] || exit 1\nprintf "\\n"\nread command\nexit 0\n';
-    for (const transport of ['http', 'https', 'fixture']) {
-      writeFileSync(join(bin, `git-remote-${transport}`), helper, { mode: 0o755 });
-      for (const key of ['protocol.allow', `protocol.${transport}.allow`]) {
-        for (const policy of ['never', 'user', 'always']) {
-          for (const fromUser of ['0', '1']) {
-            const env = { PATH: `${bin}:/usr/bin:/bin`, GIT_EXEC_PATH: bin,
-              GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: '/dev/null', GIT_CONFIG_SYSTEM: '/dev/null',
-              GIT_CONFIG_COUNT: '1', GIT_CONFIG_KEY_0: key, GIT_CONFIG_VALUE_0: policy,
-              GIT_PROTOCOL_FROM_USER: fromUser, GIT_TERMINAL_PROMPT: '0' };
-            const probe = childEnv => spawnSync('git', ['ls-remote', `${transport}::fixture`], {
-              cwd: root, env: childEnv, encoding: 'utf8', timeout: 2000, maxBuffer: 8192,
-            });
-            const expected = policy === 'always' || (policy === 'user' && fromUser === '1');
-            const label = `${key}=${policy}, fromUser=${fromUser}, review=${review}`;
-            // Widening values (bare protocol.allow user/always, an unknown protocol to always) are refused.
-            if (policy !== 'never' && (key === 'protocol.allow' || (transport === 'fixture' && policy === 'always'))) {
-              refused(buildCodexDirectTaskDescriptor({ cwd: root, env, review }), /widens Git transport policy/);
-              continue;
-            }
-            const parent = probe(env);
-            const io = seam();
-            io.spawn.mockImplementation((_file, _args, options) => probe(options.env));
-            const child = launchAgent(buildCodexDirectTaskDescriptor({ cwd: root, env, review }), io);
-            for (const result of [parent, child]) {
-              expect(result.error, label).toBeUndefined();
-              expect(result.status, label).toBe(expected ? 0 : 128);
-              if (!expected) expect(result.stderr, label).toContain(`transport '${transport}' not allowed`);
-            }
-            expect(child.status, label).toBe(parent.status);
-            expect(io.spawn.mock.calls[0][2].env.GIT_PROTOCOL_FROM_USER).toBe(fromUser);
-            expect(io.spawn.mock.calls[0][2].env.GIT_CONFIG_VALUE_0).toBe(policy);
-          }
-        }
-      }
-    }
-  });
-  // Tighten-only transport guarantee: env-supplied Git config may restrict, never widen,
-  // Git's built-in transport defaults (ext never, file and unknown user since git 2.38.1,
-  // http/https/git/ssh always).
-  const pair = (...kv) => Object.fromEntries([['GIT_CONFIG_COUNT', String(kv.length / 2)],
-    ...kv.flatMap((v, i) => (i % 2 ? [] : [[`GIT_CONFIG_KEY_${i / 2}`, v], [`GIT_CONFIG_VALUE_${i / 2}`, kv[i + 1]]]))]);
-  it.each([
-    ['protocol.ext.allow=user', pair('protocol.ext.allow', 'user')],
-    ['protocol.ext.allow=always', pair('protocol.ext.allow', 'always')],
-    ['case-folded section and variable', pair('PROTOCOL.ext.ALLOW', 'User')],
-    ['bare protocol.allow=user', pair('protocol.allow', 'user')],
-    ['bare protocol.allow=always', pair('protocol.allow', 'always')],
-    ['ext=user behind a protocol.allow=never pair', pair('protocol.allow', 'never', 'protocol.ext.allow', 'user')],
-    ['protocol.allow=user behind ext=never', pair('protocol.ext.allow', 'never', 'protocol.allow', 'user')],
-    ['unknown protocol widened to always', pair('protocol.fixture.allow', 'always')],
-    ['unknown-case subsection widened to always', pair('protocol.EXT.allow', 'always')],
-    ['unparseable policy value', pair('protocol.http.allow', 'sometimes')],
-    ['include.path indirection', pair('include.path', '/caller/gitconfig')],
-    ['includeIf indirection', pair('includeIf.gitdir:/.path', '/caller/gitconfig')],
-    ['stray key beyond the count', { GIT_CONFIG_COUNT: '0', GIT_CONFIG_KEY_3: 'protocol.ext.allow', GIT_CONFIG_VALUE_3: 'user' }],
-    ['GIT_CONFIG_PARAMETERS transport pair', { GIT_CONFIG_PARAMETERS: "'protocol.ext.allow'='user'" }],
-    ['GIT_CONFIG_PARAMETERS include', { GIT_CONFIG_PARAMETERS: "'include.path'='/caller/gitconfig'" }],
-    ['GIT_CONFIG_PARAMETERS old key=value form', { GIT_CONFIG_PARAMETERS: "'Protocol.ext.Allow=USER'" }],
-    ['GIT_CONFIG_PARAMETERS widening after a safe entry', { GIT_CONFIG_PARAMETERS: "'soak.x'='y' 'protocol.allow'='always'" }],
-    ['GIT_CONFIG_PARAMETERS unparseable', { GIT_CONFIG_PARAMETERS: "'protocol.ext.allow'=user" }],
-    ['GIT_CONFIG_PARAMETERS unterminated quote', { GIT_CONFIG_PARAMETERS: "'soak.x'='y" }],
-    ['protocol.file.allow=always (file defaults to user)', pair('protocol.file.allow', 'always')],
-    ['GIT_ALLOW_PROTOCOL file (file defaults to user)', { GIT_ALLOW_PROTOCOL: 'https:file' }],
-    ['GIT_ALLOW_PROTOCOL ext', { GIT_ALLOW_PROTOCOL: 'ext' }],
-    ['GIT_ALLOW_PROTOCOL ext among safe', { GIT_ALLOW_PROTOCOL: 'https:ext' }],
-    ['GIT_ALLOW_PROTOCOL unknown protocol', { GIT_ALLOW_PROTOCOL: 'https:fixture' }],
-  ])('refuses caller env that widens Git transport policy before spawn: %s', (_name, extra) => {
-    for (const review of [false, true]) {
-      refused(buildCodexDirectTaskDescriptor({ cwd, env: { PATH: bin, ...extra }, review }), /widens Git transport policy/);
-    }
-    refused({ ...base(), env: { PATH: bin, ...extra } }, /widens Git transport policy/);
-    refused({ ...claude(), env: { PATH: bin, ...extra } }, /widens Git transport policy/);
-  });
-  it.each([
-    ['protocol.file.allow=user (lane-pool)', pair('protocol.file.allow', 'user')],
-    ['protocol.ext.allow=never', pair('protocol.ext.allow', 'never')],
-    ['protocol.allow=never', pair('protocol.allow', 'never')],
-    ['protocol.https.allow=user', pair('protocol.https.allow', 'user')],
-    ['protocol.ssh.allow=always', pair('protocol.ssh.allow', 'always')],
-    ['protocol.fixture.allow=user', pair('protocol.fixture.allow', 'user')],
-    ['protocol.version is not a transport policy', pair('protocol.version', '2')],
-    ['unrelated pins', pair('core.hooksPath', '', 'fetch.fsckObjects', 'true')],
-    ['GIT_ALLOW_PROTOCOL safe allowlist', { GIT_ALLOW_PROTOCOL: 'https:http:git:ssh' }],
-    ['GIT_ALLOW_PROTOCOL empty (allows nothing)', { GIT_ALLOW_PROTOCOL: '' }],
-    ['GIT_CONFIG_PARAMETERS unrelated', { GIT_CONFIG_PARAMETERS: "'soak.parameter'='inherited'" }],
-    ['GIT_CONFIG_PARAMETERS restricting', { GIT_CONFIG_PARAMETERS: "'protocol.ext.allow'='never' 'protocol.allow'='never'" }],
-    ['GIT_CONFIG_PARAMETERS old form and escaped quote', { GIT_CONFIG_PARAMETERS: "'url.x.insteadOf=https://protocol.example/' 'user.name'='O'\\''Brien'" }],
-    ['GIT_CONFIG_PARAMETERS key without value', { GIT_CONFIG_PARAMETERS: "'core.bare'=" }],
-  ])('passes caller env that keeps or tightens Git transport policy verbatim: %s', (_name, extra) => {
-    const env = { PATH: bin, ...extra };
-    const io = seam(); launchAgent({ ...base(), env }, io);
+  it('keeps caller TMP untouched when read-only has an explicit tempRoot', () => {
+    const env = { PATH: bin, TMP: '/c' };
+    const io = seam();
+    launchAgent({ ...base(), sandbox: 'read-only', tempRoot: '/x', env }, io);
     expect(io.spawn.mock.calls[0][2].env).toEqual(env);
+  });
+  it('executes a dispatcher symlink using its codex PATH name', () => {
+    const dispatcher = join(root, 'dispatcher');
+    writeFileSync(dispatcher, '#!/bin/sh\nname=${0##*/}\nprintf "%s\\n" "$name"\n[ "$name" = codex ] || exit 1\n', { mode: 0o755 });
+    const dispatchBin = join(root, 'dispatch-bin');
+    mkdirSync(dispatchBin);
+    symlinkSync(dispatcher, join(dispatchBin, 'codex'));
+    const child = launchAgent({ ...base(), env: { PATH: dispatchBin } }, {
+      resolveBinary: agent => findAgentBinary(agent, [dispatchBin]),
+      spawn: (file, args, options) => spawnSync(file, args, { ...options, encoding: 'utf8', timeout: 5000, maxBuffer: 8192 }),
+    });
+    expect(child.error).toBeUndefined();
+    expect(child.stdout).toBe('codex\n');
+    expect(child.status, child.stderr).toBe(0);
   });
   it('refuses legacy inherit fields, env accessors and env proxies before IO', () => {
     refused({ ...base(), inheritEnv: {} }, /inheritEnv/);
@@ -241,7 +169,7 @@ describe('B3/B4 exact PATH and TMP projection', () => {
     symlinkSync(binary, join(real, 'codex'));
     const io = seam(); launchAgent({ ...base(), env: { PATH: `${guard}:${real}` }, pathPrefix: CODEX_SHIM_DIR }, io);
     expect(io.spawn.mock.calls[0][2].env.PATH).toBe(`${CODEX_SHIM_DIR}:${guard}:${real}`);
-    expect(findAgentBinary('gh', io.spawn.mock.calls[0][2].env.PATH.split(':'))).toBe(realpathSync(join(guard, 'gh')));
+    expect(findAgentBinary('gh', io.spawn.mock.calls[0][2].env.PATH.split(':'))).toBe(join(guard, 'gh'));
   });
   it('projects /usr/bin to exactly shim:/usr/bin, with no fixed, node or agent dirs', () => {
     const d = buildCodexDirectTaskDescriptor({ cwd, env: { PATH: '/usr/bin' } });
@@ -285,7 +213,7 @@ describe('B5 same executable as main or refuse', () => {
     writeFileSync(join(wrapper, 'codex'), '#!/bin/sh\nexit 0\n', { mode: 0o755 });
     noSpawn({ PATH: `${wrapper}:${bin}` }, /binary.*differ|identity/);
   });
-  it('launches the fixed realpath when it is the first executable codex', () => {
+  it('launches the fixed lookup path when it is the first executable codex', () => {
     const io = seam(); launchAgent(base(), io); expect(io.spawn.mock.calls[0][0]).toBe(binary);
   });
   it('refuses a relative entry before codex, but accepts one after the match in review mode', () => {
@@ -307,7 +235,7 @@ describe('B5 same executable as main or refuse', () => {
     writeFileSync(join(root, 'codex'), 'not executable', { mode: 0o644 });
     expect(() => findAgentBinary('codex', [root])).toThrow(/binary not found/);
     chmodSync(join(root, 'codex'), 0o755);
-    expect(findAgentBinary('codex', [join(root, 'missing'), root])).toBe(realpathSync(join(root, 'codex')));
+    expect(findAgentBinary('codex', [join(root, 'missing'), root])).toBe(join(root, 'codex'));
     expect(() => findAgentBinary('claude', [root])).toThrow(/binary not found/);
   });
 });
@@ -373,7 +301,7 @@ describe('closed grammar rejection: the PR #7022 attack classes', () => {
   it('10 refuses execPath, execArgv and fork-style launches', () => {
     for (const field of ['execPath', 'execArgv', 'fork', 'file', 'args', 'argv', 'stdio', 'detached']) refused({ ...base(), [field]: [] }, new RegExp(field));
   });
-  it.each(['codex', 'claude'])('11 removes runtime loader injection before spawning %s', agent => {
+  it.each(['codex', 'claude'])('11 preserves caller runtime loader variables for %s (narrowing deferred to S1e)', agent => {
     const env = { PATH: bin, SAFE: 'kept', NODE_OPTIONS: '--import=/attacker/payload.mjs',
       NODE_PATH: '/attacker/modules', CUSTOM_OPTIONS: 'x', LD_PRELOAD: '/attacker/lib',
       LD_LIBRARY_PATH: '/attacker/libs', LD_AUDIT: '/attacker/audit',
@@ -382,14 +310,14 @@ describe('closed grammar rejection: the PR #7022 attack classes', () => {
       PERL5OPT: '-Mattacker', PERL5LIB: '/attacker/perl', RUBYOPT: '-rattacker', RUBYLIB: '/attacker/ruby' };
     const io = seam();
     io.spawn.mockImplementation((_file, _args, options) => {
-      expect(options.env).toEqual({ PATH: bin, SAFE: 'kept' });
+      expect(options.env).toEqual(env);
       return 'child';
     });
     expect(launchAgent({ ...(agent === 'codex' ? base() : claude()), env }, io)).toBe('child');
     expect(io.spawn).toHaveBeenCalledOnce();
     expect(env.NODE_OPTIONS).toBe('--import=/attacker/payload.mjs');
   });
-  it('11 prevents NODE_OPTIONS preload execution in a real Node child', () => {
+  it('11 preserves NODE_OPTIONS preload execution in a real Node child (S1e)', () => {
     const payload = join(root, 'payload.mjs'), marker = join(root, 'payload-executed');
     writeFileSync(payload, `import { writeFileSync } from 'node:fs'; writeFileSync(${JSON.stringify(marker)}, 'executed');`);
     const env = { PATH: bin, NODE_OPTIONS: `--import=${JSON.stringify(payload)}` };
@@ -400,7 +328,7 @@ describe('closed grammar rejection: the PR #7022 attack classes', () => {
     expect(child.error).toBeUndefined();
     expect(child.status, child.stderr).toBe(0);
     expect(child.stdout).toBe('agent started');
-    expect(existsSync(marker)).toBe(false);
+    expect(readFileSync(marker, 'utf8')).toBe('executed');
   });
   it('12 passes shell startup variables through as main does', () => {
     const env = { ...base().env, BASH_ENV: '/caller/startup', ENV: '/caller/env', ZDOTDIR: '/caller/zsh', SHELL: '/caller/shell' };

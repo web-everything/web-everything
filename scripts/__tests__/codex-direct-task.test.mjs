@@ -67,10 +67,13 @@ const runCodexDirectExec = opts => realRunCodexDirectExec(withFixtureBinary(opts
 const codexDirectTask = opts => realCodexDirectTask(withFixtureBinary(opts));
 
 // CLI subprocesses have no IO argument: map the fixed lookup to the executable on
-// fixture PATH, leaving file identity, permissions and every other filesystem operation real.
+// fixture PATH for identity, stat and access; permissions still come from the real fixture.
 const fixtureBinaryPreload = `
   import binaryFs from 'node:fs';
-  const originalBinaryFs = { realpathSync: binaryFs.realpathSync };
+  const originalBinaryFs = { realpathSync: binaryFs.realpathSync, statSync: binaryFs.statSync, accessSync: binaryFs.accessSync };
+  const fixtureBinaryPath = file => file === '/usr/bin/codex' ? ${JSON.stringify(FAKE_CODEX_BINARY)} : file;
+  binaryFs.statSync = (file, ...args) => originalBinaryFs.statSync(fixtureBinaryPath(file), ...args);
+  binaryFs.accessSync = (file, ...args) => originalBinaryFs.accessSync(fixtureBinaryPath(file), ...args);
   binaryFs.realpathSync = Object.assign((file, ...args) => file === '/usr/bin/codex'
     ? ${JSON.stringify(FAKE_CODEX_BINARY)} : originalBinaryFs.realpathSync(file, ...args), originalBinaryFs.realpathSync);
 `;
@@ -1661,7 +1664,6 @@ describe('direct CLI flags reach the actual spawn and JSON result', () => {
       import { writeFileSync } from 'node:fs';
       import { syncBuiltinESMExports } from 'node:module';
       import { EventEmitter } from 'node:events';
-import { URL as NodeURL } from 'node:url';
       cp.execFileSync = (_bin, args) => args.includes('--absolute-git-dir') ? ${JSON.stringify(join(dir, 'metadata'))} : args.includes('rev-parse') ? 'sha' : '';
       cp.spawn = (_bin, argv) => {
         writeFileSync(${JSON.stringify(argvFile)}, JSON.stringify(argv));
@@ -1703,7 +1705,6 @@ import { URL as NodeURL } from 'node:url';
     const preload = `import cp from 'node:child_process';
       import { syncBuiltinESMExports } from 'node:module';
       import { EventEmitter } from 'node:events';
-import { URL as NodeURL } from 'node:url';
       cp.execFileSync = (_bin, args) => args.includes('--absolute-git-dir') ? ${JSON.stringify(join(dir, 'metadata'))} : args.includes('rev-parse') ? 'sha' : '';
       cp.spawn = (_bin, argv) => {
         const child = new EventEmitter();
@@ -1741,7 +1742,6 @@ import { URL as NodeURL } from 'node:url';
     const preload = `import cp from 'node:child_process';
       import { syncBuiltinESMExports } from 'node:module';
       import { EventEmitter } from 'node:events';
-import { URL as NodeURL } from 'node:url';
       cp.execFileSync = (bin, args) => {
         if (bin === 'npm' && args.includes('check:standards') && !${gateGreen}) throw Object.assign(new Error('standards red'), { status: 1 });
         return args.includes('--absolute-git-dir') ? ${JSON.stringify(join(dir, 'metadata'))} : args.includes('rev-parse') ? 'sha' : '';
@@ -2873,7 +2873,6 @@ describe('detached jobs', () => {
       import cp from 'node:child_process';
       import { syncBuiltinESMExports } from 'node:module';
       import { EventEmitter } from 'node:events';
-import { URL as NodeURL } from 'node:url';
       import { join } from 'node:path';
       import { writeFileSync } from 'node:fs';
       const spawn = cp.spawn;
@@ -2971,7 +2970,6 @@ import { URL as NodeURL } from 'node:url';
         import cp from 'node:child_process';
         import { syncBuiltinESMExports } from 'node:module';
         import { EventEmitter } from 'node:events';
-import { URL as NodeURL } from 'node:url';
         import { writeFileSync } from 'node:fs';
         import { join } from 'node:path';
         const { spawn, execFileSync } = cp;
@@ -3071,7 +3069,6 @@ import { URL as NodeURL } from 'node:url';
         import cp from 'node:child_process';
         import { syncBuiltinESMExports } from 'node:module';
         import { EventEmitter } from 'node:events';
-import { URL as NodeURL } from 'node:url';
         import { join } from 'node:path';
         const { spawn, execFileSync } = cp;
         const isGate = bin => bin === 'npm' || bin === 'node';
@@ -3341,7 +3338,6 @@ import { URL as NodeURL } from 'node:url';
       import cp from 'node:child_process';
       import { syncBuiltinESMExports } from 'node:module';
       import { EventEmitter } from 'node:events';
-import { URL as NodeURL } from 'node:url';
       const scenario = JSON.parse(process.env.TEST_JOB_SCENARIO);
       if (scenario.transcriptMode) {
         process.env.WE_CODEX_TRANSCRIPT_CHECK_MODE = scenario.transcriptMode;

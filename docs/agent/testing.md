@@ -5240,40 +5240,39 @@ restoring an old refresh timer must never make the staged slots discoverable.
 
 ## Launcher main-parity fixtures (SEC1 S1)
 
-The launcher snapshots the caller's `env` record, omits undefined values, and refuses
-non-string or NUL values. It also refuses empty keys and keys containing `=` or NUL,
-even when their values are undefined, before transport checks or runtime filtering.
+Child env = caller record verbatim; refused before spawn: non-string/NUL values,
+empty/=/NUL keys. The launcher snapshots the caller's `env` record and omits undefined
+values. Invalid keys refuse even when their values are undefined.
 Node serializes env entries as `key=value`; an unchecked `=` in a key can therefore
-change the variable name seen by the child and bypass either policy. Keep refusal
+change the variable name seen by the child. Keep refusal
 coverage for both agents and Codex review/edit modes, with the offending key in the
 diagnostic and zero resolver/spawn calls. The real-Git `ext::` regression must prove
 its local marker payload runs with the raw malformed env, then cannot run through
 the launcher. Removing the key check must redden both refusal and behavioral cases.
-Before spawning, it removes runtime loader/startup injection
-variables (`NODE_OPTIONS`, `NODE_PATH`, `LD_*`, `DYLD_*`, `*_OPTIONS`, and Python,
-Perl and Ruby loader/startup variables). Keep a named regression that inspects the
-spawn environment and runs a real Node child with a local preload payload to prove
-the payload cannot execute. Other environment narrowing remains deferred to S1e.
-It never merges the ambient environment. The differential
+Runtime loader variables and Git transport settings pass through unchanged.
+Environment narrowing is deferred to S1e (`designs/sec1-s1e-env-narrowing-prep-2026-11-20.md`);
+#7022 remains open. Keep the real Node preload fixture as a parity pin: the caller's
+`NODE_OPTIONS` still executes the local payload. The launcher never merges the ambient environment. The differential
 matrix in `agent-launch.test.mjs` compares review and edit runs with main's env formula,
-including HOME, Git/gh isolation, policy sources, roots, gates, and retry limits.
-Keep the transport-policy matrix behavioral: compare real Git operations under the
-caller env and the env handed to spawn, for global and per-transport `never`, `user`,
-and `always` with `GIT_PROTOCOL_FROM_USER=0` and `1` in review and edit modes.
-Use local remote helpers for HTTP, HTTPS and an unknown transport so both permitted
-and refused cases are deterministic without network access. A parent refusal must
-remain a child refusal. Pin undefined omission, null refusal and reported/spawned
+including runtime loader variables, Git config pairs/parameters and protocol allowlists,
+HOME, Git/gh isolation, policy sources, roots, gates, and retry limits.
+Pin undefined omission, null refusal and reported/spawned
 argv equality at the direct-task boundary as well.
 Edit PATH is the heavy-admission shim followed by the caller PATH in its original
 order, minus empty entries and that shim; review PATH and TMP remain untouched.
+Test a read-only descriptor with an explicit `tempRoot` directly, so the sandbox guard
+must preserve caller TMP even when the caller supplies a temp root.
 Both Codex PATHs match main. The checked-in six-case argv golden comes from
 `c18c5279b4` and pins token order. Relative edit PATH entries refuse before spawn.
 
 Fixed binary lookup must agree with the first executable Codex on the final child
-PATH by realpath. Refuse a wrapper, a relative entry before the match, or a missing
-match. Use executable fixtures and pair injected spawn with binary evidence; never
+PATH by realpath, but spawn the lookup's named path (`join(dir, agent)`) so a dispatcher
+symlink sees `codex` as its name. Pin that behavior with an executable dispatcher fixture.
+Refuse a wrapper, a relative entry before the match, or a missing match.
+Use executable fixtures and pair injected spawn with binary evidence; never
 require an installed agent. Keep the admission refusal/throw cases and the launcher
-in the permission-change and auditor floors.
+in the permission-change and auditor floors. The approval-count JSON also belongs to
+the permission-change file list and path matcher; pin its unreadable and edited hunks.
 Run the affected launcher, literal-tripwire and direct-task suites through heavy-admission.
 
 ## Verify failed-file recovery

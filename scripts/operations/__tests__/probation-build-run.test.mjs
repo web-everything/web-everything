@@ -765,7 +765,13 @@ describe('standalone task types and workers', () => {
       // The caller PATH and the fixed lookup must identify this same executable.
       const preload = join(dir, 'binary-lookup.mjs');
       writeFileSync(preload, `import fs from 'node:fs';
+        import cp from 'node:child_process';
         import { syncBuiltinESMExports } from 'node:module';
+        const fixturePath = file => file === '/usr/bin/codex' ? ${JSON.stringify(binary)} : file;
+        const originalStat = fs.statSync, originalAccess = fs.accessSync, originalSpawn = cp.spawn;
+        fs.statSync = (file, ...args) => originalStat(fixturePath(file), ...args);
+        fs.accessSync = (file, ...args) => originalAccess(fixturePath(file), ...args);
+        cp.spawn = (file, ...args) => originalSpawn(fixturePath(file), ...args);
         const original = fs.realpathSync;
         fs.realpathSync = Object.assign((file, ...args) => file === '/usr/bin/codex'
           ? ${JSON.stringify(binary)} : original(file, ...args), original);

@@ -55,6 +55,13 @@ describe('replay of PR #4359 (Codex writable roots widened)', () => {
 });
 
 describe('permissionChangeKind', () => {
+  it.each([null, '',
+    '@@ -1 +1 @@\n-    "scripts/old.mjs": 1,\n+    "scripts/new.mjs": 1,\n',
+    '@@ -1,3 +1,3 @@\n {\n-  "scripts/conveyor/health-watch.mjs": 1\n+  "scripts/conveyor/health-watch.mjs": 2\n }\n',
+  ])('B7 launcher approval JSON changes hold (%j)', hunks => {
+    expect(SANDBOX_BEARING_FILES).toContain('scripts/lib/agent-launch-approved.json');
+    expect(permissionChangeKind('scripts/lib/agent-launch-approved.json', hunks)).toBe('sandbox-widening');
+  });
   it.each([null, '', 'diff --git a/scripts/lib/agent-launch.mjs b/scripts/lib/agent-launch.mjs\n@@ -1 +1 @@\n-allowAll\n+allowAll2\n'])('B7 launcher changes always hold (%j)', hunks => {
     expect(SANDBOX_BEARING_FILES).toContain('scripts/lib/agent-launch.mjs');
     expect(permissionChangeKind('scripts/lib/agent-launch.mjs', hunks)).not.toBeNull();
@@ -277,7 +284,8 @@ describe('permissionChangeKind - sandbox grants the first matcher skipped (PR #4
       }
     };
     walk('scripts');
-    expect(found.sort()).toEqual([...SANDBOX_BEARING_FILES].sort());
+    // Approval counts are permission data without literal sandbox tokens.
+    expect(found.sort()).toEqual(SANDBOX_BEARING_FILES.filter(f => f !== 'scripts/lib/agent-launch-approved.json').sort());
     for (const f of SANDBOX_BEARING_FILES) expect(existsSync(join(root, f))).toBe(true);
   });
 });

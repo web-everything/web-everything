@@ -1,9 +1,8 @@
 /**
  * Closed-grammar process boundary: snapshot plain data, then build argv and directly exec.
- * Caller env passes through except runtime injection variables (undefined omitted,
- * invalid values refused, env Git config that widens transport policy refused), with
- * optional PATH prefix and task TMP roots.
- * Other environment narrowing is deferred to S1e.
+ * Child env = caller record verbatim (undefined omitted), with optional PATH prefix
+ * and task TMP roots. Refused before spawn: non-string/NUL values, empty/=/NUL keys.
+ * Environment narrowing is deferred to S1e.
  * Codex must resolve to the same executable on caller PATH as the fixed installation lookup.
  * io.spawn/io.resolveBinary are trusted test seams, never descriptor capabilities.
  */
@@ -18,8 +17,6 @@ const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const COMMON = ['agent', 'cwd', 'processGroup', 'pathPrefix', 'tempRoot', 'env'];
 const CODEX = ['sandbox', 'outputSchemaFile', 'outputLastMessageFile', 'ephemeral', 'addDirs', 'model', 'config', 'resumeThreadId'];
 const CLAUDE = ['print', 'sessionId', 'resumeId', 'model', 'outputFormat', 'verbose', 'prompt'];
-const RUNTIME_INJECTION_ENV = new Set(['NODE_OPTIONS', 'NODE_PATH', 'PYTHONPATH', 'PYTHONSTARTUP',
-  'PERL5OPT', 'PERL5LIB', 'RUBYOPT', 'RUBYLIB']);
 const fail = reason => { throw new TypeError(`agent-launch: ${reason}`); };
 
 // Inspect descriptors, never values through property access, until all data is ours.
@@ -75,75 +72,14 @@ function paths(value, name) {
   if (!Array.isArray(value)) fail(`${name} must be an array`);
   return value.map(p => absolute(p, name));
 }
-// Runtime-controlled loading must not execute code before the agent sandbox starts.
+// Validate serialization only; environment policy belongs to S1e.
 function envRecord(value) {
   record(value, 'env');
   for (const [key, entry] of Object.entries(value)) {
     if (!key || key.includes('=') || key.includes('\0')) fail(`env key ${JSON.stringify(key)} must be non-empty and contain neither '=' nor NUL`);
     if (entry !== undefined && (typeof entry !== 'string' || entry.includes('\0'))) fail(`env.${key} must be a NUL-free string or undefined`);
   }
-  transportPolicy(value);
-  return Object.fromEntries(Object.entries(value).filter(([key, entry]) => entry !== undefined
-    && !RUNTIME_INJECTION_ENV.has(key) && !key.endsWith('_OPTIONS') && !/^(?:LD_|DYLD_)/.test(key)));
-}
-// Tighten-only: env-supplied Git config may restrict Git's built-in transport defaults
-// (ext never, file and unknown user, these always) but never widen them. Config files stay S1e.
-const SAFE_TRANSPORTS = new Set(['http', 'https', 'git', 'ssh']);
-function widensTransport(key, value) {
-  const first = key.indexOf('.'), last = key.lastIndexOf('.');
-  const section = (first < 0 ? key : key.slice(0, first)).toLowerCase();
-  if (section === 'include' || section === 'includeif') return true; // indirection to an unread file
-  if (section !== 'protocol' || key.slice(last + 1).toLowerCase() !== 'allow') return false;
-  const policy = typeof value === 'string' ? value.toLowerCase() : undefined;
-  if (policy === 'never') return false;
-  const name = first === last ? undefined : key.slice(first + 1, last); // subsections are case-sensitive
-  if (policy === 'always') return !SAFE_TRANSPORTS.has(name);
-  if (policy === 'user') return name === undefined || name === 'ext';
-  return true; // unparseable policy: fail closed
-}
-// Git's GIT_CONFIG_PARAMETERS grammar: space-separated sq-quoted `'key'='value'` or `'key=value'`
-// entries, a literal quote spelled `'\''`. Anything else returns null (refused).
-function configParameters(text) {
-  const pairs = []; let i = 0;
-  const quoted = () => {
-    if (text[i] !== "'") return undefined;
-    let out = '';
-    for (;;) {
-      const end = text.indexOf("'", i + 1);
-      if (end < 0) return undefined;
-      out += text.slice(i + 1, end); i = end + 1;
-      if (text[i] !== '\\' || !"'!".includes(text[i + 1] ?? '') || text[i + 2] !== "'") return out;
-      out += text[i + 1]; i += 2;
-    }
-  };
-  while (i < text.length) {
-    if (/\s/.test(text[i])) { i++; continue; }
-    const key = quoted();
-    if (key === undefined) return null;
-    if (text[i] === '=') {
-      i++;
-      const value = /\s/.test(text[i] ?? ' ') ? undefined : quoted();
-      if (value === undefined && i < text.length && !/\s/.test(text[i])) return null;
-      pairs.push([key, value]);
-    } else {
-      const eq = key.indexOf('=');
-      pairs.push(eq < 0 ? [key, undefined] : [key.slice(0, eq), key.slice(eq + 1)]);
-    }
-    if (i < text.length && !/\s/.test(text[i])) return null;
-  }
-  return pairs;
-}
-function transportPolicy(env) {
-  const widened = reason => fail(`env ${reason} widens Git transport policy; restrict it (never) or remove it and retry`);
-  for (const [key, entry] of Object.entries(env)) {
-    const index = /^GIT_CONFIG_KEY_(.*)$/.exec(key)?.[1];
-    if (index !== undefined && entry !== undefined && widensTransport(entry, env[`GIT_CONFIG_VALUE_${index}`])) widened(key);
-  }
-  if (env.GIT_CONFIG_PARAMETERS !== undefined) {
-    const pairs = configParameters(env.GIT_CONFIG_PARAMETERS);
-    if (pairs === null || pairs.some(([key, value]) => widensTransport(key, value))) widened('GIT_CONFIG_PARAMETERS');
-  }
-  if (env.GIT_ALLOW_PROTOCOL !== undefined && env.GIT_ALLOW_PROTOCOL.split(':').some(p => p && !SAFE_TRANSPORTS.has(p))) widened('GIT_ALLOW_PROTOCOL');
+  return Object.fromEntries(Object.entries(value).filter(([, entry]) => entry !== undefined));
 }
 function configValue(key, value) {
   switch (key) {
@@ -209,7 +145,7 @@ function resolveBinary(agent) {
 export function findAgentBinary(agent, dirs) {
   for (const dir of dirs) {
     try {
-      const file = realpathSync(join(dir, agent));
+      const file = join(dir, agent);
       if (!isAbsolute(file) || !statSync(file).isFile()) continue;
       accessSync(file, constants.X_OK);
       return file;
@@ -228,7 +164,7 @@ function firstCodex(path) {
   for (const dir of path.split(':')) {
     if (!isAbsolute(dir)) fail('relative child PATH entry before codex; use absolute directories and retry');
     try {
-      const file = realpathSync(join(dir, 'codex'));
+      const file = join(dir, 'codex');
       if (!statSync(file).isFile()) continue;
       accessSync(file, constants.X_OK);
       return file;
@@ -253,7 +189,7 @@ export function buildAgentInvocation(descriptor, io) {
   try { if (!statSync(d.cwd).isDirectory()) fail('cwd must be an existing directory'); }
   catch { fail('cwd must be an existing directory'); }
   const file = absolute((io?.resolveBinary ?? resolveBinary)(d.agent), 'resolved binary');
-  if (d.agent === 'codex' && firstCodex(env.PATH) !== realpathSync(file)) {
+  if (d.agent === 'codex' && realpathSync(firstCodex(env.PATH)) !== realpathSync(file)) {
     fail('codex binary identity differs from child PATH; align PATH with the fixed installation and retry');
   }
   return { file, args, options: { shell: false, cwd: d.cwd, env, stdio: ['pipe', 'pipe', 'pipe'], detached: d.processGroup === true } };
