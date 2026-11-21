@@ -327,7 +327,7 @@ describe('CI gate mirroring fails closed', () => {
     .filter(([job]) => ['changes', 'test-shard', 'coverage-merge', 'host-paths', 'integration-part', 'integration', 'standards'].includes(job))
     .flatMap(([job, spec]) => spec.steps.flatMap((step, index) => step.uses === 'actions/checkout@v4' ? [[job, index, step.with?.path === 'frontierui']] : []));
   it.each(checkoutSteps)('pins checkout source and directory for %s step %i (FUI=%s)', (job, index, fui) => {
-    for (const [key, value] of [['ref', 'other-branch'], ['ref', null], ['path', 'unexpected'],
+    for (const [key, value] of [['ref', 'other-branch'], ['ref', null], ['ref', undefined], ['path', 'unexpected'],
       ['repository', fui ? 'other/frontierui' : 'frontier-ui/frontierui'],
       ...(fui ? [['repository', undefined]] : [])]) {
       const changed = yaml.safeLoad(workflow), checkout = changed.jobs[job].steps[index];

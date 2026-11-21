@@ -132,7 +132,7 @@ echo "::error::Host paths did not succeed."
 exit 1
 fi
 if [ "\${{ needs.changes.outputs.light }}" = "true" ]; then
-echo "Card-only PR: unit shards and coverage merge intentionally omitted."
+echo "Light CI: unit shards and coverage merge intentionally omitted. $MAIN_SKIP_REASON"
 exit 0
 fi
 if [ "\${{ needs.test-shard.result }}" != "success" ]; then
@@ -150,28 +150,56 @@ fi
   ],
 };
 
+// Reuse only changes execution metadata; local urgent verification still executes every suite.
+mirroredRuns.changes.push(
+  'node scripts/ci/main-push-skip.mjs --record-fui >> "$GITHUB_OUTPUT"',
+  'node scripts/ci/main-push-skip.mjs --sha="$HEAD_SHA" --before="$BEFORE_SHA" --run-id="$RUN_ID" --event="$EVENT_NAME" --ref="$REF" --repo="$REPO" >> "$GITHUB_OUTPUT"',
+  'echo recorded > "$RUNNER_TEMP/fui-sibling-record"',
+);
+const scheduledRef = "${{ github.event_name == 'schedule' && github.sha || '' }}";
+const siblingRef = "${{ needs.changes.outputs.fui-sha || '' }}";
+const reusePush = "${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}";
+const reused = "${{ steps.main-skip.outputs.skip == 'true' }}";
+const queueEvent = "${{ github.event_name == 'merge_group' }}";
+const queueFull = "${{ github.event_name == 'merge_group' && needs.changes.outputs.light != 'true' }}";
+const quarantineUpload = suite => ({ uses: 'actions/upload-artifact@v4', if: queueFull, with: {
+  name: `quarantine-reuse-${suite}`, path: '${{ runner.temp }}/quarantine-reuse', 'if-no-files-found': 'ignore',
+} });
+
 // Ordered uses-step signatures observed in ci.yml, independent of the input workflow.
 // Pin the complete with mapping: additions, removals and option changes require a mirror review.
 const siblingActions = [
-  { name: 'Checkout WE', uses: 'actions/checkout@v4', with: { path: 'web-everything', 'fetch-depth': 50 } },
+  { name: 'Checkout WE', uses: 'actions/checkout@v4', with: { ref: scheduledRef, path: 'web-everything', 'fetch-depth': 50 } },
   { name: 'Mint FUI read token (GitHub App)', if: "vars.WE_APP_ID != ''", uses: 'actions/create-github-app-token@v2', with: {
     'app-id': '${{ vars.WE_APP_ID }}', 'private-key': '${{ secrets.WE_APP_PRIVATE_KEY }}',
     owner: 'frontier-ui', repositories: 'frontierui', 'permission-contents': 'read',
   } },
   { name: 'Checkout FUI (sibling)', uses: 'actions/checkout@v4', with: {
-    repository: 'frontier-ui/frontierui', token: '${{ steps.fui-app-token.outputs.token || secrets.FUI_READ_TOKEN }}', path: 'frontierui',
+    repository: 'frontier-ui/frontierui', ref: siblingRef, token: '${{ steps.fui-app-token.outputs.token || secrets.FUI_READ_TOKEN }}', path: 'frontierui',
   } },
   { name: undefined, uses: 'actions/setup-node@v4', with: {
     'node-version': 22, cache: 'npm', 'cache-dependency-path': 'web-everything/package-lock.json\nfrontierui/package-lock.json\n',
   } },
 ];
 const mirroredActions = {
-  changes: [{ name: undefined, uses: 'actions/checkout@v4', with: { 'fetch-depth': 50 } }],
+  changes: [
+    { uses: 'actions/checkout@v4', with: { ref: scheduledRef, 'fetch-depth': 50 } },
+    { name: 'Mint FUI read token (GitHub App)', uses: 'actions/create-github-app-token@v2',
+      if: "${{ github.event_name == 'merge_group' || (github.event_name == 'push' && github.ref == 'refs/heads/main') }}",
+      'continue-on-error': true, with: {
+        'app-id': '${{ vars.WE_APP_ID }}', 'private-key': '${{ secrets.WE_APP_PRIVATE_KEY }}',
+        owner: 'frontier-ui', repositories: 'frontierui', 'permission-contents': 'read',
+      } },
+    { uses: 'actions/upload-artifact@v4', if: reused, with: {
+      name: 'fui-sibling-${{ steps.main-skip.outputs.fui-sha }}', path: '${{ runner.temp }}/fui-sibling-record',
+    } },
+  ],
   standards: siblingActions,
   'integration-part': [...siblingActions.map(step => ({ ...step, if: step.name === 'Mint FUI read token (GitHub App)' ? step.if : "${{ steps.gate.outputs.run == 'true' }}" })),
     { name: 'Upload integration timings', if: "${{ needs.changes.outputs.light != 'true' && (always()) }}", uses: 'actions/upload-artifact@v4', with: {
       name: 'timing-integration-${{ matrix.group }}', path: 'web-everything/coverage/timing-integration-${{ matrix.group }}.json', 'if-no-files-found': 'ignore',
     } },
+    quarantineUpload('integration-${{ matrix.group }}'),
   ],
   integration: [],
   'test-shard': [...siblingActions.map(step => ({ ...step, if: step.name === 'Mint FUI read token (GitHub App)'
@@ -182,9 +210,10 @@ const mirroredActions = {
     { name: 'Upload shard timings', if: "${{ needs.changes.outputs.light != 'true' && (always()) }}", uses: 'actions/upload-artifact@v4', with: {
       name: 'timing-unit-${{ matrix.shard }}', path: 'web-everything/coverage/timing-unit-${{ matrix.shard }}.json', 'if-no-files-found': 'ignore',
     } },
+    quarantineUpload('unit-${{ matrix.shard }}'),
   ],
   'coverage-merge': [
-    { name: undefined, uses: 'actions/checkout@v4', with: { path: 'web-everything' } },
+    { name: undefined, uses: 'actions/checkout@v4', with: { ref: scheduledRef, path: 'web-everything' } },
     { name: undefined, uses: 'actions/setup-node@v4', with: {
       'node-version': 22, cache: 'npm', 'cache-dependency-path': 'web-everything/package-lock.json',
     } },
@@ -193,7 +222,7 @@ const mirroredActions = {
     } },
   ],
   'host-paths': [
-    { name: undefined, uses: 'actions/checkout@v4', with: undefined },
+    { name: undefined, uses: 'actions/checkout@v4', with: { ref: scheduledRef } },
     { name: undefined, uses: 'actions/setup-node@v4', with: { 'node-version': 22 } },
   ],
   test: [],
@@ -204,6 +233,20 @@ const fullUnit = "${{ needs.changes.outputs.light != 'true' }}";
 const fullIntegration = "${{ steps.gate.outputs.run == 'true' }}";
 function mirroredRunContext(job, text) {
   const index = mirroredRuns[job].map(runText).indexOf(text);
+  if (job === 'changes') return {
+    'working-directory': undefined, shell: undefined, 'continue-on-error': undefined,
+    if: [undefined, queueEvent, reusePush, reused][index],
+    env: [
+      { EVENT_NAME: '${{ github.event_name }}', BASE_SHA: '${{ github.event.pull_request.base.sha }}',
+        MG_BASE_SHA: '${{ github.event.merge_group.base_sha }}', BASE_REF: '${{ github.event.pull_request.base.ref }}' },
+      { FUI_TOKEN: '${{ steps.fui-app-token.outputs.token }}' },
+      { GH_TOKEN: '${{ github.token }}', FUI_TOKEN: '${{ steps.fui-app-token.outputs.token }}',
+        HEAD_SHA: '${{ github.sha }}', BEFORE_SHA: '${{ github.event.before }}', RUN_ID: '${{ github.run_id }}',
+        EVENT_NAME: '${{ github.event_name }}', REF: '${{ github.ref }}', REPO: '${{ github.repository }}',
+        WE_CI_MAIN_PUSH_SKIP_MAX_AGE_MS: '${{ vars.WE_CI_MAIN_PUSH_SKIP_MAX_AGE_MS }}' },
+      undefined,
+    ][index],
+  };
   const setup = setupRuns.includes(text);
   const directory = text === 'npm ci\nnpm run build:tools' ? 'frontierui'
     : setup || job === 'standards' || (job === 'coverage-merge' && index === 1)
@@ -215,10 +258,8 @@ function mirroredRunContext(job, text) {
   ][index]) : job === 'integration-part' && (setup || index === 1) ? fullIntegration : undefined;
   return {
     'working-directory': directory, if: condition, shell: undefined, 'continue-on-error': undefined,
-    env: job === 'changes' ? {
-      EVENT_NAME: '${{ github.event_name }}', BASE_SHA: '${{ github.event.pull_request.base.sha }}',
-      MG_BASE_SHA: '${{ github.event.merge_group.base_sha }}', BASE_REF: '${{ github.event.pull_request.base.ref }}',
-    } : job === 'integration-part' && index === 1 ? { WE_INTEGRATION_GROUP: '${{ matrix.group }}' } : undefined,
+    env: job === 'integration-part' && index === 1 ? { WE_INTEGRATION_GROUP: '${{ matrix.group }}' }
+      : job === 'test' ? { MAIN_SKIP_REASON: '${{ needs.changes.outputs.skip-reason }}' } : undefined,
   };
 }
 
@@ -264,7 +305,7 @@ export function ciGatePlan(workflow) {
       (typeof s.run !== 'string' || !allowed.has(runText(s.run))))))
       throw new Error(`unreadable-ci-gates: update the urgent verification mirror for ${job} run or uses steps`);
     const actualActions = steps.filter(s => 'uses' in s).map(s => ({ name: s.name, uses: s.uses, with: s.with, if: s.if, env: s.env, 'continue-on-error': s['continue-on-error'] }));
-    if (!isDeepStrictEqual(actualActions, mirroredActions[job].map(s => ({ if: undefined, env: undefined, 'continue-on-error': undefined, ...s }))))
+    if (!isDeepStrictEqual(actualActions, mirroredActions[job].map(s => ({ name: undefined, if: undefined, env: undefined, 'continue-on-error': undefined, ...s }))))
       throw new Error(`unreadable-ci-gates: update the urgent verification mirror for ${job} uses steps`);
     // Every accepted command must belong to the local mirror, exactly once.
     const actualRuns = steps.filter(s => 'run' in s).map(s => runText(s.run));
@@ -277,7 +318,8 @@ export function ciGatePlan(workflow) {
       const options = checkout.with ?? {};
       const fui = sibling && index === 1;
       const path = fui ? 'frontierui' : sibling || job === 'coverage-merge' ? 'web-everything' : undefined;
-      return Object.hasOwn(options, 'ref') || options.path !== path
+      const ref = fui ? siblingRef : scheduledRef;
+      return options.ref !== ref || options.path !== path
         || (fui ? options.repository !== 'frontier-ui/frontierui' : Object.hasOwn(options, 'repository'));
     })) throw new Error(`unreadable-ci-gates: ${job} checkout layout; update the urgent verification mirror`);
     if (jobs[job].defaults?.run !== undefined || jobs[job].env !== undefined || jobs[job].container !== undefined
