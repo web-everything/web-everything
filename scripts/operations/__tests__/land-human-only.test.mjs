@@ -471,7 +471,7 @@ describe('land-human-only — the reader', () => {
       mergeable: 'MERGEABLE', mergeStateStatus: 'CLEAN', id: 'PR_node',
       statusCheckRollup: [{ name: 'test', status: 'COMPLETED', conclusion: 'SUCCESS' }] };
     const exec = (_bin, args) => {
-      if (args[0] === 'api' && args.some(a => a.includes('/check-runs?'))) return JSON.stringify([{ total_count: live.statusCheckRollup.length, check_runs: live.statusCheckRollup }]);
+      if (args[0] === 'api' && args.some(a => a.includes('/check-runs?'))) return JSON.stringify([{ total_count: live.statusCheckRollup.length, check_runs: live.statusCheckRollup.map((row, i) => ({ ...row, id: i + 1 })) }]);
       if (args[0] === 'api' && args.some(a => a.includes('/status?'))) {
         if (unreadableStatuses) throw new Error('status read unavailable');
         return JSON.stringify([{ total_count: 0, statuses: [] }]);
@@ -557,7 +557,7 @@ describe('land-human-only — the reader', () => {
       statusCheckRollup: [{ name: 'test', status: 'COMPLETED', conclusion: 'SUCCESS' }] };
     const exec = (bin, args) => {
       const a = args.join(' ');
-      if (args[0] === 'api' && a.includes('/check-runs?')) return JSON.stringify([{ total_count: live.statusCheckRollup.length, check_runs: live.statusCheckRollup }]);
+      if (args[0] === 'api' && a.includes('/check-runs?')) return JSON.stringify([{ total_count: live.statusCheckRollup.length, check_runs: live.statusCheckRollup.map((row, i) => ({ ...row, id: i + 1 })) }]);
       if (args[0] === 'api' && a.includes('/status?')) return JSON.stringify([{ total_count: 0, statuses: [] }]);
       if (a.startsWith('pr view')) return JSON.stringify(live);
       if (a.startsWith('repo view')) return JSON.stringify({ defaultBranchRef: { name: 'main' } });

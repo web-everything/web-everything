@@ -34,13 +34,20 @@ export const readReviewChecks = ({ repo, headSha, run = gh }) => {
   });
   const statuses = statusPages.flatMap(page => {
     if (!Array.isArray(page.statuses)) throw new Error('unreadable commit statuses');
-    return page.statuses.map(({ context, state, target_url }) => ({ context, state, target_url }));
+    return page.statuses;
   });
-  // Partial means not attested: the delivered rows must equal the server's claimed total for BOTH feeds.
+  // Count distinct API identities before projecting statuses: overlapping pages can replace a missing row
+  // with a duplicate while still matching total_count. Check names are not identities (reruns share them).
   const delivered = (pages, rows) => pages.length > 0 && pages.every(page => Number.isSafeInteger(page.total_count)
-    && page.total_count === pages[0].total_count) && rows.length === pages[0].total_count;
-  const rowsComplete = delivered(runPages, runs) && delivered(statusPages, statuses);
-  return Object.defineProperties([...runs, ...statuses], { rowsComplete: { value: rowsComplete }, rowsHead: { value: headSha } });
+    && page.total_count === pages[0].total_count) && rows.length === pages[0].total_count
+    && rows.every(row => Number.isSafeInteger(row?.id)) && new Set(rows.map(row => row.id)).size === rows.length;
+  // The combined-status endpoint returns one latest status per context. A context updated between pages
+  // can reappear under a new ID, so IDs alone cannot establish that this feed is complete.
+  const uniqueContexts = statuses.every(row => typeof row?.context === 'string' && row.context.length > 0)
+    && new Set(statuses.map(row => row.context)).size === statuses.length;
+  const rowsComplete = delivered(runPages, runs) && delivered(statusPages, statuses) && uniqueContexts;
+  return Object.defineProperties([...runs, ...statuses.map(({ context, state, target_url }) => ({ context, state, target_url }))],
+    { rowsComplete: { value: rowsComplete }, rowsHead: { value: headSha } });
 };
 
 export function readReviewCiGate({ repo, pr, readHead, readLabels,

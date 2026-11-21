@@ -945,9 +945,9 @@ describe('default production reader gate-only provenance', () => {
       if (failure === `${endpoint}-unreadable`) throw new Error(`${endpoint} unreadable`);
       if (failure === `${endpoint}-incomplete`) return JSON.stringify([{}]);
       return JSON.stringify(endpoint === 'checks' ? [
-        { total_count: claimed, check_runs: [{ name: 'test', status: 'completed', conclusion: 'success' }] },
-        { total_count: claimed, check_runs: [{ name: 'review-gate', status: 'completed', conclusion: 'failure' }] },
-      ] : [{ total_count: 1, statuses: [{ context: 'legacy-test', state: 'success' }] }]);
+        { total_count: claimed, check_runs: [{ id: 1, name: 'test', status: 'completed', conclusion: 'success' }] },
+        { total_count: claimed, check_runs: [{ id: 2, name: 'review-gate', status: 'completed', conclusion: 'failure' }] },
+      ] : [{ total_count: 1, statuses: [{ id: 1, context: 'legacy-test', state: 'success' }] }]);
     });
     return { pr: 6042, repo: 'example/repo', headSha: HEAD, outcome: 'needs-human',
       settings: { recheckNotCiBreak: true }, readRequired: vi.fn(() => ({ checks: ['test', 'legacy-test'] })),

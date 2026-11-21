@@ -5,6 +5,24 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { getRequiredStatusChecks } from '../required-status-checks.mjs';
 import { readReviewCiGate as readGate, readReviewHead, readReviewChecks, formatReviewCiSkip } from '../review-ci-gate-io.mjs';
+
+// Overlapping pages must not substitute duplicate rows for missing evidence.
+it.each(['check_runs', 'statuses'])('refuses duplicate pagination identities in %s', feed => {
+  const row = feed === 'check_runs'
+    ? { id: 1, name: 'test', status: 'completed', conclusion: 'success' }
+    : { id: 1, context: 'test', state: 'success' };
+  const read = pages => readReviewChecks({ repo: 'o/p', headSha: 'a'.repeat(40),
+    run: argv => JSON.stringify(argv[3].includes(feed === 'check_runs' ? '/check-runs?' : '/status?')
+      ? pages : [{ total_count: 0, check_runs: [], statuses: [] }]) });
+  expect(read([{ total_count: 2, [feed]: [row] }, { total_count: 2, [feed]: [{ ...row }] }]).rowsComplete).toBe(false);
+  expect(read([{ total_count: 2, [feed]: [row, { ...row }] }]).rowsComplete).toBe(false);
+  expect(read([{ total_count: 2, [feed]: [row, { ...row, state: 'pending', status: 'in_progress' }] }]).rowsComplete).toBe(false);
+  expect(read([{ total_count: 1, [feed]: [{ ...row, id: undefined }] }]).rowsComplete).toBe(false);
+  expect(read([{ total_count: 1, [feed]: [{ ...row, id: '1' }] }]).rowsComplete).toBe(false);
+  // Check reruns share names; combined statuses must have one latest row per context.
+  expect(read([{ total_count: 2, [feed]: [row] }, { total_count: 2, [feed]: [{ ...row, id: 2 }] }]).rowsComplete).toBe(feed === 'check_runs');
+  expect(read([{ total_count: 2, [feed]: [row] }, { total_count: 2, [feed]: [{ ...row, id: 2, context: 'other' }] }]).rowsComplete).toBe(true);
+});
 const readReviewCiGate = o => readGate({ policy: { startAfter: 'ci-green' }, ...o });
 it('push requires both fast prerequisites, and discovers required checks for repos with no fast set', () => {
   const sha = 'a'.repeat(40);
@@ -147,7 +165,7 @@ it('production read argv is repo/SHA-explicit and fetches every page and rerun',
 
 it('admits successful required commit statuses', () => {
   const run = argv => JSON.stringify(argv[3].includes('/status?')
-    ? [{ total_count: 1, statuses: [{ context: 'legacy', state: 'success' }] }] : [{ total_count: 1, check_runs: [{ name: 'custom', status: 'completed', conclusion: 'success' }] }]);
+    ? [{ total_count: 1, statuses: [{ id: 1, context: 'legacy', state: 'success' }] }] : [{ total_count: 1, check_runs: [{ id: 1, name: 'custom', status: 'completed', conclusion: 'success' }] }]);
   expect(readReviewCiGate(fixture({ readRequired: () => ({ source: 'live', checks: ['custom', 'legacy'] }),
     readChecks: ({ repo, headSha }) => readReviewChecks({ repo, headSha, run }) }))).toMatchObject({ allowed: true });
 });

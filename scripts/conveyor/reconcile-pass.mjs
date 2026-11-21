@@ -1566,9 +1566,8 @@ export function hydrateChecks(prs,{ repo, requiredChecks, readChecks, defaultBra
     const runs = Array.isArray(pr.statusCheckRollup) ? pr.statusCheckRollup : [];
     const missing = withoutImpliedRequiredChecks(requiredChecks ?? [], runs).filter(name => !runs.some(run => run?.name === name));
     const complete = pr.rowsComplete === true && pr.rowsHead === pr.headRefOid;
-    // A page-sized snapshot is not truncated when its reader already proved completeness.
-    const legacyShortRead = runs.length < 100 && pr.rowsComplete == null && pr.rowsHead == null;
-    if ((complete || legacyShortRead) && !missing.length) { ready.push(pr); continue; }
+    // Only the reader can attest completeness, even for short legacy rollups.
+    if (complete && !missing.length) { ready.push(pr); continue; }
     if (stackedPolicy === 'await-base' && isStackedPr(pr, defaultBranch)
       && runs.length < 100 && missing.length === (requiredChecks ?? []).length) {
       const basePrNumber = prs.find(candidate => candidate.headRefName === pr.baseRefName)?.number ?? null;

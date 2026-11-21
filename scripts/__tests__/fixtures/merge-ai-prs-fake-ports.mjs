@@ -25,7 +25,8 @@ if (a[0] === 'api') {
   if (path.includes('/files')) out([[{filename:'README.md',status:'modified'}]]);
   if (pr.unreadableCheckRows && path.includes('/' + pr.unreadableCheckRows + '?')) out([{}]);
   // Complete pages carry the server's total_count: the strict reader attests rows only when delivered === total.
-  const runRows = pr.statusCheckRollup.filter(c => c.name), statusRows = pr.statusCheckRollup.filter(c => c.context);
+  const runRows = pr.statusCheckRollup.filter(c => c.name).map((c, i) => ({ ...c, id: c.id ?? -(i + 1) }));
+  const statusRows = pr.statusCheckRollup.filter(c => c.context).map((c, i) => ({ ...c, id: c.id ?? -(i + 1) }));
   if (path.includes('/check-runs')) out(pr.checkRuns || [{total_count:runRows.length,check_runs:runRows}]);
   if (path.includes('/status?')) out([{total_count:statusRows.length,statuses:statusRows}]);
   if (a[1] === 'graphql') {

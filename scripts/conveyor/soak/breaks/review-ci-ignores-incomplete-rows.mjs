@@ -6,7 +6,7 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 const ROOT = resolve(fileURLToPath(import.meta.url), '../../../../..');
 const PATHS = ['scripts/conveyor/reconcile-core.mjs', 'scripts/lib/review-ci-gate.mjs',
   'scripts/lib/review-timing.mjs', 'scripts/conveyor/ci-heal-verdict-recheck.mjs',
-  'scripts/conveyor/reconcile-pass.mjs'];
+  'scripts/conveyor/reconcile-pass.mjs', 'scripts/lib/review-ci-gate-io.mjs'];
 const HEAD = 'c'.repeat(40);
 
 export default {
@@ -72,20 +72,28 @@ async function probeHydration(root) {
     baseRefName: 'main', labels: ['review:pending'], comments: [], mergeStateStatus: 'CLEAN',
     statusCheckRollup: rows, rowsComplete: true, rowsHead: HEAD };
   const violations = [];
-  for (const shape of ['complete', 'truncated', 'unreadable-status', 'short-feed']) {
+  for (const shape of ['complete', 'truncated', 'unreadable-status', 'short-feed', 'legacy-short', 'duplicate-runs', 'duplicate-statuses']) {
     let reads = 0;
     const plan = runReconcilePass({ ...options,
-      readPrs: () => [{ ...pr, rowsComplete: shape === 'complete' }],
+      readPrs: () => [{ ...pr, rowsComplete: shape === 'complete',
+        ...(shape === 'legacy-short' ? { rowsComplete: null, rowsHead: null, statusCheckRollup: [rows[0]] } : {}) }],
       readChecks: args => defaultReadChecks(args, { exec: (_file, argv) => {
         reads++;
+        if (shape === 'duplicate-runs' && argv.some(arg => arg.includes('/check-runs'))) {
+          return JSON.stringify([{ total_count: 100, check_runs: rows.slice(0, 99) }, { total_count: 100, check_runs: [rows[0]] }]);
+        }
         if (argv.some(arg => arg.includes('/check-runs'))) return JSON.stringify([{ total_count: shape === 'short-feed' ? 150 : 100, check_runs: rows }]);
         if (shape === 'unreadable-status') throw new Error('status page unavailable');
+        if (shape === 'duplicate-statuses') return JSON.stringify([
+          { total_count: 2, statuses: [{ id: 1, context: 'legacy', state: 'success' }] },
+          { total_count: 2, statuses: [{ id: 1, context: 'legacy', state: 'success' }] },
+        ]);
         return JSON.stringify([{ total_count: 0, statuses: [] }]);
       } }),
     });
-    const expected = ['unreadable-status', 'short-feed'].includes(shape) ? 0 : 1;
-    if (plan.dispatch.filter(d => d.kind === 'review').length !== expected) violations.push(`${shape} 100-row rollup: expected ${expected} reviews`);
-    if (reads !== (shape === 'complete' ? 0 : 2)) violations.push(`${shape} 100-row rollup: unexpected hydration read count ${reads}`);
+    const expected = ['unreadable-status', 'short-feed', 'duplicate-runs', 'duplicate-statuses'].includes(shape) ? 0 : 1;
+    if (plan.dispatch.filter(d => d.kind === 'review').length !== expected) violations.push(`${shape} rollup: expected ${expected} reviews`);
+    if (reads !== (shape === 'complete' ? 0 : 2)) violations.push(`${shape} rollup: unexpected hydration read count ${reads}`);
   }
   return violations;
 }

@@ -1344,7 +1344,8 @@ it.each([
   ['unreadable', () => xxRuns().map(row => ({ ...row, conclusion: row.name === 'test' ? null : row.conclusion }))],
 ])('xxh4zw8 %s hydration refuses visibly, never heals unknown evidence, and allows unrelated progress', async (_, readChecks) => {
   const { runReconcilePass, formatReport } = await import('../reconcile-pass.mjs');
-  const good = { ...xxPr(), number: 3337, statusCheckRollup: xxRuns().map(row => ({ ...row, conclusion: 'SUCCESS', status: 'COMPLETED' })) };
+  const good = { ...xxPr(), number: 3337, rowsComplete: true, rowsHead: XX_HEAD,
+    statusCheckRollup: xxRuns().map(row => ({ ...row, conclusion: 'SUCCESS', status: 'COMPLETED' })) };
   const plan = runReconcilePass({ ...xxOptions(), readChecks, readPrs: () => [xxPr(), good] });
   expect(plan.dispatch.map(d => [d.prNumber, d.kind])).toEqual([[3337, 'promote-draft']]);
   expect(plan.refusals.filter(r => r.kind === 'check-read-failed'))
@@ -1609,7 +1610,7 @@ describe('timeout re-run eligibility — card-only diff + derived red checks (PR
 
 describe('stacked PR required-check absence (#3915)', () => {
   const stacked = () => ({ ...xxPr(), number: 3915, baseRefName: 'lane/base', statusCheckRollup: [] });
-  const base = () => ({ ...xxPr(), number: 3889, headRefName: 'lane/base', baseRefName: 'main',
+  const base = () => ({ ...xxPr(), number: 3889, headRefName: 'lane/base', baseRefName: 'main', rowsComplete: true, rowsHead: XX_HEAD,
     statusCheckRollup: XX_REQUIRED.map(name => ({ name, status: 'COMPLETED', conclusion: 'SUCCESS' })) });
   const run = async (prs, extra = {}) => {
     const { runReconcilePass } = await import('../reconcile-pass.mjs');
