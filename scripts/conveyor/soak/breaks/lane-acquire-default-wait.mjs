@@ -15,6 +15,7 @@ import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { runInNewContext } from 'node:vm';
+import { leaseDisqualifiesAcquire } from '../../../lib/lane-lease.mjs';
 
 const REPO_ROOT = resolve(fileURLToPath(import.meta.url), '..', '..', '..', '..', '..');
 const MARKER = 'scripts/lane-pool.mjs';
@@ -22,7 +23,7 @@ const DEFAULT_WAIT_MS = 2500;
 
 // Exercise the production acquire loop AND cached-scan implementation with private IO. This also
 // runs in a sandbox that forbids spawning the CLI or creating temporary Git repositories.
-export async function replayAcquireDeadline({ waitMs = 30, reaperMs = 0, free = false, recovery = false, scanFailure = null } = {}, root = REPO_ROOT) {
+export async function replayAcquireDeadline({ waitMs = 30, reaperMs = 0, free = false, recovery = false, scanFailure = null, eligibilityFailure = false } = {}, root = REPO_ROOT) {
   const source = readFileSync(join(root, MARKER), 'utf8');
   const extract = (name) => {
     const start = source.indexOf(`function ${name}(`);
@@ -41,13 +42,18 @@ export async function replayAcquireDeadline({ waitMs = 30, reaperMs = 0, free = 
     acquireDefaultWaitMs: waitMs, acquireDefaultWaitInvalid: false,
     ACQUIRE_POLL_MS: 1000, LIST_LOCK_ORPHAN_GRACE_MS: 1000,
     laneDir: (repo, n) => `${repo.poolDir}/lane-${n}`, isHistoryQuarantined: () => false,
+    // Growth/recovery retry candidates pass the same lease/history gates as free-list hints.
+    leaseDisqualifiesAcquire, readLease: () => null, requireReadableLaneHistory() {},
+    join, lstatSync() {}, // Retry fixtures represent checkouts whose metadata is present.
     listScanTimeoutMs: () => 120_000, listCacheTtlMs: () => 0,
     lastListWasLockPartial: false, lastScanPartial: false,
+    laneEligibilityProbeFailed: false,
     readListCache: () => null, tryTakeListLock: () => true, readLockOwner: () => null,
     releaseListLock() {}, writeListCache() {},
     scanAcquirable: () => {
       report.scans++;
       if (scanFailure) throw Object.assign(new Error(scanFailure), { [scanFailure]: true });
+      if (eligibilityFailure) context.laneEligibilityProbeFailed = true;
       return free ? ['/fixture/lane-1'] : [];
     },
     sleepSyncMs: ms => { report.polls++; sleep(ms); }, jitteredDelayMs: ms => ms,

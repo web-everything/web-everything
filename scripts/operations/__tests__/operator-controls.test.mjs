@@ -10,7 +10,7 @@ import { createOperatorControlsSinks, createOperatorControlsReader } from '../op
 
 const input = { repo: 'web-everything/web-everything', pr: 7, actor: 'chalbert', channel: 'operator-session', reason: 'because <this>\nverbatim', kind: 'fix', n: 1 };
 const contexts = {
-  unpark: { state: 'OPEN', labels: ['review:human'], head: 'h', comments: [] },
+  unpark: { state: 'OPEN', labels: ['review:human'], head: 'a'.repeat(40), comments: [] },
   'retry-prepare': { holds: [{ meta: { reason: 'prepare-unstamped' } }], failures: [{ num: 7, held: true }] },
   rearm: { state: 'OPEN', labels: ['review:changes'], head: 'h', comments: [] },
   refresh: { state: 'OPEN', head: 'h', headRef: 'lane/a', main: 'm', containsMain: false, crossRepo: false, comments: [] },
@@ -77,7 +77,7 @@ describe('sanctioned wrappers', () => {
   it('unpark PR passes actor, reason and channel to clearance', async () => {
     const f = sinkFixture('unpark', ({ set, calls }) => ({ run: (exe, argv) => { calls.push([exe, argv]); set({ labels: ['review:accepted'] }); return '{"ok":true}'; } }));
     await f.sink(plan('unpark'));
-    expect(f.calls[0][1]).toEqual(expect.arrayContaining(['7', '--to=clear-human', '--actor=chalbert', '--reason=' + input.reason, '--channel=operator-session']));
+    expect(f.calls[0][1]).toEqual(expect.arrayContaining(['7', '--to=clear-human', `--expect-head=${contexts.unpark.head}`, '--actor=chalbert', '--reason=' + input.reason, '--channel=operator-session']));
   });
   it('rearm wraps the child, never clears human', async () => {
     const f = sinkFixture('rearm', ({ set, calls }) => ({ run: (exe, argv) => { calls.push([exe, argv]); set({ labels: ['review:pending'] }); return '{"ok":true}'; } }));
