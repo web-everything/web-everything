@@ -5,6 +5,7 @@ import { recordPrepareFailure, readFailureState, releaseDuePrepareRetries, takeP
 import { planPrepareSpawns } from '../../../scripts/conveyor/tick-core.mjs';
 import { cliEffects } from '../build-dispatch-daemon.mjs';
 import { readBuildPrioritySettings } from '../../../scripts/lib/build-queue.mjs';
+import { shapeQueue } from '../../../scripts/readiness/conveyor-state.mjs';
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { chmodSync, mkdtempSync, mkdirSync, rmSync, writeFileSync, appendFileSync, readFileSync, statSync, existsSync, renameSync, utimesSync, readdirSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
@@ -4435,6 +4436,37 @@ describe('grouped PREPARE daemon ticks', () => {
       lift.readRuntimePriority = () => ({ ids: ['7299'], source: 'runtime', mode: 'lift', only: false });
       await runBuildDispatchTick({ live: true, effects: lift });
       expect(launchedNums(lift)).toContain('7201');
+    });
+    it.each([
+      ['bornAs', { bornAs: 'xabcdef0' }],
+      ['durable id', { id: 'xabcdef0-prepare-card' }],
+    ])('retains %s admission through production queue shaping and minimal prepare picks', async (_label, identity) => {
+      const cards = [{ ...rows[0], ...identity }, rows[1]];
+      const queue = shapeQueue(cards);
+      const effects = fixture({ queue });
+      effects.loadGroupingCards = vi.fn(async () => cards);
+      effects.readRuntimePriority = () => only(['xabcdef0']);
+      effects.planTick = bk => ({ decisions: { admission: { queue, cleared: [],
+        held: queue.map(r => ({ num: r.num, reason: 'needs-prepare' })) },
+      spawnPrepareItems: planPrepareSpawns({ needsPrepare: queue, prepareHeldNums: bk.prepareHeldNums,
+        availableLanes: [1, 2], maxConcurrentItemPrepares: 2 }).itemPrepareSpawns }, nextState: {} });
+      const tick = await runBuildDispatchTick({ live: true, effects });
+      expect(launchedNums(effects)).toEqual(['7201']);
+      expect(tick.prepare.skippedInPlanning).toEqual([{ num: '7202', reason: 'not-in-runtime-only-list' }]);
+      expect(effects.loadGroupingCards).toHaveBeenCalledTimes(1);
+    });
+    it.each(['missing', 'throws', 'malformed aliases'])('fails closed for lost aliases when the card snapshot %s while numeric ids still prepare', async mode => {
+      const queue = shapeQueue(rows.slice(0, 2));
+      const effects = fixture({ queue, spawns: queue.map(({ num }) => ({ num })) });
+      if (mode === 'throws') effects.loadGroupingCards = vi.fn(async () => { throw new Error('backlog unavailable'); });
+      if (mode === 'malformed aliases') effects.loadGroupingCards = vi.fn(async () => [
+        { ...rows[0], bornAs: 'xabcdef0\n', id: 'xabcdef0/invalid-card' },
+      ]);
+      effects.readRuntimePriority = () => only(['xabcdef0', '7202']);
+      const tick = await runBuildDispatchTick({ live: true, effects });
+      expect(launchedNums(effects)).toEqual(['7202']);
+      expect(tick.prepare.skippedInPlanning).toEqual([{ num: '7201', reason: 'not-in-runtime-only-list' }]);
+      if (effects.loadGroupingCards) expect(effects.loadGroupingCards).toHaveBeenCalledTimes(1);
     });
     it('fails closed when the list is unreadable or malformed', async () => {
       for (const reader of [() => ({ ids: [], source: 'runtime-malformed', only: true, held: true }), () => { throw new Error('boom'); }]) {

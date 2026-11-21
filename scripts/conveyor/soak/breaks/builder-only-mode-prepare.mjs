@@ -4,6 +4,8 @@ import { join } from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { runBuildDispatchTick } from '../../../../skills-src/conveyor/build-dispatch-daemon.mjs';
 import { readBuildPrioritySettings } from '../../../lib/build-queue.mjs';
+import { shapeQueue } from '../../../readiness/conveyor-state.mjs';
+import { planPrepareSpawns } from '../../tick-core.mjs';
 
 const NOW = Date.parse('2026-11-20T18:00:00Z');
 const readList = ageHours => readBuildPrioritySettings({ env: {}, read: () => ({}), runtimePath: '/x', now: () => NOW,
@@ -11,9 +13,12 @@ const readList = ageHours => readBuildPrioritySettings({ env: {}, read: () => ({
 
 async function launched(settings, rows = ['1', '2'].map(num => ({ num, scope: [`we:scripts/soak/f${num}.mjs`] }))) {
   const dispatched = [];
+  const queue = shapeQueue(rows);
   const effects = {
-    planTick: () => ({ decisions: { spawnPrepareItems: rows, admission: { queue: rows, cleared: [],
-      held: rows.map(r => ({ num: r.num, reason: 'needs-prepare' })) } }, nextState: {} }),
+    planTick: bk => ({ decisions: { spawnPrepareItems: planPrepareSpawns({ needsPrepare: queue,
+      prepareHeldNums: bk.prepareHeldNums, availableLanes: [1, 2], maxConcurrentItemPrepares: 2 }).itemPrepareSpawns,
+    admission: { queue, cleared: [], held: queue.map(r => ({ num: r.num, reason: 'needs-prepare' })) } }, nextState: {} }),
+    loadGroupingCards: async () => rows,
     fetchOpenPrs: () => [], listClaims: () => [], listRunStoreInFlight: () => [], killSwitch: () => ({ engaged: false }),
     listHolds: () => [], listPrepareInFlight: () => [], listPrepareClaims: () => [],
     listPreparePrs: () => [],

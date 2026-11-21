@@ -558,6 +558,10 @@ async function runTimedBuildDispatchTick({ bookkeeping = {}, live = false, polic
   // Builder-only mode: ONE gate point for prepares. In runtime "only" mode just the listed ids may prepare; an
   // unreadable list fails closed (no prepares); an expired list is ignored by the reader and reported here.
   const runtimeOffList = new Set();
+  // Queue shaping and prepare picks omit durable aliases. Share the full-card snapshot
+  // with grouping below, including a failed read, so this tick never retries it.
+  let groupingCardsPromise;
+  const loadGroupingCards = () => groupingCardsPromise ??= Promise.resolve().then(() => effects.loadGroupingCards?.());
   if (typeof effects.readRuntimePriority === 'function') {
     let settings;
     try { settings = effects.readRuntimePriority(); } catch { settings = { held: true }; }
@@ -565,6 +569,13 @@ async function runTimedBuildDispatchTick({ bookkeeping = {}, live = false, polic
     if (!settings || typeof settings !== 'object' || settings.held || settings.only) {
       const reason = !settings || settings.held ? 'runtime-list-unreadable' : 'not-in-runtime-only-list';
       const candidates = [...(out?.decisions?.admission?.queue ?? []), ...(out?.decisions?.spawnPrepareItems ?? out?.decisions?.itemPrepareSpawns ?? [])];
+      if (settings?.only && !settings.held) {
+        const candidateNums = new Set(candidates.map(card => normNum(card.num)));
+        try {
+          const cards = await loadGroupingCards();
+          candidates.push(...(cards ?? []).filter(card => candidateNums.has(normNum(card.num))));
+        } catch { /* No alias evidence: only identities already present may authorize a prepare. */ }
+      }
       // Preserve durable aliases; a minimal duplicate must not veto an admitted full card.
       const admitted = new Set(candidates.filter(card => decideRuntimeAdmission(card, 'prepare', settings).admitted).map(card => normNum(card.num)));
       for (const card of candidates) if (!admitted.has(normNum(card.num))) runtimeOffList.add(normNum(card.num));
@@ -855,7 +866,7 @@ async function runTimedBuildDispatchTick({ bookkeeping = {}, live = false, polic
   let groupRowsByNum = new Map((admission.queue ?? []).map(r => [normNum(r.num), r]));
   let groupingCardsLoaded = true;
   try {
-    const cards = await effects.loadGroupingCards?.();
+    const cards = await loadGroupingCards();
     if (cards !== undefined) {
       const cardsByNum = new Map(cards.map(card => [normNum(card.num), card]));
       groupRowsByNum = new Map((admission.queue ?? []).map(row => {
