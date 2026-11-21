@@ -40,7 +40,7 @@ it('runtime list install validates and writes atomically with mode 0600 and exac
     expect(fsync).toHaveBeenCalledOnce();
     expect(fs.readFileSync(dest, 'utf8')).toBe('old');
     expect(fs.statSync(src).mode & 0o777).toBe(0o600);
-    expect(fs.existsSync(join(f.dir, 'build-priority.audit.jsonl'))).toBe(false);
+    expect(JSON.parse(fs.readFileSync(join(f.dir, 'build-priority.audit.jsonl'), 'utf8')).phase).toBe('install-attempt');
     fs.renameSync(src, dest);
   });
   f.options.rename = rename;
@@ -49,7 +49,7 @@ it('runtime list install validates and writes atomically with mode 0600 and exac
   expect(fs.statSync(f.path).ino).not.toBe(inode);
   expect(fs.statSync(f.path).mode & 0o777).toBe(0o600);
   expect(JSON.parse(fs.readFileSync(f.path, 'utf8'))).toEqual({ ids: ['42', '43'], mode: 'only', setBy: 'operator', at, ttlHours: 2 });
-  expect(fs.readFileSync(join(f.dir, 'build-priority.audit.jsonl'), 'utf8')).toBe(`${JSON.stringify({ actor: 'operator', reason: 'priority call', ids: ['42', '43'], mode: 'only', ttlHours: 2, at })}\n`);
+  expect(fs.readFileSync(join(f.dir, 'build-priority.audit.jsonl'), 'utf8')).toBe(`${JSON.stringify({ actor: 'operator', reason: 'priority call', ids: ['42', '43'], mode: 'only', ttlHours: 2, at, phase: 'install-attempt' })}\n`);
   untouched(f, ['build-priority.runtime.json', 'build-priority.audit.jsonl']);
 });
 
@@ -115,12 +115,13 @@ it('preview validates and prints the proposed record but writes nothing', async 
   untouched(f);
 });
 
-it('rename failure leaves the old file intact and no audit line or temporary file', async () => {
+it('rename failure leaves the old file intact with an install-attempt audit and no temporary file', async () => {
   const f = fixture({ rename: () => { throw new Error('rename refused'); } });
   fs.writeFileSync(f.path, 'old');
   expect((await f.command()).code).not.toBe(0);
   expect(fs.readFileSync(f.path, 'utf8')).toBe('old');
-  untouched(f, ['build-priority.runtime.json']);
+  expect(JSON.parse(fs.readFileSync(join(f.dir, 'build-priority.audit.jsonl'), 'utf8')).phase).toBe('install-attempt');
+  untouched(f, ['build-priority.runtime.json', 'build-priority.audit.jsonl']);
 });
 
 it('fsync failure leaves the old file intact and cleans up the temporary file and lock', async () => {
@@ -159,7 +160,7 @@ it('reads cards from a pinned origin/main using bounded git reads, refusing unkn
     ? 'backlog/042-card.md\0backlog/43-card.md\0' : '---\nscope: ["we:scripts/a.mjs"]\n---\n');
   const read = readPriorityCards({ git });
   expect(read('42')).toEqual({ scope: ['we:scripts/a.mjs'] });
-  expect(git.mock.calls[0][0]).toContain('origin/main');
+  expect(git.mock.calls[0][0]).toEqual(['rev-parse', '--verify', 'refs/remotes/origin/main']);
   expect(git.mock.calls.some(([args]) => args.includes(`${'a'.repeat(40)}:backlog/042-card.md`))).toBe(true);
   expect(() => read('99')).toThrow(/card/);
   expect(() => readPriorityCards({ git: args => args[0] === 'rev-parse' ? 'a'.repeat(40)
@@ -175,4 +176,67 @@ it('PR reader uses bounded gh list and refuses truncated or malformed evidence w
     expect(() => readPriorityPrs({ gh: () => JSON.stringify(value) })).toThrow(/repair|drain|retry/i);
   }
   expect(() => readPriorityPrs({ gh: () => { throw new Error('unreadable'); } })).toThrow();
+});
+
+
+it.each([false, true])('audit append failure refuses activation (existing runtime: %s)', async existing => {
+  const f = fixture();
+  if (existing) fs.writeFileSync(f.path, 'old');
+  fs.mkdirSync(join(f.dir, 'build-priority.audit.jsonl'));
+  const rename = vi.fn(fs.renameSync);
+  f.options.rename = rename;
+  expect((await f.command()).code).not.toBe(0);
+  expect(rename).not.toHaveBeenCalled();
+  if (existing) expect(fs.readFileSync(f.path, 'utf8')).toBe('old');
+  else expect(fs.existsSync(f.path)).toBe(false);
+  untouched(f, ['build-priority.audit.jsonl', ...(existing ? ['build-priority.runtime.json'] : [])]);
+});
+
+it.each(['scripts/a.mjs', 'scripts/renamed.mjs'])('PR rename evidence blocks overlap with %s', async path => {
+  const gh = () => JSON.stringify([{ number: 1, files: [{ path: 'scripts/renamed.mjs', previousFilename: 'scripts/a.mjs' }] }]);
+  const prs = readPriorityPrs({ gh });
+  expect(prs[0].files).toEqual(['scripts/renamed.mjs', 'scripts/a.mjs']);
+  const f = fixture({ readCard: () => ({ scope: [`we:${path}`] }), readPrs: () => prs });
+  expect((await f.command()).code).not.toBe(0);
+  untouched(f);
+});
+
+it.each(['we:scripts/a.mjs', 'fui:scripts/a.mjs'])('treats PR filename %s as a literal path in its repo', async path => {
+  const f = fixture({ readCard: () => ({ scope: [`we:${path}`] }),
+    readPrs: () => [{ repo: 'web-everything/web-everything', number: 1, files: [path] }] });
+  const result = await f.command();
+  expect(result.code).not.toBe(0);
+  expect(result.lines.join('\n')).toContain('scope overlaps open PR');
+  untouched(f);
+});
+
+it('refuses a delimiter-only scope member alongside a valid member', async () => {
+  const f = fixture({ readCard: () => ({ scope: ['we:scripts/a.mjs', ',,,'] }) });
+  const result = await f.command();
+  expect(result.code).not.toBe(0);
+  expect(result.lines.join('\n')).toMatch(/repair evidence.*retry/);
+  untouched(f);
+});
+
+it.each([false, true])('fsyncs and closes the parent directory after rename (sync failure: %s)', async fail => {
+  const f = fixture();
+  const events = [];
+  let directoryFd;
+  f.options.rename = (src, dest) => { events.push('rename'); fs.renameSync(src, dest); };
+  f.options.fsync = fd => {
+    if (fs.fstatSync(fd).isDirectory()) {
+      directoryFd = fd;
+      events.push('directory-fsync');
+      if (fail) throw new Error('directory fsync refused');
+    } else events.push('file-fsync');
+    fs.fsyncSync(fd);
+  };
+  const result = await f.command();
+  expect(events).toEqual(['file-fsync', 'rename', 'directory-fsync']);
+  expect(() => fs.fstatSync(directoryFd)).toThrow();
+  if (fail) {
+    expect(result.code).not.toBe(0);
+    expect(result.lines.join('\n')).toContain('directory fsync refused');
+  } else expect(result.code).toBe(0);
+  untouched(f, ['build-priority.runtime.json', 'build-priority.audit.jsonl']);
 });

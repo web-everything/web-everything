@@ -24,7 +24,7 @@ export function readPriorityCards({ git = args => execFileSync('git', args, {
   let sha, names;
   return id => {
     if (!names) {
-      sha = git(['rev-parse', '--verify', 'origin/main']).trim();
+      sha = git(['rev-parse', '--verify', 'refs/remotes/origin/main']).trim();
       if (!/^[0-9a-f]{40}$/.test(sha)) refuse('unreadable origin/main');
       names = git(['ls-tree', '-r', '--name-only', '-z', sha, '--', 'backlog']).split('\0').filter(Boolean);
     }
@@ -49,10 +49,11 @@ export function readPriorityPrs({ gh = args => runGhSync(args, READ_OPTIONS) } =
     if (!Array.isArray(rows) || rows.length >= 200) refuse('incomplete open PR list (limit 200)');
     for (const row of rows) {
       if (!Number.isInteger(row?.number) || row.number <= 0 || !Array.isArray(row.files)
-          || row.files.length >= GH_LIST_FILE_CAP || row.files.some(f => typeof f?.path !== 'string' || !f.path.trim())) {
+          || row.files.length >= GH_LIST_FILE_CAP || row.files.some(f => typeof f?.path !== 'string' || !f.path.trim()
+            || (f.previousFilename != null && typeof f.previousFilename !== 'string'))) {
         refuse('incomplete open PR files');
       }
-      prs.push({ repo: slug, number: row.number, files: row.files.map(f => f.path) });
+      prs.push({ repo: slug, number: row.number, files: row.files.flatMap(f => [f.path, ...(f.previousFilename ? [f.previousFilename] : [])]) });
     }
   }
   return prs;
@@ -66,7 +67,11 @@ function prepare(input, options) {
     const card = readCard(id);
     const raw = typeof card?.scope === 'string' ? [card.scope] : card?.scope;
     if (!Array.isArray(raw) || !raw.length || raw.some(s => typeof s !== 'string' || !s.trim())) refuse(`card ${id} missing or unreadable scope`);
-    const scope = normalizeBriefScope(raw).map(s => qualifyFile(s));
+    const scope = raw.flatMap(member => {
+      const normalized = normalizeBriefScope([member]);
+      if (!normalized.length) refuse(`card ${id} empty scope member`);
+      return normalized.map(s => qualifyFile(s));
+    });
     if (!scope.length) refuse(`card ${id} empty scope`);
     return scope;
   });
@@ -77,7 +82,7 @@ function prepare(input, options) {
         || !Array.isArray(pr.files) || pr.files.some(f => typeof f !== 'string' || !f.trim())) refuse('unreadable PR files');
     // Scope syntax splits on these delimiters; never silently split a literal PR filename.
     if (pr.files.some(f => /[\s,]/.test(f))) refuse('PR filenames cannot be represented by scope syntax');
-    const files = normalizeBriefScope(pr.files, repoKeyFor(pr.repo)).map(f => qualifyFile(f));
+    const files = pr.files.map(f => `${repoKeyFor(pr.repo)}:${f}`);
     if (scopes.some(scope => prHoldsFile({ ...pr, files }, scope))) refuse(`scope overlaps open PR ${pr.repo}#${pr.number}`);
   }
   const at = (options.now?.() ?? new Date()).toISOString();
@@ -102,8 +107,12 @@ function install(input, options) {
     fs.writeFileSync(fd, `${JSON.stringify(plan.record, null, 2)}\n`);
     (options.fsync ?? fs.fsyncSync)(fd);
     fs.closeSync(fd); fd = undefined;
+    // An audit failure must never activate a policy; a failed rename leaves an explicit attempt.
+    fs.appendFileSync(join(dirname(path), 'build-priority.audit.jsonl'), `${JSON.stringify({ ...plan.audit, phase: 'install-attempt' })}\n`, { mode: 0o600 });
     (options.rename ?? fs.renameSync)(scratch, path);
-    fs.appendFileSync(join(dirname(path), 'build-priority.audit.jsonl'), `${JSON.stringify(plan.audit)}\n`, { mode: 0o600 });
+    const dirFd = fs.openSync(dirname(path), 'r');
+    try { (options.fsync ?? fs.fsyncSync)(dirFd); }
+    finally { fs.closeSync(dirFd); }
     return plan;
   } finally {
     if (fd !== undefined) fs.closeSync(fd);
