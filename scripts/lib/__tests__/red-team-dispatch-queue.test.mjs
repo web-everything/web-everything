@@ -1951,3 +1951,14 @@ The red team tried to break this change and reported nothing.`,
   expect(f.queue.entries()).toEqual(before);
   expect(f.logs.some(line => line.includes('red-team result already on head'))).toBe(false);
 });
+
+
+describe('red team keeps reserved review slots', () => {
+  it.each([0, 1, 3, 4, 8, 12])('admits up to full raw budget.left=%i, including reserved seats', left => {
+    expect(redTeamQueueAdmitCount({ lanes: 20, remainingStarts: 20, budget: { left, reserve: 4 } })).toBe(left);
+  });
+  it.each([-1, 0, 2, 4])('never exceeds total budget.left=%i despite larger lane and start allowances', left => {
+    const starts = redTeamQueueAdmitCount({ lanes: 100, remainingStarts: 100, budget: { left, reserve: 8 } });
+    expect(starts).toBe(Math.max(0, left));
+  });
+});

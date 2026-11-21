@@ -107,6 +107,7 @@ function isBetweenTickLaunch(options) {
  * a smoke-passed candidate (including one already waiting on this head) retains the finalize wait.
  * @param {{root:string, env?:NodeJS.ProcessEnv, log?:Console, run?:typeof gitRun, runSmoke?:typeof runLiveSmokeWithRetry,
  *   prState?:(pr:number)=>(Promise<string|null>|string|null), lockOpts?:object, stateOpts?:{env?:NodeJS.ProcessEnv},
+ *   prBaseChain?:Function,
  *   mainOnly?:boolean, admissionWaitMs?:number, now?:()=>number, sleep?:(ms:number)=>Promise<void>,
  *   emitEvent?:Function, dispatchSmoke?:{settings?:object, run?:Function, match?:Function}}} o — injected
  *   pieces of the real dispatch smoke the candidate smoke runs for a new dispatch-touching overlay (default: #4481's).
@@ -294,7 +295,7 @@ function defaultForceWatchProbe(run, env) {
 
 async function rebuildCloneInternal({
   root, env = process.env, log = console, run = gitRun, runSmoke = runLiveSmokeWithRetry,
-  prState = (pr) => defaultPrState({ pr, root }), lockOpts = {}, stateOpts = {}, mainOnly = false,
+  prState = (pr) => defaultPrState({ pr, root }), prBaseChain, lockOpts = {}, stateOpts = {}, mainOnly = false,
   now = () => Date.now(), sleep, versions, skipCheck, entries, dispatchSmoke, readyOnly = false, adoptOnly = false,
   asJob, launchOnly = false, launchedBy = 'tick-start', waitInFlightTickMs = 0, admissionWaitMs,
   spawnerOwners = defaultSpawnerOwners, readerStartTimeOf = processStartMs, admissionEvidence,
@@ -310,7 +311,7 @@ async function rebuildCloneInternal({
     return rebuildCloneAsJob({
       root, env: stEnv, log, mainOnly, entries, launchOnly, launchedBy, waitInFlightTickMs,
       adopt: (o = {}) => rebuildCloneInternal({
-        root, env, log, run, runSmoke, prState, lockOpts, stateOpts, mainOnly, now, sleep, versions, skipCheck, entries,
+        root, env, log, run, runSmoke, prState, prBaseChain, lockOpts, stateOpts, mainOnly, now, sleep, versions, skipCheck, entries,
         dispatchSmoke, admissionWaitMs, launchedBy, ...o, stEnv, adoptOnly: true, asJob: false,
       }),
     });
@@ -384,7 +385,7 @@ async function rebuildCloneInternal({
   const prep = await withWriteLock(root, () => {
     prepareEnteredMs = now();
     return prepareRebuild({
-      root, env, log, run, prState, stateOpts, stEnv, mainOnly, now, skipCheck: skipDecider, readyOnly, adoptOnly, admissionEvidence, launchedBy,
+      root, env, log, run, prState, prBaseChain, stateOpts, stEnv, mainOnly, now, skipCheck: skipDecider, readyOnly, adoptOnly, admissionEvidence, launchedBy,
     });
   }, readyOnHead ? finalizeLockOpts : admissionLockOpts);
   const readerWaitMs = Math.max(0, (prepareEnteredMs ?? now()) - startedMs);

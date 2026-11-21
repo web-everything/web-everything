@@ -662,3 +662,124 @@ describe('fix-ready-record main()', () => {
     expect(err.mock.calls[1][0]).toMatch(/duplicate/);
   });
 });
+
+describe('fix-ready takes findings from the recorded waiver', () => {
+  afterEach(() => vi.restoreAllMocks());
+  const w = { ref, sha, ruling: 'R816', findings };
+  const argv = [`--ref=${ref}`, `--sha=${sha}`, '--tests=green', '--audit=WEAKENED', '--auditRuling=R816'];
+  const run = (args, waivers, file = tmp()) => {
+    const err = vi.spyOn(console, 'error').mockImplementation(() => {});
+    vi.spyOn(console, 'log').mockImplementation(() => {});
+    return { code: main(args, { file, waivers }), file, err };
+  };
+  it('writes the waiver findings byte-identical and in order, so the load match passes', () => {
+    const { code, file } = run(argv, [w]);
+    expect(code).toBe(0);
+    const rec = jsonLines(readFileSync(file, 'utf8'))[0];
+    expect(rec.auditDisclosed).toEqual(findings);
+    expect(readyEvidence([rec], { branch: ref, sha }, [w]).source).toBe('ready-record');
+  });
+  it('--from-waiver is accepted explicitly', () => {
+    expect(run([...argv, '--from-waiver'], [w]).code).toBe(0);
+  });
+  it.each([
+    ['no waivers at all', []],
+    ['unreadable waivers (not an array)', null],
+    ['other ref', [{ ...w, ref: 'lane/other' }]],
+    ['other sha', [{ ...w, sha: 'a'.repeat(40) }]],
+    ['other ruling', [{ ...w, ruling: 'R999' }]],
+    ['empty findings', [{ ...w, findings: [] }]],
+    ['blank finding', [{ ...w, findings: ['x', ' '] }]],
+    ['two waivers with different findings', [w, { ...w, findings: ['z'] }]],
+  ])('refuses with a named reason and writes nothing: %s', (_n, waivers) => {
+    const { code, file, err } = run(argv, waivers);
+    expect(code).toBe(1);
+    expect(err.mock.calls[0][0]).toMatch(/no recorded waiver|ambiguous|unreadable/);
+    expect(existsSync(file)).toBe(false);
+  });
+  it('refuses passing findings together with --from-waiver', () => {
+    const d = tmp(); writeFileSync(d, JSON.stringify(findings));
+    const { code } = run([...argv, '--from-waiver', `--auditDisclosed-file=${d}`], [w]);
+    expect(code).toBe(1);
+  });
+  it('explicit findings still work unchanged (no waiver lookup)', () => {
+    const d = tmp(); writeFileSync(d, JSON.stringify(findings));
+    expect(run([...argv, `--auditDisclosed-file=${d}`], []).code).toBe(0);
+  });
+  it('--from-waiver on a NOT-WEAKENED audit is refused', () => {
+    expect(run([`--ref=${ref}`, `--sha=${sha}`, '--tests=green', '--audit=NOT-WEAKENED', '--from-waiver'], [w]).code).toBe(1);
+  });
+});
+
+describe('fix-ready waiver lookup through the production loader', () => {
+  afterEach(() => vi.restoreAllMocks());
+  const mk = (platformWaivers, toolWaivers) => {
+    const dir = mkdtempSync(join(tmpdir(), 'fix-ready-w-'));
+    const pref = join(dir, 'prefs.json');
+    writeFileSync(pref, JSON.stringify({ prototypeLoad: { ruledWeakened: platformWaivers } }));
+    const settingsFile = join(dir, 'p.json');
+    writeFileSync(settingsFile, JSON.stringify({ readyRecordPath: join(dir, 'l.jsonl'), ruledWeakened: toolWaivers }));
+    return { dir, env: { HOME: dir, WE_PLATFORM_PREFERENCES_FILE: pref }, settingsFile };
+  };
+  const w = { ref, sha, ruling: 'R816', findings };
+  const args = [`--ref=${ref}`, `--sha=${sha}`, '--tests=green', '--audit=WEAKENED', '--auditRuling=R816'];
+  it('refuses conflicting waivers in different layers as ambiguous (no dedupe hiding them)', () => {
+    const err = vi.spyOn(console, 'error').mockImplementation(() => {});
+    const { dir, env, settingsFile } = mk([{ ...w, findings: ['other'] }], [w]);
+    expect(main(args, { env, settingsFile, adoptionSettings: { fixReadyPath: join(dir, 'l.jsonl') } })).toBe(1);
+    expect(err.mock.calls.map((c) => c[0]).join('\n')).toMatch(/ambiguous|unreadable/);
+  });
+  it('refuses when the waiver store is unreadable', () => {
+    const err = vi.spyOn(console, 'error').mockImplementation(() => {});
+    const { dir, env, settingsFile } = mk([], [w]);
+    mkdirSync(join(dir, 'workspace/.operations/coordination'), { recursive: true });
+    mkdirSync(join(dir, 'workspace/.operations/coordination/ruled-weakened.jsonl'));
+    expect(main(args, { env, settingsFile, adoptionSettings: { fixReadyPath: join(dir, 'l.jsonl') } })).toBe(1);
+    expect(err.mock.calls.map((c) => c[0]).join('\n')).toMatch(/unreadable|ambiguous|no recorded/);
+  });
+});
+
+describe('fix-ready refuses malformed or unreadable waiver evidence', () => {
+  afterEach(() => vi.restoreAllMocks());
+  const w = { ref, sha, ruling: 'R816', findings };
+  const args = [`--ref=${ref}`, `--sha=${sha}`, '--tests=green', '--audit=WEAKENED', '--auditRuling=R816'];
+  const setup = ({ platform = [w], tool = [], store, requests } = {}) => {
+    const dir = mkdtempSync(join(tmpdir(), 'fix-ready-m-'));
+    const pref = join(dir, 'prefs.json');
+    writeFileSync(pref, JSON.stringify({ prototypeLoad: { ruledWeakened: platform } }));
+    const settingsFile = join(dir, 'p.json');
+    writeFileSync(settingsFile, JSON.stringify({ readyRecordPath: join(dir, 'l.jsonl'), ...(tool === undefined ? {} : { ruledWeakened: tool }) }));
+    if (store !== undefined) { mkdirSync(join(dir, 'workspace/.operations/coordination'), { recursive: true }); writeFileSync(join(dir, 'workspace/.operations/coordination/ruled-weakened.jsonl'), store); }
+    if (requests !== undefined) { mkdirSync(join(dir, 'workspace/.operations/handoff'), { recursive: true }); writeFileSync(join(dir, 'workspace/.operations/handoff/waiver-requests.jsonl'), requests); }
+    return { dir, deps: { env: { HOME: dir, WE_PLATFORM_PREFERENCES_FILE: pref }, settingsFile, adoptionSettings: { fixReadyPath: join(dir, 'l.jsonl') } } };
+  };
+  const refuses = (s) => {
+    vi.spyOn(console, 'log').mockImplementation(() => {});
+    vi.spyOn(console, 'error').mockImplementation(() => {});
+    expect(main(args, s.deps)).toBe(1);
+    expect(existsSync(join(s.dir, 'l.jsonl'))).toBe(false);
+  };
+  it('baseline: one valid waiver writes', () => {
+    vi.spyOn(console, 'log').mockImplementation(() => {});
+    const s = setup();
+    expect(main(args, s.deps)).toBe(0);
+  });
+  it('refuses a valid waiver plus a conflicting one with a blank finding', () => {
+    refuses(setup({ tool: [{ ...w, findings: ['x', ' '] }] }));
+  });
+  it('refuses a corrupted store line next to a valid waiver', () => {
+    refuses(setup({ store: '{not json\n' }));
+  });
+  it('refuses a malformed waiver-requests line (possible truncated WITHDRAWN)', () => {
+    refuses(setup({ requests: '{"ruling":"WITHDRAWN","ref":"lane/fixready\n' }));
+  });
+  it('refuses a withdrawn waiver', () => {
+    refuses(setup({ requests: JSON.stringify({ ruling: 'WITHDRAWN', ref, sha, at: '2026-11-20T00:00:00Z' }) + '\n' }));
+  });
+  it('refuses a non-array tool waiver layer instead of falling through to the platform one', () => {
+    refuses(setup({ tool: { not: 'an array' } }));
+  });
+  it('refuses a non-array platform waiver layer', () => {
+    refuses(setup({ platform: 'nope', tool: [w] }));
+  });
+});
