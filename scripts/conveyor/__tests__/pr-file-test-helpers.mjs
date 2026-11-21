@@ -11,6 +11,7 @@ const fixture = [901, 902].map((number) => ({
   number, headRefName: `lane/3478-delivery-${number}`, headRefOid: `sha-${number}`,
   title: 'WE #3478: implement delivery', body: 'Closes #3478', labels: [{ name: 'review:pending' }],
   files: [{ path: 'scripts/example.mjs' }], mergeable: 'CONFLICTING', mergeStateStatus: 'DIRTY',
+  rowsComplete: true, rowsHead: `sha-${number}`,
   statusCheckRollup: [], comments: [],
 }));
 

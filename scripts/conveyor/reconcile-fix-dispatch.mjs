@@ -1317,7 +1317,7 @@ export function routeFixExecutor(planned, { setting, chain, fixSettings, loadLad
 
 /** Every Claude fix gets an explicit policy model, including send-backs without a ladder route.
  * Uses the same critical-work verdict supplied to provider-routing's CRITICAL_WORK_GATE; a rung alone is no risk signal. */
-export function launchTableFor(planned, roundEscalation, { fixSettings = resolveFixSettings() } = {}) {
+export function launchTableFor(planned, roundEscalation, { fixSettings = resolveFixSettings(), capacityRoute } = {}) {
   const table = fixerTableFor(planned.rulingNotAddressed ?? planned.takeover ?? roundEscalation ?? null);
   const verdict = criticalWorkVerdict({ ...planned, taskType: 'fix', filesTouched: planned.scope ?? [] });
   if (verdict.critical) {
@@ -1326,6 +1326,10 @@ export function launchTableFor(planned, roundEscalation, { fixSettings = resolve
     // Inherited (including omitted) routes retain the critical-work model, never the escalation rung's model.
     return { ...table, model: route?.model ?? CLAUDE_NATIVE_MODEL_BY_TIER.opus, effort: route?.effort ?? 'high',
       reason: `${route ? 'routing-policy fix:critical-work' : 'critical-work fallback'} (${verdict.reasons.map(r => r.proxy).join(', ')})` };
+  }
+  if (capacityRoute?.provider === 'claude' && capacityRoute.model && !roundEscalation
+    && !planned.takeover && !planned.rulingNotAddressed && !planned.mainFix && !planned.strongerModel) {
+    return { model: capacityRoute.model, effort: capacityRoute.effort ?? 'high', reason: 'configured capacity winner' };
   }
   const configured = fixSettings.claudeEscalationModel ?? 'sonnet';
   const model = ['haiku', 'sonnet'].includes(configured) ? configured : 'sonnet';
@@ -1608,7 +1612,8 @@ export function dispatchFix(planned, {
     // claim is released below, and the next tick retries; nothing has been spawned.
     // Card xrbu1bp — an ordinary round at or past `fix.strongerModelFromRound` runs on the stronger-model rung.
     const roundEscalation = roundEscalationFor(planned, { fixSettings, loadLadder });
-    const ladderTable = launchTableFor(planned, roundEscalation, { fixSettings }); // may refuse before anything is posted
+    const ladderTable = launchTableFor(planned, roundEscalation, { fixSettings,
+      capacityRoute: decision.executor === 'claude' ? decision.policyRoute : undefined }); // may refuse before anything is posted
     if (decision.executor === 'claude') console.error(`reconcile-fix-dispatch: PR #${planned.pr} model=${ladderTable.model} (${ladderTable.reason})`);
     if (roundEscalation) {
       console.error(`reconcile-fix-dispatch: PR #${planned.pr} round ${roundEscalation.round} on the ${roundEscalation.rung.id} route (fix.strongerModelFromRound=${roundEscalation.fromRound}) model=${decision.executor === 'claude' ? ladderTable?.model ?? 'default-fix-route' : decision.policyRoute?.model ?? 'codex default'}`);

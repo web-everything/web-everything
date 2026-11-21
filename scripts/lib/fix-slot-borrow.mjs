@@ -73,7 +73,7 @@ export function chooseFixExecutor({ setting = { value: 'codex-first', source: 'd
   if (chain && setting.value === 'codex-first' && !entry.mainFix) {
     const trigger = entry.takeover ? 'takeover' : entry.rulingNotAddressed ? 'ruling-not-addressed'
       : entry.strongerModel || (entry.round ?? 1) >= 3 ? 'stronger-model' : null;
-    return { ...pickChainRung({ chain: chain.value, trigger, codexUnproductive: entry.codexUnproductive,
+    return { ...pickChainRung({ chain: chain.value, rungs: chain.rungs, trigger, codexUnproductive: entry.codexUnproductive,
       critical, criticalClaudeFromRung: chain.criticalClaudeFromRung, criticalSource: chain.criticalClaudeFromRungSource,
       launcherAvailable: available }), source: chain.source ?? 'default' };
   }

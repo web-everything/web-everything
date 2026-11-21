@@ -45,12 +45,29 @@ export function resolveFixExecutorChain({ env = process.env, platform = platform
   // To use Codex again set routing.builder=codex (or WE_ROUTING_BUILDER=codex); a chain alone cannot override it.
   const chosen = effectiveBuilder({ env, ...(declared ? { declared } : { repo }), kind, capacity, now, quota, records, record });
   if (chosen.decision) {
+    let winner = chosen.decision.provider === 'agy-gemini' ? 'argon' : chosen.decision.provider;
+    const configured = chosen.settings.capacity.providers.find(p => p.id === chosen.decision.provider);
+    const rungs = { ...FIX_EXECUTOR_RUNGS };
+    // Model/account identifiers are not launcher names. Project a configured
+    // winner onto a local rung, retaining the existing escalation suffix.
+    if (chosen.decision.reason === 'capacity-score' && configured && !Object.hasOwn(rungs, winner)
+      && ['codex', 'claude', 'antigravity'].includes(configured.launcher)) {
+      if (configured.launcher === 'claude') winner = 'claude';
+      rungs[winner] = rung(winner, configured.launcher, { provider: configured.launcher,
+        ...(chosen.decision.model ? { model: chosen.decision.model } : {}),
+        ...(configured.effort ? { effort: configured.effort } : {}) });
+      result.rungs = { [winner]: rungs[winner] };
+      if (!result.value.includes(winner)) {
+        const at = result.value.findIndex(id => rungs[id].executor === configured.launcher || id === 'claude');
+        result.value.splice(at < 0 ? result.value.length : at, 0, winner);
+      }
+    }
     // Unknown usage preserves preference, not eligibility: filter every decision.
     // Remove ineligible rungs, then start at the scored winner. A suffix preserves
     // escalation direction and cannot send a Claude-started repair back to Codex.
     const kept = [];
     for (const id of result.value) {
-      const provider = id === 'argon' ? 'agy-gemini' : id;
+      const provider = result.rungs?.[id] ? configured.id : id === 'argon' ? 'agy-gemini' : id;
       const definition = chosen.settings.capacity.providers.find(p => p.id === provider);
       const observations = chosen.capacities.filter(c => c.provider === provider
         || (provider === 'codex-alt' && c.provider === 'codex' && !chosen.capacities.some(c => c.provider === provider)));
@@ -59,7 +76,6 @@ export function resolveFixExecutorChain({ env = process.env, platform = platform
         allowedKinds: c.allowedKinds ?? definition?.allowedKinds }));
       if (eligible.some(c => capacityEligibility(c, kind, { ...chosen.settings.capacity, now }).eligible)) kept.push(id);
     }
-    const winner = chosen.decision.provider === 'agy-gemini' ? 'argon' : chosen.decision.provider;
     const start = chosen.decision.reason === 'capacity-score' ? kept.indexOf(winner) : -1;
     result.value = start < 0 ? kept : kept.slice(start);
     result.source += '+capacity';
@@ -80,7 +96,7 @@ export function resolveFixExecutorChain({ env = process.env, platform = platform
   return { ...result, criticalClaudeFromRung: critical.value, criticalClaudeFromRungSource: criticalSource };
 }
 
-export function pickChainRung({ chain = FIX_EXECUTOR_CHAIN_DEFAULT, trigger = null, codexUnproductive = 0,
+export function pickChainRung({ chain = FIX_EXECUTOR_CHAIN_DEFAULT, rungs = {}, trigger = null, codexUnproductive = 0,
   critical = false, criticalClaudeFromRung = 2, criticalSource = 'default', launcherAvailable = () => true }) {
   if (critical && ['takeover', 'ruling-not-addressed'].includes(trigger)
     && (!chain.includes('claude') || !launcherAvailable('claude'))) {
@@ -101,7 +117,8 @@ export function pickChainRung({ chain = FIX_EXECUTOR_CHAIN_DEFAULT, trigger = nu
     : unproductive ? `codex unproductive on this head (${codexUnproductive} unproductive runs)`
       : trigger === 'stronger-model' ? 'stronger-model rung' : 'codex-first ordinary repair';
   const skips = [];
-  while (index < chain.length && chain[index] !== 'claude' && !launcherAvailable(FIX_EXECUTOR_RUNGS[chain[index]].executor)) {
+  const definition = id => Object.hasOwn(rungs, id) ? rungs[id] : FIX_EXECUTOR_RUNGS[id];
+  while (index < chain.length && chain[index] !== 'claude' && !launcherAvailable(definition(chain[index]).executor)) {
     skips.push(`${chain[index]} launcher unavailable, fallback`);
     index++;
   }
@@ -113,7 +130,10 @@ export function pickChainRung({ chain = FIX_EXECUTOR_CHAIN_DEFAULT, trigger = nu
     reason: 'critical escalation requires Claude; Claude filtered out — wait for quota reset or clear provider hold', source: 'capacity' };
   if (critical && index >= criticalClaudeFromRung) return { executor: 'claude', rung: 'claude',
     reason: `critical work reaches Claude from rung ${criticalClaudeFromRung} (criticalClaudeFromRung=${criticalClaudeFromRung}, source=${criticalSource})`, source: 'default' };
-  const selected = FIX_EXECUTOR_RUNGS[chain[index]];
+  const selected = definition(chain[index]);
   const reason = `${prefix} → ${selected.id === 'claude' ? 'falls back to Claude (chain exhausted)' : `chain rung ${index + 1}/${chain.length} ${selected.id}`}${skips.length ? `; ${skips.join('; ')}` : ''}${critical && selected.id !== 'claude' ? `; critical work stays on ${selected.id} below criticalClaudeFromRung=${criticalClaudeFromRung} (source=${criticalSource})` : ''}`;
-  return { executor: selected.executor, rung: selected.id, ...(selected.policyRoute ? { policyRoute: selected.policyRoute } : {}), reason, source: 'default' };
+  // Claude escalation uses its policy model even when its terminal capacity rung
+  // was projected from an alias. Only ordinary work carries that alias's model.
+  const policyRoute = selected.executor === 'claude' && progress > 0 ? null : selected.policyRoute;
+  return { executor: selected.executor, rung: selected.id, ...(policyRoute ? { policyRoute } : {}), reason, source: 'default' };
 }

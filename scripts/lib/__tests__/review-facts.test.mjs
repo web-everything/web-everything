@@ -1,4 +1,5 @@
 // @vitest-environment node
+import { completeCheckRows } from './helpers/complete-check-rows.mjs';
 /** perf C1c — the review daemon reads PR facts first; stale/partial store falls back to GitHub; never a write/merge input. */
 import { describe, expect, it, vi } from 'vitest';
 import { readFileSync } from 'node:fs';
@@ -24,25 +25,27 @@ describe('review facts: facts first', () => {
     expect(base.setLabels).toHaveBeenCalledTimes(1); // writes untouched
   });
 
-  it('gate: store hit with green required checks = 1 live head read, no check reads', () => {
+  it('gate: completed-only store cannot attest all rows, so green checks require the live gate', () => {
     const liveHead = vi.fn(() => 'abc');
-    const live = vi.fn();
+    const liveResult = { allowed: true, headSha: 'abc', reason: 'required-checks-successful' };
+    const live = vi.fn(() => liveResult);
     const r = readReviewCiGateFactsFirst({ policy: { startAfter: 'ci-green', startEarly: 'off' }, repo: 'o/r', pr: 7, lookup: hit(facts()), live, liveHead, readRequired: required() });
-    expect(r).toMatchObject({ allowed: true, headSha: 'abc', factsSource: 'store' });
+    expect(r).toBe(liveResult);
     expect(liveHead).toHaveBeenCalledTimes(1);
-    expect(live).not.toHaveBeenCalled();
+    expect(live).toHaveBeenCalledTimes(1);
   });
 
-  it('count: a 10-PR tick makes 40 gate gh calls on the old path (2 heads + check-runs + status) and 10 on facts-first', async () => {
+  it('count: incomplete store checks retain the full live gate plus a live head reread', async () => {
     const { readReviewCiGate } = await import('../review-ci-gate-io.mjs');
     let calls = 0;
     const readHead = () => { calls += 1; return 'abc'; };
-    const readChecks = () => { calls += 2; return [{ name: 'test', status: 'completed', conclusion: 'success', head_sha: 'abc' }]; }; // check-runs + status
+    const readChecks = () => { calls += 2; return completeCheckRows([{ name: 'test', status: 'completed', conclusion: 'success', head_sha: 'abc' }], 'abc'); }; // check-runs + status
     for (let pr = 1; pr <= 10; pr += 1) readReviewCiGate({ policy: { startAfter: 'ci-green', startEarly: 'off' }, repo: 'o/r', pr, readHead, readChecks, readRequired: required() });
     const before = calls;
     calls = 0;
-    for (let pr = 1; pr <= 10; pr += 1) readReviewCiGateFactsFirst({ policy: { startAfter: 'ci-green', startEarly: 'off' }, repo: 'o/r', pr, lookup: hit(facts()), liveHead: readHead, readRequired: required() });
-    expect({ before, after: calls }).toEqual({ before: 40, after: 10 });
+    for (let pr = 1; pr <= 10; pr += 1) readReviewCiGateFactsFirst({ policy: { startAfter: 'ci-green', startEarly: 'off' }, repo: 'o/r', pr, lookup: hit(facts()), liveHead: readHead, readRequired: required(),
+      live: args => readReviewCiGate({ ...args, readHead, readChecks }) });
+    expect({ before, after: calls }).toEqual({ before: 40, after: 50 });
   });
 
   it('gate: stale store (null) falls back to the live gate unchanged', () => {
@@ -58,12 +61,13 @@ describe('review facts: facts first', () => {
     expect(r.reason).toBe('live-ok');
   });
 
-  it('gate: a completed failure is trusted from the store (no gh)', () => {
-    const live = vi.fn();
+  it('gate: completed-only store cannot attest failure either; live refusal remains authoritative', () => {
+    const liveResult = { allowed: false, reason: 'required-checks-not-successful', affected: [{ name: 'test', reason: 'failure' }] };
+    const live = vi.fn(() => liveResult);
     const f = facts({ checks: [{ name: 'test', app: 'gha', conclusion: 'failure' }] });
     const r = readReviewCiGateFactsFirst({ policy: { startAfter: 'ci-green', startEarly: 'off' }, repo: 'o/r', pr: 7, lookup: hit(f), live, liveHead: () => 'abc', readRequired: required() });
-    expect(r).toMatchObject({ allowed: false, reason: 'required-checks-not-successful', factsSource: 'store' });
-    expect(live).not.toHaveBeenCalled();
+    expect(r).toBe(liveResult);
+    expect(live).toHaveBeenCalledTimes(1);
   });
 
   it('gate: head moved since the store was folded is not a trusted store refusal', () => {

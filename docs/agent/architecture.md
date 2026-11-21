@@ -142,8 +142,13 @@ Provider tiers remain capacity data for other configured minimum-tier constraint
 Critical takeover and ruling-not-addressed send-backs remain Claude-only and hold when Claude is unavailable.
 Escalation removes held, exhausted, inactive, reserve-only, disallowed and below-minimum providers,
 then starts at the capacity winner and retains the suffix of the configured chain. This prevents
-escalation from Claude back to Codex. Main-fix requires an eligible, available Claude rung;
-when every reader is unknown the historical effective-builder chain applies (Claude drops Codex).
+escalation from Claude back to Codex. Main-fix requires an eligible, available Claude rung.
+Configured capacity winners with new provider IDs receive a per-resolution rung using their
+launcher and model, inserted at that launcher's position before filtering the suffix. Native
+Claude aliases use the terminal Claude rung; ordinary fixes carry their model into the launch
+table, while critical work and escalation retain their policy models. These rung definitions
+travel with the resolved chain and never mutate the shared default rung registry.
+When every reader is unknown the historical effective-builder chain applies (Claude drops Codex).
 `routing.capacity.operatorReadingMaxAgeHours` defaults to 24 and follows the normal cascade with
 `capacitySources` provenance. Older operator readings never supply quota; the calendar reports
 “operator reading stale — refresh”. Refresh the reading, restore live quota, or wait for reset/clear
