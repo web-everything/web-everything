@@ -2031,6 +2031,7 @@
   "wrapper-conformance/__tests__/runner.test.ts": 0.01
  },
  "soak": {
+  "scripts/conveyor/soak/breaks/rebuild-merged-established-overlay-retired.soak.test.mjs": 5.76,
   "scripts/conveyor/soak/breaks/lane-pool-release-unpushed-guard.soak.test.mjs": 315.93,
   "scripts/conveyor/soak/breaks/lane-pool-git-diet.soak.test.mjs": 354.59,
   "scripts/conveyor/soak/breaks/runtime-admission-infra-retention.soak.test.mjs": 0.1,
