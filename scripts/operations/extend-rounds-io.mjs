@@ -2,9 +2,11 @@
 import { execFileSyncThrottled } from '../lib/gh-throttle.mjs';
 import { countGrantedRoundExtensions } from '../conveyor/round-extension-mark.mjs';
 import { OPERATOR_LOGINS } from '../lib/marker-authorship.mjs';
-import { ROUND_EXTENSION_POST_EFFECT, planRoundExtension } from './extend-rounds.mjs';
+import { ROUND_EXTENSION_POST_EFFECT, planRoundExtension, validNonconvergenceDesignPath } from './extend-rounds.mjs';
+import { realpathSync, statSync } from 'node:fs';
+import { handoffHome } from '../lib/handoff-path.mjs';
 import { spawnSync } from 'node:child_process';
-import { dirname, join, resolve } from 'node:path';
+import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const REPO_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..', '..');
@@ -26,12 +28,69 @@ const gh = (args, throttle) => execFileSyncThrottled('gh', args, {
   ...(throttle ? { throttle } : {}),
 });
 
-export function readExtensionThread(repo, pr) {
-  return JSON.parse(gh(['pr', 'view', String(pr), '--repo', repo, '--json', 'state,comments']));
+const isInside = (parent, target) => {
+  const path = relative(parent, target);
+  return path !== '' && !isAbsolute(path) && path.split(sep)[0] !== '..';
+};
+
+/** Establish regular-file evidence within the real designs directory and handoff root. */
+export function readNonconvergenceDesign(path, { root = handoffHome() } = {}) {
+  let exists = false;
+  if (validNonconvergenceDesignPath(path)) {
+    try {
+      const realRoot = realpathSync(root);
+      const designs = realpathSync(join(root, 'designs'));
+      const target = realpathSync(join(root, path));
+      exists = isInside(realRoot, designs) && isInside(designs, target)
+        && statSync(target).isFile()
+        && validNonconvergenceDesignPath(`designs/${basename(target)}`);
+    } catch { /* Unreadable or missing designs cannot authorize an override. */ }
+  }
+  return { path, exists };
+}
+
+/** Prove that slurped GraphQL pages form a complete comment thread before judging any rounds. */
+export function assembleComments(pages) {
+  const refuse = () => { throw new Error('round extension refused: incomplete or malformed comments history; operator must inspect the full thread and retry'); };
+  if (!Array.isArray(pages) || pages.length === 0) refuse();
+  const comments = [];
+  const cursors = new Set();
+  let total;
+  for (const [index, page] of pages.entries()) {
+    const connection = page?.data?.repository?.pullRequest?.comments;
+    const info = connection?.pageInfo;
+    if (page?.errors !== undefined && (!Array.isArray(page.errors) || page.errors.length > 0)) refuse();
+    if (!Number.isSafeInteger(connection?.totalCount) || connection.totalCount < 0
+      || !Array.isArray(connection.nodes) || typeof info?.hasNextPage !== 'boolean'
+      || !(info.endCursor === null || (typeof info.endCursor === 'string' && info.endCursor.length > 0))
+      || connection.nodes.some(c => typeof c?.body !== 'string' || typeof c?.createdAt !== 'string'
+        || !Number.isFinite(Date.parse(c.createdAt)) || typeof c?.viewerDidAuthor !== 'boolean'
+        || !(c.author === null || (typeof c.author?.login === 'string' && c.author.login.length > 0)))) refuse();
+    if (index === 0) total = connection.totalCount;
+    if (connection.totalCount !== total || info.hasNextPage !== (index < pages.length - 1)) refuse();
+    if (info.hasNextPage) {
+      if (!info.endCursor || cursors.has(info.endCursor) || connection.nodes.length === 0) refuse();
+      cursors.add(info.endCursor);
+    }
+    comments.push(...connection.nodes);
+  }
+  if (comments.length !== total) refuse();
+  return comments;
+}
+
+export function readExtensionThread(repo, pr, { despiteDesign, gh: runGh = gh } = {}) {
+  const [owner, name] = repo.split('/');
+  const query = 'query($owner:String!,$name:String!,$number:Int!,$endCursor:String){repository(owner:$owner,name:$name){pullRequest(number:$number){comments(first:100,after:$endCursor){totalCount pageInfo{hasNextPage endCursor} nodes{author{login} body createdAt viewerDidAuthor}}}}}';
+  const comments = assembleComments(JSON.parse(runGh(['api', 'graphql', '--paginate', '--slurp',
+    '-f', `query=${query}`, '-F', `owner=${owner}`, '-F', `name=${name}`, '-F', `number=${pr}`])));
+  const thread = JSON.parse(runGh(['pr', 'view', String(pr), '--repo', repo, '--json', 'state,files,headRefOid']));
+  return { ...thread, comments, files: thread.files?.map((file) => file.path) ?? [],
+    ...(validNonconvergenceDesignPath(despiteDesign)
+      ? { despiteDesign: readNonconvergenceDesign(despiteDesign) } : {}) };
 }
 
 export function createExtendRoundsReader({ readThread = readExtensionThread, now = () => new Date().toISOString() } = {}) {
-  return ({ repo, pr }) => ({ ...readThread(repo, pr), now: now() });
+  return ({ repo, pr, despiteDesign }) => ({ ...readThread(repo, pr, { despiteDesign }), now: now() });
 }
 
 /**
@@ -56,12 +115,12 @@ export function createExtendRoundsSinks({
       if (!OPERATOR_LOGINS.includes(viewer) || viewer !== record.actor) {
         throw new Error(`extend-rounds must run under the operator's own GitHub credential (acting as "${record.actor}"); this one is "${viewer || 'unknown'}"`);
       }
-      const before = await readThread(repo, pr);
+      const before = await readThread(repo, pr, { despiteDesign: record.despiteDesign });
       const validated = planRoundExtension({ ...before, now: record.at }, record);
       if (validated.body !== body) throw new Error('round extension body does not match its validated record');
       const count = countGrantedRoundExtensions(before.comments, { repo, pr });
       await post(repo, pr, body);
-      const after = await readThread(repo, pr);
+      const after = await readThread(repo, pr, { despiteDesign: record.despiteDesign });
       if (countGrantedRoundExtensions(after.comments, { repo, pr }) !== count + by
         || !after.comments.some((c) => c.body === body && countGrantedRoundExtensions([c], { repo, pr }) === by)) {
         throw new Error('could not prove the posted round extension increased the trusted grant count');

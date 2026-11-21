@@ -349,6 +349,17 @@ function judgeRoundUnsafe({ pr, repo = null, head, trigger, comments, files = []
     : statuteTouched.length ? `statute-file-uncertain-no-grant:${statuteTouched[0]}`
       : crossBroken.length ? `open-break-in-other-source-no-grant:${crossBroken[0].file}:${crossBroken[0].line}` : null);
 
+  // R469 / D-R451: count review and red-team rounds together, whichever source tripped the cap.
+  // This stop precedes other verdict paths; only confirmed guard findings veto it.
+  const xr = rounds.filter((r) => r.source === 'red-team' || r.source === 'review');
+  const xLatest = xr.at(-1);
+  const xPrev = xr.at(-2);
+  const xOpen = open(xLatest);
+  if (nonConverging?.enabled === true && xr.length >= 2 && xOpen.length > 0
+    && xOpen.length >= open(xPrev).length && !xOpen.some((f) => f.file && isGuardPath(f.file))) {
+    return done('non-converging', [`new-finding-class-each-round:${xr.length}-rounds-${xOpen.length}-new-findings`, 'route-to-redesign-D-R451']);
+  }
+
   if (annotated.length && refuted.length === annotated.length && crossBroken.length) reasons.push(`not-real-blocked-by-open-break-in-other-source:${crossBroken[0].file}:${crossBroken[0].line}`);
   if (annotated.length && refuted.length === annotated.length && !crossBroken.length) {
     if (guardFindings.length) return done('escalate', [`not-real-on-guard-code:${guardFindings[0].file}:${guardFindings[0].line}`, `all-${annotated.length}-findings-mechanically-refuted`]);
@@ -378,12 +389,6 @@ function judgeRoundUnsafe({ pr, repo = null, head, trigger, comments, files = []
   if (!latest) return done('send-back', ['no-parseable-findings-for-trigger']);
   if (diffGrowing) return done('suggest-split', [`diff-grew-${growth}-lines${growthRatio ? `-x${growthRatio.toFixed(2)}` : ''}`]);
   if (surfaceWidening) return done('suggest-split', [`finding-surface-widening:${newFiles.slice(0, 3).join(',')}`]);
-  // R469 / D-R451: a NEW finding class in each of rounds 1 and 2 (nothing in the latest round was raised before, and the
-  // count is not shrinking) is non-converging: route to redesign instead of granting round 3. Opt-in (settings-gated).
-  if (nonConverging?.enabled === true && same.length >= 2 && prev && annotated.length && repeated.length === 0 && !guardFindings.length
-    && latestOpen.length >= prevOpen.length) {
-    return done('non-converging', [`new-finding-class-each-round:${same.length}-rounds-${annotated.length}-new-findings`, 'route-to-redesign-D-R451']);
-  }
 
   if (annotated.length && !brokenOpen.length && !crossBroken.length && annotated.every((f) => planKeys.card.has(keyOf(f)) || !planKeys.sendBack.has(keyOf(f)))) {
     if (guardFindings.length) return done('escalate', [`card-on-guard-code:${guardFindings[0].file}:${guardFindings[0].line}`]);

@@ -89,7 +89,7 @@ describe('complete App thread reads', () => {
     expect(thread.comments[100]).toMatchObject(grant);
     expect(gh.mock.calls[0][0]).toContain('--paginate');
     expect(gh.mock.calls[0][0]).toContain(`repos/${WE}/issues/5654/comments`);
-    expect(gh.mock.calls[2][0]).toContain('state,headRefOid');
+    expect(gh.mock.calls[2][0]).toContain('state,headRefOid,files');
   });
 
   it('propagates incomplete comment reads instead of counting zero grants', () => {
@@ -734,4 +734,36 @@ describe('daemon hook (runReconcileNotesAllRepos)', () => {
     runReconcileNotesAllRepos({ repos: ['we'], tick, dryRun: true, publish, safety, autoRoundGrant: grant });
     expect(grant).not.toHaveBeenCalled();
   });
+});
+
+
+describe('shared non-converging stop in automatic grant IO', () => {
+  const rounds = () => [1, 2, 3].map(n => ({ author: { login: 'web-everything' }, createdAt: `2026-11-21T10:0${n}:00Z`,
+    body: `🔁 review — changes requested\n\nRecorded by agent (unattended review-loop) via the declared \`review-pr\` operation.\n\n### Findings\n- \`src/a.mjs:1\` — alpha parser drops the trailing record\n` }));
+  it.each([rounds(), null, undefined, {}].map(comments => [comments]))('refuses non-converging or unreadable history before any save: %j', comments => {
+    const gh = fakeGh();
+    gh.readThread.mockReturnValue({ state: 'OPEN', headRefOid: HEAD, comments });
+    const save = vi.fn();
+    const ledger = (_repo, _pr, fn) => fn({ seeded: false, baseline: 0, entries: [], save });
+    expect(call(deps(gh, { ledger }))).toMatchObject({ action: 'skip', why: expect.stringMatching(/^non-converging stop:/) });
+    expect(save).not.toHaveBeenCalled();
+    expect(gh.post).not.toHaveBeenCalled();
+  });
+  it.each([[2, 'non-converging'], [3, 'non-converging'], [2, 'unreadable'], [3, 'unreadable']])('aborts the reservation on read %i with %s history', (stopRead, history) => {
+    const gh = fakeGh();
+    let reads = 0;
+    gh.readThread.mockImplementation(() => ({ state: 'OPEN', headRefOid: HEAD, comments: ++reads >= stopRead ? (history === 'unreadable' ? undefined : rounds()) : [] }));
+    const save = vi.fn();
+    const ledger = (_repo, _pr, fn) => fn({ seeded: true, baseline: 0, entries: [], save });
+    expect(call(deps(gh, { ledger }))).toMatchObject({ action: 'skip', why: expect.stringMatching(/^non-converging stop:/) });
+    expect(save).toHaveBeenLastCalledWith(expect.objectContaining({ entries: [expect.objectContaining({ outcome: 'aborted', why: expect.stringMatching(/^non-converging stop:/) })] }));
+    expect(gh.post).not.toHaveBeenCalled();
+  });
+});
+
+
+it('the live automatic reader carries file paths and complete comments to the guard', () => {
+  const comments = [];
+  const gh = vi.fn(() => JSON.stringify({ state: 'OPEN', headRefOid: HEAD, files: [{ path: 'src/a.mjs' }] }));
+  expect(readPrThread(WE, 5654, { gh, readComments: () => comments })).toEqual({ state: 'OPEN', headRefOid: HEAD, files: ['src/a.mjs'], comments });
 });
