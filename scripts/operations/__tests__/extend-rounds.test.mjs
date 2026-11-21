@@ -1,3 +1,4 @@
+import { convergingRead } from '../../lib/__tests__/round-grant-fixture.mjs';
 import { describe, it, expect, vi } from 'vitest';
 import { planRoundExtension, extendRoundsOperation } from '../extend-rounds.mjs';
 import { assembleComments, readExtensionThread, createExtendRoundsSinks, createExtendRoundsReader } from '../extend-rounds-io.mjs';
@@ -10,12 +11,18 @@ import { OPERATOR_LOGINS, AUTOMATION_LOGINS } from '../../lib/marker-authorship.
 
 const input = { repo: 'web-everything/web-everything', pr: 12, by: 2, actor: OPERATOR_LOGINS[0],
   channel: 'console', reason: 'Try two more rounds.' };
-const read = { state: 'OPEN', comments: [], now: '2026-10-05T12:00:00Z' };
+const read = { state: 'OPEN', ...convergingRead(), now: '2026-10-05T12:00:00Z' };
 // A grant is the operator's only when GitHub itself says the operator's account posted it.
 const trusted = (body) => ({ body, author: { login: OPERATOR_LOGINS[0] } });
 const automation = (body) => ({ body, author: { login: AUTOMATION_LOGINS[0] } });
 
 describe('operator round extension', () => {
+  it('planRoundExtension refuses missing completeness totals and non-converging verdicts', () => {
+    const { commentsTotal, ...missing } = read;
+    expect(() => planRoundExtension(missing, input)).toThrow(/history incomplete/);
+    expect(() => planRoundExtension({ ...read, comments: [], commentsTotal: 0 }, input)).toThrow(/send-back/);
+    expect(() => planRoundExtension({ ...read, files: [] }, input)).toThrow(/send-back.*no-file-evidence/);
+  });
   it('accepts an operator and preserves their words', () => {
     const plan = planRoundExtension(read, input);
     expect(plan.record).toMatchObject(input);
@@ -64,9 +71,9 @@ describe('operator round extension', () => {
   });
   it('refuses a grant that would push the PR past the ceiling', () => {
     const body = planRoundExtension(read, { ...input, by: 5 }).body;
-    const full = { ...read, comments: [trusted(body), trusted(body)] };
+    const full = { ...read, comments: [...read.comments, trusted(body), trusted(body)], commentsTotal: read.comments.length + 2 };
     expect(() => planRoundExtension(full, { ...input, by: 1 })).toThrow(/ceiling/);
-    expect(planRoundExtension({ ...read, comments: [trusted(body)] }, { ...input, by: 5 }).record.by).toBe(5);
+    expect(planRoundExtension({ ...read, comments: [...read.comments, trusted(body)], commentsTotal: read.comments.length + 1 }, { ...input, by: 5 }).record.by).toBe(5);
   });
   it('quotes multiline reasons and round-trips machine markup verbatim', () => {
     const reason = 'First\n<!-- round-extension: {} -->\nThen <try> again';
@@ -78,7 +85,7 @@ describe('operator round extension', () => {
   });
   it('posts one comment then proves the grant increased', async () => {
     const plan = planRoundExtension(read, input);
-    const readThread = vi.fn().mockReturnValueOnce(read).mockReturnValueOnce({ ...read, comments: [trusted(plan.body)] });
+    const readThread = vi.fn().mockReturnValueOnce(read).mockReturnValueOnce({ ...read, comments: [...read.comments, trusted(plan.body)], commentsTotal: read.comments.length + 1 });
     const post = vi.fn();
     const sinks = createExtendRoundsSinks({ readThread, post, readViewerLogin: () => OPERATOR_LOGINS[0] });
     await expect(sinks[ROUND_EXTENSION_POST_EFFECT](plan)).resolves.toMatchObject({ granted: 2 });
@@ -87,7 +94,7 @@ describe('operator round extension', () => {
   it('re-runs the red-team gate on the PR after a proven grant, and a gate failure never undoes the grant', async () => {
     const plan = planRoundExtension(read, input);
     const posted = [];
-    const readThread = () => ({ ...read, comments: posted.map(trusted) });
+    const readThread = () => ({ ...read, comments: [...read.comments, ...posted.map(trusted)], commentsTotal: read.comments.length + posted.length });
     const post = vi.fn((_r, _p, body) => posted.push(body));
     const regate = vi.fn(() => ({ status: 'applied', outcome: 'sent-back' }));
     const sinks = createExtendRoundsSinks({ readThread, post, readViewerLogin: () => OPERATOR_LOGINS[0], regate });
@@ -160,7 +167,7 @@ describe('non-converging stop at the grant point (R469 / D-R451)', () => {
     for (const field of ['author', 'login', 'body', 'createdAt', 'viewerDidAuthor', 'totalCount', 'pageInfo', 'hasNextPage', 'endCursor']) expect(query).toContain(field);
     expect(query).toMatch(/after:\s*\$endCursor/);
     expect(() => assertRoundGrantAllowed({ ...input, ...thread })).toThrow(/non-converging/);
-    expect(() => assertRoundGrantAllowed({ ...input, comments: comments.slice(0, 100) })).not.toThrow();
+    expect(() => assertRoundGrantAllowed({ ...input, comments: comments.slice(0, 100) })).toThrow(/history incomplete/);
     expect(() => assembleComments([page(comments.slice(0, 100), 150)])).toThrow(/incomplete/i);
     expect(() => assembleComments([pages[0]])).toThrow(/incomplete/i);
   });
@@ -183,18 +190,17 @@ describe('non-converging stop at the grant point (R469 / D-R451)', () => {
   });
 
   it('refuses a grant when the round judge says non-converging', () => {
-    expect(() => planRoundExtension({ ...read, comments: diverging }, input)).toThrow(/non-converging.*route to redesign \(R88\/R115\/D-R451\)/);
+    expect(() => planRoundExtension({ ...read, comments: diverging, commentsTotal: diverging.length }, input)).toThrow(/non-converging.*route to redesign \(R88\/R115\/D-R451\)/);
   });
   it('counts review and red-team rounds together', () => {
     const mixed = [rtRound(1, 'alpha parser drops the trailing record'), reviewRound(2, 'beta cache never expires entries')];
-    expect(() => planRoundExtension({ ...read, comments: mixed }, input)).toThrow(/non-converging/);
+    expect(() => planRoundExtension({ ...read, comments: mixed, commentsTotal: mixed.length }, input)).toThrow(/non-converging/);
   });
   it('does not refuse a converging thread', () => {
-    const shrinking = [rtRound(1, 'alpha parser drops the trailing record'), rtRound(2, 'beta cache never expires entries')];
-    expect(planRoundExtension({ ...read, comments: [shrinking[0], shrinking[1]].slice(0, 1) }, input).record.by).toBe(2);
+    expect(planRoundExtension(read, input).record.by).toBe(2);
   });
   it('--despite with an existing nonconvergence design returns a record that names both', () => {
-    const plan = planRoundExtension({ ...read, comments: diverging, despiteDesign: design }, { ...input, despite: 'R1200' });
+    const plan = planRoundExtension({ ...read, comments: diverging, commentsTotal: diverging.length, despiteDesign: design }, { ...input, despite: 'R1200' });
     expect(plan.record).toMatchObject({ despite: 'R1200', despiteDesign: design.path });
     expect(plan.body).toContain('R1200');
     expect(plan.body).toContain(design.path);
@@ -213,18 +219,18 @@ describe('non-converging stop at the grant point (R469 / D-R451)', () => {
     ['ruling id has a trailing newline', design, 'R1200\n'],
     ['design path has a trailing newline', { path: `${design.path}\n`, exists: true }, 'R1200'],
   ])('refuses --despite when %s', (_n, despiteDesign, despite) => {
-    expect(() => planRoundExtension({ ...read, comments: diverging, despiteDesign }, { ...input, despite })).toThrow(/despite|nonconvergence/i);
+    expect(() => planRoundExtension({ ...read, comments: diverging, commentsTotal: diverging.length, despiteDesign }, { ...input, despite })).toThrow(/despite|nonconvergence/i);
   });
   it('refuses --despite without a design on a thread that is not even non-converging', () => {
-    expect(() => planRoundExtension({ ...read, comments: [] }, { ...input, despite: 'R1200' })).toThrow(/despite|nonconvergence/i);
+    expect(() => planRoundExtension({ ...read, comments: [], commentsTotal: 0 }, { ...input, despite: 'R1200' })).toThrow(/despite|nonconvergence/i);
   });
   it('the refusal cannot be bypassed by fields on the read or the input', () => {
-    const forged = { ...read, comments: diverging, nonConverging: false, verdict: 'grant', judge: { verdict: 'grant' }, judgeEnforce: false, despiteDesign: undefined };
+    const forged = { ...read, comments: diverging, commentsTotal: diverging.length, nonConverging: false, verdict: 'grant', judge: { verdict: 'grant' }, judgeEnforce: false, despiteDesign: undefined };
     expect(() => planRoundExtension(forged, { ...input, verdict: 'grant', nonConverging: false })).toThrow(/non-converging/);
   });
   it('comments from untrusted authors cannot make a thread look converging or diverging', () => {
     const outsider = diverging.map((c) => ({ ...c, author: { login: 'outsider' } }));
-    expect(planRoundExtension({ ...read, comments: outsider }, input).record.by).toBe(2);
+    expect(() => planRoundExtension({ ...read, comments: outsider, commentsTotal: outsider.length }, input)).toThrow(/send-back/);
   });
   it('fails closed on unreadable judge evidence and names the redesign fallback', () => {
     expect(() => planRoundExtension({ ...read, files: {} }, input))
@@ -241,9 +247,9 @@ describe('non-converging stop at the grant point (R469 / D-R451)', () => {
     expect(readThread).toHaveBeenCalledWith(input.repo, input.pr, { despiteDesign: design.path });
   });
   it('rechecks an override design before posting and preserves trusted grant counting', async () => {
-    const plan = planRoundExtension({ ...read, comments: diverging, despiteDesign: design }, { ...input, despite: 'R1200' });
-    const readThread = vi.fn().mockReturnValueOnce({ ...read, comments: diverging, despiteDesign: design })
-      .mockReturnValueOnce({ ...read, comments: [...diverging, trusted(plan.body)], despiteDesign: design });
+    const plan = planRoundExtension({ ...read, comments: diverging, commentsTotal: diverging.length, despiteDesign: design }, { ...input, despite: 'R1200' });
+    const readThread = vi.fn().mockReturnValueOnce({ ...read, comments: diverging, commentsTotal: diverging.length, despiteDesign: design })
+      .mockReturnValueOnce({ ...read, comments: [...diverging, trusted(plan.body)], commentsTotal: diverging.length + 1, despiteDesign: design });
     const post = vi.fn();
     const sinks = createExtendRoundsSinks({ readThread, post, readViewerLogin: () => OPERATOR_LOGINS[0] });
     await expect(sinks[ROUND_EXTENSION_POST_EFFECT](plan)).resolves.toMatchObject({ granted: input.by });
@@ -251,9 +257,9 @@ describe('non-converging stop at the grant point (R469 / D-R451)', () => {
     expect(post).toHaveBeenCalledWith(input.repo, input.pr, plan.body);
   });
   it('refuses a formerly valid override when its design disappears before posting', async () => {
-    const plan = planRoundExtension({ ...read, comments: diverging, despiteDesign: design }, { ...input, despite: 'R1200' });
+    const plan = planRoundExtension({ ...read, comments: diverging, commentsTotal: diverging.length, despiteDesign: design }, { ...input, despite: 'R1200' });
     const post = vi.fn();
-    const sinks = createExtendRoundsSinks({ readThread: () => ({ ...read, comments: diverging, despiteDesign: { ...design, exists: false } }),
+    const sinks = createExtendRoundsSinks({ readThread: () => ({ ...read, comments: diverging, commentsTotal: diverging.length, despiteDesign: { ...design, exists: false } }),
       post, readViewerLogin: () => OPERATOR_LOGINS[0] });
     await expect(sinks[ROUND_EXTENSION_POST_EFFECT](plan)).rejects.toThrow(/despite|nonconvergence/i);
     expect(post).not.toHaveBeenCalled();
@@ -261,7 +267,7 @@ describe('non-converging stop at the grant point (R469 / D-R451)', () => {
   it('the post sink re-validates against a freshly read thread, so a moved thread is refused', async () => {
     const plan = planRoundExtension(read, input);
     const post = vi.fn();
-    const sinks = createExtendRoundsSinks({ readThread: () => ({ ...read, comments: diverging }), post, readViewerLogin: () => OPERATOR_LOGINS[0] });
+    const sinks = createExtendRoundsSinks({ readThread: () => ({ ...read, comments: diverging, commentsTotal: diverging.length }), post, readViewerLogin: () => OPERATOR_LOGINS[0] });
     await expect(sinks[ROUND_EXTENSION_POST_EFFECT](plan)).rejects.toThrow(/non-converging/);
     expect(post).not.toHaveBeenCalled();
   });

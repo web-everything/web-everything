@@ -1,3 +1,4 @@
+import { convergingRead } from './round-grant-fixture.mjs';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { mkdtempSync, mkdirSync, readFileSync, readdirSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -12,27 +13,52 @@ vi.mock('../round-judge.mjs', async (original) => {
 });
 afterEach(() => { vi.mocked(judgeRound).mockReset(); vi.mocked(judgeRound).mockImplementation(actualJudge); });
 const actualJudge = (await vi.importActual('../round-judge.mjs')).judgeRound;
-const base = { repo: 'web-everything/web-everything', pr: 12, comments: [], files: [] };
+const base = { repo: 'web-everything/web-everything', pr: 12, ...convergingRead() };
 const override = { despite: 'R1200', despiteDesign: { path: 'designs/x-nonconvergence.md', exists: true } };
 
 describe('shared round grant guard', () => {
+  it('refuses when the completeness total is missing', () => {
+    const { commentsTotal, ...missing } = base;
+    expect(() => assertRoundGrantAllowed(missing)).toThrow(/round extension refused: history incomplete/);
+    expect(() => assertRoundGrantAllowed({ ...base, commentsTotal: undefined, ...override })).toThrow(/history incomplete/);
+    expect(judgeRound).not.toHaveBeenCalled();
+  });
+  it('refuses escalate and send-back verdicts, admits only converging ones', () => {
+    for (const verdict of ['escalate', 'send-back', 'suggest-split', 'unknown']) {
+      vi.mocked(judgeRound).mockReturnValue({ verdict, reasons: ['observed'] });
+      expect(() => assertRoundGrantAllowed({ ...base, ...override })).toThrow(verdict);
+    }
+    for (const verdict of ['grant', 'not-real-verified', 'card-the-rest']) {
+      vi.mocked(judgeRound).mockReturnValue({ verdict, reasons: ['observed'],
+        ...(verdict === 'grant' ? { k: 1 } : {}), ...(verdict === 'not-real-verified' ? { proof: ['verified'] } : {}) });
+      expect(assertRoundGrantAllowed(base).verdict).toBe(verdict);
+    }
+  });
+  it('names an unknown verdict even when its reasons are malformed', () => {
+    vi.mocked(judgeRound).mockReturnValue({ verdict: 'unknown', reasons: {} });
+    expect(() => assertRoundGrantAllowed(base)).toThrow(/verdict unknown/);
+  });
+  it('refuses a real no-file-evidence verdict even despite a design override', () => {
+    expect(() => assertRoundGrantAllowed({ ...base, files: [], ...override })).toThrow(/send-back.*no-file-evidence-no-grant/);
+  });
   it.each([null, undefined, {}])('refuses unreadable comments %j', comments => {
     expect(() => assertRoundGrantAllowed({ ...base, comments })).toThrow(/comments|history/);
   });
-  it.each([1, 150, null, -1, '0', NaN])('refuses incomplete comment evidence with total %j even despite a ruling', commentsTotal => {
+  it.each([1, 150, null, -1, '0', NaN, 0.5, Infinity, Number.MAX_SAFE_INTEGER + 1])('refuses incomplete comment evidence with total %j even despite a ruling', commentsTotal => {
     expect(() => assertRoundGrantAllowed({ ...base, ...override, commentsTotal })).toThrow(/incomplete/i);
     expect(judgeRound).not.toHaveBeenCalled();
   });
-  it('accepts a matching optional comment total', () => {
-    expect(() => assertRoundGrantAllowed({ ...base, commentsTotal: 0 })).not.toThrow();
+  it('accepts a matching mandatory comment total', () => {
+    expect(() => assertRoundGrantAllowed(base)).not.toThrow();
   });
   it.each([null, {}, ['a', null], [42]])('refuses malformed files %j, even despite a ruling', files => {
     expect(() => assertRoundGrantAllowed({ ...base, ...override, files })).toThrow();
   });
   it('returns the judge result and always enables the cross-source stop', () => {
     const result = assertRoundGrantAllowed(base);
+    expect(result.verdict).toBe('grant');
     expect(result.evidence.failClosed).not.toBe(true);
-    expect(judgeRound).toHaveBeenCalledWith({ pr: 12, repo: base.repo, head: '', trigger: 'review-cap', comments: [], files: [], nonConverging: { enabled: true } });
+    expect(judgeRound).toHaveBeenCalledWith({ pr: 12, repo: base.repo, head: '', trigger: 'review-cap', comments: base.comments, files: base.files, nonConverging: { enabled: true } });
   });
   it.each(['throw', 'invalid', 'closed'])('despite cannot override a %s judge', kind => {
     if (kind === 'throw') vi.mocked(judgeRound).mockImplementationOnce(() => { throw new Error('judge unavailable'); });
@@ -44,7 +70,7 @@ describe('shared round grant guard', () => {
     expect(() => assertRoundGrantAllowed({ ...base, ...override, files: {} })).toThrow();
   });
   it('refuses a non-converging verdict unless both bounded override fields are valid', () => {
-    vi.mocked(judgeRound).mockReturnValue({ ...actualJudge({ ...base, head: '', trigger: 'review-cap' }), verdict: 'non-converging' });
+    vi.mocked(judgeRound).mockReturnValue({ ...actualJudge({ ...base, head: '', trigger: 'review-cap' }), verdict: 'non-converging', k: undefined });
     expect(() => assertRoundGrantAllowed(base)).toThrow('non-converging round extension refused: route to redesign (R88/R115/D-R451)');
     expect(assertRoundGrantAllowed({ ...base, ...override }).verdict).toBe('non-converging');
     for (const despite of ['R1234567', 'R1\n', 'x', null]) expect(() => assertRoundGrantAllowed({ ...base, ...override, despite })).toThrow(/despite/);

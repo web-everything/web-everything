@@ -1,3 +1,4 @@
+import { convergingRead } from '../../lib/__tests__/round-grant-fixture.mjs';
 /**
  * @file scripts/conveyor/__tests__/auto-round-grant.test.mjs
  * @description The automated standing-ruling round grant (operator option B, 2026-10-20): the operator's ruling
@@ -86,6 +87,7 @@ describe('complete App thread reads', () => {
     });
     const thread = readPrThread(WE, 5654, { gh });
     expect(thread.comments).toHaveLength(101);
+    expect(thread.commentsTotal).toBe(101);
     expect(thread.comments[100]).toMatchObject(grant);
     expect(gh.mock.calls[0][0]).toContain('--paginate');
     expect(gh.mock.calls[0][0]).toContain(`repos/${WE}/issues/5654/comments`);
@@ -283,8 +285,8 @@ afterAll(() => { for (const dir of tmpDirs) rmSync(dir, { recursive: true, force
 const tmpLedger = () => { const dir = tmpDir(); return (slug, pr, fn) => withPrLedger(slug, pr, fn, { dir }); };
 /** A fake GitHub thread: posts append App-authored comments; head can be moved by a test. */
 const fakeGh = ({ comments = [], head = HEAD, state = 'OPEN' } = {}) => {
-  const t = { comments: [...comments], head, state };
-  return { t, readThread: vi.fn(() => ({ state: t.state, headRefOid: t.head, comments: t.comments })),
+  const t = { comments: [...convergingRead().comments, ...comments], head, state };
+  return { t, readThread: vi.fn(() => ({ state: t.state, headRefOid: t.head, comments: t.comments, commentsTotal: t.comments.length, files: ['backlog/x.md'] })),
     post: vi.fn((repo, pr, body) => { t.comments.push({ id: `IC_${++ids}`, author: { login: 'web-everything[bot]' }, createdAt: '2026-10-20T12:00:00Z', body }); }) };
 };
 const deps = (gh = fakeGh(), over = {}) => ({
@@ -321,6 +323,18 @@ describe('card-only is judged on the NET diff', () => {
 });
 
 describe('the grant', () => {
+  it('auto-grant refuses missing completeness proof, send-back, and missing file evidence before saving or posting', () => {
+    for (const over of [{ commentsTotal: undefined }, { comments: [], commentsTotal: 0 }, { files: [] }]) {
+      const gh = fakeGh();
+      const complete = gh.readThread();
+      gh.readThread.mockReturnValue({ ...complete, ...over });
+      const save = vi.fn();
+      const ledger = (_repo, _pr, fn) => fn({ seeded: false, baseline: 0, entries: [], save });
+      expect(call(deps(gh, { ledger }))).toMatchObject({ action: 'skip', why: expect.stringMatching(/history incomplete|send-back/) });
+      expect(save).not.toHaveBeenCalled();
+      expect(gh.post).not.toHaveBeenCalled();
+    }
+  });
   it('posts an App comment citing the ruling and its head, which the trusted reader then counts', () => {
     const gh = fakeGh();
     expect(call(deps(gh))).toMatchObject({ action: 'granted', count: 1, max: 3 });
@@ -351,7 +365,7 @@ describe('the grant', () => {
   });
   it('expected-head check right before the write: a head moved after judging is never granted', () => {
     const gh = fakeGh(); let reads = 0;
-    gh.readThread.mockImplementation(() => { reads += 1; if (reads === 2) gh.t.head = HEAD2; return { state: gh.t.state, headRefOid: gh.t.head, comments: gh.t.comments }; });
+    gh.readThread.mockImplementation(() => { reads += 1; if (reads === 2) gh.t.head = HEAD2; return { state: gh.t.state, headRefOid: gh.t.head, comments: gh.t.comments, commentsTotal: gh.t.comments.length, files: ['backlog/x.md'] }; });
     expect(call(deps(gh))).toMatchObject({ action: 'skip', why: expect.stringContaining('head moved') });
     expect(gh.post).not.toHaveBeenCalled();
     expect(call(deps(fakeGh({ head: HEAD2 })))).toMatchObject({ action: 'skip', why: expect.stringContaining('head moved') });
@@ -425,7 +439,7 @@ describe('concurrency and durable-before-post, on the real file lock and ledger'
     const innerGh = { readThread: vi.fn(() => { innerReads += 1; return gh.readThread(); }), post: vi.fn() };
     gh.readThread.mockImplementationOnce(() => {
       inner = call(deps(gh, { ledger: worker(dir), readThread: innerGh.readThread, post: innerGh.post }), later);
-      return { state: gh.t.state, headRefOid: gh.t.head, comments: gh.t.comments };
+      return { state: gh.t.state, headRefOid: gh.t.head, comments: gh.t.comments, commentsTotal: gh.t.comments.length, files: ['backlog/x.md'] };
     });
     expect(call(deps(gh, { ledger: worker(dir) }))).toMatchObject({ action: 'granted', count: 1 });
     expect(inner).toEqual({ action: 'deferred', why: expect.stringMatching(/^ledger: withFileLock: timed out/) });
@@ -438,7 +452,7 @@ describe('concurrency and durable-before-post, on the real file lock and ledger'
     const noLock = (slug, pr, fn) => withPrLedger(slug, pr, fn, { dir: open, lock: (_p, f) => f() });
     gh2.readThread.mockImplementationOnce(() => {
       inner = call(deps(gh2, { ledger: noLock, readThread: () => { openReads += 1; return gh2.readThread(); } }), later);
-      return { state: gh2.t.state, headRefOid: gh2.t.head, comments: gh2.t.comments };
+      return { state: gh2.t.state, headRefOid: gh2.t.head, comments: gh2.t.comments, commentsTotal: gh2.t.comments.length, files: ['backlog/x.md'] };
     });
     call(deps(gh2, { ledger: noLock }));
     expect(openReads).toBeGreaterThan(0);
@@ -491,7 +505,7 @@ describe('concurrency and durable-before-post, on the real file lock and ledger'
     const lockFile = ledgerPath(dir).replace(/\.json$/, '.lock');
     writeFileSync(lockFile, '999999999\n'); // outside any real pid range: always "no such process"
     utimesSync(lockFile, new Date(0), new Date(0));
-    expect(gh.t.comments).toEqual([]);
+    expect(gh.t.comments).toEqual(convergingRead().comments);
     const next = worker(dir, { timeoutMs: 2000, pollMs: 10, staleMs: 50 });
     expect(call(deps(gh, { ledger: next, ...one }))).toMatchObject({ action: 'skip', why: `already claimed: ${key}` });
     expect(call(deps(gh, { ledger: next, ...one }), later)).toMatchObject({ action: 'cap-reached', used: 1, max: 1 });
@@ -617,13 +631,15 @@ describe('audit round 3 patches', () => {
   it('(a) a non-automation author never consumes room or blocks a manual grant', () => {
     const forged = { ...autoGrant(), author: { login: 'mallory' } };
     expect(countStandingRulingGrantRecords([forged, forged, forged], { repo: WE, pr: 5654 })).toBe(0);
-    expect(() => planRoundExtension({ state: 'OPEN', comments: [...Array(9).fill(manualGrant()), forged], now: 'x' },
+    const evidence = convergingRead();
+    const comments = [...evidence.comments, ...Array(9).fill(manualGrant()), forged];
+    expect(() => planRoundExtension({ state: 'OPEN', ...evidence, comments, commentsTotal: comments.length, now: 'x' },
       { repo: WE, pr: 5654, by: 1, actor: 'chalbert', channel: 'c', reason: 'r' })).not.toThrow();
     expect(countStandingRulingGrantRecords([autoGrant()], { repo: WE, pr: 5654 })).toBe(1);
   });
   it('(b) a head moved during the slow verification, just before the post, is never granted and keeps the slot', () => {
     const gh = fakeGh(); let reads = 0;
-    gh.readThread.mockImplementation(() => { reads += 1; if (reads === 3) gh.t.head = HEAD2; return { state: gh.t.state, headRefOid: gh.t.head, comments: gh.t.comments }; });
+    gh.readThread.mockImplementation(() => { reads += 1; if (reads === 3) gh.t.head = HEAD2; return { state: gh.t.state, headRefOid: gh.t.head, comments: gh.t.comments, commentsTotal: gh.t.comments.length, files: ['backlog/x.md'] }; });
     const d = deps(gh);
     expect(call(d)).toMatchObject({ action: 'skip', why: expect.stringContaining('right before the post') });
     expect(gh.post).not.toHaveBeenCalled();
@@ -742,7 +758,7 @@ describe('shared non-converging stop in automatic grant IO', () => {
     body: `🔁 review — changes requested\n\nRecorded by agent (unattended review-loop) via the declared \`review-pr\` operation.\n\n### Findings\n- \`src/a.mjs:1\` — alpha parser drops the trailing record\n` }));
   it.each([rounds(), null, undefined, {}].map(comments => [comments]))('refuses non-converging or unreadable history before any save: %j', comments => {
     const gh = fakeGh();
-    gh.readThread.mockReturnValue({ state: 'OPEN', headRefOid: HEAD, comments });
+    gh.readThread.mockReturnValue({ state: 'OPEN', headRefOid: HEAD, comments, commentsTotal: comments?.length });
     const save = vi.fn();
     const ledger = (_repo, _pr, fn) => fn({ seeded: false, baseline: 0, entries: [], save });
     expect(call(deps(gh, { ledger }))).toMatchObject({ action: 'skip', why: expect.stringMatching(/^non-converging stop:/) });
@@ -752,7 +768,10 @@ describe('shared non-converging stop in automatic grant IO', () => {
   it.each([[2, 'non-converging'], [3, 'non-converging'], [2, 'unreadable'], [3, 'unreadable']])('aborts the reservation on read %i with %s history', (stopRead, history) => {
     const gh = fakeGh();
     let reads = 0;
-    gh.readThread.mockImplementation(() => ({ state: 'OPEN', headRefOid: HEAD, comments: ++reads >= stopRead ? (history === 'unreadable' ? undefined : rounds()) : [] }));
+    gh.readThread.mockImplementation(() => {
+      const comments = ++reads >= stopRead ? (history === 'unreadable' ? undefined : rounds()) : convergingRead().comments;
+      return { state: 'OPEN', headRefOid: HEAD, comments, commentsTotal: comments?.length, files: ['backlog/x.md'] };
+    });
     const save = vi.fn();
     const ledger = (_repo, _pr, fn) => fn({ seeded: true, baseline: 0, entries: [], save });
     expect(call(deps(gh, { ledger }))).toMatchObject({ action: 'skip', why: expect.stringMatching(/^non-converging stop:/) });
@@ -765,5 +784,5 @@ describe('shared non-converging stop in automatic grant IO', () => {
 it('the live automatic reader carries file paths and complete comments to the guard', () => {
   const comments = [];
   const gh = vi.fn(() => JSON.stringify({ state: 'OPEN', headRefOid: HEAD, files: [{ path: 'src/a.mjs' }] }));
-  expect(readPrThread(WE, 5654, { gh, readComments: () => comments })).toEqual({ state: 'OPEN', headRefOid: HEAD, files: ['src/a.mjs'], comments });
+  expect(readPrThread(WE, 5654, { gh, readComments: () => comments })).toEqual({ state: 'OPEN', headRefOid: HEAD, files: ['src/a.mjs'], comments, commentsTotal: comments.length });
 });

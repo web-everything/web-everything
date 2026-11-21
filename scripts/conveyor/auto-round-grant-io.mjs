@@ -94,7 +94,8 @@ export function readPrThread(repo, pr, { gh = ghApp, readComments = readComplete
   if (!Array.isArray(comments)) throw new Error('complete comments read returned no array');
   // Keep the expected-head check fresh even when reading a long thread takes several pages.
   const thread = JSON.parse(String(gh(['pr', 'view', String(pr), '--repo', repo, '--json', 'state,headRefOid,files'])));
-  return { ...thread, comments, files: thread.files?.map(file => file.path) ?? [] };
+  // readCompletePrComments throws unless its paginated array matches the live total.
+  return { ...thread, comments, commentsTotal: comments.length, files: thread.files?.map(file => file.path) ?? [] };
 }
 /** IO: post one comment (App identity). */
 export function postPrComment(repo, pr, body, { gh = ghApp } = {}) {
@@ -135,7 +136,7 @@ export function autoRoundGrant({ repo, note, pr }, {
       try { thread = readThread(slug, note.prNumber); } catch (e) { return { action: 'skip', why: `thread unreadable: ${firstLine(e)}` }; }
       const guard = (view) => {
         try {
-          assertRoundGrantAllowed({ repo: slug, pr: note.prNumber, comments: view?.comments,
+          assertRoundGrantAllowed({ repo: slug, pr: note.prNumber, comments: view?.comments, commentsTotal: view?.commentsTotal,
             files: view?.files === undefined ? [] : view.files, headRefOid: view?.headRefOid });
           return null;
         } catch (e) { return { action: 'skip', why: `non-converging stop: ${firstLine(e)}` }; }

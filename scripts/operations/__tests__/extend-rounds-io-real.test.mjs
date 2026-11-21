@@ -1,3 +1,4 @@
+import { convergingRead } from '../../lib/__tests__/round-grant-fixture.mjs';
 /** Exercise the real subprocess/JSON boundary; only GitHub is replaced by a local executable. */
 import { it, expect } from 'vitest';
 import { writeFileSync, readFileSync, chmodSync } from 'node:fs';
@@ -13,7 +14,7 @@ it('reads, posts verbatim words through gh argv, and verifies the persisted thre
   await withRealRepo(async ({ root }) => {
     const thread = join(root, 'thread.json');
     const fakeGh = join(root, 'gh');
-    writeFileSync(thread, JSON.stringify({ state: 'OPEN', comments: [] }));
+    writeFileSync(thread, JSON.stringify({ state: 'OPEN', ...convergingRead(), files: [{ path: 'src/q.mjs' }] }));
     writeFileSync(fakeGh, `#!${process.execPath}
 const fs = require('node:fs');
 const args = process.argv.slice(2);
@@ -58,7 +59,7 @@ else if (args[1] === 'comment') {
     });
     expect(JSON.parse(stdout)).toMatchObject({ granted: 2, total: 2 });
     const comments = JSON.parse(readFileSync(thread, 'utf8')).comments;
-    expect(comments).toHaveLength(1);
-    expect(comments[0].body).toContain('> Try "two" more.');
+    expect(comments).toHaveLength(3);
+    expect(comments[2].body).toContain('> Try "two" more.');
   });
 });

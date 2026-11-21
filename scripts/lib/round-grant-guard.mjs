@@ -10,8 +10,8 @@ const STOP = 'non-converging round extension refused: route to redesign (R88/R11
 /** despiteDesign.exists is regular-file evidence supplied by the IO reader, never a caller flag. */
 export function assertRoundGrantAllowed({ repo, pr, comments, commentsTotal, files, headRefOid, despite, despiteDesign }) {
   if (!Array.isArray(comments)) throw new Error('round extension refused: unreadable comments history');
-  if (commentsTotal !== undefined && commentsTotal !== comments.length) {
-    throw new Error('round extension refused: incomplete comments history; operator must inspect the full thread and retry');
+  if (!Number.isSafeInteger(commentsTotal) || commentsTotal < 0 || commentsTotal !== comments.length) {
+    throw new Error('round extension refused: history incomplete (comments total missing, invalid or mismatched); operator must inspect the full thread and retry');
   }
   if (files !== undefined && (!Array.isArray(files) || Array.from(files).some(file => typeof file !== 'string'))) {
     throw new Error(STOP);
@@ -21,12 +21,19 @@ export function assertRoundGrantAllowed({ repo, pr, comments, commentsTotal, fil
     judgement = judgeRound({ pr, repo, head: headRefOid ?? '', trigger: 'review-cap',
       comments, files: files ?? [], nonConverging: { enabled: true } });
   } catch { throw new Error(STOP); }
-  if (judgement?.evidence?.failClosed || !validateVerdict(judgement).ok) throw new Error(STOP);
+  const refused = () => new Error(`round extension refused: verdict ${String(judgement?.verdict)}; ${
+    Array.isArray(judgement?.reasons) ? judgement.reasons.join('; ') : 'invalid judge reasons'
+  }; operator must inspect the full thread and route to redesign`);
+  if (judgement?.evidence?.failClosed || !validateVerdict(judgement).ok) throw refused();
   const validDespite = typeof despite === 'string' && /^R\d{1,6}(?![\s\S])/.test(despite)
     && despiteDesign?.exists === true && validNonconvergenceDesignPath(despiteDesign.path);
   if (despite !== undefined && !validDespite) {
     throw new Error('--despite requires a ruling id and an existing designs/*nonconvergence*.md design');
   }
-  if (judgement.verdict === 'non-converging' && !validDespite) throw new Error(STOP);
+  if (judgement.verdict === 'non-converging') {
+    if (!validDespite) throw new Error(STOP);
+  } else if (!['grant', 'not-real-verified', 'card-the-rest'].includes(judgement.verdict)) {
+    throw refused();
+  }
   return judgement;
 }
