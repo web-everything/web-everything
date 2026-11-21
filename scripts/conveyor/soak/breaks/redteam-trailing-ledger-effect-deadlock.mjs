@@ -24,7 +24,7 @@ export default {
       const { readDrainRedTeamEvidence } = await import(pathToFileURL(join(sourceRoot, EVIDENCE)).href);
       const runsDir = mkdtempSync(join(tmpdir(), 'soak-ledger-'));
       const head = 'c'.repeat(40);
-      const eff = (step, status, type) => ({ type: type ?? `review.${step}`, step, status });
+      const eff = (step, status, type) => ({ type: type ?? (step === 'verdict-ledger.append' ? step : `review.${step}`), step, status });
       const done = ['write-up', 'label-swap', 'verdict-ledger.append', 'notice'].map(s => eff(s, 'applied'));
       const ledger = status => eff('ledgerEvents', status, 'review.ledger-events');
       const base = { op: 'review-pr', input: { repo: 'web-everything/web-everything', pr: 7202 },

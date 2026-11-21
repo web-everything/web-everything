@@ -1146,7 +1146,7 @@ describe('bounded review evidence scans', () => {
     });
   });
   describe('trailing ledger-events effect only (#7202 shape)', () => {
-    const eff = (step, status, type) => ({ type: type ?? (step === 'ledgerEvents' ? 'review.ledger-events' : `review.${step}`), step, status });
+    const eff = (step, status, type) => ({ type: type ?? (step === 'ledgerEvents' ? 'review.ledger-events' : step === 'verdict-ledger.append' ? step : `review.${step}`), step, status });
     const done = [eff('write-up', 'applied'), eff('label-swap', 'applied'), eff('verdict-ledger.append', 'applied'), eff('notice', 'applied')];
     const ledger = status => eff('ledgerEvents', status);
     const run = (f, extra = {}) => ({ op: 'review-pr', input: { repo: f.repo, pr: f.pr }, ...payload(f.head),
@@ -1171,6 +1171,8 @@ describe('bounded review evidence scans', () => {
       holds(f, run(f, { ...accepting(f), effects: [ledger('pending')] }));
       holds(f, run(f, { ...accepting(f), effects: [eff('label-swap', 'applied'), ledger('pending')] }));
       holds(f, run(f, { ...accepting(f), effects: [eff('write-up', 'applied'), ledger('pending')] }));
+      holds(f, run(f, { effects: [eff('write-up', 'applied'), eff('label-swap', 'applied'), ledger('pending')] }));
+      holds(f, run(f, { effects: [eff('write-up', 'applied'), eff('label-swap', 'applied'), eff('verdict-ledger.append', 'pending'), ledger('pending')] }));
       for (const confirm of ['changes', 'abstain', undefined]) holds(f, run(f, { ...accepting(f), findings: { confirm, read: { netBasis: { rev: f.head } } } }));
     });
     it('still holds for every other open shape', () => {

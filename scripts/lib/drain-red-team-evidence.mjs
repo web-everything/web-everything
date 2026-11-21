@@ -273,7 +273,7 @@ const unfinishedSince = run => {
 const trailingLedgerOnly = run => {
   if (run?.outcome === 'refused' || run?.pending?.kind !== 'effect' || run.pending.step !== 'ledgerEvents') return false;
   if (!['accept', 'prevention-outstanding'].includes(verdictOf(run)) || run.findings?.confirm !== 'accept' || !Array.isArray(run.effects)) return false;
-  for (const type of ['review.write-up', 'review.label-swap']) {
+  for (const type of ['review.write-up', 'review.label-swap', 'verdict-ledger.append']) {
     if (!run.effects.some(effect => effect?.type === type && effect.status === 'applied')) return false;
   }
   const open = run.effects.filter(effect => effect?.step === 'ledgerEvents' || effect?.type === 'review.ledger-events');
