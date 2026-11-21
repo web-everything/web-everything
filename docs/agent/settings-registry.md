@@ -17,7 +17,7 @@ For repo defaults, edit the owner file through a PR and rebuild the consuming da
 ## Summary
 
 - Top-level keys: 160 (162 declaration rows).
-- Declared leaves: 588 (platform copies counted separately).
+- Declared leaves: 589 (platform copies counted separately).
 - Instant top-level keys: 0; not instant: 160.
 - Instant capacity leaves: 15.
 - Constants to settle: 312.
@@ -185,7 +185,7 @@ Operator-prefs layer: ~/.plateau/platform-preferences.json is the requested oper
 | reviewChurn | scripts/settings/review.json | 3 | {"sameTree":"shadow","capMode":"shadow","maxLoopsPerPr":8} | pr | no | Review churn detection and loop cap policy. |
 | reviewHeadIndex | scripts/settings/review-head-index.json | 0 | {} | pr | no | Retention and log compaction bounds for reviewed heads. |
 | reviewNoVerdictRetry | scripts/settings/review-no-verdict-retry.json | 1 | {"cooldownReleases":6} | pr | no | Bounded cooldown releases when a review verdict never lands. |
-| rounds | scripts/settings/round-judge.json | 3 | {"judge":{"mode":"shadow","maxGrants":20},"nonConverging":{… | pr | no | Shadow round judge grants and non-convergence detection. |
+| rounds | scripts/settings/round-judge.json | 4 | {"judge":{"mode":"shadow","maxGrants":20},"nonConverging":{… | pr | no | Shadow round judge grants and non-convergence detection. |
 | routes | scripts/settings/delivery-routes.json | 15 | {"forge":"debug","red-main":"debug","incident":"debug-to-me… | pr | no | Task type to delivery mode routing. |
 | routing | scripts/settings/routing.json | 4 | {"builder":"auto","auditProvider":"codex","codexReserveForA… | pr | no | Builder and audit provider routing based on quota and reservations. |
 | ruledWeakened | scripts/settings/prototype-load.json | 1 | [{"ref":"lane/redteam-check-run","sha":"dc7a0efb1c64862460b… | pr | no | Pinned audit weakenings explicitly accepted by operator rulings. |

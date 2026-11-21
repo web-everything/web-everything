@@ -2,7 +2,9 @@
 import { execFileSyncThrottled } from '../lib/gh-throttle.mjs';
 import { countGrantedRoundExtensions } from '../conveyor/round-extension-mark.mjs';
 import { OPERATOR_LOGINS } from '../lib/marker-authorship.mjs';
-import { ROUND_EXTENSION_POST_EFFECT, planRoundExtension } from './extend-rounds.mjs';
+import { ROUND_EXTENSION_POST_EFFECT, planRoundExtension, validNonconvergenceDesignPath } from './extend-rounds.mjs';
+import { existsSync } from 'node:fs';
+import { handoffHome } from '../lib/handoff-path.mjs';
 import { spawnSync } from 'node:child_process';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -26,12 +28,15 @@ const gh = (args, throttle) => execFileSyncThrottled('gh', args, {
   ...(throttle ? { throttle } : {}),
 });
 
-export function readExtensionThread(repo, pr) {
-  return JSON.parse(gh(['pr', 'view', String(pr), '--repo', repo, '--json', 'state,comments']));
+export function readExtensionThread(repo, pr, { despiteDesign } = {}) {
+  const thread = JSON.parse(gh(['pr', 'view', String(pr), '--repo', repo, '--json', 'state,comments,files,headRefOid']));
+  return { ...thread, files: thread.files?.map((file) => file.path) ?? [],
+    ...(validNonconvergenceDesignPath(despiteDesign)
+      ? { despiteDesign: { path: despiteDesign, exists: existsSync(join(handoffHome(), despiteDesign)) } } : {}) };
 }
 
 export function createExtendRoundsReader({ readThread = readExtensionThread, now = () => new Date().toISOString() } = {}) {
-  return ({ repo, pr }) => ({ ...readThread(repo, pr), now: now() });
+  return ({ repo, pr, despiteDesign }) => ({ ...readThread(repo, pr, { despiteDesign }), now: now() });
 }
 
 /**
@@ -56,12 +61,12 @@ export function createExtendRoundsSinks({
       if (!OPERATOR_LOGINS.includes(viewer) || viewer !== record.actor) {
         throw new Error(`extend-rounds must run under the operator's own GitHub credential (acting as "${record.actor}"); this one is "${viewer || 'unknown'}"`);
       }
-      const before = await readThread(repo, pr);
+      const before = await readThread(repo, pr, { despiteDesign: record.despiteDesign });
       const validated = planRoundExtension({ ...before, now: record.at }, record);
       if (validated.body !== body) throw new Error('round extension body does not match its validated record');
       const count = countGrantedRoundExtensions(before.comments, { repo, pr });
       await post(repo, pr, body);
-      const after = await readThread(repo, pr);
+      const after = await readThread(repo, pr, { despiteDesign: record.despiteDesign });
       if (countGrantedRoundExtensions(after.comments, { repo, pr }) !== count + by
         || !after.comments.some((c) => c.body === body && countGrantedRoundExtensions([c], { repo, pr }) === by)) {
         throw new Error('could not prove the posted round extension increased the trusted grant count');
