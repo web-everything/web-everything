@@ -7,7 +7,7 @@ import { resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { promisify } from 'node:util';
 import { spawnSync } from 'node:child_process';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { activateTrace, createTracer, startTrace, mergeTraces, compareCoverage } from '../dep-trace.mjs';
 import { initialize, load } from '../dep-trace-loader.mjs';
@@ -15,9 +15,10 @@ import { runTraceCoverage } from '../../readiness/trace-coverage.mjs';
 
 const root = process.cwd();
 const test = 'fake.test.mjs';
+const hookUrl = pathToFileURL(resolve(root, 'scripts/ci/dep-trace.mjs')).href;
 function fixture(extra = {}) {
   const record = vi.fn();
-  const env = { WE_TRACE_TEST: test, WE_TRACE_DIR: 'artifacts', NODE_OPTIONS: '--conditions=original' };
+  const env = { WE_TRACE_TEST: test, WE_TRACE_DIR: 'artifacts', NODE_OPTIONS: `--conditions=original --import=${JSON.stringify(hookUrl)}` };
   const fs = Object.fromEntries(['readFileSync', 'readFile', 'readdirSync', 'existsSync'].map(name => [name, vi.fn(() => 'result')]));
   fs.statSync = vi.fn(file => {
     if (!file.endsWith('script.mjs')) throw new Error('missing');
@@ -31,16 +32,50 @@ function fixture(extra = {}) {
 }
 
 describe('shadow dependency tracer', () => {
-  function tracedChild(source) {
+  /**
+   * Runs `source` under `node -e`; traced runs activate through NODE_OPTIONS, as documented.
+   * The suite's own test-cache tracer would otherwise rewrite these children's env; load its no-op mode explicitly.
+   */
+  function runChild(source, { traced = true, nodeOptions = '' } = {}) {
     const dir = mkdtempSync(resolve(tmpdir(), 'dep-trace-'));
+    const base = `--import ${pathToFileURL(resolve(root, 'scripts/test-cache/child-tracer.mjs')).href} ${nodeOptions}`.trim();
+    const env = { ...process.env, WE_TRACE_FILE: '', NODE_OPTIONS: base };
+    for (const key of ['WE_TRACE_TEST', 'WE_TRACE_DIR', 'WE_CI_SELECTION']) delete env[key];
+    if (traced) Object.assign(env, { NODE_OPTIONS: `${base} --import=${JSON.stringify(hookUrl)}`,
+      WE_TRACE_TEST: test, WE_TRACE_DIR: dir, WE_CI_SELECTION: JSON.stringify({ trace: { enabled: true } }) });
     try {
-      return spawnSync(process.execPath, ['--import', pathToFileURL(resolve(root, 'scripts/ci/dep-trace.mjs')).href, '-e', source], {
-        env: { ...process.env, NODE_OPTIONS: '', WE_TRACE_TEST: test, WE_TRACE_DIR: dir,
-          WE_CI_SELECTION: JSON.stringify({ trace: { enabled: true } }) },
-        encoding: 'utf8', timeout: 10000, maxBuffer: 1024 * 1024,
-      });
+      const result = spawnSync(process.execPath, ['-e', source], { env, encoding: 'utf8', timeout: 10000, maxBuffer: 1024 * 1024 });
+      const file = resolve(dir, `trace-${result.pid}.json`);
+      return { result, parent: traced && existsSync(file) ? JSON.parse(readFileSync(file, 'utf8')) : null };
     } finally { rmSync(dir, { recursive: true, force: true }); }
   }
+  const tracedChild = source => runChild(source).result;
+  it('runs an env:{} child of a NODE_OPTIONS=--input-type=module parent unchanged and reports incomplete', () => {
+    const { result, parent } = runChild(`
+      import { spawnSync } from 'node:child_process';
+      const child = spawnSync(process.execPath, ['-e', 'require("node:fs"); process.stdout.write("cjs-ok")'], { env: {}, encoding: 'utf8' });
+      process.stdout.write(JSON.stringify({ status: child.status, stdout: child.stdout }));
+      process.exitCode = child.status;
+    `, { nodeOptions: '--input-type=module' });
+    expect(result.status, result.stderr).toBe(0);
+    expect(JSON.parse(result.stdout)).toEqual({ status: 0, stdout: 'cjs-ok' });
+    expect(parent).toMatchObject({ test, incomplete: true });
+  });
+  it.each([
+    ['frozen options', `cp.spawnSync(process.execPath, ['-e', 'process.stdout.write("ok")'], Object.freeze({ encoding: 'utf8' })).stdout`, false],
+    ['Buffer cwd', `cp.spawnSync(process.execPath, ['-e', 'process.stdout.write(process.cwd())'], { cwd: Buffer.from(os.tmpdir()), encoding: 'utf8' }).stdout`, false],
+    ['env:{}', `cp.spawnSync(process.execPath, ['-e', 'process.stdout.write(JSON.stringify(Object.keys(process.env).filter(k => /^(WE_|NODE_OPTIONS$)/.test(k))))'], { env: {}, encoding: 'utf8' }).stdout`, true],
+    ['promisify', `(await util.promisify(cp.execFile)(process.execPath, ['-e', 'process.stdout.write("ok")'])).stdout`, false],
+  ])('a traced %s child exits and prints exactly as an untraced one', (_label, expression, incomplete) => {
+    const source = `const cp = require('node:child_process'), os = require('node:os'), util = require('node:util');
+      (async () => { process.stdout.write(String(${expression})); })().catch(e => { process.stderr.write(String(e)); process.exitCode = 1; });`;
+    const plain = runChild(source, { traced: false }).result;
+    const { result, parent } = runChild(source);
+    expect(plain.status, plain.stderr).toBe(0);
+    expect({ status: result.status, signal: result.signal, stdout: result.stdout })
+      .toEqual({ status: plain.status, signal: plain.signal, stdout: plain.stdout });
+    expect(parent).toMatchObject({ test, incomplete });
+  });
   it.each([1, 2])('preserves a real traced child synchronous 65536-byte write to captured fd %s', fd => {
     const result = tracedChild(`require('node:fs').writeFileSync(${fd}, Buffer.alloc(65536, 'x'))`);
     expect(result.error).toBeUndefined();
@@ -58,20 +93,51 @@ describe('shadow dependency tracer', () => {
     expect(result.status, result.stderr).toBe(0);
     expect(result.stdout).toBe('ok');
   });
-  it.each(['spawn', 'spawnSync', 'execFile', 'execFileSync', 'fork'])('%s preserves frozen option descriptors and inherited cwd', name => {
+  it.each(['spawn', 'spawnSync', 'execFile', 'execFileSync', 'fork'])('%s passes frozen options with an inherited cwd through untouched', name => {
     const f = fixture();
     const options = Object.freeze(Object.create({ cwd: 'scripts' }, {
       encoding: { value: 'utf8', enumerable: true },
       env: { value: Object.freeze({ CUSTOM: 'yes' }), enumerable: false },
     }));
-    expect(f.child_process[name]('node', ['script.mjs'], options)).toBe('child');
-    const passed = f.originals[name].mock.calls[0][2];
-    expect(Object.getOwnPropertyDescriptor(passed, 'encoding')).toEqual(Object.getOwnPropertyDescriptor(options, 'encoding'));
-    expect(passed.cwd).toBe('scripts');
-    expect(passed.env).toMatchObject({ CUSTOM: 'yes', WE_TRACE_TEST: test });
-    expect(options.env).toEqual({ CUSTOM: 'yes' });
-    expect(f.tracer.snapshot().edges).toEqual([{ file: 'scripts/script.mjs', kind: 'spawn' }]);
+    const args = ['script.mjs'];
+    expect(f.child_process[name]('node', args, options)).toBe('child');
+    const passed = f.originals[name].mock.calls[0];
+    expect(passed).toHaveLength(3);
+    expect(passed[1]).toBe(args);
+    expect(passed[2]).toBe(options);
+    expect(f.tracer.snapshot()).toMatchObject({ incomplete: true, edges: [{ file: 'scripts/script.mjs', kind: 'spawn' }] });
   });
+  const shapes = () => {
+    const cb = () => {};
+    return [
+      ['command only', ['node']],
+      ['args only', ['node', ['script.mjs']]],
+      ['undefined args then options', ['node', undefined, { cwd: '/' }, cb]],
+      ['null args then options', ['node', null, { env: { ONLY: 'x' } }]],
+      ['null options placeholder', ['node', [], null, cb]],
+      ['undefined options placeholder', ['node', [], undefined, cb]],
+      ['callback in the args slot', ['script.mjs', cb]],
+      ['options in the args slot', ['script.mjs', { cwd: root }]],
+      ['env:{}', ['node', [], { env: {} }]],
+      ['numeric NODE_OPTIONS', ['node', [], { env: { NODE_OPTIONS: 7 } }]],
+      ['Symbol NODE_OPTIONS', ['node', [], { env: { NODE_OPTIONS: Symbol('opts') } }]],
+      ['Buffer cwd', ['node', ['script.mjs'], { cwd: Buffer.from(resolve(root, 'scripts')) }]],
+      ['number cwd', ['node', ['script.mjs'], { cwd: 7 }]],
+      ['throwing env getter', ['node', [], { get env() { throw new Error('getter'); } }]],
+    ];
+  };
+  it.each(['spawn', 'spawnSync', 'execFile', 'execFileSync', 'fork'].flatMap(name => shapes().map(([label, args]) => [name, label, args])))(
+    '%s hands Node the exact caller arguments: %s', (name, _label, args) => {
+      const f = fixture();
+      const receiver = { marker: true };
+      let seen;
+      f.originals[name].mockImplementation(function () { seen = this; return 'child'; });
+      expect(Reflect.apply(f.child_process[name], receiver, args)).toBe('child');
+      const passed = f.originals[name].mock.calls[0];
+      expect(passed).toHaveLength(args.length);
+      passed.forEach((value, i) => expect(value).toBe(args[i]));
+      expect(seen).toBe(receiver);
+    });
   it.each(['working', 'missing', 'throws'])('restores blocking streams after loader registration with %s stdout handle', mode => {
     const order = [];
     const stdout = mode === 'missing' ? {} : { _handle: { setBlocking(value) {
@@ -121,31 +187,62 @@ describe('shadow dependency tracer', () => {
     if (cap === null) expect(activate).not.toHaveBeenCalled();
     else expect(activate).toHaveBeenCalledWith(env, { enabled: true, maxEdgesPerTest: cap });
   });
-  it('records BOTH a started script and its JSON read in a fake child', () => {
+  it('records BOTH a started script and its JSON read in a child that inherits the trace env', () => {
     const parent = fixture();
     parent.child_process.spawn('node', ['script.mjs']);
-    const options = parent.originals.spawn.mock.calls[0][2];
-    const child = fixture({ env: options.env });
+    expect(parent.originals.spawn.mock.calls[0]).toEqual(['node', ['script.mjs']]);
+    const child = fixture();
     child.fs.readFileSync('settings.json', 'utf8');
     expect(mergeTraces([parent.tracer.snapshot(), child.tracer.snapshot()])).toEqual({
-      [test]: { 'script.mjs': ['spawn'], 'settings.json': ['read'] },
+      tests: { [test]: { 'script.mjs': ['spawn'], 'settings.json': ['read'] } }, incomplete: [],
     });
-    expect(options.env.NODE_OPTIONS).toContain('--conditions=original');
-    expect(options.env.NODE_OPTIONS).toContain('--import=');
-    expect(options.env.WE_TRACE_TEST).toBe(test);
   });
-  it.each(['spawn', 'spawnSync', 'execFile', 'execFileSync', 'fork'])('patches %s, keeps callbacks and custom env, resolves child cwd', name => {
+  it.each(['spawn', 'spawnSync', 'execFile', 'execFileSync', 'fork'])('%s records the spawn edge against the child cwd', name => {
     const f = fixture();
-    const callback = vi.fn();
-    const opts = { cwd: 'scripts', env: { NODE_OPTIONS: '--conditions=child', CUSTOM: 'yes' } };
-    expect(f.child_process[name]('node', ['script.mjs', 'missing.json'], opts, callback)).toBe('child');
-    const call = f.originals[name].mock.calls[0];
-    expect(call[2]).toMatchObject({ cwd: 'scripts', env: { CUSTOM: 'yes', WE_TRACE_TEST: test } });
-    expect(call[2].env.NODE_OPTIONS).toContain('--conditions=child');
-    expect(call[2].env.WE_TRACE_DIR).toBe(resolve(root, f.env.WE_TRACE_DIR));
-    expect(resolve(root, opts.cwd, call[2].env.WE_TRACE_DIR)).toBe(resolve(root, f.env.WE_TRACE_DIR));
-    expect(call[3]).toBe(callback);
+    f.child_process[name]('node', ['script.mjs', 'missing.json'], { cwd: 'scripts' }, vi.fn());
     expect(f.tracer.snapshot().edges).toEqual([{ file: 'scripts/script.mjs', kind: 'spawn' }]);
+  });
+  const traceEnv = (extra = {}) => ({ WE_TRACE_TEST: test, WE_TRACE_DIR: resolve(root, 'artifacts'),
+    NODE_OPTIONS: `--import=${JSON.stringify(hookUrl)}`, ...extra });
+  it.each([
+    ['inherited process env', undefined, false],
+    ['falsy env falls back to process env', { env: false }, false],
+    ['explicit env carrying the hook', { env: traceEnv() }, false],
+    ['hook as a separate --import word', { env: traceEnv({ NODE_OPTIONS: `--conditions=x --import ${hookUrl}` }) }, false],
+    ['hook as a quoted file path', { env: traceEnv({ NODE_OPTIONS: `--import="${resolve(root, 'scripts/ci/dep-trace.mjs')}"` }) }, false],
+    ['inherited (prototype) env keys', { env: Object.create(traceEnv()) }, false],
+    ['relative trace dir under the same cwd', { env: traceEnv({ WE_TRACE_DIR: 'artifacts' }) }, false],
+    ['env:{}', { env: {} }, true],
+    ['env without the hook', { env: traceEnv({ NODE_OPTIONS: '--conditions=x' }) }, true],
+    ['hook only named, not imported', { env: traceEnv({ NODE_OPTIONS: `--require=${hookUrl}` }) }, true],
+    ['hook inside a quoted other value', { env: traceEnv({ NODE_OPTIONS: `--title="--import=${hookUrl}"` }) }, true],
+    ['numeric NODE_OPTIONS', { env: traceEnv({ NODE_OPTIONS: 7 }) }, true],
+    ['Symbol NODE_OPTIONS', { env: traceEnv({ NODE_OPTIONS: Symbol('opts') }) }, true],
+    ['missing test identity', { env: traceEnv({ WE_TRACE_TEST: undefined }) }, true],
+    ['other test identity', { env: traceEnv({ WE_TRACE_TEST: 'other.test.mjs' }) }, true],
+    ['missing trace dir', { env: traceEnv({ WE_TRACE_DIR: undefined }) }, true],
+    ['relative trace dir under another cwd', { cwd: 'scripts', env: traceEnv({ WE_TRACE_DIR: 'artifacts' }) }, true],
+    ['other settings override', { env: traceEnv({ WE_CI_SELECTION: '{"trace":{"enabled":false}}' }) }, true],
+    ['non-enumerable test identity', { env: Object.defineProperty(traceEnv({ WE_TRACE_TEST: undefined }), 'WE_TRACE_TEST', { value: test, enumerable: false }) }, true],
+    ['throwing env getter', { get env() { throw new Error('getter'); } }, true],
+  ])('flags incomplete evidence from the child real env: %s', (_label, options, incomplete) => {
+    const f = fixture();
+    f.child_process.spawn('node', [], ...(options === undefined ? [] : [options]));
+    expect(f.tracer.snapshot().incomplete).toBe(incomplete);
+    expect(f.originals.spawn).toHaveBeenCalledTimes(1);
+  });
+  it('flags a child that inherits a process env whose trace identity setup removed', () => {
+    const f = fixture();
+    delete f.env.WE_TRACE_TEST;
+    f.child_process.spawnSync('node', ['-e', '0']);
+    expect(f.originals.spawnSync.mock.calls[0]).toEqual(['node', ['-e', '0']]);
+    expect(f.tracer.snapshot().incomplete).toBe(true);
+  });
+  it('flags incomplete when the working directory is gone and the child trace dir is relative', () => {
+    const f = fixture();
+    const gone = vi.spyOn(process, 'cwd').mockImplementation(() => { throw Object.assign(new Error('uv_cwd'), { code: 'ENOENT' }); });
+    try { f.child_process.spawn('node', [], { env: traceEnv({ WE_TRACE_DIR: 'artifacts' }) }); } finally { gone.mockRestore(); }
+    expect(f.tracer.snapshot().incomplete).toBe(true);
   });
   it.each(['spawn', 'spawnSync', 'execFile', 'execFileSync', 'fork'].flatMap(name => [
     ['Buffer', () => Buffer.from(resolve(root, 'scripts'))],
@@ -166,9 +263,7 @@ describe('shadow dependency tracer', () => {
     const f = fixture();
     expect(() => f.child_process[name]('node', ['script.mjs'], options)).not.toThrow();
     expect(f.originals[name]).toHaveBeenCalledTimes(1);
-    const passed = f.originals[name].mock.calls[0][2];
-    expect(typeof passed.env.NODE_OPTIONS).toBe('string');
-    expect(passed.env.WE_TRACE_TEST).toBe(test);
+    expect(f.originals[name].mock.calls[0][2]).toBe(options);
   });
   it('never throws when the working directory was deleted; absolute paths still trace', async () => {
     const f = fixture();
@@ -199,13 +294,6 @@ describe('shadow dependency tracer', () => {
     expect(f.originals[name].mock.calls[0][2].cwd).toBe('scripts');
     expect(f.tracer.snapshot().edges).toEqual([{ file: 'scripts/script.mjs', kind: 'spawn' }]);
   });
-  it.each(['spawn', 'spawnSync', 'execFile', 'execFileSync', 'fork'])('%s keeps inherited env keys and falls back on a falsy env like Node', name => {
-    const f = fixture({ env: { WE_TRACE_TEST: test, WE_TRACE_DIR: 'artifacts', NODE_OPTIONS: '--conditions=original', PROBE_PARENT: 'parent-value' } });
-    f.child_process[name]('node', [], { env: Object.create({ FOO_PROBE: 'inherited' }) });
-    expect(f.originals[name].mock.calls[0][2].env).toMatchObject({ FOO_PROBE: 'inherited', WE_TRACE_TEST: test });
-    f.child_process[name]('node', [], { env: false });
-    expect(f.originals[name].mock.calls[1][2].env).toMatchObject({ PROBE_PARENT: 'parent-value', WE_TRACE_TEST: test });
-  });
   it('resolves URL commands like the path normalizer, and ignores legacy url.parse objects Node rejects', async () => {
     const { parse } = await import('node:url');
     const f = fixture();
@@ -213,48 +301,19 @@ describe('shadow dependency tracer', () => {
     f.fs.readFileSync(parse(pathToFileURL(resolve(root, 'package.json')).href));
     expect(f.tracer.snapshot().edges).toEqual([{ file: 'scripts/script.mjs', kind: 'spawn' }]);
   });
-  it('leaves a Symbol NODE_OPTIONS for Node to reject', () => {
+  it('options in the args slot still resolve the spawn cwd (fork overload)', () => {
     const f = fixture();
-    const symbol = Symbol('opts');
-    f.child_process.spawn('node', [], { env: { NODE_OPTIONS: symbol } });
-    expect(f.originals.spawn.mock.calls[0][2].env.NODE_OPTIONS).toBe(symbol);
+    f.child_process.fork('script.mjs', { cwd: resolve(root, 'scripts') });
+    expect(f.tracer.snapshot().edges).toEqual([{ file: 'scripts/script.mjs', kind: 'spawn' }]);
   });
-  it('preserves execFile callback overload and fork options overload', () => {
-    const f = fixture();
-    const callback = vi.fn();
-    f.child_process.execFile('script.mjs', callback);
-    expect(f.originals.execFile.mock.calls[0][2]).toBe(callback);
-    f.child_process.fork('script.mjs', { cwd: root });
-    expect(f.originals.fork.mock.calls[0][1].cwd).toBe(root);
-  });
-  it.each(['spawn', 'spawnSync', 'execFile', 'execFileSync', 'fork'].flatMap(name => [undefined, null].map(args => [name, args])))('preserves %s options after an explicit %s args list', (name, args) => {
-    const f = fixture();
-    const callback = vi.fn();
-    const options = { cwd: '/', env: { ONLY: 'x' }, input: 'console.log(process.cwd(),process.env.ONLY)', encoding: 'utf8' };
-    f.child_process[name]('node', args, options, callback);
-    expect(f.originals[name].mock.calls[0]).toEqual(['node', [], {
-      ...options, env: expect.objectContaining({ ONLY: 'x', WE_TRACE_TEST: test }),
-    }, callback]);
-    expect(options.env).toEqual({ ONLY: 'x' });
-  });
-  it.each([undefined, null])('preserves execFile callbacks after an explicit %s options placeholder', options => {
-    const f = fixture();
-    const callback = vi.fn();
-    f.child_process.execFile('node', [], options, callback);
-    expect(f.originals.execFile.mock.calls[0]).toEqual(['node', [], expect.objectContaining({ env: expect.any(Object) }), callback]);
-  });
-  it('retains captured trace configuration after environment cleanup and cwd changes', () => {
-    const f = fixture();
-    delete f.env.WE_TRACE_TEST;
-    delete f.env.WE_TRACE_DIR;
-    f.env.CUSTOM = 'current';
-    const cwd = vi.spyOn(process, 'cwd').mockReturnValue('/');
-    try {
-      expect(f.child_process.spawnSync('node', ['-e', '0'])).toBe('child');
-      expect(f.originals.spawnSync.mock.calls[0][2].env).toMatchObject({
-        WE_TRACE_TEST: test, WE_TRACE_DIR: resolve(root, 'artifacts'), CUSTOM: 'current',
-      });
-    } finally { cwd.mockRestore(); }
+  it('activation leaves NODE_OPTIONS and the rest of the environment untouched', () => {
+    const env = { WE_TRACE_TEST: test, WE_TRACE_DIR: 'artifacts', NODE_OPTIONS: '--conditions=x' };
+    const before = { ...env };
+    activateTrace(env, { maxEdgesPerTest: 5000 }, {
+      fs: {}, child_process: {}, process: { once: vi.fn() }, register: vi.fn(), syncBuiltinESMExports: vi.fn(),
+      MessageChannel: class { constructor() { this.port1 = { on: vi.fn(), unref: vi.fn() }; this.port2 = {}; } },
+    });
+    expect(env).toEqual(before);
   });
   it('persists evidence after setup removes the trace environment and changes cwd', () => {
     const env = { WE_TRACE_TEST: test, WE_TRACE_DIR: 'artifacts' };
@@ -270,18 +329,26 @@ describe('shadow dependency tracer', () => {
     try { runtime.once.mock.calls[0][1](); } finally { cwd.mockRestore(); }
     expect(io.mkdirSync).toHaveBeenCalledWith(resolve(root, 'artifacts'), { recursive: true });
     expect(io.writeFileSync).toHaveBeenCalledWith(resolve(root, 'artifacts/trace-123.json'),
-      JSON.stringify({ test, truncated: false, edges: [] }));
+      JSON.stringify({ test, truncated: false, incomplete: false, edges: [] }));
   });
-  it('preserves execFile util.promisify.custom contract and still injects the trace env', async () => {
+  it('preserves execFile util.promisify.custom contract with untouched arguments, and still observes the child', async () => {
     const custom = vi.fn(async () => ({ stdout: 'ok', stderr: 'err' }));
     const cp = Object.fromEntries(['spawn', 'spawnSync', 'execFile', 'execFileSync', 'fork'].map(name => [name, vi.fn(() => 'child')]));
     Object.defineProperty(cp.execFile, promisify.custom, { value: custom });
-    const tracer = createTracer({ test, root, record: vi.fn(), env: { WE_TRACE_TEST: test, WE_TRACE_DIR: 'artifacts' }, fs: {}, child_process: cp });
+    const env = { WE_TRACE_TEST: test, WE_TRACE_DIR: 'artifacts', NODE_OPTIONS: `--import=${hookUrl}` };
+    const tracer = createTracer({ test, root, record: vi.fn(), env, fs: {}, child_process: cp });
     tracer.install();
-    await expect(promisify(cp.execFile)('node', ['-e', '1'])).resolves.toEqual({ stdout: 'ok', stderr: 'err' });
-    expect(custom.mock.calls[0][2].env.WE_TRACE_TEST).toBe(test);
-    await expect(promisify(cp.execFile)('node', undefined, { cwd: '/', encoding: 'utf8' })).resolves.toEqual({ stdout: 'ok', stderr: 'err' });
-    expect(custom.mock.calls[1]).toEqual(['node', [], expect.objectContaining({ cwd: '/', encoding: 'utf8', env: expect.any(Object) })]);
+    const args = ['-e', '1'];
+    await expect(promisify(cp.execFile)('node', args)).resolves.toEqual({ stdout: 'ok', stderr: 'err' });
+    expect(custom.mock.calls[0]).toHaveLength(2);
+    expect(custom.mock.calls[0][1]).toBe(args);
+    expect(tracer.incomplete).toBe(false);
+    const options = { cwd: '/', encoding: 'utf8', env: {} };
+    await expect(promisify(cp.execFile)('node', undefined, options)).resolves.toEqual({ stdout: 'ok', stderr: 'err' });
+    expect(custom.mock.calls[1]).toHaveLength(3);
+    expect(custom.mock.calls[1][1]).toBeUndefined();
+    expect(custom.mock.calls[1][2]).toBe(options);
+    expect(tracer.incomplete).toBe(true);
   });
   it('records fs/promises reads and lists', async () => {
     const promises = { readFile: vi.fn(async () => 'x'), readdir: vi.fn(async () => []) };
@@ -319,7 +386,7 @@ describe('shadow dependency tracer', () => {
     expect(f.tracer.truncated).toBe(true);
     expect(warn).toHaveBeenCalledTimes(1);
     expect(warn).toHaveBeenCalledWith(expect.stringContaining('rerun with a larger'));
-    expect(mergeTraces([f.tracer.snapshot()])).toEqual({}); // capped evidence stays unknown
+    expect(mergeTraces([f.tracer.snapshot()])).toEqual({ tests: {}, incomplete: [] }); // capped evidence stays unknown
     const zero = fixture({ maxEdgesPerTest: 0 });
     zero.tracer.add('a', 'read');
     expect(zero.record).not.toHaveBeenCalled();
@@ -367,25 +434,51 @@ describe('shadow dependency tracer', () => {
     runtime.once.mock.calls[0][1]();
     expect(io.writeFileSync).toHaveBeenCalledTimes(1);
     expect(io.writeFileSync.mock.calls[0][0]).toBe(resolve(root, 'artifacts/trace-123.json'));
-    expect(JSON.parse(io.writeFileSync.mock.calls[0][1])).toEqual({ test, truncated: false, edges: [{ file: 'pending.mjs', kind: 'load' }] });
+    expect(JSON.parse(io.writeFileSync.mock.calls[0][1])).toEqual({ test, truncated: false, incomplete: false, edges: [{ file: 'pending.mjs', kind: 'load' }] });
     expect(queue).toHaveLength(0);
   });
   it('merges deterministically and compares direct reachability against static, retaining unknowns', () => {
-    const traces = [{ test: 'z', edges: [{ file: 'b', kind: 'read' }, { file: 'b', kind: 'load' }] },
-      { test: 'a', edges: [] }, { test: 'z', edges: [{ file: 'b', kind: 'read' }, { file: 'a', kind: 'spawn' }] }];
+    const traces = [{ test: 'z', incomplete: false, edges: [{ file: 'b', kind: 'read' }, { file: 'b', kind: 'load' }] },
+      { test: 'a', incomplete: false, edges: [] }, { test: 'z', incomplete: false, edges: [{ file: 'b', kind: 'read' }, { file: 'a', kind: 'spawn' }] }];
     const traceMap = mergeTraces(traces);
-    expect(JSON.stringify(traceMap)).toBe('{"a":{},"z":{"a":["spawn"],"b":["load","read"]}}');
+    expect(JSON.stringify(traceMap)).toBe('{"tests":{"a":{},"z":{"a":["spawn"],"b":["load","read"]}},"incomplete":[]}');
     expect(mergeTraces([...traces].reverse())).toEqual(traceMap);
     const misses = [{ test: 'z', changed: 'b' }, { test: 'a', changed: 'b' }, { test: 'unknown', changed: 'b' }];
-    expect(compareCoverage({ misses, traceMap, staticSelected: ['a'] })).toEqual({ results: [
-      { test: 'z', changed: 'b', static: false, traced: true, traceKnown: true },
-      { test: 'a', changed: 'b', static: true, traced: false, traceKnown: true },
-      { test: 'unknown', changed: 'b', static: false, traced: false, traceKnown: false },
-    ], counts: { total: 3, static: 1, traced: 1, additional: 1, unknown: 1 } });
+    expect(compareCoverage({ misses, traceMap, staticSelected: ['a'] })).toEqual({ incomplete: false, results: [
+      { test: 'z', changed: 'b', static: false, traced: true, traceKnown: true, incomplete: false },
+      { test: 'a', changed: 'b', static: true, traced: false, traceKnown: true, incomplete: false },
+      { test: 'unknown', changed: 'b', static: false, traced: false, traceKnown: false, incomplete: false },
+    ], counts: { total: 3, static: 1, traced: 1, additional: 1, unknown: 1, incomplete: 0 } });
+  });
+  it('keeps observed edges of incomplete evidence but never reports their absence as untraced', () => {
+    const traceMap = mergeTraces([
+      { test: 'p', incomplete: false, edges: [{ file: 'x', kind: 'read' }] },
+      { test: 'p', incomplete: true, edges: [{ file: 'y', kind: 'read' }] },
+      { test: 'legacy', edges: [] }, // written without the flag: completeness unknown, so incomplete
+      { test: 'capped', truncated: true, incomplete: true, edges: [] },
+    ]);
+    expect(traceMap).toEqual({ tests: { legacy: {}, p: { x: ['read'], y: ['read'] } }, incomplete: ['legacy', 'p'] });
+    const summary = compareCoverage({ traceMap, staticSelected: [], misses: [{ test: 'p', changed: 'x' },
+      { test: 'p', changed: 'z' }, { test: 'legacy', changed: 'z' }, { test: 'capped', changed: 'z' }] });
+    expect(summary.incomplete).toBe(true);
+    expect(summary.results.map(r => [r.traced, r.incomplete, r.traceKnown]))
+      .toEqual([[true, true, true], [null, true, true], [null, true, true], [false, false, false]]);
+    expect(summary.counts).toMatchObject({ traced: 1, additional: 1, unknown: 1, incomplete: 3 });
+  });
+  it('CLI prints the incomplete flag and warns when results rest on incomplete evidence', () => {
+    const print = vi.fn();
+    const warn = vi.fn();
+    const files = { map: JSON.stringify({ tests: { t: {} }, incomplete: ['t'] }), misses: JSON.stringify([{ test: 't', changed: 'c' }]) };
+    runTraceCoverage(['map', 'misses'], { readFile: file => files[file], print, warn });
+    expect(JSON.parse(print.mock.calls[0][0])).toMatchObject({ incomplete: true, counts: { incomplete: 1 } });
+    expect(warn).toHaveBeenCalledWith(expect.stringContaining('incomplete evidence for 1 result(s)'));
+    const clean = vi.fn();
+    runTraceCoverage(['map', 'misses'], { readFile: file => (file === 'map' ? '{"tests":{"t":{}},"incomplete":[]}' : files[file]), print, warn: clean });
+    expect(clean).not.toHaveBeenCalled();
   });
   it('CLI uses injected evidence, prints summary and rejects unreadable/malformed input', () => {
     const print = vi.fn();
-    const readFile = file => ({ map: '{}', misses: '[]', static: '[]' })[file];
+    const readFile = file => ({ map: '{"tests":{},"incomplete":[]}', misses: '[]', static: '[]' })[file];
     expect(runTraceCoverage(['map', 'misses', 'static'], { readFile, print }).counts.total).toBe(0);
     expect(print).toHaveBeenCalledTimes(1);
     expect(print).toHaveBeenCalledWith(expect.stringContaining('"total":0'));
@@ -394,7 +487,7 @@ describe('shadow dependency tracer', () => {
     expect(() => runTraceCoverage(['map', 'misses'], { readFile: () => { throw new Error('unreadable'); }, print })).toThrow('unreadable');
   });
   it('labels omitted static evidence unknown without claiming additional coverage', () => {
-    const evidence = { traceMap: { t: { data: ['read'] } }, misses: [{ test: 't', changed: 'data' }] };
+    const evidence = { traceMap: { tests: { t: { data: ['read'] } }, incomplete: [] }, misses: [{ test: 't', changed: 'data' }] };
     const summary = compareCoverage(evidence);
     expect(summary).toMatchObject({ staticEvidence: 'not supplied', results: [{ static: null, traced: true }],
       counts: { static: null, traced: 1, additional: null } });
@@ -406,9 +499,12 @@ describe('shadow dependency tracer', () => {
     expect(compareCoverage({ ...evidence, staticSelected: new Set(['t']) }).counts).toMatchObject({ static: 1, additional: 0 });
   });
   it('rejects incomplete evidence shapes instead of reporting a clear replay', () => {
-    for (const evidence of [{ misses: {} }, { traceMap: [] }, { traceMap: { t: { a: [] } } },
-      { traceMap: { t: { a: ['unknown'] } } }, { misses: [{ test: 't' }] }, { staticSelected: 't' }, { staticSelected: null }]) {
-      expect(() => compareCoverage({ misses: [], traceMap: {}, ...evidence })).toThrow('invalid coverage evidence');
+    const map = (tests, incomplete = []) => ({ traceMap: { tests, incomplete } });
+    for (const evidence of [{ misses: {} }, { traceMap: [] }, { traceMap: {} }, map({ t: { a: [] } }),
+      map({ t: { a: ['unknown'] } }), { misses: [{ test: 't' }] }, { staticSelected: 't' }, { staticSelected: null },
+      { traceMap: { t: { a: ['read'] } } }, // legacy plain map: completeness unknown
+      { traceMap: { tests: {} } }, map({}, 'p'), map({ p: {} }, [7]), map({}, ['p'])]) {
+      expect(() => compareCoverage({ misses: [], traceMap: { tests: {}, incomplete: [] }, ...evidence })).toThrow('invalid coverage evidence');
     }
   });
 });

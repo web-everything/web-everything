@@ -3,7 +3,8 @@
  * @description Shadow dependency evidence only; never selects tests.
  * Set WE_TRACE_TEST=repo/test.mjs WE_TRACE_DIR=artifact-directory and append
  * ` --import="file:///absolute/repo/scripts/ci/dep-trace.mjs"` to existing NODE_OPTIONS.
- * Children inherit the hook, test identity and output directory, including with an explicit env.
+ * Observe-only: child_process calls and the environment are never rewritten. A child whose real env lacks
+ * the hook, test identity, directory or settings marks the evidence `incomplete`.
  * Edge caps emit an incomplete-evidence warning: rerun with a larger cap before using coverage.
  */
 import fs from 'node:fs';
@@ -21,12 +22,9 @@ const defaults = { enabled: true, maxEdgesPerTest: 5000 };
 /** Pure construction: only install() mutates the injected objects; record receives unique edges. */
 export function createTracer({ test, root, record = () => {}, fs: io = {}, child_process: cp = {},
   env = {}, maxEdgesPerTest = 5000, warn = () => {} }) {
-  // Test setup may scrub process.env; trace identity and destination belong to activation.
-  // Keep ordinary inherited environment values live, but resolve the destination before chdir.
-  const traceEnv = { WE_TRACE_TEST: env.WE_TRACE_TEST,
-    WE_TRACE_DIR: env.WE_TRACE_DIR === undefined ? undefined : resolve(env.WE_TRACE_DIR) };
-  if (env.WE_CI_SELECTION !== undefined) traceEnv.WE_CI_SELECTION = env.WE_CI_SELECTION;
-  const initialNodeOptions = env.NODE_OPTIONS;
+  // What a child must match to trace into this evidence; resolved at activation, before any chdir.
+  const captured = { WE_CI_SELECTION: env.WE_CI_SELECTION === undefined ? undefined : `${env.WE_CI_SELECTION}`,
+    WE_TRACE_DIR: env.WE_TRACE_DIR === undefined ? undefined : resolve(`${env.WE_TRACE_DIR}`) };
   const edges = new Map();
   const exists = io.statSync?.bind(io);
   function path(value, cwd = root) {
@@ -54,7 +52,8 @@ export function createTracer({ test, root, record = () => {}, fs: io = {}, child
     edges.set(key, edge);
     record(edge);
   }
-  const tracer = { add, truncated: false, snapshot: () => ({ test, truncated: tracer.truncated, edges: [...edges.values()].sort((a, b) =>
+  const tracer = { add, truncated: false, incomplete: false, snapshot: () => ({ test, truncated: tracer.truncated,
+    incomplete: tracer.incomplete, edges: [...edges.values()].sort((a, b) =>
     a.file.localeCompare(b.file) || a.kind.localeCompare(b.kind)) }), install() {
     for (const [name, kind] of Object.entries({ readFileSync: 'read', readFile: 'read', readdirSync: 'list', existsSync: 'read' })) {
       const original = io[name];
@@ -71,50 +70,70 @@ export function createTracer({ test, root, record = () => {}, fs: io = {}, child
     for (const name of ['spawn', 'spawnSync', 'execFile', 'execFileSync', 'fork']) {
       const original = cp[name];
       if (!original) continue;
-      const prepare = (command, args) => {
-        // Node accepts an explicit null/undefined args slot before options.
-        if (args.length && args[0] == null) args[0] = [];
-        const index = Array.isArray(args[0]) ? 1 : 0;
-        const hasOptions = args[index] && typeof args[index] === 'object';
-        const options = hasOptions ? args[index] : {};
-        // Tracing must never throw: resolve every cwd form Node accepts, and leave any other value for Node to judge.
-        let cwd = here();
-        try {
-          const given = options.cwd == null ? null : toPath(options.cwd);
-          if (given !== null) cwd = isAbsolute(given) ? resolve(given) : cwd === null ? null : resolve(cwd, given);
-        } catch { /* Node reports it */ }
-        for (const value of [command, ...(Array.isArray(args[0]) ? args[0] : [])]) {
-          // Stat the same normalized path the edge records (a URL command is a path too).
-          const name = path(value, cwd);
-          if (name === null) continue;
-          try { if (exists?.(resolve(root, name)).isFile()) add(value, 'spawn', cwd); } catch { /* not an existing script */ }
-        }
-        // Node falls back to process.env on a falsy env and walks it with for...in (inherited keys included).
-        const childEnv = {};
-        const baseEnv = options.env || env;
-        for (const key in baseEnv) childEnv[key] = baseEnv[key];
-        Object.assign(childEnv, traceEnv);
-        // Node stringifies env values; a non-string NODE_OPTIONS must not break the wrapper. Node rejects a Symbol itself.
-        const nodeOptions = childEnv.NODE_OPTIONS ?? env.NODE_OPTIONS ?? initialNodeOptions;
-        if (typeof nodeOptions !== 'symbol') childEnv.NODE_OPTIONS = inheritOptions(String(nodeOptions ?? ''));
-        // Node reads options through the prototype chain (an inherited or non-enumerable cwd); keep that view.
-        const wrapped = Object.create(options, {
-          ...Object.getOwnPropertyDescriptors(options),
-          env: { value: childEnv, enumerable: true, writable: true, configurable: true },
-        });
-        // Replace an options placeholder too, so a following callback keeps its position.
-        args.splice(index, hasOptions || (index < args.length && args[index] == null) ? 1 : 0, wrapped);
-        return [command, ...args];
-      };
-      cp[name] = function (command, ...args) { return Reflect.apply(original, this, prepare(command, args)); };
-      // Keep util.promisify's {stdout, stderr} contract: route the original custom promisifier through the same env injection.
+      // Observe-only: the caller's arguments reach Node unchanged (same values, same count, same receiver).
+      cp[name] = function (...args) { observe(args); return Reflect.apply(original, this, args); };
+      // Keep util.promisify's {stdout, stderr} contract: the original custom promisifier gets the same untouched arguments.
       const custom = original[promisify.custom];
       if (typeof custom === 'function') {
-        Object.defineProperty(cp[name], promisify.custom, { configurable: true, value: function (command, ...args) { return Reflect.apply(custom, this, prepare(command, args)); } });
+        Object.defineProperty(cp[name], promisify.custom, { configurable: true, value: function (...args) { observe(args); return Reflect.apply(custom, this, args); } });
       }
     }
   } };
+  /** Reads a child_process call without changing it: records the spawn edge and flags a child that will not trace. */
+  function observe([command, ...args]) {
+    try {
+      // Node takes options after an args array or an explicit null/undefined args slot; otherwise in the first slot.
+      const slot = Array.isArray(args[0]) || args[0] == null ? 1 : 0;
+      const options = args[slot] !== null && typeof args[slot] === 'object' ? args[slot] : {};
+      // Resolve every cwd form Node accepts; any other value is left for Node to judge.
+      let cwd = here();
+      try {
+        const given = options.cwd == null ? null : toPath(options.cwd);
+        if (given !== null) cwd = isAbsolute(given) ? resolve(given) : cwd === null ? null : resolve(cwd, given);
+      } catch { /* Node reports it */ }
+      for (const value of [command, ...(Array.isArray(args[0]) ? args[0] : [])]) {
+        // Stat the same normalized path the edge records (a URL command is a path too).
+        const name = path(value, cwd);
+        if (name === null) continue;
+        try { if (exists?.(resolve(root, name)).isFile()) add(value, 'spawn', cwd); } catch { /* not an existing script */ }
+      }
+      // The child's real env, as Node builds it: options.env, or process.env when falsy.
+      if (!childTraces(options.env || env, cwd)) markIncomplete();
+    } catch { markIncomplete(); }
+  }
+  /** True only when the child will run this hook with the same test identity, output directory and settings. */
+  function childTraces(childEnv, cwd) {
+    try {
+      // Node walks env with for...in (inherited enumerable keys included), skips undefined and stringifies the rest.
+      const seen = {};
+      for (const key in childEnv) { const value = childEnv[key]; if (value !== undefined) seen[key] = `${value}`; }
+      if (seen.WE_TRACE_TEST !== test || seen.WE_CI_SELECTION !== captured.WE_CI_SELECTION) return false;
+      if (seen.WE_TRACE_DIR === undefined || captured.WE_TRACE_DIR === undefined) return false;
+      if (!isAbsolute(seen.WE_TRACE_DIR) && cwd === null) return false;
+      if (resolve(cwd ?? root, seen.WE_TRACE_DIR) !== captured.WE_TRACE_DIR) return false;
+      return seen.NODE_OPTIONS !== undefined && importsHook(seen.NODE_OPTIONS);
+    } catch { return false; }
+  }
+  // Silent by design: a traced process must print exactly what an untraced one prints. The snapshot carries the flag.
+  function markIncomplete() { tracer.incomplete = true; }
   return tracer;
+}
+
+/** NODE_OPTIONS names this hook with --import, split as Node splits it (spaces; double quotes with backslash escapes). */
+function importsHook(options) {
+  const words = [];
+  let word = null, quoted = false;
+  for (let i = 0; i < options.length; i++) {
+    const char = options[i];
+    if (quoted && char === '\\' && i + 1 < options.length) { word = (word ?? '') + options[++i]; continue; }
+    if (char === '"') { quoted = !quoted; word ??= ''; continue; }
+    if (!quoted && /\s/.test(char)) { if (word !== null) words.push(word); word = null; continue; }
+    word = (word ?? '') + char;
+  }
+  if (word !== null) words.push(word);
+  const targets = new Set([hook, fileURLToPath(hook)]);
+  return words.some((value, i) => (value.startsWith('--import=') && targets.has(value.slice(9)))
+    || (value === '--import' && targets.has(words[i + 1])));
 }
 
 /**
@@ -136,17 +155,17 @@ function here() {
   try { return process.cwd(); } catch { return null; }
 }
 
-function inheritOptions(options = '') {
-  const flag = `--import=${JSON.stringify(hook)}`;
-  return options.includes(flag) ? options : `${options} ${flag}`.trim();
-}
-
-/** Sorted union of per-process evidence. Missing entries remain unknown, never proof of coverage. */
+/**
+ * Sorted union of per-process evidence: { tests: {test: {file: kinds}}, incomplete: [test] }.
+ * Missing entries remain unknown, never proof of coverage. A test whose evidence is incomplete (a process
+ * flagged it, or the flag is absent) keeps its observed edges, but an edge it lacks is not proof of absence.
+ */
 export function mergeTraces(traces) {
   const tests = new Map();
-  const incomplete = new Set(traces.filter(t => t.truncated).map(t => t.test));
+  const truncated = new Set(traces.filter(t => t.truncated).map(t => t.test));
+  const incomplete = new Set(traces.filter(t => !truncated.has(t.test) && t.incomplete !== false).map(t => t.test));
   for (const { test, edges } of traces) {
-    if (incomplete.has(test)) continue; // capped evidence is unknown, never a known trace
+    if (truncated.has(test)) continue; // capped evidence is unknown, never a known trace
     if (!tests.has(test)) tests.set(test, new Map());
     for (const { file, kind } of edges) {
       const files = tests.get(test);
@@ -154,26 +173,37 @@ export function mergeTraces(traces) {
       files.get(file).add(kind);
     }
   }
-  return Object.fromEntries([...tests].sort(([a], [b]) => a.localeCompare(b)).map(([test, files]) =>
-    [test, Object.fromEntries([...files].sort(([a], [b]) => a.localeCompare(b)).map(([file, kinds]) => [file, [...kinds].sort()]))]));
+  return { tests: Object.fromEntries([...tests].sort(([a], [b]) => a.localeCompare(b)).map(([test, files]) =>
+    [test, Object.fromEntries([...files].sort(([a], [b]) => a.localeCompare(b)).map(([file, kinds]) => [file, [...kinds].sort()]))])),
+  incomplete: [...incomplete].sort() };
 }
 
-/** staticSelected is an optional list/Set of test paths. Missing evidence is explicitly unknown. */
+/**
+ * staticSelected is an optional list/Set of test paths. Missing evidence is explicitly unknown, and an
+ * untraced result for a test with incomplete evidence is `traced: null` (unknown), never `false`.
+ */
 export function compareCoverage({ misses, traceMap, staticSelected }) {
   const staticKnown = staticSelected !== undefined;
   const object = v => v && typeof v === 'object' && !Array.isArray(v);
+  const tests = object(traceMap) ? traceMap.tests : undefined;
   if (!Array.isArray(misses) || misses.some(v => !object(v) || typeof v.test !== 'string' || typeof v.changed !== 'string')
-    || !object(traceMap) || Object.values(traceMap).some(files => !object(files) || Object.values(files).some(kinds =>
+    || !object(tests) || Object.values(tests).some(files => !object(files) || Object.values(files).some(kinds =>
       !Array.isArray(kinds) || !kinds.length || kinds.some(k => !['load', 'read', 'list', 'spawn'].includes(k))))
+    || !Array.isArray(traceMap.incomplete) || traceMap.incomplete.some(t => typeof t !== 'string' || !Object.hasOwn(tests, t))
     || (staticKnown && (!(Array.isArray(staticSelected) || staticSelected instanceof Set) || [...staticSelected].some(v => typeof v !== 'string'))))
     throw new Error('invalid coverage evidence');
   const selected = new Set(staticSelected);
-  const results = misses.map(({ test, changed }) => ({ test, changed, static: staticKnown ? selected.has(test) : null,
-    traced: Object.hasOwn(traceMap[test] ?? {}, changed), traceKnown: Object.hasOwn(traceMap, test) }));
-  return { ...(!staticKnown ? { staticEvidence: 'not supplied' } : {}), results,
-    counts: { total: results.length, static: staticKnown ? results.filter(r => r.static).length : null,
-    traced: results.filter(r => r.traced).length, additional: staticKnown ? results.filter(r => r.traced && !r.static).length : null,
-    unknown: results.filter(r => !r.traceKnown).length } };
+  const partial = new Set(traceMap.incomplete);
+  const results = misses.map(({ test, changed }) => {
+    const seen = Object.hasOwn(tests[test] ?? {}, changed);
+    return { test, changed, static: staticKnown ? selected.has(test) : null,
+      traced: seen ? true : partial.has(test) ? null : false, traceKnown: Object.hasOwn(tests, test), incomplete: partial.has(test) };
+  });
+  const counts = { total: results.length, static: staticKnown ? results.filter(r => r.static).length : null,
+    traced: results.filter(r => r.traced === true).length,
+    additional: staticKnown ? results.filter(r => r.traced === true && !r.static).length : null,
+    unknown: results.filter(r => !r.traceKnown).length, incomplete: results.filter(r => r.incomplete).length };
+  return { ...(!staticKnown ? { staticEvidence: 'not supplied' } : {}), incomplete: counts.incomplete > 0, results, counts };
 }
 
 /** Injectable startup keeps no-env and disabled paths completely inert. */
@@ -212,7 +242,6 @@ export function activateTrace(env, settings, { fs: io = fs, child_process: cp = 
       if (typeof handle?.setBlocking === 'function') handle.setBlocking(true);
     } catch { /* tracing must not throw when a stream is unavailable */ }
   }
-  env.NODE_OPTIONS = inheritOptions(env.NODE_OPTIONS);
   tracer.install();
   syncExports();
   runtime.once('exit', () => {
