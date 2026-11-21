@@ -387,6 +387,7 @@ describe('runDaemonLoop — the pure control flow', () => {
 describe('runReviewTick — stale status sweep', () => {
   const repo = 'web-everything/web-everything';
   const cleanPr = { number: 10, mergeable: 'MERGEABLE', mergeStateStatus: 'CLEAN',
+    statusCheckRollup: [{ name: 'test', status: 'COMPLETED', conclusion: 'SUCCESS' }],
     labels: [{ name: 'status:conflict' }, { name: 'review:accepted' }] };
   const plan = { dispatch: [{ kind: 'review', prNumber: 11 }], refusals: [],
     notes: [{ kind: 'nothing-owed', prNumber: 10 }] };
@@ -401,7 +402,7 @@ describe('runReviewTick — stale status sweep', () => {
     const tagStatus = vi.fn(opts => {
       order.push('tag');
       return tagReviewStatus({ ...opts, provider, readFixClaim: () => null,
-        requiredChecks: [], prStatusSettings: {}, signalFix: () => {} });
+        requiredChecks: ['test'], prStatusSettings: {}, signalFix: () => {} });
     });
     const out = runReviewTick({ ...base, tagStatus,
       dispatch: () => { order.push('dispatch'); return { agentId: 'review-11' }; } });
@@ -426,7 +427,7 @@ describe('runReviewTick — stale status sweep', () => {
     const prState = { ...cleanPr, labels: [stale, ...reviewLabels] };
     const provider = { ensureLabel: vi.fn(), setLabels: vi.fn() };
     const tagStatus = opts => tagReviewStatus({ ...opts, provider, readFixClaim: () => null,
-      requiredChecks: [], prStatusSettings: {}, signalFix: () => {} });
+      requiredChecks: ['test'], prStatusSettings: {}, signalFix: () => {} });
     const out = runReviewTick({ ...base, readPrs: () => [prState], tagStatus,
       dispatch: () => {
         expect(provider.setLabels).toHaveBeenCalledTimes(1);
@@ -445,7 +446,7 @@ describe('runReviewTick — stale status sweep', () => {
     const prState = { ...cleanPr, labels: ['review:changes', 'status:sent-back-review'] };
     const provider = { ensureLabel: vi.fn(), setLabels: vi.fn() };
     const tagStatus = vi.fn(opts => tagReviewStatus({ ...opts, provider, readFixClaim: () => null,
-      requiredChecks: [], prStatusSettings: {}, signalFix: () => {} }));
+      requiredChecks: ['test'], prStatusSettings: {}, signalFix: () => {} }));
     const out = runReviewTick({ ...base, readPrs: () => [prState], tagStatus,
       dispatch: () => {
         expect(tagStatus).toHaveBeenCalledOnce();
@@ -652,7 +653,8 @@ describe('runReviewTick — the per-tick sequence', () => {
   it('a PR with no planner row still ends the tick with exactly one correct status:* label (stale ones removed)', () => {
     const reconcile = vi.fn(() => ({ dispatch: [], refusals: [], notes: [] }));
     const readPrs = () => [
-      { number: 4800, labels: [{ name: 'review:accepted' }, { name: 'status:awaiting-review' }] },
+      { number: 4800, labels: [{ name: 'review:accepted' }, { name: 'status:awaiting-review' }],
+        statusCheckRollup: [{ name: 'test', status: 'COMPLETED', conclusion: 'SUCCESS' }] },
       { number: 4801, labels: [{ name: 'review:human' }, { name: 'status:fixing' }] },
       { number: 4802, labels: [{ name: 'review:human' }] }, // nothing to show, nothing stale: no write
     ];
@@ -664,7 +666,7 @@ describe('runReviewTick — the per-tick sequence', () => {
     };
     runReviewTick({
       reconcile, readPrs, readAgents: () => [],
-      tagStatus: (opts) => tagReviewStatus({ ...opts, provider: fakeProvider, readFixClaim: () => null }),
+      tagStatus: (opts) => tagReviewStatus({ ...opts, provider: fakeProvider, readFixClaim: () => null, requiredChecks: ['test'] }),
       dispatch: () => { throw new Error('nothing owed'); }, tagRound: () => {},
     });
     expect(setLabelsCalls).toEqual([
