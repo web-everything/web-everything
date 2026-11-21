@@ -4,9 +4,9 @@
  *   `origin/ops/*`; an existing lane without the diet gets it on its next acquire fetch, which then skips the
  *   advanced ops tip; an explicit by-name reader fetch still works.
  */
-import { it, expect } from 'vitest';
+import { it, expect, afterAll } from 'vitest';
 import { execFileSync, spawnSync } from 'node:child_process';
-import { mkdtempSync, rmSync, writeFileSync, readFileSync, mkdirSync, chmodSync, existsSync } from 'node:fs';
+import { cpSync, mkdtempSync, rmSync, writeFileSync, readFileSync, mkdirSync, chmodSync, existsSync } from 'node:fs';
 import { join, resolve, sep } from 'node:path';
 import { tmpdir } from 'node:os';
 import { runReclaimCase } from '../conveyor/soak/breaks/lane-reset-symbolic-ops-proof.mjs';
@@ -364,25 +364,28 @@ it.each(staleOpsCases)('$mode acquire protects $containment work when its only o
     const bin = join(base, 'bin'), trace = join(base, 'git-trace.jsonl');
     mkdirSync(bin);
     writeFileSync(trace, '');
-    const realGit = execFileSync('which', ['git'], { encoding: 'utf8' }).trim();
-    writeFileSync(join(bin, 'git'), `#!/usr/bin/env node
-const { spawnSync } = require('node:child_process');
-const { appendFileSync } = require('node:fs');
-const args = process.argv.slice(2);
-// Match and trace the subcommand after transport-hardening config options; forward the original argv.
-const commandArgs = args.slice();
-while (commandArgs[0] === '-c') commandArgs.splice(0, 2);
-appendFileSync(${JSON.stringify(trace)}, JSON.stringify(commandArgs) + '\\n');
-if (${JSON.stringify(mode)} === 'auto' && commandArgs[0] === 'fetch') {
-  const changed = spawnSync(${JSON.stringify(realGit)}, ${JSON.stringify(mutation)}, { cwd: ${JSON.stringify(origin)}, stdio: 'inherit' });
-  if (changed.status !== 0) process.exit(changed.status ?? 1);
-}
-const result = spawnSync(${JSON.stringify(realGit)}, args, { stdio: 'inherit' });
-process.exit(result.status ?? 1);
-`);
-    chmodSync(join(bin, 'git'), 0o755);
-
-    const acquire = run(['acquire', ...(mode === 'explicit' ? ['--lane=1'] : []), '--session=stale-ops', '--hard-max=1'], { PATH: `${bin}:${process.env.PATH}` });
+    // Observe the process seam rather than spawning a Node shim for every git command.
+    // Bounded network calls are traced at their wrapper boundary; the wrapper and real git still run.
+    const preload = `import cp from 'node:child_process';
+import { appendFileSync } from 'node:fs';
+import { syncBuiltinESMExports } from 'node:module';
+const original = cp.execFileSync;
+cp.execFileSync = (file, args, opts) => {
+  let commandArgs = args.slice();
+  if (file === process.execPath && commandArgs[0]?.endsWith('/git-bounded.mjs')) {
+    commandArgs = commandArgs.slice(commandArgs.indexOf('--') + 2);
+  } else if (file !== 'git') return original(file, args, opts);
+  while (commandArgs[0] === '-c') commandArgs.splice(0, 2);
+  appendFileSync(${JSON.stringify(trace)}, JSON.stringify(commandArgs) + '\\n');
+  if (${JSON.stringify(mode)} === 'auto' && commandArgs[0] === 'fetch') {
+    original('git', ${JSON.stringify(mutation)}, { cwd: ${JSON.stringify(origin)}, stdio: 'inherit' });
+  }
+  return original(file, args, opts);
+};
+syncBuiltinESMExports();`;
+    const hook = join(bin, 'observe-git.mjs');
+    writeFileSync(hook, preload);
+    const acquire = run(['acquire', ...(mode === 'explicit' ? ['--lane=1'] : []), '--session=stale-ops', '--hard-max=1'], {}, ['--import', hook]);
     expect(acquire.status, acquire.stderr).not.toBe(0);
     expect(acquire.stderr).toMatch(mode === 'explicit' ? /would destroy that work/ : /no longer provably safe to reset/);
     const calls = readFileSync(trace, 'utf8').trim().split('\n').map((line) => JSON.parse(line));
@@ -426,11 +429,24 @@ it.each([
   expect(report.violations).toEqual([]);
 }, 60000);
 
+let containmentFixture;
+afterAll(() => {
+  if (containmentFixture) rmSync(containmentFixture.root, { recursive: true, force: true });
+});
 function withContainmentLane(check) {
-  const base = mkdtempSync(join(tmpdir(), 'pool-ops-containment-'));
+  if (!containmentFixture) {
+    const root = mkdtempSync(join(tmpdir(), 'pool-ops-containment-'));
+    containmentFixture = { root, base: join(root, 'case'), snapshot: join(root, 'snapshot') };
+    mkdirSync(containmentFixture.base);
+  }
+  const { base, snapshot } = containmentFixture;
   const git = (args, cwd) => execFileSync('git', args, { cwd, encoding: 'utf8' }).trim();
-  try {
-    const origin = join(base, 'origin.git'), reference = join(base, 'reference'), pool = join(base, 'pool');
+  const origin = join(base, 'origin.git'), reference = join(base, 'reference'), pool = join(base, 'pool');
+  const args = [`--origin=${origin}`, `--reference=${reference}`, '--name=containment', '--branch=trunk', '--no-install'];
+  const run = (extra, env = {}, nodeArgs = []) => spawnSync(process.execPath, [...nodeArgs, resolve('scripts/lane-pool.mjs'), ...extra, ...args], {
+    encoding: 'utf8', env: { ...process.env, LANE_POOL_ROOT: pool, ...env }, timeout: 30000,
+  });
+  if (!existsSync(snapshot)) {
     git(['init', '--quiet', '--bare', '--initial-branch=trunk', origin]);
     git(['clone', '--quiet', origin, reference]);
     git(['config', 'user.email', 'test@example.com'], reference);
@@ -439,10 +455,6 @@ function withContainmentLane(check) {
     git(['add', 'file.txt'], reference);
     git(['commit', '--quiet', '-m', 'seed'], reference);
     git(['push', '--quiet', origin, 'HEAD:refs/heads/trunk'], reference);
-    const args = [`--origin=${origin}`, `--reference=${reference}`, '--name=containment', '--branch=trunk', '--no-install'];
-    const run = (extra, env = {}) => spawnSync('node', [resolve('scripts/lane-pool.mjs'), ...extra, ...args], {
-      encoding: 'utf8', env: { ...process.env, LANE_POOL_ROOT: pool, ...env }, timeout: 30000,
-    });
     const provision = run(['provision', '--count=1']);
     expect(provision.status, provision.stderr).toBe(0);
     const lane = join(pool, 'containment', 'lane-1');
@@ -452,8 +464,13 @@ function withContainmentLane(check) {
     git(['add', 'file.txt'], lane);
     git(['commit', '--quiet', '-m', 'unique lane work'], lane);
     expect(git(['rev-list', '--count', 'origin/trunk..HEAD'], lane)).toBe('1');
-    check({ base, origin, reference, lane, git, run });
-  } finally { rmSync(base, { recursive: true, force: true }); }
+    cpSync(base, snapshot, { recursive: true });
+  } else {
+    rmSync(base, { recursive: true, force: true });
+    cpSync(snapshot, base, { recursive: true });
+  }
+  const lane = join(pool, 'containment', 'lane-1');
+  check({ base, origin, reference, lane, git, run });
 }
 
 // lane-pool.mjs LANE_GIT_ENV + dropGitLocationEnv: an inherited GIT_DIR / GIT_WORK_TREE / GIT_REFERENCE_BACKEND must
