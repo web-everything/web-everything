@@ -447,6 +447,25 @@ describe('merge-queue exact-test extra retry after two failed_checks removals', 
     f.runs[900].event = 'schedule';
     expectExtraRetry(f);
   }));
+  it.each(['push', 'schedule'])('exact retry ignores unrelated events while retaining %s evidence', event => exactFixture(f => {
+    f.runs[900].event = event;
+    f.mainRuns.push(...['workflow_dispatch', 'pull_request'].map((other, index) => ({
+      ...f.runs[900], id: 901 + index, event: other, conclusion: 'failure', created_at: iso(removedAt + 700_000),
+    })));
+    expectExtraRetry(f);
+  }));
+  it.each(['push', 'schedule'])('exact retry cannot use unrelated success to clear %s failure', event => exactFixture(f => {
+    f.runs[900].event = event;
+    f.runs[900].conclusion = 'failure';
+    f.mainRuns.push(...['workflow_dispatch', 'pull_request'].map((other, index) => ({
+      ...f.runs[900], id: 901 + index, event: other, conclusion: 'success', created_at: iso(removedAt + 700_000),
+    })));
+    expectExactHold(f);
+  }));
+  it.each([undefined, '', 42])('exact retry fails closed on an unreadable event %s', event => exactFixture(f => {
+    f.mainRuns.push({ ...f.runs[900], id: 901, event });
+    expectExactHold(f);
+  }));
   it('exact retry refuses hourly success with an unreadable main head', () => exactFixture(f => {
     f.runs[900].event = 'schedule'; f.mainHead = null;
     expectExactHold(f);

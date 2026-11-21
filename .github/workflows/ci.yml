@@ -69,8 +69,6 @@ concurrency:
 
 permissions:
   contents: read
-  actions: read
-  checks: read
 
 jobs:
   # CARD-ONLY LIGHT PATH (actions-queue-relief, 2026-10-03). A PR that changes only `backlog/**` runs the
@@ -87,6 +85,10 @@ jobs:
   changes:
     runs-on: ubuntu-latest
     timeout-minutes: 5
+    permissions:
+      contents: read
+      actions: read
+      checks: read
     outputs:
       light: ${{ steps.detect.outputs.light == 'true' || steps.main-skip.outputs.skip == 'true' }}
       fui-sha: ${{ steps.main-skip.outputs.fui-sha || steps.fui-tip.outputs.tip }}

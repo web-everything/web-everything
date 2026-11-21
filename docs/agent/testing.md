@@ -5846,3 +5846,35 @@ For fixtures with arbitrary branches, workflow files or cross-repo couples, use
 Keep full commit IDs consistent across listings, live reads, check runs and saved
 refresh records. Resolve the diff at the listed head when a capped commits read
 or a later push intentionally makes the commits tip or live head differ.
+
+## Main push reuse: planned 24-hour acceptance check
+
+`main-push-reuse-24h` is the named post-merge acceptance report for PR #7224.
+The operator collects a complete 24-hour window after deployment, plus the preceding
+24-hour baseline, with UTC window boundaries and immutable run IDs/attempts for every
+`ci.yml` push, merge-group and scheduled run. Include exact head SHAs, reuse decisions
+and referenced queue run IDs, job start/completion times, execution receipts, runner
+minutes, and red-main observation timestamps. Incomplete inventories, missing hourly
+runs or missing measurements leave acceptance pending; they cannot produce a pass.
+
+The report asserts all four outcomes, and lists the run IDs behind each calculation:
+
+- Zero full main-push executions where the exact SHA had eligible queue-green evidence
+  at the push decision time (including the FUI, age, attempt and quarantine checks).
+- A full scheduled backstop execution in each of the 24 hourly slots, with completed
+  unit, integration and soak execution receipts; a skipped or cancelled run fails.
+- Red-main detection p90 at most 80 minutes, measured from each independently established
+  break reaching main to the first recorded red-main detection. Use nearest-rank p90.
+  With no observed breaks, report this metric as unmeasured and schedule an approved
+  incident drill; do not infer zero latency from an empty sample.
+- Total CI runner-minutes per day at least 30% below the baseline, including queue,
+  push and backstop work and all attempts. Report both totals, the calculation
+  `1 - post / baseline`, and merge counts to expose workload differences. A missing
+  or zero baseline leaves the comparison unmeasured.
+
+Tier 1 fixtures do not certify these production targets. The shared reused-push
+contract is in `scripts/ci/__tests__/main-red-evidence-regressions.test.mjs`;
+scheduled quarantine input is covered by
+`scripts/conveyor/__tests__/red-main-quarantine-auto.test.mjs`. Extra Actions/check
+permissions belong on the jobs that read evidence, as pinned by
+`scripts/ci/__tests__/main-push-skip-workflow.test.mjs`.

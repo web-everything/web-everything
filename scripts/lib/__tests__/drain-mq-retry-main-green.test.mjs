@@ -182,6 +182,18 @@ describe('same-head retry judges main freshness by main HEAD, not wall-clock', (
 describe('hourly main backstop retry evidence', () => {
   beforeEach(() => { vi.useFakeTimers(); vi.setSystemTime(now); });
   afterEach(() => vi.useRealTimers());
+  it.each(['push', 'schedule'])('ignores unrelated events while retaining %s retry evidence', event => {
+    const green = { ...run(102), event, head_sha: head };
+    const unrelated = ['workflow_dispatch', 'pull_request'].map((other, index) => ({
+      ...run(103 + index, 'failure', '2026-11-01T13:40:00Z'), event: other, head_sha: head,
+    }));
+    expect(fixture([green, ...unrelated], [removal()], head).guard().hold).toBe(false);
+    expect(fixture([{ ...green, conclusion: 'failure' }, ...unrelated.map(r => ({ ...r, conclusion: 'success' }))],
+      [removal()], head).guard().hold).toBe(true);
+  });
+  it.each([undefined, '', 42])('fails closed on an unreadable event %s', event => {
+    expect(fixture([run(102), { ...run(103), event }], [removal()], head).guard().hold).toBe(true);
+  });
   it('newer schedule failure invalidates a real push success', () => {
     const scheduled = { ...run(103, 'failure', '2026-11-01T13:40:00Z'), event: 'schedule', head_sha: head };
     expect(fixture([run(102), scheduled], [removal()], head).guard().hold).toBe(true);

@@ -1,6 +1,8 @@
 // @vitest-environment node
 import { expect, it } from 'vitest';
 import { mainRedState } from '../../conveyor/main-ci-red-core.mjs';
+import { planMainRedAlert } from '../../conveyor/health-watch-main-red.mjs';
+import { drainFreezeSignal } from '../../lib/red-main-freeze-shared.mjs';
 import { combineRedMain, readMainCiFact } from '../../merge-gate-check.mjs';
 import { decideMainPushSkip } from '../main-push-skip.mjs';
 import { readFileSync } from 'node:fs';
@@ -38,6 +40,20 @@ it('merge gate ignores a proven reused-push failure behind an older real green r
   expect(mainCi).toMatchObject({ red: false });
   expect(combineRedMain({ frozen: false }, mainCi)).toMatchObject({ frozen: false });
   expect(combineRedMain({ frozen: true, kind: 'manual' }, mainCi)).toMatchObject({ frozen: true });
+});
+it('shared reused-push fixture never reports red through merge gate, health watch or drain freeze', () => {
+  const runs = [run(11, head, 'failure'), run(10, old, 'success')];
+  const page = reusedJobs();
+  const tip = { sha: head, runStatus: 'completed', requiredChecks: ['test'],
+    checksTotal: page.total_count, checkRuns: page.jobs.map((job, index) => ({ ...job, id: index + 1 })) };
+  const now = Date.parse('2026-11-20T12:00:00Z');
+  expect(fact(runs, head, { '11/1': page })).toMatchObject({ red: false });
+  expect(planMainRedAlert({ runs, tip, now }).items).toEqual([]);
+  const state = mainRedState(runs, { tip });
+  expect(state.status).toBe('green');
+  // The drain freeze consumes the state published by the red-main owner.
+  expect(drainFreezeSignal({ state: {}, mainRedState: { red: state.status === 'red' }, now }))
+    .toMatchObject({ red: false });
 });
 it('reuse never clears older red evidence or supplies missing execution evidence', () => {
   expect(fact([run(11, head, 'failure'), run(10, old, 'failure')], head,

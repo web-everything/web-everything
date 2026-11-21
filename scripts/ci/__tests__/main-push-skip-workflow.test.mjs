@@ -7,6 +7,16 @@ import yaml from 'js-yaml';
 import { spawnSync } from 'node:child_process';
 const raw = readFileSync(new URL('../../../.github/workflows/ci.yml', import.meta.url), 'utf8');
 const wf = yaml.load(raw), jobs = wf.jobs;
+it('scopes extra token permissions to the jobs that read evidence', () => {
+  expect(wf.permissions).toEqual({ contents: 'read' });
+  expect(jobs.changes.permissions).toEqual({ contents: 'read', actions: 'read', checks: 'read' });
+  for (const [name, job] of Object.entries(jobs)) {
+    if (name === 'changes') continue;
+    // The aggregate test job already reads failed shard logs.
+    expect(job.permissions?.actions, name).toBe(name === 'test' ? 'read' : undefined);
+    expect(job.permissions?.checks, name).toBeUndefined();
+  }
+});
 const evaluate = (expr, values) => Function(...Object.keys(values), `return (${expr.replace(/\$\{\{|\}\}/g, '').replace(/steps\.main-skip/g, "steps['main-skip']")});`)(...Object.values(values));
 it('every WE checkout pins the scheduled backstop to the run sha (all jobs test one commit)', () => {
   for (const [name, job] of Object.entries(jobs)) for (const step of job.steps ?? []) {

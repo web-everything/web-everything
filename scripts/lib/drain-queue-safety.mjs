@@ -677,10 +677,12 @@ function readMqExactTestEvidence({ repo, pr, head, timeline, exec, now }) {
     if (!Number.isSafeInteger(mainPage?.total_count) || mainPage.total_count < 0 || !Array.isArray(runs)
       || runs.length !== Math.min(mainPage.total_count, 100) || new Set(runs.map(r => r?.id)).size !== runs.length
       || runs.some(r => !Number.isSafeInteger(r?.id) || r.id <= 0 || r.path !== '.github/workflows/ci.yml'
-        || !['push', 'schedule'].includes(r.event) || r.head_branch !== 'main' || !mqOid(r.head_sha)
+        || typeof r.event !== 'string' || !r.event.trim() || r.head_branch !== 'main' || !mqOid(r.head_sha)
         || !Number.isFinite(Date.parse(r.created_at))
         || (r.status === 'completed' ? !conclusions.has(r.conclusion) || !Number.isFinite(Date.parse(r.updated_at))
           : !unfinished.has(r.status) || r.conclusion !== null))) return null;
+    // Validate the complete page before ignoring events outside main CI evidence.
+    runs = runs.filter(run => ['push', 'schedule'].includes(run.event));
     if (runs.some(run => run.event === 'schedule')) {
       const mainHead = mqOid(json('git/ref/heads/main')?.object?.sha);
       if (!mainHead) return null;
@@ -1012,10 +1014,13 @@ function readMqBaseRetryEvidence({ repo, pr, head, timeline, exec, rerunScope, d
     const conclusions = new Set([...passing, ...infraConclusions, 'failure', 'action_required', 'stale']);
     const unfinished = new Set(['queued', 'in_progress', 'waiting', 'requested', 'pending']);
     if ([...newest, ...runs].some(run => run.path !== '.github/workflows/ci.yml' || run.head_branch !== 'main'
-      || !['push', 'schedule'].includes(run.event) || (run.status === 'completed' ? !conclusions.has(run.conclusion)
+      || typeof run.event !== 'string' || !run.event.trim() || (run.status === 'completed' ? !conclusions.has(run.conclusion)
         : !unfinished.has(run.status) || run.conclusion !== null)
       || !Number.isFinite(timestamp(run.created_at))
       || (run.status === 'completed' && !Number.isFinite(timestamp(run.updated_at))))) return null;
+    // Unrelated events must neither veto a retry nor supply its green evidence.
+    newest = newest.filter(run => ['push', 'schedule'].includes(run.event));
+    runs = runs.filter(run => ['push', 'schedule'].includes(run.event));
     if ([...newest, ...runs].some(run => run.event === 'schedule')) {
       if (budget-- <= 0) throw new Error('retry evidence budget exhausted');
       const mainHead = mqOid(JSON.parse(exec('gh', ['api', `repos/${repo}/git/ref/heads/main`],
