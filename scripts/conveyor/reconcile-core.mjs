@@ -1,3 +1,4 @@
+import { roundEndRefusal } from '../lib/review-loop/round-end-gates.mjs';
 import { parseMqFailureRoute } from '../lib/mq-failure-route.mjs';
 import { admitMqFailureRoute } from './mq-failure-intake.mjs';
 import { ghRepoSlug } from '../lib/constellation-repos.mjs';
@@ -302,6 +303,7 @@ export const DISPATCH_KINDS = Object.freeze(['fix', 'review', 'ci-heal', 'ci-tim
  *   `scope-bloat` / `ruling-dispute` — see the comments on the list below.
  */
 export const REFUSAL_KINDS = Object.freeze([
+  'split-required', 'intake-unmeasurable',
   'fix-join-wait',
   'review-ci', 'review-referrals-pending',
   'stood-down', 'load-flake-hold', 'load-flake-rearm-owed', 'no-findings', 'cap-exhausted',
@@ -1903,7 +1905,7 @@ export function resolveRoundExtensionAnchor({ env = {}, platform = null, repo = 
 }
 
 /** Shared fix/review counter. A sliced thread deliberately omits the unsliceable durableCounts fallback. */
-function sharedRoundAttempts(pr, { durableCount = 0, mechanicalRoundsCountTowardCap = false,
+export function sharedRoundAttempts(pr, { durableCount = 0, mechanicalRoundsCountTowardCap = false,
   realFixRounds = countRealFixRounds(pr), operatorBudget = operatorFixBudget(pr?.comments, 0) } = {}) {
   return Math.max(
     realFixRounds.ok ? realFixRounds.real : Number(durableCount) || 0,
@@ -2265,7 +2267,7 @@ export function planReconcile({
   // every queue that consumes this plan in order), is promoted from draft at once, and is never told to wait for main
   // (`owed-ci-rerun`) — it is the one PR main is waiting for. `null` (default) = before this card, byte-identical.
   mainRedPriority = null,
-  shadowDeps,
+  shadowDeps, readIntake, intakeEnforce = 'off',
 } = {}) {
   // Fast checks are per repo: a repo whose CI does not publish them (null) waits on its required checks instead.
   const repoReviewTiming = { ...reviewTiming, fastChecks: fastChecksFor(reviewTiming?.fastChecks, repo) };
@@ -4065,6 +4067,14 @@ export function planReconcile({
             : ''),
       });
       continue;
+    }
+
+    // ── REFUSAL 2b — round-end gates, measured at this head and durable round.
+    const intake = roundEndRefusal({ pr, attempts: roundAttempts(), readIntake, enforce: intakeEnforce });
+    if (intake) {
+      if (!intake.shadow && intake.kind !== 'intake-override') refuse(intake.kind, { ...withPhase, ...intake });
+      if (intake.kind !== 'intake-unmeasurable') notes.push({ kind: 'intake-effect', pr, repo, intake });
+      if (!intake.shadow && intake.kind !== 'intake-override') continue;
     }
 
     // ── REFUSAL 3 — the cap, from the PR and ONLY from the PR. `durableCounts` is what the shell read back off

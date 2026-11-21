@@ -180,3 +180,22 @@ it.each([{}, { rowsComplete: false, rowsHead: XX_HEAD }, { rowsComplete: true, r
     expect(log.mock.calls.map(([l]) => l)).toContain('check-evidence-coverage: 0/1 PRs rowsComplete===true && rowsHead===headRefOid');
   } finally { log.mockRestore(); }
 });
+
+it('intake IO passes the pinned head and durable round, records refusal before effects and keeps read-only passes read-only', async () => {
+  const { runReconcilePass } = await import('../reconcile-pass.mjs');
+  const { REARM_COMMENT_MARKER } = await import('../rearm-review.mjs');
+  const pr = { ...xxPr(), isDraft: false, rowsComplete: true, rowsHead: XX_HEAD, labels: ['review:changes'], mergeStateStatus: 'CLEAN',
+    statusCheckRollup: [{ name: 'test', status: 'completed', conclusion: 'success' }], comments: [
+      { body: '🔁 human review — changes requested\n\nFix the defect' },
+      { body: REARM_COMMENT_MARKER, author: { login: 'web-everything' } },
+    ] };
+  const intakeReader = vi.fn(() => ({ verdict: 'fail', reason: 'split-required', lines: 585 }));
+  const intakeEffects = vi.fn(plan => { expect(plan.refusals).toContainEqual(expect.objectContaining({ kind: 'split-required' })); expect(plan.dispatch).toEqual([]); });
+  const options = { ...xxOptions(), readPrs: () => [pr], readRequiredChecks: () => ({ checks: ['test'] }),
+    loadIntake: () => ({ enforce: 'on' }), intakeReader, intakeEffects, env: { VITEST: 'true' } };
+  runReconcilePass(options);
+  expect(intakeReader).toHaveBeenCalledWith(expect.objectContaining({ headRefOid: XX_HEAD, round: 1 }), { params: { enforce: 'on' } });
+  expect(intakeEffects).toHaveBeenCalledTimes(1);
+  runReconcilePass({ ...options, readOnly: true });
+  expect(intakeEffects).toHaveBeenCalledTimes(1);
+});

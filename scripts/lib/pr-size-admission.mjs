@@ -327,6 +327,7 @@ export function createSizeAdmissionRunner({ cwd = process.cwd(), env = process.e
       entries = parseNumstat(text);
       plan = planSizeAdmission(measureEntries(entries, loadSizeSettings(undefined, { env })));
     } catch (error) { plan = planSizeAdmission(error); }
+    if (request.requireSplit === true && plan.status === 'ok' && plan.lines > 0) plan.status = 'over';
     const result = { ...plan, body, reviewLabel: null, ...(pinnedSha ? { sha: pinnedSha } : {}) };
     if (plan.status === 'ok') return result;
     result.reviewLabel = REVIEW_LABELS.pending;
@@ -386,9 +387,10 @@ export function createSizeAdmissionRunner({ cwd = process.cwd(), env = process.e
       cardId = null;
       cardNote = 'split card not filed (file-item failed)';
     }
+    result.cardPublished = cardPublished;
     const dataNote = plan.dataLines > 0 ? ` ${plan.dataLines} data lines (not counted).` : '';
     const note = plan.status === 'over'
-      ? `${plan.lines} non-test lines (> ${OPEN_PR_MAX_NON_TEST_LINES}): ${cardNote}; extra reviewers requested via the size escalation (review:pending)${dataNote}`
+      ? `${plan.lines} non-test lines (${request.requireSplit === true ? 'intake requires split' : `> ${OPEN_PR_MAX_NON_TEST_LINES}`}): ${cardNote}; extra reviewers requested via the size escalation (review:pending)${dataNote}`
       : `size unknown: extra reviewers requested via the size escalation (review:pending); ${cardNote}`;
     const noted = replaceOwnedSection(body, `## Size\n\n${note}\n${groupLine}${fallback}\n`
       + (cardPublished ? `<!-- size-published:${markerKey} -->\n` : '')

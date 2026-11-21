@@ -16,9 +16,9 @@ For repo defaults, edit the owner file through a PR and rebuild the consuming da
 
 ## Summary
 
-- Top-level keys: 161 (163 declaration rows).
-- Declared leaves: 589 (platform copies counted separately).
-- Instant top-level keys: 0; not instant: 161.
+- Top-level keys: 162 (164 declaration rows).
+- Declared leaves: 599 (platform copies counted separately).
+- Instant top-level keys: 0; not instant: 162.
 - Instant capacity leaves: 15.
 - Constants to settle: 312.
 - Instant gaps: 28.
@@ -129,6 +129,7 @@ Operator-prefs layer: ~/.plateau/platform-preferences.json is the requested oper
 | heavyAdmissionCap | scripts/dispatch-settings.json | 1 | 3 | pr | no | Maximum concurrent heavy commands admitted on the host. |
 | humanClearance | scripts/settings/human-clearance-carry.json | 1 | {"mechanicalCarry":"refuse"} | pr | no | Mechanical carry-forward policy for human clearance. |
 | humanReviewSurfaces | scripts/settings/human-review-surfaces.json | 1 | "narrow" | pr | no | Scope of surfaces requiring human review. |
+| intake | scripts/settings/review-intake.json | 10 | {"maxLines":300,"countRule":"non-test-non-data","exemptPath… | env | no | Head-bound review intake size cap, path exemptions, trusted overrides and round-end enforcement. |
 | kindMaxSize | scripts/settings/agy-build.json | 1 | 3 | env | no | Maximum direct confined agy build size for allowedKinds; repair dispatch remains size 1. |
 | launchAgentsDir | scripts/settings/prototype-load.json | 1 | "~/Library/LaunchAgents" | pr | no | Host directory for rendered launchd agent definitions. |
 | livenessSweep | scripts/settings/liveness-sweep.json | 11 | {"prNoMovementMinutes":120,"prRedUnownedMinutes":60,"selfUp… | pr | no | Staleness thresholds, escalation rungs and recovery attempt limits. |
