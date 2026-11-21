@@ -130,16 +130,24 @@ export function analyzeTrace({ events, root, fuiRoot = null, tmpRoots, home = ''
   let spawns = 0;
   let reads = 0;
 
-  const touch = (p, kind) => {
+  const touch = (p, kind, op = kind) => {
     if (!p || !p.startsWith('/') || p.includes(`${sep}node_modules${sep}`) || isTmp(p) || (cacheDir && under(p, cacheDir)) || toolchain.some((t) => under(p, t)) || p.startsWith('/dev/')) return;
     if (isRepo(p)) { addTraced(p, kind); return; }
+    // Read-only bun package cache: a stat/exists probe of the bare ~/.bun directory and any access inside the exact
+    // install cache subtree. Everything else under ~/.bun and every other home path (credentials, keychains, other
+    // toolchain homes) stays a deny. The path is resolved (dot segments AND symlinks) before the check, so neither
+    // `cache/../..` nor a cache entry symlinked to a credential file can escape the allow. An allowed access is still
+    // TRACED (hashed content or listing), so a change in the cache invalidates admission and cache hits.
+    const resolved = real(resolve(p));
+    if (homes.some((h) => ((op === 'stat' || op === 'exists') && resolved === join(h, '.bun'))
+      || under(resolved, join(h, '.bun', 'install', 'cache')))) { addTraced(resolved, kind); return; }
     if (homes.some((h) => under(p, h))) denies.add(`home-read: ${p.slice(home.length + 1).split('/').slice(0, 2).join('/') || '~'}`);
   };
 
   for (const ev of events) {
-    if (ev.k === 'read' || ev.k === 'stat' || ev.k === 'exists') { reads += 1; touch(ev.p, 'file'); }
-    else if (ev.k === 'list') { reads += 1; touch(ev.p, 'dir'); }
-    else if (ev.k === 'mod') touch(ev.p, 'file');
+    if (ev.k === 'read' || ev.k === 'stat' || ev.k === 'exists') { reads += 1; touch(ev.p, 'file', ev.k); }
+    else if (ev.k === 'list') { reads += 1; touch(ev.p, 'dir', 'list'); }
+    else if (ev.k === 'mod') touch(ev.p, 'file', 'mod');
     else if (ev.k === 'net') {
       if (ev.path) continue; // unix socket: local
       if (!LOOPBACK.has(String(ev.host ?? ''))) denies.add(`network: ${ev.host}`);
