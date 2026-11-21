@@ -1,6 +1,6 @@
 /** Strict whole-store capacity reads; invalid evidence always retains the lower layer. */
 import { closeSync, constants, fstatSync, lstatSync, openSync, readSync } from 'node:fs';
-import { CAPACITY_LEAVES, OPERATOR_CAPACITY_MAX, operatorOverridesPath } from './operator-override-reader.mjs';
+import { CAPACITY_LEAVES, OPERATOR_CAPACITY_MAX, operatorOverridesPath, isEnumLeaf, validEnumValue } from './operator-override-reader.mjs';
 import { isUnderTest } from './under-test.mjs';
 import { platformPreference } from './policy-cascade.mjs';
 
@@ -16,13 +16,15 @@ export function validateStrictStoreText(raw) {
     let parsed;
     try { parsed = JSON.parse(raw); } catch { return refused('invalid-json'); }
     if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)
-      || Object.values(parsed).some(value => typeof value !== 'number' || !Number.isFinite(value))) return refused('invalid-store');
-    // Values are numbers, so every JSON string token is a key. Decode escapes before comparing.
-    const matches = raw.match(/"(?:[^"\\]|\\.)*"/g) ?? [];
+      || Object.entries(parsed).some(([k, value]) => !(isEnumLeaf(k) ? validEnumValue(k, value) : (typeof value === 'number' && Number.isFinite(value))))) return refused('invalid-store');
+    // Values are numbers or enum strings; a key is a string token followed by a colon. Decode escapes before comparing.
+    const matches = raw.match(/"(?:[^"\\]|\\.)*"(?=\s*:)/g) ?? [];
     const unique = new Set(matches.map(match => JSON.parse(match)));
     if (matches.length !== unique.size || unique.size !== Object.keys(parsed).length) return refused('duplicate key');
-    if (Object.entries(parsed).some(([k, value]) => !Object.hasOwn(CAPACITY_LEAVES, k) || !CAPACITY_LEAVES[k].validate(value))) return refused('invalid-key-or-value');
-    return { ok: true, values: parsed };
+    const enums = Object.fromEntries(Object.entries(parsed).filter(([k]) => isEnumLeaf(k)));
+    const values = Object.fromEntries(Object.entries(parsed).filter(([k]) => !isEnumLeaf(k)));
+    if (Object.entries(values).some(([k, value]) => !Object.hasOwn(CAPACITY_LEAVES, k) || !CAPACITY_LEAVES[k].validate(value))) return refused('invalid-key-or-value');
+    return { ok: true, values, enums };
   } catch { return refused('error'); }
 }
 
@@ -62,6 +64,16 @@ export function readStrictOverride(key, options = {}) {
     const store = readStrictStore(options);
     if (!store.ok) return store;
     return Object.hasOwn(store.values, key) ? { ok: true, value: store.values[key] } : refused('not-set');
+  } catch { return refused('error'); }
+}
+
+/** Read one enum-valued override from a wholly valid store. Never throws. */
+export function readEnumOverride(key, options = {}) {
+  try {
+    if (!isEnumLeaf(key)) return refused('not-enum-key');
+    const store = readStrictStore(options);
+    if (!store.ok) return store;
+    return Object.hasOwn(store.enums, key) ? { ok: true, value: store.enums[key] } : refused('not-set');
   } catch { return refused('error'); }
 }
 
