@@ -723,3 +723,59 @@ it('an unpromoted Carbon advisory route retains no live non-shadow seat', () => 
     vi.unstubAllEnvs();
   }
 });
+
+describe('carbon shadow seat vs the agy-gemini live seat cap (R1062a)', () => {
+  const run = async (mode, model, env, extra = {}) => {
+    for (const [k, v] of Object.entries({ WE_REVIEW_SEAT_CAP_AGY_GEMINI: '0', ...env })) vi.stubEnv(k, v);
+    const calls = [];
+    const rows = [];
+    const logs = [];
+    const reserved = [];
+    try {
+      const out = await runSeatWithProvider({ ...REQUEST, seatProvider: { mode, model, seat: 'correctness', pr: 7, repo: 'o/r', ...extra } }, io({
+        claudeJudge: async () => judgeOutcome({ summary: 'c', findings: [FINDING] }, { sessionId: 'claude-s' }),
+        agyJuror: async (o) => { calls.push(o); return { status: 'ok', sessionId: 'agy-s', value: { summary: 'a', findings: [FINDING] } }; },
+        appendRow: (row) => { rows.push(row); return true; },
+        log: (m) => logs.push(String(m)),
+        reserveSession: (a) => { reserved.push(a.dailyCap); return extra.dailyCap === 1 ? { allowed: false, reason: 'daily cap' } : { allowed: true }; },
+      }));
+      return { out, calls, rows, logs, reserved };
+    } finally { vi.unstubAllEnvs(); }
+  };
+
+  it('carbon shadow seat ignores agy-gemini live cap', async () => {
+    const { calls, rows } = await run('shadow', 'gemini-4-carbon-high', { WE_REVIEW_SEAT_CAP_CARBON_SHADOW: '5' });
+    expect(calls).toHaveLength(1);
+    expect(rows[0]).toMatchObject({ status: 'ok' });
+  });
+  it('a live (non-shadow) agy-gemini seat with cap 0 is still skipped', async () => {
+    const promoted = { WE_REVIEW_SEAT_CAP_CARBON_SHADOW: '5', WE_REVIEW_SHADOW_AGY_PROMOTED: 'true' };
+    const capped = await run('agy', 'gemini-4-carbon-high', promoted, { onEscape: 'skip' });
+    expect(capped.calls).toHaveLength(0);
+    expect(capped.logs.join('\n')).toContain('agy-gemini seat cap 0');
+    // control: the same promoted live seat runs once the live cap is opened, so the skip above is the cap
+    const open = await run('agy', 'gemini-4-carbon-high', { ...promoted, WE_REVIEW_SEAT_CAP_AGY_GEMINI: '20' }, { onEscape: 'skip' });
+    expect(open.calls).toHaveLength(1);
+  });
+  it('a non-carbon gemini shadow with cap 0 is still skipped', async () => {
+    const { calls } = await run('shadow', 'gemini-3-pro', { WE_REVIEW_SEAT_CAP_CARBON_SHADOW: '5' });
+    expect(calls).toHaveLength(0);
+  });
+  it('the carbon shadow switch off means no run', async () => {
+    const { calls } = await run('shadow', 'gemini-4-carbon-high', { WE_REVIEW_SEAT_CAP_CARBON_SHADOW: '0' });
+    expect(calls).toHaveLength(0);
+  });
+  it('the carbon shadow daily cap is still enforced', async () => {
+    const { calls } = await run('shadow', 'gemini-4-carbon-high', { WE_REVIEW_SEAT_CAP_CARBON_SHADOW: '5' }, { dailyCap: 1 });
+    expect(calls).toHaveLength(0);
+  });
+  it.each([undefined, -1, 'x', 1.5, null])('an absent or invalid directive dailyCap (%s) falls back to a bounded 100/day, never unlimited', async (dailyCap) => {
+    const { calls, reserved } = await run('shadow', 'gemini-4-carbon-high', { WE_REVIEW_SEAT_CAP_CARBON_SHADOW: '5' }, { dailyCap });
+    expect(reserved).toEqual([100]);
+    expect(calls).toHaveLength(1);
+  });
+  it('a valid directive dailyCap is used as given', async () => {
+    const { reserved } = await run('shadow', 'gemini-4-carbon-high', { WE_REVIEW_SEAT_CAP_CARBON_SHADOW: '5' }, { dailyCap: 7 });
+    expect(reserved).toEqual([7]);
+  });
+});
