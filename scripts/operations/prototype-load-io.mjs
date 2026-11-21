@@ -489,7 +489,10 @@ export function createPrototypeLoader({ exec, fs, now, sleep, env, settings, com
         out.ok = true; return out;
       }
       if (input.replace !== undefined && input.replace !== '' && (!safeRegistrationRef(input.replace) || input.replace === input.branch)) return stop('bad-input', { detail: 'invalid --replace ref' });
-      if (!safeRef(input.branch)) return stop('bad-input', { detail: 'bad-branch', fallback: 'Pass --branch=lane/<name>: a branch under lane/ with only letters, digits, dot, dash, underscore and slash.' });
+      const hotpatch = typeof input.branch === 'string' && input.branch.startsWith('hotpatch/');
+      if (hotpatch && input.urgent) return stop('no-ready', { detail: 'hotpatch-needs-ci-receipt', fallback: 'A hotpatch ref never loads on an urgent marker: wait for the CI test receipt and the own-sha audit.' });
+      if (hotpatch && input.branch !== `hotpatch/${input.sha}`) return stop('no-ready', { detail: 'hotpatch-ref-sha-mismatch', fallback: 'The ref suffix must equal --sha exactly: hotpatch/<40-hex sha>.' });
+      if (!hotpatch && !safeRef(input.branch)) return stop('bad-input', { detail: 'bad-branch', fallback: 'Pass --branch=lane/<name>: a branch under lane/ with only letters, digits, dot, dash, underscore and slash.' });
       if (!validSha(input.sha)) return stop('bad-input', { detail: 'bad-sha', fallback: 'Use the full 40-character sha (git rev-parse origin/<branch>), not a short sha.' });
       if (!Number.isFinite(config.adoption?.timeoutMs) || config.adoption.timeoutMs < 0
         || !Number.isFinite(config.adoption.pollMs) || config.adoption.pollMs <= 0) return stop('bad-input', { detail: 'bad-adoption-settings', fallback: 'Fix adoption.timeoutMs and adoption.pollMs in scripts/settings/prototype-load.json.' });

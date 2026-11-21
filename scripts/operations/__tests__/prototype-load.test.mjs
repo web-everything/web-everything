@@ -344,6 +344,17 @@ describe('urgent prototype admission', () => {
     expect(f.readyWrites.at(-1)).toMatchObject({ tests: 'green', testCheck: { source: 'urgent-local-full', marker, reason } });
     expect(f.records).toContainEqual(expect.objectContaining({ type: 'prototype-load.urgent', clone: expect.any(String), registration: expect.objectContaining({ clone: expect.any(String), ref: expect.any(String), sha: SHA }), ref: BASE.branch, sha: SHA, reason, marker }));
   });
+  it('hotpatch ref loads only with a bound green CI test receipt and a NOT WEAKENED own-sha audit; urgent marker and pending CI refuse (P8-a: urgent refusal and ref/sha binding)', async () => {
+    const f = fixture({ testCheck: async () => null, urgentLedger: JSON.stringify(marker) });
+    expect(await f.run({ branch: `hotpatch/${SHA}`, urgent: true, reason })).toMatchObject({ ok: false, stopReason: 'no-ready', detail: 'hotpatch-needs-ci-receipt' });
+    expect(mutations(f, 'add')).toEqual([]);
+    expect(f.readyWrites).toEqual([]);
+    const g = fixture({ testCheck: async () => null, urgentLedger: JSON.stringify(marker) });
+    expect(await g.run({ branch: `hotpatch/${'d'.repeat(40)}`, reason })).toMatchObject({ ok: false, stopReason: 'no-ready', detail: 'hotpatch-ref-sha-mismatch' });
+    expect(mutations(g, 'add')).toEqual([]);
+    const h = fixture({ testCheck: async () => null, urgentLedger: JSON.stringify(marker) });
+    expect(await h.run({ branch: 'hotpatch/short', reason })).toMatchObject({ ok: false, detail: 'hotpatch-ref-sha-mismatch' });
+  });
   it.each(['ledger', 'workflow'])('refuses unreadable %s with an operator fallback', async (missing) => {
     const f = fixture({ testCheck: async () => null, ...(missing === 'workflow' ? { urgentLedger: JSON.stringify(marker), urgentWorkflow: 'broken' } : {}) });
     expect(await f.run({ urgent: true, reason })).toMatchObject({ ok: false, stopReason: 'no-ready', detail: 'no-urgent-marker', fallback: expect.stringContaining('urgent-verify') });
