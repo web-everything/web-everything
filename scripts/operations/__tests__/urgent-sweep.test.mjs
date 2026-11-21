@@ -4,9 +4,10 @@ import { urgentSweep, createSweepDeps } from '../urgent-sweep.mjs';
 import { removeRegistration } from '../../daemon-overlay.mjs';
 import { resolveOperation } from '../run.mjs';
 import { assertHotPatchSingleton } from '../../hot-patch.mjs';
+import { urgentLoadIdentity } from '../urgent-verify-marker.mjs';
 
 const sha = 'a'.repeat(40);
-const load = { type: 'prototype-load.urgent', trackingId: 'first-load', at: '2026-11-18T12:00:00Z', ref: 'lane/repair', sha, repo: 'https://example.com/org/repo', clone: '/clone',
+const load = { type: 'prototype-load.urgent', registrationCompletionRequired: true, trackingId: 'first-load', at: '2026-11-18T12:00:00Z', ref: 'lane/repair', sha, repo: 'https://example.com/org/repo', clone: '/clone',
   registration: { clone: '/clone', ref: 'lane/repair-m1', sha: 'b'.repeat(40) } };
 const workflows = { total_count: 1, workflow_runs: [{ check_suite_id: 7, head_sha: sha, path: '.github/workflows/ci.yml' }] };
 const required = ['changes', 'test-shard', 'test'];
@@ -24,6 +25,79 @@ function fixture(rows = required.map(n => check(n))) {
   return { d, state, settlements: () => [...new Map(state.filter(r => r.status !== 'sweep-cursor').map(r => [r.id, r])).values()], events, loads, run: () => urgentSweep({}, d) };
 }
 describe('urgent CI sweep', () => {
+  it.each([
+    ['settled-unregistered', 'ordinary'], ['unloaded-adopted', 'ordinary'],
+    ['settled-unregistered', 'hot-patch'], ['unloaded-adopted', 'hot-patch'],
+  ])('keeps a legacy %s receipt settled without registration-completion fields (%s)', async (status, kind) => {
+    const f = fixture();
+    // Ledger schema changes must retain a fixture with the pre-field persisted shape.
+    // Replay it without the fixture's synthetic writer completion records.
+    const { registrationCompletionRequired, ...legacyLoad } = load;
+    if (kind === 'hot-patch') Object.assign(legacyLoad, { ref: `hotpatch/${sha}`, hotPatch: { pr: 7239 } });
+    f.loads[0] = legacyLoad;
+    f.d.loads = () => f.loads;
+    f.state.push({ id: urgentLoadIdentity(legacyLoad), ref: legacyLoad.ref, sha, at: load.at, status,
+      ...(status === 'settled-unregistered' ? { ancestryVerified: true } : {}) });
+    f.d.overlayState.mockReturnValue({ corrupt: false, overlays: [] });
+    f.d.containsOverlay.mockReturnValue(false);
+    f.d.now = () => '2026-11-18T12:30:00Z';
+    const receipt = { ...f.state[0] };
+
+    await f.run();
+    await f.run();
+
+    expect(f.settlements()).toEqual([receipt]);
+    expect(f.d.escalate).not.toHaveBeenCalled();
+    expect(f.d.checks).not.toHaveBeenCalled();
+    expect(f.d.settle.mock.calls.filter(([r]) => r.status !== 'sweep-cursor')).toEqual([]);
+  });
+  it.each(['settled-unregistered', 'unloaded-adopted'])('does not grandfather an absent new intent with an old-shaped %s receipt', async status => {
+    const f = fixture();
+    f.d.loads = () => f.loads;
+    f.state.push({ id: urgentLoadIdentity(load), ref: load.ref, sha, at: load.at, status,
+      ancestryVerified: true, unloadEventSent: true, unloadEscalationSent: true });
+    f.d.overlayState.mockReturnValue({ corrupt: false, overlays: [] });
+    f.d.containsOverlay.mockReturnValue(false);
+    await f.run();
+    f.d.now = () => '2026-11-18T12:30:00Z';
+    expect(await f.run()).toMatchObject({ results: [{ status: 'needs-you', detail: expect.stringContaining('Registration completion is unproven') }] });
+  });
+  it.each([
+    ['settled-unregistered', 'explicit-false'], ['unloaded-adopted', 'explicit-false'],
+    ['settled-unregistered', 'resumed-monitoring'], ['unloaded-adopted', 'resumed-monitoring'],
+    ['settled-unregistered', 'unproven-ancestry'], ['settled-green', 'time-based-green'],
+    ['settled-unloaded', 'removal-only'], ['unloaded-pending-adoption', 'pending-adoption'],
+  ])('keeps a legacy %s receipt monitored when %s', async (status, variant) => {
+    const f = fixture();
+    const { registrationCompletionRequired, ...legacyLoad } = load;
+    f.loads[0] = legacyLoad;
+    f.d.loads = () => f.loads;
+    const receipt = { id: urgentLoadIdentity(legacyLoad), ref: load.ref, sha, at: load.at, status,
+      ancestryVerified: variant !== 'unproven-ancestry', unloadEventSent: true, unloadEscalationSent: true,
+      ...(variant === 'explicit-false' ? { registrationComplete: false } : {}) };
+    f.state.push(receipt);
+    if (variant === 'resumed-monitoring') f.state.push({ ...receipt, status: 'monitoring-ci' });
+    f.d.overlayState.mockReturnValue({ corrupt: false, overlays: [] });
+    f.d.containsOverlay.mockReturnValue(false);
+    await f.run();
+    f.d.now = () => '2026-11-18T12:30:00Z';
+    expect(await f.run()).toMatchObject({ results: [{ status: 'needs-you', detail: expect.stringContaining('Registration completion is unproven') }] });
+  });
+  it.each(['unloadEventSent', 'unloadEscalationSent'])('retries an explicit incomplete %s checkpoint on a legacy adopted receipt', async flag => {
+    const f = fixture();
+    const { registrationCompletionRequired, ...legacyLoad } = load;
+    f.loads[0] = legacyLoad;
+    f.d.loads = () => f.loads;
+    f.state.push({ id: urgentLoadIdentity(legacyLoad), ref: load.ref, sha, at: load.at,
+      status: 'settled-unregistered', ancestryVerified: true });
+    f.state.push({ id: urgentLoadIdentity(legacyLoad), ref: load.ref, sha, at: load.at, status: 'unloaded-adopted',
+      unloadEventSent: true, unloadEscalationSent: true, [flag]: false });
+    expect(await f.run()).toMatchObject({ results: [{ status: 'unloaded-adopted' }] });
+    expect(f.d.event).toHaveBeenCalledTimes(flag === 'unloadEventSent' ? 1 : 0);
+    expect(f.d.escalate).toHaveBeenCalledTimes(flag === 'unloadEscalationSent' ? 1 : 0);
+    expect(f.settlements()[0]).toMatchObject({ status: 'unloaded-adopted', unloadEventSent: true, unloadEscalationSent: true });
+    expect(await f.run()).toMatchObject({ results: [] });
+  });
   it('exempts absent CI for a conflict load from normal timers, then resumes monitoring when CI runs', async () => {
     const f = fixture([]);
     f.loads[0] = { ...load, conflict: { pr: 42, mergeableState: 'dirty' } };

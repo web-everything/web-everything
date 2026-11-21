@@ -987,7 +987,7 @@ export function createPrototypeLoader({ exec, fs, now, sleep, env, settings, com
         } catch (e) { return stop('no-ready', { detail: 'hot-patch-admission-changed', error: String(e.message), fallback: 'Repair PR/CI evidence at this SHA and retry.' }); }
       }
       if (input.urgent) {
-        urgentIntent = { trackingId: randomUUID(), at: new Date(now()).toISOString(), type: 'prototype-load.urgent', ref: input.branch, sha: input.sha, clone: out.clone, repo: normalizeUrgentRepo(requireGit('remote', 'get-url', 'origin')), registration: { clone: out.clone, ref: out.effectiveRef, sha: out.effectiveSha }, reason: input.reason, marker: checkRun.marker ?? null };
+        urgentIntent = { trackingId: randomUUID(), at: new Date(now()).toISOString(), type: 'prototype-load.urgent', registrationCompletionRequired: true, ref: input.branch, sha: input.sha, clone: out.clone, repo: normalizeUrgentRepo(requireGit('remote', 'get-url', 'origin')), registration: { clone: out.clone, ref: out.effectiveRef, sha: out.effectiveSha }, reason: input.reason, marker: checkRun.marker ?? null };
         if (hotPatch) urgentIntent.hotPatch = hotPatch;
         if (conflict) urgentIntent.conflict = conflict;
         // Persist intent before any registration mutation; failure refuses admission.

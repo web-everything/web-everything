@@ -333,7 +333,7 @@ describe('urgent prototype admission', () => {
       if (record.type === 'prototype-load.urgent') observed.push({ record, mutations: calls.filter(c => c.cmd === 'node' && c.args[1] === 'add' && !c.args.includes('--check')).length });
     } });
     expect(await f.run({ urgent: true, reason })).toMatchObject({ ok: true });
-    expect(observed).toEqual([{ record: expect.objectContaining({ trackingId: expect.any(String), clone: expect.any(String), sha: SHA }), mutations: 0 }]);
+    expect(observed).toEqual([{ record: expect.objectContaining({ trackingId: expect.any(String), clone: expect.any(String), sha: SHA, registrationCompletionRequired: true }), mutations: 0 }]);
     expect(mutations(f, 'add')).toHaveLength(1);
   });
   it('refuses registration when the urgent tracking intent cannot be written', async () => {

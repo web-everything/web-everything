@@ -178,13 +178,25 @@ export async function urgentSweep(_input = {}, deps = createSweepDeps()) {
     if (settlements.some(r => !/^[a-f0-9]{64}$/.test(r?.id ?? '') || !['unload-decision', 'monitoring-ci', 'monitoring-unregistered', 'monitoring-green', 'settled-green', 'settled-unloaded', 'unloaded-pending-adoption', 'unloaded-adopted', 'settled-unregistered', 'sweep-cursor'].includes(r.status)))
       throw new Error('unreadable urgent settlement ledger; repair it before sweeping');
     // Historical time-based green receipts never prove an overlay is no longer registered.
-    // Old unload receipts prove removal only; resume them through the adoption check too.
+    // Old removal-only receipts still need adoption; historical terminal receipts retain their proof.
     const records = deps.loads(), complete = completedUrgentRegistrations(records);
+    const loads = new Map(records.filter(r => r.type === 'prototype-load.urgent').map(r => [identity(r), r]));
+    const latest = new Map(settlements.filter(r => r.status !== 'sweep-cursor').map(r => [r.id, r]));
+    // Before the completion protocol, terminal receipts had no registrationComplete field.
+    // Only grandfather a terminal latest receipt for an old writer. New intents explicitly
+    // require completion, and resumed monitoring or an explicit false never grants this fallback.
+    const legacyTerminal = new Set([...latest.values()].filter(r => loads.has(r.id)
+      && !Object.hasOwn(loads.get(r.id), 'registrationCompletionRequired')
+      && !Object.hasOwn(r, 'registrationComplete')
+      && (r.status === 'unloaded-adopted' || r.status === 'settled-unregistered' && r.ancestryVerified === true)).map(r => r.id));
+    const registrationFinished = r => legacyTerminal.has(r.id) || r.registrationComplete === true && complete.has(r.id);
+    const unloadNotified = r => notificationsComplete(r) || legacyTerminal.has(r.id)
+      && !Object.hasOwn(r, 'unloadEventSent') && !Object.hasOwn(r, 'unloadEscalationSent');
     const unloaded = new Map(settlements.filter(r => ['settled-unloaded', 'unloaded-pending-adoption', 'unloaded-adopted'].includes(r.status)).map(r => [r.id, r]));
     const settled = new Set(settlements.filter(r => r.status === 'settled-unregistered' && r.ancestryVerified === true
-      && r.registrationComplete === true && complete.has(r.id)).map(r => r.id));
+      && registrationFinished(r) && (!legacyTerminal.has(r.id) || latest.get(r.id) === r)).map(r => r.id));
     const absent = new Map(settlements.filter(r => r.status === 'monitoring-unregistered').map(r => [r.id, r]));
-    for (const [id, r] of unloaded) if (r.status === 'unloaded-adopted' && r.registrationComplete === true && complete.has(id) && notificationsComplete(r)) settled.add(id);
+    for (const [id, r] of unloaded) if (r.status === 'unloaded-adopted' && registrationFinished(r) && unloadNotified(r)) settled.add(id);
     const ciEscalated = new Set();
     const conflictEscalated = new Set(settlements.filter(r => r.status === 'monitoring-ci' && r.conflictEscalated === true).map(r => r.id));
     const failureEscalated = new Set(settlements.filter(r => r.status === 'monitoring-ci' && r.failureEscalated === true).map(r => r.id));
@@ -201,7 +213,6 @@ export async function urgentSweep(_input = {}, deps = createSweepDeps()) {
         if (receipt.noVerdictEscalated === true) ciEscalated.add(receipt.id);
       }
     }
-    const loads = new Map(records.filter(r => r.type === 'prototype-load.urgent').map(r => [identity(r), r]));
     const entries = [...loads], cursor = settlements.filter(r => r.status === 'sweep-cursor').at(-1)?.id;
     // Use the complete load order so even a cursor load settled last pass remains an anchor.
     // Older ledgers (or an archived cursor load) start at the beginning.
@@ -221,7 +232,7 @@ export async function urgentSweep(_input = {}, deps = createSweepDeps()) {
         let pending = unloaded.get(id);
         if (pending) {
           pending = await notifyUnload(id, r, pending, notificationErrors);
-          if (pending.status === 'unloaded-adopted' && pending.registrationComplete === true && complete.has(id)) {
+          if (pending.status === 'unloaded-adopted' && registrationFinished(pending)) {
             report({ id, status: 'unloaded-adopted' });
             continue;
           }
