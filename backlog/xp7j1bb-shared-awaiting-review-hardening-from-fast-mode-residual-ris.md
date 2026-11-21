@@ -1,5 +1,4 @@
 ---
-bornAs: xp7j1bb
 kind: task
 status: open
 dateOpened: "2026-11-20"

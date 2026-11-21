@@ -1,5 +1,4 @@
 ---
-bornAs: xisblhr
 kind: task
 status: open
 scope: ["we:scripts/merge-ai-prs.mjs", "we:scripts/pr-land.mjs", "we:scripts/lib/pr-merge-gate.mjs", "we:scripts/lib/review-escalation.mjs", "we:scripts/operations/review-pr-io.mjs", "we:scripts/conveyor/delegated-clear-human.mjs"]
