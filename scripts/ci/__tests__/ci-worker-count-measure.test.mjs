@@ -8,7 +8,7 @@ import yaml from 'js-yaml';
 
 const { jobs } = yaml.load(readFileSync(resolve(process.cwd(), '.github/workflows/ci.yml'), 'utf8'));
 // R1104 / PR #7202 Acceptance 2: independent of the workflow and urgent-verify mirror.
-const ACCEPTED_CI_WORKER_DEFAULT = 4;
+const ACCEPTED_CI_WORKER_DEFAULT = 2;
 
 // Execute the workflow's actual shell, including bash's CI error policy. Proc metadata is
 // redirected to fixtures; discovered memory.peak paths are read from the real filesystem.
