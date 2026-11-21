@@ -274,6 +274,32 @@ describe('the shadow pass', () => {
     expect(out.items[0]).toMatchObject({ state: 'at-round-limit', lane: 'operator', verdict: 'send-back' });
     expect(out.act).toEqual([]);
   });
+  it.each([false, true])('a canonical later verdict settles a same-head hold through the sweep (%s)', async (settled) => {
+    const pr = PRS[1]; const { gh } = fakeGh({ prs: [pr] }); const dir = auditDir();
+    // The sweep reader observes a later commit time and selects at-round-limit; the judge requires a later
+    // verdict to settle the hold because its named head still equals the live head.
+    const comments = [{ user: { login: AUTOMATION_LOGINS[0] }, created_at: new Date(NOW - 4 * 3600_000).toISOString(),
+      body: `review paused: head ${pr.headRefOid} was already reviewed\n\nWaiting on your ruling (block, card or not-real):\n- \`src/a.mjs:5\` — x\n\n<!-- review-referral-hold: a1b5166bcd74 -->` }];
+    if (settled) comments.push({ user: { login: AUTOMATION_LOGINS[0] }, created_at: new Date(NOW - 2 * 3600_000).toISOString(),
+      body: `🔁 review — changes requested\n\nRecorded by babysit-2019.\n\nhead ${pr.headRefOid}\n- \`src/a.mjs:5\` — not real here` });
+    const wrapped = (bin, args, o) => /\/comments\?/.test(String(args.at(-1))) ? JSON.stringify([comments]) : gh(bin, args, o);
+    const judge = vi.fn(judgeRound);
+    const out = await runStallSweep({ now: NOW, env: {}, settings: shadow(), gh: wrapped, read: reader(strictGh(wrapped)),
+      judge, dir, log: () => {} });
+    if (settled) {
+      expect(judge).toHaveBeenCalledOnce();
+      expect(judge.mock.calls[0][0]).toMatchObject({ trigger: 'review-cap' });
+      expect(out.items[0]).toMatchObject({ state: 'at-round-limit', verdict: 'send-back' });
+      expect(out.items[0].reason).not.toContain('trigger-mismatch');
+    } else {
+      expect(judge).not.toHaveBeenCalled();
+      expect(out.items[0]).toMatchObject({ state: 'at-round-limit', lane: 'operator',
+        reason: 'fail-closed: trigger-mismatch: referral-hold vs review-cap' });
+      expect(lines(dir).find(r => r.phase === 'operator')).toMatchObject({ reason: 'fail-closed: trigger-mismatch: referral-hold vs review-cap' });
+    }
+    expect(JSON.stringify(out)).not.toContain('not an object');
+    expect(out.act).toEqual([]);
+  });
   it('one unreadable PR row makes the whole pass plan nothing', async () => {
     const fresh = { ...PRS[0], number: 13, headRefOid: 'not-a-sha', updatedAt: new Date(NOW).toISOString(), labels: [] };
     const { gh } = fakeGh({ prs: [...PRS, fresh] }); const dir = auditDir();

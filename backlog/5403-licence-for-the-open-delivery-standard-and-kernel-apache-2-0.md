@@ -5,10 +5,9 @@ size: 2
 parent: "5407"
 status: open
 dateOpened: "2026-10-08"
-preparedDate: "2026-11-17"
-preparedAgainstSha: "7491c6ecda714ea2590065f2a2e3c166b306d9bc"
 tags: []
 relatedReport: reports/2026-11-17-licence-open-delivery-standard-and-kernel.md
+relatedTo: ["098", "5409", "8623", "8627"]
 ---
 
 # Licence for the open delivery standard and kernel: Apache-2.0, AGPL or Fair Source
@@ -60,3 +59,25 @@ One line per class: either the handling, or `n/a: <why>`.
 5. **Identity scoping** — n/a: a decision card; it changes no code. Any build it spawns carries its own edge cases.
 6. **State over time** — n/a: a decision card; it changes no code. Any build it spawns carries its own edge cases.
 7. **Who wrote it** — n/a: a decision card; it changes no code. Any build it spawns carries its own edge cases.
+
+## Update 2026-11-20 (D10, decisions page)
+
+Operator ask (2026-11-20 20:59 ET): “note all as full decision item and run with preparation”.
+Decision id: D10 (decisions page, 2026-11-20 20:58 ET)
+Placement: everstandards
+move-to: everstandards
+
+### Digest / context
+
+**Apache-2.0 code and schemas + CC BY 4.0 spec text (default).** Reuse this card’s existing licence research and #098 rather than duplicate them. Source: [handoff format design](designs/everstandards-format-2026-11-20.md) “Operator decisions”; the page adds Community Specification License 1.0 as the alternative. Repos stay private until the operator decides otherwise; choosing a licence does not itself authorize publication.
+
+### Supported by default — existing licence split
+
+#098’s standard split is precedent, not a fresh fork disguised as a choice. Ratify the split for the new standards. (a) **Retain Apache-2.0 + CC BY 4.0 (default)**; (b) Community Specification License 1.0 is an explicit proposed amendment, requiring licence/patent/contribution analysis against that precedent before replacing it. The earlier kernel Apache/AGPL/FSL fork remains separately scoped above.
+
+Why no new fork: the page’s default reuses an existing standard-layer ruling; only an explicit proposal to supersede that ruling would reopen it. Code and prose licences coexist across different artifacts. `we:backlog/098-licensing-strategy.md:96` keeps webcases Apache-2.0 permanently; no spec-text choice converts that suite.
+
+Skeptic: Familiar licences may leave normative-spec patent/contribution questions less explicit than CSL 1.0. The default survives as the documented split, subject to a focused review of those terms and #5409’s contribution policy before publication; popularity is not legal clearance.
+Screen: pending focused prep on CSL and artifact boundaries; the historical prepared stamp is preserved, not a claim that CSL was already researched.
+What ratifying unlocks: consistent licence files per artifact, with a separate visibility gate. Operator answers: “D10 yes”.
+Prep still needed: reuse the linked report and #098; compare CSL 1.0 using primary terms, resolve patent/contribution interactions and independently attack the default. No public flip or licence installation occurs in this task.

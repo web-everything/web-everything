@@ -22,6 +22,7 @@ export const CAPACITY_LEAVES = Object.freeze({
   'resourceGate.fixCap.raiseMinMemFreePct': capacityLeaf(v => Number.isFinite(v) && v >= 25 && v <= 60, 'threshold', 40),
   'redTeamQueue.maxProbesPerTick': capacityLeaf(integer(0, 50), 'cap', 6),
   'redTeamQueue.minConcurrent': capacityLeaf(integer(0, OPERATOR_CAPACITY_MAX.redTeam), 'cap', 0),
+  'redTeam.queue.reservedSlots': capacityLeaf(integer(0, 8), 'cap', 4),
   'deliveryCapacity.pinUnits': capacityLeaf(integer(1, 200), 'cap', 1),
   'deliveryCapacity.pinUntil': capacityLeaf(epochMs, 'cap', 0),
   'deliveryCapacity.holdUntil': capacityLeaf(epochMs, 'threshold', Number.MAX_SAFE_INTEGER),
