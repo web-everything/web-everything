@@ -1,4 +1,4 @@
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, rmSync } from 'node:fs';
 import { spawnSync } from 'node:child_process';
 import { join } from 'node:path';
 import { pathToFileURL } from 'node:url';
@@ -45,6 +45,7 @@ export default {
       steps: [{ name: "Evaluate the drain's merge gates", status: 'completed', conclusion: 'failure' }], head_sha: head, completed_at: '2026-11-18T10:00:00Z', run_id: 42, run_attempt: 1 };
     const readMainCi = () => ({ status: 'completed', conclusion: 'success', completed_at: '2026-11-18T11:00:00Z' });
     try {
+      mkdirSync(join(dir, 'backlog'));
       const baseHead = excusePrMergeGateHolds([pr], { repo, mergeGateSetting: 'on', readMainCi,
         readFreeze: () => ({ frozen: false }),
         readMergeGateVerdict: args => readMergeGateVerdict({ ...args, cache: new Map(),

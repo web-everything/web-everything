@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { mkdtempSync, rmSync, readFileSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, rmSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { dispatchTimeoutRetry, timeoutGithubEffects, flushTimeoutFollowups } from '../ci-heal-pr-dispatch.mjs';
 import { timeoutKey } from '../../conveyor/timeout-retry-state.mjs';
@@ -15,7 +15,8 @@ const observed = { repo, head, runHead: head, open: true, run: 42, job: 123, job
   attempt: 1, jobAttempt: 1, jobName: 'merge-gate', status: 'completed', conclusion: 'failure' };
 const fixture = () => {
   const dir = mkdtempSync(join(process.env.TMPDIR, 'stale-freeze-')); dirs.push(dir);
-  return { repo, dir, effects: { observe: vi.fn(() => observed), request: vi.fn(() => ({ status: 'confirmed' })) },
+  mkdirSync(join(dir, 'backlog'));
+  return { repo, dir, root: dir, effects: { observe: vi.fn(() => observed), request: vi.fn(() => ({ status: 'confirmed' })) },
     readMainCi: vi.fn(() => green), fileFollowup: vi.fn() };
 };
 
@@ -112,7 +113,7 @@ describe('stale freeze rerun durable budget', () => {
 
 describe('stale freeze shared head cap and followup state', () => {
   it('uses new ordinary evidence when a legacy mixed head started with a stale freeze', async () => {
-    const opts = fixture(); opts.root = opts.dir;
+    const opts = fixture();
     writeFileSync(join(opts.dir, `${timeoutKey(evidence)}.json`), JSON.stringify({ version: 1, evidence,
       requests: [
         { signature: 'stale-main-freeze:40', target: { run: 40, job: 123, attempt: 1 }, status: 'confirmed' },
@@ -126,7 +127,7 @@ describe('stale freeze shared head cap and followup state', () => {
     expect(opts.fileFollowup.mock.calls[0][0].content).not.toContain('run 40');
   });
   it('does not file early when stale-freeze reruns follow an ordinary timeout, then reconciles an ambiguous ordinary retry', async () => {
-    const opts = fixture(); opts.root = opts.dir;
+    const opts = fixture();
     const ordinary = { eligible: true, repo, pr: evidence.pr, head, signature: 'test-timeout',
       failures: [{ path: 'scripts/example.test.mjs', name: 'ordinary timeout', kind: 'test-timeout' }] };
     expect((await dispatchTimeoutRetry({ ...ordinary, jobs: evidence.jobs }, opts)).status).toBe('requested');
@@ -150,7 +151,7 @@ describe('stale freeze shared head cap and followup state', () => {
     expect(content).not.toContain('run 44');
   });
   it.each([false, true])('keeps ordinary retries and their followup after two stale-freeze reruns (legacy=%s)', async legacy => {
-    const opts = fixture(); opts.root = opts.dir;
+    const opts = fixture();
     for (const run of [42, 43]) {
       opts.effects.observe.mockReturnValue({ ...observed, run, jobRun: run });
       expect((await dispatchTimeoutRetry({ ...evidence, run, signature: `stale-main-freeze:${run}`,

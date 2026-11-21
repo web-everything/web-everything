@@ -5947,6 +5947,8 @@ Cover both arrival orders, historical signature-only stale-freeze requests, ambi
 reconciliation, and a failed followup write replayed with the same payload. The mixed-run soak
 uses the real observation adapter and requires two ordinary retries and one ordinary followup
 after two confirmed stale-freeze reruns.
+Followup fixtures must set `root` to their scratch directory and create its `backlog/`
+directory even when `fileFollowup` is injected: payload planning still reads the corpus.
 
 ## S1b shadow accuracy evidence
 
