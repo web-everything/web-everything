@@ -11,11 +11,45 @@ import { writeRebuildState, readRebuildState } from '../../../lib/daemon-rebuild
 import { envTimeoutAppliesToPlan } from '../../../lib/daemon-rebuild/recovery.mjs';
 import { spawnSync } from 'node:child_process';
 import { addOverlay } from '../../../lib/daemon-overlays.mjs';
-import { readReadyCandidate } from '../../../lib/daemon-rebuild/state.mjs';
+import { readReadyCandidate, readyCandidatePath } from '../../../lib/daemon-rebuild/state.mjs';
+import { matchReadyCandidate } from '../../../lib/daemon-rebuild/adopt.mjs';
 import { rebuildClone } from '../../../lib/daemon-rebuild/rebuild.mjs';
 import { acquireRead, releaseRead } from '../../../lib/daemon-clone-lock.mjs';
 import { claimBuildLease, releaseBuildLease } from '../../../lib/daemon-rebuild/lease.mjs';
 import { watchPath, readForceWatch } from '../../../lib/daemon-force-adopt.mjs';
+
+/** Pre-upgrade JSON through strict job admission and the production adoption matcher; no Git writes. */
+export async function probeLegacyReadyAdmission(kind = 'candidate') {
+  const root = mkdtempSync(join(tmpdir(), 'legacy-ready-'));
+  const env = { WE_DAEMON_REBUILD_STRICT_EVIDENCE: '1', WE_DAEMON_STATE_DIR: join(root, 'state'),
+    WE_DAEMON_OVERLAY_DIR: join(root, 'overlays') };
+  try {
+    const file = readyCandidatePath(root, env);
+    const ready = { kind, prevHead: 'head', tree: 'tree', passedAt: new Date(1000).toISOString(),
+      adopt: { finalSha: 'target', inputsKey: 'inputs', mainSha: 'main', applied: [] },
+      ...(kind === 'fallback' ? { forInputsKey: 'inputs', dropRefs: [], failed: '' } : {}) };
+    const bytes = JSON.stringify(ready);
+    mkdirSync(dirname(file), { recursive: true });
+    writeFileSync(file, bytes);
+    const store = createJobStore(join(root, 'jobs'));
+    const readers = createRebuildReaders({ strict: true });
+    let match, forced, reattachments = 0;
+    const result = await rebuildCloneAsJob({ root, env, store, launchedBy: 'tick-start', now: () => 1001,
+      adopt: async () => {
+        readers.validate(root, env);
+        const record = readers.ready(root, env);
+        forced = record.forced;
+        const matched = matchReadyCandidate({ ready: record, plan: ready.adopt, prevHead: ready.prevHead,
+          treeOf: () => ready.tree, stillWanted: () => true, verifyBuilt: () => true,
+          nowMs: 1001, maxAgeMs: 60_000 });
+        match = matched.match;
+        return { adopted: Boolean(matched.adopt), reason: matched.reason };
+      },
+      reattach: async () => { reattachments += 1; }, evict() {}, log: { error() {} } });
+    return { adopted: result.adopted === true, reason: result.reason, match, forced, reattachments,
+      jobs: store.list().records.length, preserved: readFileSync(file, 'utf8') === bytes };
+  } finally { rmSync(root, { recursive: true, force: true }); }
+}
 
 /** Real watch/finalization and disk reads; Git is injected so no checkout is moved. */
 export async function probeNullableRollback(planKeys = { inputsKey: null, mainSha: null }) {

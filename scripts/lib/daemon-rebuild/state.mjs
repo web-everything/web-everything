@@ -201,8 +201,8 @@ export function readReadyCandidateStrict(root, env = process.env, read = readFil
   catch (error) { if (error?.code === 'ENOENT') return null; throw error; }
   const r = JSON.parse(text);
   if (!fields(r, { prevHead: string, tree: string, passedAt: date, kind: v => ['candidate', 'fallback'].includes(v),
-    forced: boolean, adopt: v => fields(v, { finalSha: string, inputsKey: string, mainSha: string, applied: pinnedApplied }) }, {
-    at: date, token: string, pid: positive, host: string, forInputsKey: string,
+    adopt: v => fields(v, { finalSha: string, inputsKey: string, mainSha: string, applied: pinnedApplied }) }, {
+    forced: boolean, at: date, token: string, pid: positive, host: string, forInputsKey: string,
     dropRefs: v => Array.isArray(v) && v.every(r => fields(r,
       { ref: string, sha: string, pr: v => v === null || positive(v) })),
     failed: v => typeof v === 'string',
@@ -215,7 +215,9 @@ export function readReadyCandidateStrict(root, env = process.env, read = readFil
   }
   if (r.adopt.applied.some(a => Object.hasOwn(a, 'pinnedFrom'))
     && (!FULL_SHA_RE.test(r.prevHead) || !FULL_SHA_RE.test(r.adopt.mainSha))) throw new Error('Invalid ready pin history bounds');
-  return r;
+  // Pre-upgrade normal candidates omitted forced; normalize only after validating
+  // present values, without rewriting the persisted evidence.
+  return { forced: false, ...r };
 }
 
 // A readable record can outlive its proof. Only adoption needs live pin proof;

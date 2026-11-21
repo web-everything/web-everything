@@ -17,7 +17,35 @@ import { readOverlayConflictWakes } from '../../overlay-conflict-wake.mjs';
 import { pendingPath, readPendingDrops } from '../../overlay-drop-pending.mjs';
 import * as preparation from '../prepare.mjs';
 import * as locks from '../../daemon-clone-lock.mjs';
-import { probeNullableRollback } from '../../../conveyor/soak/fixtures/rebuild-evidence-probe.mjs';
+import { probeNullableRollback, probeLegacyReadyAdmission } from '../../../conveyor/soak/fixtures/rebuild-evidence-probe.mjs';
+
+it.each(['candidate', 'fallback'])('legacy ready %s reaches tick adoption without a forced field', async kind => {
+  expect(await probeLegacyReadyAdmission(kind)).toMatchObject({
+    adopted: true, match: kind === 'candidate' ? 'exact' : 'fallback',
+    forced: false, preserved: true, jobs: 0, reattachments: 0,
+  });
+});
+
+it.each(['candidate', 'fallback'].flatMap(kind => [undefined, false, true, null, 'false', 'true', 0, 1, {}, []]
+  .map(forced => [kind, forced])))('legacy ready %s validates forced=%j without rewriting evidence', (kind, forced) => {
+  const { root, env } = fixture();
+  const file = readyCandidatePath(root, env);
+  const ready = { kind, prevHead: 'head', tree: 'tree', passedAt: new Date(0).toISOString(),
+    adopt: { finalSha: 'target', inputsKey: 'inputs', mainSha: 'main', applied: [] },
+    ...(kind === 'fallback' ? { forInputsKey: 'inputs', dropRefs: [], failed: '' } : {}),
+    ...(forced === undefined ? {} : { forced }) };
+  const bytes = JSON.stringify(ready);
+  mkdirSync(dirname(file), { recursive: true });
+  writeFileSync(file, bytes); // Raw persisted legacy shape: the current writer adds forced:false.
+  const readers = createRebuildReaders({ strict: true });
+  if (forced === undefined || typeof forced === 'boolean') {
+    expect(() => readers.validate(root, env)).not.toThrow();
+    expect(readers.ready(root, env)).toEqual({ ...ready, forced: forced ?? false });
+  } else {
+    expect(() => readers.ready(root, env)).toThrow(RebuildEvidenceError);
+  }
+  expect(readFileSync(file, 'utf8')).toBe(bytes);
+});
 
 it.each([{ inputsKey: null, mainSha: null }, {}, { inputsKey: 'known', mainSha: 'a'.repeat(40) },
   { inputsKey: null, mainSha: 'a'.repeat(40) }, { inputsKey: 'known', mainSha: null }])(
