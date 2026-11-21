@@ -5,8 +5,6 @@ size: 2
 parent: "5407"
 status: open
 dateOpened: "2026-10-08"
-preparedDate: "2026-11-17"
-preparedAgainstSha: "7491c6ecda714ea2590065f2a2e3c166b306d9bc"
 tags: []
 relatedReport: reports/2026-11-17-licence-open-delivery-standard-and-kernel.md
 relatedTo: ["098", "5409", "x25bedj", "x7ubblz"]

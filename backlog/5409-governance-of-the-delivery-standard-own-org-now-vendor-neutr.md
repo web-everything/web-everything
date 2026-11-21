@@ -5,8 +5,6 @@ size: 2
 parent: "5407"
 status: open
 dateOpened: "2026-10-08"
-preparedDate: "2026-11-17"
-preparedAgainstSha: "157f3184592f9b20aa4356a18cfd34df7f86a099"
 relatedReport: reports/2026-11-17-delivery-standard-governance.md
 tags: []
 relatedTo: ["5403", "x25bedj", "x7ubblz"]

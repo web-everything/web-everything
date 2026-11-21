@@ -4,8 +4,6 @@ kind: decision
 parent: "3383"
 status: open
 dateOpened: "2026-10-10"
-preparedDate: "2026-10-10"
-preparedAgainstSha: "75be239bfe71416cb2de79d80d25578d0e70918c"
 relatedTo: ["5452", "4601", "4086", "5767", "4609", "3007", "2626", "4282", "5712", "5488", "xctsi6q"]
 relatedReport: reports/2026-10-10-event-stream-state-manager.md
 tags: [conveyor, daemons, event-driven, state-store, decision-prep]
