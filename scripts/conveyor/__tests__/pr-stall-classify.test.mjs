@@ -742,8 +742,9 @@ describe('drain waits for a conflict or pending checks have a known owner', () =
     expect(at('drain-skip:checks-pending', { row: { actor: 'ci', liveJob: 'ci' } })).toBeNull();
   });
   it('every kind the drain can emit is mapped or fails closed visibly', () => {
-    for (const s of ['drain-skip:conflicting', 'drain-skip:checks-pending']) {
-      expect(at(s, { row: { actor: 'drain' } }).reason, s).not.toContain('unknown waiting state');
+    for (const [s, actor] of [['drain-skip:conflicting', 'fixer'], ['drain-skip:checks-pending', 'ci']]) {
+      expect(at(s, { row: { actor } }), s).toMatchObject({ lane: 'system', action: 'tooling-card' });
     }
+    expect(at('drain-skip:future-kind', { row: { actor: 'drain' } }).reason).toContain('unknown waiting state');
   });
 });

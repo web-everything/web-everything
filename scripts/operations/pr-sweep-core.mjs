@@ -218,7 +218,7 @@ export function nextActions(pr) {
 
 const DRAIN_SKIP_ACTOR = Object.freeze({
   'red-team-pending': 'red-team', 'not-certified': 'operator', 'queue-file-overlap': 'drain', 'overlap-yield': 'drain',
-  'ready-not-reached': 'drain', conflicting: 'fixer', 'checks-pending': 'ci',
+  'ready-not-reached': 'drain', 'conflicting': 'fixer', 'checks-pending': 'ci',
 });
 
 // `review-gate` is the review's own mirror, not CI (operator-queue drops it too).
