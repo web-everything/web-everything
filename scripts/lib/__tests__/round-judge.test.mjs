@@ -352,10 +352,10 @@ describe('non-converging stop (R469: a new finding class each round)', () => {
     const r = judge([r1(), rt(H(9), [['src/d.mjs', 5, 'delta timeout unit mismatch in header']])], { nonConverging: { enabled: true } });
     expect(r.verdict).not.toBe('non-converging');
   });
-  it('does not fire at round 1, or when a finding is re-raised (that is the repeat path)', () => {
+  it('does not fire at round 1, but a re-raised finding does not veto the round 2 stop', () => {
     expect(judge([r2()], { nonConverging: { enabled: true } }).verdict).not.toBe('non-converging');
     const again = rt(H(9), [['src/a.mjs', 10, 'alpha parser drops the trailing record'], ['src/e.mjs', 8, 'epsilon path join loses the drive']]);
-    expect(judge([r1(), again], { nonConverging: { enabled: true } }).verdict).not.toBe('non-converging');
+    expect(judge([r1(), again], { nonConverging: { enabled: true } }).verdict).toBe('non-converging');
   });
   it('a second opinion cannot loosen it', () => {
     const r = judge([r1(), r2()], { nonConverging: { enabled: true }, llm: () => ({ verdict: 'grant', k: 1, reasons: ['x'] }) });
@@ -462,5 +462,57 @@ describe('referral hold settle: sparse history', () => {
     const h = bot(`review paused: head ${H(1)} was already reviewed\n\nWaiting on your ruling (block, card or not-real):\n- \`src/a.mjs:5\` — x\n\n<!-- review-referral-hold: abcdef0123456789 -->`, at());
     const sparse = [h, , bot('hi', at())]; // eslint-disable-line no-sparse-arrays
     expect(detectRoundCap({ comments: sparse, pr: PR, head: H(9), state: 'at-round-limit' })).toMatchObject({ trigger: 'referral-hold' });
+  });
+});
+
+describe('non-converging counts rounds across sources and has no repeat veto', () => {
+  const on = { nonConverging: { enabled: true } };
+  const bumps = ['alpha parser drops the trailing record', 'beta cache never expires entries', 'gamma retry loop spins forever', 'delta timeout unit mismatch in header', 'epsilon path join loses the drive', 'zeta token refresh races'];
+  it('counts red-team rounds across sources: the #7188 sequence (6 red-team rounds, each a new bypass) is non-converging', () => {
+    const rounds = bumps.map((s, i) => rt(H(i + 1), [[`src/f${i}.mjs`, i + 1, s]]));
+    expect(judge(rounds, on).verdict).toBe('non-converging');
+    expect(judge(rounds, { ...on, trigger: 'review-cap' }).verdict).toBe('non-converging');
+  });
+  it('counts a review round and a red-team round together, whichever source tripped the cap', () => {
+    const comments = [review(['- `src/a.mjs:1` — alpha parser drops the trailing record']), rt(H(9), [['src/e.mjs', 8, 'epsilon path join loses the drive']])];
+    expect(judge(comments, on).verdict).toBe('non-converging');
+    expect(judge(comments, { ...on, trigger: 'review-cap' }).verdict).toBe('non-converging');
+  });
+  it('a single re-raised finding no longer vetoes the stop (repeats go to the unfixed-finding path)', () => {
+    const again = rt(H(9), [['src/a.mjs', 10, 'alpha parser drops the trailing record'], ['src/e.mjs', 8, 'epsilon path join loses the drive']]);
+    const first = rt(H(1), [['src/a.mjs', 10, 'alpha parser drops the trailing record'], ['src/b.mjs', 20, 'beta cache never expires entries']]);
+    expect(judge([first, again], on).verdict).toBe('non-converging');
+  });
+  it('stays off when not enabled, and shrinking is still progress', () => {
+    const rounds = bumps.slice(0, 2).map((s, i) => rt(H(i + 1), [[`src/f${i}.mjs`, i + 1, s]]));
+    expect(judge(rounds).verdict).not.toBe('non-converging');
+    const two = rt(H(1), [['src/a.mjs', 1, 'alpha parser drops the trailing record'], ['src/b.mjs', 2, 'beta cache never expires entries']]);
+    expect(judge([two, rt(H(9), [['src/d.mjs', 5, 'delta timeout unit mismatch in header']])], on).verdict).not.toBe('non-converging');
+  });
+});
+
+
+describe('non-converging stop precedes other verdict paths', () => {
+  const on = { nonConverging: { enabled: true }, trigger: 'review-cap' };
+  it('three identical review rounds stop before the unfixed-send-back path, even if refuted', () => {
+    const comments = Array.from({ length: 3 }, () => review(['- `src/a.mjs:1` — alpha parser drops the trailing record']));
+    expect(judge(comments, on).verdict).toBe('non-converging');
+    expect(judge(comments, { ...on, verify: () => ({ status: 'refuted', evidence: 'observed test' }) }).verdict).toBe('non-converging');
+  });
+  it('a weakening summary does not preempt a non-shrinking stop', () => {
+    const comments = [review(['- `src/a.mjs:1` — alpha parser drops the trailing record']), review(['- `src/b.mjs:2` — bypass the guard and fail-open'])];
+    expect(judge(comments, on).verdict).toBe('non-converging');
+  });
+  it('two non-shrinking red-team rounds stop before mechanical pushes and accepted review', () => {
+    const comments = [rt(H(1), [['src/a.mjs', 1, 'alpha parser drops the trailing record']]), rt(H(9), [['src/b.mjs', 2, 'beta cache never expires entries']])];
+    for (let i = 0; i < 2; i++) {
+      comments.push(bot('🔧 conveyor fix — re-armed for re-review\n\nThe previously accepted PR was re-pushed and its acceptance is being re-checked', at()));
+      comments.push(bot('✅ review — accepted\n\nRecorded by agent (unattended review-loop)', at()));
+    }
+    expect(judge(comments, on).verdict).toBe('non-converging');
+  });
+  it('an unconfirmed guard-path finding does not veto the stop', () => {
+    const comments = [rt(H(1), [['src/a.mjs', 1, 'alpha parser drops the trailing record']]), rt(H(9), [['src/b.mjs', 2, 'beta cache never expires entries'], ['scripts/lib/red-team-gate.mjs', 3, 'unproven guard issue', 'broken', false]])];
+    expect(judge(comments, on).verdict).toBe('non-converging');
   });
 });
