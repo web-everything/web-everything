@@ -65,6 +65,22 @@ describe('test-only additive delta carries the canonical audit', () => {
   refused('a deleted expect line', r => writeFileSync(join(r, 'src/__tests__/a.test.mjs'), "it('a', () => {\n});\n"), 'deleted');
   refused('an added .skip', addTest('b.test.mjs', "it.skip('x', () => {});\n"), 'weakening');
   refused('an added .only', addTest('b.test.mjs', "it.only('x', () => {});\n"), 'weakening');
+  refused('a bracket-form only', addTest('b.test.mjs', "it['only']('x', () => {});\n"), 'weakening');
+  refused('a multiline skip', addTest('b.test.mjs', "it .\nskip('x', () => {});\n"), 'weakening');
+  it('refuses a marker under color.ui=always', () => {
+    const { repo, audited } = makeRepo();
+    git(repo, 'config', 'color.ui', 'always');
+    const head = follow(repo, addTest('b.test.mjs', "it.skip('x', () => {});\n"));
+    expect(testOnlyAdditiveDelta(repo, audited, head)).toMatchObject({ ok: false, reason: 'weakening-marker-added' });
+  });
+  it('refuses to carry from an older pass past a newer WEAKENED ancestor', () => {
+    const { repo, audited } = makeRepo();
+    const mid = follow(repo, addTest('b.test.mjs'));
+    const head = follow(repo, addTest('c.test.mjs'));
+    const rec = (h, verdict) => ({ head: h, base: 'b'.repeat(40), questionHash: QUESTION_HASH, at: '2026-11-17T00:00:00Z', verdict, findings: verdict === 'WEAKENED' ? ['f'] : [] });
+    expect(gate(repo, audited, head, { records: [rec(audited, 'NOT WEAKENED'), rec(mid, 'WEAKENED')] })).toMatchObject({ ok: false });
+    expect(gate(repo, audited, head, { records: [rec(audited, 'NOT WEAKENED'), rec(head, 'NOT WEAKENED')] }).carried).toBeUndefined();
+  });
   refused('an added .todo', addTest('b.test.mjs', "it.todo('x');\n"), 'weakening');
   refused('a non-test path alongside tests', r => { addTest('b.test.mjs')(r); writeFileSync(join(r, 'src/code.mjs'), 'export const x = 1;\nexport const y = 2;\n'); }, 'non-test');
   refused('a vitest setup file', addTest('setup.test.mjs'), 'non-test');

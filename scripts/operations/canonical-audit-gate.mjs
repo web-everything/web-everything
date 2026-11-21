@@ -133,12 +133,15 @@ export function checkCanonicalAuditForOpen({ repo = process.cwd(), ref, sha, env
   // pass with covered base and no own-head verdict may exist for this head.
   if (!evidence.ok && evidence.reason !== 'weakened') {
     try {
-      const heads = [...new Set(records.map(r => String(r.head).toLowerCase()))].filter(h => h !== fullSha);
-      for (const head of heads) {
-        const audited = canonicalAuditEvidence(records, head, covers, null);
-        if (!audited.ok || audited.record?.head !== head) continue;
-        const delta = testOnlyAdditiveDelta(repo, head, fullSha, { exec });
-        if (!delta.ok) continue;
+      // Only the NEWEST audited ancestor may carry (an older pass must never outrank a later verdict), and this
+      // head must have no verdict of its own. The ancestor is judged with its own stored fingerprint so matching
+      // negative evidence still vetoes.
+      if (records.some(r => String(r.head).toLowerCase() === fullSha)) throw new Error('own verdict exists');
+      const isAncestor = h => { try { git('merge-base', '--is-ancestor', h, fullSha); return true; } catch { return false; } };
+      const newest = [...records].reverse().find(r => isAncestor(String(r.head).toLowerCase()));
+      const head = newest && String(newest.head).toLowerCase();
+      const audited = head && canonicalAuditEvidence(records, head, covers, newest.fingerprint ?? null);
+      if (audited?.ok && audited.record?.head === head && testOnlyAdditiveDelta(repo, head, fullSha, { exec }).ok) {
         const et = new Date(now()).toLocaleString('en-US', { timeZone: 'America/New_York', hour12: false });
         warn(`carried: test-only additive delta ${head}..${fullSha} (${et} ET)`);
         return { ok: true, reason: null, message: '', record: audited.record, sha: fullSha, carried: { head, kind: 'test-only-additive' } };

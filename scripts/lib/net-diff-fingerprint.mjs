@@ -46,7 +46,7 @@ export function carriesAcross(recordedFp, liveFp) {
 const FULL_SHA = /^[0-9a-f]{40}$/;
 const TEST_FILE = /(^|\/)[^/]*\.(test|spec)\.(?:[cm]?[jt]sx?)$/;
 const SETUP_OR_CONFIG = /(setup|config|vitest|jest|global|helper|fixture|mock|\.d\.ts$)/i;
-const WEAKENING_ADDED = /\.(skip|only|todo|skipIf|runIf|fails)\b|\b(xit|xtest|xdescribe|fit|fdescribe|ftest)\s*\(/;
+const WEAKENING_ADDED = /(\.|\[['"`])(skip|only|todo|skipIf|runIf|fails)\b|\b(xit|xtest|xdescribe|fit|fdescribe|ftest)\(/; // tested on whitespace-stripped lines
 
 /**
  * Merge-path (fail closed): does `from..to` change ONLY test files, and only by adding lines? `from` must be an
@@ -61,7 +61,7 @@ export function testOnlyAdditiveDelta(repo, from, to, { exec = execFileSync } = 
     if (typeof repo !== 'string' || !repo || !FULL_SHA.test(String(from)) || !FULL_SHA.test(String(to)) || from === to) return no('bad-shas');
     const run = (args) => Buffer.from(exec('git', ['-C', repo, ...args], { encoding: 'buffer', stdio: ['ignore', 'pipe', 'pipe'], maxBuffer: 64 * 1024 * 1024 }) ?? '').toString('utf8');
     try { run(['merge-base', '--is-ancestor', from, to]); } catch { return no('not-ancestor'); }
-    const flags = ['--no-ext-diff', '--no-textconv', '--ignore-submodules=none', '--no-renames'];
+    const flags = ['--no-ext-diff', '--no-textconv', '--ignore-submodules=none', '--no-renames', '--no-color'];
     const raw = run(['diff', '--raw', '-z', '--no-abbrev', ...flags, '--end-of-options', from, to]).split('\0');
     if (raw.pop() !== '') return no('unreadable-diff');
     if (!raw.length) return no('empty-delta');
@@ -82,9 +82,9 @@ export function testOnlyAdditiveDelta(repo, from, to, { exec = execFileSync } = 
       if (!m || m[2] !== '0' || !paths.includes(m[3])) return no('deleted-or-binary');
     }
     const patch = run(['diff', '-U0', ...flags, '--end-of-options', from, to]);
-    for (const line of patch.split('\n')) {
-      if (line.startsWith('+') && WEAKENING_ADDED.test(line)) return no('weakening-marker-added');
-    }
+    // Joined without whitespace so a marker split across lines (`it .` / `skip(`) is still seen.
+    const added = patch.split('\n').filter(line => line.startsWith('+')).map(line => line.slice(1).replace(/\s+/g, '')).join('');
+    if (WEAKENING_ADDED.test(added)) return no('weakening-marker-added');
     return { ok: true, from, to };
   } catch { return no('git-failure'); }
 }
