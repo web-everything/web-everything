@@ -236,7 +236,7 @@ describe('criticalMissesFor (#4034)', () => {
     expect(criticalMissesFor(scorecards, 'bugfix')).toHaveLength(1);
   });
 
-  it('fails closed on legacy rows with no filesTouched evidence (2 entries); clears once filesTouched is a non-critical scope (0 entries)', () => {
+  it('keeps legacy launcher misses critical after scope is supplied; clears ordinary documentation misses', () => {
     const rows = [
       legacyRow({ scoredAt: '2026-09-01T00:00:00Z' }),
       legacyRow({ scoredAt: '2026-09-05T00:00:00Z' }),
@@ -244,7 +244,9 @@ describe('criticalMissesFor (#4034)', () => {
     expect(criticalMissesFor(rows, 'bugfix')).toHaveLength(2);
 
     const rowsWithScope = rows.map((r) => ({ ...r, filesTouched: ['scripts/codex-direct-task.mjs', 'scripts/gemini-direct-task.mjs'] }));
-    expect(criticalMissesFor(rowsWithScope, 'bugfix')).toHaveLength(0);
+    expect(criticalMissesFor(rowsWithScope, 'bugfix')).toHaveLength(2);
+    const ordinaryRows = rows.map(r => ({ ...r, filesTouched: ['docs/guide.md'] }));
+    expect(criticalMissesFor(ordinaryRows, 'bugfix')).toHaveLength(0);
   });
 });
 
@@ -331,5 +333,18 @@ describe('criticalWorkVerdict + isCriticalMiss — every security-proxy arm (PR 
     expect(isCriticalMiss(row)).toBe(false);
     expect(isCriticalMiss({ ...row, tags: ['security'] })).toBe(true);
     expect(isCriticalMiss(row, { tags: ['security'] })).toBe(true);
+  });
+});
+
+describe('admission/application fixture trust boundary', () => {
+  it.each([
+    'scripts/lib/__tests__/fixtures/agy-target-path-cases.mjs',
+    'scripts/lib/__tests__/fixtures/future/nested-case.json',
+  ])('marks fixture %s critical, including repo-prefixed scope', path => {
+    expect(criticalWorkVerdict({ filesTouched: [path] }).critical).toBe(true);
+    expect(criticalWorkVerdict({ filesTouched: [`we:${path}`] }).critical).toBe(true);
+  });
+  it('does not match a similarly named fixture directory', () => {
+    expect(criticalWorkVerdict({ filesTouched: ['scripts/lib/__tests__/fixtures-other/case.mjs'] }).critical).toBe(false);
   });
 });

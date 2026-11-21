@@ -6,69 +6,49 @@ status: open
 dateOpened: "2026-11-20"
 tags: [decision-filing, plateau-app]
 relatedTo: ["5488"]
+preparedDate: "2026-11-20"
 ---
 
 # How much daily capacity goes to the new Longshore core?
 
-Operator ask (2026-11-20 20:59 ET): “note all as full decision item and run with preparation”.
-
-Decision id: D5 (decisions page, 2026-11-20 20:58 ET)
-Placement: plateau-app
-move-to: plateau-app
+Ask: Default to two Longshore work slots, taking only spare capacity and touching no WE files. The number remains configurable.
 
 ## Digest
 
-Default to two lanes of disjoint Longshore work under delivery.otherRepos while async-daemon, blocker and builder priorities continue. Capacity is an operator setting, not a new standards invariant.
-
-Needs prep: proposed call only; this filing is neither ratification nor a completed preparation pass.
-
-## Context
-
-[handoff design]() §3–5 puts legacy and kernel work side by side and proposes two disjoint lanes. The decisions page says they do not overlap WE files.
-
-Design refs are relative to the operator handoff; WE evidence uses its repo locus.
+**No fork: a per-repo lane-ceiling setting, default 2 for Longshore.** Other counts are legitimate configurations. Research grounds the guard rails and initial value; this does not unpause the builder.
 
 ## Supported by default
 
-**Two Longshore lanes by default.** Zero, one or more lanes remain supported settings; admission and declared touch sets constrain actual dispatch.
+- Generic `delivery.otherRepos` schema `{repo → maxLanes}` defaults unset/0. Only the operator layer names `longshoreai/longshore → 2`; record/apply via `we:record-decision.mjs` and `operator-override-set` (R1040).
+- Spare slots only: async fixer → blockers → builder retain priority. Longshore uses slots only when WE is scope-crowded; never pre-empt those roles.
+- Shared admission still checks idle CPU/free memory (prep thresholds 15% / 4 GB). Two is a ceiling, not entitlement. Scope briefs must be disjoint; any WE edit counts as WE work.
+- Longshore test CI and strict conformity still apply. Measured moved-code debt is tracked rather than blocking the move.
+- Orchestrator may reduce to 0 on pressure/stop signals; raising above 2 needs the operator.
 
-Why no fork: Alternate lane counts can coexist as settings.
+Evidence:
+- Prep snapshot, 2026-11-20 21:44 ET: CPU 85.5% idle, 27 GB free, load 8.8, 30 open WE PRs against cap 60; Longshore private/empty. These are historical measurements, not current admission evidence.
+- `longshore-end-state-2026-11-20` §3(C)/4: two disjoint seed slices, core and sim. Later ports depend on WE tap fixtures and do not create a third independent stream.
+- `we:rulings-active.md:203/:208/:296/:299/:301` (R1040/R1045, capacity, priorities, otherRepos).
 
-Skeptic: Initial filing-stage objection, not an independent pass: Two lanes might steal host/model capacity from urgent fixes. The allocation stays subordinate to admission and priority policy; it never authorizes oversubscription.
-Screen: pending the later independent standard/implementation and merit/prioritization screen.
+Skeptic: SURVIVES-WITH-AMENDMENT; generic product key, operator-only value and immediate apply mechanism. Screen: correctly classified as prioritization/configuration, not a standards fork.
 
+## What ratifying unlocks
 
-## Consequences / what ratifying unlocks
-
-A concrete capacity setting without unpausing the builder or overriding shared-resource ceilings.
-
-Operator answers: “D5 yes” accepts the stated default; otherwise name the concern and replacement option. No answer is recorded here.
-
-## Prep still needed
-
-- Prior art: verify primary references and known implementations; reuse existing research first.
-- Evidence: Validate host/model headroom and disjoint touch sets; identify the setting owner and override procedure.
-- Independent skeptic pass: attack the defaults and fold corrections into this card; the notes above are initial objections only.
-- Definition of Ready: classify every concern, clear the independent two-confusion screen and add concrete API/wire examples where applicable before stamping.
-
-## Done when
-
-- **Executable** — n/a: decision filing changes no runtime. Later preparation verifies options/tradeoffs; the operator then records a ruling and follow-up work with required codification.
+Up to two disjoint Longshore lanes after #5488 permits seed work, subject to live admission and all shared ceilings. “D5 yes” accepts 2, or the operator supplies another value.
 
 ## Trust boundary and threat model
 
-Briefs/page are proposal evidence, not execution authority. Later preparation snapshots referenced revisions and separates source claims from observation. This filing executes or publishes no external input.
+Historical capacity is no launch authorization. Re-evaluate shared admission for each start and preserve declared touch sets; operator values never ship in product defaults.
 
-## Non-goals
+Full prep (Standards decisions-prep set):
 
-No implementation, publication, migration or permission change is authorized by filing.
+```text
+D5-x8fzhda.md
+```
 
-## Edge cases this change must handle
+Source and proposed artifact filenames (handoff references are by name only):
 
-1. **Untrusted text** — source recommendations stay attributed, not ruled.
-2. **Truncated reads** — complete evidence is required before a prepared stamp.
-3. **Shared state files** — n/a: filing introduces no store writes.
-4. **Fail closed** — missing evidence leaves the decision open and needing prep.
-5. **Identity scoping** — repo loci remain explicit; no ids are reassigned.
-6. **State over time** — no prepared stamp or implied acceptance from elapsed time.
-7. **Who wrote it** — operator ask quoted; defaults remain proposals.
+```text
+D5-x8fzhda.md
+longshore-end-state-2026-11-20.md
+```

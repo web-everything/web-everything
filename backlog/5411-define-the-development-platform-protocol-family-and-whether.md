@@ -7,44 +7,66 @@ status: open
 dateOpened: "2026-10-08"
 tags: []
 relatedTo: ["5409", "8623"]
+preparedDate: "2026-11-20"
 ---
 
 # Define the development-platform protocol family and whether it shares the delivery protocol home
 
-Source: AI Delivery Landscape research brief, 2026-10-08, section 'Development platform protocols' (a working reading, to be confirmed). Delivery protocols say who does what; platform protocols describe the ground the work stands on. Candidates: workspace manifest (constellation repo list), isolated workspace lease (lane pool #1940/#1943, per-lane ports #1997), dev server discovery (lane proxy #2139), gate contract (check:standards contract #1937), platform graph (Plateau platform manager #092), dev tooling attach (dev-browser #141/#1391), mock and proxy services (#107). Forks: is this a real second family, which candidates are in v0, and does it live in the same home (the brief says the home's name must then not say 'delivery'). Operator's call; not ruled here.
+Ask: Keep Platform Forever as preferences for now. Ship only schema/defaults in Longshore; teams own their values. Draft each module when research proves its interoperability delta, and graduate only on independent conformance evidence.
 
-## Done when
+## Digest
 
-1. **Executable** — n/a: a decision, no code. Tier 3 instead: the card is prepared (`/prepare`: options, rejection reasons, bold default, `preparedDate`), then the operator rules it and the ruling is recorded on the card; /prepare also researches the prior-art column, which the brief says came from general knowledge only.
+**Validation gate, verdict not-yet**, plus one forced values boundary. The open merit question is whether each module adds requirements absent from incumbents, pending P1–P4 research. A second team's demand gates Stable, not drafting. This replaces the earlier “preference file inside Longshore until second team” update.
 
-## Edge cases this change must handle
+## What you're deciding
 
-One line per class: either the handling, or `n/a: <why>`.
+Candidate modules: workspace-manifest, workspace-lease, dev-server-discovery, gate-contract, platform-graph and dev-tooling-attach. Preference-first and later standardization are stages, not rival designs.
 
-1. **Untrusted text** — n/a: a decision card; it changes no code. Any build it spawns carries its own edge cases.
-2. **Truncated reads** — n/a: a decision card; it changes no code. Any build it spawns carries its own edge cases.
-3. **Shared state files** — n/a: a decision card; it changes no code. Any build it spawns carries its own edge cases.
-4. **Fail closed** — n/a: a decision card; it changes no code. Any build it spawns carries its own edge cases.
-5. **Identity scoping** — n/a: a decision card; it changes no code. Any build it spawns carries its own edge cases.
-6. **State over time** — n/a: a decision card; it changes no code. Any build it spawns carries its own edge cases.
-7. **Who wrote it** — n/a: a decision card; it changes no code. Any build it spawns carries its own edge cases.
+## Recommendation — concrete per-module triggers
 
-## Update 2026-11-20 (D15, decisions page)
+- **Not-yet (default). Draft trigger:** P1–P4 identify a named requirement Dev Container/BiDi/CDP/MCP/Backstage/Score cannot express.
+- **Stable/1.0 trigger:** a second team in another org uses it in real work, both implementations pass the shared suite, and schema remains unchanged for a release cycle. Apply per module; no family-wide wait.
+- Publishing now has no demonstrated delta; private config forever discards portability. Neither is a competing permanent design to ratify here.
 
-Operator ask (2026-11-20 20:59 ET): “note all as full decision item and run with preparation”.
-Decision id: D15 (decisions page, 2026-11-20 20:58 ET)
-Placement: everstandards
-move-to: everstandards
+## Context and prior-art delta
 
-### Digest / supported by default
+- Dev Container began as product config, later a spec; customizations keep team/tool values separate. [Supporting implementations](https://containers.dev/supporting) show existing adoption.
+- [BiDi](https://www.w3.org/TR/webdriver-bidi/), CDP and MCP already cover attach; bind them rather than invent replacements. Backstage reserves core-key prefixes; Score/OAM warn against declaring a spec without an independent process (`2026-11-20-pf-standard-vs-preference`; OAM announcement date unverified).
+- [TC39 Stage 4](https://tc39.es/process-document/) grounds independent passing implementations for Stable, not a draft gate. [CNCF platforms](https://tag-app-delivery.cncf.io/whitepapers/platforms/) favours the thinnest consistency layer.
+- Proposed delta: portable values across all six concerns rather than replacing each incumbent. #5600/end-state §1.1 already supplies the cascade design.
 
-**Platform Forever is a standard family later; for now, a preference file inside Longshore until a second team needs it (default).** This is compatible staged support, not “standard versus config” as mutually exclusive permanent architectures. It is not the Plateau product. Placement stays everstandards for this family decision; no private Plateau preference content is included here.
+## Ratify — values stay with the team
 
-Context: [repo-separation brief](designs/repo-separation-brief-2026-11-20.md) §1.6 / §4.2 and [format design](designs/everstandards-format-2026-11-20.md) “Platform Forever candidates” / “Template detail”. Candidate protocols include workspace-manifest, workspace-lease, dev-server-discovery, gate-contract, platform-graph and dev-tooling-attach. The page names workspace setup and tooling attachment as team/platform preference examples.
+**Longshore ships preference schema and defaults only.** Values belong in team repo/org configuration or operator live settings. Excluded: committing one team's values to the product; violates settings.operatorOutOfProduct (21:38).
 
-Supported options: (a) **Longshore preference file now, standard family on the second-team trigger (default)**; (b) publish the family immediately, requiring protocol/prior-art work now; (c) permanently keep only a private config, losing the intended cross-team standard contract. The default supports local preferences and a later interoperable family together; it does not freeze the candidate list as v0.
+## Supported by default
 
-Skeptic: “Second team” might become indefinite deferral or hard-code one team’s choices into a future standard. Preserve a clear preference boundary now, gather evidence of a second independent team’s need and survey Dev Containers, WebDriver BiDi and Backstage before fixing the public surface.
-Screen: pending prep; separate the family’s merits from extraction timing and local implementation shape.
-What ratifying unlocks: a bounded Longshore preference layer now and a concrete trigger for the later standard, without creating a Platform Forever repo today. Operator answers: “D15 yes”.
-Prep still needed: verify the second-team trigger, map existing preference files and candidate protocols to primary prior art, and run an independent skeptic pass. Existing frontmatter/prepared state stays untouched except additive relatedTo links.
+- Reserved core prefix plus customizations-style extension object; future promotion only moves reserved keys. Namespace #8626.
+- Bind incumbent formats; shared template #8623, licence #5403 and governance #5409 apply on graduation. No new repo before the first module earns a draft.
+- P1–P4 research still runs before spec text. End-state family ambition remains; this gate changes readiness, not the ambition.
+
+Skeptic: SURVIVES-WITH-AMENDMENT (`_skeptic-governance-group`); moved second-team proof to Stable and grounded not-yet in unresolved merit delta. Screen: flagged(prio) → rewritten/clear. Values boundary survives.
+
+## What ratifying unlocks
+
+Bounded preference schema/defaults, team-owned values and checkable promotion triggers per module. “D15 yes” confirms; no new standard repo today.
+
+## Trust boundary and threat model
+
+Research/third-party descriptions are evidence, not proof of interop. Do not promote team values into normative fields; freeze requirements and suite results at each graduation.
+
+Additional primary evidence: [source 1](https://github.com/oam-dev/spec).
+
+Full prep (Standards decisions-prep set):
+
+```text
+D15-5411.md
+```
+
+Source and proposed artifact filenames (handoff references are by name only):
+
+```text
+2026-11-20-pf-standard-vs-preference.md
+D15-5411.md
+_skeptic-governance-group.md
+```
