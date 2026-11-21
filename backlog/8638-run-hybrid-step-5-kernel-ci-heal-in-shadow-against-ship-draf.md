@@ -1,4 +1,5 @@
 ---
+bornAs: xsw08od
 kind: story
 size: 3
 parent: "5488"

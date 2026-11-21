@@ -117,7 +117,7 @@ Skeptic: SURVIVES-WITH-AMENDMENT; gates Ship shapes, not every schema or who dra
 ### Supported by default
 
 - Bare bootstrap, minimal seed, conformity tool, sim copy and pure ports may start now; use `x-status: pending` placeholders for absent Ship shapes.
-- Hybrid step 5 (kernel ci-heal in shadow) emits claims/verdicts and waits on #5407 drafts; track it as #xsw08od, blocked by #5407.
+- Hybrid step 5 (kernel ci-heal in shadow) emits claims/verdicts and waits on #5407 drafts; track it as #8638, blocked by #5407.
 - Seq-only order, three gate outcomes, per-tick snapshots, one scheduler per tenant and drain-last remain engineering defaults. Capacity: #8628; store: #5785.
 
 ### Must-hold rules from the threat-model red team

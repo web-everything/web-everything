@@ -59,7 +59,7 @@ Details: `_redteam-format-group`.
 
 ## What ratifying unlocks
 
-WE export/binding work, separate maturity and level mappings with proof vectors, and stale-reference cleanup. Follow-ups: #xnulgp5 (maturity) and #xcfikoo (level axes/stale reference). No WE definitions migrate. “D9 yes” confirms.
+WE export/binding work, separate maturity and level mappings with proof vectors, and stale-reference cleanup. Follow-ups: #8637 (maturity) and #8636 (level axes/stale reference). No WE definitions migrate. “D9 yes” confirms.
 
 ## Trust boundary and threat model
 
