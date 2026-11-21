@@ -58,13 +58,20 @@ export function failClosedCapacity(key, value, { codeDefault, log = console.erro
   warn(log, `operator-override: operator-db-unreadable ${key}; using finite stricter value ${result}`);
   return result;
 }
+/** Enum-valued host overrides (on/off style settings): key -> the only allowed values. Anything else is refused.
+ *  They are stored in a SEPARATE file (operator-enum-store.mjs), so the numeric capacity store stays all-numbers. */
+export const ENUM_LEAVES = Object.freeze({
+  'ciHeal.loop': Object.freeze(['off', 'on']),
+});
+export const isEnumLeaf = key => Object.hasOwn(ENUM_LEAVES, key);
+export const validEnumValue = (key, value) => isEnumLeaf(key) && typeof value === 'string' && ENUM_LEAVES[key].includes(value);
 export const OPERATOR_OVERRIDES_RELATIVE_PATH = '.claude/operator-overrides.json';
 // userInfo().homedir comes from the account database, not $HOME, so a launcher cannot redirect the host-wide store.
 export const operatorOverridesPath = () => join(userInfo().homedir, OPERATOR_OVERRIDES_RELATIVE_PATH);
 const safe = s => String(s).replace(/[\x00-\x1f\x7f-\x9f]/g, ' ');
 function warn(log, message) { try { log(safe(message)); } catch { /* Diagnostics never break reads. */ } }
 export function validateKey(key) {
-  if (!Object.hasOwn(CAPACITY_LEAVES, key)) throw Error(`operator-override: refused ${key}; guard leaves need the signed-attestation slice`);
+  if (!Object.hasOwn(CAPACITY_LEAVES, key) && !isEnumLeaf(key)) throw Error(`operator-override: refused ${key}; guard leaves need the signed-attestation slice`);
 }
 /** `normalize: false` returns the stored values without lowering an inverted floor (the writer audits against them). */
 export function readOperatorOverrides({ file, log = console.error, normalize = true } = {}) {
