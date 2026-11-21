@@ -1,4 +1,7 @@
 import { readFileSync } from 'node:fs';
+import { execFileSync } from 'node:child_process';
+
+const GIT_TIMEOUT_MS = 15000;
 import { checkCanonicalAuditForOpen } from '../operations/canonical-audit-gate.mjs';
 
 const SETTINGS = new URL('../settings/review-auto-audit.json', import.meta.url);
@@ -32,7 +35,9 @@ export function auditOwedLine({ repo, pr, head }) {
 
 export function defaultAuditCheck({ repoDir }) {
   return (head, prRow) => {
-    const result = checkCanonicalAuditForOpen({ repo: repoDir, sha: head, ref: prRow.headRefName });
+    // Every git call is bounded: a stalled fetch must never block the daemon tick (it fails closed to owed-unknown).
+    const exec = (cmd, args, opts) => execFileSync(cmd, args, { ...opts, timeout: GIT_TIMEOUT_MS, killSignal: 'SIGKILL' });
+    const result = checkCanonicalAuditForOpen({ repo: repoDir, sha: head, ref: prRow.headRefName, exec });
     return /unreadable|truncated|malformed|fingerprint/i.test(result.message ?? '')
       ? { ...result, unknown: true } : result;
   };
