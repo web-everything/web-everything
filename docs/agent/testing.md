@@ -3777,6 +3777,12 @@ failure cleanup and parent-directory removal through the heavy-admission queue. 
 transform configs can substitute mutations without editing the working implementation.
 ## Live operator routing fixtures
 
+The shared Vitest setup sets `WE_CAPACITY_READERS=off`: default capacity observations and
+the legacy Codex threshold see unknown usage, without reading host rollouts, usage files,
+scorecards or rate ledgers, and ignore shipped operator readings. Inject `readers`/`quota`
+for capacity cases; pass a private `env` without the switch to test persisted fixture evidence.
+Production readers remain enabled unless the switch is explicitly set.
+
 Review-seat roster fixtures must cover scoped added seats as well as exact keys. Use
 `rosterForKey` at every lookup: exact settings-backed contracts win, and other `review-seat:`
 keys return the shared added-seat roster by identity so provider caps still apply. Pin primary
@@ -5909,6 +5915,13 @@ the replacement. Cover that acquisition order with a worker barrier after the
 generation guard releases, for both normal capacity and a single remaining record.
 At the size limit, assert exactly one append and the matching journal identity;
 either writer may win unless the fixture explicitly orders acquisition.
+## Live-owner adapter fixture imports
+
+Load the manual dispatcher, review job and reconcile graph during collection in
+`pr-live-owner-watch.test.mjs`. The real review adapter imports these modules even
+when dispatch and reconcile IO are injected, so a cold transform otherwise consumes
+the first case's five-second deadline. Reuse the collected modules in head-change
+and job-refusal cases; retain injected launch IO, assertions and per-case deadlines.
 
 ## Lane eligibility: absent checkout versus failed probe
 
@@ -5949,3 +5962,11 @@ staging the JSON request. The applier carries that pin to `review-set-label` as 
 ## S1b shadow accuracy evidence
 
 The static shadow returns per-file unknown evidence: unknown tests always join the selection, and unknown sources add every test reaching them. Ambiguity alone is not partial; only changed unreadable, oversized or deleted modules make the graph partial. Unchanged unreadable or oversized files remain unknown, widen reach, and appear in `unknownFiles`/`reasons` without setting partial. Literal paths anywhere in a source add edges. Existing full-suite classifiers and untracked/deleted non-test paths without importers escalate the shadow to full; listing failures do likewise. Symlinks and paths outside ROOT are never read. Test filesystem admission separately from parser bounds: oversized metadata must cause zero source reads, while exactly-at-cap files remain readable. Measure rows bind `head` (40 hex) and `base`, and record shadow mode, unknown count, selected/total tests and reasons; full shadow mode has no `shadowEscaped` tests. Sorted repo-relative `staticTests` preserves pure edge reach (including unknown widening) before escalation; measure rows record `staticTestCount` alongside `totalTests` and `mode`, and `shadowEscapedStatic` measures failures outside that reach even in full mode. Missing static evidence yields null counts/escapes. None of these fields changes the real decision; `staticTests` is diagnostic only.
+
+## Conflict watcher CLI contracts
+
+The conflict watcher's `runConflictWatchCli` is shared by its executable guard and PR snapshot
+contract. Set `cliMain` in `prFileContract` for callable entries so repeated argv checks reuse
+the loaded graph. Resetting the entire daemon graph twice inside the CLI test exceeded its
+60-second deadline on a coverage shard. Keep the file/standalone output comparison and zero-GitHub
+assertions intact; consumers without callable entries retain the fresh-import path.

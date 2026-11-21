@@ -2154,9 +2154,8 @@ export function watchParkedPrConflicts({
   return results;
 }
 
-const IS_CLI = process.argv[1] && resolve(process.argv[1]) === resolve(fileURLToPath(import.meta.url));
-if (IS_CLI) {
-  const argv = process.argv.slice(2);
+/** Repeatable CLI entry so argv contracts can reuse the loaded watcher graph. */
+export function runConflictWatchCli(argv = process.argv.slice(2)) {
   const flag = (name) => (argv.find((a) => a.startsWith(`--${name}=`)) || '').slice(name.length + 3) || undefined;
   const verb = argv.find((a) => !a.startsWith('--')) || 'sweep';
   const repo = flag('repo') || null;
@@ -2183,3 +2182,6 @@ if (IS_CLI) {
     }
   }
 }
+
+const IS_CLI = process.argv[1] && resolve(process.argv[1]) === resolve(fileURLToPath(import.meta.url));
+if (IS_CLI) runConflictWatchCli();
