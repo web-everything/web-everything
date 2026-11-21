@@ -5795,3 +5795,12 @@ For fixtures with arbitrary branches, workflow files or cross-repo couples, use
 Keep full commit IDs consistent across listings, live reads, check runs and saved
 refresh records. Resolve the diff at the listed head when a capped commits read
 or a later push intentionally makes the commits tip or live head differ.
+
+## Live-owner review adapter collection
+
+`pr-live-owner-watch.test.mjs` imports the manual dispatcher, review job and reconcile
+graph statically during collection. The first `review-dispatch` case otherwise loads
+these roots inside its five-second deadline, even when dispatch and reconcile IO are
+injected. Keep the production adapters exercised with injected effects and retain the
+original test deadlines and head-pinning assertions; avoid charging cold module loading
+to the first adapter case.
