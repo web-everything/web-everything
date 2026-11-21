@@ -150,7 +150,13 @@ export function planLabelInputRows({ repo, pr, items = [], liveLabels = [], self
   // landing during that refresh must also beat a historical addition in the same second.
   const observedIds = new Set(observedEvents.map(ledgerEventId));
   const latest = new Map();
-  items.map((it, i) => ({ it, i })).sort((a, b) => Date.parse(a.it.createdAt) - Date.parse(b.it.createdAt) || a.i - b.i)
+  items.map((it, i) => ({ it, i })).sort((a, b) => {
+    if (a.it.id != null && b.it.id != null) {
+      const left = BigInt(a.it.id), right = BigInt(b.it.id);
+      return left < right ? -1 : left > right ? 1 : a.i - b.i;
+    }
+    return Date.parse(a.it.createdAt) - Date.parse(b.it.createdAt) || a.i - b.i;
+  })
     .forEach(({ it }) => { if (HOLD_LABELS.includes(it.label)) latest.set(it.label, it); });
   const rows = [];
   for (const it of latest.values()) {
@@ -168,7 +174,7 @@ export function planLabelInputRows({ repo, pr, items = [], liveLabels = [], self
     // A delayed observation must not move an old addition after its clearing ceremony in append order.
     // This also covers the interval between clear-human's approval append and its live label swap.
     // GitHub timestamps describe a whole second. Only a strictly later second proves a clearance
-    // followed this addition. Same-second ambiguity tightens; connection order keeps a re-add latest.
+    // followed this addition. Same-second ambiguity tightens; event id order keeps a re-add latest.
     if (it.change === 'added' && clearances.some((e) => Math.floor(Date.parse(e.at) / 1000) > Math.floor(Date.parse(it.createdAt) / 1000)
       && ((approvalValid(e, now) && !e.delegation) || ((e.type === EVENT_TYPES.VERDICT || e.type === undefined)
         && verdictClears(e.verdict) && acceptanceCovers(e, headSha))))) continue;

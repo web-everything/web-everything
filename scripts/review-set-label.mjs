@@ -1245,7 +1245,7 @@ export function runReviewLabelCli({
   // its (never compared) diff stamped. With it, a live head or a derived net diff that differs is refused BEFORE any write.
   const expectFingerprintFlag = argv.find((a) => a === '--expect-fingerprint' || a.startsWith('--expect-fingerprint='));
   const expectedFingerprint = expectFingerprintFlag?.slice('--expect-fingerprint='.length).toLowerCase();
-  const pinnedClearHuman = to === 'clear-human' && expectHeadFlag !== undefined;
+  const pinnedClearHuman = to === 'clear-human';
   if (pinnedClearHuman && (!/^[0-9a-f]{40}$/.test(expectedHead || '')
     || argv.some(a => a === '--new-head' || a.startsWith('--new-head=')))) fail('clear-human requires --expect-head=<full 40-hex SHA> and no --new-head');
   const pinnedAccept = to === 'accepted' && (expectHeadFlag !== undefined || expectFingerprintFlag !== undefined);
@@ -1445,7 +1445,7 @@ export function runReviewLabelCli({
     prCommentsReadable = Array.isArray(parsed.comments);
     prComments = prCommentsReadable ? parsed.comments : [];
   } catch (e) {
-    fail(ghErr(e, 'gh pr view failed'), 1);
+    fail(ghErr(e, 'gh pr view failed'), pinnedClearHuman ? 2 : 1);
   }
 
   const refuseRearm = (reason) => {
@@ -1457,7 +1457,7 @@ export function runReviewLabelCli({
   if (to === 'rearm' && !prCommentsReadable) refuseRearm('comments unreadable — cannot prove no human clearance');
   if (to === 'rearm' && !/^[0-9a-f]{7,40}$/i.test(headSha.trim())) refuseRearm('head unreadable — cannot prove no human clearance');
 
-  if ((guardedRestamp || pinnedAccept || pinnedClearHuman || pinnedRearm || onlyIf === 'missing') && headSha !== expectedHead) fail('live head differs from --expect-head', 1);
+  if ((guardedRestamp || pinnedAccept || pinnedClearHuman || pinnedRearm || onlyIf === 'missing') && headSha !== expectedHead) fail('live head differs from --expect-head', pinnedClearHuman ? 2 : 1);
   if (expectNoReadiness && hasReviewLabel(currentLabels, READY_TO_MERGE_LABEL)) {
     fail('missing review handoff refused: producer readiness appeared after the caller observation', 1);
   }
@@ -1557,7 +1557,7 @@ export function runReviewLabelCli({
     fail(
       `${independence.reason} — nothing was changed (#2844). TWO ROUTES ACTUALLY CLEAR THIS PR, and neither is a `
       + 'flag on this command. (1) THE HUMAN CEREMONY: if the PR carries review:human, re-run with '
-      + '--to=clear-human --actor=<name> --reason="<the operator instruction authorising it>" — that target is '
+      + '--to=clear-human --expect-head=<full 40-hex head SHA> --actor=<name> --reason="<the operator instruction authorising it>" — that target is '
       + 'EXEMPT from this refusal and the durable comment records the clearance as a human ceremony; it is itself '
       + 'refused when the PR does NOT carry review:human. (2) A DIFFERENT SESSION: run the review, and this '
       + 'command, from a session that did not open the PR — its own session id is then the clearing actor and the '
@@ -2055,8 +2055,8 @@ export function runReviewLabelCli({
   // is a write — so a push after the first read leaves no ledger row and no comment, not only no label.
   if (pinnedAccept || pinnedClearHuman) {
     let live = null;
-    try { live = provider.readPrState(repo, pr).headRefOid; } catch (e) { fail(ghErr(e, 'gh pr view failed'), 1); }
-    if (live !== expectedHead) fail(pinnedClearHuman ? 'live head differs from --expect-head' : 'live head differs from --expect-head; nothing written', 1);
+    try { live = provider.readPrState(repo, pr).headRefOid; } catch (e) { fail(ghErr(e, 'gh pr view failed'), pinnedClearHuman ? 2 : 1); }
+    if (live !== expectedHead) fail(pinnedClearHuman ? 'live head differs from --expect-head' : 'live head differs from --expect-head; nothing written', pinnedClearHuman ? 2 : 1);
   }
 
   // Check the pin before each write. At the label write, reuse the clearance check's

@@ -395,6 +395,15 @@ describe('#5649 runMirrorApply', () => {
 
 describe('#5649 planLabelInputRows', () => {
   const base = { repo: REPO, pr: 7, selfLogin: 'me' };
+  it.each(['2026-10-12T11:00:00Z', '2026-10-12T10:00:00Z'])('uses the highest numeric event id for the latest label change (time %s)', time => {
+    const items = [
+      { ...tl('review:human', 'added', 'op', time), id: '9007199254740993' },
+      { ...tl('review:human', 'removed', 'op'), id: '9007199254740992' },
+    ];
+    expect(planLabelInputRows({ ...base, items, liveLabels: ['review:human'] })).toMatchObject([
+      { change: 'added', timelineId: '9007199254740993' },
+    ]);
+  });
   it('only the latest change per label counts, and only while it matches the live labels', () => {
     const items = [tl('review:human', 'added', 'op', '2026-10-12T09:00:00Z'), tl('review:human', 'removed', 'op', '2026-10-12T09:30:00Z')];
     expect(planLabelInputRows({ ...base, items, liveLabels: ['review:human'] })).toEqual([]); // stale: label is back, last change was a removal
@@ -446,13 +455,13 @@ describe('#5649 planLabelInputRows', () => {
   });
   it('distinct same-second timeline IDs survive deduplication and a retry retains the original baseline', () => {
     const approval = buildLedgerEvent({ type: 'approval', repo: REPO, pr: 7, at: '2026-10-12T12:00:00.100Z', source: 'review-set-label', approval: 'clear-human' });
-    const first = { ...tl('review:human', 'added', 'operator', '2026-10-12T12:00:00Z'), id: 'event-one' };
+    const first = { ...tl('review:human', 'added', 'operator', '2026-10-12T12:00:00Z'), id: '1' };
     const opts = { ...base, liveLabels: ['review:human'], items: [first] };
     const [old] = planLabelInputRows(opts);
     expect(planLabelInputRows({ ...opts, events: [approval, old] })).toEqual([]);
-    const next = { ...first, id: 'event-two' };
+    const next = { ...first, id: '2' };
     const [newHold] = planLabelInputRows({ ...opts, items: [first, next], events: [approval, old] });
-    expect(newHold.timelineId).toBe('event-two');
+    expect(newHold.timelineId).toBe('2');
     const state = derivePrState([approval, old, newHold], { ...FACTS, repo: REPO, pr: 7, now: Date.parse('2026-10-12T13:00:00Z') }, {});
     expect(state.holds.map(h => h.code)).toContain('label-input:review:human');
     const { timelineId: _id, clearanceBaseline: _baseline, ...legacy } = old;

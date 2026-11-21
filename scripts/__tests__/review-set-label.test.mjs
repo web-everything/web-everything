@@ -538,7 +538,7 @@ describe('runReviewLabelCli — the clear-human preconditions (#2895)', () => {
   }
 
   it('a caller that did not opt in REFUSES through the JSON contract, and reaches no gh call', () => {
-    const { exitCode, payload } = runCli({ argv: ['1048', '--repo=o/n', '--to=clear-human'] });
+    const { exitCode, payload } = runCli({ argv: ['1048', '--repo=o/n', '--to=clear-human', '--expect-head=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'] });
     expect(exitCode).not.toBe(0);
     expect(payload.error).toMatch(/did not opt in/);
   });
@@ -546,7 +546,7 @@ describe('runReviewLabelCli — the clear-human preconditions (#2895)', () => {
   // m1 — a caller PINNING the target skipped the `!fixedTo &&`-guarded validation entirely in the first cut and
   // blew up with a TypeError after `gh pr view`. Every clear-human precondition is checked at the point of use.
   it('a caller PINNING fixedTo:clear-human refuses too — not a TypeError, and not after a gh mutation', () => {
-    const { exitCode, payload } = runCli({ argv: ['1048', '--repo=o/n'], fixedTo: 'clear-human' });
+    const { exitCode, payload } = runCli({ argv: ['1048', '--repo=o/n', `--expect-head=${'a'.repeat(40)}`], fixedTo: 'clear-human' });
     expect(exitCode).not.toBe(0);
     expect(payload.error).toMatch(/did not opt in/);
   });
@@ -555,7 +555,7 @@ describe('runReviewLabelCli — the clear-human preconditions (#2895)', () => {
   // asked, and 'loop-console operator' names nobody.
   it('REFUSES an opted-in clear-human with no --actor — the default actor is not an answer', () => {
     const { exitCode, payload } = runCli({
-      argv: ['1048', '--repo=o/n', '--to=clear-human', '--reason=operator said accept 1048'],
+      argv: ['1048', '--repo=o/n', '--to=clear-human', '--expect-head=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', '--reason=operator said accept 1048'],
       allowClearHuman: true,
     });
     expect(exitCode).not.toBe(0);
@@ -567,7 +567,7 @@ describe('runReviewLabelCli — the clear-human preconditions (#2895)', () => {
   it('REFUSES an opted-in clear-human with no stated reason, including a whitespace-only one', () => {
     for (const reasonArg of [[], ['--reason='], ['--reason=   ']]) {
       const { exitCode, payload } = runCli({
-        argv: ['1048', '--repo=o/n', '--to=clear-human', '--actor=Nicolas Gilbert', ...reasonArg],
+        argv: ['1048', '--repo=o/n', '--to=clear-human', '--expect-head=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', '--actor=Nicolas Gilbert', ...reasonArg],
         allowClearHuman: true,
       });
       expect(exitCode).not.toBe(0);
@@ -1256,7 +1256,7 @@ process.exit(0);
     // Under the cap on its own — GitHub only rejects the RENDERED comment, which adds the clear-human chrome.
     const reason = 'r'.repeat(65200);
     expect(reason.length).toBeLessThan(GH_COMMENT_MAX);
-    const r = spawnSync('node', [script, '1048', '--repo=o/n', '--to=clear-human', '--actor=Nicolas Gilbert',
+    const r = spawnSync('node', [script, '1048', '--repo=o/n', '--to=clear-human', `--expect-head=${'f'.repeat(40)}`, '--actor=Nicolas Gilbert',
       `--reason=${reason}`], {
       encoding: 'utf8',
       env: { ...process.env, PATH: `${shimDir}:${process.env.PATH}`, GH_CALL_LOG: logPath },
@@ -1283,7 +1283,7 @@ process.exit(0);
     let exitCode = null;
     try {
       runReviewLabelCli({
-        argv: ['1048', '--repo=o/n', '--to=clear-human', '--actor=op', '--reason=operator said clear it'],
+        argv: ['1048', '--repo=o/n', '--to=clear-human', `--expect-head=${'f'.repeat(40)}`, '--actor=op', '--reason=operator said clear it'],
         allowClearHuman: true,
         defaultActor: 'test',
         usage: 'usage: test',
@@ -1383,7 +1383,7 @@ process.exit(0);
     : []);
   /** The values that FOLLOW each occurrence of `flag` in an argv array (adjacency, not mere presence). */
   const valuesOf = (argv, flag) => argv.flatMap((a, i) => (a === flag ? [argv[i + 1]] : []));
-  const runClear = (extra, overrides = {}) => spawnSync('node', [script, '1048', '--repo=o/n', '--to=clear-human',
+  const runClear = (extra, overrides = {}) => spawnSync('node', [script, '1048', '--repo=o/n', '--to=clear-human', `--expect-head=${SHA}`,
     `--actor=${ACTOR}`, `--reason=${REASON}`, ...extra], { encoding: 'utf8', env: { ...env(), GH_TOKEN: '', GITHUB_TOKEN: '', ...overrides } });
 
   it.each([
@@ -1426,8 +1426,8 @@ process.exit(0);
       // so the GH call sequence carries no `pr diff`. #2964 — the MUTATION order is now comment → edit: this PR
       // carries `review:human`/`review:pending` and NOT `review:accepted`, so the durable record (with its
       // marker) goes first, where an orphan is inert. The dedicated ordering suite below owns that property; the
-      // pin is kept here so a silent re-flip cannot pass this end-to-end test.
-      .toEqual(['api user', 'pr view', 'pr comment', 'pr view', 'pr edit', 'pr view']);
+      // pin is kept here so a silent re-flip cannot pass this end-to-end test. The second view verifies the mandatory head pin before any write.
+      .toEqual(['api user', 'pr view', 'pr view', 'pr comment', 'pr view', 'pr edit', 'pr view']);
 
     // 3. The durable comment — the honesty tax as it is actually posted, not as the module describes it.
     const comment = readFileSync(join(dir, 'comment.md'), 'utf8');
@@ -1467,7 +1467,7 @@ process.exit(0);
   // failure. The class is "a package.json wrapper around a JSON-contract CLI is never exercised as documented".
   it('the documented `npm run --silent review:clear` wrapper puts ONLY JSON on stdout', () => {
     const r = spawnSync('npm', ['run', '--silent', 'review:clear', '--',
-      '1048', '--repo=o/n', `--actor=${ACTOR}`], { cwd: repoRoot, encoding: 'utf8', env: env() });
+      '1048', '--repo=o/n', `--expect-head=${SHA}`, `--actor=${ACTOR}`], { cwd: repoRoot, encoding: 'utf8', env: env() });
     expect(r.status).not.toBe(0);
     // The WHOLE of stdout must parse — a banner line ahead of the payload is exactly what this catches.
     const payload = JSON.parse(r.stdout);
@@ -2036,7 +2036,7 @@ process.exit(0);
   // These drive the REAL CLI on a REAL `review:human` PR and pin the exemption, its record, and its limits.
   const HUMAN_LABELS = ['review:human', 'review:pending', 'ready-to-merge'];
   const clearHuman = (sessionId, labels = HUMAN_LABELS) => runCli(
-    ['--to=clear-human', '--actor=Nicolas', '--reason=clear it, I have reviewed it'],
+    ['--to=clear-human', `--expect-head=${SHA}`, '--actor=Nicolas', '--reason=clear it, I have reviewed it'],
     { sessionId, labels },
   );
 
@@ -2416,7 +2416,8 @@ describe('the write arc and its #2964 ordering', () => {
     it.each(['clear-human', 'rearm', 'restamp'])('does not log target %s even on the review-pr channel', (to) => {
       const io = memIo();
       const labels = to === 'clear-human' ? ['review:human'] : to === 'restamp' ? ['review:accepted'] : ['review:changes'];
-      const args = ['1048', '--repo=o/n', `--channel=${REVIEW_PR_CHANNEL}`, '--actor=operator', '--reason=Repair needed'];
+      const args = ['1048', '--repo=o/n', `--channel=${REVIEW_PR_CHANNEL}`, '--actor=operator', '--reason=Repair needed',
+        ...(to === 'clear-human' ? [`--expect-head=${'a'.repeat(40)}`] : [])];
       const config = { fixedTo: to, allowClearHuman: true, verdictBody: 'Repair needed', trialLogIo: io };
       expect(run(stubProvider({ labels, body }), args, config).exitCode).toBe(0);
       expect(readStore(io).records).toEqual([]);
@@ -4584,7 +4585,7 @@ describe('#4315 direct acceptance boundary', () => {
     const exit = vi.spyOn(process, 'exit').mockImplementation(() => { throw new Error('exit'); });
     const output = [];
     try {
-      expect(() => runReviewLabelCli({ argv: ['7', '--repo=o/r', `--to=${to}`, '--actor=operator', '--reason=generic clearance'],
+      expect(() => runReviewLabelCli({ argv: ['7', '--repo=o/r', `--to=${to}`, ...(to === 'clear-human' ? [`--expect-head=${state.headRefOid}`] : []), '--actor=operator', '--reason=generic clearance'],
         allowClearHuman: true, defaultActor: 'operator', emit: x => output.push(x),
         provider: { readPostingIdentity: () => ({ login: 'chalbert', type: 'User' }), readPrState: () => state, postComment: () => writes.push('post'), setLabels: () => writes.push('label') },
         buildComment: () => 'accept', successResult: x => x, refusalResult: x => x,
@@ -4943,7 +4944,7 @@ describe('#5649 — approval rows at the label home', () => {
     finally { process.exit = realExit; process.stderr.write = realErr; }
     return { exitCode, payload: JSON.parse(chunks.join('') || '{}') };
   }
-  const CLEAR = ['77', '--repo=o/n', '--to=clear-human', '--actor=op', '--reason=operator said clear it'];
+  const CLEAR = ['77', '--repo=o/n', '--to=clear-human', '--expect-head=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', '--actor=op', '--reason=operator said clear it'];
   const rows = () => readdirSync(ledgerDir).filter((f) => f.endsWith('.jsonl')).flatMap((f) =>
     readFileSync(join(ledgerDir, f), 'utf8').trim().split('\n').filter(Boolean).map(JSON.parse));
   const sink = () => { const seen = []; return { seen, fn: (row) => { seen.push(row); return appendVerdict(row); } }; };
