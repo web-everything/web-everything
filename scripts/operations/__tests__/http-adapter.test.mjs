@@ -1193,10 +1193,12 @@ describe('capacity operator CLI declarations and real store wiring', () => {
     try {
       const enumFlags = ['--key=ciHeal.loop', '--value=on', '--reason=enable child loop', '--actor=on-call human'];
       expect((await invoke('operator-override-set', enumFlags)).code).toBe(0);
-      expect(JSON.parse(readFileSync(file, 'utf8'))).toEqual({ 'ciHeal.loop': 'on' });
+      const enumFile = join(dir, 'operator-enum-overrides.json');
+      expect(JSON.parse(readFileSync(enumFile, 'utf8'))).toEqual({ 'ciHeal.loop': 'on' });
+      expect(existsSync(file)).toBe(false); // the numeric capacity store never holds an enum row
       expect((await invoke('operator-override-set', enumFlags.map(f => f.startsWith('--value=') ? '--value=maybe' : f))).code).not.toBe(0);
       expect((await invoke('operator-override-set', flags.map(f => f.startsWith('--value=') ? '--value=on' : f))).code).not.toBe(0);
-      expect(JSON.parse(readFileSync(file, 'utf8'))).toEqual({ 'ciHeal.loop': 'on' });
+      expect(JSON.parse(readFileSync(enumFile, 'utf8'))).toEqual({ 'ciHeal.loop': 'on' });
     } finally { operatorFixture.file = undefined; vi.unstubAllEnvs(); rmSync(dir, { recursive: true, force: true }); }
   });
   it.each([
