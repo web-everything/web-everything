@@ -24,7 +24,7 @@ export { RESOURCE_POLICY_STANDARD, RESOURCE_POLICY_KINDS, resolveResourcePolicy,
 // shadow call — keeping storage here keeps that import one-way.
 export function resourcePaths(root = resolveCoordinationRoot()) {
   const dir = join(root, 'resource');
-  return { dir, snapshot: join(dir, 'snapshot.json'), history: join(dir, 'history.jsonl'), shadow: join(dir, 'shadow.jsonl') };
+  return { dir, snapshot: join(dir, 'snapshot.json'), history: join(dir, 'history.jsonl') };
 }
 /** Bound by BYTES (one stat per append), never by re-reading the file each time: the sampler appends every ~10 s. */
 export const RESOURCE_LOG_MAX_BYTES = 8 * 1024 * 1024;
@@ -88,14 +88,6 @@ export function loadResourcePolicy({ env = process.env, repoRoot, home = homedir
   }
   return { policy: resolveResourcePolicy({ platform, tool }), sources };
 }
-function audit(root, row) {
-  try { appendResourceLog(resourcePaths(root).shadow, row); } catch { /* Observability must not change a gate. */ }
-}
-function auditRow({ gate, kind, oldVerdict, oldReason, nowMs }, decision) {
-  return { at: new Date(nowMs).toISOString(), gate, kind, old: { verdict: oldVerdict, reason: oldReason },
-    new: { verdict: decision.verdict, reason: decision.reason, snapshotAge: decision.snapshotAge, unknown: decision.unknown },
-    agree: oldVerdict === decision.verdict };
-}
 export function admit({ kind, env = process.env, nowMs = Date.now(), root, policy } = {}) {
   let decision;
   try {
@@ -105,10 +97,6 @@ export function admit({ kind, env = process.env, nowMs = Date.now(), root, polic
   } catch {
     decision = decideAdmission({ kind, snapshot: null, nowMs });
   }
-  // Unknown is always audited, including direct callers and WE_RESOURCE_SHADOW=off.
-  if (decision.unknown) {
-    try { audit(root, auditRow({ gate: 'resource-admission', kind, oldVerdict: null, oldReason: null, nowMs }, decision)); } catch { /* best effort */ }
-  }
   return decision;
 }
 /** Return comparison evidence only. An off switch skips all reads and logging. */
@@ -117,10 +105,6 @@ export function shadowAdmission({ gate, kind, oldVerdict, oldReason, env = proce
   // suite stubs only process.env — neither must leak shadow rows into the real coordination root.
   if (env.WE_RESOURCE_SHADOW === 'off' || process.env.WE_RESOURCE_SHADOW === 'off') return undefined;
   const decision = admit({ kind, env, nowMs, root });
-  try {
-    root ??= resolveCoordinationRoot({ env });
-    audit(root, auditRow({ gate, kind, oldVerdict, oldReason, nowMs }, decision));
-  } catch { /* best effort */ }
   try {
     log('resource-shadow gate=' + gate + ' kind=' + kind + ' old verdict: ' + oldVerdict + ' (' + oldReason +
       ') | new verdict: ' + decision.verdict + ' (' + decision.reason + ', snapshot age ' + decision.snapshotAge + 's)\n');
