@@ -6,6 +6,8 @@
  * the cap is sent back to the fixer when the grant covers the current round.
  */
 import { refuseDirectEntry } from '../lib/direct-entry-guard.mjs';
+import { assertRoundGrantAllowed } from '../lib/round-grant-guard.mjs';
+export { validNonconvergenceDesignPath } from '../lib/round-grant-guard.mjs';
 import { op } from './registry.mjs';
 import { compute, effect as effectStep } from './step-kinds.mjs';
 import { OPERATOR_LOGINS, JUDGE_ACTOR } from '../lib/marker-authorship.mjs';
@@ -18,7 +20,7 @@ export const ROUND_EXTENSION_POST_EFFECT = 'github.round-extension';
 
 /** Pure verdict: attribution is the operator's, with verbatim reason and an explicit channel. */
 export function planRoundExtension(read, input) {
-  const { repo, pr, by, actor, channel, reason } = input;
+  const { repo, pr, by, actor, channel, reason, despite } = input;
   if (actor === JUDGE_ACTOR) throw new Error('judge grant is refused in v1; operator-only');
   if (!OPERATOR_LOGINS.includes(String(actor ?? '').toLowerCase())) {
     throw new Error(`--actor must be a registered operator login (${OPERATOR_LOGINS.join(', ')}); this extension is the operator's`);
@@ -35,9 +37,15 @@ export function planRoundExtension(read, input) {
   if (granted + by > MAX_TOTAL_ROUND_EXTENSIONS) {
     throw new Error(`this PR already has ${granted} extra round(s); +${by} would pass the ${MAX_TOTAL_ROUND_EXTENSIONS}-round ceiling`);
   }
+  assertRoundGrantAllowed({ repo, pr, comments: read.comments, files: read.files,
+    headRefOid: read.headRefOid, despite, despiteDesign: read.despiteDesign });
+  const validDespite = despite !== undefined;
   const record = { version: 1, repo, pr, by, actor: String(actor).toLowerCase(),
-    channel: String(channel).trim(), reason: String(reason), at: read.now };
-  return { record, body: buildRoundExtensionComment(record) };
+    channel: String(channel).trim(), reason: String(reason), at: read.now, ...(validDespite ? { despite, despiteDesign: read.despiteDesign.path } : {}) };
+  // Both override fields are bounded tokens; keep the shared grant record and trusted counting unchanged.
+  const body = buildRoundExtensionComment(record)
+    + (validDespite ? `\n\nDespite ${despite}; nonconvergence design: ${record.despiteDesign}` : '');
+  return { record, body };
 }
 
 export function extendRoundsOperation({ readExtensionContext } = {}) {
@@ -45,15 +53,17 @@ export function extendRoundsOperation({ readExtensionContext } = {}) {
   return op(EXTEND_ROUNDS_OP, {
     input: {
       repo: 'string', pr: 'number', by: 'number', actor: 'string', channel: 'string', reason: 'string',
+      despite: { type: 'string', required: false },
+      despiteDesign: { type: 'string', required: false },
       preview: { type: 'boolean', required: false, default: false },
     },
     verdictFrom: 'plan',
     read: compute({
-      reads: ['input.repo', 'input.pr'],
-      fn: (view) => readExtensionContext({ repo: view.input.repo, pr: view.input.pr }),
+      reads: ['input.repo', 'input.pr', 'input.despiteDesign'],
+      fn: (view) => readExtensionContext({ repo: view.input.repo, pr: view.input.pr, despiteDesign: view.input.despiteDesign }),
     }),
     plan: compute({
-      reads: ['findings.read', 'input.repo', 'input.pr', 'input.by', 'input.actor', 'input.channel', 'input.reason'],
+      reads: ['findings.read', 'input.repo', 'input.pr', 'input.by', 'input.actor', 'input.channel', 'input.reason', 'input.despite'],
       fn: (view) => planRoundExtension(view.findings.read, view.input),
     }),
     write: effectStep({
