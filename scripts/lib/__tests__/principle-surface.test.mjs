@@ -414,7 +414,11 @@ describe('the assumptions the content triggers rest on — what is pinned (produ
     const { computeNetDiffText } = await import('../../merge-ai-prs.mjs');
     const calls = [];
     const exec = (cmd, args) => {
+      while (args[0] === '-c') args = args.slice(2);
       calls.push(args);
+      if (args[0] === 'rev-parse' && args.includes('--git-common-dir')) return `${tmpdir()}\n${tmpdir()}\n`;
+      if (args[0] === 'rev-parse' && args.at(-1) === 'refs/remotes/origin/main^{commit}') return `${'b'.repeat(40)}\n`;
+      if (args[0] === 'cat-file' && args[1] === '-e') return '';
       if (args[0] === 'diff' && !args.includes('--numstat')) return 'diff --git a/x b/x\n';
       if (args[0] === 'diff') return '1\t0\tx\n';
       if (args[0] === 'log') return '';

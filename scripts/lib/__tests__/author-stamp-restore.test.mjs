@@ -196,6 +196,19 @@ describe('plain snapshot provenance — oldest author snapshot and agreeing ids'
       .toMatchObject({ action: 'restore', id: ID });
   });
 
+  it('snapshot with literal <threadId> in markdown prose is parsed, not refused as unsupported HTML', () => {
+    const text = '- `--resume=<threadId>` accepts only a UUID.';
+    expect(plan({ edits: [edit(`${text}\n\n${buildAuthorActorMarker(ID)}`)] }))
+      .toMatchObject({ action: 'restore', id: ID });
+  });
+
+  it('still refuses a mixed-case tag with attributes or a bare mixed-case tag outside code', () => {
+    for (const text of ['`<threadId x="1">`', '<threadId>', '`<Details>` <Summary>']) {
+      expect(plan({ edits: [edit(`${text}\n${buildAuthorActorMarker(ID)}`)] }))
+        .toMatchObject({ action: 'refuse', reason: 'unsupported HTML edit snapshot; inspect complete GitHub history manually' });
+    }
+  });
+
   it.each([
     ['bare placeholder', '<path>'],
     ['details tag', '<details>'],
