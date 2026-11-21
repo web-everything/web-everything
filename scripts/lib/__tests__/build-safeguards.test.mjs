@@ -15,6 +15,9 @@ import { readCiHealBriefTemplate } from '../../operations/ci-heal-pr-dispatch.mj
 import * as codexTasks from '../../codex-direct-task.mjs';
 import { renderWorkerBrief } from '../../worker-brief.mjs';
 
+const THREAD_ID = '01a1941d-8f2e-7242-8cfe-788d55f26a75';
+const resolveBinaryFn = () => '/fixture/bin/codex';
+
 const resolve = options => resolveBuildPolicy({ env: {}, tool: {}, platform: {}, ...options });
 
 describe('build safeguards policy and briefs', () => {
@@ -388,7 +391,7 @@ describe('Codex completion wiring', () => {
       child.stdin = { on() {}, end() { queueMicrotask(() => {
         writeFileSync(argv[argv.indexOf('-o') + 1], `completion ${turn}`);
         child.stdout.emit('data', Buffer.from([
-          JSON.stringify({ type: 'thread.started', thread_id: 'original-builder' }),
+          JSON.stringify({ type: 'thread.started', thread_id: THREAD_ID }),
           JSON.stringify({ type: 'item.completed', item: { type: 'agent_message', text: `completion ${turn}` } }),
         ].join('\n') + '\n'));
         child.emit('close', 0);
@@ -398,13 +401,13 @@ describe('Codex completion wiring', () => {
     const review = vi.fn(async () => ['file:1 defect']);
     try {
       const report = await codexDirectTask({ dir, task: 'change', env: { ...process.env, WE_BUILD_SELF_REVIEW_ENABLED: 'true', WE_BUILD_FINAL_GATE: 'full' },
-        execFn, spawnFn, selfReviewFn: review, readQuotaFn: () => ({ quota: null, rolloutFile: null }), stream: false, log: () => {} });
+        execFn, spawnFn, resolveBinaryFn, selfReviewFn: review, readQuotaFn: () => ({ quota: null, rolloutFile: null }), stream: false, log: () => {} });
       expect(report.gate.mode).toBe('full'); expect(report.selfReview.rounds).toBe(2);
       expect(review).toHaveBeenCalledTimes(3); expect(spawns).toHaveLength(3);
       expect(review.mock.calls[0][0].diff).toBe('net change');
       for (const argv of spawns.slice(1)) {
         expect(argv.slice(0, -3)).toEqual(spawns[0]);
-        expect(argv.slice(-3)).toEqual(['resume', 'original-builder', '-']);
+        expect(argv.slice(-3)).toEqual(['resume', THREAD_ID, '-']);
         expect(argv[argv.indexOf('-s') + 1]).toBe('workspace-write');
         expect(argv[argv.indexOf('-C') + 1]).toBe(dir);
         expect(argv[argv.indexOf('-m') + 1]).toBe(report.route.model);
@@ -451,7 +454,7 @@ describe('Codex completion wiring', () => {
         if (repair && repairHangs) return;
         queueMicrotask(() => {
           writeFileSync(argv[argv.indexOf('-o') + 1], 'completion');
-          if (threadId) child.stdout.emit('data', Buffer.from(`${JSON.stringify({ type: 'thread.started', thread_id: 'builder' })}\n`));
+          if (threadId) child.stdout.emit('data', Buffer.from(`${JSON.stringify({ type: 'thread.started', thread_id: THREAD_ID })}\n`));
           child.emit('close', repair ? repairCode : 0);
         });
       } };
@@ -461,7 +464,7 @@ describe('Codex completion wiring', () => {
     try {
       await expect(codexDirectTask({ dir, task: 'change', timeoutMs: repairHangs ? 50 : 0,
         env: { ...process.env, WE_BUILD_SELF_REVIEW_ENABLED: 'true', WE_BUILD_FINAL_GATE: 'full' },
-        execFn, spawnFn, selfReviewFn: review, readQuotaFn: () => ({ quota: null, rolloutFile: null }), stream: false, log: () => {} }))
+        execFn, spawnFn, resolveBinaryFn, selfReviewFn: review, readQuotaFn: () => ({ quota: null, rolloutFile: null }), stream: false, log: () => {} }))
         .rejects.toThrow(message);
       expect(review).toHaveBeenCalledTimes(1);
       expect(spawns).toHaveLength(threadId ? 2 : 1);
@@ -475,7 +478,7 @@ describe('Codex completion wiring', () => {
     child.stdout = new EventEmitter(); child.stderr = new EventEmitter();
     child.stdin = { on() {}, end() { queueMicrotask(() => {
       writeFileSync(argv[argv.indexOf('-o') + 1], '{"findings":[]}');
-      child.stdout.emit('data', Buffer.from(`${JSON.stringify({ type: 'thread.started', thread_id: 'builder' })}\n`));
+      child.stdout.emit('data', Buffer.from(`${JSON.stringify({ type: 'thread.started', thread_id: THREAD_ID })}\n`));
       child.emit('close', 0);
     }); } };
     return child;
@@ -502,7 +505,7 @@ describe('Codex completion wiring', () => {
     const execFn = fakeGit(dir);
     const spawns = [];
     try {
-      const report = await codexDirectTask({ dir, task: 'change', env, selfReview: false, execFn, spawnFn: fakeCodex(spawns),
+      const report = await codexDirectTask({ dir, task: 'change', env, selfReview: false, execFn, resolveBinaryFn, spawnFn: fakeCodex(spawns),
         readQuotaFn: () => ({ quota: null, rolloutFile: null }), stream: false, log: () => {} });
       expect(report.buildPolicy.sources.finalGate).toBe(extra.WE_BUILD_FINAL_GATE ? 'env' : 'standard');
       expect(report.gate).toMatchObject(expected);
@@ -540,7 +543,7 @@ describe('Codex completion wiring', () => {
     const spawns = [];
     try {
       const report = await codexDirectTask({ dir, task: 'review this', review: true, ephemeral: true, env, execFn, selfReviewFn,
-        spawnFn: fakeCodex(spawns), stream: false, log: () => {} });
+        resolveBinaryFn, spawnFn: fakeCodex(spawns), stream: false, log: () => {} });
       expect(selfReviewFn).not.toHaveBeenCalled();
       expect(report.selfReview).toMatchObject({ skipped: true, rounds: 0 });
       expect(report.gate.ran).toBe(false);
@@ -554,15 +557,15 @@ describe('Codex completion wiring', () => {
     const options = { cwd: '/lane', route: { model: 'gpt-5.6-sol', effort: 'high' },
       writableRoots: ['/lane/.git', '/tmp/admission', '/tmp/job'], tempRoot: '/tmp/job', addDirs: ['/extra'] };
     const fresh = buildCodexDirectTaskArgv(options);
-    const resumed = buildCodexDirectTaskArgv({ ...options, resumeThreadId: 'original-builder' });
-    expect(resumed).toEqual([...fresh, 'resume', 'original-builder', '-']);
+    const resumed = buildCodexDirectTaskArgv({ ...options, resumeThreadId: THREAD_ID });
+    expect(resumed).toEqual([...fresh, 'resume', THREAD_ID, '-']);
   });
 
   it('rejects option-like or malformed resume ids before spawning', () => {
-    for (const resumeThreadId of ['', '--last', '../other', 'id\n--all', null]) {
+    for (const resumeThreadId of ['', '--last', '../other', 'id\n--all', 'builder', null]) {
       expect(() => buildCodexDirectTaskArgv({ cwd: '/lane', resumeThreadId })).toThrow('resumeThreadId');
     }
-    expect(() => buildCodexDirectTaskArgv({ cwd: '/lane', resumeThreadId: 'builder', ephemeral: true })).toThrow('ephemeral');
+    expect(() => buildCodexDirectTaskArgv({ cwd: '/lane', resumeThreadId: THREAD_ID, ephemeral: true })).toThrow('ephemeral');
   });
 
   it('resumes with route-only model and effort, appends the log, and clears a missing final message', async () => {
@@ -576,7 +579,7 @@ describe('Codex completion wiring', () => {
     writeFileSync(logFile, '{"original":true}\n');
     try {
       const result = await runCodexDirectExec({ dir, gitDir: dir, task: 'repair', logFile, stream: false,
-        route: { model: 'gpt-5.6-sol', effort: 'high' }, resumeThreadId: 'builder',
+        route: { model: 'gpt-5.6-sol', effort: 'high' }, resumeThreadId: THREAD_ID, resolveBinaryFn,
         spawnFn: () => {
           const child = new EventEmitter(); child.stdout = new EventEmitter(); child.stderr = new EventEmitter();
           child.stdin = { on() {}, end() { queueMicrotask(() => {

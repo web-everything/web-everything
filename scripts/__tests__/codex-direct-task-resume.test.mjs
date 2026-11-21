@@ -12,6 +12,9 @@ import { join, resolve, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { assertResumeThreadId, parseResumeFlag, buildCodexDirectTaskArgv, codexDirectTask } from '../codex-direct-task.mjs';
 
+const THREAD_ID = '01a1941d-8f2e-7242-8cfe-788d55f26a75';
+const resolveBinaryFn = () => '/fixture/bin/codex';
+
 const SCRIPT = resolve(dirname(fileURLToPath(import.meta.url)), '..', 'codex-direct-task.mjs');
 
 beforeEach(() => vi.stubEnv('WE_BUILD_SELF_REVIEW_ENABLED', 'false'));
@@ -40,14 +43,18 @@ const execFnFor = dir => (_bin, args) => {
 
 describe('assertResumeThreadId', () => {
   it('accepts a session id and refuses empty, non-string, shell-shaped and ephemeral resumes', () => {
-    expect(() => assertResumeThreadId('01a1941d-8f2e-7242-8cfe-788d55f26a75')).not.toThrow();
+    expect(() => assertResumeThreadId(THREAD_ID)).not.toThrow();
     for (const bad of ['', null, 42, '-flag', 'a;b', 'a b', '../x']) expect(() => assertResumeThreadId(bad)).toThrow(/resumeThreadId/);
-    expect(() => assertResumeThreadId('t1', { ephemeral: true })).toThrow(/ephemeral/);
+    expect(() => assertResumeThreadId(THREAD_ID, { ephemeral: true })).toThrow(/ephemeral/);
+  });
+
+  it('refuses a non-UUID session name', () => {
+    expect(() => assertResumeThreadId('thread-1')).toThrow(/must be a UUID/);
   });
 
   it('is the same check the argv builder applies', () => {
     expect(() => buildCodexDirectTaskArgv({ cwd: '/lane', resumeThreadId: 'a;b' })).toThrow(/resumeThreadId/);
-    expect(buildCodexDirectTaskArgv({ cwd: '/lane', resumeThreadId: 't1' }).slice(-3)).toEqual(['resume', 't1', '-']);
+    expect(buildCodexDirectTaskArgv({ cwd: '/lane', resumeThreadId: THREAD_ID }).slice(-3)).toEqual(['resume', THREAD_ID, '-']);
   });
 });
 
@@ -57,16 +64,17 @@ describe('parseResumeFlag', () => {
   });
 
   it('returns the thread id with --dir', () => {
-    expect(parseResumeFlag({ resume: 'thread-1', dir: '/lane' })).toBe('thread-1');
+    expect(parseResumeFlag({ resume: THREAD_ID, dir: '/lane' })).toBe(THREAD_ID);
   });
 
   it.each([
     ['a bare --resume with no value', { resume: true, dir: '/lane' }, /needs a value/],
     ['an empty value', { resume: '', dir: '/lane' }, /needs a value/],
+    ['a non-UUID session name', { resume: 'thread-1', dir: '/lane' }, /must be a UUID/],
     ['an invalid id', { resume: 'a;b', dir: '/lane' }, /resumeThreadId/],
-    ['--ephemeral', { resume: 't1', dir: '/lane', ephemeral: true }, /ephemeral/],
-    ['--output-schema-file', { resume: 't1', dir: '/lane', 'output-schema-file': 's.json' }, /output-schema/],
-    ['no --dir (a fresh scratch clone would not hold the work)', { resume: 't1' }, /requires --dir/],
+    ['--ephemeral', { resume: THREAD_ID, dir: '/lane', ephemeral: true }, /ephemeral/],
+    ['--output-schema-file', { resume: THREAD_ID, dir: '/lane', 'output-schema-file': 's.json' }, /output-schema/],
+    ['no --dir (a fresh scratch clone would not hold the work)', { resume: THREAD_ID }, /requires --dir/],
   ])('refuses %s', (_name, flags, message) => {
     expect(() => parseResumeFlag(flags)).toThrow(message);
   });
@@ -75,21 +83,21 @@ describe('parseResumeFlag', () => {
 describe('codexDirectTask resumeThreadId', () => {
   it('passes the thread id through to `codex exec ... resume <id> -` and reports events.threadId', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'we-resume-'));
-    const { fn: spawnFn, seen } = fakeSpawn('{"type":"thread.started","thread_id":"thread-9"}\n{"type":"turn.completed"}\n');
+    const { fn: spawnFn, seen } = fakeSpawn(`${JSON.stringify({ type: 'thread.started', thread_id: THREAD_ID })}\n{"type":"turn.completed"}\n`);
     try {
       const report = await codexDirectTask({ task: 'fix line 3', dir, gate: 'none', selfReview: false, stream: false,
-        resumeThreadId: 'thread-9', spawnFn, execFn: execFnFor(dir), log: false,
+        resumeThreadId: THREAD_ID, resolveBinaryFn, spawnFn, execFn: execFnFor(dir), log: false,
         readQuotaFn: () => ({ quota: null, rolloutFile: null }) });
-      expect(seen.argv.slice(-3)).toEqual(['resume', 'thread-9', '-']);
-      expect(report.events.threadId).toBe('thread-9');
+      expect(seen.argv.slice(-3)).toEqual(['resume', THREAD_ID, '-']);
+      expect(report.events.threadId).toBe(THREAD_ID);
     } finally { rmSync(dir, { recursive: true, force: true }); }
   });
 
   it('leaves a fresh run unresumed', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'we-resume-'));
-    const { fn: spawnFn, seen } = fakeSpawn('{"type":"thread.started","thread_id":"t"}\n');
+    const { fn: spawnFn, seen } = fakeSpawn(`${JSON.stringify({ type: 'thread.started', thread_id: THREAD_ID })}\n`);
     try {
-      await codexDirectTask({ task: 't', dir, gate: 'none', selfReview: false, stream: false, spawnFn,
+      await codexDirectTask({ task: 't', dir, gate: 'none', selfReview: false, stream: false, resolveBinaryFn, spawnFn,
         execFn: execFnFor(dir), log: false, readQuotaFn: () => ({ quota: null, rolloutFile: null }) });
       expect(seen.argv).not.toContain('resume');
     } finally { rmSync(dir, { recursive: true, force: true }); }
@@ -98,12 +106,15 @@ describe('codexDirectTask resumeThreadId', () => {
   it('refuses a bad or ephemeral resume before any git or Codex work', async () => {
     const spawnFn = vi.fn();
     const execFn = vi.fn();
-    await expect(codexDirectTask({ task: 't', dir: '/nowhere', resumeThreadId: 'a;b', spawnFn, execFn })).rejects.toThrow(/resumeThreadId/);
-    await expect(codexDirectTask({ task: 't', dir: '/nowhere', resumeThreadId: 't1', ephemeral: true, spawnFn, execFn })).rejects.toThrow(/ephemeral/);
-    await expect(codexDirectTask({ task: 't', resumeThreadId: 't1', repoRoot: '/nowhere', spawnFn, execFn })).rejects.toThrow(/requires --dir/);
-    await expect(codexDirectTask({ task: 't', dir: '/nowhere', resumeThreadId: 't1', outputSchemaFile: 's.json', spawnFn, execFn })).rejects.toThrow(/output-schema/);
+    const resolveBinaryFn = vi.fn();
+    await expect(codexDirectTask({ task: 't', dir: '/nowhere', resumeThreadId: 'a;b', resolveBinaryFn, spawnFn, execFn })).rejects.toThrow(/resumeThreadId/);
+    await expect(codexDirectTask({ task: 't', dir: '/nowhere', resumeThreadId: 'thread-1', resolveBinaryFn, spawnFn, execFn })).rejects.toThrow(/must be a UUID/);
+    await expect(codexDirectTask({ task: 't', dir: '/nowhere', resumeThreadId: THREAD_ID, ephemeral: true, resolveBinaryFn, spawnFn, execFn })).rejects.toThrow(/ephemeral/);
+    await expect(codexDirectTask({ task: 't', resumeThreadId: THREAD_ID, repoRoot: '/nowhere', resolveBinaryFn, spawnFn, execFn })).rejects.toThrow(/requires --dir/);
+    await expect(codexDirectTask({ task: 't', dir: '/nowhere', resumeThreadId: THREAD_ID, outputSchemaFile: 's.json', resolveBinaryFn, spawnFn, execFn })).rejects.toThrow(/output-schema/);
     expect(spawnFn).not.toHaveBeenCalled();
     expect(execFn).not.toHaveBeenCalled();
+    expect(resolveBinaryFn).not.toHaveBeenCalled();
   });
 });
 
@@ -118,8 +129,9 @@ describe('CLI --resume', () => {
   };
 
   it.each([
-    [['--resume=t1'], /requires --dir/],
-    [['--resume=t1', '--dir=/nowhere', '--output-schema-file=s.json'], /output-schema/],
+    [[`--resume=${THREAD_ID}`], /requires --dir/],
+    [[`--resume=${THREAD_ID}`, '--dir=/nowhere', '--output-schema-file=s.json'], /output-schema/],
+    [['--resume=thread-1', '--dir=/nowhere'], /must be a UUID/],
     [['--resume', '--dir=/nowhere'], /needs a value/],
     [['--resume=a;b', '--dir=/nowhere', '--detach'], /resumeThreadId/],
   ])('exits 2 on %j without running Codex', (args, message) => {
