@@ -133,7 +133,7 @@ import { BORROW_REASON, readRoutedOutcomes, consecutiveUnproductiveOnHead, merge
 import { fixDetachedProvider } from '../operations/dispatch-providers/fix.mjs';
 import { removePromptFile } from '../operations/fix-run.mjs';
 import { listBuildDispatchClaims } from './build-dispatch-claim.mjs';
-import { runReconcilePass, resolveLaneHead } from './reconcile-pass.mjs';
+import { runReconcilePass, resolveLaneHead, PR_LIST_JSON_FIELDS } from './reconcile-pass.mjs';
 import { readUnsupported, recordUnsupported } from './unsupported-repo.mjs';
 import { readPrsFromFile } from './open-pr-fetch.mjs';
 import { CONFLICT_LABEL } from './parked-pr-conflict-watch.mjs';
@@ -568,6 +568,19 @@ export function createFixPassPrReader({ exec = execFileSyncThrottled, root = REP
     if (cached.error) throw cached.error;
     return cached.view;
   };
+}
+
+/** A complete single-PR thread followed by an uncached view: headRefOid is checked AFTER the thread read.
+ * Failures propagate to the refusal path. Never use the pass-local cached PR reader here.
+ */
+export function readFreshFixPr(number, { repo, root = REPO_ROOT,
+  exec = execFileSyncThrottled, readComments = readCompletePrComments, clock = Date.now } = {}) {
+  const slug = ghRepoSlug(repo ?? 'we');
+  const comments = readComments(number, { repo: slug });
+  const view = JSON.parse(exec('gh', ['pr', 'view', String(number), '--repo', slug,
+    '--json', `${PR_LIST_JSON_FIELDS.replace(',comments', '')},state`],
+  { cwd: root, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: 30_000, maxBuffer: 8 * 1024 * 1024 }));
+  return { ...view, comments, commentsComplete: true, readAt: new Date(clock()).toISOString() };
 }
 
 /**
@@ -1873,6 +1886,9 @@ export function runReconcileFixDispatch({
   dispatch = dispatchFix,
   reconcile = runReconcilePass,
   readPrs,
+  readFreshPr = readFreshFixPr,
+  // Bypass pass-local plan caches: this must run the normal planner on the fresh single PR.
+  replanFreshPr = runReconcilePass,
   // R123 writes require caller permission, even when dispatch itself is stubbed (live smoke).
   // The production daemon forwards fix.standDownAutoProceed from the policy cascade (standard: true).
   allowStandDownAutoProceed = false,
@@ -1967,8 +1983,63 @@ export function runReconcileFixDispatch({
     console.error(`reconcile-fix-dispatch: open-PR read deferred — owed unknown, skipping this tick: ${readDeferred}`);
     return { handled: 0, deferred: [], nextCursor: null, dispatched: [], refusals: [], readDeferred, reconcileRefusals: 0, reconcileRefusalDetails: [] };
   }
-  const reconciled = netScope ? fixStep('net-scope', () => netScope(reconciledRaw, { root, repoKey })) : reconciledRaw;
-  let dispatchEntries = Array.isArray(reconciled.dispatch) ? reconciled.dispatch : [];
+  let reconciled = reconciledRaw;
+  // Only a bounced no-findings refusal can spend this bounded recovery read. The normal
+  // reconcile path re-derives every gate (including liveness, holds and the round cap).
+  let rereads = 0;
+  const recovered = [];
+  const freshRefusals = [];
+  for (const refusal of reconciled.refusals ?? []) {
+    if (refusal.kind !== 'no-findings' || refusal.phase !== 'bounced') {
+      freshRefusals.push(refusal);
+      continue;
+    }
+    if (rereads >= 4) {
+      freshRefusals.push({ ...refusal, kind: 'reread-budget',
+        why: 'fresh no-findings re-read budget K=4 exhausted; retry next pass or inspect the full PR thread manually' });
+      continue;
+    }
+    rereads++;
+    try {
+      const fresh = readFreshPr(refusal.prNumber, { repo: repoKey, root, clock });
+      if (!fresh || fresh.number !== refusal.prNumber || fresh.commentsComplete !== true
+          || fresh.failed === true || fresh.deferred === true || fresh.discoveryIncomplete === true
+          || typeof fresh.state !== 'string' || typeof fresh.isDraft !== 'boolean'
+          || typeof fresh.headRefName !== 'string' || typeof fresh.baseRefName !== 'string'
+          || typeof fresh.mergeStateStatus !== 'string' || !Array.isArray(fresh.labels)
+          || !Array.isArray(fresh.statusCheckRollup)
+          || !Array.isArray(fresh.comments) || fresh.comments.some(c => typeof c?.body !== 'string')
+          || !/^[a-f0-9]{40}$/i.test(fresh.headRefOid ?? '')
+          || !/^[a-f0-9]{40}$/i.test(refusal.head ?? refusal.headRefOid ?? '')) {
+        throw new Error('fresh PR evidence incomplete');
+      }
+      if (fresh.headRefOid !== (refusal.head ?? refusal.headRefOid)) {
+        freshRefusals.push({ ...refusal, kind: 'head-moved',
+          why: 'PR head moved since pass-start read; retry next pass on the new head' });
+        continue;
+      }
+      const readAt = fresh.readAt ?? new Date(clock()).toISOString();
+      if (!Number.isFinite(Date.parse(readAt))) throw new Error('fresh read time invalid');
+      const replanned = replanFreshPr({ repo, allowStandDownAutoProceed,
+        readPrs: () => [{ ...fresh, readAt }] });
+      if (!replanned || replanned.deferred || !Array.isArray(replanned.dispatch)
+          || !Array.isArray(replanned.refusals)) throw new Error('fresh re-plan incomplete');
+      const entries = replanned.dispatch.filter(e => e.kind === 'fix'
+        && e.prNumber === refusal.prNumber && e.headRefOid === fresh.headRefOid);
+      const refusals = replanned.refusals.filter(r => r.prNumber === refusal.prNumber);
+      if (entries.length === 1 && refusals.length === 0) recovered.push(entries[0]);
+      else if (refusals.length) freshRefusals.push(...refusals);
+      else freshRefusals.push({ ...refusal, head: fresh.headRefOid, readAt });
+    } catch {
+      // Unknown evidence leaves the original refusal and its original read timestamp intact.
+      freshRefusals.push(refusal);
+    }
+  }
+  // Do not mutate a shared/cached plan consumed by other phases.
+  reconciled = { ...reconciled, refusals: freshRefusals,
+    dispatch: [...(Array.isArray(reconciled.dispatch) ? reconciled.dispatch : []), ...recovered] };
+  if (netScope) reconciled = fixStep('net-scope', () => netScope(reconciled, { root, repoKey }));
+  let dispatchEntries = reconciled.dispatch;
   const profile = resolveProfile(repoKey);
 
   const unsupportedFor = (kind, action, why) => dispatchEntries

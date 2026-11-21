@@ -2643,3 +2643,128 @@ it('capability-off still observes fixer claims for lifecycle cleanup', async () 
   expect(out.entries).toEqual([expect.objectContaining({ pr: 49, claim: { state: 'held' } })]);
   expect(readClaim).toHaveBeenCalledOnce();
 });
+
+import sendBack from './fixtures/pr7312-red-team-send-back.json';
+import { readFreshFixPr } from '../reconcile-fix-dispatch.mjs';
+import { REARM_COMMENT_MARKER as freshRearmMarker } from '../rearm-review.mjs';
+import { planReconcile as planFreshBounce } from '../reconcile-core.mjs';
+
+describe('bounced no-findings fresh evidence', () => {
+  const head = '0ffddadbcfebba5deed89f65feee20dfdb4a04fd';
+  const now = Date.parse('2026-11-21T20:07:50Z');
+  const pr = (number = 7312, over = {}) => ({ number, state: 'OPEN', isDraft: false,
+    headRefName: 'lane/3438-wire-reconcile-pass', headRefOid: head, baseRefName: 'main',
+    labels: [{ name: 'review:changes' }], mergeStateStatus: 'CLEAN',
+    statusCheckRollup: [{ name: 'gate', status: 'COMPLETED', conclusion: 'SUCCESS' }],
+    rowsComplete: true, rowsHead: head, comments: [], ...over });
+  const run = (readFreshPr, prs = [pr()], options = {}) => {
+    const dispatch = vi.fn(p => ({ pr: p.pr, lane: p.lane, sessionId: 'fresh-fix', unknownTokens: [] }));
+    const reconcile = vi.fn(({ readPrs } = {}) => planFreshBounce({ prs: readPrs ? readPrs() : prs, agents: [], now }));
+    const result = runReconcileFixDispatch({ root: '/repo', checkStaleness: FRESH, now,
+      clock: () => now, stepLog: () => {}, reconcile, replanFreshPr: reconcile, readFreshPr,
+      findItemFn: findItemStub, loadItems: () => [], pickFreeLanes: () => [2],
+      fetchItemlessDiffPaths: () => [], dispatch, tryResume: () => null,
+      listBuildClaims: () => [], listFixClaims: () => [], priorityShadow: null, ...options });
+    return { result, dispatch, reconcile };
+  };
+  it('bounced PR whose pass-start read has no finding is re-read fresh and dispatched when the fresh thread holds a red-team send-back', () => {
+    const reader = vi.fn(number => pr(number, { comments: [sendBack], commentsComplete: true }));
+    const { result, dispatch, reconcile } = run(reader);
+    expect(reader).toHaveBeenCalledTimes(1);
+    expect(reconcile).toHaveBeenCalledTimes(2);
+    expect(dispatch).toHaveBeenCalledTimes(1);
+    expect(result.dispatched).toHaveLength(1);
+    expect(result.reconcileRefusalDetails).toEqual([]);
+  });
+  it('applies the existing net-scope gate to recovered fix entries', () => {
+    const netScope = vi.fn(plan => ({ ...plan, dispatch: [] }));
+    const { dispatch } = run(number => pr(number, { comments: [sendBack], commentsComplete: true }), [pr()], { netScope });
+    expect(netScope).toHaveBeenCalledTimes(1);
+    expect(netScope.mock.calls[0][0].dispatch).toMatchObject([{ kind: 'fix', prNumber: 7312 }]);
+    expect(dispatch).not.toHaveBeenCalled();
+  });
+  it('no-findings refusal names head and read time', () => {
+    const { result } = run(number => pr(number, { commentsComplete: true }));
+    expect(result.reconcileRefusalDetails[0]).toMatchObject({ kind: 'no-findings', head, readAt: new Date(now).toISOString() });
+  });
+  it('fresh re-read still empty refuses no-findings', () => {
+    const reader = vi.fn(number => pr(number, { commentsComplete: true }));
+    const { result, dispatch } = run(reader);
+    expect(reader).toHaveBeenCalledTimes(1);
+    expect(dispatch).not.toHaveBeenCalled();
+    expect(result.reconcileRefusalDetails[0].kind).toBe('no-findings');
+  });
+  it('throwing reader refuses with no dispatch', () => {
+    const reader = vi.fn(() => { throw Error('read failed'); });
+    const { result, dispatch } = run(reader);
+    expect(reader).toHaveBeenCalledTimes(1);
+    expect(dispatch).not.toHaveBeenCalled();
+    expect(result.reconcileRefusalDetails[0].kind).toBe('no-findings');
+  });
+  it.each([undefined, false])('incomplete fresh reader refuses with no dispatch (%s)', complete => {
+    const reader = vi.fn(number => pr(number, { comments: [sendBack], commentsComplete: complete }));
+    const { result, dispatch } = run(reader);
+    expect(reader).toHaveBeenCalledTimes(1);
+    expect(dispatch).not.toHaveBeenCalled();
+    expect(result.reconcileRefusalDetails[0].kind).toBe('no-findings');
+  });
+  it('budget K=4 exhausted refuses reread-budget and retries next pass', () => {
+    const reader = vi.fn(number => pr(number, { commentsComplete: true }));
+    const { result, dispatch } = run(reader, Array.from({ length: 5 }, (_, i) => pr(7312 + i)));
+    expect(reader).toHaveBeenCalledTimes(4);
+    expect(dispatch).not.toHaveBeenCalled();
+    expect(result.reconcileRefusalDetails[4]).toMatchObject({ kind: 'reread-budget', why: expect.stringMatching(/next pass/i) });
+  });
+  it('head moved between reads refuses head-moved', () => {
+    const reader = vi.fn(number => pr(number, { headRefOid: 'b'.repeat(40), comments: [sendBack], commentsComplete: true }));
+    const { result, dispatch } = run(reader);
+    expect(dispatch).not.toHaveBeenCalled();
+    expect(result.reconcileRefusalDetails[0].kind).toBe('head-moved');
+  });
+  it('review-owed no-findings is not re-read', () => {
+    const reader = vi.fn();
+    const { dispatch } = run(reader, [pr(7312, { labels: [{ name: 'review:pending' }] })]);
+    expect(reader).not.toHaveBeenCalled();
+    expect(dispatch).not.toHaveBeenCalled();
+  });
+  it.each([
+    { failed: true }, { discoveryIncomplete: true }, { comments: null },
+    { labels: undefined }, { headRefOid: null },
+  ])('failed or incomplete fresh evidence keeps refusal (%j)', over => {
+    const { result, dispatch } = run(number => pr(number, { comments: [sendBack], commentsComplete: true, ...over }));
+    expect(dispatch).not.toHaveBeenCalled();
+    expect(result.reconcileRefusalDetails[0].kind).toBe('no-findings');
+  });
+  it('default fresh reader reads the complete thread before checking the uncached head', () => {
+    const calls = [];
+    const fresh = readFreshFixPr(7312, { repo: 'we', root: '/repo', clock: () => now,
+      readComments: (number, options) => {
+        calls.push('comments');
+        expect(number).toBe(7312);
+        expect(options.repo).toBe('web-everything/web-everything');
+        return [sendBack];
+      },
+      exec: (file, argv, options) => {
+        calls.push('head');
+        expect(file).toBe('gh');
+        expect(argv.slice(0, 3)).toEqual(['pr', 'view', '7312']);
+        expect(argv.at(-1).split(',')).toContain('headRefOid');
+        expect(options.timeout).toBe(30_000);
+        expect(options.maxBuffer).toBe(8 * 1024 * 1024);
+        return JSON.stringify(pr(7312, { headRefOid: 'b'.repeat(40) }));
+      } });
+    expect(calls).toEqual(['comments', 'head']);
+    expect(fresh).toMatchObject({ headRefOid: 'b'.repeat(40), comments: [sendBack], commentsComplete: true,
+      readAt: new Date(now).toISOString() });
+    const { result, dispatch } = run(() => fresh);
+    expect(dispatch).not.toHaveBeenCalled();
+    expect(result.reconcileRefusalDetails[0].kind).toBe('head-moved');
+  });
+  it('fresh findings still pass through the planner round cap', () => {
+    const reader = vi.fn(number => pr(number, { comments: [sendBack, ...Array.from({ length: 99 }, () => ({ author: sendBack.author, body: freshRearmMarker }))], commentsComplete: true }));
+    const { result, dispatch } = run(reader);
+    expect(reader).toHaveBeenCalledTimes(1);
+    expect(dispatch).not.toHaveBeenCalled();
+    expect(result.reconcileRefusalDetails.some(r => r.kind === 'cap-exhausted')).toBe(true);
+  });
+});
