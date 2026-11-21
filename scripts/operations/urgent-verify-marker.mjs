@@ -48,6 +48,22 @@ export const urgentLoadIdentity = r => createHash('sha256').update(JSON.stringif
 // Completion proves there is no future registration write from this attempt, not success or absence.
 export const completedUrgentRegistrations = records => new Set(records.filter(r =>
   ['prototype-load.urgent-registration-complete', 'prototype-load.urgent-registration-failed'].includes(r.type)).map(urgentLoadIdentity));
+/** Historical terminal evidence shared by monitoring and singleton admission. */
+export function legacyUrgentTerminalReceipts(records, receipts) {
+  const loads = new Map(records.filter(r => r.type === 'prototype-load.urgent').map(r => [urgentLoadIdentity(r), r]));
+  // An earlier sweep demoted legacy terminals because it could not prove completion.
+  // Ignore only those copies; resumed monitoring and explicit completion fields count.
+  const demotedCopy = (r, previous) => previous && !Object.hasOwn(previous, 'registrationComplete') && !Object.hasOwn(r, 'registrationComplete')
+    && (previous.status === 'unloaded-adopted' && r.status === 'unloaded-pending-adoption' && r.fallbackEscalated === true
+      || previous.status === 'settled-unregistered' && previous.ancestryVerified === true && r.status === 'monitoring-unregistered');
+  const latest = new Map();
+  for (const r of receipts) if (r.status !== 'sweep-cursor' && !demotedCopy(r, latest.get(r.id))) latest.set(r.id, r);
+  // Only grandfather the latest terminal receipt for a writer predating completion.
+  return new Map([...latest].filter(([id, r]) => loads.has(id)
+    && !Object.hasOwn(loads.get(id), 'registrationCompletionRequired')
+    && !Object.hasOwn(r, 'registrationComplete')
+    && (r.status === 'unloaded-adopted' || r.status === 'settled-unregistered' && r.ancestryVerified === true)));
+}
 export const urgentReason = (reason) => typeof reason === 'string' && reason.trim().length >= 10;
 const fullSha = (sha) => typeof sha === 'string' && /^[a-f0-9]{40}$/i.test(sha);
 

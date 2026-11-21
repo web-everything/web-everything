@@ -16,6 +16,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, it, expect, vi } from 'vitest';
 import { main, easternIso, verifyPr, verifyRuleset, ensureRef, buildLoadArgs, reserveHotPatch } from '../hot-patch.mjs';
+import { urgentLoadIdentity } from '../operations/urgent-verify-marker.mjs';
 
 const homes = [];
 afterEach(() => { for (const home of homes.splice(0)) rmSync(home, { recursive: true, force: true }); });
@@ -57,6 +58,18 @@ function cli(ghJson = github()) {
 const request = ['request', '--daemon=review', '--pr=42'];
 
 describe('hot-patch MVP CLI', () => {
+  it('requests a subsequent hot patch after a historical ancestry-verified unregistered settlement', async () => {
+    const f = cli();
+    const load = { type: 'prototype-load.urgent', trackingId: 'legacy-hotpatch', ref: `hotpatch/${other}`, sha: other,
+      clone: '/clone/review', registration: { clone: '/clone/review', ref: `hotpatch/${other}`, sha: other } };
+    f.io.loads = () => [load];
+    f.io.state = () => [{ id: urgentLoadIdentity(load), ref: load.ref, sha: other,
+      status: 'settled-unregistered', ancestryVerified: true }];
+    expect(await main(request, f.io)).toBe(0);
+    expect(f.error()).toBe('');
+    expect(f.io.spawn).toHaveBeenCalledTimes(1);
+    expect(f.io.spawn.mock.calls[0][1]).toEqual(['scripts/operations/run.mjs', 'prototype-load', ...buildLoadArgs({ daemon: 'review', sha, pr: 42 })]);
+  });
   it.each(['CLOSED', 'MERGED'])('refuses PR state %s before ref creation or prototype-load', async state => {
     const ghJson = github({ evidence: { ...pr(), state } }), f = cli(ghJson);
     expect(await main(request, f.io)).toBe(1);

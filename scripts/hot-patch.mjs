@@ -9,7 +9,7 @@ import { fileURLToPath } from 'node:url';
 import { execFileSyncThrottled } from './lib/gh-throttle.mjs';
 import { DAEMON_CLONE_SEED, daemonCloneForLabel } from './lib/daemon-clone-registry.mjs';
 import { workspaceFor } from './lib/lane-pool-paths.mjs';
-import { urgentLedger, urgentLoadIdentity, completedUrgentRegistrations } from './operations/urgent-verify-marker.mjs';
+import { urgentLedger, urgentLoadIdentity, completedUrgentRegistrations, legacyUrgentTerminalReceipts } from './operations/urgent-verify-marker.mjs';
 const repo = 'web-everything/web-everything', prefix = `repos/${repo}`;
 const shaOK = sha => typeof sha === 'string' && /^[a-f0-9]{40}$/.test(sha);
 export function hotPatchRoot(daemon, cwd) {
@@ -94,12 +94,14 @@ export function reserveHotPatch({ env, fs = nodeFs, inherited = false }) {
 export function assertHotPatchSingleton(records, receipts) {
   const hot = records.filter(r => r.type === 'prototype-load.urgent' && /^hotpatch\/[a-f0-9]{40}/.test(r.ref ?? ''));
   const complete = completedUrgentRegistrations(records);
+  const legacyTerminal = legacyUrgentTerminalReceipts(records, receipts);
   if (hot.some(r => {
     const id = urgentLoadIdentity(r);
     // A terminal unload receipt settles the load whatever the registration-completion record says (legacy loads have none).
     return !receipts.some(s => s.id === id && s.ref === r.ref && s.sha === r.sha
       && (s.status === 'unloaded-adopted'
-        || (s.status === 'settled-unregistered' && s.ancestryVerified === true && s.registrationComplete === true && complete.has(id))));
+        || (s.status === 'settled-unregistered' && s.ancestryVerified === true
+          && (legacyTerminal.get(id) === s || s.registrationComplete === true && complete.has(id)))));
   })) throw Error('unsettled hot-patch load exists; inspect status and settle it before retrying');
 }
 export async function main(argv = process.argv.slice(2), { cwd = process.cwd(), env = process.env, ghJson, spawn = spawnSync,
