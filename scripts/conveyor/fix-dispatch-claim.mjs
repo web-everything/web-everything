@@ -318,6 +318,10 @@ export function isClaimSessionLive({ repo, pr, kind = 'fix', agentsAll, name: na
  *  Well above any real fix/ci-heal run, and above `hung-session.mjs`'s own 30-min hung threshold. */
 export const MAX_FIX_DISPATCH_CLAIM_REFRESH_MS = 4 * 60 * 60 * 1000;
 
+/** Missing owners can be released only after this spawn/listing-lag grace and a readable listing.
+ * Unknown evidence retains the claim for the existing TTL/operator inspection path. */
+export const STALE_GONE_GRACE_MS = 30 * 60 * 1000;
+
 /** Twenty minutes covers the observed 7–14 minute gaps between live daemon sweeps.
  * A longer gap (daemon down or machine asleep) is unobserved time and must not count toward the idle release window. */
 export const MAX_IDLE_CLAIM_OBSERVATION_GAP_MS = 20 * 60_000;
@@ -331,8 +335,9 @@ export const MAX_IDLE_CLAIM_OBSERVATION_GAP_MS = 20 * 60_000;
  * `agentsAll` read for the whole sweep — never one `claude agents --json --all` call per claim),
  * heartbeat-refreshes it (`file-locks.mjs#heartbeat`) so its TTL never lapses while the session is real. A
  * claim with a terminal session from this dispatch is released before overlap admission, even while its PR
- * remains in review. Unknown/missing sessions retain the TTL grace; old terminal rows cannot release a new
- * dispatch sharing their name. PR labels/head changes alone never release a live session's claim.
+ * remains in review. A readable non-empty listing with no owner row releases a runnerless claim after
+ * {@link STALE_GONE_GRACE_MS}; unknown evidence retains the TTL fallback. Old terminal rows cannot release
+ * a new dispatch sharing their name. PR labels/head changes alone never release a live session's claim.
  *
  * PR #2789 review hardening:
  *  - HUNG: every candidate agent row is first run through `hung-session.mjs#readHungInfo` (injectable as
@@ -379,21 +384,35 @@ export function refreshLiveFixDispatchClaims({
 } = {}) {
   const claims = listFixDispatchClaims(lockRoot);
   if (!claims.length) return { checked: 0, refreshed: [] };
-  const listed = listAgentsAll();
+  let listed;
+  try { listed = listAgentsAll(); } catch { listed = null; }
   if (listed && typeof listed.then === 'function') {
     throw new TypeError('refreshLiveFixDispatchClaims: listAgentsAll must be synchronous (got a Promise)');
   }
   const refreshed = [];
   const released = [];
   const awaiting = [];
+  // Empty or malformed listings cannot prove absence. Require actual named rows, not just array length.
+  const readableListing = Array.isArray(listed) && listed.length > 0
+    && listed.every(a => a && typeof a.name === 'string' && a.name.trim());
   for (const entry of claims) {
     const { repo, pr, kind, headSha = null, claimedAt = null } = entry.meta;
     const resource = fixDispatchResource({ repo, pr, kind });
     const claimedMs = Date.parse(claimedAt ?? '');
-    if (Number.isFinite(claimedMs) && nowMs - claimedMs > MAX_FIX_DISPATCH_CLAIM_REFRESH_MS) {
-      clearClaimIdleHead(lockRoot, resource, entry);
-      continue;
-    }
+    const pastGoneGrace = Number.isFinite(claimedMs) && nowMs - claimedMs > STALE_GONE_GRACE_MS;
+    const releaseStale = (reason, includeReason = true) => {
+      if (!readUnchangedClaim(lockRoot, resource, entry)) return;
+      const result = releaseFixDispatchClaim({ repo, pr, kind, owner: entry.owner, lockRoot });
+      if (!result.released) return;
+      released.push({ repo, pr, kind, owner: entry.owner, ...(includeReason ? { reason } : {}) });
+      recordIdleRelease({ kind: 'stale-claim-released', repo, pr, daemon: 'reconcile-fix-dispatch',
+        detail: { kind, reason, owner: entry.owner } }, recordEvent);
+    };
+    const quarantine = () => {
+      if (!pastGoneGrace || !readUnchangedClaim(lockRoot, resource, entry)) return;
+      recordIdleRelease({ kind: 'stale-claim-quarantined', repo, pr, daemon: 'reconcile-fix-dispatch',
+        detail: { kind, reason: 'owner-row-retained', owner: entry.owner } }, recordEvent);
+    };
     // fix-procedure (`kind:'fixing'`, `we:scripts/conveyor/fix-procedure.mjs`): the holder's session name is
     // `meta.who`, not a minted slug — minting one would THROW on the unknown kind and crash this whole sweep.
     // A claim whose name cannot be resolved is skipped (left to its own TTL), never thrown over.
@@ -401,6 +420,20 @@ export function refreshLiveFixDispatchClaims({
     if (kind === 'fixing') name = entry.meta.who ? String(entry.meta.who) : null;
     else { try { name = fixDispatchSessionName({ repo, pr, kind }); } catch { name = null; } }
     if (!name) {
+      clearClaimIdleHead(lockRoot, resource, entry);
+      continue;
+    }
+    const namedRows = (Array.isArray(listed) ? listed : []).filter(a => a && String(a.name ?? '') === name);
+    // No runner and no exact-name row: only positive listing evidence plus a readable age can release.
+    // Re-read after the listing probe so a replacement dispatch or newly stamped runner wins.
+    if (entry.meta.runnerPid == null && namedRows.length === 0) {
+      if (readableListing && pastGoneGrace) releaseStale('session-gone');
+      clearClaimIdleHead(lockRoot, resource, entry);
+      continue;
+    }
+    if (entry.meta.runnerPid != null && !Number.isInteger(entry.meta.runnerPid)) continue;
+    if (Number.isFinite(claimedMs) && nowMs - claimedMs > MAX_FIX_DISPATCH_CLAIM_REFRESH_MS) {
+      if (!Number.isInteger(entry.meta.runnerPid) && namedRows.length) quarantine();
       clearClaimIdleHead(lockRoot, resource, entry);
       continue;
     }
@@ -419,8 +452,7 @@ export function refreshLiveFixDispatchClaims({
       const cur = readUnchangedClaim(lockRoot, resource, entry);
       if (!cur) continue;
       if (runnerDead) {
-        const result = releaseFixDispatchClaim({ repo, pr, kind, owner: entry.owner, lockRoot });
-        if (result.released) released.push({ repo, pr, kind, owner: entry.owner, reason: identityReason ? `runner-identity-dead (${identityReason})` : `${entry.meta.borrowed ? 'borrowed' : 'wrapped'}-runner-dead (pid ${entry.meta.runnerPid} is gone)` });
+        releaseStale(identityReason ? `runner-identity-dead (${identityReason})` : `${entry.meta.borrowed ? 'borrowed' : 'wrapped'}-runner-dead (pid ${entry.meta.runnerPid} is gone)`);
       } else {
         const meta = { ...cur.meta };
         delete meta.idleHead;
@@ -435,7 +467,7 @@ export function refreshLiveFixDispatchClaims({
     const boundToClaim = (a) => (entry.meta.sessionId
       ? a.sessionId === entry.meta.sessionId
       : Number.isFinite(claimedMs) && startedAtMs(a.startedAt) >= claimedMs);
-    const agentsAll = (Array.isArray(listed) ? listed : []).filter((a) => a && String(a.name ?? '') === name)
+    const agentsAll = namedRows
       .map((a) => {
         let info = null;
         try { info = hungInfoFor(a, nowMs, hungThresholdMs); } catch { info = null; }
@@ -456,7 +488,7 @@ export function refreshLiveFixDispatchClaims({
     if (!isAwaiting && !isClaimSessionLive({ repo, pr, kind, agentsAll, name })) {
       // A terminal row must belong to THIS dispatch, not an older round with the
       // same reusable name. Missing/failed listings and the spawn-listing lag
-      // never release a claim. A live sibling above always wins over old rows.
+      // are handled above. A live sibling always wins over old rows.
       // #3964 (2026-10-05): a fixer's own session starts before its fixing claim;
       // an exact sessionId match settles that claim regardless of start time.
       const settled = agentsAll.some((a) =>
@@ -464,11 +496,8 @@ export function refreshLiveFixDispatchClaims({
         && ((entry.meta.sessionId && a.sessionId === entry.meta.sessionId)
           || (Number.isFinite(claimedMs) && startedAtMs(a.startedAt) >= claimedMs)));
       if (settled) {
-        if (readUnchangedClaim(lockRoot, resource, entry)) {
-          const result = releaseFixDispatchClaim({ repo, pr, kind, owner: entry.owner, lockRoot });
-          if (result.released) released.push({ repo, pr, kind, owner: entry.owner });
-        }
-      }
+        releaseStale('settled-terminal-row', false);
+      } else quarantine();
       clearClaimIdleHead(lockRoot, resource, entry);
       continue;
     }
@@ -487,11 +516,7 @@ export function refreshLiveFixDispatchClaims({
         try { return identity(a.pid, { startedBy: holderStartedBy(a, startedAtMs) }); } catch { return null; }
       });
       if (identities.every((verdict) => verdict?.alive === false)) {
-        if (readUnchangedClaim(lockRoot, resource, entry)) {
-          const result = releaseFixDispatchClaim({ repo, pr, kind, owner: entry.owner, lockRoot });
-          if (result.released) released.push({ repo, pr, kind, owner: entry.owner,
-            reason: `session-identity-dead (${identities[0].reason})` });
-        }
+        releaseStale(`session-identity-dead (${identities[0].reason})`);
         clearClaimIdleHead(lockRoot, resource, entry);
         continue;
       }
@@ -545,6 +570,7 @@ export function refreshLiveFixDispatchClaims({
       }
     }
     if (!heartbeat(lockRoot, resource, current.owner, heartbeatAt, current.pid ?? null, meta)) continue;
+    quarantine();
     if (isAwaiting) awaiting.push({ repo, pr, kind, owner: entry.owner });
     refreshed.push({
       repo, pr, kind, headSha, owner: entry.owner,
