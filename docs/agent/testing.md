@@ -5742,6 +5742,16 @@ Check mode fetches origin main before evaluating canonical audit evidence. A fai
 `main not refreshed: <reason>` and refuses even when local evidence would pass against stale refs.
 `open-pr-audit-gate.test.mjs` covers both refresh outcomes, aggregation and an unconfirmed check child.
 
+## Shadow-only static selection edges
+
+`scripts/lib/static-selection-edges.mjs` measures comment-stripped imports, alias imports,
+and literal spawn/read paths without changing gate selection. An optional `selectTests`
+callback adds a `shadow: { tests, partial }` field; it never changes `mode` or the existing decision.
+In `--measure` only, `WE_STATIC_EDGES_SHADOW` or `WE_DIFF_TEST_SELECTION=1` enables this
+diagnostic and records `shadowEscaped` failures outside its test list. Each source has a
+512 KB UTF-8 input cap: oversized files are skipped; oversized or unreadable evidence
+sets `partial: true` (as does a truncated test list). Treat partial output as incomplete
+measurement requiring inspection, never as proof of coverage or an input to a gate.
 ## CI workflow self-test (ci-self.yml)
 
 An edit to `ci.yml` is never run by its own PR: the ruleset pins the workflow from main. Before a
@@ -5786,3 +5796,15 @@ in review evidence. For retryable warnings, `effect-executor.test.mjs` must defe
 refusal and safe replay; `cli-adapter.test.mjs` must defend warning stops, fallback text and credential
 redaction in JSON and text output. These checks are deliberate contract pins when the behavior already
 exists; the stale-baseline and reverted-history cases must discriminate the publication repair.
+## Pinned merge-drain leaf fixtures (R1105)
+
+CLI fixtures exercising gates after the test-gaming scan must provide a resolved
+commit matching the listed head, a merge-base, numstat and a readable unified diff.
+Use `scripts/__tests__/fixtures/pinned-leaf-diff-fixture.mjs` for synthetic
+`lane/leaf-N` backlog-only PRs; an always-failing Git diff now exercises the
+incomplete-evidence human hold instead of the downstream gate.
+For fixtures with arbitrary branches, workflow files or cross-repo couples, use
+`pinned-pr-diff-fixture.mjs` with rows from the same PR database as fake `gh`.
+Keep full commit IDs consistent across listings, live reads, check runs and saved
+refresh records. Resolve the diff at the listed head when a capped commits read
+or a later push intentionally makes the commits tip or live head differ.
