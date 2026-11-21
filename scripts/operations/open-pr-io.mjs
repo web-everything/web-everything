@@ -97,8 +97,12 @@ function withBypassInBody(argv, b, cwd) {
   return withNoteInBody(argv, renderBypassNote(b), cwd);
 }
 function withNoteInBody(argv, note, cwd) {
-  const i = argv.findIndex((a) => a.startsWith('--body-file='));
-  if (i < 0) throw new Error('the request has no --body-file, so the bypass cannot be recorded in the PR body');
+  const i = argv.findLastIndex((a) => a.startsWith('--body-file='));
+  if (i < 0) {
+    const bodyIndex = argv.findLastIndex((a) => a.startsWith('--body='));
+    if (bodyIndex < 0) throw new Error('the request has no --body-file or --body, so the bypass cannot be recorded in the PR body');
+    return { argv: argv.map((a, j) => (j === bodyIndex ? a + note : a)), cleanup: () => {} };
+  }
   const dir = mkdtempSync(join(tmpdir(), 'open-pr-bypass-'));
   const cleanup = () => rmSync(dir, { recursive: true, force: true });
   try {
@@ -244,7 +248,7 @@ export function createPrLandRunner({ canonicalAudit = checkCanonicalAuditForOpen
     if (audit?.ok && audit.carried) {
       const c = audit.carried;
       process.stderr.write(`carried-across-main-merge ${c.from.slice(0, 8)}..${c.to.slice(0, 8)} fp ${c.fingerprint.slice(0, 8)} ruling ${c.ruling ?? 'none'}\n`);
-      if (!collectOnly && arg('body-file')) {
+      if (!collectOnly && argv.some(a => a.startsWith('--body-file=') || a.startsWith('--body='))) {
         const previousCleanup = cleanupBody;
         try {
           const noted = withNoteInBody(argv, `\n<!-- audit-carry: carried-across-main-merge ${c.from}..${c.to} -->\nMain-merge audit carry preserves the lane diff; CI still runs on the merged head.\n`, cwd);

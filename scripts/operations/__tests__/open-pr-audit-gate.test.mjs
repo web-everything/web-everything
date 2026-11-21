@@ -60,6 +60,43 @@ describe('combined open-pr preflight', () => {
       expect(() => readFileSync(copied)).toThrow();
     } finally { output.mockRestore(); rmSync(dir, { recursive: true, force: true }); }
   });
+  it('annotates the last duplicate --body-file consumed by pr-land', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'audit-carry-duplicate-body-'));
+    const first = join(dir, 'first.md'), last = join(dir, 'last.md');
+    writeFileSync(first, 'First body\n');
+    writeFileSync(last, 'Last body\n');
+    let copied;
+    const spawn = vi.fn((_cmd, args) => {
+      const files = args.filter(a => a.startsWith('--body-file='));
+      expect(files).toHaveLength(2);
+      expect(files[0]).toBe(`--body-file=${first}`);
+      expect(args).toContain('--body=Ignored inline body');
+      copied = files.at(-1).slice('--body-file='.length);
+      expect(readFileSync(copied, 'utf8')).toContain(`Last body\n\n<!-- audit-carry: carried-across-main-merge ${base}..${sha} -->`);
+      return { status: 0, stdout: '{"pr":7}' };
+    });
+    const run = createPrLandRunner({ env: {}, spawn, prepGate: () => ({ ok: true }),
+      prePrReview: () => ({ action: 'pass' }),
+      canonicalAudit: () => ({ ok: true, carried: { from: base, to: sha, fingerprint: 'f'.repeat(64) } }) });
+    try {
+      expect(run({ argv: ['--ref=lane/audit', `--body-file=${first}`, `--body-file=${last}`, '--body=Ignored inline body'] }).outcome).toBe('opened');
+      expect(spawn).toHaveBeenCalledTimes(1);
+      expect(readFileSync(first, 'utf8')).toBe('First body\n');
+      expect(readFileSync(last, 'utf8')).toBe('Last body\n');
+      expect(() => readFileSync(copied)).toThrow();
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+  it.each([false, true])('annotates the last inline --body consumed by pr-land, duplicate=%s', duplicate => {
+    const { run, spawn } = runner(() => ({ ok: true, carried: { from: base, to: sha, fingerprint: 'f'.repeat(64) } }));
+    expect(run({ argv: ['--ref=lane/audit', ...(duplicate ? ['--body=First inline body'] : []), '--body=Inline review body'] }).outcome).toBe('opened');
+    expect(spawn).toHaveBeenCalledTimes(1);
+    const args = spawn.mock.calls[0][1];
+    const bodies = args.filter(a => a.startsWith('--body='));
+    expect(bodies).toHaveLength(duplicate ? 2 : 1);
+    if (duplicate) expect(bodies[0]).toBe('--body=First inline body');
+    expect(bodies.at(-1)).toContain(`--body=Inline review body\n<!-- audit-carry: carried-across-main-merge ${base}..${sha} -->`);
+    expect(args.some(a => a.startsWith('--body-file='))).toBe(false);
+  });
   it('fails closed if the check child dies or returns an opened payload', () => {
     for (const child of [{ error: new Error('spawn failed') }, { status: 0, stdout: '{"pr":7}' },
       { status: 0, stdout: '{"reason":"opened","pr":7,"blockers":[]}' }]) {
