@@ -397,6 +397,8 @@ export function prepareBranchBeforeEnqueue({ c, traceHeadSha, cwd = process.cwd(
         // when it is stale, which used to leave a pushed, renumbered, red PR. Any unreadable input refuses.
         // Both the data checkout (cwd) and the checkout this module (and so the restamp script) loads from.
         for (const [label, root] of [['drain checkout', cwd], ['drain code checkout', codeRoot]]) {
+          // A separate checkout has its own remote-tracking ref; refresh it so an outdated ref cannot read 0 behind.
+          if (root !== cwd) git(['fetch', 'origin', '+refs/heads/main:refs/remotes/origin/main'], root);
           const { refuse, behind } = restampWouldRefuseStale(root, {
             run: (args, opts) => ({ status: 0, stdout: git(args, opts.cwd, {}, { timeout: opts.timeout ?? 30_000, killSignal: 'SIGKILL' }) }),
             env, adoptedState, now: () => Date.parse(now()),
