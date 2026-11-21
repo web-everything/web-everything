@@ -67,7 +67,8 @@ export function createTracer({ test, root, record = () => {}, fs: io = {}, child
         if (typeof original === 'function') promises[name] = function (...args) { add(args[0], kind, here()); return Reflect.apply(original, this, args); };
       }
     }
-    for (const name of ['spawn', 'spawnSync', 'execFile', 'execFileSync', 'fork']) {
+    // execSync calls Node's internal spawnSync, so it needs its own wrapper; exec reaches the exported execFile.
+    for (const name of ['spawn', 'spawnSync', 'execFile', 'execFileSync', 'execSync', 'fork']) {
       const original = cp[name];
       if (!original) continue;
       // Observe-only: the caller's arguments reach Node unchanged (same values, same count, same receiver).
@@ -127,7 +128,7 @@ function importsHook(options) {
     const char = options[i];
     if (quoted && char === '\\' && i + 1 < options.length) { word = (word ?? '') + options[++i]; continue; }
     if (char === '"') { quoted = !quoted; word ??= ''; continue; }
-    if (!quoted && /\s/.test(char)) { if (word !== null) words.push(word); word = null; continue; }
+    if (!quoted && char === ' ') { if (word !== null) words.push(word); word = null; continue; }
     word = (word ?? '') + char;
   }
   if (word !== null) words.push(word);
@@ -195,7 +196,7 @@ export function compareCoverage({ misses, traceMap, staticSelected }) {
   const selected = new Set(staticSelected);
   const partial = new Set(traceMap.incomplete);
   const results = misses.map(({ test, changed }) => {
-    const seen = Object.hasOwn(tests[test] ?? {}, changed);
+    const seen = Object.hasOwn(tests, test) && Object.hasOwn(tests[test], changed);
     return { test, changed, static: staticKnown ? selected.has(test) : null,
       traced: seen ? true : partial.has(test) ? null : false, traceKnown: Object.hasOwn(tests, test), incomplete: partial.has(test) };
   });

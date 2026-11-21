@@ -24,7 +24,7 @@ function fixture(extra = {}) {
     if (!file.endsWith('script.mjs')) throw new Error('missing');
     return { isFile: () => true };
   });
-  const child_process = Object.fromEntries(['spawn', 'spawnSync', 'execFile', 'execFileSync', 'fork'].map(name => [name, vi.fn(() => 'child')]));
+  const child_process = Object.fromEntries(['spawn', 'spawnSync', 'execFile', 'execFileSync', 'execSync', 'fork'].map(name => [name, vi.fn(() => 'child')]));
   const originals = { ...child_process };
   const tracer = createTracer({ test, root, record, env, fs, child_process, ...extra });
   tracer.install();
@@ -126,7 +126,7 @@ describe('shadow dependency tracer', () => {
       ['throwing env getter', ['node', [], { get env() { throw new Error('getter'); } }]],
     ];
   };
-  it.each(['spawn', 'spawnSync', 'execFile', 'execFileSync', 'fork'].flatMap(name => shapes().map(([label, args]) => [name, label, args])))(
+  it.each(['spawn', 'spawnSync', 'execFile', 'execFileSync', 'execSync', 'fork'].flatMap(name => shapes().map(([label, args]) => [name, label, args])))(
     '%s hands Node the exact caller arguments: %s', (name, _label, args) => {
       const f = fixture();
       const receiver = { marker: true };
@@ -215,7 +215,8 @@ describe('shadow dependency tracer', () => {
     ['env:{}', { env: {} }, true],
     ['env without the hook', { env: traceEnv({ NODE_OPTIONS: '--conditions=x' }) }, true],
     ['hook only named, not imported', { env: traceEnv({ NODE_OPTIONS: `--require=${hookUrl}` }) }, true],
-    ['hook inside a quoted other value', { env: traceEnv({ NODE_OPTIONS: `--title="--import=${hookUrl}"` }) }, true],
+    ['hook after a tab, which Node does not split on', { env: traceEnv({ NODE_OPTIONS: `--conditions=x\t--import=${hookUrl}` }) }, true],
+    ['hook inside a quoted other value',{ env: traceEnv({ NODE_OPTIONS: `--title="--import=${hookUrl}"` }) }, true],
     ['numeric NODE_OPTIONS', { env: traceEnv({ NODE_OPTIONS: 7 }) }, true],
     ['Symbol NODE_OPTIONS', { env: traceEnv({ NODE_OPTIONS: Symbol('opts') }) }, true],
     ['missing test identity', { env: traceEnv({ WE_TRACE_TEST: undefined }) }, true],
@@ -230,6 +231,13 @@ describe('shadow dependency tracer', () => {
     f.child_process.spawn('node', [], ...(options === undefined ? [] : [options]));
     expect(f.tracer.snapshot().incomplete).toBe(incomplete);
     expect(f.originals.spawn).toHaveBeenCalledTimes(1);
+  });
+  it('observes execSync, which bypasses the exported spawnSync, with options in the first slot', () => {
+    const f = fixture();
+    f.child_process.execSync('node -e 0', { encoding: 'utf8' });
+    expect(f.tracer.snapshot().incomplete).toBe(false);
+    f.child_process.execSync('node -e 0', { env: {} });
+    expect(f.tracer.snapshot().incomplete).toBe(true);
   });
   it('flags a child that inherits a process env whose trace identity setup removed', () => {
     const f = fixture();
@@ -464,6 +472,10 @@ describe('shadow dependency tracer', () => {
     expect(summary.results.map(r => [r.traced, r.incomplete, r.traceKnown]))
       .toEqual([[true, true, true], [null, true, true], [null, true, true], [false, false, false]]);
     expect(summary.counts).toMatchObject({ traced: 1, additional: 1, unknown: 1, incomplete: 3 });
+  });
+  it('never reports an unknown test traced through an inherited object key', () => {
+    const summary = compareCoverage({ traceMap: { tests: {}, incomplete: [] }, misses: [{ test: 'constructor', changed: 'name' }] });
+    expect(summary.results[0]).toMatchObject({ traced: false, traceKnown: false });
   });
   it('CLI prints the incomplete flag and warns when results rest on incomplete evidence', () => {
     const print = vi.fn();

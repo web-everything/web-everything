@@ -5106,8 +5106,11 @@ the same `WE_TRACE_TEST`, a `WE_TRACE_DIR` resolving to the same directory, or t
 `WE_CI_SELECTION` marks the evidence `incomplete`. A trace without the flag also counts as incomplete.
 Incomplete evidence keeps its observed edges, but a result it does not show is `traced: null`
 (unknown), never `false`. The replay prints `incomplete: true` and warns on stderr.
-Not observed (no edge, no flag): stream, file-descriptor and `FileHandle` reads, `execSync`, and a
-process killed by a signal (no exit hook, so no trace file; the test stays unknown).
+`execSync` is wrapped separately because it bypasses the exported `spawnSync`. Hook detection splits
+`NODE_OPTIONS` on spaces only, as Node does (a tab is not a separator).
+Not observed (no edge, no flag): stream, file-descriptor and `FileHandle` reads, and a child killed
+by a signal or a `spawnSync` timeout (no exit hook, so no trace file, while the parent's trace still
+reads complete). These are carded as `xo73a24`.
 Omitting static evidence prints `staticEvidence: "not supplied"`; static and additional counts
 are `null` (unknown). An explicit empty static list means known zero static coverage.
 Tracing stays shadow-only. The edge cap applies per process; a cap warning means incomplete evidence:
