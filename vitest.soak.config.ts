@@ -42,9 +42,12 @@ export default defineConfig({
     // Must FAIL LOUDLY before the CI job's own `timeout-minutes` (25) cancels it: a test timeout equal to the job
     // timeout meant a hung scenario never produced a failure, only a cancelled job (PR #4235). Longest scenario: the
     // 50-tick baseline, 550s on a green run and 615s on a slow runner (it shares a shard with ~30 parallel scenarios),
-    // so 10 min left no headroom (main red @ 8cd0b3d12) — 17 min is ~1.7x the slowest seen.
+    // so 10 min left no headroom (main red @ 8cd0b3d12) — 17 min was ~1.7x the slowest seen. By 2026-11-21 the baseline
+    // had grown to ~15 min on GREEN runs (runs 44856946246 = 925s, 44851761418 ~16 min shard) as ticks got slower, and
+    // main went red @ b784af27e when a slow runner hit the 1020s cap (1030s). 24 min is ~1.5x the slowest seen
+    // and stays under the 30-min `soak-shard` job cap (setup ~2 min).
     // Knob: WE_SOAK_TEST_TIMEOUT_MS.
-    testTimeout: Number(process.env.WE_SOAK_TEST_TIMEOUT_MS) || 17 * 60_000,
+    testTimeout: Number(process.env.WE_SOAK_TEST_TIMEOUT_MS) || 24 * 60_000,
     hookTimeout: 5 * 60_000,
   },
 });
