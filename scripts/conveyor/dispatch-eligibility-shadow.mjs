@@ -3,6 +3,7 @@ import * as nodeFs from 'node:fs';
 import { dirname, join } from 'node:path';
 import { eligibility } from './dispatch-eligibility.mjs';
 import { buildEligibilityFacts } from './dispatch-eligibility-facts.mjs';
+import { LIST_COMMENTS_PAGE_SIZE } from './pr-comments-complete.mjs';
 import { resolveCascade, platformPreference } from '../lib/policy-cascade.mjs';
 import { readSettings } from '../lib/settings-files.mjs';
 import { daemonConveyorStateRoot } from '../lib/daemon-last-good.mjs';
@@ -81,9 +82,14 @@ export function runEligibilityShadow({ dispatch = [], prs = [], mode = 'shadow',
     result.checked++;
     try {
       const pr = prs.find(p => p.number === entry.prNumber) ?? {};
-      const facts = buildEligibilityFacts({ pr, comments: pr.comments, commentsComplete: pr.commentsComplete === true,
+      // A listed thread under one page is the whole thread (same rule as review-hold-reconcile); a full page may be
+      // truncated and an unreadable one is unknown, so both stay incomplete.
+      const complete = pr.commentsComplete === true
+        || (pr.commentsComplete === undefined && Array.isArray(pr.comments) &&pr.comments.length < LIST_COMMENTS_PAGE_SIZE
+          && pr.comments.every(c => c && typeof c === 'object' && typeof c.body === 'string'));
+      const facts = buildEligibilityFacts({ pr, comments: pr.comments, commentsComplete: complete,
         population: entry.kind, locals: readLocals(entry, pr) });
-      const gate = eligibility(pr, facts);
+      const gate = eligibility({ ...pr, commentsComplete: complete }, facts);
       if (gate.dispatch === true) continue;
       result.disagreements++;
       appendLine(JSON.stringify({ at: new Date(now()).toISOString(), pathId, pr: entry.prNumber,

@@ -312,3 +312,22 @@ describe('shadow mode line never pollutes machine-readable stdout', () => {
     expect(r.stderr).toContain('dispatch.eligibility.mode=');
   });
 });
+
+describe('runEligibilityShadow thread completeness', () => {
+  const rows = prs => { const appendLine = vi.fn(); run({ dispatch: [entry()], prs, appendLine }); return appendLine.mock.calls.map(c => JSON.parse(c[0])); };
+  it('a short listed thread (under one page) is not unknown:thread', () => {
+    const [row] = rows([sentBackPr(6001, { isDraft: true, commentsComplete: undefined })]);
+    expect(row).toMatchObject({ gate: 'hold' });
+    expect(row.reasons).not.toContain('thread');
+  });
+  it('known-hold cases still give hold, not dispatch, with a complete thread', () => {
+    expect(rows([sentBackPr(6001, { isDraft: true, commentsComplete: true })])).toEqual([expect.objectContaining({ gate: 'hold' })]);
+  });
+  it('a full page (possibly truncated) or an unreadable thread stays unknown:thread', () => {
+    const full = Array.from({ length: 100 }, () => bot('x'));
+    expect(rows([pr(6001, { comments: full, commentsComplete: undefined })])).toEqual([expect.objectContaining({ gate: 'unknown', reasons: ['thread'] })]);
+    expect(rows([pr(6001, { comments: undefined, commentsComplete: undefined })])).toEqual([expect.objectContaining({ gate: 'unknown', reasons: ['thread'] })]);
+    const unreadable = [...sentBackPr().comments, { author: { login: 'x' } }];
+    expect(rows([sentBackPr(6001, { comments: unreadable, commentsComplete: undefined })])).toEqual([expect.objectContaining({ gate: 'unknown', reasons: ['thread'] })]);
+  });
+});
