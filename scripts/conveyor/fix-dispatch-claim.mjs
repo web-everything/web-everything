@@ -195,7 +195,7 @@ export function acquireFixDispatchClaim({
   const claimedAt = prior?.owner === owner && prior?.meta?.claimedAt && !isLeaseExpired(prior, nowMs, leaseMinutes)
     ? prior.meta.claimedAt : nowIso;
   const meta = {
-    host, sessionId, repo, pr, kind, headSha: headSha ?? null, claimedAt,
+    host, sessionId, repo, pr, kind, headSha: headSha ?? null, claimedAt, leaseMinutes,
     // #4295 — declared scope (repo-qualified) so build/fix dispatch can serialize on overlap; omitted when unknown.
     ...(Array.isArray(scope) && scope.length ? { scope: scope.map(String) } : {}),
     // Card 87 — this fix runs in a BORROWED builder slot (`{executor, reason}`); the build daemon counts it there.
