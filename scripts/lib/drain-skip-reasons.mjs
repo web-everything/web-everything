@@ -11,16 +11,25 @@
  */
 
 export const SKIP_KINDS = Object.freeze([
-  'unknown-mergeability', 'conflicting', 'behind', 'checks-pending', 'review-hold', 'cap', 'head-moved',
+  'claim-held', 'unknown-mergeability', 'conflicting', 'behind', 'checks-pending', 'review-hold', 'cap', 'head-moved',
   'couple-held', 'blocked-by', 'overlap-yield', 'rebuilt-pending-ci', 'merge-failed', 'parked',
   // Former "other" bucket, now named: every skip says which rule held it.
   'restamp-stale-code', 'not-certified', 'off-base', 'codeql-failed', 'empty-body', 'stale-read', 'escalated',
   'partner-pending', 'ready-not-reached', 'red-main-hold', 'unrecognized-reason', 'card-grouped',
 ]);
 
+export const CLAIM_HELD_PREFIX = 'claim-held:';
+
+/** Stable drain diagnostic; holder text never determines the skip kind. */
+export function formatClaimHeldReason({ kind, holder, repo, pr, uncertain }) {
+  return `${CLAIM_HELD_PREFIX} ${kind} claim on ${repo}#${pr} held by ${holder}`
+    + (uncertain ? ` (uncertain: ${uncertain})` : '');
+}
+
 /** Map a drain reason string to a stable kind. Order matters: the most specific signal wins. */
 export function classifySkipReason(reason) {
   const r = String(reason ?? '');
+  if (/^claim-held:/.test(r)) return 'claim-held';
   if (/restamp-stale-code/i.test(r) || /acceptance re-stamp failed:[\s\S]*(?:STALE code|commit(?:\(s\)|s)? behind origin)/i.test(r)) return 'restamp-stale-code';
   // All four card-group hold reasons (we:scripts/lib/card-group.mjs#cardGroupHold).
   if (/^grouped into | is reserved by open card group |^card-group state unreadable|^card-group repository identity missing/.test(r)) return 'card-grouped';
