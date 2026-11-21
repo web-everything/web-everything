@@ -2,6 +2,7 @@
 import { describe, it, expect, vi } from 'vitest';
 import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { EventEmitter } from 'node:events';
+import { execFileSync } from 'node:child_process';
 import { PassThrough } from 'node:stream';
 import { join, resolve } from 'node:path';
 import { homedir, tmpdir } from 'node:os';
@@ -108,6 +109,40 @@ const commandShapes = [
   ['relative shard malformed options', relativeShard.replace('--parallel=2', '--parallel=bad'), null],
   ['dynamic shard path refuses local execution', `node "$PWD/scripts/lib/verify-shard-run.mjs" --shards=2 --parallel=2 --budget-ms=1000 -- ${selectedTests}`, null],
   ...[
+    'scripts/lib/verify-shard-ru?.mjs',
+    'scripts/lib/verify-shard-ru*.mjs',
+    'scripts/lib/verify-shard-ru[n].mjs',
+    'scripts/l?b/verify-shard-run.mjs',
+    "'scripts/lib/'verify-shard-ru?.mjs",
+    'scripts/lib/verify-shard-ru""?.mjs',
+    'scripts/lib/../lib/verify-shard-ru?.mjs',
+  ].flatMap(path => [
+    ['direct', `node ${path}`],
+    ['node terminator', `node -- ${path}`],
+    ['prefixed', `env node ${path}`],
+    ['nested', `node scripts/readiness/heavy-admission.mjs run -- node ${path}`],
+    ['after standards', `npm run check:standards && node ${path}`],
+    ['shell payload', `sh -c ${shellQuote(`node ${path} --shards=1 --parallel=1 --budget-ms=60000 -- npx vitest run scripts/__tests__/stdout-flush.test.mjs`)}`],
+  ].map(([shape, prefix]) => [
+    `globbed shard path refuses local execution (${shape}): ${path}`,
+    shape === 'shell payload' ? prefix : `${prefix} --shards=1 --parallel=1 --budget-ms=60000 -- npx vitest run scripts/__tests__/stdout-flush.test.mjs`, null,
+  ])),
+  ...[
+    "'scripts/lib/verify-shard-ru?.mjs'",
+    '"scripts/lib/verify-shard-ru*.mjs"',
+    'scripts/lib/verify-shard-ru\\?.mjs',
+    "scripts/lib/verify-shard-ru'[n]'.mjs",
+  ].map(path => [`literal glob characters do not expand: ${path}`, `node ${path}`]),
+  ['quoted glob suite input remains data', "npx vitest run 'scripts/__tests__/*.test.mjs'"],
+  ['quoted glob standards input remains data', "npm run check:standards -- --files='scripts/lib/verify-shard-ru?.mjs'"],
+  ['unquoted glob suite input remains data', 'npx vitest run scripts/__tests__/*.test.mjs'],
+  ['unquoted glob standards input remains data', 'npm run check:standards -- --files=scripts/lib/verify-shard-ru?.mjs'],
+  ['nested glob suite input remains data', 'node scripts/readiness/heavy-admission.mjs run -- npx vitest run scripts/__tests__/*.test.mjs'],
+  ['glob echo argument remains data', 'echo scripts/lib/verify-shard-ru?.mjs'],
+  ['globbed executable refuses local execution', `./node_module?/.bin/node scripts/lib/verify-shard-run.mjs --shards=1 --parallel=1 --budget-ms=60000 -- ${selectedTests}`, null],
+  ['node options cannot hide a globbed script', `node --no-warnings scripts/lib/verify-shard-ru?.mjs --shards=1 --parallel=1 --budget-ms=60000 -- ${selectedTests}`, null],
+  ['globbed outer admission refuses local execution', `node scripts/readiness/heavy-admissio?.mjs run -- ${relativeShard}`, null],
+  ...[
     '"$RUNNER"', '$RUNNER', '"${RUNNER}"', 'scripts/lib/"$RUNNER"',
     '"${DIR}/${FILE}"', '"$(printf %s "$RUNNER")"', '`printf %s "$RUNNER"`',
   ].map(path => [
@@ -142,6 +177,13 @@ function parseCli(context, local, childArgs) {
 }
 
 describe('verify-lane --local', () => {
+  it('the reported glob resolves to the real shard runner in the production shell', () => {
+    const expanded = execFileSync('/bin/sh', ['-c', 'printf "%s" scripts/lib/verify-shard-ru?.mjs'], {
+      cwd: new URL('../../', import.meta.url), encoding: 'utf8', timeout: 1000, maxBuffer: 4096,
+    });
+    expect(expanded).toBe('scripts/lib/verify-shard-run.mjs');
+  });
+
   it('supersedes in-flight requests when local policy changes and retains identical retries (daemon soak)', async () => {
     expect(localPolicy.judge(await localPolicy.run())).toEqual([]);
   });

@@ -915,7 +915,12 @@ async function timedRunGate(phase, command, args, { outcomeKey } = {}) {
       while ((match = token.exec(command))) {
         offset = token.lastIndex;
         if (match[0] === '&&') segments.push([]);
-        else if (!/^[ \t]+$/.test(match[0])) segments.at(-1).push({ value: unquote(match[0]), start: match.index });
+        else if (!/^[ \t]+$/.test(match[0])) segments.at(-1).push({
+          value: unquote(match[0]), start: match.index,
+          // Only unquoted, unescaped patterns expand in this shell. Preserve that distinction
+          // before unquoting so literal wildcard characters in file arguments remain data.
+          glob: /[*?\[]/.test(match[0].replace(/'[^']*'|"(?:[^"\\]|\\.)*"|\\./gs, '')),
+        });
       }
       const refusal = () => { throw new Error('verify-lane: --local requires a selected Vitest command in the shard wrapper; use an unprefixed literal node path and an &&-joined gate'); };
       if (offset !== command.length) {
@@ -929,7 +934,10 @@ async function timedRunGate(phase, command, args, { outcomeKey } = {}) {
         for (const { words, depth } of commands) {
           const start = words.findIndex(t => !/^[A-Za-z_][A-Za-z0-9_]*=/.test(t.value));
           if (start < 0) continue;
-          const mentionsWrapper = word => word.value.includes('verify-shard-run.mjs');
+          if (words[start].glob) refusal();
+          // Unknown launchers may interpret even a quoted payload in another shell. A pattern
+          // can hide any part of the wrapper's name, so literal substring matching is insufficient.
+          const mentionsWrapper = word => word.value.includes('verify-shard-run.mjs') || /[*?\[]/.test(word.value);
           if (!/(?:^|\/)node$/.test(words[start].value)) {
             // Generated suite commands consume file names as data. Classify their executable
             // prefix before looking for wrappers: --files may name the shard runner itself.
@@ -949,6 +957,7 @@ async function timedRunGate(phase, command, args, { outcomeKey } = {}) {
             continue;
           }
           const scriptIndex = start + (words[start + 1]?.value === '--' ? 2 : 1);
+          if (words[scriptIndex]?.glob) refusal();
           const isWrapper = word => word && resolve(REPO, word.value).endsWith('/scripts/lib/verify-shard-run.mjs');
           if (!isWrapper(words[scriptIndex])) {
             // Admission forwards the argv after --. Inspect that executable as well: a shard
