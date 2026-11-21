@@ -2543,6 +2543,7 @@ describe('the write arc and its #2964 ordering', () => {
         const hookFiles = [
           '.githooks/pre-push',
           'scripts/guard-git-push.mjs',
+          'scripts/lib/lane-lease.mjs',
           'scripts/guard-prototype-tracker.mjs',
           'scripts/lib/poc-branches.mjs',
           'scripts/lib/constellation-repos.mjs',
