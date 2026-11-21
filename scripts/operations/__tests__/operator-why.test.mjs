@@ -4,6 +4,7 @@ import { join } from 'node:path';
 import { withRealRepo } from './helpers/real-repo.mjs';
 import { explainWhy, lastMentionLine, whyOperation } from '../operator-why.mjs';
 import { ADVISORY_NOTE_MARKER } from '../../conveyor/advisory-round-count.mjs';
+import { advisoryHeadMoveState } from '../../conveyor/reconcile-core.mjs';
 import { createWhyReader } from '../operator-why-io.mjs';
 
 const base = { subject: { kind: 'pr', id: 5017 }, repo: 'web-everything/web-everything', pr: { state: 'OPEN', labels: [] }, logs: [], checks: [], gaps: [] };
@@ -39,12 +40,14 @@ describe('why first-match owner rules', () => {
     expect(out.screen.split('\n').length).toBeLessThanOrEqual(40);
   });
   it('why names review daemon when advisory is stale', () => {
-    const out = explainWhy({ ...base, pr: staleAdvisoryPr() });
+    const pr = staleAdvisoryPr();
+    const out = explainWhy({ ...base, pr, advisoryHeadMove: advisoryHeadMoveState(pr) });
     expect(out.owner).toBe('review daemon');
     expect(out.waitingFor).toBe('advisory re-run on f7c7dcd37');
   });
   it('why says so when the advisory is unreadable', () => {
-    const out = explainWhy({ ...base, pr: staleAdvisoryPr({ comments: [{ author: { login: 'web-everything' }, body: `${ADVISORY_NOTE_MARKER}\n\nno basis` }] }) });
+    const pr = staleAdvisoryPr({ comments: [{ author: { login: 'web-everything' }, body: `${ADVISORY_NOTE_MARKER}\n\nno basis` }] });
+    const out = explainWhy({ ...base, pr, advisoryHeadMove: advisoryHeadMoveState(pr) });
     expect(out.owner).toBe('operator');
     expect(out.waitingFor).toMatch(/advisory unreadable/);
   });

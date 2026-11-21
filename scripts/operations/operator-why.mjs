@@ -1,7 +1,6 @@
 /** Operator decision 2026-10-13: manual intervention without a worker. Pure read-only explanation. */
 import { op } from './registry.mjs';
 import { compute } from './step-kinds.mjs';
-import { advisoryHeadMoveState } from '../conveyor/reconcile-core.mjs';
 import { CONSTELLATION_REPOS, DEFAULT_REPO_KEY } from '../lib/constellation-repos.mjs';
 
 export const WHY_OP = 'why';
@@ -36,7 +35,7 @@ export function explainWhy(facts) {
   const sentAt = Date.parse(latest?.createdAt ?? ''), headAt = Date.parse(f.headCommittedDate ?? '');
   const sentBack = isPr && has('review:human') && latest?.decision === 'changes' && !latest.otherHead && Number.isFinite(sentAt) && Number.isFinite(headAt) && sentAt >= headAt;
   const fixRefusal = log('fix');
-  const headMove = isPr && has('review:human') && !has('advisory:changes') ? advisoryHeadMoveState(f.pr) : { owed: false };
+  const headMove = isPr && has('review:human') && !has('advisory:changes') ? (f.advisoryHeadMove ?? { owed: false }) : { owed: false };
   const rules = [
     [isPr && /^(merged|closed)$/i.test(f.pr?.state ?? ''), () => row('nobody', 'nothing (closed)')],
     [isPr && f.standDown, () => row('operator', `stand-down answer (${f.standDown.reason ?? 'unknown'})`, `node scripts/conveyor/stand-down-answer.mjs ${subject.id} --preview --repo=${f.repo} ${audit}`)],

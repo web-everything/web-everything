@@ -8,6 +8,7 @@ import { readField } from '../backlog/frontmatter.mjs';
 import { cardForPr } from './pr-ownership-io.mjs';
 import { checksArgv, parseJsonLines } from './pr-status-io.mjs';
 import { defaultReadRequiredStatusChecks } from '../lib/required-status-checks.mjs';
+import { advisoryHeadMoveState } from '../conveyor/reconcile-core.mjs';
 import { readCompletePrComments } from '../conveyor/pr-comments-complete.mjs';
 import { latestUnresolvedStandDown } from '../conveyor/stand-down-answer-core.mjs';
 import { standDownReason } from '../conveyor/stand-down.mjs';
@@ -52,6 +53,8 @@ export function createWhyReader({
       const comments = safe('comments', () => readComments(pr, repo), null);
       if (comments) {
         facts.pr.comments = comments;
+        // Decided by the planner's own helper (here, in the io module, so operator-why.mjs stays free of acting imports).
+        facts.advisoryHeadMove = safe('advisory head move', () => advisoryHeadMoveState(facts.pr), null);
         facts.standDown = safe('stand-down', () => { const c = latestUnresolvedStandDown(comments); return c ? { ...c, reason: standDownReason(c.body) ?? 'unknown' } : null; }, null);
         facts.roundExtensions = safe('round extensions', () => countGrantedRoundExtensions(comments, { repo, pr }), null);
       }
