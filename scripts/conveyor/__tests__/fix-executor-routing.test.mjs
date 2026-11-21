@@ -22,7 +22,8 @@ describe('configured capacity candidates reach the fix launcher', () => {
     allowedKinds: ['fix', 'ci-heal'], windowModel: 'fixed', windows: [{ name: 'five_hour', lengthHours: 5 }],
     readers: [{ type: 'codex-rollout' }] };
   const options = (providers = [custom]) => ({ env: { WE_CAPACITY_READERS: 'off' }, platform: {}, now,
-    repo: { routing: { builder: 'auto' }, providerCapacity: { providers } }, records: [],
+    // Tier exclusions need an explicit floor; shipped defaults impose no minimum.
+    repo: { routing: { builder: 'auto' }, providerCapacity: { providers, minimumTiers: { fix: 3, 'ci-heal': 3 } } }, records: [],
     quota: () => ({ at: now, used_percent: 10, resets_at: (now + 3600000) / 1000 }), record: () => {} });
 
   it.each(['fix', 'ci-heal'])('launches the configured model for %s through its native launcher', async kind => {
