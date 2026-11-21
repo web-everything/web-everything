@@ -100,9 +100,27 @@ export function runTrial(dir) {
 
 if (import.meta.url === `file://${process.argv[1]}`) {
   const arg = (n, d) => process.argv.find((a) => a.startsWith(`--${n}=`))?.slice(n.length + 3) ?? d;
-  const res = runTrial(arg('dir', 'backlog'));
+  const dir = arg('dir', 'backlog');
+  // Snapshot identities before creating an output, which may itself end in .md.
+  // Stat follows symlinks; device/inode also catches hard links and directory aliases.
+  // An unreadable identity fails closed before any output is opened.
+  const inputs = fs.readdirSync(dir).filter((f) => f.endsWith('.md'))
+    .map((f) => fs.statSync(path.join(dir, f), { bigint: true }));
+  const res = runTrial(dir);
   const out = arg('out', 'reports/data/backlog-placement-trial.json');
-  fs.writeFileSync(out, `${JSON.stringify(res, null, 1)}\n`);
+  // Do not truncate on open. Check and write the same descriptor so a path swap
+  // after validation cannot redirect the write into a card.
+  const fd = fs.openSync(out, fs.constants.O_WRONLY | fs.constants.O_CREAT);
+  try {
+    const output = fs.fstatSync(fd, { bigint: true });
+    if (inputs.some((input) => input.dev === output.dev && input.ino === output.ino)) {
+      throw new Error('Output destination aliases an input card');
+    }
+    fs.ftruncateSync(fd, 0);
+    fs.writeFileSync(fd, `${JSON.stringify(res, null, 1)}\n`);
+  } finally {
+    fs.closeSync(fd);
+  }
   console.log(`cards: ${res.total}`);
   console.log('by target:', JSON.stringify(res.byTarget));
   const top = Object.entries(res.byRule).sort((a, b) => b[1] - a[1]).slice(0, 10);
