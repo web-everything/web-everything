@@ -8,17 +8,20 @@
  * both pinned to the real `HEAD` commit. A child run with {@link GitOverlay.env} sees exactly the checkout's content,
  * but `origin/main` is a fixture that never moves when someone pushes — so its result cannot drift with live data.
  * Its `origin` remote is the overlay itself, so even a fetch stays local. The hermetic `git` shim sees `GIT_DIR`
- * outside every real checkout and lets it through.
+ * outside every real checkout and lets it through. A fixture git on PATH also supplies explicit repository
+ * arguments, so production callers can scrub inherited Git environment without escaping the overlay.
+ * When adding another fake executable directory, prepend it to the overlay's env.PATH.
  *
  * Costs milliseconds and a ~1–2 MB index copy, unlike a clone or a tree copy (tens of thousands of files).
  */
-import { copyFileSync, existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { chmodSync, copyFileSync, existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { execFileSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
-import { isAbsolute, join, resolve } from 'node:path';
+import { delimiter, isAbsolute, join, resolve } from 'node:path';
 import { readGit } from './proc-read.mjs';
 
 /**
- * @typedef {{gitDir: string, head: string, env: {GIT_DIR: string, GIT_WORK_TREE: string}, cleanup: () => void}} GitOverlay
+ * @typedef {{gitDir: string, head: string, env: {GIT_DIR: string, GIT_WORK_TREE: string, PATH: string}, cleanup: () => void}} GitOverlay
  */
 
 /**
@@ -32,6 +35,9 @@ export function makeGitOverlay(root, { base = tmpdir() } = {}) {
   const commonRaw = git(['rev-parse', '--git-common-dir']);
   const common = isAbsolute(commonRaw) ? commonRaw : resolve(root, commonRaw);
   const head = git(['rev-parse', 'HEAD']);
+  // Keep the current PATH's git (including the hermetic guard), rather than bypassing it with the real binary.
+  const gitExecutable = execFileSync('sh', ['-c', 'command -v git'], { encoding: 'utf8', timeout: 5000 }).trim();
+  if (!isAbsolute(gitExecutable)) throw new Error('git overlay requires an absolute git executable on PATH');
 
   const dir = mkdtempSync(join(base, 'we-git-overlay-'));
   for (const sub of ['objects/info', 'refs/heads', 'refs/remotes/origin', 'refs/tags', 'info']) mkdirSync(join(dir, sub), { recursive: true });
@@ -46,11 +52,17 @@ export function makeGitOverlay(root, { base = tmpdir() } = {}) {
     + `[remote "origin"]\n\turl = ${dir}\n\tfetch = +refs/heads/*:refs/remotes/origin/*\n`);
   if (existsSync(join(absGitDir, 'index'))) copyFileSync(join(absGitDir, 'index'), join(dir, 'index'));
   if (existsSync(join(common, 'info', 'exclude'))) copyFileSync(join(common, 'info', 'exclude'), join(dir, 'info', 'exclude'));
+  const bin = join(dir, 'bin');
+  mkdirSync(bin);
+  const quote = value => `'${String(value).replace(/'/g, `'\\''`)}'`;
+  const shim = join(bin, 'git');
+  writeFileSync(shim, `#!/bin/sh\nexec ${quote(gitExecutable)} --git-dir=${quote(dir)} --work-tree=${quote(root)} "$@"\n`);
+  chmodSync(shim, 0o755);
 
   return {
     gitDir: dir,
     head,
-    env: { GIT_DIR: dir, GIT_WORK_TREE: root },
+    env: { GIT_DIR: dir, GIT_WORK_TREE: root, PATH: `${bin}${delimiter}${process.env.PATH || ''}` },
     cleanup: () => rmSync(dir, { recursive: true, force: true }),
   };
 }
