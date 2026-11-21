@@ -46,7 +46,7 @@ function fixture({ union = false, hops = 1, pass = false, conflict = false } = {
   const amend = (path, text) => { if (text === null) rmSync(join(repo, path)); else put(path, text); git('add', '-A'); git('commit', '--amend', '--no-edit', '-q'); B = git('rev-parse', 'HEAD'); };
   const parents = ps => { B = git('commit-tree', git('rev-parse', `${B}^{tree}`), ...ps.flatMap(p => ['-p', p]), '-m', 'shape'); };
   return { repo, env, git, A, base, main, audit, waiver, records, waivers, run, amend, parents, head: () => B,
-    revoke: () => { withdrawn = JSON.stringify({ ref: waiver.ref, sha: A, ruling: 'WITHDRAWN' }); },
+    revoke: (sha = A) => { withdrawn = JSON.stringify({ ref: waiver.ref, sha, ruling: 'WITHDRAWN' }); },
     damageWithdrawal: () => { withdrawn = '{"ref":"lane/test","ruling":"WITHDRAWN","sha":"damaged"}'; } };
 }
 describe('canonical main merge carry with real git objects', () => {
@@ -126,6 +126,14 @@ describe('canonical main merge carry with real git objects', () => {
       verdict: 'WEAKENED', findings: ['intermediate finding'] });
     f.waivers.push({ ...f.waiver, sha: intermediate, ruling: 'R124', findings: ['intermediate finding'] });
     expect(f.run()).toMatchObject({ ok: true, carried: { from: f.A, ruling: 'R124' } });
+  });
+  it('refuses carry when the current destination head is WITHDRAWN', () => {
+    const f = fixture();
+    expect(f.run().ok).toBe(true);
+    f.revoke(f.head());
+    const result = f.run();
+    expect(result).toMatchObject({ ok: false, reason: 'canonical-audit-weakened' });
+    expect(result.carried).toBeUndefined();
   });
   it('refuses carry when withdrawal evidence is damaged', () => {
     const f = fixture();

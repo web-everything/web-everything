@@ -4,6 +4,7 @@ import { readFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { canonicalAuditEvidence, validSha } from './prototype-load.mjs';
 import { loadRuledWeakened } from './prototype-load-io.mjs';
+import { withdrawnRevocations } from './ruled-weakened-store.mjs';
 import { readPlatformPreferences } from '../lib/policy-cascade.mjs';
 import { readAuditSettings, resolveAuditRecordPath } from './codex-audit-io.mjs';
 import { mainMergeCarry, mainMergeGitEnv } from '../lib/main-merge-carry.mjs';
@@ -54,7 +55,7 @@ export function checkCanonicalAuditForOpen({ repo = process.cwd(), ref, sha, env
     try { fetchMain(); }
     catch (error) { return refuse('canonical-audit-missing', error.message); }
   }
-  let records, config;
+  let records, config, isRevoked;
   try {
     // Same settings source and path resolution as the audit writer (codex-audit-io.mjs): the file beside
     // these scripts, never <repo>/scripts/settings — a sibling-repo target has none (#7011).
@@ -66,6 +67,7 @@ export function checkCanonicalAuditForOpen({ repo = process.cwd(), ref, sha, env
     // The writer resolves `~` with os.homedir(); an unset/blank HOME falls back to it too (never a
     // relative join), so both resolve the same record file and the ops store stays readable.
     const home = typeof env.HOME === 'string' && env.HOME.trim() ? env.HOME : homedir();
+    isRevoked = withdrawnRevocations({ fs: { readFileSync: readFile }, env: { ...env, HOME: home }, warn });
     config = { ruledWeakened: loadRuledWeakened({ platform: platform.prefs.prototypeLoad?.ruledWeakened,
       tool: tool.ruledWeakened, fs: { readFileSync: readFile }, env: { ...env, HOME: home }, warn }) };
     const contents = readFile(resolveAuditRecordPath(tool, { home, cwd: repo }), 'utf8');
@@ -144,6 +146,11 @@ export function checkCanonicalAuditForOpen({ repo = process.cwd(), ref, sha, env
   if (evidence.ok) {
     const carry = carryFor(evidence.record?.head?.toLowerCase());
     if (carry.ok && carriesAcross(evidence.record?.fingerprint, carry.fingerprint)) {
+      // The source waiver was checked on load. Every destination/intermediate
+      // head must independently remain free of withdrawal or damaged evidence.
+      const revokedHead = carry.chain.find(sha => isRevoked({ ref, sha }));
+      if (revokedHead) return { ok: false, reason: 'canonical-audit-weakened', record: null, sha: fullSha,
+        message: `Main-merge carry refused: head ${revokedHead} is withdrawn or its withdrawal evidence is unreadable/malformed. Ask the operator to resolve the withdrawal evidence before retrying.` };
       // Judge each merge head/base, including fingerprintless evidence, with
       // canonical eligibility and precedence. Different bases may have separate waivers.
       const intermediateHeads = new Set(carry.chain.filter(head => head !== fullSha));
