@@ -2057,6 +2057,7 @@
   "scripts/conveyor/soak/breaks/review-hold-only-incomplete-inventory.soak.test.mjs": 1,
   "scripts/conveyor/soak/breaks/clone-object-maintenance-borrowed-or-busy.soak.test.mjs": 0.79,
   "scripts/conveyor/soak/breaks/red-team-label-deadlock.soak.test.mjs": 2.53,
+  "scripts/conveyor/soak/breaks/redteam-trailing-ledger-effect-deadlock.soak.test.mjs": 1.5,
   "scripts/conveyor/soak/breaks/fix-dispatch-plan-eats-budget.soak.test.mjs": 1,
   "scripts/conveyor/soak/breaks/stall-sweep-informational-refusal.soak.test.mjs": 2,
   "scripts/conveyor/soak/breaks/overlay-main-sync-unrunnable-selection.soak.test.mjs": 1,

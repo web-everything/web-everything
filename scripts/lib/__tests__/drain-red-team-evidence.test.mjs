@@ -1145,6 +1145,42 @@ describe('bounded review evidence scans', () => {
       expect(read(f, run(f, 'not-a-sha'))).toMatchObject({ ok: false, reason: 'review-unfinished' });
     });
   });
+  describe('trailing ledger-events effect only (#7202 shape)', () => {
+    const eff = (step, status, type) => ({ type: type ?? (step === 'ledgerEvents' ? 'review.ledger-events' : `review.${step}`), step, status });
+    const done = [eff('write-up', 'applied'), eff('label-swap', 'applied'), eff('verdict-ledger.append', 'applied'), eff('notice', 'applied')];
+    const ledger = status => eff('ledgerEvents', status);
+    const run = (f, extra = {}) => ({ op: 'review-pr', input: { repo: f.repo, pr: f.pr }, ...payload(f.head),
+      pending: { kind: 'effect', step: 'ledgerEvents' }, effects: [...done, ledger('pending')], ...startedAt(4999 * 10_000 - 1000), ...extra });
+    const read = (f, rec) => readDrainRedTeamEvidence({ ...f, ...big, read: id => (id === 'review-pr-4999' ? rec : null) });
+    const holds = (f, rec) => expect(read(f, rec)).toMatchObject({ ok: false, reason: 'review-unfinished' });
+    it('does not hold the live head when only the additive ledger effect is pending', () => {
+      const f = fixture();
+      expect(read(f, run(f))).not.toMatchObject({ reason: 'review-unfinished' });
+    });
+    it('still holds for every other open shape', () => {
+      const f = fixture();
+      holds(f, run(f, { effects: [eff('write-up', 'applied'), eff('label-swap', 'pending'), ledger('pending')] }));
+      holds(f, run(f, { effects: [...done, ledger('in-flight')] }));
+      holds(f, run(f, { effects: [...done, ledger('refused')] }));
+      holds(f, run(f, { effects: [...done, ledger('weird')] }));
+      holds(f, run(f, { effects: [...done, ledger('pending')], outcome: 'refused' }));
+      holds(f, run(f, { effects: [...done, ledger('pending'), eff('notice2', 'pending')] }));
+      holds(f, run(f, { effects: [...done, ledger('pending'), ledger('pending')] }));
+      holds(f, run(f, { effects: [...done, eff('ledgerEvents', 'pending', 'review.label')] }));
+      holds(f, run(f, { pending: { kind: 'confirm', step: 'ledgerEvents' } }));
+      holds(f, run(f, { pending: { kind: 'effect', step: 'confirm' } }));
+      holds(f, run(f, { effects: undefined }));
+      holds(f, run(f, { verdict: null }));
+      holds(f, run(f, { verdict: {} }));
+      holds(f, run(f, { verdict: '' }));
+    });
+    it('a changes run with only the ledger effect open is a finished rejection, not accept evidence', () => {
+      const f = fixture();
+      const rec = run(f, { verdict: { verdict: 'changes' } });
+      expect(read(f, rec)).not.toMatchObject({ reason: 'review-unfinished' });
+      expect(read(f, rec)).not.toMatchObject({ ok: true });
+    });
+  });
   const statusFile = f => join(redTeamStatusDir(f.env), `${encodeURIComponent(f.repo)}-${f.pr}-${f.head}.json`);
   it('drain resolves a carried head among 5000 records when the carried-from review is the newest run', () => {
     const f = fixture(), from = 'c'.repeat(40);
