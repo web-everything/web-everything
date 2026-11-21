@@ -377,7 +377,7 @@ describe('runAwaitVerifyPass', () => {
       expect(rows[0].result).toMatch(/^error: session listing incomplete \(claude agents listing failed: claude agents timed out\)/);
       expect(h.calls.push).toEqual([]);
       expect(h.store.size).toBe(1);
-    });
+    }, 15_000); // ~1.8s locally, but it spawns real children and blew the 5000ms default on loaded CI shards (#7179 shard 8); sized from CI, not local
   });
   it('logs one line per action and a waiting count', async () => {
     expect(formatAwaitVerifyLines({ rows: [{ action: 'wait' }, { action: 'push', repo: 'r', pr: 1, sha: SHA, reason: 'green', result: 'pushed' }] }))

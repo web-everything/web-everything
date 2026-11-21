@@ -976,6 +976,11 @@
     }
   },
   "capacityLeaves": {
+    "redTeam.queue.reservedSlots": {
+      "description": "Live review slots reserved while runnable red-team work is queued; default 4, lent back when the queue is empty or unknown.",
+      "range": "integer 0–8",
+      "unit": "slots"
+    },
     "ciHeal.reserve": {
       "description": "Delivery slots held back for CI-heal work.",
       "range": "integer 0–12",
