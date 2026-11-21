@@ -87,6 +87,27 @@ describe('combined open-pr preflight', () => {
       expect(() => readFileSync(copied)).toThrow();
     } finally { rmSync(dir, { recursive: true, force: true }); }
   });
+  it('refuses the last duplicate body file when only the first passes prep', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'open-pr-prep-duplicate-body-'));
+    const first = join(dir, 'first.md'), last = join(dir, 'last.md');
+    writeFileSync(first, `PREP:
+Acceptance: Preflight checks the published body.
+Pre-mortem: Duplicate arguments select the wrong body.
+Files: scripts/operations/open-pr-io.mjs
+Tests: Targeted open-pr audit gate regression.
+`);
+    writeFileSync(last, 'Body missing preparation.\n');
+    const spawn = vi.fn(() => ({ status: 0, stdout: '{"reason":"check-ok"}' }));
+    const output = vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
+    const run = createPrLandRunner({ env: {}, spawn, prepMode: 'enforce',
+      prePrReview: () => ({ action: 'pass' }), canonicalAudit: () => ({ ok: true }) });
+    try {
+      expect(run({ argv: ['--ref=lane/audit', '--check', `--body-file=${first}`, `--body-file=${last}`] }))
+        .toMatchObject({ outcome: 'refused', reason: 'prep-block-missing' });
+      expect(spawn).toHaveBeenCalledOnce();
+      expect(spawn.mock.calls[0][1]).toContain('--check');
+    } finally { output.mockRestore(); rmSync(dir, { recursive: true, force: true }); }
+  });
   it.each(['', ' \n\t'])('leaves an empty body file untouched so carry cannot bypass the body gate: %j', body => {
     const dir = mkdtempSync(join(tmpdir(), 'audit-carry-empty-body-'));
     const path = join(dir, 'body.md');

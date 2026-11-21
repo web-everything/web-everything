@@ -183,7 +183,8 @@ export function createPrLandRunner({ canonicalAudit = checkCanonicalAuditForOpen
     if (!argv.includes('--dry-run')) {
       let body = '';
       let readable = true;
-      const bodyFile = arg('body-file');
+      // Match body annotation and pr-land publication when arguments repeat.
+      const bodyFile = argv.findLast(a => a.startsWith('--body-file='))?.slice('--body-file='.length);
       if (bodyFile) {
         try { body = readPrepBody(bodyFilePath(bodyFile, cwd), 'utf8'); }
         catch (error) {
