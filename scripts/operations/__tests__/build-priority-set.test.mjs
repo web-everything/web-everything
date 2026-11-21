@@ -3,7 +3,7 @@ import fs from 'node:fs';
 import { join } from 'node:path';
 import { createBuildPrioritySet, readPriorityCards, readPriorityPrs } from '../build-priority-set-io.mjs';
 import { resolveOperation } from '../run.mjs';
-import { runOperationCli } from '../cli-adapter.mjs';
+import { hasJsonFlag, runOperationCli } from '../cli-adapter.mjs';
 import { createMemoryRunStore } from '../run-store.mjs';
 import { createRegistry } from '../registry.mjs';
 import { readBuildPrioritySettings } from '../../lib/build-queue.mjs';
@@ -23,7 +23,7 @@ function fixture(overrides = {}) {
     const registry = createRegistry(); registry.register(operation.declaration);
     const outcome = await runOperationCli({ ...operation, registry, argv,
       store: createMemoryRunStore(), newRunId: () => 'priority-test' });
-    return { ...outcome, ...operation.finish(outcome) };
+    return { ...outcome, ...operation.finish({ ...outcome, json: hasJsonFlag(argv) }) };
   };
   return { dir, path, options, command, readCard, readPrs };
 }
@@ -62,6 +62,56 @@ it('round-trips the installed list through readBuildPrioritySettings', async () 
 });
 
 it('registers the operation in run.mjs', () => { expect(resolveOperation('build-priority-set').declaration.name).toBe('build-priority-set'); });
+
+it.each([
+  ['we', 'web-everything/web-everything'],
+  ['webeverything', 'web-everything/web-everything'],
+  ['fui', 'frontier-ui/frontierui'],
+  ['frontierui', 'frontier-ui/frontierui'],
+  ['FUI', 'frontier-ui/frontierui'],
+  ['plateau-app', 'plateauapp/plateau-app'],
+  ['plateau', 'plateauapp/plateau-app'],
+  ['pa', 'plateauapp/plateau-app'],
+])('refuses exact and directory overlaps for %s scopes in preview and install', async (prefix, repo) => {
+  for (const scope of ['scripts/a.mjs', 'scripts/']) {
+    for (const preview of [false, true]) {
+      const f = fixture({ readCard: () => ({ scope: [`${prefix}:${scope}`] }),
+        readPrs: () => [{ repo, number: 1, files: ['scripts/a.mjs'] }] });
+      fs.writeFileSync(f.path, 'old');
+      const result = await f.command([...flags, ...(preview ? ['--preview'] : [])]);
+      expect(result.code).not.toBe(0);
+      expect(result.lines.join('\n')).toContain(`scope overlaps open PR ${repo}#1`);
+      expect(fs.readFileSync(f.path, 'utf8')).toBe('old');
+      untouched(f, ['build-priority.runtime.json']);
+    }
+  }
+});
+
+it.each(['web-everything/web-everything', 'plateauapp/plateau-app'])(
+  'keeps Frontier UI scopes separate from identical paths in %s', async repo => {
+    const f = fixture({ readCard: () => ({ scope: ['fui:scripts/a.mjs'] }),
+      readPrs: () => [{ repo, number: 1, files: ['scripts/a.mjs'] }] });
+    expect((await f.command([...flags, '--preview'])).code).toBe(0);
+    untouched(f);
+  });
+
+it.each([false, true])('emits one JSON envelope with the priority record (preview: %s)', async preview => {
+  const f = fixture();
+  const result = await f.command([...flags, ...(preview ? ['--preview'] : []), '--json']);
+  expect(result.code).toBe(0);
+  const payload = JSON.parse(result.lines.join('\n'));
+  expect(payload.verdict.record).toEqual({ ids: ['42', '43'], mode: 'only', setBy: 'operator', at, ttlHours: 2 });
+  if (preview) untouched(f);
+  else expect(JSON.parse(fs.readFileSync(f.path, 'utf8'))).toEqual(payload.verdict.record);
+});
+
+it('keeps JSON refusals parseable without writing anything', async () => {
+  const f = fixture({ readCard: () => null });
+  const result = await f.command([...flags, '--preview', '--json']);
+  expect(result.code).not.toBe(0);
+  expect(JSON.parse(result.lines.join('\n')).error).toContain('card 42');
+  untouched(f);
+});
 
 it.each([
   ['unknown mode', 'mode', 'other'], ['ttl zero', 'ttl-hours', '0'], ['ttl negative', 'ttl-hours', '-1'],

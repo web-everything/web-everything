@@ -7,7 +7,7 @@ import { execFileSync } from 'node:child_process';
 import yaml from 'js-yaml';
 import { runGhSync } from '../lib/gh-throttle.mjs';
 import { CONSTELLATION_REPOS } from '../lib/constellation-repos.mjs';
-import { normalizeBriefScope } from './dispatch-lane.mjs';
+import { normalizeBriefScope, SCOPE_PREFIX_ALIASES } from './dispatch-lane.mjs';
 import { GH_LIST_FILE_CAP, prHoldsFile, qualifyFile, repoKeyFor } from './free-scope.mjs';
 import { resolveCoordinationRoot } from './coordination-root.mjs';
 import { buildPrioritySetOperation, BUILD_PRIORITY_SET_EFFECT, validateBuildPriorityInput } from './build-priority-set.mjs';
@@ -82,7 +82,9 @@ function prepare(input, options) {
         || !Array.isArray(pr.files) || pr.files.some(f => typeof f !== 'string' || !f.trim())) refuse('unreadable PR files');
     // Scope syntax splits on these delimiters; never silently split a literal PR filename.
     if (pr.files.some(f => /[\s,]/.test(f))) refuse('PR filenames cannot be represented by scope syntax');
-    const files = pr.files.map(f => `${repoKeyFor(pr.repo)}:${f}`);
+    const key = repoKeyFor(pr.repo);
+    // Use the card scope vocabulary while keeping PR filenames literal (including colons).
+    const files = pr.files.map(f => `${SCOPE_PREFIX_ALIASES[key] ?? key}:${f}`);
     if (scopes.some(scope => prHoldsFile({ ...pr, files }, scope))) refuse(`scope overlaps open PR ${pr.repo}#${pr.number}`);
   }
   const at = (options.now?.() ?? new Date()).toISOString();
@@ -127,6 +129,6 @@ export function createBuildPrioritySet(options = {}) {
     if (fs.existsSync(`${runtimePath(options)}.lock`)) refuse('writer lock exists; verify the owning writer before removing a stale lock');
     return prepare(input, options);
   } }), sinks: { [BUILD_PRIORITY_SET_EFFECT]: input => install(input, options) },
-  finish: ({ run, code, lines }) => ({ code, lines: code === 0 && run?.verdict?.record
+  finish: ({ run, code, lines, json }) => ({ code, lines: !json && code === 0 && run?.verdict?.record
     ? [...lines, JSON.stringify(run.verdict.record, null, 2)] : lines }) };
 }
