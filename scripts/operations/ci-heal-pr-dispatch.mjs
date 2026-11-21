@@ -882,7 +882,14 @@ export function timeoutGithubEffects({ exec = execFileSyncThrottled } = {}) {
   };
 }
 
-function confirmedTimeouts(state) { return state.requests.filter((r) => r.status === 'confirmed').length; }
+function staleFreezeRequest(request, state) {
+  return request.staleFreeze || request.signature?.startsWith('stale-main-freeze:')
+    || (!request.signature && (request.evidence ?? state.evidence).staleFreeze);
+}
+
+function confirmedTimeoutRequests(state) {
+  return state.requests.filter((r) => r.status === 'confirmed' && !staleFreezeRequest(r, state));
+}
 
 /** An ambiguous request must not become an agent heal just because this tick's evidence read failed. */
 export function readTimeoutHold({ repo, pr, head, dir = timeoutStateDir() }) {
@@ -896,18 +903,20 @@ export function readTimeoutHold({ repo, pr, head, dir = timeoutStateDir() }) {
 async function fileTimeoutFollowup(path, { root, fileFollowup } = {}) {
   let payload;
   timeoutTransaction(path, null, (state) => {
-    if (state.evidence.staleFreeze || state.evidence.infraCancelled || confirmedTimeouts(state) < 2 || state.card?.filed) return;
+    const requests = confirmedTimeoutRequests(state).filter((r) => !(r.evidence ?? state.evidence).infraCancelled);
+    if (requests.length < 2 || state.card?.filed) return;
     if (state.card?.filingPid) {
       try { process.kill(state.card.filingPid, 0); return; }
       catch (error) { if (error.code !== 'ESRCH') return; }
     }
     if (!state.card) {
-      const e = state.evidence;
+      // New requests carry their own evidence; legacy homogeneous records use the head evidence.
+      const e = requests.find(r => r.evidence && !r.evidence.staleFreeze && !r.evidence.infraCancelled)?.evidence ?? state.evidence;
       const details = `Two bounded timeout retry requests were confirmed for ${e.repo} PR #${e.pr}, head ${e.head}. `
         + 'This is a suspected flaky-test investigation, not proof of flakiness.\n\n'
         + e.failures.map((f) => `- we:${f.path} — ${f.name} (${f.kind})`).join('\n')
         + '\n\nObserved requests:\n'
-        + state.requests.filter((r) => r.status === 'confirmed').map((r) =>
+        + requests.map((r) =>
           `- run ${r.target.run}, job ${r.target.job}, attempt ${r.target.attempt}: ${r.outcome}; ${r.target.url ?? ''}`).join('\n');
       const plan = planScaffold(createFileItemReader({ root })(), {
         kind: 'story', size: 3, title: `Investigate timeout retries for PR ${e.pr} at ${e.head.slice(0, 8)}`,
@@ -959,7 +968,7 @@ export async function flushTimeoutFollowups({ root = REPO_ROOT, repo, dir = time
         if (Date.parse(at) - Date.parse(pending.reservedAt) > maxAgeMs) {
           timeoutTransaction(path, null, (current) => { current.retired ??= { reason: 'aged-out', at }; });
         } else {
-          const observed = await effects.observe(state.evidence, pending.target);
+          const observed = await effects.observe(pending.evidence ?? state.evidence, pending.target);
           if (observed.repo === repo && observed.runHead === state.evidence.head && observed.run === pending.target.run
               && observed.job === pending.target.job && observed.jobRun === pending.target.run && observed.attempt > pending.target.attempt) {
             timeoutTransaction(path, null, (current) => {
@@ -1000,25 +1009,26 @@ export async function dispatchTimeoutRetry(evidence, {
   const initial = () => {
     const legacy = readTimeoutStates(evidence, dir);
     return { version: 1, evidence, card: legacy.find((state) => state.card)?.card,
-      requests: legacy.flatMap((state) => state.requests).map((request, id) => ({ ...request, id })) };
+      requests: legacy.flatMap((state) => state.requests.map(request => ({ ...request,
+        evidence: request.evidence ?? state.evidence }))).map((request, id) => ({ ...request, id })) };
   };
   let reservation;
   const selected = timeoutTransaction(path, initial, (state) => {
     // Preserve spend from stale-freeze records written before the per-request marker existed.
     for (const request of state.requests) {
-      if (request.signature?.startsWith('stale-main-freeze:')) request.staleFreeze = true;
+      if (staleFreezeRequest(request, state)) request.staleFreeze = true;
     }
     // Reserve once per head + run, including rejected/ambiguous requests and newer job attempts.
     // Old persisted timeout state shares this lock; never reinterpret it as an unused reservation.
     if (evidence.staleFreeze && state.requests.some(r => r.target.run === evidence.run && !r.released)) return { spent: true };
     if (evidence.staleFreeze && state.requests.filter(r => r.staleFreeze && !r.released).length >= 2) return { staleExhausted: true };
-    if (!evidence.staleFreeze && confirmedTimeouts(state) >= (evidence.infraCancelled ? (evidence.cap ?? 6) : 2)) return { exhausted: true, card: state.card?.payload.num };
+    if (!evidence.staleFreeze && confirmedTimeoutRequests(state).length >= (evidence.infraCancelled ? (evidence.cap ?? 6) : 2)) return { exhausted: true, card: state.card?.payload.num };
     const pending = state.requests.find((r) => r.status === 'pending');
     if (pending) return { pending: structuredClone(pending) };
     const target = evidence.jobs.find((j) => !state.requests.some((r) => r.status === 'confirmed'
       && r.target.run === j.run && r.target.job === j.job && r.target.attempt === j.attempt));
     if (!target) return { waiting: true };
-    reservation = { id: state.requests.length, ...(evidence.staleFreeze ? { staleFreeze: true } : {}), signature: evidence.signature, target, status: 'pending', reservedAt: new Date(now()).toISOString(), outcome: 'reserved; API outcome unknown' };
+    reservation = { id: state.requests.length, evidence, ...(evidence.staleFreeze ? { staleFreeze: true } : {}), signature: evidence.signature, target, status: 'pending', reservedAt: new Date(now()).toISOString(), outcome: 'reserved; API outcome unknown' };
     state.requests.push(reservation);
     return { target };
   });

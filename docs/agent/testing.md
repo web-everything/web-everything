@@ -5937,6 +5937,16 @@ a successful rerun on a later tick, rather than only an accepted rerun request.
 Planner and soak fixtures must also provide `rowsComplete: true` and `rowsHead` equal to
 the PR head. A stale-freeze annotation never waives this shared review prerequisite;
 missing, incomplete or wrong-head rows must still refuse review with `rows-incomplete`.
+Test the planner with independently mismatched annotation heads and PR numbers. For a new observed
+field, exercise its real IO adapter and feed that output into the consumer; a stub that supplies the
+field by hand does not protect the wiring. The stale-freeze adapter contract pins API `job.name`,
+its absence for ordinary timeout observations, and dispatch refusal for a different job name.
+Stale-freeze requests must not spend the dispatcher's ordinary timeout budget. Followup eligibility
+and diagnostic evidence belong to each request, not the first writer of a shared head record.
+Cover both arrival orders, historical signature-only stale-freeze requests, ambiguous-request
+reconciliation, and a failed followup write replayed with the same payload. The mixed-run soak
+uses the real observation adapter and requires two ordinary retries and one ordinary followup
+after two confirmed stale-freeze reruns.
 
 ## S1b shadow accuracy evidence
 

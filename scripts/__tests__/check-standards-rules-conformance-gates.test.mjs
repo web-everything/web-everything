@@ -8,7 +8,9 @@
  */
 import { describe, it, expect } from 'vitest';
 import { execFileSync } from 'node:child_process';
+import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
+import { runInNewContext } from 'node:vm';
 import {
   validateBlockImplConformance, BLOCK_IMPL_DRIFT_ENFORCED,
   validateBlockExportShape, EXPORT_SHAPE_ENFORCED,
@@ -467,6 +469,21 @@ describe('computeNativeFirstConformance — front-A watch metric (#1267)', () =>
 
 // ── Standard-vs-site surface classifier (#2052, interim per #2006 Fork 2(b)) ──────
 describe('classifySurfacePaths (#2052 fail-closed standard-vs-site boundary)', () => {
+  // Exercise the production read and catch boundary without running unrelated standards sections.
+  const source = readFileSync(join(ROOT, 'scripts/check-standards.mjs'), 'utf8');
+  const section = source.indexOf('// ── 12. Standard-vs-site surface classifier');
+  const start = source.indexOf('try {', section);
+  const end = source.indexOf('\nmark("12.', start);
+  if (section < 0 || start < 0 || end < 0) throw new Error('surface classifier section missing');
+  const runSurfaceCheck = (readTracked = execFileSync) => {
+    const errors = [];
+    runInNewContext(source.slice(start, end), {
+      ROOT, execFileSync: readTracked, classifySurfacePaths,
+      err: (message) => errors.push(message),
+    });
+    return errors;
+  };
+
   it('classifies site render files as site', () => {
     const { site, standard, unclassified } = classifySurfacePaths([
       'src/index.njk', 'src/_layouts/base.njk', 'src/_includes/block-descriptions/foo.njk',
@@ -513,10 +530,28 @@ describe('classifySurfacePaths (#2052 fail-closed standard-vs-site boundary)', (
   });
 
   it('real tree stays clean — every tracked src/** path classifies (0 unclassified)', () => {
-    const tracked = execFileSync('git', ['ls-files'], { cwd: ROOT, encoding: 'utf8' })
-      .split('\n').filter(Boolean);
-    const { unclassified } = classifySurfacePaths(tracked);
-    expect(unclassified).toEqual([]);
+    expect(runSurfaceCheck()).toEqual([]);
+  });
+
+  it.each([
+    ['src/index.njk', []],
+    ['src/unknown.tsx', [expect.stringContaining('Unclassified surface path "src/unknown.tsx"')]],
+  ])('reads beyond 1 MiB and classifies the final path %s', (lastPath, expected) => {
+    const errors = runSurfaceCheck((command, args, options) => {
+      expect(command).toBe('git');
+      expect(args).toEqual(['ls-files']);
+      // Real child output crosses Node's default maxBuffer before the in-zone sentinel.
+      return execFileSync(process.execPath, ['-e',
+        `process.stdout.write('backlog/fixture-card.md\\n'.repeat(60000) + ${JSON.stringify(lastPath + '\n')})`,
+      ], options);
+    });
+    expect(errors).toEqual(expected);
+  });
+
+  it('fails closed when the tracked-path command fails', () => {
+    expect(runSurfaceCheck((_command, _args, options) =>
+      execFileSync(process.execPath, ['-e', 'process.exit(2)'], options),
+    )).toEqual([expect.stringContaining('Standard-vs-site surface classifier failed:')]);
   });
 });
 

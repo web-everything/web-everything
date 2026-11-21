@@ -18,6 +18,16 @@ const classify = (v = {}, main = green, check = row) => excusePrMergeGateHolds([
 })[0];
 
 describe('automatic stale main freeze', () => {
+  it.each([
+    ['wrong head', { head: 'b'.repeat(40) }],
+    ['wrong PR', { pr: 7267 }],
+  ])('does not dispatch a rerun for an annotation bound to the %s', (_name, changes) => {
+    const annotated = classify();
+    Object.assign(annotated.statusCheckRollup[0].mergeGateStaleFreeze, changes);
+    const plan = planReconcile({ prs: [annotated], agents: [], requiredChecks: ['merge-gate'] });
+    expect(plan.dispatch.map(r => r.kind)).not.toContain('ci-timeout-rerun');
+    expect(annotated.statusCheckRollup[0].conclusion).toBe('failure');
+  });
   it('routes to a rerun and review, never ci-heal or a synthetic success', () => {
     const annotated = classify();
     expect(annotated.statusCheckRollup[0]).toMatchObject({ conclusion: 'failure',

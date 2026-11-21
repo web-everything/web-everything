@@ -50,7 +50,8 @@ if (a[0] === 'pr' && a[1] === 'merge') {
 process.exit(0);
 `;
 const fakeGit = `#!/usr/bin/env node
-const a = process.argv.slice(2);
+let a = process.argv.slice(2);
+while (a[0] === '-c') a = a.slice(2); // the net-diff wrapper prepends hardening -c flags
 if (a[0] === 'remote' && a[1] === 'get-url') process.stdout.write('git@github.com:web-everything/web-everything.git\\n');
 ${pinnedLeafDiffFixture}
 process.exit(0);
@@ -61,6 +62,7 @@ function runCli({ failAll = false, watch = false } = {}) {
   try {
     const bin = join(dir, 'bin');
     mkdirSync(bin);
+    mkdirSync(join(dir, '.git'));
     for (const [name, code] of [['gh', fakeGh], ['git', fakeGit]]) writeFileSync(join(bin, name), code, { mode: 0o755 });
     const fixture = join(dir, 'prs.json');
     writeFileSync(fixture, JSON.stringify([2879, 2880].map(number => ({
@@ -82,6 +84,11 @@ function runCli({ failAll = false, watch = false } = {}) {
     });
     expect(r.error, r.stderr).toBeUndefined();
     const result = JSON.parse(r.stdout.trim().split('\n').at(-1));
+    for (const number of [2879, 2880]) {
+      expect(r.stderr).toContain(`net-diff #${number}: base=${'b'.repeat(40)} head=${number.toString(16).padStart(40, '0')}`);
+    }
+    expect(r.stderr).not.toContain('net diff unverified');
+    if (!watch) expect(result.parked, r.stderr).toEqual([]);
     const attempts = readFileSync(fixture + '.attempts', 'utf8').trim().split('\n').map(Number);
     if (process.env.DRAIN_ISOLATION_PROOF) console.log(JSON.stringify({ watch, failAll, status: r.status, attempts, result }));
     return { status: r.status, result, attempts };

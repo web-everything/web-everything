@@ -20,6 +20,28 @@ const fixture = () => {
 };
 
 describe('stale freeze rerun durable budget', () => {
+  it.each(['merge-gate', 'another-job'])('observes the API job name %s through the real adapter and dispatcher', async name => {
+    const opts = fixture();
+    const exec = vi.fn((_command, args) => {
+      if (args.includes('POST')) return 'HTTP/2.0 201 Created';
+      const responses = {
+        [`repos/${repo}/pulls/${evidence.pr}`]: { head: { sha: head }, state: 'open' },
+        [`repos/${repo}/actions/jobs/123`]: { id: 123, name, run_id: 42, run_attempt: 1,
+          status: 'completed', conclusion: 'failure' },
+        [`repos/${repo}/actions/runs/42`]: { id: 42, head_sha: head, run_attempt: 1, repository: { full_name: repo } },
+      };
+      if (!responses[args[1]]) throw new Error(`unexpected API path: ${args[1]}`);
+      return JSON.stringify(responses[args[1]]);
+    });
+    opts.effects = timeoutGithubEffects({ exec });
+    expect(opts.effects.observe(evidence, evidence.jobs[0])).toEqual({ ...observed, jobName: name });
+    const ordinary = { ...evidence, staleFreeze: false };
+    expect(opts.effects.observe(ordinary, evidence.jobs[0])).not.toHaveProperty('jobName');
+    const result = await dispatchTimeoutRetry(evidence, opts);
+    expect(result.status).toBe(name === 'merge-gate' ? 'requested' : 'refused');
+    expect(exec.mock.calls.filter(([, args]) => args.includes('POST'))).toHaveLength(name === 'merge-gate' ? 1 : 0);
+    if (name !== 'merge-gate') expect(result.reason).toBe('stale-head-or-job');
+  });
   it.each(['confirmed', 'rejected', 'ambiguous'])('reserves once per head+run across restart and newer attempts after %s', async status => {
     const opts = fixture(); opts.effects.request.mockReturnValue({ status });
     await dispatchTimeoutRetry(evidence, opts);
@@ -89,6 +111,77 @@ describe('stale freeze rerun durable budget', () => {
 });
 
 describe('stale freeze shared head cap and followup state', () => {
+  it('uses new ordinary evidence when a legacy mixed head started with a stale freeze', async () => {
+    const opts = fixture(); opts.root = opts.dir;
+    writeFileSync(join(opts.dir, `${timeoutKey(evidence)}.json`), JSON.stringify({ version: 1, evidence,
+      requests: [
+        { signature: 'stale-main-freeze:40', target: { run: 40, job: 123, attempt: 1 }, status: 'confirmed' },
+        { signature: 'test-timeout', target: { run: 41, job: 123, attempt: 1 }, status: 'confirmed' },
+      ] }));
+    const ordinary = { eligible: true, repo, pr: evidence.pr, head, signature: 'test-timeout', jobs: evidence.jobs,
+      failures: [{ path: 'scripts/example.test.mjs', name: 'ordinary timeout', kind: 'test-timeout' }] };
+    expect((await dispatchTimeoutRetry(ordinary, opts)).status).toBe('requested');
+    expect(opts.fileFollowup).toHaveBeenCalledTimes(1);
+    expect(opts.fileFollowup.mock.calls[0][0].content).toContain('ordinary timeout');
+    expect(opts.fileFollowup.mock.calls[0][0].content).not.toContain('run 40');
+  });
+  it('does not file early when stale-freeze reruns follow an ordinary timeout, then reconciles an ambiguous ordinary retry', async () => {
+    const opts = fixture(); opts.root = opts.dir;
+    const ordinary = { eligible: true, repo, pr: evidence.pr, head, signature: 'test-timeout',
+      failures: [{ path: 'scripts/example.test.mjs', name: 'ordinary timeout', kind: 'test-timeout' }] };
+    expect((await dispatchTimeoutRetry({ ...ordinary, jobs: evidence.jobs }, opts)).status).toBe('requested');
+    for (const run of [43, 44]) {
+      opts.effects.observe.mockReturnValue({ ...observed, run, jobRun: run });
+      expect((await dispatchTimeoutRetry({ ...evidence, run, signature: `stale-main-freeze:${run}`,
+        jobs: [{ ...evidence.jobs[0], run }] }, opts)).status).toBe('requested');
+    }
+    await flushTimeoutFollowups(opts);
+    expect(opts.fileFollowup).not.toHaveBeenCalled();
+    opts.effects.observe.mockReturnValue({ ...observed, run: 45, jobRun: 45 });
+    opts.effects.request.mockReturnValue({ status: 'ambiguous' });
+    expect((await dispatchTimeoutRetry({ ...ordinary, jobs: [{ ...evidence.jobs[0], run: 45 }] }, opts)).reason).toBe('retry-outcome-pending');
+    opts.effects.observe.mockReturnValue({ ...observed, run: 45, jobRun: 45, attempt: 2 });
+    await flushTimeoutFollowups(opts);
+    expect(opts.fileFollowup).toHaveBeenCalledTimes(1);
+    const content = opts.fileFollowup.mock.calls[0][0].content;
+    expect(content).toContain('run 42');
+    expect(content).toContain('run 45');
+    expect(content).not.toContain('run 43');
+    expect(content).not.toContain('run 44');
+  });
+  it.each([false, true])('keeps ordinary retries and their followup after two stale-freeze reruns (legacy=%s)', async legacy => {
+    const opts = fixture(); opts.root = opts.dir;
+    for (const run of [42, 43]) {
+      opts.effects.observe.mockReturnValue({ ...observed, run, jobRun: run });
+      expect((await dispatchTimeoutRetry({ ...evidence, run, signature: `stale-main-freeze:${run}`,
+        jobs: [{ ...evidence.jobs[0], run }] }, opts)).status).toBe('requested');
+    }
+    const path = join(opts.dir, `${timeoutKey(evidence)}.json`);
+    if (legacy) {
+      const state = JSON.parse(readFileSync(path, 'utf8'));
+      for (const request of state.requests) { delete request.staleFreeze; delete request.evidence; }
+      writeFileSync(path, JSON.stringify(state));
+    }
+    const ordinary = { eligible: true, repo, pr: evidence.pr, head, signature: 'test-timeout',
+      failures: [{ path: 'scripts/example.test.mjs', name: 'ordinary timeout', kind: 'test-timeout' }] };
+    opts.fileFollowup.mockRejectedValueOnce(new Error('retry filing'));
+    for (const run of [44, 45]) {
+      opts.effects.observe.mockReturnValue({ ...observed, run, jobRun: run });
+      expect((await dispatchTimeoutRetry({ ...ordinary, jobs: [{ ...evidence.jobs[0], run }] }, opts)).status).toBe('requested');
+      expect(opts.fileFollowup).toHaveBeenCalledTimes(run === 44 ? 0 : 1);
+    }
+    await flushTimeoutFollowups({ ...opts, effects: { ...opts.effects } });
+    expect(opts.fileFollowup).toHaveBeenCalledTimes(2);
+    const payload = opts.fileFollowup.mock.calls[0][0];
+    expect(opts.fileFollowup.mock.calls[1][0]).toEqual(payload);
+    expect(payload.content).toContain('ordinary timeout');
+    expect(payload.content).toContain('run 44');
+    expect(payload.content).toContain('run 45');
+    expect(payload.content).not.toContain('run 42');
+    expect(payload.content).not.toContain('run 43');
+    expect((await dispatchTimeoutRetry({ ...ordinary, jobs: [{ ...evidence.jobs[0], run: 46 }] }, opts)).reason).toBe('timeout-retries-exhausted');
+    expect(opts.effects.request).toHaveBeenCalledTimes(4);
+  });
   it.each(['rejected', 'ambiguous', 'confirmed'])('spent %s requests do not starve the eleventh PR on the next pass', async status => {
     const opts = fixture();
     opts.effects.request.mockReturnValue({ status });

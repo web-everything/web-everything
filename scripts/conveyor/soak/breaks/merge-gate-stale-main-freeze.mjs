@@ -29,7 +29,7 @@ export default {
     const { GATE_IDS } = await load('scripts/lib/merge-gate-inventory.mjs');
     const { planReconcile } = await load('scripts/conveyor/reconcile-core.mjs');
     const { executeOwedCiReruns } = await load('scripts/conveyor/owed-ci-rerun-executor.mjs');
-    const { dispatchTimeoutRetry } = await load('scripts/operations/ci-heal-pr-dispatch.mjs');
+    const { dispatchTimeoutRetry, timeoutGithubEffects } = await load('scripts/operations/ci-heal-pr-dispatch.mjs');
     const dir = mkdtempSync(join(process.env.TMPDIR, 'stale-freeze-soak-'));
     const violations = [], head = 'a'.repeat(40), repo = 'soak-owner/soak-repo';
     let writes = 0;
@@ -95,6 +95,34 @@ export default {
         apiRecovered = true;
       }
       if (attempted.join(',') !== Array.from({ length: 11 }, (_, i) => 7300 + i).join(',')) violations.push('starvation recovery retried a spent reservation or missed an eligible PR');
+      // The real observation adapter must carry job.name into dispatch. Two stale-freeze
+      // reruns on a head must then leave the ordinary timeout budget and followup intact.
+      let currentRun = 50, mixedWrites = 0;
+      const cards = [];
+      const effects = timeoutGithubEffects({ exec: (_command, args) => {
+        if (args.includes('POST')) { mixedWrites++; return 'HTTP/2.0 201 Created'; }
+        const path = args[1];
+        if (path === `repos/${repo}/pulls/7400`) return JSON.stringify({ head: { sha: head }, state: 'open' });
+        if (path === `repos/${repo}/actions/jobs/123`) return JSON.stringify({ ...job, id: 123, run_id: currentRun });
+        if (path === `repos/${repo}/actions/runs/${currentRun}`) return JSON.stringify({ id: currentRun,
+          head_sha: head, run_attempt: 1, repository: { full_name: repo } });
+        throw new Error(`unexpected API path: ${path}`);
+      } });
+      for (const run of [50, 51, 52, 53]) {
+        currentRun = run;
+        const staleFreeze = run < 52;
+        const evidence = { eligible: true, repo, pr: 7400, head, run, staleFreeze,
+          completedAt: job.completed_at, signature: staleFreeze ? `stale-main-freeze:${run}` : 'ordinary-timeout',
+          failures: [{ path: 'scripts/example.test.mjs', name: 'ordinary timeout', kind: 'test-timeout' }],
+          jobs: [{ run, job: 123, attempt: 1 }] };
+        const result = await dispatchTimeoutRetry(evidence, { repo, dir, root: dir, effects, readMainCi,
+          fileFollowup: payload => { cards.push(payload); } });
+        if (result.status !== 'requested') violations.push(`mixed retry run ${run} refused: ${result.reason}`);
+        if (cards.length !== (run === 53 ? 1 : 0)) violations.push(`mixed retry run ${run}: incorrect followup count`);
+      }
+      if (mixedWrites !== 4) violations.push(`mixed retry requests: expected 4, got ${mixedWrites}`);
+      if (cards.length === 1 && (!cards[0].content.includes('ordinary timeout')
+          || cards[0].content.includes('run 50') || cards[0].content.includes('run 51'))) violations.push('mixed followup used stale-freeze evidence');
       return { violations };
     } finally { rmSync(dir, { recursive: true, force: true }); }
   },
