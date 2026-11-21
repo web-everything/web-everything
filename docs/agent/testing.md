@@ -5096,7 +5096,11 @@ Omitting static evidence prints `staticEvidence: "not supplied"`; static and add
 are `null` (unknown). An explicit empty static list means known zero static coverage.
 Tracing stays shadow-only. The edge cap applies per process; a cap warning means incomplete evidence:
 rerun with a larger `ci.selection.trace.maxEdgesPerTest` before interpreting coverage.
-Keep tracer tests mock-only: inject filesystem/child-process objects and exercise loader hooks directly.
+Inject filesystem/child-process objects for tracer edge tests and exercise loader hooks directly.
+Runtime contract regressions in `scripts/ci/__tests__/dep-trace.test.mjs` also launch isolated Node children:
+captured stdout/stderr must accept a synchronous 65536-byte write after loader registration, and
+`spawnSync`/`execFileSync` must accept frozen options. Bound these children by timeout and output size,
+and remove their temporary trace directories after each case.
 Review lens: each settings catch fallback needs a named test forcing the loader to fail,
 including malformed input and valid overrides. The `honours fallback settings after loader failure`
 cases in `scripts/ci/__tests__/dep-trace.test.mjs` exercise startup's fallback directly.

@@ -98,7 +98,10 @@ export function createTracer({ test, root, record = () => {}, fs: io = {}, child
         const nodeOptions = childEnv.NODE_OPTIONS ?? env.NODE_OPTIONS ?? initialNodeOptions;
         if (typeof nodeOptions !== 'symbol') childEnv.NODE_OPTIONS = inheritOptions(String(nodeOptions ?? ''));
         // Node reads options through the prototype chain (an inherited or non-enumerable cwd); keep that view.
-        const wrapped = Object.assign(Object.create(options), options, { env: childEnv });
+        const wrapped = Object.create(options, {
+          ...Object.getOwnPropertyDescriptors(options),
+          env: { value: childEnv, enumerable: true, writable: true, configurable: true },
+        });
         // Replace an options placeholder too, so a following callback keeps its position.
         args.splice(index, hasOptions || (index < args.length && args[index] == null) ? 1 : 0, wrapped);
         return [command, ...args];
@@ -202,6 +205,13 @@ export function activateTrace(env, settings, { fs: io = fs, child_process: cp = 
   port1.on('message', url => tracer.add(url, 'load'));
   port1.unref();
   registerLoader(new URL('./dep-trace-loader.mjs', hook), { parentURL: hook, data: { port: port2 }, transferList: [port2] });
+  // The loader worker makes shared pipes non-blocking; preserve synchronous child writes.
+  for (const name of ['stdout', 'stderr']) {
+    try {
+      const handle = runtime[name]?._handle;
+      if (typeof handle?.setBlocking === 'function') handle.setBlocking(true);
+    } catch { /* tracing must not throw when a stream is unavailable */ }
+  }
   env.NODE_OPTIONS = inheritOptions(env.NODE_OPTIONS);
   tracer.install();
   syncExports();

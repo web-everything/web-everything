@@ -1,11 +1,14 @@
 /**
  * @file scripts/ci/__tests__/dep-trace.test.mjs
- * @description Hermetic S2 tracer and shadow coverage evidence; no real subprocesses.
+ * @description S2 tracer evidence with isolated real-child regressions for Node runtime contracts.
  */
 import { describe, it, expect, vi } from 'vitest';
 import { resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { promisify } from 'node:util';
+import { spawnSync } from 'node:child_process';
+import { mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
 import { activateTrace, createTracer, startTrace, mergeTraces, compareCoverage } from '../dep-trace.mjs';
 import { initialize, load } from '../dep-trace-loader.mjs';
 import { runTraceCoverage } from '../../readiness/trace-coverage.mjs';
@@ -28,6 +31,62 @@ function fixture(extra = {}) {
 }
 
 describe('shadow dependency tracer', () => {
+  function tracedChild(source) {
+    const dir = mkdtempSync(resolve(tmpdir(), 'dep-trace-'));
+    try {
+      return spawnSync(process.execPath, ['--import', pathToFileURL(resolve(root, 'scripts/ci/dep-trace.mjs')).href, '-e', source], {
+        env: { ...process.env, NODE_OPTIONS: '', WE_TRACE_TEST: test, WE_TRACE_DIR: dir,
+          WE_CI_SELECTION: JSON.stringify({ trace: { enabled: true } }) },
+        encoding: 'utf8', timeout: 10000, maxBuffer: 1024 * 1024,
+      });
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  }
+  it.each([1, 2])('preserves a real traced child synchronous 65536-byte write to captured fd %s', fd => {
+    const result = tracedChild(`require('node:fs').writeFileSync(${fd}, Buffer.alloc(65536, 'x'))`);
+    expect(result.error).toBeUndefined();
+    expect(result.signal).toBeNull();
+    expect(result.status, result.stderr.slice(-2048)).toBe(0);
+    expect(Buffer.byteLength(fd === 1 ? result.stdout : result.stderr)).toBe(65536);
+  });
+  it.each(['spawnSync', 'execFileSync'])('accepts frozen encoding options in a real traced %s call', name => {
+    const result = tracedChild(`
+      const cp = require('node:child_process');
+      const result = cp.${name}(process.execPath, ['-e', 'process.stdout.write("ok")'], Object.freeze({ encoding: 'utf8' }));
+      process.stdout.write(${JSON.stringify(name)} === 'spawnSync' ? result.stdout : result);
+    `);
+    expect(result.error).toBeUndefined();
+    expect(result.status, result.stderr).toBe(0);
+    expect(result.stdout).toBe('ok');
+  });
+  it.each(['spawn', 'spawnSync', 'execFile', 'execFileSync', 'fork'])('%s preserves frozen option descriptors and inherited cwd', name => {
+    const f = fixture();
+    const options = Object.freeze(Object.create({ cwd: 'scripts' }, {
+      encoding: { value: 'utf8', enumerable: true },
+      env: { value: Object.freeze({ CUSTOM: 'yes' }), enumerable: false },
+    }));
+    expect(f.child_process[name]('node', ['script.mjs'], options)).toBe('child');
+    const passed = f.originals[name].mock.calls[0][2];
+    expect(Object.getOwnPropertyDescriptor(passed, 'encoding')).toEqual(Object.getOwnPropertyDescriptor(options, 'encoding'));
+    expect(passed.cwd).toBe('scripts');
+    expect(passed.env).toMatchObject({ CUSTOM: 'yes', WE_TRACE_TEST: test });
+    expect(options.env).toEqual({ CUSTOM: 'yes' });
+    expect(f.tracer.snapshot().edges).toEqual([{ file: 'scripts/script.mjs', kind: 'spawn' }]);
+  });
+  it.each(['working', 'missing', 'throws'])('restores blocking streams after loader registration with %s stdout handle', mode => {
+    const order = [];
+    const stdout = mode === 'missing' ? {} : { _handle: { setBlocking(value) {
+      expect(value).toBe(true);
+      order.push('stdout');
+      if (mode === 'throws') throw new Error('closed stream');
+    } } };
+    const stderr = { _handle: { setBlocking: vi.fn(value => { expect(value).toBe(true); order.push('stderr'); }) } };
+    activateTrace({ WE_TRACE_TEST: test, WE_TRACE_DIR: 'artifacts' }, { maxEdgesPerTest: 5000 }, {
+      fs: {}, child_process: {}, process: { stdout, stderr, once: vi.fn() },
+      register: () => order.push('register'), syncBuiltinESMExports: () => order.push('sync'),
+      MessageChannel: class { constructor() { this.port1 = { on: vi.fn(), unref: vi.fn() }; this.port2 = {}; } },
+    });
+    expect(order).toEqual(mode === 'missing' ? ['register', 'stderr', 'sync'] : ['register', 'stdout', 'stderr', 'sync']);
+  });
   it('does nothing without both environment keys or when disabled', async () => {
     const activate = vi.fn();
     const loadSettings = vi.fn(() => { throw new Error('must not load settings'); });
