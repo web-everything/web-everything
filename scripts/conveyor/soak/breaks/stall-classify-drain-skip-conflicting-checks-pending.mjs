@@ -7,7 +7,7 @@ const SOURCE = 'scripts/conveyor/pr-stall-classify.mjs';
 const HEAD = 'ABCDEF0123456789ABCDEF0123456789ABCDEF01';
 
 const classify = (classifyStall, state, actor) => classifyStall({ head: HEAD, files: ['scripts/foo.mjs'], row: {
-  repo: 'web-everything/web-everything', number: 77, waitingOn: state, actor, stalled: true, liveJob: null,
+  repo: 'example/repo', number: 77, waitingOn: state, actor, stalled: true, liveJob: null,
   why: 'x', evidence: ['e1', 'e2', 'e3', 'e4'], next: { summary: 's', command: 'c' } } });
 
 export default {
