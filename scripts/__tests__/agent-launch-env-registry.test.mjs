@@ -33,6 +33,26 @@ function ruleFor(name) {
       ?? Object.entries(registry).find(([pattern]) => pattern.startsWith('*') && name.endsWith(pattern.slice(1)))?.[1];
 }
 const unclassified = names => names.filter(name => !ruleFor(name));
+it('never forwards non-gated guard bypasses or known gh executable redirects from either source', () => {
+  const names = new Set(['GH_PAGER', 'GH_EDITOR', 'GH_BROWSER', 'GH_ASKPASS']);
+  for (const [name, rule] of Object.entries(registry)) {
+    if (rule.class === 'drop' && !rule.restrictiveValues && !rule.restrictivePrefixes && !rule.tighterThan
+      && (/(_OFF|BYPASS|SKIP|FORCE|UNVERIFIED|NO_.*CHECK|GUARD)$/.test(name)
+        || /\bguard bypass\b/i.test(rule.why))) names.add(name);
+  }
+  for (const name of names) {
+    expect(ruleFor(name)?.never, name).toBe(true);
+    for (const source of ['ambient', 'bag', 'both']) {
+      clearEnv(name);
+      if (source !== 'bag') vi.stubEnv(name, '/untrusted-or-bypass');
+      const inheritEnv = source === 'ambient' ? {} : { [name]: '/untrusted-or-bypass' };
+      const invocation = buildAgentInvocation({ agent: 'codex', cwd: root, sandbox: 'read-only', inheritEnv }, {
+        resolveBinary: () => process.execPath,
+      });
+      expect(invocation.options.env, name).not.toHaveProperty(name);
+    }
+  }
+});
 const hasValueDecision = rule => !/value[\s-]*depend/i.test(rule.why)
   || [rule.restrictiveValues, rule.restrictivePrefixes].some(v => Array.isArray(v) && v.length > 0)
   || Boolean(rule.tighterThan) || rule.relaxOnly === true;
@@ -473,6 +493,7 @@ const parityRules = Object.entries(registry).filter(([, rule]) => !rule.never
   && !rule.restrictiveValues && !rule.restrictivePrefixes);
 // Explicit inventory prevents generic drop reasons from hiding executable redirects.
 const executableRedirects = [
+  'GH_PAGER', 'GH_EDITOR', 'GH_BROWSER', 'GH_ASKPASS',
   'EDITOR', 'VISUAL', 'PAGER', 'MANPAGER', 'BROWSER', 'LESSOPEN', 'LESSCLOSE', 'SSH_ASKPASS', 'SUDO_ASKPASS',
   'GIT_ASKPASS', 'GIT_EDITOR', 'GIT_EXEC_PATH', 'GIT_EXTERNAL_DIFF', 'GIT_PAGER', 'GIT_PROXY_COMMAND',
   'GIT_SEQUENCE_EDITOR', 'GIT_SSH', 'GIT_SSH_COMMAND', 'GIT_TEMPLATE_DIR', 'WE_GH_THROTTLE_GH_BIN', 'DEVELOPER_DIR',

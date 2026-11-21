@@ -980,6 +980,18 @@ describe('runGate — none/standards/full, never commits', () => {
 });
 
 describe('runCodexDirectExec / codexDirectTask — the orchestrator, over an injected spawnFn + execFn', () => {
+  it.each([undefined, null, 42])('refuses a non-string env value %s at the direct-task boundary before spawn', async value => {
+    const dir = mkdtempSync(join(tmpdir(), 'we-direct-env-refusal-'));
+    const spawnFn = vi.fn();
+    try {
+      await expect(codexDirectTask({ dir, task: 'fixture', gate: 'none', selfReview: false,
+        stream: false, log: false, spawnFn, env: { ...process.env, DIRECT_ENV_PROBE: value },
+        execFn: (_bin, args) => args.includes('--absolute-git-dir') ? join(dir, 'metadata') : '',
+        readQuotaFn: () => ({ quota: null, rolloutFile: null }) }))
+        .rejects.toThrow(/inheritEnv\.DIRECT_ENV_PROBE must be a NUL-free string/);
+      expect(spawnFn).not.toHaveBeenCalled();
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
   /** Same fakeSpawn shape `judge-spawn.test.mjs` uses — records argv/stdin, replays canned stdout. */
   function fakeSpawn(stdout, { code = 0, chunks } = {}) {
     const seen = { cli: null, argv: null, opts: null, stdin: '' };
@@ -1137,6 +1149,7 @@ describe('runCodexDirectExec / codexDirectTask — the orchestrator, over an inj
       const outputSchemaFile = join(dir, 'seat.schema.json');
       const r = await runCodexDirectExec({ dir, task: 'do the thing', outputSchemaFile, logFile, stream: false, spawnFn: fn });
       expect(seen.cli).toBe(FAKE_CODEX_BINARY);
+      expect(r.argv).toEqual(seen.argv);
       expect(seen.opts.shell).toBe(false);
       const expectedArgv = buildCodexDirectTaskArgv({ cwd: dir, outputSchemaFile,
         outputLastMessageFile: join(dir, '.git', 'codex-direct-task-last-message.txt') });

@@ -8,7 +8,7 @@ import { launchAgent, buildAgentInvocation, buildAgentArgs, findAgentBinary, bui
 import { defaultShimDir, checkoutShimDir, isDaemonCaller } from '../lib/gh-app-shim.mjs';
 import { isUnderTest } from '../lib/under-test.mjs';
 import { laneGitHardeningEnv, laneHistoryProofEnv, LANE_GIT_CONFIG_PINS, LANE_HISTORY_CONFIG_PINS } from '../lib/lane-git-hardening.mjs';
-import { buildCodexDirectTaskDescriptor, CODEX_SHIM_DIR } from '../codex-direct-task.mjs';
+import { buildCodexDirectTaskDescriptor, runCodexDirectExec, CODEX_SHIM_DIR } from '../codex-direct-task.mjs';
 import { clearEnv, clearRestrictiveEnv } from './fixtures/agent-launch-env.mjs';
 import { createAuditDeps } from '../operations/codex-audit-io.mjs';
 
@@ -156,10 +156,13 @@ describe('PR #7170 A-finding security regressions', () => {
     vi.stubEnv(key, restrictive);
     expect(childEnv()[key]).toBe(restrictive);
   });
-  it('F4: refuses restoring conflicting ambient bypass settings over caller restrictions', () => {
+  it('F4: never restores ambient bypass settings over caller restrictions', () => {
     setParent({ WE_HEAVY_ADMISSION: 'off', WE_PR_LIMIT_OFF: '1' });
     for (const inheritEnv of [{ WE_HEAVY_ADMISSION: 'on', WE_PR_LIMIT_OFF: '0' }, { WE_PR_LIMIT_OFF: '0' }]) {
-      refused({ ...base(), inheritEnv }, /inheritEnv\.(WE_HEAVY_ADMISSION|WE_PR_LIMIT_OFF) conflicts with the parent environment/);
+      const env = childEnv({ inheritEnv });
+      expect(env).not.toHaveProperty('WE_PR_LIMIT_OFF');
+      if (inheritEnv.WE_HEAVY_ADMISSION) expect(env.WE_HEAVY_ADMISSION).toBe('on');
+      else expect(env).not.toHaveProperty('WE_HEAVY_ADMISSION');
     }
   });
   it('F4: a complete caller environment excludes omitted ambient bypasses and validates the flag', () => {
@@ -775,7 +778,7 @@ describe('final audit: ambient hardening pins and unregistered parent restrictio
   });
   it.each(['USER', 'User'])('does not widen the transport value user to the spelling %s', value => {
     setParent({ GIT_CONFIG_COUNT: '1', GIT_CONFIG_KEY_0: 'protocol.ext.allow', GIT_CONFIG_VALUE_0: value });
-    expect(configOf(envOf({}))).toEqual({});
+    refused(base(), /ambient GIT_CONFIG transport policy is invalid/);
     clearEnv('GIT_CONFIG_COUNT');
     expect(configOf(envOf({ GIT_CONFIG_COUNT: '1', GIT_CONFIG_KEY_0: 'PROTOCOL.ALLOW', GIT_CONFIG_VALUE_0: value }))).toEqual({});
   });
@@ -925,21 +928,23 @@ describe('final audit: ambient hardening pins and unregistered parent restrictio
     const caller = laneHistoryProofEnv({}, { remoteProbe: true });
     expect(configOf(envOf(caller))).toEqual(configOf(caller));
   });
-  // Global user and unknown protocols could loosen Git defaults and stay excluded.
-  it.each(['protocol.ext.allow', 'protocol.allow', 'PROTOCOL.ALLOW', 'Protocol.ext.Allow', 'protocol.FILE.allow',
+  // Unknown protocols could loosen Git defaults and stay excluded.
+  it.each(['protocol.ext.allow', 'Protocol.ext.Allow', 'protocol.FILE.allow',
     'protocol.custom+x.allow'])('drops %s=user from the parent and from the caller bag', key => {
     setParent({ GIT_CONFIG_COUNT: '1', GIT_CONFIG_KEY_0: key, GIT_CONFIG_VALUE_0: 'user' });
     expect(configOf(envOf({}))).toEqual({});
     clearEnv('GIT_CONFIG_COUNT');
     expect(configOf(envOf({ GIT_CONFIG_COUNT: '1', GIT_CONFIG_KEY_0: key, GIT_CONFIG_VALUE_0: 'user' }))).toEqual({});
   });
-  it('a parent protocol.allow=user is dropped and cannot shelter a caller protocol.ext.allow=user', () => {
+  it('projects parent protocol.allow=user without sheltering a caller protocol.ext.allow=user', () => {
     setParent({ GIT_CONFIG_COUNT: '1', GIT_CONFIG_KEY_0: 'protocol.allow', GIT_CONFIG_VALUE_0: 'user' });
     const io = seam();
     launchAgent({ ...base(), inheritEnv: { GIT_CONFIG_COUNT: '2', GIT_CONFIG_KEY_0: 'protocol.ext.allow',
       GIT_CONFIG_VALUE_0: 'user', GIT_CONFIG_KEY_1: 'core.hooksPath', GIT_CONFIG_VALUE_1: '/dev/null' } }, io);
-    expect(configOf(io.spawn.mock.calls[0][2].env)).toEqual({ GIT_CONFIG_COUNT: '1',
-      GIT_CONFIG_KEY_0: 'core.hooksPath', GIT_CONFIG_VALUE_0: '/dev/null' });
+    expect(configOf(io.spawn.mock.calls[0][2].env)).toEqual({ GIT_CONFIG_COUNT: '6',
+      ...Object.fromEntries(['http', 'https', 'git', 'ssh', 'file'].flatMap((name, i) => [
+        [`GIT_CONFIG_KEY_${i}`, `protocol.${name}.allow`], [`GIT_CONFIG_VALUE_${i}`, 'user'],
+      ])), GIT_CONFIG_KEY_5: 'core.hooksPath', GIT_CONFIG_VALUE_5: '/dev/null' });
   });
   it('a caller protocol.ext.allow=user with no parent policy yields no GIT_CONFIG entry for ext', () => {
     const child = configOf(envOf({ GIT_CONFIG_COUNT: '2', GIT_CONFIG_KEY_0: 'protocol.ext.allow', GIT_CONFIG_VALUE_0: 'user',
@@ -960,6 +965,81 @@ describe('final audit: ambient hardening pins and unregistered parent restrictio
       maxBuffer: 1024 * 1024 });
     expect(result.status, result.stderr).toBe(128);
     expect(result.stderr).toContain("transport 'ext' not allowed");
+  });
+  it('preserves ambient user restrictions for normally allowed transports', () => {
+    // Force a local remote helper for each protocol: policy is checked before the helper
+    // runs, and the helper never performs network IO (including for git and ssh).
+    const dir = mkdtempSync(join(tmpdir(), 'agent-transport-matrix-'));
+    try {
+      const protocols = ['http', 'https', 'git', 'ssh', 'file', 'ext', 'custom'];
+      for (const protocol of protocols) {
+        const helper = join(dir, `git-remote-${protocol}`);
+        writeFileSync(helper, '#!/bin/sh\necho local-helper-reached >&2\nexit 1\n');
+        chmodSync(helper, 0o755);
+      }
+      const probe = (env, protocol) => {
+        // ext is a built-in helper, so give it the same harmless local executable explicitly.
+        const target = protocol === 'ext'
+          ? `ext::${join(dir, 'git-remote-ext').replaceAll('%', '%%').replaceAll(' ', '% ')}` : 'probe';
+        const result = spawnSync('git', ['-c', `remote.probe.vcs=${protocol}`, 'ls-remote', target], {
+          cwd, env: { ...env, GIT_EXEC_PATH: dir,
+            GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: '/dev/null', GIT_CONFIG_SYSTEM: '/dev/null' },
+          encoding: 'utf8', timeout: 5000, maxBuffer: 64 * 1024,
+        });
+        expect(result.error).toBeUndefined();
+        const refused = result.stderr.includes(`transport '${protocol}' not allowed`);
+        expect(refused || result.stderr.includes('local-helper-reached'), result.stderr).toBe(true);
+        return refused;
+      };
+      for (const protocol of protocols) {
+        for (const key of ['protocol.allow', `protocol.${protocol}.allow`]) {
+          for (const value of ['never', 'user', 'always']) {
+            const parent = { GIT_CONFIG_COUNT: '1', GIT_CONFIG_KEY_0: key, GIT_CONFIG_VALUE_0: value };
+            setParent(parent);
+            for (const fromUser of ['0', '1']) {
+              vi.stubEnv('GIT_PROTOCOL_FROM_USER', fromUser);
+              const child = envOf({});
+              const context = `${key}=${value}, ${protocol}, GIT_PROTOCOL_FROM_USER=${fromUser}`;
+              const parentRefuses = probe({ ...process.env, ...parent }, protocol);
+              const childRefuses = probe(child, protocol);
+              if (parentRefuses) expect(childRefuses, context).toBe(true);
+              if (['http', 'https', 'git', 'ssh', 'file'].includes(protocol) && value === 'user') {
+                expect(childRefuses, context).toBe(fromUser === '0');
+              }
+            }
+          }
+        }
+      }
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+  it.each(['protocol.allow', 'PrOtOcOl.AlLoW'])('projects %s=user with Git-specific precedence and duplicate globals', globalKey => {
+    const pins = env => Object.fromEntries(Array.from({ length: Number(env.GIT_CONFIG_COUNT ?? 0) },
+      (_, i) => [env[`GIT_CONFIG_KEY_${i}`].toLowerCase(), env[`GIT_CONFIG_VALUE_${i}`]]));
+    for (const specificFirst of [false, true]) {
+      const pairs = [[globalKey, 'never'], [globalKey, 'user']];
+      pairs[specificFirst ? 'unshift' : 'push'](['PROTOCOL.https.ALLOW', 'never']);
+      setParent({ GIT_CONFIG_COUNT: String(pairs.length),
+        ...Object.fromEntries(pairs.flatMap(([key, value], i) => [
+          [`GIT_CONFIG_KEY_${i}`, key], [`GIT_CONFIG_VALUE_${i}`, value],
+        ])) });
+      const expected = { 'protocol.allow': 'never', 'protocol.https.allow': 'never',
+        'protocol.http.allow': 'user', 'protocol.git.allow': 'user', 'protocol.ssh.allow': 'user', 'protocol.file.allow': 'user' };
+      expect(pins(envOf({}))).toEqual(expected);
+      const claudeEnv = buildAgentInvocation({ ...claude(), inheritEnvComplete: true, inheritEnv: {} }, seam()).options.env;
+      expect(pins(claudeEnv)).toEqual(expected);
+    }
+  });
+  it.each(['protocol.allow', 'protocol.https.allow'])('refuses malformed ambient %s policies before spawn', key => {
+    for (const value of ['USER', 'nonsense', '', 'user\n', 'user\r', 'user\u2028']) {
+      setParent({ GIT_CONFIG_COUNT: '1', GIT_CONFIG_KEY_0: key, GIT_CONFIG_VALUE_0: value });
+      refused(base(), /ambient GIT_CONFIG transport policy is invalid/);
+    }
+  });
+  it.each([base, claude])('retains the ambient non-user restriction even when a complete caller env omits it (%#)', descriptor => {
+    setParent({ GIT_PROTOCOL_FROM_USER: '0' });
+    const d = { ...descriptor(), inheritEnvComplete: true, inheritEnv: {} };
+    expect(buildAgentInvocation(d, seam()).options.env.GIT_PROTOCOL_FROM_USER).toBe('0');
+    refused({ ...d, inheritEnv: { GIT_PROTOCOL_FROM_USER: '1' } }, /conflicts with the parent environment/);
   });
   it('real Git still refuses local transport after a caller requests a file exception', () => {
     setParent({ GIT_CONFIG_COUNT: '1', GIT_CONFIG_KEY_0: 'protocol.allow', GIT_CONFIG_VALUE_0: 'never' });
@@ -987,6 +1067,32 @@ describe('final audit: ambient hardening pins and unregistered parent restrictio
     }
   });
 });
+
+it.skipIf(process.env.WE_AGENT_LAUNCH_LIVE_SMOKE !== '1')('live Codex --review smoke preserves tightening env and removes loaders and credentials', async context => {
+  // Explicit opt-in only: this requires a provisioned Codex account and model network access.
+  let binary;
+  try {
+    binary = findAgentBinary('codex', ['/usr/bin', '/bin', '/usr/local/bin', '/opt/homebrew/bin',
+      ...['.local/bin', '.npm-global/bin', '.volta/bin'].map(path => join(userInfo().homedir, path))]);
+  } catch { context.skip(); return; }
+  const dir = mkdtempSync(join(tmpdir(), 'agent-live-review-'));
+  try {
+    vi.stubEnv('WE_GH_AUTH_PERSONAL_FALLBACK', 'refuse');
+    vi.stubEnv('WE_FIX_LOOP_MAX_SESSIONS', '1');
+    vi.stubEnv('NODE_OPTIONS', '--require=/untrusted-loader');
+    vi.stubEnv('GH_TOKEN', 'fake-smoke-credential');
+    const keys = ['WE_GH_AUTH_PERSONAL_FALLBACK', 'WE_FIX_LOOP_MAX_SESSIONS', 'NODE_OPTIONS', 'GH_TOKEN'];
+    const command = `node -e 'console.log(JSON.stringify(Object.fromEntries(${JSON.stringify(keys)}.map(k => [k, process.env[k] ?? null]))))'`;
+    const result = await runCodexDirectExec({ dir, gitDir: dir, review: true, ephemeral: true,
+      task: `Run this read-only command once: ${command}\nReturn its JSON output verbatim as the entire final response.`,
+      logFile: join(dir, 'events.jsonl'), stream: false, timeoutMs: 120000, resolveBinaryFn: () => binary });
+    expect(result.timedOut).toBe(false);
+    expect(result.code, result.stderr).toBe(0);
+    expect(JSON.parse(readFileSync(result.outputLastMessageFile, 'utf8'))).toEqual({
+      WE_GH_AUTH_PERSONAL_FALLBACK: 'refuse', WE_FIX_LOOP_MAX_SESSIONS: '1', NODE_OPTIONS: null, GH_TOKEN: null,
+    });
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+}, 150000);
 
 describe('final audit: transport allowlist and bag-only limits', () => {
   const envOf = inheritEnv => buildAgentInvocation({ ...base(), ...(inheritEnv ? { inheritEnv } : {}) }, seam()).options.env;

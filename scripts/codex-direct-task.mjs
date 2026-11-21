@@ -1077,7 +1077,7 @@ export async function runCodexDirectExec({
   const outputLastMessageFile = join(gitDir, review ? `codex-self-review-${randomUUID()}-last-message.txt` : 'codex-direct-task-last-message.txt');
   route ??= resolveCodexTaskRoute({ kind: taskKind ?? (review ? 'review' : 'worker'), size, epic, decision, care, mandatoryLens, model, effort, env, log });
   const descriptor = buildCodexDirectTaskDescriptor({ env, route, cwd: dir, outputLastMessageFile, outputSchemaFile, model, effort, ephemeral, review, writableRoots, tempRoot, resumeThreadId });
-  const argv = buildAgentArgs(descriptor);
+  let argv = buildAgentArgs(descriptor);
   const prompt = buildCodexPrompt(task, { review, policy });
   writeFileSync(logFile, '', { flag: resumeThreadId ? 'a' : 'w' });
   // A resumed turn that emits no final file must not reuse an earlier completion report.
@@ -1087,7 +1087,11 @@ export async function runCodexDirectExec({
     let child;
     try {
       if (cli !== CODEX_CLI) throw new TypeError('codex-direct-task: cli must be codex');
-      child = launchAgent(descriptor, { spawn: spawnFn, resolveBinary: resolveBinaryFn });
+      child = launchAgent(descriptor, { spawn: (file, args, options) => {
+        // Binary resolution finalizes shell PATH; report the exact tokens passed to spawn.
+        argv = args;
+        return spawnFn(file, args, options);
+      }, resolveBinary: resolveBinaryFn });
     } catch (e) {
       reject(new Error(`codex-direct-task: could not start \`${cli}\`: ${e.message}`));
       return;

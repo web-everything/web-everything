@@ -5332,6 +5332,24 @@ expectations must account explicitly for the launcher's final PATH, including th
 resolved agent directory, and assert that shell PATH equals spawn PATH. Stub the
 ambient PATH in those fixtures so host shim installation does not choose the result.
 
+Direct-task reports contain the final spawned argv, including the resolved agent
+directory in shell PATH. Direct-task env bags require NUL-free strings: explicit
+undefined, null and numeric entries are refused before spawn; remove absent keys.
+
+The launcher transport matrix uses local remote helpers, without network access,
+to compare parent and child Git policy for never, user and always in both user and
+non-user operations. Global protocol.allow=user is projected onto HTTP, HTTPS,
+Git, SSH and file restrictions without enabling ext helpers. Specific policies
+take precedence regardless of list order, and GIT_PROTOCOL_FROM_USER=0 survives
+projection. Invalid ambient transport policies refuse launch before spawn.
+
+The live Codex --review smoke is opt-in: run
+`WE_AGENT_LAUNCH_LIVE_SMOKE=1 npm run test:unit -- scripts/__tests__/agent-launch.test.mjs`
+on a provisioned host with model network access. It skips without a fixed-install
+Codex binary. It runs a read-only environment probe through direct-task and
+launchAgent, requiring tightening values and the absence of NODE_OPTIONS and
+GH_TOKEN in the agent's shell. It is skipped in normal offline unit runs.
+
 CLI fixtures that record agent argv must embed their output path in the fake binary rather
 than forward unknown environment controls such as `ARGV_OUT`. Supply binary-lookup evidence
 through the existing filesystem preload; never select a fixture agent through ambient PATH.

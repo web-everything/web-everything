@@ -144,13 +144,13 @@ function gitValue(key, value) {
 const sameGitPair = ([k1, v1], [k2, v2]) => gitKey(k1) === gitKey(k2) && gitValue(k1, v1) === gitValue(k2, v2);
 // Transport candidates are also checked against the parent's policy in childGitConfig:
 // a protocol-specific exception takes precedence over Git's global protocol.allow setting.
-// `never` tightens every protocol.*.allow. `user` loosens Git's default for ext (never) and, as the global
-// protocol.allow, for every unlisted protocol. For http(s), git, ssh and file it tightens or equals
-// Git's default; only the exact lowercase value is accepted.
-const GIT_USER_TRANSPORT = /^protocol\.(https?|git|ssh|file)\.allow$/;
+// `never` tightens every protocol.*.allow. Accept `user` pairs only for transports
+// whose defaults it tightens or equals; global user restrictions are projected below.
+// Only the exact lowercase user value is accepted.
+const GIT_USER_TRANSPORT = new Set(['http', 'https', 'git', 'ssh', 'file'].map(name => `protocol.${name}.allow`));
 const tighteningGitPair = (key, value, parent) => GIT_PINS.some(pin => sameGitPair([key, value], pin))
   || (gitValue(key, value) === 'never' && GIT_TRANSPORT_POLICY.test(key))
-  || (value === 'user' && GIT_USER_TRANSPORT.test(gitKey(key)))
+  || (value === 'user' && GIT_USER_TRANSPORT.has(gitKey(key)))
   || (parent && gitKey(key) === 'core.hookspath' && value === '');
 function gitConfigPairs(env, parent = false) {
   const raw = env.GIT_CONFIG_COUNT;
@@ -159,13 +159,26 @@ function gitConfigPairs(env, parent = false) {
   // Reject impossible counts before iterating (each entry needs a key and a value var).
   if (!Number.isSafeInteger(count) || count * 2 + 1 > Object.keys(env).length) return null;
   const kept = [];
+  let globalUser = false;
   for (let i = 0; i < count; i++) {
     const key = env[`GIT_CONFIG_KEY_${i}`], value = env[`GIT_CONFIG_VALUE_${i}`];
     // Validate the entire declared set before filtering: dropping a broken entry would turn
     // Git's parse failure into a successful child operation. Empty values (helper resets) are valid.
     if (typeof key !== 'string' || typeof value !== 'string'
       || key.match(/^[a-z0-9-]+\.(?:[^\n]*\.)?[a-z][a-z0-9-]*$/i)?.[0] !== key) return null;
+    if (gitKey(key) === 'protocol.allow') globalUser = value === 'user';
     if (tighteningGitPair(key, value, parent)) kept.push([key, value]);
+    else if (parent && GIT_TRANSPORT_POLICY.test(key) && !['never', 'user', 'always'].includes(value)) {
+      fail('ambient GIT_CONFIG transport policy is invalid; repair the parent environment and retry');
+    }
+  }
+  // Global user restricts normally allowed transports, but enables ext/custom helpers.
+  // Preserve its restrictions as specific policies without exporting that permission.
+  // Specific policies override the global policy regardless of their position in Git's list.
+  if (parent && globalUser) {
+    for (const key of GIT_USER_TRANSPORT) {
+      if (!kept.some(([candidate]) => gitKey(candidate) === key)) kept.push([key, 'user']);
+    }
   }
   return { count, kept };
 }
@@ -209,7 +222,8 @@ function inheritedEnv(inherit, ambient, complete) {
       && !rule.relaxingValues.includes(normalized)) fail(`${key} has an invalid value; repair the environment`);
   };
   for (const [key, value] of Object.entries(ambient)) {
-    if (complete && !Object.hasOwn(inherit, key)) continue;
+    // Omitting the Git non-user marker would reopen every inherited user policy.
+    if (complete && !Object.hasOwn(inherit, key) && key !== 'GIT_PROTOCOL_FROM_USER') continue;
     const rule = envRule(key);
     if (!rule) { out[key] = value; continue; }
     if (rule.never) continue;
