@@ -152,8 +152,10 @@ export function planLabelInputRows({ repo, pr, items = [], liveLabels = [], self
   // landing during that refresh must also beat a historical addition in the same second.
   const observedIds = new Set(observedEvents.map(ledgerEventId));
   const latest = new Map();
+  // Id order only when EVERY item carries a decimal id: a mixed comparator is not transitive.
+  const allNumeric = items.every(it => /^[0-9]+(?![\s\S])/.test(String(it.eventId)));
   const ordered = items.map((it, i) => ({ it, i })).sort((a, b) => {
-    if (/^[0-9]+(?![\s\S])/.test(String(a.it.eventId)) && /^[0-9]+(?![\s\S])/.test(String(b.it.eventId))) {
+    if (allNumeric) {
       const left = BigInt(a.it.eventId), right = BigInt(b.it.eventId);
       return left < right ? -1 : left > right ? 1 : a.i - b.i;
     }
