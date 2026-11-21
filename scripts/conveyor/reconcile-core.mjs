@@ -1649,7 +1649,7 @@ export function advisoryHeadMoveState(pr) {
   return mechanical ? { owed: true, head: headSha, latestHead: latest.head ?? null } : { owed: false };
 }
 
-/** Unreadable or unpinned history grants nothing; cross-head chronology must agree with thread order. */
+/** Current-head chronology uses only that head; cross-head grants require readable, ordered history. */
 function latestHeadReview(pr, { currentHeadOnly = false } = {}) {
   const reviews = (Array.isArray(pr?.comments) ? pr.comments : [])
     .map((c, index) => ({ c, index }))
@@ -1657,13 +1657,14 @@ function latestHeadReview(pr, { currentHeadOnly = false } = {}) {
     // Operator send-backs are requests, not finished reviews of a head.
     .filter(({ c }) => !isOperatorAuthored(c) || !openOperatorSendBacks({ comments: [c] }).length)
     .map(({ c, index }) => ({ index, head: reviewedHeadsOf(c).at(-1) ?? latestAdvisory([c])?.head, at: Date.parse(c.createdAt) }));
-  if (!reviews.length || reviews.some(r => !r.head || !Number.isFinite(r.at))) return null;
+  if (!reviews.length) return null;
   const current = reviews.filter(r => sameHeadSha(r.head, pr.headRefOid));
   if (currentHeadOnly) {
-    // Other heads' clocks cannot hide a newer operator request on this head.
-    if (current.some((r, i) => i > 0 && r.at <= current[i - 1].at)) return null;
+    // Unpinned history and other heads' clocks cannot hide a newer operator request on this head.
+    if (current.some((r, i) => !Number.isFinite(r.at) || (i > 0 && r.at <= current[i - 1].at))) return null;
     return current.at(-1) ?? null;
   }
+  if (reviews.some(r => !r.head || !Number.isFinite(r.at))) return null;
   // Coverage is independent of chronology: a skewed old-head review cannot reopen this head.
   if (current.length || reviews.some((r, i) => i > 0 && r.at <= reviews[i - 1].at)) return null;
   return reviews.at(-1);

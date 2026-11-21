@@ -83,6 +83,19 @@ describe('review:human advisory re-run on a moved head', () => {
     ]);
   });
   it.each([
+    ['advisory', () => advisory(HEAD)], ['verdict', verdict],
+  ])('a current-head %s preserves operator send-back despite unrelated history without timestamps', (_name, review) => {
+    const comments = [review(), { ...unreadable(), createdAt: undefined },
+      { ...advisory(OLD), createdAt: undefined }, sendBack()];
+    expect(run({ comments }).dispatch).toEqual([
+      expect.objectContaining({ kind: 'fix', mode: 'operator-send-back' }),
+    ]);
+  });
+  it.each([undefined, 'unreadable'])('a current-head review with time %s still blocks operator send-back', createdAt => {
+    const comments = [advisory(HEAD), { ...advisory(HEAD), createdAt }, sendBack()];
+    expect(run({ comments }).dispatch.map(d => d.mode)).not.toContain('operator-send-back');
+  });
+  it.each([
     ['draft', { isDraft: true }, ['promote-draft']],
     ['pending draft', { isDraft: true, statusCheckRollup: [{ name: 'gate', status: 'in_progress' }] }, []],
     ['pending CI', { statusCheckRollup: [{ name: 'gate', status: 'in_progress' }] }, []],
