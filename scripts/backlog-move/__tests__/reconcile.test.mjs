@@ -82,6 +82,13 @@ describe('manifest', () => {
     expect(out.toString()).toBe(expected);
     expect(out.toString().match(/^---/gm)).toHaveLength(2);
   });
+  it.each(['kind: d\rid: old\n', 'kind: d id: old\n', 'kind: d id: old\n'])('transform refuses a bare CR / U+2028 / U+2029 in frontmatter (%j)', (front) => {
+    expect(() => transform(Buffer.from(`---\n${front}---\nbody\n`), '083', 'we:#083')).toThrow(/line ending/);
+  });
+  it('a front holding only identity lines leaves no blank line before the closing delimiter', () => {
+    expect(transform(Buffer.from('---\nid: "x"\nformerly: "y"\n---\nbody\n'), '083', 'we:#083').toString())
+      .toBe('---\nid: "083"\nformerly: "we:#083"\n---\nbody\n');
+  });
   it('the manifest records the digest of the uncorrupted mixed-ending destination bytes', () => {
     const mixed = Buffer.from('---\r\nkind: decision\n---\n\nPlacement: plateau-app\n');
     expect(buildManifest({ sourceSha: sha, cards: [{ sourcePath, bytes: mixed }] }).cards[0].destDigest)

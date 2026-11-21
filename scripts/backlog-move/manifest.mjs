@@ -5,6 +5,8 @@ import { classifyCard, splitCard } from '../backlog-placement-trial.mjs';
 export const digest = (bytes) => createHash('sha256').update(bytes).digest('hex');
 export const states = ['snapshot', 'copy', 'verify', 'cutover', 'reconcile-links', 'done', 'quarantined'];
 const idPattern = /^[a-z0-9]+$/;
+// U+2028/U+2029 built from code points so no literal separator ever sits in this source.
+const separators = [0x2028, 0x2029].map((code) => String.fromCharCode(code));
 export function cardId(sourcePath) {
   const match = /^backlog\/([a-z0-9]+)-[a-z0-9_-]+\.md$/.exec(sourcePath);
   if (!match) throw new Error('Invalid source path; inspect snapshot');
@@ -14,6 +16,8 @@ export function transform(bytes, destId, bornAs) {
   const text = Buffer.from(bytes).toString('utf8'), { front } = splitCard(text);
   if (front === null || !Buffer.from(text).equals(Buffer.from(bytes)) || !idPattern.test(destId) || !/^we:#[a-z0-9]+$/.test(bornAs))
     throw new Error('Invalid card bytes or identity; inspect snapshot');
+  // Only LF and CRLF are line endings here: a bare CR or a Unicode line separator would hide an id line from the filter below.
+  if (/\r(?!\n)/.test(front) || separators.some((s) => front.includes(s))) throw new Error('Unsupported line ending in frontmatter; inspect snapshot');
   if (/^(id|formerly):[ \t]*[>|]/m.test(front) || /^(id|formerly):[^\r\n]*\r?\n[ \t]+\S/m.test(front))
     throw new Error('Multiline identity requires operator inspection');
   // Same delimiters splitCard parsed: opening/closing line endings may differ (mixed CRLF/LF), so capture each.
@@ -26,7 +30,7 @@ export function transform(bytes, destId, bornAs) {
   // An unterminated last line that is dropped leaves the previous line's ending ahead of the closing delimiter's own.
   const last = lines.at(-1);
   if (identityLine(last) && !/\n$/.test(last)) clean = clean.replace(/\r?\n$/, '');
-  return Buffer.from(`---${open}id: ${JSON.stringify(destId)}${open}formerly: ${JSON.stringify(bornAs)}${open}${clean}${close}---${rest}`);
+  return Buffer.from(`---${open}id: ${JSON.stringify(destId)}${open}formerly: ${JSON.stringify(bornAs)}${clean === '' ? '' : `${open}${clean}`}${close}---${rest}`);
 }
 export function buildManifest({ sourceSha, cards }) {
   if (!/^[a-f0-9]{40}$/.test(sourceSha) || !Array.isArray(cards) || !cards.length) throw new Error('Pinned sourceSha and snapshots required');
