@@ -49,7 +49,7 @@ export default {
             let code;
             try {
               runReviewLabelCli({
-                argv: ['5803', '--repo=o/n', '--actor=chalbert', '--reason=operator ruling',
+                argv: [`--expect-head=${'a'.repeat(40)}`, '5803', '--repo=o/n', '--actor=chalbert', '--reason=operator ruling',
                   ...(fixed ? [] : ['--to=clear-human'])],
                 fixedTo: fixed ? 'clear-human' : null, allowClearHuman: true,
                 defaultActor: 'operator', usage: 'soak', provider,

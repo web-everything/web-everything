@@ -75,12 +75,12 @@ describe('runtime build priority', () => {
     expect(read({ ...record, mode: 'lift' }).runtime.hash).not.toBe(hash);
   });
 
-  it('expired TTL warns but still applies the list; exactly TTL is not expired', () => {
+  it('expired runtime list is ignored and reported; exactly TTL is not expired', () => {
     expect(read({ ...record, ttlHours: 1 }).runtime.expired).toBe(false);
     const settings = read({ ...record, ttlHours: 0.5 });
     expect(settings.runtime.expired).toBe(true);
-    expect(settings.runtime.line).toContain('WARNING expired');
-    expect(filterIdsToRuntimeOnly(['9', '42'], settings)).toEqual(['42']);
+    expect(settings.runtime.line).toContain('runtime list expired at');
+    expect(filterIdsToRuntimeOnly(['9', '42'], settings)).toEqual(['9', '42']);
   });
 
   it.each([

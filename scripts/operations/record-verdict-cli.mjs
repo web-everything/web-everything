@@ -117,6 +117,7 @@ export async function runRecordVerdictSelfSufficient({ reviewPrSinks, ...o } = {
       actor: parsed.input.actor,
       body: 'placeholder',
       operatorInstruction: parsed.input.operatorInstruction,
+      expectedHead: parsed.input.expectedHead,
     });
     if (precheck.ok) {
       try {

@@ -40,7 +40,7 @@ import { readPreparePolicy } from '../../scripts/conveyor/prepare-policy-setting
 import { readInfraStore, resolveInfraStorePath, infraRecoveryCard, runInfraBlocked } from '../../scripts/conveyor/infra-blocked.mjs';
 import { producerBuildContext } from '../../scripts/operations/build-pr-authorship.mjs';
 import { withRuntimeAdmission, assertRuntimeAdmitted, validRuntimeGroupMembers } from '../../scripts/lib/runtime-admission.mjs';
-import { readBuildPrioritySettings } from '../../scripts/lib/build-queue.mjs';
+import { readBuildPrioritySettings, decideRuntimeAdmission } from '../../scripts/lib/build-queue.mjs';
 import { readBuildGroupingSettings, formatBuildGroupingLine, planBuildGroups, retireMemberWhy } from '../../scripts/conveyor/build-grouping.mjs';
 import { retryTransientGit } from '../../scripts/lib/git-fetch-retry.mjs';
 import { PLANNING_SNAPSHOT_ENV, planningRead } from '../../scripts/lib/planning-snapshot.mjs';
@@ -569,6 +569,38 @@ async function runTimedBuildDispatchTick({ bookkeeping = {}, live = false, polic
   const planningSkips = [];
   // The refusal record a planning skip persists (`prepareRefusals`), exactly as the launch guard would write it.
   const planningSkipDetail = new Map();
+  // Builder-only mode: ONE gate point for prepares. In runtime "only" mode just the listed ids may prepare; an
+  // unreadable list fails closed (no prepares); an expired list is ignored by the reader and reported here.
+  const runtimeOffList = new Set();
+  // Queue shaping and prepare picks omit durable aliases. Share the full-card snapshot
+  // with grouping below, including a failed read, so this tick never retries it.
+  let groupingCardsPromise;
+  const loadGroupingCards = () => groupingCardsPromise ??= Promise.resolve().then(() => effects.loadGroupingCards?.());
+  if (typeof effects.readRuntimePriority === 'function') {
+    let settings;
+    try { settings = effects.readRuntimePriority(); } catch { settings = { held: true }; }
+    if (settings?.runtime?.expired && settings.runtime.line) console.error(`build-dispatch-daemon: ${settings.runtime.line}`);
+    if (!settings || typeof settings !== 'object' || settings.held || settings.only) {
+      const reason = !settings || settings.held ? 'runtime-list-unreadable' : 'not-in-runtime-only-list';
+      const candidates = [...(out?.decisions?.admission?.queue ?? []), ...(out?.decisions?.spawnPrepareItems ?? out?.decisions?.itemPrepareSpawns ?? [])];
+      if (settings?.only && !settings.held) {
+        const candidateNums = new Set(candidates.map(card => normNum(card.num)));
+        try {
+          const cards = await loadGroupingCards();
+          candidates.push(...(cards ?? []).filter(card => candidateNums.has(normNum(card.num))));
+        } catch { /* No alias evidence: only identities already present may authorize a prepare. */ }
+      }
+      // Preserve durable aliases; a minimal duplicate must not veto an admitted full card.
+      const admitted = new Set(candidates.filter(card => decideRuntimeAdmission(card, 'prepare', settings).admitted).map(card => normNum(card.num)));
+      for (const card of candidates) if (!admitted.has(normNum(card.num))) runtimeOffList.add(normNum(card.num));
+      const planned = new Set((out?.decisions?.spawnPrepareItems ?? out?.decisions?.itemPrepareSpawns ?? []).map(r => normNum(r.num)));
+      for (const num of runtimeOffList) if (planned.has(num)) planningSkips.push({ num, reason });
+      if (runtimeOffList.size) {
+        tickBookkeeping.prepareHeldNums = [...new Set([...(tickBookkeeping.prepareHeldNums ?? []), ...runtimeOffList])];
+        out = await effects.planTick(tickBookkeeping, { config: planConfig });
+      }
+    }
+  }
   // Inspect actual picks, then refill skipped slots. Never scan the entire held backlog: each card costs up to
   // four synchronous listings from the same 128-call budget the final launch guard needs. Eight observations
   // bound this lookahead (including selected group members below) to 32 calls; picks beyond that window still
@@ -848,7 +880,7 @@ async function runTimedBuildDispatchTick({ bookkeeping = {}, live = false, polic
   let groupRowsByNum = new Map((admission.queue ?? []).map(r => [normNum(r.num), r]));
   let groupingCardsLoaded = true;
   try {
-    const cards = await effects.loadGroupingCards?.();
+    const cards = await loadGroupingCards();
     if (cards !== undefined) {
       const cardsByNum = new Map(cards.map(card => [normNum(card.num), card]));
       groupRowsByNum = new Map((admission.queue ?? []).map(row => {
@@ -1057,7 +1089,7 @@ async function runTimedBuildDispatchTick({ bookkeeping = {}, live = false, polic
   if (live && !preparesFirst) await launchBuilds();
   // Separate durable claims use the existing lease primitive, without occupying build slots.
   // Run-store rows survive restarts; guards cover the interval before a dispatched lane is visible.
-  const prepareSpawns = (d.spawnPrepareItems ?? d.itemPrepareSpawns ?? []).filter(p => !planningSkips.some(r => r.num === normNum(p.num)));
+  const prepareSpawns = (d.spawnPrepareItems ?? d.itemPrepareSpawns ?? []).filter(p => !planningSkips.some(r => r.num === normNum(p.num)) && !runtimeOffList.has(normNum(p.num)));
   const settledPrepares = new Map();
   for (const row of allSettledPrepares) {
     if (failureRecords.some(f => f.num === row.num && f.attempt === row.source && f.retry)
@@ -1396,7 +1428,7 @@ async function runTimedBuildDispatchTick({ bookkeeping = {}, live = false, polic
     console.error(`build-dispatch-daemon: prepare launch of #${num} refused: ${refusal.reason}${refusal.note ? ` · ${refusal.note}` : ''}`);
     return refusal;
   };
-  const prepareAvailable = num => !finishedPrepares.has(normNum(num)) && !heldNums.has(normNum(num))
+  const prepareAvailable = num => !finishedPrepares.has(normNum(num)) && !heldNums.has(normNum(num)) && !runtimeOffList.has(normNum(num))
     && !repeatRefusalNums.has(normNum(num)) && !refusalHeldNums.has(normNum(num)) && !planningSkips.some(r => r.num === normNum(num))
     && !prepareBusy.has(normNum(num)) && !prepareMembers.has(normNum(num))
     && !protectedMembers.has(normNum(num)) && !inFlight.some(r => normNum(r.num) === normNum(num))
@@ -2871,6 +2903,7 @@ export function cliEffects() {
       return prepareReader.prime(nums.map(num => ({ num, ...(parkedSet.has(normNum(num)) ? { parked: true } : {}),
         claimedAt: claims.find(c => normNum(c.meta.num) === normNum(num))?.meta?.claimedAt })));
     },
+    readRuntimePriority: () => readBuildPrioritySettings(),
     listPreparePrs: args => (prepareReader ??= reader()).listPrs(args),
     readPrepareStatus: args => (prepareReader ??= reader()).read(args),
     // The card's stamp as it stands at spawn, recorded on the claim.
