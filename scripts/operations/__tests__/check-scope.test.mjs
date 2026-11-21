@@ -8,7 +8,8 @@ import { collectFreeScope, readRegistry, OPEN_PR_LIMIT } from '../free-scope-io.
 import { createRegistry } from '../registry.mjs';
 import { startRun, advanceWhileRunning, runStatus } from '../engine.mjs';
 import { isReadOnlyDeclaration } from '../http-adapter.mjs';
-import { acceptedControlFlags, parseOperationArgv, runOperationCli } from '../cli-adapter.mjs';
+import { runOperationCli } from '../cli-adapter.mjs';
+import { spawnSync } from 'node:child_process';
 import { OPERATIONS } from '../run.mjs';
 
 // Wrap (never replace) the real reader so most tests exercise it; the run.mjs test below stubs single calls.
@@ -260,24 +261,21 @@ describe('check-scope cannot be resumed (a saved verdict never stands in for a f
     const store = { read: id => records.get(id) ?? null, write: record => records.set(record.id, record) };
     return { declaration, records, go: argv => runOperationCli({ declaration, argv, registry, store, sinks, newRunId: () => 'cs-run' }) };
   };
-  it('refuses --resume of a completed run at parse time, without reading evidence again', async () => {
-    collectFreeScope.mockClear();
-    collectFreeScope.mockImplementation(() => snapshot());
-    try {
-      const { declaration, records, go } = drive();
-      expect(acceptedControlFlags(declaration)).not.toContain('resume');
-      const first = await go(['--files=scripts/a.mjs']);
-      expect(first).toMatchObject({ code: 0, stopped: 'complete' });
-      expect(first.run.verdict.ok).toBe(true);
-      expect(records.size).toBe(1);
-      for (const argv of [['--resume=cs-run'], ['--resume=cs-run', '--answer=accept']]) {
-        expect(parseOperationArgv(declaration, argv)).toMatchObject({ ok: false, errors: [expect.stringContaining('read-only')] });
-        expect(await go(argv)).toMatchObject({ code: 2, stopped: 'refused', lines: [expect.stringContaining('has no run to resume'), '', expect.any(String)] });
-      }
-      // Even with newly contradicting evidence, no invocation reached the reader after the first.
-      expect(collectFreeScope).toHaveBeenCalledTimes(1);
-    } finally { collectFreeScope.mockReset(); collectFreeScope.mockImplementation((...args) => actualCollect(...args)); }
-  });
+  it('keeps no run record a later --resume could replay: the CLI refuses it instead of returning a saved verdict', () => {
+    // Real CLI, two processes. `node` stands in for gh so the first read fails closed; what matters is that the
+    // second invocation finds nothing to resume (a file-backed store would have replayed the saved run).
+    withRegistry([], registryPath => {
+      const cli = join(process.cwd(), 'scripts/operations/run.mjs');
+      const env = { ...process.env, WE_AGENT_SCOPES_PATH: registryPath, WE_FREE_SCOPE_GH_BIN: process.execPath };
+      const invoke = args => spawnSync(process.execPath, [cli, 'check-scope', ...args], { env, encoding: 'utf8', timeout: 90e3 });
+      const first = invoke(['--files=scripts/a.mjs', '--run-id=cs-resume-probe']);
+      expect(first.stdout).toContain('"ok":false');
+      const resumed = invoke(['--resume=cs-resume-probe']);
+      expect(resumed.status).toBe(2);
+      expect(resumed.stdout).toContain('scope check did not run');
+      expect(resumed.stdout).not.toContain('"ok"');
+    });
+  }, 200e3);
   it('re-reads evidence on a second ordinary invocation', async () => {
     collectFreeScope.mockClear();
     collectFreeScope.mockImplementationOnce(() => snapshot()).mockImplementationOnce(() => snapshot({ agents: [{ ...agent, startedAt: new Date().toISOString() }] }));

@@ -1033,7 +1033,8 @@ if (IS_CLI) {
   const controlPreview = controlPolicy.memoryStore;
   const cliStores = controlPreview ? { store: createMemoryRunStore(), callLog: undefined }
     : name === RUNNER_ACTIVITY_OP ? createRunnerActivityCliStores()
-    : [DELIVERY_FLOW_OP, PR_TRACE_OP, ADOPTION_MATRIX_OP, JUDGE_SWEEP_FACTS_OP, STALE_STATE_OP, HEALTH_RESPOND_OP, ITEM_ACTIVITY_OP, WHY_OP, PR_SWEEP_OP, PR_SIZE_OP].includes(name) ? { store: createMemoryRunStore(), callLog: undefined }
+    // check-scope: an in-process store holds no record a later `--resume` could replay, so a saved verdict can never stand in for a fresh read.
+    : [DELIVERY_FLOW_OP, PR_TRACE_OP, ADOPTION_MATRIX_OP, JUDGE_SWEEP_FACTS_OP, STALE_STATE_OP, HEALTH_RESPOND_OP, ITEM_ACTIVITY_OP, WHY_OP, PR_SWEEP_OP, PR_SIZE_OP, CHECK_SCOPE_OP].includes(name) ? { store: createMemoryRunStore(), callLog: undefined }
     : { store: createFileRunStore(), callLog: createFileCallLogStore() };
   runOperationCli({
     declaration,
