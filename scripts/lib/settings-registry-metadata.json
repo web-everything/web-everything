@@ -139,6 +139,12 @@
       "changeVia": "pr",
       "instant": false
     },
+    "ciUnitRerun": {
+      "description": "Enable one retry of failed unit files and bound the number of files retried.",
+      "owner": "scripts/settings/ci-unit-rerun.json",
+      "changeVia": "pr",
+      "instant": false
+    },
     "_doc": {
       "description": "Documentation of Claude account mappings and enforcement.",
       "owner": "scripts/settings/claude-accounts.json",

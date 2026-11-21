@@ -16,9 +16,9 @@ For repo defaults, edit the owner file through a PR and rebuild the consuming da
 
 ## Summary
 
-- Top-level keys: 157 (159 declaration rows).
+- Top-level keys: 158 (160 declaration rows).
 - Declared leaves: 584 (platform copies counted separately).
-- Instant top-level keys: 0; not instant: 157.
+- Instant top-level keys: 0; not instant: 158.
 - Instant capacity leaves: 14.
 - Constants to settle: 312.
 - Instant gaps: 28.
@@ -82,6 +82,7 @@ Operator-prefs layer: ~/.plateau/platform-preferences.json is the requested oper
 | ciGhostRerun | scripts/settings/ci-ghost-rerun.json | 5 | {"thresholdMin":15,"maxPerWindow":1,"maxPerHead":1,"windowH… | pr | no | Age, frequency and cancellation bounds for ghost CI recovery. |
 | ciHeal | scripts/settings/ci-heal.json | 1 | {"staleBaseRefreshFirst":"on"} | pr | no | Try a stale-base refresh before waking a CI fixer. |
 | ciHeldRecordRetryMax | scripts/settings/review-red-team-on-skip.json | 1 | 3 | pr | no | Maximum CI-held record recovery retries. |
+| ciUnitRerun | scripts/settings/ci-unit-rerun.json | 0 | {} | pr | no | Enable one retry of failed unit files and bound the number of files retried. |
 | claudeHelper | scripts/settings/claude-helper.json | 1 | {"model":"claude-sonnet-5-5"} | pr | no | Default Claude helper and juror model. |
 | cloneMaintenance | scripts/settings/clone-maintenance.json | 1 | {"intervalMs":86400000} | pr | no | Interval between idle daemon clone garbage collections. |
 | codex | scripts/settings/codex.json | 30 | {"modelByTask":{"prepare":{"model":"gpt-6-astra","effort":"… | pr | no | Per-task Codex model, effort and pre-launch retry choices. |
