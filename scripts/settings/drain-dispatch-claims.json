@@ -1,4 +1,4 @@
 {
-  "$comment": "Dispatch claim admission: off preserves legacy fixing-only holds; shadow observes; on holds dispatch claims.",
-  "drain": { "honourDispatchClaims": "off" }
+  "$comment": "Dispatch claim admission: off preserves legacy fixing-only holds; shadow observes (decision stays legacy, adds stderr claim-held-shadow rows); on holds dispatch claims.",
+  "drain": { "honourDispatchClaims": "shadow" }
 }

@@ -189,6 +189,11 @@ describe('T7: honourDispatchClaims setting and provenance', () => {
   it('defaults to off from the standard', () => {
     expect(drain.resolveHonourDispatchClaims({})).toEqual({ value: 'off', source: 'standard' });
   });
+  it('ships the tool layer at shadow: decisions stay legacy, only claim-held-shadow rows are added', () => {
+    const shipped = JSON.parse(readFileSync(join(process.cwd(), 'scripts/settings/drain-dispatch-claims.json'), 'utf8'));
+    expect(shipped.drain.honourDispatchClaims).toBe('shadow');
+    expect(drain.resolveHonourDispatchClaims({}, { tool: shipped.drain })).toEqual({ value: 'shadow', source: 'tool' });
+  });
   it('resolves platform then tool then environment', () => {
     const platform = { honourDispatchClaims: 'shadow' }, tool = { honourDispatchClaims: 'on' };
     expect(drain.resolveHonourDispatchClaims({}, { platform })).toEqual({ value: 'shadow', source: 'platform' });
