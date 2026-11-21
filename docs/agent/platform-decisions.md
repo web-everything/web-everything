@@ -3743,6 +3743,15 @@ Four clauses:
    **Clarified 2026-10-08 (operator ruling E7, event-driven daemons):** a per-PR "ready to land" event from the
    decider is a wake/hint for that one PR, never an order — the drain re-checks every gate live and keeps the
    `blockedBy` ordering.
+   **Clarified 2026-11-21 (operator ruling `standards.D1`, Longshore switch protocol S1–S9):** moving the sole
+   writer from one engine to another as a **planned, operator-approved handover** is not the failover this clause
+   closes, and its fence is a credential fence, not a token-fenced `main` write. It is allowed only when all
+   three hold: (a) at no moment can two engines write `main`: the old writer's forge credential is fenced at
+   GitHub (its App installation suspended, and every token it minted revoked or past its one-hour life) before
+   the new writer accepts any effect; (b) the handover is never automatic: no timeout, lease expiry or health
+   signal starts it, and a rollback is the same operator-approved handover in reverse; (c) one logical writer,
+   one polling drain, stays true before and after, and the new drain still re-derives every gate live before
+   each merge. A handover that cannot show (a) to (c) is the closed second-writer path.
 
 2. **The cheap WAKE ships now, independent of everything below.** Shorten the drain poll default (60s → ~5–10s,
    one constant) and fire the daemon's `/nudge` on a PR-reaching-ready event. One constant plus one event wire —
@@ -3770,7 +3779,8 @@ merits** (clause 1). WAKE ships now (clause 2) = #2605 (drain-daemon `/nudge` se
 trigger, resolved) + the WAKE-remainder story `#2743`. Deferred merge-queue build (clause 3) = slice #2683's
 successor, gated behind tripwire **#2740** reading #2680's `land-serialization` saturation metric, **routed** by
 **#2704** (clause 4). Program #2606 / epic #2612. Clause 1 clarified 2026-10-08 by operator ruling E7 on the
-event-driven daemon design (#3886; epic 5452, slice #4283). Extends [#pr-flow-rollout-mechanism](#pr-flow-rollout-mechanism)
+event-driven daemon design (#3886; epic 5452, slice #4283). Clause 1 clarified 2026-11-21 by ruling `standards.D1` (card #5488): a planned, fenced,
+operator-approved handover of the sole writer is not failover. Extends [#pr-flow-rollout-mechanism](#pr-flow-rollout-mechanism)
 (sole-writer-to-`main`) and composes with
 [#deterministic-core-thin-judgment](#deterministic-core-thin-judgment) (the wake/land mechanics are script-decidable;
 the high-stakes un-gate stays a routed judgment call).
