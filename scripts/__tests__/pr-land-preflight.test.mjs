@@ -8,11 +8,13 @@ import { pathToFileURL } from 'node:url';
 // Execute the actual CLI/checkpoint in a child. Loader substitutes only external gate/forge ports;
 // Git effects are recorded instead of executed. No real Git, forge, card filing or operator state.
 function run({ check = true, fail = false, override = '', count = 15, exempt = false,
-  body = 'Description', earlyPr = false, labelOnGreen = false, headEvidence = 'matching' } = {}) {
+  body = 'Description', earlyPr = false, labelOnGreen = false, headEvidence = 'matching',
+  sha = 'a'.repeat(40), remoteTip = '', remoteError = false, ancestor = true, refusePush = false } = {}) {
   const dir = mkdtempSync(join(tmpdir(), 'pr-land-preflight-'));
   const trace = join(dir, 'effects.jsonl');
   const root = resolve('scripts');
-  const sha = 'a'.repeat(40);
+  const hook = join(dir, 'pre-push');
+  writeFileSync(hook, '#!/bin/sh\necho "fixture pre-push refuses" >&2\nexit 1\n');
   const record = `import { appendFileSync } from 'node:fs'; const effect = value => appendFileSync(${JSON.stringify(trace)}, JSON.stringify(value) + '\\n');`;
   const stubs = {
     './operations/canonical-audit-gate.mjs': 'export const checkCanonicalAuditForOpen = () => ({ ok: true });',
@@ -52,6 +54,7 @@ function run({ check = true, fail = false, override = '', count = 15, exempt = f
   const preload = join(dir, 'preload.mjs');
   writeFileSync(preload, `import cp from 'node:child_process'; import { syncBuiltinESMExports, register } from 'node:module';
     ${record}
+    const execFileSync = cp.execFileSync;
     cp.execFileSync = (cmd, args) => {
       effect([cmd, args]);
       if (cmd === 'node') return ''; // locus linter is read-only and independently tested
@@ -60,7 +63,15 @@ function run({ check = true, fail = false, override = '', count = 15, exempt = f
       if (args[0] === 'log') return 'fix: admission';
       if (args[0] === 'remote') return 'https://github.com/web-everything/web-everything.git';
       if (args[0] === 'diff') return args.includes('--name-status') ? 'M\\tblocks/example.ts' : ${JSON.stringify(exempt ? 'scripts/conveyor/worker.mjs' : 'blocks/example.ts')};
-      if (args[0] === 'push') return '';
+      if (args[0] === 'ls-remote') {
+        if (${remoteError}) throw new Error('ls-remote unavailable');
+        return ${JSON.stringify(remoteTip)};
+      }
+      if (args[0] === 'merge-base') {
+        if (${JSON.stringify(ancestor)} !== true) throw Object.assign(new Error('not a proven ancestor'), { status: ${ancestor === 'unreadable' ? 128 : 1} });
+        return '';
+      }
+      if (args[0] === 'push') return ${refusePush} ? execFileSync('sh', [${JSON.stringify(hook)}], { encoding: 'utf8' }) : '';
       if (args[0] === 'show') throw new Error('no ready config');
       return '';
     }; syncBuiltinESMExports(); register(${JSON.stringify(pathToFileURL(loader).href)});`);
@@ -71,7 +82,7 @@ function run({ check = true, fail = false, override = '', count = 15, exempt = f
     { cwd: dir, env: { ...process.env, TMPDIR: dir, WE_POLICY_CASCADE_LOG: '0' },
       encoding: 'utf8', timeout: 30_000, maxBuffer: 2 * 1024 * 1024 });
     if (!child.stdout.trim()) throw new Error(`CLI ${child.status}: ${child.stderr}`);
-    return { status: child.status, result: JSON.parse(child.stdout.trim().split('\n').at(-1)),
+    return { status: child.status, stderr: child.stderr, result: JSON.parse(child.stdout.trim().split('\n').at(-1)),
       effects: readFileSync(trace, 'utf8').trim().split('\n').map(s => JSON.parse(s)) };
   } finally { rmSync(dir, { recursive: true, force: true }); }
 }
@@ -133,5 +144,65 @@ describe('pr-land pre-push checkpoint', () => {
     const { status, result } = run({ override, exempt: override === 'exempt' });
     expect(status).toBe(0); expect(result.reason).toBe('check-ok');
     expect(result.detail).not.toContain('pr-limit');
+  });
+});
+
+describe('pr-land lane publish remote-tip check', () => {
+  const sha = 'a'.repeat(40);
+  const different = 'a'.repeat(39) + 'b';
+  const tip = value => `${value}\trefs/heads/lane/preflight`;
+  const publish = options => run({ check: false, count: 0, ...options });
+  const pushes = effects => effects.filter(([cmd, args]) => cmd === 'git' && args[0] === 'push');
+
+  it('origin equals HEAD: skips push even with a refusing hook and reaches PR creation', () => {
+    const { effects, stderr } = publish({ remoteTip: tip(sha), refusePush: true });
+    expect(pushes(effects)).toEqual([]);
+    expect(effects).toContainEqual(['git', ['ls-remote', 'origin', 'refs/heads/lane/preflight']]);
+    expect(effects.some(([cmd]) => cmd === 'create')).toBe(true);
+    expect(stderr).toContain(`push skipped: origin already at ${sha}`);
+  });
+
+  it('origin behind: attempts the exact non-force push and preserves pre-push refusal', () => {
+    const { status, result, effects, stderr } = publish({ remoteTip: tip(different), refusePush: true });
+    expect(effects).toContainEqual(['git', ['merge-base', '--is-ancestor', different, sha]]);
+    expect(pushes(effects)).toEqual([['git', ['push', 'origin', `${sha}:refs/heads/lane/preflight`]]]);
+    expect(status).toBe(3);
+    expect(result.reason).toBe('push-failed');
+    expect(stderr).toContain('fixture pre-push refuses');
+    expect(effects.some(([cmd]) => cmd === 'create')).toBe(false);
+  });
+
+  it('origin missing: attempts push and reaches PR creation', () => {
+    const { effects } = publish({ remoteTip: '' });
+    expect(pushes(effects)).toHaveLength(1);
+    expect(effects.some(([cmd]) => cmd === 'create')).toBe(true);
+  });
+
+  it.each(['ahead', 'diverged', 'ancestry unreadable'])('origin %s: refuses before push or PR creation', state => {
+    const { status, result, effects } = publish({ remoteTip: tip(different), ancestor: state === 'ancestry unreadable' ? 'unreadable' : false });
+    expect(status).toBe(3);
+    expect(result.reason).toBe('push-failed');
+    expect(pushes(effects)).toEqual([]);
+    expect(effects.some(([cmd]) => cmd === 'create')).toBe(false);
+  });
+
+  it.each([
+    ['failed read', '', true],
+    ['garbage', 'unreadable', false],
+    ['short SHA', tip(sha.slice(0, 8)), false],
+    ['wrong ref', `${sha}\trefs/heads/lane/other`, false],
+    ['ambiguous output', `${tip(sha)}\n${tip(different)}`, false],
+  ])('ls-remote %s: falls through to guarded push', (_name, remoteTip, remoteError) => {
+    const { status, result, effects, stderr } = publish({ remoteTip, remoteError, refusePush: true });
+    expect(pushes(effects)).toHaveLength(1);
+    expect(status).toBe(3);
+    expect(result.reason).toBe('push-failed');
+    expect(stderr).not.toContain('push skipped');
+  });
+
+  it('invalid refSha cannot authorize a skip even when the remote output matches', () => {
+    const { effects, stderr } = publish({ sha: 'a'.repeat(8), remoteTip: tip('a'.repeat(8)), refusePush: true });
+    expect(pushes(effects)).toHaveLength(1);
+    expect(stderr).not.toContain('push skipped');
   });
 });

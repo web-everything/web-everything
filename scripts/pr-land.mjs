@@ -1125,7 +1125,24 @@ async function runCli() {
     detail: ['all pre-push gates passed', ...info].join('\n') }, 0);
 
   // 2. Publish the source commit to the lane ref on origin (guard-safe: lane/*). Never force, no local branch.
-  try { gitC(['push', REMOTE, `${refSha}:refs/heads/${REF}`]); }
+  // Only an exact, readable remote tip can authorize skipping the guarded push.
+  // Failed/malformed remote reads retain the normal push path and its pre-push guard.
+  const remoteHeadRef = `refs/heads/${REF}`;
+  const remoteTipLine = tryGit(['ls-remote', REMOTE, remoteHeadRef]);
+  const remoteTipMatch = /^([0-9a-f]{40})\t([^\r\n]+)$/i.exec(remoteTipLine ?? '');
+  const remoteTip = remoteTipMatch?.[2] === remoteHeadRef ? remoteTipMatch[1] : null;
+  const validRefSha = /^[0-9a-f]{40}$/i.test(refSha);
+  const alreadyPublished = validRefSha && remoteTip === refSha;
+  if (alreadyPublished) {
+    process.stderr.write(`pr-land [${REPO}] · push skipped: ${REMOTE} already at ${refSha}\n`);
+  } else if (validRefSha && remoteTip) {
+    try { gitC(['merge-base', '--is-ancestor', remoteTip, refSha]); }
+    catch {
+      emit({ repo: REPO, merged: false, reason: 'push-failed',
+        detail: pushFailedDetail(`non-fast-forward: ${REMOTE}/${REF} (${remoteTip}) is ahead, diverged, or its ancestry cannot be verified`, { SRC, REF, REMOTE }) }, 3);
+    }
+  }
+  try { if (!alreadyPublished) gitC(['push', REMOTE, `${refSha}:refs/heads/${REF}`]); }
   catch (e) { emit({ repo: REPO, merged: false, reason: 'push-failed', detail: pushFailedDetail(e.message || e, { SRC, REF, REMOTE }) }, 3); }
 
   // 2b. (#2291 — pruned) The PRE-CHECK id-collision self-heal (#2222) that used to run here is now DEAD wiring:
