@@ -5795,3 +5795,15 @@ For fixtures with arbitrary branches, workflow files or cross-repo couples, use
 Keep full commit IDs consistent across listings, live reads, check runs and saved
 refresh records. Resolve the diff at the listed head when a capped commits read
 or a later push intentionally makes the commits tip or live head differ.
+
+
+## Stale automatic merge-gate freezes
+
+Automatic `merge-gate` main-CI freezes require fresh latest-main evidence, never the old job's main diagnostic.
+Only a sole automatic `red-main-freeze` row completed before green main may carry `mergeGateStaleFreeze`;
+the failed conclusion remains intact. The review planner sends it through the existing owed-rerun executor
+and permits independent review work. The timeout transaction reserves once per repository/head/run, including
+rejected or ambiguous requests, and rechecks main plus the live PR/job identity before requesting the job rerun.
+If the reservation is spent or uncertain, inspect merge-gate and the durable timeout retry record before an
+operator retry; automatic ticks must not clear it. `merge-gate-stale-freeze.test.mjs`, `stale-freeze-rerun.test.mjs`
+and the `merge-gate-stale-main-freeze` soak break cover classification, refusal, restart and three-tick recovery.

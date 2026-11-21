@@ -48,6 +48,7 @@ import { tmpdir } from 'node:os';
 import { execFileSync } from 'node:child_process';
 import { join } from 'node:path';
 import { timeoutStateDir, timeoutKey, readTimeoutStates, readTimeoutBudget } from '../conveyor/timeout-retry-state.mjs';
+import { mainCiGreenAfter, readLatestMainCi } from '../lib/merge-gate-hold-class.mjs';
 import { writeJsonAtomic, withFileLock } from '../lib/atomic-json-file.mjs';
 import { execFileSyncThrottled } from '../lib/gh-throttle.mjs';
 import { CONSTELLATION_REPOS } from '../lib/constellation-repos.mjs';
@@ -860,12 +861,13 @@ export function timeoutGithubEffects({ exec = execFileSyncThrottled } = {}) {
       const run = api(`${prefix}/actions/runs/${target.run}`);
       return { head: pull.head.sha, open: pull.state === 'open', repo: run.repository.full_name,
         run: run.id, runHead: run.head_sha, attempt: run.run_attempt, job: job.id,
-        jobRun: job.run_id, jobAttempt: job.run_attempt, status: job.status, conclusion: job.conclusion };
+        jobRun: job.run_id, jobAttempt: job.run_attempt, status: job.status, conclusion: job.conclusion,
+        ...(evidence.staleFreeze ? { jobName: job.name } : {}) };
     },
     request(evidence, target) {
       try {
         // Infra-cancelled: re-run the whole run's cancelled/failed jobs (a cancelled job has no log to re-run from).
-        const endpoint = evidence.infraCancelled ? `actions/runs/${target.run}/rerun-failed-jobs` : `actions/jobs/${target.job}/rerun`;
+        const endpoint = (evidence.infraCancelled || evidence.staleFreeze) ?`actions/runs/${target.run}/rerun-failed-jobs` : `actions/jobs/${target.job}/rerun`;
         const response = String(exec('gh', ['api', '--include', '--method', 'POST',
           `repos/${evidence.repo}/${endpoint}`],
         { encoding: 'utf8', timeout: 30_000, stdio: ['ignore', 'pipe', 'pipe'] }));
@@ -985,10 +987,13 @@ export async function flushTimeoutFollowups({ root = REPO_ROOT, repo, dir = time
  */
 export async function dispatchTimeoutRetry(evidence, {
   root = REPO_ROOT, repo, dir = timeoutStateDir(), effects = timeoutGithubEffects(), fileFollowup, now = Date.now,
+  readMainCi = readLatestMainCi,
 } = {}) {
   const refuse = (reason, extra = {}) => ({ status: 'refused', reason, ...extra });
   if (!evidence?.eligible || evidence.repo !== repo || !evidence.head || !evidence.signature
       || !evidence.jobs?.length) return refuse('invalid-timeout-evidence');
+  if (evidence.staleFreeze && (evidence.jobs.length !== 1
+    || !Number.isSafeInteger(evidence.run) || evidence.jobs[0].run !== evidence.run)) return refuse('invalid-stale-freeze-evidence');
   mkdirSync(dir, { recursive: true });
   const path = join(dir, `${timeoutKey(evidence)}.json`);
   // Import legacy per-signature spend under the new per-head lock on first access.
@@ -999,7 +1004,10 @@ export async function dispatchTimeoutRetry(evidence, {
   };
   let reservation;
   const selected = timeoutTransaction(path, initial, (state) => {
-    if (confirmedTimeouts(state) >= (evidence.infraCancelled ? (evidence.cap ?? 6) : 2)) return { exhausted: true, card: state.card?.payload.num };
+    // Reserve once per head + run, including rejected/ambiguous requests and newer job attempts.
+    // Old persisted timeout state shares this lock; never reinterpret it as an unused reservation.
+    if (evidence.staleFreeze && state.requests.some(r => r.target.run === evidence.run && !r.released)) return { spent: true };
+    if (!evidence.staleFreeze && confirmedTimeouts(state) >= (evidence.infraCancelled ? (evidence.cap ?? 6) : 2)) return { exhausted: true, card: state.card?.payload.num };
     const pending = state.requests.find((r) => r.status === 'pending');
     if (pending) return { pending: structuredClone(pending) };
     const target = evidence.jobs.find((j) => !state.requests.some((r) => r.status === 'confirmed'
@@ -1009,6 +1017,7 @@ export async function dispatchTimeoutRetry(evidence, {
     state.requests.push(reservation);
     return { target };
   });
+  if (selected.spent) return refuse('stale-freeze-rerun-spent; inspect merge-gate and the retry record before operator retry');
   if (selected.exhausted) {
     await fileTimeoutFollowup(path, { root, fileFollowup });
     return refuse('timeout-retries-exhausted', { card: JSON.parse(readFileSync(path, 'utf8')).card?.payload.num });
@@ -1028,11 +1037,18 @@ export async function dispatchTimeoutRetry(evidence, {
     });
   };
   let observed;
+  if (evidence.staleFreeze) {
+    try {
+      if (!mainCiGreenAfter(await readMainCi({ repo }), evidence.completedAt)) {
+        releaseFresh(); return refuse('main-ci-not-green-after-freeze');
+      }
+    } catch { releaseFresh(); return refuse('main-ci-unreadable'); }
+  }
   try { observed = await effects.observe(evidence, target); }
   catch (error) { releaseFresh(); return refuse(`retry-observation-unknown:${error.message}`); }
   const bound = observed.repo === repo && observed.head === evidence.head && observed.runHead === evidence.head
     && observed.run === target.run && observed.jobRun === target.run && observed.job === target.job;
-  if (!bound || !observed.open) { releaseFresh(); return refuse('stale-head-or-job'); }
+  if (!bound || !observed.open || (evidence.staleFreeze && observed.jobName !== 'merge-gate')) { releaseFresh(); return refuse('stale-head-or-job'); }
   if (selected.pending) {
     if (observed.attempt <= target.attempt) return refuse('retry-outcome-pending');
     timeoutTransaction(path, initial, (state) => {
@@ -1059,7 +1075,7 @@ export async function dispatchTimeoutRetry(evidence, {
     if (request.status !== 'confirmed') request.status = ['confirmed', 'rejected'].includes(outcome?.status) ? outcome.status : 'pending';
     request.outcome = outcome?.status === 'confirmed' ? 'API accepted; retry result not yet observed' : (outcome?.reason ?? 'API outcome unknown');
   });
-  await fileTimeoutFollowup(path, { root, fileFollowup });
+  if (!evidence.staleFreeze) await fileTimeoutFollowup(path, { root, fileFollowup });
   return outcome?.status === 'confirmed' ? { status: 'requested', head: evidence.head, run: target.run, job: target.job, attempt: target.attempt }
     : refuse(outcome?.status === 'rejected' ? 'retry-api-rejected' : 'retry-outcome-pending');
 }
