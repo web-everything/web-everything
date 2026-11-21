@@ -222,6 +222,8 @@ export const LOCK_HOLDERS = Object.freeze(['scripts/lib/atomic-json-file.mjs', '
   'scripts/operations/ci-ghost-rerun.mjs',
   // The ETag eviction stamp writer uses an exclusive `wx` create.
   'scripts/lib/gh-rest-read.mjs',
+  // The runtime build-priority writer serializes installs with an exclusive `wx` lock file.
+  'scripts/operations/build-priority-set-io.mjs',
   // The freeze last-good cache writer reserves its temp file with an exclusive `wx` create before the rename.
   'scripts/lib/freeze-last-good.mjs']);
 /** The imported names that take, renew or give up a hold (`withFileLock`, `withAddGuardLock`, `acquireFixDispatchClaim`,
