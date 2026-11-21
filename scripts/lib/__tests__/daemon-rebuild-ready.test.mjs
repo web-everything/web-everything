@@ -256,7 +256,7 @@ describe('the Git proof of omitted content in the candidate build', () => {
 });
 
 describe('a passed candidate blocked at finalize by a long reader tick is adopted later without re-smoking', () => {
-  it.each(['moved tip', 'retired overlay', 'HEAD mismatch'])('tick-start discards a stale pinned candidate after %s and freshly rebuilds', async (stale) => {
+  const expectStalePinnedCandidateDiscarded = async (stale) => {
     const { originDir, cloneDir, env } = makeFixture();
     env.WE_DAEMON_REBUILD_SKIP_UNRELATED = '0';
     env.WE_DAEMON_OVERLAY_EDGE_RESOLVE = '0';
@@ -308,7 +308,13 @@ describe('a passed candidate blocked at finalize by a long reader tick is adopte
     expect(readReadyCandidate(cloneDir, env)).toBeNull();
     expect(existsSync(join(cloneDir, 'main-later.txt'))).toBe(true);
     expect(gitOk(cloneDir, ['rev-parse', 'HEAD']).trim()).not.toBe(ready.adopt.finalSha);
-  });
+  };
+
+  it('readyBuildVerified refuses a force-pushed pinned sha and tick-start freshly rebuilds the current plan', () => expectStalePinnedCandidateDiscarded('moved tip'));
+
+  it('tick-start discards a stale pinned candidate after its overlay is retired and freshly rebuilds', () => expectStalePinnedCandidateDiscarded('retired overlay'));
+
+  it('tick-start discards a stale pinned candidate after the clone HEAD no longer matches and freshly rebuilds', () => expectStalePinnedCandidateDiscarded('HEAD mismatch'));
 
   it('records it as ready, then the next rebuild adopts it even though main moved again', async () => {
     const { originDir, cloneDir, env } = makeFixture();
