@@ -36,7 +36,9 @@ const HEAD = 'a'.repeat(40);
 const at = (h) => `2026-10-10T${String(h).padStart(2, '0')}:00:00Z`;
 const marker = (h) => ({ author: BOT, createdAt: at(h), body: takeoverMarkerBody({ pr: 7, head: HEAD, attempts: 5, cap: 5, rung: { id: 'x' } }) });
 const advisory = (h) => ({ author: BOT, createdAt: at(h), body: `**⚠️ THIS IS AN ADVISORY REVIEW, NOT A RECORDED VERDICT.** x\n\nNet basis: \`${'0'.repeat(40)}..${HEAD}\`` });
-const pr = (labels = [], comments = [], over = {}) => ({ number: 7, headRefOid: HEAD, baseRefName: 'main', labels: labels.map((name) => ({ name })), comments, ...over });
+const pr = (labels = [], comments = [], over = {}) => ({ number: 7, headRefOid: HEAD, baseRefName: 'main', labels: labels.map((name) => ({ name })), comments,
+  // Readiness needs every required check green, so fixtures default to a green rollup.
+  statusCheckRollup: ['test', 'smoke', 'daemon-soak', 'soak-replay-gate'].map((name) => ({ name, status: 'COMPLETED', conclusion: 'SUCCESS' })), ...over });
 const derive = (o) => derivePrStatusLabel({ humanAt: 99, ...o });
 
 describe('derivePrStatusLabel', () => {
@@ -140,7 +142,7 @@ describe('known merge conflicts (#5950)', () => {
   const conflicts = [{ mergeable: 'CONFLICTING' }, { mergeStateStatus: 'DIRTY' },
     { mergeable: 'CONFLICTING', mergeStateStatus: 'CLEAN' }, { mergeable: 'MERGEABLE', mergeStateStatus: 'DIRTY' }];
   const subject = (fields) => pr(['review:accepted', 'ready-to-merge', 'status:ready-to-merge'], [], {
-    statusCheckRollup: [check('test')], ...fields,
+    statusCheckRollup: ['test', 'smoke', 'daemon-soak', 'soak-replay-gate'].map((n) => check(n)), ...fields,
   });
   it.each(conflicts)('explicit conflict overrides acceptance and active red-team review: %j', fields => {
     for (const reviewStatus of [null, { role: 'review', state: 'reviewing' }, { role: 'review', state: 'review-stalled' }]) {
@@ -177,6 +179,7 @@ describe('known merge conflicts (#5950)', () => {
     const ensureLabel = vi.fn();
     const run = (snapshot) => tagReviewStatus({ pr: 7, repo: 'web-everything/web-everything', agents: [],
       prState: snapshot, currentLabels: snapshot.labels, planRows: [], readFixClaim: () => null,
+      requiredChecks: ['test', 'smoke', 'daemon-soak', 'soak-replay-gate'],
       provider: { ensureLabel, setLabels }, legacyReviewStatus: false });
     expect(run(subject(fields)).prStatus).toBe('status:conflict');
     expect(setLabels).toHaveBeenCalledWith('web-everything/web-everything', 7,
@@ -250,12 +253,12 @@ describe('truthful stage regressions', () => {
     const state = derive({ pr: subject });
     expect(state).toBe('ci-red');
     expect(planPrStatusLabel({ state, currentLabels: subject.labels })).toEqual({ add: 'status:ci-red', remove: ['status:ready-to-merge'] });
-    expect(derive({ pr: { ...subject, statusCheckRollup: [check('test'), check('review-gate', 'FAILURE')] } })).toBe('ready-to-merge');
+    expect(derive({ pr: { ...subject, statusCheckRollup: [check('test'), check('review-gate', 'FAILURE')] }, requiredChecks: ['test'] })).toBe('ready-to-merge');
   });
   it('required checks handle context failures, injected requirements and live repair precedence', () => {
     for (const state of ['FAILURE', 'ERROR']) expect(derive({ pr: pr([], [], { statusCheckRollup: [{ context: 'test', state }] }) })).toBe('ci-red');
     expect(derive({ pr: pr([], [], { statusCheckRollup: [check('custom', 'CANCELLED')] }), requiredChecks: ['custom'] })).toBe('ci-red');
-    for (const conclusion of ['SUCCESS', 'SKIPPED', 'NEUTRAL']) expect(derive({ pr: pr(['review:accepted'], [], { statusCheckRollup: [check('test', conclusion)] }) })).toBe('ready-to-merge');
+    for (const conclusion of ['SUCCESS', 'SKIPPED', 'NEUTRAL']) expect(derive({ pr: pr(['review:accepted'], [], { statusCheckRollup: [check('test', conclusion)] }), requiredChecks: ['test'] })).toBe('ready-to-merge');
     expect(derive({ pr: pr(['ci:failed']), rows: [{ kind: 'review' }] })).toBe('ci-red');
     expect(derive({ pr: pr(['review:accepted', 'ci:failed']), reviewStatus: { role: 'ci-heal', state: 'healing-ci' } })).toBe('fixing');
     expect(derive({ pr: pr(['ci:failed']), reviewStatus: { role: 'ci-heal', state: 'needs-human' } })).toBe('ci-red');
