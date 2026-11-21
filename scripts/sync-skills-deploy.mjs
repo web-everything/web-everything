@@ -93,7 +93,8 @@ export function listFilesRecursive(dir) {
 
 /** The files `git` tracks under `srcDir`, as paths relative to `srcDir`. */
 export function gitTrackedFiles(srcDir, repoRoot = REPO_ROOT) {
-  const relToRepo = path.relative(repoRoot, srcDir);
+  // Git discovers physical repo paths; source roots and explicit repo roots may use symlink aliases.
+  const relToRepo = path.relative(fs.realpathSync(repoRoot), fs.realpathSync(srcDir));
   const out = execFileSync('git', ['ls-files', '--', relToRepo], { cwd: repoRoot, encoding: 'utf8' });
   return out.split('\n').filter(Boolean).map((p) => path.relative(relToRepo, p));
 }

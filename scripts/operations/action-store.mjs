@@ -38,6 +38,16 @@ export function createActionStore({ root = resolveCoordinationRoot(), fs = nativ
       return attempts(resource);
     });
   });
+  // Legacy-alias directories (old repo slug) of THIS resource are its own unresolved history: fail closed.
+  // Directories of other resources are not scanned, so they cannot block this claim.
+  const assertNoAliasDirs = (resource) => io(dir, () => {
+    for (const name of ensure()) {
+      let key;
+      // An undecodable or unparseable name could be an alias of THIS resource: refuse (fail closed).
+      try { key = parseResource(decodeURIComponent(name)).resource; } catch { throw new Error('Undecodable resource directory'); }
+      if (key === resource && encodeURIComponent(key) !== name) throw new Error('Noncanonical resource directory');
+    }
+  });
   const write = (record) => io(pathFor(record.resource, record.attempt), () => {
     assertActionRecord(record);
     const path = pathFor(record.resource, record.attempt), tmp = `${path}.${randomUUID()}.tmp`;
@@ -84,8 +94,8 @@ export function createActionStore({ root = resolveCoordinationRoot(), fs = nativ
     if (attempt !== undefined) throw new TypeError('Attempt numbers are allocated by the action store');
     const identity = parseResource(resource);
     const allocate = () => {
-      // A corrupt unrelated resource also blocks dispatch. Partial visibility is unsafe.
-      list();
+      // Only this resource's own history gates its claim; unrelated directories are not scanned.
+      assertNoAliasDirs(identity.resource);
       const rows = attempts(identity.resource), latest = rows.at(-1);
       if (latest && latest.state !== 'terminal') {
         if (isExpired(latest, now()) && reconcilePort) {

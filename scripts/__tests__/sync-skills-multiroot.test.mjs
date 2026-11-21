@@ -5,12 +5,12 @@
  *   --check reports an untracked (never-committed) new skill as drift. Each root is a real tmp git repo.
  */
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
-import { mkdtempSync, rmSync, mkdirSync, writeFileSync, existsSync, readFileSync } from 'node:fs';
+import { mkdtempSync, rmSync, mkdirSync, writeFileSync, existsSync, readFileSync, symlinkSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, dirname, delimiter, resolve } from 'node:path';
 import { execFileSync, spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
-import { buildPlans, parseArgs } from '../sync-skills-deploy.mjs';
+import { buildPlans, gitTrackedFiles, parseArgs } from '../sync-skills-deploy.mjs';
 import * as skillsSync from '../sync-skills-deploy.mjs';
 
 const MODULE_PATH = join(dirname(fileURLToPath(import.meta.url)), '..', 'sync-skills-deploy.mjs');
@@ -44,6 +44,68 @@ function runCli(args, overrides = {}) {
   Object.assign(env, overrides);
   return spawnSync(process.execPath, [MODULE_PATH, ...args], { env, encoding: 'utf8', timeout: 20_000 });
 }
+
+describe('symlinked source roots', () => {
+  function aliasRoot(source, shape) {
+    const alias = join(tmp, 'checkout alias');
+    symlinkSync(shape === 'checkout' ? source.repo : source.root, alias, 'dir');
+    return shape === 'checkout' ? join(alias, 'skills') : alias;
+  }
+
+  it.each(['root', 'checkout'])('plans primary and extra roots through a %s symlink', (shape) => {
+    const primary = gitRepoWithSkills('we', ['alpha']);
+    const extra = gitRepoWithSkills('ops', ['beta']);
+    const alias = aliasRoot(extra, shape);
+    const destRoot = join(tmp, 'dest');
+    const control = buildPlans({ srcRoot: primary.root, extraRoots: [extra.root], destRoot, all: true });
+    const extraPlans = buildPlans({ srcRoot: primary.root, extraRoots: [alias], destRoot, all: true });
+    const primaryPlans = buildPlans({ srcRoot: alias, destRoot, all: true });
+    expect(extraPlans.map(({ name, actions, untracked }) => ({ name, actions, untracked })))
+      .toEqual(control.map(({ name, actions, untracked }) => ({ name, actions, untracked })));
+    expect(primaryPlans[0]).toMatchObject({ name: 'beta', actions: control[1].actions });
+  });
+
+  it('uses physical paths for both arguments of the shared tracked-file reader', () => {
+    const source = gitRepoWithSkills('we', ['alpha']);
+    const alias = aliasRoot(source, 'checkout');
+    expect(gitTrackedFiles(join(alias, 'alpha'), dirname(alias))).toEqual(['SKILL.md']);
+  });
+
+  it.each([
+    ['primary', 'root'], ['primary', 'checkout'],
+    ['env', 'root'], ['env', 'checkout'],
+    ['CLI', 'root'], ['CLI', 'checkout'],
+  ])('CLI deploys and checks a %s source through a %s symlink', (kind, shape) => {
+    const primary = gitRepoWithSkills('we', ['alpha']);
+    const extra = gitRepoWithSkills('ops', ['beta']);
+    const alias = aliasRoot(kind === 'primary' ? primary : extra, shape);
+    const overrides = { WE_SKILLS_SRC_ROOT: kind === 'primary' ? alias : primary.root };
+    if (kind === 'env') overrides.WE_SKILLS_EXTRA_ROOTS = alias;
+    const flags = ['--all', '--json', ...(kind === 'CLI' ? [`--root=${alias}`] : [])];
+    const deployed = runCli(flags, overrides);
+    expect(deployed.stderr).toBe('');
+    expect(deployed.status).toBe(0);
+    expect(JSON.parse(deployed.stdout)).toMatchObject({ ok: true, untrackedSkills: [] });
+    expect(readFileSync(join(tmp, 'dest', 'alpha', 'SKILL.md'), 'utf8')).toBe('# alpha\n');
+    if (kind !== 'primary') expect(readFileSync(join(tmp, 'dest', 'beta', 'SKILL.md'), 'utf8')).toBe('# beta\n');
+    const checked = runCli([...flags, '--check'], overrides);
+    expect(checked.stderr).toBe('');
+    expect(checked.status).toBe(0);
+    expect(JSON.parse(checked.stdout)).toMatchObject({ ok: true, drifted: 0, untrackedSkills: [] });
+  });
+
+  it('CLI discovers a symlinked default ops checkout', () => {
+    const source = gitRepoWithSkills('ops', ['ops-probe']);
+    const workspace = join(tmp, 'home', 'workspace');
+    mkdirSync(workspace, { recursive: true });
+    symlinkSync(source.repo, join(workspace, 'plateau-ops'), 'dir');
+    const deployed = runCli(['--all', '--json', '--only=ops-probe']);
+    expect(deployed.stderr).toBe('');
+    expect(deployed.status).toBe(0);
+    expect(JSON.parse(deployed.stdout)).toMatchObject({ ok: true, untrackedSkills: [] });
+    expect(readFileSync(join(tmp, 'dest', 'ops-probe', 'SKILL.md'), 'utf8')).toBe('# ops-probe\n');
+  });
+});
 
 describe('resolveRoots branch contract', () => {
   it('selects the repository source and the exact default ops root when present', () => {

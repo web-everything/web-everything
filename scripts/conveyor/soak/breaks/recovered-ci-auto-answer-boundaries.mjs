@@ -38,6 +38,7 @@ export default {
       actions: { runId: 700, attempt: id === 101 ? 1 : 2 },
       completed_at: id === 101 ? '2026-10-13T11:59:00Z' : '2026-10-13T12:01:00Z' });
     const pr = { number: 5981, headRefOid: head, headRefName: 'lane/r123-auto-proceed', baseRefName: 'main',
+      rowsComplete: true, rowsHead: head,
       labels: [], files: [], body: '', comments,
       statusCheckRollup: [{ name: 'test', status: 'COMPLETED', conclusion: 'SUCCESS' }] };
     const writes = [], violations = [];
