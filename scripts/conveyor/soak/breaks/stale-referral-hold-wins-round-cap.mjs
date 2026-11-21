@@ -9,9 +9,10 @@ const [a, b, scenario] = process.argv.slice(1);
 const { detectRoundCap } = await import(a); const { AUTOMATION_LOGINS } = await import(b);
 const live = 'b'.repeat(40);
 const mk = (body, t) => ({ author: { login: AUTOMATION_LOGINS[0] }, createdAt: t, body });
-const named = scenario === 'later-verdict' ? live : 'a'.repeat(40);
+const named = scenario === 'stale-head' ? 'a'.repeat(40) : live;
 const comments = [mk('review paused: head ' + named + ' was already reviewed\\n\\nWaiting on your ruling (block, card or not-real):\\n- \`src/a.mjs:5\` — x\\n\\n<!-- review-referral-hold: a1b5166bcd74 -->', '2026-11-19T22:05:00Z')];
 if (scenario === 'later-verdict') comments.push(mk('🔁 review — changes requested\\n\\nhead ' + live + '\\n-\`src/a.mjs:5\` — not real', '2026-11-19T23:00:00Z'));
+if (scenario === 'canonical-verdict') comments.push(mk('🔁 review — changes requested\\n\\nRecorded by babysit-2019.\\n\\nhead ' + live + '\\n- \`src/a.mjs:5\` — not real', '2026-11-19T23:00:00Z'));
 process.stdout.write(JSON.stringify(detectRoundCap({ comments, pr: 14, head: live, state: 'at-round-limit' })));`;
 
 function probe(root, scenario = 'stale-head') {
@@ -29,8 +30,12 @@ export default {
   fixPresent(root) { try { return probe(root, 'later-verdict')?.trigger === 'review-cap'; } catch { return false; } },
   async run({ sourceRoot = ROOT } = {}) {
     try {
-      const cap = probe(sourceRoot);
-      return { violations: cap?.trigger === 'review-cap' ? [] : [`stale hold won: ${JSON.stringify(cap)}`] };
+      const violations = [];
+      for (const scenario of ['stale-head', 'canonical-verdict']) {
+        const cap = probe(sourceRoot, scenario);
+        if (cap?.trigger !== 'review-cap') violations.push(`${scenario} hold won: ${JSON.stringify(cap)}`);
+      }
+      return { violations };
     } catch (error) { return { violations: [error.message] }; }
   },
   judge: report => report.violations,

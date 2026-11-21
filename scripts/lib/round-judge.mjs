@@ -146,7 +146,8 @@ function holdSettled(list, holdIdx, live) {
   return list.slice(holdIdx + 1).some((c) => {
     if (!isTrustedMarkerAuthor(c)) return false;
     const b = bodyOf(c).trimStart();
-    if (!b.startsWith('🔁 review — changes requested') || /Recorded by /i.test(b.slice(0, 400))) return false;
+    // Canonical reviewer verdicts also say "Recorded by"; exclude only the non-review actors used by extractRounds.
+    if (!b.startsWith(REVIEW_CHANGES_PREFIX) || /Recorded by (?:parked-pr-conflict|agent \(red-team gate\)|chalbert|auto-policy)/i.test(b.slice(0, 400))) return false;
     // Only the comment's own head field counts (a line `head <sha>` or `head: <sha>`); quoted text elsewhere does not.
     const fields = [...b.matchAll(/^head:? ([^\s]+)[ \t]*$/gim)].map((m) => m[1].toLowerCase());
     return fields.length > 0 && fields.every((x) => x === live);

@@ -4,6 +4,7 @@
 import { describe, expect, it } from 'vitest';
 import { detectRoundCap, extractRounds, formatJudgeLine, isGuardPath, judgeRound, parseReviewFindings, sameFinding, validateVerdict } from '../round-judge.mjs';
 import { redTeamGateMarker } from '../red-team-gate.mjs';
+import { buildVerdictComment } from '../../review-set-label.mjs';
 
 const PR = 900;
 const H = (n) => String(n).repeat(40).slice(0, 40);
@@ -374,8 +375,13 @@ describe('a later push or ruling settles a referral hold', () => {
   });
   it('a later reviewer verdict comment settles the hold', () => {
     const h = holdFor(H(9));
-    const verdict = bot(`🔁 review — changes requested\n\nhead ${H(9)}\n- \`src/a.mjs:5\` — not real here`, at());
+    const verdict = bot(`🔁 review — changes requested\n\nRecorded by babysit-2019.\n\nhead ${H(9)}\n- \`src/a.mjs:5\` — not real here`, at());
     expect(detectRoundCap({ comments: [h, verdict], pr: PR, head: H(9), state: 'at-round-limit' })).toMatchObject({ trigger: 'review-cap' });
+  });
+  it.each(['', 'unattended review-loop'])('a production verdict with channel %j settles the hold', (channel) => {
+    const verdict = bot(buildVerdictComment({ to: 'changes', actor: 'babysit-2019', channel,
+      body: `head: ${H(9)}\n- \`src/a.mjs:5\` — not real here` }), at());
+    expect(detectRoundCap({ comments: [holdFor(H(9)), verdict], pr: PR, head: H(9), state: 'at-round-limit' })).toMatchObject({ trigger: 'review-cap' });
   });
   it('a hold on the current head with no later ruling still wins', () => {
     expect(detectRoundCap({ comments: [holdFor(H(9))], pr: PR, head: H(9), state: 'at-round-limit' })).toMatchObject({ trigger: 'referral-hold' });
@@ -400,6 +406,16 @@ describe('referral hold settle: audit negatives', () => {
     const bounce = bot('🔁 review — changes requested\n\nRecorded by parked-pr-conflict', at());
     const other = bot(`🔁 review — changes requested\n\nhead ${H(1)}`, at());
     expect(detectRoundCap({ comments: [h, bounce, other], pr: PR, head: H(9), state: 'at-round-limit' })).toMatchObject({ trigger: 'referral-hold' });
+  });
+  it.each(['parked-pr-conflict-watch', 'agent (red-team gate)', 'auto-policy', 'chalbert'])('a live-head non-review verdict from %s does not settle', (actor) => {
+    const verdict = bot(buildVerdictComment({ to: 'changes', actor, body: `head ${H(9)}` }), at());
+    expect(detectRoundCap({ comments: [holdFor(H(9)), verdict], pr: PR, head: H(9), state: 'at-round-limit' })).toMatchObject({ trigger: 'referral-hold' });
+  });
+  it('an untrusted non-bot author cannot settle with a canonical reviewer verdict', () => {
+    const login = 'outside-contributor';
+    const verdict = { author: { login }, createdAt: at(),
+      body: buildVerdictComment({ to: 'changes', actor: 'babysit-2019', body: `head ${H(9)}` }) };
+    expect(detectRoundCap({ comments: [holdFor(H(9)), verdict], pr: PR, head: H(9), state: 'at-round-limit' })).toMatchObject({ trigger: 'referral-hold' });
   });
   it('an older live-head hold still wins behind a newer stale-head hold', () => {
     expect(detectRoundCap({ comments: [holdFor(H(9)), holdFor(H(1))], pr: PR, head: H(9), state: 'at-round-limit' })).toMatchObject({ trigger: 'referral-hold' });
