@@ -403,6 +403,32 @@ export function formatRedMainFreeze(redMain) {
 /** How many of main's CI runs to read: enough to find the last green one behind a short red streak. */
 const MAIN_CI_RUNS = 30;
 
+/** Reuse is neither red code nor a fresh green execution. Prove it per run, so a
+ * marker cannot hide another failure on the same SHA. Unknown evidence stays red.
+ */
+function withoutReusedMainPushes(runs, { repo, exec }) {
+  let reads = 0;
+  return runs.filter((run) => {
+    // Reruns may conceal a genuine earlier failure; retain their existing hold.
+    if (run.event !== 'push' || run.status !== 'completed' || run.conclusion !== 'failure'
+      || (run.attempt != null && Number(run.attempt) !== 1)
+      || !Number.isSafeInteger(run.databaseId) || run.databaseId <= 0 || reads >= MAIN_CI_RUNS) return true;
+    reads += 1;
+    try {
+      const page = JSON.parse(exec('gh', ['api', `repos/${repo}/actions/runs/${run.databaseId}/attempts/1/jobs?per_page=100`],
+        { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], maxBuffer: 8 * 1024 * 1024, timeout: 60_000 }) || 'null');
+      const jobs = page?.jobs;
+      if (!Array.isArray(jobs) || !jobs.length || page.total_count !== jobs.length) return true;
+      const markers = jobs.filter(job => job?.name === 'main-execution');
+      const reused = markers.length === 1 && markers[0].conclusion === 'failure'
+        && jobs.every(job => job?.status === 'completed'
+          && (job.run_attempt == null || Number(job.run_attempt) === 1)
+          && (job === markers[0] || ['success', 'skipped'].includes(job.conclusion)));
+      return !reused;
+    } catch { return true; }
+  });
+}
+
 /**
  * MAIN'S OWN CI STATUS, read straight from GitHub (operator ruling 2026-10-11, PR 4715): main's CI workflow runs on
  * the default branch, judged by the same pure rule the red-main owner uses (`mainRedState`). A freeze publisher that
@@ -435,7 +461,16 @@ export function readMainCiFact({ repo, defaultBranch = 'main', exec = execFileSy
     if (rerun) return { source, error: `main CI run ${rerun.databaseId ?? '?'} is being re-run (attempt ${Number(rerun.attempt)}) — verdict pending` };
   }
   if (Array.isArray(runs)) {
-    try { markInfraOnlyRuns(runs, { repo, exec }); } catch { /* unreadable job evidence stays red */ }
+    // Both proofs inspect the same attempt's jobs. Share successful reads only
+    // within this fact read; the final admission recheck must fetch fresh evidence.
+    const jobPages = new Map();
+    const readJobs = (command, args, options) => {
+      const key = JSON.stringify(args);
+      if (!jobPages.has(key)) jobPages.set(key, exec(command, args, options));
+      return jobPages.get(key);
+    };
+    runs = withoutReusedMainPushes(runs, { repo, exec: readJobs });
+    try { markInfraOnlyRuns(runs, { repo, exec: readJobs }); } catch { /* unreadable job evidence stays red */ }
   }
   const st = mainRedState(runs);
   if (st.status === 'unknown') return { source, error: `main CI status unknown (${st.reason})` };
