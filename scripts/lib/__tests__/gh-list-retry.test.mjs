@@ -4,11 +4,29 @@
  * (never an empty list / "0 owed") and, after several in a row, raises a `gh-list-failed` health event.
  */
 import { describe, it, expect, vi } from 'vitest';
-import { GH_LIST_BACKOFF_MS, listBackoffFromEnv, withListRetry } from '../gh-list-retry.mjs';
+import { GH_LIST_BACKOFF_MS, listBackoffFromEnv, withListRetry, withListRetryAsync } from '../gh-list-retry.mjs';
+import { mkdtempSync, readFileSync, writeFileSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 
 const e504 = () => Object.assign(new Error('gh pr list failed'), { stderr: 'HTTP 504: 504 Gateway Timeout (https://api.github.com/graphql)' });
 const wrapped504 = () => Object.assign(new Error('open-PR list unreadable'), { cause: e504() });
 const mk = () => ({ sleep: vi.fn(), events: [], streaks: new Map() });
+it.each(['failure', 'success'])('preserves both persistent repo streaks when %s completes first', async (first) => {
+  const root = mkdtempSync(join(tmpdir(), 'list-interleave-'));
+  try {
+    const path = join(root, 'gh-list-streaks.json');
+    writeFileSync(path, JSON.stringify({ 'o/fail:pr-list': 2, 'o/ok:pr-list': 2 }));
+    const options = { env: { WE_DAEMON_EVENTS: join(root, 'events.jsonl') }, attempts: 1, onEvent: vi.fn() };
+    let reject, resolve;
+    const failure = withListRetryAsync(() => new Promise((_resolve, r) => { reject = r; }), { ...options, repo: 'o/fail' });
+    const success = withListRetryAsync(() => new Promise(r => { resolve = r; }), { ...options, repo: 'o/ok' });
+    const failed = expect(failure).rejects.toThrow('gh pr list failed');
+    if (first === 'failure') { reject(e504()); await failed; resolve([]); await success; }
+    else { resolve([]); await success; reject(e504()); await failed; }
+    expect(JSON.parse(readFileSync(path, 'utf8'))).toEqual({ 'o/fail:pr-list': 3 });
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
 const run = (fn, o, extra = {}) => withListRetry(fn, { repo: 'o/r', op: 'reconcile', sleep: o.sleep,
   streaks: o.streaks, persist: false, onEvent: ev => o.events.push(ev), ...extra });
 

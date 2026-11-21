@@ -607,7 +607,7 @@ export function postRedTeamPublicationHold({ repo, pr, headSha, held, reason = '
  * wins, ordered by id. Absent = no hold. An unreadable read, or a full page with no decision, holds.
  * `combined` is the per-context latest summary; `statuses` the full newest-first list, read only when the context
  * exists. */
-export function evaluateRedTeamPublicationHold({ pr, combined, statuses, historyComplete, isTrusted = isTrustedMarkerAuthor } = {}) {
+export function evaluateRedTeamPublicationHold({ pr, combined, statuses, historyComplete, isTrusted = isTrustedMarkerAuthor, strictSummary = false } = {}) {
   const context = redTeamPublicationContext(pr);
   if (!context) return failure('red-team publication hold PR number missing or invalid');
   const latest = combined?.statuses;
@@ -620,6 +620,11 @@ export function evaluateRedTeamPublicationHold({ pr, combined, statuses, history
     return failure('red-team publication hold history unreadable; operator must inspect commit statuses');
   const complete = paged ? historyComplete : statuses.length < 100;
   const ordered = statuses.filter(status => status.context === context).sort((a, b) => b.id - a.id);
+  // The per-context summary is the newest status: a non-success there (a newer hold) always beats an older success in the list.
+  // Opt-in (`strictSummary`, the label settle): the merge gate's own evaluator keeps trusting the id-ordered history.
+  const summarized = latest.find(status => status?.context === context);
+  if (strictSummary && summarized?.state !== 'success')
+    return failure(`red-team round not confirmed published (GitHub-visible hold, ${message(summarized?.state)}); retry check publication before enqueue`);
   // The summary says this PR's context exists, so the history must show it; an empty or contradictory history
   // (e.g. a failure in the summary but none in the list) is unreadable evidence, never a clear.
   for (const status of ordered) {
@@ -739,7 +744,7 @@ export function clearLivePublicationHold({ repo, pr, headSha, gh = runGhSync, en
   return posted.ok ? { ok: true, cleared: true } : posted;
 }
 
-export function readRedTeamPublicationHoldFact({ repo, pr, headSha, gh = runGhSync, isTrusted } = {}) {
+export function readRedTeamPublicationHoldFact({ repo, pr, headSha, gh = runGhSync, isTrusted, strictSummary = false } = {}) {
   const context = redTeamPublicationContext(pr);
   if (!validHead(headSha) || !/^[\w.-]+\/[\w.-]+$/.test(repo ?? '') || !context)
     return failure('invalid red-team publication hold identity (repo, PR number and head required)');
@@ -751,7 +756,7 @@ export function readRedTeamPublicationHoldFact({ repo, pr, headSha, gh = runGhSy
     const history = present ? readStatusHistory({ repo, headSha, gh, context,
       decisive: status => status.state !== 'success' || trusted({ user: { login: String(status.creator?.login ?? '') } }) }) : undefined;
     return evaluateRedTeamPublicationHold({ pr, combined, statuses: history?.statuses, historyComplete: history?.complete,
-      ...(isTrusted ? { isTrusted } : {}) });
+      strictSummary, ...(isTrusted ? { isTrusted } : {}) });
   } catch (error) { return failure(`red-team publication hold unreadable: ${message(error)}`); }
 }
 
