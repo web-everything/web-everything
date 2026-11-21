@@ -1,6 +1,7 @@
 import { it, expect, vi } from 'vitest';
 import { execFileSync } from 'node:child_process';
 import * as dispatch from '../verify-dispatch.mjs';
+import { loadVerifySettingsFile, resolveVerifySettings } from '../../lib/verify-settings.mjs';
 import { verifyStartBody, verifyFinishBody } from '../../lib/lane-verify.mjs';
 
 export function ceilingFixture(overrides = {}) {
@@ -88,6 +89,23 @@ it('ceiling recovery still accepts default sharding and timeout flags and preser
   expect(dispatch.requeueGateCeiling(f.options)).toBe(true);
   expect(f.enqueue.mock.calls[0][0].suites).toBe("npx vitest run 'own.test.mjs'" + tail);
 });
+it.each([
+  { suites: 'npm run test:unit' },
+  { suites: 'npx vitest run --passWithNoTests' },
+  { suites: 'npx vitest related --run' },
+  { suites: 'echo own.test.mjs && npm run check:standards' },
+  { gateUncapped: true },
+  { gateExplicit: true },
+])('ceiling recovery leaves infrastructure failure intact for a nonreplaceable gate: %j', fields => {
+  const f = ceilingFixture();
+  Object.assign(f.marker(), fields);
+  const original = structuredClone(f.marker());
+  f.options.fallbackGate = vi.fn(f.options.fallbackGate);
+  expect(dispatch.requeueGateCeiling(f.options)).toBe(false);
+  expect(f.options.fallbackGate).not.toHaveBeenCalled();
+  expect(f.enqueue).not.toHaveBeenCalled();
+  expect(f.marker()).toEqual(original);
+});
 it.each(['queue', undefined])('no requeue for queue-phase timeouts or external kills (%s)', timedOutPhase => {
   const f = ceilingFixture({ timedOutPhase });
   expect(dispatch.requeueGateCeiling(f.options)).toBe(false);
@@ -112,13 +130,13 @@ it('unreadable marker or failed marker write refuses enqueue', () => {
   expect(f.enqueue).not.toHaveBeenCalled();
 });
 it('marker writers preserve requeue, selection and explicit uncapped audit fields', () => {
-  const audit = { selection: { status: 'capped-fallback', tests: 1 }, requeue: { afterJob: 'job-1' }, gateUncapped: true };
+  const audit = { selection: { status: 'capped-fallback', tests: 1 }, requeue: { afterJob: 'job-1' }, gateUncapped: true, gateExplicit: true };
   const start = verifyStartBody({ sha: 'head', ...audit });
   expect(start).toMatchObject(audit);
   expect(verifyFinishBody(start, { exitCode: 0 })).toMatchObject(audit);
 });
 
-it('the in-process sweep retries once, then records only infrastructure failure', async () => {
+it('the in-process sweep uses tool settings despite lane overrides, retries once, then records only infrastructure failure', async () => {
   const { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync } = await import('node:fs');
   const { join } = await import('node:path');
   const { tmpdir } = await import('node:os');
@@ -135,6 +153,8 @@ it('the in-process sweep retries once, then records only infrastructure failure'
     git(['branch', 'origin/main']);
     const head = git(['rev-parse', 'HEAD']);
     writeFileSync(join(lane, 'own.test.mjs'), '// changed');
+    mkdirSync(join(lane, 'scripts'));
+    writeFileSync(join(lane, 'scripts', 'verify-settings.json'), JSON.stringify({ relatedMaxTests: 1, alwaysRunTests: ['lane-guard.test.mjs'] }));
     const markerPath = join(lane, '.git', '.lane-verify');
     const read = () => JSON.parse(readFileSync(markerPath, 'utf8'));
     writeFileSync(markerPath, JSON.stringify({ sha: head, status: 'running', startedAt: 'request', suites: "npx vitest run 'own.test.mjs'", selection: { status: 'complete' } }));
@@ -147,6 +167,10 @@ it('the in-process sweep retries once, then records only infrastructure failure'
     expect(first.failures).toEqual([]);
     expect(read()).toMatchObject({ status: 'running', selection: { status: 'capped-fallback' }, requeue: { afterSha: head } });
     expect(read().requeue.afterJob).toBeTruthy();
+    const settings = resolveVerifySettings({ fileConfig: loadVerifySettingsFile(), env: process.env }).values;
+    expect(read().selection.maxTests).toBe(settings.relatedMaxTests);
+    expect(read().suites).not.toContain('lane-guard.test.mjs');
+    for (const guard of settings.alwaysRunTests) expect(read().suites).toContain(guard);
     const second = await dispatch.runVerifyDispatch({ poolRoot: root, spawnGate });
     expect(second.failures).toHaveLength(1);
     expect(read().status).toBe('infrastructure-failure');
@@ -199,4 +223,28 @@ it('detached job settlement requeues once and durable job dedupe survives a lost
     expect(store.list().records).toHaveLength(2);
     expect(JSON.parse(readFileSync(markerPath, 'utf8')).requeue.afterJob).toBe(first.id);
   } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+it.each([
+  { dispatched: false, flags: { gate: 'npx vitest run own.test.mjs' }, prior: null, explicit: true },
+  { dispatched: false, flags: {}, prior: { sha: 'head', gateExplicit: true }, explicit: false },
+  { dispatched: true, flags: { gate: 'npx vitest run own.test.mjs' }, prior: { sha: 'head', gateExplicit: true }, explicit: true },
+  { dispatched: true, flags: { gate: 'npx vitest run own.test.mjs' }, prior: { sha: 'head' }, explicit: false },
+])('the verify-lane marker producer preserves explicit/default provenance: %j', async ({ dispatched, flags, prior, explicit }) => {
+  const { readFileSync } = await import('node:fs');
+  const { runInNewContext } = await import('node:vm');
+  const source = readFileSync('scripts/verify-lane.mjs', 'utf8');
+  const auditSource = source.slice(source.indexOf('const priorAudit = readMarker();'), source.indexOf('SELECTION = summarizeSelection'));
+  const audit = runInNewContext(auditSource + '\ngateAudit', {
+    readMarker: () => prior, DISPATCHED_RUN: dispatched, headSha: 'head', flags, explicitSelection: undefined, resolvedGate: undefined,
+  });
+  const marker = verifyFinishBody(verifyStartBody({ sha: 'head', suites: 'npx vitest run own.test.mjs', ...audit }), {
+    infrastructure: { kind: 'gate-ceiling' },
+  });
+  expect(marker.gateExplicit === true).toBe(explicit);
+  if (explicit) {
+    const f = ceilingFixture({ readState: () => ({ headSha: 'head', marker: { ...marker, runId: 'job-1' } }) });
+    expect(dispatch.requeueGateCeiling(f.options)).toBe(false);
+    expect(f.enqueue).not.toHaveBeenCalled();
+  }
 });

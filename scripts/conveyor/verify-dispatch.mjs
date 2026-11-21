@@ -398,12 +398,23 @@ export function recordKilledVerification(dir, expected, error, ceilingMs) {
 /** Keep the tail verbatim, but refuse retry when rebuilding would discard execution policy. */
 function gateTail(command = '') {
   let quote = null, word = '';
+  const words = [];
+  const validate = () => {
+    const start = words[0] === 'node' && /(?:^|\/)verify-shard-run\.mjs$/.test(words[1] ?? '')
+      ? words.indexOf('--') + 1 : 0;
+    const gate = words.slice(start);
+    if (gate[0] !== 'npx' || gate[1] !== 'vitest' || !['related', 'run'].includes(gate[2])
+      || !gate.slice(3).some(w => !w.startsWith('-'))) {
+      throw new Error('ceiling recovery requires a selected default Vitest gate');
+    }
+  };
   const finishWord = () => {
     // Only options produced by the default gate may be replaced by the fallback.
     // Config/project/filter (and unknown) options require an explicit retry instead.
     if (word.startsWith('-') && !/^(?:--|--run|--passWithNoTests|--(?:testTimeout|hookTimeout|shards|parallel|budget-ms)=\d+)$/.test(word)) {
       throw new Error('ceiling recovery cannot discard custom gate options; retry the explicit gate');
     }
+    if (word) words.push(word);
     word = '';
   };
   for (let i = 0; i < command.length; i++) {
@@ -415,12 +426,14 @@ function gateTail(command = '') {
       if (c === quote) quote = null;
       else word += c;
     } else if (c === "'" || c === '"') quote = c;
-    else if (command.slice(i, i + 2) === '&&') { finishWord(); return ` ${command.slice(i)}`; }
+    else if (command.slice(i, i + 2) === '&&') { finishWord(); validate(); return ` ${command.slice(i)}`; }
     else if (/\s/.test(c)) finishWord();
+    else if (/[|;&<>$`]/.test(c)) throw new Error('unsupported gate operator');
     else word += c;
   }
   if (quote) throw new Error('incomplete gate quote');
   finishWord();
+  validate();
   return '';
 }
 
@@ -434,7 +447,7 @@ export function requeueGateCeiling({ dir, headSha, afterJob, runId, requestStart
     const runGit = args => readGit(args, { cwd: dir, encoding: 'utf8', timeout: 5000, maxBuffer: 8 * 1024 * 1024 });
     const targets = localChangedSet({ runGit })?.changedFiles;
     if (!targets) throw new Error('changed files unavailable');
-    const settings = resolveVerifySettings({ fileConfig: loadVerifySettingsFile(join(dir, 'scripts/verify-settings.json')), env: process.env }).values;
+    const settings = resolveVerifySettings({ fileConfig: loadVerifySettingsFile(), env: process.env }).values;
     const selection = relatedSelection({ targets, runGit, readRepoFile: p => readFileSync(join(dir, p), 'utf8'), settings, forceFallback: true });
     const command = selection.tests.length ? `npx vitest run ${selection.tests.map(shellQuote).join(' ')} --passWithNoTests` : "echo 'verify-lane: no selected or named suites'";
     return { selection, command };
@@ -442,7 +455,7 @@ export function requeueGateCeiling({ dir, headSha, afterJob, runId, requestStart
   if (timedOutPhase !== 'gate' || !afterJob || !enqueue) return false;
   try {
     const { marker, headSha: currentHead } = readState(dir);
-    if (!marker || currentHead !== headSha || marker.sha !== headSha || marker.requeue
+    if (!marker || marker.gateUncapped || marker.gateExplicit || currentHead !== headSha || marker.sha !== headSha || marker.requeue
       || !['running', 'infrastructure-failure'].includes(marker.status)
       || (marker.selection?.status ?? marker.phases?.selection?.status) === 'capped-fallback'
       || (marker.runId ? marker.runId !== runId : requestStartedAt && marker.startedAt !== requestStartedAt)) return false;

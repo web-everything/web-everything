@@ -110,3 +110,32 @@ it('matchRequestedDefaultGate still matches an explicit-list default across stan
   expect(gates.matchRequestedDefaultGate({ gate: requested.command, env: {}, resolved,
     resolveUnder: env => gates.resolveDefaultGate({ ...o, env }) })?.command).toBe(resolved.command);
 });
+
+it.each([false, true])('default selection drops option-shaped changed tests (graph unavailable: %s)', graphThrows => {
+  const unsafe = '--exclude=**/*.test.mjs';
+  const p = gates.resolveDefaultGate(fixture({ changed: [unsafe, own], files: { [unsafe]: '', [own]: '' }, graphThrows }));
+  expect(p.decision.selection.tests).not.toContain(unsafe);
+  expect(p.testCommand).not.toContain(unsafe);
+  expect(p.testCommand).toContain(`'${own}'`);
+});
+it('fallback drops option-shaped direct importers and named suites before clipping', () => {
+  const unsafe = '--exclude=**/*.test.mjs';
+  const selection = gates.cappedFallbackSelection({ targets: [hub], reverse: new Map([[hub, new Set([unsafe, own])]]),
+    settings: { relatedMaxTests: 1, alwaysRunTests: [unsafe, guard] } });
+  expect(selection.tests).toEqual([guard, own].sort());
+});
+it('explicit related rewrite drops option-shaped graph results', () => {
+  const unsafe = '--exclude=**/*.test.mjs';
+  const p = gates.capExplicitRelatedGate({ gate: `npx vitest related '${hub}' --run`,
+    ...fixture({ files: { [hub]: '', [unsafe]: "import './scripts/lib/hub.mjs'", [own]: "import '../hub.mjs'" } }) });
+  expect(p.selection.tests).toEqual([own]);
+  expect(p.command).not.toContain(unsafe);
+});
+it('an all-option-shaped selection never becomes an unfiltered vitest run', () => {
+  const unsafe = '--exclude=**/*.test.mjs';
+  const o = fixture({ changed: [unsafe], files: { [unsafe]: '' } });
+  o.fileConfig.alwaysRunTests = [];
+  const p = gates.resolveDefaultGate(o);
+  expect(p.decision.selection.tests).toEqual([]);
+  expect(p.command).not.toContain('vitest run');
+});

@@ -538,22 +538,23 @@ const graphCache = new WeakMap();
 
 /** A bounded command; an empty selection must never become an unfiltered unit run. */
 function explicitTestCommand(tests, flags = '') {
+  tests = tests.filter(path => !path.startsWith('-'));
   return tests.length ? `npx vitest run ${tests.map(shellQuote).join(' ')} --passWithNoTests${flags}`
     : `echo ${shellQuote('verify-lane: no selected or named test suites; CI owns exhaustive verification')}`;
 }
 
 /** Changed tests and one direct importer per source get first claim on the cap; named guards are additional. */
 export function cappedFallbackSelection({ targets, reverse = new Map(), settings, reason = 'graph unavailable' }) {
-  const priority = [...new Set(targets.filter(isVitestTestFile))].sort();
+  const priority = [...new Set(targets.filter(f => !f.startsWith('-') && isVitestTestFile(f)))].sort();
   const direct = [];
   for (const file of targets.filter(f => !isVitestTestFile(f))) {
-    const tests = [...testDepths([file], reverse)].filter(([, d]) => d <= 1).map(([t]) => t).sort();
+    const tests = [...testDepths([file], reverse)].filter(([, d]) => d <= 1).map(([t]) => t).filter(t => !t.startsWith('-')).sort();
     if (tests.length && !tests.some(t => priority.includes(t))) priority.push(tests[0]);
     direct.push(...tests);
   }
   const candidates = [...new Set([...priority, ...direct.sort()])].slice(0, settings.relatedMaxTests);
   // Bound argv bytes as well as count. Unusable graph paths cannot displace the named guard suites.
-  const guards = [...new Set(settings.alwaysRunTests ?? [])].sort();
+  const guards = [...new Set((settings.alwaysRunTests ?? []).filter(t => !t.startsWith('-')))].sort();
   const tests = [...guards];
   for (const file of candidates) if (!tests.includes(file)
     && Buffer.byteLength([...tests, file].map(shellQuote).join(' ')) < 30000) tests.push(file);
@@ -578,6 +579,8 @@ export function relatedSelection({ targets, runGit, readRepoFile, settings, forc
     }
     const selection = selectRelatedTests({ changedFiles: targets, reverse, maxTests: settings.relatedMaxTests,
       maxDepth: settings.relatedDepth });
+    selection.tests = selection.tests.filter(path => !path.startsWith('-'));
+    selection.selectedTestCount = selection.tests.length;
     if (forceFallback || !selection.tests.length || Buffer.byteLength(selection.tests.map(shellQuote).join(' ')) > 32000)
       return cappedFallbackSelection({ targets, reverse, settings, reason: forceFallback ? 'gate ceiling' : 'graph list unusable' });
     return selection;

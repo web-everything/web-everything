@@ -434,8 +434,15 @@ let GATE;
 let resolvedGate;
 let explicitSelection;
 if (typeof flags.gate === 'string') {
-  const capped = capExplicitRelatedGate({ gate: flags.gate, uncapped: flags['gate-uncapped'] === true,
-    runGit: git, readRepoFile, env: process.env });
+  let capped;
+  let capRefusal;
+  try {
+    capped = capExplicitRelatedGate({ gate: flags.gate, uncapped: flags['gate-uncapped'] === true,
+      runGit: git, readRepoFile, env: process.env });
+  } catch (error) {
+    capRefusal = error.message;
+    capped = { command: flags.gate };
+  }
   GATE = capped.command;
   if (capped.notice) process.stderr.write(`${capped.notice}\n`);
   explicitSelection = capped.selection;
@@ -462,7 +469,7 @@ if (typeof flags.gate === 'string') {
       const scripts = readCheckoutScripts();
       return runsWholeUnitTier(policy, scripts) && GATE === 'npm run test:unit' + (scripts.includes('check:standards') ? ' && npm run check:standards' : '');
     } catch { return false; } })();
-    const refusal = defaultBlocked && !policyFull && !resolvedGate ? explicitGateRefusal(GATE) : null;
+    const refusal = capRefusal || (defaultBlocked && !policyFull && !resolvedGate ? explicitGateRefusal(flags.gate) : null);
     if (refusal) {
       // A dispatched child must leave a TERMINAL record (red, exit 3) — leaving the `running` request as it was would
       // make the dispatcher re-spawn this same refusal on every sweep. A plain `request` records nothing.
@@ -473,6 +480,7 @@ if (typeof flags.gate === 'string') {
       emit({ sha: headSha, status: 'gate-refused', reason: 'explicit-gate-not-affected-test', ok: false, redCause: 'refused', redCauseFiles: [], detail: `${refusal}. The default selection is blocked for this diff, so supply an affected-test gate such as \`--gate="npx vitest related <files> --run"\`; ${dispatchedChild ? 'recorded a red marker so it is not re-dispatched' : 'no marker was recorded'}.` }, 3);
     }
   }
+  if (capRefusal) throw new Error(capRefusal);
 } else {
   const resolved = resolveBuildDefaultGate(process.env);
   if (resolved.decision.mode === 'blocked') emit({ sha: headSha, status: 'selection-required', reason: 'local-selection-bound', ok: false, redCause: 'refused', redCauseFiles: [], detail: describeGate(resolved) }, 3);
@@ -544,7 +552,11 @@ if (!resolvedGate && typeof flags.gate === 'string') {
 }
 
 const priorAudit = readMarker();
-const gateAudit = { ...(explicitSelection || resolvedGate?.decision?.selection ? { selection: explicitSelection ?? resolvedGate.decision.selection } : {}),
+// A dispatched --gate transports the original request; preserve its explicit/default provenance.
+const gateExplicit = DISPATCHED_RUN ? priorAudit?.sha === headSha && priorAudit?.gateExplicit === true
+  : typeof flags.gate === 'string';
+const gateAudit = { ...(gateExplicit ? { gateExplicit: true } : {}),
+  ...(explicitSelection || resolvedGate?.decision?.selection ? { selection: explicitSelection ?? resolvedGate.decision.selection } : {}),
   ...(flags['gate-uncapped'] === true ? { gateUncapped: true } : {}),
   ...(DISPATCHED_RUN && priorAudit?.sha === headSha && priorAudit?.requeue ? { requeue: priorAudit.requeue, selection: priorAudit.selection } : {}) };
 SELECTION = summarizeSelection({ gate: resolvedGate, explicitGate: typeof flags.gate === 'string' });
