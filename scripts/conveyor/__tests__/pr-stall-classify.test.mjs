@@ -684,3 +684,15 @@ describe('pending red-team watchdog evidence', () => {
     expect(at(state, { redTeam: pending() })).toMatchObject({ lane: 'system', action: 'ask-review-daemon' });
   });
 });
+
+describe('trigger mismatch is named', () => {
+  it('names the trigger and state instead of "not an object"', () => {
+    const r = at('at-round-limit', { verdict: null, triggerMismatch: 'referral-hold vs at-round-limit' });
+    expect(r).toMatchObject({ lane: 'operator', action: 'no-verdict' });
+    expect(r.reason).toContain('trigger-mismatch: referral-hold vs at-round-limit');
+    expect(r.reason).not.toContain('not an object');
+  });
+  it('without a mismatch the old message stays', () => {
+    expect(at('at-round-limit', { verdict: null }).reason).toContain('not an object');
+  });
+});

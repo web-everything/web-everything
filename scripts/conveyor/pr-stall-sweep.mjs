@@ -297,7 +297,7 @@ export async function runStallSweep({ now = Date.now(), env = process.env, state
     const pr = prs.get(`${row.repo}#${row.number}`);
     const head = String(pr?.headRefOid ?? '');
     const trigger = JUDGED_STATES[row.waitingOn];
-    let verdict = null; let list = []; let fileListFailure = null;
+    let verdict = null; let list = []; let fileListFailure = null; let triggerMismatch = null;
     if (trigger) {
       try {
         list = await files(row.repo, row.number);
@@ -305,13 +305,14 @@ export async function runStallSweep({ now = Date.now(), env = process.env, state
         const cap = detectRoundCap({ comments: pr.comments, pr: row.number, head, state: row.waitingOn === 'at-round-limit' ? 'at-round-limit' : null, repo: row.repo });
         // A PR in a judged state whose thread shows no cap record (e.g. a findings-less settled referral notice) still gets the judge, run for the state's own trigger with NO thread evidence (an unmatched thread may hold already-ruled findings); the judge fails closed on no evidence, never null (null = the classifier's "not an object" operator park).
         verdict = (cap?.trigger === trigger || !cap) ? judge({ pr: row.number, repo: row.repo, head, trigger, comments: cap ? pr.comments : [], files: list, setting: breaks.value, maxGrants: judgeCfg.maxGrants }) : null;
+        if (cap && cap.trigger !== trigger) triggerMismatch = `${cap.trigger} vs ${trigger}`;
       } catch (e) {
         base.errors.push(`judge ${row.repo}#${row.number}: ${msg(e)}`); readFailed = true;
         if (e?.code === 'file-list-over-cap') fileListFailure = e.fileList;
         else verdict = null;
       }
     }
-    const context = { row, head, verdict, files: list, card: null, settings: classifierSettings(cfg) };
+    const context = { row, head, verdict, triggerMismatch, files: list, card: null, settings: classifierSettings(cfg) };
     const metadata = { repo: row.repo, pr: row.number, head, prHead: `${row.repo}#${row.number}@${head.toLowerCase()}`, state: row.waitingOn, title: String(row.title ?? '').slice(0, 120), verdict: verdict?.verdict ?? null };
     if (fileListFailure) {
       items.push({ ...metadata, lane: 'operator', action: 'ruling-needed', key: `${metadata.prHead}:file-list-over-cap`,
