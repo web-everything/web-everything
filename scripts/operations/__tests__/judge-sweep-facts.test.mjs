@@ -39,13 +39,16 @@ const memoryCache = () => {
   let text = '{}';
   return createShapeCache({ cacheDir: '/scratch', read: () => text, write: (_p, data) => { text = data; } });
 };
-// Default cap 3 makes round-one fixtures candidates at cap - 2.
+// Detail fixtures use round three at the production cap of five.
+const nearCapRows = () => [1, 2].flatMap(pr => ['d'.repeat(40), 'e'.repeat(40)].map(headSha => ({
+  repo: REPO, pr, type: 'review-run', headSha, at: at(20),
+})));
 function fixture(overrides = {}) {
   const gh = vi.fn(() => JSON.stringify([pr()]));
   const readComments = vi.fn(() => []);
   const shape = vi.fn(() => ({ humanRequired: false }));
-  const options = { findSuspendedRuns: () => [], checkoutState: () => ({ behind: 0 }), gh, now: () => NOW, readLedgerRows: () => [], readFixRows: () => [],
-    readJobs: () => [], readComments, cache: memoryCache(), shape, baseCap: 3, cardReadable: () => false, ...overrides };
+  const options = { findSuspendedRuns: () => [], checkoutState: () => ({ behind: 0 }), gh, now: () => NOW, readLedgerRows: nearCapRows, readFixRows: () => [],
+    readJobs: () => [], readComments, cache: memoryCache(), shape, baseCap: 5, cardReadable: () => false, ...overrides };
   const transport = options.gh;
   const readerOptions = { ...options, gh: args => {
     const value = transport(args);
@@ -507,7 +510,7 @@ describe('injected reader and shared evidence readers', () => {
     // Seven reviewed heads at grant time + one grant exceeds the additive floor of six.
     expect(f.read().prs[0]).toMatchObject({ round: 8, cap: 8 });
     const forged = fixture({ readComments: () => [comment(grant, 1, 'untrusted-user')] });
-    expect(forged.read().prs[0].cap).toBe(3);
+    expect(forged.read().prs[0].cap).toBe(5);
   });
   it('requires trusted, live-head acceptance AND red-team evidence before reporting owed approval', () => {
     const comments = [advisory({ outcome: 'accept' }), comment(redTeamMarker(1, SHA))];
@@ -541,7 +544,7 @@ describe('injected reader and shared evidence readers', () => {
     ['fixer', {}, [{ repo: REPO, pr: 1, kind: 'fix-run' }]],
     ['pending review', { labels: [{ name: 'review:pending' }] }, []],
   ];
-  it.each(inFlight)('reads comments for a plain round-one PR during %s', (_activity, active, jobs) => {
+  it.each(inFlight)('reads comments for a plain cap-near PR during %s', (_activity, active, jobs) => {
     const f = fixture({ gh: () => JSON.stringify([pr(active)]), readJobs: () => jobs });
     expect(buildJudgeSweepBundle(f.read()).prs[0].needsJudgment).toBe(false);
     expect(f.readComments).toHaveBeenCalledTimes(1);
@@ -554,7 +557,7 @@ describe('injected reader and shared evidence readers', () => {
   });
   it.each(referralSignals.flatMap(([signal, evidence]) => inFlight.map(([activity, active, jobs]) =>
     ({ signal, activity, evidence, active, jobs }))))(
-    'reads an unruled referral signaled by $signal during $activity on round one',
+    'reads an unruled referral signaled by $signal during $activity at cap-near',
     ({ evidence, active, jobs }) => {
       const seat = 'judgeCorrectnessAdvisory', runId = 'review-pr-fixture';
       const record = { version: 1, repo: REPO, pr: 1, head: SHA, runId,
@@ -565,7 +568,7 @@ describe('injected reader and shared evidence readers', () => {
       const readComments = vi.fn(() => [comment(renderReferralRecord(record))]);
       const f = fixture({ gh, readJobs: () => jobs, readComments });
       const row = f.read().prs[0];
-      expect(row.round).toBe(1);
+      expect(row.round).toBe(3);
       expect(row.evidenceErrors).toEqual([]);
       expect(row.openReferrals).toEqual([{ key: referralFindingKey(seat, finding), ruled: false, superseded: false }]);
       expect(needsJudgment(row)).toEqual({ needsJudgment: true, reason: 'unruled-referral' });

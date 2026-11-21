@@ -21,8 +21,8 @@ vi.mock('../../lib/gh-throttle.mjs', async original => ({ ...await original(), r
 afterEach(() => { vi.resetAllMocks(); vi.unstubAllEnvs(); });
 
 const repo = 'o/r', head = 'a'.repeat(40), at = '2026-10-22T13:00:00Z';
-// Round-one fixtures exercise the cap-near boundary (cap - 2).
-const baseCap = 3;
+// Keep the production cap; detail fixtures explicitly use round three (cap - 2).
+const baseCap = 5;
 const exec = vi.fn();
 const policyHash = () => createHash('sha256').update(JSON.stringify(resolveHumanReviewSurfaces().categories)).digest('hex');
 
@@ -47,7 +47,7 @@ it.each([
       return JSON.stringify(args[1] === 'list' ? [value] : value);
     },
     now: () => Date.parse(at), baseCap,
-    readLedgerRows: () => [], readFixRows: () => [], readJobs: () => [],
+    readLedgerRows: () => rounds(1, 3), readFixRows: () => [], readJobs: () => [],
     readComments: () => comments,
   });
   const facts = reader({ repo }).prs[0];
@@ -67,7 +67,8 @@ const options = (extra = {}) => {
   checkoutState: () => ({ behind: 0 }),
   exec,
   gh: () => JSON.stringify([pr()]), now: () => Date.parse(at), baseCap,
-  readLedgerRows: () => [], readFixRows: () => [], readJobs: () => [], readComments: () => [],
+  readLedgerRows: () => Array.from({ length: 199 }, (_, i) => rounds(i + 1, 3)).flat(),
+  readFixRows: () => [], readJobs: () => [], readComments: () => [],
   cache: createShapeCache({ read: () => '{}', write: () => {} }), ...extra,
   });
   // Legacy fixtures hold full PR objects; model gh view returning one object.
@@ -138,7 +139,7 @@ it.each(['red-team:clear', 'red-team:blocked'])('reports red-team label lacks li
 
 it('reports round-limit label disagrees with round evidence below the cap', () => {
   const facts = read({ gh: () => JSON.stringify([pr({ labels: [{ name: 'status:at-round-limit' }] })]) });
-  expect(facts.round).toBe(1);
+  expect(facts.round).toBe(3);
   expect(facts.cap).toBe(baseCap);
   expect(facts.evidenceErrors).toEqual(['round-limit label disagrees with round evidence']);
 });
@@ -315,10 +316,15 @@ it.each([125, 126])('each comment page consumes the 128-call budget (%i full pag
 it('shares the call budget across PRs and withholds unread comments after exhaustion', () => {
   const listing = Array.from({ length: 129 }, (_, i) => pr({ number: i + 1 }));
   const gh = vi.fn(args => args[0] === 'pr' ? JSON.stringify(listing) : '');
-  const { readComments: _comments, ...defaults } = options({ gh });
+  const findSuspendedRuns = vi.fn(() => []);
+  const { readComments: _comments, ...defaults } = options({ gh, findSuspendedRuns });
   const facts = createJudgeSweepFactsReader(defaults)({ repo }).prs;
+  expect(findSuspendedRuns).toHaveBeenCalledTimes(129);
   expect(gh).toHaveBeenCalledTimes(128);
   expect(facts[62].openReferrals).toEqual([]);
+  expect(facts[63]).toMatchObject({ detail: 'read', openReferrals: null,
+    evidenceErrors: ['comment evidence unreadable or budget exhausted'] });
+  expect(buildJudgeSweepBundle({ prs: [facts[63]] }).prs[0].needsJudgment).toBe(true);
   expect(facts.slice(64).every(p => p.openReferrals === null && p.detail === 'error')).toBe(true);
   expect(facts[128].evidenceErrors.join(' ')).toMatch(/detail/);
 });
@@ -515,7 +521,7 @@ it('shape child receives filenames unchanged as JSON stdin with bounded output a
 // A verdict row in the ledger at the PR head is real evidence even before its advisory comment is published.
 const ledgerRow = (extra = {}) => ({ type: 'verdict', repo, pr: 1, verdict: 'changes', at, coverage: { headSha: head }, ...extra });
 const ledgerFacts = (rows, labels = [{ name: 'review:pending' }]) => read({
-  gh: () => JSON.stringify([pr({ labels })]), readLedgerRows: () => rows });
+  gh: () => JSON.stringify([pr({ labels })]), readLedgerRows: () => [...rounds(1, 3), ...rows] });
 
 it('takes the verdict from a ledger row at the PR head when no advisory comment exists', () => {
   const facts = ledgerFacts([ledgerRow()]);
@@ -710,6 +716,7 @@ it('R746 exposes a suspended run and alerts once per run past the sourced window
     const publishAlert = vi.fn(), log = vi.fn(), alertRepo = JUDGE_SWEEP_REPO;
     const suspended = { id: 'review-pr-suspended', ageMs: 3600000, findings: [{ key: 'k', summary: 'broken guard' }] };
     const reader = createJudgeSweepFactsReader(options({ findSuspendedRuns: () => [suspended], publishAlert,
+      readLedgerRows: () => rounds(1, 3).map(row => ({ ...row, repo: alertRepo })),
       alertClaimsDir: dir, log, env: { WE_REFERRAL_JUDGE_WINDOW_MIN: '60' } }));
     const first = reader({ repo: alertRepo }).prs[0];
     expect(first.suspendedReferralRun).toEqual({ runId: suspended.id, ageMinutes: 60, findings: suspended.findings });
@@ -772,13 +779,16 @@ const selectiveReader = ({ listing = [pr()], rows = [], detail = p => p, ...extr
   return { gh, read: () => reader({ repo }) };
 };
 
-it('keeps 199 PRs with three near cap under the call budget and reads only their detail and comments', () => {
+it('bounds 199 PRs including independent comments for PRs below cap-near', () => {
   const listing = Array.from({ length: 199 }, (_, i) => pr({ number: i + 1 }));
   const f = selectiveReader({ listing, rows: [1, 2, 3].flatMap(n => rounds(n, 10)) });
   const facts = f.read();
-  expect(f.gh).toHaveBeenCalledTimes(7);
+  expect(f.gh).toHaveBeenCalledTimes(128);
   expect(f.gh.mock.calls.filter(([a]) => a[1] === 'view').map(([a]) => Number(a[2]))).toEqual([1, 2, 3]);
-  expect(f.gh.mock.calls.filter(([a]) => a[0] === 'api')).toHaveLength(3);
+  expect(f.gh.mock.calls.filter(([a]) => a[0] === 'api')).toHaveLength(124);
+  expect(facts.prs[123].openReferrals).toEqual([]);
+  expect(facts.prs.slice(124).every(p => p.openReferrals === null
+    && p.evidenceErrors.includes('comment evidence unreadable or budget exhausted'))).toBe(true);
   expect(facts.prs.slice(3).every(p => p.detail === 'skipped' && p.inCi === null && p.evidenceErrors.length)).toBe(true);
 });
 
@@ -796,7 +806,7 @@ it('skipped detail never counts as clear even with accepted labels and active CI
   const facts = f.read();
   expect(facts.prs[0]).toMatchObject({ detail: 'skipped', inCi: null, latestVerdict: null });
   expect(buildJudgeSweepBundle(facts).prs[0]).toMatchObject({ needsJudgment: true, reason: expect.stringContaining('evidence-unavailable') });
-  expect(f.gh).toHaveBeenCalledTimes(1);
+  expect(f.gh).toHaveBeenCalledTimes(2);
 });
 
 it.each(['504', 'invalid JSON', 'head mismatch', 'missing head'])('isolates per-PR detail failure (%s) and never caches or clears it', kind => {
@@ -817,7 +827,7 @@ it.each(['504', 'invalid JSON', 'head mismatch', 'missing head'])('isolates per-
   expect(facts.prs[1].detail).toBe('read');
   expect(cache.set).not.toHaveBeenCalled();
   expect(shape).not.toHaveBeenCalled();
-  expect(f.gh.mock.calls.filter(([a]) => a[0] === 'api')).toHaveLength(1);
+  expect(f.gh.mock.calls.filter(([a]) => a[0] === 'api')).toHaveLength(2);
 });
 
 it('a round-limit label with unreadable ledger still reads detail', () => {
@@ -831,17 +841,68 @@ it('does not count the current head or another PR or repo as previous rounds', (
   const f = selectiveReader({ rows: [...rounds(1, 10).map(r => ({ ...r, headSha: head })),
     ...rounds(2, 12), ...rounds(1, 12).map(r => ({ ...r, repo: 'other/repo' }))] });
   expect(f.read().prs[0]).toMatchObject({ round: 1, detail: 'skipped' });
-  expect(f.gh).toHaveBeenCalledTimes(1);
+  expect(f.gh).toHaveBeenCalledTimes(2);
 });
 
 
 it.each([
   ['body', undefined], ['body', null], ['createdAt', 'invalid'],
   ['statusCheckRollup', undefined], ['statusCheckRollup', null], ['commits', undefined],
-])('fails closed on incomplete detail %s=%s before reading comments', (field, value) => {
+])('fails closed on incomplete detail %s=%s while still reading comments', (field, value) => {
   const f = selectiveReader({ rows: rounds(1, 10), detail: p => ({ ...p, [field]: value }) });
   const facts = f.read();
   expect(facts.prs[0]).toMatchObject({ detail: 'error', inCi: null });
   expect(buildJudgeSweepBundle(facts).prs[0].needsJudgment).toBe(true);
-  expect(f.gh.mock.calls.some(([args]) => args[0] === 'api')).toBe(false);
+  expect(f.gh.mock.calls.filter(([args]) => args[0] === 'api')).toHaveLength(1);
+});
+
+
+it.each([
+  { oid: 'b'.repeat(40), committedDate: at },
+  { committedDate: at },
+])('withholds head age when the last commit does not identify the listed head (%j)', lastCommit => {
+  const facts = read({ gh: () => JSON.stringify([pr({ commits: [{ oid: head, committedDate: at }, lastCommit] })]) });
+  expect(facts.minutesSinceHeadChange).toBeNull();
+  expect(facts.evidenceErrors).toContain('last commit does not identify the listed head');
+  expect(buildJudgeSweepBundle({ prs: [facts] }).prs[0].needsJudgment).toBe(true);
+});
+
+it.each([[{}], [{ name: 'test', status: 'COMPLETED' }], [null],
+  [{ name: 'test', status: 'IN_PROGRESS' }, {}]].map(rollup => [rollup]))('withholds CI state on unreadable checks (%j)', statusCheckRollup => {
+  const facts = read({ gh: () => JSON.stringify([pr({ statusCheckRollup })]) });
+  expect(facts.inCi).toBeNull();
+  expect(facts.evidenceErrors).toContain('status check evidence unreadable');
+  expect(buildJudgeSweepBundle({ prs: [facts] }).prs[0].needsJudgment).toBe(true);
+});
+
+it.each([
+  [1, false], [2, false], [3, true], [5, true],
+].flatMap(([round, failDetail]) => [false, true].map(ruled => [round, failDetail, ruled])))('verifies comments and alerts for overdue suspended runs at cap 5 round %i (detail fails=%s, ruled=%s)', (round, failDetail, ruled) => {
+  const dir = mkdtempSync(join(tmpdir(), 'referral-alert-independent-'));
+  try {
+    const record = { ...referralRecord(), repo: JUDGE_SWEEP_REPO }, publishAlert = vi.fn();
+    if (ruled) record.rulings = [{ id: 'ruling-independent', key: record.referrals[0].key,
+      reviewerId: record.reviewer.id, lens: record.reviewer.lens, result: 'block', rationale: 'repair it', evidence: ['diff'] }];
+    const readComments = vi.fn(() => [comment(renderReferralRecord(record))]);
+    const findSuspendedRuns = vi.fn(() => [{ id: 'review-pr-independent', ageMs: 7200000,
+      findings: [{ key: record.referrals[0].key, summary: 'guard' }] }]);
+    const gh = vi.fn(args => {
+      if (args[1] === 'view') throw Error('detail unavailable');
+      // The listing intentionally has no body or creation time.
+      const { body, createdAt, ...listing } = pr();
+      return JSON.stringify([listing]);
+    });
+    const facts = createJudgeSweepFactsReader(options({ gh,
+      readLedgerRows: () => rounds(1, round).map(row => ({ ...row, repo: JUDGE_SWEEP_REPO })), readComments,
+      findSuspendedRuns, publishAlert, alertClaimsDir: dir, log: () => {},
+      env: { WE_REFERRAL_JUDGE_WINDOW_MIN: '60' } }))({ repo: JUDGE_SWEEP_REPO }).prs[0];
+    expect(facts).toMatchObject({ round, cap: 5, detail: failDetail ? 'error' : 'skipped',
+      openReferrals: [{ key: record.referrals[0].key, ruled, superseded: false }],
+      suspendedReferralRun: { runId: 'review-pr-independent' } });
+    expect(readComments).toHaveBeenCalledTimes(1);
+    expect(findSuspendedRuns).toHaveBeenCalledTimes(1);
+    expect(publishAlert).toHaveBeenCalledTimes(ruled ? 0 : 1);
+    expect(gh).toHaveBeenCalledTimes(failDetail ? 2 : 1);
+    expect(buildJudgeSweepBundle({ prs: [facts] }).prs[0].needsJudgment).toBe(true);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
 });

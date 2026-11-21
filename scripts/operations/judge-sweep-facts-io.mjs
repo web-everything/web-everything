@@ -287,37 +287,44 @@ export function createJudgeSweepFactsReader({ gh = operatorGh, now = () => Date.
       // Unknown rounds must be inspected. Labels cannot exempt a PR from detail reads.
       if (round !== null && round < baseCap - 2) {
         evidenceErrors.push('detail skipped below cap-near threshold; inspect PR evidence and rerun a narrower/operator query');
-        return result;
-      }
-      try {
-        const detail = JSON.parse(boundedGh(['pr', 'view', String(p.number), '--repo', repo, '--json',
-          'headRefOid,baseRefOid,files,changedFiles,body,createdAt,statusCheckRollup,commits']));
-        if (!/^[a-f0-9]{40}$/i.test(detail?.headRefOid ?? '') || detail.headRefOid.toLowerCase() !== headSha) {
-          throw failure('detail head identity differs from listing');
+      } else {
+        try {
+          const detail = JSON.parse(boundedGh(['pr', 'view', String(p.number), '--repo', repo, '--json',
+            'headRefOid,baseRefOid,files,changedFiles,body,createdAt,statusCheckRollup,commits']));
+          if (!/^[a-f0-9]{40}$/i.test(detail?.headRefOid ?? '') || detail.headRefOid.toLowerCase() !== headSha) {
+            throw failure('detail head identity differs from listing');
+          }
+          if (typeof detail.body !== 'string' || !Number.isFinite(Date.parse(detail.createdAt))
+            || !Array.isArray(detail.statusCheckRollup) || !Array.isArray(detail.commits)) {
+            throw failure('detail fields incomplete');
+          }
+          // Retain selection and ownership from the list, accepting only the detail fields requested.
+          p = { ...p, baseRefOid: detail.baseRefOid, files: detail.files, changedFiles: detail.changedFiles,
+            body: detail.body, createdAt: detail.createdAt, statusCheckRollup: detail.statusCheckRollup, commits: detail.commits };
+          result.detail = 'read';
+          const lastCommit = Array.isArray(p.commits) ? p.commits.at(-1) : null;
+          if (lastCommit) {
+            if (typeof lastCommit.oid === 'string' && lastCommit.oid.toLowerCase() === headSha) {
+              result.minutesSinceHeadChange = minutesSince(lastCommit.committedDate);
+            } else evidenceErrors.push('last commit does not identify the listed head');
+          }
+          const checks = reduceCheckState(p.statusCheckRollup.map(c => c?.status ? c : {
+            ...c, name: c?.context, status: c?.state === 'PENDING' ? 'IN_PROGRESS' : 'COMPLETED',
+            conclusion: c?.state === 'ERROR' ? 'failure' : String(c?.state ?? '').toLowerCase(),
+          }));
+          if (checks.counts.unreadable) evidenceErrors.push('status check evidence unreadable');
+          else result.inCi = checks.state === 'pending';
+        } catch {
+          result.detail = 'error';
+          evidenceErrors.push('PR detail unreadable, head changed, or budget exhausted; inspect PR evidence and rerun a narrower/operator query');
         }
-        if (typeof detail.body !== 'string' || !Number.isFinite(Date.parse(detail.createdAt))
-          || !Array.isArray(detail.statusCheckRollup) || !Array.isArray(detail.commits)) {
-          throw failure('detail fields incomplete');
-        }
-        // Retain selection and ownership from the list, accepting only the detail fields requested.
-        p = { ...p, baseRefOid: detail.baseRefOid, files: detail.files, changedFiles: detail.changedFiles,
-          body: detail.body, createdAt: detail.createdAt, statusCheckRollup: detail.statusCheckRollup, commits: detail.commits };
-        result.detail = 'read';
-        const lastCommit = Array.isArray(p.commits) ? p.commits.at(-1) : null;
-        result.minutesSinceHeadChange = minutesSince(lastCommit?.committedDate);
-        result.inCi = reduceCheckState(p.statusCheckRollup.map(c => c.status ? c : {
-          ...c, name: c.context, status: c.state === 'PENDING' ? 'IN_PROGRESS' : 'COMPLETED',
-          conclusion: c.state === 'ERROR' ? 'failure' : String(c.state ?? '').toLowerCase(),
-        })).state === 'pending';
-      } catch {
-        result.detail = 'error';
-        evidenceErrors.push('PR detail unreadable, head changed, or budget exhausted; inspect PR evidence and rerun a narrower/operator query');
-        return result;
       }
+      // Comment verification and local suspended-run inspection are independent of detail availability.
       // Mandatory referrals can appear only in comments, even while a fixer or CI runs.
       const redTeamJudgmentLabel = labels.some(l => RED_TEAM_JUDGMENT_LABELS.has(l));
       try {
         const readCommentEvidence = () => {
+          if (calls >= MAX_CALLS) throw failure('128-call budget exhausted');
           const comments = readComments({ number: p.number, repo, exec: commentsExec });
           if (!Array.isArray(comments) || comments.some(c => typeof c?.body !== 'string' || !c.author?.login || !Number.isFinite(Date.parse(c.createdAt)))) throw failure('comments incomplete');
           return comments;
@@ -412,7 +419,7 @@ export function createJudgeSweepFactsReader({ gh = operatorGh, now = () => Date.
           }
         }
       } catch { evidenceErrors.push('suspended referral run evidence unreadable; inspect run store'); }
-      if (labels.includes('review:human')) {
+      if (result.detail === 'read' && labels.includes('review:human')) {
         try {
           // A retarget or base advance can change the net files without changing the head.
           // Unknown base identity cannot reuse a prior non-human result.
