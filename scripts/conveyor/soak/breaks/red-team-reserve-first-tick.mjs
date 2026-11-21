@@ -13,7 +13,8 @@ async function exercise(root, kind, load) {
   const { mkdtempSync, mkdirSync, writeFileSync, rmSync } = await load('node:fs');
   const { join } = await load('node:path');
   const { pathToFileURL } = await load('node:url');
-  const os = createRequire(import.meta.url)('node:os');
+  // Module metadata is rewritten by Vitest too; anchor require to the supplied tree.
+  const os = createRequire(pathToFileURL(join(root, 'package.json')))('node:os');
   const directory = mkdtempSync(join(os.tmpdir(), 'red-team-reserve-soak-'));
   // The operator reader deliberately ignores HOME. Redirect the account database seam in this
   // disposable child before importing it, as the Vitest sandbox does; never read the host store.
