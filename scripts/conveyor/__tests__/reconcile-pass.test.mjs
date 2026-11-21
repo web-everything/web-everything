@@ -161,6 +161,7 @@ it('normalises a bare repo KEY (e.g. --repo=we) to its gh owner/name slug before
 // like every other reader in this file, so this is exercised with no network.
 it('fetches the required set once per pass and threads it into planReconcile (never ci-red on an advisory-only red)', async () => {
   const { runReconcilePass } = await import('../reconcile-pass.mjs');
+  const head = 'a'.repeat(40);
   const rollup = [
     { name: 'soak-replay-gate', status: 'COMPLETED', conclusion: 'FAILURE' },
     { name: 'test', status: 'COMPLETED', conclusion: 'SUCCESS' },
@@ -168,15 +169,18 @@ it('fetches the required set once per pass and threads it into planReconcile (ne
     { name: 'daemon-soak', status: 'COMPLETED', conclusion: 'SUCCESS' },
   ];
   const readRequiredChecks = vi.fn(() => ({ checks: ['test', 'smoke', 'daemon-soak'], source: 'live' }));
+  const readChecks = vi.fn(() => { throw new Error('complete snapshot must not hydrate'); });
   const plan = runReconcilePass({
     repo: 'web-everything/web-everything',
     readPrs: () => [{
+      headRefOid: head, rowsComplete: true, rowsHead: head,
       number: 2748, headRefName: 'lane/x', labels: [{ name: 'review:accepted' }, { name: 'ready-to-merge' }],
       mergeStateStatus: 'CLEAN', statusCheckRollup: rollup, comments: [],
     }],
-    readAgents: () => [], enrich: (agents) => agents, readRequiredChecks,
+    readAgents: () => [], enrich: (agents) => agents, readRequiredChecks, readChecks,
   });
   expect(readRequiredChecks).toHaveBeenCalledWith({ repo: 'web-everything/web-everything', branch: 'main' });
+  expect(readChecks).not.toHaveBeenCalled();
   expect(plan.dispatch).toEqual([]);
   expect(plan.refusals).toEqual([expect.objectContaining({ kind: 'nothing-owed', phase: 'queued', prNumber: 2748 })]);
 });
@@ -791,13 +795,17 @@ describe('enrichPrsWithBaseRefFacts (#4265)', () => {
 // caller back to the pre-#4265 ref-only comparison even with `enrichPrsWithBaseRefFacts` itself correct).
 it('runReconcilePass threads enrichBaseRef\'s output through to planReconcile (#4265)', async () => {
   const { runReconcilePass } = await import('../reconcile-pass.mjs');
-  const stackedPr = { statusCheckRollup: ['test', 'smoke', 'daemon-soak', 'soak-replay-gate'].map(name => ({ name, status: 'COMPLETED', conclusion: 'SUCCESS' })), number: 2578, baseRefName: 'lane/3681-ratify-daemon-lifecycle', comments: [] };
+  const head = 'a'.repeat(40);
+  const stackedPr = { headRefOid: head, rowsComplete: true, rowsHead: head,
+    statusCheckRollup: ['test', 'smoke', 'daemon-soak', 'soak-replay-gate'].map(name => ({ name, status: 'COMPLETED', conclusion: 'SUCCESS' })), number: 2578, baseRefName: 'lane/3681-ratify-daemon-lifecycle', comments: [] };
+  const readChecks = vi.fn(() => { throw new Error('complete snapshot must not hydrate'); });
   const enrichBaseRef = vi.fn((prs) => prs.map((pr) => ({ ...pr, baseRefSha: 'ddd4444' })));
   runReconcilePass({
     readPrs: () => [stackedPr], readAgents: () => [], enrich: (a) => a,
     enrichMainRed: (prs) => ({ prs, mainRedWindows: [] }), enrichAlreadyLanded: (prs) => prs,
-    enrichBaseRef,
+    enrichBaseRef, readChecks,
   });
+  expect(readChecks).not.toHaveBeenCalled();
   expect(enrichBaseRef).toHaveBeenCalledWith([expect.objectContaining(stackedPr)], { defaultBranch: 'main' });
 });
 
@@ -869,13 +877,17 @@ describe('enrichPrsWithSystemFixFacts (#4263)', () => {
 // `enrichBaseRef` wiring test above — a gap here would silently degrade every caller back to refusing forever.
 it('runReconcilePass threads enrichSystemFix\'s output through to planReconcile (#4263)', async () => {
   const { runReconcilePass } = await import('../reconcile-pass.mjs');
-  const escalatedPr = { statusCheckRollup: ['test', 'smoke', 'daemon-soak', 'soak-replay-gate'].map(name => ({ name, status: 'COMPLETED', conclusion: 'SUCCESS' })), number: 2783, headRefOid: 'aaa1111', comments: [] };
+  const head = 'a'.repeat(40);
+  const escalatedPr = { headRefOid: head, rowsComplete: true, rowsHead: head,
+    statusCheckRollup: ['test', 'smoke', 'daemon-soak', 'soak-replay-gate'].map(name => ({ name, status: 'COMPLETED', conclusion: 'SUCCESS' })), number: 2783, comments: [] };
+  const readChecks = vi.fn(() => { throw new Error('complete snapshot must not hydrate'); });
   const enrichSystemFix = vi.fn((prs) => prs.map((pr) => ({ ...pr, systemFixLanded: true })));
   runReconcilePass({
     readPrs: () => [escalatedPr], readAgents: () => [], enrich: (a) => a,
     enrichMainRed: (prs) => ({ prs, mainRedWindows: [] }), enrichAlreadyLanded: (prs) => prs,
-    enrichBaseRef: (prs) => prs, enrichSystemFix,
+    enrichBaseRef: (prs) => prs, enrichSystemFix, readChecks,
   });
+  expect(readChecks).not.toHaveBeenCalled();
   expect(enrichSystemFix).toHaveBeenCalledWith([expect.objectContaining(escalatedPr)], { repo: null });
 });
 
