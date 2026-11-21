@@ -79,6 +79,7 @@ function paths(value, name) {
 function envRecord(value) {
   record(value, 'env');
   for (const [key, entry] of Object.entries(value)) {
+    if (!key || key.includes('=') || key.includes('\0')) fail(`env key ${JSON.stringify(key)} must be non-empty and contain neither '=' nor NUL`);
     if (entry !== undefined && (typeof entry !== 'string' || entry.includes('\0'))) fail(`env.${key} must be a NUL-free string or undefined`);
   }
   transportPolicy(value);

@@ -5241,7 +5241,15 @@ restoring an old refresh timer must never make the staged slots discoverable.
 ## Launcher main-parity fixtures (SEC1 S1)
 
 The launcher snapshots the caller's `env` record, omits undefined values, and refuses
-non-string or NUL values. Before spawning, it removes runtime loader/startup injection
+non-string or NUL values. It also refuses empty keys and keys containing `=` or NUL,
+even when their values are undefined, before transport checks or runtime filtering.
+Node serializes env entries as `key=value`; an unchecked `=` in a key can therefore
+change the variable name seen by the child and bypass either policy. Keep refusal
+coverage for both agents and Codex review/edit modes, with the offending key in the
+diagnostic and zero resolver/spawn calls. The real-Git `ext::` regression must prove
+its local marker payload runs with the raw malformed env, then cannot run through
+the launcher. Removing the key check must redden both refusal and behavioral cases.
+Before spawning, it removes runtime loader/startup injection
 variables (`NODE_OPTIONS`, `NODE_PATH`, `LD_*`, `DYLD_*`, `*_OPTIONS`, and Python,
 Perl and Ruby loader/startup variables). Keep a named regression that inspects the
 spawn environment and runs a real Node child with a local preload payload to prove

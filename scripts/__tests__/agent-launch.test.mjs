@@ -47,7 +47,55 @@ const matrix = [
   ['formerly stripped non-runtime values', { GIT_SSH: '/caller/ssh', GIT_SSH_COMMAND: 'caller ssh', MAIN_PUSH_OK: '1', GH_TOKEN: 'caller-token', BASH_ENV: '/caller/startup' }],
   ['undefined and arbitrary', { OMIT: undefined, UNKNOWN: 'verbatim', EMPTY: '' }],
 ];
+const envLaunchPaths = [
+  ['codex edit', env => buildCodexDirectTaskDescriptor({ cwd, env, review: false })],
+  ['codex review', env => buildCodexDirectTaskDescriptor({ cwd, env, review: true })],
+  // Claude has no separate review/edit grammar; both roles use this same branch.
+  ['claude', env => ({ ...claude(), env })],
+];
+const invalidEnvKeys = [
+  ["GIT_CONFIG_PARAMETERS='protocol.ext.allow'", "'always'"],
+  ['GIT_ALLOW_PROTOCOL=ext:', 'ssh'],
+  ['NODE_OPTIONS=--require', '/caller/preload.cjs'],
+  ['BAD=KEY', 'value'],
+  ['BAD\0KEY', 'value'],
+  ['', 'value'],
+];
 describe('B1/B2 caller environment follows main except runtime injection, without any ambient merge', () => {
+  for (const [path, descriptor] of envLaunchPaths) {
+    it.each(invalidEnvKeys.flatMap(([key, value]) => [[key, value], [key, undefined]]))(
+      `refuses malformed env key %j with value %j before spawn (${path})`, (key, value) => {
+        const d = descriptor({ PATH: bin, [key]: value });
+        const reason = `env key ${JSON.stringify(key)}`;
+        refused(d, reason);
+        expect(() => buildAgentArgs(d)).toThrow(reason);
+      });
+    it.each(invalidEnvKeys.slice(0, 2))(
+      `never runs real Git ext transport through an equals-key env %j (${path})`, (key, value) => {
+        const marker = join(root, 'ext-ran');
+        writeFileSync(join(root, 'ext-probe'), '#!/bin/sh\nprintf EXT-RAN > "$EXT_MARKER"\nexit 1\n', { mode: 0o755 });
+        const env = { PATH: `${bin}:/usr/bin:/bin`, EXT_MARKER: marker,
+          GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: '/dev/null', GIT_CONFIG_SYSTEM: '/dev/null',
+          [key]: value };
+        const probe = childEnv => spawnSync('git', ['ls-remote', 'ext::./ext-probe'], {
+          cwd: root, env: childEnv, encoding: 'utf8', timeout: 2000, maxBuffer: 8192,
+        });
+        // Positive control: Node's key=value serialization really enables ext here.
+        const exposed = probe(env);
+        expect(exposed.error).toBeUndefined();
+        expect(readFileSync(marker, 'utf8')).toBe('EXT-RAN');
+        rmSync(marker);
+        const io = seam();
+        io.spawn.mockImplementation((_file, _args, options) => probe(options.env));
+        let rejection;
+        try { launchAgent(descriptor(env), io); } catch (error) { rejection = error; }
+        expect(existsSync(marker), 'ext transport must never execute').toBe(false);
+        expect(rejection).toBeInstanceOf(TypeError);
+        expect(rejection.message).toContain(`env key ${JSON.stringify(key)}`);
+        expect(io.spawn).not.toHaveBeenCalled();
+        expect(io.resolveBinary).not.toHaveBeenCalled();
+      });
+  }
   it('does not inherit omitted ambient bypasses, runtime options or Git pairs', () => {
     for (const [key, value] of Object.entries({ WE_HEAVY_ADMISSION: 'off', WE_PR_LIMIT_OFF: '1', NODE_OPTIONS: '--require x', GIT_CONFIG_COUNT: '1', GIT_CONFIG_KEY_0: 'core.sshCommand', GIT_CONFIG_VALUE_0: 'x' })) vi.stubEnv(key, value);
     const io = seam(); launchAgent(base(), io);
