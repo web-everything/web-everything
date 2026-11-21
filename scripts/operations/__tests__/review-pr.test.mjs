@@ -3547,13 +3547,13 @@ describe('#3383 — the opt-in Antigravity review seat (judgeAntigravityReview)'
     });
 
     // #3383 — the probation default, mirroring both Codex seats' own.
-    it('when the env var is UNSET, defaults to the injected probation check', () => {
-      expect(antigravityReviewFromEnv({ WE_REVIEW_SHADOW_AGY_PROMOTED: 'true' }, { isOnProbation: () => true })).toBe(true);
+    it('an explicit probation policy still uses the injected check', () => {
+      expect(antigravityReviewFromEnv({ WE_REVIEW_SHADOW_AGY_PROMOTED: 'true' }, { isOnProbation: () => true, readFile: () => JSON.stringify({ advisorySeats: { antigravityReview: 'probation' } }) })).toBe(true);
       expect(antigravityReviewFromEnv({}, { isOnProbation: () => false })).toBe(false);
     });
 
-    it('when the env var is UNSET, uses the shipped probation setting', () => {
-      expect(antigravityReviewFromEnv({})).toBe(defaultAntigravityReviewProbationCheck());
+    it('when the env var is UNSET, uses the shipped advisory off setting', () => {
+      expect(antigravityReviewFromEnv({})).toBe(false);
     });
 
     it('the real default probation check reads the ANTIGRAVITY identity, and Carbon probation bookkeeping does not auto-seat it', () => {
@@ -4949,8 +4949,8 @@ describe('Gemini admission and the Codex roster', () => {
 });
 
 describe('disabled agy shadows at the launch boundary', () => {
-  it('runs only Claude for mandatory seats and renders off (setting), without invoking the agy runner', async () => {
-    const seatSettings = loadReviewSeatSettings({ safeguards: { value: { shadowEnabled: false, sampleRate: 0.1, minNonClaudeSeats: 1 } }, log: () => {} });
+  it.each([undefined, false, true])('runs only Claude for mandatory seats and renders off (setting), without invoking the agy runner (promotion=%s)', async promoted => {
+    const seatSettings = loadReviewSeatSettings({ promoted: promoted === undefined ? undefined : { value: promoted, source: 'fixture' }, safeguards: { value: { shadowEnabled: false, sampleRate: 0.1, minNonClaudeSeats: 1 } }, log: () => {} });
     const declaration = buildReviewPrOperation({ readPr: stubReader(), seatSettings });
     const read = shapeReadFinding(stubReader()({ pr: 7, repo: 'o/n' }), { pr: 7, repo: 'o/n' });
     const seatRunner = vi.fn(() => { throw new Error('agy must not start'); });
@@ -5009,9 +5009,10 @@ describe('card-only light review', () => {
   });
 });
 
-it('Carbon pin and injected probation never auto-seat an unpromoted non-shadow reviewer', () => {
+it('correctness promotion does not auto-seat an additional Carbon advisory reviewer', () => {
   expect(antigravityReviewFromEnv({})).toBe(false);
-  expect(antigravityReviewFromEnv({ REVIEW_PR_ANTIGRAVITY_REVIEW: '1' }, { isOnProbation: () => true })).toBe(false);
+  // Explicit advisory opt-in still cannot bypass a refused correctness promotion.
+  expect(antigravityReviewFromEnv({ REVIEW_PR_ANTIGRAVITY_REVIEW: '1', WE_REVIEW_SHADOW_AGY_PROMOTED: 'false' }, { isOnProbation: () => true })).toBe(false);
 });
 
 describe('provider-unresponsive skips and required seat policy', () => {

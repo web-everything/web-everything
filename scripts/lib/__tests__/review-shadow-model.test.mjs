@@ -9,11 +9,12 @@ import { assertCrossVendorPanel, vendorOfModel, settingsFromRoutingPolicy, shado
 import { DEFAULT_ROUTING_POLICY, validateRoutingPolicy } from '../dispatch-routing-policy.mjs';
 import { buildShadowRow, compareShadowAnswers, summarizeShadowAgreement, summarizeCarbonPromotion, renderShadowReport } from '../review-shadow-agreement.mjs';
 import { runSeatWithProvider } from '../../operations/review-seat-runner.mjs';
+import { deriveVerdict } from '../jury-core.mjs';
 import { buildTrialReport } from '../agy-shadow-trial-report.mjs';
 import { reserveShadowSession } from '../review-shadow-budget.mjs';
 
 const model = 'gemini-4-argon-high';
-const routingModel = 'claude-opus-5-5-high';
+const routingModel = 'claude-sonnet-5-5-high';
 const finding = { summary: 'private finding text', file: 'scripts/example.mjs', line: 12, category: 'security/fail-open', disposition: 'blocker' };
 const claudeAnswer = { summary: 'Claude answer', findings: [finding] };
 const directive = { mode: 'shadow', model, fallbackModel: routingModel, modelSource: 'settings', repo: 'o/r', pr: 7, head: '123456789012abcdef', seat: 'correctness' };
@@ -33,6 +34,8 @@ const ok = { status: 'ok', sessionId: 'agy', value: { summary: 'agy', findings: 
 
 // These legacy Argon trials explicitly opt in to non-Carbon Gemini execution.
 beforeEach(() => {
+  // Historical shadow fixtures opt out of the newly shipped counted correctness seat.
+  vi.stubEnv('WE_REVIEW_SHADOW_AGY_PROMOTED', 'false');
   vi.stubEnv('WE_REVIEW_SEAT_CAP_AGY_GEMINI', '5');
   vi.stubEnv(CARBON_SHADOW_CAP_ENV, '1');
 });
@@ -81,7 +84,7 @@ describe('Carbon promotion settings and advisory guards', () => {
       expect(resolve({}, read)).toEqual({ value: 10, source: 'default' });
     }
   });
-  it('ships enabled watch-only Carbon with ten agreeing PRs as the reporting target', () => {
+  it('ships enabled Carbon with ten agreeing PRs as the reporting target', () => {
     expect(resolveShadowSeatModel({ env: {} })).toEqual({ value: 'gemini-4-carbon-high', source: 'settings' });
     expect(resolveShadowPromotionPrs({ env: {} })).toEqual({ value: 10, source: 'settings' });
     expect(resolveReviewSeatSafeguards({ env: {}, platform: {}, log: () => {} }).value.shadowEnabled).toBe(true);
@@ -528,7 +531,7 @@ it('persists served-model evidence through the shadow runner for promotion count
 });
 
 // Explicit promotion fixtures exercise counted seats without granting a default promotion.
-it.each(['false', undefined, 'garbage'])('unpromoted Carbon cannot occupy a non-shadow seat (%s)', async promoted => {
+it.each(['false', 'garbage'])('unpromoted Carbon cannot occupy a non-shadow seat (%s)', async promoted => {
   vi.stubEnv('WE_REVIEW_SHADOW_AGY_PROMOTED', promoted);
   const result = await run([ok], { mode: 'agy', model: 'gemini-4-carbon-high', onEscape: 'skip' });
   expect(result.models).toEqual([]);
@@ -579,5 +582,118 @@ describe('resolveShadowPromoted fails closed on an unreadable or malformed tool 
   it('an absent tool file lets the platform layer speak', () => {
     const readFile = () => { throw Object.assign(new Error('x'), { code: 'ENOENT' }); };
     expect(resolveShadowPromoted({ env: {}, readFile, platform, log: () => {} })).toMatchObject({ value: true });
+  });
+});
+
+
+describe('one counted Carbon correctness seat', () => {
+  const carbon = 'gemini-4-carbon-high';
+  const settings = () => loadReviewSeatSettings({ policy: DEFAULT_ROUTING_POLICY, aiRouting: {}, log: () => {} });
+  async function counted(agyRun) {
+    const rows = [];
+    const claudeJudge = vi.fn(async () => ({ value: claudeAnswer }));
+    const answer = await runSeatWithProvider({ lens: 'correctness', runId: 'promotion-test',
+      seatProvider: { ...seatProviderDirective(settings(), 'correctness', highCarePr), repo: 'o/r', pr: 7, head: 'head' } }, {
+      cwd: '.', claudeJudge, unwrap: x => x, wrap: value => value,
+      agyJuror: async () => { if (agyRun instanceof Error) throw agyRun; return agyRun; },
+      // This fixture exercises standard caps, independent of operator platform preferences.
+      readSeatSettings: () => ({ tool: {}, platform: {} }),
+      appendPromotion: row => { rows.push(row); return true; }, reserveSession: () => ({ allowed: true }), log: () => {},
+    });
+    return { answer, rows, claudeJudge };
+  }
+  it('correctness lens resolves to promoted agy-gemini Carbon seat; a Carbon error falls back to the Claude seat and never accepts', async () => {
+    vi.stubEnv('WE_REVIEW_SHADOW_AGY_PROMOTED', 'true');
+    const s = settings();
+    expect(s.seatProvider).toEqual({ correctness: 'agy', security: 'shadow' });
+    expect(seatProviderDirective(s, 'correctness')).toMatchObject({ mode: 'agy', model: carbon, promoted: true, onEscape: 'claude' });
+    const { answer, claudeJudge, rows } = await counted(new Error('login lost'));
+    expect(claudeJudge).toHaveBeenCalledOnce();
+    expect(answer.seatProvider.provider).toBe('claude');
+    expect(answer.findings).toEqual(claudeAnswer.findings);
+    expect(deriveVerdict(answer)).toBe('changes');
+    expect(rows).toHaveLength(1);
+    expect(rows[0]).toMatchObject({ repo: 'o/r', pr: 7, fallback: true, agyVerdict: null });
+  });
+  it.each([
+    null,
+    { status: 'failed', reasons: ['timeout'] },
+    { status: 'skipped', reasons: ['quota exhausted'] },
+    { status: 'ok', sessionId: 's', value: { summary: '', findings: [] } },
+    { status: 'ok', sessionId: 's', value: { summary: 'unparseable', findings: 'bad' } },
+    { status: 'ok', sessionId: 's' },
+    { status: 'ok', sessionId: 's', value: { summary: 'bad finding', findings: [null] } },
+  ])('Carbon timeout, quota or malformed answer falls back: %j', async failure => {
+    vi.stubEnv('WE_REVIEW_SHADOW_AGY_PROMOTED', 'true');
+    const { answer, claudeJudge, rows } = await counted(failure);
+    expect(answer.seatProvider.provider).toBe('claude');
+    expect(answer.findings).toEqual(claudeAnswer.findings);
+    expect(deriveVerdict(answer)).toBe('changes');
+    expect(claudeJudge).toHaveBeenCalledOnce();
+    expect(rows[0].fallback).toBe(true);
+  });
+  it('counts a valid Carbon answer without running Claude and records the attempt', async () => {
+    vi.stubEnv('WE_REVIEW_SHADOW_AGY_PROMOTED', 'true');
+    const { answer, claudeJudge, rows } = await counted(ok);
+    expect(answer.seatProvider).toMatchObject({ provider: 'agy', model: carbon });
+    expect(claudeJudge).not.toHaveBeenCalled();
+    expect(rows[0]).toMatchObject({ fallback: false, agyVerdict: 'changes', runId: 'promotion-test' });
+  });
+  it('promotion enables the default-disabled Gemini seat without changing other Gemini caps; explicit zero falls back', async () => {
+    vi.stubEnv('WE_REVIEW_SHADOW_AGY_PROMOTED', 'true');
+    // Vitest 1.x stringifies undefined; remove the key after registering its restoration.
+    vi.stubEnv('WE_REVIEW_SEAT_CAP_AGY_GEMINI', '');
+    delete process.env.WE_REVIEW_SEAT_CAP_AGY_GEMINI;
+    expect((await counted(ok)).answer.seatProvider.provider).toBe('agy');
+    expect(resolveProviderCap('agy-gemini', {}, () => ({ tool: {}, platform: {} }))).toBe(0);
+    vi.stubEnv('WE_REVIEW_SEAT_CAP_AGY_GEMINI', '0');
+    const result = await counted(ok);
+    expect(result.answer.seatProvider.provider).toBe('claude');
+    expect(result.rows[0].fallback).toBe(true);
+  });
+  it('ships promotion enabled and samples other lenses deterministically at about ten percent', () => {
+    expect(resolveShadowPromoted({ env: {}, log: () => {} }).value).toBe(true);
+    vi.stubEnv('WE_REVIEW_SHADOW_AGY_PROMOTED', 'true');
+    const s = settings();
+    expect(s.shadowPolicy).toMatchObject({ scope: 'sampled', sampleRate: 0.1 });
+    const selected = Array.from({ length: 2000 }, (_, i) => shadowSeatStatus(s, { repo: 'o/r', pr: i + 1 }));
+    expect(selected.filter(x => x === 'sampled').length).toBeGreaterThan(150);
+    expect(selected.filter(x => x === 'sampled').length).toBeLessThan(250);
+    expect(selected).toEqual(Array.from({ length: 2000 }, (_, i) => shadowSeatStatus(s, { repo: 'O/R', pr: i + 1 })));
+  });
+  it('promotion leaves red-team routing and the human gate unchanged', async () => {
+    const { derivePanelVerdict } = await import('../jury-core.mjs');
+    const { RED_TEAM_MODELS } = await import('../../operations/review-extra-seats.mjs');
+    const before = structuredClone(RED_TEAM_MODELS);
+    expect(before.codex.model).toMatch(/^gpt-/);
+    vi.stubEnv('WE_REVIEW_SHADOW_AGY_PROMOTED', 'true');
+    settings();
+    const { antigravityReviewFromEnv } = await import('../../operations/review-pr.mjs');
+    expect(antigravityReviewFromEnv({ WE_REVIEW_SHADOW_AGY_PROMOTED: 'true' }, { isOnProbation: () => true })).toBe(false);
+    expect(RED_TEAM_MODELS).toEqual(before);
+    expect(derivePanelVerdict({ lensVerdicts: { correctness: 'accept', security: 'accept' }, findings: [], humanRequired: true })).toBe('needs-human');
+  });
+  it('records JSONL and reports agreement, later confirmations, explicit false positives, timeouts and PR count', async () => {
+    const { appendPromotionRow, readPromotionRows, buildPromotionReport, renderPromotionReport } = await import(/* @vite-ignore */ '../' + 'review-carbon-promotion.mjs');
+    const dir = mkdtempSync(join(tmpdir(), 'carbon-promotion-'));
+    try {
+      const path = join(dir, 'promotion.jsonl');
+      const row = { repo: 'o/r', pr: 7, head: 'h', runId: 'r', model: carbon, status: 'ok', fallback: false,
+        agyVerdict: 'changes', agyFindings: [{ path: 'scripts/x.mjs', line: 10, normSummary: 'bad guard' }] };
+      expect(appendPromotionRow(row, { path })).toBe(true);
+      appendPromotionRow({ ...row, pr: 8, runId: 'timeout', status: 'failed', fallback: true, agyVerdict: null, agyFindings: [], reasons: ['timeout'] }, { path });
+      const runs = new Map([['r', { verdict: { verdict: 'changes' } }]]);
+      const later = new Map([['o/r#7', [{ findings: { read: { latestFix: { priorHead: 'h', files: { 'scripts/x.mjs': [10] } } } } }]]]);
+      const report = buildPromotionReport({ rows: readPromotionRows({ path }), runRecords: runs, prRuns: later });
+      expect(report).toMatchObject({ prs: 2, agreement: { agree: 1, compared: 1 }, confirmedFindings: 1, falsePositives: 0, timeouts: 1, fallbacks: 1 });
+      const falsePositive = { findings: { read: { findingIdentity: [{ path: 'scripts/x.mjs', normSummary: 'bad guard', rulings: [{ head: 'h', result: 'not-real' }] }] } } };
+      expect(buildPromotionReport({ rows: [row], prRuns: new Map([['o/r#7', [falsePositive]]]) }).falsePositives).toBe(1);
+      expect(buildPromotionReport({ rows: [row] })).toMatchObject({ pendingVerdicts: 1, pendingFindings: 1, falsePositives: 0 });
+      expect(renderPromotionReport(report)).toMatch(/agreement.*confirmed findings.*false positives.*timeouts.*2 PRs/);
+      const { main } = await import('../agy-shadow-trial-report.mjs');
+      let output = '';
+      main(['--promotion'], { readPromotion: () => readPromotionRows({ path }), write: text => { output += text; }, evidenceIO: { resolveDirs: () => [] } });
+      expect(output).toMatch(/agreement.*confirmed findings.*false positives.*timeouts.*2 PRs/);
+    } finally { rmSync(dir, { recursive: true, force: true }); }
   });
 });

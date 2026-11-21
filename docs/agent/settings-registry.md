@@ -58,7 +58,7 @@ Operator-prefs layer: ~/.plateau/platform-preferences.json is the requested oper
 | acceptCarryForward | scripts/settings/accept-carry-forward.json | 1 | "on" | pr | no | Carry an accept to a new head with an identical reviewed net diff. |
 | accounts | scripts/settings/claude-accounts.json | 6 | {"a":{"service":"we.claude-code.oauth","account":"acct-a","… | pr | no | Claude account IDs mapped to Keychain credentials, without secret values. |
 | adoption | scripts/settings/prototype-load.json | 2 | {"timeoutMs":600000,"pollMs":15000} | pr | no | Prototype load adoption timeout and polling interval. |
-| advisorySeats | scripts/settings/review.json | 1 | {"antigravityReview":"probation"} | pr | no | Provider advisory review seating policy. |
+| advisorySeats | scripts/settings/review.json | 1 | {"antigravityReview":"off"} | pr | no | Provider advisory review seating policy. |
 | aiRouting | scripts/settings/ai-routing.json | 0 | {} | pr | no | AI role routing overrides; empty preserves existing resolvers. |
 | alertAfterMinutes | scripts/settings/forge-share.json | 1 | 60 | pr | no | Duration before low remote execution share raises an alert. |
 | allowedKinds | scripts/settings/agy-build.json | 1 | ["doc-fix"] | env | no | Doc-fix only; test-fix refused until #8606 regardless of settings. Production confinement unavailable; repair size 1. |

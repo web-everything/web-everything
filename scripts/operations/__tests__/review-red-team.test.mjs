@@ -1015,7 +1015,7 @@ describe('R1077 builder company routing', () => {
     expect(calls.find(c => c[0] === 'seat')[1].provider).toBe('agy-gemini');
   });
 
-  it.each([undefined, 'false'])('falls back before reserving unpromoted Carbon despite a Gemini cap opt-in (promotion=%s)', async promoted => {
+  it.each(['false', 'garbage'])('falls back before reserving unpromoted Carbon despite a Gemini cap opt-in (promotion=%s)', async promoted => {
     const { io, calls } = policyIo({ readSeatSettings: () => ({ tool: { seatDailyCaps: { 'agy-gemini': 20 } }, platform: {} }) });
     const args = input(marker('codex'));
     args.env.WE_REVIEW_SHADOW_AGY_PROMOTED = promoted;

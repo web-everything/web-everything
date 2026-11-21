@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 /** Read-only evidence for one advisory agy model; Claude remains the mandatory seat. */
+import { readPromotionRows, buildPromotionReport, renderPromotionReport } from './review-carbon-promotion.mjs';
 import { readdirSync, statSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -202,7 +203,14 @@ export function loadRedTeam(rows, { exec = execFileSync } = {}) {
   return result;
 }
 
-export function main(args, { readRows = readShadowRows, write = (text) => process.stdout.write(text), evidenceIO } = {}) {
+export function main(args, { readRows = readShadowRows, write = (text) => process.stdout.write(text), evidenceIO, readPromotion = readPromotionRows } = {}) {
+  if (args.includes('--promotion')) {
+    if (args.some(arg => !['--promotion', '--json', '--no-gh'].includes(arg))) throw new Error('unknown promotion report argument');
+    const rows = readPromotion();
+    const report = buildPromotionReport({ rows, ...loadRunEvidence(rows, evidenceIO) });
+    write(args.includes('--json') ? `${JSON.stringify(report, null, 2)}\n` : `${renderPromotionReport(report)}\n`);
+    return;
+  }
   let model = resolveShadowSeatModel().value ?? 'gemini-4-argon-high', since = null;
   for (const arg of args) {
     if (arg.startsWith('--model=')) model = arg.slice(8);

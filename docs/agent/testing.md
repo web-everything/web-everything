@@ -1127,7 +1127,19 @@ that both drive modes preserve provider effort while retaining the request fallb
 
 ## Shadow reviewer agreement evidence
 
-`promotionReplaces` names the existing seat Carbon replaces on manual promotion (default `claude`); the pure `assertCrossVendorPanel` helper checks that the resulting panel retains a non-builder vendor, with tests preserving seat count for Claude, Codex and agy builders.
+Manual `shadowSeats.antigravity.promoted: true` with `promotionReplaces: claude` now replaces
+only the counted correctness seat with Carbon when `enabled` is true; disabling it keeps both mandatory seats on Claude. Security retains its Claude seat; the other Carbon
+shadows use `scope: sampled`, deterministic at 0.1. The agy-Claude shadow fallback and advisory use Sonnet.
+Carbon failure, timeout, quota/login loss, or empty/malformed answers fall back to Claude; only a valid
+Carbon answer counts. Promotion opts this one seat into the existing Gemini routing cap (explicit
+caps still win), with the existing atomic daily session budget. The separate Carbon advisory seat is explicitly off, so correctness promotion cannot auto-seat a second Carbon reviewer. Red-team routing and human gates are unchanged.
+`scripts/lib/__tests__/review-shadow-model.test.mjs` covers these boundaries, including the exact Tier-1 case.
+The append-only `agy-carbon-promotion.jsonl` lives beside the shadow ledger. Run
+`node scripts/lib/agy-shadow-trial-report.mjs --promotion` for agreement with the final stored panel
+verdict, later fix confirmations, explicit `not-real` false positives, timeouts/fallbacks and distinct PRs.
+This local report reads persisted runs without GitHub calls; unknown verdicts/findings stay pending.
+Fix proximity is confirmation evidence, never proof that an unconfirmed finding was false.
+The pure `assertCrossVendorPanel` helper retains its existing cross-vendor check.
 
 The agy mandatory-seat shadows are off by default (operator 2026-10-16).
 `review.shadowSeats.antigravity.enabled` / `WE_REVIEW_SHADOW_AGY_ENABLED` enables shadows only within the selected scope.
