@@ -8,7 +8,7 @@ import { launchAgent, buildAgentInvocation, buildAgentArgs, findAgentBinary, bui
 import { defaultShimDir, checkoutShimDir, isDaemonCaller } from '../lib/gh-app-shim.mjs';
 import { isUnderTest } from '../lib/under-test.mjs';
 import { laneGitHardeningEnv, laneHistoryProofEnv, LANE_GIT_CONFIG_PINS, LANE_HISTORY_CONFIG_PINS } from '../lib/lane-git-hardening.mjs';
-import { buildCodexDirectTaskDescriptor, CODEX_SHIM_DIR } from '../codex-direct-task.mjs';
+import { buildCodexDirectTaskDescriptor, runCodexDirectExec, CODEX_SHIM_DIR } from '../codex-direct-task.mjs';
 import { clearEnv, clearRestrictiveEnv } from './fixtures/agent-launch-env.mjs';
 
 const SID = '12345678-1234-4234-8234-123456789abc';
@@ -30,6 +30,40 @@ beforeEach(() => {
   vi.stubEnv('PATH', fixedPath());
 });
 afterEach(() => vi.unstubAllEnvs());
+
+// Explicit opt-in: this needs a local CLI login and a model call. Ordinary gates stay hermetic.
+function liveCodexAvailable() {
+  if (process.env.WE_AGENT_LAUNCH_LIVE_SMOKE !== '1') return false;
+  try { buildAgentInvocation({ ...base(), sandbox: 'read-only' }); return true; }
+  catch (error) {
+    if (/codex binary not found/.test(error.message)) return false;
+    throw error;
+  }
+}
+it.skipIf(!liveCodexAvailable())('opt-in live Codex --review preserves tightening env and excludes loaders and credentials', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'agent-live-codex-'));
+  try {
+    writeFileSync(join(root, 'env-probe.cjs'), `console.log('SEC1_ENV_PROBE ' + JSON.stringify({
+      fallback: process.env.WE_GH_AUTH_PERSONAL_FALLBACK, limit: process.env.WE_FIX_LOOP_MAX_SESSIONS,
+      nodeOptions: Object.hasOwn(process.env, 'NODE_OPTIONS'), token: Object.hasOwn(process.env, 'GH_TOKEN')
+    }));\n`);
+    vi.stubEnv('WE_GH_AUTH_PERSONAL_FALLBACK', 'refuse');
+    vi.stubEnv('WE_FIX_LOOP_MAX_SESSIONS', '1');
+    vi.stubEnv('NODE_OPTIONS', '--require=/sec1-must-not-load.cjs');
+    vi.stubEnv('GH_TOKEN', 'sec1-must-not-inherit');
+    const report = await runCodexDirectExec({ dir: root, gitDir: root, review: true, ephemeral: true,
+      task: 'Inspect the environment for this review by running exactly `node env-probe.cjs` once. Report its output. Do not edit files.',
+      logFile: join(root, 'events.jsonl'), stream: false, log: false, timeoutMs: 120000 });
+    expect(report.timedOut).toBe(false);
+    expect(report.code, report.stderr).toBe(0);
+    const events = report.stdout.trim().split('\n').map(line => JSON.parse(line));
+    const outputs = events.filter(event => event.type === 'item.completed' && event.item?.type === 'command_execution')
+      .flatMap(event => (event.item.aggregated_output ?? '').split('\n'));
+    // Check shell output, not the model's final prose about the environment.
+    const probes = outputs.filter(line => line.startsWith('SEC1_ENV_PROBE ')).map(line => JSON.parse(line.slice(15)));
+    expect(probes).toEqual([{ fallback: 'refuse', limit: '1', nodeOptions: false, token: false }]);
+  } finally { rmSync(root, { recursive: true, force: true }); }
+}, 150000);
 
 describe('closed grammar rejection: the PR #7022 attack classes', () => {
   it('1 refuses shell wrappers as agent or nested invocation data', () => {
@@ -606,9 +640,9 @@ describe('final audit: ambient hardening pins and unregistered parent restrictio
       }
     }
   });
-  it.each(['USER', 'User'])('does not widen the transport value user to the spelling %s', value => {
+  it.each(['USER', 'User'])('preserves ambient %s but does not widen caller transport exceptions', value => {
     setParent({ GIT_CONFIG_COUNT: '1', GIT_CONFIG_KEY_0: 'protocol.ext.allow', GIT_CONFIG_VALUE_0: value });
-    expect(configOf(envOf({}))).toEqual({});
+    expect(configOf(envOf({}))).toEqual({ GIT_CONFIG_COUNT: '1', GIT_CONFIG_KEY_0: 'protocol.ext.allow', GIT_CONFIG_VALUE_0: value });
     clearEnv('GIT_CONFIG_COUNT');
     expect(configOf(envOf({ GIT_CONFIG_COUNT: '1', GIT_CONFIG_KEY_0: 'PROTOCOL.ALLOW', GIT_CONFIG_VALUE_0: value }))).toEqual({});
   });
@@ -758,23 +792,74 @@ describe('final audit: ambient hardening pins and unregistered parent restrictio
     const caller = laneHistoryProofEnv({}, { remoteProbe: true });
     expect(configOf(envOf(caller))).toEqual(configOf(caller));
   });
-  // `user` is tighter than Git's default only for file (default user). For ext (default never) and for the global
-  // protocol.allow it loosens, so it is dropped from either source; only protocol.file.allow=user is kept.
+  it.each(['http', 'https', 'git', 'ssh', 'file', 'ext', 'custom+x', 'custom_name', 'tést'].flatMap(protocol =>
+    ['user', 'USER', 'User'].map(value => [protocol, value])))('preserves ambient user restrictions for %s=%s', (protocol, value) => {
+    const parent = { GIT_CONFIG_COUNT: '1', GIT_CONFIG_KEY_0: `protocol.${protocol}.allow`, GIT_CONFIG_VALUE_0: value };
+    setParent(parent);
+    expect(configOf(envOf({}))).toEqual(parent);
+  });
+  it.each(['protocol.allow', 'PROTOCOL.ALLOW', 'Protocol.https.Allow'])('preserves ambient %s=user with Git key casing', key => {
+    const parent = { GIT_CONFIG_COUNT: '1', GIT_CONFIG_KEY_0: key, GIT_CONFIG_VALUE_0: 'user' };
+    setParent(parent);
+    expect(configOf(envOf({}))).toEqual(parent);
+  });
+  it.each([' user', 'user ', '', 'sometimes', 'user\n'])('refuses invalid ambient transport policy %j before resolution or spawn', value => {
+    setParent({ GIT_CONFIG_COUNT: '1', GIT_CONFIG_KEY_0: 'protocol.https.allow', GIT_CONFIG_VALUE_0: value });
+    refused(base(), /ambient GIT_CONFIG_COUNT.*complete valid configuration/);
+  });
+  // Caller `user` exceptions must not enable ext or unlisted protocols. Parent policy is authoritative.
   it.each(['protocol.ext.allow', 'protocol.allow', 'PROTOCOL.ALLOW', 'Protocol.ext.Allow', 'protocol.FILE.allow',
-    'protocol.https.allow', 'protocol.custom+x.allow'])('drops %s=user from the parent and from the caller bag', key => {
-    setParent({ GIT_CONFIG_COUNT: '1', GIT_CONFIG_KEY_0: key, GIT_CONFIG_VALUE_0: 'user' });
-    expect(configOf(envOf({}))).toEqual({});
-    clearEnv('GIT_CONFIG_COUNT');
+    'protocol.https.allow', 'protocol.custom+x.allow'])('drops caller %s=user without a parent policy', key => {
     expect(configOf(envOf({ GIT_CONFIG_COUNT: '1', GIT_CONFIG_KEY_0: key, GIT_CONFIG_VALUE_0: 'user' }))).toEqual({});
   });
-  it('a parent protocol.allow=user is dropped and cannot shelter a caller protocol.ext.allow=user', () => {
+  it('a parent protocol.allow=user is preserved and cannot shelter a caller protocol.ext.allow=user', () => {
     setParent({ GIT_CONFIG_COUNT: '1', GIT_CONFIG_KEY_0: 'protocol.allow', GIT_CONFIG_VALUE_0: 'user' });
     const io = seam();
     launchAgent({ ...base(), inheritEnv: { GIT_CONFIG_COUNT: '2', GIT_CONFIG_KEY_0: 'protocol.ext.allow',
       GIT_CONFIG_VALUE_0: 'user', GIT_CONFIG_KEY_1: 'core.hooksPath', GIT_CONFIG_VALUE_1: '/dev/null' } }, io);
-    expect(configOf(io.spawn.mock.calls[0][2].env)).toEqual({ GIT_CONFIG_COUNT: '1',
-      GIT_CONFIG_KEY_0: 'core.hooksPath', GIT_CONFIG_VALUE_0: '/dev/null' });
+    expect(configOf(io.spawn.mock.calls[0][2].env)).toEqual({ GIT_CONFIG_COUNT: '2',
+      GIT_CONFIG_KEY_0: 'protocol.allow', GIT_CONFIG_VALUE_0: 'user',
+      GIT_CONFIG_KEY_1: 'core.hooksPath', GIT_CONFIG_VALUE_1: '/dev/null' });
   });
+  it('transport-policy matrix never turns a parent Git refusal into child permission', () => {
+    const root = mkdtempSync(join(tmpdir(), 'agent-transport-policy-'));
+    const protocols = ['http', 'https', 'git', 'ssh', 'file', 'ext', 'custom+x', 'custom_name', 'tést'];
+    try {
+      for (const protocol of protocols) {
+        const helper = join(root, `git-remote-${protocol}`);
+        writeFileSync(helper, '#!/bin/sh\necho transport-helper-reached >&2\nexit 1\n');
+        chmodSync(helper, 0o755);
+      }
+      for (const protocol of protocols) for (const key of ['protocol.allow', `protocol.${protocol}.allow`]) {
+        for (const policy of ['never', 'user', 'always', 'NEVER', 'USER', 'ALWAYS']) for (const fromUser of ['0', '1']) {
+          const parent = { GIT_CONFIG_COUNT: '1', GIT_CONFIG_KEY_0: key, GIT_CONFIG_VALUE_0: policy };
+          setParent(parent);
+          vi.stubEnv('GIT_PROTOCOL_FROM_USER', fromUser);
+          clearEnv('GIT_ALLOW_PROTOCOL');
+          const child = envOf({});
+          // Identical local helpers replace transport IO AFTER projection, solely for this policy probe.
+          const hermetic = { PATH: fixedPath(), HOME: root, GIT_EXEC_PATH: root,
+            GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: '/dev/null' };
+          const probe = env => spawnSync('git', ['-c', `remote.probe.vcs=${protocol}`, '-c', 'remote.probe.url=unused',
+            'ls-remote', 'probe'], { cwd: root, env: { ...env, ...hermetic }, encoding: 'utf8', timeout: 5000,
+            maxBuffer: 1024 * 1024 });
+          const before = probe({ ...parent, GIT_PROTOCOL_FROM_USER: fromUser });
+          const after = probe(child);
+          const label = `${key}=${policy}, GIT_PROTOCOL_FROM_USER=${fromUser}`;
+          const parentRefused = policy.toLowerCase() === 'never' || (policy.toLowerCase() === 'user' && fromUser === '0');
+          expect(before.error, label).toBeUndefined();
+          expect(after.error, label).toBeUndefined();
+          expect(before.stderr.includes(`transport '${protocol}' not allowed`), label).toBe(parentRefused);
+          expect(before.stderr.includes('transport-helper-reached'), label).toBe(!parentRefused);
+          if (parentRefused) {
+            expect(after.status, label).toBe(128);
+            expect(after.stderr, label).toContain(`transport '${protocol}' not allowed`);
+            expect(after.stderr, label).not.toContain('transport-helper-reached');
+          }
+        }
+      }
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  }, 30000);
   it('a caller protocol.ext.allow=user with no parent policy yields no GIT_CONFIG entry for ext', () => {
     const child = configOf(envOf({ GIT_CONFIG_COUNT: '2', GIT_CONFIG_KEY_0: 'protocol.ext.allow', GIT_CONFIG_VALUE_0: 'user',
       GIT_CONFIG_KEY_1: 'core.hooksPath', GIT_CONFIG_VALUE_1: '/dev/null' }));
@@ -823,6 +908,12 @@ describe('final audit: ambient hardening pins and unregistered parent restrictio
 
 describe('final audit: transport allowlist and bag-only limits', () => {
   const envOf = inheritEnv => buildAgentInvocation({ ...base(), ...(inheritEnv ? { inheritEnv } : {}) }, seam()).options.env;
+  it.each(['0', '1', 'false', 'invalid'])('preserves ambient GIT_PROTOCOL_FROM_USER=%s and ignores caller substitutions', value => {
+    vi.stubEnv('GIT_PROTOCOL_FROM_USER', value);
+    expect(envOf({ GIT_PROTOCOL_FROM_USER: '1' }).GIT_PROTOCOL_FROM_USER).toBe(value);
+    clearEnv('GIT_PROTOCOL_FROM_USER');
+    expect(envOf({ GIT_PROTOCOL_FROM_USER: '1' })).not.toHaveProperty('GIT_PROTOCOL_FROM_USER');
+  });
   it('forwards the parent GIT_ALLOW_PROTOCOL and ignores a caller value that could add ext', () => {
     vi.stubEnv('GIT_ALLOW_PROTOCOL', 'https');
     expect(envOf({ GIT_ALLOW_PROTOCOL: 'https:ext' }).GIT_ALLOW_PROTOCOL).toBe('https');

@@ -1142,6 +1142,7 @@ describe('runCodexDirectExec / codexDirectTask — the orchestrator, over an inj
       expect(pathIndex).toBeGreaterThan(0);
       expectedArgv[pathIndex] = `shell_environment_policy.set.PATH=${JSON.stringify(expectedPath)}`;
       expect(seen.argv).toEqual(expectedArgv);
+      expect(r.argv).toEqual(seen.argv);
       expect(seen.opts.env.PATH).toBe(expectedPath);
       expect(seen.stdin).toContain('do the thing');
       expect(seen.stdin).toMatch(/do not run `git commit`/);
@@ -1151,6 +1152,18 @@ describe('runCodexDirectExec / codexDirectTask — the orchestrator, over an inj
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
+  });
+
+  it.each([undefined, null])('codexDirectTask refuses non-string env value %s before spawning', async value => {
+    const dir = mkdtempSync(join(tmpdir(), 'we-codex-invalid-env-'));
+    const fn = vi.fn();
+    try {
+      await expect(codexDirectTask({ dir, task: 'review', review: true, stream: false,
+        env: { ...process.env, SEC1_INVALID_ENV: value }, spawnFn: fn, log: false,
+        execFn: (_bin, args) => args.includes('--absolute-git-dir') ? dir : args.includes('rev-parse') ? 'sha' : '',
+      })).rejects.toThrow(/inheritEnv.SEC1_INVALID_ENV must be a NUL-free string/);
+      expect(fn).not.toHaveBeenCalled();
+    } finally { rmSync(dir, { recursive: true, force: true }); }
   });
 
   it.each([false, true])('SIGKILLs the process group and child on timeout (group kill throws: %s)', async (groupKillThrows) => {

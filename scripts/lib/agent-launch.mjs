@@ -123,7 +123,8 @@ function classOf(rule, value, ceiling) {
 // (core.sshCommand, core.pager, url.*.insteadOf, even a harmless user.name) is dropped on its own, and the
 // kept pins are re-indexed in their original order, so one extra entry can never discard the protections.
 const GIT_PINS = [...LANE_GIT_CONFIG_PINS, ...REMOTE_PROBE_CONFIG_PINS, ...LANE_HISTORY_CONFIG_PINS];
-const GIT_TRANSPORT_POLICY = /^protocol\.(?:[a-z0-9+.-]+\.)?allow$/i;
+// Git subsection names also cover custom remote helpers, including underscores and Unicode.
+const GIT_TRANSPORT_POLICY = /^protocol\.(?:[^\n]+\.)?allow$/i;
 // Git compares the section and the variable name case-insensitively and the subsection exactly
 // (CORE.HOOKSPATH is core.hooksPath; gpg.SSH.program is not gpg.ssh.program).
 function gitKey(key) {
@@ -144,14 +145,14 @@ function gitValue(key, value) {
 const sameGitPair = ([k1, v1], [k2, v2]) => gitKey(k1) === gitKey(k2) && gitValue(k1, v1) === gitValue(k2, v2);
 // Transport candidates are also checked against the parent's policy in childGitConfig:
 // a protocol-specific exception takes precedence over Git's global protocol.allow setting.
-// `never` tightens every protocol.*.allow. `user` loosens Git's default for ext (never) and, as the global
-// protocol.allow, for every unlisted protocol, so it passes only as protocol.file.allow, whose Git default is
-// already `user`; only the exact lowercase value is accepted.
+// Caller `user` passes only for file (Git's default): it could enable ext or unlisted protocols otherwise.
+// Ambient `user` policies must survive even for normally allowed transports and the global policy:
+// dropping them would allow non-user-initiated operations the parent refused.
 const GIT_FILE_TRANSPORT = 'protocol.file.allow';
 const tighteningGitPair = (key, value) => GIT_PINS.some(pin => sameGitPair([key, value], pin))
   || (gitValue(key, value) === 'never' && GIT_TRANSPORT_POLICY.test(key))
   || (value === 'user' && gitKey(key) === GIT_FILE_TRANSPORT);
-function gitConfigPairs(env) {
+function gitConfigPairs(env, preserveTransportUser = false) {
   const raw = env.GIT_CONFIG_COUNT;
   if (typeof raw !== 'string' || !raw || /[^0-9]/.test(raw)) return null;
   const count = Number(raw);
@@ -164,16 +165,21 @@ function gitConfigPairs(env) {
     // Git's parse failure into a successful child operation. Empty values (helper resets) are valid.
     if (typeof key !== 'string' || typeof value !== 'string'
       || key.match(/^[a-z0-9-]+\.(?:[^\n]*\.)?[a-z][a-z0-9-]*$/i)?.[0] !== key) return null;
-    if (tighteningGitPair(key, value)) kept.push([key, value]);
+    // Git rejects invalid transport enums. Removing one from ambient config would turn that refusal into permission.
+    if (preserveTransportUser && GIT_TRANSPORT_POLICY.test(key)
+      && !['never', 'user', 'always'].includes(gitValue(key, value))) return null;
+    if (tighteningGitPair(key, value)
+      || (preserveTransportUser && gitValue(key, value) === 'user' && GIT_TRANSPORT_POLICY.test(key))) kept.push([key, value]);
   }
   return { count, kept };
 }
 // The sole indexed-config exception to GIT_*: from the parent AND the caller bag, only tightening pairs
-// pass (exact hardening pins, protocol.*.allow=never, protocol.file.allow=user). Every other entry drops on its own; kept pairs are
+// pass (exact hardening pins, protocol.*.allow=never, protocol.file.allow=user). Ambient transport user policies
+// also pass to preserve the parent's restrictions. Every other entry drops on its own; kept pairs are
 // re-indexed, parent pairs first, so no extra entry can discard a protection and no caller pair can add one
 // that loosens.
 function childGitConfig(ambient, inherit) {
-  const parent = gitConfigPairs(ambient);
+  const parent = gitConfigPairs(ambient, true);
   if (Object.hasOwn(ambient, 'GIT_CONFIG_COUNT') && !parent) {
     fail('ambient GIT_CONFIG_COUNT and indexed keys/values must form a complete valid configuration; repair the parent environment and retry');
   }

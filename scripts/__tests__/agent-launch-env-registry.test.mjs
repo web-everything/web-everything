@@ -440,6 +440,7 @@ const parityRules = Object.entries(registry).filter(([, rule]) => !rule.never
 // Explicit inventory prevents generic drop reasons from hiding executable redirects.
 const executableRedirects = [
   'EDITOR', 'VISUAL', 'PAGER', 'MANPAGER', 'BROWSER', 'LESSOPEN', 'LESSCLOSE', 'SSH_ASKPASS', 'SUDO_ASKPASS',
+  'GH_PAGER', 'GH_EDITOR', 'GH_BROWSER', 'GH_ASKPASS',
   'GIT_ASKPASS', 'GIT_EDITOR', 'GIT_EXEC_PATH', 'GIT_EXTERNAL_DIFF', 'GIT_PAGER', 'GIT_PROXY_COMMAND',
   'GIT_SEQUENCE_EDITOR', 'GIT_SSH', 'GIT_SSH_COMMAND', 'GIT_TEMPLATE_DIR', 'WE_GH_THROTTLE_GH_BIN', 'DEVELOPER_DIR',
   'WE_FUI_ROOT',
@@ -451,6 +452,24 @@ function executableRedirectDefects(rules) {
     !executableRedirects.includes(name) || rules[name]?.class !== 'drop' || rules[name]?.never !== true);
 }
 describe('parent parity minus never; caller bag stays tighten-only', () => {
+  it('requires non-gated drop rules named as guard bypasses to be never rules', () => {
+    for (const [name, rule] of Object.entries(registry)) {
+      if (rule.class !== 'drop' || rule.restrictiveValues || rule.restrictivePrefixes || rule.tighterThan) continue;
+      if (/(_OFF|BYPASS|SKIP|FORCE|UNVERIFIED|NO_.*CHECK|GUARD)$/.test(name)
+        || /guard bypass|disables? (?:the )?guard/i.test(rule.why)) expect(rule.never, name).toBe(true);
+    }
+  });
+  it.each(['LANE_GUARD_OFF', 'WE_PR_LIMIT_OFF', 'CONVEYOR_NO_KIND_CHECK', 'CONVEYOR_NO_READY_CHECK',
+    'WE_ORPHAN_FIX_GUARD', 'GH_PAGER', 'GH_EDITOR', 'GH_BROWSER', 'GH_ASKPASS'])('%s never crosses from either source', name => {
+    expect(ruleFor(name), name).toMatchObject({ class: 'drop', never: true });
+    for (const value of ['0', '1', '/tmp/sec1-executable']) {
+      clearEnv(name);
+      expect(childEnv({ [name]: value })).not.toHaveProperty(name);
+      vi.stubEnv(name, value);
+      expect(childEnv({})).not.toHaveProperty(name);
+      expect(childEnv({ [name]: value })).not.toHaveProperty(name);
+    }
+  });
   it('requires every inventoried or explicitly described executable redirect to be a never rule', () => {
     expect(executableRedirectDefects(registry)).toEqual([]);
   });

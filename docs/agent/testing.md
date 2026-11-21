@@ -5587,6 +5587,16 @@ Absent counts and zero counts ignore orphan indexed entries, as Git does. Valid 
 filtered per pair to exported hardening pins and supported transport policies. Caller pairs
 cannot replace a retained parent key. When the parent has a transport policy, caller transport
 pairs pass only as `never`, including when a remote-probe pin would otherwise allow `always`.
+Preserve ambient `protocol.allow=user` and `protocol.<name>.allow=user`: removing them can
+enable non-user-initiated operations on transports whose default is `always`. Caller `user`
+policies remain limited to file and cannot override any inherited transport policy.
+Preserve ambient `GIT_PROTOCOL_FROM_USER` verbatim and refuse caller substitutions;
+dropping its `0` value also turns a `user` policy into permission.
+Keep Git's case-insensitive enum spellings verbatim. Invalid ambient transport enums refuse
+launch before binary resolution or spawn, so removing a malformed policy cannot enable transport.
+The transport-policy matrix in `agent-launch.test.mjs` compares real parent/child Git behavior
+for global and per-protocol never/user/always policies with `GIT_PROTOCOL_FROM_USER=0|1`.
+Local stub helpers replace transport IO after projection, so permission probes require no network.
 Other Git config sources stay excluded. Audit affirmative dangerous `why` reasons and exact
 members of never families too: exact precedence must not accidentally reopen a family.
 Never rules cover runtime/shell injection, launcher-owned paths, exec redirects,
@@ -5604,11 +5614,23 @@ Named finding regressions preserve bag-only zero leak limits, exponential ambien
 throttle caps, WE_PLATFORM_PREFERENCES_FILE, WE_FIX_LOOP_MAX_SESSIONS,
 WE_DAEMON_MANAGED_CLONE and WE_GUARD_LISTING_MAX_BYTES. Keep all fourteen attack
 classes and all three #7022 escape regressions in the same scoped heavy-admission run.
+`WE_AGENT_LAUNCH_LIVE_SMOKE=1 npm run test:unit -- scripts/__tests__/agent-launch.test.mjs`
+also enables the real Codex review-mode smoke when a binary is installed. It requires a local
+CLI login and a model call; ordinary gates skip it. The smoke runs the direct-task review path
+through launchAgent, then asserts shell command output contains tightening controls and lacks
+NODE_OPTIONS and GH_TOKEN. A skipped smoke does not establish live compatibility.
+The direct-task boundary deliberately rejects undefined and null env values before spawn;
+callers must omit absent keys. Its argv report must equal the finalized spawned argv, including
+the agent directory in Codex's shell PATH.
 
 Executable redirects must be never rules even when their old class was plain drop.
 The registry suite pins an explicit redirect inventory, checks explicit redirect reasons
 against it, and rejects missing rules or missing never markers. Keep
-WE_GH_THROTTLE_GH_BIN in that inventory: the gh shim may set its real binary for its
+GH_PAGER, GH_EDITOR, GH_BROWSER and GH_ASKPASS in that fixed inventory even without repository
+env reads. The bypass-name sweep requires non-gated drop entries ending in OFF, BYPASS, SKIP,
+FORCE, UNVERIFIED, NO_*CHECK or GUARD to be never rules. Affirmative guard-bypass descriptions
+also require never; a source filename containing "guard" does not establish bypass semantics.
+Keep WE_GH_THROTTLE_GH_BIN in that inventory: the gh shim may set its real binary for its
 own invocation, but neither ambient nor caller-bag values cross the agent boundary.
 
 
