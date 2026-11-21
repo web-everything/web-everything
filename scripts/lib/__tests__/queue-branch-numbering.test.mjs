@@ -2,10 +2,16 @@ import { afterEach, beforeEach, describe, it, expect, vi } from 'vitest';
 import * as realFs from 'node:fs';
 import * as numberingWorktrees from '../queue-branch-numbering.mjs';
 import { numberPendingHashes } from '../../lane-drain.mjs';
-import { reserveCardNumber } from '../card-number-allocator.mjs';
 import { handNumberedNewItems } from '../../check-standards-rules.mjs';
 import { BRANCH_NUMBERING_CI_CONTRACT, mainAcceptsBranchNumbering, drainNumberedPairs, trustedDrainAuthors, assertWorktreeCard, exemptDrainNumberedItems, resolveQueueNumbering, hashBacklogFiles, isMergeGroupCiRun, mergeGroupHashRefusals, prepareBranchBeforeEnqueue, reservationPlan, finishBranchPreparation } from '../queue-branch-numbering.mjs';
 import { appendDaemonEvent } from '../daemon-events.mjs';
+
+const numberingIo = vi.hoisted(() => ({ git: null }));
+vi.mock('../proc-read.mjs', async (original) => {
+  const actual = await original();
+  return { ...actual, readGit: (args, options) => numberingIo.git
+    ? numberingIo.git(args, options) : actual.readGit(args, options) };
+});
 
 vi.mock('../card-number-ledger.mjs', () => ({ appendCardLedgerRows: vi.fn(() => new Map()) }));
 vi.mock('../daemon-events.mjs', () => ({ appendDaemonEvent: vi.fn(async () => true) }));
@@ -310,34 +316,44 @@ describe('queue branch numbering', () => {
     expect(x.fs.writeFileSync).toHaveBeenCalled();
     for (const [, , options] of x.exec.mock.calls) expect(options.env).toMatchObject({ GIT_CONFIG_COUNT: '1', GIT_CONFIG_KEY_0: 'core.hooksPath', GIT_CONFIG_VALUE_0: '/dev/null' });
   });
-  it("a reused reservation below main's highest number is pushed, not refused", () => {
-    const x = setup();
-    const exec = x.exec.getMockImplementation();
-    x.exec.mockImplementation((cmd, args, options) => args[0] === 'ls-tree' && args.includes('--name-only')
-      ? 'backlog/042-main.md\0backlog/043-main.md\0' : exec(cmd, args, options));
+  it("real deferred numbering reuses a reservation below main's highest number without pushing a reservation", () => {
+    const cwd = mkdtempSync(join(tmpdir(), 'queue-reused-reservation-'));
     const oid = 'a'.repeat(40);
-    const refs = new Map([['refs/card-ids/xabc123', oid], ['refs/number-reservations/041', oid]]);
     const git = vi.fn((args) => {
-      if (args[0] === 'fetch') return '';
+      if (args[0] === 'remote') return 'origin\n';
+      if (args[0] === 'ls-files') return args[1] === 'backlog/*.md'
+        ? 'backlog/xabc123-foo.md\n' : '';
+      if (args[0] === 'ls-tree') return 'backlog/042-main.md\0backlog/043-main.md\0';
+      if (args[0] === 'ls-remote') return `${oid}\trefs/card-ids/xabc123\n${oid}\trefs/number-reservations/041\n`;
       if (args[0] === 'cat-file') return JSON.stringify({
         id: 'xabc123', num: '041', owner: 'earlier-host', timestamp: '2026-11-21T00:00:00.000Z',
       }) + '\n';
-      throw Error(`unexpected reservation command ${args[0]}`);
+      if (args[0] === 'rm') { rmSync(join(cwd, args.at(-1))); return ''; }
+      if (['fetch', 'update-ref', 'grep', 'add', 'commit'].includes(args[0])) return '';
+      throw Error(`unexpected numbering command ${args[0]}`);
     });
-    const number = x.number.getMockImplementation();
-    x.number.mockImplementation((cwd, { minNext }) => {
-      const nnn = reserveCardNumber({ id: 'xabc123', git, minimum: minNext, evidence: { main: [42, 43], refs } });
-      return { ...number(cwd, { minNext }), assigned: [{ hash: 'xabc123', nnn }] };
-    });
-    expect(prepareBranchBeforeEnqueue(x.args)).toEqual({
-      action: 'numbered', newHead: 'new', assigned: [{ hash: 'xabc123', nnn: '041' }],
-    });
-    expect(x.number).toHaveBeenCalledWith('/tmp/fake/tree', { minNext: 44 });
-    expect(x.exec).toHaveBeenCalledWith('git', ['worktree', 'add', '--no-checkout', '--detach', '/tmp/fake/tree', x.args.traceHeadSha], expect.any(Object));
-    expect(x.exec.mock.calls.filter(([, args]) => args[0] === 'push')).toEqual([
-      ['git', ['push', '--no-verify', 'origin', 'HEAD:refs/heads/topic'], expect.objectContaining({ cwd: '/tmp/fake/tree' })],
-    ]);
-    expect(git.mock.calls.some(([args]) => args[0] === 'push')).toBe(false);
+    const execFile = (cmd, args, options) => {
+      expect(cmd).toBe('git');
+      return git(args, options);
+    };
+    const spawn = (cmd, args) => ({ status: 1, stdout: execFile(cmd, args), stderr: '', signal: null });
+    try {
+      mkdirSync(join(cwd, 'backlog'));
+      mkdirSync(join(cwd, '.claude/skills/batch-backlog-items'), { recursive: true });
+      writeFileSync(join(cwd, 'backlog/xabc123-foo.md'), '---\nkind: task\n---\nFoo\n');
+      vi.stubEnv('WE_DRAIN_READS_SOURCE', 'git');
+      vi.stubEnv('WE_JIT_READ_SOURCE', 'worktree');
+      numberingIo.git = git;
+      const result = numberPendingHashes(cwd, { minNext: 44, execFile, spawn });
+      expect(result).toMatchObject({ committed: true, assigned: [{ hash: 'xabc123', nnn: '041' }] });
+      expect(readFileSync(join(cwd, 'backlog/041-foo.md'), 'utf8')).toContain('bornAs: xabc123');
+      expect(git).toHaveBeenCalledWith(['cat-file', 'blob', oid], expect.any(Object));
+      expect(git.mock.calls.some(([args]) => ['push', 'hash-object'].includes(args[0]))).toBe(false);
+    } finally {
+      numberingIo.git = null;
+      vi.unstubAllEnvs();
+      rmSync(cwd, { recursive: true, force: true });
+    }
   });
   it.each(['worktree', undefined])('refuses branch numbering with read source %s before push or state write', readSource => {
     const x = setup();

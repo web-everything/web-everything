@@ -580,7 +580,7 @@ it.each(['fetch', 'ls-tree', 'truncated-tree', 'ls-remote'])('cleans up private 
   expect(calls).toContainEqual(['update-ref', '-d', ref]);
 });
 
-it.each(['fetch', 'truncated-tree'])('fails closed with high-water mark unavailable and no reservation push after %s', (failure) => {
+it.each(['fetch', 'truncated-tree'])('fails closed with high-water mark unavailable and no reservation push or blob write after %s', (failure) => {
   const git = vi.fn((args) => {
     if (args[0] === 'fetch' && args.at(-1).startsWith('refs/heads/main:refs/tmp/numbering-')) {
       if (failure === 'fetch') throw Error('injected snapshot fetch failure');
@@ -589,13 +589,13 @@ it.each(['fetch', 'truncated-tree'])('fails closed with high-water mark unavaila
     if (args[0] === 'ls-tree') return 'backlog/043-main.md';
     return '';
   });
-  expect(() => readNumberingEvidence(git)).toThrow(failure === 'fetch'
+  expect(() => reserveCardNumber({ id: 'xaaaaaa', git })).toThrow(failure === 'fetch'
     ? /high-water mark unavailable: injected snapshot fetch failure/
     : /high-water mark unavailable: truncated backlog tree/);
   const ref = git.mock.calls.find(([args]) => args[0] === 'fetch')[0].at(-1).split(':')[1];
   expect(ref).toMatch(/^refs\/tmp\/numbering-/);
   expect(git).toHaveBeenCalledWith(['update-ref', '-d', ref]);
-  expect(git.mock.calls.some(([args]) => args[0] === 'push')).toBe(false);
+  expect(git.mock.calls.some(([args]) => ['push', 'hash-object'].includes(args[0]))).toBe(false);
 });
 
 it('refuses allocation when private evidence ref cleanup fails', () => {
