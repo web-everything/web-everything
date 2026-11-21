@@ -13,7 +13,8 @@
 #      requires `workflow_run.event == 'push'` and a head repository equal to this one; see the admission
 #      comment on the job — those clauses are load-bearing security, not tidiness.
 #   2. ENFORCEMENT — the "Refuse an unverified SHA" step below re-derives, from the API, BOTH that the SHA is
-#      an ancestor of `main` and that `test`/`smoke` are green on their LATEST run for it. It exits non-zero
+#      an ancestor of `main` and that `test`/`smoke`/`daemon-soak` are green on their LATEST run for it (for a
+#      reused push: green in the certifying queue run's suite AND as the latest real execution). It exits non-zero
 #      unless both hold. This mirrors the sole-writer rule the drain already follows
 #      (`docs/agent/platform-decisions.md#event-driven-land-is-wake-only` clause 1): *a wake signal is never a
 #      trusted land order — the gate is still re-derived server-side*. Same principle, applied to deploy.
@@ -39,10 +40,9 @@
 #
 # Stated correctly: the trigger filter and the re-derive are BOTH load-bearing, and neither subsumes the other.
 #
-# KNOWN GAP, deliberately not fixed here (#xd6hbxe): the FUI sibling is checked out at its DEFAULT branch with no
-# `ref:`, so the build is not reproducible on the FUI side — a FUI change can alter what this deploys without
-# any WE commit. Pinning it needs its own decision (which FUI ref is "the" one for a WE deploy), so it stays a
-# separate item rather than a silent choice made here.
+# FUI PIN (closes the #xd6hbxe gap, PR #7224): every main-push CI run records the FUI revision its jobs checked
+# out (artifact `fui-sibling-<sha>`). The deploy checks out exactly that revision ("Resolve certified FUI
+# revision"); a missing or ambiguous record refuses the deploy unless break glass is set.
 #
 # CROSS-REPO build: WE's `build:docs` shells out to FUI's component-render tool
 # (../frontierui/dist/tools/component-render/cli.mjs, ratified ordering #1946/#2016), so CI must

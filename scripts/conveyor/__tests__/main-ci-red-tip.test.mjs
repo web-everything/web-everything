@@ -29,9 +29,11 @@ const completions = [
 ];
 function replay(time = '19:24:34') {
   const snapshot = runsAsOf(runs, at(time));
+  const checkRuns = [check('main-execution', 'success'), ...completions.map(([name, done], id) => at(done) <= at(time)
+    ? check(name, 'success', id) : { name, id, status: 'in_progress', conclusion: null })];
+  // A complete page (checksTotal === rows) is required before the marker can certify the tip (PR #7224).
   return { runs: snapshot, tip: { sha: TIP_SHA, runStatus: snapshot.find((r) => r.headSha === TIP_SHA).status,
-    requiredChecks, redCheckRuns, checkRuns: [check('main-execution', 'success'), ...completions.map(([name, done], id) => at(done) <= at(time)
-      ? check(name, 'success', id) : { name, id, status: 'in_progress', conclusion: null })] } };
+    requiredChecks, redCheckRuns, checksTotal: checkRuns.length, checkRuns } };
 }
 
 describe('main CI truth follows the tip (2026-10-11 incident)', () => {
@@ -76,7 +78,7 @@ describe('main CI truth follows the tip (2026-10-11 incident)', () => {
     expect(mainRedState(runs, { tip: { ...tip, runStatus: 'in_progress', checkRuns: [] } })).toEqual(mainRedState(runs));
   });
   it('uses the highest check id for a same-sha rerun, regardless of list order', () => {
-    const tip = { sha: RED_SHA, runStatus: 'completed', requiredChecks, checkRuns: [
+    const tip = { sha: RED_SHA, runStatus: 'completed', requiredChecks, checksTotal: 5, checkRuns: [
       check('main-execution', 'success'), check('test', 'success', 2), check('test', 'failure', 1),
       check('test-shard (3)', 'failure', 1), check('test-shard (3)', 'success', 2),
     ] };
@@ -155,7 +157,7 @@ describe('best-effort tip IO', () => {
         expect(argv.slice(2)).toEqual(['--jq', '.sha']);
         return `${TIP_SHA}\n`;
       }
-      if (argv[1] === `repos/example/repo/commits/${TIP_SHA}/check-runs?per_page=100`) return JSON.stringify({ check_runs: api(tip.checkRuns) });
+      if (argv[1] === `repos/example/repo/commits/${TIP_SHA}/check-runs?per_page=100`) return JSON.stringify({ total_count: tip.checkRuns.length, check_runs: api(tip.checkRuns) });
       if (argv[1] === `repos/example/repo/commits/${RED_SHA}/check-runs?per_page=100`) return JSON.stringify({ check_runs: api(redCheckRuns) });
       throw new Error(`unexpected read: ${argv}`);
     };

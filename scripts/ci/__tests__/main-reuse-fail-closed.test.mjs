@@ -60,11 +60,14 @@ describe('F5 main-ci-red-core.mjs:339 — only a successful marker bound to the 
       { CHANGES_RESULT: 'failure', SKIP: '' }])
       expect(runMarker({ ...full, ...change }).at(-1).conclusion, JSON.stringify(change)).toBe('failure');
   });
-  const tip = (markerCheck, suites = {}) => ({ sha: head, runStatus: 'completed', requiredChecks: ['test', 'smoke'], checkRuns: [
-    { id: 5, name: 'test', status: 'completed', conclusion: 'success', suiteId: suites.test ?? 9 },
-    { id: 6, name: 'smoke', status: 'completed', conclusion: 'success', suiteId: suites.smoke ?? 9 },
-    ...(markerCheck ? [{ id: 7, name: 'main-execution', status: 'completed', suiteId: 9, ...markerCheck }] : []),
-  ] });
+  const tip = (markerCheck, suites = {}, checksTotal) => {
+    const checkRuns = [
+      { id: 5, name: 'test', status: 'completed', conclusion: 'success', suiteId: suites.test ?? 9 },
+      { id: 6, name: 'smoke', status: 'completed', conclusion: 'success', suiteId: suites.smoke ?? 9 },
+      ...(markerCheck ? [{ id: 7, name: 'main-execution', status: 'completed', suiteId: 9, ...markerCheck }] : []),
+    ];
+    return { sha: head, runStatus: 'completed', requiredChecks: ['test', 'smoke'], checksTotal: checksTotal ?? checkRuns.length, checkRuns };
+  };
   const runs = [{ databaseId: 1, headSha: old, event: 'push', status: 'completed', conclusion: 'failure', createdAt: '2026-11-21T10:00:00Z' }];
   it.each([
     ['skipped marker (merge-group and light runs skip it)', { conclusion: 'skipped' }],
@@ -78,6 +81,12 @@ describe('F5 main-ci-red-core.mjs:339 — only a successful marker bound to the 
   it('required checks from different runs cannot share one marker', () => {
     expect(mainRedState(runs, { tip: tip({ conclusion: 'success' }, { smoke: 8 }) })).toMatchObject({ status: 'red' });
   });
+  it.each([['larger than the page (truncated read)', 101], ['missing', null], ['a string', '3']])(
+    'a marker cannot certify a check-runs page whose total is %s (self-review)', (_, checksTotal) => {
+      const t = tip({ conclusion: 'success' }, {}, checksTotal);
+      if (checksTotal === null) delete t.checksTotal;
+      expect(mainRedState(runs, { tip: t })).toMatchObject({ status: 'red' });
+    });
   it('a successful marker in the same run as every required check certifies the tip', () => {
     expect(mainRedState(runs, { tip: tip({ conclusion: 'success' }) })).toMatchObject({ status: 'green', via: 'tip-required-checks' });
   });

@@ -78,10 +78,12 @@ jobs:
   # A proven exact-SHA queue push can also be light; dispatch/schedule and unknown evidence run full CI. Fail closed: if this job fails, `light` is
   # empty (not 'true'), and `test` / `smoke` below fail on `needs.changes.result != 'success'`.
   #
-  # REQUIRED CHECKS STILL REPORT FROM REAL RUNNING JOBS: `test` and `smoke` keep running as jobs (they do
-  # the light work or a one-line pass) instead of being job-level skipped, because a SKIPPED required check
-  # reads `skipped`, which the drain's `reviewCiGate` (scripts/lib/review-ci-gate.mjs) does NOT treat as
-  # success. `daemon-soak` already finishes in seconds when no daemon code is touched (a card-only PR never is).
+  # REQUIRED CHECKS STILL REPORT FROM REAL RUNNING JOBS on PRs and merge groups: `test` and `smoke` keep
+  # running as jobs (they do the light work or a one-line pass) instead of being job-level skipped, because a
+  # SKIPPED required check reads `skipped`, which the drain's `reviewCiGate` (scripts/lib/review-ci-gate.mjs)
+  # does NOT treat as success. `daemon-soak` already finishes in seconds when no daemon code is touched (a
+  # card-only PR never is). The ONE exception is a reused main push (no PR gate reads it): there `test`,
+  # `smoke` and `daemon-soak` are job-level SKIPPED, so no reader mistakes reuse for fresh execution.
   changes:
     runs-on: ubuntu-latest
     timeout-minutes: 5

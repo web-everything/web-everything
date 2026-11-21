@@ -158,6 +158,16 @@ describe('planMainRedAlert — recovery requires affirmative conclusions or opti
       };
       if (checksTotal === undefined) delete observation.tip.checksTotal;
       const state = mainRedState(observation.runs, { tip: observation.tip });
+      if (via === 'tip-required-checks') {
+        // PR #7224: an incomplete page cannot bind the execution marker, so the core itself refuses to
+        // certify the tip and keeps the runs' red verdict; the outstanding alert is preserved, never cleared.
+        expect(state).toMatchObject({ status: 'red' });
+        const red = plan();
+        const held = plan({ ...observation, prev: red.next });
+        expect(kinds(held)).not.toContain('main-green');
+        expect(held.next.fingerprint).toBe(red.next.fingerprint);
+        return;
+      }
       expect(state.status).toBe('green');
       if (via === 'tip-required-checks') expect(state.via).toBe(via);
       else {

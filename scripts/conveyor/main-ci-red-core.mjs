@@ -339,7 +339,9 @@ export function mainRedState(runs, { tip } = {}) {
   // it), and only when it ran in the same check suite as every required check it would vouch for.
   // Required summaries alone (including historical pushes without the marker) cannot certify execution.
   const suite = marker?.suiteId;
-  const executionKnown = marker?.status === 'completed' && marker.conclusion === 'success'
+  // Only a COMPLETE check-runs page can bind the marker: a truncated page may hide a newer red check.
+  const complete = Number.isSafeInteger(tip?.checksTotal) && tip.checksTotal === checks.length;
+  const executionKnown = complete && marker?.status === 'completed' && marker.conclusion === 'success'
     && Number.isSafeInteger(suite) && suite > 0 && Array.isArray(tip?.requiredChecks)
     // Same presence rule as tipRequiredVerdict: PR-only required checks may be absent on main.
     && tip.requiredChecks.some(name => newest(name))
