@@ -39,6 +39,9 @@ import {
 const OK = { repo: 'web-everything/web-everything', pr: 1466, to: 'accepted', actor: 'reviewer', body: '# verdict' };
 
 describe('what this applier REFUSES', () => {
+  it.each([undefined, '', 'abc'])('refuses a clearance without a full head pin (%s)', expectedHead => {
+    expect(validateRequest({ ...OK, to: 'clear-human', operatorInstruction: 'clear it', expectedHead })).toMatchObject({ ok: false, error: expect.stringContaining('expectedHead') });
+  });
   /**
    * `clear-human` WAS refused outright here. Operator ruling 2026-08-19 — made with the weakness stated in
    * front of them — allows it when the request carries the instruction authorising it. These tests changed
@@ -50,14 +53,14 @@ describe('what this applier REFUSES', () => {
    * buys is that a clearance nobody asked for requires inventing a quote and publishing it.
    */
   it('ACCEPTS clear-human when the operator instruction is attached', () => {
-    const r = validateRequest({ ...OK, to: 'clear-human', operatorInstruction: 'remove the human tag on 1445' });
+    const r = validateRequest({ ...OK, to: 'clear-human', expectedHead: 'a'.repeat(40), operatorInstruction: 'remove the human tag on 1445' });
     expect(r.ok).toBe(true);
     expect(r.request.operatorInstruction).toBe('remove the human tag on 1445');
   });
 
   it('REFUSES clear-human with no instruction — the authorisation is the whole guard', () => {
     for (const operatorInstruction of [undefined, '', '   ', 42, null]) {
-      const r = validateRequest({ ...OK, to: 'clear-human', operatorInstruction });
+      const r = validateRequest({ ...OK, to: 'clear-human', expectedHead: 'a'.repeat(40), operatorInstruction });
       expect(r.ok).toBe(false);
       expect(r.error).toMatch(/operatorInstruction/);
     }
@@ -138,8 +141,9 @@ describe('the argv handed to the SINGLE HOME', () => {
     // VERBATIM, not paraphrased: a paraphrase is the agent's account of what it was told rather than what it
     // was told, and the single home posts this straight into the durable comment.
     const words = 'For now, I want to allow you to accept an explicit demand to remove human tag.';
-    const { request } = validateRequest({ ...OK, to: 'clear-human', operatorInstruction: words });
+    const { request } = validateRequest({ ...OK, to: 'clear-human', expectedHead: 'a'.repeat(40), operatorInstruction: words });
     expect(buildLabelArgv(request, null)).toContain(`--reason=${words}`);
+    expect(buildLabelArgv(request, null)).toContain(`--expect-head=${'a'.repeat(40)}`);
   });
 
   it('adds no --reason to an ordinary verdict', () => {

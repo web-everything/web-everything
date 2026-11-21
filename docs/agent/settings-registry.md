@@ -16,9 +16,9 @@ For repo defaults, edit the owner file through a PR and rebuild the consuming da
 
 ## Summary
 
-- Top-level keys: 157 (159 declaration rows).
-- Declared leaves: 587 (platform copies counted separately).
-- Instant top-level keys: 0; not instant: 157.
+- Top-level keys: 160 (162 declaration rows).
+- Declared leaves: 590 (platform copies counted separately).
+- Instant top-level keys: 0; not instant: 160.
 - Instant capacity leaves: 15.
 - Constants to settle: 312.
 - Instant gaps: 28.
@@ -61,6 +61,7 @@ Operator-prefs layer: ~/.plateau/platform-preferences.json is the requested oper
 | advisorySeats | scripts/settings/review.json | 1 | {"antigravityReview":"probation"} | pr | no | Provider advisory review seating policy. |
 | aiRouting | scripts/settings/ai-routing.json | 0 | {} | pr | no | AI role routing overrides; empty preserves existing resolvers. |
 | alertAfterMinutes | scripts/settings/forge-share.json | 1 | 60 | pr | no | Duration before low remote execution share raises an alert. |
+| allowedKinds | scripts/settings/agy-build.json | 1 | ["doc-fix"] | env | no | Doc-fix only; test-fix refused until #8606 regardless of settings. Production confinement unavailable; repair size 1. |
 | allowedSigners | scripts/settings/card-ledger-trust.json | 1 | [] | pr | no | Trusted card-ledger signers. |
 | archive | scripts/settings/archive-retention.json | 1 | {"runsBatchCap":5000} | pr | no | Archive retention and bounded archive batch policy. |
 | audit | scripts/settings/codex-audit.json | 10 | {"verdict":{"mode":"model"},"preExisting":{"mode":"block","… | pr | no | Audit verdict, pre-existing finding and protected path policy. |
@@ -128,6 +129,7 @@ Operator-prefs layer: ~/.plateau/platform-preferences.json is the requested oper
 | heavyAdmissionCap | scripts/dispatch-settings.json | 1 | 3 | pr | no | Maximum concurrent heavy commands admitted on the host. |
 | humanClearance | scripts/settings/human-clearance-carry.json | 1 | {"mechanicalCarry":"refuse"} | pr | no | Mechanical carry-forward policy for human clearance. |
 | humanReviewSurfaces | scripts/settings/human-review-surfaces.json | 1 | "narrow" | pr | no | Scope of surfaces requiring human review. |
+| kindMaxSize | scripts/settings/agy-build.json | 1 | 3 | env | no | Maximum direct confined agy build size for allowedKinds; repair dispatch remains size 1. |
 | launchAgentsDir | scripts/settings/prototype-load.json | 1 | "~/Library/LaunchAgents" | pr | no | Host directory for rendered launchd agent definitions. |
 | livenessSweep | scripts/settings/liveness-sweep.json | 11 | {"prNoMovementMinutes":120,"prRedUnownedMinutes":60,"selfUp… | pr | no | Staleness thresholds, escalation rungs and recovery attempt limits. |
 | loadGovernor | scripts/settings/load-governor.json | 10 | {"enabled":true,"targetLoadPerCore":2,"resumeBelowPerCore":… | pr | no | Host load targets, pause priorities and resumption thresholds. |
@@ -135,6 +137,7 @@ Operator-prefs layer: ~/.plateau/platform-preferences.json is the requested oper
 | mainFixCapacity | scripts/settings/main-fix-capacity.json | 1 | {"pastFixCap":true} | pr | no | Allow main-fix work beyond the ordinary fix cap. |
 | maxLiveReviewRounds | scripts/settings/review-concurrency.json | 1 | 8 | pr | no | Maximum concurrent host review rounds. |
 | maxLoadPerCore | scripts/dispatch-settings.json | 1 | 2 | pr | no | Host load ceiling per CPU core for dispatch admission. |
+| maxSize | scripts/settings/agy-build.json | 1 | 1 | env | no | Maximum direct confined agy build size for any kind; repair dispatch remains size 1. |
 | memFreeMinPct | scripts/dispatch-settings.json | 1 | 15 | pr | no | Minimum free memory percentage for dispatch admission. |
 | mergeDelivery | scripts/lib/delivery-platform-preferences.json | 5 | {"strategy":"drain-direct","batchSize":3,"maxGroupWaitMinut… | pr | no | Merge strategy, batch size, wait time and call concurrency. |
 | mergeDelivery | scripts/settings/merge-queue.json | 6 | {"strategy":"github-merge-queue","batchSize":5,"maxGroupWai… | pr | no | Merge strategy, batch size, wait time and call concurrency. |

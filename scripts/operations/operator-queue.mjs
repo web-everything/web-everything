@@ -140,7 +140,7 @@ export function redTeamRulingRow(repo, pr, setting = CONFIRMED_BREAKS_DEFAULTS) 
     redTeam: true,
     commands: {
       block: `${command} --to=changes --body-file=<fix-list.md> --actor=<your login> --channel='<where you ruled>'`,
-      notReal: `${command} --to=clear-human --actor=<your login> --reason='<your words>'`,
+      notReal: `${command} --to=clear-human --expect-head=<full 40-hex head SHA> --actor=<your login> --reason='<your words>'`,
     },
   };
 }
@@ -863,7 +863,7 @@ export function main(args = process.argv.slice(2), { sleep = blockingSleep, poll
       + `approved, all gates green, touches ${pr.paths.join(', ')} (only a person may enqueue)\n    merge: ${pr.command}`);
     if (mergeRows.length) { console.log(mergeRows.join('\n')); shownAhead = true; }
     printRows(report.ready.map((pr) => `${pr.repo}#${pr.number}  ${pr.title}`
-      + (pr.ceremonyOwed ? ` — ${pr.reason}\n    clear-human: node scripts/review-set-label.mjs ${pr.number} --repo=${pr.repo} --to=clear-human --actor=<your login> --reason='<your words>'`
+      + (pr.ceremonyOwed ? ` — ${pr.reason}\n    clear-human: node scripts/review-set-label.mjs ${pr.number} --repo=${pr.repo} --to=clear-human --expect-head=<full 40-hex head SHA> --actor=<your login> --reason='<your words>'`
         : (pr.humanHolds ? ` — merge-gate holds only for human review: ${pr.humanHolds.join(', ')}` : ''))).concat((report.needsYouStandDowns ?? []).map((pr) => `${pr.repo}#${pr.number}  ${pr.title}  [stood down ${pr.standDownAt || 'time unknown'} — the fixer asks] ${pr.question}`
       + pr.remaining.map((f) => `\n    - still needs your ruling: ${f.file || '(no file)'}${f.line != null ? `:${f.line}` : ''}  ${f.summary}`).join(''))).concat(report.needsPerson.map((pr) => `${pr.repo}#${pr.number}  ${pr.title}  [conveyor asks since ${pr.noteAt}] ${pr.headline}${pr.detail ? ` — ${pr.detail}` : ''}`
       + `\n    extend rounds: ${pr.commands.extendRounds}\n    send back past the cap: ${pr.commands.sendBack}\n    answer the stand-down: ${pr.commands.standDownAnswer}\n    close: ${pr.commands.close}`)).join('\n'));

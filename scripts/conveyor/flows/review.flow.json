@@ -230,7 +230,7 @@
       "owner": "none",
       "ownerCite": "scripts/lib/review-loop-policy.mjs:74-78,112-113",
       "wait": {
-        "for": "a human to run /review, or scripts/review-set-label.mjs --to=clear-human",
+        "for": "a human to run /review, or scripts/review-set-label.mjs --to=clear-human --expect-head=<full 40-hex head SHA>",
         "timeout": null,
         "onTimeout": null,
         "cite": "scripts/lib/review-loop-policy.mjs:74-78; scripts/review-set-label.mjs:180-181,225-234"
@@ -529,7 +529,7 @@
     {
       "from": "human-hold",
       "to": "accepted",
-      "on": "a human runs /review and answers accept, or runs review-set-label.mjs --to=clear-human",
+      "on": "a human runs /review and answers accept, or runs review-set-label.mjs --to=clear-human --expect-head=<full 40-hex head SHA>",
       "kind": "escalation",
       "cite": "scripts/review-set-label.mjs:225-262"
     },
