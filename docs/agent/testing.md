@@ -5982,3 +5982,10 @@ For fixtures with arbitrary branches, workflow files or cross-repo couples, use
 Keep full commit IDs consistent across listings, live reads, check runs and saved
 refresh records. Resolve the diff at the listed head when a capped commits read
 or a later push intentionally makes the commits tip or live head differ.
+
+## Live-owner review launch fixture imports
+
+Load `manual-daemon-pass-io.mjs` and `review-job.mjs` sequentially during collection in
+`pr-live-owner-watch.test.mjs`. The first review adapter case otherwise pays for the cold
+review launch graph inside its five-second timeout under coverage. Keep the adapter assertions
+and per-test deadlines intact, including the production dispatcher's moved-head refusal cases.

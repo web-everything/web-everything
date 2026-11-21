@@ -7,6 +7,11 @@ import { classifyOwner, planActions, processLive, selfAudit, detectSmells, runLi
 import { feedTail, resolveLiveOwnerSettings, createLiveOwnerWatchIo } from '../pr-live-owner-watch-io.mjs';
 import { keepAliveScript } from '../../lib/test-keepalive.mjs';
 
+// Load the review launch graph during collection; its cold transform/evaluation under coverage
+// must not consume the portable IO cases' five-second assertion budget. Keep the roots sequential.
+await import('../../operations/manual-daemon-pass-io.mjs');
+await import('../../operations/review-job.mjs');
+
 const NOW = Date.parse('2026-11-10T18:00:00Z'), MIN = 60_000;
 const ago = minutes => new Date(NOW - minutes * MIN).toISOString();
 const pr = (overrides = {}) => ({ number: 863, repo: 'web-everything/web-everything', headRefOid: 'a'.repeat(40),
