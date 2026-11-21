@@ -490,3 +490,29 @@ describe('non-converging counts rounds across sources and has no repeat veto', (
     expect(judge([two, rt(H(9), [['src/d.mjs', 5, 'delta timeout unit mismatch in header']])], on).verdict).not.toBe('non-converging');
   });
 });
+
+
+describe('non-converging stop precedes other verdict paths', () => {
+  const on = { nonConverging: { enabled: true }, trigger: 'review-cap' };
+  it('three identical review rounds stop before the unfixed-send-back path, even if refuted', () => {
+    const comments = Array.from({ length: 3 }, () => review(['- `src/a.mjs:1` — alpha parser drops the trailing record']));
+    expect(judge(comments, on).verdict).toBe('non-converging');
+    expect(judge(comments, { ...on, verify: () => ({ status: 'refuted', evidence: 'observed test' }) }).verdict).toBe('non-converging');
+  });
+  it('a weakening summary does not preempt a non-shrinking stop', () => {
+    const comments = [review(['- `src/a.mjs:1` — alpha parser drops the trailing record']), review(['- `src/b.mjs:2` — bypass the guard and fail-open'])];
+    expect(judge(comments, on).verdict).toBe('non-converging');
+  });
+  it('two non-shrinking red-team rounds stop before mechanical pushes and accepted review', () => {
+    const comments = [rt(H(1), [['src/a.mjs', 1, 'alpha parser drops the trailing record']]), rt(H(9), [['src/b.mjs', 2, 'beta cache never expires entries']])];
+    for (let i = 0; i < 2; i++) {
+      comments.push(bot('🔧 conveyor fix — re-armed for re-review\n\nThe previously accepted PR was re-pushed and its acceptance is being re-checked', at()));
+      comments.push(bot('✅ review — accepted\n\nRecorded by agent (unattended review-loop)', at()));
+    }
+    expect(judge(comments, on).verdict).toBe('non-converging');
+  });
+  it('an unconfirmed guard-path finding does not veto the stop', () => {
+    const comments = [rt(H(1), [['src/a.mjs', 1, 'alpha parser drops the trailing record']]), rt(H(9), [['src/b.mjs', 2, 'beta cache never expires entries'], ['scripts/lib/red-team-gate.mjs', 3, 'unproven guard issue', 'broken', false]])];
+    expect(judge(comments, on).verdict).toBe('non-converging');
+  });
+});

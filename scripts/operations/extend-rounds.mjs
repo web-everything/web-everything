@@ -6,7 +6,8 @@
  * the cap is sent back to the fixer when the grant covers the current round.
  */
 import { refuseDirectEntry } from '../lib/direct-entry-guard.mjs';
-import { judgeRound } from '../lib/round-judge.mjs';
+import { assertRoundGrantAllowed } from '../lib/round-grant-guard.mjs';
+export { validNonconvergenceDesignPath } from '../lib/round-grant-guard.mjs';
 import { op } from './registry.mjs';
 import { compute, effect as effectStep } from './step-kinds.mjs';
 import { OPERATOR_LOGINS, JUDGE_ACTOR } from '../lib/marker-authorship.mjs';
@@ -16,10 +17,6 @@ import {
 
 export const EXTEND_ROUNDS_OP = 'extend-rounds';
 export const ROUND_EXTENSION_POST_EFFECT = 'github.round-extension';
-
-export const validNonconvergenceDesignPath = (path) => typeof path === 'string'
-  && /^designs\/[A-Za-z0-9._-]*nonconvergence[A-Za-z0-9._-]*\.md(?![\s\S])/.test(path)
-  && !path.includes('..');
 
 /** Pure verdict: attribution is the operator's, with verbatim reason and an explicit channel. */
 export function planRoundExtension(read, input) {
@@ -40,17 +37,9 @@ export function planRoundExtension(read, input) {
   if (granted + by > MAX_TOTAL_ROUND_EXTENSIONS) {
     throw new Error(`this PR already has ${granted} extra round(s); +${by} would pass the ${MAX_TOTAL_ROUND_EXTENSIONS}-round ceiling`);
   }
-  const judgement = judgeRound({ pr, repo, head: read.headRefOid ?? '', trigger: 'review-cap',
-    comments: read.comments, files: read.files ?? [], nonConverging: { enabled: true } });
-  const hasDespite = despite !== undefined;
-  const validDespite = typeof despite === 'string' && /^R\d{1,6}(?![\s\S])/.test(despite)
-    && read.despiteDesign?.exists === true && validNonconvergenceDesignPath(read.despiteDesign.path);
-  if (hasDespite && !validDespite) {
-    throw new Error('--despite requires a ruling id and an existing designs/*nonconvergence*.md design');
-  }
-  if ((judgement.verdict === 'non-converging' || judgement.evidence?.failClosed) && !validDespite) {
-    throw new Error('non-converging round extension refused: route to redesign (R88/R115/D-R451)');
-  }
+  assertRoundGrantAllowed({ repo, pr, comments: read.comments, files: read.files,
+    headRefOid: read.headRefOid, despite, despiteDesign: read.despiteDesign });
+  const validDespite = despite !== undefined;
   const record = { version: 1, repo, pr, by, actor: String(actor).toLowerCase(),
     channel: String(channel).trim(), reason: String(reason), at: read.now, ...(validDespite ? { despite, despiteDesign: read.despiteDesign.path } : {}) };
   // Both override fields are bounded tokens; keep the shared grant record and trusted counting unchanged.

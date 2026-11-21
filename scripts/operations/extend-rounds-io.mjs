@@ -3,7 +3,7 @@ import { execFileSyncThrottled } from '../lib/gh-throttle.mjs';
 import { countGrantedRoundExtensions } from '../conveyor/round-extension-mark.mjs';
 import { OPERATOR_LOGINS } from '../lib/marker-authorship.mjs';
 import { ROUND_EXTENSION_POST_EFFECT, planRoundExtension, validNonconvergenceDesignPath } from './extend-rounds.mjs';
-import { existsSync } from 'node:fs';
+import { lstatSync, statSync } from 'node:fs';
 import { handoffHome } from '../lib/handoff-path.mjs';
 import { spawnSync } from 'node:child_process';
 import { dirname, join, resolve } from 'node:path';
@@ -28,11 +28,23 @@ const gh = (args, throttle) => execFileSyncThrottled('gh', args, {
   ...(throttle ? { throttle } : {}),
 });
 
+/** Establish regular-file evidence; a symlink is never a nonconvergence design. */
+export function readNonconvergenceDesign(path, { root = handoffHome() } = {}) {
+  let exists = false;
+  if (validNonconvergenceDesignPath(path)) {
+    try {
+      const fullPath = join(root, path);
+      exists = !lstatSync(fullPath).isSymbolicLink() && statSync(fullPath).isFile();
+    } catch { /* Unreadable or missing designs cannot authorize an override. */ }
+  }
+  return { path, exists };
+}
+
 export function readExtensionThread(repo, pr, { despiteDesign } = {}) {
   const thread = JSON.parse(gh(['pr', 'view', String(pr), '--repo', repo, '--json', 'state,comments,files,headRefOid']));
   return { ...thread, files: thread.files?.map((file) => file.path) ?? [],
     ...(validNonconvergenceDesignPath(despiteDesign)
-      ? { despiteDesign: { path: despiteDesign, exists: existsSync(join(handoffHome(), despiteDesign)) } } : {}) };
+      ? { despiteDesign: readNonconvergenceDesign(despiteDesign) } : {}) };
 }
 
 export function createExtendRoundsReader({ readThread = readExtensionThread, now = () => new Date().toISOString() } = {}) {

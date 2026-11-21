@@ -349,6 +349,17 @@ function judgeRoundUnsafe({ pr, repo = null, head, trigger, comments, files = []
     : statuteTouched.length ? `statute-file-uncertain-no-grant:${statuteTouched[0]}`
       : crossBroken.length ? `open-break-in-other-source-no-grant:${crossBroken[0].file}:${crossBroken[0].line}` : null);
 
+  // R469 / D-R451: count review and red-team rounds together, whichever source tripped the cap.
+  // This stop precedes other verdict paths; only confirmed guard findings veto it.
+  const xr = rounds.filter((r) => r.source === 'red-team' || r.source === 'review');
+  const xLatest = xr.at(-1);
+  const xPrev = xr.at(-2);
+  const xOpen = open(xLatest);
+  if (nonConverging?.enabled === true && xr.length >= 2 && xOpen.length > 0
+    && xOpen.length >= open(xPrev).length && !xOpen.some((f) => f.file && isGuardPath(f.file))) {
+    return done('non-converging', [`new-finding-class-each-round:${xr.length}-rounds-${xOpen.length}-new-findings`, 'route-to-redesign-D-R451']);
+  }
+
   if (annotated.length && refuted.length === annotated.length && crossBroken.length) reasons.push(`not-real-blocked-by-open-break-in-other-source:${crossBroken[0].file}:${crossBroken[0].line}`);
   if (annotated.length && refuted.length === annotated.length && !crossBroken.length) {
     if (guardFindings.length) return done('escalate', [`not-real-on-guard-code:${guardFindings[0].file}:${guardFindings[0].line}`, `all-${annotated.length}-findings-mechanically-refuted`]);
@@ -374,16 +385,6 @@ function judgeRoundUnsafe({ pr, repo = null, head, trigger, comments, files = []
       const cardOnly = fileList.length > 0 && fileList.every((f) => /^backlog\//.test(f));
       return done('grant', [`cap-spent-on-${m.pushes}-mechanical-re-pushes`, 'latest-review-accepted', ...(cardOnly ? ['card-only'] : [])], 1);
     }
-  }
-  // R469 / D-R451: count review and red-team rounds together, whichever source tripped the cap.
-  // A repeat does not veto this stop; the unfixed-after-send-backs path above still takes precedence.
-  const xr = rounds.filter((r) => r.source === 'red-team' || r.source === 'review');
-  const xLatest = xr.at(-1);
-  const xPrev = xr.at(-2);
-  const xOpen = open(xLatest);
-  if (nonConverging?.enabled === true && xr.length >= 2 && xOpen.length > 0
-    && xOpen.length >= open(xPrev).length && !xLatest.findings.some((f) => f.file && isGuardPath(f.file))) {
-    return done('non-converging', [`new-finding-class-each-round:${xr.length}-rounds-${xOpen.length}-new-findings`, 'route-to-redesign-D-R451']);
   }
   if (!latest) return done('send-back', ['no-parseable-findings-for-trigger']);
   if (diffGrowing) return done('suggest-split', [`diff-grew-${growth}-lines${growthRatio ? `-x${growthRatio.toFixed(2)}` : ''}`]);
