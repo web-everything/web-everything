@@ -4,6 +4,7 @@ size: 3
 parent: "4075"
 status: open
 scope: ["we:scripts/check-standards-rules.mjs", "we:scripts/conveyor/soak/"]
+scopeRationale: "we:scripts/conveyor/reconcile-core.mjs is the changed-tree input used to trigger the gate, not a deliverable to edit. we:vitest.soak.config.ts is the existing test configuration, run unchanged."
 dateOpened: "2026-11-21"
 tags: []
 ---
@@ -14,13 +15,13 @@ PR #7263's 2026-11-21 correctness review found that a valid rewrite of `latestHe
 
 ## Acceptance
 
-- When a diff touches `scripts/conveyor/reconcile-core.mjs`, a `check:standards` gate evaluates every registered soak break's `fixPresent(root)` on the changed tree and reports each missing fix by break id and source path.
+- When a diff touches `we:scripts/conveyor/reconcile-core.mjs`, a `check:standards` gate evaluates every registered soak break's `fixPresent(root)` on the changed tree and reports each missing fix by break id and source path.
 - The gate distinguishes deliberately absent fixes from regressions in previously present fixes, using explicit baseline evidence; an unreadable baseline or detector must produce an actionable failure rather than silently skip a break.
 - Pin the PR #7263 case: removing either chronology guard marker, or changing the fix-pushed condition without updating its marker, fails the gate before review.
 
 ## Test and proof plan
 
-Use isolated source roots to exercise present, stale, absent, and throwing detectors. Show the stale R618 fixture red and the synchronized fixture green. Include the full `scripts/conveyor/soak/breaks` run in the affected-test plan for reconcile changes, using `vitest.soak.config.ts`.
+Use isolated source roots to exercise present, stale, absent, and throwing detectors. Show the stale R618 fixture red and the synchronized fixture green. Include the full `we:scripts/conveyor/soak/breaks` run in the affected-test plan for reconcile changes, using `we:vitest.soak.config.ts`.
 
 ## Related work
 
