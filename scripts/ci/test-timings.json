@@ -402,6 +402,7 @@
   "scripts/ci/__tests__/fetch-main-history.test.mjs": 0.11,
   "scripts/ci/__tests__/quarantine-job-wiring.test.mjs": 0.08,
   "scripts/ci/__tests__/quarantine-skip.test.mjs": 0.82,
+  "scripts/ci/__tests__/measure-base.test.mjs": 0.01,
   "scripts/ci/__tests__/refresh-timings.test.mjs": 3.62,
   "scripts/ci/__tests__/review-fast-checks.test.mjs": 0.01,
   "scripts/ci/__tests__/shard-assign.test.mjs": 1.02,
