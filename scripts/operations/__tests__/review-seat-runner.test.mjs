@@ -729,15 +729,16 @@ describe('carbon shadow seat vs the agy-gemini live seat cap (R1062a)', () => {
     for (const [k, v] of Object.entries({ WE_REVIEW_SEAT_CAP_AGY_GEMINI: '0', ...env })) vi.stubEnv(k, v);
     const calls = [];
     const rows = [];
+    const logs = [];
     try {
       const out = await runSeatWithProvider({ ...REQUEST, seatProvider: { mode, model, seat: 'correctness', pr: 7, repo: 'o/r', ...extra } }, io({
         claudeJudge: async () => judgeOutcome({ summary: 'c', findings: [FINDING] }, { sessionId: 'claude-s' }),
         agyJuror: async (o) => { calls.push(o); return { status: 'ok', sessionId: 'agy-s', value: { summary: 'a', findings: [FINDING] } }; },
         appendRow: (row) => { rows.push(row); return true; },
-        log: () => {},
+        log: (m) => logs.push(String(m)),
         reserveSession: extra.dailyCap === undefined ? undefined : () => ({ allowed: false, reason: 'daily cap' }),
       }));
-      return { out, calls, rows };
+      return { out, calls, rows, logs };
     } finally { vi.unstubAllEnvs(); }
   };
 
@@ -747,8 +748,13 @@ describe('carbon shadow seat vs the agy-gemini live seat cap (R1062a)', () => {
     expect(rows[0]).toMatchObject({ status: 'ok' });
   });
   it('a live (non-shadow) agy-gemini seat with cap 0 is still skipped', async () => {
-    const { calls } = await run('agy', 'gemini-4-carbon-high', { WE_REVIEW_SEAT_CAP_CARBON_SHADOW: '5' }, { onEscape: 'skip' });
-    expect(calls).toHaveLength(0);
+    const promoted = { WE_REVIEW_SEAT_CAP_CARBON_SHADOW: '5', WE_REVIEW_SHADOW_AGY_PROMOTED: 'true' };
+    const capped = await run('agy', 'gemini-4-carbon-high', promoted, { onEscape: 'skip' });
+    expect(capped.calls).toHaveLength(0);
+    expect(capped.logs.join('\n')).toContain('agy-gemini seat cap 0');
+    // control: the same promoted live seat runs once the live cap is opened, so the skip above is the cap
+    const open = await run('agy', 'gemini-4-carbon-high', { ...promoted, WE_REVIEW_SEAT_CAP_AGY_GEMINI: '20' }, { onEscape: 'skip' });
+    expect(open.calls).toHaveLength(1);
   });
   it('a non-carbon gemini shadow with cap 0 is still skipped', async () => {
     const { calls } = await run('shadow', 'gemini-3-pro', { WE_REVIEW_SEAT_CAP_CARBON_SHADOW: '5' });
