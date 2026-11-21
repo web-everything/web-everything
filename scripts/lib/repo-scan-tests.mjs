@@ -43,6 +43,13 @@ const skipped = (file) => /(?:^|\/)(?:__tests__|__fixtures__|node_modules)(?:\/|
 /** @type {readonly RepoScanTest[]} */
 export const REPO_SCAN_TESTS = Object.freeze([
   {
+    test: 'scripts/__tests__/real-process-guard.test.mjs',
+    scope: 'full',
+    why: 'lists every tracked *.real.test.mjs and checks each is in the real-tier manifest and starts a real process; a rename or manifest edit anywhere must re-run it',
+    matches: (f) => /\.real\.test\.mjs$/.test(f) || f === 'scripts/settings/real-tier-manifest.json' || f === 'vitest.config.ts' || f === 'vitest.real.config.ts',
+    inputs: ['scripts/__tests__/real-process-guard.test.mjs', 'scripts/settings/real-tier-manifest.json', 'scripts/settings/real-process-test-baseline.json'],
+  },
+  {
     test: 'scripts/__tests__/capability-dispatch-only.test.mjs',
     scope: 'files',
     why: 'capability checks admit dispatch only; roster filtering and unapproved admission are forbidden per source file',
