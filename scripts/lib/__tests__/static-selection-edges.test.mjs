@@ -1,8 +1,8 @@
 /**
  * @file scripts/lib/__tests__/static-selection-edges.test.mjs
  * @description Tier-1 proof of the SHADOW-ONLY static selection edges (AO S1, #7121 rescope). The new module only
- *   informs a `shadow` field; it never changes `mode`, `tests` or `complete`. The production graph is pinned to
- *   the S2 baseline (negative tests per merge-path-checklist lines 2 and 7).
+ *   informs a `shadow` field; it never changes `mode`, `tests` or `complete`, and related-test-selection.mjs stays
+ *   byte-identical to main (negative tests per merge-path-checklist lines 2 and 7).
  */
 import { describe, it, expect } from 'vitest';
 import { readFileSync } from 'node:fs';
@@ -97,33 +97,11 @@ describe('shadow never changes the decision (checklist 7)', () => {
   });
 });
 
-describe('shadow preserves the production graph (checklist 2)', () => {
-  it('file bytes equal the S2 baseline', () => {
-    // S2 intentionally extends the production graph; pin that baseline rather than the historical S1 main.
-    // No live git access: future graph changes require explicit review of this snapshot.
+describe('related-test-selection stays byte-identical to main (checklist 2)', () => {
+  it('file bytes equal origin/main', () => {
+    // sha256 of the file on main at the time this change was written (pinned: no live git access in tests).
     const here = readFileSync('scripts/lib/related-test-selection.mjs', 'utf8');
-    expect(createHash('sha256').update(here).digest('hex')).toBe('e1971fc17e8e5373918e74cb298143b3ee68e76c855d9a3081c66ad099f3a2d7');
-  });
-  it.each(['complete', 'partial', 'throw'])('preserves a real shrinking selection with %s shadow evidence', kind => {
-    const contents = {
-      'docs/a.md': 'fixture',
-      'a.test.mjs': 'readFileSync("docs/a.md")',
-    };
-    const args = {
-      runGit: args => args[0] === 'merge-base' ? 'abc\n' : 'docs/a.md\n',
-      env: { [SELECTION_FLAG]: '1' },
-      files: Object.keys(contents),
-      readFile: path => contents[path],
-    };
-    const off = selectTests(args);
-    expect(off.mode).toBe('shrink');
-    expect(off.selectedFiles).toEqual(['a.test.mjs', 'docs/a.md']);
-    const { shadow, ...on } = selectTests({ ...args, shadow: () => {
-      if (kind === 'throw') throw new Error('shadow unavailable');
-      return { tests: ['unrelated.test.mjs'], partial: kind === 'partial' };
-    } });
-    expect(shadow.partial).toBe(kind !== 'complete');
-    expect(on).toEqual(off);
+    expect(createHash('sha256').update(here).digest('hex')).toBe('2ffa9cc250e7a89624dfa0152e41d73d8d38ccce3c96070012cf1aa194c2c0f3');
   });
   it('resolvedImportsOf snapshot: unchanged behaviour on main regex', () => {
     const files = new Set(['a/x.mjs', 'a/y.mjs', 'a/z.mjs']);
@@ -301,7 +279,7 @@ describe('audit regression: measure CLI report evidence', () => {
         if (file !== 'git') throw new Error('unexpected child process');
         if (args[0] === 'merge-base') return 'abc\n';
         if (args[0] === 'diff') return 'docs/a.md\n';
-        if (args[0] === 'ls-files') return ['docs/a.md', 'scripts/lib/x.mjs', 'a.test.mjs'].join(args.includes('-z') ? '\0' : '\n');
+        if (args[0] === 'ls-files') return 'scripts/lib/x.mjs\0';
         throw new Error(`unexpected git command: ${args[0]}`);
       };
       return { ...actual, execFileSync, default: { ...actual.default, execFileSync } };
@@ -317,7 +295,6 @@ describe('audit regression: measure CLI report evidence', () => {
         if (String(path) === 'selected.json') return selectedText;
         if (String(path).endsWith('/false-green-log.json')) return JSON.stringify(persisted);
         if (String(path).endsWith('/scripts/lib/x.mjs')) return '';
-        if (String(path).endsWith('/a.test.mjs')) return 'readFileSync("docs/a.md")';
         return actual.readFileSync(path, ...rest);
       },
       mkdirSync: () => {},
@@ -357,9 +334,6 @@ describe('audit regression: measure CLI report evidence', () => {
           ...(report === undefined ? [] : ['--vitest-json=audit-report.json']),
           ...(selected === undefined ? [] : ['--selected-json=selected.json'])];
         await import('../../readiness/test-selection.mjs');
-        // Exercise selected-json validation in shrink mode rather than silently taking the full-suite fallback.
-        expect(output.decision.mode).toBe(flag === '1' ? 'shrink' : 'full');
-        expect(output.decision.selectedFiles).toEqual(flag === '1' ? ['a.test.mjs', 'docs/a.md'] : []);
         expect(exit).toHaveBeenLastCalledWith(valid ? 0 : 1);
         expect(output.recorded).toEqual(recorded);
         expect(recorded.hadReport).toBe(valid);

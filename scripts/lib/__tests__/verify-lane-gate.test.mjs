@@ -1030,18 +1030,14 @@ describe('#verify-phase-admission', () => {
 
 // #5128 — graph reads and tracked-file discovery stay injected; no real repository graph.
 describe('#5128 — bounded related-test selection', () => {
-  function boundedGate(maxTests = 3, withReader = true, unreadableGraph = 0) {
+  function boundedGate(maxTests = 3, withReader = true) {
     const files = { 'scripts/hub.mjs': '', 'scripts/mid.mjs': "import './hub.mjs'",
       'scripts/direct.test.mjs': "import './hub.mjs'" };
     for (let i = 0; i < 6; i++) files[`scripts/deep${i}.test.mjs`] = "import './mid.mjs'";
     const git = fakeGit(['scripts/hub.mjs']);
-    let hubReads = 0;
     return resolveDefaultGate({ env: TODAY, fileConfig: { relatedMaxTests: maxTests, relatedDepth: 2 },
       runGit: args => args[0] === 'ls-files' && args.includes('--cached') ? Object.keys(files).join('\n') : git(args),
-      ...(withReader ? { readRepoFile: path => {
-        if (path === 'scripts/hub.mjs' && ++hubReads === unreadableGraph) throw new Error('injected read error');
-        return files[path];
-      } } : {}),
+      ...(withReader ? { readRepoFile: path => files[path] } : {}),
     });
   }
 
@@ -1051,13 +1047,6 @@ describe('#5128 — bounded related-test selection', () => {
     expect(gate.decision.selection.status).toBe('selection-truncated');
     expect(gate.decision.targets).toEqual(['scripts/hub.mjs']);
     expect(describeGate(gate)).toContain('selection-truncated');
-  });
-
-  it.each([1, 2])('keeps plain vitest related with no selection when graph %s has an unreadable source', unreadableGraph => {
-    const gate = boundedGate(3, true, unreadableGraph);
-    expect(gate.testCommand).toBe("npx vitest related 'scripts/hub.mjs' --run --passWithNoTests");
-    expect(gate.decision).not.toHaveProperty('selection');
-    expect(gate.decision.partial).toBe(false);
   });
 
   it('recognizes a requester without the limit (older base) as the default gate, not a whole-gate fallback', () => {
@@ -1310,8 +1299,7 @@ describe('explicit-list sharding', () => {
       const files = { 'scripts/hub.mjs': '', 'scripts/mid.mjs': "import './hub.mjs'", 'scripts/deep.test.mjs': "import './mid.mjs'", 'guard.test.mjs': '// guard' };
       for (let i = 0; i < 24; i++) files[`scripts/direct${i}.test.mjs`] = "import './hub.mjs'";
       for (const [file, content] of Object.entries(files)) writeFileSync(join(repo, file), content);
-      // Model a bounded local gate in both child checkouts, even when this fixture runs in CI.
-      const env = { ...process.env, CI: '', GITHUB_ACTIONS: '', WE_BUILD_FINAL_GATE: 'related', WE_BUILD_FINAL_GATE_STANDARDS: 'selected',
+      const env = { ...process.env, WE_BUILD_FINAL_GATE: 'related', WE_BUILD_FINAL_GATE_STANDARDS: 'selected',
         WE_VERIFY_SELECTION: 'pr', WE_VERIFY_RELATED: 'all', WE_VERIFY_RELATED_MAX_TESTS: '1', WE_VERIFY_RELATED_DEPTH: '2',
         WE_VERIFY_TEST_TIMEOUT_FACTOR: '1', WE_VERIFY_STANDARDS: 'ci-only', WE_VERIFY_REVERT_RED: 'off',
         WE_VERIFY_SHARD_MIN_TESTS: '24', WE_VERIFY_SHARD_SIZE: '12', WE_VERIFY_SHARD_PARALLEL: '3',
@@ -1556,60 +1544,5 @@ describe('related gate routing in a sibling checkout without the WE admission wr
       expect(run.status).toBe(0);
       expect(readFileSync(join(dir, 'wrapper-args'), 'utf8')).toBe('run -- npx vitest run src/a.test.ts --passWithNoTests');
     } finally { rmSync(dir, { recursive: true, force: true }); }
-  });
-});
-
-
-describe('S1 static selection composition', () => {
-  it.each([
-    ['spawnPath', "spawn('node', ['scripts/child.mjs'])"],
-    ['literalRead', "readFileSync('scripts/child.mjs')"],
-    ['alias', "import 'we:scripts/child.mjs'"],
-  ])('honours %s policy changes with the same cached reader and restores edges in CI', (edge, source) => {
-    const files = { 'scripts/child.mjs': '', 'scripts/consumer.test.mjs': source };
-    const git = fakeGit(['scripts/child.mjs']);
-    const readRepoFile = p => files[p];
-    const resolveUnder = env => resolveDefaultGate({ env: { ...TODAY, ...env },
-      fileConfig: { relatedMaxTests: 1000, relatedDepth: 2 }, readRepoFile,
-      runGit: args => args[0] === 'ls-files' && args.includes('--cached') ? Object.keys(files).join('\n') : git(args) });
-    const disabled = { WE_CI_SELECTION: JSON.stringify({ staticEdges: { spawnPath: true, alias: true, literalRead: true, [edge]: false } }) };
-    expect(resolveUnder({}).decision.targets).toContain('scripts/consumer.test.mjs');
-    expect(resolveUnder(disabled).decision.targets).not.toContain('scripts/consumer.test.mjs');
-    expect(resolveUnder({ ...disabled, CI: 'true' }).decision.targets).toContain('scripts/consumer.test.mjs');
-    expect(resolveUnder(disabled).decision.targets).not.toContain('scripts/consumer.test.mjs');
-    expect(resolveUnder({ ...disabled, GITHUB_ACTIONS: 'true' }).decision.targets).toContain('scripts/consumer.test.mjs');
-  });
-  const gate = (files, env = TODAY, relatedMaxTests = 1000) => {
-    const git = fakeGit(['scripts/child.mjs']);
-    return resolveDefaultGate({ env, fileConfig: { relatedMaxTests, relatedDepth: 2 },
-      runGit: args => args[0] === 'ls-files' && args.includes('--cached') ? Object.keys(files).join('\n') : git(args),
-      readRepoFile: p => files[p] });
-  };
-  it('adds a transitive spawn importer to local related targets without changing its local cap', () => {
-    const files = { 'scripts/child.mjs': '', 'scripts/helper.mjs': "spawn('node', ['scripts/child.mjs'])",
-      'scripts/consumer.test.mjs': "import './helper.mjs'" };
-    const result = gate(files);
-    expect(result.testCommand).toContain("'scripts/consumer.test.mjs'");
-    expect(result.decision.selection).toMatchObject({ partial: false, maxTests: 1000 });
-    expect(gate(files, { ...TODAY, CI: 'true' }).decision.selection).toMatchObject({ partial: false, maxTests: 0 });
-  });
-  describe.each([
-    ['additionalTests', 1000], ['truncated tests', 1],
-  ])('oversized %s', (_list, relatedMaxTests) => {
-    it.each([
-      ['count', 301, 0], ['bytes', 200, 160], ['count and bytes', 500, 90],
-    ])('falls back to plain vitest related when %s overflows', (_bound, count, padding) => {
-      const files = { 'scripts/child.mjs': '' };
-      Array.from({ length: count }, (_, i) => {
-        files[`scripts/${'x'.repeat(padding)}${i}.test.mjs`] = "readFileSync('scripts/child.mjs')";
-      });
-      const result = gate(files, TODAY, relatedMaxTests);
-      expect(result.command).not.toBeNull();
-      expect(result.testCommand).toBe("npx vitest related 'scripts/child.mjs' --run --passWithNoTests");
-      expect(result.decision.targets).toEqual(['scripts/child.mjs']);
-      expect(result.decision.partial).toBe(false);
-      expect(result.decision.selection).toMatchObject({ status: 'complete', tests: null, additionalTests: [] });
-      expect(result.decision.selection.reason).toContain('list unusable');
-    });
   });
 });
