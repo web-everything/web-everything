@@ -1,0 +1,15 @@
+{
+  "$comment": "Selection: standard \u2192 platform \u2192 this file \u2192 WE_CI_SELECTION (JSON block). Invalid leaves retain lower-layer values. CI always uses maxTestsInCi=0 (unlimited); local relatedMaxTests remains caller-owned. staticEdges switches disable conservative source-wide literal/path-expression scanning or aliases. trace collects shadow evidence only; it never changes selection. Effective sources use policy-cascade logging (WE_POLICY_CASCADE_LOG=1).",
+  "ci": {
+    "selection": {
+      "maxTests": 0,
+      "maxTestsInCi": 0,
+      "staticEdges": {
+        "spawnPath": true,
+        "alias": true,
+        "literalRead": true
+      },
+      "trace": { "enabled": true, "maxEdgesPerTest": 5000 }
+    }
+  }
+}

@@ -5053,6 +5053,51 @@ Run this file and `daemon-rebuild-events.test.mjs` through heavy admission. This
 rule does not reset overlay main-sync parking or add retries for parked overlays.
 
 
+## Static selection edges and replay (affected-only CI S1)
+
+`related-test-selection.mjs` shares forward and reverse edges for imports, aliases,
+spawned script paths and literal reads. Its source-wide path scan is conservative:
+ambiguous literal expressions can add tests. Sibling aliases retain their textual
+key and match a tracked vendored counterpart when available; they do not read sibling
+repositories. CI uses the unlimited `ci.selection.maxTestsInCi` setting; local
+`relatedMaxTests` stays caller-owned. Truncation carries `partial: true`.
+Untruncated selection retains changed-file targets for `vitest related` and adds graph-reachable
+tests: regex discovery is supplemental, never proof that all valid imports were parsed.
+Require every changed target in the tracked inventory; an absent target (including a
+committed deletion) forces the full suite.
+
+`selection-replay.mjs` compares import-only and static selection on the current tracked
+tree. PR diff test paths are only related-test proxies. Supply `--evidence=relative.json`
+with failing/related test lists to assess misses; absent evidence is labelled incomplete.
+A historical miss cannot be attributed to the parser merely because it happened:
+probe the actual imports. The current merge-gate-hold-class test is a direct importer
+and is reached even with all new static edge kinds disabled. The named test
+`preserves the observed merge-gate-hold-class direct imports, including multiple named imports`
+in `scripts/lib/__tests__/related-test-selection.test.mjs` passes all three switches as `false`.
+Review lens: every “even with X disabled” claim must cite a test that explicitly disables X.
+
+
+## Shadow dependency tracing (S2)
+
+Append ` --import="file:///absolute/repo/scripts/ci/dep-trace.mjs"` to existing `NODE_OPTIONS`
+and set `WE_TRACE_TEST` to the repo-relative test file and `WE_TRACE_DIR` to an artifact directory.
+Node 22 uses `module.register` plus a loader message port; synchronous exit drains pending loader edges.
+Each process emits `trace-<pid>.json`; merge with `mergeTraces`, then replay via
+`scripts/readiness/trace-coverage.mjs trace-map.json misses.json [static-selected.json]`.
+Omitting static evidence prints `staticEvidence: "not supplied"`; static and additional counts
+are `null` (unknown). An explicit empty static list means known zero static coverage.
+Tracing stays shadow-only. The edge cap applies per process; a cap warning means incomplete evidence:
+rerun with a larger `ci.selection.trace.maxEdgesPerTest` before interpreting coverage.
+Keep tracer tests mock-only: inject filesystem/child-process objects and exercise loader hooks directly.
+Review lens: each settings catch fallback needs a named test forcing the loader to fail,
+including malformed input and valid overrides. The `honours fallback settings after loader failure`
+cases in `scripts/ci/__tests__/dep-trace.test.mjs` exercise startup's fallback directly.
+Review lens: the child-process wrappers must never throw where unwrapped Node would not. Every `cwd` form
+Node accepts (string, `Buffer`, file `URL` from any realm) resolves; any other value goes to Node unchanged
+for Node to judge. A non-string `NODE_OPTIONS` is stringified. A deleted working directory makes
+`process.cwd()` throw; tracing then resolves absolute paths only. The options object keeps the caller's
+prototype chain, and env is copied with `for…in` and falls back on a falsy value, as Node does. The
+`accepts a … cwd`, `never throws`, `keeps an … cwd` and `inherited env keys` cases pin this.
 ## Workflow-protection review admission
 
 The `required-admission-gates-deadlock-review` soak probes the hold classifier and unchanged

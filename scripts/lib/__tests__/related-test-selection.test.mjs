@@ -2,8 +2,12 @@
  * @file scripts/lib/__tests__/related-test-selection.test.mjs
  * @description #5128 — bounded selection keeps direct importers; all fixtures live in memory.
  */
-import { describe, expect, it } from 'vitest';
-import { buildReverseImportGraph, resolveSpecifier, testDepths, selectRelatedTests, isVitestTestFile } from '../related-test-selection.mjs';
+import { describe, expect, it, vi } from 'vitest';
+import { runInNewContext } from 'node:vm';
+import { replaySelections, runReplayCli } from '../../readiness/selection-replay.mjs';
+import { selectTests } from '../../readiness/test-selection.mjs';
+import { buildReverseImportGraph, resolveSpecifier, testDepths, selectRelatedTests, isVitestTestFile, resolvedImportsOf } from '../related-test-selection.mjs';
+import { loadCiSelection } from '../ci-selection-settings.mjs';
 
 const graph = files => buildReverseImportGraph({ files: Object.keys(files), readFile: path => files[path] });
 function hubFiles() {
@@ -15,7 +19,7 @@ function hubFiles() {
   }
   return files;
 }
-const selectHub = overrides => selectRelatedTests({ changedFiles: ['hub.mjs', 'changed.test.mjs'],
+const selectHub = overrides => selectRelatedTests({ env: {}, changedFiles: ['hub.mjs', 'changed.test.mjs'],
   reverse: graph(hubFiles()), maxTests: 5, maxDepth: 2, ...overrides });
 
 describe('#5128 — related import graph', () => {
@@ -46,12 +50,41 @@ describe('#5128 — related import graph', () => {
   });
 
   it.each([
+    `import x from /* c */ \n /* d */ "../x.mjs"`,
+    `export * from /* c */ \n /* d */ "../x.mjs"`,
+    `import /* c */ \n /* d */ "../x.mjs"`,
+    `import /* c */ ( /* d */ "../x.mjs" /* e */ )`,
+    'import /* c */ ( /* d */ `../x.mjs`)',
+    ...['require', 'mock', 'doMock', 'unmock', 'doUnmock', 'importActual', 'importMock']
+      .map(name => `${name === 'require' ? '' : 'vi.'}${name} /* c */ ( /* d */ "../x.mjs")`),
+  ])('reads block comments and whitespace between specifier tokens: %s', source => {
+    expect(graph({ 'x.mjs': '', 'src/main.mjs': source }))
+      .toEqual(new Map([['x.mjs', new Set(['src/main.mjs'])]]));
+  });
+
+  it.each([
     ['./m.mjs', 'src/m.mts'], ['./folder2', 'src/folder2/index.tsx'], ['./folder3', 'src/folder3/index.cjs'],
     ['./g', 'src/g.mjs'], ['./h.js', 'src/h.ts'], ['./g.mjs?raw', 'src/g.mjs'],
     ['./folder', 'src/folder/index.ts'], ['node:fs', null], ['vitest', null], ['./missing', null], ['../../outside', null],
   ])('resolves %s to %s', (specifier, expected) => {
     expect(resolveSpecifier('src/main.mjs', specifier, new Set(['src/g.mjs', 'src/h.ts', 'src/folder/index.ts', 'src/m.mts', 'src/folder2/index.tsx', 'src/folder3/index.cjs'])))
       .toBe(expected);
+  });
+
+  it.each([
+    'from ', 'import ', 'import (', 'require (', 'vi.mock (', "import ('./x.mjs'",
+  ])('bounds failing specifier gaps after %s to under 50 ms', prefix => {
+    // A VM deadline interrupts a regressed native regexp instead of hanging the test worker.
+    const elapsed = runInNewContext(`
+      const start = performance.now();
+      scan();
+      performance.now() - start;
+    `, { performance, scan: () => {
+      for (const gap of ['/* */'.repeat(60), ' /* */'.repeat(60), ' '.repeat(60)]) {
+        expect(graph({ 'x.mjs': '', 'main.mjs': prefix + gap + 'x' })).toEqual(new Map());
+      }
+    } }, { timeout: 1000 });
+    expect(elapsed).toBeLessThan(50);
   });
 
   it('recognizes Vitest suffixes without mistaking helpers or Playwright specs for tests', () => {
@@ -78,7 +111,7 @@ describe('#5128 — bounded related-test selection', () => {
     expect(testDepths(['hub.mjs'], reverse)).toEqual(new Map([
       ['__tests__/a.test.mjs', 1], ['__tests__/b.test.mjs', 1],
     ]));
-    expect(selectRelatedTests({ changedFiles: ['hub.mjs'], reverse, maxTests: 1, maxDepth: 2 }))
+    expect(selectRelatedTests({ env: {}, changedFiles: ['hub.mjs'], reverse, maxTests: 1, maxDepth: 2 }))
       .toMatchObject({ status: 'selection-truncated', depth: 1, tests: ['__tests__/a.test.mjs', '__tests__/b.test.mjs'] });
   });
 
@@ -118,7 +151,7 @@ describe('#5128 — bounded related-test selection', () => {
     const files = hubFiles();
     const reverse = buildReverseImportGraph({ files: [...Object.keys(files), 'gone.mjs'],
       readFile: path => { if (path === 'gone.mjs') throw Object.assign(new Error('ENOENT'), { code: 'ENOENT' }); return files[path]; } });
-    expect(selectRelatedTests({ changedFiles: ['hub.mjs', 'changed.test.mjs'], reverse, maxTests: 5, maxDepth: 2 }))
+    expect(selectRelatedTests({ env: {}, changedFiles: ['hub.mjs', 'changed.test.mjs'], reverse, maxTests: 5, maxDepth: 2 }))
       .toMatchObject({ status: 'selection-truncated', depth: 1, tests: ['changed.test.mjs', 'direct0.test.mjs', 'direct1.test.mjs'] });
   });
 
@@ -140,10 +173,249 @@ describe('#5128 — bounded related-test selection', () => {
         files[test] = `import './${target}'`;
         if (target !== 'mid.mjs') direct.push(test);
       }
-      const selected = selectRelatedTests({ changedFiles: ['a.mjs', 'b.mjs'], reverse: graph(files),
+      const selected = selectRelatedTests({ env: {}, changedFiles: ['a.mjs', 'b.mjs'], reverse: graph(files),
         maxTests: 1 + random(5), maxDepth: 1 + random(3) });
       expect(selected.status).toBe('selection-truncated');
       for (const test of direct) expect(selected.tests).toContain(test);
     }
+  });
+});
+
+
+describe('S1 static edges', () => {
+  const reach = (source, changed = 'scripts/child.mjs', extra = {}, options = {}) => {
+    const files = { [changed]: '', 'scripts/__tests__/edge.test.mjs': source, ...extra };
+    return testDepths([changed], buildReverseImportGraph({ files: Object.keys(files), readFile: p => files[p], ...options }));
+  };
+  it.each([
+    "const p = join(dir, '..', 'child.mjs'); spawn('node', [p]);",
+    "execFile('node', [resolve(dir, '..', 'child.mjs')]);",
+    "fork(new URL('../child.mjs', import.meta.url));",
+    "spawn('node', ['scripts/child.mjs']);",
+  ])('reaches a spawned path: %s', source => {
+    expect([...reach(source).keys()]).toEqual(['scripts/__tests__/edge.test.mjs']);
+  });
+  it.each([
+    "readFileSync('scripts/settings/policy.json', 'utf8')",
+    "await fs.promises.readFile(new URL('../settings/policy.json', import.meta.url))",
+    "readFile(join(dir, '..', 'settings', 'policy.json'), callback)",
+    "readFileSync(resolve(dir, '..', 'settings', 'policy.json'), 'utf8')",
+  ])('reaches literal settings reads: %s', source => {
+    expect(reach(source, 'scripts/settings/policy.json').size).toBe(1);
+  });
+  it('uses ordinary transitive edges through a helper which spawns and reads', () => {
+    for (const source of ["spawn('node', ['scripts/child.mjs'])", "readFileSync('scripts/child.mjs')"]) {
+      expect(reach("import '../helper.mjs'", undefined, { 'scripts/helper.mjs': source }).size).toBe(1);
+    }
+  });
+  it('resolves we, tsconfig aliases and vendored Frontier targets; retains external textual keys', () => {
+    const files = new Set(['src/x.ts', 'plugs/x.ts']);
+    expect(resolvedImportsOf('test.mjs', "import 'we:src/x'; import '@local/x'; import '@frontierui/plugs/x'", files,
+      { aliases: { '@local/*': ['src/*'], '@frontierui/plugs/*': ['../frontierui/plugs/*'] } }).sort())
+      .toEqual(['@frontierui/plugs/x', '@local/x', 'plugs/x.ts', 'src/x.ts']);
+    expect(resolvedImportsOf('test.mjs', "import '@frontierui/plugs/external'", files)).toContain('@frontierui/plugs/external');
+  });
+  it('substitutes every wildcard in an alias target, not only the first', () => {
+    const files = new Set(['pkg/x/x.ts']);
+    expect(resolvedImportsOf('test.mjs', "import '@dup/x'", files, { aliases: { '@dup/*': ['pkg/*/*.ts'] } }))
+      .toContain('pkg/x/x.ts');
+  });
+
+  it('allows each static edge kind to be disabled for the import-only replay', () => {
+    expect(reach("spawn('node', ['scripts/child.mjs']); readFileSync('scripts/child.mjs'); import 'we:scripts/child.mjs'",
+      undefined, {}, { staticEdges: { spawnPath: false, literalRead: false, alias: false } }).size).toBe(0);
+  });
+  it('preserves the observed merge-gate-hold-class direct imports, including multiple named imports', () => {
+    expect(reach(`// @vitest-environment node
+      import { isCandidacyHold, deferCandidacyHoldsOnPrEvent } from '../merge-gate-hold-class.mjs';
+      import { parsePrResultTable as rawParse } from '../merge-gate-hold-class.mjs';`, 'scripts/merge-gate-hold-class.mjs', {},
+      { staticEdges: { spawnPath: false, alias: false, literalRead: false } }).size).toBe(1);
+  });
+  it('reports partial truncation and unlimited CI despite caller and environment caps', () => {
+    expect(selectHub()).toMatchObject({ partial: true, status: 'selection-truncated' });
+    for (const env of [{ CI: 'true' }, { GITHUB_ACTIONS: 'true', WE_CI_SELECTION: '{"maxTests":1,"maxTestsInCi":1}' }]) {
+      expect(selectHub({ env })).toMatchObject({ partial: false, maxTests: 0, status: 'complete', fullTestCount: 33 });
+    }
+  });
+  it('validates settings, falls back on malformed input, and records cascade sources', () => {
+    const log = [];
+    const load = extra => loadCiSelection({ platform: {}, tool: {}, env: {}, ...extra });
+    expect(load({ readFile: () => '{', tool: undefined }).maxTests).toBe(0);
+    expect(load({ env: { WE_CI_SELECTION: '{' } }).maxTests).toBe(0);
+    expect(load({ tool: { maxTests: -1, maxTestsInCi: 5 } }).maxTests).toBe(0);
+    expect(load({ env: { WE_CI_SELECTION: '{"maxTests":1.5}' } }).maxTests).toBe(0);
+    expect(load({ tool: { maxTests: 5 }, env: { WE_CI_SELECTION: '{"maxTests":7}', WE_POLICY_CASCADE_LOG: '1' }, log: s => log.push(s) }).maxTests).toBe(7);
+    expect(log.join(' ')).toMatch(/maxTests=7.*env/);
+    expect(load({ tool: { staticEdges: { literalRead: 'bad' } } }).staticEdges.literalRead).toBe(true);
+  });
+  it('replays missing edges and marks absent historical test evidence incomplete', () => {
+    const files = { 'scripts/child.mjs': '', 'edge.test.mjs': "spawn('node', ['scripts/child.mjs'])" };
+    expect(replaySelections({ records: [{ pr: '7094', changedFiles: ['scripts/child.mjs'], testFiles: ['edge.test.mjs'], evidenceComplete: true }],
+      files: Object.keys(files), readFile: p => files[p] })[0]).toMatchObject({ oldMissed: ['edge.test.mjs'], newMissed: [], evidenceComplete: true });
+    const io = { runGh: () => 'scripts/child.mjs', runGit: () => Object.keys(files).join('\n'), readFile: p => files[p], print: () => {} };
+    expect(runReplayCli(['7094'], io)[0].evidenceComplete).toBe(false);
+    expect(() => runReplayCli(['7094', '--evidence=e.json'], { ...io, readFile: () => '{' })).toThrow();
+    expect(() => runReplayCli(['$(bad)'], io)).toThrow();
+  });
+  it('falls back to full selection for deleted dependency targets', () => {
+    const importer = 'docs/__tests__/importer.test.mjs';
+    const files = { [importer]: "import '../deleted.mjs'" };
+    const result = selectTests({ env: { WE_DIFF_TEST_SELECTION: '1' },
+      runGit: args => args[0] === 'merge-base' ? 'abc' : 'docs/deleted.mjs',
+      files: Object.keys(files), readFile: p => files[p] });
+    // A committed deletion is absent from ls-files, so no surviving import edge resolves.
+    expect(testDepths(['docs/deleted.mjs'], graph(files)).has(importer)).toBe(false);
+    // Full mode runs every test, including the surviving importer that the graph would omit.
+    expect(result).toMatchObject({ mode: 'full', partial: false,
+      reasons: [expect.stringContaining('absent from tracked inventory (docs/deleted.mjs)')] });
+    expect(result).not.toHaveProperty('selection');
+  });
+  it('composes explicit static tests and partial reasons in readiness selection', () => {
+    const files = { 'docs/hub.mjs': '', 'direct.test.mjs': "readFileSync('docs/hub.mjs')",
+      'mid.mjs': "spawn('node', ['docs/hub.mjs'])", 'deep.test.mjs': "import './mid.mjs'" };
+    const options = { env: { WE_DIFF_TEST_SELECTION: '1' }, runGit: args => args[0] === 'merge-base' ? 'abc' : 'docs/hub.mjs',
+      files: Object.keys(files), readFile: p => files[p], maxTests: 1, maxDepth: 1 };
+    expect(selectTests({ ...options, files: null })).toMatchObject({ mode: 'full', partial: false,
+      reasons: [expect.stringContaining('inventory unavailable')] });
+    expect(selectTests(options)).toMatchObject({ mode: 'shrink', partial: true, selectedFiles: ['direct.test.mjs'],
+      reasons: expect.arrayContaining([expect.stringContaining('partial:')]) });
+    expect(selectTests({ ...options, env: { ...options.env, CI: 'true' } })).toMatchObject({ partial: false,
+      selectedFiles: ['deep.test.mjs', 'direct.test.mjs', 'docs/hub.mjs'] });
+  });
+});
+
+
+describe('readiness graph selection fails closed', () => {
+  const select = (files, readFile = path => files[path], changed = 'docs/x.mjs') => selectTests({
+    env: { WE_DIFF_TEST_SELECTION: '1' }, files: Object.keys(files), readFile,
+    runGit: args => args[0] === 'merge-base' ? 'abc' : changed,
+  });
+
+  it.each([
+    'import /* multi\nline */ x from /* multi\nline */ "./helper"',
+    'export * from /* multi\nline */ "./helper"',
+    'import /* multi\nline */ "./helper"',
+    'import /* multi\nline */ ("./helper")',
+  ])('retains Vitest related targets when a nonempty regex graph misses valid syntax: %s', source => {
+    const helper = 'blocks/example/__tests__/helper.ts';
+    const visible = 'blocks/example/__tests__/visible.test.ts';
+    const missed = 'blocks/example/__tests__/missed.test.ts';
+    const files = { [helper]: 'export default 1', [visible]: 'import x from "./helper"', [missed]: source };
+    const reverse = graph(files);
+    expect(reverse.unreadable).toBe(0);
+    expect(testDepths([helper], reverse).has(visible)).toBe(true);
+    const result = select(files, undefined, helper);
+    // selectedFiles are inputs to `vitest related`: the helper retains BOTH importers
+    // even when the supplemental regex graph recognizes only the ordinary import.
+    expect(result).toMatchObject({ mode: 'shrink', partial: false });
+    expect(result.selectedFiles).toContain(helper);
+    expect(result.selectedFiles).toContain(visible);
+  });
+
+  it('runs the full suite when a non-test change reaches zero graph tests', () => {
+    const result = select({ 'docs/x.mjs': '', 'unrelated.test.mjs': '' });
+    expect(result).toMatchObject({ mode: 'full', partial: false,
+      reasons: [expect.stringContaining('zero tests for non-test changed files')] });
+    expect(result).not.toHaveProperty('selection');
+  });
+
+  it('resolves a side-effect import with an inline comment and selects its test', () => {
+    const files = { 'docs/x.mjs': '', 'docs/__tests__/x.test.mjs': 'import /* c */ "../x.mjs"' };
+    expect(resolvedImportsOf('docs/__tests__/x.test.mjs', files['docs/__tests__/x.test.mjs'], new Set(Object.keys(files))))
+      .toEqual(['docs/x.mjs']);
+    expect(select(files)).toMatchObject({ mode: 'shrink', selectedFiles: ['docs/__tests__/x.test.mjs', 'docs/x.mjs'] });
+  });
+
+  it('counts injected EACCES sources and runs the full suite despite a surviving test edge', () => {
+    const files = { 'docs/x.mjs': '', 'direct.test.mjs': 'import "./docs/x.mjs"',
+      'denied.mjs': '', 'denied.test.mjs': '' };
+    const readFile = path => {
+      if (path.startsWith('denied')) throw Object.assign(new Error('permission denied'), { code: 'EACCES' });
+      return files[path];
+    };
+    const reverse = buildReverseImportGraph({ files: Object.keys(files), readFile });
+    expect(reverse.unreadable).toBe(2);
+    expect(Object.keys(reverse)).not.toContain('unreadable');
+    expect(testDepths(['docs/x.mjs'], reverse).has('direct.test.mjs')).toBe(true);
+    const result = select(files, readFile);
+    expect(result).toMatchObject({ mode: 'full', partial: false,
+      reasons: [expect.stringContaining('2 unreadable graph source(s)')] });
+    expect(result).not.toHaveProperty('selection');
+  });
+
+  it('keeps a changed test selected when it has no imports', () => {
+    expect(select({ 'docs/x.test.mjs': '' }, undefined, 'docs/x.test.mjs'))
+      .toMatchObject({ mode: 'shrink', selectedFiles: ['docs/x.test.mjs'] });
+  });
+});
+
+describe('CI static edge policy', () => {
+  it.each(['CI', 'GITHUB_ACTIONS'].flatMap(flag => ['env', 'file', 'platform'].map(layer => [flag, layer])))
+  ('keeps maxTestsInCi unlimited under %s despite a hostile %s layer', (flag, layer) => {
+    const hostile = { maxTestsInCi: 5 };
+    const settings = loadCiSelection({
+      env: { [flag]: 'true', ...(layer === 'env' ? { WE_CI_SELECTION: JSON.stringify(hostile) } : {}) },
+      platform: layer === 'platform' ? hostile : {}, tool: layer === 'file' ? undefined : {},
+      readFile: () => JSON.stringify({ ci: { selection: hostile } }),
+    });
+    expect(settings.maxTestsInCi).toBe(0);
+  });
+  const allEdges = { spawnPath: true, alias: true, literalRead: true };
+  const cases = ['spawnPath', 'alias', 'literalRead'].flatMap(edge => ['env', 'file', 'platform'].map(layer => [edge, layer]));
+  const load = (edge, layer, env) => {
+    const staticEdges = { ...allEdges, [edge]: false };
+    return loadCiSelection({ env: { ...env, ...(layer === 'env' ? { WE_CI_SELECTION: JSON.stringify({ staticEdges }) } : {}) },
+      platform: layer === 'platform' ? { staticEdges } : {}, tool: layer === 'file' ? undefined : {},
+      readFile: () => JSON.stringify({ ci: { selection: { staticEdges } } }) });
+  };
+
+  it.each(cases)('ignores disabling %s via %s under either CI flag', (edge, layer) => {
+    for (const flag of ['CI', 'GITHUB_ACTIONS']) {
+      expect(load(edge, layer, { [flag]: 'true' }).staticEdges).toEqual(allEdges);
+    }
+  });
+
+  it.each(cases)('allows disabling %s via %s outside CI', (edge, layer) => {
+    expect(load(edge, layer, {}).staticEdges).toEqual({ ...allEdges, [edge]: false });
+  });
+
+  it('keeps import-only replay explicit options effective with process.env.CI set', () => {
+    vi.stubEnv('CI', 'true');
+    try {
+      expect(loadCiSelection({ tool: {}, platform: {}, env: { ...process.env,
+        WE_CI_SELECTION: JSON.stringify({ staticEdges: { ...allEdges, spawnPath: false } }) } }).staticEdges).toEqual(allEdges);
+      const files = { 'scripts/child.mjs': '', 'edge.test.mjs': "spawn('node', ['scripts/child.mjs'])" };
+      expect(replaySelections({ records: [{ pr: '7094', changedFiles: ['scripts/child.mjs'],
+        testFiles: ['edge.test.mjs'], evidenceComplete: true }], files: Object.keys(files), readFile: path => files[path] })[0])
+        .toMatchObject({ oldMissed: ['edge.test.mjs'], newMissed: [] });
+    } finally { vi.unstubAllEnvs(); }
+  });
+
+  it('a line comment containing `from /*` cannot swallow later real imports', () => {
+    const files = { 'a.mjs': '', 'b.mjs': '', 'src.mjs': "// from /*\nimport './a.mjs';\n// */\nimport './b.mjs';" };
+    expect(graph(files).get('a.mjs')?.has('src.mjs')).toBe(true);
+    expect(graph(files).get('b.mjs')?.has('src.mjs')).toBe(true);
+  });
+});
+
+
+describe('trace settings cascade', () => {
+  const load = extra => loadCiSelection({ env: {}, tool: {}, platform: {}, ...extra });
+  it('defaults to enabled shadow tracing and logs effective provenance', () => {
+    expect(load().trace).toEqual({ enabled: true, maxEdgesPerTest: 5000 });
+    const log = [];
+    expect(load({ env: { WE_POLICY_CASCADE_LOG: '1', WE_CI_SELECTION: '{"trace":{"enabled":false,"maxEdgesPerTest":12}}' }, log: line => log.push(line) }).trace)
+      .toEqual({ enabled: false, maxEdgesPerTest: 12 });
+    expect(log.join(' ')).toMatch(/ci.selection.trace:.*enabled=false.*env/);
+  });
+  it('retains each lower-layer leaf for invalid values and accepts zero', () => {
+    const platform = { trace: { enabled: false, maxEdgesPerTest: 20 } };
+    for (const trace of [null, 'bad', { enabled: 'yes', maxEdgesPerTest: -1 }, { maxEdgesPerTest: 1.5 }, { maxEdgesPerTest: Number.MAX_SAFE_INTEGER + 1 }]) {
+      expect(load({ platform, tool: { trace } }).trace).toEqual(platform.trace);
+    }
+    expect(load({ platform, tool: { trace: { enabled: true } }, env: { WE_CI_SELECTION: '{"trace":{"enabled":42,"maxEdgesPerTest":0}}' } }).trace)
+      .toEqual({ enabled: true, maxEdgesPerTest: 0 });
+    expect(load({ tool: undefined, readFile: () => '{"ci":{"selection":{"trace":{"enabled":false,"maxEdgesPerTest":7}}}}' }).trace)
+      .toEqual({ enabled: false, maxEdgesPerTest: 7 });
   });
 });
