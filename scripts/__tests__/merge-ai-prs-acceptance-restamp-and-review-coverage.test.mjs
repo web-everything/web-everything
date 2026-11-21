@@ -479,9 +479,13 @@ describe('#3184 — the drain records a fingerprint READ MISS instead of collaps
 //    `basisKind` / `basisNarrowed` the basis resolved must ride out of it — otherwise the distinction exists
 //    only inside a function nobody in production calls directly. ────────────────────────────────────────────
 describe('computeNetDiffSignals carries the basis trust question (#3343)', () => {
+  const BASE_SHA = 'a'.repeat(40);
   const fakeExec = (script = {}) => {
     const exec = (cmd, args) => {
-      const intent = args.filter((a) => a !== '--end-of-options' && a !== '--verify' && a !== '--no-ext-diff');
+      while (args[0] === '-c') args = args.slice(2);
+      if (args.includes('--git-common-dir')) return `${process.env.TMPDIR}\n${process.env.TMPDIR}`;
+      if (args[0] === 'rev-parse' && args.includes('refs/remotes/origin/main^{commit}')) return `${BASE_SHA}\n`;
+      const intent = args.filter((a) => a !== '--end-of-options' && a !== '--verify' && a !== '--no-ext-diff' && a !== '--no-textconv' && a !== '--no-color' && a !== '--src-prefix=a/' && a !== '--dst-prefix=b/');
       const h = script[`${cmd} ${intent.join(' ')}`];
       if (h && h.throw) throw new Error(h.throw);
       if (h && 'stdout' in h) return h.stdout;
@@ -494,7 +498,7 @@ describe('computeNetDiffSignals carries the basis trust question (#3343)', () =>
 
   it("a merge-base basis reports `basisKind:'merge-base'` and `basisNarrowed:true`", () => {
     const { exec } = fakeExec({
-      'git merge-base origin/main origin/lane/x': { stdout: 'forkpoint\n' },
+      [`git merge-base ${BASE_SHA} origin/lane/x`]: { stdout: 'forkpoint\n' },
       'git diff --numstat forkpoint origin/lane/x': { stdout: '3\t1\tREADME.md\n' },
       'git diff forkpoint origin/lane/x': { stdout: 'diff --git a/README.md b/README.md\n' },
     });
@@ -506,10 +510,10 @@ describe('computeNetDiffSignals carries the basis trust question (#3343)', () =>
 
   it("an ancestry basis reports `basisKind:'ancestry'` and is still NARROWED — it is the PR's own file set", () => {
     const { exec } = fakeExec({
-      'git merge-base origin/main origin/lane/x': { throw: 'no common ancestors' },
-      'git diff --numstat origin/main origin/lane/x': { stdout: '2\t0\tbacklog/a.md\n4\t4\tdocs/agent/platform-decisions.md\n' },
-      'git log --numstat --diff-merges=first-parent --pretty=format: origin/main..origin/lane/x --': { stdout: '2\t0\tbacklog/a.md\n' },
-      'git diff origin/main origin/lane/x': { stdout: 'diff --git a/backlog/a.md b/backlog/a.md\n' },
+      [`git merge-base ${BASE_SHA} origin/lane/x`]: { throw: 'no common ancestors' },
+      [`git diff --numstat ${BASE_SHA} origin/lane/x`]: { stdout: '2\t0\tbacklog/a.md\n4\t4\tdocs/agent/platform-decisions.md\n' },
+      [`git log --numstat --diff-merges=first-parent --pretty=format: ${BASE_SHA}..origin/lane/x --`]: { stdout: '2\t0\tbacklog/a.md\n' },
+      [`git diff ${BASE_SHA} origin/lane/x`]: { stdout: 'diff --git a/backlog/a.md b/backlog/a.md\n' },
     });
     const sig = computeNetDiffSignals({ exec, rev: 'lane/x', fetchExtraRefs: ['lane/x'] });
     expect(sig.basisKind).toBe('ancestry');
@@ -519,9 +523,9 @@ describe('computeNetDiffSignals carries the basis trust question (#3343)', () =>
 
   it("a base-tip basis reports `basisNarrowed:false` — the signal the producer threads into the human gate", () => {
     const { exec } = fakeExec({
-      'git merge-base origin/main origin/lane/x': { throw: 'no common ancestors' },
-      'git diff --numstat origin/main origin/lane/x': { stdout: '2\t0\tbacklog/a.md\n4\t4\tdocs/agent/platform-decisions.md\n' },
-      'git diff origin/main origin/lane/x': { stdout: 'diff --git a/backlog/a.md b/backlog/a.md\n' },
+      [`git merge-base ${BASE_SHA} origin/lane/x`]: { throw: 'no common ancestors' },
+      [`git diff --numstat ${BASE_SHA} origin/lane/x`]: { stdout: '2\t0\tbacklog/a.md\n4\t4\tdocs/agent/platform-decisions.md\n' },
+      [`git diff ${BASE_SHA} origin/lane/x`]: { stdout: 'diff --git a/backlog/a.md b/backlog/a.md\n' },
     });
     const sig = computeNetDiffSignals({ exec, rev: 'lane/x', fetchExtraRefs: ['lane/x'] });
     expect(sig.basisKind).toBe('base-tip');
