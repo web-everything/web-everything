@@ -60,7 +60,7 @@ import { hostname } from 'node:os';
 import { statSync } from 'node:fs';
 import { resolve } from 'node:path';
 
-import { isLeaseExpired, readLockEntry, heartbeat, releaseLockDir, reserve, lockDirFor } from '../readiness/file-locks.mjs';
+import { isLeaseExpired, readLockEntry, ownHeartbeatState, heartbeat, releaseLockDir, reserve, lockDirFor } from '../readiness/file-locks.mjs';
 import {
   fixDispatchClaimRoot, fixDispatchResource, listFixDispatchClaims, readFixDispatchClaim,
   fixDispatchSessionName, DEFAULT_FIX_DISPATCH_CLAIM_TTL_MINUTES,
@@ -153,7 +153,11 @@ export function readLiveDrainClaim({ repo, pr, lockRoot = fixDispatchClaimRoot()
     if (entry) {
       if (!Number.isFinite(Date.parse(entry.heartbeatAt))) uncertain = 'invalid-heartbeat';
       else if (kind === FIXING_KIND ? !isLiveFixClaim(entry, nowMs)
-        : isLeaseExpired(entry, nowMs, DEFAULT_FIX_DISPATCH_CLAIM_TTL_MINUTES)) continue;
+        : isLeaseExpired(entry, nowMs, Math.max(DEFAULT_FIX_DISPATCH_CLAIM_TTL_MINUTES,
+          Number(entry.meta?.leaseMinutes) > 0 ? Number(entry.meta.leaseMinutes) : 0))) {
+        if (ownHeartbeatState(lockRoot, resource, entry.owner) === 'unreadable') uncertain = 'unreadable-heartbeat';
+        else continue;
+      }
     } else {
       try {
         probe(lockDirFor(lockRoot, resource));

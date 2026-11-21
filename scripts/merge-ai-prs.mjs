@@ -240,7 +240,7 @@ import { ensureFreshGithubAppEnv } from './lib/github-app-auth-env.mjs';
 import { isDaemonCaller } from './lib/github-auth-policy.mjs';
 // x2e120n — per-step pass timing ("why so slow", the resident drain daemon's history.jsonl carried only a
 // pass's TOTAL ms, no breakdown). See pass-timings.mjs's own header for the full shape/rationale.
-import { buildSkipReasons, formatSkipSummary, formatSkipReasonsLine } from './lib/drain-skip-reasons.mjs';
+import { buildSkipReasons, formatSkipSummary, formatSkipReasonsLine, formatClaimHeldReason } from './lib/drain-skip-reasons.mjs';
 import { createCardGrouping, runCardGroupPass, readGroupState, resolveCardGroupStatePath } from './lib/card-group.mjs';
 import { readQueueFacts } from './lib/merge-queue-adaptive-batching.mjs';
 import { readQueueEntryFiles } from './lib/queue-file-overlap.mjs';
@@ -258,7 +258,8 @@ import { execFileSyncThrottled } from './lib/gh-throttle.mjs'; // drain order: t
 import { resolveCascade, platformPreference } from './lib/policy-cascade.mjs'; // drain order: `drain.order` / `drain.priorityMode` via the shared cascade
 import { readSettings as readDeclaredDrainSettings } from './lib/settings-files.mjs'; // drain order: the tool layer (`drain` block of the declared settings)
 import { CONSTELLATION_REPOS, canonicalizeSlug, repoKeyForSlug } from './lib/constellation-repos.mjs';
-import { readLiveFixClaim } from './conveyor/fix-procedure.mjs';
+import { readLiveFixClaim, readLiveDrainClaim } from './conveyor/fix-procedure.mjs';
+import { fixDispatchClaimRoot } from './conveyor/fix-dispatch-claim.mjs';
 import { PREP_REVIEW_HEADLINE, prepNoteCoversHead } from './conveyor/prep-review.mjs'; // card x5f2daz — the light prepare-PR review record
 import { prepareItemFromRef } from './operations/prepare-pr.mjs';
 import { applyHumanClearanceCarry, latestHumanClearance, sanitizeActor } from './lib/human-clearance-carry.mjs'; // #xnqxtdy
@@ -1000,23 +1001,48 @@ export function reconcileDrainReviewPending({ currentLabels, dryRun = false, ...
   }
 }
 
+/** Adapt dispatch evidence while keeping the legacy decision in off/shadow modes. */
+export function drainClaimReaderFor(mode, { legacy = readLiveFixClaim, drain = readLiveDrainClaim, onShadow } = {}) {
+  if (mode === 'off') return legacy;
+  if (mode === 'shadow') return args => {
+    const claim = legacy(args);
+    try {
+      const c = drain(args);
+      if (c && !claim) onShadow?.({ site: args.site, repo: args.repo, pr: args.pr,
+        kind: c.kind, holder: c.holder, uncertain: c.uncertain });
+    } catch (error) {
+      onShadow?.({ site: args.site, repo: args.repo, pr: args.pr, error: String(error) });
+    }
+    return claim;
+  };
+  const readClaim = args => {
+    const c = drain(args);
+    return c ? { meta: c.entry.meta, kind: c.kind, uncertain: c.uncertain, heldKinds: c.heldKinds } : null;
+  };
+  readClaim.honourDispatchClaims = 'on';
+  return readClaim;
+}
+
 /**
  * Attach the LIVE fix claim to a merge-site re-read (`data.fixClaim`), so `classifyPr` refuses a PR a fixer still
  * holds. The reader is injected (production: `readLiveFixClaim`). An unreadable claim store fails CLOSED — a
  * placeholder claim is attached so this merge is refused and the next pass re-reads — like draft promotion.
  * A readable-but-unclaimed PR gets no `fixClaim`. Mutates and returns `data`.
  */
-export function attachLiveFixClaim(data, { claimKey, readClaim }) {
+export function attachLiveFixClaim(data, { claimKey, readClaim, site = 'fresh' }) {
   try {
-    const claim = claimKey ? readClaim({ repo: claimKey, pr: data.number }) : null;
-    if (claim?.meta?.who) data.fixClaim = { who: claim.meta.who, claimedAt: claim.meta.claimedAt ?? null };
-  } catch { data.fixClaim = { who: '(fix-claim store unreadable)' }; }
+    const claim = claimKey ? readClaim({ repo: claimKey, pr: data.number, site }) : null;
+    const meta = claim?.meta ?? claim?.entry?.meta;
+    if (meta?.who) data.fixClaim = { who: meta.who, claimedAt: meta.claimedAt ?? null,
+      ...(claim.kind ? { kind: claim.kind, uncertain: claim.uncertain, repo: claimKey } : {}) };
+  } catch { data.fixClaim = { who: '(fix-claim store unreadable)',
+    ...(readClaim?.honourDispatchClaims === 'on' ? { kind: 'unknown', uncertain: 'reader-threw', repo: claimKey } : {}) }; }
   return data;
 }
 
 /** Whether a live fix claim (or an unreadable claim store) holds the PR right now. */
 export const prestageFixClaimHeld = (num, { claimKey, readClaim = readLiveFixClaim }) =>
-  !!attachLiveFixClaim({ number: Number(num) }, { claimKey, readClaim }).fixClaim?.who;
+  !!attachLiveFixClaim({ number: Number(num) }, { claimKey, readClaim, site: 'prestage-lock' }).fixClaim?.who;
 
 /**
  * Classify one PR into a merge/skip verdict. Pure — no gh calls. Returns
@@ -1141,7 +1167,9 @@ export function classifyPr(pr, { requiredCheck = 'test', trustLabel = 'ready-to-
   // fix.pushBeforeGate (2026-10-10) — a fixer now pushes BEFORE its local gate is green, so a claimed PR's head may be
   // an unverified intermediate commit. The live fix claim (attached by the caller as `pr.fixClaim`) is the lock: never
   // land while it is held, whatever the labels or CI say. Released on the fixer's green hand-back.
-  else if (pr?.fixClaim?.who) { decision = 'skip'; reason = `fix claim held by ${pr.fixClaim.who} — the head may be an unverified intermediate push; lands only after its fix-end`; }
+  else if (pr?.fixClaim?.who) { decision = 'skip'; reason = pr.fixClaim.kind
+    ? `${formatClaimHeldReason({ kind: pr.fixClaim.kind, holder: pr.fixClaim.who, repo: pr.fixClaim.repo, pr: pr.number, uncertain: pr.fixClaim.uncertain })} — lands only after the claim is released or expires`
+    : `fix claim held by ${pr.fixClaim.who} — the head may be an unverified intermediate push; lands only after its fix-end`; }
   else if (!certified) { decision = 'skip'; reason = `not AI-generated (a commit lacks the Co-Authored-By: Claude trailer), no "${trustLabel}" label, and not human-cleared (review:accepted)`; }
   // #3674 — ahead of the required-check arm, so a non-default base is held with its real reason (even when `test`
   // is green) instead of waiting on a check that never runs there.
@@ -1541,6 +1569,16 @@ export function resolveRebaseBeforeEnqueue(env = {}, { platform, tool } = {}) {
   const value = r.value, source = r.sources[''];
   return ['conflict-only', 'always'].includes(value) ? { value, source }
     : { value: 'always', source: `${source} (invalid; fail closed to always)` };
+}
+
+/** Pure setting cascade; unknown values add holds rather than bypassing claims. */
+export function resolveHonourDispatchClaims(env = {}, { platform, tool } = {}) {
+  const checked = value => value === undefined || ['off', 'shadow', 'on'].includes(value) ? value : 'invalid';
+  const r = resolveCascade({ standard: 'off', platform: checked(platform?.honourDispatchClaims),
+    tool: checked(tool?.honourDispatchClaims), envValues: { '': checked(env?.WE_DRAIN_HONOUR_DISPATCH_CLAIMS) } });
+  const value = r.value, source = r.sources[''];
+  return ['off', 'shadow', 'on'].includes(value) ? { value, source }
+    : { value: 'on', source: `${source} (invalid; fail closed to on)` };
 }
 
 /**
@@ -5253,6 +5291,17 @@ export async function main(argv, { env = process.env, stdout = process.stdout, e
     });
   };
   const resolveListedChecks = (repo, prs) => mapWithConcurrency(prs, resolvedMergePolicy.policy.concurrency.gateReads, (pr) => resolveChecks(repo, pr));
+  const honourDispatchClaims = resolveHonourDispatchClaims(process.env, {
+    platform: platformPreference('drain'), tool: readDeclaredDrainSettings()?.drain,
+  });
+  process.stderr.write(`merge-ai-prs: drain.honourDispatchClaims=${honourDispatchClaims.value} (${honourDispatchClaims.source}) claimRoot=${fixDispatchClaimRoot()}\n`);
+  const shadowClaimRows = new Set();
+  const passClaimReader = drainClaimReaderFor(honourDispatchClaims.value, { onShadow: row => {
+    const key = `${row.repo}#${row.pr}@${row.site}`;
+    if (shadowClaimRows.has(key)) return;
+    shadowClaimRows.add(key);
+    process.stderr.write(`merge-ai-prs · claim-held-shadow: ${JSON.stringify(row)}\n`);
+  } });
   const fetchFreshPrForRevalidation = async (repo, num, fields = null) => {
     try {
       const { stdout: raw } = await execFileP('gh', ['pr', 'view', String(num), ...repoFlag(repo),
@@ -5264,7 +5313,7 @@ export async function main(argv, { env = process.env, stdout = process.stdout, e
       if (fields) return data;
       const pruned = pruneStuckUnknown(stuckUnknownMarks, { prs: [{ ...data, repo: repo || localSlug, num }] });
       updateStuckUnknown(pruned);
-      attachLiveFixClaim(data, { claimKey: repoKeyForSlug(repo ?? localSlug), readClaim: readLiveFixClaim });
+      attachLiveFixClaim(data, { claimKey: repoKeyForSlug(repo ?? localSlug), readClaim: passClaimReader });
       const resolved = await resolveChecks(repo, data);
       return data.mergeStateStatus === 'BEHIND' && mergeStrategy.queueOwnsFreshness(repo)
         ? readFreshQueueRollup(resolved, { repo: repo || localSlug }) : resolved;
@@ -5758,10 +5807,10 @@ export async function main(argv, { env = process.env, stdout = process.stdout, e
         // scope is not stale: throwing falls back without dropping it (a null read would invalidate it).
         if (!operatorSelects(pr)) throw new Error('PR outside this run\'s --label/--base selection');
         // The same full `--check` read the listing and the pre-merge re-read use: gh caps the rollup at 100 contexts.
-        return attachLiveFixClaim(await resolveChecks(null, pr), { claimKey: repoKeyForSlug(localSlug), readClaim: readLiveFixClaim });
+        return attachLiveFixClaim(await resolveChecks(null, pr), { claimKey: repoKeyForSlug(localSlug), readClaim: passClaimReader, site: 'prestage' });
       },
       withLock: fn => withLandWriteLock(fn, { runUnlockedOnContention: false }),
-      fixClaimHeld: () => prestageFixClaimHeld(onlyPr, { claimKey: repoKeyForSlug(localSlug) }),
+      fixClaimHeld: () => prestageFixClaimHeld(onlyPr, { claimKey: repoKeyForSlug(localSlug), readClaim: passClaimReader }),
       // Preparation's branch is only a hint; this process must verify before any enqueue authorization.
       beforeEnqueue: async (c, sha, entry) => {
         const liveBranch = await __t.timeAsync('gate.defaultBranch', () => verifyDefaultBranch(c.repo || localSlug));
