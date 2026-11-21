@@ -33,6 +33,7 @@ import { loadDeliveryRoutes } from '../lib/delivery-routes.mjs';
 import { resolveAiRouting, aiRoutingInputs, AI_ROUTING_ROLES } from '../lib/ai-routing.mjs';
 import { routingOverrideOperation, ROUTING_OVERRIDE_OP } from './routing-override.mjs';
 import { createRoutingOverrideSinks } from './routing-override-file.mjs';
+import { createBuildPrioritySet } from './build-priority-set-io.mjs';
 import { execFileSync } from 'node:child_process';
 import { readCompletePrComments } from '../conveyor/pr-comments-complete.mjs';
 import { readLatestDecisions } from '../conveyor/health-responder-state.mjs';
@@ -280,6 +281,7 @@ export const OPERATIONS = Object.freeze({
   } }), sinks: {}, finish: finishAiRouting }),
   'operator-override-show': () => ({ declaration: operatorOverrideOperation('operator-override-show', { readOverrides: () => readOperatorOverrides() }), sinks: {} }),
   [ROUTING_OVERRIDE_OP]: () => ({ declaration: routingOverrideOperation(), sinks: createRoutingOverrideSinks() }),
+  'build-priority-set': () => createBuildPrioritySet(),
   [MANUAL_DAEMON_PASS_OP]: () => ({ declaration: manualDaemonPassOperation(), sinks: createManualDaemonPassSinks() }),
   [PR_TRACE_OP]: () => ({ declaration: prTraceOperation({ readFacts: createPrTraceReader() }), sinks: {}, finish: finishPrTrace }),
   [JUDGE_SWEEP_FACTS_OP]: () => ({
