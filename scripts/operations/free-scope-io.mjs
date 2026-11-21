@@ -160,8 +160,9 @@ export function readOpenPrs({ repos = DEFAULT_REPOS, exec, git = gitExec(), gitD
         const entries = wellFormed ? listedFiles : [];
         // The list names only a rename's NEW path; its previous path is a file the PR also holds, and only the paged API reports it.
         const hasRename = entries.some((f) => f.changeType === 'RENAMED');
-        const listed = { ok: wellFormed && !hasRename, files: entries.map((f) => f.path), added: entries.filter((f) => f.changeType === 'ADDED').map((f) => f.path),
-          reason: !wellFormed ? 'the PR list gave no usable files' : 'the PR list omits a renamed file\'s previous path' };
+        // An EMPTY list is unverified too: no PR changes nothing, so it is what an unpopulated response looks like.
+        const listed = { ok: wellFormed && !hasRename && entries.length > 0, files: entries.map((f) => f.path), added: entries.filter((f) => f.changeType === 'ADDED').map((f) => f.path),
+          reason: !wellFormed || !entries.length ? 'the PR list gave no usable files' : 'the PR list omits a renamed file\'s previous path' };
         const netRead = net.get(number);
         // The paginated API costs one call per PR, so only ask it when git failed AND the cheap list is capped or unusable.
         const paged = !netRead?.ok && (!listed.ok || listed.files.length >= GH_LIST_FILE_CAP) ? readPagedFiles({ repo, number, exec }) : undefined;

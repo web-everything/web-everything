@@ -8,11 +8,15 @@ import { collectFreeScope, readRegistry, OPEN_PR_LIMIT } from '../free-scope-io.
 import { createRegistry } from '../registry.mjs';
 import { startRun, advanceWhileRunning, runStatus } from '../engine.mjs';
 import { isReadOnlyDeclaration } from '../http-adapter.mjs';
+import { acceptedControlFlags, parseOperationArgv, runOperationCli } from '../cli-adapter.mjs';
 import { OPERATIONS } from '../run.mjs';
 
 // Wrap (never replace) the real reader so most tests exercise it; the run.mjs test below stubs single calls.
+const hoisted = vi.hoisted(() => ({ real: undefined }));
+const actualCollect = (...args) => hoisted.real(...args);
 vi.mock('../free-scope-io.mjs', async importOriginal => {
   const actual = await importOriginal();
+  hoisted.real = actual.collectFreeScope;
   return { ...actual, collectFreeScope: vi.fn((...args) => actual.collectFreeScope(...args)) };
 });
 
@@ -223,6 +227,65 @@ describe('checkScope validates persisted claims before trusting them', () => {
   it('refuses a non-string owner', () => {
     expect(run({ agents: [{ ...agent, owner: 5 }] }).ok).toBe(false);
   });
+  it('names the holder of a claim it refuses, e.g. one registered under a repo outside the constellation', () => {
+    expect(run({ agents: [{ ...agent, agent: 'old-worker', files: ['longshore:src/a.ts'] }] }))
+      .toMatchObject({ ok: false, reason: expect.stringMatching(/unknown repository.*agent "old-worker"/) });
+  });
+});
+
+describe('checkScope reads PR evidence without re-splitting file paths', () => {
+  it('holds a PR file whose name contains a colon', () => {
+    const prs = [{ repo: WE, number: 4, files: ['docs/a:b.md'] }];
+    expect(run({ prs }, { declaredFiles: ['we:docs/a:b.md'] })).toMatchObject({ ok: false, overlaps: [{ file: 'we:docs/a:b.md', pr: { number: 4 } }] });
+    expect(run({ prs }, { declaredFiles: ['we:docs/other.md'] }).ok).toBe(true);
+  });
+  it('keeps a brand-new backlog card exact-path-only after qualifying', () => {
+    const prs = [{ repo: WE, number: 4, files: ['backlog/new.md'], added: ['backlog/new.md'] }];
+    expect(run({ prs }, { declaredFiles: ['we:backlog/'] }).ok).toBe(true);
+    expect(run({ prs }, { declaredFiles: ['we:backlog/new.md'] }).ok).toBe(false);
+  });
+  it.each([[{ repo: WE, number: 4 }], [{ repo: WE, number: 4, files: 'x' }], [{ repo: WE, number: 4, files: [''] }],
+    [{ repo: WE, number: 4, files: ['a'], added: 'a' }], [{ repo: 'org/unknown', number: 4, files: ['a'] }], [null]])
+  ('refuses a malformed open PR %j', pr => {
+    expect(run({ prs: [pr] })).toMatchObject({ ok: false, reason: expect.stringContaining('incomplete scope snapshot') });
+  });
+});
+
+describe('check-scope cannot be resumed (a saved verdict never stands in for a fresh read)', () => {
+  const drive = () => {
+    const { declaration, sinks } = OPERATIONS['check-scope']();
+    const registry = createRegistry();
+    registry.register(declaration);
+    const records = new Map();
+    const store = { read: id => records.get(id) ?? null, write: record => records.set(record.id, record) };
+    return { declaration, records, go: argv => runOperationCli({ declaration, argv, registry, store, sinks, newRunId: () => 'cs-run' }) };
+  };
+  it('refuses --resume of a completed run at parse time, without reading evidence again', async () => {
+    collectFreeScope.mockClear();
+    collectFreeScope.mockImplementation(() => snapshot());
+    try {
+      const { declaration, records, go } = drive();
+      expect(acceptedControlFlags(declaration)).not.toContain('resume');
+      const first = await go(['--files=scripts/a.mjs']);
+      expect(first).toMatchObject({ code: 0, stopped: 'complete' });
+      expect(first.run.verdict.ok).toBe(true);
+      expect(records.size).toBe(1);
+      for (const argv of [['--resume=cs-run'], ['--resume=cs-run', '--answer=accept']]) {
+        expect(parseOperationArgv(declaration, argv)).toMatchObject({ ok: false, errors: [expect.stringContaining('read-only')] });
+        expect(await go(argv)).toMatchObject({ code: 2, stopped: 'refused', lines: [expect.stringContaining('has no run to resume'), '', expect.any(String)] });
+      }
+      // Even with newly contradicting evidence, no invocation reached the reader after the first.
+      expect(collectFreeScope).toHaveBeenCalledTimes(1);
+    } finally { collectFreeScope.mockReset(); collectFreeScope.mockImplementation((...args) => actualCollect(...args)); }
+  });
+  it('re-reads evidence on a second ordinary invocation', async () => {
+    collectFreeScope.mockClear();
+    collectFreeScope.mockImplementationOnce(() => snapshot()).mockImplementationOnce(() => snapshot({ agents: [{ ...agent, startedAt: new Date().toISOString() }] }));
+    const { go } = drive();
+    expect((await go(['--files=scripts/a.mjs'])).run.verdict.ok).toBe(true);
+    expect((await go(['--files=scripts/a.mjs'])).run.verdict.ok).toBe(false);
+    expect(collectFreeScope).toHaveBeenCalledTimes(2);
+  });
 });
 
 describe('checkScope evidence completeness through the real reader', () => {
@@ -257,6 +320,16 @@ describe('checkScope evidence completeness through the real reader', () => {
       expect(noFiles.unreadable).toEqual([{ repo: WE, error: expect.stringContaining('no usable files') }]);
       const malformed = checkScope({ declaredFiles: ['a.mjs'], now, collect: realCollect(registryPath, pagedExec(prRows([{ changeType: 'MODIFIED' }]), new Error('api down'))) });
       expect(malformed.ok).toBe(false);
+    });
+  });
+  it('treats an empty PR file list as unverified when git is unavailable', () => {
+    withRegistry([], registryPath => {
+      const down = checkScope({ declaredFiles: ['a.mjs'], now, collect: realCollect(registryPath, pagedExec(prRows([]), new Error('api down'))) });
+      expect(down.ok).toBe(false);
+      expect(down.unreadable).toEqual([{ repo: WE, error: expect.stringContaining('no usable files') }]);
+      // The paginated API can confirm that a PR really changes nothing, and then it clears.
+      expect(checkScope({ declaredFiles: ['a.mjs'], now, collect: realCollect(registryPath, pagedExec(prRows([]), '')) }))
+        .toEqual({ ok: true, overlaps: [] });
     });
   });
   it('recovers a PR row without files data from the paginated API', () => {

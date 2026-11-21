@@ -462,6 +462,12 @@ export function parseOperationArgv(declaration, argv = []) {
     raw[name] = coerced;
   }
 
+  // A READ-ONLY OPERATION HAS NOTHING TO RESUME. Its one call reads current evidence and completes; resuming the saved
+  // record would replay that verdict without reading anything again (a stale "clear" for `check-scope`). The usage text
+  // and `acceptedControlFlags` already say these flags do not apply; the parse now agrees instead of accepting them.
+  if (control.resume && !acceptedControlFlags(declaration).includes('resume')) {
+    errors.push(`\`${declaration.name}\` is read-only: it completes in one call and has no run to resume. Run it again to read current evidence.`);
+  }
   // A resume carries no input — the run record already holds it. Passing both is a confusion worth refusing.
   if (control.resume && Object.keys(raw).length) {
     errors.push('a --resume carries no input: the run record already holds it. Drop the input flags.');

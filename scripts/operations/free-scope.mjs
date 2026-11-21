@@ -19,7 +19,7 @@ export const FREE_SCOPE_OP = 'free-scope';
 /** The repos whose open PRs count — WE and plateau-app, read from the one constellation table. */
 export const DEFAULT_REPOS = Object.freeze(['we', 'plateau-app'].map((key) => CONSTELLATION_REPOS[key].slug));
 export const DEFAULT_TTL_HOURS = 4;
-export const alias = (key) =>({ webeverything: 'we', 'web-everything': 'we', plateau: 'plateau-app' })[key] || key;
+const alias = (key) => ({ webeverything: 'we', 'web-everything': 'we', plateau: 'plateau-app' })[key] || key;
 export function repoKeyFor(slug) {
   return repoKeyForSlug(slug) ?? slug.split('/').at(-1);
 }

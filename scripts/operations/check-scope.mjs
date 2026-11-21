@@ -1,6 +1,6 @@
 /** Shared, non-throwing admission over the existing free-scope snapshot and assessor. Every unknown input fails closed. */
 import { posix } from 'node:path';
-import { alias, assessFreeScope, qualifyFile, partitionRegistry, DEFAULT_TTL_HOURS } from './free-scope.mjs';
+import { assessFreeScope, qualifyFile, partitionRegistry, DEFAULT_TTL_HOURS } from './free-scope.mjs';
 import { collectFreeScope } from './free-scope-io.mjs';
 import { CONSTELLATION_REPOS, repoKeyForSlug } from '../lib/constellation-repos.mjs';
 
@@ -19,7 +19,8 @@ export function canonicalScope(raw) {
   if (!qualified) throw new Error(`empty scope entry: ${JSON.stringify(raw)}`);
   const colon = qualified.indexOf(':');
   const name = qualified.slice(0, colon);
-  const key = repoKeyForSlug(alias(name));
+  // `qualifyFile` has already mapped the short aliases; a full gh slug or an internal key resolves here.
+  const key = repoKeyForSlug(name);
   if (!key || !Object.hasOwn(CONSTELLATION_REPOS, key)) throw new Error(`scope names an unknown repository "${name}": ${raw}`);
   const rest = qualified.slice(colon + 1);
   if (CONTROL.test(rest) || rest.includes(',')) throw new Error(`scope path holds a comma or control character: ${JSON.stringify(raw)}`);
@@ -53,6 +54,20 @@ function validateEntry(entry) {
   }
 }
 
+/**
+ * An open PR with every path qualified `<repo key>:<path>` here. The inherited holder builder re-qualifies each raw path
+ * by splitting at its first colon, so a file such as `docs/a:b.md` would be read as repo `docs/a` and hold nothing.
+ */
+function qualifyPr(pr) {
+  const key = typeof pr?.repo === 'string' ? repoKeyForSlug(pr.repo) : null;
+  if (!key || !Object.hasOwn(CONSTELLATION_REPOS, key)) throw new Error('incomplete scope snapshot: open PR from an unknown repository');
+  const list = value => {
+    if (!Array.isArray(value) || value.some(f => typeof f !== 'string' || !f)) throw new Error(`incomplete scope snapshot: PR #${pr.number} has no usable file list`);
+    return value.map(f => `${key}:${f}`);
+  };
+  return { ...pr, files: list(pr.files), ...(pr.added === undefined ? {} : { added: list(pr.added) }) };
+}
+
 export function checkScope({ declaredFiles, excludeAgent, excludeOwner, collect = collectFreeScope, now = Date.now } = {}) {
   try {
     const declared = Array.isArray(declaredFiles) ? declaredFiles : typeof declaredFiles === 'string' ? declaredFiles.split(',') : null;
@@ -75,8 +90,13 @@ export function checkScope({ declaredFiles, excludeAgent, excludeOwner, collect 
     }
     if (snapshot.status === 'unknown') throw new Error('unknown scope snapshot');
     // Validate each persisted claim, then canonicalize its files the same way (an empty or escaping claim = refuse).
-    const agents = snapshot.agents.map(entry => { validateEntry(entry); return { ...entry, files: entry.files.map(canonicalScope) }; });
-    const verdict = assessFreeScope({ files, prs: snapshot.prs, agents, unreadable: snapshot.unreadable, nowMs,
+    const agents = snapshot.agents.map(entry => {
+      try { validateEntry(entry); return { ...entry, files: entry.files.map(canonicalScope) }; }
+      // Name the holder so an operator can clean the entry (e.g. one registered under an unknown repo key).
+      catch (error) { throw new Error(`${error.message} (registry entry for agent ${JSON.stringify(entry?.agent)})`); }
+    });
+    const prs = snapshot.prs.map(qualifyPr);
+    const verdict = assessFreeScope({ files, prs, agents, unreadable: snapshot.unreadable, nowMs,
       ...(excluding ? { excludeAgent, excludeOwner } : {}) });
     const { live } = partitionRegistry(agents, nowMs);
     const overlaps = verdict.files.filter(row => row.state === 'occupied').flatMap(row => row.holders.map(holder => {
