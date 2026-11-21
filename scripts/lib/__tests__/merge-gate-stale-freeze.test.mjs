@@ -11,6 +11,7 @@ const row = { name: 'merge-gate', status: 'completed', conclusion: 'failure', id
 const hold = { id: 'red-main-freeze', status: 'hold', reason: `main is RED (freeze: main CI red since ${head})` };
 const verdict = { num: 7266, head_sha: head, ok: false, completed_at, run_id: 42, run_attempt: 1, evaluatorOnlyFailure: true, results: [hold] };
 const pr = { number: 7266, state: 'OPEN', headRefOid: head, headRefName: 'lane/freeze', mergeStateStatus: 'CLEAN',
+  rowsComplete: true, rowsHead: head,
   labels: [{ name: 'review:pending' }], comments: [], statusCheckRollup: [row] };
 const classify = (v = {}, main = green, check = row) => excusePrMergeGateHolds([{ ...pr, statusCheckRollup: [check] }], {
   repo: 'owner/repo', mergeGateSetting: 'on', readMergeGateVerdict: () => ({ ...verdict, ...v }), readMainCi: () => main, readFreeze: () => ({ frozen: false }),
@@ -26,6 +27,19 @@ describe('automatic stale main freeze', () => {
     expect(plan.dispatch.map(r => r.kind)).toContain('ci-timeout-rerun');
     expect(plan.dispatch.map(r => r.kind)).toContain('review');
     expect(plan.dispatch.map(r => r.kind)).not.toContain('ci-heal');
+  });
+  it.each([
+    ['incomplete rows', { rowsComplete: false }],
+    ['missing completeness', { rowsComplete: undefined }],
+    ['wrong row head', { rowsHead: 'b'.repeat(40) }],
+    ['missing row head', { rowsHead: undefined }],
+  ])('keeps review blocked for %s despite the stale-freeze annotation', (_name, evidence) => {
+    const annotated = { ...classify(), ...evidence };
+    const plan = planReconcile({ prs: [annotated], agents: [], requiredChecks: ['merge-gate'], reviewTiming: { startAfter: 'ci-green' } });
+    expect(plan.dispatch.map(r => r.kind)).toEqual(['ci-timeout-rerun']);
+    expect(plan.refusals).toContainEqual(expect.objectContaining({ kind: 'review-ci',
+      ci: expect.objectContaining({ allowed: false, reason: 'rows-incomplete', unknown: true }) }));
+    expect(annotated.statusCheckRollup[0].conclusion).toBe('failure');
   });
   it.each([
     ['red main', {}, { ...green, conclusion: 'failure' }],

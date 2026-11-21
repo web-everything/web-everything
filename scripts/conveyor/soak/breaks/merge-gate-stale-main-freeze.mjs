@@ -35,6 +35,7 @@ export default {
     const log = ['#7266: HOLD', ...GATE_IDS.map(id => id === 'red-main-freeze'
       ? `  hold  ${id}  main is RED (freeze: main CI red since ${head})` : `  pass  ${id}  ok`), 'merge-gate: HOLD — held'].join('\n');
     const pr = { number: 7266, state: 'OPEN', headRefOid: head, headRefName: 'lane/freeze-soak',
+      rowsComplete: true, rowsHead: head,
       mergeStateStatus: 'CLEAN', labels: [{ name: 'review:pending' }], comments: [],
       statusCheckRollup: [{ name: 'merge-gate', id: 123, status: 'completed', conclusion: 'failure' }] };
     // Annotation is bound to verdict job.head_sha === PR head, never the PR number alone.
