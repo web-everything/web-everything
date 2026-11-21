@@ -56,8 +56,13 @@ export function resolveCiHealInterval({ env = process.env, settings = readSettin
 export function resolveCiHealLoop({ env = process.env, settings = readSettings(), readOverride = key => readEnumOverride(key) } = {}) {
   const pick = value => (value === 'on' || value === 'off' ? value : undefined);
   let override;
-  try { override = readOverride('ciHeal.loop'); } catch { override = undefined; }
+  try { override = readOverride('ciHeal.loop'); } catch { override = { ok: false, reason: 'error' }; }
   if (override?.ok && pick(override.value)) return { enabled: override.value === 'on', source: 'override' };
+  // Only a store that is simply absent or has no such key may defer to a lower layer; unreadable or invalid operator
+  // evidence could be a lost "off", so it fails closed to off.
+  if (!override || (override.ok === false && !['absent', 'not-set'].includes(override.reason)) || override.ok === true) {
+    return { enabled: false, source: 'override-unreadable' };
+  }
   if (env.WE_CI_HEAL_LOOP !== undefined) return { enabled: pick(env.WE_CI_HEAL_LOOP) === 'on', source: 'env' };
   const file = pick(settings?.ciHeal?.loop);
   return file ? { enabled: file === 'on', source: 'file' } : { enabled: false, source: 'standard' };

@@ -74,8 +74,13 @@ describe('ci-heal child loop wiring (async slice s2)', () => {
     expect(resolveCiHealLoop({ env: { WE_CI_HEAL_LOOP: 'on' }, settings: {}, readOverride: none })).toEqual({ enabled: true, source: 'env' });
     expect(resolveCiHealLoop({ env: {}, settings: { ciHeal: { loop: 'on' } }, readOverride: none })).toEqual({ enabled: true, source: 'file' });
     expect(resolveCiHealLoop({ env: {}, settings: {}, readOverride: none })).toEqual({ enabled: false, source: 'standard' });
-    // an unreadable or invalid override store never turns the loop on by itself
-    expect(resolveCiHealLoop({ env: {}, settings: {}, readOverride: () => { throw new Error('x'); } })).toEqual({ enabled: false, source: 'standard' });
+    // an unreadable or invalid override store (a possibly lost "off") fails closed, even when env/file say on
+    const hot = { env: { WE_CI_HEAL_LOOP: 'on' }, settings: { ciHeal: { loop: 'on' } } };
+    expect(resolveCiHealLoop({ ...hot, readOverride: () => { throw new Error('x'); } })).toEqual({ enabled: false, source: 'override-unreadable' });
+    expect(resolveCiHealLoop({ ...hot, readOverride: () => ({ ok: false, reason: 'invalid-store' }) })).toEqual({ enabled: false, source: 'override-unreadable' });
+    expect(resolveCiHealLoop({ ...hot, readOverride: () => ({ ok: false, reason: 'unreadable' }) }).enabled).toBe(false);
+    // a missing store file is not evidence of anything: lower layers apply
+    expect(resolveCiHealLoop({ ...hot, readOverride: () => ({ ok: false, reason: 'absent' }) })).toEqual({ enabled: true, source: 'env' });
     expect(resolveCiHealLoopEnabled({ env: {}, settings: {}, readOverride: on })).toBe(true);
   });
 
