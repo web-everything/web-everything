@@ -18,6 +18,12 @@ export function createUrgentDeps({ cwd = process.cwd(), home = homedir(), fs = r
   // Local verification must acquire host admission even when launched from CI.
   for (const marker of ['CI', 'GITHUB_ACTIONS', 'CONTINUOUS_INTEGRATION', 'GITLAB_CI',
     'BUILDKITE', 'CIRCLECI', 'TRAVIS', 'JENKINS_URL', 'TEAMCITY_VERSION', 'TF_BUILD', 'BUILD_NUMBER']) delete childEnv[marker];
+  // The host's approved gh-shim dirs (the agent-launch shim: <home>/.claude/github-app-token/gh-shim or gh-shim.d/<16 hex>)
+  // are launcher scaffolding, not system tools: scrub exactly those from the child PATH so nothing probes the token tree.
+  // Any other extra dir (a lookalike, another gh) is left alone.
+  // Matched by the exact path shape (any home: the host PATH is inherited while HOME may be a sandbox or fake).
+  const approvedShimDir = d => /(^|\/)\.claude\/github-app-token\/gh-shim(\.d\/[0-9a-f]{16})?$/.test(resolve(d));
+  if (childEnv.PATH) childEnv.PATH = childEnv.PATH.split(delimiter).filter(d => !(d && approvedShimDir(d))).join(delimiter);
   const fui = resolve(cwd, '../frontierui');
   // Child env is scrubbed to a few keys; local bins (vitest etc.) must stay resolvable.
   const binDirs = [join(cwd, 'node_modules/.bin'), join(fui, 'node_modules/.bin')];
