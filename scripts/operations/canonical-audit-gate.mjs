@@ -134,16 +134,20 @@ export function checkCanonicalAuditForOpen({ repo = process.cwd(), ref, sha, env
   if (!evidence.ok && evidence.reason !== 'weakened') {
     try {
       // Only the NEWEST audited ancestor may carry (an older pass must never outrank a later verdict), and this
-      // head must have no verdict of its own. The ancestor is judged with its own stored fingerprint so matching
-      // negative evidence still vetoes.
+      // head must have no verdict of its own.
       if (records.some(r => String(r.head).toLowerCase() === fullSha)) throw new Error('own verdict exists');
-      const isAncestor = h => { try { git('merge-base', '--is-ancestor', h, fullSha); return true; } catch { return false; } };
+      // git exit 1 means "not an ancestor"; any other failure THROWS, so unknown ancestry refuses the carry.
+      const ancestry = (a, b) => { try { git('merge-base', '--is-ancestor', a, b); return true; } catch (e) { if (e?.status === 1) return false; throw e; } };
+      const isAncestor = h => ancestry(h, fullSha);
       const newest = [...records].reverse().find(r => isAncestor(String(r.head).toLowerCase()));
       const head = newest && String(newest.head).toLowerCase();
       // A non-passing verdict on any commit INSIDE the carried delta (between the audited head and this head) vetoes.
-      const between = x => x !== head && isAncestor(x) && (() => { try { git('merge-base', '--is-ancestor', head, x); return true; } catch { return false; } })();
+      const between = x => x !== head && isAncestor(x) && ancestry(head, x);
       if (head && records.some(r => r.verdict !== 'NOT WEAKENED' && between(String(r.head).toLowerCase()))) throw new Error('weakened commit inside the delta');
-      const audited = head && canonicalAuditEvidence(records, head, covers, newest.fingerprint ?? null);
+      // The ancestor's net-diff fingerprint is recomputed from git, never read from the stored record.
+      const ancestorFp = head && netDiffFingerprint(repo, 'origin/main', head, { exec });
+      if (!ancestorFp) throw new Error('cannot recompute the ancestor fingerprint');
+      const audited = canonicalAuditEvidence(records, head, covers, ancestorFp);
       if (audited?.ok && audited.record?.head === head && testOnlyAdditiveDelta(repo, head, fullSha, { exec }).ok) {
         const et = new Date(now()).toLocaleString('en-US', { timeZone: 'America/New_York', hour12: false });
         warn(`carried: test-only additive delta ${head}..${fullSha} (${et} ET)`);
