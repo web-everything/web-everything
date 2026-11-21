@@ -958,15 +958,28 @@ async function runCli() {
     return soakPrecheckAtOpen({ title: createParams.title, body: CREATE_BODY, files });
   }
 
+  // Read-only decision: does origin already hold exactly refSha at the lane ref? (shared by the dry-run preview and the real push step)
+  function pushSkipDecision() {
+    const remoteHeadRef = `refs/heads/${REF}`;
+    const remoteTipLine = tryGit(['ls-remote', REMOTE, remoteHeadRef]);
+    const remoteTipMatch = /^([0-9a-f]{40})\t([^\r\n]+)$/i.exec(remoteTipLine ?? '');
+    const remoteTip = remoteTipMatch?.[2] === remoteHeadRef ? remoteTipMatch[1] : null;
+    const validRefSha = /^[0-9a-f]{40}$/i.test(refSha);
+    // A separate push destination (pushurl / pushInsteadOf) means the fetch-side tip proves nothing about it: never skip.
+    const splitPushConfig = (tryGit(['config', '--get-regexp', `^(remote\\.${REMOTE.replace(/[^\w-]/g, '\\$&')}\\.pushurl|url\\..*\\.pushinsteadof)$`]) ?? '').trim() !== '';
+    return { remoteTip, validRefSha, alreadyPublished: validRefSha && remoteTip === refSha && !splitPushConfig };
+  }
+
   if (DRY_RUN) {
     const createArgs = buildCreateArgs(createParams);
+    const pushPreview = pushSkipDecision();
     const soak = soakCreatePrecheck();
     emit({
       repo: REPO, merged: false, reason: 'dry-run', ref: REF, base: BASE, method: METHOD,
       plan: [
         `node scripts/lint-locus-prefix.mjs ${buildLocusLintArgs({ root: REPO, range: `${REMOTE}/${BASE}..${refSha}` }).join(' ')}   # #2331 producer locus-prefix re-check (fail fast on the #2170 review-append leak) — swept in --root, the clone holding the commits (#3342)`,
         `soak precheck (if no PR exists yet): ${soak.ok ? soak.skipped || soak.reason : `REFUSE: ${soak.message}`}`,
-        `git push ${REMOTE} ${SRC}:refs/heads/${REF}   # publish the lane clone's ${SRC} (${refSha.slice(0, 8)}) to the lane ref`,
+        pushPreview.alreadyPublished ? `push skipped: ${REMOTE} already at ${refSha}` : `git push ${REMOTE} ${SRC}:refs/heads/${REF}   # publish the lane clone's ${SRC} (${refSha.slice(0, 8)}) to the lane ref`,
         prCreateBodyGuard(BODY).ok ? `gh ${createArgs.join(' ')}` : `REFUSE (if no PR exists yet): ${prCreateBodyGuard(BODY).reason}  # #2332 fail-fast — an existing PR for this head is exempt`,
         PLAN.waitForChecks ? 'poll: gh pr view <pr> mergeStateStatus + gh pr checks <pr> --required  (wait until green; abort on red)'
           : PLAN.mode === 'park' ? '(--park: skip check-wait — the PR is HELD for review, not landed by this run)'
@@ -1127,14 +1140,7 @@ async function runCli() {
   // 2. Publish the source commit to the lane ref on origin (guard-safe: lane/*). Never force, no local branch.
   // Only an exact, readable remote tip can authorize skipping the guarded push.
   // Failed/malformed remote reads retain the normal push path and its pre-push guard.
-  const remoteHeadRef = `refs/heads/${REF}`;
-  const remoteTipLine = tryGit(['ls-remote', REMOTE, remoteHeadRef]);
-  const remoteTipMatch = /^([0-9a-f]{40})\t([^\r\n]+)$/i.exec(remoteTipLine ?? '');
-  const remoteTip = remoteTipMatch?.[2] === remoteHeadRef ? remoteTipMatch[1] : null;
-  const validRefSha = /^[0-9a-f]{40}$/i.test(refSha);
-  // A separate push destination (pushurl / pushInsteadOf) means the fetch-side tip proves nothing about it: never skip.
-  const splitPushConfig = (tryGit(['config', '--get-regexp', `^(remote\\.${REMOTE.replace(/[^\w-]/g, '\\$&')}\\.pushurl|url\\..*\\.pushinsteadof)$`]) ?? '').trim() !== '';
-  const alreadyPublished = validRefSha && remoteTip === refSha && !splitPushConfig;
+  const { remoteTip, validRefSha, alreadyPublished } = pushSkipDecision();
   if (alreadyPublished) {
     process.stderr.write(`pr-land [${REPO}] · push skipped: ${REMOTE} already at ${refSha}\n`);
   } else if (validRefSha && remoteTip) {
