@@ -5,6 +5,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import yaml from 'js-yaml';
 import { spawnSync } from 'node:child_process';
+import { recordQuarantineReuse } from '../quarantine-skip.mjs';
 const raw = readFileSync(new URL('../../../.github/workflows/ci.yml', import.meta.url), 'utf8');
 const wf = yaml.load(raw), jobs = wf.jobs;
 it('scopes extra token permissions to the jobs that read evidence', () => {
@@ -89,20 +90,22 @@ it('requires an unquarantined execution receipt from every unit, integration and
   try {
     const names = [['unit', 'UNIT_SHARDS'], ['integration', 'INTEGRATION_GROUPS'], ['soak', 'SOAK_SHARDS']]
       .flatMap(([suite, key]) => JSON.parse(check.env[key]).map(id => `quarantine-reuse-${suite}-${id}`));
+    // Receipts come from the real producer (send-back F2), bound to this commit/run/attempt.
+    const identity = { GITHUB_EVENT_NAME: 'merge_group', GITHUB_SHA: 'a'.repeat(40), GITHUB_RUN_ID: '100', GITHUB_RUN_ATTEMPT: '1' };
     for (const name of names) {
       mkdirSync(join(dir, name));
-      writeFileSync(join(dir, name, 'quarantine-reuse'), 'unquarantined\n');
+      recordQuarantineReuse({ reuseSafe: true }, { ...identity, RUNNER_TEMP: join(dir, name) });
     }
     const output = join(dir, 'output');
     const run = () => {
       writeFileSync(output, '');
       const result = spawnSync('bash', ['-e', '-c', check.run], { encoding: 'utf8',
-        env: { ...process.env, ...check.env, RECEIPTS: dir, GITHUB_OUTPUT: output } });
+        env: { ...process.env, ...check.env, ...identity, RECEIPTS: dir, GITHUB_OUTPUT: output } });
       expect(result.status, result.stderr).toBe(0);
       return readFileSync(output, 'utf8');
     };
     expect(run()).toBe('eligible=true\n');
-    for (const receipt of ['quarantined\n', '', 'unknown\n']) {
+    for (const receipt of ['quarantined\n', '', 'unknown\n', 'unquarantined\n']) {
       writeFileSync(join(dir, names[0], 'quarantine-reuse'), receipt);
       expect(run()).toBe('eligible=false\n');
     }
@@ -122,8 +125,15 @@ it.each(['false', '', 'TRUE', 'garbage'])('reuse cannot bypass invalid soak scop
   const run = spawnSync('bash', ['-e', '-c', script], { encoding: 'utf8', env: { ...process.env, GITHUB_STEP_SUMMARY: '/dev/null' } });
   expect(run.status, run.stdout + run.stderr).toBe(1);
 });
-it('required jobs remain real jobs; test logs the queue id through the skip reason', () => {
-  for (const name of ['test', 'smoke', 'daemon-soak']) { expect(jobs[name]).toBeDefined(); expect(jobs[name].if || '').not.toMatch(/outputs\.(light|skip)/); }
+it('required jobs are skipped only on a reused main push (send-back F1); test logs the skip reason', () => {
+  // The ONLY light/skip reference allowed in a required job's condition is the reused-push guard: a
+  // reused push must not report success for execution that never ran on main (see main-reuse-fail-closed).
+  const guard = "!(github.event_name == 'push' && needs.changes.result == 'success' && needs.changes.outputs.skip == 'true')";
+  for (const name of ['test', 'smoke', 'daemon-soak']) {
+    expect(jobs[name]).toBeDefined();
+    expect(jobs[name].if).toContain(guard);
+    expect(jobs[name].if.replace(guard, '')).not.toMatch(/outputs\.(light|skip)/);
+  }
   expect(jobs.changes.outputs['skip-reason']).toContain('main-skip.outputs.reason');
   expect(jobs.test.steps.some(s => s.env?.MAIN_SKIP_REASON === '${{ needs.changes.outputs.skip-reason }}' && s.run?.includes('$MAIN_SKIP_REASON'))).toBe(true);
 });

@@ -34,8 +34,10 @@ const input = (overrides = {}) => ({
 });
 const plan = (overrides = {}) => planMainRedAlert(input(overrides));
 const kinds = (result) => result.items.map((item) => item.kind);
-// ci.yml skips this conditional failure job when a push actually executes CI.
-const executionMarker = () => ({ id: 0, name: 'main-execution', status: 'completed', conclusion: 'skipped' });
+// ci.yml's positive marker SUCCEEDS when a push fully executes CI, in the same check suite as the
+// required checks (send-back F5). Fixture checks default to that one suite.
+const SUITE = 1;
+const executionMarker = () => ({ id: 0, name: 'main-execution', status: 'completed', conclusion: 'success', suiteId: SUITE });
 const passingTip = (overrides = {}) => {
   const tip = {
     sha: TIP_SHA, runStatus: 'completed', requiredChecks: ['test'],
@@ -48,6 +50,7 @@ const passingTip = (overrides = {}) => {
     && !tip.checkRuns.some(check => check.name === 'main-execution')) {
     tip.checkRuns = [...tip.checkRuns, executionMarker()];
   }
+  if (Array.isArray(tip.checkRuns)) tip.checkRuns = tip.checkRuns.map(check => ({ suiteId: SUITE, ...check }));
   if (!Object.hasOwn(overrides, 'checksTotal')) tip.checksTotal = tip.checkRuns?.length;
   return tip;
 };

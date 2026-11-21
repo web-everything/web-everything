@@ -49,16 +49,17 @@ function runGate({ scopeResult, run, shardResult, event = 'merge_group', skip = 
 }
 
 describe('daemon-soak aggregator gate (ci.yml) fails closed', () => {
-  it('only a literal true verified push skips soak shards, and failed detection/scope still fails closed', () => {
+  it('never passes skipped soak shards outside a pull_request; a reused push skips the whole job instead (PR #7224 F1)', () => {
     for (const event of ['push', 'merge_group', 'schedule', 'workflow_dispatch']) {
       for (const skip of ['true', 'false', '', 'TRUE']) {
-        expect(runGate({ event, skip, scopeResult: 'success', run: 'true', shardResult: 'skipped' }) === 0)
-          .toBe(event === 'push' && skip === 'true');
+        expect(runGate({ event, skip, scopeResult: 'success', run: 'true', shardResult: 'skipped' }), `${event}/${skip}`).not.toBe(0);
       }
     }
-    for (const changesResult of ['failure', 'skipped', '']) expect(runGate({ event: 'push', skip: 'true',
-      changesResult, scopeResult: 'success', run: 'true', shardResult: 'skipped' })).not.toBe(0);
-    expect(runGate({ event: 'push', skip: 'true', scopeResult: 'failure', run: 'true', shardResult: 'skipped' })).not.toBe(0);
+    // A reused push must not report a vacuous daemon-soak success: the job-level guard skips it.
+    const lines = readFileSync(CI_YML, 'utf8').split('\n');
+    const jobAt = lines.indexOf('  daemon-soak:');
+    const condition = lines.slice(jobAt + 1).find(line => /^    if: /.test(line));
+    expect(condition).toContain("!(github.event_name == 'push' && needs.changes.result == 'success' && needs.changes.outputs.skip == 'true')");
   });
 
   // R1068: soak shards run only in merge_group / main push / dispatch; on a pull_request the aggregator succeeds.

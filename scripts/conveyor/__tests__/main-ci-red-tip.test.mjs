@@ -12,10 +12,11 @@ const TIP_SHA = 'b5e21364240ec2b10a3987115a9f2fa893e8e974';
 const at = (time) => Date.parse(`2026-10-11T${time}Z`);
 const requiredChecks = ['test', 'smoke', 'daemon-soak', 'soak-replay-gate'];
 const runs = [
-  { headSha: RED_SHA, databaseId: 38166405992, status: 'completed', conclusion: 'failure', createdAt: '2026-10-11T19:03:32Z', updatedAt: '2026-10-11T19:15:15Z' },
-  { headSha: TIP_SHA, databaseId: 38166433535, status: 'completed', conclusion: 'success', createdAt: '2026-10-11T19:03:53Z', updatedAt: '2026-10-11T19:27:10Z' },
+  { headSha: RED_SHA, databaseId: 38166405992, event: 'push', status: 'completed', conclusion: 'failure', createdAt: '2026-10-11T19:03:32Z', updatedAt: '2026-10-11T19:15:15Z' },
+  { headSha: TIP_SHA, databaseId: 38166433535, event: 'push', status: 'completed', conclusion: 'success', createdAt: '2026-10-11T19:03:53Z', updatedAt: '2026-10-11T19:27:10Z' },
 ];
-const check = (name, conclusion = 'success', id = 1) => ({ name, status: 'completed', conclusion, id });
+// One run's checks share a suite id; the positive execution marker succeeds in that suite (send-back F5).
+const check = (name, conclusion = 'success', id = 1) => ({ name, status: 'completed', conclusion, id, suiteId: 1 });
 const redCheckRuns = ['smoke', 'integration', ...[1, 2, 3, 4, 5].map((n) => `test-shard (${n})`),
   ...[1, 2, 3, 4].map((n) => `soak-shard (${n})`), 'test', 'daemon-soak']
   .map((name, id) => check(name, ['test-shard (3)', 'test'].includes(name) ? 'failure' : 'success', id));
@@ -29,7 +30,7 @@ const completions = [
 function replay(time = '19:24:34') {
   const snapshot = runsAsOf(runs, at(time));
   return { runs: snapshot, tip: { sha: TIP_SHA, runStatus: snapshot.find((r) => r.headSha === TIP_SHA).status,
-    requiredChecks, redCheckRuns, checkRuns: [check('main-execution', 'skipped'), ...completions.map(([name, done], id) => at(done) <= at(time)
+    requiredChecks, redCheckRuns, checkRuns: [check('main-execution', 'success'), ...completions.map(([name, done], id) => at(done) <= at(time)
       ? check(name, 'success', id) : { name, id, status: 'in_progress', conclusion: null })] } };
 }
 
@@ -76,7 +77,7 @@ describe('main CI truth follows the tip (2026-10-11 incident)', () => {
   });
   it('uses the highest check id for a same-sha rerun, regardless of list order', () => {
     const tip = { sha: RED_SHA, runStatus: 'completed', requiredChecks, checkRuns: [
-      check('main-execution', 'skipped'), check('test', 'success', 2), check('test', 'failure', 1),
+      check('main-execution', 'success'), check('test', 'success', 2), check('test', 'failure', 1),
       check('test-shard (3)', 'failure', 1), check('test-shard (3)', 'success', 2),
     ] };
     expect(mainRedState(replay().runs, { tip })).toMatchObject({ status: 'green', via: 'tip-required-checks' });
@@ -129,13 +130,15 @@ describe('main CI truth follows the tip (2026-10-11 incident)', () => {
 });
 
 describe('best-effort tip IO', () => {
+  // GitHub reports a check run's suite as `check_suite.id`; the reader exposes it as `suiteId`.
+  const api = checks => checks.map(({ suiteId, ...c }) => (suiteId === undefined ? c : { ...c, check_suite: { id: suiteId } }));
   it('preserves numeric total_count as checksTotal when the check-runs page is partial', () => {
     const one = check('test');
     const exec = (bin, argv) => {
       expect(bin).toBe('gh');
       if (argv[1] === 'repos/example/repo/commits/main') return `${TIP_SHA}\n`;
       if (argv[1] === `repos/example/repo/commits/${TIP_SHA}/check-runs?per_page=100`) {
-        return JSON.stringify({ total_count: 2, check_runs: [one] });
+        return JSON.stringify({ total_count: 2, check_runs: api([one]) });
       }
       throw new Error(`unexpected read: ${argv}`);
     };
@@ -152,8 +155,8 @@ describe('best-effort tip IO', () => {
         expect(argv.slice(2)).toEqual(['--jq', '.sha']);
         return `${TIP_SHA}\n`;
       }
-      if (argv[1] === `repos/example/repo/commits/${TIP_SHA}/check-runs?per_page=100`) return JSON.stringify({ check_runs: tip.checkRuns });
-      if (argv[1] === `repos/example/repo/commits/${RED_SHA}/check-runs?per_page=100`) return JSON.stringify({ check_runs: redCheckRuns });
+      if (argv[1] === `repos/example/repo/commits/${TIP_SHA}/check-runs?per_page=100`) return JSON.stringify({ check_runs: api(tip.checkRuns) });
+      if (argv[1] === `repos/example/repo/commits/${RED_SHA}/check-runs?per_page=100`) return JSON.stringify({ check_runs: api(redCheckRuns) });
       throw new Error(`unexpected read: ${argv}`);
     };
     expect(readMainTip({ exec, repoSlug: 'example/repo', runs, readRequired: (o) => {

@@ -5,9 +5,10 @@ import * as core from '../main-ci-red-core.mjs';
 import * as io from '../main-ci-red-io.mjs';
 
 const settings = core.mainCiRedSettings();
-const green = { databaseId: 1, headSha: 'abcdef0123456789', createdAt: '2026-10-14T01:00:00Z', status: 'completed', conclusion: 'success' };
-const red = { databaseId: 2, headSha: '62da75ed3123456789', createdAt: '2026-10-14T02:00:00Z', status: 'completed', conclusion: 'failure', attempt: 1 };
-const tip = { databaseId: 3, headSha: '28a7885f1123456789', createdAt: '2026-10-14T03:00:00Z', status: 'completed', conclusion: 'cancelled', attempt: 1 };
+// `gh run list --json event` always reports the event; the probe refuses rows without one (PR #7224).
+const green = { databaseId: 1, headSha: 'abcdef0123456789', event: 'push', createdAt: '2026-10-14T01:00:00Z', status: 'completed', conclusion: 'success' };
+const red = { databaseId: 2, headSha: '62da75ed3123456789', event: 'push', createdAt: '2026-10-14T02:00:00Z', status: 'completed', conclusion: 'failure', attempt: 1 };
+const tip = { databaseId: 3, headSha: '28a7885f1123456789', event: 'push', createdAt: '2026-10-14T03:00:00Z', status: 'completed', conclusion: 'cancelled', attempt: 1 };
 const failure = { file: 'scripts/conveyor/__tests__/sim-scenario-self-sync-sibling.test.mjs', title: '#3383 daemon scenario simulator > A3: a main move t', error: 'Error: Test timed out in 180000ms.' };
 const log = '2026-10-14T05:47:26.5319152Z \u001b[31m\u001b[1m\u001b[7m FAIL \u001b[27m\u001b[22m\u001b[39m scripts/conveyor/__tests__/sim-scenario-self-sync-sibling.test.mjs\u001b[2m > \u001b[22m#3383 daemon scenario simulator\u001b[2m > \u001b[22mA3: a main move t\n2026-10-14T05:47:26.5320853Z \u001b[31m\u001b[1mError\u001b[22m: Test timed out in 180000ms.';
 const flake = { runId: 2, eligible: true, reason: 'flaky-signature' };
@@ -260,7 +261,7 @@ describe('rerun IO and ledger', () => {
   }));
   it('keeps the hold for a manual re-run that no ledger entry knows (missing, unreadable or pruned ledger)', async () => fixture(async (opts) => {
     // built from plain fields: earlier tests' probes flag the shared `red` fixture in place, which would hide a missing derivation
-    const first = { databaseId: red.databaseId, headSha: red.headSha, createdAt: red.createdAt, status: 'completed', conclusion: 'failure', attempt: 1 };
+    const first = { databaseId: red.databaseId, headSha: red.headSha, event: 'push', createdAt: red.createdAt, status: 'completed', conclusion: 'failure', attempt: 1 };
     const manual = { ...first, attempt: 2 };
     const settled = (conclusion, extra = {}) => ({ runs: [green, { ...manual, status: 'completed', conclusion, ...extra }] });
     for (const readRuns of [() => settled('cancelled'), () => settled('skipped'), () => settled('failure', { infraOnly: true }), () => ({ runs: [green, { ...manual, status: 'in_progress' }] })]) {

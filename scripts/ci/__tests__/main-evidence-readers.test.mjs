@@ -6,6 +6,7 @@ import { tmpdir } from 'node:os';
 import yaml from 'js-yaml';
 import { REPO_ROOT } from '../shard-assign.mjs';
 import { downloadReports, downloadRuns, expectedUnitShards } from '../refresh-timings.mjs';
+import { quarantineReceiptText } from '../quarantine-receipt.mjs';
 it('timings selects full queue/schedule runs past a skipped-success push, for latest and rolling downloads', async () => {
   const dir = mkdtempSync(join(tmpdir(), 'main-evidence-'));
   const downloads = [];
@@ -13,7 +14,7 @@ it('timings selects full queue/schedule runs past a skipped-success push, for la
     if (args[1] === 'list') return JSON.stringify([
       { databaseId: 103, event: 'push', headBranch: 'main' },
       { databaseId: 102, event: 'schedule', headBranch: 'main' },
-      { databaseId: 101, event: 'merge_group', headBranch: 'gh-readonly-queue/main/pr-1', headSha: 'a'.repeat(40) },
+      { databaseId: 101, event: 'merge_group', headBranch: 'gh-readonly-queue/main/pr-1', headSha: 'a'.repeat(40), attempt: 1 },
     ]);
     if (args[0] === 'merge-base') return '';
     if (args[0] === 'api') { const id = Number(/runs\/(\d+)/.exec(args[1])[1]);
@@ -25,7 +26,8 @@ it('timings selects full queue/schedule runs past a skipped-success push, for la
         for (const id of jobs[job].strategy.matrix[key]) {
           const folder = join(target, `quarantine-reuse-${suite}-${id}`);
           mkdirSync(folder);
-          writeFileSync(join(folder, 'quarantine-reuse'), 'unquarantined\n');
+          writeFileSync(join(folder, 'quarantine-reuse'), quarantineReceiptText({ reuseSafe: true },
+            { GITHUB_SHA: 'a'.repeat(40), GITHUB_RUN_ID: '101', GITHUB_RUN_ATTEMPT: '1' }));
         }
       }
       return '';

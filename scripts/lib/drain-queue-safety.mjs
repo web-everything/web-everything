@@ -689,7 +689,8 @@ function readMqExactTestEvidence({ repo, pr, head, timeline, exec, now }) {
     if (runs.some(run => run.event === 'schedule')) {
       const mainHead = mqOid(json('git/ref/heads/main')?.object?.sha);
       if (!mainHead) return null;
-      runs = runs.filter(run => run.event !== 'schedule' || mqOid(run.head_sha) === mainHead);
+      // An old-SHA backstop success cannot speak for current main; its failure is still known red.
+      runs = runs.filter(run => run.event !== 'schedule' || run.conclusion !== 'success' || mqOid(run.head_sha) === mainHead);
     }
     runs.sort(newestRunFirst);
     const ignored = new Set(['cancelled', 'startup_failure', 'stale', 'action_required']);
@@ -1042,7 +1043,9 @@ function readMqBaseRetryEvidence({ repo, pr, head, timeline, exec, rerunScope, d
         { encoding: 'utf8', timeout: 60_000, maxBuffer: 1024 * 1024,
           stdio: ['ignore', 'pipe', 'pipe'], throttle: { maxAttempts: 1 } }))?.object?.sha);
       if (!mainHead) return null;
-      const current = run => run.event !== 'schedule' || mqOid(run.head_sha) === mainHead;
+      // Drop only old-SHA backstop SUCCESSES (they cannot certify current main). A scheduled failure
+      // stays: with the current push pending it must decide, not an earlier push success.
+      const current = run => run.event !== 'schedule' || run.conclusion !== 'success' || mqOid(run.head_sha) === mainHead;
       newest = newest.filter(current);
       runs = runs.filter(current);
     }

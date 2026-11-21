@@ -6,10 +6,11 @@ import { drainFreezeSignal } from '../../lib/red-main-freeze-shared.mjs';
 import { combineRedMain, readMainCiFact } from '../../merge-gate-check.mjs';
 import { decideMainPushSkip } from '../main-push-skip.mjs';
 import { readFileSync } from 'node:fs';
-import { withoutReusedMainPushes } from '../../lib/main-ci-reuse-runs.mjs';
+import { REUSED_MARKER_STEP, withoutReusedMainPushes } from '../../lib/main-ci-reuse-runs.mjs';
 const head = 'a'.repeat(40), old = 'b'.repeat(40);
+// `gh run list --json attempt` always reports the attempt; reuse proof refuses an unknown one (send-back F6).
 const run = (id, sha, conclusion, event = 'push') => ({ databaseId: id, headSha: sha, conclusion,
-  event, status: 'completed', createdAt: `2026-11-20T${id}:00:00Z`, updatedAt: `2026-11-20T${id}:30:00Z` });
+  event, status: 'completed', attempt: 1, createdAt: `2026-11-20T${id}:00:00Z`, updatedAt: `2026-11-20T${id}:30:00Z` });
 const check = (name, conclusion) => ({ id: 1, name, status: 'completed', conclusion });
 it.each(['failure', undefined])('required checks cannot hide red main with marker %s', marker => {
   const tip = { sha: head, runStatus: 'completed', requiredChecks: ['test', 'smoke', 'daemon-soak'],
@@ -31,7 +32,8 @@ function fact(rows, current = head, jobPages = {}) {
   } });
 }
 const reusedJobs = () => ({ total_count: 3, jobs: [
-  { name: 'main-execution', status: 'completed', conclusion: 'failure', run_attempt: 1 },
+  { name: 'main-execution', status: 'completed', conclusion: 'failure', run_attempt: 1,
+    steps: [{ name: REUSED_MARKER_STEP, status: 'completed', conclusion: 'failure' }] },
   { name: 'test', status: 'completed', conclusion: 'success', run_attempt: 1 },
   { name: 'unit (1)', status: 'completed', conclusion: 'skipped', run_attempt: 1 },
 ] });

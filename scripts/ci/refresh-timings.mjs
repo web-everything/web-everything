@@ -10,6 +10,7 @@ import { fileURLToPath } from 'node:url';
 import { randomUUID } from 'node:crypto';
 import { readFileSync, realpathSync } from 'node:fs';
 import yaml from 'js-yaml';
+import { validQuarantineReceipt } from './quarantine-receipt.mjs';
 import { REPO_ROOT, TIMINGS_FILE, listUnitTestFiles, timingsFromReports, loadTimings, formatUpdatedTimings, median, staleRatio } from './shard-assign.mjs';
 
 /** Recursively parse unit reports only; malformed or unreadable evidence throws. Report filenames are appended to `names`. */
@@ -136,8 +137,11 @@ async function unquarantinedQueueRun(run, exec, options) {
       });
     scratch = await mkdtemp(join(tmpdir(), 'timing-receipts-'));
     exec('gh', ['run', 'download', String(run.databaseId), '--pattern=quarantine-reuse-*', '--dir', scratch], options);
+    // Every receipt must come from this run's latest attempt at this commit: a partial rerun's older
+    // attempts cannot stand in for the execution these timings would claim.
+    const want = { sha: run.headSha, runId: run.databaseId, attempt: run.attempt };
     for (const name of names) {
-      if (await readFile(join(scratch, name, 'quarantine-reuse'), 'utf8') !== 'unquarantined\n') return false;
+      if (!validQuarantineReceipt(await readFile(join(scratch, name, 'quarantine-reuse'), 'utf8'), want)) return false;
     }
     return true;
   } catch { return false; } // Missing, expired or unknown receipts leave this candidate ineligible.
@@ -147,7 +151,7 @@ async function unquarantinedQueueRun(run, exec, options) {
 /** Search past light successes. At most 100 candidates/20 artifact inventories and receipt downloads; explicit --run is the fallback. */
 async function fullTimingRuns(count, exec, error) {
   const options = { cwd: REPO_ROOT, encoding: 'utf8', timeout: 120_000, maxBuffer: 1024 * 1024 };
-  const found = JSON.parse(exec('gh', ['run', 'list', '--workflow=ci.yml', '--status=success', '--limit=100', '--json=databaseId,event,headBranch,headSha'], options));
+  const found = JSON.parse(exec('gh', ['run', 'list', '--workflow=ci.yml', '--status=success', '--limit=100', '--json=databaseId,event,headBranch,headSha,attempt'], options));
   if (!Array.isArray(found) || !found.length || found.length > 100
     || found.some(r => !Number.isSafeInteger(r?.databaseId) || r.databaseId <= 0 || typeof r.event !== 'string' || typeof r.headBranch !== 'string')
     || new Set(found.map(r => r.databaseId)).size !== found.length) throw new Error(error);

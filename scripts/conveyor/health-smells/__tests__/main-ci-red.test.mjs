@@ -29,7 +29,8 @@ const LAST_GREEN = '26b439b79';
 const PR_4522 = { number: 4522, title: 'WE #xh6ij2v: fix — fix red main — orphan-adopt soak declares its own…', headRefName: 'lane/main-red-soak', createdAt: '2026-10-08T22:43:39Z', state: 'OPEN', body: '', author: { login: 'web-everything' } };
 const PR_4523 = { number: 4523, title: 'backlog: file xu1nixv — a red main gets an owner', headRefName: 'lane/main-red-owner-card', createdAt: '2026-10-08T22:46:20Z', state: 'OPEN', body: '', author: { login: 'web-everything' } };
 
-const run = (o) => ({ status: 'completed', databaseId: 1, headSha: 'a'.repeat(40), createdAt: '2026-10-08T10:00:00Z', updatedAt: '2026-10-08T10:10:00Z', ...o });
+// `gh run list --json event` always reports the event; the probe refuses rows without one (PR #7224).
+const run = (o) => ({ status: 'completed', event: 'push', databaseId: 1, headSha: 'a'.repeat(40), createdAt: '2026-10-08T10:00:00Z', updatedAt: '2026-10-08T10:10:00Z', ...o });
 
 let dir;
 beforeEach(() => { dir = mkdtempSync(join(tmpdir(), 'main-ci-red-')); published = []; publishedState = []; });
@@ -295,7 +296,7 @@ describe('red-main owner PR priority (operator context 2026-10-08: red main bloc
 describe('a truncated read window (live 2026-10-08: 60 runs did not reach the last green run)', () => {
   it('the probe reads deeper when a full first page holds no green run', () => {
     const limits = [];
-    const page = (n) => Array.from({ length: n }, (_, i) => ({ databaseId: 1000 + i, headSha: `${i}`.padStart(40, 'b'), status: 'completed', conclusion: i === n - 1 && n > 3 ? 'success' : 'failure', createdAt: new Date(T('2026-10-08T20:00:00Z') - i * MIN).toISOString(), updatedAt: '2026-10-08T21:00:00Z' }));
+    const page = (n) => Array.from({ length: n }, (_, i) => ({ databaseId: 1000 + i, headSha: `${i}`.padStart(40, 'b'), event: 'push', status: 'completed', conclusion: i === n - 1 && n > 3 ? 'success' : 'failure', createdAt: new Date(T('2026-10-08T20:00:00Z') - i * MIN).toISOString(), updatedAt: '2026-10-08T21:00:00Z' }));
     const exec = (cmd, argv) => {
       if (argv[0] === 'run') { const n = Number(argv[argv.indexOf('--limit') + 1]); limits.push(n); return JSON.stringify(page(n === 3 ? 3 : 5)); }
       return JSON.stringify({ total_count: 1, jobs: [{ id: 1, name: 'test', conclusion: 'failure' }] });

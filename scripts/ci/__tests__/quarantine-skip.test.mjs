@@ -44,7 +44,9 @@ it('writes a receipt only for proven unquarantined execution; unknown and skippe
   try {
     for (const out of [{ reuseSafe: true, line: '' }, { reuseSafe: false, line: '--exclude=a.test.mjs' }, { line: '' }]) {
       recordQuarantineReuse(out, { GITHUB_EVENT_NAME: 'merge_group', RUNNER_TEMP: root });
-      expect(readFileSync(join(root, 'quarantine-reuse'), 'utf8')).toBe(out.reuseSafe === true ? 'unquarantined\n' : 'unknown-or-quarantined\n');
+      // The decision now rides in a JSON receipt with its execution identity (send-back F2).
+      expect(JSON.parse(readFileSync(join(root, 'quarantine-reuse'), 'utf8')).decision)
+        .toBe(out.reuseSafe === true ? 'unquarantined' : 'unknown-or-quarantined');
     }
   } finally { rmSync(root, { recursive: true, force: true }); }
 });

@@ -13,26 +13,46 @@ const event = (conclusion = 'failure') => ({ event_name: 'workflow_run', reposit
 } });
 const admitted = github => Function('github', `return (${deploy.if})`)(github);
 const page = () => ({ total_count: 4, jobs: ['main-execution', 'test', 'smoke', 'unit (1)'].map(name => ({ name,
-  status: 'completed', conclusion: name === 'main-execution' ? 'failure' : name === 'unit (1)' ? 'skipped' : 'success', run_attempt: 1 })) });
+  status: 'completed', conclusion: name === 'main-execution' ? 'failure' : name === 'unit (1)' ? 'skipped' : 'success', run_attempt: 1,
+  ...(name === 'main-execution' ? { steps: [
+    { name: marker.steps[0].name, conclusion: 'failure' }, { name: marker.steps[1].name, conclusion: 'skipped' }] } : {}) })) });
+const queueRuns = () => ({ total_count: 1, workflow_runs: [{ id: 9, path: '.github/workflows/ci.yml', head_sha: 'a'.repeat(40),
+  head_branch: 'gh-readonly-queue/main/pr-1-abc', status: 'completed', conclusion: 'success', check_suite_id: 4242 }] });
 
-async function verify(data = page(), payload = event().event) {
+async function verify(data = page(), payload = event().event, queue = queueRuns()) {
   const step = deploy.steps.find(step => step.name === 'Verify reused CI failure');
   expect(step, 'failed CI must be verified before any checkout or secret-bearing build').toBeDefined();
   const errors = [];
   const calls = [];
+  const outputs = {};
   await new (Object.getPrototypeOf(async function () {}).constructor)('github', 'context', 'core', step.with.script)(
     { rest: { actions: { listJobsForWorkflowRunAttempt: async args => {
       calls.push(args); if (data instanceof Error) throw data; return { data };
-    } } } },
-    { repo: { owner: 'fixture', repo: 'repo' }, payload }, { setFailed: message => errors.push(message) });
-  return { errors, calls };
+    }, listWorkflowRunsForRepo: async () => ({ data: queue }) } } },
+    { repo: { owner: 'fixture', repo: 'repo' }, payload },
+    { setFailed: message => errors.push(message), setOutput: (key, value) => { outputs[key] = value; } });
+  return { errors, calls, outputs };
 }
 
 it('a reused push conclusion wakes deploy and passes its reuse proof', async () => {
   const result = spawnSync('bash', ['-c', marker.steps[0].run], { encoding: 'utf8' });
   expect(result.status).toBe(1);
   expect(admitted(event(result.status === 0 ? 'success' : 'failure'))).toBe(true);
-  expect(await verify()).toMatchObject({ errors: [], calls: [{ run_id: 12, attempt_number: 1, per_page: 100 }] });
+  expect(await verify()).toMatchObject({ errors: [], calls: [{ run_id: 12, attempt_number: 1, per_page: 100 }],
+    outputs: { queue_suite: '4242' } });
+});
+it.each([
+  ['no queue run', q => { q.workflow_runs = []; q.total_count = 0; }],
+  ['a failed queue run', q => { q.workflow_runs[0].conclusion = 'failure'; }],
+  ['a queue run for another SHA', q => { q.workflow_runs[0].head_sha = 'b'.repeat(40); }],
+  ['an untrusted branch', q => { q.workflow_runs[0].head_branch = 'main'; }],
+  ['a truncated page', q => { q.total_count++; }],
+  ['no check suite', q => { delete q.workflow_runs[0].check_suite_id; }],
+])('refuses deploy when the certifying queue run has %s', async (_, change) => {
+  const queue = queueRuns(); change(queue);
+  const result = await verify(page(), event().event, queue);
+  expect(result.errors).not.toEqual([]);
+  expect(result.outputs).toEqual({});
 });
 it('keeps the trusted push boundary and exact-SHA ancestry/checks gate before checkout', () => {
   expect(admitted(event('success'))).toBe(true);
@@ -67,6 +87,8 @@ it.each([
   ['unknown attempt', data => { delete data.jobs[1].run_attempt; }],
   ['missing job inventory', data => { delete data.jobs; }],
   ['empty page', data => { data.jobs = []; data.total_count = 0; }],
+  ['the fresh-execution step failing instead', data => { data.jobs[0].steps = [{ name: marker.steps[1].name, conclusion: 'failure' }]; }],
+  ['no marker steps', data => { delete data.jobs[0].steps; }],
 ])('refuses deploy with %s', async (_, change) => {
   const data = page(); change(data);
   expect((await verify(data)).errors).not.toEqual([]);

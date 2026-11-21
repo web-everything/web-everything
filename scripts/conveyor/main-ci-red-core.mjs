@@ -332,11 +332,18 @@ export function tipRequiredVerdict(tip) {
  */
 export function mainRedState(runs, { tip } = {}) {
   const verdict = tipRequiredVerdict(tip);
-  const marker = (Array.isArray(tip?.checkRuns) ? tip.checkRuns : []).filter(check => check?.name === 'main-execution')
-    .sort((a, b) => b.id - a.id)[0];
-  // Full pushes skip this conditional marker; reused pushes fail it. Required summaries alone
-  // (including historical pushes without the marker) cannot certify fresh execution.
-  const executionKnown = marker?.status === 'completed' && ['success', 'skipped'].includes(marker.conclusion);
+  const checks = Array.isArray(tip?.checkRuns) ? tip.checkRuns : [];
+  const newest = name => checks.filter(check => check?.name === name).sort((a, b) => b.id - a.id)[0];
+  const marker = newest('main-execution');
+  // Only a full main push SUCCEEDS this marker (reuse fails it; merge-group, light and scheduled runs skip
+  // it), and only when it ran in the same check suite as every required check it would vouch for.
+  // Required summaries alone (including historical pushes without the marker) cannot certify execution.
+  const suite = marker?.suiteId;
+  const executionKnown = marker?.status === 'completed' && marker.conclusion === 'success'
+    && Number.isSafeInteger(suite) && suite > 0 && Array.isArray(tip?.requiredChecks)
+    // Same presence rule as tipRequiredVerdict: PR-only required checks may be absent on main.
+    && tip.requiredChecks.some(name => newest(name))
+    && tip.requiredChecks.every(name => !newest(name) || newest(name).suiteId === suite);
   if (verdict === 'green' && !executionKnown) return completedMainRedState(Array.isArray(runs)
     // The IO reader removes proven reused failures per run. A tip's green summaries
     // must not erase unproven failures (including other runs of that same SHA).

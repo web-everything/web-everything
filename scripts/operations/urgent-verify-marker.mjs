@@ -192,8 +192,9 @@ mirroredRuns.changes.push(
 const scheduledRef = "${{ github.event_name == 'schedule' && github.sha || '' }}";
 const siblingRef = "${{ needs.changes.outputs.fui-sha || '' }}";
 const reusePush = "${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}";
-const reused = "${{ steps.main-skip.outputs.skip == 'true' }}";
-const queueEvent = "${{ github.event_name == 'merge_group' }}";
+// Every main push records the FUI revision its jobs check out (deploy builds exactly that sibling).
+const recordedPush = "${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && (steps.main-skip.outputs.fui-sha || steps.fui-tip.outputs.tip) != '' }}";
+const fuiTipEvent = "${{ github.event_name == 'merge_group' || (github.event_name == 'push' && github.ref == 'refs/heads/main') }}";
 const queueFull = "${{ github.event_name == 'merge_group' && needs.changes.outputs.light != 'true' }}";
 const quarantineUpload = suite => ({ uses: 'actions/upload-artifact@v4', if: queueFull, with: {
   name: `quarantine-reuse-${suite}`, path: '${{ runner.temp }}/quarantine-reuse', 'if-no-files-found': 'ignore',
@@ -223,8 +224,8 @@ const mirroredActions = {
         'app-id': '${{ vars.WE_APP_ID }}', 'private-key': '${{ secrets.WE_APP_PRIVATE_KEY }}',
         owner: 'frontier-ui', repositories: 'frontierui', 'permission-contents': 'read',
       } },
-    { uses: 'actions/upload-artifact@v4', if: reused, with: {
-      name: 'fui-sibling-${{ steps.main-skip.outputs.fui-sha }}', path: '${{ runner.temp }}/fui-sibling-record',
+    { uses: 'actions/upload-artifact@v4', if: recordedPush, with: {
+      name: 'fui-sibling-${{ steps.main-skip.outputs.fui-sha || steps.fui-tip.outputs.tip }}', path: '${{ runner.temp }}/fui-sibling-record',
     } },
   ],
   standards: siblingActions,
@@ -294,8 +295,9 @@ const fullIntegration = "${{ steps.gate.outputs.run == 'true' }}";
 function mirroredRunContext(job, text) {
   const index = mirroredRuns[job].map(runText).indexOf(text);
   if (job === 'changes') return {
-    'working-directory': undefined, shell: undefined, 'continue-on-error': undefined,
-    if: [undefined, queueEvent, reusePush, reused][index],
+    'working-directory': undefined, shell: undefined,
+    'continue-on-error': index === 1 ? "${{ github.event_name == 'push' }}" : undefined,
+    if: [undefined, fuiTipEvent, reusePush, recordedPush][index],
     env: [
       { EVENT_NAME: '${{ github.event_name }}', BASE_SHA: '${{ github.event.pull_request.base.sha }}',
         MG_BASE_SHA: '${{ github.event.merge_group.base_sha }}', BASE_REF: '${{ github.event.pull_request.base.ref }}' },

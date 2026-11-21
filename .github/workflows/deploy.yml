@@ -107,7 +107,11 @@ jobs:
       # Reused pushes deliberately fail main-execution to withhold fresh main-green
       # evidence. Admit only that failure, with complete evidence from its own attempt.
       # This runs before checkout, app-token creation, or any production secret use.
+      # The proof mirrors scripts/lib/main-ci-reuse-runs.mjs#isReusedJobsPage (no checkout exists yet).
+      # It also names the queue run whose execution the reuse certified: the gate below binds the
+      # required checks to THAT check suite, since the reused push's own required jobs are skipped.
       - name: Verify reused CI failure
+        id: reuse
         if: github.event_name == 'workflow_run' && github.event.workflow_run.conclusion == 'failure'
         uses: actions/github-script@v7
         with:
@@ -122,11 +126,61 @@ jobs:
             });
             const jobs = data.jobs;
             const markers = Array.isArray(jobs) ? jobs.filter(job => job.name === 'main-execution') : [];
+            const steps = markers[0]?.steps;
+            const reuseStep = 'Queue CI reused (no fresh main execution)';
             const reused = Array.isArray(jobs) && jobs.length > 0 && data.total_count === jobs.length
               && markers.length === 1 && markers[0].conclusion === 'failure'
+              && Array.isArray(steps) && steps.some(step => step.name === reuseStep && step.conclusion === 'failure')
+              && steps.every(step => step.name === reuseStep || step.conclusion !== 'failure')
               && jobs.every(job => job.status === 'completed' && job.run_attempt === 1
                 && (job === markers[0] || ['success', 'skipped'].includes(job.conclusion)));
-            if (!reused) core.setFailed('CI failure is not proven queue reuse; refusing deploy');
+            if (!reused) {
+              core.setFailed('CI failure is not proven queue reuse; refusing deploy');
+              return;
+            }
+            const queue = (await github.rest.actions.listWorkflowRunsForRepo({
+              ...context.repo, head_sha: run.head_sha, event: 'merge_group', per_page: 100,
+            })).data;
+            const rows = Array.isArray(queue?.workflow_runs) ? queue.workflow_runs : null;
+            const certified = rows && queue.total_count === rows.length ? rows.filter(r => r.path === '.github/workflows/ci.yml'
+              && r.head_sha === run.head_sha && String(r.head_branch ?? '').startsWith('gh-readonly-queue/main/')
+              && r.status === 'completed' && r.conclusion === 'success').sort((a, b) => b.id - a.id)[0] : null;
+            if (!certified || !Number.isSafeInteger(certified.check_suite_id) || certified.check_suite_id <= 0) {
+              core.setFailed('No complete, successful queue run certifies this reused SHA; refusing deploy');
+              return;
+            }
+            core.setOutput('queue_suite', String(certified.check_suite_id));
+      # FUI is a separate repo: CI records the exact sibling revision its jobs checked out (artifact
+      # fui-sibling-<sha>). Deploy builds THAT revision, never a later untested FUI tip.
+      - name: Resolve certified FUI revision
+        id: certified-fui
+        uses: actions/github-script@v7
+        env:
+          BREAK_GLASS: ${{ inputs.break_glass }}
+        with:
+          script: |
+            const sha = process.env.DEPLOY_SHA;
+            const refuse = message => {
+              if (process.env.BREAK_GLASS === 'true') { core.warning(`BREAK GLASS — ${message}; FUI unpinned`); core.setOutput('sha', ''); }
+              else core.setFailed(message);
+            };
+            let runId = context.payload.workflow_run?.id;
+            if (!runId) {
+              const { data } = await github.rest.actions.listWorkflowRuns({
+                ...context.repo, workflow_id: 'ci.yml', head_sha: sha, event: 'push', status: 'completed', per_page: 100,
+              });
+              const rows = Array.isArray(data?.workflow_runs) ? data.workflow_runs : [];
+              runId = rows.filter(r => r.head_sha === sha && r.event === 'push' && r.path === '.github/workflows/ci.yml')
+                .sort((a, b) => b.id - a.id)[0]?.id;
+            }
+            if (!Number.isSafeInteger(runId) || runId <= 0) return refuse(`no CI push run certifies ${sha}`);
+            const { data } = await github.rest.actions.listWorkflowRunArtifacts({ ...context.repo, run_id: runId, per_page: 100 });
+            const all = Array.isArray(data?.artifacts) && data.total_count === data.artifacts.length ? data.artifacts : null;
+            const records = (all ?? []).filter(a => typeof a?.name === 'string' && a.name.startsWith('fui-sibling-'));
+            const fui = records.length === 1 && records[0].expired === false
+              && /^fui-sibling-([0-9a-f]{40})$/.exec(records[0].name)?.[1];
+            if (!all || !fui) return refuse(`CI run ${runId} has no single unexpired certified FUI record`);
+            core.setOutput('sha', fui);
       # ── THE GATE ─────────────────────────────────────────────────────────────────────────────────────────
       # Re-derive BOTH properties for DEPLOY_SHA instead of trusting how this workflow was triggered. Deploy-time
       # admission control: the deployer verifies the artifact, it does not take the caller's word for it.
@@ -137,14 +191,20 @@ jobs:
       #      was never merged. Verified empirically during review: the checks-only pipeline returned ok=true for
       #      `fff10d794baeee884950a820e774b9acdaa830a5`, a PR head that is NOT an ancestor of main. The compare
       #      API's `status` is `behind` when the head is an ancestor of the base, `identical` when equal.
-      #   B. REQUIRED CHECKS — `test` and `smoke` are both green for that sha, taking the LATEST check-run per
-      #      name. `filter=latest` is the API default and is passed explicitly here, and the jq additionally
-      #      reduces per name via `max_by(.started_at)`, so a green-then-red RE-RUN cannot be read as green by
-      #      finding the stale success earlier in the list.
+      #   B. REQUIRED CHECKS — `test`, `smoke` and `daemon-soak` are all green for that sha, taking the LATEST
+      #      check-run per name. Every check-run is read (`filter=all`, paginated) and the jq reduces per name
+      #      via `max_by(.started_at)`, so a green-then-red RE-RUN cannot be read as green by finding the
+      #      stale success earlier in the list.
+      #   C. REUSE — a reused push's own test/smoke/daemon-soak jobs are skipped. Its admission names the
+      #      certified queue run (QUEUE_SUITE): every required check must be green IN that suite, and the
+      #      latest real (non-skipped) execution of each name on the SHA must still be green, so a newer
+      #      failure (e.g. an hourly soak) refuses the deploy. daemon-soak is required on every path.
       - name: Refuse an unverified SHA
         env:
           GH_TOKEN: ${{ github.token }}
           BREAK_GLASS: ${{ inputs.break_glass }}
+          QUEUE_SUITE: ${{ steps.reuse.outputs.queue_suite }}
+          RUN_CONCLUSION: ${{ github.event.workflow_run.conclusion }}
         run: |
           set -euo pipefail
           echo "candidate: $DEPLOY_SHA"
@@ -157,14 +217,20 @@ jobs:
             *)                on_main=false ;;
           esac
 
-          # B. Required checks — LATEST run per required name must be success.
-          got=$(gh api "repos/${{ github.repository }}/commits/$DEPLOY_SHA/check-runs?filter=latest" \
-                  --jq '[.check_runs[] | select(.name=="test" or .name=="smoke")
-                         | {name, conclusion, started_at}] | sort_by(.name)')
-          echo "required check-runs (latest per name): $got"
-          checks_ok=$(printf '%s' "$got" | jq -r '
-                 (group_by(.name) | map(max_by(.started_at))
-                  | map(select(.conclusion=="success") | .name) | unique) == ["smoke","test"]')
+          # B. Required checks — LATEST run per required name must be success (C: see above).
+          got=$(gh api --paginate "repos/${{ github.repository }}/commits/$DEPLOY_SHA/check-runs?filter=all&per_page=100" \
+                  --jq '[.check_runs[] | select(.name=="test" or .name=="smoke" or .name=="daemon-soak")
+                         | {name, conclusion, started_at, suite: (.check_suite.id | tostring)}]' | jq -s 'add // []')
+          echo "required check-runs: $got"
+          if [ "${RUN_CONCLUSION:-}" = "failure" ] && [ -z "${QUEUE_SUITE:-}" ]; then
+            checks_ok=false
+          else
+            checks_ok=$(printf '%s' "$got" | jq -r --arg suite "${QUEUE_SUITE:-}" '
+                   def green(rows): (rows | group_by(.name) | map(max_by(.started_at))
+                     | map(select(.conclusion=="success") | .name) | unique) == ["daemon-soak","smoke","test"];
+                   if $suite == "" then green(.)
+                   else green(map(select(.conclusion != "skipped"))) and green(map(select(.suite == $suite))) end')
+          fi
 
           if [ "$on_main" = "true" ] && [ "$checks_ok" = "true" ]; then
             echo "✓ $DEPLOY_SHA is on main and verified green — proceeding"
@@ -172,7 +238,7 @@ jobs:
             echo "::warning::BREAK GLASS — deploying $DEPLOY_SHA (on_main=$on_main, checks_ok=$checks_ok)"
           else
             [ "$on_main"    = "true" ] || echo "::error::refusing to deploy $DEPLOY_SHA — it is not an ancestor of main (compare status: $rel)"
-            [ "$checks_ok"  = "true" ] || echo "::error::refusing to deploy $DEPLOY_SHA — required checks are not both green"
+            [ "$checks_ok"  = "true" ] || echo "::error::refusing to deploy $DEPLOY_SHA — required checks (test, smoke, daemon-soak) are not all green for the certified execution"
             exit 1
           fi
       # ─────────────────────────────────────────────────────────────────────────────────────────────────────
@@ -200,6 +266,8 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: frontier-ui/frontierui
+          # The sibling revision CI certified (empty only under an explicit break glass).
+          ref: ${{ steps.certified-fui.outputs.sha }}
           token: ${{ steps.fui-app-token.outputs.token || secrets.FUI_READ_TOKEN }}
           path: frontierui
 

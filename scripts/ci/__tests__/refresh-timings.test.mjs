@@ -8,6 +8,7 @@ import { spawnSync } from 'node:child_process';
 import yaml from 'js-yaml';
 import { downloadReports, downloadRuns, medianTimings, expectedUnitShards, foldReports, main, refreshFromDir } from '../refresh-timings.mjs';
 import { REPO_ROOT, timingsFromReports } from '../shard-assign.mjs';
+import { quarantineReceiptText } from '../quarantine-receipt.mjs';
 
 // Public contracts for Phase 2:
 // foldReports(dir) -> parsed report array, recursively matching timing-unit-*.json only.
@@ -37,7 +38,7 @@ function cli(args = [`--dir=${dir}`]) {
   // Copy the future implementation into a throwaway repo: CLI defaults must never write real timings.
   const scripts = join(repoRoot, 'scripts', 'ci');
   mkdirSync(scripts, { recursive: true });
-  for (const name of ['refresh-timings.mjs', 'shard-assign.mjs']) {
+  for (const name of ['refresh-timings.mjs', 'shard-assign.mjs', 'quarantine-receipt.mjs']) {
     copyFileSync(new URL(`../${name}`, import.meta.url), join(scripts, name));
   }
   return spawnSync(process.execPath, [join(scripts, 'refresh-timings.mjs'), ...args], {
@@ -263,8 +264,10 @@ describe('refresh-timings atomic replacement', () => {
 
 describe('refresh-timings landed queue evidence (finding 9)', () => {
   const sha = 'a'.repeat(40);
-  const queue = { databaseId: 44, event: 'merge_group', headBranch: 'gh-readonly-queue/main/pr-1', headSha: sha };
-  function fixture({ landed = false, mainPush = false, headSha = sha, receipt = 'unquarantined\n', missing = false, suite = 'unit' } = {}) {
+  const queue = { databaseId: 44, event: 'merge_group', headBranch: 'gh-readonly-queue/main/pr-1', headSha: sha, attempt: 2 };
+  // Receipts come from the real producer, bound to this queue run's latest attempt (send-back F2).
+  const good = quarantineReceiptText({ reuseSafe: true }, { GITHUB_SHA: sha, GITHUB_RUN_ID: '44', GITHUB_RUN_ATTEMPT: '2' });
+  function fixture({ landed = false, mainPush = false, headSha = sha, receipt = good, missing = false, suite = 'unit' } = {}) {
     const calls = [];
     const exec = (cmd, args) => {
       calls.push([cmd, args]);
@@ -280,7 +283,7 @@ describe('refresh-timings landed queue evidence (finding 9)', () => {
           for (const id of jobs[job].strategy.matrix[key]) {
             const folder = join(target, `quarantine-reuse-${kind}-${id}`);
             mkdirSync(folder);
-            if (!(missing && kind === suite)) writeFileSync(join(folder, 'quarantine-reuse'), kind === suite ? receipt : 'unquarantined\n');
+            if (!(missing && kind === suite)) writeFileSync(join(folder, 'quarantine-reuse'), kind === suite ? receipt : good);
           }
         }
         return '';
@@ -300,7 +303,11 @@ describe('refresh-timings landed queue evidence (finding 9)', () => {
     if (kind !== 'not landed') expect(f.calls.some(([cmd]) => cmd === 'git')).toBe(false);
   });
   it.each(['unit', 'integration', 'soak'])('refuses queue timings with missing or quarantined %s receipts', async suite => {
-    for (const bad of [{ missing: true }, { receipt: 'unknown-or-quarantined\n' }, { receipt: '' }, { receipt: 'unknown\n' }]) {
+    const other = env => quarantineReceiptText({ reuseSafe: true }, { GITHUB_SHA: sha, GITHUB_RUN_ID: '44', GITHUB_RUN_ATTEMPT: '2', ...env });
+    for (const bad of [{ missing: true }, { receipt: 'unknown-or-quarantined\n' }, { receipt: '' }, { receipt: 'unknown\n' },
+      // Legacy text, an earlier attempt, another run or another commit cannot stand in for this execution.
+      { receipt: 'unquarantined\n' }, { receipt: other({ GITHUB_RUN_ATTEMPT: '1' }) }, { receipt: other({ GITHUB_RUN_ID: '43' }) },
+      { receipt: other({ GITHUB_SHA: 'b'.repeat(40) }) }]) {
       const f = fixture({ landed: true, suite, ...bad });
       await expect(downloadReports('latest', '/scratch/reports', f)).rejects.toThrow(/No valid CI run ID/);
       expect(f.calls.some(([, args]) => args.includes('--pattern=timing-unit-*'))).toBe(false);
@@ -345,7 +352,7 @@ describe('refresh-timings CI artifact download trust boundary', () => {
     const { calls, exec } = recorder();
     await downloadReports('latest', '/scratch/reports', { exec });
     expect(calls.map(({ cmd, args }) => [cmd, args])).toEqual([
-      ['gh', ['run', 'list', '--workflow=ci.yml', '--status=success', '--limit=100', '--json=databaseId,event,headBranch,headSha']],
+      ['gh', ['run', 'list', '--workflow=ci.yml', '--status=success', '--limit=100', '--json=databaseId,event,headBranch,headSha,attempt']],
       ['gh', ['api', 'repos/{owner}/{repo}/actions/runs/4242/artifacts?per_page=100']],
       ['gh', ['run', 'download', '4242', '--pattern=timing-unit-*', '--dir', '/scratch/reports']],
     ]);
@@ -430,7 +437,7 @@ describe('rolling timing refresh', () => {
     expect(readFileSync(timingsFile, 'utf8')).toBe(original);
     calls.length = 0;
     expect(await main(['--runs=5'], { exec: rollingExec([1000, 3000, 2000, 4000, 99000], calls), timingsFile, repoRoot })).toBe(0);
-    expect(calls[0].args).toEqual(['run', 'list', '--workflow=ci.yml', '--status=success', '--limit=100', '--json=databaseId,event,headBranch,headSha']);
+    expect(calls[0].args).toEqual(['run', 'list', '--workflow=ci.yml', '--status=success', '--limit=100', '--json=databaseId,event,headBranch,headSha,attempt']);
     expect(calls.filter(c => c.args[1] === 'download').map(c => c.args.slice(0, 4))).toEqual([104, 103, 102, 101, 100].map(id => ['run', 'download', String(id), '--pattern=timing-unit-*']));
     expect(new Set(calls.filter(c => c.args[1] === 'download').map(c => c.args.at(-1))).size).toBe(5);
     expect(calls.every(c => c.cmd === 'gh' && c.options.timeout === 120000 && c.options.maxBuffer === 1024 * 1024 && !c.options.shell)).toBe(true);

@@ -26,7 +26,8 @@ describe('ci.yml lightweight required test gate', () => {
   it('keeps the test status name, all dependencies, and !cancelled guard', () => {
     expect(jobs.test.name ?? 'test').toBe('test');
     expect([...jobs.test.needs].sort()).toEqual([...required].sort());
-    expect(jobs.test.if).toBe('${{ !cancelled() }}');
+    // PR #7224 F1: a reused main push skips `test` (no vacuous success); every other run keeps !cancelled().
+    expect(jobs.test.if).toBe("${{ !cancelled() && !(github.event_name == 'push' && needs.changes.result == 'success' && needs.changes.outputs.skip == 'true') }}");
   });
 
   it('has one blocking shell gate and one advisory timing action, with no checkout, setup-node, install, or FUI work', () => {

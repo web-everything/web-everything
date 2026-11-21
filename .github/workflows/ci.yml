@@ -136,9 +136,13 @@ jobs:
           owner: frontier-ui
           repositories: frontierui
           permission-contents: read
+      # Every queue run and every main push records the FUI revision its jobs check out, so deploy can
+      # build exactly the sibling CI certified. On a push an unreadable tip records nothing (deploy then
+      # fails closed) rather than failing main CI.
       - name: Record queue FUI sibling tip
         id: fui-tip
-        if: ${{ github.event_name == 'merge_group' }}
+        if: ${{ github.event_name == 'merge_group' || (github.event_name == 'push' && github.ref == 'refs/heads/main') }}
+        continue-on-error: ${{ github.event_name == 'push' }}
         env:
           FUI_TOKEN: ${{ steps.fui-app-token.outputs.token }}
         run: node scripts/ci/main-push-skip.mjs --record-fui >> "$GITHUB_OUTPUT"
@@ -157,27 +161,49 @@ jobs:
           WE_CI_MAIN_PUSH_SKIP_MAX_AGE_MS: ${{ vars.WE_CI_MAIN_PUSH_SKIP_MAX_AGE_MS }}
         run: node scripts/ci/main-push-skip.mjs --sha="$HEAD_SHA" --before="$BEFORE_SHA" --run-id="$RUN_ID" --event="$EVENT_NAME" --ref="$REF" --repo="$REPO" >> "$GITHUB_OUTPUT"
       - name: Prepare reused sibling record
-        if: ${{ steps.main-skip.outputs.skip == 'true' }}
+        if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && (steps.main-skip.outputs.fui-sha || steps.fui-tip.outputs.tip) != '' }}
         run: echo recorded > "$RUNNER_TEMP/fui-sibling-record"
       - uses: actions/upload-artifact@v4
-        if: ${{ steps.main-skip.outputs.skip == 'true' }}
+        if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && (steps.main-skip.outputs.fui-sha || steps.fui-tip.outputs.tip) != '' }}
         with:
-          name: fui-sibling-${{ steps.main-skip.outputs.fui-sha }}
+          name: fui-sibling-${{ steps.main-skip.outputs.fui-sha || steps.fui-tip.outputs.tip }}
           path: ${{ runner.temp }}/fui-sibling-record
 
   # R1105: drain reads the overall push conclusion as main-green evidence. Reuse
   # executes no fresh suite, so this NON-REQUIRED job prevents a successful run.
-  # Required test/smoke/daemon-soak checks retain their existing PR/MQ behavior.
+  # It is a POSITIVE marker on every main push: it SUCCEEDS only after a full, fresh
+  # execution (not light, every required job succeeded in this run) and fails its
+  # named reuse step on a reused push. Merge-group, light and scheduled runs skip it,
+  # so a skipped marker never proves execution (scripts/conveyor/main-ci-red-core.mjs
+  # also binds it to the required checks' own check suite). On a reused push the
+  # required test/smoke/daemon-soak jobs are SKIPPED, never a vacuous success.
   main-execution:
-    needs: changes
-    if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && needs.changes.result == 'success' && needs.changes.outputs.skip == 'true' }}
+    needs: [changes, test, smoke, daemon-soak]
+    if: ${{ !cancelled() && github.event_name == 'push' && github.ref == 'refs/heads/main' }}
     runs-on: ubuntu-latest
     timeout-minutes: 1
     steps:
-      - name: No fresh main execution
+      # Name pinned by scripts/lib/main-ci-reuse-runs.mjs#REUSED_MARKER_STEP (reuse is proved by this step failing).
+      - name: Queue CI reused (no fresh main execution)
+        if: ${{ needs.changes.result == 'success' && needs.changes.outputs.skip == 'true' }}
         run: |
           echo "::notice::Queue CI reused; no fresh main-green evidence. Wait for the hourly backstop or next full CI run."
           exit 1
+      - name: Fresh full main execution
+        if: ${{ !(needs.changes.result == 'success' && needs.changes.outputs.skip == 'true') }}
+        env:
+          CHANGES_RESULT: ${{ needs.changes.result }}
+          LIGHT: ${{ needs.changes.outputs.light }}
+          TEST_RESULT: ${{ needs.test.result }}
+          SMOKE_RESULT: ${{ needs.smoke.result }}
+          SOAK_RESULT: ${{ needs.daemon-soak.result }}
+        run: |
+          [ "$CHANGES_RESULT" = "success" ] || { echo "::error::changes did not succeed ($CHANGES_RESULT)."; exit 1; }
+          [ "$LIGHT" = "false" ] || { echo "::error::light main push ($LIGHT): no full execution."; exit 1; }
+          for result in "test=$TEST_RESULT" "smoke=$SMOKE_RESULT" "daemon-soak=$SOAK_RESULT"; do
+            [ "${result#*=}" = "success" ] || { echo "::error::${result%%=*} did not succeed (${result#*=})."; exit 1; }
+          done
+          echo "Fresh full main execution: test, smoke and daemon-soak all succeeded in this run."
 
   # The reusable record certifies full execution, including every job's actual quarantine decision.
   # Light/unknown/quarantined runs stay successful but publish no reusable queue evidence.
@@ -203,11 +229,22 @@ jobs:
           node --input-type=module <<'NODE'
           import { readFileSync, appendFileSync } from 'node:fs';
           import { join } from 'node:path';
+          // Mirrors validQuarantineReceipt (scripts/ci/quarantine-skip.mjs; this job has no checkout).
+          // Every leg must have executed in THIS attempt at THIS commit: a partial rerun keeps earlier
+          // attempts' receipts, which must not satisfy this attempt's proof or the reuse age bound.
+          const sha = process.env.GITHUB_SHA, runId = Number(process.env.GITHUB_RUN_ID), attempt = Number(process.env.GITHUB_RUN_ATTEMPT);
+          const valid = text => {
+            const r = JSON.parse(text);
+            return r?.v === 1 && r.decision === 'unquarantined' && /^[0-9a-f]{40}$/.test(sha) && r.sha === sha
+              && Number.isSafeInteger(runId) && runId > 0 && r.run_id === runId
+              && Number.isSafeInteger(attempt) && attempt > 0 && r.run_attempt === attempt
+              && typeof r.executed_at === 'string' && Number.isFinite(Date.parse(r.executed_at));
+          };
           let eligible = false;
           try {
             eligible = [['unit', 'UNIT_SHARDS'], ['integration', 'INTEGRATION_GROUPS'], ['soak', 'SOAK_SHARDS']]
               .every(([suite, key]) => JSON.parse(process.env[key]).every(id =>
-                readFileSync(join(process.env.RECEIPTS, `quarantine-reuse-${suite}-${id}`, 'quarantine-reuse'), 'utf8') === 'unquarantined\n'));
+                valid(readFileSync(join(process.env.RECEIPTS, `quarantine-reuse-${suite}-${id}`, 'quarantine-reuse'), 'utf8'))));
           } catch { /* No complete proof: main pushes will run full CI. */ }
           appendFileSync(process.env.GITHUB_OUTPUT, `eligible=${eligible}\n`);
           console.log(eligible ? 'Full unquarantined queue execution proved.' : 'No reusable proof; main push will run full CI.');
@@ -556,9 +593,10 @@ jobs:
 
   # THE required test status: fail closed on all dependencies, including light runs.
   # Only unit shards and their coverage merge may be skipped on the card-only path.
+  # A reused main push SKIPS this job: its success would claim execution that never ran on main.
   test:
     needs: [changes, test-shard, integration, standards, coverage-merge, host-paths]
-    if: ${{ !cancelled() }}
+    if: ${{ !cancelled() && !(github.event_name == 'push' && needs.changes.result == 'success' && needs.changes.outputs.skip == 'true') }}
     runs-on: ubuntu-latest
     timeout-minutes: 5
     permissions:
@@ -942,13 +980,12 @@ jobs:
   # silently read as satisfied, same guard the `test` aggregator above uses for `test-shard`.
   daemon-soak:
     needs: [changes, daemon-soak-scope, soak-shard]
-    if: ${{ (github.event_name == 'pull_request' || github.event_name == 'merge_group' || github.event_name == 'workflow_dispatch' || github.event_name == 'schedule' || (github.event_name == 'push' && github.ref == 'refs/heads/main')) && !cancelled() }}
+    # A reused main push SKIPS this job: no soak shard ran on main.
+    if: ${{ (github.event_name == 'pull_request' || github.event_name == 'merge_group' || github.event_name == 'workflow_dispatch' || github.event_name == 'schedule' || (github.event_name == 'push' && github.ref == 'refs/heads/main')) && !cancelled() && !(github.event_name == 'push' && needs.changes.result == 'success' && needs.changes.outputs.skip == 'true') }}
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
       - name: Gate on shard results
-        env:
-          MAIN_SKIP_REASON: ${{ needs.changes.outputs.skip-reason }}
         run: |
           # R1068: on a pull_request the soak is deferred to the merge queue (shards do not run there), so the
           # required check succeeds at once. Every other event (merge_group, push, dispatch) falls through to the
@@ -970,10 +1007,6 @@ jobs:
             false) echo "Outside a pull_request the soak always runs, but scope said run=false — refusing to skip it."; exit 1 ;;
             *) echo "daemon-soak-scope emitted no usable run output (got: '${{ needs.daemon-soak-scope.outputs.run }}')."; exit 1 ;;
           esac
-          if [ "${{ github.event_name }}" = "push" ] && [ "${{ needs.changes.result }}" = "success" ] && [ "${{ needs.changes.outputs.skip }}" = "true" ]; then
-            echo "Reused queue CI: $MAIN_SKIP_REASON"
-            exit 0
-          fi
           if [ "${{ needs.soak-shard.result }}" != "success" ]; then
             echo "One or more soak shards did not succeed (soak-shard result: ${{ needs.soak-shard.result }})."
             exit 1
@@ -996,7 +1029,8 @@ jobs:
   smoke:
     # Pinned (not ubuntu-latest): -latest became Ubuntu 26.04, which Playwright's `install --with-deps` rejects.
     needs: changes
-    if: ${{ !cancelled() }}
+    # A reused main push SKIPS smoke: no docs build or interaction lane ran on main.
+    if: ${{ !cancelled() && !(github.event_name == 'push' && needs.changes.result == 'success' && needs.changes.outputs.skip == 'true') }}
     runs-on: ubuntu-24.04
     # xd1sfms (#4075/#3383) — same measurement pass: 15 successful runs sampled 2026-09-25 gave this job
     # (docs build + Playwright install + the interaction lane) min=129s max=146s p50=135s p95=146s —

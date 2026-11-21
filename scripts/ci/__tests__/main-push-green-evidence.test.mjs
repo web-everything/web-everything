@@ -46,14 +46,19 @@ it('reused push producer emits no main-green evidence to the unmodified drain', 
   expect(result.reason).toContain('main CI is not green');
   expect(result.mainRunId).toBe(103);
 });
-it('the execution marker is non-required and applies only to proven reused main pushes', () => {
+it('the execution marker is non-required, runs on every main push, and fails its reuse step only for proven reuse', () => {
+  // Send-back F5: a positive marker. The job runs on every main push; its first step fails only on
+  // proven reuse, its second succeeds only after full fresh execution (main-reuse-fail-closed covers both).
   const marker = jobs['main-execution'];
   expect(marker).toBeDefined();
-  const expr = marker.if.replace(/\$\{\{|\}\}/g, '');
+  const plain = expr => expr.replace(/\$\{\{|\}\}/g, '').replace(/!cancelled\(\)/g, 'true')
+    .replace(/needs\.([\w-]+)\.outputs\.([\w-]+)/g, (_, j, k) => `needs['${j}'].outputs['${k}']`)
+    .replace(/needs\.([\w-]+)\.result/g, (_, j) => `needs['${j}'].result`);
   for (const event of ['push', 'pull_request', 'merge_group', 'schedule', 'workflow_dispatch']) {
     for (const skip of ['true', 'false', '', undefined]) {
-      const run = Function('github', 'needs', `return (${expr})`)({ event_name: event, ref: 'refs/heads/main' }, { changes: { result: 'success', outputs: { skip } } });
-      expect(run).toBe(event === 'push' && skip === 'true');
+      const values = [{ event_name: event, ref: 'refs/heads/main' }, { changes: { result: 'success', outputs: { skip } } }];
+      expect(Function('github', 'needs', `return (${plain(marker.if)})`)(...values)).toBe(event === 'push');
+      expect(Function('github', 'needs', `return (${plain(marker.steps[0].if)})`)(...values)).toBe(skip === 'true');
     }
   }
   for (const name of ['test', 'smoke', 'daemon-soak']) expect([jobs[name].needs].flat()).not.toContain('main-execution');

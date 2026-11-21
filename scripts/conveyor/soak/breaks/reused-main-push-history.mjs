@@ -26,7 +26,8 @@ export default {
           exec: (_, args) => {
             if (args[0] === 'run') return JSON.stringify(rows);
             if (/\/runs\/[23]\/attempts\/1\/jobs\?per_page=100$/.test(args[1])) return JSON.stringify({ total_count: 2,
-              jobs: [{ name: 'main-execution', status: 'completed', conclusion: 'failure', run_attempt: 1 },
+              jobs: [{ name: 'main-execution', status: 'completed', conclusion: 'failure', run_attempt: 1,
+                steps: [{ name: 'Queue CI reused (no fresh main execution)', status: 'completed', conclusion: 'failure' }] },
                 { name: 'test', status: 'completed', conclusion: 'success', run_attempt: 1 }] });
             throw Error('fixture: unavailable evidence');
           } });

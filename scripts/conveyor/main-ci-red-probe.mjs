@@ -9,7 +9,7 @@ import { getRequiredStatusChecks } from '../lib/required-status-checks.mjs';
 import { isGhDeferred } from '../lib/gh-deferred.mjs';
 import { resolveChildTimeoutMs } from '../lib/bounded-child.mjs';
 import { CONSTELLATION_REPOS } from '../lib/constellation-repos.mjs';
-import { withoutReusedMainPushes } from '../lib/main-ci-reuse-runs.mjs';
+import { mainEventRuns, withoutReusedMainPushes, withoutStaleScheduledSuccesses } from '../lib/main-ci-reuse-runs.mjs';
 import {
   mainCiRedSettings, mainRedState, classifyRun, hexSha, parseVitestFailures,
   classifyFlakeRun, findMergeGroupFlakeEvidence, mainCiRedSettingSource,
@@ -89,7 +89,8 @@ export function readMainTip({ exec = execFileSyncThrottled, repoSlug = DEFAULT_R
       if (!Array.isArray(page?.check_runs)) throw new Error('main check-runs read returned no list');
       return {
         checksTotal: page.total_count,
-        checkRuns: page.check_runs.map(({ id, name, status, conclusion }) => ({ id, name, status, conclusion })),
+        // The suite id binds the execution marker to the run that produced the required checks.
+        checkRuns: page.check_runs.map(({ id, name, status, conclusion, check_suite }) => ({ id, name, status, conclusion, suiteId: check_suite?.id })),
       };
     };
     const checks = requiredChecks ?? readRequired({ repo: repoSlug }).checks;
@@ -117,9 +118,22 @@ export function probeMainCiRuns({ exec = execFileSyncThrottled, repoSlug = DEFAU
     const deeper = list(settings.mainCiRedRunLimitMax);
     if (Array.isArray(deeper)) runs = deeper;
   }
+  // `--branch` matches by name only: a fork's pull_request on a branch named main lands here too.
+  // Only push and the hourly backstop are main evidence; an unreadable event throws (= unknown).
+  runs = mainEventRuns(runs);
+  const pushes = runs.filter(r => r.event === 'push');
   // Prove reuse for the whole inventory before selecting failures, owners or logs.
   // A tip marker says nothing about an earlier push, or another run on the same SHA.
   runs = withoutReusedMainPushes(runs, { repo: repoSlug, exec });
+  // A backstop success speaks only for its own window; an unreadable head leaves the window rule alone.
+  let head = null;
+  if (runs.some(r => r.event === 'schedule' && r.conclusion === 'success')) {
+    try {
+      const sha = ghJson(exec, ['api', `repos/${repoSlug}/git/ref/heads/${settings.mainCiRedBranch}`])?.object?.sha;
+      head = typeof sha === 'string' && /^[0-9a-f]{40}$/i.test(sha) ? sha : null;
+    } catch { head = null; }
+  }
+  runs = withoutStaleScheduledSuccesses(runs, { head, pushes });
   const sorted = [...runs].sort((a, b) => Date.parse(b.createdAt) - Date.parse(a.createdAt));
   const failing = { jobs: [], tests: [] };
   // One job read per run, however many passes below look at it. `null` = unreadable (stays red: never promoted on a blind read).

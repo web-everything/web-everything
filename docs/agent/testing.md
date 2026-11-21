@@ -15,8 +15,14 @@ Effective values and sources are logged. Unknown or old evidence runs full CI.
 The hourly schedule is isolated from push concurrency and always runs full CI.
 A reused main push deliberately fails the non-required `main-execution` job: the
 drain reads the overall run conclusion and must never count reuse as fresh
-main-green. Required `test`, `smoke` and `daemon-soak` checks keep their PR/MQ behavior.
-Wait for the hourly backstop or next full run for fresh evidence.
+main-green. On a reused push the required `test`, `smoke` and `daemon-soak` jobs are
+SKIPPED, never a vacuous success; their PR/MQ/full-push behavior is unchanged.
+`main-execution` is a positive marker on every main push: it succeeds only after full,
+fresh, non-light execution in which all three required jobs succeeded, and fails its named
+`Queue CI reused (no fresh main execution)` step on reuse. Every queue run and main push
+records the FUI revision its jobs check out (`fui-sibling-<sha>`); deploy builds exactly
+that revision. Wait for the hourly backstop or next full run for fresh evidence.
+Operator send-back regressions (one per audit finding) live in `main-reuse-fail-closed.test.mjs`.
 `scripts/ci/__tests__/main-push-green-evidence.test.mjs` probes the real exported drain
 guard with injected skipped-push evidence and a successful full-push control.
 Timing refresh accepts queue runs only with main ancestry or a matching main push SHA.
@@ -5851,9 +5857,14 @@ spawn error message) in probe diagnostics rather than reporting zero counts as p
 Merge admission and both same-head retry evidence paths judge main's push and scheduled
 `ci.yml` runs together. A newer scheduled failure invalidates an older push success;
 PR events are excluded even when their head branch is named `main`.
+Only old-SHA scheduled SUCCESSES are dropped (outside their own execution window); a scheduled
+failure always stays red evidence. The red-main probe applies the same push/schedule event filter
+(an unreadable event makes the inventory unknown) and window rule via `scripts/lib/main-ci-reuse-runs.mjs`.
 Queue timing candidates also require `unquarantined` execution receipts from every unit,
-integration and soak matrix leg, matching the queue reuse proof. Missing or unreadable
-receipts skip the candidate; the bounded search retains the explicit `--run=<id>` fallback.
+integration and soak matrix leg, matching the queue reuse proof. A receipt (`scripts/ci/quarantine-receipt.mjs`)
+names its commit, run, attempt, job and execution time; only receipts from the run's latest attempt at
+that commit count, so a partial rerun's older attempts never satisfy the proof or its age bound. Missing,
+legacy-text or unreadable receipts skip the candidate; the bounded search retains the explicit `--run=<id>` fallback.
 Scoped regressions live in `red-main-freeze-shared.test.mjs`, `drain-mq-retry-main-green.test.mjs`,
 `drain-queue-safety-same-head-retry.test.mjs` and `refresh-timings.test.mjs`.
 
@@ -5867,8 +5878,9 @@ standard; oversized values are ignored and logged by the policy cascade. Keep pr
 light fixtures and negative age tests in `main-execution-evidence.test.mjs` and
 `drain-mq-retry-main-green.test.mjs`.
 
-The tip required-check fallback also requires the completed `main-execution` marker
-(success or conditional skip). A failed or absent marker supplies no fresh push evidence.
+The tip required-check fallback also requires the completed `main-execution` marker to have
+SUCCEEDED in the same check suite as every present required check. A skipped (merge-group,
+light, scheduled), failed, absent or foreign-suite marker supplies no fresh push evidence.
 Hourly evidence is restricted to the live main head SHA; an unreadable head retains the hold.
 `main-red-evidence-regressions.test.mjs` covers these negative paths and attempt-start expiry.
 
@@ -6013,15 +6025,21 @@ The static shadow returns per-file unknown evidence: unknown tests always join t
 
 An intentional CI failure needs an explicit policy in every `workflow_run` consumer.
 `main-push-reuse-deploy.test.mjs` inventories those consumers and executes deploy's
-pre-checkout reuse proof: only the main-execution marker may fail, every job must be
-complete in the first attempt, and a partial inventory refuses deployment. The existing
-same-repository push, exact-SHA ancestry and required-check gates still apply.
+pre-checkout reuse proof: only the main-execution marker may fail (on its named reuse step),
+every job must be complete in the first attempt, and a partial inventory refuses deployment.
+The proof names the certifying queue run's check suite; the gate then requires `test`, `smoke`
+and `daemon-soak` green in that suite AND as the latest non-skipped execution on the SHA, so a
+newer soak failure refuses the deploy. Every path requires `daemon-soak`, and FUI is checked out at
+the CI run's recorded `fui-sibling-<sha>` (missing or ambiguous refuses, unless break glass).
+The existing same-repository push, exact-SHA ancestry and required-check gates still apply.
+Reuse proof refuses unknown attempt metadata on the run or any job.
 
 Red-main readers remove proven reuse per run across the whole history before choosing
 the failure window. A tip's marker never excuses a different run, even on the same SHA.
 `main-red-reused-history.test.mjs` covers this through the production probe, including
 the 30-read bound, incomplete evidence and reruns. The `reused-main-push-history` soak
-scenario exercises persisted alerts and the drain freeze signal across consecutive reuse.
+scenario exercises persisted alerts and the drain freeze signal across consecutive reuse;
+`stale-backstop-masks-red-main` covers fork PR runs and old-SHA backstop successes.
 ## Conflict watcher CLI contracts
 
 The conflict watcher's `runConflictWatchCli` is shared by its executable guard and PR snapshot

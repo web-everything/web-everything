@@ -3,12 +3,14 @@ import { expect, it } from 'vitest';
 import { probeMainCiRuns } from '../../conveyor/main-ci-red-probe.mjs';
 import { mainRedState } from '../../conveyor/main-ci-red-core.mjs';
 import { planMainRedAlert } from '../../conveyor/health-watch-main-red.mjs';
+import { REUSED_MARKER_STEP } from '../../lib/main-ci-reuse-runs.mjs';
 
 const row = (id, conclusion = 'failure', sha = String(id).repeat(40).slice(0, 40)) => ({ databaseId: id,
   headSha: sha, event: 'push', status: 'completed', conclusion, attempt: 1,
   createdAt: new Date(1_790_000_000_000 + id * 60_000).toISOString() });
 const jobs = () => ({ total_count: 2, jobs: [
-  { name: 'main-execution', status: 'completed', conclusion: 'failure', run_attempt: 1 },
+  { name: 'main-execution', status: 'completed', conclusion: 'failure', run_attempt: 1,
+    steps: [{ name: REUSED_MARKER_STEP, status: 'completed', conclusion: 'failure' }] },
   { name: 'test', status: 'completed', conclusion: 'success', run_attempt: 1 },
 ] });
 function probe(rows, pages) {

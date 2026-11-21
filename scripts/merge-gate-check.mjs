@@ -57,7 +57,7 @@ import { writeAllSync } from './lib/write-all-sync.mjs';
 import { readSharedFreeze, flatText } from './lib/red-main-freeze-shared.mjs';
 import { MAIN_CI_RED_DEFAULTS, isTrustedPrAuthor, mainRedState } from './conveyor/main-ci-red-core.mjs';
 import { markInfraOnlyRuns } from './lib/main-ci-infra-runs.mjs';
-import { withoutReusedMainPushes } from './lib/main-ci-reuse-runs.mjs';
+import { mainEventRuns, withoutReusedMainPushes, withoutStaleScheduledSuccesses } from './lib/main-ci-reuse-runs.mjs';
 
 const firstLine = (e) => String(e?.stderr || e?.message || e).trim().split('\n').pop().slice(0, 300);
 const ghJson = (args, exec) => JSON.parse(exec('gh', args, { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], maxBuffer: 64 * 1024 * 1024 }) || 'null');
@@ -421,8 +421,7 @@ export function readMainCiFact({ repo, defaultBranch = 'main', exec = execFileSy
       '--json', 'databaseId,conclusion,status,createdAt,updatedAt,headSha,event,attempt'], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], maxBuffer: 8 * 1024 * 1024, timeout: 60_000 }) || 'null');
   } catch (e) { return { source, error: `main CI unreadable: ${firstLine(e)}` }; }
   if (Array.isArray(runs)) {
-    if (runs.some(r => typeof r?.event !== 'string')) return { source, error: 'main CI run event unreadable' };
-    runs = runs.filter((r) => ['push', 'schedule'].includes(r.event));
+    try { runs = mainEventRuns(runs); } catch (e) { return { source, error: e.message }; }
     if (runs.some(r => r.event === 'schedule')) {
       try {
         head = ghJson(['api', `repos/${repo}/git/ref/heads/${defaultBranch}`], exec)?.object?.sha;
@@ -448,19 +447,8 @@ export function readMainCiFact({ repo, defaultBranch = 'main', exec = execFileSy
     // Keep historical recovery in its original execution window. Proven reuse
     // contributes no execution, but a different intervening run prevents a delayed
     // backstop from clearing that run. Never relabel the backstop as current HEAD.
-    const executions = runs;
-    runs = runs.filter(r => {
-      if (r.event !== 'schedule' || r.headSha === head) return true;
-      const started = Date.parse(r.createdAt);
-      if (!SHA_RE.test(r.headSha) || !Number.isFinite(started)) return false;
-      // A reused push still establishes when this SHA reached main. It cannot
-      // supply green execution, but its later full backstop can recover older red.
-      const reachedMain = Math.max(-Infinity, ...pushes.filter(push => push.headSha === r.headSha
-        && Date.parse(push.createdAt) <= started).map(push => Date.parse(push.createdAt)));
-      return !executions.some(other => other.headSha !== r.headSha
-        && (!Number.isFinite(Date.parse(other.createdAt))
-          || (Date.parse(other.createdAt) >= reachedMain && Date.parse(other.createdAt) <= started)));
-    });
+    // Scheduled failures always stay (shared with the probe and health-watch).
+    runs = withoutStaleScheduledSuccesses(runs, { head, pushes });
     try { markInfraOnlyRuns(runs, { repo, exec: readJobs }); } catch { /* unreadable job evidence stays red */ }
   }
   const st = mainRedState(runs);

@@ -29,6 +29,7 @@ import { readFileSync, writeFileSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { readQuarantine } from '../lib/red-main-quarantine-io.mjs';
+import { quarantineReceiptText, validQuarantineReceipt } from './quarantine-receipt.mjs';
 import { decideCiSkip, ciJobContext, RED_MAIN_MODES } from '../lib/red-main-quarantine.mjs';
 import { writeAllSync } from '../lib/write-all-sync.mjs';
 
@@ -112,12 +113,17 @@ export function quarantineSkip({
   };
 }
 
-/** Each queue test job records its actual decision; absent/unknown/skipped receipts cannot authorize reuse. */
-export function recordQuarantineReuse(out, env = process.env) {
+/**
+ * Each queue test job records its actual decision AND the execution it belongs to (commit, run, attempt,
+ * time). A partial rerun keeps earlier attempts' artifacts, so a receipt without this identity could let old
+ * execution satisfy a newer attempt's reuse proof and age bound. Absent/unknown/skipped receipts never authorize reuse.
+ */
+export function recordQuarantineReuse(out, env = process.env, now = () => new Date()) {
   if (env.GITHUB_EVENT_NAME === 'merge_group' && env.RUNNER_TEMP) {
-    writeFileSync(join(env.RUNNER_TEMP, 'quarantine-reuse'), out.reuseSafe === true ? 'unquarantined\n' : 'unknown-or-quarantined\n');
+    writeFileSync(join(env.RUNNER_TEMP, 'quarantine-reuse'), quarantineReceiptText(out, env, now));
   }
 }
+export { validQuarantineReceipt };
 
 function flagsOf(argv) {
   const f = {};
