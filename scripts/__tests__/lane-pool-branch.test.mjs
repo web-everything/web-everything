@@ -1,6 +1,6 @@
 import { beforeEach, afterEach, expect, it } from 'vitest';
 import { execFileSync, spawnSync } from 'node:child_process';
-import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync, symlinkSync, copyFileSync, readdirSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync, symlinkSync, copyFileSync, readdirSync, utimesSync, existsSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { tmpdir } from 'node:os';
 
@@ -262,6 +262,15 @@ it('never overwrites an ignored local file the target commit tracks', () => {
   expect(readFileSync(join(lane, 'extra.txt'), 'utf8')).toBe('precious local\n');
 });
 it.each([false, true])('refuses a lane that defines a Git filter driver before any status call (dry-run: %s)', dryRun => {
-  git(lane, 'config', 'filter.sneaky.clean', 'cat');
+  const ran = join(root, 'filter-ran');
+  git(lane, 'config', 'filter.sneaky.clean', `sh -c 'touch "${ran}"; cat'`);
+  writeFileSync(join(lane, '.git', 'info', 'attributes'), 'file.txt filter=sneaky\n');
+  const future = new Date(Date.now() + 5000);
+  utimesSync(join(lane, 'file.txt'), future, future);
   refused(dryRun ? { 'dry-run': true } : {}, /filter driver/);
+  expect(existsSync(ran)).toBe(false);
+});
+it.each([false, true])('refuses a lane that stages a gitlink before any status call (dry-run: %s)', dryRun => {
+  git(lane, 'update-index', '--add', '--cacheinfo', `160000,${tip},sub`);
+  refused(dryRun ? { 'dry-run': true } : {}, /gitlink/);
 });

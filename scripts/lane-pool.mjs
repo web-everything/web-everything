@@ -5791,6 +5791,10 @@ function cmdBranch(repo) {
   const laneConfig = releaseEvidenceGit([...LANE_CONFIG_LIST_ARGS], dir, {}, { GIT_CONFIG_NOSYSTEM: '1' });
   if (laneConfig === null) refuse('lane config unreadable');
   if (laneFilterDrivers(laneConfig).length) refuse('lane defines a Git filter driver; unset it before branching');
+  // Status enters submodules, whose own config may define a clean filter this lane-level check cannot see.
+  const staged = releaseEvidenceGit(['ls-files', '--stage', '-z'], dir);
+  if (staged === null) refuse('staged index listing unreadable');
+  if (staged.split('\0').some(entry => entry.startsWith('160000 '))) refuse('lane stages a submodule/gitlink; inspect it separately before branching');
   try {
     // Unlike tryGit/status fallbacks, a failed read must never mean clean or absent.
     const branches = branchGit(['for-each-ref', '--format=%(refname)', `refs/heads/${name}`]).split('\n');
