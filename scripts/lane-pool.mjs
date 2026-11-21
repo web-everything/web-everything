@@ -2873,6 +2873,11 @@ async function cmdAcquire(repo) {
       for (const pick of pickable) {
         let historyChecked = false;
         if (usingFreeList || retryingCandidates) {
+          // Hints can outlive their checkout. Only ENOENT proves absence; other metadata
+          // errors still take the history evidence/quarantine path and block growth.
+          try { lstatSync(join(laneDir(repo, pick), '.git')); } catch (e) {
+            if (e.code === 'ENOENT') continue;
+          }
           // Preserve the history evidence/repair/quarantine path before eligibility can skip this hint.
           const candidateNow = Date.now();
           if (leaseDisqualifiesAcquire(readLease(laneDir(repo, pick)), candidateNow, ttlMs)) continue;

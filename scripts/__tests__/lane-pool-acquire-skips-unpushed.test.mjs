@@ -118,6 +118,27 @@ describe('auto-pick skips unpushed and unknown-ahead lanes before provisioning',
     expect(JSON.parse(result.stdout).lane).toBe(4);
     assertSkipped([1, 2], heads);
   });
+  for (const missing of ['directory', 'git metadata']) {
+    for (const noReset of [false, true]) {
+      it(`vanished free-list hint permits bounded growth without quarantine (${missing}, no-reset=${noReset})`, () => {
+        rmSync(lane(3), { recursive: true, force: true });
+        const held = run(['acquire', '--lane=2', '--no-reset', '--session=holder']);
+        expect(held.status, held.stderr).toBe(0);
+        freeList([1]);
+        rmSync(missing === 'directory' ? lane(1) : join(lane(1), '.git'), { recursive: true, force: true });
+        writeFileSync(trace, '');
+        const result = run(['acquire', '--session=vanished-picker', '--wait-ms=0', '--hard-max=3', '--growth-max-new=1', '--json', ...(noReset ? ['--no-reset'] : [])]);
+        expect(result.status, result.stderr).toBe(0);
+        // Growth may fill a vacant number, but must preserve a checkout missing only metadata.
+        expect(JSON.parse(result.stdout).lane).toBe(missing === 'directory' ? 1 : 3);
+        if (missing === 'git metadata') expect(readFileSync(join(lane(1), 'file.txt'), 'utf8')).toBe('base\n');
+        expect(result.stderr).not.toContain('QUARANTINED');
+        const quarantine = join(poolRoot, 'skiptest', '.quarantine-state');
+        expect(existsSync(join(quarantine, 'lane-1.json'))).toBe(false);
+        expect(existsSync(join(quarantine, 'lane-1.evidence.jsonl'))).toBe(false);
+      });
+    }
+  }
   it('skips an oversized, untrustworthy ahead-count and takes the next clean lane', () => {
     const heads = { 1: git(['rev-parse', 'HEAD'], lane(1)) };
     freeList([1]);

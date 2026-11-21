@@ -1,5 +1,5 @@
 import { execFileSync, spawnSync } from 'node:child_process';
-import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
@@ -7,7 +7,7 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 const REPO_ROOT = resolve(fileURLToPath(import.meta.url), '../../../../..');
 
 // Real acquire against a private origin: an unsafe free-list hint must not poison growth.
-export async function replay(root = REPO_ROOT) {
+export async function replay(root = REPO_ROOT, { vanished = false } = {}) {
   const base = mkdtempSync(join(tmpdir(), 'soak-acquire-unpushed-'));
   try {
     const git = (args, cwd = base) => execFileSync('git', args, { cwd, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], maxBuffer: 64 * 1024 * 1024 }).trim();
@@ -29,7 +29,7 @@ export async function replay(root = REPO_ROOT) {
       LANE_POOL_ROOT: pool, LANE_POOL_ACQUIRE_DEFAULT_WAIT_MS: '0', LANE_POOL_NO_RECOVER: '1',
       WE_NEEDS_YOU_FEED: join(base, 'needs-you.jsonl') };
     const cli = argv => spawnSync(process.execPath, [join(root, 'scripts/lane-pool.mjs'), ...argv, ...args], { env, encoding: 'utf8', timeout: 30_000, maxBuffer: 64 * 1024 * 1024 });
-    const provision = cli(['provision', '--count=1']);
+    const provision = cli(['provision', vanished ? '--count=2' : '--count=1']);
     if (provision.status !== 0) throw new Error(`fixture provision: ${provision.stderr}`);
     const dir = join(pool, 'skipsoak', 'lane-1');
     git(['checkout', '-qb', 'local/lane'], dir);
@@ -41,11 +41,22 @@ export async function replay(root = REPO_ROOT) {
     writeFreeLaneListAtomic(resolveFreeLaneListPath({ repoName: 'skipsoak', poolDir }), buildFreeLaneList({
       repoName: 'skipsoak', poolDir, writtenAt: Date.now(), lanes: [{ lane: 1, path: dir, head, branch: 'local/lane' }],
     }));
+    if (vanished) {
+      // Publish first, then remove the hinted checkout while the other lane stays leased.
+      const held = cli(['acquire', '--lane=2', '--no-reset', '--session=soak-holder']);
+      if (held.status !== 0) throw new Error(`fixture lease: ${held.stderr}`);
+      rmSync(dir, { recursive: true, force: true });
+    }
     writeFileSync(trace, '');
-    const acquired = cli(['acquire', '--session=soak-picker', '--hard-max=2', '--growth-max-new=1', '--json']);
+    const acquired = cli(['acquire', '--session=soak-picker', vanished ? '--hard-max=3' : '--hard-max=2', '--growth-max-new=1', '--wait-ms=0', '--json', ...(vanished ? ['--no-reset'] : [])]);
     let picked = null;
     try { picked = JSON.parse(acquired.stdout).lane; } catch { /* failed acquire is recorded below */ }
-    return { code: acquired.status, picked, preserved: git(['rev-parse', 'HEAD'], dir) === head, fetches: readFileSync(trace, 'utf8') };
+    return {
+      code: acquired.status, picked, preserved: vanished || git(['rev-parse', 'HEAD'], dir) === head,
+      fetches: readFileSync(trace, 'utf8'),
+      quarantined: existsSync(join(poolDir, '.quarantine-state', 'lane-1.json')) ||
+        existsSync(join(poolDir, '.quarantine-state', 'lane-1.evidence.jsonl')),
+    };
   } finally {
     rmSync(base, { recursive: true, force: true });
   }
@@ -58,10 +69,12 @@ export default {
   fixedBy: { sha: 'HEAD', where: 'lane/autopick-skip-unpushed', paths: ['scripts/lane-pool.mjs'] },
   // This regression is always enforced; source text must never turn it into an expected failure.
   fixPresent: () => true,
-  run: ({ root = REPO_ROOT } = {}) => replay(root),
+  run: async ({ root = REPO_ROOT } = {}) => ({ ...await replay(root), vanished: await replay(root, { vanished: true }) }),
   judge: r => [
     ...(r.code === 0 && r.picked === 2 ? [] : ['acquire failed to skip the unsafe hint and grow']),
     ...(r.preserved ? [] : ['unpushed HEAD changed']),
     ...(r.fetches === '' ? [] : ['unsafe hint reached provisioning']),
+    ...(r.vanished?.code === 0 && r.vanished.picked === 1 ? [] : ['vanished hint blocked bounded growth']),
+    ...(r.vanished && !r.vanished.quarantined ? [] : ['vanished hint was quarantined']),
   ],
 };

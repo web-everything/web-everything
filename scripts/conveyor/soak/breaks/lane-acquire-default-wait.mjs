@@ -44,6 +44,7 @@ export async function replayAcquireDeadline({ waitMs = 30, reaperMs = 0, free = 
     laneDir: (repo, n) => `${repo.poolDir}/lane-${n}`, isHistoryQuarantined: () => false,
     // Growth/recovery retry candidates pass the same lease/history gates as free-list hints.
     leaseDisqualifiesAcquire, readLease: () => null, requireReadableLaneHistory() {},
+    join, lstatSync() {}, // Retry fixtures represent checkouts whose metadata is present.
     listScanTimeoutMs: () => 120_000, listCacheTtlMs: () => 0,
     lastListWasLockPartial: false, lastScanPartial: false,
     laneEligibilityProbeFailed: false,

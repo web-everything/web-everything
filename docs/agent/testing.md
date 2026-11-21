@@ -5802,6 +5802,9 @@ or a later push intentionally makes the commits tip or live head differ.
 remaining files. Only ENOENT proves absent metadata. Existing checkouts with failed
 status/history/ahead probes remain ineligible and block growth/recovery; keep the
 negative cases in `lane-pool-acquire-skips-unpushed.test.mjs` alongside this coverage.
+That suite also publishes a fresh free-list hint before removing the directory or `.git`,
+then checks bounded growth with and without `--no-reset` and absence of quarantine evidence.
+The `lane-acquire-skips-unpushed` soak break replays the vanished-hint case through the real CLI.
 
 The private deadline replay in `lane-acquire-default-wait.mjs` executes the production
 acquire loop in a VM. When that loop adds a dependency, update the replay's context too:
