@@ -107,6 +107,20 @@ const commandShapes = [
   ['relative shard unsupported selection', relativeShard.replace(selectedTests, 'echo unexpected'), null],
   ['relative shard malformed options', relativeShard.replace('--parallel=2', '--parallel=bad'), null],
   ['dynamic shard path refuses local execution', `node "$PWD/scripts/lib/verify-shard-run.mjs" --shards=2 --parallel=2 --budget-ms=1000 -- ${selectedTests}`, null],
+  ...[
+    '"$RUNNER"', '$RUNNER', '"${RUNNER}"', 'scripts/lib/"$RUNNER"',
+    '"${DIR}/${FILE}"', '"$(printf %s "$RUNNER")"', '`printf %s "$RUNNER"`',
+  ].map(path => [
+    `opaque shard path refuses local execution: ${path}`,
+    `node ${path} --shards=1 --parallel=1 --budget-ms=60000 -- npx vitest run scripts/__tests__/stdout-flush.test.mjs`, null,
+  ]),
+  ['expanded executable refuses local execution', '"$NODE" "$RUNNER" -- -- npx vitest run a.test.mjs', null],
+  ['expanded shard after standards refuses local execution', 'npm run check:standards && node "$RUNNER" -- npx vitest run a.test.mjs', null],
+  ['nested expanded shard refuses local execution', 'node scripts/readiness/heavy-admission.mjs run -- node "$RUNNER" -- npx vitest run a.test.mjs', null],
+  ...['\n', '\r\n', ';', '|', '||'].map(separator => [
+    `unsupported shell separator refuses local execution: ${JSON.stringify(separator)}`,
+    `npm run check:standards${separator}node "$RUNNER" -- npx vitest run a.test.mjs`, null,
+  ]),
   ['quoted wrapper text stays an argument', `echo '${relativeShard.replaceAll("'", '')}'`],
   ['whole gate with shard wrapper', `${shardCommand} && npm run check:standards`, `${kept(shardCommand)} && npm run check:standards`],
   ['shard wrapper from quoted requester checkout', `node ${shellQuote("/tmp/requester's -- npx vitest run checkout/scripts/lib/verify-shard-run.mjs")} --shards=2 --parallel=2 --budget-ms=1000 -- ${selectedTests}`,

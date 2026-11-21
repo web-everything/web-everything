@@ -919,7 +919,9 @@ async function timedRunGate(phase, command, args, { outcomeKey } = {}) {
       }
       const refusal = () => { throw new Error('verify-lane: --local requires a selected Vitest command in the shard wrapper; use an unprefixed literal node path and an &&-joined gate'); };
       if (offset !== command.length) {
-        if (command.includes('verify-shard-run.mjs') || segments.flat().some(t => t.value.includes('verify-shard-run.mjs'))) refusal();
+        // An expansion can hide the entire wrapper path. Incomplete parsing cannot prove
+        // local routing, even when neither the raw command nor its parsed prefix names it.
+        refusal();
       } else {
         // Apply edits from the end so earlier token offsets remain valid. Only executable positions
         // count: a quoted test name or echo argument containing wrapper text is data, never edited.
