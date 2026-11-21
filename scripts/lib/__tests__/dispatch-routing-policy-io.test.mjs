@@ -214,6 +214,63 @@ it.each([
     .toMatchObject({ outcome: 'refused', refusal: expect.stringContaining('no eligible capacity') });
 });
 
+it.each([
+  ['native Claude hold', 'claude', 'claude', false],
+  ['Claude launcher hold with alias', 'claude-alt', 'claude', false],
+  ['unknown emergency launcher hold', 'claude-alt', 'claude', true],
+  ['Antigravity family hold', 'agy-claude', 'antigravity', false],
+  ['Antigravity provider hold', 'agy-claude', 'agy-claude', false],
+  ['CI-heal native hold', 'claude', 'claude', false, 'ci-heal', 'ciHealAvailability'],
+])('excludes availability before capacity selection: %s', (_name, id, held, emergency, kind = 'build', holdSource = 'availability') => {
+  const now = Date.parse('2026-11-20T15:00:00Z');
+  const providers = [
+    { id, launcher: id.startsWith('agy-') ? 'antigravity' : 'claude', model: 'claude-sonnet-5-5', emergencyOnly: emergency },
+    { id: 'codex', launcher: 'codex', model: 'gpt-6.1-sol' },
+  ].map(p => ({ ...p, tier: 3, allowedKinds: [kind], windowModel: 'fixed', windows: [], readers: [] }));
+  const capacity = providers.map(p => ({ ...p, provider: p.id, health: 1, known: !p.emergencyOnly,
+    windows: p.emergencyOnly ? [] : [{ usedPercent: p.id === 'codex' ? 20 : 10,
+      resetsAt: now + (p.id === 'codex' ? 120 : 2) * 3600000 }] }));
+  const record = vi.fn();
+  const dispatch = { kind, size: 3, scopePaths: ['we:scripts/example.mjs'] };
+  const options = { env: {}, routingPolicy: DEFAULT_ROUTING_POLICY, now, quota: () => ({ used_percent: 20 }), record,
+    scorecards: [], capacity, [holdSource]: { [held]: 'operator hold' },
+    repo: { routing: { builder: 'auto', capacity: { claudeUsageAccount: 'claude-a', allowUnknownEmergency: true } },
+      providerCapacity: { providers } } };
+  // The eligible Codex route must survive a hold on a more urgent competitor.
+  expect(resolveDispatchRoute(dispatch, options)).toMatchObject({ outcome: 'routed', executed: 'codex' });
+  expect(record).toHaveBeenLastCalledWith(expect.objectContaining({ provider: 'codex',
+    inputs: expect.arrayContaining([expect.objectContaining({ provider: id, allowed: false, eligible: false })]) }), expect.any(Object));
+  // With no remaining launcher, unknown/emergency fallbacks must not revive a held route.
+  expect(resolveDispatchRoute(dispatch, { ...options, availability: { ...options.availability, codex: 'operator hold' } }))
+    .toMatchObject({ outcome: 'refused', refusal: expect.stringContaining('no eligible capacity') });
+});
+
+it.each([
+  ['agy-gemini', 'flash'],
+  ['agy-gemini', 'gemini-3.8-flash'],
+  ['antigravity', 'flash'],
+  ['antigravity', 'pro'],
+  ['antigravity', 'carbon'],
+  ['antigravity', 'sonnet', false],
+])('checks Codex availability against the resolved capacity model %s/%s', (id, model, gemini = true) => {
+  const now = Date.parse('2026-11-20T15:00:00Z');
+  const providers = [
+    { id, launcher: 'antigravity', model },
+    { id: 'claude', launcher: 'claude', model: 'claude-sonnet-5-5' },
+  ].map(p => ({ ...p, tier: 3, allowedKinds: ['fix'], windowModel: 'fixed', windows: [], readers: [] }));
+  const capacity = providers.map(p => ({ ...p, provider: p.id, known: true, health: 1,
+    windows: [{ usedPercent: 10, resetsAt: now + (p.id === id ? 2 : 120) * 3600000 }] }));
+  const record = vi.fn();
+  const route = resolveDispatchRoute({ kind: 'fix', size: 3, scopePaths: ['we:scripts/example.mjs'] }, {
+    env: {}, routingPolicy: DEFAULT_ROUTING_POLICY, now, capacity, availability: { codex: 'operator hold' },
+    quota: () => null, record, scorecards: [], repo: { routing: { builder: 'auto' }, providerCapacity: { providers } },
+  });
+  const expected = gemini ? 'claude' : id;
+  expect(route).toMatchObject({ outcome: 'routed', executed: expected });
+  expect(record).toHaveBeenLastCalledWith(expect.objectContaining({ provider: expected,
+    inputs: expect.arrayContaining([expect.objectContaining({ provider: id, allowed: !gemini, eligible: !gemini })]) }), expect.any(Object));
+});
+
 it.each(['fix', 'ci-heal'])('%s dispatch injects settings, quota, capacity and decision persistence', kind => {
   const f = fixture();
   const now = Date.parse('2026-11-19T12:00:00Z');

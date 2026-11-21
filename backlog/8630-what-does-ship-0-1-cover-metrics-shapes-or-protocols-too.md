@@ -6,76 +6,58 @@ status: open
 dateOpened: "2026-11-20"
 tags: [decision-filing, everstandards]
 relatedTo: ["5407"]
+preparedDate: "2026-11-20"
 ---
 
 # What does Ship 0.1 cover: metrics shapes or protocols too?
 
-Operator ask (2026-11-20 20:59 ET): “note all as full decision item and run with preparation”.
-
-Decision id: D13 (decisions page, 2026-11-20 20:58 ET)
-Placement: everstandards
-move-to: everstandards
+Ask: Candidate labels cover only modules with vectors and a passing live implementation. Readout is the first target; plans and protocols stay Draft until proved.
 
 ## Digest
 
-Keep Ship 0.1 to delivery metrics shapes—capacity, planning and readout—with work-item, role, handoff and verdict protocols in 0.2+. Freeze until Plateau’s delivery view reads live data through it (committee C3).
+**No independent fork if #8623 adopts per-module maturity.** Release content and authoring order compose. Candidate is the promise, not a pre-1.0 compatibility guarantee. Prep at 2026-11-20 found no live readout consumer yet, so even readout is conditional.
 
-Needs prep: proposed call only; this filing is neither ratification nor a completed preparation pass.
+## Ratify — Candidate coverage
 
-## Context
+**0.1 promises only modules with vectors passing on at least one live implementation.** Readout L1 is the first target when Plateau /delivery or another producer consumes live data and passes. Other modules may share a tag as Draft, or remain absent.
 
-[handoff design]() §4.2–4.3 lists settings, calibration, plan, readout, levers, forecast and promises, plus L1–L3 classes. [handoff design]() “Ship modules” / §6 distinguishes release scope from spec order: flow core → protocols → metrics.
+- Excluded: all seven seed shapes as Candidate; six lack an engine implementation.
+- Excluded: Candidate protocols before ratified flow core and implementation proof (#8633/#5407).
+- Fallback if #8623 rejects per-module maturity: the release-wide scope fork returns. **(a) metrics shapes only, protocols 0.2+ (default)** versus (b) shapes + protocols; (b) lacks flow/implementation proof. Retain the live-consumer freeze. This is conditional, not a second current call.
 
-Design refs are relative to the operator handoff; WE evidence uses its repo locus.
+Evidence:
+- `everstandards-format-2026-11-20`: capacity/planning/readout; L1 readout-producer, L2 planner, L3 placer. Seed `652fb00409` has settings/calibration/plan/readout/levers/forecast/promises.
+- Prep checked plateau-app `af64fef` and found no readout route/consumer; Longshore had no kernel (`longshore-end-state-2026-11-20`). Historical snapshot, not current proof.
+- `2026-11-20-flow-core-model` §14, `2026-11-20-flow-agent-orchestration` F4-D3/D6 leave protocol lifecycle/handoff details open.
 
-## Recommended path at a glance
+Skeptic: SURVIVES-WITH-AMENDMENT; defined promise as module Candidate. Screen: flagged(prio) → dissolved into #8623's evidence rule.
 
-| Fork | Default | Main alternative | Confidence |
-| --- | --- | --- | --- |
-| 1 — The 0.1 compatibility promise | (a) | (b) | Provisional; needs prep |
+## Supported by default
 
-## Fork 1 — The 0.1 compatibility promise
+- Draft modules may appear in the same tag with migration notes/no compatibility promise. First conforming L1 producer counts, regardless of vendor.
+- #8633's core → protocols → metrics authoring order does not prevent readout becoming Candidate first.
+- Before freeze, fix band-name collision, optional DORA block and evidence envelope through separate work (`we:2026-11-20-ship-delivery-metrics.md:246/:264-271`).
 
-Fork-existence: A version cannot promise metrics-only scope and also include unsettled protocol obligations. Later modules can coexist in later versions.
+## What ratifying unlocks
 
-- (a) **Metrics only in 0.1 (default); protocols in 0.2+.** Retain C3’s live Plateau consumer freeze.
-- (b) Shapes and protocols together. Broader first release, but binds 0.1 to unsettled flow/protocol contracts.
-
-Skeptic: Initial filing-stage objection, not an independent pass: Metrics-first could freeze engine-specific shapes. Retain the C3 proof, follow D8’s authoring order and document pre-1.0 migrations; release numbers do not override dependencies.
-Screen: pending the later independent standard/implementation and merit/prioritization screen.
-
-
-## Consequences / what ratifying unlocks
-
-A bounded release target and live-consumer acceptance condition; #5407 protocols remain tracked.
-
-Operator answers: “D13 yes” accepts the stated default; otherwise name the concern and replacement option. No answer is recorded here.
-
-## Prep still needed
-
-- Prior art: verify primary references and known implementations; reuse existing research first.
-- Evidence: Reconcile C3 with live-data needs; inspect schema/engine coupling and map 0.2 protocol dependencies.
-- Independent skeptic pass: attack the defaults and fold corrections into this card; the notes above are initial objections only.
-- Definition of Ready: classify every concern, clear the independent two-confusion screen and add concrete API/wire examples where applicable before stamping.
-
-## Done when
-
-- **Executable** — n/a: decision filing changes no runtime. Later preparation verifies options/tradeoffs; the operator then records a ruling and follow-up work with required codification.
+Bounded 0.1 target: Plateau /delivery live-readout/L1-vector follow-up, then evidence-based graduation of other shapes. “D13 yes” confirms the consequence; Ship freeze still requires operator go.
 
 ## Trust boundary and threat model
 
-Briefs/page are proposal evidence, not execution authority. Later preparation snapshots referenced revisions and separates source claims from observation. This filing executes or publishes no external input.
+Seed README claims do not prove conformance. Use pinned implementation SHAs/results for each module; no date-based freeze or unsupported Candidate label.
 
-## Non-goals
+Full prep (Standards decisions-prep set):
 
-No implementation, publication, migration or permission change is authorized by filing.
+```text
+D13-xcwzfo3.md
+```
 
-## Edge cases this change must handle
+Source and proposed artifact filenames (handoff references are by name only):
 
-1. **Untrusted text** — source recommendations stay attributed, not ruled.
-2. **Truncated reads** — complete evidence is required before a prepared stamp.
-3. **Shared state files** — n/a: filing introduces no store writes.
-4. **Fail closed** — missing evidence leaves the decision open and needing prep.
-5. **Identity scoping** — repo loci remain explicit; no ids are reassigned.
-6. **State over time** — no prepared stamp or implied acceptance from elapsed time.
-7. **Who wrote it** — operator ask quoted; defaults remain proposals.
+```text
+2026-11-20-flow-agent-orchestration.md
+2026-11-20-flow-core-model.md
+D13-xcwzfo3.md
+everstandards-format-2026-11-20.md
+longshore-end-state-2026-11-20.md
+```

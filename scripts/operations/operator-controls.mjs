@@ -69,7 +69,7 @@ export function planOperatorControl(name, read, input) {
       if (read.failures?.length) steps.push(`clearBuildFailure(${input.item})`);
     } else if (!read.labels?.includes('review:human')) why = 'PR has no review:human';
     else if (read.state !== 'OPEN') throw new Error('the PR must be open to unpark');
-    else steps.push(`review-set-label.mjs ${input.pr} --to=clear-human with actor, channel and verbatim reason (its ceremony refusals still apply)`);
+    else steps.push(`review-set-label.mjs ${input.pr} --to=clear-human --expect-head=<full 40-hex head SHA> with actor, channel and verbatim reason (its ceremony refusals still apply)`);
   } else if (name === 'retry-prepare') {
     undo = 'the daemon re-holds on the next prepare failure; to re-hold now: placeBuildDispatchHold with the previous prepare reason';
     if (!read.failures?.some(f => f.held && !f.completed) && !read.holds?.some(isPrepareHold)) why = 'no held uncompleted prepare failure or prepare hold';

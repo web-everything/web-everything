@@ -80,7 +80,7 @@ export function resolveDispatchRoute(dispatch, options = {}) {
   // evidence router removes quota fields; neither a backend nor its checker may run while held.
   const rawRecords = Array.isArray(options.scorecards) ? options.scorecards : options.scorecards?.records;
   const records = Array.isArray(rawRecords) ? rawRecords.filter(row => row && typeof row === 'object') : [];
-  const availability = { ...options.availability };
+  const availability = { ...(dispatch.kind === 'ci-heal' ? options.ciHealAvailability : {}), ...options.availability };
   for (const provider of ['antigravity', 'codex']) {
     const hold = providerQuotaHold(records, provider, options.now ?? Date.now());
     if (hold) availability[provider] = hold;
@@ -100,7 +100,7 @@ export function resolveDispatchRoute(dispatch, options = {}) {
   const pinnedSettings = pinned && BUILD_KINDS.includes(dispatch?.kind) ? resolveRoutingSettings({ env: options.env ?? process.env, repo: options.repo, declared: options.declared }) : null;
   const builder = pinnedSettings ? { builder: pinnedSettings.builder, settings: pinnedSettings }
     : BUILD_KINDS.includes(dispatch?.kind) ? effectiveBuilder({ kind: dispatch.kind, env: options.env ?? process.env, now: options.now ?? Date.now(), records, capacity: options.capacity, routeKey, queuedDemand: options.queuedDemand ?? options.queuedDispatches?.filter(d => BUILD_KINDS.includes(d.kind)).length ?? 1, demandRatePerHour: options.demandRatePerHour,
-    repo: options.repo, declared: options.declared, quota: options.quota, record: options.record, disabledProviders: [...disabledProviders],
+    repo: options.repo, declared: options.declared, quota: options.quota, record: options.record, disabledProviders: [...disabledProviders], availability, modelAliases: routingPolicy.aliases,
   }) : null;
   if (builder?.decision?.provider === null) return { outcome: 'refused', refusal: 'no eligible capacity; wait for quota reset or clear provider hold', auditTrail: [] };
   const inputs = builder?.decision?.inputs ?? [];

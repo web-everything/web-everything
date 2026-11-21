@@ -158,7 +158,14 @@ export function capacityEligibility(cap, kind, settings = {}) {
   // Native model aliases use the launcher's policy identity; agy models retain
   // their distinct policy providers, just as dispatch projection does.
   const policyProvider = ['claude', 'codex'].includes(scored.launcher) ? scored.launcher : cap.provider;
+  // Use the dispatch router's availability rules before selection or unknown fallbacks,
+  // so an unavailable winner cannot reserve the remaining provider for audits.
+  const availability = settings.availability;
+  const model = settings.modelAliases?.[policyProvider]?.[scored.model] ?? scored.model;
   const allowed = !settings.disabledProviders?.includes(policyProvider)
+    && !availability?.[policyProvider]
+    && !(policyProvider.startsWith('agy-') && availability?.antigravity)
+    && !(model?.startsWith('gemini-') && availability?.codex)
     && (cap.active ?? def?.active) !== false && (cap.allowedKinds ?? def?.allowedKinds ?? []).includes(kind);
   const emergencyOnly = cap.emergencyOnly ?? def?.emergencyOnly;
   const eligible = allowed && Boolean(scored.fit) && (emergencyOnly
