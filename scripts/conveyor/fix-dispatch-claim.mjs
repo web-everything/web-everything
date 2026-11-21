@@ -195,7 +195,7 @@ export function acquireFixDispatchClaim({
   const claimedAt = prior?.owner === owner && prior?.meta?.claimedAt && !isLeaseExpired(prior, nowMs, leaseMinutes)
     ? prior.meta.claimedAt : nowIso;
   const meta = {
-    host, sessionId, repo, pr, kind, headSha: headSha ?? null, claimedAt,
+    host, sessionId, repo, pr, kind, headSha: headSha ?? null, claimedAt, leaseMinutes,
     // #4295 — declared scope (repo-qualified) so build/fix dispatch can serialize on overlap; omitted when unknown.
     ...(Array.isArray(scope) && scope.length ? { scope: scope.map(String) } : {}),
     // Card 87 — this fix runs in a BORROWED builder slot (`{executor, reason}`); the build daemon counts it there.
@@ -318,9 +318,23 @@ export function isClaimSessionLive({ repo, pr, kind = 'fix', agentsAll, name: na
  *  Well above any real fix/ci-heal run, and above `hung-session.mjs`'s own 30-min hung threshold. */
 export const MAX_FIX_DISPATCH_CLAIM_REFRESH_MS = 4 * 60 * 60 * 1000;
 
+/** Missing owners can be released only after this spawn/listing-lag grace and a readable listing.
+ * Unknown evidence retains the claim for the existing TTL/operator inspection path. */
+export const STALE_GONE_GRACE_MS = 30 * 60 * 1000;
+
 /** Twenty minutes covers the observed 7–14 minute gaps between live daemon sweeps.
  * A longer gap (daemon down or machine asleep) is unobserved time and must not count toward the idle release window. */
 export const MAX_IDLE_CLAIM_OBSERVATION_GAP_MS = 20 * 60_000;
+
+// Preserve source-level completeness evidence when joining the two inventories.
+function listFreshClaimAgents() {
+  const sources = [defaultListAgents({ all: true, fresh: true }), listWrappedWorkerAgents()];
+  const rows = sources.flatMap(source => Array.isArray(source) ? source : []);
+  if (sources.some(source => !Array.isArray(source) || source.incomplete != null)) {
+    Object.defineProperty(rows, 'incomplete', { value: sources.map(source => source?.incomplete ?? 'unreadable source') });
+  }
+  return rows;
+}
 
 /**
  * we:scripts/conveyor/fix-dispatch-claim.mjs#refreshLiveFixDispatchClaims — THE FIX for a claim outliving a
@@ -331,8 +345,10 @@ export const MAX_IDLE_CLAIM_OBSERVATION_GAP_MS = 20 * 60_000;
  * `agentsAll` read for the whole sweep — never one `claude agents --json --all` call per claim),
  * heartbeat-refreshes it (`file-locks.mjs#heartbeat`) so its TTL never lapses while the session is real. A
  * claim with a terminal session from this dispatch is released before overlap admission, even while its PR
- * remains in review. Unknown/missing sessions retain the TTL grace; old terminal rows cannot release a new
- * dispatch sharing their name. PR labels/head changes alone never release a live session's claim.
+ * remains in review. A readable non-empty listing with no owner row releases a runnerless claim after
+ * {@link STALE_GONE_GRACE_MS} since both acquire and last heartbeat, and after the configured lease expires;
+ * fixing claims are exempt. Incomplete or unknown evidence retains the TTL/operator inspection fallback. Old terminal rows cannot release
+ * a new dispatch sharing their name. PR labels/head changes alone never release a live session's claim.
  *
  * PR #2789 review hardening:
  *  - HUNG: every candidate agent row is first run through `hung-session.mjs#readHungInfo` (injectable as
@@ -364,7 +380,7 @@ export const MAX_IDLE_CLAIM_OBSERVATION_GAP_MS = 20 * 60_000;
  */
 export function refreshLiveFixDispatchClaims({
   lockRoot = fixDispatchClaimRoot(),
-  listAgentsAll = () => [...defaultListAgents({ all: true }), ...listWrappedWorkerAgents()],
+  listAgentsAll = listFreshClaimAgents,
   hungInfoFor = readHungInfo,
   awaitingVerifyFor = makeAwaitingVerifyResolver(),
   hungThresholdMs = resolveHungThresholdMs(),
@@ -386,14 +402,27 @@ export function refreshLiveFixDispatchClaims({
   const refreshed = [];
   const released = [];
   const awaiting = [];
+  // Empty or malformed listings cannot prove absence. Require actual named rows, not just array length.
+  const readableListing = Array.isArray(listed) && listed.incomplete == null && listed.length > 0
+    && listed.every(a => a && a.incomplete == null && typeof a.name === 'string' && a.name.trim());
   for (const entry of claims) {
     const { repo, pr, kind, headSha = null, claimedAt = null } = entry.meta;
     const resource = fixDispatchResource({ repo, pr, kind });
     const claimedMs = Date.parse(claimedAt ?? '');
-    if (Number.isFinite(claimedMs) && nowMs - claimedMs > MAX_FIX_DISPATCH_CLAIM_REFRESH_MS) {
-      clearClaimIdleHead(lockRoot, resource, entry);
-      continue;
-    }
+    const pastGoneGrace = Number.isFinite(claimedMs) && nowMs - claimedMs > STALE_GONE_GRACE_MS;
+    const releaseStale = (reason, includeReason = true) => {
+      if (!readUnchangedClaim(lockRoot, resource, entry)) return;
+      const result = releaseFixDispatchClaim({ repo, pr, kind, owner: entry.owner, lockRoot });
+      if (!result.released) return;
+      released.push({ repo, pr, kind, owner: entry.owner, ...(includeReason ? { reason } : {}) });
+      recordIdleRelease({ kind: 'stale-claim-released', repo, pr, daemon: 'reconcile-fix-dispatch',
+        detail: { kind, reason, owner: entry.owner } }, recordEvent);
+    };
+    const quarantine = () => {
+      if (!pastGoneGrace || !readUnchangedClaim(lockRoot, resource, entry)) return;
+      recordIdleRelease({ kind: 'stale-claim-quarantined', repo, pr, daemon: 'reconcile-fix-dispatch',
+        detail: { kind, reason: 'owner-row-retained', owner: entry.owner } }, recordEvent);
+    };
     // fix-procedure (`kind:'fixing'`, `we:scripts/conveyor/fix-procedure.mjs`): the holder's session name is
     // `meta.who`, not a minted slug — minting one would THROW on the unknown kind and crash this whole sweep.
     // A claim whose name cannot be resolved is skipped (left to its own TTL), never thrown over.
@@ -401,6 +430,31 @@ export function refreshLiveFixDispatchClaims({
     if (kind === 'fixing') name = entry.meta.who ? String(entry.meta.who) : null;
     else { try { name = fixDispatchSessionName({ repo, pr, kind }); } catch { name = null; } }
     if (!name) {
+      clearClaimIdleHead(lockRoot, resource, entry);
+      continue;
+    }
+    const namedRows = (Array.isArray(listed) ? listed : []).filter(a => a && String(a.name ?? '') === name);
+    const boundSessionPresent = entry.meta.sessionId && Array.isArray(listed)
+      && listed.some(a => a?.sessionId === entry.meta.sessionId);
+    // A bound session under another name proves presence, but does not authorize name-based lifecycle actions.
+    if (namedRows.length === 0 && boundSessionPresent && !Number.isInteger(entry.meta.runnerPid)) {
+      quarantine();
+      clearClaimIdleHead(lockRoot, resource, entry);
+      continue;
+    }
+    const heartbeatMs = Date.parse(entry.heartbeatAt);
+    const leaseMinutes = entry.meta.leaseMinutes ?? DEFAULT_FIX_DISPATCH_CLAIM_TTL_MINUTES;
+    const staleHeartbeat = Number.isFinite(heartbeatMs) && nowMs - heartbeatMs > STALE_GONE_GRACE_MS
+      && typeof leaseMinutes === 'number' && Number.isFinite(leaseMinutes) && leaseMinutes > 0
+      && nowMs - heartbeatMs > leaseMinutes * 60_000;
+    // Malformed runner metadata can still use session liveness, but never proves runner absence.
+    if (!Number.isInteger(entry.meta.runnerPid) && namedRows.length === 0) {
+      if (kind !== 'fixing' && entry.meta.runnerPid == null && readableListing && pastGoneGrace && staleHeartbeat) releaseStale('session-gone');
+      clearClaimIdleHead(lockRoot, resource, entry);
+      continue;
+    }
+    if (Number.isFinite(claimedMs) && nowMs - claimedMs > MAX_FIX_DISPATCH_CLAIM_REFRESH_MS) {
+      if (!Number.isInteger(entry.meta.runnerPid) && namedRows.length) quarantine();
       clearClaimIdleHead(lockRoot, resource, entry);
       continue;
     }
@@ -419,8 +473,7 @@ export function refreshLiveFixDispatchClaims({
       const cur = readUnchangedClaim(lockRoot, resource, entry);
       if (!cur) continue;
       if (runnerDead) {
-        const result = releaseFixDispatchClaim({ repo, pr, kind, owner: entry.owner, lockRoot });
-        if (result.released) released.push({ repo, pr, kind, owner: entry.owner, reason: identityReason ? `runner-identity-dead (${identityReason})` : `${entry.meta.borrowed ? 'borrowed' : 'wrapped'}-runner-dead (pid ${entry.meta.runnerPid} is gone)` });
+        releaseStale(identityReason ? `runner-identity-dead (${identityReason})` : `${entry.meta.borrowed ? 'borrowed' : 'wrapped'}-runner-dead (pid ${entry.meta.runnerPid} is gone)`);
       } else {
         const meta = { ...cur.meta };
         delete meta.idleHead;
@@ -435,7 +488,7 @@ export function refreshLiveFixDispatchClaims({
     const boundToClaim = (a) => (entry.meta.sessionId
       ? a.sessionId === entry.meta.sessionId
       : Number.isFinite(claimedMs) && startedAtMs(a.startedAt) >= claimedMs);
-    const agentsAll = (Array.isArray(listed) ? listed : []).filter((a) => a && String(a.name ?? '') === name)
+    const agentsAll = namedRows
       .map((a) => {
         let info = null;
         try { info = hungInfoFor(a, nowMs, hungThresholdMs); } catch { info = null; }
@@ -456,7 +509,7 @@ export function refreshLiveFixDispatchClaims({
     if (!isAwaiting && !isClaimSessionLive({ repo, pr, kind, agentsAll, name })) {
       // A terminal row must belong to THIS dispatch, not an older round with the
       // same reusable name. Missing/failed listings and the spawn-listing lag
-      // never release a claim. A live sibling above always wins over old rows.
+      // are handled above. A live sibling always wins over old rows.
       // #3964 (2026-10-05): a fixer's own session starts before its fixing claim;
       // an exact sessionId match settles that claim regardless of start time.
       const settled = agentsAll.some((a) =>
@@ -464,11 +517,8 @@ export function refreshLiveFixDispatchClaims({
         && ((entry.meta.sessionId && a.sessionId === entry.meta.sessionId)
           || (Number.isFinite(claimedMs) && startedAtMs(a.startedAt) >= claimedMs)));
       if (settled) {
-        if (readUnchangedClaim(lockRoot, resource, entry)) {
-          const result = releaseFixDispatchClaim({ repo, pr, kind, owner: entry.owner, lockRoot });
-          if (result.released) released.push({ repo, pr, kind, owner: entry.owner });
-        }
-      }
+        releaseStale('settled-terminal-row', false);
+      } else quarantine();
       clearClaimIdleHead(lockRoot, resource, entry);
       continue;
     }
@@ -487,11 +537,7 @@ export function refreshLiveFixDispatchClaims({
         try { return identity(a.pid, { startedBy: holderStartedBy(a, startedAtMs) }); } catch { return null; }
       });
       if (identities.every((verdict) => verdict?.alive === false)) {
-        if (readUnchangedClaim(lockRoot, resource, entry)) {
-          const result = releaseFixDispatchClaim({ repo, pr, kind, owner: entry.owner, lockRoot });
-          if (result.released) released.push({ repo, pr, kind, owner: entry.owner,
-            reason: `session-identity-dead (${identities[0].reason})` });
-        }
+        releaseStale(`session-identity-dead (${identities[0].reason})`);
         clearClaimIdleHead(lockRoot, resource, entry);
         continue;
       }
@@ -545,6 +591,7 @@ export function refreshLiveFixDispatchClaims({
       }
     }
     if (!heartbeat(lockRoot, resource, current.owner, heartbeatAt, current.pid ?? null, meta)) continue;
+    quarantine();
     if (isAwaiting) awaiting.push({ repo, pr, kind, owner: entry.owner });
     refreshed.push({
       repo, pr, kind, headSha, owner: entry.owner,

@@ -6,10 +6,11 @@ import { tmpdir } from 'node:os';
 import { classifyOwner, planActions, processLive, selfAudit, detectSmells, runLiveOwnerWatchPass, probeLiveOwnerWatch, LIVE_OWNER_DEFAULTS } from '../pr-live-owner-watch.mjs';
 import { feedTail, resolveLiveOwnerSettings, createLiveOwnerWatchIo } from '../pr-live-owner-watch-io.mjs';
 import { keepAliveScript } from '../../lib/test-keepalive.mjs';
-// Collect the cyclic dispatch graph before per-case deadlines start. The first review
-// adapter otherwise pays for its cold Vite transforms inside the 5-second assertion budget.
-import * as reviewJob from '../../operations/review-job.mjs';
+// Collect the cyclic dispatch/reconcile graph before the portable IO tests' deadlines.
+// The first review adapter otherwise pays the cold module transform/evaluation cost.
 import { dispatchManualPass } from '../../operations/manual-daemon-pass-io.mjs';
+import * as reviewJob from '../../operations/review-job.mjs';
+import { planReconcile, resolveRoundCap } from '../reconcile-core.mjs';
 import { durableCountsFrom } from '../reconcile-pass.mjs';
 
 const NOW = Date.parse('2026-11-10T18:00:00Z'), MIN = 60_000;
@@ -551,7 +552,6 @@ describe('portable feed IO and settings', () => {
   });
 
   async function reviewAdapters(overrides = {}) {
-    const { planReconcile, resolveRoundCap } = await import('../reconcile-core.mjs');
     return { readAgents: () => [], readGhText: commentGh(), dispatchManualPass: vi.fn(),
       reconcileReview: options => {
         const prs = options.readPrs();
