@@ -1,6 +1,7 @@
 // Run-scoped temp root for every vitest run — see scripts/lib/test-tmp-root.mjs for the leak it stops and
 // the WE_TMP_LEAK_* policy knobs. Runs in the main vitest process BEFORE workers spawn; vitest builds the
 // worker env from `process.env` at run time, so the TMPDIR set here reaches every worker and spawned child.
+import { writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
@@ -32,12 +33,23 @@ export default function setup() {
   // One fake `gh` for the whole run (vitest.setup.ts used to write one per test file).
   process.env[FAKE_GH_DIR_ENV] = createSharedFakeGh(root);
   return function teardown() {
-    for (const [key, value] of Object.entries(saved)) {
-      if (value === undefined) delete process.env[key];
-      else process.env[key] = value;
+    let failed = true;
+    try {
+      for (const [key, value] of Object.entries(saved)) {
+        if (value === undefined) delete process.env[key];
+        else process.env[key] = value;
+      }
+      removeSharedDir(root);
+      const verdict = finishRunTmpRoot({ root, policy: resolveTmpLeakPolicy() });
+      failed = verdict.failed;
+    } finally {
+      if (failed) {
+        process.exitCode = 1;
+        // The JSON report precedes teardown. Preserve both cleanup exceptions and leak-policy failures
+        // so a passing file retry cannot erase them; exceptions still propagate to Vitest.
+        const marker = process.env.WE_TEARDOWN_FAILURE_FILE;
+        if (marker) writeFileSync(marker, 'cleanup or tmp-leak policy failed in global teardown\n');
+      }
     }
-    removeSharedDir(root);
-    const verdict = finishRunTmpRoot({ root, policy: resolveTmpLeakPolicy() });
-    if (verdict.failed) process.exitCode = 1;
   };
 }

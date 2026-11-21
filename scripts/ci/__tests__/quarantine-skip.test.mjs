@@ -259,8 +259,10 @@ describe('ci.yml wiring', () => {
   });
   it.each(['Unit suite shard', 'Unit suite no-coverage group'])('%s appends the skip args to its vitest run', (prefix) => {
     const s = steps.find((x) => String(x.name).startsWith(prefix));
+    // The skip args are read once (failing the step if quarantine-skip fails) and passed to the vitest run.
+    expect(s.run).toMatch(/^\s*skip=\$\(node scripts\/ci\/quarantine-skip\.mjs\) \|\| exit 1$/m);
     const line = s.run.split('\n').find((l) => l.includes('npm run test:'));
-    expect(line).toMatch(/"\$\{files\[@\]\}" \$\(node scripts\/ci\/quarantine-skip\.mjs\)/);
+    expect(line).toMatch(/"\$\{files\[@\]\}" "\$\{skip_args\[@\]\}"/);
   });
 });
 

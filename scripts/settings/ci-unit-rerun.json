@@ -1,0 +1,4 @@
+{
+  "$comment": "ciUnitRerun: one retry of failed unit files, without coverage or quarantine. Defaults enabled=true, maxFiles=10. Standard -> platform ciUnitRerun -> tool -> WE_CI_UNIT_RERUN_ENABLED (true/false, 1/0), WE_CI_UNIT_RERUN_MAX_FILES (positive integer). Effective values and sources logged through policy-cascade. Disabled retries or failures above the cap leave the shard red for operator inspection and manual rerun.",
+  "ciUnitRerun": {}
+}

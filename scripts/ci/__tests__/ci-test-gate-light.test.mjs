@@ -73,7 +73,7 @@ describe('ci.yml lightweight required test gate', () => {
 });
 
 describe('ci.yml parallel coverage merge and host-path jobs', () => {
-  it('uses ten unit groups, nine coverage shards, and eight soak shards', () => {
+  it('uses 10 unit groups, nine coverage shards, and eight soak shards', () => {
     expect(jobs['test-shard'].strategy.matrix.shard).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
     expect(jobs['soak-shard'].strategy.matrix.shard).toEqual([1, 2, 3, 4, 5, 6, 7, 8]);
     const steps = jobs['test-shard'].steps;
@@ -84,6 +84,8 @@ describe('ci.yml parallel coverage merge and host-path jobs', () => {
     expect(covered.run).toContain(`--shard=\${{ matrix.shard }}/${count}`);
     expect(covered.if).toMatch(/matrix\.shard != 10\b/);
     expect(nocov.if).toMatch(/matrix\.shard == 10\b/);
+    const upload = steps.find((s) => s.name === 'Upload shard coverage');
+    expect(upload.if).toBe(covered.if);
     expect(nocov.run).toContain('--group=nocov --shard=1/1');
     expect(JSON.stringify(steps)).not.toMatch(/matrix\.shard\s*(?:==|!=)\s*5\b/);
     const merge = jobs['coverage-merge'];
