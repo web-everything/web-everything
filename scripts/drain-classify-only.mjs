@@ -6,6 +6,10 @@ import { filterOpenPrsByLabel, OPEN_PR_LIST_LIMIT } from './lib/no-search-backed
 
 /** At most this many labelled PRs are classified per scheduled run (each spawns a full dry-run drain). */
 const BATCH_PR_CAP = 10;
+/** Each child classification may take this long (see runCli). */
+const CHILD_TIMEOUT_MS = 10 * 60_000;
+/** Whole-batch budget: the job's `timeout-minutes: 30` minus a margin. No PR starts with less than one child timeout left. */
+const BATCH_BUDGET_MS = 25 * 60_000;
 
 /**
  * The one admission-hold decision for a toMerge candidate. A dry-run lands nothing (its `merged` set is empty),
@@ -155,12 +159,18 @@ export function runBatch(argv = process.argv.slice(2), io = {}) {
     if (!Array.isArray(listing)) return fail('open PR list unreadable');
     const { prs: labelled, truncated } = filterOpenPrsByLabel(listing, 'ready-to-merge');
     if (truncated) return fail('open PR list possibly truncated');
-    prs = labelled.slice(0, BATCH_PR_CAP).map(row => String(row?.number ?? ''));
+    // Rotate by run id so PRs past the first batch get a turn on later runs.
+    const runNo = Number(env.GITHUB_RUN_ID);
+    const start = labelled.length && Number.isSafeInteger(runNo) && runNo > 0 ? runNo % labelled.length : 0;
+    prs = [...labelled.slice(start), ...labelled.slice(0, start)].slice(0, BATCH_PR_CAP).map(row => String(row?.number ?? ''));
   }
   if (!prs.length) return { written: 0, failed: 0 };
   (io.mkdirSync || mkdirSync)(flags['verdict-dir'], { recursive: true });
-  let written = 0, failed = 0, unknown = 0;
+  let written = 0, failed = 0, unknown = 0, skipped = 0;
+  const batchStart = (io.now || Date.now)();
   for (const pr of prs) {
+    // Deadline: never start a PR that could not finish inside the job budget; finished verdicts are already on disk.
+    if ((io.now || Date.now)() - batchStart > BATCH_BUDGET_MS - CHILD_TIMEOUT_MS) { skipped++; continue; }
     try {
       if (!/^[1-9]\d*$/.test(pr)) throw new Error('invalid PR number');
       runCli([`--only=${pr}`, `--verdict-out=${flags['verdict-dir']}/pr-${pr}.json`, ...(flags.repo ? [`--repo=${flags.repo}`] : [])], io);
@@ -184,7 +194,8 @@ export function runBatch(argv = process.argv.slice(2), io = {}) {
   if (!written && !failed) failed = 1;
   // Every PR unknown would hide an outage behind a green run: fail with a summary.
   if (unknown && !written) process.stderr.write(`all ${unknown} PR(s) unknown; run the local drain\n`);
-  return unknown ? { written, failed, unknown } : { written, failed };
+  if (skipped) process.stderr.write(`${skipped} PR(s) not started: batch budget spent; next run rotates\n`);
+  return { written, failed, ...(unknown ? { unknown } : {}), ...(skipped ? { skipped } : {}) };
 }
 
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {

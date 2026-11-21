@@ -98,3 +98,46 @@ describe('drain-classify-only: cross-repo listing failure degrades to unknown', 
     expect(err).toMatch(/all 2 PR\(s\) unknown/);
   });
 });
+
+describe('drain-classify-only: batch deadline and rotation', () => {
+  const CHILD_MS = 10 * 60_000;
+  function clockIo({ prs, perChildMs, runId = '1' }) {
+    let t = now;
+    const io = batchIo({ prs, dryRunFor: okDryRun });
+    io.env.GITHUB_RUN_ID = runId;
+    io.now = () => t;
+    const base = io.execFileSync;
+    io.execFileSync = vi.fn((cmd, args, opts) => {
+      if (cmd !== 'git' && cmd !== 'gh') t += perChildMs;
+      return base(cmd, args, opts);
+    });
+    return io;
+  }
+  const files = io => Object.keys(written(io)).sort();
+
+  it('batch stops starting PRs when remaining budget is under one child timeout and keeps finished verdicts', () => {
+    const io = clockIo({ prs: [1, 2, 3, 4, 5, 6, 7, 8], perChildMs: 6 * 60_000 });
+    const [out] = quiet(() => runBatch(batchArgv, io));
+    expect(out.failed).toBe(0);
+    expect(out.written).toBe(3);
+    expect(out.skipped).toBe(5);
+    expect(files(io)).toHaveLength(3);
+    expect(CHILD_MS).toBe(600000);
+  });
+
+  it('rotates the start index so PRs past the first batch get a turn on the next run', () => {
+    const prs = Array.from({ length: 12 }, (_, i) => i + 1);
+    const a = clockIo({ prs, perChildMs: 6 * 60_000, runId: '1' });
+    const b = clockIo({ prs, perChildMs: 6 * 60_000, runId: '5' });
+    quiet(() => runBatch(batchArgv, a));
+    quiet(() => runBatch(batchArgv, b));
+    expect(files(a)).not.toEqual(files(b));
+    expect(files(b)).toContain('verdicts/pr-6.json');
+  });
+
+  it('a fast batch still classifies every PR up to the cap', () => {
+    const io = clockIo({ prs: [7, 8], perChildMs: 1000 });
+    const [out] = quiet(() => runBatch(batchArgv, io));
+    expect(out).toEqual({ written: 2, failed: 0 });
+  });
+});
