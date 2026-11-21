@@ -60,6 +60,11 @@ export function resolveLiveOwnerSettings({ env = process.env, tool = {}, platfor
   return resolved.value;
 }
 
+// Total 5 s so two retries fit the default 30 s tick budget (and the 19 s health child) beside real gh timeouts.
+const LIST_RETRY_DELAYS_MS = [1000, 4000];
+const TRANSIENT_CODES = new Set(['ETIMEDOUT', 'ECONNRESET', 'ECONNREFUSED', 'EAI_AGAIN', 'ENOTFOUND', 'EPIPE']);
+const TRANSIENT_MESSAGE = /timed? ?out|ETIMEDOUT|ECONNRESET|EAI_AGAIN|connection (?:reset|refused|closed)|\bHTTP 5\d\d\b|\b50[0234]\b|bad gateway|service unavailable|gateway time-?out|rate limit/i;
+const isTransientGhError = e => TRANSIENT_CODES.has(e?.code) || (!/budget exhausted/i.test(e?.message ?? '') && TRANSIENT_MESSAGE.test(e?.message ?? ''));
 export async function createLiveOwnerWatchIo({ env = process.env, now = Date.now(), home = homedir(), root = ROOT, adapters = {} } = {}) {
   // These roots share circular dispatch/overlay dependencies. Loading them concurrently
   // deadlocks vite-node's module evaluator; finish each root before starting the next.
@@ -269,12 +274,19 @@ export async function createLiveOwnerWatchIo({ env = process.env, now = Date.now
     listPRs() {
       const read = () => readGh(['pr', 'list', '--repo', repo, '--state', 'open', '--limit', String(config.maxPrs + 1), '--json',
         'number,headRefOid,headRefName,baseRefName,isDraft,labels,mergeable,mergeStateStatus,statusCheckRollup,createdAt,updatedAt,author,files']);
+      // A single GitHub hiccup must not raise NEEDS-YOU: retry transient failures twice with backoff,
+      // never past the tick budget. Auth/4xx/budget errors raise at once; 3 failures still fail closed.
+      const sleep = adapters.sleepMs ?? (ms => Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms));
       let prs;
-      try { prs = read(); }
-      catch (e) {
-        if (e.code !== 'ETIMEDOUT') throw e;
-        try { prs = read(); }
-        catch (retry) { throw Error(`PR list unavailable after one timeout retry (${retry.code ?? retry.message}); operator must inspect inventory before retrying`); }
+      for (let attempt = 0; ; attempt++) {
+        try { prs = read(); break; }
+        catch (e) {
+          const delay = LIST_RETRY_DELAYS_MS[attempt];
+          if (!isTransientGhError(e)) throw e;
+          if (delay === undefined) throw Error(`PR list unavailable after ${LIST_RETRY_DELAYS_MS.length} retries (${e.code ?? e.message}); operator must inspect inventory before retrying`);
+          if (deadline - Date.now() < delay + 1000) throw Error(`PR list unavailable; retry would exceed the tick budget (${e.code ?? e.message}); operator must inspect inventory before retrying`);
+          sleep(delay);
+        }
       }
       if (!Array.isArray(prs) || prs.some(p => !Array.isArray(p.labels) || !Array.isArray(p.statusCheckRollup)
         || !/^[a-f0-9]{40}$/i.test(p.headRefOid ?? ''))) throw Error('PR facts incomplete');

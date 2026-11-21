@@ -1,9 +1,9 @@
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from 'vitest';
 import { execFileSync, spawnSync } from 'node:child_process';
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, renameSync, rmSync, symlinkSync, utimesSync, writeFileSync } from 'node:fs';
+import { chmodSync, cpSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, renameSync, rmSync, symlinkSync, utimesSync, writeFileSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { tmpdir } from 'node:os';
-import { sharedRepos, withGhStub } from './fixtures/shared-git-fixture.mjs';
+import { withGhStub } from './fixtures/shared-git-fixture.mjs';
 import { readLaneJournal } from '../lib/lane-history.mjs';
 import { laneGitConfigArgs, laneGitHardeningEnv, scrubGitRepoEnv } from '../lib/lane-git-hardening.mjs';
 import { NO_REPO_CWD } from '../lib/lane-pool-salvage-push.mjs';
@@ -12,7 +12,7 @@ const script = resolve(process.cwd(), 'scripts/lane-pool.mjs');
 const git = (args, cwd) => execFileSync('git', args, {
   cwd, encoding: 'utf8', timeout: 30_000, killSignal: 'SIGKILL', maxBuffer: 8 * 1024 * 1024,
 }).trim();
-let fixtureRoot, fixture, origin, reference, base, poolRoot, laneDir, marker, lease;
+let fixtureRoot, snapshotRoot, origin, reference, base, poolRoot, laneDir, marker, lease;
 function runPool(args, fault = '', remoteFault = '', extraEnv = {}) {
   // `remoteFault` runs for the canonical-origin listing (the only ls-remote here: recovery is off), which executes
   // outside the lane (checked against the primary checkout, run outside any repository). `fs` lets a fault record calls.
@@ -68,21 +68,27 @@ beforeAll(() => {
   git(['add', '.'], reference);
   git(['-c', 'user.email=test@example.com', '-c', 'user.name=Test', 'commit', '--quiet', '-m', 'seed'], reference);
   git(['push', '--quiet', 'origin', 'main'], reference);
-  fixture = sharedRepos(fixtureRoot, [origin, reference]);
-});
-afterAll(() => fixture?.dispose());
-beforeEach(() => {
-  base = mkdtempSync(join(tmpdir(), 'release-guard-case-'));
+  // Provision/acquire are fixture setup, not release behaviours. Build them once, then copy
+  // the complete tiny topology (including objects, config, index flags, leases and journals).
+  // A filesystem snapshot also resets corrupt/missing objects and hostile config without invoking git.
+  base = join(fixtureRoot, 'case');
+  mkdirSync(base);
   poolRoot = join(base, 'pool');
   laneDir = join(poolRoot, 'releaseguard', 'lane-1');
   marker = join(laneDir, '.git', '.lane-lease');
   expect(runPool(['provision', '--count=1']).status).toBe(0);
   expect(runPool(['acquire', '--lane=1', '--no-reset']).status).toBe(0);
   lease = readFileSync(marker, 'utf8');
+  snapshotRoot = mkdtempSync(join(tmpdir(), 'release-guard-snapshot-'));
+  cpSync(fixtureRoot, join(snapshotRoot, 'fixture'), { recursive: true });
 });
-afterEach(() => {
-  rmSync(base, { recursive: true, force: true });
-  fixture.restore();
+afterAll(() => {
+  rmSync(fixtureRoot, { recursive: true, force: true });
+  if (snapshotRoot) rmSync(snapshotRoot, { recursive: true, force: true });
+});
+beforeEach(() => {
+  rmSync(fixtureRoot, { recursive: true, force: true });
+  cpSync(join(snapshotRoot, 'fixture'), fixtureRoot, { recursive: true });
 });
 
 describe.each(['--lane=1', '--all-pools'])('release unpushed guard %s', selector => {
