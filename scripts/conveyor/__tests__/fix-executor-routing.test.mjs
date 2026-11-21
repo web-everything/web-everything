@@ -1,9 +1,206 @@
 import { describe, it, expect, vi } from 'vitest';
+import { readFileSync } from 'node:fs';
+import { dirname, join } from 'node:path';
+import { fileURLToPath } from 'node:url';
+// Legacy launch assertions use shipped policy with capacity scoring switched off.
+vi.mock('../../lib/settings-files.mjs', async importOriginal => {
+  const actual = await importOriginal();
+  return { ...actual, readDeclaredSettings: options => {
+    const declared = actual.readDeclaredSettings(options);
+    return { ...declared, settings: { ...declared.settings, routing: { ...declared.settings.routing,
+      capacity: { ...declared.settings.routing?.capacity, enabled: false } } } };
+  } };
+});
 import { resolveFixExecutorSetting, chooseFixExecutor, formatFixExecutorLog } from '../../lib/fix-slot-borrow.mjs';
 import { fixDetachedProvider, fixLauncherAvailable } from '../../operations/dispatch-providers/fix.mjs';
-import { dispatchFix, roundEscalationFor, routeFixExecutor } from '../reconcile-fix-dispatch.mjs';
+import { dispatchFix, launchTableFor, roundEscalationFor, routeFixExecutor } from '../reconcile-fix-dispatch.mjs';
 
 const setting = { value: 'codex-first', source: 'default' };
+describe('configured capacity candidates reach the fix launcher', () => {
+  const now = Date.parse('2026-11-20T15:00:00Z');
+  const custom = { id: 'codex-custom', launcher: 'codex', model: 'gpt-6.1-sol', tier: 3,
+    allowedKinds: ['fix', 'ci-heal'], windowModel: 'fixed', windows: [{ name: 'five_hour', lengthHours: 5 }],
+    readers: [{ type: 'codex-rollout' }] };
+  const options = (providers = [custom]) => ({ env: { WE_CAPACITY_READERS: 'off' }, platform: {}, now,
+    // Tier exclusions need an explicit floor; shipped defaults impose no minimum.
+    repo: { routing: { builder: 'auto' }, providerCapacity: { providers, minimumTiers: { fix: 3, 'ci-heal': 3 } } }, records: [],
+    quota: () => ({ at: now, used_percent: 10, resets_at: (now + 3600000) / 1000 }), record: () => {} });
+
+  it.each(['fix', 'ci-heal'])('launches the configured model for %s through its native launcher', async kind => {
+    const { resolveFixExecutorChain } = await import('../../lib/fix-executor-chain.mjs');
+    const { effectiveBuilder } = await import('../../lib/routing-settings.mjs');
+    const { createRoutedCiHealDispatch } = await import('../../lib/fix-slot-borrow.mjs');
+    const input = { ...options(), kind };
+    expect(effectiveBuilder(input).decision).toMatchObject({ provider: 'codex-custom', reason: 'capacity-score' });
+    const chain = resolveFixExecutorChain(input);
+    const route = () => chooseFixExecutor({ setting, chain, launcherAvailable: () => true });
+    expect(route()).toMatchObject({ executor: 'codex', policyRoute: { provider: 'codex', model: custom.model } });
+    const launch = vi.fn(() => 'pid:123');
+    const log = vi.spyOn(console, 'error').mockImplementation(() => {});
+    try {
+      const planned = { pr: 42, itemNum: '42', lane: 2, laneRef: 'lane/42-x', scope: ['we:scripts/x.mjs'] };
+      if (kind === 'fix') dispatchFix(planned, {
+        root: '/repo', readBrief: () => '{{PR_NUM}} {{LANE_REF}} {{LANE}} {{SCOPE}} {{SESSION_SLUG}}',
+        readFixClaim: () => null, acquireClaim: () => ({ ok: true }), stampExecutor: vi.fn(), stampRunner: vi.fn(),
+        fixExecutorRoute: route, writeBorrowedPrompt: () => '/tmp/fix-42.md', spawnBorrowed: launch,
+        spawnAgent: () => { throw new Error('unexpected Claude launch'); },
+      });
+      else await createRoutedCiHealDispatch({
+        dispatch: async (_planned, { sinks }) => sinks.launch({ sessionSlug: 'ci-heal-42', prompt: 'P' }),
+        route, launchCodex: launch, createSinks: ({ provider }) => ({ launch: provider }),
+        writePrompt: () => '/tmp/ci-heal-42.md', removePrompt: vi.fn(), stampExecutor: vi.fn(),
+        profileFor: () => ({ slug: 'o/r' }),
+      })(planned);
+      expect(launch).toHaveBeenCalledWith(expect.objectContaining({ policyRoute: { provider: 'codex', model: custom.model } }));
+    } finally { log.mockRestore(); }
+  });
+
+  it.each([
+    ['held', { held: true }], ['inactive', { active: false }],
+    ['exhausted', { windows: [{ usedPercent: 100, resetsAt: now + 3600000 }] }],
+    ['disallowed', { allowedKinds: ['build'] }], ['below tier', { tier: 0 }],
+  ])('keeps a %s configured candidate out of the chain', async (_name, restriction) => {
+    const { resolveFixExecutorChain } = await import('../../lib/fix-executor-chain.mjs');
+    const chain = resolveFixExecutorChain({ ...options(), capacity: [{ ...custom, provider: custom.id,
+      known: true, health: 1, windows: [{ usedPercent: 10, resetsAt: now + 3600000 }], ...restriction }] });
+    expect(chooseFixExecutor({ setting, chain, launcherAvailable: () => true }).executor).toBeNull();
+  });
+
+  it('skips an unavailable configured launcher and retains the eligible Claude suffix', async () => {
+    const { resolveFixExecutorChain } = await import('../../lib/fix-executor-chain.mjs');
+    const claude = { ...custom, id: 'claude', launcher: 'claude', model: 'sonnet', readers: [] };
+    const chain = resolveFixExecutorChain({ ...options([custom, claude]), capacity: [
+      { provider: custom.id, known: true, health: 1, windows: [{ usedPercent: 10, resetsAt: now + 3600000 }] },
+      { provider: 'claude', known: true, health: 1, windows: [{ usedPercent: 10, resetsAt: now + 120 * 3600000 }] },
+    ] });
+    expect(chooseFixExecutor({ setting, chain, launcherAvailable: () => true }).executor).toBe('codex');
+    expect(chooseFixExecutor({ setting, chain, launcherAvailable: executor => executor === 'claude' }).executor).toBe('claude');
+    expect(chooseFixExecutor({ setting, chain, critical: true, takeover: true, launcherAvailable: () => true }).executor).toBe('claude');
+  });
+
+  it('maps a Claude alias to the terminal rung and preserves pinned escalation models', async () => {
+    const { resolveFixExecutorChain } = await import('../../lib/fix-executor-chain.mjs');
+    const provider = { ...custom, id: 'claude-custom', launcher: 'claude', model: 'claude-custom-model' };
+    const chain = resolveFixExecutorChain(options([provider]));
+    const decision = chooseFixExecutor({ setting, chain, launcherAvailable: () => true });
+    expect(chain.value).toEqual(['claude']);
+    expect(decision).toMatchObject({ executor: 'claude', policyRoute: { provider: 'claude', model: provider.model } });
+    const planned = { scope: ['we:src/css/site.css'] };
+    expect(launchTableFor(planned, null, { capacityRoute: decision.policyRoute }).model).toBe(provider.model);
+    for (const entry of [{ takeover: true }, { rulingNotAddressed: true }, { mainFix: true }, { strongerModel: true },
+      { scope: ['we:scripts/lib/provider-routing.mjs'] }]) {
+      expect(launchTableFor({ ...planned, ...entry }, null, { capacityRoute: decision.policyRoute }).model).not.toBe(provider.model);
+    }
+    expect(chooseFixExecutor({ setting, chain, strongerModel: true, launcherAvailable: () => true }).executor).toBe('claude');
+    for (const entry of [{ strongerModel: true }, { round: 3 }, { codexUnproductive: 2 }]) {
+      expect(chooseFixExecutor({ setting, chain, ...entry, launcherAvailable: () => true }).policyRoute).toBeUndefined();
+    }
+  });
+
+  it('projects Antigravity aliases and keeps rung definitions local to the resolved chain', async () => {
+    const { resolveFixExecutorChain, FIX_EXECUTOR_RUNGS } = await import('../../lib/fix-executor-chain.mjs');
+    const provider = { ...custom, id: 'gemini-custom', launcher: 'antigravity', model: 'gemini-4-argon-high' };
+    const chain = resolveFixExecutorChain(options([provider]));
+    expect(chooseFixExecutor({ setting, chain, launcherAvailable: () => true })).toMatchObject({
+      executor: 'antigravity', policyRoute: { provider: 'antigravity', model: provider.model },
+    });
+    expect(chooseFixExecutor({ setting, chain, launcherAvailable: () => false }).executor).toBeNull();
+    expect(Object.hasOwn(FIX_EXECUTOR_RUNGS, provider.id)).toBe(false);
+    const unknown = resolveFixExecutorChain({ ...options(), quota: () => null });
+    expect(unknown.rungs).toBeUndefined();
+    expect(chooseFixExecutor({ setting, chain: unknown, launcherAvailable: () => true }).executor).toBeNull();
+  });
+});
+describe('CI-heal capacity eligibility reaches the launch boundary', () => {
+  it('the daemon selects the independently resolved chain for the planned repair kind', () => {
+    // Keep this a filesystem path: Vite rewrites literal new URL(..., import.meta.url) as an asset URL.
+    const source = readFileSync(join(dirname(fileURLToPath(import.meta.url)), '../../../skills-src/conveyor/reconcile-fix-dispatch-daemon.mjs'), 'utf8');
+    expect(source).toContain('const chains = resolveRepairExecutorChains({ aiRouting: resolveFixChainInput() });');
+    expect(source).toContain("chain: chains[planned.kind === 'ci-heal' ? 'ci-heal' : 'fix']");
+  });
+  it.each([
+    ['kind restriction', { tier: 3, allowedKinds: ['fix'] }, false, false],
+    ['tier restriction', { tier: 1, allowedKinds: ['fix', 'ci-heal'] }, false, false],
+    ['both restrictions', { tier: 1, allowedKinds: ['fix'] }, false, false],
+    ['unknown usage', { tier: 1, allowedKinds: ['fix'] }, true, false],
+    ['no eligible executor', { tier: 1, allowedKinds: ['fix'] }, false, true],
+  ])('%s excludes Codex from CI-heal while preserving ordinary fixes', async (_name, restriction, unknown, excludeClaude) => {
+    const { resolveRepairExecutorChains } = await import('../../lib/fix-executor-chain.mjs');
+    const { PROVIDER_DEFAULTS } = await import('../../lib/provider-capacity.mjs');
+    const { createRoutedCiHealDispatch } = await import('../../lib/fix-slot-borrow.mjs');
+    const now = Date.parse('2026-11-20T15:00:00Z');
+    const providers = PROVIDER_DEFAULTS.providers.map(p => ['codex', 'codex-alt'].includes(p.id)
+      ? { ...p, ...restriction } : p.id === 'claude'
+        ? { ...p, tier: 3, allowedKinds: excludeClaude ? ['fix'] : ['fix', 'ci-heal'] } : p);
+    const capacity = [['codex', 1, 1], ['claude', 80, 120]].map(([provider, usedPercent, hours]) => ({
+      provider, health: 1, known: !unknown,
+      windows: unknown ? [] : [{ usedPercent, resetsAt: now + hours * 3600000, lengthHours: 168 }],
+    }));
+    const chains = resolveRepairExecutorChains({ env: {}, platform: {}, now, capacity,
+      repo: { routing: { builder: 'auto' }, providerCapacity: { providers, minimumTiers: { fix: 1, 'ci-heal': 3 } } },
+      quota: () => ({ used_percent: 1 }), record: () => {} });
+    expect(chains.fix.value[0]).toBe('codex');
+    const launchCodex = vi.fn(() => 'pid:1');
+    const launchClaude = vi.fn(() => ({ spawned: true }));
+    const dispatch = vi.fn(async (_planned, { sinks }) => sinks.launch({ sessionSlug: 'ci-heal-42', prompt: 'P' }));
+    const route = planned => routeFixExecutor(planned, {
+      setting, chain: chains[planned.kind ?? 'fix'], fixSettings: { strongerModelFromRound: 3 },
+      loadLadder: () => null, readRouted: () => ({}), criticalFor: () => false, launcherAvailable: () => true,
+    });
+    const run = createRoutedCiHealDispatch({ dispatch, route, launchCodex,
+      createSinks: ({ provider }) => ({ launch: provider ?? launchClaude }),
+      writePrompt: () => '/tmp/ci-heal-capacity.md', removePrompt: vi.fn(), stampExecutor: vi.fn(),
+      profileFor: () => ({ slug: 'o/r' }),
+    });
+    const log = vi.spyOn(console, 'error').mockImplementation(() => {});
+    try {
+      const result = await run({ pr: 42, scope: ['we:scripts/example.mjs'] });
+      expect(launchCodex).not.toHaveBeenCalled();
+      expect(chains['ci-heal'].value).toEqual(excludeClaude ? [] : ['claude']);
+      if (excludeClaude) {
+        expect(result.held).toBe(true);
+        expect(dispatch).not.toHaveBeenCalled();
+      } else expect(launchClaude).toHaveBeenCalledOnce();
+      expect(route({ pr: 42, kind: 'ci-heal', round: 3 }).executor).toBe(excludeClaude ? null : 'claude');
+    } finally { log.mockRestore(); }
+  });
+});
+
+it('ordinary fix starts on the capacity winner without escalating from Claude back to Codex', async () => {
+  const { resolveFixExecutorChain } = await import('../../lib/fix-executor-chain.mjs');
+  const now = Date.parse('2026-11-20T15:00:00Z');
+  const capacity = [['codex', 70, 120], ['claude', 10, 2]].map(([provider, usedPercent, hours]) => ({
+    provider, account: provider === 'claude' ? 'claude-a' : provider, health: 1, known: true,
+    windows: [{ usedPercent, resetsAt: now + hours * 3600000, lengthHours: 168 }],
+  }));
+  const chain = resolveFixExecutorChain({ repo: { routing: { builder: 'auto', capacity: { claudeUsageAccount: 'claude-a' } } },
+    platform: {}, env: {}, capacity, now, quota: () => null, record: () => {} });
+  expect(chooseFixExecutor({ setting, chain, launcherAvailable: () => true })).toMatchObject({ executor: 'claude' });
+  expect(chain.value).toEqual(['claude']);
+});
+
+it('main-fix refuses when Claude was filtered from the capacity chain or its launcher is unavailable', () => {
+  for (const value of [[], ['codex', 'codex-alt']]) {
+    expect(chooseFixExecutor({ setting, chain: { value }, mainFix: true, launcherAvailable: () => true }).executor).toBeNull();
+  }
+  expect(chooseFixExecutor({ setting, chain: { value: ['claude'] }, mainFix: true,
+    launcherAvailable: () => false }).executor).toBeNull();
+});
+
+it('ordinary fix starts at argon when the capacity winner is named agy-gemini', async () => {
+  const { resolveFixExecutorChain } = await import('../../lib/fix-executor-chain.mjs');
+  const { PROVIDER_DEFAULTS } = await import('../../lib/provider-capacity.mjs');
+  const now = Date.parse('2026-11-20T15:00:00Z');
+  const providers = PROVIDER_DEFAULTS.providers.map(p => p.id === 'agy-gemini' ? { ...p, allowedKinds: ['fix'] } : p);
+  const capacity = [['codex', 70, 120], ['agy-gemini', 1, 1]].map(([provider, usedPercent, hours]) => ({
+    provider, health: 1, known: true, windows: [{ usedPercent, resetsAt: now + hours * 3600000, lengthHours: 168 }],
+  }));
+  const chain = resolveFixExecutorChain({ repo: { routing: { builder: 'auto' }, providerCapacity: { providers },
+    fixExecutor: { fallbackChain: ['codex', 'argon', 'claude'] } }, platform: {}, env: {}, capacity, now,
+    quota: () => null, record: () => {} });
+  expect(chain.value).toEqual(['argon']);
+  expect(chooseFixExecutor({ setting, chain, launcherAvailable: () => true })).toMatchObject({ executor: 'antigravity', rung: 'argon' });
+});
 describe('fix.executor cascade', () => {
   it.each([
     [{}, setting],
@@ -177,10 +374,16 @@ describe('routed CI-heal and claim accounting', () => {
         profileFor: () => ({ slug: 'web-everything/web-everything', lanePoolRepo: '/repo' }),
       });
       const log = vi.spyOn(console, 'error').mockImplementation(() => {});
+      // Pin the native-provider fixture independently of live quota/operator readings.
+      const previousBuilder = process.env.WE_ROUTING_BUILDER;
+      process.env.WE_ROUTING_BUILDER = 'claude';
       const result = await run({ pr: 42, itemNum: '42', lane: 2, laneRef: 'lane/42-x', scope: ['we:scripts/x.mjs'] }, {
         root: '/repo', repo: 'we', readBrief: () => 'CI-heal {{PR_NUM}}', pollAttempts: () => [], readFixClaim: () => null,
         acquireClaim: () => ({ ok: true }), releaseClaim: () => {}, claimOwner: 'test-owner', stampRunner: vi.fn(), routeHeal,
-      }).finally(() => log.mockRestore());
+      }).finally(() => { log.mockRestore();
+        if (previousBuilder === undefined) delete process.env.WE_ROUTING_BUILDER;
+        else process.env.WE_ROUTING_BUILDER = previousBuilder;
+      });
       return { result, spawnAgent, launchCodex, routeHeal, log };
     };
 
@@ -610,4 +813,39 @@ describe('chain dispatch and critical scope', () => {
       expect(log.mock.calls.find(([line])=>line.includes('ruling-not-addressed rung'))[0]).toContain('model=gemini-4-argon-high');
     } finally {log.mockRestore();}
   });
+});
+
+it('executor null holds dispatchFix before claims or antigravity fallback', () => {
+  const acquireClaim = vi.fn(), spawnBorrowed = vi.fn(), spawnAgent = vi.fn();
+  const decision = { executor: null, reason: 'no eligible capacity; wait for quota reset' };
+  expect(dispatchFix({ pr: 42, itemNum: '42', lane: 2 }, {
+    root: '/repo', readFixClaim: () => null, acquireClaim, spawnBorrowed, spawnAgent,
+    fixExecutorRoute: () => decision,
+  })).toMatchObject({ held: true, reason: decision.reason });
+  expect(acquireClaim).not.toHaveBeenCalled();
+  expect(spawnBorrowed).not.toHaveBeenCalled();
+  expect(spawnAgent).not.toHaveBeenCalled();
+});
+it('executor null holds CI heal before sinks or launch', async () => {
+  const { createRoutedCiHealDispatch } = await import('../../lib/fix-slot-borrow.mjs');
+  const createSinks = vi.fn(), dispatch = vi.fn();
+  const out = await createRoutedCiHealDispatch({ route: () => ({ executor: null, reason: 'capacity held' }), createSinks, dispatch })({ pr: 42 });
+  expect(out).toEqual({ held: true, reason: 'capacity held' });
+  expect(createSinks).not.toHaveBeenCalled();
+  expect(dispatch).not.toHaveBeenCalled();
+});
+it.each([false, true])('executor null holds reconciliation before resume or dispatch (conflict=%s)', async isConflict => {
+  const { runReconcileFixDispatch } = await import('../reconcile-fix-dispatch.mjs');
+  const dispatch = vi.fn(), resume = vi.fn();
+  const out = runReconcileFixDispatch({ root: '/repo', repo: 'we', checkStaleness: () => ({ fresh: true, behind: 0 }),
+    reconcile: () => ({ dispatch: [{ kind: 'fix', prNumber: 42, headRefName: 'lane/42-x', attempts: 1, isConflict, ...(isConflict ? { reason: 'merge-status:conflicting' } : {}), files: ['scripts/x.mjs'] }], refusals: [], notes: [] }),
+    findItemFn: () => ({ num: '42', scope: ['we:scripts/x.mjs'], specPath: 'backlog/42-x.md' }),
+    loadItems: () => [], pickFreeLanes: () => [2], listBuildClaims: () => [], listFixClaims: () => [],
+    dispatchThrottle: { tryAdmit: () => ({ admit: true }) }, borrowGate: { consider: vi.fn(), clear: vi.fn() },
+    tryResume: resume, tryResumeRound: resume, dispatch,
+    fixExecutorRoute: () => ({ executor: null, reason: 'critical escalation requires Claude' }),
+  });
+  expect(out.refusals).toContainEqual(expect.objectContaining({ pr: 42, kind: 'executor-held', why: 'critical escalation requires Claude' }));
+  expect(resume).not.toHaveBeenCalled();
+  expect(dispatch).not.toHaveBeenCalled();
 });

@@ -4,8 +4,11 @@ import { appendFileSync, chmodSync, existsSync, mkdirSync, mkdtempSync, readFile
 import { spawnSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 import { realHomedir, setupHermeticTestFile } from '../hermetic-tests-vitest.mjs';
+import { makeGitOverlay } from '../hermetic-git-overlay.mjs';
+import { laneGitHardeningEnv, scrubInheritedGitEnv } from '../lane-git-hardening.mjs';
+import { assertRunnerFreshness, FRESHNESS_CACHE, FRESHNESS_REF } from '../../operations/runner-freshness.mjs';
 import {
   DEBT_ENV, GH_FIXTURE_ENV, HERMETIC_ENV, HERMETIC_MODE_ENV, HermeticAccessError, LIVE_ACCESS_MESSAGE, LIVE_GITHUB_ENV_KEYS, REAL_REPOS_ENV, REPORT_FILE_ENV, TEST_ID_ENV, TEST_NAME_ENV,
   VIOLATIONS_DIR_ENV, VIOLATIONS_FILE, buildGuardContext, classifyFetchUrl, classifyFsPath, classifyGitArgs,
@@ -14,6 +17,60 @@ import {
 } from '../hermetic-tests.mjs';
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), '..', '..', '..');
+describe('Git overlay with scrubbed repository environment', () => {
+  it('runs the real freshness fetch against the fixture after Git environment scrubbing', () => {
+    const base = mkdtempSync(join(tmpdir(), "overlay ' $(inert)-"));
+    const overlay = makeGitOverlay(ROOT, { base });
+    try {
+      const env = { ...process.env, ...overlay.env, LANE_POOL_ROOT: join(base, 'absent-pool'),
+        WE_DAEMON_MANAGED_CLONE: '', WE_OPERATION_ALLOW_STALE: '' };
+      const hardened = laneGitHardeningEnv(scrubInheritedGitEnv(env));
+      expect(hardened.GIT_DIR).toBeUndefined();
+      expect(hardened.GIT_WORK_TREE).toBeUndefined();
+      const result = spawnSync('git', ['rev-parse', '--absolute-git-dir'], {
+        cwd: ROOT, env: hardened, encoding: 'utf8', timeout: 5000,
+      });
+      expect(result.status, result.stderr).toBe(0);
+      expect(realpathSync(result.stdout.trim())).toBe(realpathSync(overlay.gitDir));
+      expect(assertRunnerFreshness({ declaration: { name: 'verify' },
+        moduleUrl: pathToFileURL(join(ROOT, 'scripts/operations/run.mjs')).href }, { env }))
+        .toEqual({ behind: 0, uncertainty: '' });
+      // A fresh cache is written only in the overlay; the fetch used its local origin.
+      expect(JSON.parse(readFileSync(join(overlay.gitDir, FRESHNESS_CACHE), 'utf8')))
+        .toMatchObject({ remote: overlay.gitDir, ref: overlay.head });
+    } finally { overlay.cleanup(); rmSync(base, { recursive: true, force: true }); }
+  });
+
+  it('does not fall back to real remote refs when the fixture ref is missing', () => {
+    const overlay = makeGitOverlay(ROOT);
+    try {
+      rmSync(join(overlay.gitDir, FRESHNESS_REF));
+      const result = spawnSync('git', ['rev-parse', '--verify', FRESHNESS_REF], {
+        cwd: ROOT, env: laneGitHardeningEnv(scrubInheritedGitEnv({ ...process.env, ...overlay.env })),
+        encoding: 'utf8', timeout: 5000,
+      });
+      expect(result.status).toBe(128);
+      expect(result.stdout).toBe('');
+    } finally { overlay.cleanup(); }
+  });
+
+  it('keeps the existing hermetic Git guard in the executable chain', () => {
+    const overlay = makeGitOverlay(ROOT);
+    try {
+      const violations = join(overlay.gitDir, 'violations');
+      const result = spawnSync('git', ['rev-parse', '--verify', FRESHNESS_REF], {
+        cwd: ROOT, encoding: 'utf8', timeout: 5000,
+        env: { ...process.env, ...overlay.env, [HERMETIC_ENV]: '1', [HERMETIC_MODE_ENV]: 'enforce',
+          [DEBT_ENV]: '', [REAL_REPOS_ENV]: realpathSync(overlay.gitDir),
+          [VIOLATIONS_DIR_ENV]: violations, [TEST_ID_ENV]: 'overlay-guard' },
+      });
+      expect(result.status).toBe(128);
+      expect(parseViolationLog(readFileSync(join(violations, VIOLATIONS_FILE), 'utf8')))
+        .toEqual([expect.objectContaining({ testId: 'overlay-guard', kind: 'git' })]);
+    } finally { overlay.cleanup(); }
+  });
+});
+
 const HOME = '/home/op';
 const SETTINGS = {
   liveSuite: { schedule: { cron: '0 * * * *', intervalHours: 1 }, tests: [] },

@@ -1,5 +1,6 @@
 import { describe, expect, it, vi } from 'vitest';
-import { readFileSync } from 'node:fs';
+import { execFileSync } from 'node:child_process';
+import { existsSync, readFileSync, mkdirSync, renameSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { withBareOrigin } from './helpers/real-repo.mjs';
@@ -10,6 +11,21 @@ import { isReadOnlyOperation } from '../registry.mjs';
 import { runOperationCli } from '../cli-adapter.mjs';
 import { createMemoryRunStore } from '../run-store.mjs';
 import * as auditIo from '../codex-audit-io.mjs';
+
+function recordingGit(ctx, trace = null) {
+  const bin = join(ctx.tmp, 'git-bin'), record = join(ctx.tmp, 'git-calls.jsonl');
+  mkdirSync(bin);
+  const realGit = execFileSync('which', ['git'], { encoding: 'utf8' }).trim();
+  writeFileSync(join(bin, 'git'), '#!/usr/bin/env node\n' +
+    "const fs = require('node:fs'), cp = require('node:child_process'), args = process.argv.slice(2);\n" +
+    "const keys = Object.entries(process.env).filter(([key]) => /^GIT_CONFIG_KEY_/.test(key)).map(([, value]) => value);\n" +
+    `fs.appendFileSync(${JSON.stringify(record)}, JSON.stringify({ args, keys }) + '\\n');\n` +
+    // Add tracing inside the observer, after production has scrubbed inherited credential tracing.
+    (trace ? `process.env.GIT_TRACE2_EVENT = ${JSON.stringify(trace)};\n` : '') +
+    `process.exit(cp.spawnSync(${JSON.stringify(realGit)}, args, { stdio: 'inherit' }).status ?? 1);\n`, { mode: 0o755 });
+  return { env: { PATH: `${bin}:${process.env.PATH}` },
+    calls: () => readFileSync(record, 'utf8').trim().split('\n').map(line => JSON.parse(line)) };
+}
 
 function fixture(options = {}) {
   const calls = [], writes = [], diagnostics = [];
@@ -39,13 +55,113 @@ function fixture(options = {}) {
 }
 
 describe('runner freshness policy', () => {
+  it.each([false, true])('freshness fetch permits credential helpers only outside a lane (lane=%s)', async laneRunner => {
+    await withBareOrigin(async ctx => {
+      const pool = join(ctx.tmp, 'pool');
+      let cwd = ctx.clone;
+      if (laneRunner) {
+        ctx.git(['push', 'origin', 'HEAD:lane/target']);
+        const at = ctx.git(['rev-parse', 'HEAD']).trim();
+        ctx.git(['checkout', '--detach', '--quiet', at]);
+        cwd = join(pool, 'repo', 'lane-1');
+        mkdirSync(join(pool, 'repo'), { recursive: true });
+        renameSync(ctx.clone, cwd);
+        writeFileSync(join(cwd, '.git', '.lane-lease'), JSON.stringify({ session: 'holder',
+          acquiredAt: new Date().toISOString(), at, branch: 'lane/target' }));
+      }
+      const observer = recordingGit(ctx);
+      expect(assertRunnerFreshness({ declaration: resolveOperation(laneRunner ? 'open-pr' : 'verify').declaration,
+        moduleUrl: pathToFileURL(join(cwd, 'run.mjs')).href }, {
+        env: { ...process.env, ...observer.env, LANE_POOL_ROOT: pool, WE_DAEMON_MANAGED_CLONE: '', WE_OPERATION_ALLOW_STALE: '' },
+      })).toEqual(laneRunner ? { exempt: true } : { behind: 0, uncertainty: '' });
+      const fetches = observer.calls().filter(call => call.args.includes('fetch'));
+      expect(fetches).toHaveLength(1);
+      const keys = fetches[0].keys;
+      expect(keys.includes('credential.helper')).toBe(laneRunner);
+      expect(keys.includes('core.askPass')).toBe(laneRunner);
+      expect(keys).toContain('core.hooksPath');
+    });
+  });
+  it.each([
+    ['attached', 'absent', true], ['attached', 'malformed', true],
+    ['attached', 'ordinary', true], ['attached', 'pinned', false],
+    ['detached', 'absent', false], ['detached', 'malformed', false],
+    ['detached', 'ordinary', true], ['detached', 'pinned', true],
+  ])('open-pr real lane regression matrix: %s HEAD, %s lease (exempt=%s)', async (head, kind, exempt) => {
+    await withBareOrigin(async ctx => {
+      ctx.git(['push', 'origin', 'HEAD:lane/target']);
+      const at = ctx.git(['rev-parse', 'HEAD']).trim();
+      if (head === 'detached') ctx.git(['checkout', '--detach', '--quiet', at]);
+      const pool = join(ctx.tmp, 'pool'), lane = join(pool, 'repo', 'lane-1');
+      mkdirSync(join(pool, 'repo'), { recursive: true });
+      renameSync(ctx.clone, lane);
+      if (kind !== 'absent') {
+        const ordinary = { session: 'holder', acquiredAt: new Date().toISOString(), ttlMinutes: 240 };
+        writeFileSync(join(lane, '.git', '.lane-lease'), kind === 'malformed' ? '{' :
+          JSON.stringify(kind === 'pinned' ? { ...ordinary, at, branch: 'lane/target' } : ordinary));
+      }
+      const check = () => assertRunnerFreshness({ declaration: resolveOperation('open-pr').declaration,
+        moduleUrl: pathToFileURL(join(lane, 'run.mjs')).href }, {
+        env: { ...process.env, LANE_POOL_ROOT: pool, WE_OPERATION_ALLOW_STALE: '1' },
+      });
+      if (exempt) expect(check()).toEqual({ exempt: true });
+      else expect(check).toThrow(/Refusing open-pr pinned runner/);
+    });
+  });
+  it('pinned runner fetch never runs a lane-configured upload-pack or follows a lane URL rewrite', async () => {
+    await withBareOrigin(async ctx => {
+      ctx.git(['push', 'origin', 'HEAD:lane/target']);
+      const at = ctx.git(['rev-parse', 'HEAD']).trim();
+      const originUrl = ctx.git(['remote', 'get-url', 'origin']).trim();
+      // A decoy whose lane/target differs: following the rewrite would read the wrong tip.
+      const decoy = join(ctx.tmp, 'decoy.git');
+      execFileSync('git', ['clone', '--quiet', '--bare', originUrl, decoy]);
+      const marker = join(ctx.tmp, 'upload-pack-ran'), uploadPack = join(ctx.tmp, 'marker-upload-pack');
+      writeFileSync(uploadPack, `#!/bin/sh\necho ran > '${marker}'\nexec git-upload-pack "$@"\n`, { mode: 0o755 });
+      ctx.git(['checkout', '--detach', '--quiet', at]);
+      ctx.git(['config', 'remote.origin.uploadpack', uploadPack]);
+      ctx.git(['config', `url.${decoy}.insteadOf`, originUrl]);
+      ctx.git(['commit', '--allow-empty', '-m', 'decoy tip', '--quiet']);
+      execFileSync('git', ['-C', ctx.clone, 'push', '--quiet', '--force', decoy, 'HEAD:refs/heads/lane/target']);
+      ctx.git(['checkout', '--detach', '--quiet', at]);
+      const pool = join(ctx.tmp, 'pool'), lane = join(pool, 'repo', 'lane-1');
+      mkdirSync(join(pool, 'repo'), { recursive: true });
+      renameSync(ctx.clone, lane);
+      writeFileSync(join(lane, '.git', '.lane-lease'), JSON.stringify({ session: 'holder',
+        acquiredAt: new Date().toISOString(), ttlMinutes: 240, at, branch: 'lane/target' }));
+      const observer = recordingGit(ctx);
+      expect(assertRunnerFreshness({ declaration: resolveOperation('open-pr').declaration,
+        moduleUrl: pathToFileURL(join(lane, 'run.mjs')).href }, {
+        env: { ...process.env, ...observer.env, LANE_POOL_ROOT: pool, WE_OPERATION_ALLOW_STALE: '' },
+      })).toEqual({ exempt: true });
+      expect(existsSync(marker)).toBe(false);
+      const fetch = observer.calls().find(call => call.args.includes('fetch'));
+      expect(fetch.args).toContain('--upload-pack=git-upload-pack');
+      expect(fetch.args).toContain('protocol.ext.allow=never');
+      expect(() => execFileSync('git', ['-C', lane, 'config', '--get-regexp', '^url\\.'], { stdio: 'pipe' })).toThrow();
+    });
+  });
+  it('scrubs repository redirection and disables lane-config executable helpers on real Git calls', async () => {
+    await withBareOrigin(async ctx => {
+      ctx.git(['config', 'core.fsmonitor', 'false']);
+      ctx.git(['config', 'core.hooksPath', '/does-not-exist']);
+      ctx.git(['config', 'core.sshCommand', 'exit 99']);
+      expect(assertRunnerFreshness({ declaration: resolveOperation('verify').declaration,
+        moduleUrl: pathToFileURL(join(ctx.clone, 'run.mjs')).href }, {
+        env: { ...process.env, GIT_DIR: '/missing-git-dir', GIT_WORK_TREE: '/missing-work-tree',
+          GIT_INDEX_FILE: '/missing-index', GIT_CONFIG_COUNT: '1', GIT_CONFIG_KEY_0: 'core.bare', GIT_CONFIG_VALUE_0: 'true',
+          LANE_POOL_ROOT: join(ctx.tmp, 'pool'), WE_DAEMON_MANAGED_CLONE: '', WE_OPERATION_ALLOW_STALE: '' },
+      })).toEqual({ behind: 0, uncertainty: '' });
+    });
+  });
   it.each(['runner', 'dispatch'])('%s freshness cannot launch automatic maintenance even when the checkout enables it', async kind => {
     await withBareOrigin(async ctx => {
       ctx.git(['config', 'maintenance.auto', 'true']);
       ctx.git(['config', 'gc.auto', '1']);
       const trace = join(ctx.tmp, 'freshness-git.jsonl');
+      const observer = kind === 'runner' ? recordingGit(ctx, trace) : null;
       const env = { ...process.env, WE_OPERATION_ALLOW_STALE: '', WE_DAEMON_MANAGED_CLONE: '',
-        LANE_POOL_ROOT: join(ctx.tmp, 'pool'), GIT_TRACE2_EVENT: trace };
+        ...observer?.env, LANE_POOL_ROOT: join(ctx.tmp, 'pool'), GIT_TRACE2_EVENT: trace };
       if (kind === 'runner') {
         const result = assertRunnerFreshness({ declaration: resolveOperation('verify').declaration,
           moduleUrl: pathToFileURL(join(ctx.clone, 'run.mjs')).href }, { env });
@@ -69,6 +185,7 @@ describe('runner freshness policy', () => {
         "ai-routing",
         "brief-mode",
         "build-priority-set",
+        "capacity-calendar",
         "ci-heal-reset",
         "claim",
         "clear-claim",

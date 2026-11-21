@@ -484,8 +484,9 @@ export function resolveRestartInFlight(env = process.env, fileConfig = loadVerif
 export function inFlightHandoff(inFlight) {
   return [...inFlight.values()]
     .filter((e) => e.pid > 0 && e.dir && e.runId)
-    .map(({ pool, lane, dir, runId, pid, sha, suites, treeHash, requestStartedAt, startedMs, logPath, leaderSettled }) =>
+    .map(({ pool, lane, dir, runId, pid, sha, suites, treeHash, local, requestStartedAt, startedMs, logPath, leaderSettled }) =>
       ({ pool, lane, dir, runId, pid, sha, suites, treeHash: treeHash ?? null, requestStartedAt: requestStartedAt ?? null, startedMs, logPath: logPath ?? null,
+        local: local === true,
         ...(leaderSettled ? { leaderSettled: true } : {}) }));
 }
 

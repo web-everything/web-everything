@@ -79,7 +79,8 @@ if (a[0] === 'api') {
 process.exit(0);
 `;
 const fakeGit = `#!/usr/bin/env node
-const a = process.argv.slice(2);
+let a = process.argv.slice(2);
+while (a[0] === '-c') a = a.slice(2);
 if (process.env.RMH_SHARED_FREEZE) {
   if (a[0] === 'ls-tree' && a.includes('red-main-freeze.json')) { process.stdout.write('red-main-freeze.json'); process.exit(0); }
   if (a[0] === 'show' && a[1]?.endsWith(':red-main-freeze.json')) { process.stdout.write(process.env.RMH_SHARED_FREEZE); process.exit(0); }

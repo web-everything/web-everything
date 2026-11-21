@@ -5,6 +5,8 @@
  *  fakes it so the suite never shells a real `git diff`/`git fetch`, even though the module's own DEFAULT is
  *  real IO — the same posture `provider`/`runJudge` already have). */
 import { describe, expect, it, vi } from 'vitest';
+import { tmpdir } from 'node:os';
+import { drainScoredGit } from '../../__tests__/fixtures/drain-scored-git.mjs';
 import {
   TARGETED_CHECK_SHAPE, buildTargetedCheckMandate, buildTargetedCheckInput, runTargetedCheck,
   planConvertAdvisoryEffects, dispatchConvertAdvisory, fetchTestGamingDiffEvidence, resolveTargetedCheckEvidence,
@@ -31,6 +33,16 @@ const d = { prNumber: 2766, headSha: HEAD, reviewedSha: HEAD, acceptComment, esc
  *  `git`, exactly like `provider`'s own default shells real `gh`). */
 const FAKE_DIFF = '--- a/scripts/operations/__tests__/review-loop-cli.test.mjs\n'
   + "+++ b/scripts/operations/__tests__/review-loop-cli.test.mjs\n-it('old case', () => {});\n+it('new case', () => {});\n";
+function localGitEvidence(cmd, args) {
+  if (cmd === 'git' && args[0] === 'remote') return 'https://github.com/web-everything/web-everything.git\n';
+  if (cmd === 'git' && args[0] === 'diff') return FAKE_DIFF; // scoped evidence read
+  if (cmd === 'git') {
+    const result = drainScoredGit(args, { gitDir: tmpdir(), head: HEAD });
+    if (result?.status === 0) return result.stdout;
+    if (args.includes('fetch')) return '';
+  }
+  throw new Error(`unexpected ${cmd} ${args.join(' ')}`);
+}
 function fakeAvailableEvidence() {
   return vi.fn(async () => ({ text: FAKE_DIFF, scored: true }));
 }
@@ -118,24 +130,23 @@ describe('fetchTestGamingDiffEvidence / resolveTargetedCheckEvidence', () => {
     expect(fetchTestGamingDiffEvidence({ rev: null, paths: ['a.test.mjs'] })).toEqual({ text: '', scored: false, reason: 'no-paths' });
   });
   it('fetchTestGamingDiffEvidence: an injected exec that resolves the basis returns the scoped diff text', () => {
-    const calls = [];
-    const exec = (cmd, args) => {
-      calls.push(args.join(' '));
-      if (args[0] === 'fetch') return '';
-      if (args[0] === 'merge-base') return 'deadbeef';
-      if (args[0] === 'diff') return FAKE_DIFF;
-      return '';
-    };
+    const exec = vi.fn(localGitEvidence);
     const result = fetchTestGamingDiffEvidence({ exec, rev: HEAD, paths: ['scripts/operations/__tests__/review-loop-cli.test.mjs'] });
-    expect(result).toEqual({ text: FAKE_DIFF, scored: true, base: 'deadbeef', rev: `origin/${HEAD}` });
-    expect(calls.some((c) => c.includes('review-loop-cli.test.mjs'))).toBe(true);
+    expect(result).toEqual({ text: FAKE_DIFF, scored: true, base: 'b'.repeat(40), rev: HEAD });
+    expect(exec.mock.calls.some(([, args]) => args.includes('cat-file') && args.includes(`${HEAD}^{commit}`))).toBe(true);
+    expect(exec.mock.calls.find(([, args]) => args[0] === 'diff')?.[1]).toEqual([
+      'diff', '--no-ext-diff', '--end-of-options', 'b'.repeat(40), HEAD, '--', 'scripts/operations/__tests__/review-loop-cli.test.mjs',
+    ]);
   });
   it('fetchTestGamingDiffEvidence: an unresolvable basis (no candidate resolves) reports scored:false', () => {
-    const exec = (cmd, args) => {
-      if (args[0] === 'fetch') return '';
-      throw new Error('fatal: bad revision');
-    };
-    expect(fetchTestGamingDiffEvidence({ exec, rev: HEAD, paths: ['x.test.mjs'] }).scored).toBe(false);
+    const exec = vi.fn((cmd, args) => {
+      if (args.includes('cat-file')) throw new Error('fatal: bad revision');
+      return localGitEvidence(cmd, args);
+    });
+    expect(fetchTestGamingDiffEvidence({ exec, rev: HEAD, paths: ['x.test.mjs'] }))
+      .toEqual({ text: '', scored: false, reason: 'ref-unresolved' });
+    expect(exec.mock.calls.some(([, args]) => args.includes('cat-file'))).toBe(true);
+    expect(exec.mock.calls.some(([, args]) => args.includes('diff'))).toBe(false);
   });
 
   it('resolveTargetedCheckEvidence: not required for an unknown escalation kind', async () => {
@@ -175,15 +186,10 @@ describe('fetchTestGamingDiffEvidence / resolveTargetedCheckEvidence', () => {
       .toMatchObject({ scored: false, reason: 'repo-not-local' });
   });
   it('fetchTestGamingDiffEvidence: a repo matching this checkout\'s origin keeps the local net-diff path', () => {
-    const exec = (cmd, args) => {
-      if (cmd === 'git' && args[0] === 'remote') return 'https://github.com/web-everything/web-everything.git\n';
-      if (args[0] === 'fetch') return '';
-      if (args[0] === 'merge-base') return 'deadbeef';
-      if (args[0] === 'diff') return FAKE_DIFF;
-      throw new Error(`unexpected ${cmd}`);
-    };
+    const exec = vi.fn(localGitEvidence);
     expect(fetchTestGamingDiffEvidence({ exec, repo: 'web-everything/web-everything', prNumber: 1, rev: HEAD, paths: ['x.test.mjs'] }))
-      .toMatchObject({ scored: true, text: FAKE_DIFF });
+      .toEqual({ scored: true, text: FAKE_DIFF, base: 'b'.repeat(40), rev: HEAD });
+    expect(exec.mock.calls.every(([cmd]) => cmd === 'git')).toBe(true);
   });
   it('resolveTargetedCheckEvidence: heal-mutual-exclusivity REQUIRES the PR comment history and hands it to the judge (PR #2781 review)', async () => {
     const heal = { kind: 'heal-mutual-exclusivity', reasonText: '**`review:accepted` removed — mutual exclusivity' };
