@@ -10,7 +10,7 @@ import { pathToFileURL } from 'node:url';
 function run({ check = true, fail = false, override = '', count = 15, exempt = false,
   body = 'Description', earlyPr = false, labelOnGreen = false, headEvidence = 'matching',
   sha = 'a'.repeat(40), remoteTip = '', remoteError = false, ancestor = true, refusePush = false,
-  pushConfig = null, dryRun = false } = {}) {
+  fetchUrls = null, pushUrls = null, dryRun = false } = {}) {
   const dir = mkdtempSync(join(tmpdir(), 'pr-land-preflight-'));
   const trace = join(dir, 'effects.jsonl');
   const root = resolve('scripts');
@@ -62,6 +62,12 @@ function run({ check = true, fail = false, override = '', count = 15, exempt = f
       if (cmd !== 'git') throw new Error('unexpected external effect: ' + cmd);
       if (args[0] === 'rev-parse') return args.includes('--absolute-git-dir') ? ${JSON.stringify(dir)} : ${JSON.stringify(sha)};
       if (args[0] === 'log') return 'fix: admission';
+      if (args[0] === 'remote' && args.includes('--all')) {
+        // get-url --all: a string is the URL list git prints; a number is a failed read with that exit status.
+        const urls = args.includes('--push') ? ${JSON.stringify(pushUrls)} : ${JSON.stringify(fetchUrls)};
+        if (typeof urls === 'number') throw Object.assign(new Error('get-url failed'), { status: urls });
+        return urls ?? 'https://github.com/web-everything/web-everything.git';
+      }
       if (args[0] === 'remote') return 'https://github.com/web-everything/web-everything.git';
       if (args[0] === 'diff') return args.includes('--name-status') ? 'M\\tblocks/example.ts' : ${JSON.stringify(exempt ? 'scripts/conveyor/worker.mjs' : 'blocks/example.ts')};
       if (args[0] === 'ls-remote') {
@@ -74,13 +80,6 @@ function run({ check = true, fail = false, override = '', count = 15, exempt = f
       }
       if (args[0] === 'push') return ${refusePush} ? execFileSync('sh', [${JSON.stringify(hook)}], { encoding: 'utf8' }) : '';
       if (args[0] === 'show') throw new Error('no ready config');
-      if (args[0] === 'config' && args[1] === '--get-regexp') {
-        // Real git: exit 1 = no matching key; any other non-zero (128 corrupt config, 6 bad regex) = unreadable.
-        const pushConfig = ${JSON.stringify(pushConfig)};
-        if (pushConfig === null) throw Object.assign(new Error('no match'), { status: 1 });
-        if (typeof pushConfig === 'number') throw Object.assign(new Error('config unreadable'), { status: pushConfig });
-        return pushConfig;
-      }
       return '';
     }; syncBuiltinESMExports(); register(${JSON.stringify(pathToFileURL(loader).href)});`);
   try {
@@ -214,15 +213,18 @@ describe('pr-land lane publish remote-tip check', () => {
     expect(stderr).not.toContain('push skipped');
   });
 
-  // Acceptance: "a separate pushurl/pushInsteadOf: never skip" — and an unreadable config never skips either.
+  // Acceptance: "a separate pushurl/pushInsteadOf: never skip" — nor several fetch URLs, nor an unreadable URL read.
+  const url = 'https://github.com/web-everything/web-everything.git';
   it.each([
-    ['remote.origin.pushurl', 'remote.origin.pushurl git@github.com:fork/web-everything.git'],
-    ['url.<base>.pushinsteadof', 'url.git@github.com:fork/.pushinsteadof https://github.com/web-everything/'],
-    ['config read exit 128 (corrupt)', 128],
-    ['config read exit 6 (bad regex)', 6],
-  ])('origin equals HEAD but %s: never skips, pushes exactly once', (_name, pushConfig) => {
-    const { status, result, effects, stderr } = publish({ remoteTip: tip(sha), pushConfig, refusePush: true });
-    expect(effects.some(([cmd, args]) => cmd === 'git' && args[0] === 'config' && args[1] === '--get-regexp')).toBe(true);
+    ['a pushurl (or pushInsteadOf rewrite) differs', { pushUrls: 'git@github.com:fork/web-everything.git' }],
+    ['two remote.origin.url values (ls-remote sees only the first)', { fetchUrls: `${url}\nhttps://mirror.test/we.git`, pushUrls: `${url}\nhttps://mirror.test/we.git` }],
+    ['two push URLs', { pushUrls: `${url}\ngit@github.com:fork/web-everything.git` }],
+    ['an empty push URL read', { pushUrls: '' }],
+    ['the fetch URL read fails (exit 128)', { fetchUrls: 128 }],
+    ['the push URL read fails (exit 2)', { pushUrls: 2 }],
+  ])('origin equals HEAD but %s: never skips, pushes exactly once', (_name, urls) => {
+    const { status, result, effects, stderr } = publish({ remoteTip: tip(sha), ...urls, refusePush: true });
+    expect(effects).toContainEqual(['git', ['remote', 'get-url', '--all', 'origin']]);
     expect(pushes(effects)).toEqual([['git', ['push', 'origin', `${sha}:refs/heads/lane/preflight`]]]);
     expect(status).toBe(3);
     expect(result.reason).toBe('push-failed');
@@ -239,8 +241,8 @@ describe('pr-land lane publish remote-tip check', () => {
 
   it.each([
     ['origin behind', { remoteTip: tip(different) }],
-    ['pushurl configured', { remoteTip: tip(sha), pushConfig: 'remote.origin.pushurl git@github.com:fork/x.git' }],
-    ['config unreadable', { remoteTip: tip(sha), pushConfig: 128 }],
+    ['pushurl configured', { remoteTip: tip(sha), pushUrls: 'git@github.com:fork/x.git' }],
+    ['push URL unreadable', { remoteTip: tip(sha), pushUrls: 128 }],
   ])('dry-run plan keeps the push line when %s', (_name, options) => {
     const { status, result, effects } = publish({ dryRun: true, ...options });
     expect(status).toBe(0);

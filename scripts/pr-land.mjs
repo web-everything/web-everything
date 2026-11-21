@@ -965,13 +965,16 @@ async function runCli() {
     const remoteTipMatch = /^([0-9a-f]{40})\t([^\r\n]+)$/i.exec(remoteTipLine ?? '');
     const remoteTip = remoteTipMatch?.[2] === remoteHeadRef ? remoteTipMatch[1] : null;
     const validRefSha = /^[0-9a-f]{40}$/i.test(refSha);
-    // A separate push destination (pushurl / pushInsteadOf) means the fetch-side tip proves nothing about it: never skip.
-    // Fail closed: only git's exit 1 ("no matching key") proves there is none; any other read failure
-    // (128 corrupt config, 6 bad regex, spawn error) counts as a split push config.
+    // ls-remote reads only the FIRST fetch URL, while push goes to every push URL (pushurl, pushInsteadOf,
+    // or several remote.<name>.url values). Skip only when git itself resolves exactly one fetch URL and
+    // exactly one, identical, push URL. `remote get-url` applies insteadOf/pushInsteadOf rewrites and ignores
+    // a GIT_CONFIG override that `git config` alone would honour. Any read failure fails closed (never skip).
     let splitPushConfig;
     try {
-      splitPushConfig = gitC(['config', '--get-regexp', `^(remote\\.${REMOTE.replace(/[^\w-]/g, '\\$&')}\\.pushurl|url\\..*\\.pushinsteadof)$`]).trim() !== '';
-    } catch (e) { splitPushConfig = e?.status !== 1; }
+      const urls = args => gitC(['remote', 'get-url', ...args, '--all', REMOTE]).split('\n').map(s => s.trim()).filter(Boolean);
+      const fetchUrls = urls([]), pushUrls = urls(['--push']);
+      splitPushConfig = !(fetchUrls.length === 1 && pushUrls.length === 1 && fetchUrls[0] === pushUrls[0]);
+    } catch { splitPushConfig = true; }
     return { remoteTip, validRefSha, alreadyPublished: validRefSha && remoteTip === refSha && !splitPushConfig };
   }
 
