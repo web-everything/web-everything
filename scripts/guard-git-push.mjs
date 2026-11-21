@@ -14,11 +14,32 @@
  * guard — is `MAIN_PUSH_OK=1` in the env (pr-land sets it on its sanctioned main-pushes). A hook is bypassable
  * with `git push --no-verify`; that is accepted defence-in-depth alongside the Bash guard + branch protection.
  *
+ * A runner acquired with `--at` is pinned for verification, not building: its lease blocks ALL pushes,
+ * including explicit detached-HEAD refspecs after a worker commit. MAIN_PUSH_OK overrides only main's lock.
  * The decision is a pure function so it is unit-tested (scripts/__tests__/guard-git-push.test.mjs) without git.
  */
 import { readFileSync } from 'node:fs';
+import { execFileSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { resolve } from 'node:path';
+import { LEASE_FILENAME } from './lib/lane-lease.mjs';
+
+/** Read checkout-local lease evidence, including Git worktrees. Only a missing marker means no lease. */
+export function readPushLease({ cwd = process.cwd(), exec = execFileSync, read = readFileSync } = {}) {
+  const path = exec('git', ['rev-parse', '--git-path', LEASE_FILENAME], {
+    cwd, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: 5000, maxBuffer: 65536,
+  }).trim();
+  if (!path) throw new Error('empty lease path');
+  let contents;
+  try { contents = read(resolve(cwd, path), 'utf8'); }
+  catch (error) {
+    if (error.code === 'ENOENT') return null;
+    throw error;
+  }
+  const lease = JSON.parse(contents);
+  if (!lease || typeof lease !== 'object' || Array.isArray(lease)) throw new Error('lease marker must contain a JSON object');
+  return lease;
+}
 
 /**
  * The remote refs in a pre-push stdin payload that target the protected branch. Pure. git feeds pre-push one
@@ -41,9 +62,16 @@ export function mainPushRefs(stdin, { protectedBranch = 'main' } = {}) {
 /**
  * The pre-push block decision. Pure. Returns a REASON string when the push must be rejected, else null.
  * @param {string} stdin  the raw pre-push stdin payload
- * @param {{override?:boolean, protectedBranch?:string}} opts  override = MAIN_PUSH_OK=1 was set
+ * @param {{override?:boolean, protectedBranch?:string, lease?:object, leaseReadError?:boolean}} opts
+ *   override = MAIN_PUSH_OK=1 was set; it never bypasses a pinned or unreadable lease.
  */
-export function pushGuardDecision(stdin, { override = false, protectedBranch = 'main' } = {}) {
+export function pushGuardDecision(stdin, { override = false, protectedBranch = 'main', lease = null, leaseReadError = false } = {}) {
+  if (leaseReadError) return 'pre-push BLOCKED: cannot read lane lease; inspect repository lease metadata and retry.';
+  // Do not expire this protection or compare at to HEAD: a worker may have committed or checked out away
+  // from the pin. Only the pool release/recovery path should clear the pinned runner's lease.
+  if (lease && Object.hasOwn(lease, 'at')) {
+    return 'pre-push BLOCKED: this pinned runner cannot push. Use a fresh build lane for changes; release the runner through lane-pool when finished.';
+  }
   if (override) return null;
   const refs = mainPushRefs(stdin, { protectedBranch });
   if (refs.length === 0) return null;
@@ -57,7 +85,9 @@ const IS_CLI = process.argv[1] && resolve(process.argv[1]) === resolve(fileURLTo
 if (IS_CLI) {
   let stdin = '';
   try { stdin = readFileSync(0, 'utf8'); } catch { stdin = ''; } // no readable stdin → nothing to block (fail-open on read error)
-  const reason = pushGuardDecision(stdin, { override: process.env.MAIN_PUSH_OK === '1' });
+  let lease = null, leaseReadError = false;
+  try { lease = readPushLease(); } catch { leaseReadError = true; }
+  const reason = pushGuardDecision(stdin, { override: process.env.MAIN_PUSH_OK === '1', lease, leaseReadError });
   if (reason) { process.stderr.write(`✗ ${reason}\n`); process.exit(1); }
   process.exit(0);
 }
