@@ -433,7 +433,7 @@ describe('exhaustive restrictive registry projection', () => {
 });
 
 
-const sampleName = pattern => pattern.replace('*', 'SEC1_PROBE');
+const sampleName = pattern => pattern.replaceAll('*', 'SEC1_PROBE');
 const neverRules = Object.entries(registry).filter(([, rule]) => rule.never);
 const parityRules = Object.entries(registry).filter(([, rule]) => !rule.never
   && !rule.restrictiveValues && !rule.restrictivePrefixes);

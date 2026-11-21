@@ -299,6 +299,7 @@
   "WE_CI_HEAL_BUDGET_RESTORE": {"class": "drop", "why": "Value-dependent: refuses budget refunds that would allow extra heals; other values stay dropped. Evidence: scripts/conveyor/ci-heal-mark.mjs:84.", "restrictiveValues": ["0", "false"]},
   "WE_CI_HEAL_CODEQL_OWN_BUDGET": {"class": "drop", "why": "Value-dependent: charges CodeQL heals against the shared cap; other values stay dropped. Evidence: scripts/conveyor/ci-heal-mark.mjs:143.", "restrictiveValues": ["0", "false"]},
   "WE_CI_HEAL_INFRA_CANCELLED": {"class": "drop", "why": "Caller override is not required by the agent; keep the owning tool default."},
+  "WE_CI_HEAL_INTERVAL_SEC": {"class": "drop", "why": "Caller override is not required by the agent; keep the owning tool default."},
   "WE_CI_HEAL_RESERVE": {"class": "drop", "why": "Caller override is not required by the agent; keep the owning tool default."},
   "WE_CI_HEAL_STALE_BASE_REFRESH_FIRST": {"class": "drop", "why": "Caller override is not required by the agent; keep the owning tool default."},
   "WE_CI_HUNG_JOB_MINUTES": {"class": "drop", "why": "Caller override is not required by the agent; keep the owning tool default."},
