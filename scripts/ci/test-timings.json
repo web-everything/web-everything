@@ -2414,6 +2414,7 @@
   "scripts/conveyor/soak/breaks/timings-advisory-merge.soak.test.mjs": 2,
   "scripts/conveyor/soak/breaks/superseded-omits-retired-merged-overlay.soak.test.mjs": 2,
   "scripts/conveyor/soak/breaks/smoke-queue-force-priority.soak.test.mjs": 1,
+  "scripts/conveyor/soak/breaks/capacity-routing-ignores-expiring-quota.soak.test.mjs": 0.1,
   "scripts/conveyor/soak/breaks/daemon-git-developer-dir.soak.test.mjs": 1,
   "scripts/conveyor/soak/breaks/watchdog-pr-list-transient-retry.soak.test.mjs": 3,
   "scripts/conveyor/soak/breaks/mq-unreadable-log-single-retry.soak.test.mjs": 1

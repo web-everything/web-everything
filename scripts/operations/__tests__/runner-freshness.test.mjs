@@ -185,6 +185,7 @@ describe('runner freshness policy', () => {
         "ai-routing",
         "brief-mode",
         "build-priority-set",
+        "capacity-calendar",
         "ci-heal-reset",
         "claim",
         "clear-claim",

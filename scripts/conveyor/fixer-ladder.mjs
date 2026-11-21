@@ -37,6 +37,8 @@ const EFFORT_RANK = ['low', 'medium', 'high', 'xhigh', 'max', 'ultra'];
 export function loadFixerLadder({
   path, read, routingPolicy = readRoutingPolicy(), externalFixProviders = EXTERNAL_FIX_PROVIDERS,
   override, // injectable: skip the file
+  capacity, now, // injectable observations and clock; production reads live capacity
+  providerCapacity, // legacy injectable capacity settings; pinned routes bypass capacity scoring
   aiRouting, operatorKeys, // optional resolver input (fix coordinator slice); absent = unchanged
 } = {}) {
   if (aiRouting !== undefined && !Array.isArray(operatorKeys)) throw new TypeError('aiRouting requires operatorKeys from the policy snapshot');
@@ -45,11 +47,12 @@ export function loadFixerLadder({
   const gateClosed = routingPolicy.criticalWorkGate.kinds.includes('fix');
   const providers = ['claude', ...externalFixProviders];
   const routes = {};
+  const routeErrors = [];
   for (const rung of policy.rungs) {
     if (rung.action !== 'dispatch') continue;
     if (!rung.taskType) { routes[rung.id] = null; continue; }
     try {
-      const base = { operation: 'fix', taskType: rung.taskType, available: providers, gateClosed, policy: routingPolicy };
+      const base = { operation: 'fix', taskType: rung.taskType, available: providers, gateClosed, policy: routingPolicy, providerCapacity, capacity, now };
       routes[rung.id] = resolveOperationRoute(base);
       // aiRouting may only RAISE a rung's effort on the same provider and model: an escalation rung is never weakened.
       if (aiRouting !== undefined && routes[rung.id]) {
@@ -59,9 +62,12 @@ export function loadFixerLadder({
           && rank(routed.effort) >= rank(routes[rung.id].effort)) routes[rung.id] = routed;
       }
     }
-    catch { routes[rung.id] = undefined; } // no route at all: unavailable
+    catch (error) {
+      if (aiRouting !== undefined && routes[rung.id]) routeErrors.push(`${rung.id}: ${error.message}`);
+      routes[rung.id] = undefined; // no route at all: unavailable
+    }
   }
   const available = (rung) => rung.action !== 'dispatch' || (!rung.taskType
     ? true : routes[rung.id] != null && routes[rung.id].provider === rung.provider);
-  return { policy, error: error ?? fromFile.error ?? null, routes, available, humanAt: humanAtMisses(policy, { available }) };
+  return { policy, error: [error, fromFile.error, ...routeErrors].filter(Boolean).join('; ') || null, routes, available, humanAt: humanAtMisses(policy, { available }) };
 }

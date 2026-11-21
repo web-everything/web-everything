@@ -67,10 +67,13 @@ export function chooseFixExecutor({ setting = { value: 'codex-first', source: 'd
   if (setting.value === 'claude') return claude('fix.executor=claude');
   if (setting.value === 'provider-routing') return claude('existing provider routing');
   const available = typeof launcherAvailable === 'function' ? executor => launcherAvailable(executor, entry) : executor => executor === 'codex' ? launcherAvailable : true;
+  if (chain && entry.mainFix && (!chain.value.includes('claude') || !available('claude'))) {
+    return { executor: null, reason: 'main-fix requires Claude; no eligible capacity or launcher — wait for quota reset or clear provider hold', source: chain.source ?? source };
+  }
   if (chain && setting.value === 'codex-first' && !entry.mainFix) {
     const trigger = entry.takeover ? 'takeover' : entry.rulingNotAddressed ? 'ruling-not-addressed'
       : entry.strongerModel || (entry.round ?? 1) >= 3 ? 'stronger-model' : null;
-    return { ...pickChainRung({ chain: chain.value, trigger, codexUnproductive: entry.codexUnproductive,
+    return { ...pickChainRung({ chain: chain.value, rungs: chain.rungs, trigger, codexUnproductive: entry.codexUnproductive,
       critical, criticalClaudeFromRung: chain.criticalClaudeFromRung, criticalSource: chain.criticalClaudeFromRungSource,
       launcherAvailable: available }), source: chain.source ?? 'default' };
   }
@@ -110,6 +113,7 @@ export function createRoutedCiHealDispatch({ dispatch, route, createSinks, launc
       if (gate?.held) return { held: true, reason: gate.reason };
     }
     const decision = route({ ...planned, repo: options.repo ?? planned.repo ?? 'we', kind: 'ci-heal' });
+    if (decision.executor === null) return { held: true, reason: decision.reason };
     const nonClaude = decision.executor !== 'claude';
     const sinks = createSinks({ ...options, ...(nonClaude ? { provider: (request) => {
       console.error(`reconcile-fix-dispatch: PR #${planned.pr} ${formatFixExecutorLog(decision)}`);

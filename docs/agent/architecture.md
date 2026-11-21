@@ -70,3 +70,101 @@ for (const injector of element.injectors()) console.log(injector.providers); // 
 const r = registry.parse('expr'); console.log(r.success, r.expressions, r.remaining); // parser
 ```
 Subclass `CustomAttribute` and log in `connectedCallback`/`disconnectedCallback` to trace lifecycle.
+
+## Capacity routing and reset calendar
+
+Build-only `routing.builder=auto` scores accounts independently. Audit and review seats retain their
+own routing. `scripts/settings/provider-capacity.json` owns provider/model tiers, launchers, allowed
+build kinds, reserves, readers, window models and account inventories. Add a model as one entry;
+`quotaOf` aliases share observations and never add horizon capacity. Override `providerCapacity`
+through the shared declared reader and policy-cascade (standard → platform → tool → environment;
+operator preferences use the platform layer). Arrays replace as a whole. Effective values and sources
+use the normal cascade log. `routing.capacity` owns global pacing weights, working hours, reset
+thresholds and demand assumptions. Unknown readings never score; unknown horizons require operator
+input. All-readers-unknown preserves the historical builder threshold only for an eligible fallback.
+If measured providers are excluded, an eligible unknown legacy fallback (then native Claude) may
+run without a capacity score or account attribution. Holds, tier and kind restrictions still apply.
+
+The pure `scripts/lib/capacity-planner.mjs` handles fixed-window end-of-window burn, rolling usage
+rates and restart-on-reset inventories. Each manual reset restores a full window and forfeits the
+remainder. Banked resets on hand are authoritative: grant cadence is informational and never enters
+planning. Expiry deadlines use cumulative current remainder plus banked capacity, earliest expiry
+first; the tightest deadline sets the required rate. With banked resets, pace and score pressure
+compare current rate against this required rate, rather than the plain window curve. Codex uses
+a bounded usage-ledger slope over `routing.capacity.rateLookbackHours` (default 24); at least
+two observations in the current window are required. Drops in usage or changed reset timestamps
+start a new window, including in historical rows without reset metadata. Other providers use
+the recent decision-ledger slope. Unknown rates remain unknown. Shortfalls boost routing up to `maxBurnBoost`
+(default 3) and emit a deduped burn event requesting queued audits, red teams and backlog builds.
+This event requests work; it does not change audit/review provider selection.
+
+`routing.capacity.workingHours` defaults to 09:00–20:00 America/New_York, weekdays 1–5.
+Recommendations compare previous-slot forfeiture against the banked expiry loss from throttling
+until the next slot; both costs appear in the calendar. Reset alerts require queued demand and
+`resetAtPercent` (default 95), and occur only in working hours. Receipts dedupe by account/window
+and event type. Telemetry failures never interrupt dispatch. Oversized inventories (>1000 resets)
+require operator correction rather than generating an unbounded plan.
+
+`node scripts/operations/run.mjs capacity-calendar [--json] [--horizon]` shows observations,
+planner actions, rate pressure, reset choices, missing operator inputs and a 14-day forecast.
+`expectedDemandPerDay` is percent-of-window units per account/provider (null means unknown).
+Horizon days run midnight-to-midnight in `workingHours.tz`, including DST transitions. Banked
+resets contribute capacity on their planner-selected working day, earliest expiry first; absent
+forecast demand, the observed burn rate projects reset timing while expected demand stays unknown.
+For restart-on-reset windows a consumed manual reset replaces the old natural reset with a full
+window from that point; fixed windows retain their original schedule.
+Inactive accounts never route or contribute capacity; sustained shortfall on three working days
+(`activateAfterShortfallDays`) recommends activation. Banked inventory alone does not guarantee
+demand coverage: working-hour deferrals can cause a shortfall before the next reset. Inventory-only
+fixtures must supply continuous working hours. The shared Claude usage file maps only to
+`routing.capacity.claudeUsageAccount`; null leaves both accounts unknown. Until launchers select accounts, routing scores only the account attributed to the live reader.
+An unattributed multi-account provider is unknown. Account IDs appear only in the capacity decision
+log, never in executable route results (follow-up: account-aware provider launchers).
+
+`fix:critical-work` and `fix:ruling-escalation-stronger` remain Claude-only pins to opus and sonnet
+respectively, exactly as declared in routing policy. Pinned routes bypass capacity scoring entirely;
+capacity cannot select or change their provider/model. Explicit takeover and ruling-not-addressed
+routes also remain Claude policy data.
+
+
+
+### Capacity routing safety
+
+Capacity ranks provider/model candidates; the normal routing gate, holds, vetoes, disabled-provider
+and model validation still apply. Projection preserves configured effort, disabled providers and
+other policy fields, and never changes non-build operations such as prepare-decision. Candidates
+are tried in order; unknown fallback usage never competes against a scored candidate. Known rejected
+capacity holds with named reasons and a wait/reset/clear-hold fallback. Apply capacity eligibility
+both to route selection and to every returned fallback rung: the pure router's `available` input
+constrains its selected route, but does not filter its returned fallback list.
+A closed critical-work gate permits only Claude, including for fixes; a Codex-only route refuses.
+Provider tiers remain capacity data for other configured minimum-tier constraints.
+Critical takeover and ruling-not-addressed send-backs remain Claude-only and hold when Claude is unavailable.
+Escalation removes held, exhausted, inactive, reserve-only, disallowed and below-minimum providers,
+then starts at the capacity winner and retains the suffix of the configured chain. This prevents
+escalation from Claude back to Codex. Main-fix requires an eligible, available Claude rung.
+Configured capacity winners with new provider IDs receive a per-resolution rung using their
+launcher and model, inserted at that launcher's position before filtering the suffix. Native
+Claude aliases use the terminal Claude rung; ordinary fixes carry their model into the launch
+table, while critical work and escalation retain their policy models. These rung definitions
+travel with the resolved chain and never mutate the shared default rung registry.
+When every reader is unknown the historical effective-builder chain applies (Claude drops Codex).
+`routing.capacity.operatorReadingMaxAgeHours` defaults to 24 and follows the normal cascade with
+`capacitySources` provenance. Older operator readings never supply quota; the calendar reports
+“operator reading stale — refresh”. Refresh the reading, restore live quota, or wait for reset/clear
+holds when routing refuses. A chain decision with `executor:null` holds every launch and resume caller.
+Timestamped Codex readings use the same freshness bound as other live readers. Persisted rollout
+files supply their modification time when the event has no timestamp; a timestamp-free injected
+Codex reading retains legacy precedence over an operator seed because its age is unproven.
+Account IDs use the provider ID grammar, and dedupe receipts hash the full event identity to keep
+all receipt writes within the capacity state directory, including directly injected observations.
+
+When critical or unproductive escalation requires Claude but filtering removed Claude, the chain
+holds instead of continuing on Codex. An invalid AI overlay makes the fixer-ladder rung unavailable
+and surfaces its error. Routing tests consume shipped defaults; injected capacity observations or
+the capacity enable switch isolate quota-dependent and legacy paths without replacing route data.
+`readTick` accepts `routingOptions` for hermetic dispatch tests: supply the routing policy,
+repo settings, isolated preferences environment, capacity snapshot, quota reader and decision
+recorder together. A Claude-only launcher fixture must not consume live Codex quota: auto
+capacity can otherwise select Codex and make the fixture refuse at launch. Omitted options
+retain production settings, host observations and decision persistence.

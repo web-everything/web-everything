@@ -1,5 +1,7 @@
 import { NO_PROMPT_COMMAND_RULES } from '../../lib/no-prompt-command-rules.mjs';
 import { applyTestsFirstPolicy } from '../../lib/tests-first-policy.mjs';
+import { DEFAULT_ROUTING_POLICY } from '../../lib/dispatch-routing-policy.mjs';
+import { PROVIDER_DEFAULTS, readProviderCapacity } from '../../lib/provider-capacity.mjs';
 /**
  * @file dispatch-lane.test.mjs — the effect that STARTS rather than completes (#3037, under epic #3029).
  *
@@ -2875,6 +2877,14 @@ describe('#3165: the planner\'s prepare lists reach the spawner', () => {
 // are stubbed.
 
 describe('#3332: the planner\'s fix and CI-heal lists reach the spawner', () => {
+  let routingDir;
+  beforeAll(() => { routingDir = mkdtempSync(join(tmpdir(), 'we-dispatch-routing-')); });
+  afterAll(() => { rmSync(routingDir, { recursive: true, force: true }); });
+  // Native argv assertions stub launcher availability to Claude. Keep quota, settings and
+  // persistence hermetic too: host Codex usage must not select an unavailable test launcher.
+  const unknownCapacity = readProviderCapacity({ now: Date.parse(NOW), readers: {}, settings: {
+    providers: PROVIDER_DEFAULTS.providers.map(p => ({ ...p, accounts: undefined, operatorReading: undefined })),
+  } });
   /** A tick as the core returns one, with the asked item/PR in exactly ONE of the five launch lists. */
   function tickWith(list, row) {
     return {
@@ -2930,6 +2940,11 @@ describe('#3332: the planner\'s fix and CI-heal lists reach the spawner', () => 
         listInFlightDispatches: () => ({ runs: [], unreadable: 0 }),
         listAgents: () => [],
         laneRefForPr: () => laneRef,
+        routingOptions: {
+          env: { WE_PLATFORM_PREFERENCES_FILE: join(routingDir, 'absent-preferences.json') },
+          repo: { routing: { builder: 'auto' } }, routingPolicy: DEFAULT_ROUTING_POLICY,
+          now: Date.parse(NOW), capacity: unknownCapacity, quota: () => null, record: () => {},
+        },
         // #3457/#3460 — same stub as the earlier `dispatchThrough` above, and for the same reason.
         checkAlreadyDone: () => ({ done: false, pr: null, checked: false }),
         checkBuildDelivery: () => null,
@@ -2972,6 +2987,7 @@ describe('#3332: the planner\'s fix and CI-heal lists reach the spawner', () => 
     });
     expect(spawned).toHaveLength(1);
     expect(run.verdict).toMatchObject({ dispatching: true, launchKind: 'fix', lane: 5, sessionSlug: 'fix-701' });
+    expect(run.findings.read.routing).toMatchObject({ outcome: 'routed', executed: 'claude' });
     const prompt = spawned[0].argv[spawned[0].argv.length - 1];
     expect(prompt).toBe(expectedPrompt('fix', {
       ITEM_NUM: '2608', PR_NUM: 701, LANE_REF: FAKE_LANE_REF, LANE: 5, SESSION_SLUG: 'fix-701', SCOPE: 'we:scripts/operations/',
@@ -3004,6 +3020,7 @@ describe('#3332: the planner\'s fix and CI-heal lists reach the spawner', () => 
     });
     expect(spawned).toHaveLength(1);
     expect(run.verdict).toMatchObject({ dispatching: true, launchKind: 'ci-heal', lane: 6, sessionSlug: 'ci-heal-743' });
+    expect(run.findings.read.routing).toMatchObject({ outcome: 'routed', executed: 'claude' });
     const prompt = spawned[0].argv[spawned[0].argv.length - 1];
     expect(prompt).toBe(expectedPrompt('ci-heal', {
       ITEM_NUM: '2638', PR_NUM: 743, LANE_REF: FAKE_LANE_REF, LANE: 6, SESSION_SLUG: 'ci-heal-743',
