@@ -222,6 +222,15 @@ it.each([false, true])('fsyncs and closes the parent directory after rename (syn
   const f = fixture();
   const events = [];
   let directoryFd;
+  const closeSync = fs.closeSync;
+  const close = vi.spyOn(fs, 'closeSync').mockImplementation(fd => {
+    closeSync(fd);
+    if (fd === directoryFd) {
+      // A successful real close proves cleanup; fstat could observe a reused fd number.
+      events.push('directory-close');
+      directoryFd = undefined;
+    }
+  });
   f.options.rename = (src, dest) => { events.push('rename'); fs.renameSync(src, dest); };
   f.options.fsync = fd => {
     if (fs.fstatSync(fd).isDirectory()) {
@@ -231,9 +240,10 @@ it.each([false, true])('fsyncs and closes the parent directory after rename (syn
     } else events.push('file-fsync');
     fs.fsyncSync(fd);
   };
-  const result = await f.command();
-  expect(events).toEqual(['file-fsync', 'rename', 'directory-fsync']);
-  expect(() => fs.fstatSync(directoryFd)).toThrow();
+  let result;
+  try { result = await f.command(); }
+  finally { close.mockRestore(); }
+  expect(events).toEqual(['file-fsync', 'rename', 'directory-fsync', 'directory-close']);
   if (fail) {
     expect(result.code).not.toBe(0);
     expect(result.lines.join('\n')).toContain('directory fsync refused');
