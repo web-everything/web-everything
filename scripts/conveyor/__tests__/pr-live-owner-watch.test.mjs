@@ -6,6 +6,10 @@ import { tmpdir } from 'node:os';
 import { classifyOwner, planActions, processLive, selfAudit, detectSmells, runLiveOwnerWatchPass, probeLiveOwnerWatch, LIVE_OWNER_DEFAULTS } from '../pr-live-owner-watch.mjs';
 import { feedTail, resolveLiveOwnerSettings, createLiveOwnerWatchIo } from '../pr-live-owner-watch-io.mjs';
 import { keepAliveScript } from '../../lib/test-keepalive.mjs';
+// Load the cyclic review graph during collection; its first lazy import inside an
+// adapter test can stall Vite's evaluator and consume the test's entire deadline.
+import * as reviewJob from '../../operations/review-job.mjs';
+import { dispatchManualPass } from '../../operations/manual-daemon-pass-io.mjs';
 
 const NOW = Date.parse('2026-11-10T18:00:00Z'), MIN = 60_000;
 const ago = minutes => new Date(NOW - minutes * MIN).toISOString();
@@ -564,7 +568,6 @@ describe('portable feed IO and settings', () => {
     expect(adapters.dispatchManualPass).not.toHaveBeenCalled();
   });
   it('review rechecks live head after reconcile and records the expected head on a refused intent', async () => {
-    const { dispatchManualPass } = await import('../../operations/manual-daemon-pass-io.mjs');
     let liveHead = pr().headRefOid;
     const dispatchReviewByMode = vi.fn(), readGhText = commentGh();
     const adapters = await reviewAdapters({
@@ -715,16 +718,14 @@ describe('portable feed IO and settings', () => {
     expect(() => feedTail(path, { read })).toThrow(/short tail read.*operator must inspect full input/);
   });
   it.each(['review-dispatch', 'red-team-dispatch'])('%s job refuses a head changed after the manual precheck through the production dispatcher', async action => {
-    const real = await import('../../operations/review-job.mjs');
-    const { dispatchManualPass } = await import('../../operations/manual-daemon-pass-io.mjs');
     const spawnJob = vi.fn(() => ({ pid: 4242 })), seen = [], outcomes = [];
     // The job-side live head moved after the precheck; nothing here can launch a real job.
     const jobOpts = { io: { liveHead: () => 'b'.repeat(40) }, spawnJob, checkoutExists: () => false,
       stackCheck: () => ({ base: null }), readCompletion: () => null };
     const record = result => { outcomes.push(result); return result; };
-    const loadReviewJob = async () => ({ ...real,
-      dispatchReviewByMode: opts => { seen.push(opts); return record(real.dispatchReviewByMode({ ...opts, ...jobOpts })); },
-      dispatchReviewJob: opts => { seen.push(opts); return record(real.dispatchReviewJob({ ...opts, ...jobOpts })); } });
+    const loadReviewJob = async () => ({ ...reviewJob,
+      dispatchReviewByMode: opts => { seen.push(opts); return record(reviewJob.dispatchReviewByMode({ ...opts, ...jobOpts })); },
+      dispatchReviewJob: opts => { seen.push(opts); return record(reviewJob.dispatchReviewJob({ ...opts, ...jobOpts })); } });
     const { io } = await localIo({ loadReviewJob, readGhText: commentGh(), readAgents: () => [],
       // Keep the stub loader even if production passes none, so this test never reaches a real launcher.
       dispatchManualPass: (input, opts) => dispatchManualPass(input, { ...opts, load: opts.load ?? loadReviewJob }),
