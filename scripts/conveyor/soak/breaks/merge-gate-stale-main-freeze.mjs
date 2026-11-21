@@ -30,7 +30,7 @@ export default {
     const { executeOwedCiReruns } = await load('scripts/conveyor/owed-ci-rerun-executor.mjs');
     const { dispatchTimeoutRetry } = await load('scripts/operations/ci-heal-pr-dispatch.mjs');
     const dir = mkdtempSync(join(process.env.TMPDIR, 'stale-freeze-soak-'));
-    const violations = [], head = 'a'.repeat(40), repo = 'web-everything/web-everything';
+    const violations = [], head = 'a'.repeat(40), repo = 'soak-owner/soak-repo';
     let writes = 0;
     const log = ['#7266: HOLD', ...GATE_IDS.map(id => id === 'red-main-freeze'
       ? `  hold  ${id}  main is RED (freeze: main CI red since ${head})` : `  pass  ${id}  ok`), 'merge-gate: HOLD — held'].join('\n');
