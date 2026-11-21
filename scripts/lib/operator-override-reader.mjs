@@ -48,13 +48,19 @@ export function failClosedCapacity(key, value, { codeDefault, log = console.erro
   warn(log, `operator-override: operator-db-unreadable ${key}; using finite stricter value ${result}`);
   return result;
 }
+/** Enum-valued host overrides (on/off style settings): key -> the only allowed values. Anything else is refused. */
+export const ENUM_LEAVES = Object.freeze({
+  'ciHeal.loop': Object.freeze(['off', 'on']),
+});
+export const isEnumLeaf = key => Object.hasOwn(ENUM_LEAVES, key);
+export const validEnumValue = (key, value) => isEnumLeaf(key) && typeof value === 'string' && ENUM_LEAVES[key].includes(value);
 export const OPERATOR_OVERRIDES_RELATIVE_PATH = '.claude/operator-overrides.json';
 // userInfo().homedir comes from the account database, not $HOME, so a launcher cannot redirect the host-wide store.
 export const operatorOverridesPath = () => join(userInfo().homedir, OPERATOR_OVERRIDES_RELATIVE_PATH);
 const safe = s => String(s).replace(/[\x00-\x1f\x7f-\x9f]/g, ' ');
 function warn(log, message) { try { log(safe(message)); } catch { /* Diagnostics never break reads. */ } }
 export function validateKey(key) {
-  if (!Object.hasOwn(CAPACITY_LEAVES, key)) throw Error(`operator-override: refused ${key}; guard leaves need the signed-attestation slice`);
+  if (!Object.hasOwn(CAPACITY_LEAVES, key) && !isEnumLeaf(key)) throw Error(`operator-override: refused ${key}; guard leaves need the signed-attestation slice`);
 }
 /** `normalize: false` returns the stored values without lowering an inverted floor (the writer audits against them). */
 export function readOperatorOverrides({ file, log = console.error, normalize = true } = {}) {
@@ -74,8 +80,10 @@ export function readOperatorOverrides({ file, log = console.error, normalize = t
     return { readable: false, values: {} };
   }
   const values = {};
+  const enums = {};
   const invalidPolicies = new Set();
   for (const [key, value] of Object.entries(data)) {
+    if (isEnumLeaf(key) && validEnumValue(key, value)) { enums[key] = value; continue; }
     const known = Object.hasOwn(CAPACITY_LEAVES, key);
     if (!known || !CAPACITY_LEAVES[key].validate(value)) {
       const policy = key.split('.')[0];
@@ -89,5 +97,5 @@ export function readOperatorOverrides({ file, log = console.error, normalize = t
   if (normalize && values['resourceGate.fixCap.ceiling'] < values['resourceGate.fixCap.floor']) {
     values['resourceGate.fixCap.floor'] = values['resourceGate.fixCap.ceiling'];
   }
-  return { readable: true, values, ...(invalidPolicies.size ? { invalidPolicies: [...invalidPolicies] } : {}) };
+  return { readable: true, values, ...(Object.keys(enums).length ? { enums } : {}), ...(invalidPolicies.size ? { invalidPolicies: [...invalidPolicies] } : {}) };
 }
