@@ -108,6 +108,34 @@ describe(`superseded-omits-live-overlay: ${seat} (18:06 ET discard)`, () => {
 });
 
 describe('addOverlay dependsOn', () => {
+  it('refuses to use a re-registered successor declaration for an older carried tip', async () => {
+    const { mkdtempSync, rmSync } = await import('node:fs');
+    const { tmpdir } = await import('node:os');
+    const { join } = await import('node:path');
+    const { addOverlay, readOverlays } = await import('../../daemon-overlays.mjs');
+    const { readyOverlayDependencies } = await import('../prepare.mjs');
+    const root = mkdtempSync(join(tmpdir(), 'overlay-deps-successor-'));
+    const env = { ...process.env, WE_DAEMON_OVERLAY_DIR: join(root, 'overlays') };
+    try {
+      addOverlay(root, { ref: 'lane/base' }, { env });
+      addOverlay(root, { ref: 'lane/app', pr: 101, dependsOn: ['lane/base'] }, { env });
+      const candidate = ready();
+      candidate.adopt.applied = [{ ref: 'lane/app', sha: SHA('a') }];
+      // The branch fast-forwards from A to C; C's declaration cannot describe carried A.
+      addOverlay(root, { ref: 'lane/app', pr: 101, dependsOn: [] }, { env });
+      const overlays = readOverlays(root, { env });
+      const chainOf = Object.assign(() => [], { fresh: new Map([[101, []]]) });
+      const dependencies = await readyOverlayDependencies({
+        applied: candidate.adopt.applied, overlays, tipOf: () => SHA('c'), chainOf,
+      });
+      expect.soft(dependencies.has('lane/app')).toBe(false);
+      expect(matchReadyCandidate(args({ ready: candidate,
+        liveApplied: [{ ref: 'lane/base', sha: SHA('b') }], carries: () => false,
+        readdable: (ref) => overlays.some((o) => o.ref === ref),
+        dependsOn: (ref) => dependencies.get(ref) ?? null,
+      }))).toMatchObject({ adopt: null, reason: 'superseded-omits-live-overlay: lane/base', omitted: ['lane/base'] });
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  });
   it('invalidates an unstated declaration on re-registration, including a changed stack', async () => {
     const { mkdtempSync, rmSync } = await import('node:fs');
     const { tmpdir } = await import('node:os');

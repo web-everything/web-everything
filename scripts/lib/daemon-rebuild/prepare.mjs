@@ -50,8 +50,8 @@ export function readOverlayEventLog(root, env) {
 /** Resolve dependency evidence for the candidate's exact tips from the tick-start registrations.
  * Normal callers do not declare dependsOn: a completely resolved live PR base chain supplies it instead.
  * makePrBaseChain.fresh contains only complete lookups, never cached/partial/failed chains. Such a lookup
- * describes the current tip, so it cannot assert independence of an older carried tip. Explicit declarations
- * and recorded stack bases are always respected; malformed evidence never falls back to an empty list. */
+ * describes the current tip, as does an explicit declaration; neither proves an older carried tip's dependencies.
+ * Recorded stack bases are always respected; malformed evidence never falls back to an empty list. */
 export async function readyOverlayDependencies({ applied, overlays, chainOf, tipOf }) {
   const result = new Map();
   const valid = (xs) => Array.isArray(xs) && xs.every(isSafeBranchName);
@@ -64,7 +64,7 @@ export async function readyOverlayDependencies({ applied, overlays, chainOf, tip
     }
     const fresh = chainOf.fresh?.get(entry.pr);
     const current = a.sha && tipOf(a.ref) === a.sha;
-    const deps = entry.dependsOn ?? (current && valid(fresh) ? fresh : null);
+    const deps = current ? (entry.dependsOn ?? (valid(fresh) ? fresh : null)) : null;
     if (!valid(deps)) continue;
     // A declaration of [] cannot override a known stack dependency.
     if (fresh !== undefined && !valid(fresh)) continue;

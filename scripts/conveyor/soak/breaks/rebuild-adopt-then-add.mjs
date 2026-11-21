@@ -179,6 +179,25 @@ export async function registryContractViolations(sourceRoot = REPO_ROOT) {
       dependsOn: (ref) => dependencies.get(ref) ?? null }));
     if (!match.adopt) violations.push({ invariant: 'real-registration-adopts', detail: match.reason });
 
+    // A carried A depended on the live overlay. After fast-forwarding to C, a new [] declaration
+    // and an empty fresh chain describe C only; they cannot authorize dropping A's dependency.
+    addOverlay(root, { ref: 'lane/a', pr: 100, dependsOn: ['lane/review-seat-fairness-m1'] }, { env });
+    const olderCandidate = base().ready;
+    addOverlay(root, { ref: 'lane/a', pr: 100, dependsOn: [] }, { env });
+    const successorDependencies = await readyOverlayDependencies({
+      applied: olderCandidate.adopt.applied, overlays: readOverlays(root, { env }), chainOf, tipOf: () => SHA('c'),
+    });
+    if (successorDependencies.has('lane/a')) {
+      violations.push({ invariant: 'successor-declaration-not-carried-proof', detail: 'C supplied dependency evidence for A' });
+    }
+    const olderMatch = matchReadyCandidate(base({ ...omitsLive, ready: olderCandidate,
+      readdable: (ref) => readOverlays(root, { env }).some((o) => o.ref === ref),
+      dependsOn: (ref) => successorDependencies.get(ref) ?? null,
+    }));
+    if (olderMatch.adopt || olderMatch.reason !== 'superseded-omits-live-overlay: lane/review-seat-fairness-m1') {
+      violations.push({ invariant: 'older-carried-dependency-omission-refused', detail: JSON.stringify(olderMatch) });
+    }
+
     // Explicit operator pins survive unregister/re-register churn. Registration alone cannot
     // authorize a temporary omission; prepare's production closure is covered by operator-retirement.test.mjs.
     const pinnedRef = 'lane/review-seat-fairness-m1';
