@@ -1132,7 +1132,9 @@ async function runCli() {
   const remoteTipMatch = /^([0-9a-f]{40})\t([^\r\n]+)$/i.exec(remoteTipLine ?? '');
   const remoteTip = remoteTipMatch?.[2] === remoteHeadRef ? remoteTipMatch[1] : null;
   const validRefSha = /^[0-9a-f]{40}$/i.test(refSha);
-  const alreadyPublished = validRefSha && remoteTip === refSha;
+  // A separate push destination (pushurl / pushInsteadOf) means the fetch-side tip proves nothing about it: never skip.
+  const splitPushConfig = (tryGit(['config', '--get-regexp', `^(remote\\.${REMOTE.replace(/[^\w-]/g, '\\$&')}\\.pushurl|url\\..*\\.pushinsteadof)$`]) ?? '').trim() !== '';
+  const alreadyPublished = validRefSha && remoteTip === refSha && !splitPushConfig;
   if (alreadyPublished) {
     process.stderr.write(`pr-land [${REPO}] · push skipped: ${REMOTE} already at ${refSha}\n`);
   } else if (validRefSha && remoteTip) {
