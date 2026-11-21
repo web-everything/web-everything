@@ -1,6 +1,6 @@
 /** Fast mechanical executor: no fixer slots or fix-pass budget. */
 import { dispatchTimeoutRetry } from '../operations/ci-heal-pr-dispatch.mjs';
-import { assertMainNotStale, checkMainStaleness, gitRun } from '../lib/main-staleness.mjs';
+import { gitRun } from '../lib/main-staleness.mjs';
 import { REPO_ROOT } from '../operations/dispatch-lane-io.mjs';
 import { cascadePolicy } from '../lib/policy-cascade.mjs';
 
@@ -14,6 +14,17 @@ export function resolveOwedRerunMax(env = process.env) {
   }).value.maxPerPass;
 }
 
+/** Reads origin/main with a hardened git environment; { fresh:true, sha } only when the fetched sha verifies. */
+export function probeOriginMain(root = REPO_ROOT, run = gitRun) {
+  const env = { ...process.env, GIT_NO_REPLACE_OBJECTS: '1', GIT_GRAFT_FILE: '/dev/null' };
+  for (const k of ['GIT_DIR', 'GIT_WORK_TREE', 'GIT_INDEX_FILE', 'GIT_OBJECT_DIRECTORY', 'GIT_ALTERNATE_OBJECT_DIRECTORIES']) delete env[k];
+  const opts = { cwd: root, env };
+  if (run(['fetch', 'origin', 'main', '--quiet'], opts).status !== 0) return { offline: true };
+  const rev = run(['rev-parse', '--verify', 'origin/main^{commit}'], opts);
+  const sha = rev.status === 0 ? rev.stdout.trim() : '';
+  return /^[0-9a-f]{40}$/.test(sha) ? { fresh: true, sha } : { offline: true };
+}
+
 export async function executeOwedCiReruns({ rows = [], repo, dispatchRetry = dispatchTimeoutRetry,
   max = resolveOwedRerunMax(), log = () => {}, root = REPO_ROOT, checkStaleness,
 } = {}) {
@@ -25,16 +36,16 @@ export async function executeOwedCiReruns({ rows = [], repo, dispatchRetry = dis
       .sort((a, b) => Number(a.prNumber) - Number(b.prNumber));
     result.skippedOverCap = Math.max(0, owed.length - cap);
     if (result.skippedOverCap) safeLog(`owed-ci-rerun: ${result.skippedOverCap} over cap ${cap}; still owed next review tick`);
-    // Unknown freshness (fetch failed) is NOT fresh here: the shared guard is fail-open on `offline`, a rerun is not.
-    const probe = checkStaleness ?? (r => checkMainStaleness({ base: 'main', autoFf: process.env.WE_DAEMON_MANAGED_CLONE !== '1',
-      cleanOnly: true, run: args => gitRun(args, { cwd: r }) }));
-    const strictCheck = r => {
-      const st = probe(r);
-      if (st?.offline) throw new Error('main freshness unknown (offline); owed rerun deferred');
-      return st;
-    };
-    try { if (owed.length) assertMainNotStale(root, strictCheck); }
-    catch (error) {
+    // The rerun is a stateless API request (no file in the PR or the clone is written), so the daemon's own clone
+    // being N commits behind must not refuse it (2026-11-21 live). It only needs origin/main to be readable
+    // (fail-closed when offline); the head is re-observed by dispatchRetry just before the POST.
+    const probe = checkStaleness ?? probeOriginMain;
+    try {
+      if (owed.length) {
+        const st = probe(root);
+        if (!st || st.offline) throw new Error('main freshness unknown (offline); owed rerun deferred');
+      }
+    } catch (error) {
       result.refused = owed.map(row => ({ pr: row.prNumber, reason: String(error?.message ?? error) }));
       result.skippedOverCap = 0;
       return result;

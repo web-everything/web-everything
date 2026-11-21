@@ -298,6 +298,22 @@ describe('ci-red-recovery-watch — sweepCiRedRecovery (dry run, apply: false by
     expect(result.applied[1]).toMatchObject({ deferred: true, ok: false, budgetExhausted: true });
   });
 
+  // 2026-11-21 live: 20 owed PRs with slow comment reads outlasted the 300 s pass deadline (SIGTERM, no refresh).
+  it('ci-red-recovery-watch-tick-fits-deadline: slow comment reads stop at the discovery budget and still apply a refresh', () => {
+    const prs = Array.from({ length: 20 }, (_, i) => ({ ...PR_2635, number: 2800 + i, headRefName: `lane/w${i}` }));
+    let t = 0;
+    const readComments = vi.fn(() => { t += 30_000; return []; });
+    const refresh = vi.fn(() => { t += 5_000; return { ok: true, action: 'rebased' }; });
+    const result = sweepCiRedRecovery({
+      readOpenPrs: () => prs, readMainRuns: () => MAIN_RUNS, readAheadBy: () => 33, readComments,
+      refresh, postComment: vi.fn(), apply: true, now: () => t,
+    });
+    expect(t).toBeLessThan(300_000);
+    expect(readComments.mock.calls.length).toBeLessThan(20);
+    expect(refresh).toHaveBeenCalled();
+    expect(result.applied.some((a) => a.action === 'rebased')).toBe(true);
+  });
+
   // Review round 2 of #6340: `started` was bumped before the refresh ran, so a refresh that came back deferred
   // (no work done) still spent the floor and the cap, and every later PR in the tick was starved.
   it.each([

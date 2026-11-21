@@ -256,7 +256,7 @@ export function sweepCiRedRecovery({
   // 2026-11-03 live: the first apply tick after main went green refreshed PRs until the 300 s pass deadline
   // SIGTERMed it mid-batch. The apply loop stops STARTING refreshes once the budget (measured from the tick's
   // start, so discovery counts) or the per-tick batch cap is spent; the rest wait for the next tick.
-  now = Date.now, applyBudgetMs = resolveApplyBudgetMs(), maxApplyPerTick = resolveMaxApplyPerTick(),
+  now = Date.now, applyBudgetMs = resolveApplyBudgetMs(), discoveryBudgetMs = Math.max(applyBudgetMs, 120_000),maxApplyPerTick = resolveMaxApplyPerTick(),
   // Review round 4 of #6340: ticks are stateless, so slow free deferrals at the front of a stable queue spent every
   // tick's budget and the refreshable PR behind them was never tried. `applyLedger` ({ read, write }, see
   // {@link createFileApplyLedger}) remembers which PRs were attempted so the next tick starts with the
@@ -296,10 +296,22 @@ export function sweepCiRedRecovery({
   // PR #2793 review — a check green on main's latest run is NOT enough on its own: the candidate also needs the
   // per-PR evidence `isMainGreenFixOwed` requires (lacks that green commit; check not already green at its merge
   // base), read only for a candidate this path could actually admit.
-  const candidates = rawCandidates.map((c) => {
+  // 2026-11-21 live: discovery (one comment read per owed PR) outlasted the 300 s pass deadline and the pass was
+  // SIGTERMed before any refresh. Discovery now has its own budget (measured from the tick's start): once spent, and
+  // after at least one PR was fully read, the remaining PRs are left for the next tick (no reads, not planned).
+  // Least-recently-attempted PRs are discovered first (same ledger as the apply loop) so the tail is not starved.
+  let discoverySeen = {};
+  try { if (apply && applyLedger) discoverySeen = normalizeApplyLedger(applyLedger.read()).at; } catch { /* fairness only */ }
+  const discoveryOrder = rawCandidates.map((c, i) => ({ c, i, seen: discoverySeen[String(c.prNumber)] ?? 0 }))
+    .sort((a, b) => a.seen - b.seen || a.i - b.i).map((x) => x.c);
+  let discoveryReads = 0;
+  const readCommentsTimed = (prNumber, opts) => { discoveryReads += 1; return readComments(prNumber, opts); };
+  const discovered = discoveryOrder.map((c) => {
+    // Floor of 4 fully-read PRs: a few deferrals (cross-repo, claim-held) must not leave no refreshable PR in the plan.
+    if (discoveryReads >= 4 && now() - tickStartedAt >= discoveryBudgetMs) return { ...c, discoveryDeferred: true };
     let exhaustionComments;
     if (exhaustedRetrySettings?.enabled && exhaustedRetrySettings.maxRetries > 0) {
-      exhaustionComments = readComments(c.prNumber, { repo });
+      exhaustionComments = readCommentsTimed(c.prNumber, { repo });
       c = { ...c, comments: exhaustionComments, exhaustion: exhaustionFacts({ comments: exhaustionComments, ciHealBudget, ciHealCap, headSha: c.headSha }) };
     }
     if (!(c.aheadBy > 0)) return c;
@@ -314,7 +326,7 @@ export function sweepCiRedRecovery({
         // The gate is the shared classifier's own (never a private label signal: this pass does not fetch labels, so
         // the old `needsHuman` gate never fired and #4368's recorded main-defect escalation went unseen).
         if (classifierNeedsComments({ failingCheckName: c.failingCheckName, mainLatestCheckRuns, prContainsMainGreenSha: withFacts.prContainsMainGreenSha })) {
-          comments ??= readComments(c.prNumber, { repo });
+          comments ??= readCommentsTimed(c.prNumber, { repo });
           withFacts.comments = comments;
         }
       }
@@ -329,9 +341,10 @@ export function sweepCiRedRecovery({
         }
       }
     }
-    comments ??= readComments(c.prNumber, { repo });
+    comments ??= readCommentsTimed(c.prNumber, { repo });
     return { ...withFacts, comments, rebaseAttemptsForSha: countRebaseOntoMainComments(comments, c.headSha, { mainRedWindows, mainGreen }) };
   });
+  const candidates = discovered.filter((c) => !c.discoveryDeferred);
   // xd3dkzx — mainRuns (with per-check verdicts) so recovery is judged on the PR's own failing check.
   // Card xu1nixv — the red-main fix PRs (published priority record) are never told to wait for main.
   const prio = readPriority();
