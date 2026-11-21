@@ -57,22 +57,19 @@ export function withdrawnRevocations({ env = process.env, fs = nodeFs, warn = co
   for (let i = 0; i < lines.length; i++) {
     const line = lines[i];
     if (!line.trim()) continue;
-    let count = 1, parsed;
+    let count = 1, parsed, rejoined = false;
     try { parsed = JSON.parse(line); } catch {
       // A record split by a raw newline inside a string: rejoin with an escaped newline (at most 3 following lines).
       for (let k = 1; k <= 3 && i + k < lines.length; k++) {
         try { parsed = JSON.parse(lines.slice(i, i + k + 1).join('\\n')); count = k + 1; break; } catch { /* keep trying */ }
       }
-      if (parsed !== undefined) {
-        warnOther(`WARNING: waiver request log lines ${i + 1}-${i + count}: record split by a raw newline; rejoined`);
-        // A newline inside an identity field would defeat ref/sha/ruling matching: treat as damaged, never as a record.
-        if (parsed && typeof parsed === 'object' && ['ref', 'sha', 'ruling'].some(f => typeof parsed[f] === 'string' && /[\r\n]/.test(parsed[f]))) parsed = { ...parsed, ruling: undefined };
-      }
+      // A rejoined record only attributes the damage (which ref it blocks); it is never an approval or a revocation.
+      if (parsed !== undefined) rejoined = true;
     }
     const first = i;
     i += count - 1;
     try {
-      if (parsed === undefined) throw Error('unparseable');
+      if (parsed === undefined || rejoined) throw Error('unparseable');
       let request = parsed;
       // Legacy withdrawal shape {withdrawn:true,ref,sha,reason}: exactly this shape reads as WITHDRAWN.
       if (request && typeof request === 'object' && !Array.isArray(request)

@@ -114,22 +114,22 @@ describe('ops ruled-weakened evidence', () => {
       it('rejoins a record split by a raw newline inside a string (shaped like lines 222/223)', () => {
         const full = JSON.stringify({ ruling: 'WITHDRAWN', ref: 'lane/fix', sha: SHA, findings: 'a\nb', reason: 'r' });
         requests(full.replace('\\n', '\n'));
-        const { warn, warnOther } = scoped('lane/fix');
-        expect(warn).not.toHaveBeenCalled();
-        expect(warnOther).toHaveBeenCalledTimes(1);
-        append();
-        expect(union()).toEqual([]);
+        // Attributes the damage to its parsed ref: blocks that ref, only reports for another.
+        expect(scoped('lane/fix').warn).toHaveBeenCalledTimes(1);
+        const other = scoped('lane/other');
+        expect(other.warn).not.toHaveBeenCalled();
+        expect(other.warnOther).toHaveBeenCalledTimes(1);
       });
-      it('a rejoined record with a newline inside ref or ruling is damaged and blocks; a rejoin is reported', () => {
-        for (const over of [{ ref: 'lane/\nfix' }, { ruling: 'WITHDRAWN\n' }]) {
-          requests(JSON.stringify({ ruling: 'WITHDRAWN', ref: 'lane/fix', sha: SHA, findings: 'a\nb', ...over }).replace('\\n', '\n'));
-          const { warn } = scoped('lane/fix');
-          expect(warn).toHaveBeenCalledTimes(1);
-          fs.rmSync(join(home, 'workspace'), { recursive: true, force: true });
-        }
-        const split = JSON.stringify({ ruling: 'WITHDRAWN', ref: 'lane/fix', sha: SHA, findings: 'a\nb' }).replace('\\n', '\n');
-        requests(split);
-        expect(scoped('lane/fix').warnOther).toHaveBeenCalledTimes(1);
+      it('a rejoined APPROVED record for ref R does not make R waivable and blocks R; a rejoined WITHDRAWN never revokes', () => {
+        const split = o => JSON.stringify({ ref: 'lane/fix', sha: SHA, findings: 'a\nb', ...o }).replace('\\n', '\n');
+        requests(split({ ruling: 'APPROVED' }));
+        const { warn } = scoped('lane/fix');
+        expect(warn).toHaveBeenCalledTimes(1);
+        expect(withdrawnRevocations({ fs, env, warn: () => {} })(entry())).toBe(false);
+        fs.rmSync(join(home, 'workspace'), { recursive: true, force: true });
+        requests(split({ ruling: 'WITHDRAWN' }));
+        expect(scoped('lane/fix').warn).toHaveBeenCalledTimes(1);
+        expect(withdrawnRevocations({ fs, env, warn: () => {} })(entry())).toBe(false);
       });
       it('a split record whose join does not parse stays unattributable and blocks', () => {
         requests('{"ref":"lane/other","sha":"' + SHA + '","findings":"a', 'b', 'c', 'd', 'e', 'never closed');
