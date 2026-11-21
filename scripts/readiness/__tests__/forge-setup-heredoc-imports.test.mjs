@@ -1,35 +1,57 @@
 // @vitest-environment node
-import {it, expect, vi} from 'vitest';
-import {readFileSync} from 'node:fs';
-import {basename} from 'node:path';
+import {it, expect} from 'vitest';
+import {readFileSync, mkdtempSync, writeFileSync} from 'node:fs';
+import {basename, join} from 'node:path';
+import {tmpdir} from 'node:os';
+import {fileURLToPath} from 'node:url';
+import {spawnSync} from 'node:child_process';
 
 const source = readFileSync(new URL('../forge-setup.sh', import.meta.url), 'utf8');
 const heredocs = [...source.matchAll(/^([^\n]*\bnode --input-type=module[^\n]*?)\s*<<-?\s*['"]?(\w+)['"]?\s*\n([\s\S]*?)^\2\s*$/gm)]
   .map(([, command, marker, body]) => ({command, marker, body}));
 
-it('finds module heredocs and verifies every named import against real source exports', async () => {
-  expect(heredocs.length).toBeGreaterThan(0);
-  let checked = 0;
+it('no module heredoc imports names from the installed bundle or a non-export of the source', async () => {
   for (const {marker, body} of heredocs) {
-    const imports = [
-      ...[...body.matchAll(/import\s*\{([^}]+)\}\s*from\s*['"]([^'"]+)['"]/g)]
-        .map(([, names, spec]) => ({names, spec, dynamic: false})),
-      ...[...body.matchAll(/const\s*\{([^}]+)\}\s*=\s*await\s+import\(([\s\S]*?forge-exec-run\.mjs[\s\S]*?)\);/g)]
-        .map(([, names, spec]) => ({names, spec, dynamic: true})),
-    ];
-    for (const {names, spec, dynamic} of imports) {
-      const module = await import(dynamic ? '../forge-exec-run.mjs'
-        : spec.startsWith('node:') ? spec : new URL('../' + basename(spec), import.meta.url).href);
+    for (const [, names, spec] of body.matchAll(/import\s*\{([^}]+)\}\s*from\s*['"]([^'"]+)['"]/g)) {
+      // The installed CLI bundle strips exports, even when its source exports them.
+      expect(spec.startsWith('/usr/local/libexec/'), `${marker}: named import from installed CLI ${spec}`).toBe(false);
+      if (spec.startsWith('node:')) continue;
+      const module = await import(new URL('../' + basename(spec), import.meta.url).href);
       for (const binding of names.split(',')) {
         const name = binding.trim().split(/\s+as\s+|\s*:\s*/)[0];
         expect(Object.hasOwn(module, name), `${marker}: ${name} is not exported by ${spec}`).toBe(true);
-        checked++;
       }
-      // The installed CLI bundle strips exports, even when its source exports them.
-      expect(spec.startsWith('/usr/local/libexec/'), `${marker}: named import from installed CLI ${spec}`).toBe(false);
     }
   }
-  expect(checked).toBeGreaterThan(0);
+});
+
+it('the egress check runs the installed runner CLI and the bundle built as forge-setup builds it reaches egressReady', () => {
+  expect(source).not.toContain("<<'EGRESS_CHECK'");
+  const check = source.match(/^\/usr\/local\/libexec\/forge-exec-run\.mjs egress-self-check "\$\{slot_uids\[@\]\}"$/m);
+  expect(check).not.toBeNull();
+  expect(source.indexOf(check[0])).toBeLessThan(source.indexOf("<<'ENABLE_SLOTS'"));
+  // Run the REAL bundle() function from the WRAPPER step, writing to a scratch dir.
+  const start = source.indexOf('        import re, json');
+  const end = source.indexOf('        installed = [');
+  expect(start).toBeGreaterThan(-1);
+  expect(end).toBeGreaterThan(start);
+  const dir = mkdtempSync(join(tmpdir(), 'forge-bundle-'));
+  const here = fileURLToPath(new URL('..', import.meta.url));
+  const py = 'import os, sys\nsource_dir = sys.argv[1]\n' + source.slice(start, end).split('\n').map(l => l.slice(8)).join('\n')
+    + '\nopen(sys.argv[2], "w").write(bundle("forge-exec-run.mjs"))\n';
+  const pyFile = join(dir, 'bundle.py');
+  writeFileSync(pyFile, py);
+  const out = join(dir, 'forge-exec-run.mjs');
+  const built = spawnSync('python3', ['-I', pyFile, here, out], {encoding: 'utf8', timeout: 30000});
+  expect(built.status, built.stderr).toBe(0);
+  expect(readFileSync(out, 'utf8')).not.toMatch(/^export /m);
+  // Bad uid: rejected by the self-check itself, proving the flag exists in the bundle.
+  const bad = spawnSync('node', [out, 'egress-self-check', 'x'], {encoding: 'utf8', timeout: 30000});
+  expect(bad.stderr).toContain('Invalid egress-self-check uids');
+  // Good uid: must reach egressReady, which fails closed here (no forge egress table on a test host).
+  const good = spawnSync('node', [out, 'egress-self-check', '101'], {encoding: 'utf8', timeout: 30000});
+  expect(good.status).not.toBe(0);
+  expect(good.stderr).toMatch(/Egress (table|rules)/);
 });
 
 it('validates pending sudoers before publishing the final sudoers file', () => {
@@ -69,29 +91,4 @@ it('rewrites fixed unit paths and enables the same unit names on retry', () => {
     expect(units).toContain(`/etc/systemd/system/${timer}.timer`);
     expect(source).toContain(`systemctl enable --now ${timer}.timer`);
   }
-});
-
-it('checks every UID with the source runner and fails closed before sudoers publication', async () => {
-  const egress = heredocs.find(({marker}) => marker === 'EGRESS_CHECK');
-  expect(egress).toBeDefined();
-  expect(egress.command).toContain('"$(cd -- "$(dirname -- "$0")" && pwd)" "${slot_uids[@]}"');
-  expect(egress.body).toContain("pathToFileURL(path.join(dir, 'forge-exec-run.mjs')).href");
-  expect(source.indexOf("<<'EGRESS_CHECK'")).toBeLessThan(source.indexOf("<<'ENABLE_SLOTS'"));
-  // No test seams (testRoot etc.) may reach the production factory: they disable the real nft probe.
-  expect(egress.body).toContain('createRunner();');
-  expect(egress.body).not.toMatch(/createRunner\(\s*[^\s)]/);
-  // Inject only the runner factory; execute the actual argv slicing and probe loop.
-  const body = egress.body
-    .replace(/^import[^\n]+;\n/gm, '')
-    .replace(/^const \{createRunner\} = await import\([^\n]+;\n/gm, '');
-  const run = new (Object.getPrototypeOf(async function () {}).constructor)('process', 'createRunner', body);
-  const argv = ['node', '-', '/repo/scripts/readiness', '101', '102', '103'];
-  const egressReady = vi.fn().mockResolvedValue(undefined);
-  const factoryArgs = [];
-  await run({argv}, (...args) => { factoryArgs.push(args); return {egressReady}; });
-  expect(factoryArgs).toEqual([[]]);
-  expect(egressReady.mock.calls).toEqual([[101], [102], [103]]);
-  egressReady.mockReset().mockResolvedValueOnce(undefined).mockRejectedValueOnce(new Error('uncovered UID'));
-  await expect(run({argv}, () => ({egressReady}))).rejects.toThrow('uncovered UID');
-  expect(egressReady.mock.calls).toEqual([[101], [102]]);
 });
