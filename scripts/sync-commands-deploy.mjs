@@ -71,7 +71,8 @@ function main(argv) {
   // parseArgs is shared with the skills deploy, which also accepts `--only=<names>`; there are no named
   // units here, so accepting it silently would be a flag that does nothing. Reject it explicitly.
   if (argv.some((a) => a.startsWith('--only='))) throw new Error('sync-commands-deploy: --only is meaningless here (commands deploy as one unit)');
-  const { check: checkOnly, dryRun, prune, all } = parseArgs(argv);
+  const { check: checkOnly, dryRun, prune, all, roots } = parseArgs(argv);
+  if (roots.length) throw new Error('sync-commands-deploy: --root is not supported (single source root)');
   const destRoot = deployRoot();
   const plan = buildCommandsPlan({ destRoot, all, prune });
 

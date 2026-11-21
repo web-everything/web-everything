@@ -270,7 +270,7 @@ export function buildPlans({ srcRoot = SRC_ROOT, extraRoots = [], destRoot, only
     const destDir = path.join(destRoot, name);
     const trackedRel = gitTrackedFiles(srcDir, entry.repoRoot);
     // A never-committed skill dir is drift in every mode: it can never deploy, and silence hid it (21:33 ET gap).
-    if (trackedRel.length === 0) {
+    if (!trackedRel.includes('SKILL.md')) {
       plans.push({ name, srcDir, destDir, destRoot, actions: [], stale: [], pruned: prune, alreadyDeployed: fs.existsSync(destDir), untracked: true });
       continue;
     }
@@ -335,7 +335,12 @@ async function main() {
   // Extra roots: --root=<dir> (repeatable) and WE_SKILLS_EXTRA_ROOTS (path-delimited, e.g. plateau-ops/skills).
   const envRoots = (process.env.WE_SKILLS_EXTRA_ROOTS || '').split(path.delimiter).filter(Boolean);
   const defaultOps = path.join(os.homedir(), 'workspace', 'plateau-ops', 'skills'); // default second home
-  const extraRoots = [...(process.env.WE_SKILLS_SRC_ROOT ? [] : [defaultOps]), ...envRoots, ...args.roots]
+  // Explicit roots (--root / env) MUST exist: a missing one is an error, never a silent skip. Only the
+  // default second home is optional.
+  const explicit = [...envRoots, ...args.roots];
+  const missing = explicit.filter((r) => !fs.existsSync(r));
+  if (missing.length) throw new Error(`sync-skills-deploy: source root(s) not found: ${missing.join(', ')}`);
+  const extraRoots = [...(process.env.WE_SKILLS_SRC_ROOT ? [] : [defaultOps]), ...explicit]
     .filter((r, i, a) => fs.existsSync(r) && a.indexOf(r) === i);
 
   const plans = buildPlans({ srcRoot, extraRoots, destRoot, only: args.only, all: args.all, prune: args.prune });
@@ -354,14 +359,15 @@ async function main() {
   const writesNothing = args.check || args.dryRun;
   if (args.json) {
     process.stdout.write(JSON.stringify({
-      ok: writesNothing ? nothingPending : true,
+      ok: writesNothing ? nothingPending : !plans.some((p) => p.untracked),
+      untrackedSkills: plans.filter((p) => p.untracked).map((p) => p.name),
       checked: plans.length,
       drifted: drifted.length,
       staleSkills: stalePending.length,
       staleFiles: stalePending.reduce((n, p) => n + p.stale.length, 0),
       applied: !args.check && !args.dryRun,
       skills: plans.map((p) => ({
-        name: p.name, actions: p.actions, stale: p.stale || [], alreadyDeployed: p.alreadyDeployed,
+        name: p.name, actions: p.actions, stale: p.stale || [], alreadyDeployed: p.alreadyDeployed, untracked: !!p.untracked,
       })),
     }, null, 2) + '\n');
   } else {

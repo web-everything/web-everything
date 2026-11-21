@@ -49,6 +49,20 @@ describe('multi-root source list', () => {
     expect(plans.every((p) => p.actions.length === 1)).toBe(true);
   });
 
+  it('CLI deploys from both roots; a missing explicit root errors', () => {
+    const a = gitRepoWithSkills('we', ['alpha']);
+    const b = gitRepoWithSkills('ops', ['beta']);
+    const dest = join(tmp, 'dest');
+    const env = { ...process.env, WE_SKILLS_DEPLOY_DIR: dest, WE_SKILLS_SRC_ROOT: a.root };
+    const ok = spawnSync(process.execPath, [MODULE_PATH, '--all', `--root=${b.root}`], { env, encoding: 'utf8' });
+    expect(ok.status).toBe(0);
+    expect(existsSync(join(dest, 'alpha', 'SKILL.md'))).toBe(true);
+    expect(existsSync(join(dest, 'beta', 'SKILL.md'))).toBe(true);
+    const bad = spawnSync(process.execPath, [MODULE_PATH, '--check', `--root=${join(tmp, 'nope')}`], { env, encoding: 'utf8' });
+    expect(bad.status).toBe(1);
+    expect(bad.stderr).toMatch(/not found/);
+  });
+
   it('refuses a duplicate name and names both paths', () => {
     const a = gitRepoWithSkills('we', ['dup']);
     const b = gitRepoWithSkills('ops', ['dup']);
