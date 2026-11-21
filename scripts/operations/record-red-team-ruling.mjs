@@ -14,6 +14,7 @@ import { breakClass } from '../lib/red-team-gate.mjs';
  * from durable evidence, preserving the hold if a later step fails; not-real requires a cause.
  */
 import { createHash } from 'node:crypto';
+import { refuseDirectEntry } from '../lib/direct-entry-guard.mjs';
 import { actionResource } from './action-record.mjs';
 import { buildRedTeamCardInput, buildSendBackBody } from './red-team-gate-apply.mjs';
 import { op } from './registry.mjs';
@@ -334,3 +335,5 @@ export function recordRedTeamRulingOperation({ readRulingContext, judgeConfirm }
     }),
   });
 }
+
+refuseDirectEntry(import.meta.url, RECORD_RED_TEAM_RULING_OP, 'node scripts/operations/record-red-team-ruling-cli.mjs or run.mjs record-red-team-ruling');
