@@ -510,6 +510,8 @@ describe('#3036 read-only is a property of the DECLARING MODULE — the part tha
     // Both declare ledger-writing effects inline in run.mjs; neither is read-only.
     'urgent-verify': 'run.mjs',
     'urgent-sweep': 'run.mjs',
+    // S0 check-scope: reads PR/registry evidence only (no ledger); declared inline in run.mjs.
+    'check-scope': 'run.mjs',
     // Card 359 — READ-ONLY: snapshot reads are injected from operator-session-bootstrap-io.mjs.
     'operator-session-bootstrap': 'operator-session-bootstrap.mjs',
     // Card xvz55jf (epic #3931) — READ-ONLY and genuinely so: both steps are `compute`, the declaring module's
