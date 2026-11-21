@@ -4432,6 +4432,9 @@ Load the real manual dispatcher and review job sequentially in the portable IO s
 `beforeAll` hook. The adapter tests share that production graph, including the job-side head
 refusal cases; cold transforms must finish before the first adapter's five-second test budget
 starts. Keep assertion timeouts unchanged and do not replace the real job dispatcher with a stub.
+Collect the review-job, manual-pass and reconcile-pass graph with static fixture imports so the
+first review adapter case does not spend its five-second deadline on cold Vite transforms.
+Retain the production lazy imports and the real dispatcher head-change refusal assertions.
 
 Stalled living owners escalate to a rate-limited NEEDS-YOU event; activity age never proves death
 or permits claim takeover. The portable IO regressions exercise production evidence, planning,
@@ -5756,7 +5759,7 @@ callback adds a `shadow: { tests, partial }` field; it never changes `mode` or t
 In `--measure` only, `WE_STATIC_EDGES_SHADOW` or `WE_DIFF_TEST_SELECTION=1` enables this
 diagnostic and records `shadowEscaped` failures outside its test list. Each source has a
 512 KB UTF-8 input cap: oversized files are skipped; oversized or unreadable evidence
-sets `partial: true` (as does a truncated test list). Treat partial output as incomplete
+sets `partial: true` only for changed files. Unknown files always widen static reach. Treat partial output as incomplete
 measurement requiring inspection, never as proof of coverage or an input to a gate.
 ## CI workflow self-test (ci-self.yml)
 
@@ -5829,3 +5832,8 @@ For fixtures with arbitrary branches, workflow files or cross-repo couples, use
 Keep full commit IDs consistent across listings, live reads, check runs and saved
 refresh records. Resolve the diff at the listed head when a capped commits read
 or a later push intentionally makes the commits tip or live head differ.
+
+
+## S1b shadow accuracy evidence
+
+The static shadow returns per-file unknown evidence: unknown tests always join the selection, and unknown sources add every test reaching them. Ambiguity alone is not partial; only changed unreadable, oversized or deleted modules make the graph partial. Unchanged unreadable or oversized files remain unknown, widen reach, and appear in `unknownFiles`/`reasons` without setting partial. Literal paths anywhere in a source add edges. Existing full-suite classifiers and untracked/deleted non-test paths without importers escalate the shadow to full; listing failures do likewise. Symlinks and paths outside ROOT are never read. Test filesystem admission separately from parser bounds: oversized metadata must cause zero source reads, while exactly-at-cap files remain readable. Measure rows bind `head` (40 hex) and `base`, and record shadow mode, unknown count, selected/total tests and reasons; full shadow mode has no `shadowEscaped` tests. Sorted repo-relative `staticTests` preserves pure edge reach (including unknown widening) before escalation; measure rows record `staticTestCount` alongside `totalTests` and `mode`, and `shadowEscapedStatic` measures failures outside that reach even in full mode. Missing static evidence yields null counts/escapes. None of these fields changes the real decision; `staticTests` is diagnostic only.
