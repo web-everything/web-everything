@@ -19,6 +19,13 @@ describe('shared round grant guard', () => {
   it.each([null, undefined, {}])('refuses unreadable comments %j', comments => {
     expect(() => assertRoundGrantAllowed({ ...base, comments })).toThrow(/comments|history/);
   });
+  it.each([1, 150, null, -1, '0', NaN])('refuses incomplete comment evidence with total %j even despite a ruling', commentsTotal => {
+    expect(() => assertRoundGrantAllowed({ ...base, ...override, commentsTotal })).toThrow(/incomplete/i);
+    expect(judgeRound).not.toHaveBeenCalled();
+  });
+  it('accepts a matching optional comment total', () => {
+    expect(() => assertRoundGrantAllowed({ ...base, commentsTotal: 0 })).not.toThrow();
+  });
   it.each([null, {}, ['a', null], [42]])('refuses malformed files %j, even despite a ruling', files => {
     expect(() => assertRoundGrantAllowed({ ...base, ...override, files })).toThrow();
   });
@@ -42,7 +49,7 @@ describe('shared round grant guard', () => {
     expect(assertRoundGrantAllowed({ ...base, ...override }).verdict).toBe('non-converging');
     for (const despite of ['R1234567', 'R1\n', 'x', null]) expect(() => assertRoundGrantAllowed({ ...base, ...override, despite })).toThrow(/despite/);
   });
-  it('reader accepts regular designs and refuses directories, symlinks and missing designs', () => {
+  it('reader accepts regular designs and refuses directories, outside symlinks and missing designs', () => {
     const root = mkdtempSync(join(tmpdir(), 'round-grant-design-'));
     try {
       mkdirSync(join(root, 'designs'));
@@ -51,12 +58,45 @@ describe('shared round grant guard', () => {
       const link = 'designs/link-nonconvergence.md';
       writeFileSync(join(root, file), 'design');
       mkdirSync(join(root, dir));
-      symlinkSync(join(root, file), join(root, link));
+      const outside = join(root, 'outside-nonconvergence.md');
+      writeFileSync(outside, 'outside');
+      symlinkSync(outside, join(root, link));
       expect(readNonconvergenceDesign(file, { root })).toEqual({ path: file, exists: true });
       for (const path of [dir, link, 'designs/missing-nonconvergence.md']) {
         const despiteDesign = readNonconvergenceDesign(path, { root });
         expect(despiteDesign.exists).toBe(false);
         expect(() => assertRoundGrantAllowed({ ...base, ...override, despiteDesign })).toThrow(/despite/);
+      }
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  });
+  it('refuses a designs directory symlink pointing outside the root', () => {
+    const root = mkdtempSync(join(tmpdir(), 'round-grant-root-'));
+    const outside = mkdtempSync(join(tmpdir(), 'round-grant-outside-'));
+    try {
+      writeFileSync(join(outside, 'x-nonconvergence.md'), 'outside');
+      symlinkSync(outside, join(root, 'designs'));
+      expect(readNonconvergenceDesign('designs/x-nonconvergence.md', { root }).exists).toBe(false);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+      rmSync(outside, { recursive: true, force: true });
+    }
+  });
+  it('checks real file basenames and path segments before accepting an inside symlink', () => {
+    const root = mkdtempSync(join(tmpdir(), 'round-grant-target-'));
+    try {
+      mkdirSync(join(root, 'designs'));
+      mkdirSync(join(root, 'designs-other'));
+      writeFileSync(join(root, 'designs/ordinary.md'), 'ordinary');
+      writeFileSync(join(root, 'designs/real-nonconvergence.md'), 'design');
+      writeFileSync(join(root, 'designs-other/real-nonconvergence.md'), 'outside');
+      for (const [name, target, exists] of [
+        ['wrong', 'designs/ordinary.md', false],
+        ['prefix', 'designs-other/real-nonconvergence.md', false],
+        ['inside', 'designs/real-nonconvergence.md', true],
+      ]) {
+        const path = `designs/${name}-nonconvergence.md`;
+        symlinkSync(join(root, target), join(root, path));
+        expect(readNonconvergenceDesign(path, { root })).toEqual({ path, exists });
       }
     } finally { rmSync(root, { recursive: true, force: true }); }
   });

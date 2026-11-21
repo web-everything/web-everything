@@ -1,6 +1,7 @@
 import { describe, it, expect, vi } from 'vitest';
 import { planRoundExtension, extendRoundsOperation } from '../extend-rounds.mjs';
-import { createExtendRoundsSinks, createExtendRoundsReader } from '../extend-rounds-io.mjs';
+import { assembleComments, readExtensionThread, createExtendRoundsSinks, createExtendRoundsReader } from '../extend-rounds-io.mjs';
+import { assertRoundGrantAllowed } from '../../lib/round-grant-guard.mjs';
 import { ROUND_EXTENSION_POST_EFFECT } from '../extend-rounds.mjs';
 import {
   buildRoundExtensionComment, countGrantedRoundExtensions, MAX_TOTAL_ROUND_EXTENSIONS,
@@ -135,6 +136,42 @@ describe('non-converging stop at the grant point (R469 / D-R451)', () => {
     body: `🔁 review — changes requested\n\nRecorded by agent (unattended review-loop) via the declared \`review-pr\` operation.\n\n### Findings\n- \`src/q${n}.mjs:${n}\` — ${summary}\n` });
   const diverging = [rtRound(1, 'alpha parser drops the trailing record'), rtRound(2, 'beta cache never expires entries'), rtRound(3, 'gamma retry loop spins forever')];
   const design = { path: 'designs/pr7123-nonconvergence-2026-11-21.md', exists: true };
+
+  const page = (nodes, totalCount, hasNextPage = false) => ({ data: { repository: { pullRequest: {
+    comments: { nodes, totalCount, pageInfo: { hasNextPage, endCursor: hasNextPage ? 'next' : null } },
+  } } } });
+  it('reads all 150 comments and refuses non-converging rounds after comment 100', () => {
+    const comments = Array.from({ length: 147 }, () => ({ ...automation('ordinary discussion'),
+      createdAt: read.now, viewerDidAuthor: false })).concat(diverging.map(c => ({ ...c, viewerDidAuthor: false })));
+    const pages = [page(comments.slice(0, 100), 150, true), page(comments.slice(100), 150)];
+    const gh = vi.fn(args => JSON.stringify(args[0] === 'pr'
+      ? { state: 'OPEN', files: [{ path: 'src/q.mjs' }], headRefOid: 'a'.repeat(40) } : pages));
+    const thread = readExtensionThread(input.repo, input.pr, { gh });
+    expect(thread).toMatchObject({ state: 'OPEN', files: ['src/q.mjs'], headRefOid: 'a'.repeat(40), comments });
+    expect(gh).toHaveBeenCalledTimes(2);
+    const graphqlArgs = gh.mock.calls.find(([args]) => args[0] === 'api')[0];
+    expect(graphqlArgs.slice(0, 4)).toEqual(['api', 'graphql', '--paginate', '--slurp']);
+    const query = graphqlArgs.find(arg => arg.startsWith('query='));
+    for (const field of ['author', 'login', 'body', 'createdAt', 'viewerDidAuthor', 'totalCount', 'pageInfo', 'hasNextPage', 'endCursor']) expect(query).toContain(field);
+    expect(query).toMatch(/after:\s*\$endCursor/);
+    expect(() => assertRoundGrantAllowed({ ...input, ...thread })).toThrow(/non-converging/);
+    expect(() => assertRoundGrantAllowed({ ...input, comments: comments.slice(0, 100) })).not.toThrow();
+    expect(() => assembleComments([page(comments.slice(0, 100), 150)])).toThrow(/incomplete/i);
+    expect(() => assembleComments([pages[0]])).toThrow(/incomplete/i);
+  });
+  it.each([
+    [], [null], [{}], [page([], undefined)], [page([], -1)],
+    [page([null], 1)], [page([{ body: 'missing metadata' }], 1)],
+    [{ ...page([], 0), errors: [{ message: 'partial response' }] }],
+    [page([], 0, true)], [page([], 0), page([], 0)],
+    [page([], 1, true), page([], 0)],
+    [page([], 0.5)],
+  ].map(pages => [pages]))('refuses malformed or incomplete comment pages %#', pages => {
+    expect(() => assembleComments(pages)).toThrow(/incomplete|malformed/i);
+  });
+  it('accepts a complete empty comment thread', () => {
+    expect(assembleComments([page([], 0)])).toEqual([]);
+  });
 
   it('refuses a grant when the round judge says non-converging', () => {
     expect(() => planRoundExtension({ ...read, comments: diverging }, input)).toThrow(/non-converging.*route to redesign \(R88\/R115\/D-R451\)/);

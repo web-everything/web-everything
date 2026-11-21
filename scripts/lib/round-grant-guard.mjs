@@ -8,8 +8,11 @@ export const validNonconvergenceDesignPath = (path) => typeof path === 'string'
 const STOP = 'non-converging round extension refused: route to redesign (R88/R115/D-R451)';
 
 /** despiteDesign.exists is regular-file evidence supplied by the IO reader, never a caller flag. */
-export function assertRoundGrantAllowed({ repo, pr, comments, files, headRefOid, despite, despiteDesign }) {
+export function assertRoundGrantAllowed({ repo, pr, comments, commentsTotal, files, headRefOid, despite, despiteDesign }) {
   if (!Array.isArray(comments)) throw new Error('round extension refused: unreadable comments history');
+  if (commentsTotal !== undefined && commentsTotal !== comments.length) {
+    throw new Error('round extension refused: incomplete comments history; operator must inspect the full thread and retry');
+  }
   if (files !== undefined && (!Array.isArray(files) || Array.from(files).some(file => typeof file !== 'string'))) {
     throw new Error(STOP);
   }
