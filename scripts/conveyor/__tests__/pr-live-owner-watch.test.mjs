@@ -345,12 +345,12 @@ describe('health-watch registration', () => {
 describe('portable feed IO and settings', () => {
   // Load the real dispatchers before timing individual adapter assertions. Their cold
   // import graph can exceed a test's 5s budget under the sharded CI workload.
+  // These roots share circular dependencies: like createLiveOwnerWatchIo, finish
+  // each import before starting the next to avoid a vite-node evaluation deadlock.
   beforeAll(async () => {
-    await Promise.all([
-      import('../../operations/manual-daemon-pass-io.mjs'),
-      import('../../operations/review-job.mjs'),
-      import('../reconcile-pass.mjs'),
-    ]);
+    await import('../../operations/manual-daemon-pass-io.mjs');
+    await import('../../operations/review-job.mjs');
+    await import('../reconcile-pass.mjs');
   }, 30_000);
   const dirs = []; afterEach(() => dirs.splice(0).forEach(dir => rmSync(dir, { recursive: true, force: true })));
   async function localIo(adapters = {}, now = NOW, dir, actEnabled = true, extraEnv = {}) {
