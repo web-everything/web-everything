@@ -2200,6 +2200,7 @@
   "scripts/conveyor/soak/breaks/superseded-watcher-conflict-retry.soak.test.mjs": 1,
   "scripts/conveyor/soak/breaks/timeout-retry-reservation-wedged-on-failed-observation.soak.test.mjs": 3.93,
   "scripts/conveyor/soak/breaks/too-large-pr-diff-scope-read.soak.test.mjs": 96.87,
+  "scripts/conveyor/soak/breaks/ci-heal-child-follows-loop-setting.soak.test.mjs": 1,
   "scripts/conveyor/soak/breaks/transient-fetch-retries-before-needs-you.soak.test.mjs": 1,
   "scripts/conveyor/soak/breaks/unprepared-card-dispatched-as-build.soak.test.mjs": 0.01,
   "scripts/conveyor/soak/breaks/unrecognized-session-lease-outlives-merged-pr.soak.test.mjs": 7.88,
