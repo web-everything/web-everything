@@ -6145,7 +6145,8 @@ ledger's home) and builds on [delivery-decider-under-fixed-settings](#delivery-d
 
 **The rule:**
 1. **F1: what the ledger holds.** Every judgment-bearing event: `verdict`, `referral`, `ruling`, `review-run`,
-   `hold` / `release`, `approval`, `send-back`, `author` and `label-input`. A v1 row reads as `type: verdict`.
+   `hold` / `release`, `approval`, `send-back`, `author`, `label-input` and `merge-intent` (D3: the drain's
+   per-PR promise to merge one head, written only through `appendIf`). A v1 row reads as `type: verdict`.
    Lifecycle transitions are **not** stored one by one. They are a pure function of the events plus facts, so a
    git push means "something was decided", never "a tick happened". Identity is repo + PR + append order; the
    content witnesses (`headSha`, `reviewedDiff`, `reviewedContribution`) stay attributes, never keys.
@@ -6202,9 +6203,17 @@ order) are built in; a product store (Plateau) registers under its own name and 
   invalid. On an I/O failure `appended` is the count really written.
 - `read({repo, from?})` returns `{status: 'ok', rows}` or `{status: 'unreadable', reason, error}` and never
   throws. A failed read is `unreadable`, never an empty `ok`; every gate treats `unreadable` as a hold.
+- `appendIf(rows, {repo, pr, expectPrSeq})`, required when `ordering` is `total` and absent otherwise. `prSeq` is
+  the number of rows the store holds for that repo and PR. The store appends only if `prSeq` equals
+  `expectPrSeq`; the check and the write are one atomic step across all writers. On a mismatch it writes nothing
+  and returns `{ok: false, appended: 0, conflict: true, prSeq}`. Rows of other PRs never cause a conflict. A row
+  whose event id is already stored counts as a duplicate, as in `append`, so a retry after a lost answer is
+  safe. It never throws; an I/O failure or an unknown outcome is `{ok: false, error}`, never a success, and the
+  caller treats it as no intent. A caller that needs `appendIf` refuses to run on a store without it.
 
 Every adapter must pass the conformance suite (`we:scripts/lib/__tests__/verdict-ledger-store-conformance.mjs`).
-The event schema and the fold stay the standard; the contract does not change either.
+The event schema and the fold stay the standard. The contract changes only by statute PR; its first change is
+`appendIf` (D3, 2026-11-21).
 
 **What this ruling does not do.** It builds nothing and adds no code. The build slices (event types v2, git
 io-shell, dual write, `derivePrState`, mirror, ledger gate) are filed separately. The write-miss posture is
@@ -6212,6 +6221,7 @@ documented at the append site and tested by the build that moves the ledger onto
 
 **Lineage:** ratified via the #3007 plan (2026-10-05); F4 resolves #3216. Unifies #3007, #5052, #5053, #5054
 and #4284. Full reasoning: [#3216](/backlog/3216-revisit-the-ledger-write-miss-posture-before-the-authority-m/).
+`appendIf` and the `merge-intent` event added 2026-11-21 by statute PR (ratified D3, `standards.D3`, card #xctsi6q).
 
 ---
 
