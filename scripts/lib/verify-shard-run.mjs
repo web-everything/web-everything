@@ -19,6 +19,8 @@ const positive = n => Number.isSafeInteger(n) && n > 0;
 // Gate arguments use --key=value. Also preserve ordinary two-token Vitest options;
 // boolean switches must never consume the following test file.
 const booleans = new Set(['--passWithNoTests', '--run', '--watch', '--coverage', '--silent', '--globals', '--isolate', '--no-isolate', '--no-file-parallelism', '--fileParallelism']);
+/** verify-lane --local: every shard attempt runs on this host under the caller's held admission slot (PR #7188). */
+export const SHARD_LOCAL_ENV = 'WE_VERIFY_SHARD_LOCAL';
 const HEAVY_ADMISSION_SCRIPT = join(dirname(fileURLToPath(import.meta.url)), '..', 'readiness', 'heavy-admission.mjs');
 
 export function shardRunArgv(files, flags) {
@@ -189,6 +191,12 @@ export async function runShards({ argv, shards: count, parallel, budgetMs }, dep
   let directory;
   try {
     if (!positive(parallel) || !Number.isSafeInteger(budgetMs) || budgetMs < 0) throw Error('invalid parallelism or budget');
+    // Forced local keeps this wrapper's inventory, split-retry and budget rules; only the route changes.
+    // It requires the caller's held slot, so shards never queue for a second one or reach Forge.
+    const forceLocal = Object.hasOwn(env, SHARD_LOCAL_ENV);
+    if (forceLocal && env[SHARD_LOCAL_ENV] !== '1') throw Error(`${SHARD_LOCAL_ENV} must be 1 when set`);
+    if (forceLocal && env[ADMISSION_HELD_ENV] !== '1') throw Error(`${SHARD_LOCAL_ENV}=1 requires a held admission slot (${ADMISSION_HELD_ENV}=1)`);
+    if (forceLocal) log('verify-shards: forced local (verify-lane --local); shards run one at a time under the held slot\n');
     const planned = splitVitestArgs(argv, 1).shards.flat();
     const found = planned.length ? discover({ files: planned, cwd }) : null;
     let excluded = found ? planned.filter(f => !found.has(canonical(resolve(cwd, f)))) : [];
@@ -216,9 +224,12 @@ export async function runShards({ argv, shards: count, parallel, budgetMs }, dep
         // `npx vitest` / `npm run` put node_modules/.bin on PATH for the shell; a bare node child does not.
         const childEnv = { ...env, WE_VERIFY_REMOTE_REPORT: remoteReport, PATH: `${join(cwd, 'node_modules', '.bin')}:${env.PATH ?? ''}` };
         delete childEnv[ADMISSION_HELD_ENV];
+        // forceLocal is decided once above; never leak it into Vitest workers (tests that call runShards).
+        delete childEnv[SHARD_LOCAL_ENV];
         let lastResult = null, observedFailure = false, loadDeferred = false;
         let observedUnsettledExit = false, retryReportsPassed = true;
         async function attempt(local, attemptFiles = files, retry = '') {
+          local ||= forceLocal;
           if (!remaining()) return 'NOT-RUN';
           const report = join(directory, `${index}.${retry}${local ? 'local' : 'initial'}.json`);
           // Preserve the npx command class through admission. JSON travels on
@@ -306,7 +317,7 @@ export async function runShards({ argv, shards: count, parallel, budgetMs }, dep
           } catch { /* Unknown location cannot authorize replacing a red verdict. */ }
           // Same predicate verify-lane uses: needs a REPORTED remote failure, and a signal, timeout or infrastructure exit
           // (e.g. 137) is never replaced by a local pass.
-          if (['FAIL', 'INVENTORY-INCOMPLETE'].includes(status) && lastResult
+          if (!forceLocal && ['FAIL', 'INVENTORY-INCOMPLETE'].includes(status) && lastResult
             && !(lastResult.exitCode === SHARD_UNSETTLED_EXIT && observedFailure)
             && shouldConfirmRemoteRed({ plan: { takeLocalSlot: false }, exitCode: lastResult.exitCode, signal: lastResult.signal,
               timedOut: lastResult.timedOut, ranOn })) {
@@ -361,7 +372,7 @@ export async function runShards({ argv, shards: count, parallel, budgetMs }, dep
         log(`verify-shard ${index + 1}/${shards.length}: ${status} (${files.length} files, ${now() - started} ms)\n`);
       }
     }
-    await Promise.all(Array.from({ length: Math.min(parallel, shards.length) }, worker));
+    await Promise.all(Array.from({ length: Math.min(forceLocal ? 1 : parallel, shards.length) }, worker));
     for (let i = 0; i < shards.length; i++) if (results[i] === undefined) { results[i] = 'NOT-RUN'; log(`verify-shard ${i + 1}/${shards.length}: NOT-RUN (stopped after an infrastructure failure or timeout)\n`); }
     if (results.every(r => r === 'PASS')) {
       log(`verify-shards: GREEN (all ${shards.length} shards, ${shards.flat().length} files executed and passed)\n`);

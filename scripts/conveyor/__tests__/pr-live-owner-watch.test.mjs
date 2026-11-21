@@ -7,7 +7,7 @@ import { classifyOwner, planActions, processLive, selfAudit, detectSmells, runLi
 import { feedTail, resolveLiveOwnerSettings, createLiveOwnerWatchIo } from '../pr-live-owner-watch-io.mjs';
 import { keepAliveScript } from '../../lib/test-keepalive.mjs';
 // Collect the cyclic dispatch graph before per-case deadlines start. The first review
-// adapter otherwise pays for its cold Vite transforms inside the 5-second assertion budget.
+// adapter otherwise pays for cold Vite transforms inside its assertion budget.
 import * as reviewJob from '../../operations/review-job.mjs';
 import { dispatchManualPass } from '../../operations/manual-daemon-pass-io.mjs';
 import { durableCountsFrom } from '../reconcile-pass.mjs';
