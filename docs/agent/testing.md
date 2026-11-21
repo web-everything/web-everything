@@ -5872,6 +5872,13 @@ the replacement. Cover that acquisition order with a worker barrier after the
 generation guard releases, for both normal capacity and a single remaining record.
 At the size limit, assert exactly one append and the matching journal identity;
 either writer may win unless the fixture explicitly orders acquisition.
+## Live-owner adapter fixture imports
+
+Load the manual dispatcher, review job and reconcile graph during collection in
+`pr-live-owner-watch.test.mjs`. The real review adapter imports these modules even
+when dispatch and reconcile IO are injected, so a cold transform otherwise consumes
+the first case's five-second deadline. Reuse the collected modules in head-change
+and job-refusal cases; retain injected launch IO, assertions and per-case deadlines.
 
 ## Lane eligibility: absent checkout versus failed probe
 

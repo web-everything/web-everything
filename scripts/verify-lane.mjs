@@ -36,6 +36,8 @@
  *   node scripts/verify-lane.mjs                      # run the default full gate (whole unit tier + check:standards) foreground, record green/red for HEAD
  *   node scripts/verify-lane.mjs --gate="npm run test:unit"   # override the suite command (skips diff-driven selection entirely)
  *   node scripts/verify-lane.mjs --repo=~/workspace/.lanes/web-everything/lane-3   # verify a specific lane clone
+ *   node scripts/verify-lane.mjs --local              # force every heavy phase to run on THIS host (like `heavy-admission run --local`); marker records local:true. As valid as a remote verify: same suites.
+ *     Selected sharded gates keep the shard wrapper (and its executed-file completeness check); every shard runs locally, one at a time, under the parent admission slot (refused if admission timed out).
  *   node scripts/verify-lane.mjs run                  # xpnhz4o — run the SAME default gate foreground, but record NO marker (the fix/ci-heal gate)
  *   node scripts/verify-lane.mjs --json              # machine-readable {sha, status, exitCode} on stdout
  *   node scripts/verify-lane.mjs check               # READ-ONLY: print the current marker's gate verdict for HEAD, run nothing
@@ -99,6 +101,7 @@ import { createRevertProbe } from './operations/mutation-check-io.mjs';
 import { resolveCoordinationRoot } from './operations/coordination-root.mjs';
 import { admissionLockRoot, resolveCap, resolveTimeoutMs, acquireSlotBlocking, releaseOwnedSlot, heartbeatOwnedSlot, ADMISSION_HELD_ENV, classifyCommandKind } from './readiness/heavy-admission.mjs';
 import { SHARD_RUN_SCRIPT, checkoutHasRetryableTestUnit, scanRetryCommand, localPhaseReason, localPhaseShape, localPhaseBypassDetail, phaseAdmissionPlan, shouldConfirmRemoteRed, decidePhaseRemote, readRemoteReport, phaseRunLocation, mergeRunLocation, overallRunLocation, remoteInfrastructureFailure, REMOTE_TERMINATION_UNCONFIRMED } from './lib/verify-remote-routing.mjs';
+import { SHARD_LOCAL_ENV } from './lib/verify-shard-run.mjs';
 import { startTreeWatchdog } from './lib/tree-watchdog.mjs';
 import { shellQuote, isShardWrapperCommand } from './lib/verify-lane-gate.mjs';
 import { randomBytes } from 'node:crypto';
@@ -135,6 +138,7 @@ for (const a of process.argv.slice(2)) {
 const expandHome = (p) => (p && p.startsWith('~') ? join(homedir(), p.slice(1)) : p);
 const REPO = resolve(expandHome(flags.repo) || process.cwd());
 const AS_JSON = !!flags.json;
+const FORCE_LOCAL = flags.local === true; // --local: run every heavy phase on this host (no Forge dispatch); marker records local:true
 // #2833 finding 5 — resolve the gate options through the SHARED resolver so `check` mode agrees with pr-land:
 // `--require-verified` OR `WE_REQUIRE_VERIFIED=1`, and the `WE_LAND_UNVERIFIED=1` break-glass. Previously `check`
 // read only `flags['require-verified']`, so the same env produced two different verdicts at the two call sites.
@@ -636,7 +640,7 @@ if (MODE === 'request') {
   }
 }
 
-if (MODE !== 'run') writeMarker(verifyStartBody({ sha: headSha, suites: GATE, startedAt: new Date().toISOString(), treeHash: currentTreeHash, runId: typeof flags['run-id'] === 'string' ? flags['run-id'] : undefined }));
+if (MODE !== 'run') writeMarker({ ...verifyStartBody({ sha: headSha, suites: GATE, startedAt: new Date().toISOString(), treeHash: currentTreeHash, runId: typeof flags['run-id'] === 'string' ? flags['run-id'] : undefined }), ...(FORCE_LOCAL ? { local: true } : {}) });
 
 // #3105 — `request` stops HERE: the marker is stamped, nothing has run yet, and this call already returns
 // (`emit` calls `process.exit`). The actual suite run is picked up by `scripts/conveyor/verify-dispatch.mjs`
@@ -687,13 +691,17 @@ const phaseAdmission = verifyPhaseAdmissionEnabled(process.env) && phasedTestGat
 const admissionPhases = {};
 async function acquireAdmission(phase, command) {
   let decision = { remote: false, reason: localPhaseReason(command, { cwd: REPO }) };
-  if (!phaseAdmissionPlan({ command, cwd: REPO, decision: { remote: true } }).takeLocalSlot) {
+  if (FORCE_LOCAL) {
+    // --local: never dispatch to Forge; every phase runs on this host under a local admission slot.
+    process.stderr.write('verify-lane: local admission (local-flag)\n');
+    decision = { remote: false, reason: 'local-flag' };
+  } else if (!phaseAdmissionPlan({ command, cwd: REPO, decision: { remote: true } }).takeLocalSlot) {
     decision = await decidePhaseRemote({ cwd: REPO, env: process.env, argv: command.split(/\s+/) });
     process.stderr.write(`verify-lane: ${decision.remote ? 'remote' : 'local'} admission (${decision.reason})\n`);
   } else {
     process.stderr.write(`verify-lane: local admission (${decision.reason})\n`);
   }
-  const plan = phaseAdmissionPlan({ command, cwd: REPO, decision });
+  const plan = FORCE_LOCAL ? { takeLocalSlot: true } : phaseAdmissionPlan({ command, cwd: REPO, decision });
   if (!plan.takeLocalSlot) return { ok: false, waitedMs: 0, remote: true, ...plan };
   const routing = phaseAdmission ? phaseAdmissionKind({
     phase, decision: resolvedGate.decision, standardsScoped: resolvedGate.decision.standards?.scoped, env: process.env,
@@ -713,7 +721,7 @@ async function acquireAdmission(phase, command) {
     admissionPhases[phase] = { ...routing, waitedMs: (previous?.waitedMs ?? 0) + acquired.waitedMs,
       slot: acquired.slot, timedOut: Boolean(previous?.timedOut || acquired.timedOut) };
   }
-  return acquired;
+  return FORCE_LOCAL ? { ...acquired, forceLocal: true } : acquired;
 }
 const admission = await acquireAdmission('vitest', phasedTestGate ? resolvedGate.testCommand : (resolvedGate?.command ?? GATE));
 let currentAdmission = admission;
@@ -762,6 +770,7 @@ let baseFailures = null;
 // The final exit code alone cannot say whether a 124 came from an unconfirmed remote attempt; the phases recorded it.
 const infrastructureNow = (exitCode, signal, failureDetails) => verificationInfrastructureFailure({ exitCode, signal, failureDetails }) ?? (remoteUnconfirmed ? { ...REMOTE_TERMINATION_UNCONFIRMED } : null);
 async function runGate(command, args, { forgeDispatch = false } = {}) {
+  forgeDispatch = !FORCE_LOCAL && forgeDispatch;
   const reportDir = mkdtempSync(join(tmpdir(), 'verify-remote-report-'));
   const reportFile = join(reportDir, 'report.jsonl');
   const childEnv = { ...process.env, WE_VERIFY_REMOTE_REPORT: reportFile };
@@ -772,6 +781,8 @@ async function runGate(command, args, { forgeDispatch = false } = {}) {
     delete childEnv.WE_FORGE_GATE_DISPATCH;
     childEnv[ADMISSION_HELD_ENV] = '1';
   }
+  // Never inherit forced-local shard routing; --local scopes it to each validated wrapper (timedRunGate).
+  delete childEnv[SHARD_LOCAL_ENV];
   const collector = createFailureCollector({ cwd: REPO });
   const output = { stdout: '', stderr: '' };
   const outputTail = createOutputTail();
@@ -890,6 +901,86 @@ async function timedRunGate(phase, command, args, { outcomeKey } = {}) {
   try {
     // Admission may span the whole gate; a command rewrite belongs only to this phase.
     const plan = phaseAdmissionPlan({ command, cwd: REPO, decision: { remote: currentAdmission.remote === true } });
+    if (currentAdmission.forceLocal) {
+      // Default-gate equivalence deliberately recognizes only generated absolute paths. Local policy
+      // must also handle user-supplied relative paths and shell quoting, in every && segment.
+      // Shards route through their own admission unless SHARD_LOCAL_ENV reaches them, so only a literal,
+      // unprefixed wrapper (given a scoped assignment below) may run. Never interpret expansions to guess one.
+      const token = /[ \t]+|&&|(?:[^\s'"\\;&|<>$`()#]|'[^']*'|"(?:[^"\\$`]|\\[^\r\n])*"|\\[^\r\n])+/gy;
+      const unquote = word => word.replace(/'([^']*)'|"((?:[^"\\]|\\.)*)"|\\(.)/gs,
+        (_match, single, double, escaped) => single ?? (double !== undefined ? double.replace(/\\(["\\$`])/g, '$1') : escaped));
+      const segments = [[]];
+      let offset = 0;
+      let match;
+      while ((match = token.exec(command))) {
+        offset = token.lastIndex;
+        if (match[0] === '&&') segments.push([]);
+        else if (!/^[ \t]+$/.test(match[0])) segments.at(-1).push({ value: unquote(match[0]), start: match.index });
+      }
+      const refusal = () => { throw new Error('verify-lane: --local requires a selected Vitest command in the shard wrapper; use an unprefixed literal node path and an &&-joined gate'); };
+      if (offset !== command.length) {
+        // An expansion can hide the entire wrapper path. Incomplete parsing cannot prove
+        // local routing, even when neither the raw command nor its parsed prefix names it.
+        refusal();
+      } else {
+        // Apply edits from the end so earlier token offsets remain valid. Only executable positions
+        // count: a quoted test name or echo argument containing wrapper text is data, never edited.
+        const commands = segments.reverse().map(words => ({ words, depth: 0 }));
+        for (const { words, depth } of commands) {
+          const start = words.findIndex(t => !/^[A-Za-z_][A-Za-z0-9_]*=/.test(t.value));
+          if (start < 0) continue;
+          const mentionsWrapper = word => word.value.includes('verify-shard-run.mjs');
+          if (!/(?:^|\/)node$/.test(words[start].value)) {
+            // Generated suite commands consume file names as data. Classify their executable
+            // prefix before looking for wrappers: --files may name the shard runner itself.
+            const argv = words.slice(start).map(word => word.value);
+            const npmScript = argv[0] === 'npm' && argv[1] === 'run'
+              && ['check:standards', 'test:unit'].includes(argv[2])
+              && (argv.length === 3 || argv[3] === '--');
+            const npmTest = argv[0] === 'npm' && argv[1] === 'test'
+              && (argv.length === 2 || argv[2] === '--');
+            const vitest = argv[0] === 'npx' && argv[1] === 'vitest'
+              && ['run', 'related'].includes(argv[2]);
+            if (npmScript || npmTest || vitest) continue;
+            // env/command (including nested launchers and shell payloads) can hide a shard
+            // runner that drops our held slot. Refuse before spawn instead of guessing prefix
+            // semantics. Literal echo arguments are data and cannot execute the wrapper.
+            if (words[start].value !== 'echo' && words.slice(start).some(mentionsWrapper)) refusal();
+            continue;
+          }
+          const scriptIndex = start + (words[start + 1]?.value === '--' ? 2 : 1);
+          const isWrapper = word => word && resolve(REPO, word.value).endsWith('/scripts/lib/verify-shard-run.mjs');
+          if (!isWrapper(words[scriptIndex])) {
+            // Admission forwards the argv after --. Inspect that executable as well: a shard
+            // below it discards our held slot, even if the outer admission says --local.
+            // Keep suite input paths as data by applying the same command classification.
+            if (words[scriptIndex] && resolve(REPO, words[scriptIndex].value).endsWith('/scripts/readiness/heavy-admission.mjs')
+              && words.slice(scriptIndex + 1).some(mentionsWrapper)) {
+              // Bound repeated suffix scans; the refusal directs the caller to an unwrapped gate.
+              if (depth >= 32) refusal();
+              const separator = words.findIndex((word, i) => i > scriptIndex && word.value === '--');
+              if (separator >= 0) commands.push({ words: words.slice(separator + 1), depth: depth + 1 });
+              else refusal();
+            }
+            if (words[scriptIndex]?.value.startsWith('-') && words.slice(scriptIndex + 1).some(mentionsWrapper)) refusal();
+            continue;
+          }
+          if (depth > 0) refusal();
+          const options = words.slice(scriptIndex + 1, scriptIndex + 4).map(t => t.value);
+          const keys = options.map(option => /^--(shards|parallel|budget-ms)=\d+$/.exec(option)?.[1]);
+          if (keys.length !== 3 || keys.some(key => !key) || new Set(keys).size !== 3
+            || words[scriptIndex + 4]?.value !== '--'
+            || words.slice(scriptIndex + 5, scriptIndex + 8).map(t => t.value).join(' ') !== 'npx vitest run') refusal();
+          // Keep the validated wrapper: it owns the executed-file completeness check, split retry and
+          // budget. A scoped SHARD_LOCAL_ENV assignment keeps its shards on this host under our slot,
+          // so it requires a slot we actually hold; without one the wrapper would route on its own.
+          if (!currentAdmission.ok) throw new Error('verify-lane: --local shard wrapper needs a held admission slot, but admission timed out; retry when capacity frees');
+          plan.command = `${plan.command.slice(0, words[start].start)}${SHARD_LOCAL_ENV}=1 ${plan.command.slice(words[start].start)}`;
+        }
+      }
+      plan.takeLocalSlot = true;
+      plan.setHeld = true;
+    }
     let result = await runGate(args ? command : plan.command, args, { forgeDispatch: !plan.takeLocalSlot });
     if (shouldConfirmRemoteRed({ plan, ...result })) {
       process.stderr.write(`verify-lane: remote phase red (exit ${result.exitCode}) - confirming on Forge\n`);
@@ -1192,11 +1283,15 @@ if (MODE === 'run') {
 //        newer run's record (compare-and-set on the sha). A slow GREEN run at X must NOT stamp green over a
 //        RED record for Y.
 const onDisk = readMarker();
-if (onDisk && !onDisk.corrupt && onDisk.sha && onDisk.sha !== headSha) {
+// A dispatched run may finish before the next supersession sweep. Its verdict cannot answer
+// a replacement request with a different execution policy, even at the very same HEAD/tree.
+const policySuperseded = DISPATCHED_RUN && onDisk && !onDisk.corrupt
+  && (onDisk.local === true) !== FORCE_LOCAL;
+if (onDisk && !onDisk.corrupt && onDisk.sha && (onDisk.sha !== headSha || policySuperseded)) {
   emit(
     {
       sha: headSha, status: 'superseded', reason: 'superseded', exitCode, ...redCauseFields,
-      detail: `suites finished (exit ${exitCode}) for ${headSha.slice(0, 8)}, but the on-disk marker now belongs to ${String(onDisk.sha).slice(0, 8)} (an overlapping verify-lane run) — refusing to overwrite it; no marker written for this run.`,
+      detail: `suites finished (exit ${exitCode}) for ${headSha.slice(0, 8)}, but the on-disk marker now belongs to ${String(onDisk.sha).slice(0, 8)}${policySuperseded ? ' with a different local policy' : ''} (an overlapping verify-lane run) — refusing to overwrite it; no marker written for this run.`,
     },
     3,
   );
@@ -1217,7 +1312,7 @@ const finished = verifyFinishBody(startBody, {
   suites: GATE,
   treeHash: stableTreeHash(currentTreeHash, preGateTreeHash, treeHashNow()),
 });
-writeMarker({ ...finished, ranOn: overallRunLocation(ranOnPhases), executedGate: resolvedGate?.command ?? GATE, ...redCauseFields, phases, ...(revertRed ? { revertRed } : {}) });
+writeMarker({ ...finished, ...(FORCE_LOCAL ? { local: true } : {}), ranOn: overallRunLocation(ranOnPhases), executedGate: resolvedGate?.command ?? GATE, ...redCauseFields, phases, ...(revertRed ? { revertRed } : {}) });
 maybeRecordGreen({ status: finished.status, treeHash: finished.treeHash });
 // R893 — an infra-failed/unsettled verify (never red) also records the distinct deferred-to-ci marker; red/green clear it.
 try { recordTerminalVerifyOutcome(GIT_DIR, finished); } catch { /* advisory record; never changes the verdict */ }
