@@ -8,9 +8,11 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
   rollupEvidence, buildOpenPrPageQuery, mapGraphqlPr, parseOpenPrPage, isTransientGhFailure, heavyIsFresh, resolveCheckAppsByCommit,
-  listOpenPrsLightPaged, listOpenPrsPagedHydrated, assertInventoryComplete, listOpenPrsPagedHydratedComplete, parseListOutput, hydrateHeavyFields, resolvePrListPaging, PrListUnreadableError,
+  listOpenPrsLightPaged, listOpenPrsPagedHydratedAsync, listOpenPrsPagedHydratedCompleteAsync, listOpenPrsPagedHydrated, assertInventoryComplete, listOpenPrsPagedHydratedComplete, parseListOutput, hydrateHeavyFields, resolvePrListPaging, PrListUnreadableError,
   HEAVY_FIELDS, PAGED_LIGHT_FIELDS, PR_LIST_PAGING_DEFAULTS, PR_LIST_PAGE_SIZE_ENV,
 } from '../pr-list-paged.mjs';
+
+import { withListRetryAsync } from '../gh-list-retry.mjs';
 
 const repo = 'owner/name';
 const node = (number, extra = {}) => ({ number, title: `PR ${number}`, url: `https://example.com/${number}`,
@@ -725,3 +727,149 @@ it.each([null, {}, { __typename: 'Unexpected', name: 'test', status: 'COMPLETED'
       }
     }
   });
+
+
+describe('listing hydrates heavy fields with bounded concurrency', () => {
+  const paging = { pageSize: 20, pageRetries: 1, heavyMaxAgeSeconds: 1 };
+  const recorded = [page([node(1), node(2)], true, 'next', 4), page([node(3), node(4)], false, null, 4)];
+  const options = { repo, paging, heavyFields: ['body', 'files'], nowMs: 10000 };
+  const reader = () => vi.fn((_cmd, args) => args[0] === 'api'
+    ? recorded[args[3].includes('after:') ? 1 : 0] : JSON.stringify(heavy));
+
+  it.each(['cold', 'seed', 'cache', 'stale', 'selected'])('listing hydrates heavy fields with bounded concurrency: sync equivalence (%s)', async mode => {
+    const cache = { 99: cached(row(99)) };
+    const seed = [];
+    if (mode === 'seed' || mode === 'cache') {
+      seed.push({ ...row(1), ...heavy, body: 'seed' });
+      cache[2] = cached(row(2), { body: 'cached' });
+    }
+    if (mode === 'cache') cache[1] = cached(row(1), { body: 'preferred cache' });
+    if (mode === 'stale') {
+      seed.push({ ...row(1), ...heavy, headRefOid: 'old' });
+      cache[2] = cached(row(2), { fetchedAtMs: 8000 });
+      cache[3] = { ...cached(row(3)), headRefOid: 'old' };
+      cache[4] = { ...row(4), body: 'missing files', fetchedAtMs: 9500 };
+    }
+    const extra = { cache, seed, ...(mode === 'selected' ? { needsHeavy: r => r.number === 1 } : {}) };
+    const before = structuredClone({ cache, seed });
+    const syncExec = reader(), exec = reader(), heavyExec = reader();
+    const sync = listOpenPrsPagedHydrated({ ...options, ...extra, exec: syncExec });
+    const asyncResult = await listOpenPrsPagedHydratedAsync({ ...options, ...extra, exec,
+      execAsync: async (...args) => ({ stdout: heavyExec(...args) }) });
+    expect({ ...asyncResult, ms: 0 }).toEqual({ ...sync, ms: 0 });
+    expect(exec.mock.calls.every(([, args]) => args[0] === 'api')).toBe(true);
+    expect(heavyExec.mock.calls).toEqual(syncExec.mock.calls.filter(([, args]) => args[0] === 'pr'));
+    expect({ cache, seed }).toEqual(before);
+  });
+
+  it('listing hydrates heavy fields with bounded concurrency: at most six in flight, ordered rows', async () => {
+    const nodes = Array.from({ length: 35 }, (_, i) => node(i + 1));
+    let active = 0, peak = 0;
+    const completed = [];
+    const result = await listOpenPrsPagedHydratedCompleteAsync({ ...options,
+      exec: () => page(nodes, false, null, nodes.length),
+      execAsync: async (_cmd, args, execOpts) => {
+        expect(execOpts).toEqual(opts);
+        active++; peak = Math.max(peak, active);
+        const number = Number(args[2]);
+        await new Promise(resolve => setTimeout(resolve, number === 1 ? 20 : 0));
+        completed.push(number); active--;
+        return { stdout: JSON.stringify({ ...heavy, body: String(number) }) };
+      } });
+    expect(peak).toBe(6);
+    expect(active).toBe(0);
+    expect(completed[0]).not.toBe(1);
+    expect(result.rows.map(r => r.number)).toEqual(nodes.map(n => n.number));
+    expect(result.rows.map(r => r.body)).toEqual(nodes.map(n => String(n.number)));
+    expect(result.hydrated).toBe(35);
+  });
+
+  it('listing hydrates heavy fields with bounded concurrency: failed hydration joins outstanding reads before retrying', async () => {
+    const nodes = Array.from({ length: 6 }, (_, i) => node(i + 1));
+    let releaseFailure, releaseOutstanding, initialReadsStarted;
+    const failedRead = new Promise(resolve => { releaseFailure = resolve; });
+    const outstandingReads = new Promise(resolve => { releaseOutstanding = resolve; });
+    const initialReady = new Promise(resolve => { initialReadsStarted = resolve; });
+    let active = 0, peak = 0, attempts = 0;
+    const activeAtAttemptStart = [];
+    const run = withListRetryAsync(() => {
+      const attempt = ++attempts;
+      activeAtAttemptStart.push(active);
+      return listOpenPrsPagedHydratedCompleteAsync({ ...options,
+        exec: () => page(nodes, false, null, nodes.length),
+        execAsync: async (_cmd, args) => {
+          active++; peak = Math.max(peak, active);
+          if (attempt === 1 && active === 6) initialReadsStarted();
+          try {
+            if (attempt === 1) {
+              if (args[2] === '1') {
+                await failedRead;
+                throw failure(timeout);
+              }
+              await outstandingReads;
+            } else await Promise.resolve();
+            return { stdout: JSON.stringify(heavy) };
+          } finally { active--; }
+        } });
+    }, { repo, backoffMs: [0], sleep: () => {}, persist: false });
+    let beforeRelease;
+    try {
+      await initialReady;
+      releaseFailure();
+      // Drain promise continuations through an event-loop turn while five reads stay blocked.
+      await new Promise(resolve => setImmediate(resolve));
+      beforeRelease = { attempts, active };
+    } finally {
+      releaseFailure();
+      releaseOutstanding();
+    }
+    const result = await run;
+    expect(beforeRelease).toEqual({ attempts: 1, active: 5 });
+    expect(activeAtAttemptStart).toEqual([0, 0]);
+    expect(attempts).toBe(2);
+    expect(peak).toBe(6);
+    expect(active).toBe(0);
+    expect(result.rows.map(r => r.number)).toEqual(nodes.map(n => n.number));
+    expect(result.hydrated).toBe(6);
+  });
+
+  it.each(['failed', 'missing', 'deferred', 'malformed'])('listing hydrates heavy fields with bounded concurrency: %s read fails closed without partial rows', async mode => {
+    const cache = { 99: cached(row(99)) }, before = structuredClone(cache);
+    const published = vi.fn();
+    const result = listOpenPrsPagedHydratedCompleteAsync({ ...options, cache, exec: reader(),
+      execAsync: async (_cmd, args) => {
+        if (args[2] !== '2') return { stdout: JSON.stringify(heavy) };
+        if (mode === 'failed') throw failure(timeout);
+        return { stdout: mode === 'missing' ? JSON.stringify({ body: 'no files' })
+          : mode === 'deferred' ? JSON.stringify({ outcome: 'deferred-low-budget' }) : '{' };
+      } });
+    await expect(result.then(published)).rejects.toBeInstanceOf(PrListUnreadableError);
+    await expect(result).rejects.toMatchObject({ stage: 'hydrate', number: 2, unreadable: true });
+    expect(published).not.toHaveBeenCalled();
+    expect(cache).toEqual(before);
+  });
+
+  it('listing hydrates heavy fields with bounded concurrency: incomplete inventory still fails closed', async () => {
+    await expect(listOpenPrsPagedHydratedCompleteAsync({ ...options,
+      exec: () => page([node(1)], false, null, 2), execAsync: async () => ({ stdout: JSON.stringify(heavy) })
+    })).rejects.toBeInstanceOf(PrListUnreadableError);
+  });
+});
+
+
+it('listing hydrates heavy fields with bounded concurrency: async list retry preserves transient retries and failure signals', async () => {
+  const streaks = new Map(), onEvent = vi.fn(), sleep = vi.fn();
+  const options = { repo, op: 'drain-list', streaks, threshold: 1, backoffMs: [0], sleep, onEvent };
+  const read = vi.fn().mockRejectedValueOnce(failure(timeout)).mockResolvedValueOnce('complete');
+  await expect(withListRetryAsync(read, options)).resolves.toBe('complete');
+  expect(read).toHaveBeenCalledTimes(2);
+  const failed = vi.fn().mockRejectedValue(failure(timeout));
+  await expect(withListRetryAsync(failed, options)).rejects.toThrow('gh failed');
+  expect(failed).toHaveBeenCalledTimes(2);
+  expect(onEvent).toHaveBeenCalledWith(expect.objectContaining({ kind: 'gh-list-failed', repo }));
+  await expect(withListRetryAsync(async () => 'complete', options)).resolves.toBe('complete');
+  expect(streaks.size).toBe(0);
+  const unreadable = vi.fn().mockRejectedValue(new PrListUnreadableError({ repo, stage: 'hydrate', number: 2, cause: new Error('missing data') }));
+  await expect(withListRetryAsync(unreadable, options)).rejects.toBeInstanceOf(PrListUnreadableError);
+  expect(unreadable).toHaveBeenCalledTimes(1);
+});
