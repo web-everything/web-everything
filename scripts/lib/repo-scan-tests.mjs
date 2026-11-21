@@ -43,6 +43,13 @@ const skipped = (file) => /(?:^|\/)(?:__tests__|__fixtures__|node_modules)(?:\/|
 /** @type {readonly RepoScanTest[]} */
 export const REPO_SCAN_TESTS = Object.freeze([
   {
+    test: 'scripts/__tests__/agent-launch-structure.test.mjs',
+    scope: 'full',
+    why: 'compares literal agent launch counts across scripts and symlinked skills with the complete S1 baseline, including extra sites in already approved files',
+    matches: (f) => /\.mjs$/.test(f) && !skipped(f) && inTree(f, ['scripts', '.claude/skills', 'skills-src']),
+    inputs: ['scripts/lib/agent-launch-approved.json', 'scripts/__tests__/agent-launch-structure.test.mjs'],
+  },
+  {
     test: 'scripts/__tests__/capability-dispatch-only.test.mjs',
     scope: 'files',
     why: 'capability checks admit dispatch only; roster filtering and unapproved admission are forbidden per source file',
