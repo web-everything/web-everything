@@ -2839,7 +2839,6 @@ export function planReconcile({
     }, requiredChecks);
     const check = reduceCheckState(pr?.statusCheckRollup, requiredChecks);
     const withPhase = { phase, check: check.state, labels: labelNames(pr?.labels) };
-
     // ── ALREADY-LANDED — its OWN branch, AHEAD OF EVERY OTHER CHECK IN THIS LOOP (`ci-red`, the advisory-fix
     // branch, STACKED-BASE, the generic `OWED` table — every one of them would otherwise dispatch a fixer or a
     // reviewer at a PR with nothing left to change). Live incident, web-everything/web-everything PR #2752: bounced
@@ -2899,6 +2898,17 @@ export function planReconcile({
           + 'operator-approved 2026-09-27) — nothing else is owed this PR until that happens',
       });
       continue;
+    }
+
+    // A stale automatic freeze is still red for merging. Reuse the daemon's mechanical executor
+    // while the review-owned annotation lets independent review work proceed.
+    const staleFreeze = collapseRollupToLatestPerName(pr?.statusCheckRollup)
+      .find(row => row?.name === 'merge-gate')?.mergeGateStaleFreeze;
+    if (staleFreeze && staleFreeze.head === pr.headRefOid && staleFreeze.pr === prNumber) {
+      dispatch.push({ ...base, ...withPhase, kind: 'ci-timeout-rerun', variant: 'stale-main-freeze',
+        timeoutRetry: { eligible: true, ...staleFreeze, staleFreeze: true,
+          signature: `stale-main-freeze:${staleFreeze.run}`, jobs: [{ run: staleFreeze.run, job: staleFreeze.job, attempt: staleFreeze.attempt }] },
+        why: 'automatic main-CI freeze predates green main; rerun merge-gate once per head/run; inspect the retry record if refused' });
     }
 
     // An earlier operator request survives later mechanical bounces and advisory accepts. Keep the existing
@@ -3184,6 +3194,11 @@ export function planReconcile({
       && reviewHoldGatesOnlyRed(pr?.statusCheckRollup, requiredChecks);
     if (reviewHoldRed) {
       refuse('review-hold-red', { ...withPhase, why: `review daemon owns held gates: ${heldGates.join(', ')}` });
+      if (staleFreeze && withPhase.labels.includes('review:pending')) {
+        dispatchReviewRow({ pr, requiredChecks, withPhase, base, attempts: roundAttempts(),
+          roundCap: effectiveRoundCap, now, refuse, refuseCapExhausted, dispatch });
+        continue;
+      }
       // An admitted advisory owns a repair next. Keep the existing finding/cap/ruling
       // guards below reachable, without healing held gates or dispatching a second review.
       if (!(phase === 'needs-human' && withPhase.labels.includes(ADVISORY_LABELS.CHANGES))) {

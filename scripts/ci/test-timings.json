@@ -579,6 +579,9 @@
   "scripts/conveyor/__tests__/owed-ci-rerun-executor.test.mjs": 0.03,
   "scripts/conveyor/__tests__/parked-pr-conflict-watch.test.mjs": 1.54,
   "scripts/conveyor/__tests__/parked-pr-progress-watch.test.mjs": 1.3,
+  "scripts/lib/__tests__/merge-gate-stale-freeze.test.mjs": 0.03,
+  "scripts/lib/__tests__/review-ci-gate-stale-freeze.test.mjs": 0.05,
+  "scripts/operations/__tests__/stale-freeze-rerun.test.mjs": 0.03,
   "scripts/conveyor/__tests__/pending-launches.test.mjs": 0.02,
   "scripts/conveyor/__tests__/planner-fact-cache.test.mjs": 0.97,
   "scripts/conveyor/__tests__/poc-branch-sync.test.mjs": 2.46,
@@ -2040,6 +2043,7 @@
   "wrapper-conformance/__tests__/runner.test.ts": 0.01
  },
  "soak": {
+  "scripts/conveyor/soak/breaks/merge-gate-stale-main-freeze.soak.test.mjs": 2,
   "scripts/conveyor/soak/breaks/lane-pool-release-unpushed-guard.soak.test.mjs": 315.93,
   "scripts/conveyor/soak/breaks/lane-pool-git-diet.soak.test.mjs": 354.59,
   "scripts/conveyor/soak/breaks/runtime-admission-infra-retention.soak.test.mjs": 0.1,

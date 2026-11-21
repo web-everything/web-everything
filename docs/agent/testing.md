@@ -5922,6 +5922,47 @@ It never infers clearance authority from a saved review or a newly read head.
 `scripts/operations/__tests__/record-verdict-cli.test.mjs` drives both CLI adapters through
 staging the JSON request. The applier carries that pin to `review-set-label` as `--expect-head`.
 
+## Stale automatic merge-gate freezes
+
+Automatic `merge-gate` main-CI freezes require fresh latest-main evidence, never the old job's main diagnostic.
+Only a sole automatic `red-main-freeze` row completed before green main may carry `mergeGateStaleFreeze`;
+the failed conclusion remains intact. The review planner sends it through the existing owed-rerun executor
+and permits independent review work. The timeout transaction reserves once per repository/head/run, including
+rejected or ambiguous requests, and rechecks main plus the live PR/job identity before requesting the job rerun.
+If the reservation is spent or uncertain, inspect merge-gate and the durable timeout retry record before an
+operator retry; automatic ticks must not clear it. `merge-gate-stale-freeze.test.mjs`, `stale-freeze-rerun.test.mjs`
+and the `merge-gate-stale-main-freeze` soak break cover classification, refusal, restart and three-tick recovery.
+The executor's per-pass cap counts attempts, excluding only stale-freeze refusals for an already-spent run
+or exhausted head cap. Those refusals happen under the reservation lock before remote IO, remain visible
+for operator inspection, and must leave capacity for later PRs. Fresh API rejections and unknown results
+still consume capacity. Replay eleven eligible PRs across two passes: reject the first ten requests,
+then recover the API and require the eleventh PR to run without retrying any spent reservation.
+
+## Stale automatic main-freeze recovery
+
+The stale-freeze annotation requires the verdict job's own `head_sha` to match the PR head;
+a `pull_request_target` job on a different base head is insufficient evidence. Test both head
+bindings and the sole failed evaluator step. Persisted retry requests with the historical
+`stale-main-freeze:` signature must retain their spend when adding request markers.
+Run the stale-freeze soak with `vitest.soak.config.ts` through heavy-admission: the default
+unit config excludes `*.soak.test.mjs`. The regression must pass unconditionally and observe
+a successful rerun on a later tick, rather than only an accepted rerun request.
+Planner and soak fixtures must also provide `rowsComplete: true` and `rowsHead` equal to
+the PR head. A stale-freeze annotation never waives this shared review prerequisite;
+missing, incomplete or wrong-head rows must still refuse review with `rows-incomplete`.
+Test the planner with independently mismatched annotation heads and PR numbers. For a new observed
+field, exercise its real IO adapter and feed that output into the consumer; a stub that supplies the
+field by hand does not protect the wiring. The stale-freeze adapter contract pins API `job.name`,
+its absence for ordinary timeout observations, and dispatch refusal for a different job name.
+Stale-freeze requests must not spend the dispatcher's ordinary timeout budget. Followup eligibility
+and diagnostic evidence belong to each request, not the first writer of a shared head record.
+Cover both arrival orders, historical signature-only stale-freeze requests, ambiguous-request
+reconciliation, and a failed followup write replayed with the same payload. The mixed-run soak
+uses the real observation adapter and requires two ordinary retries and one ordinary followup
+after two confirmed stale-freeze reruns.
+Followup fixtures must set `root` to their scratch directory and create its `backlog/`
+directory even when `fileFollowup` is injected: payload planning still reads the corpus.
+
 ## S1b shadow accuracy evidence
 
 The static shadow returns per-file unknown evidence: unknown tests always join the selection, and unknown sources add every test reaching them. Ambiguity alone is not partial; only changed unreadable, oversized or deleted modules make the graph partial. Unchanged unreadable or oversized files remain unknown, widen reach, and appear in `unknownFiles`/`reasons` without setting partial. Literal paths anywhere in a source add edges. Existing full-suite classifiers and untracked/deleted non-test paths without importers escalate the shadow to full; listing failures do likewise. Symlinks and paths outside ROOT are never read. Test filesystem admission separately from parser bounds: oversized metadata must cause zero source reads, while exactly-at-cap files remain readable. Measure rows bind `head` (40 hex) and `base`, and record shadow mode, unknown count, selected/total tests and reasons; full shadow mode has no `shadowEscaped` tests. Sorted repo-relative `staticTests` preserves pure edge reach (including unknown widening) before escalation; measure rows record `staticTestCount` alongside `totalTests` and `mode`, and `shadowEscapedStatic` measures failures outside that reach even in full mode. Missing static evidence yields null counts/escapes. None of these fields changes the real decision; `staticTests` is diagnostic only.

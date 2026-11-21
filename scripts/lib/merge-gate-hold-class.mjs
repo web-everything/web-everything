@@ -35,6 +35,32 @@ const isWorkflowTouchHold = r => r.id === 'review-acceptance' && r.status === 'h
 const manualFreeze = r => r.id === 'red-main-freeze' && r.status === 'hold'
   && /^main is RED \(freeze: manual freeze: .+\)$/.test(r.reason ?? '');
 
+const automaticFreeze = r => r.id === 'red-main-freeze' && r.status === 'hold' && !manualFreeze(r)
+  && /^main is RED \(freeze: main CI red since [0-9a-f]{9,40}\)$/.test(r.reason ?? '');
+
+export function mainCiGreenAfter(main, completedAt) {
+  return !main?.error && main?.status === 'completed' && main.conclusion === 'success'
+    && Number.isFinite(Date.parse(completedAt)) && Date.parse(main.completed_at) > Date.parse(completedAt);
+}
+
+/** Fresh, bounded read: never select an older success by filtering the latest run's status. */
+const MAIN_CI_QUERY = 'branch=main&event=push&per_page=10';
+const MAIN_CI_EVENT = new URLSearchParams(MAIN_CI_QUERY).get('event');
+export function readLatestMainCi({ repo, runGh = runGhSync } = {}) {
+  try {
+    const data = JSON.parse(runGh(['api', `repos/${repo}/actions/workflows/ci.yml/runs?${MAIN_CI_QUERY}`], {
+      encoding: 'utf8', timeout: 30_000, maxBuffer: 1024 * 1024, stdio: ['ignore', 'pipe', 'pipe'],
+      throttle: { op: 'merge-gate-main-ci', repo },
+    }));
+    const runs = data?.workflow_runs;
+    const run = Array.isArray(runs) && runs.length > 0 && runs.length <= 10 ? runs[0] : null;
+    if (!run || runs.some(r => r?.head_branch !== 'main' || r.event !== MAIN_CI_EVENT || r.status !== 'completed')
+      || run.conclusion !== 'success'
+      || !Number.isFinite(Date.parse(run.updated_at))) return { error: 'latest main CI incomplete or unreadable' };
+    return { status: run.status, conclusion: run.conclusion, completed_at: run.updated_at };
+  } catch (e) { return { error: String(e?.message ?? e) }; }
+}
+
 /** Shared candidacy classification; workflow-edit protection is applied separately by PR-event policy. */
 export function isCandidacyHold(result) {
   return result?.status === 'hold' && (candidacy.has(result.id) || isRedTeamMissing(result)
@@ -138,12 +164,15 @@ export function parsePrResultTable(log, prNumber) {
 }
 
 /** Pure classification; a candidate must have an actually passing merge-gate. */
-export function classifyMergeGateHold({ results, prLabels, freeze, verdictCompletedAt, mainCiGreen } = {}) {
+export function classifyMergeGateHold({ results, prLabels, freeze, verdictCompletedAt, mainCiGreen, mainCiNow } = {}) {
   const unreadable = why => ({ excused: false, kind: 'unreadable', holds: [], others: [], why });
   if (!Array.isArray(results) || !results.length || !Array.isArray(prLabels)
     || prLabels.some(l => typeof (typeof l === 'string' ? l : l?.name) !== 'string')
     || results.some(r => !r || !statuses.has(r.status) || !gates.has(r.id))) return unreadable('unreadable verdict or labels');
   const holds = results.filter(blocking), others = [];
+  if (holds.length === 1 && automaticFreeze(holds[0]) && mainCiGreenAfter(mainCiNow, verdictCompletedAt)) {
+    return { excused: false, rerun: true, kind: 'stale-main-freeze', holds, others: [], why: 'automatic main-CI freeze predates latest green main CI' };
+  }
   let hasCandidacy = false, hasStaleFreeze = false;
   for (const r of holds) {
     if (r.status === 'fail-closed') { others.push(r); continue; }
@@ -166,7 +195,7 @@ export function latestFailingMergeGate(rows) {
 }
 
 /** Pure except injected readers. A lazy freeze reader lets an entire pass share one fresh read. */
-export function excuseMergeGateRows(rows, { prNumber, headSha, labels, readVerdict, freeze, setting } = {}) {
+export function excuseMergeGateRows(rows, { prNumber, headSha, labels, readVerdict, freeze, setting, readMainCi, repo } = {}) {
   const unchanged = { rows, excused: false };
   try {
     if ((typeof setting === 'string' ? setting : setting?.value) !== 'on') return unchanged;
@@ -193,7 +222,19 @@ export function excuseMergeGateRows(rows, { prNumber, headSha, labels, readVerdi
       return { rows: rows.map(r => r === row ? replacement : r), excused: false, reviewHold: true };
     }
     const currentFreeze = verdict.results?.some(manualFreeze) && typeof freeze === 'function' ? freeze() : freeze;
-    const classification = classifyMergeGateHold({ results: verdict.results, prLabels: labels, freeze: currentFreeze, verdictCompletedAt: verdict.completed_at, mainCiGreen: verdict.mainCiGreen });
+    const holds = verdict.results?.filter(blocking);
+    const validRun = Number.isSafeInteger(verdict.run_id) && verdict.run_id > 0
+      && Number.isSafeInteger(verdict.run_attempt) && verdict.run_attempt > 0;
+    const mainCiNow = validRun && holds?.length === 1 && automaticFreeze(holds[0]) ? readMainCi?.() : undefined;
+    const classification = classifyMergeGateHold({ results: verdict.results, prLabels: labels, freeze: currentFreeze, verdictCompletedAt: verdict.completed_at, mainCiGreen: verdict.mainCiGreen, mainCiNow });
+    if (classification.rerun) {
+      const sharedFreeze = typeof freeze === 'function' ? freeze() : freeze;
+      if (!sharedFreeze || sharedFreeze.error || sharedFreeze.frozen !== false || verdict.evaluatorOnlyFailure !== true) return unchanged;
+      const replacement = { ...row, mergeGateReviewHold: { holds: ['red-main-freeze'], jobId },
+        mergeGateStaleFreeze: { repo, pr: prNumber, head: headSha, run: verdict.run_id, job: jobId,
+          attempt: verdict.run_attempt, completedAt: verdict.completed_at } };
+      return { rows: rows.map(r => r === row ? replacement : r), excused: false, reviewHold: true };
+    }
     if (!classification.excused) {
       const holds = verdict.results?.filter(blocking) ?? [];
       // Card 273, #5157: annotation rides on candidacyHoldIsNotCiFailure; off never annotates.
@@ -207,6 +248,18 @@ export function excuseMergeGateRows(rows, { prNumber, headSha, labels, readVerdi
       mergeGateHoldExcused: { kind: classification.kind, holds: classification.holds, jobId } };
     return { rows: rows.filter(r => r.name !== 'merge-gate' || r === row).map(r => r === row ? replacement : r), excused: true };
   } catch { return unchanged; }
+}
+
+function evaluatorOnlyFailure(job) {
+  // The evaluator must be the sole failed step in the gate's own completed job.
+  const steps = job.steps;
+  if (job.name !== 'merge-gate' || job.status !== 'completed' || job.conclusion !== 'failure'
+    || !Array.isArray(steps) || !steps.length
+    || steps.some(s => s.status !== 'completed' || !['success', 'failure', 'skipped'].includes(s.conclusion))) return false;
+  const failed = steps.filter(s => s.conclusion === 'failure');
+  if (failed.length !== 1 || failed[0].name !== "Evaluate the drain's merge gates"
+    || steps.filter(s => s.name === failed[0].name).length !== 1) return false;
+  return true;
 }
 
 function parseWorkflowProtection(job, log, prNumber) {
@@ -223,14 +276,7 @@ function parseWorkflowProtection(job, log, prNumber) {
   }
   const tableWorkflowHold = table.results.some(isWorkflowTouchHold);
   if (!tableWorkflowHold) return null;
-  // The evaluator must be the sole failed step in the gate's own completed job.
-  const steps = job.steps;
-  if (job.name !== 'merge-gate' || job.status !== 'completed' || job.conclusion !== 'failure'
-    || !Array.isArray(steps) || !steps.length
-    || steps.some(s => s.status !== 'completed' || !['success', 'failure', 'skipped'].includes(s.conclusion))) return { error: 'unreadable workflow-protection job' };
-  const failed = steps.filter(s => s.conclusion === 'failure');
-  if (failed.length !== 1 || failed[0].name !== "Evaluate the drain's merge gates"
-    || steps.filter(s => s.name === failed[0].name).length !== 1) return { error: 'workflow-protection evaluator is not the sole failed step' };
+  if (!evaluatorOnlyFailure(job)) return { error: 'workflow-protection evaluator is not the sole failed step' };
   return { ...table, workflowEditProtection: true };
 }
 
@@ -252,7 +298,8 @@ export function readMergeGateVerdict({ repo, jobId, prNumber, runGh = runGhSync,
       cache.set(key, { job, log });
     }
     const { job, log } = cache.get(key);
-    return { ...(parseWorkflowProtection(job, log, prNumber) ?? parsePrResultTable(log, prNumber)), head_sha: job.head_sha, completed_at: job.completed_at };
+    return { ...(parseWorkflowProtection(job, log, prNumber) ?? parsePrResultTable(log, prNumber)), head_sha: job.head_sha, completed_at: job.completed_at, evaluatorOnlyFailure: evaluatorOnlyFailure(job),
+      ...(job.run_id !== undefined ? { run_id: job.run_id, run_attempt: job.run_attempt } : {}) };
   } catch (e) { return { error: String(e?.message ?? e) }; }
 }
 
@@ -314,10 +361,18 @@ export function loadMergeGateHoldSetting({ key = defaultKey, env = process.env, 
 }
 
 /** One pass, one lazy shared-freeze read; any PR-specific read failure preserves its original rows. */
-export function excusePrMergeGateHolds(prs, { repo, readMergeGateVerdict: readVerdict = readMergeGateVerdict, readFreeze, mergeGateSetting, env } = {}) {
+export function excusePrMergeGateHolds(prs, { repo, readMergeGateVerdict: readVerdict = readMergeGateVerdict, readMainCi = readLatestMainCi, readFreeze, mergeGateSetting, env } = {}) {
   try {
     const setting = mergeGateSetting ?? loadMergeGateHoldSetting({ env });
     let freezeRead = false, freeze;
+    let mainRead = false, main;
+    const lazyMain = () => {
+      if (!mainRead) {
+        mainRead = true;
+        try { main = readMainCi({ repo }); } catch (e) { main = { error: String(e?.message ?? e) }; }
+      }
+      return main;
+    };
     const lazyFreeze = () => {
       if (!freezeRead) {
         freezeRead = true;
@@ -327,7 +382,7 @@ export function excusePrMergeGateHolds(prs, { repo, readMergeGateVerdict: readVe
     };
     return prs.map(pr => {
       const out = excuseMergeGateRows(pr.statusCheckRollup, { prNumber: pr.number, headSha: pr.headRefOid, labels: pr.labels,
-        readVerdict: args => readVerdict({ ...args, repo }), freeze: lazyFreeze, setting });
+        readVerdict: args => readVerdict({ ...args, repo }), freeze: lazyFreeze, setting, readMainCi: lazyMain, repo });
       return out.excused || out.reviewHold ? { ...pr, statusCheckRollup: out.rows } : pr;
     });
   } catch { return prs; }
