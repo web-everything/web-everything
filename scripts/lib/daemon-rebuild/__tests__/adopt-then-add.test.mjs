@@ -43,6 +43,19 @@ describe(`superseded-omits-live-overlay: ${seat} (18:06 ET discard)`, () => {
     expect(m.adopt).toBeTruthy();
     expect(m.rebuildAfter).toEqual([seat]);
   });
+  it('refuses an omitted registered overlay when its live entry is explicitly pinned', () => {
+    const live = { overlays: [{ ref: seat, pinned: true }] };
+    const candidate = ready();
+    candidate.adopt.applied = [];
+    expect(live.overlays.some((o) => o.ref === seat)).toBe(true);
+    const m = matchReadyCandidate(args({ ...omit, ready: candidate,
+      readdable: (ref) => {
+        const entry = live.overlays.find((o) => o?.ref === ref);
+        return !!entry && entry.pinned !== true;
+      },
+    }));
+    expect(m).toMatchObject({ adopt: null, reason: `superseded-omits-live-overlay: ${seat}` });
+  });
   it.each([{ auditAdopted: undefined }, { auditAdopted: [] }, { auditAdopted: [seat] }])(
     'refuses to erase live audit history with auditAdopted=$auditAdopted', ({ auditAdopted }) => {
       // Even a currently audited tip can move after adoption. Neither an empty/missing history list nor

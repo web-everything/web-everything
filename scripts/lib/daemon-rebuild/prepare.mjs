@@ -684,12 +684,14 @@ export async function prepareRebuild({
         removalSafety: mainOnly ? () => 'unknown' : (ref, sha) => classifyOverlayRemoval({
           ref, sha, decisions: plan.decisions, events: readOverlayEvents(), inMain: (s) => tipInMain(git, plan.mainSha, s),
         }),
-        // Registered NOW (the on-disk registry, not the tick-start snapshot): a removal made during planning is not re-added.
+        // Registered NOW (the on-disk registry, not the tick-start snapshot): removals are not re-added,
+        // and an explicit pin must stay in the running build rather than wait for the next rebuild.
         readdable: (ref) => {
           if (!wantedRefs.has(ref) || !registeredRefs.has(ref)) return false;
           try {
             const live = readOverlayState(root, { env });
-            return !live.corrupt && live.overlays.some((o) => o?.ref === ref);
+            const entry = live.overlays.find((o) => o?.ref === ref);
+            return !live.corrupt && !!entry && entry.pinned !== true;
           } catch { return false; }
         },
         // Explicit snapshot declaration or complete current PR chain; unknown/malformed still refuses.

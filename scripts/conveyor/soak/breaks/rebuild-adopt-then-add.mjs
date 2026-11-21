@@ -160,7 +160,7 @@ export async function auditPinOmissionViolations(sourceRoot = REPO_ROOT, { mainC
  * declaring independence/authorship in matcher stubs. GitHub IO alone is injected; no network is needed. */
 export async function registryContractViolations(sourceRoot = REPO_ROOT) {
   const from = (file) => import(pathToFileURL(resolve(sourceRoot, file)).href);
-  const { addOverlay, appendOverlayEvent, readOverlays, makePrBaseChain } = await from('scripts/lib/daemon-overlays.mjs');
+  const { addOverlay, removeOverlay, appendOverlayEvent, readOverlays, makePrBaseChain } = await from('scripts/lib/daemon-overlays.mjs');
   const { readyOverlayDependencies, readOverlayEventLog } = await from('scripts/lib/daemon-rebuild/prepare.mjs');
   const { matchReadyCandidate, classifyOverlayRemoval } = await from(ADOPT);
   const { OPERATOR_LOGINS } = await from('scripts/lib/marker-authorship.mjs');
@@ -178,6 +178,22 @@ export async function registryContractViolations(sourceRoot = REPO_ROOT) {
     const match = matchReadyCandidate(base({ ...omitsLive, readdable: (ref) => overlays.some((o) => o.ref === ref),
       dependsOn: (ref) => dependencies.get(ref) ?? null }));
     if (!match.adopt) violations.push({ invariant: 'real-registration-adopts', detail: match.reason });
+
+    // Explicit operator pins survive unregister/re-register churn. Registration alone cannot
+    // authorize a temporary omission; prepare's production closure is covered by operator-retirement.test.mjs.
+    const pinnedRef = 'lane/review-seat-fairness-m1';
+    removeOverlay(root, pinnedRef, { env });
+    addOverlay(root, { ref: pinnedRef, pinned: true }, { env });
+    const pinned = matchReadyCandidate(base({ ...omitsLive,
+      ready: { ...base().ready, adopt: { ...base().ready.adopt, applied: [] } },
+      readdable: (ref) => {
+        const entry = readOverlays(root, { env }).find((o) => o?.ref === ref);
+        return !!entry && entry.pinned !== true;
+      },
+    }));
+    if (pinned.adopt || pinned.reason !== `superseded-omits-live-overlay: ${pinnedRef}`) {
+      violations.push({ invariant: 'explicit-pin-omission-refused', detail: JSON.stringify(pinned) });
+    }
 
     addOverlay(root, { ref: 'lane/a', dependsOn: [] }, { env });
     addOverlay(root, { ref: 'lane/a', stackBases: ['lane/review-seat-fairness-m1'] }, { env });

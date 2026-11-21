@@ -287,6 +287,7 @@ describe('operator retirement of a live overlay', () => {
     'mainOnly benign removal', 'benign manual removal', 'removed during planning', 'malformed dependsOn',
     'declared dependency', 'stack dependency', 'unknown chain', 'complete production chain', 'snapshot declaration', 'auto-drop contract',
     'fresh chain dependency', 'malformed fresh chain', 'older carried tip', 'audited omission',
+    'explicitly pinned omission', 're-registered pinned during planning',
   ])('prepareRebuild adapter: %s', async (mode) => {
     env = { ...env, WE_DAEMON_STATE_DIR: join(root, 'state'), WE_DAEMON_AUTO_REBASE: '0',
       WE_DAEMON_OVERLAY_FOLLOW_TIP: mode === 'audited omission' ? 'audited-only' : 'follow' };
@@ -294,6 +295,8 @@ describe('operator retirement of a live overlay', () => {
     const carried = 'lane/carried';
     const mainOnly = mode === 'mainOnly benign removal';
     const removedCarried = mainOnly || mode === 'benign manual removal';
+    const pinnedOmission = ['explicitly pinned omission', 're-registered pinned during planning'].includes(mode);
+    if (mode === 'explicitly pinned omission') addOverlay(root, { ref, pinned: true }, { env });
     const deps = mode === 'malformed dependsOn' ? ['bad ref!'] : mode === 'declared dependency' ? [ref] : [];
     addOverlay(root, { ref: carried, pr: 100,
       ...(!['complete production chain', 'unknown chain', 'fresh chain dependency', 'malformed fresh chain', 'older carried tip'].includes(mode) ? { dependsOn: deps } : {}),
@@ -316,12 +319,16 @@ describe('operator retirement of a live overlay', () => {
     if (mode === 'auto-drop contract') plan.decisions.push({ ref: carried, action: 'remove', reason: 'pr-merged' });
     writeRebuildState(root, { adopted: { head: liveHead, mainSha, applied: removedCarried ? [] : [{ ref, sha }] } }, env);
     writeReadyCandidate(root, { kind: 'candidate', prevHead: liveHead, passedAt: '2026-11-15T10:00:00Z', tree: 'candidate-tree',
-      adopt: { finalSha: candidate, mainSha, inputsKey: 'ready-plan', applied: [{ ref: carried, sha }] } }, env);
+      adopt: { finalSha: candidate, mainSha, inputsKey: 'ready-plan', applied: pinnedOmission ? [] : [{ ref: carried, sha }] } }, env);
     vi.spyOn(localState, 'ensureSafeToMove').mockReturnValue({ safe: true, untracked: [] });
     vi.spyOn(repair, 'repairCloneRefs').mockReturnValue({ ok: true, pruned: [], reportedNew: [] });
     vi.spyOn(edgeFetch, 'fetchMainAndOverlays').mockReturnValue({ ok: true, goneRefs: [] });
     vi.spyOn(planner, 'planRebuild').mockImplementation(async () => {
       if (mode === 'removed during planning') removeOverlay(root, ref, { env });
+      if (mode === 're-registered pinned during planning') {
+        removeOverlay(root, ref, { env });
+        addOverlay(root, { ref, pinned: true }, { env });
+      }
       if (mode === 'snapshot declaration') addOverlay(root, { ref: carried, dependsOn: [ref] }, { env });
       return plan;
     });
@@ -351,6 +358,14 @@ describe('operator retirement of a live overlay', () => {
     }, { fresh: new Map() });
     await prepareRebuild({ root, env, run, now: () => Date.parse('2026-11-15T10:01:00Z'), mainOnly, adoptOnly: true, prBaseChain: chain });
     expect(matching).toHaveBeenCalledOnce();
+    if (pinnedOmission) {
+      const hooks = matching.mock.calls[0][0];
+      expect(hooks.registered(ref)).toBe(true);
+      expect(hooks.auditedTip).not.toBeTypeOf('function');
+      expect(readOverlays(root, { env }).find((o) => o.ref === ref)?.pinned).toBe(true);
+      expect(hooks.readdable(ref)).toBe(false);
+      expect(adoption.finalizeRebuild).not.toHaveBeenCalled();
+    }
     const match = matching.mock.results[0].value;
     if (['benign manual removal', 'complete production chain', 'snapshot declaration', 'auto-drop contract'].includes(mode)) expect(match.adopt).toBeTruthy();
     else expect(match).toMatchObject({ adopt: null, reason: mainOnly ? 'overlay-no-longer-wanted' : `superseded-omits-live-overlay: ${ref}` });
