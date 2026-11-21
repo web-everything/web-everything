@@ -59,7 +59,7 @@ describe('review-hold-only red draft promotion', () => {
     ['unchecked despite the flag', { state: 'unchecked', reviewHoldOnly: true }],
   ])('refuses %s before calling ready', (_, fresh) => {
     const ready = vi.fn();
-    const result = runReconcilePromoteDraftDispatch({
+    const result = runReconcilePromoteDraftDispatch({ readComments: () => [],
       root: '/repo',
       reconcile: () => ({ dispatch: [{ kind: 'promote-draft', prNumber: 198, headRefOid: HEAD }], refusals: [] }),
       provider: { ready }, checkStaleness: FRESH, readPrLabels: () => [],
@@ -77,7 +77,7 @@ describe('review-hold-only red draft promotion', () => {
     const runGhSyncSpy = vi.spyOn(ghThrottle, 'runGhSync').mockReturnValue('');
     const clearAwaitingCi = vi.fn();
     try {
-      const result = runReconcilePromoteDraftDispatch({
+      const result = runReconcilePromoteDraftDispatch({ readComments: () => [],
         root: '/repo', repo: 'plateauapp/plateau-app',
         reconcile: () => ({ dispatch: [{ kind: 'promote-draft', prNumber: 198, headRefOid: HEAD }], refusals: [] }),
         checkStaleness: FRESH, readPrLabels: () => [],
@@ -97,7 +97,7 @@ describe('review-hold-only red draft promotion', () => {
 describe('runReconcilePromoteDraftDispatch (draft-first PRs)', () => {
   it('calls provider.ready for every promote-draft entry, and nothing else', async () => {
     const readyCalls = [];
-    const result = runReconcilePromoteDraftDispatch({
+    const result = runReconcilePromoteDraftDispatch({ readComments: () => [],
       root: '/repo',
       reconcile: () => ({
         dispatch: [
@@ -119,7 +119,7 @@ describe('runReconcilePromoteDraftDispatch (draft-first PRs)', () => {
   });
 
   it('an empty plan promotes nothing and refuses nothing', () => {
-    const result = runReconcilePromoteDraftDispatch({
+    const result = runReconcilePromoteDraftDispatch({ readComments: () => [],
       root: '/repo', reconcile: () => ({ dispatch: [], refusals: [] }),
       provider: { ready: () => { throw new Error('must not be called'); } },
       checkStaleness: FRESH, readPrLabels: () => [],
@@ -131,7 +131,7 @@ describe('runReconcilePromoteDraftDispatch (draft-first PRs)', () => {
 
   it('a gh failure on one PR is reported as a refusal and does not stop the rest of the batch', () => {
     const readyCalls = [];
-    const result = runReconcilePromoteDraftDispatch({
+    const result = runReconcilePromoteDraftDispatch({ readComments: () => [],
       root: '/repo',
       reconcile: () => ({
         dispatch: [
@@ -156,7 +156,7 @@ describe('runReconcilePromoteDraftDispatch (draft-first PRs)', () => {
   });
 
   it('carries the reconcile pass\'s own refusal count through, unmodified', () => {
-    const result = runReconcilePromoteDraftDispatch({
+    const result = runReconcilePromoteDraftDispatch({ readComments: () => [],
       root: '/repo',
       reconcile: () => ({ dispatch: [], refusals: [{ kind: 'draft', prNumber: 9 }] }),
       provider: { ready: () => {} },
@@ -169,7 +169,7 @@ describe('runReconcilePromoteDraftDispatch (draft-first PRs)', () => {
   });
 
   it('refuses an unknown --repo before ever calling reconcile or provider', () => {
-    expect(() => runReconcilePromoteDraftDispatch({
+    expect(() => runReconcilePromoteDraftDispatch({ readComments: () => [],
       root: '/repo', repo: 'unknown/repo',
       reconcile: () => { throw new Error('must not be called'); },
       provider: { ready: () => { throw new Error('must not be called'); } },
@@ -181,7 +181,7 @@ describe('runReconcilePromoteDraftDispatch (draft-first PRs)', () => {
 
   it('reads a shared `--prs-file=` snapshot instead of asking `reconcile` for a fresh gh read, when given one', () => {
     let seenReadPrs = null;
-    runReconcilePromoteDraftDispatch({
+    runReconcilePromoteDraftDispatch({ readComments: () => [],
       root: '/repo', prsFile: '/tmp/some-file.json',
       reconcile: (opts) => { seenReadPrs = typeof opts.readPrs; return { dispatch: [], refusals: [] }; },
       provider: { ready: () => {} },
@@ -199,7 +199,7 @@ describe('runReconcilePromoteDraftDispatch — stale-green re-verification (#281
   it('refuses to promote when a fresh per-sha read disagrees with the plan\'s own (stale) green read', () => {
     const readyCalls = [];
     const seenArgs = [];
-    const result = runReconcilePromoteDraftDispatch({
+    const result = runReconcilePromoteDraftDispatch({ readComments: () => [],
       root: '/repo',
       reconcile: () => ({ dispatch: [{ kind: 'promote-draft', prNumber: 2811, headRefOid: HEAD }], refusals: [] }),
       provider: { ready: (pr) => { readyCalls.push(pr); } },
@@ -219,7 +219,7 @@ describe('runReconcilePromoteDraftDispatch — stale-green re-verification (#281
   });
 
   it('still refuses on a fresh `pending` read — only a completed, all-succeeded read promotes', () => {
-    const result = runReconcilePromoteDraftDispatch({
+    const result = runReconcilePromoteDraftDispatch({ readComments: () => [],
       root: '/repo',
       reconcile: () => ({ dispatch: [{ kind: 'promote-draft', prNumber: 2812, headRefOid: HEAD }], refusals: [] }),
       provider: { ready: () => { throw new Error('must not be called'); } },
@@ -233,7 +233,7 @@ describe('runReconcilePromoteDraftDispatch — stale-green re-verification (#281
 
   it('promotes normally once the fresh re-read confirms green', () => {
     const readyCalls = [];
-    const result = runReconcilePromoteDraftDispatch({
+    const result = runReconcilePromoteDraftDispatch({ readComments: () => [],
       root: '/repo',
       reconcile: () => ({ dispatch: [{ kind: 'promote-draft', prNumber: 2813, headRefOid: HEAD }], refusals: [] }),
       provider: { ready: (pr) => { readyCalls.push(pr); } },
@@ -247,7 +247,7 @@ describe('runReconcilePromoteDraftDispatch — stale-green re-verification (#281
   });
 
   it('a re-read that cannot be performed at all refuses rather than promoting on the stale plan alone', () => {
-    const result = runReconcilePromoteDraftDispatch({
+    const result = runReconcilePromoteDraftDispatch({ readComments: () => [],
       root: '/repo',
       reconcile: () => ({ dispatch: [{ kind: 'promote-draft', prNumber: 2814, headRefOid: HEAD }], refusals: [] }),
       provider: { ready: () => { throw new Error('must not be called'); } },
@@ -261,7 +261,7 @@ describe('runReconcilePromoteDraftDispatch — stale-green re-verification (#281
 
   it('clears the now-stale review-status:awaiting-ci label the instant a draft promotes (#2821)', () => {
     const statusCalls = [];
-    const result = runReconcilePromoteDraftDispatch({
+    const result = runReconcilePromoteDraftDispatch({ readComments: () => [],
       root: '/repo',
       reconcile: () => ({ dispatch: [{ kind: 'promote-draft', prNumber: 2821, headRefOid: HEAD }], refusals: [] }),
       provider: { ready: () => {} },
@@ -283,7 +283,7 @@ describe('runReconcilePromoteDraftDispatch — stale-green re-verification (#281
       const readHeadCheckState = args => defaultReadHeadCheckState({ ...args,
         runGh: () => rows.map(row => JSON.stringify(row)).join('\n'),
         getRequiredChecks: () => ({ checks: [], source: 'unavailable' }) });
-      const result = runReconcilePromoteDraftDispatch({
+      const result = runReconcilePromoteDraftDispatch({ readComments: () => [],
         root: '/repo', repo: 'plateauapp/plateau-app',
         reconcile: () => ({ dispatch: [{ kind: 'promote-draft', prNumber: 198, headRefOid: HEAD }], refusals: [] }),
         provider: { ready }, checkStaleness: FRESH, readPrLabels: () => [], readHeadCheckState, clearAwaitingCi: NOOP_STATUS,
@@ -324,7 +324,7 @@ describe('runReconcilePromoteDraftDispatch — stale-green re-verification (#281
       const ghThrottle = await import('../../lib/gh-throttle.mjs');
       const runGhSyncSpy = vi.spyOn(ghThrottle, 'runGhSync').mockReturnValue('');
       try {
-        const result = runReconcilePromoteDraftDispatch({
+        const result = runReconcilePromoteDraftDispatch({ readComments: () => [],
           root: '/repo',
           repo: 'plateauapp/plateau-app',
           reconcile: () => ({
@@ -351,7 +351,7 @@ describe('runReconcilePromoteDraftDispatch — stale-green re-verification (#281
       const ghThrottle = await import('../../lib/gh-throttle.mjs');
       const runGhSyncSpy = vi.spyOn(ghThrottle, 'runGhSync').mockReturnValue('');
       try {
-        runReconcilePromoteDraftDispatch({
+        runReconcilePromoteDraftDispatch({ readComments: () => [],
           root: '/repo',
           reconcile: () => ({
             dispatch: [{ kind: 'promote-draft', prNumber: 999, headRefOid: 'f'.repeat(40) }],
@@ -370,7 +370,7 @@ describe('runReconcilePromoteDraftDispatch — stale-green re-verification (#281
   });
 
   it('a clearAwaitingCi failure is best-effort and never turns a successful promotion into a refusal', () => {
-    const result = runReconcilePromoteDraftDispatch({
+    const result = runReconcilePromoteDraftDispatch({ readComments: () => [],
       root: '/repo',
       reconcile: () => ({ dispatch: [{ kind: 'promote-draft', prNumber: 2822, headRefOid: HEAD }], refusals: [] }),
       provider: { ready: () => {} },
@@ -391,7 +391,7 @@ it('xxh4zw8 fresh exact-head reader refuses complete cancelled evidence without 
   const runGh = vi.fn(() => runs.map(row => JSON.stringify(row)).join('\n'));
   const readHeadCheckState = args => defaultReadHeadCheckState({ ...args, runGh, getRequiredChecks: () => ({ checks: required }) });
   expect(readHeadCheckState({ repoSlug: 'web-everything/web-everything', sha })).toMatchObject({ state: 'red', counts: { total: 4, failed: 1 } });
-  const result = runReconcilePromoteDraftDispatch({ root: '/repo', checkStaleness: FRESH, readPrLabels: () => [],
+  const result = runReconcilePromoteDraftDispatch({ readComments: () => [], root: '/repo', checkStaleness: FRESH, readPrLabels: () => [],
     reconcile: () => ({ dispatch: [{ kind: 'promote-draft', prNumber: 3336, headRefOid: sha }], refusals: [] }),
     provider: { ready }, readHeadCheckState, clearAwaitingCi: NOOP_STATUS });
   expect(ready).not.toHaveBeenCalled();
@@ -416,7 +416,7 @@ describe('xul2kwr fresh withdrawal guard', () => {
     const calls = [];
     const ready = vi.fn(() => calls.push('ready'));
     const clear = vi.fn();
-    const result = runReconcilePromoteDraftDispatch({
+    const result = runReconcilePromoteDraftDispatch({ readComments: () => [],
       root: '/repo', repo: 'plateauapp/plateau-app', checkStaleness: FRESH,
       reconcile: () => ({ dispatch: [entry], refusals: [] }),
       readHeadCheckState: () => { calls.push('checks'); return ALWAYS_GREEN(); },
@@ -484,7 +484,7 @@ describe('isPromoteCodePath — the declared promote code path (#3806 incident)'
 
 describe('runReconcilePromoteDraftDispatch — a draft that is not promoted says why (#3806 incident)', () => {
   it('reports every non-green draft the plan refused, naming its check state; green and withdrawn are not double-reported', () => {
-    const result = runReconcilePromoteDraftDispatch({
+    const result = runReconcilePromoteDraftDispatch({ readComments: () => [],
       root: '/repo',
       reconcile: () => ({
         dispatch: [],
@@ -509,17 +509,17 @@ describe('runReconcilePromoteDraftDispatch — restore-review-label half (PR #38
   const plan = { dispatch: [{ kind: 'restore-review-label', prNumber: 3830, label: 'review:pending' }], refusals: [] };
   it('adds review:pending to a still-label-less PR and reports it', () => {
     const calls = [];
-    const r = runReconcilePromoteDraftDispatch({ ...base, reconcile: () => plan, readPrLabels: () => [], addLabel: (a) => calls.push(a) });
+    const r = runReconcilePromoteDraftDispatch({ readComments: () => [], ...base, reconcile: () => plan, readPrLabels: () => [], addLabel: (a) => calls.push(a) });
     expect(calls).toEqual([expect.objectContaining({ prNumber: 3830, label: 'review:pending' })]);
     expect(r.dispatched).toEqual([{ pr: 3830, kind: 'restore-review-label', label: 'review:pending' }]);
   });
   it('re-reads labels and refuses when a review/landing label appeared since the plan', () => {
-    const r = runReconcilePromoteDraftDispatch({ ...base, reconcile: () => plan, readPrLabels: () => [{ name: 'ready-to-merge' }], addLabel: () => { throw new Error('must not write'); } });
+    const r = runReconcilePromoteDraftDispatch({ readComments: () => [], ...base, reconcile: () => plan, readPrLabels: () => [{ name: 'ready-to-merge' }], addLabel: () => { throw new Error('must not write'); } });
     expect(r.dispatched).toEqual([]);
     expect(r.refusals).toEqual([expect.objectContaining({ pr: 3830, kind: 'label-already-set' })]);
   });
   it('a failed write is a refusal, never a throw', () => {
-    const r = runReconcilePromoteDraftDispatch({ ...base, reconcile: () => plan, readPrLabels: () => [], addLabel: () => { throw new Error('boom'); } });
+    const r = runReconcilePromoteDraftDispatch({ readComments: () => [], ...base, reconcile: () => plan, readPrLabels: () => [], addLabel: () => { throw new Error('boom'); } });
     expect(r.refusals).toEqual([expect.objectContaining({ kind: 'label-failed' })]);
   });
 });
@@ -528,7 +528,7 @@ it('yields between complete PR effects and resumes at the cursor with wraparound
   let time = 10, inEffect = false;
   const touched = [];
   const now = vi.fn(() => { expect(inEffect).toBe(false); return time; });
-  const options = { root: '/repo', checkStaleness: FRESH, now, deadlineAt: 10,
+  const options = { readComments: () => [], root: '/repo', checkStaleness: FRESH, now, deadlineAt: 10,
     reconcile: () => ({ dispatch: [3, 1, 2].map(prNumber => ({ kind: 'promote-draft', prNumber, headRefOid: 'a' })), refusals: [] }),
     readHeadCheckState: () => { inEffect = true; time = 11; return { state: 'green' }; },
     readPrLabels: () => [], provider: { ready: pr => { touched.push(pr); } },
@@ -540,7 +540,7 @@ it('yields between complete PR effects and resumes at the cursor with wraparound
   // The entry check, then each PR's clock read.
   expect(now).toHaveBeenCalledTimes(3);
   touched.length = 0;
-  const second = runReconcilePromoteDraftDispatch({ ...options, cursor: first.nextCursor, deadlineAt: 20 });
+  const second = runReconcilePromoteDraftDispatch({ readComments: () => [], ...options, cursor: first.nextCursor, deadlineAt: 20 });
   expect(touched).toEqual([2, 3, 1]);
   expect(second).toMatchObject({ handled: 3, deferred: [], nextCursor: null });
 });
@@ -548,7 +548,7 @@ it('yields between complete PR effects and resumes at the cursor with wraparound
 it('past deadline with a cursor skips reconcile, uses deferred=[cursor], and keeps the cursor for next pass', () => {
   const reconcile = vi.fn(() => ({ dispatch: [], refusals: [] }));
   const ready = vi.fn(), readHeadCheckState = vi.fn(), readPrLabels = vi.fn();
-  const result = runReconcilePromoteDraftDispatch({ root: '/repo', checkStaleness: FRESH,
+  const result = runReconcilePromoteDraftDispatch({ readComments: () => [], root: '/repo', checkStaleness: FRESH,
     now: () => 11, deadlineAt: 10, cursor: 42, reconcile,
     provider: { ready }, readHeadCheckState, readPrLabels,
   });
@@ -559,7 +559,7 @@ it('past deadline with a cursor skips reconcile, uses deferred=[cursor], and kee
 it('past deadline without a cursor skips reconcile and flags deadlineSkipped', () => {
   const reconcile = vi.fn(() => ({ dispatch: [43, 42].map(prNumber => ({ kind: 'promote-draft', prNumber })), refusals: [] }));
   const ready = vi.fn(), readHeadCheckState = vi.fn(), readPrLabels = vi.fn();
-  const result = runReconcilePromoteDraftDispatch({ root: '/repo', checkStaleness: FRESH,
+  const result = runReconcilePromoteDraftDispatch({ readComments: () => [], root: '/repo', checkStaleness: FRESH,
     now: () => 11, deadlineAt: 10, reconcile, provider: { ready }, readHeadCheckState, readPrLabels,
   });
   expect(result).toMatchObject({ handled: 0, deferred: [], nextCursor: null, deadlineSkipped: true });
@@ -575,7 +575,7 @@ it('promote-draft: a reconcile that always overruns the budget still handles one
     provider: { ready: pr => { promoted.push(pr); } }, clearAwaitingCi: () => {} };
   let cursor;
   for (let pass = 0; pass < 2; pass += 1) {
-    const result = runReconcilePromoteDraftDispatch({ ...options, deadlineAt: time + 100, cursor });
+    const result = runReconcilePromoteDraftDispatch({ readComments: () => [], ...options, deadlineAt: time + 100, cursor });
     expect(result).toMatchObject({ handled: 1, deferred: [pass === 0 ? 6 : 5], nextCursor: pass === 0 ? 6 : 5 });
     cursor = result.nextCursor ?? undefined;
   }
@@ -592,7 +592,45 @@ it('capability-off refuses promotion while a withdrawn draft remains held', () =
   };
   expect(runReconcilePromoteDraftDispatch(options).refusals).toEqual([expect.objectContaining({ kind: 'unsupported-repo' })]);
   expect(ready).not.toHaveBeenCalled();
-  expect(runReconcilePromoteDraftDispatch({ ...options, readPrLabels: () => ['review-status:draft-withdrawn'] }).refusals)
+  expect(runReconcilePromoteDraftDispatch({ readComments: () => [], ...options, readPrLabels: () => ['review-status:draft-withdrawn'] }).refusals)
     .toEqual([expect.objectContaining({ kind: 'draft-withdrawn' })]);
   expect(ready).not.toHaveBeenCalled();
+});
+
+describe('fresh operator park guard', () => {
+  const entry = { kind: 'promote-draft', prNumber: 3432, headRefOid: 'a'.repeat(40) };
+  const park = { author: { login: 'web-everything' }, body: '<!-- operator-park -->' };
+
+  it('a park posted after planning stops the dispatcher write', () => {
+    let comments = [];
+    const ready = vi.fn();
+    const readComments = vi.fn(() => comments);
+    const result = runReconcilePromoteDraftDispatch({
+      root: '/repo', repo: 'plateauapp/plateau-app', checkStaleness: FRESH,
+      reconcile: () => ({ dispatch: [entry], refusals: [] }),
+      readHeadCheckState: () => { comments = [park]; return ALWAYS_GREEN(); },
+      readPrLabels: () => [], readComments, provider: { ready }, clearAwaitingCi: NOOP_STATUS,
+    });
+    expect(readComments).toHaveBeenCalledWith(3432, { repo: 'plateauapp/plateau-app' });
+    expect(result.refusals).toEqual([expect.objectContaining({ kind: 'operator-parked' })]);
+    expect(result.dispatched).toEqual([]);
+    expect(ready).not.toHaveBeenCalled();
+  });
+
+  it.each([undefined, null, {}, 'comments', new Error('unreadable')])(
+    'fails closed for fresh comments %j', comments => {
+      const ready = vi.fn();
+      const result = runReconcilePromoteDraftDispatch({
+        root: '/repo', checkStaleness: FRESH,
+        reconcile: () => ({ dispatch: [entry], refusals: [] }),
+        readHeadCheckState: ALWAYS_GREEN, readPrLabels: () => [],
+        readComments: () => { if (comments instanceof Error) throw comments; return comments; },
+        provider: { ready }, clearAwaitingCi: NOOP_STATUS,
+      });
+      expect(result.refusals).toEqual([expect.objectContaining({
+        kind: 'draft-state-unreadable', why: expect.stringContaining('retry next tick'),
+      })]);
+      expect(ready).not.toHaveBeenCalled();
+    },
+  );
 });

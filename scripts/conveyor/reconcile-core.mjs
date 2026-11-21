@@ -169,7 +169,7 @@ import {
   isLatestAdvisoryFindingAddressed, isAdvisoryMechanismStandDownSuperseded,
 } from './advisory-fix-mark.mjs';
 import { CONFLICT_LABEL } from './conflict-label.mjs';
-import { isOperatorParked } from './draft-promotion-rule.mjs';
+import { isOperatorParked, OPERATOR_PARK_MARKER, OPERATOR_PARK_RELEASE_MARKER } from './draft-promotion-rule.mjs';
 // advisory-after-cap (web-everything/web-everything#2766 live incident, 2026-09-27) — see the ADVISORY-FIX
 // cap-exhausted branch below for why the "is a fresh review owed on a stale advisory note" check reuses these
 // two, never a second reimplementation of "does the newest advisory comment name this PR's CURRENT head".
@@ -389,6 +389,7 @@ export function concurrentAuthorPauseState({ comments, headRefOid = null, now = 
  * it raises no finding.
  */
 export const BOOKKEEPING_MARKERS = Object.freeze([
+  OPERATOR_PARK_MARKER, OPERATOR_PARK_RELEASE_MARKER,
   '<!-- mq-failure-recovery:',
   REFERRAL_HOLD_MARKER,
   REARM_COMMENT_MARKER, CI_HEAL_COMMENT_MARKER, STAND_DOWN_MARKER, SUPERSEDE_STAND_DOWN_MARKER, OPERATOR_ANSWER_MARKER,
@@ -2885,6 +2886,10 @@ export function planReconcile({
     if (pr?.isDraft && (withPhase.check === 'green' || reviewHoldOnlyRed(pr.statusCheckRollup, requiredChecks) || mainFixPriority)) {
       if (labelNames(pr.labels).includes('review-status:draft-withdrawn')) {
         refuse('draft', { ...withPhase, why: 'draft PR is withdrawn — explicit release is required before promotion' });
+        continue;
+      }
+      if (!Array.isArray(pr.comments)) {
+        refuse('draft', { ...withPhase, why: 'draft PR comments are missing or malformed — re-read the complete thread before promotion' });
         continue;
       }
       if (isOperatorParked(pr.comments)) {
