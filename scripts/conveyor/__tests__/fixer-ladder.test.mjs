@@ -1,13 +1,21 @@
 import { describe, expect, it, vi } from 'vitest';
-import { loadFixerLadder, readFixerEscalationOverride } from '../fixer-ladder.mjs';
+import { loadFixerLadder as loadLadder, readFixerEscalationOverride } from '../fixer-ladder.mjs';
 import { fixerTableFor, withRulingNotAddressed } from '../reconcile-fix-dispatch.mjs';
 import { planReconcile } from '../reconcile-core.mjs';
 import { enrichPrsWithIgnoredRulings } from '../reconcile-pass.mjs';
 import { buildAgentArgv } from '../../operations/dispatch-lane-io.mjs';
-import { readRoutingPolicy } from '../../lib/dispatch-routing-policy-io.mjs';
-import { resolveOperationRoute } from '../../lib/dispatch-routing-policy.mjs';
+import { DEFAULT_ROUTING_POLICY as fixPolicy } from '../../lib/dispatch-routing-policy.mjs';
+import { PROVIDER_DEFAULTS } from '../../lib/provider-capacity.mjs';
+const fixCapacity = { ...PROVIDER_DEFAULTS, claudeUsageAccount: 'claude-a' };
+const capacityNow = Date.parse('2026-11-19T12:00:00Z');
+const capacity = [{ ...PROVIDER_DEFAULTS.providers.find(p => p.id === 'claude'), provider: 'claude', account: 'claude-a',
+  health: 1, known: true, windows: [{ usedPercent: 10, resetsAt: capacityNow + 3600000 }] }];
+const readRoutingPolicy = () => fixPolicy;
+const loadFixerLadder = options => loadLadder({ routingPolicy: fixPolicy, providerCapacity: fixCapacity, capacity, now: capacityNow, ...options });
+import { resolveOperationRoute as resolveRoute } from '../../lib/dispatch-routing-policy-io.mjs';
 import { H1, H2, H3, H4, record, recordComment, ignoredRulingThread, BLOCK } from './ruling-fixtures.mjs';
 
+const resolveOperationRoute = options => resolveRoute({ providerCapacity: fixCapacity, capacity, now: capacityNow, ...options });
 const thread = (n) => [...ignoredRulingThread(),
   ...(n > 2 ? [recordComment(record({ head: H3, runId: 'run-3' }), 40)] : []),
   ...(n > 3 ? [recordComment(record({ head: H4, runId: 'run-4' }), 60)] : [])];
@@ -21,8 +29,8 @@ const rungOf = (p) => p.dispatch[0]?.rulingNotAddressed?.rung?.id ?? (p.refusals
 
 describe('ladder loaded from the routing policy', () => {
   const ladder = loadFixerLadder({ override: null });
-  it('models come from the routing policy, never hand-set: the stronger rung resolves to sonnet', () => {
-    expect(ladder.routes['stronger-model']).toMatchObject({ provider: 'claude', model: 'claude-sonnet-5-5', source: 'routing-policy' });
+  it('models come from the routing policy, never hand-set: the stronger rung resolves to the pinned Claude Sonnet model', () => {
+    expect(ladder.routes['stronger-model']).toMatchObject({ provider: 'claude', model: 'claude-sonnet-5-5' });
     expect(ladder.routes.resend).toBeNull();
   });
   it('the critical-work gate keeps fix on Claude, so the cross-provider rung is dormant and the ladder asks the operator at miss 3', () => {

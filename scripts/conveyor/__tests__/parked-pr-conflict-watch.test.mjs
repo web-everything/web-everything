@@ -55,6 +55,7 @@ import {
   CONFLICT_FIX_ROUND_CAP,
   latestConflictFixMarkerCreatedAtMs,
   isWatcherStandDownOperatorAnswered,
+  runConflictWatchCli,
 } from '../parked-pr-conflict-watch.mjs';
 import { buildOperatorAnswer } from '../stand-down-answer-core.mjs';
 import { CONFLICT_FIX_COMMENT_MARKER } from '../conflict-fix-round-count.mjs';
@@ -2179,7 +2180,26 @@ import { prFileContract } from './pr-file-test-helpers.mjs';
 prFileContract({
   name: 'parked-pr-conflict-watch', load: () => import('../parked-pr-conflict-watch.mjs'),
   reader: 'defaultListParkedPrs', run: 'watchParkedPrConflicts',
+  cliMain: 'runConflictWatchCli',
   fields: 'number,headRefName,baseRefName,mergeable,mergeStateStatus,labels,files',
+});
+
+it('the callable CLI rejects an invalid verb without discovering PRs', async () => {
+  const { execFileSync } = await import('node:child_process');
+  const { writeAllSync, writeLineSync } = await import('../../lib/write-all-sync.mjs');
+  execFileSync.mockClear();
+  writeAllSync.mockClear();
+  writeLineSync.mockClear();
+  const savedExitCode = process.exitCode;
+  try {
+    runConflictWatchCli(['invalid', '--dry-run']);
+    expect(process.exitCode).toBe(2);
+    expect(writeLineSync).toHaveBeenCalledWith(2, expect.stringContaining('usage: parked-pr-conflict-watch.mjs sweep'));
+    expect(writeAllSync).not.toHaveBeenCalled();
+    expect(execFileSync).not.toHaveBeenCalled();
+  } finally {
+    process.exitCode = savedExitCode;
+  }
 });
 
 
