@@ -19,6 +19,34 @@ const choose = (capacities, settings = {}, kind = 'fix') => chooseBuilder({ kind
 const repo = { routing: { builder: 'auto', capacity: { claudeUsageAccount: 'claude-a' } } };
 const chain = capacities => resolveFixExecutorChain({ repo, platform: {}, env: {}, capacity: capacities, now, quota: () => null, record: () => {} }).value;
 
+test('signed-out providers are never selected by scores, unknown fallbacks, emergency or allowlists', () => {
+  for (const provider of ['claude', 'agy-gemini', 'agy-claude']) {
+    for (const used of [null, 10]) for (const emergencyOnly of [false, true]) {
+      const c = cap(provider, used, 2, { signedOut: true, allowedKinds: ['fix'], emergencyOnly });
+      const settings = { now, allowUnknownEmergency: true };
+      const decision = chooseBuilder({ kind: 'fix', capacities: [c], settings, fallback: provider });
+      assert.equal(decision.provider, null);
+      assert.equal(decision.inputs[0].label, 'signed-out');
+      assert.equal(decision.inputs[0].score, null);
+      assert.equal(decision.inputs[0].eligible, false);
+      assert.equal(choose([c, cap('codex', 20, 2)], settings).provider, 'codex');
+    }
+  }
+});
+
+test('signed-out capacity has zero health and ignores a newer operator reading', () => {
+  const settings = { providers: [{ id: 'agy-gemini', allowedKinds: ['fix'], windows: [{ name: 'weekly' }],
+    operatorReading: { asOf: now, usedPercent: 10, resetsAt: now + hour } }] };
+  const [c] = readProviderCapacity({ now, settings, readers: {
+    'agy-gemini': () => ({ at: now - hour, status: 'signed-out' }),
+  } });
+  assert.equal(c.signedOut, true);
+  assert.equal(c.operatorReadingStale, false);
+  assert.deepEqual(c.windows, []);
+  assert.equal(c.known, false);
+  assert.equal(c.health, 0);
+});
+
 test('fresh signed-out agy usage file marks both providers without adding usage windows', () => {
   const dir = mkdtempSync(join(tmpdir(), 'capacity-signed-out-'));
   try {

@@ -116,6 +116,44 @@ function processFixture(options = {}) {
 }
 
 describe('PTY collection', () => {
+  it.each(['\x1b[2J', '\x1bc', '\x1b[?1049h', '\x1b[H'])(
+    'does not combine login markers across frame break %j', async frameBreak => {
+      const h = processFixture();
+      const assertion = expect(h.promise).rejects.toThrow('timed out');
+      h.child.stdout.write(`Not signed in${frameBreak}Select login method`);
+      await vi.advanceTimersByTimeAsync(45000);
+      await assertion;
+    });
+  it('rejects login plus folder-trust text as a trust error', async () => {
+    const h = processFixture();
+    const assertion = expect(h.promise).rejects.toThrow('trust this folder');
+    h.child.stdout.write('Not signed in\nSelect login method\nDo you trust this folder?');
+    await assertion;
+    await vi.advanceTimersByTimeAsync(45000);
+    expect(h.writes).toEqual([]);
+  });
+  it('never sends /usage when login arrives after startup Escape and before /usage', async () => {
+    const h = processFixture();
+    await vi.advanceTimersByTimeAsync(3001);
+    expect(h.writes).toEqual(['\x1b']);
+    h.child.stderr.write('Not signed in\nSelect login method');
+    expect(await h.promise).toEqual({ at: new Date(NOW).toISOString(), status: 'signed-out' });
+    await vi.advanceTimersByTimeAsync(45000);
+    expect(h.writes).toEqual(['\x1b']);
+    expect(vi.getTimerCount()).toBe(0);
+  });
+  it('preserves a login marker across the /usage screen reset', async () => {
+    const h = processFixture();
+    await vi.advanceTimersByTimeAsync(3001);
+    h.child.stdout.write('Not signed in\n');
+    await vi.advanceTimersByTimeAsync(299);
+    expect(h.writes).toEqual(['\x1b', '/usage\r']);
+    h.child.stdout.write('Select login method');
+    const result = expect(h.promise).resolves.toEqual({ at: new Date(NOW).toISOString(), status: 'signed-out' });
+    await vi.advanceTimersByTimeAsync(45000);
+    await result;
+    expect(h.writes).toEqual(['\x1b', '/usage\r']);
+  });
   it('resolves parsed usage when the fake PTY replays the signed-in capture', async () => {
     const h = processFixture();
     const resolved = vi.fn();

@@ -72,7 +72,7 @@ export function collectAgyUsage({ home = homedir(), timeoutMs = 45000, spawnFn =
   maxBytes = 1024 * 1024, descendants = descendantPids } = {}) {
   return new Promise((resolve, reject) => {
     const child = spawnFn('sh', ['-c', 'cat | script -q /dev/null agy'], { cwd: home, detached: true, stdio: ['pipe', 'pipe', 'pipe'] });
-    let leaked = false, screen = '', bytes = 0, requested = false, stopping = false, settled = false;
+    let leaked = false, screen = '', loginScreen = '', bytes = 0, requested = false, stopping = false, settled = false;
     const timers = [];
     const later = (fn, ms) => timers.push(setTimeout(fn, ms));
     const finish = (error, value) => {
@@ -98,12 +98,15 @@ export function collectAgyUsage({ home = homedir(), timeoutMs = 45000, spawnFn =
       bytes += Buffer.byteLength(data);
       if (bytes > maxBytes) return finish(new Error('agy output exceeded bound; inspect agy manually and retry'));
       screen += data.toString();
+      // Login evidence survives the usage-only screen reset below, but never a frame break.
+      loginScreen += data.toString();
       const text = stripVTControlCharacters(screen);
-      if (/not signed in/i.test(text) && /Select login method/i.test(text)) {
-        return finish(null, { at: new Date(now()).toISOString(), status: 'signed-out' });
-      }
       if (/trust this folder/i.test(text)) {
         return finish(new Error('agy asks to trust this folder; trust it manually once and retry'));
+      }
+      const loginText = stripVTControlCharacters(loginScreen.split(new RegExp(FRAME_BREAK, 'g')).at(-1));
+      if (/not signed in/i.test(loginText) && /Select login method/i.test(loginText)) {
+        return finish(null, { at: new Date(now()).toISOString(), status: 'signed-out' });
       }
       if (!requested || stopping) return;
       let parsed;
@@ -122,8 +125,12 @@ export function collectAgyUsage({ home = homedir(), timeoutMs = 45000, spawnFn =
     });
     later(() => finish(new Error('agy usage timed out; inspect agy startup or increase timeoutMs and retry')), timeoutMs);
     later(() => {
+      if (settled) return;
       send('\x1b');
-      later(() => { requested = true; screen = ''; send('/usage\r'); }, stepMs);
+      later(() => {
+        if (settled) return;
+        requested = true; screen = ''; send('/usage\r');
+      }, stepMs);
     }, startupMs);
   });
 }
