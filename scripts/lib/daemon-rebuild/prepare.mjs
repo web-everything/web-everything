@@ -13,7 +13,7 @@ import {
 } from './lease.mjs';
 import {
   staleAlertDetail, matchReadyCandidate, readyBuildVerified, finalizeRebuild, dropSuspectOverlays,
-  overlayGraduated, overlayRetiredByOperator, reportDiscardedCandidate, classifyOverlayRemoval,
+  overlayGraduated, reportDiscardedCandidate,
 } from './adopt.mjs';
 import { hostname } from 'node:os';
 import { forceRequestFor, forceBlockedReason, dropReadyCandidate, forcedWatchStatus } from '../daemon-force-adopt.mjs';
@@ -626,10 +626,6 @@ export async function prepareRebuild({
           readyAt: ready.at ?? ready.passedAt,
           ref: a.ref, sha: a.sha, build, registered: (r) => registeredRefs.has(r) || overlaysBefore.some((o) => o?.ref === r), events: readOverlayEvents(), git,
         }),
-        retiredByOperator: (a) => overlayRetiredByOperator({
-          ref: a.ref, sha: a.sha, events: readOverlayEvents(),
-          registered: (r) => registeredRefs.has(r) || overlaysBefore.some((o) => o?.ref === r),
-        }),
         contentInBuild: (sha, build) => contentContainedInBuild(git, sha, build),
         removedForMain: (ref, sha) => {
           if (plan.decisions.some((d) => d.ref === ref && d.action === 'remove' && (d.reason === 'pr-merged' || d.reason === 'in-main'))) return true;
@@ -648,11 +644,6 @@ export async function prepareRebuild({
           const readyMs = Date.parse(ready.at ?? ready.passedAt ?? '');
           return Number.isFinite(retiredMs) && Number.isFinite(readyMs) && retiredMs < readyMs;
         },
-        // Benign removals queue a rebuild after adoption; safety/unknown removals still discard.
-        // A mainOnly rebuild wants no overlay at all, so a candidate carrying any is never adopted for a removed one.
-        removalSafety: mainOnly ? () => 'unknown' : (ref, sha) => classifyOverlayRemoval({
-          ref, sha, decisions: plan.decisions, events: readOverlayEvents(), inMain: (s) => tipInMain(git, plan.mainSha, s),
-        }),
         // R508: a forced record is only adoptable while its rollback watch is intact (read under this write lock).
         forcedWatch: (sha) => forcedWatchStatus(root, stEnv, sha),
       });
@@ -688,7 +679,6 @@ export async function prepareRebuild({
           target: m.adopt.finalSha, match: m.match, passedAt: ready.passedAt, passedBy: `${ready.pid ?? '?'}@${ready.host ?? '?'}`,
           ...(m.dropRefs.length ? { dropping: m.dropRefs.map((s) => s.ref) } : {}),
           ...(m.retired?.length ? { retiredInMain: m.retired } : {}),
-          ...(m.rebuildAfter?.length ? { rebuildAfter: m.rebuildAfter } : {}),
         });
         writeState();
         const fin = await finalizeRebuild({

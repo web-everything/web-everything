@@ -626,7 +626,7 @@ describe('unaudited-tip: a pending ready candidate never outlives its audit evid
     adopt: { finalSha: 'S1', inputsKey: 'K1', mainSha: 'M1', applied }, ...over,
   });
   // The live plan reports each tip it holds back as an `overlay-unaudited-tip` alert (the gate's own, already exempting
-  // established, merged and never-adopted registrations): that alert is what the record is re-judged against.
+  // established and merged registrations): that alert is what the record is re-judged against.
   const holding = (sha) => ({ kind: 'overlay-unaudited-tip', detail: { ref, pr: 42, adopted: 'a1', newTip: sha } });
   const plan = { finalSha: 'S2', inputsKey: 'K2', mainSha: 'M2', applied: [], alerts: [holding('b1')] };
   const args = (over = {}) => ({
@@ -713,9 +713,9 @@ describe('unaudited-tip: a pending ready candidate never outlives its audit evid
     expect(matchReadyCandidate(args({ plan: cleared, auditedTip: null })).match).toBe('superseded'); // follow mode: no gate
   });
 
-  it('mirrors the plan\'s exemptions, so a record the live plan would mint is not discarded: no adopted history, or a tip main already has', () => {
+  it('requires audit evidence even without adopted history; a tip main already has remains exempt', () => {
     const none = () => false;
-    expect(matchReadyCandidate(args({ plan: { ...cleared, auditAdopted: [] }, auditedTip: none })).match).toBe('superseded');
+    expect(matchReadyCandidate(args({ plan: { ...cleared, auditAdopted: [] }, auditedTip: none })).reason).toBe('ready-audit-revoked');
     expect(matchReadyCandidate(args({ plan: { ...cleared, auditAdopted: [ref] }, auditedTip: none })).reason).toBe('ready-audit-revoked');
     expect(matchReadyCandidate(args({ plan: cleared, auditedTip: none, tipInMain: (sha) => sha === 'b1' })).match).toBe('superseded');
   });

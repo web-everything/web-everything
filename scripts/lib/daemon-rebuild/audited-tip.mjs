@@ -41,7 +41,7 @@ export function makeAuditedTipGate(env = process.env) {
   };
 }
 
-/** Object-only Path B evidence: refuse custom drivers; never run checkout/renormalization filters. */
+/** Object-only merge evidence: refuse custom drivers; never run checkout/renormalization filters. */
 export function pathBEvidenceGit(git) {
   const env = { GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: '/dev/null', GIT_ATTR_NOSYSTEM: '1',
     GIT_CONFIG_PARAMETERS: '', GIT_CONFIG_COUNT: '1', GIT_CONFIG_KEY_0: 'merge.renormalize', GIT_CONFIG_VALUE_0: 'false' };
@@ -67,13 +67,12 @@ export function tipInMain(git, mainSha, sha) {
 
 /**
  * PURE: the refs whose applied tip a build must NOT be adopted with, judged against the audit evidence NOW.
- * Mirrors the plan's own exemptions, so a build the live plan would mint is never refused here: a head applied with
- * `pinnedFrom` is never an exemption: the applied sha is judged on its own evidence, a tip the running head or main already carries or has (`carries`, `inMain`),
- * and a registration with no adopted history (`auditAdopted` lists the refs that have one; unknown list = fail closed).
+ * The applied sha needs current evidence unless the running head or main already carries it (`carries`, `inMain`).
+ * `pinnedFrom` and a registration without adopted history never exempt the applied sha.
  * `held` are the tips the live plan reports as held back (`overlay-unaudited-tip` alerts). No gate (follow mode) = nothing to revoke.
  */
 export function revokedAppliedTips({
-  applied, auditedTip, held = [], carries = () => false, inMain = () => false, prevHead, mainSha, auditAdopted,
+  applied, auditedTip, held = [], carries = () => false, inMain = () => false, prevHead, mainSha,
 }) {
   return (applied ?? [])
     .filter((a) => {
@@ -83,7 +82,6 @@ export function revokedAppliedTips({
       // pinnedFrom is the rejected tip, not evidence for the applied sha: it never exempts. The applied sha is judged below.
       if (typeof auditedTip !== 'function') return false;
       if (carries(a.sha, prevHead) || carries(a.sha, mainSha) || inMain(a.sha)) return false;
-      if (Array.isArray(auditAdopted) && !auditAdopted.includes(a.ref)) return false; // never adopted: the plan applies it unaudited
       return auditedTip(a.ref, a.sha) !== true;
     })
     .map((a) => a.ref);

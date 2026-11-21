@@ -10,7 +10,7 @@ import * as lock from '../daemon-clone-lock.mjs';
 import { rebuildClone as publicRebuildClone } from '../daemon-rebuild.mjs';
 import { rebuildClone as coreRebuildClone } from '../daemon-rebuild/index.mjs';
 import { withSelfSync } from '../daemon-self-sync.mjs';
-import { addOverlay, readOverlays, overlayFilePath } from '../daemon-overlays.mjs';
+import { addOverlay, readOverlays } from '../daemon-overlays.mjs';
 import { retireRegistration } from '../../daemon-overlay.mjs';
 
 // The hermetic guard rebinds native fs exports. Spy on that native object and synchronize its
@@ -438,16 +438,11 @@ describe('overlay withdrawal requests', () => {
       addOverlay(root, { ref: 'lane/fix', pinned }, { env });
       const r = spawnSync(process.execPath, [cli, 'remove', `--clone=${root}`, '--ref=lane/fix',
         '--by=tester', '--reason=withdrawn', '--json'], {
-        // Removal permits unknown identity, but must not treat --by as authenticated authority.
-        env: { ...process.env, ...env, HOME: scratch, WE_HERMETIC_GH: 'unauthenticated' },
-        encoding: 'utf8', timeout: 10_000, maxBuffer: 1024 * 1024,
+        env: { ...process.env, ...env, HOME: scratch }, encoding: 'utf8', timeout: 10_000, maxBuffer: 1024 * 1024,
       });
       expect(r.status, r.stderr).toBe(0);
       expect(JSON.parse(r.stdout)).toMatchObject({ removed: true });
       expect(readOverlays(root, { env })).toEqual([]);
-      const event = JSON.parse(readFileSync(overlayFilePath(root, env).replace(/\.json$/, '.events.jsonl'), 'utf8').trim());
-      expect(event).toMatchObject({ kind: 'removed', ref: 'lane/fix', by: 'tester', reason: 'withdrawn' });
-      expect(event).not.toHaveProperty('actor');
       const rec = readRequest({ nowMs: Date.now() });
       if (pinned) expect(rec).toMatchObject({ ref: 'lane/fix', by: 'tester', reason: expect.any(String) });
       else expect(rec).toBeNull();
