@@ -13,7 +13,7 @@ import {
 } from './lease.mjs';
 import {
   staleAlertDetail, matchReadyCandidate, readyBuildVerified, finalizeRebuild, dropSuspectOverlays,
-  overlayGraduated, overlayRetiredByOperator, reportDiscardedCandidate, classifyOverlayRemoval,
+  overlayGraduated, overlayRetiredByOperator, reportDiscardedCandidate,
 } from './adopt.mjs';
 import { hostname } from 'node:os';
 import { forceRequestFor, forceBlockedReason, dropReadyCandidate, forcedWatchStatus } from '../daemon-force-adopt.mjs';
@@ -597,7 +597,6 @@ export async function prepareRebuild({
         }
         return overlayEvents;
       };
-      const liveApplied = liveOverlaysOf(prevHead, plan.mainSha);
       const m = matchReadyCandidate({
         ready,
         plan,
@@ -620,7 +619,7 @@ export async function prepareRebuild({
         tipInMain: (sha) => tipInMain(git, plan.mainSha, sha),
         // the overlays the RUNNING build applies: its own rebuild-committed merge records above main (hard data — an
         // empty list for a plain-main HEAD), plus the recorded adopted set when HEAD is that adopted build
-        liveApplied,
+        liveApplied: liveOverlaysOf(prevHead, plan.mainSha),
         carries: (sha, build) => git(['merge-base', '--is-ancestor', sha, build]).status === 0,
         leftForMain: (a, build) => overlayGraduated({
           readyAt: ready.at ?? ready.passedAt,
@@ -648,11 +647,6 @@ export async function prepareRebuild({
           const readyMs = Date.parse(ready.at ?? ready.passedAt ?? '');
           return Number.isFinite(retiredMs) && Number.isFinite(readyMs) && retiredMs < readyMs;
         },
-        // Benign removals queue a rebuild after adoption; safety/unknown removals still discard.
-        // A mainOnly rebuild wants no overlay at all, so a candidate carrying any is never adopted for a removed one.
-        removalSafety: mainOnly ? () => 'unknown' : (ref, sha) => classifyOverlayRemoval({
-          ref, sha, decisions: plan.decisions, events: readOverlayEvents(), inMain: (s) => tipInMain(git, plan.mainSha, s),
-        }),
         // R508: a forced record is only adoptable while its rollback watch is intact (read under this write lock).
         forcedWatch: (sha) => forcedWatchStatus(root, stEnv, sha),
       });
@@ -688,7 +682,6 @@ export async function prepareRebuild({
           target: m.adopt.finalSha, match: m.match, passedAt: ready.passedAt, passedBy: `${ready.pid ?? '?'}@${ready.host ?? '?'}`,
           ...(m.dropRefs.length ? { dropping: m.dropRefs.map((s) => s.ref) } : {}),
           ...(m.retired?.length ? { retiredInMain: m.retired } : {}),
-          ...(m.rebuildAfter?.length ? { rebuildAfter: m.rebuildAfter } : {}),
         });
         writeState();
         const fin = await finalizeRebuild({

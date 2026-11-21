@@ -432,7 +432,7 @@ describe.each([
     const success = evidence.git;
     evidence.git = vi.fn((args) => JSON.stringify(args) === JSON.stringify(configArgs) ? response : success(args));
     expect(adoption.overlayGraduated(evidence)).toBe(false);
-    expect(evidence.git).toHaveBeenCalledWith(configArgs, expect.objectContaining({ env: expect.any(Object) }));
+    expect(evidence.git).toHaveBeenCalledWith(configArgs);
     expect(evidence.git.mock.calls.some(([args]) => args[0] === 'merge-tree')).toBe(false);
   });
 
