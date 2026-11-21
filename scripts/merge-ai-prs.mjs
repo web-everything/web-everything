@@ -1004,7 +1004,7 @@ export function reconcileDrainReviewPending({ currentLabels, dryRun = false, ...
 /** Adapt dispatch evidence while keeping the legacy decision in off/shadow modes. */
 export function drainClaimReaderFor(mode, { legacy = readLiveFixClaim, drain = readLiveDrainClaim, onShadow } = {}) {
   if (mode === 'off') return legacy;
-  if (mode === 'shadow') return args => {
+  if (mode === 'shadow') return Object.assign(args => {
     const claim = legacy(args);
     try {
       const c = drain(args);
@@ -1014,12 +1014,13 @@ export function drainClaimReaderFor(mode, { legacy = readLiveFixClaim, drain = r
       onShadow?.({ site: args.site, repo: args.repo, pr: args.pr, error: String(error) });
     }
     return claim;
-  };
+  }, { wantsSite: true });
   const readClaim = args => {
     const c = drain(args);
     return c ? { meta: c.entry.meta, kind: c.kind, uncertain: c.uncertain, heldKinds: c.heldKinds } : null;
   };
   readClaim.honourDispatchClaims = 'on';
+  readClaim.wantsSite = true;
   return readClaim;
 }
 
@@ -1031,7 +1032,7 @@ export function drainClaimReaderFor(mode, { legacy = readLiveFixClaim, drain = r
  */
 export function attachLiveFixClaim(data, { claimKey, readClaim, site = 'fresh' }) {
   try {
-    const claim = claimKey ? readClaim({ repo: claimKey, pr: data.number, site }) : null;
+    const claim = claimKey ? readClaim(readClaim?.wantsSite ? { repo: claimKey, pr: data.number, site } : { repo: claimKey, pr: data.number }) : null;
     const meta = claim?.meta ?? claim?.entry?.meta;
     if (meta?.who) data.fixClaim = { who: meta.who, claimedAt: meta.claimedAt ?? null,
       ...(claim.kind ? { kind: claim.kind, uncertain: claim.uncertain, repo: claimKey } : {}) };
