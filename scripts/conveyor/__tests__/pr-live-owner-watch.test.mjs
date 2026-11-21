@@ -6,10 +6,11 @@ import { tmpdir } from 'node:os';
 import { classifyOwner, planActions, processLive, selfAudit, detectSmells, runLiveOwnerWatchPass, probeLiveOwnerWatch, LIVE_OWNER_DEFAULTS } from '../pr-live-owner-watch.mjs';
 import { feedTail, resolveLiveOwnerSettings, createLiveOwnerWatchIo } from '../pr-live-owner-watch-io.mjs';
 import { keepAliveScript } from '../../lib/test-keepalive.mjs';
-// Load the cyclic review graph during collection; its first lazy import inside an
-// adapter test can stall Vite's evaluator and consume the test's entire deadline.
+// Collect the cyclic dispatch graph before per-case deadlines start. The first review
+// adapter otherwise pays for its cold Vite transforms inside the 5-second assertion budget.
 import * as reviewJob from '../../operations/review-job.mjs';
 import { dispatchManualPass } from '../../operations/manual-daemon-pass-io.mjs';
+import { durableCountsFrom } from '../reconcile-pass.mjs';
 
 const NOW = Date.parse('2026-11-10T18:00:00Z'), MIN = 60_000;
 const ago = minutes => new Date(NOW - minutes * MIN).toISOString();
@@ -457,7 +458,7 @@ describe('portable feed IO and settings', () => {
       reconcileReview: () => ({ dispatch: [{ kind: 'review', prNumber: 863 }], refusals: [] }) });
     expect((await io.execute({ pr: pr(), action: 'review-dispatch' })).ok).toBe(true);
     expect(dispatchManualPass.mock.calls[0][0]).toEqual({ daemon: 'review', repo: pr().repo, pr: 863, expectedHead: pr().headRefOid });
-  });
+  }, 15_000); // ~1.9s locally, but it spawns real children and blew the 5000ms default on loaded CI shards; sized from CI, not local
   it('dead red-team adapter abandons, replans recovery and forwards redTeamMode', async () => {
     const order = [], dispatchManualPass = vi.fn(input => { order.push('dispatch'); return { jobPid: 123 }; });
     const { io } = await localIo({ dispatchManualPass, readGhText: commentGh(), readRedTeamStatus: () => ({ status: 'running' }),
@@ -542,7 +543,6 @@ describe('portable feed IO and settings', () => {
 
   async function reviewAdapters(overrides = {}) {
     const { planReconcile, resolveRoundCap } = await import('../reconcile-core.mjs');
-    const { durableCountsFrom } = await import('../reconcile-pass.mjs');
     return { readAgents: () => [], readGhText: commentGh(), dispatchManualPass: vi.fn(),
       reconcileReview: options => {
         const prs = options.readPrs();
@@ -616,18 +616,18 @@ describe('portable feed IO and settings', () => {
   it('PR list retries ETIMEDOUT once and recovers without losing the inventory', async () => {
     const readGhText = vi.fn().mockImplementationOnce(() => { throw Object.assign(Error('spawnSync gh ETIMEDOUT'), { code: 'ETIMEDOUT' }); })
       .mockReturnValueOnce(JSON.stringify([pr()]));
-    const { io } = await localIo({ readGhText });
+    const { io } = await localIo({ readGhText, sleepMs: vi.fn() });
     expect(io.listPRs()).toEqual([pr()]);
     expect(readGhText).toHaveBeenCalledTimes(2);
   });
   it('PR list holds after one failed timeout retry with an inventory inspection fallback', async () => {
     const readGhText = vi.fn(() => { throw Object.assign(Error('spawnSync gh ETIMEDOUT'), { code: 'ETIMEDOUT' }); });
-    const { io } = await localIo({ readGhText });
+    const { io } = await localIo({ readGhText, sleepMs: vi.fn() });
     const h = harness([], { listPRs: io.listPRs });
     const result = await h.run();
     expect(result.considered).toBe(0);
-    expect(result.held).toContainEqual({ reason: expect.stringMatching(/PR list unavailable after one timeout retry.*ETIMEDOUT.*operator must inspect inventory/) });
-    expect(readGhText).toHaveBeenCalledTimes(2); expect(h.io.execute).not.toHaveBeenCalled();
+    expect(result.held).toContainEqual({ reason: expect.stringMatching(/PR list unavailable after 2 retries.*ETIMEDOUT.*operator must inspect inventory/) });
+    expect(readGhText).toHaveBeenCalledTimes(3); expect(h.io.execute).not.toHaveBeenCalled();
   });
 
   it('stale-base gate and optional validator use injected existing entry points', async () => {
