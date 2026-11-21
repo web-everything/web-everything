@@ -1,8 +1,10 @@
 ---
 bornAs: xp754ue
 kind: task
-status: open
+status: resolved
 dateOpened: "2026-11-15"
+dateResolved: "2026-11-21"
+graduatedTo: none
 tags: []
 related: ["daemon-clone-gc-safety-gaps"]
 ---

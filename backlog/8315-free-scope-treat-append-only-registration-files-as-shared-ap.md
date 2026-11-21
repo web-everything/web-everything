@@ -2,9 +2,11 @@
 bornAs: xjyjtqq
 kind: story
 size: 3
-status: open
+status: resolved
 scope: ["we:scripts/operations/free-scope.mjs"]
 dateOpened: "2026-11-15"
+dateResolved: "2026-11-21"
+graduatedTo: none
 tags: []
 ---
 
