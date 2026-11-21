@@ -354,10 +354,11 @@ describe('portable feed IO and settings', () => {
   // These roots share circular dependencies: like createLiveOwnerWatchIo, finish
   // each import before starting the next to avoid a vite-node evaluation deadlock.
   beforeAll(async () => {
+    await import('../pr-stall-sweep.mjs');
     await import('../../operations/manual-daemon-pass-io.mjs');
     await import('../../operations/review-job.mjs');
     await import('../reconcile-pass.mjs');
-  }, 30_000);
+  }, 60_000);
   const dirs = []; afterEach(() => dirs.splice(0).forEach(dir => rmSync(dir, { recursive: true, force: true })));
   async function localIo(adapters = {}, now = NOW, dir, actEnabled = true, extraEnv = {}) {
     if (!dir) { dir = mkdtempSync(join(process.env.TMPDIR || tmpdir(), 'live-owner-')); dirs.push(dir); }
@@ -366,7 +367,8 @@ describe('portable feed IO and settings', () => {
       ...(actEnabled ? { WE_LIVE_OWNER_WATCH_ACT: '1' } : {}), ...extraEnv,
       WE_COORDINATION_ROOT: join(dir, 'coordination'), WE_LIVE_OWNER_WATCH_DIR: join(dir, 'watch'), WE_NEEDS_YOU_FEED: join(dir, 'feed.jsonl'), WE_POLICY_CASCADE_LOG: '0' };
     return { dir, io: await createLiveOwnerWatchIo({ env, home: dir, root: dir, now, adapters: {
-      lockOptions: { stamp: () => ({ runnerStart: 'fixture-birth' }), identity: () => ({ alive: true }) }, ...adapters,
+      lockOptions: { stamp: () => ({ runnerStart: 'fixture-birth' }), identity: () => ({ alive: true }) },
+      loadReviewJob: async () => reviewJob, ...adapters,
     } }) };
   }
   it('reads the existing human + JSON feed format as a byte tail', () => {

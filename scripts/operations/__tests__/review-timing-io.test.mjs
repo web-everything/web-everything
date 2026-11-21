@@ -13,6 +13,11 @@ import { buildSendBackBody, RED_TEAM_GATE_ACTOR, RED_TEAM_GATE_CHANNEL } from '.
 import { buildVerdictComment } from '../../review-set-label.mjs';
 import { PR_COMMENTS_PAGE_SIZE } from '../../lib/review-label-provider.mjs';
 const head = 'a'.repeat(40);
+const gitCommand = args => {
+  let offset = 0;
+  while (args[offset] === '-c') offset += 2;
+  return args[offset];
+};
 it.each([REVIEW_EFFECTS.LABEL, REVIEW_EFFECTS.ADVISORY_NOTE, REVIEW_EFFECTS.STACK_HOLD]
   .flatMap(effect => [false, true].map(scored => [effect, scored])))('publishes %s for an explicitly unpinned read (scored=%s)', async (effect, scored) => {
   const read = shapeReadFinding({ state: 'OPEN', detail: { pr: 7, repo: 'o/n', labels: ['review:human'], humanRequired: true },
@@ -143,7 +148,7 @@ it('reads a real small fix as a delta while keeping the full net diff and head f
     const current = git('rev-parse', 'HEAD'); git('update-ref', 'refs/remotes/origin/lane/test', current);
     const options = { pr: 7, repo: 'o/n', cwd: root, originRepo: () => 'o/n',
       exec: (file, args, opts) => {
-        if (args[0] === 'fetch') return ''; // refs are already pinned locally; no network in this fixture
+        if (gitCommand(args) === 'fetch') return ''; // refs are already pinned locally; no network in this fixture
         return execFileSync(file, args, { ...opts, cwd: root });
       }, readView: () => ({ number: 7, state: 'OPEN', title: 'fixture', body: '', headRefName: 'lane/test', headRefOid: current,
         labels: ['review:pending'], files: [{ path: 'file.txt' }], comments: [acceptAt(prior)] }) };
@@ -174,7 +179,7 @@ function readDeltaFixture(comments) {
     writeFileSync(join(root, 'file.txt'), 'base\nvulnerable code\ndocs line\n'); git('commit', '-qam', 'docs');
     const current = git('rev-parse', 'HEAD'); git('update-ref', 'refs/remotes/origin/lane/test', current);
     return readPr({ pr: 7, repo: 'o/n', cwd: root, originRepo: () => 'o/n',
-      exec: (file, args, opts) => (args[0] === 'fetch' ? '' : execFileSync(file, args, { ...opts, cwd: root })),
+      exec: (file, args, opts) => (gitCommand(args) === 'fetch' ? '' : execFileSync(file, args, { ...opts, cwd: root })),
       readView: () => ({ number: 7, state: 'OPEN', title: 'fixture', body: '', headRefName: 'lane/test', headRefOid: current,
         labels: ['review:pending'], files: [{ path: 'file.txt' }], comments: comments(prior) }) });
   } finally { rmSync(root, { recursive: true, force: true }); }
@@ -220,7 +225,7 @@ it('caps the cumulative delta since the last full review: three small deltas, th
     const review = () => {
       const head = git('rev-parse', 'HEAD'); git('update-ref', 'refs/remotes/origin/lane/test', head);
       const raw = readPr({ pr: 7, repo: 'o/n', cwd: root, originRepo: () => 'o/n',
-        exec: (file, args, opts) => (args[0] === 'fetch' ? '' : execFileSync(file, args, { ...opts, cwd: root })),
+        exec: (file, args, opts) => (gitCommand(args) === 'fetch' ? '' : execFileSync(file, args, { ...opts, cwd: root })),
         readView: () => ({ number: 7, state: 'OPEN', title: 'fixture', body: '', headRefName: 'lane/test', headRefOid: head,
           labels: ['review:changes'], files: [{ path: 'file.txt' }], comments: [...comments] }) });
       // Each round bounces: the posted verdict carries the real basis line, anchor included, through the verdict writer.
@@ -258,7 +263,7 @@ it('a binary change gets a full review (numstat `-\\t-`), and the next small tex
     const review = () => {
       const head = git('rev-parse', 'HEAD'); git('update-ref', 'refs/remotes/origin/lane/test', head);
       const raw = readPr({ pr: 7, repo: 'o/n', cwd: root, originRepo: () => 'o/n',
-        exec: (file, args, opts) => (args[0] === 'fetch' ? '' : execFileSync(file, args, { ...opts, cwd: root })),
+        exec: (file, args, opts) => (gitCommand(args) === 'fetch' ? '' : execFileSync(file, args, { ...opts, cwd: root })),
         readView: () => ({ number: 7, state: 'OPEN', title: 'fixture', body: '', headRefName: 'lane/test', headRefOid: head,
           labels: ['review:changes'], files: [{ path: 'file.txt' }], comments: [...comments] }) });
       comments.push(reviewPrVerdict('changes', head, renderNetBasisLine(shapeReadFinding(raw, { pr: 7, repo: 'o/n' })),

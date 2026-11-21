@@ -4428,6 +4428,9 @@ mutation enters handled-ID state. Run these and the affected lock/self-sync regr
 circular dependencies: starting them together with `Promise.all` deadlocks vite-node evaluation
 before adapter construction. Keep the portable IO cases in `pr-live-owner-watch.test.mjs` at the
 default timeout; injected dispatchers and lock identity probes keep their exercised IO local.
+The fixture statically imports the real review-job module during collection and supplies it through
+`loadReviewJob`. Keep that cyclic graph out of per-test dynamic loading; the head-change cases reuse
+the same module and still exercise the production dispatchers with a fake job spawner.
 Collect the review-job, manual-pass and reconcile-pass graph with static fixture imports so the
 first review adapter case does not spend its five-second deadline on cold Vite transforms.
 Retain the production lazy imports and the real dispatcher head-change refusal assertions.
@@ -5859,6 +5862,17 @@ For fixtures with arbitrary branches, workflow files or cross-repo couples, use
 Keep full commit IDs consistent across listings, live reads, check runs and saved
 refresh records. Resolve the diff at the listed head when a capped commits read
 or a later push intentionally makes the commits tip or live head differ.
+
+## Journal stale-remover scheduling
+
+The validation/unlink regression in `scripts/lib/__tests__/delivery-policy.test.mjs`
+releases the replacement writer when the stale unlink completes. Waiting for the
+first writer's whole append can exhaust its lock budget if the second writer owns
+the replacement. Cover that acquisition order with a worker barrier after the
+generation guard releases, for both normal capacity and a single remaining record.
+At the size limit, assert exactly one append and the matching journal identity;
+either writer may win unless the fixture explicitly orders acquisition.
+
 ## Lane eligibility: absent checkout versus failed probe
 
 `lane-pool-acquire-growth.test.mjs` covers both a removed lane directory and a removed
