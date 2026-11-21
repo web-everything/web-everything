@@ -1,0 +1,60 @@
+import { spawnSync } from 'node:child_process';
+import { mkdirSync, mkdtempSync, readFileSync, readdirSync, lstatSync, readlinkSync, rmSync, writeFileSync } from 'node:fs';
+import { dirname, join, resolve } from 'node:path';
+import { CAPACITY_LEAVES } from '../../operator-override-reader.mjs';
+
+export const DOC = 'docs/agent/settings-registry.md';
+export const CLOSURE = ['scripts/lib/settings-registry.mjs', 'scripts/lib/settings-files.mjs', 'scripts/lib/operator-override-reader.mjs'];
+export function fixture({ conflict } = {}) {
+  if (!process.env.TMPDIR) throw Error('task TMPDIR required');
+  const root = mkdtempSync(join(process.env.TMPDIR, 'generated-merge-test-'));
+  const env = Object.fromEntries(Object.entries(process.env).filter(([key]) => !key.startsWith('GIT_')));
+  Object.assign(env, { GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: '/dev/null', GIT_EDITOR: 'true' });
+  const git = (args, opts = {}) => spawnSync('git', args, { cwd: root, encoding: 'utf8', timeout: 10000,
+    maxBuffer: 8 * 1024 * 1024, ...opts, env: { ...env, ...opts.env } });
+  const ok = args => { const r = git(args); if (r.status !== 0) throw Error(`${args}: ${r.stderr}`); return r.stdout.trim(); };
+  const write = (path, data) => { mkdirSync(dirname(join(root, path)), { recursive: true }); writeFileSync(join(root, path), data); };
+  const json = (path, data) => write(path, JSON.stringify(data, null, 2) + '\n');
+  const generate = mode => {
+    const r = spawnSync(process.execPath, [join(root, CLOSURE[0]), mode], { cwd: root, env, encoding: 'utf8' });
+    if (r.status !== 0) throw Error(r.stderr);
+  };
+  const commit = message => { ok(['add', '-A']); ok(['commit', '-qm', message]); return ok(['rev-parse', 'HEAD']); };
+  ok(['init', '-q', '-b', 'base']);
+  for (const [key, value] of Object.entries({ 'user.name': 'fixture', 'user.email': 'fixture@localhost',
+    'core.hooksPath': '/dev/null', 'commit.gpgsign': 'false', 'rerere.enabled': 'false' })) ok(['config', key, value]);
+  for (const path of CLOSURE) write(path, readFileSync(resolve(path)));
+  mkdirSync(join(root, 'docs/agent'), { recursive: true });
+  json('scripts/dispatch-settings.json', {});
+  json('scripts/settings/seed.json', { sample: { base: 0 } });
+  for (const path of ['delivery-platform-preferences', 'delivery-priority-settings']) json(`scripts/lib/${path}.json`, {});
+  json('scripts/lib/settings-registry-metadata.json', {
+    settings: { sample: { description: 'Fixture setting', owner: 'scripts/settings/seed.json', changeVia: 'pr', instant: false } },
+    capacityLeaves: Object.fromEntries(Object.keys(CAPACITY_LEAVES).map(key => [key, { description: 'Capacity', range: '0–100' }])),
+    instantGaps: [], toSettle: [], discoveryPasses: ['B', 'C'].map(pass => ({ pass, family: 'fixture', scope: 'all', newItems: 0, newHighImpactItems: 0 })),
+  });
+  write('source.txt', 'base\n');
+  generate('--write'); commit('base');
+  for (const [branch, key] of [['ours', 'a'], ['theirs', 'b']]) {
+    ok(['checkout', '-qb', branch, 'base']);
+    json(`scripts/settings/${key}.json`, { sample: { [key]: 1 } });
+    generate('--write');
+    if (conflict) write(conflict, `// ${branch}\n` + readFileSync(join(root, conflict), 'utf8'));
+    commit(branch);
+  }
+  const ovSha = ok(['rev-parse', 'theirs']);
+  ok(['checkout', '-q', 'ours']);
+  return { root, git, ok, write, json, generate, commit, ovSha, cur: ok(['rev-parse', 'HEAD']),
+    cleanup: () => rmSync(root, { recursive: true, force: true }) };
+}
+export function snapshot(f) {
+  const files = {};
+  const walk = dir => { for (const name of readdirSync(join(f.root, dir))) {
+    if (name === '.git') continue;
+    const path = join(dir, name), stat = lstatSync(join(f.root, path));
+    if (stat.isDirectory()) walk(path);
+    else files[path] = stat.isSymbolicLink() ? { link: readlinkSync(join(f.root, path)) } : readFileSync(join(f.root, path));
+  } };
+  walk('');
+  return { index: readFileSync(join(f.root, '.git/index')), files, head: f.ok(['rev-parse', 'HEAD']) };
+}
