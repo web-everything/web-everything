@@ -6,8 +6,10 @@
 import { describe, expect, it, vi } from 'vitest';
 import {
   planOrphanFixRound, runOrphanFixRoundPass, formatOrphanFixRoundLines, buildOrphanGuardComment, verdictReviewedHead,
-  ORPHAN_GUARD_MARKER, CHANGES_VERDICT_PREFIX, DEFAULT_ORPHAN_GRACE_MS, defaultRearm,
+  ORPHAN_GUARD_MARKER, CHANGES_VERDICT_PREFIX, DEFAULT_ORPHAN_GRACE_MS, defaultRearm, defaultRedispatch,
 } from '../orphan-fix-round.mjs';
+import * as fixDispatch from '../reconcile-fix-dispatch.mjs';
+import * as reconcilePass from '../reconcile-pass.mjs';
 import { STAND_DOWN_MARKER } from '../stand-down.mjs';
 import { FIX_BEGIN_MARKER, FIX_END_MARKER } from '../fix-procedure.mjs';
 import { REARM_COMMENT_MARKER } from '../rearm-review.mjs';
@@ -429,6 +431,55 @@ describe('runOrphanFixRoundPass — IO shell', () => {
     ...over,
   });
 
+  it('re-dispatches at most one orphan per pass and defers the rest with a cursor', async () => {
+    const s = seams([VERDICT, BEGIN, RESTACK, END], {
+      listBounced: () => [3, 1, 2].map(number => pr4715([], { number })),
+    });
+    const first = await runOrphanFixRoundPass(s);
+    const cursor = { repo: repos[0].slug, pr: 2 };
+    expect(s.redispatch).toHaveBeenCalledTimes(1);
+    expect(first).toMatchObject({ handled: 2, deferred: [cursor, { repo: repos[0].slug, pr: 3 }], nextCursor: cursor });
+    const second = await runOrphanFixRoundPass({ ...s, cursor: first.nextCursor });
+    expect(s.redispatch.mock.calls.map(([o]) => o.pr)).toEqual([1, 2]);
+    expect(second.nextCursor).toEqual({ repo: repos[0].slug, pr: 3 });
+  });
+
+  it('checks the deadline before each PR after the first and always makes one PR of progress', async () => {
+    let time = 0;
+    const s = seams([], { listBounced: () => [3, 1, 2].map(number => pr4715([], { number })),
+      now: () => time, deadlineAt: 10,
+      isOwned: async () => { time += 10; return true; } });
+    const first = await runOrphanFixRoundPass(s);
+    expect(first).toMatchObject({ handled: 1, deferred: [{ repo: repos[0].slug, pr: 2 }, { repo: repos[0].slug, pr: 3 }],
+      nextCursor: { repo: repos[0].slug, pr: 2 } });
+    const second = await runOrphanFixRoundPass({ ...s, cursor: first.nextCursor });
+    expect(second).toMatchObject({ handled: 1, nextCursor: { repo: repos[0].slug, pr: 3 } });
+    const third = await runOrphanFixRoundPass({ ...s, cursor: second.nextCursor });
+    expect(third).toMatchObject({ handled: 1, deferred: [], nextCursor: null });
+  });
+
+  it('redispatch uses the injected reconcile without running a fresh reconcile pass', async () => {
+    const reconcile = vi.fn(() => ({ dispatch: [{ kind: 'fix', prNumber: 4715 }, { kind: 'fix', prNumber: 9 },
+      { kind: 'ci-heal', prNumber: 4715 }], refusals: [{ prNumber: 9 }, { prNumber: 4715 }] }));
+    const planner = vi.spyOn(reconcilePass, 'runReconcilePass').mockImplementation(() => { throw new Error('fresh reconcile'); });
+    const dispatcher = vi.spyOn(fixDispatch, 'runReconcileFixDispatch').mockImplementation(options => {
+      expect(options.reconcile({ repo: options.repo })).toEqual({
+        dispatch: [{ kind: 'fix', prNumber: 4715 }], refusals: [{ prNumber: 4715 }] });
+      return { dispatched: [{ pr: 4715 }] };
+    });
+    try {
+      const result = await runOrphanFixRoundPass(seams([VERDICT, BEGIN, RESTACK, END], { redispatch: defaultRedispatch, reconcile }));
+      expect(result.rows[0].result).toBe('re-dispatched');
+      expect(reconcile).toHaveBeenCalledOnce();
+      expect(planner).not.toHaveBeenCalled();
+    } finally { dispatcher.mockRestore(); planner.mockRestore(); }
+  });
+
+  it('listing failure still yields an error row', async () => {
+    const result = await runOrphanFixRoundPass(seams([], { listBounced: () => { throw new Error('unreadable'); } }));
+    expect(result.rows).toEqual([{ repo: repos[0].slug, decision: 'error', reason: 'listing failed: unreadable' }]);
+  });
+
   it('re-arms #4715 through rearm-review at the observed head and leaves one marker comment', async () => {
     const s = seams([VERDICT, EVIDENCE, BEGIN, RESTACK, END]);
     const r = await runOrphanFixRoundPass(s);
@@ -442,7 +493,7 @@ describe('runOrphanFixRoundPass — IO shell', () => {
   it('re-dispatches the restack-only orphan; a refused dispatch posts no marker and is retried next tick', async () => {
     const ok = seams([VERDICT, BEGIN, RESTACK, END]);
     await runOrphanFixRoundPass(ok);
-    expect(ok.redispatch).toHaveBeenCalledWith({ slug: 'web-everything/web-everything', pr: 4715 });
+    expect(ok.redispatch).toHaveBeenCalledWith({ slug: 'web-everything/web-everything', pr: 4715, reconcile: undefined });
     expect(ok.postComment.mock.calls[0][0].body).toMatch(/re-dispatched a fixer/);
     const refused = seams([VERDICT, BEGIN, RESTACK, END], { redispatch: vi.fn(async () => ({ ok: false, why: 'fix-cap: full' })) });
     const r = await runOrphanFixRoundPass(refused);

@@ -2163,6 +2163,55 @@ describe('runTickAllRepos — one reconcile plan per repo per pass', () => {
     };
   };
 
+  it('marks guard redispatches touched only in their repository when PR numbers collide', async () => {
+    const f = productionFixture();
+    vi.spyOn(rulingStandDown, 'runRulingResolvesStandDownPass').mockResolvedValue({ rows: [] });
+    let reconcile;
+    const repo = CONSTELLATION_REPOS.we.slug;
+    const otherRepo = CONSTELLATION_REPOS.frontierui.slug;
+    await realRunTickAllRepos({ ...f.options, repos: [repo, otherRepo], budgetRotation: {}, prCursors: {},
+      orphanGuardTick: async options => {
+        expect([...options.repos].map(entry => entry.slug)).toEqual([repo, otherRepo]);
+        reconcile = options.reconcile;
+        expect(reconcile({ repo, allowStandDownAutoProceed: false }).dispatch).toContainEqual(expect.objectContaining({ prNumber: 7 }));
+        expect(reconcile({ repo: otherRepo, allowStandDownAutoProceed: false }).dispatch).toContainEqual(expect.objectContaining({ prNumber: 7 }));
+        return { rows: [{ repo, pr: 7, decision: 'redispatch', result: 're-dispatched' }], handled: 1, deferred: [], nextCursor: null };
+      } });
+    expect(reconcile({ repo, allowStandDownAutoProceed: false }).dispatch).not.toContainEqual(expect.objectContaining({ prNumber: 7 }));
+    expect(reconcile({ repo: otherRepo, allowStandDownAutoProceed: false }).dispatch).toContainEqual(expect.objectContaining({ prNumber: 7 }));
+  });
+
+  it('orphan-guard stops between PRs at its deadline and resumes from its PR cursor next pass', async () => {
+    const f = productionFixture();
+    vi.spyOn(rulingStandDown, 'runRulingResolvesStandDownPass').mockResolvedValue({ rows: [] });
+    let time = 0;
+    const cursors = {};
+    const visited = [];
+    const tick = vi.fn(options => orphanFixRound.runOrphanFixRoundPass({ ...options, env: {},
+      listBounced: () => [3, 1, 2].map(number => ({ number })),
+      isOwned: async (_repo, pr) => { visited.push(pr); time += 1000; return true; } }));
+    const options = { ...f.options, now: () => time, budgetRotation: {}, prCursors: cursors,
+      passBudgets: resolveFixPassBudgets({ env: {}, file: { fixPassBudget: { orphanGuardMs: 1000 } } }),
+      orphanGuardTick: tick };
+    const first = await realRunTickAllRepos(options);
+    const cursor = { repo: CONSTELLATION_REPOS.we.slug, pr: 2 };
+    expect(visited).toEqual([1]);
+    expect(cursors['orphan-guard']).toEqual(cursor);
+    expect(tick.mock.calls[0][0]).toMatchObject({ deadlineAt: 1000, now: options.now, reconcile: expect.any(Function) });
+    expect(first.phasePrCounts['orphan-guard']).toEqual({ handled: 1, deferred: 2 });
+    expect(first.budgets['orphan-guard']).toMatchObject({ hit: true, skipped: [cursor, { repo: cursor.repo, pr: 3 }] });
+    expect(first.refusals).toContainEqual(expect.objectContaining({ repo: 'we', kind: 'orphan-guard-deferred' }));
+    const { formatPassPhaseTiming } = await import('../reconcile-fix-dispatch-daemon.mjs');
+    expect(formatPassPhaseTiming(first).find(line => line.includes('phase=orphan-guard '))).toContain('prs=1 deferred=2');
+    const second = await realRunTickAllRepos(options);
+    expect(visited).toEqual([1, 2]);
+    expect(tick.mock.calls[1][0].cursor).toEqual(cursor);
+    expect(second.phasePrCounts['orphan-guard']).toEqual({ handled: 1, deferred: 1 });
+    await realRunTickAllRepos(options);
+    expect(visited).toEqual([1, 2, 3]);
+    expect(cursors['orphan-guard']).toBeUndefined();
+  });
+
   it.each(['keys', 'slugs'])('bounds orphan-guard between repos and resumes the skipped repo next pass (%s)', async form => {
     const f = productionFixture();
     vi.spyOn(rulingStandDown, 'runRulingResolvesStandDownPass').mockResolvedValue({ rows: [] });
