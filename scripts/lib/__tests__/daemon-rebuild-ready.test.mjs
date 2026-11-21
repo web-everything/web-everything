@@ -22,7 +22,7 @@ import {
   rebuildClone, readRebuildState, rebuildStatePath, readReadyCandidate, readyCandidatePath, matchReadyCandidate,
 } from '../daemon-rebuild.mjs';
 import { acquireRead, releaseRead } from '../daemon-clone-lock.mjs';
-import { addOverlay, appendOverlayEvent, readOverlays, removeOverlay, overlayFilePath, makePrBaseChain } from '../daemon-overlays.mjs';
+import { addOverlay, appendOverlayEvent, readOverlays, removeOverlay, overlayFilePath } from '../daemon-overlays.mjs';
 import { overlayRetiredByOperator, readyBuildVerified } from '../daemon-rebuild/adopt.mjs';
 import * as adoption from '../daemon-rebuild/adopt.mjs';
 import { OPERATOR_LOGINS } from '../marker-authorship.mjs';
@@ -110,49 +110,33 @@ afterEach(() => {
 });
 
 describe('the Git proof of omitted content in the candidate build', () => {
-  it('next tick restores an omitted registered overlay after adopting a candidate with a real registration', async () => {
+  it('next rebuild with default env removes content carried by a benignly removed ready overlay', async () => {
     const { originDir, cloneDir, env } = makeFixture();
-    env.WE_DAEMON_REBUILD_SKIP_UNRELATED = '0';
-    env.WE_DAEMON_OVERLAY_EDGE_RESOLVE = '0';
-    const omitted = 'lane/review-seat-fairness-m1';
-    pushBranch(originDir, omitted, (dir) => writeFile(dir, 'omitted.txt', 'live overlay\n'));
-    addOverlay(cloneDir, { ref: omitted, pr: 99 }, { env });
-    const chain = makePrBaseChain({ root: cloneDir, env, slug: 'test/repo', gh: (args) => {
-      if (args[0] === 'pr' && args[1] === 'view') return { baseRefName: 'main' };
-      if (args[0] === 'api') return { data: { repository: { pullRequest: { timelineItems: { nodes: [] } } } } };
-      throw new Error(`unexpected GitHub query: ${args.join(' ')}`);
-    } });
-    const options = { root: cloneDir, env, prState: async () => 'OPEN', prBaseChain: chain, lockOpts: LOCK_OPTS };
-    expect(await rebuildClone({ ...options, runSmoke: async () => PASS })).toMatchObject({ adopted: true });
-
-    // Build an older plan with a carried overlay, while the running build keeps the omitted overlay.
-    removeOverlay(cloneDir, omitted, { env });
-    pushBranch(originDir, 'lane/carried', (dir) => writeFile(dir, 'carried.txt', 'carried overlay\n'));
-    addOverlay(cloneDir, { ref: 'lane/carried', pr: 100 }, { env });
-    expect(readOverlays(cloneDir, { env })[0]).not.toHaveProperty('dependsOn');
+    // Use the shipped defaults, including audited-only and unrelated-change skipping.
+    delete env.WE_DAEMON_OVERLAY_FOLLOW_TIP;
+    delete env.WE_DAEMON_REBUILD_SKIP_UNRELATED;
+    delete env.WE_DAEMON_OVERLAY_EDGE_RESOLVE;
+    const ref = 'lane/benign-removal';
+    const tip = pushBranch(originDir, ref, (dir) => writeFile(dir, 'removed.txt', 'overlay content\n'));
+    addOverlay(cloneDir, { ref, now: '2026-11-18T20:00:00Z' }, { env });
+    appendOverlayEvent(cloneDir, { kind: 'added', ref, at: '2026-11-18T20:00:00Z' }, { env });
+    const options = { root: cloneDir, env, lockOpts: LOCK_OPTS };
     const { runSmoke, endTick } = passWhileSiblingStartsTick(cloneDir, env);
-    let candidate;
     try {
       expect(await rebuildClone({ ...options, runSmoke })).toMatchObject({ reason: 'tick-in-progress' });
-      candidate = readReadyCandidate(cloneDir, env).adopt.finalSha;
+      expect(readReadyCandidate(cloneDir, env).adopt.applied).toEqual([expect.objectContaining({ ref, sha: tip })]);
     } finally { endTick(); }
-    addOverlay(cloneDir, { ref: omitted, pr: 99 }, { env });
-    advanceMain(originDir, (dir) => writeFile(dir, 'later.txt', 'later\n'));
+    removeOverlay(cloneDir, ref, { env });
+    appendOverlayEvent(cloneDir, { kind: 'removed', ref, tip, actor: OPERATOR_LOGINS[0],
+      source: 'removeRegistration', reason: 'no longer wanted', at: '2026-11-18T21:00:00Z' }, { env });
+    advanceMain(originDir, (dir) => writeFile(dir, 'later.txt', 'later main\n'));
     const noSmoke = vi.fn(async () => PASS);
     expect(await rebuildClone({ ...options, runSmoke: noSmoke })).toMatchObject({ reason: 'ready-adopted' });
-    // Singleton plans need no stack lookup. Check fresh independence evidence once both
-    // registrations reach planning/adoption, where the live PR chains are actually requested.
-    expect(chain.fresh.get(99)).toEqual([]);
-    expect(chain.fresh.get(100)).toEqual([]);
-    expect(gitOk(cloneDir, ['rev-parse', 'HEAD']).trim()).toBe(candidate);
-    expect(existsSync(join(cloneDir, 'omitted.txt'))).toBe(false);
+    expect(readFileSync(join(cloneDir, 'removed.txt'), 'utf8')).toBe('overlay content\n');
     expect(noSmoke).not.toHaveBeenCalled();
-    const restoreSmoke = vi.fn(async () => PASS);
-    expect(await rebuildClone({ ...options, runSmoke: restoreSmoke })).toMatchObject({ adopted: true });
-    expect(readFileSync(join(cloneDir, 'omitted.txt'), 'utf8')).toBe('live overlay\n');
-    expect(readFileSync(join(cloneDir, 'carried.txt'), 'utf8')).toBe('carried overlay\n');
-    expect(readRebuildState(cloneDir, env).adopted.applied.map((a) => a.ref)).toContain(omitted);
-    expect(restoreSmoke).toHaveBeenCalledOnce();
+    expect(await rebuildClone({ ...options, runSmoke: async () => PASS })).toMatchObject({ adopted: true });
+    expect(existsSync(join(cloneDir, 'removed.txt'))).toBe(false);
+    expect(readRebuildState(cloneDir, env).adopted.applied).toEqual([]);
   }, 30_000);
 
   it('accepts equivalent content without requiring overlay ancestry, but rejects extra merged content', () => {
@@ -637,15 +621,11 @@ describe('a passed candidate blocked at finalize by a long reader tick is adopte
       if (accepted) {
         expect(match).toMatchObject({ match: 'superseded', retired: [ref], adopt: { finalSha: candidate } });
         expect(result).toMatchObject({ reason: 'ready-adopted', readyMatch: 'superseded' });
-      } else if (options.registered) {
-        // Adopt the build that passed, then add: the overlay is registered again, so the next rebuild carries it.
-        expect(match).toMatchObject({ match: 'superseded', adopt: { finalSha: candidate }, rebuildAfter: [ref] });
-        expect(result).toMatchObject({ reason: 'ready-adopted', readyMatch: 'superseded' });
       } else {
         expect(match).toMatchObject({ adopt: null, reason: `superseded-omits-live-overlay: ${ref}`, omitted: [ref] });
         expect(result.reason).not.toBe('ready-adopted');
       }
-      expect(gitOk(cloneDir, ['rev-parse', 'HEAD']).trim()).toBe(accepted || options.registered ? candidate : liveHead);
+      expect(gitOk(cloneDir, ['rev-parse', 'HEAD']).trim()).toBe(accepted ? candidate : liveHead);
       expect(noSmoke).not.toHaveBeenCalled();
     } finally { matching.mockRestore(); }
   });

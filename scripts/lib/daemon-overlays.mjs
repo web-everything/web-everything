@@ -255,16 +255,12 @@ export function registrationIdentity(entry) {
 }
 
 export function addOverlay(root, {
-  ref, pr = null, addedBy = null, reason = null, now, pinned, stackBases, conflictOverride, dependsOn,
+  ref, pr = null, addedBy = null, reason = null, now, pinned, stackBases, conflictOverride,
 } = {}, { env = process.env, expectedOverlay } = {}) {
   if (!isSafeBranchName(ref)) {
     throw new TypeError(`daemon-overlays: ref ${JSON.stringify(ref)} is not a safe branch name — refusing to add it`);
   }
   const bases = Array.isArray(stackBases) ? stackBases.filter((b) => isSafeBranchName(b)) : null;
-  // Declared dependencies (refs this overlay needs applied), recorded only when the caller declares them (an explicit
-  // empty list asserts independence). An entry without it is "unknown" to the adopt-then-add omission check, never "none".
-  // Any malformed entry voids the whole declaration (left undeclared), never narrowed to a smaller list.
-  const deps = Array.isArray(dependsOn) && dependsOn.every((b) => isSafeBranchName(b)) ? [...new Set(dependsOn)] : null;
   return withListLock(root, env, (pause) => {
     const list = readOverlaysForWrite(root, env).slice();
     pause();
@@ -279,7 +275,6 @@ export function addOverlay(root, {
         ...(pinned === true ? { pinned: true } : {}),
         ...(bases ? { stackBases: bases } : {}),
         ...(conflictOverride ? { conflictOverride } : {}),
-        ...(deps ? { dependsOn: deps } : {}), // undeclared stays undeclared: the omission check treats it as unknown
       });
     } else {
       const next = { ...list[idx], pr: pr ?? null, reason: reason ?? null };
@@ -287,8 +282,6 @@ export function addOverlay(root, {
       else if (pinned === false) delete next.pinned;
       if (bases) next.stackBases = bases;
       if (conflictOverride) next.conflictOverride = conflictOverride;
-      if (deps) next.dependsOn = deps;
-      else delete next.dependsOn; // re-registration may change the tip/stack: independence must be restated
       list[idx] = next;
     }
     return writeOverlays(root, list, { env });

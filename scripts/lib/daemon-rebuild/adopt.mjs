@@ -52,7 +52,7 @@ export function matchReadyCandidate({
   registered = stillWanted, allowFallback = true, rejected = null, nowMs, maxAgeMs,
   liveApplied, carries = () => false, leftForMain = () => false,
   removedForMain = () => false, retiredByOperator = () => false, contentInBuild = () => false, forcedWatch = () => 'missing', auditedTip = null,
-  tipInMain = () => false, removalSafety = () => 'unknown', dependsOn = () => null, readdable = () => false,
+  tipInMain = () => false, removalSafety = () => 'unknown',
 }) {
   if (!ready) return { adopt: null, reason: 'none' };
   // Adopt the build that passed, then add: an applied overlay that has since LEFT the registry for a benign reason
@@ -166,30 +166,10 @@ export function matchReadyCandidate({
     if (a.sha && retiredByOperator(a) === true) { retired.push(a.ref); return false; }
     return true;
   });
-  // Adopt, then add: a live overlay the candidate omits but that is STILL registered is not lost by adopting; the next
-  // tick's incremental rebuild adds it back in follow mode. With audit enforcement, dropping its merge history
-  // would make its next tip a never-adopted registration and bypass the audit gate. Keep the running build's
-  // identity until a fresh candidate carries it, even if today's tip is audited (it can advance on the next tick).
-  const readd = [];
-  const blocked = omitted.filter((a) => {
-    if (typeof auditedTip === 'function') return true;
-    if (readdable(a.ref) !== true) return true;
-    // A carried overlay with no recorded declaration is unknown, not independent: refuse (fail closed).
-    const needed = applied.some((x) => {
-      const deps = dependsOn(x.ref);
-      return !Array.isArray(deps) || deps.includes(a.ref);
-    });
-    if (needed) return true;
-    readd.push(a.ref);
-    return false;
-  });
-  if (blocked.length > 0) {
-    return { adopt: null, reason: `superseded-omits-live-overlay: ${blocked.map((a) => a.ref).join(', ')}`, omitted: blocked.map((a) => a.ref) };
+  if (omitted.length > 0) {
+    return { adopt: null, reason: `superseded-omits-live-overlay: ${omitted.map((a) => a.ref).join(', ')}`, omitted: omitted.map((a) => a.ref) };
   }
-  return {
-    adopt: ready.adopt, dropRefs: [], match: 'superseded', ...(retired.length ? { retired } : {}), ...staleInfo(),
-    ...(readd.length ? { rebuildAfter: [...new Set([...staleRefs, ...readd])] } : {}),
-  };
+  return { adopt: ready.adopt, dropRefs: [], match: 'superseded', ...(retired.length ? { retired } : {}), ...staleInfo() };
 }
 
 /** Only authenticated operator auto-retirement retires its exact tip, after every recorded registration. Unknown evidence refuses. */

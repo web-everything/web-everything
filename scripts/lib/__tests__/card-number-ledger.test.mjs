@@ -4,14 +4,13 @@ import { readCardLedger, appendCardLedgerRows, assignCardNumbers, parseCardLedge
 import { buildSeedRows, seedCardNumberLedger, LEGACY_IDENTITIES_PATH } from '../../backlog/seed-card-number-ledger.mjs';
 import { resolveCardNumbering } from '../policy-cascade.mjs';
 import { cardLedgerCheckpoint } from '../../backlog/card-ledger-checkpoint.mjs';
-import { chmodSync, closeSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readSync, realpathSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
+import { chmodSync, closeSync, existsSync, fstatSync, mkdirSync, mkdtempSync, readFileSync, readSync, realpathSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { dirname, join } from 'node:path';
-import { fileURLToPath, pathToFileURL } from 'node:url';
+import { join } from 'node:path';
 import { publicSigningIdentity, readBoundedTransportFile, stageOnTransportBranch } from '../git-transport-branch.mjs';
 import { provisionCardLedgerSigningKey } from '../../backlog/card-ledger-signing-key.mjs';
 
-import { execFileSync, spawnSync } from 'node:child_process';
+import { execFileSync } from 'node:child_process';
 import fs from 'node:fs';
 import { syncBuiltinESMExports } from 'node:module';
 const a = 'a'.repeat(40), b = 'b'.repeat(40);
@@ -909,6 +908,15 @@ describe('card ledger filesystem boundaries', () => {
   describe('transport filesystem byte boundary', () => {
     it('rejectsOversizedFilesystemLedgerAfterRequestingAndReadingOnlyCapPlusOneBytes', () => {
       const cap = 32, path = join(root, 'ledger.jsonl');
+      let descriptorClosed = false;
+      close.mockImplementation(fd => {
+        closeSync(fd);
+        // Observe immediately: assertion/reporting code may reopen this descriptor number.
+        try { fstatSync(fd); } catch (e) {
+          if (e.code !== 'EBADF') throw e;
+          descriptorClosed = true;
+        }
+      });
       writeFileSync(path, 'x'.repeat(4096));
       expect(() => readBoundedTransportFile(path, cap, { read, close })).toThrow(/exceeds read cap/);
       expect(read).toHaveBeenCalled();
@@ -926,22 +934,7 @@ describe('card ledger filesystem boundaries', () => {
       expect(received).toBe(cap + 1);
       const fd = read.mock.calls[0][0];
       expect(close).toHaveBeenCalledWith(fd);
-      // Vitest workers share a descriptor table: another thread can reuse fd even between
-      // closeSync and fstatSync. Prove real closure with the default close in an isolated process.
-      // Resolve through a filesystem path: Vite rewrites new URL(relative, import.meta.url) as an HTTP asset URL.
-      const transportUrl = pathToFileURL(join(dirname(fileURLToPath(import.meta.url)), '../git-transport-branch.mjs')).href;
-      const probe = spawnSync(process.execPath, ['--input-type=module', '-e', `
-        import assert from 'node:assert/strict';
-        import { readSync, fstatSync } from 'node:fs';
-        import { readBoundedTransportFile } from ${JSON.stringify(transportUrl)};
-        let fd;
-        assert.throws(() => readBoundedTransportFile(process.argv[1], Number(process.argv[2]), {
-          read(descriptor, ...args) { fd = descriptor; return readSync(descriptor, ...args); },
-        }), /exceeds read cap/);
-        assert.equal(typeof fd, 'number');
-        assert.throws(() => fstatSync(fd), { code: 'EBADF' });
-      `, path, String(cap)], { encoding: 'utf8', timeout: 10_000, maxBuffer: 64 * 1024 });
-      expect(probe.status, probe.stderr || String(probe.error ?? '')).toBe(0);
+      expect(descriptorClosed).toBe(true);
     });
 
     it('acceptsFilesystemLedgerExactlyAtCapAndClosesItsDescriptor', () => {

@@ -1,5 +1,5 @@
 /** @file adopt-then-add.test.mjs — a smoke-passed candidate is adopted when the overlay set moved for a benign reason.
- * Fixtures from the review daemon's two discards on 2026-11-18 (17:28 and 18:06 ET). */
+ * Fixtures from the review daemon's benign-removal discard on 2026-11-18 (17:28 ET). */
 import { describe, expect, it } from 'vitest';
 import { matchReadyCandidate, classifyOverlayRemoval } from '../adopt.mjs';
 import { OPERATOR_LOGINS } from '../../marker-authorship.mjs';
@@ -36,142 +36,30 @@ describe('overlay-no-longer-wanted (17:28 ET discard)', () => {
   });
 });
 
-describe(`superseded-omits-live-overlay: ${seat} (18:06 ET discard)`, () => {
-  const omit = { liveApplied: [{ ref: seat, sha: SHA('b') }], carries: () => false };
-  it('adopts then re-adds a still-registered omitted overlay', () => {
-    const m = matchReadyCandidate(args({ ...omit, readdable: (r) => r === seat, dependsOn: () => [] }));
-    expect(m.adopt).toBeTruthy();
-    expect(m.rebuildAfter).toEqual([seat]);
-  });
-  it('refuses an omitted registered overlay when its live entry is explicitly pinned', () => {
-    const live = { overlays: [{ ref: seat, pinned: true }] };
-    const candidate = ready();
-    candidate.adopt.applied = [];
-    expect(live.overlays.some((o) => o.ref === seat)).toBe(true);
-    const m = matchReadyCandidate(args({ ...omit, ready: candidate,
-      readdable: (ref) => {
-        const entry = live.overlays.find((o) => o?.ref === ref);
-        return !!entry && entry.pinned !== true;
-      },
-    }));
-    expect(m).toMatchObject({ adopt: null, reason: `superseded-omits-live-overlay: ${seat}` });
-  });
-  it.each([{ auditAdopted: undefined }, { auditAdopted: [] }, { auditAdopted: [seat] }])(
-    'refuses to erase live audit history with auditAdopted=$auditAdopted', ({ auditAdopted }) => {
-      // Even a currently audited tip can move after adoption. Neither an empty/missing history list nor
-      // a successful audit of today's tip proves that the next build can recover its adopted identity.
-      const m = matchReadyCandidate(args({ ...omit, readdable: () => true, dependsOn: () => [],
-        auditedTip: () => true, plan: { ...args().plan, auditAdopted } }));
-      expect(m).toMatchObject({ adopt: null, reason: `superseded-omits-live-overlay: ${seat}`, omitted: [seat] });
-    },
-  );
-  it('refuses an empty candidate that would erase a live audit pin', () => {
-    const candidate = ready();
-    candidate.adopt.applied = [];
-    expect(matchReadyCandidate(args({ ...omit, ready: candidate, readdable: () => true, auditedTip: () => false })))
-      .toMatchObject({ adopt: null, omitted: [seat] });
-  });
-  it.each([false, true])('keeps the audit pin across unregister/re-register when main carries A=%s', async (mainCarriesOverlay) => {
-    const { auditPinOmissionViolations } = await import('../../../conveyor/soak/breaks/rebuild-adopt-then-add.mjs');
-    expect(await auditPinOmissionViolations(undefined, { mainCarriesOverlay })).toEqual([]);
-  });
-  it('accepts an audited candidate that retains the live overlay identity', () => {
-    const candidate = ready();
-    candidate.adopt.applied.push(omit.liveApplied[0]);
-    expect(matchReadyCandidate(args({ ...omit, ready: candidate, auditedTip: () => true,
-      carries: (sha) => sha === SHA('b') }))).toMatchObject({ adopt: candidate.adopt, match: 'superseded' });
-  });
-  it('adopts the current plan and its audit identity on a same-tree match', () => {
-    const candidate = ready();
-    candidate.adopt.applied = [];
-    const plan = { ...args().plan, applied: omit.liveApplied };
-    expect(matchReadyCandidate(args({ ...omit, ready: candidate, plan, auditedTip: () => true,
-      treeOf: () => candidate.tree })))
-      .toMatchObject({ adopt: { finalSha: plan.finalSha, applied: omit.liveApplied }, match: 'same-tree' });
-  });
-  it('still permits authenticated retirement of an unregistered overlay with audit enforcement', () => {
-    expect(matchReadyCandidate(args({ ...omit, auditedTip: () => true, registered: () => false,
-      retiredByOperator: () => true })))
-      .toMatchObject({ adopt: ready().adopt, match: 'superseded', retired: [seat] });
-  });
-  it('refuses when a carried overlay has no recorded dependency declaration (unknown, not none)', () => {
-    expect(matchReadyCandidate(args({ ...omit, readdable: () => true }))).toMatchObject({ adopt: null, omitted: [seat] });
-    expect(matchReadyCandidate(args({ ...omit, readdable: () => true, dependsOn: () => null }))).toMatchObject({ adopt: null });
-  });
-  it('refuses when the overlay is not registered any more', () => {
-    expect(matchReadyCandidate(args(omit))).toMatchObject({ adopt: null, reason: `superseded-omits-live-overlay: ${seat}` });
-  });
-  it('refuses when a carried overlay declares it a dependency', () => {
-    const m = matchReadyCandidate(args({ ...omit, readdable: () => true, dependsOn: (r) => (r === 'lane/a' ? [seat] : []) }));
-    expect(m).toMatchObject({ adopt: null, omitted: [seat] });
-  });
+it('never adopts a candidate that omits a still-registered live overlay', () => {
+  const m = matchReadyCandidate(args({
+    liveApplied: [{ ref: seat, sha: SHA('b') }], carries: () => false,
+    auditedTip: null, readdable: () => true, dependsOn: () => [],
+  }));
+  expect(m).toMatchObject({ adopt: null, reason: `superseded-omits-live-overlay: ${seat}` });
 });
 
-describe('addOverlay dependsOn', () => {
-  it('refuses to use a re-registered successor declaration for an older carried tip', async () => {
-    const { mkdtempSync, rmSync } = await import('node:fs');
-    const { tmpdir } = await import('node:os');
-    const { join } = await import('node:path');
-    const { addOverlay, readOverlays } = await import('../../daemon-overlays.mjs');
-    const { readyOverlayDependencies } = await import('../prepare.mjs');
-    const root = mkdtempSync(join(tmpdir(), 'overlay-deps-successor-'));
-    const env = { ...process.env, WE_DAEMON_OVERLAY_DIR: join(root, 'overlays') };
-    try {
-      addOverlay(root, { ref: 'lane/base' }, { env });
-      addOverlay(root, { ref: 'lane/app', pr: 101, dependsOn: ['lane/base'] }, { env });
-      const candidate = ready();
-      candidate.adopt.applied = [{ ref: 'lane/app', sha: SHA('a') }];
-      // The branch fast-forwards from A to C; C's declaration cannot describe carried A.
-      addOverlay(root, { ref: 'lane/app', pr: 101, dependsOn: [] }, { env });
-      const overlays = readOverlays(root, { env });
-      const chainOf = Object.assign(() => [], { fresh: new Map([[101, []]]) });
-      const dependencies = await readyOverlayDependencies({
-        applied: candidate.adopt.applied, overlays, tipOf: () => SHA('c'), chainOf,
-      });
-      expect.soft(dependencies.has('lane/app')).toBe(false);
-      expect(matchReadyCandidate(args({ ready: candidate,
-        liveApplied: [{ ref: 'lane/base', sha: SHA('b') }], carries: () => false,
-        readdable: (ref) => overlays.some((o) => o.ref === ref),
-        dependsOn: (ref) => dependencies.get(ref) ?? null,
-      }))).toMatchObject({ adopt: null, reason: 'superseded-omits-live-overlay: lane/base', omitted: ['lane/base'] });
-    } finally { rmSync(root, { recursive: true, force: true }); }
-  });
-  it('invalidates an unstated declaration on re-registration, including a changed stack', async () => {
-    const { mkdtempSync, rmSync } = await import('node:fs');
-    const { tmpdir } = await import('node:os');
-    const { join } = await import('node:path');
-    const { addOverlay, readOverlays } = await import('../../daemon-overlays.mjs');
-    const root = mkdtempSync(join(tmpdir(), 'overlay-deps-update-'));
-    const env = { ...process.env, WE_DAEMON_OVERLAY_DIR: join(root, 'overlays') };
-    try {
-      for (const update of [{ stackBases: ['lane/base'] }, {}]) {
-        addOverlay(root, { ref: 'lane/x', dependsOn: [] }, { env });
-        addOverlay(root, { ref: 'lane/x', ...update }, { env });
-        expect(readOverlays(root, { env })[0]).not.toHaveProperty('dependsOn');
-      }
-    } finally { rmSync(root, { recursive: true, force: true }); }
-  });
-  it('stores a declared list (explicit [] asserts independence) and leaves an undeclared entry undeclared', async () => {
-    const { mkdtempSync, rmSync } = await import('node:fs');
-    const { tmpdir } = await import('node:os');
-    const { join } = await import('node:path');
-    const { addOverlay, readOverlays } = await import('../../daemon-overlays.mjs');
-    const root = mkdtempSync(join(tmpdir(), 'overlay-deps-'));
-    const env = { ...process.env, WE_DAEMON_OVERLAY_DIR: join(root, 'overlays') };
-    try {
-      addOverlay(root, { ref: 'lane/x', dependsOn: ['lane/y', 'lane/y'] }, { env });
-      addOverlay(root, { ref: 'lane/m', dependsOn: ['lane/y', 'bad ref!'] }, { env });
-      addOverlay(root, { ref: 'lane/z' }, { env });
-      const list = readOverlays(root, { env });
-      expect(list.find((o) => o.ref === 'lane/x').dependsOn).toEqual(['lane/y']);
-      expect(list.find((o) => o.ref === 'lane/m')).not.toHaveProperty('dependsOn'); // malformed: undeclared, not narrowed
-      expect(list.find((o) => o.ref === 'lane/z')).not.toHaveProperty('dependsOn');
-      addOverlay(root, { ref: 'lane/x', dependsOn: ['bad ref!'] }, { env }); // malformed update voids the old declaration
-      expect(readOverlays(root, { env }).find((o) => o.ref === 'lane/x')).not.toHaveProperty('dependsOn');
-      addOverlay(root, { ref: 'lane/w', dependsOn: [] }, { env });
-      expect(readOverlays(root, { env }).find((o) => o.ref === 'lane/w').dependsOn).toEqual([]);
-    } finally { rmSync(root, { recursive: true, force: true }); }
-  });
+const removalCases = ['fallback', 'exact', 'superseded'].flatMap((kind) =>
+  ['benign', 'unsafe', 'unknown', 'sha-less'].map((removal) => ({ kind, removal })));
+it.each(removalCases)('$kind adoption with $removal removal', ({ kind, removal }) => {
+  const candidate = ready();
+  const plan = { ...args().plan };
+  if (kind === 'fallback') {
+    candidate.kind = 'fallback';
+    candidate.forInputsKey = plan.inputsKey;
+  }
+  if (kind === 'exact') plan.finalSha = candidate.adopt.finalSha;
+  if (removal === 'sha-less') delete candidate.adopt.applied[0].sha;
+  const m = matchReadyCandidate(args({ ready: candidate, plan, ...gone,
+    removalSafety: () => removal === 'sha-less' ? 'benign' : removal }));
+  if (removal === 'benign') {
+    expect(m).toMatchObject({ adopt: candidate.adopt, match: kind, rebuildAfter: ['lane/a'] });
+  } else expect(m).toMatchObject({ adopt: null, reason: 'overlay-no-longer-wanted' });
 });
 
 describe('classifyOverlayRemoval hardening', () => {
