@@ -17,7 +17,7 @@ const end = (extra = {}) => ({ author, createdAt: END_AT,
   body: buildFixEndComment({ who: 'fix-session', headSha: HEAD }), ...extra });
 const sendBack = (extra = {}) => ({ id: 'send-back', author: { login: 'chalbert' }, createdAt: SEND_AT,
   body: `🔁 review — changes requested\n\nRecorded by chalbert via console.\n\nAt head \`${HEAD}\`: fix the export.`, ...extra });
-const pr = (extra = {}) => ({ number: 6360, state: 'OPEN', headRefName: 'lane/r618', headRefOid: HEAD,
+const pr = (extra = {}) => ({ number: 6360, state: 'OPEN', headRefName: 'lane/r618', headRefOid: HEAD, rowsHead: HEAD, rowsComplete: true,
   labels: ['review:human', 'advisory:changes'], mergeStateStatus: 'CLEAN',
   statusCheckRollup: [{ name: 'gate', status: 'completed', conclusion: 'success' }],
   comments: [advisory(), end()], ...extra });
