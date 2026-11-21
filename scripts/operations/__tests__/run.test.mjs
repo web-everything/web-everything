@@ -253,7 +253,7 @@ describe('runner freshness real repository witnesses', () => {
 });
 
 
-it('real lane slot passes while override cannot suppress the dispatch guard', async () => {
+it('real attached lane slot passes while override cannot suppress the dispatch guard', async () => {
   await withBareOrigin(async ctx => {
     seedCheckout(ctx);
     ctx.seedOriginBranch('main', { 'scripts/drift.mjs': 'export const drift = 1;' });
@@ -264,13 +264,37 @@ it('real lane slot passes while override cannot suppress the dispatch guard', as
     expect(dispatch.status).toBe(1);
     expect(dispatch.stderr).toMatch(/refusing to dispatch|stale/i);
     expect(dispatch.records).toEqual([]);
+    // An ordinary lane is attached; detached open-pr runners need readable lease evidence.
+    // Restore that geometry after the detached dispatch-refusal probe above.
+    ctx.git(['checkout', '--quiet', 'main']);
     const lane = join(ctx.tmp, 'pool', 'web-everything', 'lane-1');
     mkdirSync(dirname(lane), { recursive: true });
     renameSync(ctx.clone, lane);
-    const r = runCli({ ...ctx, clone: lane }, ['open-pr', '--json']);
+    const laneCtx = { ...ctx, clone: lane };
+    // Argument validation follows freshness but precedes run creation.
+    const invalid = runCli(laneCtx, ['open-pr', '--mode=invalid', '--json']);
+    expect(invalid.status).toBe(2);
+    expect(invalid.stdout, invalid.stderr).toContain('input field `mode` must be one of');
+    expect(invalid.stderr).not.toMatch(/Refusing|override/);
+    expect(invalid.records).toEqual([]);
+    expect(invalid.calls).toEqual([]);
+
+    // Planning runs after persistence: its refusal is recorded without submitting a PR.
+    const r = runCli(laneCtx, ['open-pr', '--json']);
     expect(r.status).toBe(1);
-    expect(r.stdout).toMatch(/cannot plan this PR/);
+    expect(r.stdout, r.stderr).toMatch(/cannot plan this PR/);
     expect(r.stderr).not.toMatch(/Refusing|override/);
+    const outcome = JSON.parse(r.stdout);
+    expect(outcome).toEqual(expect.objectContaining({ op: 'open-pr', stopped: 'step-refused', step: 'plan',
+      applied: [], inFlight: [], pending: null, verdict: null, findings: {} }));
+    expect(r.records).toEqual([`${outcome.runId}.json`]);
+    const record = JSON.parse(readFileSync(join(ctx.tmp, 'runs', r.records[0]), 'utf8'));
+    expect(record).toEqual(expect.objectContaining({ id: outcome.runId, op: 'open-pr', effects: [], pending: null,
+      findings: {}, verdict: null }));
+    expect(r.calls).toHaveLength(1);
+    const call = JSON.parse(readFileSync(join(ctx.tmp, 'calls', r.calls[0]), 'utf8').trim());
+    expect(call).toMatchObject({ operation: 'open-pr', callerKind: 'cli',
+      outcome: { status: 'error', digest: expect.stringContaining('stopped=step-refused') } });
   });
 }, 120_000);
 
