@@ -6,88 +6,69 @@ status: open
 dateOpened: "2026-11-20"
 tags: [decision-filing, plateau-app]
 relatedTo: ["2445"]
+preparedDate: "2026-11-20"
 ---
 
 # Unpause the builder for stage 1 after all four preconditions?
 
-Operator ask (2026-11-20 20:59 ET): “note all as full decision item and run with preparation”.
-
-Decision id: D16 (decisions page, 2026-11-20 20:58 ET)
-Placement: plateau-app
-move-to: plateau-app
+Ask: Give conditional approval for one small Codex build only after all readiness proofs pass. Decide whether the old audit-scope setting and newer builder brief remain prerequisites.
 
 ## Digest
 
-Not yet (high confidence in the source recommendation): keep the builder paused. Stage 1 is one small Codex build at a time; R981 reserves unpause to the operator after four evidenced preconditions.
-
-Needs prep: proposed call only; this filing is neither ratification nor a completed preparation pass.
-
-## Context
-
-The page names R981 and all four conditions. #7247/#7251 are merge/installation prerequisites from that source; preparation must resolve the exact PR/artifact identities, rather than treating same-number local backlog cards as merge or deployment evidence.
-
-Design refs are relative to the operator handoff; WE evidence uses its repo locus.
+**Not yet; conditional go once named proofs exist.** This is a readiness gate accepted on merit, not a new design fork. Prep's 2026-11-20 21:40 snapshot had 0/4 initial conditions met and builder caps 0/0; later 22:00 update found priority-tool PR #7268 open. Historical status is not live authorization.
 
 ## What you're deciding
 
-Authorize stage 1: one small Codex build at a time, only after all four proofs and a fresh operator go.
+Stage 1 only: Claude 0 / external Codex 1 / max open PRs 10, one item size ≤3. R981 reverted unpause and requires its checklist; R1054 prioritizes restoration, not bypass. Stage 2 needs a new ruling.
 
-## Why this isn't a classic fork (and is still a decision)
+## Recommendation — conditional go, not immediate unpause
 
-An agent waits on preconditions; there are no rival architectures. R981 retains operator-only authority, not automatic activation when prerequisites appear complete.
+**Default: remain paused until every proof exists**, then orchestrator sets 0/1/10, reports proofs at flip and restores caps 0 on rollback triggers.
 
-## Context & prior-art delta
+1. Only-mode fix PR #7247 merged, merge SHA recorded. Prep found it open/changes/red-team blocked at e04c73013f; off-list prepares and expired list use had occurred that day.
+2. Prepare-refusal stop PR #7251 merged or prototype-loaded, with installed-state log line. Prep found open at 1ebcb27a6a; check-conflict serialized it after #7247.
+3. Validated build-priority-set operation merged. Initially no PR; later prep update records #7268 open. Requires atomic validated write, TTL ≤168 h and ids present on main.
+4. Four-id list installed (6893/7323/4489/6966), proven by tick log, not a file claim. Previous list expired 08:03 ET.
+5. Fresh 24 h stage-0 soak after fixes: listed ids only, no repeat prepares, list change honoured within one tick.
+6. Operator keeps or drops G2 (R968 audit-scope/#6989) and G3 (proposed builder brief) explicitly. Do not silently waive them.
 
-| Existing control | Evidence required for stage 1 |
-| --- | --- |
-| #7247 prevention | Merge proof, not just a branch/card |
-| #7251 refusal stop | Installed-state proof, not just merge |
-| Priority-list tool | Identified tool and merge proof |
-| New priority list | Installed identity and activation proof |
+Excluded: go before proofs; off-list builds and repeated-refusal loops remain possible. “Fresh go later” and “conditional go now” differ only by round trip; R981 already permits checklist-triggered go.
 
-## Dependencies & lineage
+## Context and prior-art delta
 
-R981; #7247; #7251; priority-list tool and installed list (identities need research).
+- Progressive/canary rollout with pass/rollback criteria is the precedent. WE adds shared scope admission against running workers and open PRs (R1055).
+- Pass: clean PREP/audit/verify PR and no collision. Roll back on unfixed WEAKENED, collision, double or stale build; restore plist backup.
+- G2 prep gap: #6989 closed unmerged; no audit-scope/invariantsHash code found on main. G3: #7085 merged but proposed brief still differs by 83 lines. Only operator decides whether these count.
+- Sources: `we:builder-revival.md:22-32`, `builder-only-mode-prepare-prep`, `runtime-list-install-prep`, `s0-check-scope-pr1-prep`, `delivery-agent-brief.proposed`, `build-queue`, `we:rulings.md:2330` (R981), `rulings-active` R1054/R1055.
 
-## Recommendation
+Skeptic: SURVIVES as historical not-yet evidence; rechecked PRs and caps. Screen: flagged(prio) → readiness/batch-confirm, no independent merit fork. Readiness prerequisites should acquire real backlog edges when corresponding cards are identified; PR numbers above are PRs, not invented card ids.
 
-**Not yet (default).** Re-present only after #7247 merges, refusal stop #7251 installs, the priority-list tool merges, and the new list is installed. Even then the operator must authorize unpause.
+## Supported by default
 
-Skeptic: Initial filing-stage objection, not an independent pass: The changes may already have landed elsewhere. Reconcile current merge and installed-state evidence during prep; never equate merging with installation or silence with permission.
-Screen: pending the later independent standard/implementation and merit/prioritization screen.
+Preserve priority fixer → blockers → builder. Shared scope/capacity checks still apply; installed-state evidence is stronger than merge alone. G2/G3 need explicit operator disposition.
 
+## What ratifying unlocks
 
-## Consequences / what ratifying unlocks
-
-A single operator go/no-go on the bounded stage-1 candidate once evidence is complete.
-
-Operator answers: “D16 not yet” confirms the hold. A later “D16 yes” authorizes stage 1 only after all four preconditions are evidenced and the operator explicitly rules go. No answer is recorded here.
-
-## Prep still needed
-
-- Prior art: verify primary references and known implementations; reuse existing research first.
-- Evidence: Resolve the exact #7247/#7251 PR/artifact identities and identify the priority-list tool and installed list; collect merge SHAs and installed refusal-stop/list evidence; validate one-build admission.
-- Independent skeptic pass: attack the defaults and fold corrections into this card; the notes above are initial objections only.
-- Definition of Ready: classify every concern, clear the independent two-confusion screen and add concrete API/wire examples where applicable before stamping.
-
-## Done when
-
-- **Executable** — n/a: decision filing changes no runtime. Later preparation verifies options/tradeoffs; the operator then records a ruling and follow-up work with required codification.
+Conditional stage-1 start after proofs, with no second go required; “D16 yes” plus G2/G3 decisions makes the trigger mechanical. This cards-only task changes no caps or runtime list.
 
 ## Trust boundary and threat model
 
-Briefs/page are proposal evidence, not execution authority. Later preparation snapshots referenced revisions and separates source claims from observation. This filing executes or publishes no external input.
+Builder output/PR text/runtime list are untrusted. Freeze proof SHAs and timestamped logs at flip; no moving-branch rereads, silence or elapsed-time approval. Stage 2 and larger caps are out of scope.
 
-## Non-goals
+Full prep (Standards decisions-prep set):
 
-No implementation, publication, migration or permission change is authorized by filing.
+```text
+D16-xygar78.md
+```
 
-## Edge cases this change must handle
+Source and proposed artifact filenames (handoff references are by name only):
 
-1. **Untrusted text** — source recommendations stay attributed, not ruled.
-2. **Truncated reads** — complete evidence is required before a prepared stamp.
-3. **Shared state files** — n/a: filing introduces no store writes.
-4. **Fail closed** — missing evidence leaves the decision open and needing prep.
-5. **Identity scoping** — repo loci remain explicit; no ids are reassigned.
-6. **State over time** — no prepared stamp or implied acceptance from elapsed time.
-7. **Who wrote it** — operator ask quoted; defaults remain proposals.
+```text
+D16-xygar78.md
+build-queue.md
+builder-only-mode-prepare-prep.md
+delivery-agent-brief.proposed.md
+rulings-active.md
+runtime-list-install-prep.md
+s0-check-scope-pr1-prep.md
+```
