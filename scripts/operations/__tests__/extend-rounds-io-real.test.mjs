@@ -18,12 +18,21 @@ it('reads, posts verbatim words through gh argv, and verifies the persisted thre
 const fs = require('node:fs');
 const args = process.argv.slice(2);
 if (args[0] === 'api' && args[1] === 'user') { process.stdout.write(${JSON.stringify(OPERATOR_LOGINS[0] + '\n')}); process.exit(0); }
-if (args[0] !== 'pr' || args[2] !== '12' || args[args.indexOf('--repo') + 1] !== 'web-everything/web-everything') process.exit(2);
 const path = ${JSON.stringify(thread)};
 const data = JSON.parse(fs.readFileSync(path, 'utf8'));
+if (args[0] === 'api' && args[1] === 'graphql') {
+  if (!args.includes('--paginate') || !args.includes('--slurp')
+    || !args.includes('owner=web-everything') || !args.includes('name=web-everything') || !args.includes('number=12')) process.exit(2);
+  process.stdout.write(JSON.stringify([{ data: { repository: { pullRequest: { comments: {
+    totalCount: data.comments.length, pageInfo: { hasNextPage: false, endCursor: null }, nodes: data.comments,
+  } } } } }]));
+  process.exit(0);
+}
+if (args[0] !== 'pr' || args[2] !== '12' || args[args.indexOf('--repo') + 1] !== 'web-everything/web-everything') process.exit(2);
 if (args[1] === 'view') process.stdout.write(JSON.stringify(data));
 else if (args[1] === 'comment') {
-  data.comments.push({ body: args[args.indexOf('--body') + 1], author: { login: ${JSON.stringify(OPERATOR_LOGINS[0])} } });
+  data.comments.push({ body: args[args.indexOf('--body') + 1], author: { login: ${JSON.stringify(OPERATOR_LOGINS[0])} },
+    createdAt: new Date().toISOString(), viewerDidAuthor: true });
   fs.writeFileSync(path, JSON.stringify(data));
 } else process.exit(3);
 `);
