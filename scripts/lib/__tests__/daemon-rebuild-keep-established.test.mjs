@@ -11,7 +11,7 @@ import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync, existsSync
 import { tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
 import { spawnSync } from 'node:child_process';
-import { planRebuild, rebuildClone } from '../daemon-rebuild.mjs';
+import { planRebuild, rebuildClone as realRebuildClone } from '../daemon-rebuild.mjs';
 import { addOverlay } from '../daemon-overlays.mjs';
 import { gitRun } from '../main-staleness.mjs';
 import { readOverlayConflictWakes } from '../overlay-conflict-wake.mjs';
@@ -82,6 +82,10 @@ function fixture() {
   const runGit = (args, opts = {}) => gitRun(args, { cwd: clone, env: { ...env, ...opts.env } });
   return { clone, env, init, cOld, p, h, overlays, pushNewcomer, runGit, push };
 }
+
+// Existing hold fixtures describe unmerged overlays; keep retirement hermetic and explicitly unproved.
+const rebuildClone = (options) => realRebuildClone({ ...options,
+  deps: { prove: () => ({ action: 'keep', reason: 'pr-open' }) } });
 
 const passSmoke = () => vi.fn(async () => ({
   verdict: 'pass', attempts: 1, smoke: { results: [{ name: 'reconcile-dry-run', ok: true, ms: 148_000 }, { name: 'lane-acquire-release', ok: true, ms: 32_000 }] },

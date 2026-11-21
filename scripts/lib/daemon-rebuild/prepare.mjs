@@ -92,7 +92,7 @@ export function contentContainedInBuild(git, sha, build) {
  * but clone-tree mutations defer to the next normal daemon tick.
  */
 export async function prepareRebuild({
-  root, env, log, run, prState, stateOpts, mainOnly, now, skipCheck, prBaseChain, prForcePushes, autoRebase = realAutoRebase, readyOnly = false, adoptOnly = false,
+  root, env, log, run, prState, stateOpts, mainOnly, now, skipCheck, prBaseChain, prForcePushes, autoRebase = realAutoRebase, deps = {}, readyOnly = false, adoptOnly = false,
 }) {
   // Tests reaching the hold must opt in before launching a detached repair or cleaning up swaps.
   if (process.env.VITEST === 'true' && env?.WE_DAEMON_AUTO_REBASE === undefined) {
@@ -472,9 +472,37 @@ export async function prepareRebuild({
   // the repair from ever being adopted. Only a tip the running build already carries qualifies: a changed tip says
   // nothing about the older live heads it replaced. Ancestry git cannot confirm keeps the overlay lost (fail closed).
   const contains = (sha, build) => !!build && git(['merge-base', '--is-ancestor', sha, build]).status === 0;
-  const lost = mainOnly ? [] : (plan.establishedLost ?? []).filter((l) => !(l.sha
+  let lost = mainOnly ? [] : (plan.establishedLost ?? []).filter((l) => !(l.sha
     && contains(l.sha, prevHead) && contains(l.sha, plan.finalSha)));
   if (!mainOnly && lost.length > 0) {
+    // Use the guarded retirement path: PR state alone cannot prove a snapshot carries no extra work.
+    // Never apply this stale plan after changing registrations; the next tick plans from the new list.
+    const retired = [];
+    const remainingLost = [];
+    for (const item of lost) {
+      if (readyOnly) { remainingLost.push(item); continue; }
+      try {
+        const entry = overlaysBefore.find((o) => o.ref === item.ref);
+        const expectedTip = verifyRev(git, `refs/remotes/origin/${item.ref}^{commit}`);
+        if (!entry || !expectedTip) { remainingLost.push(item); continue; }
+        const retire = deps.retireRegistration ?? (await import('../../daemon-overlay.mjs')).retireRegistration;
+        const result = await retire({ root, ref: item.ref, expectedTip, expectedEntry: entry,
+          by: 'rebuild-auto-retire', env, deps });
+        if (result?.retired === true) {
+          retired.push(item.ref);
+          alert('established-overlay-retired', { ref: item.ref, reason: result.reason });
+        } else remainingLost.push(item);
+      } catch (error) {
+        remainingLost.push(item);
+        alert('established-overlay-retirement-refused', { ref: item.ref, error: String(error?.message ?? error) });
+      }
+    }
+    lost = remainingLost;
+    if (retired.length > 0 && lost.length === 0) {
+      state.held = null;
+      writeState();
+      return terminal({ moved: false, reason: 'established-overlay-retired', refs: retired });
+    }
     const detail = {
       refs: lost.map((l) => l.ref), lost,
       message: `${lost.length} overlay(s) in the running build would be lost (${lost.map((l) => l.ref).join(', ')}) — holding on the last-good build; rebase them onto main (or merge main into the stack top) and re-register`,

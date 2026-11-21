@@ -188,7 +188,7 @@ async function rebuildCloneInternal({
   root, env = process.env, log = console, run = gitRun, runSmoke = runLiveSmokeWithRetry,
   prState = (pr) => defaultPrState({ pr, root }), prBaseChain, lockOpts = {}, stateOpts = {}, mainOnly = false,
   now = () => Date.now(), sleep, versions, skipCheck, entries, dispatchSmoke, readyOnly = false, adoptOnly = false,
-  asJob, admissionWaitMs, spawnerOwners = defaultSpawnerOwners, readerStartTimeOf = processStartMs,
+  deps = {}, asJob, admissionWaitMs, spawnerOwners = defaultSpawnerOwners, readerStartTimeOf = processStartMs,
 } = {}) {
   // #4126 — the opted-in daemon's tick never smokes: it adopts a ready candidate (fast) and otherwise starts or
   // watches a detached rebuild JOB (`rebuild-job.mjs`). `asJob` undefined resolves from daemon-rebuild-settings.json
@@ -269,7 +269,7 @@ async function rebuildCloneInternal({
     && pendingReady.prevHead === verifyRev(makeGit({ run, cwd: root, env }), 'HEAD');
   const startedMs = now();
   const prep = await withWriteLock(root, () => prepareRebuild({
-    root, env, log, run, prState, prBaseChain, stateOpts, mainOnly, now, skipCheck: skipDecider, readyOnly, adoptOnly,
+    root, env, log, run, prState, prBaseChain, stateOpts, mainOnly, now, skipCheck: skipDecider, readyOnly, adoptOnly, deps,
   }), readyOnHead ? finalizeLockOpts : admissionLockOpts);
 
   if (prep.ok) {

@@ -260,7 +260,7 @@ describe('rebuildClone coordination events', () => {
     // Idle here means no failure event when moved=false. This also inventories
     // nested planning/diagnostic reasons, which must not imply a failed rebuild.
     const idle = new Set([
-      'readonly-job-mutation-due',
+      'readonly-job-mutation-due', 'established-overlay-retired',
       'adopted', 'already-adopted', 'already-head', 'already-on-main', 'applied', 'applied-',
       'applied-pinned', 'applied-retry', 'applied-stack-fallback', 'auto-rebase of ',
       'branch-not-allowlisted', 'clone-recloned', 'conflict', 'deps-job-running', 'deps-job-spaced',
