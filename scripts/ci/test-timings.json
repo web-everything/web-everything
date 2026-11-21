@@ -570,7 +570,6 @@
   "scripts/conveyor/__tests__/owed-ci-rerun-executor.test.mjs": 0.03,
   "scripts/lib/__tests__/merge-gate-stale-freeze.test.mjs": 0.03,
   "scripts/operations/__tests__/stale-freeze-rerun.test.mjs": 0.03,
-  "scripts/conveyor/soak/breaks/merge-gate-stale-main-freeze.soak.test.mjs": 2.6,
   "scripts/conveyor/__tests__/parked-pr-conflict-watch.test.mjs": 1.57,
   "scripts/conveyor/__tests__/parked-pr-progress-watch.test.mjs": 2.49,
   "scripts/conveyor/__tests__/pending-launches.test.mjs": 0.02,
@@ -2023,6 +2022,7 @@
   "wrapper-conformance/__tests__/runner.test.ts": 0.01
  },
  "soak": {
+  "scripts/conveyor/soak/breaks/merge-gate-stale-main-freeze.soak.test.mjs": 2,
   "scripts/conveyor/soak/breaks/runtime-admission-infra-retention.soak.test.mjs": 0.1,
   "scripts/conveyor/soak/breaks/forge-manifest-untracked-shipped.soak.test.mjs": 0.3,
   "scripts/conveyor/soak/breaks/catch-up-clean-first-snapshot-first.soak.test.mjs": 4.65,
