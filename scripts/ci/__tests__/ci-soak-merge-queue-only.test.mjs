@@ -6,6 +6,10 @@
 import { describe, expect, it } from 'vitest';
 import { readFileSync } from 'node:fs';
 import yaml from 'js-yaml';
+import unitConfig from '../../../vitest.config.ts';
+import soakConfig from '../../../vitest.soak.config.ts';
+import { shardFiles } from '../../conveyor/soak/shard-files.mjs';
+import { computeSoakClosure } from '../../conveyor/soak/soak-scope.mjs';
 
 const { jobs } = yaml.load(readFileSync(new URL('../../../.github/workflows/ci.yml', import.meta.url), 'utf8'));
 
@@ -25,4 +29,27 @@ describe('ci.yml soak runs in the merge queue only (R1068)', () => {
     expect(script).toMatch(/github\.event_name \}\}" = "pull_request"/);
     expect(script).toMatch(/soak deferred to merge queue \(R1068\)/);
   });
+});
+
+// These imports are execution entries, not copied assertions: changes to the original
+// files remain exercised by the normal soak discovery and required daemon-soak aggregate.
+describe('slow real-git matrices retain merge-queue coverage', () => {
+  it.each(['lane-pool-release-unpushed-guard', 'lane-pool-git-diet'])(
+    '%s is excluded from PR units and assigned to exactly one required soak shard', name => {
+      const original = `scripts/__tests__/${name}.test.mjs`;
+      const entry = `scripts/conveyor/soak/breaks/${name}.soak.test.mjs`;
+      expect(unitConfig.test.exclude).toContain(original);
+      expect(computeSoakClosure().has(original)).toBe(true);
+      expect(soakConfig.test.include).toContain('scripts/conveyor/soak/**/*.soak.test.mjs');
+      expect(readFileSync(new URL(`../../../${entry}`, import.meta.url), 'utf8'))
+        .toContain(`import '../../../__tests__/${name}.test.mjs';`);
+      const assignments = jobs['soak-shard'].strategy.matrix.shard.flatMap(shard =>
+        shardFiles({ shard, total: jobs['soak-shard'].strategy.matrix.shard.length }));
+      expect(assignments.filter(file => file === entry)).toEqual([entry]);
+      expect(jobs['soak-shard'].if).toMatch(/github\.event_name != 'pull_request'/);
+      expect(jobs['soak-shard'].steps.some(step => step.run?.includes('npm run test:soak:shard'))).toBe(true);
+      expect(jobs['daemon-soak'].needs).toContain('soak-shard');
+      expect(jobs['daemon-soak'].if).toMatch(/merge_group/);
+    },
+  );
 });

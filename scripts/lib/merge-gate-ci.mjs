@@ -227,9 +227,9 @@ export function evaluatePrGates(facts, { policy = null, requiredCheck = REQUIRED
   // test-gaming — the drain no-ops without a clone; CI has one, so an unscored diff fails closed.
   if (!sig?.scored || typeof sig.netDiffText?.text !== 'string') set('test-gaming', 'fail-closed', 'net diff text not computed');
   else {
-    const gaming = scanTestTampering({ diffText: sig.netDiffText.text });
+    const gaming = scanTestTampering({ netDiffText: sig.netDiffText, pinnedHeadSha: facts.pinnedHead?.sha ?? null });
     const accepted = hasReviewLabel(labels, REVIEW_LABELS.accepted) && acceptance && !acceptance.error;
-    const repark = shouldReparkForTestTampering({
+    const repark = gaming.evidenceIncomplete || shouldReparkForTestTampering({
       tampered: gaming.tampered, netDiffScored: true,
       humanClearedSha: accepted && gaming.tampered ? acceptance.humanClearedSha ?? null : null,
       headSha: accepted && gaming.tampered ? acceptance.headSha ?? null : null,

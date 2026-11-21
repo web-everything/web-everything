@@ -74,6 +74,7 @@
  * SCOPE. Only PRs of the local repo (the clone's origin): that is the repo whose ready PRs the drain enqueues on
  *   GitHub's merge queue. A mark with no PR number (`repo#?`) or a full-sweep mark (`*`) is left to the full pass.
  */
+import { writeFastDrainRoundDefaultBranch } from './fast-drain-scope.mjs';
 import { createPrestageCache, resolvePrestageSettings } from './drain-prestage.mjs';
 import { rmSync } from 'node:fs';
 import { readFastDrainRoundSnapshot } from './fast-drain-scope.mjs';
@@ -104,6 +105,8 @@ export const FAST_DRAIN_TIMEOUT_MS = 10 * 60_000;
 // Fixed maximum: decline dedupe must never suppress a PR indefinitely.
 export const CATCH_UP_DECLINE_TTL_MS = 60 * 60_000;
 // Declines safe to dedupe: bound to a head/labels/checks snapshot. Everything else retries every catch-up.
+// Only red-team-pending survives main CI churn; mq-same-head-failed recovery is main-dependent,
+// so it, sent-back and bornas-collision require the same mainCiRunId.
 export const CATCH_UP_DECLINE_DEDUPE_KINDS = Object.freeze(new Set(['mq-same-head-failed', 'red-team-pending', 'sent-back', 'bornas-collision']));
 const READY_LABEL = 'ready-to-merge';
 const ELIGIBLE_LABELS = Object.freeze(['review:accepted', READY_LABEL]);
@@ -411,6 +414,15 @@ export function catchUpSkipReason(pr, defaultBranch = 'main') {
   return null;
 }
 
+/** A check run is finished when it carries a conclusion or a real completedAt, whatever a stale `status` says (#7112). */
+function checkRunUnfinished(c) {
+  if (!c?.status || c.status === 'COMPLETED') return false;
+  if (CHECK_CONCLUSIONS.has(String(c.conclusion ?? '').toUpperCase())) return false;
+  const done = typeof c.completedAt === 'string' ? Date.parse(c.completedAt) : NaN;
+  return !(Number.isFinite(done) && done > Date.parse('2000-01-01T00:00:00Z') && done <= Date.now() + 60_000);
+}
+const CHECK_CONCLUSIONS = new Set(['SUCCESS', 'FAILURE', 'CANCELLED', 'TIMED_OUT', 'NEUTRAL', 'SKIPPED', 'STALE', 'STARTUP_FAILURE', 'ACTION_REQUIRED']);
+
 /**
  * Is the PR worth a fast drain right now? A WAKE filter, never the gate: it only skips a run the drain would certainly
  * no-op (a fast drain lists and classifies for ~1 min, and most green-check events are for PRs that are not queued yet
@@ -428,7 +440,7 @@ export function wakeWorthy(pr, defaultBranch = 'main') {
   if (hold) return { wake: false, reason: hold };
   if (!labels.includes(READY_LABEL)) return { wake: false, reason: `no ${READY_LABEL} label yet` };
   const running = (Array.isArray(pr.statusCheckRollup) ? pr.statusCheckRollup : [])
-    .filter((c) => (c?.__typename === 'StatusContext' ? ['PENDING', 'EXPECTED'].includes(String(c.state).toUpperCase()) : c?.status && c.status !== 'COMPLETED'));
+    .filter((c) => (c?.__typename === 'StatusContext' ? ['PENDING', 'EXPECTED'].includes(String(c.state).toUpperCase()) : checkRunUnfinished(c)));
   if (running.length) return { wake: false, reason: `${running.length} check(s) still running (${running.slice(0, 3).map((c) => c.name || c.context).join(', ')})` };
   return { wake: true, reason: 'ready-to-merge, every check finished' };
 }
@@ -652,7 +664,8 @@ function unchangedDecline(pr, held, now, mainCiRunId) {
     && typeof pr.checksDigest === 'string' && pr.checksDigest && held.checksDigest === pr.checksDigest
     && Number.isFinite(pr.lastCheckCompletedAt) && pr.lastCheckCompletedAt <= held.at
     && Number.isFinite(pr.lastLabelChangedAt) && pr.lastLabelChangedAt <= held.at
-    && Number.isSafeInteger(mainCiRunId) && mainCiRunId > 0 && held.mainCiRunId === mainCiRunId);
+    && (held.reason === 'red-team-pending'
+      || Number.isSafeInteger(mainCiRunId) && mainCiRunId > 0 && held.mainCiRunId === mainCiRunId));
 }
 
 /** PURE: ordered candidates that fit the current queue, leaving eligibility to the drain. */
@@ -808,6 +821,7 @@ export function createEnqueueOnEvent({
   cwd, localSlug, defaultBranch, execFileSyncImpl = execFileSyncThrottled,
   scriptRoot = () => cwd, allowed = () => true, log = (m) => process.stderr.write(`${m}\n`),
   env = process.env, now = () => Date.now(), spawnImpl = spawn, resolveSetting = () => resolveEnqueueOnEventSetting({ env }),
+  writeRoundSnapshot = writeFastDrainRoundDefaultBranch,
   refreshPending = () => {
     try {
       const root = scriptRoot();
@@ -852,6 +866,7 @@ export function createEnqueueOnEvent({
       || pr.state && pr.state !== 'OPEN') { missBackoff.delete(num); return null; }
     return now() - held.at < missSettings(s).ttlMinutes * 60_000 ? held : null;
   };
+  let defaultBranchReadAt = null; // Only an actual live read in this daemon can timestamp branch evidence.
   let listingSnapshot = null;
   const snapshotPrefix = `we-fast-drain-${process.pid}-${randomUUID()}`;
   const clearSnapshot = () => {
@@ -962,6 +977,7 @@ export function createEnqueueOnEvent({
           { cwd, env, encoding: 'utf8', timeout: 60_000, maxBuffer: 1024 * 1024 });
         if (typeof branch !== 'string' || !branch.trim() || branch.trim() === 'null') throw new Error('default branch unreadable');
         defaultBranch = branch.trim();
+        defaultBranchReadAt = now();
       } catch {
         log('enqueue-on-event: default branch unreadable — deferring wakes and catch-up; retrying on next tick');
         return [];
@@ -1000,6 +1016,8 @@ export function createEnqueueOnEvent({
         catchUpRound++;
         clearSnapshot();
         listingSnapshot = join(tmpdir(), `${snapshotPrefix}-${catchUpRound}.json`);
+        if (defaultBranchReadAt !== null) writeRoundSnapshot({ path: listingSnapshot, repo: localSlug,
+          defaultBranch, observedAt: defaultBranchReadAt });
         listedPrs = result.prs;
         catchUpMainCiRunId = result.mainCiRunId;
         const listed = new Set(result.prs.filter(p => !p.inQueue).map(p => p.num));
@@ -1016,6 +1034,7 @@ export function createEnqueueOnEvent({
           const current = result.prs.find(pr => pr.num === num);
           if (!current || !unchangedDecline(current, held, now(), result.mainCiRunId)) {
             // Existing wake backoffs must not mask a dedupe invalidation (including missing evidence).
+            declines.delete(num);
             backoff.delete(num);
             missBackoff.delete(num);
           }
@@ -1310,7 +1329,16 @@ export function createEnqueueOnEvent({
       // failure cannot withdraw a green wake; the drain re-reads current required checks.
       // A wake for a PR whose fast drain is running stays pending: the run loop never starts a second
       // drain for an active PR, and the next tick re-wakes it unless that run verified the enqueue.
-      if (r?.ok !== false && Array.isArray(r?.marked) && r.marked.length) pending = notePending(pending, r.marked, { localSlug, now: now() });
+      if (r?.ok !== false && Array.isArray(r?.marked) && r.marked.length) {
+        // Every local PR event invalidates memory, even if it cannot queue an immediate wake.
+        for (const mark of r.marked) {
+          const key = parseMarkKey(mark?.key);
+          if (!key || key.repo !== String(localSlug ?? '').toLowerCase()) continue;
+          // Only a PR holding a remembered decline loses its wake backoffs; untyped BLOCKED backoffs stay.
+          if (declines.delete(key.num)) { backoff.delete(key.num); missBackoff.delete(key.num); }
+        }
+        pending = notePending(pending, r.marked, { localSlug, now: now() });
+      }
     },
     /** Run due PRs now (bounded catch-up concurrency; serial events) if enabled and allowed; a no-op while a tick is already running. */
     tick() { return running && !runningCatchUpOnly ? running : startRun({}, running); },
