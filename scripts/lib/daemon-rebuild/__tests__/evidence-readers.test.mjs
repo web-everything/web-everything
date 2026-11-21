@@ -17,6 +17,27 @@ import { readOverlayConflictWakes } from '../../overlay-conflict-wake.mjs';
 import { pendingPath, readPendingDrops } from '../../overlay-drop-pending.mjs';
 import * as preparation from '../prepare.mjs';
 import * as locks from '../../daemon-clone-lock.mjs';
+import { probeNullableRollback } from '../../../conveyor/soak/fixtures/rebuild-evidence-probe.mjs';
+
+it.each([{ inputsKey: null, mainSha: null }, {}, { inputsKey: 'known', mainSha: 'a'.repeat(40) },
+  { inputsKey: null, mainSha: 'a'.repeat(40) }, { inputsKey: 'known', mainSha: null }])(
+  'failed force watch rolls back with lastGood plan keys %j and readable inProgress', async planKeys => {
+    const report = await probeNullableRollback(planKeys);
+    expect(report.errors).toEqual([]);
+    expect(report.head).toBe(report.good);
+    expect(report.resets).toEqual([report.good]);
+    expect(report.snapshots).toEqual([expect.objectContaining({ target: report.good, verified: true, ...planKeys })]);
+    expect(report.state.inProgress).toBeNull();
+    expect(report.state.adopted).toMatchObject({ head: report.good, ...planKeys });
+    expect(report.watch).toBeNull();
+    expect(report.events).toContainEqual(expect.objectContaining({ kind: 'force-adopt-rolled-back' }));
+  });
+
+it.each(['inputsKey', 'mainSha'].flatMap(key => [42, false, {}, []].map(value => [key, value])))(
+  'inProgress still rejects malformed %s=%j', (key, value) => {
+    expect(rebuildStateSchema.inProgress({ pid: 1, host: 'host', startedAt: new Date(0).toISOString(),
+      prevHead: 'old', target: 'new', applied: [], inputsKey: 'known', mainSha: 'main', [key]: value })).toBe(false);
+  });
 
 const dirs = [];
 afterEach(() => { vi.restoreAllMocks(); for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true }); });

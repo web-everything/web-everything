@@ -108,7 +108,7 @@ export const rebuildStateSchema = {
   // Pre-smoke-before-reset records lack verified: recovery must roll them back,
   // rather than refusing the evidence before it can inspect that absent marker.
   inProgress: v => fields(v, { pid: positive, host: string, startedAt: date, prevHead: string, target: string,
-    applied }, { inputsKey: string, mainSha: string, verified: boolean }),
+    applied }, { inputsKey: nullable(string), mainSha: nullable(string), verified: boolean }),
   quarantine: v => fields(v, { prevHead: string, reason: string }),
   unverified: v => fields(v, { head: string, prevHead: string }),
   // `adoptOnly` is written only for adopt-only leases (legacy shape); absent means a real-job lease.

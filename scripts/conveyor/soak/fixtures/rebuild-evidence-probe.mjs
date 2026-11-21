@@ -15,6 +15,53 @@ import { readReadyCandidate } from '../../../lib/daemon-rebuild/state.mjs';
 import { rebuildClone } from '../../../lib/daemon-rebuild/rebuild.mjs';
 import { acquireRead, releaseRead } from '../../../lib/daemon-clone-lock.mjs';
 import { claimBuildLease, releaseBuildLease } from '../../../lib/daemon-rebuild/lease.mjs';
+import { watchPath, readForceWatch } from '../../../lib/daemon-force-adopt.mjs';
+
+/** Real watch/finalization and disk reads; Git is injected so no checkout is moved. */
+export async function probeNullableRollback(planKeys = { inputsKey: null, mainSha: null }) {
+  const root = mkdtempSync(join(tmpdir(), 'nullable-rollback-'));
+  const previousLockRoot = process.env.WE_DAEMON_CLONE_LOCK_ROOT;
+  process.env.WE_DAEMON_CLONE_LOCK_ROOT = join(root, 'locks');
+  const env = { WE_DAEMON_REBUILD_STRICT_EVIDENCE: '1', WE_DAEMON_STATE_DIR: join(root, 'state'),
+    WE_DAEMON_OVERLAY_DIR: join(root, 'overlays'), WE_FORCE_ADOPT_HANDOFF: join(root, 'handoff.md'),
+    WE_FORCE_ADOPT_CORONER: join(root, 'coroner.jsonl') };
+  const good = 'a'.repeat(40), bad = 'b'.repeat(40);
+  let head = bad;
+  const resets = [], snapshots = [], errors = [], events = [];
+  const readers = createRebuildReaders({ strict: true });
+  const run = args => {
+    if (args[0] === 'rev-parse' && args.at(-1) === 'HEAD') return { status: 0, stdout: head };
+    if (args[0] === 'rev-parse' && args.at(-1) === 'MERGE_HEAD') return { status: 1, stdout: '' };
+    if (['status', 'ls-files', 'cat-file', 'rev-list'].includes(args[0])) return { status: 0, stdout: '' };
+    if (args[0] === 'reset' && args[1] === '--hard') {
+      head = args[2]; resets.push(head);
+      // Observe the persisted intermediate record without changing control flow.
+      try { snapshots.push(readers.state(root, env).inProgress); }
+      catch (error) { errors.push(error.cause?.message ?? error.message); }
+      return { status: 0, stdout: '' };
+    }
+    const error = `Unexpected rollback Git call: ${args.join(' ')}`;
+    errors.push(error);
+    throw new Error(error);
+  };
+  try {
+    writeRebuildState(root, { adopted: { head: bad, inputsKey: 'bad', mainSha: bad,
+      applied: [], at: new Date(0).toISOString() } }, env);
+    writeFileSync(watchPath(root, env), JSON.stringify({ daemon: 'health-watch', ruling: 'R1035',
+      sha: bad, startedAt: new Date(0).toISOString(), ticksLeft: 3, bad: 0,
+      lastGood: { head: good, applied: [], ...planKeys } }));
+    const result = await rebuildClone({ root, env, asJob: false, versions: null, run,
+      forceWatchProbe: async () => ({ healthy: false }), emitEvent: event => events.push(event),
+      log: { error: message => errors.push(message) } });
+    let state;
+    try { state = readers.state(root, env); } catch (error) { errors.push(error.cause?.message ?? error.message); }
+    return { result, head, good, resets, snapshots, errors, events, state, watch: readForceWatch(root, env) };
+  } finally {
+    if (previousLockRoot === undefined) delete process.env.WE_DAEMON_CLONE_LOCK_ROOT;
+    else process.env.WE_DAEMON_CLONE_LOCK_ROOT = previousLockRoot;
+    rmSync(root, { recursive: true, force: true });
+  }
+}
 
 /** Torn job sidecars cannot wedge default ticks; unattended children retain abandoned worktrees for cleanup. */
 export async function probeTickCompatibility() {
