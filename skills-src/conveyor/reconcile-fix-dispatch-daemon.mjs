@@ -1403,11 +1403,21 @@ export async function runTickAllRepos({
   // The orphan-round guard (retry/escalation cap) stays BEFORE fix so a capped orphan is never re-dispatched first.
   const requireOrphanGuard = !stuckFixerTick && realTick && !!orphanGuardTick;
   const orphanGuardCompleted = new Set();
+  const orphanGuardHeldPrs = new Map();
+  const orphanGuardFailed = new Set();
+  let orphanGuardEvidenceUnknown = false;
+  const holdPr = (repo, pr) => {
+    const key = repoKeyForSlug(repo);
+    const held = orphanGuardHeldPrs.get(key) ?? new Set();
+    held.add(pr);
+    orphanGuardHeldPrs.set(key, held);
+  };
   const orphanGuard = await timedAsync('orphan-guard', async () => {
     if (!requireOrphanGuard) return { rows: [] };
     try {
       const result = await orphanGuardTick({ env: process.env, nowMs: now(),
       deadlineAt: phaseStarts['orphan-guard'] + budgets['orphan-guard'].budgetMs,
+      ...(typeof adoptYieldProbe === 'function' ? { shouldYield } : {}),
       now, cursor: prCursors['orphan-guard'], ...(planCache ? { reconcile: planCache.reconcile } : {}),
       repos: (function* () {
         for (const repo of budgetRepos('orphan-guard', repos)) {
@@ -1419,15 +1429,19 @@ export async function runTickAllRepos({
         }
       })(),
       });
-      if (!Array.isArray(result?.rows)) orphanGuardCompleted.clear();
+      if (!Array.isArray(result?.rows)) { orphanGuardCompleted.clear(); orphanGuardEvidenceUnknown = true; }
       else for (const row of result.rows) {
         const key = row?.repo && repoKeyForSlug(row.repo);
-        if (!key) { orphanGuardCompleted.clear(); break; }
+        if (!key) { orphanGuardCompleted.clear(); orphanGuardEvidenceUnknown = true; break; }
         const success = { rearm: 're-armed', redispatch: 're-dispatched', escalate: 'escalated' };
         if (!Object.hasOwn(success, row.decision)
           || (row.result !== success[row.decision] && row.result !== 'report-only (WE_ORPHAN_FIX_GUARD=0)')) {
-          for (const repo of orphanGuardCompleted) {
-            if (repoKeyForSlug(repo) === key) orphanGuardCompleted.delete(repo);
+          if (Number.isInteger(row.pr)) holdPr(row.repo, row.pr);
+          else {
+            orphanGuardFailed.add(key);
+            for (const repo of orphanGuardCompleted) {
+              if (repoKeyForSlug(repo) === key) orphanGuardCompleted.delete(repo);
+            }
           }
         }
       }
@@ -1437,31 +1451,45 @@ export async function runTickAllRepos({
       if (result?.deferred?.length) {
         budgets['orphan-guard'].hit = true;
         budgets['orphan-guard'].skipped.push(...result.deferred);
-        for (const deferred of result.deferred) {
-          for (const repo of orphanGuardCompleted) {
-            if (repoKeyForSlug(repo) === repoKeyForSlug(deferred.repo)) orphanGuardCompleted.delete(repo);
-          }
-        }
+        for (const deferred of result.deferred) holdPr(deferred.repo, deferred.pr);
       }
       return result ?? { rows: [] };
     }
     catch (e) {
       orphanGuardCompleted.clear();
+      orphanGuardEvidenceUnknown = true;
       return { rows: [{ decision: 'error', reason: String(e?.message ?? e).split('\n')[0] }] };
     }
   });
   planCache?.markTouched({ dispatched: (Array.isArray(orphanGuard.rows) ? orphanGuard.rows : [])
     .filter(row => row?.decision === 'redispatch' && row.result?.startsWith('re-dispatched'))
     .map(row => ({ repo: row.repo, pr: row.pr })) });
+  // A budget-skipped repo still gets ordinary fixes. Its review:changes rows remain
+  // guarded using the fix planner's own evidence, without another PR listing.
+  const unvisited = new Set(orphanGuardEvidenceUnknown ? []
+    : budgets['orphan-guard'].skipped.filter(repo => typeof repo === 'string' && !orphanGuardFailed.has(repoKeyForSlug(repo))));
   const orphanGuardDeferred = requireOrphanGuard
-    ? stepRepos.get('fix').filter(repo => !orphanGuardCompleted.has(repo)) : [];
+    ? stepRepos.get('fix').filter(repo => !orphanGuardCompleted.has(repo) && !unvisited.has(repo)) : [];
   const guardedFixRepos = stepRepos.get('fix').filter(repo => !orphanGuardDeferred.includes(repo));
   const fix = stepTimed('fix', () => (authGate.paused ? pausedDispatchResult()
     : runReconcileFixDispatchAllRepos({ repos: budgetRepos('fix', guardedFixRepos), allowStandDownAutoProceed,
-      tick: boundedPrTick('fix', sharedTick('fix', fixTick ?? runReconcileFixDispatch)),
+      tick: boundedPrTick('fix', options => sharedTick('fix', fixTick ?? runReconcileFixDispatch)({ ...options,
+        ...(requireOrphanGuard ? { excludePrs: entry => orphanGuardHeldPrs.get(repoKeyForSlug(options.repo))?.has(entry.prNumber)
+          || (unvisited.has(options.repo) && (!Array.isArray(entry.labels)
+            || entry.labels.some(label => (typeof label === 'string' ? label : label.name) === 'review:changes'))),
+        } : {}),
+      })),
       ...(fixTick ? {} : { queueAdmission, dispatchThrottle, borrowGate, fixExecutorRoute }) })));
   for (const repo of orphanGuardDeferred) fix.refusals.push({ repo, prNumber: null,
     kind: 'orphan-guard-deferred', why: 'orphan-cap guard did not complete this repo; fix deferred until next pass' });
+  for (const repo of guardedFixRepos) {
+    for (const prNumber of orphanGuardHeldPrs.get(repoKeyForSlug(repo)) ?? []) {
+      if (!fix.refusals.some(row => row.repo === repo && row.prNumber === prNumber)) fix.refusals.push({
+        repo, prNumber, kind: 'orphan-guard-deferred',
+        why: 'orphan-cap guard did not settle this PR; fix deferred until next pass',
+      });
+    }
+  }
   planCache?.markTouched(fix);
   // Reclaim after fix so a slow watchdog sweep cannot delay review:changes decisions.
   // The hooks cannot interrupt in-flight work or bound discovery/endFix/release IO.

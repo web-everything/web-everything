@@ -444,6 +444,19 @@ describe('runOrphanFixRoundPass — IO shell', () => {
     expect(second.nextCursor).toEqual({ repo: repos[0].slug, pr: 3 });
   });
 
+  it('yields mid-loop before reading remaining collected PRs and returns their cursor', async () => {
+    const isOwned = vi.fn(async () => true);
+    const shouldYield = vi.fn(() => isOwned.mock.calls.length >= 2);
+    const s = seams([], { listBounced: () => [4, 3, 2, 1].map(number => pr4715([], { number })),
+      isOwned, shouldYield });
+    const result = await runOrphanFixRoundPass(s);
+    expect(isOwned.mock.calls.map(([, pr]) => pr)).toEqual([1, 2]);
+    expect(shouldYield).toHaveBeenCalledTimes(2);
+    expect(result).toMatchObject({ handled: 2,
+      deferred: [{ repo: repos[0].slug, pr: 3 }, { repo: repos[0].slug, pr: 4 }],
+      nextCursor: { repo: repos[0].slug, pr: 3 } });
+  });
+
   it('checks the deadline before each PR after the first and always makes one PR of progress', async () => {
     let time = 0;
     const s = seams([], { listBounced: () => [3, 1, 2].map(number => pr4715([], { number })),

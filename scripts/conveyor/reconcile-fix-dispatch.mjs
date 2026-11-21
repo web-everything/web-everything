@@ -1873,6 +1873,8 @@ export function runReconcileFixDispatch({
   dispatch = dispatchFix,
   reconcile = runReconcilePass,
   readPrs,
+  // Pass-local guard: PR numbers, or a predicate over reconciled dispatch rows.
+  excludePrs = [],
   // R123 writes require caller permission, even when dispatch itself is stubbed (live smoke).
   // The production daemon forwards fix.standDownAutoProceed from the policy cascade (standard: true).
   allowStandDownAutoProceed = false,
@@ -1969,6 +1971,17 @@ export function runReconcileFixDispatch({
   }
   const reconciled = netScope ? fixStep('net-scope', () => netScope(reconciledRaw, { root, repoKey })) : reconciledRaw;
   let dispatchEntries = Array.isArray(reconciled.dispatch) ? reconciled.dispatch : [];
+  const excluded = typeof excludePrs === 'function' ? excludePrs : entry => excludePrs.includes(entry.prNumber);
+  const guardRefusals = [];
+  const guardAllows = entry => {
+    if (entry.kind !== 'fix' || !excluded(entry)) return true;
+    if (!guardRefusals.some(row => row.prNumber === entry.prNumber)) guardRefusals.push({
+      kind: 'orphan-guard-deferred', prNumber: entry.prNumber,
+      why: 'orphan-cap guard did not settle this PR; fix deferred until next pass',
+    });
+    return false;
+  };
+  dispatchEntries = dispatchEntries.filter(guardAllows);
   const profile = resolveProfile(repoKey);
 
   const unsupportedFor = (kind, action, why) => dispatchEntries
@@ -1989,9 +2002,9 @@ export function runReconcileFixDispatch({
     const fixRefusals = unsupportedFor(
       'fix', 'fix', 'Fix dispatch requires a repo-specific brief and gate; the existing worker is WE-only.',
     );
-    const refusals = [...fixRefusals, ...ciHealRefusals];
+    const refusals = [...guardRefusals, ...fixRefusals, ...ciHealRefusals];
     const reviews = readUnsupported({ path: unsupportedPath }).filter((row) => row.repo === repoKey && row.action === 'review');
-    recordUnsupported({ repo: repoKey, rows: [...reviews, ...refusals], path: unsupportedPath });
+    recordUnsupported({ repo: repoKey, rows: [...reviews, ...fixRefusals, ...ciHealRefusals], path: unsupportedPath });
     return { handled: fixRefusals.length, deferred: [], nextCursor: null, dispatched: [], refusals, reconcileRefusals: reconciled.refusals.length, reconcileRefusalDetails: reconciled.refusals };
   }
   // `fix` IS supported here — still durably record any ci-heal refusals (a separate capability, possibly still
@@ -2100,7 +2113,7 @@ export function runReconcileFixDispatch({
   })) {
     let synthetic;
     try { synthetic = readPrForRestack?.(top); } catch { continue; }
-    if (!synthetic) continue;
+    if (!synthetic || !guardAllows(synthetic)) continue;
     // The planner never saw this row: stamp the red-main fix PR here too, so its restack stays on Claude.
     if (mainRedPriorityRank(synthetic.prNumber, readMainRedPriorityRecord(), { now: Date.now(), repo: repoKey }) === 0) synthetic = { ...synthetic, mainFix: true };
     // The agent pushes to this branch: only a same-repo PR whose head is the tip of its origin lane/* branch qualifies.
@@ -2172,7 +2185,7 @@ export function runReconcileFixDispatch({
     const start = planned.findIndex(entry => entry.pr === cursor);
     if (start > 0) planned = [...planned.slice(start), ...planned.slice(0, start)];
   }
-  const refusals = [...ciHealRefusals, ...planRefusals, ...stackOrder.refusals, ...scopeFilter.refusals];
+  const refusals = [...guardRefusals, ...ciHealRefusals, ...planRefusals, ...stackOrder.refusals, ...scopeFilter.refusals];
   // Card xjddimd — log the class each owed PR WOULD get (shadow). Best-effort; reads nothing the pass uses.
   const priorityShadowResult = priorityShadow
     ? priorityShadow({ planned: plannedAll, ranks: scopeFilter.ranks, refusals: scopeFilter.refusals, dispatchEntries, repoKey }) : null;

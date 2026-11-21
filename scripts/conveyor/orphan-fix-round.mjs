@@ -267,6 +267,7 @@ export async function runOrphanFixRoundPass({
   env = process.env,
   nowMs = Date.now(),
   deadlineAt = Infinity,
+  shouldYield,
   now = Date.now,
   cursor = null,
   reconcile,
@@ -299,7 +300,7 @@ export async function runOrphanFixRoundPass({
     slug > cursorRepo || (slug === cursorRepo && p.number >= cursor.pr));
   const ordered = start > 0 ? [...entries.slice(start), ...entries.slice(0, start)] : entries;
   for (const { key, slug, p } of ordered) {
-    if (deferring || (handled > 0 && now() >= deadlineAt)) {
+    if (deferring || (handled > 0 && (now() >= deadlineAt || shouldYield?.()))) {
       deferring = true;
       deferred.push({ repo: slug, pr: p.number });
       continue;
