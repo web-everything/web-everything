@@ -26,7 +26,7 @@ const facts = overrides => ({ number: 1, title: 'fixture', labels: [], headSha: 
   minutesSinceUpdate: 1, fixerRunning: false, inCi: false, owner: null, evidenceErrors: [], ...overrides });
 const pr = overrides => ({ number: 1, title: 'fixture $(touch sentinel)', headRefOid: SHA, baseRefOid: BASE, labels: [],
   updatedAt: at(1), createdAt: at(120), body: '<!-- authored-by-actor: author -->', author: { login: 'author' },
-  assignees: [], files: [{ path: 'scripts/x.mjs' }], changedFiles: 1, statusCheckRollup: [], ...overrides });
+  assignees: [], commits: [], files: [{ path: 'scripts/x.mjs' }], changedFiles: 1, statusCheckRollup: [], ...overrides });
 const comment = (body, minutes = 1, login = 'chalbert') => ({ body, createdAt: at(minutes), author: { login } });
 const advisory = ({ head = SHA, findings = [], minutes = 1, outcome = 'changes', login } = {}) => comment([
   renderPanelComment({ findings, verdict: outcome === 'accept' ? 'accept' : 'changes',
@@ -39,13 +39,24 @@ const memoryCache = () => {
   let text = '{}';
   return createShapeCache({ cacheDir: '/scratch', read: () => text, write: (_p, data) => { text = data; } });
 };
+// Detail fixtures use round three at the production cap of five.
+const nearCapRows = () => [1, 2].flatMap(pr => ['d'.repeat(40), 'e'.repeat(40)].map(headSha => ({
+  repo: REPO, pr, type: 'review-run', headSha, at: at(20),
+})));
 function fixture(overrides = {}) {
   const gh = vi.fn(() => JSON.stringify([pr()]));
   const readComments = vi.fn(() => []);
   const shape = vi.fn(() => ({ humanRequired: false }));
-  const options = { findSuspendedRuns: () => [], checkoutState: () => ({ behind: 0 }), gh, now: () => NOW, readLedgerRows: () => [], readFixRows: () => [],
+  const options = { findSuspendedRuns: () => [], checkoutState: () => ({ behind: 0 }), gh, now: () => NOW, readLedgerRows: nearCapRows, readFixRows: () => [],
     readJobs: () => [], readComments, cache: memoryCache(), shape, baseCap: 5, cardReadable: () => false, ...overrides };
-  return { ...options, read: createJudgeSweepFactsReader(options) };
+  const transport = options.gh;
+  const readerOptions = { ...options, gh: args => {
+    const value = transport(args);
+    if (args[1] !== 'view') return value;
+    const parsed = JSON.parse(value);
+    return JSON.stringify(Array.isArray(parsed) ? parsed.find(p => p.number === Number(args[2])) : parsed);
+  } };
+  return { ...options, read: createJudgeSweepFactsReader(readerOptions) };
 }
 afterEach(() => vi.restoreAllMocks());
 
@@ -401,18 +412,19 @@ describe('unownedMinutes policy cascade with injected IO', () => {
 });
 
 describe('injected reader and shared evidence readers', () => {
-  it('lists once, includes every PR, and reads comments for in-flight first-round PRs', () => {
+  it('lists once, includes every PR, and reads detail and comments for cap-near in-flight PRs', () => {
     const f = fixture({ gh: vi.fn(() => JSON.stringify([pr({ statusCheckRollup: [{ name: 'test', status: 'IN_PROGRESS' }] }), pr({ number: 2 })])),
       readJobs: () => [{ repo: REPO, pr: 2, kind: 'fix-run' }] });
     const bundle = buildJudgeSweepBundle(f.read());
     expect(bundle.prs.map(p => p.reason)).toEqual(['in CI', 'fixer running']);
     expect(bundle.prs.map(p => p.number)).toEqual([1, 2]);
-    expect(f.gh).toHaveBeenCalledTimes(1);
+    expect(f.gh).toHaveBeenCalledTimes(3);
     expect(f.readComments).toHaveBeenCalledTimes(2);
     expect(f.shape).not.toHaveBeenCalled();
     const args = f.gh.mock.calls[0][0];
     expect(args.slice(0, 2)).toEqual(['pr', 'list']);
-    for (const field of ['labels', 'headRefOid', 'baseRefOid', 'updatedAt', 'files', 'author']) expect(args.at(-1)).toContain(field);
+    for (const field of ['labels', 'headRefOid', 'updatedAt', 'assignees']) expect(args.at(-1).split(',')).toContain(field);
+    for (const field of ['files', 'body', 'statusCheckRollup', 'baseRefOid', 'author', 'changedFiles']) expect(args.at(-1).split(',')).not.toContain(field);
   });
   it('retries a thrown comment read once and clears evidence errors after success', () => {
     const readComments = vi.fn().mockImplementationOnce(() => { throw new Error('transient'); })
@@ -424,13 +436,14 @@ describe('injected reader and shared evidence readers', () => {
     expect(row.evidenceErrors).toEqual([]);
     expect(needsJudgment(row)).toEqual({ needsJudgment: false, reason: 'waiting on review' });
   });
-  it.each([true, false])('reads draft state and the latest listed commit time (draft=%s)', isDraft => {
+  it.each([true, false])('reads draft state and the latest detail commit time (draft=%s)', isDraft => {
     const gh = vi.fn(() => JSON.stringify([pr({ isDraft, updatedAt: at(1),
       commits: [{ oid: OLD, committedDate: at(500) }, { oid: SHA, committedDate: at(241) }] })]));
     const f = fixture({ gh });
     expect(f.read().prs[0]).toMatchObject({ isDraft, minutesSinceHeadChange: 241, minutesSinceUpdate: 1 });
     expect(gh.mock.calls[0][0].at(-1)).toContain('isDraft');
-    // Listing 200 PRs with commits exceeds GitHub's GraphQL node limit, so it is read only when supplied.
+    // Commit age comes from the per-PR detail, never the 200-PR list.
+    expect(gh.mock.calls[1][0].at(-1)).toContain('commits');
     expect(gh.mock.calls[0][0].at(-1)).not.toContain('commits');
   });
   it('reports unknown head age and no dispatch as null when listing commits and fix rows are absent', () => {
@@ -476,7 +489,7 @@ describe('injected reader and shared evidence readers', () => {
     expect(row.minutesSinceFixDispatch).toBe(46);
   });
   it('uses ledger rounds instead of a label guess and retains the latest fix-loop outcome', () => {
-    const f = fixture({ readLedgerRows: () => ['b', 'c', 'd', 'e'].map(h => ({ repo: REPO, pr: 1, type: 'review-run', headSha: h.repeat(40), at: at(20) })),
+    const f = fixture({ baseCap: 5, readLedgerRows: () => ['b', 'c', 'd', 'e'].map(h => ({ repo: REPO, pr: 1, type: 'review-run', headSha: h.repeat(40), at: at(20) })),
       readFixRows: () => [{ repo: 'we', pr: 1, kind: 'fix', at: at(80) }, { repo: 'we', pr: 1, kind: 'outcome', outcome: 'no-change', at: at(70) },
         { repo: 'frontierui', pr: 1, kind: 'outcome', outcome: 'pushed', at: at(61) }] });
     expect(buildJudgeSweepBundle(f.read()).prs[0]).toMatchObject({ round: 5, cap: 5, reason: 'at-cap',
@@ -531,20 +544,20 @@ describe('injected reader and shared evidence readers', () => {
     ['fixer', {}, [{ repo: REPO, pr: 1, kind: 'fix-run' }]],
     ['pending review', { labels: [{ name: 'review:pending' }] }, []],
   ];
-  it.each(inFlight)('reads comments for a plain round-one PR during %s', (_activity, active, jobs) => {
+  it.each(inFlight)('reads comments for a plain cap-near PR during %s', (_activity, active, jobs) => {
     const f = fixture({ gh: () => JSON.stringify([pr(active)]), readJobs: () => jobs });
     expect(buildJudgeSweepBundle(f.read()).prs[0].needsJudgment).toBe(false);
     expect(f.readComments).toHaveBeenCalledTimes(1);
   });
-  it.each(['body', 'title'])('reads comments when an in-flight PR has no readable %s', field => {
-    const f = fixture({ gh: () => JSON.stringify([pr({ [field]: null,
+  it('reads comments when a cap-near in-flight PR has no readable title', () => {
+    const f = fixture({ gh: () => JSON.stringify([pr({ title: null,
       statusCheckRollup: [{ name: 'test', status: 'IN_PROGRESS' }] })]) });
     expect(f.read().prs[0].openReferrals).toEqual([]);
     expect(f.readComments).toHaveBeenCalledTimes(1);
   });
   it.each(referralSignals.flatMap(([signal, evidence]) => inFlight.map(([activity, active, jobs]) =>
     ({ signal, activity, evidence, active, jobs }))))(
-    'reads an unruled referral signaled by $signal during $activity on round one',
+    'reads an unruled referral signaled by $signal during $activity at cap-near',
     ({ evidence, active, jobs }) => {
       const seat = 'judgeCorrectnessAdvisory', runId = 'review-pr-fixture';
       const record = { version: 1, repo: REPO, pr: 1, head: SHA, runId,
@@ -555,12 +568,12 @@ describe('injected reader and shared evidence readers', () => {
       const readComments = vi.fn(() => [comment(renderReferralRecord(record))]);
       const f = fixture({ gh, readJobs: () => jobs, readComments });
       const row = f.read().prs[0];
-      expect(row.round).toBe(1);
+      expect(row.round).toBe(3);
       expect(row.evidenceErrors).toEqual([]);
       expect(row.openReferrals).toEqual([{ key: referralFindingKey(seat, finding), ruled: false, superseded: false }]);
       expect(needsJudgment(row)).toEqual({ needsJudgment: true, reason: 'unruled-referral' });
       expect(readComments).toHaveBeenCalledTimes(1);
-      expect(gh).toHaveBeenCalledTimes(1);
+      expect(gh).toHaveBeenCalledTimes(2);
     });
   it('fails closed after exactly two failed in-flight referral comment reads', () => {
     const readComments = vi.fn(() => { throw new Error('offline'); });
@@ -601,7 +614,7 @@ describe('injected reader and shared evidence readers', () => {
         { needsJudgment: true, reason: 'evidence-unavailable: inspect PR evidence and rerun',
           evidenceErrors: ['red-team label lacks live result evidence'] });
       expect(f.readComments).toHaveBeenCalledTimes(1);
-      expect(gh).toHaveBeenCalledTimes(1);
+      expect(gh).toHaveBeenCalledTimes(2);
     });
   it('refuses incomplete/oversized listings with an explicit operator fallback', () => {
     for (const listing of [Array.from({ length: 200 }, (_, i) => pr({ number: i + 1 })), [pr({ labels: null })], [pr({ headRefOid: '' })]]) {
@@ -615,20 +628,19 @@ describe('injected reader and shared evidence readers', () => {
     const f = fixture({ gh, readComments: undefined });
     const row = buildJudgeSweepBundle(f.read());
     expect(gh).toHaveBeenCalledTimes(128);
-    expect(gh.mock.calls.filter(([args]) => args[0] === 'pr')).toHaveLength(1);
+    expect(gh.mock.calls.filter(([args]) => args[0] === 'pr')).toHaveLength(2);
     expect(row.prs.every(p => p.needsJudgment && p.evidenceErrors.length)).toBe(true);
-    for (const pr of row.prs) expect(pr).toMatchObject({ needsJudgment: true,
-      reason: 'evidence-unavailable: inspect PR evidence and rerun',
-      evidenceErrors: ['comment evidence unreadable or budget exhausted'] });
-    expect(gh.mock.calls.at(-1)[0]).toContain('page=127');
+    expect(row.prs[0].evidenceErrors).toEqual(['comment evidence unreadable or budget exhausted']);
+    expect(row.prs[1].evidenceErrors.join(' ')).toMatch(/detail/);
+    expect(gh.mock.calls.at(-1)[0]).toContain('page=126');
     expect(gh.mock.calls.slice(1).every(([args]) => !args.includes('--paginate'))).toBe(true);
   });
   it('fetches complete short comment threads through the shared paged TSV reader', () => {
     const gh = vi.fn(args => args[0] === 'pr' ? JSON.stringify([pr()]) : `hello\\nworld\t${at(1)}\tchalbert\tid\thttps://example.test\n`);
     const f = fixture({ gh, readComments: undefined });
     expect(f.read().prs[0].evidenceErrors).toEqual([]);
-    expect(gh).toHaveBeenCalledTimes(2);
-    expect(gh.mock.calls[1][0]).toContain(`repos/${REPO}/issues/1/comments`);
+    expect(gh).toHaveBeenCalledTimes(3);
+    expect(gh.mock.calls[2][0]).toContain(`repos/${REPO}/issues/1/comments`);
   });
 });
 
@@ -668,7 +680,7 @@ describe('shape cache and operator credential boundary', () => {
     const f = fixture({ cache, gh });
     expect(f.read().prs[0].humanRequired).toBe(true);
     expect(f.shape).not.toHaveBeenCalled();
-    expect(gh).toHaveBeenCalledTimes(1); // Only the PR list; no net-file read.
+    expect(gh).toHaveBeenCalledTimes(2); // List and detail; cached shape avoids the child.
   });
   it('discards historical head-only false entries and recomputes from the net files', () => {
     const oldKey = `${REPO}:${SHA}`;

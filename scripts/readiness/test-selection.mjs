@@ -59,7 +59,7 @@ import { dirname, resolve, join } from 'node:path';
 import { isBlastRadiusPath, isStatutePath, isGateSelfPath } from '../lib/review-escalation.mjs';
 import { writeAllSync } from '../lib/write-all-sync.mjs';
 import { admittedArgv } from './heavy-admission.mjs';
-import { shadowSelection } from '../lib/static-selection-edges.mjs';
+import { shadowSelection, readShadowFile } from '../lib/static-selection-edges.mjs';
 
 // ── the flag (NOT defaulted — DoD) ───────────────────────────────────────────────────────────────────────────
 
@@ -351,7 +351,7 @@ export function selectTests({ base = 'origin/main', runGit, env = process.env, s
   const decision = { changedFiles, ...decideSelection({ changedFiles, flagEnabled }) };
   if (typeof shadow === 'function') {
     try { decision.shadow = shadow({ changedFiles }); }
-    catch { decision.shadow = { tests: [], partial: true }; }
+    catch { decision.shadow = { mode: 'full', tests: [], partial: true, reasons: ['shadow threw'] }; }
   }
   return decision;
 }
@@ -727,7 +727,8 @@ function runCli(argv) {
     ? ({ changedFiles }) => shadowSelection({
       changedFiles,
       files: realGit(['ls-files', '-z']).split('\0').filter(Boolean),
-      readFile: (file) => readFileSync(resolve(ROOT, file), 'utf8'),
+      readFile: (file) => readShadowFile(ROOT, file),
+      isFullSuiteTrigger: (file) => isLocalFullSuiteTrigger(file) || isSensitivePath(file),
     }) : undefined;
   const decision = selectTests({ base, runGit: realGit, env: process.env, shadow });
 
@@ -764,12 +765,22 @@ function runCli(argv) {
       ? assessFalseGreen({ failedTestFiles, selectedTestFiles, mode: decision.mode })
       : { falseGreen: null, failedCount: null, escaped: null, selectedCount: selectedTestFiles.length, mode: decision.mode };
     if (decision.shadow && !hadReport) decision.shadow.partial = true;
+    if (decision.shadow) Object.assign(decision.shadow, {
+      unknownCount: decision.shadow.unknownFiles?.length ?? null,
+      testCount: decision.shadow.tests.length,
+      staticTestCount: decision.shadow.staticTests?.length ?? null,
+      totalTests: decision.shadow.totalTests ?? null,
+    });
     const shadowFields = decision.shadow ? {
       shadow: decision.shadow,
-      shadowEscaped: hadReport ? [...new Set(failedTestFiles)].filter((file) => !decision.shadow.tests.includes(file)).sort() : null,
+      shadowEscaped: hadReport ? [...new Set(failedTestFiles)].filter((file) => decision.shadow.mode !== 'full' && !decision.shadow.tests.includes(file)).sort() : null,
+      shadowEscapedStatic: hadReport && Array.isArray(decision.shadow.staticTests)
+        ? [...new Set(failedTestFiles)].filter((file) => !decision.shadow.staticTests.includes(file)).sort() : null,
     } : {};
     const sample = {
       at: new Date().toISOString(),
+      head: realGit(['rev-parse', 'HEAD']).trim(),
+      base,
       mode: decision.mode,
       humanRequired: decision.humanRequired,
       changedCount: Array.isArray(decision.changedFiles) ? decision.changedFiles.length : null,
