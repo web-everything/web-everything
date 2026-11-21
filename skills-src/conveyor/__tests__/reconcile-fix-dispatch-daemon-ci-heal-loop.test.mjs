@@ -6,8 +6,9 @@
 import { describe, it, expect, vi } from 'vitest';
 import { runTickAllRepos, buildCliDaemonEffects, buildDaemonExits } from '../reconcile-fix-dispatch-daemon.mjs';
 import { superviseAwaitVerifyLoop } from '../../../scripts/conveyor/await-verify-loop.mjs';
-import { resolveCiHealLoopEnabled, spawnCiHealLoop } from '../../../scripts/conveyor/ci-heal-loop.mjs';
+import { resolveCiHealLoopEnabled, resolveCiHealLoop, spawnCiHealLoop } from '../../../scripts/conveyor/ci-heal-loop.mjs';
 
+const noOverride = () => ({ ok: false, reason: 'not-set' });
 const quiet = () => ({ dispatched: [], refusals: [], actions: [], notes: [], rows: [] });
 const passOptions = (extra = {}) => ({
   repos: ['repo-a'], allowStandDownAutoProceed: false, readPrs: () => [],
@@ -52,16 +53,30 @@ describe('ci-heal child loop wiring (async slice s2)', () => {
   });
 
   it('off (and anything unknown) spawns no child; on spawns the loop with the parent pid', () => {
-    expect(resolveCiHealLoopEnabled({ env: {}, settings: {} })).toBe(false);
-    expect(resolveCiHealLoopEnabled({ env: {}, settings: { ciHeal: { loop: 'maybe' } } })).toBe(false);
-    expect(resolveCiHealLoopEnabled({ env: {}, settings: { ciHeal: { loop: 'on' } } })).toBe(true);
-    expect(resolveCiHealLoopEnabled({ env: { WE_CI_HEAL_LOOP: 'off' }, settings: { ciHeal: { loop: 'on' } } })).toBe(false);
-    expect(resolveCiHealLoopEnabled({ env: { WE_CI_HEAL_LOOP: 'bogus' }, settings: { ciHeal: { loop: 'on' } } })).toBe(false);
+    expect(resolveCiHealLoopEnabled({ readOverride: noOverride, env: {}, settings: {} })).toBe(false);
+    expect(resolveCiHealLoopEnabled({ readOverride: noOverride, env: {}, settings: { ciHeal: { loop: 'maybe' } } })).toBe(false);
+    expect(resolveCiHealLoopEnabled({ readOverride: noOverride, env: {}, settings: { ciHeal: { loop: 'on' } } })).toBe(true);
+    expect(resolveCiHealLoopEnabled({ readOverride: noOverride, env: { WE_CI_HEAL_LOOP: 'off' }, settings: { ciHeal: { loop: 'on' } } })).toBe(false);
+    expect(resolveCiHealLoopEnabled({ readOverride: noOverride, env: { WE_CI_HEAL_LOOP: 'bogus' }, settings: { ciHeal: { loop: 'on' } } })).toBe(false);
     const spawnFn = vi.fn(() => ({ pid: 9 }));
-    expect(spawnCiHealLoop({ env: {}, settings: {}, spawnFn, parentPid: 7 })).toBeNull();
+    expect(spawnCiHealLoop({ readOverride: noOverride, log: () => {}, env: {}, settings: {}, spawnFn, parentPid: 7 })).toBeNull();
     expect(spawnFn).not.toHaveBeenCalled();
-    spawnCiHealLoop({ env: {}, settings: { ciHeal: { loop: 'on' } }, spawnFn, parentPid: 7 });
+    spawnCiHealLoop({ readOverride: noOverride, log: () => {}, env: {}, settings: { ciHeal: { loop: 'on' } }, spawnFn, parentPid: 7 });
     expect(spawnFn.mock.calls[0][1]).toContain('--parent-pid=7');
+  });
+
+  it('the operator override wins over env and the settings file, with provenance', () => {
+    const on = () => ({ ok: true, value: 'on' });
+    const off = () => ({ ok: true, value: 'off' });
+    const none = () => ({ ok: false, reason: 'not-set' });
+    expect(resolveCiHealLoop({ env: {}, settings: { ciHeal: { loop: 'off' } }, readOverride: on })).toEqual({ enabled: true, source: 'override' });
+    expect(resolveCiHealLoop({ env: { WE_CI_HEAL_LOOP: 'on' }, settings: { ciHeal: { loop: 'on' } }, readOverride: off })).toEqual({ enabled: false, source: 'override' });
+    expect(resolveCiHealLoop({ env: { WE_CI_HEAL_LOOP: 'on' }, settings: {}, readOverride: none })).toEqual({ enabled: true, source: 'env' });
+    expect(resolveCiHealLoop({ env: {}, settings: { ciHeal: { loop: 'on' } }, readOverride: none })).toEqual({ enabled: true, source: 'file' });
+    expect(resolveCiHealLoop({ env: {}, settings: {}, readOverride: none })).toEqual({ enabled: false, source: 'standard' });
+    // an unreadable or invalid override store never turns the loop on by itself
+    expect(resolveCiHealLoop({ env: {}, settings: {}, readOverride: () => { throw new Error('x'); } })).toEqual({ enabled: false, source: 'standard' });
+    expect(resolveCiHealLoopEnabled({ env: {}, settings: {}, readOverride: on })).toBe(true);
   });
 
   it('every daemon exit path stops the ci-heal child', () => {

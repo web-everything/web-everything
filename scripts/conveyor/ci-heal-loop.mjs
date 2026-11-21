@@ -10,6 +10,7 @@ import { ensureFreshGithubAppEnv, FLEET_APP_AUTH_OPTS, isGithubAppAuthGuardError
 import { isPidAlive } from '../lib/dispatch-throttle.mjs';
 import { acquireRead, releaseRead, defaultOwner, cloneLockDirs, HEARTBEAT_INTERVAL_MS } from '../lib/daemon-clone-lock.mjs';
 import { cloneDispatchBlock } from '../lib/daemon-self-sync.mjs';
+import { readEnumOverride } from '../lib/capacity-leaf.mjs';
 import { readCloneIdentity } from '../lib/daemon-background-build.mjs';
 import { planClaudeAuthDispatchGate } from './claude-auth-health.mjs';
 import { resolveCoordinationRoot } from '../operations/coordination-root.mjs';
@@ -47,16 +48,27 @@ export function resolveCiHealInterval({ env = process.env, settings = readSettin
   return { seconds: resolved.value.intervalSec, source: resolved.sources.intervalSec };
 }
 
-/** `ciHeal.loop` on|off: standard off; env WE_CI_HEAL_LOOP over the settings file; anything unknown is off. */
-export function resolveCiHealLoopEnabled({ env = process.env, settings = readSettings() } = {}) {
+/**
+ * `ciHeal.loop` on|off with provenance. Layers, strongest first: operator override (the audited host store), env
+ * WE_CI_HEAL_LOOP, the settings file, then the standard (off). An invalid env value or an unreadable override fails
+ * closed to off at its own layer and never falls through to a stronger "on".
+ */
+export function resolveCiHealLoop({ env = process.env, settings = readSettings(), readOverride = key => readEnumOverride(key) } = {}) {
   const pick = value => (value === 'on' || value === 'off' ? value : undefined);
-  if (env.WE_CI_HEAL_LOOP !== undefined) return pick(env.WE_CI_HEAL_LOOP) === 'on'; // an invalid override fails closed
-  return (pick(settings?.ciHeal?.loop) ?? 'off') === 'on';
+  let override;
+  try { override = readOverride('ciHeal.loop'); } catch { override = undefined; }
+  if (override?.ok && pick(override.value)) return { enabled: override.value === 'on', source: 'override' };
+  if (env.WE_CI_HEAL_LOOP !== undefined) return { enabled: pick(env.WE_CI_HEAL_LOOP) === 'on', source: 'env' };
+  const file = pick(settings?.ciHeal?.loop);
+  return file ? { enabled: file === 'on', source: 'file' } : { enabled: false, source: 'standard' };
 }
+export const resolveCiHealLoopEnabled = options => resolveCiHealLoop(options).enabled;
 
 /** The single spawn point: null (nothing spawned) unless `ciHeal.loop` is on. */
-export function spawnCiHealLoop({ env = process.env, settings, spawnFn = nodeSpawn, parentPid = process.pid } = {}) {
-  if (!resolveCiHealLoopEnabled({ env, ...(settings ? { settings } : {}) })) return null;
+export function spawnCiHealLoop({ env = process.env, settings, readOverride, spawnFn = nodeSpawn, parentPid = process.pid, log = line => console.error(line) } = {}) {
+  const resolved = resolveCiHealLoop({ env, ...(settings ? { settings } : {}), ...(readOverride ? { readOverride } : {}) });
+  if (!resolved.enabled) return null;
+  log(`ci-heal-loop: ciHeal.loop=on source=${resolved.source}`);
   return spawnFn(process.execPath, [fileURLToPath(import.meta.url), `--parent-pid=${parentPid}`], { stdio: ['ignore', 'inherit', 'inherit'], env });
 }
 
