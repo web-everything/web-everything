@@ -396,6 +396,7 @@
   "scripts/ci/__tests__/ci-worker-count-measure.test.mjs": 2.09,
   "scripts/ci/__tests__/coverage-reach.test.mjs": 0.19,
   "scripts/ci/__tests__/fetch-main-history.test.mjs": 0.1,
+  "scripts/ci/__tests__/measure-base.test.mjs": 0.01,
   "scripts/ci/__tests__/quarantine-job-wiring.test.mjs": 0.07,
   "scripts/ci/__tests__/quarantine-skip.test.mjs": 0.88,
   "scripts/ci/__tests__/refresh-timings.test.mjs": 3.71,

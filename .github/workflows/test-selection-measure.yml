@@ -12,10 +12,13 @@ on:
 
 concurrency:
   group: test-selection-measure-${{ github.ref }}
+  # GitHub keeps one pending run, replacing older pending runs. No merge is dropped from coverage:
+  # the next run measures the cumulative diff from the last successfully measured sha.
   cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
 permissions:
   contents: read
+  actions: read
 
 jobs:
   test-selection-measure:
@@ -93,10 +96,17 @@ jobs:
         working-directory: web-everything
         run: node -e "const j=JSON.parse(require('fs').readFileSync('vitest-full.json','utf8')); if(!Array.isArray(j.testResults)||j.testResults.length===0||j.testResults.some(r=>typeof r.name!=='string'||!r.name||!['passed','failed'].includes(r.status))) process.exit(1)"
 
+      - name: Choose measurement base
+        id: base
+        working-directory: web-everything
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: echo "base=$(node scripts/ci/measure-base.mjs measure-covered.txt)" >> "$GITHUB_OUTPUT"
+
       - name: Record false-green signal (#2681)
         if: ${{ steps.report.outcome == 'success' }}
         working-directory: web-everything
-        run: node scripts/readiness/test-selection.mjs --measure --base=HEAD^ --vitest-json=vitest-full.json
+        run: node scripts/readiness/test-selection.mjs --measure --base=${{ steps.base.outputs.base }} --vitest-json=vitest-full.json
         env:
           # Evaluate the decision AS IF the shrink were on, so the measure reflects what shrink WOULD do —
           # without any real gate depending on it (this job gates nothing).
@@ -108,7 +118,9 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: false-green-signal
-          path: web-everything/false-green-log.json
+          path: |
+            web-everything/false-green-log.json
+            web-everything/measure-covered.txt
           if-no-files-found: warn
 
       # Free byproduct of the shadow run above: per-test durations are already in vitest-full.json, this

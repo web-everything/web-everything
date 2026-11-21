@@ -28,9 +28,20 @@ describe('test-selection measure produces data (advisory)', () => {
     expect(workflow.on.push.branches).toEqual(['main']);
   });
 
-  it('measures the merged commit (base HEAD^), not an empty diff against main itself', () => {
+  it('measures from the selected base and uploads the covered merges', () => {
+    const base = job.steps.find(s => s.id === 'base');
     const rec = job.steps.find(s => String(s.run ?? '').includes('test-selection.mjs --measure'));
-    expect(rec.run).toContain('--base=HEAD^');
+    expect(base.run).toContain('node scripts/ci/measure-base.mjs measure-covered.txt');
+    expect(base.run).toContain('base=$(');
+    expect(base.run).toContain('$GITHUB_OUTPUT');
+    expect(base.env.GH_TOKEN).toBe('${{ github.token }}');
+    expect(job.steps.indexOf(base)).toBeLessThan(job.steps.indexOf(rec));
+    expect(rec.run).toContain('--base=${{ steps.base.outputs.base }}');
+    expect(workflow.permissions.actions).toBe('read');
+    expect(workflow.concurrency['cancel-in-progress']).toBe("${{ github.ref != 'refs/heads/main' }}");
+    const artifact = job.steps.find(s => s.with?.name === 'false-green-signal');
+    expect(artifact.with.path).toContain('web-everything/false-green-log.json');
+    expect(artifact.with.path).toContain('web-everything/measure-covered.txt');
   });
 
   it('is still gated on the repo variable (or manual dispatch)', () => {
