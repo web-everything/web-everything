@@ -151,7 +151,10 @@ export function readLiveDrainClaim({ repo, pr, lockRoot = fixDispatchClaimRoot()
     const entry = readFixDispatchClaim({ repo: repoKey, pr: Number(pr), kind, lockRoot });
     let uncertain = false;
     if (entry) {
+      const lease = entry.meta?.leaseMinutes;
       if (!Number.isFinite(Date.parse(entry.heartbeatAt))) uncertain = 'invalid-heartbeat';
+      else if (kind !== FIXING_KIND && Object.hasOwn(entry.meta ?? {}, 'leaseMinutes')
+        && (!['number', 'string'].includes(typeof lease) || !Number.isFinite(Number(lease)) || Number(lease) <= 0)) uncertain = 'invalid-lease';
       else if (kind === FIXING_KIND ? !isLiveFixClaim(entry, nowMs)
         : isLeaseExpired(entry, nowMs, Math.max(DEFAULT_FIX_DISPATCH_CLAIM_TTL_MINUTES,
           Number(entry.meta?.leaseMinutes) > 0 ? Number(entry.meta.leaseMinutes) : 0))) {
@@ -173,7 +176,8 @@ export function readLiveDrainClaim({ repo, pr, lockRoot = fixDispatchClaimRoot()
       }
     }
     const owner = entry?.owner ?? null;
-    const holder = entry?.meta?.who ?? owner ?? `(${kind} claim)`;
+    let holder = [entry?.meta?.who, owner].find(value => typeof value === 'string' && value.trim());
+    if (!holder) { holder = `(${kind} claim)`; uncertain ||= 'missing-holder'; }
     held.push({ kind, owner, holder, claimedAt: entry?.meta?.claimedAt ?? null,
       heartbeatAt: entry?.heartbeatAt ?? null, uncertain,
       entry: { ...entry, meta: { ...entry?.meta, who: holder } } });

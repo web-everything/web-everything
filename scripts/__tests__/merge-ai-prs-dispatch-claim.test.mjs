@@ -168,6 +168,24 @@ describe('dispatch claim admission at the fresh re-read', () => {
 });
 
 describe('T7: honourDispatchClaims setting and provenance', () => {
+  it('main honours its supplied env when the ambient setting differs', async () => {
+    let ambientChanged = false;
+    const world = createPrestageWorld((argv, options) => runInProcess(argv, { ...options,
+      env: { ...options.env, WE_DRAIN_HONOUR_DISPATCH_CLAIMS: 'off' },
+      ports: { ...prestagePorts, git: (...args) => {
+        // main already received the original env object; replace only the ambient one.
+        process.env = { ...process.env, WE_DRAIN_HONOUR_DISPATCH_CLAIMS: 'on' };
+        ambientChanged = true;
+        return prestagePorts.git(...args);
+      } },
+    }));
+    await world(async ({ run }) => {
+      const result = await run();
+      expect(ambientChanged).toBe(true);
+      expect(result.stderr).toContain('drain.honourDispatchClaims=off (env)');
+      expect(result.stderr).not.toContain('drain.honourDispatchClaims=on');
+    }, { slug: 'web-everything/web-everything' });
+  }, 120_000);
   it('defaults to off from the standard', () => {
     expect(drain.resolveHonourDispatchClaims({})).toEqual({ value: 'off', source: 'standard' });
   });

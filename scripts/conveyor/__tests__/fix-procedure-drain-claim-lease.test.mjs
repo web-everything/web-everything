@@ -61,6 +61,27 @@ describe('drain heartbeat and lease evidence (read-only)', () => {
     expect(read()).toMatchObject({ kind: 'ci-heal', uncertain: false, heartbeatAt: new Date(NOW - MIN).toISOString() });
   });
   for (const kind of ['ci-heal', 'fix']) {
+    it.each(['', false, 0, '   '])(`${kind}: invalid meta.who %j falls back to the owner`, who => {
+      const { resource } = claim({ kind });
+      rewriteMeta(resource, meta => { meta.who = who; });
+      expect(read()).toMatchObject({ kind, holder: OWNER, uncertain: false, entry: { meta: { who: OWNER } } });
+    });
+    it(`${kind}: no non-empty holder string retains an uncertain hold`, () => {
+      const { dir } = claim({ kind });
+      const file = join(dir, 'lock.json');
+      const entry = JSON.parse(readFileSync(file, 'utf8'));
+      entry.owner = '   ';
+      entry.meta.who = false;
+      writeFileSync(file, JSON.stringify(entry));
+      expect(read()).toMatchObject({ kind, holder: `(${kind} claim)`, uncertain: 'missing-holder',
+        entry: { meta: { who: `(${kind} claim)` } } });
+    });
+    it.each(['bad', '', 0, -1, null, false, true, {}, [], 'Infinity'])
+      (`${kind}: present invalid lease %j holds past the default TTL`, leaseMinutes => {
+        const { resource } = claim({ kind, age: 30 * MIN });
+        rewriteMeta(resource, meta => { meta.leaseMinutes = leaseMinutes; });
+        expect(read()).toMatchObject({ kind, uncertain: 'invalid-lease' });
+      });
     it(`T16/T19: ${kind} stored 45-minute lease is held at 30 minutes`, () => {
       const { resource } = claim({ kind, age: 30 * MIN, leaseMinutes: 45 });
       // Isolate reader semantics from T18's separate producer-persistence guarantee.

@@ -5291,7 +5291,7 @@ export async function main(argv, { env = process.env, stdout = process.stdout, e
     });
   };
   const resolveListedChecks = (repo, prs) => mapWithConcurrency(prs, resolvedMergePolicy.policy.concurrency.gateReads, (pr) => resolveChecks(repo, pr));
-  const honourDispatchClaims = resolveHonourDispatchClaims(process.env, {
+  const honourDispatchClaims = resolveHonourDispatchClaims(env, {
     platform: platformPreference('drain'), tool: readDeclaredDrainSettings()?.drain,
   });
   process.stderr.write(`merge-ai-prs: drain.honourDispatchClaims=${honourDispatchClaims.value} (${honourDispatchClaims.source}) claimRoot=${fixDispatchClaimRoot()}\n`);
