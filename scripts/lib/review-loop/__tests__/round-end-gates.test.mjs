@@ -46,3 +46,37 @@ it('oversized effect batches ask an operator without starting a child', () => {
   expect(() => applyIntakeEffectsSync({ notes: Array.from({ length: 33 }, () => ({ kind: 'intake-effect' })) }, exec)).toThrow('operator');
   expect(exec).not.toHaveBeenCalled();
 });
+
+it('oversized shadow observations log and never block reconciliation', () => {
+  const exec = vi.fn(), log = vi.spyOn(console, 'warn').mockImplementation(() => {});
+  try {
+    expect(() => applyIntakeEffectsSync({ notes: Array.from({ length: 33 }, () => ({ kind: 'intake-effect', intake: { shadow: true } })) }, exec)).not.toThrow();
+    expect(exec).not.toHaveBeenCalled();
+    expect(log).toHaveBeenCalledWith(expect.stringContaining('shadow observation unavailable'));
+  } finally { log.mockRestore(); }
+});
+
+it.each(['stale size request; remeasure next tick', 'intake event unavailable; operator must retry'])('shadow child failure (%s) is contained while enforced effects fail closed', message => {
+  const exec = vi.fn(() => { throw Error(message); });
+  const log = vi.spyOn(console, 'warn').mockImplementation(() => {});
+  const note = { kind: 'intake-effect', intake: { shadow: true } };
+  try {
+    expect(() => applyIntakeEffectsSync({ notes: [note] }, exec)).not.toThrow();
+    expect(log).toHaveBeenCalled();
+    expect(() => applyIntakeEffectsSync({ notes: [{ ...note, intake: { shadow: false } }] }, exec)).toThrow(message);
+  } finally { log.mockRestore(); }
+});
+
+it('mixed plans apply enforced effects independently of failing shadow observations', () => {
+  const exec = vi.fn((_file, _args, options) => {
+    if (JSON.parse(options.input).notes.some(n => n.intake.shadow)) throw Error('storage failure');
+  });
+  const log = vi.spyOn(console, 'warn').mockImplementation(() => {});
+  try {
+    expect(() => applyIntakeEffectsSync({ notes: [true, false].map(shadow => ({ kind: 'intake-effect', intake: { shadow } })) }, exec)).not.toThrow();
+    expect(exec).toHaveBeenCalledTimes(2);
+    expect(JSON.parse(exec.mock.calls[0][2].input).notes).toEqual([{ kind: 'intake-effect', intake: { shadow: false } }]);
+    exec.mockImplementation(() => { throw Error('enforced failure'); });
+    expect(() => applyIntakeEffectsSync({ notes: [true, false].map(shadow => ({ kind: 'intake-effect', intake: { shadow } })) }, exec)).toThrow('enforced failure');
+  } finally { log.mockRestore(); }
+});

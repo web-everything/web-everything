@@ -45,7 +45,7 @@ export function check(subject, params = {}) {
       if (m[1] === 'urgent') urgent = m[3] === head && m[4].trim() ? m[4] : null;
       else override = m[5];
     }
-    if (override) return { ...result, reason: 'override', ...(p.trackOverrides ? { overrideUsed: override } : {}) };
+    if (override) return { ...result, reason: 'override', overrideUsed: override };
     if (urgent && p.urgentExempt) return { ...result, reason: 'exempt', exemptReason: 'urgent' };
     if (!counted.length) return { ...result, reason: 'exempt', exemptReason: 'paths-or-atomic' };
     if (lines <= p.maxLines) return result;
@@ -63,7 +63,7 @@ export function readIntake(pr, { git = createGitReader(process.cwd()), diffStat,
       const base = pr.baseRefSha ?? `refs/remotes/origin/${pr.baseRefName ?? 'main'}`;
       const baseSha = git(['merge-base', head, base]).trim();
       if (!sha.test(baseSha)) throw Error('unpinned merge-base');
-      evidence = { sha: head, baseSha, text: git(['-c', 'core.attributesFile=', 'diff', '--no-ext-diff', '--no-textconv', '--numstat', '-z', '--find-renames', baseSha, head, '--']) };
+      evidence = { sha: head, baseSha, text: git(['-c', 'core.attributesFile=', '-c', 'diff.relative=false', 'diff', '--no-relative', '--no-ext-diff', '--no-textconv', '--numstat', '-z', '--find-renames', baseSha, head, '--']) };
     }
     if (evidence.sha !== head) throw Error('stale size request');
     return check({ ...pr, pr: pr.number ?? pr.pr, head, baseSha: evidence.baseSha, entries: parseNumstat(evidence.text), markers: pr.comments ?? pr.markers }, params);
@@ -79,11 +79,14 @@ export async function main(argv, { gh, git, log = console.log } = {}) {
   const fields = 'number,headRefOid,baseRefName';
   const prs = number ? [gh(['pr', 'view', number, '--json', fields])] : gh(['pr', 'list', '--state', 'open', '--limit', '1000', '--json', fields]);
   if (!Array.isArray(prs) || prs.length >= 1000) throw Error('incomplete intake listing; operator must inspect open PRs');
+  const { ghRepoSlug } = await import('../constellation-repos.mjs');
+  const repo = ghRepoSlug(gh(['repo', 'view', '--json', 'nameWithOwner']).nameWithOwner);
   const params = readIntakeSettings();
   for (const pr of prs) {
-    try { pr.comments = readCompletePrComments(pr.number, { gh, repo: 'web-everything/web-everything' }); pr.round = sharedRoundAttempts(pr); }
+    try { pr.comments = readCompletePrComments(pr.number, { gh, repo }); pr.round = sharedRoundAttempts(pr); }
     catch { pr.round = null; }
     const v = readIntake(pr, { git, params });
+    if (!argv.includes('--shadow') && ['fail', 'unknown'].includes(v.verdict)) process.exitCode = 1;
     if (number || v.verdict !== 'pass') log(`${number ? '' : `#${pr.number} `}${v.verdict} ${v.reason} lines=${v.lines} round=${v.round}`);
   }
 }

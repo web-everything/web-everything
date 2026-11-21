@@ -34,11 +34,24 @@ export async function applyIntakeEffects(plan, { runSize = createSizeAdmissionRu
 export function applyIntakeEffectsSync(plan, exec = execFileSync) {
   const notes = plan.notes.filter(n => n.kind === 'intake-effect');
   if (!notes.length) return;
-  if (notes.length > 32) throw Error('intake effects exceed tick budget; operator must triage open splits');
-  exec(process.execPath, [fileURLToPath(import.meta.url), '--effects'], {
-    input: JSON.stringify({ notes }), encoding: 'utf8', timeout: 120000, maxBuffer: 1024 * 1024,
-    stdio: ['pipe', 'pipe', 'pipe'],
-  });
+  const run = notes => {
+    if (notes.length > 32) throw Error('intake effects exceed tick budget; operator must triage open splits');
+    exec(process.execPath, [fileURLToPath(import.meta.url), '--effects'], {
+      input: JSON.stringify({ notes }), encoding: 'utf8', timeout: 120000, maxBuffer: 1024 * 1024,
+      stdio: ['pipe', 'pipe', 'pipe'],
+    });
+  };
+  const enforced = notes.filter(n => n.intake?.shadow !== true);
+  const shadow = notes.filter(n => n.intake?.shadow === true);
+  if (enforced.length) run(enforced);
+  if (shadow.length) {
+    try {
+      if (notes.length > 32) throw Error('intake observations exceed tick budget');
+      run(shadow);
+    } catch {
+      try { console.warn('intake shadow observation unavailable; reconciliation continues'); } catch { /* Logging is best-effort too. */ }
+    }
+  }
 }
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href && process.argv[2] === '--effects') {
   const { runGhSync } = await import('../gh-throttle.mjs');
