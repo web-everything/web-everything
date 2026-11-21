@@ -1426,8 +1426,8 @@ process.exit(0);
       // so the GH call sequence carries no `pr diff`. #2964 — the MUTATION order is now comment → edit: this PR
       // carries `review:human`/`review:pending` and NOT `review:accepted`, so the durable record (with its
       // marker) goes first, where an orphan is inert. The dedicated ordering suite below owns that property; the
-      // pin is kept here so a silent re-flip cannot pass this end-to-end test. The second view verifies the mandatory head pin before any write.
-      .toEqual(['api user', 'pr view', 'pr view', 'pr comment', 'pr view', 'pr edit', 'pr view']);
+      // pin is kept here so a silent re-flip cannot pass this end-to-end test. The views pin the head initially and immediately before the verdict, approval and comment writes.
+      .toEqual(['api user', 'pr view', 'pr view', 'pr view', 'pr view', 'pr view', 'pr comment', 'pr view', 'pr edit', 'pr view']);
 
     // 3. The durable comment — the honesty tax as it is actually posted, not as the module describes it.
     const comment = readFileSync(join(dir, 'comment.md'), 'utf8');
@@ -4954,13 +4954,43 @@ describe('#5649 — approval rows at the label home', () => {
     const { exitCode } = run(stubProvider(['review:human']), CLEAR, { appendApproval: s.fn });
     expect(exitCode).toBe(0);
     expect(s.seen).toHaveLength(1);
-    expect(s.seen[0]).toMatchObject({ type: 'approval', approval: 'clear-human', delegation: null, pr: 77, repo: 'o/n', source: 'review-set-label' });
+    expect(s.seen[0]).toMatchObject({ type: 'approval', approval: 'clear-human', delegation: null, pr: 77, repo: 'o/n', source: 'review-set-label', headSha: 'a'.repeat(40) });
     const types = rows().map((r) => r.type ?? 'verdict');
     expect(types).toEqual(['verdict', 'approval']);
     expect(rows()[1].actor.declared).toBe('op');
     expect(rows()[1].actor.session).toBe(rows()[0].actor.session);
   });
 
+  it.each(['moved', 'unreadable'])('refuses further writes when head is %s during verdict append', state => {
+    const p = stubProvider(['review:human']);
+    const appendApproval = vi.fn(appendVerdict);
+    const r = run(p, CLEAR, { appendApproval, appendLedgerVerdict: row => {
+      const result = appendVerdict(row);
+      p.readPrState = () => {
+        if (state === 'unreadable') throw new Error('head read failed');
+        return { headRefOid: 'b'.repeat(40) };
+      };
+      return result;
+    } });
+    expect(r.exitCode).not.toBe(0);
+    expect(appendApproval).not.toHaveBeenCalled();
+    expect(p.calls).toEqual([]);
+    expect(rows().map(r => r.type ?? 'verdict')).toEqual(['verdict']);
+  });
+  it.each(['moved', 'unreadable'])('refuses the comment when head is %s during approval append', state => {
+    const p = stubProvider(['review:human']);
+    const r = run(p, CLEAR, { appendApproval: row => {
+      const result = appendVerdict(row);
+      p.readPrState = () => {
+        if (state === 'unreadable') throw new Error('head read failed');
+        return { headRefOid: 'b'.repeat(40) };
+      };
+      return result;
+    } });
+    expect(r.exitCode).not.toBe(0);
+    expect(p.calls).toEqual([]);
+    expect(rows().map(r => r.type ?? 'verdict')).toEqual(['verdict', 'approval']);
+  });
   it('--approval-kind=judge with a valid delegation is stored; a malformed delegation is refused before any write', () => {
     const delegation = { by: 'operator', scope: 'review:human', expires: '2099-01-01T00:00:00.000Z' };
     const s = sink();

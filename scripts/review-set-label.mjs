@@ -2117,6 +2117,13 @@ export function runReviewLabelCli({
     }
   }
 
+  const assertClearHumanHead = () => {
+    if (pinnedClearHuman && provider.readPrState(repo, pr).headRefOid !== expectedHead) {
+      throw new Error('live head differs from --expect-head');
+    }
+  };
+  try { assertClearHumanHead(); } catch (e) { fail(ghErr(e, 'gh pr view failed'), 2); }
+
   const ledgerVerdict = verdictForLabelTarget(to);
   let clearingLedgerMiss = false;
   let clearingLedgerError;
@@ -2153,6 +2160,7 @@ export function runReviewLabelCli({
       // verdict, not an approval. A refused append blocks the swap (F4), so a clearance never lands without its row.
       // The two appends are not atomic: a retry after a lost approval appends a second clearing verdict, which is
       // harmless (clearing is idempotent).
+      assertClearHumanHead();
       let approval;
       try {
         approval = appendApproval(buildLedgerEvent({
@@ -2161,6 +2169,7 @@ export function runReviewLabelCli({
           pr: Number(pr),
           at: appended.record?.at ?? new Date().toISOString(),
           approval: approvalKind,
+          headSha: expectedHead,
           delegation: approvalDelegation,
           declaredActor: actor,
           session: clearerId,
@@ -2236,6 +2245,7 @@ export function runReviewLabelCli({
   // (and `reviewed-diff`) marker the #2409 staleness gate reads.
   let restampedAt;
   const postComment = () => {
+    try { assertClearHumanHead(); } catch (e) { fail(ghErr(e, 'gh pr view failed'), 2); }
     let commentFailure;
     for (let attempt = 0; attempt < (pinnedPlainRearm ? 3 : 1); attempt++) {
       // Keep pin failures outside the provider retry catch: a moved head must
