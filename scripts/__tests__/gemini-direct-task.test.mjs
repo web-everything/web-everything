@@ -1,7 +1,7 @@
 /** Mechanical tests only. Supplied live agy 1.2.2 streams are literal fixtures; real git regressions; no real agy processes. */
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { EventEmitter } from 'node:events';
-import { mkdtempSync, rmSync, readFileSync, writeFileSync, statSync, fstatSync, openSync, constants } from 'node:fs';
+import { mkdtempSync, rmSync, readFileSync, writeFileSync, statSync, fstatSync, openSync, closeSync, constants } from 'node:fs';
 import { execFileSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { join, resolve, relative } from 'node:path';
@@ -563,6 +563,11 @@ describe('runAgyDirectExec / geminiDirectTask — injected process mechanics', (
     const logFile = join(dir, 'exclusive.jsonl');
     // Observe the real open through the runner's IO seam, independent of builtin module mocking.
     const openLogFn = vi.fn((...args) => openSync(...args));
+    const closeLogFn = vi.fn(fd => {
+      closeSync(fd);
+      // Check synchronously: after an await, another open can reuse this fd number.
+      expect(() => fstatSync(fd)).toThrow(/EBADF/);
+    });
     let liveStat;
     const readHold = vi.fn(() => {
       liveStat = fstatSync(openLogFn.mock.results[0].value);
@@ -571,14 +576,15 @@ describe('runAgyDirectExec / geminiDirectTask — injected process mechanics', (
     const { fn } = fakeSpawn('recorded\n', { hang: mode === 'timeout', error: mode === 'spawn error' ? 'ENOENT' : null });
     const spawnFn = mode === 'spawn throw' ? vi.fn(() => { throw new Error('ENOENT'); }) : fn;
     const result = await runAgyDirectExec({ dir, task: 't', logFile, exclusiveLog: true, stream: false,
-      timeoutMs: 20, spawnFn, openLogFn, readHold });
+      timeoutMs: 20, spawnFn, openLogFn, closeLogFn, readHold });
     expect(openLogFn).toHaveBeenCalledOnce();
     expect(openLogFn).toHaveBeenCalledWith(logFile,
       constants.O_NOFOLLOW | constants.O_CREAT | constants.O_EXCL | constants.O_WRONLY, 0o600);
     expect(readHold).toHaveBeenCalledOnce();
     expect(liveStat?.isFile()).toBe(true);
     const fd = openLogFn.mock.results[0].value;
-    expect(() => fstatSync(fd)).toThrow(/EBADF/);
+    expect(closeLogFn).toHaveBeenCalledOnce();
+    expect(closeLogFn).toHaveBeenCalledWith(fd);
     expect(result.code).toBe(mode === 'hold' ? 1 : mode === 'success' ? 0 : null);
     expect(result.timedOut).toBe(mode === 'timeout');
     expect(statSync(logFile).isFile()).toBe(true);

@@ -414,12 +414,12 @@ export function runGate({ dir, mode, execFn = defaultExecFn }) {
  * The parent wall kills with SIGKILL; the child's close event drains remaining output before reporting.
  * Runs one attempt. Resume mode appends to the log and closes stdin without replaying the task.
  * exclusiveLog creates a fresh no-follow transcript and retains its fd until the run settles.
- * No child process is created by unit tests: spawnFn is injectable. openLogFn lets tests observe real fds.
+ * No child process is created by unit tests: spawnFn is injectable. openLogFn/closeLogFn expose real fd lifetime.
  */
 export async function runAgyDirectExec({
   dir, task, model, effort, jsonSchema, addDirs, sandbox = false, timeoutMs = DEFAULT_TIMEOUT_MS,
   logFile, exclusiveLog = false, stream = true, spawnFn = nodeSpawn, cli = AGY_CLI, resumeConversationId = null, review = false,
-  openLogFn = openSync,
+  openLogFn = openSync, closeLogFn = closeSync,
   // Injected processes must not consume or publish the host's real quota observations.
   // Callers exercising quota behavior can inject both store operations explicitly.
   readHold = spawnFn === nodeSpawn ? readAgyHold : () => null,
@@ -442,11 +442,11 @@ export async function runAgyDirectExec({
     else writeFileSync(logFile, '');
     const hold = readHold(model);
     if (hold) {
-      if (logFd !== undefined) { closeSync(logFd); logFd = undefined; }
+      if (logFd !== undefined) { closeLogFn(logFd); logFd = undefined; }
       return { stdout: '', stderr: `agy quota exhausted: ${hold.fallbackDecision} until ${hold.quotaResetsAt} (held by ${hold.heldBackend} model ${hold.heldModel})`, code: 1, timedOut: false, argv, ...hold };
     }
   } catch (e) {
-    if (logFd !== undefined) closeSync(logFd);
+    if (logFd !== undefined) closeLogFn(logFd);
     return { stdout: '', stderr: e.message, code: null, timedOut: false, argv };
   }
   return new Promise((resolvePromise) => {
@@ -539,7 +539,7 @@ export async function runAgyDirectExec({
       try { child.kill('SIGKILL'); } catch { settle(null); }
     }
   }).finally(() => {
-    if (logFd !== undefined) closeSync(logFd);
+    if (logFd !== undefined) closeLogFn(logFd);
   });
 }
 
