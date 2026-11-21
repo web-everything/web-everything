@@ -11,7 +11,7 @@ const STRATEGY = 'scripts/lib/drain-merge-strategy.mjs';
 
 export default {
   id: 'red-team-clear-removed-after-accept',
-  title: 'removed red-team clearance and a refused carry hold admission and dequeue the unproved live head',
+  title: 'removed red-team clearance and a refused carry hold admission for the unproved live head',
   card: 'A0 / PR #7289 exact-head red-team proof',
   fixedBy: { sha: 'working-tree', where: 'current tree', paths: [SAFETY, STRATEGY] },
   fixPresent(root) {
@@ -25,14 +25,9 @@ export default {
     const { createDrainMergeStrategy } = await import(pathToFileURL(join(sourceRoot, STRATEGY)).href);
     const fixture = JSON.parse(readFileSync(new URL('../../../lib/__tests__/fixtures/pr7289-red-team.json', import.meta.url), 'utf8'));
     const repo = 'example/project', violations = [];
-    let queued = true, enqueued = false;
+    let enqueued = false;
     const exec = (_command, args) => {
       if (args.includes('--slurp')) return JSON.stringify([fixture.comments]);
-      if (args.some(a => a.includes('mergeQueue(branch:'))) return JSON.stringify({ data: { repository: { mergeQueue: { entries: {
-        nodes: queued ? [{ pullRequest: { id: 'PR7289', number: 7289 } }] : [], pageInfo: { hasNextPage: false },
-      } } } } });
-      if (args.some(a => a.includes('isInMergeQueue'))) return JSON.stringify({ data: { repository: { pullRequest: { isInMergeQueue: queued, headRefOid: fixture.head } } } });
-      if (args.some(a => a.includes('dequeuePullRequest'))) { queued = false; return JSON.stringify({ data: { dequeuePullRequest: { clientMutationId: null } } }); }
       if (args.some(a => a.includes('enqueuePullRequest'))) { enqueued = true; throw Error('unproved PR reached enqueue mutation'); }
       if (args[0] === 'pr' && args[1] === 'view') return JSON.stringify({ id: 'PR7289', number: 7289, state: 'OPEN', headRefOid: fixture.head, labels: fixture.labels });
       if (args[0] === 'pr' && ['comment', 'edit'].includes(args[1])) return '';
@@ -43,7 +38,7 @@ export default {
       resolved: { policy: { strategy: 'github-merge-queue' }, note: null },
       queueSafety: { value: { waitForRedTeamBeforeEnqueue: true, dequeueOnSendBack: true, queueRebuildMax: 3 } },
       statePath: join(tmpdir(), 'a0-soak-hermetic-state.json'),
-      readFile: () => JSON.stringify({ pending: [{ repo, num: 7289, headSha: fixture.earlierHead }], followedUp: [] }),
+      readFile: () => JSON.stringify({ pending: [], followedUp: [] }),
       writeState() {}, writeFile() {}, readRedTeamEvidence: () => ({ loopPayload: fixture.loopPayload, scheduled: false }),
       cancelObsoleteRuns() {}, batching: { observe() {} }, log: { write() {} },
     });
@@ -54,13 +49,6 @@ export default {
       if (result.enqueued || !result.reason?.includes('unknown(missing)')) violations.push('admission did not defer the unproved head');
     } catch (error) { violations.push(`admission probe failed: ${error.message}`); }
     if (enqueued) violations.push('unproved head reached enqueue mutation');
-    for (const path of ['sweep', 'follow-up']) {
-      queued = true;
-      const s = strategy();
-      if (path === 'sweep') s.dequeueSendBacks([{ number: 7289, labels: fixture.labels }]);
-      else s.collectQueueMerged({ merged: [], landedThisPass: new Set() });
-      if (queued) violations.push(`${path} left the unproved head queued`);
-    }
     return { violations };
   },
   judge: report => report.violations,

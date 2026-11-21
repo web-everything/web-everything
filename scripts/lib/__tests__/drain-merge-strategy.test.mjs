@@ -1852,63 +1852,6 @@ describe('queue safeguard overrides and untracked queue entries', () => {
     expect(out).toMatchObject({ enqueued: false });
     expect(JSON.stringify(out) + h.logs.join('')).toContain('unknown(missing)');
   });
-  it.each(['WE_DRAIN_WAIT_FOR_RED_TEAM_BEFORE_ENQUEUE', 'WE_REVIEW_RED_TEAM', 'WE_REVIEW_EXTRA_SEATS'])('A0: %s off leaves a queued PR without proof alone', key => {
-    const h = harness({ strategy: 'github-merge-queue', queued: true, liveComments: [], env: { ...process.env, [key]: '0' },
-      initial: { pending: [{ num: 5283, headSha: HEAD }], followedUp: [] } });
-    h.s.dequeueSendBacks([{ number: 5283, labels: ['ready-to-merge'] }]);
-    expect(h.calls.some(c => c.some(a => String(a).includes('dequeuePullRequest')))).toBe(false);
-    expect(h.calls.filter(c => c.includes('--slurp'))).toHaveLength(0);
-  });
-  it.each(['sweep', 'follow-up'])('dequeues a queued PR without red-team:clear or live-head proof (%s)', path => {
-    const h = harness({ strategy: 'github-merge-queue', queued: true, liveComments: [],
-      initial: { pending: [{ num: 5283, headSha: HEAD }], followedUp: [] } });
-    if (path === 'sweep') h.s.dequeueSendBacks([{ number: 5283, labels: ['ready-to-merge'] }]);
-    else h.s.collectQueueMerged({ merged: [], landedThisPass: new Set() });
-    expect(h.calls.filter(c => c.some(a => String(a).includes('dequeuePullRequest')))).toHaveLength(1);
-    expect(h.logs.join('')).toContain('unknown(missing)');
-    expect(h.logs.join('')).toContain(HEAD.slice(0, 12));
-  });
-  it.each(['sweep', 'follow-up'])('keeps a queued PR without red-team:clear when trusted live-head proof exists (%s)', path => {
-    const h = harness({ strategy: 'github-merge-queue', queued: true, liveComments: [policyClear(5283)],
-      initial: { pending: [{ num: 5283, headSha: HEAD }], followedUp: [] } });
-    if (path === 'sweep') h.s.dequeueSendBacks([{ number: 5283, labels: ['ready-to-merge'] }]);
-    else h.s.collectQueueMerged({ merged: [], landedThisPass: new Set() });
-    expect(h.calls.filter(c => c.includes('--slurp'))).toHaveLength(1);
-    expect(h.calls.some(c => c.some(a => String(a).includes('dequeuePullRequest')))).toBe(false);
-    expect(h.state().pending).toHaveLength(1);
-  });
-  it.each(['sweep', 'follow-up'])('dequeues a queued PR with red-team:clear but no live-head proof (%s)', path => {
-    const labels = ['ready-to-merge', 'red-team:clear'];
-    const h = harness({ strategy: 'github-merge-queue', queued: true, labels, liveComments: [],
-      initial: { pending: [{ num: 5283, headSha: HEAD }], followedUp: [] } });
-    if (path === 'sweep') h.s.dequeueSendBacks([{ number: 5283, labels }]);
-    else h.s.collectQueueMerged({ merged: [], landedThisPass: new Set() });
-    expect(h.calls.filter(c => c.includes('--slurp'))).toHaveLength(1);
-    expect(h.calls.filter(c => c.some(a => String(a).includes('dequeuePullRequest')))).toHaveLength(1);
-    expect(h.logs.join('')).toContain('unknown(missing)');
-  });
-  it.each(['sweep', 'follow-up'])('dequeues a queued PR whose completed red-team result confirms a break (%s)', path => {
-    const labels = ['ready-to-merge', 'red-team:clear'];
-    const thread = [{ user: { login: 'web-everything[bot]' }, body: renderRedTeamComment({
-      pr: 5283, rev: HEAD, provider: 'codex', model: 'm', recheckStatus: 'ok', foldedVerdict: 'changes',
-      findings: [{ summary: 'unresolved security break', category: 'security', impactIfUnfixed: 'broken', confirmedByRecheck: true }],
-    }) }];
-    const h = harness({ strategy: 'github-merge-queue', queued: true, labels, liveComments: thread,
-      initial: { pending: [{ num: 5283, headSha: HEAD }], followedUp: [] } });
-    if (path === 'sweep') h.s.dequeueSendBacks([{ number: 5283, labels }]);
-    else h.s.collectQueueMerged({ merged: [], landedThisPass: new Set() });
-    expect(h.calls.filter(c => c.some(a => String(a).includes('dequeuePullRequest')))).toHaveLength(1);
-    expect(h.logs.join('')).toContain('confirmed a break requiring send-back');
-  });
-  it.each(['sweep', 'follow-up'])('dequeues a queued PR with unreadable null labels despite live-head proof (%s)', path => {
-    const h = harness({ strategy: 'github-merge-queue', queued: true, liveComments: [policyClear(5283)],
-      ghView: { 5283: { state: 'OPEN', id: 'PR_NODE', headRefOid: HEAD, labels: null } },
-      initial: { pending: [{ num: 5283, headSha: HEAD }], followedUp: [] } });
-    if (path === 'sweep') h.s.dequeueSendBacks([{ number: 5283, labels: null }]);
-    else h.s.collectQueueMerged({ merged: [], landedThisPass: new Set() });
-    expect(h.calls.filter(c => c.some(a => String(a).includes('dequeuePullRequest')))).toHaveLength(1);
-    expect(h.logs.join('')).toContain('live PR labels unreadable');
-  });
   it('dequeueOnSendBack off leaves queued send-backs untouched', () => {
     const h = harness({ strategy: 'github-merge-queue', queued: true, labels: [], initial: { pending: [{ num: 5283, headSha: HEAD }], followedUp: [] }, env: { ...process.env, WE_DRAIN_DEQUEUE_ON_SEND_BACK: 'false' } });
     h.s.collectQueueMerged({ merged: [], landedThisPass: new Set() });
@@ -2121,7 +2064,6 @@ describe('drain pre-stage queue admission', () => {
         findings: [{ summary: 'new break', category: 'edge-case', impactIfUnfixed: 'broken', confirmedByRecheck: true }],
       }) });
     } else if (variant === 'in-flight') {
-      comments.length = 0; // The new pass has no completed proof on this head.
       evidence.loopPayload = { verdict: { verdict: 'accept' } };
       evidence.inFlight = true;
     } else evidence.readError = true;

@@ -590,8 +590,11 @@ export function latestRedTeamResultPosition(comments, pr) {
 /** The newest trusted red-team result for this PR and head among the records, or null. PURE. */
 function latestResult(records, pr, sha) {
   if (!/^[0-9a-f]{40}$/.test(sha)) return null;
-  return records.map(r => ({ ...r, parsed: parseRedTeamComment(recordBody(r)) }))
-    .filter(r => r.parsed?.pr === Number(pr) && r.parsed.rev === sha).sort(threadOrder).at(-1) ?? null;
+  const results = records.map(r => ({ ...r, parsed: parseRedTeamComment(recordBody(r)) }))
+    .filter(r => r.parsed?.pr === Number(pr) && r.parsed.rev === sha).sort(threadOrder);
+  // A policy skip is no re-check of a confirmed break; retain that result and its gate actions.
+  return results.reduce((latest, r) => r.parsed.policyClear && latest?.parsed.findings.some(f => f.confirmed)
+    ? latest : r, null);
 }
 
 /**

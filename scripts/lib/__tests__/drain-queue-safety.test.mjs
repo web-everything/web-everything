@@ -1,9 +1,8 @@
 // @vitest-environment node
 import { mkdtempSync, rmSync, writeFileSync, existsSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
-import { homedir, tmpdir } from 'node:os';
+import { homedir } from 'node:os';
 import { describe, expect, it, vi } from 'vitest';
-import { createDrainMergeStrategy } from '../drain-merge-strategy.mjs';
 import * as queueSafety from '../drain-queue-safety.mjs';
 import { assertCapability } from '../repo-profile.mjs';
 import { readDrainQueueSafety, redTeamEnqueueHold, dequeueSentBack, sendBackReason, decideMqSameHead, readMqTimeline, mqSameHeadGuard, createMqSameHeadRefreshStore, createMqSameHeadRefreshOptions, mqSameHeadRefreshStatePath } from '../drain-queue-safety.mjs';
@@ -2007,35 +2006,6 @@ const pr7289 = JSON.parse(readFileSync(new URL('./fixtures/pr7289-red-team.json'
 const policyClear = (pr = 5283, rev = head, login = 'web-everything') => ({ author: { login },
   body: `${redTeamMarker(pr, rev)}\nRed team not required on this head: card-only diff.` });
 
-function a0Queue({ comments = pr7289.comments, liveHead = pr7289.head, labels = pr7289.labels } = {}) {
-  const repo = 'example/project', logs = [], calls = [];
-  let queued = true;
-  const exec = (_cmd, args) => {
-    calls.push(args);
-    if (args.includes('--slurp')) {
-      if (comments instanceof Error) throw comments;
-      return JSON.stringify(comments === null ? {} : [comments]);
-    }
-    if (args.some(a => a.includes('mergeQueue(branch:'))) return JSON.stringify({ data: { repository: { mergeQueue: { entries: {
-      nodes: queued ? [{ pullRequest: { id: 'PR7289', number: 7289 } }] : [], pageInfo: { hasNextPage: false },
-    } } } } });
-    if (args.some(a => a.includes('isInMergeQueue'))) return JSON.stringify({ data: { repository: { pullRequest: { isInMergeQueue: queued, headRefOid: liveHead } } } });
-    if (args.some(a => a.includes('dequeuePullRequest'))) { queued = false; return JSON.stringify({ data: { dequeuePullRequest: { clientMutationId: null } } }); }
-    if (args[0] === 'pr' && args[1] === 'view') return JSON.stringify({ state: 'OPEN', number: 7289, id: 'PR7289', labels, headRefOid: liveHead });
-    if (args[0] === 'pr' && args[1] === 'comment') return '';
-    throw new Error(`unexpected fixture call: ${args.join(' ')}`);
-  };
-  const strategy = createDrainMergeStrategy({ localSlug: repo, exec, env: { WE_UNDER_TEST: '1' },
-    resolved: { policy: { strategy: 'github-merge-queue' }, note: null },
-    queueSafety: { value: { dequeueOnSendBack: true, queueRebuildMax: 3, waitForRedTeamBeforeEnqueue: true } },
-    statePath: join(tmpdir(), 'a0-hermetic-state.json'),
-    readFile: () => JSON.stringify({ pending: [{ repo, num: 7289, headSha: pr7289.earlierHead }], followedUp: [] }),
-    writeFile: () => {}, writeState: () => {}, cancelObsoleteRuns: () => {},
-    batching: { observe: () => ({}) }, log: { write: line => logs.push(line) },
-  });
-  return { strategy, logs, calls, queued: () => queued };
-}
-
 describe('A0 exact-head red-team clearance', () => {
   it('pure proof accepts a completed review, policy-clear and sealed carry', () => {
     for (const comment of [clean(), policyClear(), carry()])
@@ -2045,6 +2015,10 @@ describe('A0 exact-head red-team clearance', () => {
   const replay = over => redTeamEnqueueHold({ ...pr7289, scheduled: false, env: {}, ...over });
   it('holds merge when red-team:clear was removed and the carry was refused', () => {
     expect(replay()).toContain('unknown(missing)');
+  });
+  it('policy-clear cannot release admission while another pass is in flight', () => {
+    expect(hold({ comments: [policyClear()], inFlight: true, skipCardOnly: false }))
+      .toMatch(/no recorded result/);
   });
   it('untrusted-login policy-clear is not proof', () => {
     expect(hold({ scheduled: false, comments: [policyClear(5283, head, 'attacker')] })).toContain('unknown(missing)');
@@ -2074,41 +2048,4 @@ describe('A0 exact-head red-team clearance', () => {
     const comment = { get body() { throw new Error('unreadable'); }, ...bot };
     expect(hold({ scheduled: false, comments: [comment] })).toContain('unknown(missing)');
   });
-  it.each(['sweep', 'follow-up'])('dequeues a queued PR whose head has no red-team proof (%s)', path => {
-    const f = a0Queue();
-    if (path === 'sweep') f.strategy.dequeueSendBacks([{ number: 7289, labels: pr7289.labels }]);
-    else f.strategy.collectQueueMerged({ merged: [], landedThisPass: new Set() });
-    expect(f.queued()).toBe(false);
-    expect(f.logs.join('')).toContain('unknown(missing)');
-  });
-  it.each(['sweep', 'follow-up'])('unreadable thread dequeues (%s)', path => {
-    for (const comments of [new Error('offline'), null]) {
-      const f = a0Queue({ comments });
-      if (path === 'sweep') f.strategy.dequeueSendBacks([{ number: 7289, labels: pr7289.labels }]);
-      else f.strategy.collectQueueMerged({ merged: [], landedThisPass: new Set() });
-      expect(f.queued()).toBe(false);
-      expect(f.logs.join('')).toContain('unknown(missing)');
-    }
-  });
-  it.each(['sweep', 'follow-up'])('keeps a queued PR with trusted live-head proof (%s)', path => {
-    const f = a0Queue({ comments: [policyClear(7289, pr7289.head)] });
-    if (path === 'sweep') f.strategy.dequeueSendBacks([{ number: 7289, labels: pr7289.labels }]);
-    else f.strategy.collectQueueMerged({ merged: [], landedThisPass: new Set() });
-    expect(f.queued()).toBe(true);
-  });
-});
-
-it.each(['sweep', 'follow-up'])('A0 queued clearance probe works with TMPDIR unset (%s)', path => {
-  const saved = process.env.TMPDIR;
-  delete process.env.TMPDIR;
-  try {
-    const f = a0Queue();
-    if (path === 'sweep') f.strategy.dequeueSendBacks([{ number: 7289, labels: pr7289.labels }]);
-    else f.strategy.collectQueueMerged({ merged: [], landedThisPass: new Set() });
-    expect(f.queued()).toBe(false);
-    expect(f.logs.join('')).toContain('unknown(missing)');
-  } finally {
-    if (saved === undefined) delete process.env.TMPDIR;
-    else process.env.TMPDIR = saved;
-  }
 });

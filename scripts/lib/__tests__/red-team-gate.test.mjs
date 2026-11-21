@@ -563,3 +563,14 @@ describe('planRedTeamActions: class deferral × confirmed × impact', () => {
     expect(where(planRedTeamActions({ findings: [f] }, setting), f)).toBe('sendBack');
   });
 });
+
+it('a later policy-clear cannot supersede an unresolved confirmed break without a stored seal', () => {
+  const comments = [
+    bot(BODY_4722),
+    bot(`<!-- we:red-team-advisory pr=4722 rev=${HEAD} -->
+Red team not required on this head: card-only diff.`, '2026-10-10T03:04:41Z'),
+  ];
+  const disposition = readRedTeamDisposition({ comments, pr: 4722, head: HEAD, env: {} });
+  expect(disposition.result.findings.some(f => f.confirmed)).toBe(true);
+  expect(disposition.sendBack.map(f => f.index)).toContain(1);
+});

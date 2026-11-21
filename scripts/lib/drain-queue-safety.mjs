@@ -1305,6 +1305,8 @@ export function redTeamEnqueueHold({ ok, reason, loopPayload, comments, pr, head
   // comment cannot release it either.
   if (ok === false) return `post-accept red team evidence unknown (${reason}); hold and inspect run evidence`;
   if (pendingOnly) return 'post-accept red team result is not published yet (stored evidence not sealed); hold until the sweep publishes it';
+  // Proof from a completed pass cannot release a different pass that is still running.
+  if (inFlight && redTeamEnabled(env)) return 'post-accept red team has no recorded result on the live head';
   if (isPublishableRedTeamResult(disposition.result)) return null;
   if (!postAcceptRedTeamOwed(loopPayload, env, { scheduled, inFlight, recorded, skipCardOnly })) {
     // Kill switch thrown (WE_REVIEW_RED_TEAM / WE_REVIEW_EXTRA_SEATS off): enqueue without a result still works.
