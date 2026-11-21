@@ -6,6 +6,7 @@ import { drainFreezeSignal } from '../../lib/red-main-freeze-shared.mjs';
 import { combineRedMain, readMainCiFact } from '../../merge-gate-check.mjs';
 import { decideMainPushSkip } from '../main-push-skip.mjs';
 import { readFileSync } from 'node:fs';
+import { withoutReusedMainPushes } from '../../lib/main-ci-reuse-runs.mjs';
 const head = 'a'.repeat(40), old = 'b'.repeat(40);
 const run = (id, sha, conclusion, event = 'push') => ({ databaseId: id, headSha: sha, conclusion,
   event, status: 'completed', createdAt: `2026-11-20T${id}:00:00Z`, updatedAt: `2026-11-20T${id}:30:00Z` });
@@ -15,7 +16,7 @@ it.each(['failure', undefined])('required checks cannot hide red main with marke
     checkRuns: ['test', 'smoke', 'daemon-soak'].map(name => check(name, 'success')) };
   if (marker) tip.checkRuns.push(check('main-execution', marker));
   expect(mainRedState([run(10, old, 'failure'), run(11, head, 'failure')], { tip }))
-    .toMatchObject({ status: 'red', latestRed: { sha: old } });
+    .toMatchObject({ status: 'red', latestRed: { sha: head } });
 });
 function fact(rows, current = head, jobPages = {}) {
   return readMainCiFact({ repo: 'fixture/repo', exec: (_, args) => {
@@ -34,6 +35,11 @@ const reusedJobs = () => ({ total_count: 3, jobs: [
   { name: 'test', status: 'completed', conclusion: 'success', run_attempt: 1 },
   { name: 'unit (1)', status: 'completed', conclusion: 'skipped', run_attempt: 1 },
 ] });
+// These fixtures designate their failed pushes as reused. Supply the same per-run
+// job proof the production probe uses; a tip check alone cannot excuse a failure.
+const provenReuse = rows => withoutReusedMainPushes(rows, {
+  repo: 'fixture/repo', exec: () => JSON.stringify(reusedJobs()),
+});
 it('merge gate ignores a proven reused-push failure behind an older real green run', () => {
   const mainCi = fact([run(11, head, 'failure'), run(10, old, 'success')], head,
     { '11/1': reusedJobs() });
@@ -48,8 +54,8 @@ it('shared reused-push fixture never reports red through merge gate, health watc
     checksTotal: page.total_count, checkRuns: page.jobs.map((job, index) => ({ ...job, id: index + 1 })) };
   const now = Date.parse('2026-11-20T12:00:00Z');
   expect(fact(runs, head, { '11/1': page })).toMatchObject({ red: false });
-  expect(planMainRedAlert({ runs, tip, now }).items).toEqual([]);
-  const state = mainRedState(runs, { tip });
+  expect(planMainRedAlert({ runs: provenReuse(runs), tip, now }).items).toEqual([]);
+  const state = mainRedState(provenReuse(runs), { tip });
   expect(state.status).toBe('green');
   // The drain freeze consumes the state published by the red-main owner.
   expect(drainFreezeSignal({ state: {}, mainRedState: { red: state.status === 'red' }, now }))
@@ -129,13 +135,13 @@ it('unknown run event cannot become green now that the list includes all events'
 it('skipped tip falls through to an older real green push', () => {
   const tip = { sha: head, runStatus: 'completed', requiredChecks: ['test'],
     checkRuns: [check('test', 'success'), check('main-execution', 'failure')] };
-  expect(mainRedState([run(10, old, 'success'), run(11, head, 'failure')], { tip }))
+  expect(mainRedState(provenReuse([run(10, old, 'success'), run(11, head, 'failure')]), { tip }))
     .toMatchObject({ status: 'green', latestGreen: { sha: old } });
 });
 it('skipped tip preserves real scheduled evidence on the same SHA', () => {
   const tip = { sha: head, runStatus: 'completed', requiredChecks: ['test'],
     checkRuns: [check('test', 'success'), check('main-execution', 'failure')] };
-  expect(mainRedState([run(10, head, 'success', 'schedule'), run(11, head, 'failure')], { tip }))
+  expect(mainRedState(provenReuse([run(10, head, 'success', 'schedule'), run(11, head, 'failure')]), { tip }))
     .toMatchObject({ status: 'green', latestGreen: { runId: 10 } });
 });
 it('skipped tip without any real execution leaves evidence unknown', () => {

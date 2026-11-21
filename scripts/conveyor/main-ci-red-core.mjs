@@ -338,7 +338,9 @@ export function mainRedState(runs, { tip } = {}) {
   // (including historical pushes without the marker) cannot certify fresh execution.
   const executionKnown = marker?.status === 'completed' && ['success', 'skipped'].includes(marker.conclusion);
   if (verdict === 'green' && !executionKnown) return completedMainRedState(Array.isArray(runs)
-    ? runs.filter(run => run?.headSha !== tip.sha || run.event === 'schedule') : runs);
+    // The IO reader removes proven reused failures per run. A tip's green summaries
+    // must not erase unproven failures (including other runs of that same SHA).
+    ? runs.filter(run => run?.headSha !== tip.sha || run.event === 'schedule' || run.conclusion !== 'success') : runs);
   const s = completedMainRedState(runs);
   if (verdict === 'green') return {
     status: 'green', latestGreen: { sha: tip.sha, runId: null, createdAt: null, updatedAt: null }, via: 'tip-required-checks',

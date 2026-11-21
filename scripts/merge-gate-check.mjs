@@ -57,6 +57,7 @@ import { writeAllSync } from './lib/write-all-sync.mjs';
 import { readSharedFreeze, flatText } from './lib/red-main-freeze-shared.mjs';
 import { MAIN_CI_RED_DEFAULTS, isTrustedPrAuthor, mainRedState } from './conveyor/main-ci-red-core.mjs';
 import { markInfraOnlyRuns } from './lib/main-ci-infra-runs.mjs';
+import { withoutReusedMainPushes } from './lib/main-ci-reuse-runs.mjs';
 
 const firstLine = (e) => String(e?.stderr || e?.message || e).trim().split('\n').pop().slice(0, 300);
 const ghJson = (args, exec) => JSON.parse(exec('gh', args, { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], maxBuffer: 64 * 1024 * 1024 }) || 'null');
@@ -402,32 +403,6 @@ export function formatRedMainFreeze(redMain) {
 
 /** How many of main's CI runs to read: enough to find the last green one behind a short red streak. */
 const MAIN_CI_RUNS = 30;
-
-/** Reuse is neither red code nor a fresh green execution. Prove it per run, so a
- * marker cannot hide another failure on the same SHA. Unknown evidence stays red.
- */
-function withoutReusedMainPushes(runs, { repo, exec }) {
-  let reads = 0;
-  return runs.filter((run) => {
-    // Reruns may conceal a genuine earlier failure; retain their existing hold.
-    if (run.event !== 'push' || run.status !== 'completed' || run.conclusion !== 'failure'
-      || (run.attempt != null && Number(run.attempt) !== 1)
-      || !Number.isSafeInteger(run.databaseId) || run.databaseId <= 0 || reads >= MAIN_CI_RUNS) return true;
-    reads += 1;
-    try {
-      const page = JSON.parse(exec('gh', ['api', `repos/${repo}/actions/runs/${run.databaseId}/attempts/1/jobs?per_page=100`],
-        { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], maxBuffer: 8 * 1024 * 1024, timeout: 60_000 }) || 'null');
-      const jobs = page?.jobs;
-      if (!Array.isArray(jobs) || !jobs.length || page.total_count !== jobs.length) return true;
-      const markers = jobs.filter(job => job?.name === 'main-execution');
-      const reused = markers.length === 1 && markers[0].conclusion === 'failure'
-        && jobs.every(job => job?.status === 'completed'
-          && (job.run_attempt == null || Number(job.run_attempt) === 1)
-          && (job === markers[0] || ['success', 'skipped'].includes(job.conclusion)));
-      return !reused;
-    } catch { return true; }
-  });
-}
 
 /**
  * MAIN'S OWN CI STATUS, read straight from GitHub (operator ruling 2026-10-11, PR 4715): main's CI workflow runs on
