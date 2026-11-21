@@ -417,14 +417,24 @@ export function prepareBranchBeforeEnqueue({ c, traceHeadSha, cwd = process.cwd(
         const mainNums = paths(mainFiles).filter((p) => /^backlog\/[^/]+\.md$/.test(p)).map(cardId).filter(isNum).map(Number);
         const mainMax = mainNums.reduce((m, v) => Math.max(m, v), 0);
         const badNumbers = (n.assigned || []).filter((a) => !/^\d+$/.test(String(a.nnn)) || Number(a.nnn) <= mainMax || mainNums.includes(Number(a.nnn)));
-        // A number is a permanent card identity; changing its slug is allowed when only one path survives.
-        // Include unchanged main paths so a copy cannot hide a duplicate behind an existing filename.
-        const seen = new Set();
-        const badNames = paths(tracked()).filter((p) => /^backlog\/[^/]+\.md$/.test(p) && isNum(cardId(p))).filter((p) => {
-          const id = Number(cardId(p));
-          const bad = seen.has(id);
-          seen.add(id);
-          return bad;
+        // Apply branch additions/deletions since the merge base to main's paths. Absence from
+        // the PR alone is not a deletion: main may have added that path after branching.
+        // Disable rename detection so a genuine slug rename removes its old path and adds its new one.
+        const changedNames = new Set(paths(git(['diff', '--no-renames', '--name-only', '--diff-filter=AD', '-z', 'origin/main...HEAD', '--', 'backlog/'], worktree)));
+        const branchNames = new Set(tracked());
+        const mergedNames = new Set([
+          ...paths(mainFiles).filter(p => !changedNames.has(p) || branchNames.has(p)),
+          ...[...branchNames].filter(p => changedNames.has(p)),
+        ]);
+        // Check both trees: duplicates on the PR remain invalid even if main deleted a path.
+        const badNames = [branchNames, mergedNames].flatMap(names => {
+          const seen = new Set();
+          return [...names].filter((p) => /^backlog\/[^/]+\.md$/.test(p) && isNum(cardId(p))).filter((p) => {
+            const id = Number(cardId(p));
+            const bad = seen.has(id);
+            seen.add(id);
+            return bad;
+          });
         });
         if (badNames.length) throw new Error(`numbered card name(s) not valid against origin/main (collision with main or duplicate number): ${badNames.map(shownText).join(', ')}`);
         if (badNumbers.length) throw new Error(`numbered card(s) not valid against origin/main (highest ${mainMax}): ${badNumbers.map((a) => shownText(`${a.hash}→${a.nnn}`)).join(', ')}`);

@@ -14,13 +14,16 @@ export function exercise(prepareBranchBeforeEnqueue) {
     { label: 'stale checkout', behind: '38', expectPush: false },
     { label: 'taken number', nnn: '040', expectPush: false },
     { label: 'fresh and valid', expectPush: true },
-    { label: 'slug rename', listing: 'backlog/040-renamed.md\nbacklog/041-foo.md', expectPush: true },
+    { label: 'slug rename', changed: 'backlog/040-main.md\0backlog/040-renamed.md\0backlog/041-foo.md\0', listing: 'backlog/040-renamed.md\nbacklog/041-foo.md', expectPush: true },
+    { label: 'main added a colliding card after branching', changed: 'backlog/040-other.md\0backlog/041-foo.md\0', listing: 'backlog/040-other.md\0backlog/041-foo.md\0', expectPush: false },
+    { label: 'main added a padded alias after branching', changed: 'backlog/40-other.md\0backlog/041-foo.md\0', listing: 'backlog/40-other.md\0backlog/041-foo.md\0', expectPush: false },
+    { label: 'unreadable branch deletions', diffFails: true, expectPush: false },
     { label: 'copy of existing card', listing: 'backlog/040-main.md\nbacklog/040-renamed.md\nbacklog/041-foo.md', expectPush: false },
     { label: 'separate stale code clone', separate: true, codeBehind: '5', expectPush: false },
     { label: 'separate fresh code clone', separate: true, expectPush: true },
     { label: 'code fetch failure', separate: true, fetchFails: true, expectPush: false },
   ];
-  for (const { label, behind = '0', nnn = '041', listing = 'backlog/041-foo.md', separate, codeBehind = '0', fetchFails, expectPush } of scenarios) {
+  for (const { label, behind = '0', nnn = '041', listing = 'backlog/041-foo.md', changed = 'backlog/041-foo.md\0', diffFails, separate, codeBehind = '0', fetchFails, expectPush } of scenarios) {
     let numbered = false, pushed = false, codeFetched = false;
     const exec = (_cmd, args, options) => {
       if (separate && options.cwd === '/code/scripts/lib') {
@@ -33,6 +36,10 @@ export function exercise(prepareBranchBeforeEnqueue) {
       if (args.includes('--git-path')) return join(mkdtempSync(join(tmpdir(), 'soak-numbering-')), 'sparse-checkout');
       if (args[0] === 'ls-remote') return 'old\trefs/heads/topic\n';
       if (args[0] === 'rev-list') return `${behind}\n`;
+      if (args[0] === 'diff') {
+        if (diffFails) throw new Error('merge base unavailable');
+        return changed;
+      }
       if (args[0] === 'ls-files') return numbered ? listing : 'backlog/xabc123-foo.md';
       if (args[0] === 'ls-tree') return args.includes('--name-only') ? 'backlog/040-main.md' : entry('backlog/xabc123-foo.md');
       if (args[0] === 'rev-parse') return 'new';

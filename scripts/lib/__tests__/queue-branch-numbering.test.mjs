@@ -449,13 +449,65 @@ describe('queue branch numbering', () => {
     expect(out).toMatchObject({ action: 'skip', reason: expect.stringContaining('numbered card name(s) not valid against origin/main') });
     noWrites(x);
   });
+  it.each(['040', '40'])('refuses an independent collision added on main after branching (%s)', (id) => {
+    const x = setup();
+    const orig = x.exec.getMockImplementation();
+    x.exec.mockImplementation((cmd, args, o) => {
+      // The PR never contained main's 040 card, so it cannot delete it on merge.
+      if (args[0] === 'diff') return `backlog/${id}-other.md\0backlog/041-foo.md\0`;
+      if (args[0] === 'ls-files') return `backlog/${id}-other.md\0backlog/${x.number.mock.calls.length ? '041' : 'xabc123'}-foo.md\0`;
+      return orig(cmd, args, o);
+    });
+    const out = prepareBranchBeforeEnqueue(x.args);
+    expect(out).toMatchObject({ action: 'skip', reason: expect.stringContaining('numbered card name(s) not valid against origin/main') });
+    noWrites(x);
+    const emit = vi.fn();
+    expect(finishBranchPreparation(out, { c: x.args.c, revalidationAborted: [], needsAcceptanceRestamp: () => false,
+      restampAcceptance: vi.fn(), log: { write: vi.fn() }, emit })).toBe(false);
+    expect(emit).toHaveBeenCalledWith(expect.objectContaining({ kind: 'needs-you', pr: 4 }));
+  });
+  it('refuses when branch deletion evidence cannot be read', () => {
+    const x = setup();
+    const orig = x.exec.getMockImplementation();
+    x.exec.mockImplementation((cmd, args, o) => {
+      if (args[0] === 'diff') throw new Error('merge base unavailable');
+      return orig(cmd, args, o);
+    });
+    expect(prepareBranchBeforeEnqueue(x.args)).toMatchObject({ action: 'skip', reason: expect.stringContaining('merge base unavailable') });
+    noWrites(x);
+  });
   it.each(['040', '40'])('allows a slug rename preserving card number %s beside a newly numbered card', (id) => {
     const x = setup();
     const orig = x.exec.getMockImplementation();
-    x.exec.mockImplementation((cmd, args, o) => (args[0] === 'ls-files' && x.number.mock.calls.length
-      ? `backlog/${id}-renamed.md\nbacklog/041-foo.md` : orig(cmd, args, o)));
+    x.exec.mockImplementation((cmd, args, o) => {
+      if (args[0] === 'diff') {
+        expect(args).toEqual(['diff', '--no-renames', '--name-only', '--diff-filter=AD', '-z', 'origin/main...HEAD', '--', 'backlog/']);
+        expect(o.cwd).toBe('/tmp/fake/tree');
+        return `backlog/040-main.md\0backlog/${id}-renamed.md\0backlog/041-foo.md\0`;
+      }
+      return args[0] === 'ls-files' && x.number.mock.calls.length
+        ? `backlog/${id}-renamed.md\nbacklog/041-foo.md` : orig(cmd, args, o);
+    });
     expect(prepareBranchBeforeEnqueue(x.args)).toMatchObject({ action: 'numbered', newHead: 'new' });
     expect(x.exec.mock.calls.some(([, args]) => args[0] === 'push')).toBe(true);
+  });
+  it.each([
+    ['unchanged shared filename', 'backlog/040-main.md', 'backlog/040-main.md', '', 'numbered'],
+    ['main renamed a shared card', 'backlog/040-renamed.md', 'backlog/040-main.md', '', 'numbered'],
+    ['branch deleted a shared card', 'backlog/040-main.md', '', 'backlog/040-main.md\0', 'numbered'],
+    ['branch rename collides with a new main path', 'backlog/040-new-on-main.md', 'backlog/40-renamed.md', 'backlog/040-main.md\0backlog/40-renamed.md\0', 'skip'],
+  ])('validates surviving merge paths: %s', (_label, mainName, branchName, changed, action) => {
+    const x = setup();
+    const orig = x.exec.getMockImplementation();
+    x.exec.mockImplementation((cmd, args, o) => {
+      if (args[0] === 'diff') return `${changed}backlog/041-foo.md\0`;
+      if (args[0] === 'ls-tree' && args.includes('--name-only')) return `${mainName}\0`;
+      if (args[0] === 'ls-files') return `${branchName}\0backlog/${x.number.mock.calls.length ? '041' : 'xabc123'}-foo.md\0`;
+      return orig(cmd, args, o);
+    });
+    expect(prepareBranchBeforeEnqueue(x.args)).toMatchObject({ action });
+    if (action === 'skip') noWrites(x);
+    else expect(x.exec.mock.calls.some(([, args]) => args[0] === 'push')).toBe(true);
   });
   it.each(['stale', 'fresh', 'fetch failure', 'unreadable count'])('refreshes the separate code clone before trusting its origin/main (%s)', (mode) => {
     const x = setup();
