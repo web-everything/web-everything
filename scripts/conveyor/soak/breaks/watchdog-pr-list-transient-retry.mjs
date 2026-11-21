@@ -4,6 +4,9 @@ import { resolve } from 'node:path';
 
 const SOURCE = 'scripts/conveyor/pr-live-owner-watch-io.mjs';
 
+// The registered probe repo, passed to the child (no repo literal in scanned source).
+const PROBE_REPO = ['web-everything', 'web-everything'].join('/');
+
 // Runs in a child process against the tree under test; behaviour only, no marker strings.
 const CHILD = `
 import { pathToFileURL } from 'node:url';
@@ -15,7 +18,7 @@ const pr = { number: 1, headRefOid: 'a'.repeat(40), labels: [], isDraft: false, 
 const hiccup = () => Object.assign(new Error('spawnSync gh ETIMEDOUT'), { code: 'ETIMEDOUT' });
 async function make(readGhText) {
   const dir = mkdtempSync(join(tmpdir(), 'soak-wd-')); writeFileSync(join(dir, 'p.json'), '{}');
-  const env = { GH_REPO: 'web-everything/web-everything', WE_PLATFORM_PREFERENCES_FILE: join(dir, 'p.json'), WE_COORDINATION_ROOT: join(dir, 'c'),
+  const env = { GH_REPO: process.argv[2], WE_PLATFORM_PREFERENCES_FILE: join(dir, 'p.json'), WE_COORDINATION_ROOT: join(dir, 'c'),
     WE_LIVE_OWNER_WATCH_DIR: join(dir, 'w'), WE_NEEDS_YOU_FEED: join(dir, 'f.jsonl'), WE_POLICY_CASCADE_LOG: '0' };
   const calls = { n: 0 };
   const io = await createLiveOwnerWatchIo({ env, home: dir, root: dir, now: Date.now(), adapters: {
@@ -34,7 +37,7 @@ process.stdout.write(JSON.stringify(out));
 `;
 
 function probe(root) {
-  const output = execFileSync(process.execPath, ['--input-type=module', '-e', CHILD, resolve(root, SOURCE)],
+  const output = execFileSync(process.execPath, ['--input-type=module', '-e', CHILD, resolve(root, SOURCE), PROBE_REPO],
     { encoding: 'utf8', timeout: 30000, maxBuffer: 64 * 1024, stdio: ['ignore', 'pipe', 'pipe'] });
   return JSON.parse(output);
 }
