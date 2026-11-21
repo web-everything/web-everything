@@ -13,6 +13,7 @@
  *
  * IMPURE by construction: `child_process`.
  */
+import { hasClosingKeywordRef } from '../lib/commit-message-safety.mjs';
 import { blocker, mergeBlockers, formatBlockers } from '../lib/open-pr-preflight.mjs';
 import { checkCanonicalAuditForOpen, auditCarryNotice, auditCarryNote } from './canonical-audit-gate.mjs';
 import { readMainCard, assertMachineTitle } from './machine-pr-title.mjs';
@@ -88,35 +89,25 @@ export const PR_LAND_CLI = join(dirname(fileURLToPath(import.meta.url)), '..', '
 /** Opening a PR waits on required checks in two of the three modes, so the bound is generous; a kill is `unrun`. */
 export const OPEN_PR_TIMEOUT_MS = 30 * 60 * 1000;
 
-/**
- * Appends the recorded bypass (reason, actor, quoted operator instruction — each rendered as a single-line code
- * span) to a COPY of the PR body file. FAILS CLOSED: a bypass whose PR-body note cannot be written throws, so the
- * caller refuses it rather than opening a PR whose body does not record the bypass. `cleanup` removes the copy.
- */
-function withBypassInBody(argv, b, cwd) {
-  const i = argv.findLastIndex((a) => a.startsWith('--body-file='));
-  if (i < 0) throw new Error('the request has no --body-file, so the bypass cannot be recorded in the PR body');
-  const dir = mkdtempSync(join(tmpdir(), 'open-pr-bypass-'));
-  const cleanup = () => rmSync(dir, { recursive: true, force: true });
-  try {
-    const out = join(dir, 'body.md');
-    writeFileSync(out, readFileSync(bodyFilePath(argv[i].slice('--body-file='.length), cwd), 'utf8') + renderBypassNote(b));
-    return { argv: argv.map((a, j) => (j === i ? `--body-file=${out}` : a)), cleanup };
-  } catch (e) { cleanup(); throw e; }
+/** Body-file takes precedence over inline body; the last occurrence of each wins. */
+function readAuthorBody(argv, cwd, read = readFileSync) {
+  const file = argv.findLast(a => a.startsWith('--body-file='));
+  if (file !== undefined) return read(bodyFilePath(file.slice('--body-file='.length), cwd), 'utf8');
+  return argv.findLast(a => a.startsWith('--body='))?.slice('--body='.length);
 }
 
-/** Annotate only the author's non-empty body file consumed by pr-land. */
-function withCarryNoteInBody(argv, note, cwd) {
-  const i = argv.findLastIndex((a) => a.startsWith('--body-file='));
-  if (i < 0) return { argv, cleanup: () => {} };
-  const body = readFileSync(bodyFilePath(argv[i].slice('--body-file='.length), cwd), 'utf8');
-  if (!body.trim()) return { argv, cleanup: () => {} };
-  const dir = mkdtempSync(join(tmpdir(), 'open-pr-carry-'));
+/** Snapshot the validated author body and append all generated notes in one copy. */
+function withNotesInBody(argv, body, note) {
+  if (typeof body !== 'string' || !body.trim()) throw new Error('empty author body; pass a non-empty --body or --body-file');
+  if (hasClosingKeywordRef(body + note)) throw new Error('admission note/body contains a closing keyword reference; replace it with card N or PR N before retrying');
+  const dir = mkdtempSync(join(tmpdir(), 'open-pr-notes-'));
   const cleanup = () => rmSync(dir, { recursive: true, force: true });
   try {
     const out = join(dir, 'body.md');
     writeFileSync(out, body + note);
-    return { argv: argv.map((a, j) => (j === i ? `--body-file=${out}` : a)), cleanup };
+    const i = argv.findLastIndex(a => a.startsWith('--body-file='));
+    return { argv: i < 0 ? [...argv, `--body-file=${out}`]
+      : argv.map((a, j) => j === i ? `--body-file=${out}` : a), cleanup };
   } catch (e) { cleanup(); throw e; }
 }
 
@@ -180,27 +171,24 @@ export function createPrLandRunner({ canonicalAudit = checkCanonicalAuditForOpen
     let r;
     let cleanupBody = () => {}; // removes the temp PR-body copy a bypass writes; called on every path out
     const arg = (name) => argv.find((a) => a.startsWith(`--${name}=`))?.slice(name.length + 3);
-    if (!argv.includes('--dry-run')) {
-      let body = '';
-      let readable = true;
-      // Match body annotation and pr-land publication when arguments repeat.
-      const bodyFile = argv.findLast(a => a.startsWith('--body-file='))?.slice('--body-file='.length);
-      if (bodyFile) {
-        try { body = readPrepBody(bodyFilePath(bodyFile, cwd), 'utf8'); }
-        catch (error) {
-          readable = false;
-          const detail = String(error?.message || error).replace(/[\x00-\x1f\x7f-\x9f]/g, ' ');
-          process.stderr.write(`open-pr: WARNING — prep body unreadable; deferring to existing handling: ${detail}\n`);
-        }
+    let authorBody;
+    // Read once: preparation, annotations and publication must use the same source.
+    try {
+      authorBody = readAuthorBody(argv, cwd, readPrepBody);
+      if (authorBody !== undefined && (typeof authorBody !== 'string' || !authorBody.trim())) {
+        return { outcome: 'refused', reason: 'empty-body', detail: 'Pass --body or --body-file with a non-empty author summary.' };
       }
-      if (readable) {
-        const prep = prepGate(body);
-        if (prep.waived && !checking) logPrepEvent({ kind: 'waiver', detail: prep.reason }, { logPath: prepLogPath });
-        else if (!isPrepExempt(arg('title')) && !prep.ok) {
-          if (prepMode !== 'advise') collect('prep', 'prep-block-missing', prep.reason);
-          if (!checking) logPrepEvent({ kind: 'prep-advisory', detail: prep.reason }, { logPath: prepLogPath });
-          process.stderr.write(`open-pr: prep advisory (rollout pending caller migration) — ${String(prep.reason).replace(/[\x00-\x1f\x7f-\x9f\u2028\u2029]/g, ' ')}\n`);
-        }
+    } catch (error) {
+      return { outcome: 'refused', reason: 'empty-body', detail: `Author body unreadable; restore the selected body file: ${codeSpan(error?.message || error, 300)}` };
+    }
+    if (!argv.includes('--dry-run')) {
+      const body = authorBody ?? '';
+      const prep = prepGate(body);
+      if (prep.waived && !checking) logPrepEvent({ kind: 'waiver', detail: prep.reason }, { logPath: prepLogPath });
+      else if (!isPrepExempt(arg('title')) && !prep.ok) {
+        if (prepMode !== 'advise') collect('prep', 'prep-block-missing', prep.reason);
+        if (!checking) logPrepEvent({ kind: 'prep-advisory', detail: prep.reason }, { logPath: prepLogPath });
+        process.stderr.write(`open-pr: prep advisory (rollout pending caller migration) — ${String(prep.reason).replace(/[\x00-\x1f\x7f-\x9f\u2028\u2029]/g, ' ')}\n`);
       }
     }
     // Pre-PR review gate (card 2): ADDED before the home's own gates, never instead of them (the post-PR review
@@ -250,23 +238,16 @@ export function createPrLandRunner({ canonicalAudit = checkCanonicalAuditForOpen
     if (audit?.sha) argv = [...argv.filter(a => !a.startsWith('--sha=')), `--sha=${audit.sha}`];
     const collectOnly = checking || blockers.length > 0;
     if (collectOnly) argv = [...argv.filter(a => a !== '--check' && a !== '--dry-run'), '--check'];
-    else if (bypass) {
-      try { ({ argv, cleanup: cleanupBody } = withBypassInBody(argv, bypass, cwd)); }
-      catch (e) { return { outcome: 'refused', reason: 'pre-pr-review-bypass-unrecorded', detail: `bypass refused — ${e.message}` }; }
-    }
-    if (audit?.ok && audit.carried) {
-      const c = audit.carried;
-      process.stderr.write(auditCarryNotice(c));
-      if (!collectOnly && argv.some(a => a.startsWith('--body-file='))) {
-        const previousCleanup = cleanupBody;
-        try {
-          const noted = withCarryNoteInBody(argv, auditCarryNote(c), cwd);
-          argv = noted.argv;
-          cleanupBody = () => { noted.cleanup(); previousCleanup(); };
-        } catch (e) {
-          previousCleanup();
-          return { outcome: 'refused', reason: 'audit-carry-unrecorded', detail: e.message };
-        }
+    if (audit?.ok && audit.carried) process.stderr.write(auditCarryNotice(audit.carried));
+    if (!collectOnly && (bypass || audit?.carried)) {
+      if (typeof authorBody !== 'string' || !authorBody.trim()) return {
+        outcome: 'refused', reason: 'empty-body', detail: 'Pass --body or --body-file with a non-empty author summary before adding admission notes.',
+      };
+      try {
+        const note = (bypass ? renderBypassNote(bypass) : '') + (audit?.carried ? auditCarryNote(audit.carried) : '');
+        ({ argv, cleanup: cleanupBody } = withNotesInBody(argv, authorBody, note));
+      } catch (e) {
+        return { outcome: 'refused', reason: bypass ? 'pre-pr-review-bypass-unrecorded' : 'audit-carry-unrecorded', detail: e.message };
       }
     }
     try {

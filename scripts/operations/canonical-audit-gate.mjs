@@ -48,8 +48,10 @@ function openPrAuditEvidence(records, sha, covers = () => true, liveFp = null, a
   const coverMemo = new Map();
   const covered = (base) => { if (!coverMemo.has(base)) coverMemo.set(base, !!covers(base)); return coverMemo.get(base); };
   const rulings = Array.isArray(auditOptions.ruledWeakened) ? auditOptions.ruledWeakened : [auditOptions.ruledWeakened];
+  const usedRulings = new Set();
   const ruled = (record) => rulings.some(gate => {
-    return gate?.ruledWeakened && record.questionHash === QUESTION_HASH
+    if (!/^R\d+(?:\+R\d+)*(?![\s\S])/.test(gate?.ruledWeakened?.ruling)) return false;
+    const matches = gate?.ruledWeakened && record.questionHash === QUESTION_HASH
       // The ruled audit is the gate record's own (exact sha), or the carried audit of the same net diff: readiness
       // appended by an earlier carry names the NEW sha, and must keep binding to the audit it was carried from.
       && (record.head === lowerSha(gate.record?.sha ?? sha)
@@ -57,6 +59,8 @@ function openPrAuditEvidence(records, sha, covers = () => true, liveFp = null, a
       && Array.isArray(record.findings)
       && JSON.stringify(record.findings) === JSON.stringify(gate.ruledWeakened.findings)
       && covered(record.base);
+    if (matches) for (const ruling of gate.ruledWeakened.ruling.split('+')) usedRulings.add(ruling);
+    return matches;
   });
   // Unruled own WEAKENED stops before git; a matching ruling still needs canonical base coverage.
   if (own.some((d) => d.record.verdict === 'WEAKENED' && !ruled(d.record))) return { ok: false, reason: 'weakened' };
@@ -99,7 +103,7 @@ function openPrAuditEvidence(records, sha, covers = () => true, liveFp = null, a
       && list.some((r) => r?.head === record.head && r.base === base && r.questionHash === QUESTION_HASH)) continue;
     if (covered(base) && (!pass || Date.parse(text(record.at)) >= Date.parse(text(pass.at)))) pass = record;
   }
-  return pass ? { ok: true, record: original.get(pass) ?? pass } : { ok: false, reason: 'no-record' };
+  return pass ? { ok: true, record: original.get(pass) ?? pass, rulings: [...usedRulings] } : { ok: false, reason: 'no-record' };
 }
 
 // The shared evaluator skips unusable records. At admission, corrupt evidence must
@@ -197,7 +201,6 @@ export function checkCanonicalAuditForOpen({ repo = process.cwd(), ref, sha, env
     }
     return carryMemo.get(auditedSha);
   };
-  let carryRuling = null;
   let evidence, fp;
   try {
     fp = liveFingerprint(records);
@@ -206,7 +209,7 @@ export function checkCanonicalAuditForOpen({ repo = process.cwd(), ref, sha, env
       const rulings = [];
       for (const entry of config.ruledWeakened) {
         if (entry.ref !== ref || !validSha(entry.sha)
-          || !/^R\d+(?:\+R\d+)*$/.test(entry.ruling) || !Array.isArray(entry.findings)
+          || !/^R\d+(?:\+R\d+)*(?![\s\S])/.test(entry.ruling) || !Array.isArray(entry.findings)
           || !entry.findings.length || !entry.findings.every(f => typeof f === 'string' && f.trim())) continue;
         if (entry.sha.toLowerCase() !== fullSha) {
           if (!carriesAcross(entry.fingerprint, fp)) continue;
@@ -222,10 +225,6 @@ export function checkCanonicalAuditForOpen({ repo = process.cwd(), ref, sha, env
       // All valid waivers participate in the same veto evaluation. Never combine
       // findings or remove records: canonical precedence still judges every audit.
       evidence = openPrAuditEvidence(records, fullSha, covers, fp, { ruledWeakened: rulings });
-      if (evidence.ok && evidence.record.verdict === 'WEAKENED') {
-        carryRuling = rulings.find(gate => gate.record.sha.toLowerCase() === evidence.record.head.toLowerCase()
-          && JSON.stringify(gate.ruledWeakened.findings) === JSON.stringify(evidence.record.findings))?.ruledWeakened.ruling ?? null;
-      }
     }
   } catch (e) {
     // R994: a fingerprint/veto lookup failure refuses; never fall back to an older exact-head pass.
@@ -244,7 +243,7 @@ export function checkCanonicalAuditForOpen({ repo = process.cwd(), ref, sha, env
         message: `Main-merge carry refused: head ${revokedHead} is withdrawn or its withdrawal evidence is unreadable/malformed. Ask the operator to resolve the withdrawal evidence before retrying.` };
       // Judge each merge head/base, including fingerprintless evidence, with
       // canonical eligibility and precedence. Different bases may have separate waivers.
-      const intermediateHeads = new Set(carry.chain.filter(head => head !== fullSha));
+      const intermediateHeads = new Set([carry.from, ...carry.chain.filter(head => head !== fullSha)]);
       const intermediateDecisions = new Map();
       for (const record of records) {
         const head = record.head.toLowerCase(), base = record.base.toLowerCase();
@@ -253,13 +252,13 @@ export function checkCanonicalAuditForOpen({ repo = process.cwd(), ref, sha, env
         if (!intermediateDecisions.has(key)) intermediateDecisions.set(key, { head, records: [] });
         intermediateDecisions.get(key).records.push(record);
       }
-      const provenanceRulings = new Set(carryRuling ? carryRuling.split('+') : []);
+      const provenanceRulings = new Set(evidence.rulings ?? []);
       for (const { head, records: headRecords } of intermediateDecisions.values()) {
         if (canonicalAuditEvidence(headRecords, head, covers).reason !== 'weakened') continue;
         const waiver = config.ruledWeakened.find(entry =>
           entry.ref === ref && validSha(entry.sha) && entry.sha.toLowerCase() === head
           && carriesAcross(entry.fingerprint, fp) && carriesAcross(entry.fingerprint, carry.fingerprint)
-          && /^R\d+(?:\+R\d+)*$/.test(entry.ruling) && Array.isArray(entry.findings)
+          && /^R\d+(?:\+R\d+)*(?![\s\S])/.test(entry.ruling) && Array.isArray(entry.findings)
           && entry.findings.length > 0 && entry.findings.every(f => typeof f === 'string' && f.trim())
           && canonicalAuditEvidence(headRecords, head, covers, null, { ruledWeakened: {
             ruledWeakened: { ruling: entry.ruling, findings: entry.findings },
@@ -272,7 +271,7 @@ export function checkCanonicalAuditForOpen({ repo = process.cwd(), ref, sha, env
       return {
         ok: true, reason: null, message: '', record: evidence.record, sha: fullSha,
         carried: { kind: 'carried-across-main-merge', from: carry.from, to: carry.to,
-          mainParent: carry.mainParent, fingerprint: carry.fingerprint, ruling: [...provenanceRulings].join('+') || null },
+          mainParent: carry.mainParent, fingerprint: carry.fingerprint, rulings: [...provenanceRulings], ruling: [...provenanceRulings].join('+') || null },
       };
     }
   }

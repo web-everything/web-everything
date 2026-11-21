@@ -53,6 +53,25 @@ describe('canonical main merge carry with real git objects', () => {
   it('carries a ruled WEAKENED audit across a merge of origin/main with an unchanged lane diff', () => {
     const f = fixture(); expect(f.run()).toMatchObject({ ok: true, carried: { kind: 'carried-across-main-merge', from: f.A, to: f.head(), mainParent: f.main, fingerprint: f.audit.fingerprint, ruling: 'R123' } });
   });
+  it('records a source waiver even when another passing audit is selected', () => {
+    const f = fixture({ hops: 2 });
+    const intermediate = f.git('rev-parse', 'HEAD~1');
+    f.records.push({ ...f.audit, head: intermediate, verdict: 'NOT WEAKENED', findings: [], at: '2026-11-20T01:00:00Z' });
+    expect(f.run()).toMatchObject({ ok: true, record: f.records.at(-1), carried: { rulings: ['R123'], ruling: 'R123' } });
+  });
+  it('records all required source base rulings with a different passing audit selected', () => {
+    const f = fixture({ hops: 2 });
+    f.records.push({ ...f.audit, base: f.main, findings: ['second source finding'] });
+    f.waivers.push({ ...f.waiver, ruling: 'R124+R125', findings: ['second source finding'] });
+    f.records.push({ ...f.audit, head: f.git('rev-parse', 'HEAD~1'), verdict: 'NOT WEAKENED', findings: [], at: '2026-11-20T01:00:00Z' });
+    expect(f.run()).toMatchObject({ ok: true, carried: { rulings: ['R123', 'R124', 'R125'], ruling: 'R123+R124+R125' } });
+  });
+  it.each([null, '', 'approved', 'R123\n'])('refuses an unnameable source ruling %j despite a different passing audit', ruling => {
+    const f = fixture({ hops: 2 });
+    f.waiver.ruling = ruling;
+    f.records.push({ ...f.audit, head: f.git('rev-parse', 'HEAD~1'), verdict: 'NOT WEAKENED', findings: [], at: '2026-11-20T01:00:00Z' });
+    expect(f.run()).toMatchObject({ ok: false, reason: 'canonical-audit-weakened' });
+  });
   it('carries when the merge resolves test-timings.json with the canonical union', () => { expect(fixture({ union: true }).run().ok).toBe(true); });
   it('carries byte-identical parent-two timings', () => { const f = fixture({ union: true }); f.amend(timings, f.git('show', `${f.main}:${timings}`) + '\n'); expect(f.run().ok).toBe(true); });
   it('refuses a tampered intermediate merge even when the final timings match a parent', () => {
@@ -170,7 +189,7 @@ describe('canonical main merge carry with real git objects', () => {
     const intermediate = f.git('rev-parse', 'HEAD~1');
     f.records.push({ ...f.audit, head: intermediate, findings: ['intermediate finding'], at: '2026-11-20T01:00:00Z' });
     f.waivers.push({ ...f.waiver, sha: intermediate, ruling: 'R124', findings: ['intermediate finding'] });
-    expect(f.run()).toMatchObject({ ok: true, record: f.records.at(-1), carried: { from: intermediate, ruling: 'R124' } });
+    expect(f.run()).toMatchObject({ ok: true, record: f.records.at(-1), carried: { from: intermediate, rulings: ['R123', 'R124'], ruling: 'R123+R124' } });
     const sibling = f.git('commit-tree', f.git('rev-parse', `${f.A}^{tree}`), '-p', f.base, '-m', 'sibling');
     f.records.push({ ...f.audit, head: sibling, at: '2026-11-20T02:00:00Z' });
     expect(f.run()).toMatchObject({ ok: false, reason: 'canonical-audit-weakened' });

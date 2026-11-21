@@ -30,7 +30,7 @@ describe('open-pr prep admission', () => {
       expect(JSON.parse(readFileSync(logPath, 'utf8'))).toMatchObject({ kind: 'prep-advisory', detail: expect.stringContaining('PREP block absent') });
     } finally { stderr.mockRestore(); }
   }, false));
-  it.each(['', prep.replace('missing events', 'TODO'), 'prep: waived — <reason>'])('advises for any unmigrated producer payload without injecting prepGate: %j', (body) => fixture(({ bodyFile, logPath, runner, argv, spawn, review }) => {
+  it.each([prep.replace('missing events', 'TODO'), 'prep: waived — <reason>'])('advises for any unmigrated producer payload without injecting prepGate: %j', (body) => fixture(({ bodyFile, logPath, runner, argv, spawn, review }) => {
     writeFileSync(bodyFile, body);
     const stderr = vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
     try {
@@ -39,6 +39,11 @@ describe('open-pr prep admission', () => {
       expect(stderr).toHaveBeenCalledWith(expect.stringContaining('prep advisory'));
       expect(JSON.parse(readFileSync(logPath, 'utf8')).kind).toBe('prep-advisory');
     } finally { stderr.mockRestore(); }
+  }, false));
+  it.each(['', ' \n\t'])('refuses an empty author body even during prep advisory rollout: %j', body => fixture(({ bodyFile, runner, argv, spawn, review }) => {
+    writeFileSync(bodyFile, body);
+    expect(runner()({ argv })).toMatchObject({ outcome: 'refused', reason: 'empty-body' });
+    expect(spawn).not.toHaveBeenCalled(); expect(review).not.toHaveBeenCalled();
   }, false));
   it('keeps the existing pre-PR refusal active during prep advisory rollout', () => fixture(({ bodyFile, runner, argv, spawn, review }) => {
     writeFileSync(bodyFile, 'No preparation yet.');
@@ -198,20 +203,20 @@ describe('open-pr prep admission', () => {
     expect(runner()({ argv })).toMatchObject({ outcome: 'refused', reason: 'prep-block-missing' });
     expect(spawn).toHaveBeenCalledOnce(); expect(spawn.mock.calls[0][1]).toContain('--check'); expect(review).toHaveBeenCalledOnce();
   }));
-  it('does not read or gate a dry-run', () => fixture(({ runner, argv, spawn }) => {
-    const readPrepBody = vi.fn(() => { throw new Error('must not read'); });
+  it('validates the author body but does not run prep on a dry-run', () => fixture(({ runner, argv, spawn }) => {
+    const readPrepBody = vi.fn(() => prep);
     const prepGate = vi.fn(() => { throw new Error('must not gate'); });
     runner({ readPrepBody, prepGate })({ argv: [...argv, '--dry-run'] });
-    expect(readPrepBody).not.toHaveBeenCalled(); expect(prepGate).not.toHaveBeenCalled(); expect(spawn).toHaveBeenCalledOnce();
+    expect(readPrepBody).toHaveBeenCalledOnce(); expect(prepGate).not.toHaveBeenCalled(); expect(spawn).toHaveBeenCalledOnce();
   }));
-  it('warns and defers unreadable body handling, keeping terminal controls inert', () => fixture(({ runner, argv, spawn }) => {
+  it('refuses unreadable author bodies, keeping terminal controls inert', () => fixture(({ runner, argv, spawn }) => {
     const stderr = vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
     const prepGate = vi.fn();
     try {
-      runner({ readPrepBody: () => { throw new Error('bad\x1b[31m\ninput'); }, prepGate })({ argv });
-      expect(stderr).toHaveBeenCalledWith(expect.stringMatching(/WARNING.*prep body unreadable/));
-      expect(stderr.mock.calls[0][0]).not.toContain('\x1b');
-      expect(prepGate).not.toHaveBeenCalled(); expect(spawn).toHaveBeenCalledOnce();
+      const result = runner({ readPrepBody: () => { throw new Error('bad\x1b[31m\ninput'); }, prepGate })({ argv });
+      expect(result).toMatchObject({ outcome: 'refused', reason: 'empty-body' });
+      expect(result.detail).not.toContain('\x1b');
+      expect(prepGate).not.toHaveBeenCalled(); expect(spawn).not.toHaveBeenCalled();
     } finally { stderr.mockRestore(); }
   }));
   it('keeps the gate and reader injectable for other runner tests', () => fixture(({ runner, argv }) => {

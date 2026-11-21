@@ -108,66 +108,64 @@ Tests: Targeted open-pr audit gate regression.
       expect(spawn.mock.calls[0][1]).toContain('--check');
     } finally { output.mockRestore(); rmSync(dir, { recursive: true, force: true }); }
   });
-  it.each(['', ' \n\t'])('leaves an empty body file untouched so carry cannot bypass the body gate: %j', body => {
-    const dir = mkdtempSync(join(tmpdir(), 'audit-carry-empty-body-'));
-    const path = join(dir, 'body.md');
-    writeFileSync(path, body);
-    const spawn = vi.fn((_cmd, args) => {
-      expect(args).toContain(`--body-file=${path}`);
-      const guard = prCreateBodyGuard(readFileSync(path, 'utf8'));
-      expect(guard).toMatchObject({ ok: false, code: 'empty-body' });
-      return { status: 3, stdout: JSON.stringify({ reason: guard.code }) };
-    });
-    const run = createPrLandRunner({ env: {}, spawn, prepGate: () => ({ ok: true }),
-      prePrReview: () => ({ action: 'pass' }),
-      canonicalAudit: () => ({ ok: true, carried: { from: base, to: sha, fingerprint: 'f'.repeat(64) } }) });
+  it.each(['carry', 'bypass', 'combined'])('refuses every empty author body before %s annotations', kind => {
+    const dir = mkdtempSync(join(tmpdir(), 'empty-author-body-'));
+    const first = join(dir, 'first.md'), last = join(dir, 'last.md'), missing = join(dir, 'missing.md');
+    writeFileSync(first, 'First body');
+    const spawn = vi.fn();
+    const prepGate = vi.fn(() => ({ ok: true }));
+    const run = createPrLandRunner({ env: {}, spawn, prepGate,
+      prePrReview: () => ({ action: 'pass', ...(kind !== 'carry' ? { bypass: { actor: 'operator', reason: 'approved', operatorInstruction: 'approved' } } : {}) }),
+      canonicalAudit: () => ({ ok: true, ...(kind !== 'bypass' ? { carried: { from: base, to: sha, fingerprint: 'f'.repeat(64) } } : {}) }) });
     try {
-      expect(run({ argv: ['--ref=lane/audit', `--body-file=${path}`] })).toMatchObject({ outcome: 'refused', reason: 'empty-body' });
-      expect(spawn).toHaveBeenCalledOnce();
-      expect(readFileSync(path, 'utf8')).toBe(body);
+      for (const body of ['', ' \n\t']) {
+        writeFileSync(last, body);
+        for (const args of [
+          [`--body=Earlier body`, `--body=${body}`],
+          [`--body-file=${first}`, '--body=Inline fallback', `--body-file=${last}`],
+          [`--body-file=${first}`, `--body-file=${missing}`, '--body=Inline fallback'],
+        ]) {
+          expect(run({ argv: ['--ref=lane/audit', ...args] })).toMatchObject({ outcome: 'refused', reason: 'empty-body' });
+        }
+        expect(readFileSync(last, 'utf8')).toBe(body);
+      }
+      expect(spawn).not.toHaveBeenCalled();
+      expect(prepGate).not.toHaveBeenCalled();
     } finally { rmSync(dir, { recursive: true, force: true }); }
   });
-  it('logs carry provenance without a body file and leaves argv untouched', () => {
-    const output = vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
-    try {
-      const { run, spawn } = runner(() => ({ ok: true, carried: { from: base, to: sha, fingerprint: 'f'.repeat(64) } }));
-      expect(run({ argv: ['--ref=lane/audit'] }).outcome).toBe('opened');
-      expect(spawn.mock.calls[0][1].slice(1)).toEqual(['--ref=lane/audit', '--json']);
-      expect(output).toHaveBeenCalledWith(`carried-across-main-merge ${base.slice(0, 8)}..${sha.slice(0, 8)} fp ffffffff ruling none\n`);
-    } finally { output.mockRestore(); }
-  });
-  it('preserves main bypass refusal when no body file is supplied', () => {
-    const spawn = vi.fn();
-    const run = createPrLandRunner({ env: {}, spawn, prepGate: () => ({ ok: true }),
-      prePrReview: () => ({ action: 'pass', bypass: { actor: 'operator', reason: 'approved', operatorInstruction: 'approved' } }),
-      canonicalAudit: () => ({ ok: true }) });
-    expect(run({ argv: ['--ref=lane/audit'] })).toMatchObject({ outcome: 'refused', reason: 'pre-pr-review-bypass-unrecorded',
-      detail: 'bypass refused — the request has no --body-file, so the bypass cannot be recorded in the PR body' });
-    expect(spawn).not.toHaveBeenCalled();
-  });
-  it.each(['', 'Author body\n'])('annotates the last duplicate body file consumed by pr-land for bypass: %j', body => {
-    const dir = mkdtempSync(join(tmpdir(), 'bypass-main-body-'));
+  it.each(['inline', 'file'])('prepares, annotates and publishes the same last nonempty %s body', source => {
+    const dir = mkdtempSync(join(tmpdir(), 'author-body-notes-'));
     const first = join(dir, 'first.md'), last = join(dir, 'last.md');
-    writeFileSync(first, 'First body\n'); writeFileSync(last, body);
+    const body = 'Author summary\nSecond line\n';
+    writeFileSync(first, 'First body'); writeFileSync(last, body);
     const bypass = { actor: 'operator', reason: 'approved', operatorInstruction: 'approved' };
-    let copied;
+    const carried = { from: base, to: sha, fingerprint: 'f'.repeat(64), ruling: 'R123' };
+    const prepGate = vi.fn(value => { expect(value).toBe(body); return { ok: true }; });
     const spawn = vi.fn((_cmd, args) => {
-      const files = args.filter(a => a.startsWith('--body-file='));
-      expect(files).toHaveLength(2);
-      expect(files[0]).toBe(`--body-file=${first}`);
-      copied = files.at(-1).slice('--body-file='.length);
-      expect(readFileSync(copied, 'utf8')).toBe(body + renderBypassNote(bypass));
+      const path = args.findLast(a => a.startsWith('--body-file=')).slice('--body-file='.length);
+      const published = readFileSync(path, 'utf8');
+      expect(published).toContain(body + renderBypassNote(bypass));
+      expect(published).toContain('<!-- audit-carry:');
+      expect(prCreateBodyGuard(published)).toEqual(prCreateBodyGuard(body));
       return { status: 0, stdout: '{"pr":7}' };
     });
+    const run = createPrLandRunner({ env: {}, spawn, prepGate,
+      prePrReview: () => ({ action: 'pass', bypass }), canonicalAudit: () => ({ ok: true, carried }) });
+    try {
+      const args = source === 'inline' ? ['--body=First body', `--body=${body}`]
+        : [`--body-file=${first}`, `--body-file=${last}`, '--body=Ignored inline body'];
+      expect(run({ argv: ['--ref=lane/audit', ...args] }).outcome).toBe('opened');
+      expect(spawn).toHaveBeenCalledOnce(); expect(prepGate).toHaveBeenCalledOnce();
+      expect(readFileSync(last, 'utf8')).toBe(body);
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+  it.each(['actor', 'reason', 'operatorInstruction'])('refuses a bypass %s that would make a valid body fail the publisher guard', field => {
+    const bypass = { actor: 'operator', reason: 'approved', operatorInstruction: 'approved', [field]: 'Fixes #123' };
+    const spawn = vi.fn();
     const run = createPrLandRunner({ env: {}, spawn, prepGate: () => ({ ok: true }),
       prePrReview: () => ({ action: 'pass', bypass }), canonicalAudit: () => ({ ok: true }) });
-    try {
-      expect(run({ argv: ['--ref=lane/audit', `--body-file=${first}`, `--body-file=${last}`] }).outcome).toBe('opened');
-      expect(spawn).toHaveBeenCalledOnce();
-      expect(readFileSync(first, 'utf8')).toBe('First body\n');
-      expect(readFileSync(last, 'utf8')).toBe(body);
-      expect(() => readFileSync(copied)).toThrow();
-    } finally { rmSync(dir, { recursive: true, force: true }); }
+    expect(run({ argv: ['--ref=lane/audit', '--body=Author summary'] })).toMatchObject({ outcome: 'refused', reason: 'pre-pr-review-bypass-unrecorded' });
+    expect(spawn).not.toHaveBeenCalled();
   });
   it('fails closed if the check child dies or returns an opened payload', () => {
     for (const child of [{ error: new Error('spawn failed') }, { status: 0, stdout: '{"pr":7}' },
@@ -187,7 +185,7 @@ function runner(canonicalAudit) {
 
 // Keep both producers' default checker. Replace only filesystem/process effects in a child,
 // never the checker or evaluator; no real Git, credentials, network, or .git writes.
-function defaultProducer({ direct = false, dry = false, check = false, failMain = false, carry = false, records = [] } = {}) {
+function defaultProducer({ direct = false, dry = false, check = false, failMain = false, carry = false, bodyVariant, records = [] } = {}) {
   const dir = mkdtempSync(join(tmpdir(), 'default-audit-gate-'));
   const trace = join(dir, 'effects.jsonl');
   const preload = join(dir, 'effects.mjs');
@@ -232,6 +230,15 @@ function defaultProducer({ direct = false, dry = false, check = false, failMain 
     syncBuiltinESMExports();
   `);
   const argv = [`--repo=${dir}`, '--ref=lane/audit', `--sha=${sha}`, '--title=docs: update guide', '--body=Documentation update', '--json', ...(dry ? ['--dry-run'] : []), ...(check ? ['--check'] : [])];
+  if (bodyVariant) {
+    const first = join(dir, 'first.md'), last = join(dir, bodyVariant === 'newline file path' ? 'last.md\n' : 'last.md');
+    writeFileSync(first, 'Earlier author summary');
+    if (bodyVariant === 'newline file path') writeFileSync(last.trimEnd(), 'Nonempty path decoy');
+    if (bodyVariant !== 'missing file') writeFileSync(last, bodyVariant === 'whitespace file' ? ' \n\t' : '');
+    argv.push(...(bodyVariant.includes('file')
+      ? [`--body-file=${first}`, `--body-file=${last}`, '--body=Ignored inline fallback']
+      : [`--body=${bodyVariant === 'multiline' ? 'Author summary\nSecond line' : bodyVariant === 'whitespace inline' ? ' \n\t' : ''}`]));
+  }
   let entry = join(root, 'scripts/pr-land.mjs');
   if (!direct) {
     entry = join(dir, 'open.mjs');
@@ -314,6 +321,23 @@ describe('default canonical checker integration', () => {
     expect(stderr).toContain(`carried-across-main-merge bbbbbbbb..aaaaaaaa fp ${fingerprint.slice(0, 8)} ruling none\n`);
     expect(result.plan.find(line => line.startsWith('gh '))).toContain(`<!-- audit-carry: carried-across-main-merge ${base}..${sha} -->`);
   });
+  it.each(['empty inline', 'whitespace inline', 'empty file', 'whitespace file', 'missing file', 'newline file path'])('direct CLI refuses %s before carry annotation', bodyVariant => {
+    const fingerprint = normalizeDiffFingerprint('diff --git a/docs/guide.md b/docs/guide.md\n+documentation only\n');
+    const record = { head: base, base: 'c'.repeat(40), fingerprint, questionHash: QUESTION_HASH,
+      at: '2026-11-17T00:00:00Z', verdict: 'NOT WEAKENED', findings: [] };
+    const { status, result, stderr } = defaultProducer({ direct: true, dry: true, carry: true, bodyVariant, records: [record] });
+    expect(status).toBe(3); expect(result.reason).toBe('empty-body');
+    expect(stderr).not.toContain('carried-across-main-merge');
+  });
+  it('direct CLI preserves a multiline inline body through carry annotation and publication planning', () => {
+    const fingerprint = normalizeDiffFingerprint('diff --git a/docs/guide.md b/docs/guide.md\n+documentation only\n');
+    const record = { head: base, base: 'c'.repeat(40), fingerprint, questionHash: QUESTION_HASH,
+      at: '2026-11-17T00:00:00Z', verdict: 'NOT WEAKENED', findings: [] };
+    const { status, result } = defaultProducer({ direct: true, dry: true, carry: true, bodyVariant: 'multiline', records: [record] });
+    expect(status).toBe(0); expect(result.reason).toBe('dry-run');
+    expect(result.plan.find(line => line.startsWith('gh '))).toContain('Author summary');
+    expect(result.plan.find(line => line.startsWith('gh '))).toContain('Second line');
+  });
   it('direct pr-land default checker admits an audited unpublished local head in dry-run', () => {
     const record = { head: sha, base, questionHash: QUESTION_HASH, at: '2026-11-17T00:00:00Z', verdict: 'NOT WEAKENED', findings: [] };
     const { status, result, effects } = defaultProducer({ direct: true, dry: true,
@@ -362,6 +386,23 @@ describe('direct pr-land canonical gate seam', () => {
     const refuse = vi.fn();
     admitCanonicalAudit({ repo: '/repo', ref: 'lane/audit', sha }, { check: () => ({ ok: false, reason, message }), refuse });
     expect(refuse).toHaveBeenCalledWith({ repo: '/repo', merged: false, reason, detail: message }, 3);
+  });
+  it.each([undefined, null, '', ' \n\t'])('refuses empty direct author body %j before carry annotation', body => {
+    const refuse = vi.fn(), write = vi.fn();
+    const result = admitCanonicalAudit({ sha, body: 'Generated manifest', authorBody: body }, {
+      check: () => ({ ok: true, carried: { from: base, to: sha, fingerprint: 'f'.repeat(64) } }), refuse, write,
+    });
+    expect(result).toMatchObject({ ok: false, reason: 'empty-body' });
+    expect(refuse).toHaveBeenCalledWith(expect.objectContaining({ reason: 'empty-body' }), 3);
+    expect(write).not.toHaveBeenCalled(); expect(result.body).toBeUndefined();
+  });
+  it('direct annotation preserves a valid multiline author body and its guard verdict', () => {
+    const body = 'Author summary\nSecond line';
+    const result = admitCanonicalAudit({ sha, body }, {
+      check: () => ({ ok: true, carried: { from: base, to: sha, fingerprint: 'f'.repeat(64) } }), refuse: vi.fn(), write: vi.fn(),
+    });
+    expect(result.body).toContain(body + '\n<!-- audit-carry:');
+    expect(prCreateBodyGuard(result.body)).toEqual(prCreateBodyGuard(body));
   });
   it('green evidence does not emit a refusal', () => {
     const refuse = vi.fn();

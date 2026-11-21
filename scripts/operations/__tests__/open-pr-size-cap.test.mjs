@@ -20,7 +20,7 @@ function wrapper(overrides = {}) {
   const diffStat = vi.fn(() => text);
   const fileItem = vi.fn(() => card);
   const spawn = vi.fn(() => ({ status: 0, stdout: JSON.stringify(opened) }));
-  const run = openPrIo.createPrLandRunner({ canonicalAudit: () => ({ ok: true }), prepGate: () => ({ ok: true }), readPrepBody: () => '', prePrReview: () => ({ action: 'pass' }),
+  const run = openPrIo.createPrLandRunner({ canonicalAudit: () => ({ ok: true }), prepGate: () => ({ ok: true }), readPrepBody: readFileSync, prePrReview: () => ({ action: 'pass' }),
     diffStat, fileItem, spawn, dupBornAs: () => [], env: {}, ...overrides });
   return { run, diffStat, fileItem, spawn };
 }
@@ -371,6 +371,7 @@ describe('open-pr delegates size admission to the direct producer', () => {
         reason: 'operator reason', actor: 'operator', operatorInstruction: 'Ship this change',
       } }) });
       expect(run({ argv: [...argv, `--body-file=${bodyFile}`] })).toMatchObject(opened);
+      expect(body.startsWith(request.body)).toBe(true);
       expect(body).toContain('operator reason');
       expect(spawn).toHaveBeenCalledTimes(1);
     } finally { rmSync(dir, { recursive: true, force: true }); }

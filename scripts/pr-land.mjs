@@ -103,6 +103,11 @@ export function admitCanonicalAudit(request, { check = checkCanonicalAuditForOpe
   const gate = check(request);
   if (!gate.ok) refuse({ repo: request.repo, merged: false, reason: gate.reason, detail: gate.message }, 3);
   if (gate.ok && gate.carried) {
+    const bodyGuard = prCreateBodyGuard(Object.hasOwn(request, 'authorBody') ? request.authorBody : request.body);
+    if (!bodyGuard.ok) {
+      refuse({ repo: request.repo, merged: false, reason: bodyGuard.code, detail: bodyGuard.reason }, 3);
+      return { ok: false, reason: bodyGuard.code, message: bodyGuard.reason };
+    }
     write(auditCarryNotice(gate.carried));
     if (typeof request.body === 'string' && request.body.trim()) {
       const note = auditCarryNote(gate.carried);
@@ -162,16 +167,12 @@ import { laneRelevantChangeSinceForRecord } from './lib/verify-lane-gate.mjs'; /
 const argv = process.argv.slice(2);
 const flags = {};
 for (const a of argv) {
-  const m = a.match(/^--([^=]+)(?:=(.*))?$/);
-  if (m) { flags[m[1]] = m[2] === undefined ? true : m[2]; continue; }
-  // #3690 — keep malformed multiline --delegation values visible to bad-delegation validation;
-  // scope this exception to that flag so every other flag retains its ordinary non-dotAll parsing.
-  const md = a.match(/^--delegation=([\s\S]*)$/);
-  if (md) flags.delegation = md[1];
+  // Multiline author text must survive parsing, including whitespace-only bodies.
+  const m = a.match(/^--(body|body-file|delegation)=([\s\S]*)$/) ?? a.match(/^--([^=]+)(?:=(.*))?$/);
+  if (m) flags[m[1]] = m[2] === undefined ? true : m[2];
 }
 const expandHome = (p) => (p && p.startsWith('~') ? p.replace(/^~/, homedir()) : p);
-// Read a PR body from a file (the #2170 lane-review-composed body). Missing/unreadable → null (falls back
-// to gh's --fill), never a hard failure: a body-file problem must not block a green landing.
+// Read the selected author body. Missing/unreadable → null; create and carry-annotation guards refuse it.
 function readBodyFile(p) {
   try { return readFileSync(expandHome(p), 'utf8'); } catch { return null; }
 }
@@ -923,7 +924,7 @@ async function runCli() {
   };
   if (!refSha) emit({ repo: REPO, merged: false, reason: 'no-such-src', detail: `source commit "${SRC}" not found — pass --sha=<commit> or run from a checkout whose HEAD carries the lane work` }, 3);
 
-  const canonicalAudit = admitCanonicalAudit({ repo: REPO, ref: REF, sha: refSha, refreshMain: CHECK, body: CREATE_BODY }, {
+  const canonicalAudit = admitCanonicalAudit({ repo: REPO, ref: REF, sha: refSha, refreshMain: CHECK, body: CREATE_BODY, authorBody: BODY }, {
     refuse: DRY_RUN ? emit : result => collect('canonical-audit', result.reason, result.detail, refSha),
   });
 
