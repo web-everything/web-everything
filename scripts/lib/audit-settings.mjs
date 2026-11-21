@@ -249,6 +249,8 @@ export const LOCK_USERS = Object.freeze([
   'scripts/conveyor/auto-round-grant-io.mjs', 'scripts/conveyor/await-verify-loop.mjs',
   'scripts/conveyor/await-verify.mjs', 'scripts/conveyor/build-dispatch-claim.mjs',
   'scripts/conveyor/build-dispatch-hold-router.mjs', 'scripts/conveyor/build-dispatch-orphan-adopt.mjs',
+  // The CI-heal child reserves its cycle lock through file-locks.mjs.
+  'scripts/conveyor/ci-heal-loop.mjs',
   'scripts/conveyor/fix-claim-store.mjs', 'scripts/conveyor/fix-dispatch-claim.mjs',
   'scripts/conveyor/fix-procedure.mjs', 'scripts/conveyor/fixer-stuck-reclaim.mjs',
   'scripts/conveyor/health-responder.mjs', 'scripts/conveyor/land-overlap-yield.mjs',
