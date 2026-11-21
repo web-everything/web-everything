@@ -1000,6 +1000,31 @@ describe('runCodexDirectExec / codexDirectTask — the orchestrator, over an inj
     return { fn, seen };
   }
 
+  it.each([false, true])('omits undefined env and reports exactly the spawned argv (review: %s)', async review => {
+    const dir = mkdtempSync(join(tmpdir(), 'we-direct-env-contract-'));
+    const { fn, seen } = fakeSpawn('{}\n');
+    const env = { ...process.env, OMIT: undefined, EMPTY: '' };
+    try {
+      const result = await runCodexDirectExec({ dir, gitDir: dir, task: 'fixture', review, env,
+        logFile: join(dir, 'events.jsonl'), stream: false, spawnFn: fn });
+      expect(seen.opts.env).not.toHaveProperty('OMIT');
+      expect(seen.opts.env.EMPTY).toBe('');
+      expect(result.argv).toEqual(seen.argv);
+      expect(env).toHaveProperty('OMIT', undefined);
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+
+  it('refuses null env values at the direct-task boundary before spawn', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'we-direct-null-env-'));
+    const spawnFn = vi.fn();
+    try {
+      await expect(runCodexDirectExec({ dir, gitDir: dir, task: 'fixture',
+        env: { ...process.env, INVALID: null }, logFile: join(dir, 'events.jsonl'), stream: false,
+        spawnFn })).rejects.toThrow(/env\.INVALID must be a NUL-free string or undefined/);
+      expect(spawnFn).not.toHaveBeenCalled();
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+
   it('awaits the async gate again after a self-review repair and omits the output schema on resume', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'we-direct-regate-'));
     const builderId = '12345678-1234-4234-8234-123456789abc';

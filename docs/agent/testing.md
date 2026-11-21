@@ -5249,6 +5249,13 @@ the payload cannot execute. Other environment narrowing remains deferred to S1e.
 It never merges the ambient environment. The differential
 matrix in `agent-launch.test.mjs` compares review and edit runs with main's env formula,
 including HOME, Git/gh isolation, policy sources, roots, gates, and retry limits.
+Keep the transport-policy matrix behavioral: compare real Git operations under the
+caller env and the env handed to spawn, for global and per-transport `never`, `user`,
+and `always` with `GIT_PROTOCOL_FROM_USER=0` and `1` in review and edit modes.
+Use local remote helpers for HTTP, HTTPS and an unknown transport so both permitted
+and refused cases are deterministic without network access. A parent refusal must
+remain a child refusal. Pin undefined omission, null refusal and reported/spawned
+argv equality at the direct-task boundary as well.
 Edit PATH is the heavy-admission shim followed by the caller PATH in its original
 order, minus empty entries and that shim; review PATH and TMP remain untouched.
 Both Codex PATHs match main. The checked-in six-case argv golden comes from

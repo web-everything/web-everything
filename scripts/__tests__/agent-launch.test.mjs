@@ -74,6 +74,41 @@ describe('B1/B2 caller environment follows main except runtime injection, withou
     const io = seam(); launchAgent({ ...base(), env }, io);
     expect(io.spawn.mock.calls[0][2].env).toEqual({ PATH: bin, EMPTY: '', HOME: '/caller-home' });
   });
+  for (const review of [false, true]) it(`preserves ambient user restrictions for normally allowed transports (review=${review})`, () => {
+    // Local remote helpers implement only capabilities/list, so permitted operations
+    // succeed without a network connection or a Git repository.
+    const helper = '#!/bin/sh\nread command || exit 1\n[ "$command" = capabilities ] || exit 1\nprintf "\\n"\nread command || exit 1\n[ "$command" = list ] || exit 1\nprintf "\\n"\nread command\nexit 0\n';
+    for (const transport of ['http', 'https', 'fixture']) {
+      writeFileSync(join(bin, `git-remote-${transport}`), helper, { mode: 0o755 });
+      for (const key of ['protocol.allow', `protocol.${transport}.allow`]) {
+        for (const policy of ['never', 'user', 'always']) {
+          for (const fromUser of ['0', '1']) {
+            const env = { PATH: `${bin}:/usr/bin:/bin`, GIT_EXEC_PATH: bin,
+              GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: '/dev/null', GIT_CONFIG_SYSTEM: '/dev/null',
+              GIT_CONFIG_COUNT: '1', GIT_CONFIG_KEY_0: key, GIT_CONFIG_VALUE_0: policy,
+              GIT_PROTOCOL_FROM_USER: fromUser, GIT_TERMINAL_PROMPT: '0' };
+            const probe = childEnv => spawnSync('git', ['ls-remote', `${transport}::fixture`], {
+              cwd: root, env: childEnv, encoding: 'utf8', timeout: 2000, maxBuffer: 8192,
+            });
+            const expected = policy === 'always' || (policy === 'user' && fromUser === '1');
+            const parent = probe(env);
+            const io = seam();
+            io.spawn.mockImplementation((_file, _args, options) => probe(options.env));
+            const child = launchAgent(buildCodexDirectTaskDescriptor({ cwd: root, env, review }), io);
+            const label = `${key}=${policy}, fromUser=${fromUser}, review=${review}`;
+            for (const result of [parent, child]) {
+              expect(result.error, label).toBeUndefined();
+              expect(result.status, label).toBe(expected ? 0 : 128);
+              if (!expected) expect(result.stderr, label).toContain(`transport '${transport}' not allowed`);
+            }
+            expect(child.status, label).toBe(parent.status);
+            expect(io.spawn.mock.calls[0][2].env.GIT_PROTOCOL_FROM_USER).toBe(fromUser);
+            expect(io.spawn.mock.calls[0][2].env.GIT_CONFIG_VALUE_0).toBe(policy);
+          }
+        }
+      }
+    }
+  });
   it('refuses legacy inherit fields, env accessors and env proxies before IO', () => {
     refused({ ...base(), inheritEnv: {} }, /inheritEnv/);
     refused({ ...base(), inheritEnvComplete: true }, /inheritEnvComplete/);
