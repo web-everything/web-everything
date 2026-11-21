@@ -241,6 +241,20 @@ describe('atomic birth numbering', () => {
     expect(r.calls.filter((a) => a[0] === 'push')).toHaveLength(1);
   });
 
+  it.each(['xaaaaaa', 'xbbbbbb'])('replays 041 below main max 043 only when claim.id matches (%s)', (claimId) => {
+    const r = remote();
+    const raw = JSON.stringify({ id: claimId, num: '041', owner: 'earlier-host', timestamp: '2026-11-21T00:00:00.000Z' }) + '\n';
+    const oid = r.git(['hash-object', '-w', '--stdin'], { input: raw }).trim();
+    r.refs.set('refs/card-ids/xaaaaaa', oid);
+    r.refs.set('refs/number-reservations/041', oid);
+    const git = (args, extra) => args[0] === 'ls-tree'
+      ? 'backlog/042-main.md\0backlog/043-main.md\0' : r.git(args, extra);
+    const reserve = () => reserveCardNumber({ id: 'xaaaaaa', git });
+    if (claimId === 'xaaaaaa') expect(reserve()).toBe('041');
+    else expect(reserve).toThrow('invalid card-id reservation');
+    expect(r.calls.filter((args) => args[0] === 'push')).toHaveLength(0);
+  });
+
   it('two ids get two numbers and each has a create-only card-ids mapping', () => {
     const r = remote();
     const a = allocateCardNumber({ ...fixture('xaaaaaa'), git: r.git });
@@ -564,6 +578,24 @@ it.each(['fetch', 'ls-tree', 'truncated-tree', 'ls-remote'])('cleans up private 
   const ref = calls.find(([cmd]) => cmd === 'fetch').find((arg) => arg.startsWith('refs/heads/main:'))?.split(':')[1];
   expect(ref).toMatch(/^refs\/tmp\/numbering-/);
   expect(calls).toContainEqual(['update-ref', '-d', ref]);
+});
+
+it.each(['fetch', 'truncated-tree'])('fails closed with high-water mark unavailable and no reservation push after %s', (failure) => {
+  const git = vi.fn((args) => {
+    if (args[0] === 'fetch' && args.at(-1).startsWith('refs/heads/main:refs/tmp/numbering-')) {
+      if (failure === 'fetch') throw Error('injected snapshot fetch failure');
+      return '';
+    }
+    if (args[0] === 'ls-tree') return 'backlog/043-main.md';
+    return '';
+  });
+  expect(() => readNumberingEvidence(git)).toThrow(failure === 'fetch'
+    ? /high-water mark unavailable: injected snapshot fetch failure/
+    : /high-water mark unavailable: truncated backlog tree/);
+  const ref = git.mock.calls.find(([args]) => args[0] === 'fetch')[0].at(-1).split(':')[1];
+  expect(ref).toMatch(/^refs\/tmp\/numbering-/);
+  expect(git).toHaveBeenCalledWith(['update-ref', '-d', ref]);
+  expect(git.mock.calls.some(([args]) => args[0] === 'push')).toBe(false);
 });
 
 it('refuses allocation when private evidence ref cleanup fails', () => {
