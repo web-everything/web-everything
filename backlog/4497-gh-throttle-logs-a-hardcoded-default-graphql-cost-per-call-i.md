@@ -6,8 +6,8 @@ parent: "3861"
 status: open
 scope: ["we:scripts/lib/gh-throttle.mjs", "we:scripts/lib/__tests__/gh-throttle.test.mjs", "we:scripts/lib/__tests__/gh-throttle.budget-block.test.mjs", "we:scripts/lib/__tests__/gh-throttle.fidelity.test.mjs"]
 dateOpened: "2026-09-29"
-preparedDate: "2026-11-17"
-preparedAgainstSha: "aa1a1df38b5e3ff8216c4d757d4f70cccb43b192"
+preparedDate: "2026-11-20"
+preparedAgainstSha: "d12688ce238e1ca4c303eb13ed22680d9587c11b"
 tags: []
 ---
 
@@ -75,3 +75,5 @@ All four RED/GREEN tests and the scoped existing suites must pass after implemen
 ## Follow-ups
 
 Preserving response evidence currently dropped for absent rate-limit headers, increasing explicit-cost coverage for queries that do not return `rateLimit.cost`, changing report presentation, and measuring production capture coverage are separate work. Do not silently rewrite queries, enable extra requests, or relabel counter deltas as caller costs in this item. No follow-up is required to ship the bounded logging improvement.
+
+revalidated: The diff adds command timing around execFileSyncThrottled without changing cost capture, ledger enrichment, budget blocking, or the preparation’s scoped test and proof plans.
