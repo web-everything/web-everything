@@ -128,3 +128,10 @@ it('the recovered CI soak resolves repository slugs without losing its cross-rep
   expect(report.mainReads).toHaveLength(1);
   expect(report.crossRepoWrites).toEqual([]);
 }, 30_000);
+
+it('the red-team reserve soak uses a repository-neutral fixture and preserves first-tick capacity checks', async () => {
+  const file = 'scripts/conveyor/soak/breaks/red-team-reserve-first-tick.mjs';
+  expect(scanMultiRepo(read(file))).toEqual([]);
+  const { default: scenario } = await import('../conveyor/soak/breaks/red-team-reserve-first-tick.mjs');
+  expect(scenario.judge(await scenario.run())).toEqual([]);
+}, 30_000);
