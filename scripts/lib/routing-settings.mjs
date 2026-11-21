@@ -51,7 +51,7 @@ export function resolveRoutingSettings({ env = process.env, repo, declared } = {
 }
 
 /** Explicit builders are unchanged; auto scores capacity and retains the threshold fallback when all usage is unknown. */
-export function effectiveBuilder({ env = process.env, repo, declared, quota = readCodexQuota, kind = 'build', capacity, now = Date.now(), records, routeKey, queuedDemand = 0, demandRatePerHour, record = recordCapacityDecision } = {}) {
+export function effectiveBuilder({ env = process.env, repo, declared, quota = readCodexQuota, kind = 'build', capacity, now = Date.now(), records, routeKey, disabledProviders = [], queuedDemand = 0, demandRatePerHour, record = recordCapacityDecision } = {}) {
   const s = resolveRoutingSettings({ env, ...(repo ? { repo } : {}), ...(declared ? { declared } : {}) });
   if (s.builder !== 'auto') return { builder: s.builder, source: s.source, settings: s };
   let q;
@@ -60,7 +60,7 @@ export function effectiveBuilder({ env = process.env, repo, declared, quota = re
   // Unreadable quota is not "below threshold": the quota-safe direction is claude.
   const fallback = used !== null && used < s.autoClaudeAbovePercent ? 'codex' : 'claude';
   if (!s.capacity.enabled) return { builder: fallback, source: 'auto', usedPercent: used, settings: s };
-  const planning = { ...s.capacity, routeKey, queuedDemand, demandRatePerHour };
+  const planning = { ...s.capacity, routeKey, disabledProviders, queuedDemand, demandRatePerHour };
   const capacities = launcherCapacity(capacity ?? observeCapacity({ env, now, settings: s.capacity, quota: () => q, records }), s.capacity);
   const decision = chooseBuilder({ kind, capacities, settings: { ...planning, now }, fallback });
   try { record(decision, { env, now, kind, capacities, settings: planning }); } catch { /* best effort */ }

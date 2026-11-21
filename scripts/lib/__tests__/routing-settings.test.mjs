@@ -349,18 +349,23 @@ it('operator reading age defaults to 24h and resolves platform, tool and environ
 });
 
 
-it('capacity projection preserves disabled providers, configured effort and model while excluding unobserved fallbacks', () => {
+it.each(['codex', 'agy-claude'])('capacity selection honours disabled %s and preserves eligible route controls', disabled => {
   settingsDir({ 'routing.json': { routing: { builder: 'auto' } } });
   const policy = structuredClone(readRoutingPolicy());
-  policy.operations.build.disabledProviders = ['codex'];
+  policy.operations.build.disabledProviders = [disabled];
   policy.operations.build.effort = 'max';
   const now = Date.parse('2026-11-19T12:00:00Z');
   const result = resolveDispatchRoute({ kind: 'build', ...SCOPED, taskType: 'build-new-feature' }, { env: {}, now, routingPolicy: policy,
     capacity: [{ provider: 'codex', model: 'gpt-6-astra', known: true, health: 1, windows: [{ usedPercent: 10, resetsAt: now + 3600000 }] }] });
+  if (disabled === 'codex') {
+    expect(result).toMatchObject({ outcome: 'refused', refusal: expect.stringContaining('no eligible capacity') });
+    expect(state.seen).toEqual([]);
+    return;
+  }
   const projected = state.seen.at(-1).routingPolicy;
   expect(projected.operations.build).toEqual({ ...policy.operations.build, fallback: [] });
-  expect(projected.operations['build:build-new-feature']).toMatchObject({ provider: 'codex', model: 'sol', disabledProviders: ['codex'], effort: 'max' });
-  expect(result.executed).not.toBe('codex');
+  expect(projected.operations['build:build-new-feature']).toMatchObject({ provider: 'codex', model: 'sol', disabledProviders: [disabled], effort: 'max' });
+  expect(result).toMatchObject({ outcome: 'routed', executed: 'codex' });
 });
 
 it('prepare capacity projection never overwrites prepare-decision or non-build policy', () => {

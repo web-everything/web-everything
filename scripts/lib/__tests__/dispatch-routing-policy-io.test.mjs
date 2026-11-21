@@ -3,7 +3,7 @@ import { mkdtempSync, writeFileSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { chooseBuilder, readProviderCapacity } from '../provider-capacity.mjs';
-import { DEFAULT_ROUTING_POLICY } from '../dispatch-routing-policy.mjs';
+import { DEFAULT_ROUTING_POLICY, validateRoutingPolicy } from '../dispatch-routing-policy.mjs';
 import { createRoutingPolicyReader, resolveOperationRoute, resolveDispatchRoute } from '../dispatch-routing-policy-io.mjs';
 
 const dirs = [];
@@ -144,6 +144,74 @@ it.each([false, true])('retains the eligible Claude route when capacity projects
     .toMatchObject({ outcome: 'refused' });
   policy.operations.fix.disabledProviders = ['claude'];
   expect(resolveDispatchRoute(dispatch, options)).toMatchObject({ outcome: 'refused' });
+});
+
+it('excludes a policy-disabled Claude capacity winner before reserving Codex for audits', () => {
+  const now = Date.parse('2026-11-20T15:00:00Z');
+  const capacity = readProviderCapacity({ env: { WE_CAPACITY_READERS: 'off' }, now,
+    settings: { claudeUsageAccount: 'claude-a' }, readers: {
+      codex: () => ({ at: now, used_percent: 20, resets_at: now + 120 * 3600000 }),
+      claude: () => ({ at: now, seven_day: { usedPercent: 10, resetsAt: now + 2 * 3600000 } }),
+    } });
+  const policy = structuredClone(DEFAULT_ROUTING_POLICY);
+  policy.operations['prepare-item'].disabledProviders = ['claude'];
+  validateRoutingPolicy(policy);
+  const dispatch = { kind: 'prepare-item', size: 3, scopePaths: ['we:scripts/example.mjs'] };
+  const record = vi.fn();
+  const options = { env: {}, repo: { routing: { builder: 'auto', capacity: { claudeUsageAccount: 'claude-a' } } },
+    routingPolicy: policy, capacity, now, quota: () => ({ used_percent: 20 }), record, scorecards: [] };
+  expect(chooseBuilder({ kind: dispatch.kind, capacities: capacity, settings: { now }, fallback: null }).provider).toBe('claude');
+  expect(resolveDispatchRoute(dispatch, { ...options,
+    repo: { routing: { builder: 'auto', capacity: { enabled: false } } } }))
+    .toMatchObject({ outcome: 'role', executed: 'codex' });
+  expect(resolveDispatchRoute(dispatch, options)).toMatchObject({ outcome: 'role', executed: 'codex' });
+  expect(record).toHaveBeenLastCalledWith(expect.objectContaining({ provider: 'codex', reason: 'capacity-score' }), expect.any(Object));
+});
+
+it.each([
+  ['native Claude', 'operation', 'claude', false],
+  ['Claude alias', 'operation', 'claude-alt', false],
+  ['unknown emergency alias', 'operation', 'claude-alt', true],
+  ['inherited operation', 'inherited', 'claude', false],
+  ['scoped disable', 'scoped', 'claude', false],
+  ['large prepare', 'large', 'claude', false],
+  ['small prepare', 'small', 'claude', false],
+  ['derived build task', 'build', 'claude', false],
+  ['task type fallback', 'task', 'claude', false],
+])('filters disabled capacity before selection: %s', (_name, variant, id, emergency) => {
+  const now = Date.parse('2026-11-20T15:00:00Z');
+  const policy = structuredClone(DEFAULT_ROUTING_POLICY);
+  const dispatch = { kind: variant === 'build' ? 'build' : 'prepare-item', size: 3, scopePaths: ['we:scripts/example.mjs'] };
+  let controls = policy.operations[dispatch.kind];
+  if (variant === 'inherited' || variant === 'scoped') {
+    policy.operations['prepare-item:prepare'] = { inherit: true };
+    if (variant === 'scoped') controls = policy.operations['prepare-item:prepare'];
+  }
+  if (variant === 'large') { dispatch.size = 5; controls = policy.operations['prepare-decision']; }
+  if (variant === 'small') { dispatch.designQuestion = false; dispatch.wellScoped = true; controls = policy.smallPrepare.route; }
+  if (variant === 'build') controls = policy.operations['build:build-new-feature'];
+  if (variant === 'task') {
+    policy.operations['prepare-item'] = { inherit: true };
+    controls = policy.taskTypes.prepare = structuredClone(DEFAULT_ROUTING_POLICY.operations['prepare-item']);
+  }
+  controls.disabledProviders = ['claude'];
+  validateRoutingPolicy(policy);
+  const providers = [
+    { id, launcher: 'claude', model: 'claude-sonnet-5-5', emergencyOnly: emergency },
+    { id: 'codex', launcher: 'codex', model: 'gpt-6.1-sol' },
+  ].map(p => ({ ...p, tier: 3, allowedKinds: [dispatch.kind], windowModel: 'fixed', windows: [], readers: [] }));
+  const capacity = providers.map(p => ({ ...p, provider: p.id, health: 1, known: !p.emergencyOnly,
+    windows: p.emergencyOnly ? [] : [{ usedPercent: 10, resetsAt: now + (p.launcher === 'claude' ? 2 : 120) * 3600000 }] }));
+  const record = vi.fn();
+  const options = { env: {}, routingPolicy: policy, now, quota: () => ({ used_percent: 20 }), record, scorecards: [], capacity,
+    repo: { routing: { builder: 'auto', capacity: { allowUnknownEmergency: true } }, providerCapacity: { providers } } };
+  const route = resolveDispatchRoute(dispatch, options);
+  expect(route).toMatchObject({ outcome: variant === 'build' ? 'routed' : 'role', executed: 'codex' });
+  expect(record).toHaveBeenLastCalledWith(expect.objectContaining({ provider: 'codex', inputs: expect.arrayContaining([
+    expect.objectContaining({ provider: id, allowed: false, eligible: false }),
+  ]) }), expect.any(Object));
+  expect(resolveDispatchRoute(dispatch, { ...options, capacity: capacity.map(c => c.provider === 'codex' ? { ...c, held: true } : c) }))
+    .toMatchObject({ outcome: 'refused', refusal: expect.stringContaining('no eligible capacity') });
 });
 
 it.each(['fix', 'ci-heal'])('%s dispatch injects settings, quota, capacity and decision persistence', kind => {

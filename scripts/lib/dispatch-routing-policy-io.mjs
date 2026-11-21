@@ -1,13 +1,14 @@
 /** The only filesystem boundary for routing policy: reload, retain last-good, and forward snapshots. */
 import { readFileSync } from 'node:fs';
 import { ROUTING_POLICY_PATH, trustedSnapshot } from './dispatch-routing-policy-source.mjs';
-import { validateRoutingPolicy, applyRoutingOverrides, DEFAULT_ROUTING_POLICY, resolveOperationRoute as resolvePureRoute, resolvePolicyModel as resolvePureModel, operationEffort, defaultPolicyModel } from './dispatch-routing-policy.mjs';
+import { validateRoutingPolicy, applyRoutingOverrides, DEFAULT_ROUTING_POLICY, resolveOperationRoute as resolvePureRoute, resolvePolicyModel as resolvePureModel, operationEffort, defaultPolicyModel, operationRoutingEntry } from './dispatch-routing-policy.mjs';
 import { readPlatformPreferences } from './policy-cascade.mjs';
 import { appendDaemonEvent } from './daemon-events.mjs';
 import { decideDispatchRoute, MARKER_KINDS } from './dispatch-contracts.mjs';
 import { BUILD_KINDS, effectiveBuilder, resolveRoutingSettings } from './routing-settings.mjs';
 import { providerQuotaHold } from './provider-quota-hold.mjs';
 import { resolveRoutingOverrideRoute } from './dispatch-routing-override-route.mjs';
+import { taskTypeFor } from './dispatch-task-type.mjs';
 function initialPolicy(env) {
   return trustedSnapshot(env.WE_DISPATCH_ROUTING_SNAPSHOT) ?? DEFAULT_ROUTING_POLICY;
 }
@@ -92,10 +93,14 @@ export function resolveDispatchRoute(dispatch, options = {}) {
   let routingPolicy = options.routingPolicy ?? readRoutingPolicy();
   // Scoped explicit routes are policy pins; capacity must never replace or refuse them.
   const pinned = taskType && routingPolicy.operations[routeKey]?.provider;
+  const policyTaskType = taskTypeFor({ kind: dispatch.kind, cause: dispatch.cause ?? null,
+    scopePaths: Array.isArray(dispatch.scopePaths) ? dispatch.scopePaths.map(String) : [] }).taskType
+    ?? (dispatch.kind === 'prepare-item' ? 'prepare' : null);
+  const { disabledProviders } = operationRoutingEntry({ ...dispatch, operation: dispatch.kind, taskType: policyTaskType, policy: routingPolicy });
   const pinnedSettings = pinned && BUILD_KINDS.includes(dispatch?.kind) ? resolveRoutingSettings({ env: options.env ?? process.env, repo: options.repo, declared: options.declared }) : null;
   const builder = pinnedSettings ? { builder: pinnedSettings.builder, settings: pinnedSettings }
     : BUILD_KINDS.includes(dispatch?.kind) ? effectiveBuilder({ kind: dispatch.kind, env: options.env ?? process.env, now: options.now ?? Date.now(), records, capacity: options.capacity, routeKey, queuedDemand: options.queuedDemand ?? options.queuedDispatches?.filter(d => BUILD_KINDS.includes(d.kind)).length ?? 1, demandRatePerHour: options.demandRatePerHour,
-    repo: options.repo, declared: options.declared, quota: options.quota, record: options.record,
+    repo: options.repo, declared: options.declared, quota: options.quota, record: options.record, disabledProviders: [...disabledProviders],
   }) : null;
   if (builder?.decision?.provider === null) return { outcome: 'refused', refusal: 'no eligible capacity; wait for quota reset or clear provider hold', auditTrail: [] };
   const inputs = builder?.decision?.inputs ?? [];

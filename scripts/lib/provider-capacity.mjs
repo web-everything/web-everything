@@ -155,7 +155,11 @@ export function chooseBuilder({ kind = 'build', capacities, settings = {}, fallb
 export function capacityEligibility(cap, kind, settings = {}) {
   const def = (settings.providers ?? PROVIDER_DEFAULTS.providers).find(p => p.id === cap.provider);
   const scored = scoreProvider(cap, kind, settings);
-  const allowed = (cap.active ?? def?.active) !== false && (cap.allowedKinds ?? def?.allowedKinds ?? []).includes(kind);
+  // Native model aliases use the launcher's policy identity; agy models retain
+  // their distinct policy providers, just as dispatch projection does.
+  const policyProvider = ['claude', 'codex'].includes(scored.launcher) ? scored.launcher : cap.provider;
+  const allowed = !settings.disabledProviders?.includes(policyProvider)
+    && (cap.active ?? def?.active) !== false && (cap.allowedKinds ?? def?.allowedKinds ?? []).includes(kind);
   const emergencyOnly = cap.emergencyOnly ?? def?.emergencyOnly;
   const eligible = allowed && Boolean(scored.fit) && (emergencyOnly
     ? options(settings).allowUnknownEmergency && scored.label === 'unknown'
