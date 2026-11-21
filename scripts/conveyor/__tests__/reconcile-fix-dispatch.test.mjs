@@ -9,7 +9,7 @@ import { NO_PROMPT_COMMAND_RULES } from '../../lib/no-prompt-command-rules.mjs';
  * `dispatchFix` composition was mirrored from.
  */
 import { describe, it, expect, vi } from 'vitest';
-import { FIX_OVERLAP_PROSE_GLOBS, stripProseScope } from '../fix-scope-policy.mjs';
+import { FIX_OVERLAP_PROSE_GLOBS, FIX_OVERLAP_GENERATED_GLOBS, stripProseScope } from '../fix-scope-policy.mjs';
 import { spawnSync } from 'node:child_process';
 import * as ghThrottle from '../../lib/gh-throttle.mjs';
 import {
@@ -1898,6 +1898,19 @@ describe('runReconcileFixDispatch — item-less PRs (#xmtbdgs multi-repo slice 6
 
 describe('filterFixesByInFlightScope (#4295)', () => {
   const fx = (pr, scope, itemNum = null) => ({ pr, itemNum, scope });
+  it.each(['', 'we:'])('ignores only generated test-timings overlap (%s prefix), admitting both fixes', prefix => {
+    expect(Object.isFrozen(FIX_OVERLAP_GENERATED_GLOBS)).toBe(true);
+    expect(FIX_OVERLAP_GENERATED_GLOBS).toEqual(['scripts/ci/test-timings.json']);
+    const shared = `${prefix}scripts/ci/test-timings.json`;
+    expect(stripProseScope([shared, `${prefix}scripts/ci/other.json`, `${prefix}scripts/ci/shard-assign.mjs`]))
+      .toEqual([`${prefix}scripts/ci/other.json`, `${prefix}scripts/ci/shard-assign.mjs`]);
+    const queue = [fx(1, [shared, `${prefix}a.mjs`]), fx(2, [shared, `${prefix}b.mjs`])];
+    expect(filterFixesByInFlightScope(queue)).toMatchObject({ planned: queue, refusals: [] });
+    expect(filterFixesByInFlightScope([queue[1]], [], [{ meta: { pr: 1, scope: queue[0].scope } }]))
+      .toMatchObject({ planned: [queue[1]], refusals: [] });
+    expect(filterFixesByInFlightScope([fx(1, [shared, 'we:code.mjs']), fx(2, [shared, 'we:code.mjs'])]).refusals)
+      .toEqual([expect.objectContaining({ pr: 2, kind: 'scope-overlap' })]);
+  });
   it('strips only prose strings while preserving other entries and missing scopes', () => {
     const object = { repo: 'we', path: 'docs/agent/testing.md' };
     expect(Object.isFrozen(FIX_OVERLAP_PROSE_GLOBS)).toBe(true);
@@ -2642,4 +2655,11 @@ it('capability-off still observes fixer claims for lifecycle cleanup', async () 
   });
   expect(out.entries).toEqual([expect.objectContaining({ pr: 49, claim: { state: 'held' } })]);
   expect(readClaim).toHaveBeenCalledOnce();
+});
+
+it('conflict fixer instructions name the timings union command and retain normal handling for other files', () => {
+  for (const prompt of [buildResumePrompt({ pr: 1, itemNum: null }), withStaleBase('brief', { missing: ['job'] }), withPlannedContext('brief', { isConflict: true })]) {
+    expect(prompt).toContain('if scripts/ci/test-timings.json is conflicted, resolve it with `node scripts/conveyor/resolve-conflict.mjs --take=timings-union --file=scripts/ci/test-timings.json`; every other conflicted file goes through the normal flow.');
+  }
+  expect(withPlannedContext('brief', {})).toBe('brief');
 });

@@ -9,6 +9,7 @@
  * inviting the same denial after every 15-minute retry. This narrow helper reads
  * index stages instead, and is explicitly allowed by the dispatcher's settings.
  *
+ * `--take=timings-union` uses a main-first JSON union only for scripts/ci/test-timings.json.
  * Pure argument/path/planning functions sit apart from the injectable git IO shell.
  * All requested files are preflighted before writing any resolution. Only an active
  * merge in a lane clone is eligible; logs live outside the lane and .git so recording
@@ -19,6 +20,8 @@ import { appendFileSync, chmodSync, mkdirSync, mkdtempSync, writeFileSync, rmSyn
 import { homedir, tmpdir } from 'node:os';
 import { dirname, isAbsolute, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
+
+import { unionTimings, TIMINGS_PATH } from './timings-union.mjs';
 
 export const isLaneClonePath = (p) => typeof p === 'string' && /\/\.lanes\/[^/]+\/lane-\d+$/.test(p);
 
@@ -41,8 +44,14 @@ export function parseArgs(argv) {
  * PURE: missing side means deletion; union needs both sides and permits an empty add/add base. `modes` are the
  * index modes of the stages; the kept side's mode is carried so staging preserves it (union keeps ours').
  */
-export function planResolution({ take, stages, modes = {} }) {
-  if (!['ours', 'theirs', 'union'].includes(take)) throw new Error('--take must be ours, theirs, or union');
+export function planResolution({ take, stages, modes = {}, file }) {
+  if (!['ours', 'theirs', 'union', 'timings-union'].includes(take)) throw new Error('--take must be ours, theirs, union, or timings-union');
+  if (take === 'timings-union') {
+    if (file !== TIMINGS_PATH) throw new Error(`timings-union is allowed only for ${TIMINGS_PATH}`);
+    const result = unionTimings({ base: stages[1]?.toString(), ours: stages[2]?.toString(), theirs: stages[3]?.toString() });
+    if (!result.ok) throw new Error(`timings-union refused: ${result.reason}`);
+    return { take, stage: null, action: 'resolved', content: result.text, mode: modes[3] ?? '100644' };
+  }
   const stage = take === 'ours' ? 2 : take === 'theirs' ? 3 : null;
   if (stage) return { take, stage, action: stages[stage] == null ? 'deleted' : 'resolved', content: stages[stage], mode: modes[stage] ?? '100644' };
   if (stages[2] == null || stages[3] == null) throw new Error('Union requires both ours and theirs; choose a side for a deletion');
@@ -80,6 +89,7 @@ export function resolveConflicts({ dir = process.cwd(), files = [], take, argume
     if (ownDir !== dir) throw new Error(`Refusing ${dir}: not the current lane (${ownDir}); run this from inside the lane you are resolving`);
     try { git(['rev-parse', '-q', '--verify', 'MERGE_HEAD'], dir); } catch { throw new Error('No merge in progress (MERGE_HEAD missing)'); }
     if (!files.length) throw new Error('At least one --file is required');
+    if (take === 'timings-union' && files.some(file => file !== TIMINGS_PATH)) throw new Error(`timings-union is allowed only for ${TIMINGS_PATH}`);
     const plans = [...new Set(files)].map((file) => {
       validateFile(file);
       // Never follow a working-tree symlink outside the lane, including symlink parents.
@@ -97,7 +107,7 @@ export function resolveConflicts({ dir = process.cwd(), files = [], take, argume
         if (!match || match[3] !== file || !['100644', '100755'].includes(match[1])) throw new Error(`Unsupported conflict path or mode: ${file}`);
         stages[match[2]] = git(['show', `:${match[2]}:${file}`], dir); modes[match[2]] = match[1];
       }
-      return { file, ...planResolution({ take, stages, modes }) };
+      return { file, ...planResolution({ take, stages, modes, file }) };
     });
     for (const plan of plans) {
       const target = join(dir, plan.file);

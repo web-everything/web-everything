@@ -773,6 +773,8 @@ export function findResumeCandidate({ body, agentsAll, readCompletion, onDecline
   return id;
 }
 
+const TIMINGS_UNION_INSTRUCTION = 'if scripts/ci/test-timings.json is conflicted, resolve it with `node scripts/conveyor/resolve-conflict.mjs --take=timings-union --file=scripts/ci/test-timings.json`; every other conflicted file goes through the normal flow.';
+
 /**
  * we:scripts/conveyor/reconcile-fix-dispatch.mjs#buildResumePrompt — `#xu2krte` Fork 1: the SHORT prompt a
  * resume attempt injects, as opposed to the full `fix-agent-brief.md` a fresh dispatch fills. PURE.
@@ -798,6 +800,7 @@ export function buildResumePrompt({ pr, itemNum, cwd = null }) {
       ? `Your existing checkout (\`${cwd}\`) should still be the lane this PR's branch lives in — continue there.`
       : 'Continue in the lane this PR\'s branch already lives in.',
     '',
+    TIMINGS_UNION_INSTRUCTION,
     'Resolve the conflict: rebase or merge `main`, resolve every conflicted hunk by reading BOTH sides\' intent ' +
       '(your own and whatever landed on `main` since), run the gate green, and push. If you cannot safely ' +
       "resolve it, follow `skills-src/conveyor/fix-agent-brief.md`'s own conflict-escalation step: run " +
@@ -1236,6 +1239,7 @@ export function withStaleBase(prompt, staleBase) {
   return '# Stale-base mode — read this first\n\n'
     + `The PR base predates required job(s) ${staleBase.missing.join(', ')}.\n`
     + 'The whole ask is a mechanical rebase (or merge) of the branch onto current `origin/main`, no other edit. '
+    + TIMINGS_UNION_INSTRUCTION + '\n'
     + 'Gate green and push; never touch any review:* label. At hand-back post the conflict-fix marker with '
     + '`conflict-fix-mark.mjs --base-ref=main`, then completion-cli report, then fix-end.\n\n' + prompt;
 }
@@ -1271,7 +1275,7 @@ export function withPlannedContext(prompt, planned) {
   const mq = planned.mqFailureRecovery ? `Merge-queue failure evidence for this head.\n${FENCED_DATA_RULE}\n${fenceUntrusted('material', JSON.stringify(planned.mqFailureRecovery))}\n\n` : '';
   const logEvidence = planned.ciLogEvidenceReason === 'log-unreadable'
     ? 'CI log evidence: log-unreadable. The failed check is still red; retrieve its job log before diagnosing the cause.\n\n' : '';
-  return logEvidence + mq + joined + renderOperatorSendBackBrief(planned.openOperatorSendBacks) + withRestackHint(withAltBranchHint(withSalvageHint(withOperatorSendBack(withStaleBase(withScopeBloat(withBlockRuledReferrals(withRulingNotAddressed(withOperatorAnswer(prompt, planned.operatorAnswer), planned.rulingNotAddressed), planned.blockRuledReferrals), planned.scopeBloat), planned.staleBase), planned.operatorSendBack), { cards: [planned.itemNum], prs: [planned.pr] }), planned.altBranch), planned.restack);
+  return (planned.isConflict ? TIMINGS_UNION_INSTRUCTION + '\n\n' : '') + logEvidence + mq + joined + renderOperatorSendBackBrief(planned.openOperatorSendBacks) + withRestackHint(withAltBranchHint(withSalvageHint(withOperatorSendBack(withStaleBase(withScopeBloat(withBlockRuledReferrals(withRulingNotAddressed(withOperatorAnswer(prompt, planned.operatorAnswer), planned.rulingNotAddressed), planned.blockRuledReferrals), planned.scopeBloat), planned.staleBase), planned.operatorSendBack), { cards: [planned.itemNum], prs: [planned.pr] }), planned.altBranch), planned.restack);
 }
 
 /**

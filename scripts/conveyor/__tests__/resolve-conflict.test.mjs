@@ -13,16 +13,16 @@ afterEach(() => { for (const d of temps.splice(0)) rmSync(d, { recursive: true, 
  * `sub` puts the conflicted file at `sub/file` (for the symlink-parent case); `oursExec` / `theirsExec` give that
  * side's version the executable bit, so the two conflicting stages differ in mode (100644 vs 100755).
  */
-function fixture({ lane = true, merge = true, sub = false, oursExec = false, theirsExec = false } = {}) {
+function fixture({ lane = true, merge = true, sub = false, oursExec = false, theirsExec = false, conflictFile, contents = ['base\n', 'ours\n', 'theirs\n'] } = {}) {
   const root = mkdtempSync(join(tmpdir(), 'resolve-conflict-')); temps.push(root);
   const dir = join(root, lane ? '.lanes/web-everything/lane-1' : 'ordinary'); mkdirSync(dir, { recursive: true });
   const git = (...args) => execFileSync('git', args, { cwd: dir, stdio: ['ignore', 'pipe', 'pipe'] }).toString();
-  const rel = sub ? 'sub/file' : 'file';
+  const rel = conflictFile ?? (sub ? 'sub/file' : 'file');
   const commit = (exec) => { if (exec) chmodSync(join(dir, rel), 0o755); git('add', '.'); git('-c', 'user.name=t', '-c', 'user.email=t@t', 'commit', '-qm', 'fixture'); };
-  if (sub) mkdirSync(join(dir, 'sub'));
-  git('init', '-q', '-b', 'main'); writeFileSync(join(dir, rel), 'base\n'); writeFileSync(join(dir, 'clean'), 'clean\n'); commit();
-  git('switch', '-qc', 'other'); writeFileSync(join(dir, rel), 'theirs\n'); commit(theirsExec);
-  git('switch', '-q', 'main'); writeFileSync(join(dir, rel), 'ours\n'); commit(oursExec);
+  mkdirSync(dirname(join(dir, rel)), { recursive: true });
+  git('init', '-q', '-b', 'main'); writeFileSync(join(dir, rel), contents[0]); writeFileSync(join(dir, 'clean'), 'clean\n'); commit();
+  git('switch', '-qc', 'other'); writeFileSync(join(dir, rel), contents[2]); commit(theirsExec);
+  git('switch', '-q', 'main'); writeFileSync(join(dir, rel), contents[1]); commit(oursExec);
   if (merge) { try { git('-c', 'user.name=t', '-c', 'user.email=t@t', 'merge', 'other'); } catch {} }
   return { dir, git, logPath: join(root, 'log.jsonl'), root };
 }
@@ -164,4 +164,33 @@ it('preflights all files before resolving the first', () => {
   const f = fixture(); const before = f.git('status', '--porcelain');
   expect(resolveConflicts({ dir: f.dir, files: ['file', 'clean'], take: 'theirs' }, { logPath: f.logPath, cwd: f.dir }).ok).toBe(false);
   expect(f.git('status', '--porcelain')).toBe(before);
+});
+
+const timingsFile = 'scripts/ci/test-timings.json';
+it('timings-union resolves the exact timings file from stages 1/2/3 and stages the result', () => {
+  const f = fixture({ conflictFile: timingsFile, contents: ['{"unit":{"old":1}}', '{"unit":{"old":2,"pr":3}}', '{"unit":{"old":4,"main":5}}'] });
+  const result = resolveConflicts({ dir: f.dir, files: [timingsFile], take: 'timings-union' }, { logPath: f.logPath, cwd: f.dir });
+  expect(result.ok).toBe(true);
+  const expected = JSON.stringify({ unit: { old: 4, main: 5, pr: 3 } }, null, 1) + '\n';
+  expect(readFileSync(join(f.dir, timingsFile), 'utf8')).toBe(expected);
+  expect(f.git('show', `:0:${timingsFile}`)).toBe(expected);
+  expect(f.git('ls-files', '-u')).toBe('');
+});
+it('timings-union preflights every path and refuses another file without writing or staging', () => {
+  const f = fixture({ conflictFile: timingsFile, contents: ['{}', '{"a":1}', '{"a":2}'] });
+  const before = readFileSync(join(f.dir, timingsFile), 'utf8');
+  const index = f.git('ls-files', '-s');
+  const result = resolveConflicts({ dir: f.dir, files: [timingsFile, 'clean'], take: 'timings-union' }, { logPath: f.logPath, cwd: f.dir });
+  expect(result).toMatchObject({ ok: false, reason: expect.stringContaining('only') });
+  expect(readFileSync(join(f.dir, timingsFile), 'utf8')).toBe(before);
+  expect(f.git('ls-files', '-s')).toBe(index);
+});
+it('timings-union refuses invalid JSON with its reason and leaves the conflict untouched', () => {
+  const f = fixture({ conflictFile: timingsFile });
+  const before = readFileSync(join(f.dir, timingsFile), 'utf8');
+  const index = f.git('ls-files', '-s');
+  expect(resolveConflicts({ dir: f.dir, files: [timingsFile], take: 'timings-union' }, { logPath: f.logPath, cwd: f.dir }))
+    .toMatchObject({ ok: false, reason: expect.stringMatching(/JSON/) });
+  expect(readFileSync(join(f.dir, timingsFile), 'utf8')).toBe(before);
+  expect(f.git('ls-files', '-s')).toBe(index);
 });

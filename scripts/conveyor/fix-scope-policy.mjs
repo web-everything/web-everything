@@ -7,10 +7,12 @@ import { parseScopeEntry } from '../readiness/overlap-chain.mjs';
 
 export const FIX_OVERLAP_PROSE_GLOBS = Object.freeze(['backlog/**/*.md', 'docs/**/*.md']);
 
-/** Ignore prose only when computing fix overlap; retain original dispatch/claim scopes. */
+export const FIX_OVERLAP_GENERATED_GLOBS = Object.freeze(['scripts/ci/test-timings.json']);
+
+/** Ignore prose and generated timings only when computing fix overlap; retain original dispatch/claim scopes. */
 export function stripProseScope(scope) {
   return scope?.filter(entry => typeof entry !== 'string'
-    || !micromatch.isMatch(parseScopeEntry(entry)?.path ?? '', FIX_OVERLAP_PROSE_GLOBS));
+    || !micromatch.isMatch(parseScopeEntry(entry)?.path ?? '', [...FIX_OVERLAP_PROSE_GLOBS, ...FIX_OVERLAP_GENERATED_GLOBS]));
 }
 
 export const FIX_SCOPE_DEFAULTS = Object.freeze({
