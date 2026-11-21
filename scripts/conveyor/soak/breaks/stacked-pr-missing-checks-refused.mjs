@@ -21,6 +21,7 @@ export default {
     const pr = { number: 3915, headRefName: 'lane/stacked', baseRefName: 'lane/fix-ruling-needed-surface',
       headRefOid: 'a'.repeat(40), isDraft: true, labels: [], comments: [], statusCheckRollup: [] };
     const base = { ...pr, number: 3889, headRefName: pr.baseRefName, baseRefName: 'main',
+      rowsComplete: true, rowsHead: pr.headRefOid,
       statusCheckRollup: checks.map(name => ({ name, status: 'COMPLETED', conclusion: 'SUCCESS' })) };
     let reads = 0;
     const pass = prs => runReconcilePass({ repo: 'we', readPrs: () => prs, readAgents: () => [], enrich: a => a,

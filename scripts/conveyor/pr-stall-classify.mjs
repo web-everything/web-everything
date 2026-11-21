@@ -41,7 +41,7 @@ export function demoteNeverAutomatic(item, operatorCommand) {
  *   - `unknownMergeabilityDeadlineMs`: drain-owned mergeability wait, at most 15 minutes (a few drain passes).
  */
 export const CLASSIFY_DEFAULTS = Object.freeze({
-  unknownMergeabilityDeadlineMs: 15 * 60_000,
+  unknownMergeabilityDeadlineMs: 15 * 60_000, findingsPendingMinutes: 45,
   maxRedTeamRestartsPerHead: 2, staleHoldAutoResume: false, grantCeiling: MAX_TOTAL_ROUND_EXTENSIONS, maxFixListLines: 20, stateLanes: Object.freeze({}),
   systemActions: Object.freeze({ 'await-ledger-outbox': true, 'resume-stale-hold': true, 'rerun-red-team-gate': true, 'ask-review-daemon': true, 'tooling-card': true, 'restart-red-team': true, 'publish-red-team-result': true }),
   policyActions: Object.freeze({ grant: true, card: true, block: true }),
@@ -49,6 +49,7 @@ export const CLASSIFY_DEFAULTS = Object.freeze({
 /** Validators for each classifier setting leaf (shared with the sweep's cascade, so a bad value is refused there too). */
 export const CLASSIFY_VALID = Object.freeze({
   unknownMergeabilityDeadlineMs: (v) => Number.isSafeInteger(v) && v > 0 && v <= CLASSIFY_DEFAULTS.unknownMergeabilityDeadlineMs,
+  findingsPendingMinutes: (v) => Number.isSafeInteger(v) && v > 0 && v <= CLASSIFY_DEFAULTS.findingsPendingMinutes,
   maxRedTeamRestartsPerHead: (v) => Number.isSafeInteger(v) && v >= 0 && v <= 2,
   staleHoldAutoResume: (v) => typeof v === 'boolean',
   grantCeiling: (v) => Number.isSafeInteger(v) && v >= 1 && v <= MAX_TOTAL_ROUND_EXTENSIONS,
@@ -174,8 +175,8 @@ function classifyUnsafe(o = {}) {
   const rawSettings = o.settings; // read once: a getter must not validate one value and serve another
   const cfg = classifySettings(rawSettings === undefined ? {} : rawSettings);
   // Every other input is read ONCE into plain data (getters run once, here): what is validated is what is used.
-  const { row, head = '', verdict = null, files = [], card = null, grantsSoFar, redTeam } = strictClone({ row: o.row, head: o.head, verdict: o.verdict ?? null,
-    files: o.files ?? [], card: o.card ?? null, grantsSoFar: o.grantsSoFar, redTeam: o.redTeam });
+  const { row, head = '', verdict = null, files = [], card = null, grantsSoFar, redTeam, triggerMismatch = null } = strictClone({ row: o.row, head: o.head, verdict: o.verdict ?? null,
+    files: o.files ?? [], card: o.card ?? null, grantsSoFar: o.grantsSoFar, redTeam: o.redTeam, triggerMismatch: o.triggerMismatch ?? null });
   if (!isRec(row) || typeof row.repo !== 'string' || !/^[\w-]+\/[\w-][\w.-]*$/.test(row.repo) || repoKeyForSlug(row.repo) === null
     || !Number.isSafeInteger(row.number) || row.number <= 0 || typeof row.waitingOn !== 'string' || !row.waitingOn) {
     throw new Error('unreadable row');
@@ -251,11 +252,13 @@ function classifyUnsafe(o = {}) {
 
   const trigger = JUDGED_STATES[state];
   if (!trigger) return operator('unclassified', `fail-closed: unknown waiting state ${JSON.stringify(state)}`);
-  return judged({ head, verdict, trigger, files, card, grantsSoFar, acts, out, operator, cfg });
+  if (verdict === null && typeof triggerMismatch === 'string' && triggerMismatch) return operator('no-verdict', `fail-closed: trigger-mismatch: ${triggerMismatch.slice(0, 120)}`);
+  return judged({ head, verdict, trigger, files, card, grantsSoFar, acts, out, operator, cfg, ageMinutes: row.ageMinutes,
+    pendingOk: row.approxSince !== true && cfg.stateLanes[state] !== 'operator' });
 }
 
 /** A PR at a round cap / referral hold: the judge's verdict decides, within the standing policy. */
-function judged({ head, verdict, trigger, files, card, grantsSoFar, acts, out, operator, cfg }) {
+function judged({ head, verdict, trigger, files, card, grantsSoFar, acts, out, operator, cfg, ageMinutes, pendingOk }) {
   if (!isRec(verdict) || !validateVerdict(verdict).ok) return operator('no-verdict', `fail-closed: no valid round-judge verdict (${validateVerdict(verdict).why})`);
   // validateVerdict walks arrays with .some(), which skips holes: densify before trusting the reasons.
   if (![...verdict.reasons].every((r) => typeof r === 'string' && r.trim())) return operator('no-verdict', 'fail-closed: the verdict reasons are malformed');
@@ -309,7 +312,15 @@ function judged({ head, verdict, trigger, files, card, grantsSoFar, acts, out, o
   }
 
   const latest = ev.latest;
-  if (!latest.length) return operator(verdict.verdict, 'fail-closed: the judge\'s open findings are missing or malformed');
+  if (!latest.length) {
+    // The red team's findings may still be publishing: no readable finding yet is pending (retry next pass), bounded by age.
+    // Pending only on affirmative evidence: an exact wait age, no setting forcing this state to a person, and no break open elsewhere.
+    if (trigger === 'red-team-cap' && pendingOk && ev.crossBroken === 0 && Number.isFinite(ageMinutes) && ageMinutes >= 0) {
+      return ageMinutes <= cfg.findingsPendingMinutes ? null
+        : operator('findings-stuck', `the red team's findings stayed unreadable past ${cfg.findingsPendingMinutes} minutes`);
+    }
+    return operator(verdict.verdict, 'fail-closed: the judge\'s open findings are missing or malformed');
+  }
   if (verdict.verdict === 'card-the-rest') {
     if (trigger !== 'referral-hold') return operator('card-the-rest', `only coverage findings are open (${why}); carding them past a ${trigger} is a person's call`);
     // Coverage only, and no confirmed break left open in another source (the judge's `crossBroken`; unknown = not zero).

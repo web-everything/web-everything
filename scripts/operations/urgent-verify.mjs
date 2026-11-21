@@ -18,6 +18,20 @@ export function createUrgentDeps({ cwd = process.cwd(), home = homedir(), fs = r
   // Local verification must acquire host admission even when launched from CI.
   for (const marker of ['CI', 'GITHUB_ACTIONS', 'CONTINUOUS_INTEGRATION', 'GITLAB_CI',
     'BUILDKITE', 'CIRCLECI', 'TRAVIS', 'JENKINS_URL', 'TEAMCITY_VERSION', 'TF_BUILD', 'BUILD_NUMBER']) delete childEnv[marker];
+  // The host's approved gh-shim dirs (the agent-launch shim: <home>/.claude/github-app-token/gh-shim or gh-shim.d/<16 hex>)
+  // are launcher scaffolding, not system tools: scrub exactly those from the child PATH so nothing probes the token tree.
+  // Any other extra dir (a lookalike, another gh) is left alone.
+  // Matched by the exact path shape (any home: the host PATH is inherited while HOME may be a sandbox or fake).
+  // Exact shape `<some home>/.claude/github-app-token/gh-shim` or `.../gh-shim.d/<16 hex>`, and never inside the checkout
+  // or its sibling checkouts' tree: a repo-supplied lookalike is not exempt and stays probed. (HOME is a sandbox in
+  // wrapped runs, so the home itself cannot be the anchor.)
+  const checkoutRoot = resolve(cwd);
+  const approvedShimDir = d => {
+    const r = resolve(d);
+    if (r === checkoutRoot || r.startsWith(checkoutRoot + '/')) return false;
+    const m = /^(.+)\/\.claude\/github-app-token\/(gh-shim|gh-shim\.d\/[0-9a-f]{16})$/.exec(r);
+    return Boolean(m) && !m[1].includes('/.claude/');
+  };
   const fui = resolve(cwd, '../frontierui');
   // Child env is scrubbed to a few keys; local bins (vitest etc.) must stay resolvable.
   const binDirs = [join(cwd, 'node_modules/.bin'), join(fui, 'node_modules/.bin')];
@@ -56,7 +70,7 @@ export function createUrgentDeps({ cwd = process.cwd(), home = homedir(), fs = r
     // or non-executable system tool would silently resolve to a checkout-supplied replacement. Refuse up front instead.
     for (const tool of ['git', 'node', 'npm', 'sh']) {
       if (!systemPath.split(delimiter).some(d => {
-        if (!d) return false;
+        if (!d || approvedShimDir(d)) return false; // the shim stays on the child PATH (identity routing) but is never probed
         try {
           const candidate = join(d, tool);
           fs.accessSync(candidate, realFs.constants.X_OK);
