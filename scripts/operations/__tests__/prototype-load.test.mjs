@@ -3,7 +3,7 @@
  * WHY (incident 2026-10-22): pin main preservation, ready evidence, adopt-before-remove, stale
  * replacement, and adoption refusal with injected doubles, plus real Git adoption probes.
  */
-import { describe, it, expect, vi } from 'vitest';
+import { afterAll, describe, it, expect, vi } from 'vitest';
 import nodeFs, { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
 import { dirname, join, resolve } from 'node:path';
@@ -14,7 +14,8 @@ import { runInNewContext } from 'node:vm';
 import { withBareOrigin } from './helpers/real-repo.mjs';
 import { findingsHash } from '../ruled-weakened-store.mjs';
 import { recordWaivers } from '../ruled-weakened-record.mjs';
-import { createPrototypeLoader, defaultDeps } from '../prototype-load-io.mjs';
+import { createPrototypeLoader, defaultDeps, readHotPatchVetoPolicy } from '../prototype-load-io.mjs';
+import { urgentSweep } from '../urgent-sweep.mjs';
 import { netDiffFingerprint } from '../../lib/net-diff-fingerprint.mjs';
 import { resolveDaemonKey, changedPaths, comparePaths, nextMergeRef, prototypeLoadOperation, PROTOTYPE_LOAD_EFFECT } from '../prototype-load.mjs';
 import { urgentSignature } from '../urgent-verify-marker.mjs';
@@ -93,7 +94,13 @@ function fixture(options = {}) {
   };
   const fail = (status, stdout = '', stderr = 'failed') => { throw Object.assign(new Error(stderr), { status, stdout, stderr }); };
   const exec = (cmd, args, config) => {
-    calls.push({ cmd, args, config });
+    const invocationArgs = args;
+    if (cmd === 'node' && args[0] === '--input-type=module') {
+      expect(args[1]).toBe('--eval');
+      expect(args[2]).toContain('await main(process.argv.slice(1), {}, { hotPatchProvenance: true })');
+      args = [resolve(dirname(fileURLToPath(import.meta.url)), '../../..', settings.loaderCli), ...args.slice(3)];
+    }
+    calls.push({ cmd, args, config, invocationArgs });
     if (options.combinedIO?.handles(cmd, args)) return options.combinedIO.exec(cmd, args, config);
     expect(args.join(' ')).not.toMatch(/--allow-conflict|--force|--allow-no-pr/);
     expect(Object.keys(config.env).sort()).toEqual(['HOME', 'PATH', 'USER', ...Object.keys(options.gitEnv || {}), ...(env.WE_DAEMON_OVERLAY_DIR ? ['WE_DAEMON_OVERLAY_DIR'] : []), ...(env.WE_OVERLAY_NO_PR?.trim() === 'refuse' ? ['WE_OVERLAY_NO_PR'] : [])].sort());
@@ -147,6 +154,7 @@ function fixture(options = {}) {
         return fail(1);
       }
       if (action === 'add') {
+        options.beforeRegister?.();
         if (options.advanceDuringAdd) remoteTip = TREE;
         const expected = args.find((a) => a.startsWith('--expected-sha='))?.slice(15);
         if (expected && expected !== remoteTip) return fail(3, JSON.stringify({ conflictCheck: { ok: false, reason: 'sha-moved', candSha: remoteTip } }));
@@ -278,26 +286,70 @@ function fixture(options = {}) {
     dispatchSmoke: options.dispatchSmoke, removeRegistration: options.removeRegistration, ...(options.fingerprint ? { fingerprint: options.fingerprint } : {}), ...(options.defaultCombined ? {} : { combinedTest }), settings: structuredClone({ ...settings, auditRecordPath: '~/canonical-audits.jsonl', ...options.settings }), now: () => clock,
     cloneKey: (root) => { cloneRoots.push(root); return 'test-clone-key'; },
     sleep: async (ms) => { sleeps.push(ms); clock += ms; await options.onSleep?.(); } });
-  return { calls, records, readyWrites, sleeps, admitted, reads, cloneRoots, lateChanges, registrations, combinedTest, retirePlanner, run: (input = {}) => load({ ...BASE, sha: candidateSha, ...input }) };
+  return { fs, calls, records, readyWrites, sleeps, admitted, reads, cloneRoots, lateChanges, registrations, combinedTest, retirePlanner, run: (input = {}) => load({ ...BASE, sha: candidateSha, ...input }) };
 }
 const mutations = (f, action) => f.calls.filter((c) => c.cmd === 'node' && c.args[1] === action && !c.args.includes('--check'));
 describe('urgent prototype admission', () => {
   const reason = 'Restore critical daemon operation';
   const marker = { sha: SHA, fuiSha: SHA, fuiRepo: 'https://github.com/frontier-ui/frontierui', suite: 'full', shards: 1, result: 'green', startedAt: new Date(-2000).toISOString(), finishedAt: new Date(-1000).toISOString(), host: 'test-host', repo: 'https://example.com/org/repo', steps: ['fetch-main-history', 'install-fui', 'install', 'unit:unit:1/1', 'coverage', 'hostPaths', 'integration', 'standards'] };
   marker.sig = urgentSignature(marker, urgentKey);
+  it('keeps monitoring when a sweep runs between intent persistence and registration', async () => {
+    let pausedSweep;
+    const f = fixture({ beforeRegister: () => {
+      const records = f.records.filter(r => r.path.endsWith('/urgent-loads.jsonl'));
+      const program = `import { urgentSweep } from './scripts/operations/urgent-sweep.mjs';
+        const receipts = [];
+        const result = await urgentSweep({}, {
+          loads: () => ${JSON.stringify(records)}, state: () => receipts,
+          now: () => new Date(0).toISOString(), settle: r => receipts.push(r),
+          overlayState: () => ({corrupt:false, overlays:[]}), containsOverlay: () => false,
+          checks: () => ({total_count:0, check_runs:[]}), escalate: () => {}
+        });
+        process.stdout.write(JSON.stringify({result, receipts}));`;
+      pausedSweep = JSON.parse(execFileSync(process.execPath, ['--input-type=module', '-e', program], {
+        cwd: resolve(dirname(fileURLToPath(import.meta.url)), '../../..'), encoding: 'utf8', timeout: 30000,
+      }));
+    } });
+    expect(await f.run({ urgent: true, reason })).toMatchObject({ ok: true });
+    expect(pausedSweep.result).toMatchObject({ results: [{ status: 'monitoring-unregistered' }] });
+    const receipts = pausedSweep.receipts;
+    const removed = vi.fn(() => ({ retired: true }));
+    const intent = f.records.find(r => r.type === 'prototype-load.urgent');
+    expect(f.records).toContainEqual(expect.objectContaining({ type: 'prototype-load.urgent-registration-complete', trackingId: intent.trackingId }));
+    const data = { total_count: 1, check_runs: [{ id: 1, name: 'test', head_sha: SHA, app: { id: 15368 },
+      check_suite: { id: 7 }, status: 'completed', conclusion: 'failure' }],
+      workflows: { total_count: 1, workflow_runs: [{ check_suite_id: 7, head_sha: SHA, path: '.github/workflows/ci.yml' }] } };
+    expect(await urgentSweep({}, {
+      loads: () => f.records.filter(r => r.path.endsWith('/urgent-loads.jsonl')), state: () => receipts,
+      now: () => new Date(0).toISOString(), settle: r => receipts.push(r),
+      overlayState: () => ({ corrupt: false, overlays: f.admitted }), checks: () => data, required: () => ['test'],
+      remove: removed, event: () => {}, escalate: () => {},
+    })).toMatchObject({ results: [{ status: 'unloaded-pending-adoption' }] });
+    expect(removed).toHaveBeenCalledWith(intent, { ref: intent.registration.ref });
+  });
   it('writes the urgent tracking intent before registering the overlay', async () => {
     const observed = [];
     const f = fixture({ onAppend: (path, record, calls) => {
       if (record.type === 'prototype-load.urgent') observed.push({ record, mutations: calls.filter(c => c.cmd === 'node' && c.args[1] === 'add' && !c.args.includes('--check')).length });
     } });
     expect(await f.run({ urgent: true, reason })).toMatchObject({ ok: true });
-    expect(observed).toEqual([{ record: expect.objectContaining({ trackingId: expect.any(String), clone: expect.any(String), sha: SHA }), mutations: 0 }]);
+    expect(observed).toEqual([{ record: expect.objectContaining({ trackingId: expect.any(String), clone: expect.any(String), sha: SHA, registrationCompletionRequired: true }), mutations: 0 }]);
     expect(mutations(f, 'add')).toHaveLength(1);
   });
   it('refuses registration when the urgent tracking intent cannot be written', async () => {
     const f = fixture({ urgentWriteFails: true });
     expect(await f.run({ urgent: true, reason })).toMatchObject({ ok: false, registered: false, error: 'urgent ledger unwritable' });
     expect(mutations(f, 'add')).toHaveLength(0);
+  });
+  it('leaves an urgent intent monitored when completion persistence fails after registration', async () => {
+    const f = fixture({ onAppend: (_path, record) => {
+      if (record.type === 'prototype-load.urgent-registration-complete') throw Error('completion ledger unavailable');
+    } });
+    expect(await f.run({ urgent: true, reason })).toMatchObject({ ok: false, registered: true, error: 'completion ledger unavailable' });
+    expect(mutations(f, 'add')).toHaveLength(1);
+    expect(f.records.filter(r => r.path.endsWith('/urgent-loads.jsonl'))).toEqual([
+      expect.objectContaining({ type: 'prototype-load.urgent' }),
+    ]);
   });
   it('appends a registration-failed note only when the failed registration is proven absent', async () => {
     const f = fixture({ addFails: true });
@@ -321,6 +373,7 @@ describe('urgent prototype admission', () => {
     expect(readState.mock.calls[0][0]).toBe(f.records.find(r => r.type === 'prototype-load.urgent').registration.clone);
     expect(f.records.filter(r => r.path.endsWith('/urgent-loads.jsonl'))).toEqual([
       expect.objectContaining({ type: 'prototype-load.urgent' }),
+      expect.objectContaining({ type: 'prototype-load.urgent-registration-complete' }),
     ]);
   });
   it('keeps tracking when the registration command persists the overlay before failing', async () => {
@@ -329,6 +382,7 @@ describe('urgent prototype admission', () => {
     expect(f.admitted).toEqual([{ ref: BASE.branch }]);
     expect(f.records.filter(r => r.path.endsWith('/urgent-loads.jsonl'))).toEqual([
       expect.objectContaining({ type: 'prototype-load.urgent' }),
+      expect.objectContaining({ type: 'prototype-load.urgent-registration-complete' }),
     ]);
   });
   it('keeps the intent tracked when registration succeeds but admission evidence is incomplete', async () => {
@@ -336,6 +390,7 @@ describe('urgent prototype admission', () => {
     expect(await f.run({ urgent: true, reason })).toMatchObject({ ok: false, registered: true, detail: 'admitted-sha-unverified' });
     expect(f.records.filter(r => r.path.endsWith('/urgent-loads.jsonl'))).toEqual([
       expect.objectContaining({ type: 'prototype-load.urgent' }),
+      expect.objectContaining({ type: 'prototype-load.urgent-registration-complete' }),
     ]);
   });
   it('logs the urgent event and writes explicit urgent readiness evidence', async () => {
@@ -3636,5 +3691,278 @@ describe('recorder-to-load same-diff waiver admission', () => {
       expect(await make(FP, [{ ...audit, findings: ['changed findings'] }]).run())
         .toMatchObject({ ok: false, stopReason: 'no-canonical-audit' });
     } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+});
+
+
+// R1100 MVP: real CI reader, no urgent receipt, and one-field mutations of valid evidence.
+const hotHomes = [];
+// Temp fixtures are removed when this suite finishes.
+afterAll(() => { for (const home of hotHomes) rmSync(home, { recursive: true, force: true }); });
+describe('hot-patch urgent admission (R1100)', () => {
+  const repo = 'web-everything/web-everything', branch = `hotpatch/${SHA}`;
+  const validPr = () => ({ number: 42, state: 'open', head: { sha: SHA, ref: 'lane/repair', repo: { full_name: repo } },
+    base: { ref: 'main', repo: { full_name: repo } }, mergeable: true, mergeable_state: 'clean' });
+  const validRules = () => ['update', 'deletion', 'non_fast_forward'].map(type => ({ type, ruleset_id: 27726920 }));
+  function hotFixture(change = {}) {
+    const prs = change.prs ?? [validPr()];
+    const rules = change.rules ?? validRules();
+    const ruleset = { id: 27726920, enforcement: 'active', current_user_can_bypass: 'never', bypass_actors: [], ...change.ruleset };
+    const rows = change.rows ?? [{ id: 1, head_sha: SHA, name: 'test', status: 'in_progress', conclusion: null,
+      app: { id: 15368 }, check_suite: { id: 7 } }];
+    const gh = [];
+    let checkReads = 0, prReads = 0;
+    const home = mkdtempSync(join(tmpdir(), 'hotpatch-load-'));
+    hotHomes.push(home);
+    const lockFs = Object.fromEntries(['openSync', 'closeSync', 'writeFileSync', 'unlinkSync', 'statSync'].map(k => [k, nodeFs[k]]));
+    const stat = lockFs.statSync;
+    lockFs.statSync = p => p.endsWith('/urgent-loads.jsonl') && change.loads !== undefined ? { size: Buffer.byteLength(change.loads) } : stat(p);
+    lockFs.mkdirSync = (p, ...args) => { if (p.startsWith(home)) return nodeFs.mkdirSync(p, ...args); };
+    lockFs.readFileSync = (p, ...args) => {
+      if (p.startsWith(home)) {
+        if (p.endsWith('/urgent-loads.jsonl') && change.loads !== undefined) return change.loads;
+        return nodeFs.readFileSync(p, ...args);
+      }
+      return originalRead(p, ...args);
+    };
+    let originalRead;
+    const combinedIO = { fs: {}, handles: (cmd, args) => cmd === 'gh' || cmd === 'git' && args[0] === 'remote',
+      exec: (cmd, args) => {
+        if (cmd === 'git') return change.origin ?? `https://github.com/${repo}.git\n`;
+        gh.push(args);
+        const path = args.find(a => a.startsWith('repos/'));
+        if (args[0] === 'repo') return JSON.stringify({ nameWithOwner: repo, url: `https://github.com/${repo}` });
+        if (args.at(-1) === '.full_name') {
+          if (change.originFailure) throw Error('API unavailable');
+          return change.resolvedOrigin ?? repo;
+        }
+        if (path?.includes('/check-runs')) {
+          const current = ++checkReads > 1 ? change.finalRows ?? rows : rows;
+          return JSON.stringify({ total_count: current.length, check_runs: current });
+        }
+        if (path?.includes('/actions/runs')) return JSON.stringify({ total_count: 2, workflow_runs: [7, 8].map(check_suite_id => ({ check_suite_id, head_sha: SHA, path: '.github/workflows/ci.yml' })) });
+        if (path === `repos/${repo}/commits/${SHA}/pulls`) return JSON.stringify(++prReads > 1 ? change.finalPrs ?? prs : prs);
+        if (path?.includes('/pulls?')) return JSON.stringify(prs);
+        if (path === `repos/${repo}/pulls/42`) return JSON.stringify(prs[0]);
+        if (path?.includes('/rules/branches/')) return JSON.stringify(rules);
+        if (path === `repos/${repo}/rulesets/27726920`) return JSON.stringify(ruleset);
+        throw new Error(`unexpected hot-patch evidence read: ${args.join(' ')}`);
+      } };
+    const f = fixture({ ready: '', defaultTestCheck: true, combinedIO, ...change.options });
+    originalRead = f.fs.readFileSync;
+    Object.assign(f.fs, lockFs);
+    // The loader's home stays hermetic; only lock paths are redirected to real temp IO.
+    const redirect = p => p.replace('/home/test/workspace/.operations/coordination', `${home}/coordination`);
+    for (const k of ['openSync', 'writeFileSync', 'unlinkSync', 'statSync', 'mkdirSync']) {
+      const fn = f.fs[k]; f.fs[k] = (p, ...args) => fn(typeof p === 'string' ? redirect(p) : p, ...args);
+    }
+    f.fs.readFileSync = (p, ...args) => p.includes('/coordination/') ? lockFs.readFileSync(redirect(p), ...args) : originalRead(p, ...args);
+    return { ...f, gh, run: (input = {}) => f.run({ branch, urgent: true, reason: 'R1100 hot-patch PR #42', ...input }) };
+  }
+  it('accepts a renamed SSH origin resolved by GitHub', async () => {
+    const f = hotFixture({ origin: 'git@github.com:chalbert/web-everything.git' });
+    expect(await f.run()).toMatchObject({ ok: true });
+    expect(f.gh.filter(args => args.at(-1) === '.full_name')).toHaveLength(1);
+  });
+  it.each([
+    ['foreign', 'evil/fork', false], ['unavailable', undefined, true], ['empty', '', false],
+  ])('refuses %s resolved origin evidence', async (owner, resolvedOrigin, originFailure) => {
+    const f = hotFixture({ origin: `https://github.com/${owner}/web-everything`, resolvedOrigin, originFailure });
+    expect(await f.run()).toMatchObject({ ok: false, registered: false, detail: 'hot-patch-pr-protection' });
+    expect(mutations(f, 'add')).toHaveLength(0);
+  });
+  const vetoRun = (name, id, conclusion = 'failure') => ({ id, head_sha: SHA, name, status: 'completed', conclusion,
+    app: { id: 15368 }, check_suite: { id: 7 } });
+  const pendingTest = () => ({ ...vetoRun('test', 1), status: 'in_progress', conclusion: null });
+  const shardRows = () => [
+    { ...pendingTest(), name: 'test-shard (1)' },
+    vetoRun('test-shard (2)', 2, 'success'),
+  ];
+  it.each(['queued', 'in_progress', 'completed'])('admits bound %s shards without test as pending through the final re-read', async status => {
+    const rows = shardRows().map(r => ({ ...r, status, conclusion: status === 'completed' ? 'success' : null }));
+    const f = hotFixture({ rows });
+    expect(await f.run()).toMatchObject({ ok: true, registered: true });
+    expect(f.readyWrites[0]).toMatchObject({ tests: 'pending', testCheck: { name: 'test', status: 'in_progress', conclusion: null, suiteIds: [7] } });
+  });
+  it('refuses pending shards without test outside hot-patch mode', async () => {
+    const f = hotFixture({ rows: shardRows() });
+    expect(await f.run({ branch: 'lane/repair', urgent: false })).toMatchObject({ ok: false, registered: false, detail: 'ci-test-check-missing' });
+    expect(mutations(f, 'add')).toHaveLength(0);
+  });
+  it.each(['failure', 'cancelled', 'timed_out', 'action_required', 'startup_failure'])('refuses a %s shard at admission and final re-read', async conclusion => {
+    const failed = [shardRows()[0], vetoRun('test-shard (2)', 2, conclusion)];
+    for (const final of [false, true]) {
+      const f = hotFixture({ rows: final ? shardRows() : failed, ...(final ? { finalRows: failed } : {}) });
+      expect(await f.run()).toMatchObject({ ok: false, registered: false,
+        detail: final ? 'hot-patch-admission-changed' : 'ci-failed-urgent' });
+      expect(mutations(f, 'add')).toHaveLength(0);
+    }
+  });
+  it.each([
+    ['foreign app', () => shardRows().map(r => ({ ...r, app: { id: 99 } }))],
+    ['unbound workflow', () => shardRows().map(r => ({ ...r, check_suite: { id: 9 } }))],
+    ['wrong SHA', () => shardRows().map(r => ({ ...r, head_sha: TREE }))],
+    ['zero shards', () => []],
+    ['unknown shard name', () => [{ ...pendingTest(), name: 'test-shard (unknown)' }]],
+    ['unknown conclusion', () => [vetoRun('test-shard (1)', 1, 'neutral')]],
+    ['malformed shard', () => [{ ...shardRows()[0], check_suite: null }]],
+  ])('refuses %s shard evidence at admission and final re-read', async (_, rows) => {
+    for (const final of [false, true]) {
+      const f = hotFixture({ rows: final ? shardRows() : rows(), ...(final ? { finalRows: rows() } : {}) });
+      expect(await f.run()).toMatchObject({ ok: false, registered: false, ...(final ? { detail: 'hot-patch-admission-changed' } : {}) });
+      expect(mutations(f, 'add')).toHaveLength(0);
+    }
+  });
+  it.each(['test', 'unknown-job', 'review-gatekeeper', 'prefix-review-gate'])('vetoes review-gate red plus failing %s at admission and final re-read', async name => {
+    for (const final of [false, true]) {
+      const rows = [pendingTest(), vetoRun('review-gate', 2)];
+      const failed = [...rows, vetoRun(name, 3)];
+      const f = hotFixture({ rows: final ? rows : failed, ...(final ? { finalRows: failed } : {}) });
+      expect(await f.run()).toMatchObject({ ok: false, registered: false,
+        detail: final ? 'hot-patch-admission-changed' : 'ci-failed-urgent' });
+      expect(mutations(f, 'add')).toHaveLength(0);
+    }
+  });
+  it.each(['review-gate', 'merge-gate', 'review-gate (matrix)', 'merge-gate (1)'])('admits with only %s red through the final re-read', async name => {
+    const f = hotFixture({ rows: [pendingTest(), vetoRun(name, 2)] });
+    expect(await f.run()).toMatchObject({ ok: true, registered: true });
+  });
+  it.each([undefined, null, [], 'review-gate', [null], ['']])('defaults an invalid or missing veto list: %j', async value => {
+    const f = hotFixture({ rows: [pendingTest(), vetoRun('review-gate', 2)], options: { settings: { hotPatch: { vetoIgnoreChecks: value } } } });
+    expect(await f.run()).toMatchObject({ ok: true });
+  });
+  it('defaults unreadable settings: ignores review-gate but still vetoes test-shard', async () => {
+    const policy = readHotPatchVetoPolicy({ fs: { readFileSync() { throw Error('unreadable'); } } });
+    expect(policy.value.hotPatch.vetoIgnoreChecks).toEqual(['review-gate', 'merge-gate']);
+    for (const failure of [false, true]) {
+      const rows = [pendingTest(), vetoRun('review-gate', 2), ...(failure ? [vetoRun('test-shard', 3)] : [])];
+      const f = hotFixture({ rows, options: { settings: policy.value } });
+      expect(await f.run()).toMatchObject({ ok: !failure, registered: !failure });
+    }
+  });
+  it('uses a configured veto ignore list with exact and matrix matching', async () => {
+    const f = hotFixture({ rows: [pendingTest(), vetoRun('custom-gate (1)', 2)],
+      options: { settings: { hotPatch: { vetoIgnoreChecks: ['custom-gate'] } } } });
+    expect(await f.run()).toMatchObject({ ok: true });
+  });
+  it('refuses clean admission whose stackBases includes a hotpatch', async () => {
+    const f = hotFixture({ options: { checkRaw: JSON.stringify({ check: { ok: true, clean: true,
+      candSha: SHA, stackBases: [`hotpatch/${TREE}`] }, wouldRegister: true }) } });
+    expect(await f.run()).toMatchObject({ ok: false, registered: false, detail: 'hot-patch-stack-refused' });
+    expect(f.calls.some(c => c.cmd === 'node' && c.args[1] === 'add' && !c.args.includes('--check'))).toBe(false);
+  });
+  it.each(['queued', 'in_progress', 'completed'])('accepts bound Actions test %s without a receipt and records hotPatch.pr', async status => {
+    const f = hotFixture({ rows: [{ id: 1, head_sha: SHA, name: 'test', status, conclusion: status === 'completed' ? 'success' : null,
+      app: { id: 15368 }, check_suite: { id: 7 } }] });
+    expect(await f.run()).toMatchObject({ ok: true, registered: true });
+    expect(f.records).toContainEqual(expect.objectContaining({ type: 'prototype-load.urgent', ref: branch, sha: SHA, hotPatch: { pr: 42 } }));
+    expect(f.readyWrites[0]).toMatchObject({ tests: status === 'completed' ? 'green' : 'pending', testCheck: { status } });
+    if (status !== 'completed') expect(prototypeLoad.readyEvidence(f.readyWrites, { branch, sha: SHA })).toBeNull();
+    expect(f.reads.some(p => p.endsWith('/urgent-full-green.jsonl'))).toBe(false);
+    expect(f.gh.some(args => args.includes(`repos/${repo}/commits/${SHA}/pulls`))).toBe(true);
+    expect(f.gh.some(args => args.includes(`repos/${repo}/rulesets/27726920`))).toBe(true);
+  });
+  it('refuses hot-patch replacement without changing the existing registration', async () => {
+    const f = hotFixture({ options: { list: ['lane/old'], contained: ['lane/old'] } });
+    expect(await f.run({ replace: 'lane/old' })).toMatchObject({ ok: false, registered: false, stopReason: 'bad-input', detail: 'hot-patch-replace-refused' });
+    expect(f.registrations.has('lane/old')).toBe(true);
+    expect(mutations(f, 'replace')).toHaveLength(0);
+    expect(f.records.some(r => r.type === 'prototype-load.urgent')).toBe(false);
+  });
+  it.each([
+    ['PR closed', { finalPrs: [{ ...validPr(), state: 'closed' }] }],
+    ['CI failed', { finalRows: [{ id: 2, head_sha: SHA, name: 'daemon-soak', status: 'completed', conclusion: 'failure', app: { id: 15368 }, check_suite: { id: 8 } }] }],
+  ])('refuses %s during preparation before recording intent or registering', async (_, change) => {
+    const f = hotFixture(change);
+    expect(await f.run()).toMatchObject({ ok: false, registered: false });
+    expect(mutations(f, 'add')).toHaveLength(0);
+    expect(f.records.some(r => r.type === 'prototype-load.urgent')).toBe(false);
+    expect(f.readyWrites).toHaveLength(0);
+  });
+  it('passes hot-patch provenance through an in-process module invocation for check and registration', async () => {
+    const f = hotFixture();
+    expect(await f.run()).toMatchObject({ ok: true, registered: true });
+    const admissions = f.calls.filter(c => c.cmd === 'node' && c.args[1] === 'add');
+    expect(admissions).toHaveLength(2);
+    for (const call of admissions) {
+      expect(call.invocationArgs?.slice(0, 2)).toEqual(['--input-type=module', '--eval']);
+      expect(call.invocationArgs?.[2]).toContain('hotPatchProvenance: true');
+      expect(call.args.some(arg => /provenance/i.test(arg))).toBe(false);
+    }
+  });
+  it.each(['neutral', 'skipped', 'cancelled', 'stale'])('refuses queued test masking completed %s in any suite', async conclusion => {
+    const f = hotFixture({ rows: [
+      { id: 1, head_sha: SHA, name: 'test', status: 'queued', conclusion: null, app: { id: 15368 }, check_suite: { id: 7 } },
+      { id: 2, head_sha: SHA, name: 'test', status: 'completed', conclusion, app: { id: 15368 }, check_suite: { id: 8 } },
+    ] });
+    expect(await f.run()).toMatchObject({ ok: false, registered: false });
+    expect(mutations(f, 'add')).toHaveLength(0);
+  });
+  it('refuses behind main before creating or publishing a merge ref', async () => {
+    const f = hotFixture({ options: { behind: true } });
+    expect(await f.run()).toMatchObject({ ok: false, registered: false, detail: 'hot-patch-behind-main' });
+    expect(f.calls.some(c => c.cmd === 'git' && ['merge-tree', 'commit-tree', 'push'].includes(c.args[0]))).toBe(false);
+    expect(mutations(f, 'add')).toHaveLength(0);
+  });
+  it('direct hot-patch load refuses another unsettled hot patch', async () => {
+    const f = hotFixture({ loads: JSON.stringify({ type: 'prototype-load.urgent', ref: `hotpatch/${TREE}`, sha: TREE }) + '\n' });
+    expect(await f.run()).toMatchObject({ ok: false, registered: false, detail: 'hot-patch-singleton' });
+    expect(mutations(f, 'add')).toHaveLength(0);
+  });
+  it('direct concurrent hot-patch requests reserve exclusively and release after refusal', async () => {
+    let release, entered;
+    const started = new Promise(r => { entered = r; });
+    let checks = 0;
+    const f = hotFixture({ options: { defaultTestCheck: false, testCheck: async () => { if (checks++ === 0) { entered(); await new Promise(r => { release = r; }); } return null; } } });
+    const first = f.run(); await started;
+    expect(await f.run()).toMatchObject({ ok: false, registered: false, detail: 'hot-patch-singleton' });
+    release(); await first;
+    expect((await f.run()).detail).not.toBe('hot-patch-singleton');
+    expect(mutations(f, 'add')).toHaveLength(0);
+  });
+  it.each(['{malformed', ' '.repeat(4 * 1024 * 1024 + 1)])('refuses malformed or oversized singleton ledger (%#)', async loads => {
+    const f = hotFixture({ loads });
+    const result = await f.run();
+    expect(result).toMatchObject({ ok: false, registered: false, detail: 'hot-patch-singleton' });
+    expect(result.fallback).toMatch(/inspect|settle/i);
+    expect(mutations(f, 'add')).toHaveLength(0);
+  });
+  it('direct admission refuses ruleset bypass actors despite current user never', async () => {
+    const f = hotFixture({ ruleset: { bypass_actors: [{ actor_id: 1, actor_type: 'Team', bypass_mode: 'always' }] } });
+    expect(await f.run()).toMatchObject({ ok: false, registered: false, detail: 'hot-patch-pr-protection' });
+  });
+  const refusalCases = [
+    ['zero PRs', { prs: [] }, /pr/i],
+    ['two PRs', { prs: [validPr(), { ...validPr(), number: 43 }] }, /pr/i],
+    ['PR head differs', { prs: [{ ...validPr(), head: { ...validPr().head, sha: TREE } }] }, /pr|head/i],
+    ['base differs', { prs: [{ ...validPr(), base: { ...validPr().base, ref: 'release' } }] }, /pr|base/i],
+    ['foreign repo', { prs: [{ ...validPr(), head: { ...validPr().head, repo: { full_name: 'other/repo' } } }] }, /pr|repo/i],
+    ['missing rule', { rules: validRules().filter(r => r.type !== 'deletion') }, /rules|protect/i],
+    ['inactive ruleset', { ruleset: { enforcement: 'disabled' } }, /rules|protect/i],
+    ['bypassable ruleset', { ruleset: { current_user_can_bypass: 'always' } }, /rules|protect/i],
+    ['ruleset id mismatch', { ruleset: { id: 27726921 } }, /rules|protect/i],
+    ['any failed check', { rows: [{ id: 1, head_sha: SHA, name: 'test', status: 'in_progress', conclusion: null, app: { id: 15368 }, check_suite: { id: 7 } },
+      { id: 2, head_sha: SHA, name: 'daemon-soak', status: 'completed', conclusion: 'failure', app: { id: 15368 }, check_suite: { id: 8 } }] }, /ci.*fail/i],
+    ['health-watch target', { options: { settings: { daemons: { 'health-watch': { label: 'com.we.health-watch', clone: 'wev-health-watch' } } } } }, /health.watch/i],
+    ['no audit', { options: { audits: '' } }, /audit/i],
+  ];
+  it.each(refusalCases)('refuses %s on its own evidence field', async (name, change, diagnostic) => {
+    const f = hotFixture(change);
+    const result = await f.run(name === 'health-watch target' ? { daemon: 'health-watch' } : {});
+    expect(result).toMatchObject({ ok: false, registered: false });
+    // A generic bad-branch or missing-receipt refusal does not prove the new evidence gate.
+    expect([result.stopReason, result.detail, result.error, result.fallback].filter(Boolean).join(' ')).toMatch(diagnostic);
+    expect(result.detail).not.toBe('bad-branch');
+    expect(mutations(f, 'add')).toHaveLength(0);
+  });
+  it.each([`hotpatch/${TREE}`, `hotpatch/${SHA}-other`])('refuses ref %s that is not exactly hotpatch/input.sha', async ref => {
+    const f = hotFixture();
+    expect(await f.run({ branch: ref })).toMatchObject({ ok: false, stopReason: 'bad-input', registered: false });
+    expect(mutations(f, 'add')).toHaveLength(0);
+  });
+  it('a lane urgent load still requires the signed full-suite receipt', async () => {
+    const f = hotFixture();
+    expect(await f.run({ branch: BASE.branch })).toMatchObject({ ok: false, detail: 'no-urgent-marker' });
+    expect(mutations(f, 'add')).toHaveLength(0);
   });
 });
