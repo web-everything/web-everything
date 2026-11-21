@@ -2013,6 +2013,7 @@
  },
  "soak": {
   "scripts/conveyor/soak/breaks/runtime-admission-infra-retention.soak.test.mjs": 0.1,
+  "scripts/conveyor/soak/breaks/builder-only-mode-prepare.soak.test.mjs": 0.5,
   "scripts/conveyor/soak/breaks/forge-manifest-untracked-shipped.soak.test.mjs": 0.3,
   "scripts/conveyor/soak/breaks/catch-up-clean-first-snapshot-first.soak.test.mjs": 4.65,
   "scripts/conveyor/soak/breaks/rebuild-job-ready-candidate-starvation.soak.test.mjs": 2,
