@@ -225,14 +225,15 @@ describe('free-lane list is refreshed by lane-pool events (real CLI, one pool pr
     const first = await acquire('first');
     expect(first.code, first.err).toBe(0);
     expect(JSON.parse(first.out).lane).toBe(4); // lanes 1-3 refused by the guard, litter-only lane 4 handed out
-    for (const n of [1, 2, 3]) expect(first.err).toMatch(new RegExp(`lane-${n} is not provably clean and pushed`));
+    // Hints are rechecked before claiming: unsafe lanes are skipped without a provision-time refusal.
+    for (const n of [1, 2, 3]) expect(existsSync(join(laneDir(n), '.git', '.lane-lease'))).toBe(false);
     expect(listed()).not.toContain(4); // the acquire event removed it
     const second = await acquire('second');
     expect(second.code, second.err).toBe(0);
     expect(JSON.parse(second.out).lane).toBe(5); // squash-merged + pruned counts as pushed
     const third = await acquire('third');
     expect(third.code).not.toBe(0); // only the dirty / unpushed / stale-ref lanes are left
-    for (const n of [1, 2, 3]) expect(third.err).toMatch(new RegExp(`lane-${n} is not provably clean and pushed`));
+    for (const n of [1, 2, 3]) expect(existsSync(join(laneDir(n), '.git', '.lane-lease'))).toBe(false);
     // The refused lanes' work is untouched.
     expect(readFileSync(join(laneDir(1), 'file.txt'), 'utf8')).toBe('edited after publication\n');
     expect(git(['log', '-1', '--format=%s'], laneDir(2))).toBe('unpushed-work');
