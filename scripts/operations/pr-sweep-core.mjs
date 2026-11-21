@@ -352,6 +352,10 @@ export function deriveWaitingOn(pr, ctx) {
     if (enqueued) return done('in-merge-queue', 'drain', enqueued.at, 'enqueued on the merge queue', null, ['we-drain-enqueue-clearance']);
     return done('ready-to-merge', 'drain', moved('ready-to-merge', 'review:accepted'), 'ready; the drain has not merged it yet', null, ['label ready-to-merge']);
   }
+  // Last resort (after every explicit drain hold): an advisory wait with nothing else says the review daemon owes the next move.
+  if (has('review:awaiting-advisory')) {
+    return done('awaiting-review', 'reviewer', moved('review:awaiting-advisory') ?? 0, 'an advisory review is owed', actions.rerunReview, ['label review:awaiting-advisory']);
+  }
   return done('unclassified', 'nobody', null, 'no signal says who moves next', actions.why, []);
 }
 

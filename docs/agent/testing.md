@@ -5030,6 +5030,14 @@ a live target replacing a stale cached target with a different head and red chec
 Run it with `fast-drain-scope.test.mjs` and `merge-ai-prs.test.mjs` through heavy-admission. Keep `listing.*` phase timers for
 comparison against daemon observations; fixtures prove IO counts without live GitHub calls.
 
+Drain heavy-field hydration uses the shared ordered pool at width six. Keep seed/freshness and
+cache assembly shared with the synchronous reader; a failed or incomplete heavy read rejects
+the whole listing. Join outstanding reads before retrying so retries cannot exceed the pool
+bound. Async listings need `withListRetryAsync` to observe rejected reads. Default-branch names
+are static per process, with concurrent round/listing lookups sharing one pending read; gate
+evidence still comes from live reads. The `listing hydrates heavy fields with bounded concurrency`
+tests in `pr-list-paged.test.mjs` and `merge-ai-prs.test.mjs` cover these guarantees.
+
 ## Drain read-migration fixture imports
 
 Load the drain/adoption graph with static imports during collection in
@@ -5706,6 +5714,16 @@ Check mode fetches origin main before evaluating canonical audit evidence. A fai
 `main not refreshed: <reason>` and refuses even when local evidence would pass against stale refs.
 `open-pr-audit-gate.test.mjs` covers both refresh outcomes, aggregation and an unconfirmed check child.
 
+## Shadow-only static selection edges
+
+`scripts/lib/static-selection-edges.mjs` measures comment-stripped imports, alias imports,
+and literal spawn/read paths without changing gate selection. An optional `selectTests`
+callback adds a `shadow: { tests, partial }` field; it never changes `mode` or the existing decision.
+In `--measure` only, `WE_STATIC_EDGES_SHADOW` or `WE_DIFF_TEST_SELECTION=1` enables this
+diagnostic and records `shadowEscaped` failures outside its test list. Each source has a
+512 KB UTF-8 input cap: oversized files are skipped; oversized or unreadable evidence
+sets `partial: true` (as does a truncated test list). Treat partial output as incomplete
+measurement requiring inspection, never as proof of coverage or an input to a gate.
 ## CI workflow self-test (ci-self.yml)
 
 An edit to `ci.yml` is never run by its own PR: the ruleset pins the workflow from main. Before a
@@ -5733,6 +5751,21 @@ refusal, and assert no checkout/reset/clean follows a failed probe. The bounded 
 reader wraps the original stderr in `ProcReadError.cause`; preserve that stderr (or the
 spawn error message) in probe diagnostics rather than reporting zero counts as proof.
 
+## Async drain worker CLI fixtures
+
+The in-process merge drain harness ports `node drain-gh-async.mjs <bounds> <gh args>`
+through the real synchronous throttle to its fake gh function port. Preserve the serialized
+timeout and hard child kill signal, drain caller attribution and read-memo exclusion when updating this seam.
+Unknown subprocesses still fail the harness even when a best-effort reader catches them.
+`merge-ai-prs-listing-dedupe.test.mjs` covers successful listings and worker failure with
+the CLI's `gh-error` exit; `merge-ai-prs-prestage.test.mjs` covers paged heavy reads and enqueue gates.
+Use `keepAliveScript` for the hung-gh timeout fixture in `drain-gh-async.test.mjs` so it
+stays anchored to the test runner with a maximum lifetime if timeout cleanup is interrupted.
+The async drain executor uses SIGKILL for gh timeout termination, including when callers omit
+the signal or request a soft signal: synchronous child waits otherwise remain blocked when gh
+ignores that signal. Keep the worker alive through child reaping and throttle-slot release.
+The parameterized soft-signal regression checks elapsed time, child exit and slot cleanup with
+real subprocesses; the existing explicit-SIGKILL case pins the hydration callers' behavior.
 ## File-item batch history and warning coverage
 
 Existing batch validation must use the advertised remote main commit without updating the lane's
