@@ -33,14 +33,16 @@ export function directionFor(policy, leaf = '') {
   return Object.hasOwn(SAFE_DIRECTION, keyOf(policy, leaf)) ? SAFE_DIRECTION[keyOf(policy, leaf)] : undefined;
 }
 
-const same = (a, b) => JSON.stringify(a) === JSON.stringify(b);
-
 /** True when moving `from` → `to` loosens a key whose safe direction is `entry.safe`. Equal values never loosen. */
 export function isLoosening(entry, from, to) {
   const safe = typeof entry === 'string' ? entry : entry?.safe;
   if (typeof safe !== 'string') return true;
-  if (from !== undefined && same(from, to)) return false;
-  if (safe === 'true' || safe === 'false') return to !== (safe === 'true');
+  // Validate both sides for the kind BEFORE the equality shortcut: equal malformed values are still loosening.
+  if (safe === 'true' || safe === 'false') {
+    if (typeof to !== 'boolean') return true;
+    if (typeof from === 'boolean' && from === to) return false;
+    return to !== (safe === 'true');
+  }
   if (safe === 'min' || safe === 'max') {
     if (typeof from !== 'number' || typeof to !== 'number' || !Number.isFinite(from) || !Number.isFinite(to)) return true;
     return safe === 'min' ? to > from : to < from;

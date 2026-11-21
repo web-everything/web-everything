@@ -24,6 +24,13 @@ describe('settings safe direction', () => {
     expect(isLoosening({}, 1, 1.5)).toBe(true);
     expect(isLoosening('mystery', 1, 2)).toBe(true);
   });
+  it('equal malformed values are still loosening (validate before equality)', () => {
+    expect(isLoosening('min', NaN, NaN)).toBe(true);
+    expect(isLoosening('subset', 'bad', 'bad')).toBe(true);
+    expect(isLoosening('true', 'x', 'x')).toBe(true);
+    expect(isLoosening('enum:a,b', 'zz', 'zz')).toBe(true);
+    expect(isLoosening('true', {}, {})).toBe(true);
+  });
   it('subset, min, max and enum directions', () => {
     expect(isLoosening('subset', ['a', 'b'], ['a'])).toBe(false);
     expect(isLoosening('subset', ['a'], ['a', 'b'])).toBe(true);

@@ -163,7 +163,8 @@ export function resolveCascade({ standard, platform, tool, envValues = {}, valid
     if (policy) {
       // D15: env may only tighten a classed safety leaf; an unclassed leaf applies as before and is shadow-reported.
       const refused = [];
-      const probes = isObj(v) ? [...leaves(v).values()].map(l => l.path) : [[]];
+      // An object under a classed leaf is judged as one value (it cannot be a safe boolean/list); else leaf by leaf.
+      const probes = isObj(v) && classify(policy, path.join('.')) === 'unclassed' ? [...leaves(v).values()].map(l => l.path) : [[]];
       for (const rel of probes) {
         const full = [...path, ...rel];
         const leaf = full.join('.');
@@ -178,7 +179,7 @@ export function resolveCascade({ standard, platform, tool, envValues = {}, valid
           refused.push({ rel, from });
         }
       }
-      if (refused.length && !isObj(v)) continue;
+      if (refused.some(r => !r.rel.length)) continue;
       if (refused.length) {
         v = structuredClone(v);
         for (const { rel, from } of refused) { if (from === undefined) deleteLeaf(v, rel); else setLeaf(v, rel, from); }

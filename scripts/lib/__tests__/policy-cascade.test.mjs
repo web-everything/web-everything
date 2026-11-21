@@ -105,6 +105,17 @@ describe('D15 slice 1: env may only tighten a safety key', () => {
     expect(o.value).toEqual({ recheckReadsRepo: true, skipCardOnly: false, extra: 2 });
     expect(o.invalid.length).toBe(1);
   });
+  it('an object replacing a classed safety leaf is refused as one value', () => {
+    const r = resolveCascade({ policy: 'redTeam', standard: { skipCardOnly: false },
+      envValues: { skipCardOnly: { x: 1 } }, log: () => {} });
+    expect(r.value.skipCardOnly).toBe(false);
+    expect(r.invalid.length).toBe(1);
+  });
+  it('a malformed env care-exempt list never restores built-in exemptions over tool []', () => {
+    const r = resolveReviewCareExemptPaths({ env: { WE_REVIEW_CARE_EXEMPT_PATHS: 'garbage' },
+      file: 'x', readFile: () => '{"careExemptPaths":[]}', log: () => {} });
+    expect(r.value).toEqual([]);
+  });
   it('a type mismatch on a classed leaf counts as loosening', () => {
     const r = resolveCascade({ policy: 'review', standard: { unattendedAcceptRequiresCleanReferrals: true },
       envValues: { unattendedAcceptRequiresCleanReferrals: 'yes' }, log: () => {} });
