@@ -344,7 +344,7 @@ describe('wiring (source pins)', () => {
   // PR #6674 round 2 — the forge steps above are only as good as their call sites in pr-land and verify-lane.
   it('pr-land checks the deferred CI gate BEFORE applyLabel, exits 3 on refusal, and is the only applyLabel call', () => {
     const src = readFileSync('scripts/pr-land.mjs', 'utf8');
-    expect(src).toMatch(/if \(PLAN\.labelWhenGreen\) \{\s*const deferredRefusal = deferredLabelRefusal\(\{ forge, prNum, sha: refSha, deferred: DEFERRED_TO_CI \}\);\s*if \(deferredRefusal\) emit\(\{ repo: REPO, merged: false, \.\.\.deferredRefusal \}, 3\);\s*applyLabel\(\);\s*\}/);
+    expect(src).toMatch(/if \(PLAN\.labelWhenGreen\) \{\s*const deferredRefusal = deferredLabelRefusal\(\{ forge, prNum, sha: refSha, deferred: DEFERRED_TO_CI \}\);\s*if \(deferredRefusal\) emit\(\{ repo: REPO, merged: false, \.\.\.deferredRefusal \}, 3\);\s*assertPrHeadMatches\(\);\s*applyLabel\(\);\s*\}/);
     expect(src.match(/^\s*(?:if \([^)]*\) )?applyLabel\(\);/gm)).toHaveLength(1);
   });
   it('pr-land adds the disclosure on create and on a rerun against an open PR', () => {

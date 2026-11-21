@@ -4762,7 +4762,7 @@ fs.writeFileSync('state.json', JSON.stringify(s));
     const realGit = execFileSync('which', ['git'], { encoding: 'utf8' }).trim();
     writeFileSync(join(dir, 'bin', 'git'), `#!${process.execPath}
 const cp = require('node:child_process');
-if(process.argv[2] === 'diff') process.exit(1);
+if(process.argv.slice(2).includes('diff')) process.exit(1);
 const r = cp.spawnSync(${JSON.stringify(realGit)}, process.argv.slice(2), {stdio:'inherit'}); process.exit(r.status ?? 1);
 `);
     chmodSync(join(dir, 'bin', 'git'), 0o755);

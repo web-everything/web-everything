@@ -6,6 +6,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { openPrPageFixture } from '../../__tests__/fixtures/open-pr-page-fixture.mjs';
+import { drainScoredGit } from '../../__tests__/fixtures/drain-scored-git.mjs';
 import { cardGroupHold } from '../card-group.mjs';
 
 const script = fileURLToPath(new URL('../../merge-ai-prs.mjs', import.meta.url));
@@ -49,12 +50,10 @@ const fakeGit = `#!/usr/bin/env node
 const fs = require('node:fs'), a = process.argv.slice(2);
 fs.appendFileSync(process.env.GROUP_LOG, JSON.stringify(['git', ...a]) + '\\n');
 if (a[0] === 'remote' && a[1] === 'get-url') process.stdout.write('git@github.com:${slug}.git\\n');
-else if (['rev-parse','merge-base'].includes(a[0])) process.stdout.write('${sha}\\n');
-else if (a[0] === 'diff') {
-  if (a.includes('--name-only')) process.stdout.write('README.md\\0');
-  else if (a.includes('--numstat')) process.stdout.write('1\\t0\\tREADME.md\\n');
-  else process.stdout.write('diff --git a/README.md b/README.md\\n--- a/README.md\\n+++ b/README.md\\n@@ -1 +1 @@\\n-old\\n+new\\n');
-} else if (a[0] === 'show') process.exit(1);
+const scored = (${drainScoredGit.toString()})(a, { gitDir: process.cwd() + '/.git', head: '${sha}',
+  files: [{ path: 'README.md', additions: 1, deletions: 1 }] });
+if (scored) { process.stdout.write(scored.stdout); process.exit(scored.status); }
+if (a[0] === 'show') process.exit(1);
 // Repair entry is observable even if plumbing refuses: never mint or push fixture commits.
 else if (a[0] === 'merge-tree') { process.stderr.write('fixture stops repair here'); process.exit(1); }
 `;

@@ -94,7 +94,8 @@ process.exit(0);
 `;
 const fakeGit = `#!/usr/bin/env node
 const fs = require('node:fs');
-const a = process.argv.slice(2);
+let a = process.argv.slice(2);
+while (a[0] === '-c') a = a.slice(2);
 if (a[0] === 'ls-remote') fs.appendFileSync(process.env.MQ_FIXTURE + '.refresh-pins', a.join(' ') + '\\n');
 if (a[0] === 'fetch') fs.appendFileSync(process.env.MQ_FIXTURE + '.rebase-fetches', a.join(' ') + '\\n');
 if (a[0] === 'merge-tree') fs.appendFileSync(process.env.MQ_FIXTURE + '.rebase-trees', a.join(' ') + '\\n');
@@ -366,6 +367,10 @@ const COUPLE_TEST_TIMEOUT_MS = 300_000 * TIMEOUT_SCALE;
 function runCouple({ implPassAges, carrierPassAges, secondImplPassAges = null, env: extraEnv = {} }) {
   const dir = mkdtempSync(join(tmpdir(), 'drain-mq-couple-'));
   try {
+    const cwd = join(dir, 'local');
+    mkdirSync(cwd);
+    // The hardened scorer needs a clone for each member; all Git IO still uses the shims.
+    for (const name of ['frontierui', 'plateau-app']) mkdirSync(join(dir, name, '.git'), { recursive: true });
     const bin = join(dir, 'bin');
     mkdirSync(bin);
     for (const [name, code] of [['gh', fakeGhCouple], ['git', fakeGitCouple]]) writeFileSync(join(bin, name), code, { mode: 0o755 });
@@ -396,7 +401,7 @@ function runCouple({ implPassAges, carrierPassAges, secondImplPassAges = null, e
     const preload = 'data:text/javascript,' + encodeURIComponent("import os from 'node:os'; import { syncBuiltinESMExports } from 'node:module'; os.homedir = () => process.env.MQ_HOME; syncBuiltinESMExports();");
     const r = spawnSync(process.execPath, ['--import', preload, script, `--repos=${LOCAL},${FUI}${secondImplPassAges ? `,${PA}` : ''}`, '--label=ready-to-merge',
       '--no-drain-lease', '--no-red-main-freeze', '--json'], { // reconcile ON: a couple's gate needs the complete open-PR context
-      cwd: dir, encoding: 'utf8', timeout: COUPLE_RUN_TIMEOUT_MS,
+      cwd, encoding: 'utf8', timeout: COUPLE_RUN_TIMEOUT_MS,
       env: { ...process.env, ...daemonAppEnv(dir), WE_MERGE_QUEUE_SKIP_REBASE_APPROVED_HUMAN_SURFACE: 'off', PATH: `${bin}:${process.env.PATH}`, MQ_FIXTURE: fixture, MQ_HOME: dir, WE_MERGE_QUEUE_SETTINGS_FILE: settings, WE_COORDINATION_ROOT: coord,
         // Carrier pre-check and impl revalidation each retry; keep their real reads, omit production waits.
         WE_DRAIN_MERGEABLE_UNKNOWN_REPOLL_SEC: '0', ...extraEnv },

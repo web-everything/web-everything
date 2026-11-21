@@ -425,7 +425,7 @@ describe('direct pr-land uses the same admission and existing review-label path'
     expect(result.body).toMatch(/split card.*(?:9001|xsplit1).*filed/i);
     expect(result.body).toContain('extra reviewers requested via the size escalation (review:pending)');
     expect(result.body).toMatch(/file groups[^\n]*docs\/agent[^\n]*301/i);
-    const verdict = prLand.resolveProducerReviewLabel({ changedFiles: ['docs/agent/a.md'], diffLines: 301, sizeAdmission: result });
+    const verdict = prLand.resolveProducerReviewLabel({ netDiffScored: true, changedFiles: ['docs/agent/a.md'], diffLines: 301, sizeAdmission: result });
     expect(verdict).toMatchObject({ label: REVIEW_LABELS.pending, apply: true });
   });
 
@@ -446,7 +446,7 @@ describe('direct pr-land uses the same admission and existing review-label path'
     expect(result.body).toContain('size unknown: extra reviewers requested');
     expect(result.body).toMatch(/file groups/i);
     expect(effects.fileItem).toHaveBeenCalledOnce();
-    expect(prLand.resolveProducerReviewLabel({ changedFiles: [], diffLines: 0, sizeAdmission: result }))
+    expect(prLand.resolveProducerReviewLabel({ netDiffScored: true, changedFiles: [], diffLines: 0, sizeAdmission: result }))
       .toMatchObject({ label: REVIEW_LABELS.pending, apply: true });
   });
 
@@ -524,13 +524,13 @@ describe('direct pr-land uses the same admission and existing review-label path'
 
   it.each(['over', 'unknown'])('forces %s through review:pending even below the existing 400-line threshold', (status) => {
     // #size-adds-reviewers-never-refuses: reuse the producer rubric/label path.
-    expect(prLand.resolveProducerReviewLabel({ changedFiles: ['docs/example.md'], diffLines: 301,
+    expect(prLand.resolveProducerReviewLabel({ netDiffScored: true, changedFiles: ['docs/example.md'], diffLines: 301,
       sizeAdmission: { status, lines: status === 'unknown' ? null : 301 } }))
       .toMatchObject({ label: REVIEW_LABELS.pending, apply: true });
   });
 
   it('forcing size escalation preserves an existing stronger human-review requirement', () => {
-    const verdict = prLand.resolveProducerReviewLabel({ changedFiles: [], diffLines: 301,
+    const verdict = prLand.resolveProducerReviewLabel({ netDiffScored: true, changedFiles: [], diffLines: 301,
       deviation: 'operator ruling required', sizeAdmission: { status: 'over', lines: 301 } });
     expect(verdict).toMatchObject({ label: REVIEW_LABELS.human, humanRequired: true });
   });
@@ -546,7 +546,7 @@ describe('direct pr-land uses the same admission and existing review-label path'
     } : {});
     const admission = await run();
     expect(admission.status).toBe(status);
-    const verdict = prLand.resolveProducerReviewLabel({
+    const verdict = prLand.resolveProducerReviewLabel({ netDiffScored: true,
       changedFiles: ['docs/example.md'], diffLines: admission.lines ?? 0,
       sizeAdmission: admission, deviation,
     });
@@ -705,7 +705,7 @@ describe('pr-land CLI size failure boundaries', () => {
       const result = await runBlock(forge, admit, prNum, REVIEW_LABELS);
       expect(result).toEqual({ sizeAdmission: { status: 'unknown', body, reviewLabel: REVIEW_LABELS.pending }, createParams: { body } });
       expect(forge.editBody).not.toHaveBeenCalled();
-      expect(prLand.resolveProducerReviewLabel({ sizeAdmission: result.sizeAdmission }))
+      expect(prLand.resolveProducerReviewLabel({ netDiffScored: true, sizeAdmission: result.sizeAdmission }))
         .toMatchObject({ label: REVIEW_LABELS.pending, apply: true });
     }
   });
