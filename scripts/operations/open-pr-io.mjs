@@ -94,13 +94,16 @@ export const OPEN_PR_TIMEOUT_MS = 30 * 60 * 1000;
  * caller refuses it rather than opening a PR whose body does not record the bypass. `cleanup` removes the copy.
  */
 function withBypassInBody(argv, b, cwd) {
+  return withNoteInBody(argv, renderBypassNote(b), cwd);
+}
+function withNoteInBody(argv, note, cwd) {
   const i = argv.findIndex((a) => a.startsWith('--body-file='));
   if (i < 0) throw new Error('the request has no --body-file, so the bypass cannot be recorded in the PR body');
   const dir = mkdtempSync(join(tmpdir(), 'open-pr-bypass-'));
   const cleanup = () => rmSync(dir, { recursive: true, force: true });
   try {
     const out = join(dir, 'body.md');
-    writeFileSync(out, readFileSync(bodyFilePath(argv[i].slice('--body-file='.length), cwd), 'utf8') + renderBypassNote(b));
+    writeFileSync(out, readFileSync(bodyFilePath(argv[i].slice('--body-file='.length), cwd), 'utf8') + note);
     return { argv: argv.map((a, j) => (j === i ? `--body-file=${out}` : a)), cleanup };
   } catch (e) { cleanup(); throw e; }
 }
@@ -237,6 +240,21 @@ export function createPrLandRunner({ canonicalAudit = checkCanonicalAuditForOpen
     else if (bypass) {
       try { ({ argv, cleanup: cleanupBody } = withBypassInBody(argv, bypass, cwd)); }
       catch (e) { return { outcome: 'refused', reason: 'pre-pr-review-bypass-unrecorded', detail: `bypass refused — ${e.message}` }; }
+    }
+    if (audit?.ok && audit.carried) {
+      const c = audit.carried;
+      process.stderr.write(`carried-across-main-merge ${c.from.slice(0, 8)}..${c.to.slice(0, 8)} fp ${c.fingerprint.slice(0, 8)} ruling ${c.ruling ?? 'none'}\n`);
+      if (!collectOnly && arg('body-file')) {
+        const previousCleanup = cleanupBody;
+        try {
+          const noted = withNoteInBody(argv, `\n<!-- audit-carry: carried-across-main-merge ${c.from}..${c.to} -->\nMain-merge audit carry preserves the lane diff; CI still runs on the merged head.\n`, cwd);
+          argv = noted.argv;
+          cleanupBody = () => { noted.cleanup(); previousCleanup(); };
+        } catch (e) {
+          previousCleanup();
+          return { outcome: 'refused', reason: 'audit-carry-unrecorded', detail: e.message };
+        }
+      }
     }
     try {
       r = spawn(process.execPath, [PR_LAND_CLI, ...argv, '--json'], {

@@ -1484,6 +1484,7 @@
   "scripts/operations/__tests__/cache-hit-report.test.mjs": 0.03,
   "scripts/operations/__tests__/call-log.test.mjs": 0.88,
   "scripts/operations/__tests__/canonical-audit-gate.test.mjs": 0.07,
+  "scripts/operations/__tests__/canonical-audit-main-merge-carry.test.mjs": 5,
   "scripts/operations/__tests__/card-batch-extract.test.mjs": 64.44,
   "scripts/operations/__tests__/card-batch-file.test.mjs": 7.9,
   "scripts/operations/__tests__/card-batch-hold-state.test.mjs": 0.01,

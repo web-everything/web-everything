@@ -40,6 +40,26 @@ describe('combined open-pr preflight', () => {
     expect(spawn.mock.calls[0][1]).toContain('--check');
     expect(spawn.mock.calls[0][1].some(a => a.startsWith('--body-file='))).toBe(false);
   });
+  it('prints carry provenance and passes a body copy with the audit-carry marker', () => {
+    const dir = mkdtempSync(join(process.env.TMPDIR || tmpdir(), 'open-carry-'));
+    const body = join(dir, 'body.md'); writeFileSync(body, 'Review body\n');
+    const carried = { kind: 'carried-across-main-merge', from: base, to: sha, fingerprint: 'f'.repeat(64), ruling: 'R123' };
+    const output = vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
+    let copied;
+    try {
+      const run = createPrLandRunner({ env: {}, canonicalAudit: () => ({ ok: true, sha, carried }),
+        prePrReview: () => ({ action: 'pass' }), prepGate: () => ({ ok: true }),
+        spawn: (_cmd, args) => {
+          copied = args.find(a => a.startsWith('--body-file=')).slice('--body-file='.length);
+          expect(readFileSync(copied, 'utf8')).toContain(`<!-- audit-carry: carried-across-main-merge ${base}..${sha} -->`);
+          return { status: 0, stdout: '{"pr":7}' };
+        } });
+      run({ argv: ['--ref=lane/audit', `--body-file=${body}`] });
+      expect(output).toHaveBeenCalledWith(`carried-across-main-merge ${base.slice(0, 8)}..${sha.slice(0, 8)} fp ffffffff ruling R123\n`);
+      expect(readFileSync(body, 'utf8')).toBe('Review body\n');
+      expect(() => readFileSync(copied)).toThrow();
+    } finally { output.mockRestore(); rmSync(dir, { recursive: true, force: true }); }
+  });
   it('fails closed if the check child dies or returns an opened payload', () => {
     for (const child of [{ error: new Error('spawn failed') }, { status: 0, stdout: '{"pr":7}' },
       { status: 0, stdout: '{"reason":"opened","pr":7,"blockers":[]}' }]) {
@@ -79,7 +99,8 @@ function defaultProducer({ direct = false, dry = false, check = false, failMain 
     cp.execFileSync = (cmd, args) => {
       fs.appendFileSync(${JSON.stringify(trace)}, JSON.stringify([cmd, args]) + '\\n');
       if (cmd !== 'git') throw new Error('unexpected process: ' + cmd);
-      const a = args[0] === '-C' ? args.slice(2) : args;
+      const stripped = args[0] === '-c' ? args.slice(2) : args;
+      const a = stripped[0] === '-C' ? stripped.slice(2) : stripped;
       if (a[0] === 'rev-parse') return ${JSON.stringify(sha)};
       if (a[0] === 'fetch' && a.join(' ') === 'fetch origin main') {
         if (${failMain}) throw new Error('fixture main remote unavailable');
