@@ -603,6 +603,30 @@ export function recloneMarkerPath(root, env = process.env) {
 export const UNREADABLE_RECLONE_MARKER = Object.freeze({ identity: null, head: null, concluded: false, why: 'marker-unreadable' });
 
 /**
+ * The re-clone fail-closed decision, pure (x0m7a8x): shared by `withSelfSync` and every other process that runs
+ * children off this clone (the ci-heal child), so no second copy can drift.
+ * @returns {{blocked:boolean, adopt?:string, noteReclone?:string}}
+ */
+export function decideRecloneBlock({ marker: m, idNow, knownIdentity }) {
+  if (m && !m.concluded && (m.identity == null || idNow == null || m.identity === idNow)) return { blocked: true };
+  if (knownIdentity == null || idNow == null || idNow === knownIdentity) return { blocked: false };
+  if (m && m.concluded && m.identity === idNow) return { blocked: false, adopt: idNow };
+  return { blocked: true, noteReclone: 'checkout-replaced' };
+}
+
+/**
+ * Read-only: may a process that did not run `withSelfSync` dispatch from this clone? Mirrors the parent's gates
+ * (quarantined clone, un-concluded or replaced checkout). Returns the reason, or null. Never throws; fails closed.
+ */
+export function cloneDispatchBlock({ root, env = process.env, knownIdentity, readState = readRebuildState,
+  cloneIdentity = readCloneIdentity, marker = makeRecloneMarkerStore({ root, env }) } = {}) {
+  try {
+    if (readState(root, env)?.quarantine) return 'quarantine';
+    return decideRecloneBlock({ marker: marker.read(), idNow: cloneIdentity(root), knownIdentity }).blocked ? 'reclone' : null;
+  } catch { return 'unreadable'; }
+}
+
+/**
  * The real marker IO. Never throws. Fail closed: a MISSING file reads as null (no re-clone), but a file that exists
  * and cannot be parsed reads as {@link UNREADABLE_RECLONE_MARKER} (blocks until a rebuild concludes and overwrites
  * it). A write that fails is kept in memory and read back from there, so this process still blocks AND still
@@ -1107,13 +1131,10 @@ export function withSelfSync(effects, {
   };
   /** Must this tick run no children because the checkout is a re-clone no rebuild has concluded on? */
   const recloneBlocks = () => {
-    const idNow = cloneIdentity(root);
-    const m = marker.read();
-    if (m && !m.concluded && (m.identity == null || idNow == null || m.identity === idNow)) return true;
-    if (knownIdentity == null || idNow == null || idNow === knownIdentity) return false;
-    if (m && m.concluded && m.identity === idNow) { knownIdentity = idNow; return false; }
-    noteReclone('checkout-replaced');
-    return true;
+    const d = decideRecloneBlock({ marker: marker.read(), idNow: cloneIdentity(root), knownIdentity });
+    if (d.adopt) knownIdentity = d.adopt;
+    if (d.noteReclone) noteReclone(d.noteReclone);
+    return d.blocked;
   };
   const recloneSkip = () => {
     log.error?.('daemon-self-sync: the clone was re-cloned and no rebuild has concluded on it yet — skipping this tick, never running children on an unsmoked checkout (x0m7a8x)');

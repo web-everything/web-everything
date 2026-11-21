@@ -79,7 +79,7 @@ describe('operator-queue: round-cap ruling needed', () => {
       redTeam: true,
       commands: {
         block: "node scripts/review-set-label.mjs 4722 --repo=web-everything/web-everything --to=changes --body-file=<fix-list.md> --actor=<your login> --channel='<where you ruled>'",
-        notReal: "node scripts/review-set-label.mjs 4722 --repo=web-everything/web-everything --to=clear-human --actor=<your login> --reason='<your words>'",
+        notReal: "node scripts/review-set-label.mjs 4722 --repo=web-everything/web-everything --to=clear-human --expect-head=<full 40-hex head SHA> --actor=<your login> --reason='<your words>'",
       },
     });
   });

@@ -16,10 +16,10 @@ For repo defaults, edit the owner file through a PR and rebuild the consuming da
 
 ## Summary
 
-- Top-level keys: 157 (159 declaration rows).
-- Declared leaves: 584 (platform copies counted separately).
-- Instant top-level keys: 0; not instant: 157.
-- Instant capacity leaves: 14.
+- Top-level keys: 160 (162 declaration rows).
+- Declared leaves: 588 (platform copies counted separately).
+- Instant top-level keys: 0; not instant: 160.
+- Instant capacity leaves: 15.
 - Constants to settle: 312.
 - Instant gaps: 28.
 
@@ -39,6 +39,7 @@ Operator-prefs layer: ~/.plateau/platform-preferences.json is the requested oper
 | fix.conflictFixesPerPass | integer 0–24 | fixes/pass | yes | Conflict-fix dispatch allowance per pass. |
 | host.maxReviewDispatchPerTick | integer 1–16 | dispatches/tick | yes | Maximum host review dispatches per tick. |
 | lanes.maxConcurrent | integer 1–24 | lanes | yes | Maximum concurrently leased lanes. |
+| redTeam.queue.reservedSlots | integer 0–8 | slots | yes | Live review slots reserved while runnable red-team work is queued; default 4, lent back when the queue is empty or unknown. |
 | redTeamQueue.maxProbesPerTick | integer 0–50 | probes/tick | yes | Maximum red-team probes started per tick. |
 | redTeamQueue.minConcurrent | integer 0–24 | jobs | yes | Minimum concurrent red-team jobs. |
 | resourceGate.fixCap.ceiling | integer 1–24 | workers | yes | Maximum adaptive fix capacity. |
@@ -60,6 +61,7 @@ Operator-prefs layer: ~/.plateau/platform-preferences.json is the requested oper
 | advisorySeats | scripts/settings/review.json | 1 | {"antigravityReview":"probation"} | pr | no | Provider advisory review seating policy. |
 | aiRouting | scripts/settings/ai-routing.json | 0 | {} | pr | no | AI role routing overrides; empty preserves existing resolvers. |
 | alertAfterMinutes | scripts/settings/forge-share.json | 1 | 60 | pr | no | Duration before low remote execution share raises an alert. |
+| allowedKinds | scripts/settings/agy-build.json | 1 | ["doc-fix"] | env | no | Doc-fix only; test-fix refused until #8606 regardless of settings. Production confinement unavailable; repair size 1. |
 | allowedSigners | scripts/settings/card-ledger-trust.json | 1 | [] | pr | no | Trusted card-ledger signers. |
 | archive | scripts/settings/archive-retention.json | 1 | {"runsBatchCap":5000} | pr | no | Archive retention and bounded archive batch policy. |
 | audit | scripts/settings/codex-audit.json | 10 | {"verdict":{"mode":"model"},"preExisting":{"mode":"block","… | pr | no | Audit verdict, pre-existing finding and protected path policy. |
@@ -80,7 +82,7 @@ Operator-prefs layer: ~/.plateau/platform-preferences.json is the requested oper
 | carryAcrossRebase | scripts/settings/review.json | 1 | "on" | pr | no | Carry review state across eligible rebases. |
 | ci | scripts/settings/timeout-evidence.json | 1 | {"timeoutEvidenceConcurrency":4} | pr | no | Concurrency of timeout-evidence child readers. |
 | ciGhostRerun | scripts/settings/ci-ghost-rerun.json | 5 | {"thresholdMin":15,"maxPerWindow":1,"maxPerHead":1,"windowH… | pr | no | Age, frequency and cancellation bounds for ghost CI recovery. |
-| ciHeal | scripts/settings/ci-heal.json | 1 | {"staleBaseRefreshFirst":"on"} | pr | no | Try a stale-base refresh before waking a CI fixer. |
+| ciHeal | scripts/settings/ci-heal.json | 2 | {"staleBaseRefreshFirst":"on","loop":"off"} | pr | no | Try a stale-base refresh before waking a CI fixer. |
 | ciHeldRecordRetryMax | scripts/settings/review-red-team-on-skip.json | 1 | 3 | pr | no | Maximum CI-held record recovery retries. |
 | claudeHelper | scripts/settings/claude-helper.json | 1 | {"model":"claude-sonnet-5-5"} | pr | no | Default Claude helper and juror model. |
 | cloneMaintenance | scripts/settings/clone-maintenance.json | 1 | {"intervalMs":86400000} | pr | no | Interval between idle daemon clone garbage collections. |
@@ -127,6 +129,7 @@ Operator-prefs layer: ~/.plateau/platform-preferences.json is the requested oper
 | heavyAdmissionCap | scripts/dispatch-settings.json | 1 | 3 | pr | no | Maximum concurrent heavy commands admitted on the host. |
 | humanClearance | scripts/settings/human-clearance-carry.json | 1 | {"mechanicalCarry":"refuse"} | pr | no | Mechanical carry-forward policy for human clearance. |
 | humanReviewSurfaces | scripts/settings/human-review-surfaces.json | 1 | "narrow" | pr | no | Scope of surfaces requiring human review. |
+| kindMaxSize | scripts/settings/agy-build.json | 1 | 3 | env | no | Maximum direct confined agy build size for allowedKinds; repair dispatch remains size 1. |
 | launchAgentsDir | scripts/settings/prototype-load.json | 1 | "~/Library/LaunchAgents" | pr | no | Host directory for rendered launchd agent definitions. |
 | livenessSweep | scripts/settings/liveness-sweep.json | 11 | {"prNoMovementMinutes":120,"prRedUnownedMinutes":60,"selfUp… | pr | no | Staleness thresholds, escalation rungs and recovery attempt limits. |
 | loadGovernor | scripts/settings/load-governor.json | 10 | {"enabled":true,"targetLoadPerCore":2,"resumeBelowPerCore":… | pr | no | Host load targets, pause priorities and resumption thresholds. |
@@ -134,6 +137,7 @@ Operator-prefs layer: ~/.plateau/platform-preferences.json is the requested oper
 | mainFixCapacity | scripts/settings/main-fix-capacity.json | 1 | {"pastFixCap":true} | pr | no | Allow main-fix work beyond the ordinary fix cap. |
 | maxLiveReviewRounds | scripts/settings/review-concurrency.json | 1 | 8 | pr | no | Maximum concurrent host review rounds. |
 | maxLoadPerCore | scripts/dispatch-settings.json | 1 | 2 | pr | no | Host load ceiling per CPU core for dispatch admission. |
+| maxSize | scripts/settings/agy-build.json | 1 | 1 | env | no | Maximum direct confined agy build size for any kind; repair dispatch remains size 1. |
 | memFreeMinPct | scripts/dispatch-settings.json | 1 | 15 | pr | no | Minimum free memory percentage for dispatch admission. |
 | mergeDelivery | scripts/lib/delivery-platform-preferences.json | 5 | {"strategy":"drain-direct","batchSize":3,"maxGroupWaitMinut… | pr | no | Merge strategy, batch size, wait time and call concurrency. |
 | mergeDelivery | scripts/settings/merge-queue.json | 6 | {"strategy":"github-merge-queue","batchSize":5,"maxGroupWai… | pr | no | Merge strategy, batch size, wait time and call concurrency. |

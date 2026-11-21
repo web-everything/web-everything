@@ -199,7 +199,7 @@ describe('clear-human on #4708\'s shape writes the durable carry record', () => 
     const exit = vi.spyOn(process, 'exit').mockImplementation(code => { throw Object.assign(new Error('exit'), { exitCode: code }); });
     let code = 0;
     try {
-      runReviewLabelCli({ argv: [String(pr), `--repo=${repo}`, '--to=clear-human', '--actor=operator', '--reason=I approve 4708'],
+      runReviewLabelCli({ argv: [String(pr), `--repo=${repo}`, '--to=clear-human', `--expect-head=${state.headRefOid}`, '--actor=operator', '--reason=I approve 4708'],
         allowClearHuman: true, defaultActor: 'operator', emit: line => output.push(line), referralOptions,
         provider: { readPostingIdentity: () => ({ login: 'chalbert', type: 'User' }), readPrState: () => state, readLabels: () => state.labels,
           postComment: (_, __, body) => posted.push(body), setLabels: (_, __, { add, remove }) => {

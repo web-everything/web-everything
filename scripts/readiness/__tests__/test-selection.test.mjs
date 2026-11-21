@@ -235,3 +235,26 @@ describe('exported shapes are stable / documented', () => {
     expect(GLOB_FIXTURE_ROOTS.length).toBeGreaterThan(0);
   });
 });
+
+
+describe('S1b throwing shadow fallback', () => {
+  it('records full shadow on failure while preserving the real shrink decision', () => {
+    const options = { runGit: (args) => args[0] === 'merge-base' ? 'abc' : 'docs/readme.md\n', env: { [SELECTION_FLAG]: '1' } };
+    const off = selectTests(options);
+    const { shadow, ...on } = selectTests({ ...options, shadow: () => { throw Error('ls-files failed'); } });
+    expect(off.mode).toBe('shrink');
+    expect(on).toEqual(off);
+    expect(shadow).toEqual({ mode: 'full', tests: [], partial: true, reasons: ['shadow threw'] });
+  });
+});
+
+
+describe('S1b static reach remains diagnostic', () => {
+  it.each(['0', '1'])('preserves the serialized real decision with empty static reach (flag=%s)', (flag) => {
+    const options = { runGit: (args) => args[0] === 'merge-base' ? 'abc' : 'docs/readme.md\n', env: { [SELECTION_FLAG]: flag } };
+    const off = selectTests(options);
+    const { shadow, ...on } = selectTests({ ...options, shadow: () => ({ mode: 'full', tests: ['all.test.mjs'], staticTests: [], partial: false }) });
+    expect(JSON.stringify(on)).toBe(JSON.stringify(off));
+    expect(shadow.staticTests).toEqual([]);
+  });
+});

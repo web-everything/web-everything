@@ -85,7 +85,7 @@ export function buildHumanSurfaceReparkComment({ headSha, hits, netFailure }) {
   return (missingHead ? 'Human-only surface check with missing head:\n\n' : `Human-only surface at head ${headSha.slice(0, 9)} (\`${headSha}\`):\n\n`)
     + hits.map(hit => `- \`${neutralizeCommentText(hit.file)}\` (${neutralizeCommentText(hit.category)})`).join('\n')
     + (netFailure ? `\n\nNet file set unavailable: ${publicHumanSurfaceNetFailure(netFailure)}. Failing closed; the absence of human-only changes could not be verified against current origin/main.` : '')
-    + '\n\nThe prior `review:accepted` is stale for a human-only surface. Re-parked to `review:human`; the operator clears it with `review-set-label.mjs --to=clear-human`.\n'
+    + '\n\nThe prior `review:accepted` is stale for a human-only surface. Re-parked to `review:human`; the operator clears it with `review-set-label.mjs --to=clear-human --expect-head=<full 40-hex head SHA>`.\n'
     + (missingHead ? '' : `\n${buildHumanSurfaceReparkMarker(headSha)}\n`);
 }
 
