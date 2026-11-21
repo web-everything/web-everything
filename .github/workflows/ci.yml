@@ -181,6 +181,8 @@ jobs:
   # is deliberately deferred; shallow checkout brings changes to roughly 30-40 seconds.
   test-shard:
     needs: changes
+    env:
+      WE_VITEST_MAX_WORKERS: ${{ vars.WE_VITEST_MAX_WORKERS || '4' }}
     # #5027 — Arm-runner experiment switch. The repo is public, so `ubuntu-24.04-arm` is free; paid larger
     # runners were rejected on cost. `vars.WE_SHARD_RUNNER` unset (the default) = x86 `ubuntu-latest`; set it to
     # `ubuntu-24.04-arm` to trial the shards on Arm, unset it to abort — no PR needed either way. ONLY this job
@@ -211,6 +213,11 @@ jobs:
         # Keep --expect=9 in coverage-merge and the /9 unit-suite divisors in lockstep.
         shard: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
     steps:
+      - name: Record shard start
+        if: ${{ needs.changes.outputs.light != 'true' }}
+        continue-on-error: true
+        run: echo "SHARD_START_SECONDS=$(date +%s)" >> "$GITHUB_ENV"
+
       # Keep the fast-check name green for an intentionally empty unit-test scope.
       - name: Card-only unit scope receipt
         if: ${{ needs.changes.outputs.light == 'true' }}
@@ -349,6 +356,51 @@ jobs:
           path: web-everything/coverage/flaky-unit-*.json
           if-no-files-found: ignore
 
+      - name: Measure shard resources
+        if: ${{ always() && needs.changes.outputs.light != 'true' }}
+        continue-on-error: true
+        working-directory: web-everything
+        run: |
+          cpu_count=$(nproc) || cpu_count=null
+          [[ "$cpu_count" =~ ^[1-9][0-9]{0,5}$ ]] || cpu_count=null
+          # Resolve this process's cgroup, including a cgroup2 mount rooted below /.
+          cgroup_path=$(cat /proc/self/cgroup 2>/dev/null | awk -F: '!found && $1 == "0" && $2 == "" { print $3; found=1 }') || cgroup_path=
+          mount_fields=$(cat /proc/self/mountinfo 2>/dev/null | awk '!found && $0 ~ / - cgroup2 / { print $4 "\t" $5; found=1 }') || mount_fields=
+          IFS=$'\t' read -r cgroup_root cgroup_mount <<< "$mount_fields" || true
+          printf -v cgroup_root '%b' "$cgroup_root"
+          printf -v cgroup_mount '%b' "$cgroup_mount"
+          memory_peak=unavailable
+          memory_file=
+          if [[ "$cgroup_path" == /* && "$cgroup_root" == /* && "$cgroup_mount" == /* ]]; then
+            if [[ "$cgroup_root" == / ]]; then
+              memory_file="${cgroup_mount%/}${cgroup_path%/}/memory.peak"
+            elif [[ "$cgroup_path" == "$cgroup_root" ]]; then
+              memory_file="${cgroup_mount%/}/memory.peak"
+            elif [[ "$cgroup_path" == "$cgroup_root/"* ]]; then
+              memory_file="${cgroup_mount%/}${cgroup_path#"$cgroup_root"}/memory.peak"
+            fi
+            if [[ -n "$memory_file" ]]; then
+              memory_peak=$(cat "$memory_file" 2>/dev/null) || memory_peak=unavailable
+            fi
+          fi
+          [[ "$memory_peak" =~ ^[0-9]+$ ]] || memory_peak=unavailable
+          now=$(date +%s) || now=
+          wall_seconds=null
+          if [[ "$SHARD_START_SECONDS" =~ ^[1-9][0-9]{0,9}$ && "$now" =~ ^[1-9][0-9]{0,9}$ ]] && (( now >= SHARD_START_SECONDS )); then
+            wall_seconds=$((now - SHARD_START_SECONDS))
+          fi
+          printf 'nproc: %s\nmemory.peak: %s\nwall time (seconds): %s\n' "$cpu_count" "$memory_peak" "$wall_seconds" >> "$GITHUB_STEP_SUMMARY"
+          printf '{"nproc":%s,"memory.peak":"%s","wall_seconds":%s}\n' "$cpu_count" "$memory_peak" "$wall_seconds" > shard-resources.json
+
+      - name: Upload shard resources
+        if: ${{ always() && needs.changes.outputs.light != 'true' }}
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: shard-resources-test-${{ matrix.shard }}
+          path: web-everything/shard-resources.json
+          if-no-files-found: ignore
+
   # Coverage merging and host-path checks run independently; the required test job only reads results.
   coverage-merge:
     needs: [changes, test-shard]
@@ -403,6 +455,8 @@ jobs:
     if: ${{ !cancelled() }}
     runs-on: ubuntu-latest
     timeout-minutes: 5
+    permissions:
+      actions: read
     steps:
       - name: Gate on shard results
         run: |
@@ -434,6 +488,32 @@ jobs:
             echo "::error::Coverage merge did not succeed."
             exit 1
           fi
+
+      # Advisory rollout diagnostics: runner variance and missing timing evidence cannot block test.
+      - name: PR shards finish below 1050 seconds with no new failures
+        if: ${{ always() && github.event_name == 'pull_request' && needs.changes.outputs.light != 'true' }}
+        uses: actions/github-script@v7
+        continue-on-error: true
+        with:
+          script: |
+            const { data } = await github.rest.actions.listJobsForWorkflowRun({
+              ...context.repo, run_id: context.runId, filter: 'latest', per_page: 100,
+            });
+            const unavailable = 'Incomplete shard timing evidence; inspect completed jobs and wait for a fresh CI run.';
+            if (!Number.isInteger(data.total_count) || data.total_count > 100 || !Array.isArray(data.jobs)
+              || data.jobs.length !== data.total_count || data.jobs.some(job => typeof job?.name !== 'string')) throw new Error(unavailable);
+            const expected = Array.from({ length: 10 }, (_, i) => `test-shard (${i + 1})`);
+            const shards = data.jobs.filter(job => job.name.startsWith('test-shard'));
+            if (shards.length !== expected.length || expected.some(name => shards.filter(job => job.name === name).length !== 1)) throw new Error(unavailable);
+            const durations = shards.map(job => {
+              if (job.run_id !== context.runId || job.status !== 'completed' || job.conclusion !== 'success') throw new Error(`Shard did not succeed in this run: ${job.name}`);
+              const start = Date.parse(job.started_at), end = Date.parse(job.completed_at);
+              if (!Number.isFinite(start) || !Number.isFinite(end) || end < start) throw new Error(unavailable);
+              return (end - start) / 1000;
+            });
+            const longest = Math.max(...durations);
+            core.info(`PR shard long pole: ${longest} seconds (must be below 1050)`);
+            if (longest >= 1050) throw new Error('PR shard exceeded the 17.5-minute acceptance limit.');
 
   # TT3: split the real-git/real-subprocess tier into five parallel integration parts.
   # Run 44443900759 (2026-11-18): sim-scenarios 4.5 min, scan-chain 5.6 min, parallel 9.9 min.
@@ -661,6 +741,10 @@ jobs:
       matrix:
         shard: [1, 2, 3, 4, 5, 6, 7, 8]
     steps:
+      - name: Record shard start
+        continue-on-error: true
+        run: echo "SHARD_START_SECONDS=$(date +%s)" >> "$GITHUB_ENV"
+
       - uses: actions/checkout@v4
         with:
           # quarantine-skip proves the PR's changed files against its merge base: depth 50 plus blobless main
@@ -680,6 +764,50 @@ jobs:
 
       - name: Soak shard ${{ matrix.shard }}/${{ strategy.job-total }}
         run: npm run test:soak:shard -- --shard=${{ matrix.shard }}/${{ strategy.job-total }} $(node scripts/ci/quarantine-skip.mjs --job="soak-shard (${{ matrix.shard }})")
+
+      - name: Measure shard resources
+        if: always()
+        continue-on-error: true
+        run: |
+          cpu_count=$(nproc) || cpu_count=null
+          [[ "$cpu_count" =~ ^[1-9][0-9]{0,5}$ ]] || cpu_count=null
+          # Resolve this process's cgroup, including a cgroup2 mount rooted below /.
+          cgroup_path=$(cat /proc/self/cgroup 2>/dev/null | awk -F: '!found && $1 == "0" && $2 == "" { print $3; found=1 }') || cgroup_path=
+          mount_fields=$(cat /proc/self/mountinfo 2>/dev/null | awk '!found && $0 ~ / - cgroup2 / { print $4 "\t" $5; found=1 }') || mount_fields=
+          IFS=$'\t' read -r cgroup_root cgroup_mount <<< "$mount_fields" || true
+          printf -v cgroup_root '%b' "$cgroup_root"
+          printf -v cgroup_mount '%b' "$cgroup_mount"
+          memory_peak=unavailable
+          memory_file=
+          if [[ "$cgroup_path" == /* && "$cgroup_root" == /* && "$cgroup_mount" == /* ]]; then
+            if [[ "$cgroup_root" == / ]]; then
+              memory_file="${cgroup_mount%/}${cgroup_path%/}/memory.peak"
+            elif [[ "$cgroup_path" == "$cgroup_root" ]]; then
+              memory_file="${cgroup_mount%/}/memory.peak"
+            elif [[ "$cgroup_path" == "$cgroup_root/"* ]]; then
+              memory_file="${cgroup_mount%/}${cgroup_path#"$cgroup_root"}/memory.peak"
+            fi
+            if [[ -n "$memory_file" ]]; then
+              memory_peak=$(cat "$memory_file" 2>/dev/null) || memory_peak=unavailable
+            fi
+          fi
+          [[ "$memory_peak" =~ ^[0-9]+$ ]] || memory_peak=unavailable
+          now=$(date +%s) || now=
+          wall_seconds=null
+          if [[ "$SHARD_START_SECONDS" =~ ^[1-9][0-9]{0,9}$ && "$now" =~ ^[1-9][0-9]{0,9}$ ]] && (( now >= SHARD_START_SECONDS )); then
+            wall_seconds=$((now - SHARD_START_SECONDS))
+          fi
+          printf 'nproc: %s\nmemory.peak: %s\nwall time (seconds): %s\n' "$cpu_count" "$memory_peak" "$wall_seconds" >> "$GITHUB_STEP_SUMMARY"
+          printf '{"nproc":%s,"memory.peak":"%s","wall_seconds":%s}\n' "$cpu_count" "$memory_peak" "$wall_seconds" > shard-resources.json
+
+      - name: Upload shard resources
+        if: always()
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: shard-resources-soak-${{ matrix.shard }}
+          path: shard-resources.json
+          if-no-files-found: ignore
 
   # THE required `daemon-soak` check (name unchanged from before the split — see the header above for why that
   # matters). Skips green in ~10s when `daemon-soak-scope` SUCCEEDED and found no daemon code touched, same as the
