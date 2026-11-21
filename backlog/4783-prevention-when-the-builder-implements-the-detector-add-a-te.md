@@ -6,8 +6,8 @@ parent: "4075"
 status: open
 scope: ["we:backlog/4709-prevention-add-a-check-standards-or-prepare-stamp-gate-any-c.md", "we:scripts/check-standards-rules.mjs", "we:scripts/__tests__/check-standards-rules-content-lint.test.mjs"]
 dateOpened: "2026-10-02"
-preparedDate: "2026-10-03"
-preparedAgainstSha: "8b3cb25274eca9818bfec5c6fe898c85368b4fe2"
+preparedDate: "2026-11-21"
+preparedAgainstSha: "a70ef56b5d94e34a4a4c82ce66df653bec323238"
 tags: []
 ---
 
@@ -22,48 +22,60 @@ Idempotency key (do not edit): approval-prevention-key:chalbert/web-everything#3
 
 ## Progress
 
-- Premise checked on 2026-10-03 at checkout HEAD `8b3cb2527`. The original scope named only the reviewed card, and the original line references 109 and 55 were review-snapshot locations. Current evidence is the reviewed card's Design, MVP Must 3, and Done when sections; the references above now name those sections instead of unstable lines.
-- The detector is not delivered: searching `we:scripts/` for `findDoneWhenGaps` returns no matches. History for the two item keys records filing and preparation, including preparation commit `a451d570c`, not detector delivery. `we:scripts/check-standards-rules.mjs` currently exports `findMustWithoutDoneWhen` and `lintBacklogItemRendering`; neither implements the proposed missing/placeholder-section check.
-- Corrected scope includes the eventual detector/lint implementation and its existing matching suite, `we:scripts/__tests__/check-standards-rules-content-lint.test.mjs`, as well as the reviewed specification card. That suite already imports the lint and reads repository fixtures with `readFileSync`; no new test runner is needed. `we:scripts/backlog/scaffold.mjs:113` emits the actual placeholder line and is read-only evidence.
-- The reviewed card's Design proposes a body-only detector, while MVP Must 3 says the detector reads metadata from `item`. Its Design also describes a bare `TODO:` match, although its real acceptance clauses discuss that token. These are specification inconsistencies to correct, not new policy forks: the review explicitly requires the narrow placeholder match and decision/epic exemption.
-- Implementation prerequisite: 4709 supplies the detector and stamp gate. This item specifies the review hardening to accompany or follow that implementation; it does not duplicate the stamp/conveyor work. Before building, confirm that prerequisite is available. No detector test can pass on this checkout yet.
+- Rechecked on 2026-11-21 at HEAD `a70ef56b5d94e34a4a4c82ce66df653bec323238`. The old preparation assumed a numbered Done-when scaffold emitted directly by `we:scripts/backlog/scaffold.mjs:113` and no placeholder check. Corrected premise: `we:scripts/backlog/scaffold.mjs:168` delegates to `renderTaskAgreementSkeleton` in `we:scripts/backlog/task-agreement.mjs:57`, emitting Acceptance with `[A1]`. The shared reader supports legacy Done when too (`we:scripts/backlog/task-agreement.mjs:109`).
+- Searching `we:scripts/` finds no `findDoneWhenGaps` implementation. Existing checks are narrower: Must citations at `we:scripts/check-standards-rules.mjs:1306`, a placeholder-plus-proof detector at `we:scripts/check-standards-rules.mjs:1353`, and preparedDate/policy-gated placeholder errors at `we:scripts/check-standards-rules.mjs:1447`. These do not deliver the proposed gap-array contract or missing-section warning. This is not already done.
+- Old scope and corrected scope both comprise the reviewed #4709 specification, the lint implementation, and its content-lint tests. Correction is behavioral: support the current canonical agreement as well as the legacy format, reuse the shared reader, and leave the separately shipped proof/policy checks intact. The fixture is the reviewed #4709 body, not this follow-up body. Existing parity/scaffold tests are at `we:scripts/__tests__/check-standards-rules-content-lint.test.mjs:896` and `we:scripts/__tests__/check-standards-rules-content-lint.test.mjs:924`.
+- Retain size 3: approximately 30 changed lines in the reviewed specification, 45 in the lint implementation and 100 in its matching suite (175 total), grounded in the interfaces and fixture tables above. This is a story, so no estimatedLoc field is added. Existing preparation stamps are left for the runner.
+- #4709 remains open and supplies the detector and stamp integration. Its Design conflicts with its MVP on the detector signature and uses the obsolete scaffold shape (`we:backlog/4709-prevention-add-a-check-standards-or-prepare-stamp-gate-any-c.md:41`, `we:backlog/4709-prevention-add-a-check-standards-or-prepare-stamp-gate-any-c.md:70`). This item aligns that specification and supplies the review guards; it does not independently implement stamp or conveyor policy.
 
 ## Design
 
-Use one pure interface, `findDoneWhenGaps(body)`, returning the gap array described by the prerequisite. The detector inspects only the Done-when section. Metadata belongs to the caller: `lintBacklogItemRendering` invokes it only for a story or task with a non-empty `preparedAgainstSha` whose status is not resolved. Decisions and epics bypass this warning regardless of their body. Keep the prerequisite's first-stamp versus re-stamp behavior unchanged.
+Keep the proposed pure interface `findDoneWhenGaps(body)` in `we:scripts/check-standards-rules.mjs`. Return the prerequisite's gap array: missing acceptance section → `missing-section`, no real acceptance clauses → `no-numbered-clause`, a scaffold-shaped unfinished executable clause → `placeholder-clause`, otherwise `[]`. Use `readTaskAgreement` from `we:scripts/backlog/task-agreement.mjs` for canonical Acceptance and legacy Done when section/clause interpretation, including fence/comment exclusion and section precedence. Do not make Non-goals or MVP requirements part of this detector.
 
-Match a numbered Done-when clause whose text begins with the emitted scaffold prefix: number, period and whitespace, bold Executable label, em dash, then `TODO:`. Anchor at the start of the clause line; tolerate horizontal spacing and CRLF. A mention of `TODO:` later in a real acceptance clause, or in Design/Test plan prose, is not a placeholder. The exact current scaffold remains a positive fixture. Use the existing section extraction convention in `we:scripts/check-standards-rules.mjs`.
+Match the beginning of the normalized clause text: bold Executable label, horizontal whitespace, em dash, horizontal whitespace, then `TODO:`. Both canonical `[A<n>]` and legacy numbered clauses must work; tolerate CRLF and horizontal spacing. A later mention of the token in genuine acceptance text is not a placeholder. Read the actual scaffold producer in tests, alongside a legacy fixture. Missing/null/empty body must yield a missing-section gap, and prose or fenced examples alone must not satisfy the clause requirement. Gap precedence is missing section, then no clauses, then placeholder.
 
-Amend the reviewed card's Design, MVP and Test plan to agree with this interface and caller filtering. “This card's own body” in the original review means the reviewed 4709 card, not this mechanically filed follow-up. Read its actual body with frontmatter stripped in the existing content-lint suite and assert an empty detector result; do not sanitize its mentions of the placeholder token or replace it with a simplified synthetic fixture.
+The caller owns metadata: `lintBacklogItemRendering` emits the new gap warning only for story/task records with non-empty `preparedAgainstSha` and status other than resolved. Decisions, epics and unstamped records bypass this warning. Assert this warning specifically; other warnings/errors remain independent. Preserve the existing preparedDate/policy check and mutation-proof check in `we:scripts/check-standards-rules.mjs:1447`; their defaults and eligibility are not being changed.
+
+Align the Design, MVP, Test plan and acceptance wording in `we:backlog/4709-prevention-add-a-check-standards-or-prepare-stamp-gate-any-c.md` with this signature, canonical/legacy formats and caller filtering. Keep its first-stamp/re-stamp policy intact. Its real body, frontmatter stripped and otherwise unsanitized, must yield `[]`.
 
 ## MVP
 
 **Must**
-1. Align the reviewed specification in `we:backlog/4709-prevention-add-a-check-standards-or-prepare-stamp-gate-any-c.md` around the body-only signature, scaffold-shaped match, and story/task-only lint eligibility.
-2. In `we:scripts/check-standards-rules.mjs`, harden the prerequisite detector's placeholder match and its lint caller's kind guard to implement that contract.
-3. Add executable regression coverage in `we:scripts/__tests__/check-standards-rules-content-lint.test.mjs`, including the actual reviewed card body and stamped decision/epic cases. This suite is the matching test scope for the source entry and also checks the reviewed card as a fixture.
+1. Align the reviewed #4709 specification with the body-only detector and current agreement format.
+2. Harden the prerequisite detector and lint caller in `we:scripts/check-standards-rules.mjs` with the matching and eligibility contract above.
+3. Add named regression tests in `we:scripts/__tests__/check-standards-rules-content-lint.test.mjs` for the actual reviewed body, real scaffold, legacy parity, missing evidence and caller matrix. Preserve existing placeholder-policy and proof-claim tests.
 
 ## Test plan
 
-- **Capability, RED today:** the detector export is absent. Once the prerequisite is available, read the reviewed card body from disk, strip frontmatter, and assert `[]`. A mutation to a bare `TODO:` substring search must fail this case because its real Done-when clauses discuss the token.
-- **Capability, RED today:** the exact scaffold clause yields `placeholder-clause`; repeat with CRLF and spacing variants. A real numbered clause mentioning `TODO:` later in its text yields `[]`. Mutating the detector to always return `[]` must fail the scaffold case.
-- **Capability, RED today:** missing Done-when yields `missing-section`; a section with only prose yields `no-numbered-clause`. These positive controls prevent an accidentally disabled detector from satisfying all negative cases.
-- **Preservation:** table-test stamped, open decision and epic records with no Done-when through the lint; assert absence of the Done-when warning specifically, not absence of unrelated warnings. These cases pass today; mutation proof is removal of the new kind guard after the prerequisite lands.
-- **Capability, RED today:** stamped open story and task records with no Done-when produce the new warning. **Preservation:** unprepared and resolved counterparts produce no such warning; removing the stamp or status guard must fail the corresponding case.
+All new cases live in `we:scripts/__tests__/check-standards-rules-content-lint.test.mjs`:
 
-All cases live in `we:scripts/__tests__/check-standards-rules-content-lint.test.mjs`; fixture reads use repository-root resolution already present there. No stamp CLI or conveyor behavior changes are included here.
+- `reviewed 4709 body is valid`: load the actual scoped card, strip only frontmatter, expect `[]`. Keep its real acceptance discussion of `TODO:`. A bare substring matcher must fail this test.
+- `canonical and legacy scaffold clauses are gaps`: use the real skeleton producer and a legacy numbered fixture, plus CRLF/horizontal-space variants; expect `placeholder-clause`. `later TODO mentions are valid` checks real clauses under both headings and token mentions outside the section.
+- `missing evidence cannot satisfy acceptance`: null, empty and absent sections produce `missing-section`; prose-only and fenced/commented clauses produce `no-numbered-clause`. Valid clauses without MVP or Non-goals still pass. An always-empty detector must fail these controls.
+- `stamped kind matrix`: story/task with missing acceptance warn; decision/epic with that same body do not. Repeat story/task for empty/missing stamp and resolved status and assert no new gap warning. Removing each caller guard must fail its corresponding negative row.
+- `reviewed specification agrees with detector`: assert the corrected signature and canonical/legacy and caller-filter statements in the real #4709 body; reject the old instruction that the detector reads metadata from item. This test fails on the current inconsistent specification.
+
+These are planned tests, not executed proof. Detector-dependent tests fail today because its export is absent; exemption rows are preservation controls and must additionally be demonstrated red under the specified guard mutations after #4709 lands.
 
 ## Proof plan
 
-Run the focused content-lint suite with Vitest after the prerequisite is present, recording the prerequisite commit. First run the added tests against a bare-substring matcher and against a lint caller without the kind filter: capture the reviewed-body false positive and the decision/epic warnings. Restore the intended implementation and rerun; require all cases green. Also confirm the scaffold and bad story/task controls fail if detection is disabled.
+Record the #4709 implementation commit before building this follow-up. Run the focused suite via the host heavy-run queue, using `node` with `we:scripts/readiness/heavy-admission.mjs` and arguments `run --wait-ms=60000 -- npx vitest run` followed by the repo-relative form of `we:scripts/__tests__/check-standards-rules-content-lint.test.mjs`. Capture the new tests failing on the prerequisite baseline, then passing after the hardening. If a prerequisite already satisfies one guard, record its baseline pass and demonstrate the named mutation failure rather than claiming a false initial failure.
 
-Run `npm run check:standards` and the scoped backlog lint for both cards. Record warnings separately from errors: a green warning-level gate alone does not prove the exemptions or matching behavior. The focused assertions supply that proof. Preparation does not claim these future implementation tests have passed.
+Individually mutate the matcher to bare substring detection, disable gap detection, and remove kind/stamp/status filters; require the corresponding named tests to fail. Restore the implementation and require the focused suite green, including the existing canonical/legacy and proof-policy cases. Through the same queue run `npm run check:standards`; warnings alone cannot establish the behavior, so retain the focused assertion output. The runner owns preparation checks and stamping; this preparation does not claim future implementation tests passed.
 
 ## Follow-ups
 
-The prerequisite owns stamp refusal, stamp idempotence, and conveyor handling. Its citation-staleness and external-text sanitization follow-ups remain separate. Broader Markdown parsing or additional placeholder vocabularies are outside this review guard; no new policy or follow-up card is required to implement it.
+#4709 retains ownership of stamp refusal, idempotence and conveyor propagation, plus its separate citation-staleness and external-text work. No default policy change, new configuration, external input channel, or broader Markdown grammar is needed here. The shared agreement reader and scaffold are read-only dependencies for this touch set.
 
-## Done when
+## Acceptance
 
-1. **Executable** — The focused Vitest run for `we:scripts/__tests__/check-standards-rules-content-lint.test.mjs` passes with the actual reviewed-body fixture, scaffold controls, and stamped kind matrix; the specified matcher and kind-guard mutations fail it (Musts 2, 3).
-2. **Executable** — Scoped backlog lint passes for both cards and `npm run check:standards` has no new errors; the reviewed card consistently specifies the body-only detector and caller-owned metadata filtering (Must 1).
+- [A1] **Executable** — Focused content-lint test `reviewed 4709 body is valid` in `we:scripts/__tests__/check-standards-rules-content-lint.test.mjs` fails before detector delivery and passes after; a bare-token mutation fails it (Musts 2, 3).
+- [A2] **Executable** — Tests `canonical and legacy scaffold clauses are gaps` and `later TODO mentions are valid` in `we:scripts/__tests__/check-standards-rules-content-lint.test.mjs` fail before delivery and pass after, covering the changed scaffold format and legacy callers (Musts 2, 3).
+- [A3] **Executable** — Test `missing evidence cannot satisfy acceptance` in `we:scripts/__tests__/check-standards-rules-content-lint.test.mjs` fails before delivery and passes after; disabling detection fails its missing/prose/fenced controls (Musts 2, 3).
+- [A4] **Executable** — Test `stamped kind matrix` in `we:scripts/__tests__/check-standards-rules-content-lint.test.mjs` fails before warning integration and passes after; kind/stamp/status mutations fail the exemption rows. Existing proof/policy tests remain green, preserving their defaults (Musts 2, 3).
+- [A5] **Executable** — Test `reviewed specification agrees with detector` in `we:scripts/__tests__/check-standards-rules-content-lint.test.mjs` fails on the current #4709 specification and passes after alignment (Must 1).
+
+## Non-goals
+
+- [N1] Implementing #4709's stamp/conveyor gate or changing its first-stamp/re-stamp policy.
+- [N2] Changing existing proof-claim or preparedDate/policy-based errors, or broadening agreement-reader grammar.
