@@ -8,76 +8,73 @@ dateOpened: "2026-10-08"
 tags: []
 relatedReport: reports/2026-11-17-licence-open-delivery-standard-and-kernel.md
 relatedTo: ["098", "5409", "8623", "8627"]
+preparedDate: "2026-11-20"
 ---
 
 # Licence for the open delivery standard and kernel: Apache-2.0, AGPL or Fair Source
 
-Source: AI Delivery Landscape research brief, 2026-10-08, section 'Where the open line sits' (licence options and 'pick the licence once'). Options: Apache-2.0 for the most adoption (brief's recommendation for the open parts); AGPL to deter closed clones while staying open source (Grafana, Redis 8, Elastic); Fair Source (FSL) if two years of non-compete matter more than being called open source. Market evidence: HashiCorp's BSL switch cut community PRs from 21% to 9% and produced OpenTofu; Redis relicensed and reversed after ~14 months. The standard and kernel may take different licences. Operator's call; not ruled here.
+Ask: Use CSL 1.0 for spec text and Apache-2.0 for schemas, vectors and code. Keep Longshore Apache-2.0. Confirm both licence picks; publication stays separately gated.
 
-## Prepared fork (operator-only call; options and a recommendation, not a ruling)
+## Digest
 
-Ground: [#098](/backlog/098-licensing-strategy/) (resolved) already set a gradient: standard = CC BY prose plus Apache-2.0 code and schemas; reference implementation (Frontier UI) = Apache-2.0; platform (Plateau) = FSL-1.1 with a 2-year Apache conversion; `webcases` conformance suite = Apache-2.0 permanently; trademark policy is the enforcement lever (#098 point 4); a CLA is a contribution blocker. `LICENSE` and `LICENSE-DOCS` ship the standard split. The epic #5407 places the open kernel as tier 2, below the paid Plateau Loop (tier 3). Prior art: [report](/reports/2026-11-17-licence-open-delivery-standard-and-kernel/).
+Prepared, not ratified. Two forks grounded in licence texts/repo licences fetched 2026-11-20. The new spec-text default is **CSL 1.0**, replacing the earlier CC BY recommendation for everstandards; the kernel default remains **Apache-2.0**. WE's #098 split is unchanged. Prior report: `we:reports/2026-11-17-licence-open-delivery-standard-and-kernel.md`.
 
-Standing test result: the **standard** licence is settled by precedent (#098), so it is **not a fork**: ratify it. Only the **kernel** has a live either/or, because the card never says which #098 tier the kernel belongs to.
+## Fork 1 — Normative spec-text licence
 
-| Fork | Options | Default |
-|---|---|---|
-| 1. Kernel licence | (a) Apache-2.0 (open reference-implementation tier); (b) AGPL-3.0; (c) FSL-1.1 (platform tier) | **(a)** |
+Either/or: one contribution agreement determines the implementer patent promise; adding terms later cannot bind earlier contributors without consent.
 
-Settled / supported by default (not forks):
-- Standard (spec, schemas, conformance cases): Apache-2.0 code and schemas plus CC BY 4.0 prose, per #098. Ratify; no change. Housekeeping: `LICENSE` lists `docs/`, `research/`, `backlog/` as prose while `LICENSE-DOCS` also lists `reports/` and site pages; align the two in the build that follows.
-- Trademark and conformance-mark policy: #098 point 4, already ruled.
-- Contributor terms: #098 already made a CLA a contribution blocker; do not reopen DCO vs CLA here, only confirm it covers the kernel repo (#2446 option (b), own repo).
+- (a) CC BY 4.0 text + Apache schemas/code: familiar #098 split, but [CC BY §2(b)(2)](https://creativecommons.org/licenses/by/4.0/legalcode.en) excludes patent rights. Apache's Work-bound grant does not clearly cover independent implementations of prose.
+- (b) Apache for all text/code (MCP/A2A): familiar single licence; same independent-implementer patent uncertainty. [Apache §3](https://www.apache.org/licenses/LICENSE-2.0.txt) is bounded to contributions/the Work.
+- (c) **CSL 1.0 text; explicit Apache code/schema/vector licence (default).** [Community Specification](https://github.com/CommunitySpecification/Community_Specification) §2.1.1 (clause 2) grants Necessary Claims for implementations, §2.1.2 reciprocal grant, §3 45-day exclusions, §2.4 successor-owner duty. Requires Scope; explicit code licence avoids MIT fallback. SLSA/SPDX use CSL.
+- (d) CC BY plus standalone royalty-free pledge. *Rejected:* steward-only pledge lacks reciprocal implementer/contribution/exclusion machinery.
 
-## Fork 1 — Kernel licence
+(a)/(b) are rejected for this standard's enterprise patent promise; CSL remains less familiar and needs #186 counsel review. Honest limits: implementers opt in (§2.1.3); single-steward grant covers only their claims until others contribute. Do not accept outside contributions before terms/counsel review.
 
-Fork-existence: real either/or. One code distribution cannot be both Apache-2.0 (anyone may close it) and AGPL (network use forces source release) or FSL (competing use barred for two years). Which tier the kernel sits in decides the answer, and #098 puts the reference implementation and the paid platform on different licences.
+Evidence:
+- `2026-11-20-gov-spec-licences-patents`; `2026-11-20-es-standard-models` SP3.
+- [MCP licence transition](https://github.com/modelcontextprotocol/modelcontextprotocol/blob/main/LICENSE) demonstrates contributor-consent friction; [A2A](https://github.com/a2aproject/A2A) is Apache.
 
-- (a) **Apache-2.0. Default.** The epic calls the kernel open and tier 2, the funnel below the paid Plateau Loop; #098 gives the open reference implementation Apache-2.0 so the standard looks credible, not captive. Clone defence comes from trademark and the conformance mark (#098 point 4), and the paid value stays in Plateau Loop, not the kernel.
-- (b) AGPL-3.0: deters closed hosted clones while staying open source (Grafana kept it without a fork). Cost: many companies refuse AGPL, and it departs from #098's Apache choice for the open tier, so it needs a reconciliation note against #098.
-- (c) FSL-1.1: only right if the kernel is really Plateau-tier. Not open source, and it contradicts the epic's "open kernel" framing and the HashiCorp lesson (relicensing or restricting after adoption cost contributors and spawned OpenTofu).
+Skeptic: SURVIVES-WITH-AMENDMENT; added pledge alternative, opt-in/single-steward limits and contribution gate. Screen: clear.
 
-Un-gate trigger to revisit (b): a credible hosted clone of the kernel from a party not contributing back, seen while outside contributions are still few.
+## Fork 2 — Longshore kernel licence
 
-Code example: n/a, a legal call with no code surface.
+Either/or: Apache's permission, AGPL network-source duties and FSL competing-use restriction are different distribution promises.
 
-Skeptic: SURVIVES-WITH-AMENDMENT after a first-draft REFUTED. The attack found that #098 already rules the tiers and the draft had wrongly made the standard a fork and claimed the trademark and CLA calls were open. Folded in: the standard licence moved to "settled by precedent", the trademark and CLA lines now cite #098, the kernel-tier ambiguity became the stated fork-existence line, and the report's factual errors were fixed (AGPLv3 has an explicit patent grant; FSL also grants patent rights; Redis added AGPL alongside its source-available licences rather than reversing). If the operator says the kernel is Plateau-tier, flip the default to (c) FSL-1.1 per #098.
-Screen: clear (fresh-context screen: a licence is a consumer-visible legal term, and a merit difference remains even if building were free).
+- (a) **Apache-2.0 (default):** open tier under #098/#5407; trademark/conformance mark protects identity and paid value is hosting.
+- (b) AGPL-3.0: resists closed hosted clones; enterprise refusal conflicts with insurer adoption. Revisit on credible non-contributing hosted clone while contributors remain few.
+- (c) FSL-1.1: viable only if operator reclassifies kernel as Plateau-tier. *Excluded under current open-core framing*; HashiCorp/OpenTofu shows restriction risk.
 
-## Done when
+Evidence: `we:longshore-end-state-2026-11-20.md:159`, `we:repo-separation-brief-2026-11-20.md:103`, linked 11-17 report.
 
-1. **Executable** — n/a: a decision, no code. Tier 3 instead: the card is prepared (`/prepare`: options, rejection reasons, bold default, `preparedDate`), then the operator rules it and the ruling is recorded on the card; the chosen licence(s) per tier are recorded.
+Skeptic: SURVIVES; trademark lever and explicit revisit trigger withstand clone concern. Screen: clear; implementation licensing is expressly the operator's call, not a standard requirement.
 
-## Edge cases this change must handle
+## Supported by default
 
-One line per class: either the handling, or `n/a: <why>`.
+- Separate licences per artifact; webcases stays Apache permanently. Inbound terms: #5409; marks remain the enforcement lever.
+- Each repo gets LICENSE naming Apache for executable files, Scope covering modules/schemas and Notices. Counsel checks CSL/Apache overlap before publication or outside contribution.
+- Keep private repos and “licence pending/all rights reserved” until ruled; fix WE LICENSE/LICENCE-DOCS folder mismatch separately. This folds the earlier update into one proposal.
 
-1. **Untrusted text** — n/a: a decision card; it changes no code. Any build it spawns carries its own edge cases.
-2. **Truncated reads** — n/a: a decision card; it changes no code. Any build it spawns carries its own edge cases.
-3. **Shared state files** — n/a: a decision card; it changes no code. Any build it spawns carries its own edge cases.
-4. **Fail closed** — n/a: a decision card; it changes no code. Any build it spawns carries its own edge cases.
-5. **Identity scoping** — n/a: a decision card; it changes no code. Any build it spawns carries its own edge cases.
-6. **State over time** — n/a: a decision card; it changes no code. Any build it spawns carries its own edge cases.
-7. **Who wrote it** — n/a: a decision card; it changes no code. Any build it spawns carries its own edge cases.
+## What ratifying unlocks
 
-## Update 2026-11-20 (D10, decisions page)
+Per-repo licence/scope/notice follow-ups, gated on #186 counsel before public flip. “D10 yes” takes (c)/(a); it publishes nothing.
 
-Operator ask (2026-11-20 20:59 ET): “note all as full decision item and run with preparation”.
-Decision id: D10 (decisions page, 2026-11-20 20:58 ET)
-Placement: everstandards
-move-to: everstandards
+## Trust boundary and threat model
 
-### Digest / context
+Third-party licence texts are attributed evidence, not executable instructions or counsel clearance. Freeze reviewed terms; no licence installation until the operator rules.
 
-**Apache-2.0 code and schemas + CC BY 4.0 spec text (default).** Reuse this card’s existing licence research and #098 rather than duplicate them. Source: [handoff format design](designs/everstandards-format-2026-11-20.md) “Operator decisions”; the page adds Community Specification License 1.0 as the alternative. Repos stay private until the operator decides otherwise; choosing a licence does not itself authorize publication.
+Full prep (Standards decisions-prep set):
 
-### Supported by default — existing licence split
+```text
+D10-5403.md
+```
 
-#098’s standard split is precedent, not a fresh fork disguised as a choice. Ratify the split for the new standards. (a) **Retain Apache-2.0 + CC BY 4.0 (default)**; (b) Community Specification License 1.0 is an explicit proposed amendment, requiring licence/patent/contribution analysis against that precedent before replacing it. The earlier kernel Apache/AGPL/FSL fork remains separately scoped above.
+Source and proposed artifact filenames (handoff references are by name only):
 
-Why no new fork: the page’s default reuses an existing standard-layer ruling; only an explicit proposal to supersede that ruling would reopen it. Code and prose licences coexist across different artifacts. `we:backlog/098-licensing-strategy.md:96` keeps webcases Apache-2.0 permanently; no spec-text choice converts that suite.
-
-Skeptic: Familiar licences may leave normative-spec patent/contribution questions less explicit than CSL 1.0. The default survives as the documented split, subject to a focused review of those terms and #5409’s contribution policy before publication; popularity is not legal clearance.
-Screen: pending focused prep on CSL and artifact boundaries; the historical prepared stamp is preserved, not a claim that CSL was already researched.
-What ratifying unlocks: consistent licence files per artifact, with a separate visibility gate. Operator answers: “D10 yes”.
-Prep still needed: reuse the linked report and #098; compare CSL 1.0 using primary terms, resolve patent/contribution interactions and independently attack the default. No public flip or licence installation occurs in this task.
+```text
+2026-11-20-es-standard-models.md
+2026-11-20-gov-spec-licences-patents.md
+D10-5403.md
+LICENSE.md
+Notices.md
+Scope.md
+```

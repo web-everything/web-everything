@@ -6,6 +6,7 @@ status: open
 dateOpened: "2026-10-08"
 tags: []
 relatedTo: ["5785", "8629", "8628", "8627", "8634"]
+preparedDate: "2026-11-20"
 ---
 
 # Constellation split: standards, Longshore core, Plateau
@@ -26,7 +27,7 @@ Parent: #2445 (Plateau Loop extract), not #5407. This epic is the physical extra
 
 ### Where these rulings are recorded
 
-No sanctioned ruling path applies yet: the related decision cards are not prepared (no `preparedDate`), and ratifying needs prepare, red-team and a statute anchor. So the rulings are recorded here, and each card below should cite this epic when it is prepared and ratified:
+The S1–S7 rulings remain recorded lineage. Related decisions now carry prepared proposals dated 2026-11-20; those proposals are not ratification and still require the operator call and any statute amendment. Each card below should cite this epic at ratification:
 
 - #5403 (licence) — S6 answers it: Apache-2.0, public after the switch-over and a clean scan.
 - #5410 (open line) — S6 is consistent with its default; the line itself stays open.
@@ -79,45 +80,131 @@ Related, not re-filed: #5407 (Delivery standard: the protocol content Longshore 
 
 ## Update 2026-11-20 (D1, decisions page)
 
-Operator ask (2026-11-20 20:59 ET): “note all as full decision item and run with preparation”.
-Decision id: D1 (decisions page, 2026-11-20 20:58 ET)
-Placement: plateau-app
-move-to: plateau-app
+Ask: Build the new core in Longshore, switch old jobs one at a time after comparison, and keep shared data shapes in Ship's specs. Confirm whether a bare Longshore repo may start now while Ship shapes wait.
 
-### Digest / context
+### Digest
 
-Proposed amendment, not a recorded ruling: build the new end-state kernel directly in Longshore, then migrate roles one at a time. This replaces the earlier “incubate as packages inside WE, then extract” sequence above if ratified; S1–S7 remain historical lineage. Source: [handoff end-state design](designs/longshore-end-state-2026-11-20.md) §1, §3–5. About 60 PRs/day and the legacy-shape risks are source observations, not measurements repeated here.
+Prepared, not ratified. The end-state and move-plan research yields two forced invariants: **hybrid migration** and **one normative home for Ship-observable shapes**. These amend the earlier WE-incubation sequence; S1–S7 above retain their lineage. No public flip is authorized.
 
 ### Fork 1 — Transition architecture
 
-Fork-existence: the canonical new core cannot both originate in Longshore with legacy only behind adapters and freeze the legacy WE shapes as its canonical package interfaces. Role migration can be incremental under either, so the distinction is the architecture at the boundary.
+Forced invariant: stable interfaces must not freeze legacy shapes.
 
-- (a) Clean rewrite: clean target, but freezes delivery while chasing a moving system.
-- (b) Plain progression / WE incubation: smaller moves, but carries label authority, append-order ledgers and startup-only caps.
-- (c) **Hybrid (default): end-state kernel in Longshore, legacy roles in WE until tap → shadow diff → flip → delete.** Preserve ongoing C1–C3 work; port useful pure modules instead of rewriting them.
+- (a) Clean rewrite with one cutover: without tap/shadow evidence it lacks equivalence proof; with that evidence it becomes (c). Same-day flips remain a schedule setting.
+- (b) Move WE scripts with shims (#5492 → #5497). *Excluded:* preserves labels as state, append-order ledgers, startup-frozen settings and the `we` hub default as canonical interfaces.
+- (c) **Hybrid (default): end-state kernel in Longshore; legacy roles go tap → shadow diff → flip → delete.** Port pure modules; preserve C1–C3 async-fixer work. Legacy shapes live only in `adapters/legacy-we`.
 
-Skeptic: A parallel kernel can diverge indefinitely. Require replay fixtures, declared intended differences, zero unexplained shadow action diffs and per-role rollback; adapters are deleted after each successful flip.
-Screen: pending a fresh preparation pass on this architectural amendment; it is not a standards-format ruling.
+Evidence:
+- `longshore-end-state-2026-11-20` §2.2–4; `we:scripts/lib/merge-gate-ci.mjs:49` and `we:scripts/conveyor/decide.mjs:7` show legacy assumptions.
+- [Strangler Fig](https://martinfowler.com/bliki/StranglerFigApplication.html), [legacy displacement](https://martinfowler.com/articles/patterns-legacy-displacement/), [GitHub Scientist](https://github.com/github/scientist), fetched 2026-11-20.
+- Per-role flip requires zero unexplained shadow action diffs (ci-heal: 24 h), declared intended differences in its ADR, replay of tapped events, crash/371-break harness and tested rollback. Delete old readers only after the flip holds.
 
-What ratifying unlocks: an amended extraction sequence, ci-heal first and drain last, keeping the target quality bar and existing delivery active. Operator answers: “D1 yes” accepts (c), without authorizing a public flip.
-Prep still needed: compare strangler/rewrite precedents, reconcile #5492/#5497 dependencies and run an independent skeptic/screen. This update preserves existing card status; no new prepared stamp is claimed.
+Skeptic: SURVIVES-WITH-AMENDMENT; removed timing-based rejection of (a), which composes with (c). Screen: clear after separating architecture from schedule.
+
+### Fork 2 — Who owns shared contract shapes
+
+Forced invariant: two normative homes invert the standard/implementation boundary.
+
+- (a) **Ship owns WorkItem, Claim, Verdict, Policy, Handoff, Role/Authority and envelope bindings (default); Longshore pins them.** Longshore authors may draft directly in Ship. Engine-internal store/scheduler/adapter interfaces, PluginManifest, FlowEngine and conformity schemas may land now. Classify Run against #5348; classify authority-register/claim-generation fields against Ship modules.
+- (b) Longshore defines contracts and Ship standardizes later. *Excluded:* engine choices harden into the standard. The draft engine `pass|refuse|unknown` already differs from Ship's researched `pass|fail|unknown`.
+
+Evidence:
+- `2026-11-20-ship-benchmark` §1, §5; `2026-11-20-es-adopted-norms` SE-VRD-001; #5407 protocol drafts.
+- `longshore-end-state-2026-11-20` §1.2; operator settings `standards.shipFirst` (20:55) and `longshore.moveNowWithConformity` (20:56).
+
+Skeptic: SURVIVES-WITH-AMENDMENT; gates Ship shapes, not every schema or who drafts first. Screen: clear.
+
+### Supported by default
+
+- Bare bootstrap, minimal seed, conformity tool, sim copy and pure ports may start now; use `x-status: pending` placeholders for absent Ship shapes.
+- Hybrid step 5 (kernel ci-heal in shadow) emits claims/verdicts and waits on #5407 drafts; track it as #xsw08od, blocked by #5407.
+- Seq-only order, three gate outcomes, per-tick snapshots, one scheduler per tenant and drain-last remain engineering defaults. Capacity: #8628; store: #5785.
+
+### Must-hold rules from the threat-model red team
+
+- Missing/unmatched decisions count as diffs; tap-off soaks are invalid.
+- Switches start fresh review rounds; import holds as commands, never old approvals.
+- Switch/rollback requires logged authorized commands; unreadable registers refuse.
+- Pin Ship shapes, suites and norm schemas by commit and content hash; no network schema-reference lookups.
+
+Details: `_redteam-format-group`.
+
+### What ratifying unlocks
+
+Amend #5492/#5497 into pure-port and per-role flip slices, start D2's tool-first plan, and gate Ship-emitting kernel work on drafts. “D1 yes” accepts (c)/(a).
+
+### Trust boundary and threat model
+
+Tap and forge records are untrusted, snapshotted per soak; shadow execution never writes to the forge. Ratifying this card runs nothing.
+
+Full prep (Standards decisions-prep set):
+
+```text
+D1-5488.md
+```
 
 ## Update 2026-11-20 (D2, decisions page)
 
-Operator ask (2026-11-20 20:59 ET): “note all as full decision item and run with preparation”.
-Decision id: D2 (decisions page, 2026-11-20 20:58 ET)
-Placement: plateau-app
-move-to: plateau-app
+Ask: Confirm tool first, then self-contained ports, then jobs one at a time. Copies do not reduce WE CI time until a job switches.
 
-### Digest / supported by default
+### Digest
 
-The page records a 20:56 yes to moving code measured by the conformity tool; the move plan/order remains outstanding. **Tool first → pure modules → daemons (default).** This is sequencing, not a rival architecture. The agent must bring the first five PRs and their CI effect; no plan is represented as completed here.
+**No real fork: tool → pure modules → role executors.** Tool-first is the operator invariant; daemon-first lacks a pure decide/fold. The measured `we:scripts/conveyor/decide.mjs` closure is 516 files / 188,094 lines. Ordering ports by closure is scheduling.
 
-Context: [handoff end-state design](designs/longshore-end-state-2026-11-20.md) §2–4 lists port candidates (decide, foldProjection, policy-cascade, run-store/feed, simulator) and proposes seed/contracts, WE decision tap, seq ordering, pure-core port and shadow ci-heal as its first five steps. These are source proposals; reconcile them with the page’s tool-first order rather than claim they are the final five PRs.
+### Supported by default
 
-Supported by default: tool → modules → role executors; tool ownership/interface is D17. Alternatives (module-first, daemon-first) are possible sequencing settings but do not waive conformity and equivalence. The default retains kernel no-IO, replay, crash/unknown-input and latency/cost checks; no bulk copy of WE scripts.
+- Order: bootstrap/seed → conformity → sim → replay-substrate (1 file/64 lines), pr-event-feed (2/713), policy-cascade (3/405), run-store (12/2,843) → pure decide after WE tap and planReconcile split → role flips (ci-heal first, drain last).
+- Copies until flip; WE takes no Longshore dependency beforehand. S5 keeps filter-repo after clean secret scan, squashed fallback.
+- Retain no-IO, replay/same-log-same-actions, crash/unknown-input and latency/cost checks. Tool custody is #8627.
 
-Skeptic: Tool-first can become an infrastructure detour. Scope it to executable end-state checks exercised by the first port, then show the first five bounded PRs and measured CI effects.
-Screen: pending prep; sequence is priority/dependency work, not a standards merit fork.
-What ratifying unlocks: a concrete tool-first move plan aligned with D1. Operator answers: “D2 yes” confirms this order; the already recorded move approval is not re-requested.
-Prep still needed: survey existing conformity tools, inventory exact pure-module dependencies, reconcile the five-step sketch and run an independent skeptic pass. No runtime moves occur in this cards-only task.
+### First five PRs and CI effect
+
+Bootstrap commit is PR 0. All are in Longshore:
+1. Minimal seed: Node 22 ESM/JSDoc, workspaces, test CI, README/AGENTS/Apache licence (private), ADRs 0001–0004; workflow ADR pending. PluginManifest is engine-internal.
+2. Conformity T1–T9 fixtures, initially red.
+3. Conformity implementation and its internal schemas; strict profile; committed read-only WE baseline. Depends on seed, not Ship contracts.
+4. Sim copy in `packages/sim`, provenance and ratchet for its 8 top-level lets.
+5. Pure ports under `ports/we/`, secret scan, provenance and staging baseline; promote only at zero blocking findings.
+
+These copies save **0 WE CI minutes**. Longshore CI estimate is 1–2 min, to measure. Each flip removes its WE tests; full #5497 estimate reduces test-shard to one 3–4 min shard and WE PR wall time from 19–20 to about 7 min. These are move-plan estimates, not new measurements.
+
+Evidence:
+- `longshore-move-plan-2026-11-20`, `longshore-conformity-tool-prep`, `longshore-end-state-2026-11-20` §1.8/4.
+- [ESLint suppressions](https://eslint.org/docs/latest/use/suppressions) and [ArchUnit freezing](https://www.archunit.org/userguide/html/000_Index.html) §8.6 ground only-shrink baselines (fetched 2026-11-20).
+
+Defaults: orchestrator bootstrap under delegated authority; waivers ≤90 days with card/reason; warn >500 lines, block new files >1,000. WE tap and seq ordering remain separate WE work.
+
+Skeptic: SURVIVES-WITH-AMENDMENT; corrected CI estimate, dependency argument and schema placement. Screen: sequencing, not a merit fork.
+
+### Must-hold rules from the threat-model red team
+
+- Inherit D1's logged authorized switch/rollback, fresh rounds and imported holds.
+
+Details: `_redteam-format-group`.
+
+### What ratifying unlocks
+
+File bounded build cards for PRs 0–5 after D1. “D2 yes” confirms order; existing move approval is not requested again.
+
+### Trust boundary and threat model
+
+WE scanning is host-side/read-only without credentials in Longshore CI. Staged copies remain untrusted until secret scanning; never publish `ports/`.
+
+Full prep (Standards decisions-prep set):
+
+```text
+D2-5488.md
+```
+
+Source and proposed artifact filenames (handoff references are by name only):
+
+```text
+2026-11-20-es-adopted-norms.md
+2026-11-20-ship-benchmark.md
+D1-5488.md
+D2-5488.md
+_redteam-format-group.md
+longshore-conformity-tool-prep.md
+longshore-end-state-2026-11-20.md
+longshore-move-plan-2026-11-20.md
+```
