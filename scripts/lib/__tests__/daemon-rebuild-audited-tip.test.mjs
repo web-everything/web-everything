@@ -12,7 +12,7 @@ import { readyBuildVerified, matchReadyCandidate, finalizeRebuild } from '../dae
 import { makeAuditedTipGate } from '../daemon-rebuild/audited-tip.mjs';
 import { addOverlay, resolveOverlayFollowTip } from '../daemon-overlays.mjs';
 import { rebuildClone } from '../daemon-rebuild.mjs';
-import { readReadyCandidateStrict, readReadyCandidate, writeReadyCandidate, assertReadyCandidatePins } from '../daemon-rebuild/state.mjs';
+import { readReadyCandidateStrict, readReadyCandidate, writeReadyCandidate, assertReadyCandidatePins, StaleReadyPinError } from '../daemon-rebuild/state.mjs';
 import { appendEntry, storePath } from '../../operations/ruled-weakened-store.mjs';
 import { readRebuildState } from '../daemon-rebuild/state.mjs';
 
@@ -69,6 +69,25 @@ async function fixture() {
 }
 
 describe('unaudited-tip plans', () => {
+  it.each(['missing', 'held-tip-only'])('validates audited applied A while holding unaudited B after main advances; rejects %s evidence for A', async (remainingEvidence) => {
+    const f = await fixture();
+    f.env.WE_DAEMON_OVERLAY_DIR = join(f.dir, 'overlays');
+    addOverlay(f.root, { ref, pr: 42 }, { env: f.env });
+    gitOk(f.root, ['update-ref', 'HEAD', f.adopted.finalSha]);
+    const main = gitOk(f.root, ['commit-tree', `${f.base}^{tree}`, '-p', f.base, '-m', 'advance main']);
+    gitOk(f.root, ['update-ref', 'refs/remotes/origin/main', main]);
+    const plan = await f.plan();
+    expect(plan.ok).toBe(true);
+    expect(plan.mainSha).toBe(main);
+    expect(plan.applied).toEqual([{ ref, pr: 42, sha: f.a, pinnedFrom: f.b }]);
+    const ready = { prevHead: f.adopted.finalSha, adopt: plan };
+    expect(assertReadyCandidatePins(f.root, ready, f.env)).toBe(ready);
+
+    // The held tip's evidence cannot substitute for evidence of the applied SHA.
+    f.save(...(remainingEvidence === 'held-tip-only' ? [record(f.b)] : []));
+    expect(() => assertReadyCandidatePins(f.root, ready, f.env)).toThrow(StaleReadyPinError);
+    expect(() => assertReadyCandidatePins(f.root, ready, f.env)).toThrow('Unaudited ready pin');
+  });
   it.each(['throw', 'nonzero', 'empty', 'pad-throw'])(
     'retains the audit pin and refuses candidates when the hold-marker write fails: %s', async (failure) => {
       const f = await fixture();

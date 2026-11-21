@@ -56,10 +56,11 @@ export async function probeTickCompatibility() {
 }
 
 /** Real Git: publish a smoke-passed pinned candidate, move its tip, then run tick-start. */
-export async function probeStalePinnedReady() {
+export async function probeStalePinnedReady({ auditedOnly = false } = {}) {
   const dir = mkdtempSync(join(tmpdir(), 'stale-ready-soak-'));
   const root = join(dir, 'clone'), author = join(dir, 'author'), origin = join(dir, 'origin.git');
-  const env = { ...process.env, WE_DAEMON_STATE_DIR: join(dir, 'state'),
+  const env = { ...process.env, HOME: dir, WE_DAEMON_STATE_DIR: join(dir, 'state'),
+    WE_DAEMON_SMOKE_STATE_DIR: join(dir, 'smoke-slots'),
     WE_DAEMON_OVERLAY_DIR: join(dir, 'overlays'), WE_DAEMON_CLONE_LOCK_ROOT: join(dir, 'locks'),
     WE_DAEMON_OVERLAY_FOLLOW_TIP: 'follow', WE_DAEMON_REBUILD_SKIP_UNRELATED: '0',
     WE_DAEMON_OVERLAY_EDGE_RESOLVE: '0', WE_DAEMON_AUTO_REBASE: '0', WE_DAEMON_REBUILD_STRICT_EVIDENCE: '1' };
@@ -93,7 +94,16 @@ export async function probeStalePinnedReady() {
       lockOpts: { waitMs: 30, pollMs: 5 }, log: { error() {} }, emitEvent() {},
       runSmoke: async () => pass, ...extra });
     if (!(await rebuild()).adopted) throw new Error('fixture could not adopt initial overlays');
-    const pin = push('lane/moving', 'shared.txt', 'moving\n', 'lane/moving');
+    if (auditedOnly) {
+      env.WE_DAEMON_OVERLAY_FOLLOW_TIP = 'audited-only';
+      env.WE_FIX_READY_PATH = join(dir, 'fix-ready.jsonl');
+      env.WE_PLATFORM_PREFERENCES_FILE = join(dir, 'platform.json');
+      writeFileSync(env.WE_PLATFORM_PREFERENCES_FILE, '{}');
+      writeFileSync(env.WE_FIX_READY_PATH, ['lane/moving', 'lane/blocker'].map(ref => JSON.stringify({
+        ref, sha: git(root, ['rev-parse', `origin/${ref}`]), tests: 'green', audit: 'NOT WEAKENED',
+      })).join('\n'));
+    }
+    const pin = push('lane/moving', auditedOnly ? 'moving.txt' : 'shared.txt', 'moving\n', 'lane/moving');
     push('main', 'candidate.txt', 'candidate\n', 'main');
     const blocked = await rebuild({ runSmoke: async () => {
       if (!acquireRead(root, lock).ok) throw new Error('fixture could not start sibling tick');
@@ -104,15 +114,18 @@ export async function probeStalePinnedReady() {
     if (blocked.reason !== 'tick-in-progress' || ready?.adopt.applied.find(a => a.ref === 'lane/moving')?.pinnedFrom !== pin) {
       throw new Error('fixture did not publish a pinned ready candidate');
     }
-    push('lane/moving', 'new-tip.txt', 'new\n', 'lane/moving');
-    push('main', 'later.txt', 'later\n', 'main');
+    if (!auditedOnly) {
+      push('lane/moving', 'new-tip.txt', 'new\n', 'lane/moving');
+      push('main', 'later.txt', 'later\n', 'main');
+    }
     git(root, ['fetch', '-q', 'origin']);
     let smokes = 0;
     const result = await rebuild({ launchedBy: 'tick-start', runSmoke: async () => { smokes += 1; return pass; } });
     return { adopted: result.adopted === true, reason: result.reason, smokes,
       discarded: result.alerts?.some(a => a.kind === 'ready-candidate-discarded') === true,
       readyCleared: readReadyCandidate(root, env) === null,
-      freshHead: git(root, ['rev-parse', 'HEAD']) !== ready.adopt.finalSha };
+      freshHead: git(root, ['rev-parse', 'HEAD']) !== ready.adopt.finalSha,
+      heldTipExcluded: readFileSync(join(root, 'moving.txt'), 'utf8') === 'old\n' };
   } finally { releaseRead(root, lock); rmSync(dir, { recursive: true, force: true }); }
 }
 

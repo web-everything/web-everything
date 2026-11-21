@@ -70,12 +70,14 @@ describe('strict ready pins cannot downgrade audit or history proof', () => {
   });
   it('accepts a legacy ready record with a proven registered, adopted and audited pin', () => {
     const f = fixture();
+    writeFileSync(f.env.WE_FIX_READY_PATH, JSON.stringify({ ref, sha, tests: 'green', audit: 'NOT WEAKENED' }) + '\n');
     expect(readProvenReadyCandidate(f.root, f.env, readFileSync, { run: f.run })).toEqual(f.ready);
   });
 });
 
 function resetFixture(stage = 'inProgress') {
   const f = fixture();
+  writeFileSync(f.env.WE_FIX_READY_PATH, JSON.stringify({ ref, sha, tests: 'green', audit: 'NOT WEAKENED' }) + '\n');
   f.ready.adopt.finalSha = 'f'.repeat(40);
   writeFileSync(readyCandidatePath(f.root, f.env), JSON.stringify(f.ready));
   const prior = f.run.getMockImplementation();
@@ -113,7 +115,7 @@ it.each(['missing', 'corrupt', 'wrong-type', 'revoked', 'other-head'])('strict p
     f.record.verified = 'true';
     writeRebuildState(f.root, f.state, f.env);
   }
-  if (fault === 'revoked') writeFileSync(f.env.WE_FIX_READY_PATH, JSON.stringify({ ref, sha: pin, tests: 'red' }) + '\n');
+  if (fault === 'revoked') writeFileSync(f.env.WE_FIX_READY_PATH, JSON.stringify({ ref, sha, tests: 'red' }) + '\n');
   if (fault === 'other-head') {
     const prior = f.run.getMockImplementation();
     f.run.mockImplementation(args => args.includes('HEAD') ? { status: 0, stdout: '9'.repeat(40) } : prior(args));

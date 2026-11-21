@@ -5658,6 +5658,10 @@ including exact/same-tree matches, so a new smoke can proceed. Moved tips, retir
 changed HEAD and revoked audit membership must not become permanent tick-start holds.
 The real-Git table in `daemon-rebuild-ready.test.mjs` covers tip, registration and HEAD churn;
 the pin-provenance table retains every audit/history refusal at the adoption boundary.
+`daemon-rebuild-audited-tip.test.mjs` advances main while audited A is retained with
+`pinnedFrom` naming unaudited B. Ready-pin proof must accept A's evidence and reject
+missing A evidence even when B is audited. The `rebuild-evidence-compatibility` soak
+replays adoption of that prepared candidate with no extra smoke and excludes B's content.
 Ready records require prevHead/tree/passedAt/kind/forced and adopt.finalSha/inputsKey/mainSha/applied.
 Fallbacks also require forInputsKey/dropRefs/failed, with ref/sha/pr on each drop (pr may be null).
 Optional diagnostic ready metadata remains typed when present.

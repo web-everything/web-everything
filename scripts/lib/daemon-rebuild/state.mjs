@@ -256,8 +256,8 @@ export function assertReadyCandidatePins(root, r, env = process.env, read = read
     const auditedTip = makeAuditedTipGate(env);
     for (const pin of pins) {
       // Follow mode disables audit revocation for every tip; it uses no pin exemption.
-      // With auditing enabled, exact ref/SHA acceptance is mandatory in addition to history.
-      if (typeof auditedTip === 'function' && auditedTip(pin.ref, pin.pinnedFrom) !== true) throw new StaleReadyPinError('Unaudited ready pin');
+      // Audit the applied SHA; pinnedFrom is the held tip, proved by registration below.
+      if (typeof auditedTip === 'function' && auditedTip(pin.ref, pin.sha) !== true) throw new StaleReadyPinError('Unaudited ready pin');
       const registration = registry.overlays?.find(o => o.ref === pin.ref);
       if (!registration || (registration.pr ?? null) !== (pin.pr ?? null)
         || verifyRev(git, `refs/remotes/origin/${pin.ref}^{commit}`) !== pin.pinnedFrom) throw new StaleReadyPinError('Unproven ready pin registration');

@@ -13,7 +13,7 @@ export default {
   ] },
   fixPresent(root) {
     const result = spawnSync(process.execPath, ['--input-type=module', '-e',
-      "import { probeRebuildEvidence, probeStalePinnedReady, probeTickCompatibility } from './scripts/conveyor/soak/fixtures/rebuild-evidence-probe.mjs'; const r = await probeRebuildEvidence(); const s = await probeStalePinnedReady(); const t = await probeTickCompatibility(); process.exit(!t.violations.length && r.changed === 'rebuild-job-started' && r.consumedReason === 'no-result' && s.adopted && s.discarded && s.readyCleared && s.freshHead && s.smokes === 1 ? 0 : 1);"],
+      "import { probeRebuildEvidence, probeStalePinnedReady, probeTickCompatibility } from './scripts/conveyor/soak/fixtures/rebuild-evidence-probe.mjs'; const r = await probeRebuildEvidence(); const s = await probeStalePinnedReady(); const a = await probeStalePinnedReady({ auditedOnly: true }); const t = await probeTickCompatibility(); process.exit(!t.violations.length && r.changed === 'rebuild-job-started' && r.consumedReason === 'no-result' && s.adopted && s.discarded && s.readyCleared && s.freshHead && s.smokes === 1 && a.adopted && !a.discarded && a.readyCleared && !a.freshHead && a.smokes === 0 && a.heldTipExcluded ? 0 : 1);"],
     { cwd: root, encoding: 'utf8', timeout: 30_000, maxBuffer: 65536 });
     return result.status === 0;
   },
@@ -21,8 +21,12 @@ export default {
     try {
       const result = await probeRebuildEvidence();
       const stale = await probeStalePinnedReady();
+      const audited = await probeStalePinnedReady({ auditedOnly: true });
       const tick = await probeTickCompatibility();
-      return { result, stale, tick, violations: [...tick.violations, ...(stale.adopted && stale.discarded && stale.readyCleared && stale.freshHead && stale.smokes === 1
+      return { result, stale, audited, tick, violations: [...tick.violations,
+        ...(audited.adopted && !audited.discarded && audited.readyCleared && !audited.freshHead && audited.smokes === 0 && audited.heldTipExcluded
+          ? [] : ['audited applied pin was discarded or the unaudited held tip was adopted']),
+        ...(stale.adopted && stale.discarded && stale.readyCleared && stale.freshHead && stale.smokes === 1
         && result.before === 'smoke-env-timeout-backoff' && result.consumedReason === 'no-result'
         && result.changed === 'rebuild-job-started' && result.again === 'rebuild-job-running'
         && result.jobs === 2 && result.preserved ? [] : ['persisted evidence blocked admission or duplicated a rebuild'])] };
