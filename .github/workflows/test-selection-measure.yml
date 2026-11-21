@@ -30,7 +30,7 @@ jobs:
     # once (unlike `test-shard`'s 1/9 coverage split) plus the full real-git integration suite, so budget well
     # above a single shard's 15min. `continue-on-error: true` already keeps a genuine timeout here from
     # ever reddening CI; this only stops a hang from tying up a runner for the 360-min default.
-    timeout-minutes: 30
+    timeout-minutes: 75
     steps:
       # Same sibling layout as `test-shard` — the unit suite needs the FUI sibling for the `@frontierui/*` alias.
       # Shallow checkout plus blobless main history preserves the pinned-base merge base (#2681).
@@ -81,7 +81,8 @@ jobs:
       # The shadow FULL run — the whole unit suite with the json reporter, so the measure step has per-file
       # pass/fail. `|| true`: a red shadow run must still record (the false-green signal LIVES in a red full run).
       - name: Shadow full-suite run (json report)
-        timeout-minutes: 15
+        # 15 min timed out on all 15 real runs (11-04), leaving zero valid samples; 45 min lets one finish.
+        timeout-minutes: 45
         continue-on-error: true
         working-directory: web-everything
         run: npx vitest run --reporter=json --outputFile=vitest-full.json || true
