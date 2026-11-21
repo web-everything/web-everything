@@ -67,7 +67,8 @@ export async function runSeatWithProvider(request, {
         return { status: 'skipped', reasons: [reason] };
       }
     }
-    if (/gemini|carbon/i.test(String(runModel)) && resolveProviderCap('agy-gemini') <= 0) {
+    // R1062a: Carbon shadow seats sit outside the agy-gemini live cap (their own switch + daily cap apply above/below).
+    if (!carbonShadow && /gemini|carbon/i.test(String(runModel)) && resolveProviderCap('agy-gemini') <= 0) {
       const reason = 'agy-gemini seat cap 0';
       logReviewSeat(log, `review-seat: agy ${directive.mode} skipped: ${reason}`);
       return { status: 'skipped', reasons: [reason] };

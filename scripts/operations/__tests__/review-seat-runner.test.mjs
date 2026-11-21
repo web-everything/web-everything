@@ -723,3 +723,43 @@ it('an unpromoted Carbon advisory route retains no live non-shadow seat', () => 
     vi.unstubAllEnvs();
   }
 });
+
+describe('carbon shadow seat vs the agy-gemini live seat cap (R1062a)', () => {
+  const run = async (mode, model, env, extra = {}) => {
+    for (const [k, v] of Object.entries({ WE_REVIEW_SEAT_CAP_AGY_GEMINI: '0', ...env })) vi.stubEnv(k, v);
+    const calls = [];
+    const rows = [];
+    try {
+      const out = await runSeatWithProvider({ ...REQUEST, seatProvider: { mode, model, seat: 'correctness', pr: 7, repo: 'o/r', ...extra } }, io({
+        claudeJudge: async () => judgeOutcome({ summary: 'c', findings: [FINDING] }, { sessionId: 'claude-s' }),
+        agyJuror: async (o) => { calls.push(o); return { status: 'ok', sessionId: 'agy-s', value: { summary: 'a', findings: [FINDING] } }; },
+        appendRow: (row) => { rows.push(row); return true; },
+        log: () => {},
+        reserveSession: extra.dailyCap === undefined ? undefined : () => ({ allowed: false, reason: 'daily cap' }),
+      }));
+      return { out, calls, rows };
+    } finally { vi.unstubAllEnvs(); }
+  };
+
+  it('carbon shadow seat ignores agy-gemini live cap', async () => {
+    const { calls, rows } = await run('shadow', 'gemini-4-carbon-high', { WE_REVIEW_SEAT_CAP_CARBON_SHADOW: '5' });
+    expect(calls).toHaveLength(1);
+    expect(rows[0]).toMatchObject({ status: 'ok' });
+  });
+  it('a live (non-shadow) agy-gemini seat with cap 0 is still skipped', async () => {
+    const { calls } = await run('agy', 'gemini-4-carbon-high', { WE_REVIEW_SEAT_CAP_CARBON_SHADOW: '5' }, { onEscape: 'skip' });
+    expect(calls).toHaveLength(0);
+  });
+  it('a non-carbon gemini shadow with cap 0 is still skipped', async () => {
+    const { calls } = await run('shadow', 'gemini-3-pro', { WE_REVIEW_SEAT_CAP_CARBON_SHADOW: '5' });
+    expect(calls).toHaveLength(0);
+  });
+  it('the carbon shadow switch off means no run', async () => {
+    const { calls } = await run('shadow', 'gemini-4-carbon-high', { WE_REVIEW_SEAT_CAP_CARBON_SHADOW: '0' });
+    expect(calls).toHaveLength(0);
+  });
+  it('the carbon shadow daily cap is still enforced', async () => {
+    const { calls } = await run('shadow', 'gemini-4-carbon-high', { WE_REVIEW_SEAT_CAP_CARBON_SHADOW: '5' }, { dailyCap: 1 });
+    expect(calls).toHaveLength(0);
+  });
+});
