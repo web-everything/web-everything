@@ -6,6 +6,7 @@ import { explainWhy, lastMentionLine, whyOperation } from '../operator-why.mjs';
 import { ADVISORY_NOTE_MARKER } from '../../conveyor/advisory-round-count.mjs';
 import { advisoryHeadMoveState } from '../../conveyor/reconcile-core.mjs';
 import { createWhyReader } from '../operator-why-io.mjs';
+import { buildReviewedShaMarker, buildClearedHumanMarker } from '../../lib/review-escalation.mjs';
 
 const base = { subject: { kind: 'pr', id: 5017 }, repo: 'web-everything/web-everything', pr: { state: 'OPEN', labels: [] }, logs: [], checks: [], gaps: [] };
 const HEAD7 = 'f7c7dcd37' + '0'.repeat(31), OLD7 = '1c2cf7cc9' + '0'.repeat(31);
@@ -41,7 +42,7 @@ describe('why first-match owner rules', () => {
   });
   it('why names review daemon when advisory is stale', () => {
     const pr = staleAdvisoryPr();
-    const out = explainWhy({ ...base, pr, advisoryHeadMove: advisoryHeadMoveState(pr) });
+    const out = explainWhy({ ...base, pr, advisoryHeadMove: advisoryHeadMoveState(pr), advisoryReviewOnHumanHandoff: 'on' });
     expect(out.owner).toBe('review daemon');
     expect(out.waitingFor).toBe('advisory re-run on f7c7dcd37');
   });
@@ -50,6 +51,23 @@ describe('why first-match owner rules', () => {
     const out = explainWhy({ ...base, pr, advisoryHeadMove: advisoryHeadMoveState(pr) });
     expect(out.owner).toBe('operator');
     expect(out.waitingFor).toMatch(/advisory unreadable/);
+  });
+  it.each(['off', undefined])('why keeps human ownership when advisory setting is %s', advisoryReviewOnHumanHandoff => {
+    const pr = staleAdvisoryPr();
+    const out = explainWhy({ ...base, pr, advisoryHeadMove: advisoryHeadMoveState(pr), advisoryReviewOnHumanHandoff });
+    expect(out.owner).toBe('operator');
+    expect(out.waitingFor).toBe('human review / park');
+  });
+  it.each(['verdict', 'human clearance'])('why does not report unreadable history over current-head %s', kind => {
+    const pr = staleAdvisoryPr({ comments: [
+      { author: { login: 'web-everything' }, body: `${ADVISORY_NOTE_MARKER}\n\nno basis` },
+      { author: { login: 'web-everything' }, body: `${buildReviewedShaMarker(HEAD7)}\n${kind === 'human clearance' ? buildClearedHumanMarker('chalbert') : ''}` },
+    ] });
+    expect(explainWhy({ ...base, pr, advisoryHeadMove: advisoryHeadMoveState(pr), advisoryReviewOnHumanHandoff: 'on' }).waitingFor).toBe('human review / park');
+  });
+  it('why excludes advisory:changes from head-moved ownership', () => {
+    const pr = staleAdvisoryPr({ labels: ['review:human', 'advisory:changes'] });
+    expect(explainWhy({ ...base, pr, advisoryHeadMove: advisoryHeadMoveState(pr), advisoryReviewOnHumanHandoff: 'on' }).owner).toBe('operator');
   });
   for (const [name, extra, owner, op] of [
     ['build hold', { buildHolds: [{ reason: 'manual' }] }, 'nobody (parked: manual)', 'unpark'],
@@ -116,7 +134,7 @@ it('injects all external reads and preserves failed-source gaps', () => {
   expect(read({ pr: 0, item: '5754', repo: base.repo }).card.queued).toBe(true);
 });
 
-it('why names review daemon when advisory is stale, through the real io seam (commits requested)', () => {
+it.each(['on', 'off', 'unreadable'])('why honours advisory setting %s through the real io seam (commits requested)', setting => {
   const pr = staleAdvisoryPr();
   const run = (cmd, args) => {
     const joined = [cmd, ...(args ?? [])].join(' ');
@@ -126,13 +144,20 @@ it('why names review daemon when advisory is stale, through the real io seam (co
       .filter(k => fields.includes(k)).map(k => [k, k === 'number' ? 5017 : k === 'labels' ? [{ name: 'review:human' }] : pr[k] ?? null])));
   };
   const read = createWhyReader({
-    run, readAgents: () => [], readComments: () => pr.comments, readRequiredChecks: () => [], readChecks: () => [],
+    run, readAgents: () => [], readComments: () => pr.comments,
+    readOwnershipSettings: () => {
+      if (setting === 'unreadable') throw new Error('settings unavailable');
+      return { advisoryReviewOnHumanHandoff: { value: setting, source: 'repo' } };
+    },
+    readRequiredChecks: () => [], readChecks: () => [],
     listPlists: () => [], listFiles: () => [], tail: () => ({ text: '' }), readClaims: () => [], readBuildHolds: () => [],
     readBackoffs: () => [], readPrepareFailures: () => ({ failures: {} }), listPrs: () => [], readCard: () => null, now: () => 0,
   });
-  const out = explainWhy(read({ pr: 5017, item: '', repo: base.repo }));
-  expect(out.owner).toBe('review daemon');
-  expect(out.waitingFor).toBe('advisory re-run on f7c7dcd37');
+  const facts = read({ pr: 5017, item: '', repo: base.repo });
+  const out = explainWhy(facts);
+  expect(out.owner).toBe(setting === 'on' ? 'review daemon' : 'operator');
+  expect(out.waitingFor).toBe(setting === 'on' ? 'advisory re-run on f7c7dcd37' : 'human review / park');
+  if (setting === 'unreadable') expect(facts.gaps).toContainEqual({ source: 'advisory setting', error: 'settings unavailable' });
 });
 
 it('keeps the screen bounded while retaining all structured evidence and gaps', () => {

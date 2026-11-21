@@ -1630,7 +1630,8 @@ function advisoryHeadState(pr) {
  * A review:human head that moved only mechanically (a main merge / update-branch / drain bookkeeping / conveyor
  * recovery commit) owes one fresh advisory. Decided on the trusted advisory comment and the 40-hex live head:
  * `{ owed: true, head }` when a readable advisory exists, does not cover the head, and no verdict covers it either;
- * `{ unreadable: true }` when an advisory note exists but none is readable (no dispatch); otherwise `{ owed: false }`.
+ * `{ unreadable: true }` when an advisory note exists but none is readable (no advisory dispatch);
+ * repair and operator-ruling owners remain independent. Otherwise `{ owed: false }`.
  */
 export function advisoryHeadMoveState(pr) {
   const { headSha, latest, advisoryIsCurrent, alreadyReviewed, unpinnedAdvisory } = advisoryHeadState(pr);
@@ -1641,9 +1642,9 @@ export function advisoryHeadMoveState(pr) {
   const tip = commits.at(-1);
   const mechanical = Boolean(tip) && String(tip.oid ?? '').toLowerCase() === headSha
     && (isMechanicalMergeCommit(tip) || isDrainBookkeepingCommit(tip) || /^Conveyor-[A-Za-z-]+:/m.test(String(tip.messageBody ?? '')));
-  // Unreadable evidence on a mechanically moved head fails closed: no review of any kind dispatches.
-  if (!latest) return hasNote && mechanical ? { owed: false, unreadable: true } : { owed: false };
   if (advisoryIsCurrent || alreadyReviewed || parseLatestHumanClearedSha(trusted) === headSha) return { owed: false };
+  // Current-head coverage wins over unrelated unreadable history. Otherwise fail closed for this advisory.
+  if (!latest) return hasNote && mechanical ? { owed: false, unreadable: true } : { owed: false };
   if (unpinnedAdvisory) return mechanical ? { owed: false, unreadable: true } : { owed: false };
   return mechanical ? { owed: true, head: headSha, latestHead: latest.head ?? null } : { owed: false };
 }
@@ -3107,32 +3108,6 @@ export function planReconcile({
       continue;
     }
 
-    // A review:human head moved by a mechanical commit owes ONE advisory on the live head (one per head: the
-    // advisory/verdict coverage in advisoryHeadMoveState is the dedupe). Not a repair round, so it skips the
-    // findings/cap accounting and the red-team review-unfinished hold; every other review gate still applies.
-    if (phase === 'needs-human' && !withPhase.labels.includes(ADVISORY_LABELS.CHANGES)) {
-      const moved = advisoryHeadMoveState(pr);
-      if (moved.unreadable) {
-        // An advisory exists but cannot be read: fail closed, no review of any kind until a person rules.
-        refuse('advisory-unreadable', { ...withPhase, why: 'the newest advisory on this review:human PR cannot be read, so no review is dispatched; a person must read the thread' });
-        continue;
-      }
-      if (moved.owed) {
-        const rowsBefore = dispatch.length;
-        dispatchReviewRow({
-          pr, requiredChecks, withPhase, base, attempts: roundAttempts(), roundCap: effectiveRoundCap, now, dispatch,
-          refuse, refuseCapExhausted, extra: { headMovedAdvisory: true },
-          advisoryReview: { head: moved.head, reason: 'head-moved-advisory',
-            why: `the head moved mechanically to \`${moved.head}\` and the newest advisory is on \`${moved.latestHead ?? 'none'}\`;`
-              + ' one advisory review runs on the live head so the human sees a current verdict; it never accepts a review:human PR' },
-        });
-        if (dispatch.length > rowsBefore) {
-          if (dispatch.slice(rowsBefore).every(d => d.kind === 'review' && d.advisoryReview)) continue;
-          dispatch.length = rowsBefore;
-        }
-      }
-    }
-
     const sendBack = (phase === 'needs-human' ? operatorSendBackAfterReview(pr) : null)
       ?? ((ciRepairOwed || (phase === 'bounced' && !withPhase.labels.includes(CONFLICT_LABEL)))
         ? operatorSendBackRearm(pr, operatorBudget) : null);
@@ -3724,6 +3699,37 @@ export function planReconcile({
           + ' — the fix that changes the head is owed, not another review of the same head',
       });
       continue;
+    }
+
+    // Repair, send-back and ruling owners above keep priority over an advisory, including an unreadable one.
+    // One advisory per mechanical head; it is not a repair round and does not apply the red-team seat's hold.
+    if (phase === 'needs-human' && !withPhase.labels.includes(ADVISORY_LABELS.CHANGES)) {
+      const moved = advisoryHeadMoveState(pr);
+      if (moved.unreadable) {
+        refuse('advisory-unreadable', { ...withPhase, why: 'the newest advisory on this review:human PR cannot be read, so no review is dispatched; a person must read the thread' });
+        continue;
+      }
+      if (moved.owed && advisoryReviewOnHumanHandoff === 'on') {
+        const rowsBefore = dispatch.length;
+        const buffered = [];
+        const bufferRefusal = (...args) => buffered.push(args);
+        dispatchReviewRow({
+          pr, requiredChecks, withPhase, base, attempts: roundAttempts(), roundCap: effectiveRoundCap, now, dispatch,
+          refuse: bufferRefusal, refuseCapExhausted: capExhaustedVia(bufferRefusal), extra: { headMovedAdvisory: true },
+          advisoryReview: { head: moved.head, reason: 'head-moved-advisory',
+            why: `the head moved mechanically to \`${moved.head}\` and the newest advisory is on \`${moved.latestHead ?? 'none'}\`;`
+              + ' one advisory review runs on the live head so the human sees a current verdict; it never accepts a review:human PR' },
+        });
+        if (dispatch.length > rowsBefore) {
+          if (dispatch.slice(rowsBefore).every(d => d.kind === 'review' && d.advisoryReview)) {
+            buffered.forEach(args => refuse(...args));
+            continue;
+          }
+          dispatch.length = rowsBefore;
+        }
+        // A speculative review gate may refuse or propose a repair. Discard it with its rows; the normal
+        // path below owns the final refusal/repair, so the report records this PR only once.
+      }
     }
 
     // A pushed repair owes its review even if fix-end left the old findings/advisory labels in place.

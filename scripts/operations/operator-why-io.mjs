@@ -9,6 +9,7 @@ import { cardForPr } from './pr-ownership-io.mjs';
 import { checksArgv, parseJsonLines } from './pr-status-io.mjs';
 import { defaultReadRequiredStatusChecks } from '../lib/required-status-checks.mjs';
 import { advisoryHeadMoveState } from '../conveyor/reconcile-core.mjs';
+import { loadPrOwnershipSettings } from '../conveyor/pr-ownership-settings.mjs';
 import { readCompletePrComments } from '../conveyor/pr-comments-complete.mjs';
 import { latestUnresolvedStandDown } from '../conveyor/stand-down-answer-core.mjs';
 import { standDownReason } from '../conveyor/stand-down.mjs';
@@ -31,6 +32,7 @@ export function createWhyReader({
   tail = tailFile, listPlists = listDaemonPlistFiles, readPlist = path => readPlistAsJson(path, { exec: run }),
   readCard = createClaimReader({ root, listFiles, readText, exec: run }),
   readComments = (pr, repo) => readCompletePrComments(pr, { repo, exec: run }),
+  readOwnershipSettings = loadPrOwnershipSettings,
   readRequiredChecks = repo => defaultReadRequiredStatusChecks({ repo, gh: args => String(run('gh', args, { encoding: 'utf8', timeout: 60000 })) }),
   readChecks = (repo, sha) => parseJsonLines(run('gh', checksArgv({ repo, sha }), { encoding: 'utf8', timeout: 60000, maxBuffer: 32 * 1024 * 1024 })),
   readClaims = () => listFixDispatchClaims(join(coordinationRoot, 'fix-dispatch-claims')),
@@ -55,6 +57,8 @@ export function createWhyReader({
         facts.pr.comments = comments;
         // Decided by the planner's own helper (here, in the io module, so operator-why.mjs stays free of acting imports).
         facts.advisoryHeadMove = safe('advisory head move', () => advisoryHeadMoveState(facts.pr), null);
+        facts.advisoryReviewOnHumanHandoff = facts.advisoryHeadMove?.owed
+          ? safe('advisory setting', () => readOwnershipSettings()?.advisoryReviewOnHumanHandoff?.value, 'off') : 'off';
         facts.standDown = safe('stand-down', () => { const c = latestUnresolvedStandDown(comments); return c ? { ...c, reason: standDownReason(c.body) ?? 'unknown' } : null; }, null);
         facts.roundExtensions = safe('round extensions', () => countGrantedRoundExtensions(comments, { repo, pr }), null);
       }
@@ -83,7 +87,7 @@ export function createWhyReader({
       facts.linkedPrs = allPrs.filter(p => String(cardForPr(p)) === subject.id).sort((a, b) => Number(b.state === 'OPEN') - Number(a.state === 'OPEN') || b.number - a.number);
       // A single linked PR uses the same explanation, without enumerating all ownership sessions/lanes.
       if (facts.card.status === 'active' && facts.linkedPrs[0]) {
-        const linkedFacts = createWhyReader({ root, home, coordinationRoot, run, listFiles, readText, pathExists, tail, listPlists, readPlist, readCard, readComments, readRequiredChecks, readChecks, readClaims, readBuildHolds, readBackoffs, readPrepareFailures, readAgents, listPrs, now })({ pr: facts.linkedPrs[0].number, repo });
+        const linkedFacts = createWhyReader({ root, home, coordinationRoot, run, listFiles, readText, pathExists, tail, listPlists, readPlist, readCard, readComments, readOwnershipSettings, readRequiredChecks, readChecks, readClaims, readBuildHolds, readBackoffs, readPrepareFailures, readAgents, listPrs, now })({ pr: facts.linkedPrs[0].number, repo });
         facts.linkedPrs[0] = { ...facts.linkedPrs[0], explanation: explainWhy(linkedFacts) };
         gaps.push(...linkedFacts.gaps.map(g => ({ ...g, source: `linked PR ${g.source}` })));
       }

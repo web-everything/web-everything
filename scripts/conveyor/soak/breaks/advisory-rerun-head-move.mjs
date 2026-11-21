@@ -24,12 +24,14 @@ export default {
     const advisory = head => ({ author, createdAt: '2026-11-20T10:00:00Z',
       body: `${ADVISORY_NOTE_MARKER}\n\n**Verdict:** accept\n\nok\n\n---\n\nNet basis: \`${'c'.repeat(40)}..${head}\` — 1 net changed file(s) vs current main` });
     const commit = (oid, messageHeadline) => ({ oid, messageHeadline, messageBody: '', authors: [{ login: 'someone' }] });
-    const rows = (head, tip) => planReconcile({
+    const plan = (head, tip, extra = {}, options = {}) => planReconcile({
       prs: [{ number: 7230, state: 'OPEN', headRefName: 'lane/x', headRefOid: HEAD, labels: [{ name: 'review:human' }],
         mergeStateStatus: 'CLEAN', statusCheckRollup: [{ name: 'gate', status: 'completed', conclusion: 'success' }],
-        commits: [commit(OLD, 'fix: it'), commit(HEAD, tip)], comments: [advisory(head)] }],
+        commits: [commit(OLD, 'fix: it'), commit(HEAD, tip)], comments: [advisory(head)], ...extra }],
       agents: [], requiredChecks: ['gate'], reviewTiming: { startAfter: 'ci-green' }, now: Date.parse('2026-11-20T12:00:00Z'),
-    }).dispatch.filter(d => d.kind === 'review' && d.advisoryReview?.reason === 'head-moved-advisory');
+      advisoryReviewOnHumanHandoff: 'on', ...options,
+    });
+    const rows = (head, tip) => plan(head, tip).dispatch.filter(d => d.kind === 'review' && d.advisoryReview?.reason === 'head-moved-advisory');
     const owed = rows(OLD, "Merge branch 'main' into lane/x");
     if (owed.length !== 1 || owed[0].advisoryReview.head !== HEAD) violations.push(`stale advisory after a main merge: ${owed.length} advisory rows, expected 1 on the live head`);
     log?.(`stale advisory after main merge: rows=${owed.length}\n`);
@@ -37,6 +39,23 @@ export default {
     if (covered.length) violations.push('advisory already covering the head still got a row');
     const authored = rows(OLD, 'fix: another change');
     if (authored.length) violations.push('a non-merge author commit got a head-moved advisory row');
+    // PR #7263 review: unreadable history may stop reviews, never the CI repair or operator send-back.
+    const tip = "Merge branch 'main' into lane/x";
+    const unreadable = { author, createdAt: '2026-11-20T10:00:00Z', body: `${ADVISORY_NOTE_MARKER}\n\nno basis` };
+    const red = [{ name: 'gate', status: 'completed', conclusion: 'failure' }];
+    const heal = plan(OLD, tip, { comments: [unreadable], statusCheckRollup: red });
+    if (heal.dispatch.length !== 1 || heal.dispatch[0].kind !== 'ci-heal') violations.push('unreadable advisory suppressed red-CI heal');
+    const request = { id: 'operator-send-back', author: { login: 'chalbert' }, createdAt: '2026-11-20T11:00:00Z',
+      body: '🔁 review — changes requested\n\nRecorded by chalbert via console.\n\nMUST FIX: repair the export.' };
+    const sendBack = plan(OLD, tip, { comments: [unreadable, request], statusCheckRollup: red });
+    if (sendBack.dispatch.length !== 1 || sendBack.dispatch[0].mode !== 'operator-send-back') violations.push('unreadable advisory suppressed operator send-back');
+    const { buildReviewedShaMarker } = await import(pathToFileURL(join(sourceRoot, 'scripts/lib/review-escalation.mjs')).href);
+    const coveredState = plan(OLD, tip, { comments: [unreadable, { author,
+      body: `✅ review — accepted\n${buildReviewedShaMarker(HEAD)}` }] });
+    if (coveredState.refusals.some(r => r.kind === 'advisory-unreadable')) violations.push('covered head reported unreadable history');
+    const disabled = plan(OLD, tip, {}, { advisoryReviewOnHumanHandoff: 'off' });
+    if (disabled.dispatch.some(d => d.advisoryReview?.reason === 'head-moved-advisory')) violations.push('disabled advisory setting was bypassed');
+    log?.(`unreadable history: heal=${heal.dispatch[0]?.kind}, send-back=${sendBack.dispatch[0]?.mode}; disabled rows=${disabled.dispatch.length}\n`);
     return { violations };
   },
   judge: report => report.violations,
