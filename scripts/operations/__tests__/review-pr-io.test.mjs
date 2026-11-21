@@ -3932,7 +3932,8 @@ describe('card 5470: the advise step declares the shadow effect in on mode too',
 // ── Held item 177 — the stack-aware read and the STACK_HOLD sink ──────────────────────────────────────────────────────
 describe('held item 177: readPr judges a stacked top against its stack base', () => {
   const HEAD = 'a'.repeat(40);
-  const TREE = 'b'.repeat(40);
+  const MAIN_BASE = 'b'.repeat(40); // drainScoredGit's pinned main basis
+  const TREE = 'e'.repeat(40);
   const STACK_DIFF = 'diff --git a/own.mjs b/own.mjs\n--- a/own.mjs\n+++ b/own.mjs\n@@ -1 +1 @@\n-old\n+new\n';
   const view = () => ({ number: 7, title: 't', body: '', headRefName: 'lane/x', labels: [], files: [], comments: [] });
   // The main-basis diff is whatever the git stub prints; empty here, so a stack read is distinguishable from it.
@@ -3963,6 +3964,7 @@ describe('held item 177: readPr judges a stacked top against its stack base', ()
     expect(out.stackBase).toBeUndefined();
     expect(out.diff.text).not.toBe(STACK_DIFF);
     expect(calls.text).toEqual([]);
+    expect(out.net).toMatchObject({ base: MAIN_BASE, paths: [], scored: true });
   });
   it.each([
     ['no stack', { readStack: () => null }],
@@ -3975,6 +3977,8 @@ describe('held item 177: readPr judges a stacked top against its stack base', ()
     expect(out.stackBase).toBeUndefined();
     expect(out.diff.text).not.toBe(STACK_DIFF);
     expect(out.net.base).not.toBe(TREE);
+    expect(out.diff).toMatchObject({ text: '', base: MAIN_BASE, scored: true });
+    expect(out.net).toMatchObject({ base: MAIN_BASE, paths: [], scored: true });
   });
 });
 
