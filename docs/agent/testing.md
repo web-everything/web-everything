@@ -5859,7 +5859,6 @@ For fixtures with arbitrary branches, workflow files or cross-repo couples, use
 Keep full commit IDs consistent across listings, live reads, check runs and saved
 refresh records. Resolve the diff at the listed head when a capped commits read
 or a later push intentionally makes the commits tip or live head differ.
-## Lane eligibility: absent checkout versus failed probe
 
 ## Live-owner adapter fixture imports
 
@@ -5868,6 +5867,9 @@ Load the manual dispatcher, review job and reconcile graph during collection in
 when dispatch and reconcile IO are injected, so a cold transform otherwise consumes
 the first case's five-second deadline. Reuse the collected modules in head-change
 and job-refusal cases; retain injected launch IO, assertions and per-case deadlines.
+
+## Lane eligibility: absent checkout versus failed probe
+
 `lane-pool-acquire-growth.test.mjs` covers both a removed lane directory and a removed
 `.git` entry: skip those candidates without blocking bounded growth or touching the
 remaining files. Only ENOENT proves absent metadata. Existing checkouts with failed
