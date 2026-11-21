@@ -60,7 +60,7 @@ it('isolates every Path B evidence read and disables filter renormalization', ()
   expect(calls).toHaveLength(4);
   for (const { opts } of calls) expect(opts.env).toEqual({
     GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: '/dev/null', GIT_ATTR_NOSYSTEM: '1',
-    GIT_CONFIG_COUNT: '1', GIT_CONFIG_KEY_0: 'merge.renormalize', GIT_CONFIG_VALUE_0: 'false',
+    GIT_CONFIG_PARAMETERS: '', GIT_CONFIG_COUNT: '1', GIT_CONFIG_KEY_0: 'merge.renormalize', GIT_CONFIG_VALUE_0: 'false',
   });
 });
 
