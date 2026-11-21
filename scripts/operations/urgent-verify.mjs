@@ -22,7 +22,16 @@ export function createUrgentDeps({ cwd = process.cwd(), home = homedir(), fs = r
   // are launcher scaffolding, not system tools: scrub exactly those from the child PATH so nothing probes the token tree.
   // Any other extra dir (a lookalike, another gh) is left alone.
   // Matched by the exact path shape (any home: the host PATH is inherited while HOME may be a sandbox or fake).
-  const approvedShimDir = d => /(^|\/)\.claude\/github-app-token\/gh-shim(\.d\/[0-9a-f]{16})?$/.test(resolve(d));
+  // Exact shape `<some home>/.claude/github-app-token/gh-shim` or `.../gh-shim.d/<16 hex>`, and never inside the checkout
+  // or its sibling checkouts' tree: a repo-supplied lookalike is not exempt and stays probed. (HOME is a sandbox in
+  // wrapped runs, so the home itself cannot be the anchor.)
+  const checkoutRoot = resolve(cwd);
+  const approvedShimDir = d => {
+    const r = resolve(d);
+    if (r === checkoutRoot || r.startsWith(checkoutRoot + '/')) return false;
+    const m = /^(.+)\/\.claude\/github-app-token\/(gh-shim|gh-shim\.d\/[0-9a-f]{16})$/.exec(r);
+    return Boolean(m) && !m[1].includes('/.claude/');
+  };
   const fui = resolve(cwd, '../frontierui');
   // Child env is scrubbed to a few keys; local bins (vitest etc.) must stay resolvable.
   const binDirs = [join(cwd, 'node_modules/.bin'), join(fui, 'node_modules/.bin')];
