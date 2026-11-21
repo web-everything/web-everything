@@ -9,10 +9,10 @@ export default {
   card: 'fix-scope-overlap-timings',
   fixedBy: { sha: 'pending', where: 'timings-union', paths: ['scripts/conveyor/fix-scope-policy.mjs'] },
   fixPresent(root) {
-    // Observe policy behaviour in the requested tree, rather than looking for a source marker.
+    // Presence is independent of the planning scenario, so a regression cannot invert its gate.
     const probe = spawnSync(process.execPath, ['--input-type=module', '-e',
-      'const b = (await import(process.argv[1])).default; const r = await b.run(); process.exit(b.judge(r).length ? 1 : 0);',
-      pathToFileURL(fileURLToPath(import.meta.url)).href], {
+      "const { stripProseScope } = await import(process.argv[1]); process.exit(stripProseScope(['we:scripts/ci/test-timings.json']).length === 0 ? 0 : 1);",
+      pathToFileURL(join(root, 'scripts/conveyor/fix-scope-policy.mjs')).href], {
       env: { ...process.env, SOAK_TREE_ROOT: root }, encoding: 'utf8', timeout: 15_000, maxBuffer: 1024 * 1024,
     });
     return probe.status === 0;

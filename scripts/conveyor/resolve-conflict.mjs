@@ -90,6 +90,10 @@ export function resolveConflicts({ dir = process.cwd(), files = [], take, argume
     try { git(['rev-parse', '-q', '--verify', 'MERGE_HEAD'], dir); } catch { throw new Error('No merge in progress (MERGE_HEAD missing)'); }
     if (!files.length) throw new Error('At least one --file is required');
     if (take === 'timings-union' && files.some(file => file !== TIMINGS_PATH)) throw new Error(`timings-union is allowed only for ${TIMINGS_PATH}`);
+    if (take === 'timings-union') {
+      try { git(['merge-base', '--is-ancestor', 'MERGE_HEAD', 'origin/main'], dir); }
+      catch { throw new Error('timings-union refused: cannot verify MERGE_HEAD is an ancestor of origin/main; verify the main ref and merge direction, or resolve manually'); }
+    }
     const plans = [...new Set(files)].map((file) => {
       validateFile(file);
       // Never follow a working-tree symlink outside the lane, including symlink parents.

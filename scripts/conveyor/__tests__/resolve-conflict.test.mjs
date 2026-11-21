@@ -24,6 +24,7 @@ function fixture({ lane = true, merge = true, sub = false, oursExec = false, the
   git('switch', '-qc', 'other'); writeFileSync(join(dir, rel), contents[2]); commit(theirsExec);
   git('switch', '-q', 'main'); writeFileSync(join(dir, rel), contents[1]); commit(oursExec);
   if (merge) { try { git('-c', 'user.name=t', '-c', 'user.email=t@t', 'merge', 'other'); } catch {} }
+  if (conflictFile === 'scripts/ci/test-timings.json') git('update-ref', 'refs/remotes/origin/main', 'other');
   return { dir, git, logPath: join(root, 'log.jsonl'), root };
 }
 it.each(['ours', 'theirs', 'union'])('resolves %s and records the run', (take) => {
@@ -193,4 +194,28 @@ it('timings-union refuses invalid JSON with its reason and leaves the conflict u
     .toMatchObject({ ok: false, reason: expect.stringMatching(/JSON/) });
   expect(readFileSync(join(f.dir, timingsFile), 'utf8')).toBe(before);
   expect(f.git('ls-files', '-s')).toBe(index);
+});
+
+it.each(['unrelated merge head', 'missing origin/main', 'unreadable ancestry'])('timings-union refuses %s through injectable git before any writes', reason => {
+  const f = fixture({ conflictFile: timingsFile });
+  const before = readFileSync(join(f.dir, timingsFile), 'utf8');
+  const index = f.git('ls-files', '-s');
+  const calls = [];
+  const git = (args) => {
+    calls.push(args);
+    if (args[0] === 'merge-base') throw new Error(reason);
+    return Buffer.from(f.git(...args));
+  };
+  expect(resolveConflicts({ dir: f.dir, files: [timingsFile], take: 'timings-union' }, { git, logPath: f.logPath, cwd: f.dir }))
+    .toMatchObject({ ok: false, reason: expect.stringMatching(/MERGE_HEAD.*ancestor.*origin\/main.*resolve manually/) });
+  expect(calls).toContainEqual(['merge-base', '--is-ancestor', 'MERGE_HEAD', 'origin/main']);
+  expect(calls.some(args => ['ls-files', 'show', 'hash-object', 'update-index'].includes(args[0]))).toBe(false);
+  expect(readFileSync(join(f.dir, timingsFile), 'utf8')).toBe(before);
+  expect(f.git('ls-files', '-s')).toBe(index);
+});
+it('timings-union accepts a merge head that is an older ancestor of origin/main', () => {
+  const f = fixture({ conflictFile: timingsFile, contents: ['{"unit":{"a":1}}', '{"unit":{"a":2}}', '{"unit":{"a":3}}'] });
+  const descendant = f.git('-c', 'user.name=t', '-c', 'user.email=t@t', 'commit-tree', 'other^{tree}', '-p', 'other', '-m', 'main advances').trim();
+  f.git('update-ref', 'refs/remotes/origin/main', descendant);
+  expect(resolveConflicts({ dir: f.dir, files: [timingsFile], take: 'timings-union' }, { logPath: f.logPath, cwd: f.dir }).ok).toBe(true);
 });

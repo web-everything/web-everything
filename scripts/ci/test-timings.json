@@ -725,6 +725,7 @@
   "scripts/conveyor/__tests__/tick-core-wall-clock-ttl.test.mjs": 0.02,
   "scripts/conveyor/__tests__/tick-core.test.mjs": 0.21,
   "scripts/conveyor/__tests__/timeout-evidence-pool.test.mjs": 25.68,
+  "scripts/conveyor/__tests__/timings-soak-presence.test.mjs": 0.1,
   "scripts/conveyor/__tests__/timings-union.test.mjs": 0.04,
   "scripts/conveyor/__tests__/tmp-sweep.test.mjs": 1.93,
   "scripts/conveyor/__tests__/unowned-rebase-attempt-count.test.mjs": 0.01,

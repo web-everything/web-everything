@@ -5898,3 +5898,11 @@ staging the JSON request. The applier carries that pin to `review-set-label` as 
 ## S1b shadow accuracy evidence
 
 The static shadow returns per-file unknown evidence: unknown tests always join the selection, and unknown sources add every test reaching them. Ambiguity alone is not partial; only changed unreadable, oversized or deleted modules make the graph partial. Unchanged unreadable or oversized files remain unknown, widen reach, and appear in `unknownFiles`/`reasons` without setting partial. Literal paths anywhere in a source add edges. Existing full-suite classifiers and untracked/deleted non-test paths without importers escalate the shadow to full; listing failures do likewise. Symlinks and paths outside ROOT are never read. Test filesystem admission separately from parser bounds: oversized metadata must cause zero source reads, while exactly-at-cap files remain readable. Measure rows bind `head` (40 hex) and `base`, and record shadow mode, unknown count, selected/total tests and reasons; full shadow mode has no `shadowEscaped` tests. Sorted repo-relative `staticTests` preserves pure edge reach (including unknown widening) before escalation; measure rows record `staticTestCount` alongside `totalTests` and `mode`, and `shadowEscapedStatic` measures failures outside that reach even in full mode. Missing static evidence yields null counts/escapes. None of these fields changes the real decision; `staticTests` is diagnostic only.
+
+
+For soak breaks with an expected-failure gate, keep `fixPresent` independent of the
+scenario asserted by `run`: a regression in that scenario must remain a required
+failure, never flip the gate to expected failure. The timings overlap break probes
+`stripProseScope` for presence and exercises two-fix planning separately;
+`scripts/conveyor/__tests__/timings-soak-presence.test.mjs` pins that separation
+with a deliberately regressed planner.
