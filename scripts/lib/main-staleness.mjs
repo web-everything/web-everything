@@ -364,6 +364,40 @@ export function assertMainNotStale(root, checkStaleness, {
 /** The refusal marker of {@link assertOperatorCliFresh}: operator CLIs run from a stale checkout. */
 export const OPERATOR_CLI_STALE_MARKER = 'run from an up-to-date lane';
 
+/** Read-only adoption predicate shared with numbering preflight; never re-executes the CLI or exits. */
+function operatorAdoptedBuild(root, { run, env, adoptedState, now, readSettings }) {
+  let knob = env?.WE_OPERATOR_CLI_FRESH_FALLBACK;
+  if (knob === undefined) { try { knob = readSettings()?.operatorCli?.freshFallback; } catch { /* absent */ } }
+  if (knob === 'off' || env?.WE_OPERATOR_CLI_FRESH_REEXEC === '1') return { ok: false };
+  const head = readHeadSha(root, run);
+  const treeOut = run(['rev-parse', 'HEAD^{tree}'], { cwd: root, timeout: 30_000, killSignal: 'SIGKILL' });
+  const headTree = treeOut.status === 0 ? String(treeOut.stdout ?? '').trim() : null;
+  return decideAdoptedBuild({ headSha: head, headTree, state: adoptedState(root), dirty: codeDirty(root, run),
+    nowMs: now(), maxAgeMs: lastGoodMaxAgeMs(env) });
+}
+
+/**
+ * Read-only restamp preflight against the local origin ref: no fetch, sync, re-exec or exit.
+ * Unreadable count/diff throws so callers can hold before writing and retry after repairing freshness evidence.
+ * Adoption uses the operator CLI's exact smoke, age, clean-tree and fallback-setting checks.
+ */
+export function restampWouldRefuseStale(root, { base = 'main', run = gitRun, env = process.env,
+  listBehindFiles = (r) => behindFiles(r, base, run, env),
+  adoptedState = (r) => readRebuildStateFile(r, env), now = () => Date.now(), readSettings = readOperatorSettings } = {}) {
+  const count = run(['rev-list', '--count', `HEAD..origin/${base}`], { cwd: root, timeout: 60_000, killSignal: 'SIGKILL' });
+  const raw = String(count.stdout ?? '').trim();
+  if (count.status !== 0 || !/^\d+$/.test(raw) || !Number.isSafeInteger(Number(raw))) throw new Error('freshness unreadable (behind count)');
+  const behind = Number(raw);
+  if (!behind) return { refuse: false, behind };
+  const files = listBehindFiles(root);
+  if (!Array.isArray(files)) throw new Error('freshness unreadable (behind diff)');
+  if (!files.some(isCodePath) || env?.WE_DAEMON_MANAGED_CLONE === '1') return { refuse: false, behind };
+  try {
+    if (operatorAdoptedBuild(root, { run, env, adoptedState, now, readSettings }).ok) return { refuse: false, behind, adoptedBuild: true };
+  } catch { /* Missing adoption evidence cannot exempt stale code. */ }
+  return { refuse: true, behind };
+}
+
 /**
  * Item 113 — an OPERATOR CLI (`review-set-label.mjs`, `record-referral-ruling`) judges a PR with the code of
  * the checkout it runs from. Run from a checkout far behind `origin/main` it can refuse on a bug main already
@@ -410,15 +444,10 @@ export function assertOperatorCliFresh(root, { label = 'operator-cli', base = 'm
     const behind = last?.behind ?? 'several';
     // R1099 — a daemon's own smoke-gated ADOPTED build is current by construction. Honour the same off knob.
     try {
-      let knob = env?.WE_OPERATOR_CLI_FRESH_FALLBACK;
-      if (knob === undefined) { try { knob = readSettings()?.operatorCli?.freshFallback; } catch { /* absent */ } }
-      if (knob !== 'off' && env?.WE_OPERATOR_CLI_FRESH_REEXEC !== '1' && last?.filesKnown === true) {
-        const head = readHeadSha(root, run);
-        const treeOut = run(['rev-parse', 'HEAD^{tree}'], { cwd: root, timeout: 30_000, killSignal: 'SIGKILL' });
-        const headTree = treeOut.status === 0 ? String(treeOut.stdout ?? '').trim() : null;
-        const verdict = decideAdoptedBuild({ headSha: head, headTree, state: adoptedState(root), dirty: codeDirty(root, run),
-          nowMs: now(), maxAgeMs: lastGoodMaxAgeMs(env) });
+      if (last?.filesKnown === true) {
+        const verdict = operatorAdoptedBuild(root, { run, env, adoptedState, now, readSettings });
         if (verdict.ok) {
+          const head = verdict.head;
           write(`${label}: this checkout is ${behind} commit(s) behind origin/${base} in code it runs, but is its daemon's `
             + `ADOPTED smoke-passed build ${head.slice(0, 12)} (adopted ${verdict.at}) — running it, not refusing.\n`);
           return { adoptedBuild: true, behind, head };

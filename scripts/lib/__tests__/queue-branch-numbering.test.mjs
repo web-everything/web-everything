@@ -5,6 +5,7 @@ import { numberPendingHashes } from '../../lane-drain.mjs';
 import { handNumberedNewItems } from '../../check-standards-rules.mjs';
 import { BRANCH_NUMBERING_CI_CONTRACT, mainAcceptsBranchNumbering, drainNumberedPairs, trustedDrainAuthors, assertWorktreeCard, exemptDrainNumberedItems, resolveQueueNumbering, hashBacklogFiles, isMergeGroupCiRun, mergeGroupHashRefusals, prepareBranchBeforeEnqueue, reservationPlan, finishBranchPreparation } from '../queue-branch-numbering.mjs';
 import { appendDaemonEvent } from '../daemon-events.mjs';
+import { THIS_CODE_ROOT } from '../main-staleness.mjs';
 
 vi.mock('../card-number-ledger.mjs', () => ({ appendCardLedgerRows: vi.fn(() => new Map()) }));
 vi.mock('../daemon-events.mjs', () => ({ appendDaemonEvent: vi.fn(async () => true) }));
@@ -208,11 +209,12 @@ describe('queue branch numbering', () => {
     expect(reservationPlan(files, [], () => true)).toEqual({ reservations: [], minNext: 11 });
     expect(reservationPlan(files, [reservation], () => true)).toEqual({ reservations: [reservation], minNext: 5840 });
   });
-  function setup({ pending = true, state = '{"reservations":[]}', head = 'old', behind = '0' } = {}) {
+  function setup({ pending = true, state = '{"reservations":[]}', head = 'old', behind = '0', behindFiles = 'scripts/operator.mjs' } = {}) {
     let numbered = false;
     const exec = vi.fn((_, args) => {
       const sparsePath = sparseMetadataPath(args); if (sparsePath) return sparsePath;
       if (args[0] === 'rev-list') { if (behind instanceof Error) throw behind; return `${behind}\n`; }
+      if (args[0] === 'log' && args.includes('--name-only')) { if (behindFiles instanceof Error) throw behindFiles; return behindFiles; }
       if (args[0] === 'ls-remote') return `${head}\trefs/heads/topic\n`;
       if (args[0] === 'ls-files') return pending && !numbered ? 'backlog/xabc123-foo.md' : 'backlog/041-foo.md';
       if (args[0] === 'ls-tree') return args.includes('--name-only') ? 'backlog/040-main.md' : treeEntry('backlog/xabc123-foo.md') + treeEntry('src/not-materialized.js');
@@ -411,7 +413,7 @@ describe('queue branch numbering', () => {
     expect(emit).toHaveBeenCalledWith(expect.objectContaining({ kind: 'needs-you', pr: 4, daemon: 'drain' }));
     expect(revalidationAborted[0].reason).toContain('behind origin/main');
   });
-  it.each(['', 'garbage', '-1'])('refuses when the behind count is unreadable (%j)', (behind) => {
+  it.each(['', 'garbage', '-1', '9007199254740992'])('refuses when the behind count is unreadable (%j)', (behind) => {
     const x = setup({ behind });
     expect(prepareBranchBeforeEnqueue(x.args)).toMatchObject({ action: 'skip', reason: expect.stringContaining('refused') });
     noWrites(x);
@@ -421,6 +423,43 @@ describe('queue branch numbering', () => {
     expect(prepareBranchBeforeEnqueue(x.args)).toMatchObject({ action: 'skip', reason: expect.stringContaining('bad revision') });
     expect(x.number).not.toHaveBeenCalled();
     noWrites(x);
+  });
+  it('numbers when behind only in non-code files', () => {
+    const x = setup({ behind: '5', behindFiles: 'backlog/7264-incident.md\ndocs/notes.md' });
+    expect(prepareBranchBeforeEnqueue(x.args).action).toBe('numbered');
+  });
+  it('refuses before numbering when the behind diff is unreadable', () => {
+    const x = setup({ behind: '5', behindFiles: new Error('diff unreadable') });
+    expect(prepareBranchBeforeEnqueue(x.args).action).toBe('skip');
+    expect(x.number).not.toHaveBeenCalled();
+    noWrites(x);
+  });
+  it('numbers behind code when each checkout is its adopted smoke-passed build', () => {
+    const x = setup({ behind: '5' });
+    const head = 'a'.repeat(40), tree = 'b'.repeat(40);
+    const original = x.exec.getMockImplementation();
+    x.exec.mockImplementation((cmd, args, opts) => {
+      if (args[0] === 'rev-parse' && args[1] === 'HEAD') return head;
+      if (args[0] === 'rev-parse' && args[1] === 'HEAD^{tree}') return tree;
+      return original(cmd, args, opts);
+    });
+    const at = new Date().toISOString();
+    x.args.adoptedState = vi.fn(() => ({ adopted: { head, at }, smokePassed: [{ tree, passedAt: at }] }));
+    expect(prepareBranchBeforeEnqueue(x.args).action).toBe('numbered');
+    expect(x.args.adoptedState.mock.calls.map(([root]) => root)).toEqual(['/clone', THIS_CODE_ROOT]);
+    expect(x.args.adoptedState).toHaveBeenCalledTimes(2);
+  });
+  it('refuses unreadable freshness even in a daemon-managed clone', () => {
+    const x = setup({ behind: '5', behindFiles: new Error('diff unreadable') });
+    x.args.env = { WE_DAEMON_MANAGED_CLONE: '1' };
+    expect(prepareBranchBeforeEnqueue(x.args).action).toBe('skip');
+    expect(x.number).not.toHaveBeenCalled();
+    noWrites(x);
+  });
+  it('numbers behind code in a daemon-managed clone', () => {
+    const x = setup({ behind: '5' });
+    x.args.env = { WE_DAEMON_MANAGED_CLONE: '1' };
+    expect(prepareBranchBeforeEnqueue(x.args).action).toBe('numbered');
   });
   it('proceeds on a fresh checkout with valid numbers', () => {
     const x = setup({ behind: '0' });

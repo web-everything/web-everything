@@ -16,6 +16,7 @@ export function exercise(prepareBranchBeforeEnqueue) {
       if (args.includes('--git-path')) return join(mkdtempSync(join(tmpdir(), 'soak-numbering-')), 'sparse-checkout');
       if (args[0] === 'ls-remote') return 'old\trefs/heads/topic\n';
       if (args[0] === 'rev-list') return `${behind}\n`;
+      if (args[0] === 'log' && args.includes('--name-only')) return 'scripts/operator.mjs\n';
       if (args[0] === 'ls-files') return numbered ? 'backlog/041-foo.md' : 'backlog/xabc123-foo.md';
       if (args[0] === 'ls-tree') return args.includes('--name-only') ? 'backlog/040-main.md' : entry('backlog/xabc123-foo.md');
       if (args[0] === 'rev-parse') return 'new';

@@ -5,7 +5,6 @@ import { isTransientReadFailure } from './drain-api-reads.mjs';
 import { execFileSync } from 'node:child_process';
 import * as nodeFs from 'node:fs';
 import { tmpdir } from 'node:os';
-import { fileURLToPath } from 'node:url';
 import { join, dirname, basename, relative, isAbsolute, resolve, posix } from 'node:path';
 import { isHash, isNum, idFromName } from '../backlog/id.mjs';
 import { numberPendingHashes } from '../lane-drain.mjs';
@@ -14,6 +13,7 @@ import { queueStatePath } from './drain-merge-strategy.mjs';
 import { workflowEditHold } from './merge-queue-enqueue.mjs';
 import { proveHumanOnlyLicense as defaultProveHumanOnlyLicense } from './human-only-enqueue-license.mjs';
 import { appendDaemonEvent } from './daemon-events.mjs';
+import { restampWouldRefuseStale, THIS_CODE_ROOT } from './main-staleness.mjs';
 
 const SETTING = 'scripts/settings/merge-queue-numbering.json';
 const ENV = 'WE_MQ_NUMBER_CARDS_BEFORE_ENQUEUE';
@@ -178,8 +178,8 @@ export function withHooksDisabled(fn) {
 const numberingStatePath = () => join(dirname(queueStatePath()), 'drain-merge-queue-numbering.json');
 // A NUL-delimited (-z) path list is returned untrimmed: trim() would strip a leading-whitespace name
 // (sorted first) into a different path. Explicit maxBuffer: the full ls-files list nears Node's 1 MiB default.
-const safeGit = (exec, cwd) => (args, root = cwd, env = {}) => {
-  const out = String(exec('git', args, { cwd: root, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], maxBuffer: 64 * 1024 * 1024,
+const safeGit = (exec, cwd) => (args, root = cwd, env = {}, options = {}) => {
+  const out = String(exec('git', args, { cwd: root, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], maxBuffer: 64 * 1024 * 1024, ...options,
     env: { ...process.env, ...env, ...hooksDisabledEnv } }));
   return args.includes('-z') || (args[0] === 'cat-file' && args[1] === 'blob') ? out : out.trim();
 };
@@ -362,7 +362,7 @@ export function prepareBranchBeforeEnqueue({ c, traceHeadSha, cwd = process.cwd(
   isOpen = () => undefined, statePath = numberingStatePath(),
   exec = execFileSync, fs = nodeFs, lock = withNumberingLock, number = numberPendingHashes,
   now = () => new Date().toISOString(), shadow, appendLedger = appendCardLedgerRows,
-  env = process.env, log = process.stderr, codeRoot = dirname(fileURLToPath(import.meta.url)) } = {}) {
+  env = process.env, log = process.stderr, adoptedState, codeRoot = THIS_CODE_ROOT } = {}) {
   const policy = resolveCardNumbering({ env });
   shadow ??= policy.value.shadow;
   return withHooksDisabled(() => {
@@ -397,9 +397,11 @@ export function prepareBranchBeforeEnqueue({ c, traceHeadSha, cwd = process.cwd(
         // when it is stale, which used to leave a pushed, renumbered, red PR. Any unreadable input refuses.
         // Both the data checkout (cwd) and the checkout this module (and so the restamp script) loads from.
         for (const [label, root] of [['drain checkout', cwd], ['drain code checkout', codeRoot]]) {
-          const behind = git(['rev-list', '--count', 'HEAD..origin/main'], root);
-          if (!/^\d+$/.test(behind)) throw new Error(`${label} freshness unreadable (${shownText(behind).slice(0, 80)})`);
-          if (Number(behind) > 0) throw new Error(`${label} is ${behind} commit(s) behind origin/main; the restamp would refuse, so nothing was committed or pushed`);
+          const { refuse, behind } = restampWouldRefuseStale(root, {
+            run: (args, opts) => ({ status: 0, stdout: git(args, opts.cwd, {}, { timeout: opts.timeout ?? 30_000, killSignal: 'SIGKILL' }) }),
+            env, adoptedState, now: () => Date.parse(now()),
+          });
+          if (refuse) throw new Error(`${label} is ${behind} commit(s) behind origin/main; the restamp would refuse, so nothing was committed or pushed`);
         }
         const mainFiles = git(LS_BACKLOG('origin/main'));
         const plan = reservationPlan(mainFiles, state, isOpen);

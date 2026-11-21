@@ -14,7 +14,7 @@ export const SKIP_KINDS = Object.freeze([
   'unknown-mergeability', 'conflicting', 'behind', 'checks-pending', 'review-hold', 'cap', 'head-moved',
   'couple-held', 'blocked-by', 'overlap-yield', 'rebuilt-pending-ci', 'merge-failed', 'parked',
   // Former "other" bucket, now named: every skip says which rule held it.
-  'restamp-stale-code', 'not-certified', 'off-base', 'codeql-failed', 'empty-body', 'stale-read', 'escalated',
+  'restamp-stale-code', 'numbering-refused', 'not-certified', 'off-base', 'codeql-failed', 'empty-body', 'stale-read', 'escalated',
   'partner-pending', 'ready-not-reached', 'red-main-hold', 'unrecognized-reason', 'card-grouped',
 ]);
 
@@ -38,6 +38,7 @@ export function classifySkipReason(reason) {
   if (/empty\/whitespace description/.test(r)) return 'empty-body';
   if (/could not re-read the PR fresh|head SHA .*unknown|fresh re-read carried no head/.test(r)) return 'stale-read';
   if (/tamper|test-gaming|escalat/i.test(r)) return 'escalated';
+  if (/branch numbering refused/i.test(r)) return 'numbering-refused';
   // Still named, never "other": the verbatim reason rides on the row so the next rule is a one-line addition.
   return 'unrecognized-reason';
 }
