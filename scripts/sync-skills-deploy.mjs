@@ -282,7 +282,7 @@ export function buildPlans({ srcRoot = SRC_ROOT, extraRoots = [], destRoot, only
 
 function gitToplevel(dir) {
   try {
-    return execFileSync('git', ['rev-parse', '--show-toplevel'], { cwd: dir, encoding: 'utf8' }).trim();
+    return execFileSync('git', ['rev-parse', '--show-toplevel'], { cwd: dir, encoding: 'utf8', maxBuffer: 1024 * 1024 }).trim();
   } catch {
     throw new Error(`sync-skills-deploy: extra root "${dir}" is not inside a git repo; refusing`);
   }
