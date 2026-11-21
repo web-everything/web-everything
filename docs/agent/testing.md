@@ -4749,6 +4749,42 @@ Use an injected HOME and filesystem: the append-only ops store lives under
 share the ref/full-SHA/ruling de-dup key; unreadable ops evidence warns and grants nothing.
 The declared `ruled-weakened-add` CLI uses an array field with `repeatable: true` so each
 `--finding=<string>` appends one verbatim value in order; ordinary array flags still take JSON.
+
+## Lane lease heartbeats
+
+Use `lane-lease-heartbeat.mjs` for best-effort atomic renewal from any lane subdirectory.
+Owned `acquire --lane=N --adopt` may skip canonical-origin resolution, but must still
+probe local history without repair; missing ancestors quarantine the lane. Stale-lease
+PID/dirty refusals precede takeover; unleased reclaim retains its preservation-report contract.
+Apply lease-holder safety only when a marker exists. Unleased recovery and salvage retain their
+backup, preservation and liveness checks; dirty content alone must not skip those checks.
+Fixtures for abandoned leases must use a dead PID (2147483646), never the test process PID.
+Keep expired dirty-lease refusal separate from unleased `--force` recycling assertions.
+Resident reaper controls must initialize real, clean Git repositories: an empty `.git`
+directory is unreadable evidence and must be retained by the fail-closed safety gate.
+Heartbeat owners must keep the event loop available while children run and stop in `finally`;
+synchronous child execution prevents interval renewals. The Codex child runner covers detached
+jobs too. Inject `readAgents`/`readCwds` into liveness fixtures; never probe host processes in unit tests.
+Acquire takeover and explicit reclaim fail closed on unreadable cwd evidence.
+Observed live occupants journal `reclaim-refused-live-process`.
+Provisioning failures stay excluded across acquire poll rounds and prevent pool growth for that attempt.
+Per-command shells and daemon dispatchers must pass `LANE_HOLDER_PID` for the actual worker,
+or keep a lease heartbeat running; the default parent PID only covers a long-lived direct caller.
+New leases record a boot UUID when available, so DHCP hostname changes can still use local PID
+evidence. Legacy or unverified foreign-host leases fail closed. Refusal output prints the exact `release --force`
+command for recovery after the operator confirms the worker stopped.
+Reaper wiring tests must retain the real `applyReclaimSafety` function and inject only its
+probe; identity stubs hide a missing safety gate. Cover both dry-run and actual release.
+Reclaim probes must list effective Git config (including local/worktree includes) and refuse
+lane-defined clean, smudge or process filters before status; hardening pins do not disable them.
+`lane-lease-reclaim-safety.test.mjs` covers filter refusal, config-read failures and inherited
+config overrides. The lease-expiry soak also checks that a real included clean filter cannot
+write its execution marker during reaper planning or branch corroboration. Refuse gitlinks
+before status can enter a submodule with its own filters. Unreadable config or index evidence
+stays `stale-but-dirty`; inspect and repair lane config or inspect submodules separately before
+retrying reclamation.
+Verify-lane renewal tests compare timestamps observed during the running gate, and non-running
+reset/check/print-gate modes must preserve lease bytes.
 Review lane setup uses one hardened environment for the config scrub, origin validation and fetch.
 Global and system config point at the same temporary empty file, system config is disabled, and
 inherited indexed config and config-source overrides are removed before applying the hardening

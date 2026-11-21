@@ -72,6 +72,24 @@ function backupFiles(dir = join(base, 'backups')) {
 }
 
 describe('acquire default automatic recovery with private IO', () => {
+  it.each(['live', 'dirty'])('keeps a stale %s lease out of automatic recovery', kind => {
+    const card = join(laneDir, 'backlog', 'new-card.md');
+    if (kind === 'dirty') writeFileSync(card, original);
+    const marker = join(laneDir, '.git', '.lane-lease');
+    const before = JSON.stringify({ session: 'abandoned-or-waiting',
+      acquiredAt: '2000-01-01T00:00:00.000Z', ttlMinutes: 240,
+      pid: kind === 'live' ? process.pid : 2147483646 });
+    writeFileSync(marker, before);
+
+    const result = acquire();
+    expect(result.status, result.stderr).not.toBe(0);
+    expect(result.stderr).toContain(`stale-but-${kind}`);
+    expect(result.stderr).toContain('auto-recover: reclaimed 0');
+    expect(readFileSync(marker, 'utf8')).toBe(before);
+    expect(backupFiles()).toEqual([]);
+    if (kind === 'dirty') expect(readFileSync(card, 'utf8')).toBe(original);
+  }, 35_000);
+
   it.each(['cached', '--cache-ttl-ms=0', '--cache-ttl-ms=1', '--no-cache'])('acquires a recovered lane after default expiry with %s', (cacheFlag) => {
     const card = join(laneDir, 'backlog', 'new-card.md');
     writeFileSync(card, original);

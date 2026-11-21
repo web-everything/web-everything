@@ -102,6 +102,7 @@ import { resolveCoordinationRoot } from './operations/coordination-root.mjs';
 import { admissionLockRoot, resolveCap, resolveTimeoutMs, acquireSlotBlocking, releaseOwnedSlot, heartbeatOwnedSlot, ADMISSION_HELD_ENV, classifyCommandKind } from './readiness/heavy-admission.mjs';
 import { SHARD_RUN_SCRIPT, checkoutHasRetryableTestUnit, scanRetryCommand, localPhaseReason, localPhaseShape, localPhaseBypassDetail, phaseAdmissionPlan, shouldConfirmRemoteRed, decidePhaseRemote, readRemoteReport, phaseRunLocation, mergeRunLocation, overallRunLocation, remoteInfrastructureFailure, REMOTE_TERMINATION_UNCONFIRMED } from './lib/verify-remote-routing.mjs';
 import { SHARD_LOCAL_ENV } from './lib/verify-shard-run.mjs';
+import { startLaneLeaseHeartbeat } from './lib/lane-lease-heartbeat.mjs';
 import { startTreeWatchdog } from './lib/tree-watchdog.mjs';
 import { shellQuote, isShardWrapperCommand } from './lib/verify-lane-gate.mjs';
 import { randomBytes } from 'node:crypto';
@@ -149,6 +150,9 @@ const MARKER_NONCE_SUFFIX = markerNonceSuffix(process.env[VERIFY_MARKER_NONCE_EN
 delete process.env[VERIFY_MARKER_NONCE_ENV];
 const MODE = flags['dry-run'] ? 'print-gate' : positionals[0] === 'check' ? 'check' : positionals[0] === 'reset' ? 'reset'
   : positionals[0] === 'request' ? 'request' : positionals[0] === 'run' ? 'run' : 'verify';
+// Only a run that holds the lane while gating renews its lease; reset/check/print-gate must never revive one.
+const laneHeartbeat = (MODE === 'verify' || MODE === 'run') ? startLaneLeaseHeartbeat({ cwd: REPO }) : { stop() {} };
+process.once('exit', () => laneHeartbeat.stop());
 
 // The lane is agent-writable, and the fix daemon runs `request` against it: its `.git/config` must never be able to execute
 // a command here (`core.fsmonitor`, hooks, `diff.external`/textconv). Env-pinned config + argument rewrites; a lane that defines a
@@ -838,7 +842,7 @@ async function runGate(command, args, { forgeDispatch = false } = {}) {
     const watchdog = Number.isInteger(child.pid) ? startTreeWatchdog({
       pid: child.pid, timeoutMs: PHASE_TIMEOUT_MS,
       kill: { orphansOfOwnGroup: true, marker: phaseMarker, outputFds: [child.stdout?._handle?.fd, child.stderr?._handle?.fd].filter((fd) => Number.isInteger(fd) && fd > 2) },
-      ...(currentAdmission.ok ? { heartbeat: { module: HEAVY_ADMISSION_MODULE, exportName: 'heartbeatOwnedSlot', args: { lockRoot: ADMISSION_LOCK_ROOT, cap: ADMISSION_CAP, owner: REPO }, everyMs: SLOT_HEARTBEAT_MS } } : {}),
+      heartbeat: { module: HEAVY_ADMISSION_MODULE, exportName: 'heartbeatOwnedSlot', args: { lockRoot: ADMISSION_LOCK_ROOT, cap: ADMISSION_CAP, owner: REPO, laneCwd: REPO }, everyMs: Math.min(SLOT_HEARTBEAT_MS, 60_000) },
       onFire: () => {
         if (settled) return;
         announce();

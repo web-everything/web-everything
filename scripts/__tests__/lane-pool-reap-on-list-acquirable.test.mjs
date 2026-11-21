@@ -39,6 +39,7 @@ function backdateLease(laneDirPath, minutesAgo) {
   const file = LEASE_FILE(laneDirPath);
   const lease = JSON.parse(readFileSync(file, 'utf8'));
   lease.acquiredAt = new Date(Date.now() - minutesAgo * 60_000).toISOString();
+  lease.pid = 2147483646; // abandoned holder, independent of the live test runner
   writeFileSync(file, JSON.stringify(lease, null, 2) + '\n');
 }
 

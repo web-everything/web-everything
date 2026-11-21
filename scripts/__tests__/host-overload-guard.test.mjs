@@ -33,7 +33,7 @@ it.each(['absent .git', 'missing HEAD'])('refresh heals %s before configuring gc
   const refresh = poolFunction('refreshLane', {
     laneDir: (_repo, n) => `/pool/lane-${n}`, gitQuiet: config, fetchOriginHealing: fetch,
     scrubClaimedLaneConfig: scrub,
-    liveLease: () => null, ttlMsFromFlags: () => 0, laneHoldRefuses: () => false,
+    readLease: () => null, liveLease: () => null, ttlMsFromFlags: () => 0, laneHoldRefuses: () => false,
     laneDirtyOrAhead: () => ({ dirty: true, uncommitted: 1, ahead: 0 }), log: () => {},
   });
   for (const n of [1, 2]) expect(refresh({ branch: 'main' }, n).skipped).toBe(true);
