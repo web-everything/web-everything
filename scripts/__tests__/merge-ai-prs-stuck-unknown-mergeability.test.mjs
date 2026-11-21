@@ -1,3 +1,4 @@
+import { pinnedLeafDiffFixture } from './fixtures/pinned-leaf-diff-fixture.mjs';
 /**
  * RED contract for merge-ai-prs.mjs (no production changes in this task):
  * - revalidateWithUnknownRetry accepts repo?, num?, onPersistentUnknown and nudge.
@@ -319,7 +320,7 @@ process.exit(0);
 const cliGit = `#!/usr/bin/env node
 const a = process.argv.slice(2);
 if (a[0] === 'remote' && a[1] === 'get-url') process.stdout.write('git@github.com:web-everything/web-everything.git\\n');
-if (a[0] === 'diff') process.exit(1);
+${pinnedLeafDiffFixture}
 process.exit(0);
 `;
 

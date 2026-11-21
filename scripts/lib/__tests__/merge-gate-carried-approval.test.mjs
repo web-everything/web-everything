@@ -113,7 +113,7 @@ const A = 'a'.repeat(40), B = 'b'.repeat(40);
 const facts = () => ({
   repo: 'o/r', pr: { number: 7, body: 'Real body', baseRefName: 'main', headRefOid: B, labels: ['ready-to-merge', 'review:accepted'], commits: [] },
   defaultBranch: 'main', pinnedHead: { sha: B }, gatePaths: { files: ['.github/workflows/test.yml'] },
-  manifest: { live: null }, netSignals: { scored: true, changedFiles: ['docs/a.md'], diffLines: 2, humanBasisFiles: ['docs/a.md'], cumulativeDiffLines: 2, netDiffText: { text: "diff --git a/x.test.mjs b/x.test.mjs\ndeleted file mode 100644\n--- a/x.test.mjs\n+++ /dev/null\n@@ -1 +0,0 @@\n-it('a', () => {})\n" } },
+  manifest: { live: null }, netSignals: { scored: true, changedFiles: ['docs/a.md'], diffLines: 2, humanBasisFiles: ['docs/a.md'], cumulativeDiffLines: 2, netDiffText: { text: "diff --git a/x.test.mjs b/x.test.mjs\ndeleted file mode 100644\n--- a/x.test.mjs\n+++ /dev/null\n@@ -1 +0,0 @@\n-it('a', () => {})\n", scored: true, rev: B } },
   acceptance: { headSha: B, acceptedSha: B, humanClearedSha: A, humanClearance: { sha: A, diff: 'fingerprint', actor: 'op' } },
 });
 const carried = { carry: true, applicable: true, fromSha: A, toSha: B };

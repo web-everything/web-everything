@@ -14,6 +14,7 @@ import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { openPrPageFixture } from '../../__tests__/fixtures/open-pr-page-fixture.mjs';
 import { completeCheckReadFixture } from '../../__tests__/fixtures/complete-check-read-fixture.mjs';
+import { pinnedLeafDiffFixture } from '../../__tests__/fixtures/pinned-leaf-diff-fixture.mjs';
 
 import {
   DRAIN_FOLLOWUP_KIND, ensureDepsLink, followupWorktreeLayout, handOffDrainFollowup, resolveDrainFollowupSetting,
@@ -58,7 +59,7 @@ const fs = require('node:fs');
 const path = require('node:path');
 const a = process.argv.slice(2);
 if (a[0] === 'remote' && a[1] === 'get-url') process.stdout.write('git@github.com:web-everything/web-everything.git\\n');
-if (a[0] === 'diff') process.exit(1);
+${pinnedLeafDiffFixture}
 if (a[0] === 'rev-parse' && a[1] === '--git-dir') process.stdout.write('.git\\n');
 if (a[0] === 'rev-parse' && a[1] === '--git-common-dir') process.stdout.write('/fake-common/.git\\n');
 if (a[0] === 'worktree' && a[1] === 'add') {
@@ -80,10 +81,10 @@ function runCli({ env: extraEnv = {} } = {}) {
     const fixture = join(dir, 'prs.json');
     writeFileSync(fixture, JSON.stringify([3001].map((number) => ({
       number, title: `leaf ${number}`, body: 'A real summary.', headRefName: `lane/leaf-${number}`,
-      baseRefName: 'main', headRefOid: `sha-${number}`, mergeable: 'MERGEABLE', mergeStateStatus: 'CLEAN',
+      baseRefName: 'main', headRefOid: number.toString(16).padStart(40, '0'), mergeable: 'MERGEABLE', mergeStateStatus: 'CLEAN',
       statusCheckRollup: [{ name: 'test', conclusion: 'SUCCESS', status: 'COMPLETED' }],
       labels: [{ name: 'ready-to-merge' }], comments: [],
-      commits: [{ oid: `sha-${number}`, authors: [{ name: 'Claude', email: 'noreply@anthropic.com' }] }],
+      commits: [{ oid: number.toString(16).padStart(40, '0'), authors: [{ name: 'Claude', email: 'noreply@anthropic.com' }] }],
       files: [{ path: `backlog/leaf-${number}.md`, additions: 1, deletions: 0, changeType: 'ADDED' }],
     }))));
     const preload = 'data:text/javascript,' + encodeURIComponent("import os from 'node:os'; import { syncBuiltinESMExports } from 'node:module'; os.homedir = () => process.env.FU_HOME; syncBuiltinESMExports();");

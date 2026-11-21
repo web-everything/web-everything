@@ -9,7 +9,9 @@ import { dirname, join, resolve, basename, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { handoffHome } from './handoff-home.mjs';
 import { humanReviewHold } from './pr-sweep-core.mjs';
-import { liveResultGateState, parseRedTeamComment, RED_TEAM_COMMENT_MARKER, readRedTeamDisposition } from '../lib/red-team-gate.mjs';
+import { readPlatformPreferences } from '../lib/policy-cascade.mjs';
+import { FINDING_CLASSES } from '../lib/finding-class-policy.mjs';
+import { CONFIRMED_BREAK_ACTIONS, BREAK_CLASSES, CONFIRMED_BREAKS_ENV, RED_TEAM_SETTINGS_FILE, liveResultGateState, breakClass, planRedTeamActions, readConfirmedBreaks, parseRedTeamComment, RED_TEAM_COMMENT_MARKER, readRedTeamDisposition } from '../lib/red-team-gate.mjs';
 import { isTrustedMarkerAuthor } from '../lib/marker-authorship.mjs';
 import { readLiveFixClaim } from '../conveyor/fix-procedure.mjs';
 import { writeJsonAtomic, withFileLock } from '../lib/atomic-json-file.mjs';
@@ -96,7 +98,32 @@ export function itemsFromReport(report) {
 }
 // For the approval alert every confirmed break (degraded as well as broken) counts, whatever the send-back policy;
 // a break the gate already released (recorded card/advisory/ruling) no longer holds.
-const ALERT_BREAK_POLICY = Object.freeze({ broken: 'send-back', degraded: 'send-back', unconfirmed: 'advisory' });
+// Strict fallback: every confirmed break is owed a send-back and no finding class defers to a card.
+const ALERT_BREAK_POLICY = Object.freeze({ broken: 'send-back', degraded: 'send-back', unconfirmed: 'advisory', findingClasses: Object.freeze({}) });
+/** The shared reader; a missing file or an unset/invalid broken/degraded value is unreadable (strict), never a default. */
+export function readBreakPolicy({ env = process.env, readPrefs = readPlatformPreferences, settingsPath = RED_TEAM_SETTINGS_FILE } = {}) {
+  // Unreadable or absent finding-class preferences are unreadable policy: the class reader would silently default to deferrals.
+  // The preferences are read ONCE here and the validated classes are used as the policy (no second, divergent read).
+  const prefs = readPrefs({ env, warn: () => {} });
+  const classes = prefs.prefs.findingClasses;
+  // Every class must be named explicitly: the class reader defaults any omitted class to a deferral.
+  const complete = classes && typeof classes === 'object' && !Array.isArray(classes)
+    && FINDING_CLASSES.every(c => classes[c] === 'fix-now' || classes[c] === 'defer-card');
+  if (prefs.errors.length || !complete) throw new Error('findingClasses preferences are unreadable');
+  // Every override value must be a known action: the shared resolver silently drops an invalid one and keeps a lower layer.
+  const actions = new Set(Object.values(CONFIRMED_BREAK_ACTIONS));
+  const fromFile = JSON.parse(readFileSync(settingsPath, 'utf8'))?.redTeam?.confirmedBreaks ?? {};
+  for (const [k, v] of Object.entries(fromFile)) if (BREAK_CLASSES.includes(k) && !actions.has(v)) throw new Error(`invalid confirmedBreaks.${k}`);
+  for (const pair of String(env?.[CONFIRMED_BREAKS_ENV] ?? '').split(',')) {
+    if (!pair.trim()) continue;
+    const parts = pair.split('=').map(x => String(x ?? '').trim().toLowerCase());
+    const [k, v] = parts;
+    if (parts.length !== 2 || !BREAK_CLASSES.includes(k) || !actions.has(v)) throw new Error('invalid confirmedBreaks override');
+  }
+  const read = readConfirmedBreaks({ env, path: settingsPath, strict: true });
+  if (read.source?.broken === 'default' || read.source?.degraded === 'default') throw new Error('confirmedBreaks is not set');
+  return { ...read.value, findingClasses: classes };
+}
 // The parser silently drops a finding line it cannot read; the comment's own headline counts them. Any result
 // comment for the live head whose headline disagrees with what parsed is not a clean pass (fail closed).
 function headlineAgrees(comments, pr, head) {
@@ -236,7 +263,11 @@ async function readLivePr(item, { gh, cwd }, fields = 'labels,headRefOid') {
  * that came from the queue's `ready` section are judged. Returns `{kept, held}`.
  */
 export async function gateReadyItems(items, report, { gh, cwd, now = Date.now(), log = console.error, deadlineMs = 120000, concurrency = 4,
-  fixClaimLive = (repo, pr) => { try { return readLiveFixClaim({ repo, pr }) !== null; } catch { return null; } } } = {}) {
+  fixClaimLive = (repo, pr) => { try { return readLiveFixClaim({ repo, pr }) !== null; } catch { return null; } },
+  readPolicy = readBreakPolicy } = {}) {
+  // The same policy reader the gate uses; an unreadable setting keeps the strict policy (alarm).
+  let policy, strict = false;
+  try { policy = readPolicy(); if (!policy || typeof policy !== 'object') throw new Error('no policy'); } catch { policy = ALERT_BREAK_POLICY; strict = true; }
   // "your review" and "needs your merge" rows both ask the operator to approve: both pass the same live red-team gate.
   const ready = new Set([...(report.ready ?? []), ...(report.needsYourMerge ?? [])].map((r) => `${r.repo}#${r.number ?? r.pr}`));
   const deadline = Date.now() + deadlineMs;
@@ -261,11 +292,14 @@ export async function gateReadyItems(items, report, { gh, cwd, now = Date.now(),
       const state = liveResultGateState(view.comments, item.pr, view.headRefOid, item.repo);
       // The shared disposition (red-team-gate) decides what still holds on the live head; no private marker parser.
       // Read even with no result in the thread: the sealed stored evidence can hold a head the thread shows nothing for (PR #6622).
-      const disposition = readRedTeamDisposition({ comments: view.comments, pr: item.pr, head: view.headRefOid, repo: item.repo, setting: ALERT_BREAK_POLICY });
-      // Only an operator's own card / not-real / clear ruling settles a confirmed break: the gate's automatic card record
-      // is written before the card job succeeds, so it is no proof (nor is a policy that leaves degraded to a card).
+      const disposition = readRedTeamDisposition({ comments: view.comments, pr: item.pr, head: view.headRefOid, repo: item.repo, setting: policy });
+      // An operator's own card / not-real / clear ruling settles a confirmed break. So does the gate's head-bound
+      // card-queued record, but only for a finding the policy itself sends to a card (never a send-back one).
       const open = new Set([...(disposition?.sendBack ?? []), ...(disposition?.held ?? [])].map(f => f.index));
-      const settled = f => !open.has(f.index) && (disposition?.rulings.get(f.index) ?? []).some(r => r.source === 'operator' && r.kind !== 'block');
+      const cardByPolicy = new Set(planRedTeamActions(state.result, policy).card.map(f => f.index));
+      const settled = f => !open.has(f.index) && (disposition?.rulings.get(f.index) ?? []).some(r => r.kind !== 'block'
+        && (r.keys ?? []).includes(f.index) // the shared reader lists every finding's rulings: settle per break key only
+        && (r.source === 'operator' || (!strict && r.kind === 'card' && breakClass(f) !== 'broken' && cardByPolicy.has(f.index))));
       // Index 0 is the shared hold on stored evidence the thread does not show in full: no operator ruling settles it.
       // An index-0 hold that is only "publication pending" (stored evidence not sealed yet) is no break: never approve, never alarm.
       const publicationPending = (disposition?.held ?? []).some(f => f.index === 0 && f.unsealed === true);

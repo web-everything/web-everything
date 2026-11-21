@@ -5030,6 +5030,14 @@ a live target replacing a stale cached target with a different head and red chec
 Run it with `fast-drain-scope.test.mjs` and `merge-ai-prs.test.mjs` through heavy-admission. Keep `listing.*` phase timers for
 comparison against daemon observations; fixtures prove IO counts without live GitHub calls.
 
+Drain heavy-field hydration uses the shared ordered pool at width six. Keep seed/freshness and
+cache assembly shared with the synchronous reader; a failed or incomplete heavy read rejects
+the whole listing. Join outstanding reads before retrying so retries cannot exceed the pool
+bound. Async listings need `withListRetryAsync` to observe rejected reads. Default-branch names
+are static per process, with concurrent round/listing lookups sharing one pending read; gate
+evidence still comes from live reads. The `listing hydrates heavy fields with bounded concurrency`
+tests in `pr-list-paged.test.mjs` and `merge-ai-prs.test.mjs` cover these guarantees.
+
 ## Drain read-migration fixture imports
 
 Load the drain/adoption graph with static imports during collection in
@@ -5626,24 +5634,58 @@ verifies persisted events and commit messages against a temporary local Git orig
 
 ## Negative review-run proofs
 
-`headNeverReviewedFromRuns` may bypass its 400-run scan only through
-`readCompleteReviewRunsForPr`: an all-PR backfill watermark, acknowledged poison
-markers, stat-only listing verification, and no overflow or eviction for that PR.
-The full-backfill verified staging state lives in the index and uses the same identity
-reconciliation and bad-record cooldown as the open-PR backfill, parsing at most 50
-records per call by default. Concurrent writes requeue only changed identities; a bad
-or unreadable record blocks the global watermark while other candidates advance.
-Open-PR hint refreshes must preserve that staging state and proof.
-Full completeness includes a SHA-256 digest of the rebuilt entries and eviction
-markers. Readers and the backfill reuse path reject a missing or mismatched digest:
-deleting a PR key, dropping one row, or losing an eviction marker cannot preserve
-the proof. Old snapshots without the digest require a new bounded full pass.
-Appends never reseal a proof; only a completed rebuild writes the digest. This
-checks persisted consistency, not authenticity against a writer forging the whole index.
-Unverifiable indexed identities return to the original capped scan; they never
-establish absence. Keep bounded resumption, a 3,012-file snapshot, eviction, poison
-races, and capped negative fallbacks in `review-run-index.test.mjs`, alongside the
-existing `redteam-pending-settle` and `review-red-team-on-skip` suites.
+`headNeverReviewedFromRuns` proves absence through `readNamedCandidates`, independently
+of the full-review index. Archive evidence, archive claims, unreadable listings or
+records, malformed evidence, and missing/non-40-hex subject heads retain the
+hold. Every candidate, including ids named for other PRs, is read and validated with
+`assertReviewRunEvidence` on a cache miss. Payload repo/PR determines relevance
+regardless of the filename's PR; corrupt or unreadable unrelated records refuse proof.
+Independently list the directory before and after parsing: any review-like JSON file
+omitted by candidate discovery refuses proof unless its payload validates as another
+`review-*` operation (such as `review-prep` or `review-ledger-check`). These share the
+run store but are unrelated operations: validate their run-record schema, payload ID,
+and operation matching the filename prefix under the same parse budget, summary cache
+and file-identity checks before excluding them. An omitted `review-pr-*` filename
+still refuses proof. Malformed or unreadable unrelated records,
+invalid filenames and mismatched IDs or operations retain the hold.
+Known `.abandoned.json` tombstones and
+temporary files ending in `.tmp` remain excluded. Operators must inspect and repair
+omitted or malformed evidence before retrying. An unfinished review on an older head
+permits a fresh full review (R640); any live-head review prevents this proof.
+
+A process-local summary cache binds each directory/id to mtimeMs, ctimeMs, device,
+size and inode; a difference in any field forces a fresh read and validation.
+Read exceptions retain the current hold without caching a failed summary; the next
+scan retries even when metadata is unchanged. Returned payloads rejected by scanner
+validation remain cached as invalid for that identity. The transient-read regression
+in `redteam-pending-settle.test.mjs` covers repeated EMFILE failures and full-review
+dispatch recovery for PR, prep and ledger-check records without settling red-team pending.
+Only cache misses consume `runs.scan.maxParses`, resolved through the shared settings
+cascade. Reaching the limit returns false while retaining verified summaries for the
+next tick. Operators can wait for subsequent ticks, inspect omitted evidence, or
+explicitly raise the setting; a partial scan never authorizes a dispatch. Rewritten
+records are reparsed. Before returning true, re-read the candidate snapshot and
+recheck every candidate's file identity; changed or unreadable evidence returns false.
+
+Keep the ten Tier-1 regressions in `redteam-pending-settle.test.mjs`: over-400 legacy
+success and live-head refusal, unreadable heads, unrelated malformed records,
+other-PR payload validation and cached reuse, bounded cache resumption, rewritten
+identities (including ctime/device), omitted review filenames, listing races,
+null candidate discovery, and planner cooldown/formal-review/publishability holds.
+Prep fixtures cover valid coexisting records, malformed/unreadable payloads, ID/operation
+mismatches, shared budget resumption, cache invalidation, and the real-file default
+scanner dispatching a full review while preserving the pending red-team label.
+The `unrelated %s run-store records` tests cover ledger checks and a future operation
+through the same validation path. The real-file default scanner also includes a
+persisted ledger check. `cached %s candidate rewritten during final snapshot refuses
+proof` warms the cache for PR, prep and ledger-check records, changes metadata only
+at the final identity sweep, and asserts refusal without rereading the payload plus
+eviction of the stale summary. This isolates the final sweep from the parse-time check.
+Keep index integrity/backfill tests in `review-run-index.test.mjs`; index corruption,
+poison, overflow or eviction alone no longer determines the never-reviewed proof.
+This proof only permits a full review. Red-team release still requires the unchanged
+reader's finished acceptance on the live head.
+
 ## Forge sweep partial work
 
 `forge-exec-sweep.mjs` shares `slots.scanEntryBound` (integer 1000–1000000, default 200000) between
@@ -5727,6 +5769,16 @@ Check mode fetches origin main before evaluating canonical audit evidence. A fai
 `main not refreshed: <reason>` and refuses even when local evidence would pass against stale refs.
 `open-pr-audit-gate.test.mjs` covers both refresh outcomes, aggregation and an unconfirmed check child.
 
+## Shadow-only static selection edges
+
+`scripts/lib/static-selection-edges.mjs` measures comment-stripped imports, alias imports,
+and literal spawn/read paths without changing gate selection. An optional `selectTests`
+callback adds a `shadow: { tests, partial }` field; it never changes `mode` or the existing decision.
+In `--measure` only, `WE_STATIC_EDGES_SHADOW` or `WE_DIFF_TEST_SELECTION=1` enables this
+diagnostic and records `shadowEscaped` failures outside its test list. Each source has a
+512 KB UTF-8 input cap: oversized files are skipped; oversized or unreadable evidence
+sets `partial: true` (as does a truncated test list). Treat partial output as incomplete
+measurement requiring inspection, never as proof of coverage or an input to a gate.
 ## CI workflow self-test (ci-self.yml)
 
 An edit to `ci.yml` is never run by its own PR: the ruleset pins the workflow from main. Before a
@@ -5737,6 +5789,15 @@ run id in the clearance comment. `ci-self.yml` is manual dispatch only and calls
 after the first merge. `scripts/ci/__tests__/ci-self-workflow.test.mjs` parses the YAML to keep the
 contract (triggers, local call, no required-name collision). Merge-gate enforcement is a later card.
 
+## File-item card publication replay
+
+Keep validated card content and the UTC batch date in the persisted publication payload.
+Test warning stops through the CLI with a JSON-round-tripped run store: publication stays
+retryable on `--resume` while the guarded write and queue effects remain applied. Read
+NUL-delimited Git paths without trimming; leading whitespace is part of the path.
+For an existing daily batch, validate its diff from the shared main ancestor, not
+from the moving `origin/main` tip. Cover independent main advancement and a lane refresh
+between two same-day publications.
 ## Lane reset safety probe regressions
 
 `lane-pool-acquire-reset-probe-failed.test.mjs` uses a PATH Git shim activated after fetch
@@ -5744,3 +5805,48 @@ to isolate the reset-time status/ahead probes. Cover both transient recovery and
 refusal, and assert no checkout/reset/clean follows a failed probe. The bounded process
 reader wraps the original stderr in `ProcReadError.cause`; preserve that stderr (or the
 spawn error message) in probe diagnostics rather than reporting zero counts as proof.
+
+## Async drain worker CLI fixtures
+
+The in-process merge drain harness ports `node drain-gh-async.mjs <bounds> <gh args>`
+through the real synchronous throttle to its fake gh function port. Preserve the serialized
+timeout and hard child kill signal, drain caller attribution and read-memo exclusion when updating this seam.
+Unknown subprocesses still fail the harness even when a best-effort reader catches them.
+`merge-ai-prs-listing-dedupe.test.mjs` covers successful listings and worker failure with
+the CLI's `gh-error` exit; `merge-ai-prs-prestage.test.mjs` covers paged heavy reads and enqueue gates.
+Use `keepAliveScript` for the hung-gh timeout fixture in `drain-gh-async.test.mjs` so it
+stays anchored to the test runner with a maximum lifetime if timeout cleanup is interrupted.
+The async drain executor uses SIGKILL for gh timeout termination, including when callers omit
+the signal or request a soft signal: synchronous child waits otherwise remain blocked when gh
+ignores that signal. Keep the worker alive through child reaping and throttle-slot release.
+The parameterized soft-signal regression checks elapsed time, child exit and slot cleanup with
+real subprocesses; the existing explicit-SIGKILL case pins the hydration callers' behavior.
+## File-item batch history and warning coverage
+
+Existing batch validation must use the advertised remote main commit without updating the lane's
+tracking refs, and inspect every batch commit, including reverted additions. Refuse merge ancestry
+and unknown main evidence with the preserve-lane-and-retry warning. Keep stale and refreshed lane
+baselines, hidden side-parent history and oversized history evidence in `file-item-card-branch.test.mjs`.
+Its parameterized Git environment test supplies every scrubbed repository, object and index override
+and checks the intended origin, lane index and decoy repository. Its sixty-second publication check
+measures filing through remote visibility against a local bare origin; live remote latency still
+requires an observation outside the hermetic fixture.
+
+Every new exported effect primitive, guarded throw and CLI stop value needs a named test in its
+sibling unit suite. Map each PREP-listed test file to a changed test or explain the existing coverage
+in review evidence. For retryable warnings, `effect-executor.test.mjs` must defend the non-idempotent
+refusal and safe replay; `cli-adapter.test.mjs` must defend warning stops, fallback text and credential
+redaction in JSON and text output. These checks are deliberate contract pins when the behavior already
+exists; the stale-baseline and reverted-history cases must discriminate the publication repair.
+## Pinned merge-drain leaf fixtures (R1105)
+
+CLI fixtures exercising gates after the test-gaming scan must provide a resolved
+commit matching the listed head, a merge-base, numstat and a readable unified diff.
+Use `scripts/__tests__/fixtures/pinned-leaf-diff-fixture.mjs` for synthetic
+`lane/leaf-N` backlog-only PRs; an always-failing Git diff now exercises the
+incomplete-evidence human hold instead of the downstream gate.
+For fixtures with arbitrary branches, workflow files or cross-repo couples, use
+`pinned-pr-diff-fixture.mjs` with rows from the same PR database as fake `gh`.
+Keep full commit IDs consistent across listings, live reads, check runs and saved
+refresh records. Resolve the diff at the listed head when a capped commits read
+or a later push intentionally makes the commits tip or live head differ.
