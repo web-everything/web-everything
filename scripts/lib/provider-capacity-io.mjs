@@ -49,20 +49,28 @@ export function observeCapacity({ env = process.env, now = Date.now(), settings 
   const readersOff = env.WE_CAPACITY_READERS === 'off';
   const root = join(env.HOME || homedir(), '.plateau');
   records ??= readersOff ? [] : jsonFile(join(daemonConveyorStateRoot(env), '.conveyor', 'run-scorecards.json'))?.records ?? [];
-  const configured = {};
+  const configured = {}, signedOutReaders = {};
+  const usageFile = spec => !readersOff && spec?.type === 'plateau-usage-file'
+    && typeof spec.file === 'string' && !isAbsolute(spec.file) && !spec.file.split(/[\\/]/).includes('..')
+    ? jsonFile(join(root, spec.file)) : null;
   for (const p of settings.providers ?? PROVIDER_DEFAULTS.providers) for (const account of p.accounts ?? [{ id: p.id }]) {
     const specs = account.readers ?? p.readers;
+    signedOutReaders[account.id] = () => {
+      const raw = usageFile(account.signedOutFrom ?? p.signedOutFrom);
+      return raw?.status === 'signed-out' ? { at: raw.at, status: raw.status } : null;
+    };
     configured[account.id] = () => {
       for (const spec of specs ?? []) {
         let raw;
         if (spec.type === 'codex-rollout') raw = quota(env);
-        else if (!readersOff && spec.type === 'plateau-usage-file' && typeof spec.file === 'string' && !isAbsolute(spec.file) && !spec.file.split(/[\\/]/).includes('..')) raw = jsonFile(join(root, spec.file));
+        else raw = usageFile(spec);
         if (raw) return raw;
       }
       return null;
     };
   }
   const capacities = readProviderCapacity({ env, now, settings, readers: readers ?? { ...configured,
+    signedOut: id => signedOutReaders[id]?.(),
     hold: (p, at) => providerQuotaHold(records, p.startsWith('agy-') ? 'antigravity' : p, at),
   } });
   const rates = readersOff ? new Map() : recentCapacityRates(env.WE_CAPACITY_LEDGER || join(daemonConveyorStateRoot(env), 'capacity-decisions.jsonl'), now);

@@ -177,6 +177,18 @@ describe('PTY collection', () => {
     await vi.advanceTimersByTimeAsync(45000);
     expect(h.writes).toEqual(['\x1b']);
   });
+  it.each(['Not signed in', 'Select login method'])(
+    'never writes /usage when only %s replaces the prompt after Escape', async marker => {
+      const h = processFixture();
+      const assertion = expect(h.promise).rejects.toThrow('timed out');
+      h.child.stdout.write(SIGNED_IN);
+      await vi.advanceTimersByTimeAsync(3000);
+      expect(h.writes).toEqual(['\x1b']);
+      h.child.stderr.write(`\x1b[2J${marker}`);
+      await vi.advanceTimersByTimeAsync(45000);
+      await assertion;
+      expect(h.writes).toEqual(['\x1b']);
+    });
   it('rechecks the last frame when the minimum startup delay elapses', async () => {
     const h = processFixture();
     const assertion = expect(h.promise).rejects.toThrow('timed out');

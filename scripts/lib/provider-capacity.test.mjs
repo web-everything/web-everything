@@ -52,28 +52,87 @@ test('fresh signed-out agy usage file marks both providers without adding usage 
   try {
     mkdirSync(join(dir, '.plateau'));
     const file = join(dir, '.plateau', 'agy-usage.json');
-    const settings = { staleHours: 6, providers: ['agy-gemini', 'agy-claude'].map(id => ({ id,
-      readers: [{ type: 'plateau-usage-file', file: 'agy-usage.json' }] })) };
+    const settings = PROVIDER_DEFAULTS;
     for (const at of [new Date(now).toISOString(), new Date(now - 6 * hour).toISOString(),
       new Date(now - 6 * hour - 1).toISOString(), new Date(now + 1).toISOString(), 'invalid', null]) {
       // Even contradictory usage fields cannot turn a signed-out observation into quota.
       writeFileSync(file, JSON.stringify({ at, status: 'signed-out',
         five_hour: { used_percentage: 20, resets_at: now + hour } }));
       const capacities = observeCapacity({ env: { HOME: dir, CONVEYOR_STATE_ROOT: dir, WE_CAPACITY_READERS: 'on' },
-        now, settings, records: [] });
+        now, settings, records: [], quota: () => null }).filter(c => c.provider.startsWith('agy-'));
       assert.equal(capacities.length, 2);
       for (const c of capacities) {
         assert.equal(c.signedOut === true, typeof at === 'string' && Date.parse(at) <= now && now - Date.parse(at) <= 6 * hour);
         assert.deepEqual(c.windows, []);
         assert.equal(c.known, false);
+        assert.equal(c.health, c.signedOut ? 0 : 1);
+        assert.equal(scoreProvider(c, 'fix', { now }).label, c.signedOut ? 'signed-out' : 'unknown');
       }
     }
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('real config reads Gemini percentages without attributing them to agy-claude', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'capacity-agy-signed-in-'));
+  try {
+    mkdirSync(join(dir, '.plateau'));
+    writeFileSync(join(dir, '.plateau', 'agy-usage.json'), JSON.stringify({ at: new Date(now).toISOString(),
+      five_hour: { used_percentage: 20, resets_at: now + hour },
+      seven_day: { used_percentage: 30, resets_at: now + 24 * hour } }));
+    const capacities = observeCapacity({ env: { HOME: dir, CONVEYOR_STATE_ROOT: dir, WE_CAPACITY_READERS: 'on' },
+      now, settings: PROVIDER_DEFAULTS, records: [], quota: () => null });
+    const gemini = capacities.find(c => c.provider === 'agy-gemini');
+    const claude = capacities.find(c => c.provider === 'agy-claude');
+    assert.equal(gemini.known, true);
+    assert.deepEqual(gemini.windows.map(w => w.usedPercent), [20, 30]);
+    assert.deepEqual(claude.windows, []);
+    assert.equal(claude.known, false);
+    assert.equal(claude.signedOut, undefined);
+    assert.equal(scoreProvider(claude, 'fix', { now }).label, 'unknown');
+    assert.deepEqual(PROVIDER_DEFAULTS.providers.find(p => p.id === 'agy-claude').readers, []);
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
 
 test('shared setup disables capacity host readers by default', () => {
   assert.equal(process.env.WE_CAPACITY_READERS, 'off');
   assert.ok(observeCapacity({ now }).every(c => !c.known && !c.held && c.currentRatePerHour === null));
+});
+
+test('status-only signed-out evidence suppresses independent quota, operator and calendar windows', () => {
+  const settings = { providers: [{ id: 'example', readers: [],
+    calendar: { weekly: 'Mon 09:00 UTC' },
+    operatorReading: { asOf: now, usedPercent: 10, resetsAt: now + hour } }] };
+  for (const raw of [null, { at: now, five_hour: { used_percentage: 20, resets_at: now + hour } }]) {
+    const [c] = readProviderCapacity({ now, settings, readers: { example: () => raw,
+      signedOut: id => { assert.equal(id, 'example'); return { at: now, status: 'signed-out' }; } } });
+    assert.equal(c.signedOut, true);
+    assert.equal(c.health, 0);
+    assert.equal(c.known, false);
+    assert.deepEqual(c.windows, []);
+  }
+});
+
+test('status-only reader ignores missing, malformed, oversized and disabled host evidence', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'capacity-agy-status-'));
+  try {
+    mkdirSync(join(dir, '.plateau'));
+    const file = join(dir, '.plateau', 'agy-usage.json');
+    const env = { HOME: dir, CONVEYOR_STATE_ROOT: dir, WE_CAPACITY_READERS: 'on' };
+    for (const contents of [null, '{invalid', JSON.stringify({ status: 'signed-out' }),
+      JSON.stringify({ at: new Date(now).toISOString(), status: 'signed-out', padding: 'x'.repeat(2 * 1024 * 1024) })]) {
+      if (contents !== null) writeFileSync(file, contents);
+      const c = observeCapacity({ env, now, settings: PROVIDER_DEFAULTS, records: [], quota: () => null })
+        .find(c => c.provider === 'agy-claude');
+      assert.equal(c.signedOut, undefined);
+      assert.equal(c.known, false);
+      assert.deepEqual(c.windows, []);
+    }
+    writeFileSync(file, JSON.stringify({ at: new Date(now).toISOString(), status: 'signed-out' }));
+    const c = observeCapacity({ env: { ...env, WE_CAPACITY_READERS: 'off' }, now,
+      settings: PROVIDER_DEFAULTS, records: [], quota: () => null }).find(c => c.provider === 'agy-claude');
+    assert.equal(c.signedOut, undefined);
+    assert.deepEqual(c.windows, []);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
 });
 
 test('capacity readers off ignores persisted usage and operator seeds but preserves injected readers', () => {

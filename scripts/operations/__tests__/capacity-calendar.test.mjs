@@ -18,6 +18,9 @@ it('renders signed-out agy usage file headlines for both providers', async () =>
     expect(report.providers).toHaveLength(2);
     for (const capacity of report.providers) {
       expect(capacity.signedOut).toBe(true);
+      expect(capacity.health).toBe(0);
+      expect(capacity.known).toBe(false);
+      expect(capacity.windows).toEqual([]);
       expect(capacity.scores.fix.label).toBe('signed-out');
     }
     const rendered = renderCalendar(report);

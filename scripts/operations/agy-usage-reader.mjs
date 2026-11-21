@@ -101,6 +101,12 @@ export function collectAgyUsage({ home = homedir(), timeoutMs = 45000, spawnFn =
       send('\x1b');
       later(() => {
         if (settled) return;
+        const current = stripVTControlCharacters(loginScreen.split(new RegExp(FRAME_BREAK, 'g')).at(-1));
+        const notSignedIn = /not signed in/i.test(current), selectLogin = /Select login method/i.test(current);
+        if (notSignedIn || selectLogin) {
+          if (notSignedIn && selectLogin) finish(null, { at: new Date(now()).toISOString(), status: 'signed-out' });
+          return;
+        }
         requested = true; screen = ''; send('/usage\r');
       }, stepMs);
     };

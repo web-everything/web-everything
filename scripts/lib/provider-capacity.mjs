@@ -51,8 +51,11 @@ export function readProviderCapacity({ env = {}, now = Date.now(), readers = {},
       const timestampMissing = raw?.at == null && raw?.asOf == null && raw?.mtime == null;
       const liveUsable = Number.isFinite(at) ? at <= now && now - at <= s.staleHours * HOUR
         : timestampMissing && Boolean(raw) && owner.readers?.some(r => r.type === 'codex-rollout');
-      const signedOut = raw?.status === 'signed-out' && Number.isFinite(epoch(raw.at))
-        && epoch(raw.at) <= now && now - epoch(raw.at) <= s.staleHours * HOUR;
+      let status;
+      try { status = readers.signedOut?.(account.id, env); } catch { /* unknown status */ }
+      const freshSignedOut = value => value?.status === 'signed-out' && Number.isFinite(epoch(value.at))
+        && epoch(value.at) <= now && now - epoch(value.at) <= s.staleHours * HOUR;
+      const signedOut = freshSignedOut(raw) || freshSignedOut(status);
       const add = (name, w, source = 'live') => {
         const usedPercent = w?.usedPercent ?? w?.used_percent ?? w?.used_percentage;
         const resetsAt = epoch(w?.resetsAt ?? w?.resets_at);
@@ -64,7 +67,7 @@ export function readProviderCapacity({ env = {}, now = Date.now(), readers = {},
             lengthHours: w.lengthHours ?? (w.window_minutes > 0 ? w.window_minutes / 60 : null) ?? configured?.lengthHours ?? lengths[name] ?? null });
         }
       };
-      if (liveUsable && raw?.status !== 'signed-out') {
+      if (!signedOut && liveUsable && raw?.status !== 'signed-out') {
         if (owner.readers?.some(r => r.type === 'codex-rollout')) {
           const name = (w, fallback) => w?.window_minutes > 0
             ? def.windows?.find(x => x.lengthHours * 60 === w.window_minutes)?.name
@@ -81,7 +84,7 @@ export function readProviderCapacity({ env = {}, now = Date.now(), readers = {},
       // An absent timestamp does not prove the live observation predates the operator seed.
       // Preserve independent live constraints even when this single-window seed is newer.
       if (!signedOut && seed && !operatorReadingStale && seedAt <= now && (!raw || (Number.isFinite(at) && at < seedAt))) add(def.windows?.[0]?.name ?? 'weekly', seed, 'operator');
-      if (!windows.length) for (const [name, rule] of Object.entries(def.calendar ?? s.calendar?.[owner.id] ?? {})) {
+      if (!signedOut && !windows.length) for (const [name, rule] of Object.entries(def.calendar ?? s.calendar?.[owner.id] ?? {})) {
         const resetsAt = calendarReset(rule, now);
         if (resetsAt) windows.push({ name, usedPercent: null, resetsAt, source: 'configured', lengthHours: lengths[name] ?? null });
       }
