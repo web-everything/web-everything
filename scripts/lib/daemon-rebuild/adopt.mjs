@@ -354,7 +354,7 @@ export async function finalizeRebuild(options) {
 }
 
 async function finalizeRebuildLocked({
-  root, env, log, run, stateOpts, now, plan, prevHead, lease, onAdopted, auditedTip = null,
+  root, env, log, run, stateOpts, now, plan, prevHead, lease, onAdopted, auditedTip = null, validateAdoption = () => null,
 }) {
   const stEnv = { ...env, ...(stateOpts?.env || {}) };
   const git = makeGit({ run, cwd: root, env });
@@ -402,6 +402,13 @@ async function finalizeRebuildLocked({
   if (dropsPending && !isRollback && appliedKey(plan.applied) !== appliedKey(state.adopted?.applied)) {
     alert('drop-pending-unsettled', { target: plan.finalSha });
     return terminal({ moved: false, reason: 'drop-pending-unsettled', plan });
+  }
+
+  // Ready-candidate eligibility must be re-read after acquiring the add guard.
+  const invalidAdoption = validateAdoption();
+  if (invalidAdoption) {
+    alert(invalidAdoption, { target: plan.finalSha });
+    return terminal({ moved: false, reason: invalidAdoption, plan });
   }
 
   // Defensive re-check: real (unlocked) time passed for the smoke since `prepareRebuild` read `prevHead`. Either

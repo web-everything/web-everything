@@ -29,7 +29,7 @@ import { fetchMainAndOverlays, recordedEdgeSha } from './edge-fetch.mjs';
 import { planRebuild } from './plan.mjs';
 import { readPendingDrops } from '../overlay-drop-pending.mjs';
 import { detectOverlayStale } from './overlay-prune.mjs';
-import { makeAuditedTipGate, tipInMain } from './audited-tip.mjs';
+import { makeAuditedTipGate, tipInMain, pathBEvidenceGit } from './audited-tip.mjs';
 import { carriedBeyondMain } from '../../operations/prototype-retire.mjs';
 import * as realAutoRebase from './auto-rebase.mjs';
 import { healWrongBranch } from './wrong-branch-heal.mjs';
@@ -76,8 +76,7 @@ export function prMergedDropEvidence({ git, ref, mainSha }) {
 /** An omitted overlay is safe only when merging it changes nothing in the candidate's own tree.
  * A conflict, unsupported merge-tree command, or unreadable build tree fails closed. */
 export function contentContainedInBuild(git, sha, build) {
-  // Custom merge drivers can discard overlay changes while reporting an unchanged tree: refuse (fail closed).
-  if (git(['config', '--get-regexp', '^merge\\..*\\.driver$'])?.status !== 1) return false;
+  git = pathBEvidenceGit(git);
   const m = git(['merge-tree', '--write-tree', '--no-messages', build, sha]);
   const t = String(m.stdout ?? '').split('\n')[0].trim();
   return m.status === 0 && !!t && t === verifyRev(git, `${build}^{tree}`);
@@ -675,11 +674,6 @@ export async function prepareRebuild({
           alert('untracked-collision', { paths: colliding });
           return terminal({ moved: false, reason: 'untracked-collision', untracked: colliding, plan });
         }
-        alert('ready-candidate-adopted', {
-          target: m.adopt.finalSha, match: m.match, passedAt: ready.passedAt, passedBy: `${ready.pid ?? '?'}@${ready.host ?? '?'}`,
-          ...(m.dropRefs.length ? { dropping: m.dropRefs.map((s) => s.ref) } : {}),
-          ...(m.retired?.length ? { retiredInMain: m.retired } : {}),
-        });
         writeState();
         const fin = await finalizeRebuild({
           root,
@@ -689,6 +683,16 @@ export async function prepareRebuild({
           stateOpts,
           now,
           plan: m.adopt,
+          // Retirement can change the registry while finalize waits for the add guard.
+          validateAdoption: () => {
+            const current = readOverlayState(root, { env });
+            if (current.corrupt) return 'overlay-state-corrupt';
+            const currentRefs = new Set(current.overlays.map((o) => o?.ref));
+            wantedTips.clear();
+            return (m.adopt.applied ?? []).every((a) =>
+              (!registeredRefs.has(a.ref) || currentRefs.has(a.ref)) && stillWanted(a.ref, a.sha))
+              ? null : 'overlay-no-longer-wanted';
+          },
           // A separate lazy gate reads evidence only after finalize holds the add guard.
           auditedTip: makeAuditedTipGate(env),
           prevHead,
@@ -700,6 +704,13 @@ export async function prepareRebuild({
             : undefined,
         });
         const { alerts: finAlerts = [], ...finResult } = fin;
+        if (finResult.adopted) {
+          alert('ready-candidate-adopted', {
+            target: m.adopt.finalSha, match: m.match, passedAt: ready.passedAt, passedBy: `${ready.pid ?? '?'}@${ready.host ?? '?'}`,
+            ...(m.dropRefs.length ? { dropping: m.dropRefs.map((s) => s.ref) } : {}),
+            ...(m.retired?.length ? { retiredInMain: m.retired } : {}),
+          });
+        }
         if (finResult.adopted && ready.kind !== 'fallback') {
           const pending = [...registeredRefs].filter((ref) => wantedRefs.has(ref)
             && !m.adopt.applied?.some((a) => a.ref === ref && a.sha === wantedTip(ref)));

@@ -33,7 +33,9 @@ describe('prepare registration and audit identity hardening', () => {
     rmSync(root, { recursive: true, force: true });
   });
 
-  it.each(['ready', 'skip-unrelated'])('%s adoption rechecks audit evidence after waiting for the add guard', async path => {
+  it.each([
+    ['ready', 'audit'], ['skip-unrelated', 'audit'], ['ready', 'registration'], ['ready', 'corrupt registration'],
+  ])('%s adoption rechecks %s after waiting for the add guard', async (path, changed) => {
     const liveHead = 'b'.repeat(40), mainSha = 'c'.repeat(40), candidate = 'd'.repeat(40);
     const readyPath = join(root, 'fix-ready.jsonl');
     env = { ...env, WE_DAEMON_STATE_DIR: join(root, 'state'), WE_DAEMON_AUTO_REBASE: '0',
@@ -87,14 +89,18 @@ describe('prepare registration and audit identity hardening', () => {
     try {
       await Promise.race([attemptedPromise, pending.then(() => { throw new Error('adoption did not wait for the add guard'); })]);
       if (path === 'ready') expect(matching.mock.results[0].value.adopt).toBeTruthy();
-      writeFileSync(readyPath, [green, { ...green, tests: 'red' }].map(JSON.stringify).join('\n'));
+      if (changed === 'audit') writeFileSync(readyPath, [green, { ...green, tests: 'red' }].map(JSON.stringify).join('\n'));
+      else if (changed === 'registration') removeOverlay(root, ref, { env, why: 'operator withdrawal during wait' });
+      else writeFileSync(overlayFilePath(root, env), '{');
     } finally {
       vi.mocked(overlayOperator.withAddGuardLock).mockRestore();
       release();
       await holder;
     }
     const done = await pending;
-    expect(done.result).toMatchObject({ moved: false, reason: 'ready-audit-revoked' });
+    expect(done.result).toMatchObject({ moved: false, reason: changed === 'audit' ? 'ready-audit-revoked'
+      : changed === 'registration' ? 'overlay-no-longer-wanted' : 'overlay-state-corrupt' });
+    expect(done.alerts.some((a) => a.kind === 'ready-candidate-adopted')).toBe(false);
     expect(run.mock.calls.some(([args]) => args[0] === 'reset')).toBe(false);
     expect(existsSync(`${overlayFilePath(root, env)}.add-guard.lock`)).toBe(false);
   });

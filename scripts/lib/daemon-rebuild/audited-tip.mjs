@@ -23,7 +23,7 @@ export function makeAuditedTipGate(env = process.env) {
         const path = env.WE_FIX_READY_PATH || tool.readyRecordPath;
         const expanded = path === '~' ? homedir() : path.replace(/^~\//, `${homedir()}/`);
         for (const line of readFileSync(expanded, 'utf8').split('\n')) {
-          try { snapshot.records.push(JSON.parse(line)); } catch { /* Bad JSONL lines supply no evidence. */ }
+          if (line.trim()) snapshot.records.push(JSON.parse(line));
         }
         // The operator allowlist is the same union prototype-load uses; a WEAKENED record is only ever evidence
         // when an entry binds its exact ref, sha, ruling and disclosed findings.
@@ -32,7 +32,10 @@ export function makeAuditedTipGate(env = process.env) {
           platform: platform.prefs.prototypeLoad?.ruledWeakened, tool: tool.ruledWeakened,
           fs, env: { HOME: homedir(), ...env },
         });
-      } catch { /* unaudited-tip: unreadable evidence never authorizes a moving tip. */ }
+      } catch {
+        // A truncated newer record may revoke any earlier green record. Discard the entire snapshot.
+        snapshot = { records: [], ruledWeakened: [] };
+      }
     }
     // The canonical admission judge decides (latest record for the exact ref+sha wins; a red or unruled-WEAKENED
     // record never authorizes). No fingerprint source is passed, so only a record naming this exact sha counts.

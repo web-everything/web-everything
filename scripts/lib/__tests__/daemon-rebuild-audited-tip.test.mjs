@@ -901,15 +901,23 @@ describe('unaudited-tip evidence and policy', () => {
     expect(resolve({ ...env, WE_DAEMON_OVERLAY_FOLLOW_TIP: 'follow' })).toBe('follow');
     expect(resolve({ ...env, WE_DAEMON_OVERLAY_FOLLOW_TIP: 'invalid' })).toBe('audited-only');
   });
-  it('parses JSONL past bad lines, matches exact ref and case-insensitive sha/audit', () => {
+  it('matches exact ref and case-insensitive sha/audit with blank and non-record JSON lines', () => {
     const f = evidence();
-    writeFileSync(f.path, 'bad JSON\nnull\n{}\n' + JSON.stringify(record('ABC', { audit: 'not weakened' })));
+    writeFileSync(f.path, '\nnull\n{}\n' + JSON.stringify(record('ABC', { audit: 'not weakened' })));
     const gate = makeAuditedTipGate(f.env);
     expect(gate(ref, 'abc')).toBe(true);
     expect(gate('LANE/moving', 'abc')).toBe(false);
     expect(gate(ref, 'abd')).toBe(false);
     expect(gate(ref, undefined)).toBe(false);
   });
+  it.each(['{"audit":"WEAKENED"', '{"tests":"red"', 'bad JSON'])(
+    'fails closed when older green evidence is followed by unreadable JSONL: %s', (line) => {
+      const f = evidence();
+      writeFileSync(f.path, JSON.stringify(record('abc')) + '\n' + line);
+      const gate = makeAuditedTipGate(f.env);
+      expect(gate(ref, 'abc')).toBe(false);
+      expect(gate('lane/other', 'abc')).toBe(false);
+    });
   it.each([
     { tests: 'red' }, { tests: null }, { audit: null }, { audit: 'NOT WEAKENED extra' },
     { audit: 'WEAKENED' }, { audit: 'WEAKENED', auditRuling: '' },
