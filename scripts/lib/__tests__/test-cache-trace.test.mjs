@@ -226,3 +226,28 @@ describe('analyzeTrace — toolchain', () => {
     expect(out.denies).toEqual(['home-read: .npmrc']);
   });
 });
+
+describe('analyzeTrace — bun cache home read', () => {
+  const base = { root: '/r/lane', tmpRoots: ['/t'], home: '/h', closure: new Set(), execPath: '/custom/node-runtime' };
+  const denies = (p, k = 'read') => analyzeTrace({ ...base, events: [{ k, p }] }).denies;
+
+  it('a read of ~/.bun is not a deny', () => {
+    expect(denies('/h/.bun', 'stat')).toEqual([]);
+    expect(denies('/h/.bun/install/cache/pkg@1.0.0/index.js')).toEqual([]);
+  });
+
+  it.each(['/h/.bun/bin/bun', '/h/.bun/install/global/x', '/h/.bun/install/cache-evil/x', '/h/.bun/secrets', '/h/.bunx/x'])(
+    'allows only the exact bun cache dir: %s stays a deny', (p) => {
+      expect(denies(p)).toHaveLength(1);
+    });
+
+  it.each(['/h/.ssh/id_rsa', '/h/.aws/credentials', '/h/.config/gh/hosts.yml', '/h/.secrets', '/h/.claude/settings.json',
+    '/h/Library/Keychains/login.keychain-db', '/h/.cargo/credentials.toml', '/h/.rustup/x', '/h/Library/Caches/x'])(
+    'credential or non-allowed home path %s is still a home-read deny', (p) => {
+      expect(denies(p)).toEqual([expect.stringMatching(/^home-read: /)]);
+    });
+
+  it('does not let a ~/.bun symlink-style path escape: dot segments are not normalised into the allow', () => {
+    expect(denies('/h/.bun/install/cache/../../../.ssh/id_rsa')).toHaveLength(1);
+  });
+});

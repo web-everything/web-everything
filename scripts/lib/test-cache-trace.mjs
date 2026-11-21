@@ -133,6 +133,10 @@ export function analyzeTrace({ events, root, fuiRoot = null, tmpRoots, home = ''
   const touch = (p, kind) => {
     if (!p || !p.startsWith('/') || p.includes(`${sep}node_modules${sep}`) || isTmp(p) || (cacheDir && under(p, cacheDir)) || toolchain.some((t) => under(p, t)) || p.startsWith('/dev/')) return;
     if (isRepo(p)) { addTraced(p, kind); return; }
+    // Read-only bun package cache: the bare ~/.bun directory itself (existence probe) and the exact install cache
+    // subtree. Everything else under ~/.bun and every other home path (credentials, keychains, other toolchain
+    // homes) stays a deny. Dot segments are normalised first so `cache/../..` cannot escape the allow.
+    if (homes.some((h) => { const n = resolve(p); return n === join(h, '.bun') || under(n, join(h, '.bun', 'install', 'cache')); })) return;
     if (homes.some((h) => under(p, h))) denies.add(`home-read: ${p.slice(home.length + 1).split('/').slice(0, 2).join('/') || '~'}`);
   };
 
