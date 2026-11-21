@@ -9,6 +9,7 @@ preparedDate: "2026-11-17"
 preparedAgainstSha: "157f3184592f9b20aa4356a18cfd34df7f86a099"
 relatedReport: reports/2026-11-17-delivery-standard-governance.md
 tags: []
+relatedTo: ["5403", "x25bedj", "x7ubblz"]
 ---
 
 # Governance of the delivery standard: own org now, vendor-neutral core, later foundation move
@@ -59,3 +60,32 @@ One line per class: either the handling, or `n/a: <why>`.
 5. **Identity scoping** — n/a: a decision card; it changes no code. Any build it spawns carries its own edge cases.
 6. **State over time** — n/a: a decision card; it changes no code. Any build it spawns carries its own edge cases.
 7. **Who wrote it** — n/a: a decision card; it changes no code. Any build it spawns carries its own edge cases.
+
+## Update 2026-11-20 (D12, decisions page)
+
+Operator ask (2026-11-20 20:59 ET): “note all as full decision item and run with preparation”.
+Decision id: D12 (decisions page, 2026-11-20 20:58 ET)
+Placement: everstandards
+move-to: everstandards
+
+### Digest / context
+
+**Operator as steward now (default), with DCO contributions and a written foundation-transfer trigger. No shared meta repo until a second standard actually needs one.** Source: [handoff format design](designs/everstandards-format-2026-11-20.md) “Template detail” / “Operator decisions”, and [repo-separation brief](designs/repo-separation-brief-2026-11-20.md) §1.6. Reuse the existing governance research above.
+
+### Fork 1 — Stewardship update
+
+Fork-existence: final custody of decisions and marks cannot simultaneously belong to the operator and an independent foundation; advisory participation can coexist with either.
+
+- (a) **Operator as steward, neutral core, DCO and written foundation trigger (default).** Continue the prepared option above; keep transfer possible.
+- (b) Foundation stewardship now. Stronger independent custody, with governance/process obligations before multiple implementers exist.
+
+Skeptic: A written future trigger cannot guarantee relinquishing control. Reuse the existing no-relicense/transferability safeguards and name the authority and transfer procedure, rather than promise neutrality from the org name.
+Screen: pending delta prep; custody remains a merit difference even with cost stripped out.
+
+### Supported by default — optional meta repo
+
+A template/vector schema and per-standard repos are compatible. **No meta repo until a second standard actually needs it (default)**; creating one then is supported. Creating it now adds a shared release/maintenance surface without a demonstrated consumer; this is sequencing rather than a competing standards architecture. D17’s common tool is a separate ownership decision and does not imply a meta repo.
+
+Skeptic: Waiting could duplicate templates and cause drift. Track the shared source/version explicitly now and trigger extraction when the second actual standard needs it.
+What ratifying unlocks: one accountable steward and contribution/transfer terms, without creating an unneeded repo. Operator answers: “D12 yes” accepts stewardship plus the meta-repo trigger.
+Prep still needed: verify current governance/contribution terms and transfer trigger, inspect second-standard demand and independently attack both defaults. Prepared metadata remains unchanged; these new deltas still need prep.

@@ -6,6 +6,7 @@ parent: "5407"
 status: open
 dateOpened: "2026-10-08"
 tags: []
+relatedTo: ["5409", "x25bedj"]
 ---
 
 # Define the development-platform protocol family and whether it shares the delivery protocol home
@@ -27,3 +28,23 @@ One line per class: either the handling, or `n/a: <why>`.
 5. **Identity scoping** — n/a: a decision card; it changes no code. Any build it spawns carries its own edge cases.
 6. **State over time** — n/a: a decision card; it changes no code. Any build it spawns carries its own edge cases.
 7. **Who wrote it** — n/a: a decision card; it changes no code. Any build it spawns carries its own edge cases.
+
+## Update 2026-11-20 (D15, decisions page)
+
+Operator ask (2026-11-20 20:59 ET): “note all as full decision item and run with preparation”.
+Decision id: D15 (decisions page, 2026-11-20 20:58 ET)
+Placement: everstandards
+move-to: everstandards
+
+### Digest / supported by default
+
+**Platform Forever is a standard family later; for now, a preference file inside Longshore until a second team needs it (default).** This is compatible staged support, not “standard versus config” as mutually exclusive permanent architectures. It is not the Plateau product. Placement stays everstandards for this family decision; no private Plateau preference content is included here.
+
+Context: [repo-separation brief](designs/repo-separation-brief-2026-11-20.md) §1.6 / §4.2 and [format design](designs/everstandards-format-2026-11-20.md) “Platform Forever candidates” / “Template detail”. Candidate protocols include workspace-manifest, workspace-lease, dev-server-discovery, gate-contract, platform-graph and dev-tooling-attach. The page names workspace setup and tooling attachment as team/platform preference examples.
+
+Supported options: (a) **Longshore preference file now, standard family on the second-team trigger (default)**; (b) publish the family immediately, requiring protocol/prior-art work now; (c) permanently keep only a private config, losing the intended cross-team standard contract. The default supports local preferences and a later interoperable family together; it does not freeze the candidate list as v0.
+
+Skeptic: “Second team” might become indefinite deferral or hard-code one team’s choices into a future standard. Preserve a clear preference boundary now, gather evidence of a second independent team’s need and survey Dev Containers, WebDriver BiDi and Backstage before fixing the public surface.
+Screen: pending prep; separate the family’s merits from extraction timing and local implementation shape.
+What ratifying unlocks: a bounded Longshore preference layer now and a concrete trigger for the later standard, without creating a Platform Forever repo today. Operator answers: “D15 yes”.
+Prep still needed: verify the second-team trigger, map existing preference files and candidate protocols to primary prior art, and run an independent skeptic pass. Existing frontmatter/prepared state stays untouched except additive relatedTo links.

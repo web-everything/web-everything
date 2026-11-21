@@ -5,6 +5,7 @@ parent: "2445"
 status: open
 dateOpened: "2026-10-08"
 tags: []
+relatedTo: ["5785", "xctsi6q", "x8fzhda", "x7ubblz", "xx623wo"]
 ---
 
 # Constellation split: standards, Longshore core, Plateau
@@ -75,3 +76,48 @@ Related, not re-filed: #5407 (Delivery standard: the protocol content Longshore 
 
 - [N1] Choosing the org move date (#5504 stays held for the operator).
 - [N2] Ruling #5405 names or #5409 governance.
+
+## Update 2026-11-20 (D1, decisions page)
+
+Operator ask (2026-11-20 20:59 ET): “note all as full decision item and run with preparation”.
+Decision id: D1 (decisions page, 2026-11-20 20:58 ET)
+Placement: plateau-app
+move-to: plateau-app
+
+### Digest / context
+
+Proposed amendment, not a recorded ruling: build the new end-state kernel directly in Longshore, then migrate roles one at a time. This replaces the earlier “incubate as packages inside WE, then extract” sequence above if ratified; S1–S7 remain historical lineage. Source: [handoff end-state design](designs/longshore-end-state-2026-11-20.md) §1, §3–5. About 60 PRs/day and the legacy-shape risks are source observations, not measurements repeated here.
+
+### Fork 1 — Transition architecture
+
+Fork-existence: the canonical new core cannot both originate in Longshore with legacy only behind adapters and freeze the legacy WE shapes as its canonical package interfaces. Role migration can be incremental under either, so the distinction is the architecture at the boundary.
+
+- (a) Clean rewrite: clean target, but freezes delivery while chasing a moving system.
+- (b) Plain progression / WE incubation: smaller moves, but carries label authority, append-order ledgers and startup-only caps.
+- (c) **Hybrid (default): end-state kernel in Longshore, legacy roles in WE until tap → shadow diff → flip → delete.** Preserve ongoing C1–C3 work; port useful pure modules instead of rewriting them.
+
+Skeptic: A parallel kernel can diverge indefinitely. Require replay fixtures, declared intended differences, zero unexplained shadow action diffs and per-role rollback; adapters are deleted after each successful flip.
+Screen: pending a fresh preparation pass on this architectural amendment; it is not a standards-format ruling.
+
+What ratifying unlocks: an amended extraction sequence, ci-heal first and drain last, keeping the target quality bar and existing delivery active. Operator answers: “D1 yes” accepts (c), without authorizing a public flip.
+Prep still needed: compare strangler/rewrite precedents, reconcile #5492/#5497 dependencies and run an independent skeptic/screen. This update preserves existing card status; no new prepared stamp is claimed.
+
+## Update 2026-11-20 (D2, decisions page)
+
+Operator ask (2026-11-20 20:59 ET): “note all as full decision item and run with preparation”.
+Decision id: D2 (decisions page, 2026-11-20 20:58 ET)
+Placement: plateau-app
+move-to: plateau-app
+
+### Digest / supported by default
+
+The page records a 20:56 yes to moving code measured by the conformity tool; the move plan/order remains outstanding. **Tool first → pure modules → daemons (default).** This is sequencing, not a rival architecture. The agent must bring the first five PRs and their CI effect; no plan is represented as completed here.
+
+Context: [handoff end-state design](designs/longshore-end-state-2026-11-20.md) §2–4 lists port candidates (decide, foldProjection, policy-cascade, run-store/feed, simulator) and proposes seed/contracts, WE decision tap, seq ordering, pure-core port and shadow ci-heal as its first five steps. These are source proposals; reconcile them with the page’s tool-first order rather than claim they are the final five PRs.
+
+Supported by default: tool → modules → role executors; tool ownership/interface is D17. Alternatives (module-first, daemon-first) are possible sequencing settings but do not waive conformity and equivalence. The default retains kernel no-IO, replay, crash/unknown-input and latency/cost checks; no bulk copy of WE scripts.
+
+Skeptic: Tool-first can become an infrastructure detour. Scope it to executable end-state checks exercised by the first port, then show the first five bounded PRs and measured CI effects.
+Screen: pending prep; sequence is priority/dependency work, not a standards merit fork.
+What ratifying unlocks: a concrete tool-first move plan aligned with D1. Operator answers: “D2 yes” confirms this order; the already recorded move approval is not re-requested.
+Prep still needed: survey existing conformity tools, inventory exact pure-module dependencies, reconcile the five-step sketch and run an independent skeptic pass. No runtime moves occur in this cards-only task.
