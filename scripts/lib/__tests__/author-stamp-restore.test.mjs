@@ -182,7 +182,7 @@ describe('plain snapshot provenance — oldest author snapshot and agreeing ids'
       };
     };
     const baseline = plan(fixture('invariants.json'));
-    expect(baseline).toMatchObject({ action: 'restore', id: ID });
+    expect(baseline).toMatchObject({ action: 'restore', id: '00000000-0000-4000-8000-000000000000' });
     const result = plan(fixture('<path>'));
     expect(result).toEqual(JSON.parse(JSON.stringify(baseline).replaceAll('invariants.json', '<path>')));
   });
@@ -1124,7 +1124,7 @@ describe('planStampRestore — ambiguous backticks and fences (#7231)', () => {
   it.each([
     ['tab-indented closing fence', `${machine}\n\`\`\`\nexample\n\t\`\`\`\n${m()}\n\`\`\``],
     ['backtick info string then longer fence', `${machine}\n\`\`\` a\`b\n\`\`\`\`\n${m()}\n\`\`\`\``],
-    ['NBSP/form-feed closing suffix', `${machine}\n\`\`\`\nexample\n\`\`\` \f\n${m()}\n\`\`\``],
+    ['NBSP/form-feed closing suffix', `${machine}\n\`\`\`\nexample\n\`\`\`\u00a0\f\n${m()}\n\`\`\``],
     ['tilde fence', `~~~\n${m()}\n~~~`],
     ['unmatched backtick', `use \`x\n${m()}`],
   ])('refuses %s', (_n, diff) => {
