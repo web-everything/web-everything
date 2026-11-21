@@ -5,6 +5,7 @@ import * as drain from '../merge-ai-prs.mjs';
 import * as procedure from '../conveyor/fix-procedure.mjs';
 import { acquireFixDispatchClaim, releaseFixDispatchClaim } from '../conveyor/fix-dispatch-claim.mjs';
 import { classifySkipReason } from '../lib/drain-skip-reasons.mjs';
+import { readSettings } from '../lib/settings-files.mjs';
 import { runInProcess } from './fixtures/merge-ai-prs-cli-harness.mjs';
 import { prestagePorts } from './fixtures/merge-ai-prs-fake-ports.mjs';
 import { createPrestageWorld } from './fixtures/merge-ai-prs-prestage-world.mjs';
@@ -193,6 +194,10 @@ describe('T7: honourDispatchClaims setting and provenance', () => {
     const shipped = JSON.parse(readFileSync(join(process.cwd(), 'scripts/settings/drain-dispatch-claims.json'), 'utf8'));
     expect(shipped.drain.honourDispatchClaims).toBe('shadow');
     expect(drain.resolveHonourDispatchClaims({}, { tool: shipped.drain })).toEqual({ value: 'shadow', source: 'tool' });
+  });
+  it('resolves shipped shadow from the real merged settings drain block used by main', () => {
+    expect(drain.resolveHonourDispatchClaims({}, { tool: readSettings()?.drain }))
+      .toEqual({ value: 'shadow', source: 'tool' });
   });
   it('resolves platform then tool then environment', () => {
     const platform = { honourDispatchClaims: 'shadow' }, tool = { honourDispatchClaims: 'on' };
