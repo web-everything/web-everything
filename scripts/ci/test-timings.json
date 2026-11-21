@@ -1864,6 +1864,7 @@
   "scripts/readiness/__tests__/forge-slot-markers-idle-failure.test.mjs": 0.03,
   "scripts/readiness/__tests__/forge-slot-markers-per-run.test.mjs": 0.33,
   "scripts/readiness/__tests__/forge-slot-markers.test.mjs": 0.97,
+  "scripts/readiness/__tests__/forge-slots-operator-layer.test.mjs": 0.5,
   "scripts/readiness/__tests__/forge-slots.test.mjs": 4.58,
   "scripts/readiness/__tests__/forge-telemetry.test.mjs": 0.14,
   "scripts/readiness/__tests__/forge-test-selection.test.mjs": 3.67,

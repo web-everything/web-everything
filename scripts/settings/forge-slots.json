@@ -1,7 +1,7 @@
 {
-  "$comment": "Forge execution pool size per short hostname. FORGE_EXEC_SLOTS overrides these settings (integer 1..128); FORGE_HOST overrides hostname discovery. forge-b: 8 is a TBD placeholder pending host sizing. Lower settings never retire installed slots; inspect reservations before any manual retirement. Ship this file beside forge-setup.sh for a flat deployment.",
+  "$comment": "Forge execution pool size. Per-host sizes are operator-private and live in the operator layer (forgeSlots.hosts in the operator platform-preferences file, read through policy-cascade); a flat Forge deployment may instead place its own forge-slots.json beside forge-slots.mjs. FORGE_EXEC_SLOTS overrides these settings (integer 1..128); FORGE_HOST overrides hostname discovery. Lower settings never retire installed slots; inspect reservations before any manual retirement.",
   "forgeSlots": {
     "default": 8,
-    "hosts": { "forge": 14, "forge-b": 8 }
+    "hosts": {}
   }
 }
