@@ -79,10 +79,25 @@ export const RED_TEAM_WRITER_ROLE = LEGACY_ROLE;
 // fallback or by a bare gh: it is dropped, so only the shim's today's-App token can authenticate the write.
 const INHERITED_AUTH = ['GH_TOKEN', 'GITHUB_TOKEN', 'WE_GH_AUTH_TOKEN_HASH', 'WE_GH_AUTH_SOURCE', 'WE_GH_AUTH_INSTALLATION'];
 export const redTeamWriterEnv = (env = process.env) => {
-  const out = { ...env, [ROLE_ENV]: RED_TEAM_WRITER_ROLE };
+  // Daemon-class + refuse: the shim never falls back to personal auth for this write. A personal login can post a
+  // status but cannot create a check run, so every operator-shell run left an orphan publication hold.
+  const out = { ...env, [ROLE_ENV]: RED_TEAM_WRITER_ROLE, WE_GH_DAEMON_CALLER: env.WE_GH_DAEMON_CALLER || 'red-team-writer',
+    WE_GH_AUTH_PERSONAL_FALLBACK: 'refuse' };
   for (const key of INHERITED_AUTH) delete out[key];
   return out;
 };
+
+/** Fail closed BEFORE any hold or status is posted when the WE App token does not resolve. The probe is
+ * `GET /installation/repositories`, which only an App INSTALLATION token can read (a personal login gets 403/404), so
+ * success proves App authentication without relying on the shim's refusal variables. It runs through the caller's own
+ * `gh` (production wrappers included) under the writer env. `options.appWriterProbe` overrides. */
+export const appWriterProbeFor = ({ gh = runGhSync, env = process.env } = {}) => () =>
+  gh(['api', 'installation/repositories?per_page=1', '--jq', '.total_count'], { ...ioOptions, env: redTeamWriterEnv(env) });
+export function requireRedTeamAppWriter({ gh = runGhSync, env = process.env, appWriterProbe } = {}) {
+  const probe = appWriterProbe ?? appWriterProbeFor({ gh, env });
+  try { probe(); return { ok: true }; }
+  catch (error) { return failure(`red-team writer refused: WE App token unavailable, no personal fallback (${message(error)}); no hold posted`); }
+}
 
 /**
  * The WE App id readers trust and the writer authors as (#6535; operator ruling R907 → setting R905). It is a SETTING,
@@ -117,7 +132,7 @@ export function createPolicyClearPublisher({ env = process.env, run = runGhSync,
   return args => {
     const app = resolveAppId();
     if (app.ok !== true) return { ...failure(app.reason), ...(app.detail ? { detail: app.detail } : {}) };
-    return publish({ ...args, appId: app.appId, env, gh });
+    return publish({ ...args, appId: app.appId, env, gh, appWriterProbe: appWriterProbeFor({ gh, env }) });
   };
 }
 
@@ -136,7 +151,7 @@ export function createLiveCheckPublisher({ env = process.env, run = runGhSync, p
     publish: args => {
       const app = resolveAppId();
       if (app.ok !== true) return { ...failure(app.reason), ...(app.detail ? { detail: app.detail } : {}) };
-      return publish({ ...args, appId: app.appId, env, gh });
+      return publish({ ...args, appId: app.appId, env, gh, appWriterProbe: appWriterProbeFor({ gh, env }) });
     },
     clearHold: args => clearHold({ ...args, env, gh }),
   };
@@ -260,7 +275,10 @@ export function publishRedTeamPolicyClearCheck(options = {}) {
 
 function publishRedTeamPolicyClearCheckUnlocked({ repo, pr, headSha, appId, gh = runGhSync, env = process.env,
   clearHold = clearLivePublicationHold, resultComments, readResultHold = redTeamEnqueueHold,
-  readComments = ({ repo, pr, exec }) => readCompletePrComments(Number(pr), { repo, exec }) } = {}) {
+  readComments = ({ repo, pr, exec }) => readCompletePrComments(Number(pr), { repo, exec }), appWriterProbe } = {}) {
+  // The production factories always pass the probe (through their own gh wrapper); a bare unit call passes none.
+  const writer = appWriterProbe ? requireRedTeamAppWriter({ gh, env, appWriterProbe }) : { ok: true };
+  if (writer.ok !== true) return writer;
   const recovery = resultComments !== undefined;
   // The memo reads throttle.env, not the child env. Bypass both for live recovery evidence. A caller's own child env
   // (a writer's redTeamWriterEnv) is kept, so a write through this gh still runs as the WE App.
@@ -406,7 +424,10 @@ export function publishRedTeamCheckFromLive(options = {}) {
 
 function publishRedTeamCheckFromLiveUnlocked({ repo, pr, headSha, appId, gh = runGhSync,
   env = process.env, readLive, readComments, readStandingRuling = standingRulingScope,
-  holdFn = redTeamEnqueueHold, beforeHold, onConfirmed, clearHold = clearLivePublicationHold } = {}) {
+  holdFn = redTeamEnqueueHold, beforeHold, onConfirmed, clearHold = clearLivePublicationHold, appWriterProbe } = {}) {
+  // The production factories always pass the probe (through their own gh wrapper); a bare unit call passes none.
+  const writer = appWriterProbe ? requireRedTeamAppWriter({ gh, env, appWriterProbe }) : { ok: true };
+  if (writer.ok !== true) return writer;
   let published = false, holdSet = false, holdPosted = false, holdIntent = '';
   try {
     if (!validApp(appId) || !validHead(headSha) || !prIdentity(repo, pr))
@@ -586,7 +607,7 @@ export function postRedTeamPublicationHold({ repo, pr, headSha, held, reason = '
  * wins, ordered by id. Absent = no hold. An unreadable read, or a full page with no decision, holds.
  * `combined` is the per-context latest summary; `statuses` the full newest-first list, read only when the context
  * exists. */
-export function evaluateRedTeamPublicationHold({ pr, combined, statuses, historyComplete, isTrusted = isTrustedMarkerAuthor } = {}) {
+export function evaluateRedTeamPublicationHold({ pr, combined, statuses, historyComplete, isTrusted = isTrustedMarkerAuthor, strictSummary = false } = {}) {
   const context = redTeamPublicationContext(pr);
   if (!context) return failure('red-team publication hold PR number missing or invalid');
   const latest = combined?.statuses;
@@ -599,6 +620,11 @@ export function evaluateRedTeamPublicationHold({ pr, combined, statuses, history
     return failure('red-team publication hold history unreadable; operator must inspect commit statuses');
   const complete = paged ? historyComplete : statuses.length < 100;
   const ordered = statuses.filter(status => status.context === context).sort((a, b) => b.id - a.id);
+  // The per-context summary is the newest status: a non-success there (a newer hold) always beats an older success in the list.
+  // Opt-in (`strictSummary`, the label settle): the merge gate's own evaluator keeps trusting the id-ordered history.
+  const summarized = latest.find(status => status?.context === context);
+  if (strictSummary && summarized?.state !== 'success')
+    return failure(`red-team round not confirmed published (GitHub-visible hold, ${message(summarized?.state)}); retry check publication before enqueue`);
   // The summary says this PR's context exists, so the history must show it; an empty or contradictory history
   // (e.g. a failure in the summary but none in the list) is unreadable evidence, never a clear.
   for (const status of ordered) {
@@ -718,7 +744,7 @@ export function clearLivePublicationHold({ repo, pr, headSha, gh = runGhSync, en
   return posted.ok ? { ok: true, cleared: true } : posted;
 }
 
-export function readRedTeamPublicationHoldFact({ repo, pr, headSha, gh = runGhSync, isTrusted } = {}) {
+export function readRedTeamPublicationHoldFact({ repo, pr, headSha, gh = runGhSync, isTrusted, strictSummary = false } = {}) {
   const context = redTeamPublicationContext(pr);
   if (!validHead(headSha) || !/^[\w.-]+\/[\w.-]+$/.test(repo ?? '') || !context)
     return failure('invalid red-team publication hold identity (repo, PR number and head required)');
@@ -730,7 +756,7 @@ export function readRedTeamPublicationHoldFact({ repo, pr, headSha, gh = runGhSy
     const history = present ? readStatusHistory({ repo, headSha, gh, context,
       decisive: status => status.state !== 'success' || trusted({ user: { login: String(status.creator?.login ?? '') } }) }) : undefined;
     return evaluateRedTeamPublicationHold({ pr, combined, statuses: history?.statuses, historyComplete: history?.complete,
-      ...(isTrusted ? { isTrusted } : {}) });
+      strictSummary, ...(isTrusted ? { isTrusted } : {}) });
   } catch (error) { return failure(`red-team publication hold unreadable: ${message(error)}`); }
 }
 

@@ -76,7 +76,8 @@ import {
 import { readLiveFixClaim, withAltBranchHint } from '../conveyor/fix-procedure.mjs';
 import { briefWithContextPack } from '../conveyor/fix-context-pack.mjs'; // ci-heal context pack: failing checks + log staged in the brief
 import { codeqlBriefSection } from '../lib/codeql-gate.mjs';
-import { createCiHealReserve } from '../lib/ci-heal-reserve.mjs';
+import { createCiHealReserve, resolveCiHealReserve } from '../lib/ci-heal-reserve.mjs';
+import { resolveCapacityLeaf } from '../lib/capacity-leaf.mjs';
 import { listFixDispatchClaims } from '../conveyor/fix-claim-store.mjs';
 import { flushOwedWrites } from '../conveyor/ci-heal-owed.mjs';
 import { describeDispatchFailure } from '../lib/describe-spawn-failure.mjs';
@@ -439,7 +440,7 @@ export async function runReconcileCiHealDispatch({
   queueAdmission = null,
   dispatchThrottle = null, // fix-cap / host-load defer-only gate (dispatch-throttle.mjs); null = no gate
   // A PR's own red CI is owed a ci-heal owner: when the shared cap is full of review fixes, one reserved slot past it.
-  ciHealReserve = dispatchThrottle ? createCiHealReserve({ listClaims: () => listFixDispatchClaims(undefined, { liveOnly: true }) }) : null,
+  ciHealReserve = dispatchThrottle ? createCiHealReserve({ listClaims: () => listFixDispatchClaims(undefined, { liveOnly: true }), resolveReserve: () => resolveCapacityLeaf('ciHeal.reserve', { lower: resolveCiHealReserve() }).value }) : null,
   flushOwed = (key) => flushOwedWrites({ repo: key }),
   pollAttempts = pollHealAttempts,
   retryTimeout = dispatchTimeoutRetry,
@@ -549,6 +550,7 @@ export async function runReconcileCiHealDispatch({
   console.error(`ci-heal-pr-dispatch: timing pre-loop ms=${clock() - startedAt}`);
   // Phase A: finish admission and assign lanes before any expensive launch.
   // Polling and flushes may have spent the phase budget already; admission gets its own bounded slice.
+  const logRefusal = (pr, r) => console.error(`ci-heal-pr-dispatch: refused ${r.kind ?? 'unknown'} PR #${pr}: ${r.why ?? r.reason ?? 'no reason recorded'}`);
   const effectiveGateSliceMs = gateSliceMs ?? 120_000;
   const gateDeadlineAt = clock() + effectiveGateSliceMs;
   console.error(`ci-heal-pr-dispatch: gate slice ms=${effectiveGateSliceMs} source=${gateSliceMs == null ? 'default' : 'option'}`);
@@ -696,7 +698,13 @@ export async function runReconcileCiHealDispatch({
     } finally {
       const gateMs = clock() - entryNow;
       if (launch) launch.gateMs = gateMs;
-      else console.error(`ci-heal-pr-dispatch: timing PR #${entry.prNumber} gate-ms=${gateMs} dispatch-ms=0`);
+      else {
+        // Every gate refusal is logged with its kind and reason; no launch without a recorded reason is logged as unknown.
+        // A salvage that pushed recorded a dispatch, not a refusal.
+        const rows = refusals.length ? refusals : dispatched.length ? [] : [{ kind: 'unknown', why: 'no launch and no refusal recorded' }];
+        for (const r of rows) logRefusal(entry.prNumber, r);
+        console.error(`ci-heal-pr-dispatch: timing PR #${entry.prNumber} gate-ms=${gateMs} dispatch-ms=0`);
+      }
     }
   }
 
@@ -709,12 +717,14 @@ export async function runReconcileCiHealDispatch({
       // Admission ran up front, so a stop requested meanwhile (kill file, adoption yield) is honoured before each launch.
       if (fixLoop.killed()) {
         outcome.refusals.push({ pr: entry.prNumber, kind: 'fix-dispatch-killed', why: `kill file ${fixDispatchKillFile()} present` });
+        logRefusal(entry.prNumber, outcome.refusals.at(-1));
         return;
       }
       // The first launch is exempt from adoption yield; host capacity guards still apply.
       if (launchStarted && (yieldedForAdoption ||= safeAdoptYield(shouldYield))) {
         deferred.push(entry.prNumber);
         outcome.refusals.push({ pr: entry.prNumber, kind: 'adoption-yield', why: 'daemon adoption requested a yield before this launch' });
+        logRefusal(entry.prNumber, outcome.refusals.at(-1));
         return;
       }
       launchStarted = true;
@@ -743,6 +753,7 @@ export async function runReconcileCiHealDispatch({
       } finally { dispatchMs = clock() - dispatchStartedAt; }
       if (result?.held) {
         outcome.refusals.push({ pr: entry.prNumber, kind: 'held', why: result.reason ?? `a CI-heal for PR #${entry.prNumber} is already in flight` });
+        logRefusal(entry.prNumber, outcome.refusals.at(-1));
         const next = waitingForLane.shift();
         if (next) {
           next.planned.lane = planned.lane;
@@ -757,6 +768,7 @@ export async function runReconcileCiHealDispatch({
       } catch { /* Dispatch succeeded; ledger writes are best effort. */ }
     } catch (e) {
       outcome.refusals.push({ pr: entry.prNumber, kind: 'dispatch-failed', why: describeDispatchFailure(e) });
+      logRefusal(entry.prNumber, outcome.refusals.at(-1));
     } finally {
       console.error(`ci-heal-pr-dispatch: timing PR #${entry.prNumber} gate-ms=${gateMs} dispatch-ms=${dispatchMs}`);
     }
@@ -765,6 +777,7 @@ export async function runReconcileCiHealDispatch({
   for (let i = 0; i < launches.length; i += LAUNCH_WAVE) await Promise.all(launches.slice(i, i + LAUNCH_WAVE).map(runLaunch));
   for (const { entry, outcome, gateMs } of waitingForLane) {
     outcome.refusals.push({ pr: entry.prNumber, kind: 'no-lane', why: `no free lane to dispatch a CI-heal agent for PR #${entry.prNumber}` });
+    logRefusal(entry.prNumber, outcome.refusals.at(-1));
     console.error(`ci-heal-pr-dispatch: timing PR #${entry.prNumber} gate-ms=${gateMs} dispatch-ms=0`);
   }
   const dispatched = outcomes.flatMap(row => row.dispatched);

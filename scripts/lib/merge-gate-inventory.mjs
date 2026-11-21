@@ -51,7 +51,7 @@ export const DRAIN_GATES = Object.freeze([
   { id: 'test-gaming', where: 'merge-gate', input: 'git', signals: ['scanTestTampering', 'shouldReparkForTestTampering', 'decideTestGamingPark', 'decideMechanicalPark'], skipKinds: ['escalated', 'parked'] },
   { id: 'head-pin', where: 'queue', input: 'github', signals: ['revalidateForMerge', 'revalidateFresh', 'revalidateWithUnknownRetry'], skipKinds: ['head-moved', 'stale-read'],
     note: 'the queue merges exactly the tested group commit; a push removes the PR from the queue' },
-  { id: 'freshness', where: 'queue', input: 'github', signals: ['decideMergeQueueAction', 'couplePinExcuses'], skipKinds: ['unrecognized-reason', 'rebuilt-pending-ci'],
+  { id: 'freshness', where: 'queue', input: 'github', signals: ['decideMergeQueueAction', 'couplePinExcuses'], skipKinds: ['unrecognized-reason', 'rebuilt-pending-ci', 'restamp-stale-code'],
     note: 'the queue re-tests every PR against main + the entries ahead of it' },
   { id: 'red-main-freeze', where: 'merge-gate', input: 'local-only', signals: ['decideRedMainHold', 'decideQuarantineHold'], skipKinds: ['red-main-hold'], card: RED_MAIN_SHARED_SOURCE_CARD,
     note: 'marker lives in the drain checkout (.conveyor/red-main-freeze.json); no shared source yet → fail closed. red-main-hold (stop and quarantine modes) reads the same locally published red-main state, so it shares this gate' },

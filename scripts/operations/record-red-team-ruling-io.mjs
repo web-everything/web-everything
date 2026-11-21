@@ -18,6 +18,8 @@ import { syncRedTeamStatusLabels } from '../lib/red-team-status-labels.mjs';
 import { resolveCardRef } from './record-referral-ruling-io.mjs';
 import { CARD_REF_RE, readCardAtPrHead, referralCardReadable } from '../lib/referral-card-readable.mjs';
 import { trackingRefspec } from '../lib/git-transport-branch.mjs';
+import { appWriterProbeFor, redTeamWriterEnv } from '../lib/red-team-check-run.mjs';
+import { LEGACY_BOT_LOGINS } from '../lib/github-app-identity.mjs';
 import { assertRulingIdentity, isRulingComment, judgePolicyOnce, assertHumanOperator, isHumanOperatorComment, operatorBoundComments, operatorGhEnv, resolveOperatorIdentity } from '../lib/operator-identity.mjs';
 import { isTrustedMarkerAuthor } from '../lib/marker-authorship.mjs';
 import { createActionStore } from './action-store.mjs';
@@ -35,9 +37,30 @@ import { runCardDedupe, runLandPreventionCardCli } from './land-prevention-card.
 import { planRedTeamCard, blockRulingId, assertRulingCardInputFits, CARD_PENDING_OUTCOME, OPERATOR_BLOCK_OUTCOME, OPERATOR_NOT_REAL_OUTCOME, RED_TEAM_RULING_BLOCK_EFFECT, RED_TEAM_RULING_NOT_REAL_EFFECT, conflictingPendingCardJobs, hasPendingCardIntent, OPERATOR_CARD_OUTCOME, RED_TEAM_RULING_CARD_EFFECT, buildRuleReasonComment, recordRedTeamRulingOperation, rulingCardResource, selectBreaks, rulableBreaks } from './record-red-team-ruling.mjs';
 
 const REPO_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..', '..');
-/** `gh` under the OPERATOR channel: App tokens removed, so it runs as the operator's own login. */
+/** The env a ruling's `gh` writes run under: a judge ruling posts as the WE App bot (inherited tokens dropped, personal
+ *  fallback refused); every other ruling runs under the operator channel (App tokens removed). */
+export const ghEnvFor = (actor, env = process.env) => actor === JUDGE_ACTOR ? redTeamWriterEnv(env) : operatorGhEnv(env);
+/** The posting identity: the bot for a judge (a named refusal when no App token resolves, never the operator's login). */
+export function resolveRulingIdentity(actor, { env = process.env, run } = {}) {
+  if (actor !== JUDGE_ACTOR) return resolveOperatorIdentity({ env, ...(run ? { run } : {}) });
+  try {
+    const probe = appWriterProbeFor({ env, ...(run ? { gh: (args, options) => {
+      const r = run('gh', args, options);
+      if (r.status !== 0) throw new Error(String(r.stderr ?? r.error?.message ?? 'installation probe failed').trim().slice(0, 200));
+      return r.stdout;
+    } } : {}) });
+    const count = String(probe() ?? '').trim();
+    if (!/^(0|[1-9]\d*)$/.test(count) || !Number.isSafeInteger(Number(count))) throw new Error('invalid installation repository count');
+    // The writer env pins the legacy WE App. Its shared REST bot login identifies the poster;
+    // GET /user cannot resolve an installation token, and role-App logins must not stand in for it.
+    return { login: LEGACY_BOT_LOGINS.find(login => login.endsWith('[bot]')), type: 'Bot' };
+  }
+  catch (error) { throw new Error(`judge ruling refused: WE App token unavailable, no operator-login fallback (${String(error?.message ?? error).slice(0, 200)})`); }
+}
+export const judgeAuditLine = ({ repo, pr, head, login }) => `judge-ruling-audit actor=orchestrator channel=judge repo=${repo} pr=${pr} head=${head} poster=${login}`;
+/** `gh` under the ruling's channel (see {@link ghEnvFor}). */
 const gh = (args, input, env = process.env, actor) => {
-  const r = spawnSync('gh', args, { env: actor === JUDGE_ACTOR ? env : operatorGhEnv(env), encoding: 'utf8', timeout: 60_000, maxBuffer: 256 * 1024 * 1024, input,
+  const r = spawnSync('gh', args, { env: ghEnvFor(actor, env), encoding: 'utf8', timeout: 60_000, maxBuffer: 256 * 1024 * 1024, input,
     stdio: [input == null ? 'ignore' : 'pipe', 'pipe', 'pipe'] });
   if (r.status !== 0) throw new Error(`gh ${args.slice(0, 2).join(' ')} failed: ${String(r.stderr ?? r.error?.message ?? '').trim().slice(0, 300)}`);
   return String(r.stdout ?? '');
@@ -119,7 +142,7 @@ export function createRecordRedTeamRulingReader({ tool, log = line => console.er
   readEvents = repo => readJudgeLedgerSync(repo, { env }),
   readScope = () => readScopeLogged(env), runGit = git, readOnPr = readCardAtPrHead,
   resolveCard = card => resolveCardDefault(card, { runGit, readOnPr }),
-  resolveIdentity = actor => resolveOperatorIdentity({ env, ...(actor === JUDGE_ACTOR ? { automation: true } : {}) }), now = () => new Date().toISOString(),
+  resolveIdentity = actor => resolveRulingIdentity(actor, { env }), now = () => new Date().toISOString(),
   assertFresh = () => assertOperatorCliFresh(REPO_ROOT, { label: 'record-red-team-ruling', env }) } = {}) {
   return ({ repo, pr, card, actor, asJudge, evidenceFile, break: breakSpec }) => {
     assertFresh();
@@ -198,7 +221,7 @@ export function createRecordRedTeamRulingSinks({ judgeConfirm = defaultJudgeConf
   readScope = () => readScopeLogged(env),
   runGit = git, readOnPr = readCardAtPrHead,
   resolveCard = card => resolveCardDefault(card, { runGit, readOnPr }),
-  resolveIdentity = actor => resolveOperatorIdentity({ env, ...(actor === JUDGE_ACTOR ? { automation: true } : {}) }),
+  resolveIdentity = actor => resolveRulingIdentity(actor, { env }),
   coordinationRoot = resolveCoordinationRoot(), actions = createActionStore({ root: coordinationRoot }), fileCard = spawnStableCardJob,
   post = (repo, pr, body, actor) => gh(['pr', 'comment', String(pr), `--repo=${repo}`, '--body-file', '-'], body, env, actor),
   runSetLabel = execFileSync, appendEvents = appendLedgerEvents,
@@ -485,6 +508,7 @@ export function createRecordRedTeamRulingSinks({ judgeConfirm = defaultJudgeConf
       }
       if (!hasReason(fresh.comments)) throw new Error('block reason not in the read-back as a human operator comment; retry');
       proveHeld(p, record);
+      if (p.actor === JUDGE_ACTOR) warn(judgeAuditLine({ repo: p.repo, pr: p.pr, head: p.head, login: resolveIdentity(p.actor).login }));
       const alreadyUnderChanges = labelNames(recheck(p).labels).includes('review:changes');
       if (!alreadyUnderChanges) {
         const dir = mkdtempSync(join(tmpdir(), 'red-team-ruling-'));
@@ -494,7 +518,7 @@ export function createRecordRedTeamRulingSinks({ judgeConfirm = defaultJudgeConf
           let stdout;
           try {
             stdout = labelNames(recheck(p).labels).includes('review:changes') ? '{"ok":true}' : await runSetLabel(process.execPath, [join(root, 'scripts/review-set-label.mjs'), String(p.pr), `--repo=${p.repo}`,
-              '--to=changes', `--body-file=${path}`, `--actor=${p.actor}`, `--channel=${p.channel}`], { encoding: 'utf8', timeout: 120_000 });
+              '--to=changes', `--body-file=${path}`, `--actor=${p.actor}`, `--channel=${p.channel}`], { encoding: 'utf8', timeout: 120_000, ...(p.actor === JUDGE_ACTOR ? { env: ghEnvFor(p.actor, env) } : {}) });
           } catch (error) {
             let message;
             try { message = JSON.parse(String(error.stdout)).error; } catch { /* keep the process error */ }
