@@ -435,11 +435,20 @@ describe('queue branch numbering', () => {
     expect(out).toMatchObject({ action: 'skip', reason: expect.stringContaining('not valid against origin/main') });
     noWrites(x);
   });
-  it('numbered names must be valid against origin/main before push (card-id rule on the tracked name)', () => {
+  it.each([['collides with a different path on main', 'backlog/040-other.md'], ['duplicate numeric name', 'backlog/041-foo.md\nbacklog/041-bar.md']])('numbered names must be valid against origin/main before push (tracked filename %s)', (_label, listing) => {
     const x = setup();
-    x.exec.mockImplementation(((orig) => (cmd, args, o) => (args[0] === 'ls-files' && x.args.number.mock.calls.length ? 'backlog/xabc123-foo.md' : orig(cmd, args, o)))(x.exec.getMockImplementation()));
+    const orig = x.exec.getMockImplementation();
+    x.exec.mockImplementation((cmd, args, o) => (args[0] === 'ls-files' && x.number.mock.calls.length ? listing : orig(cmd, args, o)));
     const out = prepareBranchBeforeEnqueue(x.args);
-    expect(out.action).toBe('skip');
+    expect(out).toMatchObject({ action: 'skip', reason: expect.stringContaining('numbered card name(s) not valid against origin/main') });
+    noWrites(x);
+  });
+  it('refuses when the code checkout (restamp script location) is stale although the data checkout is fresh', () => {
+    const x = setup();
+    const orig = x.exec.getMockImplementation();
+    x.exec.mockImplementation((cmd, args, o) => (args[0] === 'rev-list' && o.cwd !== '/clone' ? '5\n' : orig(cmd, args, o)));
+    expect(prepareBranchBeforeEnqueue(x.args)).toMatchObject({ action: 'skip', reason: expect.stringContaining('drain code checkout is 5 commit(s) behind') });
+    expect(x.number).not.toHaveBeenCalled();
     noWrites(x);
   });
   it('leaves a numeric unresolved manifest card final without committing or pushing', () => {
@@ -970,7 +979,7 @@ it.each([false, true])('numbers a hash card beside unchanged raised-by ledgers i
     const statePath = join(root, 'state.json');
     const lock = (fn, options) => withNumberingLock(fn, { ...options, lockRoot: join(root, 'locks') });
     const envBefore = { ...process.env };
-    const result = prepareBranchBeforeEnqueue({ cwd, c, traceHeadSha: old, statePath, lock });
+    const result = prepareBranchBeforeEnqueue({ cwd, c, traceHeadSha: old, statePath, lock, codeRoot: cwd });
     expect(process.env).toEqual(envBefore);
     expect(result, result.reason).toMatchObject({ action: 'numbered', assigned: [{ hash: 'xabc123', nnn: '011' }] });
     expect(existsSync(sentinel)).toBe(false);
@@ -989,7 +998,7 @@ it.each([false, true])('numbers a hash card beside unchanged raised-by ledgers i
     expect(git('diff', '--no-renames', '--name-only', old, result.newHead).split('\n')).toEqual(['backlog/011-foo.md', 'backlog/xabc123-foo.md']);
     if (humanOnly) expect(git('show', `${result.newHead}:.github/workflows/ci.yml`)).toBe(git('show', `${old}:.github/workflows/ci.yml`));
     expect(JSON.parse(readFileSync(statePath, 'utf8')).reservations[0].nnns).toEqual([11]);
-    expect(prepareBranchBeforeEnqueue({ cwd, c, traceHeadSha: result.newHead, statePath, lock })).toEqual({ action: 'final' });
+    expect(prepareBranchBeforeEnqueue({ cwd, c, traceHeadSha: result.newHead, statePath, lock, codeRoot: cwd })).toEqual({ action: 'final' });
     expect(git('worktree', 'list', '--porcelain').match(/^worktree /gm)).toHaveLength(1);
     expect(git('rev-parse', 'HEAD')).toBe(old);
   } finally { rmSync(root, { recursive: true, force: true }); }

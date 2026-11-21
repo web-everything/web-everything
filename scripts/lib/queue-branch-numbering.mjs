@@ -5,6 +5,7 @@ import { isTransientReadFailure } from './drain-api-reads.mjs';
 import { execFileSync } from 'node:child_process';
 import * as nodeFs from 'node:fs';
 import { tmpdir } from 'node:os';
+import { fileURLToPath } from 'node:url';
 import { join, dirname, basename, relative, isAbsolute, resolve, posix } from 'node:path';
 import { isHash, isNum, idFromName } from '../backlog/id.mjs';
 import { numberPendingHashes } from '../lane-drain.mjs';
@@ -361,7 +362,7 @@ export function prepareBranchBeforeEnqueue({ c, traceHeadSha, cwd = process.cwd(
   isOpen = () => undefined, statePath = numberingStatePath(),
   exec = execFileSync, fs = nodeFs, lock = withNumberingLock, number = numberPendingHashes,
   now = () => new Date().toISOString(), shadow, appendLedger = appendCardLedgerRows,
-  env = process.env, log = process.stderr } = {}) {
+  env = process.env, log = process.stderr, codeRoot = dirname(fileURLToPath(import.meta.url)) } = {}) {
   const policy = resolveCardNumbering({ env });
   shadow ??= policy.value.shadow;
   return withHooksDisabled(() => {
@@ -394,9 +395,12 @@ export function prepareBranchBeforeEnqueue({ c, traceHeadSha, cwd = process.cwd(
         git(['fetch', 'origin', '+refs/heads/main:refs/remotes/origin/main']);
         // Preflight BEFORE any commit or push: the later acceptance restamp runs from this checkout and refuses
         // when it is stale, which used to leave a pushed, renumbered, red PR. Any unreadable input refuses.
-        const behind = git(['rev-list', '--count', 'HEAD..origin/main']);
-        if (!/^\d+$/.test(behind)) throw new Error(`drain checkout freshness unreadable (${shownText(behind).slice(0, 80)})`);
-        if (Number(behind) > 0) throw new Error(`drain checkout is ${behind} commit(s) behind origin/main; the restamp would refuse, so nothing was committed or pushed`);
+        // Both the data checkout (cwd) and the checkout this module (and so the restamp script) loads from.
+        for (const [label, root] of [['drain checkout', cwd], ['drain code checkout', codeRoot]]) {
+          const behind = git(['rev-list', '--count', 'HEAD..origin/main'], root);
+          if (!/^\d+$/.test(behind)) throw new Error(`${label} freshness unreadable (${shownText(behind).slice(0, 80)})`);
+          if (Number(behind) > 0) throw new Error(`${label} is ${behind} commit(s) behind origin/main; the restamp would refuse, so nothing was committed or pushed`);
+        }
         const mainFiles = git(LS_BACKLOG('origin/main'));
         const plan = reservationPlan(mainFiles, state, isOpen);
         // The drain ledger is local-only; fresh worktrees need its directory even when skills are untracked.
@@ -411,6 +415,16 @@ export function prepareBranchBeforeEnqueue({ c, traceHeadSha, cwd = process.cwd(
         const mainNums = paths(mainFiles).filter((p) => /^backlog\/[^/]+\.md$/.test(p)).map(cardId).filter(isNum).map(Number);
         const mainMax = mainNums.reduce((m, v) => Math.max(m, v), 0);
         const badNumbers = (n.assigned || []).filter((a) => !/^\d+$/.test(String(a.nnn)) || Number(a.nnn) <= mainMax || mainNums.includes(Number(a.nnn)));
+        // Validate the resulting tracked filenames too: new numeric cards must be unique and not collide with main.
+        const mainSet = new Set(paths(mainFiles));
+        const seen = new Set();
+        const badNames = paths(tracked()).filter((p) => /^backlog\/[^/]+\.md$/.test(p) && !mainSet.has(p) && isNum(cardId(p))).filter((p) => {
+          const id = Number(cardId(p));
+          const bad = mainNums.includes(id) || seen.has(id);
+          seen.add(id);
+          return bad;
+        });
+        if (badNames.length) throw new Error(`numbered card name(s) not valid against origin/main (collision with main or duplicate number): ${badNames.map(shownText).join(', ')}`);
         if (badNumbers.length) throw new Error(`numbered card(s) not valid against origin/main (highest ${mainMax}): ${badNumbers.map((a) => shownText(`${a.hash}→${a.nnn}`)).join(', ')}`);
         const newHead = git(['rev-parse', 'HEAD'], worktree);
         // Persist BEFORE publication: a crash or an ambiguous push failure must never release allocated numbers.
