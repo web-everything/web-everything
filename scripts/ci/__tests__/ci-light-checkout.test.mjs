@@ -98,16 +98,16 @@ describe('test-selection-measure lives in its own workflow (R523)', () => {
   it('has its own concurrency group, never cancels, and stays non-gating and gated by the repo var', () => {
     expect(own.concurrency.group).toMatch(/^test-selection-measure-/);
     expect(own.concurrency.group).not.toMatch(/^ci-/);
-    expect(Object.keys(own.on).sort()).toEqual(['merge_group', 'pull_request', 'push', 'workflow_dispatch']);
+    expect(Object.keys(own.on).sort()).toEqual(['push', 'workflow_dispatch']);
     expect(job['continue-on-error']).toBe(true);
-    expect(job['timeout-minutes']).toBe(30);
+    expect(job['timeout-minutes']).toBe(75);
     expect(job.if).toContain("vars.WE_MEASURE_TEST_SELECTION == '1'");
   });
 
   it('bounds the shadow suite steps below the job timeout so they fail soft', () => {
     for (const n of ['Shadow full-suite run (json report)', 'Shadow integration-suite run (json report)']) {
       const s = job.steps.find((x) => x.name === n);
-      expect(s['timeout-minutes']).toBeLessThan(30);
+      expect(s['timeout-minutes']).toBeLessThan(75);
       expect(s['continue-on-error']).toBe(true);
     }
   });
