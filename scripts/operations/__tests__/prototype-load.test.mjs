@@ -352,6 +352,9 @@ describe('urgent prototype admission', () => {
     const g = fixture({ testCheck: async () => null, urgentLedger: JSON.stringify(marker) });
     expect(await g.run({ branch: `hotpatch/${'d'.repeat(40)}`, reason })).toMatchObject({ ok: false, stopReason: 'no-ready', detail: 'hotpatch-ref-sha-mismatch' });
     expect(mutations(g, 'add')).toEqual([]);
+    const k = fixture({ testCheck: async () => ({ sha: SHA, name: 'test', status: 'completed', conclusion: 'success' }) });
+    expect(await k.run({ branch: `hotpatch/${SHA}` })).toMatchObject({ ok: false, detail: 'hotpatch-needs-ci-receipt' });
+    expect(mutations(k, 'add')).toEqual([]);
     const h = fixture({ testCheck: async () => null, urgentLedger: JSON.stringify(marker) });
     expect(await h.run({ branch: 'hotpatch/short', reason })).toMatchObject({ ok: false, detail: 'hotpatch-ref-sha-mismatch' });
   });
