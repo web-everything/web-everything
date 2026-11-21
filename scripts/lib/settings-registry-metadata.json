@@ -13,6 +13,24 @@
       "changeVia": "env",
       "instant": false
     },
+    "allowedKinds": {
+      "description": "Doc-fix only; test-fix refused until #8606 regardless of settings. Production confinement unavailable; repair size 1.",
+      "owner": "scripts/settings/agy-build.json",
+      "changeVia": "env",
+      "instant": false
+    },
+    "kindMaxSize": {
+      "description": "Maximum direct confined agy build size for allowedKinds; repair dispatch remains size 1.",
+      "owner": "scripts/settings/agy-build.json",
+      "changeVia": "env",
+      "instant": false
+    },
+    "maxSize": {
+      "description": "Maximum direct confined agy build size for any kind; repair dispatch remains size 1.",
+      "owner": "scripts/settings/agy-build.json",
+      "changeVia": "env",
+      "instant": false
+    },
     "heavyAdmissionCap": {
       "description": "Maximum concurrent heavy commands admitted on the host.",
       "owner": "scripts/dispatch-settings.json",

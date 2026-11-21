@@ -77,7 +77,7 @@ export const CLEARANCE_FIELD = 'operatorInstruction';
  *    approved later."
  *
  * WHAT THAT DOES AND DOES NOT GIVE UP. The sanctioned workstation path is `review-set-label.mjs
- * --to=clear-human --actor=<name> --reason=<quote the operator instruction authorising this>`, and NOTHING
+ * --to=clear-human --expect-head=<full 40-hex head SHA> --actor=<name> --reason=<quote the operator instruction authorising this>`, and NOTHING
  * there verifies that a human said it either — #2895 shipped the clearance as "the raw command with better
  * manners" and deferred the unforgeable signal to #2946. So relaying an operator's instruction through a
  * request file is exactly as strong as running the command on a laptop, and no stronger. It is not a new
@@ -104,7 +104,7 @@ export function validateRequest(raw) {
   if (!raw || typeof raw !== 'object' || Array.isArray(raw)) {
     return { ok: false, error: 'request must be a JSON object' };
   }
-  const { repo, pr, to, actor, body, sessionId, channel } = raw;
+  const { repo, pr, to, actor, body, sessionId, channel, expectedHead } = raw;
   const operatorInstruction = raw[CLEARANCE_FIELD];
 
   if (typeof repo !== 'string' || !/^[\w.-]+\/[\w.-]+$/.test(repo)) {
@@ -129,6 +129,9 @@ export function validateRequest(raw) {
         + 'the record has to be WRITTEN: it is posted in the durable comment under the actor named here.',
     };
   }
+  if (to === 'clear-human' && (typeof expectedHead !== 'string' || !/^[0-9a-f]{40}$/i.test(expectedHead))) {
+    return { ok: false, error: '`clear-human` requires `expectedHead` (full 40-hex head SHA)' };
+  }
   if (to !== 'clear-human' && operatorInstruction !== undefined) {
     // A stray instruction on an ordinary verdict means someone copied a clearance request and edited the
     // target. Refuse rather than silently ignore the field: the next edit is the one that flips it back.
@@ -150,7 +153,7 @@ export function validateRequest(raw) {
   if (channel !== undefined && (typeof channel !== 'string' || !channel.trim())) {
     return { ok: false, error: '`channel`, when present, must be a non-empty string' };
   }
-  return { ok: true, request: { repo, pr, to, actor, body: body ?? '', sessionId, channel, operatorInstruction } };
+  return { ok: true, request: { repo, pr, to, actor, body: body ?? '', sessionId, channel, operatorInstruction, ...(to === 'clear-human' ? { expectedHead } : {}) } };
 }
 
 /**
@@ -170,7 +173,7 @@ export function buildLabelArgv(request, bodyFile) {
   // The single home requires `--reason` for `clear-human` (#2895) and posts it verbatim. The operator's words
   // ARE the reason — nothing is paraphrased, because a paraphrase is the agent's account of what it was told
   // rather than what it was told.
-  if (request.to === 'clear-human') argv.push(`--reason=${request.operatorInstruction}`);
+  if (request.to === 'clear-human') argv.push(`--expect-head=${request.expectedHead}`, `--reason=${request.operatorInstruction}`);
   return argv;
 }
 
