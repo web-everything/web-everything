@@ -19,7 +19,7 @@ For repo defaults, edit the owner file through a PR and rebuild the consuming da
 - Top-level keys: 157 (159 declaration rows).
 - Declared leaves: 585 (platform copies counted separately).
 - Instant top-level keys: 0; not instant: 157.
-- Instant capacity leaves: 14.
+- Instant capacity leaves: 15.
 - Constants to settle: 312.
 - Instant gaps: 28.
 
@@ -39,6 +39,7 @@ Operator-prefs layer: ~/.plateau/platform-preferences.json is the requested oper
 | fix.conflictFixesPerPass | integer 0–24 | fixes/pass | yes | Conflict-fix dispatch allowance per pass. |
 | host.maxReviewDispatchPerTick | integer 1–16 | dispatches/tick | yes | Maximum host review dispatches per tick. |
 | lanes.maxConcurrent | integer 1–24 | lanes | yes | Maximum concurrently leased lanes. |
+| redTeam.queue.reservedSlots | integer 0–8 | slots | yes | Live review slots reserved while runnable red-team work is queued; default 4, lent back when the queue is empty or unknown. |
 | redTeamQueue.maxProbesPerTick | integer 0–50 | probes/tick | yes | Maximum red-team probes started per tick. |
 | redTeamQueue.minConcurrent | integer 0–24 | jobs | yes | Minimum concurrent red-team jobs. |
 | resourceGate.fixCap.ceiling | integer 1–24 | workers | yes | Maximum adaptive fix capacity. |
