@@ -87,7 +87,7 @@ describe('mechanical round enrichment port (#5948)', () => {
   const head = 'b'.repeat(40), priorHead = 'a'.repeat(40);
   const comment = (body, hour) => ({ author: { login: 'web-everything' }, body,
     createdAt: `2026-10-10T${String(hour).padStart(2, '0')}:00:00Z` });
-  const snapshot = (ordinary = false) => ({ number: 5948, headRefName: 'lane/mechanical', headRefOid: head,
+  const snapshot = (ordinary = false) => ({ rowsComplete: true, rowsHead: head, number: 5948, headRefName: 'lane/mechanical', headRefOid: head,
     baseRefName: 'main', labels: [{ name: 'review:pending' }], files: [{ path: 'src/a.mjs' }],
     statusCheckRollup: [{ name: 'test', status: 'COMPLETED', conclusion: 'SUCCESS', headSha: head }],
     comments: [...[1, 2, 3, 4, 5].map(h => comment(REARM_COMMENT_MARKER, h)),
@@ -161,6 +161,7 @@ it('normalises a bare repo KEY (e.g. --repo=we) to its gh owner/name slug before
 // like every other reader in this file, so this is exercised with no network.
 it('fetches the required set once per pass and threads it into planReconcile (never ci-red on an advisory-only red)', async () => {
   const { runReconcilePass } = await import('../reconcile-pass.mjs');
+  const head = 'a'.repeat(40);
   const rollup = [
     { name: 'soak-replay-gate', status: 'COMPLETED', conclusion: 'FAILURE' },
     { name: 'test', status: 'COMPLETED', conclusion: 'SUCCESS' },
@@ -168,15 +169,18 @@ it('fetches the required set once per pass and threads it into planReconcile (ne
     { name: 'daemon-soak', status: 'COMPLETED', conclusion: 'SUCCESS' },
   ];
   const readRequiredChecks = vi.fn(() => ({ checks: ['test', 'smoke', 'daemon-soak'], source: 'live' }));
+  const readChecks = vi.fn(() => { throw new Error('complete snapshot must not hydrate'); });
   const plan = runReconcilePass({
     repo: 'web-everything/web-everything',
     readPrs: () => [{
+      headRefOid: head, rowsComplete: true, rowsHead: head,
       number: 2748, headRefName: 'lane/x', labels: [{ name: 'review:accepted' }, { name: 'ready-to-merge' }],
       mergeStateStatus: 'CLEAN', statusCheckRollup: rollup, comments: [],
     }],
-    readAgents: () => [], enrich: (agents) => agents, readRequiredChecks,
+    readAgents: () => [], enrich: (agents) => agents, readRequiredChecks, readChecks,
   });
   expect(readRequiredChecks).toHaveBeenCalledWith({ repo: 'web-everything/web-everything', branch: 'main' });
+  expect(readChecks).not.toHaveBeenCalled();
   expect(plan.dispatch).toEqual([]);
   expect(plan.refusals).toEqual([expect.objectContaining({ kind: 'nothing-owed', phase: 'queued', prNumber: 2748 })]);
 });
@@ -187,7 +191,7 @@ it('maps repo slugs before binding and refuses unknown repos before IO', async (
   const options = {
     env: { WE_REVIEW_START_AFTER: 'ci-green' },
     readRequiredChecks: () => ({ checks: requiredChecks, source: 'live' }),
-    readPrs: () => [{ statusCheckRollup: requiredChecks.map(name => ({ name, status: 'COMPLETED', conclusion: 'SUCCESS' })), number: 49, headRefName: 'lane/1-x', headRefOid: 'a'.repeat(40), labels: [{ name: 'review:pending' }], comments: [] }],
+    readPrs: () => [{ rowsComplete: true, rowsHead: 'a'.repeat(40), statusCheckRollup: requiredChecks.map(name => ({ name, status: 'COMPLETED', conclusion: 'SUCCESS' })), number: 49, headRefName: 'lane/1-x', headRefOid: 'a'.repeat(40), labels: [{ name: 'review:pending' }], comments: [] }],
     readAgents: () => [{ name: 'review-fui-49', pidAlive: true, pid: 1 }], enrich: (agents) => agents,
   };
   expect(runReconcilePass({ ...options, repo: 'frontier-ui/frontierui' }).refusals.some((r) => r.kind === 'live-process')).toBe(true);
@@ -791,13 +795,17 @@ describe('enrichPrsWithBaseRefFacts (#4265)', () => {
 // caller back to the pre-#4265 ref-only comparison even with `enrichPrsWithBaseRefFacts` itself correct).
 it('runReconcilePass threads enrichBaseRef\'s output through to planReconcile (#4265)', async () => {
   const { runReconcilePass } = await import('../reconcile-pass.mjs');
-  const stackedPr = { statusCheckRollup: ['test', 'smoke', 'daemon-soak', 'soak-replay-gate'].map(name => ({ name, status: 'COMPLETED', conclusion: 'SUCCESS' })), number: 2578, baseRefName: 'lane/3681-ratify-daemon-lifecycle', comments: [] };
+  const head = 'a'.repeat(40);
+  const stackedPr = { headRefOid: head, rowsComplete: true, rowsHead: head,
+    statusCheckRollup: ['test', 'smoke', 'daemon-soak', 'soak-replay-gate'].map(name => ({ name, status: 'COMPLETED', conclusion: 'SUCCESS' })), number: 2578, baseRefName: 'lane/3681-ratify-daemon-lifecycle', comments: [] };
+  const readChecks = vi.fn(() => { throw new Error('complete snapshot must not hydrate'); });
   const enrichBaseRef = vi.fn((prs) => prs.map((pr) => ({ ...pr, baseRefSha: 'ddd4444' })));
   runReconcilePass({
     readPrs: () => [stackedPr], readAgents: () => [], enrich: (a) => a,
     enrichMainRed: (prs) => ({ prs, mainRedWindows: [] }), enrichAlreadyLanded: (prs) => prs,
-    enrichBaseRef,
+    enrichBaseRef, readChecks,
   });
+  expect(readChecks).not.toHaveBeenCalled();
   expect(enrichBaseRef).toHaveBeenCalledWith([expect.objectContaining(stackedPr)], { defaultBranch: 'main' });
 });
 
@@ -869,13 +877,17 @@ describe('enrichPrsWithSystemFixFacts (#4263)', () => {
 // `enrichBaseRef` wiring test above — a gap here would silently degrade every caller back to refusing forever.
 it('runReconcilePass threads enrichSystemFix\'s output through to planReconcile (#4263)', async () => {
   const { runReconcilePass } = await import('../reconcile-pass.mjs');
-  const escalatedPr = { statusCheckRollup: ['test', 'smoke', 'daemon-soak', 'soak-replay-gate'].map(name => ({ name, status: 'COMPLETED', conclusion: 'SUCCESS' })), number: 2783, headRefOid: 'aaa1111', comments: [] };
+  const head = 'a'.repeat(40);
+  const escalatedPr = { headRefOid: head, rowsComplete: true, rowsHead: head,
+    statusCheckRollup: ['test', 'smoke', 'daemon-soak', 'soak-replay-gate'].map(name => ({ name, status: 'COMPLETED', conclusion: 'SUCCESS' })), number: 2783, comments: [] };
+  const readChecks = vi.fn(() => { throw new Error('complete snapshot must not hydrate'); });
   const enrichSystemFix = vi.fn((prs) => prs.map((pr) => ({ ...pr, systemFixLanded: true })));
   runReconcilePass({
     readPrs: () => [escalatedPr], readAgents: () => [], enrich: (a) => a,
     enrichMainRed: (prs) => ({ prs, mainRedWindows: [] }), enrichAlreadyLanded: (prs) => prs,
-    enrichBaseRef: (prs) => prs, enrichSystemFix,
+    enrichBaseRef: (prs) => prs, enrichSystemFix, readChecks,
   });
+  expect(readChecks).not.toHaveBeenCalled();
   expect(enrichSystemFix).toHaveBeenCalledWith([expect.objectContaining(escalatedPr)], { repo: null });
 });
 
@@ -1298,7 +1310,8 @@ it('xxh4zw8 hydrates shared-file input and preserves attribution timestamps and 
   try {
     const path = join(dir, 'prs.json');
     writeFileSync(path, JSON.stringify([xxPr()]));
-    const exec = vi.fn(() => xxRuns().map(row => JSON.stringify(row)).join('\n'));
+    const exec = vi.fn((_file, args) => JSON.stringify(args.some(arg => arg.includes('/check-runs'))
+      ? [{ check_runs: xxRuns() }] : [{ statuses: [] }]));
     const plan = runReconcilePass({ ...xxOptions(), readPrs: () => readPrsFromFile(path),
       readChecks: args => defaultReadChecks(args, { exec }),
       enrichMainRed: (prs, opts) => {
@@ -1311,8 +1324,8 @@ it('xxh4zw8 hydrates shared-file input and preserves attribution timestamps and 
       } });
     expect(plan.dispatch.map(d => d.kind)).toEqual(['ci-heal']);
     expect(exec.mock.calls[0][1]).toContain('--paginate');
-    expect(exec.mock.calls[0][1]).toContain(`repos/web-everything/web-everything/commits/${XX_HEAD}/check-runs`);
-    expect(exec.mock.calls[0][1].at(-1)).toContain('completed_at');
+    expect(exec.mock.calls[0][1]).toContain(`repos/web-everything/web-everything/commits/${XX_HEAD}/check-runs?per_page=100&filter=all`);
+    expect(exec.mock.calls[1][1]).toContain(`repos/web-everything/web-everything/commits/${XX_HEAD}/status?per_page=100`);
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
 
@@ -1343,7 +1356,8 @@ it.each([
   ['unreadable', () => xxRuns().map(row => ({ ...row, conclusion: row.name === 'test' ? null : row.conclusion }))],
 ])('xxh4zw8 %s hydration refuses visibly, never heals unknown evidence, and allows unrelated progress', async (_, readChecks) => {
   const { runReconcilePass, formatReport } = await import('../reconcile-pass.mjs');
-  const good = { ...xxPr(), number: 3337, statusCheckRollup: xxRuns().map(row => ({ ...row, conclusion: 'SUCCESS', status: 'COMPLETED' })) };
+  const good = { ...xxPr(), number: 3337, rowsComplete: true, rowsHead: XX_HEAD,
+    statusCheckRollup: xxRuns().map(row => ({ ...row, conclusion: 'SUCCESS', status: 'COMPLETED' })) };
   const plan = runReconcilePass({ ...xxOptions(), readChecks, readPrs: () => [xxPr(), good] });
   expect(plan.dispatch.map(d => [d.prNumber, d.kind])).toEqual([[3337, 'promote-draft']]);
   expect(plan.refusals.filter(r => r.kind === 'check-read-failed'))
@@ -1426,7 +1440,7 @@ it('xxh4zw8 hydration collapses superseded cancellations and unreadable conclusi
   }
 });
 
-it('xxh4zw8 malformed JSON-lines read is refused and failed identical-head reads are deduplicated', async () => {
+it('xxh4zw8 malformed paged JSON read is refused and failed identical-head reads are deduplicated', async () => {
   const { runReconcilePass, defaultReadChecks } = await import('../reconcile-pass.mjs');
   const exec = vi.fn(() => '{not-json');
   const plan = runReconcilePass({ ...xxOptions(), readPrs: () => [xxPr(), { ...xxPr(), number: 3337 }],
@@ -1608,7 +1622,7 @@ describe('timeout re-run eligibility — card-only diff + derived red checks (PR
 
 describe('stacked PR required-check absence (#3915)', () => {
   const stacked = () => ({ ...xxPr(), number: 3915, baseRefName: 'lane/base', statusCheckRollup: [] });
-  const base = () => ({ ...xxPr(), number: 3889, headRefName: 'lane/base', baseRefName: 'main',
+  const base = () => ({ ...xxPr(), number: 3889, headRefName: 'lane/base', baseRefName: 'main', rowsComplete: true, rowsHead: XX_HEAD,
     statusCheckRollup: XX_REQUIRED.map(name => ({ name, status: 'COMPLETED', conclusion: 'SUCCESS' })) });
   const run = async (prs, extra = {}) => {
     const { runReconcilePass } = await import('../reconcile-pass.mjs');
@@ -2272,4 +2286,16 @@ it('runs the file-based synchronous pool with real child processes and cleans it
     })).toEqual([{ eligible: true, number: 1 }, { eligible: true, number: 2 }, { eligible: true, number: 3 }]);
     expect(evidenceExists(folder)).toBe(false);
   } finally { rmSync(lockRoot, { recursive: true, force: true }); }
+});
+
+it('never-started CI keeps its own flag and the complete empty read is attested, so startBeforeCi + verifyGreen dispatches a review', async () => {
+  const { hydrateChecks } = await import('../reconcile-pass.mjs');
+  const readChecks = () => Object.defineProperties([], { rowsComplete: { value: true }, rowsHead: { value: XX_HEAD } });
+  const pr = { number: 7, state: 'OPEN', headRefOid: XX_HEAD, headRefName: 'lane/xabc-test', verifyGreen: true,
+    labels: [{ name: 'review:pending' }], comments: [], files: [{ path: 'scripts/example.mjs' }], statusCheckRollup: [] };
+  const out = hydrateChecks([pr], { repo: 'we', requiredChecks: ['test'], readChecks, defaultBranch: 'main' });
+  expect(out.owedTriggers).toHaveLength(1);
+  expect(out.prs[0]).toMatchObject({ ciNeverStarted: true, rowsComplete: true, rowsHead: XX_HEAD });
+  const plan = timeoutPlanReconcile({ prs: out.prs, requiredChecks: ['test'], now: Date.now(), reviewTiming: { startBeforeCi: true } });
+  expect(plan.dispatch.map(d => d.kind)).toContain('review');
 });

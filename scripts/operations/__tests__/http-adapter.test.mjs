@@ -613,6 +613,8 @@ describe('#3036 read-only is a property of the DECLARING MODULE — the part tha
     'update-branch': 'update-branch.mjs',
     // Writes operator routing preferences; listed here for module-map coverage only.
     'routing-override': 'routing-override.mjs',
+    // Local runtime-policy writer; listed for module-map coverage only.
+    'build-priority-set': 'build-priority-set.mjs',
     'operator-override-set': 'operator-override.mjs',
     'operator-override-clear': 'operator-override.mjs',
     'ruled-weakened-add': 'ruled-weakened-add.mjs',
@@ -1184,6 +1186,21 @@ describe('capacity operator CLI declarations and real store wiring', () => {
       expect(JSON.parse(readFileSync(file, 'utf8'))).toEqual({});
       const rows = readFileSync(logFile, 'utf8').trim().split('\n').map(JSON.parse);
       expect(rows).toHaveLength(2); expect(rows[1]).toMatchObject({ old: 7, new: null, reason: 'over', actor: 'on-call human', osUser: userInfo().username, source: 'operator-cli' });
+    } finally { operatorFixture.file = undefined; vi.unstubAllEnvs(); rmSync(dir, { recursive: true, force: true }); }
+  });
+  it('set accepts a declared enum value for an enum key and refuses text elsewhere', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'operator-cli-enum-'));
+    const file = join(dir, 'operator-overrides.json');
+    operatorFixture.file = file;
+    try {
+      const enumFlags = ['--key=ciHeal.loop', '--value=on', '--reason=enable child loop', '--actor=on-call human'];
+      expect((await invoke('operator-override-set', enumFlags)).code).toBe(0);
+      const enumFile = join(dir, 'operator-enum-overrides.json');
+      expect(JSON.parse(readFileSync(enumFile, 'utf8'))).toEqual({ 'ciHeal.loop': 'on' });
+      expect(existsSync(file)).toBe(false); // the numeric capacity store never holds an enum row
+      expect((await invoke('operator-override-set', enumFlags.map(f => f.startsWith('--value=') ? '--value=maybe' : f))).code).not.toBe(0);
+      expect((await invoke('operator-override-set', flags.map(f => f.startsWith('--value=') ? '--value=on' : f))).code).not.toBe(0);
+      expect(JSON.parse(readFileSync(enumFile, 'utf8'))).toEqual({ 'ciHeal.loop': 'on' });
     } finally { operatorFixture.file = undefined; vi.unstubAllEnvs(); rmSync(dir, { recursive: true, force: true }); }
   });
   it.each([

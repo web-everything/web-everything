@@ -1,7 +1,7 @@
 // @vitest-environment node
 /** @file Shadow admission regressions: CPU idle wins over misleading load average. */
 import { afterEach, expect, it } from 'vitest';
-import { mkdtempSync, mkdirSync, readFileSync, writeFileSync, rmSync } from 'node:fs';
+import { existsSync, mkdtempSync, mkdirSync, readFileSync, writeFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { RESOURCE_POLICY_STANDARD, resolveResourcePolicy, loadResourcePolicy, decideAdmission, admit, shadowAdmission, resourcePaths } from '../resource-admission.mjs';
@@ -99,13 +99,14 @@ it('writes shadow JSONL and a human line; off skips and logging cannot throw', (
   const lines = [];
   expect(shadowAdmission({ gate: 'test', kind: 'build', oldVerdict: 'hold', oldReason: 'load', root, nowMs: 100000, log: s => lines.push(s) }).verdict).toBe('admit');
   expect(lines).toHaveLength(1); expect(lines[0]).toContain('new verdict: admit');
-  expect(JSON.parse(readFileSync(resourcePaths(root).shadow, 'utf8'))).toMatchObject({ gate: 'test', agree: false, new: { verdict: 'admit', unknown: false } });
+  expect(existsSync(join(root, 'resource', 'shadow.jsonl'))).toBe(false);
   shadowAdmission({ root, env: { WE_RESOURCE_SHADOW: 'off' }, log: () => { throw Error('must skip'); } });
   const blocked = join(root, 'file'); writeFileSync(blocked, 'not a directory');
   expect(() => shadowAdmission({ root: blocked, kind: 'build', log: () => { throw Error('closed'); } })).not.toThrow();
 });
-it('always audits unknown admission even with shadow disabled', () => {
+it('resource admission writes no legacy comparison row', () => {
   const root = temp();
   expect(admit({ root, kind: 'build', nowMs: 100000, env: { WE_RESOURCE_SHADOW: 'off' } }).unknown).toBe(true);
-  expect(JSON.parse(readFileSync(resourcePaths(root).shadow, 'utf8')).new.unknown).toBe(true);
+  expect(shadowAdmission({ gate: 'g', kind: 'build', oldVerdict: 'admit', oldReason: 'x', root, nowMs: 100000, log: () => {} }).unknown).toBe(true);
+  expect(existsSync(join(root, 'resource', 'shadow.jsonl'))).toBe(false);
 });

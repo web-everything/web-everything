@@ -628,6 +628,7 @@ describe('setting off = the old behaviour exactly', () => {
 
 describe('the held claim blocks every dispatch on a red intermediate head', () => {
   const redPr = (over = {}) => ({
+    rowsComplete: true, rowsHead: SHA,
     number: 4115, title: 'x', headRefName: 'lane/item-68b', headRefOid: SHA, baseRefName: 'main', isDraft: false, state: 'OPEN',
     mergeable: 'MERGEABLE', mergeStateStatus: 'BLOCKED', body: 'b',
     labels: [{ name: 'review:changes' }, { name: 'review-status:fixing' }],

@@ -29,11 +29,20 @@ describe('ci.yml lightweight required test gate', () => {
     expect(jobs.test.if).toBe('${{ !cancelled() }}');
   });
 
-  it('has only one shell gate, with no checkout, setup-node, install, or FUI work', () => {
-    expect(jobs.test.steps).toHaveLength(1);
-    const [step] = jobs.test.steps;
+  it('has one blocking shell gate and one advisory timing action, with no checkout, setup-node, install, or FUI work', () => {
+    expect(jobs.test.steps).toHaveLength(2);
+    const [step, diagnostic] = jobs.test.steps;
+    expect(step.name).toBe('Gate on shard results');
     expect(step.uses).toBeUndefined();
     expect(step.run).toBeTypeOf('string');
+    expect(step.if).toBeUndefined();
+    expect(step['continue-on-error']).toBeUndefined();
+    expect(jobs.test['continue-on-error']).toBeUndefined();
+    expect(diagnostic.name).toBe('PR shards finish below 1050 seconds with no new failures');
+    expect(diagnostic.uses).toBe('actions/github-script@v7');
+    expect(diagnostic.run).toBeUndefined();
+    expect(diagnostic.if).toBe("${{ always() && github.event_name == 'pull_request' && needs.changes.outputs.light != 'true' }}");
+    expect(diagnostic['continue-on-error']).toBe(true);
     expect(JSON.stringify(jobs.test)).not.toMatch(/actions\/(?:checkout|setup-node)|npm ci|frontierui|coverage:merge|check:standards|lint-host-paths/);
     for (const name of required) expect(step.run).toContain(`needs.${name}.result`);
   });
