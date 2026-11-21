@@ -209,7 +209,6 @@
   "scripts/__tests__/lane-pool-cap-count.test.mjs": 15.86,
   "scripts/__tests__/lane-pool-clean-verdict-memo.test.mjs": 80.05,
   "scripts/__tests__/lane-pool-flag-validation.test.mjs": 10.93,
-  "scripts/__tests__/lane-pool-git-diet.test.mjs": 436.35,
   "scripts/__tests__/lane-pool-history-evidence.test.mjs": 5.09,
   "scripts/__tests__/lane-pool-history-ledger.test.mjs": 15.4,
   "scripts/__tests__/lane-pool-hold-rule.test.mjs": 104.84,
@@ -225,7 +224,6 @@
   "scripts/__tests__/lane-pool-release-cleans-litter.test.mjs": 40.42,
   "scripts/__tests__/lane-pool-release-owner-session-scope.test.mjs": 8.44,
   "scripts/__tests__/lane-pool-release-salvage.test.mjs": 104.58,
-  "scripts/__tests__/lane-pool-release-unpushed-guard.test.mjs": 555.78,
   "scripts/__tests__/lane-pool-remove-dry-run.test.mjs": 5.61,
   "scripts/__tests__/lane-pool-repair.test.mjs": 13.78,
   "scripts/__tests__/lane-pool-repo-resolution.test.mjs": 0.27,
@@ -312,7 +310,7 @@
   "scripts/__tests__/proc-read-migration-74c.test.mjs": 3.07,
   "scripts/__tests__/proc-read-migration-74d.test.mjs": 3.26,
   "scripts/__tests__/produce-pr-view.test.mjs": 0.02,
-  "scripts/__tests__/progress-board.test.mjs": 405.7,
+  "scripts/__tests__/progress-board.test.mjs": 12.97,
   "scripts/__tests__/prototype-tracker-data.test.mjs": 0.03,
   "scripts/__tests__/prototype-tracker-render-real.test.mjs": 0.38,
   "scripts/__tests__/prototype-tracker-render.test.mjs": 0.01,
@@ -578,6 +576,7 @@
   "scripts/conveyor/__tests__/pr-label-mirror.test.mjs": 0.35,
   "scripts/conveyor/__tests__/pr-lifecycle.test.mjs": 0.03,
   "scripts/conveyor/__tests__/pr-live-owner-lock.test.mjs": 0.08,
+  "scripts/conveyor/__tests__/pr-live-owner-watch-retry.test.mjs": 1,
   "scripts/conveyor/__tests__/pr-live-owner-watch.test.mjs": 9.45,
   "scripts/conveyor/__tests__/pr-merge-watch-pass.test.mjs": 1.39,
   "scripts/conveyor/__tests__/pr-merge-watch-regressions.test.mjs": 0.85,
@@ -2021,9 +2020,12 @@
   "wrapper-conformance/__tests__/runner.test.ts": 0.01
  },
  "soak": {
+  "scripts/conveyor/soak/breaks/lane-pool-release-unpushed-guard.soak.test.mjs": 315.93,
+  "scripts/conveyor/soak/breaks/lane-pool-git-diet.soak.test.mjs": 354.59,
   "scripts/conveyor/soak/breaks/runtime-admission-infra-retention.soak.test.mjs": 0.1,
   "scripts/conveyor/soak/breaks/forge-manifest-untracked-shipped.soak.test.mjs": 0.3,
   "scripts/conveyor/soak/breaks/catch-up-clean-first-snapshot-first.soak.test.mjs": 4.65,
+  "scripts/conveyor/soak/breaks/drain-decline-memo-head-scope.soak.test.mjs": 2,
   "scripts/conveyor/soak/breaks/rebuild-job-ready-candidate-starvation.soak.test.mjs": 2,
   "scripts/conveyor/soak/breaks/same-head-hold-clean-head-never-resolves.soak.test.mjs": 2,
   "scripts/conveyor/soak/breaks/run-store-stray-entry.soak.test.mjs": 2,
@@ -2134,6 +2136,7 @@
   "scripts/conveyor/soak/breaks/infra-cancelled-ci-refused-forever.soak.test.mjs": 0.76,
   "scripts/conveyor/soak/breaks/infra-lock-waiter-busy-spins.soak.test.mjs": 1,
   "scripts/conveyor/soak/breaks/judge-runs-without-cap-record.soak.test.mjs": 1,
+  "scripts/conveyor/soak/breaks/stale-referral-hold-wins-round-cap.soak.test.mjs": 1,
   "scripts/conveyor/soak/breaks/lane-acquire-under-load.soak.test.mjs": 61.27,
   "scripts/conveyor/soak/breaks/lane-acquire-waiter-takes-partial.soak.test.mjs": 3,
   "scripts/conveyor/soak/breaks/lane-git-inherited-location.soak.test.mjs": 0.28,
@@ -2201,6 +2204,7 @@
   "scripts/conveyor/soak/breaks/superseded-watcher-conflict-retry.soak.test.mjs": 1,
   "scripts/conveyor/soak/breaks/timeout-retry-reservation-wedged-on-failed-observation.soak.test.mjs": 3.93,
   "scripts/conveyor/soak/breaks/too-large-pr-diff-scope-read.soak.test.mjs": 96.87,
+  "scripts/conveyor/soak/breaks/ci-heal-child-follows-loop-setting.soak.test.mjs": 1,
   "scripts/conveyor/soak/breaks/transient-fetch-retries-before-needs-you.soak.test.mjs": 1,
   "scripts/conveyor/soak/breaks/unprepared-card-dispatched-as-build.soak.test.mjs": 0.01,
   "scripts/conveyor/soak/breaks/unrecognized-session-lease-outlives-merged-pr.soak.test.mjs": 7.88,
@@ -2379,7 +2383,8 @@
   "scripts/conveyor/soak/breaks/timings-advisory-merge.soak.test.mjs": 2,
   "scripts/conveyor/soak/breaks/superseded-omits-retired-merged-overlay.soak.test.mjs": 2,
   "scripts/conveyor/soak/breaks/smoke-queue-force-priority.soak.test.mjs": 1,
-  "scripts/conveyor/soak/breaks/daemon-git-developer-dir.soak.test.mjs": 1
+  "scripts/conveyor/soak/breaks/daemon-git-developer-dir.soak.test.mjs": 1,
+  "scripts/conveyor/soak/breaks/watchdog-pr-list-transient-retry.soak.test.mjs": 3
  },
  "integration": {}
 }
