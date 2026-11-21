@@ -23,7 +23,6 @@ export function createUrgentDeps({ cwd = process.cwd(), home = homedir(), fs = r
   // Any other extra dir (a lookalike, another gh) is left alone.
   // Matched by the exact path shape (any home: the host PATH is inherited while HOME may be a sandbox or fake).
   const approvedShimDir = d => /(^|\/)\.claude\/github-app-token\/gh-shim(\.d\/[0-9a-f]{16})?$/.test(resolve(d));
-  if (childEnv.PATH) childEnv.PATH = childEnv.PATH.split(delimiter).filter(d => !(d && approvedShimDir(d))).join(delimiter);
   const fui = resolve(cwd, '../frontierui');
   // Child env is scrubbed to a few keys; local bins (vitest etc.) must stay resolvable.
   const binDirs = [join(cwd, 'node_modules/.bin'), join(fui, 'node_modules/.bin')];
@@ -62,7 +61,7 @@ export function createUrgentDeps({ cwd = process.cwd(), home = homedir(), fs = r
     // or non-executable system tool would silently resolve to a checkout-supplied replacement. Refuse up front instead.
     for (const tool of ['git', 'node', 'npm', 'sh']) {
       if (!systemPath.split(delimiter).some(d => {
-        if (!d) return false;
+        if (!d || approvedShimDir(d)) return false; // the shim stays on the child PATH (identity routing) but is never probed
         try {
           const candidate = join(d, tool);
           fs.accessSync(candidate, realFs.constants.X_OK);

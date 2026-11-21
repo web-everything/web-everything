@@ -518,23 +518,19 @@ describe('FUI origin binding', () => {
 describe('urgent-verify approved gh-shim dirs on PATH', () => {
   const approvedA = '/h/.claude/github-app-token/gh-shim.d/fd5c03c434fc6486';
   const approvedB = '/h/.claude/github-app-token/gh-shim';
-  it('scrubs exactly the approved shim dirs from every child PATH and keeps other dirs', () => {
+  it('keeps the approved shim dirs on the child PATH (gh identity routing is unchanged)', () => {
     const spawnSync = vi.fn(() => ({ status: 0, stdout: 'x' }));
     const d = createUrgentDeps({ cwd: '/repo', home: '/h', env: { PATH: `${approvedA}:/usr/bin:${approvedB}:/bin`, HOME: '/h' }, spawnSync });
-    d.standards();
     d.head();
-    for (const call of spawnSync.mock.calls) {
-      const parts = call[2].env.PATH.split(':');
-      expect(parts).not.toContain(approvedA);
-      expect(parts).not.toContain(approvedB);
-      expect(parts).toContain('/usr/bin');
-    }
+    expect(spawnSync.mock.calls[0][2].env.PATH).toBe(`${approvedA}:/usr/bin:${approvedB}:/bin`);
   });
-  it('does not scrub non-approved lookalikes (wrong home, non-hex key, extra gh dir)', () => {
+  it('still probes non-approved lookalike dirs (wrong shape, non-hex key, extra gh dir)', () => {
     const odd = ['/h/.claude/github-app-token/gh-shim-evil', '/h/.claude/other/gh-shim', '/h/.claude/github-app-token/gh-shim.d/notakey', '/h/.claude/github-app-token/gh-shim.d/fd5c03c434fc6486/extra', '/opt/evil-gh'];
-    const spawnSync = vi.fn(() => ({ status: 0, stdout: 'x' }));
-    createUrgentDeps({ cwd: '/repo', home: '/h', env: { PATH: `${odd.join(':')}:/bin`, HOME: '/h' }, spawnSync }).head();
-    expect(spawnSync.mock.calls[0][2].env.PATH.split(':')).toEqual([...odd, '/bin']);
+    const accessed = [];
+    const fs = { accessSync: p => { accessed.push(String(p)); throw new Error('ENOENT'); }, statSync: () => ({ isFile: () => false }) };
+    const d = createUrgentDeps({ isolated: true, cwd: '/repo', home: '/h', fs, env: { PATH: odd.join(':'), HOME: '/h' }, spawnSync: vi.fn() });
+    expect(() => d.isolate('a'.repeat(40))).toThrow(/required system tool/);
+    for (const dir of odd) expect(accessed).toContain(`${dir}/git`);
   });
   it('isolation never probes (accessSync) the approved shim dir', () => {
     const accessed = [];
