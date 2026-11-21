@@ -1,0 +1,840 @@
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { userInfo, tmpdir } from 'node:os';
+import { fileURLToPath } from 'node:url';
+import { spawnSync } from 'node:child_process';
+import { join, dirname, isAbsolute } from 'node:path';
+import { mkdtempSync, mkdirSync, rmSync, writeFileSync, chmodSync, realpathSync, readFileSync } from 'node:fs';
+import { launchAgent, buildAgentInvocation, buildAgentArgs, findAgentBinary, buildAgentPath } from '../lib/agent-launch.mjs';
+import { defaultShimDir, checkoutShimDir, isDaemonCaller } from '../lib/gh-app-shim.mjs';
+import { isUnderTest } from '../lib/under-test.mjs';
+import { laneGitHardeningEnv, laneHistoryProofEnv, LANE_GIT_CONFIG_PINS, LANE_HISTORY_CONFIG_PINS } from '../lib/lane-git-hardening.mjs';
+import { buildCodexDirectTaskDescriptor, CODEX_SHIM_DIR } from '../codex-direct-task.mjs';
+import { clearEnv, clearRestrictiveEnv } from './fixtures/agent-launch-env.mjs';
+
+const SID = '12345678-1234-4234-8234-123456789abc';
+const cwd = process.cwd();
+const base = () => ({ agent: 'codex', cwd, model: 'gpt-5.6-sol', sandbox: 'workspace-write' });
+const claude = () => ({ agent: 'claude', cwd, print: true, sessionId: SID, prompt: 'hello' });
+const seam = () => ({ spawn: vi.fn(() => 'child'), resolveBinary: vi.fn(() => process.execPath) });
+const registry = JSON.parse(readFileSync(join(dirname(fileURLToPath(import.meta.url)), '../lib/agent-launch-env-registry.json'), 'utf8'));
+const fixedPath = (prefix) => [...new Set([prefix, dirname(process.execPath), '/usr/bin', '/bin', '/usr/sbin', '/sbin',
+  '/opt/homebrew/bin', '/usr/local/bin'].filter(Boolean))].join(':');
+function refused(descriptor, reason) {
+  const io = seam();
+  expect(() => launchAgent(descriptor, io)).toThrow(reason);
+  expect(io.spawn).not.toHaveBeenCalled();
+  expect(io.resolveBinary).not.toHaveBeenCalled();
+}
+beforeEach(() => {
+  clearRestrictiveEnv(registry);
+  vi.stubEnv('PATH', fixedPath());
+});
+afterEach(() => vi.unstubAllEnvs());
+
+describe('closed grammar rejection: the PR #7022 attack classes', () => {
+  it('1 refuses shell wrappers as agent or nested invocation data', () => {
+    for (const agent of ['sh', 'bash', 'zsh', 'sh -c codex', '/bin/claude']) refused({ ...base(), agent }, /agent/);
+    refused({ ...base(), command: { agent: 'bash', args: ['-c', 'codex exec'] } }, /command/);
+  });
+  it('2 refuses env wrappers and assignment prefixes', () => {
+    for (const agent of ['env', 'env -S codex', 'FOO=bar codex', 'FOO=bar; claude']) refused({ ...base(), agent }, /agent/);
+    refused({ ...base(), prefix: ['env', '-i', '--unset=PATH'] }, /prefix/);
+  });
+  it('3 refuses the other wrapper binaries', () => {
+    for (const agent of ['nohup', 'timeout', 'xargs', 'nice', 'sudo', 'node', 'npx', 'dash', 'fish', 'stdbuf', 'script']) {
+      refused({ ...base(), agent }, /agent/);
+      refused({ ...base(), wrapper: agent }, /wrapper/);
+    }
+  });
+  it('4 refuses shell and every raw options object, even empty', () => {
+    refused({ ...base(), shell: true }, /shell/);
+    for (const options of [{}, { shell: true }, { uid: 0 }, { windowsVerbatimArguments: true }]) refused({ ...base(), options }, /options/);
+  });
+  it('5 refuses clusters and attached options in every scalar option/positional field', () => {
+    for (const value of ['-pc', `-r${SID}`, `--resume=${SID}`, '--model=exec', '-']) {
+      for (const field of ['model', 'cwd', 'outputSchemaFile', 'outputLastMessageFile', 'resumeThreadId', 'pathPrefix', 'tempRoot']) {
+        refused({ ...base(), [field]: value }, new RegExp(field));
+      }
+      for (const field of ['model', 'prompt', 'sessionId', 'resumeId', 'outputFormat']) refused({ ...claude(), [field]: value }, new RegExp(field));
+      refused({ ...base(), addDirs: [value] }, /addDirs/);
+      refused({ ...base(), config: { 'model_reasoning_effort': value } }, /model_reasoning_effort/);
+    }
+  });
+  it('6 refuses expanded, quoted and non-UUID ids, including trailing newlines', () => {
+    for (const id of ['$SID', '${SID}', '$(printf id)', '`printf id`', '~', '*', 'a b', `${SID}\n`, `"${SID}"`, `'${SID}'`, 'thread-123', '', SID + SID]) {
+      refused({ ...base(), resumeThreadId: id }, /resumeThreadId/);
+      refused({ ...claude(), sessionId: id }, /sessionId/);
+      refused({ ...claude(), sessionId: undefined, resumeId: id }, /resumeId/);
+    }
+  });
+  it('7 refuses all accessors before invoking any getter or resolver', () => {
+    const getter = vi.fn(() => getter.mock.calls.length === 1 ? 'codex' : 'bash');
+    for (const key of ['agent', 'cwd', 'unused']) {
+      const d = base(); Object.defineProperty(d, key, { get: getter }); refused(d, /accessor/);
+    }
+    const nested = {}; Object.defineProperty(nested, 'PATH', { set() { throw Error('setter ran'); } });
+    refused({ ...base(), config: nested }, /accessor/);
+    const array = ['/safe']; Object.defineProperty(array, '0', { get: getter });
+    refused({ ...base(), addDirs: array }, /accessor/);
+    expect(getter).not.toHaveBeenCalled();
+  });
+  it('8 refuses proxies anywhere without invoking traps, including revoked proxies', () => {
+    const trap = vi.fn(() => { throw Error('trap ran'); });
+    const proxy = new Proxy({}, { get: trap, ownKeys: trap, getPrototypeOf: trap });
+    refused(proxy, /Proxy/);
+    refused({ ...base(), config: proxy }, /Proxy/);
+    refused({ ...base(), addDirs: [proxy] }, /Proxy/);
+    const revoked = Proxy.revocable([], {}); revoked.revoke();
+    refused({ ...base(), addDirs: revoked.proxy }, /Proxy/);
+    expect(trap).not.toHaveBeenCalled();
+  });
+  it('9 refuses argv0 redirection', () => refused({ ...base(), argv0: 'bash' }, /argv0/));
+  it('10 refuses execPath, execArgv and fork-style launches', () => {
+    for (const field of ['execPath', 'execArgv', 'fork', 'file', 'args', 'argv', 'stdio', 'detached', 'env']) refused({ ...base(), [field]: [] }, new RegExp(field));
+  });
+  it('11 never forwards NODE_OPTIONS or any other *_OPTIONS from the caller environment', () => {
+    for (const key of ['NODE_OPTIONS', 'CUSTOM_OPTIONS', 'SHELLOPTS', 'BASHOPTS', 'LD_PRELOAD', 'DYLD_INSERT_LIBRARIES', 'IFS', 'PS4', 'NODE_PATH']) vi.stubEnv(key, 'hostile');
+    const { options: { env } } = buildAgentInvocation(base(), seam());
+    for (const key of ['NODE_OPTIONS', 'CUSTOM_OPTIONS', 'SHELLOPTS', 'BASHOPTS', 'LD_PRELOAD', 'DYLD_INSERT_LIBRARIES', 'IFS', 'PS4', 'NODE_PATH']) expect(env).not.toHaveProperty(key);
+    refused({ ...base(), env: { NODE_OPTIONS: '--import=hostile' } }, /env/);
+  });
+  it('12 never forwards shell startup variables', () => {
+    for (const key of ['BASH_ENV', 'ENV', 'ZDOTDIR', 'SHELL']) vi.stubEnv(key, '/hostile');
+    const { options: { env } } = buildAgentInvocation(base(), seam());
+    for (const key of ['BASH_ENV', 'ENV', 'ZDOTDIR', 'SHELL']) expect(env).not.toHaveProperty(key);
+    refused({ ...base(), env: { BASH_ENV: '/hostile' } }, /env/);
+  });
+  it('13 uses the real account home despite HOME override', () => {
+    vi.stubEnv('HOME', '/hostile');
+    expect(buildAgentInvocation(base(), seam()).options.env.HOME).toBe(userInfo().homedir);
+    refused({ ...base(), HOME: '/hostile' }, /HOME/);
+  });
+  it('14 snapshots once before resolver mutation and detaches aliased nested arrays', () => {
+    const roots = ['/safe'];
+    const config = { 'sandbox_workspace_write.writable_roots': roots };
+    const d = { ...base(), addDirs: roots, config };
+    const io = seam();
+    io.resolveBinary.mockImplementation(() => {
+      roots[0] = '--resume=evil'; config['sandbox_workspace_write.network_access'] = false; d.agent = 'bash';
+      return process.execPath;
+    });
+    launchAgent(d, io); roots.push('/later');
+    const [, args] = io.spawn.mock.calls[0];
+    expect(args).toContain('/safe');
+    expect(args).toContain('sandbox_workspace_write.writable_roots=["/safe"]');
+    expect(args.join(' ')).not.toMatch(/evil|later|network_access/);
+    refused({ ...base(), unknown: true }, /unknown/);
+    refused({ ...claude(), resumeId: SID }, /sessionId.*resumeId/);
+    refused({ ...base(), resumeThreadId: [SID, SID] }, /resumeThreadId/);
+    refused({ ...claude(), afterDelimiter: ['--session-id', SID] }, /afterDelimiter/);
+  });
+  it('refuses non-plain prototypes, functions, symbols, sparse arrays and cycles', () => {
+    for (const value of [new Date(), new String('codex'), () => {}, Symbol('x'), new (class X {})()]) refused({ ...base(), extra: value }, /plain|function|symbol/);
+    const d = base(); d.self = d; refused(d, /cyclic/);
+    refused({ ...base(), [Symbol('secret')]: true }, /symbol/);
+    refused({ ...base(), addDirs: Array(2 ** 32 - 1) }, /sparse/);
+    refused({ ...base(), addDirs: Object.assign(['/safe'], { extra: 'x' }) }, /array/);
+  });
+  it('fails closed at the descriptor depth bound with an operator-visible fallback', () => {
+    let nested = {}; for (let i = 0; i < 70; i++) nested = { nested };
+    refused({ ...base(), extra: nested }, /limit.*simplify/);
+  });
+  it('fails closed at the snapshot node bound with the same simplify-and-retry fallback', () => {
+    refused({ ...base(), extra: Array(10001).fill('/safe') }, /limit.*simplify/);
+  });
+  it('refuses unknown config keys, wrong types, relative and NUL paths, and conflicting resume options', () => {
+    refused({ ...base(), config: { approval_policy: 'never' } }, /approval_policy/);
+    refused({ ...base(), config: { 'sandbox_workspace_write.network_access': 'true' } }, /network_access/);
+    refused({ ...base(), config: { 'shell_environment_policy.set.PATH': '/safe::/evil' } }, /PATH/);
+    for (const cwd of ['relative', '/nul\0', '/no-such-agent-launch-dir']) refused({ ...base(), cwd }, /cwd/);
+    for (const field of ['processGroup', 'ephemeral']) refused({ ...base(), [field]: 'true' }, new RegExp(field));
+    refused({ ...base(), resumeThreadId: SID, ephemeral: true }, /ephemeral/);
+    refused({ ...base(), resumeThreadId: SID, outputSchemaFile: '/schema' }, /outputSchemaFile/);
+    refused({ ...base(), prompt: 'codex prompt must use stdin' }, /prompt/);
+    refused({ ...base(), model: 'sonnet\n' }, /model/);
+  });
+});
+
+describe('built invocation positive controls', () => {
+  it.each([
+    ['normal edit', {}], ['read-only review', { review: true }], ['resume', { resumeThreadId: SID.toUpperCase() }],
+    ['output schema', { outputSchemaFile: '/schema with spaces.json' }], ['add-dirs', { addDirs: ['/one', '/two'] }],
+  ])('pins the pre-S1 Codex argv tokens for %s', (_label, extra) => {
+    vi.stubEnv('PATH', '/arbitrary-ambient');
+    vi.stubEnv('USER', 'parent-user');
+    vi.stubEnv('WE_DAEMON_MANAGED_CLONE', '1');
+    vi.stubEnv('SEC1_POSITIVE_CONTROL', 'parent-unknown');
+    const input = { cwd, outputLastMessageFile: '/last', model: 'gpt-5.6-sol', effort: 'high', env: { PATH: '/usr/bin:/bin' }, ...extra };
+    const d = buildCodexDirectTaskDescriptor(input);
+    const configPath = fixedPath(CODEX_SHIM_DIR);
+    const expected = ['exec', '--json', '-s', extra.review ? 'read-only' : 'workspace-write', '--skip-git-repo-check', '-C', cwd,
+      ...(extra.outputSchemaFile ? ['--output-schema', extra.outputSchemaFile] : []), '-o', '/last',
+      ...(extra.addDirs ?? []).flatMap(dir => ['--add-dir', dir]), '-m', 'gpt-5.6-sol', '-c', 'model_reasoning_effort=high',
+      ...(!extra.review ? ['-c', 'sandbox_workspace_write.network_access=true', '-c', `shell_environment_policy.set.PATH=${JSON.stringify(configPath)}`] : []),
+      ...(extra.resumeThreadId ? ['resume', extra.resumeThreadId, '-'] : [])];
+    expect(buildAgentArgs(d)).toEqual(expected);
+    const io = seam(); expect(launchAgent(d, io)).toBe('child');
+    expect(io.spawn).toHaveBeenCalledWith(process.execPath, expected, expect.objectContaining({ shell: false, detached: true, cwd, stdio: ['pipe', 'pipe', 'pipe'] }));
+    expect(isAbsolute(io.spawn.mock.calls[0][0])).toBe(true);
+    // A PATH-only caller bag retains ambient metadata (including unknown names) and restrictions.
+    const env = io.spawn.mock.calls[0][2].env;
+    expect(env).toMatchObject({ USER: 'parent-user', WE_DAEMON_MANAGED_CLONE: '1', SEC1_POSITIVE_CONTROL: 'parent-unknown' });
+    expect(Object.keys(env).every(k => ['PATH', 'HOME'].includes(k)
+      || Object.hasOwn(process.env, k))).toBe(true);
+  });
+  it('encodes writable roots and temp strings as data and preserves ephemeral', () => {
+    const tempRoot = '/task "quote" \\ $TMP';
+    const d = buildCodexDirectTaskDescriptor({ cwd, model: 'gpt-5.6-sol', effort: 'high', ephemeral: true, writableRoots: [tempRoot], tempRoot });
+    const args = buildAgentArgs(d);
+    expect(args).toContain('--ephemeral');
+    expect(args).toContain(`sandbox_workspace_write.writable_roots=${JSON.stringify([tempRoot])}`);
+    for (const key of ['TMPDIR', 'TMP', 'TEMP']) {
+      expect(args).toContain(`shell_environment_policy.set.${key}=${JSON.stringify(tempRoot)}`);
+      expect(buildAgentInvocation(d, seam()).options.env[key]).toBe(tempRoot);
+    }
+  });
+  it('emits Claude print and a UUID session with the prompt after a literal delimiter', () => {
+    const io = seam(); launchAgent({ ...claude(), model: 'sonnet', outputFormat: 'stream-json', verbose: true }, io);
+    expect(io.spawn.mock.calls[0][1]).toEqual(['-p', '--session-id', SID, '--model', 'sonnet', '--output-format', 'stream-json', '--verbose', '--', 'hello']);
+    expect(buildAgentArgs({ agent: 'claude', cwd, print: true, resumeId: SID, outputFormat: 'text' })).toEqual(['-p', '--resume', SID, '--output-format', 'text']);
+  });
+  it('builds fixed PATH with shim first and ignores ambient PATH and API keys', () => {
+    vi.stubEnv('PATH', '/attacker'); vi.stubEnv('OPENAI_API_KEY', 'secret'); vi.stubEnv('USER', 'safe-user'); vi.stubEnv('CODEX_HOME', '/config');
+    const env = buildAgentInvocation({ ...base(), pathPrefix: '/shim', tempRoot: '/temp' }, seam()).options.env;
+    expect(env.PATH).toBe(fixedPath('/shim'));
+    expect(env).toMatchObject({ USER: 'safe-user', CODEX_HOME: '/config', TMPDIR: '/temp', TMP: '/temp', TEMP: '/temp' });
+    expect(env).not.toHaveProperty('OPENAI_API_KEY');
+  });
+  it('resolves a real executable by name independently of hostile PATH', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'agent-launch-path-'));
+    try {
+      const trusted = join(dir, 'trusted'), hostile = join(dir, 'hostile');
+      mkdirSync(trusted); mkdirSync(hostile);
+      for (const binDir of [trusted, hostile]) {
+        writeFileSync(join(binDir, 'codex'), '#!/bin/sh\nexit 99\n');
+        chmodSync(join(binDir, 'codex'), 0o755);
+      }
+      vi.stubEnv('PATH', hostile);
+      const file = findAgentBinary('codex', [join(dir, 'missing'), trusted]);
+      expect(isAbsolute(file)).toBe(true);
+      expect(file).toBe(realpathSync(join(trusted, 'codex')));
+      expect(() => findAgentBinary('claude', [trusted])).toThrow(/binary not found/);
+      expect(() => findAgentBinary('codex', [join(dir, 'missing')])).toThrow(/binary not found/);
+      chmodSync(join(trusted, 'codex'), 0o644);
+      expect(() => findAgentBinary('codex', [trusted])).toThrow(/binary not found/);
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+  it('rejects invalid resolver evidence and preserves spawn failures', () => {
+    const io = seam(); io.resolveBinary.mockReturnValue('codex');
+    expect(() => launchAgent(base(), io)).toThrow(/binary/); expect(io.spawn).not.toHaveBeenCalled();
+    io.resolveBinary.mockReturnValue(process.execPath); io.spawn.mockImplementation(() => { throw Error('spawn failed'); });
+    expect(() => launchAgent(base(), io)).toThrow('spawn failed');
+  });
+});
+
+describe('test-isolation markers survive the env allowlist (they only narrow)', () => {
+  it('forwards VITEST, WE_UNDER_TEST and an absolute LANE_POOL_ROOT, never the real-pool escape hatch', () => {
+    vi.stubEnv('VITEST', 'true'); vi.stubEnv('WE_UNDER_TEST', '1');
+    vi.stubEnv('LANE_POOL_ROOT', '/isolated/pool'); vi.stubEnv('WE_ALLOW_REAL_LANE_POOL_IN_TESTS', '1');
+    const { env } = buildAgentInvocation(base(), seam()).options;
+    expect(env).toMatchObject({ VITEST: 'true', WE_UNDER_TEST: '1', LANE_POOL_ROOT: '/isolated/pool' });
+    expect(env).not.toHaveProperty('WE_ALLOW_REAL_LANE_POOL_IN_TESTS');
+  });
+  it('refuses to launch when a set isolation root is malformed instead of silently dropping it', () => {
+    for (const bad of ['relative/pool', '-pool']) {
+      vi.stubEnv('LANE_POOL_ROOT', bad);
+      const io = seam();
+      expect(() => launchAgent(base(), io)).toThrow(/LANE_POOL_ROOT/);
+      expect(io.spawn).not.toHaveBeenCalled();
+    }
+  });
+});
+
+describe('three-class environment boundary', () => {
+  it('empty restrictive values cannot mask ambient restrictions or predicates', () => {
+    const blank = '';
+    const markers = { WE_GH_DAEMON_CALLER: 'daemon', XPC_SERVICE_NAME: 'com.we.test', VITEST: 'true',
+      WE_UNDER_TEST: '1', LANE_POOL_ROOT: '/isolated/pool', WE_GH_AUTH_PERSONAL_FALLBACK: 'refuse' };
+    for (const [key, value] of Object.entries(markers)) vi.stubEnv(key, value);
+    const env = buildAgentInvocation({ ...base(), inheritEnv: Object.fromEntries(Object.keys(markers).map(k => [k, blank])) }, seam()).options.env;
+    expect(env).toMatchObject(markers);
+    expect(isDaemonCaller(env)).toBe(true);
+    expect(isUnderTest(env)).toBe(true);
+    // Each predicate input independently survives; the other marker cannot hide a regression.
+    expect(isDaemonCaller({ XPC_SERVICE_NAME: env.XPC_SERVICE_NAME })).toBe(true);
+    expect(isDaemonCaller({ WE_GH_DAEMON_CALLER: env.WE_GH_DAEMON_CALLER })).toBe(true);
+    expect(isUnderTest({ VITEST: env.VITEST })).toBe(true);
+    expect(isUnderTest({ WE_UNDER_TEST: env.WE_UNDER_TEST })).toBe(true);
+    clearEnv('LANE_POOL_ROOT');
+    delete markers.LANE_POOL_ROOT;
+    for (const key of Object.keys(markers)) vi.stubEnv(key, blank);
+    const absent = buildAgentInvocation({ ...base(), inheritEnv: Object.fromEntries(Object.keys(markers).map(k => [k, blank])) }, seam()).options.env;
+    for (const key of Object.keys(markers)) {
+      if (registry[key].restrictiveValues || registry[key].restrictivePrefixes) expect(absent).not.toHaveProperty(key);
+      else expect(absent[key]).toBe('');
+    }
+    const ambient = buildAgentInvocation(base(), seam()).options.env;
+    for (const key of Object.keys(markers)) {
+      if (registry[key].restrictiveValues || registry[key].restrictivePrefixes) expect(ambient).not.toHaveProperty(key);
+      else expect(ambient[key]).toBe('');
+    }
+  });
+  it.each([' ', '\t'])('preserves whitespace presence markers %j and their daemon/test semantics', marker => {
+    for (const name of ['WE_GH_DAEMON_CALLER', 'VITEST', 'WE_UNDER_TEST']) {
+      const predicate = name === 'WE_GH_DAEMON_CALLER' ? isDaemonCaller : isUnderTest;
+      clearEnv(name);
+      const bag = buildAgentInvocation({ ...base(), inheritEnv: { [name]: marker } }, seam()).options.env;
+      expect(bag[name]).toBe(marker);
+      expect(predicate({ [name]: bag[name] })).toBe(true);
+      vi.stubEnv(name, marker);
+      for (const inheritEnv of [{}, { [name]: '' }, { [name]: 'bag-identity' }]) {
+        const env = buildAgentInvocation({ ...base(), inheritEnv }, seam()).options.env;
+        expect(env[name]).toBe(marker);
+        expect(predicate({ [name]: env[name] })).toBe(true);
+      }
+      expect(predicate({ [name]: buildAgentInvocation(base(), seam()).options.env[name] })).toBe(true);
+      clearEnv(name);
+    }
+  });
+  it('every value-gated restriction survives a blank or relaxing bag, and relaxing values stay dropped', () => {
+    for (const [name, rule] of Object.entries(registry).filter(([, r]) => r.restrictiveValues)) {
+      for (const value of rule.restrictiveValues) {
+        clearEnv(name);
+        expect(buildAgentInvocation({ ...base(), inheritEnv: { [name]: value } }, seam()).options.env[name], name).toBe(value);
+        vi.stubEnv(name, value);
+        for (const relaxed of ['', ' \t ', 'sec1-unknown-relaxation']) {
+          expect(buildAgentInvocation({ ...base(), inheritEnv: { [name]: relaxed } }, seam()).options.env[name], name).toBe(value);
+        }
+      }
+      vi.stubEnv(name, 'sec1-unknown-relaxation');
+      expect(buildAgentInvocation({ ...base(), inheritEnv: { [name]: 'sec1-unknown-relaxation' } }, seam()).options.env, name).not.toHaveProperty(name);
+      clearEnv(name);
+    }
+  });
+  it('retains every restrictive ambient variable even when the caller bag omits them', () => {
+    const restrictive = Object.fromEntries(Object.entries(registry).filter(([, rule]) => rule.class === 'forward-restrictive')
+      .map(([key, rule]) => [key, rule.value === 'absolute-path' ? '/isolated/pool' : rule.restrictivePrefixes ? rule.restrictivePrefixes[0] + 'test' : 'restrictive-identity']));
+    for (const [key, value] of Object.entries(restrictive)) vi.stubEnv(key, value);
+    expect(buildAgentInvocation({ ...base(), inheritEnv: {} }, seam()).options.env).toMatchObject(restrictive);
+  });
+  it('keeps ambient identity and neutral metadata with an explicit bag', () => {
+    vi.stubEnv('WE_GH_DAEMON_CALLER', 'host-daemon'); vi.stubEnv('USER', 'host-user');
+    const env = buildAgentInvocation({ ...base(), inheritEnv: { WE_GH_DAEMON_CALLER: 'bag-daemon', LC_MESSAGES: 'C' } }, seam()).options.env;
+    expect(env).toMatchObject({ WE_GH_DAEMON_CALLER: 'host-daemon', LC_MESSAGES: 'C' });
+    expect(env.USER).toBe('host-user');
+  });
+  it('ignores plain drop and unknown bag names while preserving unknown ambient names', () => {
+    const dropped = Object.keys(registry).filter(key => registry[key].class === 'drop' && !key.includes('*'));
+    const unknown = ['SEC1_UNKNOWN', 'SEC1_UNREGISTERED'];
+    for (const key of dropped) clearEnv(key);
+    const bag = Object.fromEntries([...dropped, ...unknown].map(key => [key, 'hostile']));
+    const explicit = buildAgentInvocation({ ...base(), inheritEnv: bag }, seam()).options.env;
+    for (const key of [...dropped, ...unknown].filter(key => !['PATH', 'HOME'].includes(key))) expect(explicit, key).not.toHaveProperty(key);
+    for (const key of unknown) vi.stubEnv(key, 'hostile');
+    const ambient = buildAgentInvocation(base(), seam()).options.env;
+    for (const key of unknown) expect(ambient[key], key).toBe('hostile');
+    for (const env of [ambient, explicit]) {
+      expect(env.HOME).toBe(userInfo().homedir);
+      expect(env.PATH).toBe(fixedPath());
+    }
+  });
+  it('drops the enabling value of personal-auth fallback from either source (refuse is covered below)', () => {
+    vi.stubEnv('WE_GH_AUTH_PERSONAL_FALLBACK', 'allow');
+    expect(buildAgentInvocation(base(), seam()).options.env).not.toHaveProperty('WE_GH_AUTH_PERSONAL_FALLBACK');
+    expect(buildAgentInvocation({ ...base(), inheritEnv: { WE_GH_AUTH_PERSONAL_FALLBACK: 'allow' } }, seam()).options.env)
+      .not.toHaveProperty('WE_GH_AUTH_PERSONAL_FALLBACK');
+  });
+  it('refuses malformed roots from either source and refuses masking a malformed ambient root', () => {
+    for (const bad of ['relative', '-root', '/nul\0']) {
+      refused({ ...base(), inheritEnv: { LANE_POOL_ROOT: bad } }, /LANE_POOL_ROOT/);
+      if (!bad.includes('\0')) {
+        vi.stubEnv('LANE_POOL_ROOT', bad);
+        refused({ ...base(), inheritEnv: { LANE_POOL_ROOT: '/safe' } }, /LANE_POOL_ROOT/);
+        clearEnv('LANE_POOL_ROOT');
+      }
+    }
+  });
+  it('requires a plain string record and keeps legacy isolation fields outside the closed grammar', () => {
+    for (const inheritEnv of [[], null, 'USER=safe', { USER: 1 }, { USER: undefined }, { USER: 'nul\0' }]) {
+      refused({ ...base(), inheritEnv }, /inheritEnv/);
+    }
+    for (const field of ['lanePoolRoot', 'underTest']) refused({ ...base(), [field]: true }, new RegExp(field));
+    const getter = vi.fn(); const bag = {}; Object.defineProperty(bag, 'USER', { get: getter });
+    refused({ ...base(), inheritEnv: bag }, /accessor/);
+    refused({ ...base(), inheritEnv: new Proxy({}, {}) }, /Proxy/);
+    expect(getter).not.toHaveBeenCalled();
+  });
+  it('snapshots bag and ambient env before a resolver can mutate either source', () => {
+    vi.stubEnv('WE_GH_DAEMON_CALLER', 'original-daemon');
+    const bag = { USER: 'original-user' };
+    const io = seam(); io.resolveBinary.mockImplementation(() => {
+      bag.USER = 'changed-user'; bag.NODE_OPTIONS = '--import=evil';
+      process.env.WE_GH_DAEMON_CALLER = 'changed-daemon';
+      return process.execPath;
+    });
+    launchAgent({ ...base(), inheritEnv: bag }, io);
+    expect(io.spawn.mock.calls[0][2].env).toMatchObject({ USER: 'original-user', WE_GH_DAEMON_CALLER: 'original-daemon' });
+    expect(io.spawn.mock.calls[0][2].env).not.toHaveProperty('NODE_OPTIONS');
+  });
+  it('keeps direct-task env-bag isolation and daemon identities in the launched child', () => {
+    const env = { LANE_POOL_ROOT: '/caller/pool', VITEST: 'caller-vitest', WE_UNDER_TEST: 'caller-test', WE_GH_DAEMON_CALLER: 'caller-daemon' };
+    const d = buildCodexDirectTaskDescriptor({ cwd, env, model: 'gpt-5.6-sol', effort: 'high' });
+    expect(d.inheritEnv).toBe(env);
+    for (const name of ['WE_GH_DAEMON_CALLER', 'VITEST', 'WE_UNDER_TEST']) clearEnv(name);
+    expect(buildAgentInvocation(d, seam()).options.env).toMatchObject(env);
+  });
+});
+
+describe('restrictive PATH projection', () => {
+  it('keeps gh shims from both snapshots before pathPrefix, node, fixed dirs and agent dir in review mode', () => {
+    const home = userInfo().homedir, legacy = defaultShimDir(home), checkout = checkoutShimDir({ home });
+    vi.stubEnv('HOME', '/hostile-home'); vi.stubEnv('PATH', `/attacker:${checkout}:${legacy}`);
+    const d = buildCodexDirectTaskDescriptor({ cwd, review: true, env: { PATH: `${legacy}:/bag-attacker:${checkout}` } });
+    expect(buildAgentArgs(d).join(' ')).not.toContain('shell_environment_policy.set.PATH');
+    const io = seam(); io.resolveBinary.mockReturnValue('/agent-install/codex');
+    const env = buildAgentInvocation(d, io).options.env;
+    expect(env.PATH).toBe(`${legacy}:${checkout}:${fixedPath()}:/agent-install`);
+    expect(env.HOME).toBe(home);
+  });
+  it('resolves bare gh to the first parent shim ahead of a real-gh fixture without using host HOME', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'agent-gh-path-'));
+    try {
+      const home = join(dir, 'account'), legacy = defaultShimDir(home), checkout = checkoutShimDir({ home }), real = join(dir, 'real');
+      for (const [where, output] of [[legacy, 'shim'], [checkout, 'checkout'], [real, 'real']]) {
+        mkdirSync(where, { recursive: true });
+        writeFileSync(join(where, 'gh'), `#!/bin/sh\nprintf '${output}'\n`, { mode: 0o755 });
+      }
+      const path = buildAgentPath({ parentPaths: [`${legacy}:${real}`, `${checkout}:${legacy}`], home,
+        pathPrefix: real, nodePath: '/running-node/node', binary: '/installed-agent/codex' });
+      expect(path).toBe(`${legacy}:${checkout}:${real}:/running-node:/usr/bin:/bin:/usr/sbin:/sbin:/opt/homebrew/bin:/usr/local/bin:/installed-agent`);
+      const result = spawnSync('gh', [], { env: { PATH: path }, encoding: 'utf8', shell: false, timeout: 5000 });
+      expect(result.error).toBeUndefined(); expect(result.status).toBe(0); expect(result.stdout).toBe('shim');
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+  it('drops relative, traversal, foreign-home, malformed-hash, suffixed and arbitrary custom shim dirs', () => {
+    const home = '/account', legacy = defaultShimDir(home), checkout = checkoutShimDir({ home });
+    const hostile = ['.', '', 'relative/gh-shim', `/other${legacy}`, `${home}/../account/.claude/github-app-token/gh-shim`,
+      `${legacy}/`, `${legacy}/evil`, checkout + 'a', checkout.slice(0, -1), checkout.toUpperCase(),
+      ...['\n', '\r', '\r\n', '\u2028', '\u2029'].map(suffix => checkout + suffix), CODEX_SHIM_DIR];
+    const options = { home, nodePath: '/node/node', binary: '/agent/codex' };
+    expect(buildAgentPath({ ...options, parentPaths: [hostile.join(':')], pathPrefix: '/explicit-shim' }))
+      .toBe('/explicit-shim:/node:/usr/bin:/bin:/usr/sbin:/sbin:/opt/homebrew/bin:/usr/local/bin:/agent');
+  });
+});
+
+describe('admission hook point (#7090 moves runtime admission here)', () => {
+  it('defaults to allow and passes the exact final spec, frozen', () => {
+    const io = seam(); io.admit = vi.fn(() => true);
+    expect(launchAgent(base(), io)).toBe('child');
+    const [spec] = io.admit.mock.calls[0];
+    const [file, args, options] = io.spawn.mock.calls[0];
+    expect(spec).toEqual({ file, args, options });
+    expect(Object.isFrozen(spec.args) && Object.isFrozen(spec.options.env)).toBe(true);
+    const plain = seam(); expect(launchAgent(base(), plain)).toBe('child');
+  });
+  it('refuses when admit returns anything but true or throws, and never spawns', () => {
+    for (const admit of [() => false, () => undefined, () => 'yes', () => Promise.resolve(true), () => { throw Error('busy'); }]) {
+      const io = seam(); io.admit = admit;
+      expect(() => launchAgent(base(), io)).toThrow(/not admitted/);
+      expect(io.spawn).not.toHaveBeenCalled();
+    }
+  });
+  it('cannot rewrite what is spawned', () => {
+    const io = seam(); io.admit = spec => { try { spec.args.push('--dangerous'); } catch { /* frozen */ } return true; };
+    launchAgent(base(), io);
+    expect(io.spawn.mock.calls[0][1]).not.toContain('--dangerous');
+  });
+});
+
+describe('value-gated auth vars forward only their tightening values', () => {
+  const envOf = (inheritEnv) => buildAgentInvocation({ ...base(), ...(inheritEnv ? { inheritEnv } : {}) }, seam()).options.env;
+  it('forwards refuse/app and drops allow/personal, from either source', () => {
+    expect(envOf({ WE_GH_AUTH_PERSONAL_FALLBACK: ' Refuse ', WE_GITHUB_AUTH: 'app' }))
+      .toMatchObject({ WE_GH_AUTH_PERSONAL_FALLBACK: 'refuse', WE_GITHUB_AUTH: 'app' });
+    const relaxed = envOf({ WE_GH_AUTH_PERSONAL_FALLBACK: 'allow', WE_GITHUB_AUTH: 'personal' });
+    expect(relaxed).not.toHaveProperty('WE_GH_AUTH_PERSONAL_FALLBACK');
+    expect(relaxed).not.toHaveProperty('WE_GITHUB_AUTH');
+    vi.stubEnv('WE_GH_AUTH_PERSONAL_FALLBACK', 'refuse');
+    expect(envOf()).toMatchObject({ WE_GH_AUTH_PERSONAL_FALLBACK: 'refuse' });
+  });
+  it('a relaxing bag value cannot override an ambient tightening one', () => {
+    vi.stubEnv('WE_GH_AUTH_PERSONAL_FALLBACK', 'refuse'); vi.stubEnv('WE_GITHUB_AUTH', 'app');
+    expect(envOf({ WE_GH_AUTH_PERSONAL_FALLBACK: 'allow', WE_GITHUB_AUTH: 'personal' }))
+      .toMatchObject({ WE_GH_AUTH_PERSONAL_FALLBACK: 'refuse', WE_GITHUB_AUTH: 'app' });
+  });
+});
+
+describe('value-gated restrictions reach exact-string consumers', () => {
+  it('canonicalizes enabling values and keeps ambient policy when the bag supplies another tightening mode', () => {
+    const names = ['WE_HEAVY_ADMISSION_CONTAINER', 'WE_HEAVY_ADMISSION_CONTAINER_NODE_MODULES'];
+    for (const name of names) clearEnv(name);
+    const envOf = inheritEnv => buildAgentInvocation({ ...base(), inheritEnv }, seam()).options.env;
+    expect(envOf(Object.fromEntries(names.map(n => [n, ' 1 '])))).toMatchObject(Object.fromEntries(names.map(n => [n, '1'])));
+    for (const name of names) vi.stubEnv(name, '1');
+    expect(envOf(Object.fromEntries(names.map(n => [n, ' true '])))).toMatchObject(Object.fromEntries(names.map(n => [n, '1'])));
+    vi.stubEnv('WE_JUDGE_NOT_REAL_MODE', 'off');
+    expect(envOf({ WE_JUDGE_NOT_REAL_MODE: 'evidence-required' }).WE_JUDGE_NOT_REAL_MODE).toBe('off');
+  });
+  it('snapshots restrictive shim paths before resolver mutation', () => {
+    const shim = defaultShimDir(userInfo().homedir);
+    const bag = { PATH: shim };
+    vi.stubEnv('PATH', shim);
+    const io = seam(); io.resolveBinary.mockImplementation(() => {
+      bag.PATH = '/attacker'; process.env.PATH = '/other-attacker'; return process.execPath;
+    });
+    expect(buildAgentInvocation({ ...base(), inheritEnv: bag }, io).options.env.PATH).toBe(`${shim}:${fixedPath()}`);
+  });
+});
+
+
+describe('registry identity predicates match the gh shim daemon reader', () => {
+  it.each(['', ' ', '\t\n', 'com.we.', 'com.we.worker', 'com.plateau.worker', 'com.apple.worker',
+    'com.we', 'COM.WE.worker', ' com.we.worker', 'interactive', 'false', '0'])('projects %j without changing daemon detection', value => {
+    for (const name of ['WE_GH_DAEMON_CALLER', 'XPC_SERVICE_NAME']) {
+      clearEnv(name);
+      expect(process.env).not.toHaveProperty(name);
+    }
+    for (const name of ['WE_GH_DAEMON_CALLER', 'XPC_SERVICE_NAME']) {
+      const projected = buildAgentInvocation({ ...base(), inheritEnv: { [name]: value } }, seam()).options.env;
+      expect(isDaemonCaller(projected)).toBe(isDaemonCaller({ [name]: value }));
+      vi.stubEnv(name, name === 'XPC_SERVICE_NAME' ? 'com.we.parent' : 'parent');
+      expect(isDaemonCaller(buildAgentInvocation({ ...base(), inheritEnv: { [name]: value } }, seam()).options.env)).toBe(true);
+      clearEnv(name);
+    }
+  });
+});
+
+describe('#7022 audit escapes are closed by construction', () => {
+  it('escape 1: a shell with argv0 "-bash" is refused before spawn, as agent and as a field', () => {
+    refused({ agent: 'bash', cwd, argv0: '-bash' }, /agent/);
+    refused({ ...base(), argv0: '-bash' }, /argv0/);
+    refused({ ...claude(), argv0: '-bash' }, /argv0/);
+  });
+  it('escape 2: GIT_SSH and the other git exec-redirect vars never reach the child, from either source', () => {
+    const redirects = ['GIT_SSH', 'GIT_SSH_COMMAND', 'GIT_EXEC_PATH', 'GIT_PROXY_COMMAND', 'GIT_ASKPASS', 'GIT_EXTERNAL_DIFF',
+      'GIT_EDITOR', 'GIT_SEQUENCE_EDITOR', 'GIT_PAGER', 'GIT_TEMPLATE_DIR', 'GIT_CONFIG_PARAMETERS', 'GIT_CONFIG_COUNT',
+      'GIT_CONFIG_KEY_0', 'GIT_CONFIG_VALUE_0'];
+    const bag = Object.fromEntries(redirects.map(name => [name, '/tmp/evil']));
+    for (const name of redirects) vi.stubEnv(name, '/tmp/evil');
+    refused({ ...base(), inheritEnv: bag }, /ambient GIT_CONFIG/);
+    clearEnv('GIT_CONFIG_COUNT'); // Orphan entries cannot form a config set; the remaining redirects must still drop.
+    const { env } = buildAgentInvocation({ ...base(), inheritEnv: bag }, seam()).options;
+    for (const name of redirects) expect(env, name).not.toHaveProperty(name);
+    for (const name of redirects) expect(registry[name]?.class ?? registry['GIT_*'].class, name).toBe('drop');
+  });
+  it('escape 3: shell argv held in a variable has no way in; the descriptor has no argv and no shell agent', () => {
+    const shellArgv = ['-c', `claude --resume ${SID}`];
+    refused({ agent: 'sh', cwd, args: shellArgv }, /agent/);
+    for (const field of ['args', 'argv', 'command', 'spawnArgs']) refused({ ...base(), [field]: shellArgv }, new RegExp(field));
+    refused({ ...claude(), prompt: shellArgv }, /prompt/);
+    const io = seam(); launchAgent(base(), io);
+    const [file, args, options] = io.spawn.mock.calls[0];
+    expect([file, ...args]).not.toContain('sh');
+    expect(args).not.toContain('-c');
+    expect(options.shell).toBe(false);
+  });
+});
+
+describe('final audit: ambient hardening pins and unregistered parent restrictions', () => {
+  const envOf = inheritEnv => buildAgentInvocation({ ...base(), inheritEnv }, seam()).options.env;
+  const configOf = env => Object.fromEntries(Object.entries(env).filter(([key]) => /^GIT_CONFIG_/.test(key)));
+  const setParent = env => { for (const [key, value] of Object.entries(env)) vi.stubEnv(key, value); };
+  beforeEach(() => {
+    for (const key of Object.keys(process.env).filter(key => key.startsWith('GIT_CONFIG_'))) clearEnv(key);
+  });
+  it.each([
+    ['lane', () => laneGitHardeningEnv({})],
+    ['remote and history proof', () => laneHistoryProofEnv({}, { remoteProbe: true })],
+  ])('preserves every exact %s hardening pair and GIT_TERMINAL_PROMPT=0 in the child', (_label, parentEnv) => {
+    const parent = parentEnv();
+    setParent(parent);
+    vi.stubEnv('GIT_CONFIG_PARAMETERS', 'core.hooksPath=.githooks');
+    vi.stubEnv('GIT_CONFIG_GLOBAL', '/untrusted/global');
+    vi.stubEnv('GIT_CONFIG_SYSTEM', '/untrusted/system');
+    const io = seam();
+    launchAgent({ ...base(), inheritEnv: {} }, io);
+    const env = io.spawn.mock.calls[0][2].env;
+    expect(configOf(env)).toEqual(configOf(parent));
+    expect(env).toMatchObject({ GIT_TERMINAL_PROMPT: '0', GIT_NO_LAZY_FETCH: '1', GIT_NO_REPLACE_OBJECTS: '1' });
+    const pairs = Array.from({ length: Number(env.GIT_CONFIG_COUNT) }, (_, i) => [env[`GIT_CONFIG_KEY_${i}`], env[`GIT_CONFIG_VALUE_${i}`]]);
+    expect(pairs).toContainEqual(['core.hooksPath', '/dev/null']);
+  });
+  it.each([
+    ['core.sshCommand', '/untrusted/ssh'], ['core.hooksPath', '.githooks'],
+    ['credential.helper', '/untrusted/helper'], ['unregistered.config', 'false'],
+    // Git compares subsections and program values exactly, so these are not spellings of a pin.
+    ['gpg.SSH.program', 'ssh-keygen'], ['core.alternateRefsCommand', 'TRUE'], ['core.sshCommand', 'SSH'],
+    ['core.hooksPath', '/DEV/NULL'], ['core.fsmonitor', 'nope'],
+    // Exec-redirect keys are never accepted, whatever their value.
+    ['core.pager', 'less'], ['core.editor', 'vi'], ['diff.external', '/untrusted/diff'],
+    ['diff.any.textconv', '/untrusted/conv'], ['protocol.ext.allow', 'always'],
+    ['url.ext::sh -c touch% /tmp/x.insteadOf', 'https://'],
+  ])('drops only the extra non-pin %s=%s and keeps every hardening pin', (key, value) => {
+    const parent = laneGitHardeningEnv({}), at = Number(parent.GIT_CONFIG_COUNT);
+    const pinsOf = env => Array.from({ length: Number(env.GIT_CONFIG_COUNT ?? 0) },
+      (_, i) => [env[`GIT_CONFIG_KEY_${i}`], env[`GIT_CONFIG_VALUE_${i}`]]);
+    const expected = pinsOf(parent);
+    // The extra entry goes FIRST so re-indexing is exercised, and once more at the end.
+    const extra = { GIT_CONFIG_KEY_0: key, GIT_CONFIG_VALUE_0: value };
+    expected.forEach(([k, v], i) => { extra[`GIT_CONFIG_KEY_${i + 1}`] = k; extra[`GIT_CONFIG_VALUE_${i + 1}`] = v; });
+    extra[`GIT_CONFIG_KEY_${at + 1}`] = key; extra[`GIT_CONFIG_VALUE_${at + 1}`] = value;
+    setParent({ ...parent, ...extra, GIT_CONFIG_COUNT: String(at + 2) });
+    const child = envOf({});
+    expect(pinsOf(child)).toEqual(expected);
+    expect(pinsOf(child)).toContainEqual(['core.hooksPath', '/dev/null']);
+    expect(pinsOf(child)).not.toContainEqual([key, value]);
+  });
+  it.each([
+    ['CORE.HOOKSPATH', '/dev/null'], ['core.hookspath', '/dev/null'], ['Gpg.ssh.Program', 'ssh-keygen'],
+    ['Core.FsMonitor', 'false'], ['core.fsmonitor', 'FALSE'], ['commit.gpgsign', 'off'], ['PUSH.GPGSIGN', 'No'],
+    ['core.trustCtime', 'Yes'], ['core.ignoreStat', '0'], ['core.commitgraph', 'OFF'], ['log.showsignature', 'False'],
+    ['core.checkstat', 'DEFAULT'], ['PROTOCOL.ALLOW', 'NEVER'], ['protocol.file.ALLOW', 'Never'],
+  ])('keeps the parent hardening pair %s=%s that Git reads as a pin despite its case', (key, value) => {
+    setParent({ GIT_CONFIG_COUNT: '2', GIT_CONFIG_KEY_0: 'user.name', GIT_CONFIG_VALUE_0: 'x',
+      GIT_CONFIG_KEY_1: key, GIT_CONFIG_VALUE_1: value });
+    expect(configOf(envOf({}))).toEqual({ GIT_CONFIG_COUNT: '1', GIT_CONFIG_KEY_0: key, GIT_CONFIG_VALUE_0: value });
+  });
+  it('keeps every boolean hardening pin in each Git boolean spelling, so a new boolean pin cannot silently go exact-only', () => {
+    const booleans = [...LANE_GIT_CONFIG_PINS, ...LANE_HISTORY_CONFIG_PINS]
+      .filter(([key, value]) => ['true', 'false'].includes(value) && key !== 'core.alternateRefsCommand');
+    expect(booleans.length).toBeGreaterThan(5);
+    for (const [key, value] of booleans) {
+      for (const spelling of value === 'true' ? ['TRUE', 'Yes', 'on', '1'] : ['FALSE', 'No', 'off', '0']) {
+        setParent({ GIT_CONFIG_COUNT: '1', GIT_CONFIG_KEY_0: key.toUpperCase(), GIT_CONFIG_VALUE_0: spelling });
+        expect(configOf(envOf({})), `${key}=${spelling}`).toEqual({ GIT_CONFIG_COUNT: '1',
+          GIT_CONFIG_KEY_0: key.toUpperCase(), GIT_CONFIG_VALUE_0: spelling });
+      }
+    }
+  });
+  it.each(['USER', 'User'])('does not widen the transport value user to the spelling %s', value => {
+    setParent({ GIT_CONFIG_COUNT: '1', GIT_CONFIG_KEY_0: 'protocol.ext.allow', GIT_CONFIG_VALUE_0: value });
+    expect(configOf(envOf({}))).toEqual({});
+    clearEnv('GIT_CONFIG_COUNT');
+    expect(configOf(envOf({ GIT_CONFIG_COUNT: '1', GIT_CONFIG_KEY_0: 'PROTOCOL.ALLOW', GIT_CONFIG_VALUE_0: value }))).toEqual({});
+  });
+  it('a differently cased parent transport prohibition still blocks caller transport exceptions', () => {
+    setParent({ GIT_CONFIG_COUNT: '1', GIT_CONFIG_KEY_0: 'PROTOCOL.ALLOW', GIT_CONFIG_VALUE_0: 'NEVER' });
+    const child = configOf(envOf(laneHistoryProofEnv({}, { remoteProbe: true })));
+    expect(child).toMatchObject({ GIT_CONFIG_KEY_0: 'PROTOCOL.ALLOW', GIT_CONFIG_VALUE_0: 'NEVER' });
+    expect(Object.values(child)).not.toContain('always');
+  });
+  it('a caller pin cannot repeat or override a differently cased parent pin for the same Git key', () => {
+    setParent({ GIT_CONFIG_COUNT: '2', GIT_CONFIG_KEY_0: 'CORE.HOOKSPATH', GIT_CONFIG_VALUE_0: '/dev/null',
+      GIT_CONFIG_KEY_1: 'protocol.https.allow', GIT_CONFIG_VALUE_1: 'NEVER' });
+    const bag = { GIT_CONFIG_COUNT: '3', GIT_CONFIG_KEY_0: 'core.hooksPath', GIT_CONFIG_VALUE_0: '/dev/null',
+      GIT_CONFIG_KEY_1: 'Protocol.https.Allow', GIT_CONFIG_VALUE_1: 'never',
+      GIT_CONFIG_KEY_2: 'protocol.https.allow', GIT_CONFIG_VALUE_2: 'always' };
+    expect(configOf(envOf(bag))).toEqual({ GIT_CONFIG_COUNT: '2',
+      GIT_CONFIG_KEY_0: 'CORE.HOOKSPATH', GIT_CONFIG_VALUE_0: '/dev/null',
+      GIT_CONFIG_KEY_1: 'protocol.https.allow', GIT_CONFIG_VALUE_1: 'NEVER' });
+  });
+  it('real Git reads a differently cased parent pin as the pin it hardens', () => {
+    const result = spawnSync('git', ['config', '--get', 'core.hooksPath'], { cwd, encoding: 'utf8', timeout: 5000,
+      maxBuffer: 1024 * 1024, env: { ...process.env, GIT_CONFIG_COUNT: '1', GIT_CONFIG_KEY_0: 'CORE.HOOKSPATH',
+        GIT_CONFIG_VALUE_0: '/dev/null' } });
+    expect(result.stdout.trim(), result.stderr).toBe('/dev/null');
+  });
+  it('a harmless extra entry such as user.name cannot discard the pins (final audit)', () => {
+    const parent = laneGitHardeningEnv({}), at = Number(parent.GIT_CONFIG_COUNT);
+    setParent({ ...parent, GIT_CONFIG_COUNT: String(at + 1), [`GIT_CONFIG_KEY_${at}`]: 'user.name', [`GIT_CONFIG_VALUE_${at}`]: 'x' });
+    expect(Number(envOf({}).GIT_CONFIG_COUNT)).toBe(at);
+  });
+  it('GIT_GRAFT_FILE and GIT_SHALLOW_FILE pass only as /dev/null (final audit)', () => {
+    setParent({ GIT_GRAFT_FILE: '/dev/null', GIT_SHALLOW_FILE: '/dev/null' });
+    expect(envOf({})).toMatchObject({ GIT_GRAFT_FILE: '/dev/null', GIT_SHALLOW_FILE: '/dev/null' });
+    setParent({ GIT_GRAFT_FILE: '/tmp/grafts', GIT_SHALLOW_FILE: '/tmp/shallow' });
+    expect(envOf({})).not.toHaveProperty('GIT_GRAFT_FILE');
+    expect(envOf({})).not.toHaveProperty('GIT_SHALLOW_FILE');
+    // The caller may tighten (bag /dev/null passes) but never redirect.
+    expect(envOf({ GIT_GRAFT_FILE: '/dev/null' }).GIT_GRAFT_FILE).toBe('/dev/null');
+    expect(envOf({ GIT_GRAFT_FILE: '/tmp/forged' })).not.toHaveProperty('GIT_GRAFT_FILE');
+  });
+  it.each(['', '-1', '1.5', '1x', ' 1', '1\n', '1e0', 'Infinity', '9007199254740992', '999999999'])
+    ('refuses malformed or impossible ambient count %j before spawn', count => {
+      setParent({ GIT_CONFIG_COUNT: count, GIT_CONFIG_KEY_0: 'core.hooksPath', GIT_CONFIG_VALUE_0: '/dev/null' });
+      refused({ ...base(), inheritEnv: laneGitHardeningEnv({}) }, /ambient GIT_CONFIG/);
+      refused(claude(), /ambient GIT_CONFIG/);
+    });
+  it.each(['GIT_CONFIG_KEY_0', 'GIT_CONFIG_VALUE_0'])
+    ('refuses incomplete ambient config when %s is missing before spawn', missing => {
+      setParent({ GIT_CONFIG_COUNT: '1', GIT_CONFIG_KEY_0: 'core.hooksPath', GIT_CONFIG_VALUE_0: '/dev/null' });
+      clearEnv(missing);
+      refused({ ...base(), inheritEnv: laneGitHardeningEnv({}) }, /ambient GIT_CONFIG/);
+      refused(claude(), /ambient GIT_CONFIG/);
+    });
+  it('ignores orphan indexed entries when the ambient count is absent', () => {
+    setParent({ GIT_CONFIG_KEY_0: 'core.hooksPath', GIT_CONFIG_VALUE_0: '/dev/null' });
+    expect(configOf(envOf({}))).toEqual({});
+  });
+  it.each(['', 'core', '.name', 'core.', 'core.1x', 'co_re.name', 'core.a_b',
+    'core.hooksPath\n', 'core.hooksPath\r', 'core.hooksPath\u2028', 'core.hooksPath\u2029'])
+    ('refuses malformed ambient key %j instead of discarding a Git parse failure', key => {
+      setParent({ GIT_CONFIG_COUNT: '2', GIT_CONFIG_KEY_0: 'core.hooksPath', GIT_CONFIG_VALUE_0: '/dev/null',
+        GIT_CONFIG_KEY_1: key, GIT_CONFIG_VALUE_1: 'x' });
+      refused(base(), /ambient GIT_CONFIG/);
+    });
+  it.each(['GIT_CONFIG_KEY_1', 'GIT_CONFIG_VALUE_1'])
+    ('refuses a missing later %s even when valid hardening precedes it', missing => {
+      setParent({ GIT_CONFIG_COUNT: '2', GIT_CONFIG_KEY_0: 'core.hooksPath', GIT_CONFIG_VALUE_0: '/dev/null',
+        GIT_CONFIG_KEY_1: 'credential.helper', GIT_CONFIG_VALUE_1: '' });
+      clearEnv(missing);
+      refused(base(), /ambient GIT_CONFIG/);
+    });
+  it('malformed caller config cannot erase valid parent pins or forward a partial caller set', () => {
+    const parent = laneGitHardeningEnv({});
+    setParent(parent);
+    expect(configOf(envOf({ GIT_CONFIG_COUNT: '1x' }))).toEqual(configOf(parent));
+    expect(configOf(envOf({ GIT_CONFIG_COUNT: '2', GIT_CONFIG_KEY_0: 'protocol.allow', GIT_CONFIG_VALUE_0: 'never',
+      GIT_CONFIG_KEY_1: 'credential.helper' }))).toEqual(configOf(parent));
+  });
+  it('preserves a zero count verbatim and drops orphan indexed entries', () => {
+    setParent({ GIT_CONFIG_COUNT: '0', GIT_CONFIG_KEY_0: 'core.hooksPath', GIT_CONFIG_VALUE_0: '.githooks' });
+    expect(configOf(envOf({}))).toEqual({ GIT_CONFIG_COUNT: '0' });
+  });
+  it('caller-bag hardening pins pass (tighten-only) and cannot loosen or reorder a valid ambient set', () => {
+    const bag = laneGitHardeningEnv({});
+    expect(configOf(envOf(bag))).toEqual(configOf(bag));
+    const parent = laneHistoryProofEnv({}, { remoteProbe: true });
+    setParent(parent);
+    expect(configOf(envOf({ ...bag, GIT_CONFIG_VALUE_0: 'true' }))).toEqual(configOf(parent));
+  });
+  it('protocol.*.allow=never passes from either source; any other protocol value does not (final audit)', () => {
+    setParent({ GIT_CONFIG_COUNT: '2', GIT_CONFIG_KEY_0: 'protocol.file.allow', GIT_CONFIG_VALUE_0: 'never',
+      GIT_CONFIG_KEY_1: 'protocol.ext.allow', GIT_CONFIG_VALUE_1: 'always' });
+    expect(configOf(envOf({}))).toEqual({ GIT_CONFIG_COUNT: '1', GIT_CONFIG_KEY_0: 'protocol.file.allow', GIT_CONFIG_VALUE_0: 'never' });
+    const bagOnly = { GIT_CONFIG_COUNT: '1', GIT_CONFIG_KEY_0: 'protocol.ext.allow', GIT_CONFIG_VALUE_0: 'never' };
+    expect(configOf(envOf(bagOnly))).toMatchObject({ GIT_CONFIG_KEY_1: 'protocol.ext.allow', GIT_CONFIG_VALUE_1: 'never' });
+  });
+  it('a caller-supplied laneGitHardeningEnv() reaches the child intact (final audit)', () => {
+    const hardening = laneGitHardeningEnv({});
+    const child = envOf(hardening);
+    expect(configOf(child)).toEqual(configOf(hardening));
+    for (const key of ['GIT_TERMINAL_PROMPT', 'GIT_NO_LAZY_FETCH', 'GIT_NO_REPLACE_OBJECTS']) {
+      if (hardening[key] !== undefined) expect(child[key], key).toBe(hardening[key]);
+    }
+    // core.sshCommand with any non-pin value is still blocked, from either source.
+    const at = Number(hardening.GIT_CONFIG_COUNT);
+    const evil = { ...hardening, GIT_CONFIG_COUNT: String(at + 1), [`GIT_CONFIG_KEY_${at}`]: 'core.sshCommand', [`GIT_CONFIG_VALUE_${at}`]: '/untrusted/ssh' };
+    expect(Object.values(configOf(envOf(evil)))).not.toContain('/untrusted/ssh');
+    setParent(evil);
+    expect(Object.values(configOf(envOf({})))).not.toContain('/untrusted/ssh');
+  });
+  it('a caller pin cannot override a stricter parent value for the same key (git: later wins)', () => {
+    setParent({ GIT_CONFIG_COUNT: '1', GIT_CONFIG_KEY_0: 'protocol.https.allow', GIT_CONFIG_VALUE_0: 'never' });
+    const bag = { GIT_CONFIG_COUNT: '2', GIT_CONFIG_KEY_0: 'protocol.HTTPS.allow', GIT_CONFIG_VALUE_0: 'user',
+      GIT_CONFIG_KEY_1: 'core.hooksPath', GIT_CONFIG_VALUE_1: '/dev/null' };
+    expect(configOf(envOf(bag))).toEqual({ GIT_CONFIG_COUNT: '2',
+      GIT_CONFIG_KEY_0: 'protocol.https.allow', GIT_CONFIG_VALUE_0: 'never',
+      GIT_CONFIG_KEY_1: 'core.hooksPath', GIT_CONFIG_VALUE_1: '/dev/null' });
+  });
+  it.each([
+    ['protocol.allow', 'never', 'protocol.file.allow', 'user'],
+    ['PrOtOcOl.AlLoW', 'never', 'PrOtOcOl.file.AlLoW', 'user'],
+    ['protocol.allow', 'never', 'protocol.ext.allow', 'user'],
+    ['protocol.https.allow', 'never', 'protocol.allow', 'user'],
+    ['protocol.https.allow', 'never', 'protocol.file.allow', 'user'],
+    ...['https', 'http', 'git', 'ssh'].map(protocol => ['protocol.allow', 'never', `protocol.${protocol}.allow`, 'always']),
+  ])('caller transport exceptions cannot weaken parent %s=%s via %s=%s', (parentKey, parentValue, callerKey, callerValue) => {
+    const parent = { GIT_CONFIG_COUNT: '1', GIT_CONFIG_KEY_0: parentKey, GIT_CONFIG_VALUE_0: parentValue };
+    setParent(parent);
+    const io = seam();
+    launchAgent({ ...base(), inheritEnv: {
+      GIT_CONFIG_COUNT: '3', GIT_CONFIG_KEY_0: callerKey, GIT_CONFIG_VALUE_0: callerValue,
+      GIT_CONFIG_KEY_1: 'core.hooksPath', GIT_CONFIG_VALUE_1: '/dev/null',
+      GIT_CONFIG_KEY_2: callerKey, GIT_CONFIG_VALUE_2: callerValue,
+    } }, io);
+    const child = configOf(io.spawn.mock.calls[0][2].env);
+    expect(child).toEqual({ ...parent, GIT_CONFIG_COUNT: '2',
+      GIT_CONFIG_KEY_1: 'core.hooksPath', GIT_CONFIG_VALUE_1: '/dev/null' });
+    expect(child.GIT_CONFIG_VALUE_0).not.toBe(callerValue);
+  });
+  it('caller transport prohibitions can still tighten an inherited transport policy', () => {
+    setParent({ GIT_CONFIG_COUNT: '1', GIT_CONFIG_KEY_0: 'protocol.file.allow', GIT_CONFIG_VALUE_0: 'user' });
+    expect(configOf(envOf({ GIT_CONFIG_COUNT: '1', GIT_CONFIG_KEY_0: 'protocol.allow', GIT_CONFIG_VALUE_0: 'never' })))
+      .toEqual({ GIT_CONFIG_COUNT: '2', GIT_CONFIG_KEY_0: 'protocol.file.allow', GIT_CONFIG_VALUE_0: 'user',
+        GIT_CONFIG_KEY_1: 'protocol.allow', GIT_CONFIG_VALUE_1: 'never' });
+  });
+  it('caller remote-probe exceptions pass when the parent has no transport policy', () => {
+    const caller = laneHistoryProofEnv({}, { remoteProbe: true });
+    expect(configOf(envOf(caller))).toEqual(configOf(caller));
+  });
+  // `user` is tighter than Git's default only for file (default user). For ext (default never) and for the global
+  // protocol.allow it loosens, so it is dropped from either source; only protocol.file.allow=user is kept.
+  it.each(['protocol.ext.allow', 'protocol.allow', 'PROTOCOL.ALLOW', 'Protocol.ext.Allow', 'protocol.FILE.allow',
+    'protocol.https.allow', 'protocol.custom+x.allow'])('drops %s=user from the parent and from the caller bag', key => {
+    setParent({ GIT_CONFIG_COUNT: '1', GIT_CONFIG_KEY_0: key, GIT_CONFIG_VALUE_0: 'user' });
+    expect(configOf(envOf({}))).toEqual({});
+    clearEnv('GIT_CONFIG_COUNT');
+    expect(configOf(envOf({ GIT_CONFIG_COUNT: '1', GIT_CONFIG_KEY_0: key, GIT_CONFIG_VALUE_0: 'user' }))).toEqual({});
+  });
+  it('a parent protocol.allow=user is dropped and cannot shelter a caller protocol.ext.allow=user', () => {
+    setParent({ GIT_CONFIG_COUNT: '1', GIT_CONFIG_KEY_0: 'protocol.allow', GIT_CONFIG_VALUE_0: 'user' });
+    const io = seam();
+    launchAgent({ ...base(), inheritEnv: { GIT_CONFIG_COUNT: '2', GIT_CONFIG_KEY_0: 'protocol.ext.allow',
+      GIT_CONFIG_VALUE_0: 'user', GIT_CONFIG_KEY_1: 'core.hooksPath', GIT_CONFIG_VALUE_1: '/dev/null' } }, io);
+    expect(configOf(io.spawn.mock.calls[0][2].env)).toEqual({ GIT_CONFIG_COUNT: '1',
+      GIT_CONFIG_KEY_0: 'core.hooksPath', GIT_CONFIG_VALUE_0: '/dev/null' });
+  });
+  it('a caller protocol.ext.allow=user with no parent policy yields no GIT_CONFIG entry for ext', () => {
+    const child = configOf(envOf({ GIT_CONFIG_COUNT: '2', GIT_CONFIG_KEY_0: 'protocol.ext.allow', GIT_CONFIG_VALUE_0: 'user',
+      GIT_CONFIG_KEY_1: 'core.hooksPath', GIT_CONFIG_VALUE_1: '/dev/null' }));
+    expect(child).toEqual({ GIT_CONFIG_COUNT: '1', GIT_CONFIG_KEY_0: 'core.hooksPath', GIT_CONFIG_VALUE_0: '/dev/null' });
+    expect(Object.values(child).map(v => v.toLowerCase())).not.toContain('protocol.ext.allow');
+  });
+  it.each(['protocol.file.allow', 'PROTOCOL.file.ALLOW'])('keeps %s=user from either source (Git default for file)', key => {
+    const pair = { GIT_CONFIG_COUNT: '1', GIT_CONFIG_KEY_0: key, GIT_CONFIG_VALUE_0: 'user' };
+    expect(configOf(envOf(pair))).toEqual(pair);
+    setParent(pair);
+    expect(configOf(envOf({}))).toEqual(pair);
+  });
+  it('real Git cannot run an ext:: remote after a caller requests protocol.ext.allow=user', () => {
+    clearEnv('GIT_ALLOW_PROTOCOL');
+    const child = envOf({ GIT_CONFIG_COUNT: '1', GIT_CONFIG_KEY_0: 'protocol.ext.allow', GIT_CONFIG_VALUE_0: 'user' });
+    const result = spawnSync('git', ['ls-remote', 'ext::true'], { cwd, env: child, encoding: 'utf8', timeout: 5000,
+      maxBuffer: 1024 * 1024 });
+    expect(result.status, result.stderr).toBe(128);
+    expect(result.stderr).toContain("transport 'ext' not allowed");
+  });
+  it('real Git still refuses local transport after a caller requests a file exception', () => {
+    setParent({ GIT_CONFIG_COUNT: '1', GIT_CONFIG_KEY_0: 'protocol.allow', GIT_CONFIG_VALUE_0: 'never' });
+    clearEnv('GIT_ALLOW_PROTOCOL');
+    const child = envOf({ GIT_CONFIG_COUNT: '1', GIT_CONFIG_KEY_0: 'protocol.file.allow', GIT_CONFIG_VALUE_0: 'user' });
+    for (const env of [process.env, child]) {
+      const result = spawnSync('git', ['ls-remote', cwd], { env, encoding: 'utf8', timeout: 5000, maxBuffer: 1024 * 1024 });
+      expect(result.status, result.stderr).toBe(128);
+      expect(result.stderr).toContain("transport 'file' not allowed");
+    }
+  });
+  it('forwards unregistered ambient WE_PR_LIMIT_WE=0 and arbitrary values but drops unknown bag names', () => {
+    for (const name of ['WE_PR_LIMIT_WE', 'SEC1_ARBITRARY_UNKNOWN', 'SEC1_BAG_UNKNOWN']) clearEnv(name);
+    setParent({ WE_PR_LIMIT_WE: '0', SEC1_ARBITRARY_UNKNOWN: ' verbatim\nvalue ' });
+    expect(envOf({ SEC1_BAG_UNKNOWN: 'bag', SEC1_ARBITRARY_UNKNOWN: 'replacement' }))
+      .toMatchObject({ WE_PR_LIMIT_WE: '0', SEC1_ARBITRARY_UNKNOWN: ' verbatim\nvalue ' });
+    expect(envOf({ SEC1_BAG_UNKNOWN: 'bag' })).not.toHaveProperty('SEC1_BAG_UNKNOWN');
+  });
+  it('never forwards unregistered FOO_TOKEN or LD_FOO from either source', () => {
+    const blocked = { FOO_TOKEN: 'credential', LD_FOO: 'loader' };
+    setParent(blocked);
+    for (const env of [envOf({}), envOf(blocked)]) {
+      for (const key of Object.keys(blocked)) expect(env).not.toHaveProperty(key);
+    }
+  });
+});
+
+describe('final audit: transport allowlist and bag-only limits', () => {
+  const envOf = inheritEnv => buildAgentInvocation({ ...base(), ...(inheritEnv ? { inheritEnv } : {}) }, seam()).options.env;
+  it('forwards the parent GIT_ALLOW_PROTOCOL and ignores a caller value that could add ext', () => {
+    vi.stubEnv('GIT_ALLOW_PROTOCOL', 'https');
+    expect(envOf({ GIT_ALLOW_PROTOCOL: 'https:ext' }).GIT_ALLOW_PROTOCOL).toBe('https');
+    clearEnv('GIT_ALLOW_PROTOCOL');
+    expect(envOf({ GIT_ALLOW_PROTOCOL: 'ext' })).not.toHaveProperty('GIT_ALLOW_PROTOCOL');
+  });
+  it('rejects positive bag-only limits without a configured ceiling while preserving strict zero', () => {
+    expect(envOf({ WE_GH_THROTTLE_CAP: '3' })).not.toHaveProperty('WE_GH_THROTTLE_CAP');
+    expect(envOf({ WE_GH_THROTTLE_WRITE_BUDGET_PER_MIN: '1' })).not.toHaveProperty('WE_GH_THROTTLE_WRITE_BUDGET_PER_MIN');
+    expect(envOf({ WE_TMP_LEAK_MAX: '0' }).WE_TMP_LEAK_MAX).toBe('0');
+    vi.stubEnv('WE_GH_THROTTLE_CAP', '8');
+    expect(envOf({ WE_GH_THROTTLE_CAP: '3' }).WE_GH_THROTTLE_CAP).toBe('3');
+    expect(envOf({ WE_GH_THROTTLE_CAP: '20' }).WE_GH_THROTTLE_CAP).toBe('8');
+  });
+});

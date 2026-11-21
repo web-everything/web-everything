@@ -750,18 +750,34 @@ describe('standalone task types and workers', () => {
       git('init', '--quiet');
       git('-c', 'user.email=t@t', '-c', 'user.name=t', 'commit', '--quiet', '--allow-empty', '-m', 'base');
       writeFileSync(join(dir, 'task.md'), 'Return JSON.');
-      // A stand-in `codex` that records the argv it was given and answers like a finished turn.
-      writeFileSync(join(dir, 'bin', 'codex'), '#!/bin/sh\nprintf "%s\\n" "$@" > "$ARGV_OUT"\nprev=""\n'
-        + 'for a in "$@"; do [ "$prev" = "-o" ] && printf "{}" > "$a"; prev="$a"; done\ncat > /dev/null\n'
-        + 'echo \'{"type":"turn.completed"}\'\n', { mode: 0o755 });
+      // Keep fixture output out of the child env: unknown ARGV_OUT is deliberately not forwarded.
+      const argvOut = join(dir, 'argv.txt');
+      const binary = join(dir, 'bin', 'codex');
+      writeFileSync(binary, `#!${process.execPath}
+        const { writeFileSync } = require('node:fs');
+        const args = process.argv.slice(2);
+        writeFileSync(${JSON.stringify(argvOut)}, args.join('\\n'));
+        writeFileSync(args[args.indexOf('-o') + 1], '{}');
+        process.stdin.resume();
+        process.stdin.on('end', () => console.log('{"type":"turn.completed"}'));
+      `, { mode: 0o755 });
+      // CLI fixtures supply binary-lookup filesystem evidence, as direct-task's CLI tests do.
+      // Production still ignores PATH when selecting the agent binary.
+      const preload = join(dir, 'binary-lookup.mjs');
+      writeFileSync(preload, `import fs from 'node:fs';
+        import { syncBuiltinESMExports } from 'node:module';
+        const original = fs.realpathSync;
+        fs.realpathSync = Object.assign((file, ...args) => file === '/usr/bin/codex'
+          ? ${JSON.stringify(binary)} : original(file, ...args), original);
+        syncBuiltinESMExports();`);
       const worker = { ...codex, model: 'gpt-6.1-sol', effort: 'low', taskType: 'prepare' };
       const argv = lightWorkerArgv({ worker, lanePath: '/lanes/22', taskFile: join(dir, 'task.md'), card: 1 })
         .map(a => a === '/lanes/22/scripts/codex-direct-task.mjs' ? resolve('scripts/codex-direct-task.mjs')
           : a === '--dir=/lanes/22' ? `--dir=${join(dir, 'lane')}` : a);
-      execFileSync(process.execPath, argv, { stdio: 'ignore', timeout: 60_000, env: { ...process.env,
-        PATH: `${join(dir, 'bin')}:${process.env.PATH}`, ARGV_OUT: join(dir, 'argv.txt'), CODEX_HOME: join(dir, 'codex-home'),
+      execFileSync(process.execPath, ['--import', preload, ...argv], { stdio: 'pipe', timeout: 60_000, env: { ...process.env,
+        CODEX_HOME: join(dir, 'codex-home'),
         WE_CODEX_USAGE_LEDGER: join(dir, 'usage.jsonl'), CONVEYOR_STATE_ROOT: join(dir, 'state') } });
-      const seen = readFileSync(join(dir, 'argv.txt'), 'utf8').split('\n');
+      const seen = readFileSync(argvOut, 'utf8').split('\n');
       expect(seen[seen.indexOf('-s') + 1]).toBe('read-only');
       expect(seen).toEqual(expect.arrayContaining(['-m', 'gpt-6.1-sol']));
       expect(seen.join(' ')).not.toMatch(/network_access|writable_roots/);

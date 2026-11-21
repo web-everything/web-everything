@@ -95,6 +95,8 @@ it.each(['codex', 'agy-gemini'].flatMap(provider =>
     const work = ${execName}({ dir: ${JSON.stringify(dir)}, task: 'inert test',
       model: ${JSON.stringify(provider === 'codex' ? 'gpt-5.4' : 'gemini-4-argon-high')}, effort: 'high',
       review: true, timeoutMs: 60000, stream: false, logFile: ${JSON.stringify(join(tmp, 'model.log'))},
+      // Binary lookup is a separate boundary from spawning in the closed-grammar launcher.
+      ${provider === 'codex' ? 'resolveBinaryFn: () => process.execPath,' : ''}
       spawnFn: (_cli, _argv, opts) => spawn(process.execPath,
         ['--input-type=module', '-e', ${JSON.stringify(modelCode)}], opts) });
     writeFileSync(${JSON.stringify(wrapperReady)}, String(process.pid)); await work;
