@@ -6,7 +6,9 @@
  */
 import { readFileSync } from 'node:fs';
 import { cascadePolicy } from './policy-cascade.mjs';
-import { DEFAULT_SELECTION } from './related-test-selection.mjs';
+
+// Tracer defaults belong here so shadow tracing leaves the production selector unchanged.
+const DEFAULT_SELECTION = { trace: { enabled: true, maxEdgesPerTest: 5000 } };
 
 /** Invalid leaves retain the lower layer. Returns `{ trace: { enabled, maxEdgesPerTest } }`. */
 export function loadCiSelection({ env = process.env, readFile = readFileSync, tool, platform, log } = {}) {

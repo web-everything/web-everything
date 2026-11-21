@@ -23,9 +23,6 @@
  * the caller injects the file list and a reader.
  */
 
-/** Standard values for the shadow dependency tracer only; it never changes selection. Configured values: ci-selection-settings.mjs. */
-export const DEFAULT_SELECTION = { trace: { enabled: true, maxEdgesPerTest: 5000 } };
-
 // `from '<spec>'` is matched on its own, not anchored to its `import {`: a multi-line import list can hold a comment
 // with a quote or `;` in it. A stray match in a comment or string only ADDS an edge (more tests), never drops one.
 const SPECIFIER_RE = /\bfrom\s*['"]([^'"\n]+)['"]|\bimport\s*\(\s*['"]([^'"\n]+)['"]\s*\)|\bimport\s+['"]([^'"\n]+)['"]|\b(?:require|mock|doMock|unmock|doUnmock|importActual|importMock)\s*\(\s*['"]([^'"\n]+)['"]|\bimport\s*\(\s*`([^`$\n]+)/g;
