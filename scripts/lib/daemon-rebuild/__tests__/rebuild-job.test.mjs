@@ -565,17 +565,18 @@ const requiredCases = [
   ...requiredPaths(completeState()).map(path => ['state', path]),
   ...requiredPaths(completeReady()).map(path => ['ready', path]),
 ].flatMap(([kind, path]) => {
-  const optional = kind === 'state' && (
+  const optional = (kind === 'ready' && path.length === 1 && path[0] === 'forced') // legacy ready records omit forced
+    || (kind === 'state' && (
     (path[0] === 'pinnedNotified' && path.length > 1)
     || (path[0] === 'rejected' && ['retryAt', 'attempts', 'harnessBroken', 'externalOnly', 'envLoad', 'dispatchSmoke'].includes(path[1]))
     || (path[0] === 'held' && ['retryAt', 'attempts'].includes(path[1])) // legacy env-timeout holds have no retryAt
     || (['adopted', 'inProgress'].includes(path[0]) && ['inputsKey', 'mainSha'].includes(path[1])) // head-only force rollback has no plan keys
     || (path[0] === 'inProgress' && path[1] === 'verified') // pre-smoke-before-reset records omit the marker
-    || (path[0] === 'building' && path[1] === 'adoptOnly')); // legacy lease shape: written only for adopt-only leases
+    || (path[0] === 'building' && path[1] === 'adoptOnly'))); // legacy lease shape: written only for adopt-only leases
   return (optional ? ['wrong-type'] : ['missing', 'wrong-type']).map(mode => [kind, path.join('.'), mode]);
 });
 
-it.each(requiredCases)('%s required field %s %s refuses without changing evidence', async (kind, dotted, mode) => {
+it.each(requiredCases)('%s persisted field %s %s refuses without changing evidence', async (kind, dotted, mode) => {
   const env = { WE_DAEMON_STATE_DIR: join(root, 'state') };
   mkdirSync(env.WE_DAEMON_STATE_DIR);
   const value = kind === 'state' ? completeState() : completeReady();
@@ -595,6 +596,27 @@ it.each(requiredCases)('%s required field %s %s refuses without changing evidenc
   expect(adopt).not.toHaveBeenCalled(); expect(reattach).not.toHaveBeenCalled();
   expect(readFileSync(file, 'utf8')).toBe(bytes);
   expect(nodeFs.existsSync(store.dir)).toBe(false);
+});
+
+it.each(['candidate', 'fallback'])('legacy ready %s without forced reaches launch admission without rewriting evidence', async kind => {
+  const env = { WE_DAEMON_STATE_DIR: join(root, 'state') };
+  mkdirSync(env.WE_DAEMON_STATE_DIR);
+  const ready = { ...completeReady(), kind };
+  delete ready.forced;
+  const file = readyCandidatePath(root, env);
+  const bytes = JSON.stringify(ready, null, 2) + '\n';
+  writeFileSync(file, bytes); // Bypass the current writer, which always supplies forced:false.
+  const adopt = vi.fn(async () => ({ reason: 'needs-build' }));
+  const reattach = vi.fn(); const evict = vi.fn();
+  const store = createJobStore(join(root, 'jobs'));
+  const result = await rebuildCloneAsJob({ root, env, store, launchOnly: true, adopt, reattach, evict, log: { error() {} } });
+  expect(result.reason).toBe('ready-pending');
+  expect(adopt).toHaveBeenCalledTimes(1);
+  expect(adopt).toHaveBeenCalledWith({ readyOnly: true,
+    admissionEvidence: { state: expect.any(Object), ready: { ...ready, forced: false } } });
+  expect(reattach).not.toHaveBeenCalled();
+  expect(store.list().records).toHaveLength(0);
+  expect(readFileSync(file, 'utf8')).toBe(bytes);
 });
 
 it('complete declared state and ready schemas are admitted without coercion', () => {
