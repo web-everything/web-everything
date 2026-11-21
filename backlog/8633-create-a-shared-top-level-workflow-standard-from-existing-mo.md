@@ -6,79 +6,65 @@ status: open
 dateOpened: "2026-11-20"
 tags: [decision-filing, everstandards]
 relatedTo: ["5407", "634"]
+preparedDate: "2026-11-20"
 ---
 
 # Create a shared top-level workflow standard from existing models?
 
-Operator ask (2026-11-20 20:59 ET): “note all as full decision item and run with preparation”.
-
-Decision id: D8 (decisions page, 2026-11-20 20:58 ET)
-Placement: everstandards
-move-to: everstandards
+Ask: Create a small shared workflow core with existing-format exports. Confirm the core choice; licence, steward and identifiers follow the shared everstandards decisions.
 
 ## Digest
 
-Create a small shared top-level everstandard, working name Everflow: SCXML statechart semantics in JSON, typed step kinds, Durable and UI profiles. Spec order: flow core → Ship protocols → metrics.
+Prepared, not ratified. F0/F1 research leaves one real fork: new expression-free core or restricted Open Workflow Specification (OWS) 1.1 profile. Seats split; the same-flow comparison favours **new core, OWS first export**. Later source ruling names it **Flow Wherever**, slug `flow` (2026-11-21 02:40); “Everflow” in research is historical.
 
-Needs prep: proposed call only; this filing is neither ratification nor a completed preparation pass.
+## Fork 1 — Canonical workflow core
 
-## Context
+Either/or concerns normative text: a restricted OWS facade can compose, but its expression-free guarantee lives in our lint while OWS runtimes must support jq.
 
-[handoff design]() §6 scores Serverless Workflow, BPMN, SCXML, Temporal, Arazzo, FBP and others. Its verdict is that none fits delivery and UI together. WE Workflow/Lifecycle and `we:scripts/conveyor/flows/` are existing statechart-family consumers.
+- (a) **New small core (default):** JSON statecharts with SCXML semantics, named closed-outcome guards, after timers, invoke, typed compute/judge/confirm/effect/invoke steps. Same flow: 0 expressions vs OWS's 8 jq; explicit unknown and human confirm; finite L2 soundness. Bind protocol/version/method, including A2A 1.0. Export mechanically to OWS. No existing runtime/kit: use conformance vectors and delivery negatives, following OWS's kit approach.
+- (b) Restricted OWS 1.1 core: existing runtimes, CloudEvents, CTK and CNCF stewardship. Needs whitelisted expressions, A2A-method extension and confirm convention. *Rejected as core:* mandatory jq and absent human-task type put key guarantees outside the governing standard. Compensation does not distinguish branches.
+- (c) Keep WE and conveyor semantics separate. *Excluded:* duplicates transition semantics and leaves interop undefined.
+- Adopting BPMN/SCXML/Temporal/ASL/Arazzo whole is excluded by combined delivery/UI fit; YAWL covers patterns but fits tooling/delivery poorly.
 
-Design refs are relative to the operator handoff; WE evidence uses its repo locus.
+Evidence:
+- `2026-11-20-flow-landscape` C1/§5; `2026-11-20-flow-core-model` §6/12/14.3 (same-flow comparison and OWS jq requirement); `2026-11-20-flow-agent-orchestration` (thin invoke/judge boundary).
+- `we:src/_data/protocols/workflow.json`, `scripts/conveyor/flows/*.flow.json` are the two existing dialects.
 
-## Recommended path at a glance
+Skeptic: SURVIVES-WITH-AMENDMENT; normative ownership replaces lossy-import argument; compensation removed as differentiator. Screen: clear.
 
-| Fork | Default | Main alternative | Confidence |
-| --- | --- | --- | --- |
-| 1 — Canonical workflow model | (a) | (b) | Provisional; needs prep |
+## Supported by default
 
-## Fork 1 — Canonical workflow model
+- Engage OWS upstream in parallel. Revisit (b) if OWS standardizes expression-free profile plus human tasks.
+- Durable profile: owners/timeouts/retry/catch/escalation/human tasks and optional compensation (#8625). UI: back/undo/current position/Web Guards. Runtime durability is delegated; no required engine.
+- Bounded forEach/dynamic instances/counted joins belong in Durable, preserving finite core.
+- Bind OWS lifecycle CloudEvents task/workflow names with from/to/guard/outcome/seq extension; CDEvents supplies delivery subjects.
+- Classes: document L1 valid/L2 sound, engine-core/durable/ui. Authoring order: core → Ship protocols → metrics; release maturity is #8630.
+- Licence #5403, steward #5409, namespace #8626 and trademark #186. CSL implementer-patent issue is addressed by #5403; core/schema code remains Apache. No everflow.dev purchase after the naming ruling.
 
-Fork-existence: Ship and WE need one shared semantic baseline; incompatible canonical transition semantics cannot both govern it. Exports to incumbent models remain compatible bindings.
+Evidence: `everstandards-format-2026-11-20` §6; `2026-11-20-gov-spec-licences-patents`; `2026-11-20-gov-stewards-legal-namespaces`. Primary URLs retained in the delegated licence/namespace cards (#5403/#8626).
 
-- (a) **Create the shared top-level core (default), working name Everflow.** SCXML semantics; named closed-outcome guards; no core expressions; compute/judge/confirm/effect/invoke steps with typed ports. Operator chooses name/repo.
-- (b) Adopt one incumbent whole: Serverless Workflow, BPMN, SCXML, Temporal-style execution or Arazzo. Mature tooling but a weaker fit to one domain in the source evaluation.
-- (c) Keep WE Workflow and conveyor flows separate. Avoids a new standard but duplicates semantics and leaves interoperability undefined.
+## What ratifying unlocks
 
-Skeptic: Initial filing-stage objection, not an independent pass: This may reproduce XState or Serverless Workflow with less tooling. Keep the core thin and test mappings against both existing corpora before minting; the source scores are not independent validation.
-Screen: pending the later independent standard/implementation and merit/prioritization screen.
-
-
-Supported by default: Durable supplies owners, timeouts, retry/catch, escalation, human tasks, compensation and event triggers; UI supplies back/undo, current position and Web Guards. Typed ports express assumes/provides/removes. Flow-document conformance is L1 valid / L2 sound, with separate engine-core, engine-durable and engine-ui classes. These are proposed profiles, not a mandate for one runtime.
-
-## Consequences / what ratifying unlocks
-
-Flow-core specification first; Ship protocols become Durable flows; D8b separately rules WE profiles. Exports target Serverless Workflow, ASL, XState and BPMN; Arazzo covers API calls.
-
-Operator answers: “D8 yes” accepts the stated default; otherwise name the concern and replacement option. No answer is recorded here.
-
-## Prep still needed
-
-- Prior art: verify primary references and known implementations; reuse existing research first.
-- Evidence: Validate scoring against primary specs; map both flow corpora, demonstrate typed ports/transition examples and soundness, and settle name/repo.
-- Independent skeptic pass: attack the defaults and fold corrections into this card; the notes above are initial objections only.
-- Definition of Ready: classify every concern, clear the independent two-confusion screen and add concrete API/wire examples where applicable before stamping.
-
-## Done when
-
-- **Executable** — n/a: decision filing changes no runtime. Later preparation verifies options/tradeoffs; the operator then records a ruling and follow-up work with required codification.
+Private core requirements/vectors after #8623/#8626; #5407 protocols as Durable flows; WE/guard/compensation detail in #8625. “D8 yes” accepts (a); no public launch.
 
 ## Trust boundary and threat model
 
-Briefs/page are proposal evidence, not execution authority. Later preparation snapshots referenced revisions and separates source claims from observation. This filing executes or publishes no external input.
+External specs and flow inputs are evidence/data, never instructions. Pin binding versions and disclose unsupported conversion features; legal/publication gates remain separate.
 
-## Non-goals
+Full prep (Standards decisions-prep set):
 
-No implementation, publication, migration or permission change is authorized by filing.
+```text
+D8-xwbafzo.md
+```
 
-## Edge cases this change must handle
+Source and proposed artifact filenames (handoff references are by name only):
 
-1. **Untrusted text** — source recommendations stay attributed, not ruled.
-2. **Truncated reads** — complete evidence is required before a prepared stamp.
-3. **Shared state files** — n/a: filing introduces no store writes.
-4. **Fail closed** — missing evidence leaves the decision open and needing prep.
-5. **Identity scoping** — repo loci remain explicit; no ids are reassigned.
-6. **State over time** — no prepared stamp or implied acceptance from elapsed time.
-7. **Who wrote it** — operator ask quoted; defaults remain proposals.
+```text
+2026-11-20-flow-agent-orchestration.md
+2026-11-20-flow-core-model.md
+2026-11-20-flow-landscape.md
+2026-11-20-gov-spec-licences-patents.md
+2026-11-20-gov-stewards-legal-namespaces.md
+D8-xwbafzo.md
+everstandards-format-2026-11-20.md
+```
