@@ -730,15 +730,16 @@ describe('carbon shadow seat vs the agy-gemini live seat cap (R1062a)', () => {
     const calls = [];
     const rows = [];
     const logs = [];
+    const reserved = [];
     try {
       const out = await runSeatWithProvider({ ...REQUEST, seatProvider: { mode, model, seat: 'correctness', pr: 7, repo: 'o/r', ...extra } }, io({
         claudeJudge: async () => judgeOutcome({ summary: 'c', findings: [FINDING] }, { sessionId: 'claude-s' }),
         agyJuror: async (o) => { calls.push(o); return { status: 'ok', sessionId: 'agy-s', value: { summary: 'a', findings: [FINDING] } }; },
         appendRow: (row) => { rows.push(row); return true; },
         log: (m) => logs.push(String(m)),
-        reserveSession: extra.dailyCap === undefined ? undefined : () => ({ allowed: false, reason: 'daily cap' }),
+        reserveSession: (a) => { reserved.push(a.dailyCap); return extra.dailyCap === 1 ? { allowed: false, reason: 'daily cap' } : { allowed: true }; },
       }));
-      return { out, calls, rows, logs };
+      return { out, calls, rows, logs, reserved };
     } finally { vi.unstubAllEnvs(); }
   };
 
@@ -767,5 +768,14 @@ describe('carbon shadow seat vs the agy-gemini live seat cap (R1062a)', () => {
   it('the carbon shadow daily cap is still enforced', async () => {
     const { calls } = await run('shadow', 'gemini-4-carbon-high', { WE_REVIEW_SEAT_CAP_CARBON_SHADOW: '5' }, { dailyCap: 1 });
     expect(calls).toHaveLength(0);
+  });
+  it.each([undefined, -1, 'x', 1.5, null])('an absent or invalid directive dailyCap (%s) falls back to a bounded 100/day, never unlimited', async (dailyCap) => {
+    const { calls, reserved } = await run('shadow', 'gemini-4-carbon-high', { WE_REVIEW_SEAT_CAP_CARBON_SHADOW: '5' }, { dailyCap });
+    expect(reserved).toEqual([100]);
+    expect(calls).toHaveLength(1);
+  });
+  it('a valid directive dailyCap is used as given', async () => {
+    const { reserved } = await run('shadow', 'gemini-4-carbon-high', { WE_REVIEW_SEAT_CAP_CARBON_SHADOW: '5' }, { dailyCap: 7 });
+    expect(reserved).toEqual([7]);
   });
 });

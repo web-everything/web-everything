@@ -29,7 +29,9 @@ import { reserveShadowSession } from '../lib/review-shadow-budget.mjs';
 import { logReviewSeat } from '../lib/review-seat-provider.mjs';
 
 /** The closed set of directive modes this runner accepts. */
-export const SEAT_RUN_MODES = Object.freeze(['agy', 'shadow']);
+/** The settings default for a Carbon shadow's daily cap (review-seat-settings standard shadowPolicy.dailyCap). */
+const CARBON_SHADOW_DEFAULT_DAILY_CAP = 100;
+export const SEAT_RUN_MODES =Object.freeze(['agy', 'shadow']);
 
 /**
  * @param {object} request - the judge request, INCLUDING its `seatProvider` directive.
@@ -78,8 +80,12 @@ export async function runSeatWithProvider(request, {
       logReviewSeat(log, `review-seat: agy skipped: ${reason}`);
       return { status: 'skipped', reasons: [reason] };
     }
-    if (directive.mode === 'shadow' && directive.dailyCap !== undefined) {
-      const admission = reserveSession({ dailyCap: directive.dailyCap, now: now() });
+    // A Carbon shadow is bounded by its daily cap now that the live cap no longer is: an absent or invalid
+    // directive cap falls back to the settings default (100/day), never to unlimited.
+    const shadowCap = carbonShadow && !(Number.isSafeInteger(directive.dailyCap) && directive.dailyCap >= 0)
+      ? CARBON_SHADOW_DEFAULT_DAILY_CAP : directive.dailyCap;
+    if (directive.mode === 'shadow' && shadowCap !== undefined) {
+      const admission = reserveSession({ dailyCap: shadowCap, now: now() });
       if (!admission.allowed) {
         logReviewSeat(log, `review-seat: agy shadow skipped: ${admission.reason}`);
         return { status: 'skipped', reasons: [admission.reason] };
