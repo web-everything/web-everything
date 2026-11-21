@@ -5,6 +5,7 @@
  * `red-team-gate.mjs#gateRoundCap`). After a proven grant the red-team gate re-runs on the PR, so a break it parked at
  * the cap is sent back to the fixer when the grant covers the current round.
  */
+import { refuseDirectEntry } from '../lib/direct-entry-guard.mjs';
 import { op } from './registry.mjs';
 import { compute, effect as effectStep } from './step-kinds.mjs';
 import { OPERATOR_LOGINS, JUDGE_ACTOR } from '../lib/marker-authorship.mjs';
@@ -63,3 +64,5 @@ export function extendRoundsOperation({ readExtensionContext } = {}) {
     }),
   });
 }
+
+refuseDirectEntry(import.meta.url, EXTEND_ROUNDS_OP, 'node scripts/operations/run.mjs extend-rounds');
