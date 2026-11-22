@@ -50,16 +50,18 @@ test('invalid, short, and newline-suffixed heads are ignored', () => {
 });
 test('mode parsing uses shadow file default, env override, and invalid -> off', () => {
   const config = { mode: 'shadow', maxPerTick: 1, maxAttemptsPerHead: 2 };
-  const read = () => JSON.stringify(config);
+  const file = value => JSON.stringify({ reviewAutoAudit: value });
+  const read = () => file(config);
   assert.equal(readAutoAuditMode({}, read), 'shadow');
   assert.equal(readAutoAuditMode(), 'shadow');
   for (const mode of ['off', 'shadow', 'on']) {
-    assert.equal(readAutoAuditMode({}, () => JSON.stringify({ ...config, mode })), mode);
+    assert.equal(readAutoAuditMode({}, () => file({ ...config, mode })), mode);
     assert.equal(readAutoAuditMode({ WE_REVIEW_AUTO_AUDIT_MODE: mode }, read), mode);
   }
   for (const value of ['', 'ON', 'invalid']) assert.equal(readAutoAuditMode({ WE_REVIEW_AUTO_AUDIT_MODE: value }, read), 'off');
-  for (const value of ['{', '{}', 'null', JSON.stringify({ ...config, mode: 'bad' }),
-    JSON.stringify({ ...config, maxPerTick: 0 }), JSON.stringify({ ...config, maxAttemptsPerHead: 1.5 })]) {
+  // The flat (pre-namespace) shape collides with other settings files' `mode` and must fail closed.
+  for (const value of ['{', '{}', 'null', file(null), file('shadow'), JSON.stringify(config), file({ ...config, mode: 'bad' }),
+    file({ ...config, maxPerTick: 0 }), file({ ...config, maxAttemptsPerHead: 1.5 })]) {
     assert.equal(readAutoAuditMode({}, () => value), 'off');
   }
   assert.equal(readAutoAuditMode({}, () => { throw Error('unreadable'); }), 'off');

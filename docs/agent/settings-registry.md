@@ -17,7 +17,7 @@ For repo defaults, edit the owner file through a PR and rebuild the consuming da
 ## Summary
 
 - Top-level keys: 164 (166 declaration rows).
-- Declared leaves: 593 (platform copies counted separately).
+- Declared leaves: 595 (platform copies counted separately).
 - Instant top-level keys: 0; not instant: 164.
 - Instant capacity leaves: 15.
 - Constants to settle: 312.
@@ -107,6 +107,7 @@ Operator-prefs layer: ~/.plateau/platform-preferences.json is the requested oper
 | enabled | scripts/settings/review-red-team-on-skip.json | 1 | true | pr | no | Enable recovery of missing red-team results on reviewed heads. |
 | enforce | scripts/settings/claude-accounts.json | 1 | false | pr | no | Enable Claude daemon account enforcement. |
 | entries | scripts/settings/privacy-terms-allowlist.json | 1 | [{"path":"scripts/lib/__tests__/daemon-jobs-runtime.test.mj… | pr | no | Explicit portability exceptions pinned to matched text and line hashes. |
+| expectations | scripts/settings/expectations.json | 1 | [{"id":"ready-no-gate","after":["clear-human","ready-to-mer… | pr | no | Observe-only PR expectation triggers, deadlines and proposed responses; responses are recorded but never executed. |
 | expectedLocalReasons | scripts/settings/forge-share.json | 1 | ["command-not-allowed","needs-git"] | pr | no | Local execution reasons excluded from remote-share warnings. |
 | externalJurors | scripts/settings/review.json | 2 | {"firstOutputMs":120000,"cooldownMs":1800000} | pr | no | First-output timeout and cooldown for external review jurors. |
 | fix | scripts/settings/fix-context-pack.json, scripts/settings/fix-safety.json, scripts/settings/fix.json | 18 | {"contextPack":true,"contextLines":30,"contextMaxBytes":800… | pr | no | Fix context, local verification, round limits and exception policy. |
@@ -135,10 +136,8 @@ Operator-prefs layer: ~/.plateau/platform-preferences.json is the requested oper
 | loadGovernor | scripts/settings/load-governor.json | 10 | {"enabled":true,"targetLoadPerCore":2,"resumeBelowPerCore":… | pr | no | Host load targets, pause priorities and resumption thresholds. |
 | loaderCli | scripts/settings/prototype-load.json | 1 | "scripts/daemon-overlay.mjs" | pr | no | CLI used to load daemon overlays. |
 | mainFixCapacity | scripts/settings/main-fix-capacity.json | 1 | {"pastFixCap":true} | pr | no | Allow main-fix work beyond the ordinary fix cap. |
-| maxAttemptsPerHead | scripts/settings/review-auto-audit.json | 1 | 2 | pr | no | Reserved per-head audit attempt limit for later audit-on-ready execution slices. |
 | maxLiveReviewRounds | scripts/settings/review-concurrency.json | 1 | 8 | pr | no | Maximum concurrent host review rounds. |
 | maxLoadPerCore | scripts/dispatch-settings.json | 1 | 2 | pr | no | Host load ceiling per CPU core for dispatch admission. |
-| maxPerTick | scripts/settings/review-auto-audit.json | 1 | 1 | pr | no | Reserved per-tick audit dispatch limit for later audit-on-ready execution slices. |
 | maxSize | scripts/settings/agy-build.json | 1 | 1 | env | no | Maximum direct confined agy build size for any kind; repair dispatch remains size 1. |
 | memFreeMinPct | scripts/dispatch-settings.json | 1 | 15 | pr | no | Minimum free memory percentage for dispatch admission. |
 | mergeDelivery | scripts/lib/delivery-platform-preferences.json | 5 | {"strategy":"drain-direct","batchSize":3,"maxGroupWaitMinut… | pr | no | Merge strategy, batch size, wait time and call concurrency. |
@@ -148,7 +147,7 @@ Operator-prefs layer: ~/.plateau/platform-preferences.json is the requested oper
 | mergeQueue | scripts/settings/approved-human-surface-hold.json, scripts/settings/human-only-enqueue.json, scripts/settings/merge-queue-numbering.json, scripts/settings/merge-queue-obsolete-runs.json, scripts/settings/merge-queue-refresh.json, scripts/settings/merge-queue.json | 31 | {"skipRebaseApprovedHumanSurface":"on","humanOnly":{"approv… | pr | no | Enqueue, human approval, card numbering and obsolete-run cancellation policy. |
 | mergeQueueBatching | scripts/settings/merge-queue-batching.json | 3 | {"enabled":true,"groupSize":3,"maxGroupsInFlight":8} | pr | no | Merge queue group size and groups in flight. |
 | minNonClaudeSeats | scripts/settings/review.json | 1 | 1 | pr | no | Minimum number of non-Claude review seats. |
-| mode | scripts/settings/review-auto-audit.json | 1 | "shadow" | pr | no | Audit-on-ready observation mode (shadow or on); both only log audit debt without dispatching in slice S1.1. |
+| mode | scripts/settings/expectations.json | 1 | "observe" | env | no | Expectation babysitter mode: off or observe. WE_EXPECTATIONS_MODE overrides the repository default. |
 | modes | scripts/settings/delivery-routes.json | 4 | {"debug":"DEBUG MODE (R817/R823/R826/R852). Diagnose on the… | pr | no | Instructions defining the available delivery modes. |
 | openPrCap | scripts/settings/open-pr-cap.json | 2 | {"excludeCardOnly":true,"excludeAccepted":true} | pr | no | Population exclusions for the open PR cap. |
 | operatorCli | scripts/settings/operator-cli.json | 1 | {"freshFallback":"on"} | pr | no | Allow a fresh operator CLI fallback. |
@@ -186,6 +185,7 @@ Operator-prefs layer: ~/.plateau/platform-preferences.json is the requested oper
 | requiredChecksCache | scripts/settings/required-checks-cache.json | 1 | {"ttlMinutes":15} | pr | no | Lifetime of cached required-status-check reads. |
 | retryCooldownMin | scripts/settings/review-red-team-on-skip.json | 1 | 30 | pr | no | Cooldown in minutes between missing red-team recovery attempts. |
 | review | scripts/settings/human-clearance-carry.json, scripts/settings/identical-net-patch.json, scripts/settings/numbering-human-clearance.json, scripts/settings/review-precedents.json | 8 | {"humanClearanceCarryForward":true,"carryEquivalence":"cont… | pr | no | Review equivalence, human clearance and precedent policy. |
+| reviewAutoAudit | scripts/settings/review-auto-audit.json | 3 | {"mode":"shadow","maxPerTick":1,"maxAttemptsPerHead":2} | pr | no | Audit-on-ready mode (off, shadow or on; S1.1 only logs audit debt) plus reserved per-tick and per-head limits. WE_REVIEW_AUTO_AUDIT_MODE overrides mode. |
 | reviewChurn | scripts/settings/review.json | 3 | {"sameTree":"shadow","capMode":"shadow","maxLoopsPerPr":8} | pr | no | Review churn detection and loop cap policy. |
 | reviewHeadIndex | scripts/settings/review-head-index.json | 0 | {} | pr | no | Retention and log compaction bounds for reviewed heads. |
 | reviewNoVerdictRetry | scripts/settings/review-no-verdict-retry.json | 1 | {"cooldownReleases":6} | pr | no | Bounded cooldown releases when a review verdict never lands. |

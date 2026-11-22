@@ -50,8 +50,9 @@ export function defaultAuditCheck({ repoDir }) {
 /** Invalid or unreadable configuration disables observation; only the shipped file defaults to shadow. */
 export function readAutoAuditMode(env = process.env, readFile = readFileSync) {
   try {
-    const settings = JSON.parse(readFile(SETTINGS, 'utf8'));
-    if (!settings || !MODES.has(settings.mode)
+    // Nested: every scripts/settings/*.json shares one top-level namespace, so a flat `mode` would collide.
+    const settings = JSON.parse(readFile(SETTINGS, 'utf8'))?.reviewAutoAudit;
+    if (!settings || typeof settings !== 'object' || !MODES.has(settings.mode)
       || !Number.isSafeInteger(settings.maxPerTick) || settings.maxPerTick <= 0
       || !Number.isSafeInteger(settings.maxAttemptsPerHead) || settings.maxAttemptsPerHead <= 0) return 'off';
     const mode = env.WE_REVIEW_AUTO_AUDIT_MODE ?? settings.mode;

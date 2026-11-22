@@ -1,6 +1,8 @@
 {
-  "$comment": "S1.1 observes audit debt only. Both shadow and on log without dispatching; limits are reserved for later execution slices.",
-  "mode": "shadow",
-  "maxPerTick": 1,
-  "maxAttemptsPerHead": 2
+  "$comment": "S1.1 observes audit debt only. Both shadow and on log without dispatching; limits are reserved for later execution slices. Nested under one key: scripts/settings/*.json share one top-level namespace.",
+  "reviewAutoAudit": {
+    "mode": "shadow",
+    "maxPerTick": 1,
+    "maxAttemptsPerHead": 2
+  }
 }
