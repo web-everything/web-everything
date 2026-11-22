@@ -1,0 +1,330 @@
+import { afterEach, expect, it, vi } from 'vitest';
+import { spawnSync } from 'node:child_process';
+import { pathToFileURL } from 'node:url';
+import { existsSync, readFileSync, realpathSync, rmSync, symlinkSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { dirname, join, posix, resolve } from 'node:path';
+import * as advisory from '../daemon-rebuild/advisory-merge.mjs';
+import { fixture, snapshot, DOC, CLOSURE } from './fixtures/generated-merge.mjs';
+
+const fixtures = [];
+const setup = opts => { const f = fixture(opts); fixtures.push(f); return f; };
+afterEach(() => { vi.unstubAllEnvs(); vi.restoreAllMocks(); for (const f of fixtures.splice(0)) f.cleanup(); });
+
+it('resolveAdvisoryConflicts regenerates docs/agent/settings-registry.md when both sides add a setting', () => {
+  const f = setup(), before = snapshot(f);
+  const result = advisory.resolveAdvisoryConflicts(f);
+  expect(result).toMatchObject({ ok: true, via: 'advisory-merge' });
+  expect(snapshot(f)).toEqual(before);
+  f.ok(['read-tree', '--reset', '-u', result.tree]);
+  const actual = readFileSync(join(f.root, DOC), 'utf8');
+  f.generate('--write');
+  expect(actual).toBe(readFileSync(join(f.root, DOC), 'utf8'));
+  expect(actual).toContain('"a":1');
+  expect(actual).toContain('"b":1');
+  f.generate('--check');
+});
+
+const cleanFilter = f => {
+  f.ok(['config', 'filter.probe.clean', 'printf FILTERED']);
+  f.write('.git/info/attributes', '* filter=probe\n');
+};
+
+it('stores the validated bytes even when a clean filter matches the scratch blob (in-memory)', () => {
+  const f = setup();
+  cleanFilter(f);
+  const result = advisory.resolveAdvisoryConflicts(f);
+  expect(result).toMatchObject({ ok: true });
+  const stored = f.ok(['cat-file', 'blob', `${result.tree}:${DOC}`]);
+  expect(stored).not.toBe('FILTERED');
+  expect(stored).toContain('"a":1');
+  expect(stored).toContain('"b":1');
+});
+
+it('refuses rather than stage clean-filtered bytes for a generated doc (worktree)', () => {
+  const f = setup();
+  expect(f.git(['merge', '--no-edit', 'theirs']).status).toBe(1);
+  cleanFilter(f);
+  const before = snapshot(f);
+  expect(advisory.resolveAdvisoryInWorktree({ git: f.git, cwd: f.root, commit: false })).toBe(false);
+  expect(snapshot(f)).toEqual(before);
+  expect(f.ok(['diff', '--name-only', '--diff-filter=U'])).toBe(DOC);
+});
+
+it.each([
+  ['a configured clean filter', f => cleanFilter(f)],
+  ['a merged ident attribute', f => f.write('.git/info/attributes', '*.json ident\n')],
+])('refuses rather than stage converted bytes for a non-generated advisory path (worktree, %s)', (_label, convert) => {
+  const f = setup(), TIMINGS = 'scripts/ci/test-timings.json';
+  const timings = unit => `${JSON.stringify({ _doc: 'x', unit, soak: {} }, null, 1)}\n`;
+  f.ok(['checkout', '-qb', 'tbase', 'base']);
+  // An expanded `$Id: … $` keyword is what the ident clean step collapses on `git add`.
+  f.write(TIMINGS, timings({ '$Id: x $': 1 }));
+  f.commit('timings base');
+  // Same line, different values on each side: a guaranteed textual conflict the timings merge resolves to max.
+  for (const [branch, value] of [['tours', 2], ['ttheirs', 3]]) {
+    f.ok(['checkout', '-qb', branch, 'tbase']);
+    f.write(TIMINGS, timings({ '$Id: x $': value }));
+    f.commit(branch);
+  }
+  f.ok(['checkout', '-q', 'tours']);
+  expect(f.git(['merge', '--no-edit', 'ttheirs']).status).toBe(1);
+  expect(f.ok(['diff', '--name-only', '--diff-filter=U'])).toBe(TIMINGS);
+  convert(f);
+  const before = snapshot(f);
+  expect(advisory.resolveAdvisoryInWorktree({ git: f.git, cwd: f.root })).toBe(false);
+  expect(snapshot(f)).toEqual(before);
+  expect(f.ok(['diff', '--name-only', '--diff-filter=U'])).toBe(TIMINGS);
+});
+
+it('regenerates even when TMPDIR is a symlink (generator main-module guard needs the real path)', () => {
+  const f = setup(), link = join(f.root, '..', `tmp-link-${process.pid}`);
+  symlinkSync(realpathSync(tmpdir()), link);
+  vi.stubEnv('TMPDIR', link);
+  try { expect(advisory.resolveAdvisoryConflicts(f)).toMatchObject({ ok: true }); } finally { rmSync(link, { force: true }); }
+});
+
+it('worktree variant resolves a real doc-only merge and commits', () => {
+  const f = setup();
+  expect(f.git(['merge', '--no-edit', 'theirs']).status).toBe(1);
+  expect(f.ok(['diff', '--name-only', '--diff-filter=U'])).toBe(DOC);
+  expect(advisory.resolveAdvisoryInWorktree({ git: f.git, cwd: f.root })).toBe(true);
+  expect(f.ok(['rev-parse', 'HEAD'])).not.toBe(f.cur);
+  expect(f.ok(['rev-list', '--parents', '-n', '1', 'HEAD']).split(' ')).toHaveLength(3);
+  expect(f.ok(['diff', '--name-only', '--diff-filter=U'])).toBe('');
+  f.generate('--check');
+});
+
+it.each(['ours', 'theirs'])('refuses a generated modify/delete conflict when %s deleted the doc', branch => {
+  const f = setup();
+  f.ok(['checkout', '-q', branch]);
+  rmSync(join(f.root, DOC));
+  f.commit('delete generated doc');
+  f.ovSha = f.ok(['rev-parse', 'theirs']);
+  f.ok(['checkout', '-q', 'ours']);
+  f.cur = f.ok(['rev-parse', 'HEAD']);
+  const before = snapshot(f);
+  expect(advisory.resolveAdvisoryConflicts(f)).toBeNull();
+  expect(snapshot(f)).toEqual(before);
+  expect(f.git(['merge', '--no-edit', 'theirs']).status).toBe(1);
+  const stopped = snapshot(f);
+  expect(advisory.resolveAdvisoryInWorktree({ git: f.git, cwd: f.root })).toBe(false);
+  expect(snapshot(f)).toEqual(stopped);
+});
+
+it.each(['ours', 'theirs'])('refuses a symlink doc on %s in both resolvers', branch => {
+  const f = setup();
+  f.ok(['checkout', '-q', branch]);
+  rmSync(join(f.root, DOC));
+  symlinkSync('../../source.txt', join(f.root, DOC));
+  f.commit('symlink doc');
+  f.ovSha = f.ok(['rev-parse', 'theirs']);
+  f.ok(['checkout', '-q', 'ours']);
+  f.cur = f.ok(['rev-parse', 'HEAD']);
+  const before = snapshot(f);
+  expect(advisory.resolveAdvisoryConflicts(f)).toBeNull();
+  expect(snapshot(f)).toEqual(before);
+  expect(f.git(['merge', '--no-edit', 'theirs']).status).toBe(1);
+  const stopped = snapshot(f);
+  expect(advisory.resolveAdvisoryInWorktree({ git: f.git, cwd: f.root })).toBe(false);
+  expect(snapshot(f)).toEqual(stopped);
+});
+
+it.each([0, 1, 2])('refuses unreadable generated revision %i in both resolvers', index => {
+  const f = setup(), revisions = [f.ok(['rev-parse', 'base']), f.cur, f.ovSha];
+  let blocked = `${revisions[index]}:${DOC}`;
+  const git = (args, opts) => args[0] === 'show' && args[1] === blocked
+    ? { status: 1, stdout: '' } : f.git(args, opts);
+  const before = snapshot(f);
+  expect(advisory.resolveAdvisoryConflicts({ ...f, git })).toBeNull();
+  expect(snapshot(f)).toEqual(before);
+  expect(f.git(['merge', '--no-edit', 'theirs']).status).toBe(1);
+  blocked = `:${index + 1}:${DOC}`;
+  const stopped = snapshot(f);
+  expect(advisory.resolveAdvisoryInWorktree({ git, cwd: f.root })).toBe(false);
+  expect(snapshot(f)).toEqual(stopped);
+});
+
+it('refuses a generated worktree symlink without writing through it', () => {
+  const f = setup();
+  expect(f.git(['merge', '--no-edit', 'theirs']).status).toBe(1);
+  rmSync(join(f.root, DOC));
+  symlinkSync('../../source.txt', join(f.root, DOC));
+  const before = snapshot(f);
+  expect(advisory.resolveAdvisoryInWorktree({ git: f.git, cwd: f.root })).toBe(false);
+  expect(snapshot(f)).toEqual(before);
+});
+
+it.each([true, false])('restores the conflict when a clean filter changes generated bytes (commit=%s)', commit => {
+  const f = setup();
+  expect(f.git(['merge', '--no-edit', 'theirs']).status).toBe(1);
+  f.write('.git/info/attributes', `${DOC} filter=changed\n`);
+  f.ok(['config', 'filter.changed.clean', "sed 's/^/filtered: /'"]);
+  const before = snapshot(f);
+  expect(advisory.resolveAdvisoryInWorktree({ git: f.git, cwd: f.root, commit })).toBe(false);
+  expect(snapshot(f)).toEqual(before);
+});
+
+it.each(['tree', 'commit', 'stage'])('cleanup failures do not override successful %s resolution', mode => {
+  const f = setup();
+  if (mode !== 'tree') expect(f.git(['merge', '--no-edit', 'theirs']).status).toBe(1);
+  const child = spawnSync(process.execPath, ['--input-type=module', '-e', `
+    import fs from 'node:fs';
+    import { syncBuiltinESMExports } from 'node:module';
+    import { spawnSync } from 'node:child_process';
+    const actual = fs.rmSync, failed = [], diagnostics = [];
+    const onDiagnostic = event => diagnostics.push(event);
+    fs.rmSync = (path, opts) => {
+      if (/we-(?:generated-merge|generated-index|advisory-merge)-/.test(String(path))) {
+        failed.push(path); throw Error('cleanup denied');
+      }
+      return actual(path, opts);
+    };
+    syncBuiltinESMExports();
+    const advisory = await import(${JSON.stringify(pathToFileURL(resolve('scripts/lib/daemon-rebuild/advisory-merge.mjs')).href)});
+    const git = (args, opts = {}) => spawnSync('git', args, { cwd: ${JSON.stringify(f.root)},
+      encoding: 'utf8', ...opts, env: { ...process.env, ...opts.env, GIT_CONFIG_GLOBAL: '/dev/null', GIT_CONFIG_NOSYSTEM: '1' } });
+    const result = ${mode === 'tree'
+      ? `advisory.resolveAdvisoryConflicts({ git, cur: '${f.cur}', ovSha: '${f.ovSha}', onDiagnostic })`
+      : `advisory.resolveAdvisoryInWorktree({ git, cwd: ${JSON.stringify(f.root)}, commit: ${mode === 'commit'}, onDiagnostic })`};
+    for (const path of failed) actual(path, { recursive: true, force: true });
+    console.log(JSON.stringify({ result, failures: failed.length, diagnostics }));
+  `], { encoding: 'utf8', timeout: 10000, maxBuffer: 1024 * 1024 });
+  expect(child.status, child.stderr).toBe(0);
+  const probe = JSON.parse(child.stdout);
+  expect(probe.failures).toBe(2);
+  expect(probe.diagnostics).toEqual(Array(2).fill('advisory-merge-cleanup-failed'));
+  expect(child.stderr.trim().split('\n')).toEqual(probe.diagnostics);
+  if (mode === 'tree') expect(probe.result).toMatchObject({ ok: true });
+  else {
+    expect(probe.result).toBe(true);
+    expect(f.ok(['diff', '--name-only', '--diff-filter=U'])).toBe('');
+    expect(f.ok(['rev-parse', 'HEAD']) === f.cur).toBe(mode === 'stage');
+    f.generate('--check');
+  }
+});
+
+const negatives = [
+  ['N1 input JSON conflicted', { conflict: 'scripts/settings/seed.json' }],
+  ['N2 closure module conflicted', { conflict: CLOSURE[1] }],
+  ['N3 bad metadata', {}, f => f.json('scripts/lib/settings-registry-metadata.json', {})],
+  ['N4 generator hangs and is killed', {}, f => f.write(CLOSURE[0], 'setInterval(() => {}, 1000);')], // keepalive-helper-ok: candidate generator text is never executed (closure mismatch refuses first)
+  ['N5 source conflict', { conflict: 'source.txt' }],
+  ['N6 check disagrees', {}, f => f.write(CLOSURE[0], `import {writeFileSync} from 'node:fs';
+if(process.argv.includes('--write')) writeFileSync('${DOC}', 'unchecked'); else process.exitCode=1;`)],
+  ['N7 symlink input', {}, f => { rmSync(join(f.root, 'scripts/settings/seed.json')); symlinkSync('../dispatch-settings.json', join(f.root, 'scripts/settings/seed.json')); }],
+  // Exit 23 = a GIT_* value leaked into the generator; 24 = clean env, then refuse anyway.
+  ['N8 GIT_DIR and GIT_CONFIG do not leak', {}, f => f.write(CLOSURE[0],
+    'process.exit(Object.keys(process.env).some(key => key.startsWith("GIT_")) ? 23 : 24);')],
+  ['oversized generator output refuses with manual-resolution fallback', {}, f => f.write(CLOSURE[0], `process.stdout.write('x'.repeat(2 * 1024 * 1024));`)],
+  ['non-JSON input refuses', {}, f => f.write('scripts/settings/evil.mjs', 'throw Error("must not execute");')],
+  ['candidate generator writes outside scratch and always exits zero is never executed', {}, f => f.write(CLOSURE[0],
+    `import {writeFileSync} from 'node:fs'; writeFileSync(${JSON.stringify(join(f.root, 'escaped-marker'))}, 'escaped'); writeFileSync('${DOC}', 'bogus');`)],
+  ['closure dependency drift refuses', {}, f => f.write(CLOSURE[1], '// drift')],
+  ['missing closure refuses', {}, f => rmSync(join(f.root, CLOSURE[2]))],
+  ['missing input refuses', {}, f => rmSync(join(f.root, 'scripts/lib/delivery-priority-settings.json'))],
+  ['symlink closure refuses', {}, f => { rmSync(join(f.root, CLOSURE[2])); symlinkSync('settings-files.mjs', join(f.root, CLOSURE[2])); }],
+];
+for (const [name, options, mutate] of negatives) it(`${name}: both resolvers refuse without changing index or worktree`, () => {
+  const f = setup(options);
+  if (mutate) { mutate(f); f.cur = f.commit(name); }
+  // Fault injection changes an explicitly trusted test closure as well as the candidate.
+  let trustedRoot;
+  if (/^N[468]|^oversized/.test(name)) {
+    const trusted = setup();
+    for (const path of CLOSURE) trusted.write(path, readFileSync(join(f.root, path)));
+    trustedRoot = trusted.root;
+  }
+  // Native ESM subprocesses exercise the actual builtin bindings, independently of Vitest's module cache.
+  const probe = worktree => {
+    const code = `
+      import cp from 'node:child_process';
+      import { syncBuiltinESMExports } from 'node:module';
+      const actual = cp.spawnSync, calls = [];
+      cp.spawnSync = (file, args, opts) => {
+        if (file !== process.execPath || !args[0]?.endsWith('/scripts/lib/settings-registry.mjs')) return actual(file, args, opts);
+        const result = actual(file, args, { ...opts, timeout: ${name.startsWith('N4') ? 100 : 30000} });
+        calls.push({ args, opts, result: { status: result.status, signal: result.signal, error: { code: result.error?.code } } });
+        return result;
+      };
+      syncBuiltinESMExports();
+      const advisory = await import(${JSON.stringify(pathToFileURL(resolve('scripts/lib/daemon-rebuild/advisory-merge.mjs')).href)});
+      const env = Object.fromEntries(Object.entries(process.env).filter(([key]) => !key.startsWith('GIT_')));
+      Object.assign(env, { GIT_CONFIG_GLOBAL: '/dev/null', GIT_CONFIG_NOSYSTEM: '1' });
+      const git = (args, opts = {}) => actual('git', args, { cwd: ${JSON.stringify(f.root)}, encoding: 'utf8',
+        timeout: 10000, maxBuffer: 8 * 1024 * 1024, ...opts, env: { ...env, ...opts.env } });
+      const trustedRoot = ${JSON.stringify(trustedRoot)};
+      const result = ${worktree
+        ? `advisory.resolveAdvisoryInWorktree({ git, cwd: ${JSON.stringify(f.root)}, trustedRoot })`
+        : `advisory.resolveAdvisoryConflicts({ git, cur: '${f.cur}', ovSha: '${f.ovSha}', trustedRoot })`};
+      console.log(JSON.stringify({ result, calls }));`;
+    const child = spawnSync(process.execPath, ['--input-type=module', '-e', code], {
+      encoding: 'utf8', timeout: 10000, maxBuffer: 1024 * 1024,
+      env: { ...process.env, GIT_DIR: '/untrusted/repo', GIT_CONFIG_COUNT: '1', GIT_CONFIG_KEY_0: 'alias.bad',
+        GIT_CONFIG_VALUE_0: 'bad', NODE_OPTIONS: '--no-warnings' },
+    });
+    expect(child.status, child.stderr).toBe(0);
+    return JSON.parse(child.stdout);
+  };
+  const before = snapshot(f);
+  const treeProbe = probe(false);
+  expect(treeProbe.result).toBeNull();
+  expect(snapshot(f)).toEqual(before);
+  expect(f.git(['merge', '--no-edit', 'theirs']).status).toBe(1);
+  const stopped = snapshot(f);
+  const worktreeProbe = probe(true);
+  expect(worktreeProbe.result).toBe(false);
+  expect(snapshot(f)).toEqual(stopped);
+  const generatorCalls = [...treeProbe.calls, ...worktreeProbe.calls];
+  if (/^N[3468]|^oversized/.test(name)) expect(generatorCalls.length).toBeGreaterThan(0);
+  else expect(generatorCalls).toEqual([]);
+  expect(existsSync(join(f.root, 'escaped-marker'))).toBe(false);
+  for (const { args, opts, result } of generatorCalls) {
+    expect(args[0].startsWith(f.root + '/')).toBe(false);
+    expect(opts.timeout).toBe(30000);
+    expect(opts.killSignal).toBe('SIGKILL');
+    expect(Object.keys(opts.env).sort()).toEqual(['HOME', 'PATH', 'TMPDIR'].filter(key => process.env[key] !== undefined).sort());
+    expect(opts.cwd).toBe(dirname(dirname(dirname(args[0]))));
+    expect(opts.maxBuffer).toBe(1024 * 1024);
+    if (name.startsWith('N4')) { expect(result.error?.code).toBe('ETIMEDOUT'); expect(result.signal).toBe('SIGKILL'); }
+    if (name.startsWith('N8')) expect(result.status).toBe(24);
+    if (name.startsWith('oversized')) expect(result.error?.code).toBe('ENOBUFS');
+  }
+});
+
+function closureImports(read = path => readFileSync(path, 'utf8')) {
+  const seen = new Set(), builtins = new Set();
+  const visit = path => {
+    if (seen.has(path)) return;
+    seen.add(path);
+    const text = read(path);
+    expect(text).not.toMatch(/\b(?:import|require)\s*\(/);
+    for (const match of text.matchAll(/(?:import|export)\s+(?:[^'";]*?\sfrom\s*)?['"]([^'"]+)['"]/g)) {
+      if (match[1].startsWith('node:')) {
+        expect(['node:fs', 'node:path', 'node:url', 'node:os']).toContain(match[1]);
+        builtins.add(match[1]);
+        continue;
+      }
+      expect(match[1]).toMatch(/^\./);
+      visit(posix.normalize(posix.join(posix.dirname(path), match[1])));
+    }
+  };
+  visit(CLOSURE[0]);
+  expect([...builtins].sort()).toEqual(['node:fs', 'node:os', 'node:path', 'node:url']);
+  return seen;
+}
+
+it.each(["import('node:fs')", "require('node:fs')", "import cp from 'node:child_process';"])(
+  'closure drift guard rejects %s', addition => {
+    expect(() => closureImports(path => readFileSync(path, 'utf8') + (path === CLOSURE[0] ? `\n${addition}` : ''))).toThrow();
+  });
+
+// This guard audits the daemon checkout's executable closure; candidate bytes must match it.
+it('trusted closure drift guard follows static local imports and pins the exact node builtin set', () => {
+  const seen = closureImports();
+  expect([...seen].sort()).toEqual([...advisory.GENERATED_MERGE_PATHS[DOC].closure].sort());
+  expect(advisory.GENERATED_MERGE_PATHS[DOC]).toEqual({ closure: CLOSURE,
+    inputs: ['scripts/settings/', 'scripts/dispatch-settings.json', 'scripts/lib/settings-registry-metadata.json',
+      'scripts/lib/delivery-platform-preferences.json', 'scripts/lib/delivery-priority-settings.json'], argv: ['--write'] });
+  expect(Object.isFrozen(advisory.GENERATED_MERGE_PATHS)).toBe(true);
+});

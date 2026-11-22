@@ -1110,6 +1110,12 @@ writes, so they do not replace a sibling process's records.
 
 ## Antigravity quota hold evidence
 
+The usage reader's login regression uses the raw ANSI capture in
+`scripts/operations/__tests__/fixtures/agy-login-screen.raw.txt`. With fake timers,
+assert resolution before startup, zero stdin writes, cleared timers and descendant
+cleanup: Escape or an interrupt sent as text can select a login method. Signed-out
+snapshots carry only `at` and `status`, never quota windows.
+
 Exercise holds with an injected temporary `dir` in
 `scripts/lib/__tests__/antigravity-run-evidence.test.mjs`. Explicit Claude and Gemini
 requests read their own backend folders; default or unrecognized models scan
@@ -4434,6 +4440,10 @@ mutation enters handled-ID state. Run these and the affected lock/self-sync regr
 circular dependencies: starting them together with `Promise.all` deadlocks vite-node evaluation
 before adapter construction. Keep the portable IO cases in `pr-live-owner-watch.test.mjs` at the
 default timeout; injected dispatchers and lock identity probes keep their exercised IO local.
+Load the real manual dispatcher and review job sequentially in the portable IO suite's bounded
+`beforeAll` hook. The adapter tests share that production graph, including the job-side head
+refusal cases; cold transforms must finish before the first adapter's five-second test budget
+starts. Keep assertion timeouts unchanged and do not replace the real job dispatcher with a stub.
 The fixture statically imports the real review-job module during collection and supplies it through
 `loadReviewJob`. Keep that cyclic graph out of per-test dynamic loading; the head-change cases reuse
 the same module and still exercise the production dispatchers with a fake job spawner.
@@ -5059,6 +5069,12 @@ sequentially. Keep fake executable PATH setup in `beforeAll` and all large-outpu
 assertions inside the original per-test deadlines; increasing the setup timeout does not resolve the import stall.
 ## Ready-candidate adoption during overlay churn
 
+`rebuildClone` keeps phase waits in a non-enumerable `timing` record to preserve existing result
+equality. The rebuild CLI explicitly serializes it for detached jobs; `daemon-rebuild-early-timing.test.mjs`
+checks the legacy shape and runs the actual CLI subprocess to verify timing transfer into the job result.
+Do not reconstruct CLI serialization in the test: removing the producer's timing serialization must fail it.
+Adoption latency remains in adoption state.
+
 `daemon-rebuild-ready.test.mjs` exercises adoption with real Git ancestry: newly registered
 refs and descendant advances remain pending after adoption, and the next adopt-only tick
 must return `needs-build` with a different plan. `ready-candidate-adopted-partial` is an
@@ -5073,6 +5089,91 @@ Run this file and `daemon-rebuild-events.test.mjs` through heavy admission. This
 rule does not reset overlay main-sync parking or add retries for parked overlays.
 
 
+## Static selection edges and replay (affected-only CI S1)
+
+`related-test-selection.mjs` shares forward and reverse edges for imports, aliases,
+spawned script paths and literal reads. Its source-wide path scan is conservative:
+ambiguous literal expressions can add tests. Sibling aliases retain their textual
+key and match a tracked vendored counterpart when available; they do not read sibling
+repositories. CI uses the unlimited `ci.selection.maxTestsInCi` setting; local
+`relatedMaxTests` stays caller-owned. Truncation carries `partial: true`.
+Untruncated selection retains changed-file targets for `vitest related` and adds graph-reachable
+tests: regex discovery is supplemental, never proof that all valid imports were parsed.
+Require every changed target in the tracked inventory; an absent target (including a
+committed deletion) forces the full suite.
+
+`selection-replay.mjs` compares import-only and static selection on the current tracked
+tree. PR diff test paths are only related-test proxies. Supply `--evidence=relative.json`
+with failing/related test lists to assess misses; absent evidence is labelled incomplete.
+A historical miss cannot be attributed to the parser merely because it happened:
+probe the actual imports. The current merge-gate-hold-class test is a direct importer
+and is reached even with all new static edge kinds disabled. The named test
+`preserves the observed merge-gate-hold-class direct imports, including multiple named imports`
+in `scripts/lib/__tests__/related-test-selection.test.mjs` passes all three switches as `false`.
+Review lens: every “even with X disabled” claim must cite a test that explicitly disables X.
+
+
+## Shadow dependency tracing (S2)
+
+Append ` --import="file:///absolute/repo/scripts/ci/dep-trace.mjs"` to existing `NODE_OPTIONS`
+and set `WE_TRACE_TEST` to the repo-relative test file and `WE_TRACE_DIR` to an artifact directory.
+Node 22 uses `module.register` plus a loader message port; synchronous exit drains pending loader edges.
+Use an absolute `WE_TRACE_DIR`. Each process emits `trace-<pid>.json` with `truncated` and `incomplete`
+flags; merge with `mergeTraces` into `{ tests, incomplete }`, then replay via
+`scripts/readiness/trace-coverage.mjs trace-map.json misses.json [static-selected.json]`.
+The tracer is observe-only: it never rewrites a `child_process` call or the environment.
+Each patched call reaches Node with the caller's exact arguments and receiver.
+A child whose real env (`options.env || process.env`) lacks this `--import` hook in `NODE_OPTIONS`,
+the same `WE_TRACE_TEST`, a `WE_TRACE_DIR` resolving to the same directory, or the same
+`WE_CI_SELECTION` marks the evidence `incomplete`. A trace without the flag also counts as incomplete.
+A non-Node child also marks it `incomplete`: `execSync` and any `shell` option (a shell runs first), a
+command whose realpath is not the running Node binary (a bare name is looked up on the child's PATH; a
+relative or empty PATH entry is unknown), `fork` with a non-Node `execPath`, and a Node child whose args,
+`execArgv` or `NODE_OPTIONS` carry `--run`, `--permission`, `--experimental-permission`, `--check`/`-c`,
+an env or config file flag (`--env-file`, `--env-file-if-exists`, `--experimental-config-file`,
+`--experimental-default-config-file`) or `--experimental-sea-config`; a non-array `execArgv` is unknown.
+URL getters are trusted only as captured from node:url at load. Patched built-in array and string
+methods are not guarded, and script arguments are scanned as flags (a safe over-flag); carded as `x7m3x86`.
+`Worker`, `ChildProcess.prototype.spawn` and `process.execve` are neither traced nor flagged; carded as `xlh3igo`.
+An inheriting child is judged by the live `process.env` at call time. Args arrays over 65536 entries and
+path buffers over 65536 bytes are not read and mark the trace `incomplete`. A `file:` string is a URL only
+for loader edges; to `fs` it is a literal path, and a URL object converts from its hostname and pathname.
+Node reads every caller value again, so the tracer never runs caller code: options, env, args and path
+values are read by descriptor, and a getter, a Proxy or an object env value (whose `toString` would run)
+is left to Node untouched and marks the trace `incomplete`. Only node:url's own `URL` getters (also
+inherited by happy-dom's `URL`) and the intrinsic `Uint8Array` getters are read. The `env getter read once`
+and `execSync cat` real-child cases and the `never runs caller code` cases pin this.
+Callback `fs.readdir` (and other callback/stream read paths) is not wrapped; carded as a read-path gap.
+Incomplete evidence keeps its observed edges, but a result it does not show is `traced: null`
+(unknown), never `false`. The replay prints `incomplete: true` and warns on stderr.
+`execSync` is wrapped separately because it bypasses the exported `spawnSync`. Hook detection splits
+`NODE_OPTIONS` on spaces only, as Node does (a tab is not a separator).
+Not observed (no edge, no flag): stream, file-descriptor and `FileHandle` reads, and a child killed
+by a signal or a `spawnSync` timeout (no exit hook, so no trace file, while the parent's trace still
+reads complete). These are carded as `xo73a24`.
+Omitting static evidence prints `staticEvidence: "not supplied"`; static and additional counts
+are `null` (unknown). An explicit empty static list means known zero static coverage.
+Tracing stays shadow-only. The edge cap applies per process; a cap warning means incomplete evidence:
+rerun with a larger `ci.selection.trace.maxEdgesPerTest` before interpreting coverage.
+Inject filesystem/child-process objects for tracer edge tests and exercise loader hooks directly.
+Runtime contract regressions in `scripts/ci/__tests__/dep-trace.test.mjs` also launch isolated Node children:
+captured stdout/stderr must accept a synchronous 65536-byte write after loader registration, and
+`spawnSync`/`execFileSync` must accept frozen options. A table case runs frozen options, a `Buffer` cwd,
+`env: {}` and promisified `execFile` both traced and untraced and asserts identical exit and output.
+A `NODE_OPTIONS=--input-type=module` parent must run an `env: {}` CommonJS child unchanged and report
+`incomplete: true`. Bound these children by timeout and output size, load the suite's test-cache
+child tracer in its no-op mode (`WE_TRACE_FILE=''`) so it cannot rewrite their env, and remove their
+temporary trace directories after each case.
+Review lens: each settings catch fallback needs a named test forcing the loader to fail,
+including malformed input and valid overrides. The `honours fallback settings after loader failure`
+cases in `scripts/ci/__tests__/dep-trace.test.mjs` exercise startup's fallback directly.
+Review lens: the child-process wrappers must never throw where unwrapped Node would not. Every `cwd` form
+Node accepts (string, `Buffer`, file `URL` from any realm) resolves; any other value goes to Node unchanged
+for Node to judge. A non-string `NODE_OPTIONS` is stringified. A deleted working directory makes
+`process.cwd()` throw; tracing then resolves absolute paths only, and a relative child `WE_TRACE_DIR`
+is incomplete. The child env is read with `for…in`, skipping undefined values, and falls back on a
+falsy value, as Node does. The `hands Node the exact caller arguments`, `accepts a … cwd`,
+`never throws`, `keeps an … cwd` and `flags incomplete evidence` cases pin this.
 ## Workflow-protection review admission
 
 The `required-admission-gates-deadlock-review` soak probes the hold classifier and unchanged
@@ -5740,6 +5841,36 @@ an empty store or admission refusal cannot prove the child deadline works. Its f
 probe recognizes both the original child timeout and the remaining pass budget. Use the
 injected clock for modeled delays; the daemon unit suite retains the real process-tree check.
 
+## Expectation babysitter replay (S1)
+
+`stuck-prs.test.mjs` tests the separate observe-only detector through heavy admission.
+Its captured sweep daemon lines are fixtures, not live-head attestations: R-d requires
+an explicit current-head binding; the original unbound #7112 human-hold line stays
+unknown. The CLI reads one open-PR batch and 8 MB log tails. Tail/list caps warn the
+operator to inspect omitted history/PRs. NEW-cause receipts reserve before append;
+failed appends, abandoned locks and capped receipts require manual inspection.
+
+Run `npm run test:unit -- scripts/conveyor/__tests__/pr-expectations.test.mjs` through
+heavy admission. Replays require all three scratch paths: `--events-file`,
+`--evidence-file`, and `--state-file`; `--as-of` requires those paths too. The events
+file is both input and the scratch miss-event sink. Evidence fixtures use the
+explicit head-bound contract documented in `pr-expectations.mjs`. Missing or capped
+evidence remains unknown. Miss receipts reserve before append to prevent duplicate
+emission after restart; a failed append or abandoned lock requires operator inspection.
+Delivery is at most once, so a crash after reservation but before append can lose a
+miss event. Failed reservations never append; successful appends followed by a save
+failure never retry. The fault-injection tests pin both boundaries and the event's
+complete facts/response contract. Live logs use a 16 MiB tail, skip an unfinished
+last append, and retain observed current-head actions in state across log rotation.
+Malformed complete lines still make evidence unknown. Historical PRs outside the
+open/tracked set are ignored; terminal PRs retire after a complete evaluation.
+Existing queue entries suppress enqueue timers, including after a dequeue/requeue.
+The `expectation-live-event-history` soak replays producer events through the live pass.
+The `expectation-check-verdicts` soak checks that a completed head-bound red-team
+check settles its verdict after the pending label clears, while unit and review-gate
+checks leave review-started unmet. Unit regressions cover every accepted completed
+conclusion, review-gate name variants, and a real review dispatch as a positive control.
+
 ## Review-run filename discovery (R1099)
 
 `review-run-names.fs.test.mjs` covers 6,000 real files, full-scan parity across PR-keyed names,
@@ -5786,6 +5917,265 @@ Park opens ready for review; draft-promotion still handles older drafts.
 Check mode fetches origin main before evaluating canonical audit evidence. A failed fetch reports
 `main not refreshed: <reason>` and refuses even when local evidence would pass against stale refs.
 `open-pr-audit-gate.test.mjs` covers both refresh outcomes, aggregation and an unconfirmed check child.
+## Between-tick rebuild launch probes
+
+`daemon-rebuild-force-adopt.test.mjs` distinguishes strict readers from between-tick launch
+ownership: only `launchOnly && asJob && !adoptOnly` with early/recovery provenance leaves
+the force watch untouched. Inline strict evidence refusals still probe health and execute
+owed rollback, including refusals during reader validation before preparation. Assert the
+`state-unreadable` result and unchanged unrelated corrupt bytes alongside the rollback;
+between-tick refusal cases preserve the watch bytes and running head even when rollback is owed.
+
+`daemon-rebuild-early-launch.test.mjs` runs with Node's test runner and also registers with Vitest.
+Its hermetic `withSelfSync` probe drives the injected watcher timer between ticks, with real job-store
+queue tests and no Git/network children. `daemon-rebuild-early-timing.test.mjs` advances separate
+reader-lock, planning, smoke-slot and smoke clocks so planning/smoke time cannot masquerade as queue wait.
+The early-launch setting is off by default; `daemon-rebuild-settings.json` `earlyLaunch.entries`
+opts in an entry such as `health-watch.mjs`. `WE_DAEMON_REBUILD_EARLY_LAUNCH=0|1` overrides enablement;
+`WE_DAEMON_REBUILD_EARLY_DEBOUNCE_MS` overrides the trailing debounce. Missing or oversized event
+history defers to tick-start. The declared self-sync rebuild path must resolve to job mode;
+`WE_DAEMON_REBUILD_AS_JOB=0` or an inline setting prevents early launch. The watcher only queues a job; ready candidates still adopt at tick boundaries.
+`launchOnly` must run the shared adopt-only preparation with `readyOnly: true` before queuing, so sticky
+rejections and smoke retry/backoff refusals still apply. `daemon-rebuild/__tests__/rebuild-job.test.mjs`
+checks persisted refusal state through real preparation with controlled Git IO, including clean admission.
+Early admission and timed recovery use `readRebuildStateStrict`: only ENOENT is empty state.
+The declared schema requires every top-level slot, with explicit null for an unused slot.
+For present records the admission inventory is: adopted head/inputsKey/mainSha/applied/at;
+inProgress pid/host/startedAt/prevHead/target/inputsKey/mainSha/applied/verified; quarantine
+prevHead/reason; unverified head/prevHead; building token/pid/host/startedAt/target/inputsKey/path (adoptOnly is optional);
+held reason/since/updatedAt; rejected inputsKey/reason/at. Backoff retryAt/attempts and
+harnessBroken/externalOnly/envLoad/dispatchSmoke booleans are typed when present. retryAt may be null;
+transient rejection flags require a date. Legacy env-timeout holds may omit retryAt.
+busySkippedTrees/forceUnverifiedTrees contain strings; smokePassed entries require key/tree/passedAt;
+pinnedNotified is a string-valued map. Applied entries require ref/sha and a nonempty string for any pinnedFrom.
+Strict ready pins require sha and pinnedFrom to be distinct full 40-hex SHAs.
+Record readers validate shape; locked adoption separately proves the registered ref/PR,
+exact held remote tip, latest rebuild-authored second-parent adopted SHA and audit membership.
+Malformed records or unreadable proof refuse as `state-unreadable`, preserving evidence.
+A readable record with expired proof is discarded as `ready-pin-stale` before any match,
+including exact/same-tree matches, so a new smoke can proceed. Moved tips, retired overlays,
+changed HEAD and revoked audit membership must not become permanent tick-start holds.
+The real-Git table in `daemon-rebuild-ready.test.mjs` covers tip, registration and HEAD churn;
+the pin-provenance table retains every audit/history refusal at the adoption boundary.
+`daemon-rebuild-audited-tip.test.mjs` advances main while audited A is retained with
+`pinnedFrom` naming unaudited B. Ready-pin proof must accept A's evidence and reject
+missing A evidence even when B is audited. The `rebuild-evidence-compatibility` soak
+replays adoption of that prepared candidate with no extra smoke and excludes B's content.
+Ready records require prevHead/tree/passedAt/kind/forced and adopt.finalSha/inputsKey/mainSha/applied.
+Fallbacks also require forInputsKey/dropRefs/failed, with ref/sha/pr on each drop (pr may be null).
+Optional diagnostic ready metadata remains typed when present.
+
+The job fixture injects EACCES/EIO and corrupt JSON, and a recursive table deletes and mistypes
+every required field, asserting refusal, untouched bytes and no job. Historical incomplete files
+are deliberately refused until operator repair; the legacy reader retains its compatibility behavior
+for consumers outside a rebuild scope. Producers preserve legitimate legacy field absence rather than admission
+inventing defaults. The pre-lock strict state read is an early refusal filter only. Launch-only
+preparation re-reads and validates state under the clone write lock, using that locked snapshot
+for every check; an unreadable locked read refuses as `state-unreadable`.
+The ready snapshot still passes through `admissionEvidence`; missing handoff refuses.
+The early/recovery race tests publish rejection, hold, lease or corrupt state between admission
+and lock acquisition, assert the second strict read holds the lock, and verify newer evidence
+survives refusal. Interrupted-rebuild bookkeeping defers to tick-start. Clean admission remains covered.
+Between-tick admission never takes
+a transient build lease, avoiding a second read-modify-write during lease release. An up-to-date
+ready-only probe also leaves ready cleanup to the next tick: the fixture plants corrupt ready evidence
+during planning and asserts that the indirect cleanup reader neither rereads nor deletes it.
+
+The launch-path fallback audit covers state, prepare, rebuild, rebuild-job, recovery and
+overlay-adoption. Rebuild-state coercions are confined to the legacy reader; strict validation
+covers prepare's recovery/array/map/backoff defaults. Ready adoption and its lazy overlay-event-log
+reader cannot run in launch-only admission: a ready snapshot defers immediately. Consumed-job and
+finished-result bookkeeping use the strict precheck snapshots (including the finished-job roster);
+later result/ready probes remain strict. Between-tick launches return before the wrapper's
+best-effort pending-adoption notifications and force-watch. Remaining settings defaults choose
+bounded standard policy; Git/process proof defaults retain holds or deny mutation; diagnostic
+and best-effort logging defaults do not authorize launch or erase persisted evidence.
+Job admission also strictly reads pending adoptions before job bookkeeping. Any `state-unreadable`
+refusal logs the repair requirement and skips pending-adoption notifications/rewrites, including at
+tick-start; the mixed overdue/malformed-record fixture asserts that the wrapper preserves file bytes.
+Only explicit `launchOnly: true`, `asJob: true` early/recovery launches outside adopt-only skip
+best-effort wrapper notifications and force-watch, including after successful queueing. Tick-start and unknown launch sources retain force-watch health checks and rollback
+even when carrying `launchOnly: true`; strict early/recovery provenance defers them
+also for inline and adopt-only callers.
+Both rebuild soak wrappers also require an unconditional positive test, so a behavioural `fixPresent`
+regression cannot turn the protected behaviour into an expected failure.
+
+Timed rebuild recovery is covered by `daemon-rebuild-recovery.test.mjs` (Vitest)
+and the `rebuild-held-recovery` soak break. Environment timeout
+backoff lives on `state.held`, leaving candidate rejection semantics intact. Legacy holds
+without a deadline derive one from `updatedAt`/`since`; invalid timestamps stay held for
+operator repair. Recovery settings use the shared policy cascade and the detached job
+queue retains its in-flight guard before considering any recovery trigger.
+Recovery uses the existing rebuild minimum interval (including jitter), even after a ready-recorded
+job; a `still-rejected` adopt-only result never launches recovery. The overdue threshold must be
+at most 15 minutes (the default); settings may only shorten it, and oversized settings clamp
+to that maximum and log the originating policy layer. The unit fixture drives the real ready-only rebuild through a
+timeout and a later passing smoke on unchanged inputs; the soak fixture checks queueing only.
+
+
+### Detached rebuild evidence policy
+
+Evidence refusals emit exactly one `rebuild-failed` coordination event with reason
+`state-unreadable` for every launch provenance, including between-tick launches.
+The event never authorizes pending-adoption or rebuild-state rewrites. Keep the
+fault/provenance matrix in `daemon-rebuild-events.test.mjs` and the request-failure
+ledger regression in `daemon-rebuild-request-failures.test.mjs` in the affected gate.
+`withSelfSync` uses the strict state reader for quarantine checks: ENOENT allows a
+normal tick; read, parse or shape errors visibly skip with `state-unreadable` and
+preserve the file. A rebuild returning that reason also skips before restarting
+or ticking. `daemon-self-sync.test.mjs` pins these holds and real daemon loggers.
+Its maintenance descendant assertions accept a reaped PID only when `kill(pid, 0)`
+returns ESRCH; live PIDs still require the existing `ps` stopped/zombie proof, and
+permission failures never count as proof of exit.
+
+Early watcher jobs carry `early`; both timed env-timeout retries and overdue-registration
+recovery jobs carry `recovery`. Only the ordinary tick-start launch carries `tick-start`.
+`rebuildClone` uses strict evidence for early/recovery launches; ordinary tick-start and
+inline rebuilds retain compatibility readers unless `WE_DAEMON_REBUILD_STRICT_EVIDENCE=1`.
+Keep fleet-wide strict validation opt-in until captured, anonymised deployment files have
+passed replay; the current writer-contract corpus is synthetic, not a fleet capture.
+The strict async scope covers indirect legacy consumers as well as prepare, smoke, lease renewal,
+cleanup and ready publication. Keep evidence entry points connected to this scope when adding
+readers; do not add a child-specific permissive fallback. Only ENOENT means empty, including after queue admission and after waiting for the preparation lock.
+The build lease lives in the strictly validated rebuild state. Ready, pending adoptions,
+overlay registry/events, starvation, force request/watch, conflict wakes and pending drops
+also refuse malformed or unreadable evidence; only ENOENT is absent. Writes revalidate evidence
+before replacing or deleting it. Refusal requires operator repair of the persisted evidence.
+For deployment schema incompatibility, `WE_DAEMON_REBUILD_STRICT_EVIDENCE=0` restores legacy
+evidence readers for ordinary tick-start and inline rebuilds, including job admission and
+the `withSelfSync` state check. Compatibility logs `strictEvidence=false` with source
+`default` or `env`. Missing and invalid switch values retain the compatibility default.
+Early/recovery provenance remains strict, even with this override; unknown provenance also
+remains strict. Launch-only admission is strict even when provenance is omitted.
+Tick-start compatibility ignores corrupt job records and treats unreadable consumed/results
+as empty/null, preserving the legacy adoption and queue paths. Strict job-store refusal
+reports `state-unreadable` and preserves bytes instead of reporting a live job.
+Force-watch rollback safety and ready adoption
+proof remain enforced. `evidence-readers.test.mjs`, `daemon-rebuild-early-launch.test.mjs` and
+`daemon-self-sync.test.mjs` exercise the switch at each entry point.
+`daemon-rebuild/__tests__/review-compatibility.test.mjs` tables torn job/consumed/result
+evidence across tick-start, early and recovery, absent/disabled/enabled strict mode,
+all documented early/recovery overrides, and nonzero-jitter recovery spacing.
+
+**Evidence publication standard:** never use `writeFileSync` directly on a complete
+JSON evidence document parsed by a strict reader. Use `writeJsonAtomic` (validated
+same-directory temporary file then rename), or an equivalent existing atomic writer.
+This includes the consumed-job ledger and job result sidecars. Atomic publication
+prevents partial reads; it does not replace the existing locks for read-modify-write
+state or serialize multiple ledger writers. Append-only event logs keep their own protocol.
+`daemon-rebuild/__tests__/evidence-readers.test.mjs` tables both provenances against each reader
+and corrupt JSON, EACCES and wrong shapes, at entry and after waiting for the write lock,
+asserting unchanged bytes. It also pins indirect legacy-reader inheritance and late ready
+corruption before publication/cleanup. The recovery suite pins both recovery launch origins
+and successful strict-child smoke/ready publication. Real CLI child probes prove entry refusal before Git IO for every launch provenance.
+
+
+Strict early/recovery preparation defers these mutators to tick-start: index-lock
+unlink; interrupted/unverified recovery state writes and rollback; quarantine reset;
+`finishPendingSwaps` (registration removal, events, swap deletion, needs-you reports);
+`healWrongBranch`; `ensureSafeToMove` (claim/store recovery); `repairCloneRefs`;
+sidecar pruning; `detectOverlayStale`; `persistStackBases`; conflict-wake mark/clear;
+pin-notice, hold and up-to-date state writes; `kickAutoRebase`; registration removal
+and overlay events; ready cleanup, forced-watch transitions and ready/skip-unrelated
+finalization. Alert-file appends, wrapper pending-adoption rewrites/notifications,
+force-watch checks/rollback, and starvation writes also defer. Fetch and deterministic
+plan object creation remain part of rebuilding; admission never claims a lease, while
+the detached child may claim its actual build lease before smoke. If an abandoned
+lease still records a candidate path, the child returns `readonly-job-mutation-due`
+(`abandoned-build-cleanup`) and leaves the lease intact for tick-start cleanup.
+The actionable-swap fixture asserts registry, event, swap and abandoned lease bytes
+survive child preparation, then proves ordinary preparation removes the candidate.
+The `rebuild-evidence-compatibility` soak also checks removal of the real Git worktree
+registration after an early claim defers, and tick adoption despite torn job sidecars.
+
+
+### Tick-start pin and evidence security
+
+`daemon-rebuild/__tests__/pin-provenance.test.mjs` checks the exact per-ref audit gate
+membership of pinnedFrom, lowercase 40-hex syntax, revoked and other-ref evidence,
+and unconditional ready pin history proof before adoption. Never replace the gate with a truthy or
+format-only pin check. Tick-start defaults to the same strict record readers as early/recovery;
+`evidence-readers.test.mjs` tables child and inline entry/locked refusal for malformed,
+wrong-type, wrong-shape and EACCES evidence, preserving pending notifications and bytes.
+Legacy records may omit backoff fields, env-timeout retryAt and lease adoptOnly.
+Force-watch health checks and owed rollback still run outside between-tick launches
+before strict admission reads, even when unrelated admission evidence refuses. Only
+the watch record is required for that bounded scope. Corrupt ready/state evidence
+must neither suppress rollback nor be erased or replaced with empty evidence: use
+the intact watch's last-good target with the locked, clean-tree rollback helper when
+normal finalization cannot preserve those files. Admission afterwards still refuses
+adopt/launch with `state-unreadable` and emits its failure once. Preserve arrival health
+checks for newly installed watched builds without counting an existing watch twice.
+An in-memory owed rollback still refuses a second force request during that call,
+including when the watch merely confirms HEAD is already at last-good; preserve
+the existing request-consumption test alongside rollback-before-admission ordering.
+Keep isBetweenTickLaunch and the once-per-tick watch tests; the force-adopt matrix
+covers corrupt ready, rebuild state and pending adoptions, including owed rollback
+and byte-preserving between-tick refusal.
+
+
+### Persisted rebuild producer compatibility
+
+Strict rebuild schemas must accept the records production writers leave on disk, without
+adding plan evidence. A force watch can store only `lastGood.head`; its rollback through
+`finalizeRebuild` writes swap/adopted records without `inputsKey` or `mainSha`. Interrupted
+recovery can promote those unknown adopted plan keys as null. Pre-fix swap records omit
+`verified`; recovery treats that absence as unsmoked and rolls back before rebuilding.
+Keep those fields typed when present and keep head/swap identity, timestamps and applied
+evidence mandatory. Production holds always write `since` and `updatedAt`: complete a
+hand-written fixture missing them instead of making the validator permissive.
+`rebuild-job.test.mjs` covers producer-shaped round trips and wrong types;
+`daemon-rebuild.test.mjs` proves absent-verification rollback with real Git;
+`daemon-rebuild-force-adopt.test.mjs` proves head-only force-watch rollback.
+
+The result writer emits `reason: null` when child output has no reason. Strict job
+admission accepts that value, consumes the terminal job once and reports `no-result`;
+other non-string reasons and corrupt JSON still refuse without consuming evidence.
+Keep round-trip coverage over absent, undefined and null child fields in
+`daemon-rebuild/__tests__/rebuild-job.test.mjs`.
+
+Environment-timeout holds record `inputsKey` and `target`. A changed value bypasses
+the old plan's deadline and resets its attempt count if smoke times out again.
+Legacy holds keep their deadline unless a recorded identity proves the plan changed.
+`daemon-rebuild-recovery.test.mjs` covers input-only and target-only changes through
+early admission, plus unchanged and legacy deadlines.
+
+Legacy overlay registries may omit audit metadata and clone identity; overlay refs
+remain required and present fields remain typed. Audit events may omit a single ref
+(for example `auto-rebase-swapped`); per-overlay consumers must match their own ref
+before using an event as evidence. Aggregate discard notices retain their full schema.
+`evidence-readers.test.mjs` replays legacy shapes and production state, ready, pending,
+registry and event writer output through `validate`, preserving file bytes. Its corpus
+is reconstructed from writer contracts; captured deployment files can extend it.
+The `rebuild-evidence-compatibility` soak replays null-result consumption, legacy
+registry/events and changed-plan admission through the durable queue. It also publishes a
+real smoke-passed pinned ready candidate, advances the overlay tip, and requires tick-start
+to discard it, smoke once and adopt a fresh build. The job tests
+snapshot the entire state directory on early/recovery lock contention and successful
+preparation, including starvation evidence; tick-start remains the positive control.
+
+Simulator runtime snapshots must also carry `.githooks/pre-commit` with its executable
+mode: real lane provisioning verifies the tracked, runnable guard before handing out a
+lane. The rebuild soak scenarios exercise this prerequisite through actual provisioning.
+For real-process teardown assertions, signal-zero ESRCH proves the descendant was reaped;
+other results still require the process-state check so live or unreadable processes never
+count as stopped.
+Cold imports of whole daemon module graphs belong in bounded suite setup (`beforeAll`),
+so the skipped-tick assertion retains its own deadline under a busy runner.
+
+Ready-candidate discard escalation writes an aggregate overlay event with `need`,
+`target`, `reason` and `refs` (possibly empty), rather than a single `ref`. Exercise
+`reportDiscardedCandidate` and `appendOverlayEvent` together when validating that shape;
+missing or wrongly typed identity/audit fields still refuse without changing bytes.
+Pin proof is checked under the preparation write lock before adoption. After the verified
+reset, write guards continue to validate record shape, allowing adopted-state writes and
+ready cleanup even if a registration or remote tip changes. The pin verifier also recognizes
+an exact target with a matching durable verified swap or adopted record; its tests cover
+both transitions and missing, corrupt, mismatched and revoked evidence.
+The real-Git ready-adoption test asserts `readyToAdoptedMs` from the recorded pass through
+preparation and the post-reset adopted-state writer. Shipped-setting tests use the real JSON:
+early launch stays disabled with empty entries and health-watch, and env-timeout delays are
+exactly 10, 20, 40 and 40 minutes with no environment or tool overrides.
 
 ## Shadow-only static selection edges
 
@@ -5921,6 +6311,14 @@ It never infers clearance authority from a saved review or a newly read head.
 `scripts/operations/__tests__/record-verdict.test.mjs` covers request validation;
 `scripts/operations/__tests__/record-verdict-cli.test.mjs` drives both CLI adapters through
 staging the JSON request. The applier carries that pin to `review-set-label` as `--expect-head`.
+## Live-owner review adapter collection
+
+`pr-live-owner-watch.test.mjs` imports the manual dispatcher, review job and reconcile
+graph statically during collection. The first `review-dispatch` case otherwise loads
+these roots inside its five-second deadline, even when dispatch and reconcile IO are
+injected. Keep the production adapters exercised with injected effects and retain the
+original test deadlines and head-pinning assertions; avoid charging cold module loading
+to the first adapter case.
 
 ## S1b shadow accuracy evidence
 
@@ -5933,3 +6331,17 @@ contract. Set `cliMain` in `prFileContract` for callable entries so repeated arg
 the loaded graph. Resetting the entire daemon graph twice inside the CLI test exceeded its
 60-second deadline on a coverage shard. Keep the file/standalone output comparison and zero-GitHub
 assertions intact; consumers without callable entries retain the fresh-import path.
+
+## Bounded verify selection and ceiling recovery
+
+Verify gates execute explicit sorted test files, including complete graph selections. Graph failures,
+empty lists and oversized argv use changed tests plus direct importers clipped to `relatedMaxTests`,
+then the named `alwaysRunTests` suites. An empty union skips the test half; never emit unfiltered Vitest.
+Explicit related gates share the selector; `--gate-uncapped` is an audited exemption.
+A related gate stamped by an older dispatcher (`--run --passWithNoTests --testTimeout=N --hookTimeout=N`)
+converts to a capped gate keeping its stamped timeouts; any other unknown option is still refused.
+Missing timeouts on such a stamp mean factor 1, so the host's factor is not added; the converted gate
+shards exactly as the default would, so it is still recognized as the default gate.
+Gate ceilings get one capped retry tied to lane, head and killed job. Detached jobs settle in
+`verify-gate-job.mjs`, so recovery must cover that consumer as well as `verify-dispatch.mjs`'s
+in-process sweep. Persist the retry identity in job input to dedupe the enqueue-before-marker crash window.

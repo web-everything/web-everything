@@ -59,7 +59,8 @@ it.each(removalCases)('$kind adoption with $removal removal', ({ kind, removal }
     removalSafety: () => removal === 'sha-less' ? 'benign' : removal }));
   if (removal === 'benign') {
     expect(m).toMatchObject({ adopt: candidate.adopt, match: kind, rebuildAfter: ['lane/a'] });
-  } else expect(m).toMatchObject({ adopt: null, reason: 'overlay-no-longer-wanted' });
+  } else expect(m).toMatchObject({ adopt: null,
+    reason: removal === 'sha-less' ? 'invalid-ready-applied' : 'overlay-no-longer-wanted' });
 });
 
 describe('classifyOverlayRemoval hardening', () => {
