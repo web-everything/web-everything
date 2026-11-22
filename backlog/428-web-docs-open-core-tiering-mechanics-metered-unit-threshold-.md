@@ -3,10 +3,12 @@ kind: decision
 size: 3
 parent: "089"
 blockedBy: ["554"]
-status: open
+status: parked
+parkedReason: maturityGated
+maturityTrigger: "adoptionSignal: #554 unparks (Web Docs tiering)."
+dateParked: "2026-11-22"
 dateOpened: "2026-06-12"
 dateStarted: "2026-06-14"
-dateParked: "2026-06-14"
 preparedDate: "2026-06-12"
 tags: [webdocs, monetization, open-core, business-model, plateau, decision]
 relatedProject: webdocs
@@ -155,3 +157,5 @@ volume — so it couldn't be sliced as a build alongside #398's A–D. Settling 
 **Build sequence once ratified:** the tiering build is a plateau-app slice `blockedBy` #427, itself
 `blockedBy` the #424 generator + #425 primitives — so resolving this decision produces an unblocked
 build, not code.
+
+Parked 2026-11-22 (plateau ruling, master plan). Unpark when: #554 unparks (Web Docs tiering).

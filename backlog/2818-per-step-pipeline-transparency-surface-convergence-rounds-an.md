@@ -198,3 +198,5 @@ rebuilt here) and a **per-item pipeline timeline** — review, drain-escalation 
 sourced from an existing ledger via `we:scripts/lib/pipeline-trace.mjs`, with a placeholder row for
 build-self-review until [#3113] lands. Both themes; `plateau-app npm test` (for its own render, once filed)
 + `we: check:standards` pass.
+
+Merged into plan step PD-LIVE (PL-WIP-CLEANUP, 2026-11-22).

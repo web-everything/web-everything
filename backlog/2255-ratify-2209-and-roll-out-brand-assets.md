@@ -1,7 +1,10 @@
 ---
 kind: story
 size: 5
-status: open
+status: closed
+closedReason: duplicate
+closedInto: "2209"
+dateClosed: "2026-11-22"
 parent: "2256"
 blockedBy: ["2209", "2250", "2251", "2252", "2253"]
 locus: webeverything
@@ -217,3 +220,5 @@ unblocked, informed by the actual ratified gate wording.
   `we:src/assets/favicon.svg`'s construction (owned by #2251), `frontierui:src/assets/logo.svg`'s
   construction (owned by #2252), `plateau-app:favicon.svg`'s construction (owned by #2253), and the act
   of ratifying #2209 itself (owned by the decision-owner on the #2209 card, not this story).
+
+Superseded 2026-11-22 by #2209 (Its ratify step repeats #2209; keep only the rollout, which becomes DZ-BRAND and DZ-SITES.) [PL-WIP-CLEANUP / plateau rulings].

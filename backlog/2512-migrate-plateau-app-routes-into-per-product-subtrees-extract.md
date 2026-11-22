@@ -2,7 +2,10 @@
 bornAs: xs1i22b
 kind: story
 size: 8
-status: open
+status: closed
+closedReason: fixed-elsewhere
+closedBy: "plan step DZ-SHELL"
+dateClosed: "2026-11-22"
 blockedBy: ["2510"]
 dateOpened: "2026-07-15"
 preparedDate: "2026-08-15"
@@ -369,3 +372,5 @@ redirect proof), **consumer** (low — reviewer additionally swept `plateau-app:
 `plateau-app:tools/explorer/`, `plateau-app:scripts/`, and the other e2e spec for hardcoded old-path
 references and found none beyond what's now listed; the `technical-configurator` seed files'
 `/backlog/NNN-slug/` hrefs point at the WE docs site, not plateau-app's own route, correctly out of scope).
+
+Superseded 2026-11-22 by plan step DZ-SHELL (Per-product route subtrees conflict with the five task-based sections. Keep the extraction-ready property (#2476) through module boundaries, not URL prefixes. Operator to confirm.) [PL-WIP-CLEANUP / plateau rulings].

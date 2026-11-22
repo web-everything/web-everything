@@ -2,7 +2,10 @@
 bornAs: xykd1x3
 kind: story
 size: 2
-status: open
+status: closed
+closedReason: fixed-elsewhere
+closedBy: "plan step DZ-RETIRE-WIP"
+dateClosed: "2026-11-22"
 scope: ["plateau:src/wip/wip-read.ts", "plateau:src/wip/wip-read.test.ts"]
 dateOpened: "2026-09-28"
 preparedDate: "2026-09-30"
@@ -105,3 +108,5 @@ against `we:scripts/conveyor/queue.mjs list --json`.
 1. **Executable** — `npx vitest run plateau:src/wip/wip-read.test.ts` passes with a case asserting the
    conveyor-queue read goes through `resolveQueuePath()` (not a hardcoded `we:.conveyor/queue.json` join),
    plus the old-shaped-`weRoot` degrade case.
+
+Superseded 2026-11-22 by plan step DZ-RETIRE-WIP (Fix lives in /wip publisher code that DZ-RETIRE-WIP removes. Reopen only if /wip stays past W12.) [PL-WIP-CLEANUP / plateau rulings].

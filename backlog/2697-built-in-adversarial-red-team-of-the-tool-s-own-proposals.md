@@ -3,7 +3,10 @@ bornAs: xtjsuum
 kind: story
 size: 2
 parent: "2676"
-status: open
+status: closed
+closedReason: duplicate
+closedInto: "2707"
+dateClosed: "2026-11-22"
 scope:
   - we:skills-src/jury/subject-jury.workflow.js
   - we:skills-src/jury/SKILL.md
@@ -171,3 +174,5 @@ pure enrichment of what the already-mandatory red-team looks for, not a new mech
 One incremental, single-repo (WE) PR — prompt text + one doc line + one new test file. No schema, engine, or
 cross-repo change; does not touch #2695's or #2950's files, so it can land independently of both and in any order
 relative to them.
+
+Superseded 2026-11-22 by #2707 (Its mandatory post-jury red-team mechanism already shipped as #2707 (per its own prep note).) [PL-WIP-CLEANUP / plateau rulings].
