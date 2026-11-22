@@ -1,0 +1,6 @@
+{
+  "description": "Explicit portability exceptions pinned to matched text and line hashes.",
+  "owner": "scripts/settings/privacy-terms-allowlist.json",
+  "changeVia": "pr",
+  "instant": false
+}

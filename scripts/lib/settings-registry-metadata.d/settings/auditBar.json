@@ -1,0 +1,6 @@
+{
+  "description": "Hotpatch security audit bar; ruled WEAKENED evidence remains unverifiable.",
+  "owner": "scripts/settings/hotpatch.json",
+  "changeVia": "pr",
+  "instant": true
+}

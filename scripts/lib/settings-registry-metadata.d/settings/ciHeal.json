@@ -1,0 +1,6 @@
+{
+  "description": "Try a stale-base refresh before waking a CI fixer.",
+  "owner": "scripts/settings/ci-heal.json",
+  "changeVia": "pr",
+  "instant": false
+}

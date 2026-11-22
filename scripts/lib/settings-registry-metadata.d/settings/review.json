@@ -1,0 +1,6 @@
+{
+  "description": "Review equivalence, human clearance and precedent policy.",
+  "owner": "scripts/settings/human-clearance-carry.json",
+  "changeVia": "pr",
+  "instant": false
+}

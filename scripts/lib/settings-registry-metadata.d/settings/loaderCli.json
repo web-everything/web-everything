@@ -1,0 +1,6 @@
+{
+  "description": "CLI used to load daemon overlays.",
+  "owner": "scripts/settings/prototype-load.json",
+  "changeVia": "pr",
+  "instant": false
+}

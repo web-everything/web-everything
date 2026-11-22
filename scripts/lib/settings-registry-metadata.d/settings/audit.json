@@ -1,0 +1,6 @@
+{
+  "description": "Audit verdict, pre-existing finding and protected path policy.",
+  "owner": "scripts/settings/codex-audit.json",
+  "changeVia": "pr",
+  "instant": false
+}
