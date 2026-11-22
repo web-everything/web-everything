@@ -165,9 +165,9 @@ export function recoverOwedFixes(input, {
     const kept = out.dispatch.filter(keep);
     out.dispatch.splice(0, out.dispatch.length, ...kept);
   };
-  const refuse = (out, prNumber, why) => {
-    drop(out, row => row.prNumber !== prNumber || !owned(row));
-    out.refusals.push({ kind: 'owed-fix-no-fixer', prNumber, why });
+  const refuse = (out, refused, why) => {
+    drop(out, row => row.prNumber !== refused.prNumber || row.kind !== refused.kind);
+    out.refusals.push({ kind: 'owed-fix-no-fixer', prNumber: refused.prNumber, why });
   };
   const refuseAll = (kind, why) => {
     if (!base) return { dispatch: [], refusals: [{ kind, why }], notes: [] };
@@ -180,12 +180,18 @@ export function recoverOwedFixes(input, {
     || !Array.isArray(input.prs) || !Number.isFinite(input.now)) {
     return refuseAll('owed-fix-evidence-unknown', 'liveness unreadable; repair the session inventory before retrying');
   }
-  try {
-    if (authGate({ listAgents: () => input.agents, now: input.now, requireLogin: true })?.paused !== false) throw new Error('auth paused or unknown; restore login before retrying');
-  } catch {
-    return refuseAll('owed-fix-auth-paused', 'auth paused or unknown; restore login before retrying');
-  }
   const out = base ?? plan(input);
+  // Only a recovery launch needs the extra positive login probe. Ordinary dispatch keeps its
+  // consumer's auth policy, and an auth outage must not silence a due needs-you escalation.
+  let recoveryAuthAllowed;
+  const checkRecoveryAuth = () => {
+    if (recoveryAuthAllowed === undefined) {
+      try {
+        recoveryAuthAllowed = authGate({ listAgents: () => input.agents, now: input.now, requireLogin: true })?.paused === false;
+      } catch { recoveryAuthAllowed = false; }
+    }
+    if (!recoveryAuthAllowed) throw new Error('auth paused or unknown; restore login before retrying');
+  };
   // A draft can produce promote-draft rather than a repair row; operator parks hold that too.
   const operatorParked = pr => (pr.state != null && pr.state !== 'OPEN') || pr.isDraft || (pr.referralHold
     && pr.referralHold.kind !== 'same-head' && pr.referralHoldAutoResolve?.outcome !== 'send-back');
@@ -265,7 +271,7 @@ export function recoverOwedFixes(input, {
           || input.agents.some(agent => claim.meta.sessionId && [agent.id, agent.sessionId].includes(claim.meta.sessionId)
             && !['done', 'stopped', 'failed'].includes(agent.state)));
       if (live) throw new Error('live fixer session; waiting for its completion');
-      const key = `${input.repo}:${row.prNumber}:${head}`;
+      const key = `${input.repo}:${row.prNumber}:${head}:${row.kind}`;
       const allow = transact(key, (stored, save) => {
         const before = structuredClone(stored);
         const state = { ...stored };
@@ -290,7 +296,10 @@ export function recoverOwedFixes(input, {
         if (state.attention && state.update) return false;
         // One tick shares this small live-head budget. Deferred entries explicitly retry next tick; the
         // recovery path reserves both of its reads up front so the budget can never strand a reservation.
-        if (state.retryAt === undefined) reserveReads(2);
+        if (state.retryAt === undefined) {
+          checkRecoveryAuth();
+          reserveReads(2);
+        }
         checkLive(identity, head, pr);
         if (state.retryAt !== undefined) {
           const item = { repo: ghRepoSlug(input.repo), pr: row.prNumber, head, kind: 'needs-you',
@@ -318,7 +327,7 @@ export function recoverOwedFixes(input, {
         checkLive(identity, head, pr);
         return admit();
       });
-      if (!allow) { refuse(out, row.prNumber, 'owed fix recovery waiting or escalated; inspect needs-you feed'); continue; }
+      if (!allow) { refuse(out, row, 'owed fix recovery waiting or escalated; inspect needs-you feed'); continue; }
       if (admission) ledger?.admit(admission);
       // A real stale fixer claim withheld the normal row; restore only the admitted, exact-head row.
       if (pr.fixClaim) {
@@ -326,7 +335,7 @@ export function recoverOwedFixes(input, {
         out.refusals.splice(0, out.refusals.length, ...kept);
         if (!out.dispatch.some(entry => entry.prNumber === row.prNumber && entry.kind === row.kind)) out.dispatch.push(row);
       }
-    } catch (error) { refuse(out, row.prNumber, String(error.message)); }
+    } catch (error) { refuse(out, row, String(error.message)); }
   }
   return out;
 }

@@ -86,14 +86,60 @@ describe('owed fix recovery', () => {
     expect(f.tick(start + 30 * minute).dispatch).toHaveLength(1);
     expect(f.tick(start + 31 * minute).dispatch).toHaveLength(0);
   });
-  it('requires a positive login probe even when health and transcript reads supply no signal', () => {
+  it.each(['fix', 'ci-heal'])('ordinary %s dispatch survives a failed recovery login probe', kind => {
     const f = fixture(), probe = vi.fn(() => false);
+    const row = { kind, prNumber: 7307, headRefOid: head };
+    f.io.base = { dispatch: [row], refusals: [], notes: [] };
+    const dispatch = f.io.base.dispatch;
+    f.io.kinds = [kind];
     f.io.authGate = options => planClaudeAuthDispatchGate({ ...options,
       health: () => ({ broken: false, source: 'no-signal' }), probe, readMaintenance: () => null });
-    expect(f.tick().dispatch).toHaveLength(0);
+    expect(f.tick().dispatch).toBe(dispatch);
+    expect(dispatch).toEqual([row]);
+    expect(probe).not.toHaveBeenCalled();
+  });
+  it('does not probe login when no repair is owed', () => {
+    const f = fixture();
+    f.io.authGate = vi.fn(() => { throw new Error('probe unavailable'); });
+    f.io.base = { dispatch: [{ kind: 'review', prNumber: 42 }], refusals: [], notes: [] };
+    expect(f.tick(start, { prs: [] })).toEqual(f.io.base);
+    expect(f.io.base.refusals).toEqual([]);
+    expect(f.io.authGate).not.toHaveBeenCalled();
+  });
+  it('a failed recovery probe preserves an ordinary sibling row and does not block escalation', () => {
+    const f = fixture();
+    f.tick();
+    const ordinary = { ...f.pr, number: 7318 };
+    f.io.authGate = vi.fn(() => { throw new Error('probe timed out'); });
+    const out = f.tick(start + 30 * minute, { prs: [f.pr, ordinary] });
+    expect(out.dispatch.map(row => row.prNumber)).toEqual([7318]);
+    expect(f.io.authGate).toHaveBeenCalledTimes(1);
+    expect(f.effects.release).not.toHaveBeenCalled();
+    f.io.authGate = () => ({ paused: false });
+    expect(f.tick(start + 31 * minute).dispatch).toHaveLength(1);
+    f.io.authGate = vi.fn(() => ({ paused: true }));
+    expect(f.tick(start + 61 * minute).dispatch).toHaveLength(0);
+    expect(f.effects.attention).toHaveBeenCalledTimes(1);
+    expect(f.effects.update).toHaveBeenCalledTimes(1);
+    expect(f.io.authGate).not.toHaveBeenCalled();
+  });
+  it('requires a positive recovery login probe even when health and transcript reads supply no signal', () => {
+    const f = fixture(), probe = vi.fn(() => false);
+    expect(f.tick().dispatch).toHaveLength(1);
+    f.io.authGate = options => planClaudeAuthDispatchGate({ ...options,
+      health: () => ({ broken: false, source: 'no-signal' }), probe, readMaintenance: () => null });
+    expect(f.tick(start + 30 * minute).dispatch).toHaveLength(0);
     expect(probe).toHaveBeenCalledTimes(1);
     probe.mockReturnValue(true);
-    expect(f.tick().dispatch).toHaveLength(1);
+    expect(f.tick(start + 31 * minute).dispatch).toHaveLength(1);
+  });
+  it('shares one failed login probe across due recoveries in a pass', () => {
+    const f = fixture(), prs = [f.pr, { ...f.pr, number: 7318 }];
+    expect(f.tick(start, { prs }).dispatch).toHaveLength(2);
+    f.io.authGate = vi.fn(() => ({ paused: true }));
+    expect(f.tick(start + 30 * minute, { prs }).dispatch).toHaveLength(0);
+    expect(f.io.authGate).toHaveBeenCalledTimes(1);
+    expect(f.effects.release).not.toHaveBeenCalled();
   });
   it('keeps eligibility shadow evidence on the claim-free recovered plan', () => {
     const f = fixture({ fixClaim: { who: 'fix-7307' } }), appendLine = vi.fn();
@@ -205,7 +251,44 @@ describe('owed fix recovery', () => {
     const f = fixture(); f.tick();
     f.io.readClaims = vi.fn().mockReturnValueOnce([]).mockReturnValue([{ owner: 'new' }]);
     expect(f.tick(start + 30 * minute).dispatch).toHaveLength(0);
+    f.io.readClaims = () => [];
+    expect(f.tick(start + 31 * minute).dispatch).toHaveLength(0);
+    expect(f.tick(start + 60 * minute).dispatch).toHaveLength(0);
+    expect(f.tick(start + 90 * minute).dispatch).toHaveLength(0);
     expect(f.effects.release).not.toHaveBeenCalled();
+    expect(f.effects.attention).toHaveBeenCalledTimes(1);
+    expect(f.effects.update).toHaveBeenCalledTimes(1);
+  });
+  it.each(['refused', 'throws'])('a %s release persists its reservation and escalates once without retrying', async failure => {
+    const { mkdtempSync, rmSync, readdirSync, readFileSync } = await import('node:fs');
+    const { join } = await import('node:path');
+    const { tmpdir } = await import('node:os');
+    const { recoveryTransaction, createOwedFixRecoveryLedger } = await import('../owed-fix-recovery.mjs');
+    const root = mkdtempSync(join(tmpdir(), 'owed-release-failure-'));
+    try {
+      const f = fixture({ fixClaim: { who: 'fix-7307' } });
+      f.setClaims([staleClaim({ kind: 'fixing', who: 'fix-7307' })]);
+      f.io.transact = (key, fn) => recoveryTransaction(key, fn, { root });
+      f.io.ledger = createOwedFixRecoveryLedger({ transact: f.io.transact, log: () => {} });
+      let stateAtRelease;
+      f.effects.release.mockImplementation(() => {
+        // Assert the reservation is already durable DURING the release, even if it fails.
+        const dir = join(root, 'owed-fix-recovery');
+        const file = readdirSync(dir).find(name => name.endsWith('.json'));
+        stateAtRelease = JSON.parse(readFileSync(join(dir, file), 'utf8'));
+        if (failure === 'throws') throw new Error('release unavailable');
+        return { released: false };
+      });
+      expect(f.tick(start + 30 * minute).dispatch).toHaveLength(0);
+      expect(stateAtRelease.retryAt).toBe(start + 30 * minute);
+      expect(f.io.ledger.settle()).toEqual([]);
+      expect(f.tick(start + 31 * minute).dispatch).toHaveLength(0);
+      expect(f.tick(start + 60 * minute).dispatch).toHaveLength(0);
+      expect(f.tick(start + 90 * minute).dispatch).toHaveLength(0);
+      expect(f.effects.release).toHaveBeenCalledTimes(1);
+      expect(f.effects.attention).toHaveBeenCalledTimes(1);
+      expect(f.effects.update).toHaveBeenCalledTimes(1);
+    } finally { rmSync(root, { recursive: true, force: true }); }
   });
   it('a newly acquired claim retains its full grace even when the owed episode is older', () => {
     const f = fixture(); f.tick();
@@ -247,6 +330,33 @@ describe('owed fix recovery', () => {
     f.io.kinds = ['fix'];
     expect(f.tick(start + 60 * minute).dispatch).toHaveLength(1);
     expect(f.effects.attention).not.toHaveBeenCalled();
+  });
+  it.each([['ci-heal', 'fix'], ['fix', 'ci-heal']])('%s escalation does not suppress %s on the same head', (first, second) => {
+    const f = fixture();
+    const tickKind = (kind, now) => {
+      f.io.kinds = [kind];
+      f.io.base = { dispatch: [{ kind, prNumber: 7307, headRefOid: head }], refusals: [], notes: [] };
+      return f.tick(now);
+    };
+    expect(tickKind(first, start).dispatch).toHaveLength(1);
+    expect(tickKind(first, start + 30 * minute).dispatch).toHaveLength(1);
+    expect(tickKind(first, start + 60 * minute).dispatch).toHaveLength(0);
+    expect(f.effects.attention).toHaveBeenCalledTimes(1);
+    expect(tickKind(second, start + 61 * minute).dispatch).toHaveLength(1);
+    expect(tickKind(second, start + 62 * minute).dispatch).toHaveLength(0);
+    expect(tickKind(second, start + 91 * minute).dispatch).toHaveLength(1);
+    expect(tickKind(second, start + 121 * minute).dispatch).toHaveLength(0);
+    expect(f.effects.attention).toHaveBeenCalledTimes(2);
+    expect(f.effects.update).toHaveBeenCalledTimes(2);
+  });
+  it('a waiting kind cannot remove the other kind from a combined plan', () => {
+    const f = fixture();
+    const ciHeal = { kind: 'ci-heal', prNumber: 7307, headRefOid: head };
+    const fix = { ...ciHeal, kind: 'fix' };
+    f.io.base = { dispatch: [ciHeal], refusals: [], notes: [] };
+    expect(f.tick().dispatch).toEqual([ciHeal]);
+    f.io.base = { dispatch: [ciHeal, fix], refusals: [], notes: [] };
+    expect(f.tick(start + minute).dispatch).toEqual([fix]);
   });
   it('live head reads are bounded and deferred initial attempts dispatch next tick', () => {
     const f = fixture();
@@ -3150,6 +3260,27 @@ describe('owed fix recovery through the production dispatch consumers', () => {
     return createReconcilePlanCache({ reconcile: () => w.planAt(now), now: () => now,
       readFingerprints: () => new Map([[7400, 'same']]), readClaims: () => new Set(), log: () => {} });
   };
+
+  it.each(['fix', 'ci-heal'])('the %s consumer launches its ordinary row despite a failed recovery probe', async kind => {
+    const w = world({ kind });
+    w.io.authGate = vi.fn(() => { throw new Error('login probe failed'); });
+    const cache = await planCacheFor(w, start);
+    cache.reconcile({ repo: null });
+    const dispatch = vi.fn(launchResult);
+    let out;
+    if (kind === 'fix') out = runFix(w, start, { reconcile: cache.reconcile, dispatch });
+    else {
+      const { runReconcileCiHealDispatch } = await import('../../operations/ci-heal-pr-dispatch.mjs');
+      out = await runReconcileCiHealDispatch({ root: '/repo', checkStaleness: FRESH, reconcile: cache.reconcile,
+        flushOwed: () => ({}), flushTimeouts: async () => [], pollAttempts: () => [], timeoutHold: () => null,
+        salvage: async () => null, pickFreeLanes: () => [3], dispatch, resolveWorkUnit: () => null,
+        fixLoop: { killed: () => false, readRows: () => [], append: async () => {}, currentBuild: async () => null },
+        owedFixRecovery: w.io });
+    }
+    expect(dispatch).toHaveBeenCalledTimes(1);
+    expect(out.dispatched).toHaveLength(1);
+    expect(w.io.authGate).not.toHaveBeenCalled();
+  });
 
   it('the daemon plan-cache wrapper still runs recovery and restores the stale-claim repair', async () => {
     const w = world({ claimed: true });

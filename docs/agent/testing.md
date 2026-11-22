@@ -6373,3 +6373,27 @@ shards exactly as the default would, so it is still recognized as the default ga
 Gate ceilings get one capped retry tied to lane, head and killed job. Detached jobs settle in
 `verify-gate-job.mjs`, so recovery must cover that consumer as well as `verify-dispatch.mjs`'s
 in-process sweep. Persist the retry identity in job input to dedupe the enqueue-before-marker crash window.
+
+## Owed-fix recovery acceptance evidence (PR #7336)
+
+The positive login probe belongs only to a due recovery launch. Test a failed or
+throwing probe beside ordinary fix and CI-heal rows, including the cached-plan
+consumer entry points. Recovery refusals and sidecar identities include dispatch
+kind: escalating CI-heal on a head must not consume the review fix's allowance,
+and vice versa. A failed release must leave its reservation durable before the
+release call; tick again at +31, +60 and +90 minutes and assert one release attempt,
+zero dispatches, one needs-you publication and one stream append.
+
+Acceptance evidence must distinguish automated coverage from operational proof:
+
+| PR acceptance | Named check | Observable assertion / current evidence |
+| --- | --- | --- |
+| 1: bounded no-fixer recovery | `fix owed >=30 min with no live fixer session is re-dispatched once, then escalated` in `scripts/conveyor/__tests__/reconcile-fix-dispatch.test.mjs` | Initial dispatch, one retry at +30, one escalation after the next missed window. |
+| 2: stale claim release and one escalation | `releases a real stale claim only after 30 minutes and never treats an absent record as stale`, plus `a %s release persists its reservation and escalates once without retrying` in the same file | No early release; refused/thrown release consumes the allowance across later ticks, including persisted sidecar IO. |
+| 3: babysit-label follow-up | `owed-fix-babysit-followup-record` in `backlog/xo73io1-verify-owed-fix-default-io-and-live-acceptance.md` | Pending: record the external follow-up's identifier, owner and assertion. This local card tracks the missing verification. |
+| 4: live proof after prototype load | `owed-fix-live-7307-or-7179` in that card | Pending: record exact deployed/PR heads and timed release, dispatch, suppression and escalation observations on PR #7336. Hermetic tests are not live proof. |
+
+The default-IO smoke is separately owed in that card. Negative soak fixture
+repairs are tracked by `xo73so1`, competing-writer ledger coverage by `xo73ca1`,
+and the broader temporal-test/acceptance review rule by `xo73mt1`. Do not mark a
+numbered acceptance item complete from a suite count alone.

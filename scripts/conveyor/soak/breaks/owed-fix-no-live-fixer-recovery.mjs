@@ -48,6 +48,55 @@ export function probe(checkout, scenario = 'all') {
         tick: () => recoverOwedFixes(input, deps) };
     }
     const cases = {
+      // PR #7336 review: a flaky recovery-only login probe must preserve ordinary consumer dispatch.
+      ordinaryAuthFlake() {
+        for (const kind of ['fix', 'ci-heal']) {
+          const f = fixture({ fixClaim: null });
+          f.deps.readClaims = () => [];
+          f.deps.authGate = () => { throw new Error('login probe timed out'); };
+          const row = { ...f.row, kind };
+          const plan = { dispatch: [row], refusals: [], notes: [] };
+          recovery.applyOwedFixRecovery(plan, { kinds: [kind], input: f.input, io: f.deps });
+          deepStrictEqual(plan.dispatch, [row], 'ordinary dispatch must survive a recovery auth flake');
+          deepStrictEqual(plan.refusals, []);
+        }
+      },
+      kindIsolation() {
+        const f = fixture({ fixClaim: null });
+        f.deps.readClaims = () => [];
+        const tick = kind => {
+          const plan = { dispatch: [{ ...f.row, kind }], refusals: [], notes: [] };
+          recovery.applyOwedFixRecovery(plan, { kinds: [kind], input: f.input, io: f.deps });
+          return plan.dispatch.length;
+        };
+        strictEqual(tick('ci-heal'), 1);
+        f.input.now += 30 * minute; strictEqual(tick('ci-heal'), 1);
+        f.input.now += 30 * minute; strictEqual(tick('ci-heal'), 0);
+        strictEqual(f.published.length, 1);
+        strictEqual(tick('fix'), 1, 'a CI-heal escalation must not suppress the subsequent review repair');
+        strictEqual(tick('fix'), 0, 'the new kind still reserves its own initial attempt');
+      },
+      releaseFailure() {
+        for (const throws of [false, true]) {
+          const f = fixture();
+          let attempts = 0, reservedAtRelease;
+          f.deps.releaseClaim = () => {
+            attempts += 1;
+            reservedAtRelease = [...f.state.values()][0]?.retryAt;
+            if (throws) throw new Error('release failed');
+            return { released: false };
+          };
+          const retryAt = f.input.now;
+          deepStrictEqual(f.tick().dispatch, []);
+          strictEqual(reservedAtRelease, retryAt, 'persist reservation before release');
+          f.input.now += minute; deepStrictEqual(f.tick().dispatch, []);
+          f.input.now += 29 * minute; deepStrictEqual(f.tick().dispatch, []);
+          f.input.now += 30 * minute; deepStrictEqual(f.tick().dispatch, []);
+          strictEqual(attempts, 1);
+          strictEqual(f.published.length, 1);
+          strictEqual(f.updates.length, 1);
+        }
+      },
       // Live PR #7336 red team: the daemon reconciles through its pass plan cache, which serves STRUCTURED CLONES
       // (and the routed CI-heal lambda wraps that again). Recovery must still run on such a plan.
       cachedPlan() {
