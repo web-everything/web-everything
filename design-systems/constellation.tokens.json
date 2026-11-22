@@ -140,7 +140,7 @@
         "name": "signal-failed",
         "value": {
           "dusk": "#ff8aa0",
-          "day": "#c2264a"
+          "day": "#bc2548"
         },
         "usage": "Status text and dot: a check or build failed. Always with the word 'Failed' and a cross; differs from landed by word and icon, not hue alone."
       },
@@ -195,8 +195,8 @@
       {
         "name": "signal-warn",
         "value": {
-          "dusk": "#f2cf4e",
-          "day": "#865e00"
+          "dusk": "#ead053",
+          "day": "#756200"
         },
         "usage": "Amber warning; sun is needs-you only. Warn always carries a word or icon."
       },
@@ -243,7 +243,7 @@
         "name": "failed-soft",
         "value": {
           "dusk": "#3c254a",
-          "day": "#f5dce2"
+          "day": "#f4dce2"
         },
         "usage": "16 percent signal-failed over surface; soft status or selection fill.",
         "derive": {
@@ -255,8 +255,8 @@
       {
         "name": "warn-soft",
         "value": {
-          "dusk": "#3a303d",
-          "day": "#ece5d6"
+          "dusk": "#39303e",
+          "day": "#e9e6d6"
         },
         "usage": "16 percent signal-warn over surface; soft status or selection fill.",
         "derive": {

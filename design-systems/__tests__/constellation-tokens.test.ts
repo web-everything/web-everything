@@ -16,7 +16,7 @@ const allowedAdditions = [
   'track', 'ribbon', 'tip-bg', 'tip-ink', 'hatch-ground', 'hatch-ink',
 ];
 // Designer-ruled day-theme contrast fixes over the archive (DZ-DS).
-const dayContrastOverrides: Record<string, string> = { 'signal-running': '#0a717d', 'signal-landed': '#0e7457' };
+const dayContrastOverrides: Record<string, string> = { 'signal-running': '#0a717d', 'signal-landed': '#0e7457', 'signal-failed': '#bc2548' };
 const allowedTopLevelAdditions = ['hatch'];
 const allowedTypeAdditions = ['appFonts', 'familyUsage'];
 const tokens = source.color.tokens as Token[];
@@ -95,9 +95,10 @@ describe('Constellation token source', () => {
       ['line-strong', 'surface', 3], ['on-sun', 'sun', 4.5], // archive values give 9.6:1; the designer floor is 4.5.
       ['on-accent', 'accent', 4.5], ['signal-warn', 'surface', 4.5],
       ['hatch-ink', 'hatch-ground', 3],
-      // Signal text on its own soft tint. failed is excluded: its archive day value (#c2264a) gives 4.42:1 and is not in the designer's fix list.
+      // Signal text on its own soft tint.
       ['accent', 'accent-soft', 4.5], ['signal-running', 'running-soft', 4.5],
       ['signal-landed', 'landed-soft', 4.5], ['signal-warn', 'warn-soft', 4.5],
+      ['signal-failed', 'failed-soft', 4.5],
     ];
     for (const theme of themes) for (const [fg, bg, minimum] of pairs) {
       const a = luminance(hex(fg, theme)), b = luminance(hex(bg, theme));
@@ -125,7 +126,7 @@ describe('Constellation token source', () => {
   it('warn is not sun', () => {
     for (const theme of themes) for (const other of ['sun', 'signal-needs-you']) {
       const difference = Math.abs(hue(hex('signal-warn', theme)) - hue(hex(other, theme)));
-      expect(Math.min(difference, 360 - difference), `${theme}: warning hue must differ from ${other} by at least 20 degrees`).toBeGreaterThanOrEqual(20); // designer-ruled day warn #865e00 is 22 degrees from sun
+      expect(Math.min(difference, 360 - difference), `${theme}: warning hue must differ from ${other} by at least 28 degrees`).toBeGreaterThanOrEqual(28); // designer pick: warn at hue 50
     }
     expect(token('signal-warn').usage).toContain('sun is needs-you only');
     expect(token('signal-warn').usage).toContain('Warn always carries a word or icon');
