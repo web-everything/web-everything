@@ -36,11 +36,17 @@ export function createHotpatchRunner({ adapter: a, read, append }) {
     await intent(r, 'audit'); await a.perform(r, 'audit');
     await write(r, { phase: 'effect-done', effect: 'audit', idempotencyKey: key(r, 'audit') });
   };
-  const tick = async (r = read().findLast(v => v.phase === 'run')?.run) => {
-    if (!r) return;
+  const tick = async r => {
+    if (!r) {
+      for (const { run } of read().filter(v => v.phase === 'run')) {
+        try { if (run) await tick(run); } catch { /* A broken run or escalation sink cannot abandon its siblings. */ }
+      }
+      return;
+    }
     try {
-      const policy = await a.policy(), current = state(r);
+      const current = state(r);
       if (flow.definition.states[current].kind === 'final') return;
+      const policy = await a.policy();
       if (current === 'pin') { await intent(r, 'pin'); await a.perform(r, 'pin'); }
       if (current === 'await') {
         if ((await a.read(r, 'receipt')).outcome === 'pass') {

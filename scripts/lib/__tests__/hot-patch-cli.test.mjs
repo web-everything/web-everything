@@ -214,3 +214,37 @@ it('malformed terminal journal completion escalates before monitoring can stop',
   expect(f.io.remove).not.toHaveBeenCalled();
   expect(() => f.runner.status(7)).toThrow();
 });
+
+async function twoLiveRuns() {
+  const f = fixture(); await waiting(f); await f.runner.tick();
+  const second = await f.runner.request(7, 'fix'); await f.runner.tick(second); await f.runner.tick(second);
+  expect(f.runner.status(7).map(r => r.state)).toEqual(['live', 'live']); return f;
+}
+it('one default tick unloads both live daemon runs after evidence fails', async () => {
+  const f = await twoLiveRuns(); f.io.live = () => 'fail'; await f.runner.tick();
+  expect(f.io.remove.mock.calls.map(([r]) => r.daemon).sort()).toEqual(['fix', 'review']);
+  expect(f.runner.status(7).map(r => r.state)).toEqual(['refused', 'refused']);
+  await f.runner.tick(); expect(f.io.remove).toHaveBeenCalledTimes(2);
+});
+it('a throwing run does not prevent another live run from being processed', async () => {
+  const f = await twoLiveRuns(); f.io.live = () => 'fail';
+  f.io.remove.mockImplementation(r => { if (r.daemon === 'review') throw Error('remove unavailable'); });
+  await f.runner.tick();
+  expect(f.io.remove.mock.calls.map(([r]) => r.daemon)).toEqual(['review', 'fix']);
+  expect(f.runner.status(7).map(r => r.state)).toEqual(['live', 'refused']);
+});
+it('malformed replay in one run escalates without abandoning the other live run', async () => {
+  const f = await twoLiveRuns(), first = f.log.find(v => v.phase === 'run');
+  f.log.push({ runKey: first.runKey, phase: 'done', transition: { predicate: { route: 'advance', to: 'refused' } } });
+  f.io.live = () => 'fail'; await f.runner.tick();
+  expect(f.io.remove.mock.calls.map(([r]) => r.daemon)).toEqual(['fix']);
+  expect(f.log).toContainEqual(expect.objectContaining({ runKey: first.runKey, phase: 'escalation' }));
+});
+
+it('an escalation write throwing in one run cannot stop the other live run', async () => {
+  const f = await twoLiveRuns(); f.io.live = () => 'fail';
+  f.io.remove.mockImplementation(r => { if (r.daemon === 'review') throw Error('remove failed'); });
+  f.io.afterAppend = row => { if (row.phase === 'escalation' && row.runKey.includes(':review:')) throw Error('journal sink failed'); };
+  await f.runner.tick();
+  expect(f.io.remove.mock.calls.map(([r]) => r.daemon)).toEqual(['review', 'fix']);
+});

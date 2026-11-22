@@ -1198,3 +1198,82 @@ describe('hotpatch canonical evidence at finalization', () => {
     },
   );
 });
+
+it('mismatched pinned hotpatch refuses just like an unavailable ordinary pinned overlay', async () => {
+  const f = await fixture(), hp = `hotpatch/${f.a}`;
+  gitOk(f.root, ['update-ref', `refs/remotes/origin/${hp}`, f.b]);
+  const plain = await f.plan({ overlays: [{ ref: 'lane/missing', pr: 42, pinned: true }] });
+  const hot = await f.plan({ overlays: [{ ref: hp, pr: 42, pinned: true }] });
+  expect(plain).toMatchObject({ ok: false, reason: 'pinned-overlay-unavailable' });
+  expect(hot).toMatchObject({ ok: false, reason: plain.reason, detail: { pinnedBy: 'flag' } });
+});
+it('a previously adopted hotpatch whose ref moved raises established loss instead of silently planning main', async () => {
+  const f = await fixture(), hp = `hotpatch/${f.a}`, overlays = [{ ref: hp, pr: 42 }];
+  gitOk(f.root, ['update-ref', `refs/remotes/origin/${hp}`, f.a]);
+  const live = await f.plan({ headSha: f.base, overlays, auditedTip: null });
+  expect(live.applied).toContainEqual(expect.objectContaining({ ref: hp, sha: f.a }));
+  gitOk(f.root, ['update-ref', `refs/remotes/origin/${hp}`, f.b]);
+  const moved = await f.plan({ headSha: live.finalSha, overlays, auditedTip: null });
+  expect(moved.decisions).toContainEqual(expect.objectContaining({ ref: hp, action: 'skip', reason: 'hotpatch-ref-sha-mismatch' }));
+  expect(moved.establishedLost).toContainEqual(expect.objectContaining({ ref: hp }));
+  expect(moved.alerts).toContainEqual(expect.objectContaining({ kind: 'established-overlay-dropped', detail: expect.objectContaining({ ref: hp }) }));
+});
+it('a mismatched hotpatch cannot serve as a containing stack top', async () => {
+  const f = await fixture(), hp = `hotpatch/${f.a}`;
+  gitOk(f.root, ['update-ref', `refs/remotes/origin/${hp}`, f.b]);
+  gitOk(f.root, ['update-ref', 'refs/remotes/origin/lane/base', f.a]);
+  const built = await f.plan({ headSha: f.base, auditedTip: null, overlays: [
+    { ref: 'lane/base', pr: 41 }, { ref: hp, pr: 42, stackBases: ['lane/base'] },
+  ] });
+  expect(built.applied).toContainEqual(expect.objectContaining({ ref: 'lane/base', sha: f.a }));
+  expect(built.decisions.some(d => d.ref === 'lane/base' && d.reason === 'stack-contained')).toBe(false);
+});
+it.each(['revoked', 'unreadable'])('stack-contained hotpatch %s evidence refuses finalization with ready-audit-revoked', async evidence => {
+  const f = await fixture(), hp = `hotpatch/${f.a}`;
+  const env = { ...process.env, ...f.env, WE_DAEMON_STATE_DIR: join(f.dir, 'state'), WE_DAEMON_OVERLAY_DIR: join(f.dir, 'overlays') };
+  gitOk(f.root, ['remote', 'add', 'origin', f.root]);
+  gitOk(f.root, ['update-ref', `refs/heads/${hp}`, f.a]);
+  gitOk(f.root, ['update-ref', `refs/remotes/origin/${hp}`, f.a]);
+  gitOk(f.root, ['update-ref', 'refs/remotes/origin/lane/top', f.b]);
+  const built = await f.plan({ headSha: f.base, auditedTip: () => true, overlays: [
+    { ref: hp, pr: 42 }, { ref: 'lane/top', pr: 43, stackBases: [hp] },
+  ] });
+  expect(built.decisions).toContainEqual(expect.objectContaining({ ref: hp, reason: 'stack-contained', sha: f.a }));
+  expect(built.applied.map(a => a.ref)).toEqual(['lane/top']);
+  const { data, readers } = hotpatchFixture();
+  for (const c of data.checks.check_runs) c.head_sha = f.a;
+  data.workflows.workflow_runs[0].head_sha = f.a; data.audits[0].head = f.a;
+  if (evidence === 'revoked') { data.audits[0].verdict = 'WEAKENED'; data.audits[0].findings = ['security']; }
+  else readers.audits = () => { throw Error('ledger unreadable'); };
+  const factory = vi.spyOn(hotpatchReaders, 'createHotpatchReaders').mockReturnValue(readers);
+  try {
+    const done = await finalizeRebuild({ root: f.root, env, log: { error() {} },
+      run: (args, opts) => spawnSync('git', args, { ...opts, encoding: 'utf8' }), now: () => Date.now(),
+      prevHead: f.b, plan: built, lease: { token: 'contained-hotpatch' } });
+    expect(done).toMatchObject({ moved: false, reason: 'ready-audit-revoked' });
+    expect(done.alerts).toContainEqual(expect.objectContaining({ kind: 'ready-audit-revoked', detail: expect.objectContaining({ refs: [hp] }) }));
+    expect(gitOk(f.root, ['rev-parse', 'HEAD'])).toBe(f.b);
+  } finally { factory.mockRestore(); }
+});
+it.each(['missing sha', 'missing ref', 'git throws'])('contained hotpatch identity/evidence %s fails closed', async kind => {
+  const hp = `hotpatch/${'a'.repeat(40)}`;
+  const decision = { ref: hp, sha: 'a'.repeat(40), action: 'skip', reason: 'stack-contained', tops: ['lane/top'] };
+  if (kind === 'missing sha') delete decision.sha;
+  if (kind === 'missing ref') delete decision.ref;
+  const revoked = await auditedTips.revokedHotpatchTips({ applied: [{ ref: 'lane/top', sha: 'b'.repeat(40) }], decisions: [decision],
+    git: () => { throw Error('unreadable git'); }, readers: hotpatchFixture().readers });
+  expect(revoked).toHaveLength(1);
+});
+
+it.each(['stack-contained', 'stack-base-moved', 'pinned-contained-in-applied'])(
+  'contained hotpatch %s checks its own sha once and never trusts ordinary top evidence', async reason => {
+    const sha = 'a'.repeat(40), ref = `hotpatch/${sha}`, { readers } = hotpatchFixture();
+    const audits = vi.fn(readers.audits); readers.audits = audits;
+    const options = { applied: [{ ref: 'lane/top', sha: 'b'.repeat(40) }],
+      decisions: [{ ref, sha, action: 'skip', reason, tops: ['lane/top'] }], readers,
+      git: args => ({ status: args[0] === 'config' ? 1 : 0, stdout: sha }) };
+    expect(await auditedTips.revokedHotpatchTips(options)).toEqual([]);
+    expect(audits).toHaveBeenCalledWith(sha);
+    readers.audits = () => { throw Error('canonical ledger unreadable'); };
+    expect(await auditedTips.revokedHotpatchTips(options)).toEqual([ref]);
+  });

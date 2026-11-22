@@ -494,7 +494,7 @@ async function finalizeRebuildLocked({
     return terminal({ moved: false, reason: 'drop-pending-unsettled', plan });
   }
 
-  const revokedHotpatch = isRollback ? [] : await revokedHotpatchTips({ applied: plan.applied, git, root, env });
+  const revokedHotpatch = isRollback ? [] : await revokedHotpatchTips({ applied: plan.applied, decisions: plan.decisions, git, root, env });
   if (revokedHotpatch.length) {
     alert('ready-audit-revoked', { target: plan.finalSha, refs: revokedHotpatch,
       message: 'Hotpatch evidence is incomplete or revoked; obtain fresh CI and audit evidence or use the normal merge path.' });

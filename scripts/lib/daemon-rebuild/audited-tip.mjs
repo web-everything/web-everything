@@ -93,16 +93,23 @@ export function revokedAppliedTips({
 }
 
 /** Re-read canonical evidence after smoke, including first adoption and follow mode. */
-export async function revokedHotpatchTips({ applied = [], git, root, env, readers }) {
+export async function revokedHotpatchTips({ applied = [], decisions = [], git, root, env, readers }) {
   const revoked = [];
   let admissionReaders = readers;
   git = pathBEvidenceGit(git);
-  for (const { ref, sha } of applied) {
-    if (!ref?.startsWith('hotpatch/')) continue;
-    if (!/^hotpatch\/[0-9a-f]{40}$/.test(ref) || ref !== `hotpatch/${sha}`
-      || git(['fetch', '--quiet', '--', 'origin', `+refs/heads/${ref}:refs/remotes/origin/${ref}`]).status !== 0
-      || verifyRev(git, `refs/remotes/origin/${ref}^{commit}`) !== sha
-      || (await admitHotpatch(sha, (admissionReaders ??= createHotpatchReaders({ cwd: root, env })))).outcome !== 'pass') revoked.push(ref);
+  const contained = decisions.filter(d => ['stack-contained', 'stack-base-moved', 'pinned-contained-in-applied'].includes(d.reason ?? d.action)
+    && (typeof d.ref !== 'string' || d.ref.startsWith('hotpatch/')));
+  const seen = new Set();
+  for (const { ref, sha } of [...applied, ...contained]) {
+    if (typeof ref !== 'string' || !ref) { revoked.push('unidentified-contained-overlay'); continue; }
+    if (!ref.startsWith('hotpatch/') || seen.has(`${ref}:${sha}`)) continue;
+    seen.add(`${ref}:${sha}`);
+    try {
+      if (!/^hotpatch\/[0-9a-f]{40}$/.test(ref) || ref !== `hotpatch/${sha}`
+        || git(['fetch', '--quiet', '--', 'origin', `+refs/heads/${ref}:refs/remotes/origin/${ref}`]).status !== 0
+        || verifyRev(git, `refs/remotes/origin/${ref}^{commit}`) !== sha
+        || (await admitHotpatch(sha, (admissionReaders ??= createHotpatchReaders({ cwd: root, env })))).outcome !== 'pass') revoked.push(ref);
+    } catch { revoked.push(ref); }
   }
   return revoked;
 }

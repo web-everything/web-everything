@@ -341,14 +341,10 @@ export async function planRebuild({
   const alerts = [];
   const decisions = [];
   const applied = [];
-  // Reject before stack analysis, so a mutable hotpatch cannot be used as a containing top either.
-  overlays = overlays.filter(o => {
-    if (!o?.ref?.startsWith('hotpatch/')) return true;
-    if (/^hotpatch\/[a-f0-9]{40}$/.test(o.ref)
-      && verifyRev(git, `refs/remotes/origin/${o.ref}^{commit}`) === o.ref.slice(9)) return true;
-    decisions.push({ ref: o.ref, pr: o.pr ?? null, action: 'skip', reason: 'hotpatch-ref-sha-mismatch', sha: null });
-    return false;
-  });
+  // Keep unavailable hotpatches visible to pin/history loss protection, but never use them in stacks.
+  const invalidHotpatch = new Set(overlays.filter(o => o?.ref?.startsWith('hotpatch/')
+    && (!/^hotpatch\/[a-f0-9]{40}$/.test(o.ref)
+      || verifyRev(git, `refs/remotes/origin/${o.ref}^{commit}`) !== o.ref.slice(9))).map(o => o.ref));
   let cur = mainSha;
   let holdFailure = null;
   const holdRefusal = () => ({
@@ -436,7 +432,7 @@ export async function planRebuild({
   // the merge base for its top and make that top clean too. Containment alone cannot justify reordering it.
   const deferredContainers = new Map();
   if (stackMode === 'tops' && headSha) {
-    const entries = toProcess.map((raw) => ({
+    const entries = toProcess.filter(raw => !invalidHotpatch.has(raw?.ref)).map((raw) => ({
       raw, sha: raw?.ref ? verifyRev(git, `refs/remotes/origin/${raw.ref}^{commit}`) : null,
     }));
     for (const base of entries) {
@@ -483,7 +479,7 @@ export async function planRebuild({
   // Held item 212 (live 2026-10-10) — stacked overlay PRs are one stack: apply only its tops. See planOverlayStacks.
   const stacks = stackMode === 'tops' && listed.length > 1
     ? await planOverlayStacks({
-      git, mainSha, overlays: listed, stateOf, prBaseChain, keepIndependent, headSha, prForcePushes,
+      git, mainSha, overlays: listed.filter(o => !invalidHotpatch.has(o?.ref)), stateOf, prBaseChain, keepIndependent, headSha, prForcePushes,
       isPinned: (raw, sha) => pinnedStatus(git, raw, mainSha, sha).pinned,
     })
     : { setAside: new Map(), tops: [], unconfirmed: [], unknown: [] };
@@ -620,6 +616,13 @@ export async function planRebuild({
     const ref = raw?.ref;
     const pr = raw?.pr ?? null;
 
+    if (invalidHotpatch.has(ref)) {
+      const pin = pinnedStatus(git, raw, mainSha, verifyRev(git, `refs/remotes/origin/${ref}^{commit}`));
+      if (pin.pinned) return refusePinned(ref, pr, null, 'hotpatch-ref-sha-mismatch', pin.why);
+      decisions.push({ ref, pr, action: 'skip', reason: 'hotpatch-ref-sha-mismatch', sha: /^hotpatch\/[a-f0-9]{40}$/.test(ref) ? ref.slice(9) : null });
+      continue;
+    }
+
     // 1. PR state — MERGED/CLOSED means the overlay is moot; never call prState for a PR-less overlay.
     const state = await stateOf(pr);
     if (state === 'MERGED' || state === 'CLOSED') {
@@ -644,10 +647,6 @@ export async function planRebuild({
     }
     // unaudited-tip — noPin only controls conflict pins; it must never bypass audit evidence.
     let unauditedFrom = null;
-    if (ref.startsWith('hotpatch/') && ovSha !== ref.slice(9)) {
-      decisions.push({ ref, pr, action: 'skip', reason: 'hotpatch-ref-sha-mismatch', sha: null });
-      continue;
-    }
     const heldAt = ref.startsWith('hotpatch/') ? null : holdUnauditedTip(ref, pr, ovSha);
     if (heldAt) {
       unauditedFrom = ovSha;
@@ -939,7 +938,8 @@ export async function planRebuild({
   const establishedLost = [];
   for (const d of decisions) {
     const pinSkipped = d.action === 'skip' && d.reason === 'pinned-overlay-conflict-skipped';
-    if (!pinSkipped && (d.action !== 'drop' || d.reason !== 'conflict')) continue;
+    const mismatch = d.action === 'skip' && d.reason === 'hotpatch-ref-sha-mismatch';
+    if (!mismatch && !pinSkipped && (d.action !== 'drop' || d.reason !== 'conflict')) continue;
     const files = conflictFiles.get(d.ref) ?? [];
     const carriedSurvives = carriedHeads.has(d.ref)
       && carriedHeads.get(d.ref).every((sha) => git(['merge-base', '--is-ancestor', sha, cur]).status === 0);
@@ -952,8 +952,8 @@ export async function planRebuild({
     // An ESTABLISHED current tip always holds: another carrier preserving only an OLDER recorded tip says nothing
     // about the newer live changes. The carriedSurvives exception applies only to changed-tip newcomers.
     if (establishedRefs.has(d.ref) || (carriedRefs.has(d.ref) && !carriedSurvives)) {
-      establishedLost.push({ ref: d.ref, pr: d.pr, sha: d.sha, reason: pinSkipped ? 'pinned-conflict-skipped' : 'conflict', files });
-      const live = `LIVE overlay ${d.ref}${d.pr != null ? ` (PR #${d.pr})` : ''} is in the running build but conflicts on ${files.join(', ') || '?'} — this rebuild drops it; `;
+      establishedLost.push({ ref: d.ref, pr: d.pr, sha: d.sha, reason: mismatch ? d.reason : pinSkipped ? 'pinned-conflict-skipped' : 'conflict', files });
+      const live = mismatch ? `LIVE overlay ${d.ref} has an unavailable immutable ref — this rebuild drops it; ` : `LIVE overlay ${d.ref}${d.pr != null ? ` (PR #${d.pr})` : ''} is in the running build but conflicts on ${files.join(', ') || '?'} — this rebuild drops it; `;
       alerts.push({
         kind: 'established-overlay-dropped',
         detail: {
@@ -968,6 +968,7 @@ export async function planRebuild({
       // priority, but prepare must hold rather than adopt a build without the previous tip's live changes.
       if (establishedRefs.has(d.ref)) continue;
     }
+    if (mismatch) continue;
     const collidesWith = applied
       .filter((a) => establishedRefs.has(a.ref))
       .map((a) => ({ ref: a.ref, pr: a.pr, files: changedFiles(git, mainSha, a.sha).filter((p) => files.includes(p)) }))
