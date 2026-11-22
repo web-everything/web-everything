@@ -310,6 +310,22 @@ it('every shared write is fsynced before its rename and its directory after', as
     expect(log.slice(at).some(e => e[0] === 'fsync' && e[1] === path.dirname(dst))).toBe(true);
   }
 });
+it('a directory fsync failure after the rename never drops or rolls back a committed write', async () => {
+  const h = harness(), fds = new Map();
+  const io = { ...fs,
+    openSync: (file, flags) => { const fd = fs.openSync(file, flags); fds.set(fd, file); return fd; },
+    fsyncSync: fd => { if (fs.statSync(fds.get(fd)).isDirectory()) throw Object.assign(Error('EIO: i/o error'), { code: 'EIO' }); fs.fsyncSync(fd); } };
+  await writeChangeEvidenceForMerged({ ...h.options, io });
+  expect(h.emit).not.toHaveBeenCalled(); expect(h.pending()).toEqual([]); expect(fs.existsSync(h.file)).toBe(true);
+  expect(JSON.parse(fs.readFileSync(path.join(h.dir, 'index.jsonl'), 'utf8')).file).toBe(path.basename(h.file));
+});
+it('a torn tail shorter than a full row prefix is still dropped', async () => {
+  const h = harness(), index = path.join(h.dir, 'index.jsonl');
+  fs.mkdirSync(h.dir, { recursive: true }); fs.writeFileSync(index, '{"file":"1-x.json"}\n{"fi');
+  await writeChangeEvidenceForMerged(h.options);
+  expect(h.pending()).toEqual([]);
+  expect(fs.readFileSync(index, 'utf8').trim().split('\n').map(line => JSON.parse(line).file)).toEqual(['1-x.json', path.basename(h.file)]);
+});
 it.each([['pending ledger', h => path.join(h.options.coordination, 'change-evidence-pending.json'), /pending ledger/],
   ['incoming batch', h => path.join(h.options.coordination, 'change-evidence-incoming', 'zz-empty.json'), /incoming evidence batch/],
   ['existing record', h => h.file, /existing record/]])(

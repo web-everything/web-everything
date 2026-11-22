@@ -5990,9 +5990,10 @@ The shadow `index.jsonl` is only ever replaced whole by an atomic rename, never 
 place, so a crash cannot leave a partial line. A torn, unterminated last row prefix from an
 older in-place append is dropped and its record re-indexed on retry; any other unreadable row
 or tail fails closed with the merge kept pending. Every shared write fsyncs the temporary file
-before its rename and the directory after, so a power loss cannot leave an empty file; an
-unparseable pending ledger, incoming batch or record fails closed naming the file to repair.
-The tests seed a torn tail, corrupt rows and tails, empty files and check the fsync order.
+before its rename and, best effort, the directory after (a failure after the rename is logged,
+never rolled back). macOS fsync is not a full flush, so an unparseable pending ledger, incoming
+batch or record still fails closed naming the file to repair. The tests seed torn and short
+tails, corrupt rows, empty files, a failing directory fsync, and check the fsync order.
 Backfill discovery pages all PRs newest-update first and stops at the first row updated
 before `--since` (a merge updates its PR), so a long merged history never blocks a recent
 window. Rows must carry a number and readable timestamps or the listing is refused; a window

@@ -31,15 +31,18 @@ function fsyncPath(io, target) {
   const fd = io.openSync(target, 'r');
   try { io.fsyncSync(fd); } finally { io.closeSync(fd); }
 }
-/** tmp + fsync + rename + directory fsync: neither a process crash nor a power loss leaves a torn or empty file. */
+/** tmp + fsync + rename + best-effort directory fsync: a process crash never leaves a torn file. */
 function atomic(io, file, bytes) {
   const dir = path.dirname(file);
   io.mkdirSync(dir, { recursive: true });
   const tmp = `${file}.${randomUUID()}.tmp`;
   try { io.writeFileSync(tmp, bytes); fsyncPath(io, tmp); io.renameSync(tmp, file); }
   finally { if (io.existsSync(tmp)) io.unlinkSync(tmp); }
-  // Some platforms refuse fsync on a directory; the file itself is already durable then.
-  try { fsyncPath(io, dir); } catch (error) { if (!['EISDIR', 'EINVAL', 'EPERM', 'EBADF'].includes(error.code)) throw error; }
+  // Best effort and never throws: the rename has already committed, and a throw here would make callers roll
+  // back (or retire) as if the write had failed. Some platforms also refuse fsync on a directory.
+  try { fsyncPath(io, dir); } catch (error) {
+    console.error(`change-evidence: directory fsync skipped after commit (${clean(error.code ?? error.message)})`);
+  }
 }
 function optional(io, file, fallback) {
   try { return io.readFileSync(file, 'utf8'); } catch (error) { if (error.code === 'ENOENT') return fallback; throw error; }
@@ -105,7 +108,7 @@ function indexLines(bytes) {
   const valid = (line, torn) => {
     let row;
     try { row = JSON.parse(line); } catch {
-      if (torn && line.startsWith(ROW_PREFIX)) {
+      if (torn && (line.startsWith(ROW_PREFIX) || ROW_PREFIX.startsWith(line))) {
         console.error('change-evidence: dropped a torn index.jsonl tail left by an interrupted append; re-indexing it');
         return false;
       }
@@ -147,7 +150,7 @@ function publish({ io, dir, record, retire }) {
       const row = JSON.stringify({ file: name, pr: record.predicate.change.number,
         mergeSha: record.subject[0].digest.gitCommit, recordedAt: record.predicate.recordedAt });
       // Never an in-place append: a crash mid-append leaves a partial line no retry could parse.
-      // Mark before the call: a failure after the rename (directory fsync) must still restore the old index.
+      // Mark before the call: restoring the identical old bytes after an early failure is harmless.
       indexWritten = true;
       atomic(io, index, [...lines, row].map(line => `${line}\n`).join(''));
     }
