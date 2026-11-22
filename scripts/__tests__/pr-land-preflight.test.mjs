@@ -456,6 +456,11 @@ describe('pr-land lane publish against real local remotes', () => {
     const { status, result } = publishReal(work, head);
     expect(status).toBe(3);
     expect(result.reason).toBe('push-failed');
+    // pr-land's own ancestry proof refused (not git's client-side rejection), so history was really completed.
+    expect(result.detail).toContain('on the push target is ahead or diverged');
+    expect(git(work, 'rev-parse', '--is-shallow-repository')).toBe('false');
+    // The history fetch wrote no remote-tracking ref for the lane branch (FETCH_HEAD only).
+    expect(git(work, 'for-each-ref', '--format=%(refname)', 'refs/remotes/origin/lane')).toBe('');
     expect(tipOf(upstream)).toBe(diverged);
   }), 30_000);
 });

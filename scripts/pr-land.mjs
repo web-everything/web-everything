@@ -984,18 +984,31 @@ async function runCli() {
 
   // git's OWN non-force push checks fast-forward on the client: in a shallow clone, or with the push target's tip
   // object missing locally, it rejects even a true fast-forward ("fetch first" / non-fast-forward). So before the
-  // push, best-effort: unshallow from REMOTE, then fetch the tip from the push URL (the one URL pushSkipDecision
-  // proved ls-remote and the push both contact). Each fetch is bounded and its failure is ignored: the guarded
-  // push still runs and git decides. It never forces and never moves a local branch (the tip lands in FETCH_HEAD).
+  // push, best-effort: unshallow, then fetch the tip from the push URL (the one URL pushSkipDecision proved
+  // ls-remote and the push both contact). Both fetches name an explicit refspec with an empty --refmap, so they
+  // write only FETCH_HEAD (no remote-tracking ref, no prune, no local branch), and they never force. Each one is
+  // bounded, never prompts, and a failure is ignored with one stderr line: the guarded push still runs and git
+  // decides. The unshallow tries REMOTE (the fetch URL) and falls back to the push URL when the clone stays shallow.
   function completeHistoryForPush({ remoteTip, pushUrl, remoteHeadRef }) {
+    const quietEnv = { ...process.env, GIT_TERMINAL_PROMPT: '0', GIT_NO_LAZY_FETCH: '1',
+      GIT_SSH_COMMAND: process.env.GIT_SSH_COMMAND || 'ssh -o BatchMode=yes' };
     const fetchQuiet = (args) => {
       try {
-        execFileSync('git', ['fetch', '-q', '--no-tags', ...args], { cwd: REPO, stdio: ['ignore', 'ignore', 'pipe'],
-          timeout: 120_000, maxBuffer: 1024 * 1024, env: { ...process.env, GIT_TERMINAL_PROMPT: '0' } });
-      } catch { /* best effort: the push runs and git validates */ }
+        execFileSync('git', ['fetch', '-q', '--no-tags', '--refmap=', ...args], { cwd: REPO, stdio: ['ignore', 'ignore', 'pipe'],
+          timeout: 120_000, maxBuffer: 1024 * 1024, env: quietEnv });
+      } catch (e) {
+        process.stderr.write(`pr-land [${REPO}] · history fetch before push failed (${String(e?.message || e).split('\n')[0]}); pushing anyway\n`);
+      }
     };
-    if (tryGit(['rev-parse', '--is-shallow-repository']) === 'true') fetchQuiet(['--unshallow', REMOTE]);
-    if (pushUrl && tryGit(['cat-file', '-e', `${remoteTip}^{commit}`]) === null) fetchQuiet(['--', pushUrl, remoteHeadRef]);
+    const isShallow = () => tryGit(['rev-parse', '--is-shallow-repository']) === 'true';
+    if (isShallow()) fetchQuiet(['--unshallow', REMOTE, remoteHeadRef]);
+    if (isShallow() && pushUrl) fetchQuiet(['--unshallow', '--', pushUrl, remoteHeadRef]);
+    let tipPresent = false;
+    try {
+      execFileSync('git', ['cat-file', '-e', `${remoteTip}^{commit}`], { cwd: REPO, stdio: 'ignore', timeout: 30_000, env: quietEnv });
+      tipPresent = true;
+    } catch { /* missing (a partial clone never lazy-fetches here): fetch it from the push URL */ }
+    if (pushUrl && !tipPresent) fetchQuiet(['--', pushUrl, remoteHeadRef]);
   }
 
   // Refuse before pushing ONLY on proof that the push target's tip is not an ancestor of refSha: merge-base exits
