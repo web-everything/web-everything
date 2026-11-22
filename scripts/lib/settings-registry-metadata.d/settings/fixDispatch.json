@@ -1,0 +1,6 @@
+{
+  "description": "Fix slot borrowing, parked-run accounting and completion release policy.",
+  "owner": "scripts/dispatch-settings.json",
+  "changeVia": "pr",
+  "instant": false
+}

@@ -1600,6 +1600,30 @@ describe('tryResumeFix — #xu2krte Fork 1, and #xazl9u3\'s whole reason to exis
 describe('runReconcileFixDispatch — read reconcile-pass, plan, assign a lane, dispatch', () => {
   const reconcileStub = (dispatchEntries) => () => ({ dispatch: dispatchEntries, refusals: [], notes: [], prs: dispatchEntries.length, agents: 0 });
 
+  it.each(['numbers', 'predicate', 'empty'])('passes %s exclusions to reconcile before writes and retains the dispatch guard', mode => {
+    const predicate = vi.fn(entry => entry.prNumber === 1764);
+    const reconcile = vi.fn(options => {
+      expect(options.allowStandDownAutoProceed).toBe(true);
+      if (mode === 'empty') expect(options).not.toHaveProperty('skipStandDownPrs');
+      else {
+        expect(options.skipStandDownPrs({ number: 1764 })).toBe(true);
+        expect(options.skipStandDownPrs({ prNumber: 1764 })).toBe(true);
+        expect(options.skipStandDownPrs({ number: 1765 })).toBe(false);
+        if (mode === 'predicate') expect(predicate.mock.calls.map(([entry]) => entry))
+          .toEqual([{ prNumber: 1764 }, { prNumber: 1764 }, { prNumber: 1765 }]);
+      }
+      return { dispatch: [{ kind: 'fix', prNumber: 1764, headRefName: 'lane/3438-wire-reconcile-pass' }], refusals: [] };
+    });
+    const result = runReconcileFixDispatch({ root: '/repo', checkStaleness: FRESH,
+      excludePrs: mode === 'predicate' ? predicate : mode === 'numbers' ? [1764] : [],
+      allowStandDownAutoProceed: true, reconcile, findItemFn: findItemStub, loadItems: () => [],
+      pickFreeLanes: () => [], fetchItemlessDiffPaths: () => [],
+    });
+    expect(reconcile).toHaveBeenCalledTimes(1);
+    expect(result.refusals).toContainEqual(expect.objectContaining(mode === 'empty'
+      ? { pr: 1764, kind: 'no-lane' } : { prNumber: 1764, kind: 'orphan-guard-deferred' }));
+  });
+
   it('dispatches every dispatchable fix entry and assigns each its own free lane, in order', () => {
     const entries = [
       { kind: 'fix', prNumber: 1764, headRefName: 'lane/3438-wire-reconcile-pass' },

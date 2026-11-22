@@ -47,7 +47,7 @@ export default {
           return yieldNow;
         },
         checkStaleness: () => ({}), readHeadCheckState: () => ({ state: 'green' }),
-        readPrLabels: () => [], clearAwaitingCi: () => {},
+        readPrLabels: () => [], readComments: () => [], clearAwaitingCi: () => {},
         deadlineAt: 60 * 60_000, now: () => time,
       });
       const report = { result, events };

@@ -36,11 +36,11 @@ import { readLiveFixClaim } from './fix-procedure.mjs';
 import { CONFLICT_LABEL } from './conflict-label.mjs';
 import { LIST_COMMENTS_PAGE_SIZE, readCompletePrComments } from './pr-comments-complete.mjs';
 import {
-  isDraftOwedPromotion, isPromotionCandidate, promotionStepDue, resolveDraftPromotionSettings,
+  isOperatorParked, isDraftOwedPromotion, isPromotionCandidate, promotionStepDue, resolveDraftPromotionSettings,
 } from './draft-promotion-rule.mjs';
 
 export const DRAFT_LIST_FIELDS = 'number,state,isDraft,headRefName,headRefOid,baseRefName,labels,isCrossRepository';
-/** The one fresh read per candidate: everything the tick's pre-`promote-draft` refusals and the rule decide on. */
+/** The fresh reads before planning and writing: everything the tick's pre-`promote-draft` refusals and the rule decide on. */
 export const PR_VIEW_FIELDS = 'number,state,isDraft,headRefName,headRefOid,baseRefName,labels,comments,body,statusCheckRollup,mergeStateStatus,mergeable,isCrossRepository';
 
 /** The one list read per repo: open drafts only. */
@@ -127,7 +127,7 @@ export function runDraftPromotionStep({
       if (!view || typeof view !== 'object') { row('error', 'pr view: no record returned'); continue; }
       if (view.headRefOid !== pr.headRefOid) { row('skip', `head moved since the check read (${String(pr.headRefOid).slice(0, 9)} → ${String(view.headRefOid).slice(0, 9)}) — the next step re-reads it`); continue; }
       const fresh = isDraftOwedPromotion({
-        pr: { ...pr, state: view.state, isDraft: view.isDraft, headRefName: view.headRefName, baseRefName: view.baseRefName, mergeable: view.mergeable, labels: view.labels, isCrossRepository: view.isCrossRepository },
+        pr: { ...pr, state: view.state, isDraft: view.isDraft, headRefName: view.headRefName, baseRefName: view.baseRefName, mergeable: view.mergeable, labels: view.labels, comments: view.comments, isCrossRepository: view.isCrossRepository },
         checks,
       });
       if (!fresh.owed) { row('skip', `${fresh.why} (re-read just before the write)`, fresh.reason); continue; }
@@ -166,6 +166,18 @@ export function runDraftPromotionStep({
         continue;
       }
 
+      // LAST read before ready: a park posted during agent/check/claim reads must stop the write.
+      let writeView;
+      try {
+        writeView = readPrView({ repoSlug: repo, prNumber: n });
+        if (!Array.isArray(writeView?.comments)) throw new Error('pr view has no comment list');
+      } catch (e) { row('error', `pre-write pr view (retry next step): ${oneLine(e)}`); continue; }
+      if (isOperatorParked(writeView.comments)) {
+        row('skip', 'draft PR is operator-parked — explicit release is required before promotion', 'operator-parked');
+        continue;
+      }
+      const writeDecision = isDraftOwedPromotion({ pr: writeView, checks });
+      if (!writeDecision.owed) { row('skip', writeDecision.why, writeDecision.reason); continue; }
       try { ready(repo, n); } catch (e) { row('error', `ready write failed: ${oneLine(e)}`); continue; }
       try { clearAwaiting(repo, n); } catch { /* best effort; the review-status sweep corrects it */ }
       row('promoted', decision.why);

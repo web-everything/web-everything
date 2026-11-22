@@ -308,10 +308,12 @@ export const PR_LIST_JSON_FIELDS = 'number,title,headRefName,headRefOid,baseRefN
  *  the default page would leave the overflow unowned, which is this item's defect wearing a smaller hat. */
 export const PR_LIST_LIMIT = 200;
 
-/** Attach authorship only where the open-PR listing has no review disposition. */
+/** Attach commit evidence for missing dispositions and review:human mechanical-head advisory reruns. */
 export function enrichPrsWithReviewEvidence(prs, { repo, readCommits = fetchPrCommits } = {}) {
   return prs.map(pr => {
-    if (!Array.isArray(pr.labels) || pr.labels.some(l => (typeof l === 'string' ? l : l?.name)?.startsWith('review:'))) return pr;
+    if (!Array.isArray(pr.labels)) return pr;
+    const labels = pr.labels.map(l => typeof l === 'string' ? l : l?.name);
+    if (!labels.includes('review:human') && labels.some(label => label?.startsWith('review:'))) return pr;
     return { ...pr, state: pr.state ?? 'OPEN',
       commits: readCommits(repo, pr.number, { headRefName: pr.headRefName, headRefOid: pr.headRefOid, baseRefName: pr.baseRefName }) };
   });
@@ -1776,6 +1778,8 @@ export function runReconcilePass({
   enrichStandDownAutoProceed = enrichPrsWithStandDownAutoProceed,
   // Planning/read-only callers must never create cursors, reservations or operator answers.
   allowStandDownAutoProceed = false,
+  // Pass-local orphan holds must retain unanswered stand-downs, before any R123 IO.
+  skipStandDownPrs = null,
   // The fixer-escalation ladder (default + local override, models from the routing policy). Injectable for tests.
   loadLadder = loadFixerLadder,
   // Card xx0055i — the `fix.*` settings (policy cascade: env > we:scripts/settings/fix.json > built-in). Injectable.
@@ -1875,9 +1879,13 @@ export function runReconcilePass({
   const covered = hydrated.prs.filter(pr => pr.rowsComplete === true && pr.rowsHead === pr.headRefOid).length;
   console.error(`check-evidence-coverage: ${covered}/${hydrated.prs.length} PRs rowsComplete===true && rowsHead===headRefOid`);
   // Evidence is applied before every downstream CI reader, including main-red attribution.
-  const autoProceedPrs = !readOnly && allowStandDownAutoProceed === true ? enrichStandDownAutoProceed(hydrated.prs, {
+  const answerablePrs = skipStandDownPrs ? hydrated.prs.filter(pr => !skipStandDownPrs(pr)) : hydrated.prs;
+  const answeredPrs = !readOnly && allowStandDownAutoProceed === true ? enrichStandDownAutoProceed(answerablePrs, {
     repo: CONSTELLATION_REPOS[repoKey].slug, requiredChecks, defaultBranch, env,
-  }) : hydrated.prs;
+  }) : answerablePrs;
+  const answeredByNumber = new Map(answeredPrs.map(pr => [pr.number, pr]));
+  const autoProceedPrs = skipStandDownPrs
+    ? hydrated.prs.map(pr => answeredByNumber.get(pr.number) ?? pr) : answeredPrs;
   let holdPrs = autoProceedPrs;
   try {
     holdPrs = excuseMergeGateHolds(autoProceedPrs, {
