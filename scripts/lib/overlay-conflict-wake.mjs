@@ -1,9 +1,11 @@
+import { rebuildReaders } from './daemon-rebuild/evidence-context.mjs';
 import { mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { daemonStateDir } from './daemon-last-good.mjs';
 
 function readEntries(env) {
+  if (rebuildReaders()) return rebuildReaders().conflictWakes(null, env);
   try {
     const entries = JSON.parse(readFileSync(join(daemonStateDir(env), 'overlay-conflict-wake.json'), 'utf8'));
     return entries && typeof entries === 'object' && !Array.isArray(entries) ? entries : {};
