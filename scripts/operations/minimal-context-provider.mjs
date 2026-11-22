@@ -158,8 +158,10 @@ export const LEAN_FIX_REQUIRED_GUARDS = Object.freeze([
   { event: 'PreToolUse', tools: ['Bash'], scripts: ['scripts/guard-bash.mjs'] },
   { event: 'PreToolUse', tools: ['Edit', 'Write'], scripts: LEAN_EDIT_GUARDS },
   { event: 'PreToolUse', tools: ['Agent'], scripts: ['scripts/guard-prep.mjs'] },
-  { event: 'Stop', scripts: ['scripts/guard-stop-passive-wait.mjs'] },
-  { event: 'SubagentStop', scripts: ['scripts/guard-stop-passive-wait.mjs', 'scripts/guard-stop-background-running.mjs'] },
+  // `--stop-hook` is the launcher mode that makes these scripts block a stop, so it is part of the token.
+  { event: 'Stop', scripts: ['--stop-hook scripts/guard-stop-passive-wait.mjs'] },
+  { event: 'SubagentStop', scripts: ['--stop-hook scripts/guard-stop-passive-wait.mjs',
+    '--stop-hook scripts/guard-stop-background-running.mjs'] },
   // The post-edit checks (post-mode lint and backlog guard, touch record) run after every Edit/Write too.
   { event: 'PostToolUse', tools: ['Edit', 'Write'],
     scripts: ['scripts/lint-locus-prefix.mjs', 'scripts/readiness/record-touch.mjs', 'scripts/backlog-guard.mjs'] },
@@ -176,8 +178,10 @@ function matcherCovers(matcher, tool) {
   try { return new RegExp(`^(?:${matcher})$`).test(tool); } catch { return false; }
 }
 
+/** The exact token, mode flag included: a look-alike path does not match, and neither does the same script run
+ *  with a mode flag the manifest does not name (a post-mode guard swapped for its `--pre` form is missing). */
 const commandHasScript = (command, script) =>
-  new RegExp(`(?<![\\w./-])${script.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}(?![\\w.-])`).test(command);
+  new RegExp(`(?<![\\w./-])${script.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}(?![\\w.-]|\\s+--)`).test(command);
 
 /** Every {@link LEAN_FIX_REQUIRED_GUARDS} requirement the given `hooks` object does not meet, as
  *  `<event>[<tool>] <script>` strings (empty = all present). Unknown or malformed shapes count as missing. */

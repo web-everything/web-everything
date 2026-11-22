@@ -140,6 +140,9 @@ describe('lean repair background argv', () => {
     'missing SubagentStop background-running guard': (h) => dropGuard(h, 'SubagentStop', undefined, 'scripts/guard-stop-background-running.mjs'),
     'missing PostToolUse Edit|Write backlog-guard (entry kept)': (h) => dropGuard(h, 'PostToolUse', 'Edit|Write', 'scripts/backlog-guard.mjs'),
     'missing PostToolUse Edit|Write record-touch (entry kept)': (h) => dropGuard(h, 'PostToolUse', 'Edit|Write', 'scripts/readiness/record-touch.mjs'),
+    'PostToolUse backlog-guard swapped to its --pre mode': (h) => swapGuard(h, 'PostToolUse', 'Edit|Write', 'scripts/backlog-guard.mjs', 'scripts/backlog-guard.mjs --pre'),
+    'Stop guard run without --stop-hook': (h) => swapGuard(h, 'Stop', undefined, '--stop-hook scripts/', 'scripts/'),
+    'SubagentStop background-running guard run without --stop-hook': (h) => swapGuard(h, 'SubagentStop', undefined, '--stop-hook scripts/guard-stop-background-running.mjs', 'scripts/guard-stop-background-running.mjs'),
     'missing PostToolUse broadcast': (h) => dropGuard(h, 'PostToolUse', undefined, 'scripts/broadcast-inject.mjs'),
     'PostToolUse broadcast narrowed to Read': (h) => { entriesOf(h, 'PostToolUse', undefined).forEach(entry => { entry.matcher = 'Read'; }); },
     'missing UserPromptSubmit broadcast': (h) => { delete h.UserPromptSubmit; },
@@ -186,9 +189,10 @@ describe('lean repair background argv', () => {
     expect(Object.keys(hooks).filter(event => !manifestEvents.has(event) && !BOOKKEEPING_EVENTS.includes(event))).toEqual([]);
     const covers = (matcher, tool) => matcher === undefined || matcher === '' || matcher === '*'
       || new RegExp(`^(?:${matcher})$`).test(tool);
-    // The guard a command runs: its last `scripts/…mjs` (with a mode flag), never the launcher or its repair hint.
-    const scriptOf = (command) => [...command.matchAll(/scripts\/[\w./-]+\.mjs(?: --[\w-]+)?/g)]
-      .map(match => match[0]).filter(script => !script.startsWith('scripts/hooks/')).at(-1);
+    // The guard a command runs: its last `scripts/…mjs` (with a launcher or script mode flag), never the
+    // launcher or its repair hint.
+    const scriptOf = (command) => [...command.matchAll(/(?:--[\w-]+ )?scripts\/[\w./-]+\.mjs(?: --[\w-]+)?/g)]
+      .map(match => match[0]).filter(script => !script.includes('scripts/hooks/')).at(-1);
     const unlisted = [];
     for (const event of manifestEvents) {
       const rules = LEAN_FIX_REQUIRED_GUARDS.filter(rule => rule.event === event);
