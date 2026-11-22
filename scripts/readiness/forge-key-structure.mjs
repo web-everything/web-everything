@@ -174,13 +174,16 @@ function encodedText(text) {
 // a computed or spread member (`[` or `...` after `{`, `,`, `*`, get/set/async, whitespace/comments skipped), or a
 // quote next to `+`. Conservative: a comment before the `[`/`...` always counts. -1 when none.
 function lastSignal(text) {
-  let last=Math.max(text.lastIndexOf('kty'),text.lastIndexOf('\\'));
-  for(const match of text.matchAll(/["'`]\s*\+|\+\s*["'`]/g))last=Math.max(last,match.index);
+  let last=text.lastIndexOf('\\');
+  // Lowercase `kty` (jwkFinding's exact-case member name), and a quote or `+` touching a comment.
+  for(const match of text.matchAll(/kty|["'`]\s*(?:\+|\/[*\/])|\+\s*(?:["'`]|\/[*\/])|\*\/\s*\+/g))last=Math.max(last,match.index);
   const computed=at=>{
     let i=at-1;
     while(i>=0&&/\s/.test(text[i]))i--;
     if(i<0)return false;
     const c=text[i];
+    // A line comment before this member on its line may hide the real previous token: count it.
+    if(text.lastIndexOf('//',i)>text.lastIndexOf('\n',i))return true;
     return c==='{'||c===','||c==='*'||c==='/'||/(?:^|\W)(?:get|set|async)$/.test(text.slice(Math.max(0,i-5),i+1));
   };
   for(const match of text.matchAll(/\[|\.\.\./g))if(computed(match.index))last=Math.max(last,match.index);
@@ -239,6 +242,8 @@ function canonicalize(bytes,emit,tick,{comments=true,utf16=true}={}) {
       if(!startsObjectMember(text,at+1))continue;
       tick();
       const limit=Math.min(text.length,at+65536);
+      // Scanning past the bound is charged by bytes (64 per step) so repeated tails stay inside the work budget.
+      if(at+65536<text.length)for(let n=(text.length-at)>>6;n>0;n--)tick();
       let depth=0;
       pieces.lastIndex=at;
       for(let piece=pieces.exec(text);piece;piece=pieces.exec(text)) {
