@@ -9,7 +9,6 @@ import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { readSettingsChecked, settingsLeaves } from './settings-files.mjs';
 import { CAPACITY_LEAVES } from './operator-override-reader.mjs';
-import { findDuplicateKeysPerScope } from '../check-standards-rules.mjs';
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '../..');
 const META = 'scripts/lib/settings-registry-metadata.json';
@@ -21,12 +20,32 @@ const entries = obj => Object.entries(obj).sort(([a], [b]) => compare(a, b));
 const documented = key => !key.startsWith('$comment');
 const object = v => v !== null && typeof v === 'object' && !Array.isArray(v);
 
-function readObject(root, path, problems, perKey = false) {
+// Keep regeneration self-contained within advisory-merge's pinned closure.
+// JSON.parse validates syntax first; strings are indivisible tokens, and each
+// object gets its own set of decoded property names (including escaped names).
+function hasDuplicateProperties(raw) {
+  const scopes = [];
+  const tokens = /"(?:\\.|[^"\\])*"|[{}\[\]:,]/g;
+  for (const token of raw.matchAll(tokens)) {
+    const value = token[0];
+    if (value === '{') scopes.push(new Set());
+    else if (value === '[') scopes.push(null);
+    else if (value === '}' || value === ']') scopes.pop();
+    else if (value.startsWith('"') && /^\s*:/.test(raw.slice(token.index + value.length))) {
+      const key = JSON.parse(value), scope = scopes.at(-1);
+      if (scope.has(key)) return true;
+      scope.add(key);
+    }
+  }
+  return false;
+}
+
+function readObject(root, path, problems) {
   try {
-    if (perKey && !lstatSync(join(root, path)).isFile()) throw Error('expected regular file (no symlinks)');
+    if (!lstatSync(join(root, path)).isFile()) throw Error('expected regular file (no symlinks)');
     const raw = readFileSync(join(root, path), 'utf8');
-    if (perKey && findDuplicateKeysPerScope(raw).length) throw Error('duplicate JSON property');
     const data = JSON.parse(raw);
+    if (hasDuplicateProperties(raw)) throw Error('duplicate JSON property');
     if (!object(data)) throw Error('expected JSON object');
     return data;
   } catch (error) { problems.push(`${path}: ${error.message}`); return {}; }
@@ -59,7 +78,7 @@ export function readMetadata({ root = ROOT, problems } = {}) {
         const encoded = encodeURIComponent(key).replace(/[!'()*]/g, c => `%${c.charCodeAt(0).toString(16).toUpperCase()}`);
         if (file !== `${encoded}.json`) throw Error(`invalid metadata filename: ${file}`);
         if (Object.hasOwn(metadata[section], key)) { errors.push(`duplicate metadata key: ${section}.${key}`); continue; }
-        Object.defineProperty(metadata[section], key, { value: readObject(root, `${path}/${file}`, errors, true), enumerable: true, configurable: true });
+        Object.defineProperty(metadata[section], key, { value: readObject(root, `${path}/${file}`, errors), enumerable: true, configurable: true });
       }
       metadata[section] = Object.fromEntries(entries(metadata[section]));
     } catch (error) { errors.push(`${path}: ${error.message}`); }

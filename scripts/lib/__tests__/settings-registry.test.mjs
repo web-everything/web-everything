@@ -258,22 +258,47 @@ test('base and per-key metadata cannot override declared key, value or owners', 
     assert.throws(() => renderMarkdown(r), /metadata overrides declared field/);
   }
 });
-test('per-key JSON rejects duplicate properties at the root and inside nested objects and arrays', t => {
-  for (const section of ['settings', 'capacityLeaves']) for (const raw of [
+test('base and per-key JSON reject duplicate properties at the root and inside nested objects and arrays', t => {
+  for (const section of [null, 'settings', 'capacityLeaves']) for (const raw of [
     '{"description":"first","description":"last"}',
     '{"leaves":{"count":{"range":"first","range":"last"}}}',
     '{"nested":[{"key":1,"k\\u0065y":2}]}',
   ]) {
     const f = fixture(t); split(f);
     const key = section === 'settings' ? 'alpha' : Object.keys(CAPACITY_LEAVES)[0];
-    const path = `${META_DIR}/${section}/${filename(key)}`;
+    const path = section === null ? META : `${META_DIR}/${section}/${filename(key)}`;
     writeFileSync(join(f.root, path), raw);
     const problems = [], metadata = readMetadata({ root: f.root, problems });
     assert.ok(problems.includes(`${path}: duplicate JSON property`));
-    assert.deepEqual(metadata[section][key], {});
+    if (section !== null) assert.deepEqual(metadata[section][key], {});
     assert.throws(() => readMetadata({ root: f.root }), /duplicate JSON property/);
-    assert.throws(() => renderMarkdown(f.build()), /duplicate JSON property/);
+    assert.throws(() => renderMarkdown(buildRegistry({ root: f.root })), /duplicate JSON property/);
   }
+});
+test('base JSON rejects symlinks and non-regular files', t => {
+  for (const symlink of [false, true]) {
+    const f = fixture(t); f.build();
+    const absolute = join(f.root, META);
+    if (symlink) {
+      const target = join(f.root, 'target.json');
+      renameSync(absolute, target);
+      symlinkSync(target, absolute);
+    } else {
+      rmSync(absolute);
+      mkdirSync(absolute);
+    }
+    const problems = [];
+    readMetadata({ root: f.root, problems });
+    assert.ok(problems.includes(`${META}: expected regular file (no symlinks)`));
+    assert.throws(() => readMetadata({ root: f.root }), /expected regular file/);
+    assert.throws(() => renderMarkdown(buildRegistry({ root: f.root })), /expected regular file/);
+  }
+});
+test('duplicate scanner allows repeated names in separate scopes and punctuation in strings', t => {
+  const f = fixture(t);
+  f.meta.extra = { left: { key: '"key":{}[],\\' }, right: [{ key: 1 }, { key: 2 }] };
+  f.write(META, f.meta);
+  assert.deepEqual(readMetadata({ root: f.root }), f.meta);
 });
 test('metadata directory rejects symlinked roots, sections and files and other non-regular entries', t => {
   for (const section of ['settings', 'capacityLeaves']) for (const entry of ['root', 'section', 'file']) for (const symlink of [false, true]) {
