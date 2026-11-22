@@ -5,7 +5,7 @@ import { pathToFileURL } from 'node:url';
 
 const PROBE = `
 const m = await import(process.argv[1]);
-const pr = { statusCheckRollup: [{ __typename: 'CheckRun', name: 'merge-gate', status: 'COMPLETED', conclusion: 'FAILURE', summary: '\\n test-gaming\\nsecond line' }] };
+const pr = { statusCheckRollup: [{ id: 100, name: 'merge-gate', status: 'completed', conclusion: 'failure', head_sha: 'a'.repeat(40), output: { title: '', summary: '\\n test-gaming\\nsecond line' } }] };
 console.log(JSON.stringify(m.describeBlockedChecks(pr, ['merge-gate'])));
 `;
 function probe(root) {

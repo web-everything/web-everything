@@ -19,10 +19,14 @@ export function describeBlockedChecks(pr, requiredChecks) {
       || pr.statusCheckRollup.some(row => !record(row) || typeof (row.name || row.context) !== 'string')
       || !Array.isArray(requiredChecks) || !requiredChecks.length
       || requiredChecks.some(name => typeof name !== 'string' || !name.trim())) return null;
+    // Paged rows expose databaseId as checkRunId; the shared selector reads id.
+    const rollup = pr.statusCheckRollup.map(row => ({ ...row,
+      ...(!(Number.isSafeInteger(Number(row.id)) && Number(row.id) > 0) && Number.isInteger(row.checkRunId)
+        ? { id: row.checkRunId } : {}) }));
     const failed = [], waiting = [];
     for (const name of new Set(requiredChecks)) {
       // Keep the shared run-ID/rollup ordering: queued replacements have no timestamps yet.
-      const row = latestCheckNamed(pr.statusCheckRollup, name);
+      const row = latestCheckNamed(rollup, name);
       const label = JSON.stringify(clean(name));
       if (!row) { waiting.push(`waiting on required check ${label} (absent)`); continue; }
       const conclusion = String(row.conclusion || row.state || '').toUpperCase();

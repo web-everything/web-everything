@@ -12,10 +12,14 @@ import { FAILED_CHECK_CONCLUSIONS } from '../rollup-collapse.mjs';
 
 const head = 'a'.repeat(40);
 const requiredChecks = ['test', 'merge-gate'];
-const row = (name, conclusion = 'SUCCESS', extra = {}) => ({ __typename: 'CheckRun', name, status: 'COMPLETED', conclusion, ...extra });
+const row = (name, conclusion = 'SUCCESS', extra = {}) => ({ __typename: 'CheckRun', name, status: 'COMPLETED', conclusion,
+  startedAt: '2026-01-01T00:00:00Z', completedAt: '2026-01-01T00:01:00Z',
+  detailsUrl: 'https://example.test/checks/100', checkRunId: 100, appSlug: 'github-actions', appId: 15368, ...extra });
+const restRow = (name, conclusion = 'success', extra = {}) => ({ id: 100, name, status: 'completed', conclusion,
+  output: { title: '', summary: '' }, head_sha: head, ...extra });
 const fixture = (extra = {}) => ({ number: 7196, headRefOid: head, baseRefName: 'main', body: 'Fix the gate.', title: 'Gate',
   labels: [{ name: 'ready-to-merge' }, { name: 'review:accepted' }], mergeable: 'MERGEABLE', mergeStateStatus: 'BLOCKED',
-  rowsComplete: true, rowsHead: head, statusCheckRollup: [row('test'), row('merge-gate', 'FAILURE', { summary: '\n test-gaming\nignored second line' })], ...extra });
+  rowsComplete: true, rowsHead: head, statusCheckRollup: [row('test'), restRow('merge-gate', 'failure', { output: { title: '', summary: '\n test-gaming\nignored second line' } })], ...extra });
 const opts = { defaultBranch: 'main', queueRequiredChecks: requiredChecks };
 const cliExec = fn => vi.fn((command, argv, options) => command === 'gh'
   ? { status: 0, stdout: JSON.stringify({ headRefOid: head }) } : fn(command, argv, options));
@@ -29,9 +33,9 @@ describe('BLOCKED required-check evidence', () => {
     expect(describeBlockedChecks(fixture({ statusCheckRollup: [row('merge-gate', conclusion)] }), ['merge-gate']).failed[0]).toContain(conclusion);
   });
   it('uses title then description when summary has no non-empty line', () => {
-    const pr = fixture({ statusCheckRollup: [row('merge-gate', 'FAILURE', { summary: '  ', title: '\n title\nmore', description: 'description' })] });
+    const pr = fixture({ statusCheckRollup: [restRow('merge-gate', 'failure', { output: { summary: '  ', title: '\n title\nmore' } })] });
     expect(describeBlockedChecks(pr, ['merge-gate']).text).toBe('required check "merge-gate" FAILURE: title');
-    pr.statusCheckRollup[0].title = '';
+    pr.statusCheckRollup = [{ __typename: 'StatusContext', context: 'merge-gate', state: 'FAILURE', description: 'description' }];
     expect(describeBlockedChecks(pr, ['merge-gate']).text).toContain(': description');
   });
   it.each(['IN_PROGRESS', 'QUEUED', 'PENDING'])('reports %s as waiting', status => {
@@ -41,11 +45,11 @@ describe('BLOCKED required-check evidence', () => {
     expect(describeBlockedChecks(fixture({ statusCheckRollup: [] }), ['merge-gate']).text).toBe('waiting on required check "merge-gate" (absent)');
   });
   it('uses the latest run rather than an old failure', () => {
-    expect(describeBlockedChecks(fixture({ statusCheckRollup: [row('merge-gate', 'FAILURE', { completedAt: '2026-01-01' }), row('merge-gate', 'SUCCESS', { completedAt: '2026-02-01' })] }), ['merge-gate']).failed).toEqual([]);
+    expect(describeBlockedChecks(fixture({ statusCheckRollup: [row('merge-gate', 'FAILURE', { checkRunId: undefined, completedAt: '2026-01-01' }), row('merge-gate', 'SUCCESS', { checkRunId: undefined, completedAt: '2026-02-01' })] }), ['merge-gate']).failed).toEqual([]);
   });
   it.each([false, true])('a newer untimestamped queued replacement supersedes an older timestamped failure without send-back (reverse=%s)', reverse => {
-    const older = row('merge-gate', 'FAILURE', { id: 100, completedAt: '2026-01-01T00:00:00Z', summary: 'old failure' });
-    const replacement = row('merge-gate', null, { id: 101, status: 'QUEUED' });
+    const older = restRow('merge-gate', 'failure', { id: 100, output: { title: '', summary: 'old failure' } });
+    const replacement = restRow('merge-gate', null, { id: 101, status: 'queued' });
     const pr = fixture({ statusCheckRollup: [row('test'), ...(reverse ? [replacement, older] : [older, replacement])] });
     expect(describeBlockedChecks(pr, requiredChecks)).toEqual({ failed: [],
       waiting: ['waiting on required check "merge-gate" (QUEUED)'], text: 'waiting on required check "merge-gate" (QUEUED)' });
@@ -53,18 +57,47 @@ describe('BLOCKED required-check evidence', () => {
   });
   it('treats an untimestamped queued rollup replacement without run IDs as waiting with no send-back', () => {
     const pr = fixture({ statusCheckRollup: [row('test'),
-      row('merge-gate', 'FAILURE', { completedAt: '2026-01-01T00:00:00Z' }),
-      row('merge-gate', null, { status: 'QUEUED' })] });
+      row('merge-gate', 'FAILURE', { checkRunId: undefined, completedAt: '2026-01-01T00:00:00Z' }),
+      row('merge-gate', null, { checkRunId: undefined, status: 'QUEUED', startedAt: '0001-01-01T00:00:00Z', completedAt: '0001-01-01T00:00:00Z' })] });
     expect(describeBlockedChecks(pr, requiredChecks).failed).toEqual([]);
     expect(describeBlockedChecks(pr, requiredChecks).text).toBe('waiting on required check "merge-gate" (QUEUED)');
     expect(decision(pr)).toEqual({ send: false });
   });
   it('uses run identity over timestamp availability when a newer failure supersedes an older queued run', () => {
     const pr = fixture({ statusCheckRollup: [row('test'),
-      row('merge-gate', 'FAILURE', { id: 101, completedAt: '2026-01-01T00:00:00Z' }),
-      row('merge-gate', null, { id: 100, status: 'QUEUED' })] });
+      restRow('merge-gate', 'failure', { id: 101 }),
+      restRow('merge-gate', null, { id: 100, status: 'queued' })] });
     expect(describeBlockedChecks(pr, requiredChecks).failed).toEqual(['required check "merge-gate" FAILURE']);
     expect(decision(pr).send).toBe(true);
+  });
+  it.each(['IN_PROGRESS', 'QUEUED'])('selects a newer paged failure over an older %s run listed last without mutating rows', status => {
+    const newer = Object.freeze(row('merge-gate', 'FAILURE', { checkRunId: 101 }));
+    const older = Object.freeze(row('merge-gate', null, { checkRunId: 100, status,
+      startedAt: '0001-01-01T00:00:00Z', completedAt: '0001-01-01T00:00:00Z' }));
+    const rows = Object.freeze([row('test'), newer, older]);
+    const pr = fixture({ statusCheckRollup: rows });
+    expect(describeBlockedChecks(pr, requiredChecks)).toEqual({ failed: ['required check "merge-gate" FAILURE'],
+      waiting: [], text: 'required check "merge-gate" FAILURE' });
+    expect(decision(pr)).toEqual({ send: true, body: 'required check "merge-gate" FAILURE' });
+    expect(pr.statusCheckRollup).toBe(rows);
+    expect(newer).not.toHaveProperty('id');
+    expect(older).not.toHaveProperty('id');
+  });
+  it('reports a generic reason without throwing for a paged failure with no finding fields', () => {
+    const pr = fixture({ statusCheckRollup: [row('merge-gate', 'FAILURE')] });
+    expect(() => describeBlockedChecks(pr, ['merge-gate'])).not.toThrow();
+    expect(describeBlockedChecks(pr, ['merge-gate'])).toEqual({ failed: ['required check "merge-gate" FAILURE'],
+      waiting: [], text: 'required check "merge-gate" FAILURE' });
+  });
+  it.each([undefined, null, '', 0, -1, 'opaque-id'])('uses checkRunId when id is unusable (%s)', id => {
+    const pr = fixture({ statusCheckRollup: [row('merge-gate', 'FAILURE', { id, checkRunId: 101 }),
+      row('merge-gate', null, { checkRunId: 100, status: 'QUEUED' })] });
+    expect(describeBlockedChecks(pr, ['merge-gate']).text).toBe('required check "merge-gate" FAILURE');
+  });
+  it('preserves usable ids when checkRunId is also present', () => {
+    const pr = fixture({ statusCheckRollup: [row('merge-gate', 'FAILURE', { id: 101, checkRunId: 100 }),
+      row('merge-gate', null, { id: 100, checkRunId: 101, status: 'QUEUED' })] });
+    expect(describeBlockedChecks(pr, ['merge-gate']).text).toBe('required check "merge-gate" FAILURE');
   });
   it.each([null, {}, { statusCheckRollup: 'bad' }, { statusCheckRollup: [null] }, { statusCheckRollup: [{ name: 'merge-gate', status: 'ALIEN' }] }])('retains the old reason on unreadable/odd evidence %j', pr => {
     expect(describeBlockedChecks(pr, requiredChecks)).toBeNull();
@@ -198,7 +231,7 @@ describe('audit safeguards', () => {
     expect(describeBlockedChecks(fixture(extra), requiredChecks).failed).toHaveLength(1);
   });
   it.each(['summary', 'title'])('extracts REST output.%s findings', field => {
-    const pr = fixture({ statusCheckRollup: [row('merge-gate', 'FAILURE', { output: { [field]: '\n nested finding\nignored' } })] });
+    const pr = fixture({ statusCheckRollup: [restRow('merge-gate', 'failure', { output: { [field]: '\n nested finding\nignored' } })] });
     expect(decision(pr).body).toBe('required check "merge-gate" FAILURE: nested finding');
   });
   it('still sends a generic failure without finding text', () => withLedger(path => {
