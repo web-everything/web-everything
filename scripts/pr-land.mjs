@@ -971,6 +971,10 @@ async function runCli() {
     try {
       const pushUrls = gitC(['remote', 'get-url', '--push', '--all', REMOTE]).split('\n').map(s => s.trim()).filter(Boolean);
       if (pushUrls.length === 1 && !pushUrls[0].startsWith('-')) pushUrl = pushUrls[0];
+      // `get-url --push` already applied insteadOf/pushInsteadOf; `ls-remote <url>` applies insteadOf AGAIN, so a
+      // chained rule (X→B, B→C) would read C while the push writes B. Read only when ls-remote would contact
+      // exactly the URL the push goes to; otherwise read nothing and push.
+      if (pushUrl && gitC(['ls-remote', '--get-url', '--', pushUrl]) !== pushUrl) pushUrl = null;
     } catch { pushUrl = null; }
     const remoteTipLine = pushUrl ? tryGit(['ls-remote', '--', pushUrl, remoteHeadRef]) : null;
     const remoteTipMatch = /^([0-9a-f]{40})\t([^\r\n]+)$/i.exec(remoteTipLine ?? '');
@@ -981,10 +985,11 @@ async function runCli() {
   // Refuse before pushing ONLY on proof that the push target's tip is not an ancestor of refSha: merge-base exits
   // exactly 1 in a clone git confirms is NOT shallow (past a shallow boundary merge-base can answer 1 falsely).
   // A missing tip object (exit 128), a shallow or unreadable clone state, or any other failure proves nothing,
-  // so the guarded non-force push runs and the server validates fast-forward itself.
+  // so the guarded non-force push runs and the server validates fast-forward itself. Local refs/replace objects
+  // are ignored (`--no-replace-objects`): they rewrite local history the server never sees.
   function provenNotAncestor(remoteTip) {
     if (tryGit(['rev-parse', '--is-shallow-repository']) !== 'false') return false;
-    try { gitC(['merge-base', '--is-ancestor', remoteTip, refSha]); return false; }
+    try { gitC(['--no-replace-objects', 'merge-base', '--is-ancestor', remoteTip, refSha]); return false; }
     catch (e) { return e?.status === 1; }
   }
 
