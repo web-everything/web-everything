@@ -27,7 +27,7 @@ it.each([
   const repo = { routing: { builder: 'auto' }, providerCapacity: { providers } };
   const settings = resolveRoutingSettings({ env, repo }).capacity;
   const capacity = readProviderCapacity({ env, now, settings, readers: {} });
-  const options = { env, repo, now, capacity, quota: () => ({ used_percent: 20 }), record: () => {} };
+  const options = { env, repo, now, capacity, quota: () => ({ at: now, used_percent: 20 }), record: () => {} };
   expect(effectiveBuilder({ ...options, kind: 'fix' }).decision).toMatchObject({
     reason: 'all-readers-unknown', provider: 'codex',
     inputs: expect.arrayContaining([expect.objectContaining({ provider, eligible: false })]),
@@ -48,7 +48,7 @@ it.each([[20, ['codex', 'codex-alt', 'claude']], [80, ['claude']]])(
     const now = Date.parse('2026-11-20T15:00:00Z');
     const settings = resolveRoutingSettings({ env, repo }).capacity;
     const capacity = readProviderCapacity({ env, now, settings, readers: {} });
-    expect(resolveFixExecutorChain({ env, repo, now, capacity, quota: () => ({ used_percent }), record: () => {} }).value).toEqual(expected);
+    expect(resolveFixExecutorChain({ env, repo, now, capacity, quota: () => ({ at: now, used_percent }), record: () => {} }).value).toEqual(expected);
   });
 vi.mock('../settings-files.mjs', async (importOriginal) => {
   const actual = await importOriginal();
@@ -176,10 +176,11 @@ describe('routing settings', () => {
     expect(resolveRoutingSettings({ env: {}, repo: { routing: { builder: 'cluade' } } }).builder).toBe('claude');
   });
   it('auto goes to claude at the threshold; an unknown reading goes to claude', () => {
+    const now = Date.now();
     const repo = { routing: { builder: 'auto', autoClaudeAbovePercent: 70, capacity: { enabled: false } } };
-    expect(effectiveBuilder({ env: {}, repo, quota: () => ({ used_percent: 90 }) }).builder).toBe('claude');
-    expect(effectiveBuilder({ env: {}, repo, quota: () => ({ used_percent: 40 }) }).builder).toBe('codex');
-    expect(effectiveBuilder({ env: {}, repo, quota: () => null }).builder).toBe('claude');
+    expect(effectiveBuilder({ env: {}, repo, now, quota: () => ({ at: now, used_percent: 90 }) }).builder).toBe('claude');
+    expect(effectiveBuilder({ env: {}, repo, now, quota: () => ({ at: now, used_percent: 40 }) }).builder).toBe('codex');
+    expect(effectiveBuilder({ env: {}, repo, now, quota: () => null }).builder).toBe('claude');
   });
   it('a malformed settings file, or unreadable auto quota, resolves to claude', () => {
     const bad = { settings: {}, errors: [{ source: 'settings/routing.json', error: 'Unexpected token' }] };
@@ -247,9 +248,10 @@ describe('routing settings', () => {
     expect(resolveFixExecutorChain({ env: {}, platform: {} }).value).toEqual(['codex', 'codex-alt', 'claude']);
   });
   it('auto routes to claude at, and above, a configured threshold; codex only below it', () => {
+    const now = Date.now();
     for (const [threshold, used, builder] of [[70, 69, 'codex'], [70, 70, 'claude'], [70, 71, 'claude'], [50, 49, 'codex'], [50, 50, 'claude'], [50, 51, 'claude']]) {
       const repo = { routing: { builder: 'auto', autoClaudeAbovePercent: threshold, capacity: { enabled: false } } };
-      expect(effectiveBuilder({ env: {}, repo, quota: () => ({ used_percent: used }) }).builder, `${used}% vs ${threshold}`).toBe(builder);
+      expect(effectiveBuilder({ env: {}, repo, now, quota: () => ({ at: now, used_percent: used }) }).builder, `${used}% vs ${threshold}`).toBe(builder);
     }
   });
   it('claude builder routes an ordinary build away from codex; codex builder still picks it', () => {
@@ -275,9 +277,10 @@ describe('routing settings', () => {
     for (const kind of [...HELD_KINDS, ...NON_BUILD_KINDS]) expect(availabilityFor({ kind, ...SCOPED })?.codex, kind).toBeUndefined();
   });
   it('auto builder at dispatch holds codex over the quota threshold or on an unreadable reading, not below it', () => {
+    const now = Date.now();
     // This suite tests the legacy threshold policy; capacity scoring has its own provider-capacity fixtures.
     settingsDir({ 'routing.json': { routing: { builder: 'auto', autoClaudeAbovePercent: 70, capacity: { enabled: false } } } });
-    for (const [quota, held] of [[{ used_percent: 90 }, true], [{ used_percent: 70 }, true], [null, true], [{ used_percent: 40 }, false]]) {
+    for (const [quota, held] of [[{ at: now, used_percent: 90 }, true], [{ at: now, used_percent: 70 }, true], [null, true], [{ at: now, used_percent: 40 }, false]]) {
       state.quota = quota;
       const codex = availabilityFor({ kind: 'build', ...SCOPED })?.codex;
       if (held) expect(codex, JSON.stringify(quota)).toMatch(/routing\.builder=claude/);
