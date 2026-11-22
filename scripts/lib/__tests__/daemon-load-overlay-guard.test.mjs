@@ -9,10 +9,11 @@ import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
 import { spawnSync } from 'node:child_process';
-import { runDaemonLoadOverlay } from '../daemon-load-overlay.mjs';
+import { guardedRegister, runDaemonLoadOverlay } from '../daemon-load-overlay.mjs';
 import { addOverlay, readOverlays, removeOverlay } from '../daemon-overlays.mjs';
 import { rebuildClone, dryRunRebuild, previewOverlayConflict } from '../daemon-rebuild.mjs';
 import { stackAwareOverlayCheck } from '../../daemon-overlay.mjs';
+import * as admission from '../../daemon-overlay.mjs';
 import * as planner from '../daemon-rebuild/plan.mjs';
 import * as strategies from '../daemon-rebuild/overlay-strategies.mjs';
 
@@ -70,6 +71,17 @@ function fixture() {
 }
 
 describe('daemon-load-overlay runs daemon-overlay add\'s conflict guard before registering', () => {
+  it.each(['hotpatch/' + 'a'.repeat(40), 'hotpatch/invalid'])('refuses %s before locking or previewing', async ref => {
+    const lock = vi.spyOn(admission, 'withAddGuardLock').mockImplementation((_root, _env, fn) => fn());
+    const preview = vi.spyOn(admission, 'stackAwareOverlayCheck').mockResolvedValue({ ok: true, clean: true });
+    const register = vi.fn();
+    expect(await guardedRegister({ root: mktemp('we-hotpatch-refused-'), ref, env: {}, gate: {}, register }))
+      .toEqual({ registered: false, reason: 'hotpatch-requires-daemon-overlay-add' });
+    expect(lock).not.toHaveBeenCalled();
+    expect(preview).not.toHaveBeenCalled();
+    expect(register).not.toHaveBeenCalled();
+  });
+
   it.each(['0', '1'])('admits a full-plan replay-resolved candidate only with edge resolution on: %s', async (edgeResolve) => {
     const f = fixture();
     f.env.WE_DAEMON_OVERLAY_EDGE_RESOLVE = edgeResolve;

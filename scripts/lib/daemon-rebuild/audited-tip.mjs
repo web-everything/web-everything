@@ -96,9 +96,12 @@ export function revokedAppliedTips({
 export async function revokedHotpatchTips({ applied = [], git, root, env, readers }) {
   const revoked = [];
   let admissionReaders = readers;
+  git = pathBEvidenceGit(git);
   for (const { ref, sha } of applied) {
     if (!ref?.startsWith('hotpatch/')) continue;
-    if (ref !== `hotpatch/${sha}` || verifyRev(git, `refs/remotes/origin/${ref}^{commit}`) !== sha
+    if (!/^hotpatch\/[0-9a-f]{40}$/.test(ref) || ref !== `hotpatch/${sha}`
+      || git(['fetch', '--quiet', '--', 'origin', `+refs/heads/${ref}:refs/remotes/origin/${ref}`]).status !== 0
+      || verifyRev(git, `refs/remotes/origin/${ref}^{commit}`) !== sha
       || (await admitHotpatch(sha, (admissionReaders ??= createHotpatchReaders({ cwd: root, env })))).outcome !== 'pass') revoked.push(ref);
   }
   return revoked;

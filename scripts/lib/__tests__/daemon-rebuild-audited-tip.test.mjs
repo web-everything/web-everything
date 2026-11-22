@@ -18,7 +18,8 @@ import { addOverlay, resolveOverlayFollowTip } from '../daemon-overlays.mjs';
 import { rebuildClone } from '../daemon-rebuild.mjs';
 import { readReadyCandidateStrict, readReadyCandidate, writeReadyCandidate, assertReadyCandidatePins, StaleReadyPinError } from '../daemon-rebuild/state.mjs';
 import { appendEntry, storePath } from '../../operations/ruled-weakened-store.mjs';
-import { readRebuildState } from '../daemon-rebuild/state.mjs';
+import { readRebuildState, writeRebuildState } from '../daemon-rebuild/state.mjs';
+import { watchPath } from '../daemon-force-adopt.mjs';
 
 // Same temp/Git helpers as overlay-pin; local tracking refs avoid network IO entirely.
 const temps = [];
@@ -1073,11 +1074,30 @@ it.each(['early', 'recovery', 'tick-start'])('%s refuses malformed pins and defe
 
 
 describe('hotpatch canonical evidence at finalization', () => {
+  it.each(['moved', 'deleted'])('revokes a hotpatch ref %s remotely during smoke despite a matching cached ref', async change => {
+    const f = await fixture();
+    const ref = `hotpatch/${f.a}`;
+    gitOk(f.root, ['remote', 'add', 'origin', f.root]);
+    gitOk(f.root, ['update-ref', `refs/heads/${ref}`, f.a]);
+    gitOk(f.root, ['update-ref', `refs/remotes/origin/${ref}`, f.a]);
+    const { data, readers } = hotpatchFixture();
+    for (const check of data.checks.check_runs) check.head_sha = f.a;
+    data.workflows.workflow_runs[0].head_sha = f.a;
+    data.audits[0].head = f.a;
+    const options = { applied: [{ ref, sha: f.a }], git: f.git, root: f.root, env: f.env, readers };
+    expect(await auditedTips.revokedHotpatchTips(options)).toEqual([]);
+    if (change === 'deleted') gitOk(f.root, ['update-ref', '-d', `refs/heads/${ref}`]);
+    else gitOk(f.root, ['update-ref', `refs/heads/${ref}`, f.b]);
+    expect(gitOk(f.root, ['rev-parse', `refs/remotes/origin/${ref}`])).toBe(f.a);
+    expect(await auditedTips.revokedHotpatchTips(options)).toEqual([ref]);
+  });
+
   describe.each(['revoked', 'unreadable'])('%s evidence', evidence => {
     it.each([
       ['rollback to last-good finalizes even when hotpatch evidence is revoked or unreadable', true],
       ['normal finalize refuses the same evidence with ready-audit-revoked', false],
-    ])('%s', async (_name, rollback) => {
+      ['forged rollback token refuses a never-adopted target with ready-audit-revoked', false, true],
+    ])('%s', async (_name, rollback, forged = false) => {
       const f = await fixture();
       const hotpatchRef = `hotpatch/${f.a}`;
       const env = { ...process.env, ...f.env,
@@ -1085,7 +1105,14 @@ describe('hotpatch canonical evidence at finalization', () => {
         WE_DAEMON_OVERLAY_DIR: join(f.dir, 'overlays'),
       };
       gitOk(f.root, ['update-ref', `refs/remotes/origin/${hotpatchRef}`, f.a]);
-      const plan = { ...f.adopted, finalSha: f.a, applied: [{ ref: hotpatchRef, sha: f.a }] };
+      gitOk(f.root, ['remote', 'add', 'origin', f.root]);
+      gitOk(f.root, ['update-ref', `refs/heads/${hotpatchRef}`, f.a]);
+      const plan = { ...f.adopted, finalSha: forged ? f.base : f.a, applied: [{ ref: hotpatchRef, sha: f.a }] };
+      const lastGood = { ...f.adopted, head: f.a, at: new Date().toISOString() };
+      if (rollback || forged) writeRebuildState(f.root, { adopted: rollback ? { ...lastGood, head: f.b } : lastGood }, env);
+      if (rollback) writeFileSync(watchPath(f.root, env), JSON.stringify({
+        daemon: 'test', ruling: 'R1', sha: f.b, lastGood, ticksLeft: 1, bad: 0, startedAt: lastGood.at,
+      }));
       const { data, readers } = hotpatchFixture();
       for (const check of data.checks.check_runs) check.head_sha = f.a;
       data.workflows.workflow_runs[0].head_sha = f.a;
@@ -1101,7 +1128,7 @@ describe('hotpatch canonical evidence at finalization', () => {
           root: f.root, env, log: { error() {} },
           run: (args, opts) => spawnSync('git', args, { ...opts, encoding: 'utf8' }),
           now: () => Date.now(), prevHead: f.b, plan,
-          lease: { token: rollback ? 'force-adopt-rollback' : 'hotpatch-direct-smoke' },
+          lease: { token: rollback || forged ? 'force-adopt-rollback' : 'hotpatch-direct-smoke' },
         });
         if (rollback) {
           expect(done).toMatchObject({ moved: true, adopted: true, head: f.a });
@@ -1114,7 +1141,7 @@ describe('hotpatch canonical evidence at finalization', () => {
           expect(revoked).toHaveBeenCalledOnce();
           expect(factory).toHaveBeenCalledWith({ cwd: f.root, env });
           expect(gitOk(f.root, ['rev-parse', 'HEAD'])).toBe(f.b);
-          expect(readRebuildState(f.root, env).adopted?.head).not.toBe(f.a);
+          expect(readRebuildState(f.root, env).adopted?.head).toBe(forged ? f.a : undefined);
         }
       } finally { revoked.mockRestore(); factory.mockRestore(); }
     });
@@ -1130,6 +1157,8 @@ describe('hotpatch canonical evidence at finalization', () => {
         WE_DAEMON_OVERLAY_FOLLOW_TIP: mode === 'follow mode' ? 'follow' : 'audited-only',
       };
       gitOk(f.root, ['update-ref', `refs/remotes/origin/${hotpatchRef}`, f.b]);
+      gitOk(f.root, ['remote', 'add', 'origin', f.root]);
+      gitOk(f.root, ['update-ref', `refs/heads/${hotpatchRef}`, f.b]);
       const { data, readers } = hotpatchFixture();
       for (const check of data.checks.check_runs) check.head_sha = f.b;
       data.workflows.workflow_runs[0].head_sha = f.b;
