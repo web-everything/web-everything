@@ -667,7 +667,7 @@ export async function smokeAndAdopt({
       };
     }
     const fin = await withWriteLock(root, () => finalizeRebuild({
-      root, env, log, run, stateOpts, now, plan: p, prevHead, lease, onAdopted, strictAdopt: strictBuild, freshSmoke,
+      root, env, log, run, stateOpts, now, plan: p, prevHead, lease, onAdopted, strictAdopt: strictBuild, freshSmoke, mainOnly,
       auditedTip: makeAuditedTipGate(env), // unaudited-tip: evidence revoked during the smoke must not be adopted
     }), finalizeLockOpts);
     if (!fin.ok) {

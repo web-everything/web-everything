@@ -444,7 +444,7 @@ export async function finalizeRebuild(options) {
 
 async function finalizeRebuildLocked({
   root, env, log, run, stateOpts, now, plan, prevHead, lease, onAdopted, auditedTip = null, readyPassedAt,
-  strictAdopt = false, freshSmoke = null,
+  strictAdopt = false, freshSmoke = null, mainOnly = false,
 }) {
   const stEnv = { ...env, ...(stateOpts?.env || {}) };
   const git = makeGit({ run, cwd: root, env });
@@ -474,8 +474,8 @@ async function finalizeRebuildLocked({
       }
       for (const d of plan.decisions ?? []) if (d.setAside) aside[d.ref] = d.setAside;
       for (const a of state.adopted?.applied ?? []) delete aside[a.ref];
-      // Unknown history must survive an adoption that still holds an unaudited ref.
-      if (state.setAside !== undefined || !plan.decisions?.some(d => d.reason === 'unaudited-tip-held')) {
+      // Unknown history survives when overlays were not examined or an unaudited ref is still held.
+      if (state.setAside !== undefined || (!mainOnly && !plan.decisions?.some(d => d.reason === 'unaudited-tip-held'))) {
         state.setAside = Object.keys(aside).length ? aside : null;
       }
     }

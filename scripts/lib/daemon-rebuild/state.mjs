@@ -228,7 +228,14 @@ export function readReadyCandidateStrict(root, env = process.env, read = readFil
     && (!FULL_SHA_RE.test(r.prevHead) || !FULL_SHA_RE.test(r.adopt.mainSha))) throw new Error('Invalid ready pin history bounds');
   // Pre-upgrade normal candidates omitted forced; normalize only after validating
   // present values, without rewriting the persisted evidence.
-  return { forced: false, ...r };
+  // Invalid smoke metadata must retain the candidate's strict gate, never discard
+  // the record into a non-strict rebuild or preserve an untrusted smoke mark.
+  if ((Object.hasOwn(r, 'strictAdopt') && !boolean(r.strictAdopt))
+    || (Object.hasOwn(r, 'freshSmoke') && r.freshSmoke !== null
+      && (typeof r.freshSmoke !== 'string' || !FULL_SHA_RE.test(r.freshSmoke)))) {
+    return { forced: false, ...r, strictAdopt: true, freshSmoke: null };
+  }
+  return { forced: false, ...r, strictAdopt: r.strictAdopt !== false, freshSmoke: r.freshSmoke ?? null };
 }
 
 // A readable record can outlive its proof. Only adoption needs live pin proof;

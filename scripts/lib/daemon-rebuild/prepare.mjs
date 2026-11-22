@@ -772,7 +772,8 @@ export async function prepareRebuild({
           plan: m.adopt,
           prevHead,
           lease: { token: ready.token ?? null },
-          strictAdopt: ready.strictAdopt === true || planStrictAdopt(plan),
+          mainOnly,
+          strictAdopt: ready.strictAdopt !== false || planStrictAdopt(plan),
           freshSmoke: typeof ready.freshSmoke === 'string' ? ready.freshSmoke : null,
           onAdopted: m.dropRefs.length
             ? ({ alert: finAlert }) => dropSuspectOverlays({
@@ -890,7 +891,7 @@ export async function prepareRebuild({
       } else {
       log?.error?.(`daemon-rebuild: skipped rebuild+smoke for ${String(plan.finalSha).slice(0, 9)} — ${d.reason} (daemonRebuild.skipUnrelated)`);
       const fin = await finalizeRebuild({
-        root, env, log, run, stateOpts, now, plan, prevHead, lease: { token: null },
+        root, env, log, run, stateOpts, now, plan, prevHead, lease: { token: null }, mainOnly,
       });
       const { alerts: finAlerts = [], ...finResult } = fin;
       return {

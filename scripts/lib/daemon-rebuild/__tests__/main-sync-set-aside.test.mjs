@@ -7,7 +7,7 @@ import { gitRun } from '../../main-staleness.mjs';
 import { clearOverlayConflictWake, readOverlayConflictWakes } from '../../overlay-conflict-wake.mjs';
 import { readMainSyncConflicts } from '../overlay-main-sync.mjs';
 import { overlayFilePath } from '../../daemon-overlays.mjs';
-import { readRebuildStateStrict, rebuildStatePath, readReadyCandidate, writeReadyCandidate } from '../state.mjs';
+import { readRebuildStateStrict, rebuildStatePath, readReadyCandidate, readReadyCandidateStrict, writeReadyCandidate } from '../state.mjs';
 import { SMOKE_CHECKS } from '../../daemon-live-smoke.mjs';
 import { createSetAsideFixture, probeRebuildSetAside } from '../../../conveyor/soak/fixtures/rebuild-set-aside-probe.mjs';
 
@@ -464,6 +464,59 @@ it('strictAdopt ready reuse refuses a strict candidate without its fresh smoke m
     expect(f.head()).toBe(before);
     expect(f.state().adopted).toEqual(adopted);
     expect(readReadyCandidate(f.root, f.env)).toBeNull();
+  } finally { f.cleanup(); }
+}, 60_000);
+
+it.each(['false', 0, undefined])('malformed or missing ready strictAdopt cannot bypass the set-aside gate: %s', async strictAdopt => {
+  const f = await createSetAsideFixture();
+  try {
+    const before = f.head();
+    const job = await f.rebuild({ readyOnly: true });
+    expect(job.reason).toBe('ready-recorded');
+    expect(job.plan.decisions.some(d => d.setAside)).toBe(true);
+    const ready = { ...readReadyCandidate(f.root, f.env), strictAdopt, freshSmoke: null };
+    expect(writeReadyCandidate(f.root, ready, f.env)).toBe(true);
+    expect(readReadyCandidateStrict(f.root, f.env)).toMatchObject({ strictAdopt: true, freshSmoke: null });
+    // Main-only planning has no omission decisions to independently restore strict mode.
+    const result = await prepareRebuild({ root: f.root, env: f.env, run: gitRun, now: Date.now,
+      prState: async () => 'OPEN', mainOnly: true });
+    expect(result).toMatchObject({ terminal: true,
+      result: { moved: false, reason: 'strict-adopt-needs-fresh-smoke' } });
+    expect(f.head()).toBe(before);
+  } finally { f.cleanup(); }
+}, 60_000);
+
+it.each([0, 'not-a-sha'])('malformed ready freshSmoke retains strict mode without smoke proof: %s', async freshSmoke => {
+  const f = await createSetAsideFixture();
+  try {
+    expect(await f.rebuild({ readyOnly: true })).toMatchObject({ reason: 'ready-recorded' });
+    const ready = { ...readReadyCandidate(f.root, f.env), strictAdopt: false, freshSmoke };
+    expect(writeReadyCandidate(f.root, ready, f.env)).toBe(true);
+    expect(readReadyCandidateStrict(f.root, f.env)).toMatchObject({ strictAdopt: true, freshSmoke: null });
+  } finally { f.cleanup(); }
+}, 60_000);
+
+it.each([false, true])('mainOnly adoption preserves unknown omission history and later audit holds: readyOnly=%s', async readyOnly => {
+  const f = await createSetAsideFixture({ audited: true });
+  try {
+    const state = f.state();
+    delete state.setAside;
+    writeFileSync(rebuildStatePath(f.root, f.env), JSON.stringify(state));
+    const job = await f.rebuild({ mainOnly: true, readyOnly });
+    if (readyOnly) {
+      expect(job.reason).toBe('ready-recorded');
+      const result = await prepareRebuild({ root: f.root, env: f.env, run: gitRun, now: Date.now,
+        prState: async () => 'OPEN', mainOnly: true });
+      expect(result.result).toMatchObject({ adopted: true });
+    } else expect(job).toMatchObject({ adopted: true });
+    expect(f.head()).toBe(f.main);
+    expect(f.state().setAside).toBeUndefined();
+    const result = await f.repair();
+    expect(result.plan.decisions).toEqual(expect.arrayContaining([
+      expect.objectContaining({ ref: f.ref, reason: 'unaudited-tip-held' }),
+    ]));
+    expect(f.head()).toBe(f.main);
+    expect(f.state().setAside).toBeUndefined();
   } finally { f.cleanup(); }
 }, 60_000);
 
