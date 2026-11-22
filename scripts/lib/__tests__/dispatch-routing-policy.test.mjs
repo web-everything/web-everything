@@ -226,7 +226,7 @@ it('a child uses the inherited last-good snapshot even while the policy file is 
   mkdirSync(join(parent, 'settings'));
   copyFileSync('scripts/settings/provider-capacity.json', join(parent, 'settings/provider-capacity.json'));
   try {
-    for (const file of ['dispatch-routing-policy-source.mjs', 'codex-model-routing.mjs', 'dispatch-routing-policy.mjs', 'dispatch-routing-providers.mjs']) copyFileSync(`scripts/lib/${file}`, join(dir, file));
+    for (const file of ['dispatch-routing-policy-source.mjs', 'codex-model-routing.mjs', 'dispatch-routing-catalog.mjs', 'dispatch-routing-policy.mjs', 'dispatch-routing-providers.mjs']) copyFileSync(`scripts/lib/${file}`, join(dir, file));
     writeFileSync(join(dir, 'dispatch-routing-policy.json'), '{broken edit');
     const moduleUrl = pathToFileURL(join(dir, 'dispatch-routing-policy.mjs')).href;
     const result = execFileSync(process.execPath, ['--input-type=module', '-e', `import { resolveOperationRoute } from ${JSON.stringify(moduleUrl)}; console.log(JSON.stringify(resolveOperationRoute({operation:'prepare-item'})));`], {

@@ -31,6 +31,60 @@ const freeze = value => { if (value && typeof value === 'object') {
 const realPolicy = () => JSON.parse(readFileSync('scripts/settings/provider-rotation.json', 'utf8')).providerRotation;
 
 describe('pure provider rotation', () => {
+  it('routeFor preserves recursively mutable legacy routes for every non-live policy state', () => {
+    for (const p of [undefined, null, {}, { mode: 'bad' }, { mode: 'shadow' },
+      { ...policy, kinds: null }, policy, { ...policy, mode: 'off' }]) {
+      const legacyRoute = { provider: 'legacy', nested: { args: ['mutable'] } };
+      const result = routeFor({ kind: 'build', subject: 'repo#1', capacity, policy: p, legacyRoute });
+      expect(p?.mode === 'off' ? result : result.route).toBe(legacyRoute);
+      legacyRoute.nested.args.push('still mutable');
+    }
+  });
+  it('refuses invented catalog triples independently of the policy catalog', () => {
+    const p = clone(policy);
+    const fake = { provider: 'codex', model: 'gpt-nonexistent', effort: 'bogus' };
+    p.catalog.codex[fake.model] = [fake.effort]; p.kinds.build.arms[0].arm = fake;
+    expect(draw({ policy: p })).toMatchObject({ arm: null, refusal: 'invalid-policy' });
+    const unused = clone(policy); unused.catalog.codex['gpt-nonexistent'] = ['high'];
+    expect(draw({ policy: unused })).toMatchObject({ arm: null, refusal: 'invalid-policy' });
+    const effort = clone(policy); effort.catalog.codex.sol.push('bogus');
+    expect(draw({ policy: effort })).toMatchObject({ arm: null, refusal: 'invalid-policy' });
+  });
+  it('copies only owned share fields without freezing mutable nested metadata', () => {
+    const kind = clone(policy.kinds.build); kind.arms[0].metadata = { tags: [] };
+    effectiveShares(kind, capacity, policy);
+    kind.arms[0].metadata.tags.push('mutable');
+  });
+  it('inactive, unknown and tier-excluded capacity and explicit null reserve contribute zero', () => {
+    for (const patch of [{ label: 'inactive' }, { label: 'unknown' }, { label: 'tier-excluded' },
+      { label: 'invented' }, { reservePercent: null }]) {
+      expect(effectiveShares(policy.kinds.build, { ...capacity, codex: { ...capacity.codex, ...patch } }, policy)[0].share).toBe(0);
+    }
+  });
+  it('refuses unknown lenses including case variants', () => {
+    for (const lens of ['Security', 'SECURITY', 'unknown'])
+      expect(panel({ seats: [{ lens, counting: true }, seats[0]] })).toMatchObject({ ok: false, panel: [], refusal: 'unknown-lens' });
+  });
+  it('panel keeps observer counting flags and live security routes enforce panel safeguards', () => {
+    const p = clone(policy); p.carbonPromoted = false;
+    const result = panel({ policy: p, seats: [{ lens: 'style', counting: true },
+      { lens: 'style', counting: true }, { lens: 'style', counting: false }] });
+    expect(result.ok).toBe(true);
+    expect(result.panel.map(s => s.counting)).toEqual([true, true, false]);
+    let carbonObservers = 0;
+    for (let i = 0; i < 100; i++) {
+      const observed = panel({ policy: p, subject: `observer:${i}`, seats: [{ lens: 'style', counting: true },
+        { lens: 'style', counting: true }, { lens: 'style', counting: false }] });
+      for (const seat of observed.panel.filter(s => /carbon/.test(s.arm.model))) { expect(seat.counting).toBe(false); carbonObservers++; }
+    }
+    expect(carbonObservers).toBeGreaterThan(0);
+    for (const builderArm of arms.map(a => a.arm)) for (let i = 0; i < 50; i++) {
+      const route = routeFor({ kind: 'review-security', subject: `repo#${i}`, policy: { ...p, mode: 'on' }, capacity, builder: builderArm }).route;
+      if (route) { expect(route.provider).not.toBe(builderArm.provider); expect(route.model).not.toMatch(/carbon|luna|flash|hydrogen|haiku/); }
+    }
+    expect(routeFor({ kind: 'review-security', subject: 'repo#1', policy: { ...p, mode: 'on' }, capacity: { codex: capacity.codex }, builder }).route).toBeNull();
+    expect(draw({ kind: 'review-security', lens: 'style', builder })).toMatchObject({ arm: null, refusal: 'kind-lens-mismatch' });
+  });
   it('refuses unknown providers, models and efforts against the declared catalog, including builders', () => {
     for (const arm of [{ provider: 'unknown', model: 'unknown', effort: 'unknown' },
       { ...builder, provider: 'unknown' }, { ...builder, model: 'unknown' }, { ...builder, effort: 'unknown' }]) {
@@ -145,7 +199,9 @@ describe('pure provider rotation', () => {
   });
   it('security lens and merge-path shapes keep a strong reviewer; Flash never drawn there', () => {
     const p = clone(policy);
-    const weak = [entry('agy-gemini', 'flash', 'google', 'standard', 1000),
+    p.catalog.claude.sonnet.push('medium');
+    const weak = [entry('claude', 'sonnet', 'anthropic', 'standard', 1000, 'medium'),
+      entry('agy-gemini', 'flash', 'google', 'standard', 1000),
       entry('agy-gemini', 'hydrogen', 'google', 'small', 1000),
       entry('codex', 'luna', 'openai', 'small', 1000), entry('claude', 'haiku', 'anthropic', 'small', 1000)];
     Object.values(p.kinds).forEach(k => k.arms.push(...weak));
@@ -154,6 +210,10 @@ describe('pure provider rotation', () => {
       expect(result.ok).toBe(true);
       for (const seat of result.panel) if (shape !== 'normal' || seat.lens === 'security')
         expect(['flash', 'hydrogen', 'luna', 'haiku']).not.toContain(seat.arm.model);
+      for (const seat of result.panel.filter(s => s.lens === 'security')) {
+        expect(p.strongArms).toContain(id(seat.arm));
+        expect(seat.arm.model).not.toMatch(/flash|hydrogen|luna|haiku/);
+      }
       expect(result.panel.some(s => p.strongArms.includes(id(s.arm)))).toBe(true);
     }
     Object.values(p.kinds).forEach(k => { k.arms = weak; });
@@ -231,7 +291,7 @@ describe('pure provider rotation', () => {
     for (const forbidden of ['node:fs', 'process.env', 'Math.random', 'Date.now']) expect(source).not.toContain(forbidden);
   });
   it('policy covers every dispatch kind and Codex holds the largest base share in each', () => {
-    const p = realPolicy(); p.carbonPromoted = true;
+    const p = realPolicy(); expect(p.carbonPromoted).toBe(false);
     expect(Object.keys(p.kinds).sort()).toEqual(['build', 'fix', 'ci-heal', 'prepare', 'audit',
       'review-correctness', 'review-security', 'review-lens', 'red-team', 'judge', 'summary', 'doc-fix'].sort());
     for (const [kind, { arms: choices }] of Object.entries(p.kinds)) {
@@ -248,14 +308,15 @@ describe('pure provider rotation', () => {
     expect(p.kinds.summary.arms.some(a => a.arm.model.includes('haiku'))).toBe(true);
   });
   it('the shipped policy draws and composes strong diverse panels', () => {
-    const p = realPolicy(); p.carbonPromoted = true;
-    for (const kind of Object.keys(p.kinds)) expect(draw({ policy: p, kind }).arm).not.toBeNull();
+    const p = realPolicy(); expect(p.carbonPromoted).toBe(false);
+    for (const kind of Object.keys(p.kinds)) expect(draw({ policy: p, kind, builder }).arm).not.toBeNull();
     for (const shape of ['security', 'merge-path'])
-      expect(panel({ policy: p, shape })).toMatchObject({ ok: true, refusal: null });
+      expect(panel({ policy: p, shape, builder: { provider: 'agy-gemini', model: 'gemini-4-carbon', effort: 'high' } }))
+        .toMatchObject({ ok: true, refusal: null });
   });
   it('strong-arm model aliases are supported', () => {
-    const p = realPolicy(); p.carbonPromoted = true; p.strongArms = ['sol-high', 'carbon-high', 'sonnet-5-5'];
-    expect(panel({ policy: p, shape: 'merge-path' }).ok).toBe(true);
+    const p = realPolicy(); expect(p.carbonPromoted).toBe(false); p.strongArms = ['sol-high', 'carbon-high', 'sonnet-5-5'];
+    expect(panel({ policy: p, shape: 'merge-path', builder: { provider: 'agy-gemini', model: 'gemini-4-carbon', effort: 'high' } }).ok).toBe(true);
   });
   it('policy mode is shadow', () => { expect(realPolicy().mode).toBe('shadow'); });
 });
