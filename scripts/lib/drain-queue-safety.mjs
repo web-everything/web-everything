@@ -4,6 +4,7 @@ import { redTeamOwedOnHead } from './review-red-team-policy.mjs';
 import { execFileSync } from 'node:child_process';
 import { execFileSyncThrottled } from './gh-throttle.mjs';
 import { ciJobLogApiArgs } from './gh-ci-log.mjs';
+import { stripAnsiLogText } from './ansi-log-text.mjs';
 import { mkdirSync, readFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { homedir } from 'node:os';
@@ -467,9 +468,9 @@ function readQuarantineCover({ repo, commit, failed, exec, quarantine, flake }) 
       }
       const job = JSON.parse(read1(`repos/${repo}/actions/jobs/${check.id}`, 1024 * 1024));
       if (job?.name !== check.name || mqOid(job?.head_sha) !== commit) return null;
-      const text = read1(`repos/${repo}/actions/jobs/${check.id}/logs`, 64 * 1024 * 1024);
+      const text = stripAnsiLogText(read1(`repos/${repo}/actions/jobs/${check.id}/logs`, 64 * 1024 * 1024));
       const failures = parseVitestFailures(text);
-      const plain = text.replace(/\x1b\[[0-9;]*m/g, '').replace(/^\d{4}-\d\d-\d\dT[\d:.]+Z /gm, '');
+      const plain = text.replace(/^\d{4}-\d\d-\d\dT[\d:.]+Z /gm, '');
       const summary = /^\s*Tests\s+(\d+) failed\b/m.exec(plain);
       const names = new Set(failures.tests.map(t => `${t.file}::${t.name}`));
       // Unhandled errors/rejections fail a run without being a listed test failure: never covered by a quarantine.
@@ -637,8 +638,8 @@ function readMqExactTestEvidence({ repo, pr, head, timeline, exec, now }) {
     // Additional source: vitest's own final summary block, read from a bounded tail of the failed shard log
     // only (never classified as a whole; aggregators' logs are never read). `Errors  N error(s)` marks unhandled errors.
     const rawLog = read(`actions/jobs/${shards[0].id}/logs`, true);
-    const tail = Buffer.from(rawLog).subarray(-MQ_SUMMARY_TAIL_BYTES).toString('utf8')
-      .replace(/\x1b\[[0-9;]*m/g, '').replace(/^\uFEFF?\d{4}-\d\d-\d\dT[\d:.]+Z /gm, '');
+    const tail = stripAnsiLogText(Buffer.from(rawLog).subarray(-MQ_SUMMARY_TAIL_BYTES).toString('utf8'))
+      .replace(/^\uFEFF?\d{4}-\d\d-\d\dT[\d:.]+Z /gm, '');
     const tailLines = tail.split(/\r?\n/);
     const starts = tailLines.map((line, i) => /^\s*Test Files\s/.test(line) ? i : -1).filter(i => i >= 0);
     if (starts.length !== 1) return null;
@@ -859,10 +860,11 @@ function readMqBaseRetryEvidence({ repo, pr, head, timeline, exec, rerunScope, d
         const jobPath = /^\/([^/]+)\/([^/]+)\/actions\/runs\/([1-9][0-9]*)\/job\/([1-9][0-9]*)$/.exec(new URL(gates[0].details_url).pathname);
         if (jobPath && `${jobPath[1]}/${jobPath[2]}` === repo && new URL(gates[0].details_url).origin === 'https://github.com') {
           budget--;
-          const log = String(exec('gh', ciJobLogApiArgs(`repos/${repo}/actions/jobs/${Number(jobPath[4])}/logs`), {
+          const rawLog = String(exec('gh', ciJobLogApiArgs(`repos/${repo}/actions/jobs/${Number(jobPath[4])}/logs`), {
             encoding: 'utf8', timeout: 60_000, maxBuffer: MQ_INFRA_LOG_BYTES, stdio: ['ignore', 'pipe', 'pipe'], throttle: { maxAttempts: 1 } }));
           // The WHOLE gate log must be read (a hold outside a tail window would be missed): oversize fails closed.
-          if (Buffer.byteLength(log, 'utf8') >= MQ_INFRA_LOG_BYTES) throw new Error('gate log too large to classify');
+          if (Buffer.byteLength(rawLog, 'utf8') >= MQ_INFRA_LOG_BYTES) throw new Error('gate log too large to classify');
+          const log = stripAnsiLogText(rawLog);
           // `fail-closed` rows count too: a red-main freeze read that raced a main CI re-run fails closed
           // ("red-main freeze unreadable: … verdict pending") — main-caused and transient, not this PR's defect.
           const holds = log.split('\n').filter(line => /^\S+\s+(?:hold|fail-closed)\s{2,}\S+/.test(line));
@@ -951,10 +953,12 @@ function readMqBaseRetryEvidence({ repo, pr, head, timeline, exec, rerunScope, d
             stdio: ['ignore', 'pipe', 'pipe'], throttle: { maxAttempts: 1 },
           });
           if (typeof text !== 'string' || !text.trim()) throw new Error('unreadable log');
-          // Bound the scan as well as subprocess output. Injected readers may return oversized text.
-          const tail = Buffer.from(text.slice(-MQ_INFRA_SCAN_BYTES), 'utf8').subarray(-MQ_INFRA_SCAN_BYTES).toString('utf8');
+          // Infrastructure signatures use a bounded tail; failure wording is checked across the full log.
+          const plain = stripAnsiLogText(text);
+          const tail = Buffer.from(plain.slice(-MQ_INFRA_SCAN_BYTES), 'utf8').subarray(-MQ_INFRA_SCAN_BYTES).toString('utf8');
           let truncatedLine = false;
-          const matched = tail.split('\n').some(line => {
+          // A real failure anywhere in the log vetoes an infrastructure phrase in the tail.
+          const matched = !testFailure.test(plain) && tail.split('\n').some(line => {
             if (line.length > MQ_INFRA_LINE_CHARS) truncatedLine = true;
             const boundedLine = line.slice(-MQ_INFRA_LINE_CHARS);
             return patterns.some(pattern => pattern.test(boundedLine));

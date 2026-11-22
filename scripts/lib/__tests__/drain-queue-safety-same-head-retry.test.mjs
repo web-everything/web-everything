@@ -278,6 +278,13 @@ describe('merge-queue same-head retry for quarantined failures', () => {
     expect(reads.every(([, args]) => args.includes('--allow-escape-sequences'))).toBe(true);
   }));
 
+  it.each(['\x1b[2K', '\x1b[K', '\x1b]0;title\x07', '\x1b]0;title\x1b\\', '\x1b'])
+    ('holds quarantined failures with an escape-prefixed unhandled-error summary (%j)', prefix => fixture(f => {
+      f.logs[31] += `${prefix}Errors 1 error\n`;
+      expect(f.guard().hold).toBe(true);
+      expect(declined(f)).toHaveLength(1);
+    }));
+
   it('allows one retry when every failing test is in the active quarantine', () => fixture(f => {
     const result = f.guard();
     expect(result.hold).toBe(false);
@@ -658,6 +665,13 @@ describe('merge-queue exact-test extra retry after two failed_checks removals', 
     expect(reads[0][1]).toContain('--allow-escape-sequences');
   }));
 
+  it.each(['\x1b[2K', '\x1b[K', '\x1b]0;title\x07', '\x1b]0;title\x1b\\', '\x1b'])
+    ('holds exact-test retry with an escape-prefixed unhandled-error summary (%j)', prefix => exactFixture(f => {
+      f.logs[31] += `2026-11-16T07:54:50.5192657Z ${prefix}Errors 1 error\n`;
+      expect(f.guard().hold).toBe(true);
+      expect(declined(f)).toHaveLength(1);
+    }));
+
   it('#6903 allows exact-test retry 2/2 from structured reports without classifying over-long log lines', () => exactFixture(f => {
     expect(f.logs[31].split('\n')[0].length).toBeGreaterThan(512);
     expectExtraRetry(f);
@@ -957,6 +971,26 @@ describe('merge-queue exact-test extra retry after two failed_checks removals', 
     expect(f.guard().hold).toBe(false);
     expect(f.exec.mock.calls.filter(([, args]) => args.includes('POST') && args.includes(`repos/${repo}/actions/jobs/31/rerun`))).toHaveLength(1);
   }));
+
+  it('holds a plain main-freeze row alongside an ANSI-coloured red-team hold', () => exactFixture(f => {
+    f.mqChecks = [check(36, 'merge-gate', 800, 'failure')];
+    f.logs[36] = '2026-11-07T23:00:00Z hold  red-main-freeze  main is RED (freeze: fixture)\n'
+      + '2026-11-07T23:00:00Z \x1b[31mhold\x1b[0m  red-team  review required\n';
+    f.artifacts = {}; f.reports = {};
+    expect(f.guard().hold).toBe(true);
+    expect(declined(f)).toHaveLength(1);
+  }));
+
+  it.each([' FAIL  scripts/x.test.mjs > broken case', 'AssertionError: expected true to be false'])
+    ('holds mixed ANSI infrastructure and real test failure: %s', failure => exactFixture(f => {
+      f.mqChecks = [check(31, 'test-shard (1)', 800, 'failure')];
+      // The failure is outside the infrastructure tail scan: it must still veto retry.
+      f.logs[31] = `\x1b[31m${failure}\x1b[0m\n${'ordinary output\n'.repeat(5000)}`
+        + '\x1b[2Kfatal: could not fetch abc123 from promisor remote\n';
+      f.artifacts = {}; f.reports = {};
+      expect(f.guard().hold).toBe(true);
+      expect(declined(f)).toHaveLength(1);
+    }));
 
   it.each(['merge-gate freeze', 'runner-loss pattern', 'aggregator log fallback'])('preserves the two-removal log-based infrastructure retry: %s', route => exactFixture(f => {
     const infraLog = 'fatal: could not fetch abc123 from promisor remote\n';

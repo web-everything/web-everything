@@ -5933,3 +5933,11 @@ contract. Set `cliMain` in `prFileContract` for callable entries so repeated arg
 the loaded graph. Resetting the entire daemon graph twice inside the CLI test exceeded its
 60-second deadline on a coverage shard. Keep the file/standalone output comparison and zero-GitHub
 assertions intact; consumers without callable entries retain the fresh-import path.
+
+## Drain log evidence normalization
+
+Drain queue and recovery log consumers share `stripAnsiLogText` before parsing evidence.
+Keep negative cases for non-colour CSI, BEL/ST-terminated OSC, and stray ESC before
+`Errors`: colour-only stripping misses erase-line commands, and generic terminal stripping
+can consume the first letter of evidence after a stray ESC. Real test-failure wording
+anywhere in a job log vetoes infrastructure signatures, including beyond the signature tail.
