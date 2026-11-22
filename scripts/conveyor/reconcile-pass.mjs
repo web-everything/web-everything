@@ -1708,6 +1708,28 @@ export function enrichPrsWithLedgerHolds(prs, { readOnly = false, repo, now = Da
   }
 }
 
+// Planner inputs of recent writable passes, by token. A dispatch consumer runs owed-fix recovery
+// (we:scripts/conveyor/owed-fix-recovery.mjs) on the plan its reconcile wrapper returned, even a structured clone
+// served by the daemon's pass plan cache: the input itself holds functions (the fixer ladder) and cannot ride that
+// clone, but the token can. In-process and bounded to the newest entries; an evicted or foreign token resolves to
+// null and the consumer keeps ordinary planning (logged).
+const OWED_FIX_RECOVERY_INPUTS_MAX = 16;
+const owedFixRecoveryInputs = new Map();
+let owedFixRecoverySeq = 0;
+export function rememberOwedFixRecoveryInput(input) {
+  const token = `${process.pid}:${++owedFixRecoverySeq}`;
+  owedFixRecoveryInputs.set(token, input);
+  while (owedFixRecoveryInputs.size > OWED_FIX_RECOVERY_INPUTS_MAX) {
+    owedFixRecoveryInputs.delete(owedFixRecoveryInputs.keys().next().value);
+  }
+  return { v: 1, token };
+}
+/** The planner input `plan` was computed from, or null when the plan carries no live token. */
+export function owedFixRecoveryInput(plan) {
+  const token = plan?.owedFixRecovery?.token;
+  return typeof token === 'string' ? owedFixRecoveryInputs.get(token) ?? null : null;
+}
+
 /**
  * we:scripts/conveyor/reconcile-pass.mjs#runReconcilePass — read, decide, return. Every reader is injectable, so
  * the whole shell is exercisable with no network and no credential.
@@ -1718,7 +1740,6 @@ export function enrichPrsWithLedgerHolds(prs, { readOnly = false, repo, now = Da
  */
 export function runReconcilePass({
   readOnly = false,
-  recoverOwedFixes = null,
   readPrs = defaultReadPrs, readAgents = defaultReadAgents, enrich = enrichAgents,
   excuseMergeGateHolds = excusePrMergeGateHolds, readMergeGateVerdict = defaultReadMergeGateVerdict,
   readFreeze = readSharedFreeze, mergeGateSetting,
@@ -1922,10 +1943,12 @@ export function runReconcilePass({
     mainRedPriority: readPriority(),
     ...(readOnly ? { shadowDeps: { mode: 'off', appendLine: () => {}, readLocals: () => undefined } } : {}),
   };
-  const plan = step('plan', () => !readOnly && recoverOwedFixes
-    ? recoverOwedFixes(plannerInput, { plan: planReconcile }) : planReconcile(plannerInput));
+  const plan = step('plan', () => planReconcile(plannerInput));
   const { prs: _prs, agents: _agents, repo: _repo, now: _now, durableCounts: _counts, ...plannerOptions } = plannerInput;
-  return { ...plan, ...(readOnly ? { enrichedPrs: prs, agentList: agents, agentsIncomplete: Object.hasOwn(agents, 'incomplete'), plannerOptions } : {}), owedTriggers: hydrated.owedTriggers, notes: [...hydrated.notes, ...plan.notes], refusals: [...hydrated.refusals, ...plan.refusals], prs: rawPrs.length, agents: agents.length,
+  // A writable pass names its planner input so each dispatch consumer runs owed-fix recovery itself, after whatever
+  // reconcile wrapper produced this plan (see rememberOwedFixRecoveryInput).
+  const owedFixRecovery = readOnly ? null : rememberOwedFixRecoveryInput(plannerInput);
+  return { ...plan, ...(readOnly ? { enrichedPrs: prs, agentList: agents, agentsIncomplete: Object.hasOwn(agents, 'incomplete'), plannerOptions } : { owedFixRecovery }), owedTriggers: hydrated.owedTriggers, notes: [...hydrated.notes, ...plan.notes], refusals: [...hydrated.refusals, ...plan.refusals], prs: rawPrs.length, agents: agents.length,
     openPrFiles: rawPrs.map((pr) => ({ pr: pr.number, files: Array.isArray(pr.files) && pr.files.length < 100
       ? pr.files.map((file) => typeof file === 'string' ? file : file.path) : null })),
   };

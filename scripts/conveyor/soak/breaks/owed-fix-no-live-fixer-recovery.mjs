@@ -10,8 +10,9 @@ export function probe(checkout, scenario = 'all') {
     import { join } from 'node:path';
     import { pathToFileURL } from 'node:url';
     const [checkout, scenario] = process.argv.slice(1);
-    const { recoverOwedFixes } = await import(pathToFileURL(
-      join(checkout, 'scripts/conveyor/owed-fix-recovery.mjs')));
+    const recovery = await import(pathToFileURL(join(checkout, 'scripts/conveyor/owed-fix-recovery.mjs')));
+    const { recoverOwedFixes } = recovery;
+    const reconcilePass = await import(pathToFileURL(join(checkout, 'scripts/conveyor/reconcile-pass.mjs')));
     const minute = 60_000;
     const head = 'a'.repeat(40);
     function fixture(overrides = {}) {
@@ -22,14 +23,14 @@ export function probe(checkout, scenario = 'all') {
         meta: { repo, pr: 2345, kind: 'fixing', headSha: head, who: 'missing-fixer',
           claimedAt: new Date(now - 31 * minute).toISOString() } };
       const input = { repo, now, agents: [], prs: [{ number: 2345, state: 'OPEN',
-        headRefOid: head, fixClaim: claim, ...overrides }] };
+        headRefOid: head, labels: [{ name: 'review:changes' }], fixClaim: claim, ...overrides }] };
       let claims = [claim];
       const state = new Map();
       const released = [], published = [], updates = [];
       const deps = {
         plan: value => ({ dispatch: value.prs[0].fixClaim ? [] : [{ ...row }],
           refusals: value.prs[0].fixClaim ? [{ kind: 'fix-claimed', prNumber: 2345 }] : [], notes: [] }),
-        readHead: () => head,
+        readLive: () => ({ headRefOid: head, state: 'OPEN', isDraft: false, labels: [{ name: 'review:changes' }] }),
         readClaims: () => structuredClone(claims),
         transact: (key, fn) => fn(structuredClone(state.get(key) ?? {}),
           next => state.set(key, structuredClone(next))),
@@ -43,10 +44,43 @@ export function probe(checkout, scenario = 'all') {
         awaitingVerifyFor: () => ({ awaiting: false }),
         runnerDead: () => true,
       };
-      return { input, deps, row, released, published, updates,
+      return { input, deps, row, released, published, updates, state,
         tick: () => recoverOwedFixes(input, deps) };
     }
     const cases = {
+      // Live PR #7336 red team: the daemon reconciles through its pass plan cache, which serves STRUCTURED CLONES
+      // (and the routed CI-heal lambda wraps that again). Recovery must still run on such a plan.
+      cachedPlan() {
+        const { rememberOwedFixRecoveryInput, owedFixRecoveryInput } = reconcilePass;
+        const f = fixture();
+        const plan = { ...f.deps.plan(f.input), owedFixRecovery: rememberOwedFixRecoveryInput(f.input) };
+        const served = structuredClone(plan);
+        recovery.applyOwedFixRecovery(served, { kinds: ['fix'], input: owedFixRecoveryInput(served), io: f.deps,
+          log: () => {} });
+        deepStrictEqual(served.dispatch, [f.row], 'a cached plan clone must still restore the stale-claim repair');
+        strictEqual(f.released.length, 1);
+      },
+      // Live PR #7336 red team: capacity refused the launch at minutes 0 and 30. The allowance must survive, so
+      // the repair launches when capacity frees (minute 31) and nothing escalates.
+      capacityDeferral() {
+        const f = fixture({ fixClaim: null });
+        f.deps.readClaims = () => [];
+        const tick = launch => {
+          const ledger = recovery.createOwedFixRecoveryLedger({ transact: f.deps.transact, log: () => {} });
+          const out = recoverOwedFixes(f.input, { ...f.deps, ledger });
+          if (launch && out.dispatch.length) ledger.attempting(2345);
+          ledger.settle();
+          return out.dispatch.length;
+        };
+        const offered = [];
+        offered.push(tick(false));
+        f.input.now += 30 * minute; offered.push(tick(false));
+        f.input.now += minute; offered.push(tick(true));
+        f.input.now += 29 * minute; offered.push(tick(true));
+        deepStrictEqual(offered, [1, 1, 1, 0], 'deferred launches must keep the allowance; the real launch then waits');
+        strictEqual(f.published.length, 0, 'a never-launched repair must not escalate');
+        strictEqual(f.updates.length, 0);
+      },
       recovery() {
         const f = fixture();
         deepStrictEqual(f.tick().dispatch, [f.row], 'stale claim must restore the exact repair row');
@@ -110,7 +144,7 @@ export function probe(checkout, scenario = 'all') {
 
 export default {
   id: 'owed-fix-no-live-fixer-recovery',
-  title: 'owed fixes recover once without a live fixer, then escalate once',
+  title: 'owed fixes recover once without a live fixer (through cached plans), keep the allowance on a capacity deferral, then escalate once',
   card: 'owed-fix recovery soak precheck',
   fixedBy: { sha: 'HEAD', where: 'main', paths: ['scripts/conveyor/owed-fix-recovery.mjs'] },
   fixPresent: checkout => probe(checkout).violations.length === 0,

@@ -16,6 +16,8 @@ describe('owed-fix no-live-fixer behavioral replay', () => {
     ['escalation', 'escalates the second miss once without redispatching'],
     ['parked', 'preserves operator-parked and draft claims without dispatch'],
     ['unreadable', 'refuses unreadable liveness evidence without side effects'],
+    ['cachedPlan', 'restores the repair on a structured clone of the plan, as the daemon plan cache serves it'],
+    ['capacityDeferral', 'keeps the allowance when capacity refuses the launch, and never escalates a never-launched repair'],
   ])('%s: %s', scenario => {
     expect(probe(root, scenario).violations).toEqual([]);
   });

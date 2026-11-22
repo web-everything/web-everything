@@ -33,7 +33,8 @@ vi.mock('../reconcile-core.mjs', async original => ({ ...await original(), planR
 import { defaultListAgents } from '../../operations/dispatch-lane-io.mjs';
 import { execFileSyncThrottled } from '../../lib/gh-throttle.mjs';
 import { planReconcile } from '../reconcile-core.mjs';
-import { runReconcilePass, enrichAgents, defaultReadAgents, enrichPrsWithLedgerHolds, withRestAuthors } from '../reconcile-pass.mjs';
+import { runReconcilePass, enrichAgents, defaultReadAgents, enrichPrsWithLedgerHolds, withRestAuthors,
+  rememberOwedFixRecoveryInput, owedFixRecoveryInput } from '../reconcile-pass.mjs';
 import { listReviewJobAgents, listAgentsWithReviewJobs } from '../../operations/review-job-store.mjs';
 const identity = prs => prs;
 const options = () => ({
@@ -116,15 +117,25 @@ describe('read-only live reconciliation', () => {
     expect(probe.writes).toContain('rmSync');
     expect(result).not.toHaveProperty('enrichedPrs');
   });
-  it('owed-fix recovery receives production planner inputs only in a writable dispatch pass', () => {
-    const recoverOwedFixes = vi.fn((input, { plan }) => plan(input));
-    runReconcilePass({ ...options(), recoverOwedFixes });
-    expect(recoverOwedFixes).toHaveBeenCalledTimes(1);
-    expect(recoverOwedFixes.mock.calls[0][0]).toMatchObject({ repo: 'we', prs: [expect.objectContaining({ number: 1 })] });
-    recoverOwedFixes.mockClear(); probe.writes = [];
-    runReconcilePass({ ...options(), readOnly: true, recoverOwedFixes });
-    expect(recoverOwedFixes).not.toHaveBeenCalled();
+  it('a writable pass names its planner input for owed-fix recovery; a read-only pass names none', () => {
+    const result = runReconcilePass(options());
+    // The daemon's pass plan cache stores and serves structured clones: the plan must clone (or the cache silently
+    // stops reusing plans), and the clone must still resolve the same planner input (or a cache hit loses recovery).
+    const clone = structuredClone(result);
+    const input = owedFixRecoveryInput(clone);
+    expect(input).toMatchObject({ repo: 'we', prs: [expect.objectContaining({ number: 1 })] });
+    expect(input).toBe(owedFixRecoveryInput(result));
+    probe.writes = [];
+    expect(runReconcilePass({ ...options(), readOnly: true })).not.toHaveProperty('owedFixRecovery');
     expect(probe.writes).toEqual([]);
+  });
+  it('the planner-input registry is bounded; an evicted or foreign token resolves to null', () => {
+    const first = rememberOwedFixRecoveryInput({ repo: 'we', marker: 'first' });
+    expect(owedFixRecoveryInput({ owedFixRecovery: first })).toMatchObject({ marker: 'first' });
+    for (let i = 0; i < 16; i++) rememberOwedFixRecoveryInput({ repo: 'we', marker: i });
+    expect(owedFixRecoveryInput({ owedFixRecovery: first })).toBeNull();
+    expect(owedFixRecoveryInput({ owedFixRecovery: { v: 1, token: 'other-host:1' } })).toBeNull();
+    expect(owedFixRecoveryInput({})).toBeNull();
   });
   it('preserves the non-enumerable incomplete marker through merged listings and enrichment', () => {
     const incomplete = ['unreadable-worker'];

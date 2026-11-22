@@ -67,8 +67,8 @@ import { repoKeyForSlug } from '../lib/constellation-repos.mjs';
 import { assertCapability, repoProfile, briefTokensForRepo } from '../lib/repo-profile.mjs';
 import { resolvePrWorkUnit } from '../conveyor/pr-work-unit.mjs';
 import { freeLaneNumbers, fetchPrDiffPaths, queueBudgetFrom, queueCapWhy, fixerTableFor } from '../conveyor/reconcile-fix-dispatch.mjs'; // queueBudgetFrom/queueCapWhy: card xkyw1x4
-import { runReconcilePass } from '../conveyor/reconcile-pass.mjs';
-import { recoverOwedFixes } from '../conveyor/owed-fix-recovery.mjs';
+import { runReconcilePass, owedFixRecoveryInput } from '../conveyor/reconcile-pass.mjs';
+import { applyOwedFixRecovery, createOwedFixRecoveryLedger, resolveOwedFixRecoveryIo } from '../conveyor/owed-fix-recovery.mjs';
 import { readUnsupported, recordUnsupported } from '../conveyor/unsupported-repo.mjs';
 import { readPrsFromFile } from '../conveyor/open-pr-fetch.mjs';
 import {
@@ -423,7 +423,18 @@ export const resetCiHealFlushDeadlineState = () => flushSkippedRepos.clear();
 
 const LAUNCH_WAVE = 4;
 
-export async function runReconcileCiHealDispatch({
+/** `o.owedFixRecovery`: owed-fix recovery IO overrides (`null` disables; off under a test runner unless injected).
+ *  Recovery runs after whatever reconcile wrapper produced the plan, and an admission this pass never attempted to
+ *  launch is given back. */
+export async function runReconcileCiHealDispatch(options = {}) {
+  const owedFixRecovery = resolveOwedFixRecoveryIo(options.owedFixRecovery, isUnderTest());
+  const ledger = createOwedFixRecoveryLedger(owedFixRecovery?.transact ? { transact: owedFixRecovery.transact } : {});
+  try { return await runCiHealDispatchPass({ ...options, owedFixRecovery, owedFixLedger: ledger }); } finally { ledger.settle(); }
+}
+
+async function runCiHealDispatchPass({
+  owedFixRecovery = {},
+  owedFixLedger = null,
   root = REPO_ROOT,
   repo = null,
   dispatch = dispatchCiHeal,
@@ -481,11 +492,7 @@ export async function runReconcileCiHealDispatch({
   timeoutFollowups = await flushTimeouts({ root, repo: CONSTELLATION_REPOS[repoKey].slug });
   flushSkippedRepos.delete(repoKey);
   flushForced = false;
-  const reconciled = reconcile({ repo,
-    ...(reconcile === runReconcilePass ? {
-      recoverOwedFixes: (input, io) => recoverOwedFixes(input, { ...io, kinds: ['ci-heal'] }),
-    } : {}),
-    ...(prsFile ? { readPrs: () => readPrsFromFile(prsFile) } : {}) });
+  const reconciled = reconcile({ repo, ...(prsFile ? { readPrs: () => readPrsFromFile(prsFile) } : {}) });
   // A DEFERRED read planned nothing: owed is UNKNOWN, not zero. Skip the tick — no timeout reruns, no dispatch, no
   // unsupported-row rewrite (that would RELEASE rows the unread PRs still owe) — and say so.
   if (reconciled?.deferred === true) {
@@ -493,6 +500,10 @@ export async function runReconcileCiHealDispatch({
     console.error(`ci-heal-pr-dispatch: open-PR read deferred — owed unknown, skipping this tick: ${readDeferred}`);
     return { handled: 0, deferred: [], nextCursor: null, dispatched: [], refusals: [], readDeferred, timeoutFollowups, reconcileRefusals: 0, reconcileRefusalDetails: [], owedFlush };
   }
+  // In place: the daemon's routed CI-heal wrapper captured `reconciled.dispatch` for executor routing, so a
+  // restored row must land in that same array (this plan object is this pass's own, never a cached copy).
+  if (owedFixRecovery !== null) applyOwedFixRecovery(reconciled, { kinds: ['ci-heal'],
+    input: owedFixRecoveryInput(reconciled), io: owedFixRecovery, ledger: owedFixLedger });
   let ciHealEntries = orderCiHealEntriesOldestFirst((reconciled.dispatch ?? []).filter((entry) => entry.kind === 'ci-heal'));
   if (cursor != null) {
     const start = ciHealEntries.findIndex(entry => entry.prNumber === cursor);
@@ -753,10 +764,13 @@ export async function runReconcileCiHealDispatch({
       }
       const dispatchStartedAt = clock();
       let result;
+      // A launch attempt: a failed one keeps any owed-fix recovery reservation (it escalates).
+      owedFixLedger?.attempting(entry.prNumber);
       try {
         result = await dispatch(planned, { root, repo: repoKey, extraArgs: agentArgsFromEnv() });
       } finally { dispatchMs = clock() - dispatchStartedAt; }
       if (result?.held) {
+        owedFixLedger?.notLaunched(entry.prNumber);
         outcome.refusals.push({ pr: entry.prNumber, kind: 'held', why: result.reason ?? `a CI-heal for PR #${entry.prNumber} is already in flight` });
         logRefusal(entry.prNumber, outcome.refusals.at(-1));
         const next = waitingForLane.shift();

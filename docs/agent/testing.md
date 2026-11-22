@@ -5971,7 +5971,13 @@ assertions intact; consumers without callable entries retain the fresh-import pa
 ## Owed fix without a session
 
 `owed-fix-recovery.mjs` is enabled only by the fix and CI-heal dispatch consumers,
-each for its own dispatch kind. Recovery must run the ordinary planner with only
+each for its own dispatch kind. It runs in the consumer after its reconcile call,
+so it holds through any wrapper (the daemon's pass plan cache, the routed CI-heal
+lambda): test it through those wrappers, not only with the bare reconcile pass. A
+recovery admission whose launch the consumer never attempted (capacity, no lane,
+a filter, a thrown pass) is given back; an attempted launch that failed is not.
+Its default IO is live, so it is off under a test runner unless injected.
+Recovery must run the ordinary planner with only
 the fixer claim removed; park, stand-down, cap and liveness refusals still apply.
 Keep the per-head reservation under the shared sidecar lock, retain every new
 claim’s full 30-minute session-listing grace, and refuse absent or unreadable
