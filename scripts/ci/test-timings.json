@@ -399,6 +399,7 @@
   "scripts/ci/__tests__/ci-unit-shard-step.test.mjs": 0.09,
   "scripts/ci/__tests__/ci-worker-count-measure.test.mjs": 1.84,
   "scripts/ci/__tests__/coverage-reach.test.mjs": 0.19,
+  "scripts/ci/__tests__/dep-trace.test.mjs": 0.05,
   "scripts/ci/__tests__/fetch-main-history.test.mjs": 0.11,
   "scripts/ci/__tests__/quarantine-job-wiring.test.mjs": 0.06,
   "scripts/ci/__tests__/quarantine-skip.test.mjs": 0.77,
@@ -585,6 +586,7 @@
   "scripts/conveyor/__tests__/poc-branch-sync.test.mjs": 2.46,
   "scripts/conveyor/__tests__/pr-blocked-by.test.mjs": 0.02,
   "scripts/conveyor/__tests__/pr-comments-complete.test.mjs": 0.18,
+  "scripts/conveyor/__tests__/pr-expectations.test.mjs": 0.3,
   "scripts/conveyor/__tests__/pr-label-mirror.test.mjs": 0.38,
   "scripts/conveyor/__tests__/pr-lifecycle.test.mjs": 0.04,
   "scripts/conveyor/__tests__/pr-live-owner-lock.test.mjs": 0.08,
@@ -720,6 +722,7 @@
   "scripts/conveyor/__tests__/stuck-pr-inspect-dispatch.test.mjs": 0.09,
   "scripts/conveyor/__tests__/stuck-pr-watch-core.test.mjs": 0.05,
   "scripts/conveyor/__tests__/stuck-pr-watch.test.mjs": 0.1,
+  "scripts/conveyor/__tests__/stuck-prs.test.mjs": 0.3,
   "scripts/conveyor/__tests__/stuck-trace.test.mjs": 0.59,
   "scripts/conveyor/__tests__/supersede-rule.test.mjs": 1.36,
   "scripts/conveyor/__tests__/supersede-watch.test.mjs": 0.11,
@@ -2038,7 +2041,10 @@
   "webcases/__tests__/requirementValidator.test.ts": 0.02,
   "webtraits/__tests__/intentProfileResolver.test.ts": 0.01,
   "webtraits/__tests__/surfaceIntentResolver.test.ts": 0.02,
-  "wrapper-conformance/__tests__/runner.test.ts": 0.01
+  "wrapper-conformance/__tests__/runner.test.ts": 0.01,
+  "scripts/lib/__tests__/daemon-rebuild-early-launch.test.mjs": 1,
+  "scripts/lib/__tests__/daemon-rebuild-early-timing.test.mjs": 1,
+  "scripts/lib/__tests__/daemon-rebuild-recovery.test.mjs": 1
  },
  "soak": {
   "scripts/conveyor/soak/breaks/lane-pool-release-unpushed-guard.soak.test.mjs": 315.93,
@@ -2286,6 +2292,7 @@
   "scripts/conveyor/soak/breaks/withdrawn-operator-block-directs-takeover.soak.test.mjs": 0.53,
   "scripts/conveyor/soak/breaks/ci-held-record-effect-never-resumes.soak.test.mjs": 2,
   "scripts/conveyor/soak/breaks/accepted-pr-stale-accept-row-never-executed.soak.test.mjs": 15.28,
+  "scripts/conveyor/soak/breaks/fix-refusal-stale-read-no-fresh-reread.soak.test.mjs": 5,
   "scripts/conveyor/soak/breaks/stall-classify-unpublished-findings-ruling-needed.soak.test.mjs": 2,
   "scripts/conveyor/soak/breaks/drain-rebases-clean-behind-pr.soak.test.mjs": 8,
   "scripts/conveyor/soak/breaks/fixer-brief-chains-rearm-review.soak.test.mjs": 1.5,
@@ -2401,6 +2408,7 @@
   "scripts/conveyor/soak/breaks/scratch-tests-forge-command.soak.test.mjs": 0.15,
   "scripts/conveyor/soak/breaks/forge-sweep-scan-bound-refusal.soak.test.mjs": 1.09,
   "scripts/conveyor/soak/breaks/forge-timeout-cancel-wait-too-short.soak.test.mjs": 0.16,
+  "scripts/conveyor/soak/breaks/settings-registry-doc-conflict-regenerated.soak.test.mjs": 3,
   "scripts/conveyor/soak/breaks/smoke-gh-throttle-load-shaped.soak.test.mjs": 26.66,
   "scripts/conveyor/soak/breaks/snapshot-eviction-blocks-job-spawn.soak.test.mjs": 0.02,
   "scripts/conveyor/soak/breaks/stacked-pr-landing-holder-deadlock.soak.test.mjs": 0,
@@ -2418,6 +2426,9 @@
   "scripts/conveyor/soak/breaks/capacity-routing-ignores-expiring-quota.soak.test.mjs": 0.1,
   "scripts/conveyor/soak/breaks/daemon-git-developer-dir.soak.test.mjs": 1,
   "scripts/conveyor/soak/breaks/watchdog-pr-list-transient-retry.soak.test.mjs": 3,
+  "scripts/conveyor/soak/breaks/rebuild-launch-before-next-tick.soak.test.mjs": 2,
+  "scripts/conveyor/soak/breaks/rebuild-held-recovery.soak.test.mjs": 1,
+  "scripts/conveyor/soak/breaks/rebuild-evidence-compatibility.soak.test.mjs": 1,
   "scripts/conveyor/soak/breaks/mq-unreadable-log-single-retry.soak.test.mjs": 1
  },
  "integration": {}

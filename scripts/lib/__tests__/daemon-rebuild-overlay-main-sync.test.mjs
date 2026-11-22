@@ -1817,14 +1817,30 @@ describe('R372 genuine merge conflict stops retrying', () => {
     expect(json(sidecar(f)).attemptedMain[ref]).toBe(f.mainSha);
   });
 
-  it('emits one overlay-main-sync-conflict event with the conflicting files and the real git output, not a failed event', async () => {
-    const f = fixture({ conflict: true });
-    await expect(job(f)).rejects.toThrow(/merge conflicts/);
+  const expectOneConflictEvent = f => {
     const conflicts = daemonEvents(f).filter(e => e.kind === 'overlay-main-sync-conflict');
     expect(conflicts).toHaveLength(1);
     expect(conflicts[0].detail).toMatchObject({ ref, step: 'merge', main: f.mainSha, tip: f.oldSha, files: ['worker.mjs'] });
     expect(conflicts[0].detail.stderrTail).toMatch(/CONFLICT|Automatic merge failed/);
     expect(daemonEvents(f).filter(e => e.kind === 'overlay-main-sync-failed')).toEqual([]);
+  };
+
+  it('emits one overlay-main-sync-conflict event with the conflicting files and the real git output, not a failed event', async () => {
+    const f = fixture({ conflict: true });
+    await expect(job(f)).rejects.toThrow(/merge conflicts/);
+    expectOneConflictEvent(f);
+  });
+
+  it('emits one overlay-main-sync-conflict event when Git writes the conflict to stdout and a warning to stderr', async () => {
+    const f = fixture({ conflict: true });
+    const realGit = f.deps.git;
+    f.deps.git = (args, opts) => {
+      const result = realGit(args, opts);
+      return gitCommand(args) === 'merge' && result.status !== 0
+        ? { ...result, stderr: `${result.stderr ?? ''}\nbenign Git warning` } : result;
+    };
+    await expect(job(f)).rejects.toThrow(/merge conflicts/);
+    expectOneConflictEvent(f);
   });
 
   it('skips the identical (main, ref tip) pair silently and retries when the ref tip moves', async () => {
