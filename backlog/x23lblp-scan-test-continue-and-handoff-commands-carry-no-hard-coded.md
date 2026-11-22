@@ -2,7 +2,7 @@
 kind: story
 size: 2
 status: open
-scope: ["we:.claude/commands/continue.md", "we:.claude/commands/handoff.md"]
+scope: ["we:.claude/commands/continue.md", "we:.claude/commands/handoff.md", "we:scripts/__tests__/command-state-scan.test.mjs"]
 dateOpened: "2026-11-22"
 tags: [plateau, design-plan, carried-acceptance]
 ---

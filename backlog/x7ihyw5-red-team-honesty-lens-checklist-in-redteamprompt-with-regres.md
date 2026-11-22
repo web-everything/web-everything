@@ -2,7 +2,7 @@
 kind: story
 size: 3
 status: open
-scope: ["we:skills-src/jury/subject-jury.workflow.js"]
+scope: ["we:skills-src/jury/subject-jury.workflow.js", "we:skills-src/jury/__tests__/redteam-honesty-lenses.test.mjs", "we:skills-src/jury/SKILL.md"]
 dateOpened: "2026-11-22"
 tags: [plateau, design-plan, carried-acceptance]
 ---

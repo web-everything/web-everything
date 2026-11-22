@@ -14,7 +14,7 @@ The enforcement work for PL-BETA-GUARDS: an access-grant check in the Worker or 
 
 ## Acceptance
 
-- [A1] **Executable** — an access-grant check in the Worker or auth flow refuses an external invite while #3130 or #3811 is open, and allows it once both are resolved; a test covers both cases and an unreadable blocker state (refuse).
+- [A1] **Executable** — an access-grant check in the Worker or auth flow refuses an external invite while #3130 or #3811 is open, and allows it once both are resolved; a test covers both cases and an unreadable blocker state (refuse). The same check also covers the shared-code login (the path #3811 documents, with no per-person identity): while either blocker is open, that login refuses any non-internal user, and a test drives that path directly, not only invites.
 
 
 
