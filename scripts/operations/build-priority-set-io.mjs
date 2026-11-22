@@ -5,6 +5,7 @@ import { fileURLToPath } from 'node:url';
 import { randomUUID } from 'node:crypto';
 import { execFileSync } from 'node:child_process';
 import yaml from 'js-yaml';
+import { isTrustChainPath } from '../lib/gate-config.mjs';
 import { runGhSync } from '../lib/gh-throttle.mjs';
 import { CONSTELLATION_REPOS } from '../lib/constellation-repos.mjs';
 import { normalizeBriefScope, SCOPE_PREFIX_ALIASES } from './dispatch-lane.mjs';
@@ -38,7 +39,7 @@ export function readPriorityCards({ git = args => execFileSync('git', args, {
     const front = /^---\r?\n([\s\S]*?)\r?\n---(?:\r?\n|$)/.exec(text);
     if (!front) refuse(`card ${id} has unreadable YAML frontmatter`);
     const data = yaml.load(front[1]);
-    return { scope: data?.scope };
+    return { scope: data?.scope, status: data?.status, size: data?.size };
   };
 }
 
@@ -89,25 +90,36 @@ export function readPriorityPrs({ gh = args => runGhSync(args, READ_OPTIONS) } =
   return prs;
 }
 
-function prepare(input, options) {
-  const { actor, reason, ids, mode, ttlHours } = validateBuildPriorityInput(input);
-  if (new Set(ids.map(canonicalId)).size !== ids.length) refuse('duplicate numeric card identities');
-  const readCard = options.readCard ?? readPriorityCards();
-  const scopes = ids.flatMap(id => {
-    const card = readCard(id);
-    const raw = typeof card?.scope === 'string' ? [card.scope] : card?.scope;
-    if (!Array.isArray(raw) || !raw.length || raw.some(s => typeof s !== 'string' || !s.trim())) refuse(`card ${id} missing or unreadable scope`);
-    const scope = raw.flatMap(member => {
-      const normalized = normalizeBriefScope([member]);
-      if (!normalized.length) refuse(`card ${id} empty scope member`);
-      return normalized.map(s => qualifyFile(s));
-    });
-    if (!scope.length) refuse(`card ${id} empty scope`);
-    return scope;
+/** Conservative supplement to the shared trust-chain predicate, including broad directory scopes. */
+function touchesMergePath(scope) {
+  const path = scope.slice(scope.indexOf(':') + 1);
+  return isTrustChainPath(path)
+    || /(?:^|\/)[^/]*(?:merge|drain|review)[^/]*(?:\/|$)/i.test(path)
+    || /^(?:\.github\/workflows(?:\/|$)|scripts\/(?:lib|readiness|conveyor)\/?$)/.test(path)
+    || ['scripts', 'scripts/', '.github', '.github/', './', '.', ''].includes(path);
+}
+
+function cardScope(card, id) {
+  const raw = typeof card?.scope === 'string' ? [card.scope] : card?.scope;
+  if (!Array.isArray(raw) || !raw.length || raw.some(s => typeof s !== 'string' || !s.trim())) refuse(`card ${id} missing or unreadable scope`);
+  const scope = raw.flatMap(member => {
+    const normalized = normalizeBriefScope([member]);
+    if (!normalized.length) refuse(`card ${id} empty scope member`);
+    return normalized.map(s => qualifyFile(s));
   });
+  if (!scope.length) refuse(`card ${id} empty scope`);
+  return scope;
+}
+
+function prepare(input, options) {
+  const { actor, reason, ids: explicitIds, autoCount, mode, ttlHours } = validateBuildPriorityInput(input);
+  if (new Set(explicitIds.map(canonicalId)).size !== explicitIds.length) refuse('duplicate numeric card identities');
+  const readCard = options.readCard ?? readPriorityCards();
+  // Preserve explicit-ID validation order and refusal behavior.
+  const scopes = autoCount ? [] : explicitIds.flatMap(id => cardScope(readCard(id), id));
   const prs = (options.readPrs ?? readPriorityPrs)();
   if (!Array.isArray(prs)) refuse('unreadable PR source');
-  for (const pr of prs) {
+  const qualifiedPrs = prs.map(pr => {
     if (!Object.values(CONSTELLATION_REPOS).some(r => r.slug === pr?.repo) || !Number.isInteger(pr.number)
         || !Array.isArray(pr.files) || pr.files.some(f => typeof f !== 'string' || !f.trim())) refuse('unreadable PR files');
     // Scope syntax splits on these delimiters; never silently split a literal PR filename.
@@ -115,10 +127,44 @@ function prepare(input, options) {
     const key = repoKeyFor(pr.repo);
     // Use the card scope vocabulary while keeping PR filenames literal (including colons).
     const files = pr.files.map(f => `${SCOPE_PREFIX_ALIASES[key] ?? key}:${f}`);
-    if (scopes.some(scope => prHoldsFile({ ...pr, files }, scope))) refuse(`scope overlaps open PR ${pr.repo}#${pr.number}`);
+    return { ...pr, files };
+  });
+
+  const overlap = scope => qualifiedPrs.find(pr => scope.some(file => prHoldsFile(pr, file)));
+  const ids = [...explicitIds], skipped = [];
+  if (autoCount) {
+    const list = (options.readPriorityList ?? (() => JSON.parse(fs.readFileSync(join(ROOT, 'scripts/settings/build-priority.json'), 'utf8')).build?.priority))();
+    if (!Array.isArray(list)) refuse('unreadable build.priority list');
+    const seen = new Set();
+    for (const value of list) {
+      if (ids.length === autoCount) break;
+      const id = String(value);
+      if (!/^\d+$/.test(id)) { skipped.push({ id, reason: 'non-numeric id' }); continue; }
+      const canonical = canonicalId(id);
+      if (seen.has(canonical)) { skipped.push({ id, reason: 'duplicate numeric card identity' }); continue; }
+      seen.add(canonical);
+      let scope;
+      try {
+        const card = readCard(canonical);
+        if (!card || card.status !== 'open') { skipped.push({ id, reason: 'status is not open' }); continue; }
+        if (typeof card.size !== 'number' || !Number.isFinite(card.size) || card.size <= 0 || card.size > 3) {
+          skipped.push({ id, reason: 'size missing or outside (0,3]' }); continue;
+        }
+        scope = cardScope(card, canonical);
+      } catch { skipped.push({ id, reason: 'unreadable card or scope on origin/main' }); continue; }
+      if (scope.some(touchesMergePath)) { skipped.push({ id, reason: 'scope touches merge path' }); continue; }
+      const held = overlap(scope);
+      if (held) { skipped.push({ id, reason: `scope overlaps open PR ${held.repo}#${held.number}` }); continue; }
+      ids.push(canonical);
+    }
+    if (!ids.length) refuse('no ready build.priority cards fit --auto-count');
+  } else {
+    const held = overlap(scopes);
+    if (held) refuse(`scope overlaps open PR ${held.repo}#${held.number}`);
   }
   const at = (options.now?.() ?? new Date()).toISOString();
-  return { record: { ids, mode, setBy: actor, at, ttlHours }, audit: { actor, reason, ids, mode, ttlHours, at } };
+  return { record: { ids, mode, setBy: actor, at, ttlHours }, audit: { actor, reason, ids, mode, ttlHours, at,
+    ...(autoCount ? { autoCount, selectedCount: ids.length, skipped } : {}) } };
 }
 
 function runtimePath(options) {

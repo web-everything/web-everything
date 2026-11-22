@@ -17,7 +17,8 @@ function fixture(overrides = {}) {
   const path = join(dir, 'build-priority.runtime.json');
   const readCard = vi.fn(() => ({ scope: ['we:scripts/a.mjs scripts/a.test.mjs'] }));
   const readPrs = vi.fn(() => []);
-  const options = { env: { WE_BUILD_PRIORITY_RUNTIME_FILE: path }, readCard, readPrs, now: () => new Date(at), ...overrides };
+  const readPriorityList = vi.fn(() => ['42', '43', '44']);
+  const options = { readPriorityList, env: { WE_BUILD_PRIORITY_RUNTIME_FILE: path }, readCard, readPrs, now: () => new Date(at), ...overrides };
   const command = async (argv = flags) => {
     const operation = createBuildPrioritySet(options);
     const registry = createRegistry(); registry.register(operation.declaration);
@@ -236,9 +237,9 @@ it('uses the coordination-root default when no runtime override is supplied', as
 
 it('reads cards from a pinned origin/main using bounded git reads, refusing unknown or ambiguous cards', () => {
   const git = vi.fn(args => args[0] === 'rev-parse' ? 'a'.repeat(40) : args[0] === 'ls-tree'
-    ? 'backlog/042-card.md\0backlog/43-card.md\0' : '---\nscope: ["we:scripts/a.mjs"]\n---\n');
+    ? 'backlog/042-card.md\0backlog/43-card.md\0' : '---\nstatus: open\nsize: 2\nscope: ["we:scripts/a.mjs"]\n---\n');
   const read = readPriorityCards({ git });
-  expect(read('42')).toEqual({ scope: ['we:scripts/a.mjs'] });
+  expect(read('42')).toEqual({ scope: ['we:scripts/a.mjs'], status: 'open', size: 2 });
   expect(git.mock.calls[0][0]).toEqual(['rev-parse', '--verify', 'refs/remotes/origin/main']);
   expect(git.mock.calls.some(([args]) => args.includes(`${'a'.repeat(40)}:backlog/042-card.md`))).toBe(true);
   expect(() => read('99')).toThrow(/card/);
@@ -378,4 +379,108 @@ it.each([false, true])('fsyncs and closes the parent directory after rename (syn
     expect(result.lines.join('\n')).toContain('directory fsync refused');
   } else expect(result.code).toBe(0);
   untouched(f, ['build-priority.runtime.json', 'build-priority.audit.jsonl']);
+});
+
+
+const autoFlags = count => [...changed('ids', undefined), `--auto-count=${count}`];
+const readyCard = id => ({ status: 'open', size: 2, scope: [`we:blocks/card-${id}.ts`] });
+const installedAudit = f => JSON.parse(fs.readFileSync(join(f.dir, 'build-priority.audit.jsonl'), 'utf8').trim());
+
+it('auto-pick takes the first N numeric cards in priority order', async () => {
+  const readCard = vi.fn(readyCard);
+  const f = fixture({ readCard, readPriorityList: () => ['44', 'xstapna', '42', '43'] });
+  expect((await f.command(autoFlags(2))).code).toBe(0);
+  expect(JSON.parse(fs.readFileSync(f.path, 'utf8')).ids).toEqual(['44', '42']);
+  expect(installedAudit(f)).toMatchObject({ ids: ['44', '42'], autoCount: 2, selectedCount: 2,
+    skipped: [{ id: 'xstapna', reason: 'non-numeric id' }] });
+  expect(readCard.mock.calls.map(([id]) => id)).toEqual(['44', '42', '44', '42']);
+});
+
+it('auto-pick skips overlapping scopes and picks the next card', async () => {
+  const f = fixture({ readCard: id => ({ ...readyCard(id), scope: [`fui:blocks/card-${id}.ts`] }),
+    readPrs: () => [{ repo: 'frontier-ui/frontierui', number: 5, files: ['blocks/card-42.ts'] }] });
+  expect((await f.command(autoFlags(2))).code).toBe(0);
+  expect(installedAudit(f)).toMatchObject({ ids: ['43', '44'],
+    skipped: [{ id: '42', reason: 'scope overlaps open PR frontier-ui/frontierui#5' }] });
+});
+
+it.each([
+  ['size above 3', { size: 5 }, /size/],
+  ['missing size', { size: undefined }, /size/],
+  ['unreadable size', { size: '2' }, /size/],
+  ['resolved status', { status: 'resolved' }, /status/],
+  ['done status', { status: 'done' }, /status/],
+  ['closed status', { status: 'closed' }, /status/],
+  ['unknown status', { status: undefined }, /status/],
+  ['merge gate', { scope: ['we:scripts/lib/merge-gate-ci.mjs'] }, /merge path/],
+  ['drain', { scope: ['we:scripts/lane-drain.mjs'] }, /merge path/],
+  ['review guard', { scope: ['we:scripts/lib/review-skill-guard.mjs'] }, /merge path/],
+  ['review label guard', { scope: ['we:scripts/review-set-label.mjs'] }, /merge path/],
+  ['trust chain', { scope: ['we:config/deliveryPolicyDefaults.ts'] }, /merge path/],
+  ['workflow', { scope: ['we:.github/workflows/checks.yml'] }, /merge path/],
+  ['broad directory', { scope: ['we:scripts/lib/'] }, /merge path/],
+  ['missing scope', { scope: undefined }, /unreadable/],
+])('auto-pick skips %s and installs a partial selection', async (_name, change, reason) => {
+  const f = fixture({ readPriorityList: () => ['42', '43'],
+    readCard: id => ({ ...readyCard(id), ...(id === '42' ? change : {}) }) });
+  expect((await f.command(autoFlags(2))).code).toBe(0);
+  expect(installedAudit(f)).toMatchObject({ ids: ['43'], autoCount: 2, selectedCount: 1,
+    skipped: [{ id: '42', reason: expect.stringMatching(reason) }] });
+});
+
+it('auto-pick fails closed on unreadable cards and continues to the next card', async () => {
+  const f = fixture({ readCard: id => { if (id === '42') throw new Error('unreadable'); return readyCard(id); } });
+  expect((await f.command(autoFlags(1))).code).toBe(0);
+  expect(installedAudit(f)).toMatchObject({ ids: ['43'], skipped: [{ id: '42', reason: expect.stringMatching(/unreadable/) }] });
+});
+
+it('auto-pick refuses when nothing fits with an operator fallback and preserves existing state', async () => {
+  const f = fixture({ readCard: () => null });
+  fs.writeFileSync(f.path, 'old');
+  const result = await f.command(autoFlags(2));
+  expect(result.code).not.toBe(0);
+  expect(result.lines.join('\n')).toMatch(/no ready.*repair evidence or drain open PRs and retry/);
+  expect(fs.readFileSync(f.path, 'utf8')).toBe('old');
+  untouched(f, ['build-priority.runtime.json']);
+});
+
+it('refuses both --ids and --auto-count before reading evidence', async () => {
+  const f = fixture();
+  const result = await f.command([...flags, '--auto-count=2']);
+  expect(result.code).not.toBe(0);
+  expect(result.lines.join('\n')).toContain('choose one');
+  expect(f.readCard).not.toHaveBeenCalled();
+  untouched(f);
+});
+
+it.each(['0', '-1', '21', '1.5', 'NaN', 'Infinity', '', '1e1', '02'])('refuses invalid --auto-count=%s', async count => {
+  const f = fixture();
+  const result = await f.command(autoFlags(count));
+  expect(result.code).not.toBe(0);
+  expect(result.lines.join('\n')).toContain('positive integer <=20');
+  expect(f.readCard).not.toHaveBeenCalled();
+  untouched(f);
+});
+
+it('auto-pick accepts the maximum count and records a partial result', async () => {
+  const f = fixture({ readCard: readyCard });
+  expect((await f.command(autoFlags(20))).code).toBe(0);
+  expect(installedAudit(f)).toMatchObject({ autoCount: 20, selectedCount: 3 });
+});
+
+it('auto-pick re-reads the priority list and PR evidence under the install lock', async () => {
+  const f = fixture({ readCard: readyCard });
+  f.options.readPriorityList = () => fs.existsSync(`${f.path}.lock`) ? ['44', '43'] : ['42', '43'];
+  f.options.readPrs = () => fs.existsSync(`${f.path}.lock`)
+    ? [{ repo: 'web-everything/web-everything', number: 1, files: ['blocks/card-44.ts'] }] : [];
+  expect((await f.command(autoFlags(1))).code).toBe(0);
+  expect(installedAudit(f)).toMatchObject({ ids: ['43'], skipped: [{ id: '44', reason: expect.stringMatching(/overlaps/) }] });
+});
+
+it('auto-pick refuses unreadable priority or PR evidence', async () => {
+  for (const overrides of [{ readPriorityList: () => null }, { readPrs: () => null }]) {
+    const f = fixture({ readCard: readyCard, ...overrides });
+    expect((await f.command(autoFlags(1))).code).not.toBe(0);
+    untouched(f);
+  }
 });
