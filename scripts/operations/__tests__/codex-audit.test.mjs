@@ -5,7 +5,7 @@ import { spawnSync as realSpawnSync } from 'node:child_process';
 import { join, dirname } from 'node:path';
 import { tmpdir } from 'node:os';
 import { fileURLToPath, URL as NodeURL } from 'node:url';
-import { describe, it, expect, vi } from 'vitest';
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { CANONICAL_QUESTION, EXHAUSTIVE_INSTRUCTION, QUESTION_HASH, main, findAudit, isAcceptedQuestionHash, resolvePriorQuestionHashes, MAX_PRIOR_WINDOW_MS, resolveEfficiencySettings } from '../codex-audit.mjs';
 import { createAuditDeps } from '../codex-audit-io.mjs';
 
@@ -567,6 +567,17 @@ describe('findAudit ordering and clock trust (#7011)', () => {
 describe('debounce and delta audits', () => {
   const PREV = 'c'.repeat(40), NEXT = 'd'.repeat(40);
   const time = Date.parse(AT);
+  // The shipped default is delta OFF (maxFiles 0); these tests enable it explicitly.
+  beforeEach(() => { settingsOverride.text = JSON.stringify({ audit: { delta: { maxFiles: 5 } } }); });
+  afterEach(() => { settingsOverride.text = null; });
+  it('the shipped default config never writes a delta record', async () => {
+    settingsOverride.text = null;
+    const f = delta();
+    expect(await main(ARGS, f.deps)).toBe(0);
+    expect(f.deps.runCodex.mock.calls[0][0]).toContain(`git diff ${BASE}...${HEAD}`);
+    expect(f.records[0]).not.toHaveProperty('basis');
+    expect(f.deps.diffFiles).not.toHaveBeenCalled();
+  });
   const basis = (over = {}) => ({ base: BASE, head: PREV, questionHash: QUESTION_HASH,
     verdict: 'NOT WEAKENED', at: AT, findings: [], ...over });
   function delta(records = [basis()], files = ['docs/a.md', 'docs/b.md']) {
@@ -762,9 +773,9 @@ describe('efficiency settings cascade', () => {
   const resolve = (audit, extra = {}) => resolveEfficiencySettings({ readFile: () => JSON.stringify({ audit }),
     platform: null, env: {}, log: () => {}, ...extra });
   it('defaults missing efficiency keys to five, using a Node file URL for real settings', () => {
-    expect(resolve({})).toEqual({ minutes: 5, maxFiles: 5 });
+    expect(resolve({})).toEqual({ minutes: 5, maxFiles: 0 });
     const readFile = vi.fn(path => { expect(path).toBeInstanceOf(NodeURL); return '{"audit":{}}'; });
-    expect(resolve({}, { readFile })).toEqual({ minutes: 5, maxFiles: 5 });
+    expect(resolve({}, { readFile })).toEqual({ minutes: 5, maxFiles: 0 });
   });
   it('unreadable settings fall back to five minutes and FULL', () => {
     expect(resolve({}, { readFile: () => { throw new Error('unreadable'); } })).toEqual({ minutes: 5, maxFiles: 0 });

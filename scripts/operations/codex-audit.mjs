@@ -103,7 +103,7 @@ export function resolveEfficiencySettings({ readFile = readFileSync, env = proce
     const positive = v => Number.isSafeInteger(v) && v > 0 && Number.isSafeInteger(v * 60_000);
     const count = v => Number.isSafeInteger(v) && v >= 0;
     const resolved = cascadePolicy('audit', tool, {
-      standard: { debounce: { minutes: 5 }, delta: { maxFiles: 5 } }, platform, env, log,
+      standard: { debounce: { minutes: 5 }, delta: { maxFiles: 0 } }, platform, env, log,
       valid: { 'debounce.minutes': positive, 'delta.maxFiles': count },
     });
     const bad = key => resolved.invalid.some(entry => entry.includes(`.${key}`))
