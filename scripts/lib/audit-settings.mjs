@@ -260,6 +260,8 @@ export const LOCK_USERS = Object.freeze([
   // The CI-heal child reserves its cycle lock through file-locks.mjs.
   'scripts/conveyor/ci-heal-loop.mjs',
   'scripts/conveyor/fix-claim-store.mjs', 'scripts/conveyor/fix-dispatch-claim.mjs',
+  // Owed-fix recovery takes withFileLock on its recovery state and reads the fix-dispatch claim lock directory.
+  'scripts/conveyor/owed-fix-recovery.mjs',
   'scripts/conveyor/fix-procedure.mjs', 'scripts/conveyor/fixer-stuck-reclaim.mjs',
   'scripts/conveyor/health-responder.mjs', 'scripts/conveyor/land-overlap-yield.mjs',
   'scripts/conveyor/main-ci-red-io.mjs', 'scripts/conveyor/needs-you-feed-job.mjs',
