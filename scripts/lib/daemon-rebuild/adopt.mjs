@@ -11,7 +11,7 @@ import { verifyRev, makeGit } from './shared.mjs';
 import { resolveOverlayConflict } from './overlay-strategies.mjs';
 import { releaseBuildLease } from './lease.mjs';
 import { ensureSafeToMove, knownInputsOf } from './local-state.mjs';
-import { revokedAppliedTips, tipInMain as gitTipInMain, pathBEvidenceGit } from './audited-tip.mjs';
+import { revokedHotpatchTips, revokedAppliedTips, tipInMain as gitTipInMain, pathBEvidenceGit } from './audited-tip.mjs';
 import { OPERATOR_LOGINS } from '../marker-authorship.mjs';
 import { readPendingDrops } from '../overlay-drop-pending.mjs';
 
@@ -492,6 +492,13 @@ async function finalizeRebuildLocked({
     return terminal({ moved: false, reason: 'drop-pending-unsettled', plan });
   }
 
+  const revokedHotpatch = await revokedHotpatchTips({ applied: plan.applied, git, root, env });
+  if (revokedHotpatch.length) {
+    alert('ready-audit-revoked', { target: plan.finalSha, refs: revokedHotpatch,
+      message: 'Hotpatch evidence is incomplete or revoked; obtain fresh CI and audit evidence or use the normal merge path.' });
+    return terminal({ moved: false, reason: 'ready-audit-revoked', plan });
+  }
+
   // Defensive re-check: real (unlocked) time passed for the smoke since `prepareRebuild` read `prevHead`. Either
   // a SIBLING process's own rebuild already landed this EXACT build (align state and stop, no error), or
   // something else moved `root` entirely (abandon this attempt cleanly; the next tick recomputes a fresh plan).
@@ -520,7 +527,7 @@ async function finalizeRebuildLocked({
   // adoption was already judged by matchReadyCandidate under this same lock); no gate (follow mode) revokes nothing.
   if (typeof auditedTip === 'function') {
     const revoked = revokedAppliedTips({
-      applied: plan.applied, auditedTip, prevHead, mainSha: plan.mainSha, auditAdopted: plan.auditAdopted,
+      applied: plan.applied, auditedTip: (ref, sha) => ref.startsWith('hotpatch/') ? ref === `hotpatch/${sha}` : auditedTip(ref, sha), prevHead, mainSha: plan.mainSha, auditAdopted: plan.auditAdopted,
       carries: (sha, build) => git(['merge-base', '--is-ancestor', sha, build]).status === 0,
       inMain: (sha) => gitTipInMain(git, plan.mainSha, sha),
     });

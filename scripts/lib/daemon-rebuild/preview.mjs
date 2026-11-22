@@ -282,6 +282,12 @@ export async function previewOverlayConflict({
     // 2. The candidate's own tip (already fetched above).
     const candSha = fetched.goneRefs.includes(ref) ? null : verifyRev(scratchGit, `origin/${ref}^{commit}`);
     if (!candSha) return { ok: false, reason: 'ref-unresolved' };
+    if (ref.startsWith('hotpatch/')) {
+      if (!/^hotpatch\/[a-f0-9]{40}$/.test(ref) || candSha !== ref.slice(9))
+        return { ok: false, reason: 'hotpatch-ref-sha-mismatch' };
+      if (scratchGit(['merge-base', '--is-ancestor', mainSha, candSha]).status !== 0)
+        return { ok: false, reason: 'hotpatch-behind-main', fallback: 'Rebase and obtain receipts on the new SHA, or use the normal merge path.' };
+    }
 
     // 3. THE CHECK — deliberately WITH messages (unlike planRebuild's own internal folds), so a real conflict
     // names its file(s) for the refusal/`--allow-conflict` print.
