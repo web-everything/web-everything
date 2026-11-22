@@ -1414,6 +1414,7 @@ export async function runTickAllRepos({
   };
   const orphanGuard = await timedAsync('orphan-guard', async () => {
     if (!requireOrphanGuard) return { rows: [] };
+    let firstRepo;
     try {
       const result = await orphanGuardTick({ env: process.env, nowMs: now(),
       deadlineAt: phaseStarts['orphan-guard'] + budgets['orphan-guard'].budgetMs,
@@ -1423,6 +1424,7 @@ export async function runTickAllRepos({
         for (const repo of budgetRepos('orphan-guard', repos)) {
           const key = repoKeyForSlug(repo);
           if (!key) throw new Error(`orphan-guard: unknown repo ${repo}`);
+          firstRepo ??= repo;
           yield { key, slug: CONSTELLATION_REPOS[key].slug };
           // Iterator progress proves only that the repo was visited; returned rows may still report failure.
           orphanGuardCompleted.add(repo);
@@ -1450,13 +1452,12 @@ export async function runTickAllRepos({
       const nextCursor = result?.repoCursors ?? result?.nextCursor;
       if (nextCursor != null) prCursors['orphan-guard'] = nextCursor;
       else delete prCursors['orphan-guard'];
-      // A repo listing that ran out of budget already parked the first unlisted repo at the head. Otherwise the repo
-      // where deferral began heads the next pass, so its remaining PRs run before the repos it already covered.
-      const listingStopped = budgets['orphan-guard'].skipped.length > 0;
-      const deferredHead = result?.deferred?.[0]?.repo;
-      const headRepo = deferredHead == null ? undefined
-        : repos.find(repo => repoKeyForSlug(repo) === repoKeyForSlug(deferredHead));
-      if (!listingStopped && headRepo !== undefined) budgetRotation['orphan-guard'] = headRepo;
+      // Only the repo listed FIRST is sure to get a PR handled (listing can spend the whole budget), so on any budget
+      // hit the first slot moves round-robin to the next repo. Heading with the first skipped or first deferred repo
+      // instead let a slow repo be listed every pass yet never come first, starving its capped orphans (PR #7330).
+      const budgetHit = budgets['orphan-guard'].skipped.length > 0 || (result?.deferred?.length ?? 0) > 0;
+      const firstAt = firstRepo === undefined ? -1 : repos.indexOf(firstRepo);
+      if (budgetHit && firstAt >= 0) budgetRotation['orphan-guard'] = repos[(firstAt + 1) % repos.length];
       if (result?.deferred?.length) {
         budgets['orphan-guard'].hit = true;
         budgets['orphan-guard'].skipped.push(...result.deferred);

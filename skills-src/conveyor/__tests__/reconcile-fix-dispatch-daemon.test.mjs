@@ -2429,6 +2429,9 @@ describe('runTickAllRepos — one reconcile plan per repo per pass', () => {
     { keys: ['we', 'frontierui'], listMs: 1001 },
     { keys: ['we', 'frontierui', 'plateau-app'], listMs: 1001 },
     { keys: ['we', 'frontierui', 'plateau-app'], listMs: 600 },
+    // Self-review: a slow repo listed every pass but never first starved under a first-skipped/first-deferred head.
+    ...['we', 'frontierui', 'plateau-app'].flatMap(slow => [[950, 60], [1001, 1]].map(([slowMs, fastMs]) =>
+      ({ keys: ['we', 'frontierui', 'plateau-app'], listMs: { [CONSTELLATION_REPOS[slow].slug]: slowMs, other: fastMs } }))),
   ])('keeps each repo\'s deferred orphan cursor across repo rotation so every capped orphan escalates (%j)', async ({ keys, listMs }) => {
     const f = productionFixture();
     vi.spyOn(rulingStandDown, 'runRulingResolvesStandDownPass').mockResolvedValue({ rows: [] });
@@ -2450,7 +2453,7 @@ describe('runTickAllRepos — one reconcile plan per repo per pass', () => {
       listBouncedPrs: () => [],
       passBudgets: resolveFixPassBudgets({ env: {}, file: { fixPassBudget: { orphanGuardMs: 1000 } } }),
       orphanGuardTick: options => orphanFixRound.runOrphanFixRoundPass({ ...options, env: {},
-        listBounced: slug => { time += listMs; return [1, 2].filter(n => !escalated.has(`${slug}#${n}`)).map(pr); },
+        listBounced: slug => { time += typeof listMs === 'number' ? listMs : listMs[slug] ?? listMs.other; return [1, 2].filter(n => !escalated.has(`${slug}#${n}`)).map(pr); },
         isOwned: async () => false,
         readComments: async (number, slug) => { inspected.push(`${slug}#${number}`); return number === 2 ? cappedComments : []; },
         escalate: async ({ slug, pr: number }) => { escalated.add(`${slug}#${number}`); return { ok: true }; },
