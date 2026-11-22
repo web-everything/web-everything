@@ -1140,6 +1140,7 @@ export function classifyPr(pr, { requiredCheck = 'test', trustLabel = 'ready-to-
       ? 'human-cleared (review:accepted), required check green, cleanly mergeable'
       : 'AI-generated, required check green, cleanly mergeable';
   if (pr?.requiredCheckReadError) { decision = 'skip'; reason = pr.requiredCheckReadError; }
+  else if (pr?.rowsComplete === false) { decision = 'skip'; reason = 'check evidence incomplete — retry with a complete live check read'; }
   // fix.pushBeforeGate (2026-10-10) — a fixer now pushes BEFORE its local gate is green, so a claimed PR's head may be
   // an unverified intermediate commit. The live fix claim (attached by the caller as `pr.fixClaim`) is the lock: never
   // land while it is held, whatever the labels or CI say. Released on the fixer's green hand-back.
@@ -5468,7 +5469,7 @@ export async function main(argv, { env = process.env, stdout = process.stdout, e
   const defaultBranchHintsByRepo = new Map();
   const defaultBranchByRepo = new Map();
   const defaultBranchOf = repo => defaultBranchByRepo.get(repo || localSlug) ?? null;
-  const verifyDefaultBranch = createLiveDefaultBranchReader({
+  const newDefaultBranchReader = () => createLiveDefaultBranchReader({
     map: defaultBranchByRepo,
     readLive: async repo => {
       const { stdout } = await execFileP('gh', ['repo', 'view', repo, '--json', 'defaultBranchRef', '--jq', '.defaultBranchRef.name'],
@@ -5477,6 +5478,7 @@ export async function main(argv, { env = process.env, stdout = process.stdout, e
     },
     warn: (e, repo) => process.stderr.write(`  ⚠ ${repo}: default branch unresolved live (${String(e.message || e).split('\n')[0]}) — deferring merge/enqueue; retry on the next pass\n`),
   });
+  const verifyDefaultBranch = newDefaultBranchReader();
   // #2417 review — returns `{ commits, degraded }`. `degraded:true` means the gh read THREW (a swallowed transient
   // failure): the empty `[]` is a fallback, not a confirmed "no commits", so `fetchPrReadsCached` declines to cache
   // it and re-fetches next `--watch` pass rather than latching an empty read for the head-SHA lifetime. Behaviour
@@ -5880,6 +5882,7 @@ export async function main(argv, { env = process.env, stdout = process.stdout, e
   // rationale; the short version: attach `result.timings` + print one unconditional stderr summary line so
   // "why is a pass slow" has a real breakdown instead of a single opaque `ms`.
   fastContextRows = null;
+  let passListingSnapshot = listingSnapshot;
   // The same full target read serves both listing paths. Comments remain at the writer-contract gate.
   const readFullListingPr = async (repo, num, fullContext = false) => {
     const fields = fullContext || RECONCILE ? SWEEP_LIST_FIELDS
@@ -5907,15 +5910,20 @@ export async function main(argv, { env = process.env, stdout = process.stdout, e
     // Full-scope lifecycle reconciliation also needs live CI/mergeability for every PR it can mutate:
     // check reruns need not change the PR's head or updatedAt. Commits follow the same scope policy.
     // Catch-up shares base facts across children; each reuse revalidates lean membership. Unknown evidence defers.
+    const passBranches = new Map();
+    let passBranchChanged = false;
     const rows = await __t.timeAsync('listing', () => readFastDrainContext({ repos: slugs, targetRepo: localSlug, onlyPr,
       concurrency: resolvedMergePolicy.policy.concurrency.gateReads, failClosed: !!flags['from-catch-up'],
-      readInventory: flags['from-catch-up'] && listingSnapshot ? () => readFastDrainPassInventory({ path: listingSnapshot,
+      readInventory: flags['from-catch-up'] && passListingSnapshot ? () => readFastDrainPassInventory({ path: passListingSnapshot,
         repos: slugs, targetRepo: localSlug, readSnapshot, listLean,
         log: line => process.stderr.write(`${line}\n`),
         concurrency: resolvedMergePolicy.policy.concurrency.gateReads,
         readMain: async repo => {
-          const defaultBranch = await verifyDefaultBranch(repo);
+          // Each before/after membership probe needs its own live read, not a memoized gate result.
+          const defaultBranch = await newDefaultBranchReader()(repo);
           if (!defaultBranch) throw new Error('default branch unresolved live');
+          if (passBranches.has(repo) && passBranches.get(repo) !== defaultBranch) passBranchChanged = true;
+          passBranches.set(repo, defaultBranch);
           const { stdout } = await execFileP('gh', ['api', `repos/${repo}/git/ref/heads/${defaultBranch}`, '--jq', '.object.sha'],
             { encoding: 'utf8', timeout: 60_000, maxBuffer: 1024 * 1024 });
           return { sha: stdout.trim(), defaultBranch };
@@ -5938,7 +5946,13 @@ export async function main(argv, { env = process.env, stdout = process.stdout, e
       },
       readGroups: () => { const path = resolveCardGroupStatePath(); return path ? readGroupState(path) : { groups: [] }; },
       time: (phase, fn) => __t.timeAsync(phase, fn), log: line => process.stderr.write(`${line}\n`),
-    }));
+    })).catch(error => {
+      if (!passBranchChanged || !error.cause?.message?.startsWith('pass main changed while reading')) throw error;
+      // The parent round's branch evidence is no longer usable by the slow listing path either.
+      passListingSnapshot = null;
+      process.stderr.write('fast-drain: default branch changed during membership — discarded pass snapshot; falling back to live listing\n');
+      return null;
+    });
     if (rows) fastContextRows = new Map([...new Set([...CONTEXT_REPOS, ...REPOS])].map(repo => [repo, rows.get(repo || localSlug)]));
   }
   // #2257 — collect + classify across EVERY repo in the sweep set into ONE global candidate list. PR numbers
@@ -5988,7 +6002,7 @@ export async function main(argv, { env = process.env, stdout = process.stdout, e
     try {
       const slug = repo || localSlug;
       let listed = {};
-      const roundPath = listingSnapshot && isFastDrainTarget(repo, { number: onlyPr }) ? listingSnapshot : null;
+      const roundPath = passListingSnapshot && isFastDrainTarget(repo, { number: onlyPr }) ? passListingSnapshot : null;
       const readTarget = () => __t.timeAsync('listing.target', () => readFullListingPr(repo, onlyPr));
       const listLive = async () => {
         let snapshotSeed;
@@ -6056,15 +6070,15 @@ export async function main(argv, { env = process.env, stdout = process.stdout, e
   };
   const resolveDefaultBranch = (repo) => resolveCachedDefaultBranch({
     repo: repo || localSlug, key: repo, map: defaultBranchHintsByRepo,
-    readRound: () => listingSnapshot && isFastDrainTarget(repo, { number: onlyPr })
-      ? readFastDrainRoundDefaultBranch({ path: listingSnapshot, repo: repo || localSlug }) : null,
+    readRound: () => passListingSnapshot && isFastDrainTarget(repo, { number: onlyPr })
+      ? readFastDrainRoundDefaultBranch({ path: passListingSnapshot, repo: repo || localSlug }) : null,
   });
-  const resolveBranches = () => __t.timeAsync('listing.defaultBranch', () => mapWithConcurrency(REPOS.filter(repo => fastContextEnabled || !(listingSnapshot && isFastDrainTarget(repo, { number: onlyPr }))), resolvedMergePolicy.policy.concurrency.gateReads, resolveDefaultBranch));
+  const resolveBranches = () => __t.timeAsync('listing.defaultBranch', () => mapWithConcurrency(REPOS.filter(repo => fastContextEnabled || !(passListingSnapshot && isFastDrainTarget(repo, { number: onlyPr }))), resolvedMergePolicy.policy.concurrency.gateReads, resolveDefaultBranch));
   const listRepos = () => mapWithConcurrency(REPOS, REPOS.length, listOne);
   let [listings] = await __t.timeAsync('listing', () => fastContextEnabled
     ? fastDrainListingAfterBranches({ resolveBranches, list: async () => [await listRepos()] })
     : Promise.all([listRepos(), resolveBranches()]));
-  if (listingSnapshot) await Promise.all(REPOS.filter(repo => isFastDrainTarget(repo, { number: onlyPr })).map(resolveDefaultBranch));
+  if (passListingSnapshot) await Promise.all(REPOS.filter(repo => isFastDrainTarget(repo, { number: onlyPr })).map(resolveDefaultBranch));
   // One repo's failed listing no longer kills the pass: it is logged as failed and the other repos proceed
   // (`partitionListings`). Only when EVERY repo failed is it the old bad-env hard-fail. The failed repo is absent
   // from the live rows, so the context re-list also fails and the couple gate fails closed for it.

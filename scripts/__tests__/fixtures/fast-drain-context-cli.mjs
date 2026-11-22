@@ -1,5 +1,5 @@
 /** Real drain entrypoint with hermetic git/gh transports; every listing is recorded as argv. */
-import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync, existsSync } from 'node:fs';
 import { spawnSync } from 'node:child_process';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -11,7 +11,7 @@ import { fastDrainArgs } from '../../lib/enqueue-on-event.mjs';
 import { daemonAppEnv } from './daemon-app-env.mjs';
 
 export function runFastDrainContextCli({ root = resolve(dirname(fileURLToPath(import.meta.url)), '../../..'), killSwitch = false,
-  catchUp = false, scope = 'target', livePatches = {}, targetLabels = null, failDefaultBranch = false, outputAsJson = true, cachedBranch = null, liveDefaultBranch = 'main', roundBranch = null, rowCount = 48, leanIncomplete = false, fullIncomplete = false, leanPageError = false, targetBaseRefName = 'main' } = {}) {
+  catchUp = false, scope = 'target', livePatches = {}, targetLabels = null, failDefaultBranch = false, outputAsJson = true, cachedBranch = null, liveDefaultBranch = 'main', branchAfterMembership = null, roundBranch = null, rowCount = 48, leanIncomplete = false, fullIncomplete = false, leanPageError = false, targetBaseRefName = 'main' } = {}) {
   const dir = mkdtempSync(join(process.env.TMPDIR, 'fast-context-cli-'));
   try {
     const bin = join(dir, 'bin'), snapshots = join(dir, 'snapshots');
@@ -40,6 +40,7 @@ export function runFastDrainContextCli({ root = resolve(dirname(fileURLToPath(im
     const liveRows = rows.map(p => ({ ...p, ...(livePatches[p.number] ?? {}) }));
     writeFileSync(join(dir, 'rows.json'), JSON.stringify(liveRows));
     writeFileSync(join(dir, 'calls.jsonl'), '');
+    writeFileSync(join(dir, 'live-branch'), liveDefaultBranch);
     writeFileSync(join(bin, 'git'), '#!/bin/sh\nif [ "$1 $2" = "remote get-url" ]; then echo https://github.com/fixture/web-everything.git; exit 0; fi\nexit 1\n', { mode: 0o755 });
     writeFileSync(join(bin, 'gh'), `#!/usr/bin/env node
 const fs = require('node:fs');
@@ -51,7 +52,7 @@ const selected = !r || r === 'fixture/web-everything' ? rows : [];
 function out(v) { fs.writeSync(1, JSON.stringify(v)); process.exit(0); }
 if (a[0] === 'repo' && a[1] === 'view') {
   if (process.env.CONTEXT_FAIL_BRANCH === '1') { fs.writeSync(2, 'fixture default branch failure'); process.exit(1); }
-  fs.writeSync(1, process.env.CONTEXT_LIVE_BRANCH); process.exit(0);
+  fs.writeSync(1, fs.readFileSync(process.env.CONTEXT_BRANCH_FILE, 'utf8')); process.exit(0);
 }
 if (a[0] === 'api' && a[1]?.includes('/git/ref/heads/')) { fs.writeSync(1, 'a'.repeat(40)); process.exit(0); }
 if (a[0] === 'api' && a[1]?.includes('/check-runs?')) {
@@ -71,6 +72,9 @@ if (a[0] === 'api' && a[1] === 'graphql' && a.some(v => v.includes('pullRequests
   const query = a.find(v => v.includes('pullRequests(states:OPEN'));
   const pageRows = query.includes('name:"web-everything"') ? rows : [];
   if (!query.includes('statusCheckRollup')) {
+    if (pageRows.length && process.env.CONTEXT_BRANCH_AFTER_MEMBERSHIP) {
+      fs.writeFileSync(process.env.CONTEXT_BRANCH_FILE, process.env.CONTEXT_BRANCH_AFTER_MEMBERSHIP);
+    }
     const size = Number(/first:(\\d+)/.exec(query)?.[1]);
     const offset = Number(/after:"lean-(\\d+)"/.exec(query)?.[1] || 0);
     if (offset && process.env.CONTEXT_LEAN_PAGE_ERROR === '1') out({errors:[{message:'fixture lean page error'}]});
@@ -96,7 +100,8 @@ out({});
       cwd: dir, encoding: 'utf8', timeout: 30_000, maxBuffer: 8 * 1024 * 1024,
       env: { ...process.env, ...daemonAppEnv(dir), PATH: `${bin}:${process.env.PATH}`, WE_UNDER_TEST: '1',
         WE_PR_SNAPSHOT: '1', WE_PR_SNAPSHOT_DIR: snapshots, WE_FAST_DRAIN_LISTING: 'snapshot',
-        WE_DEFAULT_BRANCH_CACHE_DIR: join(dir, 'branch-cache'), CONTEXT_FAIL_BRANCH: failDefaultBranch ? '1' : '0', CONTEXT_LIVE_BRANCH: liveDefaultBranch,
+        WE_DEFAULT_BRANCH_CACHE_DIR: join(dir, 'branch-cache'), CONTEXT_FAIL_BRANCH: failDefaultBranch ? '1' : '0',
+        CONTEXT_BRANCH_FILE: join(dir, 'live-branch'), CONTEXT_BRANCH_AFTER_MEMBERSHIP: branchAfterMembership ?? '',
         WE_FAST_DRAIN_SCOPE: scope, WE_FAST_DRAIN_CONTEXT: killSwitch ? 'live' : 'snapshot', WE_PR_SNAPSHOT_TTL_MS: '75000',
         WE_GH_THROTTLE_GH_BIN: join(bin, 'gh'), WE_GH_THROTTLE_COST_HEADERS: '0', WE_GH_THROTTLE_RETRY_MAX_ATTEMPTS: '1',
         CONTEXT_LEAN_INCOMPLETE: leanIncomplete ? '1' : '0', CONTEXT_FULL_INCOMPLETE: fullIncomplete ? '1' : '0',
@@ -105,6 +110,7 @@ out({});
     });
     const calls = readFileSync(join(dir, 'calls.jsonl'), 'utf8').trim().split('\n').filter(Boolean).map(JSON.parse);
     return { status: result.status, stdout: result.stdout, stderr: result.stderr, calls,
+      passSnapshotPublished: existsSync(roundPath),
       cachedBranch: readDefaultBranchCache('fixture/web-everything', { env: cacheEnv }),
       fullListings: calls.filter(a => a[0] === 'api' && a[1] === 'graphql' && a.some(v => v.includes('pullRequests(states:OPEN') && v.includes('statusCheckRollup'))).length,
       leanListings: calls.filter(a => a[0] === 'api' && a[1] === 'graphql' && a.some(v => v.includes('pullRequests(states:OPEN') && !v.includes('statusCheckRollup'))).length,

@@ -757,14 +757,14 @@ describe('fresh queue rollup completeness', () => {
 it('listing hydrates heavy fields with bounded concurrency: live defaultBranch is read once per process across concurrent gates', async () => {
   const { createLiveDefaultBranchReader } = await import('../lib/default-branch-cache.mjs');
   const source = readFileSync(join(dirname(fileURLToPath(import.meta.url)), '..', 'merge-ai-prs.mjs'), 'utf8');
-  const start = source.indexOf('  const verifyDefaultBranch = createLiveDefaultBranchReader({');
+  const start = source.indexOf('  const newDefaultBranchReader = () => createLiveDefaultBranchReader({');
   const end = source.indexOf('\n  });', start) + '\n  });'.length;
   expect(start).toBeGreaterThanOrEqual(0);
   expect(end).toBeGreaterThan(start);
   const cache = new Map();
   const read = vi.fn(async () => { await Promise.resolve(); return { stdout: 'trunk\n' }; });
   const verifyDefaultBranch = new Function('createLiveDefaultBranchReader', 'defaultBranchByRepo', 'execFileP',
-    `${source.slice(start, end)}; return verifyDefaultBranch;`)(
+    `${source.slice(start, end)}; return newDefaultBranchReader();`)(
     options => createLiveDefaultBranchReader({ ...options, writeCache: () => {} }), cache, read);
   expect(await Promise.all([verifyDefaultBranch('fixture/repo'), verifyDefaultBranch('fixture/repo')])).toEqual(['trunk', 'trunk']);
   expect(await verifyDefaultBranch('fixture/repo')).toBe('trunk');

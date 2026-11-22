@@ -29,6 +29,19 @@ it('tier 1: catch-up without --from-green-event makes zero full-PR pagination ca
     && a[a.indexOf('--json') + 1].includes('body')).map(a => a[2])).toEqual(['7']);
 });
 
+it('a live default-branch change during membership is read afresh, refuses publication and falls back to slow classification', () => {
+  const result = runFastDrainContextCli({ catchUp: true, rowCount: 18, branchAfterMembership: 'develop' });
+  expect(result.status, result.stderr).toBe(0);
+  expect(result.passSnapshotPublished).toBe(false);
+  expect(result.fullListings + result.heavyListings).toBeGreaterThan(0);
+  expect(result.stderr).toContain('default branch changed during membership — discarded pass snapshot; falling back to live listing');
+  expect(result.cachedBranch).toBe('develop');
+  expect(result.calls.some(a => a[0] === 'api' && a[1]?.endsWith('/git/ref/heads/develop'))).toBe(true);
+  const decision = JSON.parse(result.stdout);
+  expect(decision.toMerge).toEqual([]);
+  expect(decision.skipped.some(p => p.num === 7 && /base is not develop \(main\)/.test(p.reason))).toBe(true);
+});
+
 process.env.WE_UNDER_TEST = '1';
 const { readFreshGateChecks, reduceOpenPrContext, prepareDrainVerdicts, planDrainPass, buildOverlapRows, revalidateForMerge } = await import('../merge-ai-prs.mjs');
 const { repo, rows } = fixture;
@@ -288,6 +301,27 @@ it('cascade missing status pages never turn a green check-run into complete evid
     rowsComplete: checks.rowsComplete, rowsHead: checks.rowsHead }).allowed).toBe(false);
   await expect(readFreshGateChecks({ repo, headSha: head.sha,
     exec: async () => { throw Error('unreadable GitHub'); } })).rejects.toThrow('unreadable GitHub');
+});
+
+it('missing status pages skip real classification and cascade revalidation despite a green check-run', async () => {
+  const target = rows[16];
+  const complete = await productionDecision(new Map([[repo, [target]]]), repo, target.number, () => target);
+  expect(complete.ready).toEqual([target.number]);
+  expect(complete.enqueue).toEqual([target.number]);
+  const checks = await readFreshGateChecks({ repo, headSha: target.headRefOid,
+    exec: async (_file, argv) => ({ stdout: JSON.stringify(argv.at(-1).includes('/check-runs?')
+      ? [{ total_count: 1, check_runs: [{ id: 1, name: 'test', status: 'completed', conclusion: 'success' }] }]
+      : []) }) });
+  expect(checks.rowsComplete).toBe(false);
+  const incomplete = { ...target, statusCheckRollup: checks, rowsComplete: checks.rowsComplete, rowsHead: checks.rowsHead };
+  const classified = await productionDecision(new Map([[repo, [incomplete]]]), repo, target.number, () => incomplete);
+  expect(classified.ready).toEqual([]);
+  expect(classified.enqueue).toEqual([]);
+  expect(classified.skipped).toEqual([[target.number, expect.stringContaining('check evidence incomplete')]]);
+  const revalidated = await productionDecision(new Map([[repo, [target]]]), repo, target.number, () => incomplete);
+  expect(revalidated.ready).toEqual([target.number]);
+  expect(revalidated.enqueue).toEqual([]);
+  expect(revalidated.refused).toEqual([[target.number, expect.stringContaining('check evidence incomplete')]]);
 });
 
 it('a main move while waiting for the pass lock is rebound before any snapshot is published', async () => {
