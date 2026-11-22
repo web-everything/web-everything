@@ -53,6 +53,20 @@ it.each([
   }
 });
 
+it.each(['we:', 'plateau:', 'fui:', 'frontierui:', 'webeverything:', 'plateau-app:', 'pa:'].flatMap(prefix =>
+  ['tools/drain-daemon/', 'tools/drain-daemon/*.mjs', 'relocated/', 'relocated/*.mjs',
+    'scripts/operations/build-priority-set-*.mjs', 'relocated/build-priority-set-*.mjs'].map(path => `${prefix}${path}`),
+))('refuses directory or glob gate coverage %s in preview and install', async scope => {
+  for (const preview of [false, true]) {
+    const f = fixture({ readCard: id => ({ scope: id === '43' ? [scope] : ['we:scripts/a.mjs'] }) });
+    const result = await f.command([...flags, ...(preview ? ['--preview'] : [])]);
+    expect(result.code).not.toBe(0);
+    expect(result.lines.join('\n')).toMatch(/card 43 scope overlaps gate file/);
+    expect(f.readPrs).not.toHaveBeenCalled();
+    untouched(f);
+  }
+});
+
 it.each([
   ['unreadable', () => { throw new Error('cannot read gates'); }],
   ['empty', []], ['missing', () => undefined], ['malformed', [null]], ['blank', [' ']],
@@ -200,7 +214,7 @@ it.each([
   ['plateau-app', 'plateauapp/plateau-app'],
   ['plateau', 'plateauapp/plateau-app'],
   ['pa', 'plateauapp/plateau-app'],
-])('refuses exact and directory overlaps for %s scopes in preview and install', async (prefix, repo) => {
+])('refuses exact PR overlaps and gate-capable directories for %s in preview and install', async (prefix, repo) => {
   for (const scope of ['scripts/example/a.mjs', 'scripts/example/']) {
     for (const preview of [false, true]) {
       const f = fixture({ readCard: () => ({ scope: [`${prefix}:${scope}`] }),
@@ -208,7 +222,11 @@ it.each([
       fs.writeFileSync(f.path, 'old');
       const result = await f.command([...flags, ...(preview ? ['--preview'] : [])]);
       expect(result.code).not.toBe(0);
-      expect(result.lines.join('\n')).toContain(`scope overlaps open PR ${repo}#1`);
+      if (scope.endsWith('/')) {
+        expect(result.lines.join('\n')).toMatch(/card 42 scope overlaps gate file/);
+      } else {
+        expect(result.lines.join('\n')).toContain(`scope overlaps open PR ${repo}#1`);
+      }
       expect(fs.readFileSync(f.path, 'utf8')).toBe('old');
       untouched(f, ['build-priority.runtime.json']);
     }
@@ -263,13 +281,13 @@ it.each([
   ['unrepresentable PR filenames', { readPrs: () => [{ repo: 'web-everything/web-everything', number: 1, files: ['scripts/a b.mjs'] }] }],
   ['missing card scope', { readCard: () => ({}) }],
   ['open PR overlap', { readPrs: () => [{ repo: 'web-everything/web-everything', number: 1, files: ['scripts/a.test.mjs'] }] }],
-  ['directory scope overlap', { readCard: () => ({ scope: ['we:scripts/example/'] }), readPrs: () => [{ repo: 'web-everything/web-everything', number: 1, files: ['scripts/example/a.mjs'] }] }],
+  ['directory gate coverage', { readCard: () => ({ scope: ['we:scripts/example/'] }), readPrs: () => [{ repo: 'web-everything/web-everything', number: 1, files: ['scripts/example/a.mjs'] }] }],
 ])('refuses %s and preserves the old runtime file', async (_name, overrides) => {
   const f = fixture(overrides);
   fs.writeFileSync(f.path, 'old');
   const result = await f.command();
   expect(result.code).not.toBe(0);
-  if (_name === 'directory scope overlap') expect(result.lines.join('\n')).toMatch(/scope overlaps open PR/);
+  if (_name === 'directory gate coverage') expect(result.lines.join('\n')).toMatch(/card 42 scope overlaps gate file/);
   expect(fs.readFileSync(f.path, 'utf8')).toBe('old');
   untouched(f, ['build-priority.runtime.json']);
 });

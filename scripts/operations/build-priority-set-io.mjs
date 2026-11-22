@@ -1,6 +1,6 @@
 /** Fail-closed evidence readers and the single atomic runtime-list writer. */
 import fs from 'node:fs';
-import { dirname, join, resolve } from 'node:path';
+import { basename, dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { randomUUID } from 'node:crypto';
 import { execFileSync } from 'node:child_process';
@@ -11,8 +11,8 @@ import { normalizeBriefScope, SCOPE_PREFIX_ALIASES } from './dispatch-lane.mjs';
 import { GH_LIST_FILE_CAP, prHoldsFile, qualifyFile, repoKeyFor } from './free-scope.mjs';
 import { resolveCoordinationRoot } from './coordination-root.mjs';
 import { buildPrioritySetOperation, BUILD_PRIORITY_SET_EFFECT, validateBuildPriorityInput } from './build-priority-set.mjs';
-import { scopeEntriesOverlap } from '../readiness/scope-lease.mjs';
-import { isTrustChainPath, TRUST_CHAIN } from '../lib/gate-config.mjs';
+import { isSubtreeEntry, scopeEntriesOverlap } from '../readiness/scope-lease.mjs';
+import { isTrustChainPath, TRUST_CHAIN, TRUST_CHAIN_BASENAMES } from '../lib/gate-config.mjs';
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '../..');
 const SCOPE_GUARD_FILES = [
@@ -93,6 +93,11 @@ function prepare(input, options) {
   }
   if (!Array.isArray(gateFiles) || !gateFiles.length
       || gateFiles.some(home => typeof home !== 'string' || !home.trim())) refuse('empty or unreadable gate files');
+  const repoPrefixes = new Set([
+    ...Object.keys(CONSTELLATION_REPOS), ...Object.keys(SCOPE_PREFIX_ALIASES), ...Object.values(SCOPE_PREFIX_ALIASES),
+  ].map(prefix => SCOPE_PREFIX_ALIASES[prefix] ?? prefix));
+  const qualifiedGateFiles = gateFiles.flatMap(home => [...repoPrefixes].map(prefix => qualifyFile(home, prefix)));
+  const gateBasenames = new Set([...TRUST_CHAIN_BASENAMES, ...SCOPE_GUARD_FILES.map(file => basename(file))]);
   const scopes = ids.flatMap(id => {
     const card = readCard(id);
     const raw = typeof card?.scope === 'string' ? [card.scope] : card?.scope;
@@ -105,11 +110,23 @@ function prepare(input, options) {
     });
     if (!scope.length) refuse(`card ${id} empty scope`);
     for (const entry of scope) {
-      for (const home of gateFiles) {
-        if (scopeEntriesOverlap(entry, qualifyFile(home))) refuse(`card ${id} scope overlaps gate file ${home}`);
+      for (const home of qualifiedGateFiles) {
+        if (scopeEntriesOverlap(entry, home)) refuse(`card ${id} scope overlaps gate file ${home}`);
       }
       const pathWithoutPrefix = entry.slice(entry.indexOf(':') + 1);
       if (isTrustChainPath(pathWithoutPrefix)) refuse(`card ${id} scope overlaps gate file ${pathWithoutPrefix}`);
+      if (isSubtreeEntry(entry)) {
+        // A gate member can move into any leased directory. For globs, retain the
+        // authored filename pattern so only candidates that it covers are refused.
+        const directory = /[*?]/.test(pathWithoutPrefix)
+          ? pathWithoutPrefix.slice(0, pathWithoutPrefix.lastIndexOf('/') + 1)
+          : `${pathWithoutPrefix.replace(/\/$/, '')}/`;
+        const prefix = entry.slice(0, entry.indexOf(':') + 1);
+        for (const file of gateBasenames) {
+          const candidate = `${prefix}${directory}${file}`;
+          if (scopeEntriesOverlap(entry, candidate)) refuse(`card ${id} scope overlaps gate file ${candidate}`);
+        }
+      }
     }
     return scope;
   });
