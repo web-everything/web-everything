@@ -217,6 +217,11 @@ function originalFixture(t) {
   const owners = new Set(buildRegistry().rows.flatMap(row => row.owners));
   for (const owner of owners) {
     const declared = JSON.parse(readFileSync(join(ROOT, owner), 'utf8'));
+    // Pin the historical provider shape before main added shadow rollout guards.
+    if (declared.providerRotation) {
+      delete declared.providerRotation.review;
+      delete declared.providerRotation.goLive;
+    }
     f.write(owner, Object.fromEntries(Object.entries(declared).filter(([key]) =>
       key.startsWith('$comment') || Object.hasOwn(originalMetadata.settings, key))));
   }
@@ -242,6 +247,18 @@ test('migration preserves the registry built from the original repository metada
   split(f);
   assert.deepEqual(readMetadata({ root: f.root }), originalMetadata);
   assert.deepEqual(f.build(), before);
+});
+test('migration preserves the current registry including shadow rotation and hotpatch settings', t => {
+  const f = fixture(t);
+  rmSync(join(f.root, 'scripts/settings/feature.json'));
+  const current = buildRegistry({ root: ROOT });
+  for (const owner of new Set(current.rows.flatMap(row => row.owners))) f.write(owner, JSON.parse(readFileSync(join(ROOT, owner), 'utf8')));
+  const metadata = readMetadata({ root: ROOT });
+  Object.assign(f.meta, structuredClone(metadata));
+  assert.deepEqual(f.build(), current);
+  split(f);
+  assert.deepEqual(readMetadata({ root: f.root }), metadata);
+  assert.deepEqual(f.build(), current);
 });
 test('a new metadata key file alone adds a row without editing the base metadata', t => {
   const f = fixture(t); split(f);
