@@ -625,7 +625,8 @@ export function capExplicitRelatedGate({ gate, uncapped = false, runGit, readRep
     const name = equals < 0 ? token : token.slice(0, equals);
     if (timeoutOptions.has(name)) {
       const value = equals < 0 ? words[++i] : token.slice(equals + 1);
-      if (!/^\d+$/.test(value ?? '')) throw new Error(`related gate option ${name} requires a whole-number value`);
+      // Positive and bounded: 0 would switch the vitest timeout off, and a huge value would not round-trip as `=N`.
+      if (!/^[1-9]\d{0,6}$/.test(value ?? '')) throw new Error(`related gate option ${name} requires a whole number from 1 to 9999999`);
       if (timeoutOptions.get(name) !== null) throw new Error(`related gate option ${name} is repeated`);
       timeoutOptions.set(name, Number(value));
     } else if (valueOptions.has(name)) {

@@ -113,7 +113,8 @@ it('a converted old default with no selectable suite still runs nothing unfilter
   const p = gates.capExplicitRelatedGate({ gate: `npx vitest related ${hub} --run --passWithNoTests --testTimeout=15000 --hookTimeout=30000`, ...o });
   expect(p.command).toMatch(/^echo /);
 });
-it.each(['--testTimeout=abc', '--hookTimeout=', '--testTimeout', '--testTimeout=1 --testTimeout=2', '--passWithNoTests=false'])(
+it.each(['--testTimeout=abc', '--hookTimeout=', '--testTimeout', '--testTimeout=1 --testTimeout=2', '--passWithNoTests=false',
+  '--testTimeout=0', '--testTimeout 00', '--hookTimeout=010', '--testTimeout=99999999999999999999999', '--testTimeout=1e5'])(
   'explicit related gate refuses a malformed execution setting: %s', option => {
     expect(() => gates.capExplicitRelatedGate({ gate: `vitest related '${hub}' --run ${option}`, ...fixture() }))
       .toThrow(/related gate option/);
