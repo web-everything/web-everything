@@ -12,7 +12,7 @@ R1076: behavior belongs in product settings. The constants below are candidates 
 
 The policy layers are standard → platform → tool/repo → env → operator-db; see [policy-cascade.mjs](../../scripts/lib/policy-cascade.mjs). Readers opt into the cascade; this inventory does not assert every declaration uses every layer. Environment overrides require reader support and process environment propagation.
 
-For repo defaults, edit the owner file through a PR and rebuild the consuming daemon. Add or update metadata in scripts/lib/settings-registry-metadata.json, then run `node scripts/lib/settings-registry.mjs --write`. Verify with `node scripts/lib/settings-registry.mjs --check`. Missing declarations or invalid evidence block generation; repair the named file before regenerating.
+For repo defaults, edit the owner file through a PR and rebuild the consuming daemon. Add or update `scripts/lib/settings-registry-metadata.d/settings/<encoded-key>.json` (`capacityLeaves/<encoded-key>.json` for capacity metadata); encode keys with encodeURIComponent, additionally percent-escape !, apostrophe, (, ), * and _, then write every percent sign as an underscore. Then run `node scripts/lib/settings-registry.mjs --write`. Verify with `node scripts/lib/settings-registry.mjs --check`. Missing declarations or invalid evidence block generation; repair the named file before regenerating.
 
 ## Summary
 

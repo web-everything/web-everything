@@ -1,0 +1,6 @@
+{
+  "description": "UI-only fast review lane: enablement, seats, size bound and eligible paths.",
+  "owner": "scripts/settings/review.json",
+  "changeVia": "pr",
+  "instant": false
+}

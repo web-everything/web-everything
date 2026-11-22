@@ -1,0 +1,6 @@
+{
+  "description": "Merge queue group size and groups in flight.",
+  "owner": "scripts/settings/merge-queue-batching.json",
+  "changeVia": "pr",
+  "instant": false
+}

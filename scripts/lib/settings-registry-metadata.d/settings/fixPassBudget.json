@@ -1,0 +1,6 @@
+{
+  "description": "Per-pass time budgets for fixer recovery and draft promotion.",
+  "owner": "scripts/settings/fix-pass-budget.json",
+  "changeVia": "pr",
+  "instant": false
+}

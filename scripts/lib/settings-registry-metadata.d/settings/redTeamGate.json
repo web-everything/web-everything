@@ -1,0 +1,6 @@
+{
+  "description": "Red-team gate source and publication recovery policy.",
+  "owner": "scripts/settings/red-team.json",
+  "changeVia": "pr",
+  "instant": false
+}
