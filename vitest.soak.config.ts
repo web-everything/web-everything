@@ -42,9 +42,12 @@ export default defineConfig({
     // Must FAIL LOUDLY before the CI job's own `timeout-minutes` (25) cancels it: a test timeout equal to the job
     // timeout meant a hung scenario never produced a failure, only a cancelled job (PR #4235). Longest scenario: the
     // 50-tick baseline, 550s on a green run and 615s on a slow runner (it shares a shard with ~30 parallel scenarios),
-    // so 10 min left no headroom (main red @ 8cd0b3d12) — 17 min is ~1.7x the slowest seen.
+    // so 10 min left no headroom (main red @ 8cd0b3d12). The baseline has since grown to ~1017s (green on cbb0db37,
+    // 3s under 17 min) and timed out on 70001b92 at the 1020s limit with identical per-tick cost (main red 22:57Z), so
+    // 17 min no longer had headroom either: 24 min keeps ~1.4x and still fails loudly before the job's 30-min
+    // `timeout-minutes` (leaving 6 min for checkout + npm ci + teardown).
     // Knob: WE_SOAK_TEST_TIMEOUT_MS.
-    testTimeout: Number(process.env.WE_SOAK_TEST_TIMEOUT_MS) || 17 * 60_000,
+    testTimeout: Number(process.env.WE_SOAK_TEST_TIMEOUT_MS) || 24 * 60_000,
     hookTimeout: 5 * 60_000,
   },
 });
