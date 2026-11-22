@@ -6355,3 +6355,10 @@ settings, a missing key, non-array values, non-string entries and inexact paths
 still refuse as invalid evidence. Tests needing listed files must inject
 `readScopeSettings` with an explicit allowlist; real Git reader tests commit their
 own settings blob and pin it with the card snapshot. Never depend on a shipped seed.
+
+Runtime scope protection imports the immutable vocabulary from `guard-path-floor.mjs`
+and the matcher from `audit-path.mjs`. The audit settings resolver and verdict engine
+remain inert. Keep the import-graph assertion in `build-priority-set.test.mjs` alongside
+the repository-wide inertness check in `audit-verdict.test.mjs`; protected module names
+in `guard-auditor-roots.json` are path data, not module dependencies. The existing audit
+exports re-export the shared vocabulary and matcher so their callers keep the same API.

@@ -4,6 +4,7 @@ import { join } from 'node:path';
 import { afterAll, describe, expect, it } from 'vitest';
 import { AUDIT_SETTINGS_ENV, AUDIT_SETTINGS_PATH, GUARD_FLOOR, resolveAuditSettings } from '../audit-settings.mjs';
 import { resolvePriorQuestionHashes } from '../../operations/codex-audit.mjs';
+import * as floor from '../guard-path-floor.mjs';
 
 const HASH_A = Object.freeze({ hash: 'a'.repeat(64), acceptUntil: '2026-12-01T00:00:00.000Z' });
 const HASH_B = Object.freeze({ hash: 'b'.repeat(64), acceptUntil: '2026-12-02T00:00:00.000Z' });
@@ -16,6 +17,14 @@ const STRICT_PATHS = [...GUARD_FLOOR, '**'];
 const STRICT = { verdictMode: 'shadow', preExistingMode: 'block', releaseStage: 'prod', recheckMax: 0, baseRecheckMax: 0, requireOnMain: true, requirePayBy: true };
 
 describe('audit settings (R528)', () => {
+  it('shares the immutable guard floor with runtime scope protection', () => {
+    expect(GUARD_FLOOR).toBe(floor.GUARD_FLOOR);
+    expect(GUARD_FLOOR).toEqual(expect.arrayContaining([
+      'scripts/lib/guard-path-floor.mjs', 'scripts/lib/guard-auditor-roots.json',
+    ]));
+    for (const value of [floor.GUARD_FLOOR, floor.LOCK_USERS, floor.LOCK_HOLDERS, floor.LOCK_PRIMITIVES,
+      floor.AUDITOR_FLOOR, floor.REVIEW_AUTH_FLOOR]) expect(Object.isFrozen(value)).toBe(true);
+  });
   it.each(['raceBlockPaths', 'guardFloorPaths'])('strict path grammar rejects malformed %s at settings load', key => {
     for (const pattern of ['custom/a+b.mjs', '---a/scripts/x.mjs']) {
       for (const layer of ['file', 'platform', 'env']) {

@@ -11,8 +11,8 @@ import { SCOPE_PREFIX_ALIASES } from './dispatch-lane.mjs';
 import { GH_LIST_FILE_CAP, prHoldsFile, repoKeyFor } from './free-scope.mjs';
 import { resolveCoordinationRoot } from './coordination-root.mjs';
 import { buildPrioritySetOperation, BUILD_PRIORITY_SET_EFFECT, validateBuildPriorityInput } from './build-priority-set.mjs';
-import { GUARD_FLOOR, LOCK_USERS } from '../lib/audit-settings.mjs';
-import { matchesSome } from './audit-verdict.mjs';
+import { AUDITOR_FLOOR, GUARD_FLOOR, LOCK_USERS } from '../lib/guard-path-floor.mjs';
+import { matchesSome } from '../lib/audit-path.mjs';
 import { TRUST_CHAIN } from '../lib/gate-config.mjs';
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '../..');
@@ -27,7 +27,8 @@ const GUARD_DEPENDENCY_BASENAMES = new Set([
   'atomic-json-file.mjs', 'automation-home.mjs', 'backlog-status.cjs',
   'bounded-child.mjs', 'build-priority-set-io.mjs', 'build-priority-set.mjs',
   'import-graph.mjs', 'audit-settings.test.mjs',
-  'runtime-admission.mjs', 'audit-verdict.mjs', 'audit-settings.mjs', 'audit-path.mjs', 'build-policy.mjs',
+  'runtime-admission.mjs', ...AUDITOR_FLOOR.map(file => basename(file)), 'audit-path.mjs', 'build-policy.mjs',
+  'guard-path-floor.mjs', 'guard-auditor-roots.json',
   'build-queue.mjs', 'command-redact.mjs', 'constellation-repos.mjs',
   'container-exec.mjs', 'coordination-root.mjs', 'daemon-clone-layout.mjs',
   'daemon-events.mjs', 'daemon-last-good.mjs', 'declared-homes.mjs',

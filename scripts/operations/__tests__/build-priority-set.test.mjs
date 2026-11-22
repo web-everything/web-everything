@@ -38,6 +38,13 @@ function untouched(f, names = []) { expect(fs.readdirSync(f.dir).sort()).toEqual
 // Use the existing test-only graph witness; production admission never scans imports.
 const guardDependencies = importGraph(resolve('scripts/operations/build-priority-set-io.mjs')).files
   .map(file => relative(process.cwd(), file));
+it('uses shared protection vocabulary without loading the inert audit engine or settings resolver', () => {
+  expect(guardDependencies).toEqual(expect.arrayContaining([
+    'scripts/lib/guard-path-floor.mjs', 'scripts/lib/guard-auditor-roots.json', 'scripts/lib/audit-path.mjs',
+  ]));
+  expect(guardDependencies).not.toContain('scripts/operations/audit-verdict.mjs');
+  expect(guardDependencies).not.toContain('scripts/lib/audit-settings.mjs');
+});
 it.each(guardDependencies)(
   'refuses guard dependency %s and relocated basenames without writing a runtime file', async dependency => {
     for (const path of new Set([dependency, `scripts/lib/${basename(dependency)}`, `scripts/conveyor/${basename(dependency)}`])) {
