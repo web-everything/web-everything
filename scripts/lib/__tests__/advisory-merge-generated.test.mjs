@@ -61,9 +61,10 @@ it.each([
   // An expanded `$Id: … $` keyword is what the ident clean step collapses on `git add`.
   f.write(TIMINGS, timings({ '$Id: x $': 1 }));
   f.commit('timings base');
-  for (const [branch, key] of [['tours', 'a'], ['ttheirs', 'b']]) {
+  // Same line, different values on each side: a guaranteed textual conflict the timings merge resolves to max.
+  for (const [branch, value] of [['tours', 2], ['ttheirs', 3]]) {
     f.ok(['checkout', '-qb', branch, 'tbase']);
-    f.write(TIMINGS, timings({ '$Id: x $': 1, [key]: 1 }));
+    f.write(TIMINGS, timings({ '$Id: x $': value }));
     f.commit(branch);
   }
   expect(f.git(['merge', '--no-edit', 'ttheirs']).status).toBe(1);
