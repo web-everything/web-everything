@@ -2103,4 +2103,11 @@ export function renderJuryCharter(charter) {
 export const REVIEW_SEAT_RESPONSE_SCHEMA = {
   type: 'object', additionalProperties: true,
   properties: { findings: { type: 'array', items: { type: 'object' } }, assessment: SEAT_ANSWERS_SCHEMA },
+  if: { required: ['assessment'] },
+  then: { required: ['findings'], properties: { findings: { type: 'array', items: {
+    type: 'object', required: ['summary'], properties: {
+      summary: { type: 'string', minLength: 1, pattern: '\\S' },
+      file: { type: 'string', minLength: 1 }, line: { type: 'integer', minimum: 1 },
+    },
+  } } } },
 };

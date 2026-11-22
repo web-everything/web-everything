@@ -110,6 +110,18 @@ const { extractAnchors } = createRequire(import.meta.url)('./rules-loader.cjs');
  */
 export const TRUST_CHAIN = [
   {
+    role: 'lane-git-hardening', file: 'lane-git-hardening.mjs', tier: 'policy', leash: 'code',
+    desc: 'Immutable Git input and configuration trust boundary', homes: ['scripts/lib/lane-git-hardening.mjs'],
+  },
+  {
+    role: 'drain-red-team-evidence', file: 'drain-red-team-evidence.mjs', tier: 'policy', leash: 'code',
+    desc: 'Merge admission red-team evidence validation', homes: ['scripts/lib/drain-red-team-evidence.mjs'],
+  },
+  {
+    role: 'red-team-check-run', file: 'red-team-check-run.mjs', tier: 'policy', leash: 'code',
+    desc: 'Red-team check success and provenance validation', homes: ['scripts/lib/red-team-check-run.mjs'],
+  },
+  {
     role: 'checklist-seat-assessment',
     file: 'seat-assessment.mjs',
     tier: 'policy',

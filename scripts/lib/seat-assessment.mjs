@@ -216,9 +216,8 @@ export function makeRules(ctx) {
 
 const MAX_BYTES = 4 * 1024 * 1024;
 const MAX_ITEMS = 512, MAX_EVIDENCE = 128, MAX_PATHS = 10000;
-const httpsUri = { type: 'string', pattern: '^https://[^\\s]+$' };
-const digestSchema = { type: 'object', minProperties: 1, additionalProperties: { type: 'string', minLength: 1 } };
-const rubricRefSchema = { type: 'object', required: ['uri', 'digest'], properties: { uri: httpsUri, digest: digestSchema }, additionalProperties: true };
+const httpsUri = { type: 'string', format: 'uri', pattern: '^https://[^\\s]+$' };
+
 
 /** core/evidence v0.1 evidenceRef, with its local digestSet/provenanceTier refs inlined.
  * Kept separate from rubric refs: exact digests, kind and provenance are required, URI is optional.
@@ -352,6 +351,12 @@ export const SEAT_EVIDENCE_REF_SCHEMA = {
   "additionalProperties": false
 };
 
+const digestSchema = SEAT_EVIDENCE_REF_SCHEMA.properties.digest;
+const rubricRefSchema = { type: 'object', required: ['uri', 'digest'],
+  properties: { uri: httpsUri, digest: digestSchema }, additionalProperties: false };
+const evidenceKindSchema = { enum: LADDER };
+const policyLevels = ['company', 'org', 'team', 'repo'];
+
 /** Shared optional response field: legacy findings-only answers remain valid. */
 export const SEAT_ANSWERS_SCHEMA = {
   type: 'object', required: ['items'], additionalProperties: false, properties: {
@@ -398,11 +403,14 @@ const validAssessment = ajv.compile({
   },
 });
 const validRubric = ajv.compile({
-  type: 'object', required: ['rubricType', 'id', 'version', 'items'], properties: {
+  type: 'object', required: ['rubricType', 'id', 'version', 'items'], additionalProperties: false, properties: {
     rubricType: { const: 'https://everstandards.dev/core/rubric/v0.1' }, id: httpsUri,
-    version: { type: 'string', minLength: 1 }, items: { type: 'array', minItems: 1, maxItems: MAX_ITEMS,
-      items: { type: 'object', required: ['id', 'text'], properties: {
+    version: { type: 'string', minLength: 1 }, title: { type: 'string' }, appliesTo: digestSchema,
+    items: { type: 'array', minItems: 1, maxItems: MAX_ITEMS,
+      items: { type: 'object', required: ['id', 'text'], additionalProperties: false, properties: {
         id: { type: 'string', pattern: '^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$' }, text: { type: 'string', minLength: 1 },
+        minKind: evidenceKindSchema, naAllowed: { type: 'boolean' }, naWhen: rubricRefSchema,
+        sourceId: { type: 'string', minLength: 1 }, source: { type: 'string', format: 'uri' },
       } } },
   },
 });
@@ -410,7 +418,12 @@ const validPolicy = ajv.compile({
   type: 'object', required: ['policyType', 'id', 'level', 'seats'], additionalProperties: false, properties: {
     policyType: { const: 'https://everstandards.dev/core/rubric-policy/v0.1' }, id: httpsUri,
     parent: rubricRefSchema,
-    level: { enum: ['company', 'org', 'team', 'repo'] }, confirmations: { type: 'array' },
+    level: { enum: policyLevels }, confirmations: { type: 'array', maxItems: MAX_ITEMS, items: {
+      type: 'object', required: ['lens', 'setting', 'level', 'owner', 'policyDigest'], additionalProperties: false,
+      properties: { lens: { type: 'string', minLength: 1 }, setting: { type: 'string', minLength: 1 },
+        level: { enum: policyLevels }, owner: { type: 'string', minLength: 1, format: 'uri' },
+        policyDigest: digestSchema, record: rubricRefSchema },
+    } },
     seats: { type: 'array', minItems: 1, maxItems: 32, items: {
       type: 'object', required: ['lens'], additionalProperties: false,
       properties: {
@@ -420,7 +433,7 @@ const validPolicy = ajv.compile({
           allowed: { type: 'boolean' }, neverNa: { type: 'array', uniqueItems: true, items: { type: 'string' } }, max: { type: 'integer', minimum: 0 },
         } },
         evidence: { type: 'object', additionalProperties: false, properties: {
-          minKind: { type: 'string', minLength: 1 }, perItem: { type: 'object', additionalProperties: { type: 'string', minLength: 1 } },
+          minKind: evidenceKindSchema, perItem: { type: 'object', additionalProperties: evidenceKindSchema },
         } },
         allNa: { enum: ['pass', 'unknown'] }, citeScope: { enum: ['tree', 'diff'] }, check: rubricRefSchema,
       },
@@ -464,9 +477,12 @@ export function readDiffPaths(base, head, { cwd = process.cwd(), exec = execFile
   if (!HEX40.test(base ?? '') || !HEX40.test(head ?? '')) throw new Error('exact base and head required for merge-path check');
   const hardened = laneGitHardeningEnv(scrubGitRepoEnv(env));
   hardened.PATH = '/usr/bin:/bin:/usr/sbin:/sbin';
-  const output = String(exec('git', ['-c', 'core.commitGraph=false', 'diff', '--no-ext-diff', '--no-textconv',
-    '--name-only', '--no-renames', '-z', `${base}...${head}`, '--'],
-  { cwd, env: hardened, encoding: 'utf8', timeout: 15000, maxBuffer: MAX_BYTES }));
+  const options = { cwd, env: hardened, encoding: 'utf8', timeout: 15000, maxBuffer: MAX_BYTES };
+  const root = String(exec('git', ['rev-parse', '--show-toplevel'], options)).trim();
+  if (!root || /[\x00-\x1f\x7f]/.test(root)) throw new Error('cannot resolve repository root; operator must review the full diff');
+  const output = String(exec('git', ['-c', 'core.commitGraph=false', '-c', 'diff.relative=false',
+    'diff', '--no-relative', '--no-ext-diff', '--no-textconv', '--name-only', '--no-renames', '-z', `${base}...${head}`, '--'],
+  { ...options, cwd: root }));
   if (Buffer.byteLength(output) > MAX_BYTES) throw new Error('diff exceeds 4 MiB; operator must review the full diff');
   const paths = output.split('\0'); if (paths.at(-1) === '') paths.pop();
   if (paths.length > MAX_PATHS) throw new Error('diff exceeds 10000 paths; operator must review the full diff');
@@ -476,27 +492,29 @@ export function readDiffPaths(base, head, { cwd = process.cwd(), exec = execFile
 /** The executable definition references the EXISTING merge/review classifiers, never a second path list.
  * The concrete registry and merge-gate configuration are part of the digest, so changing either repins the check.
  */
+const sourceDigest = relative => ({ sha256: crypto.createHash('sha256')
+  .update(readFileSync(new URL(relative, import.meta.url))).digest('hex') });
 export const MERGE_PATH_CHECK_DEFINITION = Object.freeze({
   uri: 'https://github.com/plateauapp/plateau-settings/blob/main/review/checks/diff-touches-no-merge-path',
-  version: '2026-11-22.1', range: 'base...head', operation: 'no path matches either classifier; include both rename sides',
+  version: '2026-11-22.2', range: 'base...head', operation: 'no path matches either classifier; include both rename sides',
   classifiers: [
-    { module: 'scripts/lib/gate-config.mjs', export: 'isTrustChainPath', basenames: [...TRUST_CHAIN_BASENAMES].sort() },
-    { module: 'scripts/lib/merge-queue-affected.mjs', export: 'isGateFile',
+    { module: 'scripts/lib/gate-config.mjs', export: 'isTrustChainPath', sourceDigest: sourceDigest('./gate-config.mjs'), basenames: [...TRUST_CHAIN_BASENAMES].sort() },
+    { module: 'scripts/lib/merge-queue-affected.mjs', export: 'isGateFile', sourceDigest: sourceDigest('./merge-queue-affected.mjs'),
       patterns: GATE_PATTERNS.map(String), settingsPolicy: DEFAULT_SETTINGS_POLICY },
+    { module: 'scripts/readiness/test-selection.mjs', export: 'isLocalFullSuiteTrigger',
+      sourceDigest: sourceDigest('../readiness/test-selection.mjs') },
   ],
 });
 
-/** Pure with diffPaths supplied by the runner; otherwise reads the pinned base...head diff.
- * A named base always forces a fresh immutable read, even if a caller also supplied paths.
+/** Exact immutable range required. Supplied path arrays are never provenance: always re-read base...head.
+ * An injected reader is the runner's trusted IO seam, not assessment-authored data.
  */
 export function mergePathNaCheck({ base, head, diffPaths, readDiff, ...gitOptions } = {}) {
   const ref = { uri: MERGE_PATH_CHECK_DEFINITION.uri, digest: digestOf(MERGE_PATH_CHECK_DEFINITION) };
   try {
-    if (base !== undefined) {
-      if (!HEX40.test(base ?? '') || !HEX40.test(head ?? '')) throw new Error('exact base and head required');
-      diffPaths = (readDiff ?? ((b, h) => readDiffPaths(b, h, gitOptions)))(base, head);
-    }
-    if (!Array.isArray(diffPaths) || diffPaths.length > MAX_PATHS) throw new Error('missing or oversized net diff');
+    if (!HEX40.test(base ?? '') || !HEX40.test(head ?? '')) throw new Error('exact base and head required');
+    diffPaths = (readDiff ?? ((b, h) => readDiffPaths(b, h, gitOptions)))(base, head);
+    if (!Array.isArray(diffPaths) || !diffPaths.length || diffPaths.length > MAX_PATHS) throw new Error('missing or oversized net diff');
     if (Buffer.byteLength(JSON.stringify(diffPaths)) > MAX_BYTES) throw new Error('oversized net diff paths');
     const paths = diffPaths.map(safePath), touched = paths.find(path => isTrustChainPath(path) || isGateFile(path));
     return { ...ref, result: touched ? 'fail' : 'pass', diffPaths: paths,
@@ -518,6 +536,13 @@ function seatCascadeProblems(chain) {
       const configuring = ancestors.filter(policy => policy.seats.some(parent => parent.lens === seat.lens));
       const parent = configuring.at(-1)?.seats.find(parent => parent.lens === seat.lens);
       if (!parent) continue;
+      if (parent.check && !sameRef(parent.check, seat.check)) {
+        const levels = configuring.map(policy => policy.level);
+        const confirmed = levels.every(level => (child.confirmations ?? []).some(confirmation =>
+          confirmation.lens === seat.lens && confirmation.setting === 'check' && confirmation.level === level
+          && sameDigest(confirmation.policyDigest, policyDigest(child))));
+        if (!confirmed) problems.push(`${child.level} loosens ${seat.lens}.check without confirmation from ${levels.join(', ')}`);
+      }
       const ids = new Set([...Object.keys(parent.evidence?.perItem ?? {}), ...Object.keys(seat.evidence?.perItem ?? {})]);
       for (const id of ids) {
         const minimum = parent.evidence?.perItem?.[id] ?? parent.evidence?.minKind ?? 'assertion';
@@ -540,7 +565,7 @@ function seatCascadeProblems(chain) {
 export function readSeatSettings({ settingsPath, read = readFileSync,
   policyPaths = ['rubric-policy/company.json'], log = () => {} } = {}) {
   const problems = [], sources = {}, chain = [];
-  let mode, securityRubric, policy;
+  let mode, securityRubric, policy, modeValid = false;
   const load = relative => {
     if (!settingsPath) throw new Error('plateau-settings checkout path required');
     safePath(relative);
@@ -548,12 +573,18 @@ export function readSeatSettings({ settingsPath, read = readFileSync,
     sources[relative] = path;
     return boundedJson(String(read(path, 'utf8')));
   };
-  try { mode = load('rubric-mode.json'); requireMode(mode); }
+  try { mode = load('rubric-mode.json'); requireMode(mode); modeValid = true; }
   catch (error) { problems.push(`mode unreadable: ${error.message}; repair rubric-mode.json before enforcement`); }
   try {
     if (!Array.isArray(policyPaths) || !policyPaths.length || policyPaths.length > 4) throw new Error('invalid policy cascade');
     for (const path of policyPaths) { const p = load(path); requirePolicy(p); chain.push(p); }
     if (chain[0].level !== 'company') throw new Error('company policy required first');
+    for (let i = 1; i < chain.length; i++) {
+      const parent = chain[i - 1], child = chain[i];
+      if (policyLevels.indexOf(child.level) <= policyLevels.indexOf(parent.level)
+        || !sameRef(child.parent, { uri: parent.id, digest: digestOf(parent) }))
+        throw new Error('missing or stale parent policy binding; repair the policy cascade');
+    }
     const bad = seatCascadeProblems(chain); if (bad.length) throw new Error(bad.join('; '));
     const seats = new Map(); for (const p of chain) for (const seat of p.seats) seats.set(seat.lens, seat);
     policy = { ...chain.at(-1), seats: [...seats.values()] };
@@ -562,8 +593,14 @@ export function readSeatSettings({ settingsPath, read = readFileSync,
   } catch (error) { problems.push(`policy unreadable: ${error.message}; repair plateau-settings review files`); }
   try { log({ policy: 'seat-checklist', mode: mode?.mode ?? 'unknown', sources, problems }); }
   catch (error) { problems.push(`settings provenance log failed: ${error.message}`); }
-  return { ...mode, policy, securityRubric, sources, problems };
+  return { ...mode, modeValid, policy, securityRubric, sources, problems };
 }
+
+/** The executed seat gate, including adapter validation; policy checks must name these exact bytes. */
+export const SEAT_GATE_CHECK_REF = Object.freeze({
+  uri: 'https://everstandards.dev/core/checks/seat-gate/v0.1.2',
+  digest: digestOf({ rules: RULES_SHA256, adapter: sourceDigest('./seat-assessment.mjs') }),
+});
 
 const refused = (problems, reason = 'missing') => ({ derived: 'unknown', reason, problems, gateOutcome: 'not-pass' });
 
@@ -596,6 +633,8 @@ export function wrapSeatAnswers({ lens, head, rubric, policy, answers, at, naChe
 export function evaluateSeat({ lens, head, runId, assessmentRunId, assessment, rubric, expectedRubric,
   policy, settings, diffPaths, readFileAtHead, cwd, env, at, base, readDiff } = {}) {
   try {
+    if (settings && (settings.modeValid === false || !['shadow', 'enforce'].includes(settings.mode)))
+      return refused([...(settings.problems ?? []), 'configured mode unreadable or invalid; repair rubric-mode.json']);
     if (settings?.problems?.length) return refused([...settings.problems]);
     policy ??= settings?.policy;
     requirePolicy(policy);
@@ -605,6 +644,7 @@ export function evaluateSeat({ lens, head, runId, assessmentRunId, assessment, r
       return refused(['missing or stale head, mandatory lens, or review run binding'], 'stale');
     const seat = policy.seats.find(s => s.lens === lens);
     if (!seat || (!seat.rubric && seat.rubricFrom !== 'subject')) return refused([`${lens}: no rubric policy`]);
+    if (seat.check && !sameRef(seat.check, SEAT_GATE_CHECK_REF)) return refused(['unknown or stale seat.check; repin to the executed seat gate'], 'stale');
     if (!rubric) return refused([lens === 'correctness' ? 'no pinned acceptance' : 'no pinned security rubric']);
     if (!validRubric(rubric) || new Set(rubric.items.map(i => i.id)).size !== rubric.items.length)
       return refused(['invalid or duplicate rubric items']);
@@ -615,13 +655,18 @@ export function evaluateSeat({ lens, head, runId, assessmentRunId, assessment, r
     const answers = assessment.predicateType ? assessment.predicate?.items : assessment.items;
     let naCheck;
     const adapterProblems = [];
-    if (Array.isArray(answers) && answers.some(a => /^MP\d+$/.test(a.itemId) && a.outcome === 'n/a')) {
+    const conditional = Array.isArray(answers) ? answers.filter(a => a.outcome === 'n/a'
+      && (rubric.items.find(item => item.id === a.itemId)?.naWhen || /^MP\d+$/.test(a.itemId))) : [];
+    if (conditional.length) {
+      // Registry currently has one offline check. URI AND digest must match; claims never execute themselves.
       naCheck = mergePathNaCheck({ base, head, diffPaths, readDiff, cwd, env });
       diffPaths = naCheck.diffPaths;
-      for (const answer of answers.filter(a => /^MP\d+$/.test(a.itemId) && a.outcome === 'n/a')) {
+      for (const answer of conditional) {
         const condition = rubric.items.find(item => item.id === answer.itemId)?.naWhen;
         if (condition && !sameRef(condition, naCheck))
-          return refused(['merge-path naWhen definition digest is stale; repin the rubric and policy to the published check definition'], 'stale');
+          return refused(['unknown or stale naWhen definition digest; repin the rubric and policy to a registered check'], 'stale');
+        if (condition && assessment.predicateType && (!sameRef(answer.naCheck, naCheck) || answer.naCheck?.result !== naCheck.result))
+          adapterProblems.push(`${answer.itemId}: naCheck differs from independently executed check (CORE-VRD-054)`);
       }
       adapterProblems.push(...naCheck.problems);
     }
@@ -639,6 +684,8 @@ export function evaluateSeat({ lens, head, runId, assessmentRunId, assessment, r
     const read = readFileAtHead ?? ((rev, path) => readHeadFile(rev, path, { cwd, env }));
     const tree = {};
     for (const a of p.items) for (const e of a.evidence ?? []) {
+      // No offline resolver can establish a test's success, provenance and reviewed head from a digest alone.
+      if (e.kind === 'verified-test') problems.push(`${a.itemId}: unresolved verified-test evidence; cite the reviewed tree or rerun with a trusted offline resolver`);
       if (!e.location) continue;
       if (e.revisionId !== head) problems.push(`${a.itemId}: citation has no exact reviewed head`);
       const location = e.location, path = safePath(location.uri);
@@ -664,10 +711,8 @@ export function evaluateSeat({ lens, head, runId, assessmentRunId, assessment, r
 }
 
 function effectiveMode(settings, requested) {
-  if (['shadow', 'enforce'].includes(settings?.mode)) return settings.mode;
-  if (['shadow', 'enforce'].includes(requested)) return requested;
-  // Unknown configured mode refuses; the unconfigured library seam remains shadow-only.
-  return settings ? 'enforce' : 'shadow';
+  if (settings) return settings.modeValid !== false && ['shadow', 'enforce'].includes(settings.mode) ? settings.mode : 'enforce';
+  return ['shadow', 'enforce'].includes(requested) ? requested : 'shadow';
 }
 
 /** IO boundary: append AFTER derivation. Shadow failures remain visible and can never turn into a pass. */
@@ -675,7 +720,7 @@ export function assessSeat(options = {}) {
   const at = options.at ?? new Date().toISOString();
   let result = evaluateSeat({ ...options, at });
   const mode = effectiveMode(options.settings, options.mode);
-  if (mode === 'shadow' && (options.appendRow || options.shadowPath)) {
+  if ((mode === 'shadow' || options.mode === 'shadow' || options.shadowRequested) && (options.appendRow || options.shadowPath)) {
     const started = options.settings?.shadowStartedAt ?? options.shadowStartedAt;
     const days = options.settings?.maxDays ?? options.maxDays;
     const row = { pr: options.pr, head: options.head, lens: options.lens, ...result,
@@ -713,7 +758,7 @@ export function assessReviewSeats(options = {}) {
   for (const lens of ['security', 'correctness']) {
     const localSettings = preparationProblems.length && lens === 'correctness'
       ? { ...settings, problems: [...(settings?.problems ?? []), ...preparationProblems] } : settings;
-    seats[lens] = assessSeat({ ...options, settings: localSettings, mode, lens,
+    seats[lens] = assessSeat({ ...options, settings: localSettings, mode, shadowRequested: options.mode === 'shadow', lens,
       rubric: lens === 'correctness' ? correctness : (options.rubrics?.security ?? settings?.securityRubric),
       expectedRubric: correctness, assessment: options.assessments?.[lens] ?? null,
       assessmentRunId: options.assessmentRunIds?.[lens] });

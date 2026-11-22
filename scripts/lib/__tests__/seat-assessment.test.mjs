@@ -1,3 +1,4 @@
+import * as seatAdapter from '../seat-assessment.mjs';
 import { isGateFile } from '../merge-queue-affected.mjs';
 // @vitest-environment node
 /** CKLST-B: negative controls precede the seat gate implementation. Offline #7236 tree replay. */
@@ -22,8 +23,13 @@ const data = lens => Object.fromEntries(['assessment', 'rubric', 'policy'].map(k
 const head = data('security').assessment.predicate.revisionId;
 const tree = json('vectors/live-7236.tree.json');
 const panel = { lensVerdicts: { security: 'accept', correctness: 'accept' }, findings: [] };
-const input = lens => ({ ...data(lens), lens, head, runId: 'run-1', assessmentRunId: 'run-1', expectedRubric: data(lens).rubric,
-  diffPaths: [], readFileAtHead: (_head, path) => Array.from({ length: Math.max(...Object.keys(tree[path]).map(Number)) }, (_, i) => tree[path][i + 1] ?? '').join('\n') });
+const input = lens => {
+  const x = { ...data(lens), lens, head, base: 'b'.repeat(40), runId: 'run-1', assessmentRunId: 'run-1', expectedRubric: data(lens).rubric,
+    diffPaths: ['docs/article.md'], readFileAtHead: (_head, path) => Array.from({ length: Math.max(...Object.keys(tree[path]).map(Number)) }, (_, i) => tree[path][i + 1] ?? '').join('\n') };
+  x.readDiff = () => x.diffPaths;
+  return x;
+};
+const checkPaths = diffPaths => mergePathNaCheck({ base: 'b'.repeat(40), head, readDiff: () => diffPaths });
 const gatesFor = assessment => Object.fromEntries(['security', 'correctness'].map(lens => [lens,
   assessSeat({ ...input(lens), assessment: assessment === null ? null : data(lens).assessment, mode: 'enforce' }).gateOutcome]));
 
@@ -343,7 +349,7 @@ describe('Core evidence references stay distinct from rubric references', () => 
     }
   });
 
-  it.each(['absolute URI', 'relative URI', 'no URI'])('schema-valid evidence with %s remains accepted', form => {
+  it.each(['absolute URI', 'relative URI', 'no URI'])('canonical audit: unresolved schema-valid verified-test with %s is refused', form => {
     const x = input('security'), ref = testResultRef();
     if (form === 'relative URI') ref.uri = 'results/test-result.json';
     if (form === 'no URI') delete ref.uri;
@@ -352,8 +358,8 @@ describe('Core evidence references stay distinct from rubric references', () => 
     expect(validResponse({ findings: [], assessment: answers })).toBe(true);
     const statement = wrapSeatAnswers({ ...x, answers, at: '2026-11-22T14:00:00Z' });
     expect(validStatement(statement)).toBe(true);
-    expect(assessSeat({ ...x, assessment: answers }).gateOutcome).toBe('pass');
-    expect(assessSeat({ ...x, assessment: statement }).gateOutcome).toBe('pass');
+    expect(assessSeat({ ...x, assessment: answers }).gateOutcome).toBe('not-pass');
+    expect(assessSeat({ ...x, assessment: statement }).gateOutcome).toBe('not-pass');
   });
 });
 
@@ -413,7 +419,7 @@ it('shadow records an omitted binding as not-pass without supplying panel gates'
 
 const naRef = check => ({ uri: check.uri, digest: clone(check.digest), result: check.result });
 function conditionalInput() {
-  const x = input('security'), check = mergePathNaCheck({ diffPaths: [] });
+  const x = input('security'), check = checkPaths(['docs/article.md']);
   x.rubric = json('security.rubric.json'); x.policy = json('policy.company.json');
   for (const item of x.rubric.items.filter(item => /^MP\d+$/.test(item.id)))
     item.naWhen = { uri: check.uri, digest: check.digest };
@@ -427,14 +433,14 @@ it('merge-path naWhen uses the shared merge gate lists, including relocated trus
   const paths = [...TRUST_CHAIN.flatMap(item => item.homes ?? []), '.githooks/pre-push', 'scripts/ci/check.mjs',
     'vitest.config.ts', 'docs/article.md', 'scripts/lib/unrelated-helper.mjs', 'relocated/review-core.mjs'];
   for (const path of paths) {
-    expect(mergePathNaCheck({ diffPaths: [path] }).result).toBe(isTrustChainPath(path) || isGateFile(path) ? 'fail' : 'pass');
+    expect(checkPaths([path]).result).toBe(isTrustChainPath(path) || isGateFile(path) ? 'fail' : 'pass');
   }
-  const check = mergePathNaCheck({ diffPaths: [] });
+  const check = checkPaths(['docs/article.md']);
   expect(check.digest).toEqual(digestOf(MERGE_PATH_CHECK_DEFINITION));
   expect(check.uri).toBe('https://github.com/plateauapp/plateau-settings/blob/main/review/checks/diff-touches-no-merge-path');
 });
 it('merge-path naWhen computes and records pass for compact n/a on a non-merge diff', () => {
-  const x = conditionalInput(), check = mergePathNaCheck({ diffPaths: ['docs/article.md'] });
+  const x = conditionalInput(), check = checkPaths(['docs/article.md']);
   const answers = { items: clone(x.assessment.predicate.items) };
   for (const item of answers.items) delete item.naCheck;
   const statement = wrapSeatAnswers({ ...x, answers, at: '2026-11-22T14:00:00Z', naCheck: check });
@@ -450,7 +456,7 @@ it('merge-path naWhen recomputes the actual base...head diff instead of trusting
 });
 it('merge-path naWhen refuses missing, oversized and unreadable diff evidence with a fallback', () => {
   for (const diffPaths of [undefined, Array(10001).fill('docs/a.md')]) {
-    const result = mergePathNaCheck({ diffPaths });
+    const result = checkPaths(diffPaths);
     expect(result.result).toBe('fail'); expect(result.problems.join(' ')).toContain('operator');
   }
   const invalidRead = vi.fn(() => []);
@@ -481,10 +487,12 @@ it.each(['fail', 'n/a'])('CORE-VRD-055 requires file, line and head for %s', out
   expect(result.gateOutcome).toBe('not-pass'); expect(result.problems.join(' ')).toContain('CORE-VRD-055');
 });
 it('base...head diff reader is bounded, hardened and includes both sides of renames', () => {
-  const exec = vi.fn(() => 'docs/article.md\0scripts/lib/gate-config.mjs\0');
+  const exec = vi.fn((_bin, args) => args[0] === 'rev-parse' ? process.cwd() : 'docs/article.md\0scripts/lib/gate-config.mjs\0');
   expect(readDiffPaths('b'.repeat(40), head, { exec, env: { GIT_DIR: 'decoy', GIT_WORK_TREE: 'decoy' } })).toEqual(['docs/article.md', 'scripts/lib/gate-config.mjs']);
-  const [, args, options] = exec.mock.calls[0];
+  const [, args, options] = exec.mock.calls[1];
   expect(args).toContain(`${'b'.repeat(40)}...${head}`); expect(args).toContain('--no-renames');
+  expect(args).toContain('--no-relative'); expect(args).toContain('diff.relative=false');
+  expect(options.cwd).toBe(process.cwd());
   expect(options.env.GIT_DIR).toBeUndefined(); expect(options.env.GIT_WORK_TREE).toBeUndefined();
   expect(options.maxBuffer).toBeGreaterThan(0); expect(options.timeout).toBeGreaterThan(0);
   expect(() => readDiffPaths('main', head, { exec })).toThrow();
@@ -517,14 +525,14 @@ it('real Git base...head check ignores base-only changes and dirty files and ref
 });
 it('a forged passing naCheck cannot override the actual merge-path diff', () => {
   const x = conditionalInput();
-  expect(assessSeat({ ...x, diffPaths: ['scripts/lib/gate-config.mjs'] }).gateOutcome).toBe('not-pass');
+  expect(assessSeat({ ...x, diffPaths: ['scripts/lib/gate-config.mjs'], readDiff: () => ['scripts/lib/gate-config.mjs'] }).gateOutcome).toBe('not-pass');
 });
 it('a full conditional assessment passes only with the matching successful check and citations', () => {
   expect(assessSeat({ ...conditionalInput(), diffPaths: ['docs/article.md'] }).gateOutcome).toBe('pass');
 });
 it('diff reader bounds name an operator fallback for oversized command output', () => {
   for (const output of ['a\0'.repeat(10001), 'a'.repeat(4 * 1024 * 1024 + 1)])
-    expect(() => readDiffPaths('b'.repeat(40), head, { exec: () => output })).toThrow('operator must review the full diff');
+    expect(() => readDiffPaths('b'.repeat(40), head, { exec: (_bin, args) => args[0] === 'rev-parse' ? process.cwd() : output })).toThrow('operator must review the full diff');
 });
 
 
@@ -595,7 +603,10 @@ const evidenceMinimumCases = [
 it.each(evidenceMinimumCases)('effective per-item evidence minimum: %s', (_name, parent, child, needsConfirmation) => {
   const { company, repo } = evidencePolicies(parent, child);
   const { settings } = loadFrozenPolicyChain(repo, company);
-  if (needsConfirmation) {
+  if (_name === 'new unknown-kind override cannot satisfy global floor') {
+    expect(settings.problems.join(' ')).toContain('invalid rubric policy');
+    expect(assessSeat({ ...input('security'), settings }).gateOutcome).toBe('not-pass');
+  } else if (needsConfirmation) {
     const messages = settings.problems.join(' ');
     expect(messages).toContain('security.evidence.perItem.MP1 without confirmation from company');
     expect(messages.match(/security\.evidence\.perItem\.MP1/g)).toHaveLength(1);
@@ -619,7 +630,8 @@ it.each(['wrong setting', 'wrong level', 'no owner', 'wrong digest'])('new per-i
   if (variant === 'no owner') delete confirmation.owner;
   if (variant === 'wrong digest') confirmation.policyDigest = { sha256: '0'.repeat(64) };
   repo.confirmations = [confirmation];
-  expect(loadFrozenPolicyChain(repo, company).settings.problems.join(' ')).toContain('without confirmation');
+  expect(loadFrozenPolicyChain(repo, company).settings.problems.join(' '))
+    .toContain(variant === 'no owner' ? 'invalid rubric policy' : 'without confirmation');
 });
 it('a per-item downgrade requires confirmation from every ancestor configuring that lens', () => {
   const { company, repo } = evidencePolicies({ minKind: 'quoted-citation' }, { minKind: 'quoted-citation', perItem: { MP1: 'assertion' } });
@@ -649,4 +661,140 @@ it('the merge-path naWhen check digest matches the one pinned by every MP item o
     expect(item.naWhen.uri).toBe(MERGE_PATH_CHECK_DEFINITION.uri);
     expect(item.naWhen.digest.sha256, `${item.id}: TRUST_CHAIN/GATE_PATTERNS changed; re-pin the rubric`).toBe(live);
   }
+});
+
+
+/** Canonical audit round 1: adversarial checks exercise the production adapter, not just Core rules. */
+describe('canonical audit', () => {
+  const base = 'b'.repeat(40);
+  const boundCheck = paths => mergePathNaCheck({ base, head, readDiff: () => paths });
+  function repin(x) {
+    x.policy.seats.find(s => s.lens === x.lens).rubric = { uri: x.rubric.id, digest: digestOf(x.rubric) };
+    x.assessment.predicate.rubric = { uri: x.rubric.id, digest: digestOf(x.rubric) };
+    x.assessment.predicate.policy = { uri: x.policy.id, digest: digestOf(x.policy) };
+    return x;
+  }
+  it('fabricated asserted verified-test evidence cannot pass without offline resolution', () => {
+    const x = input('security'), ref = { ...testResultRef(), provenanceTier: 'asserted' };
+    expect(assessSeat({ ...x, assessment: verifiedAnswers(x, ref) }).gateOutcome).toBe('not-pass');
+  });
+  it('nested cwd and diff.relative cannot hide a merge-path file', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'seat-audit-diff-'));
+    try {
+      const git = (...args) => execFileSync('git', ['-c', 'core.hooksPath=/dev/null', '-c', 'commit.gpgsign=false', ...args], { cwd: dir, encoding: 'utf8', env: { PATH: process.env.PATH, HOME: dir, TMPDIR: process.env.TMPDIR, GIT_CONFIG_NOSYSTEM: '1' } }).trim();
+      git('init', '-q'); git('config', 'user.email', 'seat@example.org'); git('config', 'user.name', 'Seat fixture');
+      mkdirSync(join(dir, 'nested')); writeFileSync(join(dir, 'seed'), 'base');
+      git('add', '.'); git('commit', '-qm', 'base'); const from = git('rev-parse', 'HEAD');
+      writeFileSync(join(dir, 'gate-config.mjs'), 'gate'); git('add', '.'); git('commit', '-qm', 'gate');
+      const to = git('rev-parse', 'HEAD'); git('config', 'diff.relative', 'true');
+      expect(readDiffPaths(from, to, { cwd: join(dir, 'nested') })).toEqual(['gate-config.mjs']);
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+  it.each([undefined, [], ['docs/article.md']])('unbound supplied paths %j cannot grant n/a', diffPaths => {
+    expect(mergePathNaCheck({ head, diffPaths }).result).toBe('fail');
+  });
+  it('an exact range is independently read even when supplied paths claim another range', () => {
+    expect(mergePathNaCheck({ base, head, diffPaths: [], diffRange: { base: 'c'.repeat(40), head },
+      readDiff: () => ['scripts/lib/gate-config.mjs'] }).result).toBe('fail');
+  });
+  it.each(['lane-git-hardening.mjs', 'drain-red-team-evidence.mjs', 'red-team-check-run.mjs'])(
+    'merge dependency %s cannot grant exemption', file => {
+      expect(isTrustChainPath(`scripts/lib/${file}`)).toBe(true);
+      expect(boundCheck([`scripts/lib/${file}`]).result).toBe('fail');
+    });
+  it.each(['package-lock.json', 'tests/test-helpers/shared.ts', 'vitest.workspace.ts'])(
+    'shared full-suite trigger %s is covered by the merge check', file => expect(boundCheck([file]).result).toBe('fail'));
+  it.each(['known fails', 'unknown URI', 'unknown digest'])('non-MP conditional n/a is independently checked: %s', variant => {
+    const x = conditionalInput(); x.base = base; x.readDiff = () => variant === 'known fails' ? ['scripts/lib/gate-config.mjs'] : ['docs/article.md'];
+    const old = x.rubric.items.find(i => i.id === 'MP1'); old.id = 'CUSTOM1';
+    const a = x.assessment.predicate.items.find(i => i.itemId === 'MP1'); a.itemId = 'CUSTOM1';
+    x.policy.seats[0].required = 'all';
+    for (const answer of x.assessment.predicate.items) if (/^MP/.test(answer.itemId)) answer.outcome = 'pass';
+    a.outcome = 'n/a'; a.reason = 'Not applicable'; a.naCheck = naRef(boundCheck(['docs/article.md']));
+    if (variant === 'unknown URI') old.naWhen.uri = 'https://example.org/unknown-check';
+    if (variant === 'unknown digest') old.naWhen.digest.sha256 = 'f'.repeat(64);
+    expect(assessSeat(repin(x)).gateOutcome).toBe('not-pass');
+  });
+  it('a known non-MP conditional check records its actual successful result', () => {
+    const x = conditionalInput(); x.base = base; x.readDiff = () => ['docs/article.md'];
+    x.rubric.items.find(i => i.id === 'MP1').id = 'CUSTOM1';
+    x.assessment.predicate.items.find(i => i.itemId === 'MP1').itemId = 'CUSTOM1';
+    x.policy.seats[0].required = 'all'; repin(x);
+    const answers = { items: clone(x.assessment.predicate.items) }; for (const a of answers.items) delete a.naCheck;
+    expect(assessSeat({ ...x, assessment: answers }).gateOutcome).toBe('pass');
+  });
+  it.each(['unreadable', 'invalid'])('configured %s mode fails closed even with a shadow request, while logging problems', variant => {
+    const x = input('security'), rows = [];
+    const settings = { policy: x.policy, securityRubric: x.rubric, ...(variant === 'invalid' ? { mode: 'banana' } : {}),
+      problems: ['mode unreadable: repair rubric-mode.json'] };
+    const result = assessReviewSeats({ ...x, mode: 'shadow', settings, appendRow: row => rows.push(row),
+      assessments: { security: x.assessment }, assessmentRunIds: { security: x.runId } });
+    expect(result.seatGates).toEqual({ security: 'not-pass', correctness: 'not-pass' });
+    expect(rows).toHaveLength(2); expect(rows.every(row => row.problems.length)).toBe(true);
+  });
+  it.each([['minKind', 'made-up'], ['minKind', {}], ['naAllowed', 'yes'], ['naWhen', { uri: 'https://example.org/check', digest: { sha256: 'x' } }]])(
+    'malformed operative rubric field %s=%j is refused', (key, value) => {
+      const x = input('security'); x.rubric.items[0][key] = value;
+      expect(assessSeat(repin(x)).gateOutcome).toBe('not-pass');
+    });
+  it.each([['owner', true], ['owner', []], ['owner', ''], ['owner', 'not a URI'], ['level', 'unknown'], ['policyDigest', { sha256: 'x' }]])(
+    'malformed confirmation %s=%j is refused by the settings reader', (key, value) => {
+      const company = json('vectors/policy.company.json'), repo = json('vectors/policy.repo.json');
+      repo.confirmations = [{ lens: 'security', setting: 'evidence.minKind', owner: 'https://example.org/owner', level: 'company', policyDigest: digestOf(repo), [key]: value }];
+      expect(loadFrozenPolicyChain(repo, company).settings.problems.length).toBeGreaterThan(0);
+    });
+  it.each(['uri', 'digest', 'missing'])('stale child parent %s binding is refused', variant => {
+    const repo = json('vectors/policy.repo.json');
+    if (variant === 'uri') repo.parent.uri = 'https://example.org/other-parent';
+    if (variant === 'digest') repo.parent.digest.sha256 = 'f'.repeat(64);
+    if (variant === 'missing') delete repo.parent;
+    expect(loadFrozenPolicyChain(repo).settings.problems.length).toBeGreaterThan(0);
+  });
+  it.each(['uri', 'digest'])('unknown seat.check %s is refused', variant => {
+    const x = input('security'); x.policy.seats[0].check = { uri: 'https://example.org/unknown-seat-gate', digest: { sha256: 'f'.repeat(64) } };
+    if (variant === 'digest' && seatAdapter.SEAT_GATE_CHECK_REF) x.policy.seats[0].check.uri = seatAdapter.SEAT_GATE_CHECK_REF.uri;
+    repin(x); expect(assessSeat(x).gateOutcome).toBe('not-pass');
+  });
+  it('a child cannot drop an inherited seat check without confirmation', () => {
+    const company = json('vectors/policy.company.json'), repo = json('vectors/policy.repo.json');
+    delete repo.seats[0].check; repo.parent = { uri: company.id, digest: digestOf(company) };
+    expect(loadFrozenPolicyChain(repo, company).settings.problems.join(' ')).toContain('check');
+  });
+  it('the exact executed seat.check binding remains accepted', () => {
+    const x = input('security'); x.policy.seats[0].check = clone(seatAdapter.SEAT_GATE_CHECK_REF);
+    expect(assessSeat(repin(x)).gateOutcome).toBe('pass');
+  });
+  it('dropping a parent check requires a valid exact-policy owner confirmation', () => {
+    const company = json('vectors/policy.company.json'), repo = json('vectors/policy.repo.json');
+    delete repo.seats[0].check;
+    repo.confirmations = [{ lens: 'security', setting: 'check', level: 'company',
+      owner: 'https://example.org/owner', policyDigest: policyDigest(repo) }];
+    expect(loadFrozenPolicyChain(repo, company).settings.problems).toEqual([]);
+    repo.confirmations[0].policyDigest.sha256 = 'f'.repeat(64);
+    expect(loadFrozenPolicyChain(repo, company).settings.problems.join(' ')).toContain('check without confirmation');
+  });
+  it('a malformed configured shadow file is enforcement-not-pass with a problems row', () => {
+    const x = input('security'), rows = [];
+    const settings = readSeatSettings({ settingsPath: 'settings-checkout', read: path => JSON.stringify(
+      path.endsWith('rubric-mode.json') ? { mode: 'shadow', shadowStartedAt: '2026-11-22', maxDays: 0 }
+        : path.endsWith('company.json') ? x.policy : x.rubric) });
+    const result = assessReviewSeats({ ...x, settings, mode: 'shadow', appendRow: row => rows.push(row) });
+    expect(result.seatGates).toEqual({ security: 'not-pass', correctness: 'not-pass' });
+    expect(rows).toHaveLength(2); expect(rows.every(row => row.problems.some(p => p.includes('mode')))).toBe(true);
+  });
+  it('check digest covers the source of every classifier and full-suite trigger', () => {
+    const classifiers = MERGE_PATH_CHECK_DEFINITION.classifiers;
+    for (const module of ['scripts/lib/gate-config.mjs', 'scripts/lib/merge-queue-affected.mjs', 'scripts/readiness/test-selection.mjs']) {
+      const entry = classifiers.find(c => c.module === module);
+      expect(entry, module).toBeDefined();
+      expect(entry.sourceDigest).toEqual({ sha256: createHash('sha256').update(readFileSync(module)).digest('hex') });
+    }
+  });
+  it.each([{}, { findings: [{}] }, { findings: [{ summary: '' }] }])('assessment-bearing response requires meaningful findings: %j', response => {
+    const valid = addFormats(new Ajv2020({ strict: false })).compile(REVIEW_SEAT_RESPONSE_SCHEMA);
+    expect(valid({ ...response, assessment: { items: [] } })).toBe(false);
+    expect(valid({ findings: [], assessment: { items: [] } })).toBe(true);
+    expect(valid({ findings: [{ summary: 'Concrete issue', file: 'src/file.js', line: 1 }], assessment: { items: [] } })).toBe(true);
+    expect(valid({})).toBe(true); expect(valid({ findings: [{}] })).toBe(true);
+  });
 });
