@@ -34,6 +34,7 @@ import { publishAttention } from './needs-you-feed.mjs';
 import { createActionStore } from './action-store.mjs';
 import { actionResource } from './action-record.mjs';
 import { isUnderTest } from '../lib/under-test.mjs';
+import { readExitRulingPrs } from './judge-sweep-exit-rulings.mjs';
 import { STALL_DEFAULTS } from './judge-sweep-facts.mjs';
 import { cascadePolicy, platformPreference } from '../lib/policy-cascade.mjs';
 export const JUDGE_SWEEP_REPO = CONSTELLATION_REPOS[DEFAULT_REPO_KEY].slug;
@@ -195,6 +196,8 @@ export function createJudgeSweepFactsReader({ gh = operatorGh, now = () => Date.
   })),
   baseCap = resolveRoundCap(process.env),
   readStallThresholds = resolveStallThresholds,
+  // Tests that do not inject a reader must not depend on the operator's real rulings file.
+  readExitRulings = isUnderTest() ? () => ({ prs: new Set(), errors: [] }) : readExitRulingPrs,
   checkoutState = readCheckoutState, readFresh = readFromFreshOrigin,
   cardReadable = ref => referralCardReadable(ref, rootDir(), { readOnPr: () => {
     // Remote card verification would break this operation's bounded evidence call budget.
@@ -225,12 +228,18 @@ export function createJudgeSweepFactsReader({ gh = operatorGh, now = () => Date.
       return String(gh(args, { encoding: 'utf8', timeout: 60_000, maxBuffer: 32 * 1024 * 1024 }));
     };
     const argv = listArgv({ repo });
-    // Assignees supply ownership; heavy evidence is read only for cap-near PRs below.
+    // Assignees supply ownership; detail selection uses rounds and exit-ruling presence below.
     argv[argv.length - 1] += ',assignees,isDraft';
     const listing = JSON.parse(boundedGh(argv));
     if (!Array.isArray(listing) || listing.length >= LIST_LIMIT) throw failure('open PR listing incomplete (limit 200); use an exhaustive operator listing');
     let ledger = [], fixRows = [], jobs = [];
     const errors = [];
+    let exitPrs = new Set();
+    try {
+      const rulings = readExitRulings();
+      errors.push(...rulings.errors);
+      exitPrs = rulings.prs;
+    } catch { errors.push('exit rulings unreadable'); }
     try { ledger = readLedgerRows(repo); if (!Array.isArray(ledger)) throw failure('ledger shape'); } catch { errors.push('verdict ledger unreadable'); }
     try { fixRows = readFixRows(); if (!Array.isArray(fixRows)) throw failure('fix ledger shape'); } catch { errors.push('fix-loop ledger unreadable'); }
     try { jobs = readJobs(); if (!Array.isArray(jobs)) throw failure('jobs shape'); } catch { errors.push('live jobs unreadable'); }
@@ -244,7 +253,7 @@ export function createJudgeSweepFactsReader({ gh = operatorGh, now = () => Date.
         if (chunk.split('\n').filter(Boolean).length < 100) return chunks.join('\n');
       }
     };
-    const prs = listing.map(p => {
+    const pending = listing.map(p => {
       if (!Number.isSafeInteger(p?.number) || p.number <= 0 || !/^[a-f0-9]{40}$/i.test(p.headRefOid ?? '')
         || !Array.isArray(p.labels) || p.labels.some(l => typeof l?.name !== 'string')
         || !Number.isFinite(Date.parse(p.updatedAt)) || !Array.isArray(p.assignees)
@@ -284,164 +293,176 @@ export function createJudgeSweepFactsReader({ gh = operatorGh, now = () => Date.
         fixerRunning: errors.includes('live jobs unreadable') || unscopedWorker ? null : fixerRunning,
         owner: (errors.includes('live jobs unreadable') || unscopedWorker) && !owner ? 'unknown' : owner,
         inCi: null, detail: 'skipped', evidenceErrors, verdictHistory: [] };
-      // Unknown rounds must be inspected. Labels cannot exempt a PR from detail reads.
-      if (round !== null && round < baseCap - 2) {
-        evidenceErrors.push('detail skipped below cap-near threshold; inspect PR evidence and rerun a narrower/operator query');
-      } else {
+      // Labels never affect selection. Reserve detail calls before any comment pagination.
+      const mustDetail = exitPrs.has(p.number) || round === null || round >= baseCap - 1;
+      const readDetail = () => {
+        if (!mustDetail && round < baseCap - 2) {
+          evidenceErrors.push('detail skipped below cap-near threshold; inspect PR evidence and rerun a narrower/operator query');
+        } else {
+          try {
+            const detail = JSON.parse(boundedGh(['pr', 'view', String(p.number), '--repo', repo, '--json',
+              'headRefOid,baseRefOid,files,changedFiles,body,createdAt,statusCheckRollup,commits']));
+            if (!/^[a-f0-9]{40}$/i.test(detail?.headRefOid ?? '') || detail.headRefOid.toLowerCase() !== headSha) {
+              throw failure('detail head identity differs from listing');
+            }
+            if (typeof detail.body !== 'string' || !Number.isFinite(Date.parse(detail.createdAt))
+              || !Array.isArray(detail.statusCheckRollup) || !Array.isArray(detail.commits)) {
+              throw failure('detail fields incomplete');
+            }
+            // Retain selection and ownership from the list, accepting only the detail fields requested.
+            p = { ...p, baseRefOid: detail.baseRefOid, files: detail.files, changedFiles: detail.changedFiles,
+              body: detail.body, createdAt: detail.createdAt, statusCheckRollup: detail.statusCheckRollup, commits: detail.commits };
+            result.detail = 'read';
+            const lastCommit = Array.isArray(p.commits) ? p.commits.at(-1) : null;
+            if (lastCommit) {
+              if (typeof lastCommit.oid === 'string' && lastCommit.oid.toLowerCase() === headSha) {
+                result.minutesSinceHeadChange = minutesSince(lastCommit.committedDate);
+              } else evidenceErrors.push('last commit does not identify the listed head');
+            }
+            const checks = reduceCheckState(p.statusCheckRollup.map(c => c?.status ? c : {
+              ...c, name: c?.context, status: c?.state === 'PENDING' ? 'IN_PROGRESS' : 'COMPLETED',
+              conclusion: c?.state === 'ERROR' ? 'failure' : String(c?.state ?? '').toLowerCase(),
+            }));
+            if (checks.counts.unreadable) evidenceErrors.push('status check evidence unreadable');
+            else result.inCi = checks.state === 'pending';
+          } catch {
+            result.detail = 'error';
+            evidenceErrors.push('PR detail unreadable, head changed, or budget exhausted; inspect PR evidence and rerun a narrower/operator query');
+          }
+        }
+      };
+      const finish = () => {
+        // Comment verification and local suspended-run inspection are independent of detail availability.
+        // Mandatory referrals can appear only in comments, even while a fixer or CI runs.
+        const redTeamJudgmentLabel = labels.some(l => RED_TEAM_JUDGMENT_LABELS.has(l));
         try {
-          const detail = JSON.parse(boundedGh(['pr', 'view', String(p.number), '--repo', repo, '--json',
-            'headRefOid,baseRefOid,files,changedFiles,body,createdAt,statusCheckRollup,commits']));
-          if (!/^[a-f0-9]{40}$/i.test(detail?.headRefOid ?? '') || detail.headRefOid.toLowerCase() !== headSha) {
-            throw failure('detail head identity differs from listing');
+          const readCommentEvidence = () => {
+            if (calls >= MAX_CALLS) throw failure('128-call budget exhausted');
+            const comments = readComments({ number: p.number, repo, exec: commentsExec });
+            if (!Array.isArray(comments) || comments.some(c => typeof c?.body !== 'string' || !c.author?.login || !Number.isFinite(Date.parse(c.createdAt)))) throw failure('comments incomplete');
+            return comments;
+          };
+          let comments;
+          try { comments = readCommentEvidence(); }
+          catch (error) {
+            if (calls >= MAX_CALLS) throw error;
+            comments = readCommentEvidence();
           }
-          if (typeof detail.body !== 'string' || !Number.isFinite(Date.parse(detail.createdAt))
-            || !Array.isArray(detail.statusCheckRollup) || !Array.isArray(detail.commits)) {
-            throw failure('detail fields incomplete');
+          // List + comments cannot verify the ruling issue, comment edits, and card-only heads.
+          // Explicitly withhold automatic grant credit and surface the missing evidence.
+          const standingRuling = null;
+          if (citedGrantHeads(comments).length) evidenceErrors.push('standing ruling unverified; inspect ruling and grant scope before judging');
+          const view = { ...p, repo, comments, standingRuling };
+          const state = liveResultGateState(comments, p.number, headSha, repo, standingRuling);
+          const ruling = redTeamRulingRow(repo, view);
+          const disposition = readRedTeamDisposition({ comments, pr: p.number, head: headSha, repo, setting: CONFIRMED_BREAKS_DEFAULTS, standingRuling });
+          const blocked = ruling || disposition.held.length || disposition.sendBack.length;
+          result.redTeam = { state: blocked ? 'blocked' : labels.includes('red-team:pending') ? 'pending' : state.result ? 'clear' : 'unknown',
+            latestResultId: state.resultId, latestOutcome: state.sendBackOutcome ?? [...state.outcomes].at(-1) ?? null };
+          if (!state.result && redTeamJudgmentLabel) evidenceErrors.push('red-team label lacks live result evidence');
+          const grants = gateRoundGrants(comments, p.number, repo, standingRuling);
+          result.cap = gateRoundCap({ cap: baseCap, grants, roundAt: (at, g) => readReviewRoundAsOf({ repo, pr: p.number, at,
+            head: Number.isInteger(state.headReviewIndex) && state.headReviewIndex < g.index ? headSha : null, readLedgerRows: () => mine }) });
+          if (labels.includes('status:at-round-limit') && (round === null || round < result.cap - 1)) evidenceErrors.push('round-limit label disagrees with round evidence');
+          const trusted = trustedAdvisoryComments(comments);
+          result.verdictHistory = parseAdvisories(trusted).map(a => commentVerdict(trusted[a.index], a));
+          const latest = result.verdictHistory[0];
+          const current = mine.filter(r => r.type === 'verdict').at(-1);
+          result.latestVerdict = latest && advisoryCoversHead({ head: latest.headSha }, headSha) ? latest : null;
+          // No published advisory for this head: the ledger row at this head is the verdict. Any doubt fails closed.
+          if (!result.latestVerdict && current?.coverage?.headSha === headSha) {
+            if (typeof current.verdict === 'string' && current.verdict && Number.isFinite(Date.parse(current.at))) {
+              result.latestVerdict = { accepted: verdictClears(current.verdict), findings: null, lensVerdicts: null,
+                at: new Date(current.at).toISOString(), headSha, evidence: 'ledger' };
+            } else evidenceErrors.push('verdict ledger row malformed');
           }
-          // Retain selection and ownership from the list, accepting only the detail fields requested.
-          p = { ...p, baseRefOid: detail.baseRefOid, files: detail.files, changedFiles: detail.changedFiles,
-            body: detail.body, createdAt: detail.createdAt, statusCheckRollup: detail.statusCheckRollup, commits: detail.commits };
-          result.detail = 'read';
-          const lastCommit = Array.isArray(p.commits) ? p.commits.at(-1) : null;
-          if (lastCommit) {
-            if (typeof lastCommit.oid === 'string' && lastCommit.oid.toLowerCase() === headSha) {
-              result.minutesSinceHeadChange = minutesSince(lastCommit.committedDate);
-            } else evidenceErrors.push('last commit does not identify the listed head');
-          }
-          const checks = reduceCheckState(p.statusCheckRollup.map(c => c?.status ? c : {
-            ...c, name: c?.context, status: c?.state === 'PENDING' ? 'IN_PROGRESS' : 'COMPLETED',
-            conclusion: c?.state === 'ERROR' ? 'failure' : String(c?.state ?? '').toLowerCase(),
-          }));
-          if (checks.counts.unreadable) evidenceErrors.push('status check evidence unreadable');
-          else result.inCi = checks.state === 'pending';
-        } catch {
-          result.detail = 'error';
-          evidenceErrors.push('PR detail unreadable, head changed, or budget exhausted; inspect PR evidence and rerun a narrower/operator query');
-        }
-      }
-      // Comment verification and local suspended-run inspection are independent of detail availability.
-      // Mandatory referrals can appear only in comments, even while a fixer or CI runs.
-      const redTeamJudgmentLabel = labels.some(l => RED_TEAM_JUDGMENT_LABELS.has(l));
-      try {
-        const readCommentEvidence = () => {
-          if (calls >= MAX_CALLS) throw failure('128-call budget exhausted');
-          const comments = readComments({ number: p.number, repo, exec: commentsExec });
-          if (!Array.isArray(comments) || comments.some(c => typeof c?.body !== 'string' || !c.author?.login || !Number.isFinite(Date.parse(c.createdAt)))) throw failure('comments incomplete');
-          return comments;
-        };
-        let comments;
-        try { comments = readCommentEvidence(); }
-        catch (error) {
-          if (calls >= MAX_CALLS) throw error;
-          comments = readCommentEvidence();
-        }
-        // List + comments cannot verify the ruling issue, comment edits, and card-only heads.
-        // Explicitly withhold automatic grant credit and surface the missing evidence.
-        const standingRuling = null;
-        if (citedGrantHeads(comments).length) evidenceErrors.push('standing ruling unverified; inspect ruling and grant scope before judging');
-        const view = { ...p, repo, comments, standingRuling };
-        const state = liveResultGateState(comments, p.number, headSha, repo, standingRuling);
-        const ruling = redTeamRulingRow(repo, view);
-        const disposition = readRedTeamDisposition({ comments, pr: p.number, head: headSha, repo, setting: CONFIRMED_BREAKS_DEFAULTS, standingRuling });
-        const blocked = ruling || disposition.held.length || disposition.sendBack.length;
-        result.redTeam = { state: blocked ? 'blocked' : labels.includes('red-team:pending') ? 'pending' : state.result ? 'clear' : 'unknown',
-          latestResultId: state.resultId, latestOutcome: state.sendBackOutcome ?? [...state.outcomes].at(-1) ?? null };
-        if (!state.result && redTeamJudgmentLabel) evidenceErrors.push('red-team label lacks live result evidence');
-        const grants = gateRoundGrants(comments, p.number, repo, standingRuling);
-        result.cap = gateRoundCap({ cap: baseCap, grants, roundAt: (at, g) => readReviewRoundAsOf({ repo, pr: p.number, at,
-          head: Number.isInteger(state.headReviewIndex) && state.headReviewIndex < g.index ? headSha : null, readLedgerRows: () => mine }) });
-        if (labels.includes('status:at-round-limit') && (round === null || round < result.cap - 1)) evidenceErrors.push('round-limit label disagrees with round evidence');
-        const trusted = trustedAdvisoryComments(comments);
-        result.verdictHistory = parseAdvisories(trusted).map(a => commentVerdict(trusted[a.index], a));
-        const latest = result.verdictHistory[0];
-        const current = mine.filter(r => r.type === 'verdict').at(-1);
-        result.latestVerdict = latest && advisoryCoversHead({ head: latest.headSha }, headSha) ? latest : null;
-        // No published advisory for this head: the ledger row at this head is the verdict. Any doubt fails closed.
-        if (!result.latestVerdict && current?.coverage?.headSha === headSha) {
-          if (typeof current.verdict === 'string' && current.verdict && Number.isFinite(Date.parse(current.at))) {
-            result.latestVerdict = { accepted: verdictClears(current.verdict), findings: null, lensVerdicts: null,
-              at: new Date(current.at).toISOString(), headSha, evidence: 'ledger' };
-          } else evidenceErrors.push('verdict ledger row malformed');
-        }
-        if (!result.latestVerdict && labels.some(l => ['advisory:accepted', 'review:accepted'].includes(l))) evidenceErrors.push('accepted label lacks live verdict evidence');
-        if (result.latestVerdict && current?.coverage?.headSha === headSha && Date.parse(current.at) >= Date.parse(result.latestVerdict.at)
-          && !verdictClears(current.verdict)) result.latestVerdict = { ...result.latestVerdict, accepted: false };
-        const referrals = liveReferralState(view, { repo, pr: p.number, cardReadable });
-        if (referrals.malformed) evidenceErrors.push('referral evidence malformed');
-        const referralTargets = openReferralFindings({ comments, repo, pr: p.number, head: headSha,
-          body: p.body, createdAt: p.createdAt, cardReadable });
-        // These are active open targets. Superseded/dropped findings are excluded by the shared reader.
-        result.openReferrals = [...referralTargets.open, ...referralTargets.disputed]
-          .map(f => ({ key: f.key, ruled: f.state === 'blocked' || (f.rulingIds?.length ?? 0) > 0
-            || referrals.records.some(r => r.rulings.some(rule => rule.key === f.key))
-            || referrals.operatorRulings.some(rule => rule.key === f.key), superseded: false }));
-        result.openSendBacks = openOperatorSendBacks(view);
-        const ignored = ignoredRulings(view, { restackOf: () => false });
-        result.ignoredFindingReturned = (ignored?.effectiveMisses ?? 0) >= 2;
-      } catch { evidenceErrors.push('comment evidence unreadable or budget exhausted'); }
-      try {
-        const suspended = findSuspendedRuns({ repo, pr: p.number, head: headSha, now: start });
-        for (const held of suspended) {
-          const evidence = { runId: held.id, ageMinutes: held.ageMs / 60_000, findings: held.findings };
-          result.suspendedReferralRun ??= evidence;
-          // Require an explicit ruling for every saved finding; an empty thread proves none.
-          const ruled = held.findings.length > 0 && held.findings.every(f =>
-            result.openReferrals?.some(r => r.key === f.key && r.ruled === true));
-          const window = resolveReferralJudgeWindow({ env, log, readFile });
-          if (!ruled && evidence.ageMinutes >= window.value.referralWindowMinutes && (publishAlert || !isUnderTest(process.env))) {
-            const publish = publishAlert ?? publishAttention;
-            // Reserve the run before publication, including across processes. No expiry or liveness probe:
-            // an uncertain publication stays claimed for operator inspection rather than being sent twice.
-            const dir = alertClaimsDir ?? join(resolveRunsDir(), 'referral-judge-alert-claims');
-            mkdirSync(dir, { recursive: true });
-            const store = createActionStore({ root: join(dir, createHash('sha256').update(held.id).digest('hex')), now: () => start });
-            const resource = actionResource(repo, { type: 'pr', id: String(p.number) });
-            const kind = 'suspended-referral-no-ruling';
-            if (store.attempts(resource).some(r => r.kind === kind && r.state === 'terminal' && r.outcome === 'settled')) continue;
-            const claim = store.claim({ resource, kind, owner: `judge-sweep:${process.pid}`, evidence: { runId: held.id, head: headSha } });
-            if (!claim.ok) continue;
-            let rec = claim.record;
-            const sending = store.transition(resource, rec.attempt, { token: rec.ownerToken, rev: rec.rev,
-              from: 'intent', to: 'dispatching', patch: { dispatchingSince: start } });
-            if (!sending.ok) throw Error('referral alert claim lost; inspect run store');
-            rec = sending.record;
-            log(`${repo}#${p.number} NEEDS-YOU run ${held.id}: referral judge referralWindowMinutes=${window.value.referralWindowMinutes} source=${window.sources.referralWindowMinutes}`);
-            publish({ repo, pr: p.number, head: headSha, kind: 'suspended-referral-no-ruling',
-              reason: `PR #${p.number} run ${held.id} awaits referral ruling: ${held.findings.map(f => `${f.key}: ${f.summary}`).join('; ') || 'inspect saved referral findings'}`,
-              pick: `https://github.com/${repo}/pull/${p.number}` });
-            const observed = store.transition(resource, rec.attempt, { token: rec.ownerToken, rev: rec.rev,
-              from: 'dispatching', to: 'observed', patch: { handle: 'needs-you-feed' } });
-            if (!observed.ok) throw Error('referral alert observation lost; inspect run store');
-            rec = observed.record;
-            const settled = store.transition(resource, rec.attempt, { token: rec.ownerToken, rev: rec.rev,
-              from: 'observed', to: 'terminal', patch: { outcome: 'settled' } });
-            if (!settled.ok) throw Error('referral alert settlement lost; inspect run store');
-          }
-        }
-      } catch { evidenceErrors.push('suspended referral run evidence unreadable; inspect run store'); }
-      if (result.detail === 'read' && labels.includes('review:human')) {
+          if (!result.latestVerdict && labels.some(l => ['advisory:accepted', 'review:accepted'].includes(l))) evidenceErrors.push('accepted label lacks live verdict evidence');
+          if (result.latestVerdict && current?.coverage?.headSha === headSha && Date.parse(current.at) >= Date.parse(result.latestVerdict.at)
+            && !verdictClears(current.verdict)) result.latestVerdict = { ...result.latestVerdict, accepted: false };
+          const referrals = liveReferralState(view, { repo, pr: p.number, cardReadable });
+          if (referrals.malformed) evidenceErrors.push('referral evidence malformed');
+          const referralTargets = openReferralFindings({ comments, repo, pr: p.number, head: headSha,
+            body: p.body, createdAt: p.createdAt, cardReadable });
+          // These are active open targets. Superseded/dropped findings are excluded by the shared reader.
+          result.openReferrals = [...referralTargets.open, ...referralTargets.disputed]
+            .map(f => ({ key: f.key, ruled: f.state === 'blocked' || (f.rulingIds?.length ?? 0) > 0
+              || referrals.records.some(r => r.rulings.some(rule => rule.key === f.key))
+              || referrals.operatorRulings.some(rule => rule.key === f.key), superseded: false }));
+          result.openSendBacks = openOperatorSendBacks(view);
+          const ignored = ignoredRulings(view, { restackOf: () => false });
+          result.ignoredFindingReturned = (ignored?.effectiveMisses ?? 0) >= 2;
+        } catch { evidenceErrors.push('comment evidence unreadable or budget exhausted'); }
         try {
-          // A retarget or base advance can change the net files without changing the head.
-          // Unknown base identity cannot reuse a prior non-human result.
-          if (typeof p.baseRefOid !== 'string' || !/^[a-f0-9]{40}$/i.test(p.baseRefOid)) throw failure('base identity unreadable');
-          // Resolve on each observation: both environment and lower cascade layers can change.
-          const humanSurfaces = resolveHumanReviewSurfaces();
-          const policyHash = createHash('sha256').update(JSON.stringify(humanSurfaces.categories)).digest('hex');
-          const key = `${repo}:${headSha}:${p.baseRefOid.toLowerCase()}:${policyHash}`;
-          let human = cache.get(key);
-          if (typeof human !== 'boolean') {
-            if (!Array.isArray(p.files) || p.files.length !== p.changedFiles || !p.files.length
-              || p.files.some(f => typeof f?.path !== 'string' || !f.path)
-              || new Set(p.files.map(f => f.path)).size !== p.files.length) throw failure('net file list incomplete; inspect full diff');
-            const shaped = shape(p.files.map(f => f.path), humanSurfaces);
-            if (typeof shaped?.humanRequired !== 'boolean') throw failure('shape unreadable');
-            human = shaped.humanRequired;
-            cache.set(key, human);
+          const suspended = findSuspendedRuns({ repo, pr: p.number, head: headSha, now: start });
+          for (const held of suspended) {
+            const evidence = { runId: held.id, ageMinutes: held.ageMs / 60_000, findings: held.findings };
+            result.suspendedReferralRun ??= evidence;
+            // Require an explicit ruling for every saved finding; an empty thread proves none.
+            const ruled = held.findings.length > 0 && held.findings.every(f =>
+              result.openReferrals?.some(r => r.key === f.key && r.ruled === true));
+            const window = resolveReferralJudgeWindow({ env, log, readFile });
+            if (!ruled && evidence.ageMinutes >= window.value.referralWindowMinutes && (publishAlert || !isUnderTest(process.env))) {
+              const publish = publishAlert ?? publishAttention;
+              // Reserve the run before publication, including across processes. No expiry or liveness probe:
+              // an uncertain publication stays claimed for operator inspection rather than being sent twice.
+              const dir = alertClaimsDir ?? join(resolveRunsDir(), 'referral-judge-alert-claims');
+              mkdirSync(dir, { recursive: true });
+              const store = createActionStore({ root: join(dir, createHash('sha256').update(held.id).digest('hex')), now: () => start });
+              const resource = actionResource(repo, { type: 'pr', id: String(p.number) });
+              const kind = 'suspended-referral-no-ruling';
+              if (store.attempts(resource).some(r => r.kind === kind && r.state === 'terminal' && r.outcome === 'settled')) continue;
+              const claim = store.claim({ resource, kind, owner: `judge-sweep:${process.pid}`, evidence: { runId: held.id, head: headSha } });
+              if (!claim.ok) continue;
+              let rec = claim.record;
+              const sending = store.transition(resource, rec.attempt, { token: rec.ownerToken, rev: rec.rev,
+                from: 'intent', to: 'dispatching', patch: { dispatchingSince: start } });
+              if (!sending.ok) throw Error('referral alert claim lost; inspect run store');
+              rec = sending.record;
+              log(`${repo}#${p.number} NEEDS-YOU run ${held.id}: referral judge referralWindowMinutes=${window.value.referralWindowMinutes} source=${window.sources.referralWindowMinutes}`);
+              publish({ repo, pr: p.number, head: headSha, kind: 'suspended-referral-no-ruling',
+                reason: `PR #${p.number} run ${held.id} awaits referral ruling: ${held.findings.map(f => `${f.key}: ${f.summary}`).join('; ') || 'inspect saved referral findings'}`,
+                pick: `https://github.com/${repo}/pull/${p.number}` });
+              const observed = store.transition(resource, rec.attempt, { token: rec.ownerToken, rev: rec.rev,
+                from: 'dispatching', to: 'observed', patch: { handle: 'needs-you-feed' } });
+              if (!observed.ok) throw Error('referral alert observation lost; inspect run store');
+              rec = observed.record;
+              const settled = store.transition(resource, rec.attempt, { token: rec.ownerToken, rev: rec.rev,
+                from: 'observed', to: 'terminal', patch: { outcome: 'settled' } });
+              if (!settled.ok) throw Error('referral alert settlement lost; inspect run store');
+            }
           }
-          result.humanRequired = human;
-        } catch { result.humanRequired = null; evidenceErrors.push('shape unavailable; inspect full diff before delegating'); }
-      }
-      return result;
+        } catch { evidenceErrors.push('suspended referral run evidence unreadable; inspect run store'); }
+        if (result.detail === 'read' && labels.includes('review:human')) {
+          try {
+            // A retarget or base advance can change the net files without changing the head.
+            // Unknown base identity cannot reuse a prior non-human result.
+            if (typeof p.baseRefOid !== 'string' || !/^[a-f0-9]{40}$/i.test(p.baseRefOid)) throw failure('base identity unreadable');
+            // Resolve on each observation: both environment and lower cascade layers can change.
+            const humanSurfaces = resolveHumanReviewSurfaces();
+            const policyHash = createHash('sha256').update(JSON.stringify(humanSurfaces.categories)).digest('hex');
+            const key = `${repo}:${headSha}:${p.baseRefOid.toLowerCase()}:${policyHash}`;
+            let human = cache.get(key);
+            if (typeof human !== 'boolean') {
+              if (!Array.isArray(p.files) || p.files.length !== p.changedFiles || !p.files.length
+                || p.files.some(f => typeof f?.path !== 'string' || !f.path)
+                || new Set(p.files.map(f => f.path)).size !== p.files.length) throw failure('net file list incomplete; inspect full diff');
+              const shaped = shape(p.files.map(f => f.path), humanSurfaces);
+              if (typeof shaped?.humanRequired !== 'boolean') throw failure('shape unreadable');
+              human = shaped.humanRequired;
+              cache.set(key, human);
+            }
+            result.humanRequired = human;
+          } catch { result.humanRequired = null; evidenceErrors.push('shape unavailable; inspect full diff before delegating'); }
+        }
+        return result;
+      };
+      return { mustDetail, readDetail, finish };
+    });
+    // All mandatory details precede best-effort details and every PR's comments.
+    for (const pr of pending) if (pr.mustDetail) pr.readDetail();
+    const prs = pending.map(pr => {
+      if (!pr.mustDetail) pr.readDetail();
+      return pr.finish();
     });
     // An unreadable report leaves coverageReport unset; finish then fails closed as "unreadable".
     let report = {};
