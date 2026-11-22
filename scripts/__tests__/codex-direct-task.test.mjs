@@ -1730,16 +1730,21 @@ describe('wait --until-done', () => {
     expect(log).toHaveBeenLastCalledWith('codex-direct-task wait: overall wait timed out; run the same command again');
   });
 
-  it('overall timeout interrupts a pending slice and retains the last result', async () => {
-    vi.useFakeTimers();
-    try {
-      const waitFn = vi.fn().mockResolvedValueOnce(running).mockImplementation(() => new Promise(() => {}));
-      const log = vi.fn();
-      const waiting = waitUntilDone({ jobId: 'job', overallMs: 1000, waitFn, log });
-      await vi.advanceTimersByTimeAsync(1000);
-      expect(await waiting).toEqual(running);
-      expect(log).toHaveBeenLastCalledWith('codex-direct-task wait: overall wait timed out; run the same command again');
-    } finally { vi.useRealTimers(); }
+  it('caps each slice to the time left in the overall budget, then times out with the last result', async () => {
+    let t = 0;
+    const now = () => t;
+    const waitFn = vi.fn(async ({ maxMs }) => { t += maxMs; return running; });
+    const log = vi.fn();
+    expect(await waitUntilDone({ jobId: 'job', sliceMs: 400, overallMs: 1050, waitFn, log, now })).toEqual(running);
+    expect(waitFn.mock.calls.map(c => c[0].maxMs)).toEqual([400, 400, 250]);
+    expect(log).toHaveBeenLastCalledWith('codex-direct-task wait: overall wait timed out; run the same command again');
+  });
+
+  it('clamps an over-large overall budget to 2 h instead of overflowing timers', async () => {
+    let t = 0;
+    const waitFn = vi.fn(async ({ maxMs }) => { t += maxMs; return running; });
+    await waitUntilDone({ jobId: 'job', overallMs: 2147483648, waitFn, log: vi.fn(), now: () => t });
+    expect(t).toBe(7200000);
   });
 
   it.each([[1, 'failed'], [2, 'wait-error']])('terminal code %s (%s) is passed through immediately', async (code, status) => {

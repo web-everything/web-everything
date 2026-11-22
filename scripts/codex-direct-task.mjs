@@ -1713,21 +1713,15 @@ export async function waitUntilDone({
   if (typeof overallMs === 'boolean' || !Number.isFinite(budget) || budget <= 0) {
     throw new RangeError('codex-direct-task wait: --overall-ms must be a positive finite number');
   }
+  // No outer timer: each slice is capped to the time left, so waitForJob's own deadline guard owns cancellation
+  // (an outer race would leave the slice running). The budget is clamped to 2 h so it never nears timer limits.
+  const total = Math.min(budget, 7200000);
   const started = now();
   let last = { status: 'running', exitCode: null, resultPath: null, code: 75 };
-  const expired = Symbol('overall wait exhausted');
-  for (let slice = 1; now() - started < budget; slice++) {
-    let timer;
-    let result;
-    try {
-      result = await Promise.race([
-        waitFn({ jobId, maxMs }),
-        new Promise(resolve => { timer = setTimeout(() => resolve(expired), budget - (now() - started)); }),
-      ]);
-    } finally {
-      clearTimeout(timer);
-    }
-    if (result === expired) break;
+  for (let slice = 1; now() - started < total; slice++) {
+    const remaining = total - (now() - started);
+    if (remaining < 250) break;
+    const result = await waitFn({ jobId, maxMs: Math.min(maxMs, remaining) });
     last = result;
     if (last.code !== 75) return last;
     log(`codex-direct-task wait: job ${jobId} still running (slice ${slice}, elapsed ${Math.floor((now() - started) / 1000)}s)`);
