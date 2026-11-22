@@ -106,6 +106,10 @@ for (let i = 0; i < argv.length; i += 1) {
   // #3857 — the model-tier table's chosen (or reasoned-override) model, injected by buildAgentArgv. A real
   // claude --help flag (takes a separate value); recorded through the call log's argv, not interpreted.
   if (a === '--model' || a === '-m' || a === '--effort') { i += 1; extraFlagCount += 1; continue; }
+  // PR #7332 — the lean fix/ci-heal session flags (real claude --help options): \`--tools <list>\` takes one
+  // value; the other three are bare switches. Recorded through the call log's argv, not interpreted.
+  if (a === '--tools') { i += 1; extraFlagCount += 1; continue; }
+  if (a === '--restricted' || a === '--strict-mcp-config' || a === '--disable-slash-commands') { extraFlagCount += 1; continue; }
   // NO \`--\` END-OF-OPTIONS BRANCH, deliberately. \`buildAgentArgv\` never emits one, so a branch here would
   // model the very escape hatch dispatch-lane-io.mjs says it DECLINED to bet on — a fidelity claim with
   // nothing checking it. The guard it chose instead (refuse a leading-dash brief) is what gets exercised.

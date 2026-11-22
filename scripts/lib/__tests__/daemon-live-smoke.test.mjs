@@ -1847,7 +1847,8 @@ describe('DISPATCH_DRY_RUN_SCRIPT — real child, proves it catches the pre-fix 
     // copied, and the pass-level part (live `gh` reads) is skipped — this test needs no GitHub credential.
     const copyTree = () => {
       const dest = mkdtempSync(join(tmpdir(), 'dispatch-dry-run-'));
-      for (const rel of ['scripts', 'skills-src', 'schemas', 'src/_data', 'docs/agent/reviewer-expectations.md', 'package.json', '.gitignore']) {
+      for (const rel of ['scripts', 'skills-src', 'schemas', 'src/_data', 'docs/agent/reviewer-expectations.md', 'package.json', '.gitignore', '.claude/settings.json']) {
+        // PR #7332 — fix/ci-heal dispatches derive their lean hooks from the repo's own .claude/settings.json.
         cpSync(join(REPO_ROOT, rel), join(dest, rel), {
           recursive: true,
           filter: (src) => !src.includes(`${sep}node_modules`) && !src.includes(`${sep}.git${sep}`) && !src.endsWith(`${sep}.git`),

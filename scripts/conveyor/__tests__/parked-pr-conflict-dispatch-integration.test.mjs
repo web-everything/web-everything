@@ -39,6 +39,7 @@ import { execFileSync } from 'node:child_process';
 import { withRealRepo, git } from '../../operations/__tests__/helpers/real-repo.mjs';
 import { withFakeClaude } from '../../operations/__tests__/helpers/fake-claude.mjs';
 import { defaultSpawnAgent, defaultListAgents, DISPATCHED_AGENT_SYSTEM_PROMPT_FILE } from '../../operations/dispatch-lane-io.mjs';
+import { LEAN_FIX_HOOKS_SETTINGS, LEAN_FIX_TOOLS } from '../../operations/minimal-context-provider.mjs';
 import { stopSession } from '../../operations/dispatch-abort.mjs';
 import { buildAuthorActorMarker } from '../../lib/review-independence.mjs';
 
@@ -252,7 +253,10 @@ describe('#xu2krte end-to-end — a REAL merge conflict, dispatched through the 
         // bg-isolation override every dispatch path now applies (isolateDispatchSession).
         expect(fake.lastArgv()).toEqual([
           '--bg', '-n', 'fix-8802',
-          '--settings', JSON.stringify({ env: { WE_CONVEYOR_WORKER: '1' }, worktree: { bgIsolation: 'none' } }),
+          // PR #7332 — a fix dispatch is a lean repair session: repo hooks + tool allowlist ride `--settings`,
+          // and the restricted-session flags follow it.
+          '--settings', JSON.stringify({ env: { WE_CONVEYOR_WORKER: '1' }, worktree: { bgIsolation: 'none' }, ...LEAN_FIX_HOOKS_SETTINGS() }),
+          '--restricted', '--tools', LEAN_FIX_TOOLS, '--strict-mcp-config', '--disable-slash-commands',
           '--append-system-prompt-file', DISPATCHED_AGENT_SYSTEM_PROMPT_FILE,
           // WE routing policy — every fresh launch also carries an explicit per-operation --effort (fix → high).
           '--effort', 'high',

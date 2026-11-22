@@ -19,6 +19,13 @@ import {
 import { CONFLICT_LABEL } from '../parked-pr-conflict-watch.mjs';
 import { resolvePrWorkUnit } from '../pr-work-unit.mjs';
 import { DISPATCHED_AGENT_SYSTEM_PROMPT_FILE, dispatchSessionCwd } from '../../operations/dispatch-lane-io.mjs';
+import { LEAN_FIX_HOOKS_SETTINGS, LEAN_FIX_TOOLS } from '../../operations/minimal-context-provider.mjs';
+
+// A fix dispatch is a lean repair session (PR #7332): its `--settings` carries the repo hooks + tool allowlist
+// beside the env/worktree pair, and its argv adds the restricted-session flags. Derive both from the real
+// helper so these assertions track the repo settings, never a hand-copied hook blob.
+const leanFixSettings = (env) => JSON.stringify({ env, worktree: { bgIsolation: 'none' }, ...LEAN_FIX_HOOKS_SETTINGS() });
+const LEAN_FIX_FLAGS = ['--restricted', '--tools', LEAN_FIX_TOOLS, '--strict-mcp-config', '--disable-slash-commands'];
 import { buildAuthorActorMarker } from '../../lib/review-independence.mjs';
 
 // Existing resume fixtures have no completion record; never consult the host store.
@@ -873,7 +880,8 @@ describe('dispatchFix — the composition: plan → fill → mint → spawn', ()
       '--bg',
       '-n', 'fix-1764',
       // xgqz204 — the worker marker always rides `--settings` (a `--bg` session never sees ambient env).
-      '--settings', JSON.stringify({ env: { WE_CONVEYOR_WORKER: '1' }, worktree: { bgIsolation: 'none' } }),
+      '--settings', leanFixSettings({ WE_CONVEYOR_WORKER: '1' }),
+      ...LEAN_FIX_FLAGS,
       // #3606 — the standing-identity system prompt, without which a correctly-filled brief reads as an
       // unfilled template and the agent self-aborts (live 3/3: fix-2127/fix-2130/fix-2003).
       '--append-system-prompt-file', DISPATCHED_AGENT_SYSTEM_PROMPT_FILE,
@@ -910,7 +918,7 @@ describe('dispatchFix — the composition: plan → fill → mint → spawn', ()
     // targets the SAME directory this dispatch actually starts in.
     expect(resolveSettingsEnv).toHaveBeenCalledWith(dispatchSessionCwd('sid', { root: '/repo' }));
     expect(calls[0]).toContain('--settings');
-    expect(calls[0][calls[0].indexOf('--settings') + 1]).toBe(JSON.stringify({ env: { PATH: '/shim:/usr/bin', WE_CONVEYOR_WORKER: '1' }, worktree: { bgIsolation: 'none' } }));
+    expect(calls[0][calls[0].indexOf('--settings') + 1]).toBe(leanFixSettings({ PATH: '/shim:/usr/bin', WE_CONVEYOR_WORKER: '1' }));
   });
 
   it('#x8mpubm — the REAL default resolveSettingsEnv (unconfigured host) adds nothing beyond the worker marker (xgqz204)', () => {
@@ -924,7 +932,7 @@ describe('dispatchFix — the composition: plan → fill → mint → spawn', ()
         // opt-in gated on WE_GITHUB_APP_* and must stay a safe no-op on this (unconfigured) test host.
       },
     );
-    expect(calls[0][calls[0].indexOf('--settings') + 1]).toBe(JSON.stringify({ env: { WE_CONVEYOR_WORKER: '1' }, worktree: { bgIsolation: 'none' } }));
+    expect(calls[0][calls[0].indexOf('--settings') + 1]).toBe(leanFixSettings({ WE_CONVEYOR_WORKER: '1' }));
   });
 
   it('attaches a carried-forward `resumeAttempt` (from a prior tryResumeFix call) to the reported result, without re-attempting anything itself', () => {
