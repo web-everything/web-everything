@@ -1,6 +1,8 @@
 /** Production adapter for a drain's held same-head MQ failure. No work runs at import time. */
 import { execFileSyncThrottled } from './gh-throttle.mjs';
-import { createMqLiveReader, readMqTimeline, decideMqSameHead } from './drain-queue-safety.mjs';
+import { ciJobLogApiArgs } from './gh-ci-log.mjs';
+import { readNormalizedJobLog } from './ansi-log-text.mjs';
+import { createMqLiveReader, readMqTimeline, decideMqSameHead, createMqSameHeadRefreshStore } from './drain-queue-safety.mjs';
 import { collectMqFailureEvidence } from './mq-failure-evidence.mjs';
 import { createMqFailureLedger } from './mq-failure-ledger.mjs';
 import { drainMqFailureRecovery } from './drain-mq-failure-recovery.mjs';
@@ -14,7 +16,7 @@ const safe = text => String(text).replace(/[\x00-\x1f\x7f-\x9f\u2028\u2029]/g, '
  * Inject exec and ledger for hermetic fixtures. Limits are hard ceilings, not policy settings.
  */
 export function createDrainMqFailureRecoveryIo({ exec = execFileSyncThrottled,
-  ledger = createMqFailureLedger(), maxCalls = 128 } = {}) {
+  ledger = createMqFailureLedger(), refreshStore = createMqSameHeadRefreshStore(), maxCalls = 128 } = {}) {
   const limit = Number.isSafeInteger(maxCalls) && maxCalls > 0 ? Math.min(maxCalls, 128) : 128;
   const liveExec = createMqLiveReader(exec);
   let calls = 0;
@@ -45,7 +47,8 @@ export function createDrainMqFailureRecoveryIo({ exec = execFileSyncThrottled,
     { input: JSON.stringify(body) }));
   return {
     ledger,
-    forRoute: () => createDrainMqFailureRecoveryIo({ exec, ledger, maxCalls: limit }),
+    forRoute: () => createDrainMqFailureRecoveryIo({ exec, ledger, refreshStore, maxCalls: limit }),
+    readRefreshCount: ({ repo, pr, head }) => refreshStore.has(`${repo}#${pr}@${head}`) ? 1 : 0,
     readTimeline: ({ repo, pr }) => readMqTimeline({ repo, pr, exec: request }),
     readPr: ({ repo, pr }) => json(['pr', 'view', String(pr), '--repo', repo, '--json', 'headRefOid,mergeStateStatus,baseRefName']),
     readLabels({ repo, pr }) {
@@ -77,8 +80,9 @@ export function createDrainMqFailureRecoveryIo({ exec = execFileSyncThrottled,
             && ['success', 'skipped', 'neutral', 'cancelled', 'failure'].includes(job.conclusion)) };
         },
         readJobLog({ repo, jobId }) {
-          const text = request('gh', ['api', `repos/${repo}/actions/jobs/${jobId}/logs`], { maxBuffer: 256 * 1024 });
-          return { text, complete: typeof text === 'string' && Buffer.byteLength(text) <= 256 * 1024 };
+          const normalized = readNormalizedJobLog(request('gh', ciJobLogApiArgs(`repos/${repo}/actions/jobs/${jobId}/logs`), { maxBuffer: 256 * 1024 }));
+          return { text: normalized.ok ? normalized.text : '',
+            complete: normalized.ok && Buffer.byteLength(normalized.text) <= 256 * 1024 };
         },
       } });
     },
@@ -103,21 +107,26 @@ export async function routeMqFailureOnHold({ repo, pr, head, guard,
     const identity = { repo, pr, head };
     if (!validIdentity(identity) || guard?.hold !== true || typeof guard.line !== 'string'
       || !guard.line.startsWith('mq-same-head-failed:')) return finish(false, 'No eligible same-head MQ hold');
+    if (guard.recoveryAction === 'refresh-first') return finish(false, 'Single refresh first; admission remains held');
     const active = io.forRoute ? io.forRoute() : io;
     const timeline = await active.readTimeline({ repo, pr });
     if (timeline?.error || timeline?.hasPreviousPage !== false || !Array.isArray(timeline?.nodes)
       || timeline.nodes.length > 100) return finish(false, 'Incomplete timeline; operator inspection required');
-    // Reuse the drain's second-parent binding and retry exhaustion decision. Unknown events/reasons,
-    // repeated failures and a queue re-entry after failure cannot authorize a recovery route.
+    // Reuse the drain's second-parent binding. Repeated bound failures go to the fixer;
+    // unknown history still cannot cause a mutation or publication.
     const decision = decideMqSameHead({ ...identity, timeline });
     if (!decision.hold || !decision.line?.endsWith(' — failed_checks'))
-      return finish(false, 'No single eligible failed_checks removal; operator inspection required');
+      return finish(false, 'No eligible failed_checks removal; operator inspection required');
     const removals = timeline.nodes.filter(event => event?.__typename === 'RemovedFromMergeQueueEvent'
       && event.reason?.trim().toLowerCase() === 'failed_checks'
       && event.beforeCommit?.parents?.nodes?.[1]?.oid === head);
-    const event = removals[0];
-    if (removals.length !== 1 || !oid(event?.beforeCommit?.oid)
+    const event = removals.at(-1);
+    if (!removals.length || !oid(event?.beforeCommit?.oid)
       || !Number.isFinite(Date.parse(event?.createdAt))) return finish(false, 'Unbound removal evidence; operator inspection required');
+    const refreshCount = await active.readRefreshCount(identity);
+    if (refreshCount !== 0 && refreshCount !== 1)
+      return finish(false, 'Refresh ledger unreadable; operator inspection required');
+    const retriesExhausted = refreshCount === 1;
     const live = await active.readPr({ repo, pr });
     if (live?.headRefOid !== head || live.mergeStateStatus !== 'CLEAN' || live.baseRefName !== 'main')
       return finish(false, 'Live head or CLEAN main-base evidence unavailable; operator inspection required');
@@ -128,7 +137,8 @@ export async function routeMqFailureOnHold({ repo, pr, head, guard,
         throw new Error('Head or merge state changed; operator inspection required');
     };
     const result = await drainMqFailureRecovery({ removal,
-      hold: { reason: 'mq-same-head-failed', historyComplete: true, mergeState: 'CLEAN', retriesExhausted: false },
+      hold: { reason: 'mq-same-head-failed', historyComplete: true, mergeState: 'CLEAN', retriesExhausted,
+        forceFixer: retriesExhausted || guard.recoveryAction === 'fixer' || removals.length > 1 },
       dryRun: false, ledger: active.ledger,
       io: {
         collectEvidence: args => active.collectEvidence(args),
