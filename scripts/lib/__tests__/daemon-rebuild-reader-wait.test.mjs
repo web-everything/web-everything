@@ -199,11 +199,12 @@ function plannedFixture(f) {
 
 const mutationCases = [
   ['in-progress-rollback', f => writeRebuildState(f.root, { inProgress: {
-    target: f.head, prevHead: f.old, startedAt: '2000-01-01T00:00:00Z',
+    pid: 999999, host: hostname(), target: f.head, prevHead: f.old, startedAt: '2000-01-01T00:00:00Z',
+    inputsKey: 'fixture', mainSha: f.head, applied: [], verified: false,
   } }, f.env), f => expect(f.git(['rev-parse', 'HEAD'])).toBe(f.old)],
   ['unverified-rollback', f => writeRebuildState(f.root, { unverified: { head: f.head, prevHead: f.old } }, f.env),
     f => expect(f.git(['rev-parse', 'HEAD'])).toBe(f.old)],
-  ['quarantine-reset', f => writeRebuildState(f.root, { quarantine: { prevHead: f.old } }, f.env),
+  ['quarantine-reset', f => writeRebuildState(f.root, { quarantine: { prevHead: f.old, reason: 'fixture-rollback' } }, f.env),
     f => expect(f.git(['rev-parse', 'HEAD'])).toBe(f.old)],
   ['wrong-branch-heal', f => f.git(['checkout', '-qb', 'ops/review-requests']),
     f => expect(f.git(['symbolic-ref', '--short', 'HEAD'])).toBe('main')],
@@ -232,13 +233,14 @@ const mutationCases = [
   }, f => expect(fs.existsSync(join(f.root, 'backlog/xabc123-sidecar.md'))).toBe(false)],
   ['ready-candidate-adopt', f => {
     const plan = plannedFixture(f);
-    writeReadyCandidate(f.root, { prevHead: f.head, adopt: plan }, f.env);
+    writeReadyCandidate(f.root, { prevHead: f.head, adopt: plan, kind: 'candidate',
+      tree: f.git(['rev-parse', `${plan.finalSha}^{tree}`]), passedAt: new Date().toISOString() }, f.env);
     vi.spyOn(adoption, 'matchReadyCandidate').mockReturnValue({ adopt: plan, dropRefs: [], match: 'exact' });
     vi.spyOn(adoption, 'finalizeRebuild').mockResolvedValue({ moved: true, adopted: true });
   }, () => expect(adoption.finalizeRebuild).toHaveBeenCalledOnce()],
   ['skip-unrelated-adopt', f => {
     plannedFixture(f);
-    writeRebuildState(f.root, { adopted: { head: f.head } }, f.env);
+    writeRebuildState(f.root, { adopted: { head: f.head, inputsKey: 'fixture', mainSha: f.head, applied: [], at: new Date().toISOString() } }, f.env);
     f.args.skipCheck = () => ({ skip: true, reason: 'fixture' });
     vi.spyOn(adoption, 'finalizeRebuild').mockResolvedValue({ moved: true, adopted: true });
   }, () => expect(adoption.finalizeRebuild).toHaveBeenCalledOnce()],

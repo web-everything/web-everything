@@ -72,9 +72,9 @@ describe('prepare-124 S3 — reporter folds traces in', () => {
       return r;
     };
     const clean = [{ k: 'read', p: join(root, 'package.json') }];
-    for (let i = 0; i < 3; i += 1) finish({}, clean);
+    for (let i = 0; i < 3; i += 1) finish({ WE_TEST_CACHE_TRACE: '1' }, clean);
     expect(readAdmission(dir, name)).toMatchObject({ cleanRuns: 3, status: 'clean', admitted: true });
-    const denied = finish({}, [{ k: 'spawn', kind: 'spawnSync', cmd: 'git', args: ['status'], cwd: root }]);
+    const denied = finish({ WE_TEST_CACHE_TRACE: '1' }, [{ k: 'spawn', kind: 'spawnSync', cmd: 'git', args: ['status'], cwd: root }]);
     expect(readAdmission(dir, name)).toMatchObject({ cleanRuns: 0, status: 'denied', admitted: false, reasons: ['checkout-cwd: git'] });
     expect(existsSync(join(dir, 'traces', denied.runId))).toBe(false);
     const ci = tmp();

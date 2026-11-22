@@ -1,6 +1,6 @@
 /** PR #5940: repeated contention and recovered swaps must not flood coordination events. */
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
-import { tmpdir } from 'node:os';
+import { hostname, tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { rebuildClone } from '../../../lib/daemon-rebuild/rebuild.mjs';
 import { writeRebuildState } from '../../../lib/daemon-rebuild/state.mjs';
@@ -49,7 +49,8 @@ export default {
       if (!locked.ok) violations.push('fixture did not acquire its read lock');
 
       writeRebuildState(root, {
-        inProgress: { target: head, prevHead: 'a'.repeat(40), verified: true, startedAt: '2000-01-01T00:00:00Z' },
+        inProgress: { pid: process.pid, host: hostname(), target: head, prevHead: 'a'.repeat(40), verified: true,
+          startedAt: '2000-01-01T00:00:00Z', inputsKey: 'recovered-inputs', mainSha: head, applied: [] },
       }, env);
       const recovered = await rebuildClone(options);
       if (recovered.reason !== 'recovered-adopted' || recovered.moved !== false || !recovered.adopted) {

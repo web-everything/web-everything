@@ -136,11 +136,12 @@ import { smokeLoadFactor } from '../lib/daemon-live-smoke.mjs';
 import { loadVerifyRecoverySettings } from '../lib/verify-recovery-settings.mjs';
 import { randomUUID, randomBytes } from 'node:crypto';
 import { readVerifyMarker, VERIFY_FILENAME, verifyFinishBody, verificationInfrastructureFailure, VERIFY_MARKER_NONCE_ENV, markerNonceSuffix } from '../lib/lane-verify.mjs';
+import { localChangedSet, relatedSelection, shellQuote } from '../lib/verify-lane-gate.mjs';
+import { loadVerifySettingsFile, resolveVerifySettings } from '../lib/verify-settings.mjs';
 import { writeAllSync } from '../lib/write-all-sync.mjs';
 import { resolveCeilingMs as resolveAdmissionCeilingMs } from '../readiness/heavy-admission.mjs';
 import { resolveChildTimeoutMs } from '../lib/bounded-child.mjs';
 import { branchMatchesQueueIds, isQueueScopeEnabled, readScopedQueueIds } from './queue-scope.mjs';
-import { loadVerifySettingsFile, resolveVerifySettings } from '../lib/verify-settings.mjs';
 
 /** Several multiples of the gate's documented 150-350s normal range — generous on purpose (see file header):
  *  a slow-but-healthy GATE run under contention must never be mistaken for a stuck one. Applies ONLY to the
@@ -372,7 +373,7 @@ function ownsMarker(current, expected) {
   return !expected.startedAt || current.startedAt === expected.startedAt;
 }
 
-/** A killed child cannot write its result. Settle only the still-owned request; never requeue it silently. */
+/** A killed child cannot write its result. Settle only the still-owned request before considering a capped retry. */
 export function recordKilledVerification(dir, expected, error, ceilingMs) {
   const infrastructure = verificationInfrastructureFailure({ exitCode: error?.status, signal: error?.signal,
     timedOutPhase: error?.timedOutPhase, ceilingMs });
@@ -392,6 +393,86 @@ export function recordKilledVerification(dir, expected, error, ceilingMs) {
   const tmp = `${path}.${process.pid}.tmp`;
   writeFileSync(tmp, JSON.stringify(finished, null, 2) + '\n');
   renameSync(tmp, path);
+}
+
+/** Keep the tail verbatim, but refuse retry when rebuilding would discard execution policy. */
+function gateTail(command = '') {
+  let quote = null, word = '';
+  const words = [];
+  const validate = () => {
+    const start = words[0] === 'node' && /(?:^|\/)verify-shard-run\.mjs$/.test(words[1] ?? '')
+      ? words.indexOf('--') + 1 : 0;
+    const gate = words.slice(start);
+    if (gate[0] !== 'npx' || gate[1] !== 'vitest' || !['related', 'run'].includes(gate[2])
+      || !gate.slice(3).some(w => !w.startsWith('-'))) {
+      throw new Error('ceiling recovery requires a selected default Vitest gate');
+    }
+  };
+  const finishWord = () => {
+    // Only options produced by the default gate may be replaced by the fallback.
+    // Config/project/filter (and unknown) options require an explicit retry instead.
+    if (word.startsWith('-') && !/^(?:--|--run|--passWithNoTests|--(?:testTimeout|hookTimeout|shards|parallel|budget-ms)=\d+)$/.test(word)) {
+      throw new Error('ceiling recovery cannot discard custom gate options; retry the explicit gate');
+    }
+    if (word) words.push(word);
+    word = '';
+  };
+  for (let i = 0; i < command.length; i++) {
+    const c = command[i];
+    if (c === '\\' && quote !== "'") {
+      if (++i >= command.length) throw new Error('incomplete gate escape');
+      word += command[i];
+    } else if (quote) {
+      if (c === quote) quote = null;
+      else word += c;
+    } else if (c === "'" || c === '"') quote = c;
+    else if (command.slice(i, i + 2) === '&&') { finishWord(); validate(); return ` ${command.slice(i)}`; }
+    else if (/\s/.test(c)) finishWord();
+    else if (/[|;&<>$`]/.test(c)) throw new Error('unsupported gate operator');
+    else word += c;
+  }
+  if (quote) throw new Error('incomplete gate quote');
+  finishWord();
+  validate();
+  return '';
+}
+
+/** Requeue only the settled, owned head once. The marker is durable dedupe; jobs also key on afterJob. */
+export function requeueGateCeiling({ dir, headSha, afterJob, runId, requestStartedAt, timedOutPhase, ceilingMs,
+  enqueue, readState = readLaneState, writeMarker = value => {
+    const gitDir = tryGit(['rev-parse', '--absolute-git-dir'], dir) || join(dir, '.git');
+    const path = join(gitDir, VERIFY_FILENAME), tmp = `${path}.${process.pid}.tmp`;
+    writeFileSync(tmp, JSON.stringify(value) + '\n'); renameSync(tmp, path);
+  }, fallbackGate = () => {
+    const runGit = args => readGit(args, { cwd: dir, encoding: 'utf8', timeout: 5000, maxBuffer: 8 * 1024 * 1024 });
+    const targets = localChangedSet({ runGit })?.changedFiles;
+    if (!targets) throw new Error('changed files unavailable');
+    const settings = resolveVerifySettings({ fileConfig: loadVerifySettingsFile(), env: process.env }).values;
+    const selection = relatedSelection({ targets, runGit, readRepoFile: p => readFileSync(join(dir, p), 'utf8'), settings, forceFallback: true });
+    const command = selection.tests.length ? `npx vitest run ${selection.tests.map(shellQuote).join(' ')} --passWithNoTests` : "echo 'verify-lane: no selected or named suites'";
+    return { selection, command };
+  } }) {
+  if (timedOutPhase !== 'gate' || !afterJob || !enqueue) return false;
+  try {
+    const { marker, headSha: currentHead } = readState(dir);
+    if (!marker || marker.gateUncapped || marker.gateExplicit || currentHead !== headSha || marker.sha !== headSha || marker.requeue
+      || !['running', 'infrastructure-failure'].includes(marker.status)
+      || (marker.selection?.status ?? marker.phases?.selection?.status) === 'capped-fallback'
+      || (marker.runId ? marker.runId !== runId : requestStartedAt && marker.startedAt !== requestStartedAt)) return false;
+    const tail = gateTail(marker.suites);
+    const { selection, command } = fallbackGate();
+    const requeue = { afterJob, afterSha: headSha, reason: 'gate-ceiling', ceilingMs,
+      from: marker.selection?.status ?? marker.phases?.selection?.status ?? 'unknown', to: 'capped-fallback', tests: selection.tests.length };
+    const next = { ...marker, status: 'running', finishedAt: null, exitCode: null, infrastructure: undefined,
+      suites: command + tail, selection: { ...selection, tests: selection.tests.length }, requeue };
+    // Prove the marker can be written before queueing. Dedupe is committed only after enqueue succeeds.
+    const fresh = readState(dir);
+    if (fresh.headSha !== headSha || JSON.stringify(fresh.marker) !== JSON.stringify(marker)) return false;
+    writeMarker(marker);
+    enqueue(next);
+    writeMarker(next);
+    return true;
+  } catch { return false; }
 }
 
 function parseFlags(argv) {
@@ -648,6 +729,7 @@ export function runLaneGate({ pool, lane, dir, headSha, marker, runId, spawnGate
   if (marker.suites) args.push(`--gate=${marker.suites}`);
   // Preserve the request's execution policy in both in-process and detached gate jobs.
   if (marker.local === true) args.push('--local');
+  if (marker.gateUncapped === true) args.push('--gate-uncapped');
   let gate;
   try { gate = spawnGate(args, {
     onSpawn: (pid) => { try { onSpawn?.(pid, logPath); } catch {} },
@@ -851,8 +933,8 @@ export async function runVerifyDispatch({ dryRun = false, spawnGate = spawnGateB
     const gate = runLaneGate({ pool, lane, dir, headSha, marker, runId, spawnGate, log, gateCeiling,
       onSpawn: (pid, path) => { entry.pid = pid; entry.logPath = path; } });
     return gate.then(
-      value => settle({ status: 'fulfilled', value }, { pool, lane, dir, headSha, gateCeiling }),
-      reason => settle({ status: 'rejected', reason }, { pool, lane, dir, headSha, gateCeiling }),
+      value => settle({ status: 'fulfilled', value }, { pool, lane, dir, headSha, gateCeiling, marker, runId }),
+      reason => settle({ status: 'rejected', reason }, { pool, lane, dir, headSha, gateCeiling, marker, runId }),
     ).catch((error) => {
       // Settlement (including marker reads/logging) must never leave an unhandled rejection.
       try { log(`  ⚠ ${pool}/lane-${lane}: settlement failed (non-fatal): ${error.message}`); } catch {}
@@ -866,7 +948,7 @@ export async function runVerifyDispatch({ dryRun = false, spawnGate = spawnGateB
     });
   });
 
-  function settle(result, { pool, lane, dir, headSha, gateCeiling }) {
+  function settle(result, { pool, lane, dir, headSha, gateCeiling, marker, runId }) {
     if (result.status === 'fulfilled') {
       if (awaitSettle) dispatched.push({ pool, lane, sha: headSha });
       return;
@@ -891,6 +973,11 @@ export async function runVerifyDispatch({ dryRun = false, spawnGate = spawnGateB
       const phase = e.timedOutPhase || 'gate';
       const ceilingMs = phase === 'queue' ? QUEUE_PHASE_CEILING_MS : gateCeiling.ms;
       log(`  ⚠ ${pool}/lane-${lane}: verify-lane exceeded the ${ceilingMs}ms ${phase}-phase ceiling — killed (tree included). Recorded infrastructure failure for the still-owned request; inspect the cause before an explicit retry.`);
+      if (requeueGateCeiling({ dir, headSha, afterJob: runId, runId, requestStartedAt: marker.startedAt,
+        timedOutPhase: phase, ceilingMs, enqueue: () => {} })) {
+        log(`  ↻ ${pool}/lane-${lane}: gate ceiling — queued capped-fallback after ${runId}`);
+        return;
+      }
       recordFailure({ pool, lane, sha: headSha, timedOut: true, timedOutPhase: phase, infrastructure: markerFor(dir)?.infrastructure });
     } else if (status === 2) {
       if (awaitSettle) dispatched.push({ pool, lane, sha: headSha, red: true });

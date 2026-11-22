@@ -1,0 +1,119 @@
+/** One strict policy for evidence reads in every rebuild launch.
+ * Legacy entry points consult the async scope too, so adding an indirect caller cannot
+ * silently downgrade tick-start children or inline rebuilds.
+ */
+import { readFileSync } from 'node:fs';
+import { readRebuildStateStrict, readReadyCandidateStrict } from './state.mjs';
+import { readPendingAdoptionsStrict } from '../overlay-adoption.mjs';
+import { overlayFilePath } from '../daemon-overlays.mjs';
+import { starvePath } from './lease.mjs';
+import { requestPath, watchPath } from '../daemon-force-adopt.mjs';
+import { pendingPath } from '../overlay-drop-pending.mjs';
+import { daemonStateDir } from '../daemon-last-good.mjs';
+import { join } from 'node:path';
+
+export class RebuildEvidenceError extends Error {
+  constructor(cause) { super('state-unreadable: repair persisted evidence before retrying', { cause }); }
+}
+export function createRebuildReaders({ strict = false, read = readFileSync } = {}) {
+  if (!strict) return undefined;
+  const checked = fn => (...args) => {
+    try { return fn(...args); } catch (cause) { throw new RebuildEvidenceError(cause); }
+  };
+  const json = (file, absent) => {
+    let text;
+    try { text = read(file, 'utf8'); } catch (e) { if (e.code === 'ENOENT') return absent; throw e; }
+    return JSON.parse(text);
+  };
+  const object = r => r !== null && typeof r === 'object' && !Array.isArray(r);
+  const text = r => typeof r === 'string' && r.length > 0;
+  const date = r => text(r) && Number.isFinite(Date.parse(r));
+  const readers = {
+    forceRequest: checked((root, env) => {
+      const r = json(requestPath(root, env), undefined);
+      if (r !== undefined && (!object(r) || !['daemon', 'ruling', 'quote', 'sha'].every(k => text(r[k]))
+        || !date(r.requestedAt) || !date(r.expiresAt))) throw new Error('Invalid force request');
+      return r ?? null;
+    }),
+    forceWatch: checked((root, env) => {
+      const r = json(watchPath(root, env), undefined);
+      if (r !== undefined && (!object(r) || !['daemon', 'ruling', 'sha'].every(k => text(r[k]))
+        || !date(r.startedAt) || !Number.isSafeInteger(r.ticksLeft) || r.ticksLeft < 0
+        || !Number.isSafeInteger(r.bad) || r.bad < 0 || !(r.lastGood === null || object(r.lastGood)))) {
+        throw new Error('Invalid force watch');
+      }
+      return r ?? null;
+    }),
+    conflictWakes: checked((_root, env) => {
+      const r = json(join(daemonStateDir(env), 'overlay-conflict-wake.json'), {});
+      if (!object(r) || !Object.values(r).every(v => object(v) && Number.isSafeInteger(v.pr) && v.pr > 0
+        && text(v.ref) && date(v.at))) throw new Error('Invalid overlay conflict wakes');
+      return r;
+    }),
+    pendingDrops: checked((root, env) => {
+      const r = json(pendingPath(root, env), { pending: [] });
+      if (!object(r) || !Array.isArray(r.pending)) throw new Error('Invalid pending drops');
+      return r.pending;
+    }),
+    state: checked((root, env) => readRebuildStateStrict(root, env, read)),
+    ready: checked((root, env) => readReadyCandidateStrict(root, env, read)),
+    pending: checked((root, env) => readPendingAdoptionsStrict(root, { env, fs: { readFileSync: read } })),
+    // The build lease is part of the strictly validated rebuild state, never a separate fallback.
+    lease: checked((root, env) => readRebuildStateStrict(root, env, read).building),
+    overlays: checked((root, env) => {
+      const r = json(overlayFilePath(root, env), { clone: null, overlays: [] });
+      if (!r || Array.isArray(r) || !Array.isArray(r.overlays)
+        || !(!Object.hasOwn(r, 'clone') || r.clone === null || typeof r.clone === 'string')
+        || !r.overlays.every(o => object(o) && text(o.ref)
+          // Old registries can omit audit metadata; identity remains mandatory.
+          && (!Object.hasOwn(o, 'pr') || o.pr === null || (Number.isSafeInteger(o.pr) && o.pr > 0))
+          && (!Object.hasOwn(o, 'addedAt') || date(o.addedAt))
+          && (!Object.hasOwn(o, 'addedBy') || o.addedBy === null || text(o.addedBy))
+          && (!Object.hasOwn(o, 'reason') || o.reason === null || typeof o.reason === 'string')
+          && (!('pinned' in o) || typeof o.pinned === 'boolean')
+          && (!('stackBases' in o) || (Array.isArray(o.stackBases) && o.stackBases.every(text)))
+          && (!('conflictOverride' in o) || (object(o.conflictOverride) && text(o.conflictOverride.instruction)
+            && text(o.conflictOverride.actor) && date(o.conflictOverride.at))))) {
+        throw new Error('Invalid overlay registry');
+      }
+      return { ...r, clone: r.clone ?? null, corrupt: false };
+    }),
+    overlayEvents: checked((root, env) => {
+      let source;
+      try { source = read(overlayFilePath(root, env).replace(/\.json$/, '.events.jsonl'), 'utf8'); }
+      catch (e) { if (e.code === 'ENOENT') return []; throw e; }
+      return source.split('\n').filter(line => line.trim()).map(line => {
+        const r = JSON.parse(line);
+        // prepareRebuild/reportDiscardedCandidate emits one aggregate notice,
+        // including when an overlay-free candidate has refs: []. It names a
+        // target and reason instead of a single ref; keep that evidence typed.
+        const discard = object(r) && r.kind === 'needs-you' && r.need === 'ready-candidate-discarded'
+          && date(r.at) && text(r.target) && text(r.reason)
+          && Array.isArray(r.refs) && r.refs.every(text);
+        // Also recognize a notice whose discriminator was lost, so legacy-event
+        // compatibility cannot turn an incomplete discard into valid evidence.
+        const discardNotice = object(r) && r.kind === 'needs-you'
+          && (r.need === 'ready-candidate-discarded' || (Object.hasOwn(r, 'target') && Object.hasOwn(r, 'refs')));
+        if (!object(r) || typeof r.kind !== 'string'
+          // Aggregate and auto-rebase events need not name a single ref. The
+          // consumers require ref themselves before using per-overlay evidence.
+          || (Object.hasOwn(r, 'ref') && typeof r.ref !== 'string')
+          || (discardNotice && !discard)) {
+          throw new Error('Invalid overlay event');
+        }
+        return r;
+      });
+    }),
+    starvation: checked((root, env) => {
+      const r = json(starvePath(root, env), { count: 0 });
+      if (!r || !Number.isSafeInteger(r.count) || r.count < 0) throw new Error('Invalid starvation evidence');
+      return r.count;
+    }),
+  };
+  readers.validate = (root, env) => {
+    readers.state(root, env); readers.ready(root, env); readers.pending(root, env);
+    readers.overlays(root, env); readers.starvation(root, env); readers.overlayEvents(root, env);
+    readers.forceRequest(root, env); readers.forceWatch(root, env); readers.conflictWakes(root, env); readers.pendingDrops(root, env);
+  };
+  return Object.freeze(readers);
+}
