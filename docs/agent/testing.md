@@ -1127,12 +1127,16 @@ that both drive modes preserve provider effort while retaining the request fallb
 
 ## Shadow reviewer agreement evidence
 
-Manual `shadowSeats.antigravity.promoted: true` with `promotionReplaces: claude` now replaces
-only the counted correctness seat with Carbon when `enabled` is true; disabling it keeps both mandatory seats on Claude. Security retains its Claude seat; the other Carbon
-shadows use `scope: sampled`, deterministic at 0.1. The agy-Claude shadow fallback and advisory use Sonnet.
-Carbon failure, timeout, quota/login loss, or empty/malformed answers fall back to Claude; only a valid
-Carbon answer counts. Promotion opts this one seat into the existing Gemini routing cap (explicit
-caps still win), with the existing atomic daily session budget. The separate Carbon advisory seat is explicitly off, so correctness promotion cannot auto-seat a second Carbon reviewer. Red-team routing and human gates are unchanged.
+Manual `shadowSeats.antigravity.promoted: true` with the legacy selector `promotionReplaces: claude`
+enables an additional blocking-only Carbon correctness seat when `enabled` is true. Claude always
+runs and remains the only correctness decider. Carbon blockers are merged into the panel findings
+with prevention guards intact, and cause send-backs/referrals even when Claude accepts. Covered
+referrals do not erase Carbon blockers. Carbon never contributes an accept or a counted pass;
+no-blocker answers (including prevention-outstanding) and failed/invalid answers contribute nothing.
+Security retains its Claude seat; the other Carbon shadows use deterministic `scope: sampled` at 0.1.
+The agy-Claude shadow fallback and advisory use Sonnet. Promotion opts the companion into the existing
+Gemini routing cap (explicit caps still win), with the atomic daily session budget. The separate Carbon
+advisory seat stays off. Red-team routing and human gates are unchanged.
 `scripts/lib/__tests__/review-shadow-model.test.mjs` covers these boundaries, including the exact Tier-1 case.
 The append-only `agy-carbon-promotion.jsonl` lives beside the shadow ledger. Run
 `node scripts/lib/agy-shadow-trial-report.mjs --promotion` for agreement with the final stored panel
@@ -1140,16 +1144,16 @@ verdict, later fix confirmations, explicit `not-real` false positives, timeouts/
 This local report reads persisted runs without GitHub calls; unknown verdicts/findings stay pending.
 Fix proximity is confirmation evidence, never proof that an unconfirmed finding was false.
 Promotion is confined to the existing shadow correctness route: an explicit Claude route or a
-Gemini routing disable refuses replacement, and dispatch rechecks live controls and cap kill switches.
+Gemini routing disable refuses the companion, and dispatch rechecks live controls and cap kill switches.
 An invalid `promotionReplaces` override refuses and logs. Other Carbon non-shadow roles, including
-red-team and advisory seats, remain refused regardless of the promotion flag. Counted Carbon answers
+red-team and advisory seats, remain refused regardless of the promotion flag. Admitted Carbon answers
 validate against the server-owned review JSON schema with no coercion or additional properties.
 Every finding requires a non-empty file and positive integer line, and all findings must survive
 `scopeFindingsToCitedFiles` admission against the pinned diff. Zero findings require a completed,
 non-error `read_file` of a diff path in the served transcript; summary phrases do not prove inspection.
 An observed matching served model, no timeout (including salvaged answers), and a successful ledger
 append remain required. Any missing or invalid evidence falls back to Claude.
-A promoted Carbon accept always runs the Claude correctness seat and needs its corroborating accept; Carbon blocking findings still count directly.
+Carbon cannot substitute for a failed Claude seat; correctness remains unrun if Claude fails.
 The pure `assertCrossVendorPanel` helper retains its existing cross-vendor check.
 
 The agy mandatory-seat shadows are off by default (operator 2026-10-16).

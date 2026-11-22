@@ -52,7 +52,7 @@ describe('settings — review.seatProvider.<lens> comes from the routing policy 
     expect(c.claudeSeatModel.correctness).toBe('claude-sonnet-5-5');
   });
 
-  it('the shipped settings: Carbon correctness counts, security stays shadow and advisory Claude uses Sonnet', () => {
+  it('the shipped settings: Carbon is the blocking correctness companion, security stays shadow and advisory Claude uses Sonnet', () => {
     const s = loadReviewSeatSettings({ policy: DEFAULT_ROUTING_POLICY });
     expect(s.seatProvider).toEqual({ correctness: 'agy', security: 'shadow' });
     expect(s.seatModel).toEqual({ correctness: 'gemini-4-carbon-high', security: 'claude-sonnet-5-5-high' });

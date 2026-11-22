@@ -200,13 +200,13 @@ export async function runSeatWithProvider(request, {
     }
   }
   if (agyRun.status === 'ok' && agyRun.sessionId) {
-    // Carbon may send back directly, but can never clear correctness without an independent Claude answer.
-    if (promoted && deriveVerdict(agyRun.value) === 'accept') {
-      logReviewSeat(log, 'review-seat: promoted Carbon accept requires Claude correctness corroboration');
+    if (promoted) {
+      // Claude alone decides correctness. Carbon contributes only additional blockers, never a pass.
       const claude = unwrap(await claudeJudge(plain));
-      return wrap({ ...claude.value, seatProvider: { provider: 'claude',
-        carbonAccept: { provider: 'agy', model, sessionId: agyRun.sessionId },
-      } }, claude.telemetry);
+      const blocking = agyRun.value.findings.filter(f => deriveVerdict({ findings: [f] }) === 'changes');
+      return wrap({ ...claude.value, seatProvider: { provider: 'claude' },
+        ...(blocking.length ? { carbonBlocking: { provider: 'agy', model, sessionId: agyRun.sessionId, findings: blocking } } : {}),
+      }, claude.telemetry);
     }
     const t = agyRun.telemetry ?? {};
     return wrap(

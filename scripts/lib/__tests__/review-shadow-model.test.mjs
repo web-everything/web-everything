@@ -614,7 +614,7 @@ describe('one counted Carbon correctness seat', () => {
     vi.stubEnv('WE_REVIEW_SHADOW_AGY_PROMOTED', 'true');
     const s = settings();
     expect(s.seatProvider).toEqual({ correctness: 'agy', security: 'shadow' });
-    expect(seatProviderDirective(s, 'correctness')).toMatchObject({ mode: 'agy', model: carbon, promoted: true, onEscape: 'claude' });
+    expect(seatProviderDirective(s, 'correctness')).toMatchObject({ mode: 'agy', model: carbon, promoted: true, blockingOnly: true, onEscape: 'claude' });
     const { answer, claudeJudge, rows } = await counted(new Error('login lost'));
     expect(claudeJudge).toHaveBeenCalledOnce();
     expect(answer.seatProvider.provider).toBe('claude');
@@ -640,11 +640,12 @@ describe('one counted Carbon correctness seat', () => {
     expect(claudeJudge).toHaveBeenCalledOnce();
     expect(rows[0].fallback).toBe(true);
   });
-  it('counts a valid Carbon answer without running Claude and records the attempt', async () => {
+  it('keeps a valid Carbon blocker alongside Claude and records the attempt', async () => {
     vi.stubEnv('WE_REVIEW_SHADOW_AGY_PROMOTED', 'true');
     const { answer, claudeJudge, rows } = await counted(ok);
-    expect(answer.seatProvider).toMatchObject({ provider: 'agy', model: carbon });
-    expect(claudeJudge).not.toHaveBeenCalled();
+    expect(answer.seatProvider.provider).toBe('claude');
+    expect(answer.carbonBlocking).toMatchObject({ provider: 'agy', model: carbon, findings: ok.value.findings });
+    expect(claudeJudge).toHaveBeenCalledOnce();
     expect(rows[0]).toMatchObject({ fallback: false, agyVerdict: 'changes', runId: 'promotion-test' });
   });
   it('promotion enables the default-disabled Gemini seat without changing other Gemini caps; explicit zero falls back', async () => {
@@ -652,7 +653,7 @@ describe('one counted Carbon correctness seat', () => {
     // Vitest 1.x stringifies undefined; remove the key after registering its restoration.
     vi.stubEnv('WE_REVIEW_SEAT_CAP_AGY_GEMINI', '');
     delete process.env.WE_REVIEW_SEAT_CAP_AGY_GEMINI;
-    expect((await counted(ok)).answer.seatProvider.provider).toBe('agy');
+    expect((await counted(ok)).answer.carbonBlocking).toMatchObject({ provider: 'agy', model: carbon });
     expect(resolveProviderCap('agy-gemini', {}, () => ({ tool: {}, platform: {} }))).toBe(0);
     vi.stubEnv('WE_REVIEW_SEAT_CAP_AGY_GEMINI', '0');
     const result = await counted(ok);
@@ -916,11 +917,12 @@ describe('promotion verdict authorization audit', () => {
     expect(result.calls).toEqual(['carbon', 'claude']);
     expect(deriveVerdict(result.answer)).toBe('changes');
   });
-  it('Carbon blocking findings still count directly and yield a send-back', async () => {
+  it('Carbon blocking findings are retained while Claude always runs', async () => {
     const result = await attempt(good);
-    expect(result.calls).toEqual(['carbon']);
+    expect(result.calls).toEqual(['carbon', 'claude']);
     expect(deriveVerdict(result.answer)).toBe('changes');
-    expect(result.answer.seatProvider.provider).toBe('agy');
+    expect(result.answer.seatProvider.provider).toBe('claude');
+    expect(result.answer.carbonBlocking.findings).toEqual(good.value.findings);
   });
   it('Carbon accept plus Claude accept yields accept', async () => {
     const result = await attempt(carbonClean, { claude: claudeClean });
@@ -934,6 +936,40 @@ describe('promotion verdict authorization audit', () => {
   });
   it('Carbon accept never clears the lens when Claude fails to answer', async () => {
     await expect(attempt(carbonClean, { claude: new Error('Claude unavailable') })).rejects.toThrow('Claude unavailable');
+  });
+
+  const guardedCarbon = { ...good, value: { summary: 'Carbon found a blocker', findings: [{ ...finding,
+    verdict: 'CONFIRMED', impactIfUnfixed: 'broken', introduced: true, worseThanBase: true, parallelizable: false,
+    rootCause: 'inverted guard', prevention: 'add regression coverage', preventionCaptured: false,
+  }] } };
+  const preventionCarbon = { ...good, value: { summary: 'Carbon owes prevention', findings: [{ ...finding,
+    disposition: 'carve-out', impactIfUnfixed: 'broken', introduced: false, worseThanBase: false, parallelizable: true,
+    prevention: 'add regression coverage', preventionCaptured: false,
+  }] } };
+  it.each([carbonClean, good, preventionCarbon, guardedCarbon])('every Carbon verdict still requires Claude and cannot override a Claude send-back: %j', async carbon => {
+    const result = await attempt(carbon, { claude: claudeAnswer });
+    expect(result.calls).toEqual(['carbon', 'claude']);
+    expect(result.answer.seatProvider.provider).toBe('claude');
+    expect(result.answer.findings).toEqual(claudeAnswer.findings);
+    expect(deriveVerdict(result.answer)).toBe('changes');
+  });
+  it.each([carbonClean, good, preventionCarbon, guardedCarbon])('no Carbon verdict can clear correctness when Claude fails: %j', async carbon => {
+    await expect(attempt(carbon, { claude: new Error('Claude unavailable') })).rejects.toThrow('Claude unavailable');
+  });
+  it('Carbon blocking findings survive Claude accept with their prevention fields intact', async () => {
+    const result = await attempt(guardedCarbon, { claude: claudeClean });
+    expect(result.calls).toEqual(['carbon', 'claude']);
+    expect(result.answer.findings).toEqual([]);
+    expect(result.answer.carbonBlocking.findings).toEqual(guardedCarbon.value.findings);
+    expect(result.answer.seatProvider.provider).toBe('claude');
+  });
+  it.each([carbonClean, preventionCarbon])('Carbon with no blocking finding contributes neither an accept nor a counted pass: %j', async carbon => {
+    expect(deriveVerdict(carbon.value)).toBe(carbon === preventionCarbon ? 'prevention-outstanding' : 'accept');
+    const result = await attempt(carbon, { claude: claudeClean });
+    expect(result.calls).toEqual(['carbon', 'claude']);
+    expect(result.answer.findings).toEqual([]);
+    expect(result.answer.carbonBlocking).toBeUndefined();
+    expect(result.answer.seatProvider.carbonAccept).toBeUndefined();
   });
 
 });

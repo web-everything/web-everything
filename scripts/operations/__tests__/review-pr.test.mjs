@@ -5039,3 +5039,58 @@ describe('provider-unresponsive skips and required seat policy', () => {
     expect(() => reduce({}, { judgeAdvisory: skipped })).toThrow(/blocked-on-infra:.*0\/1/);
   });
 });
+
+
+describe('promoted Carbon is blocking-only; Claude owns the correctness verdict', () => {
+  const carbonFinding = { summary: 'Carbon observed an inverted guard', file: NET_PATHS[0], line: 12,
+    verdict: 'CONFIRMED', impactIfUnfixed: 'broken', introduced: true, worseThanBase: true, parallelizable: false,
+    rootCause: 'inverted guard', prevention: 'add regression coverage', preventionCaptured: false };
+  const judge = { ...CLEAN_ANSWER, seatProvider: { provider: 'claude' },
+    carbonBlocking: { provider: 'agy', model: 'gemini-4-carbon-high', findings: [carbonFinding] } };
+  it('Claude empty accept plus additional Carbon blocker is a send-back retaining its referral and prevention guard', () => {
+    const { registry } = registryFor({});
+    let run = advanceWhileRunning(startRun({ op: REVIEW_PR_OP, id: 'carbon-blocking', input: BASE_INPUT, registry }), { registry });
+    while (run.pending?.kind === 'judge') {
+      run = advanceWhileRunning(run, { registry, resume: { value: run.pending.step === 'judge' ? judge : CLEAN_ANSWER } });
+    }
+    const reduced = run.findings.reduce;
+    expect(runStatus(run, { registry })).toBe('awaiting-effect');
+    expect(reduced.lensVerdicts.correctness).toBe('accept');
+    expect(reduced.verdict).toBe('changes');
+    expect(reduced.referrals).toContainEqual(expect.objectContaining({ original: carbonFinding }));
+    expect(reduced.findings).toContainEqual(expect.objectContaining({ summary: carbonFinding.summary,
+      prevention: carbonFinding.prevention, preventionCaptured: false, rootCause: carbonFinding.rootCause }));
+  });
+  it('additional Carbon cannot supply the missing mandatory Claude correctness answer', () => {
+    const { registry } = registryFor({});
+    expect(() => atConfirm({ registry, input: BASE_INPUT, answers: { judge: { ...judge, summary: '' } } })).toThrow(/no summary/);
+  });
+  it.each(['accept', 'changes'])('covered Carbon referrals remain blocking and published with Claude %s', async claudeVerdict => {
+    const { findingIdentityEntry, exactClaimKey, classifyReferralsByRound } = await import('../../lib/jury-core.mjs');
+    const read = shapeReadFinding(stubReader({ netRev: PINNED_HEAD })({ pr: 7, repo: 'o/n' }), { pr: 7, repo: 'o/n' });
+    const head = read.netBasis.rev;
+    read.findingIdentity = [{ ...findingIdentityEntry(carbonFinding, 'carbon-1', { heads: [head] }),
+      activeHeads: [head], activeInstances: [{ head, claim: exactClaimKey(carbonFinding) }] }];
+    read.referralOpenHeads = [head];
+    expect(classifyReferralsByRound([{ seat: 'judge', original: carbonFinding }], { identity: read.findingIdentity, head, lens: 'correctness', openHeads: [head] }).covered).toHaveLength(1);
+    const declaration = buildReviewPrOperation({ readPr: stubReader(), codexAdvisory: true, minNonClaudeSeats: 1 });
+    const reduced = declaration.steps.find(s => s.name === 'reduce').step.fn({ input: { lens: 'correctness' }, findings: {
+      read, judge: { ...(claudeVerdict === 'accept' ? CLEAN_ANSWER : BLOCKING_ANSWER), carbonBlocking: judge.carbonBlocking }, judgeSecurity: CLEAN_ANSWER, judgeAdvisory: CLEAN_ANSWER,
+    } });
+    expect(reduced.lensVerdicts.correctness).toBe(claudeVerdict);
+    expect(reduced.verdict).toBe('changes');
+    expect(reduced.findings).toContainEqual(expect.objectContaining({ summary: carbonFinding.summary, prevention: carbonFinding.prevention }));
+  });
+
+  it('a Carbon blocker does not bypass the existing human gate', () => {
+    const read = shapeReadFinding(stubReader({ netRev: PINNED_HEAD })({ pr: 7, repo: 'o/n' }), { pr: 7, repo: 'o/n' });
+    const declaration = buildReviewPrOperation({ readPr: stubReader(), codexAdvisory: true, minNonClaudeSeats: 1 });
+    const reduced = declaration.steps.find(s => s.name === 'reduce').step.fn({ input: { lens: 'correctness' }, findings: {
+      read: { ...read, humanRequired: true }, judge, judgeSecurity: CLEAN_ANSWER, judgeAdvisory: CLEAN_ANSWER,
+    } });
+    expect(reduced.verdict).toBe('needs-human');
+    expect(reduced.findings).toContainEqual(expect.objectContaining({ summary: carbonFinding.summary }));
+    expect(reduced.lensVerdicts).not.toHaveProperty('carbon-correctness');
+  });
+
+});

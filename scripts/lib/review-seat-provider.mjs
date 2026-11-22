@@ -116,11 +116,11 @@ export function loadReviewSeatSettings({ policy, operatorKeys, aiRouting = aiRou
   const base = settingsFromRoutingPolicy(policy, { shadowModel, aiRouting, operatorKeys });
   const promotion = promoted ?? resolveShadowPromoted({ log: () => {} });
   const replaces = promotionReplaces ?? resolveShadowPromotionReplaces({ log });
-  // One existing Claude-counted mandatory lens only. Pure policy projections and saved rosters stay unchanged.
+  // Promote only the correctness companion; its directive always retains Claude as the decider.
   const replace = resolved.value.shadowEnabled === true && promotion.value === true && replaces.value === 'claude'
     && base.seatProvider.correctness === 'shadow' && carbonPromotionRouteAllowed(policy)
     && /carbon/i.test(shadowModel?.value ?? '');
-  if (replace) logReviewSeat(log, `review.shadowSeats.antigravity.promoted=true (${promotion.source}); promotionReplaces=${replaces.value} (${replaces.source}); lens=correctness; model=${shadowModel.value} (${shadowModel.source})`);
+  if (replace) logReviewSeat(log, `review.shadowSeats.antigravity.promoted=true (${promotion.source}); promotionReplaces=${replaces.value} (${replaces.source}); lens=correctness; role=additional-blocking; decider=claude; model=${shadowModel.value} (${shadowModel.source})`);
   const settings = Object.freeze({ ...base,
     ...(replace ? { seatProvider: Object.freeze({ ...base.seatProvider, correctness: 'agy' }),
       seatModel: Object.freeze({ ...base.seatModel, correctness: shadowModel.value }), promotedLens: 'correctness' } : {}),
@@ -164,7 +164,7 @@ function modelDirective(settings, lens, mode) {
   const model = settings.seatModel?.[lens] ?? settings.agyModel;
   if (typeof model !== 'string' || !model) throw new TypeError(`review-seat-provider: the ${lens} seat names no agy model`);
   if (mode === 'agy' && settings.promotedLens === lens) {
-    return Object.freeze({ mode, model, promoted: true, dailyCap: settings.shadowPolicy?.dailyCap ?? 100, onEscape: 'claude' });
+    return Object.freeze({ mode, model, promoted: true, blockingOnly: true, dailyCap: settings.shadowPolicy?.dailyCap ?? 100, onEscape: 'claude' });
   }
   const budget = mode === 'shadow' && settings.shadowPolicy ? { dailyCap: settings.shadowPolicy.dailyCap ?? 100 } : {};
   const override = settings.shadowModelOverride;
