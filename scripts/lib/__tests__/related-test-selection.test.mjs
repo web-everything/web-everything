@@ -68,18 +68,18 @@ describe('#5128 — bounded related-test selection', () => {
   });
 
   it.each([33, 50, 0])('keeps the complete graph when maxTests is %s', maxTests => {
-    expect(selectHub({ maxTests })).toMatchObject({ status: 'complete', tests: null,
+    expect(selectHub({ maxTests })).toMatchObject({ status: 'complete', tests: Object.keys(hubFiles()).filter(isVitestTestFile).sort(),
       fullTestCount: 33, selectedTestCount: 33, droppedCount: 0, depth: null });
   });
 
-  it('treats non-test helpers under __tests__ as zero-cost hops', () => {
+  it('treats non-test helpers under __tests__ as zero-cost hops before capping direct tests', () => {
     const reverse = graph({ 'hub.mjs': '', '__tests__/helper.mjs': "import '../hub.mjs'",
       '__tests__/a.test.mjs': "import './helper.mjs'", '__tests__/b.test.mjs': "import './helper.mjs'" });
     expect(testDepths(['hub.mjs'], reverse)).toEqual(new Map([
       ['__tests__/a.test.mjs', 1], ['__tests__/b.test.mjs', 1],
     ]));
     expect(selectRelatedTests({ changedFiles: ['hub.mjs'], reverse, maxTests: 1, maxDepth: 2 }))
-      .toMatchObject({ status: 'selection-truncated', depth: 1, tests: ['__tests__/a.test.mjs', '__tests__/b.test.mjs'] });
+      .toMatchObject({ status: 'selection-truncated', depth: 1, tests: ['__tests__/a.test.mjs'], selectedTestCount: 1, droppedCount: 1 });
   });
 
   it('takes the nearest ring when depth one would select no tests', () => {
@@ -87,8 +87,8 @@ describe('#5128 — bounded related-test selection', () => {
     delete files['direct0.test.mjs'];
     delete files['direct1.test.mjs'];
     expect(selectHub({ changedFiles: ['hub.mjs'], reverse: graph(files) }))
-      .toMatchObject({ status: 'selection-truncated', depth: 2, fullTestCount: 30, selectedTestCount: 30,
-        tests: Object.keys(files).filter(path => path.startsWith('deep')).sort(), droppedCount: 0 });
+      .toMatchObject({ status: 'selection-truncated', depth: 2, fullTestCount: 30, selectedTestCount: 5,
+        tests: Object.keys(files).filter(path => path.startsWith('deep')).sort().slice(0, 5), droppedCount: 25 });
   });
 
   it('keeps a changed hub reachable when an unrelated changed test would otherwise fill the list', () => {
@@ -98,7 +98,7 @@ describe('#5128 — bounded related-test selection', () => {
     const selected = selectHub({ reverse: graph(files) });
     expect(selected.status).toBe('selection-truncated');
     expect(selected.tests).toContain('changed.test.mjs');
-    expect(selected.tests.filter(path => path.startsWith('deep'))).toHaveLength(30);
+    expect(selected.tests).toEqual(['changed.test.mjs', 'deep0-0.test.mjs', 'deep0-1.test.mjs', 'deep0-2.test.mjs', 'deep0-3.test.mjs']);
     expect(selected.depth).toBe(2);
   });
 
@@ -128,7 +128,7 @@ describe('#5128 — bounded related-test selection', () => {
     ]);
   });
 
-  it('always retains every direct importer of any changed file across seeded graphs', () => {
+  it('retains direct importers up to the cap across seeded graphs', () => {
     let seed = 5128;
     const random = n => { seed = (Math.imul(seed, 1664525) + 1013904223) >>> 0; return seed % n; };
     for (let trial = 0; trial < 30; trial++) {
@@ -140,10 +140,12 @@ describe('#5128 — bounded related-test selection', () => {
         files[test] = `import './${target}'`;
         if (target !== 'mid.mjs') direct.push(test);
       }
+      const maxTests = 1 + random(5);
       const selected = selectRelatedTests({ changedFiles: ['a.mjs', 'b.mjs'], reverse: graph(files),
-        maxTests: 1 + random(5), maxDepth: 1 + random(3) });
+        maxTests, maxDepth: 1 + random(3) });
       expect(selected.status).toBe('selection-truncated');
-      for (const test of direct) expect(selected.tests).toContain(test);
+      expect(selected.tests).toHaveLength(Math.min(direct.length, maxTests));
+      for (const test of selected.tests) expect(direct).toContain(test);
     }
   });
 });
