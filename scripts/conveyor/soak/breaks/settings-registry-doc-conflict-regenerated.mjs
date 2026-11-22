@@ -1,0 +1,112 @@
+/** Generated registry conflicts must use merged declarations without executing candidate code. */
+import { spawnSync } from 'node:child_process';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
+import { dirname, join, resolve } from 'node:path';
+import { fileURLToPath, pathToFileURL } from 'node:url';
+import { makeGit } from '../../../lib/daemon-rebuild/shared.mjs';
+import { resolveOverlayConflict } from '../../../lib/daemon-rebuild/overlay-strategies.mjs';
+
+const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '../../../..');
+const SOURCE = 'scripts/lib/daemon-rebuild/advisory-merge.mjs';
+const RESOLVER = 'scripts/lib/daemon-rebuild/overlay-strategies.mjs';
+const DOC = 'docs/agent/settings-registry.md';
+const CLOSURE = ['scripts/lib/settings-registry.mjs', 'scripts/lib/settings-files.mjs', 'scripts/lib/operator-override-reader.mjs'];
+const INPUTS = ['scripts/dispatch-settings.json', 'scripts/lib/settings-registry-metadata.json',
+  'scripts/lib/delivery-platform-preferences.json', 'scripts/lib/delivery-priority-settings.json'];
+
+function scenario(root, tamper = false, resolver = resolveOverlayConflict) {
+  if (!process.env.TMPDIR) throw new Error('task TMPDIR required');
+  const dir = realpathSync(mkdtempSync(join(process.env.TMPDIR, 'soak-settings-registry-')));
+  const env = Object.fromEntries(Object.entries(process.env).filter(([key]) => !key.startsWith('GIT_')));
+  Object.assign(env, { GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: '/dev/null', GIT_EDITOR: 'true' });
+  const git = makeGit({ cwd: dir, env, timeoutMs: 20_000,
+    run: (args, opts) => spawnSync('git', args, { ...opts, encoding: 'utf8', maxBuffer: 8 * 1024 * 1024 }),
+  });
+  const ok = args => {
+    const result = git(args);
+    if (result.status !== 0) throw new Error(`settings-registry fixture Git failed: ${result.stderr}`);
+    return result.stdout.trim();
+  };
+  const write = (path, data) => {
+    mkdirSync(dirname(join(dir, path)), { recursive: true });
+    writeFileSync(join(dir, path), data);
+  };
+  const json = (path, data) => write(path, `${JSON.stringify(data, null, 2)}\n`);
+  const commit = message => { ok(['add', '-A']); ok(['commit', '-qm', message]); return ok(['rev-parse', 'HEAD']); };
+  const generate = () => {
+    const result = spawnSync(process.execPath, [join(dir, CLOSURE[0]), '--write'], {
+      cwd: dir, env, encoding: 'utf8', timeout: 30_000, maxBuffer: 1024 * 1024,
+    });
+    if (result.status !== 0) throw new Error(`fixture generation failed: ${result.stderr}`);
+  };
+  try {
+    ok(['init', '-q', '-b', 'base']);
+    for (const [key, value] of Object.entries({ 'core.hooksPath': '/dev/null', 'commit.gpgsign': 'false', 'rerere.enabled': 'false' })) {
+      ok(['config', key, value]);
+    }
+    for (const path of [...CLOSURE, ...INPUTS,
+      ...readdirSync(join(root, 'scripts/settings')).filter(name => name.endsWith('.json')).map(name => `scripts/settings/${name}`)]) {
+      write(path, readFileSync(join(root, path)));
+    }
+    // Keep real inputs, adding one documented fixture family with distinct leaves on each side.
+    const metadata = JSON.parse(readFileSync(join(dir, INPUTS[1]), 'utf8'));
+    metadata.settings.soakRegistryProbe = { description: 'Soak registry probe', owner: 'scripts/settings/soak-base.json', changeVia: 'pr', instant: false };
+    json(INPUTS[1], metadata);
+    mkdirSync(join(dir, 'docs/agent'), { recursive: true });
+    json('scripts/settings/soak-base.json', { soakRegistryProbe: { soakBase: 1 } });
+    generate(); commit('base');
+    ok(['checkout', '-qb', 'lane/ours', 'base']);
+    json('scripts/settings/soak-ours.json', { soakRegistryProbe: { soakOurs: 1 } });
+    generate();
+    const cur = commit('ours');
+    ok(['checkout', '-qb', 'lane/theirs', 'base']);
+    json('scripts/settings/soak-theirs.json', { soakRegistryProbe: { soakTheirs: 1 } });
+    generate();
+    const marker = join(dir, 'candidate-generator-ran');
+    if (tamper) write(CLOSURE[0], `import { writeFileSync } from 'node:fs';\nwriteFileSync(${JSON.stringify(marker)}, 'executed');\n`);
+    const ovSha = commit('theirs');
+    ok(['checkout', '-q', 'lane/ours']);
+    const conflict = git(['merge-tree', '--write-tree', '--name-only', cur, ovSha]);
+    const lines = String(conflict.stdout ?? '').split('\n').slice(1);
+    const files = lines.slice(0, lines.indexOf(''));
+    if (conflict.status !== 1 || JSON.stringify(files) !== JSON.stringify([DOC])) {
+      throw new Error('fixture must conflict only on the generated registry doc');
+    }
+    if (tamper && ok(['show', `${String(conflict.stdout).split('\n')[0]}:${CLOSURE[0]}`]) !== ok(['show', `${ovSha}:${CLOSURE[0]}`])) {
+      throw new Error('candidate merged tree did not retain overlay generator drift');
+    }
+    const result = resolver({ git, cur, ovSha, ref: 'lane/theirs' });
+    if (tamper) {
+      const problems = [];
+      if (result?.ok !== false) problems.push('candidate generator drift: resolver did not refuse');
+      if (existsSync(marker)) problems.push('candidate generator drift: untrusted generator executed');
+      return problems;
+    }
+    if (result?.ok !== true || !/^[0-9a-f]{40}$/.test(result.tree ?? '')) return ['doc only: resolver did not return a merged tree'];
+    const merged = ok(['show', `${result.tree}:${DOC}`]);
+    return ['soakOurs', 'soakTheirs'].filter(setting => !merged.includes(setting)).map(setting => `doc only: merged doc lost ${setting}`);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+}
+
+// Used by the synchronous presence probe with the resolver from the checkout being examined.
+export function docOnlyResolves(root, resolver) { return scenario(root, false, resolver).length === 0; }
+
+export default {
+  id: 'settings-registry-doc-conflict-regenerated',
+  title: 'settings registry doc conflicts regenerate both settings while candidate generator drift refuses',
+  card: '0',
+  fixedBy: { sha: 'HEAD', where: 'lane/settings-registry-regen-conflict', paths: [SOURCE] },
+  fixPresent(root) {
+    const script = `import { docOnlyResolves } from ${JSON.stringify(import.meta.url)};
+      import { resolveOverlayConflict } from ${JSON.stringify(pathToFileURL(join(root, RESOLVER)).href)};
+      process.exit(docOnlyResolves(${JSON.stringify(root)}, resolveOverlayConflict) ? 0 : 1);`;
+    const result = spawnSync(process.execPath, ['--input-type=module', '-e', script], {
+      cwd: root, encoding: 'utf8', timeout: 60_000, maxBuffer: 1024 * 1024,
+    });
+    return result.status === 0;
+  },
+  async run({ root = ROOT } = {}) {
+    return { problems: [...scenario(root), ...scenario(root, true)] };
+  },
+  judge(report) { return report.problems; },
+};

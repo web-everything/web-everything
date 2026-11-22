@@ -4,9 +4,11 @@ import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
 import {
   assessBuilderStarvation, parseTickRows, classifyPrMovement, renderSweepReport,
-  SWEEP_JOBS, buildLaunchdPlist, installPlan,
+  SWEEP_JOBS, buildLaunchdPlist, buildAgyUsagePlist, installPlan,
   attentionSignature, decideNotify, runCoronerJob, formatErrorRates, opusCommand, applyInstallPlan,
+  AGY_USAGE_INTERVAL_MINUTES,
 } from '../scheduled-sweep.mjs';
+import { readAgyUsageSettings, runAgyUsageReader } from '../agy-usage-reader.mjs';
 import { DAEMON_MANIFEST } from '../../../skills-src/conveyor/daemon-manifest.mjs';
 
 const MIN = 60_000;
@@ -97,12 +99,12 @@ describe('report and wiring', () => {
     expect(xml).toContain('--pass=pr-movement-sweep');
     const plan = installPlan({ repoRoot: '/r', nodePath: '/n', home: '/h', apply: false });
     expect(plan.writes).toEqual([]);
-    expect(plan.commands.length).toBe(4);
+    expect(plan.commands.length).toBe(5);
     expect(plan.commands.join('\n')).toContain('launchctl bootstrap');
   });
   it('install is default-off when apply is OMITTED (the real default), and only --apply plans writes', () => {
     expect(installPlan({ repoRoot: '/r', nodePath: '/n', home: '/h' }).writes).toEqual([]);
-    expect(installPlan({ repoRoot: '/r', nodePath: '/n', home: '/h', apply: true }).writes).toHaveLength(4);
+    expect(installPlan({ repoRoot: '/r', nodePath: '/n', home: '/h', apply: true }).writes).toHaveLength(5);
   });
 });
 
@@ -269,6 +271,50 @@ describe('installer guarantees are enforced by tested code, not top-level script
 
 
 describe('PR merge watcher installer selection', () => {
+  it('includes and selects the half-hour agy reader LaunchAgent without KeepAlive', () => {
+    const cfg = { repoRoot: '/r', nodePath: '/n', home: '/h' };
+    const plan = installPlan({ ...cfg, pass: 'agy-usage-reader', apply: true });
+    expect(plan.files).toHaveLength(1);
+    const file = plan.files[0];
+    expect(file.pass).toBe('agy-usage-reader');
+    expect(file.path).toBe('/h/Library/LaunchAgents/com.we.agy-usage-reader.plist');
+    expect(file.xml).toBe(buildAgyUsagePlist(cfg));
+    expect(file.xml).toContain('<key>Label</key><string>com.we.agy-usage-reader</string>');
+    expect(file.xml).toContain('<string>/n</string>');
+    expect(file.xml).toContain('<string>/r/scripts/operations/agy-usage-reader.mjs</string>');
+    expect(file.xml).toContain('<key>StartInterval</key><integer>1800</integer>');
+    expect(file.xml).toContain('<key>RunAtLoad</key><true/>');
+    expect(file.xml).not.toContain('KeepAlive');
+    expect(file.xml).toContain('<key>WE_AGY_USAGE_MIN_INTERVAL_MINUTES</key><string>30</string>');
+    for (const key of ['StandardOutPath', 'StandardErrorPath']) {
+      expect(file.xml).toContain(`<key>${key}</key><string>/h/workspace/.operations/logs/agy-usage-reader.log</string>`);
+    }
+    expect(plan.writes).toEqual(plan.files);
+    expect(installPlan(cfg).files).toContainEqual(file);
+    expect(installPlan({ ...cfg, pass: 'agy-usage-reader' }).writes).toEqual([]);
+  });
+  it('pairs the plist StartInterval with the reader throttle so every tick collects', async () => {
+    const xml = buildAgyUsagePlist({ repoRoot: '/r', nodePath: '/n', home: '/h' });
+    const startInterval = Number(xml.match(/<key>StartInterval<\/key><integer>(\d+)<\/integer>/)[1]);
+    const minEnv = xml.match(/<key>WE_AGY_USAGE_MIN_INTERVAL_MINUTES<\/key><string>([^<]+)<\/string>/)[1];
+    expect(startInterval).toBe(AGY_USAGE_INTERVAL_MINUTES * 60);
+    expect(Number(minEnv)).toBe(AGY_USAGE_INTERVAL_MINUTES);
+    const settings = readAgyUsageSettings({ env: { WE_AGY_USAGE_MIN_INTERVAL_MINUTES: minEnv }, log: () => {} });
+    expect(settings.minIntervalMinutes * 60).toBe(startInterval);
+    const store = new Map();
+    const io = { readFile: async p => { if (!store.has(p)) throw Object.assign(new Error('missing'), { code: 'ENOENT' }); return store.get(p); },
+      mkdir: async () => {}, writeFile: async (p, d) => { store.set(p, d); },
+      rename: async (a, b) => { store.set(b, store.get(a)); store.delete(a); }, unlink: async () => {} };
+    let clock = now, collected = 0;
+    const record = () => ({ at: new Date(clock).toISOString(),
+      five_hour: { used_percentage: 1, resets_at: 1 }, seven_day: { used_percentage: 1, resets_at: 1 } });
+    const collect = async () => { collected += 1; clock += 3300; return record(); };
+    const tickAt = t => { clock = t; return runAgyUsageReader({ io, collect, home: '/h', now: () => clock, settings }); };
+    for (let n = 0; n < 4; n += 1) await tickAt(now + n * startInterval * 1000);
+    expect(collected).toBe(4);
+    expect(await tickAt(now + 3 * startInterval * 1000 + startInterval * 500)).toEqual({ skipped: true });
+    expect(collected).toBe(4);
+  });
   it('installs just --pass=pr-merge-watch and leaves sweep plists out', () => {
     const plan = installPlan({ repoRoot: '/r', nodePath: '/n', home: '/h', apply: true, pass: 'pr-merge-watch' });
     expect(plan.files.map(f => f.pass)).toEqual(['pr-merge-watch']);

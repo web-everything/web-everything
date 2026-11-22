@@ -132,10 +132,10 @@ describe('logFixPassPriorityShadow (IO shell)', () => {
 });
 
 describe('readers fail closed', () => {
-  it('settings: unreadable file = off; the shipped file = shadow', () => {
+  it('settings: unreadable file = off; the shipped file = off', () => {
     expect(readDeliveryPrioritySettings({ read: () => { throw new Error('ENOENT'); } }).mode).toBe('off');
     expect(readDeliveryPrioritySettings({ read: () => '{not json' }).mode).toBe('off');
-    expect(readDeliveryPrioritySettings().mode).toBe('shadow');
+    expect(readDeliveryPrioritySettings().mode).toBe('off');
   });
 
   it('owner record: absent, malformed or expired = null', () => {

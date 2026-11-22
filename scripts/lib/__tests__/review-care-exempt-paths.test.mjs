@@ -311,14 +311,15 @@ describe('care exemption settings resolver', () => {
     const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
     try {
       expect(validateCareExemptPaths([glob])).toEqual(DEFAULT_CARE_EXEMPT_PATHS);
-      for (const options of [
-        { readFile: () => JSON.stringify({ careExemptPaths: [glob] }) },
-        { env: { WE_REVIEW_CARE_EXEMPT_PATHS: JSON.stringify([glob]) } },
+      // A bad tool list resets to built-in; a bad env list is dropped alone (env may only tighten).
+      for (const [options, value, source] of [
+        [{ readFile: () => JSON.stringify({ careExemptPaths: [glob] }) }, DEFAULT_CARE_EXEMPT_PATHS, 'standard'],
+        [{ env: { WE_REVIEW_CARE_EXEMPT_PATHS: JSON.stringify([glob]) } }, ['app/safe.json'], 'tool'],
       ]) {
         const result = resolveReviewCareExemptPaths({ env: {}, readFile: () => '{"careExemptPaths":["app/safe.json"]}',
           log: () => {}, ...options });
-        expect(result.value).toEqual(DEFAULT_CARE_EXEMPT_PATHS);
-        expect(result.sources['']).toBe('standard');
+        expect(result.value).toEqual(value);
+        expect(result.sources['']).toBe(source);
       }
       expect(warn).toHaveBeenCalled();
     } finally { warn.mockRestore(); }
@@ -346,8 +347,8 @@ describe('care exemption settings resolver', () => {
 
   it('resolves tool then JSON environment overrides and logs provenance', async () => {
     const log = vi.fn();
-    const readFile = () => JSON.stringify({ careExemptPaths: ['data/generated/**'] });
-    expect((await resolve({ readFile })).value).toEqual(['data/generated/**']);
+    const readFile = () => JSON.stringify({ careExemptPaths: ['data/generated/**', 'app/snapshot.json'] });
+    expect((await resolve({ readFile })).value).toEqual(['data/generated/**', 'app/snapshot.json']);
     const result = await resolve({ readFile, env: { WE_REVIEW_CARE_EXEMPT_PATHS: '["app/snapshot.json"]' }, log });
     expect(result.value).toEqual(['app/snapshot.json']);
     expect(result.sources['']).toBe('env');
@@ -360,8 +361,9 @@ describe('care exemption settings resolver', () => {
   const envLayers = { valid: '["app/env.json"]', invalid: '["scripts/**"]', empty: '[]', unparseable: 'invalid',
     absent: undefined };
   const expectedLayer = (tool, env) => {
-    if ([tool, env].some(l => l === 'invalid' || l === 'unparseable')) return [[...DEFAULT_CARE_EXEMPT_PATHS], 'standard'];
-    if (env !== 'absent') return [env === 'valid' ? ['app/env.json'] : [], 'env'];
+    if (['invalid', 'unparseable'].includes(tool)) return [[...DEFAULT_CARE_EXEMPT_PATHS], 'standard'];
+    // D15: env may only tighten: an env list that adds a path ('valid') or is bad is dropped alone; the tool layer stays.
+    if (env !== 'absent' && !['valid', 'invalid', 'unparseable'].includes(env)) return [[], 'env'];
     return [tool === 'valid' ? ['app/snapshot.json'] : [], 'tool'];
   };
   it.each(Object.keys(toolLayers).flatMap(tool => Object.keys(envLayers).map(env => [tool, env])))(
@@ -374,17 +376,18 @@ describe('care exemption settings resolver', () => {
         const [value, source] = expectedLayer(tool, env);
         expect(result.value).toEqual(value);
         expect(result.sources['']).toBe(source);
-        expect(warn.mock.calls.length > 0).toBe(source === 'standard');
+        expect(warn.mock.calls.length > 0).toBe(source === 'standard' || ['invalid', 'unparseable'].includes(env));
       } finally { warn.mockRestore(); }
     });
 
-  it('invalid environment JSON falls back to built-in rather than tool exemptions', async () => {
+  it('invalid environment JSON is dropped alone and keeps the tool exemptions', async () => {
     const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
     try {
       const result = await resolve({ readFile: () => '{"careExemptPaths":["app/snapshot.json"]}',
         env: { WE_REVIEW_CARE_EXEMPT_PATHS: 'invalid' } });
-      expect(result.value).toContain(timings);
-      expect(result.sources['']).toBe('standard');
+      // D15: a bad env value is dropped alone; it never discards the tool exemptions (which would loosen).
+      expect(result.value).toEqual(['app/snapshot.json']);
+      expect(result.sources['']).toBe('tool');
       expect(warn).toHaveBeenCalled();
     } finally { warn.mockRestore(); }
   });

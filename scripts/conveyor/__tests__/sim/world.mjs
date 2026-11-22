@@ -22,7 +22,7 @@
 
 import { execFileSync } from 'node:child_process';
 import {
-  appendFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, symlinkSync, writeFileSync,
+  appendFileSync, chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, statSync, symlinkSync, writeFileSync,
 } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
@@ -100,6 +100,9 @@ function buildWeTemplate() {
       // `list --acquirable` reports zero lanes no matter how many were provisioned (#3383 gap — see this
       // file's own git-blame/report for the live incident this fixed).
       '.gitignore',
+      // Provisioning verifies the tracked pre-commit guard before handing out a
+      // lane. Keep the real hook in this runtime snapshot, like its scripts above.
+      '.githooks/pre-commit',
       // #3383 (scenario B, I-07) — the canonical backlog loader `we:scripts/operations/dispatch-lane-io.mjs
       // #defaultLoadItems` requires this file BY PATH (`require(join(root,'src','_data','backlog.js'))`), off
       // the SIM CLONE's own `root` (every daemon that resolves a PR's backlog item — review, fix-dispatch —
@@ -130,6 +133,7 @@ function buildWeTemplate() {
     const dst = join(work, rel);
     mkdirSync(dirname(dst), { recursive: true });
     writeFileSync(dst, readFileSync(src));
+    if (rel === '.githooks/pre-commit') chmodSync(dst, statSync(src).mode & 0o777);
   }
   git(work, ['init', '-q']);
   git(work, ['symbolic-ref', 'HEAD', 'refs/heads/main']); // never trust the ambient init.defaultBranch
