@@ -67,6 +67,7 @@ it.each([
     f.write(TIMINGS, timings({ '$Id: x $': value }));
     f.commit(branch);
   }
+  f.ok(['checkout', '-q', 'tours']);
   expect(f.git(['merge', '--no-edit', 'ttheirs']).status).toBe(1);
   expect(f.ok(['diff', '--name-only', '--diff-filter=U'])).toBe(TIMINGS);
   convert(f);
