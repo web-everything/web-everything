@@ -231,6 +231,29 @@ describe('pr-land lane publish remote-tip check', () => {
     expect(stderr).not.toContain('push skipped');
   });
 
+  // The fetch-side tip says nothing about a different push destination, so it can neither skip nor refuse the
+  // push: a non-ancestor tip read from upstream must not block a valid push to the fork (red-team, #7307).
+  it.each([
+    ['a pushurl (or pushInsteadOf rewrite) differs', { pushUrls: 'git@github.com:fork/web-everything.git' }],
+    ['two remote.origin.url values', { fetchUrls: `${url}\nhttps://mirror.test/we.git`, pushUrls: `${url}\nhttps://mirror.test/we.git` }],
+    ['two push URLs', { pushUrls: `${url}\ngit@github.com:fork/web-everything.git` }],
+    ['the fetch URL read fails (exit 128)', { fetchUrls: 128 }],
+    ['the push URL read fails (exit 2)', { pushUrls: 2 }],
+  ])('fetch tip is not an ancestor but %s: no ancestry refusal, guarded push runs and reaches PR creation', (_name, urls) => {
+    const { status, effects } = publish({ remoteTip: tip(different), ancestor: false, ...urls });
+    expect(effects.some(([cmd, args]) => cmd === 'git' && args[0] === 'merge-base')).toBe(false);
+    expect(pushes(effects)).toEqual([['git', ['push', 'origin', `${sha}:refs/heads/lane/preflight`]]]);
+    expect(effects.some(([cmd]) => cmd === 'create')).toBe(true);
+    expect(status).toBe(0);
+  });
+
+  it('same single fetch/push URL and a non-ancestor tip: still refuses before push', () => {
+    const { status, result, effects } = publish({ remoteTip: tip(different), ancestor: false, fetchUrls: url, pushUrls: url });
+    expect(status).toBe(3);
+    expect(result.reason).toBe('push-failed');
+    expect(pushes(effects)).toEqual([]);
+  });
+
   it('dry-run plan names the skip when origin already holds HEAD', () => {
     const { status, result, effects } = publish({ dryRun: true, remoteTip: tip(sha) });
     expect(status).toBe(0); expect(result.reason).toBe('dry-run');

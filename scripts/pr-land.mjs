@@ -975,7 +975,11 @@ async function runCli() {
       const fetchUrls = urls([]), pushUrls = urls(['--push']);
       splitPushConfig = !(fetchUrls.length === 1 && pushUrls.length === 1 && fetchUrls[0] === pushUrls[0]);
     } catch { splitPushConfig = true; }
-    return { remoteTip, validRefSha, alreadyPublished: validRefSha && remoteTip === refSha && !splitPushConfig };
+    // The read tip describes the push destination only when both are the same single URL. Otherwise it can
+    // neither skip nor refuse the push; the non-force push itself enforces fast-forward on the real target.
+    const tipIsPushTarget = !splitPushConfig;
+    return { remoteTip, validRefSha, tipIsPushTarget,
+      alreadyPublished: validRefSha && remoteTip === refSha && tipIsPushTarget };
   }
 
   if (DRY_RUN) {
@@ -1148,10 +1152,10 @@ async function runCli() {
   // 2. Publish the source commit to the lane ref on origin (guard-safe: lane/*). Never force, no local branch.
   // Only an exact, readable remote tip can authorize skipping the guarded push.
   // Failed/malformed remote reads retain the normal push path and its pre-push guard.
-  const { remoteTip, validRefSha, alreadyPublished } = pushSkipDecision();
+  const { remoteTip, validRefSha, tipIsPushTarget, alreadyPublished } = pushSkipDecision();
   if (alreadyPublished) {
     process.stderr.write(`pr-land [${REPO}] · push skipped: ${REMOTE} already at ${refSha}\n`);
-  } else if (validRefSha && remoteTip) {
+  } else if (validRefSha && remoteTip && tipIsPushTarget) {
     try { gitC(['merge-base', '--is-ancestor', remoteTip, refSha]); }
     catch {
       emit({ repo: REPO, merged: false, reason: 'push-failed',
