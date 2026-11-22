@@ -3,13 +3,13 @@
  * @description S2 tracer evidence with isolated real-child regressions for Node runtime contracts.
  */
 import { describe, it, expect, vi } from 'vitest';
-import { resolve } from 'node:path';
+import { dirname, resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { promisify } from 'node:util';
 import { spawnSync } from 'node:child_process';
-import { existsSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { activateTrace, createTracer, startTrace, mergeTraces, compareCoverage } from '../dep-trace.mjs';
+import { activateTrace, createTracer, startTrace, mergeTraces, compareCoverage, nodeBinary } from '../dep-trace.mjs';
 import { initialize, load } from '../dep-trace-loader.mjs';
 import { runTraceCoverage } from '../../readiness/trace-coverage.mjs';
 
@@ -29,7 +29,9 @@ function fixture(extra = {}) {
   });
   const child_process = Object.fromEntries(['spawn', 'spawnSync', 'execFile', 'execFileSync', 'execSync', 'fork'].map(name => [name, vi.fn(() => 'child')]));
   const originals = { ...child_process };
-  const tracer = createTracer({ test, root, record, env, fs, child_process, ...extra });
+  // Mocked children: 'node' and the running binary count as Node; nodeBinary itself is tested against real files.
+  const isNodeBinary = command => command === 'node' || command === process.execPath;
+  const tracer = createTracer({ test, root, record, env, fs, child_process, isNodeBinary, ...extra });
   tracer.install();
   return { tracer, fs, child_process, originals, record, env };
 }
@@ -256,8 +258,16 @@ describe('shadow dependency tracer', () => {
     ['spawn node with a shell path', f => f.child_process.spawn('node', [], { shell: '/bin/bash' }), true],
     ['fork with a non-Node execPath', f => f.child_process.fork('script.mjs', [], { execPath: '/bin/cat' }), true],
     ['spawn of the running Node binary', f => f.child_process.spawn(process.execPath, ['-e', '0']), false],
-    ['spawn node by name', f => f.child_process.spawnSync('/usr/local/bin/node', ['-e', '0']), false],
-    ['fork with no execPath', f => f.child_process.fork('script.mjs'), false],
+    ['spawn node by name', f => f.child_process.spawnSync('node', ['-e', '0']), false],
+    ['spawn of another binary named node', f => f.child_process.spawnSync('/opt/other/node', ['-e', '0']), true],
+    ['node --run (a package script through a shell)', f => f.child_process.spawn('node', ['--run', 'build']), true],
+    ['node --permission (the hook may not load)', f => f.child_process.spawnSync('node', ['--permission', 'script.mjs']), true],
+    ['node --check=…', f => f.child_process.execFileSync('node', ['--check=1', 'script.mjs']), true],
+    ['fork with a --permission execArgv', f => f.child_process.fork('script.mjs', [], { execArgv: ['--permission'] }), true],
+    ['fork with a getter execArgv element', f => f.child_process.fork('script.mjs', [], { execArgv: Object.defineProperty([], 0, { enumerable: true, get: count }) }), true],
+    ['fork with plain execArgv', f => f.child_process.fork('script.mjs', [], { execArgv: ['--conditions=x'] }), false],
+    ['NODE_OPTIONS carrying --permission', f => f.child_process.spawn('node', [], { env: traceEnv({ NODE_OPTIONS: `--permission --import=${hookUrl}` }) }), true],
+    ['a huge sparse args array, bounded', f => f.child_process.spawn('node', new Array(2 ** 32 - 1)), true],    ['fork with no execPath', f => f.child_process.fork('script.mjs'), false],
     ['fork with execPath Node', f => f.child_process.fork('script.mjs', [], { execPath: process.execPath }), false],
   ])('a non-Node child marks the trace incomplete: %s', (_label, call, incomplete) => {
     const f = fixture();
@@ -303,6 +313,62 @@ describe('shadow dependency tracer', () => {
     expect(f.fs.readFileSync(target)).toBe('result');
     expect(reads).toBe(0);
     expect(f.tracer.snapshot()).toMatchObject({ incomplete: true, edges: [] });
+  });
+  it('nodeBinary accepts only the running Node binary, by path or first on an absolute PATH', () => {
+    const dir = mkdtempSync(resolve(tmpdir(), 'dep-trace-node-'));
+    try {
+      writeFileSync(resolve(dir, 'node'), '#!/bin/sh\ncat "$@"\n', { mode: 0o755 });
+      expect(nodeBinary(process.execPath, undefined, null)).toBe(true);
+      expect(nodeBinary('node', dirname(realpathSync(process.execPath)), root)).toBe(true);
+      expect(nodeBinary('node', `${dir}:${dirname(realpathSync(process.execPath))}`, root)).toBe(false);
+      expect(nodeBinary(resolve(dir, 'node'), undefined, root)).toBe(false);
+      expect(nodeBinary('node', undefined, root)).toBe(false);
+      expect(nodeBinary('node', `bin:${dirname(process.execPath)}`, root)).toBe(false);
+      expect(nodeBinary('cat', '/bin:/usr/bin', root)).toBe(false);
+      expect(nodeBinary('./node', dirname(process.execPath), null)).toBe(false);
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+  it('judges an inheriting child by the live process.env, as Node does at call time', () => {
+    const env = traceEnv();
+    const runtime = { once: vi.fn(), env };
+    const cp = { spawn: vi.fn() };
+    const tracer = activateTrace(env, { maxEdgesPerTest: 5000 }, {
+      fs: {}, child_process: cp, process: runtime, register: vi.fn(), syncBuiltinESMExports: vi.fn(),
+      MessageChannel: class { constructor() { this.port1 = { on: vi.fn(), unref: vi.fn() }; this.port2 = {}; } },
+    });
+    cp.spawn(process.execPath, ['-e', '0']);
+    expect(tracer.incomplete).toBe(false);
+    runtime.env = { ...env, WE_TRACE_DIR: resolve(root, 'elsewhere') };
+    cp.spawn(process.execPath, ['-e', '0']);
+    expect(tracer.incomplete).toBe(true);
+  });
+  it('wrappers keep the original name and length', () => {
+    const cp = { spawn: function spawn(a, b, c) { return [a, b, c]; } };
+    const io = { readFileSync: function readFileSync(p, o) { return [p, o]; }, promises: { readdir: async function readdir(p) { return p; } } };
+    createTracer({ test, root, env: {}, fs: io, child_process: cp }).install();
+    expect([cp.spawn.name, cp.spawn.length, io.readFileSync.name, io.readFileSync.length, io.promises.readdir.name])
+      .toEqual(['spawn', 3, 'readFileSync', 2, 'readdir']);
+  });
+  it('reads fs paths as Node does: a file: string is literal, a URL object converts from its pathname', () => {
+    const f = fixture();
+    f.fs.readFileSync(pathToFileURL(resolve(root, 'package.json')).href);
+    f.fs.readFileSync({ href: 'file:///wrong', protocol: 'file:', hostname: '', pathname: resolve(root, 'a.json') });
+    f.tracer.add(pathToFileURL(resolve(root, 'loaded.mjs')).href, 'load');
+    const files = f.tracer.snapshot().edges.map(edge => edge.file);
+    expect(files).toContain('a.json');
+    expect(files).toContain('loaded.mjs');
+    expect(files).not.toContain('package.json');
+    expect(files).not.toContain('wrong');
+  });
+  it('never calls a patched Buffer.from, and bounds a huge Buffer path', () => {
+    const f = fixture();
+    const path = Buffer.from(resolve(root, 'a.json'));
+    const from = vi.spyOn(Buffer, 'from');
+    try { f.fs.readFileSync(path); } finally { from.mockRestore(); }
+    expect(from).not.toHaveBeenCalled();
+    expect(f.tracer.snapshot()).toMatchObject({ incomplete: false, edges: [{ file: 'a.json', kind: 'read' }] });
+    f.fs.readFileSync(Buffer.alloc(70000, 'a'));
+    expect(f.tracer.snapshot().incomplete).toBe(true);
   });
   it('still traces getter-free env, inherited data keys, node:url and happy-dom URLs, and Buffer subclasses', () => {
     const f = fixture();
@@ -420,7 +486,8 @@ describe('shadow dependency tracer', () => {
     const tracer = createTracer({ test, root, record: vi.fn(), env, fs: {}, child_process: cp });
     tracer.install();
     const args = ['-e', '1'];
-    await expect(promisify(cp.execFile)('node', args)).resolves.toEqual({ stdout: 'ok', stderr: 'err' });
+    // The running binary by absolute path: this env has no PATH, so a bare `node` would be unprovable (incomplete).
+    await expect(promisify(cp.execFile)(process.execPath, args)).resolves.toEqual({ stdout: 'ok', stderr: 'err' });
     expect(custom.mock.calls[0]).toHaveLength(2);
     expect(custom.mock.calls[0][1]).toBe(args);
     expect(tracer.incomplete).toBe(false);

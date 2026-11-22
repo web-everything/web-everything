@@ -13,7 +13,7 @@ import fs from 'node:fs';
 import childProcess from 'node:child_process';
 import { register, syncBuiltinESMExports } from 'node:module';
 import { MessageChannel, receiveMessageOnPort, threadId } from 'node:worker_threads';
-import { resolve, relative, isAbsolute, sep, basename } from 'node:path';
+import { resolve, relative, isAbsolute, sep } from 'node:path';
 import { fileURLToPath, URL as NodeURL } from 'node:url';
 import { promisify, types } from 'node:util';
 
@@ -22,6 +22,42 @@ const ROOT = fileURLToPath(new URL('../../', hook));
 const defaults = { enabled: true, maxEdgesPerTest: 5000 };
 /** A read the tracer refused because it could run caller code; the evidence is then incomplete. */
 const UNSAFE = Symbol('unsafe');
+// Intrinsics captured before any test code runs, so a later monkeypatch never runs inside the tracer.
+const { statSync, accessSync, realpathSync, constants: { X_OK } } = fs;
+const bufferFrom = Buffer.from, bufferToString = Buffer.prototype.toString;
+/** Above these sizes the tracer stops reading and marks the evidence incomplete (Node judges the call). */
+const MAX_ARGS = 65536, MAX_PATH_BYTES = 65536;
+/** Node options with which the hook may not load, or the work runs outside Node (`--run` uses a shell). */
+const UNTRACED_FLAGS = ['--run', '--permission', '--experimental-permission', '--check', '-c'];
+const untracedFlag = word => typeof word === 'string' && UNTRACED_FLAGS.some(flag => word === flag || word.startsWith(`${flag}=`));
+
+/**
+ * True when `command` starts the running Node binary: a path resolving (via realpath) to execPath, or a bare
+ * name found first on the child's PATH whose realpath is execPath. Relative or empty PATH entries, Windows,
+ * and anything unreadable answer false (incomplete evidence). Uses the intrinsics captured above.
+ */
+export function nodeBinary(command, pathValue, cwd, execPath = process.execPath) {
+  if (typeof command !== 'string' || !command || process.platform === 'win32') return false;
+  const same = file => { try { return realpathSync(file) === realpathSync(execPath); } catch { return false; } };
+  if (command.includes(sep)) return isAbsolute(command) ? same(command) : cwd !== null && same(resolve(cwd, command));
+  if (typeof pathValue !== 'string') return false;
+  for (const dir of pathValue.split(':')) {
+    if (!isAbsolute(dir)) return false;
+    const file = resolve(dir, command);
+    try { if (!statSync(file).isFile()) continue; accessSync(file, X_OK); } catch { continue; }
+    return same(file);
+  }
+  return false;
+}
+
+/** Gives a wrapper the original's name and length, so a traced function looks like Node's own. */
+function mirror(wrapper, original) {
+  for (const key of ['name', 'length']) {
+    const d = Reflect.getOwnPropertyDescriptor(original, key);
+    if (d && Object.hasOwn(d, 'value')) Object.defineProperty(wrapper, key, d);
+  }
+  return wrapper;
+}
 
 /**
  * obj[key] read without running caller code, or UNSAFE. Walks the prototype chain by descriptor, refusing at a
@@ -57,15 +93,17 @@ function readEnv(childEnv) {
 
 /** Pure construction: only install() mutates the injected objects; record receives unique edges. */
 export function createTracer({ test, root, record = () => {}, fs: io = {}, child_process: cp = {},
-  env = {}, maxEdgesPerTest = 5000, warn = () => {}, execPath = process.execPath }) {
+  env = {}, maxEdgesPerTest = 5000, warn = () => {}, execPath = process.execPath, liveEnv = () => env,
+  isNodeBinary = (command, pathValue, cwd) => nodeBinary(command, pathValue, cwd, execPath) }) {
   // What a child must match to trace into this evidence; resolved at activation, before any chdir.
   const captured = { WE_CI_SELECTION: env.WE_CI_SELECTION === undefined ? undefined : `${env.WE_CI_SELECTION}`,
     WE_TRACE_DIR: env.WE_TRACE_DIR === undefined ? undefined : resolve(`${env.WE_TRACE_DIR}`) };
   const edges = new Map();
   const exists = io.statSync?.bind(io);
-  function path(value, cwd = root) {
+  function path(value, cwd = root, kind) {
     try {
-      value = typeof value === 'string' && value.startsWith('file:') ? fileURLToPath(value) : toPath(value);
+      // Only the loader reports URL strings; to fs and child_process a `file:` string is a literal relative path.
+      value = kind === 'load' && typeof value === 'string' && value.startsWith('file:') ? fileURLToPath(value) : toPath(value);
       if (value === UNSAFE) { markIncomplete(); return null; }
       if (value === null || value.startsWith('node:')) return null;
       // No working directory (it was deleted): only an absolute path can be resolved.
@@ -76,7 +114,7 @@ export function createTracer({ test, root, record = () => {}, fs: io = {}, child
     } catch { return null; }
   }
   function add(value, kind, cwd) {
-    const file = path(value, cwd);
+    const file = path(value, cwd, kind);
     if (file === null) return;
     const key = `${file}\0${kind}`;
     if (edges.has(key)) return;
@@ -94,14 +132,14 @@ export function createTracer({ test, root, record = () => {}, fs: io = {}, child
     a.file.localeCompare(b.file) || a.kind.localeCompare(b.kind)) }), install() {
     for (const [name, kind] of Object.entries({ readFileSync: 'read', readFile: 'read', readdirSync: 'list', existsSync: 'read' })) {
       const original = io[name];
-      if (original) io[name] = function (...args) { add(args[0], kind, here()); return Reflect.apply(original, this, args); };
+      if (original) io[name] = mirror(function (...args) { add(args[0], kind, here()); return Reflect.apply(original, this, args); }, original);
     }
     // Promise-based reads (fs/promises) are dependencies too; without this they would look like absent edges.
     const promises = io.promises;
     if (promises) {
       for (const [name, kind] of Object.entries({ readFile: 'read', readdir: 'list' })) {
         const original = promises[name];
-        if (typeof original === 'function') promises[name] = function (...args) { add(args[0], kind, here()); return Reflect.apply(original, this, args); };
+        if (typeof original === 'function') promises[name] = mirror(function (...args) { add(args[0], kind, here()); return Reflect.apply(original, this, args); }, original);
       }
     }
     // execSync calls Node's internal spawnSync, so it needs its own wrapper; exec reaches the exported execFile.
@@ -109,11 +147,11 @@ export function createTracer({ test, root, record = () => {}, fs: io = {}, child
       const original = cp[name];
       if (!original) continue;
       // Observe-only: the caller's arguments reach Node unchanged (same values, same count, same receiver).
-      cp[name] = function (...args) { observe(name, args); return Reflect.apply(original, this, args); };
+      cp[name] = mirror(function (...args) { observe(name, args); return Reflect.apply(original, this, args); }, original);
       // Keep util.promisify's {stdout, stderr} contract: the original custom promisifier gets the same untouched arguments.
       const custom = original[promisify.custom];
       if (typeof custom === 'function') {
-        Object.defineProperty(cp[name], promisify.custom, { configurable: true, value: function (...args) { observe(name, args); return Reflect.apply(custom, this, args); } });
+        Object.defineProperty(cp[name], promisify.custom, { configurable: true, value: mirror(function (...args) { observe(name, args); return Reflect.apply(custom, this, args); }, custom) });
       }
     }
   } };
@@ -128,15 +166,13 @@ export function createTracer({ test, root, record = () => {}, fs: io = {}, child
       const list = Array.isArray(args[0]) ? args[0] : null;
       const slot = list || args[0] == null ? 1 : 0;
       const options = args[slot] !== null && typeof args[slot] === 'object' ? args[slot] : {};
-      const [cwdOption, envOption, shell, forkExec] = ['cwd', 'env', 'shell', 'execPath'].map(key => peek(options, key));
-      const length = list ? peek(list, 'length') : 0;
-      if ([cwdOption, envOption, shell, forkExec, length].includes(UNSAFE)) return markIncomplete();
+      const [cwdOption, envOption, shell, forkExec, execArgv] = ['cwd', 'env', 'shell', 'execPath', 'execArgv'].map(key => peek(options, key));
+      if ([cwdOption, envOption, shell, forkExec, execArgv].includes(UNSAFE)) return markIncomplete();
       const values = [command];
-      for (let i = 0; i < length; i++) {
-        const value = peek(list, i);
-        if (value === UNSAFE) return markIncomplete();
-        values.push(value);
-      }
+      const nodeArgs = readList(list);
+      const forkArgs = name === 'fork' && execArgv != null ? readList(Array.isArray(execArgv) ? execArgv : null) : [];
+      if (nodeArgs === null || forkArgs === null) return markIncomplete();
+      values.push(...nodeArgs);
       // Resolve every cwd form Node accepts; any other value is left for Node to judge.
       let cwd = here();
       try {
@@ -150,26 +186,41 @@ export function createTracer({ test, root, record = () => {}, fs: io = {}, child
         if (file === null) continue;
         try { if (exists?.(resolve(root, file)).isFile()) add(value, 'spawn', cwd); } catch { /* not an existing script */ }
       }
+      // The child's real env, as Node builds it at call time: options.env, or the live process.env when falsy.
+      const childEnv = envOption || liveEnv();
+      const seen = childEnv === UNSAFE ? null : readEnv(childEnv);
+      if (seen === null) return markIncomplete();
       // A non-Node child (a shell, `cat`) never loads the hook, so whatever it reads is untraced.
-      if (!nodeChild(name, command, shell, forkExec)) return markIncomplete();
-      // The child's real env, as Node builds it: options.env, or process.env when falsy.
-      if (!childTraces(envOption || env, cwd)) markIncomplete();
+      if (!nodeChild(name, command, shell, forkExec, seen.PATH, cwd)) return markIncomplete();
+      // Flags with which the hook may not load, or that hand the work to a shell (`--run`).
+      if ((name === 'fork' ? forkArgs : nodeArgs).some(untracedFlag)) return markIncomplete();
+      if (!childTraces(seen, cwd)) markIncomplete();
     } catch { markIncomplete(); }
+  }
+  /** The elements of a caller array read by descriptor, or null when a getter, a Proxy or its size forbids it. */
+  function readList(array) {
+    if (array === null) return [];
+    const length = peek(array, 'length');
+    if (!Number.isSafeInteger(length) || length > MAX_ARGS) return null;
+    const values = [];
+    for (let i = 0; i < length; i++) {
+      const value = peek(array, i);
+      if (value === UNSAFE) return null;
+      values.push(value);
+    }
+    return values;
   }
   /**
    * True only when Node itself is the child: fork (its execPath unset or Node), or a shell-less spawn of Node.
    * execSync and any `shell` option run a shell first, whose command may read files untraced.
    */
-  function nodeChild(name, command, shell, forkExec) {
-    const isNode = file => typeof file === 'string' && (resolve(file) === execPath || /^node(\.exe)?$/i.test(basename(file)));
-    if (name === 'fork') return forkExec == null || isNode(forkExec);
-    return name !== 'execSync' && !shell && isNode(command);
+  function nodeChild(name, command, shell, forkExec, pathValue, cwd) {
+    if (name === 'fork') return forkExec == null || isNodeBinary(forkExec, pathValue, cwd);
+    return name !== 'execSync' && !shell && isNodeBinary(command, pathValue, cwd);
   }
   /** True only when the child will run this hook with the same test identity, output directory and settings. */
-  function childTraces(childEnv, cwd) {
+  function childTraces(seen, cwd) {
     try {
-      const seen = readEnv(childEnv);
-      if (seen === null) return false;
       if (seen.WE_TRACE_TEST !== test || seen.WE_CI_SELECTION !== captured.WE_CI_SELECTION) return false;
       if (seen.WE_TRACE_DIR === undefined || captured.WE_TRACE_DIR === undefined) return false;
       if (!isAbsolute(seen.WE_TRACE_DIR) && cwd === null) return false;
@@ -195,6 +246,8 @@ function importsHook(options) {
   }
   if (word !== null) words.push(word);
   const targets = new Set([hook, fileURLToPath(hook)]);
+  // A flag with which the hook may not load (or the work leaves Node) makes the child untraced.
+  if (words.some(untracedFlag)) return false;
   return words.some((value, i) => (value.startsWith('--import=') && targets.has(value.slice(9)))
     || (value === '--import' && targets.has(words[i + 1])));
 }
@@ -208,13 +261,19 @@ function importsHook(options) {
 function toPath(value) {
   if (typeof value === 'string') return value;
   // Intrinsic TypedArray getters: a subclass or own getter cannot run.
-  if (types.isUint8Array(value)) return Buffer.from(...[viewBuffer, viewOffset, viewLength].map(get => Reflect.apply(get, value, []))).toString();
+  if (types.isUint8Array(value)) {
+    const [buffer, offset, length] = [viewBuffer, viewOffset, viewLength].map(get => Reflect.apply(get, value, []));
+    return length > MAX_PATH_BYTES ? UNSAFE : Reflect.apply(bufferToString, Reflect.apply(bufferFrom, Buffer, [buffer, offset, length]), []);
+  }
   if (value === null || typeof value !== 'object') return null;
   // Node's own URL test: a legacy url.parse() result (it has auth/path) is not a URL to Node.
-  const [href, protocol, auth, legacy] = ['href', 'protocol', 'auth', 'path'].map(key => peek(value, key));
+  const [href, protocol, auth, legacy, hostname, pathname] = ['href', 'protocol', 'auth', 'path', 'hostname', 'pathname'].map(key => peek(value, key));
   if ([href, protocol, auth, legacy].includes(UNSAFE)) return UNSAFE;
-  if (typeof href === 'string' && protocol === 'file:' && auth === undefined && legacy === undefined) return fileURLToPath(href);
-  return null;
+  if (!href || !protocol || auth !== undefined || legacy !== undefined) return null;
+  if (protocol !== 'file:') return null;
+  // Node converts a URL object from its hostname and pathname (not href); only plain strings are read.
+  if (typeof hostname !== 'string' || typeof pathname !== 'string') return UNSAFE;
+  return fileURLToPath(value);
 }
 const typedArray = Object.getPrototypeOf(Uint8Array.prototype);
 const [viewBuffer, viewOffset, viewLength] = ['buffer', 'byteOffset', 'byteLength']
@@ -299,7 +358,9 @@ export function activateTrace(env, settings, { fs: io = fs, child_process: cp = 
   MessageChannel: Channel = MessageChannel, register: registerLoader = register, syncBuiltinESMExports: syncExports = syncBuiltinESMExports,
   receiveMessageOnPort: receive = receiveMessageOnPort, threadId: tid = threadId } = {}) {
   const outputDir = resolve(env.WE_TRACE_DIR);
-  const tracer = createTracer({ test: env.WE_TRACE_TEST, root: ROOT, env, fs: io, child_process: cp,
+  // Node reads process.env at call time, so a test that reassigns it changes what a child inherits.
+  const liveEnv = () => { const live = peek(runtime, 'env'); return live === undefined ? env : live; };
+  const tracer = createTracer({ test: env.WE_TRACE_TEST, root: ROOT, env, liveEnv, fs: io, child_process: cp,
     maxEdgesPerTest: settings.maxEdgesPerTest, warn: message => console.error(message) });
   const { port1, port2 } = new Channel();
   port1.on('message', url => tracer.add(url, 'load'));

@@ -5111,7 +5111,12 @@ A child whose real env (`options.env || process.env`) lacks this `--import` hook
 the same `WE_TRACE_TEST`, a `WE_TRACE_DIR` resolving to the same directory, or the same
 `WE_CI_SELECTION` marks the evidence `incomplete`. A trace without the flag also counts as incomplete.
 A non-Node child also marks it `incomplete`: `execSync` and any `shell` option (a shell runs first), a
-command other than the running Node binary or `node`, and `fork` with a non-Node `execPath`.
+command whose realpath is not the running Node binary (a bare name is looked up on the child's PATH; a
+relative or empty PATH entry is unknown), `fork` with a non-Node `execPath`, and a Node child whose args,
+`execArgv` or `NODE_OPTIONS` carry `--run`, `--permission`, `--experimental-permission` or `--check`/`-c`.
+An inheriting child is judged by the live `process.env` at call time. Args arrays over 65536 entries and
+path buffers over 65536 bytes are not read and mark the trace `incomplete`. A `file:` string is a URL only
+for loader edges; to `fs` it is a literal path, and a URL object converts from its hostname and pathname.
 Node reads every caller value again, so the tracer never runs caller code: options, env, args and path
 values are read by descriptor, and a getter, a Proxy or an object env value (whose `toString` would run)
 is left to Node untouched and marks the trace `incomplete`. Only node:url's own `URL` getters (also
