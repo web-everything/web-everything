@@ -14,6 +14,7 @@ import { buildPlans, gitTrackedFiles, parseArgs } from '../sync-skills-deploy.mj
 import * as skillsSync from '../sync-skills-deploy.mjs';
 
 const MODULE_PATH = join(dirname(fileURLToPath(import.meta.url)), '..', 'sync-skills-deploy.mjs');
+const GIT_REPO_ENV = ['GIT_DIR', 'GIT_WORK_TREE', 'GIT_INDEX_FILE', 'GIT_COMMON_DIR', 'GIT_PREFIX'];
 let tmp;
 beforeEach(() => { tmp = mkdtempSync(join(tmpdir(), 'sync-multiroot-')); });
 afterEach(() => { try { rmSync(tmp, { recursive: true, force: true }); } catch { /* best-effort */ } });
@@ -41,6 +42,8 @@ function runCli(args, overrides = {}) {
   const env = { ...process.env, HOME: join(tmp, 'home'), WE_SKILLS_DEPLOY_DIR: join(tmp, 'dest'), ...overrides };
   delete env.WE_SKILLS_EXTRA_ROOTS;
   delete env.WE_SKILLS_SRC_ROOT;
+  // A test run started from a git hook inherits these; a control run must not.
+  for (const key of GIT_REPO_ENV) delete env[key];
   Object.assign(env, overrides);
   return spawnSync(process.execPath, [MODULE_PATH, ...args], { env, encoding: 'utf8', timeout: 20_000 });
 }
@@ -349,5 +352,76 @@ describe('multi-root source list', () => {
     expect(r.status).toBe(1);
     expect(r.stdout).toMatch(/UNTRACKED fresh/);
     expect(existsSync(join(dest, 'fresh'))).toBe(false);
+  });
+});
+
+describe('operator send-back: one home per root spelling', () => {
+  const summary = (r) => ({ status: r.status, stderr: r.stderr, json: r.stdout ? JSON.parse(r.stdout) : null });
+
+  it.each([
+    ['a trailing slash', (root) => `${root}/`],
+    ['a doubled trailing slash', (root) => `${root}//`],
+    ['a dot segment', (root) => join(root, '..', 'skills') + '/.'],
+    ['a symlink alias', (root) => { const alias = join(tmp, 'ops alias'); symlinkSync(root, alias, 'dir'); return alias; }],
+  ])('--root naming the default ops root with %s exits 0, same as without it', (_label, spell) => {
+    const ops = gitRepoWithSkills('home/workspace/plateau-ops', ['ops-probe']);
+    const args = ['--dry-run', '--json', '--only=ops-probe'];
+    const control = runCli(args);
+    const spelled = runCli([...args, `--root=${spell(ops.root)}`]);
+    expect(control.status).toBe(0);
+    expect(summary(spelled)).toEqual(summary(control));
+  });
+
+  it('resolveRoots normalizes each root and keeps one entry per real directory', () => {
+    const ops = gitRepoWithSkills('home/workspace/plateau-ops', ['ops-probe']);
+    const primary = gitRepoWithSkills('we', ['alpha']);
+    const env = { WE_SKILLS_EXTRA_ROOTS: `${ops.root}/` };
+    const args = parseArgs([`--root=${ops.root}//`, `--root=${primary.root}/`]);
+    expect(skillsSync.resolveRoots({ ...env, WE_SKILLS_SRC_ROOT: `${primary.root}/` }, args, join(tmp, 'home')))
+      .toEqual({ srcRoot: primary.root, extraRoots: [ops.root] });
+  });
+
+  it('buildPlans treats two spellings of one extra root, or the primary root again, as one home', () => {
+    const a = gitRepoWithSkills('we', ['alpha']);
+    const b = gitRepoWithSkills('ops', ['beta']);
+    const plans = buildPlans({ srcRoot: a.root, extraRoots: [b.root, `${b.root}/`, `${a.root}/`], destRoot: join(tmp, 'dest'), all: true });
+    expect(plans.map((p) => p.name)).toEqual(['alpha', 'beta']);
+  });
+});
+
+describe('operator send-back: inherited Git repository environment', () => {
+  const weGitDir = execFileSync('git', ['rev-parse', '--absolute-git-dir'], { cwd: dirname(MODULE_PATH), encoding: 'utf8' }).trim();
+  const weTop = execFileSync('git', ['rev-parse', '--show-toplevel'], { cwd: dirname(MODULE_PATH), encoding: 'utf8' }).trim();
+  const view = (r) => {
+    const j = JSON.parse(r.stdout);
+    return { status: r.status, untrackedSkills: j.untrackedSkills, skills: j.skills.map(({ name, untracked, actions }) => ({ name, untracked, actions })) };
+  };
+
+  it.each([
+    ['GIT_DIR', () => ({ GIT_DIR: weGitDir })],
+    ['GIT_DIR + GIT_WORK_TREE', () => ({ GIT_DIR: weGitDir, GIT_WORK_TREE: weTop })],
+    ['GIT_INDEX_FILE', () => ({ GIT_INDEX_FILE: join(tmp, 'no-such-index') })],
+    ['every repository variable', () => ({
+      GIT_DIR: weGitDir, GIT_WORK_TREE: weTop, GIT_INDEX_FILE: join(tmp, 'no-such-index'),
+      GIT_COMMON_DIR: weGitDir, GIT_PREFIX: 'scripts/',
+    })],
+  ])('with an inherited %s both ops skills are still tracked', (_label, envFor) => {
+    gitRepoWithSkills('home/workspace/plateau-ops', ['providers', 'review-design']);
+    const args = ['--dry-run', '--json', '--only=providers,review-design'];
+    const control = runCli(args);
+    expect(view(control)).toMatchObject({ status: 0, untrackedSkills: [] });
+    expect(view(control).skills.map((s) => s.untracked)).toEqual([false, false]);
+    expect(view(runCli(args, envFor()))).toEqual(view(control));
+  });
+
+  it('the shared tracked-file reader ignores an inherited GIT_DIR', () => {
+    const ops = gitRepoWithSkills('ops', ['beta']);
+    const saved = process.env.GIT_DIR;
+    process.env.GIT_DIR = weGitDir;
+    try {
+      expect(gitTrackedFiles(join(ops.root, 'beta'), ops.repo)).toEqual(['SKILL.md']);
+    } finally {
+      if (saved === undefined) delete process.env.GIT_DIR; else process.env.GIT_DIR = saved;
+    }
   });
 });

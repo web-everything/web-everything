@@ -97,11 +97,27 @@ export function listFilesRecursive(dir) {
   return out;
 }
 
+/** Repository-selecting variables a git hook exports. Inherited, they point every git call at the
+ *  hook's repo instead of the root being read, so a secondary root's skills read as untracked. */
+export const GIT_REPO_ENV = Object.freeze(['GIT_DIR', 'GIT_WORK_TREE', 'GIT_INDEX_FILE', 'GIT_COMMON_DIR', 'GIT_PREFIX']);
+
+/** `env` without the repository-selecting git variables. */
+export function gitRootEnv(env = process.env) {
+  const clean = { ...env };
+  for (const key of GIT_REPO_ENV) delete clean[key];
+  return clean;
+}
+
+/** Run git against `dir` alone: `-C <dir>` and no inherited repository variables. */
+function gitAt(dir, args) {
+  return execFileSync('git', ['-C', dir, ...args], { env: gitRootEnv(), encoding: 'utf8', maxBuffer: 16 * 1024 * 1024 });
+}
+
 /** The files `git` tracks under `srcDir`, as paths relative to `srcDir`. */
 export function gitTrackedFiles(srcDir, repoRoot = REPO_ROOT) {
   // Git discovers physical repo paths; source roots and explicit repo roots may use symlink aliases.
   const relToRepo = path.relative(fs.realpathSync(repoRoot), fs.realpathSync(srcDir));
-  const out = execFileSync('git', ['ls-files', '--', relToRepo], { cwd: repoRoot, encoding: 'utf8' });
+  const out = gitAt(repoRoot, ['ls-files', '--', relToRepo]);
   return out.split('\n').filter(Boolean).map((p) => path.relative(relToRepo, p));
 }
 
@@ -251,7 +267,15 @@ export function buildPlans({ srcRoot = SRC_ROOT, extraRoots = [], destRoot, only
   if (!repoRoot) repoRoot = fs.existsSync(srcRoot) ? gitToplevel(srcRoot) : REPO_ROOT;
   // SK1: one home per skill. Primary root uses `repoRoot`; each extra root is its own git repo (found via
   // `git rev-parse`; fails closed if it is not one).
-  const roots = [{ root: srcRoot, repoRoot }, ...extraRoots.map((r) => ({ root: path.resolve(r), repoRoot: gitToplevel(r) }))];
+  // Two spellings of one directory (trailing slash, `.` segment, symlink alias) are one home, not two.
+  const seen = new Set([realpathOrSelf(srcRoot)]);
+  const uniqueExtras = extraRoots.map((r) => path.resolve(r)).filter((r) => {
+    const key = realpathOrSelf(r);
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+  const roots = [{ root: srcRoot, repoRoot }, ...uniqueExtras.map((r) => ({ root: r, repoRoot: gitToplevel(r) }))];
   const home = new Map(); // name -> { root, repoRoot }
   for (const entry of roots) {
     for (const name of listSkillNames(entry.root)) {
@@ -290,7 +314,7 @@ export function buildPlans({ srcRoot = SRC_ROOT, extraRoots = [], destRoot, only
 
 function gitToplevel(dir) {
   try {
-    return execFileSync('git', ['rev-parse', '--show-toplevel'], { cwd: dir, encoding: 'utf8', maxBuffer: 1024 * 1024 }).trim();
+    return gitAt(dir, ['rev-parse', '--show-toplevel']).trim();
   } catch {
     throw new Error(`sync-skills-deploy: extra root "${dir}" is not inside a git repo; refusing`);
   }
@@ -336,7 +360,7 @@ export function formatPlans(plans, { checkOnly, dryRun, noun = 'skill' }) {
 }
 
 /** Root-selection decisions are deterministic given env, args, home and the injectable existence probe. */
-export function resolveRoots(env = process.env, args = { roots: [] }, home = os.homedir(), exists = fs.existsSync) {
+export function resolveRoots(env = process.env, args = { roots: [] }, home = os.homedir(), exists = fs.existsSync, realpath = realpathOrSelf) {
   const srcRoot = env.WE_SKILLS_SRC_ROOT ? path.resolve(env.WE_SKILLS_SRC_ROOT) : SRC_ROOT;
   if (!exists(srcRoot)) throw new Error(`sync-skills-deploy: missing skills-src at ${srcRoot}`);
   // Extra roots: --root=<dir> (repeatable) and WE_SKILLS_EXTRA_ROOTS (path-delimited, e.g. plateau-ops/skills).
@@ -347,9 +371,23 @@ export function resolveRoots(env = process.env, args = { roots: [] }, home = os.
   const explicit = [...envRoots, ...args.roots];
   const missing = explicit.filter((r) => !exists(r));
   if (missing.length) throw new Error(`sync-skills-deploy: source root(s) not found: ${missing.join(', ')}`);
-  const extraRoots = [...(env.WE_SKILLS_SRC_ROOT ? [] : [defaultOps]), ...explicit]
-    .filter((r, i, a) => exists(r) && a.indexOf(r) === i);
+  // One entry per real directory: `<ops>/skills/`, `<ops>/skills` and a symlink alias are the same home,
+  // so they must not trip the two-homes refusal. A root that is the primary root is the primary root.
+  const seen = new Set([realpath(srcRoot)]);
+  const extraRoots = [];
+  for (const r of [...(env.WE_SKILLS_SRC_ROOT ? [] : [defaultOps]), ...explicit].map((p) => path.resolve(p))) {
+    if (!exists(r)) continue;
+    const key = realpath(r);
+    if (seen.has(key)) continue;
+    seen.add(key);
+    extraRoots.push(r);
+  }
   return { srcRoot, extraRoots };
+}
+
+/** realpath, or the resolved path itself when it cannot be read (an injected `exists` probe in tests). */
+function realpathOrSelf(p) {
+  try { return fs.realpathSync(p); } catch { return path.resolve(p); }
 }
 
 async function main() {
