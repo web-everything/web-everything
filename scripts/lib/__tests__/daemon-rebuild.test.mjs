@@ -919,6 +919,30 @@ describe('rebuildClone', () => {
 
   // Advisory 2026-09-25 (PR #2625): a corrupt overlay file read as "no overlays", so the next rebuild silently
   // built main alone and dropped every registered fix, with no alert anywhere.
+  // Default (non-strict) tick-start mode keeps the original overlay-state-corrupt refusal and alert.
+  it('a corrupt overlay-state file refuses the rebuild with an alert, never builds main alone', async () => {
+    const { originDir, cloneDir, env } = makeFixture();
+    env.WE_DAEMON_REBUILD_STRICT_EVIDENCE = '0';
+    pushBranch(originDir, 'lane/kept', (dir) => writeFile(dir, 'kept.txt', 'x\n'));
+    addOverlay(cloneDir, { ref: 'lane/kept' }, { env });
+    const first = await rebuildClone({ root: cloneDir, env, runSmoke: passSmoke(), prState: async () => null, lockOpts: LOCK_OPTS });
+    expect(first.adopted).toBe(true);
+    const headBefore = gitOk(cloneDir, ['rev-parse', 'HEAD']).trim();
+    advanceMain(originDir, (dir) => writeFile(dir, 'main-next.txt', 'y\n'));
+    writeFileSync(overlayFilePath(cloneDir, env), '{ not json');
+
+    const runSmoke = passSmoke();
+    const result = await rebuildClone({ root: cloneDir, env, launchedBy: 'tick-start', runSmoke, prState: async () => null, lockOpts: LOCK_OPTS });
+
+    expect(result.moved).toBe(false);
+    expect(result.reason).toBe('overlay-state-corrupt');
+    expect(result.alerts.some((a) => a.kind === 'overlay-state-corrupt')).toBe(true);
+    expect(runSmoke).not.toHaveBeenCalled();
+    expect(gitOk(cloneDir, ['rev-parse', 'HEAD']).trim()).toBe(headBefore);
+    expect(existsSync(join(cloneDir, 'kept.txt'))).toBe(true);
+    expect(readFileSync(overlayFilePath(cloneDir, env), 'utf8')).toBe('{ not json'); // left for a person to inspect
+  });
+
   it('a corrupt overlay-state file refuses as state-unreadable with a visible log, never builds main alone', async () => {
     const { originDir, cloneDir, env } = makeFixture();
     env.WE_DAEMON_REBUILD_STRICT_EVIDENCE = '1';

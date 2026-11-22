@@ -413,6 +413,26 @@ describe('R508 force-adopt: sticky rejection, pinned ready record, finalization'
     expect(headOf(cloneDir)).toBe(lastGood);
   });
 
+  // The force watch is read strictly at every tick start, so the strict-evidence rollback switch (=0) must not
+  // weaken it: a corrupt watch still fails closed and the request stays pending, untouched.
+  it('default mode: an unreadable watch file still fails closed with strict evidence off (no re-smoke, request kept)', async () => {
+    const { cloneDir, env, target, arm, lastGood } = setup();
+    env.WE_DAEMON_REBUILD_STRICT_EVIDENCE = '0';
+    const failThenPass = vi.fn().mockResolvedValueOnce((await failing()()))
+      .mockResolvedValue({ verdict: 'pass', attempts: 1, smoke: { results: [] } });
+    await tick(cloneDir, env, { runSmoke: failThenPass });
+    writeFileSync(join(env.WE_DAEMON_STATE_DIR, `${cloneKeyOf(cloneDir)}.force-watch.json`), '{corrupt');
+    arm();
+    const request = readForceAdopt(cloneDir, env);
+    const smoke = failing();
+    for (let i = 0; i < 2; i += 1) expect((await tick(cloneDir, env, { runSmoke: smoke, forceWatchProbe: healthy })).reason).toBe('state-unreadable');
+    expect(smoke).not.toHaveBeenCalled();
+    expect(readForceAdopt(cloneDir, env)).toEqual(request);
+    expect(readForceAdopt(cloneDir, env)).toMatchObject({ sha: target });
+    expect(readFileSync(join(env.WE_DAEMON_STATE_DIR, `${cloneKeyOf(cloneDir)}.force-watch.json`), 'utf8')).toBe('{corrupt');
+    expect(headOf(cloneDir)).toBe(lastGood);
+  });
+
   it.each([
     ['up-to-date', 'the clone already runs another current build'],
     ['untracked-collision', 'an untracked file collides with the forced build'],
@@ -469,6 +489,25 @@ describe('R508 force-adopt: sticky rejection, pinned ready record, finalization'
     expect(readReadyCandidate(cloneDir, env)).toMatchObject({ forced: true }); // kept, not dropped
     expect(log.error).toHaveBeenCalledWith(expect.stringContaining('state-unreadable'));
     expect(readFileSync(watchFileOf(cloneDir, env), 'utf8')).toBe('{corrupt');
+    expect(alertsOf(cloneDir, env).some((a) => a.kind === 'ready-candidate-discarded')).toBe(false);
+    writeFileSync(watchFileOf(cloneDir, env), intact); // the read recovers
+    const again = await tick(cloneDir, env, { runSmoke: failing(), forceWatchProbe: healthy });
+    expect(again.reason).toBe('ready-adopted');
+    expect(headOf(cloneDir)).toBe(target);
+  });
+
+  it('default mode: a forced ready candidate whose rollback watch is UNREADABLE is not adopted with strict evidence off, and is KEPT', async () => {
+    const { cloneDir, env, lastGood, target, arm } = setup();
+    env.WE_DAEMON_REBUILD_STRICT_EVIDENCE = '0';
+    arm();
+    await tick(cloneDir, env, { runSmoke: failing(), readyOnly: true });
+    expect(readReadyCandidate(cloneDir, env)).toMatchObject({ forced: true });
+    const intact = readFileSync(watchFileOf(cloneDir, env), 'utf8');
+    writeFileSync(watchFileOf(cloneDir, env), '{corrupt');
+    const r = await tick(cloneDir, env, { runSmoke: failing(), forceWatchProbe: healthy });
+    expect(r.reason).toBe('state-unreadable');
+    expect(headOf(cloneDir)).toBe(lastGood); // fail closed: never adopted while its watch cannot be read
+    expect(readReadyCandidate(cloneDir, env)).toMatchObject({ forced: true }); // kept, not dropped
     expect(alertsOf(cloneDir, env).some((a) => a.kind === 'ready-candidate-discarded')).toBe(false);
     writeFileSync(watchFileOf(cloneDir, env), intact); // the read recovers
     const again = await tick(cloneDir, env, { runSmoke: failing(), forceWatchProbe: healthy });
