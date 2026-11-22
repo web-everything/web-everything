@@ -29,6 +29,8 @@ function fixture(test) {
     if (args[0] === 'pr') return JSON.stringify({ headRefOid: f.head, mergeStateStatus: 'CLEAN',
       statusCheckRollup: [{ status: 'COMPLETED', conclusion: 'SUCCESS' }], labels: ['ready-to-merge'] });
     const endpoint = args.find(a => a.startsWith('repos/'));
+    if (endpoint?.includes('/actions/runs?head_sha=')) return JSON.stringify({ total_count: 1,
+      workflow_runs: [{ created_at: '2099-01-01T00:00:00Z' }] });
     if (endpoint?.includes('/check-runs') && f.checksOverride) return JSON.stringify(f.checksOverride);
     if (endpoint?.includes('/check-runs')) return JSON.stringify({ total_count: 1, check_runs: [{
       id: 12, name: 'test-shard (1)', head_sha: merge, status: 'completed', conclusion: 'failure',

@@ -117,7 +117,7 @@ export function readMqTimeline({ repo, pr, exec = execFileSync } = {}) {
 export const mqSameHeadRefreshStatePath = (env = process.env) => env.WE_DRAIN_MQ_REFRESH_STATE_PATH
   || join(homedir(), '.claude', 'conveyor', 'mq-same-head-refresh-state.json');
 
-/** Append-only spent heads. All readers/writers share a lock, never a cached snapshot. */
+/** Append-only claims with sidecar times. Writers share a lock, never a cached snapshot. */
 export function createMqSameHeadRefreshStore({ path = mqSameHeadRefreshStatePath() } = {}) {
   const load = () => {
     let saved;
@@ -126,16 +126,29 @@ export function createMqSameHeadRefreshStore({ path = mqSameHeadRefreshStatePath
     if (!Array.isArray(saved) || saved.some(key => typeof key !== 'string')) throw new Error('invalid refresh ledger');
     return new Set(saved);
   };
+  const loadTimes = () => {
+    let times;
+    try { times = JSON.parse(readFileSync(`${path}.times.json`, 'utf8')); }
+    catch (error) { if (error.code === 'ENOENT') return {}; throw error; }
+    if (!times || Array.isArray(times) || typeof times !== 'object'
+      || Object.values(times).some(time => !Number.isSafeInteger(time) || time < 0))
+      throw new Error('invalid refresh claim times');
+    return times;
+  };
   return {
     has: key => load().has(key),
+    claimedAt: key => loadTimes()[key] ?? null,
     hasPr: (repo, pr) => [...load()].some(key => key.startsWith(`${repo}#${pr}@`)),
     claim(key) {
-      // Contention never falls back to an unlocked write. A failed request also spends its head.
+      // Contention never falls back to an unlocked write. Failed requests retain their claims.
       mkdirSync(dirname(path), { recursive: true });
       return withFileLock(`${path}.lock`, () => {
         const keys = load();
         if (keys.has(key)) return false;
+        const times = loadTimes();
+        times[key] = Date.now();
         keys.add(key);
+        writeJsonAtomic(`${path}.times.json`, times, { mode: 0o600 });
         writeJsonAtomic(path, [...keys], { mode: 0o600 });
         return true;
       }, { timeoutMs: 0 });
@@ -227,14 +240,15 @@ function mqRefreshChecksGreen(checks, exec, opts) {
   });
 }
 
-function mqSameHeadRefresh({ repo, pr, head, exec, log, store, allow }) {
+function mqSameHeadRefresh({ repo, pr, head, exec, log, store, allow, retry = false }) {
   const key = `${repo}#${pr}@${head}`;
+  const claimKey = retry ? `${key}#retry` : key;
   const safe = value => String(value ?? '').replace(/[\x00-\x1f\x7f-\x9f\u2028\u2029]/g, ' ');
   const prefix = `mq-same-head-refresh: #${safe(pr)} head ${safe(head)} — `;
   const skip = reason => logMqRefreshSkip({ repo, pr, head, log }, reason);
   const unavailable = () => skip('state unavailable; inspect shared refresh ledger and lock before retrying');
   if (!store) { unavailable(); return; }
-  try { if (store.has(key)) { skip('already requested'); return; } } catch { unavailable(); return; }
+  try { if (store.has(claimKey)) { skip('already requested'); return; } } catch { unavailable(); return; }
   exec = createMqLiveReader(exec);
   const opts = { encoding: 'utf8', timeout: 60_000, maxBuffer: 4 * 1024 * 1024,
     stdio: ['ignore', 'pipe', 'pipe'], throttle: { maxAttempts: 1 } };
@@ -277,12 +291,12 @@ function mqSameHeadRefresh({ repo, pr, head, exec, log, store, allow }) {
     if (names.some(name => typeof name !== 'string' || !name.trim())) { skip('labels unreadable'); return; }
     if (sendBackReason(names) || redTeamLabelHoldReason(names)) { skip('blocking label'); return; }
   } catch { skip(stage); return; }
-  try { if (store.claim(key) !== true) { skip('claim lost'); return; } }
+  try { if (store.claim(claimKey) !== true) { skip('claim lost'); return; } }
   catch { unavailable(); return; }
   try {
     exec('gh', ['api', '-X', 'PUT', `repos/${repo}/pulls/${pr}/update-branch`,
       '-f', `expected_head_sha=${head}`], opts);
-    log(`${prefix}update-branch requested`);
+    log(`${prefix}${retry ? 'update-branch retried (earlier recorded refresh never executed)' : 'update-branch requested'}`);
     // GitHub can create a new merge commit. Bind that generated head to the spent
     // attempt too; a later author push still has its own independent ledger key.
     try {
@@ -298,7 +312,7 @@ function mqSameHeadRefresh({ repo, pr, head, exec, log, store, allow }) {
     const message = safe(String(error?.stderr || error?.message || error).split('\n')[0]).slice(0, 240);
     log(`${prefix}update-branch refused (${message}); not retrying at this head`);
   }
-  return true; // The claim is spent even when update-branch refuses the request.
+  return true; // Keep the claim even when update-branch refuses; recovery allows at most one retry.
 }
 
 const timelineHasConflict = timeline => Array.isArray(timeline?.nodes)
@@ -389,13 +403,34 @@ export function mqSameHeadGuard({ repo, pr, head, exec = execFileSyncThrottled, 
       && mqFailureReasons.has(mqRemovalReason(event))
       && mqOid(event.beforeCommit?.parents?.nodes?.[1]?.oid) === currentHead) : [];
     if (removals.length) {
-      let spent = false, ledgerUnreadable = false;
+      let spent = false, ledgerUnreadable = false, retry = false, runEvidenceUnreadable = false;
       try {
         const store = refresh?.store, key = `${repo}#${pr}@${currentHead}`;
         spent = store?.has(key) === true;
+        if (spent) {
+          const retryClaimed = store.has(`${key}#retry`);
+          const claimedAt = store.claimedAt(retryClaimed ? `${key}#retry` : key);
+          let executed = false;
+          if (claimedAt !== null) {
+            runEvidenceUnreadable = true;
+            const runs = JSON.parse(exec('gh', ['api', `repos/${repo}/actions/runs?head_sha=${currentHead}&per_page=100`], {
+              encoding: 'utf8', timeout: 60_000, maxBuffer: 4 * 1024 * 1024,
+              stdio: ['ignore', 'pipe', 'pipe'], throttle: { maxAttempts: 1 },
+            }));
+            if (!Number.isSafeInteger(claimedAt) || claimedAt < 0
+              || !Number.isSafeInteger(runs?.total_count) || runs.total_count < 0 || runs.total_count > 100
+              || !Array.isArray(runs.workflow_runs) || runs.workflow_runs.length !== runs.total_count
+              || runs.workflow_runs.some(run => typeof run?.created_at !== 'string' || !Number.isFinite(Date.parse(run.created_at))))
+              throw new Error('refresh run evidence unreadable or incomplete');
+            executed = runs.workflow_runs.some(run => Date.parse(run.created_at) > claimedAt);
+            runEvidenceUnreadable = false;
+          }
+          spent = executed || retryClaimed;
+          retry = !spent;
+        }
         // Recover successor binding if the process died or the post-write read failed.
         // A normal author commit has one parent and receives its own attempt.
-        if (!spent && store?.hasPr?.(repo, pr) === true) {
+        if (!spent && !retry && store?.hasPr?.(repo, pr) === true) {
           const commit = JSON.parse(exec('gh', ['api', `repos/${repo}/commits/${currentHead}`], {
             encoding: 'utf8', timeout: 60_000, maxBuffer: 1024 * 1024,
             stdio: ['ignore', 'pipe', 'pipe'], throttle: { maxAttempts: 1 },
@@ -409,11 +444,15 @@ export function mqSameHeadGuard({ repo, pr, head, exec = execFileSyncThrottled, 
           }
         }
       }
-      catch { ledgerUnreadable = true; }
+      catch {
+        if (runEvidenceUnreadable) spent = true;
+        else ledgerUnreadable = true;
+      }
       retriesExhausted = ledgerUnreadable ? undefined : spent;
       if (removals.length > 1 || spent || ledgerUnreadable) {
         recoveryAction = 'fixer';
         detail = ledgerUnreadable ? 'refresh ledger unreadable; hold for fixer inspection'
+          : runEvidenceUnreadable ? 'refresh run evidence unreadable or incomplete; inspect Actions runs and shared refresh ledger; hold for fixer inspection'
           : 'single refresh already spent or second same-head failure; hold for fixer';
         // Queue additions never renew a claim for this exact authored head.
         if (spent && refresh && !dryRun) logMqRefreshSkip({ repo, pr, head: currentHead, log }, 'already requested');
@@ -424,7 +463,7 @@ export function mqSameHeadGuard({ repo, pr, head, exec = execFileSyncThrottled, 
         recoveryAction = diagnostic.realFailure ? 'fixer' : 'refresh-first';
         detail = diagnostic.detail;
         if (refresh && !dryRun && !diagnostic.realFailure
-          && mqSameHeadRefresh({ repo, pr, head: currentHead, exec, log, ...refresh }) === true)
+          && mqSameHeadRefresh({ repo, pr, head: currentHead, exec, log, ...refresh, retry }) === true)
           retriesExhausted = true;
       }
       log(`mq-same-head-recovery: #${String(pr).replace(/\D/g, '')} head ${currentHead} — ${detail}`);

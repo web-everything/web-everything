@@ -79,6 +79,10 @@ describe('merge-queue same-head failure admission', () => {
       }, log: vi.fn(), approvedHeadHold: vi.fn(() => false), enqueueAllowed: vi.fn(() => true) };
       f.workflowRuns = new Map();
       f.exec = vi.fn((_command, args) => {
+        if (args.includes(`repos/${repo}/actions/runs?head_sha=${head}&per_page=100`)) {
+          if (f.runs instanceof Error) throw f.runs;
+          return JSON.stringify(f.runs ?? { total_count: 1, workflow_runs: [{ created_at: '2099-01-01T00:00:00Z' }] });
+        }
         const runPath = args.find(arg => /^repos\/[^/]+\/[^/]+\/actions\/runs\/\d+$/.test(arg));
         if (runPath) {
           const result = f.workflowRuns.get(runPath.split('/').at(-1));
@@ -644,13 +648,62 @@ describe('merge-queue same-head failure admission', () => {
       expect(mqSameHeadRefreshStatePath({})).toBe(join(homedir(), '.claude', 'conveyor', 'mq-same-head-refresh-state.json'));
       expect(mqSameHeadRefreshStatePath({ WE_DRAIN_MQ_REFRESH_STATE_PATH: '/fixture/state.json' })).toBe('/fixture/state.json');
     });
-    it('held CLEAN green requests exactly once across passes and a second store instance', () => fixture(f => {
+    it('executed refresh (CI run after claim) blocks a second refresh across passes and stores', () => fixture(f => {
       expect(f.run().hold).toBe(true);
       f.run();
       f.run(createMqSameHeadRefreshStore({ path: f.path }));
       expect(f.requests().map(([, args]) => args)).toEqual([['api', '-X', 'PUT', `repos/${repo}/pulls/${pr}/update-branch`, '-f', `expected_head_sha=${head}`]]);
       expect(f.log).toHaveBeenCalledWith(`mq-same-head-refresh: #${pr} head ${head} — update-branch requested`);
     }));
+    it('unexecuted legacy claim triggers exactly one timestamped retry while admission holds', () => fixture(f => {
+      const key = `${repo}#${pr}@${head}`;
+      writeFileSync(f.path, JSON.stringify([key]));
+      expect(f.store.claimedAt(key)).toBeNull();
+      expect(f.run()).toMatchObject({ hold: true, retriesExhausted: true });
+      expect(f.requests()).toHaveLength(1);
+      expect(f.store.claimedAt(`${key}#retry`)).toEqual(expect.any(Number));
+      expect(f.store.claimedAt(key)).toBeNull();
+      expect(JSON.parse(readFileSync(f.path, 'utf8'))).toEqual([key, `${key}#retry`]);
+      expect(f.log).toHaveBeenCalledWith(`mq-same-head-refresh: #${pr} head ${head} — update-branch retried (earlier recorded refresh never executed)`);
+    }));
+    it('unexecuted retry stays spent across passes and stores; no second retry', () => fixture(f => {
+      const key = `${repo}#${pr}@${head}`;
+      writeFileSync(f.path, JSON.stringify([key]));
+      f.runs = { total_count: 0, workflow_runs: [] };
+      f.run();
+      expect(f.run()).toMatchObject({ hold: true, recoveryAction: 'fixer', retriesExhausted: true });
+      f.run(createMqSameHeadRefreshStore({ path: f.path }));
+      expect(f.requests()).toHaveLength(1);
+    }));
+    it.each([new Error('offline'), {}, { total_count: 101, workflow_runs: [] },
+      { total_count: 1, workflow_runs: [] }, { total_count: 1, workflow_runs: [{ created_at: 'invalid' }] }])(
+      'unreadable or incomplete run evidence %j fails closed without update-branch', runs => fixture(f => {
+        f.store.claim(`${repo}#${pr}@${head}`);
+        f.runs = runs;
+        expect(f.run()).toMatchObject({ hold: true, recoveryAction: 'fixer', retriesExhausted: true });
+        expect(f.requests()).toHaveLength(0);
+        expect(f.log).toHaveBeenCalledWith(expect.stringMatching(/run evidence unreadable or incomplete; inspect Actions runs.*hold for fixer inspection/));
+      }));
+    it.each([-1000, 0])('CI started before or at claim (%s ms) allows one retry', offset => fixture(f => {
+      const key = `${repo}#${pr}@${head}`;
+      f.store.claim(key);
+      f.runs = { total_count: 1, workflow_runs: [{ created_at: new Date(f.store.claimedAt(key) + offset).toISOString() }] };
+      f.run(); f.run();
+      expect(f.requests()).toHaveLength(1);
+      expect(f.store.has(`${key}#retry`)).toBe(true);
+    }));
+    it.each(['not CLEAN', 'checks not green', 'authorization refused', 'blocking label'])(
+      'legacy retry preserves %s refusal without spending retry', reason => fixture(f => {
+        const key = `${repo}#${pr}@${head}`;
+        writeFileSync(f.path, JSON.stringify([key]));
+        if (reason === 'not CLEAN') f.live.mergeStateStatus = 'BEHIND';
+        if (reason === 'checks not green') f.live.statusCheckRollup = [];
+        if (reason === 'authorization refused') f.enqueueAllowed.mockReturnValue(false);
+        if (reason === 'blocking label') f.labels.push('review:changes');
+        f.run();
+        expect(f.requests()).toHaveLength(0);
+        expect(f.store.has(`${key}#retry`)).toBe(false);
+      }));
     it.each([
       ['a required check failing', f => { f.required = [{ name: 'test', bucket: 'fail' }]; }],
       ['a required check pending', f => { f.required = [{ name: 'test', bucket: 'pending' }]; }],
@@ -797,7 +850,11 @@ describe('merge-queue same-head failure admission', () => {
       const other = createMqSameHeadRefreshStore({ path: f.path });
       const key = `${repo}#${pr}@${head}`;
       expect(f.store.claim(key)).toBe(true);
+      const time = other.claimedAt(key);
+      expect(time).toEqual(expect.any(Number));
+      expect(JSON.parse(readFileSync(`${f.path}.times.json`, 'utf8'))).toEqual({ [key]: time });
       expect(other.claim(key)).toBe(false);
+      expect(other.claimedAt(key)).toBe(time);
       expect(other.claim(`${repo}#${pr}@${prior}`)).toBe(true);
       expect(f.store.claim(`${repo}#${pr + 1}@${head}`)).toBe(true);
       expect(f.store.claim(`other/repo#${pr}@${head}`)).toBe(true);
