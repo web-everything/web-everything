@@ -252,15 +252,15 @@ describe('drain async shadow mode resolution', () => {
   const observe = shadow => { shadow.observePass({ candidates: [candidate] }); shadow.recordActual(candidate); };
   const rowsAt = root => join(root, 'drain-async-shadow', 'shadow.jsonl');
 
-  it('createAsyncShadow with WE_ASYNC_DRAIN unset records rows (shadow is the default)', () => {
+  it('createAsyncShadow with WE_ASYNC_DRAIN unset writes nothing (retired default)', () => {
     const root = temp();
     observe(createAsyncShadow({ env: { WE_COORDINATION_ROOT: root }, now: () => 100 }));
-    expect(lines(rowsAt(root))).toHaveLength(1);
+    expect(existsSync(rowsAt(root))).toBe(false);
   });
 
-  it('the repo tool-layer setting drain.asyncShadow is shadow, never a plist env', () => {
+  it('the repo tool-layer setting drain.asyncShadow is off, never a plist env', () => {
     const file = JSON.parse(readFileSync(join(process.cwd(), 'scripts', 'settings', 'drain-async-shadow.json'), 'utf8'));
-    expect(file.drain.asyncShadow).toBe('shadow');
+    expect(file.drain.asyncShadow).toBe('off');
   });
 
   it('explicit off (env or option) is the opt-out and writes nothing', () => {

@@ -29,7 +29,7 @@ export default defineConfig({
     // `action-cli.test.mjs`/`action-records.test.mjs` rely on: their `createActionStore()` calls take no
     // explicit root, so without it they would write real attempts to `~/workspace/.operations/coordination`.
     // prepare-124 S3: the shadow tracer setup file goes FIRST so it snapshots env before vitest.setup.ts strips `WE_*`.
-    // Same off switches as the reporter, plus WE_TEST_CACHE_TRACE=0 (it records only; it never skips a test).
+    // Retired tracing requires WE_TEST_CACHE_TRACE=1 plus the reporter's cache switches (observation only).
     setupFiles: [...(testTraceEnabled(process.env) ? ['./scripts/test-cache/trace-setup.mjs'] : []), './vitest.setup.ts'],
     // prepare-124 S2: SHADOW-ONLY test-result cache. The reporter never skips or changes a test; it records "would
     // skip" next to the real outcome in ~/.cache/we-vitest-results. Absent under CI / GITHUB_ACTIONS / WE_TEST_CACHE=0

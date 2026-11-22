@@ -62,8 +62,7 @@ const ACTIONS = Object.freeze([
 // The whole workflow is pinned: any parsed difference (container, services, paths, new keys, ...) is refused.
 const EXPECTED_WORKFLOW = Object.freeze({
   name: 'drain-verdict',
-  on: { workflow_dispatch: { inputs: { pr: { description: 'PR number to classify', required: true, type: 'number' } } },
-    schedule: [{ cron: '*/10 * * * *' }] },
+  on: { workflow_dispatch: { inputs: { pr: { description: 'PR number to classify', required: true, type: 'number' } } } },
   permissions: { contents: 'read', 'pull-requests': 'read', checks: 'read', statuses: 'read' },
   concurrency: { group: 'drain-verdict', 'cancel-in-progress': false },
   env: { GITHUB_TOKEN: '${{ github.token }}' },
