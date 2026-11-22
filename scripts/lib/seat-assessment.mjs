@@ -14,7 +14,7 @@ import addFormats from 'ajv-formats';
 import { laneGitHardeningEnv, laneHistoryProofEnv, scrubGitRepoEnv } from './lane-git-hardening.mjs';
 import { TRUST_CHAIN_BASENAMES, isTrustChainPath } from './gate-config.mjs';
 import { GATE_PATTERNS, DEFAULT_SETTINGS_POLICY, isGateFile, resolveSettingsPolicy, logPolicyOnce,
-  readSettingsReaders, SETTINGS_FILE_RE, MAX_SETTINGS_FILES, MAX_SETTINGS_READERS, MAX_SETTINGS_KEYS, MAX_GRAPH_MS,
+  SETTINGS_READER_DIRS,
 } from './merge-queue-affected.mjs';
 import { readDeclaredSettings } from './settings-files.mjs';
 import { buildAcceptanceRubric } from './seat-ac-rubric.mjs';
@@ -499,9 +499,10 @@ const sourceDigest = relative => ({ sha256: crypto.createHash('sha256')
   .update(readFileSync(new URL(relative, import.meta.url))).digest('hex') });
 export const MERGE_PATH_CHECK_DEFINITION = Object.freeze({
   uri: 'https://github.com/plateauapp/plateau-settings/blob/main/review/checks/diff-touches-no-merge-path',
-  version: '2026-11-22.3', range: 'base...head',
-  operation: 'no path or settings reader matches built-in or configured gate classifiers; include both rename sides',
-  resolution: ['readDeclaredSettings', 'resolveSettingsPolicy', 'readSettingsReaders'],
+  version: '2026-11-22.4', range: 'base...head',
+  operation: 'refuse all scripts, workflows, settings-reader directories and settings-named paths, plus built-in/configured gates; include both rename sides',
+  resolution: ['readDeclaredSettings', 'resolveSettingsPolicy'],
+  conservativeReaderDirectories: SETTINGS_READER_DIRS,
   classifiers: [
     { module: 'scripts/lib/gate-config.mjs', export: 'isTrustChainPath', sourceDigest: sourceDigest('./gate-config.mjs'), basenames: [...TRUST_CHAIN_BASENAMES].sort() },
     { module: 'scripts/lib/merge-queue-affected.mjs', export: 'isGateFile', sourceDigest: sourceDigest('./merge-queue-affected.mjs'),
@@ -519,6 +520,11 @@ function readGatePolicy({ env, readGateSettings, settingsLog, loggedGatePolicies
   if (!declared || typeof declared !== 'object' || !declared.settings || typeof declared.settings !== 'object'
     || Array.isArray(declared.settings) || !Array.isArray(declared.errors ?? []) || declared.errors?.length)
     throw new Error('configured gate settings unreadable; repair the declared settings');
+  if (declared.duplicates !== undefined && (!Array.isArray(declared.duplicates) || declared.duplicates.length))
+    throw new Error('duplicate or unreadable gate-setting ownership; repair the declared settings');
+  const fresh = declared.settings.mergeFreshness;
+  if (fresh !== undefined && (!fresh || typeof fresh !== 'object' || Array.isArray(fresh)))
+    throw new Error('malformed gate-relevant mergeFreshness container; repair the declared settings');
   const policy = resolveSettingsPolicy({ env, declared });
   if (policy.errors.length) throw new Error('configured gate policy resolution failed; repair settings/env overrides');
   if (policy.gateFiles.length > MAX_PATHS) throw new Error('configured gate policy exceeds 10000 globs; review the full configuration');
@@ -526,32 +532,21 @@ function readGatePolicy({ env, readGateSettings, settingsLog, loggedGatePolicies
   return policy;
 }
 
-/** IO: settings-reader searches share the immutable history boundary and one bounded graph budget. */
-function settingsHistoryGit({ cwd = process.cwd(), env = process.env, exec = execFileSync }, deadline) {
-  const hardened = laneHistoryProofEnv(scrubGitRepoEnv(env));
-  hardened.PATH = '/usr/bin:/bin:/usr/sbin:/sbin';
-  let root;
-  const run = (args, directory) => {
-    const remaining = deadline - Date.now();
-    if (remaining <= 0) throw new Error('settings-reader graph budget exceeded');
-    const output = String(exec('git', ['-c', 'core.commitGraph=false', ...args],
-      { cwd: directory, env: hardened, encoding: 'utf8', timeout: Math.min(15000, remaining), maxBuffer: MAX_BYTES }));
-    if (Buffer.byteLength(output) > MAX_BYTES) throw new Error('settings-reader output exceeds 4 MiB');
-    return output;
-  };
-  return args => {
-    root ??= run(['rev-parse', '--show-toplevel'], cwd).trim();
-    if (!root || /[\x00-\x1f\x7f]/.test(root)) throw new Error('cannot resolve settings-reader repository root');
-    return run(args[0] === 'show' ? ['show', '--no-ext-diff', '--no-textconv', ...args.slice(1)] : args, root);
-  };
+/** PURE: a conservative superset of gate code, including every directory the shared reader can search.
+ * Settings changes never get a key/value comparison exemption: their presence in base...head is enough.
+ */
+function isConservativeMergePath(path) {
+  return path === 'scripts' || path.startsWith('scripts/') || path === '.github' || path.startsWith('.github/')
+    || SETTINGS_READER_DIRS.some(dir => path === dir || path.startsWith(`${dir}/`))
+    || /(^|\/)[^/]*settings[^/]*(\/|$)/i.test(path);
 }
 
 /** Exact immutable range required. Supplied arrays never establish provenance: always re-read base...head.
- * Configured gate policy augments built-ins; settings-reader resolution uses the merge gate's shared reader.
+ * Configured gate policy augments built-ins and the conservative script/workflow/settings refusal.
  * Injected readers are trusted runner IO seams, never assessment-authored data.
  */
 export function mergePathNaCheck({ base, head, diffPaths, readDiff, readGateSettings = readDeclaredSettings,
-  readGateReaders = readSettingsReaders, settingsGit, settingsLog, loggedGatePolicies, ...gitOptions } = {}) {
+  settingsLog, loggedGatePolicies, ...gitOptions } = {}) {
   const ref = { uri: MERGE_PATH_CHECK_DEFINITION.uri, digest: digestOf(MERGE_PATH_CHECK_DEFINITION) };
   try {
     if (!HEX40.test(base ?? '') || !HEX40.test(head ?? '')) throw new Error('exact base and head required');
@@ -560,23 +555,8 @@ export function mergePathNaCheck({ base, head, diffPaths, readDiff, readGateSett
     if (!Array.isArray(diffPaths) || !diffPaths.length || diffPaths.length > MAX_PATHS) throw new Error('missing or oversized net diff');
     if (Buffer.byteLength(JSON.stringify(diffPaths)) > MAX_BYTES) throw new Error('oversized net diff paths');
     const paths = diffPaths.map(safePath);
-    const gatePath = path => isTrustChainPath(path) || isGateFile(path) || isGateFile(path, policy);
-    let touched = paths.find(gatePath);
-    if (!touched) {
-      const settings = paths.filter(path => SETTINGS_FILE_RE.test(path));
-      if (settings.length > MAX_SETTINGS_FILES) throw new Error(`settings-reader resolution exceeds ${MAX_SETTINGS_FILES} files`);
-      const deadline = Date.now() + MAX_GRAPH_MS, git = settingsGit ?? settingsHistoryGit(gitOptions, deadline);
-      for (const file of settings) {
-        if (Date.now() > deadline) throw new Error('settings-reader graph budget exceeded');
-        const result = readGateReaders({ git, file, shas: [base, head], policy, deadline });
-        if (!result || result.why || !Array.isArray(result.readers)) throw new Error(`settings readers unresolved: ${file}`);
-        if (result.readers.length > MAX_SETTINGS_READERS || !Array.isArray(result.keys ?? [])
-          || (result.keys?.length ?? 0) > MAX_SETTINGS_KEYS) throw new Error(`settings readers oversized: ${file}`);
-        const readers = result.readers.map(safePath);
-        const reader = result.gateReader ? safePath(result.gateReader) : readers.find(gatePath);
-        if (reader) { touched = `${file} (read by ${reader})`; break; }
-      }
-    }
+    const touched = paths.find(path => isConservativeMergePath(path)
+      || isTrustChainPath(path) || isGateFile(path) || isGateFile(path, policy));
     return { ...ref, result: touched ? 'fail' : 'pass', diffPaths: paths,
       problems: touched ? [`merge-path n/a refused: diff touches ${touched}`] : [] };
   } catch (error) {
@@ -684,7 +664,7 @@ export function wrapSeatAnswers({ lens, head, rubric, policy, answers, at, naChe
  */
 export function evaluateSeat({ lens, head, runId, assessmentRunId, assessment, rubric, expectedRubric,
   policy, settings, diffPaths, readFileAtHead, cwd, env, at, base, readDiff,
-  readGateSettings, readGateReaders, settingsGit, settingsLog, loggedGatePolicies } = {}) {
+  readGateSettings, settingsLog, loggedGatePolicies } = {}) {
   try {
     if (settings && (settings.modeValid === false || !['shadow', 'enforce'].includes(settings.mode)))
       return refused([...(settings.problems ?? []), 'configured mode unreadable or invalid; repair rubric-mode.json']);
@@ -713,7 +693,7 @@ export function evaluateSeat({ lens, head, runId, assessmentRunId, assessment, r
     if (conditional.length) {
       // Registry currently has one offline check. URI AND digest must match; claims never execute themselves.
       naCheck = mergePathNaCheck({ base, head, diffPaths, readDiff, cwd, env,
-        readGateSettings, readGateReaders, settingsGit, settingsLog, loggedGatePolicies });
+        readGateSettings, settingsLog, loggedGatePolicies });
       diffPaths = naCheck.diffPaths;
       for (const answer of conditional) {
         const condition = rubric.items.find(item => item.id === answer.itemId)?.naWhen;

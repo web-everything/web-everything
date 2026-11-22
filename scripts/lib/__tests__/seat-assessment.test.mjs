@@ -429,11 +429,11 @@ function conditionalInput() {
   for (const item of x.assessment.predicate.items.filter(item => item.outcome === 'n/a')) item.naCheck = naRef(check);
   return x;
 }
-it('merge-path naWhen uses the shared merge gate lists, including relocated trust-chain files', () => {
+it('merge-path naWhen includes shared gate lists and the conservative script/workflow superset', () => {
   const paths = [...TRUST_CHAIN.flatMap(item => item.homes ?? []), '.githooks/pre-push', 'scripts/ci/check.mjs',
     'vitest.config.ts', 'docs/article.md', 'scripts/lib/unrelated-helper.mjs', 'relocated/review-core.mjs'];
   for (const path of paths) {
-    expect(checkPaths([path]).result).toBe(isTrustChainPath(path) || isGateFile(path) ? 'fail' : 'pass');
+    expect(checkPaths([path]).result).toBe(path === 'docs/article.md' ? 'pass' : 'fail');
   }
   const check = checkPaths(['docs/article.md']);
   expect(check.digest).toEqual(digestOf(MERGE_PATH_CHECK_DEFINITION));
@@ -446,6 +446,16 @@ it('merge-path naWhen computes and records pass for compact n/a on a non-merge d
   const statement = wrapSeatAnswers({ ...x, answers, at: '2026-11-22T14:00:00Z', naCheck: check });
   expect(statement.predicate.items.filter(item => item.outcome === 'n/a').every(item => JSON.stringify(item.naCheck) === JSON.stringify(naRef(check)))).toBe(true);
   expect(assessSeat({ ...x, assessment: answers, diffPaths: ['docs/article.md'] }).gateOutcome).toBe('pass');
+});
+it('published rubric and policy fixtures permit a docs-only conditional assessment without re-pinning', () => {
+  const x = conditionalInput();
+  x.rubric = json('security.rubric.json');
+  x.policy = json('policy.company.json');
+  expect(x.policy.seats.find(seat => seat.lens === 'security').rubric)
+    .toEqual({ uri: x.rubric.id, digest: digestOf(x.rubric) });
+  const answers = { items: clone(x.assessment.predicate.items) };
+  for (const item of answers.items) delete item.naCheck;
+  expect(assessSeat({ ...x, assessment: answers }).gateOutcome).toBe('pass');
 });
 it('merge-path naWhen recomputes the actual base...head diff instead of trusting supplied clean paths', () => {
   const x = conditionalInput(), readDiff = vi.fn(() => ['scripts/lib/gate-config.mjs']);
@@ -924,58 +934,18 @@ describe('merge-path policy security', () => {
       readGateSettings: () => declared({ settingsGateFiles: [] }) });
     expect(result.result).toBe('fail');
   });
-  it('a shared settings-reader resolution finding gate code refuses the exemption', () => {
-    const settingsGit = vi.fn(args => args[0] === 'show' ? JSON.stringify({ seatTuning: args[1].startsWith(head) ? 2 : 1 })
-      : args[0] === 'grep' ? 'scripts/lib/gate-config.mjs\0' : '');
-    const result = check({ settingsGit });
-    expect(result.result).toBe('fail'); expect(settingsGit).toHaveBeenCalled();
-    expect(result.problems.join(' ')).toContain('gate-config.mjs');
-  });
-  it.each(['unreadable', 'unresolved', 'oversized reader set'])(
-    'settings reader %s refuses exemption', variant => {
-      const readGateReaders = () => {
-        if (variant === 'unreadable') throw new Error('reader IO unavailable');
-        if (variant === 'unresolved') return { why: 'no reader of seatTuning' };
-        return { readers: Array(201).fill('scripts/lib/ordinary-reader.mjs'), keys: [] };
-      };
-      expect(check({ readGateReaders }).result).toBe('fail');
-    });
-  it('a known non-gate reader and a clean configured policy allow a settings exemption', () => {
-    const log = vi.fn(), result = check({ settingsLog: log, loggedGatePolicies: new Set(),
-      readGateReaders: () => ({ readers: ['scripts/lib/ordinary-reader.mjs'], keys: ['seatTuning'], gateReader: null }) });
-    expect(result.result).toBe('pass'); expect(log).toHaveBeenCalledWith(expect.stringContaining('affected-settings'));
-  });
-  it('the production settings-reader Git boundary is hardened, bounded, and runs from the repository root', () => {
-    const exec = vi.fn((_bin, args) => args.includes('rev-parse') ? process.cwd()
-      : args.includes('show') ? JSON.stringify({ seatTuning: 1 }) : 'scripts/lib/gate-config.mjs\0');
-    const result = check({ exec, cwd: 'nested-cwd', env: { GIT_DIR: 'decoy', GIT_WORK_TREE: 'decoy', GIT_GRAFT_FILE: 'decoy' } });
-    expect(result.result).toBe('fail'); expect(result.problems.join(' ')).toContain('gate-config.mjs');
-    expect(exec).toHaveBeenCalled();
-    for (const [, args, options] of exec.mock.calls) {
-      expect(options.env.GIT_DIR).toBeUndefined(); expect(options.env.GIT_WORK_TREE).toBeUndefined();
-      expect(options.env.GIT_GRAFT_FILE).toBe('/dev/null'); expect(options.env.GIT_NO_REPLACE_OBJECTS).toBe('1');
-      expect(args).toContain('core.commitGraph=false'); expect(options.timeout).toBeGreaterThan(0); expect(options.maxBuffer).toBe(4 * 1024 * 1024);
-      expect(options.cwd).toBe(args.includes('rev-parse') ? 'nested-cwd' : process.cwd());
-      if (args.includes('show')) { expect(args).toContain('--no-ext-diff'); expect(args).toContain('--no-textconv'); }
-    }
-  });
-  it.each(['unreadable command', 'oversized output', 'unknown repository root'])(
-    'production settings-reader %s refuses with an operator fallback', variant => {
-      const exec = vi.fn((_bin, args) => {
-        if (args.includes('rev-parse')) return variant === 'unknown repository root' ? '' : process.cwd();
-        if (variant === 'oversized output') return 'x'.repeat(4 * 1024 * 1024 + 1);
-        throw new Error('immutable settings object unreadable');
-      });
-      const result = check({ exec });
-      expect(result.result).toBe('fail'); expect(result.problems.join(' ')).toContain('operator');
-    });
-  it('too many settings files require a full operator diff review', () => {
-    const result = check({ readDiff: () => Array.from({ length: 21 }, (_, i) => `scripts/settings/feature-${i}.json`) });
-    expect(result.result).toBe('fail'); expect(result.problems.join(' ')).toContain('operator');
-  });
-  it('too many changed settings keys cannot establish a safe reader exemption', () => {
-    const result = check({ readGateReaders: () => ({ readers: [], keys: Array(41).fill('seatTuning') }) });
-    expect(result.result).toBe('fail'); expect(result.problems.join(' ')).toContain('operator');
+  it.each([
+    ['known non-gate readers', () => ({ readers: ['scripts/lib/ordinary-reader.mjs'], keys: ['seatTuning'], gateReader: null })],
+    ['equal compared values', () => ({ readers: [], keys: [], gateReader: null })],
+    ['unresolved readers', () => ({ why: 'no reader of seatTuning' })],
+    ['oversized readers', () => ({ readers: Array(201).fill('scripts/lib/ordinary-reader.mjs'), keys: [] })],
+    ['oversized keys', () => ({ readers: [], keys: Array(41).fill('seatTuning') })],
+    ['unreadable readers', () => { throw new Error('reader IO unavailable'); }],
+  ])('a settings path refuses without key comparison or reader IO: %s', (_name, reader) => {
+    const readGateReaders = vi.fn(reader), settingsGit = vi.fn();
+    const result = check({ readGateReaders, settingsGit });
+    expect(result.result).toBe('fail'); expect(result.problems.join(' ')).toContain(file);
+    expect(readGateReaders).not.toHaveBeenCalled(); expect(settingsGit).not.toHaveBeenCalled();
   });
   const relaxations = [
     ['global evidence floor', (_p, c) => c.evidence.minKind = 'assertion'],
@@ -1000,5 +970,59 @@ describe('merge-path policy security', () => {
     const loaded = loadFrozenPolicyChain(repo, company).settings;
     expect(loaded.problems.length).toBeGreaterThan(0);
     expect(assessSeat({ ...input('security'), settings: loaded, mode: 'enforce' }).gateOutcome).toBe('not-pass');
+  });
+});
+
+
+/** Fail closed on the full merge machinery surface, regardless of settings key comparisons. */
+describe('merge-path blanket refusal', () => {
+  const declared = () => ({ settings: {}, errors: [], duplicates: [] });
+  const check = extra => mergePathNaCheck({ base: 'b'.repeat(40), head, readDiff: () => ['docs/article.md'],
+    readGateSettings: declared, settingsLog: () => {}, ...extra });
+  it.each(['scripts/lib/jury-core.mjs', 'scripts/lib/settings-files.mjs', 'scripts/lib/ordinary-helper.mjs',
+    'scripts/lib/__tests__/ordinary-helper.test.mjs', '.github/local/nested-policy.yml',
+    'settings/company.json', 'config/review.settings.json', 'vendor/settings-reader.mjs', 'skills-src/review/notes.md'])(
+    'all scripts, workflows and settings readers/files refuse n/a: %s', path => {
+      const result = check({ readDiff: () => [path], readGateReaders: () => ({ readers: [], keys: [] }) });
+      expect(result.result).toBe('fail'); expect(result.problems.join(' ')).toContain(path);
+    });
+  it.each([['scripts/lib/ordinary-helper.mjs', 'src/moved.mjs'], ['src/moved.mjs', 'scripts/lib/ordinary-helper.mjs']])(
+    'a rename between %s and %s refuses on either side', (from, to) => {
+      expect(check({ readDiff: () => [from, to] }).result).toBe('fail');
+    });
+  it.each(['docs/article.md', 'src/components/App.tsx', 'demos/app.html'])(
+    'a docs-only or app-only diff can still get n/a: %s', path => expect(check({ readDiff: () => [path] }).result).toBe('pass'));
+  it('equal base-tip and head setting values cannot exempt a merge-base...head settings change', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'seat-settings-merge-base-'));
+    const env = { PATH: process.env.PATH, HOME: dir, TMPDIR: process.env.TMPDIR, GIT_CONFIG_NOSYSTEM: '1' };
+    const git = (...args) => execFileSync('git', ['-c', 'core.hooksPath=/dev/null', '-c', 'commit.gpgsign=false', ...args],
+      { cwd: dir, env, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }).trim();
+    try {
+      git('init', '-q'); git('config', 'user.name', 'Seat fixture'); git('config', 'user.email', 'seat@example.org');
+      const file = 'scripts/settings/ordinary-feature.json'; mkdirSync(join(dir, 'scripts/settings'), { recursive: true });
+      writeFileSync(join(dir, file), JSON.stringify({ ordinaryFeature: 1 })); git('add', '.'); git('commit', '-qm', 'common');
+      const common = git('rev-parse', 'HEAD');
+      writeFileSync(join(dir, file), JSON.stringify({ ordinaryFeature: 2 })); git('add', '.'); git('commit', '-qm', 'base tip');
+      const base = git('rev-parse', 'HEAD'); git('checkout', '-q', '--detach', common);
+      writeFileSync(join(dir, file), JSON.stringify({ ordinaryFeature: 2 })); git('add', '.'); git('commit', '-qm', 'head');
+      const pinned = git('rev-parse', 'HEAD');
+      expect(git('show', `${base}:${file}`)).toBe(git('show', `${pinned}:${file}`));
+      const result = mergePathNaCheck({ base, head: pinned, cwd: dir, env, readGateSettings: declared, settingsLog: () => {},
+        readGateReaders: () => ({ readers: [], keys: [], gateReader: null }) });
+      expect(result.diffPaths, JSON.stringify(result)).toContain(file); expect(result.result).toBe('fail');
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+  it.each(['mergeFreshness', 'mergeFreshness.settingsReaderMode', 'mergeFreshness.settingsGateFiles'])(
+    'duplicate gate-setting ownership refuses exemptions: %s', path => {
+      const result = check({ readGateSettings: () => ({ ...declared(), duplicates: [{ path,
+        sources: ['settings/first.json', 'settings/second.json'] }] }) });
+      expect(result.result).toBe('fail'); expect(result.problems.join(' ')).toContain('operator');
+    });
+  it.each([null, false, 0, 'gate-all', []].map(value => [value]))('malformed mergeFreshness container %j cannot select a fallback', mergeFreshness => {
+    const result = check({ readGateSettings: () => ({ ...declared(), settings: { mergeFreshness } }) });
+    expect(result.result).toBe('fail'); expect(result.problems.join(' ')).toContain('operator');
+  });
+  it.each([null, false, 0, [], 'settings'].map(value => [value]))('malformed root settings container %j remains refused', settings => {
+    expect(check({ readGateSettings: () => ({ ...declared(), settings }) }).result).toBe('fail');
   });
 });
