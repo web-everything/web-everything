@@ -135,8 +135,8 @@ function readState(root, env, strict, read = readFileSync) {
     // Optional for persisted pre-continuity states; present malformed records fail closed.
     if (strict && parsed.setAside != null && (!object(parsed.setAside)
       || !Object.values(parsed.setAside).every(v => fields(v,
-        { eligible: v => v === true, ref: string, sha: v => FULL_SHA_RE.test(v),
-          mainSha: v => FULL_SHA_RE.test(v), reason: v => v === 'main-sync-conflict',
+        { eligible: v => v === true, ref: string, sha: v => typeof v === 'string' && FULL_SHA_RE.test(v),
+          mainSha: v => typeof v === 'string' && FULL_SHA_RE.test(v), reason: v => v === 'main-sync-conflict',
           files: v => strings(v) && v.length > 0 })))) throw new Error('Invalid rebuild state setAside');
     if (strict) return parsed; // Preserve the one validated snapshot, without legacy coercion.
     return {

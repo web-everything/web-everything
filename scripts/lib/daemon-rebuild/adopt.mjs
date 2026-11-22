@@ -5,7 +5,8 @@
 import { mkdirSync, appendFileSync } from 'node:fs';
 import { dirname } from 'node:path';
 import { hostname } from 'node:os';
-import { removeOverlay, appendOverlayEvent } from '../daemon-overlays.mjs';
+import { pinnedStatus } from './plan.mjs';
+import { removeOverlay, appendOverlayEvent, readOverlayState } from '../daemon-overlays.mjs';
 import { alertsFilePath, readRebuildState, writeRebuildState, clearReadyCandidate, appliedShape } from './state.mjs';
 import { verifyRev, makeGit } from './shared.mjs';
 import { resolveOverlayConflict } from './overlay-strategies.mjs';
@@ -464,6 +465,10 @@ async function finalizeRebuildLocked({
   // Every exit from this (locked) phase ends the build, so every exit releases its lease and persists that.
   releaseBuildLease(state, lease);
   const terminal = (result) => {
+    if (result.adopted && state.setAside) {
+      for (const a of state.adopted?.applied ?? []) delete state.setAside[a.ref];
+      if (Object.keys(state.setAside).length === 0) state.setAside = null;
+    }
     writeState();
     const stale = staleAlertDetail(result, state);
     if (stale) alert('clone-held-stale', stale);
@@ -490,6 +495,29 @@ async function finalizeRebuildLocked({
   if (dropsPending && !isRollback && appliedKey(plan.applied) !== appliedKey(state.adopted?.applied)) {
     alert('drop-pending-unsettled', { target: plan.finalSha });
     return terminal({ moved: false, reason: 'drop-pending-unsettled', plan });
+  }
+
+  // Registrations can be pinned while smoke runs unlocked. Re-read under the
+  // add guard before any adoption (including already-adopted reconciliation).
+  const live = readOverlayState(root, { env });
+  if (live.corrupt) {
+    alert('overlay-state-corrupt', { message: 'cannot re-check omitted overlay pins; repair the overlay registry' });
+    return terminal({ moved: false, reason: 'overlay-state-corrupt', plan });
+  }
+  const included = new Set((plan.applied ?? []).map(a => a.ref));
+  const pinnedOmitted = live.overlays.filter(o => {
+    if (included.has(o.ref)) return false;
+    const tip = verifyRev(git, `refs/remotes/origin/${o.ref}^{commit}`);
+    if (tip && gitTipInMain(git, plan.mainSha, tip)) return false;
+    return !tip || pinnedStatus(git, o, plan.mainSha, tip).pinned;
+  });
+  if (pinnedOmitted.length) {
+    const refs = pinnedOmitted.map(o => o.ref);
+    const detail = { refs, message: `omitted overlay(s) became pinned during smoke: ${refs.join(', ')}; holding on the last-good build — rebase them onto main` };
+    alert('established-overlay-hold', detail);
+    state.held = { since: state.held?.since ?? nowIso(), reason: 'established-overlay-conflict',
+      failed: detail.message, details: [], lastGood: prevHead, target: null, mainSha: plan.mainSha, updatedAt: nowIso() };
+    return terminal({ moved: false, reason: 'established-overlay-conflict', detail, plan });
   }
 
   // Defensive re-check: real (unlocked) time passed for the smoke since `prepareRebuild` read `prevHead`. Either

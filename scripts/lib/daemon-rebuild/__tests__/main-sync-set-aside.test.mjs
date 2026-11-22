@@ -1,6 +1,10 @@
-import { it, expect } from 'vitest';
+import { it, expect, vi } from 'vitest';
 import * as planner from '../plan.mjs';
 import { writeFileSync, readFileSync } from 'node:fs';
+import { prepareRebuild } from '../prepare.mjs';
+import { gitRun } from '../../main-staleness.mjs';
+import { clearOverlayConflictWake, readOverlayConflictWakes } from '../../overlay-conflict-wake.mjs';
+import { readMainSyncConflicts } from '../overlay-main-sync.mjs';
 import { overlayFilePath } from '../../daemon-overlays.mjs';
 import { readRebuildStateStrict, rebuildStatePath } from '../state.mjs';
 import { createSetAsideFixture, probeRebuildSetAside } from '../../../conveyor/soak/fixtures/rebuild-set-aside-probe.mjs';
@@ -36,7 +40,7 @@ it.each(['unparseable', 'empty', 'error'])('unknown conflict evidence escalates:
       return inject ? git(args) : f.git(args);
     };
     const plan = await planner.planRebuild({ git: planGit, headSha: f.head(), mainRef: 'origin/main',
-      overlays: f.overlays(), edgeResolve: false, mainSyncConflicts: { [f.ref]: f.tip } });
+      overlays: f.overlays(), edgeResolve: false, mainSyncConflicts: readMainSyncConflicts(f.root, f.env) });
     expect(plan.establishedLost.map(o => o.ref)).toEqual([f.ref]);
     expect(plan.decisions.some(d => d.setAside)).toBe(false);
   } finally { f.cleanup(); }
@@ -49,12 +53,13 @@ it('adopts current main, records files, alerts once across ticks, and re-adds a 
     repaired: true, reapplied: true, cleared: true });
 }, 60_000);
 
-it('preserves the audit identity when an established overlay is set aside', async () => {
+it('does not invent adopted ancestry for omitted content, and still audits its repair', async () => {
   const f = await createSetAsideFixture({ audited: true });
   try {
     const result = await f.rebuild();
     expect(result.adopted).toBe(true);
     expect(f.git(['merge-base', '--is-ancestor', f.main, f.head()]).status).toBe(0);
+    expect(f.git(['merge-base', '--is-ancestor', f.tip, f.head()]).status).not.toBe(0);
     expect(f.state().setAside[f.ref].files).toEqual([f.file]);
     // A clean replacement still needs its ordinary audit. Set-aside cannot erase that gate.
     await f.repair();
@@ -88,6 +93,107 @@ it('reads pre-continuity persisted state, round-trips set-aside, and refuses mal
     const broken = JSON.parse(readFileSync(path, 'utf8'));
     broken.setAside[f.ref].files = [];
     writeFileSync(path, JSON.stringify(broken));
+    expect(() => readRebuildStateStrict(f.root, f.env)).toThrow('Invalid rebuild state setAside');
+  } finally { f.cleanup(); }
+}, 60_000);
+
+it.each(['main', 'tip', 'missing-main'])('stale or incomplete sync pair retains the hold: %s', async kind => {
+  const f = await createSetAsideFixture();
+  try {
+    const path = `${overlayFilePath(f.root, f.env)}.main-sync.state`;
+    const data = JSON.parse(readFileSync(path, 'utf8'));
+    if (kind === 'missing-main') delete data.conflictMain[f.ref];
+    else data[kind === 'main' ? 'conflictMain' : 'conflictTip'][f.ref] = 'a'.repeat(40);
+    writeFileSync(path, JSON.stringify(data));
+    expect(await f.rebuild()).toMatchObject({ reason: 'established-overlay-conflict' });
+    expect(f.state().setAside?.[f.ref]).toBeUndefined();
+  } finally { f.cleanup(); }
+}, 60_000);
+
+it('keeps the old hold when the overlay also conflicts with an applied overlay', async () => {
+  const f = await createSetAsideFixture({ sibling: true });
+  try {
+    expect(await f.rebuild()).toMatchObject({ reason: 'established-overlay-conflict' });
+    expect(f.state().setAside?.[f.ref]).toBeUndefined();
+  } finally { f.cleanup(); }
+}, 60_000);
+
+it('keeps the hold when independence from another overlay cannot be proved', async () => {
+  const f = await createSetAsideFixture({ sibling: true });
+  try {
+    const git = args => args[0] === 'merge-tree' && args.includes(f.tip) && !args.includes(f.main)
+      ? { status: 128, stdout: '' } : f.git(args);
+    const plan = await planner.planRebuild({ git, headSha: f.head(), mainRef: 'origin/main',
+      overlays: f.overlays(), edgeResolve: false, mainSyncConflicts: readMainSyncConflicts(f.root, f.env) });
+    expect(plan.establishedLost.map(o => o.ref)).toContain(f.ref);
+    expect(plan.decisions.some(d => d.setAside)).toBe(false);
+  } finally { f.cleanup(); }
+}, 60_000);
+
+it('wakes the set-aside overlay PR even when the resolver diagnostic is suppressed', async () => {
+  const f = await createSetAsideFixture({ pr: 123 });
+  try {
+    clearOverlayConflictWake(f.env, 123);
+    expect(await f.rebuild()).toMatchObject({ adopted: true });
+    expect(readOverlayConflictWakes(f.env).get(123)).toMatchObject({ ref: f.ref, files: [f.file] });
+  } finally { f.cleanup(); }
+}, 60_000);
+
+it('launches automatic rebase for a set-aside overlay without holding the rebuild', async () => {
+  const f = await createSetAsideFixture();
+  try {
+    const kickAutoRebase = vi.fn(async () => ({ started: [f.ref], skipped: [] }));
+    const result = await prepareRebuild({ root: f.root, env: f.env, run: gitRun, now: Date.now, prState: async () => 'OPEN', autoRebase: { resolveAutoRebaseSwitch: () => ({ enabled: true, source: 'test' }),
+      finishPendingSwaps: async () => {}, kickAutoRebase } });
+    expect(result.terminal).toBe(false);
+    expect(result.plan.establishedLost).toEqual([]);
+    expect(kickAutoRebase).toHaveBeenCalledWith(expect.objectContaining({ lost: [expect.objectContaining({ ref: f.ref })] }));
+  } finally { f.cleanup(); }
+}, 60_000);
+
+it('retains set-aside evidence until the repaired candidate is adopted', async () => {
+  const f = await createSetAsideFixture();
+  try {
+    await f.rebuild();
+    const record = f.state().setAside[f.ref];
+    let observed = false;
+    await f.repair({ runSmoke: async () => {
+      observed = true;
+      expect(f.state().setAside?.[f.ref]).toEqual(record);
+      throw new Error('smoke unavailable');
+    } });
+    expect(observed).toBe(true);
+    expect(f.state().setAside?.[f.ref]).toEqual(record);
+    expect(await f.rebuild()).toMatchObject({ adopted: true });
+    expect(f.state().setAside?.[f.ref]).toBeUndefined();
+  } finally { f.cleanup(); }
+}, 60_000);
+
+it('refuses adoption if an omitted overlay becomes pinned during smoke', async () => {
+  const f = await createSetAsideFixture();
+  try {
+    const before = f.head();
+    const result = await f.rebuild({ runSmoke: async () => {
+      const path = overlayFilePath(f.root, f.env);
+      const list = JSON.parse(readFileSync(path, 'utf8'));
+      list.overlays.find(o => o.ref === f.ref).pinned = true;
+      writeFileSync(path, JSON.stringify(list));
+      return { verdict: 'pass', attempts: 1, smoke: { results: [] } };
+    } });
+    expect(result.adopted).not.toBe(true);
+    expect(result.reason).toBe('established-overlay-conflict');
+    expect(f.head()).toBe(before);
+  } finally { f.cleanup(); }
+}, 60_000);
+
+it.each(['sha', 'mainSha'])('strict set-aside validation rejects coerced array %s', async field => {
+  const f = await createSetAsideFixture();
+  try {
+    await f.rebuild();
+    const path = rebuildStatePath(f.root, f.env);
+    const state = JSON.parse(readFileSync(path, 'utf8'));
+    state.setAside[f.ref][field] = [state.setAside[f.ref][field]];
+    writeFileSync(path, JSON.stringify(state));
     expect(() => readRebuildStateStrict(f.root, f.env)).toThrow('Invalid rebuild state setAside');
   } finally { f.cleanup(); }
 }, 60_000);

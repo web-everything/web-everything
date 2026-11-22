@@ -6368,3 +6368,11 @@ with the rebase remedy. This exception never applies to explicit pins or the sel
 Those retain the existing refusal/last-good hold. Conflicts with other overlays retain the existing
 loss protection. The real-Git `main-sync-set-aside.test.mjs` and `rebuild-main-sync-set-aside` soak
 cover adoption of main, duplicate suppression and automatic return after branch repair.
+
+## Rebuild set-aside regression fixtures
+
+`daemon-rebuild/__tests__/main-sync-set-aside.test.mjs` drives the real Git fixture in
+`conveyor/soak/fixtures/rebuild-set-aside-probe.mjs`. Clear the sync worker's existing
+conflict wake before testing rebuild's wake producer; otherwise the worker masks a missing
+rebuild notification. Omission evidence is not adopted ancestry: inspect merge ancestry
+and retain the durable set-aside record through failed smoke, then clear it only on adoption.

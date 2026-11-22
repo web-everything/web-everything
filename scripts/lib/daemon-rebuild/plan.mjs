@@ -342,7 +342,7 @@ export async function planOverlayStacks({
  *   prBaseChain?:((pr:number)=>(Promise<string[]|null>|string[]|null))|null,
  *   prForcePushes?:((pr:number)=>(Promise<Array<{before:string,after?:string|null}>|null>))|null, stackMode?:'tops'|'independent',
  *   stackModeSource?:string, auditedTip?:((ref:string, sha:string)=>boolean)|null,
- *   mainSyncConflicts?:Record<string,string>}} o
+ *   mainSyncConflicts?:{conflictMain?:Record<string,string>,conflictTip?:Record<string,string>}, setAside?:Record<string,object>}} o
  * @returns {Promise<{ok:false, reason:'main-unresolved'}|{ok:true, mainSha:string, finalSha:string,
  *   applied:Array<{ref:string,pr:number|null,sha:string}>,
  *   decisions:Array<{ref:string,pr:number|null,action:'remove'|'drop'|'skip'|'apply',reason:string,sha:string|null}>,
@@ -351,7 +351,7 @@ export async function planOverlayStacks({
 export async function planRebuild({
   git, headSha, mainRef, overlays = [], prState, mainOnly = false, edgeResolve = true,
   prBaseChain = null, prForcePushes = null, stackMode = 'tops', stackModeSource = 'standard', keepIndependent = new Set(),
-  noPin = new Set(), auditedTip = null, mainSyncConflicts = {},
+  noPin = new Set(), auditedTip = null, mainSyncConflicts = {}, setAside = {},
 }) {
   const mainSha = verifyRev(git, `${mainRef}^{commit}`);
   if (!mainSha) return { ok: false, reason: 'main-unresolved' };
@@ -652,6 +652,14 @@ export async function planRebuild({
       decisions.push({ ref, pr, action: 'remove', reason: 'ref-gone', sha: null });
       continue;
     }
+    // Omitted content has no adopted merge parent. Its durable omission record requires
+    // ordinary audit evidence before it can return, without making its old tip an ancestor.
+    if (setAside[ref] && typeof auditedTip === 'function' && !inMain(ovSha) && !auditedTip(ref, ovSha)) {
+      decisions.push({ ref, pr, action: 'skip', reason: 'unaudited-tip-held', sha: ovSha });
+      alerts.push({ kind: 'overlay-unaudited-tip', detail: { ref, pr, newTip: ovSha,
+        message: `overlay ${ref} remains set aside: tip ${ovSha.slice(0, 10)} needs a fix-ready + audit record (unaudited-tip)` } });
+      continue;
+    }
     // unaudited-tip — noPin only controls conflict pins; it must never bypass audit evidence.
     let unauditedFrom = null;
     const heldAt = holdUnauditedTip(ref, pr, ovSha);
@@ -897,7 +905,7 @@ export async function planRebuild({
     if (holdFailure) return holdRefusal();
     return planRebuild({
       git, headSha, mainRef, overlays, prState, mainOnly, edgeResolve, prBaseChain, prForcePushes, stackMode, stackModeSource,
-      keepIndependent: new Set([...keepIndependent, ...lostBases]), noPin, auditedTip, mainSyncConflicts,
+      keepIndependent: new Set([...keepIndependent, ...lostBases]), noPin, auditedTip, mainSyncConflicts, setAside,
     });
   }
 
@@ -950,15 +958,22 @@ export async function planRebuild({
     // Slice 2 continuity: reuse the ordinary conflict-drop/retry path. Only a proved
     // direct main conflict can waive the live-overlay hold; guard/explicit pins and
     // held unaudited tips retain today's behaviour. Never unregister the overlay.
-    if (!pinSkipped && !d.unauditedTip && mainSyncConflicts[d.ref] === d.sha) {
+    if (!pinSkipped && !d.unauditedTip && mainSyncConflicts.conflictMain?.[d.ref] === mainSha
+      && mainSyncConflicts.conflictTip?.[d.ref] === d.sha) {
       const raw = listed.find(o => o.ref === d.ref);
       const aside = mainSyncSetAside(git, raw, mainSha, d.sha);
-      if (aside.eligible) {
-        recordIdentity(d.ref, d.pr, d.sha); // Preserve the audit gate while omitting its content.
+      // A main conflict alone may waive the hold. Any conflict or unknown result
+      // against an applied overlay keeps the old path, regardless of file overlap.
+      const evidenceGit = pathBEvidenceGit(git);
+      const independent = aside.eligible && applied.every(a => {
+        const check = evidenceGit(['merge-tree', '--write-tree', '--no-messages', a.sha, d.sha]);
+        return check.status === 0 && !check.error && OID.test(String(check.stdout ?? '').trim());
+      });
+      if (independent) {
         d.setAside = aside;
         d.files = aside.files;
         alerts.push({ kind: 'overlay-main-sync-set-aside', detail: {
-          ...aside,
+          ...aside, pr: d.pr,
           message: `overlay ${d.ref} set aside on ${aside.files.join(', ')} — rebase its branch onto main (or merge main into it); it stays registered and re-applies automatically when conflict-free`,
         } });
         continue;
@@ -1018,7 +1033,7 @@ export async function planRebuild({
     ok: true, mainSha, finalSha: cur, applied, decisions, alerts, inputsKey, upToDate: cur === headSha, establishedLost,
     // unaudited-tip — the refs with an adopted history (the plan applies any OTHER registration's tip unaudited); a ready
     // record or a finalize re-judges its own tips against the evidence with this same exemption.
-    auditAdopted: [...new Set([...adoptedTips.keys(), ...graduatedTips.keys()])],
+    auditAdopted: [...new Set([...adoptedTips.keys(), ...graduatedTips.keys(), ...Object.keys(setAside)])],
   };
   return retryPins(plan);
 
@@ -1058,7 +1073,7 @@ export async function planRebuild({
       for (const refs of retryPinGroups()) {
         const alt = await planRebuild({
           git, headSha, mainRef, overlays, prState, mainOnly, edgeResolve, prBaseChain, prForcePushes, stackMode, stackModeSource,
-          keepIndependent, noPin: new Set(refs), auditedTip, mainSyncConflicts,
+          keepIndependent, noPin: new Set(refs), auditedTip, mainSyncConflicts, setAside,
         });
         if (!alt.ok || alt.establishedLost.length > 0) continue;
         const altApplied = new Map(alt.applied.map((a) => [a.ref, a]));

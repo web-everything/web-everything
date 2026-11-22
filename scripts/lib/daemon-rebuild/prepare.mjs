@@ -414,7 +414,7 @@ export async function prepareRebuild({
   try { mainSyncConflicts = readMainSyncConflicts(root, env); }
   catch (error) { alert('overlay-main-sync-state-unknown', { message: `${error.message}; keeping existing overlay loss protections — repair main-sync state` }); }
   const plan = await planRebuild({
-    auditedTip: makeAuditedTipGate(env), mainSyncConflicts,
+    auditedTip: makeAuditedTipGate(env), mainSyncConflicts, setAside: state.setAside ?? {},
     git, headSha: prevHead, mainRef: 'origin/main', overlays: overlaysBefore, prState, mainOnly, edgeResolve,
     stackMode: stack.mode, stackModeSource: stack.source, prBaseChain: chainOf,
     prForcePushes: prForcePushes ?? chainOf.forcePushes ?? null,
@@ -431,14 +431,13 @@ export async function prepareRebuild({
     try { persistStackBases(root, chainOf.fresh, { env }); } catch (e) { alert('stack-bases-not-recorded', { error: String(e?.message ?? e) }); }
   }
   // Durable set-aside bookkeeping uses the same completed plan as adoption. Preserve
-  // unresolved records on partial refusals; clear only when a complete plan no longer omits them.
+  // unresolved records on partial refusals; applied candidates clear only after adoption.
   const asideBefore = state.setAside ?? {};
   const asideNow = { ...asideBefore };
   if (plan.ok) {
     // A failed rebase/audit attempt must not erase the outstanding operator record.
-    const returned = new Set((plan.applied ?? []).map(o => o.ref));
     for (const ref of Object.keys(asideNow)) {
-      if (returned.has(ref) || !overlaysBefore.some(o => o.ref === ref)
+      if (!overlaysBefore.some(o => o.ref === ref)
         || plan.decisions.some(d => d.ref === ref && d.action === 'remove')) delete asideNow[ref];
     }
     for (const d of plan.decisions) if (d.setAside) asideNow[d.ref] = d.setAside;
@@ -469,6 +468,11 @@ export async function prepareRebuild({
       if (Object.hasOwn(pinnedBefore, ref) && pinnedBefore[ref] === noticeKey) continue;
     }
     if (event.kind === 'overlay-main-sync-set-aside') {
+      // Keep the fixer wake even though the lower-level unresolved alert is suppressed.
+      if (!strictState && event.detail.pr != null) {
+        const { pr, ref, files } = event.detail;
+        markOverlayConflictWake(env, { pr, ref, files, at: nowIso(), clone: root });
+      }
       const old = asideBefore[event.detail.ref];
       if (old?.sha === event.detail.sha && JSON.stringify(old.files) === JSON.stringify(event.detail.files)) continue;
       if (!strictState) appendOverlayEvent(root, { kind: event.kind, ...event.detail }, { env });
@@ -532,6 +536,19 @@ export async function prepareRebuild({
   const contains = (sha, build) => !!build && git(['merge-base', '--is-ancestor', sha, build]).status === 0;
   const lost = mainOnly ? [] : (plan.establishedLost ?? []).filter((l) => !(l.sha
     && contains(l.sha, prevHead) && contains(l.sha, plan.finalSha)));
+  const omitted = mainOnly ? [] : plan.decisions.filter(d => d.setAside).map(d => ({
+    ref: d.ref, pr: d.pr, sha: d.sha, reason: 'conflict', files: d.files,
+  }));
+  // Repair launch is independent of the live-overlay hold: a safe omission still
+  // needs its branch rebased, while only establishedLost blocks the build.
+  if (!strictState && omitted.length > 0) {
+    try {
+      const setting = autoRebase.resolveAutoRebaseSwitch(env);
+      if (setting.enabled) await autoRebase.kickAutoRebase({ root, env, lost: omitted });
+    } catch (error) { alert('overlay-conflict-unresolved', {
+      refs: omitted.map(o => o.ref), message: `automatic rebase unavailable; rebase the set-aside branches manually: ${error.message}`,
+    }); }
+  }
   if (!mainOnly && lost.length > 0) {
     const detail = {
       refs: lost.map((l) => l.ref), lost,

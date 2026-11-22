@@ -8,7 +8,7 @@ import { runOverlayMainSync } from '../../../lib/daemon-rebuild/overlay-main-syn
 import { addOverlay, readOverlays, overlayFilePath } from '../../../lib/daemon-overlays.mjs';
 import { alertsFilePath } from '../../../lib/daemon-rebuild/state.mjs';
 
-export async function createSetAsideFixture({ pinned = false, guard = false, audited = false } = {}) {
+export async function createSetAsideFixture({ pinned = false, guard = false, audited = false, sibling = false, pr = null } = {}) {
   const base = mkdtempSync(join(tmpdir(), 'rebuild-set-aside-'));
   const root = join(base, 'clone'), author = join(base, 'author'), origin = join(base, 'origin.git');
   const env = { ...process.env, WE_DAEMON_STATE_DIR: join(base, 'state'),
@@ -26,8 +26,8 @@ export async function createSetAsideFixture({ pinned = false, guard = false, aud
   const write = (cwd, path, value) => { mkdirSync(dirname(join(cwd, path)), { recursive: true }); writeFileSync(join(cwd, path), value); };
   const commit = (cwd, message) => { git(cwd, ['add', '-A']); git(cwd, ['commit', '-qm', message]); };
   const ref = 'lane/set-aside', file = guard ? 'scripts/lib/daemon-rebuild.mjs' : 'worker.mjs';
-  const rebuild = () => rebuildClone({ root, env, prState: async () => 'OPEN',
-    runSmoke: async () => ({ verdict: 'pass', attempts: 1, smoke: { results: [] } }), log: { error() {} } });
+  const rebuild = (options = {}) => rebuildClone({ root, env, prState: async () => 'OPEN', prBaseChain: async () => null,
+    runSmoke: async () => ({ verdict: 'pass', attempts: 1, smoke: { results: [] } }), log: { error() {} }, ...options });
   const cleanup = () => rmSync(base, { recursive: true, force: true });
   try {
     git(base, ['init', '--bare', '-q', origin]);
@@ -38,13 +38,19 @@ export async function createSetAsideFixture({ pinned = false, guard = false, aud
     git(base, ['clone', '-q', origin, author]);
     git(author, ['checkout', '-qb', ref]); write(author, file, 'export const value = 1;\n'); commit(author, 'overlay');
     git(author, ['push', '-q', 'origin', ref]);
-    addOverlay(root, { ref, pinned }, { env });
+    addOverlay(root, { ref, pinned, pr }, { env });
     const initial = await rebuild();
     if (!initial.adopted) throw new Error(`initial adoption: ${initial.reason}`);
     git(author, ['checkout', '-q', 'main']); write(author, file, 'export const value = 2;\n'); commit(author, 'new main');
     git(author, ['push', '-q', 'origin', 'main']);
     const main = git(author, ['rev-parse', 'HEAD']);
     const tip = git(author, ['rev-parse', ref]);
+    if (sibling) {
+      git(author, ['checkout', '-qb', 'lane/sibling']);
+      write(author, file, 'export const value = 4;\n'); commit(author, 'sibling');
+      git(author, ['push', '-q', 'origin', 'lane/sibling']);
+      addOverlay(root, { ref: 'lane/sibling' }, { env });
+    }
     git(root, ['fetch', '-q', 'origin']);
     try { await runOverlayMainSync({ root, ref, env }); throw new Error('expected sync conflict'); }
     catch (error) { if (!/merge conflicts/.test(error.message)) throw error; }
@@ -53,11 +59,11 @@ export async function createSetAsideFixture({ pinned = false, guard = false, aud
       head: () => git(root, ['rev-parse', 'HEAD']),
       state: () => readRebuildState(root, env), overlays: () => readOverlays(root, { env }),
       alerts: () => existsSync(alertsFilePath(root, env)) ? readFileSync(alertsFilePath(root, env), 'utf8').trim().split('\n').filter(Boolean).map(JSON.parse) : [],
-      async repair() {
+      async repair(options = {}) {
         git(author, ['checkout', '-q', '-B', ref, 'main']);
         write(author, file, 'export const value = 3;\n'); commit(author, 'rebased overlay');
         git(author, ['push', '-q', '--force', 'origin', ref]);
-        return rebuild();
+        return rebuild(options);
       },
     };
   } catch (error) { cleanup(); throw error; }
