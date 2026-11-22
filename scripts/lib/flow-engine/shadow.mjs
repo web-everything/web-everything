@@ -1,7 +1,9 @@
-import { openSync, readSync, closeSync } from 'node:fs';
+import { openSync, readSync, closeSync, lstatSync } from 'node:fs';
 
 const LIMIT = 262144;
-function readBounded(file, { open, read, close }) {
+function readBounded(file, { open, read, close, stat }) {
+  // lstat first: a FIFO/device/symlink would block or escape; refuse before any open.
+  if (!stat(file).isFile()) throw Error('shadow input is not a regular file; skipped');
   const fd = open(file, 'r');
   try {
     const buffer = Buffer.alloc(LIMIT + 1);
@@ -25,14 +27,14 @@ export function comparePlans(left, right) {
 // Explicit opt-in file contains {definition, projection, ctx, logPath}. It is prepared by
 // the operator from independent review-loop evidence, never inferred from the actual result.
 export async function shadowReviewStep({ repo, pr, classified, head, netDiff, round, runId }, {
-  file = process.env.WE_FLOW_V0_SHADOW_FILE, open = openSync, read = readSync, close = closeSync,
+  file = process.env.WE_FLOW_V0_SHADOW_FILE, stat = lstatSync, open = openSync, read = readSync, close = closeSync,
   engine = { load, plan, transitionRecord, appendTransition }, log = message => console.error(message),
 } = {}) {
   const note = message => { try { log(message.replace(/[\x00-\x1f\x7f]/g, ' ')); } catch { /* diagnostic only */ } };
   if (!file) return;
   try {
     note('flow-v0 shadow enabled; source=environment WE_FLOW_V0_SHADOW_FILE (or explicit caller option)');
-    const input = JSON.parse(readBounded(file, { open, read, close }));
+    const input = JSON.parse(readBounded(file, { open, read, close, stat }));
     if (input.ctx.repo !== repo || String(input.ctx.pr) !== String(pr)) throw Error('shadow context does not match actual PR');
     for (const [name, value] of Object.entries({ head: head ?? classified?.head, netDiff: netDiff ?? classified?.netDiff, round: round ?? classified?.round, runId: runId ?? classified?.runId })) {
       if (value != null && input.ctx[name] !== value) throw Error(`shadow context does not match actual ${name}`);

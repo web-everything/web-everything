@@ -358,7 +358,7 @@ function shadowFixture() {
   const input = { definition: def, projection: projection(flow), ctx: { ...ctx }, logPath: 'records.jsonl' };
   let bytes, position;
   const reads = [], closed = [];
-  const options = { file: 'fixture', open: () => { bytes = Buffer.from(JSON.stringify(input)); position = 0; return 42; },
+  const options = { file: 'fixture', stat: () => ({ isFile: () => true }), open: () => { bytes = Buffer.from(JSON.stringify(input)); position = 0; return 42; },
     read: (fd, buffer, offset, length) => {
       assert.equal(fd, 42); reads.push(length);
       const n = Math.min(length, bytes.length - position, 97);
@@ -369,6 +369,13 @@ function shadowFixture() {
   const actual = { repo: ctx.repo, pr: ctx.pr, classified: { loopOutcome: 'converged', outcome: 'auto-cleared', runId: null, label: null } };
   return { input, actual, options, rows, logs, reads, closed };
 }
+
+test('shadow refuses a non-regular file without opening it (no blocking open)', async () => {
+  const f = shadowFixture();
+  let opened = false;
+  await shadowReviewStep(f.actual, { ...f.options, stat: () => ({ isFile: () => false }), open: () => { opened = true; return 1; } });
+  assert.equal(opened, false); assert.equal(f.rows.length, 0);
+});
 
 test('shadow maps production completion fields for successful and bounced reviews', async () => {
   const f = shadowFixture();
