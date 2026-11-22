@@ -13,7 +13,9 @@ const soakConfig = readFileSync(new URL('../../../vitest.soak.config.ts', import
 
 // Worst observed (run 38604669331, slow runner): unit shard 2 = ~14 min of tests, daemon-soak baseline = 615s.
 const WORST_UNIT_SHARD_MIN = 14;
-const WORST_SOAK_BASELINE_MIN = 10.25;
+// 2026-11-22: the 50-tick baseline took 1017s on the last green main run (cbb0db375) and 1031s+ on the red one
+// (70001b920, timed out at r24 with ~1 tick left); every soak-shard (1) job today ran 15-18 min. Sized at 17.5.
+const WORST_SOAK_BASELINE_MIN = 17.5;
 // 2026-11-18 samples: test-shard (3) up to 24 min, soak shards up to 17 min.
 const WORST_TEST_SHARD_MIN = 24;
 // TT3 run 44443900759: the slowest integration part took 9.9 min before lane-pool was split further.
