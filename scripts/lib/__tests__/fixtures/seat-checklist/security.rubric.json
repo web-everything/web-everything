@@ -1,7 +1,7 @@
 {
  "rubricType": "https://everstandards.dev/core/rubric/v0.1",
  "id": "https://github.com/plateauapp/plateau-settings/blob/main/review/rubrics/security",
- "version": "2026-11-22.2",
+ "version": "2026-11-22.3",
  "title": "Security seat: basic list on every PR (SB1-SB4, CKLST-1 A) plus the merge-path lines MP1-MP14 when the diff touches merge-path code",
  "items": [
   {
@@ -35,7 +35,7 @@
    "naWhen": {
     "uri": "https://github.com/plateauapp/plateau-settings/blob/main/review/checks/diff-touches-no-merge-path",
     "digest": {
-     "sha256": "97bd449e86ade1459179f2a2580c254a5b84fd544ebd108d995decf518c36a68"
+     "sha256": "16a016a1040bc75a6f918d18f4c2936664b9a6184715de97cf911b96d8622d8f"
     }
    }
   },
@@ -45,7 +45,7 @@
    "naWhen": {
     "uri": "https://github.com/plateauapp/plateau-settings/blob/main/review/checks/diff-touches-no-merge-path",
     "digest": {
-     "sha256": "97bd449e86ade1459179f2a2580c254a5b84fd544ebd108d995decf518c36a68"
+     "sha256": "16a016a1040bc75a6f918d18f4c2936664b9a6184715de97cf911b96d8622d8f"
     }
    }
   },
@@ -55,7 +55,7 @@
    "naWhen": {
     "uri": "https://github.com/plateauapp/plateau-settings/blob/main/review/checks/diff-touches-no-merge-path",
     "digest": {
-     "sha256": "97bd449e86ade1459179f2a2580c254a5b84fd544ebd108d995decf518c36a68"
+     "sha256": "16a016a1040bc75a6f918d18f4c2936664b9a6184715de97cf911b96d8622d8f"
     }
    }
   },
@@ -65,7 +65,7 @@
    "naWhen": {
     "uri": "https://github.com/plateauapp/plateau-settings/blob/main/review/checks/diff-touches-no-merge-path",
     "digest": {
-     "sha256": "97bd449e86ade1459179f2a2580c254a5b84fd544ebd108d995decf518c36a68"
+     "sha256": "16a016a1040bc75a6f918d18f4c2936664b9a6184715de97cf911b96d8622d8f"
     }
    }
   },
@@ -75,7 +75,7 @@
    "naWhen": {
     "uri": "https://github.com/plateauapp/plateau-settings/blob/main/review/checks/diff-touches-no-merge-path",
     "digest": {
-     "sha256": "97bd449e86ade1459179f2a2580c254a5b84fd544ebd108d995decf518c36a68"
+     "sha256": "16a016a1040bc75a6f918d18f4c2936664b9a6184715de97cf911b96d8622d8f"
     }
    }
   },
@@ -85,7 +85,7 @@
    "naWhen": {
     "uri": "https://github.com/plateauapp/plateau-settings/blob/main/review/checks/diff-touches-no-merge-path",
     "digest": {
-     "sha256": "97bd449e86ade1459179f2a2580c254a5b84fd544ebd108d995decf518c36a68"
+     "sha256": "16a016a1040bc75a6f918d18f4c2936664b9a6184715de97cf911b96d8622d8f"
     }
    }
   },
@@ -95,7 +95,7 @@
    "naWhen": {
     "uri": "https://github.com/plateauapp/plateau-settings/blob/main/review/checks/diff-touches-no-merge-path",
     "digest": {
-     "sha256": "97bd449e86ade1459179f2a2580c254a5b84fd544ebd108d995decf518c36a68"
+     "sha256": "16a016a1040bc75a6f918d18f4c2936664b9a6184715de97cf911b96d8622d8f"
     }
    }
   },
@@ -105,7 +105,7 @@
    "naWhen": {
     "uri": "https://github.com/plateauapp/plateau-settings/blob/main/review/checks/diff-touches-no-merge-path",
     "digest": {
-     "sha256": "97bd449e86ade1459179f2a2580c254a5b84fd544ebd108d995decf518c36a68"
+     "sha256": "16a016a1040bc75a6f918d18f4c2936664b9a6184715de97cf911b96d8622d8f"
     }
    }
   },
@@ -115,7 +115,7 @@
    "naWhen": {
     "uri": "https://github.com/plateauapp/plateau-settings/blob/main/review/checks/diff-touches-no-merge-path",
     "digest": {
-     "sha256": "97bd449e86ade1459179f2a2580c254a5b84fd544ebd108d995decf518c36a68"
+     "sha256": "16a016a1040bc75a6f918d18f4c2936664b9a6184715de97cf911b96d8622d8f"
     }
    }
   },
@@ -125,7 +125,7 @@
    "naWhen": {
     "uri": "https://github.com/plateauapp/plateau-settings/blob/main/review/checks/diff-touches-no-merge-path",
     "digest": {
-     "sha256": "97bd449e86ade1459179f2a2580c254a5b84fd544ebd108d995decf518c36a68"
+     "sha256": "16a016a1040bc75a6f918d18f4c2936664b9a6184715de97cf911b96d8622d8f"
     }
    }
   },
@@ -135,7 +135,7 @@
    "naWhen": {
     "uri": "https://github.com/plateauapp/plateau-settings/blob/main/review/checks/diff-touches-no-merge-path",
     "digest": {
-     "sha256": "97bd449e86ade1459179f2a2580c254a5b84fd544ebd108d995decf518c36a68"
+     "sha256": "16a016a1040bc75a6f918d18f4c2936664b9a6184715de97cf911b96d8622d8f"
     }
    }
   },
@@ -145,7 +145,7 @@
    "naWhen": {
     "uri": "https://github.com/plateauapp/plateau-settings/blob/main/review/checks/diff-touches-no-merge-path",
     "digest": {
-     "sha256": "97bd449e86ade1459179f2a2580c254a5b84fd544ebd108d995decf518c36a68"
+     "sha256": "16a016a1040bc75a6f918d18f4c2936664b9a6184715de97cf911b96d8622d8f"
     }
    }
   },
@@ -155,7 +155,7 @@
    "naWhen": {
     "uri": "https://github.com/plateauapp/plateau-settings/blob/main/review/checks/diff-touches-no-merge-path",
     "digest": {
-     "sha256": "97bd449e86ade1459179f2a2580c254a5b84fd544ebd108d995decf518c36a68"
+     "sha256": "16a016a1040bc75a6f918d18f4c2936664b9a6184715de97cf911b96d8622d8f"
     }
    }
   },
@@ -165,7 +165,7 @@
    "naWhen": {
     "uri": "https://github.com/plateauapp/plateau-settings/blob/main/review/checks/diff-touches-no-merge-path",
     "digest": {
-     "sha256": "97bd449e86ade1459179f2a2580c254a5b84fd544ebd108d995decf518c36a68"
+     "sha256": "16a016a1040bc75a6f918d18f4c2936664b9a6184715de97cf911b96d8622d8f"
     }
    }
   }

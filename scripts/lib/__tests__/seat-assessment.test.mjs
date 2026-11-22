@@ -459,8 +459,9 @@ it('merge-path naWhen refuses missing, oversized and unreadable diff evidence wi
   const x = conditionalInput();
   expect(assessSeat({ ...x, base: 'b'.repeat(40), readDiff: () => { throw new Error('diff unreadable'); } }).gateOutcome).toBe('not-pass');
 });
-it('merge-path naWhen refuses the supplied placeholder digest until the rubric is repinned', () => {
+it('merge-path naWhen refuses a rubric pinning a stale check digest', () => {
   const x = conditionalInput(); x.rubric = json('security.rubric.json'); x.policy = json('policy.company.json');
+  for (const item of x.rubric.items) if (item.naWhen) item.naWhen.digest.sha256 = '97bd449e86ade1459179f2a2580c254a5b84fd544ebd108d995decf518c36a68';
   x.assessment.predicate.rubric = { uri: x.rubric.id, digest: digestOf(x.rubric) };
   x.assessment.predicate.policy = { uri: x.policy.id, digest: digestOf(x.policy) };
   expect(assessSeat(x)).toMatchObject({ gateOutcome: 'not-pass', reason: 'stale' });
@@ -638,4 +639,14 @@ it('a per-item downgrade requires confirmation from every ancestor configuring t
   expect(load().problems.join(' ')).toContain('without confirmation from company, team');
   repo.confirmations.push({ ...repo.confirmations[0], level: 'team', owner: 'https://example.org/team-owner' });
   expect(load().problems).toEqual([]);
+});
+
+it('the merge-path naWhen check digest matches the one pinned by every MP item of the published rubric (drift forces a re-pin)', () => {
+  const live = digestOf(MERGE_PATH_CHECK_DEFINITION).sha256;
+  const mp = json('security.rubric.json').items.filter(i => /^MP\d+$/.test(i.id));
+  expect(mp).toHaveLength(14);
+  for (const item of mp) {
+    expect(item.naWhen.uri).toBe(MERGE_PATH_CHECK_DEFINITION.uri);
+    expect(item.naWhen.digest.sha256, `${item.id}: TRUST_CHAIN/GATE_PATTERNS changed; re-pin the rubric`).toBe(live);
+  }
 });
