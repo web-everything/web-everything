@@ -66,8 +66,9 @@ export function readProviderCapacity({ env = {}, now = Date.now(), readers = {},
         codexRollout: (account.readers ?? owner.readers)?.some(r => r.type === 'codex-rollout') });
       let status;
       try { status = readers.signedOut?.(account.id, env); } catch { /* unknown status */ }
-      // Signed-out status is a plain timestamped observation: no future skew, same expiry as live readings.
-      const freshSignedOut = value => value?.status === 'signed-out' && liveReadingTimestampValid(value, now, { staleHours: s.staleHours });
+      // Signed-out status must carry its own `at`: never asOf or the file mtime, no future skew, live-reading expiry.
+      const freshSignedOut = value => value?.status === 'signed-out' && value.at != null
+        && liveReadingTimestampValid({ at: value.at }, now, { staleHours: s.staleHours });
       const signedOut = freshSignedOut(raw) || freshSignedOut(status);
       const add = (name, w, source = 'live') => {
         const usedPercent = w?.usedPercent ?? w?.used_percent ?? w?.used_percentage;

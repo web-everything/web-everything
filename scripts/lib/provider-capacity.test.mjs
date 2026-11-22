@@ -47,6 +47,26 @@ test('signed-out capacity has zero health and ignores a newer operator reading',
   assert.equal(c.health, 0);
 });
 
+test('signed-out file without its own at is never dated by the file mtime (PR 7331 merge)', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'capacity-signed-out-mtime-'));
+  try {
+    mkdirSync(join(dir, '.plateau'));
+    const file = join(dir, '.plateau', 'agy-usage.json');
+    for (const body of [{ status: 'signed-out' }, { at: null, status: 'signed-out' }]) {
+      writeFileSync(file, JSON.stringify(body));
+      // A fresh mtime must not stand in for the missing observation time, for either reader of the file.
+      utimesSync(file, new Date(now - hour), new Date(now - hour));
+      const capacities = observeCapacity({ env: { HOME: dir, CONVEYOR_STATE_ROOT: dir, WE_CAPACITY_READERS: 'on' },
+        now, settings: PROVIDER_DEFAULTS, records: [], quota: () => null }).filter(c => c.provider.startsWith('agy-'));
+      assert.equal(capacities.length, 2);
+      for (const c of capacities) {
+        assert.equal(c.signedOut, undefined, `${c.provider} ${JSON.stringify(body)}`);
+        assert.equal(c.health, 1);
+      }
+    }
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
 test('fresh signed-out agy usage file marks both providers without adding usage windows', () => {
   const dir = mkdtempSync(join(tmpdir(), 'capacity-signed-out-'));
   try {
