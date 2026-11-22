@@ -174,10 +174,12 @@ export async function runSeatWithProvider(request, {
       const scoped = scopeFindingsToCitedFiles(agyRun.value.findings, { scope: directive.citationScope });
       if (!scoped.enforced || scoped.admitted.length !== agyRun.value.findings.length) {
         reasons.push('Carbon citation scope unavailable or findings withheld as out-of-scope');
-      } else if (!scoped.admitted.length) {
+      } else {
         let inspected = false;
-        try { inspected = Boolean(agyRun.transcriptFile) && hasSuccessfulDiffRead(readTranscript(agyRun.transcriptFile), directive.citationScope); } catch { /* unreadable evidence refuses */ }
-        if (!inspected) reasons.push('Carbon returned zero findings without a successful diff read_file');
+        try { inspected = Boolean(agyRun.transcriptFile) && hasSuccessfulDiffRead(readTranscript(agyRun.transcriptFile), directive.citationScope, {
+          checkoutRoot: agyRun.checkoutRoot ?? cwd, requiredFiles: scoped.admitted.map(finding => finding.file),
+        }); } catch { /* unreadable evidence refuses */ }
+        if (!inspected) reasons.push('Carbon lacks successful diff read_file evidence for its cited files');
       }
     }
     if (agyRun.servedModel !== model) reasons.push('observed Carbon model identity missing or mismatched');

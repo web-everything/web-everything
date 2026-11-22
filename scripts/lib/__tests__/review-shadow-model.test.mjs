@@ -14,6 +14,11 @@ import { deriveVerdict } from '../jury-core.mjs';
 import { buildTrialReport } from '../agy-shadow-trial-report.mjs';
 import { reserveShadowSession } from '../review-shadow-budget.mjs';
 
+const servedReadTrace = (path, state = 'DONE', extra = {}) => [
+  { event: 'step_update', step_update: { step_index: 1, step_type: 'tool', tool_name: 'read_file', state, tool_info: { parameters: { AbsolutePath: path } }, ...extra } },
+  { event: 'result', result: { status: 'SUCCESS' } },
+].map(x => JSON.stringify(x)).join('\n');
+
 const model = 'gemini-4-argon-high';
 const routingModel = 'claude-sonnet-5-5-high';
 const finding = { summary: 'private finding text', file: 'scripts/example.mjs', line: 12, category: 'security/fail-open', disposition: 'blocker' };
@@ -592,13 +597,13 @@ describe('one counted Carbon correctness seat', () => {
   const carbon = 'gemini-4-carbon-high';
   const settings = () => loadReviewSeatSettings({ policy: DEFAULT_ROUTING_POLICY, aiRouting: {}, log: () => {} });
   async function counted(agyRun) {
-    if (agyRun === ok) agyRun = { ...ok, servedModel: carbon };
+    if (agyRun === ok) agyRun = { ...ok, servedModel: carbon, checkoutRoot: '/lane', transcriptFile: 'served.jsonl' };
     const rows = [];
     const claudeJudge = vi.fn(async () => ({ value: claudeAnswer }));
     const answer = await runSeatWithProvider({ lens: 'correctness', runId: 'promotion-test', shape: REVIEW_JUDGE_SHAPE,
       seatProvider: { ...seatProviderDirective(settings(), 'correctness', highCarePr), repo: 'o/r', pr: 7, head: 'head', citationScope: [finding.file] } }, {
       cwd: '.', claudeJudge, unwrap: x => x, wrap: value => value,
-      agyJuror: async () => { if (agyRun instanceof Error) throw agyRun; return agyRun; },
+      agyJuror: async () => { if (agyRun instanceof Error) throw agyRun; return agyRun; }, readTranscript: () => servedReadTrace(finding.file),
       // This fixture exercises standard caps, independent of operator platform preferences.
       readRoutingPolicy: () => DEFAULT_ROUTING_POLICY, readSeatSettings: () => ({ tool: {}, platform: {} }),
       appendPromotion: row => { rows.push(row); return true; }, reserveSession: () => ({ allowed: true }), log: () => {},
@@ -704,14 +709,14 @@ describe('one counted Carbon correctness seat', () => {
 
 describe('promotion verdict authorization audit', () => {
   const carbon = 'gemini-4-carbon-high';
-  const good = { status: 'ok', sessionId: 'carbon-session', servedModel: carbon, value: { summary: 'Reviewed diff: inverted guard', findings: [finding] } };
+  const good = { status: 'ok', sessionId: 'carbon-session', servedModel: carbon, checkoutRoot: '/lane', transcriptFile: 'served.jsonl', value: { summary: 'Reviewed diff: inverted guard', findings: [finding] } };
   const policyWith = patch => {
     const policy = structuredClone(DEFAULT_ROUTING_POLICY);
     Object.assign(policy.operations['review-seat:mandatory:correctness'], patch);
     return validateRoutingPolicy(policy);
   };
   const selection = policy => loadReviewSeatSettings({ policy, aiRouting: {}, log: () => {} });
-  async function attempt(result = good, { lens = 'correctness', promoted = true, policy = DEFAULT_ROUTING_POLICY, append = () => true, scope = [finding.file], transcript = '' } = {}) {
+  async function attempt(result = good, { lens = 'correctness', promoted = true, policy = DEFAULT_ROUTING_POLICY, append = () => true, scope = [finding.file], transcript = servedReadTrace(finding.file) } = {}) {
     vi.stubEnv('WE_REVIEW_SHADOW_AGY_PROMOTED', 'true');
     const rows = [], calls = [];
     const answer = await runSeatWithProvider({ lens, runId: 'audit', shape: REVIEW_JUDGE_SHAPE, seatProvider: {
@@ -752,8 +757,8 @@ describe('promotion verdict authorization audit', () => {
     expect(logs.join(' ')).toMatch(/invalid.*promotion.*refus|promotion.*invalid.*refus/i);
   });
   it.each([
-    { ...good, value: { summary: 'Review not performed: no diff evidence', findings: [] } },
-    { ...good, value: { summary: 'Clean', findings: [] } },
+    { ...good, transcriptFile: null, value: { summary: 'Review not performed: no diff evidence', findings: [] } },
+    { ...good, transcriptFile: null, value: { summary: 'Clean', findings: [] } },
     ...[{ file: 42 }, { line: 0 }, { line: -1 }, { line: 1.5 }, { category: {} }].map(patch => ({ ...good, value: { summary: 'Reviewed', findings: [{ ...finding, ...patch }] } })),
     ...[undefined, 'unknown', 'gemini-4-argon-high'].map(servedModel => ({ ...good, servedModel })),
     { ...good, timedOut: true },
@@ -823,6 +828,37 @@ describe('promotion verdict authorization audit', () => {
     const result = await attempt({ ...good, transcriptFile: 'served.jsonl', value: { summary: 'Clean', findings: [] } }, { transcript: readTrace(finding.file) });
     expect(result.calls).toEqual(['carbon']);
     expect(result.answer.seatProvider.provider).toBe('agy');
+  });
+
+  it('schema-valid nonblocking placeholder with file and line but no reads falls back to Claude', async () => {
+    const result = await attempt({ ...good, value: { summary: 'Could not inspect the diff', findings: [{
+      summary: 'Could not inspect the file', file: finding.file, line: 1, disposition: 'nit',
+      impactIfUnfixed: 'cosmetic', introduced: false, worseThanBase: false,
+    }] } }, { transcript: '' });
+    fellBack(result);
+    expect(result.rows[0]).toMatchObject({ fallback: true, agyVerdict: null });
+  });
+  it('reading root config.json never satisfies scope containing only src/config.json', async () => {
+    fellBack(await attempt({ ...good, transcriptFile: 'served.jsonl', value: { summary: 'Clean', findings: [] } }, {
+      scope: ['src/config.json'], transcript: readTrace('config.json'),
+    }));
+  });
+  it('every cited finding file must have its own successful diff read', async () => {
+    fellBack(await attempt({ ...good, transcriptFile: 'served.jsonl', value: { ...good.value,
+      findings: [finding, { ...finding, file: 'scripts/second.mjs' }],
+    } }, { scope: [finding.file, 'scripts/second.mjs'], transcript: readTrace(finding.file) }));
+  });
+
+  it.each(['./src/config.json', '/lane/src/config.json', '/lane/src/../src/config.json', 'src\\config.json'])('exact repo-relative successful reads admit a counted answer: %s', async path => {
+    const result = await attempt({ ...good, value: { summary: 'Clean', findings: [] } }, {
+      scope: ['src/config.json'], transcript: readTrace(path),
+    });
+    expect(result.calls).toEqual(['carbon']);
+  });
+  it.each(['/lane/config.json', '/other/src/config.json', 'src/../config.json'])('a normalized read outside the exact scoped path runs Claude: %s', async path => {
+    fellBack(await attempt({ ...good, value: { summary: 'Clean', findings: [] } }, {
+      scope: ['src/config.json'], transcript: readTrace(path),
+    }));
   });
 
 });

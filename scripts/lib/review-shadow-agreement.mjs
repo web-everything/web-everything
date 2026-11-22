@@ -21,9 +21,9 @@
  * USAGE: node scripts/lib/review-shadow-agreement.mjs --report [--json]
  */
 import { appendFileSync, mkdirSync, readFileSync } from 'node:fs';
-import { dirname, join } from 'node:path';
+import { dirname, join, posix, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { bindFindingIds, deriveVerdict, findingIdentityEntry, normalizeFindings, scopeFindingsToCitedFiles } from './jury-core.mjs';
+import { bindFindingIds, deriveVerdict, findingIdentityEntry, normalizeFindings } from './jury-core.mjs';
 import { findingDefectClass } from './review-round-rules.mjs';
 import { daemonConveyorStateRoot } from './daemon-last-good.mjs';
 import { assertCrossVendorPanel, loadReviewSeatSettings, sanitizeReviewLog } from './review-seat-provider.mjs';
@@ -120,10 +120,24 @@ export function validShadowAnswer(answer, { counted = false, schema } = {}) {
       && (finding.line == null || (Number.isSafeInteger(finding.line) && finding.line > 0)));
 }
 
+/** Normalize a served path against its actual juror checkout, never against a suffix. */
+function repoRelativeReadPath(value, checkoutRoot) {
+  if (typeof value !== 'string' || !value || value.includes('\0')) return null;
+  let path = posix.normalize(value.replace(/\\/g, '/'));
+  const absolute = p => posix.isAbsolute(p) || /^[A-Za-z]:\//.test(p);
+  if (absolute(path)) {
+    if (typeof checkoutRoot !== 'string' || !checkoutRoot) return null;
+    let root = posix.normalize(checkoutRoot.replace(/\\/g, '/'));
+    if (!absolute(root)) root = resolve(root).replace(/\\/g, '/');
+    path = posix.relative(root, path);
+  }
+  return path && path !== '.' && path !== '..' && !path.startsWith('../') && !absolute(path) ? path : null;
+}
+
 /** Served transcript evidence only. A completed, non-error read_file must cite a diff path.
  * The juror's existing escape checks have already validated the transcript and in-lane paths.
  */
-export function hasSuccessfulDiffRead(transcript, scope) {
+export function hasSuccessfulDiffRead(transcript, scope, { checkoutRoot, requiredFiles = [] } = {}) {
   try {
     const events = String(transcript).split('\n').filter(line => line.trim()).map(line => JSON.parse(line));
     if (events.at(-1)?.event !== 'result' || events.at(-1)?.result?.status !== 'SUCCESS') return false;
@@ -150,10 +164,16 @@ export function hasSuccessfulDiffRead(transcript, scope) {
       if (step.state !== undefined) record.done = step.state === 'DONE' && (step.step_type === 'tool' || names.includes('read_file'));
       steps.set(key, record);
     }
-    return [...steps.values()].some(record => {
-      if (!record.read || record.bad || !record.done || !record.path) return false;
-      const scoped = scopeFindingsToCitedFiles([{ summary: 'served read_file', file: record.path, line: 1 }], { scope });
-      return scoped.enforced && scoped.admitted.length === 1;
+    const diffPaths = new Set((Array.isArray(scope) ? scope : []).map(path => repoRelativeReadPath(path, checkoutRoot)).filter(Boolean));
+    const inspected = new Set();
+    for (const record of steps.values()) {
+      if (!record.read || record.bad || !record.done || !record.path) continue;
+      const path = repoRelativeReadPath(record.path, checkoutRoot);
+      if (path && diffPaths.has(path)) inspected.add(path);
+    }
+    return inspected.size > 0 && requiredFiles.every(file => {
+      const path = repoRelativeReadPath(file, checkoutRoot);
+      return path !== null && inspected.has(path);
     });
   } catch { return false; }
 }
