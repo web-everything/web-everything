@@ -97,9 +97,14 @@ export function listFilesRecursive(dir) {
   return out;
 }
 
-/** Repository-selecting variables a git hook exports. Inherited, they point every git call at the
- *  hook's repo instead of the root being read, so a secondary root's skills read as untracked. */
-export const GIT_REPO_ENV = Object.freeze(['GIT_DIR', 'GIT_WORK_TREE', 'GIT_INDEX_FILE', 'GIT_COMMON_DIR', 'GIT_PREFIX']);
+/** Repository-selecting variables a git hook (or a caller's shell) exports. Inherited, they point every
+ *  git call at another repo, index or object store, or stop discovery short, so a secondary root's skills
+ *  read as untracked or its root reads as "not a git repo". */
+export const GIT_REPO_ENV = Object.freeze([
+  'GIT_DIR', 'GIT_WORK_TREE', 'GIT_INDEX_FILE', 'GIT_COMMON_DIR', 'GIT_PREFIX',
+  'GIT_CEILING_DIRECTORIES', 'GIT_DISCOVERY_ACROSS_FILESYSTEM',
+  'GIT_OBJECT_DIRECTORY', 'GIT_ALTERNATE_OBJECT_DIRECTORIES', 'GIT_NAMESPACE',
+]);
 
 /** `env` without the repository-selecting git variables. */
 export function gitRootEnv(env = process.env) {

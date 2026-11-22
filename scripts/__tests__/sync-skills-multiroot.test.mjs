@@ -14,7 +14,7 @@ import { buildPlans, gitTrackedFiles, parseArgs } from '../sync-skills-deploy.mj
 import * as skillsSync from '../sync-skills-deploy.mjs';
 
 const MODULE_PATH = join(dirname(fileURLToPath(import.meta.url)), '..', 'sync-skills-deploy.mjs');
-const GIT_REPO_ENV = ['GIT_DIR', 'GIT_WORK_TREE', 'GIT_INDEX_FILE', 'GIT_COMMON_DIR', 'GIT_PREFIX'];
+const GIT_REPO_ENV = skillsSync.GIT_REPO_ENV;
 let tmp;
 beforeEach(() => { tmp = mkdtempSync(join(tmpdir(), 'sync-multiroot-')); });
 afterEach(() => { try { rmSync(tmp, { recursive: true, force: true }); } catch { /* best-effort */ } });
@@ -401,9 +401,13 @@ describe('operator send-back: inherited Git repository environment', () => {
     ['GIT_DIR', () => ({ GIT_DIR: weGitDir })],
     ['GIT_DIR + GIT_WORK_TREE', () => ({ GIT_DIR: weGitDir, GIT_WORK_TREE: weTop })],
     ['GIT_INDEX_FILE', () => ({ GIT_INDEX_FILE: join(tmp, 'no-such-index') })],
+    ['GIT_CEILING_DIRECTORIES', () => ({ GIT_CEILING_DIRECTORIES: join(tmp, 'home', 'workspace', 'plateau-ops') })],
     ['every repository variable', () => ({
       GIT_DIR: weGitDir, GIT_WORK_TREE: weTop, GIT_INDEX_FILE: join(tmp, 'no-such-index'),
       GIT_COMMON_DIR: weGitDir, GIT_PREFIX: 'scripts/',
+      GIT_CEILING_DIRECTORIES: join(tmp, 'home', 'workspace', 'plateau-ops'), GIT_DISCOVERY_ACROSS_FILESYSTEM: '0',
+      GIT_OBJECT_DIRECTORY: join(weGitDir, 'objects'), GIT_ALTERNATE_OBJECT_DIRECTORIES: join(weGitDir, 'objects'),
+      GIT_NAMESPACE: 'elsewhere',
     })],
   ])('with an inherited %s both ops skills are still tracked', (_label, envFor) => {
     gitRepoWithSkills('home/workspace/plateau-ops', ['providers', 'review-design']);
