@@ -153,33 +153,49 @@ export const LEAN_FIX_TOOLS = `${RESTRICTED_PROVIDER_TOOLS},Agent`;
  *  renamed or narrowed off a lean tool fails the dispatch closed. Extend it here when a guard is added. */
 const LEAN_EDIT_GUARDS = ['scripts/guard-lane.mjs', 'scripts/lint-locus-prefix.mjs --pre', 'scripts/lint-invisible-characters.mjs',
   'scripts/check-memory.mjs --pre', 'scripts/backlog-guard.mjs --pre', 'scripts/guard-backward-edge.mjs'];
+// `form` is how the guard must be invoked: `pre` = through the pinned `.guard-main` launcher with the blocking
+// `|| exit 2` tail (only exit 2 blocks a tool call); `stop` = `exec`'d through the pinned launcher as a stop
+// hook; absent = a plain exact token (the broadcast hook runs from the session's own checkout by design).
 export const LEAN_FIX_REQUIRED_GUARDS = Object.freeze([
-  { event: 'PreToolUse', tools: ['Bash'], scripts: ['scripts/guard-bash.mjs'] },
-  { event: 'PreToolUse', tools: ['Edit', 'Write'], scripts: LEAN_EDIT_GUARDS },
-  { event: 'PreToolUse', tools: ['Agent'], scripts: ['scripts/guard-prep.mjs'] },
-  { event: 'Stop', scripts: ['scripts/guard-stop-passive-wait.mjs'] },
-  { event: 'SubagentStop', scripts: ['scripts/guard-stop-passive-wait.mjs', 'scripts/guard-stop-background-running.mjs'] },
+  { event: 'PreToolUse', tools: ['Bash'], form: 'pre', scripts: ['scripts/guard-bash.mjs'] },
+  { event: 'PreToolUse', tools: ['Edit', 'Write'], form: 'pre', scripts: LEAN_EDIT_GUARDS },
+  { event: 'PreToolUse', tools: ['Agent'], form: 'pre', scripts: ['scripts/guard-prep.mjs'] },
+  { event: 'Stop', form: 'stop', scripts: ['scripts/guard-stop-passive-wait.mjs'] },
+  { event: 'SubagentStop', form: 'stop', scripts: ['scripts/guard-stop-passive-wait.mjs', 'scripts/guard-stop-background-running.mjs'] },
   // The broadcast hook is the operator's stop channel: it must fire after every lean tool and on every prompt.
   { event: 'PostToolUse', tools: LEAN_FIX_TOOLS.split(','), scripts: ['scripts/broadcast-inject.mjs'] },
   { event: 'UserPromptSubmit', scripts: ['scripts/broadcast-inject.mjs'] },
 ].map(rule => Object.freeze({ ...rule, scripts: Object.freeze([...rule.scripts]) })));
 
 /** Claude Code matcher semantics: absent, empty or `*` matches every tool; otherwise an anchored regex
- *  (`Edit|Write` is the common pipe-list case). An unparseable matcher covers nothing (fail closed). */
+ *  (`Edit|Write` is the common pipe-list case). An unparseable matcher covers nothing (fail closed) — compiled
+ *  on its own FIRST, so a broken matcher such as `x)|(?:Bash` cannot become valid once wrapped in the anchors. */
 function matcherCovers(matcher, tool) {
   if (matcher === undefined || matcher === '' || matcher === '*') return true;
   if (typeof matcher !== 'string') return false;
-  try { return new RegExp(`^(?:${matcher})$`).test(tool); } catch { return false; }
+  try {
+    new RegExp(matcher);
+    return new RegExp(`^(?:${matcher})$`).test(tool);
+  } catch { return false; }
 }
 
-const commandHasScript = (command, script) =>
-  new RegExp(`(?<![\\w./-])${script.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}(?![\\w.-])`).test(command);
+const escapeRegExp = (text) => text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+const PINNED_LAUNCHER_PREFIX = `sh -c 'launcher="$HOME/workspace/.guard-main/scripts/hooks/run-pinned-guard.mjs"; `;
+const commandHasScript = (command, script, form) => {
+  const token = escapeRegExp(script);
+  if (!form) return new RegExp(`(?<![\\w./-])${token}(?![\\w.-])`).test(command);
+  if (!command.startsWith(PINNED_LAUNCHER_PREFIX)) return false;
+  const tail = form === 'pre'
+    ? `; node "\\$launcher" ${token}; code=\\$\\?; \\[ "\\$code" -eq 0 \\] \\|\\| exit 2'`
+    : `; exec node "\\$launcher" --stop-hook ${token}'`;
+  return new RegExp(`${tail}\\s*$`).test(command);
+};
 
 /** Every {@link LEAN_FIX_REQUIRED_GUARDS} requirement the given `hooks` object does not meet, as
  *  `<event>[<tool>] <script>` strings (empty = all present). Unknown or malformed shapes count as missing. */
 export function leanFixGuardGaps(hooks) {
   const missing = [];
-  for (const { event, tools = [undefined], scripts } of LEAN_FIX_REQUIRED_GUARDS) {
+  for (const { event, tools = [undefined], form, scripts } of LEAN_FIX_REQUIRED_GUARDS) {
     const entries = Array.isArray(hooks?.[event]) ? hooks[event] : [];
     for (const tool of tools) {
       const commands = entries.filter(entry => tool === undefined || matcherCovers(entry?.matcher, tool))
@@ -187,7 +203,7 @@ export function leanFixGuardGaps(hooks) {
         .filter(hook => hook?.type === 'command' && typeof hook.command === 'string')
         .map(hook => hook.command);
       for (const script of scripts) {
-        if (!commands.some(command => commandHasScript(command, script))) missing.push(`${event}${tool ? `[${tool}]` : ''} ${script}`);
+        if (!commands.some(command => commandHasScript(command, script, form))) missing.push(`${event}${tool ? `[${tool}]` : ''} ${script}`);
       }
     }
   }

@@ -141,6 +141,16 @@ describe('lean repair background argv', () => {
     'missing PostToolUse broadcast': (h) => dropGuard(h, 'PostToolUse', undefined, 'scripts/broadcast-inject.mjs'),
     'PostToolUse broadcast narrowed to Read': (h) => { entriesOf(h, 'PostToolUse', undefined).forEach(entry => { entry.matcher = 'Read'; }); },
     'missing UserPromptSubmit broadcast': (h) => { delete h.UserPromptSubmit; },
+    // Present but switched off: run outside the pinned launcher, unable to block, or behind a broken matcher.
+    'Bash guard run from the lane copy (unpinned)': (h) => {
+      entriesOf(h, 'PreToolUse', 'Bash').forEach(entry => { entry.hooks = [{ type: 'command', command: 'node scripts/guard-bash.mjs' }]; });
+    },
+    'Bash guard non-blocking exit 0': (h) => swapGuard(h, 'PreToolUse', 'Bash', "|| exit 2'", "|| exit 0'"),
+    'Bash guard only in a trailing comment': (h) => swapGuard(h, 'PreToolUse', 'Bash', 'node "$launcher" scripts/guard-bash.mjs', 'true # scripts/guard-bash.mjs'),
+    'Stop guard not exec-ed through the launcher': (h) => swapGuard(h, 'Stop', undefined, 'exec node "$launcher" --stop-hook', 'node scripts/noop.mjs; true'),
+    'broken Bash matcher balanced only by the anchor wrap': (h) => {
+      entriesOf(h, 'PreToolUse', 'Bash').forEach(entry => { entry.matcher = 'x)|(?:Bash'; });
+    },
   };
 
   it.each(['unreadable', 'invalid JSON', 'missing hooks', 'missing Edit|Write', 'missing Bash', 'missing Stop', 'empty guard',

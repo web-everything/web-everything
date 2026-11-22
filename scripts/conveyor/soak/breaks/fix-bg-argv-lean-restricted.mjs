@@ -10,19 +10,28 @@ const SOURCE = 'scripts/operations/dispatch-lane-io.mjs';
 const PROVIDER = 'scripts/operations/minimal-context-provider.mjs';
 const SETTINGS_FIXTURE = 'scripts/operations/__tests__/fixtures/lean-hooks-claude-settings.json';
 const KINDS = ['fix', 'ci-heal'];
-// PR #7332 round 2: an entry that keeps its matcher but loses ONE guard (or the broadcast stop channel) must be
-// refused by the subject tree's own hook loader, not copied into the lean session.
+// PR #7332 round 2: an entry that keeps its matcher but loses ONE guard (or the broadcast stop channel), or keeps
+// the guard switched off (unpinned, non-blocking, behind a broken matcher), must be refused by the subject tree's
+// own hook loader, not copied into the lean session.
 const GUARD_FAULTS = [
-  { event: 'PreToolUse', script: 'scripts/guard-bash.mjs' },
-  { event: 'PreToolUse', script: 'scripts/guard-lane.mjs' },
-  { event: 'Stop', script: 'scripts/guard-stop-passive-wait.mjs' },
-  { event: 'PostToolUse', script: 'scripts/broadcast-inject.mjs' },
+  { name: 'guard-bash dropped', event: 'PreToolUse', find: 'scripts/guard-bash.mjs', replace: 'scripts/noop.mjs' },
+  { name: 'guard-lane dropped', event: 'PreToolUse', find: 'scripts/guard-lane.mjs', replace: 'scripts/noop.mjs' },
+  { name: 'Stop guard dropped', event: 'Stop', find: 'scripts/guard-stop-passive-wait.mjs', replace: 'scripts/noop.mjs' },
+  { name: 'broadcast dropped', event: 'PostToolUse', find: 'scripts/broadcast-inject.mjs', replace: 'scripts/noop.mjs' },
+  { name: 'guard-bash non-blocking', event: 'PreToolUse', matcher: 'Bash', find: "|| exit 2'", replace: "|| exit 0'" },
+  { name: 'guard-bash unpinned', event: 'PreToolUse', matcher: 'Bash',
+    find: 'node "$launcher" scripts/guard-bash.mjs', replace: 'node scripts/guard-bash.mjs' },
+  { name: 'broken matcher', event: 'PreToolUse', matcher: 'Bash', setMatcher: 'x)|(?:Bash' },
 ];
 const GUARDS = {
   Bash: ['guard-bash.mjs'],
   'Edit|Write': ['guard-lane.mjs', 'lint-locus-prefix.mjs --pre', 'lint-invisible-characters.mjs',
     'check-memory.mjs --pre', 'backlog-guard.mjs --pre', 'guard-backward-edge.mjs'],
+  'Agent|Task': ['guard-prep.mjs'],
 };
+// Exact token, so a look-alike (`broadcast-inject.mjs.disabled`) does not count as the hook.
+const hasToken = (command, script) => new RegExp(`(?<![\\w./-])scripts/${script.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}(?![\\w.-])`)
+  .test(String(command));
 // A fresh process both permits dynamic import in the synchronous fixPresent contract and avoids
 // caching a different tree's builder or settings. No agent is spawned by buildAgentArgv.
 const PROBE = `
@@ -44,15 +53,17 @@ try {
   const canonical = readFileSync(process.argv[3], 'utf8');
   const dir = mkdtempSync(join(tmpdir(), 'soak-lean-guards-'));
   try {
-    guardFaults = JSON.parse(process.argv[4]).map(({ event, script }) => {
+    guardFaults = JSON.parse(process.argv[4]).map(({ name, event, matcher, find, replace, setMatcher }) => {
       const settings = JSON.parse(canonical);
       for (const entry of settings.hooks?.[event] ?? []) {
-        for (const hook of entry.hooks ?? []) hook.command = String(hook.command).split(script).join('scripts/noop.mjs');
+        if (matcher !== undefined && entry.matcher !== matcher) continue;
+        if (setMatcher !== undefined) entry.matcher = setMatcher;
+        if (find !== undefined) for (const hook of entry.hooks ?? []) hook.command = String(hook.command).split(find).join(replace);
       }
       const path = join(dir, 'settings.json');
       writeFileSync(path, JSON.stringify(settings));
-      try { LEAN_FIX_HOOKS_SETTINGS(path); return { event, script, refused: false }; }
-      catch { return { event, script, refused: true }; }
+      try { LEAN_FIX_HOOKS_SETTINGS(path); return { name, refused: false }; }
+      catch { return { name, refused: true }; }
     });
   } finally { rmSync(dir, { recursive: true, force: true }); }
 } catch (error) { guardFaults = { error: error.message }; }
@@ -108,10 +119,11 @@ function judge(report) {
           }
         }
       }
-      for (const [event, script] of [['Stop', 'guard-stop-passive-wait.mjs'], ['PostToolUse', 'broadcast-inject.mjs'],
+      for (const [event, script] of [['Stop', 'guard-stop-passive-wait.mjs'], ['SubagentStop', 'guard-stop-passive-wait.mjs'],
+        ['SubagentStop', 'guard-stop-background-running.mjs'], ['PostToolUse', 'broadcast-inject.mjs'],
         ['UserPromptSubmit', 'broadcast-inject.mjs']]) {
         const entries = Array.isArray(settings?.hooks?.[event]) ? settings.hooks[event] : [];
-        if (!entries.some(entry => (entry?.hooks ?? []).some(hook => String(hook?.command).includes(`scripts/${script}`)))) {
+        if (!entries.some(entry => (entry?.hooks ?? []).some(hook => hasToken(hook?.command, script)))) {
           violations.push(`${kind}: missing ${event} hook ${script}`);
         }
       }
@@ -122,7 +134,7 @@ function judge(report) {
     violations.push(`guard-fault probe incomplete: ${faults?.error ?? 'no evidence'}`);
   } else {
     for (const fault of faults) {
-      if (fault?.refused !== true) violations.push(`lean hooks accepted settings missing ${fault?.event} ${fault?.script}`);
+      if (fault?.refused !== true) violations.push(`lean hooks accepted settings with ${fault?.name}`);
     }
   }
   return violations;
