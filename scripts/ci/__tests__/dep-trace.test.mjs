@@ -16,6 +16,9 @@ import { runTraceCoverage } from '../../readiness/trace-coverage.mjs';
 const root = process.cwd();
 const test = 'fake.test.mjs';
 const hookUrl = pathToFileURL(resolve(root, 'scripts/ci/dep-trace.mjs')).href;
+/** Counts reads of caller code (getters, traps, toString) that only the tracer could make in a mocked call. */
+let reads = 0;
+const count = () => { reads++; return 'x'; };
 function fixture(extra = {}) {
   const record = vi.fn();
   const env = { WE_TRACE_TEST: test, WE_TRACE_DIR: 'artifacts', NODE_OPTIONS: `--conditions=original --import=${JSON.stringify(hookUrl)}` };
@@ -66,6 +69,12 @@ describe('shadow dependency tracer', () => {
     ['Buffer cwd', `cp.spawnSync(process.execPath, ['-e', 'process.stdout.write(process.cwd())'], { cwd: Buffer.from(os.tmpdir()), encoding: 'utf8' }).stdout`, false],
     ['env:{}', `cp.spawnSync(process.execPath, ['-e', 'process.stdout.write(JSON.stringify(Object.keys(process.env).filter(k => /^(WE_|NODE_OPTIONS$)/.test(k))))'], { env: {}, encoding: 'utf8' }).stdout`, true],
     ['promisify', `(await util.promisify(cp.execFile)(process.execPath, ['-e', 'process.stdout.write("ok")'])).stdout`, false],
+    // PR #7123 send-back 1: the child exits 7 unless it sees the getter's FIRST value, so a second read by the tracer fails it.
+    ['env getter read once', `(() => { let n = 0; const env = Object.defineProperty({ ...process.env }, 'PROBE', { enumerable: true, get: () => (n++ ? 'second' : 'first') });
+      const child = cp.spawnSync(process.execPath, ['-e', 'process.exit(process.env.PROBE === "first" ? 0 : 7)'], { env });
+      if (child.status !== 0) throw new Error('child exited ' + child.status); return child.status; })()`, true],
+    // PR #7123 send-back 2: a non-Node child never loads the hook, so its reads are untraced.
+    ['execSync cat', `cp.execSync('cat package.json').length > 0`, true],
   ])('a traced %s child exits and prints exactly as an untraced one', (_label, expression, incomplete) => {
     const source = `const cp = require('node:child_process'), os = require('node:os'), util = require('node:util');
       (async () => { process.stdout.write(String(${expression})); })().catch(e => { process.stderr.write(String(e)); process.exitCode = 1; });`;
@@ -232,12 +241,76 @@ describe('shadow dependency tracer', () => {
     expect(f.tracer.snapshot().incomplete).toBe(incomplete);
     expect(f.originals.spawn).toHaveBeenCalledTimes(1);
   });
-  it('observes execSync, which bypasses the exported spawnSync, with options in the first slot', () => {
+  // PR #7123 send-back 2: a shell runs first, so even `node -e 0` through execSync is not provably traced.
+  it('observes execSync, which bypasses the exported spawnSync, and flags its shell child incomplete', () => {
     const f = fixture();
     f.child_process.execSync('node -e 0', { encoding: 'utf8' });
-    expect(f.tracer.snapshot().incomplete).toBe(false);
-    f.child_process.execSync('node -e 0', { env: {} });
+    expect(f.originals.execSync.mock.calls[0]).toEqual(['node -e 0', { encoding: 'utf8' }]);
     expect(f.tracer.snapshot().incomplete).toBe(true);
+  });
+  it.each([
+    ['execSync cat', f => f.child_process.execSync('cat package.json'), true],
+    ['spawnSync cat', f => f.child_process.spawnSync('cat', ['package.json']), true],
+    ['execFile of a shell', f => f.child_process.execFile('/bin/sh', ['-c', 'cat x']), true],
+    ['spawn node with shell: true', f => f.child_process.spawn('node', ['-e', '0'], { shell: true }), true],
+    ['spawn node with a shell path', f => f.child_process.spawn('node', [], { shell: '/bin/bash' }), true],
+    ['fork with a non-Node execPath', f => f.child_process.fork('script.mjs', [], { execPath: '/bin/cat' }), true],
+    ['spawn of the running Node binary', f => f.child_process.spawn(process.execPath, ['-e', '0']), false],
+    ['spawn node by name', f => f.child_process.spawnSync('/usr/local/bin/node', ['-e', '0']), false],
+    ['fork with no execPath', f => f.child_process.fork('script.mjs'), false],
+    ['fork with execPath Node', f => f.child_process.fork('script.mjs', [], { execPath: process.execPath }), false],
+  ])('a non-Node child marks the trace incomplete: %s', (_label, call, incomplete) => {
+    const f = fixture();
+    call(f);
+    expect(f.tracer.snapshot().incomplete).toBe(incomplete);
+  });
+  // PR #7123 send-back 1: Node reads every caller value again, so the tracer must never run a getter, Proxy trap
+  // or toString itself; such a value marks the trace incomplete and reaches Node untouched.
+  it.each([
+    ['env own getter', () => [{ env: Object.defineProperty(traceEnv(), 'PROBE', { enumerable: true, get: count }) }]],
+    ['env inherited getter', () => [{ env: Object.create(Object.defineProperty(traceEnv(), 'PROBE', { enumerable: true, get: count })) }]],
+    ['env Proxy', () => [{ env: new Proxy(traceEnv(), { get: (t, k) => (count(), t[k]), ownKeys: t => (count(), Reflect.ownKeys(t)) }) }]],
+    ['env with a Proxy prototype', () => [{ env: Object.create(new Proxy(traceEnv(), { get: (t, k) => (count(), t[k]) })) }]],
+    ['env object value with toString', () => [{ env: traceEnv({ PROBE: { toString: count } }) }]],
+    ['options.env getter', () => [{ get env() { return count(), traceEnv(); } }]],
+    ['options.cwd getter', () => [{ env: traceEnv(), get cwd() { return count(), root; } }]],
+    ['options.shell getter', () => [{ env: traceEnv(), get shell() { return count(), false; } }]],
+    ['options Proxy', () => [new Proxy({ env: traceEnv() }, { get: (t, k) => (count(), t[k]) })]],
+    ['duck-typed URL cwd with getters', () => [{ env: traceEnv(), cwd: { get href() { return count(), 'file:///'; }, protocol: 'file:' } }]],
+  ])('never runs caller code and flags incomplete: %s', (_label, make) => {
+    reads = 0;
+    const f = fixture();
+    const [options] = make();
+    f.child_process.spawn('node', ['script.mjs'], options);
+    expect(reads).toBe(0);
+    expect(f.originals.spawn.mock.calls[0][2]).toBe(options);
+    expect(f.tracer.snapshot().incomplete).toBe(true);
+  });
+  it('never runs an args-array getter or Proxy and flags incomplete', () => {
+    reads = 0;
+    const f = fixture();
+    const list = Object.defineProperty(['script.mjs'], 1, { enumerable: true, get: count });
+    f.child_process.spawn('node', list, { env: traceEnv() });
+    f.child_process.spawnSync('node', new Proxy(['script.mjs'], { get: (t, k) => (count(), t[k]) }), { env: traceEnv() });
+    expect(reads).toBe(0);
+    expect(f.originals.spawn.mock.calls[0][1]).toBe(list);
+    expect(f.tracer.snapshot()).toMatchObject({ incomplete: true, edges: [] });
+  });
+  it('never runs a getter on an fs path, and flags the unreadable path incomplete', () => {
+    reads = 0;
+    const f = fixture();
+    const target = { get href() { return count(), pathToFileURL(resolve(root, 'a.json')).href; }, protocol: 'file:' };
+    expect(f.fs.readFileSync(target)).toBe('result');
+    expect(reads).toBe(0);
+    expect(f.tracer.snapshot()).toMatchObject({ incomplete: true, edges: [] });
+  });
+  it('still traces getter-free env, inherited data keys, node:url and happy-dom URLs, and Buffer subclasses', () => {
+    const f = fixture();
+    class Path extends Uint8Array { get buffer() { throw new Error('user getter'); } }
+    f.child_process.spawn('node', ['script.mjs'], { env: Object.create(traceEnv()), cwd: new URL(pathToFileURL(root).href) });
+    f.child_process.spawn('node', ['script.mjs'], { env: traceEnv(), cwd: new Path(Buffer.from(resolve(root, 'scripts'))) });
+    expect(f.tracer.snapshot()).toEqual({ test, truncated: false, incomplete: false,
+      edges: [{ file: 'script.mjs', kind: 'spawn' }, { file: 'scripts/script.mjs', kind: 'spawn' }] });
   });
   it('flags a child that inherits a process env whose trace identity setup removed', () => {
     const f = fixture();

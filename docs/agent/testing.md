@@ -5110,6 +5110,14 @@ Each patched call reaches Node with the caller's exact arguments and receiver.
 A child whose real env (`options.env || process.env`) lacks this `--import` hook in `NODE_OPTIONS`,
 the same `WE_TRACE_TEST`, a `WE_TRACE_DIR` resolving to the same directory, or the same
 `WE_CI_SELECTION` marks the evidence `incomplete`. A trace without the flag also counts as incomplete.
+A non-Node child also marks it `incomplete`: `execSync` and any `shell` option (a shell runs first), a
+command other than the running Node binary or `node`, and `fork` with a non-Node `execPath`.
+Node reads every caller value again, so the tracer never runs caller code: options, env, args and path
+values are read by descriptor, and a getter, a Proxy or an object env value (whose `toString` would run)
+is left to Node untouched and marks the trace `incomplete`. Only node:url's own `URL` getters (also
+inherited by happy-dom's `URL`) and the intrinsic `Uint8Array` getters are read. The `env getter read once`
+and `execSync cat` real-child cases and the `never runs caller code` cases pin this.
+Callback `fs.readdir` (and other callback/stream read paths) is not wrapped; carded as a read-path gap.
 Incomplete evidence keeps its observed edges, but a result it does not show is `traced: null`
 (unknown), never `false`. The replay prints `incomplete: true` and warns on stderr.
 `execSync` is wrapped separately because it bypasses the exported `spawnSync`. Hook detection splits

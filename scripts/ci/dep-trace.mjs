@@ -3,25 +3,61 @@
  * @description Shadow dependency evidence only; never selects tests.
  * Set WE_TRACE_TEST=repo/test.mjs WE_TRACE_DIR=artifact-directory and append
  * ` --import="file:///absolute/repo/scripts/ci/dep-trace.mjs"` to existing NODE_OPTIONS.
- * Observe-only: child_process calls and the environment are never rewritten. A child whose real env lacks
- * the hook, test identity, directory or settings marks the evidence `incomplete`.
+ * Observe-only: child_process calls and the environment are never rewritten, and a caller value is read only
+ * when the read cannot run caller code (no getter, no Proxy, no object toString). A child that is not Node
+ * (a shell, `cat`), one whose real env lacks the hook, test identity, directory or settings, and one whose
+ * options or env could not be read safely mark the evidence `incomplete`.
  * Edge caps emit an incomplete-evidence warning: rerun with a larger cap before using coverage.
  */
 import fs from 'node:fs';
 import childProcess from 'node:child_process';
 import { register, syncBuiltinESMExports } from 'node:module';
 import { MessageChannel, receiveMessageOnPort, threadId } from 'node:worker_threads';
-import { resolve, relative, isAbsolute, sep } from 'node:path';
-import { fileURLToPath } from 'node:url';
-import { promisify } from 'node:util';
+import { resolve, relative, isAbsolute, sep, basename } from 'node:path';
+import { fileURLToPath, URL as NodeURL } from 'node:url';
+import { promisify, types } from 'node:util';
 
 const hook = import.meta.url;
 const ROOT = fileURLToPath(new URL('../../', hook));
 const defaults = { enabled: true, maxEdgesPerTest: 5000 };
+/** A read the tracer refused because it could run caller code; the evidence is then incomplete. */
+const UNSAFE = Symbol('unsafe');
+
+/**
+ * obj[key] read without running caller code, or UNSAFE. Walks the prototype chain by descriptor, refusing at a
+ * Proxy or a getter; node:url's own URL getters are pure and allowed. Observe-only (PR #7123): Node reads the
+ * value again, so a second read of a getter would hand the child a different value than an untraced run.
+ */
+function peek(obj, key) {
+  for (let o = obj; o !== null; o = Reflect.getPrototypeOf(o)) {
+    if (types.isProxy(o)) return UNSAFE;
+    const d = Reflect.getOwnPropertyDescriptor(o, key);
+    if (!d) continue;
+    if (Object.hasOwn(d, 'value')) return d.value;
+    return o === NodeURL.prototype && typeof d.get === 'function' ? Reflect.apply(d.get, obj, []) : UNSAFE;
+  }
+  return undefined;
+}
+
+/**
+ * The child env as Node builds it (for...in, inherited enumerable keys included, undefined skipped, the rest
+ * stringified), or null when reading it could run caller code: a Proxy in the chain, a getter, an object value.
+ */
+function readEnv(childEnv) {
+  if (childEnv === null || typeof childEnv !== 'object') return null;
+  for (let o = childEnv; o !== null; o = Reflect.getPrototypeOf(o)) if (types.isProxy(o)) return null;
+  const seen = Object.create(null);
+  for (const key in childEnv) {
+    const value = peek(childEnv, key);
+    if (value === UNSAFE || (value !== null && (typeof value === 'object' || typeof value === 'function'))) return null;
+    if (value !== undefined) seen[key] = `${value}`;
+  }
+  return seen;
+}
 
 /** Pure construction: only install() mutates the injected objects; record receives unique edges. */
 export function createTracer({ test, root, record = () => {}, fs: io = {}, child_process: cp = {},
-  env = {}, maxEdgesPerTest = 5000, warn = () => {} }) {
+  env = {}, maxEdgesPerTest = 5000, warn = () => {}, execPath = process.execPath }) {
   // What a child must match to trace into this evidence; resolved at activation, before any chdir.
   const captured = { WE_CI_SELECTION: env.WE_CI_SELECTION === undefined ? undefined : `${env.WE_CI_SELECTION}`,
     WE_TRACE_DIR: env.WE_TRACE_DIR === undefined ? undefined : resolve(`${env.WE_TRACE_DIR}`) };
@@ -30,6 +66,7 @@ export function createTracer({ test, root, record = () => {}, fs: io = {}, child
   function path(value, cwd = root) {
     try {
       value = typeof value === 'string' && value.startsWith('file:') ? fileURLToPath(value) : toPath(value);
+      if (value === UNSAFE) { markIncomplete(); return null; }
       if (value === null || value.startsWith('node:')) return null;
       // No working directory (it was deleted): only an absolute path can be resolved.
       if (cwd === null) { if (!isAbsolute(value)) return null; cwd = root; }
@@ -72,42 +109,67 @@ export function createTracer({ test, root, record = () => {}, fs: io = {}, child
       const original = cp[name];
       if (!original) continue;
       // Observe-only: the caller's arguments reach Node unchanged (same values, same count, same receiver).
-      cp[name] = function (...args) { observe(args); return Reflect.apply(original, this, args); };
+      cp[name] = function (...args) { observe(name, args); return Reflect.apply(original, this, args); };
       // Keep util.promisify's {stdout, stderr} contract: the original custom promisifier gets the same untouched arguments.
       const custom = original[promisify.custom];
       if (typeof custom === 'function') {
-        Object.defineProperty(cp[name], promisify.custom, { configurable: true, value: function (...args) { observe(args); return Reflect.apply(custom, this, args); } });
+        Object.defineProperty(cp[name], promisify.custom, { configurable: true, value: function (...args) { observe(name, args); return Reflect.apply(custom, this, args); } });
       }
     }
   } };
-  /** Reads a child_process call without changing it: records the spawn edge and flags a child that will not trace. */
-  function observe([command, ...args]) {
+  /**
+   * Reads a child_process call without changing it: records the spawn edge and flags a child that will not trace.
+   * Every caller value is read through peek, so a getter or Proxy is never run; one that cannot be read marks
+   * the evidence incomplete and the call still reaches Node untouched.
+   */
+  function observe(name, [command, ...args]) {
     try {
       // Node takes options after an args array or an explicit null/undefined args slot; otherwise in the first slot.
-      const slot = Array.isArray(args[0]) || args[0] == null ? 1 : 0;
+      const list = Array.isArray(args[0]) ? args[0] : null;
+      const slot = list || args[0] == null ? 1 : 0;
       const options = args[slot] !== null && typeof args[slot] === 'object' ? args[slot] : {};
+      const [cwdOption, envOption, shell, forkExec] = ['cwd', 'env', 'shell', 'execPath'].map(key => peek(options, key));
+      const length = list ? peek(list, 'length') : 0;
+      if ([cwdOption, envOption, shell, forkExec, length].includes(UNSAFE)) return markIncomplete();
+      const values = [command];
+      for (let i = 0; i < length; i++) {
+        const value = peek(list, i);
+        if (value === UNSAFE) return markIncomplete();
+        values.push(value);
+      }
       // Resolve every cwd form Node accepts; any other value is left for Node to judge.
       let cwd = here();
       try {
-        const given = options.cwd == null ? null : toPath(options.cwd);
+        const given = cwdOption == null ? null : toPath(cwdOption);
+        if (given === UNSAFE) return markIncomplete();
         if (given !== null) cwd = isAbsolute(given) ? resolve(given) : cwd === null ? null : resolve(cwd, given);
       } catch { /* Node reports it */ }
-      for (const value of [command, ...(Array.isArray(args[0]) ? args[0] : [])]) {
+      for (const value of values) {
         // Stat the same normalized path the edge records (a URL command is a path too).
-        const name = path(value, cwd);
-        if (name === null) continue;
-        try { if (exists?.(resolve(root, name)).isFile()) add(value, 'spawn', cwd); } catch { /* not an existing script */ }
+        const file = path(value, cwd);
+        if (file === null) continue;
+        try { if (exists?.(resolve(root, file)).isFile()) add(value, 'spawn', cwd); } catch { /* not an existing script */ }
       }
+      // A non-Node child (a shell, `cat`) never loads the hook, so whatever it reads is untraced.
+      if (!nodeChild(name, command, shell, forkExec)) return markIncomplete();
       // The child's real env, as Node builds it: options.env, or process.env when falsy.
-      if (!childTraces(options.env || env, cwd)) markIncomplete();
+      if (!childTraces(envOption || env, cwd)) markIncomplete();
     } catch { markIncomplete(); }
+  }
+  /**
+   * True only when Node itself is the child: fork (its execPath unset or Node), or a shell-less spawn of Node.
+   * execSync and any `shell` option run a shell first, whose command may read files untraced.
+   */
+  function nodeChild(name, command, shell, forkExec) {
+    const isNode = file => typeof file === 'string' && (resolve(file) === execPath || /^node(\.exe)?$/i.test(basename(file)));
+    if (name === 'fork') return forkExec == null || isNode(forkExec);
+    return name !== 'execSync' && !shell && isNode(command);
   }
   /** True only when the child will run this hook with the same test identity, output directory and settings. */
   function childTraces(childEnv, cwd) {
     try {
-      // Node walks env with for...in (inherited enumerable keys included), skips undefined and stringifies the rest.
-      const seen = {};
-      for (const key in childEnv) { const value = childEnv[key]; if (value !== undefined) seen[key] = `${value}`; }
+      const seen = readEnv(childEnv);
+      if (seen === null) return false;
       if (seen.WE_TRACE_TEST !== test || seen.WE_CI_SELECTION !== captured.WE_CI_SELECTION) return false;
       if (seen.WE_TRACE_DIR === undefined || captured.WE_TRACE_DIR === undefined) return false;
       if (!isAbsolute(seen.WE_TRACE_DIR) && cwd === null) return false;
@@ -139,17 +201,24 @@ function importsHook(options) {
 
 /**
  * The path forms Node's fs and child_process accept: string, Buffer/Uint8Array, or a file URL.
- * URLs are duck-typed because a test environment may install a different URL global than node:url's.
- * Returns null for anything else.
+ * URLs are duck-typed because a test environment may install a different URL global than node:url's
+ * (happy-dom's extends it). Returns null for anything else, and UNSAFE when reading the value could run
+ * caller code (a getter outside node:url's URL, a Proxy): the evidence is then incomplete.
  */
 function toPath(value) {
   if (typeof value === 'string') return value;
-  if (value instanceof Uint8Array) return Buffer.from(value.buffer, value.byteOffset, value.byteLength).toString();
+  // Intrinsic TypedArray getters: a subclass or own getter cannot run.
+  if (types.isUint8Array(value)) return Buffer.from(...[viewBuffer, viewOffset, viewLength].map(get => Reflect.apply(get, value, []))).toString();
+  if (value === null || typeof value !== 'object') return null;
   // Node's own URL test: a legacy url.parse() result (it has auth/path) is not a URL to Node.
-  if (value !== null && typeof value === 'object' && typeof value.href === 'string' && value.protocol === 'file:'
-    && value.auth === undefined && value.path === undefined) return fileURLToPath(value.href);
+  const [href, protocol, auth, legacy] = ['href', 'protocol', 'auth', 'path'].map(key => peek(value, key));
+  if ([href, protocol, auth, legacy].includes(UNSAFE)) return UNSAFE;
+  if (typeof href === 'string' && protocol === 'file:' && auth === undefined && legacy === undefined) return fileURLToPath(href);
   return null;
 }
+const typedArray = Object.getPrototypeOf(Uint8Array.prototype);
+const [viewBuffer, viewOffset, viewLength] = ['buffer', 'byteOffset', 'byteLength']
+  .map(key => Object.getOwnPropertyDescriptor(typedArray, key).get);
 
 /** process.cwd() throws once the working directory is deleted; tracing then resolves absolute paths only. */
 function here() {
