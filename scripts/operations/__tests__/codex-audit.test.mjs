@@ -632,12 +632,40 @@ describe('debounce and delta audits', () => {
   });
   it.each([null, [], {}])('no readable usable ledger falls back to full: %j', async records => { await full(delta(records)); });
   it('a delta over maxFiles falls back to full', async () => { await full(delta(undefined, Array.from({ length: 6 }, (_, i) => `docs/${i}.md`))); });
+  it.each([NEXT, null, ''])('finding 1: a delta record cannot become a basis, even with basis=%j', async prior => {
+    await full(delta([basis({ basis: prior })]));
+  });
+  it.each([
+    { verdict: 'WEAKENED' },
+    { verdict: 'WEAKENED', base: NEXT, at: 'invalid', findings: ['NOT WEAKENED'] },
+    { verdict: 'WEAKENED', questionHash: 'f'.repeat(64) },
+    { verdict: 'unknown' }, { at: 'invalid' }, { findings: ['WEAKENED'] },
+  ])('finding 2: any weakened or unreadable current-head record forces FULL: %j', async over => {
+    await full(delta([basis(), basis({ head: HEAD, ...over })]));
+  });
+  it.each([{ base: NEXT }, { base: NEXT, at: 'invalid', findings: ['NOT WEAKENED'] },
+    { questionHash: 'f'.repeat(64) }])('finding 3: any weakened basis record vetoes reuse across bases and states: %j', async over => {
+    await full(delta([basis({ verdict: 'WEAKENED', ...over }), basis()]));
+  });
+  it('finding 4: an uppercase weakened basis head vetoes a lowercase pass', async () => {
+    await full(delta([basis(), basis({ head: PREV.toUpperCase(), verdict: 'WEAKENED' })]));
+  });
+  it('finding 4: an uppercase weakened current head forces FULL', async () => {
+    await full(delta([basis(), basis({ head: HEAD.toUpperCase(), base: NEXT.toUpperCase(), verdict: 'WEAKENED' })]));
+  });
+  it('finding 4: uppercase passing base and head use the normalized exact delta', async () => {
+    const f = delta([basis({ base: BASE.toUpperCase(), head: PREV.toUpperCase() })]);
+    expect(await main(ARGS, f.deps)).toBe(0);
+    expect(f.records[0].basis).toBe(PREV);
+    expect(f.deps.diffFiles).toHaveBeenCalledWith(PREV, HEAD);
+    expect(f.deps.runCodex.mock.calls[0][0]).toContain(`git diff ${PREV}..${HEAD}\n`);
+  });
   it('valid basis plus two ordinary files audits the delta and preserves exact findAudit binding', async () => {
     const f = delta();
     expect(await main(ARGS, f.deps)).toBe(0);
     const prompt = f.deps.runCodex.mock.calls[0][0];
     expect(prompt).toContain(CANONICAL_QUESTION);
-    expect(prompt).toContain(`git diff ${PREV}...${HEAD}`);
+    expect(prompt).toContain(`git diff ${PREV}..${HEAD}\n`);
     expect(prompt).toContain('already audited NOT WEAKENED');
     expect(f.records[0]).toEqual({ at: AT, base: BASE, head: HEAD, baseRef: 'origin/main',
       questionHash: QUESTION_HASH, verdict: 'NOT WEAKENED', findings: [], basis: PREV });
@@ -749,4 +777,15 @@ describe('efficiency settings cascade', () => {
   it.each([{}, null, [], 'invalid'])('malformed delta section %j disables delta', section => {
     expect(resolve({ delta: section }).maxFiles).toBe(0);
   });
+  it.each([{}, { nested: 1 }, [], '5', null, -1, 1.5, Number.MAX_SAFE_INTEGER + 1])(
+    'finding 5: raw invalid maxFiles %j disables delta in either layer with fallback warning', maxFiles => {
+      for (const layer of ['tool', 'platform']) {
+        const log = vi.fn();
+        const audit = { delta: { maxFiles } };
+        expect(resolve(layer === 'tool' ? audit : {}, {
+          platform: layer === 'platform' ? audit : null, log,
+        }).maxFiles).toBe(0);
+        expect(log).toHaveBeenCalledWith(expect.stringContaining('delta.maxFiles=0 (fallback; 0 means FULL)'));
+      }
+    });
 });
