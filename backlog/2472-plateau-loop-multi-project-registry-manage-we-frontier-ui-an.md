@@ -2,7 +2,7 @@
 bornAs: xsde084
 kind: epic
 parent: "2445"
-status: open
+status: parked
 priority: low
 dateOpened: "2026-07-12"
 tags: []

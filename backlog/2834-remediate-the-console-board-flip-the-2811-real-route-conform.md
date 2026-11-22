@@ -3,7 +3,7 @@ bornAs: xnlo0ns
 kind: story
 size: 8
 parent: "2804"
-status: open
+status: parked
 blockedBy: []
 scope:
   - "plateau-app:src/backlog-view/lane-board.ts"
