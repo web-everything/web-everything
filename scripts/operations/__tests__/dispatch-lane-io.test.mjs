@@ -116,7 +116,35 @@ describe('lean repair background argv', () => {
     },
   );
 
-  it.each(['unreadable', 'invalid JSON', 'missing hooks', 'missing Edit|Write', 'missing Bash', 'missing Stop', 'empty guard'])(
+  // Individual guards and the broadcast hooks, not only their matchers: an entry that survives with one guard
+  // dropped, swapped for another command, renamed to a look-alike, or narrowed off a lean tool must fail closed.
+  const entriesOf = (hooks, event, matcher) => (hooks[event] ?? []).filter(entry => entry.matcher === matcher);
+  const dropGuard = (hooks, event, matcher, script) => {
+    for (const entry of entriesOf(hooks, event, matcher)) entry.hooks = entry.hooks.filter(hook => !hook.command.includes(script));
+    hooks[event] = hooks[event].filter(entry => entry.hooks.length > 0);
+  };
+  const swapGuard = (hooks, event, matcher, script, replacement) => {
+    for (const entry of entriesOf(hooks, event, matcher)) {
+      for (const hook of entry.hooks) hook.command = hook.command.split(script).join(replacement);
+    }
+  };
+  const GUARD_FAULTS = {
+    'missing Bash guard-bash (entry kept)': (h) => swapGuard(h, 'PreToolUse', 'Bash', 'scripts/guard-bash.mjs', 'scripts/noop.mjs'),
+    'look-alike Bash guard-bash': (h) => swapGuard(h, 'PreToolUse', 'Bash', 'scripts/guard-bash.mjs', 'scripts/guard-bash.mjs.disabled'),
+    'missing Edit|Write guard-lane (entry kept)': (h) => dropGuard(h, 'PreToolUse', 'Edit|Write', 'scripts/guard-lane.mjs'),
+    'missing Edit|Write guard-backward-edge (entry kept)': (h) => dropGuard(h, 'PreToolUse', 'Edit|Write', 'scripts/guard-backward-edge.mjs'),
+    'Edit|Write guard narrowed to Edit': (h) => { entriesOf(h, 'PreToolUse', 'Edit|Write').forEach(entry => { entry.matcher = 'Edit'; }); },
+    'pre-mode flag dropped from check-memory': (h) => swapGuard(h, 'PreToolUse', 'Edit|Write', 'scripts/check-memory.mjs --pre', 'scripts/check-memory.mjs'),
+    'missing Agent|Task guard-prep': (h) => dropGuard(h, 'PreToolUse', 'Agent|Task', 'scripts/guard-prep.mjs'),
+    'missing Stop guard (entry kept)': (h) => swapGuard(h, 'Stop', undefined, 'scripts/guard-stop-passive-wait.mjs', 'scripts/noop.mjs'),
+    'missing SubagentStop background-running guard': (h) => dropGuard(h, 'SubagentStop', undefined, 'scripts/guard-stop-background-running.mjs'),
+    'missing PostToolUse broadcast': (h) => dropGuard(h, 'PostToolUse', undefined, 'scripts/broadcast-inject.mjs'),
+    'PostToolUse broadcast narrowed to Read': (h) => { entriesOf(h, 'PostToolUse', undefined).forEach(entry => { entry.matcher = 'Read'; }); },
+    'missing UserPromptSubmit broadcast': (h) => { delete h.UserPromptSubmit; },
+  };
+
+  it.each(['unreadable', 'invalid JSON', 'missing hooks', 'missing Edit|Write', 'missing Bash', 'missing Stop', 'empty guard',
+    ...Object.keys(GUARD_FAULTS)])(
     'fails closed at argv build time on %s repo settings; build and resume remain available', (fault) => {
       const canonicalText = fs.readFileSync(CANONICAL_SETTINGS, 'utf8');
       const canonical = JSON.parse(canonicalText);
@@ -126,6 +154,7 @@ describe('lean repair background argv', () => {
         canonical.hooks.PreToolUse = canonical.hooks.PreToolUse.filter(entry => entry.matcher !== fault.slice(8));
       }
       if (fault === 'empty guard') canonical.hooks.PreToolUse.find(entry => entry.matcher === 'Bash').hooks = [];
+      GUARD_FAULTS[fault]?.(canonical.hooks);
       const dir = mkdtempSync(join(tmpdir(), 'lean-hooks-'));
       const faultPath = join(dir, 'settings.json');
       if (fault !== 'unreadable') writeFileSync(faultPath, fault === 'invalid JSON' ? '{' : JSON.stringify(canonical));
@@ -145,6 +174,19 @@ describe('lean repair background argv', () => {
       expect(() => buildAgentArgv(options('fix'))).not.toThrow();
     },
   );
+
+  it('accepts a required guard moved to a combined or catch-all matcher that still covers the lean tool', () => {
+    const read = vi.mocked(LEAN_FIX_HOOKS_SETTINGS).getMockImplementation();
+    const canonical = JSON.parse(fs.readFileSync(CANONICAL_SETTINGS, 'utf8'));
+    canonical.hooks.PreToolUse.find(entry => entry.matcher === 'Bash').matcher = 'Bash|Monitor';
+    canonical.hooks.PreToolUse.find(entry => entry.matcher === 'Agent|Task').matcher = '*';
+    const dir = mkdtempSync(join(tmpdir(), 'lean-hooks-'));
+    const path = join(dir, 'settings.json');
+    try {
+      writeFileSync(path, JSON.stringify(canonical));
+      expect(read(path).hooks).toEqual(canonical.hooks);
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
 });
 
 describe('the tick reader handoff', () => {

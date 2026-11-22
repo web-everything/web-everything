@@ -146,22 +146,66 @@ export const RESTRICTED_PROVIDER_TOOLS = 'Bash,Edit,Write,Read,Glob,Grep';
 /** Fix and ci-heal briefs require an adversarial subagent review, so their allowlist also carries `Agent`. */
 export const LEAN_FIX_TOOLS = `${RESTRICTED_PROVIDER_TOOLS},Agent`;
 
-/** Derive restricted repair hooks from this checkout at call time; never silently omit repo guards.
- * Agent|Task and Monitor guards are nontrivial and outside the six-tool repair surface. */
+/** Every guard and broadcast hook a lean repair session must keep, by event and the lean tools it must cover
+ *  (`tools` absent = an event with no tool matcher). Each `script` (with its mode flag, where the blocking mode
+ *  needs one) must appear as an exact token in a command hook of an entry whose matcher covers every listed
+ *  tool. Matcher presence alone is not enough: an entry that survives with one guard dropped, swapped,
+ *  renamed or narrowed off a lean tool fails the dispatch closed. Extend it here when a guard is added. */
+const LEAN_EDIT_GUARDS = ['scripts/guard-lane.mjs', 'scripts/lint-locus-prefix.mjs --pre', 'scripts/lint-invisible-characters.mjs',
+  'scripts/check-memory.mjs --pre', 'scripts/backlog-guard.mjs --pre', 'scripts/guard-backward-edge.mjs'];
+export const LEAN_FIX_REQUIRED_GUARDS = Object.freeze([
+  { event: 'PreToolUse', tools: ['Bash'], scripts: ['scripts/guard-bash.mjs'] },
+  { event: 'PreToolUse', tools: ['Edit', 'Write'], scripts: LEAN_EDIT_GUARDS },
+  { event: 'PreToolUse', tools: ['Agent'], scripts: ['scripts/guard-prep.mjs'] },
+  { event: 'Stop', scripts: ['scripts/guard-stop-passive-wait.mjs'] },
+  { event: 'SubagentStop', scripts: ['scripts/guard-stop-passive-wait.mjs', 'scripts/guard-stop-background-running.mjs'] },
+  // The broadcast hook is the operator's stop channel: it must fire after every lean tool and on every prompt.
+  { event: 'PostToolUse', tools: LEAN_FIX_TOOLS.split(','), scripts: ['scripts/broadcast-inject.mjs'] },
+  { event: 'UserPromptSubmit', scripts: ['scripts/broadcast-inject.mjs'] },
+].map(rule => Object.freeze({ ...rule, scripts: Object.freeze([...rule.scripts]) })));
+
+/** Claude Code matcher semantics: absent, empty or `*` matches every tool; otherwise an anchored regex
+ *  (`Edit|Write` is the common pipe-list case). An unparseable matcher covers nothing (fail closed). */
+function matcherCovers(matcher, tool) {
+  if (matcher === undefined || matcher === '' || matcher === '*') return true;
+  if (typeof matcher !== 'string') return false;
+  try { return new RegExp(`^(?:${matcher})$`).test(tool); } catch { return false; }
+}
+
+const commandHasScript = (command, script) =>
+  new RegExp(`(?<![\\w./-])${script.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}(?![\\w.-])`).test(command);
+
+/** Every {@link LEAN_FIX_REQUIRED_GUARDS} requirement the given `hooks` object does not meet, as
+ *  `<event>[<tool>] <script>` strings (empty = all present). Unknown or malformed shapes count as missing. */
+export function leanFixGuardGaps(hooks) {
+  const missing = [];
+  for (const { event, tools = [undefined], scripts } of LEAN_FIX_REQUIRED_GUARDS) {
+    const entries = Array.isArray(hooks?.[event]) ? hooks[event] : [];
+    for (const tool of tools) {
+      const commands = entries.filter(entry => tool === undefined || matcherCovers(entry?.matcher, tool))
+        .flatMap(entry => (Array.isArray(entry?.hooks) ? entry.hooks : []))
+        .filter(hook => hook?.type === 'command' && typeof hook.command === 'string')
+        .map(hook => hook.command);
+      for (const script of scripts) {
+        if (!commands.some(command => commandHasScript(command, script))) missing.push(`${event}${tool ? `[${tool}]` : ''} ${script}`);
+      }
+    }
+  }
+  return missing;
+}
+
+/** Derive restricted repair hooks from this checkout at call time; never silently omit repo guards. */
 export function LEAN_FIX_HOOKS_SETTINGS(settingsPath = resolve(dirname(fileURLToPath(import.meta.url)), '../../.claude/settings.json')) {
   const { hooks } = JSON.parse(readFileSync(settingsPath, 'utf8'));
-  const pre = hooks?.PreToolUse;
-  const stop = hooks?.Stop;
+  if (!hooks || typeof hooks !== 'object' || Array.isArray(hooks)) throw new Error('missing hooks');
   const validEntry = (entry) => Array.isArray(entry?.hooks) && entry.hooks.length > 0
-    && entry.hooks.every(hook => hook.type === 'command' && typeof hook.command === 'string' && hook.command.trim());
-  if (!Array.isArray(pre) || !['Edit|Write', 'Bash'].every(matcher => pre.some(entry => entry.matcher === matcher))
-      || !Array.isArray(stop) || stop.length === 0) {
-    throw new Error('missing required PreToolUse matchers or Stop hooks');
-  }
+    && entry.hooks.every(hook => hook?.type === 'command' && typeof hook.command === 'string' && hook.command.trim());
   // EVERY event and matcher is copied verbatim (catch-all and combined included): the broadcast hook is the
   // operator's stop channel, and the lean session must lose nothing the main session's repo hooks provide.
   const all = Object.values(hooks).flatMap(entries => (Array.isArray(entries) ? entries : [null]));
   if (!all.every(validEntry)) throw new Error('incomplete repair hook entries');
+  const missing = leanFixGuardGaps(hooks);
+  if (missing.length) throw new Error(`missing required repair guards: ${missing.join('; ')}`);
   return {
     hooks,
     permissions: { allow: LEAN_FIX_TOOLS.split(',') },
