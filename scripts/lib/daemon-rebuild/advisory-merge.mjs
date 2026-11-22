@@ -185,7 +185,8 @@ export function resolveAdvisoryConflicts({ git, cur, ovSha, trustedRoot = daemon
       const blobPath = join(scratch, path.endsWith('.mjs') ? 'index.mjs' : 'timings.json');
       writeFileSync(blobPath, text);
       if (path.endsWith('.mjs') && !checkModuleSyntax(blobPath)) return null;
-      const blob = git(['hash-object', '-w', '--', blobPath]);
+      // --no-filters: store exactly the validated bytes; a clean filter matching the scratch name must not swap them.
+      const blob = git(['hash-object', '-w', '--no-filters', '--', blobPath]);
       const blobSha = String(blob.stdout ?? '').trim();
       if (blob.status !== 0 || !FULL_SHA_RE.test(blobSha)) return null;
       if (git(['update-index', '--add', '--cacheinfo', '100644', blobSha, path], options).status !== 0) return null;

@@ -23,7 +23,7 @@
  * derived from the declaration — including which operations have a juror to point at a lane at all.
  */
 
-import { RESOLVE_GENERATED_OP, RESOLVE_GENERATED_EFFECT, resolveGenerated, resolveGeneratedOperation, finishResolveGenerated } from './resolve-generated.mjs';
+import { RESOLVE_GENERATED_OP, RESOLVE_GENERATED_EFFECT, resolveGeneratedSink, resolveGeneratedOperation, finishResolveGenerated } from './resolve-generated.mjs';
 import { appendEntry } from './ruled-weakened-store.mjs';
 import { ruledWeakenedAddOperation, RULED_WEAKENED_ADD_OP, RULED_WEAKENED_ADD_EFFECT, finishRuledWeakenedAdd } from './ruled-weakened-add.mjs';
 import { OPERATOR_OVERRIDE_OPS, OPERATOR_OVERRIDE_EFFECT, operatorOverrideOperation } from './operator-override.mjs';
@@ -254,7 +254,7 @@ export function finishCodexAudit({ run, code, lines, json }) {
 
 export const CLI_ONLY_OPERATIONS = Object.freeze({
   [RESOLVE_GENERATED_OP]: () => ({ declaration: resolveGeneratedOperation(),
-    sinks: { [RESOLVE_GENERATED_EFFECT]: input => resolveGenerated(input) }, finish: finishResolveGenerated }),
+    sinks: { [RESOLVE_GENERATED_EFFECT]: resolveGeneratedSink }, finish: finishResolveGenerated }),
   [RULED_WEAKENED_ADD_OP]: () => ({ declaration: ruledWeakenedAddOperation(),
     sinks: { [RULED_WEAKENED_ADD_EFFECT]: entry => appendEntry(entry) }, finish: finishRuledWeakenedAdd }),
   ...Object.fromEntries(OPERATOR_OVERRIDE_OPS.filter(name => name !== 'operator-override-show').map(name => [name, () => ({

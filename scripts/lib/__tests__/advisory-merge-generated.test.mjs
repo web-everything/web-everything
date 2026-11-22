@@ -25,6 +25,33 @@ it('resolveAdvisoryConflicts regenerates docs/agent/settings-registry.md when bo
   f.generate('--check');
 });
 
+const cleanFilter = f => {
+  f.ok(['config', 'filter.probe.clean', 'printf FILTERED']);
+  f.write('.git/info/attributes', '* filter=probe\n');
+};
+
+it('stores the validated bytes even when a clean filter matches the scratch blob (in-memory)', () => {
+  const f = setup();
+  cleanFilter(f);
+  const result = advisory.resolveAdvisoryConflicts(f);
+  expect(result).toMatchObject({ ok: true });
+  const stored = f.ok(['cat-file', 'blob', `${result.tree}:${DOC}`]);
+  expect(stored).not.toBe('FILTERED');
+  expect(stored).toContain('"a":1');
+  expect(stored).toContain('"b":1');
+});
+
+it('never stages clean-filtered bytes for a generated doc (worktree)', () => {
+  const f = setup();
+  expect(f.git(['merge', '--no-edit', 'theirs']).status).toBe(1);
+  cleanFilter(f);
+  const ok = advisory.resolveAdvisoryInWorktree({ git: f.git, cwd: f.root, commit: false });
+  if (ok) {
+    expect(f.ok(['cat-file', 'blob', `:${DOC}`])).toContain('"b":1');
+  } else expect(f.ok(['diff', '--name-only', '--diff-filter=U'])).toBe(DOC);
+  expect(f.git(['cat-file', 'blob', `:${DOC}`]).stdout).not.toBe('FILTERED');
+});
+
 it('regenerates even when TMPDIR is a symlink (generator main-module guard needs the real path)', () => {
   const f = setup(), link = join(f.root, '..', `tmp-link-${process.pid}`);
   symlinkSync(realpathSync(tmpdir()), link);

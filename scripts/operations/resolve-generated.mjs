@@ -20,12 +20,15 @@ export function resolveGenerated({ cwd = process.cwd(), git } = {}) {
     return resolveAdvisoryInWorktree({ git, cwd, commit: false });
   } catch { return false; }
 }
+// `cwd` is a reserved adapter control flag (cli-adapter CONTROL_FLAGS), so the lane is declared as `checkout`
+// and mapped onto the resolver's `cwd` by {@link resolveGeneratedSink}.
 export function resolveGeneratedOperation() {
   return op(RESOLVE_GENERATED_OP, {
-    input: { cwd: { type: 'string', required: false, default: '.' } },
-    resolve: effect({ reads: ['input.cwd'], effects: ({ input }) => [{ type: RESOLVE_GENERATED_EFFECT, payload: input }] }),
+    input: { checkout: { type: 'string', required: false, default: '.' } },
+    resolve: effect({ reads: ['input.checkout'], effects: ({ input }) => [{ type: RESOLVE_GENERATED_EFFECT, payload: input }] }),
   });
 }
+export const resolveGeneratedSink = input => resolveGenerated({ cwd: input?.checkout || '.' });
 export function finishResolveGenerated({ run, code, lines }) {
   const applied = run?.effects?.find(entry => entry.type === RESOLVE_GENERATED_EFFECT && entry.status === 'applied');
   if (code !== 0) return { code, lines };
