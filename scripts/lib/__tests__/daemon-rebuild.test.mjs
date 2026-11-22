@@ -2121,7 +2121,7 @@ describe('overlay list — concurrent add vs. a rebuild auto-remove (two real pr
       const early = await rebuildP;
       throw new Error(`the rebuild process never reached its read→write window: ${early.out}`);
     }
-    const addP = runNode([CLI, 'add', `--clone=${cloneDir}`, '--ref=lane/new', '--pr=7', '--no-lock', '--json'], { ...env, WE_OVERLAY_AUDIT_EVIDENCE: 'off', WE_DAEMON_OVERLAY_STACK_BASES: '{}' });
+    const addP = runNode([CLI, 'add', `--clone=${cloneDir}`, '--ref=lane/new', '--pr=7', '--no-lock', '--json', '--unaudited-reason=test fixture overlay, no audit record'], { ...env, WE_DAEMON_OVERLAY_STACK_BASES: '{}' });
 
     const [a, b] = await Promise.all([rebuildP, addP]);
     expect(b.code, b.out).toBe(0);
