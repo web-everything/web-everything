@@ -1611,7 +1611,7 @@ export function formatRefusalLine(label, r) {
   const prNum = r?.prNumber ?? r?.pr ?? null;
   const prLabel = prNum == null ? '(no PR)' : `PR #${prNum}`;
   const holder = r?.kind === 'live-process' ? ` [name=${r.name ?? '?'} pid=${r.pid ?? 'absent'} cwd=${r.cwd ?? '?'}]` : '';
-  return `reconcile-fix-dispatch-daemon: ${label} ${r?.kind ?? 'unknown'} ${r?.repo ?? '?'} ${prLabel} — ${r?.why ?? '(no reason given)'}${holder}`;
+  return `reconcile-fix-dispatch-daemon: ${label} ${r?.kind ?? 'unknown'} ${r?.repo ?? '?'} ${prLabel} — ${r?.why ?? '(no reason given)'}${holder}${r?.head ? ` head=${r.head}` : ''}${r?.readAt ? ` read=${r.readAt}` : ''}`;
 }
 
 /** ONE printable line per draft the promote half un-drafted (`gh pr ready`), the success half of "log every
