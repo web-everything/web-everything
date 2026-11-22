@@ -1,0 +1,6 @@
+{
+  "description": "Enable shadow detection of stale human referral holds; retired observer defaults off.",
+  "owner": "scripts/settings/stale-referral-human-shadow.json",
+  "changeVia": "pr",
+  "instant": false
+}

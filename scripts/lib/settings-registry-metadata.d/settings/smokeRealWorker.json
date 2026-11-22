@@ -1,0 +1,6 @@
+{
+  "description": "Allow real workers for smoke sentinel PRs.",
+  "owner": "scripts/settings/smoke-real-worker.json",
+  "changeVia": "pr",
+  "instant": false
+}

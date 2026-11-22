@@ -1,0 +1,5 @@
+{
+  "description": "Conflict-fix dispatch allowance per pass.",
+  "range": "integer 0–24",
+  "unit": "fixes/pass"
+}

@@ -1,0 +1,13 @@
+{
+  "description": "Maximum concurrent host review rounds.",
+  "owner": "scripts/settings/review-concurrency.json",
+  "changeVia": "pr",
+  "instant": false,
+  "leaves": {
+    "$": {
+      "range": "integer 1–16",
+      "unit": "rounds",
+      "note": "also instant via operator-override capacity leaf"
+    }
+  }
+}

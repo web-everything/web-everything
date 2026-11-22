@@ -1,0 +1,6 @@
+{
+  "description": "Task type to delivery mode routing.",
+  "owner": "scripts/settings/delivery-routes.json",
+  "changeVia": "pr",
+  "instant": false
+}
