@@ -5,7 +5,7 @@ import { mkdtempSync, mkdirSync, writeFileSync, chmodSync, rmSync, existsSync } 
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { buildAgentArgv, createTickReader, createDispatchSinks, defaultClaudeProvider, leanRepairGrant, reserveBuildLane, resolveDispatchSettingsEnv, DISPATCH_BASH_TIMEOUT_ENV } from '../dispatch-lane-io.mjs';
+import { buildAgentArgv, createTickReader, createDispatchSinks, defaultClaudeProvider, dispatchLaneGrant, laneRepoKey, leanRepairGrant, reserveBuildLane, resolveDispatchSettingsEnv, DISPATCH_BASH_TIMEOUT_ENV } from '../dispatch-lane-io.mjs';
 import { LEAN_FIX_HOOKS_SETTINGS, LEAN_FIX_REQUIRED_GUARDS, LEAN_FIX_TOOLS } from '../minimal-context-provider.mjs';
 import { spawnPreventionLandingJob } from '../../lib/prevention-landing-job.mjs';
 import { NO_PROMPT_COMMAND_RULES } from '../../lib/no-prompt-command-rules.mjs';
@@ -81,9 +81,9 @@ describe('lean repair background argv', () => {
       const settings = JSON.parse(argv[argv.indexOf('--settings') + 1]);
       expect(settings.env).toEqual({ PATH: '/fixture/bin', WE_CONVEYOR_WORKER: '1' });
       expect(settings.worktree).toEqual({ bgIsolation: 'none' });
-      // The lean tools come first; the lane grant's rules (PR #7332 round 2) follow and are the only additions.
-      expect(settings.permissions?.allow.slice(0, 7)).toEqual(['Bash', 'Edit', 'Write', 'Read', 'Glob', 'Grep', 'Agent']);
-      expect(settings.permissions.allow.slice(7).every(rule => /^(?:Edit|Write|Bash)\(/.test(rule))).toBe(true);
+      // The lean tools, then exactly the lane grant's rules (PR #7332 round 2) — nothing else.
+      expect(settings.permissions?.allow).toEqual(['Bash', 'Edit', 'Write', 'Read', 'Glob', 'Grep', 'Agent',
+        ...leanRepairGrant(options(kind).payload).allow]);
       // Every event and matcher, verbatim: nothing filtered (PostToolUse, broadcast and catch-alls included).
       expect(settings.hooks).toEqual(canonical.hooks);
       expect(Object.keys(settings.hooks)).toEqual(Object.keys(canonical.hooks));
@@ -226,13 +226,16 @@ describe('lean repair background argv', () => {
   it('carries an explicit lane grant into --add-dir and the --settings permissions for fix and ci-heal', () => {
     for (const kind of ['fix', 'ci-heal']) {
       const argv = buildAgentArgv({ ...options(kind), laneGrant: LANE_GRANT });
-      expect(addDirsOf(argv)).toEqual(['/lanes/web-everything/lane-7']);
+      // The assigned lane first, then the repo's pool roots: fix/ci-heal lanes are not reserved, so the brief's
+      // acquire may take another free lane in the same pool.
+      const pools = ['web-everything', 'webeverything'].map(pool => expect.stringMatching(new RegExp(`/\\.lanes/${pool}$`)));
+      expect(addDirsOf(argv)).toEqual(['/lanes/web-everything/lane-7', ...pools]);
       // `--add-dir <directories...>` is variadic: a flag must close it, so the prompt is never read as a directory.
       const last = argv.lastIndexOf('--add-dir');
       expect(argv[last + 2]).toMatch(/^--/);
       expect(argv.at(-1)).toBe('Repair this PR.');
       const { permissions } = settingsOf(argv);
-      expect(permissions.additionalDirectories).toEqual(['/lanes/web-everything/lane-7']);
+      expect(permissions.additionalDirectories).toEqual(addDirsOf(argv));
       expect(permissions.allow).toEqual(expect.arrayContaining([...LEAN_FIX_TOOLS.split(','), ...LANE_GRANT.allow]));
       expect(buildAgentArgv({ ...options(kind), laneGrant: LANE_GRANT, resumeSessionId: 'existing-session' }))
         .toEqual(['--bg', '--resume', 'existing-session', 'Repair this PR.']);
@@ -243,8 +246,28 @@ describe('lean repair background argv', () => {
   it('derives the grant from the payload lane and scope when none is passed (the direct reconcile fix path)', () => {
     const payload = { ...options('fix').payload, lane: 12, scope: ['we:scripts/a.mjs'] };
     const argv = buildAgentArgv({ ...options('fix'), payload });
-    expect(addDirsOf(argv)).toEqual(['web-everything', 'webeverything'].map(pool => expect.stringMatching(new RegExp(`/\\.lanes/${pool}/lane-12$`))));
+    expect(addDirsOf(argv)).toEqual([
+      ...['web-everything', 'webeverything'].map(pool => expect.stringMatching(new RegExp(`/\\.lanes/${pool}/lane-12$`))),
+      ...['web-everything', 'webeverything'].map(pool => expect.stringMatching(new RegExp(`/\\.lanes/${pool}$`)))]);
     expect(settingsOf(argv).permissions.allow).toEqual(expect.arrayContaining([expect.stringMatching(/^Edit\(.*\/lane-12\/\*\*\)$/)]));
+  });
+
+  // Self-review (round 2): the repo comes from the dispatch's own `repo`, never only from the scope — a sibling
+  // repo's card may list a `we:` path first, and a ci-heal may carry no scope at all.
+  it('grants the dispatch repo\'s own lane pool, whatever the scope lists first', () => {
+    for (const repo of ['frontierui', 'frontier-ui/frontierui']) {
+      for (const scope of [undefined, [], ['we:scripts/a.mjs', 'frontierui:src/b.ts']]) {
+        const payload = { ...options('fix').payload, lane: 3, repo, scope };
+        const dirs = addDirsOf(buildAgentArgv({ ...options('fix'), payload }));
+        expect(dirs).toEqual([expect.stringMatching(/\/\.lanes\/frontierui\/lane-3$/), expect.stringMatching(/\/\.lanes\/frontierui$/)]);
+        expect(dispatchLaneGrant(payload, { root: '/w/webeverything', exists: () => false }).additionalDirectories)
+          .toEqual(['/w/.lanes/frontierui/lane-3']);
+      }
+    }
+    expect(laneRepoKey({ repo: 'plateauapp/plateau-app' })).toBe('plateau-app');
+    expect(laneRepoKey({ repo: 'unknown/repo', scope: ['plateau-app:src/a.ts'] })).toBe('plateau-app');
+    expect(laneRepoKey({ repo: 'constructor' })).toBe('we');
+    expect(laneRepoKey({})).toBe('we');
   });
 
   it('a laneless lean launch, or one with an empty explicit grant, still gets its repo lane pool — never no directory', () => {
@@ -291,7 +314,8 @@ describe('lean repair background argv', () => {
     defaultClaudeProvider({ ...requests[0], cwd: '/tmp/scratch-grant' }, {
       spawnAgent: (argv) => { argvs.push(argv); return ''; }, wrapKind: () => false,
     });
-    expect(addDirsOf(argvs[0])).toEqual(['/lanes/web-everything/lane-40']);
+    expect(addDirsOf(argvs[0])[0]).toBe('/lanes/web-everything/lane-40');
+    expect(addDirsOf(argvs[0]).slice(1)).toEqual(leanRepairGrant({ launchKind: 'ci-heal', lane: 40 }).additionalDirectories);
     expect(settingsOf(argvs[0]).permissions.allow).toEqual(expect.arrayContaining(['Edit(/lanes/web-everything/lane-40/**)']));
   });
 

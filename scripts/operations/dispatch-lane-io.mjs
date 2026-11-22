@@ -1994,7 +1994,7 @@ export function defaultClaudeProvider(request, {
     sessionId: request.sessionId,
     payload: {
       prompt: request.prompt, sessionSlug: request.sessionSlug, num: request.num, launchKind: request.launchKind,
-      lane: request.lane, scope: request.scope,
+      lane: request.lane, scope: request.scope, repo: request.repo,
     },
     // PR #7332 — the sink's lane grant; a restricted repair session gets it only through the argv.
     laneGrant: request.laneGrant ?? null,
@@ -2368,7 +2368,7 @@ export function laneRootsFor(root = REPO_ROOT, exists = existsSync, repoKey = 'w
  */
 export function dispatchLaneGrant(payload, { root = REPO_ROOT, exists = existsSync } = {}) {
   const lane = payload?.lane;
-  const repoKey = repoKeyForScope(payload?.scope) ?? 'we';
+  const repoKey = laneRepoKey(payload);
   const dirs = (lane != null && String(lane).trim() !== '')
     ? [laneDirFor(lane, { root, exists, repoKey })]
     : laneRootsFor(root, exists, repoKey);
@@ -2380,15 +2380,32 @@ export function dispatchLaneGrant(payload, { root = REPO_ROOT, exists = existsSy
 }
 
 /**
+ * PR #7332 — WHICH REPO'S LANE POOL a dispatch is granted: the payload's own `repo` (a constellation key such as
+ * `frontierui`, or its `owner/name` slug) first, then its scope's first repo prefix, else `we`. A scope is not
+ * enough on its own: a sibling repo's card may list a `we:` path first, and a ci-heal may carry no scope at all.
+ * @param {{repo?:string|null, scope?:string|string[]|null}} payload
+ * @returns {string}
+ */
+export function laneRepoKey(payload) {
+  const repo = typeof payload?.repo === 'string' ? payload.repo.trim() : '';
+  if (repo && Object.hasOwn(CONSTELLATION_REPOS, repo)) return repo;
+  const bySlug = repo && Object.entries(CONSTELLATION_REPOS).find(([, entry]) => entry?.slug === repo);
+  if (bySlug) return bySlug[0];
+  return repoKeyForScope(payload?.scope) ?? 'we';
+}
+
+/**
  * PR #7332 — THE LANE GRANT a `--restricted` fix/ci-heal session receives through its launch argv. Restricted
  * mode ignores user, project and local settings files (`claude --help`), so the {@link dispatchLaneGrant} the
  * sinks write into the scratch cwd's settings.local.json never reaches it, and its file tools are confined to
  * the working directories (a lane read without `--add-dir` was refused live: "outside <cwd>; --restricted
- * confines the file tools to the working directory"). Order: a non-empty explicit grant (the sink's, for its
- * reserved lane); else one derived from the payload — `<pool>/lane-N` under every pool basename of the scope's
- * repo when a lane is named, else the pool roots themselves (the direct reconcile fix path, which reserves no
- * lane). The derivation does no filesystem I/O: a missing `--add-dir` path is accepted by the CLI (checked
- * live), and a pure builder keeps every argv test hermetic. Fails closed when no directory remains.
+ * confines the file tools to the working directory"). It is the explicit grant (the sink's, for the assigned
+ * lane), plus `<pool>/lane-N` when the payload names a lane, plus the pool roots of the dispatch's repo
+ * ({@link laneRepoKey}). The pool roots are always included because fix and ci-heal lanes are not reserved
+ * before launch: when the assigned lane is leased, the brief's acquire takes another free lane in the same pool.
+ * Lane clones only, never a primary checkout; the repo's Edit/Write lane guard still applies inside them. The
+ * derivation does no filesystem I/O: a missing `--add-dir` path is accepted by the CLI (checked live), and a
+ * pure builder keeps every argv test hermetic. Fails closed when no directory remains.
  * @param {{lane?:string|number|null, scope?:string|string[]|null, launchKind?:string}} payload
  * @param {{additionalDirectories?:string[], allow?:string[]}|null} [laneGrant]
  * @returns {{additionalDirectories:string[], allow:string[]}}
@@ -2397,16 +2414,12 @@ export function leanRepairGrant(payload, laneGrant = null, {
   root = REPO_ROOT, poolDirs = (repoKey) => laneWorkspacePoolDirs(root, repoKey),
 } = {}) {
   const clean = (list) => (Array.isArray(list) ? list.filter(v => typeof v === 'string' && v.trim()) : []);
-  const given = clean(laneGrant?.additionalDirectories);
-  let dirs = given;
-  let allow = given.length ? clean(laneGrant?.allow) : [];
-  if (!given.length) {
-    const pools = clean(poolDirs(repoKeyForScope(payload?.scope) ?? 'we'));
-    const lane = payload?.lane == null ? '' : String(payload.lane).trim();
-    dirs = /^\d+$/.test(lane) ? pools.map(pool => join(pool, `lane-${lane}`)) : pools;
-    allow = [...dirs.flatMap(d => [`Edit(${d}/**)`, `Write(${d}/**)`]),
-      ...conflictHelperAllowRules(root), ...rearmReviewAllowRules(root)];
-  }
+  const pools = clean(poolDirs(laneRepoKey(payload)));
+  const lane = payload?.lane == null ? '' : String(payload.lane).trim();
+  const dirs = [...clean(laneGrant?.additionalDirectories),
+    ...(/^\d+$/.test(lane) ? pools.map(pool => join(pool, `lane-${lane}`)) : []), ...pools];
+  const allow = [...clean(laneGrant?.allow), ...dirs.flatMap(d => [`Edit(${d}/**)`, `Write(${d}/**)`]),
+    ...conflictHelperAllowRules(root), ...rearmReviewAllowRules(root)];
   if (!dirs.length) {
     throw notApplied('dispatch-lane: no lane directory to grant this restricted repair session; check the lane pool and retry');
   }

@@ -1706,9 +1706,9 @@ export function dispatchFix(planned, {
       advisor,
       // fix procedure — a re-armed concurrent-author pause hands the next fixer the saved alt branch to start from.
       ...(ladderTable ? { table: ladderTable } : {}),
-      // PR #7332 — `scope` picks the repo whose lane pool the restricted session is granted (`leanRepairGrant`);
-      // no `lane`: this path reserves none, and the agent may take another free lane.
-      payload: { prompt: renderNoPromptCommandRules(withPlannedContext(prompt, planned), 'fix'), sessionSlug, launchKind: 'fix', scope: planned.scope },
+      // PR #7332 — `repo` (then `scope`) picks the repo whose lane pool the restricted session is granted
+      // (`leanRepairGrant`); no `lane`: this path reserves none, and the agent may take another free lane.
+      payload: { prompt: renderNoPromptCommandRules(withPlannedContext(prompt, planned), 'fix'), sessionSlug, launchKind: 'fix', repo, scope: planned.scope },
       // #3606 — see this function's own docblock: without this the fix agent reads a correctly-filled brief as an
       // unfilled template and self-aborts (3/3 live).
       systemPromptFile: DISPATCHED_AGENT_SYSTEM_PROMPT_FILE,
