@@ -1,4 +1,6 @@
 {
-  "$comment": "fix.pushResolvedSideBranch defaults on. Standard -> platform fix.pushResolvedSideBranch -> this tool file -> WE_FIX_PUSH_RESOLVED_SIDE_BRANCH=on|off. Effective value/source logged each daemon tick. Pushes a saved conflict repair, never clears merge/review holds; unreadable settings disable writes and require operator inspection.",
-  "fix": { "pushResolvedSideBranch": true }
+  "$comment": "fix.pushResolvedSideBranch defaults on: dispatch a push-only task through the normal fixer launcher for a saved resolved branch; never a privileged writer or full re-resolve. Standard -> platform fix.pushResolvedSideBranch -> this tool file -> WE_FIX_PUSH_RESOLVED_SIDE_BRANCH=on|off. Effective value/source logged by reconciliation. Disabled/unreadable settings refuse saved repairs for operator inspection; no merge/review holds are cleared.",
+  "fix": {
+    "pushResolvedSideBranch": true
+  }
 }

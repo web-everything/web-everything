@@ -69,9 +69,7 @@ describe('R242 fixDispatch.skipEmptySteps policy cascade', () => {
 
 // These historical fixtures exercise other daemon halves with R123 explicitly disabled.
 // stand-down-auto-proceed-daemon.test.mjs exercises the production policy defaults and writer.
-// Historical fixtures explicitly park saved-repair IO; Slice A cases below opt into its real phase.
-const runTickAllRepos = options => realRunTickAllRepos({ allowStandDownAutoProceed: false,
-  resolvedSideBranchSetting: { value: false, source: 'historical fixture' }, ...options });
+const runTickAllRepos = options => realRunTickAllRepos({ allowStandDownAutoProceed: false, ...options });
 
 // #3383 bug 1 — wired into withSelfSync's `hasStaleRefusal` option in main(); tested here in isolation
 // (pure, no IO) against the exact shape `runReconcileFixDispatchAllRepos` returns.
@@ -1898,7 +1896,7 @@ describe('fix daemon pass timing', () => {
     });
     expect(Object.keys(result.phaseMs).sort()).toEqual([
       'fix', 'ci-heal', 'hung-ci', 'main-red-rebase', 'missing-run', 'promote-draft', 'notes',
-      'auth-gate', 'await-verify', 'stuck-fixers', 'supersede', 'ruling-stand-down', 'orphan-guard', 'push-resolved-side-branch',
+      'auth-gate', 'await-verify', 'stuck-fixers', 'supersede', 'ruling-stand-down', 'orphan-guard',
     ].sort());
     for (const ms of Object.values(result.phaseMs)) expect(ms).toBeGreaterThan(0);
     expect(result.passMs).toBeGreaterThanOrEqual(Object.values(result.phaseMs).reduce((a, b) => a + b, 0));
@@ -2157,7 +2155,7 @@ describe('runTickAllRepos — one reconcile plan per repo per pass', () => {
         { kind: 'promote-draft', prNumber: 8, headRefOid: 'def', baseRefName: 'main' }] });
     });
     return { planner, dispatch, promote, checkStaleness, timeoutHold, readHeadCheckState, live,
-      options: { repos: ['we'], resolvedSideBranchSetting: { value: false, source: 'historical fixture' }, fixSettings: { skipEmptySteps: false, standDownAutoProceed: false },
+      options: { repos: ['we'], fixSettings: { skipEmptySteps: false, standDownAutoProceed: false },
         authGateOverride: () => ({ paused: false, reason: null }), notesDryRun: true,
         now: () => elapsed,
         readPlanFingerprint: () => { elapsed += 20; return new Map([[7, 'a'], [8, 'a']]); },
@@ -2676,7 +2674,7 @@ describe('fix pass budgets', () => {
       },
     });
     const result = await runTickAllRepos(opts);
-    const phases = ['auth-gate', 'push-resolved-side-branch', 'await-verify', 'supersede', 'ruling-stand-down', 'orphan-guard',
+    const phases = ['auth-gate', 'await-verify', 'supersede', 'ruling-stand-down', 'orphan-guard',
       'fix', 'stuck-fixers', 'ci-heal', 'hung-ci', 'main-red-rebase', 'missing-run', 'promote-draft', 'notes'];
     expect(Object.keys(result.phaseMs)).toEqual(phases);
     const lines = [];
@@ -3064,58 +3062,5 @@ describe('runReconcileNotesAllRepos — cooperative deadline', () => {
     runReconcileNotesAllRepos({ ...options, deadlineAt: 100 });
     expect(tick.mock.calls.map(([options]) => options.repo)).toEqual(['repo-a', 'repo-b']);
     expect(posted).toEqual([42, 43]);
-  });
-});
-
-describe('Slice A saved-repair daemon admission', () => {
-  const empty = () => ({ dispatched: [], refusals: [] });
-  const fixture = overrides => ({ repos: ['web-everything/web-everything', 'frontier-ui/frontierui'],
-    fixTick: empty, ciHealTick: async () => empty(), promoteDraftTick: noopPromoteDraftTick,
-    hungCiTick: noopHungCiTick, mainRedRebaseTick: noopMainRedRebaseTick, missingRunTick: noopMissingRunTick,
-    notesTick: noopNotesTick, awaitVerifyTick: async () => ({ rows: [] }), stuckFixerTick: async () => ({ rows: [] }),
-    resolvedSideBranchSetting: { value: true, source: 'test' }, resolvedSideBranchStaleGuard: () => {},
-    passBudgets: resolveFixPassBudgets({ env: {}, file: { fixPassBudget: { fixMs: 1000 } } }),
-    budgetRotation: {}, prCursors: {}, ...overrides });
-  it('#12 stale-main guard runs before the saved-repair writer and refuses stale code', async () => {
-    const writer = vi.fn(() => []);
-    const guard = vi.fn(() => assertMainNotStale('/repo', () => ({ action: 'warn', reason: 'diverged', behind: 1, ahead: 1, dirty: false })));
-    await runTickAllRepos(fixture({ resolvedSideBranchTick: writer, resolvedSideBranchStaleGuard: guard }));
-    expect(guard).toHaveBeenCalledTimes(2);
-    expect(writer).not.toHaveBeenCalled();
-  });
-  it('#13 phase budget defers another repo and resumes the retained PR cursor on the next tick', async () => {
-    let time = 0;
-    const rotation = {}, cursors = {}, calls = [];
-    const writer = vi.fn(opts => {
-      calls.push(opts); time += 2000;
-      return Object.assign([], { handled: 1, nextCursor: 7329, deferred: [7329] });
-    });
-    const opts = fixture({ now: () => time, budgetRotation: rotation, prCursors: cursors, resolvedSideBranchTick: writer });
-    const result = await runTickAllRepos(opts);
-    expect(writer).toHaveBeenCalledOnce();
-    expect(result.budgets['push-resolved-side-branch'].hit).toBe(true);
-    expect(cursors['push-resolved-side-branch']['web-everything/web-everything']).toBe(7329);
-    expect(rotation['push-resolved-side-branch']).toBe('frontier-ui/frontierui');
-    expect(calls[0]).toMatchObject({ deadlineAt: 1000, now: expect.any(Function) });
-    await runTickAllRepos({ ...opts, repos: ['web-everything/web-everything'] });
-    expect(calls[1].cursor).toBe(7329);
-  });
-  it('#13 adoption yield reaches the saved-repair phase and retains its unfinished PR', async () => {
-    const writer = vi.fn(opts => {
-      expect(opts.shouldYield()).toBe(true);
-      return Object.assign([], { handled: 0, nextCursor: 7329, deferred: [7329], yieldedForAdoption: true });
-    });
-    const cursors = {};
-    const result = await runTickAllRepos(fixture({ repos: ['web-everything/web-everything'],
-      resolvedSideBranchTick: writer, adoptYieldProbe: () => true, prCursors: cursors }));
-    expect(writer).toHaveBeenCalledOnce();
-    expect(result.budgets['push-resolved-side-branch'].hit).toBe(true);
-    expect(cursors['push-resolved-side-branch']['web-everything/web-everything']).toBe(7329);
-  });
-  it('#9 pushed-unrecorded heads are forwarded to same-tick fixer suppression', async () => {
-    const fixTick = vi.fn(empty), sha = '3'.repeat(40);
-    await runTickAllRepos(fixture({ repos: ['web-everything/web-everything'], fixTick,
-      resolvedSideBranchTick: () => [{ pr: 7329, result: 'pushed-unrecorded', sha }] }));
-    expect(fixTick).toHaveBeenCalledWith(expect.objectContaining({ resolvedSideBranchPushes: [expect.objectContaining({ pr: 7329, sha })] }));
   });
 });

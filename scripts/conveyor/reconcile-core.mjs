@@ -1,4 +1,4 @@
-import { findResolvedSideBranch, resolvedSideBranchEvidenceReadable } from './resolved-side-branch.mjs';
+import { findResolvedSideBranch, resolvedSideBranchEvidenceReadable, pushedResolvedRepairReviewOwed } from './resolved-side-branch.mjs';
 import { parseMqFailureRoute } from '../lib/mq-failure-route.mjs';
 import { admitMqFailureRoute } from './mq-failure-intake.mjs';
 import { ghRepoSlug } from '../lib/constellation-repos.mjs';
@@ -151,7 +151,7 @@ import {
   standDownComments,
   standDownHeadChangeAt,
 } from './stand-down.mjs';
-import { loadFlakeHoldState, pushedLoadFlakeFixOwedRearm } from './load-flake-hold.mjs';
+import { loadFlakeHolds, loadFlakeHoldState, pushedLoadFlakeFixOwedRearm } from './load-flake-hold.mjs';
 import { FIX_BEGIN_MARKER, FIX_END_MARKER } from './fix-procedure.mjs';
 // #3850 — a stand-down answer's structured disposition (close-superseded), executed by the conveyor.
 import { answerDisposition, isCloseSupersededExecuted } from './stand-down-answer-core.mjs';
@@ -303,7 +303,7 @@ export const DISPATCH_KINDS = Object.freeze(['fix', 'review', 'ci-heal', 'ci-tim
  *   `scope-bloat` / `ruling-dispute` — see the comments on the list below.
  */
 export const REFUSAL_KINDS = Object.freeze([
-  'resolved-side-branch-owed', 'resolved-side-branch-unreadable',
+  'resolved-side-branch-disabled', 'resolved-side-branch-unreadable', 'resolved-side-branch-review-owed',
   'fix-join-wait',
   'review-ci', 'review-referrals-pending', 'advisory-unreadable',
   'stood-down', 'load-flake-hold', 'load-flake-rearm-owed', 'no-findings', 'cap-exhausted',
@@ -2231,6 +2231,7 @@ export function missingReviewLabel(pr) {
 
 
 export function planReconcile({
+  resolvedSideBranchEnabled = true,
   repo = 'we', prs = [], agents = [], durableCounts = {}, now = 0, roundCap = NEGOTIATION_ROUND_CAP, ciHealCap: ciHealCapArg = null,
   // `ciHeal.*` budget cascade ({@link resolveCiHealBudget}); the IO shell may pass the resolved layers. An explicit
   // `ciHealCap` still wins (source `caller`).
@@ -2468,7 +2469,7 @@ export function planReconcile({
     const refuse = (kind, extra) => { refusals.push({ ...base, kind, ...extra,
       ...(kind === 'no-findings' ? { head: pr?.headRefOid ?? null,
         readAt: pr?.readAt ?? new Date(now).toISOString() } : {}) }); };
-    // A saved repair is owed a plain fast-forward push, even if the OLD head was held/red.
+    // Saved repairs use the normal fixer launch with a push-only brief, even if the old head was held/red.
     // This is not merge permission: no review, hold, label or gate state is changed.
     if (Object.hasOwn(pr, 'resolvedSideBranches')) {
       if (!resolvedSideBranchEvidenceReadable({ pr, branches: pr.resolvedSideBranches })) {
@@ -2477,8 +2478,25 @@ export function planReconcile({
       }
       const saved = findResolvedSideBranch({ pr, branches: pr.resolvedSideBranches });
       if (saved) {
-        refuse('resolved-side-branch-owed', { branch: saved.name, sha: saved.sha,
-          why: 'resolved side branch owed a fast-forward push; no fixer launch; the new head still requires the normal merge gate' });
+        if (resolvedSideBranchEnabled !== true) {
+          refuse('resolved-side-branch-disabled', { why: 'push-only fixer disabled; operator inspection required, no full re-resolve' });
+        } else if (threadMayBeTruncated(pr) || pr.state !== 'OPEN' || pr.isCrossRepository !== false) {
+          refuse('resolved-side-branch-unreadable', { why: 'saved repair needs an open same-repository PR and complete thread; operator inspection required' });
+        } else {
+          const workerHold = loadFlakeHoldState({ comments: pr.comments, headRefOid: pr.headRefOid, now });
+          const workerOwnsSavedSha = loadFlakeHolds(pr.comments).some(hold => !hold.redispatch
+            && sameHeadSha(hold.alt?.sha, saved.sha));
+          // The retry worker owns active holds and its saved SHAs, including exhausted/closed attempts.
+          // A new fixer must neither race that worker nor restart the same repair's retry allowance.
+          if (workerHold.live || workerOwnsSavedSha) {
+            refuse('load-flake-hold', { why: workerHold.live
+              ? 'the retry-limited load-flake worker owns this PR; no push-only or full fixer launch'
+              : 'this saved SHA belongs to the load-flake worker; its retry is closed or exhausted — operator inspection required' });
+          } else {
+            dispatch.push({ ...base, kind: 'fix', pushOnly: { branch: saved.name, sha: saved.sha },
+              why: 'verify the saved repair and push only to this PR head; do no new conflict work' });
+          }
+        }
         continue;
       }
     }
@@ -2940,6 +2958,28 @@ export function planReconcile({
           : 'draft PR — required checks are green or held only for review; promote it to ready for review (draft-first PRs, '
           + 'operator-approved 2026-09-27) — nothing else is owed this PR until that happens',
       });
+      continue;
+    }
+
+    // A saved repair that is now the exact PR head owes independent review even when labels/comments
+    // stayed unchanged or the side ref disappeared. Keep the normal claim, liveness, draft, hold and CI
+    // gates; never let a review gate's proposed scope repair turn this handoff into a full fixer launch.
+    const resolvedRepairReview = pushedResolvedRepairReviewOwed(pr);
+    if (resolvedRepairReview) {
+      const reviewRows = [];
+      const why = 'the saved repair is now this exact head; fresh independent review is owed before another fix';
+      dispatchReviewRow({ pr, requiredChecks, withPhase, base, attempts: roundAttempts(),
+        roundCap: effectiveRoundCap, refuse, refuseCapExhausted, dispatch: reviewRows, now,
+        extra: { resolvedRepairReview },
+        ...(withPhase.labels.includes(REVIEW_LABELS.human)
+          ? { advisoryReview: { head: pr.headRefOid, reason: 'fix-pushed', why } }
+          : { reviewAfterFix: why }),
+      });
+      for (const row of reviewRows) {
+        if (row.kind === 'review' || row.kind === 'convert-advisory') dispatch.push(row);
+        else refuse('resolved-side-branch-review-owed', { ...withPhase, resolvedRepairReview,
+          why: 'saved repair awaits exact-head review; review gate proposed repair work — operator inspection required' });
+      }
       continue;
     }
 

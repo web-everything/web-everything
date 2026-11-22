@@ -1,5 +1,6 @@
-import { isAutomationAuthored, isTrustedMarkerAuthor, AUTOMATION_LOGINS } from '../lib/marker-authorship.mjs';
+import { isAutomationAuthored, AUTOMATION_LOGINS } from '../lib/marker-authorship.mjs';
 import { parseAltBranch, concurrentAuthorPauses, loadFlakeHolds, STAND_DOWN_MARKER } from './stand-down.mjs';
+import { isReviewVerdictComment, reviewedHeadsOf, basisLineOf } from './mechanical-round-cap.mjs';
 /** Bounded ancestry orders repairs; an exact automation-authored alt record authorizes the candidate.
  * `ancestors` is a complete, bounded rev-list from the IO shell, including the tip itself.
  * Null means no unambiguous proof, never permission to force or clear a merge hold.
@@ -23,37 +24,36 @@ export function isResolvedRepairAuthor(c) {
 }
 export function hasResolvedRepairRecord(pr, branch) {
   if (!Array.isArray(pr?.comments)) return false;
-  return pr.comments.some(c => {
-    if (!isResolvedRepairAuthor(c)) return false;
-    if (!String(c.body ?? '').trimStart().startsWith(STAND_DOWN_MARKER)
-      && !concurrentAuthorPauses([c]).length && !loadFlakeHolds([c]).length) return false;
-    const records = [parseAltBranch(c.body), ...concurrentAuthorPauses([c]).map(r => r.alt),
-      ...loadFlakeHolds([c]).map(r => r.alt)];
-    return records.some(r => r?.branch === branch.name && r.sha === branch.sha && FULL_SHA.test(r.sha));
-  });
+  return pr.comments.some(c => repairRecords(c).some(r => r?.branch === branch.name
+    && r.sha === branch.sha && FULL_SHA.test(r.sha)));
+}
+function repairRecords(c) {
+  if (!isResolvedRepairAuthor(c)) return [];
+  if (!String(c.body ?? '').trimStart().startsWith(STAND_DOWN_MARKER)
+    && !concurrentAuthorPauses([c]).length && !loadFlakeHolds([c]).length) return [];
+  return [parseAltBranch(c.body), ...concurrentAuthorPauses([c]).map(r => r.alt),
+    ...loadFlakeHolds([c]).map(r => r.alt)];
 }
 
-export const RESOLVED_PUSH_MARKER = '🔧 conveyor saved repair — awaiting re-review';
-export function resolvedPushBody({ head, sha, branch }) {
-  if (!FULL_SHA.test(head ?? '') || !FULL_SHA.test(sha ?? '') || !laneHeadRef(branch)) throw Error('unpinned repair handoff');
-  return `${RESOLVED_PUSH_MARKER}\n<!-- resolved-repair from=${head} sha=${sha} branch=${branch} -->`;
-}
-/** Ordered complete thread: a pending handoff becomes active only at its exact new head. */
-export function pushedResolvedRepairOwedRearm({ comments, headRefOid, labels = [] }) {
-  if (!Array.isArray(labels) || !labels.some(l => (l?.name ?? l) === 'review:changes') || !Array.isArray(comments)) return null;
-  const trusted = comments.filter(isTrustedMarkerAuthor);
-  for (let i = trusted.length - 1; i >= 0; i--) {
-    const c = trusted[i];
-    if (!isResolvedRepairAuthor(c) || !String(c.body ?? '').startsWith(RESOLVED_PUSH_MARKER + '\n')) continue;
-    const m = /<!-- resolved-repair from=([a-f0-9]{40}) sha=([a-f0-9]{40}) branch=(lane\/[\w./-]+) -->/.exec(c.body);
-    if (!m || m[2] !== headRefOid || !laneHeadRef(m[3])) continue;
-    const closed = trusted.slice(i + 1).some(next => isResolvedRepairAuthor(next)
-      && ['🔧 conveyor fix — re-armed for re-review', '🔁 review — changes requested', '✅ review — accepted', '**⚠️ THIS IS AN ADVISORY REVIEW']
-        .some(marker => String(next.body ?? '').trimStart().startsWith(marker)));
-    return closed ? null : { sha: m[2], pushedAt: c.createdAt, branch: m[3] };
+/** The existing full-SHA producer record is a durable review handoff once its repair becomes the PR head.
+ * No live side ref or successful post-push write is needed. Only a later, trusted review of this EXACT
+ * head consumes it; label changes, re-arms, other heads and abbreviated/quoted evidence grant nothing.
+ */
+export function pushedResolvedRepairReviewOwed(pr) {
+  if (pr?.state !== 'OPEN' || pr.isCrossRepository !== false || !laneHeadRef(pr.headRefName)
+    || !FULL_SHA.test(pr.headRefOid ?? '') || !Array.isArray(pr.comments)) return null;
+  for (let index = pr.comments.length - 1; index >= 0; index--) {
+    const record = repairRecords(pr.comments[index]).find(r => r && resolvedBranchName(r.branch, pr.number)
+      && FULL_SHA.test(r.sha ?? '') && r.sha === pr.headRefOid);
+    if (!record) continue;
+    const reviewed = pr.comments.slice(index + 1).some(c => isReviewVerdictComment(c)
+      && (basisLineOf(c) || String(c.body ?? '').trimStart().startsWith('✅ review — accepted'))
+      && reviewedHeadsOf(c).includes(pr.headRefOid));
+    return reviewed ? null : { branch: record.branch, sha: record.sha };
   }
   return null;
 }
+
 export function findResolvedSideBranch({ pr, branches } = {}) {
   if (!resolvedSideBranchEvidenceReadable({ pr, branches })) return null;
   const matching = branches.filter(b => resolvedBranchName(b?.name, pr?.number));

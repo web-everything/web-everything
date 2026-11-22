@@ -1,22 +1,21 @@
-/** #7329 / #7142: the saved repair must be pushed instead of launching fixer seven/six. */
+/** #7329 / #7142: launch only a push-only task for an already-resolved repair. */
 import { existsSync } from 'node:fs';
 import { resolve, join } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 
 export default {
-  id: 'resolved-conflict-push-before-question',
-  title: 'resolved conflict side branch pushes before questions without another fixer or a gate bypass',
+  id: 'resolved-conflict-push-only',
+  title: 'resolved conflict side branch dispatches a push-only brief, never a full re-resolve',
   card: 'PR #7329 / #7142',
-  fixedBy: { sha: 'uncommitted', where: 'lane-37', paths: ['scripts/conveyor/resolved-side-branch-push.mjs', 'scripts/conveyor/reconcile-core.mjs'] },
-  fixPresent: root => existsSync(join(root, 'scripts/conveyor/resolved-side-branch-push.mjs')),
+  fixedBy: { sha: 'uncommitted', where: 'lane-3', paths: ['scripts/conveyor/resolved-side-branch-io.mjs', 'scripts/conveyor/reconcile-core.mjs'] },
+  fixPresent: root => existsSync(join(root, 'scripts/conveyor/resolved-side-branch-io.mjs')),
   async run({ sourceRoot } = {}) {
     const root = sourceRoot ?? resolve(fileURLToPath(import.meta.url), '../../../../..');
     const imp = p => import(pathToFileURL(join(root, p)).href);
     const { runTickAllRepos, resolveFixPassBudgets } = await imp('skills-src/conveyor/reconcile-fix-dispatch-daemon.mjs');
-    const { runResolvedSideBranchPass } = await imp('scripts/conveyor/resolved-side-branch-push.mjs');
     const { buildConcurrentAuthorPauseComment, AUTOMATION_LOGINS } = await imp('scripts/conveyor/stand-down.mjs');
     const { planReconcile } = await imp('scripts/conveyor/reconcile-core.mjs');
-    const { runReconcileFixDispatch } = await imp('scripts/conveyor/reconcile-fix-dispatch.mjs');
+    const { runReconcileFixDispatch, pushOnlyFixBrief } = await imp('scripts/conveyor/reconcile-fix-dispatch.mjs');
     const { workflowEditFact } = await imp('scripts/lib/merge-gate-ci.mjs');
     const H = 'a'.repeat(40), B = 'b'.repeat(40), S = 'c'.repeat(40), order = [], violations = [];
     const saved = { name: 'lane/topic-fix-7329-conflict-alt', sha: S, ancestors: [S, H, B] };
@@ -26,17 +25,6 @@ export default {
     const empty = () => ({ dispatched: [], refusals: [] });
     const mechanical = () => ({ dispatch: [], refusals: [], applied: [] });
     const result = await runTickAllRepos({ repos: ['web-everything/web-everything'],
-      resolvedSideBranchSetting: { value: true, source: 'standard' },
-      resolvedSideBranchStaleGuard: () => {},
-      resolvedSideBranchTick: ({ repo }) => runResolvedSideBranchPass({ repo }, {
-        listPrs: () => [pr], readBranches: () => [saved], readPr: () => pr,
-        acquireClaim: () => ({ ok: true }), checkClaim: () => true, releaseClaim: () => {},
-        admitPush: () => true, protect: ({ bodies }) => { pr = { ...pr, comments: [...pr.comments, ...bodies.map(body => ({ body, author: { login: AUTOMATION_LOGINS[0] } }))] }; },
-        appToken: () => 'ghs_soak',
-        preparePush: () => ({ verification: { sha: S, status: 'green' },
-          push: () => { order.push('push'); pr = { ...pr, headRefOid: S }; }, close: () => {} }),
-        record: () => order.push('record'), log: () => {},
-      }),
       fixTick: options => {
         order.push('dispatch-planning');
         return runReconcileFixDispatch({ ...options, root: '/repo',
@@ -44,8 +32,16 @@ export default {
           reconcile: () => planReconcile({ prs: [{ ...pr, resolvedSideBranches: [saved] }] }),
           findItemFn: () => null, loadItems: () => [], fetchItemlessDiffPaths: () => ['scripts/x.mjs'],
           pickFreeLanes: () => [1], listBuildClaims: () => [], listFixClaims: () => [],
-          priorityShadow: null, tryResumeRound: null, stepLog: () => {},
-          dispatch: () => { violations.push('fresh fixer launched for saved repair'); return {}; },
+          priorityShadow: null, tryResumeRound: () => { violations.push('full-round resume attempted'); return { resumed: false }; }, stepLog: () => {},
+          dispatch: planned => {
+            order.push('push-only-launch');
+            if (planned.pushOnly?.sha !== S || planned.pushOnly?.branch !== saved.name || planned.isConflict)
+              violations.push('saved repair dispatched as a full re-resolve');
+            const brief = pushOnlyFixBrief(planned);
+            if (!brief.includes('Do no new conflict work') || !brief.includes(`${saved.name}@${S}`))
+              violations.push('push-only brief missing saved repair or no-new-work constraint');
+            return { pr: planned.pr };
+          },
         });
       },
       ciHealTick: empty, promoteDraftTick: empty, hungCiTick: mechanical,
@@ -55,8 +51,17 @@ export default {
       orphanGuardTick: null, authGateOverride: () => ({ paused: false }),
       now: () => 0, prCursors: {}, budgetRotation: {}, passBudgets: resolveFixPassBudgets({ env: {}, file: {} }),
     });
-    if (result.resolvedSideBranches?.[0]?.result !== 'pushed' || pr.headRefOid !== S) violations.push('daemon did not push the saved repair');
-    if (order[0] !== 'push' || order[1] !== 'record' || order.indexOf('question-pass') < order.indexOf('push')) violations.push('question/state preceded push');
+    if (result.dispatched?.length !== 1 || order.filter(x => x === 'push-only-launch').length !== 1)
+      violations.push('daemon did not dispatch exactly one push-only fixer');
+    if (pr.headRefOid !== H) violations.push('planner changed the PR head');
+    // The normal launcher pushes later. Preserve the exact labels/comments and discard live ref
+    // evidence, as after a restart/deleted saved ref: old findings must never launch a full fixer.
+    const pushed = { ...pr, headRefOid: S, mergeStateStatus: 'CLEAN', rowsHead: S, rowsComplete: true,
+      statusCheckRollup: [{ name: 'test', status: 'completed', conclusion: 'success' }] };
+    const afterPush = planReconcile({ prs: [pushed], requiredChecks: ['test'], reviewTiming: { startAfter: 'ci-green' } });
+    if (afterPush.dispatch.some(row => row.kind === 'fix')
+      || !afterPush.dispatch.some(row => row.kind === 'review' && row.resolvedRepairReview?.sha === S))
+      violations.push('successful saved-repair push reopened old findings instead of exact-head review');
     const gate = workflowEditFact({ pinnedHead: { sha: S }, gatePaths: { files: ['.github/workflows/ci.yml'] }, acceptance: { humanClearedSha: H } });
     if (gate?.status !== 'hold') violations.push('old-head clearance bypassed the new-head workflow hold');
     return { violations, order };

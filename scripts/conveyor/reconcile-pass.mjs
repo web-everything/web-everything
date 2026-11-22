@@ -1,4 +1,4 @@
-import { enrichResolvedSideBranches } from './resolved-side-branch-push.mjs';
+import { enrichResolvedSideBranches, resolveResolvedSideBranchSetting } from './resolved-side-branch-io.mjs';
 import { isUnderTest as resolvedScanUnderTest } from '../lib/under-test.mjs';
 import { greenLedgerDir, hasGreenLedger } from '../lib/lane-verify.mjs';
 import { unread } from './dispatch-eligibility.mjs';
@@ -1908,6 +1908,8 @@ export function runReconcilePass({
   console.error(`fix.standDownHoldsAcrossHeads=${standDownHoldsAcrossHeads.value} (source: ${standDownHoldsAcrossHeads.source})`);
   const timing = resolveTimingPolicy({ env });
   const prs = step('enrich-verify-green', () => enrichVerifyGreen(rulingPrs, { policy: timing.review, env }));
+  const savedRepairSetting = resolveResolvedSideBranchSetting({ env });
+  console.error(`fix.pushResolvedSideBranch=${savedRepairSetting.value} (source: ${savedRepairSetting.source}; push-only fixer)`);
   const resolvedPrs = enrichResolvedBranches ? step('resolved-side-branches', () => enrichResolvedBranches(prs, { repo: repoKey })) : prs;
   const plannerInput = {
     reviewTiming: timing.review, fixTiming: timing.fix,
@@ -1915,7 +1917,7 @@ export function runReconcilePass({
     owedCiRerun: owedCiRerunSetting.value,
     staleCiRerun: staleCiRerunSetting.value,
     roundCap: resolveRoundCap(env),
-    repo: repoKey, prs: resolvedPrs,
+    repo: repoKey, prs: resolvedPrs, resolvedSideBranchEnabled: savedRepairSetting.value,
     agents, durableCounts: durableCountsFrom(prs), now, defaultBranch, mainRedWindows,
     mainLatestCheckRuns, requiredChecks, mainSha, fixerLadder,
     ...fixCapSettings(() => fixSettings, env, loadTakeoverBudget),

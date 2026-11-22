@@ -1,56 +1,50 @@
-# Saved conflict repairs — normal lane verification
+# Saved conflict repairs — push-only fixer launch
 
-Bare transport is discovery only. The writer reuses load-flake reverify IO to prepare
-the saved ref, acquire a build lane, check its exact SHA, and run verify-lane with
-the sanitized verification environment. Host-load deferral, red or unreadable verify,
-or unreadable admission publishes a stand-down and fix-question-asked; no fixer is
-relaunched. A green result permits only a normal, non-forced git push FROM that lane,
-with the repository's complete pre-push hook chain. Hooks are never replaced or disabled.
-The normal push guard additionally checks the advertised destination SHA against the
-expected PR head. A lane with missing, changed or obsolete hooks requires operator
-inspection; the writer never installs a private hook to get past that refusal.
-After verification and immediately before transport, read the lane's complete effective
-Git configuration, including worktree settings and includes. Refuse URL rewrites,
-credential sources, proxies, transport commands, URL-shaped remote aliases and other
-unsafe lane configuration; never silently scrub it to make the push pass. Unknown,
-unreadable, truncated or oversized configuration requires operator inspection. The App
-credential helper is scoped to HTTPS on github.com so another host cannot request it.
+Read-only, bounded discovery in `resolved-side-branch-io.mjs` supplies the planner
+with saved refs and ancestry. Detection requires an exact automation-authored alt
+record, a full SHA, ancestry containing the current PR head and base, and one
+unambiguous newest repair. Unreadable evidence, over 16 refs, over 32,768 ancestors,
+or divergent repairs refuses both push-only and full-resolution launches and calls
+for operator inspection. The scan rotates at most eight PRs and shares a 128-call
+API budget. Unscanned PRs are distinct from unreadable evidence.
 
-Promotion also needs a complete App-authored stand-down/alt record binding this PR's
-exact branch and full SHA, bounded ancestry containing current head and base, an open
-same-repository PR headed under lane/, and head-bound verification/CI admission.
-Missing verification records trigger normal verification, even with pushBeforeGate
-enabled: a saved ref has no live early-push waiter. Previous-head CI uses the normal
-fixPushGate and configured timing policy; unknown evidence refuses. Known
-load-flake repairs remain owned by the retry-limited load-flake worker. This limits
-the feature deliberately rather than weakening either existing rule.
+For a saved repair the planner emits `kind: fix` with `pushOnly: { branch, sha }`.
+The normal `dispatchFix` launch owns claims, heartbeat, verification, self-review,
+hooks and token handling. Its brief pins the saved ref/SHA and permits pushing
+only to that PR's own safe `lane/*` head. It forbids new conflict work, repairs,
+rebases, forced pushes and review-state changes. The launcher owns its existing
+capped pre-review check; this mode adds no second self-review loop. Verification
+failure stands down for operator inspection, never a full re-resolve in that round.
+Conflict and previous-round resume paths are excluded so old repair instructions
+cannot replace the push-only brief.
 
-The injectable write protocol acquires the fixing and dispatch claims, rechecks
-inside the claim, prepares transport, persists the exact repair handoff and carries
-unanswered questions BEFORE pushing, then rereads open/head/base immediately before
-and after the write. A successful push remains pushed-unrecorded if readback or
-recording fails. A pending head-bound handoff suppresses old findings after a crash
-and lets the existing rearmPushedFixes worker re-arm for review. Carrying a question
-never carries an acceptance or human clearance. Writes use only an owner-bound App
-token; GitHub calls pin the real executable, github.com, a clean environment, and
-personalRoute=false on each throttled call.
+Active load-flake holds retain their existing retry-limited worker ownership and
+refuse fixer launches before push-only admission. A saved SHA already owned by that
+worker also cannot restart its retry allowance after a closed or exhausted attempt;
+operator inspection is required. A closed historical hold for a different saved SHA
+does not block unrelated push-only work. Use the shared hold readers, including
+their legacy/abbreviated-SHA handling, rather than treating producer evidence as admission.
 
-Scans rotate under the daemon's existing phase budgets, PR cursors and adoption
-yield. Only actually unreadable scans hold a PR; unscanned PRs retain their ordinary
-reconciliation. A full 100-PR inventory, over 16 saved refs, over 32,768 ancestors,
-or an exhausted shared API budget requires operator inspection. The shared reconcile
-pass supplies evidence to both fixer and ci-heal consumers.
+The automation-authored alt record is also a durable, exact-head review handoff.
+Once the PR head equals its full saved SHA, the normal planner owes independent
+review before another fix, even with unchanged labels/comments and after the saved
+ref is deleted or no longer scanned. Only a later trusted review whose structured
+producer evidence covers that exact full SHA consumes the handoff. Re-arms, older
+heads, abbreviated/quoted evidence and untrusted comments do not consume it. Normal
+claim, liveness, draft, referral and CI gates still apply. If a review gate requires
+new repair work, refuse for operator inspection instead of launching a full fixer.
+The push-only task changes no review label or acceptance and adds no custom writer.
 
-Merge-path checklist: producer identity is the shared marker-authorship login list,
-with exact record bindings; missing signals refuse; comment sequence (not dates)
-closes a repair round; claims and live rechecks protect read/write races; all writes
-bind full head/base SHA and PR; handoffs bind source head, repair SHA and branch;
-unknown inputs refuse; success recording follows the effect; pending protection
-precedes it; no personal credentials or hostile environment reach transport; no label
-waives admission; no child runs concurrently with an unowned claim. The simplest
-safe hook and verification fallback is refusal, with the existing guarded workers
-as the operator-visible recovery path. Negative probes for all sixteen audit items
-live in resolved-side-branch*.test.mjs.
+`fix.pushResolvedSideBranch` retains its existing cascade and environment key but
+now enables the push-only fixer task. Its effective value/source is logged by
+reconciliation. Disabled or unreadable policy refuses saved repairs without falling
+back to full resolution. There is no custom daemon writer phase or privileged push IO.
 
-Question publication still emits fix-question-asked only after the comment succeeds.
-No merge-gate, waiver, acceptance or human-clearance result is changed by this pass.
+No merge permission, hold, acceptance, label clearance or human clearance is
+carried by detection or dispatch. The new head still faces the normal merge gate.
+Stand-down carry-over remains in `stand-down.mjs`; successfully posted questions
+still emit `fix-question-asked`, including the daemon notes path.
+
+The named merge-path checklist is in `resolved-side-branch.test.mjs`, bounded
+read-only probes in `resolved-side-branch-discovery.test.mjs`, and the behavior soak
+in `resolved-conflict-push-only.soak.test.mjs`.

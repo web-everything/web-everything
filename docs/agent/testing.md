@@ -6346,38 +6346,27 @@ Gate ceilings get one capped retry tied to lane, head and killed job. Detached j
 `verify-gate-job.mjs`, so recovery must cover that consumer as well as `verify-dispatch.mjs`'s
 in-process sweep. Persist the retry identity in job input to dedupe the enqueue-before-marker crash window.
 
-## Saved-conflict push race probes
+## Saved-conflict push-only fixer probes
 
-`resolved-side-branch-normal-verify.test.mjs` exercises the repository's normal pre-push hook with
-a changed remote advertisement. An API head re-read alone does not pin a plain push:
-Git must also refuse an advertised old oid that differs from the exact read head,
-then the server applies its ordinary compare-and-swap. Keep the no-force assertion,
-bare discovery/environment probe, post-push readback and no-personal-token
-negatives alongside this hook test. The daemon soak uses the real fix dispatcher
-to prove a saved repair push cannot immediately launch a fixer on its new head.
+`scripts/conveyor/__tests__/resolved-side-branch.test.mjs` covers the merge-path
+checklist: saved SHA dispatches push-only, own safe lane head only, no hook bypass,
+unreadable/oversized/ambiguous evidence refuses both launch modes, failed verification
+never falls through to full re-resolution, and successful question publication
+precedes `fix-question-asked`. Probe the new-head merge gate and planner holds; saved
+repair discovery or dispatch never grants acceptance or human clearance.
+The successful-push regression preserves the original labels/comments across the
+push, then reconciles with and without live saved-ref evidence. It must owe exact-head
+review and never dispatch old findings. A later trusted full-SHA review consumes that
+durable handoff; wrong-head, abbreviated, quoted, untrusted and pre-handoff reviews
+do not. CI holds and a review gate proposing scope repair still prevent a fixer launch.
+Saved load-flake regressions must attest an eligible descendant with the real hold
+producer and still refuse fixer dispatch: the retry-limited worker retains active
+ownership, and its closed/exhausted saved SHA cannot restart through push-only.
+Cover abbreviated persisted SHAs and preserve unrelated work after a different hold closes.
 
-
-## Saved repair push admission (Slice A audit)
-
-A saved lane ref and git ancestry are discovery evidence, never producer or verify
-proof. Require an automation-authored alt record with the full branch/SHA. The
-bare discovery transport never writes. Reuse load-flake IO to acquire a build lane
-at the saved SHA and run normal verify-lane with its sanitized environment. Red,
-unreadable or load-deferred verification publishes a head-bound stand-down and
-fix-question-asked, retaining no-relaunch suppression. Green verification still needs
-previous-head CI admission and all claim/head/base checks. Push only from that lane
-through the unchanged normal hook chain; its advertised-head restriction rejects
-a raced destination without force. Never replace the prototype-tracker gate with a
-private hook. A missing/obsolete hook requires operator inspection. Keep named
-normal-verify, red, load deferral, environment hygiene and real-hook payload tests
-in resolved-side-branch-normal-verify.test.mjs, alongside the behavior-based soak.
-Strict claim scans must reject corrupt entries and directory errors. Publish the
-repair handoff and any still-unanswered questions before making the new head
-visible; readback/record failures after success retain pushed-unrecorded status.
-Unscanned PRs are distinct from unreadable PRs and keep ordinary reconciliation.
-
-Saved-repair transport regressions must plant a real lane-local URL rewrite after
-verification and assert no transport command or credential delivery. Cover included
-and worktree configuration, URL-shaped remote aliases, proxy/auth/command settings,
-unreadable or oversized listings, and credential fill for a foreign host. The normal
-hook chain remains required; unsafe configuration is refused, never silently scrubbed.
+`resolved-side-branch-discovery.test.mjs` exercises the bounded read-only scan,
+rotation, API budget and setting cascade. `resolved-conflict-push-only.soak.test.mjs`
+drives daemon planning into normal fixer dispatch and checks the actual push-only
+brief. Claims, verification, self-review, hooks and credentials stay with the normal
+fix launcher. Do not restore a separate push writer or a second self-review loop.
+Run only affected files through the host heavy-admission queue.
