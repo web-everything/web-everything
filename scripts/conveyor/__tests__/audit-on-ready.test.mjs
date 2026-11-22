@@ -1,4 +1,4 @@
-import test from 'node:test';
+import { test } from 'vitest';
 import assert from 'node:assert/strict';
 import { planAuditOwed, auditOwedLine, readAutoAuditMode, defaultAuditCheck } from '../audit-on-ready.mjs';
 import { runAutoAuditShadow } from '../../../skills-src/conveyor/review-daemon.mjs';

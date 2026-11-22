@@ -1,10 +1,13 @@
 import { readFileSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
+import { dirname, join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 
 const GIT_TIMEOUT_MS = 15000;
 import { checkCanonicalAuditForOpen } from '../operations/canonical-audit-gate.mjs';
 
-const SETTINGS = new URL('../settings/review-auto-audit.json', import.meta.url);
+// A path (not `new URL('literal', import.meta.url)`): Vite rewrites that literal form into an asset URL under vitest.
+const SETTINGS = join(dirname(fileURLToPath(import.meta.url)), '..', 'settings', 'review-auto-audit.json');
 const MODES = new Set(['off', 'shadow', 'on']);
 const REQUIRED_LABELS = ['review:human', 'advisory:accepted', 'red-team:clear'];
 
