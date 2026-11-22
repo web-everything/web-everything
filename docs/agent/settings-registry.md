@@ -16,9 +16,9 @@ For repo defaults, edit the owner file through a PR and rebuild the consuming da
 
 ## Summary
 
-- Top-level keys: 163 (165 declaration rows).
-- Declared leaves: 592 (platform copies counted separately).
-- Instant top-level keys: 0; not instant: 163.
+- Top-level keys: 164 (166 declaration rows).
+- Declared leaves: 618 (platform copies counted separately).
+- Instant top-level keys: 0; not instant: 164.
 - Instant capacity leaves: 15.
 - Constants to settle: 312.
 - Instant gaps: 28.
@@ -80,7 +80,7 @@ Operator-prefs layer: ~/.plateau/platform-preferences.json is the requested oper
 | cards | scripts/settings/card-dedupe.json | 2 | {"$comment":"Repo override (operator go 2026-10-10): dedupe… | pr | no | Mechanical finding deduplication and similarity threshold. |
 | careExemptPaths | scripts/settings/review.json | 1 | ["scripts/ci/test-timings.json","data/generated/**","src/_d… | pr | no | Narrow paths exempted from care classification, retaining human gates. |
 | carryAcrossRebase | scripts/settings/review.json | 1 | "on" | pr | no | Carry review state across eligible rebases. |
-| ci | scripts/settings/timeout-evidence.json | 1 | {"timeoutEvidenceConcurrency":4} | pr | no | Concurrency of timeout-evidence child readers. |
+| ci | scripts/settings/ci-selection.json, scripts/settings/timeout-evidence.json | 3 | {"selection":{"trace":{"enabled":true,"maxEdgesPerTest":500… | pr | no | CI dependency selection, shadow tracing and timeout-evidence reader concurrency. |
 | ciGhostRerun | scripts/settings/ci-ghost-rerun.json | 5 | {"thresholdMin":15,"maxPerWindow":1,"maxPerHead":1,"windowH… | pr | no | Age, frequency and cancellation bounds for ghost CI recovery. |
 | ciHeal | scripts/settings/ci-heal.json | 2 | {"staleBaseRefreshFirst":"on","loop":"off"} | pr | no | Try a stale-base refresh before waking a CI fixer. |
 | ciHeldRecordRetryMax | scripts/settings/review-red-team-on-skip.json | 1 | 3 | pr | no | Maximum CI-held record recovery retries. |
@@ -168,6 +168,7 @@ Operator-prefs layer: ~/.plateau/platform-preferences.json is the requested oper
 | prepareStaleHours | scripts/settings/coroner-postmortem.json | 1 | 24 | pr | no | Age in hours at which preparation is treated as stale. |
 | prevention | scripts/settings/prevention-batch.json | 4 | {"$comment":"batchFiling enables rolling prevention PRs; fa… | pr | no | Prevention card batching and filing limits. |
 | providerCapacity | scripts/settings/provider-capacity.json | 1 | {"providers":[{"id":"codex","launcher":"codex","tier":3,"al… | pr | no | Provider/account quota windows, readers, reserves, banked resets and minimum tiers for capacity-based routing. |
+| providerRotation | scripts/settings/provider-rotation.json | 24 | {"mode":"shadow","catalog":[{"provider":"codex","model":"gp… | pr | no | Pure provider rotation input: mode, arm catalog/shares, identity families, exhaustion/reserve bounds, strong/small guards and Carbon promotion evidence. |
 | quarantine | scripts/settings/card-ledger-trust.json | 1 | [] | pr | no | Quarantined card-ledger identities. |
 | raisedByMigrate | scripts/settings/raised-by-migrate.json | 1 | {"maxPrsPerRun":10} | pr | no | Maximum PRs attempted per raised-by migration apply run. |
 | readyRecordPath | scripts/settings/prototype-load.json | 1 | "~/workspace/.operations/coordination/fix-ready.jsonl" | pr | no | Fix readiness coordination record location. |
