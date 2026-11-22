@@ -199,7 +199,7 @@ export function gitExecQuarantined() {
   const quarantineFor = (dir) => {
     let found = quarantines.get(dir);
     if (!found) {
-      const common = String(execFileSync('git', ['-C', dir, 'rev-parse', '--git-common-dir'], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] })).trim();
+      const common = String(execFileSync('git', ['-C', dir, 'rev-parse', '--git-common-dir'], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], maxBuffer: 1024 * 1024, timeout: 30e3 })).trim();
       found = { objects: fs.mkdtempSync(path.join(os.tmpdir(), 'free-scope-objects-')), alternate: path.resolve(dir, common, 'objects') };
       quarantines.set(dir, found);
     }
