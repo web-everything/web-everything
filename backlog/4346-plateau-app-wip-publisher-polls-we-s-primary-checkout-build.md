@@ -70,3 +70,5 @@ builder's own `--dry-run` from `~/workspace/wev-control` and check whether `load
 2. **Live** — the publisher tree uses under 40 CPU-s in a 4-minute sample.
 
 Superseded 2026-11-22 by plan step DZ-RETIRE-WIP (Fix lives in /wip publisher code that DZ-RETIRE-WIP removes. Reopen only if /wip stays past W12.) [PL-WIP-CLEANUP / plateau rulings].
+
+Acceptance items carried (2026-11-22): plan step PD-LIVE (delivery plan): 120 s cadence unit test and the CPU live proof.

@@ -176,3 +176,5 @@ cross-repo change; does not touch #2695's or #2950's files, so it can land indep
 relative to them.
 
 Superseded 2026-11-22 by #2707 (Its mandatory post-jury red-team mechanism already shipped as #2707 (per its own prep note).) [PL-WIP-CLEANUP / plateau rulings].
+
+Acceptance items carried (2026-11-22): plan step DZ-STUDIO-RATIFY (design plan): honesty-lens checklist and its regression assertions; data-model truth also overlaps #2695.

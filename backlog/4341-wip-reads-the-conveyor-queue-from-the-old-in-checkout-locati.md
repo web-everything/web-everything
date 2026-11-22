@@ -110,3 +110,5 @@ against `we:scripts/conveyor/queue.mjs list --json`.
    plus the old-shaped-`weRoot` degrade case.
 
 Superseded 2026-11-22 by plan step DZ-RETIRE-WIP (Fix lives in /wip publisher code that DZ-RETIRE-WIP removes. Reopen only if /wip stays past W12.) [PL-WIP-CLEANUP / plateau rulings].
+
+Acceptance items carried (2026-11-22): plan step PD-LIVE (delivery plan): resolver-based queue read and the degrade tests.

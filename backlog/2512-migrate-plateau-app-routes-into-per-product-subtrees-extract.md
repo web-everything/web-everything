@@ -374,3 +374,5 @@ references and found none beyond what's now listed; the `technical-configurator`
 `/backlog/NNN-slug/` hrefs point at the WE docs site, not plateau-app's own route, correctly out of scope).
 
 Superseded 2026-11-22 by plan step DZ-SHELL (Per-product route subtrees conflict with the five task-based sections. Keep the extraction-ready property (#2476) through module boundaries, not URL prefixes. Operator to confirm.) [PL-WIP-CLEANUP / plateau rulings].
+
+Acceptance items carried (2026-11-22): plan step DZ-SHELL (design plan) and card xdzzp2l: legacy-URL redirect tests (static, dynamic, query string, before auth).
