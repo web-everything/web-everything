@@ -3,7 +3,7 @@ bornAs: xvbh2rb
 kind: story
 size: 8
 parent: "2804"
-status: active
+status: parked
 blockedBy: ["2809", "2810"]
 scope:
   - plateau-app:tests/visual/real-route-fidelity.spec.ts

@@ -3,7 +3,7 @@ bornAs: xljqux3
 kind: decision
 parent: "2445"
 size: 3
-status: open
+status: parked
 priority: low
 dateOpened: "2026-07-11"
 preparedDate: "2026-07-28"

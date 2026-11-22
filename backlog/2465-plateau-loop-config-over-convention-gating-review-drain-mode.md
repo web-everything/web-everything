@@ -3,7 +3,7 @@ bornAs: x8wagm6
 kind: story
 size: 8
 parent: "2445"
-status: open
+status: parked
 priority: low
 dateOpened: "2026-07-12"
 tags: []
