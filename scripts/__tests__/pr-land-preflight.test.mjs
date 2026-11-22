@@ -9,8 +9,9 @@ import { pathToFileURL } from 'node:url';
 // Git effects are recorded instead of executed. No real Git, forge, card filing or operator state.
 function run({ check = true, fail = false, override = '', count = 15, exempt = false,
   body = 'Description', earlyPr = false, labelOnGreen = false, headEvidence = 'matching',
-  sha = 'a'.repeat(40), remoteTip = '', remoteError = false, ancestor = true, refusePush = false,
-  fetchUrls = null, pushUrls = null, dryRun = false, createFails = false, fallbackGit = false } = {}) {
+  sha = 'a'.repeat(40), remoteTip = '', forkTip = '', remoteError = false, ancestor = true, refusePush = false,
+  shallow = 'false', fetchUrls = null, pushUrls = null, dryRun = false, createFails = false, fallbackGit = false,
+  realGit = null } = {}) {
   const dir = mkdtempSync(join(tmpdir(), 'pr-land-preflight-'));
   const trace = join(dir, 'effects.jsonl');
   const root = resolve('scripts');
@@ -58,10 +59,15 @@ function run({ check = true, fail = false, override = '', count = 15, exempt = f
   writeFileSync(preload, `import cp from 'node:child_process'; import { syncBuiltinESMExports, register } from 'node:module';
     ${record}
     const execFileSync = cp.execFileSync;
-    cp.execFileSync = (cmd, args) => {
+    cp.execFileSync = (cmd, args, opts) => {
       effect([cmd, args]);
       if (cmd === 'node') return ''; // locus linter is read-only and independently tested
       if (cmd !== 'git') throw new Error('unexpected external effect: ' + cmd);
+      // realGit: the publish step's remote reads, ancestry/shallow checks and the push run against real local
+      // bare repositories; every other git call stays stubbed.
+      if (${!!realGit} && (['ls-remote', 'merge-base', 'push'].includes(args[0]) || (args[0] === 'remote' && args.includes('--all'))
+        || args.includes('--is-shallow-repository'))) return execFileSync(cmd, args, opts);
+      if (args.includes('--is-shallow-repository')) { if (${JSON.stringify(shallow)} === null) throw new Error('shallow unreadable'); return ${JSON.stringify(shallow)}; }
       if (args[0] === 'rev-parse') return args.includes('--absolute-git-dir') ? ${JSON.stringify(dir)} : ${JSON.stringify(sha)};
       if (args[0] === 'log') return 'fix: admission';
       if (args[0] === 'remote' && args.includes('--all')) {
@@ -74,7 +80,9 @@ function run({ check = true, fail = false, override = '', count = 15, exempt = f
       if (args[0] === 'diff') return args.includes('--name-status') ? 'M\\tblocks/example.ts' : ${JSON.stringify(exempt ? 'scripts/conveyor/worker.mjs' : 'blocks/example.ts')};
       if (args[0] === 'ls-remote') {
         if (${remoteError}) throw new Error('ls-remote unavailable');
-        return ${JSON.stringify(remoteTip)};
+        // remoteTip answers for the default (upstream) URL; forkTip for any other push URL that is read.
+        return args.includes('https://github.com/web-everything/web-everything.git') || args.includes('origin')
+          ? ${JSON.stringify(remoteTip)} : ${JSON.stringify(forkTip)};
       }
       if (args[0] === 'merge-base') {
         if (${JSON.stringify(ancestor)} !== true) throw Object.assign(new Error('not a proven ancestor'), { status: ${ancestor === 'unreadable' ? 128 : 1} });
@@ -87,11 +95,11 @@ function run({ check = true, fail = false, override = '', count = 15, exempt = f
       return '';
     }; syncBuiltinESMExports(); register(${JSON.stringify(pathToFileURL(loader).href)});`);
   try {
-    const child = spawnSync(process.execPath, ['--import', preload, join(root, 'pr-land.mjs'), `--repo=${dir}`,
+    const child = spawnSync(process.execPath, ['--import', preload, join(root, 'pr-land.mjs'), `--repo=${realGit?.repo ?? dir}`,
       '--ref=lane/preflight', '--title=fix: admission', `--body=${body}`, labelOnGreen ? '--label-on-green' : '--no-wait', '--json',
       ...(check ? ['--check'] : []), ...(dryRun ? ['--dry-run'] : []), ...(fallbackGit ? ['--fallback-git'] : []),
       ...(override === 'forceOpen' ? ['--force-open', '--reason=operator'] : [])],
-    { cwd: dir, env: { ...process.env, TMPDIR: dir, WE_POLICY_CASCADE_LOG: '0', ...(fallbackGit ? { WE_MERGE_BREAK_GLASS: '1' } : {}) },
+    { cwd: dir, env: { ...(realGit ? realGit.env : process.env), TMPDIR: dir, WE_POLICY_CASCADE_LOG: '0', ...(fallbackGit ? { WE_MERGE_BREAK_GLASS: '1' } : {}) },
       encoding: 'utf8', timeout: 30_000, maxBuffer: 2 * 1024 * 1024 });
     if (!child.stdout.trim()) throw new Error(`CLI ${child.status}: ${child.stderr}`);
     return { status: child.status, stderr: child.stderr, result: JSON.parse(child.stdout.trim().split('\n').at(-1)),
@@ -169,7 +177,10 @@ describe('pr-land lane publish remote-tip check', () => {
   it('origin equals HEAD: skips push even with a refusing hook and reaches PR creation', () => {
     const { effects, stderr } = publish({ remoteTip: tip(sha), refusePush: true });
     expect(pushes(effects)).toEqual([]);
-    expect(effects).toContainEqual(['git', ['ls-remote', 'origin', 'refs/heads/lane/preflight']]);
+    // The tip is read from the resolved PUSH URL, never from the remote name (which reads the fetch URL).
+    expect(effects).toContainEqual(['git', ['remote', 'get-url', '--push', '--all', 'origin']]);
+    expect(effects).toContainEqual(['git', ['ls-remote', '--', 'https://github.com/web-everything/web-everything.git', 'refs/heads/lane/preflight']]);
+    expect(effects.some(([cmd, args]) => cmd === 'git' && args[0] === 'ls-remote' && args.includes('origin'))).toBe(false);
     expect(effects.some(([cmd]) => cmd === 'create')).toBe(true);
     expect(stderr).toContain(`push skipped: origin already at ${sha}`);
   });
@@ -190,12 +201,27 @@ describe('pr-land lane publish remote-tip check', () => {
     expect(effects.some(([cmd]) => cmd === 'create')).toBe(true);
   });
 
-  it.each(['ahead', 'diverged', 'ancestry unreadable'])('origin %s: refuses before push or PR creation', state => {
-    const { status, result, effects } = publish({ remoteTip: tip(different), ancestor: state === 'ancestry unreadable' ? 'unreadable' : false });
+  it.each(['ahead', 'diverged'])('origin %s (merge-base proves not an ancestor): refuses before push or PR creation', () => {
+    const { status, result, effects } = publish({ remoteTip: tip(different), ancestor: false });
     expect(status).toBe(3);
     expect(result.reason).toBe('push-failed');
+    expect(result.detail).toContain(`non-fast-forward: origin/lane/preflight (${different})`);
     expect(pushes(effects)).toEqual([]);
     expect(effects.some(([cmd]) => cmd === 'create')).toBe(false);
+  });
+
+  // An unreadable remote tip or ancestry must never block the push: the server validates fast-forward itself
+  // (operator send-back on #7307). Only a definitive "not an ancestor" in a full (non-shallow) clone refuses.
+  it.each([
+    ['ancestry unreadable (tip object missing, exit 128)', { ancestor: 'unreadable' }],
+    ['a shallow clone (merge-base may lie past the boundary)', { ancestor: false, shallow: 'true' }],
+    ['an unreadable shallow state', { ancestor: false, shallow: null }],
+    ['a garbage shallow state', { ancestor: false, shallow: 'maybe' }],
+  ])('origin differs and %s: no refusal, guarded push runs and reaches PR creation', (_name, options) => {
+    const { status, effects } = publish({ remoteTip: tip(different), ...options });
+    expect(pushes(effects)).toEqual([['git', ['push', 'origin', `${sha}:refs/heads/lane/preflight`]]]);
+    expect(effects.some(([cmd]) => cmd === 'create')).toBe(true);
+    expect(status).toBe(0);
   });
 
   it.each([
@@ -218,42 +244,48 @@ describe('pr-land lane publish remote-tip check', () => {
     expect(stderr).not.toContain('push skipped');
   });
 
-  // Acceptance: "a separate pushurl/pushInsteadOf: never skip" — nor several fetch URLs, nor an unreadable URL read.
+  // The push target is unknown (several push URLs, or an unreadable/unsafe one): nothing is read from any remote,
+  // so a tip can neither skip nor refuse the push — it runs once and the server validates.
   const url = 'https://github.com/web-everything/web-everything.git';
+  const fork = 'git@github.com:fork/web-everything.git';
   it.each([
-    ['a pushurl (or pushInsteadOf rewrite) differs', { pushUrls: 'git@github.com:fork/web-everything.git' }],
-    ['two remote.origin.url values (ls-remote sees only the first)', { fetchUrls: `${url}\nhttps://mirror.test/we.git`, pushUrls: `${url}\nhttps://mirror.test/we.git` }],
-    ['two push URLs', { pushUrls: `${url}\ngit@github.com:fork/web-everything.git` }],
+    ['two remote.origin.url values (push goes to both)', { fetchUrls: `${url}\nhttps://mirror.test/we.git`, pushUrls: `${url}\nhttps://mirror.test/we.git` }],
+    ['two push URLs', { pushUrls: `${url}\n${fork}` }],
     ['an empty push URL read', { pushUrls: '' }],
-    ['the fetch URL read fails (exit 128)', { fetchUrls: 128 }],
     ['the push URL read fails (exit 2)', { pushUrls: 2 }],
-  ])('origin equals HEAD but %s: never skips, pushes exactly once', (_name, urls) => {
-    const { status, result, effects, stderr } = publish({ remoteTip: tip(sha), ...urls, refusePush: true });
-    expect(effects).toContainEqual(['git', ['remote', 'get-url', '--all', 'origin']]);
+    ['the push URL starts with "-" (would be read as an ls-remote option)', { pushUrls: '--upload-pack=touch /tmp/x' }],
+  ])('origin equals HEAD but %s: no remote read, never skips, pushes exactly once', (_name, urls) => {
+    const { status, result, effects, stderr } = publish({ remoteTip: tip(sha), forkTip: tip(sha), ...urls, refusePush: true });
+    expect(effects).toContainEqual(['git', ['remote', 'get-url', '--push', '--all', 'origin']]);
+    expect(effects.some(([cmd, args]) => cmd === 'git' && ['ls-remote', 'merge-base'].includes(args[0]))).toBe(false);
     expect(pushes(effects)).toEqual([['git', ['push', 'origin', `${sha}:refs/heads/lane/preflight`]]]);
     expect(status).toBe(3);
     expect(result.reason).toBe('push-failed');
     expect(stderr).not.toContain('push skipped');
   });
 
-  // The fetch-side tip says nothing about a different push destination, so it can neither skip nor refuse the
-  // push: a non-ancestor tip read from upstream must not block a valid push to the fork (red-team, #7307).
-  it.each([
-    ['a pushurl (or pushInsteadOf rewrite) differs', { pushUrls: 'git@github.com:fork/web-everything.git' }],
-    ['two remote.origin.url values', { fetchUrls: `${url}\nhttps://mirror.test/we.git`, pushUrls: `${url}\nhttps://mirror.test/we.git` }],
-    ['two push URLs', { pushUrls: `${url}\ngit@github.com:fork/web-everything.git` }],
-    ['the fetch URL read fails (exit 128)', { fetchUrls: 128 }],
-    ['the push URL read fails (exit 2)', { pushUrls: 2 }],
-  ])('fetch tip is not an ancestor but %s: no ancestry refusal, guarded push runs and reaches PR creation', (_name, urls) => {
-    const { status, effects } = publish({ remoteTip: tip(different), ancestor: false, ...urls });
+  // A separate pushurl / pushInsteadOf rewrite: the tip is read from the PUSH URL. The fetch URL's tip (upstream)
+  // never skips, refuses or is even read (operator send-back on #7307).
+  it('pushurl differs, the fork lacks the branch, upstream holds an unrelated tip: push runs, no exit 3', () => {
+    const { status, effects } = publish({ remoteTip: tip(different), ancestor: false, pushUrls: fork, forkTip: '' });
+    expect(effects).toContainEqual(['git', ['ls-remote', '--', fork, 'refs/heads/lane/preflight']]);
+    expect(effects.some(([cmd, args]) => cmd === 'git' && args[0] === 'ls-remote' && args.includes(url))).toBe(false);
     expect(effects.some(([cmd, args]) => cmd === 'git' && args[0] === 'merge-base')).toBe(false);
     expect(pushes(effects)).toEqual([['git', ['push', 'origin', `${sha}:refs/heads/lane/preflight`]]]);
     expect(effects.some(([cmd]) => cmd === 'create')).toBe(true);
     expect(status).toBe(0);
   });
 
-  it('same single fetch/push URL and a non-ancestor tip: still refuses before push', () => {
-    const { status, result, effects } = publish({ remoteTip: tip(different), ancestor: false, fetchUrls: url, pushUrls: url });
+  it('pushurl differs and the fork already holds HEAD: skips the push even though upstream differs', () => {
+    const { effects, stderr } = publish({ remoteTip: tip(different), pushUrls: fork, forkTip: tip(sha), refusePush: true });
+    expect(pushes(effects)).toEqual([]);
+    expect(stderr).toContain(`push skipped: origin already at ${sha}`);
+    expect(effects.some(([cmd]) => cmd === 'create')).toBe(true);
+  });
+
+  it('pushurl differs and the fork tip is provably not an ancestor: refuses before push', () => {
+    const { status, result, effects } = publish({ remoteTip: tip(sha), pushUrls: fork, forkTip: tip(different), ancestor: false });
+    expect(effects).toContainEqual(['git', ['merge-base', '--is-ancestor', different, sha]]);
     expect(status).toBe(3);
     expect(result.reason).toBe('push-failed');
     expect(pushes(effects)).toEqual([]);
@@ -292,4 +324,87 @@ describe('pr-land lane publish remote-tip check', () => {
     expect(result.plan.some(line => line.startsWith('push skipped'))).toBe(false);
     expect(pushes(effects)).toEqual([]);
   });
+});
+
+// Real local git (temp bare repositories, no network): the publish step's remote reads, ancestry check and push
+// run for real, so these prove what git itself does with pushurl, GIT_CONFIG and a shallow clone.
+describe('pr-land lane publish against real local remotes', () => {
+  const ref = 'refs/heads/lane/preflight';
+  const baseEnv = Object.fromEntries(Object.entries(process.env).filter(([k]) => !k.startsWith('GIT_')));
+  const gitEnv = { ...baseEnv, GIT_CONFIG_GLOBAL: '/dev/null', GIT_CONFIG_NOSYSTEM: '1', GIT_TERMINAL_PROMPT: '0',
+    GIT_AUTHOR_NAME: 't', GIT_AUTHOR_EMAIL: 't@example.test', GIT_COMMITTER_NAME: 't', GIT_COMMITTER_EMAIL: 't@example.test' };
+  const git = (cwd, ...args) => {
+    const r = spawnSync('git', args, { cwd, env: gitEnv, encoding: 'utf8' });
+    if (r.status !== 0) throw new Error(`git ${args.join(' ')}: ${r.stderr}`);
+    return r.stdout.trim();
+  };
+  const commit = (repo, name) => { writeFileSync(join(repo, name), name); git(repo, 'add', name); git(repo, 'commit', '-qm', name); return git(repo, 'rev-parse', 'HEAD'); };
+  const tipOf = (bare) => spawnSync('git', ['rev-parse', '--verify', '-q', ref], { cwd: bare, env: gitEnv, encoding: 'utf8' }).stdout.trim();
+  const withRepos = fn => {
+    const root = mkdtempSync(join(tmpdir(), 'pr-land-realgit-'));
+    try {
+      const upstream = join(root, 'upstream.git'), forkRepo = join(root, 'fork.git'), other = join(root, 'other');
+      git(root, 'init', '-q', '--bare', upstream); git(root, 'init', '-q', '--bare', forkRepo);
+      git(root, 'init', '-q', other);
+      const unrelated = commit(other, 'unrelated'); // commit B: no shared history with the work repo
+      git(other, 'push', '-q', upstream, `HEAD:${ref}`);
+      return fn({ root, upstream, forkRepo, other, unrelated });
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  };
+  const publishReal = (repo, sha, env = {}) => run({ check: false, count: 0, sha, realGit: { repo, env: { ...gitEnv, ...env } } });
+  const refuseHook = repo => { const hook = join(repo, '.git', 'hooks', 'pre-push'); writeFileSync(hook, '#!/bin/sh\necho "fixture pre-push refuses" >&2\nexit 1\n', { mode: 0o755 }); };
+
+  it('origin.url=upstream (lane/preflight at unrelated B), origin.pushurl=fork without it: pushes to the fork, no exit 3', () => withRepos(({ root, upstream, forkRepo, unrelated }) => {
+    const work = join(root, 'work'); git(root, 'init', '-q', work);
+    const sha = commit(work, 'a');
+    git(work, 'remote', 'add', 'origin', upstream); git(work, 'config', 'remote.origin.pushurl', forkRepo);
+    git(work, 'fetch', '-q', 'origin', ref); // B is present locally, so a fetch-side ancestry check would say "not an ancestor"
+    const { status, result, effects } = publishReal(work, sha);
+    expect(result.reason).not.toBe('push-failed');
+    expect(status).toBe(0);
+    expect(tipOf(forkRepo)).toBe(sha);
+    expect(tipOf(upstream)).toBe(unrelated);
+    expect(effects.some(([cmd]) => cmd === 'create')).toBe(true);
+  }));
+
+  it('origin.pushurl=fork already at HEAD: the push-URL read skips the push (a refusing pre-push hook is never run)', () => withRepos(({ root, upstream, forkRepo }) => {
+    const work = join(root, 'work'); git(root, 'init', '-q', work);
+    const sha = commit(work, 'a');
+    git(work, 'push', '-q', forkRepo, `HEAD:${ref}`);
+    git(work, 'remote', 'add', 'origin', upstream); git(work, 'config', 'remote.origin.pushurl', forkRepo);
+    refuseHook(work);
+    const { status, stderr, effects } = publishReal(work, sha);
+    expect(stderr).toContain(`push skipped: origin already at ${sha}`);
+    expect(status).toBe(0);
+    expect(effects.some(([cmd]) => cmd === 'create')).toBe(true);
+  }));
+
+  // `git config` honours GIT_CONFIG but `git push` does not: the decision must follow the real push target.
+  it('GIT_CONFIG naming a different pushurl does not change the push target read (isolation)', () => withRepos(({ root, upstream, forkRepo }) => {
+    const work = join(root, 'work'); git(root, 'init', '-q', work);
+    const sha = commit(work, 'a');
+    git(work, 'remote', 'add', 'origin', upstream);
+    git(work, 'push', '-q', 'origin', `HEAD:${ref}`, '--force'); // upstream (the real push target) already at HEAD
+    const override = join(root, 'override.gitconfig');
+    writeFileSync(override, `[remote "origin"]\n\tpushurl = ${forkRepo}\n`);
+    refuseHook(work);
+    const { status, stderr, effects } = publishReal(work, sha, { GIT_CONFIG: override });
+    expect(effects.some(([cmd, args]) => cmd === 'git' && args[0] === 'ls-remote' && args.includes(forkRepo))).toBe(false);
+    expect(stderr).toContain(`push skipped: origin already at ${sha}`);
+    expect(status).toBe(0);
+    expect(tipOf(forkRepo)).toBe('');
+  }));
+
+  it('a shallow clone with origin behind (tip object missing locally) still publishes; the server validates', () => withRepos(({ root, upstream }) => {
+    const seed = join(root, 'seed'); git(root, 'init', '-q', seed);
+    const old = commit(seed, 'c1'); commit(seed, 'c2'); const head = commit(seed, 'c3');
+    git(seed, 'push', '-q', upstream, `${old}:${ref}`, '--force'); git(seed, 'push', '-q', upstream, 'HEAD:refs/heads/main');
+    const work = join(root, 'work');
+    git(root, 'clone', '-q', '--depth=1', '--branch=main', pathToFileURL(upstream).href, work);
+    expect(git(work, 'rev-parse', '--is-shallow-repository')).toBe('true');
+    const { status, result } = publishReal(work, head);
+    expect(result.reason).not.toBe('push-failed');
+    expect(status).toBe(0);
+    expect(tipOf(upstream)).toBe(head);
+  }));
 });

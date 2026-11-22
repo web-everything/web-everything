@@ -958,28 +958,34 @@ async function runCli() {
     return soakPrecheckAtOpen({ title: createParams.title, body: CREATE_BODY, files });
   }
 
-  // Read-only decision: does origin already hold exactly refSha at the lane ref? (shared by the dry-run preview and the real push step)
+  // Read-only decision: does the PUSH target already hold exactly refSha at the lane ref? (shared by the dry-run
+  // preview and the real push step). The tip is read from the URL the push goes to — `remote get-url --push`
+  // (pushurl if set, else url, after pushInsteadOf/insteadOf rewrites; it ignores a GIT_CONFIG override that
+  // only `git config` honours) — never from the remote NAME, which ls-remote resolves to the fetch URL. With no
+  // single, safe push URL (several URLs, an unreadable read, or one starting with "-" that ls-remote would parse
+  // as an option) nothing is read: no tip can skip or refuse, and the push runs. Any read failure means "no tip".
   function pushSkipDecision() {
     const remoteHeadRef = `refs/heads/${REF}`;
-    const remoteTipLine = tryGit(['ls-remote', REMOTE, remoteHeadRef]);
+    const validRefSha = /^[0-9a-f]{40}$/i.test(refSha);
+    let pushUrl = null;
+    try {
+      const pushUrls = gitC(['remote', 'get-url', '--push', '--all', REMOTE]).split('\n').map(s => s.trim()).filter(Boolean);
+      if (pushUrls.length === 1 && !pushUrls[0].startsWith('-')) pushUrl = pushUrls[0];
+    } catch { pushUrl = null; }
+    const remoteTipLine = pushUrl ? tryGit(['ls-remote', '--', pushUrl, remoteHeadRef]) : null;
     const remoteTipMatch = /^([0-9a-f]{40})\t([^\r\n]+)$/i.exec(remoteTipLine ?? '');
     const remoteTip = remoteTipMatch?.[2] === remoteHeadRef ? remoteTipMatch[1] : null;
-    const validRefSha = /^[0-9a-f]{40}$/i.test(refSha);
-    // ls-remote reads only the FIRST fetch URL, while push goes to every push URL (pushurl, pushInsteadOf,
-    // or several remote.<name>.url values). Skip only when git itself resolves exactly one fetch URL and
-    // exactly one, identical, push URL. `remote get-url` applies insteadOf/pushInsteadOf rewrites and ignores
-    // a GIT_CONFIG override that `git config` alone would honour. Any read failure fails closed (never skip).
-    let splitPushConfig;
-    try {
-      const urls = args => gitC(['remote', 'get-url', ...args, '--all', REMOTE]).split('\n').map(s => s.trim()).filter(Boolean);
-      const fetchUrls = urls([]), pushUrls = urls(['--push']);
-      splitPushConfig = !(fetchUrls.length === 1 && pushUrls.length === 1 && fetchUrls[0] === pushUrls[0]);
-    } catch { splitPushConfig = true; }
-    // The read tip describes the push destination only when both are the same single URL. Otherwise it can
-    // neither skip nor refuse the push; the non-force push itself enforces fast-forward on the real target.
-    const tipIsPushTarget = !splitPushConfig;
-    return { remoteTip, validRefSha, tipIsPushTarget,
-      alreadyPublished: validRefSha && remoteTip === refSha && tipIsPushTarget };
+    return { remoteTip, validRefSha, alreadyPublished: validRefSha && remoteTip !== null && remoteTip === refSha };
+  }
+
+  // Refuse before pushing ONLY on proof that the push target's tip is not an ancestor of refSha: merge-base exits
+  // exactly 1 in a clone git confirms is NOT shallow (past a shallow boundary merge-base can answer 1 falsely).
+  // A missing tip object (exit 128), a shallow or unreadable clone state, or any other failure proves nothing,
+  // so the guarded non-force push runs and the server validates fast-forward itself.
+  function provenNotAncestor(remoteTip) {
+    if (tryGit(['rev-parse', '--is-shallow-repository']) !== 'false') return false;
+    try { gitC(['merge-base', '--is-ancestor', remoteTip, refSha]); return false; }
+    catch (e) { return e?.status === 1; }
   }
 
   if (DRY_RUN) {
@@ -1152,15 +1158,12 @@ async function runCli() {
   // 2. Publish the source commit to the lane ref on origin (guard-safe: lane/*). Never force, no local branch.
   // Only an exact, readable remote tip can authorize skipping the guarded push.
   // Failed/malformed remote reads retain the normal push path and its pre-push guard.
-  const { remoteTip, validRefSha, tipIsPushTarget, alreadyPublished } = pushSkipDecision();
+  const { remoteTip, validRefSha, alreadyPublished } = pushSkipDecision();
   if (alreadyPublished) {
     process.stderr.write(`pr-land [${REPO}] · push skipped: ${REMOTE} already at ${refSha}\n`);
-  } else if (validRefSha && remoteTip && tipIsPushTarget) {
-    try { gitC(['merge-base', '--is-ancestor', remoteTip, refSha]); }
-    catch {
-      emit({ repo: REPO, merged: false, reason: 'push-failed',
-        detail: pushFailedDetail(`non-fast-forward: ${REMOTE}/${REF} (${remoteTip}) is ahead, diverged, or its ancestry cannot be verified`, { SRC, REF, REMOTE }) }, 3);
-    }
+  } else if (validRefSha && remoteTip && provenNotAncestor(remoteTip)) {
+    emit({ repo: REPO, merged: false, reason: 'push-failed',
+      detail: pushFailedDetail(`non-fast-forward: ${REMOTE}/${REF} (${remoteTip}) on the push target is ahead or diverged`, { SRC, REF, REMOTE }) }, 3);
   }
   try { if (!alreadyPublished) gitC(['push', REMOTE, `${refSha}:refs/heads/${REF}`]); }
   catch (e) { emit({ repo: REPO, merged: false, reason: 'push-failed', detail: pushFailedDetail(e.message || e, { SRC, REF, REMOTE }) }, 3); }
