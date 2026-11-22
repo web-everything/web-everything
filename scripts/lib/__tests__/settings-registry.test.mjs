@@ -223,11 +223,13 @@ test('per-key directory reconstructs exactly the original metadata JSON shape an
   assert.deepEqual(readMetadata({ root: f.root }), original);
   assert.deepEqual(f.build(), before);
 });
-test('migration preserves the registry built from the original repository metadata JSON', t => {
+test('migration preserves the original registry with the intentional drain policy description update', t => {
   const f = fixture(t);
   rmSync(join(f.root, 'scripts/settings/feature.json'));
   for (const row of buildRegistry().rows) for (const owner of row.owners) f.write(owner, JSON.parse(readFileSync(join(ROOT, owner), 'utf8')));
-  f.write(META, originalMetadata);
+  const expectedMetadata = structuredClone(originalMetadata);
+  expectedMetadata.settings.drain.description = 'Merge drain grouping and asynchronous facts shadow policy.';
+  f.write(META, expectedMetadata);
   assert.deepEqual(buildRegistry(), buildRegistry({ root: f.root }));
 });
 test('a new metadata key file alone adds a row without editing the base metadata', t => {
@@ -342,10 +344,16 @@ test('malformed names, unexpected entries and unreadable per-key JSON fail close
   assert.throws(() => renderMarkdown(f.build()), /settings-registry-metadata\.d\/settings\/broken.json/);
 });
 
-test('generated documentation preserves original bytes except the intentional per-key authoring instruction', () => {
+test('generated documentation preserves original bytes except the per-key instruction and removed drain retry policy', () => {
   const doc = readFileSync(join(ROOT, 'docs/agent/settings-registry.md'), 'utf8');
   const originalInstruction = 'For repo defaults, edit the owner file through a PR and rebuild the consuming daemon. Add or update metadata in scripts/lib/settings-registry-metadata.json, then run `node scripts/lib/settings-registry.mjs --write`. Verify with `node scripts/lib/settings-registry.mjs --check`. Missing declarations or invalid evidence block generation; repair the named file before regenerating.';
-  const original = doc.replace(/^For repo defaults,.*$/m, originalInstruction);
-  assert.equal(createHash('sha256').update(original).digest('hex'), '502cdfa13cdb8007e9f13933e229f0886cac688ea5d0973d3c787d0533f57d4a');
+  const original = doc.replace(/^For repo defaults,.*$/m, originalInstruction)
+    // Restore only the two inventory effects of deleting drain-mq-retry.json;
+    // keep the historical digest pinned so every other byte remains guarded.
+    .replace('- Declared leaves: 615 (platform copies counted separately).', '- Declared leaves: 618 (platform copies counted separately).')
+    .replace('| drain | scripts/settings/drain-async-shadow.json, scripts/settings/drain-card-group.json | 4 |',
+      '| drain | scripts/settings/drain-async-shadow.json, scripts/settings/drain-card-group.json, scripts/settings/drain-mq-retry.json | 7 |')
+    .replace('Merge drain grouping and asynchronous facts shadow policy.', originalMetadata.settings.drain.description);
+  assert.equal(createHash('sha256').update(original).digest('hex'), '239663dfb7c702b1f8cf475f1b8659d16fea92c2deaa92c027f3a67f5106cc8d');
   execFileSync(process.execPath, [join(ROOT, 'scripts/lib/settings-registry.mjs'), '--check']);
 });

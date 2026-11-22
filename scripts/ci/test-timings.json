@@ -270,7 +270,6 @@
   "scripts/__tests__/merge-ai-prs-merge-failure-isolation.test.mjs": 33.28,
   "scripts/__tests__/merge-ai-prs-merge-queue-hook-wiring.test.mjs": 247.81,
   "scripts/__tests__/merge-ai-prs-merge-trace-post-confirm.test.mjs": 0.02,
-  "scripts/__tests__/merge-ai-prs-mq-fixer-route.test.mjs": 0.01,
   "scripts/__tests__/merge-ai-prs-net-diff-computation.test.mjs": 9.64,
   "scripts/__tests__/merge-ai-prs-one-repo-listing-fails.test.mjs": 42.12,
   "scripts/__tests__/merge-ai-prs-overlap-yield.test.mjs": 0.05,
@@ -2431,7 +2430,6 @@
   "scripts/conveyor/soak/breaks/rebuild-held-recovery.soak.test.mjs": 1,
   "scripts/conveyor/soak/breaks/rebuild-evidence-compatibility.soak.test.mjs": 1,
   "scripts/conveyor/soak/breaks/mq-unreadable-log-single-retry.soak.test.mjs": 1,
-  "scripts/conveyor/soak/breaks/mq-same-head-unexecuted-refresh-retry.soak.test.mjs": 1,
   "scripts/conveyor/soak/breaks/drain-mq-log-reader-escape-sequences.soak.test.mjs": 1
  },
  "integration": {}
