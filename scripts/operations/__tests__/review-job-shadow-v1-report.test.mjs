@@ -129,7 +129,21 @@ describe('S1 full-step evidence', () => {
     expect(rows(logFile())[0].predicate.agreement).toBe(false);
   });
 
-  it.each([{ extra: 1 }, { attempt: 2 }])('a Step with an extra field %j is refused as a disagreement', async extra => {
+  const attemptPlan = (engine, planAttempt) => (flow, p) => engine.plan(flow, { ...p, attempt: 1, parts: { ...p.parts, Visit: '1.1' } })
+    .map(s => ({ ...s, key: s.key.replace(/\.1$/, `.${planAttempt}`), attempt: planAttempt }));
+  it.each([[2, 2, true], [2, 3, false], [2, 1, false]])('actual attempt %i vs planned attempt %i agrees=%s through the key only', async (actualAttempt, planAttempt, agree) => {
+    runReport(flags);
+    const real = await vi.importActual('../../lib/flow-engine/shadow.mjs');
+    const engine = await import('../../lib/flow-engine/index.mjs');
+    await real.shadowReviewStep({ repo: flags.repo, pr: flags.pr, session: flags.session,
+      classified: { ...flags, loopOutcome: flags.verdict, attempt: actualAttempt } }, {
+      readSetting, log: () => {}, engine: { ...engine, plan: attemptPlan(engine, planAttempt) },
+    });
+    expect(rows(logFile())[0].predicate.agreement).toBe(agree);
+    if (!agree) expect(JSON.parse(rows(logFile() + '.findings.jsonl')[0].actual).key).toBe(`review:o%2Fr%237:1.${actualAttempt}`);
+  });
+
+  it.each([{ extra: 1 }])('a Step with an extra field %j is refused as a disagreement', async extra => {
     runReport(flags);
     const real = await vi.importActual('../../lib/flow-engine/shadow.mjs');
     const engine = await import('../../lib/flow-engine/index.mjs');

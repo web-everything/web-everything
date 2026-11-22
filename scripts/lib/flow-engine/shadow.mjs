@@ -110,17 +110,18 @@ export async function shadowReviewStep({ repo, pr, classified, session, completi
     if (records.some(r => r.predicate.inputs.includes(input) && r.predicate.runId === (classified?.runId ?? 'unknown') && r.predicate.completionAt === completion.endedAt)) throw Error('completion already observed; skipped');
     const flow = engine.load(definition);
     const outcome = completion.outcome === 'auto-cleared' && completion.verdict === 'converged' ? 'accept' : completion.outcome === 'bounced' ? 'continue' : 'unknown';
-    const projection = { flowDigest: flow.digest, seq: records.length, records, event: 'done', outcome, parts: { Subject: `${repo}#${pr}`, Visit: `${seq}.1` } };
+    const attempt = Number.isSafeInteger(classified?.attempt) && classified.attempt >= 1 ? classified.attempt : 1;
+    const projection = { flowDigest: flow.digest, seq: records.length, records, event: 'done', outcome, parts: { Subject: `${repo}#${pr}`, Visit: `${seq}.${attempt}` }, attempt };
     const ctx = { repo, pr, head, netDiff, round: classified?.round ?? 'unknown', runId: classified?.runId ?? 'unknown', seq, at: stamp, executorCommit: executorCommit(), inputs: [input] };
     const steps = engine.plan(flow, projection);
     const actualOutcome = classified?.outcome === 'auto-cleared' && classified.loopOutcome === 'converged' ? 'accept' : classified?.outcome === 'bounced' ? 'continue' : null;
     // The declared Visit key part carries this visit's attempt (the review subset permits one).
     const actual = { from: 'judge-convergence', event: 'done', guard: 'convergence', outcome: actualOutcome,
       route: actualOutcome ? 'advance' : null, to: actualOutcome === 'accept' ? 'accepted' : actualOutcome === 'continue' ? 'judge-convergence' : null,
-      key: `review:${encodeURIComponent(`${repo}#${pr}`)}:${seq}.1` };
-    // Exactly seven fields. `attempt` is folded into the key (Visit part), so the engine's attempt field is dropped
-    // only when it is 1; any other extra field stays and makes the canonical forms differ (a disagreement).
-    const fullStep = ({ attempt, ...rest }) => (attempt === undefined || attempt === 1 ? rest : { ...rest, attempt });
+      key: `review:${encodeURIComponent(`${repo}#${pr}`)}:${seq}.${attempt}` };
+    // Exactly seven fields. `attempt` is folded into the key (`<seq>.<attempt>`) for every value on both sides and is
+    // never a field, so an attempt mismatch reads as disagree through the key; any other extra field also differs.
+    const fullStep = ({ attempt: _folded, ...rest }) => rest;
     const planned = steps.map(fullStep);
     const agreement = steps.length === 1 && comparePlans(planned[0], actual).equal;
     note(`flow-v0 shadow ${canonicalJSON({ repo, pr, seq, steps: planned, actual, agreement })}`);
