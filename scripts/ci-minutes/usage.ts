@@ -1,5 +1,6 @@
 type FeedState = 'fresh' | 'stale' | 'error';
 type Summary = {
+  state: 'fresh';
   org: string;
   cycle: string;
   usedMinutes: number;
@@ -38,10 +39,11 @@ export function parseUsageSummary(
   }
   let usedMinutes = 0;
   for (const item of json.usageItems) {
-    if (!record(item)) return error();
-    if (item.product !== 'actions' || item.unitType !== 'Minutes') continue;
-    const discount = item.discountQuantity ?? 0;
-    const net = item.netQuantity ?? 0;
+    if (!record(item) || typeof item.product !== 'string'
+      || typeof item.unitType !== 'string') return error();
+    if (item.product !== 'actions' || item.unitType.toLowerCase() !== 'minutes') continue;
+    const discount = item.discountQuantity;
+    const net = item.netQuantity;
     if (!nonnegative(discount) || !nonnegative(net)) return error();
     // Multiplier (2x Windows, 10x macOS) is UNCONFIRMED. The fixture is synthetic;
     // a live check against one real response is owed in S2.1. Do not multiply here.
@@ -50,6 +52,7 @@ export function parseUsageSummary(
   const pct = (usedMinutes / includedMinutes) * 100;
   if (!Number.isFinite(usedMinutes) || !Number.isFinite(pct)) return error();
   return {
+    state: 'fresh',
     org: json.organization, cycle: `${year}-${String(month).padStart(2, '0')}`,
     usedMinutes, includedMinutes, pct,
   };
@@ -82,7 +85,7 @@ export function evaluateThresholds(reading: Reading, firedKeys: string[]): {
     lines.push(line);
   };
   // Feed state takes precedence even if a caller accidentally supplies cached pct.
-  if ((state !== undefined && state !== 'fresh') || !nonnegative(pct)
+  if (state !== 'fresh' || !nonnegative(pct)
     || !nonnegative(includedMinutes) || includedMinutes === 0) {
     emit('stale', 'CI minutes feed stale >6h');
   } else {

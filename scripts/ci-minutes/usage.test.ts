@@ -47,25 +47,51 @@ describe('fixture', () => {
 
 describe('usage', () => {
   const summary = JSON.parse(fixtureText);
-  const reading = { org: 'web-everything', cycle: '2026-11', includedMinutes: 50000, pct: 82 };
+  const reading = { org: 'web-everything', cycle: '2026-11', includedMinutes: 50000,
+    pct: 82, state: 'fresh' as const };
 
   it('parser totals 4600 minutes on the fixture', () => {
     expect(parseUsageSummary(summary, { includedMinutes: 50000 })).toEqual({
       org: 'web-everything', cycle: '2026-11', usedMinutes: 4600,
-      includedMinutes: 50000, pct: 9.2,
+      includedMinutes: 50000, pct: 9.2, state: 'fresh',
     });
   });
 
-  it('tolerates missing numeric fields and ignores unrelated items', () => {
+  it('errors on missing or null quantities on Actions minutes rows', () => {
+    for (const quantities of [
+      {}, { discountQuantity: 20 }, { netQuantity: 10 },
+      { discountQuantity: undefined, netQuantity: 10 },
+      { discountQuantity: 20, netQuantity: undefined },
+      { discountQuantity: null, netQuantity: 10 },
+      { discountQuantity: 20, netQuantity: null },
+    ]) {
+      expect(parseUsageSummary({ ...summary, usageItems: [
+        { product: 'actions', unitType: 'Minutes', ...quantities },
+      ] }, { includedMinutes: 100 })).toEqual({ state: 'error', pct: null });
+    }
+  });
+
+  it('matches minutes case-insensitively and allows unrelated rows without quantities', () => {
     const usageItems = [
-      { product: 'actions', unitType: 'Minutes', discountQuantity: 20 },
-      { product: 'actions', unitType: 'Minutes', netQuantity: 10 },
-      { product: 'actions', unitType: 'Minutes' }, {},
-      { product: 'copilot', unitType: 'Minutes', netQuantity: 999 },
-      { product: 'actions', unitType: 'GigabyteHours', netQuantity: 999 },
+      { product: 'actions', unitType: 'minutes', discountQuantity: 20, netQuantity: 0 },
+      { product: 'actions', unitType: 'MINUTES', discountQuantity: 0, netQuantity: 10 },
+      { product: 'copilot', unitType: 'Minutes' },
+      { product: 'actions', unitType: 'GigabyteHours' },
     ];
     expect(parseUsageSummary({ ...summary, usageItems }, { includedMinutes: 100 }))
-      .toMatchObject({ usedMinutes: 30, pct: 30 });
+      .toMatchObject({ state: 'fresh', usedMinutes: 30, pct: 30 });
+  });
+
+  it('fails closed on every malformed usage row, including unrelated rows', () => {
+    for (const item of [null, undefined, [], 'actions', 3, {},
+      { product: 'actions' }, { unitType: 'Minutes' },
+      { product: null, unitType: 'Minutes' }, { product: 3, unitType: 'Minutes' },
+      { product: 'copilot', unitType: null }, { product: 'copilot', unitType: 3 }]) {
+      expect(parseUsageSummary({ ...summary, usageItems: [
+        { product: 'actions', unitType: 'Minutes', discountQuantity: 20, netQuantity: 10 },
+        item,
+      ] }, { includedMinutes: 100 })).toEqual({ state: 'error', pct: null });
+    }
   });
 
   it('fails closed on missing or invalid summary identity, period, or usageItems', () => {
@@ -80,10 +106,13 @@ describe('usage', () => {
   });
 
   it('rejects invalid quantities, overflowing totals, and unusable allowances', () => {
-    for (const quantity of [-1, '3', NaN, Infinity]) {
-      expect(parseUsageSummary({ ...summary, usageItems: [
-        { product: 'actions', unitType: 'Minutes', netQuantity: quantity },
-      ] }, { includedMinutes: 100 })).toMatchObject({ state: 'error', pct: null });
+    for (const quantity of [-1, '3', NaN, Infinity, -Infinity]) {
+      for (const field of ['discountQuantity', 'netQuantity']) {
+        expect(parseUsageSummary({ ...summary, usageItems: [
+          { product: 'actions', unitType: 'minutes', discountQuantity: 0,
+            netQuantity: 0, [field]: quantity },
+        ] }, { includedMinutes: 100 })).toMatchObject({ state: 'error', pct: null });
+      }
     }
     for (const includedMinutes of [0, -1, NaN, Infinity, Number.MIN_VALUE]) {
       expect(parseUsageSummary(summary, { includedMinutes }))
@@ -114,6 +143,15 @@ describe('usage', () => {
       'ci-min:web-everything:80:2026-12', 'ci-min:web-everything:95:2026-12',
     ]);
     expect(evaluateThresholds({ ...reading, pct: 80 }, []).lines).toHaveLength(1);
+  });
+
+  it('a reading without explicit state warns and never emits percentage lines', () => {
+    const { state, ...withoutState } = reading;
+    const first = evaluateThresholds({ ...withoutState, pct: 99 }, []);
+    expect(first).toEqual({ lines: ['CI minutes feed stale >6h'],
+      firedKeys: ['ci-min:web-everything:stale:2026-11'] });
+    expect(evaluateThresholds({ ...reading, state: undefined }, []).lines).toEqual(first.lines);
+    expect(evaluateThresholds(withoutState, first.firedKeys).lines).toEqual([]);
   });
 
   it('stale and failed feeds have null pct, warn once per cycle, and never report percentages', () => {
