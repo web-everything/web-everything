@@ -7,7 +7,8 @@ import { gitRun } from '../../main-staleness.mjs';
 import { clearOverlayConflictWake, readOverlayConflictWakes } from '../../overlay-conflict-wake.mjs';
 import { readMainSyncConflicts } from '../overlay-main-sync.mjs';
 import { overlayFilePath } from '../../daemon-overlays.mjs';
-import { readRebuildStateStrict, rebuildStatePath } from '../state.mjs';
+import { readRebuildStateStrict, rebuildStatePath, readReadyCandidate, writeReadyCandidate } from '../state.mjs';
+import { SMOKE_CHECKS } from '../../daemon-live-smoke.mjs';
 import { createSetAsideFixture, probeRebuildSetAside } from '../../../conveyor/soak/fixtures/rebuild-set-aside-probe.mjs';
 
 // Negative cases come first: the new policy must retain the old refusal/hold protections.
@@ -302,7 +303,7 @@ it('refuses adoption if an omitted overlay becomes pinned during smoke', async (
       const list = JSON.parse(readFileSync(path, 'utf8'));
       list.overlays.find(o => o.ref === f.ref).pinned = true;
       writeFileSync(path, JSON.stringify(list));
-      return { verdict: 'pass', attempts: 1, smoke: { results: [] } };
+      return { verdict: 'pass', attempts: 1, smoke: { results: SMOKE_CHECKS.map(({ name }) => ({ name, ok: true })) } };
     } });
     expect(result.adopted).not.toBe(true);
     expect(result.reason).toBe('established-overlay-conflict');
@@ -404,7 +405,7 @@ it.each([false, true])('omitted registered pin blocks normal adoption but permit
   const f = await createSetAsideFixture({ pinned: true });
   try {
     const result = await finalizeRebuild({ root: f.root, env: f.env, run: gitRun, now: Date.now,
-      prevHead: f.head(), lease: { token: rollback ? 'force-adopt-rollback' : 'normal' },
+      prevHead: f.head(), lease: { token: rollback ? 'force-adopt-rollback' : 'normal' }, freshSmoke: f.main,
       plan: { ok: true, finalSha: f.main, mainSha: f.main, inputsKey: 'rollback-test', applied: [], decisions: [] } });
     if (rollback) {
       expect(result.adopted).toBe(true);
@@ -426,5 +427,58 @@ it('a set-aside never takes the skip-unrelated adopt path: candidate smoke is fo
     expect(skipCheck).not.toHaveBeenCalled();
     expect(result.result?.skippedSmoke).not.toBe(true);
     expect(result.terminal).toBe(false);
+  } finally { f.cleanup(); }
+}, 60_000);
+
+it('strictAdopt direct finalize refuses a set-aside without fresh smoke and keeps HEAD', async () => {
+  const f = await createSetAsideFixture();
+  try {
+    const before = f.head(), adopted = f.state().adopted;
+    const job = await f.rebuild({ readyOnly: true });
+    expect(job.reason).toBe('ready-recorded');
+    expect(job.plan.decisions.some(d => d.setAside)).toBe(true);
+    const result = await finalizeRebuild({ root: f.root, env: f.env, run: gitRun, now: Date.now,
+      plan: job.plan, prevHead: before, lease: { token: 'normal' } });
+    expect(result).toMatchObject({ moved: false, reason: 'strict-adopt-needs-fresh-smoke' });
+    expect(f.head()).toBe(before);
+    expect(f.state().adopted).toEqual(adopted);
+    expect(readReadyCandidate(f.root, f.env)).toBeNull();
+  } finally { f.cleanup(); }
+}, 60_000);
+
+it('strictAdopt ready reuse refuses a strict candidate without its fresh smoke mark', async () => {
+  const f = await createSetAsideFixture();
+  try {
+    const before = f.head(), adopted = f.state().adopted;
+    const job = await f.rebuild({ readyOnly: true });
+    expect(job.reason).toBe('ready-recorded');
+    const ready = readReadyCandidate(f.root, f.env);
+    expect(ready).toMatchObject({ strictAdopt: true, freshSmoke: job.plan.finalSha });
+    delete ready.freshSmoke; // A persisted ready verdict alone cannot prove a complete fresh smoke.
+    expect(writeReadyCandidate(f.root, ready, f.env)).toBe(true);
+    const result = await prepareRebuild({ root: f.root, env: f.env, run: gitRun, now: Date.now,
+      prState: async () => 'OPEN' });
+    expect(result).toMatchObject({ terminal: true,
+      result: { moved: false, reason: 'strict-adopt-needs-fresh-smoke' } });
+    expect(result.alerts.some(a => a.kind === 'ready-candidate-adopted')).toBe(true);
+    expect(f.head()).toBe(before);
+    expect(f.state().adopted).toEqual(adopted);
+    expect(readReadyCandidate(f.root, f.env)).toBeNull();
+  } finally { f.cleanup(); }
+}, 60_000);
+
+it('strictAdopt rollback exemption restores last-good even for a set-aside plan without fresh smoke', async () => {
+  const f = await createSetAsideFixture();
+  try {
+    const lastGood = f.head(), adopted = f.state().adopted;
+    const job = await f.rebuild({ readyOnly: true });
+    expect(job.reason).toBe('ready-recorded');
+    expect(job.plan.decisions.some(d => d.setAside)).toBe(true);
+    expect(f.git(['reset', '--hard', job.plan.finalSha]).status).toBe(0);
+    const result = await finalizeRebuild({ root: f.root, env: f.env, run: gitRun, now: Date.now,
+      plan: { ...job.plan, finalSha: lastGood, applied: adopted.applied },
+      prevHead: job.plan.finalSha, lease: { token: 'force-adopt-rollback' } });
+    expect(result).toMatchObject({ moved: true, adopted: true });
+    expect(f.head()).toBe(lastGood);
   } finally { f.cleanup(); }
 }, 60_000);

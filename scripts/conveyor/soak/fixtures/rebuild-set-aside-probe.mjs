@@ -7,6 +7,7 @@ import { rebuildClone, readRebuildState } from '../../../lib/daemon-rebuild.mjs'
 import { runOverlayMainSync } from '../../../lib/daemon-rebuild/overlay-main-sync.mjs';
 import { addOverlay, readOverlays, overlayFilePath } from '../../../lib/daemon-overlays.mjs';
 import { writeRebuildState, alertsFilePath } from '../../../lib/daemon-rebuild/state.mjs';
+import { SMOKE_CHECKS } from '../../../lib/daemon-live-smoke.mjs';
 
 export async function createSetAsideFixture({ pinned = false, guard = false, audited = false, sibling = false, pr = null } = {}) {
   const base = mkdtempSync(join(tmpdir(), 'rebuild-set-aside-'));
@@ -27,7 +28,8 @@ export async function createSetAsideFixture({ pinned = false, guard = false, aud
   const commit = (cwd, message) => { git(cwd, ['add', '-A']); git(cwd, ['commit', '-qm', message]); };
   const ref = 'lane/set-aside', file = guard ? 'scripts/lib/daemon-rebuild.mjs' : 'worker.mjs';
   const rebuild = (options = {}) => rebuildClone({ root, env, prState: async () => 'OPEN', prBaseChain: async () => null,
-    runSmoke: async () => ({ verdict: 'pass', attempts: 1, smoke: { results: [] } }), log: { error() {} }, ...options });
+    runSmoke: async () => ({ verdict: 'pass', attempts: 1,
+      smoke: { results: SMOKE_CHECKS.map(({ name }) => ({ name, ok: true })) } }), log: { error() {} }, ...options });
   const cleanup = () => rmSync(base, { recursive: true, force: true });
   try {
     git(base, ['init', '--bare', '-q', origin]);

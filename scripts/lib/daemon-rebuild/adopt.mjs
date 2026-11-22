@@ -5,7 +5,7 @@
 import { mkdirSync, appendFileSync } from 'node:fs';
 import { dirname } from 'node:path';
 import { hostname } from 'node:os';
-import { pinnedStatus } from './plan.mjs';
+import { pinnedStatus, planStrictAdopt } from './plan.mjs';
 import { removeOverlay, appendOverlayEvent, readOverlayState } from '../daemon-overlays.mjs';
 import { alertsFilePath, readRebuildState, writeRebuildState, clearReadyCandidate, appliedShape } from './state.mjs';
 import { verifyRev, makeGit } from './shared.mjs';
@@ -444,6 +444,7 @@ export async function finalizeRebuild(options) {
 
 async function finalizeRebuildLocked({
   root, env, log, run, stateOpts, now, plan, prevHead, lease, onAdopted, auditedTip = null, readyPassedAt,
+  strictAdopt = false, freshSmoke = null,
 }) {
   const stEnv = { ...env, ...(stateOpts?.env || {}) };
   const git = makeGit({ run, cwd: root, env });
@@ -501,6 +502,16 @@ async function finalizeRebuildLocked({
   const appliedKey = (list) => JSON.stringify((list ?? []).map((a) => [a.ref, a.sha]).sort());
   // The health-watch rollback to last-good only reverts HEAD; it never touches registrations, so it is never blocked.
   const isRollback = lease?.token === 'force-adopt-rollback';
+  // THE strictAdopt gate: the one last step before the swap that every adoption path (normal, reuse/ready, fallback,
+  // force, skip-unrelated) goes through. An omission/set-aside build is adopted only on a fresh complete smoke pass of
+  // THIS candidate (`freshSmoke` is set only by smoke.mjs from a completeSmokePass of this run, never a cached/ready
+  // verdict without that mark). The only exception is the health watch's rollback to last-good.
+  const strict = strictAdopt === true || planStrictAdopt(plan);
+  if (strict && !isRollback && freshSmoke !== plan.finalSha) {
+    alert('strict-adopt-refused', { target: plan.finalSha, message: 'a build that omits or sets aside an overlay is adopted only on a fresh complete smoke pass of this candidate; keeping last-good' });
+    clearReadyCandidate(root, stEnv);
+    return terminal({ moved: false, reason: 'strict-adopt-needs-fresh-smoke', plan });
+  }
   if (dropsPending && !isRollback && appliedKey(plan.applied) !== appliedKey(state.adopted?.applied)) {
     alert('drop-pending-unsettled', { target: plan.finalSha });
     return terminal({ moved: false, reason: 'drop-pending-unsettled', plan });

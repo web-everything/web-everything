@@ -772,6 +772,8 @@ export async function prepareRebuild({
           plan: m.adopt,
           prevHead,
           lease: { token: ready.token ?? null },
+          strictAdopt: ready.strictAdopt === true || planStrictAdopt(plan),
+          freshSmoke: typeof ready.freshSmoke === 'string' ? ready.freshSmoke : null,
           onAdopted: m.dropRefs.length
             ? ({ alert: finAlert }) => dropSuspectOverlays({
               root, env, suspects: m.dropRefs, failed: m.failed, alert: finAlert,

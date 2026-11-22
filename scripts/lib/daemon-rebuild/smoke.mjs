@@ -633,8 +633,13 @@ export async function smokeAndAdopt({
       const recorded = await locked((st) => { st.forceUnverifiedTrees = [tree, ...(st.forceUnverifiedTrees || []).filter((t) => t !== tree)].slice(0, 5); });
       if (!recorded) throw new Error('adopted over a failed smoke: could not record it as unverified (write lock refused)');
     }
+    // strictAdopt: the fresh-smoke mark rides the ready record so a deferred adoption can prove its smoke was complete.
+    const strictBuild = planStrictAdopt(p) || planStrictAdopt(plan);
+    const freshSmoke = !overFailedSmoke && readyMeta?.forced !== true && completeSmokePass(smokeResult) ? p.finalSha : null;
     writeReadyCandidate(root, {
       ...readyMeta,
+      strictAdopt: strictBuild,
+      freshSmoke,
       prevHead,
       tree: verifyRev(git, `${p.finalSha}^{tree}`),
       adopt: {
@@ -662,7 +667,7 @@ export async function smokeAndAdopt({
       };
     }
     const fin = await withWriteLock(root, () => finalizeRebuild({
-      root, env, log, run, stateOpts, now, plan: p, prevHead, lease, onAdopted,
+      root, env, log, run, stateOpts, now, plan: p, prevHead, lease, onAdopted, strictAdopt: strictBuild, freshSmoke,
       auditedTip: makeAuditedTipGate(env), // unaudited-tip: evidence revoked during the smoke must not be adopted
     }), finalizeLockOpts);
     if (!fin.ok) {
