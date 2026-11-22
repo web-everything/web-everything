@@ -1,4 +1,5 @@
 ---
+bornAs: xn4er4k
 kind: story
 size: 3
 status: open
@@ -7,9 +8,9 @@ dateOpened: "2026-11-22"
 tags: []
 ---
 
-# PD-FUI-6 Rung navigation (we-rung-nav)
+# PD-FUI-4 Detail sheet (we-detail-sheet)
 
-Frontier UI block we-rung-nav (blocks/rung-nav); needed by every rung, PD-LADSET and the DZ-SHELL breadcrumb; independent of FUI-1 to 5. Acceptance: breadcrumb that follows the ladder (Plan, Stream, Feature, PR) plus a rung switch (segmented control on desktop, menu on phone); rungs come from data (the ladder setting, preset B, D15 cascade), hard-coded rungs are a test failure; each rung has a hash link; Esc and browser Back go up one rung. Tier-1 test: renders the rungs from the ladder setting; selecting a rung updates the hash; Back returns to the previous rung.
+Frontier UI block we-detail-sheet (blocks/detail-sheet): composes master-detail + layout. Acceptance: opens on selection, moves focus into the sheet, closes on Esc and returns focus; selection comes from SelectionBehavior; aria-labelledby from its title; right drawer above 640 px and bottom sheet below (container query, not viewport guess; supersedes the 700 px figure); v1 modal on both with scrim, focus kept inside, Esc and browser Back close it, each step has a #step-id link. Non-modal desktop drawer is a later refinement. Tier-1 test: opens on selection, moves focus into the sheet, closes on Esc and returns focus. Max 300 non-test lines.
 
 ## Acceptance
 

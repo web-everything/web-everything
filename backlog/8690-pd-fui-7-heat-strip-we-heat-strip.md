@@ -1,15 +1,17 @@
 ---
+bornAs: xnpd8wr
 kind: story
 size: 3
 status: open
+blockedBy: ["8689"]
 scope: ["fui:blocks/"]
 dateOpened: "2026-11-22"
 tags: []
 ---
 
-# PD-FUI-4 Detail sheet (we-detail-sheet)
+# PD-FUI-7 Heat strip (we-heat-strip)
 
-Frontier UI block we-detail-sheet (blocks/detail-sheet): composes master-detail + layout. Acceptance: opens on selection, moves focus into the sheet, closes on Esc and returns focus; selection comes from SelectionBehavior; aria-labelledby from its title; right drawer above 640 px and bottom sheet below (container query, not viewport guess; supersedes the 700 px figure); v1 modal on both with scrim, focus kept inside, Esc and browser Back close it, each step has a #step-id link. Non-modal desktop drawer is a later refinement. Tier-1 test: opens on selection, moves focus into the sheet, closes on Esc and returns focus. Max 300 non-test lines.
+Frontier UI block we-heat-strip (blocks/heat-strip) for the project rung (PD-PROJ, P1, later); needs PD-FUI-1. Acceptance: one thin strip per machine on the shared time axis; colour = busy percent against that machine's own target (calm under, warm near, hot over); colour never the only carrier: hover or focus gives text like Studio 82% of 75% target; hot cells have a pattern-free outline; no hatching (reserved for forecast). Tier-1 test: maps busy/target to calm, warm or hot and exposes the value as text on focus.
 
 ## Acceptance
 

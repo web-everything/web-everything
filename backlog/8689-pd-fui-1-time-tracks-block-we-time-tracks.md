@@ -1,16 +1,16 @@
 ---
+bornAs: xrf4ker
 kind: story
-size: 3
+size: 5
 status: open
-blockedBy: ["xrf4ker"]
 scope: ["fui:blocks/"]
 dateOpened: "2026-11-22"
 tags: []
 ---
 
-# PD-FUI-2 Milestone flags (we-milestone-flag)
+# PD-FUI-1 Time tracks block (we-time-tracks)
 
-Frontier UI block we-milestone-flag (child of we-time-tracks; needs PD-FUI-1). Acceptance: selecting a flag shows its window in place; ] selects next flag and [ the previous; one flag selected at a time; Esc or tapping the flag again clears; window opens in place, not a modal; the axis does not zoom; other flags dim. Accessible name = milestone name plus a relative window (in 3-9 days or window unknown); a calendar date only when the FCST-6 date policy allows it (default off). Dense flags de-fan (stack or offset) at 390 px with a test. Tier-1 test: selecting a flag shows its window in place; ] selects the next flag and [ the previous. Needs Time Marker intent entry. Max 300 non-test lines.
+Frontier UI block we-time-tracks (blocks/time-tracks). Acceptance: lanes keep order; same time maps to same x; today marker splits past and a forecast slot; Up/Down moves focus lane to lane; no hex colours and no @keyframes. Tier-1 test: stacks lanes on one shared axis and places an item by its time. Needs Time Track intent entry. Max 300 non-test lines.
 
 ## Acceptance
 
@@ -38,4 +38,4 @@ One line per class: either the handling, or `n/a: <why>`.
 
 ## Duplicate admission
 
-new PD-FUI card
+new card for the PD-FUI plan; none filed yet

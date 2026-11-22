@@ -1,15 +1,17 @@
 ---
+bornAs: xr0qe34
 kind: story
-size: 2
+size: 3
 status: open
+blockedBy: ["8689"]
 scope: ["fui:blocks/"]
 dateOpened: "2026-11-22"
 tags: []
 ---
 
-# PD-FUI-3 Status card with source-word tag (we-status-card)
+# PD-FUI-2 Milestone flags (we-milestone-flag)
 
-Frontier UI block we-status-card (blocks/status-card): card, we-badge state, source-word slot rendered with we-tag. Acceptance: renders state badge, title and source-word tag; the word is text, not only colour; words Measured, Derived, Assumed, Edited, Stale, Plan as small mono uppercase ink-muted, never coloured, never sun; border style is the second carrier (solid, dotted, dashed, solid with pencil, dashed with clock, solid no fill); unknown word falls back to a neutral tag; no animation (no pulse). Tier-1 test: renders state badge, title and source-word tag; the source word is text, not only colour. Check whether to merge with the Attention Card entry in MISSING_BLOCKS. Max 300 non-test lines.
+Frontier UI block we-milestone-flag (child of we-time-tracks; needs PD-FUI-1). Acceptance: selecting a flag shows its window in place; ] selects next flag and [ the previous; one flag selected at a time; Esc or tapping the flag again clears; window opens in place, not a modal; the axis does not zoom; other flags dim. Accessible name = milestone name plus a relative window (in 3-9 days or window unknown); a calendar date only when the FCST-6 date policy allows it (default off). Dense flags de-fan (stack or offset) at 390 px with a test. Tier-1 test: selecting a flag shows its window in place; ] selects the next flag and [ the previous. Needs Time Marker intent entry. Max 300 non-test lines.
 
 ## Acceptance
 

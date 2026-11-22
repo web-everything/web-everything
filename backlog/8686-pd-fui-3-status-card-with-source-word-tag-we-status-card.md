@@ -1,15 +1,16 @@
 ---
+bornAs: xksajth
 kind: story
-size: 5
+size: 2
 status: open
 scope: ["fui:blocks/"]
 dateOpened: "2026-11-22"
 tags: []
 ---
 
-# PD-FUI-1 Time tracks block (we-time-tracks)
+# PD-FUI-3 Status card with source-word tag (we-status-card)
 
-Frontier UI block we-time-tracks (blocks/time-tracks). Acceptance: lanes keep order; same time maps to same x; today marker splits past and a forecast slot; Up/Down moves focus lane to lane; no hex colours and no @keyframes. Tier-1 test: stacks lanes on one shared axis and places an item by its time. Needs Time Track intent entry. Max 300 non-test lines.
+Frontier UI block we-status-card (blocks/status-card): card, we-badge state, source-word slot rendered with we-tag. Acceptance: renders state badge, title and source-word tag; the word is text, not only colour; words Measured, Derived, Assumed, Edited, Stale, Plan as small mono uppercase ink-muted, never coloured, never sun; border style is the second carrier (solid, dotted, dashed, solid with pencil, dashed with clock, solid no fill); unknown word falls back to a neutral tag; no animation (no pulse). Tier-1 test: renders state badge, title and source-word tag; the source word is text, not only colour. Check whether to merge with the Attention Card entry in MISSING_BLOCKS. Max 300 non-test lines.
 
 ## Acceptance
 
@@ -37,4 +38,4 @@ One line per class: either the handling, or `n/a: <why>`.
 
 ## Duplicate admission
 
-new card for the PD-FUI plan; none filed yet
+new PD-FUI card

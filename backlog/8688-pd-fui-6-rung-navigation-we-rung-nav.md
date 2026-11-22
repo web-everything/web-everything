@@ -1,16 +1,16 @@
 ---
+bornAs: xqganip
 kind: story
 size: 3
 status: open
-blockedBy: ["xrf4ker"]
 scope: ["fui:blocks/"]
 dateOpened: "2026-11-22"
 tags: []
 ---
 
-# PD-FUI-7 Heat strip (we-heat-strip)
+# PD-FUI-6 Rung navigation (we-rung-nav)
 
-Frontier UI block we-heat-strip (blocks/heat-strip) for the project rung (PD-PROJ, P1, later); needs PD-FUI-1. Acceptance: one thin strip per machine on the shared time axis; colour = busy percent against that machine's own target (calm under, warm near, hot over); colour never the only carrier: hover or focus gives text like Studio 82% of 75% target; hot cells have a pattern-free outline; no hatching (reserved for forecast). Tier-1 test: maps busy/target to calm, warm or hot and exposes the value as text on focus.
+Frontier UI block we-rung-nav (blocks/rung-nav); needed by every rung, PD-LADSET and the DZ-SHELL breadcrumb; independent of FUI-1 to 5. Acceptance: breadcrumb that follows the ladder (Plan, Stream, Feature, PR) plus a rung switch (segmented control on desktop, menu on phone); rungs come from data (the ladder setting, preset B, D15 cascade), hard-coded rungs are a test failure; each rung has a hash link; Esc and browser Back go up one rung. Tier-1 test: renders the rungs from the ladder setting; selecting a rung updates the hash; Back returns to the previous rung.
 
 ## Acceptance
 

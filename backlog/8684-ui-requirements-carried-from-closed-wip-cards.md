@@ -1,4 +1,5 @@
 ---
+bornAs: xf99xv7
 kind: story
 size: 8
 parent: "6202"
@@ -21,7 +22,7 @@ Safeguards carried from #4901 (phone Flow view): reject cross-snapshot unions (r
 
 - [A1] **Executable** — `CarriedSourceFidelity.test_carried_bodies_equal_pinned_sources` below compares all 12 carried titles and complete bodies against source cards pinned at WE commit `17a4e1f94889cdf4f4760765b10228e7aaa9600c`. Only blank separator lines at block boundaries are ignored. Changed or deleted requirements, missing blocks, unavailable pinned sources and incomplete fences must fail validation; do not refresh the pin to bypass a mismatch. If the pinned objects are unavailable, restore that local history before claiming preservation.
 
-Save the following Python block as `$TMPDIR/xf99xv7-carried-source-test.py` and run `queue=we:scripts/readiness/heavy-admission.mjs; node "${queue#we:}" run --wait-ms=60000 -- python3 "$TMPDIR/xf99xv7-carried-source-test.py"` from the WE repository root. The named negative tests exercise content mutations and missing evidence without changing the card or source files.
+Save the following Python block as `$TMPDIR/8684-carried-source-test.py` and run `queue=we:scripts/readiness/heavy-admission.mjs; node "${queue#we:}" run --wait-ms=60000 -- python3 "$TMPDIR/8684-carried-source-test.py"` from the WE repository root. The named negative tests exercise content mutations and missing evidence without changing the card or source files.
 
 ```python
 import os
@@ -31,7 +32,7 @@ import unittest
 from pathlib import Path
 
 PIN = "17a4e1f94889cdf4f4760765b10228e7aaa9600c"
-CARD = "we:backlog/xf99xv7-ui-requirements-carried-from-closed-wip-cards.md"
+CARD = "we:backlog/8684-ui-requirements-carried-from-closed-wip-cards.md"
 SOURCES = [
     ('4007', 'we:backlog/4007-plateau-wip-dashboard-shows-live-plan-steps-per-card.md'),
     ('4057', 'we:backlog/4057-wip-fleet-panel-pr-ownership-rows-and-a-why-is-nothing-dispa.md'),
