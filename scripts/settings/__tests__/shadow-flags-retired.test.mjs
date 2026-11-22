@@ -44,24 +44,24 @@ afterEach(() => { vi.unstubAllEnvs(); for (const dir of dirs.splice(0)) rmSync(d
 // Hydrogen: no model alias in model-settings.json. Carbon/neon/lens/round-judge are out of scope.
 const flags = [
   ['post-accept-advisory', 'WE_REVIEW_POST_ACCEPT_ADVISORY_MODE', 'shadow', 'off',
-    () => resolvePostAcceptAdvisorySettings({ env: {}, platform: {}, log: () => {} }).value.mode],
+    (env = {}) => resolvePostAcceptAdvisorySettings({ env, platform: {}, log: () => {} }).value.mode],
   ['review-churn cap', 'WE_REVIEW_CHURN_CAP_MODE', 'shadow', 'off',
-    () => resolveReviewChurn({ env: {}, platform: {} }).capMode],
+    (env = {}) => resolveReviewChurn({ env, platform: {} }).capMode],
   ['review-churn same tree', 'WE_REVIEW_CHURN_SAME_TREE', 'shadow', 'off',
-    () => resolveReviewChurn({ env: {}, platform: {} }).sameTree],
+    (env = {}) => resolveReviewChurn({ env, platform: {} }).sameTree],
   ['review-early-start', 'WE_REVIEW_START_EARLY', 'shadow', 'off',
-    () => resolveTimingPolicy({ env: {}, platformReview: {}, platformFix: {} }).review.startEarly],
+    (env = {}) => resolveTimingPolicy({ env, platformReview: {}, platformFix: {} }).review.startEarly],
   ['delivery-capacity auto tune', null, 'shadow', 'off',
     () => resolveDeliveryCapacity({ env: {}, platform: {} }).value.autoTune.mode],
   ['delivery-priority', null, 'shadow', 'off',
     () => readDeliveryPrioritySettings({ env: {}, read: (...args) => readFileSync(...args) }).mode],
-  ['test-result-cache trace', 'WE_TEST_CACHE_TRACE', undefined, '0',
-    () => traceEnabled({}) ? 'shadow' : 'off'],
+  ['test-result-cache trace', 'WE_TEST_CACHE_TRACE', '1', '0',
+    (env = {}) => traceEnabled(env) ? 'shadow' : 'off'],
   ['stale-referral-human', 'WE_STALE_REFERRAL_HUMAN_SHADOW', '1', '0',
-    () => resolveStaleReferralHumanShadow({ env: {}, platform: {} }).value.enabled ? 'shadow' : 'off'],
-  ['drain-async', 'WE_ASYNC_DRAIN', 'shadow', 'off', () => {
+    (env = {}) => resolveStaleReferralHumanShadow({ env, platform: {} }).value.enabled ? 'shadow' : 'off'],
+  ['drain-async', 'WE_ASYNC_DRAIN', 'shadow', 'off', (env = {}) => {
     const dir = temp();
-    const observer = createAsyncShadow({ env: {}, dir });
+    const observer = createAsyncShadow({ env, dir });
     observer.observePass({ candidates: [{ repo: 'o/r', num: 7, headSha: HEAD }] });
     observer.recordActual({ repo: 'o/r', num: 7, headSha: HEAD });
     return readdirSync(dir).length ? 'shadow' : 'off';
@@ -107,18 +107,42 @@ function countedOutputs() {
   });
 }
 
-it('each retired shadow flag resolves off and no counted verdict path changes', () => {
+it('each retired shadow flag resolves off', () => {
   for (const [name, , , , resolve] of flags) expect.soft(resolve(), name).toBe('off');
 });
 
-it.each(flags)('%s: counted review, drain and merge-gate bytes do not depend on the observer', (name, envKey, before, off) => {
-  // Pure counted functions have no observer settings argument. Exercise their real input contracts under
-  // both environments; file-only settings stay outside these contracts. No projection removes evidence.
-  if (envKey) vi.stubEnv(envKey, before);
-  const previous = countedOutputs();
-  if (envKey) vi.stubEnv(envKey, off);
-  expect(countedOutputs(), name).toBe(previous);
-});
+// File-only settings use the production resolver's read seam; no repository settings are edited.
+function resolveObserver(name, env, value, resolve) {
+  if (name === 'delivery-capacity auto tune') return resolveDeliveryCapacity({ env, platform: {},
+    read: () => ({ deliveryCapacity: { autoTune: { mode: value } } }) }).value.autoTune.mode;
+  if (name === 'delivery-priority') return readDeliveryPrioritySettings({ env,
+    read: () => JSON.stringify({ deliveryPriority: { mode: value } }) }).mode;
+  return resolve(env);
+}
+
+it.each(flags.filter(([name]) => !['test-selection-measure', 'drain-verdict'].includes(name)))(
+  '%s: real resolver selects old shadow and retired values with byte-identical counted verdicts',
+  (name, envKey, before, off, resolve) => {
+    const env = {};
+    if (envKey) { env[envKey] = before; vi.stubEnv(envKey, before); }
+    expect(resolveObserver(name, env, before, resolve), `${name} old shadow`).toBe('shadow');
+    const previous = countedOutputs();
+    if (envKey) { env[envKey] = off; vi.stubEnv(envKey, off); }
+    expect(resolveObserver(name, env, off, resolve), `${name} retired`).toBe('off');
+    expect(countedOutputs(), name).toBe(previous);
+  });
+
+// Workflow triggers have no settings resolver. Exercise the real YAML loader for both shapes.
+it.each(['test-selection-measure', 'drain-verdict'])(
+  '%s: old automatic and retired manual triggers leave counted verdict bytes identical', name => {
+    const doc = workflow(name);
+    expect(Object.keys(doc.on)).toEqual(['workflow_dispatch']);
+    const retired = countedOutputs();
+    const old = yaml.load(yaml.dump({ ...doc, on: { ...doc.on,
+      ...(name === 'drain-verdict' ? { schedule: [{ cron: '*/10 * * * *' }] } : { push: { branches: ['main'] } }) } }));
+    expect(Object.keys(old.on)).toContain(name === 'drain-verdict' ? 'schedule' : 'push');
+    expect(countedOutputs()).toBe(retired);
+  });
 
 it('absent evidence and a moved head remain closed after retirement', () => {
   expect(verify(null, inputs, { now }).ok).toBe(false);

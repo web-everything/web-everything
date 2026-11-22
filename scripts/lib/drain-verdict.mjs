@@ -88,7 +88,7 @@ export function auditWorkflow(yamlText) {
   const READ_SCOPES = ['contents', 'pull-requests', 'checks', 'statuses'];
   const permissions = value => exact(value, READ_SCOPES) && READ_SCOPES.every(scope => value[scope] === 'read');
   if (!permissions(doc.permissions)) problems.push('expected explicit read-only permissions');
-  if (!exact(doc.on, ['schedule', 'workflow_dispatch'])) problems.push('only schedule and dispatch triggers allowed');
+  if (!exact(doc.on, ['workflow_dispatch'])) problems.push('only workflow_dispatch trigger allowed; schedule forbidden');
   if (doc.name !== 'drain-verdict') problems.push('unexpected workflow name');
   const walk = value => {
     if (Array.isArray(value)) { value.forEach(walk); return; }
