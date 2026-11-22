@@ -2156,12 +2156,149 @@ describe('runTickAllRepos — one reconcile plan per repo per pass', () => {
     });
     return { planner, dispatch, promote, checkStaleness, timeoutHold, readHeadCheckState, live,
       options: { repos: ['we'], fixSettings: { skipEmptySteps: false, standDownAutoProceed: false },
+        listBouncedPrs: () => [],
         authGateOverride: () => ({ paused: false, reason: null }), notesDryRun: true,
         now: () => elapsed,
         readPlanFingerprint: () => { elapsed += 20; return new Map([[7, 'a'], [8, 'a']]); },
         readPlanClaimSet: () => { elapsed += 5; return new Set(); } },
     };
   };
+
+  it('marks guard redispatches touched only in their repository when PR numbers collide', async () => {
+    const f = productionFixture();
+    vi.spyOn(rulingStandDown, 'runRulingResolvesStandDownPass').mockResolvedValue({ rows: [] });
+    let reconcile;
+    const repo = CONSTELLATION_REPOS.we.slug;
+    const otherRepo = CONSTELLATION_REPOS.frontierui.slug;
+    await realRunTickAllRepos({ ...f.options, repos: [repo, otherRepo], budgetRotation: {}, prCursors: {},
+      orphanGuardTick: async options => {
+        expect([...options.repos].map(entry => entry.slug)).toEqual([repo, otherRepo]);
+        reconcile = options.reconcile;
+        expect(reconcile({ repo, allowStandDownAutoProceed: false }).dispatch).toContainEqual(expect.objectContaining({ prNumber: 7 }));
+        expect(reconcile({ repo: otherRepo, allowStandDownAutoProceed: false }).dispatch).toContainEqual(expect.objectContaining({ prNumber: 7 }));
+        return { rows: [{ repo, pr: 7, decision: 'redispatch', result: 're-dispatched' }], handled: 1, deferred: [], nextCursor: null };
+      } });
+    expect(reconcile({ repo, allowStandDownAutoProceed: false }).dispatch).not.toContainEqual(expect.objectContaining({ prNumber: 7 }));
+    expect(reconcile({ repo: otherRepo, allowStandDownAutoProceed: false }).dispatch).toContainEqual(expect.objectContaining({ prNumber: 7 }));
+  });
+
+  it('orphan-guard stops between PRs at its deadline and resumes from its PR cursor next pass', async () => {
+    const f = productionFixture();
+    vi.spyOn(rulingStandDown, 'runRulingResolvesStandDownPass').mockResolvedValue({ rows: [] });
+    let time = 0;
+    const cursors = {};
+    const visited = [];
+    const tick = vi.fn(options => orphanFixRound.runOrphanFixRoundPass({ ...options, env: {},
+      listBounced: () => [3, 1, 2].map(number => ({ number })),
+      isOwned: async (_repo, pr) => { visited.push(pr); time += 1000; return true; } }));
+    const options = { ...f.options, now: () => time, budgetRotation: {}, prCursors: cursors,
+      passBudgets: resolveFixPassBudgets({ env: {}, file: { fixPassBudget: { orphanGuardMs: 1000 } } }),
+      orphanGuardTick: tick };
+    const first = await realRunTickAllRepos(options);
+    const cursor = { repo: CONSTELLATION_REPOS.we.slug, pr: 2 };
+    expect(visited).toEqual([1]);
+    expect(cursors['orphan-guard']).toEqual(cursor);
+    expect(tick.mock.calls[0][0]).toMatchObject({ deadlineAt: 1000, now: options.now, reconcile: expect.any(Function) });
+    expect(first.phasePrCounts['orphan-guard']).toEqual({ handled: 1, deferred: 2 });
+    expect(first.budgets['orphan-guard']).toMatchObject({ hit: true, skipped: [cursor, { repo: cursor.repo, pr: 3 }] });
+    expect(first.refusals).toContainEqual(expect.objectContaining({ repo: 'we', kind: 'orphan-guard-deferred' }));
+    const { formatPassPhaseTiming } = await import('../reconcile-fix-dispatch-daemon.mjs');
+    expect(formatPassPhaseTiming(first).find(line => line.includes('phase=orphan-guard '))).toContain('prs=1 deferred=2');
+    const second = await realRunTickAllRepos(options);
+    expect(visited).toEqual([1, 2]);
+    expect(tick.mock.calls[1][0].cursor).toEqual(cursor);
+    expect(second.phasePrCounts['orphan-guard']).toEqual({ handled: 1, deferred: 2 });
+    expect(second.budgets['orphan-guard'].skipped).toEqual([{ repo: cursor.repo, pr: 3 }, { repo: cursor.repo, pr: 1 }]);
+    await realRunTickAllRepos(options);
+    expect(visited).toEqual([1, 2, 3]);
+    expect(cursors['orphan-guard']).toEqual({ repo: cursor.repo, pr: 1 });
+  });
+
+  it.each([
+    { repos: ['we'], reuseReconcilePlan: true },
+    { repos: ['we', 'frontierui'], reuseReconcilePlan: true },
+    { repos: ['we', 'frontierui'], reuseReconcilePlan: false },
+  ])('holds live review:changes PRs despite stale planner labels while dispatching ordinary fixes (%j)', async ({ repos, reuseReconcilePlan }) => {
+    const realFix = fixDispatch.runReconcileFixDispatch;
+    const f = productionFixture();
+    vi.spyOn(rulingStandDown, 'runRulingResolvesStandDownPass').mockResolvedValue({ rows: [] });
+    const dispatched = vi.fn(entry => ({ pr: entry.pr }));
+    const rows = [1, 2, 3].map(prNumber => ({ kind: 'fix', prNumber,
+      headRefName: `repair-${prNumber}`, headRefOid: 'a'.repeat(40),
+      labels: ['fix:ready'], files: [`file-${prNumber}.mjs`] }));
+    f.planner.mockImplementation(() => planOf({ dispatch: rows }));
+    vi.mocked(fixDispatch.runReconcileFixDispatch).mockImplementation(options => realFix({
+      ...options, root: '/fixture', checkStaleness: f.checkStaleness,
+      resolveProfile: () => ({ capabilities: { fix: true, ciHeal: true }, canonicalPrefix: 'we' }),
+      listFixClaims: () => [], listBuildClaims: () => [], loadItems: () => [],
+      priorityShadow: null, pickFreeLanes: () => [37], writeStacks: null,
+      tryResume: null, tryResumeRound: null, dispatch: dispatched,
+    }));
+    let time = 0;
+    const listBouncedPrs = vi.fn(async () => [{ number: 1 }, { number: 2 }]);
+    const options = { ...f.options, repos, reuseReconcilePlan, listBouncedPrs,
+      now: () => time, budgetRotation: {}, prCursors: {},
+      passBudgets: resolveFixPassBudgets({ env: {}, file: { fixPassBudget: { orphanGuardMs: 1000 } } }),
+      orphanGuardTick: async ({ repos }) => {
+        const visited = [];
+        for (const repo of repos) { visited.push(repo); time += 1001; }
+        const [repo] = visited;
+        return { rows: [{ repo: repo.slug, pr: 1, decision: 'escalate', result: 'not-done: unavailable' }],
+          handled: 1, deferred: [{ repo: repo.slug, pr: 2 }], nextCursor: { repo: repo.slug, pr: 2 } };
+      } };
+    for (let pass = 0; pass < 3; pass += 1) {
+      const result = await realRunTickAllRepos(options);
+      expect(result.budgets['orphan-guard'].hit).toBe(true);
+      expect(result.dispatched.map(row => row.pr)).toEqual(repos.map(() => 3));
+      expect(result.refusals.filter(row => row.kind === 'orphan-guard-deferred')
+        .map(row => row.prNumber).sort()).toEqual(repos.flatMap(() => [1, 2]).sort());
+      expect(dispatched).toHaveBeenCalledTimes((pass + 1) * repos.length);
+      expect(listBouncedPrs).toHaveBeenCalledTimes((pass + 1) * (repos.length - 1));
+      if (repos.length > 1) expect(listBouncedPrs).toHaveBeenLastCalledWith(
+        CONSTELLATION_REPOS[repos[(pass + 1) % repos.length]].slug);
+    }
+  });
+
+  it.each(['throws', 'missing', 'malformed'])('holds the whole budget-skipped repo when its live bounced listing is %s', async mode => {
+    const f = productionFixture();
+    vi.spyOn(rulingStandDown, 'runRulingResolvesStandDownPass').mockResolvedValue({ rows: [] });
+    let time = 0;
+    const listBouncedPrs = vi.fn(async () => {
+      if (mode === 'throws') throw new Error('listing unavailable');
+      return [{ number: '4715' }];
+    });
+    const result = await realRunTickAllRepos({ ...f.options, repos: ['we', 'frontierui'],
+      now: () => time, budgetRotation: {}, prCursors: {}, reuseReconcilePlan: false,
+      listBouncedPrs: mode === 'missing' ? undefined : listBouncedPrs,
+      passBudgets: resolveFixPassBudgets({ env: {}, file: { fixPassBudget: { orphanGuardMs: 1000 } } }),
+      orphanGuardTick: async ({ repos }) => {
+        for (const repo of repos) { expect(repo.key).toBe('we'); time += 1001; }
+        return { rows: [] };
+      },
+    });
+    expect(vi.mocked(fixDispatch.runReconcileFixDispatch).mock.calls.map(([options]) => options.repo)).toEqual(['we']);
+    expect(result.refusals).toContainEqual({ repo: 'frontierui', prNumber: null,
+      kind: 'orphan-guard-deferred', why: 'orphan-cap guard did not complete this repo; fix deferred until next pass' });
+    expect(listBouncedPrs).toHaveBeenCalledTimes(mode === 'missing' ? 0 : 1);
+    if (mode !== 'missing') expect(listBouncedPrs).toHaveBeenCalledWith(CONSTELLATION_REPOS.frontierui.slug);
+  });
+
+  it('threads adoption yield into the orphan guard only when a probe exists', async () => {
+    const f = productionFixture();
+    let yieldNow = false;
+    const seen = [];
+    const tick = vi.fn(options => orphanFixRound.runOrphanFixRoundPass({ ...options,
+      listBounced: () => [1, 2, 3].map(number => ({ number })),
+      isOwned: async (_repo, pr) => { seen.push(pr); yieldNow = true; return true; } }));
+    const options = { ...f.options, budgetRotation: {}, prCursors: {}, orphanGuardTick: tick };
+    const result = await realRunTickAllRepos({ ...options, adoptYieldProbe: () => yieldNow });
+    expect(tick.mock.calls[0][0].shouldYield).toEqual(expect.any(Function));
+    expect(seen).toEqual([1]);
+    expect(result.phasePrCounts['orphan-guard']).toEqual({ handled: 1, deferred: 2 });
+    yieldNow = false;
+    await realRunTickAllRepos(options);
+    expect(tick.mock.calls[1][0]).not.toHaveProperty('shouldYield');
+  });
 
   it.each(['keys', 'slugs'])('bounds orphan-guard between repos and resumes the skipped repo next pass (%s)', async form => {
     const f = productionFixture();
@@ -2187,7 +2324,7 @@ describe('runTickAllRepos — one reconcile plan per repo per pass', () => {
     expect(time).toBe(2002);
   });
 
-  it('keeps the fix rotation head across a pass where the orphan guard excludes its repo (no starvation cycle)', async () => {
+  it('rotates ordinary fixes through budget-skipped orphan repos without starvation', async () => {
     const f = productionFixture();
     vi.spyOn(rulingStandDown, 'runRulingResolvesStandDownPass').mockResolvedValue({ rows: [] });
     let time = 0;
@@ -2209,11 +2346,8 @@ describe('runTickAllRepos — one reconcile plan per repo per pass', () => {
       passes.push([...fixVisits]);
       rotationAfter.push(options.budgetRotation.fix);
     }
-    // Pass 2 stops after frontierui and parks plateau-app; pass 3 only has `we` eligible and must NOT forget it.
-    expect(passes.slice(0, 3)).toEqual([['we'], ['frontierui'], ['we']]);
-    expect(rotationAfter[1]).toBe('plateau-app');
-    expect(rotationAfter[2]).toBe('plateau-app');
-    expect(passes[3][0]).toBe('plateau-app');
+    expect(passes).toEqual([['we'], ['frontierui'], ['plateau-app'], ['we']]);
+    expect(rotationAfter.slice(0, 3)).toEqual(['frontierui', 'plateau-app', 'we']);
   });
 
   it('reports an unknown orphan-guard repo without yielding an invalid repo to the guard', async () => {
@@ -2247,11 +2381,13 @@ describe('runTickAllRepos — one reconcile plan per repo per pass', () => {
     expect(orphanFixRound.planOrphanFixRound({ pr: capped, nowMs: time }).decision).toBe('escalate');
     const fixRepos = [];
     const dispatch = vi.fn();
-    vi.mocked(fixDispatch.runReconcileFixDispatch).mockImplementation(({ repo }) => {
+    vi.mocked(fixDispatch.runReconcileFixDispatch).mockImplementation(({ repo, excludePrs }) => {
       fixRepos.push(repo);
       f.live.invalid = true;
-      const rows = repo === CONSTELLATION_REPOS.we.slug || repo === 'we' ? [] : [capped];
-      const dispatched = rows.filter(pr => !pr.labels.includes('review:human')).map(pr => {
+      const rows = repo === CONSTELLATION_REPOS.we.slug || repo === 'we' ? []
+        : [capped, { number: 4716, labels: ['fix:ready'] }];
+      const dispatched = rows.filter(pr => !pr.labels.includes('review:human')
+        && !excludePrs({ prNumber: pr.number, labels: pr.labels })).map(pr => {
         dispatch({ repo, pr: pr.number });
         return { pr: pr.number };
       });
@@ -2260,6 +2396,7 @@ describe('runTickAllRepos — one reconcile plan per repo per pass', () => {
     const escalate = vi.fn(async () => { capped.labels.push('review:human'); return { ok: true }; });
     const repos = ['we', 'frontierui'].map(key => form === 'slugs' ? CONSTELLATION_REPOS[key].slug : key);
     const options = { ...f.options, repos, now: () => time, budgetRotation: {},
+      listBouncedPrs: slug => slug === CONSTELLATION_REPOS.frontierui.slug ? [capped] : [],
       passBudgets: resolveFixPassBudgets({ env: {}, file: { fixPassBudget: { orphanGuardMs: 1000 } } }),
       orphanGuardTick: options => orphanFixRound.runOrphanFixRoundPass({ ...options, env: {},
         listBounced: slug => { time += 1001; return slug === CONSTELLATION_REPOS.frontierui.slug ? [capped] : []; },
@@ -2268,19 +2405,19 @@ describe('runTickAllRepos — one reconcile plan per repo per pass', () => {
     };
     const first = await realRunTickAllRepos(options);
     expect(first.budgets['orphan-guard'].skipped).toEqual([repos[1]]);
-    expect(fixRepos).toEqual([repos[0]]);
-    expect(dispatch).not.toHaveBeenCalled();
+    expect(fixRepos).toEqual(repos);
+    expect(dispatch.mock.calls.map(([row]) => row.pr)).toEqual([4716]);
     expect(escalate).not.toHaveBeenCalled();
-    expect(first.refusals).toContainEqual({ repo: repos[1], prNumber: null,
-      kind: 'orphan-guard-deferred', why: 'orphan-cap guard did not complete this repo; fix deferred until next pass' });
+    expect(fixDispatch.runReconcileFixDispatch.mock.calls.find(([o]) => o.repo === repos[1])[0]
+      .excludePrs({ prNumber: 4715, labels: capped.labels })).toBe(true);
     fixRepos.length = 0;
     const second = await realRunTickAllRepos(options);
     expect(second.budgets['orphan-guard'].skipped).toEqual([repos[0]]);
-    expect(fixRepos).toEqual([repos[1]]);
+    expect(fixRepos).toEqual(repos);
     expect(escalate).toHaveBeenCalledTimes(1);
     expect(escalate).toHaveBeenCalledWith({ slug: CONSTELLATION_REPOS.frontierui.slug,
       pr: 4715, labels: ['review:changes'] });
-    expect(dispatch).not.toHaveBeenCalled();
+    expect(dispatch.mock.calls.map(([row]) => row.pr)).toEqual([4716, 4716]);
     expect(second.stuckFixers.orphanRounds.rows).toContainEqual(expect.objectContaining({
       pr: 4715, decision: 'escalate', result: 'escalated',
     }));
