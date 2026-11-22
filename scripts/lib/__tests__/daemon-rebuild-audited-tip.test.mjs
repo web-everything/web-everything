@@ -99,6 +99,17 @@ describe('unaudited-tip plans', () => {
     const alerts = plan.alerts.filter((x) => x.kind === 'overlay-unaudited-tip' && x.detail.ref === ref);
     expect(alerts).toHaveLength(1);
     expect(alerts[0].detail).toMatchObject({ setAside: true, adopted: f.a, newTip: f.b });
+    // The adopted head stays recorded, so the NEXT rebuild never reads the overlay as a new registration and applies tip B.
+    const next = await f.plan({ headSha: plan.finalSha });
+    expect(next.applied.some((x) => x.ref === ref && x.sha === f.b)).toBe(false);
+    expect(next.auditAdopted).toContain(ref);
+  });
+  it('ready-pin-stale loop: an explicitly pinned overlay is refused, never silently set aside', async () => {
+    const f = await fixture();
+    f.save();
+    const plan = await f.plan({ stalePins: { [ref]: f.a }, overlays: [{ ref, pr: 42, pinned: true }] });
+    expect(plan.ok).toBe(false);
+    expect(plan.reason).toBe('pinned-overlay-unavailable');
   });
   it('ready-pin-stale loop: a stale marker never sets aside an overlay whose adopted head is audited again', async () => {
     const f = await fixture();

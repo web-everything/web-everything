@@ -651,6 +651,13 @@ export async function planRebuild({
     let unauditedFrom = null;
     const heldAt = holdUnauditedTip(ref, pr, ovSha);
     if (heldAt === false) {
+      // An explicitly/mechanism-pinned overlay is never silently left out: refuse, exactly as a vanished ref would.
+      const p = pinnedStatus(git, raw, mainSha, ovSha);
+      if (p.pinned) return refusePinned(ref, pr, ovSha, 'unaudited-tip-held', p.why);
+      // Mint an identity-only hold marker (no `applied` entry, like a set-aside stack base) so the adopted head stays
+      // findable: the next rebuild must not read the still-registered overlay as a new, never-adopted registration.
+      const adoptedHead = adoptedTips.get(ref) ?? graduatedTips.get(ref);
+      if (!recordHold(ref, pr, adoptedHead, null)) return holdRefusal();
       decisions.push({ ref, pr, action: 'skip', reason: 'unaudited-tip-held', sha: ovSha });
       continue;
     }
