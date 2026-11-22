@@ -54,6 +54,7 @@ import {
   prTerminalPredatesLease,
   laneIndicesIn,
   applyReclaimSafety,
+  releaseLane,
 } from '../lease-reaper.mjs';
 import { fixDispatchSessionName } from '../fix-claim-store.mjs';
 import { DEFAULT_LEASE_TTL_MINUTES } from '../../lib/lane-lease.mjs';
@@ -836,7 +837,20 @@ describe('main — reclaim safety wiring', () => {
     expect(JSON.parse(stdout)).toMatchObject({ scanned: 3, kept: 2, failures: 0,
       ...(dryRun ? { reaped: 0, wouldReap: [safe] } : { reaped: 1, collected: [safe] }) });
     if (dryRun) expect(release).not.toHaveBeenCalled();
-    else expect(release.mock.calls).toEqual([['pool', 4, { reason: 'ttl-stale' }]]);
+    else expect(release.mock.calls).toEqual([['pool', 4, { reason: 'ttl-stale', lease: leases.get(4) }]]);
+  });
+});
+
+describe('releaseLane — passes the judged lease to the child release', () => {
+  it('adds --expect-lease with the judged fingerprint, renewedAt included', () => {
+    const exec = vi.fn();
+    const lease = { session: 's', acquiredAt: '2026-01-01T00:00:00.000Z', holder: 'h', renewedAt: '2026-01-01T01:00:00.000Z', pid: 9 };
+    releaseLane('pool', 3, { reason: 'ttl-stale', lease, exec, cli: 'lane-pool.mjs', env: {} });
+    const argv = exec.mock.calls[0][1];
+    expect(argv.slice(0, 6)).toEqual(['lane-pool.mjs', 'release', '--pool=pool', '--lane=3', '--force', '--reason=ttl-stale']);
+    const expectArg = argv.find(a => a.startsWith('--expect-lease='));
+    expect(JSON.parse(expectArg.slice('--expect-lease='.length)))
+      .toEqual({ session: 's', acquiredAt: '2026-01-01T00:00:00.000Z', holder: 'h', renewedAt: '2026-01-01T01:00:00.000Z' });
   });
 });
 

@@ -3963,12 +3963,28 @@ async function cmdRelease(repo) {
   if (flags.all) { targets = existingLanes(repo).filter((n) => readLease(laneDir(repo, n))); targeted = false; } // every held lane
   else if (flags.lane !== undefined) { targets = [Number(flags.lane)]; targeted = true; }
   else return fail('release needs --lane=N or --all');
+  // A caller that judged the lease in ANOTHER process (the lease reaper's `release --force`) passes the lease it
+  // judged. The release then refuses any lease that differs from it — including one its holder RENEWED after the
+  // verdict (`sameLease` compares `renewedAt`). Unparseable evidence fails closed.
+  let expectLease = null;
+  if (flags['expect-lease'] !== undefined) {
+    try { expectLease = JSON.parse(String(flags['expect-lease'])); } catch { /* checked below */ }
+    if (!expectLease || typeof expectLease !== 'object' || typeof expectLease.acquiredAt !== 'string') {
+      return fail('release --expect-lease must be the JSON lease the caller judged (with acquiredAt); refusing to release');
+    }
+  }
   let released = 0;
   const kept = []; // lanes kept by the work guard, a hold or a failed card save (named in --json for callers)
   for (const n of targets) {
     const dir = laneDir(repo, n);
     const lease = readLease(dir);
     if (!lease) { log(`  lane-${n}: no lease to release`); continue; }
+    if (expectLease && !sameLease(lease, expectLease)) {
+      log(`  lane-${n}: lease changed since the caller judged it (re-acquired or renewed by its holder) — kept; ${describeLease(lease)}`);
+      kept.push({ lane: n, kind: 'leased', reason: 'lease changed since the caller judged it' });
+      process.exitCode = 1;
+      continue;
+    }
     // #2350 — a RESERVED (permanent) lane is NEVER handed back by an ordinary `release` (not even `--force`):
     // its whole point is to be a durable, off-limits slot. Only the deliberate `--release-reserved` un-reserve
     // drops it. This keeps a stray `release --all` / `--force` from silently un-reserving the memory-lane.
@@ -4101,7 +4117,9 @@ async function cmdRelease(repo) {
     const refusedReset = resetPinnedLaneForRelease(repo, dir, lease);
     if (refusedReset) { kept.push({ lane: n, ...refusedReset }); process.exitCode = 1; continue; }
     if (!takeMarkerIf(dir, (moved) => sameLease(moved, lease), n)) {
-      log(`  lane-${n}: lease changed since it was read (a new acquire/release raced this one) — not releasing; re-run if lane-${n} still looks wrong`);
+      log(`  lane-${n}: lease changed since it was read (a new acquire/release or a holder renewal raced this one) — not releasing; re-run if lane-${n} still looks wrong`);
+      kept.push({ lane: n, kind: 'leased', reason: 'lease changed since it was read' });
+      process.exitCode = 1; // a caller (the lease reaper) must not count a kept lane as released
       continue;
     }
     if (delivered) log(`  lane-${n}: contested lease released — its work is fully landed (clean tree, HEAD on upstream main), nothing to lose`);
@@ -5904,7 +5922,7 @@ function cmdUnmap(repo) {
 const KNOWN_FLAGS = new Set([
   'acquirable', 'adopt', 'all', 'all-pools', 'at', 'base', 'branch', 'count', 'discard', 'force', 'item', 'json', 'lane',
   'name', 'no-install', 'no-reap', 'no-reset', 'origin', 'pool', 'purpose', 'reference', 'release-reserved',
-  'repo', 'reserve', 'scope', 'session', 'expect-holder', 'ttl-minutes', 'wait-ms',
+  'repo', 'reserve', 'scope', 'session', 'expect-holder', 'expect-lease', 'ttl-minutes', 'wait-ms',
   // #xn432dz — list --acquirable's single-flight cache / early-stop / bounded-scan knobs.
   'limit', 'no-cache', 'cache-ttl-ms', 'scan-timeout-ms', 'list-contention-grace-ms',
   // list --acquirable's per-lane "holds un-pushed work" memo (see VERDICT_MEMO_FILE).

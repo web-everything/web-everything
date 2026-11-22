@@ -59,6 +59,27 @@ it.each(['owner', 'other'])('acquire --adopt from a lane cwd still requires a ca
   expect(readFileSync(join(lane, 'work'), 'utf8')).toBe('precious work');
 });
 
+// The lease reaper judges staleness in its own process and then runs `release --force` as a child. The child
+// must refuse a lease its holder renewed (or re-acquired) after that verdict, and say so with a non-zero exit.
+it('release --force --expect-lease keeps a lease renewed after the caller judged it', () => {
+  seed();
+  const judged = readLease();
+  const release = expect => run(['release', '--lane=1', '--pool=fixture', `--origin=${reference}`,
+    `--reference=${reference}`, '--force', `--expect-lease=${expect}`]);
+  writeFileSync(marker(), JSON.stringify({ ...judged, renewedAt: new Date().toISOString() }));
+  const renewed = readFileSync(marker(), 'utf8');
+  const refused = release(JSON.stringify(judged));
+  expect(refused.status, refused.stderr).not.toBe(0);
+  expect(refused.stderr).toMatch(/lease changed since the caller judged it/);
+  expect(readFileSync(marker(), 'utf8')).toBe(renewed);
+  const malformed = release('not-json');
+  expect(malformed.status).not.toBe(0);
+  expect(readFileSync(marker(), 'utf8')).toBe(renewed);
+  const matching = release(renewed);
+  expect(matching.status, matching.stderr).toBe(0);
+  expect(existsSync(marker())).toBe(false);
+});
+
 it.each(['live', 'dirty'])('forced refresh preserves a stale %s lease before fetch or reset', kind => {
   seed(kind === 'live' ? { pid: process.pid, host: hostname() } : {});
   if (kind === 'dirty') writeFileSync(join(lane, 'work'), 'precious work');
