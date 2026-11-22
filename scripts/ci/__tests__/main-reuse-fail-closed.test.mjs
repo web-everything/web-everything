@@ -9,7 +9,7 @@ import { spawnSync } from 'node:child_process';
 import yaml from 'js-yaml';
 import { mainRedState } from '../../conveyor/main-ci-red-core.mjs';
 import { probeMainCiRuns, readMainTip } from '../../conveyor/main-ci-red-probe.mjs';
-import { REUSED_MARKER_STEP, withoutReusedMainPushes } from '../../lib/main-ci-reuse-runs.mjs';
+import { REUSED_MARKER_STEP, withoutReusedMainPushes, withoutStaleScheduledSuccesses } from '../../lib/main-ci-reuse-runs.mjs';
 import { mqSameHeadGuard } from '../../lib/drain-queue-safety.mjs';
 import { recordQuarantineReuse, validQuarantineReceipt } from '../quarantine-skip.mjs';
 
@@ -207,6 +207,20 @@ describe('F3/F4 main-ci-red-probe.mjs:111/122 — the probe inventory is main-on
   });
   it('a backstop failure is always kept as red evidence', () => {
     expect(mainRedState(probe([row(1, head, 'success'), row(2, old, 'failure', 'schedule')]).runs).status).toBe('red');
+  });
+  it('a proven-reused newer push inside the window still closes an older SHA backstop', () => {
+    // `runs` is AFTER reuse filtering (the reused push 2 is gone); `pushes` is before it.
+    const pushes = [row(1, old, 'failure'), row(2, head, 'failure')];
+    const backstop = row(3, old, 'success', 'schedule');
+    expect(withoutStaleScheduledSuccesses([pushes[0], backstop], { head: null, pushes })).toEqual([pushes[0]]);
+    // Without the newer push the window is clean and the backstop recovers its own SHA.
+    expect(withoutStaleScheduledSuccesses([pushes[0], backstop], { head: null, pushes: [pushes[0]] })).toEqual([pushes[0], backstop]);
+  });
+  it('SHA comparisons ignore case (current head and window)', () => {
+    const backstop = row(3, head, 'success', 'schedule');
+    expect(withoutStaleScheduledSuccesses([row(1, old, 'success'), backstop], { head: head.toUpperCase(), pushes: [] })).toContain(backstop);
+    const upper = row(2, old.toUpperCase(), 'success', 'schedule');
+    expect(withoutStaleScheduledSuccesses([row(1, old, 'failure'), upper], { head: null, pushes: [row(1, old, 'failure')] })).toContain(upper);
   });
 });
 

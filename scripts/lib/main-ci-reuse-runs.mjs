@@ -49,14 +49,18 @@ export function mainEventRuns(runs) {
  */
 export function withoutStaleScheduledSuccesses(runs, { head = null, pushes = [] } = {}) {
   const at = value => Date.parse(value ?? '');
+  const sha = value => (typeof value === 'string' ? value.toLowerCase() : null);
+  // A PROVEN-REUSED push of a newer SHA is gone from `runs` but still moved main: it must close the
+  // older SHA's window too, or that SHA's delayed backstop would read green for a commit never run on main.
+  const moves = [...runs, ...pushes];
   return runs.filter(r => {
     if (r.event !== 'schedule' || r.conclusion !== 'success') return true;
-    if (head && r.headSha === head) return true;
+    if (head && sha(r.headSha) === sha(head)) return true;
     const started = at(r.createdAt);
     if (typeof r.headSha !== 'string' || !/^[0-9a-f]{40}$/i.test(r.headSha) || !Number.isFinite(started)) return false;
-    const reachedMain = Math.max(-Infinity, ...pushes.filter(push => push.headSha === r.headSha
+    const reachedMain = Math.max(-Infinity, ...pushes.filter(push => sha(push.headSha) === sha(r.headSha)
       && at(push.createdAt) <= started).map(push => at(push.createdAt)));
-    return !runs.some(other => other.headSha !== r.headSha
+    return !moves.some(other => sha(other.headSha) !== sha(r.headSha)
       && (!Number.isFinite(at(other.createdAt)) || (at(other.createdAt) >= reachedMain && at(other.createdAt) <= started)));
   });
 }
