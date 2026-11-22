@@ -9,7 +9,7 @@ export const CAPACITY_DEFAULTS = {
   aheadPenalty: 0.7, behindBoost: 1.2, burnWindowHours: 24, burnUnusedPercent: 40,
   longKinds: [], resetAtPercent: 95, maxBurnBoost: 3,
   workingHours: { start: '09:00', end: '20:00', tz: 'America/New_York', days: [1, 2, 3, 4, 5] },
-  claudeUsageAccount: null, expectedDemandPerDay: null, activateAfterShortfallDays: 3,
+  claudeUsageAccount: null, claudeAccountMap: {}, expectedDemandPerDay: null, activateAfterShortfallDays: 3,
   criticalKinds: ['critical', 'security', 'audit', 'audit-full'], allowUnknownEmergency: false,
 };
 const HOUR = 3600000;
@@ -43,13 +43,19 @@ export function readProviderCapacity({ env = {}, now = Date.now(), readers = {},
       const def = { ...owner, ...entry, ...account };
       let raw, windows = [];
       try { raw = readers[account.id]?.(env) ?? readers[owner.id]?.(env); } catch { /* unknown */ }
-      // The shared Claude file cannot identify an account. Never attribute it to both accounts.
-      if (owner.id === 'claude' && owner.accounts && s.claudeUsageAccount !== account.id) raw = null;
+      // An explicit file identity must be mapped. The legacy setting covers identity-less files only.
+      const usageAccount = owner.id === 'claude' && owner.accounts
+        ? raw?.account == null ? s.claudeUsageAccount
+          : typeof raw.account === 'string' && Object.hasOwn(s.claudeAccountMap ?? {}, raw.account) ? s.claudeAccountMap[raw.account] : null
+        : null;
+      if (owner.id === 'claude' && owner.accounts && usageAccount !== account.id) raw = null;
       const at = epoch(raw?.at ?? raw?.asOf ?? raw?.mtime);
       const seed = env.WE_CAPACITY_READERS === 'off' ? undefined : def.operatorReading, seedAt = epoch(seed?.asOf);
-      const operatorReadingStale = Boolean(seed) && (!Number.isFinite(seedAt) || seedAt > now || now - seedAt > s.operatorReadingMaxAgeHours * HOUR);
+      const operatorReadingStale = Boolean(seed) && (!Number.isFinite(seedAt) || seedAt > now || now - seedAt > Math.min(24, s.operatorReadingMaxAgeHours) * HOUR);
       const timestampMissing = raw?.at == null && raw?.asOf == null && raw?.mtime == null;
-      const liveUsable = Number.isFinite(at) ? at <= now && now - at <= s.staleHours * HOUR
+      const liveStale = Number.isFinite(at) && now - at > Math.min(24, s.staleHours) * HOUR;
+      // A live session appends events while we read, so allow 60 s of read-time skew; further in the future is unusable.
+      const liveUsable = Number.isFinite(at) ? at <= now + 60000 && !liveStale
         : timestampMissing && Boolean(raw) && owner.readers?.some(r => r.type === 'codex-rollout');
       const add = (name, w, source = 'live') => {
         const usedPercent = w?.usedPercent ?? w?.used_percent ?? w?.used_percentage;
@@ -86,6 +92,8 @@ export function readProviderCapacity({ env = {}, now = Date.now(), readers = {},
       let held = false;
       try { held = Boolean(readers.hold?.(owner.id, now)); } catch { held = true; }
       return { ...def, provider: entry.id, account: account.id, configuredWindows: def.windows, windows, held, health: held ? 0 : 1,
+        usageAccount: raw ? usageAccount : null,
+        stale: !windows.some(w => Number.isFinite(w.usedPercent)) && (liveStale || operatorReadingStale),
         operatorReadingStale, known: windows.some(w => Number.isFinite(w.usedPercent)), now };
     });
   });
@@ -100,7 +108,8 @@ export function launcherCapacity(capacities, settings = {}) {
     const def = providers.find(p => p.id === provider);
     const owner = providers.find(p => p.id === def?.quotaOf) ?? def;
     if ((owner?.accounts?.length ?? new Set(observations.map(c => c.account)).size) <= 1) return observations;
-    const attributed = owner?.id === 'claude' || provider === 'claude' ? settings.claudeUsageAccount : null;
+    const attributed = owner?.id === 'claude' || provider === 'claude'
+      ? observations.find(c => c.usageAccount === c.account)?.account ?? settings.claudeUsageAccount : null;
     const live = attributed && observations.find(c => c.account === attributed);
     return live ? [live] : [{ ...observations[0], account: null, windows: [], known: false,
       held: observations.some(c => c.held) }];

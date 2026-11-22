@@ -30,6 +30,22 @@ function snapshotGit(state = {}) {
 const fixture = (fn) => { const root = mkdtempSync(join(tmpdir(), 'codex-ledger-')); return Promise.resolve().then(() => fn(root)).finally(() => rmSync(root, { recursive: true, force: true })); };
 const stdout = `${JSON.stringify({ type: 'turn.completed', usage: { input_tokens: 100, cached_input_tokens: 60, output_tokens: 20, reasoning_output_tokens: 10 } })}\n`;
 
+it.each([128, 9 * 1024 * 1024])('Codex rollout reader requests at most 256 KiB from the correct tail offset (size=%s)', size => fixture(root => {
+  const sessions = join(root, 'sessions');
+  mkdirSync(sessions);
+  const path = join(sessions, 'rollout.jsonl');
+  writeFileSync(path, '');
+  truncateSync(path, size);
+  const read = vi.spyOn(fs, 'readSync');
+  const readFile = vi.spyOn(fs, 'readFileSync');
+  expect(readCodexQuota({ CODEX_HOME: root })).toBeNull();
+  const length = Math.min(size, 256 * 1024);
+  expect(read).toHaveBeenCalledTimes(1);
+  expect(read.mock.calls[0][1].byteLength).toBe(length);
+  expect(read.mock.calls[0].slice(2)).toEqual([0, length, size - length]);
+  expect(readFile).not.toHaveBeenCalled();
+}));
+
 it('ledger readers enforce their 8 MiB and 256 KiB tail byte limits and offsets', () => fixture(root => {
   const path = join(root, 'large-ledger.jsonl');
   writeFileSync(path, '');
@@ -82,9 +98,9 @@ describe('Codex usage ledger', () => {
   });
   it('reads only the Codex bucket from persisted rollout observations', () => fixture(root => {
     const sessions = join(root, 'sessions', '2026'); mkdirSync(sessions, { recursive: true });
-    const event = (id, used, reset) => JSON.stringify({ type: 'event_msg', payload: { type: 'token_count', rate_limits: { limit_id: id, primary: { used_percent: used, resets_at: reset } } } });
+    const event = (id, used, reset) => JSON.stringify({ timestamp: new Date(used * 1000).toISOString(), type: 'event_msg', payload: { type: 'token_count', rate_limits: { limit_id: id, primary: { used_percent: used, resets_at: reset, window_minutes: 300 } } } });
     writeFileSync(join(sessions, 'run.jsonl'), `${event('codex', 10, 5)}\n${event('codex', 12, 5)}\n${event('other', 99, 6)}\n`);
-    expect(readCodexQuota({ CODEX_HOME: root })).toEqual({ used_percent: 12, resets_at: 5, at: null,
+    expect(readCodexQuota({ CODEX_HOME: root })).toEqual({ used_percent: 12, resets_at: 5, window_minutes: 300, at: new Date(12000).toISOString(),
       mtime: fs.statSync(join(sessions, 'run.jsonl')).mtimeMs });
     expect(readCodexQuota({ CODEX_HOME: join(root, 'missing') })).toBeNull();
   }));
@@ -92,10 +108,10 @@ describe('Codex usage ledger', () => {
     const sessions = join(root, 'sessions'); mkdirSync(sessions);
     for (const [name, id, used, time] of [['old', 'codex', 10, 100], ['eligible', 'codex', 22, 200], ['newest', 'other', 99, 300]]) {
       const path = join(sessions, `${name}.jsonl`);
-      writeFileSync(path, JSON.stringify({ type: 'event_msg', payload: { type: 'token_count', rate_limits: { limit_id: id, primary: { used_percent: used, resets_at: 5 } } } }) + '\n');
+      writeFileSync(path, JSON.stringify({ timestamp: new Date(time * 1000).toISOString(), type: 'event_msg', payload: { type: 'token_count', rate_limits: { limit_id: id, primary: { used_percent: used, resets_at: 5, window_minutes: 300 } } } }) + '\n');
       utimesSync(path, time, time);
     }
-    expect(readCodexQuota({ CODEX_HOME: root })).toEqual({ used_percent: 22, resets_at: 5, at: null, mtime: 200000 });
+    expect(readCodexQuota({ CODEX_HOME: root })).toEqual({ used_percent: 22, resets_at: 5, window_minutes: 300, at: new Date(200000).toISOString(), mtime: 200000 });
   }));
   it('records successes and failed launches exactly once without altering their result', async () => {
     const rows = []; let time = 100;

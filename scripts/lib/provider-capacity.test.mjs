@@ -1,6 +1,6 @@
 import { test } from 'vitest';
 import assert from 'node:assert/strict';
-import { mkdtempSync, writeFileSync, readFileSync, readdirSync, rmSync, mkdirSync } from 'node:fs';
+import { mkdtempSync, writeFileSync, readFileSync, readdirSync, rmSync, mkdirSync, utimesSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { PROVIDER_DEFAULTS, readProviderCapacity, scoreProvider, chooseBuilder, burnWindows, planLine, calendarReset } from './provider-capacity.mjs';
@@ -19,9 +19,111 @@ const choose = (capacities, settings = {}, kind = 'fix') => chooseBuilder({ kind
 const repo = { routing: { builder: 'auto', capacity: { claudeUsageAccount: 'claude-a' } } };
 const chain = capacities => resolveFixExecutorChain({ repo, platform: {}, env: {}, capacity: capacities, now, quota: () => null, record: () => {} }).value;
 
+const rolloutLine = (at, used = 94, reset = now + 120 * hour) => JSON.stringify({
+  timestamp: new Date(at).toISOString(), type: 'event_msg', payload: { type: 'token_count',
+    rate_limits: { limit_id: 'codex', primary: { used_percent: used, resets_at: reset / 1000, window_minutes: 10080 } } },
+});
+
+test('codex reading comes from the newest rollout rate_limits and beats an older operator reading', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'capacity-live-'));
+  try {
+    mkdirSync(join(dir, 'sessions'));
+    const latest = join(dir, 'sessions', 'latest.jsonl');
+    writeFileSync(latest, `${rolloutLine(now)}\n${rolloutLine(now - 3 * hour, 80)}\n`);
+    utimesSync(latest, new Date(now - 4 * hour), new Date(now - 4 * hour));
+    const old = join(dir, 'sessions', 'old.jsonl');
+    writeFileSync(old, `${rolloutLine(now - 2 * hour, 90)}\n`);
+    utimesSync(old, new Date(now), new Date(now));
+    const settings = { providers: [{ ...providers[0], operatorReading: {
+      asOf: now - hour, usedPercent: 92, resetsAt: now + 120 * hour } }] };
+    const read = () => observeCapacity({ env: { HOME: dir, CODEX_HOME: dir, CONVEYOR_STATE_ROOT: dir },
+      now, settings, records: [] })[0];
+    assert.equal(read().windows[0].usedPercent, 94);
+    assert.equal(read().windows[0].source, 'live');
+    // A reset starts a new bucket: read again rather than keeping the highest percentage.
+    writeFileSync(latest, `${rolloutLine(now, 2, now + 168 * hour)}\n`);
+    assert.equal(read().windows[0].usedPercent, 2);
+    assert.equal(read().windows[0].resetsAt, now + 168 * hour);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
 test('shared setup disables capacity host readers by default', () => {
   assert.equal(process.env.WE_CAPACITY_READERS, 'off');
   assert.ok(observeCapacity({ now }).every(c => !c.known && !c.held && c.currentRatePerHour === null));
+});
+
+test('rollout tails are bounded and missing or changed quota evidence stays unknown', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'capacity-tail-'));
+  try {
+    mkdirSync(join(dir, 'sessions'));
+    const file = join(dir, 'sessions', 'rollout.jsonl'), env = { CODEX_HOME: dir };
+    const valid = JSON.parse(rolloutLine(now));
+    writeFileSync(file, `${rolloutLine(now)}\n${' '.repeat(256 * 1024)}\n`);
+    assert.equal(readCodexQuota(env), null); // Outside the tail: refresh the rollout or use an operator reading.
+    writeFileSync(file, `${'x'.repeat(300 * 1024)}\n${rolloutLine(now)}\n`);
+    assert.equal(readCodexQuota(env).used_percent, 94);
+    for (const change of [e => delete e.timestamp, e => e.timestamp = 'bad',
+      e => delete e.payload.rate_limits.primary.window_minutes,
+      e => delete e.payload.rate_limits.primary.resets_at,
+      e => e.payload.rate_limits.primary.used_percent = '94',
+      e => e.payload.rate_limits.primary.used_percent = 101,
+      e => e.payload.rate_limits.primary = null]) {
+      const broken = structuredClone(valid); change(broken);
+      writeFileSync(file, `${rolloutLine(now - hour)}\n${JSON.stringify(broken)}\n`);
+      assert.equal(readCodexQuota(env), null);
+    }
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('Claude file account map attributes only the mapped account and keeps unknown accounts unknown', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'capacity-account-'));
+  try {
+    mkdirSync(join(dir, '.plateau'));
+    const file = join(dir, '.plateau', 'claude-usage.json');
+    const env = { HOME: dir, CONVEYOR_STATE_ROOT: dir };
+    const settings = { claudeAccountMap: { work: 'claude-b' }, claudeUsageAccount: 'claude-a' };
+    const read = (account, extra = {}) => {
+      writeFileSync(file, JSON.stringify({ at: now, account, seven_day: { used_percentage: 42, resets_at: now + 120 * hour } }));
+      return observeCapacity({ env, now, settings: { ...settings, ...extra }, quota: () => null, records: [] });
+    };
+    const mapped = read('work');
+    assert.deepEqual(mapped.filter(c => c.provider === 'claude').map(c => c.known), [false, true]);
+    assert.equal(mapped.find(c => c.account === 'claude-b').windows[0].usedPercent, 42);
+    const selected = effectiveBuilder({ repo: { routing: { builder: 'auto', capacity: settings } },
+      env, platform: {}, capacity: mapped, now, quota: () => null, record: () => {} });
+    assert.equal(selected.decision.account, 'claude-b');
+    for (const cs of [read('unmapped'), read('toString'), read(undefined, { claudeUsageAccount: null }),
+      read('work', { claudeAccountMap: { work: 'not-an-account' } })]) {
+      for (const c of cs.filter(c => c.provider === 'claude')) {
+        assert.equal(c.known, false);
+        assert.equal(scoreProvider(c, 'fix').usedPercent, null);
+      }
+    }
+    assert.equal(read(undefined).find(c => c.account === 'claude-a').known, true);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('capacity freshness clock preserves six-hour expiry and never treats readings older than a day as known', () => {
+  const settings = { providers: [providers[0]] };
+  const readers = { codex: () => ({ at: now, used_percent: 94, resets_at: now + 168 * hour }) };
+  const read = (age, extra = {}) => readProviderCapacity({ now: now + age * hour, settings: { ...settings, ...extra }, readers })[0];
+  assert.equal(read(6).known, true);
+  assert.equal(read(6 + 1 / hour).known, false);
+  assert.equal(read(25).stale, true);
+  assert.equal(read(25, { staleHours: 72 }).known, false);
+  const seeded = readProviderCapacity({ now: now + 25 * hour, settings: { providers: [{ ...providers[0],
+    operatorReading: { asOf: now, usedPercent: 92, resetsAt: now + 168 * hour } }], operatorReadingMaxAgeHours: 72 } })[0];
+  assert.equal(seeded.operatorReadingStale, true);
+  assert.equal(seeded.stale, true);
+  assert.equal(seeded.known, false);
+  assert.equal(scoreProvider(seeded, 'fix').score, null);
+});
+
+test('a live reading stamped seconds after the read clock is live; one far in the future is not', () => {
+  const readers = skew => ({ codex: () => ({ at: now + skew, used_percent: 94, resets_at: now + 168 * hour }) });
+  const read = skew => readProviderCapacity({ now, settings: { providers: [providers[0]] }, readers: readers(skew) })[0];
+  assert.equal(read(5000).known, true);
+  assert.equal(read(10 * 60000).known, false);
 });
 
 test('capacity readers off ignores persisted usage and operator seeds but preserves injected readers', () => {
@@ -29,9 +131,9 @@ test('capacity readers off ignores persisted usage and operator seeds but preser
   try {
     const env = { HOME: dir, CODEX_HOME: dir, CONVEYOR_STATE_ROOT: dir,
       WE_CODEX_USAGE_LEDGER: join(dir, 'codex.jsonl'), WE_CAPACITY_LEDGER: join(dir, 'decisions.jsonl') };
-    const raw = { at: now, used_percent: 27, resets_at: (now + hour) / 1000 };
+    const raw = { at: now, used_percent: 27, resets_at: (now + hour) / 1000, window_minutes: 300 };
     mkdirSync(join(dir, 'sessions'));
-    writeFileSync(join(dir, 'sessions', 'rollout.jsonl'), JSON.stringify({ type: 'event_msg', payload: {
+    writeFileSync(join(dir, 'sessions', 'rollout.jsonl'), JSON.stringify({ timestamp: new Date(now).toISOString(), type: 'event_msg', payload: {
       type: 'token_count', rate_limits: { limit_id: 'codex', primary: raw } } }));
     mkdirSync(join(dir, '.plateau'));
     const usage = { at: now, five_hour: { used_percentage: 20, resets_at: now + hour } };
@@ -222,9 +324,9 @@ test('plan line, calendar scores, burn detection, durable dedupe and never-throw
 test('Codex live reader preserves primary shape and returns secondary', () => {
   const dir = mkdtempSync(join(tmpdir(), 'quota-'));
   try {
-    const secondary = { used_percent: 40, resets_at: (now + hour) / 1000 };
+    const secondary = { used_percent: 40, resets_at: (now + hour) / 1000, window_minutes: 10080 };
     mkdirSync(join(dir, 'sessions'));
-    writeFileSync(join(dir, 'sessions', 'rollout.jsonl'), JSON.stringify({ type: 'event_msg', payload: { type: 'token_count', rate_limits: { limit_id: 'codex', primary: { used_percent: 27, resets_at: now / 1000 }, secondary } } }));
+    writeFileSync(join(dir, 'sessions', 'rollout.jsonl'), JSON.stringify({ timestamp: new Date(now).toISOString(), type: 'event_msg', payload: { type: 'token_count', rate_limits: { limit_id: 'codex', primary: { used_percent: 27, resets_at: now / 1000, window_minutes: 300 }, secondary } } }));
     const result = readCodexQuota({ CODEX_HOME: dir });
     assert.equal(result.used_percent, 27); assert.deepEqual(result.secondary, secondary);
   } finally { rmSync(dir, { recursive: true, force: true }); }
@@ -300,7 +402,7 @@ test('operator readings expire at configured age despite a future reset and unav
   assert.equal(stale[0].known, false);
   assert.equal(choose(stale).provider, null);
   assert.match(renderCalendar(capacityCalendar({ capacities: stale, settings, now })), /operator reading stale — refresh/);
-  assert.equal(read({ operatorReadingMaxAgeHours: 72 })[0].known, true);
+  assert.equal(read({ operatorReadingMaxAgeHours: 72 })[0].known, false); // The daily ceiling cannot be extended.
   assert.equal(read({ operatorReadingMaxAgeHours: 71 })[0].known, false);
   const live = readProviderCapacity({ settings, now, readers: { codex: () => ({ at: now, used_percent: 10, resets_at: now + hour }) } });
   assert.equal(live[0].known, true);
