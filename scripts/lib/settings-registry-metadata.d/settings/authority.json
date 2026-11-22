@@ -1,0 +1,6 @@
+{
+  "description": "Repository grant for orchestrator red-main quarantine authority.",
+  "owner": "scripts/settings/orchestrator-authority.json",
+  "changeVia": "pr",
+  "instant": false
+}

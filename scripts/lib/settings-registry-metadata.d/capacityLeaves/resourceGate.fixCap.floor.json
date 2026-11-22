@@ -1,0 +1,5 @@
+{
+  "description": "Minimum adaptive fix capacity.",
+  "range": "integer 1–24",
+  "unit": "workers"
+}

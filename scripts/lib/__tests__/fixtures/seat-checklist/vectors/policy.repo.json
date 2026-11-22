@@ -1,0 +1,44 @@
+{
+ "policyType": "https://everstandards.dev/core/rubric-policy/v0.1",
+ "id": "https://everstandards.dev/core/fixtures/policies/repo",
+ "level": "repo",
+ "parent": {
+  "uri": "https://everstandards.dev/core/fixtures/policies/company",
+  "digest": {
+   "sha256": "37d73e81ebe761aebce5ffcae23e645c484aab5744aa9c37bc8b61b1e0097bf7"
+  }
+ },
+ "seats": [
+  {
+   "lens": "security",
+   "rubric": {
+    "uri": "https://everstandards.dev/core/fixtures/rubrics/merge-path",
+    "digest": {
+     "sha256": "6d3cab5df71b9438dfef2eb4f65a2f7b5e0d25a37eff206223f207e8a7994953"
+    }
+   },
+   "required": "all",
+   "na": {
+    "allowed": true,
+    "neverNa": [
+     "MP1",
+     "MP2",
+     "MP5",
+     "MP7",
+     "MP9"
+    ],
+    "max": 5
+   },
+   "evidence": {
+    "minKind": "quoted-citation"
+   },
+   "citeScope": "tree",
+   "check": {
+    "uri": "https://everstandards.dev/core/fixtures/checks/seat-gate",
+    "digest": {
+     "sha256": "1f0e3dad99908345f7439f8ffabdffc4c4c5a5e6c0d6f0b8a3b9a3f0c4d6e7f8"
+    }
+   }
+  }
+ ]
+}

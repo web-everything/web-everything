@@ -1,0 +1,6 @@
+{
+  "description": "Line margin around a finding region in fix scope.",
+  "owner": "scripts/settings/fix-scope.json",
+  "changeVia": "pr",
+  "instant": false
+}

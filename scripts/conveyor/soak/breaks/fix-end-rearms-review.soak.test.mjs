@@ -22,7 +22,8 @@ const PRE_FIX_COMMIT = '163e9fe190bacdf6ebbcdc6786ddc9305e600aa6';
 const CORE = 'scripts/conveyor/reconcile-core.mjs';
 const SEND_BACKS = 'scripts/lib/operator-send-backs.mjs';
 
-// Committed change manifest from PRE_FIX_COMMIT to the completed R618 implementation.
+// R618 behavior manifest, maintained as later changes reshape its guards.
+// PR #7263 separates current-head clock validation from cross-head history validation.
 // Keep it independent of FIX_MARKERS and moving refs: a merge must not delete the omission cases.
 // Comments, blank lines and delimiter-only lines carry no independent R618 behavior.
 const R618_CHANGE_MANIFEST = {
@@ -41,11 +42,12 @@ const R618_CHANGE_MANIFEST = {
     ".filter(({ c }) => isTrustedMarkerAuthor(c) && (isReviewVerdictComment(c) || latestAdvisory([c])))",
     ".filter(({ c }) => !isOperatorAuthored(c) || !openOperatorSendBacks({ comments: [c] }).length)",
     ".map(({ c, index }) => ({ index, head: reviewedHeadsOf(c).at(-1) ?? latestAdvisory([c])?.head, at: Date.parse(c.createdAt) }));",
-    "if (!reviews.length || reviews.some(r => !r.head || !Number.isFinite(r.at))) return null;",
+    "if (!reviews.length) return null;",
     "const current = reviews.filter(r => sameHeadSha(r.head, pr.headRefOid));",
     "if (currentHeadOnly) {",
-    "if (current.some((r, i) => i > 0 && r.at <= current[i - 1].at)) return null;",
+    "if (current.some((r, i) => !Number.isFinite(r.at) || (i > 0 && r.at <= current[i - 1].at))) return null;",
     "return current.at(-1) ?? null;",
+    "if (reviews.some(r => !r.head || !Number.isFinite(r.at))) return null;",
     "if (current.length || reviews.some((r, i) => i > 0 && r.at <= reviews[i - 1].at)) return null;",
     "return reviews.at(-1);",
     "function operatorSendBackAfterReview(pr) {",
@@ -69,7 +71,7 @@ const R618_CHANGE_MANIFEST = {
     "why: `operator send-back by @${sendBack.login} with a must-fix body — re-armed once as a fix (operator re-arm)`,",
     "const lastReview = latestHeadReview(pr);",
     "const release = releasedFixClaim(pr);",
-    "if (OWED[phase] && lastReview && release && release.releasedAtMs > lastReview.at",
+    "if (OWED[phase] && !unreadableHeadMoveAdvisory && lastReview && release && release.releasedAtMs > lastReview.at",
     "&& !withPhase.labels.includes(CONFLICT_LABEL) && String(pr?.mergeStateStatus ?? '').toUpperCase() !== 'DIRTY'",
     "&& release.index > lastReview.index",
     "&& !sameHeadSha(lastReview.head, pr.headRefOid)",
@@ -111,7 +113,7 @@ it('R618 enumeration remains nonempty when origin/main equals HEAD and the integ
     expect(execFileSync('git', ['rev-parse', 'origin/main'])).toBe(execFileSync('git', ['rev-parse', 'HEAD']));
     expect(execFileSync('git', ['diff', 'origin/main', '--', CORE, SEND_BACKS])).toBe('');
     const calls = git.mock.calls.length;
-    expect(addedBehaviorLines()).toHaveLength(59);
+    expect(addedBehaviorLines()).toHaveLength(60);
     expect(addedBehaviorLines()).toEqual(R618_LINES);
     expect(git.mock.calls).toHaveLength(calls);
   } finally { git.mockImplementation(original); }
@@ -122,7 +124,7 @@ it('empty R618 behavior enumeration fails closed instead of skipping omission te
 });
 
 it('FIX_MARKERS represents every behavior-bearing line added or changed by R618', () => {
-  expect(R618_LINES).toHaveLength(59);
+  expect(R618_LINES).toHaveLength(60);
   const uncovered = R618_LINES.filter(([path, source]) =>
     !(FIX_MARKERS[path] ?? []).some(marker => marker.includes(source.trim())));
   expect(uncovered).toEqual([]);

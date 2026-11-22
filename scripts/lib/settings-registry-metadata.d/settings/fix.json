@@ -1,0 +1,6 @@
+{
+  "description": "Fix context, local verification, round limits and exception policy.",
+  "owner": "scripts/settings/fix-context-pack.json",
+  "changeVia": "pr",
+  "instant": false
+}
