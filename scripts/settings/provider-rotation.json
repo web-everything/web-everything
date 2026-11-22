@@ -1,6 +1,63 @@
 {
 "providerRotation": {
   "mode": "shadow",
+  "catalog": [
+    {
+      "provider": "codex",
+      "model": "gpt-6.1-sol",
+      "effort": "high"
+    },
+    {
+      "provider": "codex",
+      "model": "gpt-6.1-sol",
+      "effort": "medium"
+    },
+    {
+      "provider": "codex",
+      "model": "gpt-6-luna",
+      "effort": "medium"
+    },
+    {
+      "provider": "codex",
+      "model": "sol",
+      "effort": "high"
+    },
+    {
+      "provider": "agy-gemini",
+      "model": "gemini-4-flash",
+      "effort": "high"
+    },
+    {
+      "provider": "agy-gemini",
+      "model": "gemini-4-carbon",
+      "effort": "high"
+    },
+    {
+      "provider": "agy-gemini",
+      "model": "gemini-4-hydrogen",
+      "effort": "high"
+    },
+    {
+      "provider": "claude",
+      "model": "claude-sonnet-5-5",
+      "effort": "medium"
+    },
+    {
+      "provider": "claude",
+      "model": "claude-haiku-5-5",
+      "effort": "medium"
+    }
+  ],
+  "exhaustedPercent": 98,
+  "reserveReleaseHours": 6,
+  "reservePercent": 10,
+  "smallArms": [
+    "hydrogen",
+    "luna",
+    "haiku",
+    "flash"
+  ],
+  "carbonPromoted": false,
   "minPanelFamilies": 2,
   "strongArms": [
     "codex/gpt-6.1-sol/high",

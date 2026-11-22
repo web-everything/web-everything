@@ -9,7 +9,12 @@ const arms = [entry('codex', 'sol', 'openai', 'strong', 60),
   entry('agy-gemini', 'carbon', 'google', 'strong', 25),
   entry('claude', 'sonnet', 'anthropic', 'strong', 15)];
 const id = arm => `${arm.provider}/${arm.model}/${arm.effort}`;
-const policy = { mode: 'shadow', minPanelFamilies: 2, strongArms: arms.map(a => id(a.arm)),
+const catalog = { codex: { sol: ['high'], luna: ['high'] },
+  'agy-gemini': { carbon: ['high'], flash: ['high'], hydrogen: ['high'] },
+  claude: { sonnet: ['high'], haiku: ['high'] }, openai: { sol: ['high'] },
+  anthropic: { sonnet: ['high'] } };
+const policy = { catalog, exhaustedPercent: 98, reserveReleaseHours: 6, reservePercent: 10,
+  smallArms: ['hydrogen', 'luna', 'haiku', 'flash'], carbonPromoted: true, mode: 'shadow', minPanelFamilies: 2, strongArms: arms.map(a => id(a.arm)),
   smallTiers: ['small'], keyLenses: ['correctness', 'security', 'red-team'],
   strongShapes: ['security', 'merge-path'], kinds: Object.fromEntries(
     ['build', 'review-correctness', 'review-security', 'review-lens', 'red-team'].map(k => [k, { arms: structuredClone(arms) }])) };
@@ -26,6 +31,70 @@ const freeze = value => { if (value && typeof value === 'object') {
 const realPolicy = () => JSON.parse(readFileSync('scripts/settings/provider-rotation.json', 'utf8')).providerRotation;
 
 describe('pure provider rotation', () => {
+  it('refuses unknown providers, models and efforts against the declared catalog, including builders', () => {
+    for (const arm of [{ provider: 'unknown', model: 'unknown', effort: 'unknown' },
+      { ...builder, provider: 'unknown' }, { ...builder, model: 'unknown' }, { ...builder, effort: 'unknown' }]) {
+      const p = clone(policy); p.kinds.build.arms[0].arm = arm;
+      expect(draw({ policy: p })).toMatchObject({ arm: null, refusal: 'invalid-policy' });
+      expect(panel({ builder: arm }).ok).toBe(false);
+    }
+  });
+  it('derives Claude family from identity despite forged family labels on two Sonnet reviewers', () => {
+    const p = clone(policy);
+    p.kinds['review-lens'].arms = [entry('claude', 'sonnet', 'google', 'strong', 1),
+      entry('anthropic', 'sonnet', 'anthropic', 'strong', 1)];
+    expect(panel({ policy: p, seats: [{ lens: 'style', counting: true }, { lens: 'style', counting: true }],
+      capacity: { ...capacity, anthropic: capacity.claude } })).toMatchObject({ ok: false, panel: [] });
+  });
+  it('excludes exhausted and reserved providers from shares and live routes', () => {
+    for (const patch of [{ usedPct: 98 }, { usedPct: 99 }, { reserve: true }, { reserved: true },
+      { reserveOnly: true }, { held: true }, { usedPct: 91, hoursToReset: 8 }]) {
+      const cap = clone(capacity); Object.assign(cap.codex, patch);
+      expect(effectiveShares(policy.kinds.build, cap, policy)[0].share).toBe(0);
+      for (let i = 0; i < 50; i++) expect(routeFor({ kind: 'build', subject: `capacity:${i}`,
+        policy: { ...policy, mode: 'on' }, capacity: cap }).route?.provider).not.toBe('codex');
+      expect(draw({ capacity: { codex: cap.codex } })).toMatchObject({ arm: null, refusal: 'no-eligible-arm' });
+    }
+  });
+  it('uses policy strongShapes when normal is promoted to a strong shape', () => {
+    const p = clone(policy); p.strongShapes.push('normal');
+    Object.values(p.kinds).forEach(k => { k.arms = [entry('codex', 'luna', 'openai', 'small', 1),
+      entry('claude', 'haiku', 'anthropic', 'small', 1)]; });
+    expect(panel({ policy: p, seats: [{ lens: 'style', counting: true }, { lens: 'style', counting: true }] }))
+      .toMatchObject({ ok: false, panel: [], refusal: 'no-strong-seat' });
+  });
+  it('refuses counting Carbon without explicit boolean promotion evidence', () => {
+    for (const value of [undefined, false, 'true']) {
+      const p = clone(policy); delete p.carbonPromoted;
+      if (value !== undefined) p.carbonPromoted = value;
+      expect(panel({ policy: p })).toMatchObject({ ok: false, panel: [] });
+    }
+    const p = clone(policy); delete p.carbonPromoted;
+    expect(panel({ policy: p, capacity: { ...capacity, carbonPromoted: true } }).ok).toBe(true);
+    expect(panel({ policy: p, seats: [{ lens: 'style', counting: true }, { lens: 'style', counting: true },
+      { lens: 'style', counting: false }] }).ok).toBe(true);
+  });
+  it.each([false, 'true'])('refuses counting Carbon when policy promotion is %j despite true capacity evidence', carbonPromoted => {
+    const p = clone(policy); p.carbonPromoted = carbonPromoted;
+    expect(panel({ policy: p, capacity: { ...capacity, carbonPromoted: true } }))
+      .toEqual({ ok: false, panel: [], refusal: 'single-family-panel' });
+  });
+  it('excludes small model identities at runtime from every key lens and strong shape even with a strong tier', () => {
+    for (const weak of [entry('codex', 'luna', 'openai', 'strong', 1),
+      entry('claude', 'haiku', 'anthropic', 'strong', 1),
+      entry('agy-gemini', 'hydrogen', 'google', 'strong', 1),
+      entry('agy-gemini', 'flash', 'google', 'strong', 1)]) {
+      const p = clone(policy); p.strongArms.push(id(weak.arm));
+      Object.values(p.kinds).forEach(k => { k.arms = [weak]; });
+      for (const lens of ['correctness', 'security', 'red-team', 'style']) {
+        for (const shape of lens === 'style' ? ['security', 'merge-path'] : ['normal']) {
+          const otherBuilder = weak.arm.provider === 'codex' ? arms[2].arm : builder;
+          expect(panel({ policy: p, builder: otherBuilder, shape,
+            seats: [{ lens, counting: true }, { lens: 'style', counting: true }] })).toMatchObject({ ok: false, panel: [] });
+        }
+      }
+    }
+  });
   it('same kind and subject always pick the same arm; shares within 2% over 10k keys', () => {
     const counts = Object.fromEntries(arms.map(a => [a.arm.provider, 0]));
     for (let i = 0; i < 10000; i++) {
@@ -42,13 +111,13 @@ describe('pure provider rotation', () => {
     const cap = clone(capacity);
     cap.codex.usedPct = 100;
     cap['agy-gemini'] = { usedPct: 0, hoursToReset: .1, manualResetsHeld: 2, available: true };
-    const shares = effectiveShares({ arms }, cap);
+    const shares = effectiveShares({ arms }, cap, policy);
     expect(shares[0].share).toBe(0);
     expect(shares[1].share).toBeGreaterThan(shares[2].share);
     expect(shares[1].share).toBeCloseTo(15000 / 15300);
     expect(shares.reduce((sum, a) => sum + a.share, 0)).toBeCloseTo(1);
     cap.claude.available = false;
-    expect(effectiveShares({ arms }, cap)[2].share).toBe(0);
+    expect(effectiveShares({ arms }, cap, policy)[2].share).toBe(0);
     delete cap['agy-gemini'];
     expect(draw({ capacity: cap }).refusal).toBe('no-eligible-arm');
   });
@@ -71,8 +140,8 @@ describe('pure provider rotation', () => {
     }
     expect(panel({ capacity: { codex: capacity.codex } })).toMatchObject({ ok: false, refusal: 'no-cross-vendor-seat' });
     const p = clone(policy);
-    p.kinds['review-security'].arms = [entry('other-openai', 'sol2', 'openai', 'strong', 1)];
-    expect(panel({ policy: p, capacity: { ...capacity, 'other-openai': capacity.codex } })).toMatchObject({ ok: false, refusal: 'no-cross-vendor-seat' });
+    p.kinds['review-security'].arms = [entry('openai', 'sol', 'openai', 'strong', 1)];
+    expect(panel({ policy: p, capacity: { ...capacity, openai: capacity.codex } })).toMatchObject({ ok: false, refusal: 'no-cross-vendor-seat' });
   });
   it('security lens and merge-path shapes keep a strong reviewer; Flash never drawn there', () => {
     const p = clone(policy);
@@ -152,7 +221,7 @@ describe('pure provider rotation', () => {
     expect(Object.isFrozen(result)).toBe(true);
     expect(Object.isFrozen(result.arm)).toBe(true);
     expect(Object.isFrozen(result.redrawn)).toBe(true);
-    expect(Object.isFrozen(effectiveShares(args.policy.kinds.build, args.capacity))).toBe(true);
+    expect(Object.isFrozen(effectiveShares(args.policy.kinds.build, args.capacity, args.policy))).toBe(true);
     const composed = panel({ policy: args.policy, capacity: args.capacity });
     expect(Object.isFrozen(composed.panel)).toBe(true);
     expect(Object.isFrozen(composed.panel[0].arm)).toBe(true);
@@ -162,7 +231,7 @@ describe('pure provider rotation', () => {
     for (const forbidden of ['node:fs', 'process.env', 'Math.random', 'Date.now']) expect(source).not.toContain(forbidden);
   });
   it('policy covers every dispatch kind and Codex holds the largest base share in each', () => {
-    const p = realPolicy();
+    const p = realPolicy(); p.carbonPromoted = true;
     expect(Object.keys(p.kinds).sort()).toEqual(['build', 'fix', 'ci-heal', 'prepare', 'audit',
       'review-correctness', 'review-security', 'review-lens', 'red-team', 'judge', 'summary', 'doc-fix'].sort());
     for (const [kind, { arms: choices }] of Object.entries(p.kinds)) {
@@ -179,13 +248,13 @@ describe('pure provider rotation', () => {
     expect(p.kinds.summary.arms.some(a => a.arm.model.includes('haiku'))).toBe(true);
   });
   it('the shipped policy draws and composes strong diverse panels', () => {
-    const p = realPolicy();
+    const p = realPolicy(); p.carbonPromoted = true;
     for (const kind of Object.keys(p.kinds)) expect(draw({ policy: p, kind }).arm).not.toBeNull();
     for (const shape of ['security', 'merge-path'])
       expect(panel({ policy: p, shape })).toMatchObject({ ok: true, refusal: null });
   });
   it('strong-arm model aliases are supported', () => {
-    const p = realPolicy(); p.strongArms = ['sol-high', 'carbon-high', 'sonnet-5-5'];
+    const p = realPolicy(); p.carbonPromoted = true; p.strongArms = ['sol-high', 'carbon-high', 'sonnet-5-5'];
     expect(panel({ policy: p, shape: 'merge-path' }).ok).toBe(true);
   });
   it('policy mode is shadow', () => { expect(realPolicy().mode).toBe('shadow'); });

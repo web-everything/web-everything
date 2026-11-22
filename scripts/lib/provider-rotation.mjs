@@ -2,7 +2,7 @@ import { createHash } from 'node:crypto';
 
 const families = ['openai', 'google', 'anthropic'];
 const keyLenses = ['correctness', 'security', 'red-team'];
-const strongShapes = ['security', 'merge-path'];
+const requiredStrongShapes = ['security', 'merge-path'];
 const armId = arm => `${arm.provider}/${arm.model}/${arm.effort}`;
 const object = value => value !== null && typeof value === 'object' && !Array.isArray(value);
 const strings = value => Array.isArray(value) && value.every(s => typeof s === 'string' && s.length);
@@ -15,36 +15,61 @@ const frozen = value => {
   return value;
 };
 const copyArm = arm => ({ provider: arm.provider, model: arm.model, effort: arm.effort });
-const validArm = arm => object(arm) && ['provider', 'model', 'effort'].every(k =>
-  typeof arm[k] === 'string' && arm[k].length && !arm[k].includes('/')) && arm.provider !== 'agy-claude';
-const validKind = kind => object(kind) && Array.isArray(kind.arms) && kind.arms.length > 0 &&
-  kind.arms.every(a => object(a) && validArm(a.arm) && families.includes(a.family) &&
+// Vendor identity comes from the provider and model, never a roster's family label.
+const providerFamilies = { codex: 'openai', openai: 'openai', claude: 'anthropic',
+  anthropic: 'anthropic', 'agy-gemini': 'google', gemini: 'google', google: 'google' };
+const familyFor = arm => {
+  if (!object(arm) || !Object.hasOwn(providerFamilies, arm.provider) || typeof arm.model !== 'string') return null;
+  const modelFamily = /^(?:claude-|sonnet(?:-|$)|opus(?:-|$)|haiku(?:-|$))/.test(arm.model) ? 'anthropic'
+    : /^(?:gpt-|sol(?:-|$)|luna(?:-|$)|terra(?:-|$)|astra(?:-|$))/.test(arm.model) ? 'openai'
+    : /^(?:gemini-|carbon(?:-|$)|hydrogen(?:-|$)|flash(?:-|$))/.test(arm.model) ? 'google' : null;
+  const providerFamily = providerFamilies[arm.provider];
+  return modelFamily === providerFamily ? providerFamily : null;
+};
+const validArm = (arm, policy) => object(arm) && ['provider', 'model', 'effort'].every(k =>
+  typeof arm[k] === 'string' && arm[k].length && !arm[k].includes('/')) &&
+  familyFor(arm) !== null && catalogHas(arm, policy?.catalog);
+// Flat triples keep dotted model names as values in settings; injected callers may use a lookup map.
+const catalogHas = (arm, catalog) => Array.isArray(catalog)
+  ? catalog.some(a => object(a) && a.provider === arm.provider && a.model === arm.model && a.effort === arm.effort)
+  : object(catalog) && Object.hasOwn(catalog, arm.provider) && object(catalog[arm.provider]) &&
+    Object.hasOwn(catalog[arm.provider], arm.model) && strings(catalog[arm.provider][arm.model]) &&
+    catalog[arm.provider][arm.model].includes(arm.effort);
+const validKind = (kind, policy) => object(kind) && Array.isArray(kind.arms) && kind.arms.length > 0 &&
+  kind.arms.every(a => object(a) && validArm(a.arm, policy) &&
     ['small', 'standard', 'strong'].includes(a.tier) && Number.isFinite(a.share) && a.share > 0) &&
   new Set(kind.arms.map(a => armId(a.arm))).size === kind.arms.length;
+const validBounds = policy => object(policy) &&
+  Number.isFinite(policy.exhaustedPercent) && policy.exhaustedPercent > 0 && policy.exhaustedPercent <= 100 &&
+  Number.isFinite(policy.reserveReleaseHours) && policy.reserveReleaseHours >= 0 &&
+  Number.isFinite(policy.reservePercent) && policy.reservePercent >= 0 && policy.reservePercent <= 100;
 const validPolicy = policy => object(policy) && ['off', 'shadow', 'on'].includes(policy.mode) &&
   Number.isInteger(policy.minPanelFamilies) && policy.minPanelFamilies >= 2 && policy.minPanelFamilies <= 3 &&
   strings(policy.strongArms) && policy.strongArms.length > 0 && strings(policy.smallTiers) &&
-  policy.smallTiers.includes('small') && strings(policy.keyLenses) &&
+  policy.smallTiers.includes('small') && strings(policy.smallArms) && strings(policy.keyLenses) &&
   keyLenses.every(l => policy.keyLenses.includes(l)) && strings(policy.strongShapes) &&
-  strongShapes.every(s => policy.strongShapes.includes(s)) && object(policy.kinds) &&
-  Object.values(policy.kinds).length > 0 && Object.values(policy.kinds).every(validKind) &&
-  // One provider cannot acquire a different vendor family through another kind.
-  Object.values(policy.kinds).flatMap(k => k.arms).every((a, _, all) =>
-    all.every(b => b.arm.provider !== a.arm.provider || b.family === a.family));
+  requiredStrongShapes.every(s => policy.strongShapes.includes(s)) && validBounds(policy) && object(policy.kinds) &&
+  Object.values(policy.kinds).length > 0 && Object.values(policy.kinds).every(k => validKind(k, policy));
 
 // Spare quota per hour, reset floor 15 minutes; each held manual reset adds 25%.
 // Unknown, incomplete, unavailable or exhausted capacity contributes zero, never full quota.
-const spare = cap => {
+const spare = (cap, policy) => {
   if (!object(cap) || cap.available !== true || !Number.isFinite(cap.usedPct) ||
-    cap.usedPct < 0 || cap.usedPct > 100 || !Number.isFinite(cap.hoursToReset) || cap.hoursToReset < 0 ||
+    cap.usedPct < 0 || cap.usedPct >= policy.exhaustedPercent ||
+    ['reserve', 'reserved', 'reserveOnly', 'held'].some(k => cap[k] !== undefined && cap[k] !== false) ||
+    ['reserve-only', 'exhausted', 'held'].includes(cap.label) || !Number.isFinite(cap.hoursToReset) || cap.hoursToReset < 0 ||
     !Number.isInteger(cap.manualResetsHeld) || cap.manualResetsHeld < 0) return 0;
-  const rate = (100 - cap.usedPct) / Math.max(cap.hoursToReset, .25) * (1 + .25 * cap.manualResetsHeld);
+  const reserve = cap.reservePercent ?? policy.reservePercent;
+  if (!Number.isFinite(reserve) || reserve < 0 || reserve > 100) return 0;
+  const effectiveUsed = cap.usedPct + (cap.hoursToReset > policy.reserveReleaseHours ? reserve : 0);
+  if (effectiveUsed >= 100) return 0;
+  const rate = (100 - effectiveUsed) / Math.max(cap.hoursToReset, .25) * (1 + .25 * cap.manualResetsHeld);
   return Number.isFinite(rate) ? rate : 0;
 };
-export function effectiveShares(kindPolicy, capacity) {
-  if (!validKind(kindPolicy) || !object(capacity)) return frozen([]);
-  const weighted = kindPolicy.arms.map(a => ({ ...a, arm: copyArm(a.arm),
-    share: a.share * spare(capacity[a.arm.provider]) }));
+export function effectiveShares(kindPolicy, capacity, policy) {
+  if (!validBounds(policy) || !validKind(kindPolicy, policy) || !object(capacity)) return frozen([]);
+  const weighted = kindPolicy.arms.map(a => ({ ...a, arm: copyArm(a.arm), family: familyFor(a.arm),
+    share: a.share * spare(capacity[a.arm.provider], policy) }));
   const total = weighted.reduce((sum, a) => sum + a.share, 0);
   return frozen(weighted.map(a => ({ ...a, share: Number.isFinite(total) && total > 0 ? a.share / total : 0 })));
 }
@@ -63,7 +88,7 @@ export function drawArm({ kind, subject, policy, capacity, exclude = [] } = {}) 
   if (typeof subject !== 'string' || !subject.length || !strings(exclude)) return refuse('invalid-input');
   if (!object(capacity)) return refuse('missing-capacity');
   result.bucket = bucketFor(kind, subject);
-  let choices = effectiveShares(policy.kinds[kind], capacity);
+  let choices = effectiveShares(policy.kinds[kind], capacity, policy);
   result.ineligible = choices.filter(a => !a.share || exclude.includes(armId(a.arm))).map(a => armId(a.arm));
   choices = choices.filter(a => a.share > 0);
   // Re-walk the same bucket after each rejected arm. The finite roster bounds redraws.
@@ -83,7 +108,9 @@ const strong = (entry, policy) => {
     `${model}-${entry.arm.effort}`, `${short}-${entry.arm.effort}`].some(id => policy.strongArms.includes(id));
 };
 const small = (entry, policy) => policy.smallTiers.includes(entry.tier) ||
-  /hydrogen|luna|haiku/i.test(entry.arm.model);
+  /hydrogen|luna|haiku|flash/i.test(entry.arm.model) ||
+  policy.smallArms.some(id => id === armId(entry.arm) || id === entry.arm.model ||
+    id === entry.arm.model.replace(/^(?:claude-|gpt-[\d.]+-|gemini-4-)/, ''));
 const seatKind = lens => lens === 'red-team' ? 'red-team' :
   ['correctness', 'security'].includes(lens) ? `review-${lens}` : 'review-lens';
 
@@ -92,30 +119,33 @@ export function composePanel({ seats, builder, policy, capacity, subject, shape 
   if (!validPolicy(policy)) return refuse('invalid-policy');
   if (!object(capacity)) return refuse('missing-capacity');
   // S1.1 has one ordinary shape and the two explicit strong shapes. Unknown shapes wait.
-  if (!['normal', ...strongShapes].includes(shape)) return refuse('unknown-shape');
+  if (!['normal', ...policy.strongShapes].includes(shape)) return refuse('unknown-shape');
   // Refusal means the PR waits for corrected evidence/operator action; never use a partial panel.
   if (Array.isArray(seats) && seats.length > 16) return refuse('panel-too-large');
   if (!Array.isArray(seats) || !seats.length || !seats.every(s =>
     object(s) && typeof s.lens === 'string' && s.lens.length && typeof s.counting === 'boolean') ||
-    !validArm(builder) || typeof subject !== 'string' || !subject.length) return refuse('invalid-input');
-  const roster = Object.values(policy.kinds).flatMap(k => k.arms);
-  const builderFamily = roster.find(a => a.arm.provider === builder.provider)?.family;
+    !validArm(builder, policy) || typeof subject !== 'string' || !subject.length) return refuse('invalid-input');
+  const builderFamily = familyFor(builder);
   if (!builderFamily) return refuse('unknown-builder-family');
-  const needsStrong = strongShapes.includes(shape);
+  const needsStrong = policy.strongShapes.includes(shape);
+  // An explicit malformed/false flag cannot fall through to another true source.
+  const carbonPromoted = (policy.carbonPromoted === undefined ? capacity.carbonPromoted : policy.carbonPromoted) === true;
   const candidates = [];
   for (const seat of seats) {
     const kind = seatKind(seat.lens);
     if (!Object.hasOwn(policy.kinds, kind)) return refuse('unknown-kind');
-    let eligible = effectiveShares(policy.kinds[kind], capacity).filter(a => a.share > 0);
+    let eligible = effectiveShares(policy.kinds[kind], capacity, policy).filter(a => a.share > 0);
     if (policy.keyLenses.includes(seat.lens)) {
       eligible = eligible.filter(a => a.family !== builderFamily);
       if (!eligible.length) return refuse('no-cross-vendor-seat');
     }
+    if (seat.counting && !carbonPromoted) eligible = eligible.filter(a => !/carbon/i.test(a.arm.model));
     // Security seats and strong shapes admit strong arms only (including excluding Flash).
     if (needsStrong || seat.lens === 'security') {
       eligible = eligible.filter(a => !small(a, policy) && strong(a, policy));
       if (!eligible.length) return refuse('no-strong-seat');
     }
+    if (policy.keyLenses.includes(seat.lens)) eligible = eligible.filter(a => !small(a, policy));
     if (!eligible.length) return refuse('no-eligible-arm');
     candidates.push(eligible);
   }
