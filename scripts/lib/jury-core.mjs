@@ -1953,13 +1953,13 @@ export function buildPanelFindings(lensFindings = {}) {
  * @verdicts-total — every `VERDICTS` member is handled explicitly (needs-human, changes, prevention-outstanding,
  *   accept); the `check:standards` verdict-totality gate enforces it, so a new enum member can't be dropped here.
  * @param {{lensVerdicts: Object<string, 'accept'|'changes'|'needs-human'|'prevention-outstanding'>, humanRequired?: boolean,
- *   conflict?: boolean, degradedBasis?: boolean, mandatoryLenses?: string[], findings: Array<object>}} o -
+ *   conflict?: boolean, degradedBasis?: boolean, mandatoryLenses?: string[], findings: Array<object>, seatGates?: Object<string, 'pass'|'not-pass'>, seatGateNotes?: string[]}} o -
  *   `findings` (REQUIRED) is the WHOLE panel's list (`buildPanelFindings(lensFindings)`); the prevention scan
  *   reads it, immune to per-lens verdict flattening. `degradedBasis` (#xu2pp2m) defaults to `false`, so every
  *   pre-existing caller is byte-stable.
  * @returns {'accept'|'changes'|'needs-human'|'prevention-outstanding'}
  */
-export function derivePanelVerdict({ lensVerdicts = {}, humanRequired = false, conflict = false, degradedBasis = false, mandatoryLenses = MANDATORY_LENSES, findings, bar = PREVENTION_IMPACT_BAR } = {}) {
+export function derivePanelVerdict({ lensVerdicts = {}, humanRequired = false, conflict = false, degradedBasis = false, mandatoryLenses = MANDATORY_LENSES, findings, bar = PREVENTION_IMPACT_BAR, seatGates, seatGateNotes } = {}) {
   if (findings === undefined) {
     throw new Error('derivePanelVerdict: `findings` is required — pass buildPanelFindings(lensFindings) (or an explicit [] to assert none). A defaulted [] silently reinstates the #2823 advisory-prevention leak on the drain path.');
   }
@@ -1995,6 +1995,14 @@ export function derivePanelVerdict({ lensVerdicts = {}, humanRequired = false, c
   // findings still surfaces it (byte-stable for the pre-round-2 verdict-only callers).
   const preventionFromLens = Object.values(lensVerdicts).some((v) => v === VERDICTS.PREVENTION_OUTSTANDING);
   if (preventionFromFindings || preventionFromLens) return VERDICTS.PREVENTION_OUTSTANDING;
+  // CKLST-B: only explicitly enforced callers supply this map. Shadow omits it entirely.
+  if (seatGates !== undefined) {
+    const blank = mandatoryLenses.filter(lens => lensVerdicts[lens] === VERDICTS.ACCEPT && seatGates?.[lens] !== 'pass');
+    if (blank.length) {
+      if (Array.isArray(seatGateNotes)) seatGateNotes.push(`blank accept: answer ${blank.map(lens => `${lens} rubric items`).join(', ')}`);
+      return VERDICTS.CHANGES;
+    }
+  }
   if (mandatoryVerdicts.every((v) => v === VERDICTS.ACCEPT)) return VERDICTS.ACCEPT;
   return VERDICTS.CHANGES;
 }

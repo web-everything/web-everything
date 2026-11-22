@@ -1,0 +1,173 @@
+{
+ "rubricType": "https://everstandards.dev/core/rubric/v0.1",
+ "id": "https://github.com/plateauapp/plateau-settings/blob/main/review/rubrics/security",
+ "version": "2026-11-22.2",
+ "title": "Security seat: basic list on every PR (SB1-SB4, CKLST-1 A) plus the merge-path lines MP1-MP14 when the diff touches merge-path code",
+ "items": [
+  {
+   "id": "SB1",
+   "text": "Secrets. The diff adds no secret, token, key or credential to code, config, fixtures, logs or output; secrets are read only from the configured secret store or App token, never hard-coded and never from personal credentials.",
+   "sourceId": "v5.0.0-13.3.1",
+   "source": "https://github.com/OWASP/ASVS/blob/v5.0.0/5.0/en/0x22-V13-Configuration.md",
+   "naAllowed": false
+  },
+  {
+   "id": "SB2",
+   "text": "Access boundaries. Every new or changed action that writes, merges, labels, deletes or reads protected data checks the caller's explicit permission at a trusted layer, and the change does not widen who or what may act.",
+   "sourceId": "v5.0.0-8.2.1",
+   "source": "https://github.com/OWASP/ASVS/blob/v5.0.0/5.0/en/0x17-V8-Authorization.md"
+  },
+  {
+   "id": "SB3",
+   "text": "Untrusted input. Every input from outside the trust boundary (PR text, comments, labels, branch names, file contents, API responses, CLI arguments, env) is checked against an allow-list or expected structure before it decides anything or reaches a shell, path or eval.",
+   "sourceId": "v5.0.0-2.2.1",
+   "source": "https://github.com/OWASP/ASVS/blob/v5.0.0/5.0/en/0x11-V2-Validation-and-Business-Logic.md"
+  },
+  {
+   "id": "SB4",
+   "text": "Fail-closed defaults. Every error, exception, timeout, missing or unreadable input, and every default value ends in refuse or pending, never in allow.",
+   "sourceId": "v5.0.0-16.5.3",
+   "source": "https://github.com/OWASP/ASVS/blob/v5.0.0/5.0/en/0x25-V16-Security-Logging-and-Error-Handling.md"
+  },
+  {
+   "id": "MP1",
+   "text": "Producer identity. Is every status, check or comment trusted only from the expected App, bot or login? (Not by name; a newer \"success\" from another app must not count.)",
+   "naWhen": {
+    "uri": "https://github.com/plateauapp/plateau-settings/blob/main/review/checks/diff-touches-no-merge-path",
+    "digest": {
+     "sha256": "97bd449e86ade1459179f2a2580c254a5b84fd544ebd108d995decf518c36a68"
+    }
+   }
+  },
+  {
+   "id": "MP2",
+   "text": "Present vs absent. Does a missing required signal (check, status, hold, record) refuse, rather than count as \"nothing blocking\"?",
+   "naWhen": {
+    "uri": "https://github.com/plateauapp/plateau-settings/blob/main/review/checks/diff-touches-no-merge-path",
+    "digest": {
+     "sha256": "97bd449e86ade1459179f2a2580c254a5b84fd544ebd108d995decf518c36a68"
+    }
+   }
+  },
+  {
+   "id": "MP3",
+   "text": "Ordering. Is it ordered by id or sequence, never by created_at or timestamps (missing, invalid or equal timestamps)?",
+   "naWhen": {
+    "uri": "https://github.com/plateauapp/plateau-settings/blob/main/review/checks/diff-touches-no-merge-path",
+    "digest": {
+     "sha256": "97bd449e86ade1459179f2a2580c254a5b84fd544ebd108d995decf518c36a68"
+    }
+   }
+  },
+  {
+   "id": "MP4",
+   "text": "Read-then-write races. Is there a re-read after every write, fail-closed if anything changed or appeared (concurrent holds, other hosts)?",
+   "naWhen": {
+    "uri": "https://github.com/plateauapp/plateau-settings/blob/main/review/checks/diff-touches-no-merge-path",
+    "digest": {
+     "sha256": "97bd449e86ade1459179f2a2580c254a5b84fd544ebd108d995decf518c36a68"
+    }
+   }
+  },
+  {
+   "id": "MP5",
+   "text": "Head binding. Is every decision pinned to an exact 40-hex head, re-verified right before and after the write, with refusal on a moved head?",
+   "naWhen": {
+    "uri": "https://github.com/plateauapp/plateau-settings/blob/main/review/checks/diff-touches-no-merge-path",
+    "digest": {
+     "sha256": "97bd449e86ade1459179f2a2580c254a5b84fd544ebd108d995decf518c36a68"
+    }
+   }
+  },
+  {
+   "id": "MP6",
+   "text": "Binding to the round or run. Can a hold or success from one round or run clear another? Bind to an id; refuse unbound.",
+   "naWhen": {
+    "uri": "https://github.com/plateauapp/plateau-settings/blob/main/review/checks/diff-touches-no-merge-path",
+    "digest": {
+     "sha256": "97bd449e86ade1459179f2a2580c254a5b84fd544ebd108d995decf518c36a68"
+    }
+   }
+  },
+  {
+   "id": "MP7",
+   "text": "Fail-open catches. Does any try/catch, default value or \"unknown\" path end in allow? Every unreadable input must refuse.",
+   "naWhen": {
+    "uri": "https://github.com/plateauapp/plateau-settings/blob/main/review/checks/diff-touches-no-merge-path",
+    "digest": {
+     "sha256": "97bd449e86ade1459179f2a2580c254a5b84fd544ebd108d995decf518c36a68"
+    }
+   }
+  },
+  {
+   "id": "MP8",
+   "text": "Write ordering. Is dedupe or state persisted only AFTER the effect succeeds (no suppressed retries)?",
+   "naWhen": {
+    "uri": "https://github.com/plateauapp/plateau-settings/blob/main/review/checks/diff-touches-no-merge-path",
+    "digest": {
+     "sha256": "97bd449e86ade1459179f2a2580c254a5b84fd544ebd108d995decf518c36a68"
+    }
+   }
+  },
+  {
+   "id": "MP9",
+   "text": "Crash windows. If the process dies between steps, which state is left? Never leave a gate open; post a pending hold first and success last.",
+   "naWhen": {
+    "uri": "https://github.com/plateauapp/plateau-settings/blob/main/review/checks/diff-touches-no-merge-path",
+    "digest": {
+     "sha256": "97bd449e86ade1459179f2a2580c254a5b84fd544ebd108d995decf518c36a68"
+    }
+   }
+  },
+  {
+   "id": "MP10",
+   "text": "Credentials. Which token writes? Never fall back to personal credentials; refuse without the App token.",
+   "naWhen": {
+    "uri": "https://github.com/plateauapp/plateau-settings/blob/main/review/checks/diff-touches-no-merge-path",
+    "digest": {
+     "sha256": "97bd449e86ade1459179f2a2580c254a5b84fd544ebd108d995decf518c36a68"
+    }
+   }
+  },
+  {
+   "id": "MP11",
+   "text": "Environment hardening. Are GIT_DIR, GIT_WORK_TREE, replace objects, grafts, commit-graph, PATH and credential helpers controlled? Fetches must verify the fetched sha.",
+   "naWhen": {
+    "uri": "https://github.com/plateauapp/plateau-settings/blob/main/review/checks/diff-touches-no-merge-path",
+    "digest": {
+     "sha256": "97bd449e86ade1459179f2a2580c254a5b84fd544ebd108d995decf518c36a68"
+    }
+   }
+  },
+  {
+   "id": "MP12",
+   "text": "Scope of exemptions. Does any skip or no-op rule trust a label or policy string without re-deriving it from the diff?",
+   "naWhen": {
+    "uri": "https://github.com/plateauapp/plateau-settings/blob/main/review/checks/diff-touches-no-merge-path",
+    "digest": {
+     "sha256": "97bd449e86ade1459179f2a2580c254a5b84fd544ebd108d995decf518c36a68"
+    }
+   }
+  },
+  {
+   "id": "MP13",
+   "text": "Process liveness. Can a surviving child or uid process change files after a verdict is recorded? Then the verdict must not be trusted.",
+   "naWhen": {
+    "uri": "https://github.com/plateauapp/plateau-settings/blob/main/review/checks/diff-touches-no-merge-path",
+    "digest": {
+     "sha256": "97bd449e86ade1459179f2a2580c254a5b84fd544ebd108d995decf518c36a68"
+    }
+   }
+  },
+  {
+   "id": "MP14",
+   "text": "Simplest correct option. Before adding machinery (retries, markers, carry), is there a stateless alternative (e.g. update-branch → fresh round)? Prefer it.",
+   "naWhen": {
+    "uri": "https://github.com/plateauapp/plateau-settings/blob/main/review/checks/diff-touches-no-merge-path",
+    "digest": {
+     "sha256": "97bd449e86ade1459179f2a2580c254a5b84fd544ebd108d995decf518c36a68"
+    }
+   }
+  }
+ ]
+}

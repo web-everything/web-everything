@@ -109,6 +109,39 @@ const { extractAnchors } = createRequire(import.meta.url)('./rules-loader.cjs');
  * fail-closed direction is human, never committee.
  */
 export const TRUST_CHAIN = [
+  {
+    role: 'checklist-seat-assessment',
+    file: 'seat-assessment.mjs',
+    tier: 'policy',
+    leash: 'code',
+    desc: 'CKLST-B checklist seat derivation',
+    homes: ['scripts/lib/seat-assessment.mjs'],
+  },
+  {
+    role: 'checklist-seat-ac-rubric',
+    file: 'seat-ac-rubric.mjs',
+    tier: 'policy',
+    leash: 'code',
+    desc: 'CKLST-B checklist seat derivation',
+    homes: ['scripts/lib/seat-ac-rubric.mjs'],
+  },
+  {
+    role: 'checklist-seat-assessment.test',
+    file: 'seat-assessment.test.mjs',
+    tier: 'policy',
+    leash: 'spec',
+    desc: 'CKLST-B checklist conformance contract',
+    homes: ['scripts/lib/__tests__/seat-assessment.test.mjs'],
+  },
+  {
+    role: 'checklist-seat-ac-rubric.test',
+    file: 'seat-ac-rubric.test.mjs',
+    tier: 'policy',
+    leash: 'spec',
+    desc: 'CKLST-B checklist conformance contract',
+    homes: ['scripts/lib/__tests__/seat-ac-rubric.test.mjs'],
+  },
+
   ...['card-ledger-trust.json', 'card-ledger-legacy-identities.json'].map(file => ({
     role: file === 'card-ledger-trust.json' ? 'card-ledger-trust' : 'card-ledger-legacy-identities',
     file, tier: 'policy', leash: 'spec', homes: [`scripts/settings/${file}`],
