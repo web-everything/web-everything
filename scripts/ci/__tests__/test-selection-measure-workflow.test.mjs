@@ -23,9 +23,8 @@ describe('test-selection measure produces data (advisory)', () => {
     expect(shadow['continue-on-error']).toBe(true);
   });
 
-  it('triggers only on push to main and manual dispatch (not every PR push)', () => {
-    expect(Object.keys(workflow.on).sort()).toEqual(['push', 'workflow_dispatch']);
-    expect(workflow.on.push.branches).toEqual(['main']);
+  it('triggers only on manual dispatch after shadow retirement', () => {
+    expect(Object.keys(workflow.on)).toEqual(['workflow_dispatch']);
   });
 
   it('measures the merged commit (base HEAD^), not an empty diff against main itself', () => {
