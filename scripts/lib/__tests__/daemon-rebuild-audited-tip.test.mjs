@@ -10,11 +10,16 @@ import { planRebuild } from '../daemon-rebuild/plan.mjs';
 import { makeGit } from '../daemon-rebuild/shared.mjs';
 import { readyBuildVerified, matchReadyCandidate, finalizeRebuild } from '../daemon-rebuild/adopt.mjs';
 import { makeAuditedTipGate } from '../daemon-rebuild/audited-tip.mjs';
+import * as auditedTips from '../daemon-rebuild/audited-tip.mjs';
+import * as hotpatchReaders from '../hotpatch-readers.mjs';
+import { admitHotpatch } from '../hotpatch-guards.mjs';
+import { hotpatchFixture } from './fixtures/hotpatch.mjs';
 import { addOverlay, resolveOverlayFollowTip } from '../daemon-overlays.mjs';
 import { rebuildClone } from '../daemon-rebuild.mjs';
 import { readReadyCandidateStrict, readReadyCandidate, writeReadyCandidate, assertReadyCandidatePins, StaleReadyPinError } from '../daemon-rebuild/state.mjs';
 import { appendEntry, storePath } from '../../operations/ruled-weakened-store.mjs';
-import { readRebuildState } from '../daemon-rebuild/state.mjs';
+import { readRebuildState, writeRebuildState } from '../daemon-rebuild/state.mjs';
+import { watchPath } from '../daemon-force-adopt.mjs';
 
 // Same temp/Git helpers as overlay-pin; local tracking refs avoid network IO entirely.
 const temps = [];
@@ -1066,3 +1071,130 @@ it.each(['early', 'recovery', 'tick-start'])('%s refuses malformed pins and defe
   expect(matchReadyCandidate({ ...args, ready: { ...ready, adopt: { ...plan, applied: [{ ref, sha: f.b }] } } }).reason)
     .toBe('ready-audit-revoked');
 }, 180_000); // six real rebuild checks over real git fixtures: far slower than the default under host load
+
+
+describe('hotpatch canonical evidence at finalization', () => {
+  it.each(['moved', 'deleted'])('revokes a hotpatch ref %s remotely during smoke despite a matching cached ref', async change => {
+    const f = await fixture();
+    const ref = `hotpatch/${f.a}`;
+    gitOk(f.root, ['remote', 'add', 'origin', f.root]);
+    gitOk(f.root, ['update-ref', `refs/heads/${ref}`, f.a]);
+    gitOk(f.root, ['update-ref', `refs/remotes/origin/${ref}`, f.a]);
+    const { data, readers } = hotpatchFixture();
+    for (const check of data.checks.check_runs) check.head_sha = f.a;
+    data.workflows.workflow_runs[0].head_sha = f.a;
+    data.audits[0].head = f.a;
+    const options = { applied: [{ ref, sha: f.a }], git: f.git, root: f.root, env: f.env, readers };
+    expect(await auditedTips.revokedHotpatchTips(options)).toEqual([]);
+    if (change === 'deleted') gitOk(f.root, ['update-ref', '-d', `refs/heads/${ref}`]);
+    else gitOk(f.root, ['update-ref', `refs/heads/${ref}`, f.b]);
+    expect(gitOk(f.root, ['rev-parse', `refs/remotes/origin/${ref}`])).toBe(f.a);
+    expect(await auditedTips.revokedHotpatchTips(options)).toEqual([ref]);
+  });
+
+  describe.each(['revoked', 'unreadable'])('%s evidence', evidence => {
+    it.each([
+      ['rollback to last-good finalizes even when hotpatch evidence is revoked or unreadable', true],
+      ['normal finalize refuses the same evidence with ready-audit-revoked', false],
+      ['forged rollback token refuses a never-adopted target with ready-audit-revoked', false, true],
+    ])('%s', async (_name, rollback, forged = false) => {
+      const f = await fixture();
+      const hotpatchRef = `hotpatch/${f.a}`;
+      const env = { ...process.env, ...f.env,
+        WE_DAEMON_STATE_DIR: join(f.dir, 'state'),
+        WE_DAEMON_OVERLAY_DIR: join(f.dir, 'overlays'),
+      };
+      gitOk(f.root, ['update-ref', `refs/remotes/origin/${hotpatchRef}`, f.a]);
+      gitOk(f.root, ['remote', 'add', 'origin', f.root]);
+      gitOk(f.root, ['update-ref', `refs/heads/${hotpatchRef}`, f.a]);
+      const plan = { ...f.adopted, finalSha: forged ? f.base : f.a, applied: [{ ref: hotpatchRef, sha: f.a }] };
+      const lastGood = { ...f.adopted, head: f.a, at: new Date().toISOString() };
+      if (rollback || forged) writeRebuildState(f.root, { adopted: rollback ? { ...lastGood, head: f.b } : lastGood }, env);
+      if (rollback) writeFileSync(watchPath(f.root, env), JSON.stringify({
+        daemon: 'test', ruling: 'R1', sha: f.b, lastGood, ticksLeft: 1, bad: 0, startedAt: lastGood.at,
+      }));
+      const { data, readers } = hotpatchFixture();
+      for (const check of data.checks.check_runs) check.head_sha = f.a;
+      data.workflows.workflow_runs[0].head_sha = f.a;
+      data.audits[0].head = f.a;
+      if (evidence === 'revoked') {
+        data.audits[0].verdict = 'WEAKENED';
+        data.audits[0].findings = ['guard weakened'];
+      } else readers.checks = () => { throw new Error('CI evidence unavailable'); };
+      const factory = vi.spyOn(hotpatchReaders, 'createHotpatchReaders').mockReturnValue(readers);
+      const revoked = vi.spyOn(auditedTips, 'revokedHotpatchTips');
+      try {
+        const done = await finalizeRebuild({
+          root: f.root, env, log: { error() {} },
+          run: (args, opts) => spawnSync('git', args, { ...opts, encoding: 'utf8' }),
+          now: () => Date.now(), prevHead: f.b, plan,
+          lease: { token: rollback || forged ? 'force-adopt-rollback' : 'hotpatch-direct-smoke' },
+        });
+        if (rollback) {
+          expect(done).toMatchObject({ moved: true, adopted: true, head: f.a });
+          expect(revoked).not.toHaveBeenCalled();
+          expect(factory).not.toHaveBeenCalled();
+          expect(gitOk(f.root, ['rev-parse', 'HEAD'])).toBe(f.a);
+          expect(readRebuildState(f.root, env).adopted.head).toBe(f.a);
+        } else {
+          expect(done).toMatchObject({ moved: false, reason: 'ready-audit-revoked' });
+          expect(revoked).toHaveBeenCalledOnce();
+          expect(factory).toHaveBeenCalledWith({ cwd: f.root, env });
+          expect(gitOk(f.root, ['rev-parse', 'HEAD'])).toBe(f.b);
+          expect(readRebuildState(f.root, env).adopted?.head).toBe(forged ? f.a : undefined);
+        }
+      } finally { revoked.mockRestore(); factory.mockRestore(); }
+    });
+  });
+
+  it.each(['first adoption', 'follow mode'])(
+    'finalizeRebuild refuses canonical evidence revoked after preparation: %s', async mode => {
+      const f = await fixture();
+      const hotpatchRef = `hotpatch/${f.b}`;
+      const env = { ...process.env, ...f.env,
+        WE_DAEMON_STATE_DIR: join(f.dir, 'state'),
+        WE_DAEMON_OVERLAY_DIR: join(f.dir, 'overlays'),
+        WE_DAEMON_OVERLAY_FOLLOW_TIP: mode === 'follow mode' ? 'follow' : 'audited-only',
+      };
+      gitOk(f.root, ['update-ref', `refs/remotes/origin/${hotpatchRef}`, f.b]);
+      gitOk(f.root, ['remote', 'add', 'origin', f.root]);
+      gitOk(f.root, ['update-ref', `refs/heads/${hotpatchRef}`, f.b]);
+      const { data, readers } = hotpatchFixture();
+      for (const check of data.checks.check_runs) check.head_sha = f.b;
+      data.workflows.workflow_runs[0].head_sha = f.b;
+      data.audits[0].head = f.b;
+      expect(await admitHotpatch(f.b, readers)).toMatchObject({ outcome: 'pass' });
+      // Keep the legacy gate permissive: only a fresh canonical admission can catch this revocation.
+      const auditedTip = mode === 'follow mode' ? makeAuditedTipGate(env) : () => true;
+      if (mode === 'follow mode') expect(auditedTip).toBeNull();
+      const built = await f.plan({ headSha: f.base, overlays: [{ ref: hotpatchRef, pr: 42 }], auditedTip });
+      expect(built.ok).toBe(true);
+      expect(built.applied).toEqual([{ ref: hotpatchRef, pr: 42, sha: f.b }]);
+      expect(built.auditAdopted).not.toContain(hotpatchRef);
+      gitOk(f.root, ['checkout', '-q', '--detach', f.base]);
+
+      // Preparation passed, then the own-SHA canonical audit becomes negative during smoke.
+      data.audits[0].verdict = 'WEAKENED';
+      data.audits[0].findings = ['guard weakened'];
+      const readAudits = vi.fn(readers.audits);
+      readers.audits = readAudits;
+      const factory = vi.spyOn(hotpatchReaders, 'createHotpatchReaders').mockReturnValue(readers);
+      try {
+        const done = await finalizeRebuild({
+          root: f.root, env, log: { error() {} },
+          run: (args, opts) => spawnSync('git', args, { ...opts, encoding: 'utf8' }),
+          now: () => Date.now(), lease: { token: 'hotpatch-direct-smoke' },
+          prevHead: f.base, plan: built, auditedTip,
+        });
+        expect(factory).toHaveBeenCalledWith({ cwd: f.root, env });
+        expect(readAudits).toHaveBeenCalledWith(f.b);
+        expect(done).toMatchObject({ moved: false, reason: 'ready-audit-revoked' });
+        expect(done.alerts).toContainEqual(expect.objectContaining({
+          kind: 'ready-audit-revoked', detail: expect.objectContaining({ refs: [hotpatchRef] }),
+        }));
+        expect(gitOk(f.root, ['rev-parse', 'HEAD'])).toBe(f.base);
+        expect(readRebuildState(f.root, env).adopted?.head).not.toBe(built.finalSha);
+      } finally { factory.mockRestore(); }
+    },
+  );
+});

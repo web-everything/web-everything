@@ -11,9 +11,10 @@ import { verifyRev, makeGit } from './shared.mjs';
 import { resolveOverlayConflict } from './overlay-strategies.mjs';
 import { releaseBuildLease } from './lease.mjs';
 import { ensureSafeToMove, knownInputsOf } from './local-state.mjs';
-import { revokedAppliedTips, tipInMain as gitTipInMain, pathBEvidenceGit } from './audited-tip.mjs';
+import { revokedHotpatchTips, revokedAppliedTips, tipInMain as gitTipInMain, pathBEvidenceGit } from './audited-tip.mjs';
 import { OPERATOR_LOGINS } from '../marker-authorship.mjs';
 import { readPendingDrops } from '../overlay-drop-pending.mjs';
+import { readForceWatch } from '../daemon-force-adopt.mjs';
 
 const AUTOMATIC_RETIREMENT_REASONS = Object.freeze([
   'in-main', 'pr-merged', 'pr-squash-merged', 'redundant-merge-sibling', 'superseded', 'urgent-failed', 'pr-closed',
@@ -485,11 +486,19 @@ async function finalizeRebuildLocked({
   let dropsPending = false;
   try { dropsPending = readPendingDrops(root, env).length > 0; } catch { dropsPending = true; }
   const appliedKey = (list) => JSON.stringify((list ?? []).map((a) => [a.ref, a.sha]).sort());
-  // The health-watch rollback to last-good only reverts HEAD; it never touches registrations, so it is never blocked.
-  const isRollback = lease?.token === 'force-adopt-rollback';
+  // A rollback may skip evidence only for the saved last-good head (the watch preserves it across forced adoption).
+  const isRollback = lease?.token === 'force-adopt-rollback' && !!plan.finalSha
+    && plan.finalSha === (readForceWatch(root, stEnv)?.lastGood?.head ?? state.adopted?.head);
   if (dropsPending && !isRollback && appliedKey(plan.applied) !== appliedKey(state.adopted?.applied)) {
     alert('drop-pending-unsettled', { target: plan.finalSha });
     return terminal({ moved: false, reason: 'drop-pending-unsettled', plan });
+  }
+
+  const revokedHotpatch = isRollback ? [] : await revokedHotpatchTips({ applied: plan.applied, git, root, env });
+  if (revokedHotpatch.length) {
+    alert('ready-audit-revoked', { target: plan.finalSha, refs: revokedHotpatch,
+      message: 'Hotpatch evidence is incomplete or revoked; obtain fresh CI and audit evidence or use the normal merge path.' });
+    return terminal({ moved: false, reason: 'ready-audit-revoked', plan });
   }
 
   // Defensive re-check: real (unlocked) time passed for the smoke since `prepareRebuild` read `prevHead`. Either
@@ -520,7 +529,7 @@ async function finalizeRebuildLocked({
   // adoption was already judged by matchReadyCandidate under this same lock); no gate (follow mode) revokes nothing.
   if (typeof auditedTip === 'function') {
     const revoked = revokedAppliedTips({
-      applied: plan.applied, auditedTip, prevHead, mainSha: plan.mainSha, auditAdopted: plan.auditAdopted,
+      applied: plan.applied, auditedTip: (ref, sha) => ref.startsWith('hotpatch/') ? ref === `hotpatch/${sha}` : auditedTip(ref, sha), prevHead, mainSha: plan.mainSha, auditAdopted: plan.auditAdopted,
       carries: (sha, build) => git(['merge-base', '--is-ancestor', sha, build]).status === 0,
       inMain: (sha) => gitTipInMain(git, plan.mainSha, sha),
     });

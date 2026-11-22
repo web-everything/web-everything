@@ -1,5 +1,7 @@
 /** unaudited-tip — fail closed to the adopted head when audit evidence is unavailable. */
 import fs, { readFileSync } from 'node:fs';
+import { admitHotpatch } from '../hotpatch-guards.mjs';
+import { createHotpatchReaders } from '../hotpatch-readers.mjs';
 import { homedir } from 'node:os';
 import { resolveOverlayFollowTip } from '../daemon-overlays.mjs';
 import { verifyRev } from './shared.mjs';
@@ -78,6 +80,7 @@ export function revokedAppliedTips({
   return (applied ?? [])
     .filter((a) => {
       if (!a?.ref || !a.sha) return false;
+      if (a.ref.startsWith('hotpatch/')) return a.ref !== `hotpatch/${a.sha}` || typeof auditedTip !== 'function' || auditedTip(a.ref, a.sha) !== true;
       // A live hold on the applied sha itself always wins over any pin.
       if (held.some((x) => x.detail.ref === a.ref && x.detail.newTip === a.sha)) return true;
       // pinnedFrom is the rejected tip, not evidence for the applied sha: it never exempts. The applied sha is judged below.
@@ -87,4 +90,19 @@ export function revokedAppliedTips({
       return auditedTip(a.ref, a.sha) !== true;
     })
     .map((a) => a.ref);
+}
+
+/** Re-read canonical evidence after smoke, including first adoption and follow mode. */
+export async function revokedHotpatchTips({ applied = [], git, root, env, readers }) {
+  const revoked = [];
+  let admissionReaders = readers;
+  git = pathBEvidenceGit(git);
+  for (const { ref, sha } of applied) {
+    if (!ref?.startsWith('hotpatch/')) continue;
+    if (!/^hotpatch\/[0-9a-f]{40}$/.test(ref) || ref !== `hotpatch/${sha}`
+      || git(['fetch', '--quiet', '--', 'origin', `+refs/heads/${ref}:refs/remotes/origin/${ref}`]).status !== 0
+      || verifyRev(git, `refs/remotes/origin/${ref}^{commit}`) !== sha
+      || (await admitHotpatch(sha, (admissionReaders ??= createHotpatchReaders({ cwd: root, env })))).outcome !== 'pass') revoked.push(ref);
+  }
+  return revoked;
 }
