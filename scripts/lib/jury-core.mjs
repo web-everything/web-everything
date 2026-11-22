@@ -1983,6 +1983,15 @@ export function derivePanelVerdict({ lensVerdicts = {}, humanRequired = false, c
   // bounce is more actionable than a park, and it costs nothing), while both of the outcomes that mechanically
   // CLEAR a PR are taken off the table. See this function's own docblock for the PR #2122 measurement.
   if (degradedBasis) return VERDICTS.NEEDS_HUMAN;
+  // CKLST-B: only explicitly enforced callers supply this map. Shadow omits it entirely.
+  // Check before either mechanically clearing outcome, including prevention-outstanding.
+  if (seatGates !== undefined) {
+    const blank = mandatoryLenses.filter(lens => seatGates?.[lens] !== 'pass');
+    if (blank.length) {
+      if (Array.isArray(seatGateNotes)) seatGateNotes.push(`blank accept: answer ${blank.map(lens => `${lens} rubric items`).join(', ')}`);
+      return VERDICTS.CHANGES;
+    }
+  }
   // #2823 round-2 finding 4 — derive "the panel owes a guard" from the FINDINGS, not the per-lens verdicts (the
   // structural fix). A RESOLVED finding whose named prevention is neither captured nor filed owes a guard, whatever
   // its lens's single verdict flattened to (an advisory lens with a co-resident unresolved finding would flatten to
@@ -1995,14 +2004,6 @@ export function derivePanelVerdict({ lensVerdicts = {}, humanRequired = false, c
   // findings still surfaces it (byte-stable for the pre-round-2 verdict-only callers).
   const preventionFromLens = Object.values(lensVerdicts).some((v) => v === VERDICTS.PREVENTION_OUTSTANDING);
   if (preventionFromFindings || preventionFromLens) return VERDICTS.PREVENTION_OUTSTANDING;
-  // CKLST-B: only explicitly enforced callers supply this map. Shadow omits it entirely.
-  if (seatGates !== undefined) {
-    const blank = mandatoryLenses.filter(lens => lensVerdicts[lens] === VERDICTS.ACCEPT && seatGates?.[lens] !== 'pass');
-    if (blank.length) {
-      if (Array.isArray(seatGateNotes)) seatGateNotes.push(`blank accept: answer ${blank.map(lens => `${lens} rubric items`).join(', ')}`);
-      return VERDICTS.CHANGES;
-    }
-  }
   if (mandatoryVerdicts.every((v) => v === VERDICTS.ACCEPT)) return VERDICTS.ACCEPT;
   return VERDICTS.CHANGES;
 }

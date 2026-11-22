@@ -157,7 +157,7 @@ it('gate-deciding files and their invariant tests are registered at the policy t
 it('module imports no gh or network writer', () => {
   const source = readFileSync(new URL('../seat-assessment.mjs', import.meta.url), 'utf8');
   const imports = [...source.matchAll(/from ['"]([^'"]+)['"]/g)].map(m => m[1]);
-  expect(imports.every(p => ['node:crypto', 'node:fs', 'node:path', 'node:child_process', './lane-git-hardening.mjs', './seat-ac-rubric.mjs', './gate-config.mjs', './merge-queue-affected.mjs', 'ajv', 'ajv-formats'].includes(p))).toBe(true);
+  expect(imports.every(p => ['node:crypto', 'node:fs', 'node:path', 'node:child_process', './lane-git-hardening.mjs', './seat-ac-rubric.mjs', './gate-config.mjs', './merge-queue-affected.mjs', './settings-files.mjs', 'ajv', 'ajv-formats'].includes(p))).toBe(true);
   expect(source).not.toMatch(/\b(?:fetch|https?|gh)\s*\(/);
 });
 it('git show is bounded, hardened and uses argv; rejects hostile paths before execution', () => {
@@ -613,11 +613,11 @@ it.each(evidenceMinimumCases)('effective per-item evidence minimum: %s', (_name,
     expect(assessSeat({ ...input('security'), settings }).gateOutcome).toBe('not-pass');
   } else expect(settings.problems).toEqual([]);
 });
-it('a new per-item downgrade is permitted only with confirmation bound to the exact child policy', () => {
+it('merge-path policy security: an exact child-authored confirmation cannot permit a per-item downgrade', () => {
   const { company, repo } = evidencePolicies({ minKind: 'quoted-citation' }, { minKind: 'quoted-citation', perItem: { MP1: 'assertion' } });
   repo.confirmations = [{ lens: 'security', setting: 'evidence.perItem.MP1', level: 'company',
     owner: 'https://example.org/company-owner', policyDigest: policyDigest(repo) }];
-  expect(loadFrozenPolicyChain(repo, company).settings.problems).toEqual([]);
+  expect(loadFrozenPolicyChain(repo, company).settings.problems.join(' ')).toContain('without confirmation');
   repo.seats[0].evidence.perItem.MP1 = 'resolved-citation';
   expect(loadFrozenPolicyChain(repo, company).settings.problems.join(' ')).toContain('without confirmation');
 });
@@ -633,7 +633,7 @@ it.each(['wrong setting', 'wrong level', 'no owner', 'wrong digest'])('new per-i
   expect(loadFrozenPolicyChain(repo, company).settings.problems.join(' '))
     .toContain(variant === 'no owner' ? 'invalid rubric policy' : 'without confirmation');
 });
-it('a per-item downgrade requires confirmation from every ancestor configuring that lens', () => {
+it('merge-path policy security: claims from every ancestor still lack authenticated approval', () => {
   const { company, repo } = evidencePolicies({ minKind: 'quoted-citation' }, { minKind: 'quoted-citation', perItem: { MP1: 'assertion' } });
   const team = clone(company); team.id = 'https://example.org/policies/team'; team.level = 'team';
   team.parent = { uri: company.id, digest: digestOf(company) };
@@ -650,7 +650,7 @@ it('a per-item downgrade requires confirmation from every ancestor configuring t
     owner: 'https://example.org/company-owner', policyDigest: policyDigest(repo) }];
   expect(load().problems.join(' ')).toContain('without confirmation from company, team');
   repo.confirmations.push({ ...repo.confirmations[0], level: 'team', owner: 'https://example.org/team-owner' });
-  expect(load().problems).toEqual([]);
+  expect(load().problems.join(' ')).toContain('without confirmation from company, team');
 });
 
 it('the merge-path naWhen check digest matches the one pinned by every MP item of the published rubric (drift forces a re-pin)', () => {
@@ -764,12 +764,12 @@ describe('canonical audit', () => {
     const x = input('security'); x.policy.seats[0].check = clone(seatAdapter.SEAT_GATE_CHECK_REF);
     expect(assessSeat(repin(x)).gateOutcome).toBe('pass');
   });
-  it('dropping a parent check requires a valid exact-policy owner confirmation', () => {
+  it('merge-path policy security: an exact-policy owner claim cannot drop a parent check', () => {
     const company = json('vectors/policy.company.json'), repo = json('vectors/policy.repo.json');
     delete repo.seats[0].check;
     repo.confirmations = [{ lens: 'security', setting: 'check', level: 'company',
       owner: 'https://example.org/owner', policyDigest: policyDigest(repo) }];
-    expect(loadFrozenPolicyChain(repo, company).settings.problems).toEqual([]);
+    expect(loadFrozenPolicyChain(repo, company).settings.problems.join(' ')).toContain('check without confirmation');
     repo.confirmations[0].policyDigest.sha256 = 'f'.repeat(64);
     expect(loadFrozenPolicyChain(repo, company).settings.problems.join(' ')).toContain('check without confirmation');
   });
@@ -796,5 +796,209 @@ describe('canonical audit', () => {
     expect(valid({ findings: [], assessment: { items: [] } })).toBe(true);
     expect(valid({ findings: [{ summary: 'Concrete issue', file: 'src/file.js', line: 1 }], assessment: { items: [] } })).toBe(true);
     expect(valid({})).toBe(true); expect(valid({ findings: [{}] })).toBe(true);
+  });
+});
+
+
+/** Targeted security fixes: preserve the legacy reducer and valid shadow behavior. */
+describe('targeted security', () => {
+  it.each(['accept', 'prevention-outstanding'])('A: a failing mandatory %s seat cannot mechanically clear', verdict => {
+    const lensVerdicts = { correctness: 'accept', security: verdict }, notes = [];
+    expect(derivePanelVerdict({ lensVerdicts, findings: [] })).toBe(verdict);
+    expect(derivePanelVerdict({ lensVerdicts, findings: [], seatGates: { correctness: 'pass', security: 'not-pass' }, seatGateNotes: notes })).toBe('changes');
+    expect(notes.join(' ')).toContain('security rubric items');
+    expect(derivePanelVerdict({ lensVerdicts, findings: [], seatGates: { correctness: 'pass', security: 'pass' } })).toBe(verdict);
+  });
+  it.each(['advisory verdict', 'resolved finding'])('A: %s owing prevention cannot bypass a mandatory seat gate', source => {
+    const lensVerdicts = { ...panel.lensVerdicts, ...(source === 'advisory verdict' ? { simplicity: 'prevention-outstanding' } : {}) };
+    const findings = source === 'resolved finding' ? [{ lens: 'security', summary: 'Guard still owed', outcome: 'fixed',
+      prevention: 'Add a head-binding guard', preventionCaptured: false, impactIfUnfixed: 'broken' }] : [];
+    expect(derivePanelVerdict({ lensVerdicts, findings })).toBe('prevention-outstanding');
+    expect(derivePanelVerdict({ lensVerdicts, findings, seatGates: { correctness: 'pass', security: 'not-pass' } })).toBe('changes');
+    expect(derivePanelVerdict({ lensVerdicts, findings, seatGates: { correctness: 'pass', security: 'pass' } })).toBe('prevention-outstanding');
+  });
+  it.each([undefined, null, {}, { security: 'pass' }])('A: every mandatory prevention seat needs a pass in an enforced map %j', security => {
+    const lensVerdicts = { correctness: 'prevention-outstanding', security: 'prevention-outstanding' };
+    const seatGates = security === undefined ? {} : security;
+    expect(derivePanelVerdict({ lensVerdicts, findings: [], seatGates })).toBe('changes');
+    expect(derivePanelVerdict({ lensVerdicts, findings: [] })).toBe('prevention-outstanding');
+  });
+  it.each(['humanRequired', 'conflict', 'degradedBasis', 'mandatory-human'])('A: %s still requires human review when enforced seats fail', reason => {
+    const lensVerdicts = { ...panel.lensVerdicts, ...(reason === 'mandatory-human' ? { security: 'needs-human' } : {}) };
+    const options = { lensVerdicts, findings: [], ...(reason === 'mandatory-human' ? {} : { [reason]: true }) };
+    expect(derivePanelVerdict(options)).toBe('needs-human');
+    expect(derivePanelVerdict({ ...options, seatGates: {} })).toBe('needs-human');
+  });
+  it('B: every executed history command disables grafts, replacement refs and commit-graph ancestry', () => {
+    const exec = vi.fn((_bin, args) => args.includes('rev-parse') ? process.cwd() : 'scripts/lib/gate-config.mjs\0');
+    expect(readDiffPaths('b'.repeat(40), head, { exec,
+      env: { GIT_GRAFT_FILE: 'hostile-grafts', GIT_NO_REPLACE_OBJECTS: '0', GIT_CONFIG_COUNT: '1',
+        GIT_CONFIG_KEY_0: 'core.commitGraph', GIT_CONFIG_VALUE_0: 'true' } })).toEqual(['scripts/lib/gate-config.mjs']);
+    for (const [, args, { env }] of exec.mock.calls) {
+      expect(env.GIT_GRAFT_FILE).toBe('/dev/null'); expect(env.GIT_NO_REPLACE_OBJECTS).toBe('1');
+      const pins = Object.fromEntries(Array.from({ length: Number(env.GIT_CONFIG_COUNT) }, (_, i) =>
+        [env[`GIT_CONFIG_KEY_${i}`], env[`GIT_CONFIG_VALUE_${i}`]]));
+      expect(pins['core.commitGraph'] === 'false' || args.includes('core.commitGraph=false')).toBe(true);
+    }
+  });
+  it('B: repository info/grafts cannot forge the three-dot merge base and hide a merge-path edit', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'seat-history-proof-'));
+    const git = (...args) => execFileSync('git', ['-c', 'core.hooksPath=/dev/null', '-c', 'commit.gpgsign=false', ...args],
+      { cwd: dir, encoding: 'utf8', env: { PATH: process.env.PATH, HOME: dir, TMPDIR: process.env.TMPDIR,
+        GIT_CONFIG_NOSYSTEM: '1' }, stdio: ['ignore', 'pipe', 'pipe'] }).trim();
+    try {
+      git('init', '-q'); git('config', 'user.name', 'Seat fixture'); git('config', 'user.email', 'seat@example.org');
+      writeFileSync(join(dir, 'seed'), 'common'); git('add', '.'); git('commit', '-qm', 'common'); const common = git('rev-parse', 'HEAD');
+      mkdirSync(join(dir, 'scripts/lib'), { recursive: true }); writeFileSync(join(dir, 'scripts/lib/gate-config.mjs'), 'gate');
+      git('add', '.'); git('commit', '-qm', 'head gate edit'); const pinned = git('rev-parse', 'HEAD');
+      git('checkout', '-q', '--detach', common); writeFileSync(join(dir, 'base-only'), 'base');
+      git('add', '.'); git('commit', '-qm', 'base branch'); const base = git('rev-parse', 'HEAD');
+      // The forged edge makes the reviewed head an ancestor of the base, hiding the entire head diff.
+      git('replace', '--graft', base, pinned);
+      writeFileSync(join(dir, '.git/info/grafts'), `${base} ${pinned}\n`);
+      expect(readDiffPaths(base, pinned, { cwd: dir })).toEqual(['scripts/lib/gate-config.mjs']);
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+  const reviewOptions = () => {
+    const x = input('security'), c = input('correctness');
+    return { ...x, expectedRubric: c.rubric, rubrics: { security: x.rubric },
+      assessments: { security: x.assessment, correctness: c.assessment },
+      assessmentRunIds: { security: x.runId, correctness: c.runId } };
+  };
+  it.each(['enforec', '', null, false, {}, [], undefined])('C: explicit invalid requested mode %j refuses evidence and provides enforced seat gates', mode => {
+    const options = reviewOptions(), read = vi.fn(options.readFileAtHead);
+    const result = assessReviewSeats({ ...options, mode, readFileAtHead: read });
+    expect(result.seatGates).toEqual({ security: 'not-pass', correctness: 'not-pass' });
+    expect(result.seats.security.problems.join(' ')).toContain('mode');
+    expect(derivePanelVerdict({ ...panel, seatGates: result.seatGates })).toBe('changes');
+    expect(assessSeat({ ...input('security'), mode }).gateOutcome).toBe('not-pass');
+    expect(read).not.toHaveBeenCalled();
+  });
+  it('C: an invalid requested mode cannot be overridden by a configured valid shadow mode', () => {
+    const options = reviewOptions(), settings = { mode: 'shadow', modeValid: true, policy: options.policy, problems: [] };
+    expect(assessReviewSeats({ ...options, settings, mode: 'typo' }).seatGates)
+      .toEqual({ security: 'not-pass', correctness: 'not-pass' });
+  });
+  it.each(['shadow', undefined])('C: valid shadow and the omitted mode retain the existing panel verdict', mode => {
+    const options = reviewOptions(); if (mode !== undefined) options.mode = mode;
+    const result = assessReviewSeats(options);
+    expect(result.seatGates).toBeUndefined();
+    expect(derivePanelVerdict({ ...panel, seatGates: result.seatGates })).toBe('accept');
+    expect(result.seats.security.gateOutcome).toBe('pass'); expect(result.seats.correctness.gateOutcome).toBe('pass');
+  });
+});
+
+
+/** Production policy resolution must not turn settings or self-approved relaxations into exemptions. */
+describe('merge-path policy security', () => {
+  const base = 'b'.repeat(40), file = 'scripts/settings/lane-private.json';
+  const declared = (fresh = {}) => ({ settings: { mergeFreshness: fresh }, owners: {}, errors: [] });
+  const check = extra => mergePathNaCheck({ base, head, readDiff: () => [file],
+    readGateSettings: () => declared(), ...extra });
+  it.each(['environment gate-all', 'declared gate-all', 'environment gate file', 'declared gate file'])(
+    'configured %s classifies a settings file as merge-path code', source => {
+      const env = source === 'environment gate-all' ? { WE_MERGE_QUEUE_SETTINGS_READER_MODE: 'gate-all' }
+        : source === 'environment gate file' ? { WE_MERGE_QUEUE_SETTINGS_GATE_FILES: 'lane-private.json' } : {};
+      const readGateSettings = () => declared(source === 'declared gate-all' ? { settingsReaderMode: 'gate-all' }
+        : source === 'declared gate file' ? { settingsGateFiles: ['lane-private.json'] } : {});
+      expect(isGateFile(file)).toBe(false);
+      const result = check({ env, readGateSettings });
+      expect(result.result).toBe('fail'); expect(result.problems.join(' ')).toContain(file);
+      const x = input('security'); x.diffPaths = [file];
+      expect(assessSeat({ ...x, env, readGateSettings }).gateOutcome).toBe('not-pass');
+    });
+  it.each(['throws', 'read errors', 'invalid mode', 'oversized config', 'too many globs'])(
+    'configured resolution %s refuses even a clean diff, with an operator fallback', variant => {
+      const readGateSettings = () => {
+        if (variant === 'throws') throw new Error('settings unreadable');
+        if (variant === 'read errors') return { ...declared(), errors: [{ source: 'settings/broken.json', error: 'unreadable' }] };
+        if (variant === 'invalid mode') return declared({ settingsReaderMode: 'typo' });
+        if (variant === 'oversized config') return declared({ settingsGateFiles: ['x'.repeat(4 * 1024 * 1024 + 1)] });
+        return declared({ settingsGateFiles: Array(10001).fill('lane-private.json') });
+      };
+      const result = check({ readDiff: () => ['docs/article.md'], readGateSettings });
+      expect(result.result).toBe('fail'); expect(result.problems.join(' ')).toContain('operator');
+    });
+  it('configured lists augment the built-ins rather than remove built-in gate settings', () => {
+    const result = check({ readDiff: () => ['scripts/settings/merge-queue.json'],
+      readGateSettings: () => declared({ settingsGateFiles: [] }) });
+    expect(result.result).toBe('fail');
+  });
+  it('a shared settings-reader resolution finding gate code refuses the exemption', () => {
+    const settingsGit = vi.fn(args => args[0] === 'show' ? JSON.stringify({ seatTuning: args[1].startsWith(head) ? 2 : 1 })
+      : args[0] === 'grep' ? 'scripts/lib/gate-config.mjs\0' : '');
+    const result = check({ settingsGit });
+    expect(result.result).toBe('fail'); expect(settingsGit).toHaveBeenCalled();
+    expect(result.problems.join(' ')).toContain('gate-config.mjs');
+  });
+  it.each(['unreadable', 'unresolved', 'oversized reader set'])(
+    'settings reader %s refuses exemption', variant => {
+      const readGateReaders = () => {
+        if (variant === 'unreadable') throw new Error('reader IO unavailable');
+        if (variant === 'unresolved') return { why: 'no reader of seatTuning' };
+        return { readers: Array(201).fill('scripts/lib/ordinary-reader.mjs'), keys: [] };
+      };
+      expect(check({ readGateReaders }).result).toBe('fail');
+    });
+  it('a known non-gate reader and a clean configured policy allow a settings exemption', () => {
+    const log = vi.fn(), result = check({ settingsLog: log, loggedGatePolicies: new Set(),
+      readGateReaders: () => ({ readers: ['scripts/lib/ordinary-reader.mjs'], keys: ['seatTuning'], gateReader: null }) });
+    expect(result.result).toBe('pass'); expect(log).toHaveBeenCalledWith(expect.stringContaining('affected-settings'));
+  });
+  it('the production settings-reader Git boundary is hardened, bounded, and runs from the repository root', () => {
+    const exec = vi.fn((_bin, args) => args.includes('rev-parse') ? process.cwd()
+      : args.includes('show') ? JSON.stringify({ seatTuning: 1 }) : 'scripts/lib/gate-config.mjs\0');
+    const result = check({ exec, cwd: 'nested-cwd', env: { GIT_DIR: 'decoy', GIT_WORK_TREE: 'decoy', GIT_GRAFT_FILE: 'decoy' } });
+    expect(result.result).toBe('fail'); expect(result.problems.join(' ')).toContain('gate-config.mjs');
+    expect(exec).toHaveBeenCalled();
+    for (const [, args, options] of exec.mock.calls) {
+      expect(options.env.GIT_DIR).toBeUndefined(); expect(options.env.GIT_WORK_TREE).toBeUndefined();
+      expect(options.env.GIT_GRAFT_FILE).toBe('/dev/null'); expect(options.env.GIT_NO_REPLACE_OBJECTS).toBe('1');
+      expect(args).toContain('core.commitGraph=false'); expect(options.timeout).toBeGreaterThan(0); expect(options.maxBuffer).toBe(4 * 1024 * 1024);
+      expect(options.cwd).toBe(args.includes('rev-parse') ? 'nested-cwd' : process.cwd());
+      if (args.includes('show')) { expect(args).toContain('--no-ext-diff'); expect(args).toContain('--no-textconv'); }
+    }
+  });
+  it.each(['unreadable command', 'oversized output', 'unknown repository root'])(
+    'production settings-reader %s refuses with an operator fallback', variant => {
+      const exec = vi.fn((_bin, args) => {
+        if (args.includes('rev-parse')) return variant === 'unknown repository root' ? '' : process.cwd();
+        if (variant === 'oversized output') return 'x'.repeat(4 * 1024 * 1024 + 1);
+        throw new Error('immutable settings object unreadable');
+      });
+      const result = check({ exec });
+      expect(result.result).toBe('fail'); expect(result.problems.join(' ')).toContain('operator');
+    });
+  it('too many settings files require a full operator diff review', () => {
+    const result = check({ readDiff: () => Array.from({ length: 21 }, (_, i) => `scripts/settings/feature-${i}.json`) });
+    expect(result.result).toBe('fail'); expect(result.problems.join(' ')).toContain('operator');
+  });
+  it('too many changed settings keys cannot establish a safe reader exemption', () => {
+    const result = check({ readGateReaders: () => ({ readers: [], keys: Array(41).fill('seatTuning') }) });
+    expect(result.result).toBe('fail'); expect(result.problems.join(' ')).toContain('operator');
+  });
+  const relaxations = [
+    ['global evidence floor', (_p, c) => c.evidence.minKind = 'assertion'],
+    ['new per-item evidence floor', (_p, c) => c.evidence.perItem = { MP1: 'assertion' }],
+    ['required items', (_p, c) => c.required = ['MP1']],
+    ['n/a permission', (p, c) => { p.na.allowed = false; c.na.allowed = true; }],
+    ['never-n/a items', (_p, c) => c.na.neverNa = []],
+    ['n/a maximum', (p, c) => { p.na.max = 1; c.na.max = 2; }],
+    ['all-n/a verdict', (_p, c) => c.allNa = 'pass'],
+    ['citation scope', (p, c) => { p.citeScope = 'diff'; c.citeScope = 'tree'; }],
+    ['rubric binding', (_p, c) => c.rubric.digest.sha256 = 'f'.repeat(64)],
+    ['subject rubric', (_p, c) => { delete c.rubric; c.rubricFrom = 'subject'; }],
+    ['parent gate check', (_p, c) => delete c.check],
+  ];
+  it.each(relaxations)('a child-authored exact owner/digest claim cannot relax %s', (_name, mutate) => {
+    const company = json('vectors/policy.company.json'), repo = json('vectors/policy.repo.json');
+    mutate(company.seats[0], repo.seats[0]); repo.parent = { uri: company.id, digest: digestOf(company) };
+    const settings = [...seatAdapter.loosened(company.seats[0], repo.seats[0]), 'check', 'evidence.perItem.MP1'];
+    repo.confirmations = [...new Set(settings)].map(setting => ({ lens: 'security', setting, level: 'company',
+      owner: 'https://example.org/company-owner', policyDigest: policyDigest(repo),
+      record: { uri: 'https://example.org/claimed-approval', digest: { sha256: 'a'.repeat(64) } } }));
+    const loaded = loadFrozenPolicyChain(repo, company).settings;
+    expect(loaded.problems.length).toBeGreaterThan(0);
+    expect(assessSeat({ ...input('security'), settings: loaded, mode: 'enforce' }).gateOutcome).toBe('not-pass');
   });
 });

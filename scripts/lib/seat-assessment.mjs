@@ -11,9 +11,12 @@ import { join } from 'node:path';
 import { execFileSync } from 'node:child_process';
 import Ajv from 'ajv';
 import addFormats from 'ajv-formats';
-import { laneGitHardeningEnv, scrubGitRepoEnv } from './lane-git-hardening.mjs';
+import { laneGitHardeningEnv, laneHistoryProofEnv, scrubGitRepoEnv } from './lane-git-hardening.mjs';
 import { TRUST_CHAIN_BASENAMES, isTrustChainPath } from './gate-config.mjs';
-import { GATE_PATTERNS, DEFAULT_SETTINGS_POLICY, isGateFile } from './merge-queue-affected.mjs';
+import { GATE_PATTERNS, DEFAULT_SETTINGS_POLICY, isGateFile, resolveSettingsPolicy, logPolicyOnce,
+  readSettingsReaders, SETTINGS_FILE_RE, MAX_SETTINGS_FILES, MAX_SETTINGS_READERS, MAX_SETTINGS_KEYS, MAX_GRAPH_MS,
+} from './merge-queue-affected.mjs';
+import { readDeclaredSettings } from './settings-files.mjs';
 import { buildAcceptanceRubric } from './seat-ac-rubric.mjs';
 
 export const RULES_SHA256 = 'bcb15ef4987a1dbe7adda7ff721385fcc82fedc82356e98d174da85b5ce8c3cf';
@@ -475,7 +478,7 @@ export function readHeadFile(head, path, { cwd = process.cwd(), exec = execFileS
 /** IO: the actual three-dot path set; no-renames includes the old and new path of a move. */
 export function readDiffPaths(base, head, { cwd = process.cwd(), exec = execFileSync, env = process.env } = {}) {
   if (!HEX40.test(base ?? '') || !HEX40.test(head ?? '')) throw new Error('exact base and head required for merge-path check');
-  const hardened = laneGitHardeningEnv(scrubGitRepoEnv(env));
+  const hardened = laneHistoryProofEnv(scrubGitRepoEnv(env));
   hardened.PATH = '/usr/bin:/bin:/usr/sbin:/sbin';
   const options = { cwd, env: hardened, encoding: 'utf8', timeout: 15000, maxBuffer: MAX_BYTES };
   const root = String(exec('git', ['rev-parse', '--show-toplevel'], options)).trim();
@@ -496,27 +499,84 @@ const sourceDigest = relative => ({ sha256: crypto.createHash('sha256')
   .update(readFileSync(new URL(relative, import.meta.url))).digest('hex') });
 export const MERGE_PATH_CHECK_DEFINITION = Object.freeze({
   uri: 'https://github.com/plateauapp/plateau-settings/blob/main/review/checks/diff-touches-no-merge-path',
-  version: '2026-11-22.2', range: 'base...head', operation: 'no path matches either classifier; include both rename sides',
+  version: '2026-11-22.3', range: 'base...head',
+  operation: 'no path or settings reader matches built-in or configured gate classifiers; include both rename sides',
+  resolution: ['readDeclaredSettings', 'resolveSettingsPolicy', 'readSettingsReaders'],
   classifiers: [
     { module: 'scripts/lib/gate-config.mjs', export: 'isTrustChainPath', sourceDigest: sourceDigest('./gate-config.mjs'), basenames: [...TRUST_CHAIN_BASENAMES].sort() },
     { module: 'scripts/lib/merge-queue-affected.mjs', export: 'isGateFile', sourceDigest: sourceDigest('./merge-queue-affected.mjs'),
       patterns: GATE_PATTERNS.map(String), settingsPolicy: DEFAULT_SETTINGS_POLICY },
     { module: 'scripts/readiness/test-selection.mjs', export: 'isLocalFullSuiteTrigger',
       sourceDigest: sourceDigest('../readiness/test-selection.mjs') },
+    { module: 'scripts/lib/settings-files.mjs', export: 'readDeclaredSettings', sourceDigest: sourceDigest('./settings-files.mjs') },
+    { module: 'scripts/lib/seat-assessment.mjs', export: 'mergePathNaCheck', sourceDigest: sourceDigest('./seat-assessment.mjs') },
   ],
 });
 
-/** Exact immutable range required. Supplied path arrays are never provenance: always re-read base...head.
- * An injected reader is the runner's trusted IO seam, not assessment-authored data.
+/** IO: the merge gate's configured policy, with its error diagnostics retained rather than defaulted away. */
+function readGatePolicy({ env, readGateSettings, settingsLog, loggedGatePolicies }) {
+  const declared = boundedJson(readGateSettings());
+  if (!declared || typeof declared !== 'object' || !declared.settings || typeof declared.settings !== 'object'
+    || Array.isArray(declared.settings) || !Array.isArray(declared.errors ?? []) || declared.errors?.length)
+    throw new Error('configured gate settings unreadable; repair the declared settings');
+  const policy = resolveSettingsPolicy({ env, declared });
+  if (policy.errors.length) throw new Error('configured gate policy resolution failed; repair settings/env overrides');
+  if (policy.gateFiles.length > MAX_PATHS) throw new Error('configured gate policy exceeds 10000 globs; review the full configuration');
+  logPolicyOnce(policy, settingsLog, loggedGatePolicies);
+  return policy;
+}
+
+/** IO: settings-reader searches share the immutable history boundary and one bounded graph budget. */
+function settingsHistoryGit({ cwd = process.cwd(), env = process.env, exec = execFileSync }, deadline) {
+  const hardened = laneHistoryProofEnv(scrubGitRepoEnv(env));
+  hardened.PATH = '/usr/bin:/bin:/usr/sbin:/sbin';
+  let root;
+  const run = (args, directory) => {
+    const remaining = deadline - Date.now();
+    if (remaining <= 0) throw new Error('settings-reader graph budget exceeded');
+    const output = String(exec('git', ['-c', 'core.commitGraph=false', ...args],
+      { cwd: directory, env: hardened, encoding: 'utf8', timeout: Math.min(15000, remaining), maxBuffer: MAX_BYTES }));
+    if (Buffer.byteLength(output) > MAX_BYTES) throw new Error('settings-reader output exceeds 4 MiB');
+    return output;
+  };
+  return args => {
+    root ??= run(['rev-parse', '--show-toplevel'], cwd).trim();
+    if (!root || /[\x00-\x1f\x7f]/.test(root)) throw new Error('cannot resolve settings-reader repository root');
+    return run(args[0] === 'show' ? ['show', '--no-ext-diff', '--no-textconv', ...args.slice(1)] : args, root);
+  };
+}
+
+/** Exact immutable range required. Supplied arrays never establish provenance: always re-read base...head.
+ * Configured gate policy augments built-ins; settings-reader resolution uses the merge gate's shared reader.
+ * Injected readers are trusted runner IO seams, never assessment-authored data.
  */
-export function mergePathNaCheck({ base, head, diffPaths, readDiff, ...gitOptions } = {}) {
+export function mergePathNaCheck({ base, head, diffPaths, readDiff, readGateSettings = readDeclaredSettings,
+  readGateReaders = readSettingsReaders, settingsGit, settingsLog, loggedGatePolicies, ...gitOptions } = {}) {
   const ref = { uri: MERGE_PATH_CHECK_DEFINITION.uri, digest: digestOf(MERGE_PATH_CHECK_DEFINITION) };
   try {
     if (!HEX40.test(base ?? '') || !HEX40.test(head ?? '')) throw new Error('exact base and head required');
+    const policy = readGatePolicy({ env: gitOptions.env ?? process.env, readGateSettings, settingsLog, loggedGatePolicies });
     diffPaths = (readDiff ?? ((b, h) => readDiffPaths(b, h, gitOptions)))(base, head);
     if (!Array.isArray(diffPaths) || !diffPaths.length || diffPaths.length > MAX_PATHS) throw new Error('missing or oversized net diff');
     if (Buffer.byteLength(JSON.stringify(diffPaths)) > MAX_BYTES) throw new Error('oversized net diff paths');
-    const paths = diffPaths.map(safePath), touched = paths.find(path => isTrustChainPath(path) || isGateFile(path));
+    const paths = diffPaths.map(safePath);
+    const gatePath = path => isTrustChainPath(path) || isGateFile(path) || isGateFile(path, policy);
+    let touched = paths.find(gatePath);
+    if (!touched) {
+      const settings = paths.filter(path => SETTINGS_FILE_RE.test(path));
+      if (settings.length > MAX_SETTINGS_FILES) throw new Error(`settings-reader resolution exceeds ${MAX_SETTINGS_FILES} files`);
+      const deadline = Date.now() + MAX_GRAPH_MS, git = settingsGit ?? settingsHistoryGit(gitOptions, deadline);
+      for (const file of settings) {
+        if (Date.now() > deadline) throw new Error('settings-reader graph budget exceeded');
+        const result = readGateReaders({ git, file, shas: [base, head], policy, deadline });
+        if (!result || result.why || !Array.isArray(result.readers)) throw new Error(`settings readers unresolved: ${file}`);
+        if (result.readers.length > MAX_SETTINGS_READERS || !Array.isArray(result.keys ?? [])
+          || (result.keys?.length ?? 0) > MAX_SETTINGS_KEYS) throw new Error(`settings readers oversized: ${file}`);
+        const readers = result.readers.map(safePath);
+        const reader = result.gateReader ? safePath(result.gateReader) : readers.find(gatePath);
+        if (reader) { touched = `${file} (read by ${reader})`; break; }
+      }
+    }
     return { ...ref, result: touched ? 'fail' : 'pass', diffPaths: paths,
       problems: touched ? [`merge-path n/a refused: diff touches ${touched}`] : [] };
   } catch (error) {
@@ -524,39 +584,31 @@ export function mergePathNaCheck({ base, head, diffPaths, readDiff, ...gitOption
   }
 }
 
-/** CORE-VRD-048 adapter guard for a gap in the frozen v0.1.2 cascade rule.
- * A NEW child per-item override can weaken the parent's GLOBAL floor. Compare the union of item ids
- * using each seat's effective fallback; preserve the pinned vendor bytes and existing confirmation rules.
+/** CORE-VRD-048 adapter guards beyond the frozen vendor: no authenticated approval source exists here.
+ * Strip every child-authored confirmation before the Core cascade check; such claims never authorise relaxation.
+ * Compare effective item floors (including inherited globals), and retain parent gate checks as well.
  */
 function seatCascadeProblems(chain) {
-  const problems = cascadeProblems(chain);
+  const problems = cascadeProblems(chain.map(policy => ({ ...policy, confirmations: [] })));
   for (let i = 1; i < chain.length; i++) {
     const child = chain[i], ancestors = chain.slice(0, i);
     for (const seat of child.seats) {
       const configuring = ancestors.filter(policy => policy.seats.some(parent => parent.lens === seat.lens));
       const parent = configuring.at(-1)?.seats.find(parent => parent.lens === seat.lens);
       if (!parent) continue;
-      if (parent.check && !sameRef(parent.check, seat.check)) {
-        const levels = configuring.map(policy => policy.level);
-        const confirmed = levels.every(level => (child.confirmations ?? []).some(confirmation =>
-          confirmation.lens === seat.lens && confirmation.setting === 'check' && confirmation.level === level
-          && sameDigest(confirmation.policyDigest, policyDigest(child))));
-        if (!confirmed) problems.push(`${child.level} loosens ${seat.lens}.check without confirmation from ${levels.join(', ')}`);
-      }
+      const levels = configuring.map(policy => policy.level);
+      if (parent.check && !sameRef(parent.check, seat.check))
+        problems.push(`${child.level} loosens ${seat.lens}.check without confirmation from ${levels.join(', ')}`);
       const ids = new Set([...Object.keys(parent.evidence?.perItem ?? {}), ...Object.keys(seat.evidence?.perItem ?? {})]);
       for (const id of ids) {
         const minimum = parent.evidence?.perItem?.[id] ?? parent.evidence?.minKind ?? 'assertion';
         const effective = seat.evidence?.perItem?.[id] ?? seat.evidence?.minKind ?? 'assertion';
-        if (meets(effective, minimum)) continue;
-        const setting = `evidence.perItem.${id}`, levels = configuring.map(policy => policy.level);
-        const confirmed = levels.every(level => (child.confirmations ?? []).some(confirmation =>
-          confirmation.lens === seat.lens && confirmation.setting === setting && confirmation.level === level
-          && confirmation.owner && sameDigest(confirmation.policyDigest, policyDigest(child))));
-        if (!confirmed) problems.push(`${child.level} loosens ${seat.lens}.${setting} without confirmation from ${levels.join(', ')}`);
+        if (!meets(effective, minimum))
+          problems.push(`${child.level} loosens ${seat.lens}.evidence.perItem.${id} without confirmation from ${levels.join(', ')}`);
       }
     }
   }
-  return [...new Set(problems)];
+  return [...new Set(problems)].map(problem => `${problem}; child confirmations ignored: no authenticated approval-record source; retain the parent policy`);
 }
 
 /** IO: explicit settings checkout; company → optional explicitly named descendant policies (D15).
@@ -631,7 +683,8 @@ export function wrapSeatAnswers({ lens, head, rubric, policy, answers, at, naChe
  * the closed Core Statement. Never infer it from the current runId or from assessment-authored fields.
  */
 export function evaluateSeat({ lens, head, runId, assessmentRunId, assessment, rubric, expectedRubric,
-  policy, settings, diffPaths, readFileAtHead, cwd, env, at, base, readDiff } = {}) {
+  policy, settings, diffPaths, readFileAtHead, cwd, env, at, base, readDiff,
+  readGateSettings, readGateReaders, settingsGit, settingsLog, loggedGatePolicies } = {}) {
   try {
     if (settings && (settings.modeValid === false || !['shadow', 'enforce'].includes(settings.mode)))
       return refused([...(settings.problems ?? []), 'configured mode unreadable or invalid; repair rubric-mode.json']);
@@ -659,7 +712,8 @@ export function evaluateSeat({ lens, head, runId, assessmentRunId, assessment, r
       && (rubric.items.find(item => item.id === a.itemId)?.naWhen || /^MP\d+$/.test(a.itemId))) : [];
     if (conditional.length) {
       // Registry currently has one offline check. URI AND digest must match; claims never execute themselves.
-      naCheck = mergePathNaCheck({ base, head, diffPaths, readDiff, cwd, env });
+      naCheck = mergePathNaCheck({ base, head, diffPaths, readDiff, cwd, env,
+        readGateSettings, readGateReaders, settingsGit, settingsLog, loggedGatePolicies });
       diffPaths = naCheck.diffPaths;
       for (const answer of conditional) {
         const condition = rubric.items.find(item => item.id === answer.itemId)?.naWhen;
@@ -710,7 +764,12 @@ export function evaluateSeat({ lens, head, runId, assessmentRunId, assessment, r
   } catch (error) { return refused([`seat derivation failed: ${error.message}; repair evidence and rerun the seat`]); }
 }
 
-function effectiveMode(settings, requested) {
+/** Omitted mode keeps the library's shadow default; an explicit invalid value never selects a default. */
+function invalidRequestedMode(options) {
+  return Object.hasOwn(options, 'mode') && !['shadow', 'enforce'].includes(options.mode);
+}
+function effectiveMode(settings, requested, invalidRequested = false) {
+  if (invalidRequested) return 'enforce';
   if (settings) return settings.modeValid !== false && ['shadow', 'enforce'].includes(settings.mode) ? settings.mode : 'enforce';
   return ['shadow', 'enforce'].includes(requested) ? requested : 'shadow';
 }
@@ -718,8 +777,10 @@ function effectiveMode(settings, requested) {
 /** IO boundary: append AFTER derivation. Shadow failures remain visible and can never turn into a pass. */
 export function assessSeat(options = {}) {
   const at = options.at ?? new Date().toISOString();
-  let result = evaluateSeat({ ...options, at });
-  const mode = effectiveMode(options.settings, options.mode);
+  const invalidMode = invalidRequestedMode(options);
+  let result = invalidMode ? refused(['invalid requested rubric mode; choose shadow or enforce and rerun'])
+    : evaluateSeat({ ...options, at });
+  const mode = effectiveMode(options.settings, options.mode, invalidMode);
   if ((mode === 'shadow' || options.mode === 'shadow' || options.shadowRequested) && (options.appendRow || options.shadowPath)) {
     const started = options.settings?.shadowStartedAt ?? options.shadowStartedAt;
     const days = options.settings?.maxDays ?? options.maxDays;
@@ -747,7 +808,8 @@ export function assessSeat(options = {}) {
  */
 export function assessReviewSeats(options = {}) {
   const settings = options.settings ?? (options.settingsPath ? readSeatSettings(options) : undefined);
-  const mode = effectiveMode(settings, options.mode);
+  const invalidMode = invalidRequestedMode(options);
+  const mode = effectiveMode(settings, options.mode, invalidMode);
   const read = options.readFileAtRevision ?? ((revision, path) => readHeadFile(revision, path, options));
   let correctness = options.expectedRubric, preparationProblems = [];
   if (correctness === undefined && options.mergeBase) {
@@ -758,7 +820,7 @@ export function assessReviewSeats(options = {}) {
   for (const lens of ['security', 'correctness']) {
     const localSettings = preparationProblems.length && lens === 'correctness'
       ? { ...settings, problems: [...(settings?.problems ?? []), ...preparationProblems] } : settings;
-    seats[lens] = assessSeat({ ...options, settings: localSettings, mode, shadowRequested: options.mode === 'shadow', lens,
+    seats[lens] = assessSeat({ ...options, settings: localSettings, mode: invalidMode ? options.mode : mode, shadowRequested: options.mode === 'shadow', lens,
       rubric: lens === 'correctness' ? correctness : (options.rubrics?.security ?? settings?.securityRubric),
       expectedRubric: correctness, assessment: options.assessments?.[lens] ?? null,
       assessmentRunId: options.assessmentRunIds?.[lens] });
