@@ -256,6 +256,57 @@ describe('the Git proof of omitted content in the candidate build', () => {
 });
 
 describe('a passed candidate blocked at finalize by a long reader tick is adopted later without re-smoking', () => {
+  it('readyBuildVerified refuses a force-pushed pinned sha and rebuildClone freshly smokes the current plan', async () => {
+    const { originDir, cloneDir, env } = makeFixture();
+    env.WE_DAEMON_REBUILD_SKIP_UNRELATED = '0';
+    env.WE_DAEMON_OVERLAY_EDGE_RESOLVE = '0';
+    advanceMain(originDir, (dir) => writeFile(dir, 'shared.txt', 'base\n'));
+    const old = pushBranch(originDir, 'lane/moving', (dir) => writeFile(dir, 'moving.txt', 'old\n'));
+    pushBranch(originDir, 'lane/blocker', (dir) => writeFile(dir, 'shared.txt', 'blocker\n'));
+    for (const ref of ['lane/moving', 'lane/blocker']) addOverlay(cloneDir, { ref }, { env });
+    expect(await rebuildClone({ root: cloneDir, env, runSmoke: async () => PASS, lockOpts: LOCK_OPTS })).toMatchObject({ adopted: true });
+    const prevHead = gitOk(cloneDir, ['rev-parse', 'HEAD']).trim();
+    const tip = pushBranch(originDir, 'lane/moving', (dir) => writeFile(dir, 'shared.txt', 'moving\n'), { base: 'origin/lane/moving' });
+    // Make a different candidate while the moving overlay remains pinned at its reachable old head.
+    advanceMain(originDir, (dir) => writeFile(dir, 'main-moved.txt', 'new\n'));
+    const { runSmoke, endTick } = passWhileSiblingStartsTick(cloneDir, env);
+    let ready;
+    try {
+      const blocked = await rebuildClone({ root: cloneDir, env, runSmoke, lockOpts: LOCK_OPTS });
+      expect(blocked.reason).toBe('tick-in-progress');
+      ready = readReadyCandidate(cloneDir, env);
+      expect(ready.adopt.applied.find((a) => a.ref === 'lane/moving')).toMatchObject({ sha: old, pinnedFrom: tip });
+    } finally { endTick(); }
+    const verify = () => readyBuildVerified({
+      git: (args) => git(cloneDir, args), adopt: ready.adopt, prevHead,
+      mainTip: gitOk(cloneDir, ['rev-parse', 'origin/main']).trim(),
+    });
+    expect(verify()).toBe(true);
+    pushBranch(originDir, 'lane/moving', (dir) => {
+      writeFile(dir, 'moving.txt', 'old\n');
+      writeFile(dir, 'shared.txt', 'moving\n');
+    }, { force: true });
+    gitOk(cloneDir, ['fetch', '-q', 'origin', '+refs/heads/*:refs/remotes/origin/*']);
+    expect(git(cloneDir, ['merge-base', '--is-ancestor', old, 'origin/lane/moving']).status).toBe(1);
+    expect(verify()).toBe(false);
+    // Exact and same-tree matches are re-derived from the live plan and deliberately reuse its smoke.
+    // Move main to a different tree so the old ready record needs superseded-build provenance instead.
+    advanceMain(originDir, (dir) => writeFile(dir, 'main-later.txt', 'later\n'));
+
+    const freshSmoke = vi.fn(async () => PASS);
+    const result = await rebuildClone({ root: cloneDir, env, runSmoke: freshSmoke, lockOpts: LOCK_OPTS });
+    expect(result.adopted).toBe(true);
+    expect(result.reason).not.toBe('ready-adopted');
+    // This PR's strict pin proof now catches the force-pushed pin before the build check, so the discard
+    // reason is ready-pin-stale (it was unverified-build before); the fresh-rebuild behaviour is unchanged.
+    expect(result.alerts).toContainEqual(expect.objectContaining({ kind: 'ready-candidate-discarded', detail: expect.objectContaining({ reason: 'ready-pin-stale' }) }));
+    expect(freshSmoke).toHaveBeenCalledTimes(1);
+    expect(readReadyCandidate(cloneDir, env)).toBeNull();
+    expect(gitOk(cloneDir, ['rev-parse', 'HEAD']).trim()).not.toBe(ready.adopt.finalSha);
+    expect(readFileSync(join(cloneDir, 'main-later.txt'), 'utf8')).toBe('later\n');
+    expect(git(cloneDir, ['merge-base', '--is-ancestor', old, 'HEAD']).status).toBe(0);
+  });
+
   it.each(['moved tip', 'retired overlay', 'HEAD mismatch'])('tick-start discards a stale pinned candidate after %s and freshly rebuilds', async (stale) => {
     const { originDir, cloneDir, env } = makeFixture();
     env.WE_DAEMON_REBUILD_SKIP_UNRELATED = '0';
