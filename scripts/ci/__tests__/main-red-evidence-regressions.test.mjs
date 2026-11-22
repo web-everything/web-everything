@@ -138,8 +138,14 @@ it('delayed historical recovery cannot clear a different historical SHA failure 
     run(12, 'c'.repeat(40), 'failure'), run(10, old, 'failure')], head, { '14/1': reusedJobs() }))
     .toMatchObject({ red: true });
 });
-it('historical recovery can follow reused pushes without becoming their execution evidence', () => {
+// Send-back F3: a backstop for an older SHA created AFTER a newer (even proven-reused) push moved
+// main is outside its own window. It cannot clear that SHA's failure; only a current-head backstop can.
+it('an older-SHA backstop created after a reused newer push cannot clear red (fail closed)', () => {
   expect(fact([run(10, old, 'failure'), run(12, head, 'failure'), run(13, old, 'success', 'schedule')],
+    head, { '12/1': reusedJobs() })).toMatchObject({ red: true, firstRedSha: old });
+});
+it('a current-head backstop after a reused push still recovers older red', () => {
+  expect(fact([run(10, old, 'failure'), run(12, head, 'failure'), run(13, head, 'success', 'schedule')],
     head, { '12/1': reusedJobs() })).toMatchObject({ red: false });
 });
 it('backstop on a reused commit still recovers older red after another reused commit lands', () => {
