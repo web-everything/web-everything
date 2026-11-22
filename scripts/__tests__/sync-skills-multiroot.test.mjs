@@ -14,7 +14,12 @@ import { buildPlans, gitTrackedFiles, parseArgs } from '../sync-skills-deploy.mj
 import * as skillsSync from '../sync-skills-deploy.mjs';
 
 const MODULE_PATH = join(dirname(fileURLToPath(import.meta.url)), '..', 'sync-skills-deploy.mjs');
-const GIT_REPO_ENV = skillsSync.GIT_REPO_ENV;
+// Test-owned (not read from the module under test), so a control run stays clean even if the source list shrinks.
+const GIT_REPO_ENV = [
+  'GIT_DIR', 'GIT_WORK_TREE', 'GIT_INDEX_FILE', 'GIT_COMMON_DIR', 'GIT_PREFIX',
+  'GIT_CEILING_DIRECTORIES', 'GIT_DISCOVERY_ACROSS_FILESYSTEM',
+  'GIT_OBJECT_DIRECTORY', 'GIT_ALTERNATE_OBJECT_DIRECTORIES', 'GIT_NAMESPACE',
+];
 let tmp;
 beforeEach(() => { tmp = mkdtempSync(join(tmpdir(), 'sync-multiroot-')); });
 afterEach(() => { try { rmSync(tmp, { recursive: true, force: true }); } catch { /* best-effort */ } });
