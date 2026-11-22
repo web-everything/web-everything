@@ -81,7 +81,7 @@ import { resolveFixSettings, resolveFixDispatchSettings } from '../../scripts/co
 import { unlinkSync, readFileSync, mkdirSync, writeFileSync, renameSync } from 'node:fs';
 import { resolveCascade } from '../../scripts/lib/policy-cascade.mjs';
 import { stopSession } from '../../scripts/operations/dispatch-abort.mjs';
-import { runOrphanFixRoundPass } from '../../scripts/conveyor/orphan-fix-round.mjs';
+import { defaultListBounced, runOrphanFixRoundPass } from '../../scripts/conveyor/orphan-fix-round.mjs';
 import { createStaleBaseGate } from '../../scripts/conveyor/stale-base-refresh.mjs';
 import { resolveRepairExecutorChains } from '../../scripts/lib/fix-executor-chain.mjs';
 import { resolveAiRouting, aiRoutingInputs, AI_ROUTING_STANDARD } from '../../scripts/lib/ai-routing.mjs';
@@ -1170,6 +1170,7 @@ export async function runTickAllRepos({
   adoptYieldProbe,
   // Off under a test run unless injected (the real pass reads GitHub).
   orphanGuardTick = process.env.VITEST ? null : runOrphanFixRoundPass,
+  listBouncedPrs = process.env.VITEST ? null : defaultListBounced,
 } = {}) {
   callRecorder.reset();
   const persistCursors = budgetRotation === fixPassRotation && prCursors === fixPassPrCursors;
@@ -1198,7 +1199,8 @@ export async function runTickAllRepos({
     // A repo that deferred PRs keeps its PR cursor; when the loop finishes it must also head the next pass,
     // or a repo reached after the budget is spent starves despite the cursor. A budget STOP keeps the first
     // skipped (never visited) repo at the head: a visited deferred repo comes round again after it.
-    const retainedCursor = repo => prCursors[phase]?.[repo] != null;
+    // The orphan guard lists every repo before it reads a PR, so its head is set from its result instead (PR #7330).
+    const retainedCursor = repo => phase !== 'orphan-guard' && prCursors[phase]?.[repo] != null;
     for (let i = 0; i < ordered.length; i += 1) {
       if (((completedRepo || yieldedForAdoption) && shouldYield()) || now() - start > budget.budgetMs) {
         budget.hit = true;
@@ -1401,48 +1403,114 @@ export async function runTickAllRepos({
   // The orphan-round guard (retry/escalation cap) stays BEFORE fix so a capped orphan is never re-dispatched first.
   const requireOrphanGuard = !stuckFixerTick && realTick && !!orphanGuardTick;
   const orphanGuardCompleted = new Set();
+  const orphanGuardHeldPrs = new Map();
+  const orphanGuardFailed = new Set();
+  let orphanGuardEvidenceUnknown = false;
+  const holdPr = (repo, pr) => {
+    const key = repoKeyForSlug(repo);
+    const held = orphanGuardHeldPrs.get(key) ?? new Set();
+    held.add(pr);
+    orphanGuardHeldPrs.set(key, held);
+  };
   const orphanGuard = await timedAsync('orphan-guard', async () => {
     if (!requireOrphanGuard) return { rows: [] };
+    let firstRepo;
     try {
       const result = await orphanGuardTick({ env: process.env, nowMs: now(),
+      deadlineAt: phaseStarts['orphan-guard'] + budgets['orphan-guard'].budgetMs,
+      ...(typeof adoptYieldProbe === 'function' ? { shouldYield } : {}),
+      now, cursor: prCursors['orphan-guard'], ...(planCache ? { reconcile: planCache.reconcile } : {}),
       repos: (function* () {
         for (const repo of budgetRepos('orphan-guard', repos)) {
           const key = repoKeyForSlug(repo);
           if (!key) throw new Error(`orphan-guard: unknown repo ${repo}`);
+          firstRepo ??= repo;
           yield { key, slug: CONSTELLATION_REPOS[key].slug };
           // Iterator progress proves only that the repo was visited; returned rows may still report failure.
           orphanGuardCompleted.add(repo);
         }
       })(),
       });
-      if (!Array.isArray(result?.rows)) orphanGuardCompleted.clear();
+      if (!Array.isArray(result?.rows)) { orphanGuardCompleted.clear(); orphanGuardEvidenceUnknown = true; }
       else for (const row of result.rows) {
         const key = row?.repo && repoKeyForSlug(row.repo);
-        if (!key) { orphanGuardCompleted.clear(); break; }
+        if (!key) { orphanGuardCompleted.clear(); orphanGuardEvidenceUnknown = true; break; }
         const success = { rearm: 're-armed', redispatch: 're-dispatched', escalate: 'escalated' };
         if (!Object.hasOwn(success, row.decision)
           || (row.result !== success[row.decision] && row.result !== 'report-only (WE_ORPHAN_FIX_GUARD=0)')) {
-          for (const repo of orphanGuardCompleted) {
-            if (repoKeyForSlug(repo) === key) orphanGuardCompleted.delete(repo);
+          if (Number.isInteger(row.pr)) holdPr(row.repo, row.pr);
+          else {
+            orphanGuardFailed.add(key);
+            for (const repo of orphanGuardCompleted) {
+              if (repoKeyForSlug(repo) === key) orphanGuardCompleted.delete(repo);
+            }
           }
         }
+      }
+      phasePrCounts['orphan-guard'] = { handled: result?.handled ?? 0, deferred: result?.deferred?.length ?? 0 };
+      // Per-repo cursors (PR #7330): a repo's deferred PR survives passes that visit only other repos.
+      const nextCursor = result?.repoCursors ?? result?.nextCursor;
+      if (nextCursor != null) prCursors['orphan-guard'] = nextCursor;
+      else delete prCursors['orphan-guard'];
+      // Only the repo listed FIRST is sure to get a PR handled (listing can spend the whole budget), so on any budget
+      // hit the first slot moves round-robin to the next repo. Heading with the first skipped or first deferred repo
+      // instead let a slow repo be listed every pass yet never come first, starving its capped orphans (PR #7330).
+      const budgetHit = budgets['orphan-guard'].skipped.length > 0 || (result?.deferred?.length ?? 0) > 0;
+      const firstAt = firstRepo === undefined ? -1 : repos.indexOf(firstRepo);
+      if (budgetHit && firstAt >= 0) budgetRotation['orphan-guard'] = repos[(firstAt + 1) % repos.length];
+      if (result?.deferred?.length) {
+        budgets['orphan-guard'].hit = true;
+        budgets['orphan-guard'].skipped.push(...result.deferred);
+        for (const deferred of result.deferred) holdPr(deferred.repo, deferred.pr);
       }
       return result ?? { rows: [] };
     }
     catch (e) {
       orphanGuardCompleted.clear();
+      orphanGuardEvidenceUnknown = true;
       return { rows: [{ decision: 'error', reason: String(e?.message ?? e).split('\n')[0] }] };
     }
   });
+  planCache?.markTouched({ dispatched: (Array.isArray(orphanGuard.rows) ? orphanGuard.rows : [])
+    .filter(row => row?.decision === 'redispatch' && row.result?.startsWith('re-dispatched'))
+    .map(row => ({ repo: row.repo, pr: row.pr })) });
+  // A budget-skipped repo still gets ordinary fixes. Discover its review:changes
+  // PRs live: the shared snapshot/planner may predate a newly added label.
+  const unvisited = new Set(orphanGuardEvidenceUnknown ? []
+    : budgets['orphan-guard'].skipped.filter(repo => typeof repo === 'string' && !orphanGuardFailed.has(repoKeyForSlug(repo))));
   const orphanGuardDeferred = requireOrphanGuard
-    ? stepRepos.get('fix').filter(repo => !orphanGuardCompleted.has(repo)) : [];
+    ? stepRepos.get('fix').filter(repo => !orphanGuardCompleted.has(repo) && !unvisited.has(repo)) : [];
+  if (requireOrphanGuard) for (const repo of stepRepos.get('fix')) {
+    if (!unvisited.has(repo)) continue;
+    try {
+      const bounced = await listBouncedPrs(CONSTELLATION_REPOS[repoKeyForSlug(repo)].slug);
+      if (!Array.isArray(bounced) || bounced.some(pr => !Number.isInteger(pr?.number) || pr.number <= 0)) {
+        throw new Error('unreadable live review:changes listing');
+      }
+      for (const pr of bounced) holdPr(repo, pr.number);
+    } catch {
+      // Unknown live evidence holds the whole repo until the next pass.
+      orphanGuardDeferred.push(repo);
+    }
+  }
   const guardedFixRepos = stepRepos.get('fix').filter(repo => !orphanGuardDeferred.includes(repo));
   const fix = stepTimed('fix', () => (authGate.paused ? pausedDispatchResult()
     : runReconcileFixDispatchAllRepos({ repos: budgetRepos('fix', guardedFixRepos), allowStandDownAutoProceed,
-      tick: boundedPrTick('fix', sharedTick('fix', fixTick ?? runReconcileFixDispatch)),
+      tick: boundedPrTick('fix', options => sharedTick('fix', fixTick ?? runReconcileFixDispatch)({ ...options,
+        ...(requireOrphanGuard ? { excludePrs: entry => orphanGuardHeldPrs.get(repoKeyForSlug(options.repo))?.has(entry.prNumber),
+        } : {}),
+      })),
       ...(fixTick ? {} : { queueAdmission, dispatchThrottle, borrowGate, fixExecutorRoute }) })));
   for (const repo of orphanGuardDeferred) fix.refusals.push({ repo, prNumber: null,
     kind: 'orphan-guard-deferred', why: 'orphan-cap guard did not complete this repo; fix deferred until next pass' });
+  for (const repo of guardedFixRepos) {
+    for (const prNumber of orphanGuardHeldPrs.get(repoKeyForSlug(repo)) ?? []) {
+      if (!fix.refusals.some(row => row.repo === repo && row.prNumber === prNumber)) fix.refusals.push({
+        repo, prNumber, kind: 'orphan-guard-deferred',
+        why: 'orphan-cap guard did not settle this PR; fix deferred until next pass',
+      });
+    }
+  }
   planCache?.markTouched(fix);
   // Reclaim after fix so a slow watchdog sweep cannot delay review:changes decisions.
   // The hooks cannot interrupt in-flight work or bound discovery/endFix/release IO.

@@ -1,0 +1,6 @@
+{
+  "description": "Stop or quarantine behavior while main CI is red.",
+  "owner": "scripts/settings/red-main-hold.json",
+  "changeVia": "pr",
+  "instant": false
+}

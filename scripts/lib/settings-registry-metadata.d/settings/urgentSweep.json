@@ -1,0 +1,6 @@
+{
+  "description": "Urgent work sweep interval in minutes.",
+  "owner": "scripts/settings/urgent-sweep.json",
+  "changeVia": "pr",
+  "instant": false
+}

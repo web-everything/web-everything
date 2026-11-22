@@ -1,0 +1,6 @@
+{
+  "description": "Audit coordination record location.",
+  "owner": "scripts/settings/prototype-load.json",
+  "changeVia": "pr",
+  "instant": false
+}
