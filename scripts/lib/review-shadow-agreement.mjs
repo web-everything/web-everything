@@ -137,7 +137,7 @@ function repoRelativeReadPath(value, checkoutRoot) {
 /** Served transcript evidence only. A completed, non-error read_file must cite a diff path.
  * The juror's existing escape checks have already validated the transcript and in-lane paths.
  */
-export function hasSuccessfulDiffRead(transcript, scope, { checkoutRoot, requiredFiles = [] } = {}) {
+export function hasSuccessfulDiffRead(transcript, scope, { checkoutRoot, requiredFiles = [], wholeFiles = false } = {}) {
   try {
     const events = String(transcript).split('\n').filter(line => line.trim()).map(line => JSON.parse(line));
     if (events.at(-1)?.event !== 'result' || events.at(-1)?.result?.status !== 'SUCCESS') return false;
@@ -146,13 +146,16 @@ export function hasSuccessfulDiffRead(transcript, scope, { checkoutRoot, require
       const step = event?.event === 'step_update' ? event.step_update : null;
       if (!step || step.step_index == null) continue;
       const key = JSON.stringify([step.conversation_id ?? null, step.step_index]);
-      const record = steps.get(key) ?? { read: false, bad: false, done: false, path: null };
+      const record = steps.get(key) ?? { read: false, bad: false, done: false, path: null, whole: true };
       const names = [step.tool_name, step.tool_info?.name].filter(name => name !== undefined);
       if (names.some(name => name !== 'read_file')) record.bad = true;
       if (names.includes('read_file')) {
         record.read = true;
         let params = step.tool_info?.parameters;
         if (typeof params === 'string') params = JSON.parse(params);
+        // With no hunk-range metadata, only a path-only (unbounded) read proves whole-file coverage.
+        // Any range, offset, limit or other read control conservatively requires Claude.
+        if (!params || Object.keys(params).some(key => !/^(AbsolutePath|FilePath|file_path|filePath|path)$/.test(key))) record.whole = false;
         const paths = params && typeof params === 'object' && !Array.isArray(params)
           ? Object.entries(params).filter(([k]) => /^(AbsolutePath|FilePath|file_path|filePath|path)$/.test(k)).map(([, v]) => v) : [];
         if (!paths.length || paths.some(path => typeof path !== 'string' || !path.trim()
@@ -167,7 +170,7 @@ export function hasSuccessfulDiffRead(transcript, scope, { checkoutRoot, require
     const diffPaths = new Set((Array.isArray(scope) ? scope : []).map(path => repoRelativeReadPath(path, checkoutRoot)).filter(Boolean));
     const inspected = new Set();
     for (const record of steps.values()) {
-      if (!record.read || record.bad || !record.done || !record.path) continue;
+      if (!record.read || record.bad || !record.done || !record.path || (wholeFiles && !record.whole)) continue;
       const path = repoRelativeReadPath(record.path, checkoutRoot);
       if (path && diffPaths.has(path)) inspected.add(path);
     }

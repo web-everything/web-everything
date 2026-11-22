@@ -168,6 +168,9 @@ export async function runSeatWithProvider(request, {
   let agyRun = await runAgy();
   if (promoted && agyRun.status === 'ok') {
     const reasons = [];
+    if (!/^[0-9a-f]{40}$/i.test(String(directive.head ?? ''))
+      || !/^[0-9a-f]{40}$/i.test(String(agyRun.checkoutHead ?? ''))
+      || agyRun.checkoutHead.toLowerCase() !== directive.head.toLowerCase()) reasons.push('Carbon read checkout HEAD is missing or differs from the reviewed PR HEAD');
     if (typeof agyRun.sessionId !== 'string' || !agyRun.sessionId.trim()) reasons.push('missing Carbon session identity');
     if (!validShadowAnswer(agyRun.value, { counted: true, schema: plain.shape })) reasons.push('invalid Carbon answer schema or finding coordinates');
     else {
@@ -177,7 +180,9 @@ export async function runSeatWithProvider(request, {
       } else {
         let inspected = false;
         try { inspected = Boolean(agyRun.transcriptFile) && hasSuccessfulDiffRead(readTranscript(agyRun.transcriptFile), directive.citationScope, {
-          checkoutRoot: agyRun.checkoutRoot ?? cwd, requiredFiles: scoped.admitted.map(finding => finding.file),
+          checkoutRoot: agyRun.checkoutRoot ?? cwd,
+          requiredFiles: scoped.admitted.length ? scoped.admitted.map(finding => finding.file) : directive.citationScope,
+          wholeFiles: scoped.admitted.length === 0,
         }); } catch { /* unreadable evidence refuses */ }
         if (!inspected) reasons.push('Carbon lacks successful diff read_file evidence for its cited files');
       }

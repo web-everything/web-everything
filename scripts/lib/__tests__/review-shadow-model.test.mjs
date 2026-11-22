@@ -597,11 +597,11 @@ describe('one counted Carbon correctness seat', () => {
   const carbon = 'gemini-4-carbon-high';
   const settings = () => loadReviewSeatSettings({ policy: DEFAULT_ROUTING_POLICY, aiRouting: {}, log: () => {} });
   async function counted(agyRun) {
-    if (agyRun === ok) agyRun = { ...ok, servedModel: carbon, checkoutRoot: '/lane', transcriptFile: 'served.jsonl' };
+    if (agyRun === ok) agyRun = { ...ok, servedModel: carbon, checkoutHead: 'a'.repeat(40), checkoutRoot: '/lane', transcriptFile: 'served.jsonl' };
     const rows = [];
     const claudeJudge = vi.fn(async () => ({ value: claudeAnswer }));
     const answer = await runSeatWithProvider({ lens: 'correctness', runId: 'promotion-test', shape: REVIEW_JUDGE_SHAPE,
-      seatProvider: { ...seatProviderDirective(settings(), 'correctness', highCarePr), repo: 'o/r', pr: 7, head: 'head', citationScope: [finding.file] } }, {
+      seatProvider: { ...seatProviderDirective(settings(), 'correctness', highCarePr), repo: 'o/r', pr: 7, head: 'a'.repeat(40), citationScope: [finding.file] } }, {
       cwd: '.', claudeJudge, unwrap: x => x, wrap: value => value,
       agyJuror: async () => { if (agyRun instanceof Error) throw agyRun; return agyRun; }, readTranscript: () => servedReadTrace(finding.file),
       // This fixture exercises standard caps, independent of operator platform preferences.
@@ -709,7 +709,7 @@ describe('one counted Carbon correctness seat', () => {
 
 describe('promotion verdict authorization audit', () => {
   const carbon = 'gemini-4-carbon-high';
-  const good = { status: 'ok', sessionId: 'carbon-session', servedModel: carbon, checkoutRoot: '/lane', transcriptFile: 'served.jsonl', value: { summary: 'Reviewed diff: inverted guard', findings: [finding] } };
+  const good = { status: 'ok', sessionId: 'carbon-session', servedModel: carbon, checkoutHead: 'a'.repeat(40), checkoutRoot: '/lane', transcriptFile: 'served.jsonl', value: { summary: 'Reviewed diff: inverted guard', findings: [finding] } };
   const policyWith = patch => {
     const policy = structuredClone(DEFAULT_ROUTING_POLICY);
     Object.assign(policy.operations['review-seat:mandatory:correctness'], patch);
@@ -720,7 +720,7 @@ describe('promotion verdict authorization audit', () => {
     vi.stubEnv('WE_REVIEW_SHADOW_AGY_PROMOTED', 'true');
     const rows = [], calls = [];
     const answer = await runSeatWithProvider({ lens, runId: 'audit', shape: REVIEW_JUDGE_SHAPE, seatProvider: {
-      mode: 'agy', promoted, model: carbon, onEscape: 'claude', repo: 'o/r', pr: 7, head: 'head', citationScope: scope,
+      mode: 'agy', promoted, model: carbon, onEscape: 'claude', repo: 'o/r', pr: 7, head: 'a'.repeat(40), citationScope: scope,
     } }, {
       cwd: '.', unwrap: x => x, wrap: value => value,
       claudeJudge: async () => { calls.push('claude'); return { value: claudeAnswer }; },
@@ -859,6 +859,41 @@ describe('promotion verdict authorization audit', () => {
     fellBack(await attempt({ ...good, value: { summary: 'Clean', findings: [] } }, {
       scope: ['src/config.json'], transcript: readTrace(path),
     }));
+  });
+
+  it('reads from a base-version checkout never authorize a Carbon accept for the reviewed head', async () => {
+    const result = await attempt({ ...good, checkoutHead: 'b'.repeat(40), value: { summary: 'Clean', findings: [] } });
+    fellBack(result);
+    expect(result.rows[0]).toMatchObject({ fallback: true, agyVerdict: null });
+  });
+  it('missing observed checkout HEAD never authorizes a counted Carbon answer', async () => {
+    fellBack(await attempt({ ...good, checkoutHead: undefined, value: { summary: 'Clean', findings: [] } }));
+  });
+  const twoFileReads = (partial = false) => [finding.file, 'scripts/second.mjs'].map((path, i) => ({
+    event: 'step_update', step_update: { step_index: i + 1, step_type: 'tool', tool_name: 'read_file', state: 'DONE',
+      tool_info: { parameters: { AbsolutePath: path, ...(partial ? { start_line: 1, end_line: 1 } : {}) } } },
+  })).concat({ event: 'result', result: { status: 'SUCCESS' } }).map(x => JSON.stringify(x)).join('\n');
+  it('two-file diff with one read of one line of one file requires Claude', async () => {
+    fellBack(await attempt({ ...good, checkoutHead: 'a'.repeat(40), value: { summary: 'Clean', findings: [] } }, {
+      scope: [finding.file, 'scripts/second.mjs'],
+      transcript: readTrace(finding.file, 'DONE', { tool_info: { parameters: { AbsolutePath: finding.file, start_line: 1, end_line: 1 } } }),
+    }));
+  });
+  it('a clean answer requires whole-file evidence for every changed file, not just one full read', async () => {
+    fellBack(await attempt({ ...good, checkoutHead: 'a'.repeat(40), value: { summary: 'Clean', findings: [] } }, {
+      scope: [finding.file, 'scripts/second.mjs'], transcript: readTrace(finding.file),
+    }));
+  });
+  it('single-line reads of every file still do not establish clean full-diff coverage', async () => {
+    fellBack(await attempt({ ...good, checkoutHead: 'a'.repeat(40), value: { summary: 'Clean', findings: [] } }, {
+      scope: [finding.file, 'scripts/second.mjs'], transcript: twoFileReads(true),
+    }));
+  });
+  it('whole-file reads of every changed file at the reviewed HEAD allow a clean Carbon answer', async () => {
+    const result = await attempt({ ...good, checkoutHead: 'a'.repeat(40), value: { summary: 'Clean', findings: [] } }, {
+      scope: [finding.file, 'scripts/second.mjs'], transcript: twoFileReads(),
+    });
+    expect(result.calls).toEqual(['carbon']);
   });
 
 });
