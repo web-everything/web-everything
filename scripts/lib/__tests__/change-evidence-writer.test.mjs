@@ -22,9 +22,17 @@ afterEach(() => { vi.unstubAllEnvs(); for (const dir of dirs.splice(0)) fs.rmSyn
 function harness() {
   const coordination = fs.mkdtempSync(path.join(process.env.TMPDIR || os.tmpdir(), 'change-evidence-')); dirs.push(coordination);
   const x = input(), emit = vi.fn();
+  // Closed PRs, newest update first, as the REST pulls listing returns them (one closed-unmerged row).
+  x.listing = [{ number: pr.number, merged_at: '2026-11-21T15:00:00Z', updated_at: '2026-11-21T15:00:02Z' },
+    { number: 2, merged_at: null, updated_at: '2026-11-21T09:00:00Z' },
+    { number: 1, merged_at: '2026-11-20T23:59:59Z', updated_at: '2026-11-20T23:59:59Z' }];
   const gh = vi.fn(args => {
-    if (args[0] === 'pr') return args[1] === 'list' ? [{ number: pr.number, mergedAt: '2026-11-21T15:00:00Z' }, { number: 1, mergedAt: '2026-11-20T23:59:59Z' }] : x.pr;
+    if (args[0] === 'pr') return x.pr;
     const endpoint = args[1];
+    if (endpoint.includes('/pulls?state=closed&sort=updated&direction=desc&')) {
+      const page = Number(new URL(endpoint, 'https://x/').searchParams.get('page'));
+      return x.listing.slice((page - 1) * 100, page * 100);
+    }
     if (endpoint.includes('/events?')) return x.events;
     if (endpoint.includes('/comments?')) return x.comments;
     if (endpoint.includes('/pulls/') && endpoint.includes('/commits?')) return x.commits;
@@ -142,6 +150,50 @@ it('backfills a bounded merged PR listing through the same writer', async () => 
   expect(h.gh.mock.calls[0][0]).not.toContain('--search');
   expect(h.pending()).toEqual([]);
   expect(fs.readdirSync(h.dir).filter(n => /^1-/.test(n))).toEqual([]); // merged before the window: not collected
+  expect(h.gh.mock.calls.filter(([a]) => a[0] === 'pr' && a[2] !== String(pr.number))).toEqual([]); // closed-unmerged #2 skipped
+});
+// Red-team break (x1b8hlo): a long merged history must not make a small recent window unrecoverable.
+const history = (inWindow, before, since = '2026-11-21') => [
+  ...Array.from({ length: inWindow }, (_, i) => ({ number: i ? 10000 + i : pr.number, merged_at: `${since}T12:00:00Z`, updated_at: `${since}T12:00:00Z` })),
+  ...Array.from({ length: before }, (_, i) => ({ number: 20000 + i, merged_at: '2026-01-01T00:00:00Z', updated_at: '2026-01-01T00:00:00Z' })),
+];
+it('backfill recovers one recent merge from a 1,000-merge history and stops listing at the window', async () => {
+  const h = harness(); h.x.listing = history(1, 999);
+  await expect(backfillChangeEvidence({ ...h.options, since: '2026-11-21' })).resolves.toHaveLength(1);
+  expect(fs.existsSync(h.file)).toBe(true);
+  expect(h.gh.mock.calls.filter(([a]) => a[1]?.includes('/pulls?state=closed'))).toHaveLength(1);
+});
+it('backfill keeps an old merge that was updated recently out of the window', async () => {
+  const h = harness(); h.x.listing = [{ number: 30000, merged_at: '2026-11-01T00:00:00Z', updated_at: '2026-11-21T20:00:00Z' }, ...h.x.listing];
+  await backfillChangeEvidence({ ...h.options, since: '2026-11-21' });
+  expect(h.gh.mock.calls.some(([a]) => a[0] === 'pr' && a[2] === '30000')).toBe(false);
+  expect(fs.existsSync(h.file)).toBe(true);
+});
+it.each([['a later --since', { since: '2026-11-21', maxPages: 2 }], ['a larger --max-pages', { since: '2026-11-10', maxPages: 3 }]])(
+  'backfill fails closed when the window outruns the page cap, and %s recovers', async (_, recovery) => {
+    const busy = () => { const h = harness(); h.x.listing = [...history(1, 0),
+      ...Array.from({ length: 250 }, (_, i) => ({ number: 40000 + i, merged_at: null, updated_at: '2026-11-15T00:00:00Z' })), ...history(0, 10)]; return h; };
+    const h = busy();
+    await expect(backfillChangeEvidence({ ...h.options, since: '2026-11-10', maxPages: 2 })).rejects.toThrow(/later --since or a larger --max-pages/);
+    expect(h.gh.mock.calls.some(([a]) => a[0] === 'pr')).toBe(false); // nothing collected from a partial listing
+    const ok = busy();
+    await expect(backfillChangeEvidence({ ...ok.options, ...recovery })).resolves.toHaveLength(1);
+    expect(fs.existsSync(ok.file)).toBe(true);
+  });
+it.each([
+  ['a non-array page', { rows: 1 }],
+  ['a row without a number', [{ merged_at: null, updated_at: '2026-11-21T00:00:00Z' }]],
+  ['an unparseable updated_at', [{ number: 5, merged_at: null, updated_at: 'yesterday' }]],
+  ['a non-string merged_at', [{ number: 5, merged_at: 7, updated_at: '2026-11-21T00:00:00Z' }]],
+  ['an unparseable merged_at', [{ number: 5, merged_at: 'soon', updated_at: '2026-11-21T00:00:00Z' }]],
+])('backfill refuses a listing with %s', async (_, page) => {
+  const h = harness(); h.gh.mockImplementation(args => { if (args[1]?.includes('/pulls?state=closed')) return page; throw Error('no'); });
+  await expect(backfillChangeEvidence({ ...h.options, since: '2026-11-21' })).rejects.toThrow(/listing/);
+});
+it('backfill refuses an invalid repo slug before building the listing URL', async () => {
+  const h = harness();
+  await expect(backfillChangeEvidence({ ...h.options, since: '2026-11-21', repo: 'a/b?x=1' })).rejects.toThrow(/repo/);
+  expect(h.gh).not.toHaveBeenCalled();
 });
 it('backfill never emits daemon events and its call budget scales with the merge count', async () => {
   const h = harness(), original = h.gh.getMockImplementation();

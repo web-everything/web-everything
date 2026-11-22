@@ -175,15 +175,37 @@ export async function writeChangeEvidenceForMerged({ merged = [], queueFollowUps
   return written;
 }
 
+/**
+ * Merges at or after `since`, read from closed PRs newest-update first (no search listing, #no-label-search).
+ * A merge updates the PR, so updated_at >= merged_at: the first row updated before `since` ends the scan,
+ * and the read is bounded by the window, not by the repository's history (red-team x1b8hlo).
+ */
+function mergedSince({ listing, repo, since, maxPages }) {
+  const time = (value, field) => {
+    const t = typeof value === 'string' ? Date.parse(value) : NaN;
+    if (!Number.isFinite(t)) throw Error(`incomplete merged listing: unreadable ${field}`);
+    return t;
+  };
+  const found = new Map();
+  for (let page = 1; page <= maxPages; page++) {
+    const rows = listing.read(['api', `repos/${repo}/pulls?state=closed&sort=updated&direction=desc&per_page=100&page=${page}`]);
+    if (!Array.isArray(rows) || rows.length > 100) throw Error('incomplete merged listing page');
+    for (const row of rows) {
+      if (!Number.isSafeInteger(row?.number) || row.number < 1) throw Error('incomplete merged listing: unreadable number');
+      if (time(row.updated_at, 'updated_at') < since) return [...found.values()];
+      if (row.merged_at !== null && time(row.merged_at, 'merged_at') >= since) found.set(row.number, { number: row.number });
+    }
+    if (rows.length < 100) return [...found.values()];
+  }
+  throw Error(`merged listing exceeds ${maxPages} pages of closed PRs; operator: retry backfill with a later --since or a larger --max-pages`);
+}
+
 export async function backfillChangeEvidence({ since, repo = DEFAULT_REPO, gh = defaultGh, maxCalls = 256, maxPages = 10, ...options } = {}) {
   // utc-day-slice-ok: validates the supplied UTC calendar date, not the operator's current day.
   if (!/^\d{4}-\d{2}-\d{2}$/.test(since ?? '') || new Date(since).toISOString().slice(0, 10) !== since) throw Error('expected --since=YYYY-MM-DD');
+  if (!/^[\w.-]+\/[\w.-]+$/.test(repo ?? '')) throw Error('expected --repo=owner/repo');
   if ((options.mode ?? resolveChangeEvidenceMode().value.mode) === 'off') return [];
-  const listing = reader(gh, 1, maxPages);
-  const listed = listing.read(['pr', 'list', '--repo', repo, '--state', 'merged', '--limit', '1000', '--json', 'number,mergedAt']);
-  if (!Array.isArray(listed) || listed.length >= 1000) throw Error('merged listing capped; operator must backfill a narrower window');
-  // No search-backed listing (#no-label-search): filter the merged list by merge time, UTC start of the day.
-  const prs = listed.filter(pr => typeof pr.mergedAt === 'string' && pr.mergedAt >= `${since}T00:00:00Z`);
+  const prs = mergedSince({ listing: reader(gh, maxPages, maxPages), repo, since: Date.parse(`${since}T00:00:00Z`), maxPages });
   // Root cause of the first live backfill failing ~20 of 30: ONE 256-call budget shared by every merge (about 9 reads
   // each). The backfill budget scales with the number of merges. Backfill never emits to the live daemon-events log
   // (only the drain hook at merge time does); failures stay on stderr and in the pending ledger.
@@ -193,12 +215,14 @@ export async function backfillChangeEvidence({ since, repo = DEFAULT_REPO, gh = 
 }
 if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
   const args = process.argv.slice(2);
-  if (!args.includes('--backfill') || args.some(arg => arg !== '--backfill' && !arg.startsWith('--since=') && !arg.startsWith('--repo='))) {
-    console.error('usage: writer.mjs --backfill --since=YYYY-MM-DD [--repo=owner/repo]'); process.exitCode = 1;
+  const value = flag => args.find(arg => arg.startsWith(flag))?.slice(flag.length);
+  if (!args.includes('--backfill') || args.some(arg => arg !== '--backfill' && !['--since=', '--repo=', '--max-pages='].some(f => arg.startsWith(f)))) {
+    console.error('usage: writer.mjs --backfill --since=YYYY-MM-DD [--repo=owner/repo] [--max-pages=N]'); process.exitCode = 1;
   } else {
     try {
-      await backfillChangeEvidence({ since: args.find(arg => arg.startsWith('--since='))?.slice(8),
-        repo: args.find(arg => arg.startsWith('--repo='))?.slice(7) ?? DEFAULT_REPO });
+      // A non-integer --max-pages fails the reader's bounds check ('invalid read bounds').
+      await backfillChangeEvidence({ since: value('--since='), repo: value('--repo=') ?? DEFAULT_REPO,
+        ...(value('--max-pages=') === undefined ? {} : { maxPages: Number(value('--max-pages=')) }) });
     } catch (error) { console.error(clean(error.message)); process.exitCode = 1; }
   }
 }
