@@ -163,6 +163,8 @@ export const LOCK_HOLDERS = Object.freeze(['scripts/lib/atomic-json-file.mjs', '
   'scripts/lib/daemon-overlays.mjs', 'scripts/lib/lane-repair.mjs', 'scripts/lib/overlay-adoption.mjs', 'scripts/lib/we-scan-cache.mjs',
   'scripts/readiness/forge-exec-run.mjs', 'scripts/lib/review-shadow-budget.mjs', 'scripts/readiness/reservations.mjs',
   'scripts/readiness/prepare-hold-state.mjs',
+  // Capacity events dedupe across dispatchers with an exclusive-create receipt.
+  'scripts/lib/provider-capacity-io.mjs',
   // Binary maintenance serializes scheduled ticks with an exclusive lock directory.
   'scripts/operations/agy-upgrade-check.mjs',
   // The urgent-load verifier takes an exclusive lock directory and `wx` receipt files (found by the hold scan).
@@ -220,6 +222,10 @@ export const LOCK_HOLDERS = Object.freeze(['scripts/lib/atomic-json-file.mjs', '
   'scripts/operations/urgent-verify.mjs',
   // Ghost recovery owns an operation lock as well as reserving the shared rerun budget.
   'scripts/operations/ci-ghost-rerun.mjs',
+  // The expectation babysitter serializes state updates and miss delivery with an exclusive lock directory.
+  'scripts/conveyor/pass-daemons/pr-expectation-pass.mjs',
+  // The stuck-PR detector reads claim locks and serializes NEW-cause receipts with a lock directory.
+  'scripts/conveyor/stuck-prs.mjs',
   // The ETag eviction stamp writer uses an exclusive `wx` create.
   'scripts/lib/gh-rest-read.mjs',
   // The runtime build-priority writer serializes installs with an exclusive `wx` lock file.

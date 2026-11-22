@@ -83,7 +83,7 @@ import { resolveCascade } from '../../scripts/lib/policy-cascade.mjs';
 import { stopSession } from '../../scripts/operations/dispatch-abort.mjs';
 import { runOrphanFixRoundPass } from '../../scripts/conveyor/orphan-fix-round.mjs';
 import { createStaleBaseGate } from '../../scripts/conveyor/stale-base-refresh.mjs';
-import { resolveFixExecutorChain } from '../../scripts/lib/fix-executor-chain.mjs';
+import { resolveRepairExecutorChains } from '../../scripts/lib/fix-executor-chain.mjs';
 import { resolveAiRouting, aiRoutingInputs, AI_ROUTING_STANDARD } from '../../scripts/lib/ai-routing.mjs';
 import { criticalWorkVerdict } from '../../scripts/lib/critical-work.mjs';
 import { createFixBorrowGate, resolveFixExecutorSetting, createRoutedCiHealDispatch } from '../../scripts/lib/fix-slot-borrow.mjs'; // card 87: borrow a free builder slot
@@ -1302,9 +1302,9 @@ export async function runTickAllRepos({
     launcherAvailable: (executor) => fixLauncherAvailable(executor),
   }) : null;
   const executorSetting = resolveFixExecutorSetting();
-  const chain = resolveFixExecutorChain({ aiRouting: resolveFixChainInput() });
+  const chains = resolveRepairExecutorChains({ aiRouting: resolveFixChainInput() });
   const fixExecutorRoute = (planned) => routeFixExecutor(planned, {
-    setting: executorSetting, chain, fixSettings, launcherAvailable: e => fixLauncherAvailable(e),
+    setting: executorSetting, chain: chains[planned.kind === 'ci-heal' ? 'ci-heal' : 'fix'], fixSettings, launcherAvailable: e => fixLauncherAvailable(e),
     criticalFor: planned => criticalWorkVerdict({ taskType: planned.kind === 'ci-heal' ? 'ci-heal' : 'fix', filesTouched: planned.scope ?? [] }).critical,
   });
   const routedCiHealTick = (options) => {
@@ -1611,7 +1611,7 @@ export function formatRefusalLine(label, r) {
   const prNum = r?.prNumber ?? r?.pr ?? null;
   const prLabel = prNum == null ? '(no PR)' : `PR #${prNum}`;
   const holder = r?.kind === 'live-process' ? ` [name=${r.name ?? '?'} pid=${r.pid ?? 'absent'} cwd=${r.cwd ?? '?'}]` : '';
-  return `reconcile-fix-dispatch-daemon: ${label} ${r?.kind ?? 'unknown'} ${r?.repo ?? '?'} ${prLabel} — ${r?.why ?? '(no reason given)'}${holder}`;
+  return `reconcile-fix-dispatch-daemon: ${label} ${r?.kind ?? 'unknown'} ${r?.repo ?? '?'} ${prLabel} — ${r?.why ?? '(no reason given)'}${holder}${r?.head ? ` head=${r.head}` : ''}${r?.readAt ? ` read=${r.readAt}` : ''}`;
 }
 
 /** ONE printable line per draft the promote half un-drafted (`gh pr ready`), the success half of "log every

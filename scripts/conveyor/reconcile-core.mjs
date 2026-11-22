@@ -2439,7 +2439,9 @@ export function planReconcile({
         ? pr.files.map((f) => (typeof f?.path === 'string' ? f.path : String(f ?? ''))).filter(Boolean)
         : null,
     };
-    const refuse = (kind, extra) => { refusals.push({ ...base, kind, ...extra }); };
+    const refuse = (kind, extra) => { refusals.push({ ...base, kind, ...extra,
+      ...(kind === 'no-findings' ? { head: pr?.headRefOid ?? null,
+        readAt: pr?.readAt ?? new Date(now).toISOString() } : {}) }); };
     // A comment list that may be cut at the list page (exactly 100, not marked complete by the reader) hides every
     // marker after comment 100: the rearm count reads low, a stand-down or a spent takeover reads absent — each one
     // fails OPEN. Nothing is decided for this PR on such a view; the reconcile pass's readers re-read the thread in

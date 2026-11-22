@@ -15,7 +15,7 @@ const fixture = [901, 902].map((number) => ({
   statusCheckRollup: [], comments: [],
 }));
 
-export function prFileContract({ name, load, reader, run, fields, reconcile = false, progress = false }) {
+export function prFileContract({ name, load, reader, run, fields, cliMain, reconcile = false, progress = false }) {
   describe(`${name} PR snapshot IO`, () => {
     // The standalone argv contract is the snapshot-DISABLED path; with the snapshot on, an unservable snapshot falls
     // back to small GraphQL pages (gh-list-retry incident 2026-11-03), which is asserted in its own suite.
@@ -63,7 +63,9 @@ export function prFileContract({ name, load, reader, run, fields, reconcile = fa
     });
 
     async function cli(args, prs) {
-      vi.resetModules();
+      // Callable entries exercise the same argv parser without rebuilding the daemon import graph.
+      // Older consumers still execute their top-level IS_CLI block through a fresh import.
+      if (!cliMain) vi.resetModules();
       const { execFileSync } = await import('node:child_process');
       const { writeAllSync } = await import('../../lib/write-all-sync.mjs');
       const { execFileSyncThrottled } = await import('../../lib/gh-throttle.mjs');
@@ -80,7 +82,8 @@ export function prFileContract({ name, load, reader, run, fields, reconcile = fa
       try {
         process.argv = [process.execPath, resolve(`scripts/conveyor/${name}.mjs`),
           ...(reconcile ? ['--json'] : ['sweep', '--dry-run']), '--repo=web-everything/web-everything', ...args];
-        await load(); // Executes the actual IS_CLI block, including flag parsing.
+        const mod = await load();
+        if (cliMain) mod[cliMain]();
         expect(process.exitCode).toBe(savedExitCode);
         const output = reconcile ? stdout.mock.calls.map(([s]) => s).join('')
           : writeAllSync.mock.calls.filter(([fd]) => fd === 1).map(([, s]) => s).join('');
@@ -113,7 +116,7 @@ export function prFileContract({ name, load, reader, run, fields, reconcile = fa
         expect(standalone.throttled).toEqual([['gh',
           ['pr', 'list', '--state', 'open', '--limit', '200', '--json', fields, '--repo', 'web-everything/web-everything'], expect.any(Object)]]);
       });
-      // Each cli() call resets the module graph and re-imports the whole watch script, twice per test. That is ~2s on an
+      // Legacy cli() entries reset the module graph and re-import the whole watch script, twice per test. That is ~2s on an
       // idle host but exceeded the 5s default on a loaded coverage shard (main red @ 996a30514, shard 6/9), so the budget
       // is explicit; every assertion above is unchanged.
     }, CLI_TEST_TIMEOUT_MS);
