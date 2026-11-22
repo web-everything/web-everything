@@ -16,7 +16,7 @@ export function scanTestingNotesAdvisory(root, { git = execFileSync } = {}) {
   try {
     const base = git('git', ['merge-base', 'origin/main', 'HEAD'], options).trim();
     if (!/^[a-f0-9]{40,64}$/.test(base)) throw new Error('missing merge base');
-    const patch = git('git', ['diff', '--no-ext-diff', '--no-textconv', '--text', '--unified=0',
+    const patch = git('git', ['diff', '--no-color', '--no-ext-diff', '--no-textconv', '--text', '--unified=0',
       base, '--', TESTING_GUIDE], options);
     return testingNotesAdvisory(changedLines(patch).size ? [TESTING_GUIDE] : []);
   } catch {
