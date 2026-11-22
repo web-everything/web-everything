@@ -40,7 +40,18 @@ export function prFileContract({ name, load, reader, run, fields, cliMain, recon
         const key = reconcile ? 'readPrs' : 'listPrs';
         const expected = mod[run]({ ...options, [key]: () => fixture });
         const actual = mod[run]({ ...options, [key]: () => readPrsFromFile(path) });
-        expect(actual).toEqual(expected);
+        if (reconcile) {
+          // A writable reconcile pass names its own planner input with a fresh per-pass token
+          // (we:scripts/conveyor/reconcile-pass.mjs#rememberOwedFixRecoveryInput). The token is pass identity, not a
+          // decision: both passes must carry one for the same repo, each distinct, and every decision must match.
+          const shape = { v: 1, repo: 'we', token: expect.stringMatching(/^\d+:we:\d+$/) };
+          expect(expected.owedFixRecovery).toEqual(shape);
+          expect(actual.owedFixRecovery).toEqual(shape);
+          expect(actual.owedFixRecovery.token).not.toBe(expected.owedFixRecovery.token);
+          expect({ ...actual, owedFixRecovery: null }).toEqual({ ...expected, owedFixRecovery: null });
+        } else {
+          expect(actual).toEqual(expected);
+        }
         expect(reconcile ? actual.dispatch.length + actual.refusals.length : actual.length).toBeGreaterThan(0);
       });
     });
