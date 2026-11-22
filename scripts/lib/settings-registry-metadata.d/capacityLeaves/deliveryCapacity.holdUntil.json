@@ -1,0 +1,5 @@
+{
+  "description": "End of a delivery capacity hold.",
+  "range": "positive safe integer ≤ now + 72 hours",
+  "unit": "epoch milliseconds"
+}

@@ -1,0 +1,6 @@
+{
+  "description": "Page size for GitHub PR listing.",
+  "owner": "scripts/settings/pr-list-paging.json",
+  "changeVia": "pr",
+  "instant": false
+}

@@ -1,0 +1,6 @@
+{
+  "description": "Build grouping, priorities, launch limits and verification policy.",
+  "owner": "scripts/settings/build-grouping.json",
+  "changeVia": "pr",
+  "instant": false
+}
