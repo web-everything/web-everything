@@ -21,6 +21,8 @@
  *  - Before any rollback, HEAD is compared with the watched sha under the clone's write lock (rebuild.mjs); a mismatch is
  *    reported as `superseded`, and the watch follows HEAD instead of reverting a build it does not watch.
  */
+import { rebuildReaders } from './daemon-rebuild/evidence-context.mjs';
+
 import { appendFileSync, mkdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { homedir } from 'node:os';
@@ -37,8 +39,8 @@ const handoffDir = (env) => join(env?.HOME || homedir(), 'workspace/.operations/
 export const rulingsPath = (env = process.env) => env.WE_RULINGS_FILE || join(handoffDir(env), 'rulings.md');
 const handoffFile = (env) => env.WE_FORCE_ADOPT_HANDOFF || join(handoffDir(env), 'force-adopt.md');
 const coronerFile = (env) => env.WE_FORCE_ADOPT_CORONER || join(handoffDir(env), 'coroner-force-adopt.jsonl');
-const requestPath = (root, env) => join(stateDir(env), `${cloneKeyOf(root)}.force-adopt.json`);
-const watchPath = (root, env) => join(stateDir(env), `${cloneKeyOf(root)}.force-watch.json`);
+export const requestPath = (root, env) => join(stateDir(env), `${cloneKeyOf(root)}.force-adopt.json`);
+export const watchPath = (root, env) => join(stateDir(env), `${cloneKeyOf(root)}.force-watch.json`);
 
 /** The text of one ruling section ("## R508 — …" up to the next "## "), or null. */
 function rulingSection(text, ruling) {
@@ -83,7 +85,7 @@ export function requestForceAdopt({ root, env = process.env, daemon, ruling, quo
 }
 /** The pending request, or null when absent or expired (a stale operator request never fires later). */
 export function readForceAdopt(root, env = process.env, now = Date.now) {
-  const r = readJson(requestPath(root, env));
+  const r = rebuildReaders() ? rebuildReaders().forceRequest(root, env) : readJson(requestPath(root, env));
   return r && Date.parse(r.expiresAt) > now() ? r : null;
 }
 /** The pending request IF it names exactly `sha` (a full 40-hex id, compared case-insensitively), else null. The ONE place a
@@ -96,12 +98,19 @@ export function forceRequestFor(root, env, sha, now = Date.now) {
 }
 // Best-effort: an unwritable/unreadable state dir (ENOTDIR, EACCES) must not turn a refusal into a throw.
 const removeQuietly = (p) => { try { rmSync(p, { force: true }); } catch { /* unreachable state dir: nothing to clear */ } };
-export const clearForceAdopt = (root, env = process.env) => removeQuietly(requestPath(root, env));
+export const clearForceAdopt = (root, env = process.env) => {
+  rebuildReaders()?.forceRequest(root, env);
+  return removeQuietly(requestPath(root, env));
+};
 
-export const readForceWatch = (root, env = process.env) => readJson(watchPath(root, env));
+export const readForceWatch = (root, env = process.env) => rebuildReaders() ? rebuildReaders().forceWatch(root, env) : readJson(watchPath(root, env));
 /** The watch file as it is: `missing` (ENOENT / a state dir that is not a directory), `unreadable` (EACCES, EIO, corrupt JSON — that
  *  is NOT "no watch": a second force would overwrite the open watch's last-good with an unproven build) or `ok`. */
 function readWatchRecord(root, env) {
+  if (rebuildReaders()) {
+    const watch = rebuildReaders().forceWatch(root, env);
+    return { state: watch ? 'ok' : 'missing', watch };
+  }
   let text;
   try { text = readFileSync(watchPath(root, env), 'utf8'); } catch (e) { return { state: e?.code === 'ENOENT' || e?.code === 'ENOTDIR' ? 'missing' : 'unreadable', watch: null }; }
   try { const w = JSON.parse(text); return w && typeof w === 'object' ? { state: 'ok', watch: w } : { state: 'unreadable', watch: null }; } catch { return { state: 'unreadable', watch: null }; }
@@ -181,6 +190,8 @@ function retireWatch(root, env, { sha = null, unlessRan = false } = {}) {
  *  sticky-rejection bypass asks it too, so a force that `recordForcedAdoption` would refuse never triggers a full re-smoke per tick.
  *  A watch is open (`watch-already-open`), exists but is unreadable (`watch-unreadable`), or a rollback is owed that never reached disk (`rollback-owed`). */
 export function forceBlockedReason(root, env = process.env) {
+  const held = rebuildReaders()?.forceAdoptBlocker?.(root, env);
+  if (held) return held;
   if (readForceWatch(root, env)) return 'watch-already-open';
   if (watchUnreadable(root, env)) return 'watch-unreadable'; // fail closed: an unreadable watch may be an open one
   if (pendingRollbacks.has(watchPath(root, env))) return 'rollback-owed'; // never adopt over an unpaid rollback
