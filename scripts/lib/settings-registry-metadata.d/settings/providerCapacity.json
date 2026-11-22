@@ -1,0 +1,6 @@
+{
+  "description": "Provider/account quota windows, readers, reserves, banked resets and minimum tiers for capacity-based routing.",
+  "owner": "scripts/settings/provider-capacity.json",
+  "changeVia": "pr",
+  "instant": false
+}

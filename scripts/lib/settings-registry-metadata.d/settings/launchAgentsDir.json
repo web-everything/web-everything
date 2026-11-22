@@ -1,0 +1,6 @@
+{
+  "description": "Host directory for rendered launchd agent definitions.",
+  "owner": "scripts/settings/prototype-load.json",
+  "changeVia": "pr",
+  "instant": false
+}

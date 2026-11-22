@@ -19,7 +19,7 @@ Vitest's thread pool cannot chdir. Run it sequentially within each test file.
 The gh/git function ports also generate the executable shims for the two `*.real.test.mjs` smokes.
 Those files are explicitly excluded from the PR unit config. There is currently no filename-based
 scheduled real-process config discovery; scheduled-runner enrollment remains separate.
-> Authors: APPEND new sections at the END of this file, never right after the title (`.gitattributes` union-merges it, but appending avoids overlapping insertions).
+> Authors: add new testing notes in their own file under [testing/](testing/README.md). This file keeps existing sections only; do not append new notes here.
 
 ## Review PR transport isolation (R37)
 
@@ -6311,7 +6311,7 @@ It never infers clearance authority from a saved review or a newly read head.
 `scripts/operations/__tests__/record-verdict.test.mjs` covers request validation;
 `scripts/operations/__tests__/record-verdict-cli.test.mjs` drives both CLI adapters through
 staging the JSON request. The applier carries that pin to `review-set-label` as `--expect-head`.
-## Live-owner review adapter collection
+## Per-topic notes
 
 `pr-live-owner-watch.test.mjs` imports the manual dispatcher, review job and reconcile
 graph statically during collection. The first `review-dispatch` case otherwise loads
@@ -6332,6 +6332,16 @@ the loaded graph. Resetting the entire daemon graph twice inside the CLI test ex
 60-second deadline on a coverage shard. Keep the file/standalone output comparison and zero-GitHub
 assertions intact; consumers without callable entries retain the fresh-import path.
 
+## Orphan exclusions precede stand-down answers
+
+The fix-dispatch orphan guard must reach `runReconcilePass` before R123 enrichment,
+which can reserve and post an operator answer before dispatch rows exist. Adapt
+dispatch predicates to PR numbers (`number` or `prNumber`); do not depend on labels
+at this boundary. Keep excluded PRs in the plan with their original unanswered
+comments and retain the later dispatch filter. `reconcile-pass.test.mjs` exercises
+the real auto-proceed writer with injected IO: the excluded PR gets no thread read,
+reservation or post while a non-excluded PR receives an answer.
+`reconcile-fix-dispatch.test.mjs` covers both exclusion forms and the empty no-op.
 ## Bounded verify selection and ceiling recovery
 
 Verify gates execute explicit sorted test files, including complete graph selections. Graph failures,
@@ -6345,3 +6355,4 @@ shards exactly as the default would, so it is still recognized as the default ga
 Gate ceilings get one capped retry tied to lane, head and killed job. Detached jobs settle in
 `verify-gate-job.mjs`, so recovery must cover that consumer as well as `verify-dispatch.mjs`'s
 in-process sweep. Persist the retry identity in job input to dedupe the enqueue-before-marker crash window.
+- [Testing topic notes and authoring guidance](testing/README.md)

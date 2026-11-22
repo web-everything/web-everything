@@ -1,0 +1,6 @@
+{
+  "description": "Automatic bounded extra review rounds for eligible card-only work.",
+  "owner": "scripts/settings/review.json",
+  "changeVia": "pr",
+  "instant": false
+}

@@ -1,0 +1,6 @@
+{
+  "description": "Share identical read-only GitHub calls within a rebuild smoke.",
+  "owner": "scripts/settings/rebuild-smoke.json",
+  "changeVia": "pr",
+  "instant": false
+}

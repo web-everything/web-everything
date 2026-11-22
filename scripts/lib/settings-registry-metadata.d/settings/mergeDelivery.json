@@ -1,0 +1,6 @@
+{
+  "description": "Merge strategy, batch size, wait time and call concurrency.",
+  "owner": "scripts/settings/merge-queue.json",
+  "changeVia": "pr",
+  "instant": false
+}

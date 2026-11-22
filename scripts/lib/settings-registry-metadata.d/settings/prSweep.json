@@ -1,0 +1,6 @@
+{
+  "description": "Idle PR sweep cadence, thresholds and diagnosis policy.",
+  "owner": "scripts/settings/pr-sweep.json",
+  "changeVia": "pr",
+  "instant": false
+}

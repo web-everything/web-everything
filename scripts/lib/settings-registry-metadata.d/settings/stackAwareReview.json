@@ -1,0 +1,6 @@
+{
+  "description": "Stack-aware review mode.",
+  "owner": "scripts/settings/stack-aware-review.json",
+  "changeVia": "pr",
+  "instant": false
+}

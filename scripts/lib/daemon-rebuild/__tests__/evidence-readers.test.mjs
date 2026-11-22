@@ -12,6 +12,7 @@ import { starvePath, readRebuildStarvation } from '../lease.mjs';
 import { readOverlayEventLog } from '../prepare.mjs';
 import { createRebuildReaders, RebuildEvidenceError } from '../evidence-readers.mjs';
 import { withRebuildReaders } from '../evidence-context.mjs';
+import { daemonStateDir } from '../../daemon-last-good.mjs';
 import { requestPath, watchPath, readForceAdopt, readForceWatch } from '../../daemon-force-adopt.mjs';
 import { readOverlayConflictWakes } from '../../overlay-conflict-wake.mjs';
 import { pendingPath, readPendingDrops } from '../../overlay-drop-pending.mjs';
@@ -209,6 +210,30 @@ it('replays legacy registry metadata and ref-less audit events without rewriting
   expect(readers.overlayEvents(root, env)).toHaveLength(1);
   expect(readFileSync(registry, 'utf8')).toBe(registryBytes);
   expect(readFileSync(registry.replace(/\.json$/, '.events.jsonl'), 'utf8')).toBe(eventBytes);
+});
+
+it('accepts production-written pr=0 conflict wakes and `event`-named overlay events (live 2026-11-22 recovery refusal)', () => {
+  const { root, env } = fixture();
+  const registry = overlayFilePath(root, env);
+  mkdirSync(dirname(registry), { recursive: true });
+  writeFileSync(registry, JSON.stringify({ overlays: [] }));
+  writeFileSync(registry.replace(/\.json$/, '.events.jsonl'), JSON.stringify({
+    at: new Date(0).toISOString(), event: 'stale-record-dropped', clone: root, reason: 'empty overlay list and not a known daemon clone',
+  }) + '\n');
+  const wakes = join(daemonStateDir(env), 'overlay-conflict-wake.json');
+  mkdirSync(dirname(wakes), { recursive: true });
+  writeFileSync(wakes, JSON.stringify({ 0: { pr: 0, ref: 'lane/x', files: [], at: new Date(0).toISOString(), clone: root } }));
+  const readers = createRebuildReaders({ strict: true });
+  expect(() => readers.validate(root, env)).not.toThrow();
+  writeFileSync(wakes, JSON.stringify({ 0: { pr: -1, ref: 'lane/x', at: new Date(0).toISOString() } }));
+  expect(() => readers.validate(root, env)).toThrow(RebuildEvidenceError);
+  writeFileSync(wakes, JSON.stringify({}));
+  const events = registry.replace(/\.json$/, '.events.jsonl');
+  for (const bad of [{ event: 'unknown' }, { event: 'stale-record-dropped', kind: 123 },
+    { event: 'ready-candidate-discarded', target: 't', refs: [] }]) {
+    writeFileSync(events, JSON.stringify({ at: new Date(0).toISOString(), ...bad }) + '\n');
+    expect(() => readers.validate(root, env)).toThrow(RebuildEvidenceError);
+  }
 });
 
 it('replays production state, ready, pending, registry and aggregate event writer output', () => {

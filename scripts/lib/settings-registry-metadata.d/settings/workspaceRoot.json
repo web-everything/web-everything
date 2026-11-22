@@ -1,0 +1,6 @@
+{
+  "description": "Workspace root used by prototype daemon loading.",
+  "owner": "scripts/settings/prototype-load.json",
+  "changeVia": "pr",
+  "instant": false
+}
