@@ -67,7 +67,7 @@ export function parseReport(text, root = process.cwd()) {
     throw new Error('global error evidence is missing, invalid or nonzero; inspect original run');
   }
   const seen = new Set();
-  return report.testResults.map(result => {
+  const files = report.testResults.map(result => {
     if (typeof result.name !== 'string' || !result.name) throw new Error('missing test filename');
     const file = relative(root, resolve(root, result.name)).split('\\').join('/');
     if (!file || isAbsolute(file) || file.startsWith('../') || /[\x00-\x1f\x7f]/.test(file) || file.startsWith('-') || seen.has(file)) throw new Error('invalid or duplicate test filename');
@@ -91,6 +91,11 @@ export function parseReport(text, root = process.cwd()) {
     const failed = result.status === 'failed' || collectionError || failedTests.length > 0;
     return { file, failed, passed: result.status === 'passed' && !failed, failedTests, tests };
   });
+  for (const [key, count] of [['numFailedTests', files.reduce((n, f) => n + f.failedTests.length, 0)],
+    ['numFailedTestSuites', files.filter(f => f.failed).length]]) {
+    if (report[key] !== undefined && report[key] !== count) throw new Error(`incomplete failure evidence: ${key} mismatch`);
+  }
+  return files;
 }
 
 export function planRetry(text, policy, root) {
@@ -120,7 +125,7 @@ export function retryVerdict(first, rerunText, { shard, sha, runId, root, exitCo
 
 /** IO boundary, injectable so orchestration and fail-closed reads can be exercised hermetically. */
 export async function rerunOnce({ shard, mode, firstExit, teardownFailed = file => existsSync(file), skipArgs = [], env = process.env, root = process.cwd(),
-  policy, read = file => readFileSync(file, 'utf8'), write = (file, data) => writeFileSync(file, data),
+  policy, exists = existsSync, read = file => readFileSync(file, 'utf8'), write = writeFileSync,
   remove = file => rmSync(file, { force: true }), run = args => spawnSync('npm', args, { cwd: root, env, stdio: 'inherit' }),
   listFiles, warn = console.log, error = console.error } = {}) {
   try {
@@ -138,6 +143,9 @@ export async function rerunOnce({ shard, mode, firstExit, teardownFailed = file 
     // Vitest positional filters are substrings: refuse ambiguous filters rather than run extra files.
     const all = await listFiles();
     if (first.some(f => !all.includes(f.file) || all.some(other => other !== f.file && other.includes(f.file)))) throw new Error('ambiguous/unknown retry filter; inspect files and rerun manually');
+    const marker = `coverage/rerun-used-${shard}.json`;
+    if (exists(marker)) throw new Error('retry allowance already used');
+    write(marker, JSON.stringify(identity), { flag: 'wx' });
     const output = `coverage/rerun-unit-${shard}.json`;
     remove(output); // A crashed retry must never reuse an earlier passing report.
     const coverageArgs = mode === 'covered' ? ['--coverage.reportOnFailure=true', `--coverage.reportsDirectory=coverage-rerun-${shard}`] : [];
