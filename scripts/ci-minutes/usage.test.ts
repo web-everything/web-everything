@@ -1,6 +1,7 @@
 // The multiplier question is open; README.md records the findings and required S1.2 answer.
 import { describe, expect, it } from 'vitest';
 import fixtureText from './fixtures/usage-summary.web-everything.json?raw';
+import { evaluateThresholds, feedState, parseUsageSummary } from './usage';
 
 describe('fixture', () => {
   it('fixture parses as JSON', () => {
@@ -41,5 +42,100 @@ describe('fixture', () => {
       }
       return value;
     });
+  });
+});
+
+describe('usage', () => {
+  const summary = JSON.parse(fixtureText);
+  const reading = { org: 'web-everything', cycle: '2026-11', includedMinutes: 50000, pct: 82 };
+
+  it('parser totals 4600 minutes on the fixture', () => {
+    expect(parseUsageSummary(summary, { includedMinutes: 50000 })).toEqual({
+      org: 'web-everything', cycle: '2026-11', usedMinutes: 4600,
+      includedMinutes: 50000, pct: 9.2,
+    });
+  });
+
+  it('tolerates missing numeric fields and ignores unrelated items', () => {
+    const usageItems = [
+      { product: 'actions', unitType: 'Minutes', discountQuantity: 20 },
+      { product: 'actions', unitType: 'Minutes', netQuantity: 10 },
+      { product: 'actions', unitType: 'Minutes' }, {},
+      { product: 'copilot', unitType: 'Minutes', netQuantity: 999 },
+      { product: 'actions', unitType: 'GigabyteHours', netQuantity: 999 },
+    ];
+    expect(parseUsageSummary({ ...summary, usageItems }, { includedMinutes: 100 }))
+      .toMatchObject({ usedMinutes: 30, pct: 30 });
+  });
+
+  it('fails closed on missing or invalid summary identity, period, or usageItems', () => {
+    for (const invalid of [null, {}, { ...summary, usageItems: undefined },
+      { ...summary, usageItems: {} }, { ...summary, organization: '' },
+      { ...summary, organization: 3 }, { ...summary, timePeriod: null },
+      { ...summary, timePeriod: { year: 2026, month: 13 } },
+      { ...summary, timePeriod: { year: 2026, month: 1.5 } }]) {
+      expect(parseUsageSummary(invalid, { includedMinutes: 100 }))
+        .toMatchObject({ state: 'error', pct: null });
+    }
+  });
+
+  it('rejects invalid quantities, overflowing totals, and unusable allowances', () => {
+    for (const quantity of [-1, '3', NaN, Infinity]) {
+      expect(parseUsageSummary({ ...summary, usageItems: [
+        { product: 'actions', unitType: 'Minutes', netQuantity: quantity },
+      ] }, { includedMinutes: 100 })).toMatchObject({ state: 'error', pct: null });
+    }
+    for (const includedMinutes of [0, -1, NaN, Infinity, Number.MIN_VALUE]) {
+      expect(parseUsageSummary(summary, { includedMinutes }))
+        .toMatchObject({ state: 'error', pct: null });
+    }
+    expect(parseUsageSummary({ ...summary, usageItems: [
+      { product: 'actions', unitType: 'Minutes', netQuantity: Number.MAX_VALUE,
+        discountQuantity: Number.MAX_VALUE },
+    ] }, { includedMinutes: 100 })).toMatchObject({ state: 'error', pct: null });
+  });
+
+  it('crosses 80 and 95 once per cycle and re-arms on a new cycle', () => {
+    expect(evaluateThresholds({ ...reading, pct: 79.9 }, []).lines).toEqual([]);
+    const first = evaluateThresholds(reading, []);
+    expect(first).toEqual({
+      lines: ['CI minutes web-everything at 82% of 50000 private min (cycle 2026-11)'],
+      firedKeys: ['ci-min:web-everything:80:2026-11'],
+    });
+    expect(evaluateThresholds(reading, first.firedKeys).lines).toEqual([]);
+    const second = evaluateThresholds({ ...reading, pct: 95 }, first.firedKeys);
+    expect(second.lines).toHaveLength(1);
+    expect(second.firedKeys).toContain('ci-min:web-everything:95:2026-11');
+    expect(first.firedKeys).toHaveLength(1); // Input state stays untouched.
+    expect(evaluateThresholds({ ...reading, pct: 99 }, second.firedKeys).lines).toEqual([]);
+    const next = evaluateThresholds({ ...reading, pct: 95, cycle: '2026-12' }, second.firedKeys);
+    expect(next.lines).toHaveLength(2);
+    expect(next.firedKeys.slice(-2)).toEqual([
+      'ci-min:web-everything:80:2026-12', 'ci-min:web-everything:95:2026-12',
+    ]);
+    expect(evaluateThresholds({ ...reading, pct: 80 }, []).lines).toHaveLength(1);
+  });
+
+  it('stale and failed feeds have null pct, warn once per cycle, and never report percentages', () => {
+    const sixHours = 6 * 60 * 60 * 1000;
+    expect(feedState({ fetchedAtMs: 0, nowMs: sixHours, ok: true })).toBe('fresh');
+    for (const ok of [true, false]) {
+      const state = feedState({ fetchedAtMs: 0, nowMs: sixHours + 1, ok });
+      expect(state).toBe(ok ? 'stale' : 'error');
+      const unavailable = { ...reading, state, pct: null };
+      expect(unavailable.pct).toBeNull();
+      const first = evaluateThresholds(unavailable, []);
+      expect(first).toEqual({ lines: ['CI minutes feed stale >6h'],
+        firedKeys: ['ci-min:web-everything:stale:2026-11'] });
+      expect(evaluateThresholds(unavailable, first.firedKeys).lines).toEqual([]);
+      expect(evaluateThresholds({ ...unavailable, cycle: '2026-12' }, first.firedKeys).lines)
+        .toEqual(['CI minutes feed stale >6h']);
+      // Even a cached numeric percentage cannot override feed failure.
+      expect(evaluateThresholds({ ...unavailable, pct: 99 }, []).lines).toEqual(first.lines);
+    }
+    expect(feedState({ fetchedAtMs: 0, nowMs: 11, ok: true, staleAfterMs: 10 })).toBe('stale');
+    for (const fetchedAtMs of [NaN, Infinity, 20]) {
+      expect(feedState({ fetchedAtMs, nowMs: 10, ok: true })).toBe('error');
+    }
   });
 });
