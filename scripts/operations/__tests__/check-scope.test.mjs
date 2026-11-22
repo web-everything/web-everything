@@ -266,7 +266,9 @@ describe('check-scope cannot be resumed (a saved verdict never stands in for a f
     // second invocation finds nothing to resume (a file-backed store would have replayed the saved run).
     withRegistry([], registryPath => {
       const cli = join(process.cwd(), 'scripts/operations/run.mjs');
-      const env = { ...process.env, WE_AGENT_SCOPES_PATH: registryPath, WE_FREE_SCOPE_GH_BIN: process.execPath };
+      // WE_DAEMON_MANAGED_CLONE is the runner's own exemption from its freshness check, which would otherwise
+      // `git fetch origin main` (a live access this hermetic test must not make, and impossible without a checkout).
+      const env = { ...process.env, WE_AGENT_SCOPES_PATH: registryPath, WE_FREE_SCOPE_GH_BIN: process.execPath, WE_DAEMON_MANAGED_CLONE: '1' };
       const invoke = args => spawnSync(process.execPath, [cli, 'check-scope', ...args], { env, encoding: 'utf8', timeout: 90e3 });
       const first = invoke(['--files=scripts/a.mjs', '--run-id=cs-resume-probe']);
       expect(first.stdout).toContain('"ok":false');
