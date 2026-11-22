@@ -9,7 +9,7 @@
  *
  * THE RULE. Build a reverse-import graph from the working tree (static `import`/`export … from`/`import()`/
  * `require()` with a relative string specifier). Count every test the changed files reach, at any depth.
- *   - At or under `maxTests`: nothing changes. The gate keeps `vitest related` and vitest's own exact graph.
+ *   - At or under `maxTests`: return the sorted explicit graph test list.
  *   - Over `maxTests`: run an explicit list instead. It always holds the changed test files (which, under
  *     relatedMode 'all', include the tests that name a changed file) and every test within `maxDepth` import hops. If that is still over
  *     `maxTests`, the depth drops one hop at a time, but never below 1: a test that DIRECTLY imports a changed file
@@ -150,7 +150,7 @@ export function testDepths(starts, reverse) {
 }
 
 /**
- * Decide whether to keep `vitest related` or run a bounded explicit test list.
+ * Select a bounded explicit test list for the local gate.
  * @param {{changedFiles: string[], reverse: Map<string, Set<string>>, maxTests: number, maxDepth: number}} args
  * @returns {{status: 'complete'|'selection-truncated', fullTestCount: number, selectedTestCount: number,
  *   depth: number|null, maxDepth: number, maxTests: number, tests: string[]|null, droppedCount: number,
@@ -166,9 +166,9 @@ export function selectRelatedTests({ changedFiles, reverse, maxTests, maxDepth }
   }).filter((h) => h.transitive > 0).sort((a, b) => b.transitive - a.transitive).slice(0, 5);
   const base = { fullTestCount: fullCount, maxDepth, maxTests, hubs };
   if (!(maxTests > 0) || fullCount <= maxTests) {
-    return { ...base, status: 'complete', selectedTestCount: fullCount, depth: null, tests: null, droppedCount: 0,
+    return { ...base, status: 'complete', selectedTestCount: fullCount, depth: null, tests: [...depths.keys()].sort(), droppedCount: 0,
       directTestCount: [...depths.values()].filter((d) => d <= 1).length,
-      reason: maxTests > 0 ? `${fullCount} related test(s) ≤ limit ${maxTests} — vitest related, full import depth` : 'limit off — vitest related, full import depth' };
+      reason: maxTests > 0 ? `${fullCount} related test(s) ≤ limit ${maxTests} — explicit tests, full import depth` : 'limit off — explicit tests, full import depth' };
   }
   // Changed test files always run; under relatedMode 'all' the caller's targets already include the tests that
   // name a changed file (literal references), so they are kept here too.
@@ -195,7 +195,14 @@ export function selectRelatedTests({ changedFiles, reverse, maxTests, maxDepth }
     depth = Math.min(...depths.values());
     for (const [test, d] of depths) if (d <= depth) selected.add(test);
   }
-  const tests = [...selected].sort();
+  // Reserve changed tests and one nearest test per source before filling the remaining budget.
+  const priority = [...always].sort();
+  for (const file of changed.filter(f => !isVitestTestFile(f))) {
+    const nearest = [...testDepths([file], reverse)].sort((a, b) => a[1] - b[1] || a[0].localeCompare(b[0]));
+    if (nearest.length && !nearest.some(([t]) => priority.includes(t))) priority.push(nearest[0][0]);
+  }
+  const tests = [...new Set([...priority, ...[...selected].sort((a, b) => depths.get(a) - depths.get(b) || a.localeCompare(b))])].slice(0, maxTests).sort();
+  selected = new Set(tests);
   const droppedCount = [...depths.keys()].filter((t) => !selected.has(t)).length;
   return { ...base, status: 'selection-truncated', selectedTestCount: tests.length, depth, tests, droppedCount,
     directTestCount: [...depths.values()].filter((d) => d <= 1).length,
