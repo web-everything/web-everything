@@ -121,7 +121,9 @@ function validateProviderControls(entry, path) {
   if (entry?.enabledProviders?.some(p => entry.disabledProviders?.includes(p))) fail(`${path}: provider cannot be both enabled and disabled`);
 }
 
-export function defaultPolicyModel(provider) {
+export function defaultPolicyModel(provider, operation = '') {
+  // Provider-only review overrides must choose a review-eligible model. Explicit small tiers still refuse.
+  if (provider === 'agy-gemini' && requiresReviewModel(operation)) return 'pro';
   const model = { claude: 'sonnet', codex: 'default', antigravity: 'sonnet', 'agy-claude': 'sonnet', 'agy-gemini': 'neon' }[provider];
   if (!model) fail(`unknown provider ${JSON.stringify(provider)}`);
   return model;
@@ -138,7 +140,7 @@ export function applyRoutingOverrides(base, overrides = {}) {
     if (object(patch.effort)) entry.effort = { ...(object(policy.operations[name].effort) ? policy.operations[name].effort : {}), ...patch.effort };
     if (patch.provider !== undefined) {
       delete entry.inherit;
-      entry.model = patch.model ?? (patch.provider === policy.operations[name].provider ? policy.operations[name].model : defaultPolicyModel(patch.provider));
+      entry.model = patch.model ?? (patch.provider === policy.operations[name].provider ? policy.operations[name].model : defaultPolicyModel(patch.provider, name));
       entry.fallback ??= [];
       // Selecting a provider explicitly is also a live enable, including a default-zero Gemini cap.
       entry.enabledProviders = [...new Set([...(entry.enabledProviders ?? []), patch.provider])];

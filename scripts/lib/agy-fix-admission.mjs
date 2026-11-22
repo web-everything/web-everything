@@ -76,7 +76,9 @@ export function deriveAgyFixAdmission(item = {}, launch = {}) {
   const taskKind = item.taskKind ?? item.taskType ?? item.kind ?? launch.taskKind ?? 'fix';
   const size = item.size ?? launch.size;
   if (!scope.length || scope.length > 20 || !scope.every(isAdmissibleTargetScope)) return null;
-  if (!launchScope.length || launchScope.length > 20 || !launchScope.every(isAdmissibleTargetScope)
+  // A broad launch envelope may contain a narrower, independently admitted item scope.
+  // This never admits docs itself, whose protected descendants make it critical.
+  if (!launchScope.length || launchScope.length > 20 || !launchScope.every(p => p === 'docs' || isAdmissibleTargetScope(p))
     || !scope.every(p => launchScope.some(root => p === root || p.startsWith(`${root}/`)))) return null;
   // Recheck the actual admitted paths, including directory forms, against the routing gate.
   try {
