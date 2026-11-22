@@ -8,6 +8,7 @@
  *   `daemon-rebuild.test.mjs` (real temp git fixtures, injected `runSmoke` stubs) — the helpers below are
  *   copied from that file rather than imported, per this card's instructions.
  */
+import { writeRebuildState } from '../daemon-rebuild/state.mjs';
 import {
   describe, it, expect, beforeEach, afterEach, vi,
 } from 'vitest';
@@ -386,6 +387,9 @@ describe('smoke-env-timeout: a slow lane scan under load never makes an overlay 
     const state = readRebuildState(cloneDir, env);
     expect(state.rejected).toBeNull();
     expect(state.held?.reason).toBe('smoke-env-timeout');
+    expect(state.held.attempts).toBe(1);
+    expect(Date.parse(state.held.retryAt) - Date.parse(state.held.updatedAt)).toBeGreaterThanOrEqual(599_000);
+    expect(result.alerts.find(a => a.kind === 'clone-held-stale').detail.retryAt).toBe(state.held.retryAt);
     expect(runSmoke).toHaveBeenCalledTimes(1); // no plain-main, no last-good control
     expect(gitOk(cloneDir, ['rev-parse', 'HEAD']).trim()).toBe(mainSha);
   });
@@ -546,7 +550,8 @@ describe('single-flight build lease across the fallback (x5wbsbc on #2731)', () 
     const file = rebuildStatePath(cloneDir, env);
     mkdirSync(dirname(file), { recursive: true });
     const cur = existsSync(file) ? JSON.parse(readFileSync(file, 'utf8')) : {};
-    writeFileSync(file, JSON.stringify({ ...cur, building }));
+    writeRebuildState(cloneDir, { ...cur, building: { target: gitOk(cloneDir, ['rev-parse', 'HEAD']).trim(),
+      inputsKey: 'seeded-inputs', ...building } }, env);
   };
 
   it('a live sibling lease returns rebuild-in-progress without smoking', async () => {

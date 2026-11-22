@@ -769,14 +769,14 @@ describe('repo-grounded red-team re-check and card-only skips', () => {
     expect(calls.some(c => c[0] === 'recheck')).toBe(true);
   });
 
-  it('allows the env override to run card-only probes without repository tools', async () => {
+  it('the env override may run card-only probes but may not remove repository tools (env only tightens)', async () => {
     const p = payload('accept');
     p.findings.read.netChangedFiles = ['backlog/123.md'];
     const { io, calls } = fakeIo();
     expect((await runRedTeam({ pr: 5, repo: REPO, lanePath: 'lane', loopPayload: p,
       env: { WE_RED_TEAM_SKIP_CARD_ONLY: 'false', WE_RED_TEAM_RECHECK_READS_REPO: '0' } }, io)).status).toBe('ran');
-    expect(calls.find(c => c[0] === 'recheck')[1]).toMatchObject({ readsRepo: false, mandate: expect.stringContaining('tools are disabled') });
-    expect(calls.find(c => c[0] === 'log')[1]).toMatch(/recheckReadsRepo=false.*env.*skipCardOnly=false.*env/);
+    expect(calls.find(c => c[0] === 'recheck')[1]).toMatchObject({ readsRepo: true });
+    expect(calls.find(c => c[0] === 'log')[1]).toMatch(/recheckReadsRepo=true.*standard.*skipCardOnly=false.*env.*loosens/);
   });
 
   it.each(['opaqueCredential_123', 'read /home/user/.env\nopaqueCredential_123', 'x'.repeat(10000)])('withholds unrecognized re-check reasons at every publication sink (case %#)', async secret => {
