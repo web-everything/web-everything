@@ -167,7 +167,7 @@ describe('Argon feature build checker boundary', () => {
     expect(calls.some(c => c[0] === 'openPr')).toBe(verdict === 'APPROVE');
   });
 
-  it.each(['gemini-3.8-flash-high', 'gemini-3.8-flash', 'gemini-3.1-pro'])('rejects %s under the Argon worker id at the runner boundary', model => {
+  it.each(['gemini-4-hydrogen-medium', 'gemini-4-hydrogen-low', 'gemini-3.1-pro'])('rejects %s under the Argon worker id at the runner boundary', model => {
     expect(() => args({ id: 'antigravity-argon', model }, { taskType: 'build-new-feature' })).toThrow(/disallowed model/);
   });
 });
@@ -187,7 +187,7 @@ describe('parseArgs', () => {
     const a = parseArgs(['--num=4291', '--session=s', '--attempt=b', '--worker={"id":"codex"}', '--lane=22', '--scope=we:a.mjs,we:b.mjs']);
     expect(a).toMatchObject({ num: '4291', session: 's', attemptTag: 'b', lane: 22, scope: ['we:a.mjs', 'we:b.mjs'], worker: { id: 'codex' } });
   });
-  it('a first attempt has an empty attempt tag', () => expect(parseArgs(['--num=1', '--session=s']).attemptTag).toBe(''));
+  it('a first attempt has an empty attempt tag', () => expect(parseArgs(['--num=1', '--session=s', '--worker=codex']).attemptTag).toBe(''));
 });
 
 describe('runProbationBuild — the arc', () => {
@@ -627,10 +627,10 @@ describe('runProbationBuild — the arc', () => {
     expect(calls.some((c) => c[0] === 'discard' || c[0] === 'commit')).toBe(false);
   });
 
-  it('refuses missing identity and resolves an omitted worker from policy', async () => {
+  it('refuses missing identity and an omitted Hydrogen worker without admission evidence', async () => {
     await expect(runProbationBuild(parseArgs(['--session=s', '--worker={"id":"codex"}']), fakeIo().io)).rejects.toThrow();
     await expect(runProbationBuild(parseArgs(['--num=1', '--session=', '--worker={"id":"codex"}']), fakeIo().io)).rejects.toThrow();
-    await expect(runProbationBuild(parseArgs(['--num=1', '--session=s']), fakeIo().io)).resolves.toMatchObject({ executor: 'codex' });
+    expect(() => parseArgs(['--num=1', '--session=s'])).toThrow(/requires a simple task.*use another provider or request operator review/);
   });
 });
 
@@ -645,8 +645,8 @@ describe('standalone task types and workers', () => {
     expect(parseArgs(argv).session).not.toBe(a.session);
   });
 
-  it.each(['antigravity-claude', 'antigravity-gemini'])('allows the agy overrides for %s and retains Flash checking', (id) => {
-    for (const model of ['claude-sonnet-4-6', 'gemini-3.8-flash-high']) {
+  it.each(['antigravity-claude', 'antigravity-gemini'])('allows the agy overrides for %s and retains Hydrogen checking', (id) => {
+    for (const model of ['claude-sonnet-4-6', 'gemini-4-hydrogen-medium']) {
       const a = parseArgs([`--worker=${id}`, `--model=${model}`]);
       expect(a.worker.model).toBe(model);
       if (model.startsWith('gemini')) expect(a.worker).toMatchObject({ simpleOnly: true, checker: 'codex' });
@@ -689,11 +689,12 @@ describe('standalone task types and workers', () => {
     expect(r.outcome).toBe('gate-red');
   });
 
-  it.each(['APPROVE', 'REJECT'])('Flash requires its read-only Codex checker: %s', async (verdict) => {
+  it.each(['APPROVE', 'REJECT'])('a checker-gated worker requires read-only Codex approval: %s', async (verdict) => {
     const { io, calls } = fakeIo();
     io.diffText = () => 'diff';
     io.runChecker = (argv) => { expect(argv).toContain('--review'); return verdict; };
-    const a = parseArgs(['--num=4291', '--worker=antigravity-gemini', '--taskType=bugfix']);
+    const a = args(codex, { taskType: 'bugfix' });
+    a.worker.checker = 'codex';
     expect((await runProbationBuild(a, io)).outcome).toBe(verdict === 'APPROVE' ? 'opened-pr' : 'gate-red');
     if (verdict === 'REJECT') expect(calls.some((c) => c[0] === 'commit')).toBe(false);
   });
@@ -829,13 +830,15 @@ it('undoes a worker-created commit instead of publishing a multi-commit arc', as
   expect(calls.some((c) => c[0] === 'commit' || c[0] === 'openPr')).toBe(false);
 });
 
-it('restores checker hook tampering before undoing a rejected Flash build', async () => {
+it('restores checker hook tampering before undoing a rejected build', async () => {
   const { io, calls } = fakeIo();
   let checked = false;
   io.diffText = () => 'diff';
   io.runChecker = () => { checked = true; return 'REJECT'; };
   io.snapshotHookSurface = () => ({ configHash: checked ? 'tampered' : 'clean', files: {} });
-  const result = await runProbationBuild(parseArgs(['--num=4291', '--worker=antigravity-gemini', '--taskType=bugfix']), io);
+  const input = args(codex, { taskType: 'bugfix' });
+  input.worker.checker = 'codex';
+  const result = await runProbationBuild(input, io);
   expect(result.detail).toContain('checker changed the git-hook surface');
   const restore = calls.findIndex((c) => c[0] === 'reset-hooks' && c.length === 3);
   const discard = calls.findIndex((c) => c[0] === 'discard');
@@ -845,9 +848,10 @@ it('restores checker hook tampering before undoing a rejected Flash build', asyn
 
 
 describe('test-fix build (#4551)', () => {
-  it('runs Flash with the Codex checker and rejects production paths', async () => {
-    const input = parseArgs(['--num=4551', '--taskType=test-fix', '--worker=antigravity-gemini']);
-    expect(input.worker).toMatchObject({ taskType: 'test-fix', model: 'gemini-3.8-flash-high', checker: 'codex' });
+  it('runs an eligible worker with the Codex checker and rejects production paths', async () => {
+    const input = args(codex, { taskType: 'test-fix', scope: 'scripts/a.test.mjs' });
+    input.worker.checker = 'codex';
+    expect(input.worker).toMatchObject({ taskType: 'test-fix', provider: 'codex', checker: 'codex' });
     const run = fakeIo({ itemScope: ['scripts/a.test.mjs'], numstat: '1\t1\tscripts/a.test.mjs' });
     let checked = false;
     run.io.diffText = () => 'test diff';
@@ -954,8 +958,8 @@ describe('standalone prepare', () => {
     return fake;
   }
   const prepareArgs = () => args(codex, { taskType: 'prepare', scope: `we:${path}` });
-  it.each(['still-valid', 'still-valid-gemini', 'needs-reprepare', 'over-cap', 'invalid', 'disabled', 'tampered',
-    'head-moved', 'hooks-changed', 'numstat-changed', 'stamp-retry-codex', 'stamp-retry-gemini',
+  it.each(['still-valid', 'needs-reprepare', 'over-cap', 'invalid', 'disabled', 'tampered',
+    'head-moved', 'hooks-changed', 'numstat-changed', 'stamp-retry-codex',
     'light-vetoed', 'light-quota-held', 'scorecards-unreadable', 'ignored-changed', 'ignored-pre-throw', 'ignored-post-throw'])(
     'scope-only stale preparation: %s uses the existing card-only landing arc', async mode => {
       const skipped = ['over-cap', 'disabled', 'light-vetoed', 'light-quota-held', 'scorecards-unreadable', 'ignored-pre-throw'].includes(mode);
@@ -967,9 +971,8 @@ describe('standalone prepare', () => {
       const workerArgv = [];
       const scorecards = [];
       const retry = mode.startsWith('stamp-retry-');
-      const originalWorker = ['stamp-retry-gemini', 'still-valid-gemini', 'tampered', 'head-moved', 'hooks-changed', 'numstat-changed'].includes(mode)
-        ? { ...args(undefined, { taskType: 'prepare', worker: 'antigravity-gemini' }).worker, effort: 'high' }
-        : { ...prepareArgs().worker, effort: 'high' };
+      // Hydrogen prepare hand-offs are refused; exercise revalidation with the Codex runner.
+      const originalWorker = { ...prepareArgs().worker, effort: 'high' };
       io.appendScorecard = row => scorecards.push(row);
       const prWorkers = [];
       io.writePrBody = (_dir, data) => { prWorkers.push(data.worker); return '/lanes/22/.pr-body.md'; };
@@ -1585,8 +1588,8 @@ describe('parseArgs — operator pins keep the narrow worker allowlist (PR 3209 
     expect(() => parseArgs(['--num=1', '--session=s', '--worker=antigravity-claude', '--model=claude-opus-4-6-thinking'])).toThrow(/disallowed model/);
     expect(() => parseArgs(['--num=1', '--session=s', '--worker=codex', '--model=gpt-5.6-terra'])).toThrow(/disallowed model/);
   });
-  it('resolves a default route for a non-critical doc-fix with no --worker (no gate crash)', () => {
-    expect(() => parseArgs(['--num=1', '--session=s', '--taskType=doc-fix'])).not.toThrow();
+  it('refuses a default Hydrogen doc-fix without simple and scope evidence', () => {
+    expect(() => parseArgs(['--num=1', '--session=s', '--taskType=doc-fix'])).toThrow(/requires a simple task/);
   });
 });
 

@@ -1,6 +1,6 @@
 /** Shared pre-launch quota hold; pure and independent of launcher imports. */
 export const QUOTA_COOLOFF_MS = 60 * 60 * 1000;
-export const CODEX_QUOTA_FULL_PERCENT = 98;
+export const CODEX_QUOTA_FULL_PERCENT = 100;
 
 export function isQuotaError(text) {
   if (typeof text !== 'string') return false;
@@ -28,7 +28,8 @@ export function providerQuotaHold(records, provider, now) {
     if (Number.isFinite(until) && now < until) return `quota exhausted on its last seat call (${last.scoredAt}); sitting out until ${new Date(until).toISOString()}`;
     return null;
   }
-  if (typeof last.quotaUsedPercent === 'number' && last.quotaUsedPercent >= CODEX_QUOTA_FULL_PERCENT
+  const fullPercent = provider === 'codex' ? CODEX_QUOTA_FULL_PERCENT : 98;
+  if (typeof last.quotaUsedPercent === 'number' && last.quotaUsedPercent >= fullPercent
     && Number.isFinite(resetAt) && now < resetAt) {
     return `quota gauge at ${last.quotaUsedPercent}% on its last seat call; sitting out until ${new Date(resetAt).toISOString()}`;
   }

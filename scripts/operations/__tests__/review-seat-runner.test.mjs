@@ -52,13 +52,13 @@ describe('settings — review.seatProvider.<lens> comes from the routing policy 
     expect(c.claudeSeatModel.correctness).toBe('claude-sonnet-5-5');
   });
 
-  it('the shipped routing policy: correctness and security in shadow on claude-opus-5-5-high, the advisory agy seat on', () => {
+  it('the shipped routing policy: correctness and security in shadow on claude-sonnet-5-5-high, the advisory agy seat on', () => {
     const s = loadReviewSeatSettings({ policy: DEFAULT_ROUTING_POLICY });
     expect(s.seatProvider).toEqual({ correctness: 'shadow', security: 'shadow' });
-    expect(s.seatModel).toEqual({ correctness: 'claude-opus-5-5-high', security: 'claude-opus-5-5-high' });
+    expect(s.seatModel).toEqual({ correctness: 'claude-sonnet-5-5-high', security: 'claude-sonnet-5-5-high' });
     expect(s.claudeSeatModel).toEqual({ correctness: 'claude-sonnet-5-5', security: 'claude-sonnet-5-5' });
     expect(s.agyCorrectnessAdvisory).toBe(true);
-    expect(s.agyModel).toBe('claude-opus-5-5-high');
+    expect(s.agyModel).toBe('claude-sonnet-5-5-high');
   });
 
   it.each([
@@ -105,7 +105,7 @@ describe('provider selection — the seat runner', () => {
 
   it('shadow: an agy juror that shares the Claude session id is not an independent reviewer — voided', async () => {
     const rows = [];
-    const out = await runSeatWithProvider({ ...REQUEST, seatProvider: { mode: 'shadow', model: 'm' } }, io({
+    const out = await runSeatWithProvider({ ...REQUEST, seatProvider: { mode: 'shadow', model: 'claude-opus-5-5-high' } }, io({
       claudeJudge: async () => judgeOutcome({ summary: 'c', findings: [] }, { sessionId: 'same' }),
       agyJuror: async () => ({ status: 'ok', sessionId: 'same', value: { summary: 'a', findings: [] } }),
       appendRow: (row) => { rows.push(row); return true; },
@@ -116,7 +116,7 @@ describe('provider selection — the seat runner', () => {
 
   it('agy: a clean agy answer IS the seat answer and the run record says agy judged', async () => {
     let claudeRan = false;
-    const out = await runSeatWithProvider({ ...REQUEST, seatProvider: { mode: 'agy', model: 'm', onEscape: 'claude' } }, io({
+    const out = await runSeatWithProvider({ ...REQUEST, seatProvider: { mode: 'agy', model: 'claude-opus-5-5-high', onEscape: 'claude' } }, io({
       claudeJudge: async () => { claudeRan = true; return judgeOutcome({ summary: 'c', findings: [] }); },
       agyJuror: async () => ({ status: 'ok', sessionId: 'agy-1', wallMs: 5, value: { summary: 'a', findings: [OTHER] } }),
     }));
@@ -130,19 +130,19 @@ describe('provider selection — the seat runner', () => {
 
 describe('void-on-escape — the fallback', () => {
   it('agy seat: a voided agy run falls back to Claude for that seat, and says why', async () => {
-    const out = await runSeatWithProvider({ ...REQUEST, seatProvider: { mode: 'agy', model: 'm', onEscape: 'claude' } }, io({
+    const out = await runSeatWithProvider({ ...REQUEST, seatProvider: { mode: 'agy', model: 'claude-opus-5-5-high', onEscape: 'claude' } }, io({
       claudeJudge: async () => judgeOutcome({ summary: 'claude judged', findings: [FINDING] }, { sessionId: 'c' }),
       agyJuror: async () => ({ status: 'voided', reasons: ['change outside the juror lane: /lanes/review-lane'], value: { summary: 'x', findings: [] } }),
     }));
     const { value } = unwrapJudgeOutcome(out);
     expect(value.summary).toBe('claude judged');
     expect(value.findings).toEqual([FINDING]);
-    expect(value.seatProvider).toEqual({ provider: 'claude', fellBackFrom: { provider: 'agy', model: 'm', status: 'voided', reasons: ['change outside the juror lane: /lanes/review-lane'] } });
+    expect(value.seatProvider).toEqual({ provider: 'claude', fellBackFrom: { provider: 'agy', model: 'claude-opus-5-5-high', status: 'voided', reasons: ['change outside the juror lane: /lanes/review-lane'] } });
   });
 
   it('advisory agy seat: a voided run is a recorded skip, never a Claude spend', async () => {
     let claudeRan = false;
-    const out = await runSeatWithProvider({ ...REQUEST, lens: 'agy-correctness', seatProvider: { mode: 'agy', model: 'm', onEscape: 'skip' } }, io({
+    const out = await runSeatWithProvider({ ...REQUEST, lens: 'agy-correctness', seatProvider: { mode: 'agy', model: 'claude-opus-5-5-high', onEscape: 'skip' } }, io({
       claudeJudge: async () => { claudeRan = true; return judgeOutcome({ summary: 'c', findings: [] }); },
       agyJuror: async () => ({ status: 'voided', reasons: ['juror lane changed on a read-only seat: ?? pwned.txt'] }),
     }));
@@ -416,12 +416,12 @@ describe('PR #4131 review fixes', () => {
     });
     const judge = createDefaultJudge({ provider, cwd: '/lanes/review-lane', seatRunner });
     // advisory agy seat: voided → skipped; Claude provider never called
-    const skipped = unwrapJudgeOutcome(await judge({ ...REQUEST, allowedTools: undefined, lens: 'agy-correctness', seatProvider: { mode: 'agy', model: 'm', onEscape: 'skip' } }));
+    const skipped = unwrapJudgeOutcome(await judge({ ...REQUEST, allowedTools: undefined, lens: 'agy-correctness', seatProvider: { mode: 'agy', model: 'claude-opus-5-5-high', onEscape: 'skip' } }));
     expect(skipped.value.skipped).toMatchObject({ provider: 'agy' });
     expect(providerCalls).toHaveLength(0);
     expect(agyCalls[0].laneCwd).toBe('/lanes/review-lane');
     // shadow: Claude provider called once, without the directive
-    const shadow = unwrapJudgeOutcome(await judge({ ...REQUEST, seatProvider: { mode: 'shadow', model: 'm' } }));
+    const shadow = unwrapJudgeOutcome(await judge({ ...REQUEST, seatProvider: { mode: 'shadow', model: 'claude-opus-5-5-high' } }));
     expect(providerCalls).toHaveLength(1);
     expect(providerCalls[0].seatProvider).toBeUndefined();
     expect(shadow.value.shadow.status).toBe('voided');
@@ -599,7 +599,7 @@ describe('PR #4131 review fixes', () => {
   });
 
   it('an agy juror that THROWS never leaks a local path into the published skip summary', async () => {
-    const out = await runSeatWithProvider({ ...REQUEST, lens: 'agy-correctness', seatProvider: { mode: 'agy', model: 'm', onEscape: 'skip' } }, io({
+    const out = await runSeatWithProvider({ ...REQUEST, lens: 'agy-correctness', seatProvider: { mode: 'agy', model: 'claude-opus-5-5-high', onEscape: 'skip' } }, io({
       claudeJudge: async () => { throw new Error('advisory seat must not spend Claude'); },
       agyJuror: async () => { throw new Error('spawn failed in /lanes/review-lane/.git: ENOENT'); },
     }));
@@ -616,7 +616,7 @@ describe('PR #4131 review fixes', () => {
   });
 
   const runWith = (fx, act, transcript = transcriptWith([])) => runAgyReviewJuror({
-    request: REQUEST, laneCwd: fx.lane, model: 'm',
+    request: REQUEST, laneCwd: fx.lane, model: 'claude-opus-5-5-high',
     deps: { repoRoot: fx.other, spawnJudge: async ({ cwd }) => {
       const t = join(fx.root, 'transcript.jsonl'); writeFileSync(t, transcript); act?.(cwd);
       return { value: { summary: 's', findings: [] }, sessionId: 'agy-1', transcriptFile: t };
@@ -673,7 +673,7 @@ describe('first live shadow run (PR #4133) — the shared checkout\'s own churn 
       execFileSync('git', ['-C', fx.other, 'add', '.gitignore']);
       execFileSync('git', ['-C', fx.other, '-c', 'user.email=t@t', '-c', 'user.name=t', 'commit', '-qm', 'ignore']);
       const r = await runAgyReviewJuror({
-        request: REQUEST, laneCwd: fx.lane, model: 'm',
+        request: REQUEST, laneCwd: fx.lane, model: 'claude-opus-5-5-high',
         deps: { repoRoot: fx.other, spawnJudge: async () => {
           const t = join(fx.root, 't.jsonl'); writeFileSync(t, transcriptWith([]));
           execFileSync('mkdir', ['-p', join(fx.other, '.conveyor')]);
@@ -690,7 +690,7 @@ describe('first live shadow run (PR #4133) — the shared checkout\'s own churn 
     const fx = fixtureLane();
     try {
       const r = await runAgyReviewJuror({
-        request: REQUEST, laneCwd: fx.lane, model: 'm',
+        request: REQUEST, laneCwd: fx.lane, model: 'claude-opus-5-5-high',
         deps: { repoRoot: fx.other, spawnJudge: async () => {
           const t = join(fx.root, 't.jsonl');
           writeFileSync(t, transcriptWith([{ step_type: 'tool', state: 'DONE', tool_name: 'run_command', tool_info: { parameters: { CommandLine: 'ls' } } }]));

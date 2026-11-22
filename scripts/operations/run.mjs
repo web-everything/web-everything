@@ -27,6 +27,7 @@ import { appendEntry } from './ruled-weakened-store.mjs';
 import { ruledWeakenedAddOperation, RULED_WEAKENED_ADD_OP, RULED_WEAKENED_ADD_EFFECT, finishRuledWeakenedAdd } from './ruled-weakened-add.mjs';
 import { OPERATOR_OVERRIDE_OPS, OPERATOR_OVERRIDE_EFFECT, operatorOverrideOperation } from './operator-override.mjs';
 import { lastOverrideReason, readOperatorOverrides, writeOperatorOverride, clearOperatorOverride } from '../lib/operator-override-store.mjs';
+import { readRoutingPolicy, resolveOperationRoute } from '../lib/dispatch-routing-policy-io.mjs';
 import { aiRoutingOperation, AI_ROUTING_OP, finishAiRouting } from './ai-routing.mjs';
 import { briefModeOperation, BRIEF_MODE_OP, finishBriefMode } from './brief-mode.mjs';
 import { loadDeliveryRoutes } from '../lib/delivery-routes.mjs';
@@ -278,7 +279,10 @@ export const OPERATIONS = Object.freeze({
     sinks: {}, finish: finishBriefMode }),
   [AI_ROUTING_OP]: () => ({ declaration: aiRoutingOperation({ collect: () => {
     const routing = resolveAiRouting();
-    return { settings: routing.value, sources: routing.sources, invalid: routing.invalid,
+    const policy = readRoutingPolicy();
+    const deliveryRoutes = Object.fromEntries(['doc-fix', 'prevention-card', 'prepare-card']
+      .map(kind => [kind, resolveOperationRoute({ operation: kind, policy })]));
+    return { deliveryRoutes, settings: routing.value, sources: routing.sources, invalid: routing.invalid,
       inputs: Object.fromEntries(AI_ROUTING_ROLES.map(role => [role, aiRoutingInputs(role, routing)])) };
   } }), sinks: {}, finish: finishAiRouting }),
   'operator-override-show': () => ({ declaration: operatorOverrideOperation('operator-override-show', { readOverrides: () => readOperatorOverrides() }), sinks: {} }),

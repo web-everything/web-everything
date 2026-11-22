@@ -559,6 +559,7 @@ export function readTick({
       size: item?.size ?? null,
       designQuestion: item?.designQuestion, wellScoped: item?.wellScoped,
       risk: item?.risk ?? null,
+      humanRequired: item?.humanRequired === true,
       // #3857 — a `security` tag raises the worker to Opus; carried through `findItem` for this read.
       tags: Array.isArray(item?.tags) ? item.tags : [],
       taskKey: { storyRef: key, round: 1, taskId: launchKind },
@@ -1106,6 +1107,7 @@ export function findItem(key, loadItems, pocRegistry = null) {
     // the ABSENCE of the field, and it keeps the resolved-item shape byte-identical for every unsized card.
     ...(it.size == null || it.size === '' ? {} : { size: it.size }),
     ...(it.risk == null ? {} : { risk: it.risk }),
+    ...(it.humanRequired === true ? { humanRequired: true } : {}),
     ...(typeof it.designQuestion === 'boolean' ? { designQuestion: it.designQuestion } : {}),
     ...(typeof it.wellScoped === 'boolean' ? { wellScoped: it.wellScoped } : {}),
     // #3857/#3906 — the card's `tags:`, for the tier table's `security` row. Spread for the same reason.
@@ -1861,7 +1863,9 @@ export function routeDispatchProvider(request, {
       veto.model === route.model && veto.provider === (route.provider.startsWith('agy-') ? 'antigravity' : route.provider)));
     const workerFor = route => {
       if (!request.probationWorker || route.provider === 'claude') return null;
-      return probationWorkerForRoute(route, request.probationWorker.taskType);
+      // An inadmissible candidate must yield to the next declared fallback before any spawn.
+      try { return probationWorkerForRoute(route, request.probationWorker.taskType); }
+      catch { return null; }
     };
     const chosen = candidates.find(route => (!pinnedModel || route.provider === 'claude') && providerAvailable(route.provider, route) && checkerAvailable(workerFor(route)) && (route.provider === 'claude'
       || (probationLaunchDecision({ ...request, probationWorker: workerFor(route) }, probationLaunch).launch
