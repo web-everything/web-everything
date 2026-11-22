@@ -41,7 +41,9 @@ function fixture() {
   // gh stub: no PR heads any ref; every other GitHub question fails (fails closed in the planner).
   const bin = mktemp('we-overlay-rr-gh-');
   writeFileSync(join(bin, 'gh'), '#!/bin/sh\nif [ "$1 $2" = "pr list" ]; then echo "[]"; exit 0; fi\nif [ "$1 $2" = "repo view" ]; then echo \'{"nameWithOwner":"web-everything/web-everything","url":"https://github.com/web-everything/web-everything"}\'; exit 0; fi\nexit 1\n', { mode: 0o755 });
-  const env = { ...process.env, PATH: `${bin}:${process.env.PATH}`, WE_DAEMON_OVERLAY_DIR: state, WE_DAEMON_OVERLAY_STACK_BASES: '{}', WE_OVERLAY_NO_PR: 'warn' };
+  const prefs = join(base, 'prefs.json');
+  writeFileSync(prefs, JSON.stringify({ overlaySafety: { auditEvidence: 'off' } }));
+  const env = { ...process.env, WE_PLATFORM_PREFERENCES_FILE: prefs, WE_OVERLAY_AUDIT_EVIDENCE: 'off', PATH: `${bin}:${process.env.PATH}`, WE_DAEMON_OVERLAY_DIR: state, WE_DAEMON_OVERLAY_STACK_BASES: '{}', WE_OVERLAY_NO_PR: 'warn' };
   /** Commit `file` on `ref` (starting from `from`) and push it; returns the new tip. */
   const push = (ref, file, content, from = 'origin/main') => {
     gitOk(author, ['fetch', '-q', 'origin']);

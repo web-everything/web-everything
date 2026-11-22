@@ -521,6 +521,7 @@ export function createPrototypeLoader({ exec, fs, now, sleep, env, settings, com
       out.canonicalAudit = { mode: 'refuse', ...canonicalAuditEvidence(auditRecords, input.sha, covers, liveFp,
         { ruledWeakened: auditGate }) };
       if (!out.canonicalAudit.ok) return stop('no-canonical-audit', {
+        detail: `no NOT WEAKENED canonical audit record for ${input.sha}, no waiver in ruled-weakened.jsonl`,
         fallback: waiver ? `waiver exists but no fix-ready record. Run scripts/operations/fix-ready-record.mjs with auditRuling and auditDisclosed matching the waiver, then retry prototype-load.` : `Run node scripts/operations/run.mjs codex-audit --base=origin/main --head=${input.sha}, then retry prototype-load. WEAKENED requires a matching ruledWeakened entry and fix-ready disclosure.` });
       if (auditGate?.ruledWeakened) console.warn(`WARNING: RULED-WEAKENED EXCEPTION ${auditGate.ruledWeakened.ruling}: loading ${input.branch}@${input.sha} despite audit WEAKENED (source layer: ${auditGate.ruledWeakened.layer || 'tool'}). Disclosed findings: ${auditGate.ruledWeakened.findings.join(' | ')}`);
       stage = 'no-ready';
@@ -861,7 +862,7 @@ export function createPrototypeLoader({ exec, fs, now, sleep, env, settings, com
       }
       try {
         if (input.replace) {
-          const result = loader('replace', out.clone, out.effectiveRef, [`--replaces=${input.replace}`, `--expected-sha=${out.effectiveSha}`,
+          const result = loader('replace', out.clone, out.effectiveRef, ['--audit-checked-by=prototype-load', `--replaces=${input.replace}`, `--expected-sha=${out.effectiveSha}`,
             `--reason=${input.why || `prototype-load: ${input.daemon} ${out.effectiveRef} replaces ${input.replace}`}`, `--by=${env.USER || 'unknown'}`]);
           out.registration = result;
           const data = lastJson(result);
@@ -876,7 +877,7 @@ export function createPrototypeLoader({ exec, fs, now, sleep, env, settings, com
           }
           out.replaced = input.replace;
         } else if (out.registered !== 'already') {
-          const result = loader('add', out.clone, out.effectiveRef, [`--expected-sha=${out.effectiveSha}`, `--reason=${input.why || `prototype-load: ${input.daemon} ${out.effectiveRef}`}`, `--by=${env.USER || 'unknown'}`]);
+          const result = loader('add', out.clone, out.effectiveRef, ['--audit-checked-by=prototype-load', `--expected-sha=${out.effectiveSha}`, `--reason=${input.why || `prototype-load: ${input.daemon} ${out.effectiveRef}`}`, `--by=${env.USER || 'unknown'}`]);
           out.registration = result;
           if (result.code !== 0) return stop('register-failed');
           out.registered = true;
