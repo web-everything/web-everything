@@ -1,7 +1,7 @@
 {
  "rubricType": "https://everstandards.dev/core/rubric/v0.1",
  "id": "https://github.com/plateauapp/plateau-settings/blob/main/review/rubrics/security",
- "version": "2026-11-22+we.worktree",
+ "version": "2026-11-22+we.bdfafcc65b",
  "title": "Security seat: basic list on every PR (SB1-SB4, CKLST-1 A) plus the merge-path lines MP1-MP14 when the diff touches merge-path code",
  "items": [
   {
