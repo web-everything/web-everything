@@ -297,13 +297,15 @@ export function releaseLockDir(lockRoot, path) {
  * @param {string} lockRoot
  * @param {string} path
  * @param {{owner:string, heartbeatAt?:string, meta?:{writerToken?:string}}|null} expected  the entry the caller read (`null` ⇒ an entry-less dir)
+ * @param {{matchMeta?:boolean}} options require unchanged dispatch metadata as well as owner/heartbeat
  * @returns {boolean} whether the expected lock was removed (`false` ⇒ gone already, or someone else's — left standing)
  */
-export function releaseLockDirIf(lockRoot, path, expected) {
+export function releaseLockDirIf(lockRoot, path, expected, { matchMeta = false } = {}) {
   const dir = lockDirFor(lockRoot, path);
   const matchesExpected = (found) => (expected
     ? !!found && found.owner === expected.owner && found.meta?.writerToken === expected.meta?.writerToken
       && (expected.heartbeatAt == null || found.heartbeatAt === expected.heartbeatAt)
+      && (!matchMeta || JSON.stringify(found.meta ?? null) === JSON.stringify(expected.meta ?? null))
     : found === null);
   // Cheap pre-check: a lock that is plainly not the one judged is never moved at all, so the rename window below
   // opens only when the lock looks like the expected one.

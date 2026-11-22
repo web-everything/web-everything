@@ -77,7 +77,7 @@ import { pidIdentity, pidIdentityStamp, holderStartedBy } from '../lib/pid-alive
 import { makeAwaitingVerifyResolver } from './await-verify.mjs';
 import { hostname } from 'node:os';
 import {
-  reserve, readLockEntry, releaseLockDir, heartbeat, isLeaseExpired,
+  reserve, readLockEntry, releaseLockDirIf, heartbeat, isLeaseExpired,
 } from '../readiness/file-locks.mjs';
 import {
   DEFAULT_FIX_DISPATCH_CLAIM_TTL_MINUTES, fixDispatchClaimRoot, fixDispatchResource, readFixDispatchClaim,
@@ -275,19 +275,20 @@ export function releaseSessionFixDispatchClaims({ repo, pr, who, lockRoot = fixD
  * Release a claim this `owner` holds. A no-op (never throws, never touches a lock it does not own) when the
  * claim is already gone or owned by someone else — the caller learns why via `reason`, but nothing is torn
  * down out from under a legitimate different holder (e.g. one that reclaimed it after our own TTL lapsed).
- * @param {{repo:string, pr:number, kind?:string, owner:string, lockRoot?:string}} o
+ * @param {{repo:string, pr:number, kind?:string, owner:string, expected?:object|null, lockRoot?:string}} o
  * @returns {{released:boolean, reason?:string, heldBy?:string|null}}
  */
 export function releaseFixDispatchClaim({
-  repo, pr, kind = 'fix', owner, lockRoot = fixDispatchClaimRoot(),
+  repo, pr, kind = 'fix', owner, expected = null, lockRoot = fixDispatchClaimRoot(),
 } = {}) {
   if (!owner) throw new TypeError('releaseFixDispatchClaim requires an owner');
   const resource = fixDispatchResource({ repo, pr, kind });
   const current = readLockEntry(lockRoot, resource);
   if (!current) return { released: false, reason: 'absent' };
   if (current.owner !== owner) return { released: false, reason: 'not-owner', heldBy: current.owner };
-  releaseLockDir(lockRoot, resource);
-  return { released: true };
+  if (expected && expected.owner !== owner) return { released: false, reason: 'not-owner' };
+  const released = releaseLockDirIf(lockRoot, resource, expected ?? current, { matchMeta: true });
+  return released ? { released: true } : { released: false, reason: 'claim-changed' };
 }
 
 /** we:scripts/conveyor/fix-dispatch-claim.mjs#isClaimSessionLive — is there a LIVE, non-terminal session

@@ -129,7 +129,7 @@ export function directRecentAuthExpired(agents, {
  * we:scripts/conveyor/claude-auth-health.mjs#readClaudeAuthHealth — THE SHARED READ. `broken: true` the moment
  * EITHER source says so; `source` names which one fired (`'health-episode'` wins the label when both do, since
  * it is the one the operator's own HEALTH section already names).
- * @param {{stateRoot?:string, agents?:Array<object>, now?:number}} [o]
+ * @param {{stateRoot?:string, agents?:Array<object>, now?:number, requireLogin?:boolean}} [o]
  * @returns {{broken:boolean, source:('health-episode'|'direct-scan'|'no-signal'), episode?:object, checked?:number}}
  */
 export function readClaudeAuthHealth({ stateRoot, agents = [], now = Date.now() } = {}) {
@@ -188,12 +188,12 @@ export function decideClaudeAuthDispatchGate(health, loggedIn) {
  * one real `claude agents --json --all` read, the shared health read over it, the cheap probe (skipped
  * entirely when the health read is already clean — no reason to shell a probe when nothing is broken), and the
  * pure decision above. Every real read is injectable so a daemon's own unit tests never shell out.
- * @param {{stateRoot?:string, listAgents?:Function, health?:Function, probe?:Function, now?:number}} [o]
+ * @param {{stateRoot?:string, listAgents?:Function, health?:Function, probe?:Function, now?:number, requireLogin?:boolean}} [o]
  * @returns {{paused:boolean, reason:(string|null), source:string}}
  */
 export function planClaudeAuthDispatchGate({
   stateRoot, listAgents = () => defaultListAgents({ all: true }), health = readClaudeAuthHealth, probe = probeClaudeLoggedIn, now = Date.now(),
-  readMaintenance = readMaintenanceMarker,
+  readMaintenance = readMaintenanceMarker, requireLogin = false,
 } = {}) {
   // Card 105 — an operator-declared maintenance window pauses every Claude-starting daemon regardless of login health.
   const maintenance = readMaintenance();
@@ -201,7 +201,8 @@ export function planClaudeAuthDispatchGate({
   let agents = [];
   try { agents = listAgents(); } catch { agents = []; }
   const healthResult = health({ stateRoot, agents, now });
-  const loggedIn = healthResult.broken ? probe() : true; // clean host — never shells the probe at all
-  const gate = decideClaudeAuthDispatchGate(healthResult, loggedIn);
+  // Recovery requires positive login evidence even when the tolerant health reader has no signal.
+  const loggedIn = (requireLogin || healthResult.broken) ? probe() : true;
+  const gate = decideClaudeAuthDispatchGate(requireLogin ? { broken: true } : healthResult, loggedIn === true);
   return { ...gate, source: healthResult.source };
 }

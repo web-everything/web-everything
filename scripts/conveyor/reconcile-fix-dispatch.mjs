@@ -133,7 +133,7 @@ import { BORROW_REASON, readRoutedOutcomes, consecutiveUnproductiveOnHead, merge
 import { fixDetachedProvider } from '../operations/dispatch-providers/fix.mjs';
 import { removePromptFile } from '../operations/fix-run.mjs';
 import { listBuildDispatchClaims } from './build-dispatch-claim.mjs';
-import { runReconcilePass, resolveLaneHead, PR_LIST_JSON_FIELDS } from './reconcile-pass.mjs';
+import { runReconcilePass, resolveLaneHead, PR_LIST_JSON_FIELDS, owedFixRecoveryInput } from './reconcile-pass.mjs';
 import { readUnsupported, recordUnsupported } from './unsupported-repo.mjs';
 import { readPrsFromFile } from './open-pr-fetch.mjs';
 import { CONFLICT_LABEL } from './parked-pr-conflict-watch.mjs';
@@ -176,6 +176,7 @@ import { resolveOperationRoute, resolvePolicyModel } from '../lib/dispatch-routi
 import { countRearmComments } from './rearm-review.mjs';
 import { countAdvisoryComments } from './advisory-round-count.mjs';
 import { readCompletePrComments } from './pr-comments-complete.mjs';
+import { applyOwedFixRecovery, createOwedFixRecoveryLedger, resolveOwedFixRecoveryIo } from './owed-fix-recovery.mjs';
 
 // card 302 — resolve red-main capacity through the shared policy layers.
 export function resolveMainFixCapacity(env = process.env) {
@@ -1864,8 +1865,21 @@ export function classifyEnvFaultRefusals(refusals) {
  *   holds THIS function's own per-entry refusals (`no-scope`/`no-lane`/`dispatch-failed`/`unsupported-repo`)
  *   for PRs the plan DID offer. Handing up `reconciled.refusals` itself is what lets the daemon's own onTick
  *   print the reconcile layer's real reason instead of discarding it to a count.
+ * @param {object|null} [o.owedFixRecovery] - owed-fix recovery IO overrides
+ *   (`we:scripts/conveyor/owed-fix-recovery.mjs#recoverOwedFixes`); `null` disables recovery. Recovery runs on
+ *   every writable pass, whatever `reconcile` wrapper produced the plan, and gives back an admission this pass
+ *   never attempted to launch. Off under a test runner unless injected (its default IO reads and writes live
+ *   claim, GitHub and coordination state).
  */
-export function runReconcileFixDispatch({
+export function runReconcileFixDispatch(options = {}) {
+  const owedFixRecovery = resolveOwedFixRecoveryIo(options.owedFixRecovery, isUnderTestEnv());
+  const ledger = createOwedFixRecoveryLedger(owedFixRecovery?.transact ? { transact: owedFixRecovery.transact } : {});
+  try { return runReconcileFixDispatchPass({ ...options, owedFixRecovery, owedFixLedger: ledger }); } finally { ledger.settle(); }
+}
+
+function runReconcileFixDispatchPass({
+  owedFixRecovery = {},
+  owedFixLedger = null,
   shadowDeps,
   // A synchronous executor keeps this pass's existing return contract. Tests may inject hermetic IO.
   refreshMqFailure = refreshMqFailureHeadSync,
@@ -1984,6 +1998,14 @@ export function runReconcileFixDispatch({
     return { handled: 0, deferred: [], nextCursor: null, dispatched: [], refusals: [], readDeferred, reconcileRefusals: 0, reconcileRefusalDetails: [] };
   }
   let reconciled = reconciledRaw;
+  // Owed-fix recovery runs HERE, after any reconcile wrapper (the daemon's pass plan cache included), on this
+  // pass's own copy of the plan — never on a plan another phase reads.
+  if (!dryRun && owedFixRecovery !== null) {
+    reconciled = { ...reconciled, dispatch: [...(Array.isArray(reconciled.dispatch) ? reconciled.dispatch : [])],
+      refusals: [...(Array.isArray(reconciled.refusals) ? reconciled.refusals : [])] };
+    fixStep('owed-fix-recovery', () => applyOwedFixRecovery(reconciled, { kinds: ['fix'],
+      input: owedFixRecoveryInput(reconciledRaw), io: owedFixRecovery, ledger: owedFixLedger }));
+  }
   // Only a bounced no-findings refusal can spend this bounded recovery read. The normal
   // reconcile path re-derives every gate (including liveness, holds and the round cap).
   let rereads = 0;
@@ -2351,12 +2373,17 @@ export function runReconcileFixDispatch({
     // A resume continues an existing Claude session and claim; a borrowed fix always starts fresh so its claim records the slot.
     if (entry.isConflict && !borrowed && executorDecision?.executor !== 'codex' && !entry.restack) {
       let attempt;
+      // A launch attempt from here on: a failed one keeps any owed-fix recovery reservation (it escalates).
+      owedFixLedger?.attempting(entry.pr);
       try {
         attempt = fixStep('resume', () => tryResume(entry, { root, repo: repoKey }), entry.pr);
       } catch (e) {
+        // The resume probe reads before it resumes anything (see above): a throw here started nothing.
+        owedFixLedger?.notLaunched(entry.pr);
         refusals.push({ pr: entry.pr, kind: 'dispatch-failed', why: describeDispatchFailure(e) });
         continue;
       }
+      if (!attempt.resumed) owedFixLedger?.notLaunched(entry.pr);
       if (attempt.resumed) {
         console.error(`reconcile-fix-dispatch: PR #${entry.pr} ${formatFixExecutorLog(executorDecision ?? { executor: 'claude', reason: 'resuming existing session', source: 'default' })}`);
         dispatched.push(attempt.result);
@@ -2369,11 +2396,14 @@ export function runReconcileFixDispatch({
     // throw here never aborts the pass, it only means a cold start.
     if (executorDecision?.executor !== 'codex' && tryResumeRound && !entry.isConflict && !borrowed && !entry.restack && !entry.takeover && roundOf(entry) >= 2) {
       let attempt = null;
+      owedFixLedger?.attempting(entry.pr);
       try {
         attempt = fixStep('resume-round', () => tryResumeRound(entry, { root, repo: repoKey }), entry.pr);
       } catch (e) {
         attempt = { resumed: false, resumeAttempt: { attempted: false, roundResume: true, refused: 'error', why: describeDispatchFailure(e) } };
       }
+      // A declined (or failed) round resume falls through to a cold start, which is its own attempt below.
+      if (!attempt?.resumed) owedFixLedger?.notLaunched(entry.pr);
       if (attempt?.resumed) {
         console.error(`reconcile-fix-dispatch: PR #${entry.pr} ${formatFixExecutorLog(executorDecision ?? { executor: 'claude', reason: 'resuming existing session', source: 'default' })}`);
         dispatched.push(attempt.result);
@@ -2390,9 +2420,11 @@ export function runReconcileFixDispatch({
       continue;
     }
     const lane = lanes.shift();
+    owedFixLedger?.attempting(entry.pr);
     try {
       const result = fixStep('dispatch', () => dispatch({ ...entry, lane }, { root, repo: repoKey, extraArgs: agentArgsFromEnv(), resumeAttempt, ...(executorDecision ? { executorDecision } : {}), ...(borrowed ? { borrowed } : {}) }), entry.pr);
       if (result?.held) {
+        owedFixLedger?.notLaunched(entry.pr);
         // #x0jphk5 — a `(repo, pr, headRefOid)` claim already held elsewhere: nothing was spawned, so the lane
         // this iteration popped went unused — return it to the pool for the NEXT entry, exactly as a
         // `tryResumeFix` success already leaves it untouched (this function's own docblock, "#xazl9u3").
