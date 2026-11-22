@@ -114,7 +114,7 @@ export async function main(argv, deps) {
     const lines = answer.split(/\r?\n/);
     while (lines.length && !lines[0].trim()) lines.shift();
     const verdict = lines.shift();
-    if (verdict !== 'NOT WEAKENED' && verdict !== 'WEAKENED') throw new Error('invalid first verdict line');
+    if (verdict !== 'NOT WEAKENED' && verdict !== 'WEAKENED') throw new Error(`no verdict line (first line: ${JSON.stringify(clean(String(verdict ?? '')).slice(0, 80))})`);
     if (hasConflictingVerdict(verdict, lines)) throw new Error('conflicting verdict lines');
     const findings = lines.filter(line => line.trim()).map(clean);
     const result = { verdict, base, head, questionHash: QUESTION_HASH, findings };
@@ -130,8 +130,9 @@ export async function main(argv, deps) {
     }
     deps.stdout(flags.json ? `${JSON.stringify(result)}\n` : `${[verdict, ...findings].join('\n')}\n`);
     return verdict === 'NOT WEAKENED' ? 0 : 1;
-  } catch {
-    (deps?.stderr ?? (text => process.stderr.write(text)))('UNPARSEABLE audit: incomplete or failed evidence; retry or request human review of the full diff.\n');
+  } catch (error) {
+    const reason = clean(String(error?.message ?? 'unknown failure')).slice(0, 300);
+    (deps?.stderr ?? (text => process.stderr.write(text)))(`UNPARSEABLE audit (${reason}): incomplete or failed evidence; retry or request human review of the full diff.\n`);
     return 3;
   }
 }
