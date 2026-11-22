@@ -6390,7 +6390,7 @@ Acceptance evidence must distinguish automated coverage from operational proof:
 | --- | --- | --- |
 | 1: bounded no-fixer recovery | `fix owed >=30 min with no live fixer session is re-dispatched once, then escalated` in `scripts/conveyor/__tests__/reconcile-fix-dispatch.test.mjs` | Initial dispatch, one retry at +30, one escalation after the next missed window. |
 | 2: stale claim release and one escalation | `releases a real stale claim only after 30 minutes and never treats an absent record as stale`, plus `a %s release persists its reservation and escalates once without retrying` in the same file | No early release; refused/thrown release consumes the allowance across later ticks, including persisted sidecar IO. |
-| 3: babysit-label follow-up | `owed-fix-babysit-followup-record` in `backlog/xo73io1-verify-owed-fix-default-io-and-live-acceptance.md` | Pending: record the external follow-up's identifier, owner and assertion. This local card tracks the missing verification. |
+| 3: babysit-label follow-up | `owed-fix-babysit-followup-record` in #xo73io1 | Pending: record the external follow-up's identifier, owner and assertion. This local card tracks the missing verification. |
 | 4: live proof after prototype load | `owed-fix-live-7307-or-7179` in that card | Pending: record exact deployed/PR heads and timed release, dispatch, suppression and escalation observations on PR #7336. Hermetic tests are not live proof. |
 
 The default-IO smoke is separately owed in that card. Negative soak fixture
