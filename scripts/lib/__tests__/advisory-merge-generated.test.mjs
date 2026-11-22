@@ -95,7 +95,8 @@ it('worktree variant resolves a real doc-only merge and commits', () => {
   f.generate('--check');
 });
 
-it.each(['ours', 'theirs'])('refuses a generated modify/delete conflict when %s deleted the doc', branch => {
+it.each([['ours', true], ['theirs', true], ['ours', false], ['theirs', false]])(
+  'takes deletion when %s deleted the doc (commit=%s)', (branch, commit) => {
   const f = setup();
   f.ok(['checkout', '-q', branch]);
   rmSync(join(f.root, DOC));
@@ -104,12 +105,16 @@ it.each(['ours', 'theirs'])('refuses a generated modify/delete conflict when %s 
   f.ok(['checkout', '-q', 'ours']);
   f.cur = f.ok(['rev-parse', 'HEAD']);
   const before = snapshot(f);
-  expect(advisory.resolveAdvisoryConflicts(f)).toBeNull();
+  const result = advisory.resolveAdvisoryConflicts(f);
+  expect(result).toMatchObject({ ok: true });
+  expect(f.ok(['ls-tree', result.tree, '--', DOC])).toBe('');
   expect(snapshot(f)).toEqual(before);
   expect(f.git(['merge', '--no-edit', 'theirs']).status).toBe(1);
-  const stopped = snapshot(f);
-  expect(advisory.resolveAdvisoryInWorktree({ git: f.git, cwd: f.root })).toBe(false);
-  expect(snapshot(f)).toEqual(stopped);
+  expect(advisory.resolveAdvisoryInWorktree({ git: f.git, cwd: f.root, commit })).toBe(true);
+  expect(f.ok(['ls-files', '--', DOC])).toBe('');
+  expect(existsSync(join(f.root, DOC))).toBe(false);
+  expect(f.ok(['diff', '--name-only', '--diff-filter=U'])).toBe('');
+  f.generate('--check');
 });
 
 it.each(['ours', 'theirs'])('refuses a symlink doc on %s in both resolvers', branch => {
@@ -208,6 +213,9 @@ const negatives = [
   ['N1 input JSON conflicted', { conflict: 'scripts/settings/seed.json' }],
   ['N2 closure module conflicted', { conflict: CLOSURE[1] }],
   ['N3 bad metadata', {}, f => f.json('scripts/lib/settings-registry-metadata.json', {})],
+  ['deleted doc with bad metadata', {}, f => { rmSync(join(f.root, DOC)); f.json('scripts/lib/settings-registry-metadata.json', {}); }],
+  ['deleted doc with closure drift', {}, f => { rmSync(join(f.root, DOC)); f.write(CLOSURE[1], '// drift'); }],
+  ['deleted doc with source conflict', { conflict: 'source.txt' }, f => rmSync(join(f.root, DOC))],
   ['N4 generator hangs and is killed', {}, f => f.write(CLOSURE[0], 'setInterval(() => {}, 1000);')], // keepalive-helper-ok: candidate generator text is never executed (closure mismatch refuses first)
   ['N5 source conflict', { conflict: 'source.txt' }],
   ['N6 check disagrees', {}, f => f.write(CLOSURE[0], `import {writeFileSync} from 'node:fs';
@@ -276,7 +284,7 @@ for (const [name, options, mutate] of negatives) it(`${name}: both resolvers ref
   expect(worktreeProbe.result).toBe(false);
   expect(snapshot(f)).toEqual(stopped);
   const generatorCalls = [...treeProbe.calls, ...worktreeProbe.calls];
-  if (/^N[3468]|^oversized/.test(name)) expect(generatorCalls.length).toBeGreaterThan(0);
+  if (/^N[3468]|^oversized|^deleted doc with bad metadata/.test(name)) expect(generatorCalls.length).toBeGreaterThan(0);
   else expect(generatorCalls).toEqual([]);
   expect(existsSync(join(f.root, 'escaped-marker'))).toBe(false);
   for (const { args, opts, result } of generatorCalls) {
@@ -327,4 +335,14 @@ it('trusted closure drift guard follows static local imports and pins the exact 
     inputs: ['scripts/settings/', 'scripts/dispatch-settings.json', 'scripts/lib/settings-registry-metadata.json',
       'scripts/lib/delivery-platform-preferences.json', 'scripts/lib/delivery-priority-settings.json'], argv: ['--write'] });
   expect(Object.isFrozen(advisory.GENERATED_MERGE_PATHS)).toBe(true);
+});
+
+it.each(['rm', 'commit'])('restores a modify/delete conflict when git %s fails', command => {
+  const f = setup();
+  f.ok(['rm', '--', DOC]); f.cur = f.commit('delete doc');
+  expect(f.git(['merge', '--no-edit', 'theirs']).status).toBe(1);
+  const before = snapshot(f);
+  const git = (args, opts) => args[0] === command ? { status: 1, stdout: '' } : f.git(args, opts);
+  expect(advisory.resolveAdvisoryInWorktree({ git, cwd: f.root })).toBe(false);
+  expect(snapshot(f)).toEqual(before);
 });

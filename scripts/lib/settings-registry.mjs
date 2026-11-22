@@ -1,6 +1,6 @@
 /**
  * @file scripts/lib/settings-registry.mjs
- * @description Declared settings inventory and documentation drift guard; never resolves host overrides.
+ * @description Declared settings inventory and deterministic documentation renderer; never resolves host overrides.
  * Usage: node scripts/lib/settings-registry.mjs --write | --check
  * API: buildRegistry({ root }), renderMarkdown(registry). Descriptions belong in the metadata JSON.
  */
@@ -118,7 +118,7 @@ export function renderMarkdown(registry) {
     'R1076: behavior belongs in product settings. The constants below are candidates to settle, not conversions or approved policy changes. Pass C records environment override availability in its instant column; that alone does not prove live reload.', '',
     '## How to change a setting', '',
     'The policy layers are standard → platform → tool/repo → env → operator-db; see [policy-cascade.mjs](../../scripts/lib/policy-cascade.mjs). Readers opt into the cascade; this inventory does not assert every declaration uses every layer. Environment overrides require reader support and process environment propagation.', '',
-    'For repo defaults, edit the owner file through a PR and rebuild the consuming daemon. Add or update metadata in scripts/lib/settings-registry-metadata.json, then run `node scripts/lib/settings-registry.mjs --write`. Verify with `node scripts/lib/settings-registry.mjs --check`. Missing declarations or invalid evidence block generation; repair the named file before regenerating.', '',
+    'For repo defaults, edit the owner file through a PR and rebuild the consuming daemon. Add or update metadata in scripts/lib/settings-registry-metadata.json, then run `npm run docs:settings-registry` to generate the local, gitignored doc; never commit it. Verify with `node scripts/lib/settings-registry.mjs --check`. Missing declarations or invalid evidence block generation; repair the named file before regenerating.', '',
     '## Summary', '',
     `- Top-level keys: ${unique.length} (${rows.length} declaration rows).`,
     `- Declared leaves: ${rows.reduce((sum, row) => sum + row.leafCount, 0)} (platform copies counted separately).`,
@@ -154,6 +154,6 @@ if (process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1]
     if (mode.length !== 1 || !['--write', '--check'].includes(mode[0])) throw Error('usage: node scripts/lib/settings-registry.mjs --write | --check');
     const content = renderMarkdown(buildRegistry({ root: ROOT }));
     if (mode[0] === '--write') writeFileSync(join(ROOT, DOC), content);
-    else if (readFileSync(join(ROOT, DOC), 'utf8') !== content) throw Error(`${DOC} is stale; run node scripts/lib/settings-registry.mjs --write`);
+    else if (renderMarkdown(buildRegistry({ root: ROOT })) !== content) throw Error('Settings registry render is not deterministic; repair the generator before regenerating');
   } catch (error) { console.error(error.message); process.exitCode = 1; }
 }

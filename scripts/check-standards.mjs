@@ -2255,7 +2255,7 @@ try {
 } catch (error) {
   err(`Settings registry check failed: ${error.stderr || error.message}`);
 }
-mark("7a. Settings registry documentation must be in sync");
+mark("7a. Settings registry metadata must be valid and rendering deterministic");
 // ── 8. No compiled artifacts shadowing TS sources ────────────────────────────
 // A stray `tsc <file>` (or an editor "compile on save") emits `.js`/`.d.ts` next to the `.ts`/
 // `.tsx` source, ignoring tsconfig `outDir`. Because Vite/vitest resolve extensionless imports
