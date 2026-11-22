@@ -36,9 +36,16 @@ export function resolveFreeScopeSettings({ env = process.env, platform, log } = 
   if (resolved.invalid.length) throw new TypeError(`free-scope: invalid staleAfterMinutes setting: ${resolved.invalid.join('; ')}`);
   return { staleAfterMinutes: resolved.value.staleAfterMinutes, source: resolved.sources.staleAfterMinutes };
 }
-export function readRegistry(file) {
+/** `required: true` makes a missing registry an error: absence then proves nothing about who holds a scope. */
+export function readRegistry(file, { required = false } = {}) {
   let source;
-  try { source = fs.readFileSync(file, 'utf8'); } catch (error) { if (error.code === 'ENOENT') return []; throw error; }
+  try { source = fs.readFileSync(file, 'utf8'); } catch (error) {
+    if (error.code === 'ENOENT') {
+      if (required) throw new Error(`free-scope: registry ${file} does not exist (set WE_AGENT_SCOPES_PATH, or create it as {"entries":[]})`);
+      return [];
+    }
+    throw error;
+  }
   try {
     const parsed = JSON.parse(source);
     const entries = Array.isArray(parsed) ? parsed : parsed?.entries;
@@ -147,11 +154,18 @@ export function readOpenPrs({ repos = DEFAULT_REPOS, exec, git = gitExec(), gitD
       const net = readNetFileSets({ dir: gitDirFor(repo), rows, git });
       const why = [];
       if (rows.length >= OPEN_PR_LIMIT) why.push(`open PR list hit the ${OPEN_PR_LIMIT}-row limit and may be truncated`);
-      for (const { number, title, url, files: listedFiles = [] } of rows) {
-        const listed = { ok: true, files: listedFiles.map((f) => f.path), added: listedFiles.filter((f) => f.changeType === 'ADDED').map((f) => f.path) };
+      for (const { number, title, url, files: listedFiles } of rows) {
+        // A row with no `files` array (or a malformed entry) is incomplete evidence, never an empty change set.
+        const wellFormed = Array.isArray(listedFiles) && listedFiles.every((f) => f && typeof f.path === 'string' && f.path);
+        const entries = wellFormed ? listedFiles : [];
+        // The list names only a rename's NEW path; its previous path is a file the PR also holds, and only the paged API reports it.
+        const hasRename = entries.some((f) => f.changeType === 'RENAMED');
+        // An EMPTY list is unverified too: no PR changes nothing, so it is what an unpopulated response looks like.
+        const listed = { ok: wellFormed && !hasRename && entries.length > 0, files: entries.map((f) => f.path), added: entries.filter((f) => f.changeType === 'ADDED').map((f) => f.path),
+          reason: !wellFormed || !entries.length ? 'the PR list gave no usable files' : 'the PR list omits a renamed file\'s previous path' };
         const netRead = net.get(number);
-        // The paginated API costs one call per PR, so only ask it when git failed AND the cheap list is capped.
-        const paged = !netRead?.ok && listed.files.length >= GH_LIST_FILE_CAP ? readPagedFiles({ repo, number, exec }) : undefined;
+        // The paginated API costs one call per PR, so only ask it when git failed AND the cheap list is capped or unusable.
+        const paged = !netRead?.ok && (!listed.ok || listed.files.length >= GH_LIST_FILE_CAP) ? readPagedFiles({ repo, number, exec }) : undefined;
         const choice = choosePrFileSet({ net: netRead, paged, listed });
         // An unresolved PR still holds every file it listed, but the snapshot is incomplete: never "free".
         const { files, added } = choice.source ? choice : listed;
@@ -162,7 +176,8 @@ export function readOpenPrs({ repos = DEFAULT_REPOS, exec, git = gitExec(), gitD
       if (why.length) unreadable.push({ repo, error: why.join('; ') });
     } catch (error) { unreadable.push({ repo, error: firstLine(error) }); }
   }
-  return { prs, unreadable };
+  // `repos` echoes what this read was asked to cover, so a caller can prove its declared repos were all in scope.
+  return { prs, unreadable, repos: [...repos] };
 }
 export function findCardFile(card, { root }) {
   const id = String(card).replace(/^#/, '');
@@ -187,9 +202,9 @@ export function readCardScope(card, { root }) {
   return entries;
 }
 export function collectFreeScope({ files = '', card = '', root = repoRoot, repos = DEFAULT_REPOS,
-  env = process.env, now = Date.now, exec = ghExec(env), registryPath = defaultRegistryPath(env),
+  env = process.env, now = Date.now, exec = ghExec(env), registryPath = defaultRegistryPath(env), requireRegistry = false,
   git = gitExec(), gitDirFor = (repo) => defaultGitDirFor(repo, { root, env }) } = {}) {
   const scope = [...new Set([...files.split(','), ...(card ? readCardScope(card, { root }) : [])].map((f) => qualifyFile(f)).filter(Boolean))];
   if (!scope.length) throw new TypeError('free-scope: give --files=a,b or --card=<id>');
-  return { files: scope, nowMs: now(), ...readOpenPrs({ repos, exec, git, gitDirFor }), agents: readRegistry(registryPath) };
+  return { files: scope, nowMs: now(), ...readOpenPrs({ repos, exec, git, gitDirFor }), agents: readRegistry(registryPath, { required: requireRegistry }) };
 }
