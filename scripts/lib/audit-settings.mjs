@@ -121,6 +121,8 @@ const FLOOR_SETTINGS = Object.freeze([
   // The legacy dispatch settings file as a glob: this module never reads it, and settings-files.test.mjs counts a quoted
   // literal of its full name as a direct reader.
   'scripts/settings/stand-down.json', 'scripts/settings/fix.json', 'scripts/review-settings.json', 'scripts/dispatch-settings.*',
+  // The advisory-merge floor module names it as a regeneration input of the settings registry doc.
+  'scripts/lib/settings-registry-metadata.json',
   'scripts/lib/delivery-platform-preferences.json', 'scripts/lib/delivery-priority-settings.json', 'scripts/lib/poc-branches.json',
   'scripts/exec-output-baseline.json', 'scripts/pr-comment-read-baseline.json', 'scripts/check-standards.contract.json',
   'scripts/lib/dispatch-routing-policy.json', 'scripts/ci/test-timings.json', 'scripts/lib/model-probation.json', 'scripts/lib/swept-repos.json',
