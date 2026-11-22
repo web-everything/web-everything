@@ -1143,10 +1143,12 @@ Promotion is confined to the existing shadow correctness route: an explicit Clau
 Gemini routing disable refuses replacement, and dispatch rechecks live controls and cap kill switches.
 An invalid `promotionReplaces` override refuses and logs. Other Carbon non-shadow roles, including
 red-team and advisory seats, remain refused regardless of the promotion flag. Counted Carbon answers
-reuse the shadow field/coordinate validator and require an observed matching served model, actual
-findings evidence, no abstention or timeout (including salvaged timeout answers), and a successful
-ledger append. Any failure falls back to Claude; empty clean answers are conservatively rechecked
-by Claude rather than counted as Carbon accepts.
+validate against the server-owned review JSON schema with no coercion or additional properties.
+Every finding requires a non-empty file and positive integer line, and all findings must survive
+`scopeFindingsToCitedFiles` admission against the pinned diff. Zero findings require a completed,
+non-error `read_file` of a diff path in the served transcript; summary phrases do not prove inspection.
+An observed matching served model, no timeout (including salvaged answers), and a successful ledger
+append remain required. Any missing or invalid evidence falls back to Claude.
 The pure `assertCrossVendorPanel` helper retains its existing cross-vendor check.
 
 The agy mandatory-seat shadows are off by default (operator 2026-10-16).

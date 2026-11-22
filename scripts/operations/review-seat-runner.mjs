@@ -1,3 +1,5 @@
+import { readFileSync } from 'node:fs';
+import { scopeFindingsToCitedFiles } from '../lib/jury-core.mjs';
 import { carbonNonShadowAllowed } from '../lib/review-seat-settings.mjs';
 /**
  * review-seat-runner.mjs — RUN ONE REVIEW SEAT ON THE PROVIDER ITS SETTING NAMES (card 84, review half).
@@ -23,7 +25,7 @@ import { carbonNonShadowAllowed } from '../lib/review-seat-settings.mjs';
  * Every answer this returns carries `seatProvider: {provider, ...}` so the run record says who actually judged.
  */
 import { runAgyReviewJuror, scrubPaths } from '../lib/agy-review-juror.mjs';
-import { appendShadowRow, buildShadowRow, compareShadowAnswers, isQuotaHeldShadow, validShadowAnswer } from '../lib/review-shadow-agreement.mjs';
+import { appendShadowRow, buildShadowRow, compareShadowAnswers, isQuotaHeldShadow, validShadowAnswer, hasSuccessfulDiffRead } from '../lib/review-shadow-agreement.mjs';
 import { CARBON_SHADOW_CAP_ENV, resolveCarbonShadowCap, resolveProviderCap, resolveRoutingProviderCap, readReviewSeatPolicy } from '../lib/review-seat-caps.mjs';
 import { reserveShadowSession } from '../lib/review-shadow-budget.mjs';
 import { appendPromotionRow, promotionAttempt } from '../lib/review-carbon-promotion.mjs';
@@ -49,7 +51,7 @@ export const SEAT_RUN_MODES =Object.freeze(['agy', 'shadow']);
  */
 export async function runSeatWithProvider(request, {
   claudeJudge, unwrap, wrap, cwd, agyJuror = runAgyReviewJuror, appendRow = appendShadowRow, now = () => Date.now(),
-  log = (m) => console.error(m), reserveSession = reserveShadowSession, appendPromotion = appendPromotionRow, readSeatSettings = readReviewSeatPolicy, readRoutingPolicy = readLiveRoutingPolicy,
+  log = (m) => console.error(m), reserveSession = reserveShadowSession, appendPromotion = appendPromotionRow, readSeatSettings = readReviewSeatPolicy, readRoutingPolicy = readLiveRoutingPolicy, readTranscript = path => readFileSync(path, 'utf8'),
 }) {
   const { seatProvider: directive, ...plain } = request;
   if (!directive || !SEAT_RUN_MODES.includes(directive.mode)) {
@@ -167,9 +169,16 @@ export async function runSeatWithProvider(request, {
   if (promoted && agyRun.status === 'ok') {
     const reasons = [];
     if (typeof agyRun.sessionId !== 'string' || !agyRun.sessionId.trim()) reasons.push('missing Carbon session identity');
-    if (!validShadowAnswer(agyRun.value)) reasons.push('invalid Carbon answer fields or finding coordinates');
-    else if (!agyRun.value.findings.length || /review not performed|did not review|unable to review|cannot review|not reviewed/i.test(agyRun.value.summary)) {
-      reasons.push('Carbon abstained or returned no diff findings evidence');
+    if (!validShadowAnswer(agyRun.value, { counted: true, schema: plain.shape })) reasons.push('invalid Carbon answer schema or finding coordinates');
+    else {
+      const scoped = scopeFindingsToCitedFiles(agyRun.value.findings, { scope: directive.citationScope });
+      if (!scoped.enforced || scoped.admitted.length !== agyRun.value.findings.length) {
+        reasons.push('Carbon citation scope unavailable or findings withheld as out-of-scope');
+      } else if (!scoped.admitted.length) {
+        let inspected = false;
+        try { inspected = Boolean(agyRun.transcriptFile) && hasSuccessfulDiffRead(readTranscript(agyRun.transcriptFile), directive.citationScope); } catch { /* unreadable evidence refuses */ }
+        if (!inspected) reasons.push('Carbon returned zero findings without a successful diff read_file');
+      }
     }
     if (agyRun.servedModel !== model) reasons.push('observed Carbon model identity missing or mismatched');
     if (agyRun.timedOut === true || agyRun.telemetry?.timedOut === true) reasons.push('Carbon timed out; salvaged answer refused');

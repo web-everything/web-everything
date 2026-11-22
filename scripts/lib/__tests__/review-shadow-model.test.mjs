@@ -8,6 +8,7 @@ import { CARBON_SHADOW_CAP_ENV, resolveCarbonShadowCap, resolveProviderCap } fro
 import { assertCrossVendorPanel, vendorOfModel, settingsFromRoutingPolicy, shadowSeatStatus, seatProviderDirective, loadReviewSeatSettings } from '../review-seat-provider.mjs';
 import { DEFAULT_ROUTING_POLICY, validateRoutingPolicy } from '../dispatch-routing-policy.mjs';
 import { buildShadowRow, compareShadowAnswers, summarizeShadowAgreement, summarizeCarbonPromotion, renderShadowReport } from '../review-shadow-agreement.mjs';
+import { REVIEW_JUDGE_SHAPE } from '../../operations/review-pr.mjs';
 import { runSeatWithProvider } from '../../operations/review-seat-runner.mjs';
 import { deriveVerdict } from '../jury-core.mjs';
 import { buildTrialReport } from '../agy-shadow-trial-report.mjs';
@@ -594,8 +595,8 @@ describe('one counted Carbon correctness seat', () => {
     if (agyRun === ok) agyRun = { ...ok, servedModel: carbon };
     const rows = [];
     const claudeJudge = vi.fn(async () => ({ value: claudeAnswer }));
-    const answer = await runSeatWithProvider({ lens: 'correctness', runId: 'promotion-test',
-      seatProvider: { ...seatProviderDirective(settings(), 'correctness', highCarePr), repo: 'o/r', pr: 7, head: 'head' } }, {
+    const answer = await runSeatWithProvider({ lens: 'correctness', runId: 'promotion-test', shape: REVIEW_JUDGE_SHAPE,
+      seatProvider: { ...seatProviderDirective(settings(), 'correctness', highCarePr), repo: 'o/r', pr: 7, head: 'head', citationScope: [finding.file] } }, {
       cwd: '.', claudeJudge, unwrap: x => x, wrap: value => value,
       agyJuror: async () => { if (agyRun instanceof Error) throw agyRun; return agyRun; },
       // This fixture exercises standard caps, independent of operator platform preferences.
@@ -710,15 +711,15 @@ describe('promotion verdict authorization audit', () => {
     return validateRoutingPolicy(policy);
   };
   const selection = policy => loadReviewSeatSettings({ policy, aiRouting: {}, log: () => {} });
-  async function attempt(result = good, { lens = 'correctness', promoted = true, policy = DEFAULT_ROUTING_POLICY, append = () => true } = {}) {
+  async function attempt(result = good, { lens = 'correctness', promoted = true, policy = DEFAULT_ROUTING_POLICY, append = () => true, scope = [finding.file], transcript = '' } = {}) {
     vi.stubEnv('WE_REVIEW_SHADOW_AGY_PROMOTED', 'true');
     const rows = [], calls = [];
-    const answer = await runSeatWithProvider({ lens, runId: 'audit', seatProvider: {
-      mode: 'agy', promoted, model: carbon, onEscape: 'claude', repo: 'o/r', pr: 7, head: 'head',
+    const answer = await runSeatWithProvider({ lens, runId: 'audit', shape: REVIEW_JUDGE_SHAPE, seatProvider: {
+      mode: 'agy', promoted, model: carbon, onEscape: 'claude', repo: 'o/r', pr: 7, head: 'head', citationScope: scope,
     } }, {
       cwd: '.', unwrap: x => x, wrap: value => value,
       claudeJudge: async () => { calls.push('claude'); return { value: claudeAnswer }; },
-      agyJuror: async () => { calls.push('carbon'); return result; },
+      agyJuror: async () => { calls.push('carbon'); return result; }, readTranscript: () => transcript,
       readRoutingPolicy: () => policy, readSeatSettings: () => ({ tool: {}, platform: {} }),
       appendPromotion: row => { rows.push(row); return append(row); }, reserveSession: () => ({ allowed: true }), log: () => {},
     });
@@ -773,4 +774,55 @@ describe('promotion verdict authorization audit', () => {
     fellBack(result);
     expect(result.calls).toEqual(['claude']);
   });
+  it.each([
+    { ...good.value, outcome: 'fixed' },
+    { ...good.value, findings: [{ ...finding, outcome: 'fixed' }] },
+    { ...good.value, findings: [{ ...finding, preventionCaptured: 'false' }] },
+    { ...good.value, findings: [{ ...finding, introduced: 'false' }] },
+    { ...good.value, findings: [{ ...finding, verdict: 'ACCEPT' }] },
+    { ...good.value, findings: [{ ...finding, disposition: 'accept' }] },
+    { ...good.value, findings: [{ ...finding, citationScope: 'in-scope' }] },
+  ])('counted Carbon rejects properties and types outside the strict review schema: %j', async value => {
+    const result = await attempt({ ...good, value });
+    fellBack(result);
+    expect(result.rows[0]).toMatchObject({ fallback: true, agyVerdict: null });
+  });
+  it.each([{ scope: [] }, { scope: null }, { scope: ['elsewhere.mjs'] }])('citation admission refuses missing or out-of-scope evidence before Carbon counts: %j', async ({ scope }) => {
+    const result = await attempt(good, { scope });
+    fellBack(result);
+    expect(result.rows[0]).toMatchObject({ fallback: true, agyVerdict: null });
+  });
+  it('discarding even one out-of-scope Carbon finding requires the Claude seat', async () => {
+    fellBack(await attempt({ ...good, value: { ...good.value, findings: [finding, { ...finding, file: 'elsewhere.mjs' }] } }));
+  });
+  it.each([
+    { summary: 'could not inspect the diff' },
+    { summary: 'could not inspect the diff', file: finding.file },
+    { summary: 'could not inspect the diff', file: '', line: 1 },
+  ])('uncited counted placeholders cannot satisfy evidence admission: %j', async placeholder => {
+    fellBack(await attempt({ ...good, value: { summary: 'Reviewed', findings: [placeholder] } }));
+  });
+  const readTrace = (path, state = 'DONE', extra = {}) => [
+    { event: 'step_update', step_update: { step_index: 1, step_type: 'tool', tool_name: 'read_file', state, tool_info: { parameters: { AbsolutePath: path } }, ...extra } },
+    { event: 'result', result: { status: 'SUCCESS' } },
+  ].map(x => JSON.stringify(x)).join('\n');
+  it.each([
+    '',
+    readTrace('elsewhere.mjs'),
+    readTrace(finding.file, 'ACTIVE'),
+    readTrace(finding.file, 'DONE', { status: 'TOOL_ERROR' }),
+    [
+      { event: 'step_update', step_update: { step_index: 1, step_type: 'tool', tool_name: 'read_file', state: 'ACTIVE', tool_info: { parameters: { AbsolutePath: finding.file } } } },
+      { event: 'step_update', step_update: { step_index: 1, step_type: 'finish', state: 'DONE' } },
+      { event: 'result', result: { status: 'SUCCESS' } },
+    ].map(x => JSON.stringify(x)).join('\n'),
+  ])('a clean Carbon answer without a successful diff read still runs Claude: %j', async transcript => {
+    fellBack(await attempt({ ...good, transcriptFile: 'served.jsonl', value: { summary: 'Clean', findings: [] } }, { transcript }));
+  });
+  it('zero findings can count only with a served successful read_file of a diff path', async () => {
+    const result = await attempt({ ...good, transcriptFile: 'served.jsonl', value: { summary: 'Clean', findings: [] } }, { transcript: readTrace(finding.file) });
+    expect(result.calls).toEqual(['carbon']);
+    expect(result.answer.seatProvider.provider).toBe('agy');
+  });
+
 });

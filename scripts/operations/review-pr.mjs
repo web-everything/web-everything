@@ -1889,6 +1889,7 @@ export function buildReviewAntigravityJudgeRequest({ read, aim = '' }) {
 function withSeatContext(directive, read, seat) {
   return {
     ...directive, seat, repo: read.repo, pr: read.pr, head: read.netBasis?.rev ?? null,
+    ...(directive.promoted ? { citationScope: read.degraded === true ? [] : read.netChangedFiles } : {}),
     ...(Array.isArray(read.findingIdentity) && read.findingIdentity.length ? { identityTable: read.findingIdentity } : {}),
   };
 }
