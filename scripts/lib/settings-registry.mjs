@@ -74,8 +74,9 @@ export function readMetadata({ root = ROOT, problems } = {}) {
       if (!Object.hasOwn(metadata, section)) metadata[section] = {};
       if (!object(metadata[section])) throw Error('expected JSON object');
       for (const file of readdirSync(join(root, path)).sort(compare)) {
-        const key = decodeURIComponent(file.slice(0, -5));
-        const encoded = encodeURIComponent(key).replace(/[!'()*]/g, c => `%${c.charCodeAt(0).toString(16).toUpperCase()}`);
+        // Filenames stay within [A-Za-z0-9._-] (the audit-path grammar): `_` replaces the percent sign, so a literal `_` is escaped too.
+        const key = decodeURIComponent(file.slice(0, -5).replaceAll('_', '%'));
+        const encoded = encodeURIComponent(key).replace(/[!'()*_]/g, c => `%${c.charCodeAt(0).toString(16).toUpperCase()}`).replaceAll('%', '_');
         if (file !== `${encoded}.json`) throw Error(`invalid metadata filename: ${file}`);
         if (Object.hasOwn(metadata[section], key)) { errors.push(`duplicate metadata key: ${section}.${key}`); continue; }
         Object.defineProperty(metadata[section], key, { value: readObject(root, `${path}/${file}`, errors), enumerable: true, configurable: true });
@@ -182,7 +183,7 @@ export function renderMarkdown(registry) {
     'R1076: behavior belongs in product settings. The constants below are candidates to settle, not conversions or approved policy changes. Pass C records environment override availability in its instant column; that alone does not prove live reload.', '',
     '## How to change a setting', '',
     'The policy layers are standard → platform → tool/repo → env → operator-db; see [policy-cascade.mjs](../../scripts/lib/policy-cascade.mjs). Readers opt into the cascade; this inventory does not assert every declaration uses every layer. Environment overrides require reader support and process environment propagation.', '',
-    'For repo defaults, edit the owner file through a PR and rebuild the consuming daemon. Add or update `scripts/lib/settings-registry-metadata.d/settings/<encoded-key>.json` (`capacityLeaves/<encoded-key>.json` for capacity metadata); encode keys with encodeURIComponent and additionally percent-escape !, apostrophe, (, ), and *. Then run `node scripts/lib/settings-registry.mjs --write`. Verify with `node scripts/lib/settings-registry.mjs --check`. Missing declarations or invalid evidence block generation; repair the named file before regenerating.', '',
+    'For repo defaults, edit the owner file through a PR and rebuild the consuming daemon. Add or update `scripts/lib/settings-registry-metadata.d/settings/<encoded-key>.json` (`capacityLeaves/<encoded-key>.json` for capacity metadata); encode keys with encodeURIComponent, additionally percent-escape !, apostrophe, (, ), * and _, then write every percent sign as an underscore. Then run `node scripts/lib/settings-registry.mjs --write`. Verify with `node scripts/lib/settings-registry.mjs --check`. Missing declarations or invalid evidence block generation; repair the named file before regenerating.', '',
     '## Summary', '',
     `- Top-level keys: ${unique.length} (${rows.length} declaration rows).`,
     `- Declared leaves: ${rows.reduce((sum, row) => sum + row.leafCount, 0)} (platform copies counted separately).`,

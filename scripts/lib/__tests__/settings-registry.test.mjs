@@ -18,7 +18,7 @@ import { CAPACITY_LEAVES } from '../operator-override-reader.mjs';
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '../../..');
 const META = 'scripts/lib/settings-registry-metadata.json';
 const META_DIR = 'scripts/lib/settings-registry-metadata.d';
-const filename = key => encodeURIComponent(key).replace(/[!'()*]/g, c => `%${c.charCodeAt(0).toString(16).toUpperCase()}`) + '.json';
+const filename = key => encodeURIComponent(key).replace(/[!'()*_]/g, c => `%${c.charCodeAt(0).toString(16).toUpperCase()}`).replaceAll('%', '_') + '.json';
 function fixture(t) {
   const root = mkdtempSync(join(tmpdir(), 'settings-registry-'));
   t.onTestFinished(() => rmSync(root, { recursive: true, force: true }));
@@ -324,14 +324,16 @@ test('metadata directory rejects symlinked roots, sections and files and other n
 });
 test('filenames round-trip punctuation, percent, slash and Unicode keys in deterministic order', t => {
   const f = fixture(t); split(f);
-  const keys = ['z', 'a.b', '$*', 'slash/\\percent%', 'café', '__proto__'];
+  const keys = ['z', 'a.b', '$*', 'slash/\\percent%', 'café', '__proto__', 'snake_case', '$description', '*'];
+  // Every filename stays inside the audit-path grammar, so no percent sign ever reaches a tracked path.
+  for (const key of keys) assert.match(filename(key), /^[A-Za-z0-9._-]+$/);
   for (const key of keys) f.write(`${META_DIR}/settings/${filename(key)}`, { description: key });
   const metadata = readMetadata({ root: f.root });
   for (const key of keys) assert.equal(metadata.settings[key].description, key);
   assert.deepEqual(Object.keys(metadata.settings), Object.keys(metadata.settings).sort());
 });
 test('malformed names, unexpected entries and unreadable per-key JSON fail closed with repair paths', t => {
-  for (const name of ['bad%.json', '%61lpha.json', 'notes.txt']) {
+  for (const name of ['bad%.json', '%61lpha.json', '_61lpha.json', 'a_b.json', 'notes.txt']) {
     const f = fixture(t); f.write(`${META_DIR}/settings/${name}`, {});
     assert.throws(() => renderMarkdown(f.build()), /settings-registry-metadata\.d/);
   }
