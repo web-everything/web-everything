@@ -711,14 +711,14 @@ describe('first live shadow run (PR #4133) — the shared checkout\'s own churn 
   });
 });
 
-it('an unpromoted Carbon advisory route retains no live non-shadow seat', () => {
-  vi.stubEnv('WE_REVIEW_SHADOW_AGY_PROMOTED', 'false');
+it.each(['false', 'true'])('Carbon advisory opt-in uses the resolved promotion without caller context (%s)', promoted => {
+  vi.stubEnv('WE_REVIEW_SHADOW_AGY_PROMOTED', promoted);
   try {
     const settings = settingsFromRoutingPolicy(withEntries({
       'review-seat:advisory:agy-correctness': { provider: 'agy-gemini', model: 'gemini-4-carbon-high', fallback: [] },
     }), { aiRouting: {} });
     expect(settings.agyModel).toBe('gemini-4-carbon-high');
-    expect(settings.agyCorrectnessAdvisory).toBe(false);
+    expect(settings.agyCorrectnessAdvisory).toBe(promoted === 'true');
   } finally {
     vi.unstubAllEnvs();
   }
@@ -779,4 +779,19 @@ describe('carbon shadow seat vs the agy-gemini live seat cap (R1062a)', () => {
     const { reserved } = await run('shadow', 'gemini-4-carbon-high', { WE_REVIEW_SEAT_CAP_CARBON_SHADOW: '5' }, { dailyCap: 7 });
     expect(reserved).toEqual([7]);
   });
+});
+
+it('promoted Carbon advisory dispatch works without a counted promotion directive', async () => {
+  vi.stubEnv('WE_REVIEW_SHADOW_AGY_PROMOTED', 'true');
+  vi.stubEnv('WE_REVIEW_SEAT_CAP_AGY_GEMINI', '20');
+  const agyJuror = vi.fn(async () => ({ status: 'ok', sessionId: 'advisory-carbon', value: { summary: 'Carbon advisory', findings: [FINDING] } }));
+  const claudeJudge = vi.fn();
+  try {
+    const { value } = unwrapJudgeOutcome(await runSeatWithProvider({ ...REQUEST, lens: 'agy-correctness',
+      seatProvider: { mode: 'agy', model: 'gemini-4-carbon-high', onEscape: 'skip' } }, io({ agyJuror, claudeJudge })));
+    expect(agyJuror).toHaveBeenCalledOnce();
+    expect(claudeJudge).not.toHaveBeenCalled();
+    expect(value.findings).toEqual([FINDING]);
+    expect(value.carbonBlocking).toBeUndefined();
+  } finally { vi.unstubAllEnvs(); }
 });

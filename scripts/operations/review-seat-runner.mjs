@@ -92,7 +92,9 @@ export async function runSeatWithProvider(request, {
       logReviewSeat(log, `review-seat: agy ${directive.mode} skipped: ${reason}`);
       return { status: 'skipped', reasons: [reason] };
     }
-    if (directive.mode !== 'shadow' && !carbonNonShadowAllowed(runModel, { log, promoted, lens: plain.lens })) {
+    // Advisory opt-in uses the shared promotion gate; counted Carbon still requires the blocking-only correctness directive.
+    if (directive.mode !== 'shadow' && (!carbonNonShadowAllowed(runModel, { log })
+      || (/carbon/i.test(String(runModel)) && !promoted && plain.lens !== 'agy-correctness'))) {
       const reason = 'Carbon not promoted — non-shadow seat refused';
       logReviewSeat(log, `review-seat: agy skipped: ${reason}`);
       return { status: 'skipped', reasons: [reason] };

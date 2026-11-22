@@ -108,7 +108,8 @@ describe('operator routing overrides', () => {
         vi.stubEnv('WE_REVIEW_SHADOW_AGY_PROMOTED', 'true');
         try {
           const plan = reviewSeatRoutes({ routingPolicy: policy, available: ['agy-gemini'] });
-          expect(plan.routes.find(route => route.key === taskType)).toBeUndefined();
+          expect(plan.routes.find(route => route.key === taskType)).toMatchObject({ provider: 'agy-gemini' });
+          expect(plan.routes.some(route => ['codex', 'agy-claude'].includes(route.provider))).toBe(false);
         } finally { vi.unstubAllEnvs(); }
       }
     });

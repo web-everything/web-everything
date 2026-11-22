@@ -254,10 +254,7 @@ export function resolveShadowPromoted({ env = process.env, file = REVIEW_SETTING
 }
 
 export function carbonNonShadowAllowed(model, options) {
-  return !/carbon/i.test(String(model)) || (options?.promoted === true && options?.lens === 'correctness'
-    && resolveShadowPromoted(options).value === true
-    && resolveShadowPromotionReplaces(options).value === 'claude'
-    && resolveReviewSeatSafeguards(options).value.shadowEnabled === true);
+  return !/carbon/i.test(String(model)) || resolveShadowPromoted(options).value === true;
 }
 
 const loggedExternalJurors = new Set();

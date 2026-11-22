@@ -3542,13 +3542,13 @@ describe('#3383 — the opt-in Antigravity review seat (judgeAntigravityReview)'
       expect(antigravityReviewFromEnv({ [ANTIGRAVITY_REVIEW_ENV_VAR]: '' }, { isOnProbation: () => true })).toBe(false);
     });
 
-    it('explicit advisory opt-in cannot broaden a correctness-only Carbon promotion', () => {
-      expect(antigravityReviewFromEnv({ [ANTIGRAVITY_REVIEW_ENV_VAR]: '1', WE_REVIEW_SHADOW_AGY_PROMOTED: 'true' }, { isOnProbation: () => false })).toBe(false);
+    it('explicit advisory opt-in enables promoted Carbon without probation', () => {
+      expect(antigravityReviewFromEnv({ [ANTIGRAVITY_REVIEW_ENV_VAR]: '1', WE_REVIEW_SHADOW_AGY_PROMOTED: 'true' }, { isOnProbation: () => false })).toBe(true);
     });
 
     // #3383 — the probation default, mirroring both Codex seats' own.
-    it('an advisory probation policy cannot broaden correctness-only Carbon promotion', () => {
-      expect(antigravityReviewFromEnv({ WE_REVIEW_SHADOW_AGY_PROMOTED: 'true' }, { isOnProbation: () => true, readFile: () => JSON.stringify({ advisorySeats: { antigravityReview: 'probation' } }) })).toBe(false);
+    it('an explicit advisory probation policy enables promoted Carbon only on probation', () => {
+      expect(antigravityReviewFromEnv({ WE_REVIEW_SHADOW_AGY_PROMOTED: 'true' }, { isOnProbation: () => true, readFile: () => JSON.stringify({ advisorySeats: { antigravityReview: 'probation' } }) })).toBe(true);
       expect(antigravityReviewFromEnv({}, { isOnProbation: () => false })).toBe(false);
     });
 
@@ -4348,20 +4348,33 @@ describe('card 84 — review.seatProvider.<lens> and the advisory agy-correctnes
     expect(requests.judge.seatProvider).toBeUndefined();
   });
 
-  it('seats the advisory agy-correctness juror: agy-only, skip on escape, never in the verdict basis', () => {
-    const { declaration, registry } = registryFor({}, { seatSettings: AGY_SEAT_SETTINGS });
+  it.each(['claude-opus-5-5-high', 'gemini-4-carbon-high'])('seats advisory %s: agy-only, skip on escape, never in the verdict basis', model => {
+    const { declaration, registry } = registryFor({}, { seatSettings: { ...AGY_SEAT_SETTINGS, agyModel: model } });
     expect(declaration.steps.map((s) => s.name)).toContain('judgeAgyCorrectness');
     expect(ADVISORY_SEAT_STEPS).toContain('judgeAgyCorrectness');
     const { run, requests } = atConfirm({
       registry, input: BASE_INPUT, id: 'run-seat-agy-adv', answers: { judgeAgyCorrectness: BLOCKING_ANSWER },
     });
-    expect(requests.judgeAgyCorrectness.seatProvider).toMatchObject({ mode: 'agy', onEscape: 'skip', model: 'claude-opus-5-5-high' });
+    expect(requests.judgeAgyCorrectness.seatProvider).toMatchObject({ mode: 'agy', onEscape: 'skip', model });
     expect(requests.judgeAgyCorrectness.allowedTools).toBeUndefined();
     expect(requests.judgeAgyCorrectness.providerName).toBeUndefined();
     // A blocker from the advisory agy seat is published, labelled, and does NOT flip the panel.
     expect(run.findings.reduce.verdict).toBe('accept');
     expect(run.findings.reduce.lensVerdicts['agy-correctness']).toBe('changes');
     expect(run.findings.reduce.lensProviders['agy-correctness']).toBe('agy, advisory');
+  });
+
+  it.each([CLEAN_ANSWER, BLOCKING_ANSWER])('Carbon advisory cannot clear a Claude correctness blocker: %j', advisory => {
+    const { registry } = registryFor({}, { seatSettings: { ...AGY_SEAT_SETTINGS, agyModel: 'gemini-4-carbon-high' } });
+    const { run } = atConfirm({ registry, input: BASE_INPUT, answers: { judge: BLOCKING_ANSWER, judgeAgyCorrectness: advisory } });
+    expect(run.findings.reduce.lensVerdicts.correctness).toBe('changes');
+    expect(run.findings.reduce.verdict).toBe('changes');
+  });
+  it('Carbon advisory cannot supply a missing Claude correctness answer', () => {
+    const { registry } = registryFor({}, { seatSettings: { ...AGY_SEAT_SETTINGS, agyModel: 'gemini-4-carbon-high' } });
+    expect(() => atConfirm({ registry, input: BASE_INPUT, answers: {
+      judge: { summary: '', findings: [] }, judgeAgyCorrectness: CLEAN_ANSWER,
+    } })).toThrow(/no summary/);
   });
 
   describe('seatSettingsForRun — a resume reads the agy-correctness roster off the SAVED run, not the live settings', () => {

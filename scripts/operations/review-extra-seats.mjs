@@ -1920,10 +1920,10 @@ export async function speculateRedTeam({
     const readSeatSettings = io.readSeatSettings ?? (options => readReviewSeatPolicy({ ...options, log: io.log }));
     const routeByBuilder = redTeamRouteByBuilder(env, readSeatSettings);
     let builderHeadMessage = '';
-    if (routeByBuilder) {
-      try { builderHeadMessage = io.readHeadMessage(lanePath, rev) ?? ''; } catch { /* unknown builder keeps routing */ }
-    }
+    // Vendor independence also applies when builder-based preference is switched off.
+    try { builderHeadMessage = io.readHeadMessage(lanePath, rev) ?? ''; } catch { /* unknown builder keeps routing */ }
     const builder = resolveBuilder({ body: read.body, headMessage: builderHeadMessage });
+    const codexBuilder = builder.provider === 'codex';
     const preferred = !routeByBuilder ? null : builder.provider === 'codex' ? 'agy-gemini'
       : ['claude', 'agy-claude'].includes(builder.provider) ? 'codex' : null;
     const operatorKeys = (io.readRoutingPolicy ?? readRoutingPolicy).operatorKeys?.() ?? [];
@@ -1956,6 +1956,7 @@ export async function speculateRedTeam({
       }
       available.push(p);
     }
+    if (codexBuilder) available = available.filter(p => p !== 'codex');
     let provider = null;
     let callId = null;
     let lastReason = null;
@@ -1963,7 +1964,7 @@ export async function speculateRedTeam({
     for (let attempt = 0; attempt <= providers.length && available.length && !callId; attempt += 1) {
       // Default selection reserves agy-claude for emergencies; explicit operator chains may use it.
       const emergency = ['codex', 'agy-gemini'].every(p => capped.has(p));
-      const candidates = available.filter(p => p !== 'agy-claude' || operatorRoute || emergency);
+      const candidates = available.filter(p => p !== 'agy-claude' || codexBuilder || operatorRoute || emergency);
       if (!candidates.length) break;
       let routeError = null;
       try {
@@ -1995,6 +1996,12 @@ export async function speculateRedTeam({
       }
       let pick = configuredRoute ? { provider: configuredRoute.provider, reasoning: 'routing-policy' } : selectReviewSeatProvider({ lens: RED_TEAM_SEAT.key, available: candidates, scorecards: records });
       if (!pick.provider) { lastReason = pick.reasoning; break; }
+      if (codexBuilder && pick.provider === 'codex') {
+        lastReason = 'Codex red-team refused for a Codex builder';
+        io.log(`red team: ${lastReason}; retrying independent fallback`);
+        available = available.filter(p => p !== 'codex');
+        continue;
+      }
       // Check the resolved model, including builder/AI overrides, before spending its budget.
       // Keep runSeat's guard too: promotion can be withdrawn between admission and execution.
       const candidateModel = configuredRoute?.model ?? RED_TEAM_MODELS[pick.provider].model;
@@ -2023,8 +2030,8 @@ export async function speculateRedTeam({
       if (deferredByCap) io.log(`red team: capped route (${unavailable.join('; ') || lastReason}); fallback to ${pick.provider}`);
       if (pick.provider === 'agy-claude') io.log(operatorRoute
         ? 'red team: explicit operator route to agy-claude'
-        : 'red team: emergency fallback to agy-claude — codex and agy-gemini at cap');
-      if (preferred === 'agy-gemini' && pick.provider === 'codex') io.log('red team: same-vendor codex fallback accepted for Codex builder');
+        : emergency ? 'red team: emergency fallback to agy-claude — codex and agy-gemini at cap'
+          : 'red team: cross-vendor fallback to agy-claude for Codex builder');
       let reservation;
       try {
         reservation = io.reserveCalls({ provider: pick.provider, want: 1, dailyCap: caps[pick.provider], now });
