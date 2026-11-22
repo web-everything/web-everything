@@ -445,8 +445,8 @@ describe('the real layout (we:scripts/settings/ + legacy dispatch-settings.json)
   });
 
   it('declares the build-priority scope allowlist in its feature file', () => {
-    expect(real.settings.allowedDirs).toEqual(['scripts/conveyor/']);
-    expect(real.owners.allowedDirs).toBe('settings/build-priority-scope.json');
+    expect(real.settings.allowedFiles).toEqual(['scripts/conveyor/pr-stall-sweep.mjs']);
+    expect(real.owners.allowedFiles).toBe('settings/build-priority-scope.json');
   });
 
   it('declares catch-up ordering and first-listing defaults in merge-queue settings', () => {

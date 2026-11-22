@@ -1,4 +1,5 @@
 /** Real git fidelity: the card reader runs real git against a real repo with a real origin/main ref. */
+import { execFileSync } from 'node:child_process';
 import { chmodSync, symlinkSync } from 'node:fs';
 import { join } from 'node:path';
 import { expect, it } from 'vitest';
@@ -41,5 +42,34 @@ it('refuses real directory, ancestor, missing and symlink tree entries; accepts 
     expect(read.pathType(regular)).toBe('file');
     expect(read.pathType(executable)).toBe('file');
     expect(readPriorityCards({ git: args => ctx.git(args) }).pathType(regular)).not.toBe('file');
+  });
+});
+
+it('reads bounded content from the pinned main blob despite worktree and ref changes', async () => {
+  await withRealRepo(async ctx => {
+    const path = 'scripts/conveyor/pr-stall-sweep.mjs';
+    ctx.commit({ [path]: '// @guard\n' });
+    ctx.git(['update-ref', 'refs/remotes/origin/main', 'HEAD']);
+    const calls = [];
+    const read = readPriorityCards({ git: (args, options) => { calls.push({ args, options }); return ctx.git(args); } });
+    expect(read.readContent(path)).toBe('// @guard\n');
+    ctx.commit({ [path]: 'export {};\n' });
+    ctx.git(['update-ref', 'refs/remotes/origin/main', 'HEAD']);
+    expect(read.readContent(path)).toBe('// @guard\n');
+    expect(calls.filter(call => call.args[0] === 'show').every(call => call.options.maxBuffer === 65536)).toBe(true);
+    expect(() => read.readContent('scripts/missing.mjs')).toThrow();
+    expect(readPriorityCards({ git: args => ctx.git(args) }).readContent(path)).toBe('export {};\n');
+  });
+});
+
+it('bounds real Git content output at 64 KiB and refuses overflow', async () => {
+  await withRealRepo(async ctx => {
+    const path = 'scripts/conveyor/pr-stall-sweep.mjs';
+    ctx.commit({ [path]: 'x'.repeat(65537) });
+    ctx.git(['update-ref', 'refs/remotes/origin/main', 'HEAD']);
+    const read = readPriorityCards({ git: (args, options) => execFileSync('git', args, {
+      encoding: 'utf8', timeout: 10000, cwd: ctx.root, ...options,
+    }) });
+    expect(() => read.readContent(path)).toThrow(/ENOBUFS/);
   });
 });

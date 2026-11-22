@@ -1,9 +1,9 @@
 {
   "$comment": "Add metadata for every non-$comment top-level declared key and CAPACITY_LEAVES key. Descriptions live only here (max 160 characters). owner is the primary declaring file; the generator lists every declaring file. Record capacity aliases under leaves ($ means the scalar itself). Arrays count as one leaf. toSettle preserves pass-table values; pass C instant means its env-only column indicates an override, not proof of live reload. Pass A was an unquantified baseline inventory of declared settings, platform files, capacity leaves, operator prefs keys and env vars; numeric discovery evidence starts at B. R1076: behavior belongs in product settings; this inventory does not convert constants.",
   "settings": {
-    "allowedDirs": {
+    "allowedFiles": {
       "owner": "scripts/settings/build-priority-scope.json",
-      "description": "Directory prefixes admitting exact regular-file WE scopes to build-priority-set (scripts/conveyor/ only); invalid or unreadable evidence refuses.",
+      "description": "Named regular-file WE scopes for build-priority-set; protected names/markers and unreadable or over-64-KiB main content refuse (human review required).",
       "changeVia": "pr",
       "instant": true
     },

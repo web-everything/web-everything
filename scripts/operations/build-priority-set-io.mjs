@@ -60,17 +60,22 @@ const SCOPE_SETTINGS = 'scripts/settings/build-priority-scope.json';
 const normalSegments = path => path.split('/').every(segment =>
   /^[a-z0-9_-][a-z0-9_.-]*$/.test(segment) && !segment.includes('..'));
 
-function readAllowedDirs(options) {
+const exactSourceFile = path => !/[\s,]/.test(path) && normalSegments(path)
+  && !path.split('/').slice(0, -1).some(segment => segment.includes('.'))
+  && /\.(mjs|js|ts|json|md|sh|yml|yaml|css|html)$/.test(path);
+const CONTENT_LIMIT = 64 * 1024;
+const GUARD_NAME = /^guard-|-guard|policy|gate/i;
+const GUARD_MARKER = /TRUST_CHAIN|isTrustChainPath|@guard|gate-config/i;
+
+function readAllowedFiles(options) {
   try {
     const settings = JSON.parse(fs.readFileSync(options.scopeSettingsPath ?? join(ROOT, SCOPE_SETTINGS), 'utf8'));
-    if (!Array.isArray(settings?.allowedDirs) || !settings.allowedDirs.length) throw new Error('empty allowedDirs');
-    return settings.allowedDirs.map(dir => {
-      if (typeof dir !== 'string') throw new Error('invalid directory');
-      const path = dir.toLowerCase();
-      if (!path.endsWith('/') || !normalSegments(path.slice(0, -1))
-          || path.slice(0, -1).split('/').some(segment => segment.includes('.'))) throw new Error('invalid directory');
-      return path;
-    });
+    if (!settings || Object.hasOwn(settings, 'allowedDirs')
+        || !Array.isArray(settings.allowedFiles) || !settings.allowedFiles.length) throw new Error('empty allowedFiles');
+    return new Set(settings.allowedFiles.map(file => {
+      if (typeof file !== 'string' || !exactSourceFile(file.toLowerCase())) throw new Error('invalid file');
+      return file.toLowerCase();
+    }));
   } catch { refuse(`unreadable or malformed scope settings ${SCOPE_SETTINGS}`); }
 }
 const READ_OPTIONS = { encoding: 'utf8', maxBuffer: 8 * 1024 * 1024, timeout: 10000, stdio: ['ignore', 'pipe', 'pipe'] };
@@ -78,8 +83,8 @@ const canonicalId = id => id.replace(/^0+(?=\d)/, '');
 const refuse = why => { throw new Error(`build-priority-set: ${why}; repair evidence or drain open PRs and retry`); };
 
 /** One pinned main snapshot per reader; no worktree cards, fetching or lazy network reads. */
-export function readPriorityCards({ git = args => execFileSync('git', args, {
-  ...READ_OPTIONS, maxBuffer: 8 * 1024 * 1024, cwd: ROOT, env: { ...process.env, GIT_NO_LAZY_FETCH: '1' },
+export function readPriorityCards({ git = (args, options = {}) => execFileSync('git', args, {
+  ...READ_OPTIONS, ...options, cwd: ROOT, env: { ...process.env, GIT_NO_LAZY_FETCH: '1' },
 }) } = {}) {
   let sha, names;
   const snapshot = () => {
@@ -112,6 +117,9 @@ export function readPriorityCards({ git = args => execFileSync('git', args, {
     const match = /^(100644|100755) blob [0-9a-f]{40}\t([^\0]+)$/.exec(rows[0]);
     return match && match[2] === path ? 'file' : 'non-file';
   };
+  // Refuse overflow instead of silently declaring a partial scan clean. The same
+  // pinned main SHA supplies cards, regular-file evidence and guard content.
+  read.readContent = path => git(['show', `${snapshot()}:${path}`], { maxBuffer: CONTENT_LIMIT });
   return read;
 }
 
@@ -137,8 +145,10 @@ function prepare(input, options) {
   const { actor, reason, ids, mode, ttlHours } = validateBuildPriorityInput(input);
   if (new Set(ids.map(canonicalId)).size !== ids.length) refuse('duplicate numeric card identities');
   const readCard = options.readCard ?? readPriorityCards();
-  const pathType = options.pathType ?? readCard.pathType ?? readPriorityCards().pathType;
-  const allowedDirs = readAllowedDirs(options);
+  const source = readCard.pathType && readCard.readContent ? readCard : readPriorityCards();
+  const pathType = options.pathType ?? source.pathType;
+  const readContent = options.readContent ?? source.readContent;
+  const allowedFiles = readAllowedFiles(options);
   let gateFiles;
   try {
     if (!Array.isArray(TRUST_CHAIN) || !TRUST_CHAIN.length) refuse('empty or unreadable gate TRUST_CHAIN');
@@ -170,11 +180,8 @@ function prepare(input, options) {
       const match = typeof entry === 'string' && /^([a-z-]+):(.+)$/i.exec(entry);
       const prefix = match && match[1].toLowerCase();
       const path = match && match[2].toLowerCase();
-      const segments = path ? path.split('/') : [];
       if (!match || /[\s,]/.test(entry) || prefix !== 'we'
-          || !normalSegments(path)
-          || segments.slice(0, -1).some(segment => segment.includes('.'))
-          || !/\.(mjs|js|ts|json|md|sh|yml|yaml|css|html)$/.test(segments.at(-1))) {
+          || !exactSourceFile(path)) {
         refuse(`card ${id} scope entry ${JSON.stringify(entry)} must be an exact file path`);
       }
       if (protectedPaths.has(path) || protectedBasenames.has(basename(path))
@@ -182,12 +189,23 @@ function prepare(input, options) {
           || EXECUTION_CONTROLS.some(pattern => pattern.test(basename(path)))) {
         refuse(`card ${id} scope entry ${JSON.stringify(entry)} overlaps gate file ${path}`);
       }
-      if (!allowedDirs.some(dir => path.startsWith(dir))) {
-        refuse(`card ${id} scope entry ${JSON.stringify(entry)} outside allowedDirs`);
+      if (!allowedFiles.has(path)) {
+        refuse(`card ${id} scope entry ${JSON.stringify(entry)} outside allowedFiles`);
+      }
+      if (GUARD_NAME.test(basename(path))) {
+        refuse(`card ${id} scope entry ${JSON.stringify(entry)} has a guard name`);
       }
       let type;
       try { type = pathType(path); } catch { /* Unreadable Git evidence refuses below. */ }
       if (type !== 'file') refuse(`card ${id} scope entry ${JSON.stringify(entry)} not a readable regular file on origin/main`);
+      let content;
+      try { content = readContent(path); } catch { /* Unknown or oversized evidence refuses below. */ }
+      if (typeof content !== 'string' || Buffer.byteLength(content, 'utf8') > CONTENT_LIMIT) {
+        refuse(`card ${id} scope entry ${JSON.stringify(entry)} unreadable content or exceeds 64 KB; obtain human review and narrow the scope before retrying`);
+      }
+      if (content.split(/\r?\n/).some(line => GUARD_MARKER.test(line))) {
+        refuse(`card ${id} scope entry ${JSON.stringify(entry)} contains a guard marker`);
+      }
       return `we:${path}`;
     });
   });
