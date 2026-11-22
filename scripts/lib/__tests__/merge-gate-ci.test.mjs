@@ -970,7 +970,10 @@ describe('ci.yml and soak-replay-gate.yml report on merge_group', () => {
   // Exact allow-list: a required job runs on merge_group only with no `if`, or an `if` that is exactly
   // `!cancelled()` (no event filter at all). Any other condition — including one that merely CONTAINS
   // `!cancelled()` beside an event filter — is refused, because a skipped required job counts as passing.
-  const RUNS_ON_EVERY_EVENT = new Set(['${{ !cancelled() }}', '!cancelled()']);
+  // The ONE other exact form (PR #7224) skips only a reused MAIN PUSH (`event_name == 'push'` inside the
+  // negation, so merge_group / pull_request always run): its success would claim execution that never ran.
+  const REUSED_MAIN_PUSH_SKIP = "${{ !cancelled() && !(github.event_name == 'push' && needs.changes.result == 'success' && needs.changes.outputs.skip == 'true') }}";
+  const RUNS_ON_EVERY_EVENT = new Set(['${{ !cancelled() }}', '!cancelled()', REUSED_MAIN_PUSH_SKIP]);
   const onMergeGroup = (job) => job.if === undefined || RUNS_ON_EVERY_EVENT.has(String(job.if).trim());
 
   it('triggers on merge_group', () => {
@@ -984,11 +987,16 @@ describe('ci.yml and soak-replay-gate.yml report on merge_group', () => {
 
   it('the merge_group predicate rejects a job condition that would skip on merge_group', () => {
     for (const cond of ["${{ github.event_name == 'pull_request' && !cancelled() }}", "github.event_name != 'merge_group' && !cancelled()",
-      "${{ !cancelled() && github.event_name == 'push' }}", '${{ false }}', "${{ github.event_name == 'merge_group' && false }}"]) {
+      "${{ !cancelled() && github.event_name == 'push' }}", '${{ false }}', "${{ github.event_name == 'merge_group' && false }}",
+      // Near-copies of the reused-main-push skip that WOULD skip on merge_group or drop a guard.
+      REUSED_MAIN_PUSH_SKIP.replace("event_name == 'push'", "event_name == 'merge_group'"),
+      REUSED_MAIN_PUSH_SKIP.replace("event_name == 'push' && ", ''),
+      REUSED_MAIN_PUSH_SKIP.replace(' && needs.changes.outputs.skip', ' || needs.changes.outputs.skip')]) {
       expect(onMergeGroup({ if: cond }), cond).toBe(false);
     }
     expect(onMergeGroup({})).toBe(true);
     expect(onMergeGroup({ if: '${{ !cancelled() }}' })).toBe(true);
+    expect(onMergeGroup({ if: REUSED_MAIN_PUSH_SKIP })).toBe(true);
   });
 
   it('soak-replay-gate triggers on merge_group and its group step fails closed on a failed or empty list', () => {
