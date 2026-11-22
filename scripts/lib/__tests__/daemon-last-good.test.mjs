@@ -247,7 +247,7 @@ describe('assertMainNotStale — the x5wbsbc last-good fallback (managed clone)'
   });
 
   const warnCheck = () => () => ({
-    action: 'warn', reason: 'diverged', behind: 3, ahead: 2, dirty: false,
+    action: 'warn', reason: 'not-auto-syncing', behind: 3, ahead: 0, dirty: false,
   });
 
   it('onLastGood true: returns fresh/onLastGood, does NOT throw, writes a LAST-KNOWN-GOOD line (no ALERT)', () => {
@@ -262,7 +262,7 @@ describe('assertMainNotStale — the x5wbsbc last-good fallback (managed clone)'
       overAge: false,
     });
 
-    const result = assertMainNotStale(root, warnCheck(), { label: `last-good-${root}`, lastGood, dispatchPath: () => true, listBehindFiles: () => ['scripts/ordinary.mjs'], write: (s) => writes.push(s) });
+    const result = assertMainNotStale(root, warnCheck(), { label: `last-good-${root}`, lastGood, dispatchPath: () => true, readSettings: () => ({ daemons: { staleLagTolerated: ['runtime.mjs'] } }), listBehindFiles: () => ['runtime.mjs'], write: (s) => writes.push(s) });
 
     expect(result.fresh).toBe(true);
     expect(result.onLastGood).toBe(true);
@@ -283,7 +283,7 @@ describe('assertMainNotStale — the x5wbsbc last-good fallback (managed clone)'
       overAge: true,
     });
 
-    const result = assertMainNotStale(root, warnCheck(), { label: `last-good-${root}`, lastGood, dispatchPath: () => true, listBehindFiles: () => ['scripts/ordinary.mjs'], write: (s) => writes.push(s) });
+    const result = assertMainNotStale(root, warnCheck(), { label: `last-good-${root}`, lastGood, dispatchPath: () => true, readSettings: () => ({ daemons: { staleLagTolerated: ['runtime.mjs'] } }), listBehindFiles: () => ['runtime.mjs'], write: (s) => writes.push(s) });
 
     expect(result.fresh).toBe(true);
     expect(result.overAge).toBe(true);
@@ -291,7 +291,7 @@ describe('assertMainNotStale — the x5wbsbc last-good fallback (managed clone)'
     expect(writes.some((s) => s.includes('ALERT'))).toBe(true);
   });
 
-  it('onLastGood false: still throws with the STALE code marker', () => {
+  it('onLastGood false: scripts lag still throws with the STALE code marker', () => {
     const root = makeRealRepoWithOrigin();
     const lastGood = () => ({
       onLastGood: false, lastGood: null, held: null, heldSince: null, ageMs: null, overAge: false,
@@ -301,7 +301,7 @@ describe('assertMainNotStale — the x5wbsbc last-good fallback (managed clone)'
       .toThrow(STALE_MAIN_REFUSAL_MARKER);
   });
 
-  it('a lastGood that throws is treated the same as onLastGood:false (fail closed) — still throws the STALE marker', () => {
+  it('unreadable last-good cannot exempt protected scripts lag', () => {
     const root = makeRealRepoWithOrigin();
     const lastGood = () => { throw new Error('boom'); };
 

@@ -1,10 +1,10 @@
 /**
- * Default daemon stale scope: unrelated code lag must dispatch without dispatchPath;
+ * Daemon stale allowlist: tolerated-path-only lag must dispatch;
  * gate / TRUST_CHAIN lag must still refuse. Real Git, real guard from sourceRoot.
  * fixPresent probes behavior so historical trees must reproduce the break.
  */
 import { execFileSync } from 'node:child_process';
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -18,12 +18,10 @@ const { assertMainNotStale, isStaleMainRefusalMessage } = await import(
 const { TRUST_CHAIN } = await import(
   pathToFileURL(join(process.env.SOAK_SOURCE_ROOT, 'scripts/lib/gate-config.mjs')).href);
 const root = process.env.SOAK_CLONE;
-// Model a daemon with a complete, unrelated entry closure; use the default entryModule.
-process.argv[1] = join(root, 'scripts/daemon.mjs');
 const out = { dispatched: false, refused: false, error: null,
   trustPath: 'scripts/lib/' + TRUST_CHAIN.find((m) => m.file !== 'gate-config.mjs').file };
 try {
-  assertMainNotStale(root, undefined, { codeRoot: root });
+  assertMainNotStale(root, undefined, { label: 'soak-stale-allowlist' });
   out.dispatched = true;
 } catch (e) {
   out.refused = isStaleMainRefusalMessage(e.message);
@@ -46,12 +44,8 @@ function probe(sourceRoot, log, { unrelatedOnly = false, strictOnly = false } = 
     git(seed, 'init', '-q', '-b', 'main');
     git(seed, 'config', 'user.email', 'soak@example.invalid');
     git(seed, 'config', 'user.name', 'soak');
-    writeFileSync(join(seed, 'scripts/daemon.mjs'), "import { guard } from './lib/guard-closure.mjs';\nexport const daemon = guard;\n");
-    writeFileSync(join(seed, 'scripts/lib/guard-closure.mjs'),
-      "import { collectImportClosure } from './import-closure.mjs';\nexport const guard = collectImportClosure;\n");
-    // Include the real scanner in the exercised graph: a synthetic leaf cannot catch self-matches.
-    writeFileSync(join(seed, 'scripts/lib/import-closure.mjs'),
-      readFileSync(join(sourceRoot, 'scripts/lib/import-closure.mjs'), 'utf8'));
+    mkdirSync(join(seed, 'docs'), { recursive: true });
+    writeFileSync(join(seed, 'baseline.txt'), 'baseline\n');
     git(seed, 'add', '.');
     git(seed, 'commit', '-q', '-m', 'daemon baseline');
     // Shared local objects let us advance origin/main without fetch, push or network IO.
@@ -69,21 +63,15 @@ function probe(sourceRoot, log, { unrelatedOnly = false, strictOnly = false } = 
       git(seed, 'commit', '-q', '-m', `advance ${path}`);
       git(clone, 'update-ref', 'refs/remotes/origin/main', git(seed, 'rev-parse', 'HEAD').trim());
     };
-    lag('scripts/unrelated.mjs');
+    lag('docs/tolerated.md');
     const unrelated = dispatch();
-    log?.(`unrelated lag: ${JSON.stringify(unrelated)}`);
+    log?.(`tolerated-path lag: ${JSON.stringify(unrelated)}`);
     if (!strictOnly && (!unrelated.dispatched || unrelated.refused || unrelated.error)) {
-      violations.push({ invariant: 'default-scope-dispatches-unrelated-code-lag',
-        detail: `no dispatchPath, but unrelated code lag did not dispatch: ${JSON.stringify(unrelated)}` });
+      violations.push({ invariant: 'allowlist-dispatches-tolerated-path-only-lag',
+        detail: `tolerated-path-only lag did not dispatch: ${JSON.stringify(unrelated)}` });
     }
-    // Presence is determined solely by the positive, unrelated-lag behavior.
+    // Presence is determined solely by the distinct positive, tolerated-path-only behavior.
     if (unrelatedOnly) return { violations };
-    lag('scripts/lib/guard-closure.mjs');
-    const closure = dispatch();
-    log?.(`imported guard lag: ${JSON.stringify(closure)}`);
-    if (closure.dispatched || !closure.refused) {
-      violations.push({ invariant: 'default-scope-refuses-imported-guard-lag', detail: JSON.stringify(closure) });
-    }
     git(clone, 'reset', '--hard', 'origin/main');
     lag('scripts/lib/gate-config.mjs');
     const gate = dispatch();
@@ -110,11 +98,11 @@ function probe(sourceRoot, log, { unrelatedOnly = false, strictOnly = false } = 
 
 export default {
   id: 'daemon-stale-guard-refuses-unrelated-lag',
-  title: 'the default daemon stale guard dispatches unrelated lag but refuses gate and trust-chain lag',
-  card: 'assertMainNotStale default import-closure scoping',
+  title: 'the daemon allowlist dispatches tolerated-path lag and refuses gate and trust-chain lag',
+  card: 'assertMainNotStale settings allowlist',
   fixedBy: {
-    sha: 'HEAD', where: 'working tree: default import-closure scoping',
-    paths: ['scripts/lib/main-staleness.mjs', 'scripts/lib/import-closure.mjs'],
+    sha: 'HEAD', where: 'working tree: settings allowlist',
+    paths: ['scripts/lib/main-staleness.mjs', 'scripts/settings/daemon-stale-lag.json'],
   },
   fixPresent(root) { return probe(root, undefined, { unrelatedOnly: true }).violations.length === 0; },
   async run({ log, sourceRoot = REPO_ROOT, strictOnly = false } = {}) { return probe(sourceRoot, log, { strictOnly }); },

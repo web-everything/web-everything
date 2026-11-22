@@ -22,10 +22,10 @@ import { basename, dirname, isAbsolute, relative, resolve, sep } from 'node:path
 import { fileURLToPath } from 'node:url';
 // Sparse copied-CLI fixtures may omit gate-config's graph; without it every behind file counts as strict (refuse).
 const gateConfig = await import('./gate-config.mjs').catch(() => null);
-import { collectImportClosure, closureHits } from './import-closure.mjs';
+import { cascadePolicy } from './policy-cascade.mjs';
 import { daemonEventsPath } from './daemon-events.mjs';
 import { lastGoodForClone, lastGoodMaxAgeMs, readRebuildStateFile, rebuildGraceForClone } from './daemon-last-good.mjs';
-import { readSettings as readOperatorSettings } from './settings-files.mjs';
+import { readSettingsChecked, readSettings as readOperatorSettings } from './settings-files.mjs';
 // Sparse copied-CLI fixtures may omit the launcher; only lane fallback needs it, and must refuse without it.
 const freshLauncher = await import('../run-fresh.mjs').catch(() => null);
 
@@ -39,7 +39,7 @@ function emitLaneReleaseFailedSync(event) {
 /** Default git runner — spawnSync (returns non-zero without throwing). */
 export function gitRun(args, opts = {}) {
   // A synchronous preflight must not leave Git's detached maintenance writing the checkout.
-  const r = spawnSync('git', ['-c', 'gc.auto=0', '-c', 'maintenance.auto=false', ...args], { encoding: 'utf8', maxBuffer: 256 * 1024 * 1024, ...opts });
+  const r = spawnSync('git', ['-c', 'gc.auto=0', '-c', 'maintenance.auto=false', '-c', 'core.quotepath=false', ...args], { encoding: 'utf8', maxBuffer: 256 * 1024 * 1024, ...opts });
   return { status: r.status == null ? 1 : r.status, stdout: r.stdout || '', stderr: r.stderr || '' };
 }
 
@@ -88,7 +88,12 @@ export function checkMainStaleness({ base = 'main', autoFf = true, cleanOnly = f
   const origin = rev(`origin/${base}`);
   if (!local || !origin) return { offline: true };
   if (local === origin) return { fresh: true, behind: 0 };
-  const count = (range) => { const r = run(['rev-list', '--count', range]); return r.status === 0 && /^\d+$/.test(r.stdout.trim()) ? Number(r.stdout.trim()) : null; };
+  const count = (range) => {
+    const r = run(['rev-list', '--count', range]);
+    const text = typeof r.stdout === 'string' ? r.stdout.trim() : '';
+    const n = Number(text);
+    return r.status === 0 && /^\d+$/.test(text) && Number.isSafeInteger(n) ? n : null;
+  };
   const behind = count(`${base}..origin/${base}`);
   const ahead = count(`origin/${base}..${base}`);
   // An unreadable commit count is UNKNOWN, never zero: refuse (strict) instead of reporting fresh.
@@ -99,7 +104,11 @@ export function checkMainStaleness({ base = 'main', autoFf = true, cleanOnly = f
     };
   }
   const st = run(['status', '--porcelain']);
-  const dirty = !!(st.stdout && st.stdout.trim());
+  const dirty = st.status !== 0 || typeof st.stdout !== 'string' || !!st.stdout.trim();
+  if (st.status !== 0 || typeof st.stdout !== 'string') {
+    return { action: 'warn', reason: 'status-unknown', behind, ahead, dirty: true,
+      warning: 'could not read git status — tree unknown; retry the gated rebuild.' };
+  }
   let onBase = true;
   if (cleanOnly) {
     const head = run(['symbolic-ref', '--short', 'HEAD']);
@@ -231,10 +240,53 @@ function logToleratedLag({ label, behind, files, base, reason, write }) {
   toleratedLagLogs.add(key);
 }
 
-function strictStalePath(path, entry) {
-  return !gateConfig || gateConfig.isTrustChainPath(path) || basename(path) === 'gate-config.mjs'
-    || /^scripts\/lib\/settings-[^/]+(?:\.mjs|\.json)$/.test(path)
-    || path.startsWith('scripts/lib/settings-registry-metadata.d/') || path === entry;
+// Only decoded, canonical repo-relative Git paths can participate in an exemption.
+function knownBehindPath(path) {
+  return typeof path === 'string' && path.length > 0 && !path.includes('\ufffd') && path.isWellFormed()
+    && !/[\\\0]/.test(path) && !path.startsWith('/')
+    && !path.split('/').some(part => !part || part === '.' || part === '..');
+}
+
+// Small glob grammar: *, **, ? and leading ! exclusions; no extglobs or braces.
+function lagGlob(pattern) {
+  let re = '';
+  for (let i = 0; i < pattern.length; i++) {
+    const c = pattern[i];
+    if (c === '*' && pattern[i + 1] === '*') {
+      if (pattern[i + 2] === '/') { re += '(?:[\\s\\S]*/)?'; i += 2; }
+      else { re += '[\\s\\S]*'; i++; }
+    } else if (c === '*') re += '[^/]*';
+    else if (c === '?') re += '[^/]';
+    else re += c.replace(/[.+^${}()|[\]\\]/g, '\\$&');
+  }
+  return new RegExp(`^${re}$`);
+}
+
+function readLagSettings() {
+  const result = readSettingsChecked();
+  return result.taint.length || result.duplicates.length ? {} : result.value;
+}
+
+function toleratedLagFiles(files, readSettings) {
+  try {
+    const tool = readSettings()?.daemons?.staleLagTolerated;
+    // Missing/unreadable tool evidence must never fall back to a platform exemption.
+    if (!Array.isArray(tool) || tool.length > 256 || !tool.every(p => typeof p === 'string'
+      && p.length > 0 && p.length <= 1024 && !/[\\\0{}[\]()]/.test(p))) return false;
+    const { value } = cascadePolicy('daemons', { staleLagTolerated: tool }, {
+      standard: { staleLagTolerated: [] },
+      valid: { staleLagTolerated: v => Array.isArray(v) && v.every(p => tool.includes(p)) },
+    });
+    const patterns = value.staleLagTolerated;
+    const allow = patterns.filter(p => !p.startsWith('!')).map(lagGlob);
+    const deny = patterns.filter(p => p.startsWith('!')).map(p => lagGlob(p.slice(1)));
+    return files.every(path => knownBehindPath(path) && gateConfig
+      && !path.startsWith('scripts/') && !gateConfig.isTrustChainPath(path)
+      && basename(path) !== 'gate-config.mjs'
+      && !path.startsWith('.claude/') && !path.startsWith('docs/agent/')
+      && !/^settings-registry(?:[.-]|$)/.test(basename(path))
+      && allow.some(re => re.test(path)) && !deny.some(re => re.test(path)));
+  } catch { return false; }
 }
 
 /**
@@ -248,15 +300,12 @@ function strictStalePath(path, entry) {
  * @param {string} root
  * @param {(root: string) => ReturnType<typeof checkMainStaleness>} [checkStaleness] - injectable, defaults to
  *   a real `checkMainStaleness` scoped (via `run`'s `cwd`) to `root`.
- * @param {{base?: string, label?: string, entryModule?: string, dispatchPath?: ((path: string) => boolean)|null}} [o] - `base` is the
- *   delivery target to measure staleness against (default `main`); `label` prefixes the thrown/logged message so
- *   each caller reads as itself (default `review-dispatch`, this function's original and still most common
- *   caller). `dispatchPath` (#4387) narrows a MANAGED clone's refusal to the files this dispatch actually runs:
- *   a managed clone behind only in files it rejects dispatches and logs the tolerated lag. By default, use
- *   the process entry module import closure. Unknown closure/evidence and strict gate/settings/entry lag refuse.
+ * @param {{base?: string, label?: string, readSettings?: Function}} [o] - injectable settings reader
+ *   defaults to the checked repository reader. Managed lag requires every file to match
+ *   daemons.staleLagTolerated. Unknown evidence requires a gated rebuild.
  */
 export function assertMainNotStale(root, checkStaleness, {
-  base = 'main', label = 'review-dispatch', dispatchPath = null, entryModule = process.argv[1],
+  base = 'main', label = 'review-dispatch', dispatchPath = null, readSettings = readLagSettings,
   listBehindFiles = (r) => behindFiles(r, base),
   // xgqz204 — the self-fast-forward seams (see `selfFastForwardAction`). All default to the real process.
   codeRoot = THIS_CODE_ROOT, armed = selfSyncState.armed, reexeced = selfSyncState.reexeced,
@@ -286,54 +335,12 @@ export function assertMainNotStale(root, checkStaleness, {
     }
     return behindMemo;
   };
-  let codeDirtyMemo;
-  const cleanNonDiverged = () => {
-    if (st.ahead > 0) return false;
-    if (codeDirtyMemo === undefined) {
-      codeDirtyMemo = !!st.dirty;
-      if (codeDirtyMemo) {
-        try { codeDirtyMemo = treeDirtyForCode(root) !== false; } catch { codeDirtyMemo = true; }
-      }
-    }
-    return !codeDirtyMemo;
-  };
-  let canUseStaleFallback = false;
-  if (st?.action === 'warn' && managedClone) {
-    const files = behindList();
-    const known = Array.isArray(files) && files.length > 0
-      && files.every((f) => typeof f === 'string' && f.length > 0);
-    const entry = entryModule ? relative(codeRoot, resolve(codeRoot, entryModule)).split(sep).join('/') : null;
-    if (typeof dispatchPath !== 'function') {
-      let closure = null;
-      try {
-        closure = collectImportClosure({ root: codeRoot, entries: entry ? [entry] : [], requireResolvedImports: true });
-      } catch { /* unknown closure refuses; rebuild is the operator fallback */ }
-      if (closure?.complete) dispatchPath = (f) => closureHits({ closure, changedFiles: [f] }).length > 0;
-    }
-    canUseStaleFallback = known && !files.some((f) => strictStalePath(f, entry))
-      && typeof dispatchPath === 'function';
-  }
-  // #4044 (live 2026-09-25): the drain lands a commit every few minutes, most touching only `backlog/*.md`, and
-  // the fix daemon refused WHOLE repos whenever its managed clone was a few such commits behind. This guard
-  // exists so a dispatch never runs STALE CODE from this checkout's import path — commits that change no code
-  // file cannot make it stale. So a managed clone behind ONLY in non-code files is fresh enough to dispatch;
-  // the next tick-start rebuild still brings it current. Unknown diff ⇒ the refusal stands (fail closed).
-  if (st && st.action === 'warn' && managedClone && canUseStaleFallback && cleanNonDiverged()) {
-    const files = behindList();
-    if (Array.isArray(files) && files.length > 0 && !files.some(isCodePath)) {
-      logToleratedLag({ label, behind: st.behind, files, base, reason: 'non-code files only', write });
-      st = { fresh: true, behind: st.behind, behindNonCodeOnly: true, files: files.length };
-    } else if (Array.isArray(files) && files.length > 0 && typeof dispatchPath === 'function'
-      && !files.some((f) => isCodePath(f) && dispatchPath(f))) {
-      // #4387 (live 2026-09-28): the drain lands about a PR a minute and a rebuild takes minutes, so the review
-      // daemon sat 4-18 commits behind and logged 970 refusals in one evening — for commits that never touched
-      // the code a review dispatch runs. Only a behind file on the caller's own dispatch path can make it stale.
-      const codeFiles = files.filter(isCodePath);
-      const code = codeFiles.length;
-      logToleratedLag({ label, behind: st.behind, files, base, reason: 'none on this dispatch code path', write });
-      st = { fresh: true, behind: st.behind, behindOffDispatchPath: true, files: files.length, codeFiles: code, toleratedFiles: codeFiles };
-    }
-  }
+  // Mandatory for every managed-clone exception, including the historical build fallbacks.
+  const files = st?.action === 'warn' && managedClone ? behindList() : null;
+  const canUseStaleFallback = st?.action === 'warn' && managedClone
+    && st.reason !== 'count-unknown' && st.reason !== 'status-unknown'
+    && Number.isSafeInteger(st.behind) && st.behind > 0 && st.ahead === 0 && st.dirty === false
+    && Array.isArray(files) && files.length > 0 && toleratedLagFiles(files, readSettings);
   // x5wbsbc (epic #4075) — FALLBACK TO THE LAST WORKING BUILD, NEVER BLOCK DELIVERY (operator ruling 2026-09-26).
   // A managed clone that is still behind here is being HELD by its gated rebuild (a rejected smoke, a smoke in
   // flight, a broken smoke harness). When its HEAD is exactly the last build a live smoke passed
@@ -342,11 +349,7 @@ export function assertMainNotStale(root, checkStaleness, {
   // still dispatches; the health watch's `daemon-held-on-last-good` sign notifies the operator after 15 min.
   if (st && st.action === 'warn' && managedClone && canUseStaleFallback) {
     let lg = null;
-    // Live 2026-10-04: untracked backlog/*.md cards a review job left in the clone made `st.dirty` true, so the
-    // last-good fallback never applied while the rebuild was held. Only a TRACKED change or an untracked CODE
-    // file makes the tree differ from the verified build; an unreadable status stays dirty (fail closed).
-    let dirty = !!st.dirty;
-    if (dirty) { try { dirty = treeDirtyForCode(root); } catch { dirty = true; } }
+    const dirty = false; // strict prerequisites above already established a clean tree
     try { lg = lastGood(root, dirty); } catch { lg = null; }
     if (lg && lg.onLastGood) {
       const heldWhy = lg.held ? ` held since ${lg.heldSince} (${lg.held.reason ?? '?'}${lg.held.failed ? `: ${lg.held.failed}` : ''})` : '';
@@ -367,7 +370,7 @@ export function assertMainNotStale(root, checkStaleness, {
   // BOUNDED grace covers that window: a live build lease, and a last adoption no older than
   // `WE_STALE_GUARD_REBUILD_GRACE_MS` (default 60 min, 0 = off). Only for a caller that names its dispatch path
   // and only with a KNOWN behind-file list — an unknown diff still refuses.
-  if (st && st.action === 'warn' && managedClone && canUseStaleFallback && typeof dispatchPath === 'function' && cleanNonDiverged()) {
+  if (st && st.action === 'warn' && managedClone && canUseStaleFallback && typeof dispatchPath === 'function') {
     const files = behindList();
     let g = null;
     if (Array.isArray(files) && files.length > 0) { try { g = rebuildGrace(root); } catch { g = null; } }
@@ -379,6 +382,11 @@ export function assertMainNotStale(root, checkStaleness, {
           + ` is in progress (${Math.round((g.sinceAdoptMs ?? 0) / 60_000)} min since the last adoption, within the grace)` });
       st = { fresh: true, behind: st.behind, rebuildGrace: true, onPathFiles: onPath, buildTarget: g.target ?? null };
     }
+  }
+  if (st?.action === 'warn' && canUseStaleFallback) {
+    logToleratedLag({ label, behind: st.behind, files, base,
+      reason: 'every behind file matches daemons.staleLagTolerated (tool settings; hard exclusions applied)', write });
+    st = { fresh: true, behind: st.behind, behindTolerated: true, files: files.length };
   }
   if (st && st.synced) {
     process.stderr.write(`${label}: fast-forwarded the dispatching checkout ${st.behind} commit(s) to origin/${base} (#3474) before dispatching.\n`);
@@ -448,14 +456,15 @@ export function assertOperatorCliFresh(root, { label = 'operator-cli', base = 'm
   // whatever checkout CI built and injects its own seams. Neither is an operator running from a stale clone.
   if (env?.WE_DAEMON_MANAGED_CLONE === '1' || skipUnderVitest) return { skipped: true };
   let last = null;
-  const check = (r, failClosed = false) => {
+  const check = (r) => {
     const cwd = { cwd: r, timeout: 60_000, killSignal: 'SIGKILL' };
     if (run(['fetch', 'origin', base, '--quiet'], cwd).status !== 0) return (last = { offline: true });
     const count = run(['rev-list', '--count', `HEAD..origin/${base}`], cwd);
-    if (failClosed && (count.status !== 0 || !/^\d+$/.test(String(count.stdout ?? '').trim()))) {
-      return { offline: true };
+    const countText = typeof count.stdout === 'string' ? count.stdout.trim() : '';
+    const behind = Number(countText);
+    if (count.status !== 0 || !/^\d+$/.test(countText) || !Number.isSafeInteger(behind)) {
+      return (last = { action: 'warn', reason: 'count-unknown', behind: null, ahead: null, dirty: true });
     }
-    const behind = count.status === 0 ? Number(count.stdout.trim()) || 0 : 0;
     if (!behind) return (last = { fresh: true, behind: 0 });
     const files = listBehindFiles(r);
     // Unknown diff fails closed; a diff with no code file is not stale for this CLI.

@@ -17,7 +17,7 @@ For repo defaults, edit the owner file through a PR and rebuild the consuming da
 ## Summary
 
 - Top-level keys: 164 (166 declaration rows).
-- Declared leaves: 618 (platform copies counted separately).
+- Declared leaves: 619 (platform copies counted separately).
 - Instant top-level keys: 0; not instant: 164.
 - Instant capacity leaves: 15.
 - Constants to settle: 312.
@@ -93,7 +93,7 @@ Operator-prefs layer: ~/.plateau/platform-preferences.json is the requested oper
 | daemonAliases | scripts/settings/prototype-load.json | 6 | {"reconcile-fix-dispatch":"fix","wev-fix-daemon":"fix","wev… | pr | no | Alias names mapped to canonical daemon roles. |
 | daemonDegradedModes | scripts/settings/delivery-routes.json | 1 | {"daemon-tooling":"debug-to-merge"} | pr | no | Delivery modes used when daemon tooling is degraded. |
 | daemonTasksDescription | scripts/settings/daemon-tasks.json | 1 | "Daemon task table (a verbatim inventory of the live 2026-1… | pr | no | Documentation of the daemon task manifest and host token substitution. |
-| daemons | scripts/settings/claude-accounts.json, scripts/settings/prototype-load.json | 33 | {"review":{"label":"com.we.review-daemon","runs":"review da… | pr | no | Daemon inventory and launch-label account mappings. |
+| daemons | scripts/settings/claude-accounts.json, scripts/settings/daemon-stale-lag.json, scripts/settings/prototype-load.json | 34 | {"staleLagTolerated":["backlog/**","designs/**","docs/**","… | pr | no | Daemon account mappings and staleLagTolerated glob exemptions; missing evidence and protected paths always refuse. |
 | delivery | scripts/settings/delivery-identity.json, scripts/settings/delivery-metrics.json | 43 | {"identity":{"$comment":"Per-role GitHub App identity (oper… | pr | no | Role-based GitHub App identities and delivery metrics collection policy. |
 | deliveryCapacity | scripts/settings/delivery-capacity.json | 12 | {"autoTune":{"mode":"off","everyMin":60,"windowH":6,"minMer… | pr | no | Delivery capacity measurement, weighted units and automatic tuning policy. |
 | deliveryFlow | scripts/settings/delivery-flow.json | 0 | {} | pr | no | Ordered delivery stages by change class, retaining protected spine stages. |

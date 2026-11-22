@@ -256,56 +256,103 @@ describe('assertMainNotStale — managed clone never auto-ffs (#4044 Module E)',
       .toThrow(/STALE code from this checkout/);
     expect(git(clonePath, 'rev-list', '--count', 'HEAD..origin/main').trim()).not.toBe('0'); // never touched
   });
-  // #4044 (live 2026-09-25): the fix daemon refused whole repos when its clone was a few backlog-only commits
-  // behind. Commits that change no code file cannot make a checkout's import path stale.
-  it('managed clone behind ONLY in non-code files (backlog/*.md) is not stale — no throw, and the clone is never touched', () => {
-    const clonePath = makeBehindClone('9999-backlog-card.md');
-    const st = withManagedCloneEnv('1', () => assertMainNotStale(clonePath, undefined, {
-      label: 'test', codeRoot: clonePath, entryModule: 'daemon.mjs',
-    }));
-    expect(st).toMatchObject({ fresh: true, behindNonCodeOnly: true, behind: 1 });
-    expect(git(clonePath, 'rev-list', '--count', 'HEAD..origin/main').trim()).toBe('1'); // only the rebuild moves it
+  const warn = () => ({ action: 'warn', reason: 'not-auto-syncing', behind: 2, ahead: 0, dirty: false });
+  const patterns = ['backlog/**', 'designs/**', 'docs/**', '**/*.md', '**/__tests__/**', '**/*.test.*', '!.claude/**', '!docs/agent/**'];
+  const options = (extra = {}) => ({
+    label: 'allowlist-daemon', readSettings: () => ({ daemons: { staleLagTolerated: patterns } }),
+    listBehindFiles: () => ['backlog/a.md'], lastGood: () => null, rebuildGrace: () => null,
+    write: () => {}, ...extra,
   });
-  // DAEMON-STALE-SCOPE: strict evidence must beat every stale-build escape hatch.
-  function scopedOptions(files, extra = {}) {
-    return {
-      label: 'scope-daemon', entryModule: 'daemon.mjs', codeRoot: '/repo',
-      dispatchPath: () => false, listBehindFiles: () => files, write: () => {},
-      lastGood: () => ({ onLastGood: true, lastGood: 'a'.repeat(40) }),
-      rebuildGrace: () => ({ grace: true }), ...extra,
-    };
-  }
-  const scopeWarn = () => ({ action: 'warn', behind: 7, dirty: false });
-  for (const mode of ['off-path', 'rebuild-grace', 'non-code']) {
-    for (const state of ['dirty', 'diverged', 'unreadable-status']) {
-      it(`${mode} refuses ${state} managed trees`, () => {
-        const warn = () => ({ action: 'warn', behind: 7, ahead: state === 'diverged' ? 1 : 0,
-          dirty: state !== 'diverged' });
-        const opts = scopedOptions([mode === 'non-code' ? 'backlog/card.md' : 'other.mjs'], {
-          dispatchPath: () => mode === 'rebuild-grace', lastGood: () => null,
-          treeDirtyForCode: () => { if (state === 'unreadable-status') throw new Error('status unavailable'); return true; },
-        });
-        withManagedCloneEnv('1', () => expect(() => assertMainNotStale('/repo', warn, opts)).toThrow(/STALE/));
-      });
-    }
-    it(`${mode} permits untracked non-code dirt using codeDirty`, () => {
-      withManagedCloneEnv('1', () => {
-        expect(assertMainNotStale('/repo', () => ({ action: 'warn', behind: 7, ahead: 0, dirty: true }),
-          scopedOptions([mode === 'non-code' ? 'backlog/card.md' : 'other.mjs'], {
-            dispatchPath: () => mode === 'rebuild-grace', lastGood: () => null, treeDirtyForCode: () => false,
-          }))).toMatchObject({ fresh: true });
-      });
-    });
-  }
-  it('tolerated lag logs a changed reason for the same label/count/files', () => {
-    const logs = [];
-    const opts = scopedOptions(['other.mjs'], { label: 'changed-reason', write: s => logs.push(s) });
+
+  // Negative cases FIRST: even convincing stale-build evidence cannot override the mandatory boundary.
+  it.each([
+    ['gate file', ['elsewhere/gate-config.mjs']],
+    ...TRUST_CHAIN.map(({ file }) => [`TRUST_CHAIN ${file}`, [`elsewhere/${file}`]]),
+    ['scripts library', ['scripts/lib/x.mjs']],
+    ['scripts settings', ['scripts/settings/daemon-stale-lag.json']],
+    ['registry metadata', ['elsewhere/settings-registry-metadata.json']],
+    ['registry directory', ['scripts/lib/settings-registry-metadata.d/settings/daemons.json']],
+    ['agent docs', ['docs/agent/testing.md']],
+    ['Claude instructions', ['.claude/a.md']],
+  ])('%s lag refuses even with a wildcard setting and last-good/grace', (_name, files) => {
     withManagedCloneEnv('1', () => {
-      assertMainNotStale('/repo', scopeWarn, opts);
-      assertMainNotStale('/repo', scopeWarn, { ...opts, dispatchPath: () => true });
+      expect(() => assertMainNotStale('/repo', warn, options({
+        readSettings: () => ({ daemons: { staleLagTolerated: ['**'] } }), listBehindFiles: () => files,
+        dispatchPath: () => false, lastGood: () => ({ onLastGood: true }), rebuildGrace: () => ({ grace: true }),
+      }))).toThrow(/STALE/);
     });
-    expect(logs).toHaveLength(2);
-    expect(logs[1]).toContain('LAST-KNOWN-GOOD');
+  });
+  it.each([
+    ['unknown', null], ['empty', []], ['unparseable', ['bad\ufffd.md']],
+    ['quoted undecoded', ['"docs/a\\377.md"']], ['absolute', ['/docs/x.md']],
+    ['traversal', ['docs/../scripts/x.mjs']], ['malformed', [3]],
+    ['mixed', ['backlog/a.md', 'src/runtime.mjs']], ['unlisted', ['runtime.mjs']],
+  ])('%s behind list refuses', (_name, files) => {
+    withManagedCloneEnv('1', () => expect(() => assertMainNotStale('/repo', warn, options({
+      listBehindFiles: () => files, lastGood: () => ({ onLastGood: true }), rebuildGrace: () => ({ grace: true }),
+    }))).toThrow(/STALE/));
+  });
+  it.each([
+    ['dirty', { dirty: true }], ['diverged', { ahead: 1, reason: 'diverged' }],
+    ['count-unknown', { behind: 0, reason: 'count-unknown' }],
+    ['count-unknown positive behind', { reason: 'count-unknown' }],
+    ['ahead unknown', { ahead: undefined }], ['behind malformed', { behind: NaN }],
+    ['status-unknown', { reason: 'status-unknown', dirty: true }],
+  ])('%s refuses with every fallback enabled', (_name, change) => {
+    withManagedCloneEnv('1', () => expect(() => assertMainNotStale('/repo', () => ({ ...warn(), ...change }), options({
+      treeDirtyForCode: () => false, dispatchPath: () => true,
+      lastGood: () => ({ onLastGood: true }), rebuildGrace: () => ({ grace: true }),
+    }))).toThrow(/STALE/));
+  });
+  it.each([
+    ['missing', () => ({})], ['unreadable', () => { throw Error('unreadable'); }],
+    ['malformed', () => ({ daemons: { staleLagTolerated: '**' } })],
+    ['oversized list', () => ({ daemons: { staleLagTolerated: Array(257).fill('**') } })],
+    ['oversized pattern', () => ({ daemons: { staleLagTolerated: ['*'.repeat(1025)] } })],
+    ['invalid glob', () => ({ daemons: { staleLagTolerated: ['{docs,backlog}/**'] } })],
+  ])('%s setting refuses; operator must restore valid settings and retry gated rebuild', (_name, readSettings) => {
+    withManagedCloneEnv('1', () => expect(() => assertMainNotStale('/repo', warn, options({ readSettings }))).toThrow(/clone-held-stale/));
+  });
+  it('failed git status is dirty/unknown and cannot dispatch tolerated lag', () => {
+    const calls = [];
+    const run = scripted({
+      fetch: { status: 0 }, 'rev-parse': a => ({ stdout: a[1] === 'main' ? 'local' : 'origin' }),
+      'rev-list': a => ({ stdout: a[2].startsWith('main..') ? '1' : '0' }),
+      status: { status: 128, stdout: '' },
+    }, calls);
+    const check = () => checkMainStaleness({ run, cleanOnly: true });
+    expect(check()).toMatchObject({ action: 'warn', reason: 'status-unknown', dirty: true });
+    withManagedCloneEnv('1', () => expect(() => assertMainNotStale('/repo', check, options())).toThrow(/STALE/));
+    expect(calls.some(a => a[0] === 'merge' || a[0] === 'pull')).toBe(false);
+  });
+  it('all tolerated paths dispatch; one diagnostic per distinct label/count/files/reason', () => {
+    const logs = [];
+    const files = ['backlog/a.md', 'docs/x.md', 'a/__tests__/t.test.mjs'];
+    const opts = options({ label: 'all-tolerated', listBehindFiles: () => files, write: s => logs.push(s) });
+    withManagedCloneEnv('1', () => {
+      expect(assertMainNotStale('/repo', warn, opts)).toMatchObject({ fresh: true, behindTolerated: true });
+      assertMainNotStale('/repo', warn, { ...opts, listBehindFiles: () => [...files].reverse() });
+      expect(logs).toHaveLength(1);
+      assertMainNotStale('/repo', () => ({ ...warn(), behind: 3 }), opts);
+      expect(logs).toHaveLength(2);
+      assertMainNotStale('/repo', warn, { ...opts, lastGood: () => ({ onLastGood: true, lastGood: 'abc' }) });
+      expect(logs).toHaveLength(3); // different reason, same lag
+    });
+    expect(logs[0]).toContain('all-tolerated:');
+    expect(logs[0]).toContain('2 commit(s)');
+    for (const path of files) expect(logs[0]).toContain(path);
+    expect(logs[0]).toContain('tolerated lag: every behind file matches daemons.staleLagTolerated');
+  });
+  it('negative glob wins over positive glob', () => {
+    withManagedCloneEnv('1', () => expect(() => assertMainNotStale('/repo', warn, options({
+      readSettings: () => ({ daemons: { staleLagTolerated: ['**', '!backlog/**'] } }),
+    }))).toThrow(/STALE/));
+  });
+  it('default real settings permit markdown lag without moving the managed clone', () => {
+    const clonePath = makeBehindClone('9999-backlog-card.md');
+    const st = withManagedCloneEnv('1', () => assertMainNotStale(clonePath, undefined, { label: 'real-settings', lastGood: () => null }));
+    expect(st).toMatchObject({ fresh: true, behindTolerated: true, behind: 1 });
+    expect(git(clonePath, 'rev-list', '--count', 'HEAD..origin/main').trim()).toBe('1');
   });
   it('behindFiles preserves unusual Git paths in both listing modes', () => {
     dir = mkdtempSync(join(tmpdir(), 'behind-paths-'));
@@ -324,114 +371,6 @@ describe('assertMainNotStale — managed clone never auto-ffs (#4044 Module E)',
     for (const stdout of ['"scripts/unknown\\377.mjs"\n', 'unterminated.mjs', 'bad\ufffd.mjs\0']) {
       expect(behindFiles('/repo', 'main', () => ({ status: 0, stdout }), {})).toBeNull();
     }
-  });
-  it('strict gate and TRUST_CHAIN lag refuses even off-path with last-good and rebuild grace', () => {
-    withManagedCloneEnv('1', () => {
-      for (const file of ['scripts/lib/gate-config.mjs', ...TRUST_CHAIN.map((m) => `scripts/lib/${m.file}`)]) {
-        expect(() => assertMainNotStale('/repo', scopeWarn, scopedOptions([file]))).toThrow(/STALE/);
-      }
-    });
-  });
-  it('strict settings schema and registry lag refuses even off-path', () => {
-    withManagedCloneEnv('1', () => {
-      for (const file of ['scripts/lib/settings-files.mjs', 'scripts/lib/settings-registry-metadata.json',
-        'scripts/lib/settings-registry-metadata.d/settings/daemons.json']) {
-        expect(() => assertMainNotStale('/repo', scopeWarn, scopedOptions([file]))).toThrow(/STALE/);
-      }
-    });
-  });
-  it('strict daemon entry lag refuses even when dispatchPath rejects it', () => {
-    withManagedCloneEnv('1', () => {
-      expect(() => assertMainNotStale('/repo', scopeWarn, scopedOptions(['daemon.mjs']))).toThrow(/STALE/);
-    });
-  });
-  it('unknown, empty, malformed or unreadable behind list refuses despite stale-build fallbacks', () => {
-    withManagedCloneEnv('1', () => {
-      for (const files of [null, [], [null], ['']]) {
-        expect(() => assertMainNotStale('/repo', scopeWarn, scopedOptions(files))).toThrow(/STALE/);
-      }
-      expect(() => assertMainNotStale('/repo', scopeWarn, scopedOptions(null, {
-        listBehindFiles: () => { throw new Error('unreadable'); },
-      }))).toThrow(/STALE/);
-    });
-  });
-  it('default scope refuses unknown or incomplete import closure with rebuild fallback guidance', () => {
-    withManagedCloneEnv('1', () => {
-      expect(() => assertMainNotStale('/repo', scopeWarn, scopedOptions(['other.mjs'], {
-        dispatchPath: null,
-      }))).toThrow(/clone-held-stale/);
-      expect(() => assertMainNotStale('/repo', scopeWarn, scopedOptions(['backlog/card.md'], {
-        dispatchPath: null,
-      }))).toThrow(/STALE/);
-    });
-  });
-  it('no dispatchPath: unrelated code is allowed and tolerated lag is logged once per daemon/count/files', () => {
-    dir = mkdtempSync(join(tmpdir(), 'default-stale-scope-'));
-    mkdirSync(join(dir, 'scripts'), { recursive: true });
-    writeFileSync(join(dir, 'scripts/daemon.mjs'), "import './shared.mjs';\n");
-    writeFileSync(join(dir, 'scripts/shared.mjs'), 'export const x = 1;\n');
-    const logs = [];
-    const opts = { label: `default-scope-${dir}`, codeRoot: dir, entryModule: 'scripts/daemon.mjs',
-      listBehindFiles: () => ['scripts/unrelated.mjs'], write: (s) => logs.push(s) };
-    withManagedCloneEnv('1', () => {
-      expect(assertMainNotStale(dir, scopeWarn, opts)).toMatchObject({ fresh: true, behindOffDispatchPath: true });
-      assertMainNotStale(dir, scopeWarn, opts);
-      expect(() => assertMainNotStale(dir, scopeWarn, { ...opts,
-        listBehindFiles: () => ['scripts/shared.mjs'], lastGood: () => null, rebuildGrace: () => null,
-      })).toThrow(/STALE/);
-    });
-    // Both unresolved imports and dynamic targets make the default scope unknown.
-    for (const source of ["import './missing.mjs';", 'await import(process.env.MODULE);',
-      "require('./worker.cjs');", 'const req = createRequire(import.meta.url);',
-      "spawn(process.execPath, ['./worker.mjs']);", "exec('node worker.mjs');",
-      "fork('./worker.mjs');", "import '/external.mjs';", "import 'file:///external.mjs';"]) {
-      writeFileSync(join(dir, 'scripts/daemon.mjs'), source);
-      withManagedCloneEnv('1', () => {
-        expect(() => assertMainNotStale(dir, scopeWarn, { ...opts,
-          lastGood: () => ({ onLastGood: true }), rebuildGrace: () => ({ grace: true }),
-        })).toThrow(/STALE/);
-      });
-    }
-    expect(logs).toHaveLength(1);
-    expect(logs[0]).toContain(opts.label);
-    expect(logs[0]).toMatch(/7 commit.*scripts\/unrelated.mjs.*tolerated lag.*tolerating the lag and dispatching/);
-  });
-  // #4387 — a caller's `dispatchPath` narrows the refusal to the files that dispatch actually runs.
-  it('managed clone behind in code OFF the dispatch path dispatches and logs the tolerated lag (#4387)', () => {
-    const clonePath = makeBehindClone('unrelated.mjs');
-    const logs = [];
-    const st = withManagedCloneEnv('1', () => assertMainNotStale(clonePath, undefined, {
-      label: 'test', dispatchPath: (p) => p === 'review.mjs', write: (s) => logs.push(s),
-    }));
-    expect(st).toMatchObject({ fresh: true, behindOffDispatchPath: true, behind: 1, codeFiles: 1 });
-    expect(logs.join('')).toMatch(/1 commit\(s\) behind origin\/main .*tolerating the lag/);
-    expect(git(clonePath, 'rev-list', '--count', 'HEAD..origin/main').trim()).toBe('1'); // never touched
-  });
-  it('managed clone behind in code ON the dispatch path still refuses (#4387)', () => {
-    const clonePath = makeBehindClone('review.mjs');
-    expect(() => withManagedCloneEnv('1', () => assertMainNotStale(clonePath, undefined, {
-      label: 'test', dispatchPath: (p) => p === 'review.mjs', write: () => {},
-    }))).toThrow(/STALE code from this checkout/);
-  });
-  it('dispatchPath fails closed: unknown behind files or unknown default closure refuses', () => {
-    const warn = () => ({ action: 'warn', reason: 'not-auto-syncing', behind: 3, ahead: 0, dirty: false });
-    const opts = { label: 'test', dispatchPath: () => false, write: () => {}, lastGood: () => null };
-    withManagedCloneEnv('1', () => {
-      expect(() => assertMainNotStale('/repo', warn, { ...opts, listBehindFiles: () => null })).toThrow(/STALE/);
-      expect(() => assertMainNotStale('/repo', warn, { ...opts, listBehindFiles: () => [] })).toThrow(/STALE/);
-      expect(() => assertMainNotStale('/repo', warn, { ...opts, dispatchPath: null, listBehindFiles: () => ['x.mjs'] }))
-        .toThrow(/STALE/);
-      // a behind TEST file on the dispatch path is not code — tolerated
-      expect(assertMainNotStale('/repo', warn, { ...opts, dispatchPath: (p) => p.startsWith('a/'), listBehindFiles: () => ['a/__tests__/r.mjs', 'x.mjs'] }))
-        .toMatchObject({ fresh: true, behindOffDispatchPath: true });
-    });
-  });
-  it('dispatchPath never widens an UNMANAGED checkout\'s rule — a diverged checkout still refuses (#4387)', () => {
-    const warn = () => ({ action: 'warn', reason: 'diverged', behind: 3, ahead: 1, dirty: false });
-    withManagedCloneEnv(undefined, () => {
-      expect(() => assertMainNotStale('/repo', warn, { dispatchPath: () => false, listBehindFiles: () => ['x.mjs'] }))
-        .toThrow(/DIVERGED/);
-    });
   });
   // Live 2026-10-04 (PRs #3923/#3924): a daemon clone is main + overlay MERGES, so it has several merge bases
   // with origin/main and `git diff HEAD...origin/main` picked the plain-main one — counting a file an overlay
@@ -474,25 +413,11 @@ describe('assertMainNotStale — managed clone never auto-ffs (#4044 Module E)',
       lastGood: () => null, rebuildGrace: () => ({ grace: true }),
     }))).toThrow(/STALE/);
   });
-  // The bounded rebuild-in-progress grace: on-path lag while the clone's own rebuild runs still dispatches.
-  it('rebuild grace: on-path lag dispatches only while a rebuild is in progress; unknown diff still refuses', () => {
-    const warn = () => ({ action: 'warn', reason: 'not-auto-syncing', behind: 9, ahead: 0, dirty: false });
-    const logs = [];
-    const opts = {
-      label: 'test', dispatchPath: (p) => p === 'review.mjs', write: (s) => logs.push(s), lastGood: () => null,
-      listBehindFiles: () => ['review.mjs', 'backlog/x.md'],
-    };
+  it('rebuild grace remains limited to callers supplying dispatch scope and allowlisted clean lag', () => {
     withManagedCloneEnv('1', () => {
-      const building = () => ({ grace: true, reason: 'rebuild-in-progress', target: 'a'.repeat(40), sinceAdoptMs: 600_000 });
-      expect(assertMainNotStale('/repo', warn, { ...opts, rebuildGrace: building }))
-        .toMatchObject({ fresh: true, rebuildGrace: true, onPathFiles: ['review.mjs'] });
-      expect(logs.join('')).toMatch(/ON this dispatch's code path \(review\.mjs\).*rebuild to aaaaaaaaaaaa is in progress/);
-      expect(() => assertMainNotStale('/repo', warn, { ...opts, rebuildGrace: () => ({ grace: false, reason: 'grace-expired' }) }))
-        .toThrow(/STALE/);
-      expect(() => assertMainNotStale('/repo', warn, { ...opts, rebuildGrace: () => { throw new Error('x'); } })).toThrow(/STALE/);
-      expect(() => assertMainNotStale('/repo', warn, { ...opts, listBehindFiles: () => null, rebuildGrace: building })).toThrow(/STALE/);
-      // an unknown default closure never gets the grace
-      expect(() => assertMainNotStale('/repo', warn, { ...opts, dispatchPath: null, rebuildGrace: building })).toThrow(/STALE/);
+      const opts = options({ dispatchPath: () => true, rebuildGrace: () => ({ grace: true }) });
+      expect(assertMainNotStale('/repo', warn, opts)).toMatchObject({ fresh: true, rebuildGrace: true });
+      expect(assertMainNotStale('/repo', warn, { ...opts, dispatchPath: null })).toMatchObject({ fresh: true, behindTolerated: true });
     });
   });
   it('codeDirty: untracked non-code files do not count; a tracked change or untracked code does', () => {
@@ -502,20 +427,10 @@ describe('assertMainNotStale — managed clone never auto-ffs (#4044 Module E)',
     expect(codeDirty('/r', run(' M backlog/x1.md\n'))).toBe(true);
     expect(codeDirty('/r', run('', 128))).toBe(true);
   });
-  it('last-good fallback ignores untracked non-code files (live 2026-10-04: review cards left in the clone)', () => {
-    const warn = () => ({ action: 'warn', reason: 'not-auto-syncing', behind: 9, ahead: 0, dirty: true });
-    const seen = [];
-    const opts = {
-      label: 'test', write: () => {}, listBehindFiles: () => ['review.mjs'], dispatchPath: (p) => p === 'review.mjs',
-      rebuildGrace: () => ({ grace: false }),
-      lastGood: (_r, dirty) => { seen.push(dirty); return dirty ? { onLastGood: false } : { onLastGood: true, lastGood: 'a'.repeat(40) }; },
-    };
-    withManagedCloneEnv('1', () => {
-      expect(assertMainNotStale('/repo', warn, { ...opts, treeDirtyForCode: () => false })).toMatchObject({ fresh: true, onLastGood: true });
-      expect(() => assertMainNotStale('/repo', warn, { ...opts, treeDirtyForCode: () => true })).toThrow(/STALE/);
-      expect(() => assertMainNotStale('/repo', warn, { ...opts, treeDirtyForCode: () => { throw new Error('x'); } })).toThrow(/STALE/);
-    });
-    expect(seen).toEqual([false, true, true]);
+  it('dirty tree cannot use last-good even if codeDirty would ignore untracked markdown', () => {
+    withManagedCloneEnv('1', () => expect(() => assertMainNotStale('/repo', () => ({ ...warn(), dirty: true }), options({
+      treeDirtyForCode: () => false, lastGood: () => ({ onLastGood: true }),
+    }))).toThrow(/STALE/));
   });
   it('isCodePath: modules and JSON are code; markdown and tests are not', () => {
     expect(['a.mjs', 'x/y.js', 'c.cjs', 'd.ts', 'src/_data/x.json', 'package-lock.json'].every(isCodePath)).toBe(true);

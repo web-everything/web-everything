@@ -711,14 +711,10 @@ describe('dispatchReview — managed clone behind origin/main (#4387)', () => {
   });
   const managed = () => { prevEnv = process.env.WE_DAEMON_MANAGED_CLONE; process.env.WE_DAEMON_MANAGED_CLONE = '1'; };
 
-  it('behind only in code OFF the review path: the review dispatches (before #4387: refused)', () => {
+  it('behind in scripts/** code, even OFF the review path: refuses (allowlist ruling, supersedes #4387)', () => {
     const root = behindClone('scripts/backlog/capacity.mjs', 'scripts/lane-pool.mjs', 'backlog/1-card.md');
     managed();
-    const stderr = vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
-    try {
-      expect(run(root)).toHaveLength(1);
-      expect(stderr.mock.calls.map((c) => String(c[0])).join('')).toMatch(/3 commit\(s\) behind origin\/main .*scripts\/backlog\/capacity\.mjs.*tolerating the lag/);
-    } finally { stderr.mockRestore(); }
+    expect(() => run(root)).toThrow(/3 commit\(s\) behind origin\/main.*STALE code from this checkout/s);
     expect(git(root, 'rev-list', '--count', 'HEAD..origin/main').trim()).toBe('3'); // the clone is never moved
   });
 

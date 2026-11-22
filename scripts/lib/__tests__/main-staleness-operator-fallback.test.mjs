@@ -87,6 +87,14 @@ describe('operator CLI fresh-checkout fallback (drain re-stamp, PR #4880)', () =
     expect(o.write.mock.calls[0][0]).toContain(`knob source: ${source}`);
   });
 
+  it.each(['garbage', '', '999999999999999999999'])('unknown root count %j refuses instead of reporting fresh', rootBehind => {
+    const { o, call } = fixture({ rootBehind, env: { WE_OPERATOR_CLI_FRESH_FALLBACK: 'off' } });
+    expect(call).toThrow(/run from an up-to-date lane/);
+    expect(o.spawn).not.toHaveBeenCalled();
+  });
+  it.each(['garbage', '', '999999999999999999999'])('unknown fallback count %j refuses instead of reporting fresh', candidateBehind => {
+    refuses({ candidateBehind });
+  });
   it('accepts non-code lag and untracked non-code files', () => {
     const { call } = fixture({ candidateBehind: 5, candidateFiles: ['backlog/card.md'], dirty: '?? notes.md\n' });
     expect(call()).toEqual({ reexecedFrom: candidate, status: 7 });

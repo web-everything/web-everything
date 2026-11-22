@@ -1,5 +1,5 @@
 {
-  "description": "Daemon inventory and launch-label account mappings.",
+  "description": "Daemon account mappings and staleLagTolerated glob exemptions; missing evidence and protected paths always refuse.",
   "owner": "scripts/settings/claude-accounts.json",
   "changeVia": "pr",
   "instant": false

@@ -2184,16 +2184,22 @@ whose pending hash already landed without reservation refs: identical content de
 differing content holds, with no new claim. Deferred-numbering fixtures inject the `execFile`
 option on `numberPendingHashes` and mock the shared process reader, so every Git path uses
 the same fixture without depending on captured builtin imports or patching native ESM bindings.
-Review staleness fixtures must use off-path files from the current sandbox import closure.
-Collision healing now pulls `backlog/frontmatter.mjs` onto that path; cover its refusal and
-use `backlog/capacity.mjs` for tolerated unrelated lag in both dispatch modes and the soak.
-Managed-clone staleness fixtures without `dispatchPath` use the process entry module's import
-closure by default (`entryModule` and `codeRoot` are injectable). Unreadable/incomplete closures or
-unknown behind-file lists refuse; the operator remedy remains the gated rebuild's `clone-held-stale`
-alert. Gate/TRUST_CHAIN files, settings modules and registry metadata, and the daemon entry always
-refuse, including with last-good or rebuild grace evidence. Fixtures exercising those fallbacks must
-supply a known, non-strict behind-file list and dispatch scope. Tolerated lag logs deduplicate by
-label, behind count, and sorted file list within the process.
+Managed-clone staleness fixtures exercise the real `assertMainNotStale` against the
+`daemons.staleLagTolerated` settings allowlist, with an injectable checked settings reader.
+Every behind path must match; scripts, gate/TRUST_CHAIN, settings registry files,
+`.claude/` and `docs/agent/` always refuse. Unknown/empty/undecodable path lists,
+failed status or commit counts, missing/unreadable settings, dirty and diverged trees
+refuse even with last-good or rebuild-grace evidence. The existing fallback scopes remain
+subject to this boundary; rebuild grace still requires an explicit dispatch scope, which
+never grants path tolerance. The remedy is the gated rebuild's `clone-held-stale` alert.
+Globs support `*`, `**`, `?` and leading `!` exclusions; any exclusion wins. Oversized
+settings (over 256 patterns or 1024 characters per pattern) refuse: reduce the list,
+restore readable settings and retry the gated rebuild. The soak's presence probe uses
+tolerated-path-only lag; a separate unconditional test verifies gate/TRUST_CHAIN refusal.
+Logs deduplicate by daemon label, behind count, sorted files and reason. The shared policy
+cascade reports the effective setting and source. No Frontier UI or plateau-app exemption
+is seeded: these are sibling repositories, with no corresponding source directory in WE;
+no daemon-independent UI subtree in this checkout was established.
 
 Both collision planners refuse to move a `bornAs` card or a reserved source number. Remote-backed
 heals never reuse a gap below the frontier: trees and reservation refs cannot show whether a gap

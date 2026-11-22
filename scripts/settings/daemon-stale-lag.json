@@ -1,0 +1,6 @@
+{
+  "$comment": "Managed clone lag exemptions. Missing/unreadable settings refuse. Globs: *, **, ?, ! exclusions. All files must match. scripts/**, TRUST_CHAIN, gate-config, registry files, .claude/** and docs/agent/** can never be exempted. No environment override. Standard default: []; platform preferences precede this tool declaration. Reduce oversized lists (max 256 patterns of 1024 characters) and retry the gated rebuild.",
+  "daemons": {
+    "staleLagTolerated": ["backlog/**", "designs/**", "docs/**", "**/*.md", "**/__tests__/**", "**/*.test.*", "!.claude/**", "!docs/agent/**"]
+  }
+}
