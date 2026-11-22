@@ -1,0 +1,10 @@
+{
+  "source": "origin/main",
+  "commit": "a72a6a01d6d263b41d50403fa1f93e0b367f531c",
+  "references": [
+    [
+      "AGENTS.md",
+      "7. **Prove claims by observation \u2014 never assert an untested cause.** Before telling the user something works, is fixed, or is broken-because-X, back it with a **real probe of the running system** (curl the served HTML, drive the browser, run the gate, grep the actual output). \"Cache / stale tab / hard-reload / it's just uncommitted\" are **hypotheses to test and rule out by observation**, never diagnoses to hand over. If you haven't run the probe, you haven't diagnosed \u2014 say \"let me check\" and check. When a probe itself could be wrong (a guessed key/port/selector), say so rather than presenting an inconclusive run as proof. Full discipline \u2192 [testing.md](docs/agent/testing.md#proof-based-verification--observe-before-you-claim)."
+    ]
+  ]
+}
