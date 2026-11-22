@@ -15,7 +15,7 @@ import { createAsyncShadow } from '../drain-async-shadow.mjs';
 import { traceEnabled } from '../test-cache-trace.mjs';
 import { derivePanelVerdict } from '../jury-core.mjs';
 import { REVIEW_TIMING_DEFAULTS, reviewStartGate } from '../review-timing.mjs';
-import { postAcceptAdvisoryDecision } from '../review-loop-policy.mjs';
+import ShadowReporter from '../../test-cache/shadow-reporter.mjs';
 import { planReconcile } from '../../conveyor/reconcile-core.mjs';
 import { createDeliveryCapacityTune } from '../../operations/delivery-capacity-tune-shell.mjs';
 import { evaluatePrGates } from '../merge-gate-ci.mjs';
@@ -122,8 +122,9 @@ const churnPlan = (settings, comments, trees) => plan(reconcilePr(REQUIRED.map(o
   reviewChurn: { settings, headTree: 't'.repeat(40), trees } }));
 const startGate = (policy, checks) => reviewStartGate({ headSha: HEAD, checks, requiredChecks: REQUIRED,
   rowsHead: HEAD, rowsComplete: true, repo: 'we', policy });
-// Both strings mean "a required check is not registered yet"; reconcile-core#ciMissingRerun treats them alike.
-const MISSING_CHECK_REASONS = ['ci-not-registered', 'required-checks-not-successful'];
+const startEarlyOf = value => resolveTimingPolicy({ env: { WE_REVIEW_START_EARLY: value }, platformReview: {}, platformFix: {} }).review;
+// startEarly is read only when startAfter is NOT the repo's `push`: these are the documented rollback targets.
+const ROLLBACK_START_AFTER = ['fast-checks', 'ci-green'];
 
 const consumers = {
   'review-churn same tree': env => {
@@ -137,20 +138,19 @@ const consumers = {
     const result = churnPlan(settings, heads.map((head, i) => accept(head, i + 1)), {});
     return { observed: rowOf(result)?.churnShadow?.kind ?? null, counted: without(result, 'churnShadow') };
   },
+  // Driven under each rollback startAfter, where reviewStartGate reads startEarly (under the repo's `push` it is
+  // unread: pinned separately below). Review permission (`allowed`) is the counted decision; the refusal reason a
+  // status label reads is pinned in its own test, because retiring DOES rename it on two shapes.
   'review-early-start': env => {
-    // The repo's resolved policy (startAfter=push) never reads startEarly, so its gates and plans must be
-    // byte-identical. The standard startAfter (fast-checks) is where startEarly IS read: the observer fires there.
-    const live = resolveTimingPolicy({ env, platformReview: {}, platformFix: {} }).review;
-    const standard = { ...REVIEW_TIMING_DEFAULTS, startEarly: live.startEarly };
-    const shapes = Object.values(CHECK_SHAPES);
+    const { startEarly } = resolveTimingPolicy({ env, platformReview: {}, platformFix: {} }).review;
+    const policies = ROLLBACK_START_AFTER.map(startAfter => ({ ...REVIEW_TIMING_DEFAULTS, startAfter, startEarly }));
     return {
-      observed: startGate(standard, CHECK_SHAPES.fastPending).wouldStartEarly ?? null,
-      // Under the standard policy the refusal REASON for a missing fast check is renamed; it is pinned below.
-      counted: JSON.stringify({ live: shapes.map(checks => startGate(live, checks)),
-        standardAllowed: shapes.map(checks => startGate(standard, checks).allowed),
-        plans: shapes.map(checks => plan(reconcilePr(checks), live)) }),
+      observed: policies.every(policy => startGate(policy, CHECK_SHAPES.fastPending).wouldStartEarly === true),
+      counted: JSON.stringify(policies.map(policy =>
+        Object.values(CHECK_SHAPES).map(checks => [startGate(policy, checks).allowed, startGate(policy, checks).affected]))),
     };
   },
+  // The tune shell is observation only (its recommendation is journaled, never applied): observer-only.
   'delivery-capacity auto tune': (env, mode) => {
     const resolvePolicy = () => resolveDeliveryCapacity({ env, platform: {},
       read: () => ({ deliveryCapacity: { autoTune: { mode } } }) });
@@ -160,35 +160,33 @@ const consumers = {
     const tune = createDeliveryCapacityTune({ resolvePolicy, io, coordinationRoot: () => 'coord', now: () => now,
       exec: () => { touched.push('gh'); throw Error('no network in this test'); },
       readOpenPrs: () => [], readSources: () => ({}) });
-    const readout = { units: 4, mode: 'units' };
-    const before = JSON.stringify(readout);
-    tune(readout);
-    const { autoTune, ...enforced } = resolvePolicy().value;
-    return { observed: touched.length > 0,
-      counted: JSON.stringify({ enforced, readoutUnchanged: JSON.stringify(readout) === before }) };
+    tune({ units: 4, mode: 'units' });
+    return { observed: touched.length > 0, counted: null };
   },
+  // The fix pass only logs the priority ranking (reconcile-fix-dispatch puts it on the pass output): observer-only.
   'delivery-priority': (env, mode) => {
     const lines = [];
-    const planned = [{ pr: 7, kind: 'fix', headRefOid: HEAD }];
-    const before = JSON.stringify(planned);
-    logFixPassPriorityShadow({ planned, env, now, log: line => lines.push(line), readOwner: () => null,
+    logFixPassPriorityShadow({ planned: [{ pr: 7, kind: 'fix', headRefOid: HEAD }], env, now, log: line => lines.push(line),
+      readOwner: () => null,
       readSettings: () => readDeliveryPrioritySettings({ env, read: () => JSON.stringify({ deliveryPriority: { mode } }) }) });
-    return { observed: lines.length > 0, counted: JSON.stringify({ plannedUnchanged: JSON.stringify(planned) === before }) };
+    return { observed: lines.length > 0, counted: null };
   },
-  // review-loop-cli computes the advisory decision and records it only when mode !== 'off'; the live push is
-  // driveRun's and never reads the mode. Observer-only: the shadow decision exists, the retired value computes none.
-  'post-accept-advisory': env => {
-    const { mode } = resolvePostAcceptAdvisorySettings({ env, platform: {}, log: () => {} }).value;
-    const decision = mode === 'off' ? null
-      : postAcceptAdvisoryDecision({ verdict: { verdict: 'accept', findings: [] }, mode, invalid: false });
-    return { observed: decision?.action === 'push', counted: null };
-  },
+  // Observer-only, and its gate (review-loop-cli `mode !== 'off'`) needs the whole review-loop harness. That real
+  // gate is driven under off/shadow/on, with live effects asserted identical, by review-loop-cli.test.mjs
+  // 'CLI records later %s broken ratings and preserves off/shadow/on live effects'. Here: the value that gate reads.
+  'post-accept-advisory': env => ({
+    observed: resolvePostAcceptAdvisorySettings({ env, platform: {}, log: () => {} }).value.mode !== 'off', counted: null }),
   'stale-referral-human': async env => {
     const decision = await decideStaleReferralHumanHold({ repo: 'o/r', headRefOid: HEAD, labels: [{ name: 'review:human' }] },
       { settings: resolveStaleReferralHumanShadow({ env, platform: {} }) });
     return { observed: decision.why !== 'shadow disabled', counted: null };
   },
-  'test-result-cache trace': env => ({ observed: traceEnabled(env), counted: null }),
+  // The vitest shadow reporter hands traced workers a run id only when tracing is on.
+  'test-result-cache trace': env => {
+    const reporterEnv = { ...env };
+    new ShadowReporter({ env: reporterEnv, dir: temp() }).onInit({ config: { root: temp() } });
+    return { observed: 'WE_TEST_CACHE_RUN_ID' in reporterEnv, counted: null };
+  },
   'drain-async': env => ({ observed: flags.find(([name]) => name === 'drain-async')[4](env) === 'shadow', counted: null }),
 };
 
@@ -198,7 +196,7 @@ it('every retired setting flag has a consumer probe', () => {
 });
 
 it.each(flags.filter(([name]) => consumers[name]))(
-  '%s: the real consumer observes the old shadow value and the retired value leaves its counted decision unchanged',
+  '%s: the real consumer observes the old shadow value and the retired value silences it, leaving any counted decision unchanged',
   async (name, envKey, before, off) => {
     const envFor = value => envKey ? { [envKey]: value } : {};
     const old = await consumers[name](envFor(before), before);
@@ -208,18 +206,32 @@ it.each(flags.filter(([name]) => consumers[name]))(
     expect(retired.counted, `${name}: counted decision`).toBe(old.counted);
   });
 
-it('review-early-start: under the standard startAfter, retiring renames only the missing-fast-check refusal, which reconcile reads both ways', () => {
-  const policy = value => ({ ...REVIEW_TIMING_DEFAULTS,
-    startEarly: resolveTimingPolicy({ env: { WE_REVIEW_START_EARLY: value }, platformReview: {}, platformFix: {} }).review.startEarly });
-  const shadow = startGate(policy('shadow'), CHECK_SHAPES.fastMissing);
-  const off = startGate(policy('off'), CHECK_SHAPES.fastMissing);
-  expect([shadow.reason, off.reason]).toEqual(['ci-not-registered', 'required-checks-not-successful']);
-  expect(off.allowed).toBe(shadow.allowed);
-  expect(off.affected).toEqual(shadow.affected);
-  expect(MISSING_CHECK_REASONS).toEqual(expect.arrayContaining([shadow.reason, off.reason]));
-  expect(read('scripts/conveyor/reconcile-core.mjs')).toContain("['required-checks-not-successful', 'ci-not-registered'].includes(gate.reason)");
-  for (const shape of ['green', 'pending', 'red', 'fastPending'])
-    expect(startGate(policy('off'), CHECK_SHAPES[shape]).reason, shape).toBe(startGate(policy('shadow'), CHECK_SHAPES[shape]).reason);
+it('review-early-start: under the repo startAfter (push) the start gate and the reconcile plan never read startEarly', () => {
+  const live = value => startEarlyOf(value);
+  expect(live('off').startAfter).toBe('push');
+  for (const [shape, checks] of Object.entries(CHECK_SHAPES)) {
+    expect(startGate(live('off'), checks), shape).toEqual(startGate(live('shadow'), checks));
+    expect(JSON.stringify(plan(reconcilePr(checks), live('off'))), shape).toBe(JSON.stringify(plan(reconcilePr(checks), live('shadow'))));
+  }
+});
+
+// NOT byte-identical, recorded rather than hidden: after a rollback of startAfter, the retired value restores the
+// original strict refusal REASON (review-timing.mjs: "Rollback preserves the original strict CI-green result").
+// Review permission and affected rows stay identical (counted above). The reason is an input to the review status
+// label (pr-status-label reviewCiWait), so after such a rollback two shapes are labelled from the strict reason.
+it('review-early-start: after a startAfter rollback, retiring renames exactly these refusal reasons', () => {
+  const renamed = {};
+  for (const startAfter of ROLLBACK_START_AFTER) for (const [shape, checks] of Object.entries(CHECK_SHAPES)) {
+    const [shadow, off] = ['shadow', 'off'].map(value =>
+      startGate({ ...REVIEW_TIMING_DEFAULTS, startAfter, startEarly: startEarlyOf(value).startEarly }, checks));
+    expect(off.allowed, `${startAfter} ${shape}`).toBe(shadow.allowed);
+    if (off.reason !== shadow.reason) renamed[`${startAfter} ${shape}`] = [shadow.reason, off.reason];
+  }
+  expect(renamed).toEqual({
+    'fast-checks fastMissing': ['ci-not-registered', 'required-checks-not-successful'],
+    'ci-green fastMissing': ['ci-not-registered', 'required-checks-not-successful'],
+    'ci-green red': ['ci-red', 'required-checks-not-successful'],
+  });
 });
 
 // Workflow triggers have no in-process consumer: no counted function reads a workflow file, so there is no
