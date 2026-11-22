@@ -336,6 +336,15 @@ const DRAFT_OPT_OUT = !!flags['no-draft'];
  *     also carry the auto-land signal. `park` is the ALREADY-VALIDATED label string (see `resolveParkLabel`).
  * @returns {{waitForChecks:boolean, labelWhenGreen:boolean, mergeWhenGreen:boolean, triggerDrain:boolean, mode:string, parkLabel?:string}}
  */
+/** A one-line note for a failed git child that never echoes its argv. execFileSync's `e.message` starts with
+ *  the whole command line, which carries the push URL and so any credentials embedded in it. Pure. */
+export function childFailureNote(e) {
+  if (e?.signal) return `signal ${e.signal}`;
+  if (Number.isInteger(e?.status)) return `exit ${e.status}`;
+  if (typeof e?.code === 'string' && /^[A-Z0-9_]{1,32}$/.test(e.code)) return e.code;
+  return 'failed';
+}
+
 export function planPrLand({ wait, labelOnGreen, park } = {}) {
   if (park) return { waitForChecks: false, labelWhenGreen: false, mergeWhenGreen: false, triggerDrain: false, mode: 'park', parkLabel: park };
   if (labelOnGreen) return { waitForChecks: true, labelWhenGreen: true, mergeWhenGreen: false, triggerDrain: false, mode: 'label-on-green' };
@@ -990,14 +999,18 @@ async function runCli() {
   // bounded, never prompts, and a failure is ignored with one stderr line: the guarded push still runs and git
   // decides. The unshallow tries REMOTE (the fetch URL) and falls back to the push URL when the clone stays shallow.
   function completeHistoryForPush({ remoteTip, pushUrl, remoteHeadRef }) {
-    const quietEnv = { ...process.env, GIT_TERMINAL_PROMPT: '0', GIT_NO_LAZY_FETCH: '1',
-      GIT_SSH_COMMAND: process.env.GIT_SSH_COMMAND || 'ssh -o BatchMode=yes' };
+    const quietEnv = { ...process.env, GIT_TERMINAL_PROMPT: '0', GIT_NO_LAZY_FETCH: '1' };
+    // BatchMode only when nothing else picks the ssh command: GIT_SSH_COMMAND overrides GIT_SSH and core.sshCommand,
+    // so forcing it would make this fetch use a different ssh identity than the push.
+    if (!process.env.GIT_SSH_COMMAND && !process.env.GIT_SSH && !tryGit(['config', '--get', 'core.sshCommand'])) {
+      quietEnv.GIT_SSH_COMMAND = 'ssh -o BatchMode=yes';
+    }
     const fetchQuiet = (args) => {
       try {
         execFileSync('git', ['fetch', '-q', '--no-tags', '--refmap=', ...args], { cwd: REPO, stdio: ['ignore', 'ignore', 'pipe'],
           timeout: 120_000, maxBuffer: 1024 * 1024, env: quietEnv });
       } catch (e) {
-        process.stderr.write(`pr-land [${REPO}] · history fetch before push failed (${String(e?.message || e).split('\n')[0]}); pushing anyway\n`);
+        process.stderr.write(`pr-land [${REPO}] · history fetch before push failed (${childFailureNote(e)}); pushing anyway\n`);
       }
     };
     const isShallow = () => tryGit(['rev-parse', '--is-shallow-repository']) === 'true';

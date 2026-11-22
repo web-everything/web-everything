@@ -4,6 +4,7 @@ import { mkdtempSync, writeFileSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
+import { childFailureNote } from '../pr-land.mjs';
 
 // Execute the actual CLI/checkpoint in a child. Loader substitutes only external gate/forge ports;
 // Git effects are recorded instead of executed. No real Git, forge, card filing or operator state.
@@ -66,7 +67,7 @@ function run({ check = true, fail = false, override = '', count = 15, exempt = f
       // realGit: the publish step's remote reads, ancestry/shallow checks and the push run against real local
       // bare repositories; every other git call stays stubbed.
       if (${!!realGit} && (['ls-remote', 'push', 'fetch', 'cat-file'].includes(args[0]) || args.includes('merge-base') || (args[0] === 'remote' && args.includes('--all'))
-        || args.includes('--is-shallow-repository'))) return execFileSync(cmd, args, opts);
+        || args.includes('--is-shallow-repository') || (args[0] === 'config' && args.includes('core.sshCommand')))) return execFileSync(cmd, args, opts);
       if (args.includes('--is-shallow-repository')) { if (${JSON.stringify(shallow)} === null) throw new Error('shallow unreadable'); return ${JSON.stringify(shallow)}; }
       if (args[0] === 'rev-parse') return args.includes('--absolute-git-dir') ? ${JSON.stringify(dir)} : ${JSON.stringify(sha)};
       if (args[0] === 'log') return 'fix: admission';
@@ -444,6 +445,35 @@ describe('pr-land lane publish against real local remotes', () => {
     expect(status).toBe(0);
     expect(tipOf(upstream)).toBe(head);
   }), 30_000);
+
+  // A forced `ssh -o BatchMode=yes` would override core.sshCommand, so the history fetch would reach a different
+  // ssh identity than the push, fail, and leave git's client-side "fetch first" rejection (self-review on #7307).
+  it('a shallow clone pushing over core.sshCommand completes history through that same ssh command and publishes', () => withRepos(({ root, upstream }) => {
+    const seed = join(root, 'seed'); git(root, 'init', '-q', seed);
+    const old = commit(seed, 'c1'); commit(seed, 'c2'); const head = commit(seed, 'c3');
+    git(seed, 'push', '-q', upstream, `${old}:${ref}`, '--force'); git(seed, 'push', '-q', upstream, 'HEAD:refs/heads/main');
+    const work = join(root, 'work');
+    git(root, 'clone', '-q', '--depth=1', '--branch=main', pathToFileURL(upstream).href, work);
+    const fakeSsh = join(root, 'fake-ssh.sh'), used = join(root, 'fake-ssh.log');
+    writeFileSync(fakeSsh, `#!/bin/sh\necho "$1" >> '${used}'\nshift\nexec sh -c "$*"\n`, { mode: 0o755 });
+    git(work, 'config', 'core.sshCommand', fakeSsh); git(work, 'config', 'ssh.variant', 'simple');
+    git(work, 'config', 'remote.origin.pushurl', `ssh://fixture-host${upstream}`);
+    git(work, 'remote', 'set-url', 'origin', join(root, 'gone.git')); // the fetch URL is unusable: history must come over ssh
+    const { status, result } = publishReal(work, head);
+    expect(result.reason).not.toBe('push-failed');
+    expect(status).toBe(0);
+    expect(tipOf(upstream)).toBe(head);
+    expect(readFileSync(used, 'utf8').split('\n').filter(Boolean).length).toBeGreaterThanOrEqual(3); // ls-remote, history fetch, push
+  }), 30_000);
+
+  it('a failed git child is reported by exit status, never by its argv (a push URL can carry credentials)', () => {
+    const e = Object.assign(new Error('Command failed: git fetch -q -- https://user:SECRET-TOKEN@h/x.git lane/x\nfatal: auth'), { status: 128, signal: null });
+    expect(childFailureNote(e)).toBe('exit 128');
+    expect(childFailureNote({ signal: 'SIGTERM', status: null, message: 'Command failed: git fetch -- https://u:SECRET@h/x' })).toBe('signal SIGTERM');
+    expect(childFailureNote({ code: 'ENOENT', message: 'spawnSync git ENOENT https://u:SECRET@h' })).toBe('ENOENT');
+    expect(childFailureNote({ code: 'https://u:SECRET@h', message: 'x' })).toBe('failed');
+    expect(childFailureNote(undefined)).toBe('failed');
+  });
 
   it('a shallow clone whose push target diverged still refuses (completed history proves it), and the tip is untouched', () => withRepos(({ root, upstream }) => {
     const seed = join(root, 'seed'); git(root, 'init', '-q', seed);
