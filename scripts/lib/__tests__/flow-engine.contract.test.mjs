@@ -99,7 +99,7 @@ export function flowEngineContract(api, register) {
     const resumed = { ...p, seq: 1, records: [historical] };
     assert.equal(api.plan(flow, { ...resumed, attempt: 2 })[0].attempt, 2);
     assert.throws(() => api.plan(flow, resumed), /key\/attempt already recorded/);
-    const duplicate = { ...first, predicate: { ...first.predicate, seq: 2 } };
+    const duplicate = api.transitionRecord(flow, first.predicate, { ...ctx, seq: 2 });
     assert.throws(() => api.plan(flow, { ...p, seq: 2, records: [first, duplicate], attempt: 2 }), /key\/attempt has a second body/);
     for (const attempt of [0, -1, 1.5, null, '2', 4]) {
       const malformed = { ...first, predicate: { ...first.predicate, attempt } };
@@ -175,23 +175,232 @@ test('append-only helper preserves existing log and swallows write and serializa
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
 
-test('shadow appends beside actual outcome, logs disagreement, and closes oversized/unreadable inputs with operator fallback', async () => {
+test('retry cannot reset its visit, skip attempts or accept after maxAttempts one', () => {
+  for (const maxAttempts of [1, 3]) {
+    const d = fixture(); d.retry.maxAttempts = maxAttempts;
+    const flow = engine.load(d), p = projection(flow);
+    const retry = engine.transitionRecord(flow, engine.plan(flow, { ...p, outcome: 'unknown' })[0], ctx);
+    const resumed = { ...p, seq: 1, records: [retry] };
+    for (const outcome of ['accept', 'unknown']) {
+      assert.throws(() => engine.plan(flow, { ...resumed, outcome, parts: { ...p.parts, Visit: 2 } }), /Retry exhausted|Retry continuity/);
+      assert.throws(() => engine.plan(flow, { ...resumed, outcome, attempt: 3 }), /Retry exhausted|Retry continuity/);
+      assert.throws(() => engine.plan(flow, { ...resumed, outcome, attempt: 2, parts: { ...p.parts, Visit: 2 } }), /Retry exhausted|Retry continuity/);
+    }
+    if (maxAttempts === 1) assert.throws(() => engine.plan(flow, resumed), /Retry exhausted/);
+  }
+});
+
+test('replay enforces retry identity and attempt continuity even on success', () => {
+  const d = fixture(); d.retry.maxAttempts = 3;
+  const flow = engine.load(d), p = projection(flow);
+  const first = engine.transitionRecord(flow, engine.plan(flow, { ...p, outcome: 'unknown' })[0], ctx);
+  const next = engine.plan(flow, { ...p, seq: 1, records: [first], attempt: 2 })[0];
+  for (const change of [{ key: 'review:o%2Fr%237:2', attempt: 1 }, { attempt: 3 }]) {
+    const second = engine.transitionRecord(flow, { ...next, ...change }, { ...ctx, seq: 2 });
+    assert.throws(() => engine.plan(flow, { ...p, seq: 2, records: [first, second] }), /Retry continuity/);
+  }
+  const one = engine.load(fixture()), q = projection(one);
+  const retry = engine.transitionRecord(one, engine.plan(one, { ...q, outcome: 'unknown' })[0], ctx);
+  const success = engine.transitionRecord(one, engine.plan(one, q)[0], { ...ctx, seq: 2 });
+  assert.throws(() => engine.plan(one, { ...q, seq: 2, records: [retry, success] }), /second body|Retry exhausted/);
+});
+
+test('replay keys must match declared template, encoding, repeated parts and subject', () => {
+  const d = fixture(); d.states['judge-convergence'].key += ':{Visit}';
+  const flow = engine.load(d), p = projection(flow), step = engine.plan(flow, p)[0];
+  for (const key of ['', 'anything', 'other:o%2Fr%237:1:1', 'review:o%2Fr%238:1:1', 'review:o%2fr%237:1:1', 'review:o%2Fr%237:1:2', 'review:%zz:1:1']) {
+    const record = engine.transitionRecord(flow, { ...step, key }, ctx);
+    assert.throws(() => engine.plan(flow, { ...p, seq: 1, records: [record] }), /replay key/, key);
+  }
+});
+
+test('replay refuses stripped or malformed statement, subject, versions and evidence', () => {
+  const flow = engine.load(fixture()), p = projection(flow);
+  const original = engine.transitionRecord(flow, engine.plan(flow, p)[0], ctx);
+  const mutations = [
+    r => r.predicate, r => { delete r._type; return r; }, r => { r.predicateType = 'urn:other'; return r; },
+    r => { r.subject = []; return r; }, r => { r.subject[0].name = 'o/r#8'; return r; },
+    r => { r.subject[0].digest.gitCommit = 'bad'; return r; }, r => { r.subject[1].digest.sha256 = 'bad'; return r; },
+    r => { r.subject[0].uri = 'https://github.com/o/r/pull/8'; return r; },
+    r => { delete r.subject[0].annotations; return r; },
+    r => { delete r.predicate.inputs; return r; }, r => { r.predicate.inputs = []; return r; },
+    r => { r.predicate.inputs = ['not a reference']; return r; }, r => { r.predicate.inputs = [null]; return r; },
+    r => { r.predicate.executor = 'urn:unversioned'; return r; },
+  ];
+  for (const change of mutations) assert.throws(() => engine.plan(flow, { ...p, seq: 1, records: [change(structuredClone(original))] }), /replay|projection/i, change.toString());
+  for (const change of [{ head: 'd'.repeat(40) }, { netDiff: 'e'.repeat(64) }, { repo: 'other/repo', pr: 7 }]) {
+    assert.throws(() => engine.plan(flow, { ...p, ...change, seq: 1, records: [original] }), /subject\/version/);
+  }
+  const continued = engine.transitionRecord(flow, engine.plan(flow, { ...p, outcome: 'continue' })[0], ctx);
+  const final = engine.transitionRecord(flow, engine.plan(flow, { ...p, parts: { ...p.parts, Visit: 2 } })[0], { ...ctx, head: 'd'.repeat(40), seq: 2 });
+  assert.throws(() => engine.plan(flow, { ...p, seq: 2, records: [continued, final] }), /subject\/version continuity/);
+});
+
+function approvalFixture() {
+  const d = fixture(), s = d.states['judge-convergence'];
+  s.kind = 'confirm'; s.confirm = { role: 'decider', outcomes: ['ratify', 'reject'], excludes: ['author', 'preparers'], bindsSubjectVersion: true, onSilence: 'stay-blocked' };
+  d.guards = { 'approval-valid': { classifies: 'approval proof', outcomes: ['pass', 'fail', 'unknown'] } };
+  s.on = ['ratify', 'reject'].flatMap(event => ['pass', 'fail', 'unknown'].map(outcome => ({ event: `confirm.${event}`, guard: 'approval-valid', outcome,
+    route: outcome === 'pass' ? 'advance' : 'retry', target: outcome === 'pass' ? (event === 'ratify' ? 'accepted' : 'parked') : 'judge-convergence' })));
+  return d;
+}
+
+test('approval replay requires exact subjectVersion and nonempty evidence references', () => {
+  const flow = engine.load(approvalFixture()), p = { ...projection(flow), event: 'confirm.ratify', outcome: 'pass' };
+  const step = engine.plan(flow, p)[0];
+  const record = engine.transitionRecord(flow, step, ctx);
+  assert.deepEqual(engine.plan(flow, { ...p, seq: 1, records: [record] }), []);
+  for (const change of [r => { delete r.predicate.subjectVersion; }, r => { r.predicate.subjectVersion = 'd'.repeat(40); }, r => { r.predicate.inputs = []; }]) {
+    const invalid = structuredClone(record); change(invalid);
+    assert.throws(() => engine.plan(flow, { ...p, seq: 1, records: [invalid] }), /replay/);
+  }
+});
+
+test('unmodified confirmation plan-to-record-to-replay round trip covers pass, fail and unknown retries', () => {
+  const def = approvalFixture(); def.retry.maxAttempts = 3;
+  const flow = engine.load(def);
+  for (const event of ['confirm.ratify', 'confirm.reject']) {
+    for (const outcome of ['pass', 'fail', 'unknown']) {
+      const p = { ...projection(flow), event, outcome };
+      const record = engine.transitionRecord(flow, engine.plan(flow, p)[0], ctx);
+      assert.equal(record.predicate.subjectVersion, ctx.head);
+      const resumed = { ...p, seq: 1, records: [record], attempt: 2, outcome: 'pass' };
+      const next = engine.plan(flow, resumed);
+      if (outcome === 'pass') {
+        assert.deepEqual(next, []);
+      } else {
+        assert.equal(record.predicate.route, 'retry');
+        assert.equal(next[0].attempt, 2);
+        assert.equal(next[0].key, record.predicate.key);
+        const completed = engine.transitionRecord(flow, next[0], { ...ctx, seq: 2 });
+        assert.equal(completed.predicate.subjectVersion, ctx.head);
+        assert.deepEqual(engine.plan(flow, { ...resumed, seq: 2, records: [record, completed] }), []);
+      }
+    }
+  }
+});
+
+test('confirmation producer binds subjectVersion from trusted context over a supplied step value', () => {
+  const flow = engine.load(approvalFixture()), p = { ...projection(flow), event: 'confirm.ratify', outcome: 'pass' };
+  const record = engine.transitionRecord(flow, { ...engine.plan(flow, p)[0], subjectVersion: 'd'.repeat(40) }, ctx);
+  assert.equal(record.predicate.subjectVersion, ctx.head);
+  assert.deepEqual(engine.plan(flow, { ...p, seq: 1, records: [record] }), []);
+});
+
+test('transitionRecord step cannot overwrite trusted flow digest sequence or context evidence', () => {
+  const flow = engine.load(fixture()), p = projection(flow);
+  const record = engine.transitionRecord(flow, { ...engine.plan(flow, p)[0], flow: 'forged', flowDigest: { sha256: '0'.repeat(64) }, seq: 999, inputs: [], at: 'bad', executor: 'urn:forged' }, ctx);
+  assert.equal(record.predicate.flow, flow.definition.id); assert.deepEqual(record.predicate.flowDigest, { sha256: flow.digest });
+  assert.equal(record.predicate.seq, 1); assert.deepEqual(record.predicate.inputs, ctx.inputs); assert.equal(record.predicate.at, ctx.at);
+  assert.deepEqual(engine.plan(flow, { ...p, seq: 1, records: [record] }), []);
+});
+
+test('key declarations refuse inherited constructor and toString properties', () => {
+  for (const name of ['constructor', 'toString']) {
+    const d = fixture(); d.states['judge-convergence'].key += `:{${name}}`;
+    assert.throws(() => engine.load(d), /not declared in keys.parts/);
+  }
+});
+
+test('approval fail cannot advance and observer role cannot bypass approval-valid', () => {
+  for (const role of ['decider', 'observer']) {
+    const d = approvalFixture(); d.states['judge-convergence'].confirm.role = role;
+    assert.doesNotThrow(() => engine.load(d));
+    const fail = structuredClone(d); fail.states['judge-convergence'].on[1] = { ...fail.states['judge-convergence'].on[1], route: 'advance', target: 'accepted' };
+    assert.throws(() => engine.load(fail), /approval-valid/);
+    const bypass = structuredClone(d); bypass.guards.other = bypass.guards['approval-valid'];
+    for (const t of bypass.states['judge-convergence'].on) t.guard = 'other';
+    assert.throws(() => engine.load(bypass), /approval-valid/);
+  }
+});
+
+function shadowFixture() {
   const def = fixture(), flow = engine.load(def), rows = [], logs = [];
-  const input = { definition: def, projection: projection(flow), ctx, logPath: 'records.jsonl' };
-  const options = { file: 'fixture', stat: () => ({ size: 1 }), read: () => JSON.stringify(input),
+  const input = { definition: def, projection: projection(flow), ctx: { ...ctx }, logPath: 'records.jsonl' };
+  let bytes, position;
+  const reads = [], closed = [];
+  const options = { file: 'fixture', open: () => { bytes = Buffer.from(JSON.stringify(input)); position = 0; return 42; },
+    read: (fd, buffer, offset, length) => {
+      assert.equal(fd, 42); reads.push(length);
+      const n = Math.min(length, bytes.length - position, 97);
+      bytes.copy(buffer, offset, position, position + n); position += n; return n;
+    }, close: fd => closed.push(fd),
     engine: { ...engine, appendTransition: async (_, row) => { rows.push(row); return true; } }, log: s => logs.push(s) };
-  const actual = { repo: ctx.repo, pr: ctx.pr, classified: { verdict: 'accept', loopOutcome: 'converged', outcome: 'auto-cleared' } };
-  await shadowReviewStep(actual, options);
-  assert.equal(rows.length, 1); assert(logs.some(s => s.includes('"agreement":true')));
-  await shadowReviewStep({ ...actual, classified: { outcome: 'parked' } }, options);
-  assert(logs.some(s => s.includes('shadow disagreement')));
-  const count = rows.length;
-  await shadowReviewStep(actual, { ...options, stat: () => ({ size: 262145 }), read: () => { throw Error('must not read oversized'); } });
-  assert.equal(rows.length, count); assert(logs.some(s => s.includes('operator must supply a bounded projection')));
-  await shadowReviewStep(actual, { ...options, read: () => { throw Error('unreadable'); } });
-  assert(logs.some(s => s.includes('unreadable')));
-  await shadowReviewStep(actual, { ...options, engine: { load: () => { throw Error('boom'); } }, log: () => { throw Error('logger failure'); } });
-  await shadowReviewStep(actual, { file: '', read: () => { throw Error('disabled must do no IO'); } });
+  // Exactly the fields passed by review-job's production completion adapter (no verdict).
+  const actual = { repo: ctx.repo, pr: ctx.pr, classified: { loopOutcome: 'converged', outcome: 'auto-cleared', runId: null, label: null } };
+  return { input, actual, options, rows, logs, reads, closed };
+}
+
+test('shadow maps production completion fields for successful and bounced reviews', async () => {
+  const f = shadowFixture();
+  await shadowReviewStep(f.actual, f.options);
+  assert.equal(f.rows.length, 1); assert(f.logs.some(s => s.includes('"agreement":true')));
+  f.input.projection.outcome = 'continue'; f.logs.length = 0;
+  await shadowReviewStep({ ...f.actual, classified: { outcome: 'bounced', loopOutcome: 'not-converged' } }, f.options);
+  assert(f.logs.some(s => s.includes('"agreement":true')));
+});
+
+test('shadow unrecognized actual never agrees with planned unknown', async () => {
+  const f = shadowFixture(); f.input.projection.outcome = 'unknown';
+  await shadowReviewStep({ ...f.actual, classified: { outcome: 'new-word' } }, f.options);
+  assert(f.logs.some(s => s.includes('"agreement":false')));
+  assert(f.logs.some(s => s.includes('shadow disagreement')));
+});
+
+test('shadow compares route and target as well as outcome', async () => {
+  for (const change of [{ route: 'wait' }, { to: 'parked' }]) {
+    const f = shadowFixture();
+    const step = engine.plan(engine.load(f.input.definition), f.input.projection)[0];
+    await shadowReviewStep(f.actual, { ...f.options, engine: { ...f.options.engine, plan: () => [{ ...step, ...change }] } });
+    assert(f.logs.some(s => s.includes('"agreement":false')));
+    assert(f.logs.some(s => s.includes('shadow disagreement')));
+  }
+});
+
+test('shadow refuses stale PR, head, net-diff, round and run before comparison or recording', async () => {
+  for (const name of ['repo', 'pr', 'head', 'netDiff', 'round', 'runId']) {
+    for (const nested of [false, true]) {
+      const f = shadowFixture(); f.input.ctx.round = 1; f.input.ctx.runId = 'old-run';
+      const actual = structuredClone(f.actual);
+      if (nested && !['repo', 'pr'].includes(name)) actual.classified[name] = 'new-value';
+      else actual[name] = 'new-value';
+      await shadowReviewStep(actual, f.options);
+      assert.equal(f.rows.length, 0, name); assert(f.logs.some(s => s.includes('context does not match')), name);
+      assert(!f.logs.some(s => s.includes('"agreement":true')));
+    }
+  }
+});
+
+test('shadow empty plan reports disagreement', async () => {
+  const f = shadowFixture();
+  await shadowReviewStep(f.actual, { ...f.options, engine: { ...f.options.engine, plan: () => [] } });
+  assert.equal(f.rows.length, 0);
+  assert(f.logs.some(s => s.includes('"agreement":false')));
+  assert(f.logs.some(s => s.includes('shadow disagreement')));
+});
+
+test('shadow fd reads stop at limit plus one despite growing input, close fd and name operator fallback', async () => {
+  const f = shadowFixture(); let total = 0;
+  await shadowReviewStep(f.actual, { ...f.options, read: (fd, buffer, offset, length) => {
+    assert.equal(fd, 42); assert.equal(buffer.length, 262145);
+    const n = Math.min(length, 10000); buffer.fill(32, offset, offset + n); total += n; return n;
+  } });
+  assert.equal(total, 262145); assert.deepEqual(f.closed, [42]); assert.equal(f.rows.length, 0);
+  assert(f.logs.some(s => s.includes('operator must supply a bounded projection')));
+  await shadowReviewStep(f.actual, f.options);
+  assert.equal(f.reads[0], 262145); assert.equal(f.rows.length, 1); // short reads are accumulated
+});
+
+test('shadow IO, append, engine and logger failures never throw into the tick', async () => {
+  const f = shadowFixture();
+  await shadowReviewStep(f.actual, { ...f.options, read: () => { throw Error('unreadable'); } });
+  assert(f.logs.some(s => s.includes('unreadable'))); assert.deepEqual(f.closed, [42]);
+  await shadowReviewStep(f.actual, { ...f.options, engine: { ...f.options.engine, appendTransition: async () => false } });
+  assert(f.logs.some(s => s.includes('append failed; operator')));
+  await shadowReviewStep(f.actual, { ...f.options, engine: { ...f.options.engine, appendTransition: async () => { throw Error('append rejected'); } } });
+  assert(f.logs.some(s => s.includes('append rejected')));
+  await shadowReviewStep(f.actual, { ...f.options, engine: { load: () => { throw Error('boom'); } }, log: () => { throw Error('logger failure'); } });
+  await shadowReviewStep(f.actual, { file: '', open: () => { throw Error('disabled must do no IO'); } });
 });
 
 test('negative: real daemon completion/merge routing is byte-equal with shadow disabled, mutating, throwing or rejecting', async () => {

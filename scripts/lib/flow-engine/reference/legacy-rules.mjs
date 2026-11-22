@@ -14,8 +14,8 @@ export const flowRules = {
   humanTask: (f) => { const out = []; for (const [k, s] of Object.entries(f.states)) { if (s.kind !== 'confirm') continue; const c = s.confirm;
     for (const t of s.on) { const m = /^confirm\.(.+)$/.exec(t.event ?? ''); if (!m) out.push(`${k}: transition on ${t.event ?? 'done'} — a human task advances only on a decider outcome (FLOW-DL-008)`); else if (!c.outcomes.includes(m[1])) out.push(`${k}: ${t.event} not a declared outcome (FLOW-DL-008)`); }
     for (const o of c.outcomes) if (!s.on.some((t) => t.event === `confirm.${o}`)) out.push(`${k}: outcome ${o} has no route (FLOW-DL-004)`);
-    if (c.role === 'decider' && !(c.excludes.includes('preparers') && c.excludes.includes('author'))) out.push(`${k}: decider task must exclude preparers and author (FLOW-DL-009)`);
-    if (c.role === 'decider' && !s.on.filter((t) => /^confirm\.(ratify|reject)$/.test(t.event)).every((t) => t.guard === 'approval-valid')) out.push(`${k}: ratify/reject must pass guard approval-valid (FLOW-DL-009)`); } return out; },
+    if (!(c.excludes.includes('preparers') && c.excludes.includes('author'))) out.push(`${k}: decider task must exclude preparers and author (FLOW-DL-009)`);
+    if (!s.on.filter((t) => /^confirm\.(ratify|reject)$/.test(t.event)).every((t) => t.guard === 'approval-valid' && (t.outcome === 'pass' || NONADV.has(t.route)))) out.push(`${k}: ratify/reject must pass guard approval-valid (FLOW-DL-009)`); } return out; },
   recordEmits: (f) => Object.values(f.states).some((s) => ['https://everstandards.dev/governance/ruling-record/v0.1', 'https://everstandards.dev/governance/ruling-record/v0'].includes(s.emits)) ? [] : ['no state emits a governance/ruling-record (FLOW-DL-010)'],
   retryBounded: (f) => { const uses = Object.values(f.states).some((s) => (s.on ?? []).some((t) => t.route === 'retry')); return uses && !(f.retry && f.states[f.retry.onExhausted]) ? ['retry routes without a bound and an onExhausted state (FLOW-DL-011)'] : []; },
   compensationSafe: (f) => (f.compensations ?? []).filter((c) => !f.states[c.for]).map((c) => `compensation for unknown state ${c.for} (FLOW-DL-012)`),

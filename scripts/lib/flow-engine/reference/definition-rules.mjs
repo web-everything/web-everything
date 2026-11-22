@@ -116,7 +116,7 @@ export function makeRules() {
       const steps = [...walk(f).filter((x) => STEP.has(x.state.kind)).map((x) => [x.name, x.state.key]), ...Object.entries(obj(f?.compensation?.steps)).map(([n, s]) => [`compensation ${n}`, s?.key])];
       for (const [n, key] of steps) {
         if (typeof key !== 'string') { out.push(`${n}: step has no key (FLOW-DEF-009)`); continue; }
-        for (const p of partsOf(key)) if (!parts[p]) out.push(`${n}: key part {${p}} is not declared in keys.parts (FLOW-DEF-009)`);
+        for (const p of partsOf(key)) if (!Object.hasOwn(parts, p)) out.push(`${n}: key part {${p}} is not declared in keys.parts (FLOW-DEF-009)`);
         if (seen.has(key)) out.push(`${n}: key ${key} is also the key of ${seen.get(key)}; step keys are unique (FLOW-DEF-009)`); seen.set(key, n);
       }
       return out;
@@ -128,7 +128,7 @@ export function makeRules() {
       for (const x of walk(f)) if (x.parent && hot.has(x.parent)) hot.add(x.name); // children of a re-entered compound are re-entered
       for (const x of walk(f)) {
         if (!STEP.has(x.state.kind) || !hot.has(x.name)) continue;
-        if (!partsOf(x.state.key).some((p) => parts[p]?.kind === 'visit')) out.push(`${x.name}: can be re-entered but its key ${x.state.key ?? '(none)'} has no visit part (FLOW-DEF-010)`);
+        if (!partsOf(x.state.key).some((p) => Object.hasOwn(parts, p) && parts[p]?.kind === 'visit')) out.push(`${x.name}: can be re-entered but its key ${x.state.key ?? '(none)'} has no visit part (FLOW-DEF-010)`);
       }
       return out;
     },

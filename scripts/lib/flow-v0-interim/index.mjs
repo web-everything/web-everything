@@ -11,7 +11,8 @@ export function transitionRecord(flow, step, ctx) {
     { name: subject, uri: `https://github.com/${ctx.repo}/pull/${ctx.pr}`, digest: { gitCommit: ctx.head },
       annotations: { 'we.id': `tag:everstandards.dev,${ctx.at.slice(0, 10)}:flow-run/we/${ctx.repo}/${ctx.pr}/t${ctx.seq}`, 'we.idempotencyKey': `tr:${subject}:${ctx.seq}` } },
     { name: 'net-diff', digest: { sha256: ctx.netDiff } },
-  ], predicateType, predicate: { flow: flow.definition.id, flowDigest: { sha256: flow.digest }, seq: ctx.seq, ...step,
+  ], predicateType, predicate: { ...step, flow: flow.definition.id, flowDigest: { sha256: flow.digest }, seq: ctx.seq,
+    ...(flow.definition.states[step.from]?.kind === 'confirm' ? { subjectVersion: ctx.head } : {}),
     inputs: [...ctx.inputs], at: ctx.at, executor: `https://github.com/web-everything/web-everything/blob/${ctx.executorCommit}/scripts/lib/flow-v0-interim/plan.mjs` } };
 }
 export async function appendTransition(path, record, append = appendFile) {
