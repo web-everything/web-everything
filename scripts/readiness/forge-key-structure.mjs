@@ -228,11 +228,10 @@ function canonicalize(bytes,emit,tick,{comments=true,utf16=true}={}) {
         if(piece[0]==='{')depth++;
         else if(piece[0]==='}'&&--depth===0) {emit(Buffer.from(text.slice(at,pieces.lastIndex)),{expand:false});closed=true;break;}
       }
-      // A candidate longer than the bound is never silently skipped: scan its whole tail instead of exhausting.
-      // jwkFinding only reports an object that names `kty` (literally or through a backslash escape), so a tail
-      // with neither marker cannot hold a JWK: that skip is exact, not an exemption. Unclosed JSON-shaped prose
-      // (truncated table cells) no longer exhausts the budget; a real key beyond the bound is still found.
-      if(!closed&&at+65536<text.length&&lastMarker>=at)emit(Buffer.from(text.slice(at)),{expand:false});
+      // A candidate longer than the bound is never silently skipped: fail closed.
+      // A JWK must name `kty`, literally or through a backslash escape, so a tail with neither marker cannot
+      // hold one under any parser: only then is the candidate dropped (exact, not an exemption).
+      if(!closed&&at+65536<text.length&&lastMarker>=at)throw EXHAUSTED;
     }
   }
   // Decimal/signed/0x byte arrays: comments are whitespace, never squeezed into numbers.

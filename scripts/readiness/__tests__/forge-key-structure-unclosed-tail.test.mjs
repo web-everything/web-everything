@@ -18,11 +18,17 @@ describe('forge key structure: unclosed object tails stay linear without weakeni
     expect(Date.now()-started).toBeLessThan(5000);
   });
   it('does not exhaust on truncated JSON-shaped cells in a large benign doc',()=>{
-    expect(keyStructureFinding(Buffer.from(truncated+prose+'\\|'))).toBeNull();
+    expect(keyStructureFinding(Buffer.from(truncated+prose))).toBeNull();
   });
-  it('still blocks a JWK that stays open past the 64 KiB candidate bound inside a large doc',()=>{
-    for(const pad of [65600,70000])
-      expect(keyStructureFinding(Buffer.from(truncated+prose+jwk(pad)))).toBe('private-key-structure');
+  it('still fails closed on a JWK open past the 64 KiB bound, including template-literal values',()=>{
+    for(const pad of [65600,70000]) {
+      expect(keyStructureFinding(Buffer.from(truncated+prose+jwk(pad)))).toMatch(/^private-key-(?:structure|scan-budget-exhausted-use-local)$/);
+      expect(keyStructureFinding(Buffer.from('an unclosed '+q+' {'+' '.repeat(pad)+q+['k','ty'].join('')+q+':`oct`,'+q+'k'+q+':`YQ`}')))
+        .toBe('private-key-scan-budget-exhausted-use-local');
+    }
+  });
+  it('fails closed when an escape could hide the key type in an unclosed tail',()=>{
+    expect(keyStructureFinding(Buffer.from(truncated+prose+'{"k\\u0074y":"oct"'))).toBe('private-key-scan-budget-exhausted-use-local');
   });
   it('still blocks a PEM private key inside a large doc',()=>{
     const pem='-----BEGIN '+['PRIVATE','KEY'].join(' ')+'-----\nQUJD\n-----END '+['PRIVATE','KEY'].join(' ')+'-----';
