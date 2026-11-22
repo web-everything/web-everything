@@ -12,9 +12,16 @@ import { GH_LIST_FILE_CAP, prHoldsFile, qualifyFile, repoKeyFor } from './free-s
 import { resolveCoordinationRoot } from './coordination-root.mjs';
 import { buildPrioritySetOperation, BUILD_PRIORITY_SET_EFFECT, validateBuildPriorityInput } from './build-priority-set.mjs';
 import { scopeEntriesOverlap } from '../readiness/scope-lease.mjs';
-import { TRUST_CHAIN } from '../lib/gate-config.mjs';
+import { isTrustChainPath, TRUST_CHAIN } from '../lib/gate-config.mjs';
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '../..');
+const SCOPE_GUARD_FILES = [
+  'scripts/operations/build-priority-set-io.mjs',
+  'scripts/operations/build-priority-set.mjs',
+  'scripts/operations/free-scope.mjs',
+  'scripts/readiness/scope-lease.mjs',
+  'scripts/lib/build-queue.mjs',
+];
 const READ_OPTIONS = { encoding: 'utf8', maxBuffer: 8 * 1024 * 1024, timeout: 10000, stdio: ['ignore', 'pipe', 'pipe'] };
 const canonicalId = id => id.replace(/^0+(?=\d)/, '');
 const refuse = why => { throw new Error(`build-priority-set: ${why}; repair evidence or drain open PRs and retry`); };
@@ -67,17 +74,20 @@ function prepare(input, options) {
   const readCard = options.readCard ?? readPriorityCards();
   let gateFiles;
   try {
+    if (!Array.isArray(TRUST_CHAIN) || !TRUST_CHAIN.length) refuse('empty or unreadable gate TRUST_CHAIN');
+    gateFiles = TRUST_CHAIN.flatMap(member => {
+      if (!Array.isArray(member?.homes) || !member.homes.length
+          || member.homes.some(home => typeof home !== 'string' || !home.trim())
+          || typeof member.file !== 'string' || !member.file.trim()) refuse('incomplete gate TRUST_CHAIN member');
+      return [...member.homes, member.file];
+    });
     if (options.gateFiles !== undefined) {
-      gateFiles = typeof options.gateFiles === 'function' ? options.gateFiles() : options.gateFiles;
-    } else {
-      if (!Array.isArray(TRUST_CHAIN) || !TRUST_CHAIN.length) refuse('empty or unreadable gate TRUST_CHAIN');
-      gateFiles = TRUST_CHAIN.flatMap(member => {
-        if (!Array.isArray(member?.homes) || !member.homes.length
-            || member.homes.some(home => typeof home !== 'string' || !home.trim())
-            || typeof member.file !== 'string' || !member.file.trim()) refuse('incomplete gate TRUST_CHAIN member');
-        return [...member.homes, member.file];
-      });
+      const extra = typeof options.gateFiles === 'function' ? options.gateFiles() : options.gateFiles;
+      if (!Array.isArray(extra) || !extra.length
+          || extra.some(home => typeof home !== 'string' || !home.trim())) refuse('empty or unreadable gate files');
+      gateFiles.push(...extra);
     }
+    gateFiles = [...new Set([...gateFiles, ...SCOPE_GUARD_FILES])];
   } catch {
     refuse('unreadable or incomplete gate files');
   }
@@ -95,10 +105,11 @@ function prepare(input, options) {
     });
     if (!scope.length) refuse(`card ${id} empty scope`);
     for (const entry of scope) {
-      if (!entry.startsWith('we:')) continue;
       for (const home of gateFiles) {
         if (scopeEntriesOverlap(entry, qualifyFile(home))) refuse(`card ${id} scope overlaps gate file ${home}`);
       }
+      const pathWithoutPrefix = entry.slice(entry.indexOf(':') + 1);
+      if (isTrustChainPath(pathWithoutPrefix)) refuse(`card ${id} scope overlaps gate file ${pathWithoutPrefix}`);
     }
     return scope;
   });

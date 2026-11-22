@@ -36,6 +36,12 @@ it.each([
   'we:scripts/**', 'we:scripts/lib/*.mjs', 'we:',
   `we:${TRUST_CHAIN.find(m => m.file !== 'gate-config.mjs').homes[0]}`,
   'we:gate-config.mjs',
+  'we:relocated/gate-config.mjs',
+  'we:scripts/operations/build-priority-set-io.mjs',
+  'we:scripts/operations/build-priority-set.mjs',
+  'we:scripts/operations/free-scope.mjs',
+  'we:scripts/readiness/scope-lease.mjs',
+  'we:scripts/lib/build-queue.mjs',
 ])('refuses gate scope coverage %s without writing a runtime file', async scope => {
   for (const preview of [false, true]) {
     const f = fixture({ readCard: id => ({ scope: id === '43' ? [scope] : ['we:scripts/a.mjs'] }) });
@@ -88,15 +94,39 @@ it('refuses gate evidence that becomes unreadable under the writer lock', async 
   untouched(f);
 });
 
+it.each([{ gateFiles: ['scripts/unrelated.mjs'] }, { gateFiles: () => ['scripts/unrelated.mjs'] }])(
+  'keeps canonical gate protection with unrelated override %j', async ({ gateFiles }) => {
+    const f = fixture({ gateFiles, readCard: () => ({ scope: ['we:scripts/lib/gate-config.mjs'] }) });
+    const result = await f.command();
+    expect(result.code).not.toBe(0);
+    expect(result.lines.join('\n')).toMatch(/scope overlaps gate file/);
+    expect(f.readPrs).not.toHaveBeenCalled();
+    untouched(f);
+  });
+
 it('installs a literal non-gate scope', async () => {
   const f = fixture({ readCard: () => ({ scope: ['we:scripts/a.mjs'] }) });
   expect((await f.command()).code).toBe(0);
   expect(JSON.parse(fs.readFileSync(f.path, 'utf8')).ids).toEqual(['42', '43']);
 });
 
-it.each(['fui:', 'plateau-app:'])('installs other-repo gate paths under %s', async prefix => {
+it.each(['fui:', 'plateau-app:', 'plateau:'])('refuses other-repo gate paths under %s', async prefix => {
   const f = fixture({ readCard: () => ({ scope: [`${prefix}scripts/lib/gate-config.mjs`] }) });
-  expect((await f.command()).code).toBe(0);
+  const result = await f.command();
+  expect(result.code).not.toBe(0);
+  expect(result.lines.join('\n')).toMatch(/scope overlaps gate file/);
+  expect(f.readPrs).not.toHaveBeenCalled();
+  untouched(f);
+});
+
+it('refuses the real cross-repo trust-chain daemon basename', async () => {
+  expect(TRUST_CHAIN.some(member => member.file === 'daemon.mjs')).toBe(true);
+  const f = fixture({ readCard: () => ({ scope: ['plateau:tools/drain-daemon/daemon.mjs'] }) });
+  const result = await f.command();
+  expect(result.code).not.toBe(0);
+  expect(result.lines.join('\n')).toMatch(/scope overlaps gate file.*daemon\.mjs/);
+  expect(f.readPrs).not.toHaveBeenCalled();
+  untouched(f);
 });
 
 it('runtime list install validates and writes atomically with mode 0600 and exact reader fields', async () => {
@@ -233,11 +263,13 @@ it.each([
   ['unrepresentable PR filenames', { readPrs: () => [{ repo: 'web-everything/web-everything', number: 1, files: ['scripts/a b.mjs'] }] }],
   ['missing card scope', { readCard: () => ({}) }],
   ['open PR overlap', { readPrs: () => [{ repo: 'web-everything/web-everything', number: 1, files: ['scripts/a.test.mjs'] }] }],
-  ['directory scope overlap', { readCard: () => ({ scope: ['we:scripts/'] }), readPrs: () => [{ repo: 'web-everything/web-everything', number: 1, files: ['scripts/a.mjs'] }] }],
+  ['directory scope overlap', { readCard: () => ({ scope: ['we:scripts/example/'] }), readPrs: () => [{ repo: 'web-everything/web-everything', number: 1, files: ['scripts/example/a.mjs'] }] }],
 ])('refuses %s and preserves the old runtime file', async (_name, overrides) => {
   const f = fixture(overrides);
   fs.writeFileSync(f.path, 'old');
-  expect((await f.command()).code).not.toBe(0);
+  const result = await f.command();
+  expect(result.code).not.toBe(0);
+  if (_name === 'directory scope overlap') expect(result.lines.join('\n')).toMatch(/scope overlaps open PR/);
   expect(fs.readFileSync(f.path, 'utf8')).toBe('old');
   untouched(f, ['build-priority.runtime.json']);
 });
