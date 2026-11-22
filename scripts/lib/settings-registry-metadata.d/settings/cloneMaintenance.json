@@ -1,0 +1,6 @@
+{
+  "description": "Interval between idle daemon clone garbage collections.",
+  "owner": "scripts/settings/clone-maintenance.json",
+  "changeVia": "pr",
+  "instant": false
+}

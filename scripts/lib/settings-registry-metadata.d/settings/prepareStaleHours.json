@@ -1,0 +1,6 @@
+{
+  "description": "Age in hours at which preparation is treated as stale.",
+  "owner": "scripts/settings/coroner-postmortem.json",
+  "changeVia": "pr",
+  "instant": false
+}

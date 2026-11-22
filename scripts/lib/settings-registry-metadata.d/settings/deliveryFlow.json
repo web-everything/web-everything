@@ -1,0 +1,6 @@
+{
+  "description": "Ordered delivery stages by change class, retaining protected spine stages.",
+  "owner": "scripts/settings/delivery-flow.json",
+  "changeVia": "pr",
+  "instant": false
+}

@@ -5,21 +5,25 @@
  */
 import { test } from 'vitest';
 import assert from 'node:assert/strict';
+import { createHash } from 'node:crypto';
+import { execFileSync } from 'node:child_process';
 import MarkdownIt from 'markdown-it';
 import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { buildRegistry, renderMarkdown } from '../settings-registry.mjs';
+import { buildRegistry, readMetadata, renderMarkdown } from '../settings-registry.mjs';
 import { CAPACITY_LEAVES } from '../operator-override-reader.mjs';
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '../../..');
 const META = 'scripts/lib/settings-registry-metadata.json';
+const META_DIR = 'scripts/lib/settings-registry-metadata.d';
+const filename = key => encodeURIComponent(key).replace(/[!'()*]/g, c => `%${c.charCodeAt(0).toString(16).toUpperCase()}`) + '.json';
 function fixture(t) {
   const root = mkdtempSync(join(tmpdir(), 'settings-registry-'));
   t.onTestFinished(() => rmSync(root, { recursive: true, force: true }));
   for (const dir of ['scripts/settings', 'scripts/lib']) mkdirSync(join(root, dir), { recursive: true });
-  const write = (path, value) => writeFileSync(join(root, path), JSON.stringify(value));
+  const write = (path, value) => { mkdirSync(dirname(join(root, path)), { recursive: true }); writeFileSync(join(root, path), JSON.stringify(value)); };
   write('scripts/dispatch-settings.json', { $comment: 'ignored', alpha: { count: 2 } });
   write('scripts/settings/feature.json', { beta: [1, 2], empty: {} });
   write('scripts/lib/delivery-platform-preferences.json', { alpha: { count: 5 } });
@@ -202,4 +206,69 @@ test('current numeric discovery evidence converges for H but not the M tail', ()
   const md = renderMarkdown(buildRegistry({ root: ROOT }));
   assert.ok(md.includes('H-impact discovery converged'));
   assert.ok(md.includes('M-impact tail has not converged'));
+});
+
+// Immutable compact snapshot captured before the per-key migration (not regenerated).
+const originalMetadata = JSON.parse(readFileSync(join(ROOT, 'scripts/lib/__tests__/fixtures/settings-registry-original.json'), 'utf8'));
+function split(f) {
+  for (const section of ['settings', 'capacityLeaves']) {
+    for (const [key, value] of Object.entries(f.meta[section])) f.write(`${META_DIR}/${section}/${filename(key)}`, value);
+    delete f.meta[section];
+  }
+  f.write(META, f.meta);
+}
+test('per-key directory reconstructs exactly the original metadata JSON shape and registry', t => {
+  const f = fixture(t), original = structuredClone(f.meta), before = f.build();
+  split(f);
+  assert.deepEqual(readMetadata({ root: f.root }), original);
+  assert.deepEqual(f.build(), before);
+});
+test('migration preserves the registry built from the original repository metadata JSON', t => {
+  const f = fixture(t);
+  rmSync(join(f.root, 'scripts/settings/feature.json'));
+  for (const row of buildRegistry().rows) for (const owner of row.owners) f.write(owner, JSON.parse(readFileSync(join(ROOT, owner), 'utf8')));
+  f.write(META, originalMetadata);
+  assert.deepEqual(buildRegistry(), buildRegistry({ root: f.root }));
+});
+test('a new metadata key file alone adds a row without editing the base metadata', t => {
+  const f = fixture(t); split(f);
+  const base = readFileSync(join(f.root, META), 'utf8');
+  f.write('scripts/settings/new.json', { newKey: 7 });
+  f.write(`${META_DIR}/settings/newKey.json`, { description: 'New key.', owner: 'scripts/settings/new.json', changeVia: 'pr', instant: false });
+  const registry = f.build();
+  assert.deepEqual(registry.problems, []);
+  assert.equal(registry.rows.find(row => row.key === 'newKey').value, 7);
+  assert.equal(readFileSync(join(f.root, META), 'utf8'), base);
+});
+test('duplicate metadata key in base and directory fails closed in either section', t => {
+  for (const section of ['settings', 'capacityLeaves']) {
+    const f = fixture(t), [key, value] = Object.entries(f.meta[section])[0];
+    f.write(`${META_DIR}/${section}/${filename(key)}`, value);
+    assert.throws(() => renderMarkdown(f.build()), /duplicate metadata key/);
+  }
+});
+test('filenames round-trip punctuation, percent, slash and Unicode keys in deterministic order', t => {
+  const f = fixture(t); split(f);
+  const keys = ['z', 'a.b', '$*', 'slash/\\percent%', 'café', '__proto__'];
+  for (const key of keys) f.write(`${META_DIR}/settings/${filename(key)}`, { description: key });
+  const metadata = readMetadata({ root: f.root });
+  for (const key of keys) assert.equal(metadata.settings[key].description, key);
+  assert.deepEqual(Object.keys(metadata.settings), Object.keys(metadata.settings).sort());
+});
+test('malformed names, unexpected entries and unreadable per-key JSON fail closed with repair paths', t => {
+  for (const name of ['bad%.json', '%61lpha.json', 'notes.txt']) {
+    const f = fixture(t); f.write(`${META_DIR}/settings/${name}`, {});
+    assert.throws(() => renderMarkdown(f.build()), /settings-registry-metadata\.d/);
+  }
+  const f = fixture(t); f.write(`${META_DIR}/settings/broken.json`, {});
+  writeFileSync(join(f.root, META_DIR, 'settings/broken.json'), '{');
+  assert.throws(() => renderMarkdown(f.build()), /settings-registry-metadata\.d\/settings\/broken.json/);
+});
+
+test('generated documentation preserves original bytes except the intentional per-key authoring instruction', () => {
+  const doc = readFileSync(join(ROOT, 'docs/agent/settings-registry.md'), 'utf8');
+  const originalInstruction = 'For repo defaults, edit the owner file through a PR and rebuild the consuming daemon. Add or update metadata in scripts/lib/settings-registry-metadata.json, then run `node scripts/lib/settings-registry.mjs --write`. Verify with `node scripts/lib/settings-registry.mjs --check`. Missing declarations or invalid evidence block generation; repair the named file before regenerating.';
+  const original = doc.replace(/^For repo defaults,.*$/m, originalInstruction);
+  assert.equal(createHash('sha256').update(original).digest('hex'), '239663dfb7c702b1f8cf475f1b8659d16fea92c2deaa92c027f3a67f5106cc8d');
+  execFileSync(process.execPath, [join(ROOT, 'scripts/lib/settings-registry.mjs'), '--check']);
 });

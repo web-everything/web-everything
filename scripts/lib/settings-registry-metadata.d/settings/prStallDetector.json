@@ -1,0 +1,6 @@
+{
+  "description": "Repeated-reason and unchanged-label stall detection.",
+  "owner": "scripts/settings/pr-stall-sweep.json",
+  "changeVia": "pr",
+  "instant": false
+}

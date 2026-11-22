@@ -1,0 +1,5 @@
+{
+  "description": "Maximum concurrently leased lanes.",
+  "range": "integer 1–24",
+  "unit": "lanes"
+}

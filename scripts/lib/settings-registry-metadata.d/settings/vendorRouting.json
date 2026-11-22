@@ -1,0 +1,6 @@
+{
+  "description": "Preferred vendors by task type.",
+  "owner": "scripts/settings/vendor-routing.json",
+  "changeVia": "pr",
+  "instant": false
+}

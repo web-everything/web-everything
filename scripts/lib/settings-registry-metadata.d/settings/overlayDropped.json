@@ -1,0 +1,6 @@
+{
+  "description": "Freshness window for detecting dropped overlays.",
+  "owner": "scripts/settings/overlay-dropped.json",
+  "changeVia": "pr",
+  "instant": false
+}
