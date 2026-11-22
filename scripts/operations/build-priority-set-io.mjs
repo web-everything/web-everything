@@ -11,6 +11,8 @@ import { normalizeBriefScope, SCOPE_PREFIX_ALIASES } from './dispatch-lane.mjs';
 import { GH_LIST_FILE_CAP, prHoldsFile, qualifyFile, repoKeyFor } from './free-scope.mjs';
 import { resolveCoordinationRoot } from './coordination-root.mjs';
 import { buildPrioritySetOperation, BUILD_PRIORITY_SET_EFFECT, validateBuildPriorityInput } from './build-priority-set.mjs';
+import { scopeEntriesOverlap } from '../readiness/scope-lease.mjs';
+import { TRUST_CHAIN } from '../lib/gate-config.mjs';
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '../..');
 const READ_OPTIONS = { encoding: 'utf8', maxBuffer: 8 * 1024 * 1024, timeout: 10000, stdio: ['ignore', 'pipe', 'pipe'] };
@@ -63,16 +65,41 @@ function prepare(input, options) {
   const { actor, reason, ids, mode, ttlHours } = validateBuildPriorityInput(input);
   if (new Set(ids.map(canonicalId)).size !== ids.length) refuse('duplicate numeric card identities');
   const readCard = options.readCard ?? readPriorityCards();
+  let gateFiles;
+  try {
+    if (options.gateFiles !== undefined) {
+      gateFiles = typeof options.gateFiles === 'function' ? options.gateFiles() : options.gateFiles;
+    } else {
+      if (!Array.isArray(TRUST_CHAIN) || !TRUST_CHAIN.length) refuse('empty or unreadable gate TRUST_CHAIN');
+      gateFiles = TRUST_CHAIN.flatMap(member => {
+        if (!Array.isArray(member?.homes) || !member.homes.length
+            || member.homes.some(home => typeof home !== 'string' || !home.trim())
+            || typeof member.file !== 'string' || !member.file.trim()) refuse('incomplete gate TRUST_CHAIN member');
+        return [...member.homes, member.file];
+      });
+    }
+  } catch {
+    refuse('unreadable or incomplete gate files');
+  }
+  if (!Array.isArray(gateFiles) || !gateFiles.length
+      || gateFiles.some(home => typeof home !== 'string' || !home.trim())) refuse('empty or unreadable gate files');
   const scopes = ids.flatMap(id => {
     const card = readCard(id);
     const raw = typeof card?.scope === 'string' ? [card.scope] : card?.scope;
     if (!Array.isArray(raw) || !raw.length || raw.some(s => typeof s !== 'string' || !s.trim())) refuse(`card ${id} missing or unreadable scope`);
     const scope = raw.flatMap(member => {
-      const normalized = normalizeBriefScope([member]);
+      // The repo root covers every gate home; retain it for the coverage refusal below.
+      const normalized = member.trim() === 'we:' ? ['we:'] : normalizeBriefScope([member]);
       if (!normalized.length) refuse(`card ${id} empty scope member`);
       return normalized.map(s => qualifyFile(s));
     });
     if (!scope.length) refuse(`card ${id} empty scope`);
+    for (const entry of scope) {
+      if (!entry.startsWith('we:')) continue;
+      for (const home of gateFiles) {
+        if (scopeEntriesOverlap(entry, qualifyFile(home))) refuse(`card ${id} scope overlaps gate file ${home}`);
+      }
+    }
     return scope;
   });
   const prs = (options.readPrs ?? readPriorityPrs)();

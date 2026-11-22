@@ -7,6 +7,7 @@ import { hasJsonFlag, runOperationCli } from '../cli-adapter.mjs';
 import { createMemoryRunStore } from '../run-store.mjs';
 import { createRegistry } from '../registry.mjs';
 import { decideRuntimeAdmission, readBuildPrioritySettings } from '../../lib/build-queue.mjs';
+import { TRUST_CHAIN } from '../../lib/gate-config.mjs';
 
 const dirs = [];
 const at = '2026-11-20T12:00:00.000Z';
@@ -29,6 +30,74 @@ function fixture(overrides = {}) {
 }
 const changed = (flag, value) => [...flags.filter(s => !s.startsWith(`--${flag}=`)), ...(value === undefined ? [] : [`--${flag}=${value}`])];
 function untouched(f, names = []) { expect(fs.readdirSync(f.dir).sort()).toEqual(names.sort()); }
+
+it.each([
+  'we:scripts/lib/gate-config.mjs', 'we:scripts/', 'we:scripts/lib/',
+  'we:scripts/**', 'we:scripts/lib/*.mjs', 'we:',
+  `we:${TRUST_CHAIN.find(m => m.file !== 'gate-config.mjs').homes[0]}`,
+  'we:gate-config.mjs',
+])('refuses gate scope coverage %s without writing a runtime file', async scope => {
+  for (const preview of [false, true]) {
+    const f = fixture({ readCard: id => ({ scope: id === '43' ? [scope] : ['we:scripts/a.mjs'] }) });
+    const result = await f.command([...flags, ...(preview ? ['--preview'] : [])]);
+    expect(result.code).not.toBe(0);
+    expect(result.lines.join('\n')).toMatch(/card 43.*gate file /);
+    if (scope === 'we:scripts/lib/gate-config.mjs') expect(result.lines.join('\n')).toContain('scripts/lib/gate-config.mjs');
+    untouched(f);
+  }
+});
+
+it.each([
+  ['unreadable', () => { throw new Error('cannot read gates'); }],
+  ['empty', []], ['missing', () => undefined], ['malformed', [null]], ['blank', [' ']],
+])('refuses %s gate evidence without writing a runtime file', async (_name, gateFiles) => {
+  const f = fixture({ gateFiles });
+  const result = await f.command();
+  expect(result.code).not.toBe(0);
+  expect(result.lines.join('\n')).toMatch(/gate.*repair evidence.*retry/);
+  untouched(f);
+});
+
+it.each([undefined, [], [42]])('refuses incomplete TRUST_CHAIN homes %j', async homes => {
+  const member = TRUST_CHAIN[0], previous = member.homes;
+  try {
+    member.homes = homes;
+    const f = fixture();
+    const result = await f.command();
+    expect(result.code).not.toBe(0);
+    expect(result.lines.join('\n')).toMatch(/gate.*repair evidence.*retry/);
+    untouched(f);
+  } finally { member.homes = previous; }
+});
+
+it.each([{ gateFiles: ['scripts/lib/gate-config.mjs'] }, { gateFiles: () => ['scripts/lib/gate-config.mjs'] }])(
+  'refuses gate coverage with injected gate files %j', async ({ gateFiles }) => {
+    const f = fixture({ gateFiles, readCard: () => ({ scope: ['we:scripts/lib/'] }) });
+    expect((await f.command()).code).not.toBe(0);
+    untouched(f);
+  });
+
+it('refuses gate evidence that becomes unreadable under the writer lock', async () => {
+  const gateFiles = vi.fn().mockReturnValueOnce(['scripts/lib/gate-config.mjs'])
+    .mockImplementationOnce(() => { throw new Error('gate list unreadable'); });
+  const f = fixture({ gateFiles });
+  const result = await f.command();
+  expect(result.code).not.toBe(0);
+  expect(gateFiles).toHaveBeenCalledTimes(2);
+  expect(result.lines.join('\n')).toContain('unreadable or incomplete gate files');
+  untouched(f);
+});
+
+it('installs a literal non-gate scope', async () => {
+  const f = fixture({ readCard: () => ({ scope: ['we:scripts/a.mjs'] }) });
+  expect((await f.command()).code).toBe(0);
+  expect(JSON.parse(fs.readFileSync(f.path, 'utf8')).ids).toEqual(['42', '43']);
+});
+
+it.each(['fui:', 'plateau-app:'])('installs other-repo gate paths under %s', async prefix => {
+  const f = fixture({ readCard: () => ({ scope: [`${prefix}scripts/lib/gate-config.mjs`] }) });
+  expect((await f.command()).code).toBe(0);
+});
 
 it('runtime list install validates and writes atomically with mode 0600 and exact reader fields', async () => {
   const f = fixture();
@@ -102,10 +171,10 @@ it.each([
   ['plateau', 'plateauapp/plateau-app'],
   ['pa', 'plateauapp/plateau-app'],
 ])('refuses exact and directory overlaps for %s scopes in preview and install', async (prefix, repo) => {
-  for (const scope of ['scripts/a.mjs', 'scripts/']) {
+  for (const scope of ['scripts/example/a.mjs', 'scripts/example/']) {
     for (const preview of [false, true]) {
       const f = fixture({ readCard: () => ({ scope: [`${prefix}:${scope}`] }),
-        readPrs: () => [{ repo, number: 1, files: ['scripts/a.mjs'] }] });
+        readPrs: () => [{ repo, number: 1, files: ['scripts/example/a.mjs'] }] });
       fs.writeFileSync(f.path, 'old');
       const result = await f.command([...flags, ...(preview ? ['--preview'] : [])]);
       expect(result.code).not.toBe(0);
