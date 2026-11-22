@@ -1,12 +1,13 @@
 /** Legacy untimed claims stranded #7310, #7315 and #7321 without update-branch or a CI run. */
 import { execFileSync } from 'node:child_process';
 import { mkdtempSync, writeFileSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 
 const SOURCE = 'scripts/lib/drain-queue-safety.mjs';
 
-function probe({ mqSameHeadGuard, createMqSameHeadRefreshStore }, { mkdtempSync, writeFileSync, rmSync, join }) {
-  const dir = mkdtempSync(join(process.env.TMPDIR, 'mq-unexecuted-refresh-'));
+function probe({ mqSameHeadGuard, createMqSameHeadRefreshStore }, { mkdtempSync, writeFileSync, rmSync, join, tmpdir }) {
+  const dir = mkdtempSync(join(tmpdir(), 'mq-unexecuted-refresh-'));
   try {
     const repo = 'fixture/drain', pr = 7310, head = 'a'.repeat(40);
     const path = join(dir, 'state.json'), key = `${repo}#${pr}@${head}`;
@@ -45,9 +46,10 @@ export default {
       const output = execFileSync(process.execPath, ['--input-type=module', '-e', `
         import { pathToFileURL } from 'node:url';
         import { mkdtempSync, writeFileSync, rmSync } from 'node:fs';
+        import { tmpdir } from 'node:os';
         import { join } from 'node:path';
         const safety = await import(pathToFileURL(process.argv[1]).href);
-        process.stdout.write(JSON.stringify((${probe.toString()})(safety, { mkdtempSync, writeFileSync, rmSync, join })));
+        process.stdout.write(JSON.stringify((${probe.toString()})(safety, { mkdtempSync, writeFileSync, rmSync, join, tmpdir })));
       `, resolve(root, SOURCE)], { encoding: 'utf8', timeout: 10000, maxBuffer: 64 * 1024,
         stdio: ['ignore', 'pipe', 'pipe'] });
       const violations = JSON.parse(output);
@@ -56,7 +58,7 @@ export default {
   },
   async run({ log } = {}) {
     const safety = await import('../../../lib/drain-queue-safety.mjs');
-    const violations = probe(safety, { mkdtempSync, writeFileSync, rmSync, join });
+    const violations = probe(safety, { mkdtempSync, writeFileSync, rmSync, join, tmpdir });
     log?.(`mq unexecuted-refresh retry: ${violations.length} violation(s)`);
     return { violations };
   },
