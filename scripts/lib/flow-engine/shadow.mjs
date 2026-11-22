@@ -117,8 +117,10 @@ export async function shadowReviewStep({ repo, pr, classified, session, completi
     // The declared Visit key part carries this visit's attempt (the review subset permits one).
     const actual = { from: 'judge-convergence', event: 'done', guard: 'convergence', outcome: actualOutcome,
       route: actualOutcome ? 'advance' : null, to: actualOutcome === 'accept' ? 'accepted' : actualOutcome === 'continue' ? 'judge-convergence' : null,
-      key: `review:${encodeURIComponent(`${repo}#${pr}`)}:${seq}.1`, attempt: 1 };
-    const fullStep = step => Object.fromEntries(['from', 'event', 'guard', 'outcome', 'route', 'to', 'key', 'attempt'].map(k => [k, step[k]]));
+      key: `review:${encodeURIComponent(`${repo}#${pr}`)}:${seq}.1` };
+    // Exactly seven fields. `attempt` is folded into the key (Visit part), so the engine's attempt field is dropped
+    // only when it is 1; any other extra field stays and makes the canonical forms differ (a disagreement).
+    const fullStep = ({ attempt, ...rest }) => (attempt === undefined || attempt === 1 ? rest : { ...rest, attempt });
     const planned = steps.map(fullStep);
     const agreement = steps.length === 1 && comparePlans(planned[0], actual).equal;
     note(`flow-v0 shadow ${canonicalJSON({ repo, pr, seq, steps: planned, actual, agreement })}`);

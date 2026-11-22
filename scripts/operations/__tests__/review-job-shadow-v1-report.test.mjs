@@ -109,7 +109,7 @@ describe('S1 full-step evidence', () => {
     const finding = rows(logFile() + '.findings.jsonl')[0];
     const planned = JSON.parse(finding.planned), actual = JSON.parse(finding.actual);
     expect(finding).toMatchObject({ repo: 'o/r', pr: '7', seq: 1 });
-    expect(Object.keys(actual).sort()).toEqual(['attempt', 'event', 'from', 'guard', 'key', 'outcome', 'route', 'to']);
+    expect(Object.keys(actual).sort()).toEqual(['event', 'from', 'guard', 'key', 'outcome', 'route', 'to']);
     expect(planned).toEqual({ ...actual, key: actual.key + '-wrong' });
     expect(actual.key).toBe('review:o%2Fr%237:1.1');
     expect(finding.actual).toBe(engine.canonicalJSON(actual));
@@ -124,6 +124,18 @@ describe('S1 full-step evidence', () => {
     await real.shadowReviewStep({ repo: flags.repo, pr: flags.pr, session: flags.session,
       classified: { ...flags, loopOutcome: flags.verdict } }, {
       readSetting, log: () => {}, engine: { ...engine, plan: (flow, p) => engine.plan(flow, p).map(s => ({ ...s, event: 'other' })) },
+    });
+    expect(rows(logFile() + '.findings.jsonl')).toHaveLength(1);
+    expect(rows(logFile())[0].predicate.agreement).toBe(false);
+  });
+
+  it.each([{ extra: 1 }, { attempt: 2 }])('a Step with an extra field %j is refused as a disagreement', async extra => {
+    runReport(flags);
+    const real = await vi.importActual('../../lib/flow-engine/shadow.mjs');
+    const engine = await import('../../lib/flow-engine/index.mjs');
+    await real.shadowReviewStep({ repo: flags.repo, pr: flags.pr, session: flags.session,
+      classified: { ...flags, loopOutcome: flags.verdict } }, {
+      readSetting, log: () => {}, engine: { ...engine, plan: (flow, p) => engine.plan(flow, p).map(s => ({ ...s, ...extra })) },
     });
     expect(rows(logFile() + '.findings.jsonl')).toHaveLength(1);
     expect(rows(logFile())[0].predicate.agreement).toBe(false);
