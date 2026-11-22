@@ -1010,7 +1010,7 @@ async function runCli() {
           ? `node scripts/merge-ai-prs.mjs --only=<pr> --label=${LABEL || 'ready-to-merge'} --this-repo   # #2290 single-couple FAST DRAIN (the drain lands it — pr-land never merges)`
           : PLAN.mode === 'park' ? '(--park: STOP — the PR is HELD review:*; a human clears it via /review, then the drain lands it)'
           : '(label-on-green: STOP after labelling — the standalone drain lands it; no direct merge here)',
-        FALLBACK_GIT ? `fallback on failure (BREAK-GLASS only, WE_MERGE_BREAK_GLASS=1): git merge --no-ff ${REMOTE}/${REF} + push ${REMOTE} ${BASE}` : null,
+        FALLBACK_GIT ? `fallback on failure (BREAK-GLASS only, WE_MERGE_BREAK_GLASS=1): git merge --no-ff ${refSha} + push ${REMOTE} ${BASE}` : null,
       ].filter(Boolean),
       detail: `would open+label ${SRC} (${refSha.slice(0, 8)}) as a self-approved PR from ${REF}${PLAN.triggerDrain ? ' and trigger a single-couple drain' : ''} — the drain lands it onto ${BASE}`,
     }, 0);
@@ -1607,9 +1607,11 @@ async function runCli() {
       // break-glass use emits the loud audit line). Capture the pre-merge base sha for the heal's onto-ref.
       assertMayMerge({ caller: 'pr-land', pr: null, repo: REPO });
       const preMergeBaseSha = tryGit(['rev-parse', `${REMOTE}/${BASE}`]) || null;
-      tryGit(['fetch', REMOTE, `${REF}`, '--quiet']);
+      // Merge the exact commit this run published (refSha), never the fetch-side `${REMOTE}/${REF}`: with a
+      // separate push URL that tracking ref is another repository's tip, and a failed fetch leaves it stale.
+      if (!/^[0-9a-f]{40}$/i.test(refSha ?? '')) throw new Error(`source commit unresolved (${refSha || 'empty'}) — refusing to merge`);
       gitC(['checkout', BASE]);
-      gitC(['merge', '--no-ff', `${REMOTE}/${REF}`, '-m', `merge ${REF} (pr-land git fallback)`]);
+      gitC(['merge', '--no-ff', refSha, '-m', `merge ${REF} (pr-land git fallback)`]);
       // JIT numbering (#2288 / #xzxc92d): the fallback-git merge is a LAND path too — the last one #2288 left
       // un-numbered. Number every provisional hash file the merge just brought onto BASE BEFORE the push, so
       // no hash strands on main (this is the exact route that stranded #xzxc92d itself). Shares lane-drain's

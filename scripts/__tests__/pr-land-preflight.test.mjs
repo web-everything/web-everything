@@ -10,7 +10,7 @@ import { pathToFileURL } from 'node:url';
 function run({ check = true, fail = false, override = '', count = 15, exempt = false,
   body = 'Description', earlyPr = false, labelOnGreen = false, headEvidence = 'matching',
   sha = 'a'.repeat(40), remoteTip = '', remoteError = false, ancestor = true, refusePush = false,
-  fetchUrls = null, pushUrls = null, dryRun = false } = {}) {
+  fetchUrls = null, pushUrls = null, dryRun = false, createFails = false, fallbackGit = false } = {}) {
   const dir = mkdtempSync(join(tmpdir(), 'pr-land-preflight-'));
   const trace = join(dir, 'effects.jsonl');
   const root = resolve('scripts');
@@ -30,7 +30,9 @@ function run({ check = true, fail = false, override = '', count = 15, exempt = f
       let lookups = 0;
       export const createGhLandProvider = () => ({ listOpenByHead: () => {
         effect(['pr-lookup']); return ++lookups === 1 && ${earlyPr} ? [{ number: 7 }] : []; },
-        create: p => { effect(['create', p]); return 'https://example.test/pull/7'; },
+        create: p => { effect(['create', p]);
+          if (${createFails}) throw new Error('validation failed: fixture create refused');
+          return 'https://example.test/pull/7'; },
         viewPr: (pr, fields) => {
           if (fields === 'headRefOid' && ${JSON.stringify(headEvidence)} === 'unreadable') throw new Error('head unreadable');
           return { labels: [], comments: [], body: 'Description', mergeable: 'MERGEABLE', mergeStateStatus: 'CLEAN',
@@ -78,6 +80,8 @@ function run({ check = true, fail = false, override = '', count = 15, exempt = f
         if (${JSON.stringify(ancestor)} !== true) throw Object.assign(new Error('not a proven ancestor'), { status: ${ancestor === 'unreadable' ? 128 : 1} });
         return '';
       }
+      // The fallback merge is recorded, then refused, so the run stops before any lock, push or heal effect.
+      if (args[0] === 'merge') throw new Error('fixture refuses the fallback merge');
       if (args[0] === 'push') return ${refusePush} ? execFileSync('sh', [${JSON.stringify(hook)}], { encoding: 'utf8' }) : '';
       if (args[0] === 'show') throw new Error('no ready config');
       return '';
@@ -85,8 +89,9 @@ function run({ check = true, fail = false, override = '', count = 15, exempt = f
   try {
     const child = spawnSync(process.execPath, ['--import', preload, join(root, 'pr-land.mjs'), `--repo=${dir}`,
       '--ref=lane/preflight', '--title=fix: admission', `--body=${body}`, labelOnGreen ? '--label-on-green' : '--no-wait', '--json',
-      ...(check ? ['--check'] : []), ...(dryRun ? ['--dry-run'] : []), ...(override === 'forceOpen' ? ['--force-open', '--reason=operator'] : [])],
-    { cwd: dir, env: { ...process.env, TMPDIR: dir, WE_POLICY_CASCADE_LOG: '0' },
+      ...(check ? ['--check'] : []), ...(dryRun ? ['--dry-run'] : []), ...(fallbackGit ? ['--fallback-git'] : []),
+      ...(override === 'forceOpen' ? ['--force-open', '--reason=operator'] : [])],
+    { cwd: dir, env: { ...process.env, TMPDIR: dir, WE_POLICY_CASCADE_LOG: '0', ...(fallbackGit ? { WE_MERGE_BREAK_GLASS: '1' } : {}) },
       encoding: 'utf8', timeout: 30_000, maxBuffer: 2 * 1024 * 1024 });
     if (!child.stdout.trim()) throw new Error(`CLI ${child.status}: ${child.stderr}`);
     return { status: child.status, stderr: child.stderr, result: JSON.parse(child.stdout.trim().split('\n').at(-1)),
@@ -252,6 +257,20 @@ describe('pr-land lane publish remote-tip check', () => {
     expect(status).toBe(3);
     expect(result.reason).toBe('push-failed');
     expect(pushes(effects)).toEqual([]);
+  });
+
+  // The break-glass fallback must merge the commit this run published, never the fetch-side tracking ref:
+  // with a separate push URL `origin/<ref>` is another repository's tip, and a failed fetch leaves it stale.
+  it.each([
+    ['a single shared URL', {}],
+    ['a separate pushurl', { pushUrls: 'git@github.com:fork/web-everything.git', remoteTip: tip(different) }],
+  ])('--fallback-git with %s merges the pushed refSha, not origin/<ref>', (_name, urls) => {
+    const { status, result, effects } = publish({ createFails: true, fallbackGit: true, ...urls });
+    const merges = effects.filter(([cmd, args]) => cmd === 'git' && args[0] === 'merge');
+    expect(merges).toEqual([['git', ['merge', '--no-ff', sha, '-m', 'merge lane/preflight (pr-land git fallback)']]]);
+    expect(effects.some(([cmd, args]) => cmd === 'git' && args[0] === 'fetch')).toBe(false);
+    expect(status).toBe(3);
+    expect(result.reason).toBe('fallback-failed');
   });
 
   it('dry-run plan names the skip when origin already holds HEAD', () => {
