@@ -26,7 +26,51 @@ function fixture() {
     rotationShadow: { policy, capacity } };
 }
 
+function observation(input, options = {}) {
+  const io = fixture(), baseline = fixture();
+  baseline.rotationShadow = { policy: { ...policy, mode: 'off' }, capacity };
+  Object.assign(io.rotationShadow, options);
+  expect(appendScorecard(input, io)).toEqual(appendScorecard(input, baseline));
+  expect(io.bytes()).toBe(baseline.bytes());
+  return JSON.parse(readFileSync(join(io.path, '..', 'rotation-shadow.jsonl'), 'utf8'));
+}
+
 describe('provider rotation shadow', () => {
+  it.each(['review-seat', 'review-seat:', 'review', 'review-pr'])('missing lens on %s records a refusal with ok false (audit 4)', kind => {
+    expect(observation(row(kind))).toMatchObject({ shadowPick: null, refusal: 'unknown-lens', crossVendor: { ok: false } });
+  });
+  it('red-team identity cannot be downgraded by explicit style metadata (audit 5)', () => {
+    for (const fields of [{ lens: 'style' }, { seat: { lens: 'style' } }]) {
+      expect(observation({ ...row('red-team'), ...fields, builder: builders[0] }, { capacity: { codex: capacity.codex } }))
+        .toMatchObject({ shadowPick: null, crossVendor: { required: true, ok: false }, refusal: 'no-cross-vendor-seat' });
+    }
+  });
+  it.each([{ builderFamily: 'openai' }, { builderProvider: 'codex' },
+    { builder: { provider: 'codex' } }, { builder: { model: 'gpt-6.1-sol', effort: 'high' } }])(
+    'requires complete builder identity for key seats despite family assertion %j (audit 6)', fields => {
+      expect(observation({ ...row('review-security'), ...fields }))
+        .toMatchObject({ shadowPick: null, crossVendor: { required: true, ok: false }, refusal: expect.stringMatching(/builder-family/) });
+    });
+  it('policy-added key lenses also require builder evidence in the observer (audit 2)', () => {
+    expect(observation({ ...row('review-seat'), lens: 'style', builderFamily: 'openai' },
+      { policy: { ...policy, keyLenses: [...policy.keyLenses, 'style'] } }))
+      .toMatchObject({ shadowPick: null, crossVendor: { required: true, ok: false }, refusal: expect.any(String) });
+  });
+  it.each([{ allowedKinds: [] }, { emergencyOnly: true }, { active: false }])(
+    'live capacity projection refuses ineligible provider %j (audit 8)', patch => {
+      const now = Date.parse('2026-11-22T00:00:00Z');
+      expect(observation(row(), { capacity: undefined, now, routing: () => ({ capacity: {} }), observe: () => [
+        { provider: 'codex', known: true, health: 1, tier: 10, active: true, held: false,
+          windowModel: 'fixed', windows: [{ usedPercent: 20, resetsAt: now + 3600000, lengthHours: 4 }], ...patch },
+      ] })).toMatchObject({ shadowPick: null, refusal: 'no-eligible-arm' });
+    });
+  it.each(['security', 'merge-path'])('passes dispatch shape %s through the observer (audit 9)', shape => {
+    const weakPolicy = structuredClone(policy);
+    weakPolicy.kinds.build.arms = [{ arm: { provider: 'agy-gemini', model: 'gemini-4-flash', effort: 'high' }, tier: 'standard', share: 1 }];
+    expect(observation({ ...row(), shape }, { policy: weakPolicy }))
+      .toMatchObject({ shadowPick: null, refusal: 'no-strong-seat' });
+  });
+
   it('shadow never changes the actual provider and cross-vendor holds for every pick', () => {
     const off = fixture(), on = fixture(); off.rotationShadow = { policy: { ...policy, mode: 'off' }, capacity };
     const input = row(); const before = JSON.stringify(input);
@@ -54,7 +98,7 @@ describe('provider rotation shadow', () => {
   it('appends one sidecar row for every agentic dispatch kind without changing scorecards', () => {
     const io = fixture();
     for (const kind of ['build', 'fix', 'ci-heal', 'review-seat', 'review', 'red-team', 'audit', 'judge', 'advisory-review', 'prepare', 'probation-launch'])
-      appendScorecard({ ...row(kind), builderProvider: 'codex', lens: kind === 'review-seat' ? 'security' : undefined }, io);
+      appendScorecard({ ...row(kind), builder: builders[0], lens: kind === 'review-seat' ? 'security' : undefined }, io);
     const lines = readFileSync(join(dirs[0], 'rotation-shadow.jsonl'), 'utf8').trim().split('\n').map(JSON.parse);
     expect(lines).toHaveLength(11);
     expect(new Set(lines.map(l => l.dispatchKind)).size).toBe(11);

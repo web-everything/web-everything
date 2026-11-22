@@ -25,6 +25,22 @@ const repairLaunchRoute = (kind, vetoes = []) => {
   return resolveOperationRoute({ operation: kind, policy, vetoes });
 };
 describe('operation routing policy', () => {
+  it.each(['gemini-4-carbon', 'gemini-4-flash', 'gemini-4-hydrogen'])(
+    'keeps rotation-only identity %s out of live policy validation (audit 10)', model => {
+      const policy = copy();
+      policy.operations.judge = { provider: 'agy-gemini', model, effort: 'high', fallback: [] };
+      expect(() => validateRoutingPolicy(policy)).toThrow(/unknown model/);
+      policy.aliases['agy-gemini']['rotation-only'] = model;
+      expect(() => validateRoutingPolicy(policy)).toThrow(/unknown model/);
+    });
+  it('valid high inherited effort overlay retains legacy selection while invalid effort refuses (audit 11)', () => {
+    const policy = copy(); policy.operations.fix = { inherit: true }; delete policy.taskTypes.bugfix;
+    expect(resolveOperationRoute({ operation: 'fix', taskType: 'bugfix', policy,
+      aiRouting: { effort: 'high' }, operatorKeys: [] })).toBeNull();
+    expect(() => resolveOperationRoute({ operation: 'fix', taskType: 'bugfix', policy,
+      aiRouting: { effort: 'bogus' }, operatorKeys: [] })).toThrow(/aiRouting: unknown effort/);
+  });
+
   it.each(['review-seat:future-lens', 'review-seat:extra-juror:future-mandate'])(
     'uses the added-seat launcher roster for an unlisted scoped key %s', key => {
       expect(Object.hasOwn(OPERATION_PROVIDER_ROSTERS, key)).toBe(false);

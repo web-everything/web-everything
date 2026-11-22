@@ -46,7 +46,7 @@ export function createRebuildReaders({ strict = false, read = readFileSync } = {
     }),
     conflictWakes: checked((_root, env) => {
       const r = json(join(daemonStateDir(env), 'overlay-conflict-wake.json'), {});
-      if (!object(r) || !Object.values(r).every(v => object(v) && Number.isSafeInteger(v.pr) && v.pr > 0
+      if (!object(r) || !Object.values(r).every(v => object(v) && Number.isSafeInteger(v.pr) && v.pr >= 0 /* 0 = the non-PR host convention the wake writer uses */
         && text(v.ref) && date(v.at))) throw new Error('Invalid overlay conflict wakes');
       return r;
     }),
@@ -94,7 +94,8 @@ export function createRebuildReaders({ strict = false, read = readFileSync } = {
         // compatibility cannot turn an incomplete discard into valid evidence.
         const discardNotice = object(r) && r.kind === 'needs-you'
           && (r.need === 'ready-candidate-discarded' || (Object.hasOwn(r, 'target') && Object.hasOwn(r, 'refs')));
-        if (!object(r) || typeof r.kind !== 'string'
+        // The stale-record-dropped writer names its event with `event` instead of `kind`; both are typed evidence.
+        if (!object(r) || (typeof r.kind !== 'string' && typeof r.event !== 'string')
           // Aggregate and auto-rebase events need not name a single ref. The
           // consumers require ref themselves before using per-overlay evidence.
           || (Object.hasOwn(r, 'ref') && typeof r.ref !== 'string')
