@@ -1,9 +1,10 @@
 ---
 kind: story
+locus: plateau-app
 size: 5
 status: open
 dateOpened: "2026-11-22"
-tags: []
+tags: [plateau, plateau-ui, design-plan]
 ---
 
 # Plateau state patterns (plan step DZ-STATES): loading, empty, error and offline blocks

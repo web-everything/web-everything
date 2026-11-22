@@ -1,9 +1,11 @@
 ---
 kind: story
+locus: plateau-app
 size: 5
 status: open
+blockedBy: ["xdzzp2l"]
 dateOpened: "2026-11-22"
-tags: []
+tags: [plateau, plateau-ui, design-plan]
 ---
 
 # Plateau Settings page (plan step DZ-SETTINGS): workspace, repos, ladder, date policy, theme, Labs toggle, batching, PR-size policy

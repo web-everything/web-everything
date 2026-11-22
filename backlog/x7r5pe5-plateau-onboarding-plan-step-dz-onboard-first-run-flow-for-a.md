@@ -1,9 +1,11 @@
 ---
 kind: story
+locus: plateau-app
 size: 5
 status: open
+blockedBy: ["xdzzp2l", "xqr3x2x", "xn8wrsi"]
 dateOpened: "2026-11-22"
-tags: []
+tags: [plateau, plateau-ui, design-plan]
 ---
 
 # Plateau onboarding (plan step DZ-ONBOARD): first-run flow for a new workspace

@@ -1,9 +1,11 @@
 ---
 kind: story
+locus: plateau-app
 size: 8
 status: open
+blockedBy: ["640"]
 dateOpened: "2026-11-22"
-tags: []
+tags: [plateau, plateau-ui, design-plan]
 ---
 
 # Plateau shell (plan step DZ-SHELL): five task-based sections, route table, mobile bottom bar

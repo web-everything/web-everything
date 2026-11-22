@@ -1,9 +1,11 @@
 ---
 kind: story
+locus: plateau-app
 size: 5
 status: open
+blockedBy: ["xqr3x2x", "xdzzp2l"]
 dateOpened: "2026-11-22"
-tags: []
+tags: [plateau, plateau-ui, design-plan]
 ---
 
 # Plateau Today screen (plan step DZ-TODAY): task-based home replacing mock dashboard tiles
