@@ -429,7 +429,10 @@ export async function planRebuild({
         if (!sha) continue;
         const bases = git(['merge-base', '--all', headSha, sha]);
         if (bases.status !== 0) {
-          if (bases.status !== 1) carriedRefs.add(ref); // unreadable history, rather than unrelated histories
+          if (bases.status !== 1) {
+            runningHistoryKnown = false;
+            carriedRefs.add(ref); // unreadable history, rather than unrelated histories
+          }
           continue;
         }
         const liveBases = String(bases.stdout ?? '').split('\n').filter((s) => OID.test(s)
@@ -658,7 +661,8 @@ export async function planRebuild({
     }
     // Omitted content has no adopted merge parent. Its durable omission record requires
     // ordinary audit evidence before it can return, without making its old tip an ancestor.
-    if ((setAside === null || setAside[ref]) && typeof auditedTip === 'function' && !inMain(ovSha) && !auditedTip(ref, ovSha)) {
+    if (((setAside === null && !carriedRefs.has(ref)) || setAside?.[ref])
+      && typeof auditedTip === 'function' && !inMain(ovSha) && !auditedTip(ref, ovSha)) {
       decisions.push({ ref, pr, action: 'skip', reason: 'unaudited-tip-held', sha: ovSha });
       alerts.push({ kind: 'overlay-unaudited-tip', detail: { ref, pr, newTip: ovSha,
         message: `overlay ${ref} remains set aside: tip ${ovSha.slice(0, 10)} needs a fix-ready + audit record (unaudited-tip)` } });
@@ -965,7 +969,7 @@ export async function planRebuild({
     if (!pinSkipped && !d.unauditedTip && mainSyncConflicts.conflictMain?.[d.ref] === mainSha
       && mainSyncConflicts.conflictTip?.[d.ref] === d.sha) {
       const raw = listed.find(o => o.ref === d.ref);
-      const aside = runningHistoryKnown
+      const aside = runningHistoryKnown && setAside !== null
         ? mainSyncSetAside(git, raw, mainSha, d.sha, carriedHeads.get(d.ref) ?? [])
         : { eligible: false, reason: 'running-history-unknown' };
       // Compare the entire final applied delta (including edge/replayed resolutions)

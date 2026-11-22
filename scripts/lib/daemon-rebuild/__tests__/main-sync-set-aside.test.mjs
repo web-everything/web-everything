@@ -11,6 +11,61 @@ import { readRebuildStateStrict, rebuildStatePath } from '../state.mjs';
 import { createSetAsideFixture, probeRebuildSetAside } from '../../../conveyor/soak/fixtures/rebuild-set-aside-probe.mjs';
 
 // Negative cases come first: the new policy must retain the old refusal/hold protections.
+it.each(['legacy', 'missing'])('unknown continuity holds an established running tip with one existing loss alert per tick: %s', async kind => {
+  const f = await createSetAsideFixture({ audited: true });
+  try {
+    const before = f.head();
+    const path = rebuildStatePath(f.root, f.env);
+    const state = f.state();
+    delete state.setAside;
+    writeFileSync(path, JSON.stringify(state));
+    if (kind === 'missing') unlinkSync(path);
+    for (const tick of [1, 2]) {
+      const alertsBefore = f.alerts().length;
+      expect(await f.rebuild(), `tick ${tick}`).toMatchObject({ reason: 'established-overlay-conflict' });
+      expect(f.head()).toBe(before);
+      expect(f.state().setAside).toBeUndefined();
+      expect(f.alerts().slice(alertsBefore).filter(a => a.detail?.ref === f.ref
+        && ['established-overlay-dropped', 'overlay-main-sync-set-aside', 'overlay-unaudited-tip'].includes(a.kind))
+        .map(a => a.kind)).toEqual(['established-overlay-dropped']);
+    }
+  } finally { f.cleanup(); }
+}, 60_000);
+
+it.each(['inference', 'log'])('unreadable running ancestry retains the established hold: %s', async kind => {
+  const f = await createSetAsideFixture();
+  try {
+    const before = f.head();
+    const base = f.git(['rev-parse', `${f.tip}^`]).stdout.trim();
+    const tree = f.git(['rev-parse', `${f.tip}^{tree}`]).stdout.trim();
+    const replacement = f.git(['-c', 'user.name=t', '-c', 'user.email=t@t',
+      'commit-tree', tree, '-p', base, '-m', 'replacement']).stdout.trim();
+    expect(f.git(['update-ref', `refs/remotes/origin/${f.ref}`, replacement]).status).toBe(0);
+    let failedRead = false;
+    const git = args => {
+      if (args[0] === 'log' && args.includes('--first-parent')) {
+        if (kind === 'log') failedRead = true;
+        return { status: kind === 'log' ? 128 : 0, stdout: '' };
+      }
+      if (kind === 'inference' && args[0] === 'merge-base' && args[1] === '--all'
+        && args[2] === before && args[3] === replacement) {
+        failedRead = true;
+        return { status: 128, stdout: '' };
+      }
+      return f.git(args);
+    };
+    const plan = await planner.planRebuild({ git, headSha: before, mainRef: 'origin/main',
+      overlays: f.overlays(), edgeResolve: false, setAside: {},
+      mainSyncConflicts: { conflictMain: { [f.ref]: f.main }, conflictTip: { [f.ref]: replacement } } });
+    expect(failedRead).toBe(true);
+    expect(plan.establishedLost.map(o => o.ref)).toEqual([f.ref]);
+    expect(plan.decisions.some(d => d.setAside)).toBe(false);
+    expect(plan.alerts.filter(a => a.detail?.ref === f.ref).map(a => a.kind))
+      .toEqual(['established-overlay-dropped']);
+    expect(f.head()).toBe(before);
+  } finally { f.cleanup(); }
+}, 60_000);
+
 it.each([{ pinned: true, why: 'flag' }, { guard: true, why: 'mechanism' }])(
   'never sets aside a protected overlay: %j', async ({ why, ...options }) => {
     const f = await createSetAsideFixture(options);
@@ -89,6 +144,10 @@ it('reads pre-continuity persisted state, round-trips set-aside, and refuses mal
     delete legacy.setAside;
     writeFileSync(path, JSON.stringify(legacy));
     expect(() => readRebuildStateStrict(f.root, f.env)).not.toThrow();
+    expect(await f.rebuild()).toMatchObject({ reason: 'established-overlay-conflict' });
+    expect(f.state().setAside).toBeUndefined();
+    // Explicit known-empty continuity still round-trips a subsequent omission.
+    writeFileSync(path, JSON.stringify({ ...f.state(), setAside: {} }));
     await f.rebuild();
     expect(readRebuildStateStrict(f.root, f.env).setAside[f.ref].files).toEqual([f.file]);
     const broken = JSON.parse(readFileSync(path, 'utf8'));
