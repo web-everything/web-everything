@@ -24,11 +24,16 @@ function fixture(test) {
       pullRequest: { headRefOid: f.head, isInMergeQueue: false } } } });
     if (args.some(a => a.includes('timelineItems'))) return JSON.stringify({ data: { repository: { pullRequest: {
       timelineItems: { nodes: f.events, pageInfo: { hasPreviousPage: false } } } } } });
-    if (args.includes('PUT')) { f.writes.push(args); if (f.afterHead) f.head = f.afterHead; return '{}'; }
+    if (args.includes('PUT')) { if (f.requestError) throw f.requestError; f.writes.push(args); if (f.afterHead) f.head = f.afterHead; return '{}'; }
     if (args.includes('headRefOid') && f.postReadFails) throw new Error('post-write read unavailable');
+    if (args[0] === 'pr' && f.readError) throw f.readError;
+    if (args.includes('labels,headRefOid') && f.labeled) return JSON.stringify(f.labeled);
+    if (args[0] === 'pr' && f.live) return JSON.stringify(f.live);
     if (args[0] === 'pr') return JSON.stringify({ headRefOid: f.head, mergeStateStatus: 'CLEAN',
       statusCheckRollup: [{ status: 'COMPLETED', conclusion: 'SUCCESS' }], labels: ['ready-to-merge'] });
     const endpoint = args.find(a => a.startsWith('repos/'));
+    if (endpoint?.includes('/actions/runs?head_sha=') && f.runs instanceof Error) throw f.runs;
+    if (endpoint?.includes('/actions/runs?head_sha=') && f.runs) return JSON.stringify(f.runs);
     if (endpoint?.includes('/actions/runs?head_sha=')) return JSON.stringify({ total_count: 1,
       workflow_runs: [{ created_at: '2099-01-01T00:00:00Z' }] });
     if (endpoint?.includes('/check-runs') && f.checksOverride) return JSON.stringify(f.checksOverride);
@@ -51,6 +56,92 @@ function fixture(test) {
 }
 
 describe('same-head failures never authorize re-enqueue from logs', () => {
+  const decisions = f => f.log.mock.calls.map(([line]) => line)
+    .filter(line => line.startsWith('mq-same-head-refresh-decision:'));
+  const prefix = `mq-same-head-refresh-decision: #${pr} head ${head}`;
+
+  it.each([
+    ['head moved', f => { f.live = { headRefOid: 'd'.repeat(40) }; }],
+    ['not CLEAN', f => { f.live = { headRefOid: head, mergeStateStatus: 'BEHIND' }; }],
+    ['checks not green', f => { f.live = { headRefOid: head, mergeStateStatus: 'CLEAN', statusCheckRollup: [] }; }],
+    ['checks unreadable', f => { f.readError = new Error('offline'); }],
+    ['labels unreadable', f => { f.labeled = { headRefOid: head, labels: null }; }],
+    ['blocking label', f => { f.labeled = { headRefOid: head, labels: ['review:changes'] }; }],
+  ])('logs every repeated %s evaluation while preserving the deduplicated skip', (reason, arrange) => fixture(f => {
+    arrange(f);
+    const options = { repo: `fixture/repeated-${reason.replaceAll(' ', '-')}` };
+    f.run(options); f.run(options);
+    expect(decisions(f)).toEqual(Array(2).fill(`${prefix} retry=false executed=unknown spent=false outcome=skipped reason=${reason}`));
+    expect(f.log.mock.calls.filter(([line]) => line === `mq-same-head-refresh: #${pr} head ${head} — skipped (${reason})`).length).toBe(1);
+    expect(f.writes).toHaveLength(0);
+  }));
+  it.each([
+    ['authorization refused or unreadable; inspect red-team evidence and workflow/human approval before retrying', { allow: () => false }],
+    ['state unavailable; inspect shared refresh ledger and lock before retrying', { store: undefined }],
+    ['claim lost', { store: { has: () => false, claim: () => false } }],
+    ['already requested', null],
+  ])('logs every repeated refresh skip: %s', (reason, refresh) => fixture(f => {
+    let reads = 0;
+    refresh ??= { store: { has: () => ++reads % 2 === 0 } };
+    const options = { refresh: { store: createMqSameHeadRefreshStore({ path: f.path }), allow: () => true, ...refresh } };
+    f.run(options); f.run(options);
+    expect(decisions(f)).toEqual(Array(2).fill(`${prefix} retry=false executed=unknown spent=false outcome=skipped reason=${reason}`));
+    expect(f.writes).toHaveLength(0);
+  }));
+  it('logs a requested refresh and each subsequent spent fixer hold', () => fixture(f => {
+    f.run(); f.run(); f.run();
+    expect(decisions(f)).toEqual([
+      `${prefix} retry=false executed=unknown spent=false outcome=requested reason=update-branch requested`,
+      ...Array(2).fill(`${prefix} retry=false executed=true spent=true outcome=held-fixer reason=single refresh already spent or second same-head failure; hold for fixer`),
+    ]);
+    expect(f.writes).toHaveLength(1);
+  }));
+  it('a claimed but never executed head retries instead of being treated as spent', () => fixture(f => {
+    const store = createMqSameHeadRefreshStore({ path: f.path });
+    store.claim(`${repo}#${pr}@${head}`);
+    f.runs = { total_count: 0, workflow_runs: [] };
+    expect(f.run()).toMatchObject({ hold: true, recoveryAction: 'refresh-first' });
+    expect(decisions(f)).toEqual([`${prefix} retry=true executed=false spent=false outcome=requested reason=update-branch retried`]);
+    expect(f.writes).toHaveLength(1);
+    expect(store.has(`${repo}#${pr}@${head}#retry`)).toBe(true);
+  }));
+  it.each(['ledger', 'runs'])('logs repeated unreadable %s fixer holds with detail', kind => fixture(f => {
+    let options = {};
+    if (kind === 'ledger') options = { refresh: { store: { has: () => { throw new Error('offline'); } } } };
+    else {
+      createMqSameHeadRefreshStore({ path: f.path }).claim(`${repo}#${pr}@${head}`);
+      f.runs = new Error('offline');
+    }
+    f.run(options); f.run(options);
+    expect(decisions(f)).toHaveLength(2);
+    for (const line of decisions(f)) {
+      expect(line).toContain('executed=unknown');
+      expect(line).toContain(`spent=${kind === 'ledger' ? 'unknown' : 'true'} outcome=held-fixer reason=refresh ${kind === 'ledger' ? 'ledger' : 'run evidence'} unreadable`);
+      expect(line).toContain('fixer inspection');
+    }
+    expect(f.writes).toHaveLength(0);
+  }));
+  it('logs every real failure routed to fixer', () => fixture(f => {
+    f.text = 'AssertionError: expected true';
+    f.run(); f.run();
+    expect(decisions(f)).toEqual(Array(2).fill(`${prefix} retry=false executed=unknown spent=false outcome=held-fixer reason=real failure observed; route to fixer without refresh`));
+    expect(f.writes).toHaveLength(0);
+  }));
+  it('logs a refused request once and sanitizes the reason', () => fixture(f => {
+    f.requestError = new Error('HTTP 422: \x1bhead\x9bmoved\u2028');
+    f.run();
+    expect(decisions(f)).toEqual([`${prefix} retry=false executed=unknown spent=false outcome=skipped reason=update-branch refused (HTTP 422:  head moved )`]);
+  }));
+  it('logs unavailable refresh evaluation and leaves dry-run decisions silent', () => fixture(f => {
+    f.run({ refresh: undefined });
+    expect(decisions(f)).toEqual([`${prefix} retry=false executed=unknown spent=false outcome=not-evaluated reason=refresh unavailable`]);
+    f.log.mockClear();
+    f.run({ dryRun: true });
+    createMqSameHeadRefreshStore({ path: f.path }).claim(`${repo}#${pr}@${head}`);
+    f.run({ dryRun: true });
+    expect(decisions(f)).toEqual([]);
+    expect(f.writes).toHaveLength(0);
+  }));
   it('initializes and cleans up the fixture when TMPDIR is unset', () => {
     // Keep scratch in the task's temp root while exercising the OS fallback.
     const root = tmpdir();
