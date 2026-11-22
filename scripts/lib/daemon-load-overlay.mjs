@@ -80,7 +80,7 @@ import {
  */
 export async function guardedRegister({ root, ref, pr, env, gate, register }) {
   // Lazy: daemon-overlay.mjs imports this module (overlaySafetySettings), so a static import would be a cycle.
-  const { stackAwareOverlayCheck, withAddGuardLock } = await import('../daemon-overlay.mjs');
+  const { stackAwareOverlayCheck, withAddGuardLock, registrationAuditGate } = await import('../daemon-overlay.mjs');
   return withAddGuardLock(root, env, async () => {
     const st = readOverlayState(root, { env });
     if (st.corrupt) return { registered: false, reason: 'overlay-store-corrupt' };
@@ -89,6 +89,8 @@ export async function guardedRegister({ root, ref, pr, env, gate, register }) {
     });
     if (!check.ok) return { registered: false, reason: 'conflict-check-failed', check };
     if (!check.clean && !gate.override) return { registered: false, reason: 'conflict', check };
+    if (!registrationAuditGate({ root, ref, sha: check.candSha, env }))
+      return { registered: false, reason: 'no-canonical-audit', check };
     register(!check.clean ? { ...gate.override, files: check.files, conflicting: check.conflicting } : null);
     return { registered: true, check };
   });
@@ -243,6 +245,11 @@ function readSettingsFile() {
 export function overlaySafetySettings(env = process.env, { readSettings = readSettingsFile } = {}) {
   const declared = readSettings() || {};
   const file = declared.overlaySafety || {};
+  const audit = cascadePolicy('overlaySafety', file, {
+    standard: { auditEvidence: 'refuse' }, env,
+    envValues: { auditEvidence: env.WE_OVERLAY_AUDIT_EVIDENCE },
+    valid: { auditEvidence: value => ['refuse', 'warn', 'off'].includes(value) },
+  });
   const retries = cascadePolicy('overlaySmoke', declared.overlaySmoke, {
     standard: { dispatchLaunchRetries: 1 }, env,
     envValues: { dispatchLaunchRetries: strictEnvInteger(env.WE_OVERLAY_DISPATCH_LAUNCH_RETRIES) },
@@ -260,6 +267,8 @@ export function overlaySafetySettings(env = process.env, { readSettings = readSe
   const filePaths = Array.isArray(file.dispatchPaths) && file.dispatchPaths.every((x) => typeof x === 'string') ? file.dispatchPaths : null;
   const timeout = Number(env?.WE_OVERLAY_DISPATCH_SMOKE_TIMEOUT_MS ?? file.smokeTimeoutMs);
   return {
+    auditEvidence: audit.value.auditEvidence,
+    auditEvidenceSource: audit.sources.auditEvidence,
     dispatchLaunchRetries: retries.value.dispatchLaunchRetries,
     dispatchLaunchRetriesSource: retries.sources.dispatchLaunchRetries,
     dispatchSmoke: pick(env?.WE_OVERLAY_DISPATCH_SMOKE, file.dispatchSmoke, ['on', 'off'], 'on'),

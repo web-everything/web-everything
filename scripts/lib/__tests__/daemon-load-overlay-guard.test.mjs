@@ -53,8 +53,10 @@ function fixture() {
     gitOk(author, ['push', '-q', '-f', 'origin', `HEAD:refs/heads/${ref}`]);
     return gitOk(author, ['rev-parse', 'HEAD']).trim();
   };
+  const prefs = join(base, 'prefs.json');
+  writeFileSync(prefs, JSON.stringify({ overlaySafety: { auditEvidence: 'off' } }));
   const env = {
-    ...process.env, WE_DAEMON_OVERLAY_DIR: mktemp('we-load-guard-overlay-'), WE_DAEMON_OVERLAY_STACK_BASES: '{}',
+    ...process.env, WE_PLATFORM_PREFERENCES_FILE: prefs, WE_OVERLAY_AUDIT_EVIDENCE: 'off', WE_DAEMON_OVERLAY_DIR: mktemp('we-load-guard-overlay-'), WE_DAEMON_OVERLAY_STACK_BASES: '{}',
   };
   push('lane/fix-procedure', { 'shared.mjs': 'export const X = 2;\n' });
   push('lane/promote-stale-green', { 'shared.mjs': 'export const X = 3;\n' });

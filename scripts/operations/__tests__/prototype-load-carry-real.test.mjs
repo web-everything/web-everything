@@ -45,7 +45,7 @@ describe('prototype-load real R503 candidate fetch', () => {
           return execFileSync(command, boundArgs, { ...options, cwd: clone });
         };
         const load = createPrototypeLoader({ ...defaultDeps(), exec,
-          env: { HOME: tmp, TMPDIR: tmp, WE_DAEMON_OVERLAY_DIR: join(tmp, 'overlays') },
+          env: { HOME: tmp, TMPDIR: tmp, WE_OVERLAY_AUDIT_EVIDENCE: 'off', WE_DAEMON_OVERLAY_DIR: join(tmp, 'overlays') },
           testCheck: async () => ({ sha, name: 'test', status: 'completed', conclusion: 'success', appId: 15368 }),
           settings: { daemons: { control: { clone } }, workspaceRoot: tmp, loaderCli: 'scripts/daemon-overlay.mjs',
             readyRecordPath, auditRecordPath, recordPath, adoption: { timeoutMs: 30, pollMs: 10 } },
@@ -95,7 +95,7 @@ async function smokeFixture(smoke, check, { wrapExec = (exec) => exec } = {}) {
       return execFileSync(command, bound, { ...options, cwd: clone });
     };
     const load = createPrototypeLoader({ ...defaultDeps(), exec: wrapExec(baseExec), realDispatchSmoke: smoke,
-      env: { HOME: tmp, TMPDIR: tmp, USER: 'test', WE_DAEMON_OVERLAY_DIR: join(tmp, 'overlays') },
+      env: { HOME: tmp, TMPDIR: tmp, USER: 'test', WE_OVERLAY_AUDIT_EVIDENCE: 'off', WE_DAEMON_OVERLAY_DIR: join(tmp, 'overlays') },
       testCheck: async () => ({ sha, name: 'test', status: 'completed', conclusion: 'success', appId: 15368 }),
       settings: { daemons: { control: { clone } }, workspaceRoot: tmp, loaderCli: 'scripts/daemon-overlay.mjs',
         readyRecordPath, auditRecordPath, recordPath, adoption: { timeoutMs: 30, pollMs: 10 } } });

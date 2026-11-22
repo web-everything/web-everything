@@ -537,6 +537,15 @@ describe('codex-audit runner registration', () => {
   });
 });
 
+it('unaudited loader refusal explicitly names both missing evidence sources', async () => {
+  const f = auditedFixture('refuse', { audits: '' });
+  const out = await f.run();
+  expect(out.stopReason).toBe('no-canonical-audit');
+  expect(out.detail).toContain(`no NOT WEAKENED canonical audit record for ${SHA}`);
+  expect(out.detail).toContain('no waiver in ruled-weakened.jsonl');
+  expect(f.calls).toEqual([]);
+});
+
 describe('canonicalAuditEvidence', () => {
   it('exports a pure selector returning the matching NOT WEAKENED record', () => {
     const record = Object.freeze(auditRecord());
@@ -2106,7 +2115,7 @@ describe('prototype-load', () => {
     expect(calls).toEqual([
       ['add', clone, '--ref=lane/new', '--check', `--expected-sha=${SHA}`, '--json'],
       ['list', clone, '--json'],
-      ['add', clone, '--ref=lane/new', `--expected-sha=${SHA}`, '--reason=tested change', '--by=tester', '--json'],
+      ['add', clone, '--ref=lane/new', '--audit-checked-by=prototype-load', `--expected-sha=${SHA}`, '--reason=tested change', '--by=tester', '--json'],
     ]);
     const addIndex = f.calls.findIndex((c) => c.cmd === 'node' && c.args.includes('--by=tester'));
     expect(f.calls.slice(addIndex - 2, addIndex).map((c) => c.args)).toEqual([

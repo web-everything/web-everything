@@ -14,6 +14,7 @@
 
 /** Keyed `<policy>.<leaf>`; a scalar policy (empty leaf) is keyed by the policy alone. */
 export const SAFE_DIRECTION = Object.freeze({
+  'overlaySafety.auditEvidence': { kind: 'safety', safe: 'enum:refuse,warn,off' },
   'review.unattendedAcceptRequiresCleanReferrals': { kind: 'safety', safe: 'true' },
   'review.careExemptPaths': { kind: 'safety', safe: 'subset' },
   'redTeam.recheckReadsRepo': { kind: 'safety', safe: 'true' },
