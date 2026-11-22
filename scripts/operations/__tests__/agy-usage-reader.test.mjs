@@ -440,6 +440,18 @@ describe('snapshot persistence', () => {
     await runAgyUsageReader(h);
     expect(h.collect).toHaveBeenCalledOnce();
   });
+  it.each([[1, 54000], [0.5, 27000], [30, 1740000], [0, 0]])(
+    'keeps a short interval throttled: %s min skips below %s ms', async (minIntervalMinutes, window) => {
+      if (window > 0) {
+        const fresh = fileFixture(JSON.stringify(complete(NOW - window + 1)));
+        fresh.settings = { minIntervalMinutes, timeoutMs: 45000 };
+        expect(await runAgyUsageReader(fresh)).toEqual({ skipped: true });
+      }
+      const due = fileFixture(JSON.stringify(complete(NOW - window)));
+      due.settings = { minIntervalMinutes, timeoutMs: 45000 };
+      await runAgyUsageReader(due);
+      expect(due.collect).toHaveBeenCalledOnce();
+    });
   it('stamps the written snapshot with the collection START time', async () => {
     const h = fileFixture();
     let clock = NOW;

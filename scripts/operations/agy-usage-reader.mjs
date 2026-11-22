@@ -154,6 +154,12 @@ export function collectAgyUsage({ home = homedir(), timeoutMs = 45000, spawnFn =
  */
 export const THROTTLE_SLACK_MS = 60000;
 
+/** The skip window: the interval less the slack, capped at a tenth of the interval so short intervals still throttle. */
+export function throttleWindowMs(minIntervalMinutes) {
+  const interval = minIntervalMinutes * 60000;
+  return interval - Math.min(THROTTLE_SLACK_MS, interval / 10);
+}
+
 export async function runAgyUsageReader({ home = homedir(), io = fs, now = Date.now,
   settings = readAgyUsageSettings(), collect = collectAgyUsage } = {}) {
   const target = join(home, '.plateau', 'agy-usage.json');
@@ -165,7 +171,7 @@ export async function runAgyUsageReader({ home = homedir(), io = fs, now = Date.
     // A recent signed-out result also throttles retries, without claiming any quota evidence.
     if (Number.isFinite(at) && at <= now()
       && (previous.status === 'signed-out' || (valid(previous.five_hour) && valid(previous.seven_day)))
-      && now() - at < settings.minIntervalMinutes * 60000 - THROTTLE_SLACK_MS) return { skipped: true };
+      && now() - at < throttleWindowMs(settings.minIntervalMinutes)) return { skipped: true };
   } catch (error) { if (error.code !== 'ENOENT') throw error; }
   // Stamp the record at collection START, so the time collection takes never shifts the next throttle window.
   const startedAt = now();
