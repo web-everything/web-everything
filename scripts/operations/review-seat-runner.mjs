@@ -92,7 +92,7 @@ export async function runSeatWithProvider(request, {
       logReviewSeat(log, `review-seat: agy ${directive.mode} skipped: ${reason}`);
       return { status: 'skipped', reasons: [reason] };
     }
-    // Advisory opt-in uses the shared promotion gate; counted Carbon still requires the blocking-only correctness directive.
+    // Advisory opt-in uses the shared promotion gate; counted Carbon requires the promoted correctness directive.
     if (directive.mode !== 'shadow' && (!carbonNonShadowAllowed(runModel, { log })
       || (/carbon/i.test(String(runModel)) && !promoted && plain.lens !== 'agy-correctness'))) {
       const reason = 'Carbon not promoted — non-shadow seat refused';
@@ -183,8 +183,8 @@ export async function runSeatWithProvider(request, {
         let inspected = false;
         try { inspected = Boolean(agyRun.transcriptFile) && hasSuccessfulDiffRead(readTranscript(agyRun.transcriptFile), directive.citationScope, {
           checkoutRoot: agyRun.checkoutRoot ?? cwd,
-          requiredFiles: scoped.admitted.length ? scoped.admitted.map(finding => finding.file) : directive.citationScope,
-          wholeFiles: scoped.admitted.length === 0,
+          requiredFiles: directive.citationScope,
+          wholeFiles: deriveVerdict(agyRun.value) === 'accept',
         }); } catch { /* unreadable evidence refuses */ }
         if (!inspected) reasons.push('Carbon lacks successful diff read_file evidence for its cited files');
       }
@@ -202,14 +202,6 @@ export async function runSeatWithProvider(request, {
     }
   }
   if (agyRun.status === 'ok' && agyRun.sessionId) {
-    if (promoted) {
-      // Claude alone decides correctness. Carbon contributes only additional blockers, never a pass.
-      const claude = unwrap(await claudeJudge(plain));
-      const blocking = agyRun.value.findings.filter(f => deriveVerdict({ findings: [f] }) === 'changes');
-      return wrap({ ...claude.value, seatProvider: { provider: 'claude' },
-        ...(blocking.length ? { carbonBlocking: { provider: 'agy', model, sessionId: agyRun.sessionId, findings: blocking } } : {}),
-      }, claude.telemetry);
-    }
     const t = agyRun.telemetry ?? {};
     return wrap(
       { ...agyRun.value, seatProvider: { provider: 'agy', model, sessionId: agyRun.sessionId } },

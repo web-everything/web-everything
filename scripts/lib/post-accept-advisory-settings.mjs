@@ -24,11 +24,12 @@ export function resolvePostAcceptAdvisorySettings({ env = process.env, platform,
   else if (Object.hasOwn(env, 'WE_REVIEW_POST_ACCEPT_ADVISORY_MODE') && env.WE_REVIEW_POST_ACCEPT_ADVISORY_MODE === undefined) {
     warn('invalid env mode');
   }
-  let tool;
+  let tool, toolBlock;
   try {
     const data = JSON.parse(readFile(file));
     if (!object(data)) throw new Error('invalid settings shape');
-    tool = blockMode(data.postAcceptAdvisory, 'tool');
+    toolBlock = data.postAcceptAdvisory;
+    tool = blockMode(toolBlock, 'tool');
   }
   catch { warn('unreadable review settings'); tool = 'shadow'; }
   let plat = platform;
@@ -42,6 +43,13 @@ export function resolvePostAcceptAdvisorySettings({ env = process.env, platform,
     standard: { mode: 'shadow' }, platform: project(blockMode(plat, 'platform'), 'platform'), env,
     envValues: project(env.WE_REVIEW_POST_ACCEPT_ADVISORY_MODE, 'env'),
   });
+  const sampling = cascadePolicy('review.postAcceptAdvisory.sampling', { sampleRate: toolBlock?.sampleRate }, {
+    standard: { sampleRate: 0.1 }, platform: { sampleRate: plat?.sampleRate }, env,
+    envValues: { sampleRate: env.WE_REVIEW_POST_ACCEPT_ADVISORY_SAMPLE_RATE === undefined ? undefined : Number(env.WE_REVIEW_POST_ACCEPT_ADVISORY_SAMPLE_RATE) },
+    valid: { sampleRate: v => typeof v === 'number' && Number.isFinite(v) && v >= 0 && v < 1 },
+  });
+  Object.assign(result.value, sampling.value);
+  Object.assign(result.sources, sampling.sources);
   if (invalid) result.value.mode = 'shadow';
   try { log(formatCascadeSourcesLine('review.postAcceptAdvisory', result)); } catch { /* telemetry */ }
   return { ...result, invalid };

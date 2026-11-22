@@ -1127,34 +1127,29 @@ that both drive modes preserve provider effort while retaining the request fallb
 
 ## Shadow reviewer agreement evidence
 
-Manual `shadowSeats.antigravity.promoted: true` with the legacy selector `promotionReplaces: claude`
-enables an additional blocking-only Carbon correctness seat when `enabled` is true. Claude always
-runs and remains the only correctness decider. Carbon blockers are merged into the panel findings
-with prevention guards intact, and cause send-backs/referrals even when Claude accepts. Covered
-referrals do not erase Carbon blockers. Carbon never contributes an accept or a counted pass;
-no-blocker answers (including prevention-outstanding) and failed/invalid answers contribute nothing.
-Security retains its Claude seat; the other Carbon shadows use deterministic `scope: sampled` at 0.1.
-The agy-Claude shadow fallback and advisory use Sonnet. Promotion opts the companion into the existing
-Gemini routing cap (explicit caps still win), with the atomic daily session budget. The separate Carbon
-advisory seat stays off. Red-team routing and human gates are unchanged.
-`scripts/lib/__tests__/review-shadow-model.test.mjs` covers these boundaries, including the exact Tier-1 case.
-The append-only `agy-carbon-promotion.jsonl` lives beside the shadow ledger. Run
-`node scripts/lib/agy-shadow-trial-report.mjs --promotion` for agreement with the final stored panel
-verdict, later fix confirmations, explicit `not-real` false positives, timeouts/fallbacks and distinct PRs.
-This local report reads persisted runs without GitHub calls; unknown verdicts/findings stay pending.
-Fix proximity is confirmation evidence, never proof that an unconfirmed finding was false.
-Promotion is confined to the existing shadow correctness route: an explicit Claude route or a
-Gemini routing disable refuses the companion, and dispatch rechecks live controls and cap kill switches.
-An invalid `promotionReplaces` override refuses and logs. Other Carbon non-shadow roles, including
-red-team and advisory seats, remain refused regardless of the promotion flag. Admitted Carbon answers
-validate against the server-owned review JSON schema with no coercion or additional properties.
-Every finding requires a non-empty file and positive integer line, and all findings must survive
-`scopeFindingsToCitedFiles` admission against the pinned diff. Zero findings require a completed,
-non-error `read_file` of a diff path in the served transcript; summary phrases do not prove inspection.
-An observed matching served model, no timeout (including salvaged answers), and a successful ledger
-append remain required. Any missing or invalid evidence falls back to Claude.
-Carbon cannot substitute for a failed Claude seat; correctness remains unrun if Claude fails.
-The pure `assertCrossVendorPanel` helper retains its existing cross-vendor check.
+Manual `shadowSeats.antigravity.promoted: true` with `promotionReplaces: claude` replaces
+correctness with a deciding Carbon seat. A valid Carbon accept counts without invoking Claude.
+Reads must be bound to the reviewed head and cover every changed file; clean answers require
+whole-file reads. Errors, timeouts, missing reads, invalid answers and ledger failures invoke the
+fallback reviewer, never a synthetic accept. Historical companion blockers remain enforced on resume.
+Correctness, security and red-team each require a different vendor from the builder, including
+fallbacks and observed model identities. Unknown builder or unavailable independent providers hold
+the review with an operator-visible WAIT. Gemini builders use Claude or Codex correctness.
+Other lenses may use any vendor. The human gate remains unchanged.
+
+Watch-only Carbon shadows, the agy advisory reviewer and post-accept advisory snapshots use the
+existing deterministic PR hash sampler at a default rate of 0.1. Post-accept loop/rating evidence
+continues recording so later outcomes can be joined to sampled snapshots. Settings log provenance.
+
+`scripts/lib/__tests__/review-shadow-model.test.mjs` covers Carbon evidence and failure boundaries;
+`scripts/lib/__tests__/review-seat-independence.test.mjs` covers the builder/seat assignment table,
+sampling defaults and success ledger. New deciding attempts append to `review-seat-success.jsonl`
+beside the existing promotion ledger; extras and red-team retain their scorecards. Run
+`node scripts/lib/agy-shadow-trial-report.mjs --seats --no-gh` to read counts by seat, provider and
+seat/provider, including counted verdicts, agreement, confirmed findings, false positives and timeouts.
+Unknown outcomes remain pending; missing corroboration never establishes a false positive.
+The existing `--promotion` report remains available for Carbon attempt history.
+
 
 The agy mandatory-seat shadows are off by default (operator 2026-10-16).
 `review.shadowSeats.antigravity.enabled` / `WE_REVIEW_SHADOW_AGY_ENABLED` enables shadows only within the selected scope.
@@ -5121,9 +5116,9 @@ reservation. Keep the pinned-head co-author read ahead of routing; the scratch c
 is created only after provider selection. Standard daily caps are Codex 80 (the tool
 settings explicitly raise it to 600), agy-gemini 0
 (off; operator opt-in through `review.seatDailyCaps.agy-gemini` or `enabledProviders`), agy-claude 10 (red-team emergency only). Codex builders prefer agy-gemini;
-if disabled or capped, use Codex and log same-vendor acceptance. Claude builders prefer
-Codex, then agy-gemini at cap. Unknown builders and `routeByBuilder=false` retain policy
-routing among the ordinary providers. Log each cap fallback, including reservation races.
+if disabled or capped, use an independent Claude provider or wait. Claude builders prefer
+Codex, then agy-gemini at cap. Gemini builders use Codex or Claude. Unknown builders wait;
+`routeByBuilder=false` preserves policy preference while still enforcing vendor independence. Log each cap fallback, including reservation races.
 Never choose agy-claude by default: only exhaustion of both ordinary providers' budgets
 permits the logged emergency route. Exhausting even the emergency budget retains the
 existing cap hold. Tests cover emergency selection, all budgets exhausted, and missing
