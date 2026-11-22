@@ -57,6 +57,11 @@ describe('forge key structure: unclosed object tails stay linear without weakeni
     expect(keyStructureFinding(Buffer.from(many))).toBe(EXH);
     expect(Date.now()-started).toBeLessThan(2000);
   });
+  it('keeps the signal scan linear on bracket-heavy input',()=>{
+    const started=Date.now();
+    expect(keyStructureFinding(Buffer.from('[a]'.repeat(40000)))).toBeNull();
+    expect(Date.now()-started).toBeLessThan(500);
+  });
   it('still blocks a PEM private key inside a large doc',()=>{
     const pem='-----BEGIN '+['PRIVATE','KEY'].join(' ')+'-----\nQUJD\n-----END '+['PRIVATE','KEY'].join(' ')+'-----';
     expect(keyStructureFinding(Buffer.from(truncated+prose+pem))).toBe(FINDING);

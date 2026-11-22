@@ -177,13 +177,20 @@ function lastSignal(text) {
   let last=text.lastIndexOf('\\');
   // Lowercase `kty` (jwkFinding's exact-case member name), and a quote or `+` touching a comment.
   for(const match of text.matchAll(/kty|["'`]\s*(?:\+|\/[*\/])|\+\s*(?:["'`]|\/[*\/])|\*\/\s*\+/g))last=Math.max(last,match.index);
+  // Forward-only line state (last newline, last `//`) keeps the scan linear however many brackets there are.
+  let scanned=0,lastNl=-1,lastSlash=-1;
   const computed=at=>{
     let i=at-1;
     while(i>=0&&/\s/.test(text[i]))i--;
     if(i<0)return false;
     const c=text[i];
+    for(;scanned<=i;scanned++) {
+      const code=text.charCodeAt(scanned);
+      if(code===10)lastNl=scanned;
+      else if(code===47&&text.charCodeAt(scanned+1)===47)lastSlash=scanned;
+    }
     // A line comment before this member on its line may hide the real previous token: count it.
-    if(text.lastIndexOf('//',i)>text.lastIndexOf('\n',i))return true;
+    if(lastSlash>lastNl)return true;
     return c==='{'||c===','||c==='*'||c==='/'||/(?:^|\W)(?:get|set|async)$/.test(text.slice(Math.max(0,i-5),i+1));
   };
   for(const match of text.matchAll(/\[|\.\.\./g))if(computed(match.index))last=Math.max(last,match.index);
