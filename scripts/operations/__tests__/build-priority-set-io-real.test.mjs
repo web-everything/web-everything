@@ -19,20 +19,20 @@ it('reads the real remote main despite a shadowing local branch and refuses a mi
 
 it('refuses real directory, ancestor, missing and symlink tree entries; accepts only regular blob modes on the pinned card SHA', async () => {
   await withRealRepo(async ctx => {
-    const regular = 'scripts/lib/a.mjs', executable = 'scripts/conveyor/pr-stall-sweep.mjs';
+    const regular = 'scripts/conveyor/a.mjs', executable = 'scripts/conveyor/pr-stall-sweep.mjs';
     ctx.commit({
-      'backlog/42-example.md': '---\nscope: ["we:scripts/lib/a.mjs"]\n---\n',
+      'backlog/42-example.md': '---\nscope: ["we:scripts/conveyor/a.mjs"]\n---\n',
       [regular]: 'export {};\n', [executable]: 'export {};\n',
-      'scripts/lib/relocated.mjs/child.mjs': 'export {};\n',
+      'scripts/conveyor/relocated.mjs/child.mjs': 'export {};\n',
     });
-    symlinkSync('a.mjs', join(ctx.root, 'scripts/lib/link.mjs'));
+    symlinkSync('a.mjs', join(ctx.root, 'scripts/conveyor/link.mjs'));
     chmodSync(join(ctx.root, executable), 0o755);
     ctx.git(['add', '--', 'scripts']);
     ctx.git(['commit', '--quiet', '-m', 'fixture: file modes']);
     ctx.git(['update-ref', 'refs/remotes/origin/main', 'HEAD']);
     const read = readPriorityCards({ git: args => ctx.git(args) });
-    expect(read('42').scope).toEqual(['we:scripts/lib/a.mjs']);
-    for (const path of ['scripts/lib', 'scripts/lib/relocated.mjs', 'scripts/lib/missing.mjs', 'scripts/lib/link.mjs']) {
+    expect(read('42').scope).toEqual(['we:scripts/conveyor/a.mjs']);
+    for (const path of ['scripts/conveyor', 'scripts/conveyor/relocated.mjs', 'scripts/conveyor/missing.mjs', 'scripts/conveyor/link.mjs']) {
       expect(read.pathType(path), path).not.toBe('file');
     }
     ctx.git(['rm', '--quiet', '--', regular]);

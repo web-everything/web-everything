@@ -3,7 +3,7 @@
   "settings": {
     "allowedDirs": {
       "owner": "scripts/settings/build-priority-scope.json",
-      "description": "Directory prefixes admitting exact regular-file WE scopes to build-priority-set; invalid or unreadable evidence refuses.",
+      "description": "Directory prefixes admitting exact regular-file WE scopes to build-priority-set (scripts/conveyor/ only); invalid or unreadable evidence refuses.",
       "changeVia": "pr",
       "instant": true
     },

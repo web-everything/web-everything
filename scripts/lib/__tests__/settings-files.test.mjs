@@ -445,7 +445,7 @@ describe('the real layout (we:scripts/settings/ + legacy dispatch-settings.json)
   });
 
   it('declares the build-priority scope allowlist in its feature file', () => {
-    expect(real.settings.allowedDirs).toEqual(['scripts/conveyor/', 'scripts/lib/']);
+    expect(real.settings.allowedDirs).toEqual(['scripts/conveyor/']);
     expect(real.owners.allowedDirs).toBe('settings/build-priority-scope.json');
   });
 

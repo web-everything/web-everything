@@ -1,4 +1,4 @@
 {
   "$comment": "Exact-file scope admission for build-priority-set. Read from the running checkout on every prepare, including under the writer lock. Missing, unreadable, empty or invalid evidence refuses; repair this file and retry. allowedDirs contains normal repo-relative directory prefixes ending in /, compared case-insensitively. No default or environment override grants admission.",
-  "allowedDirs": ["scripts/conveyor/", "scripts/lib/"]
+  "allowedDirs": ["scripts/conveyor/"]
 }

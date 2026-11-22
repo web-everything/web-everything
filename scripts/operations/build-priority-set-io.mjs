@@ -24,6 +24,7 @@ const EXECUTION_CONTROLS = [
 const GUARD_DEPENDENCY_BASENAMES = new Set([
   'atomic-json-file.mjs', 'automation-home.mjs', 'backlog-status.cjs',
   'bounded-child.mjs', 'build-priority-set-io.mjs', 'build-priority-set.mjs',
+  'runtime-admission.mjs', 'audit-settings.mjs', 'audit-path.mjs', 'build-policy.mjs',
   'build-queue.mjs', 'command-redact.mjs', 'constellation-repos.mjs',
   'container-exec.mjs', 'coordination-root.mjs', 'daemon-clone-layout.mjs',
   'daemon-events.mjs', 'daemon-last-good.mjs', 'declared-homes.mjs',
