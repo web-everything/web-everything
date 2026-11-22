@@ -6345,3 +6345,14 @@ shards exactly as the default would, so it is still recognized as the default ga
 Gate ceilings get one capped retry tied to lane, head and killed job. Detached jobs settle in
 `verify-gate-job.mjs`, so recovery must cover that consumer as well as `verify-dispatch.mjs`'s
 in-process sweep. Persist the retry identity in job input to dedupe the enqueue-before-marker crash window.
+
+
+## Test timing ownership
+
+The scheduled bot refresh (`.github/workflows/ci-timings-refresh.yml`, currently weekly)
+owns `scripts/ci/test-timings.json`. PR authors adding unit tests or soak breaks should
+leave that file to the bot. Files without timing entries get their suite's median
+stored timing and still land in exactly one shard. The PR-open soak precheck requires
+break coverage for daemon-scope bug fixes as before; timing entries are not evidence
+for that requirement. The balance diagnostic still requires measurements for every
+file before claiming measured balance; it is not a PR admission requirement.
