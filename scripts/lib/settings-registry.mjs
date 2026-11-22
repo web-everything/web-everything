@@ -4,11 +4,12 @@
  * Usage: node scripts/lib/settings-registry.mjs --write | --check
  * API: buildRegistry({ root }), renderMarkdown(registry). Descriptions belong in per-key metadata files.
  */
-import { readFileSync, writeFileSync, statSync, readdirSync } from 'node:fs';
+import { readFileSync, writeFileSync, statSync, lstatSync, readdirSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { readSettingsChecked, settingsLeaves } from './settings-files.mjs';
 import { CAPACITY_LEAVES } from './operator-override-reader.mjs';
+import { findDuplicateKeysPerScope } from '../check-standards-rules.mjs';
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '../..');
 const META = 'scripts/lib/settings-registry-metadata.json';
@@ -20,9 +21,12 @@ const entries = obj => Object.entries(obj).sort(([a], [b]) => compare(a, b));
 const documented = key => !key.startsWith('$comment');
 const object = v => v !== null && typeof v === 'object' && !Array.isArray(v);
 
-function readObject(root, path, problems) {
+function readObject(root, path, problems, perKey = false) {
   try {
-    const data = JSON.parse(readFileSync(join(root, path), 'utf8'));
+    if (perKey && !lstatSync(join(root, path)).isFile()) throw Error('expected regular file (no symlinks)');
+    const raw = readFileSync(join(root, path), 'utf8');
+    if (perKey && findDuplicateKeysPerScope(raw).length) throw Error('duplicate JSON property');
+    const data = JSON.parse(raw);
     if (!object(data)) throw Error('expected JSON object');
     return data;
   } catch (error) { problems.push(`${path}: ${error.message}`); return {}; }
@@ -35,7 +39,10 @@ export function readMetadata({ root = ROOT, problems } = {}) {
   const metadata = readObject(root, META, errors);
   const finish = () => { if (!problems && errors.length) throw Error(errors.join('\n')); return metadata; };
   let sections;
-  try { sections = readdirSync(join(root, META_DIR)).sort(compare); }
+  try {
+    if (!lstatSync(join(root, META_DIR)).isDirectory()) throw Error('expected directory (no symlinks)');
+    sections = readdirSync(join(root, META_DIR)).sort(compare);
+  }
   catch (error) {
     if (error.code !== 'ENOENT') errors.push(`${META_DIR}: ${error.message}`);
     return finish();
@@ -44,6 +51,7 @@ export function readMetadata({ root = ROOT, problems } = {}) {
     const path = `${META_DIR}/${section}`;
     try {
       if (!['settings', 'capacityLeaves'].includes(section)) throw Error('unknown metadata section');
+      if (!lstatSync(join(root, path)).isDirectory()) throw Error('expected directory (no symlinks)');
       if (!Object.hasOwn(metadata, section)) metadata[section] = {};
       if (!object(metadata[section])) throw Error('expected JSON object');
       for (const file of readdirSync(join(root, path)).sort(compare)) {
@@ -51,7 +59,7 @@ export function readMetadata({ root = ROOT, problems } = {}) {
         const encoded = encodeURIComponent(key).replace(/[!'()*]/g, c => `%${c.charCodeAt(0).toString(16).toUpperCase()}`);
         if (file !== `${encoded}.json`) throw Error(`invalid metadata filename: ${file}`);
         if (Object.hasOwn(metadata[section], key)) { errors.push(`duplicate metadata key: ${section}.${key}`); continue; }
-        Object.defineProperty(metadata[section], key, { value: readObject(root, `${path}/${file}`, errors), enumerable: true, configurable: true });
+        Object.defineProperty(metadata[section], key, { value: readObject(root, `${path}/${file}`, errors, true), enumerable: true, configurable: true });
       }
       metadata[section] = Object.fromEntries(entries(metadata[section]));
     } catch (error) { errors.push(`${path}: ${error.message}`); }
@@ -107,6 +115,7 @@ export function buildRegistry({ root = ROOT } = {}) {
   const keys = new Set(rows.map(row => row.key));
   for (const key of keys) if (!Object.hasOwn(metadata.settings ?? {}, key)) problems.push(`missing setting metadata: ${key}`);
   for (const [key, meta] of entries(metadata.settings ?? {})) {
+    for (const field of ['key', 'value', 'owners']) if (meta != null && Object.hasOwn(meta, field)) problems.push(`metadata overrides declared field: ${key}.${field}`);
     if (!keys.has(key)) problems.push(`orphan setting metadata: ${key}`);
     if (!['capacity-leaf', 'env', 'operator-prefs', 'pr'].includes(meta?.changeVia)) problems.push(`invalid changeVia: ${key}`);
     if (typeof meta?.description !== 'string' || !meta.description.trim() || meta.description.length > 160) problems.push(`invalid description: ${key}`);
@@ -120,7 +129,7 @@ export function buildRegistry({ root = ROOT } = {}) {
     return { ...meta, key };
   });
   for (const key of Object.keys(metadata.capacityLeaves ?? {})) if (!Object.hasOwn(CAPACITY_LEAVES, key)) problems.push(`orphan capacity metadata: ${key}`);
-  return { rows: rows.map(row => ({ ...row, ...metadata.settings?.[row.key], leafCount: leafCount(row.value) }))
+  return { rows: rows.map(row => ({ ...metadata.settings?.[row.key], ...row, leafCount: leafCount(row.value) }))
     .sort((a, b) => compare(a.key, b.key) || compare(a.owners.join(), b.owners.join())),
   capacityRows, instantGaps: metadata.instantGaps ?? [], toSettle: metadata.toSettle ?? [], discoveryPasses: metadata.discoveryPasses ?? [], problems: problems.sort(compare) };
 }

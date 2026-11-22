@@ -8,7 +8,7 @@ import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
 import { execFileSync } from 'node:child_process';
 import MarkdownIt from 'markdown-it';
-import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync, renameSync, symlinkSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -245,6 +245,56 @@ test('duplicate metadata key in base and directory fails closed in either sectio
     const f = fixture(t), [key, value] = Object.entries(f.meta[section])[0];
     f.write(`${META_DIR}/${section}/${filename(key)}`, value);
     assert.throws(() => renderMarkdown(f.build()), /duplicate metadata key/);
+  }
+});
+test('base and per-key metadata cannot override declared key, value or owners', t => {
+  for (const perKey of [false, true]) {
+    const f = fixture(t), before = f.build().rows;
+    Object.assign(f.meta.settings.alpha, { key: 'forged', value: { forged: true }, owners: ['forged.json'] });
+    if (perKey) split(f);
+    const r = f.build();
+    for (const field of ['key', 'value', 'owners']) assert.ok(r.problems.includes(`metadata overrides declared field: alpha.${field}`));
+    assert.deepEqual(r.rows, before);
+    assert.throws(() => renderMarkdown(r), /metadata overrides declared field/);
+  }
+});
+test('per-key JSON rejects duplicate properties at the root and inside nested objects and arrays', t => {
+  for (const section of ['settings', 'capacityLeaves']) for (const raw of [
+    '{"description":"first","description":"last"}',
+    '{"leaves":{"count":{"range":"first","range":"last"}}}',
+    '{"nested":[{"key":1,"k\\u0065y":2}]}',
+  ]) {
+    const f = fixture(t); split(f);
+    const key = section === 'settings' ? 'alpha' : Object.keys(CAPACITY_LEAVES)[0];
+    const path = `${META_DIR}/${section}/${filename(key)}`;
+    writeFileSync(join(f.root, path), raw);
+    const problems = [], metadata = readMetadata({ root: f.root, problems });
+    assert.ok(problems.includes(`${path}: duplicate JSON property`));
+    assert.deepEqual(metadata[section][key], {});
+    assert.throws(() => readMetadata({ root: f.root }), /duplicate JSON property/);
+    assert.throws(() => renderMarkdown(f.build()), /duplicate JSON property/);
+  }
+});
+test('metadata directory rejects symlinked roots, sections and files and other non-regular entries', t => {
+  for (const section of ['settings', 'capacityLeaves']) for (const entry of ['root', 'section', 'file']) for (const symlink of [false, true]) {
+    const f = fixture(t); split(f);
+    const key = section === 'settings' ? 'alpha' : Object.keys(CAPACITY_LEAVES)[0];
+    const path = entry === 'root' ? META_DIR : entry === 'section' ? `${META_DIR}/${section}` : `${META_DIR}/${section}/${filename(key)}`;
+    const absolute = join(f.root, path);
+    if (symlink) {
+      const target = join(f.root, 'target');
+      renameSync(absolute, target);
+      symlinkSync(target, absolute);
+    } else {
+      rmSync(absolute, { recursive: true });
+      if (entry === 'file') mkdirSync(absolute);
+      else writeFileSync(absolute, '{}');
+    }
+    const problems = [];
+    readMetadata({ root: f.root, problems });
+    assert.ok(problems.some(p => p.startsWith(`${path}: expected `)), problems.join('\n'));
+    assert.throws(() => readMetadata({ root: f.root }), /expected (directory|regular file)/);
+    assert.throws(() => renderMarkdown(f.build()), /expected (directory|regular file)/);
   }
 });
 test('filenames round-trip punctuation, percent, slash and Unicode keys in deterministic order', t => {
