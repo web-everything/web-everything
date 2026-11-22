@@ -1,4 +1,6 @@
 /** Best-effort coordination events shared by daemon processes.
+ * Question kind: fix-question-asked (after durable stand-down publication; detail = {head, needsYou:true}).
+ * Distinct from fix-stood-down/status:needs-you so orchestrator filters do not hide the question.
  * PR watcher kinds: pr-merged, pr-ready-not-merging, ready-stuck (detail.needsYou=true; label age and blocker cause), pr-looping, pr-no-progress, ci-job-overdue,
  * review-paused-no-verdict (once per PR head: >=3 review runs on the head, none a recorded decisive verdict; detail = { head, runs, reason }).
  * Stuck PR evidence kind: stuck-trace; detail = { head, trigger, headline, owner, waitingFor, note } (event only).

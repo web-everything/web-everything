@@ -1896,7 +1896,7 @@ describe('fix daemon pass timing', () => {
     });
     expect(Object.keys(result.phaseMs).sort()).toEqual([
       'fix', 'ci-heal', 'hung-ci', 'main-red-rebase', 'missing-run', 'promote-draft', 'notes',
-      'auth-gate', 'await-verify', 'stuck-fixers', 'supersede', 'ruling-stand-down', 'orphan-guard',
+      'auth-gate', 'await-verify', 'stuck-fixers', 'supersede', 'ruling-stand-down', 'orphan-guard', 'push-resolved-side-branch',
     ].sort());
     for (const ms of Object.values(result.phaseMs)) expect(ms).toBeGreaterThan(0);
     expect(result.passMs).toBeGreaterThanOrEqual(Object.values(result.phaseMs).reduce((a, b) => a + b, 0));
@@ -2674,7 +2674,7 @@ describe('fix pass budgets', () => {
       },
     });
     const result = await runTickAllRepos(opts);
-    const phases = ['auth-gate', 'await-verify', 'supersede', 'ruling-stand-down', 'orphan-guard',
+    const phases = ['auth-gate', 'push-resolved-side-branch', 'await-verify', 'supersede', 'ruling-stand-down', 'orphan-guard',
       'fix', 'stuck-fixers', 'ci-heal', 'hung-ci', 'main-red-rebase', 'missing-run', 'promote-draft', 'notes'];
     expect(Object.keys(result.phaseMs)).toEqual(phases);
     const lines = [];

@@ -1,0 +1,4 @@
+{
+  "$comment": "fix.pushResolvedSideBranch defaults on. Standard -> platform fix.pushResolvedSideBranch -> this tool file -> WE_FIX_PUSH_RESOLVED_SIDE_BRANCH=on|off. Effective value/source logged each daemon tick. Pushes a saved conflict repair, never clears merge/review holds; unreadable settings disable writes and require operator inspection.",
+  "fix": { "pushResolvedSideBranch": true }
+}

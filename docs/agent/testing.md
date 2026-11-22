@@ -6345,3 +6345,13 @@ shards exactly as the default would, so it is still recognized as the default ga
 Gate ceilings get one capped retry tied to lane, head and killed job. Detached jobs settle in
 `verify-gate-job.mjs`, so recovery must cover that consumer as well as `verify-dispatch.mjs`'s
 in-process sweep. Persist the retry identity in job input to dedupe the enqueue-before-marker crash window.
+
+## Saved-conflict push race probes
+
+`resolved-side-branch-io.test.mjs` exercises the actual generated pre-push hook with
+a changed remote advertisement. An API head re-read alone does not pin a plain push:
+Git must also refuse an advertised old oid that differs from the exact read head,
+then the server applies its ordinary compare-and-swap. Keep the no-force assertion,
+fresh bare transport/environment probe, post-push readback and no-personal-token
+negatives alongside this hook test. The daemon soak uses the real fix dispatcher
+to prove a saved repair push cannot immediately launch a fixer on its new head.

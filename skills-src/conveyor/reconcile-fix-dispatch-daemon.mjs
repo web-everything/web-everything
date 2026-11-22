@@ -46,6 +46,8 @@ import { safeAdoptYield } from '../../scripts/lib/daemon-rebuild/adopt-yield.mjs
 
 import { createFixHandoffSleep, createFixHandoffProbe } from '../../scripts/lib/fix-handoff.mjs';
 import { publishAttention } from '../../scripts/operations/needs-you-feed.mjs';
+import { emitFixQuestion } from '../../scripts/conveyor/stand-down.mjs';
+import { runResolvedSideBranchPass, resolveResolvedSideBranchSetting } from '../../scripts/conveyor/resolved-side-branch-push.mjs';
 import { autoRoundGrant as defaultAutoRoundGrant, firstLine as redactedFirstLine, stuckAfterGrant as defaultStuckAfterGrant } from '../../scripts/conveyor/auto-round-grant-io.mjs';
 import { resolveFixSafety } from '../../scripts/conveyor/repeated-finding-reset.mjs';
 import { execFileSync } from 'node:child_process';
@@ -420,6 +422,7 @@ export function runReconcileNotesAllRepos({
   publish = publishAttention, safety = resolveFixSafety(), autoRoundGrant = defaultAutoRoundGrant, stuckAfterGrant = defaultStuckAfterGrant,
   dryRun = defaultNoteCommentDryRun(), verdictSettings = resolveCiHealVerdictSettings(), readRequiredChecks = defaultReadRequiredChecks,
   deadlineAt, cursor, now = Date.now,
+  questionEvent = emitFixQuestion,
   ...tickOpts
 } = {}) {
   process.stderr.write(`policy · fix.alertAtRoundCap=${safety.value.alertAtRoundCap} (${safety.sources.alertAtRoundCap})\n`);
@@ -538,6 +541,10 @@ export function runReconcileNotesAllRepos({
         continue;
       }
       const outcome = postComment({ repo, pr: n.prNumber, body: plan.body });
+      if (outcome.ok && n.kind === 'stood-down') {
+        Promise.resolve(questionEvent({ repo: CONSTELLATION_REPOS[repo]?.slug ?? repo,
+          pr: n.prNumber, head: pr?.headRefOid ?? null })).catch(() => {});
+      }
       comments.push({
         repo,
         prNumber: n.prNumber,
@@ -1125,6 +1132,8 @@ export function createPassCallRecorder() {
  */
 export async function runTickAllRepos({
   repos = FIX_DISPATCH_DAEMON_REPOS, fixTick, ciHealTick, hungCiTick, mainRedRebaseTick, missingRunTick, promoteDraftTick, rulingStandDownTick, notesTick, notesDryRun,
+  resolvedSideBranchTick,
+  resolvedSideBranchSetting = resolveResolvedSideBranchSetting(),
   authGateOverride,
   // s2: false while the ci-heal child loop is alive; the inline step otherwise runs under the same single-run lock.
   ciHealInline = true, ciHealLock = false, withCiHealLock = withCiHealCycleLock,
@@ -1179,7 +1188,7 @@ export async function runTickAllRepos({
   const shouldYield = () => (yieldedForAdoption ||= safeAdoptYield(adoptYieldProbe));
   const passStart = now();
   const anyTickInjected = [fixTick, ciHealTick, hungCiTick, mainRedRebaseTick, missingRunTick,
-    promoteDraftTick, notesTick, awaitVerifyTick, stuckFixerTick, supersedeTick, rulingStandDownTick].some(Boolean);
+    promoteDraftTick, notesTick, awaitVerifyTick, stuckFixerTick, supersedeTick, rulingStandDownTick, resolvedSideBranchTick].some(Boolean);
   const planCache = (reuseReconcilePlan ?? !anyTickInjected)
     ? createReconcilePlanCache({ reconcile: reconcilePass, now, readFingerprints: readPlanFingerprint, readClaims: readPlanClaimSet }) : null;
   const budgets = Object.fromEntries(Object.entries(FIX_PASS_LIMITS).map(([key, rule]) =>
@@ -1257,6 +1266,19 @@ export async function runTickAllRepos({
   const factsWarm = realTick ? await timedAsync('facts', () => warmFixFacts(repos)) : null;
   const authGate = timed('auth-gate', () => (authGateOverride ? authGateOverride()
     : ((fixTick || ciHealTick) ? { paused: false, reason: null } : planClaudeAuthDispatchGate())));
+  // Push before any notes/questions or fixer launches. App auth is independent of model login.
+  const resolvedSideBranches = await timedAsync('push-resolved-side-branch', async () => {
+    console.error(`fix.pushResolvedSideBranch=${resolvedSideBranchSetting.value} (source: ${resolvedSideBranchSetting.source})`);
+    const rows = [];
+    if (!resolvedSideBranchSetting.value || (anyTickInjected && !resolvedSideBranchTick)) return rows;
+    for (const repo of repos) {
+      try { rows.push(...(await (resolvedSideBranchTick ?? runResolvedSideBranchPass)({ repo })).map(row => ({ ...row, repo }))); }
+      catch { console.error(`push-resolved-side-branch: ${repo} unreadable — operator inspection required`); }
+    }
+    return rows;
+  });
+  const resolvedSideBranchPushes = resolvedSideBranches.filter(row => row.result === 'pushed');
+  planCache?.markTouched({ dispatched: resolvedSideBranchPushes });
   // #5137 — FIRST, before any fresh dispatch: a fixer that ended its turn awaiting a verdict is pushed (green,
   // exact sha) or resumed (red) here, so the model never holds a turn open on `check --wait`. Pushing needs no
   // Claude login; resuming does, so a paused login only defers the resume (the record keeps it pending).
@@ -1439,6 +1461,7 @@ export async function runTickAllRepos({
   const guardedFixRepos = stepRepos.get('fix').filter(repo => !orphanGuardDeferred.includes(repo));
   const fix = stepTimed('fix', () => (authGate.paused ? pausedDispatchResult()
     : runReconcileFixDispatchAllRepos({ repos: budgetRepos('fix', guardedFixRepos), allowStandDownAutoProceed,
+      ...(resolvedSideBranchPushes.length ? { resolvedSideBranchPushes } : {}),
       tick: boundedPrTick('fix', sharedTick('fix', fixTick ?? runReconcileFixDispatch)),
       ...(fixTick ? {} : { queueAdmission, dispatchThrottle, borrowGate, fixExecutorRoute }) })));
   for (const repo of orphanGuardDeferred) fix.refusals.push({ repo, prNumber: null,
@@ -1563,6 +1586,7 @@ export async function runTickAllRepos({
     mainRedRebase, // the main-red-rebase half's own detail, same reason
     missingRun, // the missing-run-recovery half's own detail, same reason (xi4od2p, #4075/#3383)
     rulingStandDown,
+    resolvedSideBranches,
     promoteDraft, // the promote-draft half's own detail, same reason (draft-first PRs, 2026-09-27)
     authPaused: authGate.paused, // card x5kagse — fix/ci-heal dispatch skipped outright this tick
     authPauseReason: authGate.reason,

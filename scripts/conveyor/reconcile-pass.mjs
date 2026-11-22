@@ -1719,6 +1719,7 @@ export function enrichPrsWithLedgerHolds(prs, { readOnly = false, repo, now = Da
 export function runReconcilePass({
   readOnly = false,
   readPrs = defaultReadPrs, readAgents = defaultReadAgents, enrich = enrichAgents,
+  enrichResolvedBranches = null,
   excuseMergeGateHolds = excusePrMergeGateHolds, readMergeGateVerdict = defaultReadMergeGateVerdict,
   readFreeze = readSharedFreeze, mergeGateSetting,
   enrichMainRed = enrichPrsWithMainRedFacts, enrichAlreadyLanded = enrichPrsWithAlreadyLandedFacts,
@@ -1909,7 +1910,8 @@ export function runReconcilePass({
     owedCiRerun: owedCiRerunSetting.value,
     staleCiRerun: staleCiRerunSetting.value,
     roundCap: resolveRoundCap(env),
-    repo: repoKey, prs, agents, durableCounts: durableCountsFrom(prs), now, defaultBranch, mainRedWindows,
+    repo: repoKey, prs: enrichResolvedBranches ? step('resolved-side-branches', () => enrichResolvedBranches(prs, { repo: repoKey })) : prs,
+    agents, durableCounts: durableCountsFrom(prs), now, defaultBranch, mainRedWindows,
     mainLatestCheckRuns, requiredChecks, mainSha, fixerLadder,
     ...fixCapSettings(() => fixSettings, env, loadTakeoverBudget),
     ...operatorRulingRoundsSetting(loadOperatorRulingRounds, env),

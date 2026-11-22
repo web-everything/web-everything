@@ -134,6 +134,7 @@ import { fixDetachedProvider } from '../operations/dispatch-providers/fix.mjs';
 import { removePromptFile } from '../operations/fix-run.mjs';
 import { listBuildDispatchClaims } from './build-dispatch-claim.mjs';
 import { runReconcilePass, resolveLaneHead, PR_LIST_JSON_FIELDS } from './reconcile-pass.mjs';
+import { enrichResolvedSideBranches } from './resolved-side-branch-push.mjs';
 import { readUnsupported, recordUnsupported } from './unsupported-repo.mjs';
 import { readPrsFromFile } from './open-pr-fetch.mjs';
 import { CONFLICT_LABEL } from './parked-pr-conflict-watch.mjs';
@@ -1885,6 +1886,8 @@ export function runReconcileFixDispatch({
   tryResumeRound = isUnderTestEnv() ? null : tryResumeRoundFix,
   dispatch = dispatchFix,
   reconcile = runReconcilePass,
+  enrichResolvedBranches = isUnderTestEnv() ? null : enrichResolvedSideBranches,
+  resolvedSideBranchPushes = [],
   readPrs,
   readFreshPr = readFreshFixPr,
   // Bypass pass-local plan caches: this must run the normal planner on the fresh single PR.
@@ -1974,6 +1977,7 @@ export function runReconcileFixDispatch({
   // stale. Run it for every repo.
   assertMainNotStale(root, checkStaleness, FIX_STALE_GUARD_OPTS);
   const reconciledRaw = reconcile({ repo, allowStandDownAutoProceed,
+    ...(enrichResolvedBranches ? { enrichResolvedBranches } : {}),
     ...(readPrs ? { readPrs } : {}),
     ...(prsFile ? { readPrs: () => readPrsFromFile(prsFile) } : {}) });
   // A DEFERRED read (gh low budget / slot throttle / author-lookup budget) planned nothing: owed is UNKNOWN, not zero.
@@ -2039,6 +2043,14 @@ export function runReconcileFixDispatch({
   reconciled = { ...reconciled, refusals: freshRefusals,
     dispatch: [...(Array.isArray(reconciled.dispatch) ? reconciled.dispatch : []), ...recovered] };
   if (netScope) reconciled = fixStep('net-scope', () => netScope(reconciled, { root, repoKey }));
+  // A push earlier THIS tick must not immediately launch from a stale bounce. Head binding makes this
+  // a one-tick handoff to fresh gate evidence, not a persistent exemption from fixing later findings.
+  const pushedNow = entry => resolvedSideBranchPushes.some(row => row.repo === ghRepoSlug(repo ?? 'we')
+    && row.pr === entry.prNumber && row.sha === entry.headRefOid);
+  const pushedRows = (reconciled.dispatch ?? []).filter(pushedNow);
+  reconciled = { ...reconciled, dispatch: (reconciled.dispatch ?? []).filter(entry => !pushedNow(entry)),
+    refusals: [...(reconciled.refusals ?? []), ...pushedRows.map(entry => ({ ...entry,
+      kind: 'resolved-side-branch-owed', why: 'saved repair pushed this tick; waiting for the new head merge gate, no fixer launch' }))] };
   let dispatchEntries = reconciled.dispatch;
   const profile = resolveProfile(repoKey);
 
