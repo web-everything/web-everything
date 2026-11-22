@@ -1015,6 +1015,64 @@
       "owner": "scripts/lib/delivery-priority-settings.json",
       "changeVia": "pr",
       "instant": false
+    },
+    "resourcePool": {
+      "description": "S1a shadow studio ledger: builder floor and maxima; reserves validated for later slices. Enforce remains shadow.",
+      "owner": "scripts/settings/resource-pool.json",
+      "changeVia": "pr",
+      "instant": false,
+      "leaves": {
+        "builderFloor": {
+          "range": "integer 0–64",
+          "unit": "units",
+          "note": "also instant via resourcePool.builderFloor"
+        },
+        "classes.1.reserve": {
+          "range": "integer 0–64",
+          "unit": "units",
+          "note": "also instant via resourcePool.class.1.reserve"
+        },
+        "classes.1.max": {
+          "range": "integer 0–64",
+          "unit": "units",
+          "note": "also instant via resourcePool.class.1.max"
+        },
+        "classes.2.reserve": {
+          "range": "integer 0–64",
+          "unit": "units",
+          "note": "also instant via resourcePool.class.2.reserve"
+        },
+        "classes.2.max": {
+          "range": "integer 0–64",
+          "unit": "units",
+          "note": "also instant via resourcePool.class.2.max"
+        },
+        "classes.3.reserve": {
+          "range": "integer 0–64",
+          "unit": "units",
+          "note": "also instant via resourcePool.class.3.reserve"
+        },
+        "classes.3.max": {
+          "range": "integer 0–64",
+          "unit": "units",
+          "note": "also instant via resourcePool.class.3.max"
+        },
+        "classes.4.reserve": {
+          "range": "integer 0–64",
+          "unit": "units",
+          "note": "also instant via resourcePool.class.4.reserve"
+        },
+        "classes.4.max": {
+          "range": "integer 0–64",
+          "unit": "units",
+          "note": "also instant via resourcePool.class.4.max"
+        },
+        "mode": {
+          "range": "off | shadow | enforce",
+          "unit": "mode",
+          "note": "instant via resourcePool.mode enum override; enforce remains shadow in S1a"
+        }
+      }
     }
   },
   "capacityLeaves": {
@@ -1092,6 +1150,51 @@
       "description": "End of a delivery capacity hold.",
       "range": "positive safe integer ≤ now + 72 hours",
       "unit": "epoch milliseconds"
+    },
+    "resourcePool.builderFloor": {
+      "description": "Protected builder capacity floor in shadow allocation decisions.",
+      "range": "integer 0–64",
+      "unit": "units"
+    },
+    "resourcePool.class.1.reserve": {
+      "description": "Class 1 reserve policy, validated and retained for later pool slices.",
+      "range": "integer 0–64",
+      "unit": "units"
+    },
+    "resourcePool.class.1.max": {
+      "description": "Maximum units for class 1 repair work in shadow allocation decisions.",
+      "range": "integer 0–64",
+      "unit": "units"
+    },
+    "resourcePool.class.2.reserve": {
+      "description": "Class 2 reserve policy, validated and retained for later pool slices.",
+      "range": "integer 0–64",
+      "unit": "units"
+    },
+    "resourcePool.class.2.max": {
+      "description": "Maximum units for class 2 review work in shadow allocation decisions.",
+      "range": "integer 0–64",
+      "unit": "units"
+    },
+    "resourcePool.class.3.reserve": {
+      "description": "Class 3 reserve policy, validated and retained for later pool slices.",
+      "range": "integer 0–64",
+      "unit": "units"
+    },
+    "resourcePool.class.3.max": {
+      "description": "Maximum units for class 3 fix work in shadow allocation decisions.",
+      "range": "integer 0–64",
+      "unit": "units"
+    },
+    "resourcePool.class.4.reserve": {
+      "description": "Class 4 reserve policy, validated and retained for later pool slices.",
+      "range": "integer 0–64",
+      "unit": "units"
+    },
+    "resourcePool.class.4.max": {
+      "description": "Maximum units for class 4 builder work in shadow allocation decisions.",
+      "range": "integer 0–64",
+      "unit": "units"
     }
   },
   "instantGaps": [

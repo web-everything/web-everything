@@ -6323,3 +6323,29 @@ contract. Set `cliMain` in `prFileContract` for callable entries so repeated arg
 the loaded graph. Resetting the entire daemon graph twice inside the CLI test exceeded its
 60-second deadline on a coverage shard. Keep the file/standalone output comparison and zero-GitHub
 assertions intact; consumers without callable entries retain the fresh-import path.
+
+## Resource pool S1a shadow observation (R1094)
+
+`resource-pool.test.mjs` pins queued priority, maxima, the 4u builder floor, bounded C1
+overdraw, no preemption and unknown-evidence holds. `resource-pool-io.test.mjs` covers
+missing/malformed sources, liveness failures, companion files, oversized evidence and
+settings bounds. `operations/__tests__/resource-pool.test.mjs` tests the readout and CLI sink.
+Only sampler memory/swap/CPU, live review rounds, canonical red-team statuses and class-3
+fix claims are inventoried. The digest is a **partial** inventory, never total host occupancy;
+no shrink claim is made. Claim expiry follows the existing 10-minute lease contract.
+Red-team status files use the writer's encoded-repo/PR/40-hex-head filename; companions
+are excluded before parsing. Check a claim's valid heartbeat for expiry before validating
+holder metadata; expired legacy metadata cannot hold capacity. Unreadable claims or invalid
+heartbeats remain unknown. Queued red-team rows hold no slot. Pidless running rows expire
+after the shared foreign-host stale window (30 minutes by default, 10-minute floor), using
+file mtime as the writer's last progress. Foreign-host rows use `foreignStaleOwnerDead`:
+staleness alone never overrides live pid evidence, unknown birth time or another namespace.
+Fresh ambiguous running rows remain unknown. The IO suite pins these expiry boundaries
+and the malformed/unreadable negative paths using hermetic process probes.
+Unknown evidence holds every hypothetical start; inspect the named source and rerun.
+The comparison column observes `resource-admission.admit` only, excluding dispatch caps.
+No existing caller consumes this pool. Enforce remains shadow; off disables the explicit
+CLI shadow sink. Mode has an instant enum leaf; bounds use the numeric override store.
+Reserves are retained/validated policy leaves for later slices; this slice's rule subtracts
+queued higher-class demand and protects unoccupied builderFloor without double counting reserves.
+Run these scoped tests and `check:standards` through heavy-admission, with one bounded wait.
