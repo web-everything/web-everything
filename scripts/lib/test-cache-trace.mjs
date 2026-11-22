@@ -26,9 +26,9 @@ const LOOPBACK = new Set(['localhost', '127.0.0.1', '::1', '[::1]', '0.0.0.0', '
 const GLOBAL_TOP_RE = /^(?:vitest\.[^/]+|tsconfig[^/]*\.json|package(?:-lock)?\.json|node_modules\/\.package-lock\.json)$/;
 const NODE_VALUE_FLAGS = new Set(['-e', '--eval', '-p', '--print', '-r', '--require', '--import', '--loader', '--experimental-loader', '--input-type', '--conditions', '-C']);
 
-/** Tracing runs only while the cache is on and not switched off with `WE_TEST_CACHE_TRACE=0`. */
+/** Retired shadow tracing is off by default; WE_TEST_CACHE_TRACE=1 explicitly enables it while the cache is on. */
 export function traceEnabled(env = process.env) {
-  return cacheEnabled(env) && env.WE_TEST_CACHE_TRACE !== '0';
+  return cacheEnabled(env) && env.WE_TEST_CACHE_TRACE === '1';
 }
 
 /** Trace this file in this run? `WE_TEST_CACHE_TRACE_SAMPLE=N` traces about 1 file in N, rotating with the run id. */
@@ -130,16 +130,25 @@ export function analyzeTrace({ events, root, fuiRoot = null, tmpRoots, home = ''
   let spawns = 0;
   let reads = 0;
 
-  const touch = (p, kind) => {
+  const touch = (p, kind, op = kind) => {
     if (!p || !p.startsWith('/') || p.includes(`${sep}node_modules${sep}`) || isTmp(p) || (cacheDir && under(p, cacheDir)) || toolchain.some((t) => under(p, t)) || p.startsWith('/dev/')) return;
     if (isRepo(p)) { addTraced(p, kind); return; }
+    // Bun existence probes ONLY: a stat/exists of exactly ~/.bun or exactly ~/.bun/install/cache. Reads or listings of
+    // them, anything inside the cache (package contents), the rest of ~/.bun and every other home path (credentials,
+    // keychains, other toolchain homes) stay a deny. The path is resolved (dot segments AND symlinks) before the check,
+    // so neither `cache/../..` nor a symlink to a credential file can match. An allowed probe is still TRACED.
+    const resolved = real(resolve(p));
+    if ((op === 'stat' || op === 'exists') && homes.some((h) => resolved === join(h, '.bun') || resolved === join(h, '.bun', 'install', 'cache'))) {
+      addTraced(resolved, kind);
+      return;
+    }
     if (homes.some((h) => under(p, h))) denies.add(`home-read: ${p.slice(home.length + 1).split('/').slice(0, 2).join('/') || '~'}`);
   };
 
   for (const ev of events) {
-    if (ev.k === 'read' || ev.k === 'stat' || ev.k === 'exists') { reads += 1; touch(ev.p, 'file'); }
-    else if (ev.k === 'list') { reads += 1; touch(ev.p, 'dir'); }
-    else if (ev.k === 'mod') touch(ev.p, 'file');
+    if (ev.k === 'read' || ev.k === 'stat' || ev.k === 'exists') { reads += 1; touch(ev.p, 'file', ev.k); }
+    else if (ev.k === 'list') { reads += 1; touch(ev.p, 'dir', 'list'); }
+    else if (ev.k === 'mod') touch(ev.p, 'file', 'mod');
     else if (ev.k === 'net') {
       if (ev.path) continue; // unix socket: local
       if (!LOOPBACK.has(String(ev.host ?? ''))) denies.add(`network: ${ev.host}`);

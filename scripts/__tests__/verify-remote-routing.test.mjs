@@ -58,7 +58,7 @@ describe('timeout preservation', () => {
       remoteAttempt: forgeDispatch, ranOn: { location: 'local' },
     }));
     const context = {
-      phaseAdmission, localPhaseReason, phaseAdmissionPlan, decidePhaseRemote, acquireSlotBlocking,
+      FORCE_LOCAL: false, phaseAdmission, localPhaseReason, phaseAdmissionPlan, decidePhaseRemote, acquireSlotBlocking,
       phaseAdmissionKind: () => ({ kind: 'files' }), classifyCommandKind: () => 'selected',
       admissionPhases: {}, laneMatch: null, GATE: command, ADMISSION_TIMEOUT_MS: 1000,
       shouldConfirmRemoteRed, remoteInfrastructureFailure, mergeRunLocation: (a, b) => a === b ? a : 'mixed',

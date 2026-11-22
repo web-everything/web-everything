@@ -1,6 +1,6 @@
 {
   "deliveryPriority": {
-    "mode": "shadow",
+    "mode": "off",
     "agingHours": 8,
     "maxLiveP0": 2,
     "unblockWeightMinutes": 60

@@ -110,18 +110,25 @@ describe('createVerifyWakeSleep + verify request handoff — real filesystem con
   });
 
   it('debounce/burst: five signals produce exactly one early wake and the following sleep(250) reaches interval', async () => {
-    // Wide window: a loaded CI runner stretches the burst's timers (92ms was seen against 80), so the debounce
-    // must dwarf the burst's own wall-clock jitter for "one burst = one wake" to be a fair assertion.
-    const sleep = wakeSleep({ debounceMs: 250 });
+    // Wide window: a loaded CI runner stretches the burst's timers (92ms against 80, then 379ms in total for ~25ms
+    // of delays on main @ b1029cb98). The debounce is a QUIET window after the last signal, so the premise of
+    // "one burst = one wake" is that no gap BETWEEN signals reaches it; the burst's total wall-clock is not part
+    // of the contract and must not be bounded (it flaked under load).
+    const debounceMs = 250;
+    const sleep = wakeSleep({ debounceMs });
     const reasons = [];
-    const start = performance.now();
     const pending = sleep(5000).then(reason => { reasons.push(reason); return reason; });
     await delay(5);
+    let maxGap = 0;
+    let previous = performance.now();
     for (let i = 0; i < 5; i += 1) {
       expect(signalVerifyRequest({ dir, log: vi.fn() })).toBe(true);
+      const now = performance.now();
+      maxGap = Math.max(maxGap, now - previous);
+      previous = now;
       if (i < 4) await delay(5);
     }
-    expect(performance.now() - start).toBeLessThan(250);
+    expect(maxGap).toBeLessThan(debounceMs);
     // The burst itself must not have woken the sleep mid-burst (the real debounce invariant).
     expect(reasons).toEqual([]);
     expect(await Promise.race([pending, delay(1500).then(() => 'timed-out')])).toBe('handoff');

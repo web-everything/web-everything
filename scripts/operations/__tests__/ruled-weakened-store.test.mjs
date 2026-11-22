@@ -1,7 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import fs from 'node:fs';
 import { join } from 'node:path';
-import { appendEntry, readStore, storePath, validateEntry } from '../ruled-weakened-store.mjs';
+import { appendEntry, readStore, storePath, validateEntry, withdrawnRevocations } from '../ruled-weakened-store.mjs';
 import { createPrototypeLoader, loadRuledWeakened } from '../prototype-load-io.mjs';
 import { readyEvidence } from '../prototype-load.mjs';
 import { resolveOperation } from '../run.mjs';
@@ -59,6 +59,91 @@ describe('ops ruled-weakened evidence', () => {
     append();
     requests(withdrawn({ at }));
     expect(union({ platform: [entry()], tool: [entry()] })).toEqual([]);
+  });
+  describe('legacy {withdrawn:true,ref,sha} request lines', () => {
+    const legacy = (over = {}) => ({ withdrawn: true, ref: 'lane/fix', sha: SHA, reason: 'declined', ...over });
+    const revocations = () => {
+      const warn = vi.fn();
+      return { warn, isRevoked: withdrawnRevocations({ fs, env, warn }) };
+    };
+    it('ruled-weakened-store treats a legacy {withdrawn:true,ref,sha} line as a WITHDRAWN request and emits no warning', () => {
+      requests(legacy());
+      const { warn, isRevoked } = revocations();
+      expect(warn).not.toHaveBeenCalled();
+      expect(isRevoked(entry())).toBe(true);
+      append();
+      expect(union()).toEqual([]);
+    });
+    it.each([{ ref: undefined }, { sha: undefined }, { ref: ' ' }, { sha: 'short' }, { withdrawn: 'true' }, { withdrawn: false }])(
+      'still treats a malformed legacy line as malformed: %j', over => {
+        requests(legacy(over));
+        const { warn, isRevoked } = revocations();
+        expect(warn).toHaveBeenCalledTimes(1);
+        expect(warn.mock.calls[0][0]).toMatch(/line 1/);
+        expect(isRevoked(entry())).toBe(false);
+      });
+    describe('scoped refusal', () => {
+      const scoped = (scopeRef) => {
+        const warn = vi.fn(), warnOther = vi.fn();
+        withdrawnRevocations({ fs, env, warn, warnOther, scopeRef });
+        return { warn, warnOther };
+      };
+      const damagedFor = ref => ({ ref, sha: SHA, ruling: null, findings: ['x'] });
+      it('a damaged line for another ref does not block (reported only)', () => {
+        requests(damagedFor('lane/other'));
+        const { warn, warnOther } = scoped('lane/fix');
+        expect(warn).not.toHaveBeenCalled();
+        expect(warnOther).toHaveBeenCalledTimes(1);
+      });
+      it('a damaged line for the same ref blocks', () => {
+        requests(damagedFor('lane/fix (description)'));
+        const { warn, warnOther } = scoped('lane/fix');
+        expect(warn).toHaveBeenCalledTimes(1);
+        expect(warnOther).not.toHaveBeenCalled();
+      });
+      it('an unattributable line blocks', () => {
+        requests('{"ref": truncated', '{"findings":"no ref","sha":1}');
+        const { warn } = scoped('lane/fix');
+        expect(warn).toHaveBeenCalledTimes(2);
+      });
+      it('without a scope every damaged line blocks', () => {
+        requests(damagedFor('lane/other'));
+        const { warn } = scoped(undefined);
+        expect(warn).toHaveBeenCalledTimes(1);
+      });
+      it('rejoins a record split by a raw newline inside a string (shaped like lines 222/223)', () => {
+        const full = JSON.stringify({ ruling: 'WITHDRAWN', ref: 'lane/fix', sha: SHA, findings: 'a\nb', reason: 'r' });
+        requests(full.replace('\\n', '\n'));
+        // Attributes the damage to its parsed ref: blocks that ref, only reports for another.
+        expect(scoped('lane/fix').warn).toHaveBeenCalledTimes(1);
+        const other = scoped('lane/other');
+        expect(other.warn).not.toHaveBeenCalled();
+        expect(other.warnOther).toHaveBeenCalledTimes(1);
+      });
+      it('a rejoined APPROVED record for ref R does not make R waivable and blocks R; a rejoined WITHDRAWN never revokes', () => {
+        const split = o => JSON.stringify({ ref: 'lane/fix', sha: SHA, findings: 'a\nb', ...o }).replace('\\n', '\n');
+        requests(split({ ruling: 'APPROVED' }));
+        const { warn } = scoped('lane/fix');
+        expect(warn).toHaveBeenCalledTimes(1);
+        expect(withdrawnRevocations({ fs, env, warn: () => {} })(entry())).toBe(false);
+        fs.rmSync(join(home, 'workspace'), { recursive: true, force: true });
+        requests(split({ ruling: 'WITHDRAWN' }));
+        expect(scoped('lane/fix').warn).toHaveBeenCalledTimes(1);
+        expect(withdrawnRevocations({ fs, env, warn: () => {} })(entry())).toBe(false);
+      });
+      it('a split record whose join does not parse stays unattributable and blocks', () => {
+        requests('{"ref":"lane/other","sha":"' + SHA + '","findings":"a', 'b', 'c', 'd', 'e', 'never closed');
+        const { warn } = scoped('lane/fix');
+        expect(warn).toHaveBeenCalled();
+      });
+    });
+    it('a withdrawn line never counts as an approval', () => {
+      requests(legacy());
+      const { isRevoked } = revocations();
+      expect(isRevoked(entry())).toBe(true);
+      expect(gate(union())).toBeNull();
+      expect(union({ platform: [entry()], tool: [entry()] })).toEqual([]);
+    });
   });
   it('revokes at equal timestamps and revokes undated platform/tool waivers even for older WITHDRAWN', () => {
     append();

@@ -311,6 +311,9 @@ export function readTick({
   // missing or unreadable store reads as NO trials, which is the fail-closed direction: with no clean trials
   // the cascade can never find a non-Claude provider fit and resolves to Claude.
   readScorecards = () => defaultReadScorecards(),
+  // Routing IO (settings, quota observations and decision persistence) can be supplied together.
+  // Empty options retain all production readers and the production decision ledger.
+  routingOptions = {},
   preparePolicy = readPreparePolicy,
   // #3843 (#3801 Fork 4 (b)) — the checked-in unsized-card size policy, read at this same io edge.
   readSizePolicy = () => defaultReadSizePolicy({ root, readText }),
@@ -426,7 +429,7 @@ export function readTick({
       num: id, root, exec, bookkeepingFile,
       runNode: () => tickJson, readText: cachedText, loadItems: () => items,
       listInFlightDispatches, listAgents: cachedAgents, isPidAlive, recordLiveness, laneRefForPr, checkAlreadyDone, checkBuildDelivery,
-      readScorecards: scorecardsOnce, readSizePolicy: sizePolicyOnce, readPromotions: promotionsOnce,
+      readScorecards: scorecardsOnce, readSizePolicy: sizePolicyOnce, readPromotions: promotionsOnce, routingOptions,
       enforceSupervision, readDeliveryAgentOverride, dispatchModes: modesOnce,
       now: () => observedAt,
     }));
@@ -561,6 +564,7 @@ export function readTick({
       taskKey: { storyRef: key, round: 1, taskId: launchKind },
       ...(overrideHonoured ? override : {}),
     }, {
+      ...routingOptions,
       scorecards: readScorecards(),
       enforceSupervision: enforceSupervision === true,
       sizePolicy: readSizePolicy(),
@@ -3511,12 +3515,12 @@ export function defaultLaneRefForPr(pr, { exec = execFileSyncThrottled, env = pr
  * `dispatch-lane-defaults.test.mjs` now pins the argv and the opts, and the wake CLI test proves the same argv
  * across a real process boundary. `session-reaper-cli.test.mjs` pins the OPT-IN side the same way (#3435).
  *
- * @param {{exec?: Function, env?: object, all?: boolean}} [io] - injected ONLY so the argv and opts can be
+ * @param {{exec?: Function, env?: object, all?: boolean, fresh?: boolean}} [io] - injected ONLY so the argv and opts can be
  *   asserted. `all` defaults to `false` — every existing caller keeps today's active-sessions-only behavior
  *   unchanged; pass `all: true` ONLY from a caller whose job requires seeing completed sessions too.
  */
-export function defaultListAgents({ exec = execFileSync, env = process.env, all = false } = {}) {
-  const out = cachedClaudeAgents({ all, env, fetch: () => exec('claude', ['agents', '--json', ...(all ? ['--all'] : [])], {
+export function defaultListAgents({ exec = execFileSync, env = process.env, all = false, fresh = false } = {}) {
+  const out = cachedClaudeAgents({ all, env, fresh, fetch: () => exec('claude', ['agents', '--json', ...(all ? ['--all'] : [])], {
     encoding: 'utf8',
     stdio: ['ignore', 'pipe', 'pipe'],
     maxBuffer: 8 * 1024 * 1024,

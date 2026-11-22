@@ -127,11 +127,11 @@ describe('shadow never changes the decision (checklist 7)', () => {
   });
 });
 
-describe('related-test-selection stays byte-identical to main (checklist 2)', () => {
-  it('file bytes equal origin/main', () => {
-    // sha256 of the file on main at the time this change was written (pinned: no live git access in tests).
+describe('related-test-selection pinned baseline after explicit-list cap', () => {
+  it('file bytes equal the explicit-list cap baseline', () => {
+    // sha256 after the designed explicit-list cap change (pinned: no live git access in tests).
     const here = readFileSync('scripts/lib/related-test-selection.mjs', 'utf8');
-    expect(createHash('sha256').update(here).digest('hex')).toBe('2ffa9cc250e7a89624dfa0152e41d73d8d38ccce3c96070012cf1aa194c2c0f3');
+    expect(createHash('sha256').update(here).digest('hex')).toBe('d85852ccf305d361d2bc93b6f8367c098875cbc7025c1a21384de15894ab5412');
   });
   it('resolvedImportsOf snapshot: unchanged behaviour on main regex', () => {
     const files = new Set(['a/x.mjs', 'a/y.mjs', 'a/z.mjs']);
