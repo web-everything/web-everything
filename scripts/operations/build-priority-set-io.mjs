@@ -26,6 +26,7 @@ const EXECUTION_CONTROLS = [
 const GUARD_DEPENDENCY_BASENAMES = new Set([
   'atomic-json-file.mjs', 'automation-home.mjs', 'backlog-status.cjs',
   'bounded-child.mjs', 'build-priority-set-io.mjs', 'build-priority-set.mjs',
+  'import-graph.mjs', 'audit-settings.test.mjs',
   'runtime-admission.mjs', 'audit-verdict.mjs', 'audit-settings.mjs', 'audit-path.mjs', 'build-policy.mjs',
   'build-queue.mjs', 'command-redact.mjs', 'constellation-repos.mjs',
   'container-exec.mjs', 'coordination-root.mjs', 'daemon-clone-layout.mjs',
@@ -87,8 +88,10 @@ const canonicalId = id => id.replace(/^0+(?=\d)/, '');
 const refuse = why => { throw new Error(`build-priority-set: ${why}; repair evidence or drain open PRs and retry`); };
 
 /** One pinned main snapshot per reader; no worktree cards, fetching or lazy network reads. */
-export function readPriorityCards({ git = (args, options = {}) => execFileSync('git', args, {
-  ...READ_OPTIONS, ...options, maxBuffer: READ_OPTIONS.maxBuffer, cwd: ROOT, env: { ...process.env, GIT_NO_LAZY_FETCH: '1' },
+export function readPriorityCards({ root = ROOT, git = (args, options = {}) => execFileSync('git', ['--no-replace-objects', ...args], {
+  ...READ_OPTIONS, ...options, maxBuffer: options.maxBuffer ?? READ_OPTIONS.maxBuffer, cwd: root,
+  env: { ...Object.fromEntries(Object.entries(process.env).filter(([key]) => !key.startsWith('GIT_'))),
+    GIT_NO_LAZY_FETCH: '1', GIT_NO_REPLACE_OBJECTS: '1' },
 }) } = {}) {
   let sha, names;
   const snapshot = () => {
@@ -124,7 +127,10 @@ export function readPriorityCards({ git = (args, options = {}) => execFileSync('
   // Refuse overflow instead of silently declaring a partial scan clean. The same
   // pinned main SHA supplies cards, regular-file evidence and guard content.
   read.readContent = path => git(['show', `${snapshot()}:${path}`], { maxBuffer: CONTENT_LIMIT });
-  read.readScopeSettings = () => read.readContent(SCOPE_SETTINGS);
+  read.readScopeSettings = () => {
+    if (read.pathType(SCOPE_SETTINGS) !== 'file') throw new Error('invalid settings file mode');
+    return read.readContent(SCOPE_SETTINGS);
+  };
   return read;
 }
 
@@ -193,6 +199,7 @@ function prepare(input, options) {
       const folded = path.toLowerCase();
       if (protectedPaths.has(folded) || protectedBasenames.has(basename(folded))
           || GUARD_DEPENDENCY_BASENAMES.has(basename(folded))
+          || /^scripts\/(?:[^/]+\/)*__tests__\/helpers\//.test(folded)
           || EXECUTION_CONTROLS.some(pattern => pattern.test(basename(folded)))
           || matchesSome(path, [...GUARD_FLOOR, ...LOCK_USERS])) {
         refuse(`card ${id} scope entry ${JSON.stringify(entry)} overlaps gate file ${path}`);

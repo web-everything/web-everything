@@ -82,6 +82,11 @@ const protectedScopes = [
   'scripts/operations/build-priority-set-io.mjs', 'scripts/operations/build-priority-set.mjs',
   'scripts/operations/__tests__/build-priority-set.test.mjs',
   'scripts/operations/__tests__/build-priority-set-io-real.test.mjs',
+  'scripts/lib/import-graph.mjs', 'scripts/operations/__tests__/import-graph.mjs',
+  'scripts/lib/__tests__/helpers/real-repo.mjs',
+  'scripts/operations/__tests__/helpers/real-repo.mjs',
+  'scripts/conveyor/nested/__tests__/helpers/fixture.mjs',
+  'scripts/lib/__tests__/audit-settings.test.mjs',
 ];
 it.each(['we:', 'fui:'].flatMap(prefix => protectedScopes.map(path => `${prefix}${path}`)))(
   'refuses protected scope %s in preview and install', async scope => {
@@ -194,6 +199,7 @@ it('ignores a broader worktree allowlist and uses the pinned snapshot allowlist'
   const settings = 'scripts/settings/build-priority-scope.json';
   const git = vi.fn(args => {
     if (args[0] === 'rev-parse') return sha;
+    if (args[0] === '--literal-pathspecs') return `100644 blob ${'b'.repeat(40)}\t${settings}\0`;
     if (args[0] === 'show' && args[1] === `${sha}:${settings}`) {
       return '{"allowedFiles":["scripts/lib/ledger-readiness-daily.mjs"]}';
     }
@@ -214,9 +220,12 @@ it('ignores a broader worktree allowlist and uses the pinned snapshot allowlist'
   untouched(f, ['scope.json']);
 });
 
-it.each(['missing', 'unreadable'])('refuses %s snapshot settings despite a readable worktree allowlist', async evidence => {
+it.each(['missing', 'unreadable', '120000 blob', '160000 commit'])('refuses %s snapshot settings despite a readable worktree allowlist', async evidence => {
   const git = vi.fn(args => {
     if (args[0] === 'rev-parse') return 'a'.repeat(40);
+    if (args[0] === '--literal-pathspecs' && evidence.includes(' ')) {
+      return `${evidence} ${'b'.repeat(40)}\tscripts/settings/build-priority-scope.json\0`;
+    }
     throw new Error(evidence);
   });
   const f = fixture({ readCard: readPriorityCards({ git }), readScopeSettings: undefined });

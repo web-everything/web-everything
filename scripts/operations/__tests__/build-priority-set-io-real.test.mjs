@@ -1,10 +1,12 @@
 /** Real git fidelity: the card reader runs real git against a real repo with a real origin/main ref. */
 import { execFileSync } from 'node:child_process';
-import { chmodSync, symlinkSync, writeFileSync } from 'node:fs';
+import { chmodSync, symlinkSync, unlinkSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
-import { expect, it } from 'vitest';
+import { afterEach, expect, it, vi } from 'vitest';
 import { withRealRepo } from './helpers/real-repo.mjs';
 import { readPriorityCards } from '../build-priority-set-io.mjs';
+
+afterEach(() => { vi.unstubAllEnvs(); });
 
 it('reads the real remote main despite a shadowing local branch and refuses a missing card', async () => {
   await withRealRepo(async ctx => {
@@ -69,9 +71,69 @@ it('bounds real Git content output at 64 KiB and refuses overflow', async () => 
     ctx.commit({ [path]: 'x'.repeat(65537) });
     ctx.git(['update-ref', 'refs/remotes/origin/main', 'HEAD']);
     const read = readPriorityCards({ git: (args, options) => execFileSync('git', args, {
-      encoding: 'utf8', timeout: 10000, cwd: ctx.root, ...options,
+      encoding: 'utf8', timeout: 10000, cwd: ctx.root, ...options, maxBuffer: options?.maxBuffer ?? 8 * 1024 * 1024,
     }) });
     expect(() => read.readContent(path)).toThrow(/ENOBUFS/);
+  });
+});
+
+it.each(['refs/replace/', 'refs/hostile/'])(
+  'isolates the default Git runner from repository overrides and %s blob replacements', async replaceBase => {
+    await withRealRepo(async ctx => {
+      await withRealRepo(async other => {
+        const card = 'backlog/42-example.md', settings = 'scripts/settings/build-priority-scope.json';
+        const original = {
+          [card]: '---\nscope: ["we:scripts/conveyor/a.mjs"]\n---\n',
+          [settings]: '{"allowedFiles":["scripts/conveyor/a.mjs"]}',
+        };
+        const hostile = {
+          [card]: '---\nscope: ["we:scripts/lib/unlisted.mjs"]\n---\n',
+          [settings]: '{"allowedFiles":["scripts/lib/unlisted.mjs"]}',
+        };
+        ctx.commit(original);
+        const sha = ctx.head();
+        ctx.git(['update-ref', 'refs/remotes/origin/main', sha]);
+        ctx.commit(hostile);
+        other.commit(hostile);
+        other.git(['update-ref', 'refs/remotes/origin/main', 'HEAD']);
+        for (const path of [card, settings]) {
+          const before = ctx.head(`${sha}:${path}`), after = ctx.head(`HEAD:${path}`);
+          ctx.git(['update-ref', `${replaceBase}${before}`, after]);
+          expect(ctx.git(['show', `${sha}:${path}`], {
+            env: { ...process.env, GIT_REPLACE_REF_BASE: replaceBase },
+          })).toBe(hostile[path]);
+        }
+        for (const key of ['GIT_DIR', 'GIT_WORK_TREE', 'GIT_COMMON_DIR', 'GIT_OBJECT_DIRECTORY',
+          'GIT_ALTERNATE_OBJECT_DIRECTORIES', 'GIT_INDEX_FILE']) {
+          vi.stubEnv(key, join(other.root, key === 'GIT_WORK_TREE' ? '' : '.git'));
+        }
+        vi.stubEnv('GIT_REPLACE_REF_BASE', replaceBase);
+        vi.stubEnv('GIT_CONFIG_COUNT', '999');
+        vi.stubEnv('GIT_NO_REPLACE_OBJECTS', '0');
+        const read = readPriorityCards({ root: ctx.root });
+        expect(read('42').scope).toEqual(['we:scripts/conveyor/a.mjs']);
+        expect(read.readScopeSettings()).toBe(original[settings]);
+      });
+    });
+  });
+
+it.each(['symlink', 'gitlink'])('refuses %s scope settings even when the blob text is valid allowlist JSON', async mode => {
+  await withRealRepo(async ctx => {
+    const settings = 'scripts/settings/build-priority-scope.json';
+    const contents = '{"allowedFiles":["scripts/conveyor/a.mjs"]}';
+    ctx.commit({ [settings]: contents });
+    if (mode === 'symlink') {
+      unlinkSync(join(ctx.root, settings));
+      symlinkSync(contents, join(ctx.root, settings));
+      ctx.git(['add', '--', settings]);
+    } else {
+      ctx.git(['update-index', '--cacheinfo', `160000,${ctx.head()},${settings}`]);
+    }
+    ctx.git(['commit', '--quiet', '-m', 'fixture: non-regular settings']);
+    ctx.git(['update-ref', 'refs/remotes/origin/main', 'HEAD']);
+    if (mode === 'symlink') expect(ctx.git(['show', `HEAD:${settings}`])).toBe(contents);
+    const read = readPriorityCards({ git: args => ctx.git(args) });
+    expect(() => read.readScopeSettings()).toThrow(/invalid settings file mode/);
   });
 });
 
