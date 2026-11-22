@@ -21,7 +21,7 @@ export function fixture() {
         { event: 'done', guard: 'convergence', outcome: 'continue', route: 'advance', target: 'judge-convergence' },
         { event: 'done', guard: 'convergence', outcome: 'stop', route: 'advance', target: 'parked' },
         { event: 'done', guard: 'convergence', outcome: 'unknown', route: 'retry', target: 'judge-convergence' },
-      ] }, accepted: { kind: 'final' }, parked: { kind: 'final' },
+      ] }, accepted: { kind: 'final', emits: 'https://everstandards.dev/governance/ruling-record/v0.1' }, parked: { kind: 'final' },
     } };
 }
 const projection = flow => ({ flowDigest: flow.digest, seq: 0, records: [], event: 'done', outcome: 'accept', parts: { Subject: 'o/r#7', Visit: 1 } });
@@ -29,6 +29,45 @@ const ctx = { repo: 'o/r', pr: 7, head: 'a'.repeat(40), netDiff: 'b'.repeat(64),
 
 // Reusable implementation contract: pass only the public FlowEngine slot and a test registrar.
 export function flowEngineContract(api, register) {
+  register('load refuses unknown flowType URIs without falling back to legacy validation', () => {
+    for (const flowType of ['urn:unimplemented:flow:v99', 'https://everstandards.dev/flow/definition/v99', 'https://everstandards.dev/flow/decision-lifecycle/v99']) {
+      const def = fixture(); def.flowType = flowType;
+      assert.throws(() => api.load(def), /flowType/, flowType);
+    }
+    for (const flowType of ['https://everstandards.dev/flow/decision-lifecycle/v0', 'https://everstandards.dev/flow/decision-lifecycle/v0.1']) {
+      const def = fixture(); def.flowType = flowType;
+      assert.equal(api.load(def).definition.flowType, flowType);
+    }
+  });
+  register('legacy load requires a governance ruling-record emitter (FLOW-DL-010)', () => {
+    for (const flowType of ['https://everstandards.dev/flow/decision-lifecycle/v0', 'https://everstandards.dev/flow/decision-lifecycle/v0.1']) {
+      const def = fixture(); def.flowType = flowType;
+      delete def.states.accepted.emits;
+      assert.throws(() => api.load(def), /FLOW-DL-010/);
+      def.states.accepted.emits = 'urn:unrelated:record';
+      assert.throws(() => api.load(def), /FLOW-DL-010/);
+      for (const version of ['v0', 'v0.1']) {
+        def.states.accepted.emits = `https://everstandards.dev/governance/ruling-record/${version}`;
+        assert.doesNotThrow(() => api.load(def));
+      }
+    }
+  });
+  for (const route of ['wait', 'retry', 'escalate', 'fail']) {
+    register(`replay keeps unknown/${route} at its source even when the target is success`, () => {
+      const def = fixture(); def.retry.maxAttempts = 3;
+      Object.assign(def.states['judge-convergence'].on[3], { route, target: 'accepted' });
+      const flow = api.load(def), p = projection(flow);
+      const held = api.transitionRecord(flow, api.plan(flow, { ...p, outcome: 'unknown' })[0], ctx);
+      const resumed = { ...p, seq: 1, records: [held], attempt: 2 };
+      const next = api.plan(flow, resumed);
+      assert.equal(next.length, 1, 'non-advance must not complete the flow');
+      assert.equal(next[0].from, 'judge-convergence');
+      assert.equal(next[0].route, 'advance');
+      assert.equal(next[0].to, 'accepted');
+      const accepted = api.transitionRecord(flow, next[0], { ...ctx, seq: 2 });
+      assert.deepEqual(api.plan(flow, { ...resumed, seq: 2, records: [held, accepted] }), []);
+    });
+  }
   register('contract 1: whole validation, RFC 8785 digest and loaded digest pin', () => {
     const def = fixture(), flow = api.load(def);
     assert.equal(api.version, 'FlowEngine/v0');

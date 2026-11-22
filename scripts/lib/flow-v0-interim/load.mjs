@@ -24,7 +24,6 @@ const validateDefinition = validator('definition');
 const legacySchema = structuredClone(schemas);
 const legacyRoot = legacySchema.$defs[legacySchema.legacy.$ref.split('/').pop()];
 const root = schemas.$defs[schemas.definition.$ref.split('/').pop()];
-legacyRoot.properties.flowType = { type: 'string', format: 'uri' }; // design §1.4 removes the pin
 legacyRoot.properties.keys = root.properties.keys;
 legacyRoot.required.push('keys');
 const legacyState = legacySchema.$defs[legacyRoot.properties.states.additionalProperties.$ref.split('/').pop()];
@@ -58,13 +57,14 @@ export function load(definition) {
     throw Object.assign(Error(`Unsupported features: ${features.map(x => x[0]).join(', ')}`), { lossReport });
   }
   const modern = def.flowType === 'https://everstandards.dev/flow/definition/v0.1';
-  const validate = modern ? validateDefinition : validateLegacy;
+  const validate = modern ? validateDefinition : legacyRoot.properties.flowType.enum.includes(def.flowType) ? validateLegacy : null;
+  if (!validate) throw Error('Unsupported flowType; use an implemented flow definition format');
   if (!validate(def)) throw Error(`FLOW-DEF-001/FLOW-DL-001: ${ajv.errorsText(validate.errors)}`);
   if (Object.values(def.states).some(s => !['compute', 'judge', 'confirm', 'effect', 'invoke', 'final'].includes(s.kind))) throw Error('Out-of-subset node kind');
   const rules = makeRules();
   const mapped = modern ? def : { ...def, states: Object.fromEntries(Object.entries(def.states).map(([n, s]) => [n, { ...s, kind: s.kind === 'invoke' ? 'judge' : s.kind }])) };
   const problems = modern ? DEF_RULES.flatMap(n => rules[n](def)) : [
-    ...['targetsResolve', 'outcomesRouted', 'reachableAndLive', 'humanTask', 'retryBounded'].flatMap(n => flowRules[n](def)),
+    ...['targetsResolve', 'outcomesRouted', 'reachableAndLive', 'humanTask', 'recordEmits', 'retryBounded'].flatMap(n => flowRules[n](def)),
     ...['keysDeclared', 'visitInKeyOnCycle', 'noExpressions'].flatMap(n => rules[n](mapped)),
   ];
   for (const [name, s] of Object.entries(def.states)) {

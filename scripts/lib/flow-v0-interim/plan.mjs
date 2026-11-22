@@ -65,7 +65,7 @@ export function plan(flow, projection) {
     if (bodies.has(execution) && bodies.get(execution) !== body) throw Error('Step key/attempt has a second body; operator review required');
     retryContinuity(previous, r.key, attempt, limit, def.retry?.onExhausted);
     bodies.set(execution, body);
-    from = r.to;
+    if (r.route === 'advance') from = r.to;
     previous = r;
   }
   const state = def.states[from];
