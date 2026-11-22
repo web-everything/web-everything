@@ -170,25 +170,30 @@ describe('Carbon promotion settings and advisory guards', () => {
 });
 
 describe('shadow directives', () => {
+  const routingModel = 'claude-sonnet-5-5-high';
   it('applies override and freezes it, preserving advisory model', () => {
+    // providers.codex.useHeavily / routing.gemini4Tiers rulings: agy-claude review fallback is Sonnet.
     const settings = { ...settingsFromRoutingPolicy(DEFAULT_ROUTING_POLICY, { shadowModel: { value: model, source: 'settings' } }), shadowPolicy };
     expect(seatProviderDirective(settings, 'correctness', highCarePr)).toEqual({ mode: 'shadow', model, fallbackModel: routingModel, modelSource: 'settings', onEscape: 'claude', dailyCap: 100 });
     expect(Object.isFrozen(settings.shadowModelOverride)).toBe(true);
     expect(settings.agyModel).toBe(routingModel);
   });
   it('ignores override on a non-shadow agy seat', () => {
+    // providers.codex.useHeavily / routing.gemini4Tiers rulings: the non-shadow review route also uses Sonnet.
     const policy = structuredClone(DEFAULT_ROUTING_POLICY);
     delete policy.operations['review-seat:mandatory:correctness'].mode;
     const settings = settingsFromRoutingPolicy(validateRoutingPolicy(policy), { shadowModel: { value: model, source: 'env' } });
     expect(seatProviderDirective(settings, 'correctness')).toEqual({ mode: 'agy', model: routingModel, onEscape: 'claude' });
   });
   it('uses routing policy without override or when models equal', () => {
+    // providers.codex.useHeavily / routing.gemini4Tiers rulings: equal-model selection compares against Sonnet.
     for (const shadowModel of [null, { value: routingModel, source: 'env' }]) {
       expect(seatProviderDirective({ ...settingsFromRoutingPolicy(DEFAULT_ROUTING_POLICY, { shadowModel }), shadowPolicy }, 'correctness', highCarePr))
         .toEqual({ mode: 'shadow', model: routingModel, onEscape: 'claude', dailyCap: 100 });
     }
   });
   it('logs the cascade once per distinct message', () => {
+    // providers.codex.useHeavily / routing.gemini4Tiers rulings: provenance reports the Sonnet fallback.
     const logs = [];
     const options = { safeguards: { value: { ...shadowPolicy, sampleRate: 0.1, minNonClaudeSeats: 1 } }, policy: DEFAULT_ROUTING_POLICY, shadowModel: { value: 'unique-trial-model', source: 'env' }, log: (m) => logs.push(m) };
     loadReviewSeatSettings(options); loadReviewSeatSettings(options);

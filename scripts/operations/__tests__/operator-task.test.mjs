@@ -18,6 +18,7 @@ import { createFileItemReader } from '../file-item-io.mjs';
 import { withRealRepo } from './helpers/real-repo.mjs';
 import { resetCascadeLogForTest } from '../../lib/policy-cascade.mjs';
 import * as operatorTaskModule from '../../backlog/operator-task.mjs';
+import { applyRoutingOverrides, DEFAULT_ROUTING_POLICY } from '../../lib/dispatch-routing-policy.mjs';
 // These tests describe codex-first routing; the shipped routing.builder=claude is covered in routing-settings.test.mjs.
 process.env.WE_ROUTING_BUILDER = 'codex';
 
@@ -329,11 +330,11 @@ describe('operator task post-build', () => {
   });
   // The route flag crosses three hops with no shared type: readTick's verdict -> shapeDispatchRead -> the
   // dispatch-lane effect payload -> createDispatchSinks' provider request. Run the real chain (default sink router,
-  // stub spawner) on two non-agent routes: build forced mechanical, and the routing policy's own codex route for a
-  // docs-only card under default modes (the path production takes). A hop that drops the flag, or an operator check
+  // stub spawner) on two non-agent routes: build forced mechanical, and an explicit Codex policy route for a
+  // docs-only card under default modes. A hop that drops the flag, or an operator check
   // moved below the policy branch, sends the card to the wrapper, which cannot post the report. The ordinary card is
   // the control: it must reach the wrapper.
-  async function dispatchOperatorCard(extra, { scope = ['we:scripts/worker-brief.mjs'], modes = { build: 'mechanical' } } = {}) {
+  async function dispatchOperatorCard(extra, { scope = ['we:scripts/worker-brief.mjs'], modes = { build: 'mechanical' }, routingOptions = {} } = {}) {
     const num = '9101';
     const registry = createRegistry();
     registry.register(dispatchLaneOperation({
@@ -351,6 +352,7 @@ describe('operator task post-build', () => {
         checkAlreadyDone: () => ({ done: false, pr: null, checked: false }),
         checkBuildDelivery: () => null,
         readScorecards: () => [],
+        routingOptions,
         readDeliveryAgentOverride: () => null,
         dispatchModes: () => ({}),
       }),
@@ -403,8 +405,11 @@ describe('operator task post-build', () => {
     expect(ordinary.wrapped[0].operatorPostBuild).toBe(false);
   });
   it('sends an operator report card to the agent even when the routing policy picks a non-Claude worker', async () => {
-    // A doc-fix card outside docs/agent/ (which the policy keeps on Claude) routes to codex in the shipped policy.
-    const policy = { scope: ['we:docs/operator-route-note.md'], modes: {} };
+    // routing.gemini4Tiers moved doc-fix to Hydrogen, whose live confinement guard refuses delivery.
+    // Pin a supported Codex override to exercise the report handoff without bypassing that guard.
+    const policy = { scope: ['we:docs/operator-route-note.md'], modes: {}, routingOptions: {
+      routingPolicy: applyRoutingOverrides(DEFAULT_ROUTING_POLICY, { 'build:doc-fix': { provider: 'codex', model: 'sol' } }),
+    } };
     const ordinary = await dispatchOperatorCard({ ...OP, report: false }, policy);
     // Control: under default modes the policy's own route takes the docs-only card to the wrapper.
     expect(ordinary.effect.payload.routing?.policyRoute?.provider).toBe('codex');

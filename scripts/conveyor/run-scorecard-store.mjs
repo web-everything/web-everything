@@ -42,7 +42,8 @@ import { createHash } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import { dirname, join, resolve } from 'node:path';
 import { scrubReasons } from '../lib/secret-scrub.mjs';
-import { daemonConveyorStateRoot } from '../lib/daemon-rebuild.mjs';
+// Use the leaf owner: the rebuild barrel cycles back through routing and model probation.
+import { daemonConveyorStateRoot } from '../lib/daemon-last-good.mjs';
 import { withInfraLock } from './infra-blocked.mjs';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));

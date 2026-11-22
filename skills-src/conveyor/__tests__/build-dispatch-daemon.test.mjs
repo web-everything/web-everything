@@ -1783,7 +1783,11 @@ describe('build-dispatch-daemon.mjs boots as a fresh `node` process — the clas
     expect(usageAt).toBeGreaterThanOrEqual(0);
     // Only policy provenance and the observed Node warning may precede usage. Every operator-override
     // diagnostic means degraded policy/store reads and must fail, even when the daemon reaches usage.
+    // routing.gemini4Tiers: Hydrogen admission now loads the routing-policy JSON in the daemon graph, which Node
+    // announces with its own experimental-JSON-modules warning (not a degraded policy read).
     const expectedStartupLine = l => l.startsWith('policy-cascade ·')
+      || /^\(node:\d+\) ExperimentalWarning: Importing JSON modules is an experimental feature and might change at any time$/.test(l)
+      || l === '(Use `node --trace-warnings ...` to show where the warning was created)'
       || /^\(node:\d+\) \[DEP0040\] DeprecationWarning: The `punycode` module is deprecated\. Please use a userland alternative instead\.$/.test(l)
       || l === '(Use `node --trace-deprecation ...` to show where the warning was created)';
     expect(lines.slice(0, usageAt).every(expectedStartupLine)).toBe(true);
@@ -3609,7 +3613,7 @@ describe('executor prediction and independent caps (#4531)', () => {
     expect(policyFrom({}, env)).toMatchObject({ maxConcurrentBuilds: 3, maxConcurrentExternalBuilds: 8 });
     expect(policyFrom({ 'max-concurrent': '0', 'max-concurrent-external': '0' }, env)).toMatchObject({ maxConcurrentBuilds: 0, maxConcurrentExternalBuilds: 0 });
   });
-  it('predicts a real probation route and admits it while the Claude cap is full', async () => {
+  it('holds the real Hydrogen probation route but admits Codex while the Claude cap is full', async () => {
     const root = mkdtempSync(join(tmpdir(), '4531-routing-'));
     try {
       mkdirSync(join(root, 'backlog'));
@@ -3617,19 +3621,30 @@ describe('executor prediction and independent caps (#4531)', () => {
       const options = { root, env: { WE_PROBATION_LAUNCH: 'on' }, loadItems: () => [item], scorecards: [], sizePolicy: {}, promotions: {} };
       const predicted = await cliPredictRoute(item.num, item.scope, options);
       expect(predicted.error).toBeUndefined();
-      expect(['codex', 'antigravity']).toContain(predicted.executor);
+      // providers.codex.useHeavily / routing.gemini4Tiers rulings: this small docs route uses the non-Claude Gemini executor.
+      expect(predicted.executor).toBe('agy-gemini');
       const dispatches = [];
       const effects = effectsFor({ lockRoot: join(root, 'claims'), pid: 1234, dispatches, runStoreInFlight: [{ num: '9000', scope: ['we:unrelated'], executor: 'claude' }] });
       effects.predictRoute = (num, scope) => cliPredictRoute(num, scope, options);
       const result = await runBuildDispatchTick({ live: true, effects });
-      expect(result.dispatched.map(d => d.num)).toEqual(['3827']);
-      expect(result.plan.dispatch[0].executor).toBe(predicted.executor);
+      // routing.gemini4Tiers selects Hydrogen, whose live admission requires simple-task
+      // evidence and proven confinement; the Claude cap does not cause this routing hold.
+      expect(predicted.refusal).toBe('Hydrogen build refused: simple task evidence is missing; use another provider or request operator review');
+      expect(result.dispatched).toEqual([]);
+      expect(result.plan.dispatch).toEqual([]);
+      expect(result.plan.hold.find(h => h.num === item.num)).toMatchObject({ rule: 'routing', reason: predicted.refusal });
       expect(result.plan.hold.find(h => h.num === '2662')).toBeDefined();
-      expect((await cliPredictRoute(item.num, item.scope, { ...options, env: { WE_PROBATION_LAUNCH: 'off' } })).executor).toBe('codex');
+      // Disabling the probation launcher does not override the Hydrogen policy or its admission.
+      expect(await cliPredictRoute(item.num, item.scope, { ...options, env: { WE_PROBATION_LAUNCH: 'off' } })).toMatchObject({ executor: 'agy-gemini', refusal: predicted.refusal });
       expect((await cliPredictRoute(item.num, item.scope, { ...options, loadItems: () => [{ ...item, scope: ['we:scripts/lib/provider-routing.mjs'] }] })).executor).toBe('claude');
       writeFileSync(join(root, 'backlog', '3827-docs.md'), '---\ndeliveryAgent: codex\ndeliveryAgentReason: operator selection\n---\n');
       expect((await cliPredictRoute(item.num, item.scope, options)).executor).toBe('codex');
-      expect((await cliPredictRoute(item.num, item.scope, { ...options, env: { WE_PROBATION_LAUNCH: 'off', WE_BUILD_DISPATCH_MODE: 'agent' } })).executor).toBe('codex');
+      // A real operator-selected external route still passes the full Claude pool.
+      const external = await runBuildDispatchTick({ live: true, effects });
+      expect(external.dispatched.map(d => d.num)).toEqual(['3827']);
+      expect(external.plan.dispatch[0].executor).toBe('codex');
+      expect(dispatches.map(d => d.num)).toEqual(['3827']);
+      expect(await cliPredictRoute(item.num, item.scope, { ...options, env: { WE_PROBATION_LAUNCH: 'off', WE_BUILD_DISPATCH_MODE: 'agent' } })).toMatchObject({ executor: 'agy-gemini', refusal: predicted.refusal });
     } finally { rmSync(root, { recursive: true, force: true }); }
   });
   it('boots as a real Node CLI and rejects --bogus-flag with exit 2', () => {

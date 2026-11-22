@@ -147,10 +147,11 @@ it('updates the real preferences target and preserves its symlink', async () => 
   const target = join(f.dir, 'target.json');
   writeFileSync(target, '{"keep":true}');
   fs.symlinkSync('target.json', f.path);
-  expect((await f.command(['--operation=review-seat', '--taskType=red-team', '--provider=agy-gemini'])).code).toBe(0);
+  // routing.gemini4Tiers: review seats require a larger tier than the default Neon.
+  expect((await f.command(['--operation=review-seat', '--taskType=red-team', '--provider=agy-gemini', '--model=pro'])).code).toBe(0);
   expect(fs.lstatSync(f.path).isSymbolicLink()).toBe(true);
   expect(fs.readlinkSync(f.path)).toBe('target.json');
-  expect(JSON.parse(readFileSync(target, 'utf8'))).toEqual({ keep: true, routingOverrides: { [key]: { provider: 'agy-gemini' } } });
+  expect(JSON.parse(readFileSync(target, 'utf8'))).toEqual({ keep: true, routingOverrides: { [key]: { provider: 'agy-gemini', model: 'pro' } } });
   expect(readdirSync(f.dir).sort()).toEqual(['preferences.json', 'target.json']);
 });
 
@@ -296,13 +297,14 @@ it.each(['write', 'clear'])('serializes an overlapping %s and write without losi
     return worker;
   };
   try {
-    const first = start(true, { key, patch: action === 'clear' ? null : { provider: 'agy-gemini' } });
+    // routing.gemini4Tiers: use an admitted review tier so this exercises write serialization.
+    const first = start(true, { key, patch: action === 'clear' ? null : { provider: 'agy-gemini', model: 'pro' } });
     const firstExit = once(first, 'exit');
     await once(first, 'message');
     const second = start(false, { key: otherKey, patch: { model: 'sonnet', provider: 'agy-claude' } });
     expect(await Promise.all([firstExit, once(second, 'exit')])).toEqual([[0], [0]]);
     expect(JSON.parse(readFileSync(f.path, 'utf8'))).toEqual({ unrelated: { keep: true }, routingOverrides: {
-      ...(action === 'clear' ? {} : { [key]: { provider: 'agy-gemini' } }),
+      ...(action === 'clear' ? {} : { [key]: { provider: 'agy-gemini', model: 'pro' } }),
       [otherKey]: { model: 'sonnet', provider: 'agy-claude' },
     } });
     expect(readdirSync(f.dir).sort()).toEqual(['overlapping-writer.mjs', 'preferences.json']);
