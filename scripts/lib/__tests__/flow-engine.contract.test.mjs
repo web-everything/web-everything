@@ -363,7 +363,8 @@ function shadowFixture() {
     return writeReviewJobDone({ dir, session: actual.session, repo: actual.repo, pr: actual.pr, classified: actual.classified, now: () => ctx.at, flowShadow: () => {} });
   };
   done();
-  return { dir, actual, options, logs, done, cleanup: () => rmSync(dir, { recursive: true, force: true }), rows: () => readFileSync(options.file, 'utf8').trim().split('\n').map(JSON.parse) };
+  const logFile = join(dir, 'shadow-6f2f72-7.jsonl');
+  return { dir, logFile, actual, options, logs, done, cleanup: () => rmSync(dir, { recursive: true, force: true }), rows: () => readFileSync(logFile, 'utf8').trim().split('\n').map(JSON.parse) };
 }
 
 test('shadow settings default, platform, tool, environment override and disabled provenance', async () => {
@@ -436,8 +437,8 @@ test('shadow refuses regular-file violations and completion aliases without chan
     try {
       const completion = join(f.dir, 'review-7.json'), before = readFileSync(completion, 'utf8');
       if (kind === 'directory') f.options.file = f.dir;
-      if (kind === 'symlink') symlinkSync(completion, f.options.file);
-      if (kind === 'hardlink') linkSync(completion, f.options.file);
+      if (kind === 'symlink') symlinkSync(completion, f.logFile);
+      if (kind === 'hardlink') linkSync(completion, f.logFile);
       if (kind === 'same') f.options.file = completion;
       await shadowReviewStep(f.actual, f.options);
       assert.equal(readFileSync(completion, 'utf8'), before);
@@ -449,7 +450,7 @@ test('shadow refuses regular-file violations and completion aliases without chan
 test('shadow bounded log reads close fd, refuse oversized input and name operator fallback', async () => {
   const f = shadowFixture(); let total = 0, closed = false;
   try {
-    writeFileSync(f.options.file, '');
+    writeFileSync(f.logFile, '');
     await shadowReviewStep(f.actual, { ...f.options, open: () => 42, close: () => { closed = true; }, read: (_, buffer, offset, length) => {
       const n = Math.min(length, 10000); buffer.fill(32, offset, offset + n); total += n; return n;
     } });
@@ -462,9 +463,9 @@ test('shadow refuses duplicate sequence and concurrent observations', async () =
   try {
     await Promise.all([shadowReviewStep(f.actual, f.options), shadowReviewStep(f.actual, f.options)]);
     assert.equal(f.rows().length, 1);
-    const bytes = readFileSync(f.options.file, 'utf8'); writeFileSync(f.options.file, bytes + bytes);
+    const bytes = readFileSync(f.logFile, 'utf8'); writeFileSync(f.logFile, bytes + bytes);
     f.done(2); await shadowReviewStep(f.actual, f.options);
-    assert.equal(readFileSync(f.options.file, 'utf8'), bytes + bytes);
+    assert.equal(readFileSync(f.logFile, 'utf8'), bytes + bytes);
     assert(f.logs.some(s => s.includes('duplicate or noncontiguous')));
   } finally { f.cleanup(); }
 });

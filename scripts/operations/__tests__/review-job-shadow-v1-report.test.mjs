@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { mkdtempSync, readFileSync, rmSync, writeFileSync, readdirSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createReviewJobIo } from '../review-job.mjs';
@@ -20,6 +20,8 @@ let dir, report, observations;
 const flags = { session: 'review-7', kind: 'review', pr: '7', repo: 'o/r', status: 'done',
   outcome: 'bounced', verdict: 'complete', runId: 'run-1', label: 'review label',
   head: 'a'.repeat(40), netDiff: 'b'.repeat(64), round: 0 };
+const logFile = () => join(dir, 'shadow-6f2f72-7.jsonl');
+const rows = file => readFileSync(file, 'utf8').trim().split('\n').map(JSON.parse);
 const bytes = () => readFileSync(join(dir, 'review-7.json'), 'utf8');
 beforeEach(async () => {
   dir = mkdtempSync(join(tmpdir(), 'review-shadow-v1-'));
@@ -73,14 +75,14 @@ describe('v1 report shadow observer', () => {
     setting.value = '{"reviewLoop":{"flowShadow":{"enabled":false}}}';
     report(flags); await Promise.all(observations);
     expect(shadowReviewStep).toHaveBeenCalledOnce();
-    expect(() => readFileSync(join(dir, 'shadow.jsonl'))).toThrow();
+    expect(() => readFileSync(logFile())).toThrow();
   });
 
   it.each([Error('unreadable settings'), '{', '{}', '{"reviewLoop":{"flowShadow":{"enabled":"yes"}}}'])('unreadable or malformed settings fail closed: %s', async value => {
     setting.value = value;
     expect(resolveFlowShadow(process.env, { readSetting }).enabled).toBe(false);
     report(flags); await Promise.all(observations);
-    expect(() => readFileSync(join(dir, 'shadow.jsonl'))).toThrow();
+    expect(() => readFileSync(logFile())).toThrow();
   });
 
   it('valid enabled setting and v1 done evidence append exactly one row at the env override', async () => {
@@ -88,8 +90,72 @@ describe('v1 report shadow observer', () => {
     expect(result.record).toMatchObject({ kind: 'review', status: 'done' });
     expect(result.record.role).toBeUndefined();
     await Promise.all(observations);
-    const rows = readFileSync(join(dir, 'shadow.jsonl'), 'utf8').trim().split('\n').map(JSON.parse);
+    const rows = readFileSync(logFile(), 'utf8').trim().split('\n').map(JSON.parse);
     expect(rows).toHaveLength(1);
     expect(rows[0].predicate).toMatchObject({ round: 0, runId: 'run-1' });
+  });
+});
+
+// S1 negative cases exercise the real observer and durable report boundary.
+describe('S1 full-step evidence', () => {
+  it('key-only disagreement opens a finding with both canonical seven-field steps', async () => {
+    runReport(flags);
+    const real = await vi.importActual('../../lib/flow-engine/shadow.mjs');
+    const engine = await import('../../lib/flow-engine/index.mjs');
+    await real.shadowReviewStep({ repo: flags.repo, pr: flags.pr, session: flags.session,
+      classified: { ...flags, loopOutcome: flags.verdict } }, {
+      readSetting, log: () => {}, engine: { ...engine, plan: (flow, p) => engine.plan(flow, p).map(s => ({ ...s, key: s.key + '-wrong' })) },
+    });
+    const finding = rows(logFile() + '.findings.jsonl')[0];
+    const planned = JSON.parse(finding.planned), actual = JSON.parse(finding.actual);
+    expect(finding).toMatchObject({ repo: 'o/r', pr: '7', seq: 1 });
+    expect(Object.keys(actual).sort()).toEqual(['attempt', 'from', 'guard', 'key', 'outcome', 'route', 'to']);
+    expect(planned).toEqual({ ...actual, key: actual.key + '-wrong' });
+    expect(actual.key).toBe('review:o%2Fr%237:1.1');
+    expect(finding.actual).toBe(engine.canonicalJSON(actual));
+    expect(finding.planned).toBe(engine.canonicalJSON(planned));
+    expect(rows(logFile())[0].predicate.agreement).toBe(false);
+  });
+
+  it.each(['bounced', 'auto-cleared'])('shadow on/off preserves %s runReport result, completion and exit behavior', async outcome => {
+    const input = { ...flags, outcome, verdict: outcome === 'auto-cleared' ? 'converged' : 'complete' };
+    setting.value = '{"reviewLoop":{"flowShadow":{"enabled":false}}}';
+    const exit = process.exitCode, off = report(input), before = bytes();
+    await Promise.all(observations);
+    setting.value = '{"reviewLoop":{"flowShadow":{"enabled":true}}}';
+    expect(report(input)).toEqual(off);
+    await Promise.all(observations);
+    expect(bytes()).toBe(before);
+    expect(process.exitCode).toBe(exit);
+    expect(rows(logFile())).toHaveLength(1);
+  });
+
+  it('rotates a log at the bound and continues replay/sequence in the active file', async () => {
+    report(flags); await Promise.all(observations);
+    const first = readFileSync(logFile(), 'utf8');
+    writeFileSync(logFile(), first + ' '.repeat(262144 - Buffer.byteLength(first)));
+    report({ ...flags, runId: 'run-2' }); await Promise.all(observations);
+    expect(readFileSync(logFile() + '.1', 'utf8')).toHaveLength(262144);
+    expect(rows(logFile())[0].predicate.seq).toBe(2);
+    report({ ...flags, runId: 'run-3' }); await Promise.all(observations);
+    expect(rows(logFile()).map(r => r.predicate.seq)).toEqual([2, 3]);
+  });
+
+  it('two PRs write distinct safe filenames', async () => {
+    report(flags); await Promise.all(observations);
+    report({ ...flags, pr: '8', session: 'review-8' }); await Promise.all(observations);
+    expect(rows(logFile())[0].subject[0].name).toBe('o/r#7');
+    expect(rows(join(dir, 'shadow-6f2f72-8.jsonl'))[0].subject[0].name).toBe('o/r#8');
+  });
+
+  it('ownership refusal leaves no shadow row even when the existing completion is done', async () => {
+    runReport({ ...flags, 'session-id': 'owner' });
+    const before = bytes(), baseline = runReport(flags);
+    expect(baseline.refused).toBe(true);
+    expect(report(flags)).toEqual(baseline);
+    await Promise.all(observations);
+    expect(shadowReviewStep).not.toHaveBeenCalled();
+    expect(bytes()).toBe(before);
+    expect(readdirSync(dir).filter(n => n.endsWith('.jsonl'))).toEqual([]);
   });
 });

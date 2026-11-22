@@ -617,7 +617,7 @@ export function createReviewJobIo({ root = REPO_ROOT, env = process.env, dir = r
       if (!workerWrapperEnabledFor('review', env)) {
         const result = runReport(flags);
         // Observe only after the durable v1 result; shadow failures never affect the report.
-        if (flags.status === 'done') {
+        if (flags.status === 'done' && !result.refused) {
           try { Promise.resolve(shadowReviewStep(structuredClone({ repo: flags.repo ?? null, pr: flags.pr ?? null, classified, session: flags.session }))).catch(() => {}); } catch { /* shadow never affects the tick */ }
         }
         return result;

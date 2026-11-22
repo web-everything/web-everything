@@ -1,7 +1,7 @@
-import { openSync, readSync, closeSync, lstatSync, readFileSync, mkdirSync, realpathSync } from 'node:fs';
+import { openSync, readSync, closeSync, lstatSync, readFileSync, mkdirSync, realpathSync, readdirSync, renameSync, appendFileSync } from 'node:fs';
 import { createHash } from 'node:crypto';
 import { execFileSync } from 'node:child_process';
-import { dirname, join, resolve } from 'node:path';
+import { basename, dirname, join, resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { cascadePolicy } from '../policy-cascade.mjs';
 import { resolveCoordinationRoot } from '../../operations/coordination-root.mjs';
@@ -61,7 +61,9 @@ export async function shadowReviewStep({ repo, pr, classified, session, completi
     const setting = resolveFlowShadow(env, { tool, readSetting });
     note(`flow-v0 shadow settings ${JSON.stringify(setting)}`);
     if (!setting.enabled) return;
-    const logPath = resolve(file ?? setting.file);
+    const configured = resolve(file ?? setting.file);
+    // Hex encoding is injective and keeps untrusted repository names out of paths.
+    const logPath = join(dirname(configured), `${basename(configured).replace(/[^A-Za-z0-9_-]/g, '-').replace(/-jsonl$/, '')}-${Buffer.from(String(repo)).toString('hex')}-${pr}.jsonl`);
     const sessions = listCompletionSessions(completionsDir);
     const completion = session && tryReadCompletion(session, completionsDir);
     if (!repo || !/^[^/#]+\/[^/#]+$/.test(repo) || !/^[1-9][0-9]*$/.test(String(pr)) || !completion || !(completion.role === 'review' || (completion.role === undefined && completion.kind === 'review')) || completion.status !== 'done' || String(completion.pr) !== String(pr)) throw Error('required repo/PR/done review completion absent; skipped');
@@ -69,12 +71,18 @@ export async function shadowReviewStep({ repo, pr, classified, session, completi
     if (!/^[a-f0-9]{40}$/.test(head ?? '') || !/^[a-f0-9]{64}$/.test(netDiff ?? '')) throw Error('required classified head/netDiff absent or invalid; skipped (no hashes invented)');
     // Reject lexical paths, symlinks, and hard-link aliases before opening or locking.
     let logStat;
-    try { logStat = stat(logPath); } catch (e) { if (e.code !== 'ENOENT') throw e; }
-    if (logStat && !logStat.isFile()) throw Error('shadow log is not a regular file; skipped');
-    for (const name of sessions) {
-      const path = completionPath(name, completionsDir), cs = lstatSync(path);
-      if (resolve(path) === logPath || (logStat && cs.dev === logStat.dev && cs.ino === logStat.ino)) throw Error('shadow log aliases a completion record; skipped');
-    }
+    const checkPath = path => {
+      let info;
+      try { info = stat(path); } catch (e) { if (e.code !== 'ENOENT') throw e; }
+      if (info && !info.isFile()) throw Error('shadow log is not a regular file; skipped');
+      for (const name of sessions) {
+        const completion = completionPath(name, completionsDir), cs = lstatSync(completion);
+        if (resolve(completion) === path || (info && cs.dev === info.dev && cs.ino === info.ino)) throw Error('shadow log aliases a completion record; skipped');
+      }
+      return info;
+    };
+    checkPath(configured);
+    logStat = checkPath(logPath);
     mkdirSync(dirname(logPath), { recursive: true });
     // Resolve parent aliases so two configured spellings still share a lock.
     lockRoot = join(realpathSync(dirname(logPath)), '.flow-v0-shadow-locks');
@@ -84,9 +92,16 @@ export async function shadowReviewStep({ repo, pr, classified, session, completi
     const lockTime = Date.now(); // Lease age must use wall time, independently of evidence timestamps.
     locked = reserve(lockRoot, 'append', `${process.pid}:${lockTime}:${Math.random()}`, lockTime, new Date(lockTime).toISOString()).ok;
     if (!locked) throw Error('shadow log busy; skipped; operator may retry observation');
+    logStat = checkPath(logPath); // Recheck size after acquiring the shared lock.
+    const archives = readdirSync(dirname(logPath)).filter(n => n.startsWith(basename(logPath) + '.') && /^\d+$/.test(n.slice(basename(logPath).length + 1)))
+      .sort((a, b) => Number(a.split('.').pop()) - Number(b.split('.').pop()));
     let rows = [];
-    try { rows = readBounded(logPath, { open, read, close, stat }).split('\n').filter(Boolean).map(line => JSON.parse(line)); }
-    catch (e) { if (e.code !== 'ENOENT') throw e; }
+    for (const [i, name] of archives.entries()) if (Number(name.split('.').pop()) !== i + 1) throw Error('archive sequence incomplete; operator must inspect log');
+    for (const path of [...archives.map(n => join(dirname(logPath), n)), logPath]) {
+      checkPath(path);
+      try { rows.push(...readBounded(path, { open, read, close, stat }).split('\n').filter(line => line.trim()).map(line => JSON.parse(line))); }
+      catch (e) { if (e.code !== 'ENOENT') throw e; }
+    }
     const records = rows.filter(r => r.subject?.[0]?.name === `${repo}#${pr}`);
     const seq = records.length + 1;
     if (records.some((r, i) => r.predicate?.seq !== i + 1)) throw Error('duplicate or noncontiguous sequence; operator must inspect log; skipped');
@@ -94,17 +109,34 @@ export async function shadowReviewStep({ repo, pr, classified, session, completi
     if (records.some(r => r.predicate.inputs.includes(input) && r.predicate.runId === (classified?.runId ?? 'unknown') && r.predicate.completionAt === completion.endedAt)) throw Error('completion already observed; skipped');
     const flow = engine.load(definition);
     const outcome = completion.outcome === 'auto-cleared' && completion.verdict === 'converged' ? 'accept' : completion.outcome === 'bounced' ? 'continue' : 'unknown';
-    const projection = { flowDigest: flow.digest, seq: records.length, records, event: 'done', outcome, parts: { Subject: `${repo}#${pr}`, Visit: seq } };
+    const projection = { flowDigest: flow.digest, seq: records.length, records, event: 'done', outcome, parts: { Subject: `${repo}#${pr}`, Visit: `${seq}.1` } };
     const ctx = { repo, pr, head, netDiff, round: classified?.round ?? 'unknown', runId: classified?.runId ?? 'unknown', seq, at: stamp, executorCommit: executorCommit(), inputs: [input] };
     const steps = engine.plan(flow, projection);
     const actualOutcome = classified?.outcome === 'auto-cleared' && classified.loopOutcome === 'converged' ? 'accept' : classified?.outcome === 'bounced' ? 'continue' : null;
-    const actual = actualOutcome ? { from: 'judge-convergence', guard: 'convergence', outcome: actualOutcome, route: 'advance', to: actualOutcome === 'accept' ? 'accepted' : 'judge-convergence' } : null;
-    const agreement = steps.length === 1 && actual !== null && Object.entries(actual).every(([k, v]) => steps[0][k] === v);
-    note(`flow-v0 shadow ${canonicalJSON({ repo, pr, seq, steps, actual: classified, agreement })}`);
-    if (!agreement) note('flow-v0 shadow disagreement; operator review required; no gate decision changed');
+    // The declared Visit key part carries this visit's attempt (the review subset permits one).
+    const actual = { from: 'judge-convergence', guard: 'convergence', outcome: actualOutcome,
+      route: actualOutcome ? 'advance' : null, to: actualOutcome === 'accept' ? 'accepted' : actualOutcome === 'continue' ? 'judge-convergence' : null,
+      key: `review:${encodeURIComponent(`${repo}#${pr}`)}:${seq}.1`, attempt: 1 };
+    const fullStep = step => Object.fromEntries(['from', 'guard', 'outcome', 'route', 'to', 'key', 'attempt'].map(k => [k, step[k]]));
+    const planned = steps.map(fullStep);
+    const agreement = steps.length === 1 && comparePlans(planned[0], actual).equal;
+    note(`flow-v0 shadow ${canonicalJSON({ repo, pr, seq, steps: planned, actual, agreement })}`);
+    if (!agreement) {
+      const findings = logPath + '.findings.jsonl';
+      checkPath(findings);
+      appendFileSync(findings, canonicalJSON({ repo, pr, seq, planned: canonicalJSON(planned.length === 1 ? planned[0] : planned), actual: canonicalJSON(actual) }) + '\n');
+      note('flow-v0 shadow disagreement; operator review required; no gate decision changed');
+    }
     for (const step of steps) {
       const record = engine.transitionRecord(flow, step, ctx);
-      Object.assign(record.predicate, { round: ctx.round, runId: ctx.runId, completionAt: completion.endedAt });
+      Object.assign(record.predicate, { round: ctx.round, runId: ctx.runId, completionAt: completion.endedAt, agreement });
+      const rowBytes = Buffer.byteLength(JSON.stringify(record) + '\n');
+      if (rowBytes > LIMIT) throw Error('shadow row exceeds 256 KiB; operator must inspect evidence');
+      if (logStat && logStat.size + rowBytes > LIMIT) {
+        renameSync(logPath, `${logPath}.${archives.length + 1}`);
+        logStat = undefined;
+        note('flow-v0 shadow rotated; prior evidence retained in numbered archive');
+      }
       if (!await engine.appendTransition(logPath, record)) note('flow-v0 shadow append failed; operator must inspect review-loop log');
     }
   } catch (e) { note(`flow-v0 shadow failed; operator must inspect evidence: ${String(e?.message ?? e)}`); }
