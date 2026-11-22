@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from 'vitest';
-import { reviewModelEligible } from '../review-model-eligibility.mjs';
+import { reviewModelEligible, assertPinnedJudgeModel, requiresMandatoryReview } from '../review-model-eligibility.mjs';
 import { readRegistry } from '../model-probation.mjs';
 import { DEFAULT_ROUTING_POLICY, validateRoutingPolicy, resolveOperationRoute, applyRoutingOverrides } from '../dispatch-routing-policy.mjs';
 import { settingsFromRoutingPolicy, seatProviderDirective } from '../review-seat-provider.mjs';
@@ -37,11 +37,16 @@ describe('review model role eligibility', () => {
       const policy = policyFor(key, model);
       expect(() => validateRoutingPolicy(policy)).toThrow(/refused|unknown model/);
       const base = policyFor(key, 'gemini-4-argon-high');
+      // operator ruling 7333: advisory probation never counts for mandatory seats
+      if (taskType.startsWith('mandatory:')) base.operations[key] = { provider: 'agy-claude', model: 'sonnet', fallback: [] };
+      // operator ruling 7333: advisory probation never counts for mandatory seats
       expect(() => applyRoutingOverrides(base, { [key]: route(model) })).toThrow(/refused|unknown model/);
       expect(() => resolveOperationRoute({ operation: 'review-seat', taskType, policy })).toThrow(/refused|unknown model/);
+      // operator ruling 7333: advisory probation never counts for mandatory seats
       expect(() => resolveOperationRoute({ operation: 'review-seat', taskType, policy: base,
         aiRouting: route(model), operatorKeys: [] })).toThrow(/refused|unknown model/);
-      policy.operations[key] = { ...route('gemini-4-argon-high'), fallback: [{ provider: 'agy-gemini', model }] };
+      policy.operations[key] = { ...base.operations[key], fallback: [{ provider: 'agy-gemini', model }] };
+      // operator ruling 7333: advisory probation never counts for mandatory seats
       expect(() => validateRoutingPolicy(policy)).toThrow(/refused|unknown model/);
     }
     expect(() => settingsFromRoutingPolicy(policyFor('review-seat:mandatory:security', model), { aiRouting: undefined }))
@@ -54,10 +59,13 @@ describe('review model role eligibility', () => {
 
   it.each(['hydrogen', 'hydrogen-low', 'neon'])('rejects the resolved %s alias and a shadow override', model => {
     expect(() => validateRoutingPolicy(policyFor('review-seat:mandatory:security', model))).toThrow(/refused/);
-    const policy = policyFor('review-seat:mandatory:security', 'gemini-4-argon-high');
+    const policy = policyFor('review-seat:mandatory:security', 'claude-sonnet-5-5-high');
+    // operator ruling 7333: advisory probation never counts for mandatory seats
+    policy.operations['review-seat:mandatory:security'].provider = 'agy-claude';
     policy.operations['review-seat:mandatory:security'].mode = 'shadow';
     policy.operations['review-seat:mandatory:security'].fallback = [{ provider: 'claude', model: 'sonnet' }];
     const settings = settingsFromRoutingPolicy(policy, { aiRouting: undefined });
+    // operator ruling 7333: advisory probation never counts for mandatory seats
     expect(() => seatProviderDirective({ ...settings, shadowPolicy: { shadowEnabled: true, scope: 'high-care' },
       shadowModelOverride: { model: DEFAULT_ROUTING_POLICY.aliases['agy-gemini'][model] } }, 'security',
     { repo: 'example/repo', pr: 1, careLevel: 'high' })).toThrow(/refused/);
@@ -96,7 +104,7 @@ describe('review model role eligibility', () => {
     expect(() => validateRoutingPolicy(policyFor('merge-path', model))).toThrow(/refused|unknown model/);
   });
 
-  it.each(['gemini-4-carbon-high', 'gemini-4-argon-high', 'claude-opus-5-5-high', 'claude-sonnet-5-5-high'])(
+  it.each(['gemini-4-carbon-high', 'claude-opus-5-5-high', 'claude-sonnet-5-5-high'])(
     'preserves the established %s review route', model => {
       const provider = model.startsWith('claude') ? 'agy-claude' : 'agy-gemini';
       const policy = policyFor('review-seat:mandatory:security', model);
@@ -105,4 +113,49 @@ describe('review model role eligibility', () => {
       expect(resolveOperationRoute({ operation: 'review-seat', taskType: 'mandatory:security', policy: validated }))
         .toMatchObject({ provider, model, fallback: [] });
     });
+
+  it('refuses advisory-probation Argon on a mandatory security seat', () => {
+    const policy = policyFor('review-seat:mandatory:security', 'gemini-4-argon-high');
+    // operator ruling 7333: advisory probation never counts for mandatory seats
+    expect(() => validateRoutingPolicy(policy)).toThrow(/review model refused/);
+    // operator ruling 7333: advisory probation never counts for mandatory seats
+    expect(() => resolveOperationRoute({ operation: 'review-seat', taskType: 'mandatory:security', policy }))
+      .toThrow(/review model refused/);
+  });
+});
+
+describe('review model eligibility rulings (#7333)', () => {
+  const argon = 'gemini-4-argon-high';
+  const probation = { entries: [{ provider: 'antigravity', model: argon, roles: { 'advisory-review': 'probation' } }] };
+  const trusted = { entries: [{ provider: 'antigravity', model: argon, roles: { 'advisory-review': 'trusted' } }] };
+
+  it('(a) an explicit pin gets the same check: no small tier, even pinned', () => {
+    for (const [provider, model] of [['agy-gemini', 'gemini-4-hydrogen-low'], ['claude', 'haiku'], ['codex', 'luna']]) {
+      expect(() => assertPinnedJudgeModel(provider, model, 'judge:security')).toThrow(/review model refused/);
+    }
+    expect(() => assertPinnedJudgeModel('claude', 'sonnet', 'judge:security')).not.toThrow();
+  });
+
+  it('(b) an empty or unreadable registry fails closed for registry-governed models', () => {
+    const unreadable = readRegistry({ read: () => { throw Error('unreadable'); } });
+    for (const registry of [{ entries: [] }, unreadable]) {
+      expect(reviewModelEligible('codex', 'gpt-6-astra', registry)).toBe(false);
+      expect(reviewModelEligible('agy-gemini', argon, registry)).toBe(false);
+    }
+  });
+
+  it('(c) advisory probation never counts for mandatory jurors or merge routes', () => {
+    expect(reviewModelEligible('agy-gemini', argon, probation)).toBe(true);
+    expect(reviewModelEligible('agy-gemini', argon, probation, { mandatory: true })).toBe(false);
+    expect(reviewModelEligible('agy-gemini', argon, trusted, { mandatory: true })).toBe(true);
+    for (const key of ['review-seat:mandatory:security', 'merge-gate', 'land']) expect(requiresMandatoryReview(key)).toBe(true);
+    expect(requiresMandatoryReview('review-seat:advisory:agy-correctness-x')).toBe(false);
+  });
+
+  it('(d) the eligibility module, registry and tests are critical-work protected', () => {
+    for (const file of ['scripts/lib/review-model-eligibility.mjs', 'scripts/lib/model-probation-registry.mjs',
+      'scripts/lib/model-probation.json', 'scripts/lib/__tests__/review-model-eligibility.test.mjs']) {
+      expect(criticalWorkVerdict({ filesTouched: [file] }).critical).toBe(true);
+    }
+  });
 });

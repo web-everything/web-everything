@@ -47,6 +47,7 @@ import { seatTiming, withSeatTiming } from './review-seat-timing-core.mjs';
  */
 
 import { resolveOperationRoute } from '../lib/dispatch-routing-policy-io.mjs';
+import { assertPinnedJudgeModel } from '../lib/review-model-eligibility.mjs';
 import { redactSpawnText } from '../lib/describe-spawn-failure.mjs';
 import { pickAgyEvidence } from '../lib/antigravity-run-evidence.mjs';
 import { describeSubmit, extractSubmitResult } from './open-pr.mjs';
@@ -850,6 +851,8 @@ export function createDefaultJudge({
     // other CLI's own model flag verbatim.
     const effective = configured ? { ...declared, providerName: configured.provider, model: configured.model, effort: configured.effort } : (model && !TOOL_FREE_JUDGE_PROVIDER_NAMES.includes(effectiveProviderName)) ? { ...declared, model } : declared;
     assertSafeJudgeRequest(effective);
+    // An explicit pin gets the same review-eligibility check as a policy route: no small tier on a pinned seat.
+    if (pinned) assertPinnedJudgeModel(effectiveProviderName, effective.model, `${operation}:${effective.mandate?.lens ?? request?.lens ?? ''}`);
     // #xqa9ttq/#3383 — TOOL-FREE ONLY, ENFORCED HERE TOO, not only inside each provider's own spawn module. A
     // caller that injects its own `provider` function bypasses `resolveProvider` entirely, so this check is the
     // one place that catches "tool-free provider + tool-bearing request" regardless of HOW that provider got

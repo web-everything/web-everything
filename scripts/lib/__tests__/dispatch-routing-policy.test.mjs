@@ -117,6 +117,14 @@ describe('operation routing policy', () => {
     for (const provider of supported) {
       const accepted = structuredClone(policy);
       accepted.operations[key] = { ...routeFor(provider), fallback: [] };
+      if (key.includes('mandatory:') && provider === 'agy-gemini') {
+        // operator ruling 7333: advisory probation never counts for mandatory seats
+        expect(() => validateRoutingPolicy(accepted)).toThrow(/review model refused/);
+        // operator ruling 7333: advisory probation never counts for mandatory seats
+        expect(() => planRoutingOverride({ ...input, provider, model: models[provider] }, policy))
+          .toThrow(/review model refused/);
+        continue;
+      }
       expect(validateRoutingPolicy(accepted).operations[key]).toMatchObject({ provider });
       expect(planRoutingOverride({ ...input, provider, model: models[provider] }, policy)).toMatchObject({ key, patch: { provider } });
     }
@@ -138,11 +146,13 @@ describe('operation routing policy', () => {
     });
   it.each(['codex', 'agy-claude', 'agy-gemini'])(
     'resolves a supported red-team override for %s against the launch roster', provider => {
-      // The generic Gemini default is Neon, which cannot sit a review seat. Pin the eligible roster model.
+      // Review overrides default to Argon; its probation remains eligible for advisory red-team seats.
       const patch = provider === 'agy-gemini' ? { provider, model: 'gemini-4-argon-high' } : { provider };
-      if (provider === 'agy-gemini') expect(() => applyRoutingOverrides(DEFAULT_ROUTING_POLICY, {
-        'review-seat:red-team': { provider },
-      })).toThrow(/review model refused/);
+      // operator ruling 7333: advisory probation never counts for mandatory seats
+      if (provider === 'agy-gemini') expect(resolveOperationRoute({ operation: 'review-seat', taskType: 'red-team',
+        policy: applyRoutingOverrides(DEFAULT_ROUTING_POLICY, {
+          'review-seat:red-team': { provider },
+        }) })).toMatchObject({ provider, model: 'gemini-4-argon-high' });
       const policy = applyRoutingOverrides(DEFAULT_ROUTING_POLICY, { 'review-seat:red-team': patch });
       expect(resolveOperationRoute({ operation: 'review-seat', taskType: 'red-team',
         available: OPERATION_PROVIDER_ROSTERS['review-seat:red-team'], policy })).toMatchObject({ provider });

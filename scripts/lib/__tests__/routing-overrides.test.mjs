@@ -52,8 +52,9 @@ describe('operator routing overrides', () => {
   it.each(['advisory:agy-correctness', 'mandatory:correctness', 'mandatory:security'])(
     'rejects unsupported providers for %s before accepting an override', task => {
       for (const provider of ['codex', 'antigravity']) {
+        // operator ruling 7333: advisory probation never counts for mandatory seats
         expect(() => applyRoutingOverrides(DEFAULT_ROUTING_POLICY, {
-          [`review-seat:${task}`]: { provider },
+          [`review-seat:${task}`]: { provider, model: provider === 'codex' ? 'sol' : 'sonnet' },
         })).toThrow(/provider/);
         expect(() => applyRoutingOverrides(DEFAULT_ROUTING_POLICY, {
           [`review-seat:${task}`]: { fallback: [{ provider: 'claude', model: 'sonnet' },
@@ -67,7 +68,8 @@ describe('operator routing overrides', () => {
     for (const task of ['mandatory:correctness', 'mandatory:security', 'advisory:agy-correctness']) {
       delete base.operations[`review-seat:${task}`];
     }
-    expect(() => applyRoutingOverrides(base, { 'review-seat': { provider: 'codex' } })).toThrow(/no available route/);
+    // operator ruling 7333: advisory probation never counts for mandatory seats
+    expect(() => applyRoutingOverrides(base, { 'review-seat': { provider: 'codex', model: 'sol' } })).toThrow(/no available route/);
   });
 
   it('rejects disabling every mandatory seat provider before publishing settings', () => {

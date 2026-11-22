@@ -85,13 +85,13 @@ export function validateRoutingPolicy(input) {
         fail(`${path}.mode must be "shadow", with a claude route in fallback to count`);
       }
       const resolvedModel = modelFor(policy, entry.provider, entry.model, path);
-      if (requiresReviewModel(name)) assertReviewModelEligible(entry.provider, resolvedModel);
+      if (requiresReviewModel(name)) assertReviewModelEligible(entry.provider, resolvedModel, name);
       validateEffort(entry.effort, entry.provider);
       if (!Array.isArray(entry.fallback)) fail(`${path}.fallback must be an array`);
       for (const [i, next] of entry.fallback.entries()) {
         keys(next, ['provider', 'model', 'effort'], `${path}.fallback[${i}]`);
         const fallbackModel = modelFor(policy, next.provider, next.model, `${path}.fallback[${i}]`);
-        if (requiresReviewModel(name)) assertReviewModelEligible(next.provider, fallbackModel);
+        if (requiresReviewModel(name)) assertReviewModelEligible(next.provider, fallbackModel, name);
         validateEffort(next.effort, next.provider);
       }
       const allowedProviders = group === 'operations' && rosterForKey(name);
@@ -214,7 +214,7 @@ export function resolveOperationRoute({ operation, taskType, size, designQuestio
   }
   const candidates = [entry, ...entry.fallback].map(({ provider, model, effort }) => ({ provider, model: modelFor(policy, provider, model, operation), effort: resolvePolicyEffort(provider, typeof effort === 'string' ? effort : effort?.[provider] ?? operationEffort(operation, provider, taskType, policy)) }));
   if (requiresReviewModel(`${operation}:${taskType ?? ''}`)) {
-    for (const route of candidates) assertReviewModelEligible(route.provider, route.model);
+    for (const route of candidates) assertReviewModelEligible(route.provider, route.model, `${operation}:${taskType ?? ''}`);
   }
   const chain = candidates.filter(route => !disabledProviders.has(route.provider) && !entry.disabledProviders?.includes(route.provider))
     .filter(route => (!gateClosed || route.provider === 'claude') && (route.provider === 'claude' || !vetoes.some(veto => veto.model === route.model && veto.provider === (route.provider.startsWith('agy-') ? 'antigravity' : route.provider))))
