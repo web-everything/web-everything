@@ -34,7 +34,7 @@ const toolAsyncShadowMode = () => { try { return readSettings()?.drain?.asyncSha
 
 /**
  * Mode: explicit option, then WE_ASYNC_DRAIN, then the tool setting drain.asyncShadow (scripts/settings/
- * drain-async-shadow.json, shadow). A set but invalid WE_ASYNC_DRAIN, an invalid tool setting, or nothing at all means off. Observation only.
+ * drain-async-shadow.json, off after shadow retirement). A set but invalid WE_ASYNC_DRAIN, an invalid tool setting, or nothing at all means off. Observation only.
  */
 export function createAsyncShadow({
   env = process.env,

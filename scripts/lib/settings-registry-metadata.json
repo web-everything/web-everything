@@ -837,7 +837,7 @@
       "instant": false
     },
     "postAcceptAdvisory": {
-      "description": "Advisory review mode after acceptance.",
+      "description": "Advisory review mode after acceptance; retired observer defaults off.",
       "owner": "scripts/settings/review.json",
       "changeVia": "pr",
       "instant": false
@@ -933,7 +933,7 @@
       "instant": false
     },
     "staleReferralHumanShadow": {
-      "description": "Enable shadow detection of stale human referral holds.",
+      "description": "Enable shadow detection of stale human referral holds; retired observer defaults off.",
       "owner": "scripts/settings/stale-referral-human-shadow.json",
       "changeVia": "pr",
       "instant": false
@@ -1011,7 +1011,7 @@
       "instant": false
     },
     "deliveryPriority": {
-      "description": "Delivery priority mode, aging, P0 concurrency and unblock weight.",
+      "description": "Delivery priority mode, aging, P0 concurrency and unblock weight; retired shadow defaults off.",
       "owner": "scripts/lib/delivery-priority-settings.json",
       "changeVia": "pr",
       "instant": false

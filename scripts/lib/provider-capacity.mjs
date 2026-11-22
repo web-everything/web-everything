@@ -64,6 +64,12 @@ export function readProviderCapacity({ env = {}, now = Date.now(), readers = {},
       const liveStale = Number.isFinite(at) && now - at > Math.min(24, s.staleHours) * HOUR;
       const liveUsable = liveReadingTimestampValid(raw, now, { staleHours: s.staleHours,
         codexRollout: (account.readers ?? owner.readers)?.some(r => r.type === 'codex-rollout') });
+      let status;
+      try { status = readers.signedOut?.(account.id, env); } catch { /* unknown status */ }
+      // Signed-out status must carry its own `at`: never asOf or the file mtime, no future skew, live-reading expiry.
+      const freshSignedOut = value => value?.status === 'signed-out' && value.at != null
+        && liveReadingTimestampValid({ at: value.at }, now, { staleHours: s.staleHours });
+      const signedOut = freshSignedOut(raw) || freshSignedOut(status);
       const add = (name, w, source = 'live') => {
         const usedPercent = w?.usedPercent ?? w?.used_percent ?? w?.used_percentage;
         const resetsAt = epoch(w?.resetsAt ?? w?.resets_at);
@@ -75,7 +81,7 @@ export function readProviderCapacity({ env = {}, now = Date.now(), readers = {},
             lengthHours: w.lengthHours ?? (w.window_minutes > 0 ? w.window_minutes / 60 : null) ?? configured?.lengthHours ?? lengths[name] ?? null });
         }
       };
-      if (liveUsable) {
+      if (!signedOut && liveUsable && raw?.status !== 'signed-out') {
         if (owner.readers?.some(r => r.type === 'codex-rollout')) {
           const name = (w, fallback) => w?.window_minutes > 0
             ? def.windows?.find(x => x.lengthHours * 60 === w.window_minutes)?.name
@@ -91,15 +97,15 @@ export function readProviderCapacity({ env = {}, now = Date.now(), readers = {},
       }
       // An absent timestamp does not prove the live observation predates the operator seed.
       // Preserve independent live constraints even when this single-window seed is newer.
-      if (seed && !operatorReadingStale && seedAt <= now && (!raw || (Number.isFinite(at) && at < seedAt))) add(def.windows?.[0]?.name ?? 'weekly', seed, 'operator');
-      if (!windows.length) for (const [name, rule] of Object.entries(def.calendar ?? s.calendar?.[owner.id] ?? {})) {
+      if (!signedOut && seed && !operatorReadingStale && seedAt <= now && (!raw || (Number.isFinite(at) && at < seedAt))) add(def.windows?.[0]?.name ?? 'weekly', seed, 'operator');
+      if (!signedOut && !windows.length) for (const [name, rule] of Object.entries(def.calendar ?? s.calendar?.[owner.id] ?? {})) {
         const resetsAt = calendarReset(rule, now);
         if (resetsAt) windows.push({ name, usedPercent: null, resetsAt, source: 'configured', lengthHours: lengths[name] ?? null });
       }
       let held = false;
       try { held = Boolean(readers.hold?.(owner.id, now)); } catch { held = true; }
-      return { ...def, provider: entry.id, account: account.id, configuredWindows: def.windows, windows, held, health: held ? 0 : 1,
-        usageAccount: raw ? usageAccount : null, usageIdentityRejected,
+      return { ...def, provider: entry.id, account: account.id, configuredWindows: def.windows, windows, held, health: held || signedOut ? 0 : 1,
+        ...(signedOut ? { signedOut: true } : {}), usageAccount: raw ? usageAccount : null, usageIdentityRejected,
         stale: !windows.some(w => Number.isFinite(w.usedPercent)) && (liveStale || operatorReadingStale),
         operatorReadingStale, known: windows.some(w => Number.isFinite(w.usedPercent)), now };
     });
@@ -140,9 +146,9 @@ export function scoreProvider(cap, kind, settings = {}) {
   const pace = planner.pace;
   const burn = planner.action === 'burn' || planner.pacingAction === 'burn' || planner.burnAggressively;
   const paceFactor = (pace === 'ahead' ? s.aheadPenalty : burn || pace === 'behind' ? s.behindBoost : 1) * (1 + (planner.scoreBoost ?? 0));
-  const label = (cap.active ?? def?.active) === false ? 'inactive' : cap.held ? 'held' : !w || w.resetsAt <= now ? 'unknown' : usedPercent >= s.exhaustedPercent ? 'exhausted'
+  const label = cap.signedOut ? 'signed-out' : (cap.active ?? def?.active) === false ? 'inactive' : cap.held ? 'held' : !w || w.resetsAt <= now ? 'unknown' : usedPercent >= s.exhaustedPercent ? 'exhausted'
     : !fit ? 'tier-excluded' : effectiveUsed >= 100 ? 'reserve-only' : pace === 'ahead' ? 'ahead' : pace === 'behind' ? 'behind' : 'normal';
-  const excluded = ['inactive', 'held', 'unknown', 'exhausted', 'tier-excluded', 'reserve-only'].includes(label);
+  const excluded = ['signed-out', 'inactive', 'held', 'unknown', 'exhausted', 'tier-excluded', 'reserve-only'].includes(label);
   const remaining = spare * hoursToReset;
   return { provider: cap.provider, account: cap.account ?? null, planner, model: cap.model ?? def?.model, launcher: cap.launcher ?? def?.launcher, usedPercent, effectiveUsed, resetsAt: w?.resetsAt ?? null,
     spare, urgency, health: cap.health, fit, pace, paceFactor, remaining, label,

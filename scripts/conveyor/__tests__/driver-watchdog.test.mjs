@@ -1238,6 +1238,7 @@ describe('the watchdog shares NONE of the driver\'s own decision logic', () => {
       'repo-names.mjs',             // R945 — constellation-repos' repo-name setting (leaf: no imports)
       'resolve-runner-checkout.mjs',// lease pid → checkout
       'runner-lock.mjs',            // the singleton lease
+      'settings-safe-direction.mjs',// D15 — policy-cascade's env-may-only-tighten classifier (leaf: no imports)
       'under-test.mjs',             // #5187 — claude-agents-cache's runner-neutral test-isolation predicate
       'write-all-sync.mjs',
     ]);

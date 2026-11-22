@@ -1110,6 +1110,12 @@ writes, so they do not replace a sibling process's records.
 
 ## Antigravity quota hold evidence
 
+The usage reader's login regression uses the raw ANSI capture in
+`scripts/operations/__tests__/fixtures/agy-login-screen.raw.txt`. With fake timers,
+assert resolution before startup, zero stdin writes, cleared timers and descendant
+cleanup: Escape or an interrupt sent as text can select a login method. Signed-out
+snapshots carry only `at` and `status`, never quota windows.
+
 Exercise holds with an injected temporary `dir` in
 `scripts/lib/__tests__/antigravity-run-evidence.test.mjs`. Explicit Claude and Gemini
 requests read their own backend folders; default or unrecognized models scan
@@ -6305,6 +6311,14 @@ It never infers clearance authority from a saved review or a newly read head.
 `scripts/operations/__tests__/record-verdict.test.mjs` covers request validation;
 `scripts/operations/__tests__/record-verdict-cli.test.mjs` drives both CLI adapters through
 staging the JSON request. The applier carries that pin to `review-set-label` as `--expect-head`.
+## Live-owner review adapter collection
+
+`pr-live-owner-watch.test.mjs` imports the manual dispatcher, review job and reconcile
+graph statically during collection. The first `review-dispatch` case otherwise loads
+these roots inside its five-second deadline, even when dispatch and reconcile IO are
+injected. Keep the production adapters exercised with injected effects and retain the
+original test deadlines and head-pinning assertions; avoid charging cold module loading
+to the first adapter case.
 
 ## S1b shadow accuracy evidence
 
@@ -6317,3 +6331,17 @@ contract. Set `cliMain` in `prFileContract` for callable entries so repeated arg
 the loaded graph. Resetting the entire daemon graph twice inside the CLI test exceeded its
 60-second deadline on a coverage shard. Keep the file/standalone output comparison and zero-GitHub
 assertions intact; consumers without callable entries retain the fresh-import path.
+
+## Bounded verify selection and ceiling recovery
+
+Verify gates execute explicit sorted test files, including complete graph selections. Graph failures,
+empty lists and oversized argv use changed tests plus direct importers clipped to `relatedMaxTests`,
+then the named `alwaysRunTests` suites. An empty union skips the test half; never emit unfiltered Vitest.
+Explicit related gates share the selector; `--gate-uncapped` is an audited exemption.
+A related gate stamped by an older dispatcher (`--run --passWithNoTests --testTimeout=N --hookTimeout=N`)
+converts to a capped gate keeping its stamped timeouts; any other unknown option is still refused.
+Missing timeouts on such a stamp mean factor 1, so the host's factor is not added; the converted gate
+shards exactly as the default would, so it is still recognized as the default gate.
+Gate ceilings get one capped retry tied to lane, head and killed job. Detached jobs settle in
+`verify-gate-job.mjs`, so recovery must cover that consumer as well as `verify-dispatch.mjs`'s
+in-process sweep. Persist the retry identity in job input to dedupe the enqueue-before-marker crash window.

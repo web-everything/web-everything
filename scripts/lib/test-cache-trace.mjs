@@ -26,9 +26,9 @@ const LOOPBACK = new Set(['localhost', '127.0.0.1', '::1', '[::1]', '0.0.0.0', '
 const GLOBAL_TOP_RE = /^(?:vitest\.[^/]+|tsconfig[^/]*\.json|package(?:-lock)?\.json|node_modules\/\.package-lock\.json)$/;
 const NODE_VALUE_FLAGS = new Set(['-e', '--eval', '-p', '--print', '-r', '--require', '--import', '--loader', '--experimental-loader', '--input-type', '--conditions', '-C']);
 
-/** Tracing runs only while the cache is on and not switched off with `WE_TEST_CACHE_TRACE=0`. */
+/** Retired shadow tracing is off by default; WE_TEST_CACHE_TRACE=1 explicitly enables it while the cache is on. */
 export function traceEnabled(env = process.env) {
-  return cacheEnabled(env) && env.WE_TEST_CACHE_TRACE !== '0';
+  return cacheEnabled(env) && env.WE_TEST_CACHE_TRACE === '1';
 }
 
 /** Trace this file in this run? `WE_TEST_CACHE_TRACE_SAMPLE=N` traces about 1 file in N, rotating with the run id. */
