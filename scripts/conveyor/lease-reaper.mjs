@@ -1529,9 +1529,10 @@ export function buildLeaseSignalsFor({ prStatesByRepo, sessionStates, sessionPid
  * child's journal line names the reaper (not a bare host:pid) and carries the reap classification as its
  * reason (`session-gone`, `pr-merged`, `ttl-stale`, …).
  */
-export function releaseLane(pool, lane, { reason = null, exec = execFileSync, cli = LANE_POOL_CLI, env = process.env } = {}) {
+export function releaseLane(pool, lane, { reason = null, lease = null, exec = execFileSync, cli = LANE_POOL_CLI, env = process.env } = {}) {
   // #x5n4zn3 — was bare (no timeout): a real `lane-pool.mjs release` call, one per reaped lease.
   const argv = [cli, 'release', `--pool=${pool}`, `--lane=${lane}`, '--force'];
+  if (lease) argv.push(`--expect-holder=${lease.holder}`, `--expect-renewed-at=${lease.renewedAt ?? 'none'}`);
   if (reason) argv.push(`--reason=${reason}`);
   exec('node', argv, {
     encoding: 'utf8',
@@ -1618,7 +1619,7 @@ function main(argv) {
       continue;
     }
     try {
-      releaseLane(c.pool, c.lane, { reason: c.reason });
+      releaseLane(c.pool, c.lane, { reason: c.reason, lease: c.lease });
       log(`  reaped ${c.pool}/lane-${c.lane} (${c.reason}; was session ${c.lease?.session ?? 'unknown'})`);
       done.push({ pool: c.pool, lane: c.lane, reason: c.reason, session: c.lease?.session ?? null });
       reaped++;

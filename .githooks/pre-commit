@@ -10,6 +10,8 @@
 # last command's exit code, so sequencing without fail-fast silently swallows earlier failures. Use
 # `|| exit $?` after each gate so the first failure stops the hook and propagates the right exit code.
 
+node scripts/lane-pool.mjs assert-lease || exit $?
+
 # Placeholder git author guard (2026-10-05..20 incident: every lane commit was authored "test"). Lane clones
 # only; refuses only a placeholder/missing author or committer — a real identity always passes.
 node scripts/guard-git-identity.mjs || exit $?

@@ -6345,3 +6345,17 @@ shards exactly as the default would, so it is still recognized as the default ga
 Gate ceilings get one capped retry tied to lane, head and killed job. Detached jobs settle in
 `verify-gate-job.mjs`, so recovery must cover that consumer as well as `verify-dispatch.mjs`'s
 in-process sweep. Persist the retry identity in job input to dedupe the enqueue-before-marker crash window.
+
+
+## Lane lease heartbeat races
+
+TTL-based takers compare `sameLeaseVersion` and re-check `isLeaseStale` on the
+moved marker. Forced foreign release compares `sameLeaseVersion` without requiring
+TTL expiry: the reaper can independently prove session-gone or PR-merged. A changed
+heartbeat still blocks release. Keep named regressions for both unchanged unexpired
+leases and renewals after each independent verdict. Owner operations keep identity-only
+`sameLease` so their own heartbeat does not block release. Use the lane-pool barrier seams in temporary `LANE_POOL_ROOT`
+pools to renew after the verdict and before the take. `renew` refuses a different
+holder and reserved leases. Commit/push hooks run `assert-lease`: expired or foreign
+holds refuse writes, live holds renew, unexpected internal errors warn and fail open.
+Keep the hook refusal and pre-push stdin-sharing cases in `lane-pool-renew-assert.test.mjs`.

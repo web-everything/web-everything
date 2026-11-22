@@ -68,6 +68,18 @@ export function renewedLease(lease, nowIso) {
   return { ...lease, renewedAt: nowIso };
 }
 
+/** Missing heartbeats normalize to null; malformed values never compare equal, even to themselves. */
+export function normRenewedAt(value) {
+  if (value === undefined || value === null) return null;
+  return typeof value === 'string' && Number.isFinite(Date.parse(value)) ? value : Symbol('invalid renewedAt');
+}
+
+/** Identity for owner operations; an owner's own heartbeat does not invalidate its release. */
+export const sameLease = (a, b) => !!a && !!b && a.acquiredAt === b.acquiredAt && a.session === b.session && a.holder === b.holder;
+
+/** Snapshot equality for a stale verdict: a heartbeat invalidates that verdict. */
+export const sameLeaseVersion = (a, b) => sameLease(a, b) && normRenewedAt(a.renewedAt) === normRenewedAt(b.renewedAt);
+
 /** #2350 — is this a RESERVED (permanent) lease? A pure boolean read (older leases lack the field ⇒ falsy ⇒
  *  ordinary TTL-governed lease, today's semantics). Callers use it to render the hold distinctly and to gate
  *  `release` (a reserved lane is never handed back except via the deliberate `--release-reserved` override). */
