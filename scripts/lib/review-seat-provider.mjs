@@ -22,9 +22,9 @@
  */
 import { aiRoutingInputs, resolveAiRouting } from './ai-routing.mjs';
 import { createHash } from 'node:crypto';
-import { carbonNonShadowAllowed, resolveReviewSeatSafeguards, resolveShadowSeatModel } from './review-seat-settings.mjs';
+import { carbonNonShadowAllowed, resolveReviewSeatSafeguards, resolveShadowSeatModel, resolveShadowPromoted, resolveShadowPromotionReplaces } from './review-seat-settings.mjs';
 import { readRoutingPolicy } from './dispatch-routing-policy-io.mjs';
-import { resolveOperationRoute } from './dispatch-routing-policy.mjs';
+import { resolveOperationRoute, operationRoutingEntry } from './dispatch-routing-policy.mjs';
 
 /** The closed provider vocabulary for a seat. */
 export const SEAT_PROVIDERS = Object.freeze(['claude', 'agy', 'shadow']);
@@ -96,14 +96,34 @@ export function logReviewSeat(log, message) {
   log(sanitizeReviewLog(message));
 }
 
+/** Live controls for the existing shadow correctness route; promotion never overrides a Claude-only route. */
+export function carbonPromotionRouteControls(policy) {
+  const controls = operationRoutingEntry({ operation: REVIEW_SEAT_OPERATION, taskType: mandatorySeatTask('correctness'), policy });
+  return { ...controls.entry, disabledProviders: [...controls.disabledProviders] };
+}
+export function carbonPromotionRouteAllowed(policy) {
+  const entry = carbonPromotionRouteControls(policy);
+  return entry.mode === 'shadow' && AGY_PROVIDERS.includes(entry.provider) && !entry.disabledProviders.includes('agy-gemini');
+}
+
 /** The live routing settings plus the advisory shadow model cascade; log each distinct selection once. */
-export function loadReviewSeatSettings({ policy, operatorKeys, aiRouting = aiRoutingInputs('review', resolveAiRouting()).coordinator, shadowModel = resolveShadowSeatModel(), safeguards = null, log = (m) => console.error(m) } = {}) {
+export function loadReviewSeatSettings({ policy, operatorKeys, aiRouting = aiRoutingInputs('review', resolveAiRouting()).coordinator, shadowModel = resolveShadowSeatModel(), safeguards = null, promoted, promotionReplaces, log = (m) => console.error(m) } = {}) {
   if (policy === undefined) {
     policy = readRoutingPolicy();
     operatorKeys ??= readRoutingPolicy.operatorKeys();
   }
   const resolved = safeguards ?? resolveReviewSeatSafeguards({ log });
-  const settings = Object.freeze({ ...settingsFromRoutingPolicy(policy, { shadowModel, aiRouting, operatorKeys }),
+  const base = settingsFromRoutingPolicy(policy, { shadowModel, aiRouting, operatorKeys });
+  const promotion = promoted ?? resolveShadowPromoted({ log: () => {} });
+  const replaces = promotionReplaces ?? resolveShadowPromotionReplaces({ log });
+  // Promote only the correctness companion; its directive always retains Claude as the decider.
+  const replace = resolved.value.shadowEnabled === true && promotion.value === true && replaces.value === 'claude'
+    && base.seatProvider.correctness === 'shadow' && carbonPromotionRouteAllowed(policy)
+    && /carbon/i.test(shadowModel?.value ?? '');
+  if (replace) logReviewSeat(log, `review.shadowSeats.antigravity.promoted=true (${promotion.source}); promotionReplaces=${replaces.value} (${replaces.source}); lens=correctness; role=additional-blocking; decider=claude; model=${shadowModel.value} (${shadowModel.source})`);
+  const settings = Object.freeze({ ...base,
+    ...(replace ? { seatProvider: Object.freeze({ ...base.seatProvider, correctness: 'agy' }),
+      seatModel: Object.freeze({ ...base.seatModel, correctness: shadowModel.value }), promotedLens: 'correctness' } : {}),
     shadowPolicy: resolved.value, minNonClaudeSeats: resolved.value.minNonClaudeSeats });
   const lenses = SEAT_PROVIDER_LENSES.filter((lens) => settings.seatProvider[lens] === 'shadow');
   if (lenses.length) {
@@ -143,6 +163,9 @@ export function seatProviderDirective(settings, lens, context) {
 function modelDirective(settings, lens, mode) {
   const model = settings.seatModel?.[lens] ?? settings.agyModel;
   if (typeof model !== 'string' || !model) throw new TypeError(`review-seat-provider: the ${lens} seat names no agy model`);
+  if (mode === 'agy' && settings.promotedLens === lens) {
+    return Object.freeze({ mode, model, promoted: true, blockingOnly: true, dailyCap: settings.shadowPolicy?.dailyCap ?? 100, onEscape: 'claude' });
+  }
   const budget = mode === 'shadow' && settings.shadowPolicy ? { dailyCap: settings.shadowPolicy.dailyCap ?? 100 } : {};
   const override = settings.shadowModelOverride;
   if (mode === 'shadow' && override?.model && override.model !== model) {

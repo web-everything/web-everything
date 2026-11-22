@@ -1889,6 +1889,7 @@ export function buildReviewAntigravityJudgeRequest({ read, aim = '' }) {
 function withSeatContext(directive, read, seat) {
   return {
     ...directive, seat, repo: read.repo, pr: read.pr, head: read.netBasis?.rev ?? null,
+    ...(directive.promoted ? { citationScope: read.degraded === true ? [] : read.netChangedFiles } : {}),
     ...(Array.isArray(read.findingIdentity) && read.findingIdentity.length ? { identityTable: read.findingIdentity } : {}),
   };
 }
@@ -3054,6 +3055,29 @@ export function reviewPrOperation({
           if (answer.skipped) skippedSeats.push({ lens: seat.lens, reason: String(answer.skipped.reason ?? seatSummary) });
         }
 
+        // Carbon is a negative-only companion, not a correctness decider or a counted pass.
+        // Keep its blockers even when a prior referral is already covered: dedupe the referral,
+        // never erase the finding (including its prevention guard) or turn it into an accept.
+        let carbonSendBack = false;
+        for (const seat of seats.filter(s => s.lens === 'correctness')) {
+          const blockers = (seat.answer?.carbonBlocking?.findings ?? [])
+            .filter(f => deriveVerdict({ findings: [f] }) === VERDICTS.CHANGES);
+          if (!blockers.length) continue;
+          const scoped = scopeFindingsToCitedFiles(blockers, { scope: citationScope });
+          const carbonLens = 'carbon-correctness';
+          lensFindings[carbonLens] = [...(lensFindings[carbonLens] ?? []), ...scoped.findings];
+          lensAdmitted[carbonLens] = [...(lensAdmitted[carbonLens] ?? []), ...scoped.admitted];
+          carbonSendBack ||= scoped.admitted.length > 0;
+          citationScopeEnforced ||= scoped.enforced;
+          unverifiableCitations.push(...scoped.unverifiable);
+          const roundScoped = classifyReferralsByRound(
+            blockers.filter(requiresMandatoryReferral).map(original => ({ seat: seat.step, original })),
+            { identity: read.findingIdentity, head: read.netBasis?.rev ?? null, latestFix: read.latestFix,
+              lens: 'correctness', openHeads: read.referralOpenHeads },
+          );
+          referrals.push(...roundScoped.kept);
+        }
+
         // TAGGED WITH THEIR LENS, by `buildPanelFindings` — so a merged list never loses which juror said it.
         // That provenance is what makes the operator-facing comment readable with two seats: without it, a
         // security finding and a correctness finding are indistinguishable rows.
@@ -3104,7 +3128,7 @@ export function reviewPrOperation({
         const retiredOnOneAnswer = uncorroboratedRetirements({ downgraded: unverifiedClaims,
           known: knownVerifications(read.referralVerified, read.netBasis?.rev), settled: settledClaims,
           reasons: knownVerificationReasons(read.referralVerified, read.netBasis?.rev) });
-        const panelVerdict = operatorSendBackVerdict(derivePanelVerdict({
+        let panelVerdict = operatorSendBackVerdict(derivePanelVerdict({
           lensVerdicts: panelLensVerdicts,
           humanRequired: read.humanRequired === true,
           // #xu2pp2m — THE BASIS THIS PANEL ACTUALLY JUDGED ON. `read.degraded` is already the fact every
@@ -3123,6 +3147,7 @@ export function reviewPrOperation({
           // It is the verdict basis WITHOUT the advisory Codex seat.
           findings: buildPanelFindings(verdictAdmitted),
         }), read.openOperatorSendBacks);
+        if (carbonSendBack && panelVerdict !== VERDICTS.NEEDS_HUMAN) panelVerdict = VERDICTS.CHANGES;
         // Held: every verdict the loop can turn into an accept by itself — a clean accept, and a prevention-outstanding one (the loop
         // files the guard, then accepts). A `changes` verdict still bounces to the fixer; the round-cards accept refuses it
         // (`roundCardsRefusal`), and `planRecordDecision` refuses any agent-addressed accept while this list is non-empty.

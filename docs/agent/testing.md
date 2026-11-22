@@ -1127,7 +1127,34 @@ that both drive modes preserve provider effort while retaining the request fallb
 
 ## Shadow reviewer agreement evidence
 
-`promotionReplaces` names the existing seat Carbon replaces on manual promotion (default `claude`); the pure `assertCrossVendorPanel` helper checks that the resulting panel retains a non-builder vendor, with tests preserving seat count for Claude, Codex and agy builders.
+Manual `shadowSeats.antigravity.promoted: true` with the legacy selector `promotionReplaces: claude`
+enables an additional blocking-only Carbon correctness seat when `enabled` is true. Claude always
+runs and remains the only correctness decider. Carbon blockers are merged into the panel findings
+with prevention guards intact, and cause send-backs/referrals even when Claude accepts. Covered
+referrals do not erase Carbon blockers. Carbon never contributes an accept or a counted pass;
+no-blocker answers (including prevention-outstanding) and failed/invalid answers contribute nothing.
+Security retains its Claude seat; the other Carbon shadows use deterministic `scope: sampled` at 0.1.
+The agy-Claude shadow fallback and advisory use Sonnet. Promotion opts the companion into the existing
+Gemini routing cap (explicit caps still win), with the atomic daily session budget. The separate Carbon
+advisory seat stays off. Red-team routing and human gates are unchanged.
+`scripts/lib/__tests__/review-shadow-model.test.mjs` covers these boundaries, including the exact Tier-1 case.
+The append-only `agy-carbon-promotion.jsonl` lives beside the shadow ledger. Run
+`node scripts/lib/agy-shadow-trial-report.mjs --promotion` for agreement with the final stored panel
+verdict, later fix confirmations, explicit `not-real` false positives, timeouts/fallbacks and distinct PRs.
+This local report reads persisted runs without GitHub calls; unknown verdicts/findings stay pending.
+Fix proximity is confirmation evidence, never proof that an unconfirmed finding was false.
+Promotion is confined to the existing shadow correctness route: an explicit Claude route or a
+Gemini routing disable refuses the companion, and dispatch rechecks live controls and cap kill switches.
+An invalid `promotionReplaces` override refuses and logs. Other Carbon non-shadow roles, including
+red-team and advisory seats, remain refused regardless of the promotion flag. Admitted Carbon answers
+validate against the server-owned review JSON schema with no coercion or additional properties.
+Every finding requires a non-empty file and positive integer line, and all findings must survive
+`scopeFindingsToCitedFiles` admission against the pinned diff. Zero findings require a completed,
+non-error `read_file` of a diff path in the served transcript; summary phrases do not prove inspection.
+An observed matching served model, no timeout (including salvaged answers), and a successful ledger
+append remain required. Any missing or invalid evidence falls back to Claude.
+Carbon cannot substitute for a failed Claude seat; correctness remains unrun if Claude fails.
+The pure `assertCrossVendorPanel` helper retains its existing cross-vendor check.
 
 The agy mandatory-seat shadows are off by default (operator 2026-10-16).
 `review.shadowSeats.antigravity.enabled` / `WE_REVIEW_SHADOW_AGY_ENABLED` enables shadows only within the selected scope.

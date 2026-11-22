@@ -941,7 +941,7 @@ it('reloads red-team routing each pass, preserves explicit zero, and restores Ge
     const result = await speculateRedTeam({ pr: 6, repo: REPO, read: payload('accept').findings.read, env }, cleared.io);
     expect(result.status).toBe('skipped');
     expect(cleared.calls.filter(c => c[0] === 'seat')).toHaveLength(0);
-    overrides = { 'review-seat:red-team': { enabledProviders: ['agy-gemini'], disabledProviders: ['codex', 'agy-claude'] } };
+    overrides = { 'review-seat:red-team': { provider: 'agy-gemini', model: 'pro', enabledProviders: ['agy-gemini'], disabledProviders: ['codex', 'agy-claude'] } };
     const enabled = fakeIo({ readRoutingPolicy: reader });
     expect((await speculateRedTeam({ pr: 7, repo: REPO, read: payload('accept').findings.read, env }, enabled.io)).status).toBe('speculated');
     expect(enabled.calls.find(c => c[0] === 'seat')[1].provider).toBe('agy-gemini');
@@ -1001,25 +1001,27 @@ describe('R1077 builder company routing', () => {
   const marker = provider => buildDelegationMarker({ provider, model: provider === 'codex' ? 'gpt-6.1-sol' : 'claude-sonnet-5-5', taskType: 'bugfix' });
   const policyIo = over => fakeIo({ readRoutingPolicy: () => structuredClone(DEFAULT_ROUTING_POLICY), readSeatSettings: () => ({ tool: {}, platform: {} }), ...over });
 
-  it.each([['codex', 'codex', 'gpt-6.1-sol'], ['claude', 'codex', 'gpt-6.1-sol'], ['agy-claude', 'codex', 'gpt-6.1-sol']])('routes %s builders to %s/%s', async (builder, provider, model) => {
+  it.each([['codex', 'agy-claude', RED_TEAM_MODELS['agy-claude'].model], ['claude', 'codex', 'gpt-6.1-sol'], ['agy-claude', 'codex', 'gpt-6.1-sol']])('routes %s builders to %s/%s', async (builder, provider, model) => {
     const { io, calls } = policyIo();
     expect((await speculateRedTeam(input(marker(builder)), io)).status).toBe('speculated');
     expect(calls.find(c => c[0] === 'seat')[1]).toMatchObject({ provider, model });
   });
 
-  it('routes a Codex builder to promoted Gemini when enabled through its live setting', async () => {
+  it('promoted Carbon with a positive Gemini cap gives a Codex builder a Gemini red-team, never Codex', async () => {
     const { io, calls } = policyIo({ readSeatSettings: () => ({ tool: { seatDailyCaps: { 'agy-gemini': 20 } }, platform: {} }) });
     const args = input(marker('codex'));
     args.env.WE_REVIEW_SHADOW_AGY_PROMOTED = 'true';
     expect((await speculateRedTeam(args, io)).status).toBe('speculated');
     expect(calls.find(c => c[0] === 'seat')[1].provider).toBe('agy-gemini');
+    expect(calls.filter(c => c[0] === 'reserve').map(c => c[1])).toEqual(['agy-gemini']);
   });
 
-  it.each([undefined, 'false'])('falls back before reserving unpromoted Carbon despite a Gemini cap opt-in (promotion=%s)', async promoted => {
+  it.each([undefined, 'false', 'garbage', 'true'])('promotion gates the Gemini route; a Codex builder never reserves Codex (promotion=%s)', async promoted => {
     const { io, calls } = policyIo({ readSeatSettings: () => ({ tool: { seatDailyCaps: { 'agy-gemini': 20 } }, platform: {} }) });
     const args = input(marker('codex'));
     args.env.WE_REVIEW_SHADOW_AGY_PROMOTED = promoted;
-    expect(carbonNonShadowAllowed(RED_TEAM_MODELS['agy-gemini'].model, { env: args.env, log: io.log })).toBe(false);
+    const allowed = promoted === undefined || promoted === 'true';
+    expect(carbonNonShadowAllowed(RED_TEAM_MODELS['agy-gemini'].model, { env: args.env, log: io.log })).toBe(allowed);
     const runSeat = io.runSeat;
     io.runSeat = options => {
       expect(carbonNonShadowAllowed(options.model, { env: args.env, log: io.log })).toBe(true);
@@ -1027,9 +1029,11 @@ describe('R1077 builder company routing', () => {
     };
     const result = await speculateRedTeam(args, io);
     expect(result.status).toBe('speculated');
-    expect(calls.filter(c => c[0] === 'reserve').map(c => c[1])).toEqual(['codex']);
-    expect(calls.find(c => c[0] === 'seat')[1]).toMatchObject({ provider: 'codex', model: RED_TEAM_MODELS.codex.model });
-    expect(calls.some(c => c[0] === 'log' && /Carbon not promoted.*fallback/.test(c[1]))).toBe(true);
+    const provider = allowed ? 'agy-gemini' : 'agy-claude';
+    expect(calls.filter(c => c[0] === 'reserve').map(c => c[1])).toEqual([provider]);
+    expect(calls.find(c => c[0] === 'seat')[1]).toMatchObject({ provider, model: RED_TEAM_MODELS[provider].model });
+    expect(calls.some(c => c[0] === 'seat' && c[1].provider === 'codex')).toBe(false);
+    if (!allowed) expect(calls.some(c => c[0] === 'log' && /Carbon not promoted.*fallback/.test(c[1]))).toBe(true);
   });
 
   // Round-6 red team: a Carbon refusal must skip that ROUTE, not the whole provider, so an explicitly
@@ -1082,28 +1086,32 @@ describe('R1077 builder company routing', () => {
 
   it.each(['codex', 'claude'])('falls back and logs when the cross-company provider for %s is capped', async builder => {
     const preferred = builder === 'codex' ? 'agy-gemini' : 'codex';
-    const { io, calls } = policyIo({ readRecords: () => [{ dispatchKind: REVIEW_SEAT_DISPATCH_KIND,
+    const flashPolicy = structuredClone(DEFAULT_ROUTING_POLICY);
+    flashPolicy.operations['review-seat:red-team'] = { provider: 'agy-gemini', model: 'flash', fallback: [{ provider: 'codex', model: 'sol', effort: 'high' }, { provider: 'agy-claude', model: RED_TEAM_MODELS['agy-claude'].model, effort: 'high' }] };
+    const { io, calls } = policyIo({ readRoutingPolicy: () => flashPolicy, readRecords: () => [{ dispatchKind: REVIEW_SEAT_DISPATCH_KIND,
       provider: preferred, callId: 'spent', scoredAt: new Date(NOW).toISOString(), status: 'ok' }] });
     const args = input(marker(builder));
     args.env = { WE_REVIEW_SHADOW_AGY_PROMOTED: 'true', WE_REVIEW_SEAT_CAP_AGY_GEMINI: '20', [PROVIDER_CAP_ENV[preferred]]: '1' };
     expect((await speculateRedTeam(args, io)).status).toBe('speculated');
-    expect(calls.find(c => c[0] === 'seat')[1].provider).toBe(preferred === 'codex' ? 'agy-gemini' : 'codex');
+    expect(calls.find(c => c[0] === 'seat')[1].provider).toBe(preferred === 'codex' ? 'agy-gemini' : 'agy-claude');
     expect(calls.some(c => c[0] === 'log' && /daily-cap.*fallback to/.test(c[1]))).toBe(true);
-    if (builder === 'codex') expect(calls.some(c => c[0] === 'log' && /same-vendor codex fallback accepted/.test(c[1]))).toBe(true);
+    if (builder === 'codex') expect(calls.some(c => c[0] === 'reserve' && c[1] === 'codex')).toBe(false);
   });
 
   it('retries the other provider when the preferred reservation races with another caller', async () => {
-    const { io, calls } = policyIo({ readSeatSettings: () => ({ tool: { seatDailyCaps: { 'agy-gemini': 20 } }, platform: {} }) });
+    const flashPolicy = structuredClone(DEFAULT_ROUTING_POLICY);
+    flashPolicy.operations['review-seat:red-team'] = { provider: 'agy-gemini', model: 'flash', fallback: [{ provider: 'codex', model: 'sol', effort: 'high' }, { provider: 'agy-claude', model: RED_TEAM_MODELS['agy-claude'].model, effort: 'high' }] };
+    const { io, calls } = policyIo({ readRoutingPolicy: () => flashPolicy, readSeatSettings: () => ({ tool: { seatDailyCaps: { 'agy-gemini': 20 } }, platform: {} }) });
     const reserve = io.reserveCalls;
     io.reserveCalls = o => o.provider === 'agy-gemini' ? { used: o.dailyCap, callIds: [] } : reserve(o);
     const args = input(marker('codex'));
     args.env.WE_REVIEW_SHADOW_AGY_PROMOTED = 'true';
     expect((await speculateRedTeam(args, io)).status).toBe('speculated');
-    expect(calls.find(c => c[0] === 'seat')[1].provider).toBe('codex');
-    expect(calls.some(c => c[0] === 'log' && /fallback to codex/.test(c[1]))).toBe(true);
+    expect(calls.find(c => c[0] === 'seat')[1].provider).toBe('agy-claude');
+    expect(calls.some(c => c[0] === 'reserve' && c[1] === 'codex')).toBe(false);
   });
 
-  it.each(['default', 'routing', 'environment', 'settings'])('falls back to Codex and logs same-vendor acceptance when Gemini is disabled by %s', async source => {
+  it.each(['default', 'routing', 'environment', 'settings'])('uses Claude, never same-vendor Codex, when Gemini is disabled by %s', async source => {
     const { io, calls } = policyIo(source === 'settings' ? {
       readSeatSettings: () => ({ tool: { seatDailyCaps: { 'agy-gemini': 0 } }, platform: {} }),
     } : {});
@@ -1117,8 +1125,8 @@ describe('R1077 builder company routing', () => {
     const args = input(marker('codex'));
     if (source === 'environment') args.env.WE_REVIEW_SEAT_CAP_AGY_GEMINI = '0';
     expect((await speculateRedTeam(args, io)).status).toBe('speculated');
-    expect(calls.find(c => c[0] === 'seat')[1]).toMatchObject({ provider: 'codex', model: 'gpt-6.1-sol' });
-    expect(calls.some(c => c[0] === 'log' && /same-vendor codex fallback accepted/.test(c[1]))).toBe(true);
+    expect(calls.find(c => c[0] === 'seat')[1]).toMatchObject({ provider: 'agy-claude', model: RED_TEAM_MODELS['agy-claude'].model });
+    expect(calls.some(c => c[0] === 'reserve' && c[1] === 'codex')).toBe(false);
   });
 
   it.each(['codex', 'claude', 'unknown'])('uses and logs emergency agy-claude only when both ordinary providers are capped for %s', async builder => {
@@ -1154,10 +1162,10 @@ describe('R1077 builder company routing', () => {
     expect(calls.some(c => c[0] === 'seat')).toBe(false);
   });
 
-  it('does not use emergency agy-claude for a missing ordinary CLI with budget left', async () => {
+  it('uses independent Claude when a Codex builder has no Gemini CLI', async () => {
     const { io, calls } = policyIo({ cliAvailable: p => p === 'agy-claude' });
-    expect((await speculateRedTeam(input(marker('codex')), io)).status).toBe('skipped');
-    expect(calls.some(c => c[0] === 'seat')).toBe(false);
+    expect((await speculateRedTeam(input(marker('codex')), io)).status).toBe('speculated');
+    expect(calls.find(c => c[0] === 'seat')[1].provider).toBe('agy-claude');
   });
 
   it.each([true, false])('falls back and logs for a capped unknown-builder policy route with routeByBuilder=%s', async enabled => {
@@ -1192,6 +1200,9 @@ describe('R1077 builder company routing', () => {
     const { io, calls } = policyIo({ readHeadMessage: () => '', readSeatSettings: () => ({ platform: {}, tool: { redTeam: { routeByBuilder: enabled } } }) });
     resolveOperationRoute.mockReturnValueOnce({ provider: 'codex', model: 'gpt-6-astra', effort: 'high' });
     await speculateRedTeam(input(builder === 'unknown' ? 'no marker' : marker(builder)), io);
-    expect(calls.find(c => c[0] === 'seat')[1]).toMatchObject({ provider: 'codex', model: 'gpt-6-astra' });
+    if (builder === 'codex') {
+      expect(calls.find(c => c[0] === 'seat')[1].provider).toBe('agy-claude');
+      expect(calls.some(c => c[0] === 'reserve' && c[1] === 'codex')).toBe(false);
+    } else expect(calls.find(c => c[0] === 'seat')[1]).toMatchObject({ provider: 'codex', model: 'gpt-6-astra' });
   });
 });

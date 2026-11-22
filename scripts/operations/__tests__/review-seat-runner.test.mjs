@@ -52,13 +52,13 @@ describe('settings — review.seatProvider.<lens> comes from the routing policy 
     expect(c.claudeSeatModel.correctness).toBe('claude-sonnet-5-5');
   });
 
-  it('the shipped routing policy: correctness and security in shadow on claude-opus-5-5-high, the advisory agy seat on', () => {
+  it('the shipped settings: Carbon is the blocking correctness companion, security stays shadow and advisory Claude uses Sonnet', () => {
     const s = loadReviewSeatSettings({ policy: DEFAULT_ROUTING_POLICY });
-    expect(s.seatProvider).toEqual({ correctness: 'shadow', security: 'shadow' });
-    expect(s.seatModel).toEqual({ correctness: 'claude-opus-5-5-high', security: 'claude-opus-5-5-high' });
+    expect(s.seatProvider).toEqual({ correctness: 'agy', security: 'shadow' });
+    expect(s.seatModel).toEqual({ correctness: 'gemini-4-carbon-high', security: 'claude-sonnet-5-5-high' });
     expect(s.claudeSeatModel).toEqual({ correctness: 'claude-sonnet-5-5', security: 'claude-sonnet-5-5' });
     expect(s.agyCorrectnessAdvisory).toBe(true);
-    expect(s.agyModel).toBe('claude-opus-5-5-high');
+    expect(s.agyModel).toBe('claude-sonnet-5-5-high');
   });
 
   it.each([
@@ -711,14 +711,14 @@ describe('first live shadow run (PR #4133) — the shared checkout\'s own churn 
   });
 });
 
-it('an unpromoted Carbon advisory route retains no live non-shadow seat', () => {
-  vi.stubEnv('WE_REVIEW_SHADOW_AGY_PROMOTED', 'false');
+it.each(['false', 'true'])('Carbon advisory opt-in uses the resolved promotion without caller context (%s)', promoted => {
+  vi.stubEnv('WE_REVIEW_SHADOW_AGY_PROMOTED', promoted);
   try {
     const settings = settingsFromRoutingPolicy(withEntries({
       'review-seat:advisory:agy-correctness': { provider: 'agy-gemini', model: 'gemini-4-carbon-high', fallback: [] },
     }), { aiRouting: {} });
     expect(settings.agyModel).toBe('gemini-4-carbon-high');
-    expect(settings.agyCorrectnessAdvisory).toBe(false);
+    expect(settings.agyCorrectnessAdvisory).toBe(promoted === 'true');
   } finally {
     vi.unstubAllEnvs();
   }
@@ -753,9 +753,10 @@ describe('carbon shadow seat vs the agy-gemini live seat cap (R1062a)', () => {
     const capped = await run('agy', 'gemini-4-carbon-high', promoted, { onEscape: 'skip' });
     expect(capped.calls).toHaveLength(0);
     expect(capped.logs.join('\n')).toContain('agy-gemini seat cap 0');
-    // control: the same promoted live seat runs once the live cap is opened, so the skip above is the cap
+    // Opening the cap still cannot authorize an unscoped Carbon role.
     const open = await run('agy', 'gemini-4-carbon-high', { ...promoted, WE_REVIEW_SEAT_CAP_AGY_GEMINI: '20' }, { onEscape: 'skip' });
-    expect(open.calls).toHaveLength(1);
+    expect(open.calls).toHaveLength(0);
+    expect(open.logs.join(' ')).toContain('non-shadow seat refused');
   });
   it('a non-carbon gemini shadow with cap 0 is still skipped', async () => {
     const { calls } = await run('shadow', 'gemini-3-pro', { WE_REVIEW_SEAT_CAP_CARBON_SHADOW: '5' });
@@ -778,4 +779,19 @@ describe('carbon shadow seat vs the agy-gemini live seat cap (R1062a)', () => {
     const { reserved } = await run('shadow', 'gemini-4-carbon-high', { WE_REVIEW_SEAT_CAP_CARBON_SHADOW: '5' }, { dailyCap: 7 });
     expect(reserved).toEqual([7]);
   });
+});
+
+it('promoted Carbon advisory dispatch works without a counted promotion directive', async () => {
+  vi.stubEnv('WE_REVIEW_SHADOW_AGY_PROMOTED', 'true');
+  vi.stubEnv('WE_REVIEW_SEAT_CAP_AGY_GEMINI', '20');
+  const agyJuror = vi.fn(async () => ({ status: 'ok', sessionId: 'advisory-carbon', value: { summary: 'Carbon advisory', findings: [FINDING] } }));
+  const claudeJudge = vi.fn();
+  try {
+    const { value } = unwrapJudgeOutcome(await runSeatWithProvider({ ...REQUEST, lens: 'agy-correctness',
+      seatProvider: { mode: 'agy', model: 'gemini-4-carbon-high', onEscape: 'skip' } }, io({ agyJuror, claudeJudge })));
+    expect(agyJuror).toHaveBeenCalledOnce();
+    expect(claudeJudge).not.toHaveBeenCalled();
+    expect(value.findings).toEqual([FINDING]);
+    expect(value.carbonBlocking).toBeUndefined();
+  } finally { vi.unstubAllEnvs(); }
 });

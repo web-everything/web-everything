@@ -8,12 +8,19 @@ import { CARBON_SHADOW_CAP_ENV, resolveCarbonShadowCap, resolveProviderCap } fro
 import { assertCrossVendorPanel, vendorOfModel, settingsFromRoutingPolicy, shadowSeatStatus, seatProviderDirective, loadReviewSeatSettings } from '../review-seat-provider.mjs';
 import { DEFAULT_ROUTING_POLICY, validateRoutingPolicy } from '../dispatch-routing-policy.mjs';
 import { buildShadowRow, compareShadowAnswers, summarizeShadowAgreement, summarizeCarbonPromotion, renderShadowReport } from '../review-shadow-agreement.mjs';
+import { REVIEW_JUDGE_SHAPE } from '../../operations/review-pr.mjs';
 import { runSeatWithProvider } from '../../operations/review-seat-runner.mjs';
+import { deriveVerdict } from '../jury-core.mjs';
 import { buildTrialReport } from '../agy-shadow-trial-report.mjs';
 import { reserveShadowSession } from '../review-shadow-budget.mjs';
 
+const servedReadTrace = (path, state = 'DONE', extra = {}) => [
+  { event: 'step_update', step_update: { step_index: 1, step_type: 'tool', tool_name: 'read_file', state, tool_info: { parameters: { AbsolutePath: path } }, ...extra } },
+  { event: 'result', result: { status: 'SUCCESS' } },
+].map(x => JSON.stringify(x)).join('\n');
+
 const model = 'gemini-4-argon-high';
-const routingModel = 'claude-opus-5-5-high';
+const routingModel = 'claude-sonnet-5-5-high';
 const finding = { summary: 'private finding text', file: 'scripts/example.mjs', line: 12, category: 'security/fail-open', disposition: 'blocker' };
 const claudeAnswer = { summary: 'Claude answer', findings: [finding] };
 const directive = { mode: 'shadow', model, fallbackModel: routingModel, modelSource: 'settings', repo: 'o/r', pr: 7, head: '123456789012abcdef', seat: 'correctness' };
@@ -33,6 +40,8 @@ const ok = { status: 'ok', sessionId: 'agy', value: { summary: 'agy', findings: 
 
 // These legacy Argon trials explicitly opt in to non-Carbon Gemini execution.
 beforeEach(() => {
+  // Historical shadow fixtures opt out of the newly shipped counted correctness seat.
+  vi.stubEnv('WE_REVIEW_SHADOW_AGY_PROMOTED', 'false');
   vi.stubEnv('WE_REVIEW_SEAT_CAP_AGY_GEMINI', '5');
   vi.stubEnv(CARBON_SHADOW_CAP_ENV, '1');
 });
@@ -81,7 +90,7 @@ describe('Carbon promotion settings and advisory guards', () => {
       expect(resolve({}, read)).toEqual({ value: 10, source: 'default' });
     }
   });
-  it('ships enabled watch-only Carbon with ten agreeing PRs as the reporting target', () => {
+  it('ships enabled Carbon with ten agreeing PRs as the reporting target', () => {
     expect(resolveShadowSeatModel({ env: {} })).toEqual({ value: 'gemini-4-carbon-high', source: 'settings' });
     expect(resolveShadowPromotionPrs({ env: {} })).toEqual({ value: 10, source: 'settings' });
     expect(resolveReviewSeatSafeguards({ env: {}, platform: {}, log: () => {} }).value.shadowEnabled).toBe(true);
@@ -108,11 +117,12 @@ describe('Carbon promotion settings and advisory guards', () => {
     const selectedModel = carbon ? 'gemini-4-carbon-high' : model;
     const carbonShadow = carbon && mode === 'shadow';
     // R1062a: a Carbon shadow ignores the live Gemini cap and follows only its own switch
-    const enabled = carbonShadow ? Number(carbonCap) > 0 : Number(geminiCap) > 0;
+    const enabled = carbonShadow ? Number(carbonCap) > 0 : Number(geminiCap) > 0 && !(carbon && mode === 'agy');
     const result = await run([{ ...ok, servedModel: selectedModel }], { mode, model: selectedModel, onEscape: 'skip' });
     expect(result.models).toEqual(enabled ? [selectedModel] : []);
     if (!enabled) {
-      const reasons = [carbonShadow && carbonCap === '0' ? 'carbon shadow seat off' : 'agy-gemini seat cap 0'];
+      const reasons = [carbonShadow && carbonCap === '0' ? 'carbon shadow seat off'
+        : carbon && mode === 'agy' && Number(geminiCap) > 0 ? 'Carbon not promoted — non-shadow seat refused' : 'agy-gemini seat cap 0'];
       expect(mode === 'shadow' ? result.value.shadow : result.value.seatProvider).toMatchObject({ status: 'skipped', reasons });
     }
     if (mode === 'shadow') expect(result.value.findings).toEqual(claudeAnswer.findings);
@@ -415,12 +425,12 @@ describe('Carbon replacement target', () => {
     expect(resolveShadowPromotionReplaces({ env: {}, readFile })).toEqual({ value: 'codex', source: 'settings' });
     expect(resolveShadowPromotionReplaces({ env: {}, readFile: () => '{}' })).toEqual({ value: 'claude', source: 'default' });
   });
-  it.each(['', 'unknown', {}, ['claude'], 'x'.repeat(10000)])('invalid target falls back visibly: %j', value => {
-    expect(resolveShadowPromotionReplaces({ env: { WE_REVIEW_SHADOW_AGY_PROMOTION_REPLACES: value }, readFile })).toEqual({ value: 'codex', source: 'settings' });
-    expect(resolveShadowPromotionReplaces({ env: {}, readFile: () => JSON.stringify({ shadowSeats: { antigravity: { promotionReplaces: value } } }) })).toEqual({ value: 'claude', source: 'default' });
+  it.each(['', 'unknown', {}, ['claude'], 'x'.repeat(10000)])('invalid target refuses promotion visibly: %j', value => {
+    expect(resolveShadowPromotionReplaces({ env: { WE_REVIEW_SHADOW_AGY_PROMOTION_REPLACES: value }, readFile })).toEqual({ value: null, source: 'refused' });
+    expect(resolveShadowPromotionReplaces({ env: {}, readFile: () => JSON.stringify({ shadowSeats: { antigravity: { promotionReplaces: value } } }) })).toEqual({ value: null, source: 'refused' });
   });
-  it('unreadable settings fall back to one Claude seat', () => {
-    expect(resolveShadowPromotionReplaces({ env: {}, readFile: () => { throw Error('unreadable'); } })).toEqual({ value: 'claude', source: 'default' });
+  it('unreadable replacement settings refuse promotion', () => {
+    expect(resolveShadowPromotionReplaces({ env: {}, readFile: () => { throw Error('unreadable'); } })).toEqual({ value: null, source: 'refused' });
   });
   it('reports a one-seat replacement for Claude and Codex builders using routed models', () => {
     const settings = settingsFromRoutingPolicy(DEFAULT_ROUTING_POLICY, { aiRouting: {} });
@@ -528,16 +538,16 @@ it('persists served-model evidence through the shadow runner for promotion count
 });
 
 // Explicit promotion fixtures exercise counted seats without granting a default promotion.
-it.each(['false', undefined, 'garbage'])('unpromoted Carbon cannot occupy a non-shadow seat (%s)', async promoted => {
+it.each(['false', 'garbage'])('unpromoted Carbon cannot occupy a non-shadow seat (%s)', async promoted => {
   vi.stubEnv('WE_REVIEW_SHADOW_AGY_PROMOTED', promoted);
   const result = await run([ok], { mode: 'agy', model: 'gemini-4-carbon-high', onEscape: 'skip' });
   expect(result.models).toEqual([]);
   expect(result.value.seatProvider).toMatchObject({ status: 'skipped', reasons: ['Carbon not promoted — non-shadow seat refused'] });
   expect((await run([ok], { model: 'gemini-4-carbon-high' })).models).toEqual(['gemini-4-carbon-high']);
 });
-it('manual promotion allows Carbon with a positive Gemini cap', async () => {
+it('manual promotion cannot authorize an unscoped Carbon role with a positive Gemini cap', async () => {
   vi.stubEnv('WE_REVIEW_SHADOW_AGY_PROMOTED', 'true');
-  expect((await run([ok], { mode: 'agy', model: 'gemini-4-carbon-high' })).models).toEqual(['gemini-4-carbon-high']);
+  expect((await run([ok], { mode: 'agy', model: 'gemini-4-carbon-high' })).models).toEqual([]);
 });
 it.each([
   ['garbage', false], ['true', true], [' TRUE ', true], ['false', false], [' FaLsE ', false], ['   ', false], ['', true],
@@ -580,4 +590,386 @@ describe('resolveShadowPromoted fails closed on an unreadable or malformed tool 
     const readFile = () => { throw Object.assign(new Error('x'), { code: 'ENOENT' }); };
     expect(resolveShadowPromoted({ env: {}, readFile, platform, log: () => {} })).toMatchObject({ value: true });
   });
+});
+
+
+describe('one counted Carbon correctness seat', () => {
+  const carbon = 'gemini-4-carbon-high';
+  const settings = () => loadReviewSeatSettings({ policy: DEFAULT_ROUTING_POLICY, aiRouting: {}, log: () => {} });
+  async function counted(agyRun) {
+    if (agyRun === ok) agyRun = { ...ok, servedModel: carbon, checkoutHead: 'a'.repeat(40), checkoutRoot: '/lane', transcriptFile: 'served.jsonl' };
+    const rows = [];
+    const claudeJudge = vi.fn(async () => ({ value: claudeAnswer }));
+    const answer = await runSeatWithProvider({ lens: 'correctness', runId: 'promotion-test', shape: REVIEW_JUDGE_SHAPE,
+      seatProvider: { ...seatProviderDirective(settings(), 'correctness', highCarePr), repo: 'o/r', pr: 7, head: 'a'.repeat(40), citationScope: [finding.file] } }, {
+      cwd: '.', claudeJudge, unwrap: x => x, wrap: value => value,
+      agyJuror: async () => { if (agyRun instanceof Error) throw agyRun; return agyRun; }, readTranscript: () => servedReadTrace(finding.file),
+      // This fixture exercises standard caps, independent of operator platform preferences.
+      readRoutingPolicy: () => DEFAULT_ROUTING_POLICY, readSeatSettings: () => ({ tool: {}, platform: {} }),
+      appendPromotion: row => { rows.push(row); return true; }, reserveSession: () => ({ allowed: true }), log: () => {},
+    });
+    return { answer, rows, claudeJudge };
+  }
+  it('correctness lens resolves to promoted agy-gemini Carbon seat; a Carbon error falls back to the Claude seat and never accepts', async () => {
+    vi.stubEnv('WE_REVIEW_SHADOW_AGY_PROMOTED', 'true');
+    const s = settings();
+    expect(s.seatProvider).toEqual({ correctness: 'agy', security: 'shadow' });
+    expect(seatProviderDirective(s, 'correctness')).toMatchObject({ mode: 'agy', model: carbon, promoted: true, blockingOnly: true, onEscape: 'claude' });
+    const { answer, claudeJudge, rows } = await counted(new Error('login lost'));
+    expect(claudeJudge).toHaveBeenCalledOnce();
+    expect(answer.seatProvider.provider).toBe('claude');
+    expect(answer.findings).toEqual(claudeAnswer.findings);
+    expect(deriveVerdict(answer)).toBe('changes');
+    expect(rows).toHaveLength(1);
+    expect(rows[0]).toMatchObject({ repo: 'o/r', pr: 7, fallback: true, agyVerdict: null });
+  });
+  it.each([
+    null,
+    { status: 'failed', reasons: ['timeout'] },
+    { status: 'skipped', reasons: ['quota exhausted'] },
+    { status: 'ok', sessionId: 's', value: { summary: '', findings: [] } },
+    { status: 'ok', sessionId: 's', value: { summary: 'unparseable', findings: 'bad' } },
+    { status: 'ok', sessionId: 's' },
+    { status: 'ok', sessionId: 's', value: { summary: 'bad finding', findings: [null] } },
+  ])('Carbon timeout, quota or malformed answer falls back: %j', async failure => {
+    vi.stubEnv('WE_REVIEW_SHADOW_AGY_PROMOTED', 'true');
+    const { answer, claudeJudge, rows } = await counted(failure);
+    expect(answer.seatProvider.provider).toBe('claude');
+    expect(answer.findings).toEqual(claudeAnswer.findings);
+    expect(deriveVerdict(answer)).toBe('changes');
+    expect(claudeJudge).toHaveBeenCalledOnce();
+    expect(rows[0].fallback).toBe(true);
+  });
+  it('keeps a valid Carbon blocker alongside Claude and records the attempt', async () => {
+    vi.stubEnv('WE_REVIEW_SHADOW_AGY_PROMOTED', 'true');
+    const { answer, claudeJudge, rows } = await counted(ok);
+    expect(answer.seatProvider.provider).toBe('claude');
+    expect(answer.carbonBlocking).toMatchObject({ provider: 'agy', model: carbon, findings: ok.value.findings });
+    expect(claudeJudge).toHaveBeenCalledOnce();
+    expect(rows[0]).toMatchObject({ fallback: false, agyVerdict: 'changes', runId: 'promotion-test' });
+  });
+  it('promotion enables the default-disabled Gemini seat without changing other Gemini caps; explicit zero falls back', async () => {
+    vi.stubEnv('WE_REVIEW_SHADOW_AGY_PROMOTED', 'true');
+    // Vitest 1.x stringifies undefined; remove the key after registering its restoration.
+    vi.stubEnv('WE_REVIEW_SEAT_CAP_AGY_GEMINI', '');
+    delete process.env.WE_REVIEW_SEAT_CAP_AGY_GEMINI;
+    expect((await counted(ok)).answer.carbonBlocking).toMatchObject({ provider: 'agy', model: carbon });
+    expect(resolveProviderCap('agy-gemini', {}, () => ({ tool: {}, platform: {} }))).toBe(0);
+    vi.stubEnv('WE_REVIEW_SEAT_CAP_AGY_GEMINI', '0');
+    const result = await counted(ok);
+    expect(result.answer.seatProvider.provider).toBe('claude');
+    expect(result.rows[0].fallback).toBe(true);
+  });
+  it('ships promotion enabled and samples other lenses deterministically at about ten percent', () => {
+    expect(resolveShadowPromoted({ env: {}, log: () => {} }).value).toBe(true);
+    vi.stubEnv('WE_REVIEW_SHADOW_AGY_PROMOTED', 'true');
+    const s = settings();
+    expect(s.shadowPolicy).toMatchObject({ scope: 'sampled', sampleRate: 0.1 });
+    const selected = Array.from({ length: 2000 }, (_, i) => shadowSeatStatus(s, { repo: 'o/r', pr: i + 1 }));
+    expect(selected.filter(x => x === 'sampled').length).toBeGreaterThan(150);
+    expect(selected.filter(x => x === 'sampled').length).toBeLessThan(250);
+    expect(selected).toEqual(Array.from({ length: 2000 }, (_, i) => shadowSeatStatus(s, { repo: 'O/R', pr: i + 1 })));
+  });
+  it('promotion leaves red-team routing and the human gate unchanged', async () => {
+    const { derivePanelVerdict } = await import('../jury-core.mjs');
+    const { RED_TEAM_MODELS } = await import('../../operations/review-extra-seats.mjs');
+    const before = structuredClone(RED_TEAM_MODELS);
+    expect(before.codex.model).toMatch(/^gpt-/);
+    vi.stubEnv('WE_REVIEW_SHADOW_AGY_PROMOTED', 'true');
+    settings();
+    const { antigravityReviewFromEnv } = await import('../../operations/review-pr.mjs');
+    expect(antigravityReviewFromEnv({ WE_REVIEW_SHADOW_AGY_PROMOTED: 'true' }, { isOnProbation: () => true })).toBe(false);
+    expect(RED_TEAM_MODELS).toEqual(before);
+    expect(derivePanelVerdict({ lensVerdicts: { correctness: 'accept', security: 'accept' }, findings: [], humanRequired: true })).toBe('needs-human');
+  });
+  it('records JSONL and reports agreement, later confirmations, explicit false positives, timeouts and PR count', async () => {
+    const { appendPromotionRow, readPromotionRows, buildPromotionReport, renderPromotionReport } = await import(/* @vite-ignore */ '../' + 'review-carbon-promotion.mjs');
+    const dir = mkdtempSync(join(tmpdir(), 'carbon-promotion-'));
+    try {
+      const path = join(dir, 'promotion.jsonl');
+      const row = { repo: 'o/r', pr: 7, head: 'h', runId: 'r', model: carbon, status: 'ok', fallback: false,
+        agyVerdict: 'changes', agyFindings: [{ path: 'scripts/x.mjs', line: 10, normSummary: 'bad guard' }] };
+      expect(appendPromotionRow(row, { path })).toBe(true);
+      appendPromotionRow({ ...row, pr: 8, runId: 'timeout', status: 'failed', fallback: true, agyVerdict: null, agyFindings: [], reasons: ['timeout'] }, { path });
+      const runs = new Map([['r', { verdict: { verdict: 'changes' } }]]);
+      const later = new Map([['o/r#7', [{ findings: { read: { latestFix: { priorHead: 'h', files: { 'scripts/x.mjs': [10] } } } } }]]]);
+      const report = buildPromotionReport({ rows: readPromotionRows({ path }), runRecords: runs, prRuns: later });
+      expect(report).toMatchObject({ prs: 2, agreement: { agree: 1, compared: 1 }, confirmedFindings: 1, falsePositives: 0, timeouts: 1, fallbacks: 1 });
+      const falsePositive = { findings: { read: { findingIdentity: [{ path: 'scripts/x.mjs', normSummary: 'bad guard', rulings: [{ head: 'h', result: 'not-real' }] }] } } };
+      expect(buildPromotionReport({ rows: [row], prRuns: new Map([['o/r#7', [falsePositive]]]) }).falsePositives).toBe(1);
+      expect(buildPromotionReport({ rows: [row] })).toMatchObject({ pendingVerdicts: 1, pendingFindings: 1, falsePositives: 0 });
+      expect(renderPromotionReport(report)).toMatch(/agreement.*confirmed findings.*false positives.*timeouts.*2 PRs/);
+      const { main } = await import('../agy-shadow-trial-report.mjs');
+      let output = '';
+      main(['--promotion'], { readPromotion: () => readPromotionRows({ path }), write: text => { output += text; }, evidenceIO: { resolveDirs: () => [] } });
+      expect(output).toMatch(/agreement.*confirmed findings.*false positives.*timeouts.*2 PRs/);
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+});
+
+
+describe('promotion verdict authorization audit', () => {
+  const carbon = 'gemini-4-carbon-high';
+  const good = { status: 'ok', sessionId: 'carbon-session', servedModel: carbon, checkoutHead: 'a'.repeat(40), checkoutRoot: '/lane', transcriptFile: 'served.jsonl', value: { summary: 'Reviewed diff: inverted guard', findings: [finding] } };
+  const policyWith = patch => {
+    const policy = structuredClone(DEFAULT_ROUTING_POLICY);
+    Object.assign(policy.operations['review-seat:mandatory:correctness'], patch);
+    return validateRoutingPolicy(policy);
+  };
+  const selection = policy => loadReviewSeatSettings({ policy, aiRouting: {}, log: () => {} });
+  async function attempt(result = good, { lens = 'correctness', promoted = true, policy = DEFAULT_ROUTING_POLICY, append = () => true, scope = [finding.file], transcript = servedReadTrace(finding.file), claude = claudeAnswer } = {}) {
+    vi.stubEnv('WE_REVIEW_SHADOW_AGY_PROMOTED', 'true');
+    const rows = [], calls = [];
+    const answer = await runSeatWithProvider({ lens, runId: 'audit', shape: REVIEW_JUDGE_SHAPE, seatProvider: {
+      mode: 'agy', promoted, model: carbon, onEscape: 'claude', repo: 'o/r', pr: 7, head: 'a'.repeat(40), citationScope: scope,
+    } }, {
+      cwd: '.', unwrap: x => x, wrap: value => value,
+      claudeJudge: async () => { calls.push('claude'); if (claude instanceof Error) throw claude; return { value: claude }; },
+      agyJuror: async () => { calls.push('carbon'); return result; }, readTranscript: () => transcript,
+      readRoutingPolicy: () => policy, readSeatSettings: () => ({ tool: {}, platform: {} }),
+      appendPromotion: row => { rows.push(row); return append(row); }, reserveSession: () => ({ allowed: true }), log: () => {},
+    });
+    return { answer, rows, calls };
+  }
+  const fellBack = result => {
+    expect(result.answer.seatProvider.provider).toBe('claude');
+    expect(deriveVerdict(result.answer)).toBe('changes');
+    expect(result.calls.at(-1)).toBe('claude');
+  };
+  it.each([
+    { provider: 'claude', model: 'sonnet', mode: undefined },
+    { disabledProviders: ['agy-gemini'] },
+  ])('validated routing restrictions refuse correctness promotion: %j', patch => {
+    vi.stubEnv('WE_REVIEW_SHADOW_AGY_PROMOTED', 'true');
+    const settings = selection(policyWith(patch));
+    expect(seatProviderDirective(settings, 'correctness', highCarePr)?.mode).not.toBe('agy');
+  });
+  it('dispatch rechecks real disabledProviders rather than trusting synthetic enabledProviders', async () => {
+    const result = await attempt(good, { policy: policyWith({ disabledProviders: ['agy-gemini'] }) });
+    fellBack(result);
+    expect(result.calls).toEqual(['claude']);
+  });
+  it('invalid promotionReplaces refuses promotion and logs instead of falling through', () => {
+    vi.stubEnv('WE_REVIEW_SHADOW_AGY_PROMOTED', 'true');
+    vi.stubEnv('WE_REVIEW_SHADOW_AGY_PROMOTION_REPLACES', 'cluade');
+    const logs = [];
+    const settings = loadReviewSeatSettings({ policy: DEFAULT_ROUTING_POLICY, aiRouting: {}, log: m => logs.push(m) });
+    expect(seatProviderDirective(settings, 'correctness', highCarePr)?.mode).not.toBe('agy');
+    expect(logs.join(' ')).toMatch(/invalid.*promotion.*refus|promotion.*invalid.*refus/i);
+  });
+  it.each([
+    { ...good, transcriptFile: null, value: { summary: 'Review not performed: no diff evidence', findings: [] } },
+    { ...good, transcriptFile: null, value: { summary: 'Clean', findings: [] } },
+    ...[{ file: 42 }, { line: 0 }, { line: -1 }, { line: 1.5 }, { category: {} }].map(patch => ({ ...good, value: { summary: 'Reviewed', findings: [{ ...finding, ...patch }] } })),
+    ...[undefined, 'unknown', 'gemini-4-argon-high'].map(servedModel => ({ ...good, servedModel })),
+    { ...good, timedOut: true },
+    { ...good, telemetry: { timedOut: true } },
+  ])('invalid, abstaining, wrong-model or salvaged timeout Carbon answer never counts: %j', async result => {
+    const out = await attempt(result);
+    fellBack(out);
+    expect(out.rows[0]).toMatchObject({ fallback: true, agyVerdict: null });
+    if (result.timedOut || result.telemetry?.timedOut) expect(out.rows[0].timeout).toBe(true);
+  });
+  it('failed ledger write refuses to count a valid Carbon answer', async () => {
+    const result = await attempt(good, { append: () => false });
+    fellBack(result);
+    expect(result.answer.seatProvider.fellBackFrom.reasons.join(' ')).toMatch(/ledger/i);
+  });
+  it.each(['security', 'red-team'])('promotion does not authorize another non-shadow role: %s', async lens => {
+    const result = await attempt(good, { lens });
+    fellBack(result);
+    expect(result.calls).toEqual(['claude']);
+  });
+  it.each([
+    { ...good.value, outcome: 'fixed' },
+    { ...good.value, findings: [{ ...finding, outcome: 'fixed' }] },
+    { ...good.value, findings: [{ ...finding, preventionCaptured: 'false' }] },
+    { ...good.value, findings: [{ ...finding, introduced: 'false' }] },
+    { ...good.value, findings: [{ ...finding, verdict: 'ACCEPT' }] },
+    { ...good.value, findings: [{ ...finding, disposition: 'accept' }] },
+    { ...good.value, findings: [{ ...finding, citationScope: 'in-scope' }] },
+  ])('counted Carbon rejects properties and types outside the strict review schema: %j', async value => {
+    const result = await attempt({ ...good, value });
+    fellBack(result);
+    expect(result.rows[0]).toMatchObject({ fallback: true, agyVerdict: null });
+  });
+  it.each([{ scope: [] }, { scope: null }, { scope: ['elsewhere.mjs'] }])('citation admission refuses missing or out-of-scope evidence before Carbon counts: %j', async ({ scope }) => {
+    const result = await attempt(good, { scope });
+    fellBack(result);
+    expect(result.rows[0]).toMatchObject({ fallback: true, agyVerdict: null });
+  });
+  it('discarding even one out-of-scope Carbon finding requires the Claude seat', async () => {
+    fellBack(await attempt({ ...good, value: { ...good.value, findings: [finding, { ...finding, file: 'elsewhere.mjs' }] } }));
+  });
+  it.each([
+    { summary: 'could not inspect the diff' },
+    { summary: 'could not inspect the diff', file: finding.file },
+    { summary: 'could not inspect the diff', file: '', line: 1 },
+  ])('uncited counted placeholders cannot satisfy evidence admission: %j', async placeholder => {
+    fellBack(await attempt({ ...good, value: { summary: 'Reviewed', findings: [placeholder] } }));
+  });
+  const readTrace = (path, state = 'DONE', extra = {}) => [
+    { event: 'step_update', step_update: { step_index: 1, step_type: 'tool', tool_name: 'read_file', state, tool_info: { parameters: { AbsolutePath: path } }, ...extra } },
+    { event: 'result', result: { status: 'SUCCESS' } },
+  ].map(x => JSON.stringify(x)).join('\n');
+  it.each([
+    '',
+    readTrace('elsewhere.mjs'),
+    readTrace(finding.file, 'ACTIVE'),
+    readTrace(finding.file, 'DONE', { status: 'TOOL_ERROR' }),
+    [
+      { event: 'step_update', step_update: { step_index: 1, step_type: 'tool', tool_name: 'read_file', state: 'ACTIVE', tool_info: { parameters: { AbsolutePath: finding.file } } } },
+      { event: 'step_update', step_update: { step_index: 1, step_type: 'finish', state: 'DONE' } },
+      { event: 'result', result: { status: 'SUCCESS' } },
+    ].map(x => JSON.stringify(x)).join('\n'),
+  ])('a clean Carbon answer without a successful diff read still runs Claude: %j', async transcript => {
+    fellBack(await attempt({ ...good, transcriptFile: 'served.jsonl', value: { summary: 'Clean', findings: [] } }, { transcript }));
+  });
+  it('zero findings can count only with a served successful read_file of a diff path', async () => {
+    const result = await attempt({ ...good, transcriptFile: 'served.jsonl', value: { summary: 'Clean', findings: [] } }, { transcript: readTrace(finding.file), claude: claudeClean });
+    expect(result.calls).toEqual(['carbon', 'claude']);
+    expect(deriveVerdict(result.answer)).toBe('accept');
+    expect(result.answer.seatProvider.provider).toBe('claude');
+  });
+
+  it('schema-valid nonblocking placeholder with file and line but no reads falls back to Claude', async () => {
+    const result = await attempt({ ...good, value: { summary: 'Could not inspect the diff', findings: [{
+      summary: 'Could not inspect the file', file: finding.file, line: 1, disposition: 'nit',
+      impactIfUnfixed: 'cosmetic', introduced: false, worseThanBase: false,
+    }] } }, { transcript: '' });
+    fellBack(result);
+    expect(result.rows[0]).toMatchObject({ fallback: true, agyVerdict: null });
+  });
+  it('reading root config.json never satisfies scope containing only src/config.json', async () => {
+    fellBack(await attempt({ ...good, transcriptFile: 'served.jsonl', value: { summary: 'Clean', findings: [] } }, {
+      scope: ['src/config.json'], transcript: readTrace('config.json'),
+    }));
+  });
+  it('every cited finding file must have its own successful diff read', async () => {
+    fellBack(await attempt({ ...good, transcriptFile: 'served.jsonl', value: { ...good.value,
+      findings: [finding, { ...finding, file: 'scripts/second.mjs' }],
+    } }, { scope: [finding.file, 'scripts/second.mjs'], transcript: readTrace(finding.file) }));
+  });
+
+  it.each(['./src/config.json', '/lane/src/config.json', '/lane/src/../src/config.json', 'src\\config.json'])('exact repo-relative successful reads admit a counted answer: %s', async path => {
+    const result = await attempt({ ...good, value: { summary: 'Clean', findings: [] } }, {
+      scope: ['src/config.json'], transcript: readTrace(path), claude: claudeClean,
+    });
+    expect(result.calls).toEqual(['carbon', 'claude']);
+    expect(deriveVerdict(result.answer)).toBe('accept');
+  });
+  it.each(['/lane/config.json', '/other/src/config.json', 'src/../config.json'])('a normalized read outside the exact scoped path runs Claude: %s', async path => {
+    fellBack(await attempt({ ...good, value: { summary: 'Clean', findings: [] } }, {
+      scope: ['src/config.json'], transcript: readTrace(path),
+    }));
+  });
+
+  it('reads from a base-version checkout never authorize a Carbon accept for the reviewed head', async () => {
+    const result = await attempt({ ...good, checkoutHead: 'b'.repeat(40), value: { summary: 'Clean', findings: [] } });
+    fellBack(result);
+    expect(result.rows[0]).toMatchObject({ fallback: true, agyVerdict: null });
+  });
+  it('missing observed checkout HEAD never authorizes a counted Carbon answer', async () => {
+    fellBack(await attempt({ ...good, checkoutHead: undefined, value: { summary: 'Clean', findings: [] } }));
+  });
+  const twoFileReads = (partial = false) => [finding.file, 'scripts/second.mjs'].map((path, i) => ({
+    event: 'step_update', step_update: { step_index: i + 1, step_type: 'tool', tool_name: 'read_file', state: 'DONE',
+      tool_info: { parameters: { AbsolutePath: path, ...(partial ? { start_line: 1, end_line: 1 } : {}) } } },
+  })).concat({ event: 'result', result: { status: 'SUCCESS' } }).map(x => JSON.stringify(x)).join('\n');
+  it('two-file diff with one read of one line of one file requires Claude', async () => {
+    fellBack(await attempt({ ...good, checkoutHead: 'a'.repeat(40), value: { summary: 'Clean', findings: [] } }, {
+      scope: [finding.file, 'scripts/second.mjs'],
+      transcript: readTrace(finding.file, 'DONE', { tool_info: { parameters: { AbsolutePath: finding.file, start_line: 1, end_line: 1 } } }),
+    }));
+  });
+  it('a clean answer requires whole-file evidence for every changed file, not just one full read', async () => {
+    fellBack(await attempt({ ...good, checkoutHead: 'a'.repeat(40), value: { summary: 'Clean', findings: [] } }, {
+      scope: [finding.file, 'scripts/second.mjs'], transcript: readTrace(finding.file),
+    }));
+  });
+  it('single-line reads of every file still do not establish clean full-diff coverage', async () => {
+    fellBack(await attempt({ ...good, checkoutHead: 'a'.repeat(40), value: { summary: 'Clean', findings: [] } }, {
+      scope: [finding.file, 'scripts/second.mjs'], transcript: twoFileReads(true),
+    }));
+  });
+  it('whole-file reads of every changed file at the reviewed HEAD allow a clean Carbon answer', async () => {
+    const result = await attempt({ ...good, checkoutHead: 'a'.repeat(40), value: { summary: 'Clean', findings: [] } }, {
+      scope: [finding.file, 'scripts/second.mjs'], transcript: twoFileReads(), claude: claudeClean,
+    });
+    expect(result.calls).toEqual(['carbon', 'claude']);
+    expect(deriveVerdict(result.answer)).toBe('accept');
+  });
+
+  const carbonClean = { ...good, value: { summary: 'Carbon clean', findings: [] } };
+  const claudeClean = { summary: 'Claude inspected the diff and accepts', findings: [] };
+  it('Carbon accept alone never accepts without running the Claude correctness seat', async () => {
+    const result = await attempt(carbonClean);
+    expect(result.calls).toEqual(['carbon', 'claude']);
+    expect(deriveVerdict(result.answer)).toBe('changes');
+  });
+  it('nonblocking Carbon finding after one line of one file in a two-file diff still requires Claude', async () => {
+    const probe = { ...good, value: { summary: 'Carbon accepts', findings: [{ ...finding, disposition: 'nit', impactIfUnfixed: 'cosmetic', introduced: false, worseThanBase: false, parallelizable: true }] } };
+    expect(deriveVerdict(probe.value)).toBe('accept');
+    const result = await attempt(probe, {
+      scope: [finding.file, 'scripts/second.mjs'],
+      transcript: readTrace(finding.file, 'DONE', { tool_info: { parameters: { AbsolutePath: finding.file, start_line: 1, end_line: 1 } } }),
+    });
+    expect(result.calls).toEqual(['carbon', 'claude']);
+    expect(deriveVerdict(result.answer)).toBe('changes');
+  });
+  it('Carbon blocking findings are retained while Claude always runs', async () => {
+    const result = await attempt(good);
+    expect(result.calls).toEqual(['carbon', 'claude']);
+    expect(deriveVerdict(result.answer)).toBe('changes');
+    expect(result.answer.seatProvider.provider).toBe('claude');
+    expect(result.answer.carbonBlocking.findings).toEqual(good.value.findings);
+  });
+  it('Carbon accept plus Claude accept yields accept', async () => {
+    const result = await attempt(carbonClean, { claude: claudeClean });
+    expect(result.calls).toEqual(['carbon', 'claude']);
+    expect(deriveVerdict(result.answer)).toBe('accept');
+  });
+  it('Carbon accept plus Claude send-back yields send-back', async () => {
+    const result = await attempt(carbonClean, { claude: claudeAnswer });
+    expect(result.calls).toEqual(['carbon', 'claude']);
+    expect(deriveVerdict(result.answer)).toBe('changes');
+  });
+  it('Carbon accept never clears the lens when Claude fails to answer', async () => {
+    await expect(attempt(carbonClean, { claude: new Error('Claude unavailable') })).rejects.toThrow('Claude unavailable');
+  });
+
+  const guardedCarbon = { ...good, value: { summary: 'Carbon found a blocker', findings: [{ ...finding,
+    verdict: 'CONFIRMED', impactIfUnfixed: 'broken', introduced: true, worseThanBase: true, parallelizable: false,
+    rootCause: 'inverted guard', prevention: 'add regression coverage', preventionCaptured: false,
+  }] } };
+  const preventionCarbon = { ...good, value: { summary: 'Carbon owes prevention', findings: [{ ...finding,
+    disposition: 'carve-out', impactIfUnfixed: 'broken', introduced: false, worseThanBase: false, parallelizable: true,
+    prevention: 'add regression coverage', preventionCaptured: false,
+  }] } };
+  it.each([carbonClean, good, preventionCarbon, guardedCarbon])('every Carbon verdict still requires Claude and cannot override a Claude send-back: %j', async carbon => {
+    const result = await attempt(carbon, { claude: claudeAnswer });
+    expect(result.calls).toEqual(['carbon', 'claude']);
+    expect(result.answer.seatProvider.provider).toBe('claude');
+    expect(result.answer.findings).toEqual(claudeAnswer.findings);
+    expect(deriveVerdict(result.answer)).toBe('changes');
+  });
+  it.each([carbonClean, good, preventionCarbon, guardedCarbon])('no Carbon verdict can clear correctness when Claude fails: %j', async carbon => {
+    await expect(attempt(carbon, { claude: new Error('Claude unavailable') })).rejects.toThrow('Claude unavailable');
+  });
+  it('Carbon blocking findings survive Claude accept with their prevention fields intact', async () => {
+    const result = await attempt(guardedCarbon, { claude: claudeClean });
+    expect(result.calls).toEqual(['carbon', 'claude']);
+    expect(result.answer.findings).toEqual([]);
+    expect(result.answer.carbonBlocking.findings).toEqual(guardedCarbon.value.findings);
+    expect(result.answer.seatProvider.provider).toBe('claude');
+  });
+  it.each([carbonClean, preventionCarbon])('Carbon with no blocking finding contributes neither an accept nor a counted pass: %j', async carbon => {
+    expect(deriveVerdict(carbon.value)).toBe(carbon === preventionCarbon ? 'prevention-outstanding' : 'accept');
+    const result = await attempt(carbon, { claude: claudeClean });
+    expect(result.calls).toEqual(['carbon', 'claude']);
+    expect(result.answer.findings).toEqual([]);
+    expect(result.answer.carbonBlocking).toBeUndefined();
+    expect(result.answer.seatProvider.carbonAccept).toBeUndefined();
+  });
+
 });

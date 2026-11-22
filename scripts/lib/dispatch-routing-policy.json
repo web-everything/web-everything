@@ -100,9 +100,9 @@
     "prepare-card": {"provider": "codex","model": "sol","effort": {"claude": "medium","codex": "medium","antigravity": "medium","agy-claude": "medium","agy-gemini": "medium"},"fallback": [{"provider": "claude","model": "sonnet","effort": "medium"}]},
     "doc-fix": {"provider": "codex","model": "sol","effort": {"claude": "low","codex": "medium","antigravity": "medium","agy-claude": "medium","agy-gemini": "medium"},"fallback": [{"provider": "claude","model": "sonnet","effort": "low"}]},
     "review-seat:red-team": {"inherit": true,"effort": {"claude": "high","codex": "high","antigravity": "high","agy-claude": "high","agy-gemini": "high"}},
-    "review-seat:mandatory:correctness": {"provider": "agy-claude","model": "opus-5-5","mode": "shadow","effort": {"claude": "high","agy-claude": "high"},"fallback": [{"provider": "claude","model": "sonnet","effort": "high"}]},
-    "review-seat:mandatory:security": {"provider": "agy-claude","model": "opus-5-5","mode": "shadow","effort": {"claude": "high","agy-claude": "high"},"fallback": [{"provider": "claude","model": "sonnet","effort": "high"}]},
-    "review-seat:advisory:agy-correctness": {"provider": "agy-claude","model": "opus-5-5","effort": {"agy-claude": "high"},"fallback": []},
+    "review-seat:mandatory:correctness": {"provider": "agy-claude","model": "sonnet","mode": "shadow","effort": {"claude": "high","agy-claude": "high"},"fallback": [{"provider": "claude","model": "sonnet","effort": "high"}]},
+    "review-seat:mandatory:security": {"provider": "agy-claude","model": "sonnet","mode": "shadow","effort": {"claude": "high","agy-claude": "high"},"fallback": [{"provider": "claude","model": "sonnet","effort": "high"}]},
+    "review-seat:advisory:agy-correctness": {"provider": "agy-claude","model": "sonnet","effort": {"agy-claude": "high"},"fallback": []},
     "precedent-draft": {"provider": "claude","model": "haiku","effort": {"claude": "low"},"fallback": []}
   },
   "taskTypes": {

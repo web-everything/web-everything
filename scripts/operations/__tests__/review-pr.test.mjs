@@ -3002,7 +3002,7 @@ describe('#xqa9ttq — the opt-in Codex advisory seat (judgeAdvisory)', () => {
       expect(codexAdvisoryFromEnv({ [CODEX_ADVISORY_ENV_VAR]: '' }, { isOnProbation: () => true })).toBe(false);
     });
 
-    it('is true for the exact literal "1", regardless of probation status', () => {
+    it('explicit advisory opt-in cannot broaden a correctness-only Carbon promotion', () => {
       expect(codexAdvisoryFromEnv({ [CODEX_ADVISORY_ENV_VAR]: '1' }, { isOnProbation: () => false })).toBe(true);
     });
 
@@ -3308,7 +3308,7 @@ describe('#x8n4crp — the opt-in Codex correctness-advisory seat (judgeCorrectn
       expect(correctnessAdvisoryFromEnv({ [CORRECTNESS_ADVISORY_ENV_VAR]: '' }, { isOnProbation: () => true })).toBe(false);
     });
 
-    it('is true for the exact literal "1", regardless of probation status', () => {
+    it('explicit advisory opt-in cannot broaden a correctness-only Carbon promotion', () => {
       expect(correctnessAdvisoryFromEnv({ [CORRECTNESS_ADVISORY_ENV_VAR]: '1' }, { isOnProbation: () => false })).toBe(true);
     });
 
@@ -3542,18 +3542,18 @@ describe('#3383 — the opt-in Antigravity review seat (judgeAntigravityReview)'
       expect(antigravityReviewFromEnv({ [ANTIGRAVITY_REVIEW_ENV_VAR]: '' }, { isOnProbation: () => true })).toBe(false);
     });
 
-    it('is true for the exact literal "1", regardless of probation status', () => {
+    it('explicit advisory opt-in enables promoted Carbon without probation', () => {
       expect(antigravityReviewFromEnv({ [ANTIGRAVITY_REVIEW_ENV_VAR]: '1', WE_REVIEW_SHADOW_AGY_PROMOTED: 'true' }, { isOnProbation: () => false })).toBe(true);
     });
 
     // #3383 — the probation default, mirroring both Codex seats' own.
-    it('when the env var is UNSET, defaults to the injected probation check', () => {
-      expect(antigravityReviewFromEnv({ WE_REVIEW_SHADOW_AGY_PROMOTED: 'true' }, { isOnProbation: () => true })).toBe(true);
+    it('an explicit advisory probation policy enables promoted Carbon only on probation', () => {
+      expect(antigravityReviewFromEnv({ WE_REVIEW_SHADOW_AGY_PROMOTED: 'true' }, { isOnProbation: () => true, readFile: () => JSON.stringify({ advisorySeats: { antigravityReview: 'probation' } }) })).toBe(true);
       expect(antigravityReviewFromEnv({}, { isOnProbation: () => false })).toBe(false);
     });
 
-    it('when the env var is UNSET, uses the shipped probation setting', () => {
-      expect(antigravityReviewFromEnv({})).toBe(defaultAntigravityReviewProbationCheck());
+    it('when the env var is UNSET, uses the shipped advisory off setting', () => {
+      expect(antigravityReviewFromEnv({})).toBe(false);
     });
 
     it('the real default probation check reads the ANTIGRAVITY identity, and Carbon probation bookkeeping does not auto-seat it', () => {
@@ -4348,20 +4348,33 @@ describe('card 84 — review.seatProvider.<lens> and the advisory agy-correctnes
     expect(requests.judge.seatProvider).toBeUndefined();
   });
 
-  it('seats the advisory agy-correctness juror: agy-only, skip on escape, never in the verdict basis', () => {
-    const { declaration, registry } = registryFor({}, { seatSettings: AGY_SEAT_SETTINGS });
+  it.each(['claude-opus-5-5-high', 'gemini-4-carbon-high'])('seats advisory %s: agy-only, skip on escape, never in the verdict basis', model => {
+    const { declaration, registry } = registryFor({}, { seatSettings: { ...AGY_SEAT_SETTINGS, agyModel: model } });
     expect(declaration.steps.map((s) => s.name)).toContain('judgeAgyCorrectness');
     expect(ADVISORY_SEAT_STEPS).toContain('judgeAgyCorrectness');
     const { run, requests } = atConfirm({
       registry, input: BASE_INPUT, id: 'run-seat-agy-adv', answers: { judgeAgyCorrectness: BLOCKING_ANSWER },
     });
-    expect(requests.judgeAgyCorrectness.seatProvider).toMatchObject({ mode: 'agy', onEscape: 'skip', model: 'claude-opus-5-5-high' });
+    expect(requests.judgeAgyCorrectness.seatProvider).toMatchObject({ mode: 'agy', onEscape: 'skip', model });
     expect(requests.judgeAgyCorrectness.allowedTools).toBeUndefined();
     expect(requests.judgeAgyCorrectness.providerName).toBeUndefined();
     // A blocker from the advisory agy seat is published, labelled, and does NOT flip the panel.
     expect(run.findings.reduce.verdict).toBe('accept');
     expect(run.findings.reduce.lensVerdicts['agy-correctness']).toBe('changes');
     expect(run.findings.reduce.lensProviders['agy-correctness']).toBe('agy, advisory');
+  });
+
+  it.each([CLEAN_ANSWER, BLOCKING_ANSWER])('Carbon advisory cannot clear a Claude correctness blocker: %j', advisory => {
+    const { registry } = registryFor({}, { seatSettings: { ...AGY_SEAT_SETTINGS, agyModel: 'gemini-4-carbon-high' } });
+    const { run } = atConfirm({ registry, input: BASE_INPUT, answers: { judge: BLOCKING_ANSWER, judgeAgyCorrectness: advisory } });
+    expect(run.findings.reduce.lensVerdicts.correctness).toBe('changes');
+    expect(run.findings.reduce.verdict).toBe('changes');
+  });
+  it('Carbon advisory cannot supply a missing Claude correctness answer', () => {
+    const { registry } = registryFor({}, { seatSettings: { ...AGY_SEAT_SETTINGS, agyModel: 'gemini-4-carbon-high' } });
+    expect(() => atConfirm({ registry, input: BASE_INPUT, answers: {
+      judge: { summary: '', findings: [] }, judgeAgyCorrectness: CLEAN_ANSWER,
+    } })).toThrow(/no summary/);
   });
 
   describe('seatSettingsForRun — a resume reads the agy-correctness roster off the SAVED run, not the live settings', () => {
@@ -4949,8 +4962,8 @@ describe('Gemini admission and the Codex roster', () => {
 });
 
 describe('disabled agy shadows at the launch boundary', () => {
-  it('runs only Claude for mandatory seats and renders off (setting), without invoking the agy runner', async () => {
-    const seatSettings = loadReviewSeatSettings({ safeguards: { value: { shadowEnabled: false, sampleRate: 0.1, minNonClaudeSeats: 1 } }, log: () => {} });
+  it.each([undefined, false, true])('runs only Claude for mandatory seats and renders off (setting), without invoking the agy runner (promotion=%s)', async promoted => {
+    const seatSettings = loadReviewSeatSettings({ promoted: promoted === undefined ? undefined : { value: promoted, source: 'fixture' }, safeguards: { value: { shadowEnabled: false, sampleRate: 0.1, minNonClaudeSeats: 1 } }, log: () => {} });
     const declaration = buildReviewPrOperation({ readPr: stubReader(), seatSettings });
     const read = shapeReadFinding(stubReader()({ pr: 7, repo: 'o/n' }), { pr: 7, repo: 'o/n' });
     const seatRunner = vi.fn(() => { throw new Error('agy must not start'); });
@@ -5009,9 +5022,10 @@ describe('card-only light review', () => {
   });
 });
 
-it('Carbon pin and injected probation never auto-seat an unpromoted non-shadow reviewer', () => {
+it('correctness promotion does not auto-seat an additional Carbon advisory reviewer', () => {
   expect(antigravityReviewFromEnv({})).toBe(false);
-  expect(antigravityReviewFromEnv({ REVIEW_PR_ANTIGRAVITY_REVIEW: '1' }, { isOnProbation: () => true })).toBe(false);
+  // Explicit advisory opt-in still cannot bypass a refused correctness promotion.
+  expect(antigravityReviewFromEnv({ REVIEW_PR_ANTIGRAVITY_REVIEW: '1', WE_REVIEW_SHADOW_AGY_PROMOTED: 'false' }, { isOnProbation: () => true })).toBe(false);
 });
 
 describe('provider-unresponsive skips and required seat policy', () => {
@@ -5037,4 +5051,59 @@ describe('provider-unresponsive skips and required seat policy', () => {
   it('blocks on infra when skipped advisories leave minNonClaudeSeats unmet', () => {
     expect(() => reduce({}, { judgeAdvisory: skipped })).toThrow(/blocked-on-infra:.*0\/1/);
   });
+});
+
+
+describe('promoted Carbon is blocking-only; Claude owns the correctness verdict', () => {
+  const carbonFinding = { summary: 'Carbon observed an inverted guard', file: NET_PATHS[0], line: 12,
+    verdict: 'CONFIRMED', impactIfUnfixed: 'broken', introduced: true, worseThanBase: true, parallelizable: false,
+    rootCause: 'inverted guard', prevention: 'add regression coverage', preventionCaptured: false };
+  const judge = { ...CLEAN_ANSWER, seatProvider: { provider: 'claude' },
+    carbonBlocking: { provider: 'agy', model: 'gemini-4-carbon-high', findings: [carbonFinding] } };
+  it('Claude empty accept plus additional Carbon blocker is a send-back retaining its referral and prevention guard', () => {
+    const { registry } = registryFor({});
+    let run = advanceWhileRunning(startRun({ op: REVIEW_PR_OP, id: 'carbon-blocking', input: BASE_INPUT, registry }), { registry });
+    while (run.pending?.kind === 'judge') {
+      run = advanceWhileRunning(run, { registry, resume: { value: run.pending.step === 'judge' ? judge : CLEAN_ANSWER } });
+    }
+    const reduced = run.findings.reduce;
+    expect(runStatus(run, { registry })).toBe('awaiting-effect');
+    expect(reduced.lensVerdicts.correctness).toBe('accept');
+    expect(reduced.verdict).toBe('changes');
+    expect(reduced.referrals).toContainEqual(expect.objectContaining({ original: carbonFinding }));
+    expect(reduced.findings).toContainEqual(expect.objectContaining({ summary: carbonFinding.summary,
+      prevention: carbonFinding.prevention, preventionCaptured: false, rootCause: carbonFinding.rootCause }));
+  });
+  it('additional Carbon cannot supply the missing mandatory Claude correctness answer', () => {
+    const { registry } = registryFor({});
+    expect(() => atConfirm({ registry, input: BASE_INPUT, answers: { judge: { ...judge, summary: '' } } })).toThrow(/no summary/);
+  });
+  it.each(['accept', 'changes'])('covered Carbon referrals remain blocking and published with Claude %s', async claudeVerdict => {
+    const { findingIdentityEntry, exactClaimKey, classifyReferralsByRound } = await import('../../lib/jury-core.mjs');
+    const read = shapeReadFinding(stubReader({ netRev: PINNED_HEAD })({ pr: 7, repo: 'o/n' }), { pr: 7, repo: 'o/n' });
+    const head = read.netBasis.rev;
+    read.findingIdentity = [{ ...findingIdentityEntry(carbonFinding, 'carbon-1', { heads: [head] }),
+      activeHeads: [head], activeInstances: [{ head, claim: exactClaimKey(carbonFinding) }] }];
+    read.referralOpenHeads = [head];
+    expect(classifyReferralsByRound([{ seat: 'judge', original: carbonFinding }], { identity: read.findingIdentity, head, lens: 'correctness', openHeads: [head] }).covered).toHaveLength(1);
+    const declaration = buildReviewPrOperation({ readPr: stubReader(), codexAdvisory: true, minNonClaudeSeats: 1 });
+    const reduced = declaration.steps.find(s => s.name === 'reduce').step.fn({ input: { lens: 'correctness' }, findings: {
+      read, judge: { ...(claudeVerdict === 'accept' ? CLEAN_ANSWER : BLOCKING_ANSWER), carbonBlocking: judge.carbonBlocking }, judgeSecurity: CLEAN_ANSWER, judgeAdvisory: CLEAN_ANSWER,
+    } });
+    expect(reduced.lensVerdicts.correctness).toBe(claudeVerdict);
+    expect(reduced.verdict).toBe('changes');
+    expect(reduced.findings).toContainEqual(expect.objectContaining({ summary: carbonFinding.summary, prevention: carbonFinding.prevention }));
+  });
+
+  it('a Carbon blocker does not bypass the existing human gate', () => {
+    const read = shapeReadFinding(stubReader({ netRev: PINNED_HEAD })({ pr: 7, repo: 'o/n' }), { pr: 7, repo: 'o/n' });
+    const declaration = buildReviewPrOperation({ readPr: stubReader(), codexAdvisory: true, minNonClaudeSeats: 1 });
+    const reduced = declaration.steps.find(s => s.name === 'reduce').step.fn({ input: { lens: 'correctness' }, findings: {
+      read: { ...read, humanRequired: true }, judge, judgeSecurity: CLEAN_ANSWER, judgeAdvisory: CLEAN_ANSWER,
+    } });
+    expect(reduced.verdict).toBe('needs-human');
+    expect(reduced.findings).toContainEqual(expect.objectContaining({ summary: carbonFinding.summary }));
+    expect(reduced.lensVerdicts).not.toHaveProperty('carbon-correctness');
+  });
+
 });
