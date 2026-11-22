@@ -1,6 +1,6 @@
 import { execFileSync } from 'node:child_process';
 import { resolveBuilder } from '../lib/review-builder.mjs';
-import { independentReviewRequest, isIndependentReviewSeat } from '../lib/review-seat-independence.mjs';
+import { independentReviewRequest, isIndependentReviewSeat, INDEPENDENT_REVIEW_SEATS } from '../lib/review-seat-independence.mjs';
 import { carbonNonShadowAllowed } from '../lib/review-seat-settings.mjs';
 import { seatTiming, withSeatTiming } from './review-seat-timing-core.mjs';
 /**
@@ -756,6 +756,7 @@ function judgeTelemetryFrom(outcome, effective) {
     effectiveEffort: outcome.effort,
     effort: outcome.effort ?? effective.effort,
     model: outcome.servedModel ?? effective.model,
+    modelObserved: typeof outcome.servedModel === 'string' && Boolean(outcome.servedModel.trim()),
     ...pickAgyEvidence(outcome),
   };
 }
@@ -804,6 +805,7 @@ export function createDefaultJudge({
   provider, providerName: factoryProviderName, cwd: factoryCwd, model, operation = 'judge', resolveProvider = resolveJudgeProvider,
   checkProviderHold = defaultProviderQuotaHold,
   appendSeat = null,
+  readBuilderRecords,
   now = () => Date.now(),
   logGracefulOutcome = (line) => { try { process.stderr.write(`${line}\n`); } catch { /* best effort */ } },
   // Card 84 — the seat runner a `seatProvider` request goes to. Injectable so a test drives THIS wrapper (not the
@@ -968,7 +970,7 @@ export function createDefaultJudge({
       if (!headMessage && /^[0-9a-f]{40}$/i.test(context.head ?? '') && laneCwd) {
         try { headMessage = execFileSync('git', ['show', '-s', '--format=%B', context.head], { cwd: laneCwd, encoding: 'utf8', timeout: 5000, maxBuffer: 128 * 1024 }); } catch { /* unknown holds */ }
       }
-      const identity = resolveBuilder({ body: context.body, headMessage });
+      const identity = resolveBuilder({ ...context, headMessage }, { readRecords: readBuilderRecords });
       builder = identity.model !== 'unknown' ? identity.model : identity.provider;
       request = independentReviewRequest({ ...request, reviewBuilder: builder }, builder);
       if (['correctness', 'security'].includes(request.lens) && !request.seatProvider && !request.providerName && factoryProviderName && factoryProviderName !== 'claude') request = { ...request, providerName: 'claude' };
@@ -983,9 +985,10 @@ export function createDefaultJudge({
     };
     let result;
     try { result = await execute(); } catch (error) { await record(null, error); throw error; }
-    const observed = unwrapJudgeOutcome(result).telemetry?.model;
-    if (builder && observed && !isIndependentReviewSeat(request.lens, observed, builder)) {
-      const error = new Error('WAIT: observed reviewer model is not cross-vendor');
+    const telemetry = unwrapJudgeOutcome(result).telemetry;
+    const observed = telemetry?.modelObserved === false ? null : telemetry?.servedModel ?? telemetry?.model;
+    if (builder && INDEPENDENT_REVIEW_SEATS.includes(request.lens) && (!observed || !isIndependentReviewSeat(request.lens, observed, builder))) {
+      const error = new Error('WAIT: observed reviewer model missing or not cross-vendor');
       await record(null, error);
       throw error;
     }

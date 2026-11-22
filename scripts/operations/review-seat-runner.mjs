@@ -1,6 +1,7 @@
 import { readFileSync } from 'node:fs';
 import { scopeFindingsToCitedFiles, deriveVerdict } from '../lib/jury-core.mjs';
-import { carbonNonShadowAllowed } from '../lib/review-seat-settings.mjs';
+import { isIndependentReviewSeat } from '../lib/review-seat-independence.mjs';
+import { resolveShadowPromoted, resolveShadowPromotionReplaces, resolveReviewSeatSafeguards, carbonNonShadowAllowed } from '../lib/review-seat-settings.mjs';
 /**
  * review-seat-runner.mjs — RUN ONE REVIEW SEAT ON THE PROVIDER ITS SETTING NAMES (card 84, review half).
  *
@@ -63,6 +64,15 @@ export async function runSeatWithProvider(request, {
     let promotionControls;
     if (promoted) {
       try {
+        const promotion = resolveShadowPromoted({ log });
+        const replaces = resolveShadowPromotionReplaces({ log });
+        const safeguards = resolveReviewSeatSafeguards({ log });
+        if (promotion.value !== true || replaces.value !== 'claude' || safeguards.value.shadowEnabled !== true) {
+          return { status: 'failed', reasons: ['live Carbon promotion controls withdrawn'] };
+        }
+        if (!isIndependentReviewSeat(plain.lens, runModel, plain.reviewBuilder)) {
+          return { status: 'failed', reasons: ['live Carbon promotion lacks cross-vendor builder identity'] };
+        }
         const policy = readRoutingPolicy();
         if (!carbonPromotionRouteAllowed(policy)) throw new Error('routing restrictions refuse Carbon promotion');
         promotionControls = carbonPromotionRouteControls(policy);
@@ -206,7 +216,8 @@ export async function runSeatWithProvider(request, {
     return wrap(
       { ...agyRun.value, seatProvider: { provider: 'agy', model, sessionId: agyRun.sessionId } },
       { sessionId: agyRun.sessionId, wallMs: agyRun.wallMs, durationMs: agyRun.wallMs, costUsd: 0, usage: t.usage,
-        numTurns: t.numTurns, stopReason: t.stopReason, transcriptFile: agyRun.transcriptFile, model: agyRun.servedModel ?? model },
+        numTurns: t.numTurns, stopReason: t.stopReason, transcriptFile: agyRun.transcriptFile, model: agyRun.servedModel ?? model,
+        modelObserved: typeof agyRun.servedModel === 'string' && Boolean(agyRun.servedModel.trim()) },
     );
   }
   const why = agyRun.status === 'ok' ? ['agy juror reported no session id'] : (agyRun.reasons ?? []);

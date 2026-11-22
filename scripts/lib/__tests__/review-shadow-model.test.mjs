@@ -600,7 +600,7 @@ describe('one counted Carbon correctness seat', () => {
     if (agyRun === ok) agyRun = { ...ok, servedModel: carbon, checkoutHead: 'a'.repeat(40), checkoutRoot: '/lane', transcriptFile: 'served.jsonl' };
     const rows = [];
     const claudeJudge = vi.fn(async () => ({ value: claudeAnswer }));
-    const answer = await runSeatWithProvider({ lens: 'correctness', runId: 'promotion-test', shape: REVIEW_JUDGE_SHAPE,
+    const answer = await runSeatWithProvider({ lens: 'correctness', reviewBuilder: 'claude', runId: 'promotion-test', shape: REVIEW_JUDGE_SHAPE,
       seatProvider: { ...seatProviderDirective(settings(), 'correctness', highCarePr), repo: 'o/r', pr: 7, head: 'a'.repeat(40), citationScope: [finding.file] } }, {
       cwd: '.', claudeJudge, unwrap: x => x, wrap: value => value,
       agyJuror: async () => { if (agyRun instanceof Error) throw agyRun; return agyRun; }, readTranscript: () => servedReadTrace(finding.file),
@@ -721,7 +721,7 @@ describe('promotion verdict authorization audit', () => {
   async function attempt(result = good, { lens = 'correctness', promoted = true, policy = DEFAULT_ROUTING_POLICY, append = () => true, scope = [finding.file], transcript = servedReadTrace(finding.file), claude = claudeAnswer } = {}) {
     vi.stubEnv('WE_REVIEW_SHADOW_AGY_PROMOTED', 'true');
     const rows = [], calls = [];
-    const answer = await runSeatWithProvider({ lens, runId: 'audit', shape: REVIEW_JUDGE_SHAPE, seatProvider: {
+    const answer = await runSeatWithProvider({ lens, reviewBuilder: 'claude', runId: 'audit', shape: REVIEW_JUDGE_SHAPE, seatProvider: {
       mode: 'agy', promoted, model: carbon, onEscape: 'claude', repo: 'o/r', pr: 7, head: 'a'.repeat(40), citationScope: scope,
     } }, {
       cwd: '.', unwrap: x => x, wrap: value => value,

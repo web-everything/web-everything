@@ -1914,7 +1914,7 @@ export async function speculateRedTeam({
     let builderHeadMessage = '';
     // Vendor independence also applies when builder-based preference is switched off.
     try { builderHeadMessage = io.readHeadMessage(lanePath, rev) ?? ''; } catch { /* unknown builder keeps routing */ }
-    const builder = resolveBuilder({ body: read.body, headMessage: builderHeadMessage });
+    const builder = resolveBuilder({ repo: read.repo, pr: read.pr, head: rev, body: read.body, headMessage: builderHeadMessage });
     const codexBuilder = builder.provider === 'codex';
     const preferred = !routeByBuilder ? null : builder.provider === 'codex' ? 'agy-gemini'
       : ['claude', 'agy-claude'].includes(builder.provider) ? 'codex' : null;
@@ -2176,7 +2176,7 @@ export async function completeRedTeam({ pr, repo, loopPayload, pass, post = true
     const reason = ran ? null : (seatRow.reason || seatRow.error || `red-team seat ${seatRow.status}`);
     const confirmed = findings.filter((f) => f.confirmedByRecheck);
     const foldedVerdict = foldRedTeamVerdict({ ran, findings: confirmed });
-    const builder = resolveBuilder({ body: pass.body, headMessage: pass.headMessage ?? '' });
+    const builder = resolveBuilder({ repo, pr, head: rev, body: pass.body, headMessage: pass.headMessage ?? '' });
 
     const row = {
       ...seatRow,
