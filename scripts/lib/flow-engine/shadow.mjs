@@ -10,10 +10,12 @@ import { reserve, releaseLockDir } from '../../readiness/file-locks.mjs';
 import definition from './review-definition.mjs';
 import { load, plan, transitionRecord, appendTransition, canonicalJSON } from './index.mjs';
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '../../..');
-export function resolveFlowShadow(env = process.env, { tool } = {}) {
+export function resolveFlowShadow(env = process.env, { tool, readSetting = readFileSync } = {}) {
   if (tool === undefined) {
-    try { tool = JSON.parse(readFileSync(join(ROOT, 'scripts/settings/review-flow-shadow.json'), 'utf8'))?.reviewLoop?.flowShadow; }
-    catch { tool = undefined; }
+    try {
+      tool = JSON.parse(readSetting(join(ROOT, 'scripts/settings/review-flow-shadow.json'), 'utf8'))?.reviewLoop?.flowShadow;
+      if (typeof tool?.enabled !== 'boolean' || (tool.file != null && (typeof tool.file !== 'string' || !tool.file.trim()))) throw Error('invalid shadow setting');
+    } catch { tool = { enabled: false }; }
   }
   const r = cascadePolicy('reviewLoop.flowShadow', tool, {
     env, standard: { enabled: true, file: null },
@@ -48,7 +50,7 @@ export function comparePlans(left, right) {
 // No production decisions depend on this observer. Evidence and replay are read under
 // one cross-checkout log lock; contention skips rather than blocking the review tick.
 export async function shadowReviewStep({ repo, pr, classified, session, completionsDir = resolveCompletionsDir() }, {
-  env = process.env, tool, file, stat = lstatSync, open = openSync, read = readSync, close = closeSync,
+  env = process.env, tool, readSetting, file, stat = lstatSync, open = openSync, read = readSync, close = closeSync,
   engine = { load, plan, transitionRecord, appendTransition },
   executorCommit = () => env.WE_FLOW_V0_EXECUTOR_COMMIT || execFileSync('git', ['rev-parse', 'HEAD'], { cwd: ROOT, encoding: 'utf8', timeout: 2000, maxBuffer: 1024 }).trim(),
   now = () => new Date().toISOString(), log = message => console.error(message),
@@ -56,13 +58,13 @@ export async function shadowReviewStep({ repo, pr, classified, session, completi
   const note = message => { try { log(message.replace(/[\x00-\x1f\x7f]/g, ' ')); } catch { /* diagnostic only */ } };
   let lockRoot, locked = false;
   try {
-    const setting = resolveFlowShadow(env, { tool });
+    const setting = resolveFlowShadow(env, { tool, readSetting });
     note(`flow-v0 shadow settings ${JSON.stringify(setting)}`);
     if (!setting.enabled) return;
     const logPath = resolve(file ?? setting.file);
     const sessions = listCompletionSessions(completionsDir);
     const completion = session && tryReadCompletion(session, completionsDir);
-    if (!repo || !/^[^/#]+\/[^/#]+$/.test(repo) || !/^[1-9][0-9]*$/.test(String(pr)) || !completion || completion.role !== 'review' || completion.status !== 'done' || String(completion.pr) !== String(pr)) throw Error('required repo/PR/done review completion absent; skipped');
+    if (!repo || !/^[^/#]+\/[^/#]+$/.test(repo) || !/^[1-9][0-9]*$/.test(String(pr)) || !completion || !(completion.role === 'review' || (completion.role === undefined && completion.kind === 'review')) || completion.status !== 'done' || String(completion.pr) !== String(pr)) throw Error('required repo/PR/done review completion absent; skipped');
     const head = classified?.head, netDiff = classified?.netDiff;
     if (!/^[a-f0-9]{40}$/.test(head ?? '') || !/^[a-f0-9]{64}$/.test(netDiff ?? '')) throw Error('required classified head/netDiff absent or invalid; skipped (no hashes invented)');
     // Reject lexical paths, symlinks, and hard-link aliases before opening or locking.

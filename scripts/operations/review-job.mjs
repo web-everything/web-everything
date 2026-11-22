@@ -113,6 +113,7 @@ import {
 } from './review-job-store.mjs';
 import { assertMainNotStale, dispatchReview, isReviewCodePath, planReviewDispatch } from './review-dispatch.mjs';
 import { runReport } from './completion-cli.mjs';
+import { shadowReviewStep } from '../lib/flow-engine/shadow.mjs';
 import { writeReviewJobDone, writeReviewJobStarted } from './review-job-envelope.mjs';
 import { reviewSeatLaunchEnv } from '../lib/review-seat-caps.mjs';
 import { workerWrapperEnabledFor } from './worker-wrapper-launch.mjs';
@@ -608,15 +609,22 @@ export function createReviewJobIo({ root = REPO_ROOT, env = process.env, dir = r
     // 117 S3b — the job writes its record as the v2 envelope (launcher `node-job`): its own pid/timeout on `started`,
     // a schema-checked result + action on `done`, the v1 words unchanged. `WE_WORKER_WRAPPER=off` keeps the v1 report.
     report: (flags) => {
-      if (!workerWrapperEnabledFor('review', env)) return runReport(flags);
+      const classified = { outcome: flags.outcome, loopOutcome: flags.verdict ?? null, runId: flags.runId ?? null, label: flags.label ?? null,
+        ...(flags.head !== undefined ? { head: flags.head } : {}),
+        ...(flags.netDiff !== undefined ? { netDiff: flags.netDiff } : {}),
+        ...(flags.round !== undefined ? { round: flags.round } : {}),
+      };
+      if (!workerWrapperEnabledFor('review', env)) {
+        const result = runReport(flags);
+        // Observe only after the durable v1 result; shadow failures never affect the report.
+        if (flags.status === 'done') {
+          try { Promise.resolve(shadowReviewStep(structuredClone({ repo: flags.repo ?? null, pr: flags.pr ?? null, classified, session: flags.session }))).catch(() => {}); } catch { /* shadow never affects the tick */ }
+        }
+        return result;
+      }
       if (flags.status === 'started') return writeReviewJobStarted({ session: flags.session, pr: flags.pr, timeoutMs: flags.timeoutMs ?? null });
       return writeReviewJobDone({
-        session: flags.session, pr: flags.pr ?? null, repo: flags.repo ?? null,
-        classified: { outcome: flags.outcome, loopOutcome: flags.verdict ?? null, runId: flags.runId ?? null, label: flags.label ?? null,
-          ...(flags.head !== undefined ? { head: flags.head } : {}),
-          ...(flags.netDiff !== undefined ? { netDiff: flags.netDiff } : {}),
-          ...(flags.round !== undefined ? { round: flags.round } : {}),
-        },
+        session: flags.session, pr: flags.pr ?? null, repo: flags.repo ?? null, classified,
       });
     },
     claim: (slug, record) => {
