@@ -29,6 +29,7 @@ import { buildEntryBootScript } from '../daemon-boot-smoke.mjs';
 import { addOverlay, readOverlays, removeOverlay } from '../daemon-overlays.mjs';
 import { defaultPoolRoot } from '../lane-pool-paths.mjs';
 import { DISPATCH_CWD_ENV } from '../../operations/dispatch-lane-io.mjs';
+import * as rebuildPlan from '../daemon-rebuild/plan.mjs';
 
 // Pre-dates daemonRebuild.skipUnrelated: these tests assert a smoke runs for non-code moves, so pin the knob off.
 process.env.WE_DAEMON_REBUILD_SKIP_UNRELATED = '0';
@@ -513,6 +514,36 @@ describe('smoke-harness-broken (x5wbsbc)', () => {
     });
     expect(readRebuildState(cloneDir, env).held).toBeNull();
     expect(runSmoke).toHaveBeenCalledTimes(2);
+  });
+
+  it('strict set-aside adoption holds when candidate and last-good share a broken harness', async () => {
+    const { originDir, cloneDir, env } = makeFixture();
+    env.WE_DAEMON_HARNESS_BROKEN_ADOPT_NOT_WORSE = '1';
+    pushBranch(originDir, 'lane/harness-fix', dir => writeFile(dir, 'harness-fix.txt', 'fix\n'));
+    addOverlay(cloneDir, { ref: 'lane/harness-fix', pinned: true }, { env });
+    const prevHead = gitOk(cloneDir, ['rev-parse', 'HEAD']).trim();
+    const originalPlan = rebuildPlan.planRebuild;
+    const planner = vi.spyOn(rebuildPlan, 'planRebuild').mockImplementation(async options => {
+      const plan = await originalPlan(options);
+      plan.decisions.push({ ref: 'lane/omitted', action: 'skip', setAside: { eligible: true } });
+      return plan;
+    });
+    const runSmoke = vi.fn(async () => ({
+      verdict: 'code', attempts: 1,
+      smoke: { results: [{ ok: false, name: 'reconcile-dry-run', detail: 'shared cross-org auth failure' }] },
+    }));
+    try {
+      const result = await rebuildClone({
+        root: cloneDir, env, runSmoke, prState: async () => null, lockOpts: LOCK_OPTS,
+      });
+      expect(runSmoke).toHaveBeenCalledTimes(2); // A + C: the pinned overlay prevents B.
+      expect(result.reason).not.toBe('harness-broken-adopted-not-worse');
+      expect(result.reason).toBe('smoke-harness-broken');
+      expect(result.adopted).not.toBe(true);
+      expect(result.moved).toBe(false);
+      expect(gitOk(cloneDir, ['rev-parse', 'HEAD']).trim()).toBe(prevHead);
+      expect(readRebuildState(cloneDir, env).held?.reason).toBe('smoke-harness-broken');
+    } finally { planner.mockRestore(); }
   });
 
   it('rejects a candidate failing x and y when the last-good control fails only x', async () => {

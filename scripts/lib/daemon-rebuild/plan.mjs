@@ -42,6 +42,14 @@ export const PINNED_OVERLAY_GONE_MESSAGE = 'pinned overlay is gone (ref deleted 
  * only makes the rebuild wait for a rebase; a wrong "not pinned" can destroy the mechanism.
  * @returns {{pinned:boolean, why:'flag'|'mechanism'|'unknown'|null}}
  */
+/** PURE: strictAdopt — any omission (set-aside, dropped overlay, or a tip held for an omitted base) puts the build in
+ *  STRICT mode: full fresh smoke (no incremental/cached checks, no skip-unrelated), no adopt-over-failed-smoke
+ *  fallback, and no first-adoption exemption (stack bases are audit-checked before being skipped). */
+export function planStrictAdopt(plan) {
+  return Array.isArray(plan?.decisions)
+    && plan.decisions.some((d) => d?.setAside || d?.action === 'drop' || d?.reason === 'unaudited-tip-held');
+}
+
 export function pinnedStatus(git, raw, mainSha, ovSha) {
   if (raw?.pinned === true) return { pinned: true, why: 'flag' };
   if (!ovSha) return { pinned: false, why: null };
@@ -631,11 +639,31 @@ export async function planRebuild({
     return keep ? recordHold(ref, pr, keep, null) : false;
   };
 
+  // strictAdopt: a stack top that contains an omitted (set-aside) base carries that base's unaudited tip under its own
+  // first-adoption exemption. The base is skipped as stack-contained BEFORE the omission audit check, so check it here
+  // and hold every containing top until the base has audit evidence.
+  const heldByOmittedBase = new Map();
+  if (typeof auditedTip === 'function') {
+    for (const [baseRef, aside] of stacks.setAside) {
+      if (!(((setAside === null && !carriedRefs.has(baseRef)) || setAside?.[baseRef]))) continue;
+      const baseSha = aside.sha;
+      if (!baseSha || tipInMain(git, mainSha, baseSha) || auditedTip(baseRef, baseSha)) continue;
+      for (const t of aside.tops ?? []) heldByOmittedBase.set(t.ref, { base: baseRef, sha: baseSha });
+    }
+  }
+
   for (let index = 0; index < toProcess.length; index++) {
     if (holdFailure) return holdRefusal();
     const raw = toProcess[index];
     const ref = raw?.ref;
     const pr = raw?.pr ?? null;
+    if (heldByOmittedBase.has(ref)) {
+      const held = heldByOmittedBase.get(ref);
+      decisions.push({ ref, pr, action: 'skip', reason: 'unaudited-tip-held', sha: raw?.sha ?? null });
+      alerts.push({ kind: 'overlay-unaudited-tip', detail: { ref, pr, newTip: held.sha,
+        message: `overlay ${ref} held: it contains set-aside ${held.base} whose tip ${String(held.sha).slice(0, 10)} needs a fix-ready + audit record (unaudited-tip)` } });
+      continue;
+    }
 
     // 1. PR state — MERGED/CLOSED means the overlay is moot; never call prState for a PR-less overlay.
     const state = await stateOf(pr);

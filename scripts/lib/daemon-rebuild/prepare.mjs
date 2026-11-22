@@ -32,7 +32,7 @@ import {
   readOverlayState, overlayFilePath, removeOverlay, appendOverlayEvent, makePrBaseChain, resolveOverlayStackMode, persistStackBases,
 } from '../daemon-overlays.mjs';
 import { fetchMainAndOverlays, recordedEdgeSha } from './edge-fetch.mjs';
-import { planRebuild } from './plan.mjs';
+import { planRebuild, planStrictAdopt } from './plan.mjs';
 import { readMainSyncConflicts } from './overlay-main-sync.mjs';
 import { readPendingDrops } from '../overlay-drop-pending.mjs';
 import { detectOverlayStale } from './overlay-prune.mjs';
@@ -850,7 +850,7 @@ export async function prepareRebuild({
   const headTree = busyTrees.length ? verifyRev(git, `${prevHead}^{tree}`) : null;
   const busyUnverified = busyTrees.length > 0 && (!headTree || busyTrees.includes(headTree));
   // An omission (set-aside or dropped overlay) changes what runs: it always gets the full candidate smoke.
-  const hasOmission = Array.isArray(plan.decisions) && plan.decisions.some((d) => d?.setAside || d?.action === 'drop');
+  const hasOmission = planStrictAdopt(plan);
   if (typeof skipCheck === 'function' && !hasOmission && state.adopted?.head === prevHead && !state.held && !state.quarantine
     && !busyUnverified && !buildLeaseIsLive(state.building, { env: stEnv, nowMs: nowMs() })) {
     // --no-renames: a renamed file must list BOTH endpoints, or a renamed-away imported module hides from the closure.

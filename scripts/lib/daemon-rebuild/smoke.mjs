@@ -22,7 +22,7 @@ import { dirname, join, posix } from 'node:path';
 import { makeGit, verifyRev, OVERLAY_EDGE_RESOLVE_ENV } from './shared.mjs';
 import { candidateSmokeEnv, materializeCandidate, removeCandidate } from './candidate.mjs';
 import { hostname } from 'node:os';
-import { pinnedStatus, planRebuild } from './plan.mjs';
+import { pinnedStatus, planRebuild, planStrictAdopt } from './plan.mjs';
 import { makeAuditedTipGate } from './audited-tip.mjs';
 import { runBounded } from '../bounded-child.mjs';
 import { SMOKE_CHECKS, SMOKE_BUDGET_ENV, resolveSmokeBudgets, isDispatchDryRunScript } from '../daemon-live-smoke.mjs';
@@ -476,10 +476,10 @@ export async function smokeAndAdopt({
   const smokeSha = async (sha, changedFiles, label, suspects = [], { failFast = [] } = {}) => {
     // Recovery uses only evidence collected in this run, never historical passing trees.
     const freshComparison = label != null;
-    if (freshComparison) changedFiles = null;
+    if (freshComparison || planStrictAdopt(plan)) changedFiles = null; // strictAdopt: full fresh smoke, no incremental checks
     const identity = smokePassIdentity(git, sha, cloneKind);
     const passes = readRebuildState(root, stEnv).smokePassed;
-    const proven = !freshComparison && reuse.reuseEnabled && identity && Array.isArray(passes) && passes.find(entry => {
+    const proven = !freshComparison && !planStrictAdopt(plan) && reuse.reuseEnabled && identity && Array.isArray(passes) && passes.find(entry => {
       const age = now() - Date.parse(entry?.passedAt);
       return entry?.key === identity.key && age >= 0 && age < reuse.reuseHours * 3_600_000;
     });
@@ -995,7 +995,7 @@ export async function smokeAndAdopt({
   const cFailed = c.smokeResult ? failedRows(c.smokeResult) : null;
   const harnessBroken = !!(cFailed && failsSameChecks(failedA, cFailed));
   if (harnessBroken) {
-    if (!c.reused && env[HARNESS_BROKEN_ADOPT_NOT_WORSE_ENV] !== '0') {
+    if (!c.reused && env[HARNESS_BROKEN_ADOPT_NOT_WORSE_ENV] !== '0' && !planStrictAdopt(plan)) { // strictAdopt: never adopt over a failed smoke
       // xhiqxz3 — "no worse" on the ordinary smoke says nothing about the worker launch: prove that first.
       if (aSuspects.length) {
         const d = await dispatchOnly(plan.finalSha, aSuspects);
