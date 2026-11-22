@@ -50,9 +50,14 @@ export function observeCapacity({ env = process.env, now = Date.now(), settings 
   const root = join(env.HOME || homedir(), '.plateau');
   records ??= readersOff ? [] : jsonFile(join(daemonConveyorStateRoot(env), '.conveyor', 'run-scorecards.json'))?.records ?? [];
   const configured = {}, signedOutReaders = {};
-  const usageFile = spec => !readersOff && spec?.type === 'plateau-usage-file'
-    && typeof spec.file === 'string' && !isAbsolute(spec.file) && !spec.file.split(/[\\/]/).includes('..')
-    ? jsonFile(join(root, spec.file)) : null;
+  const observations = new Map(); // One coherent snapshot per capacity read, shared by accounts, aliases and status readers.
+  const usageFile = spec => {
+    if (readersOff || spec?.type !== 'plateau-usage-file' || typeof spec.file !== 'string'
+      || isAbsolute(spec.file) || spec.file.split(/[\\/]/).includes('..')) return null;
+    const key = JSON.stringify([spec.type, spec.file]);
+    if (!observations.has(key)) observations.set(key, jsonFile(join(root, spec.file)));
+    return observations.get(key);
+  };
   for (const p of settings.providers ?? PROVIDER_DEFAULTS.providers) for (const account of p.accounts ?? [{ id: p.id }]) {
     const specs = account.readers ?? p.readers;
     signedOutReaders[account.id] = () => {
@@ -61,9 +66,16 @@ export function observeCapacity({ env = process.env, now = Date.now(), settings 
     };
     configured[account.id] = () => {
       for (const spec of specs ?? []) {
+        const key = JSON.stringify([spec.type, spec.file]);
+        if (observations.has(key)) {
+          const raw = observations.get(key);
+          if (raw) return raw;
+          continue;
+        }
         let raw;
         if (spec.type === 'codex-rollout') raw = quota(env);
         else raw = usageFile(spec);
+        observations.set(key, raw);
         if (raw) return raw;
       }
       return null;

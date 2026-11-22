@@ -9,7 +9,7 @@ export const CAPACITY_DEFAULTS = {
   aheadPenalty: 0.7, behindBoost: 1.2, burnWindowHours: 24, burnUnusedPercent: 40,
   longKinds: [], resetAtPercent: 95, maxBurnBoost: 3,
   workingHours: { start: '09:00', end: '20:00', tz: 'America/New_York', days: [1, 2, 3, 4, 5] },
-  claudeUsageAccount: null, expectedDemandPerDay: null, activateAfterShortfallDays: 3,
+  claudeUsageAccount: null, claudeAccountMap: {}, expectedDemandPerDay: null, activateAfterShortfallDays: 3,
   criticalKinds: ['critical', 'security', 'audit', 'audit-full'], allowUnknownEmergency: false,
 };
 const HOUR = 3600000;
@@ -17,6 +17,13 @@ const lengths = { five_hour: 5, seven_day: 168, daily: 24, weekly: 168 };
 const windowKey = name => name === 'seven_day' ? 'weekly' : name;
 const epoch = v => typeof v === 'number' ? (v < 1e12 ? v * 1000 : v) : Date.parse(v);
 const options = s => ({ ...CAPACITY_DEFAULTS, ...(s?.routing?.capacity ?? s ?? {}) });
+/** Live evidence needs an age; only actively appended Codex rollouts allow read-time skew. */
+export function liveReadingTimestampValid(raw, now, { codexRollout = false, staleHours = CAPACITY_DEFAULTS.staleHours } = {}) {
+  const at = epoch(raw?.at ?? raw?.asOf ?? raw?.mtime);
+  return Number.isFinite(at) && at <= now + (codexRollout ? 60000 : 0)
+    && now - at <= Math.min(24, staleHours) * HOUR;
+}
+
 export const bindingWindow = cap => cap.windows.filter(w => Number.isFinite(w.usedPercent))
   .reduce((a, b) => !a || b.usedPercent > a.usedPercent ? b : a, null);
 
@@ -43,18 +50,24 @@ export function readProviderCapacity({ env = {}, now = Date.now(), readers = {},
       const def = { ...owner, ...entry, ...account };
       let raw, windows = [];
       try { raw = readers[account.id]?.(env) ?? readers[owner.id]?.(env); } catch { /* unknown */ }
-      // The shared Claude file cannot identify an account. Never attribute it to both accounts.
-      if (owner.id === 'claude' && owner.accounts && s.claudeUsageAccount !== account.id) raw = null;
+      // An explicit file identity must be mapped. The legacy setting covers identity-less files only.
+      const usageAccount = owner.id === 'claude' && owner.accounts
+        ? raw?.account == null ? s.claudeUsageAccount
+          : typeof raw.account === 'string' && Object.hasOwn(s.claudeAccountMap ?? {}, raw.account) ? s.claudeAccountMap[raw.account] : null
+        : null;
+      const usageIdentityRejected = owner.id === 'claude' && Boolean(owner.accounts) && raw?.account != null
+        && !owner.accounts.some(a => a.id === usageAccount);
+      if (owner.id === 'claude' && owner.accounts && usageAccount !== account.id) raw = null;
       const at = epoch(raw?.at ?? raw?.asOf ?? raw?.mtime);
       const seed = env.WE_CAPACITY_READERS === 'off' ? undefined : def.operatorReading, seedAt = epoch(seed?.asOf);
-      const operatorReadingStale = Boolean(seed) && (!Number.isFinite(seedAt) || seedAt > now || now - seedAt > s.operatorReadingMaxAgeHours * HOUR);
-      const timestampMissing = raw?.at == null && raw?.asOf == null && raw?.mtime == null;
-      const liveUsable = Number.isFinite(at) ? at <= now && now - at <= s.staleHours * HOUR
-        : timestampMissing && Boolean(raw) && owner.readers?.some(r => r.type === 'codex-rollout');
+      const operatorReadingStale = Boolean(seed) && (!Number.isFinite(seedAt) || seedAt > now || now - seedAt > Math.min(24, s.operatorReadingMaxAgeHours) * HOUR);
+      const liveStale = Number.isFinite(at) && now - at > Math.min(24, s.staleHours) * HOUR;
+      const liveUsable = liveReadingTimestampValid(raw, now, { staleHours: s.staleHours,
+        codexRollout: (account.readers ?? owner.readers)?.some(r => r.type === 'codex-rollout') });
       let status;
       try { status = readers.signedOut?.(account.id, env); } catch { /* unknown status */ }
-      const freshSignedOut = value => value?.status === 'signed-out' && Number.isFinite(epoch(value.at))
-        && epoch(value.at) <= now && now - epoch(value.at) <= s.staleHours * HOUR;
+      // Signed-out status is a plain timestamped observation: no future skew, same expiry as live readings.
+      const freshSignedOut = value => value?.status === 'signed-out' && liveReadingTimestampValid(value, now, { staleHours: s.staleHours });
       const signedOut = freshSignedOut(raw) || freshSignedOut(status);
       const add = (name, w, source = 'live') => {
         const usedPercent = w?.usedPercent ?? w?.used_percent ?? w?.used_percentage;
@@ -91,7 +104,9 @@ export function readProviderCapacity({ env = {}, now = Date.now(), readers = {},
       let held = false;
       try { held = Boolean(readers.hold?.(owner.id, now)); } catch { held = true; }
       return { ...def, provider: entry.id, account: account.id, configuredWindows: def.windows, windows, held, health: held || signedOut ? 0 : 1,
-        ...(signedOut ? { signedOut: true } : {}), operatorReadingStale, known: windows.some(w => Number.isFinite(w.usedPercent)), now };
+        ...(signedOut ? { signedOut: true } : {}), usageAccount: raw ? usageAccount : null, usageIdentityRejected,
+        stale: !windows.some(w => Number.isFinite(w.usedPercent)) && (liveStale || operatorReadingStale),
+        operatorReadingStale, known: windows.some(w => Number.isFinite(w.usedPercent)), now };
     });
   });
 }
@@ -105,7 +120,9 @@ export function launcherCapacity(capacities, settings = {}) {
     const def = providers.find(p => p.id === provider);
     const owner = providers.find(p => p.id === def?.quotaOf) ?? def;
     if ((owner?.accounts?.length ?? new Set(observations.map(c => c.account)).size) <= 1) return observations;
-    const attributed = owner?.id === 'claude' || provider === 'claude' ? settings.claudeUsageAccount : null;
+    const attributed = owner?.id === 'claude' || provider === 'claude'
+      ? observations.find(c => c.usageAccount === c.account)?.account
+        ?? (observations.some(c => c.usageIdentityRejected) ? null : settings.claudeUsageAccount) : null;
     const live = attributed && observations.find(c => c.account === attributed);
     return live ? [live] : [{ ...observations[0], account: null, windows: [], known: false,
       held: observations.some(c => c.held) }];
