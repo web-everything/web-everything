@@ -54,7 +54,7 @@ import { evictSnapshots } from '../lib/daemon-job-snapshots.mjs';
 import { TERMINAL_JOB_STATUSES, formatJobHandle, parseJobHandle } from '../operations/job-record.mjs';
 import { daemonJobsDir, deleteRun } from '../operations/run-store.mjs';
 import { cloneNodeModulesInstaller } from '../lib/daemon-rebuild/rebuild-job.mjs';
-import { laneNeedsVerifyDispatch, runLaneGate, readLaneState, gateCeilings, resolveGateCeiling, killOrphanGroup } from './verify-dispatch.mjs';
+import { laneNeedsVerifyDispatch, runLaneGate, readLaneState, requeueGateCeiling, gateCeilings, resolveGateCeiling, killOrphanGroup } from './verify-dispatch.mjs';
 
 const SELF = fileURLToPath(import.meta.url);
 const CLONE_ROOT = resolve(dirname(SELF), '..', '..');
@@ -496,6 +496,7 @@ export function createVerifyGateJobs({
     return {
       pool: input.pool, lane: input.lane, dir: input.dir, runId: input.runId, sha: input.headSha,
       suites: input.suites ?? null, treeHash: input.treeHash ?? null, requestStartedAt: input.requestStartedAt ?? null,
+      local: input.local === true,
       jobId: r.id, pid, startedMs: prev?.startedMs ?? queuedMs(r, now), keptFor: prev?.keptFor,
       ...(heldBy ? { heldBy } : {}),
     };
@@ -507,10 +508,15 @@ export function createVerifyGateJobs({
     dir: store.dir,
     /** The dispatch sweep's `launchGate`: queue one gate job (launched by the next {@link sync}). */
     launch({ pool, lane, dir, headSha, marker, runId }) {
+      if (marker?.requeue) {
+        const existing = store.list().records.find(r => r.input?.dir === dir && r.input?.headSha === headSha
+          && r.input?.requeue?.afterJob === marker.requeue.afterJob);
+        if (existing) return existing;
+      }
       return enqueueJob({
         store, kindDef: VERIFY_GATE_JOB_KIND, codeSha: readHead(), now: now(),
         input: { pool, lane, dir, headSha, runId, suites: marker?.suites ?? null, treeHash: marker?.treeHash ?? null,
-          requestStartedAt: marker?.startedAt ?? null },
+          requeue: marker?.requeue, gateUncapped: marker?.gateUncapped === true, local: marker?.local === true, requestStartedAt: marker?.startedAt ?? null },
       });
     },
     /**
@@ -604,6 +610,13 @@ export function createVerifyGateJobs({
           else if (res.outcome === 'failed') failure = { pool: input.pool, lane: input.lane, sha: input.headSha };
         }
         settled.push({ id: r.id, ...input, outcome: res?.outcome ?? r.job.status });
+        if (res?.timedOutPhase === 'gate' && requeueGateCeiling({ dir: input.dir, headSha: input.headSha,
+          afterJob: r.id, runId: input.runId, requestStartedAt: input.requestStartedAt,
+          timedOutPhase: res.timedOutPhase, ceilingMs: res.gateCeilingMs ?? resolveGateCeiling().ms,
+          enqueue: marker => this.launch({ ...input, marker, runId: randomUUID() }) })) {
+          log(`verify-daemon: requeued ${r.id} with capped-fallback gate`);
+          failure = null;
+        }
         if (failure) { try { onSettled(failure); } catch {} }
       }
       // The lane claims have the last word: a lane whose claim is not provably released stays held even when no record

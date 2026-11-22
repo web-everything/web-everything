@@ -3,16 +3,21 @@ import { mkdtempSync, readFileSync, rmSync, mkdirSync, writeFileSync, utimesSync
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { execFileSync } from 'node:child_process';
-import { appendCodexUsage, codexUsageLedgerPath, codexRunTokens, readCodexQuota, withCodexUsage } from '../codex-usage-ledger.mjs';
+import { appendCodexUsage, readCodexBurnRate, codexUsageLedgerPath, codexRunTokens, readCodexQuota, withCodexUsage } from '../codex-usage-ledger.mjs';
 import { aggregateCodexUsage, readCodexUsageReport, parseSince, formatCodexUsageReport } from '../../codex-usage-report.mjs';
 import * as procRead from '../proc-read.mjs';
 import * as fs from 'node:fs';
+import { recentCapacityRates } from '../provider-capacity-io.mjs';
 
-// Native ESM namespace exports are non-configurable. Keep real filesystem behavior
-// behind a mock module so spies also observe the ledger's named fs imports.
-vi.mock('node:fs', async importOriginal => ({ ...await importOriginal() }));
+// Install wrappers before the ledger captures named imports. Replacing namespace
+// properties with spyOn later does not replace those captured function references.
+vi.mock('node:fs', async importOriginal => {
+  const actual = await importOriginal();
+  return { ...actual, openSync: vi.fn(actual.openSync), readSync: vi.fn(actual.readSync),
+    readFileSync: vi.fn(actual.readFileSync) };
+});
 
-afterEach(() => vi.restoreAllMocks());
+afterEach(() => { vi.restoreAllMocks(); vi.clearAllMocks(); });
 
 // Exercise the real snapshot and filesystem without writing a Git directory.
 function snapshotGit(state = {}) {
@@ -28,6 +33,78 @@ function snapshotGit(state = {}) {
 
 const fixture = (fn) => { const root = mkdtempSync(join(tmpdir(), 'codex-ledger-')); return Promise.resolve().then(() => fn(root)).finally(() => rmSync(root, { recursive: true, force: true })); };
 const stdout = `${JSON.stringify({ type: 'turn.completed', usage: { input_tokens: 100, cached_input_tokens: 60, output_tokens: 20, reasoning_output_tokens: 10 } })}\n`;
+
+// Behavioural bound: evidence outside the final 256 KiB of a large rollout is never read; evidence inside is.
+it.each([128, 9 * 1024 * 1024])('Codex rollout reader sees only the final 256 KiB of a rollout (size=%s)', size => fixture(root => {
+  mkdirSync(join(root, 'sessions'));
+  const path = join(root, 'sessions', 'rollout.jsonl');
+  const event = JSON.stringify(quotaEvent('2026-11-19T12:00:00Z'));
+  writeFileSync(path, `${event}\n`);
+  truncateSync(path, size);
+  const head = readCodexQuota({ CODEX_HOME: root });
+  expect(head).toBeNull(); // zero padding (or truncation) hides the head event
+  fs.appendFileSync(path, `\n${event}\n`);
+  expect(readCodexQuota({ CODEX_HOME: root })?.used_percent).toBe(100);
+}));
+
+const quotaEvent = (timestamp, primary = {}, secondary) => ({ timestamp, type: 'event_msg', payload: {
+  type: 'token_count', rate_limits: { limit_id: 'codex', primary: {
+    used_percent: 100, resets_at: 2000000000, window_minutes: 300, ...primary,
+  }, ...(secondary ? { secondary } : {}) },
+} });
+
+it('Codex quota returns only validated window fields, so camel-case extras cannot hide exhaustion', () => fixture(root => {
+  mkdirSync(join(root, 'sessions'));
+  const at = '2026-11-19T12:00:00Z';
+  const secondary = { used_percent: 40, resets_at: 2000000000, window_minutes: 10080 };
+  writeFileSync(join(root, 'sessions', 'rollout.jsonl'), JSON.stringify(quotaEvent(at,
+    { usedPercent: 0, resetsAt: 1, extra: true }, { ...secondary, usedPercent: 0 })));
+  const quota = readCodexQuota({ CODEX_HOME: root });
+  expect(quota).toEqual({ used_percent: 100, resets_at: 2000000000, window_minutes: 300,
+    secondary, at, mtime: fs.statSync(join(root, 'sessions', 'rollout.jsonl')).mtimeMs });
+}));
+
+it.each([undefined, 'invalid'])('Codex skips undated history (%s), but rejects malformed newest dated evidence', timestamp => fixture(root => {
+  mkdirSync(join(root, 'sessions'));
+  const path = join(root, 'sessions', 'rollout.jsonl');
+  const valid = quotaEvent('2026-11-19T12:00:00Z');
+  writeFileSync(path, [quotaEvent(timestamp), valid, quotaEvent(timestamp)].map(JSON.stringify).join('\n'));
+  expect(readCodexQuota({ CODEX_HOME: root })?.used_percent).toBe(100);
+  writeFileSync(path, [valid, quotaEvent('2026-11-19T12:01:00Z', { used_percent: 'bad' })].map(JSON.stringify).join('\n'));
+  expect(readCodexQuota({ CODEX_HOME: root })).toBeNull();
+}));
+
+it('Codex reads only the eight newest rollout files by mtime, then orders their events by timestamp', () => fixture(async root => {
+  mkdirSync(join(root, 'sessions'));
+  const paths = Array.from({ length: 10 }, (_, i) => {
+    const path = join(root, 'sessions', `${i}.jsonl`);
+    // Excluded old files have newer events; among eligible files the oldest mtime wins.
+    const timestamp = new Date(Date.parse('2026-11-19T12:00:00Z') - i * 1000).toISOString();
+    writeFileSync(path, JSON.stringify(quotaEvent(timestamp, { used_percent: i })));
+    utimesSync(path, 1000 + i, 1000 + i);
+    return path;
+  });
+  // Files 0 and 1 are the two oldest by mtime and carry the newest events; they must be ignored.
+  expect(paths).toHaveLength(10);
+  expect(readCodexQuota({ CODEX_HOME: root })?.used_percent).toBe(2);
+}));
+
+it('ledger readers enforce their 8 MiB and 256 KiB tail byte limits and offsets', () => fixture(root => {
+  const path = join(root, 'large-ledger.jsonl');
+  writeFileSync(path, '');
+  const size = 9 * 1024 * 1024;
+  truncateSync(path, size);
+  const read = vi.fn((...args) => fs.readSync(...args));
+  const now = Date.parse('2026-11-20T15:00:00Z');
+  readCodexBurnRate({ env: { WE_CODEX_USAGE_LEDGER: path }, now, read,
+    window: { usedPercent: 20, resetsAt: now + 24 * 3600000, lengthHours: 168 } });
+  expect(read).toHaveBeenCalledTimes(1);
+  expect(read.mock.calls[0].slice(2)).toEqual([0, 8 * 1024 * 1024, size - 8 * 1024 * 1024]);
+  read.mockClear();
+  recentCapacityRates(path, now, { read });
+  expect(read).toHaveBeenCalledTimes(1);
+  expect(read.mock.calls[0].slice(2)).toEqual([0, 256 * 1024, size - 256 * 1024]);
+}));
 
 describe('Codex usage ledger', () => {
   it('reuses the central conveyor root and honors the explicit override', () => {
@@ -64,19 +141,20 @@ describe('Codex usage ledger', () => {
   });
   it('reads only the Codex bucket from persisted rollout observations', () => fixture(root => {
     const sessions = join(root, 'sessions', '2026'); mkdirSync(sessions, { recursive: true });
-    const event = (id, used, reset) => JSON.stringify({ type: 'event_msg', payload: { type: 'token_count', rate_limits: { limit_id: id, primary: { used_percent: used, resets_at: reset } } } });
+    const event = (id, used, reset) => JSON.stringify({ timestamp: new Date(used * 1000).toISOString(), type: 'event_msg', payload: { type: 'token_count', rate_limits: { limit_id: id, primary: { used_percent: used, resets_at: reset, window_minutes: 300 } } } });
     writeFileSync(join(sessions, 'run.jsonl'), `${event('codex', 10, 5)}\n${event('codex', 12, 5)}\n${event('other', 99, 6)}\n`);
-    expect(readCodexQuota({ CODEX_HOME: root })).toEqual({ used_percent: 12, resets_at: 5 });
+    expect(readCodexQuota({ CODEX_HOME: root })).toEqual({ used_percent: 12, resets_at: 5, window_minutes: 300, at: new Date(12000).toISOString(),
+      mtime: fs.statSync(join(sessions, 'run.jsonl')).mtimeMs });
     expect(readCodexQuota({ CODEX_HOME: join(root, 'missing') })).toBeNull();
   }));
   it('selects the newest rollout containing a Codex bucket', () => fixture(root => {
     const sessions = join(root, 'sessions'); mkdirSync(sessions);
     for (const [name, id, used, time] of [['old', 'codex', 10, 100], ['eligible', 'codex', 22, 200], ['newest', 'other', 99, 300]]) {
       const path = join(sessions, `${name}.jsonl`);
-      writeFileSync(path, JSON.stringify({ type: 'event_msg', payload: { type: 'token_count', rate_limits: { limit_id: id, primary: { used_percent: used, resets_at: 5 } } } }) + '\n');
+      writeFileSync(path, JSON.stringify({ timestamp: new Date(time * 1000).toISOString(), type: 'event_msg', payload: { type: 'token_count', rate_limits: { limit_id: id, primary: { used_percent: used, resets_at: 5, window_minutes: 300 } } } }) + '\n');
       utimesSync(path, time, time);
     }
-    expect(readCodexQuota({ CODEX_HOME: root })).toEqual({ used_percent: 22, resets_at: 5 });
+    expect(readCodexQuota({ CODEX_HOME: root })).toEqual({ used_percent: 22, resets_at: 5, window_minutes: 300, at: new Date(200000).toISOString(), mtime: 200000 });
   }));
   it('records successes and failed launches exactly once without altering their result', async () => {
     const rows = []; let time = 100;
@@ -160,8 +238,8 @@ describe('Codex usage ledger', () => {
   it('accounts for an oversized untracked file without reading its contents', () => fixture(async root => {
     snapshotGit({ untracked: 'large\0' });
     writeFileSync(join(root, 'large'), ''); truncateSync(join(root, 'large'), 2 * 1024 * 1024);
-    const read = vi.spyOn(fs, 'readFileSync');
-    const open = vi.spyOn(fs, 'openSync');
+    const read = fs.readFileSync.mockClear();
+    const open = fs.openSync.mockClear();
     const rows = [];
     await withCodexUsage({ cwd: root }, async () => ({ code: 0 }), { quota: () => null, append: r => rows.push(r) });
     expect(rows[0].changedFiles).toBe(false);
@@ -267,3 +345,46 @@ describe('Codex usage report', () => {
     const report = readCodexUsageReport({ env }); expect(report.runs).toBe(1); expect(report.byTaskKind.__proto__.runs).toBe(1);
   }));
 });
+
+describe('Codex burn-rate ledger slope', () => {
+  it('uses two recent rows, retains zero burn and rejects missing or single-row evidence', () => fixture(root => {
+    const env = { WE_CODEX_USAGE_LEDGER: join(root, 'rate.jsonl') }, now = Date.parse('2026-11-19T15:00:00Z');
+    const window = { usedPercent: 28, resetsAt: now + 140 * 3600000, lengthHours: 168 };
+    const rate = () => readCodexBurnRate({ env, now, window });
+    expect(rate()).toBeNull();
+    const row = (h, used, extra = {}) => JSON.stringify({ at: new Date(now - h * 3600000).toISOString(), quota: { after_used_percent: used, ...extra } });
+    writeFileSync(env.WE_CODEX_USAGE_LEDGER, row(20, 20)); expect(rate()).toBeNull();
+    writeFileSync(env.WE_CODEX_USAGE_LEDGER, [row(30, 0), row(20, 20), 'torn', row(10, 25), row(-1, 99)].join('\n'));
+    expect(rate()).toBe(0.5);
+    expect(readCodexBurnRate({ env, now, window, lookbackHours: 12 })).toBeNull();
+    writeFileSync(env.WE_CODEX_USAGE_LEDGER, [row(20, 25), row(10, 25)].join('\n')); expect(rate()).toBe(0);
+  }));
+  it('cuts historical rows at usage drops and explicit window changes, including reset rows', () => fixture(root => {
+    const env = { WE_CODEX_USAGE_LEDGER: join(root, 'rate.jsonl') }, now = Date.parse('2026-11-19T15:00:00Z');
+    const window = { usedPercent: 28, resetsAt: now + 140 * 3600000, lengthHours: 168 };
+    const row = (h, used, extra = {}) => JSON.stringify({ at: new Date(now - h * 3600000).toISOString(), quota: { after_used_percent: used, ...extra } });
+    const rate = lines => { writeFileSync(env.WE_CODEX_USAGE_LEDGER, lines.join('\n')); return readCodexBurnRate({ env, now, window }); };
+    expect(rate([row(20, 90), row(10, 20)])).toBeNull();
+    expect(rate([row(20, 90), row(10, 20), row(5, 25)])).toBe(1);
+    expect(rate([row(20, 10, { after_resets_at: window.resetsAt - 3600000 }), row(10, 20, { after_resets_at: window.resetsAt })])).toBeNull();
+    expect(rate([row(20, 10), row(10, 20, { before_used_percent: 99 }), row(5, 25)])).toBe(1);
+    expect(rate([row(20, 10), row(20, 20)])).toBeNull();
+    expect(rate([row(20, 50), row(10, 60)])).toBeNull();
+  }));
+  it('persists before and after reset identifiers for future unambiguous window matching', () => {
+    const row = appendCodexUsage({ quotaBefore: { used_percent: 20, resets_at: 123 }, quotaAfter: { used_percent: 22, resets_at: 123 } },
+      { env: { WE_CODEX_USAGE_LEDGER: 'unused' }, mkdir: () => {}, append: () => {} });
+    expect(row.quota).toMatchObject({ before_resets_at: 123, after_resets_at: 123 });
+  });
+});
+
+it('bounded Codex rate tail ignores an oversized partial line and stays unknown without two usable rows', () => fixture(root => {
+  const env = { WE_CODEX_USAGE_LEDGER: join(root, 'rate') }, now = Date.parse('2026-11-19T15:00:00Z');
+  const window = { usedPercent: 28, resetsAt: now + 140 * 3600000, lengthHours: 168 };
+  const prefix = 'x'.repeat(8 * 1024 * 1024 + 1);
+  const row = (h, used) => JSON.stringify({ at: new Date(now - h * 3600000).toISOString(), quota: { after_used_percent: used } });
+  writeFileSync(env.WE_CODEX_USAGE_LEDGER, prefix + '\n' + row(2, 26));
+  expect(readCodexBurnRate({ env, now, window })).toBeNull();
+  writeFileSync(env.WE_CODEX_USAGE_LEDGER, [prefix, row(2, 26), row(1, 27)].join('\n'));
+  expect(readCodexBurnRate({ env, now, window })).toBe(1);
+}));

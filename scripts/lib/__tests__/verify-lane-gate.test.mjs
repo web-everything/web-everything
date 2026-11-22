@@ -113,7 +113,7 @@ describe('#4540 — untracked lane scratch selection', () => {
     expect.soft(decision.targets).toEqual(['scripts/example.mjs', 'scripts/example.test.mjs']);
     expect.soft(decision.referencedTests).toEqual(['scripts/example.test.mjs']);
     expect(decision.changedFiles).toEqual(['.commit-msg.txt', 'scripts/example.mjs']);
-    expect(command).toBe("npx vitest related 'scripts/example.mjs' 'scripts/example.test.mjs' --run --passWithNoTests && npm run check:standards -- --local --files='.commit-msg.txt,scripts/example.mjs'");
+    expect(command).toBe("npx vitest run 'scripts/example.test.mjs' --passWithNoTests && npm run check:standards -- --local --files='.commit-msg.txt,scripts/example.mjs'");
   });
   it('scratch-only skips successfully without grep, while opt-out requires an explicit gate', () => {
     for (const optOut of [false, true]) {
@@ -128,7 +128,7 @@ describe('#4540 — untracked lane scratch selection', () => {
       if (optOut) expect(command).toBeNull();
       else {
         expect(decision.reasons.join(' ')).toMatch(/scratch only/);
-        expect(execSync(command.split(' && ')[0], { encoding: 'utf8' })).toMatch(/vitest half skipped.*scratch/);
+        expect(execSync(command.split(' && ')[0], { encoding: 'utf8' })).toContain('no selected or named test suites; CI owns exhaustive verification');
       }
     }
   });
@@ -187,28 +187,28 @@ describe('#4540 — untracked lane scratch selection', () => {
 });
 
 describe('resolveDefaultGate (xpnhz4o) — the LOCAL gate runs only the diff-selected tests', () => {
-  it('a scripts/ change (the everyday PR) SELECTS: vitest related on it + the tests naming it, never `npm run test:unit`', () => {
+  it('a scripts/ change (the everyday PR) SELECTS: an explicit list of the tests naming it, never `npm run test:unit`', () => {
     const { command, decision } = resolveDefaultGate({ fileConfig: null,
       runGit: fakeGit(['scripts/verify-lane.mjs'], { grepHits: { 'verify-lane.mjs': ['scripts/__tests__/verify-lane.test.mjs'] } }),
       env: TODAY,
     });
     expect(decision.mode).toBe('shrink');
     expect(decision.referencedTests).toEqual(['scripts/__tests__/verify-lane.test.mjs']);
-    expect(command).toBe("npx vitest related 'scripts/__tests__/verify-lane.test.mjs' 'scripts/verify-lane.mjs' --run --passWithNoTests && npm run check:standards -- --local --files='scripts/verify-lane.mjs'");
+    expect(command).toBe("npx vitest run 'scripts/__tests__/verify-lane.test.mjs' --passWithNoTests && npm run check:standards -- --local --files='scripts/verify-lane.mjs'");
     expect(command).not.toContain('test:unit');
   });
 
   it('a docs-only diff selects (and passes with no tests) and scopes check:standards (#1937)', () => {
     const { command, decision } = resolveDefaultGate({ fileConfig: null, runGit: fakeGit(['docs/readme.md']), env: TODAY });
     expect(decision.mode).toBe('shrink');
-    expect(command).toBe("npx vitest related 'docs/readme.md' --run --passWithNoTests && npm run check:standards -- --local --files='docs/readme.md'");
+    expect(command).toBe("echo 'verify-lane: no selected or named test suites; CI owns exhaustive verification' && npm run check:standards -- --local --files='docs/readme.md'");
   });
 
   it('keys on the WORKING TREE: uncommitted and untracked files are in the selection (a fixer gates before committing)', () => {
     const { command, decision } = resolveDefaultGate({ fileConfig: null, runGit: fakeGit(['scripts/a.mjs'], { untracked: ['scripts/__tests__/a-new.test.mjs'] }), env: TODAY });
     expect(decision.mode).toBe('shrink');
     expect(decision.changedFiles).toEqual(['scripts/__tests__/a-new.test.mjs', 'scripts/a.mjs']);
-    expect(command).toContain("'scripts/__tests__/a-new.test.mjs' 'scripts/a.mjs'");
+    expect(command.split(' && ')[0]).toBe("npx vitest run 'scripts/__tests__/a-new.test.mjs' --passWithNoTests");
   });
 
   it.each([
@@ -228,7 +228,7 @@ describe('resolveDefaultGate (xpnhz4o) — the LOCAL gate runs only the diff-sel
     expect(src.decision.deletedSourceFiles).toEqual(['scripts/gone.mjs']);
     const test = resolveDefaultGate({ fileConfig: null, runGit: fakeGit(['scripts/a.mjs', 'scripts/__tests__/gone.test.mjs'], { deleted: ['scripts/__tests__/gone.test.mjs'] }), env: TODAY });
     expect(test.decision.mode).toBe('shrink');
-    expect(test.command.split(' && ')[0]).toBe("npx vitest related 'scripts/a.mjs' --run --passWithNoTests");
+    expect(test.command.split(' && ')[0]).toBe("echo 'verify-lane: no selected or named test suites; CI owns exhaustive verification'");
   });
 
   it('PR #2680 review — a diff of ONLY deleted non-source files never emits a target-less `vitest related` (a false red)', () => {
@@ -236,7 +236,7 @@ describe('resolveDefaultGate (xpnhz4o) — the LOCAL gate runs only the diff-sel
     expect(decision.mode).toBe('shrink');
     expect(decision.targets).toEqual([]);
     expect(command).not.toMatch(/vitest related\s+--run/);
-    expect(command.split(' && ')[0]).toMatch(/^echo .*vitest half skipped/);
+    expect(command.split(' && ')[0]).toBe("echo 'verify-lane: no selected or named test suites; CI owns exhaustive verification'");
   });
 
   it('PR #2680 review — reference discovery greps every vitest test suffix (jsx / cts included)', () => {
@@ -261,7 +261,7 @@ describe('resolveDefaultGate (xpnhz4o) — the LOCAL gate runs only the diff-sel
     const { command, decision } = resolveDefaultGate({ fileConfig: null, runGit: fakeGit(['backlog/100-example.md'], { grepHits: { backlog: ['x.test.mjs'] } }), env: TODAY });
     expect(decision.mode).toBe('shrink');
     expect(decision.referencedTests).toEqual([]);
-    expect(command).toBe("npx vitest related 'backlog/100-example.md' --run --passWithNoTests && npm run check:standards");
+    expect(command).toBe("echo 'verify-lane: no selected or named test suites; CI owns exhaustive verification' && npm run check:standards");
   });
 
   it('a change under a glob-discovered root (demos/) adds the tests that name the root', () => {
@@ -271,7 +271,7 @@ describe('resolveDefaultGate (xpnhz4o) — the LOCAL gate runs only the diff-sel
 
   it('a gate-self/policy-core path keeps check:standards unscoped (the gate sees the whole-repo signal on a change to itself)', () => {
     const { command } = resolveDefaultGate({ fileConfig: null, runGit: fakeGit(['scripts/lib/review-escalation.mjs']), env: TODAY });
-    expect(command).toMatch(/--passWithNoTests && npm run check:standards$/);
+    expect(command).toBe("echo 'verify-lane: no selected or named test suites; CI owns exhaustive verification' && npm run check:standards");
   });
 
   it('an explicit opt-out (WE_DIFF_TEST_SELECTION=0) requires an explicit gate', () => {
@@ -358,10 +358,10 @@ describe('resolveDefaultGate per-repo scripts (#3919) — only run the npm scrip
     expect(resolveDefaultGate({ fileConfig: null, runGit: fakeGit(files), env: TODAY, scripts: FRONTIERUI_SCRIPTS }).command).toBe(legacy.command);
   });
 
-  it.each(cases)('a plateau-app checkout ($name) keeps related tests and skips the missing check:standards', ({ files }) => {
+  it.each(cases)('a plateau-app checkout ($name) keeps capped test selection and skips the missing check:standards', ({ files }) => {
     const { command, gateReasons, decision } = resolveDefaultGate({ fileConfig: null, runGit: fakeGit(files), env: TODAY, scripts: PLATEAU_APP_SCRIPTS });
     if (decision.mode === 'blocked') { expect(command).toBeNull(); return; }
-    expect(command).toContain('npx vitest related ');
+    expect(command.split(' && ')[0]).toBe("echo 'verify-lane: no selected or named test suites; CI owns exhaustive verification'");
     expect(command).not.toContain('npm test');
     expect(command).not.toContain('test:unit');
     expect(command).not.toContain('check:standards');
@@ -369,15 +369,15 @@ describe('resolveDefaultGate per-repo scripts (#3919) — only run the npm scrip
     expect(gateReasons.join(' ')).toMatch(/no `check:standards`/);
   });
 
-  it('a plateau-app checkout with an uncommitted edit also keeps related tests', () => {
+  it('a plateau-app checkout with an uncommitted edit also keeps capped test selection', () => {
     const { command } = resolveDefaultGate({ fileConfig: null, runGit: fakeGit(['docs/readme.md'], { untracked: ['src/x.ts'] }), env: TODAY, scripts: PLATEAU_APP_SCRIPTS });
-    expect(command).toContain('npx vitest related ');
+    expect(command.split(' && ')[0]).toBe("echo 'verify-lane: no selected or named test suites; CI owns exhaustive verification'");
     expect(command).not.toContain('npm test');
   });
 
-  it('a checkout with check:standards but no test:unit keeps the (scoped) health gate after related tests', () => {
+  it('a checkout with check:standards but no test:unit keeps the (scoped) health gate after capped test selection', () => {
     const { command } = resolveDefaultGate({ fileConfig: null, runGit: fakeGit(['src/a.ts']), env: TODAY, scripts: ['test', 'check:standards'] });
-    expect(command).toBe("npx vitest related 'src/a.ts' --run --passWithNoTests && npm run check:standards -- --local --files='src/a.ts'");
+    expect(command).toBe("echo 'verify-lane: no selected or named test suites; CI owns exhaustive verification' && npm run check:standards -- --local --files='src/a.ts'");
   });
 
   it('a checkout with no test/test:unit/check:standards script skips BOTH halves with an explicit reason, never a missing-script failure', () => {
@@ -673,7 +673,7 @@ describe('verify-lane.mjs source wiring — the default gate actually calls reso
   it('xpnhz4o — prints describeGate before running, and `run` mode records no marker', () => {
     const src = readFileSync(resolve(process.cwd(), 'scripts/verify-lane.mjs'), 'utf8');
     expect(src).toMatch(/process\.stderr\.write\(describeGate\(resolved\)/);
-    expect(src).toMatch(/if \(MODE !== 'run'\) writeMarker\(verifyStartBody/);
+    expect(src).toMatch(/if \(MODE !== 'run'\) writeMarker\(\{ \.\.\.verifyStartBody/);
     expect(src).toMatch(/const preStart = MODE === 'run' \? null : readMarker\(\)/);
   });
 
@@ -749,7 +749,7 @@ describe('fix-3311 selection replay', () => {
     }), env: TODAY });
     expect(decision.mode).toBe('shrink');
     expect(decision.targets).toEqual([...helpers, ref].sort());
-    expect(command).toContain('vitest related');
+    expect(command.split(' && ')[0]).toBe("npx vitest run 'scripts/operations/__tests__/repair-routing-review-fixes.test.mjs' --passWithNoTests");
     expect(command).not.toContain('npm run test:unit');
   });
   it('also bounds long path arguments below the target-count limit', () => {
@@ -803,8 +803,8 @@ describe('explicitGateRefusal — an agent-supplied gate must be an affected-tes
 });
 
 it('exposes the gate halves without splitting shell-quoted changed paths', () => {
-  const gate = resolveDefaultGate({ fileConfig: null, runGit: fakeGit(['scripts/a && b.mjs']), env: TODAY });
-  expect(gate.testCommand).toContain("'scripts/a && b.mjs'");
+  const gate = resolveDefaultGate({ fileConfig: null, runGit: fakeGit(['scripts/a && b.test.mjs']), env: TODAY });
+  expect(gate.testCommand).toContain("'scripts/a && b.test.mjs'");
   expect(gate.standardsCommand).toMatch(/^npm run check:standards/);
   expect(gate.command).toBe(`${gate.testCommand} && ${gate.standardsCommand}`);
 });
@@ -979,7 +979,7 @@ describe('#verify-standards-auto', () => {
   });
   it('omits the standards command and describes the skip', () => {
     const resolved = resolveDefaultGate({ fileConfig: null, runGit: fakeGit(['scripts/foo.mjs']), env: { ...TODAY, WE_VERIFY_STANDARDS: 'auto' } });
-    expect(resolved.command).toBe("npx vitest related 'scripts/foo.mjs' --run --passWithNoTests");
+    expect(resolved.command).toBe("echo 'verify-lane: no selected or named test suites; CI owns exhaustive verification'");
     expect(resolved.standardsCommand).toBeNull();
     expect(resolved.gateReasons).toContain('skipped (auto: code-only diff)');
     expect(describeGate(resolved)).toContain('  check:standards: skipped (auto: code-only diff)');
@@ -1049,7 +1049,7 @@ describe('#5128 — bounded related-test selection', () => {
     expect(describeGate(gate)).toContain('selection-truncated');
   });
 
-  it('recognizes a requester without the limit (older base) as the default gate, not a whole-gate fallback', () => {
+  it('recognizes a requester with the limit disabled as the default gate, not a whole-gate fallback', () => {
     const files = { 'scripts/hub.mjs': '', 'scripts/mid.mjs': "import './hub.mjs'", 'scripts/direct.test.mjs': "import './hub.mjs'" };
     for (let i = 0; i < 6; i++) files[`scripts/deep${i}.test.mjs`] = "import './mid.mjs'";
     const git = fakeGit(['scripts/hub.mjs']);
@@ -1059,13 +1059,13 @@ describe('#5128 — bounded related-test selection', () => {
     const resolved = resolveUnder(TODAY);
     expect(resolved.testCommand).toMatch(/^npx vitest run /);
     const stamped = resolveUnder({ ...TODAY, WE_VERIFY_RELATED_MAX_TESTS: '0' }).command;
-    expect(stamped).toMatch(/^npx vitest related 'scripts\/hub\.mjs'/);
+    expect(stamped.split(' && ')[0]).toBe("npx vitest run 'scripts/deep0.test.mjs' 'scripts/deep1.test.mjs' 'scripts/deep2.test.mjs' 'scripts/deep3.test.mjs' 'scripts/deep4.test.mjs' 'scripts/deep5.test.mjs' 'scripts/direct.test.mjs' --passWithNoTests");
     const plan = matchRequestedDefaultGate({ gate: stamped, env: TODAY, resolved, resolveUnder });
-    expect(plan?.testCommand).toBe("npx vitest related 'scripts/hub.mjs' --run --passWithNoTests");
-    expect(plan.decision.selection ?? null).toBeNull();
+    expect(plan?.testCommand).toBe(stamped.split(' && ')[0]);
+    expect(plan.decision.selection).toMatchObject({ status: 'complete', selectedTestCount: 7, maxTests: 40 });
   });
 
-  it('keeps vitest related, with no selection, when git or the graph throws', () => {
+  it('uses capped-fallback when git or the graph throws', () => {
     const git = fakeGit(['scripts/hub.mjs']);
     for (const [label, runGit, readRepoFile] of [
       ['ls-files throws', args => { if (args[0] === 'ls-files' && args.includes('--cached')) throw new Error('git broke'); return git(args); }, () => ''],
@@ -1073,33 +1073,35 @@ describe('#5128 — bounded related-test selection', () => {
         () => { throw new TypeError('boom'); }],
     ]) {
       const gate = resolveDefaultGate({ env: TODAY, fileConfig: { relatedMaxTests: 1, relatedDepth: 2 }, runGit, readRepoFile });
-      expect(gate.testCommand, label).toBe("npx vitest related 'scripts/hub.mjs' --run --passWithNoTests");
-      expect(gate.decision, label).not.toHaveProperty('selection', expect.objectContaining({ status: 'selection-truncated' }));
+      expect(gate.testCommand, label).toBe("echo 'verify-lane: no selected or named test suites; CI owns exhaustive verification'");
+      expect(gate.decision.selection, label).toMatchObject({ status: 'capped-fallback', tests: [] });
     }
   });
 
-  it('keeps vitest related when the bounded list is longer than one command line can carry', () => {
+  it('uses capped-fallback when the bounded list is longer than one command line can carry', () => {
     const files = { 'scripts/hub.mjs': '' };
-    for (let i = 0; i < 400; i++) files[`scripts/${'x'.repeat(90)}${i}.test.mjs`] = "import './hub.mjs'";
+    // The selected list itself must exceed 32 KB after applying the test-count cap.
+    for (let i = 0; i < 4; i++) files[`scripts/${'x'.repeat(9000)}${i}.test.mjs`] = "import './hub.mjs'";
     const git = fakeGit(['scripts/hub.mjs']);
-    const gate = resolveDefaultGate({ env: TODAY, fileConfig: { relatedMaxTests: 3, relatedDepth: 2 },
+    const gate = resolveDefaultGate({ env: TODAY, fileConfig: { relatedMaxTests: 4, relatedDepth: 2 },
       runGit: args => args[0] === 'ls-files' && args.includes('--cached') ? Object.keys(files).join('\n') : git(args),
       readRepoFile: path => files[path] });
-    expect(gate.testCommand).toBe("npx vitest related 'scripts/hub.mjs' --run --passWithNoTests");
-    expect(gate.decision.selection).toMatchObject({ status: 'complete', tests: null });
+    const tests = [0, 1, 2].map(i => `scripts/${'x'.repeat(9000)}${i}.test.mjs`);
+    expect(gate.testCommand).toBe(`npx vitest run ${tests.map(t => `'${t}'`).join(' ')} --passWithNoTests`);
+    expect(gate.decision.selection).toMatchObject({ status: 'capped-fallback', tests });
     expect(gate.decision.selection.reason).toContain('list unusable');
   });
 
-  it('keeps vitest related under the limit', () => {
+  it('runs the sorted explicit list under the limit', () => {
     const gate = boundedGate(50);
-    expect(gate.testCommand).toBe("npx vitest related 'scripts/hub.mjs' --run --passWithNoTests");
+    expect(gate.testCommand).toBe("npx vitest run 'scripts/deep0.test.mjs' 'scripts/deep1.test.mjs' 'scripts/deep2.test.mjs' 'scripts/deep3.test.mjs' 'scripts/deep4.test.mjs' 'scripts/deep5.test.mjs' 'scripts/direct.test.mjs' --passWithNoTests");
     expect(gate.decision.selection.status).toBe('complete');
   });
 
-  it('keeps the original command and omits selection without a reader', () => {
+  it('uses capped-fallback without a reader', () => {
     const gate = boundedGate(3, false);
-    expect(gate.testCommand).toBe("npx vitest related 'scripts/hub.mjs' --run --passWithNoTests");
-    expect(gate.decision).not.toHaveProperty('selection');
+    expect(gate.testCommand).toBe("echo 'verify-lane: no selected or named test suites; CI owns exhaustive verification'");
+    expect(gate.decision.selection).toMatchObject({ status: 'capped-fallback', tests: [] });
   });
 
   it('emits selection counts in structured and formatted phase telemetry', () => {
@@ -1300,7 +1302,7 @@ describe('explicit-list sharding', () => {
       for (let i = 0; i < 24; i++) files[`scripts/direct${i}.test.mjs`] = "import './hub.mjs'";
       for (const [file, content] of Object.entries(files)) writeFileSync(join(repo, file), content);
       const env = { ...process.env, WE_BUILD_FINAL_GATE: 'related', WE_BUILD_FINAL_GATE_STANDARDS: 'selected',
-        WE_VERIFY_SELECTION: 'pr', WE_VERIFY_RELATED: 'all', WE_VERIFY_RELATED_MAX_TESTS: '1', WE_VERIFY_RELATED_DEPTH: '2',
+        WE_VERIFY_SELECTION: 'pr', WE_VERIFY_RELATED: 'all', WE_VERIFY_RELATED_MAX_TESTS: '24', WE_VERIFY_RELATED_DEPTH: '2',
         WE_VERIFY_TEST_TIMEOUT_FACTOR: '1', WE_VERIFY_STANDARDS: 'ci-only', WE_VERIFY_REVERT_RED: 'off',
         WE_VERIFY_SHARD_MIN_TESTS: '24', WE_VERIFY_SHARD_SIZE: '12', WE_VERIFY_SHARD_PARALLEL: '3',
         WE_VERIFY_PHASE_TIMEOUT_MS: '10000', WE_VERIFY_ALWAYS_RUN_TESTS: 'guard.test.mjs', WE_VERIFY_PHASE_ADMISSION: '1',
@@ -1391,7 +1393,7 @@ process.exit(1);`);
     for (let i = 0; i < count; i++) files[`scripts/direct${i}.test.mjs`] = "import './hub.mjs'";
     files['scripts/deep.test.mjs'] = "import './mid.mjs'";
     const git = fakeGit(['scripts/hub.mjs']);
-    return resolveDefaultGate({ env: TODAY, fileConfig: { relatedMaxTests: 1, relatedDepth: 2, phaseTimeoutMs: 10000, ...settings }, readRepoFile: p => files[p],
+    return resolveDefaultGate({ env: TODAY, fileConfig: { relatedMaxTests: count, relatedDepth: 2, phaseTimeoutMs: 10000, ...settings }, readRepoFile: p => files[p],
       runGit: args => args[0] === 'ls-files' && args.includes('--cached') ? Object.keys(files).join('\n') : git(args) });
   }
   it('wraps at threshold, with 75 files producing seven shards and a 90% budget', () => {

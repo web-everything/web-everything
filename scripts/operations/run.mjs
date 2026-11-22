@@ -23,6 +23,7 @@
  * derived from the declaration — including which operations have a juror to point at a lane at all.
  */
 
+import { RESOLVE_GENERATED_OP, RESOLVE_GENERATED_EFFECT, resolveGeneratedSink, resolveGeneratedOperation, finishResolveGenerated } from './resolve-generated.mjs';
 import { appendEntry } from './ruled-weakened-store.mjs';
 import { ruledWeakenedAddOperation, RULED_WEAKENED_ADD_OP, RULED_WEAKENED_ADD_EFFECT, finishRuledWeakenedAdd } from './ruled-weakened-add.mjs';
 import { OPERATOR_OVERRIDE_OPS, OPERATOR_OVERRIDE_EFFECT, operatorOverrideOperation } from './operator-override.mjs';
@@ -93,6 +94,8 @@ import { createRunnerActivityReader, createRunnerActivityCliStores } from './run
 import { daemonStatusOperation, DAEMON_STATUS_OP } from './daemon-status.mjs';
 import { collectDaemonStatus } from './daemon-status-io.mjs';
 import { heavyQueueOperation, HEAVY_QUEUE_OP } from './heavy-queue.mjs';
+import { capacityCalendarOperation, finishCapacityCalendar } from './capacity-calendar.mjs';
+import { capacityCalendar } from './capacity-calendar-io.mjs';
 import { hostCapacityOperation, HOST_CAPACITY_OP, finishHostCapacity } from './host-capacity.mjs';
 import { collectHostCapacity } from '../readiness/host-capacity.mjs';
 import { collectHeavyQueue } from './heavy-queue-io.mjs';
@@ -250,6 +253,8 @@ export function finishCodexAudit({ run, code, lines, json }) {
 
 
 export const CLI_ONLY_OPERATIONS = Object.freeze({
+  [RESOLVE_GENERATED_OP]: () => ({ declaration: resolveGeneratedOperation(),
+    sinks: { [RESOLVE_GENERATED_EFFECT]: resolveGeneratedSink }, finish: finishResolveGenerated }),
   [RULED_WEAKENED_ADD_OP]: () => ({ declaration: ruledWeakenedAddOperation(),
     sinks: { [RULED_WEAKENED_ADD_EFFECT]: entry => appendEntry(entry) }, finish: finishRuledWeakenedAdd }),
   ...Object.fromEntries(OPERATOR_OVERRIDE_OPS.filter(name => name !== 'operator-override-show').map(name => [name, () => ({
@@ -512,6 +517,7 @@ export const OPERATIONS = Object.freeze({
     sinks: {},
   }),
   // R258 — measured CPU/memory capacity; read-only, no effect sinks.
+  'capacity-calendar': () => ({ declaration: capacityCalendarOperation({ collect: capacityCalendar }), sinks: {}, finish: finishCapacityCalendar }),
   [HOST_CAPACITY_OP]: () => ({
     declaration: hostCapacityOperation({ collect: collectHostCapacity }),
     sinks: {},

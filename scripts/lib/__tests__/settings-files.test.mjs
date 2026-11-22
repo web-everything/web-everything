@@ -465,7 +465,10 @@ describe('the real layout (we:scripts/settings/ + legacy dispatch-settings.json)
     // Inventories inspect individual files for ownership, but also read scripts/settings/ through the checked
     // loader. Keep them out of LEGACY_ONLY_READERS: overlay-dropped uses that list to warn about lost settings.
     // settings-registry.test.mjs covers feature-file values, shared ownership and fail-closed checked reads.
-    const declarationInventories = ['scripts/lib/settings-registry.mjs'];
+    // The generated-doc merge resolver and its soak break only LIST the settings files as regeneration inputs
+    // (a digest of paths); neither reads a setting value from the legacy file.
+    const declarationInventories = ['scripts/lib/settings-registry.mjs', 'scripts/lib/daemon-rebuild/advisory-merge.mjs',
+      'scripts/conveyor/soak/breaks/settings-registry-doc-conflict-regenerated.mjs'];
     const root = join(SETTINGS_DIR, '..', '..');
     const stripComments = (src) => src.replace(/\/\*[\s\S]*?\*\//g, '').replace(/^\s*\/\/.*$/gm, '');
     const direct = [];
