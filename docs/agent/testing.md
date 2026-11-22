@@ -5967,3 +5967,21 @@ contract. Set `cliMain` in `prFileContract` for callable entries so repeated arg
 the loaded graph. Resetting the entire daemon graph twice inside the CLI test exceeded its
 60-second deadline on a coverage shard. Keep the file/standalone output comparison and zero-GitHub
 assertions intact; consumers without callable entries retain the fresh-import path.
+
+## Drain log evidence normalization
+
+Drain queue and recovery log consumers share `readNormalizedJobLog` over the whole job log. Strip only SGR;
+reject remaining ESC bytes or C1 controls. Keep the drain source tests for `ciJobLogApiArgs` (including
+`--allow-escape-sequences`) and normalization immediately around each full log read.
+
+Log parsing never authorizes re-enqueue, rerun or merge. Same-head MQ failures hold admission. Real assertion
+failure in a normalized log goes straight to the fixer, without refresh. Otherwise (including unreadable or
+normalization-failed logs), permit one `update-branch` refresh per PR-authored head under the existing live
+head, merge-state, green PR checks, approval and App-token preconditions. The shared locked ledger spends
+the head before the write, including refused requests. Re-read after the write and bind a generated merge
+head to the spent attempt; a new author head gets its own attempt. A second failure holds for the fixer.
+Normalization `ok:false` never supplies success or real-failure proof; recovery evidence stays incomplete.
+
+Keep negative tests for real failures (zero refreshes), unreadable/normalization-failed logs (one refresh),
+repeat failures and persisted ledger entries (no second refresh), new author heads (one new refresh), and
+the merge gate refusing non-green group members. The unreadable-log soak probes the refresh path itself.
