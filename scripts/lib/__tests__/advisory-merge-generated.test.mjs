@@ -41,15 +41,38 @@ it('stores the validated bytes even when a clean filter matches the scratch blob
   expect(stored).toContain('"b":1');
 });
 
-it('never stages clean-filtered bytes for a generated doc (worktree)', () => {
+it('refuses rather than stage clean-filtered bytes for a generated doc (worktree)', () => {
   const f = setup();
   expect(f.git(['merge', '--no-edit', 'theirs']).status).toBe(1);
   cleanFilter(f);
-  const ok = advisory.resolveAdvisoryInWorktree({ git: f.git, cwd: f.root, commit: false });
-  if (ok) {
-    expect(f.ok(['cat-file', 'blob', `:${DOC}`])).toContain('"b":1');
-  } else expect(f.ok(['diff', '--name-only', '--diff-filter=U'])).toBe(DOC);
-  expect(f.git(['cat-file', 'blob', `:${DOC}`]).stdout).not.toBe('FILTERED');
+  const before = snapshot(f);
+  expect(advisory.resolveAdvisoryInWorktree({ git: f.git, cwd: f.root, commit: false })).toBe(false);
+  expect(snapshot(f)).toEqual(before);
+  expect(f.ok(['diff', '--name-only', '--diff-filter=U'])).toBe(DOC);
+});
+
+it.each([
+  ['a configured clean filter', f => cleanFilter(f)],
+  ['a merged ident attribute', f => f.write('.git/info/attributes', '*.json ident\n')],
+])('refuses rather than stage converted bytes for a non-generated advisory path (worktree, %s)', (_label, convert) => {
+  const f = setup(), TIMINGS = 'scripts/ci/test-timings.json';
+  const timings = unit => `${JSON.stringify({ _doc: 'x', unit, soak: {} }, null, 1)}\n`;
+  f.ok(['checkout', '-qb', 'tbase', 'base']);
+  // An expanded `$Id: … $` keyword is what the ident clean step collapses on `git add`.
+  f.write(TIMINGS, timings({ '$Id: x $': 1 }));
+  f.commit('timings base');
+  for (const [branch, key] of [['tours', 'a'], ['ttheirs', 'b']]) {
+    f.ok(['checkout', '-qb', branch, 'tbase']);
+    f.write(TIMINGS, timings({ '$Id: x $': 1, [key]: 1 }));
+    f.commit(branch);
+  }
+  expect(f.git(['merge', '--no-edit', 'ttheirs']).status).toBe(1);
+  expect(f.ok(['diff', '--name-only', '--diff-filter=U'])).toBe(TIMINGS);
+  convert(f);
+  const before = snapshot(f);
+  expect(advisory.resolveAdvisoryInWorktree({ git: f.git, cwd: f.root })).toBe(false);
+  expect(snapshot(f)).toEqual(before);
+  expect(f.ok(['diff', '--name-only', '--diff-filter=U'])).toBe(TIMINGS);
 });
 
 it('regenerates even when TMPDIR is a symlink (generator main-module guard needs the real path)', () => {

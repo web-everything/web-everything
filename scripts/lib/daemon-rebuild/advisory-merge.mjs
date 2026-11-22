@@ -256,18 +256,17 @@ export function resolveAdvisoryInWorktree({ git, cwd, commit = true, trustedRoot
     };
     try {
       for (const { path, text } of merged) writeFileSync(join(cwd, path), text);
-      const generatedHashes = new Map();
-      for (const { path } of merged) {
+      // Expected blob ids come from the validated bytes themselves. `git add` applies clean filters and
+      // attributes (ident, eol, working-tree-encoding — some settable by the merged .gitattributes), so every
+      // staged path, generated or not, must hash to exactly what was validated or the resolution is refused.
+      const expectedHashes = new Map();
+      for (const { path, text } of merged) {
         if (path.endsWith('.mjs') && !checkModuleSyntax(join(cwd, path))) return restore();
-        if (Object.hasOwn(GENERATED_MERGE_PATHS, path)) {
-          const blob = git(['hash-object', '--no-filters', '--', join(cwd, path)]);
-          const sha = String(blob.stdout ?? '').trim();
-          if (blob.status !== 0 || !FULL_SHA_RE.test(sha)) return restore();
-          generatedHashes.set(path, sha);
-        }
+        const bytes = Buffer.from(text);
+        expectedHashes.set(path, createHash('sha1').update(`blob ${bytes.length}\0`).update(bytes).digest('hex'));
       }
       if (git(['add', '--', ...paths]).status !== 0) return restore();
-      for (const [path, sha] of generatedHashes) {
+      for (const [path, sha] of expectedHashes) {
         const staged = git(['rev-parse', `:${path}`]);
         if (staged.status !== 0 || String(staged.stdout ?? '').trim() !== sha) return restore();
       }
