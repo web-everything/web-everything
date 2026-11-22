@@ -1,0 +1,6 @@
+{
+  "description": "Builder and audit provider routing based on quota and reservations.",
+  "owner": "scripts/settings/routing.json",
+  "changeVia": "pr",
+  "instant": false
+}

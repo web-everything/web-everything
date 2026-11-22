@@ -45,13 +45,13 @@ function scenario(root, tamper = false, resolver = resolveOverlayConflict) {
       ok(['config', key, value]);
     }
     for (const path of [...CLOSURE, ...INPUTS,
+      ...['settings', 'capacityLeaves'].flatMap(section => readdirSync(join(root, 'scripts/lib/settings-registry-metadata.d', section))
+        .map(name => `scripts/lib/settings-registry-metadata.d/${section}/${name}`)),
       ...readdirSync(join(root, 'scripts/settings')).filter(name => name.endsWith('.json')).map(name => `scripts/settings/${name}`)]) {
       write(path, readFileSync(join(root, path)));
     }
     // Keep real inputs, adding one documented fixture family with distinct leaves on each side.
-    const metadata = JSON.parse(readFileSync(join(dir, INPUTS[1]), 'utf8'));
-    metadata.settings.soakRegistryProbe = { description: 'Soak registry probe', owner: 'scripts/settings/soak-base.json', changeVia: 'pr', instant: false };
-    json(INPUTS[1], metadata);
+    json('scripts/lib/settings-registry-metadata.d/settings/soakRegistryProbe.json', { description: 'Soak registry probe', owner: 'scripts/settings/soak-base.json', changeVia: 'pr', instant: false });
     mkdirSync(join(dir, 'docs/agent'), { recursive: true });
     json('scripts/settings/soak-base.json', { soakRegistryProbe: { soakBase: 1 } });
     generate(); commit('base');

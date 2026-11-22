@@ -1,0 +1,6 @@
+{
+  "description": "Provider advisory review seating policy.",
+  "owner": "scripts/settings/review.json",
+  "changeVia": "pr",
+  "instant": false
+}
