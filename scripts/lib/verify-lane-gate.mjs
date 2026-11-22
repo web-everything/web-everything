@@ -613,13 +613,22 @@ export function capExplicitRelatedGate({ gate, uncapped = false, runGit, readRep
   // Discovery/filter values are not source targets. Preserve literal argv and refuse
   // unknown flags rather than silently changing the requested verification.
   const valueOptions = new Set(['--config', '--project', '--testNamePattern', '-t', '--exclude']);
+  // PR #7323 — the options every previously stamped DEFAULT related gate carried (`--run --passWithNoTests
+  // --testTimeout=N --hookTimeout=N`). A pending request from before the cap must convert, not be refused:
+  // `--passWithNoTests` is already in every rewritten command, and stamped timeouts are kept as requested.
+  const timeoutOptions = new Map([['--testTimeout', null], ['--hookTimeout', null]]);
   for (let i = 0; i < words.length; i++) {
     const token = words[i];
-    if (token === '--run') continue;
+    if (token === '--run' || token === '--passWithNoTests') continue;
     if (/^--bail(?:=\d+)?$/.test(token)) { options.push(token); continue; }
     const equals = token.indexOf('=');
     const name = equals < 0 ? token : token.slice(0, equals);
-    if (valueOptions.has(name)) {
+    if (timeoutOptions.has(name)) {
+      const value = equals < 0 ? words[++i] : token.slice(equals + 1);
+      if (!/^\d+$/.test(value ?? '')) throw new Error(`related gate option ${name} requires a whole-number value`);
+      if (timeoutOptions.get(name) !== null) throw new Error(`related gate option ${name} is repeated`);
+      timeoutOptions.set(name, Number(value));
+    } else if (valueOptions.has(name)) {
       const value = equals < 0 ? words[++i] : token.slice(equals + 1);
       if (!value || value.startsWith('-')) throw new Error(`related gate option ${name} requires a literal value`);
       options.push(name, value);
@@ -632,7 +641,11 @@ export function capExplicitRelatedGate({ gate, uncapped = false, runGit, readRep
   const settings = resolveVerifySettings({ fileConfig, env }).values;
   const selection = relatedSelection({ targets, runGit, readRepoFile, settings });
   if (options.length && !selection.tests.length) throw new Error('related gate options require selected or named test suites; supply an explicit affected-test gate');
-  const flags = scaledTimeoutFlags(settings.testTimeoutFactor) + (options.length ? ` ${options.map(shellQuote).join(' ')}` : '');
+  // Stamped timeouts win; an unstamped one keeps this host's scaled default (none at factor 1).
+  const scaled = Object.fromEntries(scaledTimeoutFlags(settings.testTimeoutFactor).trim().split(' ').filter(Boolean).map(f => f.split('=')));
+  const timeouts = [...timeoutOptions].map(([name, value]) => [name, value ?? scaled[name]])
+    .filter(([, value]) => value !== undefined).map(([name, value]) => ` ${name}=${value}`).join('');
+  const flags = timeouts + (options.length ? ` ${options.map(shellQuote).join(' ')}` : '');
   return { command: explicitTestCommand(selection.tests, flags) + (tail ? ` ${tail}` : ''), selection,
     notice: `explicit related gate capped (${targets.length} → ${selection.tests.length} tests)` };
 }

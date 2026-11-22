@@ -86,6 +86,38 @@ it('explicit related gate preserves filtering and bail options as literal argume
   const p = gates.capExplicitRelatedGate({ gate: `vitest related '${hub}' --run -t 'a && b' --exclude=slow.test.mjs --bail=2`, ...fixture(), env: { WE_VERIFY_TEST_TIMEOUT_FACTOR: '1' } });
   expect(p.command).toBe(`npx vitest run '${own}' --passWithNoTests '-t' 'a && b' '--exclude' 'slow.test.mjs' '--bail=2'`);
 });
+// PR #7323 red team — a request stamped by the PREVIOUS dispatcher carries the old default related gate; it must
+// convert to a capped gate (keeping its stamped timeouts), never be refused.
+it.each([
+  [`npx vitest related ${hub} --run --passWithNoTests --testTimeout=15000 --hookTimeout=30000`, ' --testTimeout=15000 --hookTimeout=30000', ''],
+  [`npx vitest related '${hub}' --run --passWithNoTests --testTimeout=15000 --hookTimeout=30000 && npm run check:standards`, ' --testTimeout=15000 --hookTimeout=30000', ' && npm run check:standards'],
+  [`npx vitest related '${hub}' --run --passWithNoTests`, '', ''],
+  [`npx vitest related '${hub}' --run --passWithNoTests --testTimeout=15000`, ' --testTimeout=15000', ''],
+  [`vitest related ${hub} --run --passWithNoTests --testTimeout 7000 --hookTimeout=9000`, ' --testTimeout=7000 --hookTimeout=9000', ''],
+])('explicit related gate converts a previously stamped default gate: %s', (gate, timeouts, tail) => {
+  const p = gates.capExplicitRelatedGate({ gate, ...fixture(), env: { WE_VERIFY_TEST_TIMEOUT_FACTOR: '1' } });
+  expect(p.command).toBe(`npx vitest run '${own}' --passWithNoTests${timeouts}${tail}`);
+  expect(p.selection.tests).toEqual([own]);
+});
+it('an unstamped timeout keeps the host scaled default while a stamped one wins', () => {
+  const p = gates.capExplicitRelatedGate({ gate: `npx vitest related ${hub} --run --passWithNoTests --hookTimeout=42`, ...fixture(), env: { WE_VERIFY_TEST_TIMEOUT_FACTOR: '3' } });
+  expect(p.command).toBe(`npx vitest run '${own}' --passWithNoTests --testTimeout=15000 --hookTimeout=42`);
+});
+it.each([[`npx vitest related ${hub} --run`]])('a fresh related gate still gets the scaled timeouts once: %s', gate => {
+  const p = gates.capExplicitRelatedGate({ gate, ...fixture(), env: { WE_VERIFY_TEST_TIMEOUT_FACTOR: '3' } });
+  expect(p.command).toBe(`npx vitest run '${own}' --passWithNoTests --testTimeout=15000 --hookTimeout=30000`);
+});
+it('a converted old default with no selectable suite still runs nothing unfiltered', () => {
+  const o = fixture({ files: {} });
+  o.fileConfig.alwaysRunTests = [];
+  const p = gates.capExplicitRelatedGate({ gate: `npx vitest related ${hub} --run --passWithNoTests --testTimeout=15000 --hookTimeout=30000`, ...o });
+  expect(p.command).toMatch(/^echo /);
+});
+it.each(['--testTimeout=abc', '--hookTimeout=', '--testTimeout', '--testTimeout=1 --testTimeout=2', '--passWithNoTests=false'])(
+  'explicit related gate refuses a malformed execution setting: %s', option => {
+    expect(() => gates.capExplicitRelatedGate({ gate: `vitest related '${hub}' --run ${option}`, ...fixture() }))
+      .toThrow(/related gate option/);
+  });
 it.each(['--root=other', '--unknown', '--run=false'])('explicit related gate refuses unsupported option %s', option => {
   expect(() => gates.capExplicitRelatedGate({ gate: `vitest related '${hub}' ${option}`, ...fixture() }))
     .toThrow(/unsupported related gate option/);

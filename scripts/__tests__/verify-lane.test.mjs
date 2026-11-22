@@ -1921,6 +1921,20 @@ process.exit(${standardsExit});
     expect(result.stderr).not.toContain('whole-gate admission');
   });
 
+  // PR #7323 red team — a request stamped before the related cap carries the old default `vitest related … --run
+  // --passWithNoTests --testTimeout --hookTimeout`; its dispatched child must run it capped, never record gate-refused.
+  it('a dispatched child converts a previously stamped default related gate instead of refusing it', () => {
+    const f = fixture({ importsSource: true });
+    const stamped = 'npx vitest related source.mjs --run --passWithNoTests --testTimeout=15000 --hookTimeout=30000 && npm run check:standards';
+    const result = f.invoke([`--gate=${stamped}`, '--run-id=legacy-default']);
+    expect(result.json?.status, result.stdout + result.stderr).not.toBe('gate-refused');
+    expect(JSON.parse(readFileSync(marker(), 'utf8')).redCause).not.toBe('refused');
+    const first = f.calls()[0].args;
+    expect(first.slice(0, 2)).toEqual(['vitest', 'run']);
+    expect(first).toEqual(expect.arrayContaining(['--testTimeout=15000', '--hookTimeout=30000', ...f.files]));
+    expect(first).not.toContain('related');
+  });
+
   it('says so, and records why, when a dispatched default-shaped gate still falls back to whole-gate admission (#66)', () => {
     const f = fixture();
     const result = f.invoke(['--gate=npx vitest run untouched-a.test.mjs --someOtherFlag', '--run-id=unknown-shape']);
