@@ -8,6 +8,7 @@
   "scripts/conveyor/reconcile-pass.mjs": 1,
   "scripts/conveyor/session-reaper.mjs": 1,
   "scripts/conveyor/session-watchdog.mjs": 1,
+  "scripts/conveyor/stuck-prs.mjs": 1,
   "scripts/lane-whois.mjs": 1,
   "scripts/lib/claude-sessions.mjs": 1,
   "scripts/lib/lane-salvage.mjs": 1,
