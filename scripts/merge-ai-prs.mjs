@@ -145,6 +145,7 @@ import {
   collapseRollupToLatestPerName, latestCheckNamed, isFailedCheckRow,
   requiredCheckReadNeeded, requiredCheckRunsEndpoint, mergeRequiredCheckRuns,
 } from './lib/rollup-collapse.mjs';
+import { describeBlockedChecks, sendBackBlockedGates } from './lib/drain-blocked-reason.mjs';
 import { CODEQL_CHECK_NAME, loadDrainGateSettings } from './lib/codeql-gate.mjs';
 export { isAiAuthor, isAiCommit, isMechanicalMergeCommit, isDrainBookkeepingCommit } from './lib/ai-pr-authorship.mjs';
 export { isAiGeneratedPr, hasLabel };
@@ -1055,7 +1056,9 @@ export const prestageFixClaimHeld = (num, { claimKey, readClaim = readLiveFixCla
  * `'main'`). Missing or unreadable default/base branch evidence always fails closed, including pure callers.
  */
 export function classifyPr(pr, { requiredCheck = 'test', trustLabel = 'ready-to-merge', allowPendingReview = false, defaultBranch = null, blockOnCodeQL = DRAIN_GATE_SETTINGS.drainBlocksOnCodeQL, queueRequiredChecks = null, preparePendingCi = false } = {}) {
+  const blockedChecks = describeBlockedChecks(pr, queueRequiredChecks);
   const prestagePendingCi = preparePendingCi && hasLabel(pr, REVIEW_LABELS.accepted) && hasLabel(pr, 'ready-to-merge') && !pr.isDraft
+    && !blockedChecks?.failed.length
     && prestageCi(pr, prestageRequiredChecks(queueRequiredChecks, requiredCheck)) === 'pending';
   const num = pr?.number;
   const title = pr?.title || '';
@@ -1113,6 +1116,7 @@ export function classifyPr(pr, { requiredCheck = 'test', trustLabel = 'ready-to-
       queueBlocker = `; ${gate.reason}${gate.affected.length ? `: ${gate.affected.map(({ name, reason }) => `${name} (${reason})`).join(', ')}` : ''}`;
       return false;
     }
+    if (blockedChecks?.failed.length) return false;
     queueBlockedRelief = true;
     return true;
   };
@@ -1162,7 +1166,8 @@ export function classifyPr(pr, { requiredCheck = 'test', trustLabel = 'ready-to-
   // only BLOCKED (checks red/pending, ci-heal already running: #4235, 2026-10-07) was classified `behind` in the
   // skip-reasons log and read as an unowned rebase.
   else if (!landableState && !(prestagePendingCi && state === 'BLOCKED' && !['CHANGES_REQUESTED', 'REVIEW_REQUIRED'].includes(pr.reviewDecision)) && !relieveQueueBlocked()) {
-    decision = 'skip'; reason = unlandableStateReason(state) + queueBlocker;
+    const blocked = state === 'BLOCKED' ? blockedChecks : null;
+    decision = 'skip'; reason = unlandableStateReason(state) + (blocked?.text ? `; ${blocked.text}` : '') + queueBlocker;
     workflowHoldRepark = state === 'BLOCKED' && canReparkWorkflowHold();
   }
   // #2324 — refuse to land a PR with an empty/whitespace description, same rule pr-land.mjs enforces before
@@ -6170,6 +6175,14 @@ export async function main(argv, { env = process.env, stdout = process.stdout, e
     localSlug,
     defaultBranchOf,
   }));
+  if (!DRY_RUN) {
+    try {
+      const sendBacks = sendBackBlockedGates({ prsByRepo, verdicts, requiredChecksOf: queueRequiredChecksOf, localSlug,
+        cwdOf: repo => isLocalRepo(repo) ? undefined : siblingCloneDir(repo),
+        ledgerPath: join(dirname(refreshedStatePath()), 'drain-gate-send-backs.json') });
+      for (const outcome of sendBacks) process.stderr.write(`  ${repoTag(outcome.repo)}${outcome.num} required-check send-back: ${outcome.sent ? 'review:changes' : 'skipped'}${outcome.reason ? `; ${outcome.reason}` : ''}\n`);
+    } catch { process.stderr.write('  required-check send-back unavailable; failed PRs remain skipped; retry next pass\n'); }
+  }
   __t.add('classifyGateReads', __t.mark() - __gateReadsT0);
   // #2393 — the `stackParents` proof-of-land gate's SECOND proof source: a parent that landed in a PRIOR drain
   // session, read off `origin/main`'s durable `bornAs:<hash>` record (#2392). Computed ONCE per pass over every
