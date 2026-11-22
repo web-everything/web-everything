@@ -6,6 +6,10 @@ import { filterOpenPrsByLabel, OPEN_PR_LIST_LIMIT } from './lib/no-search-backed
 
 /** At most this many labelled PRs are classified per scheduled run (each spawns a full dry-run drain). */
 const BATCH_PR_CAP = 10;
+/** Each child classification may take this long (see runCli). */
+const CHILD_TIMEOUT_MS = 10 * 60_000;
+/** Whole-batch budget: the job's `timeout-minutes: 30` minus a margin. No PR starts with less than one child timeout left. */
+const BATCH_BUDGET_MS = 20 * 60_000;
 
 /**
  * The one admission-hold decision for a toMerge candidate. A dry-run lands nothing (its `merged` set is empty),
@@ -99,10 +103,13 @@ export function runCli(argv = process.argv.slice(2), io = {}) {
   const repoSlug = flags.repo || env.GITHUB_REPOSITORY;
   if (!/^[\w.-]+\/[\w.-]+$/.test(repoSlug || '') ||
       (flags.repo && flags.repo !== env.GITHUB_REPOSITORY)) throw new Error('unbound repository; run the local drain');
-  const options = { encoding: 'utf8', maxBuffer: 16 * 1024 * 1024, timeout: 10 * 60_000, env };
+  const options = { encoding: 'utf8', maxBuffer: 16 * 1024 * 1024, timeout: CHILD_TIMEOUT_MS, env };
   const exec = (cmd, args) => {
     try {
-      const raw = String((io.execFileSync || execFileSync)(cmd, args, options));
+      // Every subprocess is also capped by the batch deadline, so one PR cannot overrun the job budget.
+      const left = io.deadline === undefined ? CHILD_TIMEOUT_MS : io.deadline - (io.now || Date.now)();
+      if (left <= 0) throw new Error('batch deadline passed');
+      const raw = String((io.execFileSync || execFileSync)(cmd, args, { ...options, timeout: Math.min(CHILD_TIMEOUT_MS, left) }));
       if (Buffer.byteLength(raw) > options.maxBuffer) throw new Error('oversized output');
       return raw;
     } catch (cause) { throw new Error('classification read failed or exceeded output/time bounds; run the local drain', { cause }); }
@@ -138,6 +145,7 @@ export function runBatch(argv = process.argv.slice(2), io = {}) {
   if (flags.batch !== true || !/^[\w./-]+$/.test(flags['verdict-dir'] || '') || flags['verdict-dir'].includes('..')) {
     throw new Error('usage: --batch --verdict-dir=dir [--repo=owner/repo]; run the local drain');
   }
+  const batchStart = (io.now || Date.now)();
   const env = { ...(io.env || process.env) };
   assertSafeEnv(env);
   const fail = reason => { process.stderr.write(`${reason}; run the local drain\n`); return { written: 0, failed: 1 }; };
@@ -155,15 +163,25 @@ export function runBatch(argv = process.argv.slice(2), io = {}) {
     if (!Array.isArray(listing)) return fail('open PR list unreadable');
     const { prs: labelled, truncated } = filterOpenPrsByLabel(listing, 'ready-to-merge');
     if (truncated) return fail('open PR list possibly truncated');
-    prs = labelled.slice(0, BATCH_PR_CAP).map(row => String(row?.number ?? ''));
+    // Random start: workflow run ids are not consecutive, so a modulo of the id can pin the same offset forever;
+    // a uniform start reaches every PR with probability 1 over runs.
+    const start = Math.floor((io.random || Math.random)() * labelled.length) || 0;
+    prs = [...labelled.slice(start), ...labelled.slice(0, start)].slice(0, BATCH_PR_CAP).map(row => String(row?.number ?? ''));
   }
   if (!prs.length) return { written: 0, failed: 0 };
   (io.mkdirSync || mkdirSync)(flags['verdict-dir'], { recursive: true });
-  let written = 0, failed = 0, unknown = 0;
+  let written = 0, failed = 0, unknown = 0, skipped = 0;
+  const deadline = batchStart + BATCH_BUDGET_MS;
   for (const pr of prs) {
     try {
-      if (!/^[1-9]\d*$/.test(pr)) throw new Error('invalid PR number');
-      runCli([`--only=${pr}`, `--verdict-out=${flags['verdict-dir']}/pr-${pr}.json`, ...(flags.repo ? [`--repo=${flags.repo}`] : [])], io);
+      if (!/^[1-9]\d*$/.test(pr) || !Number.isSafeInteger(Number(pr))) throw new Error('invalid PR number');
+      // Never start a PR that could not finish inside the job budget; finished verdicts are already on disk and
+      // the unstarted PR gets an explicit 'unknown' verdict (never mergeable), not a silent gap.
+      if (deadline - (io.now || Date.now)() < CHILD_TIMEOUT_MS) {
+        skipped++;
+        throw Object.assign(new Error('batch budget spent'), { unknownReason: 'batch budget spent before this PR was classified' });
+      }
+      runCli([`--only=${pr}`, `--verdict-out=${flags['verdict-dir']}/pr-${pr}.json`, ...(flags.repo ? [`--repo=${flags.repo}`] : [])], { ...io, deadline });
       written++;
     } catch (error) {
       if (error.unknownReason) {
@@ -184,7 +202,8 @@ export function runBatch(argv = process.argv.slice(2), io = {}) {
   if (!written && !failed) failed = 1;
   // Every PR unknown would hide an outage behind a green run: fail with a summary.
   if (unknown && !written) process.stderr.write(`all ${unknown} PR(s) unknown; run the local drain\n`);
-  return unknown ? { written, failed, unknown } : { written, failed };
+  if (skipped) process.stderr.write(`${skipped} PR(s) not started: batch budget spent; next run rotates\n`);
+  return { written, failed, ...(unknown ? { unknown } : {}), ...(skipped ? { skipped } : {}) };
 }
 
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {

@@ -6,7 +6,8 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { readDeclaredSettings } from '../settings-files.mjs';
 import { resolveDispatchRoute, readRoutingPolicy } from '../dispatch-routing-policy-io.mjs';
-import { resolveFixExecutorChain } from '../fix-executor-chain.mjs';
+import { resolveFixExecutorChain, pickChainRung } from '../fix-executor-chain.mjs';
+import { PROVIDER_DEFAULTS, calendarReset, readProviderCapacity } from '../provider-capacity.mjs';
 import { inheritedRoutingPolicy } from './inherited-routing-policy.mjs';
 
 // Passthrough mocks, off by default: a test points the settings readers at a temp dir, fixes the Codex quota
@@ -14,6 +15,41 @@ import { inheritedRoutingPolicy } from './inherited-routing-policy.mjs';
 // redirected, so a regression from the declared reader back to readSettings() cannot fall through to the
 // shipped scripts/settings (which says builder=claude and would hide it).
 const state = vi.hoisted(() => ({ dir: null, quota: undefined, seen: [] }));
+
+it.each([
+  ['claude', { active: false }, ['codex', 'codex-alt']],
+  ['claude', { allowedKinds: ['build'] }, ['codex', 'codex-alt']],
+  ['codex-alt', { active: false }, ['codex', 'claude']],
+])('unknown readers still exclude %s with %j from fix escalation', (provider, restriction, expected) => {
+  const now = Date.parse('2026-11-20T15:00:00Z');
+  const env = { WE_CAPACITY_READERS: 'off' };
+  const providers = PROVIDER_DEFAULTS.providers.map(p => p.id === provider ? { ...p, ...restriction } : p);
+  const repo = { routing: { builder: 'auto' }, providerCapacity: { providers } };
+  const settings = resolveRoutingSettings({ env, repo }).capacity;
+  const capacity = readProviderCapacity({ env, now, settings, readers: {} });
+  const options = { env, repo, now, capacity, quota: () => ({ used_percent: 20 }), record: () => {} };
+  expect(effectiveBuilder({ ...options, kind: 'fix' }).decision).toMatchObject({
+    reason: 'all-readers-unknown', provider: 'codex',
+    inputs: expect.arrayContaining([expect.objectContaining({ provider, eligible: false })]),
+  });
+  const chain = resolveFixExecutorChain(options);
+  expect(chain.value).toEqual(expected);
+  expect(pickChainRung({ chain: chain.value, launcherAvailable: () => true }).executor).toBe('codex');
+  if (provider === 'claude') {
+    expect(pickChainRung({ chain: chain.value, codexUnproductive: 3, launcherAvailable: () => true }).executor).toBeNull();
+    expect(pickChainRung({ chain: chain.value, critical: true, trigger: 'takeover', launcherAvailable: () => true }).executor).toBeNull();
+  }
+});
+
+it.each([[20, ['codex', 'codex-alt', 'claude']], [80, ['claude']]])(
+  'unknown readers preserve legacy fix preference at %s percent usage', (used_percent, expected) => {
+    const env = { WE_CAPACITY_READERS: 'off' };
+    const repo = { routing: { builder: 'auto' } };
+    const now = Date.parse('2026-11-20T15:00:00Z');
+    const settings = resolveRoutingSettings({ env, repo }).capacity;
+    const capacity = readProviderCapacity({ env, now, settings, readers: {} });
+    expect(resolveFixExecutorChain({ env, repo, now, capacity, quota: () => ({ used_percent }), record: () => {} }).value).toEqual(expected);
+  });
 vi.mock('../settings-files.mjs', async (importOriginal) => {
   const actual = await importOriginal();
   const at = o => (state.dir ? { ...o, dir: state.dir, legacyPath: null } : o);
@@ -25,9 +61,85 @@ vi.mock('../codex-usage-ledger.mjs', async (importOriginal) => {
 });
 vi.mock('../dispatch-contracts.mjs', async (importOriginal) => {
   const actual = await importOriginal();
-  return { ...actual, decideDispatchRoute: (d, o) => { state.seen.push({ kind: d?.kind, availability: { ...o?.availability } }); return actual.decideDispatchRoute(d, o); } };
+  return { ...actual, decideDispatchRoute: (d, o) => { state.seen.push({ kind: d?.kind, availability: { ...o?.availability }, routingPolicy: o.routingPolicy }); return actual.decideDispatchRoute(d, o); } };
 });
 beforeEach(() => { vi.stubEnv('WE_ROUTING_BUILDER', ''); });
+
+it('scoped Codex pins respect the Claude builder audit reserve', () => {
+  const policy = readRoutingPolicy();
+  const keys = Object.keys(policy.operations).filter(key => key.includes(':') && policy.operations[key].provider === 'codex');
+  expect(keys.length).toBeGreaterThan(0);
+  for (const key of keys) for (const codexReserveForAudit of [false, true]) {
+    const [kind, taskType] = key.split(':');
+    if (!BUILD_KINDS.includes(kind)) continue;
+    resolveDispatchRoute({ kind, taskType, scopePaths: ['we:scripts/example.mjs'], risk: 'high' }, {
+      routingPolicy: policy, repo: { routing: { builder: 'claude', codexReserveForAudit } }, env: {},
+    });
+    expect(state.seen.at(-1).availability.codex).toContain('reserved for audit');
+  }
+});
+
+it.each([
+  ['reserve-only', { usedPercent: 95 }], ['inactive', { active: false }],
+  ['disallowed', { allowedKinds: [] }], ['tier-excluded', { tier: 1 }],
+  ['held', { held: true }], ['exhausted', { usedPercent: 99 }],
+])('dispatch fallbacks exclude %s capacity', (_label, bad) => {
+  const now = Date.parse('2026-11-20T15:00:00Z');
+  const capacity = ['codex', 'claude'].map(provider => ({ provider, health: 1, known: true,
+    ...(provider === 'claude' ? { account: 'claude-a', ...bad } : {}),
+    windows: [{ usedPercent: provider === 'claude' ? bad.usedPercent ?? 20 : 10, resetsAt: now + (provider === 'claude' ? 120 : 1) * 3600000 }] }));
+  const route = resolveDispatchRoute({ kind: 'build', size: 3, scopePaths: ['we:scripts/example.mjs'] }, {
+    env: {}, repo: { routing: { builder: 'auto', capacity: { claudeUsageAccount: 'claude-a' } },
+      providerCapacity: { minimumTiers: { build: 3 } } }, capacity, now, quota: () => null, record: () => {},
+  });
+  expect(state.seen.at(-1).availability.claude).toContain('capacity:');
+  expect(route).toMatchObject({ outcome: 'routed', executed: 'codex' });
+  expect(route.policyRoute.fallback).toEqual([]);
+});
+
+it.each(['../escape', 'two/accounts', 'two\\accounts', '..', '', 'account\nother', 'account\n', 'account\r', 'account\u2028',
+  '--account', 'account`name', 'account"name', 'account\u200b', 'ａｃｃｏｕｎｔ'])('rejects unsafe provider account id %j', id => {
+  const providers = [{ ...PROVIDER_DEFAULTS.providers[0], accounts: [{ id }] }];
+  expect(resolveRoutingSettings({ env: {}, repo: { providerCapacity: { providers } } }).capacity.providers).toEqual(PROVIDER_DEFAULTS.providers);
+});
+
+it.each(['codex', 'codex-alt'])('capacity projection launches winning %s when the other model is below tier', winner => {
+  const now = Date.parse('2026-11-20T15:00:00Z');
+  const capacity = ['codex', 'codex-alt'].map(provider => ({ provider, tier: provider === winner ? 3 : 1,
+    known: true, health: 1, windows: [{ usedPercent: 10, resetsAt: now + 3600000 }] }));
+  const policy = structuredClone(readRoutingPolicy());
+  policy.operations.build.model = winner === 'codex' ? 'astra' : 'sol';
+  const route = resolveDispatchRoute({ kind: 'build', size: 3, scopePaths: ['we:scripts/example.mjs'] }, {
+    env: {}, repo: { routing: { builder: 'auto' }, providerCapacity: { minimumTiers: { build: 3 } } },
+    routingPolicy: policy, capacity, now, quota: () => null, record: () => {},
+  });
+  expect(route).toMatchObject({ outcome: 'routed', executed: 'codex', policyRoute: { model: winner === 'codex' ? 'gpt-6.1-sol' : 'gpt-6-astra' } });
+});
+
+it('unknown fallback filters excluded models even when an eligible sibling shares their launcher', () => {
+  const now = Date.parse('2026-11-20T15:00:00Z');
+  const policy = structuredClone(readRoutingPolicy());
+  policy.operations.build.fallback.push({ provider: 'antigravity', model: 'sonnet', effort: 'high' });
+  const providers = PROVIDER_DEFAULTS.providers.map(p => p.id === 'agy-gemini' ? { ...p, allowedKinds: ['build'] } : p);
+  const capacity = ['codex', 'claude', 'agy-gemini', 'agy-claude'].map(provider => ({ provider,
+    health: 1, known: provider === 'codex', windows: provider === 'codex'
+      ? [{ usedPercent: 99, resetsAt: now + 120 * 3600000 }] : [] }));
+  resolveDispatchRoute({ kind: 'build', size: 3, scopePaths: ['we:scripts/example.mjs'] }, {
+    env: {}, repo: { routing: { builder: 'auto' }, providerCapacity: { providers } }, routingPolicy: policy,
+    capacity, now, quota: () => null, record: () => {},
+  });
+  const projected = state.seen.at(-1).routingPolicy;
+  expect(projected.operations.build.fallback.map(route => route.provider)).toEqual(['claude']);
+});
+
+it.each([
+  ['02:30 America/New_York', '2026-03-08T06:00:00Z', '2026-03-09T06:30:00Z'],
+  ['01:30 America/New_York', '2026-11-01T04:00:00Z', '2026-11-01T05:30:00Z'],
+  ['01:30 America/New_York', '2026-11-01T05:31:00Z', '2026-11-01T06:30:00Z'],
+  ['09:00 Asia/Kolkata', '2026-11-20T00:00:00Z', '2026-11-20T03:30:00Z'],
+])('calendarReset handles DST gaps, folds and half-hour zones: %s after %s', (rule, at, expected) => {
+  expect(calendarReset(rule, Date.parse(at))).toBe(Date.parse(expected));
+});
 afterEach(() => { state.dir = null; state.quota = undefined; state.seen = []; vi.unstubAllEnvs(); });
 
 /** A temp settings dir holding the given files; the readers use it until the test ends. */
@@ -64,7 +176,7 @@ describe('routing settings', () => {
     expect(resolveRoutingSettings({ env: {}, repo: { routing: { builder: 'cluade' } } }).builder).toBe('claude');
   });
   it('auto goes to claude at the threshold; an unknown reading goes to claude', () => {
-    const repo = { routing: { builder: 'auto', autoClaudeAbovePercent: 70 } };
+    const repo = { routing: { builder: 'auto', autoClaudeAbovePercent: 70, capacity: { enabled: false } } };
     expect(effectiveBuilder({ env: {}, repo, quota: () => ({ used_percent: 90 }) }).builder).toBe('claude');
     expect(effectiveBuilder({ env: {}, repo, quota: () => ({ used_percent: 40 }) }).builder).toBe('codex');
     expect(effectiveBuilder({ env: {}, repo, quota: () => null }).builder).toBe('claude');
@@ -72,19 +184,22 @@ describe('routing settings', () => {
   it('a malformed settings file, or unreadable auto quota, resolves to claude', () => {
     const bad = { settings: {}, errors: [{ source: 'settings/routing.json', error: 'Unexpected token' }] };
     expect(resolveRoutingSettings({ env: {}, declared: bad })).toMatchObject({ builder: 'claude', source: 'unreadable-settings' });
-    expect(effectiveBuilder({ env: {}, repo: { routing: { builder: 'auto' } }, quota: () => null }).builder).toBe('claude');
+    expect(effectiveBuilder({ env: {}, repo: { routing: { builder: 'auto', capacity: { enabled: false } } }, quota: () => null }).builder).toBe('claude');
   });
   it('explicit deliveryAgent=codex is refused with a named reason while the reserve is on', () => {
+    settingsDir({ 'routing.json': { routing: { builder: 'claude', codexReserveForAudit: true } } });
     const r = resolveDispatchRoute({ kind: 'build', deliveryAgent: 'codex' }, {});
     expect(r.outcome).toBe('refused');
     expect(r.refusal).toMatch(/codexReserveForAudit/);
   });
   it('deliveryAgent is trimmed and lower-cased before the refusal check', () => {
+    settingsDir({ 'routing.json': { routing: { builder: 'claude', codexReserveForAudit: true } } });
     for (const agent of [' codex ', 'CODEX', 'Codex\n']) {
       expect(resolveDispatchRoute({ kind: 'build', deliveryAgent: agent }, {}).outcome).toBe('refused');
     }
   });
   it('kind is normalised once: a padded or upper-cased build kind is refused and held exactly like the plain one', () => {
+    settingsDir({ 'routing.json': { routing: { builder: 'claude', codexReserveForAudit: true } } });
     const plain = resolveDispatchRoute({ kind: 'build', ...SCOPED, deliveryAgent: 'codex' }, {});
     expect(plain.outcome).toBe('refused');
     for (const kind of [' build ', 'BUILD', 'build\n', '\tBuild']) {
@@ -99,6 +214,7 @@ describe('routing settings', () => {
     }
   });
   it('the codex hold never strands a ci-heal while native Claude is available; it still refuses when native Claude is held too', () => {
+    settingsDir({ 'routing.json': { routing: { builder: 'claude' } } });
     const dispatch = { kind: 'ci-heal', scopePaths: ['we:scripts/example.mjs'], reason: 'red-ci' };
     const options = { routingPolicy: readRoutingPolicy(), scorecards: [], ciHealAvailability: { 'antigravity-claude': 'quota held' } };
     const r = resolveDispatchRoute(dispatch, options);
@@ -132,7 +248,7 @@ describe('routing settings', () => {
   });
   it('auto routes to claude at, and above, a configured threshold; codex only below it', () => {
     for (const [threshold, used, builder] of [[70, 69, 'codex'], [70, 70, 'claude'], [70, 71, 'claude'], [50, 49, 'codex'], [50, 50, 'claude'], [50, 51, 'claude']]) {
-      const repo = { routing: { builder: 'auto', autoClaudeAbovePercent: threshold } };
+      const repo = { routing: { builder: 'auto', autoClaudeAbovePercent: threshold, capacity: { enabled: false } } };
       expect(effectiveBuilder({ env: {}, repo, quota: () => ({ used_percent: used }) }).builder, `${used}% vs ${threshold}`).toBe(builder);
     }
   });
@@ -159,7 +275,8 @@ describe('routing settings', () => {
     for (const kind of [...HELD_KINDS, ...NON_BUILD_KINDS]) expect(availabilityFor({ kind, ...SCOPED })?.codex, kind).toBeUndefined();
   });
   it('auto builder at dispatch holds codex over the quota threshold or on an unreadable reading, not below it', () => {
-    settingsDir({ 'routing.json': { routing: { builder: 'auto', autoClaudeAbovePercent: 70 } } });
+    // This suite tests the legacy threshold policy; capacity scoring has its own provider-capacity fixtures.
+    settingsDir({ 'routing.json': { routing: { builder: 'auto', autoClaudeAbovePercent: 70, capacity: { enabled: false } } } });
     for (const [quota, held] of [[{ used_percent: 90 }, true], [{ used_percent: 70 }, true], [null, true], [{ used_percent: 40 }, false]]) {
       state.quota = quota;
       const codex = availabilityFor({ kind: 'build', ...SCOPED })?.codex;
@@ -214,4 +331,56 @@ describe('routing settings', () => {
     expect(resolveFixExecutorChain({ env: { WE_FIX_EXECUTOR_FALLBACK_CHAIN: 'codex,claude' }, platform: {}, repo }).value).toEqual(['claude']);
     expect(resolveFixExecutorChain({ env: {}, platform: {}, repo: { ...repo, routing: { builder: 'codex' } } }).value).toEqual(['codex', 'codex-alt', 'claude']);
   });
+});
+
+it('operator reading age defaults to 24h and resolves platform, tool and environment with provenance', () => {
+  expect(resolveRoutingSettings({ env: {}, repo: {} }).capacity.operatorReadingMaxAgeHours).toBe(24);
+  const dir = settingsDir({ 'routing.json': { routing: { capacity: { operatorReadingMaxAgeHours: 12 } } } });
+  const prefs = join(dir, 'platform.json');
+  writeFileSync(prefs, JSON.stringify({ routing: { capacity: { operatorReadingMaxAgeHours: 18 } } }));
+  const env = { WE_PLATFORM_PREFERENCES_FILE: prefs };
+  expect(resolveRoutingSettings({ env, repo: {} }).capacity.operatorReadingMaxAgeHours).toBe(18);
+  const tool = resolveRoutingSettings({ env });
+  expect(tool.capacity.operatorReadingMaxAgeHours).toBe(12);
+  expect(tool.capacitySources.operatorReadingMaxAgeHours).toBe('tool');
+  const overridden = resolveRoutingSettings({ env: { ...env, WE_ROUTING_CAPACITY_OPERATOR_READING_MAX_AGE_HOURS: '6' } });
+  expect(overridden.capacity.operatorReadingMaxAgeHours).toBe(6);
+  expect(overridden.capacitySources.operatorReadingMaxAgeHours).toBe('env');
+});
+
+
+it.each(['codex', 'agy-claude'])('capacity selection honours disabled %s and preserves eligible route controls', disabled => {
+  settingsDir({ 'routing.json': { routing: { builder: 'auto' } } });
+  const policy = structuredClone(readRoutingPolicy());
+  policy.operations.build.disabledProviders = [disabled];
+  policy.operations.build.effort = 'max';
+  const now = Date.parse('2026-11-19T12:00:00Z');
+  const result = resolveDispatchRoute({ kind: 'build', ...SCOPED, taskType: 'build-new-feature' }, { env: {}, now, routingPolicy: policy,
+    capacity: [{ provider: 'codex', model: 'gpt-6-astra', known: true, health: 1, windows: [{ usedPercent: 10, resetsAt: now + 3600000 }] }] });
+  if (disabled === 'codex') {
+    expect(result).toMatchObject({ outcome: 'refused', refusal: expect.stringContaining('no eligible capacity') });
+    expect(state.seen).toEqual([]);
+    return;
+  }
+  const projected = state.seen.at(-1).routingPolicy;
+  expect(projected.operations.build).toEqual({ ...policy.operations.build, fallback: [] });
+  expect(projected.operations['build:build-new-feature']).toMatchObject({ provider: 'codex', model: 'sol', disabledProviders: [disabled], effort: 'max' });
+  expect(result).toMatchObject({ outcome: 'routed', executed: 'codex' });
+});
+
+it('prepare capacity projection never overwrites prepare-decision or non-build policy', () => {
+  settingsDir({ 'routing.json': { routing: { builder: 'auto' } } });
+  const policy = readRoutingPolicy();
+  const now = Date.parse('2026-11-19T12:00:00Z');
+  const options = { env: {}, now, routingPolicy: policy, capacity: [{ provider: 'codex', known: true, health: 1,
+    windows: [{ usedPercent: 10, resetsAt: now + 3600000 }] }] };
+  for (const kind of ['prepare', 'prepare-item']) {
+    resolveDispatchRoute({ kind, ...SCOPED }, options);
+    const projected = state.seen.at(-1).routingPolicy;
+    expect(projected.operations['prepare-decision']).toBe(policy.operations['prepare-decision']);
+    expect(projected.smallPrepare).toBe(policy.smallPrepare);
+    expect(projected.operations[kind].effort).toEqual(policy.operations[kind].effort);
+  }
+  resolveDispatchRoute({ kind: 'prepare-decision', ...SCOPED }, options);
+  expect(state.seen.at(-1).routingPolicy).toBe(policy);
 });
