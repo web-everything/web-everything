@@ -94,6 +94,34 @@ export function probe(checkout) {
     deepStrictEqual(timed.calls, [1, 2]);
     deepStrictEqual(timed.reads, [1, 2]);
     deepStrictEqual(resumed.deferred, [at(3), at(1)]);
+
+    // PR #7330 red-team: repo discovery spends each pass's budget, so the daemon reaches one repo per pass and
+    // persists the cursor the pass returns. A capped orphan behind a no-op PR must still escalate in BOTH repos.
+    {
+      let time = 0;
+      const escalated = [];
+      const { ORPHAN_GUARD_MARKER } = await import(
+        pathToFileURL(join(checkout, 'scripts/conveyor/orphan-fix-round.mjs')));
+      const capped = [comments[0],
+        comment('2026-10-10T10:10:00Z', ORPHAN_GUARD_MARKER + ' — re-dispatched a fixer'),
+        comment('2026-10-10T10:20:00Z', ORPHAN_GUARD_MARKER + ' — re-dispatched a fixer'), comments[1]];
+      const base = { env: {}, nowMs: Date.parse('2026-10-10T12:00:00Z'), now: () => time, deadlineAt: 0,
+        listBounced: slug => { time += 1; return [1, 2].filter(n => !escalated.includes(slug + '#' + n))
+          .map(number => ({ number, labels: ['review:changes'], headRefOid: 'a'.repeat(40), isDraft: false })); },
+        readComments: async number => number === 2 ? capped : [],
+        isOwned: async () => false,
+        escalate: async ({ slug, pr }) => { escalated.push(slug + '#' + pr); return { ok: true }; },
+        rearm: async () => { throw new Error('unexpected rearm'); },
+        redispatch: async () => { throw new Error('unexpected redispatch'); },
+        postComment: () => {} };
+      let cursor = null;
+      for (const slug of ['org/a', 'org/b', 'org/a', 'org/b', 'org/a', 'org/b']) {
+        const report = await runOrphanFixRoundPass({ ...base, repos: [{ key: slug, slug }], cursor });
+        cursor = report.repoCursors ?? report.nextCursor;
+      }
+      deepStrictEqual(escalated.sort(), ['org/a#2', 'org/b#2'],
+        'each repo must keep its own deferred PR so every capped orphan escalates');
+    }
   `, checkout, ghRepoSlug('we')], { encoding: 'utf8', timeout: 15_000, maxBuffer: 1024 * 1024 });
   return { violations: child.status === 0 ? [] : [
     `bounded orphan-guard replay failed: ${child.error?.message ?? child.stderr ?? child.signal ?? child.status}`,

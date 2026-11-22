@@ -1199,9 +1199,8 @@ export async function runTickAllRepos({
     // A repo that deferred PRs keeps its PR cursor; when the loop finishes it must also head the next pass,
     // or a repo reached after the budget is spent starves despite the cursor. A budget STOP keeps the first
     // skipped (never visited) repo at the head: a visited deferred repo comes round again after it.
-    const retainedCursor = repo => phase === 'orphan-guard'
-      ? repoKeyForSlug(prCursors[phase]?.repo) === repoKeyForSlug(repo)
-      : prCursors[phase]?.[repo] != null;
+    // The orphan guard lists every repo before it reads a PR, so its head is set from its result instead (PR #7330).
+    const retainedCursor = repo => phase !== 'orphan-guard' && prCursors[phase]?.[repo] != null;
     for (let i = 0; i < ordered.length; i += 1) {
       if (((completedRepo || yieldedForAdoption) && shouldYield()) || now() - start > budget.budgetMs) {
         budget.hit = true;
@@ -1447,8 +1446,17 @@ export async function runTickAllRepos({
         }
       }
       phasePrCounts['orphan-guard'] = { handled: result?.handled ?? 0, deferred: result?.deferred?.length ?? 0 };
-      if (result?.nextCursor != null) prCursors['orphan-guard'] = result.nextCursor;
+      // Per-repo cursors (PR #7330): a repo's deferred PR survives passes that visit only other repos.
+      const nextCursor = result?.repoCursors ?? result?.nextCursor;
+      if (nextCursor != null) prCursors['orphan-guard'] = nextCursor;
       else delete prCursors['orphan-guard'];
+      // A repo listing that ran out of budget already parked the first unlisted repo at the head. Otherwise the repo
+      // where deferral began heads the next pass, so its remaining PRs run before the repos it already covered.
+      const listingStopped = budgets['orphan-guard'].skipped.length > 0;
+      const deferredHead = result?.deferred?.[0]?.repo;
+      const headRepo = deferredHead == null ? undefined
+        : repos.find(repo => repoKeyForSlug(repo) === repoKeyForSlug(deferredHead));
+      if (!listingStopped && headRepo !== undefined) budgetRotation['orphan-guard'] = headRepo;
       if (result?.deferred?.length) {
         budgets['orphan-guard'].hit = true;
         budgets['orphan-guard'].skipped.push(...result.deferred);

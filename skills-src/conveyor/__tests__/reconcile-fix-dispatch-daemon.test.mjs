@@ -2197,7 +2197,7 @@ describe('runTickAllRepos — one reconcile plan per repo per pass', () => {
     const first = await realRunTickAllRepos(options);
     const cursor = { repo: CONSTELLATION_REPOS.we.slug, pr: 2 };
     expect(visited).toEqual([1]);
-    expect(cursors['orphan-guard']).toEqual(cursor);
+    expect(cursors['orphan-guard']).toEqual({ [cursor.repo]: 2 });
     expect(tick.mock.calls[0][0]).toMatchObject({ deadlineAt: 1000, now: options.now, reconcile: expect.any(Function) });
     expect(first.phasePrCounts['orphan-guard']).toEqual({ handled: 1, deferred: 2 });
     expect(first.budgets['orphan-guard']).toMatchObject({ hit: true, skipped: [cursor, { repo: cursor.repo, pr: 3 }] });
@@ -2206,12 +2206,12 @@ describe('runTickAllRepos — one reconcile plan per repo per pass', () => {
     expect(formatPassPhaseTiming(first).find(line => line.includes('phase=orphan-guard '))).toContain('prs=1 deferred=2');
     const second = await realRunTickAllRepos(options);
     expect(visited).toEqual([1, 2]);
-    expect(tick.mock.calls[1][0].cursor).toEqual(cursor);
+    expect(tick.mock.calls[1][0].cursor).toEqual({ [cursor.repo]: 2 });
     expect(second.phasePrCounts['orphan-guard']).toEqual({ handled: 1, deferred: 2 });
     expect(second.budgets['orphan-guard'].skipped).toEqual([{ repo: cursor.repo, pr: 3 }, { repo: cursor.repo, pr: 1 }]);
     await realRunTickAllRepos(options);
     expect(visited).toEqual([1, 2, 3]);
-    expect(cursors['orphan-guard']).toEqual({ repo: cursor.repo, pr: 1 });
+    expect(cursors['orphan-guard']).toEqual({ [cursor.repo]: 1 });
   });
 
   it.each([
@@ -2421,6 +2421,47 @@ describe('runTickAllRepos — one reconcile plan per repo per pass', () => {
     expect(second.stuckFixers.orphanRounds.rows).toContainEqual(expect.objectContaining({
       pr: 4715, decision: 'escalate', result: 'escalated',
     }));
+  });
+
+  // PR #7330 red-team: a repo's deferred PR cursor was one global value, so visiting another repo overwrote it and
+  // a capped orphan behind a no-op PR was never inspected while repo discovery exhausted the budget each pass.
+  it.each([
+    { keys: ['we', 'frontierui'], listMs: 1001 },
+    { keys: ['we', 'frontierui', 'plateau-app'], listMs: 1001 },
+    { keys: ['we', 'frontierui', 'plateau-app'], listMs: 600 },
+  ])('keeps each repo\'s deferred orphan cursor across repo rotation so every capped orphan escalates (%j)', async ({ keys, listMs }) => {
+    const f = productionFixture();
+    vi.spyOn(rulingStandDown, 'runRulingResolvesStandDownPass').mockResolvedValue({ rows: [] });
+    let time = Date.parse('2026-10-10T16:00:00Z');
+    const comment = (hour, body) => ({ createdAt: `2026-10-10T${hour}:00:00Z`, body,
+      author: { login: 'web-everything' }, includesCreatedEdit: false });
+    const cappedComments = [comment('10', orphanFixRound.CHANGES_VERDICT_PREFIX),
+      comment('11', `${orphanFixRound.ORPHAN_GUARD_MARKER} — re-dispatched a fixer`),
+      comment('12', `${orphanFixRound.ORPHAN_GUARD_MARKER} — re-dispatched a fixer`),
+      comment('13', FIX_END_MARKER)];
+    const pr = number => ({ number, labels: ['review:changes'], isDraft: false, headRefOid: 'a'.repeat(40) });
+    expect(orphanFixRound.planOrphanFixRound({ pr: { ...pr(1), comments: [] }, nowMs: time }).decision).toBe('none');
+    expect(orphanFixRound.planOrphanFixRound({ pr: { ...pr(2), comments: cappedComments }, nowMs: time }).decision).toBe('escalate');
+    const slugs = keys.map(key => CONSTELLATION_REPOS[key].slug);
+    const escalated = new Set();
+    const inspected = [];
+    const cursors = {};
+    const options = { ...f.options, repos: keys, now: () => time, budgetRotation: {}, prCursors: cursors,
+      listBouncedPrs: () => [],
+      passBudgets: resolveFixPassBudgets({ env: {}, file: { fixPassBudget: { orphanGuardMs: 1000 } } }),
+      orphanGuardTick: options => orphanFixRound.runOrphanFixRoundPass({ ...options, env: {},
+        listBounced: slug => { time += listMs; return [1, 2].filter(n => !escalated.has(`${slug}#${n}`)).map(pr); },
+        isOwned: async () => false,
+        readComments: async (number, slug) => { inspected.push(`${slug}#${number}`); return number === 2 ? cappedComments : []; },
+        escalate: async ({ slug, pr: number }) => { escalated.add(`${slug}#${number}`); return { ok: true }; },
+        rearm: async () => ({ ok: false, why: 'unexpected' }), redispatch: async () => ({ ok: false, why: 'unexpected' }),
+        postComment: () => {} }),
+    };
+    for (let pass = 0; pass < 4 * keys.length && escalated.size < keys.length; pass += 1) {
+      await realRunTickAllRepos(options);
+    }
+    expect([...escalated].sort()).toEqual(slugs.map(slug => `${slug}#2`).sort());
+    expect(inspected.length).toBeLessThanOrEqual(4 * keys.length * 2);
   });
 
   it.each(['throws', 'returns early'])('defers fix until next pass when orphan-guard %s before completing a repo', async mode => {

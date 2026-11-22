@@ -476,7 +476,8 @@ describe('runOrphanFixRoundPass — IO shell', () => {
   it.each([[1, Infinity], [1, 0], [3, Infinity], [3, 0]])('rotates every repo and PR around the deadline cursor without losing coverage (first %s, budget %s)', async (progress, budget) => {
     const repos = [{ key: 'b', slug: 'org/b' }, { key: 'a', slug: 'org/a' }];
     const at = (repo, pr) => ({ repo: `org/${repo}`, pr });
-    const all = [at('a', 1), at('a', 2), at('b', 1), at('b', 2)];
+    // Repos run in the order the caller yields them; the daemon heads the next pass with the first deferred repo.
+    const all = [at('b', 1), at('b', 2), at('a', 1), at('a', 2)];
     const visited = [];
     const listed = [];
     const s = seams([], { repos: (function* () { yield* repos; })(),
@@ -488,7 +489,9 @@ describe('runOrphanFixRoundPass — IO shell', () => {
     expect(first.deferred).toEqual(all.slice(progress));
     visited.length = 0;
     listed.length = 0;
-    const second = await runOrphanFixRoundPass({ ...s, repos, cursor: first.nextCursor, deadlineAt: budget });
+    const headAt = repos.findIndex(repo => repo.slug === first.deferred[0].repo);
+    const headed = [...repos.slice(headAt), ...repos.slice(0, headAt)];
+    const second = await runOrphanFixRoundPass({ ...s, repos: headed, cursor: first.repoCursors, deadlineAt: budget });
     const rotated = [...all.slice(progress), ...all.slice(0, progress)];
     expect(visited).toEqual(budget === Infinity ? rotated : [rotated[0]]);
     expect(second.deferred).toEqual(budget === Infinity ? [] : rotated.slice(1));
@@ -501,8 +504,13 @@ describe('runOrphanFixRoundPass — IO shell', () => {
     [{ repo: 'org/b', pr: 1 }, ['b2', 'a1', 'a2']],
     [{ repo: 'b', pr: 1 }, ['b2', 'a1', 'a2']],
     [{ repo: 'org/aa', pr: 9 }, ['b2', 'a1', 'a2']],
-    [{ repo: 'org/z', pr: 9 }, ['a1', 'a2', 'b2']],
-  ])('resumes a missing cursor at its sorted successor or wraps: %j', async (cursor, expected) => {
+    [{ repo: 'org/b', pr: 9 }, ['a1', 'a2', 'b2']],
+    [{ 'org/b': 9 }, ['a1', 'a2', 'b2']],
+    [{ 'org/a': 2, 'org/b': 2 }, ['b2', 'a2', 'a1']],
+    [{ a: 2 }, ['b2', 'a2', 'a1']],
+    [{ 'org/a': 0, 'org/b': 'x' }, ['b2', 'a1', 'a2']],
+    [['org/a', 2], ['b2', 'a1', 'a2']],
+  ])('resumes each repo at its own cursor, a missing PR at its successor, or wraps that repo last: %j', async (cursor, expected) => {
     const visited = [];
     await runOrphanFixRoundPass(seams([], {
       repos: [{ key: 'b', slug: 'org/b' }, { key: 'a', slug: 'org/a' }], cursor,
@@ -510,6 +518,26 @@ describe('runOrphanFixRoundPass — IO shell', () => {
       isOwned: async (key, pr) => { visited.push(`${key}${pr}`); return true; },
     }));
     expect(visited).toEqual(expected);
+  });
+
+  // PR #7330 red-team: passes that each reach one repo must not overwrite the other repo's deferred PR.
+  it('keeps an unlisted or unreadable repo\'s cursor while advancing the listed repo\'s own cursor', async () => {
+    let time = 0;
+    const inspected = [];
+    const s = seams([], { now: () => time, deadlineAt: 10,
+      listBounced: slug => { if (slug === 'org/c') throw new Error('unreadable'); time += 11; return [2, 1].map(number => ({ number })); },
+      isOwned: async (key, pr) => { inspected.push(`${key}${pr}`); return true; } });
+    let cursor = null;
+    for (const repo of ['a', 'b', 'a', 'b']) {
+      const pass = await runOrphanFixRoundPass({ ...s, repos: [{ key: repo, slug: `org/${repo}` }, { key: 'c', slug: 'org/c' }], cursor });
+      cursor = pass.repoCursors;
+    }
+    expect(inspected).toEqual(['a1', 'b1', 'a2', 'b2']);
+    expect(cursor).toEqual({ 'org/a': 1, 'org/b': 1 });
+    const legacy = await runOrphanFixRoundPass({ ...s, repos: [{ key: 'b', slug: 'org/b' }], cursor: { repo: 'org/a', pr: 2 } });
+    expect(legacy.repoCursors).toEqual({ 'org/a': 2, 'org/b': 2 });
+    const cleared = await runOrphanFixRoundPass({ ...s, deadlineAt: Infinity, repos: [{ key: 'a', slug: 'org/a' }], cursor: { 'org/a': 2, 'org/b': 2 } });
+    expect(cleared.repoCursors).toEqual({ 'org/b': 2 });
   });
 
   it('reports an earlier repo listing failure even when resuming in a later repo', async () => {

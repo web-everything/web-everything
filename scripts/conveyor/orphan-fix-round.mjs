@@ -261,7 +261,8 @@ export function defaultPostComment({ slug, pr, body, exec = execFileSync }) {
 
 /**
  * ONE guard pass over every constellation repo. Never throws; one PR's failure never stops the rest.
- * @returns {Promise<{enabled:boolean, rows:Array<object>, handled:number, deferred:Array<object>, nextCursor:object|null}>}
+ * `cursor` is the per-repo map a previous pass returned as `repoCursors` (or a legacy single `{repo, pr}`).
+ * @returns {Promise<{enabled:boolean, rows:Array<object>, handled:number, deferred:Array<object>, nextCursor:object|null, repoCursors:object|null}>}
  */
 export async function runOrphanFixRoundPass({
   env = process.env,
@@ -286,19 +287,22 @@ export async function runOrphanFixRoundPass({
   const enabled = orphanGuardEnabled(env);
   const rows = [], deferred = [];
   let handled = 0, redispatched = false, deferring = false;
-  const entries = [];
-  let cursorRepo = cursor?.repo;
+  // Each repo keeps its OWN resume point (PR #7330): a pass that reaches only some repos must not overwrite the
+  // deferred progress of a repo it never listed. A legacy single `{repo, pr}` cursor migrates to one entry.
+  const repoCursors = normalizeOrphanCursors(cursor);
+  const resumeAt = (key, slug) => repoCursors[slug] ?? repoCursors[key];
+  const listed = [], head = [], wrapped = [];
   for (const { key, slug } of repos) {
-    if (key === cursor?.repo) cursorRepo = slug;
     let prs;
     try { prs = listBounced(slug); } catch (e) { rows.push({ repo: slug, decision: 'error', reason: `listing failed: ${String(e?.message ?? e).split('\n')[0]}` }); continue; }
-    for (const p of prs ?? []) entries.push({ key, slug, p });
+    listed.push({ key, slug });
+    // Repos run in the order the caller yields them (the daemon rotates that order fairly); each repo resumes at
+    // its cursor, and the PRs before it run after every repo's resumed part so one large repo never starves the rest.
+    const at = resumeAt(key, slug);
+    const own = [...(prs ?? [])].sort((a, b) => a.number - b.number);
+    for (const p of own) (at != null && p.number < at ? wrapped : head).push({ key, slug, p });
   }
-  // Rotate the complete inventory: resuming must never hide unchecked PRs from the daemon.
-  entries.sort((a, b) => a.slug < b.slug ? -1 : a.slug > b.slug ? 1 : a.p.number - b.p.number);
-  const start = cursor == null ? 0 : entries.findIndex(({ slug, p }) =>
-    slug > cursorRepo || (slug === cursorRepo && p.number >= cursor.pr));
-  const ordered = start > 0 ? [...entries.slice(start), ...entries.slice(0, start)] : entries;
+  const ordered = [...head, ...wrapped];
   for (const { key, slug, p } of ordered) {
     if (deferring || (handled > 0 && (now() >= deadlineAt || shouldYield?.()))) {
       deferring = true;
@@ -339,7 +343,23 @@ export async function runOrphanFixRoundPass({
       row.result = `error: ${String(e?.message ?? e).split('\n')[0]}`;
     }
   }
-  return { enabled, rows, handled, deferred, nextCursor: deferred[0] ?? null };
+  // A listed repo's cursor becomes its first deferred PR (or clears); an unlisted repo's cursor is kept untouched.
+  const nextRepoCursors = { ...repoCursors };
+  for (const { key, slug } of listed) { delete nextRepoCursors[key]; delete nextRepoCursors[slug]; }
+  for (const d of deferred) nextRepoCursors[d.repo] ??= d.pr;
+  return { enabled, rows, handled, deferred, nextCursor: deferred[0] ?? null,
+    repoCursors: Object.keys(nextRepoCursors).length ? nextRepoCursors : null };
+}
+
+/** Per-repo orphan cursors `{ <repo>: <pr> }`; accepts the legacy single `{ repo, pr }` cursor. Invalid → none. */
+export function normalizeOrphanCursors(cursor) {
+  if (cursor === null || typeof cursor !== 'object' || Array.isArray(cursor)) return {};
+  const valid = ([repo, pr]) => typeof repo === 'string' && repo.length > 0 && Number.isSafeInteger(pr) && pr > 0;
+  const keys = Object.keys(cursor);
+  if (keys.length === 2 && keys.includes('repo') && keys.includes('pr')) {
+    return valid([cursor.repo, cursor.pr]) ? { [cursor.repo]: cursor.pr } : {};
+  }
+  return Object.fromEntries(Object.entries(cursor).filter(valid));
 }
 
 export function formatOrphanFixRoundLines(result) {
