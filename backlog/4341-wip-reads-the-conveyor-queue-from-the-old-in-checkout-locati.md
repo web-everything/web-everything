@@ -3,6 +3,7 @@ bornAs: xykd1x3
 kind: story
 size: 2
 status: open
+scopeRationale: "the old in-checkout queue file is the stale path being replaced, not a deliverable"
 scope: ["plateau:src/wip/wip-read.ts", "plateau:src/wip/wip-read.test.ts"]
 dateOpened: "2026-09-28"
 preparedDate: "2026-09-30"
@@ -105,3 +106,5 @@ against `we:scripts/conveyor/queue.mjs list --json`.
 1. **Executable** — `npx vitest run plateau:src/wip/wip-read.test.ts` passes with a case asserting the
    conveyor-queue read goes through `resolveQueuePath()` (not a hardcoded `we:.conveyor/queue.json` join),
    plus the old-shaped-`weRoot` degrade case.
+
+Will be closed when plan step PD-LIVE (delivery plan) delivers; ruled 2026-11-22 (PL-WIP-CLEANUP).

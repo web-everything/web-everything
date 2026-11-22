@@ -1,7 +1,10 @@
 ---
 kind: story
 size: 5
-status: open
+status: parked
+parkedReason: maturityGated
+maturityTrigger: "adoptionSignal: dev-browser live patch (#410) ships and Platform > Governance exists."
+dateParked: "2026-11-22"
 blockedBy: ["410", "554"]
 dateOpened: "2026-06-14"
 tags: [dev-browser, live-patch, deployed-app, saas, policy, governance, hosted]
@@ -22,3 +25,5 @@ tags: [dev-browser, live-patch, deployed-app, saas, policy, governance, hosted]
 
 Pure configuration surface for already-ratified axes — no new policy semantics, just their management home.
 Sibling hosted work: the collaboration epic (#555) and the audit/compliance dashboard (#557).
+
+Parked 2026-11-22 (plateau ruling, master plan). Unpark when: dev-browser live patch (#410) ships and Platform > Governance exists.

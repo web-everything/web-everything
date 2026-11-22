@@ -2,7 +2,10 @@
 bornAs: xrpeaug
 kind: epic
 parent: "2527"
-status: open
+status: parked
+parkedReason: maturityGated
+maturityTrigger: "adoptionSignal: Phase 2; SaaS cost governance for a hosted builder."
+dateParked: "2026-11-22"
 priority: low
 dateOpened: "2026-07-16"
 tags: [plateau-loop, builder, saas, cost-control, governance]
@@ -62,3 +65,5 @@ out of auto-select, per the epic's "no slice built until un-deferred" rule.
    plus global/per-tenant kill-switches and runaway auto-pause (req 5). Independent of metering.
 3. **Per-tenant budget-gate** — spend + build-count quotas enforced *before* a build starts (req 1).
    `blockedBy` cost-metering: a spend quota needs the trustworthy metered record first.
+
+Parked 2026-11-22 (plateau ruling, master plan). Unpark when: Phase 2; SaaS cost governance for a hosted builder.

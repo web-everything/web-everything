@@ -43,3 +43,5 @@ PR #2360 (merge commit 2866bdfcc, 2026-09-21) delivered the source-tracking half
 - Done-when 6 is NOT met. The tracked we:.claude/commands/continue.md still says "Prototype PR = #1853" and "PR #2334 has merged" and names `lane-54`; the tracked we:.claude/commands/handoff.md still names `lane-54`; no test scans them. Those two files were tracked byte for byte, as deployed, with the text unchanged.
 
 Remaining before this card can resolve: the state-naming cleanup and its scan test (Done-when 6), and the choice on the pre-overwrite warning (design point 4). The hard-coded personal clone in we:.claude/commands/wip.md goes away when the report CLI graduates to main (#3443, PR #2360 "Owed").
+
+Will be closed when carry card x23lblp delivers; ruled 2026-11-22 (PL-WIP-CLEANUP).

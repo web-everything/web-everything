@@ -4,7 +4,10 @@ kind: story
 size: 2
 tier: pinned
 parent: "2804"
-status: open
+status: parked
+parkedReason: maturityGated
+maturityTrigger: "adoptionSignal: #2811 is unparked (shared floor predicate)."
+dateParked: "2026-11-22"
 dateOpened: "2026-08-02"
 blockedBy: ["2810"]
 scope:
@@ -190,3 +193,5 @@ code changes.
 Introspection capture from the independent review of plateau-app PR #133 (the #2810 geometry+theme lib). Not
 a live defect — a DRY hazard surfaced while the reviewer traced why the lib and the harness both own a
 `grid-collapsed` code path. Filed so the third shared predicate lands the same way the first two did.
+
+Parked 2026-11-22 (plateau ruling, master plan). Unpark when: #2811 is unparked (shared floor predicate).

@@ -217,3 +217,5 @@ unblocked, informed by the actual ratified gate wording.
   `we:src/assets/favicon.svg`'s construction (owned by #2251), `frontierui:src/assets/logo.svg`'s
   construction (owned by #2252), `plateau-app:favicon.svg`'s construction (owned by #2253), and the act
   of ratifying #2209 itself (owned by the decision-owner on the #2209 card, not this story).
+
+Will be closed when carry card xt9bmkj delivers; ruled 2026-11-22 (PL-BRAND-RATIFY).
