@@ -2290,6 +2290,7 @@
   "scripts/conveyor/soak/breaks/red-team-bare-flag-mode-mismatch.soak.test.mjs": 1.5,
   "scripts/conveyor/soak/breaks/overlay-main-sync-tests-stderr-tail.soak.test.mjs": 1.5,
   "scripts/conveyor/soak/breaks/overlay-main-sync-killed-run-cause.soak.test.mjs": 1.5,
+  "scripts/conveyor/soak/breaks/overlay-main-sync-chunked-run-budget.soak.test.mjs": 1.5,
   "scripts/conveyor/soak/breaks/red-team-clear-reverted-by-unfinished-review.soak.test.mjs": 1.5,
   "scripts/conveyor/soak/breaks/red-team-gate-send-back-failed-never-retried.soak.test.mjs": 1.5,
   "scripts/conveyor/soak/breaks/withdrawn-operator-block-directs-takeover.soak.test.mjs": 0.53,
