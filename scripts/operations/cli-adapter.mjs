@@ -1,3 +1,6 @@
+import { execFileSync } from 'node:child_process';
+import { resolveBuilder } from '../lib/review-builder.mjs';
+import { independentReviewRequest, isIndependentReviewSeat } from '../lib/review-seat-independence.mjs';
 import { carbonNonShadowAllowed } from '../lib/review-seat-settings.mjs';
 import { seatTiming, withSeatTiming } from './review-seat-timing-core.mjs';
 /**
@@ -800,6 +803,7 @@ function judgeTelemetryFrom(outcome, effective) {
 export function createDefaultJudge({
   provider, providerName: factoryProviderName, cwd: factoryCwd, model, operation = 'judge', resolveProvider = resolveJudgeProvider,
   checkProviderHold = defaultProviderQuotaHold,
+  appendSeat = null,
   now = () => Date.now(),
   logGracefulOutcome = (line) => { try { process.stderr.write(`${line}\n`); } catch { /* best effort */ } },
   // Card 84 — the seat runner a `seatProvider` request goes to. Injectable so a test drives THIS wrapper (not the
@@ -915,6 +919,7 @@ export function createDefaultJudge({
         : resolveProvider(spawnProviderName);
       try {
         const actual = configured && spawnProviderName !== effectiveProviderName ? { ...effective, ...configured.fallback.find(route => route.provider === spawnProviderName), providerName: spawnProviderName } : effective;
+        if (request.reviewBuilder && !isIndependentReviewSeat(request.lens, actual.model ?? spawnProviderName, request.reviewBuilder)) throw new Error('WAIT: judge fallback lacks cross-vendor independence');
         const outcome = await spawnProvider(buildProviderRequest(actual, cwd, spawnProviderName));
         // NOT a spread of `outcome` — see the ordinary path's own note just below.
         return judgeOutcome(outcome.value, judgeTelemetryFrom(outcome, actual));
@@ -955,9 +960,37 @@ export function createDefaultJudge({
     // #4815 — a request that already carries its own answer (`skipSpawn.answer`) spawns nothing: the step declared a judge turn
     // whose work turned out to be empty (no claim to verify) or impossible (no readable diff), and says what to record instead.
     if (request?.skipSpawn && typeof request.skipSpawn === 'object' && request.skipSpawn.answer != null) return judgeOutcome(request.skipSpawn.answer);
-    if (request?.seatProvider == null) return judge(request, opts);
     const laneCwd = opts?.cwd || factoryCwd;
-    return seatRunner(request, { claudeJudge: (r) => judge(r, opts), unwrap: unwrapJudgeOutcome, wrap: judgeOutcome, cwd: laneCwd ?? null });
+    let builder;
+    if (request.reviewContext) {
+      const context = request.reviewContext;
+      let headMessage = context.headMessage ?? '';
+      if (!headMessage && /^[0-9a-f]{40}$/i.test(context.head ?? '') && laneCwd) {
+        try { headMessage = execFileSync('git', ['show', '-s', '--format=%B', context.head], { cwd: laneCwd, encoding: 'utf8', timeout: 5000, maxBuffer: 128 * 1024 }); } catch { /* unknown holds */ }
+      }
+      const identity = resolveBuilder({ body: context.body, headMessage });
+      builder = identity.model !== 'unknown' ? identity.model : identity.provider;
+      request = independentReviewRequest({ ...request, reviewBuilder: builder }, builder);
+      if (['correctness', 'security'].includes(request.lens) && !request.seatProvider && !request.providerName && factoryProviderName && factoryProviderName !== 'claude') request = { ...request, providerName: 'claude' };
+    }
+    const execute = async () => request.seatProvider == null ? judge(request, opts)
+      : seatRunner(request, { claudeJudge: r => judge(builder ? independentReviewRequest({ ...r, providerName: 'claude', model: 'claude-sonnet-5-5' }, builder) : r, opts),
+        unwrap: unwrapJudgeOutcome, wrap: judgeOutcome, cwd: laneCwd ?? null });
+    if (!request.reviewContext) return execute();
+    const record = async (outcome, error) => {
+      const { appendSeatAttempt, seatAttempt } = await import('../lib/review-seat-ledger.mjs');
+      if (!(appendSeat ?? appendSeatAttempt)(seatAttempt(request, outcome && unwrapJudgeOutcome(outcome), error))) throw new Error('WAIT: review seat ledger unavailable');
+    };
+    let result;
+    try { result = await execute(); } catch (error) { await record(null, error); throw error; }
+    const observed = unwrapJudgeOutcome(result).telemetry?.model;
+    if (builder && observed && !isIndependentReviewSeat(request.lens, observed, builder)) {
+      const error = new Error('WAIT: observed reviewer model is not cross-vendor');
+      await record(null, error);
+      throw error;
+    }
+    await record(result);
+    return result;
   };
   routedJudge.providerName = providerName;
   return routedJudge;

@@ -1431,6 +1431,7 @@ export function shapeReadFinding(raw, { pr, repo, careLevel } = {}) {
     url: String(detail.url || ''),
     headRefName: String(raw.headRefName || ''),
     body: String(raw.body || ''),
+    headMessage: String(raw.headMessage || ''),
     // #xwk0tzu — WHAT THE INDEPENDENCE CHECK ANSWERED, recorded even when it did not refuse. A status that
     // only ever appears in a thrown message is invisible on every run that proceeds, and the two statuses
     // that proceed WITHOUT proving independence (`unknown-author`, `stamp-lost`) are exactly the ones a
@@ -1595,6 +1596,7 @@ export function buildReviewJudgeRequest({ read, lens, aim = '', seatProvider = n
     input: renderJudgeInput(read),
     shape: REVIEW_JUDGE_SHAPE,
     lens,
+    reviewContext: { repo: read.repo, pr: read.pr, head: read.netBasis?.rev, body: read.body, headMessage: read.headMessage },
     model: JUDGE_MODEL,
     effort: JUDGE_EFFORT,
     budget: JUDGE_BUDGET_USD,
@@ -1668,6 +1670,7 @@ export const CODEX_ADVISORY_SANDBOX_CORRECTION = [
  */
 export function buildReviewAdvisoryJudgeRequest({ read, aim = '' }) {
   return {
+    reviewContext: { repo: read.repo, pr: read.pr, head: read.netBasis?.rev, body: read.body, headMessage: read.headMessage },
     // #xqa9ttq — `CODEX_ADVISORY_SANDBOX_CORRECTION` is appended, not spliced in: it corrects the shared
     // mandate's "no tools at all" framing for THIS seat only, without touching `buildPanelMandate`'s text
     // (shared by every other, genuinely tool-free-or-tool-bearing, panel seat).
@@ -1770,6 +1773,7 @@ export function buildReviewCorrectnessAdvisoryMandate({ read, aim = '' }) {
  */
 export function buildReviewCorrectnessAdvisoryJudgeRequest({ read, aim = '' }) {
   return {
+    reviewContext: { repo: read.repo, pr: read.pr, head: read.netBasis?.rev, body: read.body, headMessage: read.headMessage },
     mandate: buildReviewCorrectnessAdvisoryMandate({ read, aim }),
     input: renderJudgeInput(read),
     shape: REVIEW_JUDGE_SHAPE,
@@ -1870,8 +1874,11 @@ export function buildReviewAntigravityMandate({ read, aim = '' }) {
  * @param {string} [o.aim] - the caller's #3094 hypothesis, or `''`.
  * @returns {object} the judge request.
  */
-export function buildReviewAntigravityJudgeRequest({ read, aim = '' }) {
+export function buildReviewAntigravityJudgeRequest({ read, aim = '', sampleRate = 0.1 }) {
+  const sampled = shadowSeatStatus({ shadowPolicy: { shadowEnabled: true, scope: 'sampled', sampleRate } }, read) === 'sampled';
   return {
+    ...(!sampled ? { skipSpawn: { answer: { summary: 'agy advisory off (sample)', findings: [], skipped: { reason: 'off (sample)' } } } } : {}),
+    reviewContext: { repo: read.repo, pr: read.pr, head: read.netBasis?.rev, body: read.body, headMessage: read.headMessage },
     mandate: buildReviewAntigravityMandate({ read, aim }),
     input: renderJudgeInput(read),
     shape: REVIEW_JUDGE_SHAPE,
@@ -1925,8 +1932,11 @@ export function buildReviewAgyCorrectnessMandate({ read, aim = '' }) {
  * (`mode: 'agy'`, `onEscape: 'skip'`) routes it to the agy juror, and an escape or failure records the seat as
  * skipped rather than spending a Claude juror on an advisory opinion. PURE.
  */
-export function buildReviewAgyCorrectnessJudgeRequest({ read, aim = '', model }) {
+export function buildReviewAgyCorrectnessJudgeRequest({ read, aim = '', model, sampleRate = 0.1 }) {
+  const sampled = shadowSeatStatus({ shadowPolicy: { shadowEnabled: true, scope: 'sampled', sampleRate } }, read) === 'sampled';
   return {
+    reviewContext: { repo: read.repo, pr: read.pr, head: read.netBasis?.rev, body: read.body, headMessage: read.headMessage },
+    ...(!sampled ? { skipSpawn: { answer: { summary: 'agy advisory off (sample)', findings: [], skipped: { reason: 'off (sample)' } } } } : {}),
     mandate: buildReviewAgyCorrectnessMandate({ read, aim }),
     input: renderJudgeInput(read),
     shape: REVIEW_JUDGE_SHAPE,
@@ -2823,6 +2833,7 @@ export function reviewPrOperation({
           read: view.findings.read,
           aim: typeof view.input.aim === 'string' ? view.input.aim : '',
           model: seatSettings.agyModel,
+          sampleRate: seatSettings.shadowPolicy?.sampleRate ?? 0.1,
         }),
       }),
     } : {}),
@@ -3055,7 +3066,7 @@ export function reviewPrOperation({
           if (answer.skipped) skippedSeats.push({ lens: seat.lens, reason: String(answer.skipped.reason ?? seatSummary) });
         }
 
-        // Carbon is a negative-only companion, not a correctness decider or a counted pass.
+        // Historical persisted companion runs retain their blockers when resumed.
         // Keep its blockers even when a prior referral is already covered: dedupe the referral,
         // never erase the finding (including its prevention guard) or turn it into an accept.
         let carbonSendBack = false;

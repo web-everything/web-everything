@@ -83,7 +83,7 @@ function fakeIo(over = {}) {
     makeScratch: (o) => { calls.push(['scratch', o]); return '/tmp/x00g3tt-scratch'; },
     removeScratch: (d) => calls.push(['rm', d]),
     writeFile: (p, t) => calls.push(['write', p, t]),
-    readHeadMessage: (_dir, rev) => rev ? '' : 'fix: guard\n\nCo-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>\n',
+    readHeadMessage: (_dir, rev) => 'fix: guard\n\nCo-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>\n',
     runSeat: async (o) => { calls.push(['seat', o]); return { report: report(o.provider, answer([BREAK])) }; },
     runRecheck: async (o) => { calls.push(['recheck', o]); return { checks: [{ index: 0, confirmed: true, reason: 'the diff divides by n with no zero check' }] }; },
     logTrial: (row) => { trials.push(row); return row; },
@@ -208,15 +208,12 @@ describe('x00g3tt — the red team fires on ACCEPT only', () => {
     expect(calls.some((c) => c[0] === 'seat')).toBe(false);
   });
 
-  it('card xn2wf9t — codex AT ITS OWN CAP still runs the red team, falling back to an antigravity backend (never "no seat")', async () => {
+  it('waits when capped Codex leaves only same-vendor Claude emergency seats for a Claude builder', async () => {
     const spent = [{ dispatchKind: REVIEW_SEAT_DISPATCH_KIND, provider: 'codex', callId: 'old-1', scoredAt: new Date(NOW).toISOString(), status: 'ok' }];
     const { io, calls } = fakeIo({ readRecords: () => spent });
     const r = await runRedTeam({ pr: 5, repo: REPO, lanePath: '/lane', loopPayload: payload('accept'), env: { [PROVIDER_CAP_ENV.codex]: '1' } }, io);
-    expect(r.status).toBe('ran');
-    expect(['agy-claude', 'agy-gemini']).toContain(r.provider);
-    const seats = calls.filter((c) => c[0] === 'seat');
-    expect(seats).toHaveLength(1);
-    expect(seats[0][1].provider).not.toBe('codex');
+    expect(r).toMatchObject({ status: 'skipped', deferredByCap: true, reason: expect.stringContaining('WAIT') });
+    expect(calls.some(c => c[0] === 'seat' || c[0] === 'reserve')).toBe(false);
   });
 
   it('never runs twice for the same head once a clean row exists', async () => {
@@ -998,10 +995,10 @@ describe('security classification policy transitions', () => {
 describe('R1077 builder company routing', () => {
   beforeEach(() => resolveOperationRoute.mockImplementation(resolvePolicyRoute));
   const input = body => ({ pr: 5, repo: REPO, lanePath: '/lane', read: payload('accept', body).findings.read, env: {} });
-  const marker = provider => buildDelegationMarker({ provider, model: provider === 'codex' ? 'gpt-6.1-sol' : 'claude-sonnet-5-5', taskType: 'bugfix' });
+  const marker = provider => buildDelegationMarker({ provider, model: provider === 'codex' ? 'gpt-6.1-sol' : provider === 'agy-gemini' ? 'gemini-4-carbon-high' : 'claude-sonnet-5-5', taskType: 'bugfix' });
   const policyIo = over => fakeIo({ readRoutingPolicy: () => structuredClone(DEFAULT_ROUTING_POLICY), readSeatSettings: () => ({ tool: {}, platform: {} }), ...over });
 
-  it.each([['codex', 'agy-claude', RED_TEAM_MODELS['agy-claude'].model], ['claude', 'codex', 'gpt-6.1-sol'], ['agy-claude', 'codex', 'gpt-6.1-sol']])('routes %s builders to %s/%s', async (builder, provider, model) => {
+  it.each([['codex', 'agy-claude', RED_TEAM_MODELS['agy-claude'].model], ['claude', 'codex', 'gpt-6.1-sol'], ['agy-claude', 'codex', 'gpt-6.1-sol'], ['agy-gemini', 'codex', 'gpt-6.1-sol']])('routes %s builders to %s/%s', async (builder, provider, model) => {
     const { io, calls } = policyIo();
     expect((await speculateRedTeam(input(marker(builder)), io)).status).toBe('speculated');
     expect(calls.find(c => c[0] === 'seat')[1]).toMatchObject({ provider, model });
@@ -1129,13 +1126,18 @@ describe('R1077 builder company routing', () => {
     expect(calls.some(c => c[0] === 'reserve' && c[1] === 'codex')).toBe(false);
   });
 
-  it.each(['codex', 'claude', 'unknown'])('uses and logs emergency agy-claude only when both ordinary providers are capped for %s', async builder => {
+  it.each(['codex', 'claude', 'unknown'])('only an independent emergency provider may launch for %s', async builder => {
     const { io, calls } = policyIo({ readHeadMessage: () => '' });
     const args = input(builder === 'unknown' ? 'no marker' : marker(builder));
     args.env = { WE_REVIEW_SEAT_CAP_CODEX: '0', WE_REVIEW_SEAT_CAP_AGY_GEMINI: '0' };
-    expect((await speculateRedTeam(args, io)).status).toBe('speculated');
-    expect(calls.find(c => c[0] === 'seat')[1].provider).toBe('agy-claude');
-    expect(calls.some(c => c[0] === 'log' && /emergency fallback to agy-claude/.test(c[1]))).toBe(true);
+    const result = await speculateRedTeam(args, io);
+    if (builder === 'codex') {
+      expect(result.status).toBe('speculated');
+      expect(calls.find(c => c[0] === 'seat')[1].provider).toBe('agy-claude');
+    } else {
+      expect(result).toMatchObject({ status: 'skipped', deferredByCap: true, reason: expect.stringContaining('WAIT') });
+      expect(calls.some(c => c[0] === 'reserve' || c[0] === 'seat')).toBe(false);
+    }
   });
 
   it('keeps the emergency seat when capped ordinary providers also lack their CLIs', async () => {
@@ -1181,15 +1183,14 @@ describe('R1077 builder company routing', () => {
     const args = input('no marker');
     args.env.WE_REVIEW_SEAT_CAP_CODEX = '0';
     args.env.WE_REVIEW_SEAT_CAP_AGY_GEMINI = '20';
-    expect((await speculateRedTeam(args, io)).status).toBe('speculated');
-    expect(calls.find(c => c[0] === 'seat')[1].provider).toBe('agy-gemini');
-    expect(calls.some(c => c[0] === 'log' && /fallback to agy-gemini/.test(c[1]))).toBe(true);
+    expect(await speculateRedTeam(args, io)).toMatchObject({ status: 'skipped', deferredByCap: true, reason: expect.stringContaining('WAIT') });
+    expect(calls.some(c => c[0] === 'reserve' || c[0] === 'seat')).toBe(false);
   });
 
   it('refuses invalid routing evidence even with an ordinary provider at cap', async () => {
     const { io, calls } = policyIo({ readHeadMessage: () => '' });
     resolveOperationRoute.mockImplementationOnce(() => { throw new Error('invalid routing evidence'); });
-    const args = input('no marker');
+    const args = input(marker('claude'));
     args.env.WE_REVIEW_SEAT_CAP_CODEX = '0';
     args.env.WE_REVIEW_SEAT_CAP_AGY_GEMINI = '20';
     expect(await speculateRedTeam(args, io)).toMatchObject({ status: 'skipped', reason: expect.stringContaining('invalid routing evidence') });
@@ -1203,6 +1204,7 @@ describe('R1077 builder company routing', () => {
     if (builder === 'codex') {
       expect(calls.find(c => c[0] === 'seat')[1].provider).toBe('agy-claude');
       expect(calls.some(c => c[0] === 'reserve' && c[1] === 'codex')).toBe(false);
-    } else expect(calls.find(c => c[0] === 'seat')[1]).toMatchObject({ provider: 'codex', model: 'gpt-6-astra' });
+    } else if (builder === 'unknown') expect(calls.some(c => c[0] === 'reserve' || c[0] === 'seat')).toBe(false);
+    else expect(calls.find(c => c[0] === 'seat')[1]).toMatchObject({ provider: 'codex', model: 'gpt-6-astra' });
   });
 });

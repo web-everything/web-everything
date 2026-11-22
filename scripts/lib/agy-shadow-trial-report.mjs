@@ -1,4 +1,6 @@
 #!/usr/bin/env node
+import { readSeatAttempts, buildSeatSuccessReport } from './review-seat-ledger.mjs';
+import { readStore as readSeatScorecards, resolveScorecardStorePath } from '../conveyor/run-scorecard-store.mjs';
 /** Read-only evidence for one advisory agy model; Claude remains the mandatory seat. */
 import { readPromotionRows, buildPromotionReport, renderPromotionReport } from './review-carbon-promotion.mjs';
 import { readdirSync, statSync } from 'node:fs';
@@ -203,7 +205,14 @@ export function loadRedTeam(rows, { exec = execFileSync } = {}) {
   return result;
 }
 
-export function main(args, { readRows = readShadowRows, write = (text) => process.stdout.write(text), evidenceIO, readPromotion = readPromotionRows } = {}) {
+export function main(args, { readRows = readShadowRows, write = (text) => process.stdout.write(text), evidenceIO, readPromotion = readPromotionRows, readSeats = readSeatAttempts, readScorecards = readSeatScorecards } = {}) {
+  if (args.includes('--seats')) {
+    if (args.some(arg => !['--seats', '--json', '--no-gh'].includes(arg))) throw new Error('unknown seat report argument');
+    const rows = [...readSeats(), ...readRows().map(r => ({ ...r, provider: /^claude-/.test(r.model ?? '') ? 'agy-claude' : /^gemini-/.test(r.model ?? '') ? 'agy-gemini' : 'unknown', deciding: false })), ...readPromotion().filter(r => r.status !== 'ok').map(r => ({ ...r, provider: 'agy-gemini', deciding: true }))];
+    const report = buildSeatSuccessReport({ rows, scorecards: readScorecards({ path: resolveScorecardStorePath(), strict: true }).records, ...loadRunEvidence(rows, evidenceIO) });
+    write(`${JSON.stringify(report, null, 2)}\n`);
+    return;
+  }
   if (args.includes('--promotion')) {
     if (args.some(arg => !['--promotion', '--json', '--no-gh'].includes(arg))) throw new Error('unknown promotion report argument');
     const rows = readPromotion();

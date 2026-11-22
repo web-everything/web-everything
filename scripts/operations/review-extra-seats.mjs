@@ -1,4 +1,6 @@
 #!/usr/bin/env node
+import { resolveBuilder } from '../lib/review-builder.mjs';
+import { isIndependentReviewSeat } from '../lib/review-seat-independence.mjs';
 import { redTeamRouteByBuilder, readReviewSeatPolicy } from '../lib/review-seat-caps.mjs';
 import { carbonNonShadowAllowed } from '../lib/review-seat-settings.mjs';
 import { renderNoPromptCommandRules } from '../lib/no-prompt-command-rules.mjs';
@@ -92,7 +94,6 @@ export { EXTRA_SEATS_ENV, RED_TEAM_ENV, extraSeatsEnabled, redTeamEnabled, redTe
 import { expectationForLens, huntBriefForLens } from '../lib/review-core.mjs';
 import { appendScorecard, readStore, resolveScorecardStorePath } from '../conveyor/run-scorecard-store.mjs';
 import { scrubPublish } from '../lib/secret-scrub.mjs';
-import { parseDelegationMarker } from '../lib/delegation-marker.mjs';
 import { logDelegationTrial } from '../conveyor/log-delegation-trial.mjs';
 import { isTrustedMarkerAuthor } from '../lib/marker-authorship.mjs';
 import { RED_TEAM_UNVERIFIABLE_TAG, readRedTeamProbes, RED_TEAM_COMMENT_MARKER, RED_TEAM_CONFIRMED_TAG, RED_TEAM_UNCONFIRMED_TAG, redTeamMarker, redTeamForHead } from '../lib/red-team-gate.mjs';
@@ -1388,16 +1389,7 @@ function missRowRecorded(records, row) {
  * provider/model/taskType), else the `Co-Authored-By: Claude …` trailer of the reviewed head commit, else unknown. PURE.
  * @returns {{provider:string, model:string, taskType:(string|null), delegated:boolean, source:string}}
  */
-export function resolveBuilder({ body = '', headMessage = '' } = {}) {
-  const d = parseDelegationMarker(String(body ?? ''));
-  if (d) return { provider: d.provider, model: d.model, taskType: d.taskType, delegated: true, source: 'delegation-marker' };
-  const m = String(headMessage ?? '').match(/^Co-Authored-By:\s*Claude\s+([^<\n]+?)\s*</im);
-  if (m) {
-    const model = `claude-${m[1].replace(/\([^)]*\)/g, '').trim().toLowerCase().replace(/\s+/g, '-')}`;
-    return { provider: 'claude', model, taskType: null, delegated: false, source: 'co-authored-by' };
-  }
-  return { provider: 'unknown', model: 'unknown', taskType: null, delegated: false, source: 'none' };
-}
+export { resolveBuilder } from '../lib/review-builder.mjs';
 
 /**
  * The red team's brief. PURE. Same two shapes as {@link buildSeatTask}: `inline` for a tool-free seat (Gemini),
@@ -1956,7 +1948,8 @@ export async function speculateRedTeam({
       }
       available.push(p);
     }
-    if (codexBuilder) available = available.filter(p => p !== 'codex');
+    available = available.filter(p => isIndependentReviewSeat('red-team', p, builder.model !== 'unknown' ? builder.model : builder.provider));
+    if (!available.length) return { status: 'skipped', deferredByCap: true, reason: `WAIT: no cross-vendor red-team provider available (${unavailable.join('; ') || 'builder vendor only or unknown builder'})` };
     let provider = null;
     let callId = null;
     let lastReason = null;
@@ -1996,10 +1989,10 @@ export async function speculateRedTeam({
       }
       let pick = configuredRoute ? { provider: configuredRoute.provider, reasoning: 'routing-policy' } : selectReviewSeatProvider({ lens: RED_TEAM_SEAT.key, available: candidates, scorecards: records });
       if (!pick.provider) { lastReason = pick.reasoning; break; }
-      if (codexBuilder && pick.provider === 'codex') {
-        lastReason = 'Codex red-team refused for a Codex builder';
+      if (!isIndependentReviewSeat('red-team', configuredRoute?.model ?? pick.provider, builder.model !== 'unknown' ? builder.model : builder.provider)) {
+        lastReason = 'WAIT: red-team requires a cross-vendor provider';
         io.log(`red team: ${lastReason}; retrying independent fallback`);
-        available = available.filter(p => p !== 'codex');
+        available = available.filter(p => p !== pick.provider);
         continue;
       }
       // Check the resolved model, including builder/AI overrides, before spending its budget.
@@ -2026,6 +2019,11 @@ export async function speculateRedTeam({
           available = available.filter(p => p !== pick.provider);
           continue;
         }
+      }
+      if (!isIndependentReviewSeat('red-team', configuredRoute?.model ?? pick.provider, builder.model !== 'unknown' ? builder.model : builder.provider)) {
+        available = available.filter(p => p !== pick.provider);
+        lastReason = 'WAIT: fallback red-team model is not cross-vendor';
+        continue;
       }
       if (deferredByCap) io.log(`red team: capped route (${unavailable.join('; ') || lastReason}); fallback to ${pick.provider}`);
       if (pick.provider === 'agy-claude') io.log(operatorRoute

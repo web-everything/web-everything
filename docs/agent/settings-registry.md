@@ -17,7 +17,7 @@ For repo defaults, edit the owner file through a PR and rebuild the consuming da
 ## Summary
 
 - Top-level keys: 161 (163 declaration rows).
-- Declared leaves: 590 (platform copies counted separately).
+- Declared leaves: 591 (platform copies counted separately).
 - Instant top-level keys: 0; not instant: 161.
 - Instant capacity leaves: 15.
 - Constants to settle: 312.
@@ -152,7 +152,7 @@ Operator-prefs layer: ~/.plateau/platform-preferences.json is the requested oper
 | operatorUsernameSha256 | scripts/settings/privacy-terms-allowlist.json | 1 | ["cb89fdbcb4b894166b90fca32c9a56935d21f27c40f0f8c1611ee4624… | pr | no | Hashed operator usernames recognized by the portability gate. |
 | overlayDropped | scripts/settings/overlay-dropped.json | 1 | {"freshMinutes":30} | pr | no | Freshness window for detecting dropped overlays. |
 | parallelSeats | scripts/settings/review.json | 1 | "on" | pr | no | Enable parallel review seats. |
-| postAcceptAdvisory | scripts/settings/review.json | 1 | {"mode":"shadow"} | pr | no | Advisory review mode after acceptance. |
+| postAcceptAdvisory | scripts/settings/review.json | 2 | {"mode":"shadow","sampleRate":0.1} | pr | no | Advisory review mode after acceptance. |
 | prLandReady | scripts/settings/pr-land-ready.json | 1 | {"guardConfigPaths":["scripts/settings/prototype-load.json"… | pr | no | Configuration paths requiring guarded landing readiness. |
 | prLimit | scripts/settings/pr-limit.json | 4 | {"excludeCardOnly":true,"excludeStackedAwaitingBase":true,"… | pr | no | PR limit exclusions and explicit focus references. |
 | prListPaging | scripts/settings/pr-list-paging.json | 1 | {"pageSize":20} | pr | no | Page size for GitHub PR listing. |

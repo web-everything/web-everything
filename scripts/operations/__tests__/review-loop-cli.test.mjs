@@ -52,7 +52,7 @@ import { buildOperatorRulingComment, mandatoryReferralReviewer, normalizeFinding
 // explicit miss. A case that needs a hit, a structured result, or the REAL lookup passes its own (the spread below
 // lets it win). The real lookup/idempotency tests run against tiny temporary backlogs further down.
 const LOOKUP_MISS = { findFiledPrevention: () => null, findFiledRoundCards: () => null };
-const driveReviewLoopOnce = options => driveReviewLoopOnceRaw({ ...LOOKUP_MISS, advisorySettings: () => ({ value: { mode: 'off' } }), recordAdvisoryLoops: () => null, recordAdvisoryRating: () => null, ...options });
+const driveReviewLoopOnce = options => driveReviewLoopOnceRaw({ ...LOOKUP_MISS, sampleAdvisory: () => true, advisorySettings: () => ({ value: { mode: 'off' } }), recordAdvisoryLoops: () => null, recordAdvisoryRating: () => null, ...options });
 
 // Legacy filing tests exercise the explicitly disabled safety policy. New boundary tests below
 // use the production default through driveReviewLoopOnce.
@@ -1587,6 +1587,19 @@ describe('unattended accept reads the live head', () => {
 
 
 describe('post-accept advisory shadow wiring', () => {
+  it('an unsampled PR creates no post-accept advisory snapshot', async () => {
+    const { declaration, registry } = registryFor();
+    const snapshots = [];
+    const result = await runReviewLoopOnce({ declaration, registry, argv: BASE_ARGV,
+      store: createMemoryRunStore(), sinks: recordingSinks([]), makeJudge: cannedJudge(CLEAN_ANSWER),
+      mintRunId: () => 'unsampled-advisory', advisorySettings: () => ({ value: { mode: 'shadow', sampleRate: 0 } }),
+      sampleAdvisory: (identity, sampleRate) => sampleRate > 0,
+      recordAdvisoryShadow: row => snapshots.push(row), recordAdvisoryLoops: () => {}, recordAdvisoryRating: () => {},
+    });
+    expect(result.run.findings.confirm).toBe('accept');
+    expect(snapshots).toEqual([]);
+  });
+
   it.each(['CONFIRMED', 'PLAUSIBLE', 'writer-error', 'logger-error'])(
     'CLI records later %s broken ratings and preserves off/shadow/on live effects', async scenario => {
       const execute = async mode => {
