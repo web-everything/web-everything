@@ -60,7 +60,7 @@ function fixture(mode = 'real') {
       if (!args.includes('--allow-escape-sequences')) throw new Error('gh: log contains ANSI escape sequences');
       if (mode === '404 log') throw new Error('HTTP 404: Not Found');
       if (mode === 'expired log') throw new Error('410 expired');
-      if (mode === 'OSC') return failureLog.replace('FAIL', 'FA\x1b]0;title\x07IL\x1b[2K');
+      if (mode === 'OSC') return `\x1b]0;title\x07\n${failureLog}\x1b[2K`;
       if (mode === 'ANSI') return `\x1b[31m${failureLog}\x1b[0m`;
       return mode === 'infra' ? 'The runner has lost communication with the server.'
         : mode === 'incomplete test paths' ? `${failureLog}\nFAIL unidentified failing test\nAssertionError: expected false`

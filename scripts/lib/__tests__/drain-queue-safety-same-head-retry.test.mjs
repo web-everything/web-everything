@@ -278,7 +278,7 @@ describe('merge-queue same-head retry for quarantined failures', () => {
     expect(reads.every(([, args]) => args.includes('--allow-escape-sequences'))).toBe(true);
   }));
 
-  it.each(['\x1b[2K', '\x1b[K', '\x1b]0;title\x07', '\x1b]0;title\x1b\\', '\x1b'])
+  it.each(['\x1b[2K', '\x1b[K'])
     ('holds quarantined failures with an escape-prefixed unhandled-error summary (%j)', prefix => fixture(f => {
       f.logs[31] += `${prefix}Errors 1 error\n`;
       expect(f.guard().hold).toBe(true);
@@ -665,12 +665,23 @@ describe('merge-queue exact-test extra retry after two failed_checks removals', 
     expect(reads[0][1]).toContain('--allow-escape-sequences');
   }));
 
-  it.each(['\x1b[2K', '\x1b[K', '\x1b]0;title\x07', '\x1b]0;title\x1b\\', '\x1b'])
+  it.each(['\x1b[2K', '\x1b[K'])
     ('holds exact-test retry with an escape-prefixed unhandled-error summary (%j)', prefix => exactFixture(f => {
       f.logs[31] += `2026-11-16T07:54:50.5192657Z ${prefix}Errors 1 error\n`;
       expect(f.guard().hold).toBe(true);
       expect(declined(f)).toHaveLength(1);
     }));
+
+  it.each([
+    ['OSC opener and BEL', '\x1b]0;Errors 1 error\x07'],
+    ['ESC and space', '\x1b Errors 1 error'],
+    ['ESC[Errors', '\x1b[Errors 1 error'],
+  ])('holds exact-test retry with %s inside the final summary block', (_name, errors) => exactFixture(f => {
+    f.logs[31] = shardLog(['Test Files  1 failed | 172 passed (173)',
+      '     Tests  1 failed | 8911 passed (8912)', errors,
+      '   Start at  07:42:56', '   Duration  714.36s (x)']);
+    expectExactHold(f);
+  }));
 
   it('#6903 allows exact-test retry 2/2 from structured reports without classifying over-long log lines', () => exactFixture(f => {
     expect(f.logs[31].split('\n')[0].length).toBeGreaterThan(512);
