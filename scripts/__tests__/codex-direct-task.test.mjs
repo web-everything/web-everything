@@ -18,7 +18,7 @@ import { keepAliveScript } from '../lib/test-keepalive.mjs';
 import { admissionLockRoot } from '../readiness/heavy-admission.mjs';
 import { CODEX_TASK_RULES, CODEX_REVIEW_TASK_RULES } from '../lib/build-policy.mjs';
 import {
-  startDetachedJob, waitForJob, readJobRecord, writeJobRecord, cliExitCode, jobIsAlive, readPidStart, readPidState,
+  startDetachedJob, waitForJob, waitUntilDone, readJobRecord, writeJobRecord, cliExitCode, jobIsAlive, readPidStart, readPidState,
   PID_START_TIMEOUT_MS, JOB_RECORD_INIT_DEADLINE_MS,
   CODEX_CLI,
   DEFAULT_TIMEOUT_MS,
@@ -1706,6 +1706,59 @@ describe('direct CLI flags reach the actual spawn and JSON result', () => {
 });
 
 
+describe('wait --until-done', () => {
+  const running = { status: 'running', exitCode: null, resultPath: 'result.json', code: 75 };
+
+  it('wait --until-done blocks across slices and returns only on job exit', async () => {
+    const done = { ...running, status: 'done', exitCode: 0, code: 0 };
+    const waitFn = vi.fn().mockResolvedValueOnce(running).mockResolvedValueOnce(running).mockResolvedValueOnce(done);
+    const log = vi.fn();
+    expect(await waitUntilDone({ jobId: 'job', sliceMs: 500, waitFn, now: () => 0, log })).toEqual(done);
+    expect(waitFn.mock.calls).toEqual(Array(3).fill([{ jobId: 'job', maxMs: 500 }]));
+    expect(log.mock.calls).toEqual([
+      ['codex-direct-task wait: job job still running (slice 1, elapsed 0s)'],
+      ['codex-direct-task wait: job job still running (slice 2, elapsed 0s)'],
+    ]);
+  });
+
+  it('overall timeout returns code 75 with message and the last JSON result', async () => {
+    let time = 0;
+    const waitFn = vi.fn(async () => { time += 500; return running; });
+    const log = vi.fn();
+    expect(await waitUntilDone({ jobId: 'job', sliceMs: 500, overallMs: 1000, waitFn, now: () => time, log })).toEqual(running);
+    expect(waitFn).toHaveBeenCalledTimes(2);
+    expect(log).toHaveBeenLastCalledWith('codex-direct-task wait: overall wait timed out; run the same command again');
+  });
+
+  it('overall timeout interrupts a pending slice and retains the last result', async () => {
+    vi.useFakeTimers();
+    try {
+      const waitFn = vi.fn().mockResolvedValueOnce(running).mockImplementation(() => new Promise(() => {}));
+      const log = vi.fn();
+      const waiting = waitUntilDone({ jobId: 'job', overallMs: 1000, waitFn, log });
+      await vi.advanceTimersByTimeAsync(1000);
+      expect(await waiting).toEqual(running);
+      expect(log).toHaveBeenLastCalledWith('codex-direct-task wait: overall wait timed out; run the same command again');
+    } finally { vi.useRealTimers(); }
+  });
+
+  it.each([[1, 'failed'], [2, 'wait-error']])('terminal code %s (%s) is passed through immediately', async (code, status) => {
+    const result = { ...running, status, code };
+    const waitFn = vi.fn().mockResolvedValue(result);
+    const log = vi.fn();
+    expect(await waitUntilDone({ jobId: 'job', waitFn, log })).toEqual(result);
+    expect(waitFn).toHaveBeenCalledTimes(1);
+    expect(waitFn).toHaveBeenCalledWith({ jobId: 'job', maxMs: 540000 });
+    expect(log).not.toHaveBeenCalled();
+  });
+
+  it.each([0, -1, '', 'abc', Infinity, true])('rejects invalid overall-ms=%s before job IO', async overallMs => {
+    const waitFn = vi.fn();
+    await expect(waitUntilDone({ overallMs, waitFn })).rejects.toThrow('--overall-ms');
+    expect(waitFn).not.toHaveBeenCalled();
+  });
+});
+
 describe('detached jobs', () => {
   let jobsDir;
   beforeEach(() => { jobsDir = mkdtempSync(join(tmpdir(), 'codex-jobs-test-')); });
@@ -1839,11 +1892,11 @@ describe('detached jobs', () => {
     expect(child.stderr).toBe('codex-direct-task wait: --max-ms must be between 250 and 540000\n');
   });
 
-  it.each(['250', '540000', '1080000', undefined])('wait CLI accepts max-ms=%s and reports a completed job', maxMs => {
+  it.each(['250', '540000', '1080000', undefined, 'until-done'])('wait CLI accepts max-ms=%s and reports a completed job', maxMs => {
     const record = { id: 'accepted', pid: process.pid, status: 'done', exitCode: 0, resultPath: 'result.json' };
     writeJobRecord(record, { jobsDir });
     const child = spawnSync(process.execPath, ['scripts/codex-direct-task.mjs', 'wait', '--job=accepted',
-      ...(maxMs === undefined ? [] : [`--max-ms=${maxMs}`])], {
+      ...(maxMs === 'until-done' ? ['--until-done'] : maxMs === undefined ? [] : [`--max-ms=${maxMs}`])], {
       encoding: 'utf8', timeout: 4000, maxBuffer: 1024 * 1024,
       env: { ...process.env, CODEX_JOBS_DIR: jobsDir },
     });

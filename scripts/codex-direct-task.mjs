@@ -1703,6 +1703,39 @@ export async function waitForJob({
   }
 }
 
+/** CLI wait across bounded slices; intermediate progress goes only to stderr. */
+export async function waitUntilDone({
+  jobId, sliceMs = MAX_JOB_WAIT_MS, overallMs = 3000000,
+  waitFn = waitForJob, now = Date.now, log = message => writeLineSync(2, message),
+} = {}) {
+  const maxMs = jobWaitBudget(sliceMs);
+  const budget = Number(overallMs);
+  if (typeof overallMs === 'boolean' || !Number.isFinite(budget) || budget <= 0) {
+    throw new RangeError('codex-direct-task wait: --overall-ms must be a positive finite number');
+  }
+  const started = now();
+  let last = { status: 'running', exitCode: null, resultPath: null, code: 75 };
+  const expired = Symbol('overall wait exhausted');
+  for (let slice = 1; now() - started < budget; slice++) {
+    let timer;
+    let result;
+    try {
+      result = await Promise.race([
+        waitFn({ jobId, maxMs }),
+        new Promise(resolve => { timer = setTimeout(() => resolve(expired), budget - (now() - started)); }),
+      ]);
+    } finally {
+      clearTimeout(timer);
+    }
+    if (result === expired) break;
+    last = result;
+    if (last.code !== 75) return last;
+    log(`codex-direct-task wait: job ${jobId} still running (slice ${slice}, elapsed ${Math.floor((now() - started) / 1000)}s)`);
+  }
+  log('codex-direct-task wait: overall wait timed out; run the same command again');
+  return last;
+}
+
 // ── CLI ───────────────────────────────────────────────────────────────────────────────────────────
 function transcriptCheckFailed(check) {
   const mode = check?.mode ?? process.env.WE_CODEX_TRANSCRIPT_CHECK_MODE?.trim();
@@ -1762,6 +1795,9 @@ async function main() {
       + '    Values below 250 or non-numeric values are usage errors (exit 2), before any job IO.\n'
       + '    Omitted defaults to 540000 ms; values above 540000 are clamped to 540000 ms.\n'
       + '    All IO shares that single requested deadline; no floor or additional grace.\n'
+      + '  wait --until-done --job=<id> [--slice-ms=540000] [--overall-ms=3000000]: wait across slices.\n'
+      + '    Same slice validation as --max-ms; heartbeat on stderr after each running slice.\n'
+      + '    Overall timeout exits 75; run the same command again.\n'
       + '  CODEX_JOBS_DIR overrides ~/workspace/.operations/coordination/codex-jobs.\n'
       + '  --review (#4194): a READ-ONLY review task — Codex runs under `-s read-only` and is told to answer in its '
       + 'final message (the report\'s `lastMessage`) instead of editing files.\n'
@@ -1776,13 +1812,18 @@ async function main() {
     return;
   }
   if (isWaitInvocation(args)) {
-    let maxMs;
-    try { maxMs = jobWaitBudget(flags['max-ms'] ?? flags.wait); }
+    let outcome;
+    try {
+      const jobId = flags.job ?? flags.id;
+      outcome = flags['until-done']
+        ? await waitUntilDone({ jobId, sliceMs: flags['slice-ms'], overallMs: flags['overall-ms'] })
+        : await waitForJob({ jobId, maxMs: jobWaitBudget(flags['max-ms'] ?? flags.wait) });
+    }
     catch (error) {
       writeLineSync(2, error.message);
       process.exit(2);
     }
-    const { code, ...result } = await waitForJob({ jobId: flags.job ?? flags.id, maxMs });
+    const { code, ...result } = outcome;
     // Pending filesystem requests must not keep a timed-out wait CLI alive.
     writeLineSync(1, JSON.stringify(result));
     process.exit(code);
