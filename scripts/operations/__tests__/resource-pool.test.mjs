@@ -13,12 +13,13 @@ it('renders mode, sources, holders and a digest; preserves JSON verdict digest',
   const text = renderResourcePool(report);
   for (const term of ['mode shadow', 'configured enforce', 'fix: UNKNOWN', 'pr-1', report.digest]) expect(text).toContain(term);
   expect(text).not.toContain('bad\nfile');
-  expect(finishResourcePool()({ run: { verdict: report }, code: 0, lines: ['json'], json: true }).lines).toEqual(['json']);
-  expect(finishResourcePool()({ run: { verdict: report }, code: 0 }).lines).toEqual([text]);
+  expect(text).toContain('C3: 2 (observed minimum; total unknown)u');
+  expect(finishResourcePool({ log: () => true })({ run: { verdict: report }, code: 0, lines: ['json'], json: true }).lines).toEqual(['json']);
+  expect(finishResourcePool({ log: () => true })({ run: { verdict: report }, code: 0 }).lines).toEqual([text]);
 });
 
 it('shadow rows are written only through the finish sink, including JSON runs', () => {
-  const log = vi.fn();
+  const log = vi.fn(() => true);
   const report = { mode: 'shadow', rows: [{ kind: 'review' }] };
   const finish = finishResourcePool({ log });
   expect(log).not.toHaveBeenCalled();
@@ -31,4 +32,27 @@ it('shadow rows are written only through the finish sink, including JSON runs', 
   finish({ ...args, run: {} });
   expect(log).not.toHaveBeenCalled();
   expect(() => finishResourcePool({ log: () => { throw Error('disk'); } })(args)).not.toThrow();
+});
+
+it.each([() => false, () => { throw Error('disk full'); }, undefined])('failed or absent sink is visible and exits nonzero in text and JSON', log => {
+  const report = { mode: 'shadow', rows: [], digest: 'pool', settings: {}, sources: [], summary: {}, holders: [] };
+  for (const json of [false, true]) {
+    const payload = { verdict: report, stopped: 'complete' };
+    const stderr = vi.fn();
+    const result = finishResourcePool({ log, stderr })({ run: { verdict: report }, code: 0, lines: [JSON.stringify(payload, null, 2)], json });
+    expect(result.code).toBe(1);
+    if (json) {
+      expect(JSON.parse(result.lines.join('\n'))).toEqual(payload);
+      expect(stderr).toHaveBeenCalledWith(expect.stringContaining('UNKNOWN — shadow log sink failed'));
+    } else {
+      expect(result.lines.join('\n')).toContain('UNKNOWN — shadow log sink failed');
+      expect(stderr).not.toHaveBeenCalled();
+    }
+  }
+});
+
+it('makes the expired red-team row count visible in the readout', () => {
+  const report = { mode: 'shadow', configuredMode: 'shadow', digest: 'pool', settings: {},
+    sources: [{ source: 'redTeam', ok: true, expiredRedTeamRows: 2 }], summary: {}, holders: [] };
+  expect(renderResourcePool(report)).toContain('2 expired red-team rows ignored (older than 24h)');
 });

@@ -6331,17 +6331,21 @@ overdraw, no preemption and unknown-evidence holds. `resource-pool-io.test.mjs` 
 missing/malformed sources, liveness failures, companion files, oversized evidence and
 settings bounds. `operations/__tests__/resource-pool.test.mjs` tests the readout and CLI sink.
 Only sampler memory/swap/CPU, live review rounds, canonical red-team statuses and class-3
-fix claims are inventoried. The digest is a **partial** inventory, never total host occupancy;
+fix claims are inventoried. Claims and workers share the canonical dispatch session name
+(`fixDispatchSessionName`); collection counts overlapping claim/lane/heavy-slot evidence
+once. Different repo/kind jobs and workers without a shared identity stay separately counted.
+The cross-source IO regression pins one holder and 2u for the three overlapping records.
+The digest is a **partial** inventory, never total host occupancy;
 no shrink claim is made. Claim expiry follows the existing 10-minute lease contract.
 Red-team status files use the writer's encoded-repo/PR/40-hex-head filename; companions
 are excluded before parsing. Check a claim's valid heartbeat for expiry before validating
 holder metadata; expired legacy metadata cannot hold capacity. Unreadable claims or invalid
-heartbeats remain unknown. Queued red-team rows hold no slot. Pidless running rows expire
-after the shared foreign-host stale window (30 minutes by default, 10-minute floor), using
-file mtime as the writer's last progress. Foreign-host rows use `foreignStaleOwnerDead`:
-staleness alone never overrides live pid evidence, unknown birth time or another namespace.
-Fresh ambiguous running rows remain unknown. The IO suite pins these expiry boundaries
-and the malformed/unreadable negative paths using hermetic process probes.
+heartbeats remain unknown. Red-team rows older than the hard 24-hour lease ceiling
+expire by file mtime regardless of PID or host; the readout reports the ignored count.
+Rows exactly at the ceiling remain subject to liveness checks. Fresher queued/running
+rows with live PIDs hold capacity; missing PIDs or ambiguous host/process evidence remain
+unknown. Unreadable or malformed status evidence stays fail-closed. The IO suite pins
+25-hour expiry, the exact boundary, and one-hour foreign-host/live-local cases.
 Unknown evidence holds every hypothetical start; inspect the named source and rerun.
 The comparison column observes `resource-admission.admit` only, excluding dispatch caps.
 No existing caller consumes this pool. Enforce remains shadow; off disables the explicit

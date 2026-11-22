@@ -1,10 +1,12 @@
 // @vitest-environment node
 import { afterEach, beforeEach, it, expect, vi } from 'vitest';
-import { mkdtempSync, mkdirSync, writeFileSync, rmSync, readFileSync, utimesSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, writeFileSync, rmSync, readFileSync, utimesSync, renameSync } from 'node:fs';
 import { tmpdir } from 'node:os';
+import * as fs from 'node:fs';
 import { join } from 'node:path';
 import { readPoolSource, collectResourcePool, loadPoolSettings, appendShadowRows, poolPidAlive,
-  poolSourcePaths, readPoolSettingsChecked, SOURCES } from '../resource-pool-io.mjs';
+  RED_TEAM_HARD_LEASE_CEILING_MS, poolSourcePaths, readPoolSettingsChecked, readPoolJson, readPoolOverrides, readPoolHeavyHeld, SOURCES } from '../resource-pool-io.mjs';
+import { lockDirFor } from '../../readiness/file-locks.mjs';
 import { POOL_DEFAULTS } from '../resource-pool.mjs';
 let coord, paths;
 const nowMs = 2000;
@@ -25,6 +27,8 @@ beforeEach(() => {
 });
 afterEach(() => rmSync(coord, { recursive: true, force: true }));
 const read = (source, options = {}) => readPoolSource(source, { paths, coord, nowMs,
+  listCommands: () => `${process.pid} 1 node resource-pool.mjs`,
+  run: () => JSON.stringify({ lanes: [] }), heavyStatus: () => ({ held: [] }),
   roundBudget: () => ({ live: 2 }), slotAlive: () => true, ...options });
 const collect = (options = {}) => collectResourcePool({ paths, coord, nowMs, settings: settings(), readSource: read, legacy, ...options });
 it('reads ONLY the named S1a sources, counts C2/C3, names paths, and never claims shrink', () => {
@@ -77,7 +81,7 @@ it('only confirmed dead red-team slots and explicit finished statuses are omitte
   writeFileSync(join(paths.redTeam, filename), JSON.stringify({ ...status(), status: 'ended' }));
   expect(read('redTeam').ok).toBe(false);
 });
-it('validates fix heartbeat before expiry; excludes expired fixes and live ci-heal from this slice', () => {
+it('validates fix heartbeat before expiry; excludes expired fixes and counts live ci-heal', () => {
   const lockDir = join(paths.fix, 'b'.repeat(16)); mkdirSync(lockDir);
   const file = join(lockDir, 'lock.json');
   for (const data of [{}, { owner: 'x', heartbeatAt: 'bad' }, { owner: 'x', heartbeatAt: new Date(1000).toISOString() }]) {
@@ -86,7 +90,7 @@ it('validates fix heartbeat before expiry; excludes expired fixes and live ci-he
   const claim = { owner: 'x', heartbeatAt: new Date(-700000).toISOString(), meta: { repo: 'we', pr: 1, kind: 'fix' } };
   writeFileSync(file, JSON.stringify(claim)); expect(read('fix').holders).toEqual([]);
   writeFileSync(file, JSON.stringify({ ...claim, heartbeatAt: new Date(1000).toISOString(), meta: { ...claim.meta, kind: 'ci-heal' } }));
-  expect(read('fix').holders).toEqual([]);
+  expect(read('fix').holders).toHaveLength(1);
 });
 it.each([{ repo: 'we', pr: 1 }, { repo: 'we', pr: 1, kind: 'fixing' }, { kind: 'ci-heal', pr: 'old' }, null])(
   'ignores expired claims with legacy or malformed metadata %j, but holds fresh ones', meta => {
@@ -120,11 +124,11 @@ it('unreadable claims and invalid heartbeats fail closed even with an old file m
   rmSync(file); mkdirSync(file);
   expect(read('fix').ok).toBe(false);
 });
-it('queued rows never occupy slots or invoke a liveness probe, even with a live pid', () => {
+it('queued pidless rows are unknown and queued live pids occupy capacity', () => {
   writeFileSync(join(paths.redTeam, filename), JSON.stringify({ ...status(), status: 'queued' }));
-  const slotAlive = vi.fn(() => { throw Error('must not probe'); });
-  expect(read('redTeam', { slotAlive })).toMatchObject({ ok: true, holders: [] });
-  expect(slotAlive).not.toHaveBeenCalled();
+  expect(read('redTeam')).toMatchObject({ ok: true, holders: [{ kind: 'redTeam' }] });
+  writeFileSync(join(paths.redTeam, filename), JSON.stringify({ ...status(), status: 'queued', pid: null }));
+  expect(read('redTeam').ok).toBe(false);
 });
 const writeRunningAt = (row, at) => {
   const file = join(paths.redTeam, filename); writeFileSync(file, JSON.stringify(row));
@@ -133,20 +137,46 @@ const writeRunningAt = (row, at) => {
 const liveNow = 10_000_000;
 const localProbe = (extra = {}) => ({ nowMs: liveNow, env: {}, slotAlive: undefined,
   host: 'studio', namespace: 'local', processAlive: () => false, readStart: () => 'birth', ...extra });
-it('pidless running rows expire only beyond the shared 30-minute stale window', () => {
+it.each([
+  { pid: undefined }, { host: 'Mac' }, { host: 'Mac', pid: undefined }, {},
+])('ignores a 25h-old running lease regardless of pid or host %j and counts expiry', row => {
+  const clock = 200_000_000;
+  writeRunningAt({ ...status(), ...row }, clock - 25 * 60 * 60 * 1000);
+  const slotAlive = vi.fn(() => { throw Error('expired lease must not be probed'); });
+  expect(read('redTeam', { nowMs: clock, slotAlive })).toMatchObject({ ok: true, holders: [], expiredRedTeamRows: 1 });
+  expect(slotAlive).not.toHaveBeenCalled();
+});
+it('keeps a 1h-old foreign-host running lease unknown', () => {
+  writeRunningAt({ ...status(), host: 'Mac' }, liveNow - 60 * 60 * 1000);
+  expect(read('redTeam', localProbe())).toMatchObject({ ok: false, error: expect.stringContaining('unknown red-team liveness') });
+});
+it('counts a 1h-old live local pid as a holder', () => {
+  writeRunningAt(status(), liveNow - 60 * 60 * 1000);
+  expect(read('redTeam', localProbe({ processAlive: () => true }))).toMatchObject({
+    ok: true, holders: [{ kind: 'redTeam' }], expiredRedTeamRows: 0,
+  });
+});
+it('expires only strictly beyond the 24h hard lease ceiling, even with a live pid', () => {
+  const clock = 200_000_000;
+  expect(RED_TEAM_HARD_LEASE_CEILING_MS).toBe(24 * 60 * 60 * 1000);
+  writeRunningAt(status(), clock - RED_TEAM_HARD_LEASE_CEILING_MS);
+  expect(read('redTeam', { nowMs: clock })).toMatchObject({ ok: true, holders: [{ kind: 'redTeam' }], expiredRedTeamRows: 0 });
+  expect(read('redTeam', { nowMs: clock + 1 })).toMatchObject({ ok: true, holders: [], expiredRedTeamRows: 1 });
+});
+it('pidless running rows within the hard lease ceiling remain unknown', () => {
   for (const age of [1800001, 1800000, 1000, -1000]) {
     writeRunningAt({ ...status(), pid: undefined }, liveNow - age);
-    expect(read('redTeam', localProbe())).toMatchObject(age > 1800000 ? { ok: true, holders: [] } : { ok: false });
+    expect(read('redTeam', localProbe())).toMatchObject({ ok: false });
   }
 });
 it.each([0, -1, '123', {}])('malformed running pid %j is unknown even on an old row', pid => {
   writeRunningAt({ ...status(), pid }, 1);
   expect(read('redTeam', localProbe()).ok).toBe(false);
 });
-it('stale foreign-host rows with dead or reused local pid are omitted using the shared owner rule', () => {
+it('foreign-host rows without namespace never infer death from local pid absence or reuse', () => {
   writeRunningAt({ ...status(), host: 'Mac', pidStart: 'old' }, liveNow - 1800001);
-  expect(read('redTeam', localProbe())).toMatchObject({ ok: true, holders: [] });
-  expect(read('redTeam', localProbe({ processAlive: () => true }))).toMatchObject({ ok: true, holders: [] });
+  expect(read('redTeam', localProbe())).toMatchObject({ ok: false });
+  expect(read('redTeam', localProbe({ processAlive: () => true }))).toMatchObject({ ok: false });
 });
 it('fresh foreign hosts, foreign namespaces, live owners and unreadable probes remain unknown', () => {
   for (const [row, age, io] of [
@@ -190,12 +220,12 @@ it('only ESRCH proves death; unexpected process errors remain unknown', () => {
     expect(poolPidAlive(123, () => { throw Object.assign(Error(), { code }); })).toBe(expected);
   expect(poolPidAlive(0)).toBe(null);
 });
-it('settings default shadow/floor4; enforce stays shadow, off suppresses logging; all sources logged', () => {
+it('settings default shadow/floor4; enforce is refused, off suppresses logging; all sources logged', () => {
   const log = vi.fn(); const result = loadPoolSettings({ ...settingsArgs(), log });
   expect(result.value).toMatchObject({ mode: 'shadow', builderFloor: 4 }); expect(result.unknown).toBe(false);
   expect(log.mock.calls[0][0]).toContain('tool');
   const enforce = loadPoolSettings({ ...settingsArgs(), env: { WE_RESOURCE_POOL_MODE: 'enforce' } });
-  expect(enforce).toMatchObject({ configuredMode: 'enforce', value: { mode: 'shadow' } });
+  expect(enforce).toMatchObject({ configuredMode: 'enforce', unknown: true, error: expect.stringContaining('not yet supported') });
   const overridden = loadPoolSettings({ ...settingsArgs(), operatorOverride: { builderFloor: 6, 'class.3.max': 10 }, enumOverride: { ok: true, value: 'off' } });
   expect(overridden.value).toMatchObject({ mode: 'off', builderFloor: 6, classes: { 3: { max: 10 } } });
   expect(overridden.provenance).toContain('operator-enum-db');
@@ -228,4 +258,137 @@ it('collecting is read-only; only the explicit sink appends shadow evidence', ()
   expect(append).toHaveBeenCalledTimes(3);
   expect(append.mock.calls[0][0]).toBe(join(coord, 'resource', 'pool-shadow.jsonl'));
   expect(appendShadowRows(report.rows, { coord, append: () => { throw Error('disk'); } })).toBe(false);
+});
+
+it.each([{}, [], null, 1])('invalid mode %j cannot disappear during flattening', mode => {
+  for (const layer of ['tool', 'platform']) {
+    const args = settingsArgs();
+    if (layer === 'tool') args.read = () => ({ value: { mode }, taint: [] });
+    else args.platform = { mode };
+    expect(loadPoolSettings(args).unknown).toBe(true);
+  }
+});
+it('rejects typo keys and explicit null platform namespace', () => {
+  expect(loadPoolSettings({ ...settingsArgs(), platform: { builderFlor: 20 } }).unknown).toBe(true);
+  const file = join(coord, 'preferences.json'); writeFileSync(file, '{"resourcePool":null}');
+  const args = settingsArgs(); delete args.platform;
+  expect(loadPoolSettings({ ...args, env: { WE_PLATFORM_PREFERENCES_FILE: file } }).unknown).toBe(true);
+});
+it('duplicate numeric override keys including escaped equivalents invalidate evidence', () => {
+  const file = join(coord, 'overrides.json');
+  for (const key of ['resourcePool.builderFloor', 'resourcePool.builderFlo\\u006fr']) {
+    writeFileSync(file, `{"resourcePool.builderFloor":20,"${key}":0}`);
+    expect(() => readPoolOverrides({ file })).toThrow(/duplicate/);
+    const args = settingsArgs(); delete args.operatorOverride;
+    // Exercise the loader's error path through its checked reader.
+    expect(loadPoolSettings({ ...args, overrideFile: file }).unknown).toBe(true);
+  }
+});
+it.each(['', 'unrecognized', '123 1 node other.mjs'])('incomplete ps inventory %j cannot prove zero rounds', output => {
+  expect(read('rounds', { listCommands: () => output, roundBudget: () => ({ live: 0 }) }).ok).toBe(false);
+});
+it('complete ps inventory is passed unchanged to the review parser and permits observed zero', () => {
+  const inventory = `${process.pid} 1 node resource-pool.mjs`;
+  const roundBudget = vi.fn(({ listCommands }) => ({ live: listCommands() === inventory ? 0 : undefined }));
+  expect(read('rounds', { listCommands: () => inventory, roundBudget })).toMatchObject({ ok: true, holders: [] });
+});
+const lane = (path, session, purpose, leased = true) => ({ path, leased, lease: { session, purpose } });
+it('counts both live conveyor-fix and conveyor-ci-heal leases as two C3 holders without heavy slots', () => {
+  const lanes = [lane('pool/lane-1', 'fix-7343', 'conveyor-fix'),
+    lane('pool/lane-2', 'ci-heal-7337', 'conveyor-ci-heal')];
+  const result = read('workers', { run: () => JSON.stringify({ lanes }) });
+  expect(result).toMatchObject({ ok: true, holders: [
+    { class: 3, size: 2, jobId: 'fix-7343' },
+    { class: 3, size: 2, jobId: 'ci-heal-7337' },
+  ] });
+  expect(result.holders.reduce((units, holder) => units + holder.size, 0)).toBe(4);
+});
+it('counts live fix-7343 and ci-heal-7337 leases and deduplicates heavy slots by lane', () => {
+  const lanes = [lane('/pool/lane-1', 'fix-7343', 'conveyor-fix'), lane('/pool/lane-2', 'ci-heal-7337', 'conveyor-ci-heal'),
+    lane('/pool/lane-3', 'fix-old', 'conveyor-fix', false), lane('/pool/lane-4', 'conveyor-fix-99', null)];
+  const result = read('workers', { run: () => JSON.stringify({ lanes }), heavyStatus: () => ({ held: [
+    { owner: '/pool/lane-1#123', meta: { dispatchKind: 'fix', lane: '1' } },
+    { owner: '/pool/lane-2', meta: { dispatchKind: 'ci-heal', lane: '2' } },
+    { owner: '/pool/lane-5#456', meta: { dispatchKind: 'ci-heal', session: 'ci-heal-1' } },
+    { owner: '/pool/lane-5#789', meta: { dispatchKind: 'ci-heal' } },
+  ] }) });
+  expect(result.ok).toBe(true); expect(result.holders).toHaveLength(4);
+  expect(result.holders.every(h => h.class === 3 && h.size === 2)).toBe(true);
+});
+it.each(['{', '{}', '{"lanes":[{}]}', '{"lanes":[{"path":"x","leased":true,"lease":null}]}'])('malformed lane status %s holds', output => {
+  expect(read('workers', { run: () => output }).ok).toBe(false);
+});
+it('failed lane reads, oversized inventory and malformed heavy slots hold with manual fallback', () => {
+  for (const options of [{ run: () => { throw Error('lane status failed'); } },
+    { run: () => JSON.stringify({ lanes: Array(20001).fill(null) }) },
+    { heavyStatus: () => ({}) }, { heavyStatus: () => ({ held: [{}] }) }])
+    expect(read('workers', options)).toMatchObject({ ok: false, error: expect.stringContaining('inspect') });
+});
+it('terminal historical red-team files are readable without liveness probes', () => {
+  for (const state of ['ok', 'failed', 'finished', 'cancelled', 'error']) {
+    writeRunningAt({ ...status(), status: state, pid: null }, 1);
+    expect(read('redTeam', { slotAlive: () => { throw Error('must not probe'); } })).toMatchObject({ ok: true, holders: [] });
+  }
+});
+it('reads the validated fd despite pathname replacement and refuses nonregular or growing sources', () => {
+  const replacement = join(coord, 'replacement'); writeFileSync(replacement, '{}');
+  const io = { ...fs, fstatSync(fd) { const info = fs.fstatSync(fd); renameSync(replacement, paths.snapshot); return info; } };
+  expect(readPoolJson(paths.snapshot, { io }).data).toEqual(snap());
+  expect(() => readPoolJson(paths.fix)).toThrow(/regular/);
+  const large = Buffer.alloc(16 * 1024 * 1024 + 1, 32);
+  expect(() => readPoolJson(paths.snapshot, { io: { ...fs, readSync(fd, buf) { large.copy(buf); return large.length; } } })).toThrow(/grew/);
+});
+it('snapshot uses the validated object without calling a tolerant pathname reader', () => {
+  const snapshotReader = vi.fn(() => null);
+  expect(read('snapshot', { snapshotReader })).toMatchObject({ ok: true, snapshot: snap() });
+  expect(snapshotReader).not.toHaveBeenCalled();
+});
+it('a sink returning false fails shadow appending', () => {
+  expect(appendShadowRows([{}], { coord, append: () => false })).toBe(false);
+});
+
+it('strict heavy slots refuse entryless, malformed and oversized locks instead of silently freeing capacity', () => {
+  const root = join(coord, 'heavy'); mkdirSync(root);
+  expect(readPoolHeavyHeld({ root, cap: 1 })).toEqual({ held: [] });
+  const dir = lockDirFor(root, 'slot-0'); mkdirSync(dir);
+  expect(() => readPoolHeavyHeld({ root, cap: 1 })).toThrow();
+  for (const text of ['{', '{}', ' '.repeat(16 * 1024 * 1024 + 1)]) {
+    writeFileSync(join(dir, 'lock.json'), text);
+    expect(() => readPoolHeavyHeld({ root, cap: 1 })).toThrow();
+  }
+  const row = { owner: '/pool/lane-1#123', heartbeatAt: new Date(nowMs).toISOString(), meta: { dispatchKind: 'fix' } };
+  writeFileSync(join(dir, 'lock.json'), JSON.stringify(row));
+  expect(readPoolHeavyHeld({ root, cap: 1 })).toEqual({ held: [row] });
+});
+
+it.each([true, false])('counts overlapping fresh claim, lane and heavy-slot evidence once as 2u (lane present: %s)', withLane => {
+  const lockDir = join(paths.fix, 'e'.repeat(16)); mkdirSync(lockDir);
+  writeFileSync(join(lockDir, 'lock.json'), JSON.stringify({ owner: 'dispatcher',
+    heartbeatAt: new Date(1000).toISOString(), meta: { repo: 'we', pr: 12, kind: 'fix' } }));
+  const report = collect({ readSource: source => read(source, {
+    roundBudget: () => ({ live: 0 }),
+    run: () => JSON.stringify({ lanes: withLane ? [{ path: '/pool/lane-1', leased: true,
+      lease: { session: 'fix-12', purpose: 'conveyor-fix' } }] : [] }),
+    heavyStatus: () => ({ held: [{ owner: '/pool/lane-1#123', meta: { dispatchKind: 'fix', session: 'fix-12' } }] }),
+  }) });
+  expect(report.unknown).toBe(false);
+  expect(report.holders).toHaveLength(1);
+  expect(report.summary['studio.units'].held).toBe(2);
+  expect(report.holders[0].jobId).toBe('fix-12');
+});
+it('keeps different repo/kind jobs and workers without shared job identity separately counted', () => {
+  const lockDir = join(paths.fix, 'e'.repeat(16)); mkdirSync(lockDir);
+  writeFileSync(join(lockDir, 'lock.json'), JSON.stringify({ owner: 'dispatcher',
+    heartbeatAt: new Date(1000).toISOString(), meta: { repo: 'we', pr: 12, kind: 'fix' } }));
+  const report = collect({ readSource: source => read(source, {
+    roundBudget: () => ({ live: 0 }),
+    run: () => JSON.stringify({ lanes: [
+      { path: '/pool/lane-2', leased: true, lease: { session: 'fix-fui-12', purpose: 'conveyor-fix' } },
+      { path: '/pool/lane-3', leased: true, lease: { session: 'ci-heal-12', purpose: 'ci-heal' } },
+    ] }),
+    heavyStatus: () => ({ held: [{ owner: '/pool/lane-4#123', meta: { dispatchKind: 'fix' } }] }),
+  }) });
+  expect(report.unknown).toBe(false);
+  expect(report.holders).toHaveLength(4);
+  expect(report.summary['studio.units'].held).toBe(8);
 });
