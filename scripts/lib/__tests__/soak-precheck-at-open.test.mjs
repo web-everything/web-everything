@@ -21,38 +21,19 @@ describe('soak precheck at PR open', () => {
     timings: {},
   };
 
-  it.each(['ADDED', 'RENAMED'])('refuses an untimed %s break test even when replay is inapplicable', (changeType) => {
-    const verdict = soakPrecheckAtOpen({ ...addedBreak, files: [{ path: breakTest, changeType }] });
-    expect(verdict).toMatchObject({ ok: false, applicable: false, missingTimings: [breakTest] });
-    expect(verdict.message).toContain(`"${breakTest}": 2`);
-    expect(verdict.message).toContain('inside the "soak" object of scripts/ci/test-timings.json');
+  it('accepts an added soak break test with no timing entry — shard-assign median fallback places it', () => {
+    const verdict = soakPrecheckAtOpen(addedBreak);
+    expect(verdict).toMatchObject({ ok: true });
+    expect(verdict.missingTimings).toBeUndefined();
   });
-  it('names every missing timing while excluding registered tests', () => {
-    const other = 'scripts/conveyor/soak/breaks/y.soak.test.mjs';
-    const timed = 'scripts/conveyor/soak/breaks/z.soak.test.mjs';
-    const verdict = soakPrecheckAtOpen({ ...addedBreak,
-      files: [breakTest, other, timed].map(path => ({ path, changeType: 'ADDED' })),
-      timings: { [timed]: 2 },
-    });
-    expect(verdict.missingTimings).toEqual([breakTest, other]);
-    for (const path of [breakTest, other]) expect(verdict.message).toContain(`"${path}": 2`);
-    expect(verdict.message).not.toContain(timed);
+  it.each(['ADDED', 'RENAMED'])('accepts an untimed %s break test', (changeType) => {
+    expect(soakPrecheckAtOpen({ ...addedBreak, files: [{ path: breakTest, changeType }] }).ok).toBe(true);
   });
-  it('leaves the result unchanged for a timed added break test', () => {
-    const baseline = soakPrecheckAtOpen({ ...addedBreak, files: [{ path: breakTest, changeType: 'MODIFIED' }] });
-    expect(soakPrecheckAtOpen({ ...addedBreak, timings: { [breakTest]: 2 } })).toEqual(baseline);
-    expect(baseline.ok).toBe(true);
-  });
-  it.each([null, '2', 0, -2, NaN, Infinity, -Infinity, undefined, true])(
-    'refuses an added break test with an invalid timing %s', (timing) => {
-      const verdict = soakPrecheckAtOpen({ ...addedBreak, timings: { [breakTest]: timing } });
-      expect(verdict).toMatchObject({ ok: false, missingTimings: [breakTest] });
-      expect(verdict.message).toContain(`"${breakTest}": 2`);
-      expect(verdict.message).toContain('scripts/ci/test-timings.json');
-    },
-  );
-  it('accepts a positive finite fractional timing', () => {
-    expect(soakPrecheckAtOpen({ ...addedBreak, timings: { [breakTest]: 0.25 } }).ok).toBe(true);
+  it('still refuses a daemon bug fix with only an untimed unrelated added file (replay gate kept)', () => {
+    const verdict = soakPrecheckAtOpen({ ...fix,
+      files: [...fix.files, { path: 'scripts/lib/new-helper.mjs', changeType: 'ADDED' }] });
+    expect(verdict.ok).toBe(false);
+    expect(verdict.message).toContain('scripts/conveyor/soak/breaks/');
   });
   it('leaves the result unchanged when no break test is added', () => {
     const input = { ...fix, files: [{ path: 'README.md', changeType: 'ADDED' }] };
@@ -62,49 +43,13 @@ describe('soak precheck at PR open', () => {
     expect(soakPrecheckAtOpen({ ...addedBreak, files: [{ path: breakTest, changeType }] }))
       .toMatchObject({ ok: true });
   });
-  it('loads soak timings from test-timings.json by default', () => {
-    expect(soakPrecheckAtOpen({ ...addedBreak, timings: undefined }))
-      .toMatchObject({ ok: false, missingTimings: [breakTest] });
-  });
-  it('refuses an added break test when the timings reader throws', () => {
-    const readTimings = vi.fn(() => { throw new Error('permission denied'); });
-    const verdict = soakPrecheckAtOpen({ ...addedBreak, timings: undefined, readTimings });
-    expect(verdict.ok).toBe(false);
-    expect(verdict.message).toContain('scripts/ci/test-timings.json');
-    expect(verdict.message).toContain('could not be read');
-    expect(verdict.message).toContain('Fix:');
-    expect(verdict.message).toContain(`${SOAK_PRECHECK_ENV}=0`);
-    expect(readTimings).toHaveBeenCalledOnce();
-  });
-  it.each(['{invalid', '{}', 'null', '{"soak":null}', '{"soak":[]}', '{"soak":"2"}', '{"soak":2}'])(
-    'refuses unreadable timings evidence %s', (contents) => {
-      const verdict = soakPrecheckAtOpen({ ...addedBreak, timings: undefined,
-        readTimings: () => contents });
-      expect(verdict.ok).toBe(false);
-      expect(verdict.message).toContain('scripts/ci/test-timings.json');
-      expect(verdict.message).toContain('could not be read');
-    },
-  );
-  it('uses the injected reader for valid soak timings', () => {
-    const readTimings = vi.fn(() => JSON.stringify({ soak: { [breakTest]: 2 } }));
-    expect(soakPrecheckAtOpen({ ...addedBreak, timings: undefined, readTimings }).ok).toBe(true);
-    expect(readTimings).toHaveBeenCalledWith(expect.any(URL), 'utf8');
-    expect(readTimings.mock.calls[0][0].pathname).toMatch(/\/scripts\/ci\/test-timings\.json$/);
-  });
-  it('does not read the timings file when timings are supplied or no break test is added', () => {
+  it('never reads the timings file, even when it is unreadable', () => {
     const readTimings = vi.fn(() => { throw new Error('must not read'); });
-    expect(soakPrecheckAtOpen({ ...addedBreak, timings: { [breakTest]: 2 }, readTimings }).ok).toBe(true);
-    expect(soakPrecheckAtOpen({ ...addedBreak, timings: undefined, files: [], readTimings }).ok).toBe(true);
+    expect(soakPrecheckAtOpen({ ...addedBreak, timings: undefined, readTimings }).ok).toBe(true);
     expect(readTimings).not.toHaveBeenCalled();
   });
-  it('disables the unreadable timings check on opt-out without calling the reader', () => {
-    const readTimings = vi.fn(() => { throw new Error('permission denied'); });
-    expect(soakPrecheckAtOpen({ ...addedBreak, timings: undefined, readTimings,
-      env: { [SOAK_PRECHECK_ENV]: '0' } })).toEqual({ ok: true, skipped: 'disabled' });
-    expect(readTimings).not.toHaveBeenCalled();
-  });
-  it('disables the missing timing check on opt-out', () => {
-    expect(soakPrecheckAtOpen({ ...addedBreak, timings: undefined, env: { [SOAK_PRECHECK_ENV]: '0' } }))
+  it('disables the check on opt-out', () => {
+    expect(soakPrecheckAtOpen({ ...addedBreak, env: { [SOAK_PRECHECK_ENV]: '0' } }))
       .toEqual({ ok: true, skipped: 'disabled' });
   });
   it('refuses a daemon fix without replay evidence with actionable instructions', () => {
