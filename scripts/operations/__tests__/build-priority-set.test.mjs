@@ -175,24 +175,75 @@ it('accepts an empty array as a setting and refuses scopes instead of the settin
   untouched(f);
 });
 
-it.each(['we:scripts/lib/ledger-readiness-daily.mjs', 'we:scripts/conveyor/plain.mjs',
-  'we:scripts/lib/gate-config.mjs', 'fui:scripts/conveyor/plain.mjs', 'we:scripts/*.mjs'])(
-  'refuses any scope with the empty shipped allowlist, including plain files: %s', async scope => {
-    for (const preview of [false, true]) {
-      const f = fixture({
-        readScopeSettings: () => fs.readFileSync(resolve('scripts/settings/build-priority-scope.json'), 'utf8'),
-        readCard: () => ({ scope: [scope] }),
-        pathType: vi.fn(() => 'file'), readContent: vi.fn(() => 'export {};\n'),
-      });
-      const result = await f.command([...flags, ...(preview ? ['--preview'] : [])]);
-      expect(result.code).not.toBe(0);
-      expect(result.lines.join('\n')).toContain('allowlist is empty; add the file by a reviewed settings PR');
-      expect(f.options.pathType).not.toHaveBeenCalled();
-      expect(f.options.readContent).not.toHaveBeenCalled();
-      expect(f.readPrs).not.toHaveBeenCalled();
-      untouched(f);
-    }
-  });
+it.each([
+  ['we:scripts/lib/ledger-readiness-daily.mjs', 'outside allowedFiles'],
+  ['we:scripts/conveyor/plain.mjs', 'outside allowedFiles'],
+  ['we:scripts/lib/gate-config.mjs', 'overlaps gate file'],
+  ['fui:scripts/conveyor/plain.mjs', 'must be an exact file path'],
+  ['we:scripts/*.mjs', 'must be an exact file path'],
+])('refuses unlisted or protected scope %s with the shipped allowlist', async (scope, refusal) => {
+  for (const preview of [false, true]) {
+    const f = fixture({
+      readScopeSettings: () => fs.readFileSync(resolve('scripts/settings/build-priority-scope.json'), 'utf8'),
+      readCard: () => ({ scope: [scope] }),
+      pathType: vi.fn(() => 'file'), readContent: vi.fn(() => 'export {};\n'),
+    });
+    const result = await f.command([...flags, ...(preview ? ['--preview'] : [])]);
+    expect(result.code).not.toBe(0);
+    expect(result.lines.join('\n')).toContain(refusal);
+    expect(f.options.pathType).not.toHaveBeenCalled();
+    expect(f.options.readContent).not.toHaveBeenCalled();
+    expect(f.readPrs).not.toHaveBeenCalled();
+    untouched(f);
+  }
+});
+
+it('admits the docket generator with the shipped allowlist and injected snapshot content', async () => {
+  for (const preview of [false, true]) {
+    const f = fixture({
+      allowedFiles: ['scripts/gen-decision-docket.mjs'],
+      readScopeSettings: () => fs.readFileSync(resolve('scripts/settings/build-priority-scope.json'), 'utf8'),
+      readCard: () => ({ scope: ['we:scripts/gen-decision-docket.mjs'] }),
+    });
+    expect((await f.command([...flags, ...(preview ? ['--preview'] : [])])).code).toBe(0);
+    expect(f.readPrs).toHaveBeenCalledTimes(preview ? 1 : 2);
+    if (preview) untouched(f);
+    else expect(JSON.parse(fs.readFileSync(f.path, 'utf8')).ids).toEqual(['42', '43']);
+  }
+});
+
+it.each([
+  'scripts/ci/shard-assign.mjs', 'scripts/ci/ci-durations.mjs',
+  'scripts/ci/nested/plain.mjs', 'SCRIPTS/CI/PLAIN.MJS',
+  'vitest.config.ts', 'playwright.config.ts', 'apps/x/vitest.config.ts',
+  'vite.config.ts', 'jest.config.js', 'apps/x/playwright.unit.config.mjs',
+  'apps/x/vitest.workspace.ts', 'apps/x/vitest.workspace.unit.ts',
+  'apps/x/vitest.setup.ts', 'apps/x/vitest.setup.unit.ts', 'apps/x/JEST.CONFIG.TS',
+])('refuses listed CI or test-runner control %s', async path => {
+  for (const preview of [false, true]) {
+    const f = fixture({ allowedFiles: [path], readCard: () => ({ scope: [`we:${path}`] }),
+      pathType: vi.fn(() => 'file'), readContent: vi.fn(() => 'export {};\n') });
+    const result = await f.command([...flags, ...(preview ? ['--preview'] : [])]);
+    expect(result.code).not.toBe(0);
+    expect(result.lines.join('\n')).toContain(`scope entry "we:${path}" overlaps gate file`);
+    expect(f.options.pathType).not.toHaveBeenCalled();
+    expect(f.options.readContent).not.toHaveBeenCalled();
+    expect(f.readPrs).not.toHaveBeenCalled();
+    untouched(f);
+  }
+});
+
+it('refuses a listed GitHub workflow as malformed scope settings', async () => {
+  for (const preview of [false, true]) {
+    const path = '.github/workflows/ci.yml';
+    const f = fixture({ allowedFiles: [path], readCard: () => ({ scope: [`we:${path}`] }) });
+    const result = await f.command([...flags, ...(preview ? ['--preview'] : [])]);
+    expect(result.code).not.toBe(0);
+    expect(result.lines.join('\n')).toContain('unreadable or malformed scope settings');
+    expect(f.readPrs).not.toHaveBeenCalled();
+    untouched(f);
+  }
+});
 
 it('ignores a broader worktree allowlist and uses the pinned snapshot allowlist', async () => {
   const sha = 'a'.repeat(40);

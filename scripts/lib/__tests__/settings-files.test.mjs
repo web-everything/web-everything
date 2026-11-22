@@ -444,8 +444,8 @@ describe('the real layout (we:scripts/settings/ + legacy dispatch-settings.json)
     expect(real.duplicates).toEqual([]);
   });
 
-  it('declares a valid empty build-priority scope allowlist in its feature file', () => {
-    expect(real.settings.allowedFiles).toEqual([]);
+  it('declares the docket generator as the build-priority scope allowlist in its feature file', () => {
+    expect(real.settings.allowedFiles).toEqual(['scripts/gen-decision-docket.mjs']);
     expect(real.owners.allowedFiles).toBe('settings/build-priority-scope.json');
   });
 

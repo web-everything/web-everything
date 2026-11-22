@@ -1,3 +1,3 @@
 {
-  "allowedFiles": []
+  "allowedFiles": ["scripts/gen-decision-docket.mjs"]
 }

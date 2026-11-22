@@ -18,6 +18,7 @@ import { TRUST_CHAIN } from '../lib/gate-config.mjs';
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '../..');
 // Execution controls and the guard remain protected wherever a copy is relocated.
 const EXECUTION_CONTROLS = [
+  /^(?:vitest|vite|playwright|jest)[^/]*\.config\.[a-z]+$/, /^vitest\.(?:workspace|setup)[^/]*\.[a-z]+$/,
   /^package\.json$/, /^vitest.*\.config\..+$/, /setup.*\.(?:js|ts|mjs)$/, /^vitest\.setup\..+$/,
   /^(?:cli-adapter|engine|effect-executor|build-priority-set-io|build-priority-set|build-priority-set\.test|build-priority-set-io-real\.test)\.mjs$/,
 ];
@@ -199,6 +200,7 @@ function prepare(input, options) {
       const folded = path.toLowerCase();
       if (protectedPaths.has(folded) || protectedBasenames.has(basename(folded))
           || GUARD_DEPENDENCY_BASENAMES.has(basename(folded))
+          || /^(?:scripts\/ci\/|\.github\/)/.test(folded)
           || /^scripts\/(?:[^/]+\/)*__tests__\/helpers\//.test(folded)
           || EXECUTION_CONTROLS.some(pattern => pattern.test(basename(folded)))
           || matchesSome(path, [...GUARD_FLOOR, ...LOCK_USERS])) {
