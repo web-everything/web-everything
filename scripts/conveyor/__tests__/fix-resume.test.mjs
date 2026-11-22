@@ -3,6 +3,12 @@
  * stronger-model rung starts at `fix.strongerModelFromRound` (rung by round).
  */
 import { describe, expect, it, vi } from 'vitest';
+
+// Repair argv uses the validated committed hook fixture, independent of the operator's HOME.
+vi.mock('../../operations/minimal-context-provider.mjs', async (original) => {
+  const { withLeanRepairSettingsFixture } = await import('../../operations/__tests__/helpers/lean-repair-settings.mjs');
+  return withLeanRepairSettingsFixture(await original());
+});
 import { join } from 'node:path';
 import {
   baseRebasedUnder, buildRoundResumePrompt, findSessionLane, isScratchSessionDir, jobModel, JOURNAL_TAIL_BYTES, laneFromJournal,

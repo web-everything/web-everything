@@ -18,6 +18,12 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
+// Repair argv uses the validated committed hook fixture, independent of the operator's HOME.
+vi.mock('../minimal-context-provider.mjs', async (original) => {
+  const { withLeanRepairSettingsFixture } = await import('./helpers/lean-repair-settings.mjs');
+  return withLeanRepairSettingsFixture(await original());
+});
+
 import { DISPATCH_EFFECT } from '../dispatch-lane.mjs';
 import {
   assertDispatcherFresh, createDispatchSinks, dispatchExecutorFor, routeDispatchProvider,

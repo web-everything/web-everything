@@ -1,4 +1,10 @@
 import { describe, expect, it, vi } from 'vitest';
+
+// Repair argv uses the validated committed hook fixture, independent of the operator's HOME.
+vi.mock('../../operations/minimal-context-provider.mjs', async (original) => {
+  const { withLeanRepairSettingsFixture } = await import('../../operations/__tests__/helpers/lean-repair-settings.mjs');
+  return withLeanRepairSettingsFixture(await original());
+});
 // Legacy launch assertions use shipped policy with capacity scoring switched off.
 vi.mock('../../lib/settings-files.mjs', async importOriginal => {
   const actual = await importOriginal();
