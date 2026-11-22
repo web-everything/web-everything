@@ -177,6 +177,11 @@ describe('checkScope reads exactly the declared repositories', () => {
     expect(checkScope({ declaredFiles: ['frontierui:src/index.ts', 'plateau:x.ts', 'frontierui:src/b.ts'], collect, now }).ok).toBe(true);
     expect(collect.mock.calls[0][0]).toMatchObject({ repos: [FUI, 'plateauapp/plateau-app'], requireRegistry: true });
   });
+  it('asks the collector for a read-only read, so the declared-read-only operation moves no ref', () => {
+    const collect = vi.fn(() => snapshot());
+    checkScope({ declaredFiles: ['scripts/a.mjs'], collect, now });
+    expect(collect.mock.calls[0][0]).toMatchObject({ readOnly: true });
+  });
   it('refuses a collector that did not cover a declared repository', () => {
     expect(run({}, { declaredFiles: ['frontierui:src/index.ts'] })).toMatchObject({ ok: false, reason: expect.stringContaining('incomplete scope snapshot') });
     expect(run({ repos: undefined }).ok).toBe(false);
@@ -222,6 +227,18 @@ describe('checkScope validates persisted claims before trusting them', () => {
   ('refuses an expiry the partitioner cannot compute: %j', patch => {
     expect(run({ agents: [{ ...agent, ...patch }] })).toMatchObject({ ok: false, reason: expect.stringContaining('corrupt scope registry entry') });
   });
+  // `Date.parse(0)` and `Date.parse('1')` are valid dates (year 2000/2001), so a corrupt stamp used to read as an
+  // ancient, expired claim and was silently ignored.
+  it.each([[{ startedAt: 0 }], [{ startedAt: 1 }], [{ startedAt: '0' }], [{ startedAt: '1' }], [{ startedAt: null }], [{ startedAt: true }],
+    [{ startedAt: [] }], [{ startedAt: new Date(now).getTime() }], [{ startedAt: 'not a date' }], [{ startedAt: '' }],
+    [{ staleAfterMinutes: 30, lastSeenAt: 0 }], [{ staleAfterMinutes: 30, lastSeenAt: '1' }], [{ staleAfterMinutes: 30, lastSeenAt: null }]])
+  ('refuses a persisted timestamp that is not an ISO string: %j', patch => {
+    expect(run({ agents: [{ ...agent, ...patch }] })).toMatchObject({ ok: false, reason: expect.stringContaining('corrupt scope registry entry') });
+  });
+  it('still reads ISO timestamps with an offset or without a time', () => {
+    expect(run({ agents: [{ ...agent, startedAt: '2026-11-18T07:00:00-05:00' }] }).ok).toBe(false);
+    expect(run({ agents: [{ ...agent, startedAt: '2000-01-01' }] }).ok).toBe(true);
+  });
   it('still honours a very long but representable TTL as a live claim', () => {
     expect(run({ agents: [{ ...agent, ttlHours: 24 * 365 * 10 }] }).ok).toBe(false);
   });
@@ -240,10 +257,27 @@ describe('checkScope reads PR evidence without re-splitting file paths', () => {
     expect(run({ prs }, { declaredFiles: ['we:docs/a:b.md'] })).toMatchObject({ ok: false, overlaps: [{ file: 'we:docs/a:b.md', pr: { number: 4 } }] });
     expect(run({ prs }, { declaredFiles: ['we:docs/other.md'] }).ok).toBe(true);
   });
-  it('keeps a brand-new backlog card exact-path-only after qualifying', () => {
+  // Fail closed: the card-filing exemptions of `free-scope` (a card a PR adds holds only its own path; two `backlog/`
+  // claims do not block each other) are NOT inherited here, because a wider scope can still cover the same files.
+  it.each([['we:backlog/'], ['we:'], ['we:backlog/new.md'], ['we:backlog/**']])('is held by a PR that adds a backlog card: %s', scope => {
     const prs = [{ repo: WE, number: 4, files: ['backlog/new.md'], added: ['backlog/new.md'] }];
-    expect(run({ prs }, { declaredFiles: ['we:backlog/'] }).ok).toBe(true);
-    expect(run({ prs }, { declaredFiles: ['we:backlog/new.md'] }).ok).toBe(false);
+    expect(run({ prs }, { declaredFiles: [scope] })).toMatchObject({ ok: false, overlaps: [{ pr: { number: 4, repo: WE } }] });
+  });
+  it('still lets a disjoint scope through next to a PR that adds a card', () => {
+    const prs = [{ repo: WE, number: 4, files: ['backlog/new.md'], added: ['backlog/new.md'] }];
+    expect(run({ prs }, { declaredFiles: ['we:scripts/a.mjs'] }).ok).toBe(true);
+  });
+  it.each([['we:backlog/'], ['we:backlog'], ['we:'], ['we:backlog/new.md']])('is held by an agent claiming the backlog folder: %s', scope => {
+    expect(run({ agents: [{ ...agent, files: ['we:backlog/'] }] }, { declaredFiles: [scope] }))
+      .toMatchObject({ ok: false, overlaps: [{ agent: 'lane-3' }] });
+  });
+  it('keeps the shared assessor lenient for card filing, so only the strict check changed', () => {
+    const prs = [{ repo: WE, number: 4, files: ['backlog/new.md'], added: ['backlog/new.md'] }];
+    expect(assessFreeScope({ files: ['we:backlog/'], prs, nowMs: now }).status).toBe('free');
+    expect(assessFreeScope({ files: ['we:backlog/'], prs, nowMs: now, strict: true }).status).toBe('occupied');
+    const agents = [{ ...agent, files: ['we:backlog/'] }];
+    expect(assessFreeScope({ files: ['we:backlog/'], agents, nowMs: now }).status).toBe('free');
+    expect(assessFreeScope({ files: ['we:backlog/'], agents, nowMs: now, strict: true }).status).toBe('occupied');
   });
   it.each([[{ repo: WE, number: 4 }], [{ repo: WE, number: 4, files: 'x' }], [{ repo: WE, number: 4, files: [''] }],
     [{ repo: WE, number: 4, files: ['a'], added: 'a' }], [{ repo: 'org/unknown', number: 4, files: ['a'] }], [null]])
@@ -311,6 +345,26 @@ describe('checkScope evidence completeness through the real reader', () => {
       const result = checkScope({ declaredFiles: ['old.mjs'], now, collect: realCollect(registryPath, pagedExec(prRows(renamed), new Error('api down'))) });
       expect(result.ok).toBe(false);
       expect(result.unreadable).toEqual([{ repo: WE, error: expect.stringContaining('renamed') }]);
+    });
+  });
+  it.each([['no previous_filename', '{"s":"renamed","f":"new.mjs","p":null}\n'], ['empty previous_filename', '{"s":"renamed","f":"new.mjs","p":""}\n'],
+    ['no status', '{"f":"new.mjs","p":"old.mjs"}\n'], ['unknown status', '{"s":"teleported","f":"new.mjs","p":"old.mjs"}\n']])
+  ('never clears the source of a rename from an incomplete paginated row (%s)', (_name, api) => {
+    withRegistry([], registryPath => {
+      const result = checkScope({ declaredFiles: ['old.mjs'], now, collect: realCollect(registryPath, pagedExec(prRows(renamed), api)) });
+      expect(result.ok).toBe(false);
+      expect(result.unreadable).toEqual([{ repo: WE, error: expect.stringMatching(/github api: .*(previous_filename|unexpected files API row)/) }]);
+    });
+  });
+  it.each([[undefined], ['modified'], ['MOVED'], [7], [null]])('never trusts a listed file whose changeType is %j (a rename could hide its old path)', changeType => {
+    withRegistry([], registryPath => {
+      const listed = [{ path: 'new.mjs', ...(changeType === undefined ? {} : { changeType }) }];
+      const result = checkScope({ declaredFiles: ['old.mjs'], now, collect: realCollect(registryPath, pagedExec(prRows(listed), new Error('api down'))) });
+      expect(result.ok).toBe(false);
+      expect(result.unreadable).toEqual([{ repo: WE, error: expect.stringContaining('no usable files') }]);
+      // With the paginated API available the same PR is read exactly, including the rename's old path.
+      expect(checkScope({ declaredFiles: ['old.mjs'], now, collect: realCollect(registryPath, pagedExec(prRows(listed), apiRows)) }))
+        .toMatchObject({ ok: false, overlaps: [{ file: 'we:old.mjs', pr: { number: 5 } }] });
     });
   });
   it('treats a PR row without files data as incomplete, never as an empty change set', () => {

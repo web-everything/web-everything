@@ -100,22 +100,47 @@ export function defaultGitDirFor(repo, { root = repoRoot, env = process.env } = 
  * FETCH_HEAD written). A failed fetch is not fatal: heads already present are still diffed, and a stale base only
  * widens a set (never narrows it). Returns Map(number → { ok, files, added } | { ok: false, reason }).
  */
-export function readNetFileSets({ dir, rows, git, remote = 'origin', base = 'main' }) {
+/** A branch name safe to pass to git as a ref: no leading dash, no `..`, no glob or control characters. */
+const SAFE_BRANCH = /^(?!-)(?!.*\.\.)(?!.*\/\/)[A-Za-z0-9._/-]+$/;
+/**
+ * `perRowBase` (the open-PR reader): each PR is diffed against ITS OWN base branch (`row.baseRefName`), never an assumed
+ * `base`: a stacked PR can match main yet differ from the branch it targets. A row without a usable base name is
+ * unreadable by git (the caller falls back and fails closed), never diffed against main.
+ * `readOnly` (check-scope): no ref is created or moved and FETCH_HEAD is not written. The base tip comes from
+ * `ls-remote` and is fetched by id; when that read fails, an existing local `<remote>/<base>` ref is used, which can
+ * only be older, and an older base only widens a set. The caller's `git` should also keep fetched objects out of the repo.
+ */
+export function readNetFileSets({ dir, rows, git, remote = 'origin', base = 'main', perRowBase = false, readOnly = false }) {
   const out = new Map();
   const fail = (row, reason) => out.set(row.number, { ok: false, reason });
   if (!dir) { for (const row of rows) fail(row, 'no local checkout of this repo'); return out; }
-  const valid = rows.filter((row) => Number.isInteger(row.number) && row.number > 0 && SHA.test(String(row.headRefOid || '')));
-  for (const row of rows) if (!valid.includes(row)) fail(row, 'no usable head commit id');
+  const baseOf = (row) => (perRowBase ? row.baseRefName : base);
+  const valid = rows.filter((row) => Number.isInteger(row.number) && row.number > 0 && SHA.test(String(row.headRefOid || ''))
+    && typeof baseOf(row) === 'string' && SAFE_BRANCH.test(baseOf(row)));
+  for (const row of rows) if (!valid.includes(row)) fail(row, SHA.test(String(row.headRefOid || '')) ? 'no usable base branch' : 'no usable head commit id');
   if (!valid.length) return out;
   const present = (sha) => { try { git(dir, ['cat-file', '-e', `${sha}^{commit}`]); return true; } catch { return false; } };
   const missing = valid.filter((row) => !present(row.headRefOid));
-  try {
-    git(dir, ['fetch', '--quiet', '--no-write-fetch-head', '--end-of-options', remote,
-      `+refs/heads/${base}:refs/remotes/${remote}/${base}`, ...missing.map((row) => `refs/pull/${row.number}/head`)]);
-  } catch { /* offline or a head gone: diff whatever is present; the rest falls back below */ }
+  const bases = [...new Set(valid.map(baseOf))];
+  // What each base is diffed against: the remote-tracking ref (writing mode), or the tip id read from the remote (read-only).
+  const against = new Map();
+  const wants = [];
+  if (readOnly) {
+    for (const name of bases) {
+      let tip = null;
+      try { tip = String(git(dir, ['ls-remote', '--exit-code', '--end-of-options', remote, `refs/heads/${name}`])).split(/\s/)[0]; } catch { /* use the local ref */ }
+      if (tip && SHA.test(tip)) { against.set(name, tip); if (!present(tip)) wants.push(tip); } else against.set(name, `${remote}/${name}`);
+    }
+  } else for (const name of bases) against.set(name, `${remote}/${name}`);
+  const wanted = [...(readOnly ? wants : bases.map((name) => `+refs/heads/${name}:refs/remotes/${remote}/${name}`)), ...missing.map((row) => `refs/pull/${row.number}/head`)];
+  // A fetch with no refspec would apply the remote's default one and move refs, so a read-only run with nothing to fetch skips it.
+  if (wanted.length) {
+    try { git(dir, ['fetch', '--quiet', '--no-write-fetch-head', '--end-of-options', remote, ...wanted]); }
+    catch { /* offline or a head gone: diff whatever is present; the rest falls back below */ }
+  }
   for (const row of valid) {
     try {
-      const mergeBase = String(git(dir, ['merge-base', '--end-of-options', `${remote}/${base}`, row.headRefOid])).split('\n')[0].trim();
+      const mergeBase = String(git(dir, ['merge-base', '--end-of-options', against.get(baseOf(row)), row.headRefOid])).split('\n')[0].trim();
       if (!SHA.test(mergeBase)) throw new Error('no merge-base with the base branch');
       // --no-renames: a rename holds both its old and new path. -z: paths are NUL-separated, never quoted.
       const raw = String(git(dir, ['diff', '--no-ext-diff', '--no-renames', '--name-status', '-z', '--end-of-options', mergeBase, row.headRefOid]));
@@ -130,6 +155,10 @@ export function readNetFileSets({ dir, rows, git, remote = 'origin', base = 'mai
   }
   return out;
 }
+/** `status` values GitHub's PR files API documents; any other value is an unknown row shape and unreadable. */
+const API_STATUSES = new Set(['added', 'removed', 'modified', 'renamed', 'copied', 'changed', 'unchanged']);
+/** `changeType` values `gh pr list --json files` documents; a file without one cannot be told apart from a rename. */
+const LIST_CHANGE_TYPES = new Set(['ADDED', 'CHANGED', 'COPIED', 'DELETED', 'MODIFIED', 'RENAMED']);
 /** GitHub's paginated files API for one PR (up to GH_API_FILE_CAP files). A rename holds both paths. */
 export function readPagedFiles({ repo, number, exec }) {
   try {
@@ -138,25 +167,58 @@ export function readPagedFiles({ repo, number, exec }) {
     const files = [], added = [];
     for (const line of String(raw).split(/\r?\n/).filter((l) => l.trim())) {
       const row = JSON.parse(line);
-      if (!row || typeof row.f !== 'string') throw new Error('unexpected files API row');
+      if (!row || typeof row.f !== 'string' || !row.f || typeof row.s !== 'string' || !API_STATUSES.has(row.s)) throw new Error('unexpected files API row');
+      const previous = typeof row.p === 'string' && row.p ? row.p : null;
+      // A rename holds both paths; a rename row without the old one is incomplete evidence, never a destination-only answer.
+      if (row.s === 'renamed' && !previous) throw new Error('files API renamed row has no previous_filename');
       files.push(row.f);
-      if (typeof row.p === 'string' && row.p) files.push(row.p);
+      if (previous) files.push(previous);
       if (row.s === 'added') added.push(row.f);
     }
     return { ok: true, files, added };
   } catch (error) { return { ok: false, reason: firstLine(error) }; }
 }
-export function readOpenPrs({ repos = DEFAULT_REPOS, exec, git = gitExec(), gitDirFor = (repo) => defaultGitDirFor(repo) }) {
+/**
+ * A `git` that keeps everything it fetches OUT of the repository: objects land in a throwaway directory and the
+ * repository's own object store is only an alternate to read from. Together with `readNetFileSets({ readOnly })`,
+ * which creates no ref and no FETCH_HEAD, a read-only caller leaves the checkout exactly as it found it.
+ * Call `.cleanup()` when done.
+ */
+export function gitExecQuarantined() {
+  const quarantines = new Map();
+  const quarantineFor = (dir) => {
+    let found = quarantines.get(dir);
+    if (!found) {
+      const common = String(execFileSync('git', ['-C', dir, 'rev-parse', '--git-common-dir'], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] })).trim();
+      found = { objects: fs.mkdtempSync(path.join(os.tmpdir(), 'free-scope-objects-')), alternate: path.resolve(dir, common, 'objects') };
+      quarantines.set(dir, found);
+    }
+    return found;
+  };
+  const run = (dir, args) => {
+    const { objects, alternate } = quarantineFor(dir);
+    return execFileSync('git', ['-C', dir, ...args], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], maxBuffer: 64 * 1024 * 1024, timeout: 120e3,
+      env: { ...process.env, GIT_OBJECT_DIRECTORY: objects, GIT_ALTERNATE_OBJECT_DIRECTORIES: alternate } });
+  };
+  run.cleanup = () => { for (const { objects } of quarantines.values()) fs.rmSync(objects, { recursive: true, force: true }); quarantines.clear(); };
+  return run;
+}
+export function readOpenPrs({ repos = DEFAULT_REPOS, exec, readOnly = false, git = readOnly ? gitExecQuarantined() : gitExec(), gitDirFor = (repo) => defaultGitDirFor(repo) }) {
+  try { return readOpenPrsWith({ repos, exec, readOnly, git, gitDirFor }); } finally { git.cleanup?.(); }
+}
+function readOpenPrsWith({ repos, exec, readOnly, git, gitDirFor }) {
   const prs = [], unreadable = [];
   for (const repo of repos) {
     try {
-      const rows = JSON.parse(exec(['pr', 'list', '--repo', repo, '--state', 'open', '--limit', String(OPEN_PR_LIMIT), '--json', 'number,title,url,headRefOid,files']));
-      const net = readNetFileSets({ dir: gitDirFor(repo), rows, git });
+      const rows = JSON.parse(exec(['pr', 'list', '--repo', repo, '--state', 'open', '--limit', String(OPEN_PR_LIMIT), '--json', 'number,title,url,headRefOid,baseRefName,files']));
+      const net = readNetFileSets({ dir: gitDirFor(repo), rows, git, perRowBase: true, readOnly });
       const why = [];
       if (rows.length >= OPEN_PR_LIMIT) why.push(`open PR list hit the ${OPEN_PR_LIMIT}-row limit and may be truncated`);
       for (const { number, title, url, files: listedFiles } of rows) {
         // A row with no `files` array (or a malformed entry) is incomplete evidence, never an empty change set.
-        const wellFormed = Array.isArray(listedFiles) && listedFiles.every((f) => f && typeof f.path === 'string' && f.path);
+        // `changeType` is required too: without it a rename cannot be told from an edit, so its previous path would be missed.
+        const wellFormed = Array.isArray(listedFiles) && listedFiles.every((f) => f && typeof f.path === 'string' && f.path
+          && typeof f.changeType === 'string' && LIST_CHANGE_TYPES.has(f.changeType));
         const entries = wellFormed ? listedFiles : [];
         // The list names only a rename's NEW path; its previous path is a file the PR also holds, and only the paged API reports it.
         const hasRename = entries.some((f) => f.changeType === 'RENAMED');
@@ -203,8 +265,8 @@ export function readCardScope(card, { root }) {
 }
 export function collectFreeScope({ files = '', card = '', root = repoRoot, repos = DEFAULT_REPOS,
   env = process.env, now = Date.now, exec = ghExec(env), registryPath = defaultRegistryPath(env), requireRegistry = false,
-  git = gitExec(), gitDirFor = (repo) => defaultGitDirFor(repo, { root, env }) } = {}) {
+  readOnly = false, git = readOnly ? gitExecQuarantined() : gitExec(), gitDirFor = (repo) => defaultGitDirFor(repo, { root, env }) } = {}) {
   const scope = [...new Set([...files.split(','), ...(card ? readCardScope(card, { root }) : [])].map((f) => qualifyFile(f)).filter(Boolean))];
   if (!scope.length) throw new TypeError('free-scope: give --files=a,b or --card=<id>');
-  return { files: scope, nowMs: now(), ...readOpenPrs({ repos, exec, git, gitDirFor }), agents: readRegistry(registryPath, { required: requireRegistry }) };
+  return { files: scope, nowMs: now(), ...readOpenPrs({ repos, exec, git, gitDirFor, readOnly }), agents: readRegistry(registryPath, { required: requireRegistry }) };
 }

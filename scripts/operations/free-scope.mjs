@@ -115,7 +115,10 @@ export function releaseScope(entries, agent, owner) {
 // An EXISTING card a PR edits, or one a scope names exactly, still collides as before.
 const CARD_PATH = /^[^:]+:backlog\/[^/]+\.md$/;
 const CARD_FOLDER = /^[^:]+:backlog\/?$/;
-function overlaps(file, h) {
+// `strict` (check-scope, the fail-closed admission) drops both exemptions: a card another PR adds, or a folder another
+// agent claims, can still sit under a repository-wide or `backlog/` scope, so neither may read as disjoint.
+function overlaps(file, h, strict = false) {
+  if (strict) return scopeEntriesOverlap(file, h.file);
   if (h.newCard) return file === h.file;
   if (CARD_FOLDER.test(file) && CARD_FOLDER.test(h.file)) return false;
   return scopeEntriesOverlap(file, h.file);
@@ -166,7 +169,7 @@ function prHolders(pr) {
 }
 const holderName = (h) => h.type === 'pr' ? `PR #${h.number} (${h.repo})` : `agent ${h.agent}`;
 /** `excludeOwner` narrows `excludeAgent` to the caller's own entry; left undefined, every entry of that name is excluded. */
-export function assessFreeScope({ files, prs = [], agents = [], nowMs, excludeAgent = '', excludeOwner, excludePr = 0, excludeRepo = DEFAULT_REPOS[0], unreadable = [] }) {
+export function assessFreeScope({ files, prs = [], agents = [], nowMs, excludeAgent = '', excludeOwner, excludePr = 0, excludeRepo = DEFAULT_REPOS[0], unreadable = [], strict = false }) {
   const scope = qualified(files || []);
   if (!scope.length) throw new TypeError('free-scope: give --files=a,b or --card=<id>');
   const excluded = (e) => e.agent === excludeAgent && (excludeOwner === undefined || ownerOf(e.owner) === ownerOf(excludeOwner));
@@ -182,7 +185,7 @@ export function assessFreeScope({ files, prs = [], agents = [], nowMs, excludeAg
   // A file is only FREE when the snapshot is complete AND nothing holds it; with an incomplete snapshot an
   // unheld file is `unknown` in every output (row, list and text), never free.
   const rows = scope.map((file) => {
-    const holders = candidates.filter((h) => overlaps(file, h));
+    const holders = candidates.filter((h) => overlaps(file, h, strict));
     const state = holders.length ? 'occupied' : unreadable.length ? 'unknown' : 'free';
     return { file, state, free: state === 'free', holders };
   });

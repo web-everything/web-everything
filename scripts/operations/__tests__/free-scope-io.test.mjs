@@ -27,10 +27,10 @@ if (args[0] === 'api') {
   for (let i = 0; i < 150; i++) console.log(JSON.stringify({ s: i === 0 ? 'added' : i === 1 ? 'renamed' : 'modified', f: 'c' + i + '.mjs', p: i === 1 ? 'old1.mjs' : null }));
   process.exit(0);
 }
-const full = Array.from({length: Number(args[args.indexOf('--limit') + 1])}, (_, i) => ({number: i + 1, title: 'P', url: 'u', files: [{path: 'f' + i + '.mjs'}]}));
-const twin = [{number: 12, title: 'Twin ' + repo, url: 'u', files: [{path: 'twin.mjs'}]}];
-const fixture = [{number: 12, title: 'Fixture', url: 'https://example.test/12', files: [{path: 'held.mjs'}]}];
-const capped = [{number: 7, title: 'Capped', url: 'u', files: Array.from({length: 100}, (_, i) => ({path: 'c' + i + '.mjs'}))}];
+const full = Array.from({length: Number(args[args.indexOf('--limit') + 1])}, (_, i) => ({number: i + 1, title: 'P', url: 'u', files: [{path: 'f' + i + '.mjs', changeType: 'MODIFIED'}]}));
+const twin = [{number: 12, title: 'Twin ' + repo, url: 'u', files: [{path: 'twin.mjs', changeType: 'MODIFIED'}]}];
+const fixture = [{number: 12, title: 'Fixture', url: 'https://example.test/12', files: [{path: 'held.mjs', changeType: 'MODIFIED'}]}];
+const capped = [{number: 7, title: 'Capped', url: 'u', files: Array.from({length: 100}, (_, i) => ({path: 'c' + i + '.mjs', changeType: 'MODIFIED'}))}];
 console.log(JSON.stringify(repo === 'full/repo' ? full : ['capped/repo', 'paged/repo'].includes(repo) ? capped : require('node:fs').existsSync(__filename + '.twins') ? twin : repo === 'fixture/repo' ? fixture : []));
 `, { mode: 0o755 });
   env = { WE_AGENT_SCOPES_PATH: registry, WE_FREE_SCOPE_GH_BIN: gh };

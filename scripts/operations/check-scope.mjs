@@ -7,6 +7,9 @@ import { CONSTELLATION_REPOS, repoKeyForSlug } from '../lib/constellation-repos.
 /** The latest instant a `Date` can hold; an expiry past it cannot be rendered by the assessor. */
 const MAX_TIME_MS = 8.64e15;
 const CONTROL = /[\u0000-\u001f\u007f]/;
+/** A persisted timestamp is an ISO-8601 string: `Date.parse` alone also accepts `0`, `1` and `"1"` as years in 2000 and 2001. */
+const ISO_TIMESTAMP = /^\d{4}-\d{2}-\d{2}(?:[T ]\d{2}:\d{2}(?::\d{2}(?:\.\d+)?)?(?:Z|[+-]\d{2}:?\d{2})?)?$/;
+const isoMs = (value) => (typeof value === 'string' && ISO_TIMESTAMP.test(value) ? Date.parse(value) : NaN);
 
 /**
  * One scope entry in the assessor's canonical form `<repo key>:<normalized path>`. Refuses (throws) a blank or empty
@@ -36,20 +39,20 @@ const inRange = ms => Number.isFinite(ms) && Math.abs(ms) <= MAX_TIME_MS;
 
 /** A persisted claim must be well formed AND have an expiry the partitioner can compute; anything else is corrupt. */
 function validateEntry(entry) {
-  const startedMs = Date.parse(entry?.startedAt);
+  const startedMs = isoMs(entry?.startedAt);
   if (!entry || typeof entry !== 'object' || typeof entry.agent !== 'string' || !entry.agent.trim()
     || !Array.isArray(entry.files) || !entry.files.length || entry.files.some(f => typeof f !== 'string' || !f.trim())
     || !Number.isFinite(startedMs)
     || (entry.owner !== undefined && typeof entry.owner !== 'string')
     || (entry.ttlHours !== undefined && !positive(entry.ttlHours))
     || (entry.staleAfterMinutes !== undefined && !positive(entry.staleAfterMinutes))
-    || (entry.lastSeenAt !== undefined && !Number.isFinite(Date.parse(entry.lastSeenAt)))) {
+    || (entry.lastSeenAt !== undefined && !Number.isFinite(isoMs(entry.lastSeenAt)))) {
     throw new Error('corrupt scope registry entry');
   }
   // Overflow (`ttlHours: 1e308`) would make the partitioner read a live claim as stale: refuse, never ignore.
   if (!inRange(startedMs + (entry.ttlHours ?? DEFAULT_TTL_HOURS) * 3600e3)) throw new Error('corrupt scope registry entry: expiry out of range');
   if (entry.staleAfterMinutes !== undefined) {
-    const seen = Number.isFinite(Date.parse(entry.lastSeenAt)) ? Date.parse(entry.lastSeenAt) : startedMs;
+    const seen = entry.lastSeenAt !== undefined ? isoMs(entry.lastSeenAt) : startedMs;
     if (!inRange(seen + entry.staleAfterMinutes * 60e3)) throw new Error('corrupt scope registry entry: heartbeat out of range');
   }
 }
@@ -83,7 +86,7 @@ export function checkScope({ declaredFiles, excludeAgent, excludeOwner, collect 
     if (!Number.isFinite(nowMs)) throw new Error('invalid clock reading');
     // Read exactly the repositories the scope names: PRs in another repo cannot hold these files, and a repo left unread cannot clear them.
     const repos = [...new Set(files.map(file => CONSTELLATION_REPOS[file.slice(0, file.indexOf(':'))].slug))];
-    const snapshot = collect({ files: files.join(','), repos, requireRegistry: true, now: () => nowMs });
+    const snapshot = collect({ files: files.join(','), repos, requireRegistry: true, readOnly: true, now: () => nowMs });
     if (!snapshot || !Array.isArray(snapshot.prs) || !Array.isArray(snapshot.agents) || !Array.isArray(snapshot.unreadable)
       || !Array.isArray(snapshot.repos) || repos.some(repo => !snapshot.repos.includes(repo))) {
       throw new Error('incomplete scope snapshot');
@@ -96,7 +99,7 @@ export function checkScope({ declaredFiles, excludeAgent, excludeOwner, collect 
       catch (error) { throw new Error(`${error.message} (registry entry for agent ${JSON.stringify(entry?.agent)})`); }
     });
     const prs = snapshot.prs.map(qualifyPr);
-    const verdict = assessFreeScope({ files, prs, agents, unreadable: snapshot.unreadable, nowMs,
+    const verdict = assessFreeScope({ files, prs, agents, unreadable: snapshot.unreadable, nowMs, strict: true,
       ...(excluding ? { excludeAgent, excludeOwner } : {}) });
     const { live } = partitionRegistry(agents, nowMs);
     const overlaps = verdict.files.filter(row => row.state === 'occupied').flatMap(row => row.holders.map(holder => {
