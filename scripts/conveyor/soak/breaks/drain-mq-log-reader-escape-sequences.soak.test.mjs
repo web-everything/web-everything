@@ -16,10 +16,7 @@ it('discovers the break and behaviorally requires the fix on this tree', () => {
 it('reads escape-coded logs through every drain MQ evidence path', async () => {
   const report = await b.run();
   expect(b.judge(report)).toEqual([]);
-  expect(Object.keys(report.readers)).toEqual(['recovery', 'same-head', 'quarantine', 'freeze', 'exact-test']);
-  expect(report.readers['exact-test'].reads).toEqual([
-    expect.objectContaining({ encoding: 'buffer' }),
-  ]);
+  expect(Object.keys(report.readers)).toEqual(['recovery', 'same-head']);
   for (const { reads, accepted } of Object.values(report.readers)) {
     expect(reads.length).toBeGreaterThan(0);
     expect(accepted).toHaveLength(reads.length);
@@ -27,7 +24,7 @@ it('reads escape-coded logs through every drain MQ evidence path', async () => {
   }
 });
 
-it.each(['recovery', 'same-head', 'quarantine', 'freeze', 'exact-test'])(
+it.each(['recovery', 'same-head'])(
   'detects the pre-fix transport refusal in the %s reader', async reader => {
     const report = await exerciseReaders(ROOT, reader);
     expect(b.judge(report)).toContain(`${reader}: escape-coded log was not read successfully`);

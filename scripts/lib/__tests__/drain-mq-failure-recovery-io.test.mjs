@@ -77,6 +77,34 @@ function fixture(mode = 'real') {
 }
 
 describe('drain MQ failure production adapter', () => {
+  it('real failure routes to the fixer even when every failing test is outside the PR diff', async () => {
+    const f = fixture();
+    expect(await routeMqFailureOnHold(f.options)).toMatchObject({ routed: true });
+    const body = f.writes().find(([, args]) => args[1] === 'comment')[2].input;
+    const route = parseMqFailureRoute({ expected: identity, comment: { body, author: { login: 'chalbert' } } });
+    const admitted = admitMqFailureRoute({ ...identity, route,
+      changedFiles: { ...identity, complete: true, files: ['src/unrelated.mjs'] } });
+    expect(admitted).toMatchObject({ recoveryAction: 'fix', evidence: { fixerOnly: true } });
+    // The dispatcher reconstructs a route from persisted evidence before choosing its action.
+    expect(admitMqFailureRoute({ ...identity, route: { ...identity, ...admitted.evidence, stale: false },
+      changedFiles: { ...identity, complete: true, files: [] } })).toMatchObject({ recoveryAction: 'fix' });
+  });
+  it.each(['404 log', 'OSC', 'infra', 'repeated matching removal', 'retry exhausted'])(
+    'spent refresh with %s evidence holds and routes only to the fixer', async mode => {
+      const f = fixture(mode);
+      f.options.guard = { ...guard, recoveryAction: 'fixer' };
+      expect(await routeMqFailureOnHold(f.options)).toMatchObject({ routed: true });
+      const body = f.writes().find(([, args]) => args[1] === 'comment')[2].input;
+      const route = parseMqFailureRoute({ expected: identity, comment: { body, author: { login: 'chalbert' } } });
+      expect(admitMqFailureRoute({ ...identity, route,
+        changedFiles: { ...identity, complete: true, files: [] } })).toMatchObject({ recoveryAction: 'fix' });
+      if (['404 log', 'OSC'].includes(mode)) expect(route.complete).toBe(false);
+    });
+  it('refresh-first defers fixer routing and performs no evidence reads or writes', async () => {
+    const f = fixture();
+    expect(await routeMqFailureOnHold({ ...f.options, guard: { ...guard, recoveryAction: 'refresh-first' } })).toMatchObject({ routed: false });
+    expect(f.exec).not.toHaveBeenCalled();
+  });
   it('404 job log retains the hold without publication', async () => {
     const f = fixture('404 log');
     expect(await routeMqFailureOnHold(f.options)).toMatchObject({ routed: false });
@@ -124,14 +152,14 @@ describe('drain MQ failure production adapter', () => {
   });
 
   it.each(['infra', 'unreadable', 'wrong parent', 'wrong reason', 'missing merge commit', 'wrong run commit',
-    'incomplete timeline', 'oversized timeline', 'retry exhausted', 'stale head', 'conflict',
+    'incomplete timeline', 'oversized timeline', 'stale head', 'conflict',
     'unknown labels', 'expired log', 'oversized log', 'oversized runs'])('retains the hold without writes for %s', async mode => {
     const f = fixture(mode);
     expect(await routeMqFailureOnHold(f.options)).toMatchObject({ routed: false, reason: expect.any(String) });
     expect(f.writes()).toEqual([]);
   });
 
-  it.each(['unknown event', 'unknown reason', 'repeated matching removal'])(
+  it.each(['unknown event', 'unknown reason'])(
     'excludes ineligible timeline history without publication: %s', async mode => {
       const f = fixture(mode);
       expect(await routeMqFailureOnHold(f.options)).toMatchObject({

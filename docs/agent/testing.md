@@ -5936,14 +5936,18 @@ assertions intact; consumers without callable entries retain the fresh-import pa
 
 ## Drain log evidence normalization
 
-Drain queue and recovery log consumers share `readNormalizedJobLog` before parsing evidence. Normalize the whole log before
-slicing any summary/signature tail. Its `{ ok: false }` result propagates as a terminal
-hold through quarantine, flake, gate and exact-test readers; the recovery IO reader
-returns `complete: false`. The drain log-read source gate guards this shared boundary.
-Strip only SGR sequences; reject any remaining ESC byte or C1 control (U+0080–U+009F).
-Keep negative cases for non-colour CSI, BEL/ST-terminated OSC, stray ESC before
-`FAIL`/`Unhandled`/`Errors`, and C1-prefixed evidence: generic terminal stripping
-can consume the first letter of evidence after a stray ESC. A normalization failure
-holds for operator inspection; it never qualifies for the unreadable-log transport
-retry or falls through to another retry proof. Real test-failure wording
-anywhere in a job log vetoes infrastructure signatures, including beyond the signature tail.
+Drain queue and recovery log consumers share `readNormalizedJobLog` over the whole job log. Strip only SGR;
+reject remaining ESC bytes or C1 controls. Keep the drain source tests for `ciJobLogApiArgs` (including
+`--allow-escape-sequences`) and normalization immediately around each full log read.
+
+Log parsing never authorizes re-enqueue, rerun or merge. Same-head MQ failures hold admission. Real assertion
+failure in a normalized log goes straight to the fixer, without refresh. Otherwise (including unreadable or
+normalization-failed logs), permit one `update-branch` refresh per PR-authored head under the existing live
+head, merge-state, green PR checks, approval and App-token preconditions. The shared locked ledger spends
+the head before the write, including refused requests. Re-read after the write and bind a generated merge
+head to the spent attempt; a new author head gets its own attempt. A second failure holds for the fixer.
+Normalization `ok:false` never supplies success or real-failure proof; recovery evidence stays incomplete.
+
+Keep negative tests for real failures (zero refreshes), unreadable/normalization-failed logs (one refresh),
+repeat failures and persisted ledger entries (no second refresh), new author heads (one new refresh), and
+the merge gate refusing non-green group members. The unreadable-log soak probes the refresh path itself.

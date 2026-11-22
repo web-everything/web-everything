@@ -106,20 +106,21 @@ export async function routeMqFailureOnHold({ repo, pr, head, guard,
     const identity = { repo, pr, head };
     if (!validIdentity(identity) || guard?.hold !== true || typeof guard.line !== 'string'
       || !guard.line.startsWith('mq-same-head-failed:')) return finish(false, 'No eligible same-head MQ hold');
+    if (guard.recoveryAction === 'refresh-first') return finish(false, 'Single refresh first; admission remains held');
     const active = io.forRoute ? io.forRoute() : io;
     const timeline = await active.readTimeline({ repo, pr });
     if (timeline?.error || timeline?.hasPreviousPage !== false || !Array.isArray(timeline?.nodes)
       || timeline.nodes.length > 100) return finish(false, 'Incomplete timeline; operator inspection required');
-    // Reuse the drain's second-parent binding and retry exhaustion decision. Unknown events/reasons,
-    // repeated failures and a queue re-entry after failure cannot authorize a recovery route.
+    // Reuse the drain's second-parent binding. Repeated bound failures go to the fixer;
+    // unknown history still cannot cause a mutation or publication.
     const decision = decideMqSameHead({ ...identity, timeline });
     if (!decision.hold || !decision.line?.endsWith(' — failed_checks'))
-      return finish(false, 'No single eligible failed_checks removal; operator inspection required');
+      return finish(false, 'No eligible failed_checks removal; operator inspection required');
     const removals = timeline.nodes.filter(event => event?.__typename === 'RemovedFromMergeQueueEvent'
       && event.reason?.trim().toLowerCase() === 'failed_checks'
       && event.beforeCommit?.parents?.nodes?.[1]?.oid === head);
-    const event = removals[0];
-    if (removals.length !== 1 || !oid(event?.beforeCommit?.oid)
+    const event = removals.at(-1);
+    if (!removals.length || !oid(event?.beforeCommit?.oid)
       || !Number.isFinite(Date.parse(event?.createdAt))) return finish(false, 'Unbound removal evidence; operator inspection required');
     const live = await active.readPr({ repo, pr });
     if (live?.headRefOid !== head || live.mergeStateStatus !== 'CLEAN' || live.baseRefName !== 'main')
@@ -131,7 +132,8 @@ export async function routeMqFailureOnHold({ repo, pr, head, guard,
         throw new Error('Head or merge state changed; operator inspection required');
     };
     const result = await drainMqFailureRecovery({ removal,
-      hold: { reason: 'mq-same-head-failed', historyComplete: true, mergeState: 'CLEAN', retriesExhausted: false },
+      hold: { reason: 'mq-same-head-failed', historyComplete: true, mergeState: 'CLEAN', retriesExhausted: false,
+        forceFixer: guard.recoveryAction === 'fixer' || removals.length > 1 },
       dryRun: false, ledger: active.ledger,
       io: {
         collectEvidence: args => active.collectEvidence(args),
