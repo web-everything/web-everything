@@ -100,9 +100,20 @@ describe('unaudited-tip plans', () => {
     expect(alerts).toHaveLength(1);
     expect(alerts[0].detail).toMatchObject({ setAside: true, adopted: f.a, newTip: f.b });
     // The adopted head stays recorded, so the NEXT rebuild never reads the overlay as a new registration and applies tip B.
-    const next = await f.plan({ headSha: plan.finalSha });
+    // Recorded out of band (prepare keeps the marker): NO merge parent claims the excluded head, yet it stays adopted.
+    expect(gitOk(f.root, ['rev-list', '--parents', '-n1', plan.finalSha]).split(' ')).not.toContain(f.a);
+    const next = await f.plan({ headSha: plan.finalSha, stalePins: { [ref]: f.a } });
     expect(next.applied.some((x) => x.ref === ref && x.sha === f.b)).toBe(false);
     expect(next.auditAdopted).toContain(ref);
+  });
+  it('ready-pin-stale loop: refuses to set aside when the ADOPTED head cannot be judged for mechanism pins', async () => {
+    const f = await fixture();
+    f.save();
+    const git = (args, opts) => (args[0] === 'merge-base' && args.includes(f.a)
+      ? { status: 1, stdout: '', stderr: 'injected' } : f.git(args, opts));
+    const plan = await f.plan({ stalePins: { [ref]: f.a }, git });
+    expect(plan.ok).toBe(false);
+    expect(plan.reason).toBe('pinned-overlay-unavailable');
   });
   it('ready-pin-stale loop: an explicitly pinned overlay is refused, never silently set aside', async () => {
     const f = await fixture();

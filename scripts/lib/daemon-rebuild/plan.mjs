@@ -398,6 +398,10 @@ export async function planRebuild({
         carriedHeads.set(hit[1], [...(carriedHeads.get(hit[1]) ?? []), ps[1]]);
         if (!adoptedTips.has(hit[1])) adoptedTips.set(hit[1], ps[1]);
       }
+      // ready-pin-stale loop — a set-aside overlay leaves no merge record; its adopted head is carried out of band.
+      for (const [ref, sha] of Object.entries(stalePins ?? {})) {
+        if (OID.test(sha) && !adoptedTips.has(ref) && !graduatedTips.has(ref)) adoptedTips.set(ref, sha);
+      }
       // A stack base may have entered the build only through its top, with no merge record of its own.
       // Shared ancestry outside main proves a carried part of its old tip even after a docs-only advance.
       // A recorded identity (including a different PR reusing that ref) takes precedence over this inference.
@@ -652,12 +656,13 @@ export async function planRebuild({
     const heldAt = holdUnauditedTip(ref, pr, ovSha);
     if (heldAt === false) {
       // An explicitly/mechanism-pinned overlay is never silently left out: refuse, exactly as a vanished ref would.
-      const p = pinnedStatus(git, raw, mainSha, ovSha);
-      if (p.pinned) return refusePinned(ref, pr, ovSha, 'unaudited-tip-held', p.why);
-      // Mint an identity-only hold marker (no `applied` entry, like a set-aside stack base) so the adopted head stays
-      // findable: the next rebuild must not read the still-registered overlay as a new, never-adopted registration.
+      // Judged on the ADOPTED head being discarded (the running content), not only the moved remote tip; an unknown
+      // adopted head is treated as pinned. The adopted head stays known out of band (`stalePins`, seeded into
+      // adoptedTips above), never as a merge parent that would make ancestry claim content the build excludes.
       const adoptedHead = adoptedTips.get(ref) ?? graduatedTips.get(ref);
-      if (!recordHold(ref, pr, adoptedHead, null)) return holdRefusal();
+      const p = adoptedHead ? pinnedStatus(git, raw, mainSha, adoptedHead) : { pinned: true, why: 'unknown' };
+      const pTip = pinnedStatus(git, raw, mainSha, ovSha);
+      if (p.pinned || pTip.pinned) return refusePinned(ref, pr, ovSha, 'unaudited-tip-held', p.pinned ? p.why : pTip.why);
       decisions.push({ ref, pr, action: 'skip', reason: 'unaudited-tip-held', sha: ovSha });
       continue;
     }
