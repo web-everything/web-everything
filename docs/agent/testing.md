@@ -6355,3 +6355,16 @@ shards exactly as the default would, so it is still recognized as the default ga
 Gate ceilings get one capped retry tied to lane, head and killed job. Detached jobs settle in
 `verify-gate-job.mjs`, so recovery must cover that consumer as well as `verify-dispatch.mjs`'s
 in-process sweep. Persist the retry identity in job input to dedupe the enqueue-before-marker crash window.
+
+### Main-sync overlay set-aside (daemon continuity)
+
+A validated main-sync conflict pair, confirmed by a direct Git conflict between current main
+and the same unpinned overlay tip, may build without
+that overlay, including one in the running build. Keep the registration so the ordinary planner
+retries it after a rebase. Record ref, tip, reason and conflicting files in rebuild `setAside`
+state and the overlay event trail; emit `overlay-main-sync-set-aside` once per unresolved tip/files,
+with the rebase remedy. This exception never applies to explicit pins or the self-destruct guard
+(overlays touching `REBUILD_MECHANISM_PATHS`), unaudited held tips, or unreadable conflict evidence.
+Those retain the existing refusal/last-good hold. Conflicts with other overlays retain the existing
+loss protection. The real-Git `main-sync-set-aside.test.mjs` and `rebuild-main-sync-set-aside` soak
+cover adoption of main, duplicate suppression and automatic return after branch repair.

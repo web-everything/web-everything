@@ -33,6 +33,7 @@ import {
 } from '../daemon-overlays.mjs';
 import { fetchMainAndOverlays, recordedEdgeSha } from './edge-fetch.mjs';
 import { planRebuild } from './plan.mjs';
+import { readMainSyncConflicts } from './overlay-main-sync.mjs';
 import { readPendingDrops } from '../overlay-drop-pending.mjs';
 import { detectOverlayStale } from './overlay-prune.mjs';
 import { makeAuditedTipGate, tipInMain } from './audited-tip.mjs';
@@ -409,8 +410,11 @@ export async function prepareRebuild({
   // The PR base chains come from gh, else from each entry's recorded `stackBases`, else ancestry alone.
   const stack = resolveOverlayStackMode(env);
   const chainOf = prBaseChain ?? makePrBaseChain({ root, overlays: overlaysBefore, env });
+  let mainSyncConflicts = {};
+  try { mainSyncConflicts = readMainSyncConflicts(root, env); }
+  catch (error) { alert('overlay-main-sync-state-unknown', { message: `${error.message}; keeping existing overlay loss protections — repair main-sync state` }); }
   const plan = await planRebuild({
-    auditedTip: makeAuditedTipGate(env),
+    auditedTip: makeAuditedTipGate(env), mainSyncConflicts,
     git, headSha: prevHead, mainRef: 'origin/main', overlays: overlaysBefore, prState, mainOnly, edgeResolve,
     stackMode: stack.mode, stackModeSource: stack.source, prBaseChain: chainOf,
     prForcePushes: prForcePushes ?? chainOf.forcePushes ?? null,
@@ -426,6 +430,21 @@ export async function prepareRebuild({
   if (!strictState && chainOf.fresh?.size > 0) {
     try { persistStackBases(root, chainOf.fresh, { env }); } catch (e) { alert('stack-bases-not-recorded', { error: String(e?.message ?? e) }); }
   }
+  // Durable set-aside bookkeeping uses the same completed plan as adoption. Preserve
+  // unresolved records on partial refusals; clear only when a complete plan no longer omits them.
+  const asideBefore = state.setAside ?? {};
+  const asideNow = { ...asideBefore };
+  if (plan.ok) {
+    // A failed rebase/audit attempt must not erase the outstanding operator record.
+    const returned = new Set((plan.applied ?? []).map(o => o.ref));
+    for (const ref of Object.keys(asideNow)) {
+      if (returned.has(ref) || !overlaysBefore.some(o => o.ref === ref)
+        || plan.decisions.some(d => d.ref === ref && d.action === 'remove')) delete asideNow[ref];
+    }
+    for (const d of plan.decisions) if (d.setAside) asideNow[d.ref] = d.setAside;
+  }
+  const asideChanged = JSON.stringify(asideBefore) !== JSON.stringify(asideNow);
+  if (strictState && asideChanged) return mutationDue('overlay-set-aside');
   // overlay-pin — `overlay-pinned` is logged ONCE per (ref, new tip), not every tick the pin holds; the record
   // (`state.pinnedNotified`: ref → the new tip last reported) is pruned only after a complete plan.
   const pinnedBefore = state.pinnedNotified && typeof state.pinnedNotified === 'object' ? state.pinnedNotified : {};
@@ -434,6 +453,10 @@ export async function prepareRebuild({
   // already emitted, even though this plan will not be adopted.
   if (!plan.ok) Object.assign(pinnedNow, pinnedBefore);
   for (const event of plan.alerts || []) {
+    // A set-aside has one actionable notice; do not also repeat the resolver's
+    // lower-level unresolved diagnostic on every otherwise healthy rebuild tick.
+    if (event.kind === 'overlay-conflict-unresolved'
+      && plan.decisions?.some(d => d.ref === event.detail.ref && d.setAside)) continue;
     // unaudited-tip shares the once-per-(ref, new tip) record, but under a kind-tagged value: a tip held back for
     // audit on one tick can be pinned on the next (its record lands, then it conflicts), and that pin notice must
     // still log. The record is pruned as soon as a plan stops reporting it.
@@ -445,6 +468,11 @@ export async function prepareRebuild({
       if (!strictState && event.kind === 'overlay-pinned' && pr != null) markOverlayConflictWake(env, { pr, ref, files, at: nowIso(), clone: root });
       if (Object.hasOwn(pinnedBefore, ref) && pinnedBefore[ref] === noticeKey) continue;
     }
+    if (event.kind === 'overlay-main-sync-set-aside') {
+      const old = asideBefore[event.detail.ref];
+      if (old?.sha === event.detail.sha && JSON.stringify(old.files) === JSON.stringify(event.detail.files)) continue;
+      if (!strictState) appendOverlayEvent(root, { kind: event.kind, ...event.detail }, { env });
+    }
     alert(event.kind, event.detail);
     if (!strictState && event.kind === 'overlay-conflict-unresolved' && event.detail.pr != null) {
       const { pr, ref, files } = event.detail;
@@ -455,6 +483,10 @@ export async function prepareRebuild({
       const { pr, ref, files, collidesWith } = event.detail;
       markOverlayConflictWake(env, { pr, ref, files, collidesWith, at: nowIso(), clone: root });
     }
+  }
+  if (!strictState && asideChanged) {
+    state.setAside = Object.keys(asideNow).length ? asideNow : null;
+    writeState();
   }
   if (!strictState && JSON.stringify(pinnedBefore) !== JSON.stringify(pinnedNow)) {
     state.pinnedNotified = Object.keys(pinnedNow).length ? pinnedNow : null;
@@ -550,7 +582,7 @@ export async function prepareRebuild({
       if (refused) return terminal({ moved: false, reason: refused, plan });
       appendOverlayEvent(root, { kind: 'auto-dropped', ref: d.ref, pr: d.pr, reason: d.reason, ...proof }, { env });
       alert('overlay-auto-dropped', { ref: d.ref, reason: d.reason });
-    } else if (d.action === 'drop') {
+    } else if (d.action === 'drop' && !d.setAside) {
       alert('overlay-conflict-dropped', {
         ref: d.ref, reason: d.reason, ...(d.files ? { files: d.files } : {}),
       });
