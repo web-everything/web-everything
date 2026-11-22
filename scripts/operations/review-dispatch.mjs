@@ -494,6 +494,10 @@ const REVIEW_CODE_PATH_FILES = new Set([
   'scripts/lib/red-team-status-labels.mjs',
   // 117 S3b — the review session and the review job now launch / record through the unified worker wrapper.
   'scripts/operations/worker-wrapper-launch.mjs', 'scripts/operations/worker-wrapper.mjs',
+  // The closure walker is a direct import of this dispatcher, and collision healing (frontmatter, card numbers)
+  // used to reach the sandbox closure only through the daemon-rebuild barrel. run-scorecard-store now imports
+  // the leaf (daemon-last-good) instead, so list them explicitly rather than lose the staleness refusal.
+  'scripts/lib/import-closure.mjs', 'scripts/backlog/frontmatter.mjs', 'scripts/lib/card-number-allocator.mjs',
 ]);
 
 /** #4387 (PR #2916 review, round 2) — direct imports are not enough: the credential sandbox lives one level
