@@ -110,6 +110,24 @@ describe('lane-pool salvage-unpushed', () => {
       || (e.args.includes('stash') && e.args.includes('clear')))).toBe(false);
   };
 
+  it.each(['live', 'dirty'])('keeps a stale %s lease out of salvage', kind => {
+    const sha = commit(lane, 'unpublished work');
+    if (kind === 'dirty') writeFileSync(join(lane, 'work.txt'), 'uncommitted work');
+    const marker = join(lane, '.git', '.lane-lease');
+    const before = JSON.stringify({ session: 'abandoned-or-waiting',
+      acquiredAt: '2000-01-01T00:00:00.000Z', ttlMinutes: 240,
+      pid: kind === 'live' ? process.pid : 2147483646 });
+    writeFileSync(marker, before);
+    writeFileSync(join(root, 'git-log'), '');
+
+    const result = run('salvage-unpushed');
+    expect(result.status, result.stderr).toBe(0);
+    expect(result.stderr).toContain(`stale-but-${kind}`);
+    expect(readFileSync(marker, 'utf8')).toBe(before);
+    if (kind === 'dirty') expect(readFileSync(join(lane, 'work.txt'), 'utf8')).toBe('uncommitted work');
+    assertKept(sha);
+  });
+
   it.each(['absent', 'expired'].flatMap(lease =>
     ['agent', 'cwd', 'recent', 'unknown agents', 'unknown cwds'].map(signal => [lease, signal])))
   ('refuses %s lease salvage with %s liveness evidence and asks for manual inspection', (lease, signal) => {
@@ -397,7 +415,7 @@ describe('lane-pool salvage-unpushed', () => {
     expect(acquired.status, acquired.stderr).toBe(0);
     const marker = join(lane, '.git', '.lane-lease');
     const lease = JSON.parse(readFileSync(marker, 'utf8'));
-    writeFileSync(marker, JSON.stringify({ ...lease, acquiredAt: '2000-01-01T00:00:00.000Z' }));
+    writeFileSync(marker, JSON.stringify({ ...lease, pid: 2147483646, acquiredAt: '2000-01-01T00:00:00.000Z' }));
     const sha = commit(lane, 'abandoned');
     const salvaged = run('salvage-unpushed');
     expect(salvaged.status, salvaged.stderr).toBe(0); expect(refs()).toContain(sha);

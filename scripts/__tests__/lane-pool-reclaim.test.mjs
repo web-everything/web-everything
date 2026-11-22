@@ -181,6 +181,7 @@ describe('lane-pool reclaim — AFTER', () => {
     // Backdate the (never-released) lease well past its TTL — the session died holding it.
     const lease = JSON.parse(readFileSync(leaseMarker(1), 'utf8'));
     lease.acquiredAt = new Date(Date.now() - 10 * 60 * 60 * 1000).toISOString();
+    lease.pid = 2147483646; // the dead session's process is gone
     writeFileSync(leaseMarker(1), `${JSON.stringify(lease, null, 2)}\n`);
 
     const r = runPool(['reclaim', '--lane=1', '--json', ...poolArgs()]);
@@ -197,12 +198,14 @@ describe('lane-pool reclaim — AFTER', () => {
     writeFileSync(join(lanePath(1), 'orphan.txt'), 'never pushed anywhere\n');
     const lease = JSON.parse(readFileSync(leaseMarker(1), 'utf8'));
     lease.acquiredAt = new Date(Date.now() - 10 * 60 * 60 * 1000).toISOString();
+    lease.pid = 2147483646; // the dead session's process is gone
     const staleBody = `${JSON.stringify(lease, null, 2)}\n`;
     writeFileSync(leaseMarker(1), staleBody);
 
     const r = runPool(['reclaim', '--lane=1', '--json', ...poolArgs()]);
-    expect(r.code).toBe(0);
-    expect(JSON.parse(r.out).reclaimed).toBe(false);
+    // A stale lease over a dirty lane is reported "stale-but-dirty" and refused outright (non-zero exit).
+    expect(r.code).not.toBe(0);
+    expect(r.err).toContain('stale-but-dirty');
     expect(existsSync(join(lanePath(1), 'orphan.txt'))).toBe(true);
     expect(readFileSync(leaseMarker(1), 'utf8')).toBe(staleBody); // never even claimed — untouched
   });

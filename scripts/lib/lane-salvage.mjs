@@ -393,7 +393,7 @@ export function laneLivenessGate({
   const livePids = pidsWithCwdIn(cwds, dir);
   let newestMtimeMs = null;
   try { newestMtimeMs = newestContentMtimeMs(dir); } catch { newestMtimeMs = nowMs; }
-  return salvageEligibility({ leased: false, liveOwner, livePids, newestMtimeMs, nowMs, quietMs });
+  return { ...salvageEligibility({ leased: false, liveOwner, livePids, newestMtimeMs, nowMs, quietMs }), livePids };
 }
 
 /**

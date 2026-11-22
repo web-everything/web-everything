@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import { startLaneLeaseHeartbeat } from './lib/lane-lease-heartbeat.mjs';
 /**
  * codex-direct-task.mjs — a PERSONAL, manually-invoked escape hatch: delegate one real coding task to Codex
  * CLI's agentic (tool-bearing) mode, for a Claude Code operator whose own usage is running low.
@@ -1061,6 +1062,7 @@ export async function runCodexDirectExec({
   review = false,
   policy, resumeThreadId,
   closeGraceMs = GATE_CLOSE_GRACE_MS,
+  startHeartbeat = startLaneLeaseHeartbeat,
 } = {}) {
   // Inside `.git/` — NEVER inside the working tree. A real live run against this very script found the bug
   // this avoids: a last-message/log file written into `dir` shows up as an untracked `??` file and pollutes
@@ -1075,7 +1077,8 @@ export async function runCodexDirectExec({
   // A resumed turn that emits no final file must not reuse an earlier completion report.
   rmSync(outputLastMessageFile, { force: true });
 
-  return new Promise((resolvePromise, reject) => {
+  const heartbeat = startHeartbeat({ cwd: dir });
+  try { return await new Promise((resolvePromise, reject) => {
     let child;
     try {
       child = spawnFn(cli, argv, { cwd: dir, stdio: ['pipe', 'pipe', 'pipe'], detached: true,
@@ -1165,6 +1168,7 @@ export async function runCodexDirectExec({
     child.stdin?.on('error', () => { /* the child may exit before we finish writing; `close` reports it */ });
     child.stdin?.end(prompt);
   });
+  } finally { heartbeat.stop(); }
 }
 
 // ── the orchestrator ──────────────────────────────────────────────────────────────────────────────
@@ -1583,7 +1587,14 @@ export function jobIsAlive({ pid, pidStart }, { readStart = readPidStart, readSt
   // answer throws, so `wait` fails closed (exit 2) instead of marking a possibly-live job failed.
   return readStart(pid) === pidStart;
 }
-export async function waitForJob({
+export async function waitForJob(options = {}) {
+  const { cwd = process.cwd(), startHeartbeat = startLaneLeaseHeartbeat } = options;
+  const heartbeat = startHeartbeat({ cwd });
+  try { return await waitForJobWithoutHeartbeat(options); }
+  finally { heartbeat.stop(); }
+}
+
+async function waitForJobWithoutHeartbeat({
   jobId, maxMs = MAX_JOB_WAIT_MS,
   readRecord,
   writeRecord,

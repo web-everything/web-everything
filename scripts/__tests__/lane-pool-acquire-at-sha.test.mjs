@@ -394,13 +394,14 @@ describe('acquire at an exact pushed branch tip', () => {
     expect(git(['rev-parse', 'HEAD'], lane)).toBe(initial);
     expect(existsSync(lease())).toBe(false);
   });
-  it.each([false, true])('terminal pinned lease reaping resets only a lane without new work (moved=%s)', moved => {
+  it.each([false, true].flatMap(live => [false, true].map(moved => [live, moved])))('terminal pinned lease reaping requires a dead holder and no new work (live=%s moved=%s)', (live, moved) => {
     mkdirSync(join(reference, 'backlog'));
     writeFileSync(join(reference, 'backlog', '123-item.md'), '---\nstatus: resolved\n---\n');
     git(['add', 'backlog']); git(['commit', '-m', 'resolved item']);
     git(['push', '--quiet', 'origin', 'HEAD:main']);
     const main = git(['rev-parse', 'HEAD']);
-    expect(acquire(tip, ['--session=conveyor-123']).status).toBe(0);
+    // Expiry alone cannot establish death: use an explicit live or dead worker PID.
+    expect(acquire(tip, ['--session=conveyor-123'], { LANE_HOLDER_PID: String(live ? process.pid : 2147483646) }).status).toBe(0);
     const expired = { ...JSON.parse(readFileSync(lease(), 'utf8')), acquiredAt: '2000-01-01T00:00:00Z', ttlMinutes: 1 };
     writeFileSync(lease(), JSON.stringify(expired));
     if (moved) git(['commit', '--allow-empty', '-m', 'new work'], lane);
@@ -409,8 +410,12 @@ describe('acquire at an exact pushed branch tip', () => {
     writeFileSync(join(root, 'shim-bin', 'gh'), '#!/bin/sh\nexit 1\n', { mode: 0o755 });
     const r = run('list', ['--acquirable', '--json'], { ...env, TEST_REAP: '1' });
     expect(r.status, r.stderr).toBe(0);
-    expect(existsSync(lease())).toBe(moved);
-    expect(git(['rev-parse', 'HEAD'], lane)).toBe(moved ? before : main);
-    if (!moved) expect(git(['symbolic-ref', '--short', 'HEAD'], lane)).toBe('main');
+    const kept = live || moved;
+    expect(existsSync(lease())).toBe(kept);
+    expect(git(['rev-parse', 'HEAD'], lane)).toBe(kept ? before : main);
+    if (kept) {
+      expect(readFileSync(lease(), 'utf8')).toBe(JSON.stringify(expired));
+      expect(spawnSync('git', ['symbolic-ref', '-q', 'HEAD'], { cwd: lane }).status).not.toBe(0);
+    } else expect(git(['symbolic-ref', '--short', 'HEAD'], lane)).toBe('main');
   });
 });

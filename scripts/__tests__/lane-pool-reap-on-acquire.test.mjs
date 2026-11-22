@@ -35,11 +35,12 @@ function runPool(args, extraEnv = {}) {
 
 // #3283 — BACKDATE a lease past its TTL, in place. The reaper's narrowing turns "is this lease still alive?"
 // into a real precondition, so the TTL-stale ghost that #2748 exists for has to be MADE stale rather than
-// merely asserted about. Rewrites only `acquiredAt`, so every other field stays exactly as acquire stamped it.
+// merely asserted about. The abandoned holder also needs a dead PID; TTL alone never proves death.
 function backdateLease(laneDirPath, minutesAgo) {
   const file = LEASE_FILE(laneDirPath);
   const lease = JSON.parse(readFileSync(file, 'utf8'));
   lease.acquiredAt = new Date(Date.now() - minutesAgo * 60_000).toISOString();
+  lease.pid = 2147483646;
   writeFileSync(file, JSON.stringify(lease, null, 2) + '\n');
 }
 

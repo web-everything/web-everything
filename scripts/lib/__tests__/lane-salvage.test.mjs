@@ -149,7 +149,7 @@ describe('laneLivenessGate (#xl5xhmj)', () => {
     const readAgents = () => [];
     const readCwds = () => [];
     const g = laneLivenessGate({ dir: '/pool/lane-9', readAgents, readCwds, quietMs: 0 });
-    expect(g).toEqual({ eligible: true, reason: 'unleased, no live owner or process, quiet' });
+    expect(g).toEqual({ eligible: true, reason: 'unleased, no live owner or process, quiet', livePids: [] });
   });
 
   it('fails CLOSED when `claude agents` cannot be read — never treats an unreadable lane as safe', () => {

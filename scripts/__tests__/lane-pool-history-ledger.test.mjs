@@ -142,6 +142,7 @@ describe('lane-history ledger — AFTER', () => {
     const leaseFile = LEASE_FILE(lanePath(1));
     const lease = JSON.parse(readFileSync(leaseFile, 'utf8'));
     lease.acquiredAt = new Date(Date.now() - (DEFAULT_LEASE_TTL_MINUTES + 60) * 60_000).toISOString();
+    lease.pid = 2147483646; // an abandoned holder: its process is gone (a live holder is never reaped)
     writeFileSync(leaseFile, JSON.stringify(lease, null, 2));
 
     const r = runPool(['list', '--acquirable', '--json', ...poolArgs()]);

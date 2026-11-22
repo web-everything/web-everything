@@ -78,6 +78,7 @@
  * RESERVED (permanent memory, #2350) leases are NEVER reaped, on every axis.
  */
 
+import { probeLaneReclaim, probeLaneStatus } from '../lib/lane-lease-liveness.mjs';
 import { readGit } from '../lib/proc-read.mjs';
 import { laneGitHardeningEnv } from '../lib/lane-git-hardening.mjs';
 
@@ -374,18 +375,7 @@ export function laneBranchItemNum(dir, { git = defaultGitSymbolicRef } = {}) {
 /** Default {@link laneQuietSincePr} clean-tree reader: raw `git status --porcelain` output, or `null` on any
  *  failure (unreadable dir) — the caller then treats "can't confirm clean" as unknown, never as clean. */
 function defaultGitStatusPorcelain(dir) {
-  try {
-    return readGit(['status', '--porcelain'], {
-      cwd: dir,
-      env: laneGitEnv(),
-      encoding: 'utf8',
-      stdio: ['ignore', 'pipe', 'pipe'],
-      timeout: resolveChildTimeoutMs(),
-      killSignal: 'SIGKILL',
-    });
-  } catch {
-    return null;
-  }
+  return probeLaneStatus(dir);
 }
 
 /**
@@ -1238,6 +1228,17 @@ export function applyLaneHold({ reap, keep }, { nowMs, check = checkLaneHold } =
   return { reap: stillReap, keep: kept };
 }
 
+// Apply fresh holder/worktree evidence before releasing a lease for reuse.
+export function applyReclaimSafety(plan, { check = probeLaneReclaim } = {}) {
+  const reap = [], keep = [...plan.keep];
+  for (const candidate of plan.reap) {
+    const verdict = check(candidate.dir, candidate.lease);
+    if (verdict.safe) reap.push(candidate);
+    else keep.push({ ...candidate, reason: verdict.reason });
+  }
+  return { reap, keep };
+}
+
 // ── IO SHELL (runs only as a CLI — owns POOL_ROOT walk / marker reads / gh / the release delegation) ──────────
 
 const HERE = dirname(fileURLToPath(import.meta.url));
@@ -1604,7 +1605,11 @@ function main(argv) {
 
   const signalsFor = buildLeaseSignalsFor({ prStatesByRepo, sessionStates, sessionPidAlive, sessionAgents, wrapperPids, claimRunnerPids, staleTerminalNames, nowMs });
   const plan = reapPlan(candidates, { nowMs, ttlMs, signalsFor });
-  const { reap, keep } = applyLaneHold(plan, { nowMs });
+  const { reap, keep } = applyReclaimSafety(applyLaneHold(plan, { nowMs }));
+
+  for (const c of keep) {
+    if (c.reason?.startsWith('stale-but-')) log(`  kept ${c.pool}/lane-${c.lane}: ${c.reason}`);
+  }
 
   // Reclaim (unless dry-run). A single failed release is logged and skipped — the reaper is best-effort and one
   // stuck lane must not abort the whole sweep — but a failure count surfaces via a non-zero exit (below) so a
