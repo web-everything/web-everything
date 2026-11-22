@@ -88,7 +88,7 @@ const refuse = why => { throw new Error(`build-priority-set: ${why}; repair evid
 
 /** One pinned main snapshot per reader; no worktree cards, fetching or lazy network reads. */
 export function readPriorityCards({ git = (args, options = {}) => execFileSync('git', args, {
-  ...READ_OPTIONS, ...options, cwd: ROOT, env: { ...process.env, GIT_NO_LAZY_FETCH: '1' },
+  ...READ_OPTIONS, ...options, maxBuffer: READ_OPTIONS.maxBuffer, cwd: ROOT, env: { ...process.env, GIT_NO_LAZY_FETCH: '1' },
 }) } = {}) {
   let sha, names;
   const snapshot = () => {
