@@ -210,6 +210,7 @@ test('current numeric discovery evidence converges for H but not the M tail', ()
 
 // Immutable compact snapshot captured before the per-key migration (not regenerated).
 const originalMetadata = JSON.parse(readFileSync(join(ROOT, 'scripts/lib/__tests__/fixtures/settings-registry-original.json'), 'utf8'));
+const shadowRotationDescription = 'Shadow rotation policy, catalog, capacity and reviewer guards; inactive PROV-AB-G1 option A goLive records sticky subjects, 30 runs, 60/10 shares and 24h clean.';
 function originalFixture(t) {
   const f = fixture(t);
   rmSync(join(f.root, 'scripts/settings/feature.json'));
@@ -242,6 +243,18 @@ test('migration preserves the registry built from the original repository metada
   split(f);
   assert.deepEqual(readMetadata({ root: f.root }), originalMetadata);
   assert.deepEqual(f.build(), before);
+});
+test('migration preserves the original registry plus the intentional shadow rotation description', t => {
+  const f = originalFixture(t);
+  const expectedMetadata = structuredClone(originalMetadata);
+  expectedMetadata.settings.providerRotation.description = shadowRotationDescription;
+  Object.assign(f.meta, expectedMetadata);
+  const before = f.build();
+  assert.deepEqual(before.problems, []);
+  split(f);
+  assert.deepEqual(readMetadata({ root: f.root }), expectedMetadata);
+  assert.deepEqual(f.build(), before);
+  assert.equal(readMetadata().settings.providerRotation.description, shadowRotationDescription);
 });
 test('a new metadata key file alone adds a row without editing the base metadata', t => {
   const f = fixture(t); split(f);
@@ -355,10 +368,13 @@ test('malformed names, unexpected entries and unreadable per-key JSON fail close
   assert.throws(() => renderMarkdown(f.build()), /settings-registry-metadata\.d\/settings\/broken.json/);
 });
 
-test('generated documentation preserves original bytes except the intentional per-key authoring instruction', t => {
-  const doc = renderMarkdown(originalFixture(t).build());
+test('generated documentation matches the shadow rotation snapshot with per-key authoring instructions', t => {
+  const f = originalFixture(t);
+  f.meta.settings.providerRotation.description = shadowRotationDescription;
+  const doc = renderMarkdown(f.build());
   const originalInstruction = 'For repo defaults, edit the owner file through a PR and rebuild the consuming daemon. Add or update metadata in scripts/lib/settings-registry-metadata.json, then run `node scripts/lib/settings-registry.mjs --write`. Verify with `node scripts/lib/settings-registry.mjs --check`. Missing declarations or invalid evidence block generation; repair the named file before regenerating.';
   const original = doc.replace(/^For repo defaults,.*$/m, originalInstruction);
-  assert.equal(createHash('sha256').update(original).digest('hex'), '239663dfb7c702b1f8cf475f1b8659d16fea92c2deaa92c027f3a67f5106cc8d');
+  // Snapshot includes the intentional shadow rotation defaults and description.
+  assert.equal(createHash('sha256').update(original).digest('hex'), '01518f0f4a3415bad06bd8e1bc3b78f4139ebcff384c4157c6c6bd551bc41e82');
   execFileSync(process.execPath, [join(ROOT, 'scripts/lib/settings-registry.mjs'), '--check']);
 });

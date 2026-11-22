@@ -3,7 +3,10 @@ bornAs: x62p7ex
 kind: story
 size: 3
 parent: "3931"
-status: open
+status: closed
+closedReason: duplicate
+closedInto: "6202"
+dateClosed: "2026-11-22"
 blockedBy: ["4198"]
 scope: ["plateau:docs/wip-page.md", "plateau:src/wip/wip-view.ts", "plateau:src/wip/wip-view.css", "plateau:src/wip/wip-read.ts", "plateau:src/wip/types.ts", "plateau:wip-relay.js", "plateau:src/wip/wip-view.test.ts", "plateau:src/wip/wip-view.hostile.test.ts", "plateau:src/wip/wip-read.test.ts", "plateau:src/wip/wip-source.test.ts", "plateau:src/wip/wip-relay-contract.test.ts", "plateau:scripts/wip-relay.test.mjs"]
 dateOpened: "2026-09-25"

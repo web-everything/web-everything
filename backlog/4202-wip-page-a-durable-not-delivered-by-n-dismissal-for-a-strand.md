@@ -2,7 +2,10 @@
 bornAs: xkol9y8
 kind: task
 parent: "4075"
-status: open
+status: closed
+closedReason: duplicate
+closedInto: "6202"
+dateClosed: "2026-11-22"
 scope: ["plateau:docs/wip-page.md", "plateau:src/wip/stranding-dismissals.ts", "plateau:src/wip/stranding-dismissals.test.ts", "plateau:src/wip/wip-view.ts", "plateau:src/wip/wip-view.test.ts", "plateau:src/wip/wip-mount.test.ts"]
 dateOpened: "2026-09-25"
 preparedDate: "2026-10-01"
