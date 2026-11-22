@@ -1,0 +1,6 @@
+{
+  "description": "Claude account IDs mapped to Keychain credentials, without secret values.",
+  "owner": "scripts/settings/claude-accounts.json",
+  "changeVia": "pr",
+  "instant": false
+}

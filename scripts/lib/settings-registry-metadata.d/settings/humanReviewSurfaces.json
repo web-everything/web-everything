@@ -1,0 +1,6 @@
+{
+  "description": "Scope of surfaces requiring human review.",
+  "owner": "scripts/settings/human-review-surfaces.json",
+  "changeVia": "pr",
+  "instant": false
+}

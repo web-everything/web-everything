@@ -1,0 +1,6 @@
+{
+  "description": "Measurement window for remote execution share.",
+  "owner": "scripts/settings/forge-share.json",
+  "changeVia": "pr",
+  "instant": false
+}

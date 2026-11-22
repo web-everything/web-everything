@@ -1,0 +1,6 @@
+{
+  "description": "Bounds on run record parsing.",
+  "owner": "scripts/settings/runs-scan.json",
+  "changeVia": "pr",
+  "instant": false
+}

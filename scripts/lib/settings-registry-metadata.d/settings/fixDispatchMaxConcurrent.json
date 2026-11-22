@@ -1,0 +1,6 @@
+{
+  "description": "Maximum concurrent fix dispatches.",
+  "owner": "scripts/dispatch-settings.json",
+  "changeVia": "pr",
+  "instant": false
+}

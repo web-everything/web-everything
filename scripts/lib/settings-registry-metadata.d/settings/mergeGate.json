@@ -1,0 +1,6 @@
+{
+  "description": "Treatment of candidacy holds in merge-gate checks.",
+  "owner": "scripts/settings/merge-gate.json",
+  "changeVia": "pr",
+  "instant": false
+}

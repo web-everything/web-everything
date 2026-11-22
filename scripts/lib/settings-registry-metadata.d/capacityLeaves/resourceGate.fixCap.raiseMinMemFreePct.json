@@ -1,0 +1,5 @@
+{
+  "description": "Free memory required to raise fix capacity.",
+  "range": "finite number 25–60",
+  "unit": "percent"
+}

@@ -1,0 +1,6 @@
+{
+  "description": "Quarantined card-ledger identities.",
+  "owner": "scripts/settings/card-ledger-trust.json",
+  "changeVia": "pr",
+  "instant": false
+}

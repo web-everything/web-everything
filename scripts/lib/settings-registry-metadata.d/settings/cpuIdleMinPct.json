@@ -1,0 +1,6 @@
+{
+  "description": "Minimum idle CPU percentage by dispatch kind.",
+  "owner": "scripts/dispatch-settings.json",
+  "changeVia": "pr",
+  "instant": false
+}

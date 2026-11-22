@@ -12,13 +12,13 @@ R1076: behavior belongs in product settings. The constants below are candidates 
 
 The policy layers are standard → platform → tool/repo → env → operator-db; see [policy-cascade.mjs](../../scripts/lib/policy-cascade.mjs). Readers opt into the cascade; this inventory does not assert every declaration uses every layer. Environment overrides require reader support and process environment propagation.
 
-For repo defaults, edit the owner file through a PR and rebuild the consuming daemon. Add or update metadata in scripts/lib/settings-registry-metadata.json, then run `node scripts/lib/settings-registry.mjs --write`. Verify with `node scripts/lib/settings-registry.mjs --check`. Missing declarations or invalid evidence block generation; repair the named file before regenerating.
+For repo defaults, edit the owner file through a PR and rebuild the consuming daemon. Add or update `scripts/lib/settings-registry-metadata.d/settings/<encoded-key>.json` (`capacityLeaves/<encoded-key>.json` for capacity metadata); encode keys with encodeURIComponent, additionally percent-escape !, apostrophe, (, ), * and _, then write every percent sign as an underscore. Then run `node scripts/lib/settings-registry.mjs --write`. Verify with `node scripts/lib/settings-registry.mjs --check`. Missing declarations or invalid evidence block generation; repair the named file before regenerating.
 
 ## Summary
 
-- Top-level keys: 161 (163 declaration rows).
-- Declared leaves: 590 (platform copies counted separately).
-- Instant top-level keys: 0; not instant: 161.
+- Top-level keys: 164 (166 declaration rows).
+- Declared leaves: 618 (platform copies counted separately).
+- Instant top-level keys: 0; not instant: 164.
 - Instant capacity leaves: 15.
 - Constants to settle: 312.
 - Instant gaps: 28.
@@ -80,7 +80,7 @@ Operator-prefs layer: ~/.plateau/platform-preferences.json is the requested oper
 | cards | scripts/settings/card-dedupe.json | 2 | {"$comment":"Repo override (operator go 2026-10-10): dedupe… | pr | no | Mechanical finding deduplication and similarity threshold. |
 | careExemptPaths | scripts/settings/review.json | 1 | ["scripts/ci/test-timings.json","data/generated/**","src/_d… | pr | no | Narrow paths exempted from care classification, retaining human gates. |
 | carryAcrossRebase | scripts/settings/review.json | 1 | "on" | pr | no | Carry review state across eligible rebases. |
-| ci | scripts/settings/timeout-evidence.json | 1 | {"timeoutEvidenceConcurrency":4} | pr | no | Concurrency of timeout-evidence child readers. |
+| ci | scripts/settings/ci-selection.json, scripts/settings/timeout-evidence.json | 3 | {"selection":{"trace":{"enabled":true,"maxEdgesPerTest":500… | pr | no | CI dependency selection, shadow tracing and timeout-evidence reader concurrency. |
 | ciGhostRerun | scripts/settings/ci-ghost-rerun.json | 5 | {"thresholdMin":15,"maxPerWindow":1,"maxPerHead":1,"windowH… | pr | no | Age, frequency and cancellation bounds for ghost CI recovery. |
 | ciHeal | scripts/settings/ci-heal.json | 2 | {"staleBaseRefreshFirst":"on","loop":"off"} | pr | no | Try a stale-base refresh before waking a CI fixer. |
 | ciHeldRecordRetryMax | scripts/settings/review-red-team-on-skip.json | 1 | 3 | pr | no | Maximum CI-held record recovery retries. |
@@ -95,18 +95,19 @@ Operator-prefs layer: ~/.plateau/platform-preferences.json is the requested oper
 | daemonTasksDescription | scripts/settings/daemon-tasks.json | 1 | "Daemon task table (a verbatim inventory of the live 2026-1… | pr | no | Documentation of the daemon task manifest and host token substitution. |
 | daemons | scripts/settings/claude-accounts.json, scripts/settings/prototype-load.json | 33 | {"review":{"label":"com.we.review-daemon","runs":"review da… | pr | no | Daemon inventory and launch-label account mappings. |
 | delivery | scripts/settings/delivery-identity.json, scripts/settings/delivery-metrics.json | 43 | {"identity":{"$comment":"Per-role GitHub App identity (oper… | pr | no | Role-based GitHub App identities and delivery metrics collection policy. |
-| deliveryCapacity | scripts/settings/delivery-capacity.json | 12 | {"autoTune":{"mode":"shadow","everyMin":60,"windowH":6,"min… | pr | no | Delivery capacity measurement, weighted units and automatic tuning policy. |
+| deliveryCapacity | scripts/settings/delivery-capacity.json | 12 | {"autoTune":{"mode":"off","everyMin":60,"windowH":6,"minMer… | pr | no | Delivery capacity measurement, weighted units and automatic tuning policy. |
 | deliveryFlow | scripts/settings/delivery-flow.json | 0 | {} | pr | no | Ordered delivery stages by change class, retaining protected spine stages. |
-| deliveryPriority | scripts/lib/delivery-priority-settings.json | 4 | {"mode":"shadow","agingHours":8,"maxLiveP0":2,"unblockWeigh… | pr | no | Delivery priority mode, aging, P0 concurrency and unblock weight. |
+| deliveryPriority | scripts/lib/delivery-priority-settings.json | 4 | {"mode":"off","agingHours":8,"maxLiveP0":2,"unblockWeightMi… | pr | no | Delivery priority mode, aging, P0 concurrency and unblock weight; retired shadow defaults off. |
 | description | scripts/settings/node-heap-cap.json | 1 | "V8 old-space caps for review child processes and the revie… | pr | no | Documentation of V8 old-space memory caps. |
 | directionAwareHuman | scripts/settings/direction-aware-human.json | 1 | "shadow" | pr | no | Direction-aware human review classification mode. |
 | draftPromotion | scripts/settings/draft-promotion.json | 1 | {"absentRequiredChecksNotApplicable":["merge-gate"]} | pr | no | Required-check exceptions for draft promotion. |
-| drain | scripts/settings/drain-async-shadow.json, scripts/settings/drain-card-group.json, scripts/settings/drain-mq-retry.json | 7 | {"asyncShadow":"shadow","group":{"enabled":true,"maxSize":8… | pr | no | Merge drain grouping, recovery and infrastructure classification policy. |
+| drain | scripts/settings/drain-async-shadow.json, scripts/settings/drain-card-group.json, scripts/settings/drain-mq-retry.json | 7 | {"asyncShadow":"off","group":{"enabled":true,"maxSize":8,"e… | pr | no | Merge drain grouping, recovery and infrastructure classification policy. |
 | drainFactsSource | scripts/settings/drain-facts-source.json | 1 | {"source":"store-first"} | pr | no | Preferred source of merge drain facts. |
 | drainFollowupJob | scripts/settings/drain-followup-job.json | 1 | "on" | pr | no | Enable follow-up drain jobs. |
 | enabled | scripts/settings/review-red-team-on-skip.json | 1 | true | pr | no | Enable recovery of missing red-team results on reviewed heads. |
 | enforce | scripts/settings/claude-accounts.json | 1 | false | pr | no | Enable Claude daemon account enforcement. |
 | entries | scripts/settings/privacy-terms-allowlist.json | 1 | [{"path":"scripts/lib/__tests__/daemon-jobs-runtime.test.mj… | pr | no | Explicit portability exceptions pinned to matched text and line hashes. |
+| expectations | scripts/settings/expectations.json | 1 | [{"id":"ready-no-gate","after":["clear-human","ready-to-mer… | pr | no | Observe-only PR expectation triggers, deadlines and proposed responses; responses are recorded but never executed. |
 | expectedLocalReasons | scripts/settings/forge-share.json | 1 | ["command-not-allowed","needs-git"] | pr | no | Local execution reasons excluded from remote-share warnings. |
 | externalJurors | scripts/settings/review.json | 2 | {"firstOutputMs":120000,"cooldownMs":1800000} | pr | no | First-output timeout and cooldown for external review jurors. |
 | fix | scripts/settings/fix-context-pack.json, scripts/settings/fix-safety.json, scripts/settings/fix.json | 18 | {"contextPack":true,"contextLines":30,"contextMaxBytes":800… | pr | no | Fix context, local verification, round limits and exception policy. |
@@ -146,13 +147,14 @@ Operator-prefs layer: ~/.plateau/platform-preferences.json is the requested oper
 | mergeQueue | scripts/settings/approved-human-surface-hold.json, scripts/settings/human-only-enqueue.json, scripts/settings/merge-queue-numbering.json, scripts/settings/merge-queue-obsolete-runs.json, scripts/settings/merge-queue-refresh.json, scripts/settings/merge-queue.json | 31 | {"skipRebaseApprovedHumanSurface":"on","humanOnly":{"approv… | pr | no | Enqueue, human approval, card numbering and obsolete-run cancellation policy. |
 | mergeQueueBatching | scripts/settings/merge-queue-batching.json | 3 | {"enabled":true,"groupSize":3,"maxGroupsInFlight":8} | pr | no | Merge queue group size and groups in flight. |
 | minNonClaudeSeats | scripts/settings/review.json | 1 | 1 | pr | no | Minimum number of non-Claude review seats. |
+| mode | scripts/settings/expectations.json | 1 | "observe" | env | no | Expectation babysitter mode: off or observe. WE_EXPECTATIONS_MODE overrides the repository default. |
 | modes | scripts/settings/delivery-routes.json | 4 | {"debug":"DEBUG MODE (R817/R823/R826/R852). Diagnose on the… | pr | no | Instructions defining the available delivery modes. |
 | openPrCap | scripts/settings/open-pr-cap.json | 2 | {"excludeCardOnly":true,"excludeAccepted":true} | pr | no | Population exclusions for the open PR cap. |
 | operatorCli | scripts/settings/operator-cli.json | 1 | {"freshFallback":"on"} | pr | no | Allow a fresh operator CLI fallback. |
 | operatorUsernameSha256 | scripts/settings/privacy-terms-allowlist.json | 1 | ["cb89fdbcb4b894166b90fca32c9a56935d21f27c40f0f8c1611ee4624… | pr | no | Hashed operator usernames recognized by the portability gate. |
 | overlayDropped | scripts/settings/overlay-dropped.json | 1 | {"freshMinutes":30} | pr | no | Freshness window for detecting dropped overlays. |
 | parallelSeats | scripts/settings/review.json | 1 | "on" | pr | no | Enable parallel review seats. |
-| postAcceptAdvisory | scripts/settings/review.json | 1 | {"mode":"shadow"} | pr | no | Advisory review mode after acceptance. |
+| postAcceptAdvisory | scripts/settings/review.json | 1 | {"mode":"off"} | pr | no | Advisory review mode after acceptance; retired observer defaults off. |
 | prLandReady | scripts/settings/pr-land-ready.json | 1 | {"guardConfigPaths":["scripts/settings/prototype-load.json"… | pr | no | Configuration paths requiring guarded landing readiness. |
 | prLimit | scripts/settings/pr-limit.json | 4 | {"excludeCardOnly":true,"excludeStackedAwaitingBase":true,"… | pr | no | PR limit exclusions and explicit focus references. |
 | prListPaging | scripts/settings/pr-list-paging.json | 1 | {"pageSize":20} | pr | no | Page size for GitHub PR listing. |
@@ -166,6 +168,7 @@ Operator-prefs layer: ~/.plateau/platform-preferences.json is the requested oper
 | prepareStaleHours | scripts/settings/coroner-postmortem.json | 1 | 24 | pr | no | Age in hours at which preparation is treated as stale. |
 | prevention | scripts/settings/prevention-batch.json | 4 | {"$comment":"batchFiling enables rolling prevention PRs; fa… | pr | no | Prevention card batching and filing limits. |
 | providerCapacity | scripts/settings/provider-capacity.json | 1 | {"providers":[{"id":"codex","launcher":"codex","tier":3,"al… | pr | no | Provider/account quota windows, readers, reserves, banked resets and minimum tiers for capacity-based routing. |
+| providerRotation | scripts/settings/provider-rotation.json | 24 | {"mode":"shadow","catalog":[{"provider":"codex","model":"gp… | pr | no | Pure provider rotation input: mode, arm catalog/shares, identity families, exhaustion/reserve bounds, strong/small guards and Carbon promotion evidence. |
 | quarantine | scripts/settings/card-ledger-trust.json | 1 | [] | pr | no | Quarantined card-ledger identities. |
 | raisedByMigrate | scripts/settings/raised-by-migrate.json | 1 | {"maxPrsPerRun":10} | pr | no | Maximum PRs attempted per raised-by migration apply run. |
 | readyRecordPath | scripts/settings/prototype-load.json | 1 | "~/workspace/.operations/coordination/fix-ready.jsonl" | pr | no | Fix readiness coordination record location. |
@@ -183,7 +186,7 @@ Operator-prefs layer: ~/.plateau/platform-preferences.json is the requested oper
 | requiredChecksCache | scripts/settings/required-checks-cache.json | 1 | {"ttlMinutes":15} | pr | no | Lifetime of cached required-status-check reads. |
 | retryCooldownMin | scripts/settings/review-red-team-on-skip.json | 1 | 30 | pr | no | Cooldown in minutes between missing red-team recovery attempts. |
 | review | scripts/settings/human-clearance-carry.json, scripts/settings/identical-net-patch.json, scripts/settings/numbering-human-clearance.json, scripts/settings/review-precedents.json | 8 | {"humanClearanceCarryForward":true,"carryEquivalence":"cont… | pr | no | Review equivalence, human clearance and precedent policy. |
-| reviewChurn | scripts/settings/review.json | 3 | {"sameTree":"shadow","capMode":"shadow","maxLoopsPerPr":8} | pr | no | Review churn detection and loop cap policy. |
+| reviewChurn | scripts/settings/review.json | 3 | {"sameTree":"off","capMode":"off","maxLoopsPerPr":8} | pr | no | Review churn detection and loop cap policy. |
 | reviewHeadIndex | scripts/settings/review-head-index.json | 0 | {} | pr | no | Retention and log compaction bounds for reviewed heads. |
 | reviewNoVerdictRetry | scripts/settings/review-no-verdict-retry.json | 1 | {"cooldownReleases":6} | pr | no | Bounded cooldown releases when a review verdict never lands. |
 | rounds | scripts/settings/round-judge.json | 3 | {"judge":{"mode":"shadow","maxGrants":20},"nonConverging":{… | pr | no | Shadow round judge grants and non-convergence detection. |
@@ -199,11 +202,11 @@ Operator-prefs layer: ~/.plateau/platform-preferences.json is the requested oper
 | stack | scripts/settings/stack.json | 1 | {"reviewWhileBaseOpen":true} | pr | no | Permit review while the base PR remains open. |
 | stackAwareReview | scripts/settings/stack-aware-review.json | 1 | {"mode":"on"} | pr | no | Stack-aware review mode. |
 | staleRedispatchDailyCap | scripts/settings/review-red-team-on-skip.json | 1 | 3 | pr | no | Daily cap on stale red-team redispatches. |
-| staleReferralHumanShadow | scripts/settings/stale-referral-human-shadow.json | 1 | {"enabled":true} | pr | no | Enable shadow detection of stale human referral holds. |
+| staleReferralHumanShadow | scripts/settings/stale-referral-human-shadow.json | 1 | {"enabled":false} | pr | no | Enable shadow detection of stale human referral holds; retired observer defaults off. |
 | standDown | scripts/settings/stand-down.json | 1 | {"lapseOnNewHead":"on"} | pr | no | Lapse head-bound stand-downs when a new head arrives. |
 | target | scripts/settings/forge-share.json | 1 | 0.9 | pr | no | Target fraction of heavy work executed remotely. |
 | tasks | scripts/settings/daemon-tasks.json | 1 | [{"label":"com.plateau.drain-daemon","program":["{node}","{… | pr | no | Daemon task definitions used to render launchd plists. |
-| timing | scripts/settings/review.json | 3 | {"startAfter":"push","cancelOnCiRed":true,"startEarly":"sha… | pr | no | Review start timing, early-start mode and cancellation on CI failure. |
+| timing | scripts/settings/review.json | 3 | {"startAfter":"push","cancelOnCiRed":true,"startEarly":"off… | pr | no | Review start timing, early-start mode and cancellation on CI failure. |
 | transcriptCheck | scripts/settings/codex-transcript-check.json | 2 | {"mode":"warn","tokenCap":3000000} | pr | no | Post-run Codex transcript diagnostics mode and token cap. |
 | uiFastLane | scripts/settings/review.json | 6 | {"enabled":false,"seats":1,"redTeam":false,"nitpicksBlock":… | pr | no | UI-only fast review lane: enablement, seats, size bound and eligible paths. |
 | urgentSweep | scripts/settings/urgent-sweep.json | 1 | {"intervalMinutes":5} | pr | no | Urgent work sweep interval in minutes. |

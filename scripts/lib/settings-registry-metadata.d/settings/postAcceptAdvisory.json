@@ -1,0 +1,6 @@
+{
+  "description": "Advisory review mode after acceptance; retired observer defaults off.",
+  "owner": "scripts/settings/review.json",
+  "changeVia": "pr",
+  "instant": false
+}

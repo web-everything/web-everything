@@ -17,6 +17,7 @@ import {
 } from '../daemon-self-sync.mjs';
 import { assertMainNotStale, isStaleMainRefusalMessage } from '../main-staleness.mjs';
 import { acquireRead, releaseRead, acquireWrite, releaseWrite, inspectCloneLock } from '../daemon-clone-lock.mjs';
+import { rebuildStatePath, readRebuildStateStrict, writeRebuildState } from '../daemon-rebuild/state.mjs';
 import { keepAliveScript } from '../test-keepalive.mjs';
 
 // R986 pure-core fallback: exercise a consumer through the real wrapper with injected IO.
@@ -223,6 +224,80 @@ describe('withSelfSync — DEFAULT path: rebuild-driven (#4044 Module E)', () =>
     });
     await expect(w.tickOnce()).resolves.toBe('ticked');
     expect(log.error).toHaveBeenCalledWith(expect.stringContaining('fetch-failed'));
+  });
+
+  it.each(['corrupt', 'shape', 'EIO', 'EACCES'])(
+    'unreadable %s state holds the tick visibly and preserves file bytes', async fault => {
+      const root = mkdtempSync(join(tmpdir(), 'self-sync-unreadable-'));
+      try {
+        const env = { WE_DAEMON_REBUILD_STRICT_EVIDENCE: '1', WE_DAEMON_STATE_DIR: join(root, 'state'), WE_DAEMON_CLONE_LOCK_ROOT: join(root, 'locks') };
+        writeRebuildState(root, {}, env);
+        const file = rebuildStatePath(root, env);
+        if (fault === 'corrupt' || fault === 'shape') writeFileSync(file, fault === 'corrupt' ? '{broken' : '{}');
+        const bytes = readFileSync(file);
+        const tick = vi.fn(), onRestart = vi.fn(), releaseRead = vi.fn(), log = { error: vi.fn() };
+        const ioFault = ['EIO', 'EACCES'].includes(fault) ? {
+          readState: (root, env) => readRebuildStateStrict(root, env, () => { throw Object.assign(new Error(fault), { code: fault }); }),
+        } : {}; // Parse/shape cases exercise the wrapper's real default reader.
+        const w = withSelfSync({ tickOnce: tick }, {
+          root, env, onRestart, log, readHead: () => 'boot', readReady: () => null,
+          rebuild: async () => ({ moved: false, reason: 'up-to-date' }),
+          acquireRead: okLock, releaseRead, ...ioFault,
+        });
+        await expect(w.tickOnce()).resolves.toMatchObject({ skipped: true, reason: 'state-unreadable' });
+        expect(tick).not.toHaveBeenCalled();
+        expect(onRestart).not.toHaveBeenCalled();
+        expect(releaseRead).toHaveBeenCalledTimes(1);
+        expect(log.error).toHaveBeenCalledWith(expect.stringContaining('state-unreadable'));
+        expect(readFileSync(file)).toEqual(bytes);
+      } finally { rmSync(root, { recursive: true, force: true }); }
+    },
+  );
+
+  it('absent rebuild state allows a normal tick without creating state', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'self-sync-absent-'));
+    try {
+      const env = { WE_DAEMON_STATE_DIR: join(root, 'state'), WE_DAEMON_CLONE_LOCK_ROOT: join(root, 'locks') };
+      const tick = vi.fn(() => 'ticked');
+      const w = withSelfSync({ tickOnce: tick }, {
+        root, env, onRestart: vi.fn(), log: { error: vi.fn() }, readHead: () => 'boot', readReady: () => null,
+        rebuild: async () => ({ moved: false, reason: 'up-to-date' }), acquireRead: okLock, releaseRead: vi.fn(),
+      });
+      await expect(w.tickOnce()).resolves.toBe('ticked');
+      expect(tick).toHaveBeenCalledTimes(1);
+      expect(existsSync(rebuildStatePath(root, env))).toBe(false);
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  });
+
+  it.each([undefined, '0'])('strict-evidence compatibility (%s) lets the tick read legacy state', async value => {
+    const root = mkdtempSync(join(tmpdir(), 'self-sync-legacy-'));
+    try {
+      const env = { WE_DAEMON_STATE_DIR: join(root, 'state'),
+        ...(value === undefined ? {} : { WE_DAEMON_REBUILD_STRICT_EVIDENCE: value }) };
+      writeRebuildState(root, {}, env);
+      writeFileSync(rebuildStatePath(root, env), '{}');
+      const tick = vi.fn(() => 'ticked');
+      const w = withSelfSync({ tickOnce: tick }, {
+        root, env, onRestart: vi.fn(), log: { error: vi.fn() }, readHead: () => 'boot', readReady: () => null,
+        rebuild: async () => ({ moved: false, reason: 'up-to-date' }), acquireRead: okLock, releaseRead: vi.fn(),
+      });
+      await expect(w.tickOnce()).resolves.toBe('ticked');
+      expect(tick).toHaveBeenCalledOnce();
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  });
+
+  it('a state-unreadable rebuild result logs and holds instead of ticking or restarting', async () => {
+    const tick = vi.fn(), onRestart = vi.fn(), acquireRead = vi.fn(okLock), log = { error: vi.fn() };
+    const w = withSelfSync({ tickOnce: tick }, {
+      root: '/x', onRestart, rebuild: async () => ({ moved: false, reason: 'state-unreadable' }),
+      acquireRead, releaseRead: vi.fn(), readState: emptyState, log,
+    });
+    await expect(w.tickOnce()).resolves.toMatchObject({ skipped: true, reason: 'state-unreadable' });
+    expect(tick).not.toHaveBeenCalled();
+    expect(onRestart).not.toHaveBeenCalled();
+    expect(acquireRead).not.toHaveBeenCalled();
+    expect(log.error).toHaveBeenCalledWith(expect.stringContaining('state-unreadable'));
+    expect(log.error.mock.calls.flat().join(' ')).not.toContain('ticking on the current code');
   });
 
   it('a refused read lock skips the tick entirely — never reads a tree mid-move', async () => {
@@ -1107,6 +1182,7 @@ describe('a skipped tick is an empty tick every real daemon onTick can log (#404
       const effects = build({ owner: 'test-owner', log });
       expect(() => effects.onTick(skippedTick('writer-active'), 0)).not.toThrow();
       expect(() => effects.onTick(skippedTick('quarantine'), 0)).not.toThrow();
+      expect(() => effects.onTick(skippedTick('state-unreadable'), 0)).not.toThrow();
     }
     // Two cold dynamic imports of whole daemon module graphs: ~1.6 s on an idle Mac, past vitest's 5 s default
     // under a loaded host (reproduced on origin/main at load average ~230, 2026-09-26). The assertion is about
@@ -1286,6 +1362,10 @@ setTimeout(() => { writeFileSync(process.env.PACK_FALLBACK_FILE, 'reached'); pro
     let writerBefore;
     let writerAfter;
     const expectPackStopped = () => {
+      // ESRCH proves the descendant was reaped even when the sandbox denies ps.
+      // A live process or EPERM still requires the existing stopped/zombie proof.
+      try { realKill(packPid, 0); }
+      catch (error) { if (error.code === 'ESRCH') return; throw error; }
       // A terminated orphan can briefly remain a zombie until the host reaps it.
       let state = '';
       try { state = execFileSync('ps', ['-p', String(packPid), '-o', 'stat='], { encoding: 'utf8', timeout: 1000, maxBuffer: 1024 }).trim(); }

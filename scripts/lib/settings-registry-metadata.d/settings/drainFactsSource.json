@@ -1,0 +1,6 @@
+{
+  "description": "Preferred source of merge drain facts.",
+  "owner": "scripts/settings/drain-facts-source.json",
+  "changeVia": "pr",
+  "instant": false
+}

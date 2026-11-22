@@ -1,0 +1,5 @@
+{
+  "description": "Live review slots reserved while runnable red-team work is queued; default 4, lent back when the queue is empty or unknown.",
+  "range": "integer 0–8",
+  "unit": "slots"
+}
