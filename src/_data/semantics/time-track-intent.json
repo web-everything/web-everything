@@ -1,0 +1,5 @@
+{
+  "term": "Time Track Intent",
+  "definition": "Stacked, named lanes that preserve their given order and share one Scale Ruler time axis: equal times align across lanes, and a shared today marker splits each lane into past and forecast content slots. Up/Down moves focus between lanes. The contract owns lane layout and axis mapping; slotted content owns item rendering.",
+  "usage": "Standardized by the Time Track Intent, composing Scale Ruler's time type without redefining its math. Frontier UI implements it as the we-time-tracks block with we-time-track lanes. Forecast visual treatments remain presentation choices."
+}

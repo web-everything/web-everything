@@ -710,7 +710,12 @@ async function syncTestEvidence({ root, scratch, selected, testReport, env, io, 
     }
     const description = cause.kind === 'timeout' ? `timeout${cause.limitMs === null ? '' : ` ${cause.limitMs}ms`}`
       : `signal ${cause.signal ?? result?.error?.code ?? 'unknown'}`;
-    throw Object.assign(new Error(`tests: run killed (${description}, ${attempt} attempts, ${selected.length} files); operator review required${tail ? `: ${tail}` : ''}`),
+    const names = selected.slice(0, 8).map(file => {
+      const name = cleanText(file);
+      return name.length > 64 ? `${name.slice(0, 30)}…${name.slice(-33)}` : name;
+    }).join(', ') + (selected.length > 8 ? ` +${selected.length - 8} more` : '');
+    const message = `tests: run killed (${description}, ${attempt} attempts, ${selected.length} files); selected: ${names}; operator review required${tail ? `: ${tail}` : ''}`.slice(0, 1000);
+    throw Object.assign(new Error(message),
       { step: 'tests', stderrTail: tail, cause, failedTests });
   }
   let validatedFailure = false;
@@ -881,7 +886,7 @@ export async function runOverlayMainSync({ root, ref, token, env = process.env, 
     if (conflicts.length) {
       mergeConflict = true;
       conflictInfo = { files: conflicts, tip: from,
-        stderrTail: stderrTail(merge) || cleanText(merge?.stdout).slice(-500) };
+        stderrTail: cleanText([stderrTail(merge), merge?.stdout].filter(Boolean).join('\n')).slice(-500) };
       event(root, { kind: 'overlay-main-merge-conflict', ref, files: conflicts }, { env });
       if (old.pr) markOverlayConflictWake(env, { pr: old.pr, ref, files: conflicts, at: now(), clone: root });
       else publishNeedsYou(root, env, ref, 'overlay-main-merge-conflict',
@@ -921,7 +926,11 @@ export async function runOverlayMainSync({ root, ref, token, env = process.env, 
     const filteredNotRunnable = selected.size - tests.length;
     // Related-only, capped: more than the fast-lane file cap per run is classified FULL by heavy-admission and
     // runs on the Mac. Never run a whole suite here; CI retests. Chunks stay within the fast cap.
-    const cap = overlayRelatedTestCap(env), chunkSize = Math.min(50, resolveFastMaxFiles(env));
+    const rawChunkFiles = env.WE_OVERLAY_MAIN_SYNC_CHUNK_FILES;
+    const chunkFiles = Number(rawChunkFiles);
+    const validChunkFiles = /^\d+$/.test(String(rawChunkFiles ?? '')) && Number.isSafeInteger(chunkFiles) && chunkFiles >= 1;
+    const chunkSize = Math.min(50, validChunkFiles ? chunkFiles : 10, resolveFastMaxFiles(env));
+    const cap = overlayRelatedTestCap(env);
     // The overlay's own changed tests are never dropped; only dependents beyond the cap are.
     const ownCount = tests.filter(file => own.includes(file)).length;
     const droppedByCap = Math.max(0, tests.length - Math.max(cap, ownCount));

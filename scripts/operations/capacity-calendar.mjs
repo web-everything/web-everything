@@ -27,7 +27,7 @@ export function renderCalendar(report) {
     const p = cap.planner;
     const planning = `${cap.windowModel ?? 'fixed'}: ${p.action}; reset plan ${JSON.stringify(p.resetPlan ?? [])}`;
     const bank = p.bankedCount === undefined ? '' : `; banked ${p.bankedCount}, earliest expiry ${p.earliestExpiry ?? 'unknown'}, required ${p.requiredRatePerHour ?? 'unknown'} vs current ${p.currentRatePerHour ?? 'unknown'} %/h, on-track ${p.onTrack === null ? 'unknown' : p.onTrack ? 'yes' : 'no'}`;
-    return `${cap.provider}${cap.account ? '/' + cap.account : ''}: ${windows}\n  ${planning}${bank}\n  reset choices: ${JSON.stringify(p.resetChoices ?? [])}\n  ${Object.entries(cap.scores).map(([k, v]) => `${k}=${v.score?.toFixed(3) ?? v.label}`).join(' ')}`;
+    return `${cap.provider}${cap.account ? '/' + cap.account : ''}: ${cap.signedOut ? 'signed out' : windows}\n  ${planning}${bank}\n  reset choices: ${JSON.stringify(p.resetChoices ?? [])}\n  ${Object.entries(cap.scores).map(([k, v]) => `${k}=${v.score?.toFixed(3) ?? v.label}`).join(' ')}`;
   }).concat(report.plan, `burn windows: ${JSON.stringify(report.burns)}`, `needs operator input: ${(report.needsOperatorInput ?? []).join('; ') || 'none'}`, ...(report.horizon ? [renderHorizon(report.horizon)] : [])).join('\n');
 }
 export function renderHorizon(horizon) {

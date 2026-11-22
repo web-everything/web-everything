@@ -165,9 +165,9 @@ describe('pending-CI start policy', () => {
       .toMatchObject({ allowed: false, reason: 'required-checks-not-successful', affected: [
         { name: 'standards', reason: 'missing' }, { name: 'test', reason: 'pending' }] });
   });
-  it('resolves shipped R468 timing from review.json as push start, red cancellation, and shadow early policy', () => {
+  it('resolves shipped R468 timing from review.json as push start, red cancellation, and retired early policy', () => {
     const resolved = resolveTimingPolicy({ env: {}, fix: {}, platformReview: {}, platformFix: {}, log: () => {} });
-    expect(resolved.review).toMatchObject({ startAfter: 'push', cancelOnCiRed: true, startEarly: 'shadow' });
+    expect(resolved.review).toMatchObject({ startAfter: 'push', cancelOnCiRed: true, startEarly: 'off' });
     expect(resolved.sources.review).toMatchObject({ startAfter: 'tool', cancelOnCiRed: 'tool', startEarly: 'tool' });
   });
   it.each(['fast-checks', 'ci-green'])('allows an environment rollback of shipped push timing to %s', startAfter => {
