@@ -210,14 +210,15 @@ test('current numeric discovery evidence converges for H but not the M tail', ()
 
 // Immutable compact snapshot captured before the per-key migration (not regenerated).
 const originalMetadata = JSON.parse(readFileSync(join(ROOT, 'scripts/lib/__tests__/fixtures/settings-registry-original.json'), 'utf8'));
-function historicalFixture(t) {
+function originalFixture(t) {
   const f = fixture(t);
   rmSync(join(f.root, 'scripts/settings/feature.json'));
-  // Keep the migration proof on its captured key set as new settings are declared.
-  const owners = new Set(buildRegistry().rows.filter(row => Object.hasOwn(originalMetadata.settings, row.key)).flatMap(row => row.owners));
+  // Keep later declarations out of the historical migration and byte-preservation checks.
+  const owners = new Set(buildRegistry().rows.flatMap(row => row.owners));
   for (const owner of owners) {
-    const declaration = JSON.parse(readFileSync(join(ROOT, owner), 'utf8'));
-    f.write(owner, Object.fromEntries(Object.entries(declaration).filter(([key]) => key.startsWith('$comment') || Object.hasOwn(originalMetadata.settings, key))));
+    const declared = JSON.parse(readFileSync(join(ROOT, owner), 'utf8'));
+    f.write(owner, Object.fromEntries(Object.entries(declared).filter(([key]) =>
+      key.startsWith('$comment') || Object.hasOwn(originalMetadata.settings, key))));
   }
   Object.assign(f.meta, structuredClone(originalMetadata));
   return f;
@@ -236,7 +237,7 @@ test('per-key directory reconstructs exactly the original metadata JSON shape an
   assert.deepEqual(f.build(), before);
 });
 test('migration preserves the registry built from the original repository metadata JSON', t => {
-  const f = historicalFixture(t), before = f.build();
+  const f = originalFixture(t), before = f.build();
   assert.deepEqual(before.problems, []);
   split(f);
   assert.deepEqual(readMetadata({ root: f.root }), originalMetadata);
@@ -355,7 +356,7 @@ test('malformed names, unexpected entries and unreadable per-key JSON fail close
 });
 
 test('generated documentation preserves original bytes except the intentional per-key authoring instruction', t => {
-  const doc = renderMarkdown(historicalFixture(t).build());
+  const doc = renderMarkdown(originalFixture(t).build());
   const originalInstruction = 'For repo defaults, edit the owner file through a PR and rebuild the consuming daemon. Add or update metadata in scripts/lib/settings-registry-metadata.json, then run `node scripts/lib/settings-registry.mjs --write`. Verify with `node scripts/lib/settings-registry.mjs --check`. Missing declarations or invalid evidence block generation; repair the named file before regenerating.';
   const original = doc.replace(/^For repo defaults,.*$/m, originalInstruction);
   assert.equal(createHash('sha256').update(original).digest('hex'), '239663dfb7c702b1f8cf475f1b8659d16fea92c2deaa92c027f3a67f5106cc8d');

@@ -105,11 +105,12 @@ describe('hotpatch production readers', () => {
       }
       if (command === 'gh') {
         if (args[0] === 'repo') return JSON.stringify({ nameWithOwner: 'org/repo', url: 'https://github.com/org/repo' });
-        if (args[1].includes('/check-runs?')) return JSON.stringify(fixture.data.checks);
-        if (args[1].includes('/actions/runs?')) return JSON.stringify(fixture.data.workflows);
-        if (args[1] === 'repos/org/repo/actions/runs/70/jobs?filter=all&per_page=100')
+        const endpoint = args[1] === '--allow-escape-sequences' ? args[2] : args[1];
+        if (endpoint.includes('/check-runs?')) return JSON.stringify(fixture.data.checks);
+        if (endpoint.includes('/actions/runs?')) return JSON.stringify(fixture.data.workflows);
+        if (endpoint === 'repos/org/repo/actions/runs/70/jobs?filter=all&per_page=100')
           return JSON.stringify({ total_count: jobs.length, jobs });
-        const logId = /^repos\/org\/repo\/actions\/jobs\/(\d+)\/logs$/.exec(args[2])?.[1];
+        const logId = /^repos\/org\/repo\/actions\/jobs\/(\d+)\/logs$/.exec(endpoint)?.[1];
         if (logId && Object.hasOwn(logs, logId)) return logs[logId];
       }
       throw new Error('unexpected IO');
@@ -121,8 +122,10 @@ describe('hotpatch production readers', () => {
     const f = production();
     expect(await admitHotpatch(SHA, f.readers)).toMatchObject({ outcome: 'pass' });
     expect(f.calls.filter(c => c.command === 'gh')).toHaveLength(8);
-    expect(f.calls.filter(c => c.command === 'gh' && c.args[2]?.endsWith('/logs')).map(c => c.args))
-      .toEqual([8, 9, 20, 21].map(id => ['api', '--allow-escape-sequences', `repos/org/repo/actions/jobs/${id}/logs`, '--hostname', 'github.com']));
+    const logs = f.calls.filter(c => c.command === 'gh' && c.args.some(arg => arg.endsWith('/logs')));
+    expect(logs.map(c => c.args)).toEqual([8, 9, 20, 21].map(id =>
+      ['api', '--allow-escape-sequences', `repos/org/repo/actions/jobs/${id}/logs`, '--hostname', 'github.com']));
+    expect(logs.every(c => c.options.timeout === 30000 && c.options.maxBuffer === 2 * 1024 * 1024)).toBe(true);
     expect(f.calls.filter(c => c.command === 'git' && c.args[0] === 'fetch').map(c => c.args)).toEqual([['fetch', '--no-tags', 'origin', 'main', SHA]]);
     expect(f.calls.findIndex(c => c.args[0] === 'fetch')).toBeLessThan(f.calls.findIndex(c => c.args[0] === 'diff'));
     const next = production(); next.data.checks.check_runs[0].conclusion = 'failure';
@@ -133,20 +136,20 @@ describe('hotpatch production readers', () => {
     const f = production(); f.jobs[0].steps[0].conclusion = 'skipped';
     expect(await admitHotpatch(SHA, f.readers)).toMatchObject({ outcome: 'unknown' });
   });
-  it('production receipts refuse quarantine exclusions in successful job logs', async () => {
-    const f = production(); f.logs[8] = 'red-main-quarantine skip: quarantined → --exclude=guard.test.mjs\n';
-    expect(await admitHotpatch(SHA, f.readers)).toMatchObject({ outcome: 'unknown' });
-  });
-  it('production receipts read escape-coded logs and still refuse quarantine exclusions', async () => {
-    const f = production();
-    f.logs[8] = '\x1b[32m' + f.logs[8] + '\x1b[0m';
+  it('production receipts read escape-coded execution logs through the shared transport', async () => {
+    const f = production(); f.logs[8] = `\x1b[32m${f.logs[8]}\x1b[0m`;
     expect(await admitHotpatch(SHA, f.readers)).toMatchObject({ outcome: 'pass' });
-    f.logs[8] += '\x1b[31mred-main-quarantine skip: quarantined → --exclude=guard.test.mjs\x1b[0m\n';
+    expect(f.calls.find(c => c.command === 'gh' && c.args.includes('repos/org/repo/actions/jobs/8/logs')).args)
+      .toContain('--allow-escape-sequences');
+  });
+  it.each(['', '\x1b[31m'])('production receipts refuse quarantine exclusions in successful job logs (prefix=%j)', async prefix => {
+    const f = production(); f.logs[8] = `${prefix}red-main-quarantine skip: quarantined → --exclude=guard.test.mjs\n`;
     expect(await admitHotpatch(SHA, f.readers)).toMatchObject({ outcome: 'unknown' });
   });
-  it('production receipts keep unreadable execution logs unknown', async () => {
+  it('unreadable production execution logs stay unknown', async () => {
     const f = production(); delete f.logs[8];
     expect(await admitHotpatch(SHA, f.readers)).toMatchObject({ outcome: 'unknown' });
+    expect(f.calls.some(c => c.command === 'gh' && c.args.includes('repos/org/repo/actions/jobs/8/logs'))).toBe(true);
   });
   it('unreadable main workflow and audit evidence stay unknown', async () => {
     for (const kind of ['workflow', 'audit']) {
