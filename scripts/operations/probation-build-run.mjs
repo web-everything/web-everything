@@ -66,13 +66,14 @@ import { classifyPrepareFailure } from '../conveyor/prepare-failure-policy.mjs';
  *
  * Operator CLI: --num=<item> --taskType=doc-fix|bugfix|test-fix|prepare|build-new-feature --worker=<roster id|JSON> [--model=<allowed id>].
  * Omitted taskType remains doc-fix; omitted session gets a random per-run identity. Worker names resolve
- * from PROBATION_WORKERS (agy Claude defaults to Sonnet). Flash is for simple mechanical work and requires
+ * from PROBATION_WORKERS (agy Claude defaults to Sonnet). Hydrogen is for simple mechanical work and requires
  * a read-only Codex APPROVE. No enclosing Claude session is started.
  *
  * IO lives in the `io` object so the whole arc is testable with fakes; the CLI block at the bottom wires the
  * real processes.
  */
 
+import { assertAgyHydrogenBuildAdmission } from '../lib/agy-sandbox.mjs';
 import { runPrepareBatch } from './prepare-batch.mjs';
 import { createHash, randomBytes } from 'node:crypto';
 import { execFileSync, execFile } from 'node:child_process';
@@ -246,15 +247,15 @@ export function parseArgs(argv) {
     if (def.id === 'antigravity-argon' && !resolveBuildArgonModel(model)) throw new Error(`disallowed model for ${def.id}: ${model}`);
     if (taskType === 'build-new-feature' && !PROBATION_ROSTER[taskType].includes(def.id)) throw new Error('feature builds require a feature probation roster worker');
     if (explicit) {
-      const allowed = def.provider === 'antigravity' ? [defaultModel, 'claude-sonnet-4-6', 'gemini-3.8-flash-high'] : [defaultModel];
+      const allowed = def.provider === 'antigravity' ? [defaultModel, 'claude-sonnet-4-6', 'gemini-4-hydrogen-medium'] : [defaultModel];
       if (taskType === 'prepare' && (!['codex', 'antigravity-gemini'].includes(def.id) || model !== defaultModel)) throw new Error('prepare requires a Codex or Gemini roster model');
       if (!allowed.includes(model)) throw new Error(`disallowed model for ${def.id}: ${model}`);
     }
     // A Gemini override must never bypass the simple-only/checker constraints.
     const gemini = model.startsWith('gemini-');
-    const flash = gemini && !(def.id === 'antigravity-argon' && resolveBuildArgonModel(model));
+    const simpleGemini = gemini && !(def.id === 'antigravity-argon' && resolveBuildArgonModel(model));
     worker = { ...supplied, ...def, model, taskType,
-      simpleOnly: def.simpleOnly || flash, checker: gemini ? 'codex' : def.checker };
+      simpleOnly: def.simpleOnly || simpleGemini, checker: gemini ? 'codex' : def.checker };
   }
   return {
     runId: flags['run-id'] ?? null,
@@ -374,6 +375,12 @@ export async function runProbationBuild(args, io) {
 
     let item = io.findItem(num, lanePath);
     if (!item) return finish('not-applicable', 'none', `no backlog/${num}-*.md file in this checkout`);
+    if (/^gemini-.*(?:hydrogen|flash)/.test(worker.model ?? '')) {
+      assertAgyHydrogenBuildAdmission({ ...parseYamlFrontmatter(item.raw), kind: preparing ? 'prepare-item' : 'build',
+        taskType, scopePaths: declaredScopePaths(item.scope) }, worker.model);
+      assertAgyHydrogenBuildAdmission({ ...parseYamlFrontmatter(item.raw), kind: 'build', taskType,
+        scopePaths: declaredScopePaths(args.scope) }, worker.model);
+    }
     if (preparing && parseYamlFrontmatter(item.raw).status !== 'open') {
       return finish('not-applicable', 'none', 'prepare requires an open card');
     }

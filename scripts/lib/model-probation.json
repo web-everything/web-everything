@@ -29,6 +29,26 @@
       "since": "2026-11-18",
       "owner": "3383",
       "note": "Carbon shadow probation bookkeeping only; never auto-seats advisory-review. R1062 requires ten agreeing PRs and manual promotion by the orchestrator."
+    },
+    {
+      "provider": "antigravity",
+      "model": "gemini-4-hydrogen-medium",
+      "roles": {
+        "delivery": "probation"
+      },
+      "since": "2026-11-21",
+      "owner": "3383",
+      "note": "S0.1: probation delivery for doc-fix, prevention-card and prepare-card; no review role."
+    },
+    {
+      "provider": "antigravity",
+      "model": "gemini-4-hydrogen-low",
+      "roles": {
+        "delivery": "probation"
+      },
+      "since": "2026-11-21",
+      "owner": "3383",
+      "note": "Probation delivery for trivial small work; no review role."
     }
   ]
 }

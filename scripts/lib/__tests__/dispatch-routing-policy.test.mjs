@@ -105,7 +105,7 @@ describe('operation routing policy', () => {
     policy.operations[key] = { inherit: true };
     const input = { operation: 'review-seat', taskType: key.slice('review-seat:'.length) };
     if (key === 'review-seat') input.taskType = '';
-    const models = { claude: 'sonnet', codex: 'sol', 'agy-claude': 'sonnet', 'agy-gemini': 'flash' };
+    const models = { claude: 'sonnet', codex: 'sol', 'agy-claude': 'sonnet', 'agy-gemini': 'gemini-4-argon-high' };
     const routeFor = provider => ({ provider, model: models[provider] });
     const rejected = structuredClone(policy);
     rejected.operations[key] = { ...routeFor(unsupported), fallback: [] };
@@ -118,7 +118,7 @@ describe('operation routing policy', () => {
       const accepted = structuredClone(policy);
       accepted.operations[key] = { ...routeFor(provider), fallback: [] };
       expect(validateRoutingPolicy(accepted).operations[key]).toMatchObject({ provider });
-      expect(planRoutingOverride({ ...input, provider }, policy)).toMatchObject({ key, patch: { provider } });
+      expect(planRoutingOverride({ ...input, provider, model: models[provider] }, policy)).toMatchObject({ key, patch: { provider } });
     }
   });
   it('shares the red-team launch roster with existing review-seat consumers', async () => {
@@ -138,7 +138,8 @@ describe('operation routing policy', () => {
     });
   it.each(['codex', 'agy-claude', 'agy-gemini'])(
     'resolves a supported red-team override for %s against the launch roster', provider => {
-      const policy = applyRoutingOverrides(DEFAULT_ROUTING_POLICY, { 'review-seat:red-team': { provider } });
+      const patch = provider === 'agy-gemini' ? { provider, model: 'pro' } : { provider };
+      const policy = applyRoutingOverrides(DEFAULT_ROUTING_POLICY, { 'review-seat:red-team': patch });
       expect(resolveOperationRoute({ operation: 'review-seat', taskType: 'red-team',
         available: OPERATION_PROVIDER_ROSTERS['review-seat:red-team'], policy })).toMatchObject({ provider });
     });
@@ -282,6 +283,7 @@ describe('review-round regressions (PR 3209)', () => {
   });
   it('an explicit Codex build route stays on the mechanical wrapper when probation launch is off', () => {
     const policy = copy(); policy.operations.build = { provider: 'codex', model: 'default', fallback: [] };
+    policy.operations['build:doc-fix'] = policy.operations.build;
     const routing = decideDispatchRoute({ kind: 'build', scopePaths: ['we:docs/a.md'], size: 1, risk: 'low' }, { routingPolicy: policy });
     const request = { launchKind: 'build', policyRoute: routing.policyRoute, probationWorker: routing.probationWorker, reportModel: vi.fn() };
     const wrapper = vi.fn(() => 'pid:9'); const agent = vi.fn(() => 'claude-session');
@@ -380,11 +382,12 @@ it.each(['fix', 'ci-heal'])('%s retries Astra high before Claude only on definit
   expect(seen).toEqual([]);
 });
 
-it('routes all mechanical documentation and filing entries at medium effort', () => {
+it('routes mechanical documentation and filing defaults to Hydrogen medium', () => {
   const policy = copy();
-  for (const entry of [policy.operations.build, policy.operations['build:doc-fix'], ...['doc-fix', 'prevention-card', 'prepare-card'].flatMap(k => [policy.operations[k], policy.taskTypes[k]])]) {
-    expect(entry.provider).toBe('codex'); expect(entry.model).toBe('sol');
-    expect(entry.effort.codex).toBe('medium');
+  expect(policy.operations.build).toMatchObject({ provider: 'codex', model: 'sol' });
+  for (const entry of [policy.operations['build:doc-fix'], ...['doc-fix', 'prevention-card', 'prepare-card'].flatMap(k => [policy.operations[k], policy.taskTypes[k]])]) {
+    expect(entry.provider).toBe('agy-gemini'); expect(entry.model).toBe('hydrogen');
+    expect(entry.effort['agy-gemini']).toBe('medium');
   }
   for (const entry of ['prevention-card', 'prepare-card'].flatMap(k => [policy.operations[k], policy.taskTypes[k]])) {
     expect(Object.values(entry.effort).every(e => e === 'medium')).toBe(true);
@@ -496,4 +499,23 @@ it.each([false, true])('scoped inheritance cannot discard parent disabledProvide
   policy.operations['fix:critical-work'] = { inherit: true };
   expect(() => resolveOperationRoute({ operation: 'fix', taskType: 'critical-work', gateClosed, policy }))
     .toThrow(/inherited route cannot enforce disabled providers; configure an explicit provider and fallback/);
+});
+
+
+it.each(['antigravity', 'agy-gemini'])('rejects retired Flash routes for %s', provider => {
+  for (const model of ['flash', 'gemini-3.8-flash', 'gemini-3.8-flash-high']) {
+    const policy = copy();
+    policy.operations['doc-fix'] = { provider, model, fallback: [] };
+    expect(() => validateRoutingPolicy(policy)).toThrow(/unknown model/);
+  }
+});
+
+it('maps trivial and middle Gemini tiers while keeping Argon and Carbon', () => {
+  const policy = copy();
+  for (const provider of ['antigravity', 'agy-gemini']) {
+    expect(policy.aliases[provider]).toMatchObject({ hydrogen: 'gemini-4-hydrogen-medium',
+      'hydrogen-low': 'gemini-4-hydrogen-low', neon: 'gemini-4-neon-high',
+      pro: 'gemini-4-argon-high', carbon: 'gemini-4-carbon-high' });
+    expect(policy.aliases[provider]).not.toHaveProperty('flash');
+  }
 });

@@ -60,6 +60,12 @@ describe('repair scope admission', () => {
     expect(deriveAgyFixAdmission({ size: 1, scope: ['we:docs/guide.md'] }, { scope: 'we:docs' }))
       .toEqual({ kind: 'doc-fix', size: 1, scope: ['docs/guide.md'] });
   });
+  it('a broad docs envelope cannot admit protected descendants or an equally broad item', () => {
+    for (const scope of [['docs'], ['docs/agent/testing.md']]) {
+      expect(deriveAgyFixAdmission({ taskKind: 'doc-fix', size: 1, scope }, { scope: ['docs'] }))
+        .toBeNull();
+    }
+  });
   it('test-fix is refused until #8606', () => {
     for (const taskKind of ['test-fix', 'fix', 'doc-fix', 'feature'])
       expect(admit({ taskKind, size: 1, scope: ['blocks/selection/__tests__/a.test.ts'] })).toBeNull();
@@ -142,9 +148,9 @@ describe('the repair-dispatch chain tests that hold enforcement assertions are n
   ])('refuses %s', path => { expect(isAdmissibleTargetPath(path)).toBe(false); });
 });
 
-it('admits existing docs directories only as scopes, never as applied files', () => {
-  expect(isAdmissibleTargetScope('docs')).toBe(true);
-  // Existing directories still pass through the critical-work boundary.
+it('refuses docs directory scopes covering protected descendants and directory applied files', () => {
+  expect(isAdmissibleTargetScope('docs')).toBe(false);
+  // Directory scopes cannot cover the protected docs/agent descendants.
   expect(isAdmissibleTargetScope('docs/agent')).toBe(false);
   expect(isAdmissibleTargetScope('docs/nonexistent-directory')).toBe(false);
   expect(isAdmissibleTargetPath('docs')).toBe(false);
@@ -158,10 +164,10 @@ it('admits only allowlisted tests directory scopes while refusing them as applie
   expect(isAdmissibleTargetScope('blocks/selection/__tests__')).toBe(true);
 });
 
-it('settings admit doc-fix only and cannot widen repair size', () => {
+it('settings enable small delivery kinds and cannot widen repair size', () => {
   const settings = JSON.parse(readFileSync(new URL('../../settings/agy-build.json', import.meta.url), 'utf8'));
-  expect(settings.allowedKinds).toEqual(['doc-fix']);
-  expect(admit({ taskKind: 'doc-fix', size: 3, scope: ['docs'] })).toBeNull();
+  expect(settings.allowedKinds).toEqual(['doc-fix', 'prevention-card', 'prepare-card']);
+  expect(admit({ taskKind: 'doc-fix', size: 3, scope: ['docs/guide.md'] })).toBeNull();
 });
 
 it('pins frozen production confinement as unavailable', async () => {

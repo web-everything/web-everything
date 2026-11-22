@@ -1384,7 +1384,7 @@ export function decideDispatchRoute(dispatch = {}, options = {}) {
   // Every policy-routed kind needs a verdict, including roles and future operation names.
   // Keep the inherited evidence router unchanged when no explicit policy route exists.
   const roleGate = decideCriticalWorkGate({ ...criticalWorkGate, kinds: [...new Set([...criticalWorkGate.kinds, dispatch.kind])] }, dispatch.kind, record.taskType ?? (dispatch.kind === 'prepare-item' ? 'prepare' : dispatch.kind), {
-    criticalWork: criticalWorkVerdict({ filesTouched: dispatch.cardPath ? [dispatch.cardPath] : dispatch.scopePaths, risk: dispatch.risk, tags: dispatch.tags }),
+    criticalWork: criticalWorkVerdict({ filesTouched: dispatch.kind === 'prepare-item' && dispatch.cardPath ? [dispatch.cardPath] : [...(dispatch.scopePaths ?? []), ...(dispatch.cardPath ? [dispatch.cardPath] : [])], risk: dispatch.risk, tags: dispatch.tags, humanRequired: dispatch.humanRequired }),
     criticalMisses: criticalMissesFor(options.scorecards ?? [], dispatch.kind === 'prepare-item' ? 'prepare' : dispatch.kind),
   });
   const gateClosed = (roleGate && !roleGate.open) || record.auditTrail?.some(row => row.criterion === 'critical-work-gate' && row.result === 'claude-only');
@@ -1408,7 +1408,7 @@ export function decideDispatchRoute(dispatch = {}, options = {}) {
     record.probationWorker = null;
     if (tier) record.tier = tier;
     if (route.provider !== 'claude' && (dispatch.kind === 'prepare-item' || (dispatch.kind === 'build' && ['doc-fix', 'test-fix', 'build-new-feature'].includes(record.taskType)))) {
-      record.probationWorker = probationWorkerForRoute(route, dispatch.kind === 'prepare-item' ? 'prepare' : record.taskType);
+      record.probationWorker = probationWorkerForRoute(route, dispatch.kind === 'prepare-item' ? 'prepare' : record.taskType, { simple: dispatch.simple === true, estimatedSize: record.estimatedLoc, filesTouched: dispatch.scopePaths });
       if (record.taskType === 'build-new-feature' && (!PROBATION_ROSTER[record.taskType].includes(record.probationWorker.id) || record.probationWorker.simpleOnly)) {
         return { ...record, outcome: 'refused', probationWorker: null, refusal: 'feature builds require a non-simple feature roster worker' };
       }

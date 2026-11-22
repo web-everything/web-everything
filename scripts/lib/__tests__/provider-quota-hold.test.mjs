@@ -149,3 +149,31 @@ describe('quota error evidence', () => {
     expect(quota.providerQuotaHold([row], 'codex', now)).toBeNull();
   });
 });
+
+
+describe('Codex quota gauge boundary', () => {
+  const row = { provider: 'codex', status: 'ok', scoredAt: new Date(now).toISOString(),
+    quotaResetsAt: new Date(now + quota.QUOTA_COOLOFF_MS).toISOString() };
+
+  it('keeps a Codex seat at 99.9 percent eligible', () => {
+    expect(quota.providerQuotaHold([{ ...row, quotaUsedPercent: 99.9 }], 'codex', now)).toBeNull();
+  });
+
+  it('sits out a Codex seat at 100 percent until reset', () => {
+    expect(quota.CODEX_QUOTA_FULL_PERCENT).toBe(100);
+    expect(quota.providerQuotaHold([{ ...row, quotaUsedPercent: 100 }], 'codex', now)).toMatch(/100%/);
+    expect(quota.providerQuotaHold([{ ...row, quotaUsedPercent: 100 }], 'codex', now + quota.QUOTA_COOLOFF_MS)).toBeNull();
+  });
+});
+
+
+describe('non-Codex quota gauge boundary', () => {
+  it.each(['claude', 'antigravity', 'agy-gemini', 'future-provider'])('%s retains the 98 percent hold', provider => {
+    const row = { provider, status: 'ok', scoredAt: new Date(now).toISOString(),
+      quotaResetsAt: new Date(now + quota.QUOTA_COOLOFF_MS).toISOString() };
+    expect(quota.providerQuotaHold([{ ...row, quotaUsedPercent: 97.9 }], provider, now)).toBeNull();
+    for (const quotaUsedPercent of [98, 99, 99.9, 100])
+      expect(quota.providerQuotaHold([{ ...row, quotaUsedPercent }], provider, now)).toMatch(/quota gauge/);
+    expect(quota.providerQuotaHold([{ ...row, quotaUsedPercent: 99 }], provider, now + quota.QUOTA_COOLOFF_MS)).toBeNull();
+  });
+});

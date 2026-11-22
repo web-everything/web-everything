@@ -17,7 +17,8 @@ import { pendingProbationLaunches } from '../../lib/model-probation.mjs';
 import { beginHealAttempt, bindHealAttempt, failHealAttempt, readHealAttempt, finishHealAttempt, observeHealAttempt, pollHealAttempts, publishHealAttempt, parseArgs, realIo, runProbationHeal } from '../probation-heal-run.mjs';
 
 const agyClaude = { id: 'antigravity-claude', provider: 'antigravity', model: 'claude-sonnet-4-6', executor: 'antigravity', launcher: 'scripts/gemini-direct-task.mjs', checker: null, taskType: 'ci-heal' };
-const agyGemini = { ...agyClaude, id: 'antigravity-gemini', model: 'gemini-3.8-flash-high', checker: 'codex' };
+// routing.gemini4Tiers: active heal fixtures use Argon; Flash is retired.
+const agyGemini = { ...agyClaude, id: 'antigravity-gemini', model: 'gemini-4-argon-high', checker: 'codex' };
 const docFixWorker = { id: 'codex', provider: 'codex', model: 'gpt-6-astra', executor: 'codex', launcher: 'scripts/codex-direct-task.mjs', checker: null, taskType: 'doc-fix' };
 
 describe('probationLaunchFromEnv', () => {

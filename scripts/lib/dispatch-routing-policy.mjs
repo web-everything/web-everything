@@ -6,12 +6,12 @@ import { rosterForKey } from './dispatch-routing-providers.mjs';
 const CATALOG = Object.freeze({
   claude: ['claude-haiku-5-5', 'claude-sonnet-5-5', 'claude-opus-5-5'],
   codex: ['gpt-6.1-sol', 'gpt-6-astra', 'gpt-6-sol', 'gpt-6-luna', 'gpt-5.6-sol', 'gpt-5.6-terra'],
-  // Historical ids remain valid for persisted runs; aliases select the current family.
-  antigravity: ['claude-sonnet-5-5-high', 'claude-sonnet-5-5-medium', 'claude-sonnet-5-5-low', 'claude-sonnet-5-5', 'claude-sonnet-4-6', 'claude-opus-4-6-thinking', 'gemini-3.8-flash-high', 'gemini-3.8-flash', 'gemini-3.1-pro', 'gemini-4-argon-high', 'gemini-4-carbon-high'],
+  // Retained historical ids support persisted runs; retired Flash identities cannot select a route.
+  antigravity: ['claude-sonnet-5-5-high', 'claude-sonnet-5-5-medium', 'claude-sonnet-5-5-low', 'claude-sonnet-5-5', 'claude-sonnet-4-6', 'claude-opus-4-6-thinking', 'gemini-4-hydrogen-medium', 'gemini-4-hydrogen-low', 'gemini-4-neon-high', 'gemini-3.1-pro', 'gemini-4-argon-high', 'gemini-4-carbon-high'],
   // Card 84 — agy 1.3.0 serves the 5.5 family with the effort baked into the id (`agy models`, 2026-10-06).
   'agy-claude': ['claude-sonnet-5-5', 'claude-sonnet-4-6', 'claude-opus-4-6-thinking', 'claude-opus-5-5-high', 'claude-opus-5-5-medium', 'claude-opus-5-5-low',
     'claude-sonnet-5-5-high', 'claude-sonnet-5-5-medium', 'claude-sonnet-5-5-low'],
-  'agy-gemini': ['gemini-3.8-flash-high', 'gemini-3.8-flash', 'gemini-3.1-pro', 'gemini-4-argon-high', 'gemini-4-carbon-high'],
+  'agy-gemini': ['gemini-4-hydrogen-medium', 'gemini-4-hydrogen-low', 'gemini-4-neon-high', 'gemini-3.1-pro', 'gemini-4-argon-high', 'gemini-4-carbon-high'],
 });
 const object = value => value !== null && typeof value === 'object' && !Array.isArray(value);
 const fail = message => { throw new TypeError(`routing policy: ${message}`); };
@@ -83,12 +83,14 @@ export function validateRoutingPolicy(input) {
       if (entry.mode !== undefined && (entry.mode !== 'shadow' || !entry.fallback?.some?.((f) => f?.provider === 'claude'))) {
         fail(`${path}.mode must be "shadow", with a claude route in fallback to count`);
       }
-      modelFor(policy, entry.provider, entry.model, path);
+      const resolvedModel = modelFor(policy, entry.provider, entry.model, path);
+      assertOperationModel(name, resolvedModel);
       validateEffort(entry.effort, entry.provider);
       if (!Array.isArray(entry.fallback)) fail(`${path}.fallback must be an array`);
       for (const [i, next] of entry.fallback.entries()) {
         keys(next, ['provider', 'model', 'effort'], `${path}.fallback[${i}]`);
-        modelFor(policy, next.provider, next.model, `${path}.fallback[${i}]`);
+        const fallbackModel = modelFor(policy, next.provider, next.model, `${path}.fallback[${i}]`);
+        assertOperationModel(name, fallbackModel);
         validateEffort(next.effort, next.provider);
       }
       const allowedProviders = group === 'operations' && rosterForKey(name);
@@ -119,9 +121,16 @@ function validateProviderControls(entry, path) {
 }
 
 export function defaultPolicyModel(provider) {
-  const model = { claude: 'sonnet', codex: 'default', antigravity: 'sonnet', 'agy-claude': 'sonnet', 'agy-gemini': 'flash' }[provider];
+  const model = { claude: 'sonnet', codex: 'default', antigravity: 'sonnet', 'agy-claude': 'sonnet', 'agy-gemini': 'neon' }[provider];
   if (!model) fail(`unknown provider ${JSON.stringify(provider)}`);
   return model;
+}
+
+// Validate both declared keys and effective inherited routes before selecting any candidate.
+function assertOperationModel(operation, model) {
+  if (/review|juror|judge|red-team|merge|land/i.test(operation) && /hydrogen|neon|flash/i.test(model)) {
+    fail(`${operation}: small-tier model ${model} refused; configure a larger model or request operator review`);
+  }
 }
 
 /** Arrays replace; nested effort maps merge. Overrides never mutate the repo snapshot. */
@@ -208,6 +217,7 @@ export function resolveOperationRoute({ operation, taskType, size, designQuestio
     if (!entry || entry.inherit) return inheritRoute();
   }
   const candidates = [entry, ...entry.fallback].map(({ provider, model, effort }) => ({ provider, model: modelFor(policy, provider, model, operation), effort: resolvePolicyEffort(provider, typeof effort === 'string' ? effort : effort?.[provider] ?? operationEffort(operation, provider, taskType, policy)) }));
+  for (const route of candidates) assertOperationModel(`${operation}:${taskType ?? ''}`, route.model);
   const chain = candidates.filter(route => !disabledProviders.has(route.provider) && !entry.disabledProviders?.includes(route.provider))
     .filter(route => (!gateClosed || route.provider === 'claude') && (route.provider === 'claude' || !vetoes.some(veto => veto.model === route.model && veto.provider === (route.provider.startsWith('agy-') ? 'antigravity' : route.provider))))
     .filter(route => !availability?.[route.provider]

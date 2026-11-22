@@ -141,8 +141,8 @@ describe('probation roster models reach the build runner parser', () => {
 
   it('explicit Gemini policy routes and fallback chains honour the Codex checker hold', () => {
     const policy = structuredClone(inheritedRoutingPolicy);
-    policy.operations['build:test-fix'] = { provider: 'agy-gemini', model: 'gemini-3.8-flash-high', fallback: [
-      { provider: 'antigravity', model: 'gemini-3.8-flash-high' }, { provider: 'claude', model: 'sonnet' },
+    policy.operations['build:test-fix'] = { provider: 'agy-gemini', model: 'gemini-4-hydrogen-medium', fallback: [
+      { provider: 'antigravity', model: 'gemini-4-hydrogen-medium' }, { provider: 'claude', model: 'sonnet' },
     ] };
     const route = currentRoute({ kind: 'build', size: 1, scopePaths: ['we:scripts/__tests__/example.test.mjs'] }, {
       routingPolicy: policy, availability: { codex: 'held' },
@@ -151,7 +151,7 @@ describe('probation roster models reach the build runner parser', () => {
     expect(route.policyRoute.fallback).toEqual([]);
   });
 
-  it.each(['gemini-3.8-flash-high', 'gemini-3.8-flash', 'gemini-3.1-pro', 'claude-sonnet-4-6'])('explicit feature policy refuses non-roster %s before spawn', model => {
+  it.each(['gemini-4-hydrogen-medium', 'gemini-4-hydrogen-low', 'gemini-3.1-pro', 'claude-sonnet-4-6'])('explicit feature policy refuses non-roster %s before spawn', model => {
     const policy = structuredClone(inheritedRoutingPolicy);
     policy.operations['build:build-new-feature'] = { provider: 'antigravity', model, fallback: [] };
     expect(currentRoute({ kind: 'build', size: 3, scopePaths: ['we:scripts/example.mjs'] }, { routingPolicy: policy }))
@@ -162,7 +162,7 @@ describe('probation roster models reach the build runner parser', () => {
     const request = { launchKind: 'build', repo: 'we', probationWorker: {
       ...PROBATION_WORKERS['antigravity-argon'], taskType: 'build-new-feature',
     }, policyRoute: { provider: 'antigravity', model: 'gemini-4-argon-high', fallback: [
-      { provider: 'antigravity', model: 'gemini-3.8-flash-high' },
+      { provider: 'antigravity', model: 'gemini-4-hydrogen-medium' },
       { provider: 'antigravity', model: 'claude-sonnet-4-6' },
       { provider: 'claude', model: 'claude-sonnet-5-5' },
     ] } };
@@ -778,4 +778,46 @@ describe('prepare runner card envelope wiring', () => {
     if (runner === 'codex') expect(read.routing.probationWorker?.provider).toBe('codex');
     else expect(read.routing).toMatchObject({ probationWorker: null, routed: 'claude' });
   });
+});
+
+
+it('readTick carries humanRequired from the loaded card through production routing', () => {
+  const item = { ...ITEM, scope: ['we:docs/guide.md'], size: 1 };
+  expect(runReadTick('build', { item }).routing.probationWorker).not.toBeNull();
+  expect(runReadTick('build', { item: { ...item, humanRequired: true } }).routing)
+    .toMatchObject({ routed: 'claude', probationWorker: null });
+});
+
+
+it.each(['codex', 'claude'])('launches the selected %s policy fallback with its actual model and worker', provider => {
+  const fallback = { provider, model: provider === 'codex' ? PROBATION_WORKERS.codex.model : 'claude-sonnet-5-5', effort: 'high' };
+  const request = {
+    launchKind: 'build', repo: 'we',
+    probationWorker: { ...PROBATION_WORKERS['antigravity-argon'], taskType: 'build-new-feature' },
+    policyRoute: { provider: 'antigravity', model: 'gemini-4-argon-high', fallback: [fallback] },
+  };
+  const launches = [];
+  const launch = actual => {
+    launches.push(actual);
+    return 'selected-fallback';
+  };
+  expect(routeDispatchProvider(request, {
+    probationLaunch: 'on', scriptExists: () => true, registry: {},
+    providerAvailable: candidate => candidate !== 'antigravity',
+    probation: actual => {
+      expect(provider).toBe('codex');
+      expect(actual.probationWorker).toMatchObject({
+        id: 'codex', provider: 'codex', model: fallback.model, effort: fallback.effort, taskType: 'build-new-feature',
+      });
+      return launch(actual);
+    },
+    agent: actual => {
+      expect(provider).toBe('claude');
+      expect(actual.probationWorker).toBeNull();
+      expect(actual.table).toMatchObject({ model: fallback.model, effort: fallback.effort });
+      return launch(actual);
+    },
+  })).toBe('selected-fallback');
+  expect(launches).toHaveLength(1);
+  expect(launches[0].policyRoute).toEqual({ ...fallback, fallback: [] });
 });
