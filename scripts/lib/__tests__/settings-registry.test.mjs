@@ -223,11 +223,13 @@ test('per-key directory reconstructs exactly the original metadata JSON shape an
   assert.deepEqual(readMetadata({ root: f.root }), original);
   assert.deepEqual(f.build(), before);
 });
-test('migration preserves the registry built from the original repository metadata JSON', t => {
+test('migration preserves the original registry plus the intentional shadow rotation description', t => {
   const f = fixture(t);
   rmSync(join(f.root, 'scripts/settings/feature.json'));
   for (const row of buildRegistry().rows) for (const owner of row.owners) f.write(owner, JSON.parse(readFileSync(join(ROOT, owner), 'utf8')));
-  f.write(META, originalMetadata);
+  const expectedMetadata = structuredClone(originalMetadata);
+  expectedMetadata.settings.providerRotation.description = 'Shadow rotation policy, catalog, capacity and reviewer guards; inactive PROV-AB-G1 option A goLive records sticky subjects, 30 runs, 60/10 shares and 24h clean.';
+  f.write(META, expectedMetadata);
   assert.deepEqual(buildRegistry(), buildRegistry({ root: f.root }));
 });
 test('a new metadata key file alone adds a row without editing the base metadata', t => {
@@ -342,10 +344,11 @@ test('malformed names, unexpected entries and unreadable per-key JSON fail close
   assert.throws(() => renderMarkdown(f.build()), /settings-registry-metadata\.d\/settings\/broken.json/);
 });
 
-test('generated documentation preserves original bytes except the intentional per-key authoring instruction', () => {
+test('generated documentation matches the shadow rotation snapshot with per-key authoring instructions', () => {
   const doc = readFileSync(join(ROOT, 'docs/agent/settings-registry.md'), 'utf8');
   const originalInstruction = 'For repo defaults, edit the owner file through a PR and rebuild the consuming daemon. Add or update metadata in scripts/lib/settings-registry-metadata.json, then run `node scripts/lib/settings-registry.mjs --write`. Verify with `node scripts/lib/settings-registry.mjs --check`. Missing declarations or invalid evidence block generation; repair the named file before regenerating.';
   const original = doc.replace(/^For repo defaults,.*$/m, originalInstruction);
-  assert.equal(createHash('sha256').update(original).digest('hex'), '76cf30afed6cf657e1f4f5939437e3b469b4247662d1aee0f4fa26970bd77564');
+  // Reconciled snapshot includes providerRotation defaults and ciUnitRerun.
+  assert.equal(createHash('sha256').update(original).digest('hex'), '433791f37d91bf80092f6bb4b1fb511f7949be9cea712137c1824d66f1d705b3');
   execFileSync(process.execPath, [join(ROOT, 'scripts/lib/settings-registry.mjs'), '--check']);
 });

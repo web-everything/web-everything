@@ -1,8 +1,10 @@
 // @vitest-environment node
 import { expect, it, vi } from 'vitest';
 import { rerunOnce, resolvePolicy } from '../rerun-failed-once.mjs';
-import { mkdtempSync, writeFileSync, rmSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, readFileSync, realpathSync, writeFileSync, rmSync, symlinkSync } from 'node:fs';
 import { join } from 'node:path';
+import { fileURLToPath } from 'node:url';
+import { spawnSync } from 'node:child_process';
 import { readPlatformPreferences } from '../../lib/policy-cascade.mjs';
 
 const policy = { enabled: true, maxFiles: 10, flakeAllowlist: ['a.test.mjs'] };
@@ -22,6 +24,42 @@ const fixture = (overrides = {}) => {
 const record = io => JSON.parse(io.write.mock.calls.find(([file]) => file.includes('flaky-unit'))[1]);
 const resolve = options => resolvePolicy({ tool: policy, platform: {}, log: vi.fn(), ...options });
 const refused = async io => { expect(await rerunOnce(io)).toBe(1); expect(io.run).not.toHaveBeenCalled(); };
+
+it.each(['nocov', 'covered'].flatMap(mode => [false, true].map(unhandled => ({ mode, unhandled }))))(
+  'real retry reporter executes $mode tests (unhandled=$unhandled)', async ({ mode, unhandled }) => {
+    const dir = realpathSync(mkdtempSync(join(process.env.TMPDIR, 'ci-retry-reporter-')));
+    const repo = fileURLToPath(new URL('../../../', import.meta.url));
+    try {
+      mkdirSync(join(dir, 'scripts'), { recursive: true });
+      symlinkSync(join(repo, 'scripts/ci'), join(dir, 'scripts/ci'));
+      symlinkSync(join(repo, 'node_modules'), join(dir, 'node_modules'));
+      writeFileSync(join(dir, 'vitest.config.mjs'), 'export default { test: { environment: "node", poolOptions: { threads: { minThreads: 1, maxThreads: 1 } } } };');
+      writeFileSync(join(dir, 'a.test.mjs'), `import { it } from 'vitest';
+        it('fails', async () => {
+          ${unhandled ? "Promise.reject(new Error('retry unhandled error')); await new Promise(resolve => setTimeout(resolve, 30));" : ''}
+        });`);
+      let json;
+      const io = fixture({ mode, root: dir,
+        // Vitest 1 includes the unnamed root suite in JSON assertion fullName.
+        read: file => file.includes('first-run') ? identity : file.includes('timing')
+          ? report().replace('"fullName":"fails"', '"fullName":" fails"') : json,
+        run: vi.fn(args => {
+          expect(args[1]).toBe(mode === 'covered' ? 'test:coverage:shard' : 'test:unit');
+          const result = spawnSync(process.execPath, [join(repo, 'node_modules/vitest/vitest.mjs'), 'run',
+            ...(mode === 'covered' ? ['--coverage'] : []), ...args.slice(3)],
+          { cwd: dir, env: process.env, encoding: 'utf8', timeout: 30000, maxBuffer: 1024 * 1024 });
+          expect(result.error).toBeUndefined();
+          expect(result.status, result.stderr).toBe(unhandled ? 1 : 0);
+          json = readFileSync(join(dir, 'coverage/rerun-unit-2.json'), 'utf8');
+          return result;
+        }),
+      });
+      expect(await rerunOnce(io), io.error.mock.calls.flat().join('\n')).toBe(unhandled ? 1 : 0);
+      expect(io.run).toHaveBeenCalledTimes(1);
+      expect(JSON.parse(json).numUnhandledErrors).toBe(unhandled ? 1 : 0);
+      expect(record(io).files[0].rerun).toBe(unhandled ? 'failed' : 'passed');
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  }, 45000);
 
 it('a real failure stays red after one retry', async () => {
   const io = fixture({ read: file => file.includes('first-run') ? identity : report(), run: vi.fn(() => ({ status: 1 })) });
