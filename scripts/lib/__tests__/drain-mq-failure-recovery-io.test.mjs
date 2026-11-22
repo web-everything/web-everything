@@ -60,7 +60,8 @@ function fixture(mode = 'real') {
       if (!args.includes('--allow-escape-sequences')) throw new Error('gh: log contains ANSI escape sequences');
       if (mode === '404 log') throw new Error('HTTP 404: Not Found');
       if (mode === 'expired log') throw new Error('410 expired');
-      if (mode === 'OSC') return `\x1b]0;title\x07\n${failureLog}\x1b[2K`;
+      if (mode === 'OSC') return `${failureLog}\n\x1b]0;Errors 1 error\x07`;
+      if (mode === 'ESC[Errors') return `${failureLog}\n\x1b[Errors 1 error`;
       if (mode === 'ANSI') return `\x1b[31m${failureLog}\x1b[0m`;
       return mode === 'infra' ? 'The runner has lost communication with the server.'
         : mode === 'incomplete test paths' ? `${failureLog}\nFAIL unidentified failing test\nAssertionError: expected false`
@@ -83,7 +84,7 @@ describe('drain MQ failure production adapter', () => {
       .toContain('--allow-escape-sequences');
   });
 
-  it.each(['ANSI', 'OSC'])('job log with %s escapes is read and classified, not unreadable', async mode => {
+  it.each(['ANSI'])('job log with %s escapes is read and classified, not unreadable', async mode => {
     const f = fixture(mode);
     const evidence = await f.options.io.collectEvidence({ removal: {
       ...identity, mergeGroupHead: mergeHead, branch,
@@ -91,6 +92,16 @@ describe('drain MQ failure production adapter', () => {
     expect(evidence.complete).toBe(true);
     expect(classifyMqFailureEvidence(evidence)).toBe('real');
     expect(await routeMqFailureOnHold(f.options)).toMatchObject({ routed: true });
+  });
+
+  it.each(['OSC', 'ESC[Errors'])('readJobLog with %s error evidence stays incomplete and retains the hold', async mode => {
+    const f = fixture(mode);
+    const evidence = await f.options.io.collectEvidence({ removal: {
+      ...identity, mergeGroupHead: mergeHead, branch,
+    } });
+    expect(evidence.complete).toBe(false);
+    expect(await routeMqFailureOnHold(f.options)).toMatchObject({ routed: false });
+    expect(f.writes()).toEqual([]);
   });
 
   it('real failure derives the timeline removal and emits comment plus label once per head', async () => {

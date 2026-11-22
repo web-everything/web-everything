@@ -278,7 +278,7 @@ describe('merge-queue same-head retry for quarantined failures', () => {
     expect(reads.every(([, args]) => args.includes('--allow-escape-sequences'))).toBe(true);
   }));
 
-  it.each(['\x1b[2K', '\x1b[K'])
+  it.each(['\x1b[2K', '\x1b[K', '\x1b '])
     ('holds quarantined failures with an escape-prefixed unhandled-error summary (%j)', prefix => fixture(f => {
       f.logs[31] += `${prefix}Errors 1 error\n`;
       expect(f.guard().hold).toBe(true);
@@ -672,6 +672,11 @@ describe('merge-queue exact-test extra retry after two failed_checks removals', 
       expect(declined(f)).toHaveLength(1);
     }));
 
+  it('holds exact-test retry with ESC[Errors after the four-line summary', () => exactFixture(f => {
+    f.logs[31] += '2026-11-16T07:54:50.5192657Z \x1b[Errors 1 error\n';
+    expectExactHold(f);
+  }));
+
   it.each([
     ['OSC opener and BEL', '\x1b]0;Errors 1 error\x07'],
     ['ESC and space', '\x1b Errors 1 error'],
@@ -991,6 +996,24 @@ describe('merge-queue exact-test extra retry after two failed_checks removals', 
     expect(f.guard().hold).toBe(true);
     expect(declined(f)).toHaveLength(1);
   }));
+
+  it('holds a plain main-freeze row alongside an escape-prefixed red-team hold', () => exactFixture(f => {
+    f.mqChecks = [check(36, 'merge-gate', 800, 'failure')];
+    f.logs[36] = '2026-11-07T23:00:00Z hold  red-main-freeze  main is RED (freeze: fixture)\n'
+      + '\x1b2026-11-07T23:00:00Z hold  red-team  review required\n';
+    f.artifacts = {}; f.reports = {};
+    expect(f.guard().hold).toBe(true);
+    expect(declined(f)).toHaveLength(1);
+  }));
+
+  it.each(['FA\x1bIL scripts/x.test.mjs > broken case', '\x1b]0;Errors 1 error\x07'])
+    ('holds promisor-fetch infrastructure with escaped failure evidence (%j)', failure => exactFixture(f => {
+      f.mqChecks = [check(31, 'test-shard (1)', 800, 'failure')];
+      f.logs[31] = `${failure}\nfatal: could not fetch abc123 from promisor remote\n`;
+      f.artifacts = {}; f.reports = {};
+      expect(f.guard().hold).toBe(true);
+      expect(declined(f)).toHaveLength(1);
+    }));
 
   it.each([' FAIL  scripts/x.test.mjs > broken case', 'AssertionError: expected true to be false'])
     ('holds mixed ANSI infrastructure and real test failure: %s', failure => exactFixture(f => {

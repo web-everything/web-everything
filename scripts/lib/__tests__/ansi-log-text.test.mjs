@@ -15,27 +15,30 @@ describe('CSI-only log evidence normalization', () => {
     ['stray ESC', '\x1bErrors'],
     ['ESC and space', '\x1b Errors'],
     ['two-character escape', '\x1bMErrors'],
-    ['8-bit CSI and OSC', '\x9b31mErrors\x9d0;1 error\x9c'],
     ['incomplete CSI', '\x1b[31'],
-  ])('preserves %s unchanged', (_name, text) => {
-    expect(stripAnsiLogText(text)).toBe(text);
+  ])('rejects %s as unreadable', (_name, text) => {
+    expect(() => stripAnsiLogText(text)).toThrow('log contains non-CSI escape bytes');
   });
 
-  it('consumes only the valid CSI final byte in ESC[Errors', () => {
-    expect(stripAnsiLogText('\x1b[Errors')).toBe('rrors');
+  it('rejects ambiguous ESC[Errors instead of erasing the error marker', () => {
+    expect(() => stripAnsiLogText('\x1b[Errors 1 error')).toThrow('log contains non-CSI escape bytes');
+  });
+
+  it('preserves 8-bit controls without ESC bytes', () => {
+    const text = '\x9b31mErrors\x9d0;1 error\x9c';
+    expect(stripAnsiLogText(text)).toBe(text);
   });
 
   it('never joins CSI fragments across LF or CRLF boundaries', () => {
     const text = '\x1b[31\nmErrors\r\n\x1b[\r\nErrors\n';
-    expect(stripAnsiLogText(text)).toBe(text);
+    expect(() => stripAnsiLogText(text)).toThrow('log contains non-CSI escape bytes');
   });
 
   it('normalizes 80 KiB of repeated OSC openers within a loose linear-time budget', () => {
     const text = '\x1b]'.repeat(40 * 1024) + 'Errors 1 error';
     const started = performance.now();
-    const result = stripAnsiLogText(text);
+    expect(() => stripAnsiLogText(text)).toThrow('log contains non-CSI escape bytes');
     const elapsed = performance.now() - started;
-    expect(result).toBe(text);
     expect(elapsed).toBeLessThan(1000);
   });
 });
