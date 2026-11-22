@@ -1,3 +1,4 @@
+// @repo-scanning-test scope=full — checks guide anchors against callers and the complete topic inventory.
 import { describe, it, expect } from 'vitest';
 import { readFileSync, readdirSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
