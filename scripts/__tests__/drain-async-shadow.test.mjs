@@ -106,7 +106,7 @@ describe('async drain shadow measurement', () => {
     expect(shadow.emitSummary().readyNotReached).toBe(1);
   });
 
-  it.each([undefined, 'off', 'live', 'typo'])('is off by default, for explicit off, and for unknown modes (%s)', mode => {
+  it.each(['off', 'live', 'typo'])('is off for explicit off and for unknown explicit modes (%s); default is shadow, see mode resolution', mode => {
     const dir = join(temp(), 'disabled');
     const shadow = createAsyncShadow({ env: {}, mode, dir });
     shadow.observePass({ candidates: [candidate] });
@@ -245,5 +245,60 @@ describe('async drain shadow measurement', () => {
     shadow.observePass({ candidates: [] });
     expect(lines(join(dir, 'shadow.jsonl'))[0].readyAt).toBe(100);
     expect(lines(join(dir, 'summary.jsonl'))).toHaveLength(1);
+  });
+});
+
+describe('drain async shadow mode resolution', () => {
+  const observe = shadow => { shadow.observePass({ candidates: [candidate] }); shadow.recordActual(candidate); };
+  const rowsAt = root => join(root, 'drain-async-shadow', 'shadow.jsonl');
+
+  it('createAsyncShadow with WE_ASYNC_DRAIN unset records rows (shadow is the default)', () => {
+    const root = temp();
+    observe(createAsyncShadow({ env: { WE_COORDINATION_ROOT: root }, now: () => 100 }));
+    expect(lines(rowsAt(root))).toHaveLength(1);
+  });
+
+  it('the repo tool-layer setting drain.asyncShadow is shadow, never a plist env', () => {
+    const file = JSON.parse(readFileSync(join(process.cwd(), 'scripts', 'settings', 'drain-async-shadow.json'), 'utf8'));
+    expect(file.drain.asyncShadow).toBe('shadow');
+  });
+
+  it('explicit off (env or option) is the opt-out and writes nothing', () => {
+    for (const make of [root => createAsyncShadow({ env: { WE_ASYNC_DRAIN: 'off', WE_COORDINATION_ROOT: root } }),
+      root => createAsyncShadow({ mode: 'off', env: { WE_COORDINATION_ROOT: root } })]) {
+      const root = temp();
+      observe(make(root));
+      expect(existsSync(join(root, 'drain-async-shadow'))).toBe(false);
+    }
+  });
+
+  it('an unknown value or an invalid tool setting never enables more than shadow and falls back safely', () => {
+    const root = temp();
+    observe(createAsyncShadow({ env: { WE_ASYNC_DRAIN: 'enqueue', WE_COORDINATION_ROOT: root }, toolMode: 'bogus' }));
+    expect(existsSync(join(root, 'drain-async-shadow'))).toBe(false);
+  });
+
+  it('an invalid WE_ASYNC_DRAIN value disables observation even when the tool setting is shadow', () => {
+    const root = temp();
+    observe(createAsyncShadow({ env: { WE_ASYNC_DRAIN: 'typo', WE_COORDINATION_ROOT: root }, toolMode: 'shadow' }));
+    expect(existsSync(join(root, 'drain-async-shadow'))).toBe(false);
+  });
+
+  it('the tool setting off disables observation when no env or option is given', () => {
+    const root = temp();
+    observe(createAsyncShadow({ env: { WE_COORDINATION_ROOT: root }, toolMode: 'off' }));
+    expect(existsSync(join(root, 'drain-async-shadow'))).toBe(false);
+  });
+
+  it('observation never mutates its inputs or returns a decision, on, off or with a throwing directory', () => {
+    const input = { candidates: [structuredClone(candidate)], enqueuedKeys: new Set() };
+    const before = structuredClone(input);
+    for (const mk of [() => createAsyncShadow({ env: { WE_COORDINATION_ROOT: temp() } }), () => createAsyncShadow({ mode: 'off' }),
+      () => createAsyncShadow({ mode: 'shadow', dir: '/dev/null/x' })]) {
+      const shadow = mk();
+      expect(shadow.observePass(input)).toBeUndefined();
+      expect(shadow.recordActual(input.candidates[0])).toBeUndefined();
+      expect(input).toEqual(before);
+    }
   });
 });
