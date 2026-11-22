@@ -54,9 +54,9 @@ import { OPERATOR_LOGINS } from './marker-authorship.mjs';
 export const WE_DAEMON_OVERLAY_DIR_ENV = 'WE_DAEMON_OVERLAY_DIR';
 
 /** Default overlay state root when the env override is unset. */
-function overlayDir(env = process.env) {
+export function overlayDir(env = process.env) {
   const fromEnv = typeof env?.[WE_DAEMON_OVERLAY_DIR_ENV] === 'string' ? env[WE_DAEMON_OVERLAY_DIR_ENV].trim() : '';
-  return fromEnv || join(homedir(), '.claude', 'daemon-overlays');
+  return fromEnv || join(env.HOME || homedir(), '.claude', 'daemon-overlays');
 }
 
 /** Resolve symlinks before mapping version folders back to their logical clone identity. */
@@ -95,12 +95,11 @@ function eventsFilePath(root, env = process.env) {
  * (`corrupt:false`); an unparsable file or one that is not `{overlays: [...]}`-shaped is `corrupt:true`, also
  * with an empty list — a caller decides whether/how to alert, this function only fails closed.
  * @param {string} root
- * @param {{env?:NodeJS.ProcessEnv}} [o]
+ * @param {{env?:NodeJS.ProcessEnv, file?:string}} [o] Optional exact state filename for read-only inventory.
  * @returns {{clone:string|null, overlays:Array<object>, corrupt:boolean}}
  */
-export function readOverlayState(root, { env = process.env } = {}) {
+export function readOverlayState(root, { env = process.env, file = overlayFilePath(root, env) } = {}) {
   if (rebuildReaders()) return rebuildReaders().overlays(root, env);
-  const file = overlayFilePath(root, env);
   let raw;
   try {
     raw = readFileSync(file, 'utf8');
@@ -259,7 +258,7 @@ export function registrationIdentity(entry) {
 }
 
 export function addOverlay(root, {
-  ref, pr = null, addedBy = null, reason = null, now, pinned, stackBases, conflictOverride,
+  ref, pr = null, addedBy = null, reason = null, now, pinned, stackBases, conflictOverride, sha,
 } = {}, { env = process.env, expectedOverlay } = {}) {
   if (!isSafeBranchName(ref)) {
     throw new TypeError(`daemon-overlays: ref ${JSON.stringify(ref)} is not a safe branch name — refusing to add it`);
@@ -276,12 +275,14 @@ export function addOverlay(root, {
     if (idx === -1) {
       list.push({
         ref, pr: pr ?? null, addedAt: now || new Date().toISOString(), addedBy: addedBy ?? null, reason: reason ?? null,
+        ...(sha ? { sha } : {}),
         ...(pinned === true ? { pinned: true } : {}),
         ...(bases ? { stackBases: bases } : {}),
         ...(conflictOverride ? { conflictOverride } : {}),
       });
     } else {
       const next = { ...list[idx], pr: pr ?? null, reason: reason ?? null };
+      if (sha) next.sha = sha;
       if (pinned === true) next.pinned = true;
       else if (pinned === false) delete next.pinned;
       if (bases) next.stackBases = bases;

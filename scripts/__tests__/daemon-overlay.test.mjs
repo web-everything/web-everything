@@ -74,7 +74,7 @@ function makeFixture() {
   gitOk(cloneDir, ['push', '-q', '-u', 'origin', 'main']);
   gitOk(cloneDir, ['fetch', '-q', 'origin']);
   const overlayDir = mktemp('we-overlay-cli-state-');
-  const env = { ...process.env, WE_DAEMON_OVERLAY_DIR: overlayDir, WE_DAEMON_OVERLAY_STACK_BASES: '{}' };
+  const env = { ...process.env, WE_OVERLAY_AUDIT_EVIDENCE: 'off', WE_DAEMON_OVERLAY_DIR: overlayDir, WE_DAEMON_OVERLAY_STACK_BASES: '{}' };
   return { originDir, cloneDir, overlayDir, env };
 }
 
@@ -295,7 +295,7 @@ describe('daemon-overlay.mjs add — the overlay-conflict guard', () => {
 
     const r = runCli(['add', `--clone=${cloneDir}`, '--ref=lane/other', '--pr=5'], env);
     expect(r.status).toBe(0);
-    expect(r.stderr).toBe('');
+    expect(r.stderr).toBe('daemon-overlay: overlaySafety.auditEvidence=off (env)\n');
 
     const state = overlayStateFile(overlayDir, cloneDir);
     expect(state.overlays.map((o) => o.ref).sort()).toEqual(['lane/fix-procedure', 'lane/other']);
@@ -413,7 +413,7 @@ function deadPid() {
 
 function lockFixture(waitMs) {
   const overlayDir = mktemp('we-overlay-lock-');
-  const env = { ...process.env, WE_DAEMON_OVERLAY_DIR: overlayDir, WE_DAEMON_OVERLAY_STACK_BASES: '{}' };
+  const env = { ...process.env, WE_OVERLAY_AUDIT_EVIDENCE: 'off', WE_DAEMON_OVERLAY_DIR: overlayDir, WE_DAEMON_OVERLAY_STACK_BASES: '{}' };
   if (waitMs) env.WE_DAEMON_OVERLAY_ADD_GUARD_WAIT_MS = String(waitMs);
   const root = mktemp('we-overlay-lock-root-');
   const lockDir = `${overlayFilePath(root, env)}.add-guard.lock`;
@@ -727,4 +727,33 @@ describe('findStackBases', () => {
       expect(opts).toMatchObject({ cwd: '/clone', env: { GIT_OPTIONAL_LOCKS: '0' } });
     }
   });
+});
+
+// Audit admission is exercised through the real CLI and its add-guard lock.
+it('add refuses missing canonical audit even with prototype marker and leaves no registration', () => {
+  const f = makeFixture();
+  pushBranch(f.originDir, 'lane/unaudited', dir => writeFile(dir, 'audit-case', 'candidate'));
+  const env = { ...f.env, HOME: f.overlayDir, WE_OVERLAY_AUDIT_EVIDENCE: 'refuse' };
+  const result = runCli(['add', `--clone=${f.cloneDir}`, '--ref=lane/unaudited', '--pr=7', '--audit-checked-by=prototype-load'], env);
+  expect(result.status, result.stderr).toBe(3);
+  expect(result.stderr).toContain('no NOT WEAKENED canonical audit record and no waiver in ruled-weakened.jsonl');
+  expect(existsSync(overlayFilePath(f.cloneDir, env))).toBe(false);
+});
+
+it('add override records the actual guarded SHA and operator reason', () => {
+  const f = makeFixture();
+  pushBranch(f.originDir, 'lane/override', dir => writeFile(dir, 'audit-case', 'candidate'));
+  const env = { ...f.env, HOME: f.overlayDir, WE_OVERLAY_AUDIT_EVIDENCE: 'refuse' };
+  const args = ['add', `--clone=${f.cloneDir}`, '--ref=lane/override', '--pr=7'];
+  expect(runCli([...args, '--unaudited-reason=short'], env).status).toBe(3);
+  const result = runCli([...args, '--unaudited-reason=operator emergency approval', '--audit-checked-by=prototype-load'], env);
+  expect(result.status, result.stderr).toBe(0);
+  expect(result.stderr).toContain('WARNING');
+  const state = JSON.parse(readFileSync(overlayFilePath(f.cloneDir, env), 'utf8'));
+  const sha = gitOk(f.originDir, ['rev-parse', 'refs/heads/lane/override']).trim();
+  expect(state.overlays[0].sha).toBe(sha);
+  const eventsFile = readdirSync(f.overlayDir).find(name => name.endsWith('.events.jsonl'));
+  const events = readFileSync(join(f.overlayDir, eventsFile), 'utf8').trim().split('\n').map(JSON.parse);
+  expect(events).toContainEqual(expect.objectContaining({ kind: 'unaudited-override', ref: 'lane/override', sha, reason: 'operator emergency approval' }));
+  expect(events.at(-1)).toMatchObject({ kind: 'added', auditCheckedBy: 'prototype-load' });
 });

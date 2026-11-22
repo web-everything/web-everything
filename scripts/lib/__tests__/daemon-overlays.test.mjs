@@ -237,7 +237,7 @@ describe('CLI (spawnSync, --no-lock — never imports daemon-clone-lock.mjs)', (
   function run(args) {
     return spawnSync(process.execPath, [CLI_PATH, ...args], {
       encoding: 'utf8',
-      env: { ...process.env, WE_DAEMON_OVERLAY_DIR: overlayDir, WE_DAEMON_OVERLAY_STACK_BASES: '{}' },
+      env: { ...process.env, WE_OVERLAY_AUDIT_EVIDENCE: 'off', WE_DAEMON_OVERLAY_DIR: overlayDir, WE_DAEMON_OVERLAY_STACK_BASES: '{}' },
       timeout: 20_000,
     });
   }
@@ -248,7 +248,7 @@ describe('CLI (spawnSync, --no-lock — never imports daemon-clone-lock.mjs)', (
     const r = run(['add', `--clone=${cloneDir}`, '--ref=lane/cli-test', '--pr=7', '--by=tester', '--no-lock', '--json']);
     expect(r.status, r.stderr).toBe(0);
     const out = JSON.parse(r.stdout);
-    expect(out.list).toEqual([{ ref: 'lane/cli-test', pr: 7, addedAt: expect.any(String), addedBy: 'tester', reason: null }]);
+    expect(out.list).toEqual([{ ref: 'lane/cli-test', sha: gitOk(originDir, ['rev-parse', 'refs/heads/lane/cli-test']).trim(), pr: 7, addedAt: expect.any(String), addedBy: 'tester', reason: null }]);
     const events = readFileSync(join(overlayDir, `${cloneKey(cloneDir)}.events.jsonl`), 'utf8').trim().split('\n').map((l) => JSON.parse(l));
     expect(events).toHaveLength(1);
     expect(events[0]).toMatchObject({ kind: 'added', ref: 'lane/cli-test', pr: 7 });
@@ -339,7 +339,7 @@ describe('register-only: never contends for the clone write lock (#4229/#2760 fo
           CLI_PATH, 'add', `--clone=${cloneDir}`, '--ref=lane/4229-pr-2760', '--pr=2760', '--json',
         ], {
           encoding: 'utf8',
-          env: { ...process.env, WE_DAEMON_OVERLAY_DIR: overlayDir, WE_DAEMON_CLONE_LOCK_ROOT: lockRoot, WE_DAEMON_OVERLAY_STACK_BASES: '{}' },
+          env: { ...process.env, WE_OVERLAY_AUDIT_EVIDENCE: 'off', WE_DAEMON_OVERLAY_DIR: overlayDir, WE_DAEMON_CLONE_LOCK_ROOT: lockRoot, WE_DAEMON_OVERLAY_STACK_BASES: '{}' },
           timeout: 20_000,
         });
         const elapsed = Date.now() - startedAt;
@@ -375,7 +375,7 @@ describe('pinned overlays (self-destruct guard, 2026-09-25)', () => {
     const { originDir, cloneDir } = makeGitClone();
     pushRef(originDir, 'lane/mech');
     const r = spawnSync(process.execPath, [CLI_PATH, 'add', `--clone=${cloneDir}`, '--ref=lane/mech', '--pinned', '--no-lock', '--json'], {
-      encoding: 'utf8', env: { ...process.env, WE_DAEMON_OVERLAY_DIR: overlayDir, WE_DAEMON_OVERLAY_STACK_BASES: '{}' },
+      encoding: 'utf8', env: { ...process.env, WE_OVERLAY_AUDIT_EVIDENCE: 'off', WE_DAEMON_OVERLAY_DIR: overlayDir, WE_DAEMON_OVERLAY_STACK_BASES: '{}' },
     });
     expect(r.status, r.stderr).toBe(0);
     expect(JSON.parse(r.stdout).list[0]).toMatchObject({ ref: 'lane/mech', pinned: true });
