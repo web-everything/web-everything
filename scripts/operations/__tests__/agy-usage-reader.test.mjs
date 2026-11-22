@@ -359,18 +359,19 @@ describe('snapshot persistence', () => {
     expect(pty.kill).toHaveBeenCalledWith(1235, 'SIGKILL');
   });
   it('throttles a recent signed-out record without treating it as usage', async () => {
-    const h = fileFixture(JSON.stringify({ at: new Date(NOW - 899999).toISOString(), status: 'signed-out' }));
+    const h = fileFixture(JSON.stringify({ at: new Date(NOW - 839999).toISOString(), status: 'signed-out' }));
     expect(await runAgyUsageReader(h)).toEqual({ skipped: true });
     expect(h.collect).not.toHaveBeenCalled();
     expect(h.io.writeFile).not.toHaveBeenCalled();
   });
-  it.each([NOW - 900000, NOW + 1, 'invalid'])('retries signed-out records with expired or invalid timestamps: %s', async at => {
+  // The throttle boundary is the 15-minute interval minus the one-minute tick slack (THROTTLE_SLACK_MS).
+  it.each([NOW - 840000, NOW + 1, 'invalid'])('retries signed-out records with expired or invalid timestamps: %s', async at => {
     const h = fileFixture(JSON.stringify({ at: typeof at === 'number' ? new Date(at).toISOString() : at, status: 'signed-out' }));
     await runAgyUsageReader(h);
     expect(h.collect).toHaveBeenCalledOnce();
   });
-  it('skips a snapshot younger than fifteen minutes without spawning or writing', async () => {
-    const h = fileFixture(JSON.stringify(complete(NOW - 899999)));
+  it('skips a snapshot younger than fifteen minutes less the tick slack without spawning or writing', async () => {
+    const h = fileFixture(JSON.stringify(complete(NOW - 839999)));
     expect(await runAgyUsageReader(h)).toEqual({ skipped: true });
     expect(h.collect).not.toHaveBeenCalled();
     expect(h.io.writeFile).not.toHaveBeenCalled();
@@ -387,7 +388,7 @@ describe('snapshot persistence', () => {
     await runAgyUsageReader(h);
     expect(h.collect).toHaveBeenCalled();
   });
-  it.each([undefined, JSON.stringify(complete(NOW - 900000))])(
+  it.each([undefined, JSON.stringify(complete(NOW - 840000))])(
     'collects missing or expired snapshots, writes private temp file then atomically renames', async previous => {
       const h = fileFixture(previous);
       await runAgyUsageReader(h);
@@ -410,6 +411,43 @@ describe('snapshot persistence', () => {
     const h = fileFixture(previous);
     await expect(runAgyUsageReader(h)).rejects.toThrow();
     expect(h.collect).not.toHaveBeenCalled();
+  });
+  it('does not let the collection time push the next half-hour launchd tick into the throttle window', async () => {
+    // Judge repro (PR 7331): collection starts 12:00:00 and finishes 12:00:03.3; the 30-min tick must run.
+    const store = new Map();
+    const io = { readFile: vi.fn(async path => {
+      if (!store.has(path)) throw Object.assign(new Error('missing'), { code: 'ENOENT' });
+      return store.get(path);
+    }), mkdir: vi.fn(), writeFile: vi.fn(async (path, data) => { store.set(path, data); }),
+    rename: vi.fn(async (from, to) => { store.set(to, store.get(from)); store.delete(from); }), unlink: vi.fn(async () => {}) };
+    let clock = NOW;
+    const collect = vi.fn(async ({ now }) => { clock += 3300; return parseAgyUsage(SCREEN, now()); });
+    const run = at => { clock = at; return runAgyUsageReader({ io, collect, home: '/h', now: () => clock,
+      settings: { minIntervalMinutes: 30, timeoutMs: 45000 } }); };
+    await run(NOW);
+    expect(collect).toHaveBeenCalledTimes(1);
+    expect(await run(NOW + 15 * 60000)).toEqual({ skipped: true });
+    expect(collect).toHaveBeenCalledTimes(1);
+    await run(NOW + 30 * 60000);
+    expect(collect).toHaveBeenCalledTimes(2);
+    // A tick firing slightly early (process start jitter) still collects.
+    await run(NOW + 60 * 60000 - 500);
+    expect(collect).toHaveBeenCalledTimes(3);
+  });
+  it('lets a record stamped at collection END (pre-fix snapshot) still pass the next tick', async () => {
+    const h = fileFixture(JSON.stringify(complete(NOW - 30 * 60000 + 3300)));
+    h.settings = { minIntervalMinutes: 30, timeoutMs: 45000 };
+    await runAgyUsageReader(h);
+    expect(h.collect).toHaveBeenCalledOnce();
+  });
+  it('stamps the written snapshot with the collection START time', async () => {
+    const h = fileFixture();
+    let clock = NOW;
+    h.now = () => clock;
+    h.collect.mockImplementation(async ({ now }) => { clock += 3300; return parseAgyUsage(SCREEN, now()); });
+    const result = await runAgyUsageReader(h);
+    expect(result.at).toBe(new Date(NOW).toISOString());
+    expect(JSON.parse(h.io.writeFile.mock.calls[0][1]).at).toBe(new Date(NOW).toISOString());
   });
   it('cleans up a temporary file after rename failure without replacing the snapshot', async () => {
     const h = fileFixture();

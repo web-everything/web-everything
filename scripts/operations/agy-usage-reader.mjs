@@ -148,6 +148,12 @@ export function collectAgyUsage({ home = homedir(), timeoutMs = 45000, spawnFn =
   });
 }
 
+/**
+ * Tick slack for the throttle. A scheduler tick exactly one interval after the last run must collect, even when
+ * process start-up jitter makes it fire a little early or the previous record was stamped at collection end.
+ */
+export const THROTTLE_SLACK_MS = 60000;
+
 export async function runAgyUsageReader({ home = homedir(), io = fs, now = Date.now,
   settings = readAgyUsageSettings(), collect = collectAgyUsage } = {}) {
   const target = join(home, '.plateau', 'agy-usage.json');
@@ -159,9 +165,11 @@ export async function runAgyUsageReader({ home = homedir(), io = fs, now = Date.
     // A recent signed-out result also throttles retries, without claiming any quota evidence.
     if (Number.isFinite(at) && at <= now()
       && (previous.status === 'signed-out' || (valid(previous.five_hour) && valid(previous.seven_day)))
-      && now() - at < settings.minIntervalMinutes * 60000) return { skipped: true };
+      && now() - at < settings.minIntervalMinutes * 60000 - THROTTLE_SLACK_MS) return { skipped: true };
   } catch (error) { if (error.code !== 'ENOENT') throw error; }
-  const result = await collect({ home, timeoutMs: settings.timeoutMs, now });
+  // Stamp the record at collection START, so the time collection takes never shifts the next throttle window.
+  const startedAt = now();
+  const result = { ...await collect({ home, timeoutMs: settings.timeoutMs, now }), at: new Date(startedAt).toISOString() };
   await io.mkdir(join(home, '.plateau'), { recursive: true });
   const temporary = `${target}.${process.pid}.${randomUUID()}.tmp`;
   try {

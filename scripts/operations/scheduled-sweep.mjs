@@ -161,6 +161,9 @@ ${env.DEVELOPER_DIR ? `\t\t<key>DEVELOPER_DIR</key><string>${esc(env.DEVELOPER_D
 `;
 }
 
+/** One value feeds both the launchd StartInterval and the reader's throttle, so the two cannot drift apart. */
+export const AGY_USAGE_INTERVAL_MINUTES = 30;
+
 export function buildAgyUsagePlist({ repoRoot, nodePath, home }) {
   const log = `${home}/workspace/.operations/logs/agy-usage-reader.log`;
   return `<?xml version="1.0" encoding="UTF-8"?>
@@ -175,12 +178,12 @@ export function buildAgyUsagePlist({ repoRoot, nodePath, home }) {
 \t</array>
 \t<key>WorkingDirectory</key><string>${esc(repoRoot)}</string>
 \t<key>RunAtLoad</key><true/>
-\t<key>StartInterval</key><integer>1800</integer>
+\t<key>StartInterval</key><integer>${AGY_USAGE_INTERVAL_MINUTES * 60}</integer>
 \t<key>StandardOutPath</key><string>${esc(log)}</string>
 \t<key>StandardErrorPath</key><string>${esc(log)}</string>
 \t<key>EnvironmentVariables</key>
 \t<dict>
-\t\t<key>WE_AGY_USAGE_MIN_INTERVAL_MINUTES</key><string>30</string>
+\t\t<key>WE_AGY_USAGE_MIN_INTERVAL_MINUTES</key><string>${AGY_USAGE_INTERVAL_MINUTES}</string>
 \t\t<key>PATH</key><string>${esc(dirname(nodePath))}:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
 \t</dict>
 </dict>
