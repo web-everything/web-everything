@@ -3,7 +3,7 @@ import { describe, it, expect } from 'vitest';
 import { readFileSync } from 'node:fs';
 import {
   isDraftOwedPromotion, isPromotionCandidate, promotionStepDue, resolveDraftPromotionSettings,
-  DRAFT_PROMOTION_ENV, WITHDRAWN_LABEL,
+  DRAFT_PROMOTION_ENV, WITHDRAWN_LABEL, isOperatorParked, OPERATOR_PARK_MARKER, OPERATOR_PARK_RELEASE_MARKER,
 } from '../draft-promotion-rule.mjs';
 import { runDraftPromotionStep, runDraftPromotionIfDue, formatDraftPromotionLines, defaultReadPrView, DRAFT_LIST_FIELDS, PR_VIEW_FIELDS } from '../draft-promotion-loop.mjs';
 import { planReconcile } from '../reconcile-core.mjs';
@@ -24,7 +24,34 @@ const viewOf = (d, over = {}) => ({
   statusCheckRollup: [{ name: 'test', status: 'completed', conclusion: 'success' }], ...over,
 });
 
+const T = { author: { login: 'web-everything' } };
 describe('isDraftOwedPromotion', () => {
+  it('isDraftOwedPromotion refuses a lane draft carrying the operator-park marker (converted to draft after open, no withdrawn label)', () => {
+    const pr = draft({ comments: [{ ...T, body: `${OPERATOR_PARK_MARKER}\nConverted to draft after open.` }] });
+    expect(isDraftOwedPromotion({ pr, checks: green })).toMatchObject({ owed: false, reason: 'operator-parked' });
+  });
+  it('owes promotion after a later release marker, ignoring subsequent ordinary comments', () => {
+    const pr = draft({ comments: [
+      { ...T, body: OPERATOR_PARK_MARKER }, { ...T, body: OPERATOR_PARK_RELEASE_MARKER }, { ...T, body: 'Ready now.' },
+    ] });
+    expect(isDraftOwedPromotion({ pr, checks: green }).owed).toBe(true);
+  });
+  it.each(['Please park this later.', `Mention ${OPERATOR_PARK_MARKER}`, `Note\n${OPERATOR_PARK_MARKER}`, `${OPERATOR_PARK_MARKER} extra`])(
+    'still owes promotion when prose mentions park without an exact first-line marker: %s', body => {
+      expect(isDraftOwedPromotion({ pr: draft({ comments: [{ ...T, body }] }), checks: green }).owed).toBe(true);
+    },
+  );
+  it('uses trimmed first lines and preserves a later park through prose and inexact releases', () => {
+    expect(isOperatorParked([
+      { ...T, body: OPERATOR_PARK_RELEASE_MARKER }, { ...T, body: `  ${OPERATOR_PARK_MARKER}  \r\nHold.` },
+      { ...T, body: 'ordinary comment' }, { ...T, body: `Note\n${OPERATOR_PARK_RELEASE_MARKER}` },
+      { ...T, body: `${OPERATOR_PARK_RELEASE_MARKER} extra` },
+    ])).toBe(true);
+    // an untrusted account can neither park nor release
+    expect(isOperatorParked([{ author: { login: 'rando' }, body: OPERATOR_PARK_MARKER }])).toBe(false);
+    expect(isOperatorParked([{ ...T, body: OPERATOR_PARK_MARKER }, { author: { login: 'rando' }, body: OPERATOR_PARK_RELEASE_MARKER }])).toBe(true);
+    expect(isOperatorParked(undefined)).toBe(false);
+  });
   it.each([
     [{ mergeable: 'MERGEABLE' }, 'awaiting-ci-trigger'],
     [{ mergeable: 'CONFLICTING' }, 'ci-blocked-by-conflict'],
@@ -157,6 +184,13 @@ describe('replay: #4567/#4563/#4535 green drafts left unpromoted (2026-10-09)', 
   it('a withdrawal that lands after the list read refuses the write', () => {
     const { readied } = run({ readPrView: ({ prNumber }) => viewOf(fixture.drafts.find((d) => d.number === prNumber), { labels: [{ name: WITHDRAWN_LABEL }] }) });
     expect(readied).toEqual([]);
+  });
+  it('an operator park after the list read refuses the write using fresh comments', () => {
+    const { readied, result } = run({ readPrView: ({ prNumber }) => viewOf(fixture.drafts.find(d => d.number === prNumber), {
+      comments: [{ ...T, body: OPERATOR_PARK_MARKER }],
+    }) });
+    expect(readied).toEqual([]);
+    expect(result.rows.every(r => r.action === 'skip' && r.reason === 'operator-parked')).toBe(true);
   });
   it('a failed read or write is a row, never a throw', () => {
     const { result } = run({ ready: () => { throw new Error('boom'); } });

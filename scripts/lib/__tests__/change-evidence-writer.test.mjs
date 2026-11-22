@@ -15,6 +15,9 @@ const configBytes = fs.readFileSync(path.join(fixtures, 'policy.json'));
 const input = () => ({ pr: structuredClone(pr), events: read('events-7289.json'), comments: read('comments-7289.json'),
   mergeCommit: read(`commit-${sha}.json`), commits: pr.commits.map(c => read(`commit-${c.oid}.json`)),
   checkRuns: read(`mcr-${sha}.json`).check_runs, config: JSON.parse(configBytes), configBytes,
+  branchRules: [{ type: 'required_status_checks', parameters: { required_status_checks:
+    JSON.parse(configBytes).clauses.tested.requiredChecks.map(context => ({ context })) } }],
+  branchProtection: { protected: true, protection: { enabled: false } },
   recordedAt: '2026-11-21T15:00:00Z', recorder: 'https://everstandards.dev/ship/tools/change-evidence-build' });
 const clause = (x, id) => buildChangeEvidence(x).predicate.clauses.find(c => c.clause === id).verdict;
 const dirs = [];
@@ -29,6 +32,8 @@ function harness() {
   const gh = vi.fn(args => {
     if (args[0] === 'pr') return x.pr;
     const endpoint = args[1];
+    if (endpoint.includes('/rules/branches/')) return x.branchRules;
+    if (endpoint.includes('/branches/')) return x.branchProtection;
     if (endpoint.includes('/pulls?state=all&sort=updated&direction=desc&')) {
       const page = Number(new URL(endpoint, 'https://x/').searchParams.get('page'));
       const rows = x.listing.slice((page - 1) * 100, page * 100);
@@ -42,7 +47,7 @@ function harness() {
     if (endpoint.endsWith(`/commits/${sha}`)) return x.mergeCommit;
     throw Error(`unexpected read ${args}`);
   });
-  const options = { coordination, gh, emit, configBytes, mode: 'shadow', merged: [{ num: pr.number, repo: null }], queueFollowUps: [] };
+  const options = { coordination, gh, emit, configBytes, mode: 'shadow', repo: 'web-everything/web-everything', merged: [{ num: pr.number, repo: null }], queueFollowUps: [] };
   const dir = path.join(coordination, 'change-evidence/shadow/web-everything__web-everything');
   return { x, gh, emit, options, dir, file: path.join(dir, `${pr.number}-${sha}.json`),
     pending: () => JSON.parse(fs.readFileSync(path.join(coordination, 'change-evidence-pending.json'), 'utf8')) };
@@ -63,7 +68,7 @@ it('writes one record per merge whose subject is the landed commit (#7289 fixtur
 });
 it('a failed read leaves the merge pending and writes no pass record', async () => {
   const h = harness(); h.gh.mockImplementation(() => { throw Error('unreadable'); });
-  await writeChangeEvidenceForMerged(h.options);
+  await expect(writeChangeEvidenceForMerged(h.options)).rejects.toThrow(/unreadable/);
   expect(h.pending()).toHaveLength(1); expect(fs.existsSync(h.file)).toBe(false);
   expect(h.emit).toHaveBeenCalledWith(expect.objectContaining({ kind: 'change-evidence-missing' }));
 });
@@ -115,9 +120,9 @@ it('writes atomically and clears pending only after write and index', async () =
   expect(order).toEqual(['rename', 'index']); expect(h.pending()).toEqual([]);
 });
 it('rolls back a record on index failure and retries pending idempotently', async () => {
-  const h = harness(); await writeChangeEvidenceForMerged({ ...h.options, io: { ...fs, renameSync: (src, dst) => {
+  const h = harness(); await expect(writeChangeEvidenceForMerged({ ...h.options, io: { ...fs, renameSync: (src, dst) => {
     if (dst === path.join(h.dir, 'index.jsonl')) throw Error('disk full'); fs.renameSync(src, dst);
-  } } });
+  } } })).rejects.toThrow(/disk full/);
   expect(h.pending()).toHaveLength(1); expect(fs.existsSync(h.file)).toBe(false);
   await writeChangeEvidenceForMerged({ ...h.options, merged: [] });
   const bytes = fs.readFileSync(h.file, 'utf8'); h.gh.mockClear();
@@ -143,7 +148,7 @@ it('resolves setting precedence and reports provenance', () => {
 it('a capped page fails closed with operator fallback', async () => {
   const h = harness(), original = h.gh.getMockImplementation();
   h.gh.mockImplementation(args => args[1]?.includes('/events?') ? Array.from({ length: 100 }, () => h.x.events[0]) : original(args));
-  await writeChangeEvidenceForMerged({ ...h.options, maxPages: 1 });
+  await expect(writeChangeEvidenceForMerged({ ...h.options, maxPages: 1 })).rejects.toThrow(/page cap/);
   expect(fs.existsSync(h.file)).toBe(false); expect(h.pending()).toHaveLength(1);
   expect(h.emit.mock.calls[0][0].detail.reason).toMatch(/backfill|operator/);
 });
@@ -231,7 +236,7 @@ it('backfill fails closed when the listing never settles across scans', async ()
 it('backfill never emits daemon events and its call budget scales with the merge count', async () => {
   const h = harness(), original = h.gh.getMockImplementation();
   h.gh.mockImplementation(args => { if (args[1]?.includes('/events?')) throw Error('forge unavailable'); return original(args); });
-  await backfillChangeEvidence({ ...h.options, since: '2026-11-21' });
+  await expect(backfillChangeEvidence({ ...h.options, since: '2026-11-21' })).rejects.toThrow(/forge unavailable/);
   expect(h.emit).not.toHaveBeenCalled(); expect(h.pending()).toHaveLength(1);
   const ok = harness(); await backfillChangeEvidence({ ...ok.options, since: '2026-11-21', maxCalls: 1 });
   expect(fs.existsSync(ok.file)).toBe(true);
@@ -239,23 +244,23 @@ it('backfill never emits daemon events and its call budget scales with the merge
 it.each(['/events?', '/comments?', '/check-runs?', `/commits/${sha}`, '/pulls/'])('failed %s read retains pending without a record', async endpoint => {
   const h = harness(), original = h.gh.getMockImplementation();
   h.gh.mockImplementation(args => { if (args[1]?.includes(endpoint)) throw Error('forge unavailable'); return original(args); });
-  await writeChangeEvidenceForMerged(h.options);
+  await expect(writeChangeEvidenceForMerged(h.options)).rejects.toThrow(/forge unavailable/);
   expect(fs.existsSync(h.file)).toBe(false); expect(h.pending()).toHaveLength(1);
   expect(h.emit).toHaveBeenCalledWith(expect.objectContaining({ kind: 'change-evidence-missing', pr: pr.number }));
 });
 it('a failed atomic rename leaves no visible record or temporary file', async () => {
   const h = harness();
-  await writeChangeEvidenceForMerged({ ...h.options, io: { ...fs, renameSync: (src, dst) => {
+  await expect(writeChangeEvidenceForMerged({ ...h.options, io: { ...fs, renameSync: (src, dst) => {
     if (dst === h.file) throw Error('rename refused'); fs.renameSync(src, dst);
-  } } });
+  } } })).rejects.toThrow(/rename refused/);
   expect(h.pending()).toHaveLength(1); expect(fs.readdirSync(h.dir)).toEqual([]);
 });
 it('a partial index write never reaches the index and is retried', async () => {
   const h = harness(), index = path.join(h.dir, 'index.jsonl');
-  await writeChangeEvidenceForMerged({ ...h.options, io: { ...fs, writeFileSync: (file, bytes) => {
+  await expect(writeChangeEvidenceForMerged({ ...h.options, io: { ...fs, writeFileSync: (file, bytes) => {
     if (file.startsWith(`${index}.`)) { fs.writeFileSync(file, bytes.slice(0, 9)); throw Error('partial write'); }
     fs.writeFileSync(file, bytes);
-  } } });
+  } } })).rejects.toThrow(/partial write/);
   expect(fs.existsSync(h.file)).toBe(false); expect(h.pending()).toHaveLength(1);
   expect(fs.existsSync(index)).toBe(false); expect(fs.readdirSync(h.dir)).toEqual([]);
   await writeChangeEvidenceForMerged({ ...h.options, merged: [] });
@@ -281,7 +286,7 @@ it.each([['a corrupt terminated line', '{"file":\n'], ['a non-object row', '[1]\
   '%s inside the index fails closed and keeps the merge pending', async (_, bad) => {
     const h = harness(), index = path.join(h.dir, 'index.jsonl');
     fs.mkdirSync(h.dir, { recursive: true }); fs.writeFileSync(index, `${bad}{"file":"1-x.json"}\n`);
-    await writeChangeEvidenceForMerged(h.options);
+    await expect(writeChangeEvidenceForMerged(h.options)).rejects.toThrow(/invalid change-evidence index/);
     expect(h.pending()).toHaveLength(1); expect(fs.existsSync(h.file)).toBe(false);
     expect(fs.readFileSync(index, 'utf8')).toBe(`${bad}{"file":"1-x.json"}\n`);
     expect(h.emit).toHaveBeenCalledWith(expect.objectContaining({ detail: expect.objectContaining({ reason: expect.stringMatching(/invalid change-evidence index/) }) }));
@@ -290,7 +295,7 @@ it.each([['NUL bytes', '\0\0\0\0'], ['a non-row fragment', '[{"file":"x"']])(
   'an unterminated tail of %s is not a torn row and fails closed', async (_, tail) => {
     const h = harness(), index = path.join(h.dir, 'index.jsonl'), bytes = `{"file":"1-x.json"}\n${tail}`;
     fs.mkdirSync(h.dir, { recursive: true }); fs.writeFileSync(index, bytes);
-    await writeChangeEvidenceForMerged(h.options);
+    await expect(writeChangeEvidenceForMerged(h.options)).rejects.toThrow(/invalid change-evidence index/);
     expect(h.pending()).toHaveLength(1); expect(fs.existsSync(h.file)).toBe(false); expect(fs.readFileSync(index, 'utf8')).toBe(bytes);
     expect(h.emit).toHaveBeenCalledWith(expect.objectContaining({ detail: expect.objectContaining({ reason: expect.stringMatching(/invalid change-evidence index/) }) }));
   });
@@ -331,7 +336,7 @@ it.each([['pending ledger', h => path.join(h.options.coordination, 'change-evide
   ['existing record', h => h.file, /existing record/]])(
   'an empty %s (power loss) fails closed naming the file to repair', async (_, where, reason) => {
     const h = harness(), file = where(h); fs.mkdirSync(path.dirname(file), { recursive: true }); fs.writeFileSync(file, '');
-    await writeChangeEvidenceForMerged(h.options);
+    await expect(writeChangeEvidenceForMerged(h.options)).rejects.toThrow(reason);
     expect(fs.existsSync(path.join(h.dir, 'index.jsonl'))).toBe(false);
     expect(h.emit).toHaveBeenCalledWith(expect.objectContaining({ detail: expect.objectContaining({ reason: expect.stringMatching(reason) }) }));
   });
@@ -347,10 +352,10 @@ it('the index is only ever replaced by rename, never written in place', async ()
 });
 it('failed pending retirement rolls back the record and index', async () => {
   const h = harness();
-  await writeChangeEvidenceForMerged({ ...h.options, io: { ...fs, renameSync: (src, dst) => {
+  await expect(writeChangeEvidenceForMerged({ ...h.options, io: { ...fs, renameSync: (src, dst) => {
     if (dst.endsWith('change-evidence-pending.json') && JSON.parse(fs.readFileSync(src)).length === 0) throw Error('pending write refused');
     fs.renameSync(src, dst);
-  } } });
+  } } })).rejects.toThrow(/pending write refused/);
   expect(h.pending()).toHaveLength(1); expect(fs.existsSync(h.file)).toBe(false);
   expect(fs.readFileSync(path.join(h.dir, 'index.jsonl'), 'utf8')).toBe('');
 });
@@ -362,7 +367,7 @@ it('a crash after record rename is reconciled without changing its bytes', async
   expect(JSON.parse(fs.readFileSync(path.join(h.dir, 'index.jsonl'), 'utf8')).mergeSha).toBe(sha);
 });
 it('budget exhaustion preserves every remaining merge for retry', async () => {
-  const h = harness(); await writeChangeEvidenceForMerged({ ...h.options, maxCalls: 1 });
+  const h = harness(); await expect(writeChangeEvidenceForMerged({ ...h.options, maxCalls: 1 })).rejects.toThrow(/budget exhausted/);
   expect(h.gh).toHaveBeenCalledTimes(1); expect(fs.existsSync(h.file)).toBe(false); expect(h.pending()).toHaveLength(1);
 });
 it('different landed SHAs produce distinct records for the same PR', async () => {
@@ -376,7 +381,7 @@ it('different landed SHAs produce distinct records for the same PR', async () =>
 it('the drain has exactly one awaited hook immediately after follow-up confirmation', () => {
   const source = fs.readFileSync(path.resolve('scripts/merge-ai-prs.mjs'), 'utf8');
   expect(source.match(/await writeChangeEvidenceForMerged\(/g)).toHaveLength(1);
-  expect(source).toMatch(/confirmQueueFollowUps\(queueFollowUps, \{ complete: queueFollowUpsClean \}\);\s+if \(!DRY_RUN\) try \{ await writeChangeEvidenceForMerged\(\{ merged, queueFollowUps \}\); \}/);
+  expect(source).toMatch(/confirmQueueFollowUps\(queueFollowUps, \{ complete: queueFollowUpsClean \}\);\s+if \(!DRY_RUN\) try \{ await writeChangeEvidenceForMerged\(\{ merged, queueFollowUps, repo: localSlug \}\); \}/);
 });
 it('binds governance to the exact shipped policy bytes and repo blob URI', async () => {
   const h = harness(); await writeChangeEvidenceForMerged({ ...h.options, configBytes: undefined });
@@ -451,7 +456,7 @@ it.each(['json', 'subject', 'policy', 'verdict'])('existing invalid %s record re
   if (kind === 'policy') record.predicate.governance.digest.sha256 = 'a'.repeat(64);
   if (kind === 'verdict') record.predicate.verdict.verdict = 'fail';
   fs.mkdirSync(h.dir, { recursive: true }); fs.writeFileSync(h.file, kind === 'json' ? '{' : JSON.stringify(record));
-  await writeChangeEvidenceForMerged(h.options);
+  await expect(writeChangeEvidenceForMerged(h.options)).rejects.toThrow(/existing record/);
   expect(h.pending()).toHaveLength(1); expect(fs.existsSync(path.join(h.dir, 'index.jsonl'))).toBe(false);
   expect(h.emit).toHaveBeenCalledWith(expect.objectContaining({ kind: 'change-evidence-missing' }));
 });
@@ -460,7 +465,7 @@ it('lock contention durably retains confirmed queue follow-ups for the next pass
   withLedgerAppendLock(`change-evidence:${h.options.coordination}`, () => {
     waiting = writeChangeEvidenceForMerged({ ...h.options, merged: [], queueFollowUps: h.options.merged });
   }, { dir: h.options.coordination, waitMs: 0 });
-  await waiting; expect(fs.existsSync(h.file)).toBe(false);
+  await expect(waiting).rejects.toThrow(/ledger/); expect(fs.existsSync(h.file)).toBe(false);
   await writeChangeEvidenceForMerged({ ...h.options, merged: [] });
   expect(fs.existsSync(h.file)).toBe(true); expect(h.pending()).toEqual([]);
 });
@@ -562,7 +567,7 @@ it('the 7289 fixture retains its overall pass verdict', () => {
 it('a lock acquisition error retains the incoming merge for automatic retry', async () => {
   const h = harness(), lock = path.join(h.options.coordination, `ledger-append-${createHash('sha256').update(`change-evidence:${h.options.coordination}`).digest('hex')}.lock`);
   fs.writeFileSync(lock, 'unreadable lock ownership');
-  await writeChangeEvidenceForMerged(h.options);
+  await expect(writeChangeEvidenceForMerged(h.options)).rejects.toThrow(/ledger/);
   expect(fs.existsSync(h.file)).toBe(false);
   fs.unlinkSync(lock);
   await writeChangeEvidenceForMerged({ ...h.options, merged: [] });

@@ -1,0 +1,6 @@
+{
+  "description": "Merged change evidence mode: off skips collection; shadow and on write local shadow records only.",
+  "owner": "scripts/settings/change-evidence.json",
+  "changeVia": "pr",
+  "instant": true
+}

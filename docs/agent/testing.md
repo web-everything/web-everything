@@ -19,7 +19,7 @@ Vitest's thread pool cannot chdir. Run it sequentially within each test file.
 The gh/git function ports also generate the executable shims for the two `*.real.test.mjs` smokes.
 Those files are explicitly excluded from the PR unit config. There is currently no filename-based
 scheduled real-process config discovery; scheduled-runner enrollment remains separate.
-> Authors: APPEND new sections at the END of this file, never right after the title (`.gitattributes` union-merges it, but appending avoids overlapping insertions).
+> Authors: add new testing notes in their own file under [testing/](testing/README.md). This file keeps existing sections only; do not append new notes here.
 
 ## Review PR transport isolation (R37)
 
@@ -6311,7 +6311,7 @@ It never infers clearance authority from a saved review or a newly read head.
 `scripts/operations/__tests__/record-verdict.test.mjs` covers request validation;
 `scripts/operations/__tests__/record-verdict-cli.test.mjs` drives both CLI adapters through
 staging the JSON request. The applier carries that pin to `review-set-label` as `--expect-head`.
-## Live-owner review adapter collection
+## Per-topic notes
 
 `pr-live-owner-watch.test.mjs` imports the manual dispatcher, review job and reconcile
 graph statically during collection. The first `review-dispatch` case otherwise loads
@@ -6338,9 +6338,21 @@ assertions intact; consumers without callable entries retain the fresh-import pa
 checks, policy kind/tier exclusions, self-review, unrelated SHA markers, incomplete
 restamps, revocation, post-merge backfills, corrupt persisted statements, lock contention
 and the dry-run drain hook. Run this file through heavy admission. The shipped merge
-policy lists check App IDs/slugs and review producer logins. Historical v0.1 policies
+policy lists CI and review producer URIs. Historical v0.1 policies
 without these fields retain the pinned GitHub Actions and reviewer/merger defaults;
-explicit empty lists trust nobody. Review producers must also be distinct from the author.
+explicit empty lists trust nobody. Review and approval compare canonical actor URIs,
+including the equivalent `app/name` and `name[bot]` spellings, case and whitespace.
+A trusted rejection with an unreadable creation or edit time makes review fail, even
+when dated acceptance evidence would otherwise pass. The collector reads the base
+branch's effective rules and classic protection, using the shared required-check
+projections, and requires the policy's required-check names to match their union;
+missing, unreadable or changed protection fails collection. Required integration IDs
+also constrain check producers. Repository identity is explicit: the drain supplies
+its local slug, and library/backfill callers must supply a repo instead of assuming WE.
+Collection failures retain pending work and reject after reporting missing-evidence
+events; backfill propagates that rejection to the CLI's nonzero exit path. The drain
+catches it and reports the failure without aborting completed merges. Negative cases
+and an executed drain-hook failure are in `change-evidence-sendbacks.test.mjs`.
 Acceptance SHA binding uses its own reviewed-sha plus a matching prevention marker,
 never time proximity alone. Legacy rebase carries remain asserted: complete markers and
 an earlier acceptance are required, but #7289 has different diff/contribution hashes and
@@ -6365,6 +6377,16 @@ and the tests pin both recoveries plus the 1,000-merge history case. Offset page
 a PR is touched or reopened mid-scan, so a multi-page scan re-reads page 1 and rescans on any
 change; a listing that never settles fails closed. The tests touch a PR between page reads.
 
+## Orphan exclusions precede stand-down answers
+
+The fix-dispatch orphan guard must reach `runReconcilePass` before R123 enrichment,
+which can reserve and post an operator answer before dispatch rows exist. Adapt
+dispatch predicates to PR numbers (`number` or `prNumber`); do not depend on labels
+at this boundary. Keep excluded PRs in the plan with their original unanswered
+comments and retain the later dispatch filter. `reconcile-pass.test.mjs` exercises
+the real auto-proceed writer with injected IO: the excluded PR gets no thread read,
+reservation or post while a non-excluded PR receives an answer.
+`reconcile-fix-dispatch.test.mjs` covers both exclusion forms and the empty no-op.
 ## Bounded verify selection and ceiling recovery
 
 Verify gates execute explicit sorted test files, including complete graph selections. Graph failures,
@@ -6378,3 +6400,4 @@ shards exactly as the default would, so it is still recognized as the default ga
 Gate ceilings get one capped retry tied to lane, head and killed job. Detached jobs settle in
 `verify-gate-job.mjs`, so recovery must cover that consumer as well as `verify-dispatch.mjs`'s
 in-process sweep. Persist the retry identity in job input to dedupe the enqueue-before-marker crash window.
+- [Testing topic notes and authoring guidance](testing/README.md)

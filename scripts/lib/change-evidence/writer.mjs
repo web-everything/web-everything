@@ -14,7 +14,6 @@ import { cascadePolicy } from '../policy-cascade.mjs';
 import { readSettings } from '../settings-files.mjs';
 import { withLedgerAppendLock } from '../ledger-append-lock.mjs';
 
-const DEFAULT_REPO = 'web-everything/web-everything';
 const POLICY = path.join(path.dirname(fileURLToPath(import.meta.url)), 'data/merge-policy.json');
 const RECORDER = 'https://github.com/web-everything/web-everything/blob/main/scripts/lib/change-evidence/writer.mjs';
 const FIELDS = 'number,url,title,author,baseRefName,headRefName,headRefOid,mergedAt,mergedBy,mergeCommit,commits';
@@ -52,8 +51,9 @@ function parsed(bytes, what) {
   try { return JSON.parse(bytes); } catch { throw Error(`unreadable ${what}; operator must repair or remove it, then retry backfill`); }
 }
 function identity(item, repo) {
-  const slug = item.repo || repo, num = Number(item.num ?? item.number);
-  if (!/^[\w.-]+\/[\w.-]+$/.test(slug) || !Number.isSafeInteger(num) || num < 1) throw Error('invalid merge identity');
+  const slug = item.repo == null ? repo : item.repo, num = Number(item.num ?? item.number);
+  if (typeof slug !== 'string' || !/^[\w.-]+\/[\w.-]+$/.test(slug)
+    || slug.split('/').some(part => /^\.+$/.test(part)) || !Number.isSafeInteger(num) || num < 1) throw Error('invalid merge identity: explicit repo and PR number required');
   return { repo: slug, num };
 }
 const key = item => `${item.repo}#${item.num}`;
@@ -93,7 +93,9 @@ function collect(item, reads, maxPages) {
   const commits = reads.pages(`${api}/pulls/${num}/commits`);
   if (!commits.length || commits.at(-1).sha !== pr.headRefOid) throw Error('incomplete PR commit history');
   const checkRuns = reads.pages(`${api}/commits/${pr.mergeCommit.oid}/check-runs`, 'check_runs');
-  return { pr, events, comments, mergeCommit, commits, checkRuns };
+  const branchRules = reads.pages(`${api}/rules/branches/${encodeURIComponent(pr.baseRefName)}`);
+  const branchProtection = reads.read(['api', `${api}/branches/${encodeURIComponent(pr.baseRefName)}`]);
+  return { pr, events, comments, mergeCommit, commits, checkRuns, branchRules, branchProtection };
 }
 
 /**
@@ -164,7 +166,7 @@ function publish({ io, dir, record, retire }) {
 }
 
 export async function writeChangeEvidenceForMerged({ merged = [], queueFollowUps = [],
-  repo = DEFAULT_REPO, coordination = resolveCoordinationRoot(), gh = defaultGh, io = fs,
+  repo, coordination = resolveCoordinationRoot(), gh = defaultGh, io = fs,
   emit = appendDaemonEvent, mode, configBytes, now = () => new Date(), recorder = RECORDER,
   maxCalls = 256, maxPages = 10, reads: sharedReads,
 } = {}) {
@@ -216,6 +218,8 @@ export async function writeChangeEvidenceForMerged({ merged = [], queueFollowUps
     try { await emit(event); } catch { /* stderr still makes an unavailable event sink visible */ }
     console.error(`change-evidence-missing: ${event.repo}#${event.pr ?? '?'}: ${event.detail.reason}; ${event.detail.fallback}`);
   }
+  if (failures.length) throw new AggregateError(failures.map(e => Error(e.detail.reason)),
+    `change-evidence collection failed: ${failures.map(e => e.detail.reason).join('; ')}`);
   return written;
 }
 
@@ -264,7 +268,7 @@ function mergedSince({ listing, repo, since, maxPages }) {
   throw Error(`merged listing kept changing during ${LISTING_SCANS} scans; operator: retry backfill when the repository is quieter`);
 }
 
-export async function backfillChangeEvidence({ since, repo = DEFAULT_REPO, gh = defaultGh, maxCalls = 256, maxPages = 10, ...options } = {}) {
+export async function backfillChangeEvidence({ since, repo, gh = defaultGh, maxCalls = 256, maxPages = 10, ...options } = {}) {
   // utc-day-slice-ok: validates the supplied UTC calendar date, not the operator's current day.
   if (!/^\d{4}-\d{2}-\d{2}$/.test(since ?? '') || new Date(since).toISOString().slice(0, 10) !== since) throw Error('expected --since=YYYY-MM-DD');
   if (!/^[\w.-]+\/[\w.-]+$/.test(repo ?? '') || repo.split('/').some(part => /^\.+$/.test(part))) throw Error('expected --repo=owner/repo');
@@ -284,12 +288,12 @@ if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.me
   const args = process.argv.slice(2);
   const value = flag => args.find(arg => arg.startsWith(flag))?.slice(flag.length);
   if (!args.includes('--backfill') || args.some(arg => arg !== '--backfill' && !['--since=', '--repo=', '--max-pages='].some(f => arg.startsWith(f)))) {
-    console.error('usage: writer.mjs --backfill --since=YYYY-MM-DD [--repo=owner/repo] [--max-pages=N]'); process.exitCode = 1;
+    console.error('usage: writer.mjs --backfill --since=YYYY-MM-DD --repo=owner/repo [--max-pages=N]'); process.exitCode = 1;
   } else {
     try {
       const pages = value('--max-pages=');
       // Digits only: '', '0', '1e3' and '0x10' are refused by backfill's --max-pages check.
-      await backfillChangeEvidence({ since: value('--since='), repo: value('--repo=') ?? DEFAULT_REPO,
+      await backfillChangeEvidence({ since: value('--since='), repo: value('--repo='),
         ...(pages === undefined ? {} : { maxPages: /^[1-9]\d*$/.test(pages) ? Number(pages) : NaN }) });
     } catch (error) { console.error(clean(error.message)); process.exitCode = 1; }
   }

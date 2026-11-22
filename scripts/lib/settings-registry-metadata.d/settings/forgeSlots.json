@@ -1,0 +1,6 @@
+{
+  "description": "Forge execution pool size by host, with a default for unlisted hosts.",
+  "owner": "scripts/settings/forge-slots.json",
+  "changeVia": "pr",
+  "instant": false
+}

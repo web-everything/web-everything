@@ -1,0 +1,6 @@
+{
+  "description": "Documentation of Claude account mappings and enforcement.",
+  "owner": "scripts/settings/claude-accounts.json",
+  "changeVia": "pr",
+  "instant": false
+}

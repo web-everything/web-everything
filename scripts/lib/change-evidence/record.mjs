@@ -4,12 +4,16 @@
  */
 import { createHash } from 'node:crypto';
 import { isTrustedMarkerAuthor } from '../marker-authorship.mjs';
+import { requiredChecksFromRules, requiredChecksFromBranch } from '../required-status-checks.mjs';
 const sha256 = bytes => createHash('sha256').update(bytes).digest('hex');
 const TIER = { asserted: 0, replayed: 1, probe: 2 };
 const EVALUATOR = 'https://everstandards.dev/ship/tools/change-evidence-build';
-const actorOf = login => login.startsWith('app/') || login.endsWith('[bot]')
-  ? { id: `https://github.com/apps/${login.replace(/^app\//, '').replace(/\[bot\]$/, '')}`, kind: 'bot', native: login }
-  : { id: `https://github.com/${login}`, kind: 'person', native: login };
+const actorOf = login => {
+  const canonical = String(login ?? '').trim().toLowerCase();
+  return canonical.startsWith('app/') || canonical.endsWith('[bot]')
+    ? { id: `https://github.com/apps/${canonical.replace(/^app\//, '').replace(/\[bot\]$/, '')}`, kind: 'bot', native: login }
+    : { id: `https://github.com/${canonical}`, kind: 'person', native: login };
+};
 const checkProducer = run => run.app?.slug ? `https://github.com/apps/${run.app.slug}` : undefined;
 const evidenceKey = e => JSON.stringify([e.kind, e.uri ?? null, e.digest]);
 function fold(clauses) {
@@ -21,11 +25,33 @@ function fold(clauses) {
     : req.length ? { verdict: 'pass' } : { verdict: 'unknown', reason: 'missing' };
 }
 export function buildChangeEvidence({ pr, events, comments, mergeCommit: mc, commits, checkRuns: runs,
-  config, configBytes, recordedAt: AT, recorder: BUILDER }) {
+  branchRules, branchProtection, config, configBytes, recordedAt: AT, recorder: BUILDER }) {
   const mergeSha = pr.mergeCommit.oid;
   if (!/^[0-9a-f]{40}$/.test(mergeSha) || mc.sha !== mergeSha || !mc.commit?.tree?.sha || !mc.parents?.[0]?.sha)
     throw Error('forge did not verify the landed commit');
   if (JSON.stringify(JSON.parse(String(configBytes))) !== JSON.stringify(config)) throw Error('policy bytes differ from config');
+  // A checked-in snapshot cannot assert which checks the protected branch requires today.
+  const rules = Array.isArray(branchRules) && branchRules.filter(r => r?.type === 'required_status_checks');
+  const ruleChecks = rules && rules.flatMap(r => Array.isArray(r.parameters?.required_status_checks)
+    ? r.parameters.required_status_checks : [null]);
+  const classic = branchProtection?.protection?.enabled === false ? null : branchProtection?.protection?.required_status_checks;
+  if (classic != null && (typeof classic !== 'object' || Array.isArray(classic)
+    || (!Array.isArray(classic.contexts) && !Array.isArray(classic.checks))
+    || (classic.contexts !== undefined && !Array.isArray(classic.contexts))
+    || (classic.checks !== undefined && !Array.isArray(classic.checks)))) throw Error('unreadable classic branch protection');
+  let liveNames;
+  try { liveNames = [...new Set([...requiredChecksFromRules(branchRules), ...requiredChecksFromBranch(branchProtection)])]; }
+  catch (error) { throw Error(`unreadable branch protection: ${error.message}`); }
+  const checks = ruleChecks && [...ruleChecks,
+    ...(classic?.contexts ?? []).map(context => ({ context })),
+    ...(classic?.checks ?? []).map(c => c && ({ context: c.context, integration_id: c.app_id }))];
+  const snapshot = config.clauses.tested.requiredChecks;
+  if (!checks?.length || checks.some(c => !c || typeof c.context !== 'string' || !c.context.trim()
+    || (c.integration_id != null && (!Number.isSafeInteger(c.integration_id) || c.integration_id < 1)))
+    || !Array.isArray(snapshot) || !snapshot.length || snapshot.some(name => typeof name !== 'string' || !name.trim())
+    || new Set(snapshot).size !== snapshot.length
+    || JSON.stringify(liveNames.sort()) !== JSON.stringify([...snapshot].sort()))
+    throw Error('required-check snapshot differs from or lacks readable branch protection; refresh the policy before retrying');
   const cfgDigest = { sha256: sha256(configBytes) };
   const REPO = pr.url.split('/pull/')[0];
   const policy = { uri: `${config.id}#merge-policy`, digest: cfgDigest };
@@ -39,6 +65,7 @@ export function buildChangeEvidence({ pr, events, comments, mergeCommit: mc, com
   const beforeMerge = t => Number.isFinite(Date.parse(t)) && Date.parse(t) <= Date.parse(at);
   // Backfill must evaluate the merge-time snapshot, including comment edits.
   events = events.filter(e => beforeMerge(e.created_at));
+  const allComments = comments;
   comments = comments.filter(c => beforeMerge(c.created_at) && (!c.updated_at || beforeMerge(c.updated_at)))
     .sort((a, b) => Date.parse(a.created_at) - Date.parse(b.created_at) || a.id - b.id);
 
@@ -47,7 +74,8 @@ export function buildChangeEvidence({ pr, events, comments, mergeCommit: mc, com
   const tc = config.clauses.tested, tEv = [], missing = [], bad = [], off = [], unlisted = [];
   for (const name of tc.requiredChecks) {
     const candidates = runs.filter(x => x.name === name && beforeMerge(x.completed_at));
-    const allowed = x => producerAllowed(tc, checkProducer(x), ['https://github.com/apps/github-actions']);
+    const allowed = x => producerAllowed(tc, checkProducer(x), ['https://github.com/apps/github-actions'])
+      && checks.filter(c => c.context === name).every(c => c.integration_id == null || c.integration_id === x.app?.id);
     if (candidates.some(x => checkProducer(x) && !allowed(x))) unlisted.push(name);
     const r = candidates.filter(allowed).sort((a, b) => b.id - a.id)[0];
     if (!r || r.status !== 'completed' || !eligible(tc, 'ci-check')) { missing.push(name); continue; }
@@ -60,29 +88,35 @@ export function buildChangeEvidence({ pr, events, comments, mergeCommit: mc, com
   // Legacy review comments bind the acceptance's own SHA to its prevention marker.
   // A nearby timestamp alone is never a binding.
   const rEv = [], rc = config.clauses.reviewed;
-  const sharedTrusted = new Set(comments.filter(c => isTrustedMarkerAuthor({ ...c, viewerDidAuthor: false })));
+  const sharedTrusted = new Set(allComments.filter(c => isTrustedMarkerAuthor({ ...c, viewerDidAuthor: false })));
   const producers = rc.trustedProducers ?? ['https://github.com/apps/plateau-reviewer', 'https://github.com/apps/plateau-merger'];
   let unlistedReview = false;
-  const independent = c => c.user?.login?.toLowerCase() !== pr.author.login.toLowerCase();
-  const trusted = c => independent(c) && producers.includes(actorOf(c.user?.login ?? '').id)
+  const independent = c => Boolean(c.user?.login) && actorOf(c.user.login).id !== author.id;
+  const trustedProducer = c => producers.includes(actorOf(c.user?.login ?? '').id)
     && (sharedTrusted.has(c)
       || (process.env.WE_AUTOMATION_LOGINS === undefined && process.env.WE_OPERATOR_LOGINS === undefined
-        && ['plateau-reviewer[bot]', 'plateau-merger[bot]'].includes(c.user.login)));
+        && ['https://github.com/apps/plateau-reviewer', 'https://github.com/apps/plateau-merger'].includes(actorOf(c.user?.login).id)));
+  const trusted = c => independent(c) && trustedProducer(c);
+  const rejection = c => /^(?:(?:🔁|❌|⛔|🚫) )?(?:human )?review — (?:rejected|changes requested|blocked)(?:\r?\n|$)/u.test(c.body);
+  // An unorderable rejection cannot be superseded safely, even by a dated acceptance.
+  const undatedRejection = allComments.some(c => trustedProducer(c) && rejection(c)
+    && (!Number.isFinite(Date.parse(c.created_at))
+      || (c.updated_at != null && !Number.isFinite(Date.parse(c.updated_at)))));
   const marker = (c, name, length = 40) => new RegExp(`^<!-- ${name}: ([0-9a-f]{${length}}) -->$`, 'm').exec(c.body)?.[1];
   let accepted;
   for (const c of comments) {
     if (!producers.includes(actorOf(c.user?.login ?? '').id)
       && (/^✅ review — accepted/u.test(c.body) || /^📌 review — acceptance re-stamped/u.test(c.body))) unlistedReview = true;
     if (!trusted(c)) continue;
-    if (/^(?:(?:🔁|❌|⛔|🚫) )?(?:human )?review — (?:rejected|changes requested|blocked)(?:\r?\n|$)/u.test(c.body)) {
+    if (rejection(c)) {
       // Revocation invalidates the active acceptance and every carry derived from it.
       accepted = undefined; rEv.length = 0; continue;
     }
-    if (c.user.login === 'plateau-reviewer[bot]' && /^✅ review — accepted/.test(c.body)) {
+    if (actorOf(c.user.login).id === 'https://github.com/apps/plateau-reviewer' && /^✅ review — accepted/.test(c.body)) {
       accepted = undefined;
       rEv.length = 0;
       const ownSha = marker(c, 'reviewed-sha');
-      const matches = comments.filter(d => trusted(d) && d.user.login === c.user.login
+      const matches = comments.filter(d => trusted(d) && actorOf(d.user.login).id === actorOf(c.user.login).id
         && new RegExp(`^<!-- approval-prevention-filed:${ownSha} -->`).test(d.body)
         && Date.parse(d.created_at) >= Date.parse(c.created_at)
         && Date.parse(d.created_at) - Date.parse(c.created_at) < 5 * 60e3);
@@ -105,7 +139,8 @@ export function buildChangeEvidence({ pr, events, comments, mergeCommit: mc, com
     }
   }
   const rOk = rEv.filter((e) => eligible(rc, e.kind));
-  const reviewed = rOk.some((e) => e.digest.gitCommit === head) ? base('reviewed', { verdict: 'pass' })
+  const reviewed = undatedRejection ? base('reviewed', { verdict: 'fail', detail: 'trusted rejection has an unreadable timestamp; acceptance cannot supersede it' })
+    : rOk.some((e) => e.digest.gitCommit === head) ? base('reviewed', { verdict: 'pass' })
     : !rOk.length && unlistedReview ? base('reviewed', { verdict: 'unknown', reason: 'unverifiable' })
     : rEv.length ? base('reviewed', { verdict: 'unknown', reason: 'stale', detail: `accepted review covers ${[...new Set(rOk.map((e) => e.digest.gitCommit.slice(0, 12)))]}, head is ${head.slice(0, 12)}` })
     : base('reviewed', { verdict: 'unknown', reason: !rOk.length && unlistedReview ? 'unverifiable' : 'missing' });

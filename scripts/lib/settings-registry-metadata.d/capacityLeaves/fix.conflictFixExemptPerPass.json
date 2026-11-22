@@ -1,0 +1,5 @@
+{
+  "description": "Mechanical conflict-fix exemptions per pass.",
+  "range": "integer 0–10",
+  "unit": "fixes/pass"
+}

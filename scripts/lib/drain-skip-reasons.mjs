@@ -11,7 +11,7 @@
  */
 
 export const SKIP_KINDS = Object.freeze([
-  'claim-held', 'unknown-mergeability', 'conflicting', 'behind', 'checks-pending', 'review-hold', 'cap', 'head-moved',
+  'claim-held', 'unknown-mergeability', 'conflicting', 'behind', 'checks-failed', 'checks-pending', 'review-hold', 'cap', 'head-moved',
   'couple-held', 'blocked-by', 'overlap-yield', 'rebuilt-pending-ci', 'merge-failed', 'parked',
   // Former "other" bucket, now named: every skip says which rule held it.
   'restamp-stale-code', 'not-certified', 'off-base', 'codeql-failed', 'empty-body', 'stale-read', 'escalated',
@@ -34,11 +34,12 @@ export function classifySkipReason(reason) {
   // All four card-group hold reasons (we:scripts/lib/card-group.mjs#cardGroupHold).
   if (/^grouped into | is reserved by open card group |^card-group state unreadable|^card-group repository identity missing/.test(r)) return 'card-grouped';
   if (/^(?:red-main-hold|freeze-unreadable-hold)\b/.test(r)) return 'red-main-hold'; // Stable pass-level kind, including unreadable freeze evidence.
+  if (/required check "[^"]+" (?:FAILURE|ERROR|CANCELLED|TIMED_OUT|ACTION_REQUIRED|STARTUP_FAILURE)\b/.test(r)) return 'checks-failed';
   if (/mergeable=UNKNOWN|merge state UNKNOWN/i.test(r)) return 'unknown-mergeability';
   if (/mergeable=CONFLICTING|DIRTY/.test(r) && !/BEHIND⇒/.test(r)) return 'conflicting';
   if (/\bBEHIND\b/.test(r)) return 'behind';
   if (/review hold|review:(changes|human|pending)|awaiting review|review acceptance/i.test(r)) return 'review-hold';
-  if (/required check .* (is not green|direct read failed)|checks? pending|not green/i.test(r)) return 'checks-pending';
+  if (/waiting on required check|required check .* (is not green|direct read failed)|checks? pending|not green/i.test(r)) return 'checks-pending';
   if (/^head moved|head moved since/i.test(r)) return 'head-moved';
   if (/\bcap\b|max-merges|merge limit/i.test(r)) return 'cap';
   if (/^not AI-generated|not human-cleared/.test(r)) return 'not-certified';
