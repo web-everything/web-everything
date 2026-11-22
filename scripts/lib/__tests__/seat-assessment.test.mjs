@@ -157,7 +157,7 @@ it('gate-deciding files and their invariant tests are registered at the policy t
 it('module imports no gh or network writer', () => {
   const source = readFileSync(new URL('../seat-assessment.mjs', import.meta.url), 'utf8');
   const imports = [...source.matchAll(/from ['"]([^'"]+)['"]/g)].map(m => m[1]);
-  expect(imports.every(p => ['node:crypto', 'node:fs', 'node:path', 'node:child_process', './lane-git-hardening.mjs', './seat-ac-rubric.mjs', './gate-config.mjs', './merge-queue-affected.mjs', './settings-files.mjs', 'ajv', 'ajv-formats'].includes(p))).toBe(true);
+  expect(imports.every(p => ['node:crypto', 'node:fs', 'node:path', 'node:child_process', './lane-git-hardening.mjs', './seat-ac-rubric.mjs', './gate-config.mjs', './merge-queue-affected.mjs', './settings-files.mjs', '../readiness/test-selection.mjs', './dispatch-thresholds.mjs', 'ajv', 'ajv-formats'].includes(p))).toBe(true);
   expect(source).not.toMatch(/\b(?:fetch|https?|gh)\s*\(/);
 });
 it('git show is bounded, hardened and uses argv; rejects hostile paths before execution', () => {
@@ -973,6 +973,29 @@ describe('merge-path policy security', () => {
   });
 });
 
+
+/** Governance edits cannot claim the non-merge-path exemption, including either side of a rename. */
+describe('merge-path governance refusal', () => {
+  const governancePaths = ['.claude/skills/x', '.claude/agent-memory/x', '.claude/unknown/x',
+    'agent-memory-src/review.md', 'agent-memory/unknown/x', 'docs/agent/platform-decisions.md',
+    'docs/agent/unknown/x', '.claude', 'agent-memory-src', 'agent-memory', 'docs/agent',
+    'AGENTS.md', 'CLAUDE.md', 'skills-src/unknown/x', 'conformance-vectors/unknown/x',
+    'wrapper-conformance/unknown/x', 'conformance-engine/unknown/x',
+    'sibling/.claude/skills/x', 'sibling/agent-memory-src/review.md'];
+  const check = paths => mergePathNaCheck({ base: 'b'.repeat(40), head, readDiff: () => paths,
+    readGateSettings: () => ({ settings: {}, errors: [], duplicates: [] }), settingsLog: () => {} });
+  it.each(governancePaths)('governance and shared sensitive paths refuse n/a: %s', path => {
+    expect(check([path]).result).toBe('fail');
+    const x = conditionalInput(); x.diffPaths = [path];
+    expect(assessSeat(x).gateOutcome).toBe('not-pass');
+  });
+  it.each(governancePaths.flatMap(path => [[path, 'src/moved.ts'], ['src/moved.ts', path]]))(
+    'a governance rename from %s to %s refuses on either side', (from, to) => {
+      expect(check([from, to]).result).toBe('fail');
+    });
+  it.each(['docs/article.md', 'src/components/App.tsx'])(
+    'ordinary documentation and app paths retain n/a: %s', path => expect(check([path]).result).toBe('pass'));
+});
 
 /** Fail closed on the full merge machinery surface, regardless of settings key comparisons. */
 describe('merge-path blanket refusal', () => {

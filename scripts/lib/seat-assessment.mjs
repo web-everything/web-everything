@@ -17,6 +17,8 @@ import { GATE_PATTERNS, DEFAULT_SETTINGS_POLICY, isGateFile, resolveSettingsPoli
   SETTINGS_READER_DIRS,
 } from './merge-queue-affected.mjs';
 import { readDeclaredSettings } from './settings-files.mjs';
+import { isSensitivePath } from '../readiness/test-selection.mjs';
+import { NEVER_SPOT_CHECK_PATH_PREFIXES } from './dispatch-thresholds.mjs';
 import { buildAcceptanceRubric } from './seat-ac-rubric.mjs';
 
 export const RULES_SHA256 = 'bcb15ef4987a1dbe7adda7ff721385fcc82fedc82356e98d174da85b5ce8c3cf';
@@ -499,16 +501,19 @@ const sourceDigest = relative => ({ sha256: crypto.createHash('sha256')
   .update(readFileSync(new URL(relative, import.meta.url))).digest('hex') });
 export const MERGE_PATH_CHECK_DEFINITION = Object.freeze({
   uri: 'https://github.com/plateauapp/plateau-settings/blob/main/review/checks/diff-touches-no-merge-path',
-  version: '2026-11-22.4', range: 'base...head',
-  operation: 'refuse all scripts, workflows, settings-reader directories and settings-named paths, plus built-in/configured gates; include both rename sides',
+  version: '2026-11-22.5', range: 'base...head',
+  operation: 'refuse all scripts, workflows, settings, agent-governance directories and shared sensitive/statute paths, plus built-in/configured gates; include both rename sides',
   resolution: ['readDeclaredSettings', 'resolveSettingsPolicy'],
   conservativeReaderDirectories: SETTINGS_READER_DIRS,
   classifiers: [
     { module: 'scripts/lib/gate-config.mjs', export: 'isTrustChainPath', sourceDigest: sourceDigest('./gate-config.mjs'), basenames: [...TRUST_CHAIN_BASENAMES].sort() },
     { module: 'scripts/lib/merge-queue-affected.mjs', export: 'isGateFile', sourceDigest: sourceDigest('./merge-queue-affected.mjs'),
       patterns: GATE_PATTERNS.map(String), settingsPolicy: DEFAULT_SETTINGS_POLICY },
-    { module: 'scripts/readiness/test-selection.mjs', export: 'isLocalFullSuiteTrigger',
+    { module: 'scripts/readiness/test-selection.mjs', export: 'isLocalFullSuiteTrigger/isSensitivePath',
       sourceDigest: sourceDigest('../readiness/test-selection.mjs') },
+    { module: 'scripts/lib/review-escalation.mjs', export: 'isBlastRadiusPath', sourceDigest: sourceDigest('./review-escalation.mjs') },
+    { module: 'scripts/lib/dispatch-thresholds.mjs', export: 'NEVER_SPOT_CHECK_PATH_PREFIXES.statute',
+      sourceDigest: sourceDigest('./dispatch-thresholds.mjs'), prefixes: NEVER_SPOT_CHECK_PATH_PREFIXES.statute },
     { module: 'scripts/lib/settings-files.mjs', export: 'readDeclaredSettings', sourceDigest: sourceDigest('./settings-files.mjs') },
     { module: 'scripts/lib/seat-assessment.mjs', export: 'mergePathNaCheck', sourceDigest: sourceDigest('./seat-assessment.mjs') },
   ],
@@ -532,11 +537,17 @@ function readGatePolicy({ env, readGateSettings, settingsLog, loggedGatePolicies
   return policy;
 }
 
-/** PURE: a conservative superset of gate code, including every directory the shared reader can search.
+/** PURE: a conservative superset of gate code, shared sensitive/statute guards and agent governance.
  * Settings changes never get a key/value comparison exemption: their presence in base...head is enough.
+ * Unknown files and directory/symlink leaves in governance homes always refuse the exemption.
  */
 function isConservativeMergePath(path) {
-  return path === 'scripts' || path.startsWith('scripts/') || path === '.github' || path.startsWith('.github/')
+  const governancePath = path.normalize('NFKC').toLowerCase();
+  return isSensitivePath(governancePath)
+    || NEVER_SPOT_CHECK_PATH_PREFIXES.statute.some(prefix => governancePath.startsWith(prefix.toLowerCase()))
+    || ['.claude', 'agent-memory-src', 'agent-memory', 'docs/agent']
+      .some(dir => governancePath === dir || governancePath.startsWith(`${dir}/`))
+    || path === 'scripts' || path.startsWith('scripts/') || path === '.github' || path.startsWith('.github/')
     || SETTINGS_READER_DIRS.some(dir => path === dir || path.startsWith(`${dir}/`))
     || /(^|\/)[^/]*settings[^/]*(\/|$)/i.test(path);
 }
