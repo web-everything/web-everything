@@ -1,29 +1,47 @@
 /** Fail-closed evidence readers and the single atomic runtime-list writer. */
 import fs from 'node:fs';
-import { basename, dirname, join, resolve } from 'node:path';
+import { basename, dirname, join, relative, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { randomUUID } from 'node:crypto';
 import { execFileSync } from 'node:child_process';
 import yaml from 'js-yaml';
 import { runGhSync } from '../lib/gh-throttle.mjs';
 import { CONSTELLATION_REPOS } from '../lib/constellation-repos.mjs';
-import { normalizeBriefScope, SCOPE_PREFIX_ALIASES } from './dispatch-lane.mjs';
-import { GH_LIST_FILE_CAP, prHoldsFile, qualifyFile, repoKeyFor } from './free-scope.mjs';
+import { SCOPE_PREFIX_ALIASES } from './dispatch-lane.mjs';
+import { GH_LIST_FILE_CAP, prHoldsFile, repoKeyFor } from './free-scope.mjs';
 import { resolveCoordinationRoot } from './coordination-root.mjs';
 import { buildPrioritySetOperation, BUILD_PRIORITY_SET_EFFECT, validateBuildPriorityInput } from './build-priority-set.mjs';
-import { scopeEntriesOverlap } from '../readiness/scope-lease.mjs';
-import { TRUST_CHAIN, TRUST_CHAIN_BASENAMES } from '../lib/gate-config.mjs';
+import { TRUST_CHAIN } from '../lib/gate-config.mjs';
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '../..');
-const SCOPE_GUARD_FILES = [
-  'scripts/operations/build-priority-set-io.mjs',
-  'scripts/operations/build-priority-set.mjs',
-  'scripts/operations/free-scope.mjs',
-  'scripts/readiness/scope-lease.mjs',
-  'scripts/lib/build-queue.mjs',
-  'scripts/operations/__tests__/build-priority-set.test.mjs',
-  'scripts/operations/__tests__/build-priority-set-io-real.test.mjs',
-];
+let guardImportClosure;
+
+/** Read the guard's static relative imports once; missing source never grants admission. */
+function readGuardImportClosure() {
+  if (guardImportClosure) return guardImportClosure;
+  const files = new Set();
+  function visit(file) {
+    if (files.has(file)) return;
+    if (file.startsWith('../') || file === '..') refuse(`unresolvable guard import ${file}`);
+    files.add(file);
+    let source;
+    try { source = fs.readFileSync(resolve(ROOT, file), 'utf8'); }
+    catch { refuse(`unreadable or unresolvable guard import ${file}`); }
+    // Static imports only, including side-effect imports; node: and packages are external.
+    const imports = /^\s*import\s+(?:[^;'"()]*?\s+from\s*)?['"]([^'"]+)['"]/gm;
+    for (const match of source.matchAll(imports)) {
+      if (!match[1].startsWith('./') && !match[1].startsWith('../')) continue;
+      visit(relative(ROOT, resolve(ROOT, dirname(file), match[1])));
+    }
+  }
+  visit('scripts/operations/build-priority-set-io.mjs');
+  visit('scripts/operations/build-priority-set.mjs');
+  // Protect the tests without treating their test-runner imports as guard dependencies.
+  files.add('scripts/operations/__tests__/build-priority-set.test.mjs');
+  files.add('scripts/operations/__tests__/build-priority-set-io-real.test.mjs');
+  guardImportClosure = files;
+  return files;
+}
 const READ_OPTIONS = { encoding: 'utf8', maxBuffer: 8 * 1024 * 1024, timeout: 10000, stdio: ['ignore', 'pipe', 'pipe'] };
 const canonicalId = id => id.replace(/^0+(?=\d)/, '');
 const refuse = why => { throw new Error(`build-priority-set: ${why}; repair evidence or drain open PRs and retry`); };
@@ -89,49 +107,37 @@ function prepare(input, options) {
           || extra.some(home => typeof home !== 'string' || !home.trim())) refuse('empty or unreadable gate files');
       gateFiles.push(...extra);
     }
-    gateFiles = [...new Set([...gateFiles, ...SCOPE_GUARD_FILES])];
+    gateFiles = [...new Set(gateFiles)];
   } catch {
     refuse('unreadable or incomplete gate files');
   }
   if (!Array.isArray(gateFiles) || !gateFiles.length
       || gateFiles.some(home => typeof home !== 'string' || !home.trim())) refuse('empty or unreadable gate files');
+  const protectedPaths = new Set([...gateFiles, ...readGuardImportClosure()]);
+  const protectedBasenames = new Set([...protectedPaths].map(file => basename(file)));
   const repoPrefixes = new Set([
     ...Object.keys(CONSTELLATION_REPOS), ...Object.keys(SCOPE_PREFIX_ALIASES), ...Object.values(SCOPE_PREFIX_ALIASES),
-  ].map(prefix => SCOPE_PREFIX_ALIASES[prefix] ?? prefix));
-  const qualifiedGateFiles = gateFiles.flatMap(home => [...repoPrefixes].map(prefix => qualifyFile(home, prefix)));
-  const gateBasenames = new Set([...TRUST_CHAIN_BASENAMES, ...SCOPE_GUARD_FILES.map(file => basename(file))]);
+  ]);
   const scopes = ids.flatMap(id => {
     const card = readCard(id);
     const raw = typeof card?.scope === 'string' ? [card.scope] : card?.scope;
-    if (!Array.isArray(raw) || !raw.length || raw.some(s => typeof s !== 'string' || !s.trim())) refuse(`card ${id} missing or unreadable scope`);
-    const scope = raw.flatMap(member => {
-      // The repo root covers every gate home; retain it for the coverage refusal below.
-      const normalized = member.trim() === 'we:' ? ['we:'] : normalizeBriefScope([member]);
-      if (!normalized.length) refuse(`card ${id} empty scope member`);
-      return normalized.map(s => qualifyFile(s));
+    if (!Array.isArray(raw) || !raw.length) refuse(`card ${id} missing or unreadable scope`);
+    return raw.map(entry => {
+      const match = typeof entry === 'string' && /^([a-z-]+):(.+)$/i.exec(entry);
+      const prefix = match && match[1].toLowerCase();
+      const path = match && match[2];
+      const segments = path ? path.split('/') : [];
+      if (!match || /[\s,]/.test(entry) || !repoPrefixes.has(prefix)
+          || segments.some((segment, index) => !/^[a-z0-9_-][a-z0-9_.-]*$/i.test(segment)
+            || (index < segments.length - 1 && segment.includes('.')))
+          || !/\.(mjs|js|ts|json|md|sh|yml|yaml|css|html)$/.test(segments.at(-1))) {
+        refuse(`card ${id} scope entry ${JSON.stringify(entry)} must be an exact file path`);
+      }
+      if (protectedPaths.has(path) || protectedBasenames.has(basename(path))) {
+        refuse(`card ${id} scope entry ${JSON.stringify(entry)} overlaps gate file ${path}`);
+      }
+      return `${SCOPE_PREFIX_ALIASES[prefix] ?? prefix}:${path}`;
     });
-    if (!scope.length) refuse(`card ${id} empty scope`);
-    for (const entry of scope) {
-      for (const home of qualifiedGateFiles) {
-        if (scopeEntriesOverlap(entry, home)) refuse(`card ${id} scope overlaps gate file ${home}`);
-      }
-      const pathWithoutPrefix = entry.slice(entry.indexOf(':') + 1);
-      if (gateBasenames.has(basename(pathWithoutPrefix))) refuse(`card ${id} scope overlaps gate file ${pathWithoutPrefix}`);
-      // Only literal paths with known source extensions can bypass relocation checks.
-      if (/[*?]/.test(pathWithoutPrefix) || !/\.(mjs|js|ts|json|md|sh|yml|yaml|css|html)$/.test(pathWithoutPrefix)) {
-        // A gate member can move into any leased directory. For globs, retain the
-        // authored filename pattern so only candidates that it covers are refused.
-        const directory = /[*?]/.test(pathWithoutPrefix)
-          ? pathWithoutPrefix.slice(0, pathWithoutPrefix.lastIndexOf('/') + 1)
-          : `${pathWithoutPrefix.replace(/\/$/, '')}/`;
-        const prefix = entry.slice(0, entry.indexOf(':') + 1);
-        for (const file of gateBasenames) {
-          const candidate = `${prefix}${directory}${file}`;
-          if (scopeEntriesOverlap(entry, candidate)) refuse(`card ${id} scope overlaps gate file ${candidate}`);
-        }
-      }
-    }
-    return scope;
   });
   const prs = (options.readPrs ?? readPriorityPrs)();
   if (!Array.isArray(prs)) refuse('unreadable PR source');

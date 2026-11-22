@@ -13,14 +13,14 @@ const dirs = [];
 const at = '2026-11-20T12:00:00.000Z';
 const flags = ['--ids=42,43', '--mode=only', '--ttl-hours=2', '--actor=operator', '--reason=priority call'];
 afterEach(() => { for (const dir of dirs.splice(0)) fs.rmSync(dir, { recursive: true, force: true }); });
-function fixture(overrides = {}) {
+function fixture(overrides = {}, createOperation = createBuildPrioritySet) {
   const dir = fs.mkdtempSync(join(process.env.TMPDIR, 'build-priority-set-')); dirs.push(dir);
   const path = join(dir, 'build-priority.runtime.json');
-  const readCard = vi.fn(() => ({ scope: ['we:scripts/a.mjs scripts/a.test.mjs'] }));
+  const readCard = vi.fn(() => ({ scope: ['we:scripts/a.mjs', 'we:scripts/a.test.mjs'] }));
   const readPrs = vi.fn(() => []);
   const options = { env: { WE_BUILD_PRIORITY_RUNTIME_FILE: path }, readCard, readPrs, now: () => new Date(at), ...overrides };
   const command = async (argv = flags) => {
-    const operation = createBuildPrioritySet(options);
+    const operation = createOperation(options);
     const registry = createRegistry(); registry.register(operation.declaration);
     const outcome = await runOperationCli({ ...operation, registry, argv,
       store: createMemoryRunStore(), newRunId: () => 'priority-test' });
@@ -32,8 +32,7 @@ const changed = (flag, value) => [...flags.filter(s => !s.startsWith(`--${flag}=
 function untouched(f, names = []) { expect(fs.readdirSync(f.dir).sort()).toEqual(names.sort()); }
 
 it.each([
-  'we:scripts/lib/gate-config.mjs', 'we:scripts/', 'we:scripts/lib/',
-  'we:scripts/**', 'we:scripts/lib/*.mjs', 'we:',
+  'we:scripts/lib/gate-config.mjs',
   `we:${TRUST_CHAIN.find(m => m.file !== 'gate-config.mjs').homes[0]}`,
   'we:gate-config.mjs',
   'we:relocated/gate-config.mjs',
@@ -42,6 +41,11 @@ it.each([
   'we:scripts/operations/free-scope.mjs',
   'we:scripts/readiness/scope-lease.mjs',
   'we:scripts/lib/build-queue.mjs',
+  'we:scripts/lib/constellation-repos.mjs',
+  'we:scripts/lib/repo-names.mjs',
+  'we:scripts/lib/gh-throttle.mjs',
+  'plateau:relocated/constellation-repos.mjs',
+  'fui:relocated/gh-throttle.mjs',
   'we:scripts/operations/__tests__/build-priority-set.test.mjs',
   'we:scripts/operations/__tests__/build-priority-set-io-real.test.mjs',
   ...['build-priority-set-io.mjs', 'build-priority-set.mjs', 'free-scope.mjs',
@@ -52,25 +56,48 @@ it.each([
     const f = fixture({ readCard: id => ({ scope: id === '43' ? [scope] : ['we:scripts/a.mjs'] }) });
     const result = await f.command([...flags, ...(preview ? ['--preview'] : [])]);
     expect(result.code).not.toBe(0);
-    expect(result.lines.join('\n')).toMatch(/card 43.*gate file /);
+    expect(result.lines.join('\n')).toMatch(/card 43 scope entry .* overlaps gate file /);
     if (scope === 'we:scripts/lib/gate-config.mjs') expect(result.lines.join('\n')).toContain('scripts/lib/gate-config.mjs');
     untouched(f);
   }
 });
 
 it.each(['we:', 'plateau:', 'fui:', 'frontierui:', 'webeverything:', 'plateau-app:', 'pa:'].flatMap(prefix =>
-  ['tools/drain-daemon/', 'tools/drain-daemon/*.mjs', 'relocated/', 'relocated.v2', 'relocated/*.mjs',
-    'scripts/operations/build-priority-set-*.mjs', 'relocated/build-priority-set-*.mjs'].map(path => `${prefix}${path}`),
-))('refuses directory or glob gate coverage %s in preview and install', async scope => {
+  [
+    ['directory with trailing slash', 'scripts/'], ['bare repo prefix', ''],
+    ['star glob', 'scripts/*.mjs'], ['recursive glob', 'scripts/**'],
+    ['question glob', 'scripts/a?.mjs'], ['bracket glob', 'scripts/[a].mjs'],
+    ['brace glob', 'scripts/{a,b}.mjs'],
+    ['dotted directory without extension', 'relocated.v2'],
+    ['dotted directory with source extension', 'relocated.mjs/x.mjs'],
+    ['dotted directory with version', 'relocated.v2/x.mjs'],
+    ['dot-directory segment', 'scripts/.hidden/x.mjs'], ['hidden final segment', 'scripts/.x.mjs'],
+    ['no extension', 'scripts/Makefile'], ['unknown extension', 'scripts/a.exe'],
+    ['parent segment', 'scripts/../a.mjs'], ['current segment', 'scripts/./a.mjs'],
+    ['empty segment', 'scripts//a.mjs'], ['absolute path', '/scripts/a.mjs'],
+    ['whitespace and comma mixed', 'scripts/a.mjs, we:scripts/b.mjs'],
+    ['whitespace', 'scripts/a.mjs scripts/b.mjs'], ['trailing whitespace', 'scripts/a.mjs '], ['newline', 'scripts/a.mjs\n'],
+    ['backslash', 'scripts/\\a.mjs'],
+  ].map(([shape, path]) => [shape, `${prefix}${path}`]),
+))('refuses %s: %s in preview and install', async (_shape, scope) => {
   for (const preview of [false, true]) {
     const f = fixture({ readCard: id => ({ scope: id === '43' ? [scope] : ['we:scripts/a.mjs'] }) });
     const result = await f.command([...flags, ...(preview ? ['--preview'] : [])]);
     expect(result.code).not.toBe(0);
-    expect(result.lines.join('\n')).toMatch(/card 43 scope overlaps gate file/);
+    expect(result.lines.join('\n')).toContain(`card 43 scope entry ${JSON.stringify(scope)} must be an exact file path`);
     expect(f.readPrs).not.toHaveBeenCalled();
     untouched(f);
   }
 });
+
+it.each(['scripts/a.mjs', 'unknown:scripts/a.mjs'])(
+  'refuses an invalid or protected literal %s', async scope => {
+    const f = fixture({ readCard: () => ({ scope: [scope] }) });
+    const result = await f.command();
+    expect(result.code).not.toBe(0);
+    expect(result.lines.join('\n')).toContain(`card 42 scope entry ${JSON.stringify(scope)}`);
+    untouched(f);
+  });
 
 it.each(['we:', 'fui:'])(
   'refuses a non-gate literal scope overlapping an open PR directory in %s', async prefix => {
@@ -108,12 +135,55 @@ it.each([undefined, [], [42]])('refuses incomplete TRUST_CHAIN homes %j', async 
   } finally { member.homes = previous; }
 });
 
-it.each([{ gateFiles: ['scripts/lib/gate-config.mjs'] }, { gateFiles: () => ['scripts/lib/gate-config.mjs'] }])(
-  'refuses gate coverage with injected gate files %j', async ({ gateFiles }) => {
-    const f = fixture({ gateFiles, readCard: () => ({ scope: ['we:scripts/lib/'] }) });
-    expect((await f.command()).code).not.toBe(0);
+it.each(['we:', 'plateau:', 'fui:'].flatMap(prefix =>
+  ['scripts/custom-gate.mjs', 'relocated/custom-gate.mjs'].map(path => `${prefix}${path}`),
+))('refuses injected gate path or basename %s', async scope => {
+  for (const gateFiles of [['scripts/custom-gate.mjs'], () => ['scripts/custom-gate.mjs']]) {
+    const f = fixture({ gateFiles, readCard: () => ({ scope: [scope] }) });
+    const result = await f.command();
+    expect(result.code).not.toBe(0);
+    expect(result.lines.join('\n')).toContain(`card 42 scope entry ${JSON.stringify(scope)} overlaps gate file`);
     untouched(f);
+  }
+});
+
+it.each(['unreadable source', 'unresolvable relative import'])(
+  'refuses an incomplete import closure: %s', async failure => {
+    vi.resetModules();
+    const { createBuildPrioritySet: createFresh } = await import('../build-priority-set-io.mjs');
+    const original = fs.readFileSync;
+    const spy = vi.spyOn(fs, 'readFileSync').mockImplementation((path, ...args) => {
+      if (String(path).endsWith('/scripts/lib/constellation-repos.mjs')) {
+        if (failure === 'unreadable source') throw new Error('source unreadable');
+        return `${original(path, ...args)}\nimport missing from './missing-priority-closure.mjs';\n`;
+      }
+      return original(path, ...args);
+    });
+    try {
+      const f = fixture({}, createFresh);
+      const result = await f.command();
+      expect(result.code).not.toBe(0);
+      expect(result.lines.join('\n')).toMatch(/unreadable or unresolvable guard import.*repair evidence.*retry/);
+      expect(f.readPrs).not.toHaveBeenCalled();
+      untouched(f);
+    } finally { spy.mockRestore(); }
   });
+
+it('memoizes the transitive guard import closure across preview and installation', async () => {
+  vi.resetModules();
+  const { createBuildPrioritySet: createFresh } = await import('../build-priority-set-io.mjs');
+  const spy = vi.spyOn(fs, 'readFileSync');
+  try {
+    const f = fixture({}, createFresh);
+    expect((await f.command([...flags, '--preview'])).code).toBe(0);
+    const closureReads = spy.mock.calls.map(([path]) => String(path));
+    expect(closureReads.filter(path => path.endsWith('/scripts/lib/constellation-repos.mjs'))).toHaveLength(1);
+    expect(closureReads.filter(path => path.endsWith('/scripts/lib/repo-names.mjs'))).toHaveLength(1);
+    spy.mockClear();
+    expect((await f.command()).code).toBe(0);
+    expect(spy).not.toHaveBeenCalled();
+  } finally { spy.mockRestore(); }
+});
 
 it('refuses gate evidence that becomes unreadable under the writer lock', async () => {
   const gateFiles = vi.fn().mockReturnValueOnce(['scripts/lib/gate-config.mjs'])
@@ -131,13 +201,13 @@ it.each([{ gateFiles: ['scripts/unrelated.mjs'] }, { gateFiles: () => ['scripts/
     const f = fixture({ gateFiles, readCard: () => ({ scope: ['we:scripts/lib/gate-config.mjs'] }) });
     const result = await f.command();
     expect(result.code).not.toBe(0);
-    expect(result.lines.join('\n')).toMatch(/scope overlaps gate file/);
+    expect(result.lines.join('\n')).toMatch(/scope entry .* overlaps gate file/);
     expect(f.readPrs).not.toHaveBeenCalled();
     untouched(f);
   });
 
 it('installs a literal non-gate scope', async () => {
-  const f = fixture({ readCard: () => ({ scope: ['we:scripts/a.mjs'] }) });
+  const f = fixture({ readCard: () => ({ scope: ['we:scripts/conveyor/pr-stall-sweep.mjs'] }) });
   expect((await f.command()).code).toBe(0);
   expect(JSON.parse(fs.readFileSync(f.path, 'utf8')).ids).toEqual(['42', '43']);
 });
@@ -146,7 +216,7 @@ it.each(['fui:', 'plateau-app:', 'plateau:'])('refuses other-repo gate paths und
   const f = fixture({ readCard: () => ({ scope: [`${prefix}scripts/lib/gate-config.mjs`] }) });
   const result = await f.command();
   expect(result.code).not.toBe(0);
-  expect(result.lines.join('\n')).toMatch(/scope overlaps gate file/);
+  expect(result.lines.join('\n')).toMatch(/scope entry .* overlaps gate file/);
   expect(f.readPrs).not.toHaveBeenCalled();
   untouched(f);
 });
@@ -156,7 +226,7 @@ it('refuses the real cross-repo trust-chain daemon basename', async () => {
   const f = fixture({ readCard: () => ({ scope: ['plateau:tools/drain-daemon/daemon.mjs'] }) });
   const result = await f.command();
   expect(result.code).not.toBe(0);
-  expect(result.lines.join('\n')).toMatch(/scope overlaps gate file.*daemon\.mjs/);
+  expect(result.lines.join('\n')).toMatch(/scope entry .* overlaps gate file.*daemon\.mjs/);
   expect(f.readPrs).not.toHaveBeenCalled();
   untouched(f);
 });
@@ -241,7 +311,7 @@ it.each([
       const result = await f.command([...flags, ...(preview ? ['--preview'] : [])]);
       expect(result.code).not.toBe(0);
       if (scope.endsWith('/')) {
-        expect(result.lines.join('\n')).toMatch(/card 42 scope overlaps gate file/);
+        expect(result.lines.join('\n')).toMatch(/card 42 scope entry .* must be an exact file path/);
       } else {
         expect(result.lines.join('\n')).toContain(`scope overlaps open PR ${repo}#1`);
       }
@@ -305,7 +375,7 @@ it.each([
   fs.writeFileSync(f.path, 'old');
   const result = await f.command();
   expect(result.code).not.toBe(0);
-  if (_name === 'directory gate coverage') expect(result.lines.join('\n')).toMatch(/card 42 scope overlaps gate file/);
+  if (_name === 'directory gate coverage') expect(result.lines.join('\n')).toMatch(/card 42 scope entry .* must be an exact file path/);
   expect(fs.readFileSync(f.path, 'utf8')).toBe('old');
   untouched(f, ['build-priority.runtime.json']);
 });
@@ -417,14 +487,15 @@ it.each(['scripts/a.mjs', 'scripts/renamed.mjs'])('PR rename evidence blocks ove
   untouched(f);
 });
 
-it.each(['we:scripts/a.mjs', 'fui:scripts/a.mjs'])('treats PR filename %s as a literal path in its repo', async path => {
-  const f = fixture({ readCard: () => ({ scope: [`we:${path}`] }),
-    readPrs: () => [{ repo: 'web-everything/web-everything', number: 1, files: [path] }] });
-  const result = await f.command();
-  expect(result.code).not.toBe(0);
-  expect(result.lines.join('\n')).toContain('scope overlaps open PR');
-  untouched(f);
-});
+it.each(['we:scripts/a.mjs', 'fui:scripts/a.mjs'])(
+  'keeps PR filename %s literal without treating its colon as a repo prefix', async path => {
+    const readPrs = vi.fn(() => [{ repo: 'web-everything/web-everything', number: 1, files: [path] }]);
+    const f = fixture({ readCard: () => ({ scope: ['we:scripts/a.mjs'] }), readPrs });
+    const result = await f.command([...flags, '--preview']);
+    expect(result.code).toBe(0);
+    expect(readPrs).toHaveBeenCalledOnce();
+    untouched(f);
+  });
 
 it('refuses a delimiter-only scope member alongside a valid member', async () => {
   const f = fixture({ readCard: () => ({ scope: ['we:scripts/a.mjs', ',,,'] }) });
