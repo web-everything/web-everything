@@ -6345,3 +6345,39 @@ shards exactly as the default would, so it is still recognized as the default ga
 Gate ceilings get one capped retry tied to lane, head and killed job. Detached jobs settle in
 `verify-gate-job.mjs`, so recovery must cover that consumer as well as `verify-dispatch.mjs`'s
 in-process sweep. Persist the retry identity in job input to dedupe the enqueue-before-marker crash window.
+
+## Saved-conflict push race probes
+
+`resolved-side-branch-normal-verify.test.mjs` exercises the repository's normal pre-push hook with
+a changed remote advertisement. An API head re-read alone does not pin a plain push:
+Git must also refuse an advertised old oid that differs from the exact read head,
+then the server applies its ordinary compare-and-swap. Keep the no-force assertion,
+bare discovery/environment probe, post-push readback and no-personal-token
+negatives alongside this hook test. The daemon soak uses the real fix dispatcher
+to prove a saved repair push cannot immediately launch a fixer on its new head.
+
+
+## Saved repair push admission (Slice A audit)
+
+A saved lane ref and git ancestry are discovery evidence, never producer or verify
+proof. Require an automation-authored alt record with the full branch/SHA. The
+bare discovery transport never writes. Reuse load-flake IO to acquire a build lane
+at the saved SHA and run normal verify-lane with its sanitized environment. Red,
+unreadable or load-deferred verification publishes a head-bound stand-down and
+fix-question-asked, retaining no-relaunch suppression. Green verification still needs
+previous-head CI admission and all claim/head/base checks. Push only from that lane
+through the unchanged normal hook chain; its advertised-head restriction rejects
+a raced destination without force. Never replace the prototype-tracker gate with a
+private hook. A missing/obsolete hook requires operator inspection. Keep named
+normal-verify, red, load deferral, environment hygiene and real-hook payload tests
+in resolved-side-branch-normal-verify.test.mjs, alongside the behavior-based soak.
+Strict claim scans must reject corrupt entries and directory errors. Publish the
+repair handoff and any still-unanswered questions before making the new head
+visible; readback/record failures after success retain pushed-unrecorded status.
+Unscanned PRs are distinct from unreadable PRs and keep ordinary reconciliation.
+
+Saved-repair transport regressions must plant a real lane-local URL rewrite after
+verification and assert no transport command or credential delivery. Cover included
+and worktree configuration, URL-shaped remote aliases, proxy/auth/command settings,
+unreadable or oversized listings, and credential fill for a foreign host. The normal
+hook chain remains required; unsafe configuration is refused, never silently scrubbed.

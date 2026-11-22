@@ -1885,6 +1885,8 @@ export function runReconcileFixDispatch({
   tryResumeRound = isUnderTestEnv() ? null : tryResumeRoundFix,
   dispatch = dispatchFix,
   reconcile = runReconcilePass,
+  enrichResolvedBranches,
+  resolvedSideBranchPushes = [],
   readPrs,
   readFreshPr = readFreshFixPr,
   // Bypass pass-local plan caches: this must run the normal planner on the fresh single PR.
@@ -1974,6 +1976,7 @@ export function runReconcileFixDispatch({
   // stale. Run it for every repo.
   assertMainNotStale(root, checkStaleness, FIX_STALE_GUARD_OPTS);
   const reconciledRaw = reconcile({ repo, allowStandDownAutoProceed,
+    ...(enrichResolvedBranches ? { enrichResolvedBranches } : {}),
     ...(readPrs ? { readPrs } : {}),
     ...(prsFile ? { readPrs: () => readPrsFromFile(prsFile) } : {}) });
   // A DEFERRED read (gh low budget / slot throttle / author-lookup budget) planned nothing: owed is UNKNOWN, not zero.
@@ -2039,6 +2042,14 @@ export function runReconcileFixDispatch({
   reconciled = { ...reconciled, refusals: freshRefusals,
     dispatch: [...(Array.isArray(reconciled.dispatch) ? reconciled.dispatch : []), ...recovered] };
   if (netScope) reconciled = fixStep('net-scope', () => netScope(reconciled, { root, repoKey }));
+  // A push earlier THIS tick must not immediately launch from a stale bounce. Head binding makes this
+  // a same-tick backstop; the durable pre-push marker owes re-arm on subsequent ticks.
+  const pushedNow = entry => resolvedSideBranchPushes.some(row => row.repo === ghRepoSlug(repo ?? 'we')
+    && row.pr === entry.prNumber && row.sha === entry.headRefOid);
+  const pushedRows = (reconciled.dispatch ?? []).filter(pushedNow);
+  reconciled = { ...reconciled, dispatch: (reconciled.dispatch ?? []).filter(entry => !pushedNow(entry)),
+    refusals: [...(reconciled.refusals ?? []), ...pushedRows.map(entry => ({ ...entry,
+      kind: 'resolved-side-branch-owed', why: 'saved repair pushed this tick; waiting for the new head merge gate, no fixer launch' }))] };
   let dispatchEntries = reconciled.dispatch;
   const profile = resolveProfile(repoKey);
 

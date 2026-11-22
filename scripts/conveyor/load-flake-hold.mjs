@@ -1,3 +1,4 @@
+import { pushedResolvedRepairOwedRearm } from './resolved-side-branch.mjs';
 /**
  * we:scripts/conveyor/load-flake-hold.mjs — the load-flake hold readers production code uses (PR #3945 review).
  *
@@ -53,6 +54,8 @@ const REVIEW_ROUND_MARKERS = Object.freeze([
  * or review verdict has been posted since that push. Pure. Returns `{ sha, pushedAt }` or `null`.
  */
 export function pushedLoadFlakeFixOwedRearm({ comments, headRefOid, labels = [] }) {
+  const saved = pushedResolvedRepairOwedRearm({ comments, headRefOid, labels });
+  if (saved) return saved;
   const names = (Array.isArray(labels) ? labels : []).map((l) => (typeof l === 'string' ? l : l?.name));
   if (!names.includes('review:changes') || typeof headRefOid !== 'string' || !headRefOid) return null;
   const pushed = loadFlakeResults(comments).filter((r) => !r.redispatch && r.result === 'pushed').at(-1);

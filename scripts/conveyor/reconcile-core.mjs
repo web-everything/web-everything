@@ -1,3 +1,4 @@
+import { findResolvedSideBranch, resolvedSideBranchEvidenceReadable } from './resolved-side-branch.mjs';
 import { parseMqFailureRoute } from '../lib/mq-failure-route.mjs';
 import { admitMqFailureRoute } from './mq-failure-intake.mjs';
 import { ghRepoSlug } from '../lib/constellation-repos.mjs';
@@ -302,6 +303,7 @@ export const DISPATCH_KINDS = Object.freeze(['fix', 'review', 'ci-heal', 'ci-tim
  *   `scope-bloat` / `ruling-dispute` — see the comments on the list below.
  */
 export const REFUSAL_KINDS = Object.freeze([
+  'resolved-side-branch-owed', 'resolved-side-branch-unreadable',
   'fix-join-wait',
   'review-ci', 'review-referrals-pending', 'advisory-unreadable',
   'stood-down', 'load-flake-hold', 'load-flake-rearm-owed', 'no-findings', 'cap-exhausted',
@@ -2466,6 +2468,20 @@ export function planReconcile({
     const refuse = (kind, extra) => { refusals.push({ ...base, kind, ...extra,
       ...(kind === 'no-findings' ? { head: pr?.headRefOid ?? null,
         readAt: pr?.readAt ?? new Date(now).toISOString() } : {}) }); };
+    // A saved repair is owed a plain fast-forward push, even if the OLD head was held/red.
+    // This is not merge permission: no review, hold, label or gate state is changed.
+    if (Object.hasOwn(pr, 'resolvedSideBranches')) {
+      if (!resolvedSideBranchEvidenceReadable({ pr, branches: pr.resolvedSideBranches })) {
+        refuse('resolved-side-branch-unreadable', { why: 'saved-branch evidence unreadable/oversized; operator inspection required, no fixer launch' });
+        continue;
+      }
+      const saved = findResolvedSideBranch({ pr, branches: pr.resolvedSideBranches });
+      if (saved) {
+        refuse('resolved-side-branch-owed', { branch: saved.name, sha: saved.sha,
+          why: 'resolved side branch owed a fast-forward push; no fixer launch; the new head still requires the normal merge gate' });
+        continue;
+      }
+    }
     // A comment list that may be cut at the list page (exactly 100, not marked complete by the reader) hides every
     // marker after comment 100: the rearm count reads low, a stand-down or a spent takeover reads absent — each one
     // fails OPEN. Nothing is decided for this PR on such a view; the reconcile pass's readers re-read the thread in

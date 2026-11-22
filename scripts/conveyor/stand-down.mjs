@@ -42,6 +42,7 @@ import { repoKeyForSlug } from '../lib/constellation-repos.mjs';
 import { execFileSync } from 'node:child_process';
 import { resolveChildTimeoutMs } from '../lib/bounded-child.mjs';
 import { isTrustedMarkerAuthor } from '../lib/marker-authorship.mjs';
+import { appendDaemonEvent } from '../lib/daemon-events.mjs';
 import { readBotLogins } from '../lib/github-app-identity.mjs';
 import { cascadePolicy } from '../lib/policy-cascade.mjs';
 
@@ -776,6 +777,12 @@ export function buildStandDownComment({ actor = 'conveyor fix agent', reason = '
 }
 
 // ── IO SHELL (runs only as a CLI — the pure exports above stay side-effect-free on import) ────────────────────────
+/** Watch-visible question event, separate from filtered fix-stood-down/status:needs-you kinds.
+ * Called only after the durable question/comment succeeds. No PR prose enters the terminal/event kind.
+ */
+export function emitFixQuestion({ repo, pr, head = null }, emit = appendDaemonEvent) {
+  return emit({ kind: 'fix-question-asked', repo, pr, daemon: 'conveyor-fix', detail: { head, needsYou: true } });
+}
 const IS_CLI = process.argv[1] && resolve(process.argv[1]) === resolve(new URL(import.meta.url).pathname);
 if (IS_CLI) {
   const argv = process.argv.slice(2);
@@ -862,6 +869,8 @@ if (IS_CLI) {
   // above is the durable record the planner reads; a failed label write is reported, never fatal.
   let labeled = false;
   if (!concurrent && !loadHold && !redispatch) {
+    await emitFixQuestion({ repo: typeof flags.repo === 'string' ? flags.repo : 'web-everything/web-everything', pr,
+      head: isSafeGitSha(flags.head) ? flags.head : null });
     try {
       gh(['label', 'create', STAND_DOWN_LABEL, ...repoArgs, '--color', 'b60205', '--description', 'a fixer stood down; a person is the next step (auto-managed)', '--force']);
       if (supersededBy) gh(['label', 'create', SUPERSEDED_LABEL, ...repoArgs, '--color', '6e7781', '--description', 'a merged PR declares it supersedes this one; closing needs an operator decision (auto-managed)', '--force']);

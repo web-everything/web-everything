@@ -304,9 +304,9 @@ export function releaseFixClaim({ repo, pr, who, sessionId = null, token = null,
 }
 
 /** Every LIVE fix claim (optionally for one repo). */
-export function listLiveFixClaims({ repo = null, lockRoot = fixDispatchClaimRoot(), nowMs = Date.now() } = {}) {
+export function listLiveFixClaims({ repo = null, strict = false, lockRoot = fixDispatchClaimRoot(), nowMs = Date.now() } = {}) {
   const repoKey = repo == null ? null : repoKeyOf(repo);
-  return listFixDispatchClaims(lockRoot)
+  return listFixDispatchClaims(lockRoot, { strict })
     .filter((e) => e.meta?.kind === FIXING_KIND && (repoKey == null || e.meta.repo === repoKey))
     .filter((e) => isLiveFixClaim(e, nowMs));
 }
@@ -318,13 +318,13 @@ export function listLiveFixClaims({ repo = null, lockRoot = fixDispatchClaimRoot
  * @returns {null | {refused:true, pr:number, repo:string, holder:string, why:string, message:string}}
  */
 export function pushRefusal({
-  repo = null, branch, sessionId = null, who = null, token = null, lockRoot = fixDispatchClaimRoot(), nowMs = Date.now(),
+  repo = null, branch, sessionId = null, who = null, token = null, strict = false, lockRoot = fixDispatchClaimRoot(), nowMs = Date.now(),
 } = {}) {
   const b = normalizeBranch(branch);
   if (!b) return null;
   let repoKey = null;
   try { repoKey = repo == null ? null : repoKeyOf(repo); } catch { repoKey = null; }
-  const claims = listLiveFixClaims({ lockRoot, nowMs })
+  const claims = listLiveFixClaims({ lockRoot, nowMs, strict })
     .filter((e) => e.meta?.branch === b && (repoKey == null || e.meta.repo === repoKey));
   for (const entry of claims) {
     if (isClaimHolder(entry, { sessionId, who, token })) continue;
