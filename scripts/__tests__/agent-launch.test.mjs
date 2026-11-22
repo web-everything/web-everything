@@ -260,7 +260,7 @@ describe('B5 same executable as main or refuse', () => {
     expect(probe.stdout).toBe('wrapper');
     noSpawn({ PATH }, /binary.*differ|identity/);
   });
-  it('checks symlink-parent PATH traversal against the actual executable', () => {
+  it.each(['child PATH', 'fixed binary'])('checks symlink-parent traversal in %s against the actual executable', source => {
     const other = join(root, 'other'); mkdirSync(other);
     mkdirSync(join(other, 'nested')); mkdirSync(join(other, 'bin'));
     symlinkSync(join(other, 'nested'), join(root, 'link'));
@@ -269,11 +269,16 @@ describe('B5 same executable as main or refuse', () => {
     const probe = spawnSync('codex', [], { env: { PATH }, encoding: 'utf8', timeout: 5000, maxBuffer: 8192 });
     expect(probe.status, probe.stderr).toBe(0);
     expect(probe.stdout).toBe('wrapper');
-    noSpawn({ PATH }, /binary.*differ|identity/);
+    const io = seam();
+    const descriptor = { ...base(), env: { PATH: source === 'child PATH' ? PATH : bin } };
+    if (source === 'fixed binary') io.resolveBinary.mockReturnValue(`${PATH}/codex`);
+    expect(() => launchAgent(descriptor, io)).toThrow(/binary.*differ|identity/);
+    expect(io.spawn).not.toHaveBeenCalled();
     rmSync(join(other, 'bin', 'codex'));
     symlinkSync(binary, join(other, 'bin', 'codex'));
-    const io = seam(); launchAgent({ ...base(), env: { PATH } }, io);
-    expect(io.spawn.mock.calls[0][2].env.PATH).toBe(PATH);
+    launchAgent(descriptor, io);
+    expect(io.spawn.mock.calls[0][2].env.PATH).toBe(descriptor.env.PATH);
+    expect(io.spawn.mock.calls[0][0]).toBe(source === 'fixed binary' ? `${PATH}/codex` : binary);
   });
   it('compares review binary identity against caller PATH without adding a prefix', () => {
     const wrapper = join(root, 'review-wrapper'); mkdirSync(wrapper);

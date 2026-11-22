@@ -773,8 +773,9 @@ describe('standalone task types and workers', () => {
         fs.accessSync = (file, ...args) => originalAccess(fixturePath(file), ...args);
         cp.spawn = (file, ...args) => originalSpawn(fixturePath(file), ...args);
         const original = fs.realpathSync;
-        fs.realpathSync = Object.assign((file, ...args) => file === '/usr/bin/codex'
-          ? ${JSON.stringify(binary)} : original(file, ...args), original);
+        fs.realpathSync = Object.assign((file, ...args) => original(fixturePath(file), ...args), original, {
+          native: (file, ...args) => original.native(fixturePath(file), ...args),
+        });
         syncBuiltinESMExports();`);
       const worker = { ...codex, model: 'gpt-6.1-sol', effort: 'low', taskType: 'prepare' };
       const argv = lightWorkerArgv({ worker, lanePath: '/lanes/22', taskFile: join(dir, 'task.md'), card: 1 })

@@ -74,8 +74,10 @@ const fixtureBinaryPreload = `
   const fixtureBinaryPath = file => file === '/usr/bin/codex' ? ${JSON.stringify(FAKE_CODEX_BINARY)} : file;
   binaryFs.statSync = (file, ...args) => originalBinaryFs.statSync(fixtureBinaryPath(file), ...args);
   binaryFs.accessSync = (file, ...args) => originalBinaryFs.accessSync(fixtureBinaryPath(file), ...args);
-  binaryFs.realpathSync = Object.assign((file, ...args) => file === '/usr/bin/codex'
-    ? ${JSON.stringify(FAKE_CODEX_BINARY)} : originalBinaryFs.realpathSync(file, ...args), originalBinaryFs.realpathSync);
+  binaryFs.realpathSync = Object.assign((file, ...args) => originalBinaryFs.realpathSync(fixtureBinaryPath(file), ...args),
+    originalBinaryFs.realpathSync, {
+      native: (file, ...args) => originalBinaryFs.realpathSync.native(fixtureBinaryPath(file), ...args),
+    });
 `;
 
 // Historical orchestration fixtures isolate the new independently tested self-review.

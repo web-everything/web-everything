@@ -206,7 +206,9 @@ export function buildAgentInvocation(descriptor, io) {
   try { if (!statSync(d.cwd).isDirectory()) fail('cwd must be an existing directory'); }
   catch { fail('cwd must be an existing directory'); }
   const file = absolute((io?.resolveBinary ?? resolveBinary)(d.agent), 'resolved binary');
-  if (d.agent === 'codex' && realpathSync(firstCodex(env.PATH)) !== realpathSync(file)) {
+  // The JS realpath implementation normalizes '..' before walking symlinks.
+  // Native resolution preserves the lookup semantics used by stat/access and exec.
+  if (d.agent === 'codex' && realpathSync.native(firstCodex(env.PATH)) !== realpathSync.native(file)) {
     fail('codex binary identity differs from child PATH; align PATH with the fixed installation and retry');
   }
   return { file, args, options: { shell: false, cwd: d.cwd, env, stdio: ['pipe', 'pipe', 'pipe'], detached: d.processGroup === true } };
