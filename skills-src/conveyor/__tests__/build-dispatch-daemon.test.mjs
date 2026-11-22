@@ -1785,7 +1785,10 @@ describe('build-dispatch-daemon.mjs boots as a fresh `node` process — the clas
     // diagnostic means degraded policy/store reads and must fail, even when the daemon reaches usage.
     const expectedStartupLine = l => l.startsWith('policy-cascade ·')
       || /^\(node:\d+\) \[DEP0040\] DeprecationWarning: The `punycode` module is deprecated\. Please use a userland alternative instead\.$/.test(l)
-      || l === '(Use `node --trace-deprecation ...` to show where the warning was created)';
+      || l === '(Use `node --trace-deprecation ...` to show where the warning was created)'
+      // Older Node 22 releases (e.g. 22.1) also warn once on any JSON module import; newer ones do not.
+      || /^\(node:\d+\) ExperimentalWarning: Importing JSON modules is an experimental feature and might change at any time$/.test(l)
+      || l === '(Use `node --trace-warnings ...` to show where the warning was created)';
     expect(lines.slice(0, usageAt).every(expectedStartupLine)).toBe(true);
     expect([
       'operator-override: operator-db-invalid host.maxReviewDispatchPerTick (invalid type or outside hard range); repair the store before using this policy',
