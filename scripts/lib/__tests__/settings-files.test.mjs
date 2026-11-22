@@ -445,7 +445,7 @@ describe('the real layout (we:scripts/settings/ + legacy dispatch-settings.json)
   });
 
   it('declares the build-priority scope allowlist in its feature file', () => {
-    expect(real.settings.allowedFiles).toEqual(['scripts/conveyor/pr-stall-sweep.mjs']);
+    expect(real.settings.allowedFiles).toEqual(['scripts/lib/ledger-readiness-daily.mjs']);
     expect(real.owners.allowedFiles).toBe('settings/build-priority-scope.json');
   });
 

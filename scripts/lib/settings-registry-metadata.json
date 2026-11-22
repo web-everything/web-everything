@@ -3,7 +3,7 @@
   "settings": {
     "allowedFiles": {
       "owner": "scripts/settings/build-priority-scope.json",
-      "description": "Named regular-file WE scopes for build-priority-set; protected names/markers and unreadable or over-64-KiB main content refuse (human review required).",
+      "description": "Exact-case WE files from pinned main; GUARD_FLOOR/LOCK_USERS, guard names/markers and unreadable or over-64-KiB evidence refuse (human review required).",
       "changeVia": "pr",
       "instant": true
     },

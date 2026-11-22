@@ -14,7 +14,7 @@ const dirs = [];
 const at = '2026-11-20T12:00:00.000Z';
 const flags = ['--ids=42,43', '--mode=only', '--ttl-hours=2', '--actor=operator', '--reason=priority call'];
 afterEach(() => { for (const dir of dirs.splice(0)) fs.rmSync(dir, { recursive: true, force: true }); });
-function fixture({ allowedFiles = ['scripts/conveyor/a.mjs', 'scripts/conveyor/a.test.mjs', 'scripts/conveyor/pr-stall-sweep.mjs', 'scripts/conveyor/renamed.mjs'], ...overrides } = {}, createOperation = createBuildPrioritySet) {
+function fixture({ allowedFiles = ['scripts/conveyor/a.mjs', 'scripts/conveyor/a.test.mjs', 'scripts/lib/ledger-readiness-daily.mjs', 'scripts/conveyor/renamed.mjs'], ...overrides } = {}, createOperation = createBuildPrioritySet) {
   const dir = fs.mkdtempSync(join(process.env.TMPDIR, 'build-priority-set-')); dirs.push(dir);
   const path = join(dir, 'build-priority.runtime.json');
   const settingsDir = fs.mkdtempSync(join(process.env.TMPDIR, 'priority-scope-')); dirs.push(settingsDir);
@@ -22,7 +22,7 @@ function fixture({ allowedFiles = ['scripts/conveyor/a.mjs', 'scripts/conveyor/a
   fs.writeFileSync(scopeSettingsPath, JSON.stringify({ allowedFiles: allowedFiles.filter(file => /\.(mjs|js|ts|json|md|sh|yml|yaml|css|html)$/i.test(file)).concat('scripts/conveyor/a.mjs') }));
   const readCard = vi.fn(() => ({ scope: ['we:scripts/conveyor/a.mjs', 'we:scripts/conveyor/a.test.mjs'] }));
   const readPrs = vi.fn(() => []);
-  const options = { env: { WE_BUILD_PRIORITY_RUNTIME_FILE: path }, readCard, readPrs, pathType: () => 'file', readContent: () => 'export {};\n', scopeSettingsPath, now: () => new Date(at), ...overrides };
+  const options = { env: { WE_BUILD_PRIORITY_RUNTIME_FILE: path }, readCard, readPrs, pathType: () => 'file', readContent: () => 'export {};\n', readScopeSettings: () => fs.readFileSync(scopeSettingsPath, 'utf8'), now: () => new Date(at), ...overrides };
   const command = async (argv = flags) => {
     const operation = createOperation(options);
     const registry = createRegistry(); registry.register(operation.declaration);
@@ -140,7 +140,7 @@ it.each(['missing', 'unreadable', '', '{', '{}', 'null', '{"allowedDirs":["scrip
 ])('refuses missing, unreadable or malformed scope settings %j', async contents => {
   const f = fixture();
   const settingsPath = join(f.dir, 'scope.json');
-  f.options.scopeSettingsPath = settingsPath;
+  f.options.readScopeSettings = () => fs.readFileSync(settingsPath, 'utf8');
   if (contents === 'unreadable') fs.mkdirSync(settingsPath);
   else if (contents !== 'missing') fs.writeFileSync(settingsPath, contents);
   const result = await f.command();
@@ -148,6 +148,52 @@ it.each(['missing', 'unreadable', '', '{', '{}', 'null', '{"allowedDirs":["scrip
   expect(result.lines.join('\n')).toMatch(/scope settings.*repair evidence.*retry/);
   expect(f.readPrs).not.toHaveBeenCalled();
   untouched(f, contents === 'missing' ? [] : ['scope.json']);
+});
+
+it('ignores a broader worktree allowlist and uses the pinned snapshot allowlist', async () => {
+  const sha = 'a'.repeat(40);
+  const settings = 'scripts/settings/build-priority-scope.json';
+  const git = vi.fn(args => {
+    if (args[0] === 'rev-parse') return sha;
+    if (args[0] === 'show' && args[1] === `${sha}:${settings}`) {
+      return '{"allowedFiles":["scripts/lib/ledger-readiness-daily.mjs"]}';
+    }
+    if (args[0] === 'ls-tree') return 'backlog/42-example.md\0';
+    if (args[0] === 'show') return '---\nscope: ["we:scripts/lib/unlisted.mjs"]\n---\n';
+    throw new Error('unexpected git read');
+  });
+  const f = fixture({ allowedFiles: ['scripts/lib/unlisted.mjs'],
+    readCard: readPriorityCards({ git }), readScopeSettings: undefined });
+  const worktree = join(f.dir, 'scope.json');
+  fs.writeFileSync(worktree, '{"allowedFiles":["scripts/lib/unlisted.mjs"]}');
+  f.options.scopeSettingsPath = worktree;
+  const result = await f.command();
+  expect(result.code).not.toBe(0);
+  expect(result.lines.join('\n')).toContain('outside allowedFiles');
+  expect(git).toHaveBeenCalledWith(['show', `${sha}:${settings}`], { maxBuffer: 65536 });
+  expect(f.readPrs).not.toHaveBeenCalled();
+  untouched(f, ['scope.json']);
+});
+
+it.each(['missing', 'unreadable'])('refuses %s snapshot settings despite a readable worktree allowlist', async evidence => {
+  const git = vi.fn(args => {
+    if (args[0] === 'rev-parse') return 'a'.repeat(40);
+    throw new Error(evidence);
+  });
+  const f = fixture({ readCard: readPriorityCards({ git }), readScopeSettings: undefined });
+  const result = await f.command();
+  expect(result.code).not.toBe(0);
+  expect(result.lines.join('\n')).toMatch(/scope settings.*repair evidence.*retry/);
+  expect(f.readPrs).not.toHaveBeenCalled();
+  untouched(f);
+});
+
+it('refuses oversized snapshot settings with an operator fallback', async () => {
+  const f = fixture({ readScopeSettings: () => JSON.stringify({ allowedFiles: ['scripts/conveyor/a.mjs'] }) + ' '.repeat(65536) });
+  const result = await f.command();
+  expect(result.code).not.toBe(0);
+  expect(result.lines.join('\n')).toMatch(/scope settings.*64 KB.*human review.*retry/);
+  untouched(f);
 });
 
 it.each(['we:', 'plateau:', 'fui:', 'frontierui:', 'webeverything:', 'plateau-app:', 'pa:'].flatMap(prefix =>
@@ -271,7 +317,7 @@ it('rechecks scope settings under the writer lock', async () => {
   const f = fixture();
   const path = join(f.dir, 'scope.json');
   fs.writeFileSync(path, '{"allowedFiles":["scripts/conveyor/a.mjs","scripts/conveyor/a.test.mjs"]}');
-  f.options.scopeSettingsPath = path;
+  f.options.readScopeSettings = () => fs.readFileSync(path, 'utf8');
   f.options.readPrs = () => { fs.unlinkSync(path); return []; };
   const result = await f.command();
   expect(result.code).not.toBe(0);
@@ -287,25 +333,58 @@ it.each(['', `100644 blob ${'a'.repeat(40)}\tscripts/conveyor/wrong.mjs\0`,
   expect(read.pathType('scripts/conveyor/a.mjs')).not.toBe('file');
 });
 
-it('normalizes scope, allowed file and PR paths case-insensitively', async () => {
+it('keeps PR overlap comparisons case-insensitive', async () => {
   const pathType = vi.fn(() => 'file');
-  const f = fixture({ readCard: () => ({ scope: ['WE:SCRIPTS/CONVEYOR/A.MJS'] }), pathType,
+  const f = fixture({ pathType,
     readPrs: () => [{ repo: 'web-everything/web-everything', number: 1, files: ['SCRIPTS/CONVEYOR/A.MJS'] }] });
-  const path = join(f.dir, 'scope.json');
-  fs.writeFileSync(path, '{"allowedFiles":["SCRIPTS/CONVEYOR/A.MJS"]}');
-  f.options.scopeSettingsPath = path;
   const result = await f.command();
   expect(result.code).not.toBe(0);
   expect(pathType).toHaveBeenCalledWith('scripts/conveyor/a.mjs');
   expect(result.lines.join('\n')).toMatch(/scope overlaps open PR/);
-  untouched(f, ['scope.json']);
+  untouched(f);
 });
 
-it('installs the listed pr-stall-sweep scope with injected content', async () => {
-  const f = fixture({ scopeSettingsPath: undefined, readCard: () => ({ scope: ['we:scripts/conveyor/pr-stall-sweep.mjs'] }) });
+it.each(['scripts/lib/Ledger-Readiness-Daily.mjs', 'SCRIPTS/LIB/LEDGER-READINESS-DAILY.MJS'])(
+  'refuses scope casing different from the allowlist: %s', async path => {
+    const pathType = vi.fn(() => 'file');
+    const f = fixture({ readCard: () => ({ scope: [`we:${path}`] }), pathType });
+    const result = await f.command();
+    expect(result.code).not.toBe(0);
+    expect(result.lines.join('\n')).toMatch(/outside allowedFiles/);
+    expect(pathType).not.toHaveBeenCalled();
+    untouched(f);
+  });
+
+it('preserves exact allowed-file casing for the tree check', async () => {
+  const path = 'scripts/lib/Ledger-Readiness-Daily.mjs';
+  const pathType = vi.fn(() => 'missing');
+  const f = fixture({ allowedFiles: [path], readCard: () => ({ scope: [`we:${path}`] }), pathType });
+  const result = await f.command();
+  expect(result.code).not.toBe(0);
+  expect(pathType).toHaveBeenCalledWith(path);
+  expect(result.lines.join('\n')).toMatch(/not a readable regular file/);
+  untouched(f);
+});
+
+it('installs the listed ledger-readiness-daily scope with injected snapshot content', async () => {
+  const f = fixture({ allowedFiles: ['scripts/lib/ledger-readiness-daily.mjs'],
+    readCard: () => ({ scope: ['we:scripts/lib/ledger-readiness-daily.mjs'] }) });
   expect((await f.command()).code).toBe(0);
   expect(JSON.parse(fs.readFileSync(f.path, 'utf8')).ids).toEqual(['42', '43']);
 });
+
+it.each(['scripts/conveyor/pr-stall-sweep.mjs', 'scripts/lib/x-merge-y.mjs',
+  'SCRIPTS/LIB/X-MERGE-Y.MJS', 'SCRIPTS/CONVEYOR/PR-STALL-SWEEP.MJS'])(
+  'refuses GUARD_FLOOR / LOCK_USERS path %s even when allowed', async path => {
+    for (const preview of [false, true]) {
+      const f = fixture({ allowedFiles: [path], readCard: () => ({ scope: [`we:${path}`] }) });
+      const result = await f.command([...flags, ...(preview ? ['--preview'] : [])]);
+      expect(result.code).not.toBe(0);
+      expect(result.lines.join('\n')).toMatch(/overlaps gate file/);
+      expect(f.readPrs).not.toHaveBeenCalled();
+      untouched(f);
+    }
+  });
 
 it.each(['guard-1c-mutation-check.mjs', 'build-dispatch-policy.mjs', 'x-gate.mjs', 'merge-gate-y.mjs',
   'review-gate-x.mjs', 'x-gate-y.mjs', 'x-guardrail.mjs', 'GUARD-UPPER.MJS'])(
@@ -314,7 +393,7 @@ it.each(['guard-1c-mutation-check.mjs', 'build-dispatch-policy.mjs', 'x-gate.mjs
     const f = fixture({ allowedFiles: [path], readCard: () => ({ scope: [`we:${path}`] }) });
     const result = await f.command();
     expect(result.code).not.toBe(0);
-    expect(result.lines.join('\n')).toMatch(/guard name/);
+    expect(result.lines.join('\n')).toContain(name === 'build-dispatch-policy.mjs' ? 'has a guard name' : 'overlaps gate file');
     expect(f.readPrs).not.toHaveBeenCalled();
     untouched(f);
   });

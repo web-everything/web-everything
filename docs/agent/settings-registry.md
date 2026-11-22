@@ -61,7 +61,7 @@ Operator-prefs layer: ~/.plateau/platform-preferences.json is the requested oper
 | advisorySeats | scripts/settings/review.json | 1 | {"antigravityReview":"probation"} | pr | no | Provider advisory review seating policy. |
 | aiRouting | scripts/settings/ai-routing.json | 0 | {} | pr | no | AI role routing overrides; empty preserves existing resolvers. |
 | alertAfterMinutes | scripts/settings/forge-share.json | 1 | 60 | pr | no | Duration before low remote execution share raises an alert. |
-| allowedFiles | scripts/settings/build-priority-scope.json | 1 | ["scripts/conveyor/pr-stall-sweep.mjs"] | pr | yes | Named regular-file WE scopes for build-priority-set; protected names/markers and unreadable or over-64-KiB main content refuse (human review required). |
+| allowedFiles | scripts/settings/build-priority-scope.json | 1 | ["scripts/lib/ledger-readiness-daily.mjs"] | pr | yes | Exact-case WE files from pinned main; GUARD_FLOOR/LOCK_USERS, guard names/markers and unreadable or over-64-KiB evidence refuse (human review required). |
 | allowedKinds | scripts/settings/agy-build.json | 1 | ["doc-fix"] | env | no | Doc-fix only; test-fix refused until #8606 regardless of settings. Production confinement unavailable; repair size 1. |
 | allowedSigners | scripts/settings/card-ledger-trust.json | 1 | [] | pr | no | Trusted card-ledger signers. |
 | archive | scripts/settings/archive-retention.json | 1 | {"runsBatchCap":5000} | pr | no | Archive retention and bounded archive batch policy. |

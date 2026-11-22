@@ -1,6 +1,6 @@
 /** Real git fidelity: the card reader runs real git against a real repo with a real origin/main ref. */
 import { execFileSync } from 'node:child_process';
-import { chmodSync, symlinkSync } from 'node:fs';
+import { chmodSync, symlinkSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { expect, it } from 'vitest';
 import { withRealRepo } from './helpers/real-repo.mjs';
@@ -20,7 +20,7 @@ it('reads the real remote main despite a shadowing local branch and refuses a mi
 
 it('refuses real directory, ancestor, missing and symlink tree entries; accepts only regular blob modes on the pinned card SHA', async () => {
   await withRealRepo(async ctx => {
-    const regular = 'scripts/conveyor/a.mjs', executable = 'scripts/conveyor/pr-stall-sweep.mjs';
+    const regular = 'scripts/conveyor/a.mjs', executable = 'scripts/lib/ledger-readiness-daily.mjs';
     ctx.commit({
       'backlog/42-example.md': '---\nscope: ["we:scripts/conveyor/a.mjs"]\n---\n',
       [regular]: 'export {};\n', [executable]: 'export {};\n',
@@ -39,6 +39,7 @@ it('refuses real directory, ancestor, missing and symlink tree entries; accepts 
     ctx.git(['rm', '--quiet', '--', regular]);
     ctx.git(['commit', '--quiet', '-m', 'fixture: remove regular file']);
     ctx.git(['update-ref', 'refs/remotes/origin/main', 'HEAD']);
+    expect(read.pathType('scripts/conveyor/A.mjs')).not.toBe('file');
     expect(read.pathType(regular)).toBe('file');
     expect(read.pathType(executable)).toBe('file');
     expect(readPriorityCards({ git: args => ctx.git(args) }).pathType(regular)).not.toBe('file');
@@ -47,7 +48,7 @@ it('refuses real directory, ancestor, missing and symlink tree entries; accepts 
 
 it('reads bounded content from the pinned main blob despite worktree and ref changes', async () => {
   await withRealRepo(async ctx => {
-    const path = 'scripts/conveyor/pr-stall-sweep.mjs';
+    const path = 'scripts/lib/ledger-readiness-daily.mjs';
     ctx.commit({ [path]: '// @guard\n' });
     ctx.git(['update-ref', 'refs/remotes/origin/main', 'HEAD']);
     const calls = [];
@@ -64,12 +65,43 @@ it('reads bounded content from the pinned main blob despite worktree and ref cha
 
 it('bounds real Git content output at 64 KiB and refuses overflow', async () => {
   await withRealRepo(async ctx => {
-    const path = 'scripts/conveyor/pr-stall-sweep.mjs';
+    const path = 'scripts/lib/ledger-readiness-daily.mjs';
     ctx.commit({ [path]: 'x'.repeat(65537) });
     ctx.git(['update-ref', 'refs/remotes/origin/main', 'HEAD']);
     const read = readPriorityCards({ git: (args, options) => execFileSync('git', args, {
       encoding: 'utf8', timeout: 10000, cwd: ctx.root, ...options,
     }) });
     expect(() => read.readContent(path)).toThrow(/ENOBUFS/);
+  });
+});
+
+it('reads scope settings from the same pinned SHA as cards and ignores broader worktree and ref state', async () => {
+  await withRealRepo(async ctx => {
+    const settings = 'scripts/settings/build-priority-scope.json';
+    const seed = 'scripts/lib/ledger-readiness-daily.mjs';
+    const original = JSON.stringify({ allowedFiles: [seed] });
+    ctx.commit({ [settings]: original, 'backlog/42-example.md': '---\nscope: ["we:scripts/lib/ledger-readiness-daily.mjs"]\n---\n' });
+    ctx.git(['update-ref', 'refs/remotes/origin/main', 'HEAD']);
+    const sha = ctx.git(['rev-parse', 'HEAD']).trim();
+    const calls = [];
+    const read = readPriorityCards({ git: (args, options) => { calls.push(args); return ctx.git(args); } });
+    read('42');
+    const broader = JSON.stringify({ allowedFiles: [seed, 'scripts/lib/unlisted.mjs'] });
+    writeFileSync(join(ctx.root, settings), broader);
+    expect(read.readScopeSettings()).toBe(original);
+    ctx.commit({ [settings]: broader });
+    ctx.git(['update-ref', 'refs/remotes/origin/main', 'HEAD']);
+    expect(read.readScopeSettings()).toBe(original);
+    expect(calls.filter(args => args[0] === 'show')).toContainEqual(['show', `${sha}:${settings}`]);
+    expect(readPriorityCards({ git: args => ctx.git(args) }).readScopeSettings()).toBe(broader);
+  });
+});
+
+it('refuses missing scope settings at the snapshot even when present in the worktree', async () => {
+  await withRealRepo(async ctx => {
+    ctx.commit({ 'scripts/settings/other.json': '{}' });
+    ctx.git(['update-ref', 'refs/remotes/origin/main', 'HEAD']);
+    writeFileSync(join(ctx.root, 'scripts/settings/build-priority-scope.json'), '{"allowedFiles":["scripts/lib/ledger-readiness-daily.mjs"]}');
+    expect(() => readPriorityCards({ git: args => ctx.git(args) }).readScopeSettings()).toThrow();
   });
 });

@@ -11,6 +11,8 @@ import { SCOPE_PREFIX_ALIASES } from './dispatch-lane.mjs';
 import { GH_LIST_FILE_CAP, prHoldsFile, repoKeyFor } from './free-scope.mjs';
 import { resolveCoordinationRoot } from './coordination-root.mjs';
 import { buildPrioritySetOperation, BUILD_PRIORITY_SET_EFFECT, validateBuildPriorityInput } from './build-priority-set.mjs';
+import { GUARD_FLOOR, LOCK_USERS } from '../lib/audit-settings.mjs';
+import { matchesSome } from './audit-verdict.mjs';
 import { TRUST_CHAIN } from '../lib/gate-config.mjs';
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '../..');
@@ -24,7 +26,7 @@ const EXECUTION_CONTROLS = [
 const GUARD_DEPENDENCY_BASENAMES = new Set([
   'atomic-json-file.mjs', 'automation-home.mjs', 'backlog-status.cjs',
   'bounded-child.mjs', 'build-priority-set-io.mjs', 'build-priority-set.mjs',
-  'runtime-admission.mjs', 'audit-settings.mjs', 'audit-path.mjs', 'build-policy.mjs',
+  'runtime-admission.mjs', 'audit-verdict.mjs', 'audit-settings.mjs', 'audit-path.mjs', 'build-policy.mjs',
   'build-queue.mjs', 'command-redact.mjs', 'constellation-repos.mjs',
   'container-exec.mjs', 'coordination-root.mjs', 'daemon-clone-layout.mjs',
   'daemon-events.mjs', 'daemon-last-good.mjs', 'declared-homes.mjs',
@@ -58,25 +60,27 @@ const GUARD_DEPENDENCY_BASENAMES = new Set([
 ]);
 const SCOPE_SETTINGS = 'scripts/settings/build-priority-scope.json';
 const normalSegments = path => path.split('/').every(segment =>
-  /^[a-z0-9_-][a-z0-9_.-]*$/.test(segment) && !segment.includes('..'));
+  /^[a-z0-9_-][a-z0-9_.-]*$/i.test(segment) && !segment.includes('..'));
 
 const exactSourceFile = path => !/[\s,]/.test(path) && normalSegments(path)
   && !path.split('/').slice(0, -1).some(segment => segment.includes('.'))
-  && /\.(mjs|js|ts|json|md|sh|yml|yaml|css|html)$/.test(path);
+  && /\.(mjs|js|ts|json|md|sh|yml|yaml|css|html)$/i.test(path);
 const CONTENT_LIMIT = 64 * 1024;
 const GUARD_NAME = /^guard-|-guard|policy|gate/i;
 const GUARD_MARKER = /TRUST_CHAIN|isTrustChainPath|@guard|gate-config/i;
 
-function readAllowedFiles(options) {
+function readAllowedFiles(readSettings) {
   try {
-    const settings = JSON.parse(fs.readFileSync(options.scopeSettingsPath ?? join(ROOT, SCOPE_SETTINGS), 'utf8'));
+    const contents = readSettings();
+    if (typeof contents !== 'string' || Buffer.byteLength(contents, 'utf8') > CONTENT_LIMIT) throw new Error('invalid settings content');
+    const settings = JSON.parse(contents);
     if (!settings || Object.hasOwn(settings, 'allowedDirs')
         || !Array.isArray(settings.allowedFiles) || !settings.allowedFiles.length) throw new Error('empty allowedFiles');
     return new Set(settings.allowedFiles.map(file => {
-      if (typeof file !== 'string' || !exactSourceFile(file.toLowerCase())) throw new Error('invalid file');
-      return file.toLowerCase();
+      if (typeof file !== 'string' || !exactSourceFile(file)) throw new Error('invalid file');
+      return file;
     }));
-  } catch { refuse(`unreadable or malformed scope settings ${SCOPE_SETTINGS}`); }
+  } catch { refuse(`unreadable or malformed scope settings ${SCOPE_SETTINGS}, or exceeds 64 KB; obtain human review and narrow the settings before retrying`); }
 }
 const READ_OPTIONS = { encoding: 'utf8', maxBuffer: 8 * 1024 * 1024, timeout: 10000, stdio: ['ignore', 'pipe', 'pipe'] };
 const canonicalId = id => id.replace(/^0+(?=\d)/, '');
@@ -120,6 +124,7 @@ export function readPriorityCards({ git = (args, options = {}) => execFileSync('
   // Refuse overflow instead of silently declaring a partial scan clean. The same
   // pinned main SHA supplies cards, regular-file evidence and guard content.
   read.readContent = path => git(['show', `${snapshot()}:${path}`], { maxBuffer: CONTENT_LIMIT });
+  read.readScopeSettings = () => read.readContent(SCOPE_SETTINGS);
   return read;
 }
 
@@ -145,10 +150,10 @@ function prepare(input, options) {
   const { actor, reason, ids, mode, ttlHours } = validateBuildPriorityInput(input);
   if (new Set(ids.map(canonicalId)).size !== ids.length) refuse('duplicate numeric card identities');
   const readCard = options.readCard ?? readPriorityCards();
-  const source = readCard.pathType && readCard.readContent ? readCard : readPriorityCards();
+  const source = readCard.pathType && readCard.readContent && readCard.readScopeSettings ? readCard : readPriorityCards();
   const pathType = options.pathType ?? source.pathType;
   const readContent = options.readContent ?? source.readContent;
-  const allowedFiles = readAllowedFiles(options);
+  const allowedFiles = readAllowedFiles(options.readScopeSettings ?? source.readScopeSettings);
   let gateFiles;
   try {
     if (!Array.isArray(TRUST_CHAIN) || !TRUST_CHAIN.length) refuse('empty or unreadable gate TRUST_CHAIN');
@@ -179,14 +184,16 @@ function prepare(input, options) {
     return raw.map(entry => {
       const match = typeof entry === 'string' && /^([a-z-]+):(.+)$/i.exec(entry);
       const prefix = match && match[1].toLowerCase();
-      const path = match && match[2].toLowerCase();
+      const path = match && match[2];
       if (!match || /[\s,]/.test(entry) || prefix !== 'we'
           || !exactSourceFile(path)) {
         refuse(`card ${id} scope entry ${JSON.stringify(entry)} must be an exact file path`);
       }
-      if (protectedPaths.has(path) || protectedBasenames.has(basename(path))
-          || GUARD_DEPENDENCY_BASENAMES.has(basename(path))
-          || EXECUTION_CONTROLS.some(pattern => pattern.test(basename(path)))) {
+      const folded = path.toLowerCase();
+      if (protectedPaths.has(folded) || protectedBasenames.has(basename(folded))
+          || GUARD_DEPENDENCY_BASENAMES.has(basename(folded))
+          || EXECUTION_CONTROLS.some(pattern => pattern.test(basename(folded)))
+          || matchesSome(path, [...GUARD_FLOOR, ...LOCK_USERS])) {
         refuse(`card ${id} scope entry ${JSON.stringify(entry)} overlaps gate file ${path}`);
       }
       if (!allowedFiles.has(path)) {
@@ -206,7 +213,7 @@ function prepare(input, options) {
       if (content.split(/\r?\n/).some(line => GUARD_MARKER.test(line))) {
         refuse(`card ${id} scope entry ${JSON.stringify(entry)} contains a guard marker`);
       }
-      return `we:${path}`;
+      return `we:${folded}`;
     });
   });
   const prs = (options.readPrs ?? readPriorityPrs)();
