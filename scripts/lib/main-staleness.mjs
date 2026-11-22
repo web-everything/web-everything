@@ -88,9 +88,16 @@ export function checkMainStaleness({ base = 'main', autoFf = true, cleanOnly = f
   const origin = rev(`origin/${base}`);
   if (!local || !origin) return { offline: true };
   if (local === origin) return { fresh: true, behind: 0 };
-  const count = (range) => { const r = run(['rev-list', '--count', range]); return r.status === 0 ? Number(r.stdout.trim()) || 0 : 0; };
+  const count = (range) => { const r = run(['rev-list', '--count', range]); return r.status === 0 && /^\d+$/.test(r.stdout.trim()) ? Number(r.stdout.trim()) : null; };
   const behind = count(`${base}..origin/${base}`);
   const ahead = count(`origin/${base}..${base}`);
+  // An unreadable commit count is UNKNOWN, never zero: refuse (strict) instead of reporting fresh.
+  if (behind === null || ahead === null) {
+    return {
+      action: 'warn', reason: 'count-unknown', behind: behind ?? 0, ahead: ahead ?? 0, dirty: false,
+      warning: `could not count commits between local ${base} and origin/${base} — freshness unknown.`,
+    };
+  }
   const st = run(['status', '--porcelain']);
   const dirty = !!(st.stdout && st.stdout.trim());
   let onBase = true;
@@ -192,10 +199,14 @@ export const STALE_GUARD_MISSING_COMMITS_ENV = 'WE_STALE_GUARD_MISSING_COMMITS';
 export function behindFiles(root, base = 'main', run = gitRun, env = process.env) {
   const opts = { cwd: root, timeout: 60_000, killSignal: 'SIGKILL' };
   const r = env?.[STALE_GUARD_MISSING_COMMITS_ENV] === '0'
-    ? run(['diff', '--name-only', `HEAD...origin/${base}`], opts)
-    : run(['log', '--cc', '--name-only', '--format=', `HEAD..origin/${base}`], opts);
+    ? run(['diff', '-z', '--name-only', `HEAD...origin/${base}`], opts)
+    : run(['log', '-z', '--cc', '--name-only', '--format=', `HEAD..origin/${base}`], opts);
   if (r.status !== 0) return null;
-  return [...new Set(String(r.stdout ?? '').split('\n').map((x) => x.trim()).filter(Boolean))];
+  const output = r.stdout;
+  // NUL records preserve whitespace, quotes and newlines in Git paths. Missing terminators or
+  // replacement characters mean we cannot establish the changed paths: require a gated rebuild.
+  if (typeof output !== 'string' || output.includes('\ufffd') || (output && !output.endsWith('\0'))) return null;
+  return [...new Set(output.split('\0').filter(Boolean))];
 }
 
 /** Does the working tree differ from HEAD in a way that changes what runs — any TRACKED change, or an untracked
@@ -213,7 +224,7 @@ export function codeDirty(root, run = gitRun) {
 // One diagnostic per distinct lag in this process, shared by every dispatch pass.
 const toleratedLagLogs = new Set();
 function logToleratedLag({ label, behind, files, base, reason, write }) {
-  const key = JSON.stringify([label, behind, [...files].sort()]);
+  const key = JSON.stringify([label, behind, [...files].sort(), reason]);
   if (toleratedLagLogs.has(key)) return;
   write(`${label}: the managed clone is ${behind} commit(s) behind origin/${base} (files: ${files.join(', ')}) — `
     + `tolerated lag: ${reason}; tolerating the lag and dispatching.\n`);
@@ -275,6 +286,17 @@ export function assertMainNotStale(root, checkStaleness, {
     }
     return behindMemo;
   };
+  let codeDirtyMemo;
+  const cleanNonDiverged = () => {
+    if (st.ahead > 0) return false;
+    if (codeDirtyMemo === undefined) {
+      codeDirtyMemo = !!st.dirty;
+      if (codeDirtyMemo) {
+        try { codeDirtyMemo = treeDirtyForCode(root) !== false; } catch { codeDirtyMemo = true; }
+      }
+    }
+    return !codeDirtyMemo;
+  };
   let canUseStaleFallback = false;
   if (st?.action === 'warn' && managedClone) {
     const files = behindList();
@@ -296,7 +318,7 @@ export function assertMainNotStale(root, checkStaleness, {
   // exists so a dispatch never runs STALE CODE from this checkout's import path — commits that change no code
   // file cannot make it stale. So a managed clone behind ONLY in non-code files is fresh enough to dispatch;
   // the next tick-start rebuild still brings it current. Unknown diff ⇒ the refusal stands (fail closed).
-  if (st && st.action === 'warn' && managedClone && canUseStaleFallback) {
+  if (st && st.action === 'warn' && managedClone && canUseStaleFallback && cleanNonDiverged()) {
     const files = behindList();
     if (Array.isArray(files) && files.length > 0 && !files.some(isCodePath)) {
       logToleratedLag({ label, behind: st.behind, files, base, reason: 'non-code files only', write });
@@ -345,7 +367,7 @@ export function assertMainNotStale(root, checkStaleness, {
   // BOUNDED grace covers that window: a live build lease, and a last adoption no older than
   // `WE_STALE_GUARD_REBUILD_GRACE_MS` (default 60 min, 0 = off). Only for a caller that names its dispatch path
   // and only with a KNOWN behind-file list — an unknown diff still refuses.
-  if (st && st.action === 'warn' && managedClone && canUseStaleFallback && typeof dispatchPath === 'function') {
+  if (st && st.action === 'warn' && managedClone && canUseStaleFallback && typeof dispatchPath === 'function' && cleanNonDiverged()) {
     const files = behindList();
     let g = null;
     if (Array.isArray(files) && files.length > 0) { try { g = rebuildGrace(root); } catch { g = null; } }

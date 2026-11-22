@@ -6353,3 +6353,19 @@ shards exactly as the default would, so it is still recognized as the default ga
 Gate ceilings get one capped retry tied to lane, head and killed job. Detached jobs settle in
 `verify-gate-job.mjs`, so recovery must cover that consumer as well as `verify-dispatch.mjs`'s
 in-process sweep. Persist the retry identity in job input to dedupe the enqueue-before-marker crash window.
+
+## Managed stale-scope evidence
+
+Strict import-closure walks reject unresolved execution edges (CommonJS loaders, child processes,
+absolute/file URL imports and computed dynamic imports). An incomplete closure requires a gated
+rebuild; it cannot license off-path tolerance or rebuild grace. Those two allowances also require
+a clean code tree with no local commits ahead. Soak fix presence probes only unrelated-lag
+tolerance; gate, trust-chain and imported-guard refusals have an unconditional test so regressions
+cannot turn themselves into expected failures.
+
+Strict stale-scope evidence is parsed as JavaScript syntax. Detection vocabulary inside comments,
+strings, regular expressions and template text is not an execution edge; template substitutions
+are. The real `main-staleness.mjs` dependency-chain regression checks that its scanner dependency
+remains complete while the guard's actual child-process edges still invalidate the full closure.
+The unrelated-lag soak also includes the real scanner source in its entry closure. Parser absence
+or syntax errors leave strict evidence incomplete and require the same gated-rebuild fallback.

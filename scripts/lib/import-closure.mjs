@@ -12,6 +12,46 @@ import { dirname, resolve as resolvePath, relative, isAbsolute, basename } from 
 
 const IMPORT_SPEC_RE = /(?:\bfrom\s*|\bimport\s*\(\s*|\bimport\s+)(['"])([^'"\n]+)\1/g;
 const JSON_LITERAL_RE = /['"`]([^'"`\n]*\.json)['"`]/g;
+// Sparse copied-CLI fixtures may omit dependencies. Strict walks then refuse unknown syntax;
+// non-strict legacy walks retain their existing conservative text-based behavior.
+const syntax = await import('typescript').then((m) => m.default ?? m).catch(() => null);
+const EXECUTION_NAMES = new Set(['require', 'createRequire', 'spawn', 'spawnSync',
+  'exec', 'execSync', 'execFile', 'execFileSync', 'fork']);
+
+/** Collect executable ESM edges without interpreting comments, strings or regex bodies as code. */
+function strictSourceEvidence(src, file) {
+  const imports = [];
+  if (!syntax) return { imports, complete: false };
+  const tree = syntax.createSourceFile(file, src, syntax.ScriptTarget.Latest, true, syntax.ScriptKind.JS);
+  let complete = tree.parseDiagnostics.length === 0;
+  const addImport = (node) => {
+    if (!node || !syntax.isStringLiteral(node)) { complete = false; return; }
+    imports.push(node.text);
+    // Namespace and aliased imports must not hide child-process execution edges.
+    if (node.text === 'node:child_process' || node.text === 'child_process') complete = false;
+  };
+  const visit = (node) => {
+    if (syntax.isImportDeclaration(node)) {
+      addImport(node.moduleSpecifier);
+      if (node.importClause?.namedBindings && syntax.isNamedImports(node.importClause.namedBindings)
+        && node.importClause.namedBindings.elements.some((e) => (e.propertyName ?? e.name).text === 'createRequire')) complete = false;
+    } else if (syntax.isExportDeclaration(node) && node.moduleSpecifier) {
+      addImport(node.moduleSpecifier);
+    } else if (syntax.isCallExpression(node)) {
+      if (node.expression.kind === syntax.SyntaxKind.ImportKeyword) {
+        addImport(node.arguments[0]);
+      } else if (syntax.isIdentifier(node.expression) && EXECUTION_NAMES.has(node.expression.text)) {
+        complete = false;
+      } else if (syntax.isPropertyAccessExpression(node.expression)
+        && ['require', 'createRequire'].includes(node.expression.name.text)) {
+        complete = false;
+      }
+    }
+    syntax.forEachChild(node, visit);
+  };
+  visit(tree);
+  return { imports, complete };
+}
 const NONLITERAL_DYNAMIC_IMPORT_RE = /\bimport\s*\(\s*(?!['"])/;
 
 function resolveRelativeSpec(fromFile, spec, exists) {
@@ -29,7 +69,8 @@ function resolveRelativeSpec(fromFile, spec, exists) {
  * to "any code file changed". `bareDeps` = some file imports a package (a `package*.json` change is relevant).
  * `jsonNames` = basenames of `.json` string literals in closure files (a config read at runtime by name).
  * Never throws: an unreadable entry returns `null` (the caller's conservative fallback).
- * `requireResolvedImports` additionally marks missing/out-of-root relative imports incomplete.
+ * `requireResolvedImports` additionally rejects missing/out-of-root, absolute/file URL imports,
+ * CommonJS loaders and child-process execution edges. Unknown strict evidence requires a gated rebuild.
  * `parsed` may be shared across walks of the SAME tree snapshot (e.g. successive spawned-script hops).
  * Keep `requireResolvedImports` unchanged when sharing `parsed`.
  * It must be discarded before walking a changed tree; by default every invocation gets a fresh cache.
@@ -67,12 +108,21 @@ export function collectImportClosure({
       let src;
       try { src = readFile(file); } catch { info.complete = false; }
       if (src !== undefined) {
-        for (const m of src.matchAll(IMPORT_SPEC_RE)) {
-          const spec = m[2];
+        let specs;
+        if (requireResolvedImports) {
+          try {
+            const evidence = strictSourceEvidence(src, file);
+            info.complete &&= evidence.complete;
+            specs = evidence.imports;
+          } catch { info.complete = false; specs = []; }
+        } else specs = [...src.matchAll(IMPORT_SPEC_RE)].map((m) => m[2]);
+        for (const spec of specs) {
           if (spec.startsWith('./') || spec.startsWith('../')) {
             const hit = resolveRelativeSpec(file, spec, existsOnce);
             if (hit && !relative(absRoot, hit).startsWith('..')) info.imports.push(hit);
             else if (requireResolvedImports) info.complete = false;
+          } else if (requireResolvedImports && (isAbsolute(spec) || spec.startsWith('file:'))) {
+            info.complete = false;
           } else if (!spec.startsWith('node:') && /^[@a-z]/i.test(spec) && !/\s/.test(spec)) {
             info.bareDeps = true;
           }
@@ -81,7 +131,7 @@ export function collectImportClosure({
         for (const line of src.split('\n')) {
           const t = line.trim();
           if (t.startsWith('*') || t.startsWith('//') || t.startsWith('/*')) continue;
-          if (NONLITERAL_DYNAMIC_IMPORT_RE.test(t.replace(/\/\/.*$/, ''))) { info.complete = false; break; }
+          if (!requireResolvedImports && NONLITERAL_DYNAMIC_IMPORT_RE.test(t.replace(/\/\/.*$/, ''))) { info.complete = false; break; }
         }
       }
       parsed.set(file, info);

@@ -57,6 +57,18 @@ describe('checkMainStaleness (fail-soft IO)', () => {
     expect(checkMainStaleness({ run }).fresh).toBe(true);
     expect(calls.some((a) => a[0] === 'pull')).toBe(false);
   });
+  it('an unreadable or malformed commit count is UNKNOWN: warns, never reports fresh or syncs', () => {
+    for (const out of [{ status: 1, stdout: '' }, { status: 0, stdout: 'garbage\n' }]) {
+      const calls = [];
+      const run = scripted({
+        fetch: { status: 0 },
+        'rev-parse': (a) => ({ stdout: a[1] === 'main' ? 'localsha\n' : 'originsha\n' }),
+        'rev-list': out, status: { stdout: '' }, pull: { status: 0 },
+      }, calls);
+      expect(checkMainStaleness({ run })).toMatchObject({ action: 'warn', reason: 'count-unknown' });
+      expect(calls.some((a) => a[0] === 'pull' || a[0] === 'merge')).toBe(false);
+    }
+  });
   it('behind + clean → auto fast-forwards (pull --ff-only --autostash)', () => {
     const calls = [];
     const run = scripted({
@@ -264,6 +276,55 @@ describe('assertMainNotStale — managed clone never auto-ffs (#4044 Module E)',
     };
   }
   const scopeWarn = () => ({ action: 'warn', behind: 7, dirty: false });
+  for (const mode of ['off-path', 'rebuild-grace', 'non-code']) {
+    for (const state of ['dirty', 'diverged', 'unreadable-status']) {
+      it(`${mode} refuses ${state} managed trees`, () => {
+        const warn = () => ({ action: 'warn', behind: 7, ahead: state === 'diverged' ? 1 : 0,
+          dirty: state !== 'diverged' });
+        const opts = scopedOptions([mode === 'non-code' ? 'backlog/card.md' : 'other.mjs'], {
+          dispatchPath: () => mode === 'rebuild-grace', lastGood: () => null,
+          treeDirtyForCode: () => { if (state === 'unreadable-status') throw new Error('status unavailable'); return true; },
+        });
+        withManagedCloneEnv('1', () => expect(() => assertMainNotStale('/repo', warn, opts)).toThrow(/STALE/));
+      });
+    }
+    it(`${mode} permits untracked non-code dirt using codeDirty`, () => {
+      withManagedCloneEnv('1', () => {
+        expect(assertMainNotStale('/repo', () => ({ action: 'warn', behind: 7, ahead: 0, dirty: true }),
+          scopedOptions([mode === 'non-code' ? 'backlog/card.md' : 'other.mjs'], {
+            dispatchPath: () => mode === 'rebuild-grace', lastGood: () => null, treeDirtyForCode: () => false,
+          }))).toMatchObject({ fresh: true });
+      });
+    });
+  }
+  it('tolerated lag logs a changed reason for the same label/count/files', () => {
+    const logs = [];
+    const opts = scopedOptions(['other.mjs'], { label: 'changed-reason', write: s => logs.push(s) });
+    withManagedCloneEnv('1', () => {
+      assertMainNotStale('/repo', scopeWarn, opts);
+      assertMainNotStale('/repo', scopeWarn, { ...opts, dispatchPath: () => true });
+    });
+    expect(logs).toHaveLength(2);
+    expect(logs[1]).toContain('LAST-KNOWN-GOOD');
+  });
+  it('behindFiles preserves unusual Git paths in both listing modes', () => {
+    dir = mkdtempSync(join(tmpdir(), 'behind-paths-'));
+    git(dir, 'init', '-q', '-b', 'main');
+    commit(dir, 'base.mjs', 'export {};');
+    const head = git(dir, 'rev-parse', 'HEAD').trim();
+    const paths = ['é.mjs', 'tab\tfile.mjs', 'line\nfile.mjs', '"quoted.mjs', ' spaced.mjs '];
+    for (const path of paths) commit(dir, path, 'export {};');
+    git(dir, 'update-ref', 'refs/remotes/origin/main', git(dir, 'rev-parse', 'HEAD').trim());
+    git(dir, 'reset', '--hard', head);
+    for (const env of [{}, { WE_STALE_GUARD_MISSING_COMMITS: '0' }]) {
+      expect(behindFiles(dir, 'main', undefined, env).sort()).toEqual([...paths].sort());
+    }
+  });
+  it('behindFiles refuses malformed or undecodable path evidence', () => {
+    for (const stdout of ['"scripts/unknown\\377.mjs"\n', 'unterminated.mjs', 'bad\ufffd.mjs\0']) {
+      expect(behindFiles('/repo', 'main', () => ({ status: 0, stdout }), {})).toBeNull();
+    }
+  });
   it('strict gate and TRUST_CHAIN lag refuses even off-path with last-good and rebuild grace', () => {
     withManagedCloneEnv('1', () => {
       for (const file of ['scripts/lib/gate-config.mjs', ...TRUST_CHAIN.map((m) => `scripts/lib/${m.file}`)]) {
@@ -320,7 +381,10 @@ describe('assertMainNotStale — managed clone never auto-ffs (#4044 Module E)',
       })).toThrow(/STALE/);
     });
     // Both unresolved imports and dynamic targets make the default scope unknown.
-    for (const source of ["import './missing.mjs';", 'await import(process.env.MODULE);']) {
+    for (const source of ["import './missing.mjs';", 'await import(process.env.MODULE);',
+      "require('./worker.cjs');", 'const req = createRequire(import.meta.url);',
+      "spawn(process.execPath, ['./worker.mjs']);", "exec('node worker.mjs');",
+      "fork('./worker.mjs');", "import '/external.mjs';", "import 'file:///external.mjs';"]) {
       writeFileSync(join(dir, 'scripts/daemon.mjs'), source);
       withManagedCloneEnv('1', () => {
         expect(() => assertMainNotStale(dir, scopeWarn, { ...opts,
@@ -402,14 +466,13 @@ describe('assertMainNotStale — managed clone never auto-ffs (#4044 Module E)',
     // the knob restores the old merge-base diff (which over-reports the overlay's review.mjs)
     expect(behindFiles(clonePath, 'main', undefined, { WE_STALE_GUARD_MISSING_COMMITS: '0' })).toContain('review.mjs');
   });
-  it('managed clone behind only in files an overlay already brought in (plus off-path code) dispatches', () => {
+  it('managed clone with local overlay commits still refuses unrelated lag as diverged', () => {
     const clonePath = makeOverlayClone();
-    const logs = [];
-    const st = withManagedCloneEnv('1', () => assertMainNotStale(clonePath, undefined, {
-      label: 'test', dispatchPath: (p) => p === 'review.mjs', write: (s) => logs.push(s),
-      lastGood: () => null, rebuildGrace: () => ({ grace: false }),
-    }));
-    expect(st).toMatchObject({ fresh: true, behindOffDispatchPath: true, toleratedFiles: ['unrelated.mjs'] });
+    expect(Number(git(clonePath, 'rev-list', '--count', 'origin/main..HEAD').trim())).toBeGreaterThan(0);
+    expect(() => withManagedCloneEnv('1', () => assertMainNotStale(clonePath, undefined, {
+      label: 'test', dispatchPath: (p) => p === 'review.mjs', write: () => {},
+      lastGood: () => null, rebuildGrace: () => ({ grace: true }),
+    }))).toThrow(/STALE/);
   });
   // The bounded rebuild-in-progress grace: on-path lag while the clone's own rebuild runs still dispatches.
   it('rebuild grace: on-path lag dispatches only while a rebuild is in progress; unknown diff still refuses', () => {

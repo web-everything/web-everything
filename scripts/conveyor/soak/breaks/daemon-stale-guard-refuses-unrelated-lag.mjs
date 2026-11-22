@@ -4,7 +4,7 @@
  * fixPresent probes behavior so historical trees must reproduce the break.
  */
 import { execFileSync } from 'node:child_process';
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -36,7 +36,7 @@ const git = (cwd, ...args) => execFileSync('git', args, {
   cwd, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: 10_000, maxBuffer: 1024 * 1024,
 });
 
-function probe(sourceRoot, log) {
+function probe(sourceRoot, log, { unrelatedOnly = false, strictOnly = false } = {}) {
   const dir = mkdtempSync(join(tmpdir(), 'soak-daemon-stale-scope-'));
   const violations = [];
   try {
@@ -46,7 +46,12 @@ function probe(sourceRoot, log) {
     git(seed, 'init', '-q', '-b', 'main');
     git(seed, 'config', 'user.email', 'soak@example.invalid');
     git(seed, 'config', 'user.name', 'soak');
-    writeFileSync(join(seed, 'scripts/daemon.mjs'), 'export const daemon = true;\n');
+    writeFileSync(join(seed, 'scripts/daemon.mjs'), "import { guard } from './lib/guard-closure.mjs';\nexport const daemon = guard;\n");
+    writeFileSync(join(seed, 'scripts/lib/guard-closure.mjs'),
+      "import { collectImportClosure } from './import-closure.mjs';\nexport const guard = collectImportClosure;\n");
+    // Include the real scanner in the exercised graph: a synthetic leaf cannot catch self-matches.
+    writeFileSync(join(seed, 'scripts/lib/import-closure.mjs'),
+      readFileSync(join(sourceRoot, 'scripts/lib/import-closure.mjs'), 'utf8'));
     git(seed, 'add', '.');
     git(seed, 'commit', '-q', '-m', 'daemon baseline');
     // Shared local objects let us advance origin/main without fetch, push or network IO.
@@ -67,10 +72,19 @@ function probe(sourceRoot, log) {
     lag('scripts/unrelated.mjs');
     const unrelated = dispatch();
     log?.(`unrelated lag: ${JSON.stringify(unrelated)}`);
-    if (!unrelated.dispatched || unrelated.refused || unrelated.error) {
+    if (!strictOnly && (!unrelated.dispatched || unrelated.refused || unrelated.error)) {
       violations.push({ invariant: 'default-scope-dispatches-unrelated-code-lag',
         detail: `no dispatchPath, but unrelated code lag did not dispatch: ${JSON.stringify(unrelated)}` });
     }
+    // Presence is determined solely by the positive, unrelated-lag behavior.
+    if (unrelatedOnly) return { violations };
+    lag('scripts/lib/guard-closure.mjs');
+    const closure = dispatch();
+    log?.(`imported guard lag: ${JSON.stringify(closure)}`);
+    if (closure.dispatched || !closure.refused) {
+      violations.push({ invariant: 'default-scope-refuses-imported-guard-lag', detail: JSON.stringify(closure) });
+    }
+    git(clone, 'reset', '--hard', 'origin/main');
     lag('scripts/lib/gate-config.mjs');
     const gate = dispatch();
     log?.(`gate lag: ${JSON.stringify(gate)}`);
@@ -102,7 +116,7 @@ export default {
     sha: 'HEAD', where: 'working tree: default import-closure scoping',
     paths: ['scripts/lib/main-staleness.mjs', 'scripts/lib/import-closure.mjs'],
   },
-  fixPresent(root) { return probe(root).violations.length === 0; },
-  async run({ log, sourceRoot = REPO_ROOT } = {}) { return probe(sourceRoot, log); },
+  fixPresent(root) { return probe(root, undefined, { unrelatedOnly: true }).violations.length === 0; },
+  async run({ log, sourceRoot = REPO_ROOT, strictOnly = false } = {}) { return probe(sourceRoot, log, { strictOnly }); },
   judge(report) { return report.violations.map((v) => `[${v.invariant}] ${v.detail}`); },
 };
