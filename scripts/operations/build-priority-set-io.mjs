@@ -5,7 +5,9 @@ import { fileURLToPath } from 'node:url';
 import { randomUUID } from 'node:crypto';
 import { execFileSync } from 'node:child_process';
 import yaml from 'js-yaml';
-import { isTrustChainPath } from '../lib/gate-config.mjs';
+import { isTrustChainPath, TRUST_CHAIN, TRUST_CHAIN_BASENAMES } from '../lib/gate-config.mjs';
+import { GUARD_FLOOR } from '../lib/audit-settings.mjs';
+import { globsMayIntersect } from '../readiness/scope-lease.mjs';
 import { runGhSync } from '../lib/gh-throttle.mjs';
 import { CONSTELLATION_REPOS } from '../lib/constellation-repos.mjs';
 import { normalizeBriefScope, SCOPE_PREFIX_ALIASES } from './dispatch-lane.mjs';
@@ -44,30 +46,35 @@ export function readPriorityCards({ git = args => execFileSync('git', args, {
 }
 
 /** Strict per-PR paginated read: every row validated, head pinned before and after, 3000-file API cap refused. */
-function readPagedPrFiles({ gh, repo, number, head }) {
-  if (typeof head !== 'string' || !/^[0-9a-f]{40}$/.test(head)) refuse('incomplete open PR files');
+function readPagedPrFiles({ gh, repo, number, head, total }) {
+  if (typeof head !== 'string' || !/^[0-9a-f]{40}$/.test(head)
+      || !Number.isInteger(total) || total < GH_LIST_FILE_CAP || total >= PAGED_FILE_LIMIT) refuse('incomplete open PR files');
   try {
     const raw = gh(['api', '--paginate', `repos/${repo}/pulls/${number}/files?per_page=100`,
       '--jq', '.[] | {f: .filename, p: .previous_filename}']);
     const files = [];
+    const filenames = new Set();
     let rows = 0;
     for (const line of String(raw).split(/\r?\n/).filter(l => l.trim())) {
       const row = JSON.parse(line);
       if (typeof row?.f !== 'string' || !row.f.trim() || (row.p != null && (typeof row.p !== 'string' || !row.p.trim()))) throw new Error('bad row');
+      if (filenames.has(row.f)) throw new Error('duplicate row');
+      filenames.add(row.f);
       rows += 1;
       files.push(row.f, ...(row.p ? [row.p] : []));
     }
-    if (rows < GH_LIST_FILE_CAP || rows >= PAGED_FILE_LIMIT) throw new Error('truncated');
-    if (String(gh(['api', `repos/${repo}/pulls/${number}`, '--jq', '.head.sha'])).trim() !== head) throw new Error('head moved');
+    if (rows !== total) throw new Error('truncated');
+    const after = JSON.parse(gh(['api', `repos/${repo}/pulls/${number}`, '--jq', '{head: .head.sha, total: .changed_files}']));
+    if (after?.head !== head || after?.total !== total) throw new Error('PR changed');
     return files;
   } catch { return refuse('incomplete open PR files'); }
 }
 
-/** At most three bounded list calls. At either cap, an operator must drain and retry. */
+/** Bounded bulk lists; only capped file lists need per-PR paging and a metadata recheck. */
 export function readPriorityPrs({ gh = args => runGhSync(args, READ_OPTIONS) } = {}) {
   const prs = [];
   for (const { slug } of Object.values(CONSTELLATION_REPOS)) {
-    const rows = JSON.parse(gh(['pr', 'list', '--repo', slug, '--state', 'open', '--limit', '200', '--json', 'number,files,headRefOid']));
+    const rows = JSON.parse(gh(['pr', 'list', '--repo', slug, '--state', 'open', '--limit', '200', '--json', 'number,files,headRefOid,changedFiles']));
     if (!Array.isArray(rows) || rows.length >= 200) refuse('incomplete open PR list (limit 200)');
     for (const row of rows) {
       if (!Number.isInteger(row?.number) || row.number <= 0 || !Array.isArray(row.files)
@@ -78,22 +85,35 @@ export function readPriorityPrs({ gh = args => runGhSync(args, READ_OPTIONS) } =
       if (row.files.length >= GH_LIST_FILE_CAP) {
         // The bulk list is capped: page only this PR; any failed, malformed, truncated or moved read refuses.
         const known = row.files.flatMap(f => [f.path, ...(f.previousFilename ? [f.previousFilename] : [])]);
-        const files = readPagedPrFiles({ gh, repo: slug, number: row.number, head: row.headRefOid });
+        const files = readPagedPrFiles({ gh, repo: slug, number: row.number, head: row.headRefOid, total: row.changedFiles });
         const have = new Set(files);
         if (known.some(p => !have.has(p))) refuse('incomplete open PR files');
         prs.push({ repo: slug, number: row.number, files });
         continue;
       }
+      if (row.changedFiles !== row.files.length || new Set(row.files.map(f => f.path)).size !== row.files.length) refuse('incomplete open PR files');
       prs.push({ repo: slug, number: row.number, files: row.files.flatMap(f => [f.path, ...(f.previousFilename ? [f.previousFilename] : [])]) });
     }
   }
   return prs;
 }
 
-/** Conservative supplement to the shared trust-chain predicate, including broad directory scopes. */
+const MERGE_PATH_SCOPES = [...new Set([
+  ...GUARD_FLOOR, ...TRUST_CHAIN.flatMap(member => member.homes ?? []),
+  '.github/workflows/', 'scripts/lib/', 'scripts/readiness/', 'scripts/conveyor/',
+])];
+
+/** Use the bounded lease matcher for directory/glob coverage of the trust chain and audit floor. */
 function touchesMergePath(scope) {
+  // cardScope already rejects noncanonical paths and unsupported scope syntax.
   const path = scope.slice(scope.indexOf(':') + 1);
+  const basename = path.slice(path.lastIndexOf('/') + 1);
   return isTrustChainPath(path)
+    || MERGE_PATH_SCOPES.some(protectedScope => globsMayIntersect(path, protectedScope))
+    // File-shaped wildcard basenames also follow relocated trust-chain modules. Generic directory globs
+    // use the registered homes/floor above so a disjoint scope such as blocks/** remains eligible.
+    || (basename.includes('.') && /[*?]/.test(basename)
+      && [...TRUST_CHAIN_BASENAMES].some(name => globsMayIntersect(basename, name)))
     || /(?:^|\/)[^/]*(?:merge|drain|review)[^/]*(?:\/|$)/i.test(path)
     || /^(?:\.github\/workflows(?:\/|$)|scripts\/(?:lib|readiness|conveyor)\/?$)/.test(path)
     || ['scripts', 'scripts/', '.github', '.github/', './', '.', ''].includes(path);

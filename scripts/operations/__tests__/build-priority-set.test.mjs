@@ -7,6 +7,7 @@ import { hasJsonFlag, runOperationCli } from '../cli-adapter.mjs';
 import { createMemoryRunStore } from '../run-store.mjs';
 import { createRegistry } from '../registry.mjs';
 import { decideRuntimeAdmission, readBuildPrioritySettings } from '../../lib/build-queue.mjs';
+import { buildPriorityLog, policyFrom } from '../../../skills-src/conveyor/build-dispatch-daemon.mjs';
 
 const dirs = [];
 const at = '2026-11-20T12:00:00.000Z';
@@ -259,16 +260,16 @@ it('PR reader uses bounded gh list and refuses truncated or malformed evidence w
 });
 
 const HEAD = 'a'.repeat(40);
-const capped = [{ number: 1, headRefOid: HEAD, files: Array.from({ length: 100 }, (_, i) => ({ path: `f${i}` })) }];
+const capped = [{ number: 1, headRefOid: HEAD, changedFiles: 140, files: Array.from({ length: 100 }, (_, i) => ({ path: `f${i}` })) }];
 const row = i => JSON.stringify({ f: `f${i}`, p: null });
 const pagedLines = n => Array.from({ length: n }, (_, i) => row(i)).join('\n');
-/** gh stub: list -> capped PR; paginated files -> paged(); head read -> head(). */
-const stub = ({ paged = () => pagedLines(140), head = () => HEAD, list = capped } = {}) => {
+/** gh stub: list -> capped PR; paginated files -> paged(); metadata recheck -> head()/total(). */
+const stub = ({ paged = () => pagedLines(140), head = () => HEAD, total = () => 140, list = capped } = {}) => {
   const calls = [];
   const gh = args => {
     calls.push(args);
     if (args[0] === 'api' && args.includes('--paginate')) return paged();
-    if (args[0] === 'api') return head();
+    if (args[0] === 'api') return JSON.stringify({ head: head(), total: total() });
     return JSON.stringify(args.includes('web-everything/web-everything') ? list : []);
   };
   return { gh, calls };
@@ -288,17 +289,76 @@ it('a PR at the bulk file cap is paged per PR and overlap admission sees all 140
   expect(result.lines.join('\n')).toContain('scope overlaps open PR');
 });
 
+it('an uncapped PR triggers no gh api calls', () => {
+  const { gh, calls } = stub({ list: [{ number: 2, changedFiles: 1, files: [{ path: 'safe.mjs' }] }] });
+  expect(readPriorityPrs({ gh })).toEqual([{ repo: 'web-everything/web-everything', number: 2, files: ['safe.mjs'] }]);
+  expect(calls.some(args => args[0] === 'api')).toBe(false);
+});
+
+it.each([undefined, null, '1', 0, 2, 140])('an uncapped PR refuses a missing or inconsistent file total without paging: %s', changedFiles => {
+  const { gh, calls } = stub({ list: [{ number: 2, changedFiles, files: [{ path: 'safe.mjs' }] }] });
+  expect(() => readPriorityPrs({ gh })).toThrow(REFUSE);
+  expect(calls.some(args => args[0] === 'api')).toBe(false);
+});
+
+it('a capped PR refuses a truncated page retaining all bulk filenames', () => {
+  const { gh } = stub({ list: [{ ...capped[0], changedFiles: 140 }], paged: () => pagedLines(100) });
+  expect(() => readPriorityPrs({ gh })).toThrow(REFUSE);
+});
+
+it('a PR with exactly 100 files succeeds when the independent total agrees', () => {
+  const { gh } = stub({ list: [{ ...capped[0], changedFiles: 100 }],
+    paged: () => pagedLines(100), total: () => 100 });
+  expect(readPriorityPrs({ gh })[0].files).toHaveLength(100);
+});
+
+it.each([undefined, null, '140', 139, 141, 3000])('a capped PR refuses a changed or unreadable metadata total: %s', total => {
+  expect(() => readPriorityPrs({ gh: stub({ total: () => total }).gh })).toThrow(REFUSE);
+});
+
+it.each([undefined, null, '140', 99, 140.5, 3000, 3001])('a capped PR refuses an invalid independent file total: %s', changedFiles => {
+  expect(() => readPriorityPrs({ gh: stub({ list: [{ ...capped[0], changedFiles }] }).gh })).toThrow(REFUSE);
+});
+
+it('a capped PR refuses duplicate filename rows even when the total and bulk names match', () => {
+  const { gh } = stub({ list: [{ ...capped[0], changedFiles: 140 }],
+    paged: () => `${pagedLines(100)}\n${Array.from({ length: 40 }, () => row(0)).join('\n')}` });
+  expect(() => readPriorityPrs({ gh })).toThrow(REFUSE);
+});
+
+it('preview succeeds with a non-overlapping 140-file capped PR', async () => {
+  const f = fixture({ readCard: readyCard, readPrs: () => readPriorityPrs({ gh: stub().gh }) });
+  const result = await f.command([...flags, '--preview', '--json']);
+  expect(result.code).toBe(0);
+  expect(JSON.parse(result.lines.join('\n')).verdict.record.ids).toEqual(['42', '43']);
+  untouched(f);
+});
+
+it('installed priority appears in runtime readiness with caps zero and capped PRs open', async () => {
+  const f = fixture({ readCard: readyCard, readPrs: () => readPriorityPrs({ gh: stub().gh }) });
+  const env = { ...f.options.env, WE_BUILD_DAEMON_MAX_CONCURRENT: '0', WE_BUILD_DAEMON_MAX_CONCURRENT_EXTERNAL: '0' };
+  f.options.env = env;
+  const before = policyFrom({}, env);
+  expect((await f.command(autoFlags(1))).code).toBe(0);
+  const priority = readBuildPrioritySettings({ env, now: Date.parse(at) });
+  expect(priority).toMatchObject({ ids: ['42'], source: 'runtime' });
+  expect(buildPriorityLog(priority, {}).line).toContain('build.priority (runtime): 1 ids [42]');
+  expect(policyFrom({}, env)).toEqual(before);
+  expect(before).toMatchObject({ maxConcurrentBuilds: 0, maxConcurrentExternalBuilds: 0 });
+});
+
 it.each([
   ['failed read', { paged: () => { throw new Error('boom'); } }],
   ['malformed json', { paged: () => 'not json' }],
   ['too few rows', { paged: () => pagedLines(50) }],
   ['rows at the 3000-file API cap', { paged: () => pagedLines(3000) }],
   ['bulk filenames missing (duplicates)', { paged: () => Array.from({ length: 140 }, () => row(0)).join('\n') }],
+  ['bulk filename missing from otherwise complete unique rows', { paged: () => Array.from({ length: 140 }, (_, i) => i ? row(i) : JSON.stringify({ f: 'other', p: null })).join('\n') }],
   ['renames halve the count', { paged: () => Array.from({ length: 50 }, (_, i) => JSON.stringify({ f: `n${i}`, p: `o${i}` })).join('\n') }],
   ['numeric rename source', { paged: () => `${pagedLines(139)}\n${JSON.stringify({ f: 'f139', p: 7 })}` }],
   ['head moved while paging', { head: () => 'b'.repeat(40) }],
   ['failed head read', { head: () => { throw new Error('boom'); } }],
-  ['no head in the list', { list: [{ number: 1, files: capped[0].files }] }],
+  ['no head in the list', { list: [{ ...capped[0], headRefOid: undefined }] }],
 ])('a capped PR with a %s still refuses', (_name, options) => {
   expect(() => readPriorityPrs({ gh: stub(options).gh })).toThrow(REFUSE);
 });
@@ -323,7 +383,7 @@ it.each([false, true])('audit append failure refuses activation (existing runtim
 });
 
 it.each(['scripts/a.mjs', 'scripts/renamed.mjs'])('PR rename evidence blocks overlap with %s', async path => {
-  const gh = () => JSON.stringify([{ number: 1, files: [{ path: 'scripts/renamed.mjs', previousFilename: 'scripts/a.mjs' }] }]);
+  const gh = () => JSON.stringify([{ number: 1, changedFiles: 1, files: [{ path: 'scripts/renamed.mjs', previousFilename: 'scripts/a.mjs' }] }]);
   const prs = readPriorityPrs({ gh });
   expect(prs[0].files).toEqual(['scripts/renamed.mjs', 'scripts/a.mjs']);
   const f = fixture({ readCard: () => ({ scope: [`we:${path}`] }), readPrs: () => prs });
@@ -385,6 +445,51 @@ it.each([false, true])('fsyncs and closes the parent directory after rename (syn
 const autoFlags = count => [...changed('ids', undefined), `--auto-count=${count}`];
 const readyCard = id => ({ status: 'open', size: 2, scope: [`we:blocks/card-${id}.ts`] });
 const installedAudit = f => JSON.parse(fs.readFileSync(join(f.dir, 'build-priority.audit.jsonl'), 'utf8').trim());
+
+it('auto-count uses the default settings reader path and build.priority key', async () => {
+  const list = JSON.parse(fs.readFileSync(join(process.cwd(), 'scripts/settings/build-priority.json'), 'utf8')).build.priority;
+  const expected = list.find(id => /^\d+$/.test(String(id)));
+  expect(expected).toBeDefined();
+  const readCard = vi.fn(readyCard);
+  const f = fixture({ readPriorityList: undefined, readCard });
+  expect((await f.command(autoFlags(1))).code).toBe(0);
+  expect(JSON.parse(fs.readFileSync(f.path, 'utf8')).ids).toEqual([String(expected).replace(/^0+(?=\d)/, '')]);
+  expect(readCard).toHaveBeenCalledWith(String(expected).replace(/^0+(?=\d)/, ''));
+});
+
+it.each([
+  'we:scripts/**', 'we:scripts/*', 'we:scripts/settings/', 'we:scripts/settings',
+  'we:**', 'we:*', 'we:.github/', 'we:.github/workflows/**',
+  'fui:scripts/**', 'plateau-app:scripts/settings/',
+  'we:scripts/**/gate-*.mjs', 'we:config/*Defaults.ts',
+  'we:scripts/operations/build-priority-set-io.mjs',
+  'we:scripts/a.mjs scripts/settings/', 'we:tools/deliveryPolicyDefaul*.ts',
+])('auto-pick skips scopes covering merge paths: %s', async scope => {
+  const f = fixture({ readPriorityList: () => ['42', '43'],
+    readCard: id => ({ ...readyCard(id), ...(id === '42' ? { scope: [scope] } : {}) }) });
+  expect((await f.command(autoFlags(2))).code).toBe(0);
+  expect(installedAudit(f)).toMatchObject({ ids: ['43'],
+    skipped: [{ id: '42', reason: 'scope touches merge path' }] });
+});
+
+it.each([
+  'we:scripts/s?ttings/**', 'we:config/deliveryPolicyDefaul?s.ts', 'we:scripts/[ls]ib/',
+  'we:scripts/settings/../settings/', 'we:scripts/*/../settings/',
+  'we:../scripts/settings/', 'we:/scripts/settings/',
+])('auto-pick skips unsupported or noncanonical scopes before merge-path matching: %s', async scope => {
+  const f = fixture({ readPriorityList: () => ['42', '43'],
+    readCard: id => ({ ...readyCard(id), ...(id === '42' ? { scope: [scope] } : {}) }) });
+  expect((await f.command(autoFlags(2))).code).toBe(0);
+  expect(installedAudit(f)).toMatchObject({ ids: ['43'],
+    skipped: [{ id: '42', reason: 'unreadable card or scope on origin/main' }] });
+});
+
+it.each(['we:blocks/**', 'we:docs/*.md', 'fui:blocks/', 'we:scripts/ordinary.mjs'])
+('auto-pick keeps disjoint safe scopes eligible: %s', async scope => {
+  const f = fixture({ readCard: () => ({ ...readyCard('42'), scope: [scope] }) });
+  expect((await f.command(autoFlags(1))).code).toBe(0);
+  expect(installedAudit(f).ids).toEqual(['42']);
+});
 
 it('auto-pick takes the first N numeric cards in priority order', async () => {
   const readCard = vi.fn(readyCard);
@@ -483,4 +588,10 @@ it('auto-pick refuses unreadable priority or PR evidence', async () => {
     expect((await f.command(autoFlags(1))).code).not.toBe(0);
     untouched(f);
   }
+});
+
+it('an uncapped PR refuses duplicate filename rows despite a matching independent total', () => {
+  const { gh, calls } = stub({ list: [{ number: 2, changedFiles: 2, files: [{ path: 'safe.mjs' }, { path: 'safe.mjs' }] }] });
+  expect(() => readPriorityPrs({ gh })).toThrow(REFUSE);
+  expect(calls.some(args => args[0] === 'api')).toBe(false);
 });
