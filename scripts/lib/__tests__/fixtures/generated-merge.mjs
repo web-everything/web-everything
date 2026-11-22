@@ -30,15 +30,17 @@ export function fixture({ conflict } = {}) {
   json('scripts/settings/seed.json', { sample: { base: 0 } });
   for (const path of ['delivery-platform-preferences', 'delivery-priority-settings']) json(`scripts/lib/${path}.json`, {});
   json('scripts/lib/settings-registry-metadata.json', {
-    settings: { sample: { description: 'Fixture setting', owner: 'scripts/settings/seed.json', changeVia: 'pr', instant: false } },
+    settings: {},
     capacityLeaves: Object.fromEntries(Object.keys(CAPACITY_LEAVES).map(key => [key, { description: 'Capacity', range: '0–100' }])),
     instantGaps: [], toSettle: [], discoveryPasses: ['B', 'C'].map(pass => ({ pass, family: 'fixture', scope: 'all', newItems: 0, newHighImpactItems: 0 })),
   });
+  json('scripts/lib/settings-registry-metadata.d/settings/sample.json', { description: 'Fixture setting', owner: 'scripts/settings/seed.json', changeVia: 'pr', instant: false });
   write('source.txt', 'base\n');
   generate('--write'); commit('base');
   for (const [branch, key] of [['ours', 'a'], ['theirs', 'b']]) {
     ok(['checkout', '-qb', branch, 'base']);
-    json(`scripts/settings/${key}.json`, { sample: { [key]: 1 } });
+    json(`scripts/settings/${key}.json`, { sample: { [key]: 1 }, [key]: true });
+    json(`scripts/lib/settings-registry-metadata.d/settings/${key}.json`, { description: `Fixture ${key}`, owner: `scripts/settings/${key}.json`, changeVia: 'pr', instant: false });
     generate('--write');
     if (conflict) write(conflict, `// ${branch}\n` + readFileSync(join(root, conflict), 'utf8'));
     commit(branch);

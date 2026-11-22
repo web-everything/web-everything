@@ -1,0 +1,6 @@
+{
+  "description": "Role-based GitHub App identities and delivery metrics collection policy.",
+  "owner": "scripts/settings/delivery-identity.json",
+  "changeVia": "pr",
+  "instant": false
+}

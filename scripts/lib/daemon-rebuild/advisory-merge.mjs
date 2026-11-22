@@ -12,7 +12,7 @@ export const ADVISORY_MERGE_PATHS = Object.freeze(['scripts/ci/test-timings.json
 export const GENERATED_MERGE_PATHS = Object.freeze({
   'docs/agent/settings-registry.md': Object.freeze({
     closure: Object.freeze(['scripts/lib/settings-registry.mjs', 'scripts/lib/settings-files.mjs', 'scripts/lib/operator-override-reader.mjs']),
-    inputs: Object.freeze(['scripts/settings/', 'scripts/dispatch-settings.json', 'scripts/lib/settings-registry-metadata.json',
+    inputs: Object.freeze(['scripts/settings/', 'scripts/dispatch-settings.json', 'scripts/lib/settings-registry-metadata.json', 'scripts/lib/settings-registry-metadata.d/',
       'scripts/lib/delivery-platform-preferences.json', 'scripts/lib/delivery-priority-settings.json']),
     argv: Object.freeze(['--write']),
   }),

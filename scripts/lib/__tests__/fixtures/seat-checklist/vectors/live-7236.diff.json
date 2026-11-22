@@ -1,0 +1,12 @@
+[
+ "scripts/ci/test-timings.json",
+ "scripts/conveyor/soak/breaks/redteam-label-settles-from-check.mjs",
+ "scripts/conveyor/soak/breaks/redteam-label-settles-from-check.soak.test.mjs",
+ "scripts/lib/__tests__/red-team-label-settle.test.mjs",
+ "scripts/lib/drain-red-team-evidence.mjs",
+ "scripts/lib/red-team-check-run.mjs",
+ "scripts/lib/red-team-status-labels.mjs",
+ "scripts/operations/red-team-gate-apply.mjs",
+ "scripts/operations/review-job.mjs",
+ "scripts/settings/privacy-terms-allowlist.json"
+]

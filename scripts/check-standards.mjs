@@ -58,6 +58,7 @@ import { scanFilesCached, gitGrepCached, cacheEnabled, fileKeys } from './lib/st
 import { scanStdoutFlush, stdoutFlushMessage } from './lib/stdout-flush-scan.mjs';
 import { runWeScan } from './lib/rust-scan-bridge.mjs';
 import { createSectionGate, SKIP_REASON } from './lib/standards-sections.mjs';
+import { scanTestingNotesAdvisory } from './lib/testing-notes-advisory.mjs';
 import {
   BACKLOG_STATUSES, BACKLOG_KINDS, FIB, FILE, blockSpecFile,
   dMissingField, dUnresolvedRef, dMissingDescription, buildGraduatedKinds, validateBacklogItem, validatePolyglotWideningGate, isCanonicalGraduated, detectClassificationCollapse, computeNativeFirstConformance, computeDesignKnowledgeConformance,
@@ -311,6 +312,9 @@ const errors = [];
 const warnings = [];
 const err = (m, descriptor) => errors.push({ message: m, descriptor });
 const warn = (m, descriptor) => warnings.push({ message: m, descriptor });
+
+// Advisory only, including when the PR diff cannot be read. Never adds an error.
+for (const message of scanTestingNotesAdvisory(ROOT)) warn(message);
 
 // #2876 — separate from the scoped-planes average; failures stay blocking.
 const diffBranchCoverage = scanDiffBranchCoverage(ROOT);

@@ -1,0 +1,1167 @@
+{
+ "$schema": "https://json-schema.org/draft/2020-12/schema",
+ "$id": "https://everstandards.dev/core/0.1.2/verdict.schema.json",
+ "title": "core/verdict v0.1.2: v0.1.1 plus checklist-based seat accepts (rubric, rubric policy, assessment predicate) (status: draft)",
+ "$comment": "Patch release, additive only: every 0.1.0 and 0.1.1 record is valid here (overlap check in tools-v0.1/validate.mjs). The verdict and finding predicates are unchanged. New type ids: https://everstandards.dev/core/assessment/v0.1 (a seat's per-item answers, an in-toto predicate), https://everstandards.dev/core/rubric/v0.1 (a checklist), https://everstandards.dev/core/rubric-policy/v0.1 (per-seat org config, D15 cascade). Traces: review.acceptOnChecklist, standards.D15, standards.everythingConfigurable, standards.interopFirst, standards.normSunset, standards.D6.",
+ "$defs": {
+  "coreReason": {
+   "description": "[CORE-VRD-013] Core unknown reasons.",
+   "enum": [
+    "missing",
+    "stale",
+    "inconclusive",
+    "not-run",
+    "unverifiable",
+    "error"
+   ]
+  },
+  "reason": {
+   "description": "[CORE-VRD-013] A core reason, a private-use x- reason, or a registered reason named by an absolute https URI. Unrecognised reasons fail closed (CORE-VRD-015).",
+   "type": "string",
+   "anyOf": [
+    {
+     "$ref": "#/$defs/coreReason"
+    },
+    {
+     "pattern": "^x-[a-z0-9][a-z0-9-]{0,62}$"
+    },
+    {
+     "format": "uri",
+     "pattern": "^https://"
+    }
+   ]
+  },
+  "party": {
+   "description": "[CORE-VRD-014] Who owes the proof: 'creator' or an absolute https URI.",
+   "type": "string",
+   "anyOf": [
+    {
+     "const": "creator"
+    },
+    {
+     "format": "uri",
+     "pattern": "^https://"
+    }
+   ]
+  },
+  "policyRef": {
+   "description": "[CORE-VRD-016] The evaluated policy, bound by URI and digest (e.g. the gate definition's git tree).",
+   "type": "object",
+   "required": [
+    "uri",
+    "digest"
+   ],
+   "properties": {
+    "uri": {
+     "type": "string",
+     "format": "uri"
+    },
+    "digest": {
+     "$ref": "https://everstandards.dev/core/0.1.0/evidence.schema.json#/$defs/digestSet"
+    }
+   },
+   "additionalProperties": false
+  },
+  "examined": {
+   "description": "[CORE-VRD-018] What was actually examined; count >= 1 is required on pass.",
+   "type": "object",
+   "required": [
+    "count",
+    "unit"
+   ],
+   "properties": {
+    "count": {
+     "type": "integer",
+     "minimum": 0
+    },
+    "unit": {
+     "type": "string",
+     "minLength": 1
+    },
+    "description": {
+     "type": "string"
+    }
+   },
+   "additionalProperties": false
+  },
+  "verdictPredicate": {
+   "type": "object",
+   "required": [
+    "verdict",
+    "policy",
+    "evidence",
+    "evaluatedAt"
+   ],
+   "properties": {
+    "verdict": {
+     "enum": [
+      "pass",
+      "fail",
+      "unknown"
+     ],
+     "description": "[CORE-VRD-003]"
+    },
+    "reason": {
+     "$ref": "#/$defs/reason"
+    },
+    "owedBy": {
+     "$ref": "#/$defs/party"
+    },
+    "attempted": {
+     "type": "string",
+     "minLength": 1
+    },
+    "policy": {
+     "$ref": "#/$defs/policyRef"
+    },
+    "evaluatedAt": {
+     "type": "string",
+     "format": "date-time",
+     "description": "[CORE-VRD-009]"
+    },
+    "evaluator": {
+     "type": "string",
+     "format": "uri",
+     "description": "[CORE-VRD-024] SHOULD"
+    },
+    "examined": {
+     "$ref": "#/$defs/examined"
+    },
+    "evidence": {
+     "type": "array",
+     "items": {
+      "$ref": "https://everstandards.dev/core/0.1.0/evidence.schema.json#/$defs/evidenceRef"
+     },
+     "description": "[CORE-VRD-017]"
+    },
+    "detail": {
+     "type": "string"
+    },
+    "careLevel": {
+     "$ref": "#/$defs/careLevel"
+    }
+   },
+   "additionalProperties": false,
+   "allOf": [
+    {
+     "if": {
+      "properties": {
+       "verdict": {
+        "const": "unknown"
+       }
+      }
+     },
+     "then": {
+      "required": [
+       "reason"
+      ]
+     }
+    },
+    {
+     "if": {
+      "properties": {
+       "verdict": {
+        "enum": [
+         "pass",
+         "fail"
+        ]
+       }
+      }
+     },
+     "then": {
+      "not": {
+       "required": [
+        "reason"
+       ]
+      }
+     }
+    },
+    {
+     "if": {
+      "properties": {
+       "reason": {
+        "const": "unverifiable"
+       }
+      },
+      "required": [
+       "reason"
+      ]
+     },
+     "then": {
+      "required": [
+       "owedBy",
+       "attempted"
+      ]
+     },
+     "else": {
+      "not": {
+       "anyOf": [
+        {
+         "required": [
+          "owedBy"
+         ]
+        },
+        {
+         "required": [
+          "attempted"
+         ]
+        }
+       ]
+      }
+     }
+    },
+    {
+     "if": {
+      "properties": {
+       "verdict": {
+        "const": "pass"
+       }
+      }
+     },
+     "then": {
+      "required": [
+       "examined"
+      ],
+      "properties": {
+       "examined": {
+        "type": "object",
+        "properties": {
+         "count": {
+          "type": "integer",
+          "minimum": 1
+         }
+        }
+       },
+       "evidence": {
+        "type": "array",
+        "minItems": 1
+       }
+      }
+     }
+    }
+   ]
+  },
+  "verdict": {
+   "description": "[CORE-VRD-012] Verdict Statement.",
+   "type": "object",
+   "required": [
+    "_type",
+    "subject",
+    "predicateType",
+    "predicate"
+   ],
+   "properties": {
+    "_type": {
+     "const": "https://in-toto.io/Statement/v1"
+    },
+    "subject": {
+     "type": "array",
+     "minItems": 1,
+     "items": {
+      "$ref": "https://everstandards.dev/core/0.1.0/evidence.schema.json#/$defs/subject"
+     },
+     "description": "[CORE-VRD-002]"
+    },
+    "predicateType": {
+     "const": "https://everstandards.dev/core/verdict/v0.1"
+    },
+    "predicate": {
+     "$ref": "#/$defs/verdictPredicate"
+    }
+   }
+  },
+  "findingPredicate": {
+   "description": "[CORE-VRD-021][CORE-VRD-022][CORE-VRD-025..035] One result. Never a verdict.",
+   "type": "object",
+   "required": [
+    "ruleId",
+    "disposition"
+   ],
+   "properties": {
+    "ruleId": {
+     "type": "string",
+     "minLength": 1
+    },
+    "disposition": {
+     "enum": [
+      "blocker",
+      "carve-out",
+      "nit"
+     ]
+    },
+    "message": {
+     "type": "string"
+    },
+    "location": {
+     "type": "string"
+    },
+    "fingerprints": {
+     "type": "object",
+     "minProperties": 1,
+     "additionalProperties": {
+      "type": "string",
+      "minLength": 1
+     },
+     "description": "[CORE-VRD-023] SARIF partialFingerprints/fingerprints, reused for the cross-round link"
+    },
+    "unverifiable": {
+     "type": "object",
+     "required": [
+      "owedBy",
+      "attempted"
+     ],
+     "properties": {
+      "owedBy": {
+       "$ref": "#/$defs/party"
+      },
+      "attempted": {
+       "type": "string",
+       "minLength": 1
+      }
+     },
+     "additionalProperties": false
+    },
+    "native": {
+     "type": "object",
+     "description": "the native SARIF 2.1.0 result, kept as-is (D7 R1)"
+    },
+    "answers": {
+     "$ref": "#/$defs/answers"
+    },
+    "evidenceKind": {
+     "$ref": "#/$defs/evidenceKind"
+    },
+    "link": {
+     "$ref": "#/$defs/findingLink"
+    }
+   },
+   "not": {
+    "anyOf": [
+     {
+      "required": [
+       "verdict"
+      ]
+     },
+     {
+      "required": [
+       "reason"
+      ]
+     }
+    ]
+   },
+   "additionalProperties": false,
+   "if": {
+    "required": [
+     "link"
+    ]
+   },
+   "then": {
+    "required": [
+     "fingerprints"
+    ]
+   }
+  },
+  "finding": {
+   "description": "[CORE-VRD-021] Finding Statement, its own predicate type.",
+   "type": "object",
+   "required": [
+    "_type",
+    "subject",
+    "predicateType",
+    "predicate"
+   ],
+   "properties": {
+    "_type": {
+     "const": "https://in-toto.io/Statement/v1"
+    },
+    "subject": {
+     "type": "array",
+     "minItems": 1,
+     "items": {
+      "$ref": "https://everstandards.dev/core/0.1.0/evidence.schema.json#/$defs/subject"
+     }
+    },
+    "predicateType": {
+     "const": "https://everstandards.dev/core/finding/v0.1"
+    },
+    "predicate": {
+     "$ref": "#/$defs/findingPredicate"
+    }
+   }
+  },
+  "mapping": {
+   "description": "[CORE-VRD-008][CORE-VRD-020] Outward-only mapping table.",
+   "type": "object",
+   "required": [
+    "passingValues",
+    "rows"
+   ],
+   "properties": {
+    "module": {
+     "type": "string"
+    },
+    "$comment": {
+     "type": "string"
+    },
+    "passingValues": {
+     "type": "object",
+     "additionalProperties": {
+      "type": "array",
+      "items": {
+       "type": "string"
+      }
+     }
+    },
+    "rows": {
+     "type": "array",
+     "items": {
+      "type": "object",
+      "required": [
+       "from"
+      ],
+      "properties": {
+       "from": {
+        "enum": [
+         "pass",
+         "fail",
+         "unknown"
+        ]
+       }
+      }
+     }
+    }
+   },
+   "additionalProperties": false
+  },
+  "answers": {
+   "description": "[CORE-VRD-025][CORE-VRD-026] The three blocker questions (WE #2950). Partial or absent answers are allowed in the record; a consumer then treats the finding as blocking.",
+   "type": "object",
+   "properties": {
+    "introduced": {
+     "type": "boolean"
+    },
+    "worseThanBase": {
+     "type": "boolean"
+    },
+    "parallelizable": {
+     "type": "boolean"
+    }
+   },
+   "additionalProperties": false
+  },
+  "linkState": {
+   "description": "[CORE-VRD-028] Cross-round state. Outward to SARIF 2.1.0 result.baselineState per CORE-VRD-031.",
+   "enum": [
+    "new",
+    "still-open",
+    "fixed",
+    "reopened"
+   ]
+  },
+  "findingLink": {
+   "description": "[CORE-VRD-028][CORE-VRD-029] Cross-round finding link. Identity is the finding's SARIF fingerprints; matchedOn names the fingerprint keys that matched the earlier round.",
+   "type": "object",
+   "required": [
+    "state",
+    "round"
+   ],
+   "properties": {
+    "state": {
+     "$ref": "#/$defs/linkState"
+    },
+    "round": {
+     "type": "integer",
+     "minimum": 1
+    },
+    "matchedOn": {
+     "type": "array",
+     "minItems": 1,
+     "uniqueItems": true,
+     "items": {
+      "type": "string",
+      "minLength": 1
+     }
+    }
+   },
+   "additionalProperties": false,
+   "if": {
+    "properties": {
+     "state": {
+      "const": "new"
+     }
+    }
+   },
+   "then": {
+    "not": {
+     "required": [
+      "matchedOn"
+     ]
+    }
+   },
+   "else": {
+    "required": [
+     "matchedOn"
+    ]
+   }
+  },
+  "evidenceKind": {
+   "description": "[CORE-VRD-035] Finding evidence ladder (WE #3312, #3375 top rung), lowest first: assertion < resolved-citation < repro < quoted-citation < verified-test; or an org kind (x- or registered https URI).",
+   "type": "string",
+   "anyOf": [
+    {
+     "enum": [
+      "assertion",
+      "resolved-citation",
+      "repro",
+      "quoted-citation",
+      "verified-test"
+     ]
+    },
+    {
+     "pattern": "^x-[a-z0-9][a-z0-9-]{0,62}$"
+    },
+    {
+     "format": "uri",
+     "pattern": "^https://"
+    }
+   ]
+  },
+  "careLevelValue": {
+   "description": "[CORE-VRD-033] Core care levels or an org level (x- or registered https URI).",
+   "type": "string",
+   "anyOf": [
+    {
+     "enum": [
+      "low",
+      "elevated",
+      "high"
+     ]
+    },
+    {
+     "pattern": "^x-[a-z0-9][a-z0-9-]{0,62}$"
+    },
+    {
+     "format": "uri",
+     "pattern": "^https://"
+    }
+   ]
+  },
+  "careLevel": {
+   "description": "[CORE-VRD-032][CORE-VRD-033] Advisory care level (WE #2563). Scales review rigor; never blocks. The scorer is an org-configured plug.",
+   "type": "object",
+   "required": [
+    "level",
+    "scorer"
+   ],
+   "properties": {
+    "level": {
+     "$ref": "#/$defs/careLevelValue"
+    },
+    "scorer": {
+     "type": "string",
+     "format": "uri",
+     "pattern": "^https://"
+    },
+    "score": {
+     "type": "number"
+    },
+    "basis": {
+     "type": "array",
+     "items": {
+      "type": "string",
+      "minLength": 1
+     }
+    }
+   },
+   "additionalProperties": false
+  },
+  "admission": {
+   "description": "[CORE-VRD-036] Org config, per gate: the finding evidence kinds that may block at this gate (WE #3312). Absent = admit everything.",
+   "type": "object",
+   "required": [
+    "gate",
+    "accept"
+   ],
+   "properties": {
+    "gate": {
+     "type": "string",
+     "format": "uri"
+    },
+    "accept": {
+     "type": "array",
+     "minItems": 1,
+     "uniqueItems": true,
+     "items": {
+      "$ref": "#/$defs/evidenceKind"
+     }
+    }
+   },
+   "additionalProperties": false
+  },
+  "itemId": {
+   "description": "[CORE-VRD-046] A rubric item id, stable across rubric versions (e.g. MP5, or an imported ASVS id kept as its source wrote it in sourceId).",
+   "type": "string",
+   "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$"
+  },
+  "rubricRef": {
+   "description": "[CORE-VRD-039][CORE-VRD-047] A rubric or rubric policy by absolute https URI and canonical-JSON digest.",
+   "type": "object",
+   "required": [
+    "uri",
+    "digest"
+   ],
+   "properties": {
+    "uri": {
+     "type": "string",
+     "format": "uri",
+     "pattern": "^https://"
+    },
+    "digest": {
+     "$ref": "https://everstandards.dev/core/0.1.0/evidence.schema.json#/$defs/digestSet"
+    }
+   },
+   "additionalProperties": false
+  },
+  "rubricItem": {
+   "description": "[CORE-VRD-046] One criterion.",
+   "type": "object",
+   "required": [
+    "id",
+    "text"
+   ],
+   "properties": {
+    "id": {
+     "$ref": "#/$defs/itemId"
+    },
+    "text": {
+     "type": "string",
+     "minLength": 1
+    },
+    "sourceId": {
+     "type": "string",
+     "minLength": 1,
+     "description": "the bound norm's own id, version-qualified (ASVS: v<version>-<chapter>.<section>.<requirement>, e.g. v5.0.0-1.2.5)"
+    },
+    "source": {
+     "type": "string",
+     "format": "uri",
+     "description": "the norm or document the item comes from"
+    },
+    "naAllowed": {
+     "type": "boolean",
+     "description": "false: this item can never be n/a (CORE-VRD-042)"
+    },
+    "naWhen": {
+     "$ref": "#/$defs/rubricRef",
+     "description": "[CORE-VRD-054] a named check (URI plus digest, never an expression) that MUST hold for an n/a answer to this item to be accepted"
+    },
+    "minKind": {
+     "$ref": "#/$defs/evidenceKind",
+     "description": "[CORE-VRD-041] the weakest evidence kind that can support an answer"
+    }
+   },
+   "additionalProperties": false
+  },
+  "rubric": {
+   "description": "[CORE-VRD-046] A checklist: org content, referenced by URI plus digest, never inlined in a flow.",
+   "type": "object",
+   "required": [
+    "rubricType",
+    "id",
+    "version",
+    "items"
+   ],
+   "properties": {
+    "rubricType": {
+     "const": "https://everstandards.dev/core/rubric/v0.1"
+    },
+    "id": {
+     "type": "string",
+     "format": "uri",
+     "pattern": "^https://"
+    },
+    "version": {
+     "type": "string",
+     "minLength": 1
+    },
+    "title": {
+     "type": "string"
+    },
+    "appliesTo": {
+     "$ref": "https://everstandards.dev/core/0.1.0/evidence.schema.json#/$defs/digestSet",
+     "description": "[CORE-VRD-042] set only on a per-subject rubric (e.g. a change's acceptance criteria): the subject digest it belongs to"
+    },
+    "items": {
+     "type": "array",
+     "minItems": 1,
+     "items": {
+      "$ref": "#/$defs/rubricItem"
+     }
+    }
+   },
+   "additionalProperties": false
+  },
+  "seatPolicy": {
+   "description": "[CORE-VRD-047] One deciding seat's rubric settings. Product-neutral: a lens is a name; no provider field exists, so no provider can be exempted (CORE-VRD-051).",
+   "type": "object",
+   "required": [
+    "lens"
+   ],
+   "properties": {
+    "lens": {
+     "type": "string",
+     "pattern": "^[a-z][a-z0-9-]{0,62}$"
+    },
+    "rubric": {
+     "$ref": "#/$defs/rubricRef"
+    },
+    "rubricFrom": {
+     "const": "subject",
+     "description": "the rubric comes with the subject (its acceptance criteria), bound by rubric.appliesTo"
+    },
+    "required": {
+     "anyOf": [
+      {
+       "const": "all"
+      },
+      {
+       "type": "array",
+       "minItems": 1,
+       "uniqueItems": true,
+       "items": {
+        "$ref": "#/$defs/itemId"
+       }
+      }
+     ]
+    },
+    "na": {
+     "type": "object",
+     "required": [
+      "allowed"
+     ],
+     "properties": {
+      "allowed": {
+       "type": "boolean"
+      },
+      "neverNa": {
+       "type": "array",
+       "uniqueItems": true,
+       "items": {
+        "$ref": "#/$defs/itemId"
+       }
+      },
+      "max": {
+       "type": "integer",
+       "minimum": 0
+      }
+     },
+     "additionalProperties": false
+    },
+    "allNa": {
+     "enum": [
+      "unknown",
+      "pass"
+     ],
+     "description": "what a seat whose every required item is n/a derives; default unknown"
+    },
+    "evidence": {
+     "type": "object",
+     "properties": {
+      "minKind": {
+       "$ref": "#/$defs/evidenceKind"
+      },
+      "perItem": {
+       "type": "object",
+       "propertyNames": {
+        "$ref": "#/$defs/itemId"
+       },
+       "additionalProperties": {
+        "$ref": "#/$defs/evidenceKind"
+       }
+      }
+     },
+     "additionalProperties": false
+    },
+    "citeScope": {
+     "enum": [
+      "tree",
+      "diff"
+     ],
+     "description": "tree: a cited file must exist at the head; diff: it must also be in the net diff"
+    },
+    "check": {
+     "$ref": "#/$defs/rubricRef",
+     "description": "the named check that derives the seat (its gate), by URI and digest"
+    }
+   },
+   "additionalProperties": false,
+   "not": {
+    "required": [
+     "rubric",
+     "rubricFrom"
+    ]
+   }
+  },
+  "confirmation": {
+   "description": "[CORE-VRD-048] An owner's confirmation of one loosening, bound to the exact child policy digest.",
+   "type": "object",
+   "required": [
+    "lens",
+    "setting",
+    "level",
+    "owner",
+    "policyDigest"
+   ],
+   "properties": {
+    "lens": {
+     "type": "string",
+     "minLength": 1
+    },
+    "setting": {
+     "type": "string",
+     "minLength": 1
+    },
+    "level": {
+     "enum": [
+      "company",
+      "org",
+      "team",
+      "repo"
+     ]
+    },
+    "owner": {
+     "type": "string",
+     "format": "uri"
+    },
+    "policyDigest": {
+     "$ref": "https://everstandards.dev/core/0.1.0/evidence.schema.json#/$defs/digestSet"
+    },
+    "record": {
+     "$ref": "#/$defs/rubricRef"
+    }
+   },
+   "additionalProperties": false
+  },
+  "rubricPolicy": {
+   "description": "[CORE-VRD-047][CORE-VRD-048] Per-level org config of deciding seats, resolved company -> org -> team -> repo (D15). A lens a level omits is inherited.",
+   "type": "object",
+   "required": [
+    "policyType",
+    "id",
+    "level",
+    "seats"
+   ],
+   "properties": {
+    "policyType": {
+     "const": "https://everstandards.dev/core/rubric-policy/v0.1"
+    },
+    "id": {
+     "type": "string",
+     "format": "uri",
+     "pattern": "^https://"
+    },
+    "level": {
+     "enum": [
+      "company",
+      "org",
+      "team",
+      "repo"
+     ]
+    },
+    "parent": {
+     "$ref": "#/$defs/rubricRef"
+    },
+    "seats": {
+     "type": "array",
+     "items": {
+      "$ref": "#/$defs/seatPolicy"
+     }
+    },
+    "confirmations": {
+     "type": "array",
+     "items": {
+      "$ref": "#/$defs/confirmation"
+     }
+    }
+   },
+   "additionalProperties": false
+  },
+  "location": {
+   "description": "[CORE-VRD-041] SARIF physicalLocation, flattened: artifactLocation.uri (repo-relative path), region.startLine / endLine, region.snippet.text.",
+   "type": "object",
+   "required": [
+    "uri",
+    "startLine"
+   ],
+   "properties": {
+    "uri": {
+     "type": "string",
+     "minLength": 1,
+     "pattern": "^[^/]"
+    },
+    "startLine": {
+     "type": "integer",
+     "minimum": 1
+    },
+    "endLine": {
+     "type": "integer",
+     "minimum": 1
+    },
+    "snippet": {
+     "type": "string",
+     "minLength": 1
+    }
+   },
+   "additionalProperties": false
+  },
+  "itemEvidence": {
+   "description": "[CORE-VRD-041] Evidence for one answer: {file, line, head} as a SARIF-shaped location plus revisionId (SARIF versionControlDetails.revisionId), and/or a core evidence reference (e.g. an in-toto test-result Statement).",
+   "type": "object",
+   "required": [
+    "kind"
+   ],
+   "properties": {
+    "kind": {
+     "$ref": "#/$defs/evidenceKind"
+    },
+    "location": {
+     "$ref": "#/$defs/location"
+    },
+    "revisionId": {
+     "type": "string",
+     "pattern": "^[0-9a-f]{40}$"
+    },
+    "ref": {
+     "$ref": "https://everstandards.dev/core/0.1.0/evidence.schema.json#/$defs/evidenceRef"
+    },
+    "note": {
+     "type": "string"
+    }
+   },
+   "additionalProperties": false,
+   "anyOf": [
+    {
+     "required": [
+      "location"
+     ]
+    },
+    {
+     "required": [
+      "ref"
+     ]
+    }
+   ]
+  },
+  "itemAnswer": {
+   "description": "[CORE-VRD-040] One item's answer: pass | fail | n/a. Unanswered is unknown (it is never written; it is the absence).",
+   "type": "object",
+   "required": [
+    "itemId",
+    "outcome",
+    "evidence"
+   ],
+   "properties": {
+    "itemId": {
+     "$ref": "#/$defs/itemId"
+    },
+    "outcome": {
+     "enum": [
+      "pass",
+      "fail",
+      "n/a"
+     ]
+    },
+    "reason": {
+     "type": "string",
+     "minLength": 1
+    },
+    "evidence": {
+     "type": "array",
+     "items": {
+      "$ref": "#/$defs/itemEvidence"
+     }
+    },
+    "native": {
+     "type": "object",
+     "description": "the bound norm's own result (SARIF result, OSCAL finding-target), kept as-is"
+    },
+    "naCheck": {
+     "type": "object",
+     "description": "[CORE-VRD-054] the result of the item's naWhen check, recorded on an n/a answer: the check's URI and digest and whether it held",
+     "required": [
+      "uri",
+      "digest",
+      "result"
+     ],
+     "properties": {
+      "uri": {
+       "type": "string",
+       "format": "uri",
+       "pattern": "^https://"
+      },
+      "digest": {
+       "$ref": "https://everstandards.dev/core/0.1.0/evidence.schema.json#/$defs/digestSet"
+      },
+      "result": {
+       "enum": [
+        "pass",
+        "fail",
+        "error"
+       ]
+      }
+     },
+     "additionalProperties": false
+    }
+   },
+   "additionalProperties": false,
+   "allOf": [
+    {
+     "if": {
+      "properties": {
+       "outcome": {
+        "const": "fail"
+       }
+      }
+     },
+     "then": {
+      "properties": {
+       "evidence": {
+        "type": "array",
+        "minItems": 1,
+        "contains": {
+         "type": "object",
+         "required": [
+          "location",
+          "revisionId"
+         ]
+        }
+       }
+      },
+      "description": "[CORE-VRD-055] a fail cites {file, line, head}"
+     }
+    },
+    {
+     "if": {
+      "properties": {
+       "outcome": {
+        "enum": [
+         "fail",
+         "n/a"
+        ]
+       }
+      }
+     },
+     "then": {
+      "required": [
+       "reason"
+      ]
+     }
+    },
+    {
+     "if": {
+      "properties": {
+       "outcome": {
+        "const": "pass"
+       }
+      }
+     },
+     "then": {
+      "properties": {
+       "evidence": {
+        "type": "array",
+        "minItems": 1
+       }
+      }
+     }
+    }
+   ]
+  },
+  "assessmentPredicate": {
+   "description": "[CORE-VRD-039] A deciding seat's per-item answers. Not a finding and not a verdict: it carries no verdict, reason or disposition (CORE-VRD-050).",
+   "type": "object",
+   "required": [
+    "seat",
+    "rubric",
+    "policy",
+    "revisionId",
+    "evaluatedAt",
+    "items"
+   ],
+   "properties": {
+    "seat": {
+     "type": "object",
+     "required": [
+      "lens",
+      "evaluator"
+     ],
+     "properties": {
+      "lens": {
+       "type": "string",
+       "pattern": "^[a-z][a-z0-9-]{0,62}$"
+      },
+      "evaluator": {
+       "type": "string",
+       "format": "uri"
+      }
+     },
+     "additionalProperties": false
+    },
+    "rubric": {
+     "$ref": "#/$defs/rubricRef"
+    },
+    "policy": {
+     "$ref": "#/$defs/rubricRef"
+    },
+    "revisionId": {
+     "type": "string",
+     "pattern": "^[0-9a-f]{40}$",
+     "description": "the reviewed head (SARIF versionControlDetails.revisionId)"
+    },
+    "repositoryUri": {
+     "type": "string",
+     "format": "uri"
+    },
+    "evaluatedAt": {
+     "type": "string",
+     "format": "date-time"
+    },
+    "items": {
+     "type": "array",
+     "items": {
+      "$ref": "#/$defs/itemAnswer"
+     }
+    }
+   },
+   "additionalProperties": false
+  },
+  "assessment": {
+   "description": "[CORE-VRD-039] Assessment Statement (in-toto Statement v1).",
+   "type": "object",
+   "required": [
+    "_type",
+    "subject",
+    "predicateType",
+    "predicate"
+   ],
+   "properties": {
+    "_type": {
+     "const": "https://in-toto.io/Statement/v1"
+    },
+    "subject": {
+     "type": "array",
+     "minItems": 1,
+     "items": {
+      "$ref": "https://everstandards.dev/core/0.1.0/evidence.schema.json#/$defs/subject"
+     }
+    },
+    "predicateType": {
+     "const": "https://everstandards.dev/core/assessment/v0.1"
+    },
+    "predicate": {
+     "$ref": "#/$defs/assessmentPredicate"
+    }
+   },
+   "additionalProperties": false
+  }
+ }
+}

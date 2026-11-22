@@ -1,0 +1,6 @@
+{
+  "description": "Per-task Codex model, effort and pre-launch retry choices.",
+  "owner": "scripts/settings/codex.json",
+  "changeVia": "pr",
+  "instant": false
+}

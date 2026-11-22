@@ -1,0 +1,6 @@
+{
+  "description": "Trusted card-ledger signers.",
+  "owner": "scripts/settings/card-ledger-trust.json",
+  "changeVia": "pr",
+  "instant": false
+}

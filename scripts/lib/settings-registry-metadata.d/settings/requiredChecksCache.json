@@ -1,0 +1,6 @@
+{
+  "description": "Lifetime of cached required-status-check reads.",
+  "owner": "scripts/settings/required-checks-cache.json",
+  "changeVia": "pr",
+  "instant": false
+}

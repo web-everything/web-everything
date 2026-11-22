@@ -2,7 +2,10 @@
 bornAs: x6ugywx
 kind: story
 size: 2
-status: open
+status: closed
+closedReason: duplicate
+closedInto: "6202"
+dateClosed: "2026-11-22"
 scope: ["plateau:src/wip/", "plateau:src/wip/glance/"]
 dateOpened: "2026-10-03"
 tags: []
