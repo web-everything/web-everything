@@ -415,3 +415,16 @@ it.each([false, true])('omitted registered pin blocks normal adoption but permit
     }
   } finally { f.cleanup(); }
 }, 60_000);
+
+it('a set-aside never takes the skip-unrelated adopt path: candidate smoke is forced', async () => {
+  const f = await createSetAsideFixture();
+  try {
+    const skipCheck = vi.fn(() => ({ skip: true, reason: 'test-unrelated' }));
+    const result = await prepareRebuild({ root: f.root, env: f.env, run: gitRun, now: Date.now, prState: async () => 'OPEN', skipCheck,
+      autoRebase: { resolveAutoRebaseSwitch: () => ({ enabled: false, source: 'test' }), finishPendingSwaps: async () => {}, kickAutoRebase: async () => ({ started: [], skipped: [] }) } });
+    expect(result.plan.decisions.some(d => d.setAside)).toBe(true);
+    expect(skipCheck).not.toHaveBeenCalled();
+    expect(result.result?.skippedSmoke).not.toBe(true);
+    expect(result.terminal).toBe(false);
+  } finally { f.cleanup(); }
+}, 60_000);

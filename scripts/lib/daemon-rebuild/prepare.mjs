@@ -849,7 +849,9 @@ export async function prepareRebuild({
   const busyTrees = Array.isArray(state.busySkippedTrees) ? state.busySkippedTrees : [];
   const headTree = busyTrees.length ? verifyRev(git, `${prevHead}^{tree}`) : null;
   const busyUnverified = busyTrees.length > 0 && (!headTree || busyTrees.includes(headTree));
-  if (typeof skipCheck === 'function' && state.adopted?.head === prevHead && !state.held && !state.quarantine
+  // An omission (set-aside or dropped overlay) changes what runs: it always gets the full candidate smoke.
+  const hasOmission = Array.isArray(plan.decisions) && plan.decisions.some((d) => d?.setAside || d?.action === 'drop');
+  if (typeof skipCheck === 'function' && !hasOmission && state.adopted?.head === prevHead && !state.held && !state.quarantine
     && !busyUnverified && !buildLeaseIsLive(state.building, { env: stEnv, nowMs: nowMs() })) {
     // --no-renames: a renamed file must list BOTH endpoints, or a renamed-away imported module hides from the closure.
     // -z: NUL-separated, so a non-ASCII path is not C-quoted into a string that never matches a closure member.
