@@ -1,0 +1,6 @@
+{
+  "description": "Population exclusions for the open PR cap.",
+  "owner": "scripts/settings/open-pr-cap.json",
+  "changeVia": "pr",
+  "instant": false
+}

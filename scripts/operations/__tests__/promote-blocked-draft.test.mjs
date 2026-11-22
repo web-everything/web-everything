@@ -17,7 +17,7 @@ const dispatch = (reconcile, readPrLabels, ready) => runReconcilePromoteDraftDis
   root: '/repo', reconcile, provider: { ready },
   checkStaleness: () => ({ fresh: true, behind: 0 }),
   readHeadCheckState: () => ({ state: 'green', why: 'required checks succeeded' }),
-  readPrLabels, clearAwaitingCi: () => {},
+  readComments: () => [], readPrLabels, clearAwaitingCi: () => {},
 });
 
 describe.each(['red-team:blocked', 'red-team:pending'])('%s draft promotion across daemon planning and dispatch', hold => {

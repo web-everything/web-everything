@@ -1,0 +1,6 @@
+{
+  "description": "Merge drain grouping, recovery and infrastructure classification policy.",
+  "owner": "scripts/settings/drain-card-group.json",
+  "changeVia": "pr",
+  "instant": false
+}

@@ -1,0 +1,64 @@
+{
+ "rubricType": "https://everstandards.dev/core/rubric/v0.1",
+ "id": "https://everstandards.dev/core/fixtures/rubrics/merge-path",
+ "version": "2026-11-19",
+ "title": "Merge-path prep checklist (from 2026-11-19 audit loops)",
+ "items": [
+  {
+   "id": "MP1",
+   "text": "Producer identity. Is every status, check or comment trusted only from the expected App, bot or login? (Not by name; a newer \"success\" from another app must not count.)"
+  },
+  {
+   "id": "MP2",
+   "text": "Present vs absent. Does a missing required signal (check, status, hold, record) refuse, rather than count as \"nothing blocking\"?"
+  },
+  {
+   "id": "MP3",
+   "text": "Ordering. Is it ordered by id or sequence, never by created_at or timestamps (missing, invalid or equal timestamps)?"
+  },
+  {
+   "id": "MP4",
+   "text": "Read-then-write races. Is there a re-read after every write, fail-closed if anything changed or appeared (concurrent holds, other hosts)?"
+  },
+  {
+   "id": "MP5",
+   "text": "Head binding. Is every decision pinned to an exact 40-hex head, re-verified right before and after the write, with refusal on a moved head?"
+  },
+  {
+   "id": "MP6",
+   "text": "Binding to the round or run. Can a hold or success from one round or run clear another? Bind to an id; refuse unbound."
+  },
+  {
+   "id": "MP7",
+   "text": "Fail-open catches. Does any try/catch, default value or \"unknown\" path end in allow? Every unreadable input must refuse."
+  },
+  {
+   "id": "MP8",
+   "text": "Write ordering. Is dedupe or state persisted only AFTER the effect succeeds (no suppressed retries)?"
+  },
+  {
+   "id": "MP9",
+   "text": "Crash windows. If the process dies between steps, which state is left? Never leave a gate open; post a pending hold first and success last."
+  },
+  {
+   "id": "MP10",
+   "text": "Credentials. Which token writes? Never fall back to personal credentials; refuse without the App token."
+  },
+  {
+   "id": "MP11",
+   "text": "Environment hardening. Are GIT_DIR, GIT_WORK_TREE, replace objects, grafts, commit-graph, PATH and credential helpers controlled? Fetches must verify the fetched sha."
+  },
+  {
+   "id": "MP12",
+   "text": "Scope of exemptions. Does any skip or no-op rule trust a label or policy string without re-deriving it from the diff?"
+  },
+  {
+   "id": "MP13",
+   "text": "Process liveness. Can a surviving child or uid process change files after a verdict is recorded? Then the verdict must not be trusted."
+  },
+  {
+   "id": "MP14",
+   "text": "Simplest correct option. Before adding machinery (retries, markers, carry), is there a stateless alternative (e.g. update-branch → fresh round)? Prefer it."
+  }
+ ]
+}

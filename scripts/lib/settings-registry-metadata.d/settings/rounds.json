@@ -1,0 +1,6 @@
+{
+  "description": "Shadow round judge grants and non-convergence detection.",
+  "owner": "scripts/settings/round-judge.json",
+  "changeVia": "pr",
+  "instant": false
+}

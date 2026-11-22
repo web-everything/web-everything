@@ -1,0 +1,6 @@
+{
+  "description": "Advisory review policy when CI repair hands ownership to a human.",
+  "owner": "scripts/settings/pr-ownership.json",
+  "changeVia": "pr",
+  "instant": false
+}

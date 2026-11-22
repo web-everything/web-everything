@@ -1,0 +1,6 @@
+{
+  "description": "Stack detection, bottom-first order, restacking and hold expiry.",
+  "owner": "scripts/settings/pr-stack.json",
+  "changeVia": "pr",
+  "instant": false
+}

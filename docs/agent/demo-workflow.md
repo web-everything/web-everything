@@ -165,6 +165,9 @@ To show the same element as HTML and JSX on a block/adapter page (`source-toggle
   snippets that won't parse.
 
 ## 5. Testing (mandatory — details in [testing.md](testing.md) and the coverage plan)
+
+Add new testing notes as per-topic files in [testing/](testing/README.md).
+
 - **Logic** → unit tests over the **shared fixtures** (`*.test.ts`, Vitest). Adding a mapping/behavior
   case = adding one fixture, which covers the demo and the tests at once.
 - **Browser runtime** → an **E2E spec** at `{plugs|blocks}/__tests__/e2e/{id}.spec.ts` (Playwright):

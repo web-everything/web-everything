@@ -1,0 +1,6 @@
+{
+  "description": "Enable follow-up drain jobs.",
+  "owner": "scripts/settings/drain-followup-job.json",
+  "changeVia": "pr",
+  "instant": false
+}

@@ -1,0 +1,6 @@
+{
+  "description": "Documentation of missing red-team recovery controls.",
+  "owner": "scripts/settings/review-red-team-on-skip.json",
+  "changeVia": "pr",
+  "instant": false
+}

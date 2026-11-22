@@ -1,0 +1,6 @@
+{
+  "description": "Prototype load adoption timeout and polling interval.",
+  "owner": "scripts/settings/prototype-load.json",
+  "changeVia": "pr",
+  "instant": false
+}
