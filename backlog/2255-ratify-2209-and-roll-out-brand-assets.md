@@ -224,3 +224,5 @@ unblocked, informed by the actual ratified gate wording.
 Superseded 2026-11-22 by #2209 (Its ratify step repeats #2209; keep only the rollout, which becomes DZ-BRAND and DZ-SITES.) [PL-WIP-CLEANUP / plateau rulings].
 
 Acceptance items carried (2026-11-22): plan step DZ-BRAND (design plan): check:branding validator, icon cleanup, gradient hue-span normalization and the asset rollout.
+
+Acceptance items also tracked on new card xt9bmkj.

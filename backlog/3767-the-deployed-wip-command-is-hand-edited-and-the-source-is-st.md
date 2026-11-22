@@ -50,3 +50,5 @@ Remaining before this card can resolve: the state-naming cleanup and its scan te
 Superseded 2026-11-22 by plan step DZ-RETIRE-WIP (Fix lives in /wip publisher code that DZ-RETIRE-WIP removes. Reopen only if /wip stays past W12.) [PL-WIP-CLEANUP / plateau rulings].
 
 Acceptance items carried (2026-11-22): plan step DZ-LINT (design plan): continue/handoff hard-coded state scan test and the pre-overwrite warning choice.
+
+Acceptance items also tracked on new card x23lblp.
