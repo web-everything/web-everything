@@ -30,9 +30,11 @@ import { admissionLockRoot, slotPath } from '../readiness/heavy-admission.mjs';
 import { readLockEntry } from '../readiness/file-locks.mjs';
 import { verifyFinishBody } from '../lib/lane-verify.mjs';
 import { GATE_STARTED_MARKER, GATE_QUEUED_MARKER } from '../conveyor/verify-dispatch.mjs';
-import { CARD_ONLY_SKIP_GATE } from '../lib/verify-lane-gate.mjs';
+import { CARD_ONLY_SKIP_GATE, shellQuote } from '../lib/verify-lane-gate.mjs';
 
-// Selection fixtures retain the historical related gate explicitly.
+const namedSuitesCommand = `npx vitest run ${JSON.parse(readFileSync(resolve(process.cwd(), 'scripts/verify-settings.json'), 'utf8')).alwaysRunTests.slice().sort().map(shellQuote).join(' ')} --passWithNoTests`;
+
+// Selection fixtures explicitly opt into the related-selection policy.
 beforeEach(() => {
   vi.stubEnv('WE_BUILD_FINAL_GATE', 'related');
   vi.stubEnv('WE_BUILD_FINAL_GATE_STANDARDS', 'selected');
@@ -450,10 +452,14 @@ describe('verify-lane — card-only diff skips the local gate (skipLocalForCardO
       commitFile('scripts/lib/zz-fix.mjs');
       const second = spawnSync('node', [VERIFY_LANE, 'request', '--json'], { cwd: dir, encoding: 'utf8', env });
       expect(second.stderr).toContain(`selection mode: since-last-green — delta ${green.slice(0, 8)}..HEAD only`);
-      expect(second.stderr).not.toContain('zz2-green.mjs');
+      // Commands name selected tests now; inspect the diff selection to prove which sources it covers.
+      const preview = (selection) => JSON.parse(execFileSync('node', [VERIFY_LANE, '--dry-run'], {
+        cwd: dir, encoding: 'utf8', env: { ...env, WE_VERIFY_SELECTION: selection },
+      }));
+      expect(preview('since-last-green').decision.changedFiles).toEqual(['scripts/lib/zz-fix.mjs']);
       const prMode = spawnSync('node', [VERIFY_LANE, 'request', '--json'], { cwd: dir, encoding: 'utf8', env: { ...env, WE_VERIFY_SELECTION: 'pr' } });
       expect(prMode.stderr).toContain('selection mode: pr');
-      expect(prMode.stderr).toContain('zz2-green.mjs');
+      expect(preview('pr').decision.changedFiles).toEqual(['.gitignore', 'scripts/lib/zz-fix.mjs', 'scripts/lib/zz2-green.mjs']);
     } finally { rmSync(ledgerDir, { recursive: true, force: true }); }
   });
   // Review round 1 (finding 2): a card-only skip runs NO gate, so it must never become a "last green" in the ledger.
@@ -1483,10 +1489,20 @@ describe('request with an explicit --gate when the default selection is blocked'
 
   it('accepts an affected-test gate and stamps the request', () => {
     blockDefault();
-    const r = request('npx vitest related src/a.test.ts --run');
+    const r = request('npx vitest run src/a.test.ts');
     expect(r.status).toBe(0);
     expect(JSON.parse(r.stdout)).toMatchObject({ status: 'requested' });
-    expect(JSON.parse(readFileSync(marker(), 'utf8'))).toMatchObject({ status: 'running', suites: 'npx vitest related src/a.test.ts --run' });
+    expect(JSON.parse(readFileSync(marker(), 'utf8'))).toMatchObject({ status: 'running', suites: 'npx vitest run src/a.test.ts' });
+  });
+
+  it('refuses an affected-test gate rewritten to include --passWithNoTests and records no marker', () => {
+    blockDefault();
+    const r = request('npx vitest related src/a.test.ts --run');
+    expect(r.stderr).toContain('explicit related gate capped');
+    expect(r.status).toBe(3);
+    expect(JSON.parse(r.stdout)).toMatchObject({ status: 'gate-refused', reason: 'explicit-gate-not-affected-test',
+      detail: expect.stringContaining('--passWithNoTests') });
+    expect(existsSync(marker())).toBe(false);
   });
 
   it('a dispatcher child (--run-id) re-checks at run time: a gate accepted for a docs-only diff does not run once the tree reaches package.json', () => {
@@ -1541,7 +1557,7 @@ it('first attempt times out', async () => {
   writeFileSync(attempt, 'attempted');
   await new Promise(() => {});
 }, 40);
-` : importsSource ? "import './source.mjs';\n" : '// baseline\n');
+` : importsSource ? "import './source.mjs';\n" : '// source.mjs fixture (literal reference, no import)\n');
     if (guard) writeFileSync(join(dir, 'guard.test.mjs'), '// repo-wide guard\n');
     // A second declared guard the stub vitest "excludes by config": it is dropped from the executed-file report
     // while the other guard passes — the run still exits 0.
@@ -1560,7 +1576,7 @@ const held = heldSlots({ lockRoot: admissionLockRoot(process.cwd()), cap: 1, fas
 appendFileSync('calls.jsonl', JSON.stringify({ args, held, inherited: process.env.WE_HEAVY_ADMISSION_HELD, nonce: process.env.WE_VERIFY_MARKER_NONCE ?? null }) + '\\n');
 if (${live} && args[0] === 'vitest') {
   const { spawnSync } = await import('node:child_process');
-  const result = spawnSync(process.execPath, [${JSON.stringify(resolve(process.cwd(), 'node_modules/vitest/vitest.mjs'))}, ...args.slice(1), ...(args[1] === 'related' ? ['--maxWorkers=1', '--minWorkers=1'] : [])], { stdio: 'inherit' });
+  const result = spawnSync(process.execPath, [${JSON.stringify(resolve(process.cwd(), 'node_modules/vitest/vitest.mjs'))}, ...args.slice(1), ...(!args.includes('--maxWorkers=1') ? ['--maxWorkers=1', '--minWorkers=1'] : [])], { stdio: 'inherit' });
   process.exit(result.status ?? 2);
 }
 if (args[0] === 'vitest' && args.includes('--reporter=json') && args.includes('--maxWorkers=1')) {
@@ -1575,7 +1591,7 @@ if (args[0] === 'vitest' && args.includes('--reporter=json') && args.includes('-
   }
   process.exit(${retryExit});
 }
-if ((args[0] === 'vitest' && args[1] === 'related') || (args[0] === 'run' && args[1] === 'test:unit')) {
+if ((args[0] === 'vitest' && args[1] === 'run' && args.includes('--passWithNoTests')) || (args[0] === 'run' && args[1] === 'test:unit')) {
   writeAllSync(1, 'passed file\\n'.repeat(${outputLines}));
   writeAllSync(2, ${JSON.stringify(stderr)});
   writeAllSync(1, ${JSON.stringify(stdout)});
@@ -1871,7 +1887,7 @@ process.exit(${standardsExit});
     const req = f.invoke(['request']);
     expect(req.code, req.stdout + req.stderr).toBe(0); // always
     const stamped = JSON.parse(readFileSync(marker(), 'utf8')).suites;
-    expect(stamped).toContain('npx vitest related ');
+    expect(stamped).toContain('npx vitest run ');
     expect(stamped).not.toContain('npm test');
     expect(stamped).toContain('check:standards');
     const result = f.invoke([`--gate=${stamped}`, '--run-id=full-policy'], { WE_VERIFY_STANDARDS: 'ci-only' });
@@ -1900,14 +1916,28 @@ process.exit(${standardsExit});
     expect(finished.suites).toBe(stamped);
     // The requester's own selection ran — the same vitest command it stamped, never a weaker one.
     const first = f.calls()[0].args;
-    expect(first.slice(0, 2)).toEqual(['vitest', 'related']);
+    expect(first.slice(0, 2)).toEqual(['vitest', 'run']);
     expect(first.some(a => a.startsWith('--testTimeout'))).toBe(stamped.includes('--testTimeout'));
     expect(result.stderr).not.toContain('whole-gate admission');
   });
 
+  // PR #7323 red team — a request stamped before the related cap carries the old default `vitest related … --run
+  // --passWithNoTests --testTimeout --hookTimeout`; its dispatched child must run it capped, never record gate-refused.
+  it('a dispatched child converts a previously stamped default related gate instead of refusing it', () => {
+    const f = fixture({ importsSource: true });
+    const stamped = 'npx vitest related source.mjs --run --passWithNoTests --testTimeout=15000 --hookTimeout=30000 && npm run check:standards';
+    const result = f.invoke([`--gate=${stamped}`, '--run-id=legacy-default']);
+    expect(result.json?.status, result.stdout + result.stderr).not.toBe('gate-refused');
+    expect(JSON.parse(readFileSync(marker(), 'utf8')).redCause).not.toBe('refused');
+    const first = f.calls()[0].args;
+    expect(first.slice(0, 2)).toEqual(['vitest', 'run']);
+    expect(first).toEqual(expect.arrayContaining(['--testTimeout=15000', '--hookTimeout=30000', ...f.files]));
+    expect(first).not.toContain('related');
+  });
+
   it('says so, and records why, when a dispatched default-shaped gate still falls back to whole-gate admission (#66)', () => {
     const f = fixture();
-    const result = f.invoke(['--gate=npx vitest related source.mjs --run --passWithNoTests --someOtherFlag', '--run-id=unknown-shape']);
+    const result = f.invoke(['--gate=npx vitest run untouched-a.test.mjs --someOtherFlag', '--run-id=unknown-shape']);
     expect(result.stderr).toContain('⚠ verify-lane: whole-gate admission');
     const finished = JSON.parse(readFileSync(marker(), 'utf8'));
     expect(finished.phases.admissionMode).toBe('gate');
@@ -1981,7 +2011,7 @@ process.exit(${standardsExit});
     expect(result.json.status).toBe('red');
     expect(result.json.retriedFailures).toBeUndefined();
     expect(result.json.isolatedRetry).toBeUndefined();
-    expect(f.calls().some(call => call.args[0] === 'vitest' && call.args[1] === 'run')).toBe(false);
+    expect(f.calls().some(call => call.args.includes('--maxWorkers=1'))).toBe(false);
   });
 
   // 75b (3) — #3990 round 1: a red vitest half skipped repo-scan and standards, hiding a literal U+200B.
@@ -1990,7 +2020,7 @@ process.exit(${standardsExit});
     const result = f.invoke();
     expect(result.code).toBe(2);
     const calls = f.calls();
-    expect(calls.map(call => call.args.slice(0, 2))).toEqual([['vitest', 'related'], ['vitest', 'run'], ['run', 'check:standards']]);
+    expect(calls.map(call => call.args.slice(0, 2))).toEqual([['vitest', 'run'], ['vitest', 'run'], ['run', 'check:standards']]);
     expect(calls[1].args.some(a => a.includes('review-policy.conformance'))).toBe(true);
     const finished = JSON.parse(readFileSync(marker(), 'utf8'));
     expect(finished.status).toBe('red');
@@ -2030,7 +2060,7 @@ process.exit(${standardsExit});
       const result = f.invoke();
       expect(result.code, result.stdout + result.stderr).toBe(2);
       const calls = f.calls();
-      expect(calls.map(c => c.args.slice(0, 2))).toEqual([['vitest', 'related'], ['vitest', 'run'], ['vitest', 'run'], ['run', 'check:standards']]);
+      expect(calls.map(c => c.args.slice(0, 2))).toEqual([['vitest', 'run'], ['vitest', 'run'], ['vitest', 'run'], ['run', 'check:standards']]);
       expect(calls[2].args[2]).toBe('guard.test.mjs');
       expect(result.json).toMatchObject({ status: 'red', redCause: 'scan', redCauseFiles: ['guard.test.mjs'] });
       const finished = JSON.parse(readFileSync(marker(), 'utf8'));
@@ -2270,6 +2300,7 @@ describe('build finalGateStandards preview', () => {
   function change(path) {
     mkdirSync(join(dir, path.split('/').slice(0, -1).join('/')), { recursive: true });
     writeFileSync(join(dir, path), 'fixture\n');
+    if (path === 'scripts/example.mjs') writeFileSync(join(dir, 'scripts/example.test.mjs'), "import './example.mjs';\n");
   }
   function preview(finalGate, standards, extra = {}) {
     const env = { ...gateScrubbedEnv(), WE_BUILD_FINAL_GATE: finalGate,
@@ -2287,7 +2318,7 @@ describe('build finalGateStandards preview', () => {
   it('standard-default full source yields related tests and a downgrade reason', () => {
     seed(); change('scripts/example.mjs');
     const gate = preview(undefined, 'always');
-    expect(gate.command).toContain('npx vitest related ');
+    expect(gate.command).toContain('npx vitest run ');
     expect(gate.command).not.toContain('npm run test:unit');
     expect(gate.reasons.join(' ')).toMatch(/full.*standard.*related/);
   });
@@ -2297,7 +2328,7 @@ describe('build finalGateStandards preview', () => {
     git('update-ref', 'refs/remotes/origin/main', 'HEAD');
     change('scripts/example.mjs');
     const gate = preview('full', 'always');
-    expect(gate.command).toContain('npx vitest related ');
+    expect(gate.command).toContain('npx vitest run ');
     expect(gate.command).not.toMatch(/npm (test|run test:unit)/);
   });
   it.each(['always', 'selected'])('full is unchanged with %s', (standards) => {
@@ -2312,7 +2343,8 @@ describe('build finalGateStandards preview', () => {
     const gate = preview('related', standards);
     if (standards === 'always') {
       expect(gate.command).toContain('npm run check:standards');
-      expect(gate.command).toContain('vitest related');
+      if (path.startsWith('scripts/')) expect(gate.command).toContain("vitest run 'scripts/example.test.mjs' --passWithNoTests");
+      else expect(gate.command).toContain(namedSuitesCommand);
       expect(gate.command).not.toContain('local gate skipped');
       expect(gate.decision.mode).toBe('shrink');
       expect(gate.standards).toMatchObject({ policy: 'always', run: true, source: 'build.finalGateStandards (env)' });
@@ -2532,7 +2564,7 @@ describe('full build gate default', () => {
       if (requester === 'selected' && path.startsWith('backlog/')) {
         expect(suites).toBe(CARD_ONLY_SKIP_GATE);
       } else {
-        expect(suites).toMatch(/^npx vitest related /);
+        expect(suites.startsWith(namedSuitesCommand)).toBe(true);
       }
       // The skip echo mentions check:standards; only an npm command executes it.
       expect(suites.includes('npm run check:standards')).toBe(requester === 'always');

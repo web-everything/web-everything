@@ -6,13 +6,15 @@ import { join } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import * as gates from '../lib/verify-lane-gate.mjs';
 
-const options = (files = ['src/a.ts']) => ({
+// `tracked` is the repo's tracked-file list (the import graph); with none, the explicit-list gate selects no
+// test and the default push gate refuses (fail closed) rather than running an unscoped `vitest related`.
+const options = (files = ['src/a.ts'], tracked = []) => ({
   base: 'upstream/release', scripts: ['test', 'check:standards'], env: { WE_VERIFY_SELECTION: 'pr', WE_VERIFY_TEST_TIMEOUT_FACTOR: '1' }, fileConfig: null,
-  fileExists: () => false, readRepoFile: () => '',
+  fileExists: () => false, readRepoFile: path => (path.endsWith('.test.ts') ? "import './a.ts'" : ''),
   runGit: vi.fn(args => {
     if (args[0] === 'merge-base') return 'base-sha';
     if (args[0] === 'diff') return args.includes('--diff-filter=D') ? '' : files.join('\n');
-    if (args[0] === 'ls-files') return '';
+    if (args[0] === 'ls-files') return args.includes('--cached') ? tracked.join('\n') : '';
     throw new Error('no matches');
   }),
 });
@@ -91,10 +93,11 @@ describe('R913 push-if-green CLI publication guards', () => {
 
 describe('R913 push-if-green default gate', () => {
   it('selects related tests against the requested remote branch, never the whole suite', () => {
-    const opts = options();
+    const opts = options(['src/a.ts'], ['src/a.ts', 'src/a.test.ts']);
     const gate = gates.resolvePushDefaultGate(opts);
     expect(gate.exitCode).toBe(0);
-    expect(gate.command).toContain("npx vitest related 'src/a.ts' --run --passWithNoTests");
+    expect(gate.command).toContain("npx vitest run 'src/a.test.ts' --passWithNoTests");
+    expect(gate.command).not.toContain('vitest related');
     expect(gate.command).not.toMatch(/npm (test|run test:unit)/);
     expect(opts.runGit).toHaveBeenCalledWith(['merge-base', 'upstream/release', 'HEAD']);
   });
