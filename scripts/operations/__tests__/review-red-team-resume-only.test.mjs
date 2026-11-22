@@ -375,6 +375,8 @@ describe('runRedTeam pre-launch deferrals', () => {
         scoredAt: new Date(now).toISOString(), quotaResetsAt: new Date(now + 3_600_000).toISOString(),
       }] : [],
       cliAvailable: provider => provider === 'codex',
+      // Pins a known Claude builder (live cross-vendor independence waits on an unknown builder).
+      readHeadMessage: () => 'fix\n\nCo-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>\n',
       reserveCalls: vi.fn(() => { throw Error('reservation EIO'); }),
       runSeat: vi.fn(), append: vi.fn(), postComment: vi.fn(), makeScratch: vi.fn(),
     };

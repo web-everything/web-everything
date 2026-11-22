@@ -426,7 +426,8 @@ function seatsIo(over = {}) {
     makeScratch: () => '/tmp/scratch',
     removeScratch: () => {},
     writeFile: () => {},
-    readHeadMessage: () => 'fix\n',
+    // Pins a known Claude builder (live per-seat cross-vendor independence waits on an unknown builder); codex red team stays independent.
+    readHeadMessage: () => 'fix\n\nCo-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>\n',
     runSeat: async () => ({ report: { lastMessage: answer([BREAK]), exitCode: 0 } }),
     runRecheck: async () => ({ checks: [{ index: 0, confirmed: true, reason: 'no zero check' }] }),
     logTrial: (r) => r,

@@ -41,7 +41,8 @@ const REPO = 'web-everything/web-everything';
 const NOW = Date.parse('2026-09-26T15:00:00Z');
 
 const CARBON_PROMOTION_CASES = [
-  { name: 'unpromoted (default)', env: { [PROVIDER_CAP_ENV['agy-gemini']]: '5' }, promoted: false, seatCount: 2 },
+  // Pinned off: isolates from live review.json shadowSeats.antigravity.promoted=true (and the file-level env stub below).
+  { name: 'unpromoted (pinned off)', env: { WE_REVIEW_SHADOW_AGY_PROMOTED: 'false', [PROVIDER_CAP_ENV['agy-gemini']]: '5' }, promoted: false, seatCount: 2 },
   { name: 'manually promoted with a positive cap', env: { WE_REVIEW_SHADOW_AGY_PROMOTED: 'true', [PROVIDER_CAP_ENV['agy-gemini']]: '5' }, promoted: true, seatCount: 3 },
 ];
 
@@ -72,7 +73,7 @@ describe('red-team reservation routing under operator overrides', () => {
   const caps = { WE_REVIEW_SEAT_CAP_CODEX: '5000', WE_REVIEW_SEAT_CAP_AGY_CLAUDE: '0', WE_REVIEW_SEAT_CAP_AGY_GEMINI: '0' };
   it('uses the codex-only override with both agy providers capped at zero', async () => {
     const { io, calls } = fakeSeatIo({ readRoutingPolicy: () => policyFor(),
-      readAiRouting: () => ({}), readHeadMessage: () => '',
+      readAiRouting: () => ({}),
       runSeat: async o => { calls.push(['seat', o]); return { report: { lastMessage: answer({ 'red-team': { verdict: 'accept', findings: [] } }) } }; } });
     expect((await run(io, caps)).status).toBe('speculated');
     expect(calls.filter(c => c[0] === 'reserve')).toEqual([['reserve', 'codex', 1, 1]]);
@@ -128,12 +129,15 @@ describe('red-team reservation routing under operator overrides', () => {
   });
   it('tries a remaining in-chain fallback after codex reservation denial', async () => {
     const { io, calls } = fakeSeatIo({
-      readRoutingPolicy: () => policyFor([{ provider: 'agy-claude', model: 'sonnet' }]), readAiRouting: () => ({}), readHeadMessage: () => '',
+      readRoutingPolicy: () => policyFor([{ provider: 'agy-claude', model: 'sonnet' }]), readAiRouting: () => ({}),
       runSeat: async o => { calls.push(['seat', o]); return { report: { events: { finalResponse: answer({ 'red-team': { verdict: 'accept', findings: [] } }) } } }; },
     });
     const reserve = io.reserveCalls;
     io.reserveCalls = o => o.provider === 'codex' ? { used: 5000, callIds: [] } : reserve(o);
-    expect((await run(io, { ...caps, WE_REVIEW_SEAT_CAP_AGY_CLAUDE: '300' })).status).toBe('speculated');
+    // Google-built PR (same-vendor marker): both codex and agy-claude are cross-vendor, unlike the default Claude builder.
+    const read = { ...LOOP_PAYLOAD.findings.read, body: '<!-- delegation: provider=gemini model=gemini-3-pro taskType=other -->' };
+    const pass = await speculateRedTeam({ pr: 5, repo: REPO, lanePath: 'lane', read, env: { ...caps, WE_REVIEW_SEAT_CAP_AGY_CLAUDE: '300' }, post: false, record: false }, io);
+    expect(pass.status).toBe('speculated');
     expect(calls.find(c => c[0] === 'seat')[1].provider).toBe('agy-claude');
   });
   it('never reserves a routing-disabled provider even with a positive environment cap', async () => {
@@ -160,6 +164,8 @@ function fakeSeatIo(over = {}, ledgerBox = {}) {
     newId: (() => { let n = 0; return () => `call-${++n}`; })(),
     log: (l) => calls.push(['log', l]),
     readRecords: () => [],
+    // Known Claude builder so cross-vendor red-team independence does not WAIT on an unknown builder.
+    readHeadMessage: () => 'Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>',
     reserveCalls: ({ provider, want, dailyCap, now }) => {
       const r = reserveSeatCalls({ ledger: ledgerBox[provider] ?? null, records: io.readRecords(), want, dailyCap, now, newId: io.newId, provider });
       ledgerBox[provider] = r.ledger;
@@ -1729,7 +1735,7 @@ describe('durable raw seat evidence', () => {
     const text = name === 'missing-seat' ? answer({}) : raw(name);
     const { io, calls, rows } = fakeSeatIo({
       cliAvailable: provider => provider === 'codex', writeRawAnswer: effect,
-      readHeadMessage: () => '', runSeat: async opts => { calls.push(['seat', opts]); return { report: { lastMessage: text } }; },
+      runSeat: async opts => { calls.push(['seat', opts]); return { report: { lastMessage: text } }; },
       postComment: () => { throw new Error('failed calls must never post'); },
     });
     const pass = await speculateRedTeam({ pr: 5, repo: REPO, lanePath: 'lane', read: LOOP_PAYLOAD.findings.read, env: {}, post: false }, io);
@@ -1822,7 +1828,7 @@ describe('#6535 publish-first: a red-team round starts only after its in_progres
   const spec = io => speculateRedTeam({ pr: 5, repo: REPO, lanePath: 'lane', read: LOOP_PAYLOAD.findings.read, env: {}, post: true }, io);
   const rig = redTeamStatus => {
     const order = [];
-    const { io } = fakeSeatIo({ cliAvailable: p => p === 'codex', readHeadMessage: () => '',
+    const { io } = fakeSeatIo({ cliAvailable: p => p === 'codex',
       redTeamStatus: input => { order.push(['status', input.status]); return redTeamStatus(input); },
       runSeat: async () => { order.push(['seat']); return { report: { lastMessage: answer({}) } }; } });
     return { io, order };

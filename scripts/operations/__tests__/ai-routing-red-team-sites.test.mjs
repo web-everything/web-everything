@@ -11,7 +11,8 @@ import { selectReviewSeatProvider } from '../../lib/provider-routing.mjs';
 import { createRedTeamIo, speculateRedTeam, reserveSeatCalls, RED_TEAM_MODELS, RECHECK_MODEL } from '../review-extra-seats.mjs';
 
 const NOW = Date.parse('2026-11-16T15:00:00Z');
-const read = { title: 'guard', body: '', diffText: 'diff --git a/x.mjs b/x.mjs\n+guard();',
+// Known Claude builder: the red-team seat needs a cross-vendor reviewer, and an unknown builder means WAIT (not live-ledger dependent).
+const read = { title: 'guard', body: buildDelegationMarker({ provider: 'claude', model: 'claude-opus-5-5', taskType: 'bugfix' }), diffText: 'diff --git a/x.mjs b/x.mjs\n+guard();',
   netChangedFiles: ['x.mjs'], netBasis: { rev: 'a'.repeat(40) } };
 const setting = (role, coordinator, executors = 'inherit') => resolveAiRouting({ env: {}, platform: {},
   tool: { [role]: { coordinator, executors } }, accountMap: { accounts: {} }, log: false });
@@ -438,7 +439,8 @@ test('recheck overlay validation refuses an incomplete counting-Claude-seat poli
 
 const builderSeat = (builder, overrides = {}, env = {}) => seat(empty, overrides, env,
   (args, io) => speculateRedTeam({ ...args, read: { ...args.read,
-    body: buildDelegationMarker({ provider: builder, model: 'gpt-6-astra', taskType: 'bugfix' }) } }, io));
+    // Marker model matches the builder's vendor (claude + gpt-* is a conflicting identity, which means WAIT).
+    body: buildDelegationMarker({ provider: builder, model: { claude: 'claude-opus-5-5', gemini: 'gemini-3-pro' }[builder] ?? 'gpt-6-astra', taskType: 'bugfix' }) } }, io));
 
 test.each(['policy', 'overlay'])('unpromoted Carbon from %s falls back before reservation', async source => {
   const policy = structuredClone(DEFAULT_ROUTING_POLICY);
@@ -448,7 +450,9 @@ test.each(['policy', 'overlay'])('unpromoted Carbon from %s falls back before re
     fallback: [{ provider: 'codex', model: 'sol', effort: 'high' }],
   };
   const actual = await seat(source === 'overlay' ? providerOnly('red-team', 'agy-gemini') : empty,
-    { readRoutingPolicy: () => policy }, { WE_REVIEW_SEAT_CAP_AGY_GEMINI: '20', WE_REVIEW_SHADOW_AGY_PROMOTED: 'false' });
+    // routeByBuilder off: the Claude-builder preference would otherwise pick codex directly, before Carbon is ever tried.
+    { readRoutingPolicy: () => policy, readSeatSettings: () => ({ tool: { redTeam: { routeByBuilder: false } } }) },
+    { WE_REVIEW_SEAT_CAP_AGY_GEMINI: '20', WE_REVIEW_SHADOW_AGY_PROMOTED: 'false' });
   assert.equal(actual.result.status, 'speculated', actual.result.reason);
   assert.deepEqual(actual.reservations, ['codex']);
   assert.equal(actual.calls[0].provider, 'codex');
@@ -495,7 +499,8 @@ test.each(['review-seat:red-team', 'review-seat', '*'])('explicit %s operator ro
       [key]: { provider: 'agy-claude', model: 'sonnet', effort: 'high', fallback: [] },
     } } }), emit: () => {},
   });
-  const actual = await builderSeat('claude', { readRoutingPolicy });
+  // Codex builder: agy-claude is Anthropic, so it is only cross-vendor for a non-Claude builder.
+  const actual = await builderSeat('codex', { readRoutingPolicy });
   assert.deepEqual(readRoutingPolicy.operatorKeys(), [key]);
   assert.equal(actual.result.status, 'speculated', actual.result.reason);
   assert.deepEqual(actual.reservations, ['agy-claude']);
@@ -511,7 +516,8 @@ test('explicit operator fallback admits agy-claude when Codex CLI is absent but 
         fallback: [{ provider: 'agy-claude', model: 'sonnet', effort: 'high' }] },
     } } }), emit: () => {},
   });
-  const actual = await builderSeat('claude', { readRoutingPolicy, cliAvailable: provider => provider !== 'codex' });
+  // Google builder: codex and agy-claude both stay cross-vendor, so the absent Codex CLI (not vendor) decides the fallback.
+  const actual = await builderSeat('gemini', { readRoutingPolicy, cliAvailable: provider => provider !== 'codex' });
   assert.equal(actual.result.status, 'speculated', actual.result.reason);
   assert.deepEqual(actual.reservations, ['agy-claude']);
   assert.equal(actual.calls[0].provider, 'agy-claude');
@@ -541,7 +547,9 @@ test('operator review-seat:red-team override wins over builder preference', asyn
       'review-seat:red-team': { provider: 'codex', model: 'sol', effort: 'xhigh', fallback: [] },
     } } }), emit: () => {},
   });
-  const actual = await builderSeat('codex', { readRoutingPolicy }, { WE_REVIEW_SEAT_CAP_AGY_GEMINI: '20' });
+  // Google builder: a codex override stays cross-vendor (a Codex builder's own-vendor override is refused by crossVendorKeySeats);
+  // without the override the inherited route would run at effort 'high', so 'xhigh' proves the override won.
+  const actual = await builderSeat('gemini', { readRoutingPolicy }, { WE_REVIEW_SEAT_CAP_AGY_GEMINI: '20' });
   assert.equal(actual.result.status, 'speculated', actual.result.reason);
   assert.deepEqual([actual.calls[0].provider, actual.calls[0].model, actual.calls[0].effort],
     ['codex', DEFAULT_ROUTING_POLICY.aliases.codex.sol, 'xhigh']);
@@ -590,7 +598,8 @@ test('emergency provider at its standard ten-call cap refuses dispatch and logs 
   const actual = await builderSeat('codex', { readRecords: () => Array.from({ length: 10 }, (_, index) => ({
     dispatchKind: 'review-seat', provider: 'agy-claude', callId: `spent-${index}`,
     scoredAt: new Date(NOW).toISOString(), status: 'ok',
-  })) }, { WE_REVIEW_SEAT_CAP_CODEX: '0' });
+    // Gemini cap 20 + Carbon unpromoted: isolates from live agy-gemini cap 0 and promoted=true, so the loop reaches the skip log.
+  })) }, { WE_REVIEW_SEAT_CAP_CODEX: '0', WE_REVIEW_SEAT_CAP_AGY_GEMINI: '20', WE_REVIEW_SHADOW_AGY_PROMOTED: 'false' });
   assert.equal(actual.result.status, 'skipped');
   assert.match(actual.result.reason, /agy-claude: daily-cap: 10\/10/);
   assert.ok(actual.logs.some(line => /red team skipped:.*10\/10/.test(line)));

@@ -961,7 +961,12 @@ export function createDefaultJudge({
   const routedJudge = async (request, opts = null) => {
     // #4815 — a request that already carries its own answer (`skipSpawn.answer`) spawns nothing: the step declared a judge turn
     // whose work turned out to be empty (no claim to verify) or impossible (no readable diff), and says what to record instead.
-    if (request?.skipSpawn && typeof request.skipSpawn === 'object' && request.skipSpawn.answer != null) return judgeOutcome(request.skipSpawn.answer);
+    // A skip that declares its own decision evidence (`skipSpawn.telemetry`, e.g. a sampled-out agy advisory seat) keeps it:
+    // a skipped seat must say WHY in its telemetry, never hand consumers a null where a fallbackDecision belongs.
+    if (request?.skipSpawn && typeof request.skipSpawn === 'object' && request.skipSpawn.answer != null) {
+      const declared = request.skipSpawn.telemetry;
+      return judgeOutcome(request.skipSpawn.answer, declared && typeof declared === 'object' ? { ...declared } : null);
+    }
     const laneCwd = opts?.cwd || factoryCwd;
     let builder;
     if (request.reviewContext) {

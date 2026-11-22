@@ -136,6 +136,8 @@ describe('runRedTeam — the pass itself honours the advisory accept and stays o
       reserveCalls: () => { calls.push(['reserve']); return { callIds: [], ledger: null }; },
       append: () => {},
       cliAvailable: () => true,
+      // Pins a known Claude builder (live cross-vendor independence waits on an unknown builder).
+      readHeadMessage: () => 'fix\n\nCo-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>\n',
       listComments: () => [],
       postComment: (o) => calls.push(['post', o]),
     };

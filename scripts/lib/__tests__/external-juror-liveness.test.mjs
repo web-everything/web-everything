@@ -122,9 +122,37 @@ describe('review external juror setting cascade', () => {
     expect(settings({ readFile: () => '{"advisorySeats":{"antigravityReview":"probation"}}' }))
       .toMatchObject({ value: { antigravityReview: 'probation' }, sources: { antigravityReview: 'tool' } });
   });
-  it('shipped probation keeps existing unruled Antigravity referrals enabled and saved rosters intact', () => {
-    expect(referralSeatDisabled('judgeAntigravityReview', {})).toBe(false);
+  it('unpromoted probation keeps existing unruled Antigravity referrals enabled and saved rosters intact', () => {
+    // Pinned to the unpromoted state this guards (live review.json now ships promoted Carbon with the seat off).
+    expect(referralSeatDisabled('judgeAntigravityReview', { WE_REVIEW_SHADOW_AGY_PROMOTED: 'false' })).toBe(false);
     expect(reviewSeatOptionsForRun({ findings: { read: { seatSteps: ['judge', 'judgeSecurity', 'judgeAntigravityReview'] }, judgeAntigravityReview: {} } }, null, { antigravityReview: false }).antigravityReview).toBe(true);
+  });
+});
+
+// Pinned PR identities: the agy advisory seats sample deterministically (SHA-256 of repo#pr) at 0.1, so a provider-path
+// test needs a PR that samples IN (#24) and the skip-path test one that samples OUT (#1).
+const SAMPLED_READ = { repo: 'web-everything/web-everything', pr: 24, title: 'fixture', netChangedFiles: [], diffText: 'diff' };
+const UNSAMPLED_READ = { ...SAMPLED_READ, pr: 1 };
+// No live ledger writes or reads from these unit tests.
+const HERMETIC = { checkProviderHold: () => null, appendSeat: () => true, readBuilderRecords: () => [] };
+
+describe('agy advisory sample skip carries explicit decision evidence', () => {
+  const never = () => async () => { throw Error('a skipped seat must not reach its provider'); };
+  it.each([
+    ['sampled out', UNSAMPLED_READ, 'off (sample)', 'skip-not-sampled'],
+    ['missing PR identity', { title: 'fixture', netChangedFiles: [], diffText: 'diff' }, 'off (missing PR identity)', 'skip-sample-refused'],
+  ])('%s: both agy advisory builders skip with the real reason and a non-null fallbackDecision', async (_, read, reason, fallbackDecision) => {
+    for (const request of [buildReviewAntigravityJudgeRequest({ read }), buildReviewAgyCorrectnessJudgeRequest({ read, model: 'fixture' })]) {
+      const judge = createDefaultJudge({ resolveProvider: never, ...HERMETIC, logGracefulOutcome: () => {} });
+      const answer = unwrapJudgeOutcome(await judge(request));
+      expect(answer.value).toMatchObject({ findings: [], skipped: { reason } });
+      expect(answer.telemetry).not.toBeNull();
+      expect(answer.telemetry.fallbackDecision).toBe(fallbackDecision);
+    }
+  });
+  it('a sampled-in PR spawns no skip', () => {
+    expect(buildReviewAntigravityJudgeRequest({ read: SAMPLED_READ }).skipSpawn).toBeUndefined();
+    expect(buildReviewAgyCorrectnessJudgeRequest({ read: SAMPLED_READ, model: 'fixture' }).skipSpawn).toBeUndefined();
   });
 });
 
@@ -132,9 +160,9 @@ describe('unresponsive advisory skip evidence', () => {
   const evidence = { requestedModel: 'gemini-3.1-pro', servedModel: 'unknown', quotaState: 'provider-unresponsive',
     fallbackDecision: 'skip-provider-unresponsive', firstOutputMs: 15, cooldownMs: 1000 };
   it('the antigravity builder opts into graceful handling and the adapter records the reason', async () => {
-    const request = buildReviewAntigravityJudgeRequest({ read: { title: 'fixture', netChangedFiles: [], diffText: 'diff' } });
+    const request = buildReviewAntigravityJudgeRequest({ read: SAMPLED_READ });
     expect(request.gracefulOnUnavailable).toBe(true);
-    const judge = createDefaultJudge({ resolveProvider: () => async () => { throw agyEvidenceError(evidence); }, checkProviderHold: () => null, logGracefulOutcome: () => {} });
+    const judge = createDefaultJudge({ resolveProvider: () => async () => { throw agyEvidenceError(evidence); }, ...HERMETIC, logGracefulOutcome: () => {} });
     const answer = unwrapJudgeOutcome(await judge(request));
     expect(answer.value.skipped.reason).toBe('provider-unresponsive');
     expect(answer.value.summary).toContain('first-output window 15 ms; cooldown 1000 ms');
@@ -142,8 +170,8 @@ describe('unresponsive advisory skip evidence', () => {
   });
   it.each(['skip-provider-unresponsive', 'skip-quota-exhausted', 'skip-quota-hold', 'skip-backend-mismatch', 'skip-model-mismatch', 'skip-binary-dead'])('skips explicit provider evidence %s', fallbackDecision => {
     const error = agyEvidenceError({ ...evidence, fallbackDecision });
-    const judge = createDefaultJudge({ resolveProvider: () => async () => { throw error; }, checkProviderHold: () => null, logGracefulOutcome: () => {} });
-    const request = buildReviewAntigravityJudgeRequest({ read: { title: 'fixture', netChangedFiles: [], diffText: 'diff' } });
+    const judge = createDefaultJudge({ resolveProvider: () => async () => { throw error; }, ...HERMETIC, logGracefulOutcome: () => {} });
+    const request = buildReviewAntigravityJudgeRequest({ read: SAMPLED_READ });
     return judge(request).then(result => {
       const answer = unwrapJudgeOutcome(result);
       expect(answer.value.skipped).toBeDefined();
@@ -154,8 +182,8 @@ describe('unresponsive advisory skip evidence', () => {
   it.each(['missing structured output', 'malformed structured output', 'schema validation failed', 'tool-denial', 'unexpected failure'])('fails closed on %s without skip evidence', async message => {
     const error = new Error(message);
     const log = vi.fn();
-    const judge = createDefaultJudge({ resolveProvider: () => async () => { throw error; }, checkProviderHold: () => null, logGracefulOutcome: log });
-    const request = buildReviewAntigravityJudgeRequest({ read: { title: 'fixture', netChangedFiles: [], diffText: 'diff' } });
+    const judge = createDefaultJudge({ resolveProvider: () => async () => { throw error; }, ...HERMETIC, logGracefulOutcome: log });
+    const request = buildReviewAntigravityJudgeRequest({ read: SAMPLED_READ });
     await expect(judge(request)).rejects.toBe(error);
     error.telemetry = { ...evidence, fallbackDecision: 'none' };
     await expect(judge(request)).rejects.toBe(error);

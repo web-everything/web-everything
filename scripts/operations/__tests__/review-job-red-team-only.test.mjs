@@ -204,6 +204,8 @@ function runSharedRecovery(input, { status, records = [], recordsUnreadable = fa
       cliAvailable: probeFresh ? provider => { calls.provider++; return provider === 'codex'; } : forbid('provider'),
       reserveCalls: probeFresh ? () => { calls.reserve++; return capDeferred ? { used: 1, callIds: [] } : { used: 0, callIds: ['retry-call'] }; } : forbid('reserve'),
       makeScratch: () => 'fixture-scratch', writeFile: () => {}, removeScratch: () => {},
+      // Pins a known Claude builder (live cross-vendor independence waits on an unknown builder).
+      readHeadMessage: () => 'Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>',
       runSeat: probeFresh ? () => { calls.model++; if (env.WE_SHARED_RUNS_DIR) calls.retryCountAtCall = readRedTeamStatus({ repo: input.repo, pr: input.pr, head: input.loopPayload.findings.read.netBasis.rev, env }).retryCount; return { report: null, error: 'injected failed retry' }; } : forbid('model'),
       runRecheck: forbid('recheck'),
       listComments: () => comments, postComment: ({ body }) => comments.push({ body, author: { login: 'web-everything' } }),
@@ -1295,7 +1297,9 @@ describe('red-team-only review job', () => {
             if (cap === 'reservation-error' && at < Date.parse('2026-10-24T15:00:00Z')) throw Error('reservation EIO');
             return reserveSeatCalls({ ...options, records, ledger, newId: () => 'retry-call' });
           },
-          makeScratch: () => '/fixture', removeScratch: () => {}, writeFile: () => {}, readHeadMessage: () => '',
+          makeScratch: () => '/fixture', removeScratch: () => {}, writeFile: () => {},
+          // Pins a known Claude builder (live cross-vendor independence waits on an unknown builder).
+          readHeadMessage: () => 'Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>',
           runSeat: async () => { saved.modelCalls++; return { report: { exitCode: 0,
             lastMessage: JSON.stringify({ lenses: { 'red-team': { verdict: 'accept', findings: [] } } }) } }; },
           runRecheck: () => { throw Error('empty findings need no recheck'); },

@@ -4964,11 +4964,14 @@ describe('Gemini admission and the Codex roster', () => {
 describe('disabled agy shadows at the launch boundary', () => {
   it.each([undefined, false, true])('runs only Claude for mandatory seats and renders off (setting), without invoking the agy runner (promotion=%s)', async promoted => {
     const seatSettings = loadReviewSeatSettings({ promoted: promoted === undefined ? undefined : { value: promoted, source: 'fixture' }, safeguards: { value: { shadowEnabled: false, sampleRate: 0.1, minNonClaudeSeats: 1 } }, log: () => {} });
-    const declaration = buildReviewPrOperation({ readPr: stubReader(), seatSettings });
-    const read = shapeReadFinding(stubReader()({ pr: 7, repo: 'o/n' }), { pr: 7, repo: 'o/n' });
+    // Known Codex builder (same-vendor marker) so cross-vendor independence picks Claude instead of WAITing on an unknown builder.
+    const body = '<!-- delegation: provider=codex model=gpt-6-astra taskType=other -->';
+    const declaration = buildReviewPrOperation({ readPr: stubReader({ body }), seatSettings });
+    const read = shapeReadFinding(stubReader({ body })({ pr: 7, repo: 'o/n' }), { pr: 7, repo: 'o/n' });
     const seatRunner = vi.fn(() => { throw new Error('agy must not start'); });
-    const provider = vi.fn(async () => ({ value: CLEAN_ANSWER }));
-    const judge = createDefaultJudge({ provider, seatRunner });
+    // Observed Claude reviewer model satisfies the cross-vendor check; appendSeat is injected so the live seat ledger is untouched.
+    const provider = vi.fn(async () => ({ value: CLEAN_ANSWER, servedModel: 'claude-sonnet-5-5' }));
+    const judge = createDefaultJudge({ provider, seatRunner, appendSeat: () => true });
     for (const name of ['judge', 'judgeSecurity']) {
       const request = declaration.steps.find(s => s.name === name).step.request({ input: { lens: 'correctness' }, findings: { read } });
       await judge(request);

@@ -74,6 +74,8 @@ vi.mock('../../lib/judge-spawn.mjs', async (importOriginal) => {
 const { createDefaultJudge, resolveJudgeProvider, JUDGE_PROVIDER_NAMES, unwrapJudgeOutcome } = await import('../cli-adapter.mjs');
 const { judgeSpawn } = await import('../../lib/judge-spawn.mjs');
 const { buildReviewJudgeRequest, buildReviewAdvisoryJudgeRequest, DEFAULT_LENS } = await import('../review-pr.mjs');
+const { buildDelegationMarker } = await import('../../lib/delegation-marker.mjs');
+const codexBuilt = buildDelegationMarker({ provider: 'codex', model: 'gpt-6-astra', taskType: 'bugfix' });
 
 describe('JUDGE_PROVIDER_NAMES', () => {
   it('is exactly claude, codex, antigravity — additive, claude first/default', () => {
@@ -446,11 +448,13 @@ describe('createDefaultJudge - a codex-routed request never carries the lane cwd
 });
 
 describe('createDefaultJudge - the REAL review-pr requests route correctly through ONE factory (PR #2117 review: dispatch/`--provider=codex` composed path)', () => {
-  const read = { repo: 'o/r', pr: 1, title: 't', body: '', netChangedFiles: ['a.mjs'], diffText: 'diff' };
+  // Codex builder pinned via the PR body marker: the mandatory seat needs a cross-vendor (claude) reviewer; an unknown builder means WAIT.
+  const read = { repo: 'o/r', pr: 1, title: 't', body: codexBuilt, netChangedFiles: ['a.mjs'], diffText: 'diff' };
 
   it('a mandatory (tool-bearing) seat goes to the claude provider WITH its lane cwd and tools; the advisory seat goes to codex with NO tools, NO cwd, NO Claude model', async () => {
     const claudeCalls = [];
-    const claudeStub = async (req) => { claudeCalls.push(req); return { value: {}, costUsd: 0 }; };
+    // servedModel: the independence gate requires an observed cross-vendor reviewer model after the seat runs.
+    const claudeStub = async (req) => { claudeCalls.push(req); return { value: {}, costUsd: 0, servedModel: 'claude-sonnet-5-5' }; };
     const judgeFn = createDefaultJudge({ cwd: '/some/lane', provider: claudeStub });
 
     await judgeFn(buildReviewJudgeRequest({ read, lens: DEFAULT_LENS }));

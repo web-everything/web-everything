@@ -3019,7 +3019,9 @@ describe('#4315 durable referral effects', () => {
     {},
     { REVIEW_PR_ANTIGRAVITY_REVIEW: '1' },
     { REVIEW_PR_ANTIGRAVITY_REVIEW: '1', WE_REVIEW_SEAT_CAP_AGY_GEMINI: '40' },
-  ])('unpromoted Carbon keeps prior referrals pending through the sink and acceptance gate (%j)', async env => {
+  ])('unpromoted Carbon keeps prior referrals pending through the sink and acceptance gate (%j)', async baseEnv => {
+    // Pinned off: isolates from live review.json shadowSeats.antigravity.promoted=true.
+    const env = { ...baseEnv, WE_REVIEW_SHADOW_AGY_PROMOTED: 'false' };
     const h = harness({ env });
     const old = seedReferrals(h, ['judgeAntigravityReview'], h.state.headRefOid);
     expect(antigravityReviewFromEnv(env)).toBe(false);

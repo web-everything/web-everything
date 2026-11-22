@@ -1863,6 +1863,22 @@ export function buildReviewAntigravityMandate({ read, aim = '' }) {
 }
 
 /**
+ * The deterministic 0.1 sampling gate both agy advisory seats share (operator review.exerciseAllModels). `{}` when the
+ * PR samples in; otherwise a `skipSpawn` whose answer names the REAL status (`off (sample)`, `off (missing PR
+ * identity)`, `off (invalid sample rate)` — never collapsed into one) and whose telemetry carries an explicit
+ * `fallbackDecision`, so a skipped seat is never recorded with null decision evidence. PURE.
+ */
+export function agyAdvisorySampleSkip(read, sampleRate) {
+  const status = shadowSeatStatus({ shadowPolicy: { shadowEnabled: true, scope: 'sampled', sampleRate } }, read);
+  if (status === 'sampled') return {};
+  const fallbackDecision = status === 'off (sample)' ? 'skip-not-sampled' : 'skip-sample-refused';
+  return { skipSpawn: {
+    answer: { summary: `agy advisory ${status}`, findings: [], skipped: { reason: status } },
+    telemetry: { fallbackDecision, modelEvidence: 'not-launched' },
+  } };
+}
+
+/**
  * #3383 — THE FIFTH SEAT'S RECIPE. Same shape as {@link buildReviewCorrectnessAdvisoryJudgeRequest} — no
  * `allowedTools`, no `model` (the provider boundary in `cli-adapter.mjs#resolveJudgeProvider` pins
  * `ANTIGRAVITY_MODEL` by default; an explicit `request.model` still wins there) — but its own mandate builder
@@ -1875,9 +1891,8 @@ export function buildReviewAntigravityMandate({ read, aim = '' }) {
  * @returns {object} the judge request.
  */
 export function buildReviewAntigravityJudgeRequest({ read, aim = '', sampleRate = 0.1 }) {
-  const sampled = shadowSeatStatus({ shadowPolicy: { shadowEnabled: true, scope: 'sampled', sampleRate } }, read) === 'sampled';
   return {
-    ...(!sampled ? { skipSpawn: { answer: { summary: 'agy advisory off (sample)', findings: [], skipped: { reason: 'off (sample)' } } } } : {}),
+    ...agyAdvisorySampleSkip(read, sampleRate),
     reviewContext: { repo: read.repo, pr: read.pr, head: read.netBasis?.rev, body: read.body, headMessage: read.headMessage },
     mandate: buildReviewAntigravityMandate({ read, aim }),
     input: renderJudgeInput(read),
@@ -1933,10 +1948,9 @@ export function buildReviewAgyCorrectnessMandate({ read, aim = '' }) {
  * skipped rather than spending a Claude juror on an advisory opinion. PURE.
  */
 export function buildReviewAgyCorrectnessJudgeRequest({ read, aim = '', model, sampleRate = 0.1 }) {
-  const sampled = shadowSeatStatus({ shadowPolicy: { shadowEnabled: true, scope: 'sampled', sampleRate } }, read) === 'sampled';
   return {
     reviewContext: { repo: read.repo, pr: read.pr, head: read.netBasis?.rev, body: read.body, headMessage: read.headMessage },
-    ...(!sampled ? { skipSpawn: { answer: { summary: 'agy advisory off (sample)', findings: [], skipped: { reason: 'off (sample)' } } } } : {}),
+    ...agyAdvisorySampleSkip(read, sampleRate),
     mandate: buildReviewAgyCorrectnessMandate({ read, aim }),
     input: renderJudgeInput(read),
     shape: REVIEW_JUDGE_SHAPE,
