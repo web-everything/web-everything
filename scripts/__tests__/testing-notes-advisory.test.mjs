@@ -30,7 +30,7 @@ describe('testing notes advisory', () => {
     } });
     expect(warnings).toEqual(testingNotesAdvisory([TESTING_GUIDE]));
     expect(calls[0][1]).toEqual(['merge-base', 'origin/main', 'HEAD']);
-    expect(calls[1][1]).toEqual(['diff', '--no-ext-diff', '--no-textconv', '--text', '--unified=0', base, '--', TESTING_GUIDE]);
+    expect(calls[1][1]).toEqual(['diff', '--no-color', '--no-ext-diff', '--no-textconv', '--text', '--unified=0', base, '--', TESTING_GUIDE]);
     expect(calls[1][2]).toMatchObject({ timeout: 5000, maxBuffer: 1024 * 1024 });
   });
 
