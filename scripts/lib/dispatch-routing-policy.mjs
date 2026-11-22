@@ -2,6 +2,7 @@
 import { CODEX_EFFORT_MAP } from './codex-model-routing.mjs';
 import { initialRoutingPolicy as defaults } from './dispatch-routing-policy-source.mjs';
 import { rosterForKey } from './dispatch-routing-providers.mjs';
+import { assertReviewModelEligible, requiresReviewModel } from './review-model-eligibility.mjs';
 
 const CATALOG = Object.freeze({
   claude: ['claude-haiku-5-5', 'claude-sonnet-5-5', 'claude-opus-5-5'],
@@ -83,12 +84,14 @@ export function validateRoutingPolicy(input) {
       if (entry.mode !== undefined && (entry.mode !== 'shadow' || !entry.fallback?.some?.((f) => f?.provider === 'claude'))) {
         fail(`${path}.mode must be "shadow", with a claude route in fallback to count`);
       }
-      modelFor(policy, entry.provider, entry.model, path);
+      const resolvedModel = modelFor(policy, entry.provider, entry.model, path);
+      if (requiresReviewModel(name)) assertReviewModelEligible(entry.provider, resolvedModel);
       validateEffort(entry.effort, entry.provider);
       if (!Array.isArray(entry.fallback)) fail(`${path}.fallback must be an array`);
       for (const [i, next] of entry.fallback.entries()) {
         keys(next, ['provider', 'model', 'effort'], `${path}.fallback[${i}]`);
-        modelFor(policy, next.provider, next.model, `${path}.fallback[${i}]`);
+        const fallbackModel = modelFor(policy, next.provider, next.model, `${path}.fallback[${i}]`);
+        if (requiresReviewModel(name)) assertReviewModelEligible(next.provider, fallbackModel);
         validateEffort(next.effort, next.provider);
       }
       const allowedProviders = group === 'operations' && rosterForKey(name);
@@ -208,6 +211,9 @@ export function resolveOperationRoute({ operation, taskType, size, designQuestio
     if (!entry || entry.inherit) return inheritRoute();
   }
   const candidates = [entry, ...entry.fallback].map(({ provider, model, effort }) => ({ provider, model: modelFor(policy, provider, model, operation), effort: resolvePolicyEffort(provider, typeof effort === 'string' ? effort : effort?.[provider] ?? operationEffort(operation, provider, taskType, policy)) }));
+  if (requiresReviewModel(`${operation}:${taskType ?? ''}`)) {
+    for (const route of candidates) assertReviewModelEligible(route.provider, route.model);
+  }
   const chain = candidates.filter(route => !disabledProviders.has(route.provider) && !entry.disabledProviders?.includes(route.provider))
     .filter(route => (!gateClosed || route.provider === 'claude') && (route.provider === 'claude' || !vetoes.some(veto => veto.model === route.model && veto.provider === (route.provider.startsWith('agy-') ? 'antigravity' : route.provider))))
     .filter(route => !availability?.[route.provider]

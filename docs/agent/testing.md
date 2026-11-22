@@ -5943,3 +5943,11 @@ Documentation and filing defaults use Hydrogen medium; Hydrogen delivery must pa
 prove lane confinement. Directory scopes that cover protected descendants are critical even
 without enumerating the directory. `agy-hydrogen-dispatch.test.mjs` exercises the real routing,
 launcher refusal, and live delivery registry rather than supplying a critical-work verdict.
+
+## Review model role eligibility
+
+`review-model-eligibility.test.mjs` covers policy aliases/overrides, persisted routes,
+mandatory juror execution, direct advisory/red-team spawning, and merge-sensitive shapes.
+Small tiers stay ineligible even when delivery probation or Carbon promotion is enabled.
+Keep the established Carbon/Argon/Opus/Sonnet roster and Carbon's separate promotion tests;
+new model identities need a review role in `model-probation.json`, not just delivery probation.
