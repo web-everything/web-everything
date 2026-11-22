@@ -99,9 +99,38 @@ it.each([
   expect(p.command).toBe(`npx vitest run '${own}' --passWithNoTests${timeouts}${tail}`);
   expect(p.selection.tests).toEqual([own]);
 });
-it('an unstamped timeout keeps the host scaled default while a stamped one wins', () => {
-  const p = gates.capExplicitRelatedGate({ gate: `npx vitest related ${hub} --run --passWithNoTests --hookTimeout=42`, ...fixture(), env: { WE_VERIFY_TEST_TIMEOUT_FACTOR: '3' } });
+it('a fresh gate keeps the host scaled default for an unstamped timeout while a stamped one wins', () => {
+  const p = gates.capExplicitRelatedGate({ gate: `npx vitest related ${hub} --run --hookTimeout=42`, ...fixture(), env: { WE_VERIFY_TEST_TIMEOUT_FACTOR: '3' } });
   expect(p.command).toBe(`npx vitest run '${own}' --passWithNoTests --testTimeout=15000 --hookTimeout=42`);
+});
+// PR #7323 self-review — an old DEFAULT stamp with no timeouts came from a factor-1 requester. Filling in this host's
+// factor-3 timeouts made the converted gate match no default variant (whole-gate admission instead of the default).
+it('an old default stamp with no timeouts keeps none on a scaled host and equals the factor-1 default', () => {
+  const p = gates.capExplicitRelatedGate({ gate: `npx vitest related ${hub} --run --passWithNoTests`, ...fixture(), env: { WE_VERIFY_TEST_TIMEOUT_FACTOR: '3' } });
+  expect(p.command).toBe(`npx vitest run '${own}' --passWithNoTests`);
+  const requester = gates.resolveDefaultGate({ ...fixture(), env: { WE_VERIFY_TEST_TIMEOUT_FACTOR: '1' } });
+  expect(gates.gateCommandsEqual(requester.command.split(' && ')[0], p.command)).toBe(true);
+});
+it('an old default stamp keeps only its stamped timeout on a scaled host', () => {
+  const p = gates.capExplicitRelatedGate({ gate: `npx vitest related ${hub} --run --passWithNoTests --hookTimeout=42`, ...fixture(), env: { WE_VERIFY_TEST_TIMEOUT_FACTOR: '3' } });
+  expect(p.command).toBe(`npx vitest run '${own}' --passWithNoTests --hookTimeout=42`);
+});
+// Same class: with sharding on, the default shards its selection; a converted old stamp must shard the same way.
+it('a converted old default shards exactly as the default gate does', () => {
+  const f = fixture();
+  f.fileConfig.shardMinTests = 1;
+  const env = { WE_VERIFY_TEST_TIMEOUT_FACTOR: '3' };
+  const p = gates.capExplicitRelatedGate({ gate: `npx vitest related ${hub} --run --passWithNoTests --testTimeout=15000 --hookTimeout=30000`, ...f, env });
+  const def = gates.resolveDefaultGate({ ...f, env });
+  expect(p.command).toMatch(/^node '.*verify-shard-run\.mjs' --shards=1 /);
+  expect(p.selection.shards).toMatchObject({ count: 1 });
+  expect(gates.gateCommandsEqual(def.command.split(' && ')[0], p.command)).toBe(true);
+});
+it('a gate with its own filter options is never sharded', () => {
+  const f = fixture();
+  f.fileConfig.shardMinTests = 1;
+  const p = gates.capExplicitRelatedGate({ gate: `npx vitest related ${hub} --run -t name`, ...f, env: { WE_VERIFY_TEST_TIMEOUT_FACTOR: '1' } });
+  expect(p.command).toMatch(/^npx vitest run /);
 });
 it.each([[`npx vitest related ${hub} --run`]])('a fresh related gate still gets the scaled timeouts once: %s', gate => {
   const p = gates.capExplicitRelatedGate({ gate, ...fixture(), env: { WE_VERIFY_TEST_TIMEOUT_FACTOR: '3' } });
@@ -113,7 +142,8 @@ it('a converted old default with no selectable suite still runs nothing unfilter
   const p = gates.capExplicitRelatedGate({ gate: `npx vitest related ${hub} --run --passWithNoTests --testTimeout=15000 --hookTimeout=30000`, ...o });
   expect(p.command).toMatch(/^echo /);
 });
-it.each(['--testTimeout=abc', '--hookTimeout=', '--testTimeout', '--testTimeout=1 --testTimeout=2', '--passWithNoTests=false'])(
+it.each(['--testTimeout=abc', '--hookTimeout=', '--testTimeout', '--testTimeout=1 --testTimeout=2', '--passWithNoTests=false',
+  '--testTimeout=0', '--hookTimeout=2147483648', '--testTimeout=99999999999999999999999', '--testTimeout=015000'])(
   'explicit related gate refuses a malformed execution setting: %s', option => {
     expect(() => gates.capExplicitRelatedGate({ gate: `vitest related '${hub}' --run ${option}`, ...fixture() }))
       .toThrow(/related gate option/);

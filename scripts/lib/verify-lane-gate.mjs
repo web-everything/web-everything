@@ -512,13 +512,12 @@ function resolveGateFromBase({ base, runGit, env, scripts, fileExists, readRepoF
     // Deletions or excluded untracked scratch can leave no target, and `vitest related` with no
     // positional file is an error (a false red); there is nothing for vitest to run, so say so and skip it.
     let vitestCmd = explicitTestCommand(selection.tests, timeoutFlags);
-    if (settings.shardMinTests > 0
-      && selection.tests.length >= settings.shardMinTests) {
-      const shards = { count: Math.ceil(selection.tests.length / settings.shardSize), size: settings.shardSize, parallel: settings.shardParallel };
+    const shards = shardPlan(selection.tests.length, settings);
+    if (shards) {
       selection.shards = shards;
       decision.shards = shards;
       decision.reasons = [...decision.reasons, `${shards.count} shards (size ${shards.size}, parallel ${shards.parallel}); shardMinTests=${settings.shardMinTests} (${settingsSource.shardMinTests}), shardSize=${settings.shardSize} (${settingsSource.shardSize}), shardParallel=${settings.shardParallel} (${settingsSource.shardParallel}), phaseTimeoutMs=${settings.phaseTimeoutMs} (${settingsSource.phaseTimeoutMs})`];
-      vitestCmd = `node ${shellQuote(SHARD_RUN_SCRIPT)} --shards=${shards.count} --parallel=${shards.parallel} --budget-ms=${Math.floor(0.9 * settings.phaseTimeoutMs)} -- ${vitestCmd}`;
+      vitestCmd = shardWrap(vitestCmd, shards, settings);
     }
     // #3887 — `vitest related` selects tests that IMPORT a changed file; a repo-SCANNING test reads files from disk and
     // imports nothing, so it was never selected. Run the marked scanners scoped to the changed files (cost ~ the number
@@ -535,6 +534,15 @@ function resolveGateFromBase({ base, runGit, env, scripts, fileExists, readRepoF
 }
 
 const graphCache = new WeakMap();
+
+/** The default gate's shard plan, in one place, so a converted explicit gate shards exactly like the default. */
+function shardPlan(testCount, settings) {
+  return settings.shardMinTests > 0 && testCount >= settings.shardMinTests
+    ? { count: Math.ceil(testCount / settings.shardSize), size: settings.shardSize, parallel: settings.shardParallel } : null;
+}
+function shardWrap(vitestCmd, shards, settings) {
+  return `node ${shellQuote(SHARD_RUN_SCRIPT)} --shards=${shards.count} --parallel=${shards.parallel} --budget-ms=${Math.floor(0.9 * settings.phaseTimeoutMs)} -- ${vitestCmd}`;
+}
 
 /** A bounded command; an empty selection must never become an unfiltered unit run. */
 function explicitTestCommand(tests, flags = '') {
@@ -617,15 +625,18 @@ export function capExplicitRelatedGate({ gate, uncapped = false, runGit, readRep
   // --testTimeout=N --hookTimeout=N`). A pending request from before the cap must convert, not be refused:
   // `--passWithNoTests` is already in every rewritten command, and stamped timeouts are kept as requested.
   const timeoutOptions = new Map([['--testTimeout', null], ['--hookTimeout', null]]);
+  let defaultStamp = false;
   for (let i = 0; i < words.length; i++) {
     const token = words[i];
-    if (token === '--run' || token === '--passWithNoTests') continue;
+    if (token === '--run') continue;
+    if (token === '--passWithNoTests') { defaultStamp = true; continue; }
     if (/^--bail(?:=\d+)?$/.test(token)) { options.push(token); continue; }
     const equals = token.indexOf('=');
     const name = equals < 0 ? token : token.slice(0, equals);
     if (timeoutOptions.has(name)) {
       const value = equals < 0 ? words[++i] : token.slice(equals + 1);
-      if (!/^\d+$/.test(value ?? '')) throw new Error(`related gate option ${name} requires a whole-number value`);
+      // Bounded: 0 means "no timeout" to vitest and Node clamps a delay over 2^31-1 to 1 ms.
+      if (!/^[1-9]\d*$/.test(value ?? '') || Number(value) > 2_147_483_647) throw new Error(`related gate option ${name} requires a whole-number value from 1 to 2147483647`);
       if (timeoutOptions.get(name) !== null) throw new Error(`related gate option ${name} is repeated`);
       timeoutOptions.set(name, Number(value));
     } else if (valueOptions.has(name)) {
@@ -641,12 +652,20 @@ export function capExplicitRelatedGate({ gate, uncapped = false, runGit, readRep
   const settings = resolveVerifySettings({ fileConfig, env }).values;
   const selection = relatedSelection({ targets, runGit, readRepoFile, settings });
   if (options.length && !selection.tests.length) throw new Error('related gate options require selected or named test suites; supply an explicit affected-test gate');
-  // Stamped timeouts win; an unstamped one keeps this host's scaled default (none at factor 1).
-  const scaled = Object.fromEntries(scaledTimeoutFlags(settings.testTimeoutFactor).trim().split(' ').filter(Boolean).map(f => f.split('=')));
+  // Stamped timeouts win. A fresh gate's unstamped one keeps this host's scaled default (none at factor 1). An old
+  // DEFAULT stamp (`--passWithNoTests` marks it) carried exactly its requester's timeouts — none means factor 1 — so
+  // nothing is filled from this host: a factor-1 requester and a factor-3 child must still match the default variant.
+  const scaled = defaultStamp ? {}
+    : Object.fromEntries(scaledTimeoutFlags(settings.testTimeoutFactor).trim().split(' ').filter(Boolean).map(f => f.split('=')));
   const timeouts = [...timeoutOptions].map(([name, value]) => [name, value ?? scaled[name]])
     .filter(([, value]) => value !== undefined).map(([name, value]) => ` ${name}=${value}`).join('');
   const flags = timeouts + (options.length ? ` ${options.map(shellQuote).join(' ')}` : '');
-  return { command: explicitTestCommand(selection.tests, flags) + (tail ? ` ${tail}` : ''), selection,
+  let vitestCmd = explicitTestCommand(selection.tests, flags);
+  // Shard exactly as the default gate would, so a converted old default stays recognized. A gate with its own
+  // filter/config options is never sharded: the shard runner is only proven on the default's options.
+  const shards = options.length ? null : shardPlan(selection.tests.length, settings);
+  if (shards) { selection.shards = shards; vitestCmd = shardWrap(vitestCmd, shards, settings); }
+  return { command: vitestCmd + (tail ? ` ${tail}` : ''), selection,
     notice: `explicit related gate capped (${targets.length} → ${selection.tests.length} tests)` };
 }
 
