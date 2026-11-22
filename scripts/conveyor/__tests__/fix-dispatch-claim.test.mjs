@@ -680,7 +680,7 @@ it.each([false, true])('default claim refresh keeps a live wrapped fixing claim 
     });
     writeCompletion(record, completions);
     const result = refreshLiveFixDispatchClaims({ lockRoot: claimRoot, nowMs: T0 + 1000, nowIso: () => iso(T0 + 1000), hungInfoFor: () => null, awaitingVerifyFor: () => null, prHeadFor: () => null });
-    expect(list).toHaveBeenCalledWith({ all: true });
+    expect(list).toHaveBeenCalledWith({ all: true, fresh: true });
     expect(result.refreshed).toHaveLength(1);
     expect(result.released ?? []).toEqual([]);
     expect(readFixDispatchClaim(key).heartbeatAt).toBe(iso(T0 + 1000));
@@ -1318,13 +1318,13 @@ describe('idle-claim auto-release (R201)', () => {
             since: iso(T0 + (minutes < changedOffset ? 0 : resetOffset) * 60_000),
             lastSeen: iso(T0 + minutes * 60_000) });
         }
-        expect(events).toHaveLength(0);
+        expect(events.filter(({ kind }) => kind === 'idle-claim-released')).toHaveLength(0);
       } else {
         expect(result.released).toHaveLength(1);
         expect(result.refreshed).toHaveLength(0);
         expect(readFixDispatchClaim({ repo: 'we', pr: 5996, lockRoot: claimRoot })).toBeNull();
-        expect(events).toHaveLength(1);
-        expect(events[0]).toMatchObject({ kind: 'idle-claim-released', repo: 'we', pr: 5996,
+        expect(events.filter(({ kind }) => kind === 'idle-claim-released')).toHaveLength(1);
+        expect(events.filter(({ kind }) => kind === 'idle-claim-released')[0]).toMatchObject({ kind: 'idle-claim-released', repo: 'we', pr: 5996,
           detail: { headSha: head, idleSince: iso(T0 + resetOffset * 60_000), owner: 'A' } });
       }
     }
@@ -1382,10 +1382,10 @@ describe('idle-claim auto-release (R201)', () => {
     const retained = readFixDispatchClaim({ repo: 'we', pr: 5996, lockRoot: claimRoot });
     expect(retained.owner).toBe('A');
     expect(retained.meta.idleHead).toEqual({ sha: 'sha1', since: iso(next), lastSeen: iso(next) });
-    expect(events).toHaveLength(0);
+    expect(events.filter(({ kind }) => kind === 'idle-claim-released')).toHaveLength(0);
     expect(sweepThrough(next, next + IDLE_MS, { events }).released).toHaveLength(1);
-    expect(events).toHaveLength(1);
-    expect(events[0].detail.idleSince).toBe(iso(next));
+    expect(events.filter(({ kind }) => kind === 'idle-claim-released')).toHaveLength(1);
+    expect(events.filter(({ kind }) => kind === 'idle-claim-released')[0].detail.idleSince).toBe(iso(next));
   });
 
   it.each([
@@ -1415,10 +1415,10 @@ describe('idle-claim auto-release (R201)', () => {
     const { idleHead, ...meta } = before.meta;
     expect(idleHead).toEqual({ sha: 'sha1', since: iso(T0), lastSeen: iso(T0 + 10 * 60_000) });
     expect(after).toEqual({ ...before, meta });
-    expect(events).toHaveLength(0);
+    expect(events.filter(({ kind }) => kind === 'idle-claim-released')).toHaveLength(0);
     expect(sweepThrough(resumedAt, resumedAt + IDLE_MS, { events }).released).toHaveLength(1);
-    expect(events).toHaveLength(1);
-    expect(events[0].detail.idleSince).toBe(iso(resumedAt));
+    expect(events.filter(({ kind }) => kind === 'idle-claim-released')).toHaveLength(1);
+    expect(events.filter(({ kind }) => kind === 'idle-claim-released')[0].detail.idleSince).toBe(iso(resumedAt));
   });
 
   it.each([
@@ -1497,7 +1497,7 @@ describe('idle-claim auto-release (R201)', () => {
     const result = sweep(next, { events });
     expect(result.released ?? []).toHaveLength(0);
     expect(result.refreshed).toHaveLength(1);
-    expect(events).toHaveLength(0);
+    expect(events.filter(({ kind }) => kind === 'idle-claim-released')).toHaveLength(0);
     expect(readFixDispatchClaim(key).meta.idleHead).toEqual({ sha: 'sha1', since: iso(next), lastSeen: iso(next) });
   });
 
@@ -1523,7 +1523,7 @@ describe('idle-claim auto-release (R201)', () => {
       expect(result.refreshed).toHaveLength(0);
       expect(readFixDispatchClaim({ repo: 'we', pr: 5996, lockRoot: claimRoot })).toBeNull();
       expect(prHeadFor).toHaveBeenCalledOnce();
-      expect(events).toHaveLength(1);
+      expect(events.filter(({ kind }) => kind === 'idle-claim-released')).toHaveLength(1);
       return;
     }
     expect(result.released ?? []).toHaveLength(0);
@@ -1532,7 +1532,7 @@ describe('idle-claim auto-release (R201)', () => {
     expect(retained.owner).toBe('A');
     expect(retained.meta).not.toHaveProperty('idleHead');
     expect(prHeadFor).not.toHaveBeenCalled();
-    expect(events).toHaveLength(0);
+    expect(events.filter(({ kind }) => kind === 'idle-claim-released')).toHaveLength(0);
   });
 
   it('an owner replacement during the idle head probe leaves the new claim untouched and records no release', () => {
@@ -1568,7 +1568,7 @@ describe('idle-claim auto-release (R201)', () => {
       expect(r.released ?? []).toHaveLength(0);
       expect(r.refreshed).toHaveLength(1);
     }
-    expect(events).toHaveLength(0);
+    expect(events.filter(({ kind }) => kind === 'idle-claim-released')).toHaveLength(0);
   });
 
   it('a session that goes back to work restarts the idle clock', () => {

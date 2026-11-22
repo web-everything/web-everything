@@ -235,10 +235,12 @@ const mutateWorkflow = mutate => {
 };
 const jobs = doc => Object.values(doc.jobs);
 const checkouts = doc => jobs(doc).flatMap(job => job.steps || []).filter(step => /^actions\/checkout@/.test(step.uses || ''));
-const rejectedWorkflow = text => {
+const rejectedWorkflow = (text, reason) => {
   const result = auditWorkflow(text);
   expect(result).toMatchObject({ ok: false, problems: expect.any(Array) });
   expect(result.problems.length).toBeGreaterThan(0);
+  if (reason) expect(result.problems).toContain(reason);
+  if (!reason?.includes('schedule forbidden')) expect(result.problems).not.toContain('only workflow_dispatch trigger allowed; schedule forbidden');
   for (const problem of result.problems) expect(problem).toEqual(expect.any(String));
 };
 
@@ -247,6 +249,12 @@ describe('T4: audit the real read-only workflow and permission mutants', () => {
     const text = workflowText(), doc = yaml.safeLoad(text);
     expect(checkouts(doc).length).toBeGreaterThan(0);
     expect(auditWorkflow(text)).toEqual({ ok: true, problems: [] });
+  });
+  it.each(['schedule', 'pull_request', 'pull_request_target', 'push', 'missing dispatch'])('refuses %s trigger shape explicitly', event => {
+    rejectedWorkflow(mutateWorkflow(doc => {
+      if (event === 'missing dispatch') delete doc.on.workflow_dispatch;
+      else doc.on[event] = event === 'schedule' ? [{ cron: '*/10 * * * *' }] : {};
+    }), 'only workflow_dispatch trigger allowed; schedule forbidden');
   });
   it.each(['contents', 'pull-requests', 'checks', 'statuses', 'id-token'])('refuses top-level %s: write', permission => {
     rejectedWorkflow(mutateWorkflow(doc => { doc.permissions = { ...doc.permissions, [permission]: 'write' }; }));
@@ -299,7 +307,7 @@ describe('T4: audit the real read-only workflow and permission mutants', () => {
     ['unpinned action', doc => { jobs(doc)[0].steps.push({ uses: 'actions/upload-artifact@v4' }); }],
     ['short SHA action', doc => { jobs(doc)[0].steps.push({ uses: 'actions/upload-artifact@abcdef0' }); }],
     ['App token action', doc => { jobs(doc)[0].steps.push({ uses: `actions/create-github-app-token@${'d'.repeat(40)}` }); }],
-    ...['pull_request', 'pull_request_target', 'push'].map(event => [`${event} trigger`, doc => { doc.on = { ...doc.on, [event]: {} }; }]),
+
     ...['EXTRA_TOKEN', 'APP_PRIVATE_KEY'].flatMap(name => [
       [`literal ${name}`, doc => { doc.env = { ...doc.env, [name]: 'credential' }; }],
       [`job ${name} expression`, doc => { jobs(doc)[0].env = { [name]: '${{ vars.CREDENTIAL }}' }; }],

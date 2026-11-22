@@ -3,8 +3,33 @@ import { capacityCalendarOperation, finishCapacityCalendar, renderCalendar } fro
 import { isReadOnlyOperation } from '../registry.mjs';
 import { capacityCalendar } from '../capacity-calendar-io.mjs';
 import { withRealRepo } from './helpers/real-repo.mjs';
-import { mkdirSync, writeFileSync } from 'node:fs';
+import { mkdirSync, writeFileSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
+
+it('renders signed-out agy usage file headlines for both providers', async () => {
+  await withRealRepo(({ root }) => {
+    const now = Date.parse('2026-11-19T23:00:00Z');
+    mkdirSync(join(root, '.plateau'));
+    writeFileSync(join(root, '.plateau', 'agy-usage.json'), JSON.stringify({ at: new Date(now).toISOString(), status: 'signed-out' }));
+    const shipped = JSON.parse(readFileSync('scripts/settings/provider-capacity.json', 'utf8'));
+    const settings = { providers: shipped.providerCapacity.providers.filter(p => ['agy-gemini', 'agy-claude'].includes(p.id)) };
+    const report = capacityCalendar({ now, settings,
+      env: { HOME: root, CONVEYOR_STATE_ROOT: root, WE_CAPACITY_READERS: 'on' } });
+    expect(report.providers).toHaveLength(2);
+    for (const capacity of report.providers) {
+      expect(capacity.signedOut).toBe(true);
+      expect(capacity.health).toBe(0);
+      expect(capacity.known).toBe(false);
+      expect(capacity.windows).toEqual([]);
+      expect(capacity.scores.fix.label).toBe('signed-out');
+    }
+    const rendered = renderCalendar(report);
+    for (const id of ['agy-gemini', 'agy-claude']) {
+      expect(rendered).toContain(`${id}/${id}: signed out\n`);
+      expect(rendered).not.toContain(`${id}/${id}: unknown`);
+    }
+  });
+});
 
 it('requires an injected reader and defers collection until the compute step', () => {
   expect(() => capacityCalendarOperation()).toThrow('collect reader');

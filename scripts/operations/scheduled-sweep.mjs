@@ -161,13 +161,44 @@ ${env.DEVELOPER_DIR ? `\t\t<key>DEVELOPER_DIR</key><string>${esc(env.DEVELOPER_D
 `;
 }
 
+/** One value feeds both the launchd StartInterval and the reader's throttle, so the two cannot drift apart. */
+export const AGY_USAGE_INTERVAL_MINUTES = 30;
+
+export function buildAgyUsagePlist({ repoRoot, nodePath, home }) {
+  const log = `${home}/workspace/.operations/logs/agy-usage-reader.log`;
+  return `<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+\t<key>Label</key><string>com.we.agy-usage-reader</string>
+\t<key>ProgramArguments</key>
+\t<array>
+\t\t<string>${esc(nodePath)}</string>
+\t\t<string>${esc(repoRoot)}/scripts/operations/agy-usage-reader.mjs</string>
+\t</array>
+\t<key>WorkingDirectory</key><string>${esc(repoRoot)}</string>
+\t<key>RunAtLoad</key><true/>
+\t<key>StartInterval</key><integer>${AGY_USAGE_INTERVAL_MINUTES * 60}</integer>
+\t<key>StandardOutPath</key><string>${esc(log)}</string>
+\t<key>StandardErrorPath</key><string>${esc(log)}</string>
+\t<key>EnvironmentVariables</key>
+\t<dict>
+\t\t<key>WE_AGY_USAGE_MIN_INTERVAL_MINUTES</key><string>${AGY_USAGE_INTERVAL_MINUTES}</string>
+\t\t<key>PATH</key><string>${esc(dirname(nodePath))}:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+\t</dict>
+</dict>
+</plist>
+`;
+}
+
 /** Default off: `apply:false` plans no writes. Never runs launchctl; it only lists the commands for the operator. */
 export function installPlan({ repoRoot, nodePath, home, apply = false, pass: selected }) {
-  const passes = [...Object.values(SWEEP_JOBS).map(j => j.pass), 'pr-merge-watch'];
+  const passes = [...Object.values(SWEEP_JOBS).map(j => j.pass), 'pr-merge-watch', 'agy-usage-reader'];
   if (selected !== undefined && !passes.includes(selected)) throw Error('unknown installable pass');
   const files = passes.filter(pass => selected === undefined || pass === selected).map(pass => ({
-    pass, path: `${home}/Library/LaunchAgents/com.we.conveyor-pass-daemon.${pass}.plist`,
-    xml: buildLaunchdPlist({ pass, repoRoot, nodePath, home, developerDir: process.env.DEVELOPER_DIR }),
+    pass, path: `${home}/Library/LaunchAgents/${pass === 'agy-usage-reader' ? 'com.we.agy-usage-reader' : `com.we.conveyor-pass-daemon.${pass}`}.plist`,
+    xml: pass === 'agy-usage-reader' ? buildAgyUsagePlist({ repoRoot, nodePath, home })
+      : buildLaunchdPlist({ pass, repoRoot, nodePath, home, developerDir: process.env.DEVELOPER_DIR }),
   }));
   return {
     writes: apply ? files : [],
