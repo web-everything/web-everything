@@ -4,7 +4,10 @@ kind: story
 locus: plateau-app
 size: 3
 parent: "4623"
-status: open
+status: closed
+closedReason: duplicate
+closedInto: "6202"
+dateClosed: "2026-11-22"
 blockedBy: ["4894", "4900"]
 scope: ["plateau-app:src/wip/wip-view.ts", "plateau-app:src/wip/wip-view.css", "plateau-app:src/wip/wip-view.test.ts", "plateau-app:src/wip/wip-view.hostile.test.ts", "plateau-app:tests/wip-progress.spec.ts"]
 dateOpened: "2026-10-01"
