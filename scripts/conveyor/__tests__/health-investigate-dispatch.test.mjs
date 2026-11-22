@@ -244,7 +244,11 @@ describe('health-investigate on the declared dispatch-lane operation', () => {
     for (const must of ['Edit', 'Write', 'Bash(gh pr comment:*)', 'Bash(gh:*)', 'Bash(git:*)', `Bash(node ${root}/scripts/operations/run.mjs dispatch-lane:*)`, `Bash(node ${root}/scripts/operations/run.mjs urgent-verify:*)`, `Bash(node ${root}/scripts/operations/run.mjs urgent-sweep:*)`]) {
       expect(rules, must).toContain(must);
     }
+    // The resource-pool CLI writes shadow evidence; deny both executable spellings.
+    expect(rules).toContain(`Bash(node ${root}/scripts/operations/run.mjs resource-pool:*)`);
+    expect(rules).toContain('Bash(node scripts/operations/run.mjs resource-pool:*)');
     const allow = argv.find((a) => a.startsWith('--allowedTools='));
+    expect(allow).not.toContain('scripts/operations/run.mjs resource-pool:');
     expect(allow).toContain(`Bash(node ${root}/scripts/operations/run.mjs stale-state:*)`);
     expect(allow).toContain(`Bash(node ${root}/scripts/operations/run.mjs adoption-matrix:*)`);
     expect(allow).not.toMatch(/Edit|Write/);
