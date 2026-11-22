@@ -1,0 +1,5 @@
+{
+  "description": "Minimum concurrent red-team jobs.",
+  "range": "integer 0–24",
+  "unit": "jobs"
+}

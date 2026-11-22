@@ -1,0 +1,6 @@
+{
+  "description": "Narrow paths exempted from care classification, retaining human gates.",
+  "owner": "scripts/settings/review.json",
+  "changeVia": "pr",
+  "instant": false
+}

@@ -1,0 +1,6 @@
+{
+  "description": "Mechanical finding deduplication and similarity threshold.",
+  "owner": "scripts/settings/card-dedupe.json",
+  "changeVia": "pr",
+  "instant": false
+}

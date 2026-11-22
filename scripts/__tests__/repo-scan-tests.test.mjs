@@ -21,6 +21,20 @@ const root = resolve(dirname(fileURLToPath(import.meta.url)), '../..');
 const MULTI = 'scripts/__tests__/multi-repo-checks.test.mjs';
 
 describe('selectScanTests', () => {
+  it('selects the testing notes scan for doc callers, guide targets, topics and rule inputs', () => {
+    const test = 'scripts/__tests__/testing-notes-advisory.test.mjs';
+    const entry = REPO_SCAN_TESTS.find(e => e.test === test);
+    expect(entry).toBeDefined();
+    for (const path of ['AGENTS.md', 'docs/agent/testing.md', 'docs/agent/new-caller.md',
+      'docs/agent/testing/new-topic.md', 'docs/agent/testing/README.md', 'scripts/check-standards.mjs', ...entry.inputs]) {
+      expect(selectScanTests({ changedFiles: [path] }).full.map(e => e.test), path).toContain(test);
+    }
+    for (const path of ['docs/readme.md', 'docs/agent/other/nested.md', 'backlog/1-x.md', 'scripts/lib/unrelated.mjs']) {
+      expect(selectScanTests({ changedFiles: [path] }).full.map(e => e.test), path).not.toContain(test);
+    }
+    expect(selectScanTests({ changedFiles: ['docs/agent/testing/removed-topic.md'], fileExists: () => false }).full).toEqual([]);
+  });
+
   it('scopes capability admission scans to production sources and widens when the rule changes', () => {
     const test = 'scripts/__tests__/capability-dispatch-only.test.mjs';
     const entry = REPO_SCAN_TESTS.find(e => e.test === test);
@@ -52,8 +66,8 @@ describe('selectScanTests', () => {
     ]);
   });
 
-  it('docs and backlog changes select only the full ownership scan; no diff selects nothing', () => {
-    expect(selectScanTests({ changedFiles: ['docs/agent/x.md', 'backlog/1-x.md'] })).toEqual({
+  it('unrelated docs and backlog changes select only the full ownership scan; no diff selects nothing', () => {
+    expect(selectScanTests({ changedFiles: ['docs/readme.md', 'backlog/1-x.md'] })).toEqual({
       scoped: [],
       full: [REPO_SCAN_TESTS.find((e) => e.test === 'scripts/lib/__tests__/constellation-ownership.test.mjs')],
       widened: [],

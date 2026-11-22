@@ -19,7 +19,7 @@ import { keepAliveScript } from '../lib/test-keepalive.mjs';
 import { admissionLockRoot } from '../readiness/heavy-admission.mjs';
 import { CODEX_TASK_RULES, CODEX_REVIEW_TASK_RULES } from '../lib/build-policy.mjs';
 import {
-  startDetachedJob, waitForJob, readJobRecord, writeJobRecord, cliExitCode, jobIsAlive, readPidStart, readPidState,
+  startDetachedJob, waitForJob, waitUntilDone, readJobRecord, writeJobRecord, cliExitCode, jobIsAlive, readPidStart, readPidState,
   PID_START_TIMEOUT_MS, JOB_RECORD_INIT_DEADLINE_MS,
   DEFAULT_TIMEOUT_MS,
   DEFAULT_INSTALL_TIMEOUT_MS,
@@ -1271,7 +1271,7 @@ describe('runCodexDirectExec / codexDirectTask — the orchestrator, over an inj
     const allocated = [];
     // The launcher drops runtime loader variables (NODE_OPTIONS, LD_*, ...); keep the ambient copy
     // free of them so the review-branch equality below never depends on the developer's shell.
-    const loader = /^(NODE_OPTIONS|NODE_PATH|NODE_REPL_EXTERNAL_MODULE|OPENSSL_(CONF|MODULES|ENGINES)|LD_.*|DYLD_.*|PYTHON(PATH|STARTUP|HOME|USERBASE)|PERL5OPT|PERL5LIB|PERLLIB|PERL5DB|RUBYOPT|RUBYLIB|JAVA_TOOL_OPTIONS|_JAVA_OPTIONS|JDK_JAVA_OPTIONS|GCONV_PATH)$/i;
+    const loader = /^(NODE_OPTIONS|BUN_OPTIONS|NODE_PATH|NODE_REPL_EXTERNAL_MODULE|OPENSSL_(CONF|MODULES|ENGINES)|LD_.*|DYLD_.*|PYTHON(PATH|STARTUP|HOME|USERBASE)|PERL5OPT|PERL5LIB|PERLLIB|PERL5DB|RUBYOPT|RUBYLIB|JAVA_TOOL_OPTIONS|_JAVA_OPTIONS|JDK_JAVA_OPTIONS|GCONV_PATH)$/i;
     const ambient = Object.fromEntries(Object.entries(process.env).filter(([key]) => !loader.test(key)));
     const env = { ...ambient, LANE_POOL_ROOT: join(dir, 'pool override'), TMPDIR: '/old/tmp' };
     const execFn = (bin, args) => args.includes('--absolute-git-dir') ? join(dir, 'metadata') : args.includes('rev-parse') ? 'sha' : '';
@@ -1790,6 +1790,64 @@ describe('direct CLI flags reach the actual spawn and JSON result', () => {
 });
 
 
+describe('wait --until-done', () => {
+  const running = { status: 'running', exitCode: null, resultPath: 'result.json', code: 75 };
+
+  it('wait --until-done blocks across slices and returns only on job exit', async () => {
+    const done = { ...running, status: 'done', exitCode: 0, code: 0 };
+    const waitFn = vi.fn().mockResolvedValueOnce(running).mockResolvedValueOnce(running).mockResolvedValueOnce(done);
+    const log = vi.fn();
+    expect(await waitUntilDone({ jobId: 'job', sliceMs: 500, waitFn, now: () => 0, log })).toEqual(done);
+    expect(waitFn.mock.calls).toEqual(Array(3).fill([{ jobId: 'job', maxMs: 500 }]));
+    expect(log.mock.calls).toEqual([
+      ['codex-direct-task wait: job job still running (slice 1, elapsed 0s)'],
+      ['codex-direct-task wait: job job still running (slice 2, elapsed 0s)'],
+    ]);
+  });
+
+  it('overall timeout returns code 75 with message and the last JSON result', async () => {
+    let time = 0;
+    const waitFn = vi.fn(async () => { time += 500; return running; });
+    const log = vi.fn();
+    expect(await waitUntilDone({ jobId: 'job', sliceMs: 500, overallMs: 1000, waitFn, now: () => time, log })).toEqual(running);
+    expect(waitFn).toHaveBeenCalledTimes(2);
+    expect(log).toHaveBeenLastCalledWith('codex-direct-task wait: overall wait timed out; run the same command again');
+  });
+
+  it('caps each slice to the time left in the overall budget, then times out with the last result', async () => {
+    let t = 0;
+    const now = () => t;
+    const waitFn = vi.fn(async ({ maxMs }) => { t += maxMs; return running; });
+    const log = vi.fn();
+    expect(await waitUntilDone({ jobId: 'job', sliceMs: 400, overallMs: 1050, waitFn, log, now })).toEqual(running);
+    expect(waitFn.mock.calls.map(c => c[0].maxMs)).toEqual([400, 400, 250]);
+    expect(log).toHaveBeenLastCalledWith('codex-direct-task wait: overall wait timed out; run the same command again');
+  });
+
+  it('clamps an over-large overall budget to 2 h instead of overflowing timers', async () => {
+    let t = 0;
+    const waitFn = vi.fn(async ({ maxMs }) => { t += maxMs; return running; });
+    await waitUntilDone({ jobId: 'job', overallMs: 2147483648, waitFn, log: vi.fn(), now: () => t });
+    expect(t).toBe(7200000);
+  });
+
+  it.each([[1, 'failed'], [2, 'wait-error']])('terminal code %s (%s) is passed through immediately', async (code, status) => {
+    const result = { ...running, status, code };
+    const waitFn = vi.fn().mockResolvedValue(result);
+    const log = vi.fn();
+    expect(await waitUntilDone({ jobId: 'job', waitFn, log })).toEqual(result);
+    expect(waitFn).toHaveBeenCalledTimes(1);
+    expect(waitFn).toHaveBeenCalledWith({ jobId: 'job', maxMs: 540000 });
+    expect(log).not.toHaveBeenCalled();
+  });
+
+  it.each([0, -1, '', 'abc', Infinity, true])('rejects invalid overall-ms=%s before job IO', async overallMs => {
+    const waitFn = vi.fn();
+    await expect(waitUntilDone({ overallMs, waitFn })).rejects.toThrow('--overall-ms');
+    expect(waitFn).not.toHaveBeenCalled();
+  });
+});
+
 describe('detached jobs', () => {
   let jobsDir;
   beforeEach(() => { jobsDir = mkdtempSync(join(tmpdir(), 'codex-jobs-test-')); });
@@ -1923,11 +1981,11 @@ describe('detached jobs', () => {
     expect(child.stderr).toBe('codex-direct-task wait: --max-ms must be between 250 and 540000\n');
   });
 
-  it.each(['250', '540000', '1080000', undefined])('wait CLI accepts max-ms=%s and reports a completed job', maxMs => {
+  it.each(['250', '540000', '1080000', undefined, 'until-done'])('wait CLI accepts max-ms=%s and reports a completed job', maxMs => {
     const record = { id: 'accepted', pid: process.pid, status: 'done', exitCode: 0, resultPath: 'result.json' };
     writeJobRecord(record, { jobsDir });
     const child = spawnSync(process.execPath, ['scripts/codex-direct-task.mjs', 'wait', '--job=accepted',
-      ...(maxMs === undefined ? [] : [`--max-ms=${maxMs}`])], {
+      ...(maxMs === 'until-done' ? ['--until-done'] : maxMs === undefined ? [] : [`--max-ms=${maxMs}`])], {
       encoding: 'utf8', timeout: 4000, maxBuffer: 1024 * 1024,
       env: { ...process.env, CODEX_JOBS_DIR: jobsDir },
     });

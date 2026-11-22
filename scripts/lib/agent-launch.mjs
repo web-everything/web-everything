@@ -2,7 +2,7 @@
  * Closed-grammar process boundary: snapshot plain data, then build argv and directly exec.
  * Child env = caller record minus runtime loader variables (undefined omitted), with optional
  * PATH prefix and task TMP roots. Refused before spawn: non-string/NUL values, empty/=/NUL keys.
- * Loader variables (NODE_OPTIONS, LD_*, DYLD_*, ...) run caller code inside the agent process
+ * Loader variables (NODE_OPTIONS, BUN_OPTIONS, LD_*, DYLD_*, ...) run caller code inside the agent process
  * before its sandbox exists, so they are always dropped. Wider narrowing (shell startup, Git,
  * bypass flags) is S1e.
  * Codex must resolve to the same executable on caller PATH as the fixed installation lookup.
@@ -79,7 +79,7 @@ function paths(value, name) {
 // that Node loads at startup), plus the common interpreter loader keys. Compared upper-cased,
 // which over-drops case variants (fail-safe). Dropped, never passed.
 const LOADER_PREFIXES = ['LD_', 'DYLD_'];
-const LOADER_KEYS = new Set(['NODE_OPTIONS', 'NODE_PATH', 'NODE_REPL_EXTERNAL_MODULE',
+const LOADER_KEYS = new Set(['NODE_OPTIONS', 'BUN_OPTIONS', 'NODE_PATH', 'NODE_REPL_EXTERNAL_MODULE',
   'OPENSSL_CONF', 'OPENSSL_MODULES', 'OPENSSL_ENGINES',
   'PYTHONPATH', 'PYTHONSTARTUP', 'PYTHONHOME', 'PYTHONUSERBASE', 'PERL5OPT', 'PERL5LIB', 'PERLLIB', 'PERL5DB',
   'RUBYOPT', 'RUBYLIB', 'JAVA_TOOL_OPTIONS', '_JAVA_OPTIONS', 'JDK_JAVA_OPTIONS', 'GCONV_PATH']);
@@ -179,7 +179,9 @@ function firstCodex(path) {
   for (const dir of path.split(':')) {
     if (!isAbsolute(dir)) fail('relative child PATH entry before codex; use absolute directories and retry');
     try {
-      const file = join(dir, 'codex');
+      // Preserve the OS lookup: normalization can erase missing/non-directory components
+      // or change the meaning of '..' after a symlink.
+      const file = `${dir}/codex`;
       if (!statSync(file).isFile()) continue;
       accessSync(file, constants.X_OK);
       return file;

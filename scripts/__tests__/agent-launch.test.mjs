@@ -36,6 +36,7 @@ function mainCodexShimPath(env) {
 // (or the interpreters it starts) before any agent sandbox exists, so they never reach the child.
 const LOADER_ORACLE = {
   NODE_OPTIONS: '--import=/attacker/payload.mjs', NODE_PATH: '/attacker/modules',
+  BUN_OPTIONS: '--preload=/attacker/payload.mjs', bun_options: '--preload=/attacker/lower.mjs',
   NODE_REPL_EXTERNAL_MODULE: '/attacker/repl.js',
   OPENSSL_CONF: '/attacker/openssl.cnf', OPENSSL_MODULES: '/attacker/ossl-modules', OPENSSL_ENGINES: '/attacker/engines',
   LD_PRELOAD: '/attacker/lib', LD_LIBRARY_PATH: '/attacker/libs', LD_AUDIT: '/attacker/audit',
@@ -241,6 +242,38 @@ describe('B5 same executable as main or refuse', () => {
   });
   it('refuses no codex, missing PATH and an empty entry before codex', () => {
     noSpawn({ PATH: root }, /codex.*PATH/); noSpawn({}, /codex.*PATH/); noSpawn({ PATH: `:${bin}` }, /relative|absolute/);
+  });
+  it.each(['missing', 'regular-file'])('checks the literal PATH entry through a %s component', component => {
+    if (component === 'regular-file') writeFileSync(join(root, component), 'not a directory');
+    const literal = `${root}/${component}/../bin`;
+    // The OS cannot resolve this entry, even though path.join would turn it into bin.
+    const probe = spawnSync('codex', ['--version'], { env: { PATH: literal }, timeout: 5000, maxBuffer: 8192 });
+    expect(['ENOENT', 'ENOTDIR']).toContain(probe.error?.code);
+    noSpawn({ PATH: literal }, /codex.*PATH/);
+  });
+  it('does not let a normalized missing PATH entry hide a later wrapper', () => {
+    const wrapper = join(root, 'later-wrapper'); mkdirSync(wrapper);
+    writeFileSync(join(wrapper, 'codex'), '#!/bin/sh\nprintf wrapper\n', { mode: 0o755 });
+    const PATH = `${root}/missing/../bin:${wrapper}`;
+    const probe = spawnSync('codex', [], { env: { PATH }, encoding: 'utf8', timeout: 5000, maxBuffer: 8192 });
+    expect(probe.status, probe.stderr).toBe(0);
+    expect(probe.stdout).toBe('wrapper');
+    noSpawn({ PATH }, /binary.*differ|identity/);
+  });
+  it('checks symlink-parent PATH traversal against the actual executable', () => {
+    const other = join(root, 'other'); mkdirSync(other);
+    mkdirSync(join(other, 'nested')); mkdirSync(join(other, 'bin'));
+    symlinkSync(join(other, 'nested'), join(root, 'link'));
+    writeFileSync(join(other, 'bin', 'codex'), '#!/bin/sh\nprintf wrapper\n', { mode: 0o755 });
+    const PATH = `${root}/link/../bin`;
+    const probe = spawnSync('codex', [], { env: { PATH }, encoding: 'utf8', timeout: 5000, maxBuffer: 8192 });
+    expect(probe.status, probe.stderr).toBe(0);
+    expect(probe.stdout).toBe('wrapper');
+    noSpawn({ PATH }, /binary.*differ|identity/);
+    rmSync(join(other, 'bin', 'codex'));
+    symlinkSync(binary, join(other, 'bin', 'codex'));
+    const io = seam(); launchAgent({ ...base(), env: { PATH } }, io);
+    expect(io.spawn.mock.calls[0][2].env.PATH).toBe(PATH);
   });
   it('compares review binary identity against caller PATH without adding a prefix', () => {
     const wrapper = join(root, 'review-wrapper'); mkdirSync(wrapper);
