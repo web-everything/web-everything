@@ -3,7 +3,7 @@ import { canonicalAuditEvidence, testWorkflowBound, TEST_CHECK_APP_ID } from '..
 import { resolveCascade } from './policy-cascade.mjs';
 const defaults = Object.freeze({ liveWhen: 'after-receipt-and-audit', auditBar: 'no-pr-introduced-security', receiptSource: 'ci-full-suite', parallel: true });
 const result = (outcome, detail) => ({ outcome, detail, ...(outcome === 'pass' ? {} : {
-  fallback: 'Wait for complete CI and an own-sha audit; repair or archive evidence exceeding 100 API rows or 2 MiB, or use the normal merge path.',
+  fallback: 'Wait for complete CI and an own-sha audit; repair or archive evidence exceeding 100 API rows/calls or 2 MiB, or use the normal merge path.',
 }) });
 const unknown = () => result('unknown', 'hotpatch-evidence-unreadable');
 const complete = (data, key) => Number.isInteger(data?.total_count) && data.total_count >= 0
@@ -28,15 +28,21 @@ export async function receiptGuard(sha, readers) {
     const runs = data.check_runs.filter(r => r.head_sha === sha && r.app.id === TEST_CHECK_APP_ID);
     if (runs.some(r => r.status === 'completed' && ['failure', 'cancelled', 'timed_out', 'action_required', 'startup_failure', 'stale'].includes(r.conclusion)))
       return result('fail', 'hotpatch-ci-failed');
-    const latest = runs.filter(r => r.name === 'test').sort((a, b) => b.id - a.id)[0];
-    if (!latest) return result('wait', 'hotpatch-needs-ci-receipt');
-    if (!testWorkflowBound({ suiteIds: [latest.check_suite.id] }, workflows, sha)) return result('unknown', 'hotpatch-workflow-unbound');
-    const required = ['test', ...plan.map((_, i) => `test-shard (${i + 1})`)];
-    for (const name of required) {
-      const check = runs.filter(r => r.name === name && r.check_suite.id === latest.check_suite.id).sort((a, b) => b.id - a.id)[0];
-      if (!check || check.status !== 'completed') return result('wait', 'hotpatch-needs-ci-receipt');
+    const tests = data.check_runs.filter(r => r.head_sha === sha && r.name === 'test');
+    if (!tests.length) return result('wait', 'hotpatch-needs-ci-receipt');
+    for (const test of tests) {
+      if (test.app.id !== TEST_CHECK_APP_ID || !testWorkflowBound({ suiteIds: [test.check_suite.id] }, workflows, sha)) return result('unknown', 'hotpatch-workflow-unbound');
+      for (const name of ['test', 'smoke', 'daemon-soak', ...plan.map((_, i) => `test-shard (${i + 1})`)]) {
+        if (!runs.some(r => r.name === name && r.check_suite.id === test.check_suite.id)) return result('wait', 'hotpatch-needs-ci-receipt');
+      }
+    }
+    // Inspect every attempt and producer, not just the latest successful required job.
+    for (const check of data.check_runs) {
+      if (check.head_sha !== sha) return unknown();
+      if (check.status !== 'completed') return result('wait', 'hotpatch-needs-ci-receipt');
       if (check.conclusion !== 'success') return result('fail', 'hotpatch-incomplete-ci-receipt');
     }
+    if (await readers.fullSuite(sha, workflows) !== true) return result('unknown', 'hotpatch-full-suite-unproven');
     return result('pass', 'hotpatch-ci-receipt');
   } catch { return unknown(); }
 }
@@ -48,6 +54,7 @@ export async function auditGuard(sha, readers) {
     if (!Array.isArray(records) || !Array.isArray(rulings)) return unknown();
     // No fingerprint argument: only the requested head can contribute canonical evidence.
     const own = records.filter(r => r?.head?.toLowerCase() === sha);
+    if (own.some(r => !Array.isArray(r.findings) || r.findings.some(f => typeof f !== 'string'))) return unknown();
     const evidence = canonicalAuditEvidence(own, sha, base => {
       const covered = readers.covers(base, sha);
       if (typeof covered !== 'boolean') throw new Error('unreadable audit base');
@@ -63,7 +70,7 @@ export async function ciDefinitionGuard(sha, readers) {
   try {
     const paths = await readers.paths(sha);
     if (!Array.isArray(paths) || paths.some(p => typeof p !== 'string' || !p)) return unknown();
-    return paths.some(p => /^(?:\.github\/workflows\/|scripts\/ci\/|vitest[^/]*\.config\.[^/]+$|package(?:-lock)?\.json$)/.test(p))
+    return paths.some(p => /^(?:\.github\/(?:workflows|actions)\/|scripts\/(?:ci(?:\/|[^/]*$)|hermetic-tests[^/]*$|lib\/(?:hermetic|red-main-quarantine)[^/]*$)|vitest[^/]*\.[^/]+$|package(?:-lock)?\.json$)/.test(p))
       ? result('fail', 'hotpatch-ci-definition-change') : result('pass', 'hotpatch-ci-definition-unchanged');
   } catch { return unknown(); }
 }

@@ -5,7 +5,7 @@ import { resolve, dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { resolvePriorQuestionHashes } from '../operations/codex-audit.mjs';
 import { ciUnitPlan } from '../operations/urgent-verify-marker.mjs';
-import { jsonLines, mergeRuledWeakened } from '../operations/prototype-load.mjs';
+import { mergeRuledWeakened } from '../operations/prototype-load.mjs';
 import { readStore, storePath, withdrawnRevocations } from '../operations/ruled-weakened-store.mjs';
 import { resolveOriginRepository } from '../operations/prototype-retire.mjs';
 import { laneHistoryProofEnv, scrubGitLocationEnv } from './lane-git-hardening.mjs';
@@ -18,7 +18,7 @@ export function createHotpatchReaders({ cwd = root, env = process.env, exec = ex
   const git = args => String(exec('git', args, { ...opts, env: laneHistoryProofEnv(scrubGitLocationEnv(env)) }));
   let calls = 0;
   const gh = args => {
-    if (++calls > 3) throw new Error('hotpatch API budget exceeded');
+    if (++calls > 100) throw new Error('hotpatch API budget exceeded');
     return { code: 0, stdout: String(execFileSyncThrottled('gh', args, { ...opts,
     throttle: { caller: 'hotpatch-admission', ...(exec !== execFileSync ? { exec: (a, o) => exec('gh', a, o) } : {}) } })) };
   };
@@ -47,8 +47,41 @@ export function createHotpatchReaders({ cwd = root, env = process.env, exec = ex
     return JSON.parse(r.stdout);
   };
   return {
-    checks: sha => api(`commits/${sha}/check-runs?per_page=100`),
+    checks: sha => api(`commits/${sha}/check-runs?filter=all&per_page=100`),
     workflows: sha => api(`actions/runs?head_sha=${sha}&per_page=100`),
+    fullSuite: (sha, workflows) => {
+      const ci = workflows.workflow_runs.filter(r => r.head_sha === sha && r.path === '.github/workflows/ci.yml');
+      if (!ci.length) throw new Error('missing CI execution');
+      for (const run of ci) {
+        if (!Number.isSafeInteger(run.id) || run.status !== 'completed' || run.conclusion !== 'success') return false;
+        const data = api(`actions/runs/${run.id}/jobs?filter=all&per_page=100`);
+        if (!Number.isInteger(data.total_count) || data.total_count < 1 || data.total_count > 100
+          || !Array.isArray(data.jobs) || data.jobs.length !== data.total_count) throw new Error('incomplete CI jobs');
+        const groups = [
+          [/^test-shard \(/, /^Unit suite /],
+          [/^integration-part \(/, /^Real-git integration suite /],
+          [/^soak-shard \(/, /^Soak shard /],
+          [/^smoke$/, /^(?:Build WE docs \(deploy smoke\)|Interaction lane)$/],
+        ];
+        for (const [jobName, stepName] of groups) {
+          const jobs = data.jobs.filter(j => jobName.test(j.name));
+          if (!jobs.length) return false;
+          for (const job of jobs) {
+            if (!Number.isSafeInteger(job.id) || job.head_sha !== sha || job.status !== 'completed' || job.conclusion !== 'success'
+              || !Array.isArray(job.steps) || !job.steps.some(s => stepName.test(s.name) && s.status === 'completed' && s.conclusion === 'success')) return false;
+            if (job.name === 'smoke') {
+              if (!['Build WE docs (deploy smoke)', 'Interaction lane'].every(name => job.steps.some(s => s.name === name && s.status === 'completed' && s.conclusion === 'success'))) return false;
+              continue;
+            }
+            const log = origin.gh(['api', `repos/${origin.repo}/actions/jobs/${job.id}/logs`]);
+            if (log.code !== 0) throw new Error('unreadable execution log');
+            const decisions = log.stdout.split('\n').filter(line => line.includes('red-main-quarantine skip:'));
+            if (!decisions.length || decisions.some(line => line.includes('→') || !line.includes('running everything'))) return false;
+          }
+        }
+      }
+      return true;
+    },
     ciPlan: sha => { prepare(sha); return ciUnitPlan(git(['show', 'origin/main:.github/workflows/ci.yml'])); },
     paths: sha => {
       prepare(sha);
@@ -56,14 +89,18 @@ export function createHotpatchReaders({ cwd = root, env = process.env, exec = ex
       if (raw && !raw.endsWith('\0')) throw new Error('incomplete hotpatch diff');
       return raw ? raw.slice(0, -1).split('\0') : [];
     },
-    auditOptions: () => ({ now: Date.now(), priorQuestionHashes: resolvePriorQuestionHashes({ env, readFile: (p, e) => files.readFileSync(p, e) }) }),
+    auditOptions: () => ({ now: Date.now(), priorQuestionHashes: resolvePriorQuestionHashes({ env, strict: true, readFile: (p, e) => files.readFileSync(p, e) }) }),
     audits: () => {
       preferences();
       const path = tool.auditRecordPath.replace(/^~\//, `${env.HOME}/`);
       try {
         const body = files.readFileSync(path, 'utf8');
         if (Buffer.byteLength(body) > opts.maxBuffer) throw new Error('audit ledger exceeds 2 MiB; archive old records');
-        return jsonLines(body);
+        return body.split('\n').filter(line => line.trim()).map(line => {
+          const record = JSON.parse(line);
+          if (!record || typeof record !== 'object' || Array.isArray(record)) throw new Error('invalid audit record');
+          return record;
+        });
       }
       catch (e) { if (e.code === 'ENOENT') return []; throw e; }
     },

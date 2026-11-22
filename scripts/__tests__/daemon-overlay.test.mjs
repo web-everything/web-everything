@@ -745,6 +745,18 @@ describe('hotpatch add admission', () => {
       stdout.mockRestore(); stderr.mockRestore(); process.env = oldEnv; process.exitCode = oldCode;
     }
   }
+  it('R6: direct add refuses a clean hotpatch behind main', async () => {
+    const {hotpatchFixture} = await import('../lib/__tests__/fixtures/hotpatch.mjs');
+    const f = makeFixture(), fixture = hotpatchFixture();
+    const tip = gitOk(f.cloneDir, ['rev-parse', 'HEAD']).trim();
+    advanceMain(f.originDir, dir => writeFile(dir, 'main.txt', 'new main'));
+    for (const check of fixture.data.checks.check_runs) check.head_sha = tip;
+    fixture.data.workflows.workflow_runs[0].head_sha = tip; fixture.data.audits[0].head = tip;
+    const result = await hotpatchAdd(f, fixture.readers);
+    expect(result.code).not.toBe(0);
+    expect(result.output).toContain('hotpatch-behind-main');
+    expect(overlayStateFile(f.overlayDir, f.cloneDir)?.overlays ?? []).toEqual([]);
+  });
   it('direct add of hotpatch/<sha> runs the same receipt and audit admission', async () => {
     const { hotpatchFixture } = await import('../lib/__tests__/fixtures/hotpatch.mjs');
     const f = makeFixture(), fixture = hotpatchFixture();

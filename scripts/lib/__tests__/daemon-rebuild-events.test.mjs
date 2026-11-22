@@ -306,6 +306,8 @@ describe('rebuildClone coordination events', () => {
       'diff-unknown', 'dirty', 'disabled', 'dispatch-smoke', 'executable-or-runtime-file-change',
       'expired', 'fallback-inputs-moved', 'fallback-not-allowed', 'fallback-plain-main', 'forced-sha-pinned',
       'forced-watch-missing', 'forced-watch-owed', 'forced-watch-unreadable',
+      // Hotpatch admission/immutability refusals do not attempt a rebuild or a ref write.
+      'hotpatch-behind-main', 'hotpatch-main-sync-forbidden', 'hotpatch-ref-sha-mismatch',
       'harness-broken-adopted-not-worse', 'held-after-rollback', 'imported-change', 'in-main',
       'index-locked', 'invalid-ready-applied', 'invalid-probation', 'local-commits', 'manifest-or-config-change', 'merge-in-progress',
       'merge conflicts remain after the ref tip moved', // overlay-main-sync-conflict diagnostic

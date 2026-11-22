@@ -10,6 +10,9 @@ import { planRebuild } from '../daemon-rebuild/plan.mjs';
 import { makeGit } from '../daemon-rebuild/shared.mjs';
 import { readyBuildVerified, matchReadyCandidate, finalizeRebuild } from '../daemon-rebuild/adopt.mjs';
 import { makeAuditedTipGate } from '../daemon-rebuild/audited-tip.mjs';
+import * as hotpatchReaders from '../hotpatch-readers.mjs';
+import { admitHotpatch } from '../hotpatch-guards.mjs';
+import { hotpatchFixture } from './fixtures/hotpatch.mjs';
 import { addOverlay, resolveOverlayFollowTip } from '../daemon-overlays.mjs';
 import { rebuildClone } from '../daemon-rebuild.mjs';
 import { readReadyCandidateStrict, readReadyCandidate, writeReadyCandidate, assertReadyCandidatePins, StaleReadyPinError } from '../daemon-rebuild/state.mjs';
@@ -1066,3 +1069,55 @@ it.each(['early', 'recovery', 'tick-start'])('%s refuses malformed pins and defe
   expect(matchReadyCandidate({ ...args, ready: { ...ready, adopt: { ...plan, applied: [{ ref, sha: f.b }] } } }).reason)
     .toBe('ready-audit-revoked');
 }, 180_000); // six real rebuild checks over real git fixtures: far slower than the default under host load
+
+
+describe('hotpatch canonical evidence at finalization', () => {
+  it.each(['first adoption', 'follow mode'])(
+    'finalizeRebuild refuses canonical evidence revoked after preparation: %s', async mode => {
+      const f = await fixture();
+      const hotpatchRef = `hotpatch/${f.b}`;
+      const env = { ...process.env, ...f.env,
+        WE_DAEMON_STATE_DIR: join(f.dir, 'state'),
+        WE_DAEMON_OVERLAY_DIR: join(f.dir, 'overlays'),
+        WE_DAEMON_OVERLAY_FOLLOW_TIP: mode === 'follow mode' ? 'follow' : 'audited-only',
+      };
+      gitOk(f.root, ['update-ref', `refs/remotes/origin/${hotpatchRef}`, f.b]);
+      const { data, readers } = hotpatchFixture();
+      for (const check of data.checks.check_runs) check.head_sha = f.b;
+      data.workflows.workflow_runs[0].head_sha = f.b;
+      data.audits[0].head = f.b;
+      expect(await admitHotpatch(f.b, readers)).toMatchObject({ outcome: 'pass' });
+      // Keep the legacy gate permissive: only a fresh canonical admission can catch this revocation.
+      const auditedTip = mode === 'follow mode' ? makeAuditedTipGate(env) : () => true;
+      if (mode === 'follow mode') expect(auditedTip).toBeNull();
+      const built = await f.plan({ headSha: f.base, overlays: [{ ref: hotpatchRef, pr: 42 }], auditedTip });
+      expect(built.ok).toBe(true);
+      expect(built.applied).toEqual([{ ref: hotpatchRef, pr: 42, sha: f.b }]);
+      expect(built.auditAdopted).not.toContain(hotpatchRef);
+      gitOk(f.root, ['checkout', '-q', '--detach', f.base]);
+
+      // Preparation passed, then the own-SHA canonical audit becomes negative during smoke.
+      data.audits[0].verdict = 'WEAKENED';
+      data.audits[0].findings = ['guard weakened'];
+      const readAudits = vi.fn(readers.audits);
+      readers.audits = readAudits;
+      const factory = vi.spyOn(hotpatchReaders, 'createHotpatchReaders').mockReturnValue(readers);
+      try {
+        const done = await finalizeRebuild({
+          root: f.root, env, log: { error() {} },
+          run: (args, opts) => spawnSync('git', args, { ...opts, encoding: 'utf8' }),
+          now: () => Date.now(), lease: { token: 'hotpatch-direct-smoke' },
+          prevHead: f.base, plan: built, auditedTip,
+        });
+        expect(factory).toHaveBeenCalledWith({ cwd: f.root, env });
+        expect(readAudits).toHaveBeenCalledWith(f.b);
+        expect(done).toMatchObject({ moved: false, reason: 'ready-audit-revoked' });
+        expect(done.alerts).toContainEqual(expect.objectContaining({
+          kind: 'ready-audit-revoked', detail: expect.objectContaining({ refs: [hotpatchRef] }),
+        }));
+        expect(gitOk(f.root, ['rev-parse', 'HEAD'])).toBe(f.base);
+        expect(readRebuildState(f.root, env).adopted?.head).not.toBe(built.finalSha);
+      } finally { factory.mockRestore(); }
+    },
+  );
+});

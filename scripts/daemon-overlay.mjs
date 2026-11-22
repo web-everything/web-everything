@@ -644,6 +644,7 @@ export async function retireRegistration({ root, ref, expectedTip, expectedEntry
  * `deps` ({contain, check, tip, afterDrop}) is a test seam.
  */
 export async function replaceRegistration({ root, ref, old, expectedSha, pr = null, by = null, reason = null, pinned, env = process.env, checkOnly = false, deps = {} }) {
+  if (ref?.startsWith('hotpatch/')) return { ok: false, refused: 'hotpatch-replace-forbidden', code: 3 };
   const contain = deps.contain ?? (() => proveReplaceContainment({ root, oldRef: old, newRef: ref, expectedSha, env }));
   const conflictCheck = deps.check ?? ((existingOverlays) => stackAwareOverlayCheck({ root, ref, pr, existingOverlays, env }));
   const tip = deps.tip ?? ((r) => remoteTip({ root, ref: r, env }));
