@@ -16,9 +16,9 @@ For repo defaults, edit the owner file through a PR and rebuild the consuming da
 
 ## Summary
 
-- Top-level keys: 164 (166 declaration rows).
-- Declared leaves: 618 (platform copies counted separately).
-- Instant top-level keys: 0; not instant: 164.
+- Top-level keys: 165 (167 declaration rows).
+- Declared leaves: 619 (platform copies counted separately).
+- Instant top-level keys: 1; not instant: 164.
 - Instant capacity leaves: 15.
 - Constants to settle: 312.
 - Instant gaps: 28.
@@ -61,6 +61,7 @@ Operator-prefs layer: ~/.plateau/platform-preferences.json is the requested oper
 | advisorySeats | scripts/settings/review.json | 1 | {"antigravityReview":"probation"} | pr | no | Provider advisory review seating policy. |
 | aiRouting | scripts/settings/ai-routing.json | 0 | {} | pr | no | AI role routing overrides; empty preserves existing resolvers. |
 | alertAfterMinutes | scripts/settings/forge-share.json | 1 | 60 | pr | no | Duration before low remote execution share raises an alert. |
+| allowedDirs | scripts/settings/build-priority-scope.json | 1 | ["scripts/conveyor/","scripts/lib/"] | pr | yes | Directory prefixes admitting exact regular-file WE scopes to build-priority-set; invalid or unreadable evidence refuses. |
 | allowedKinds | scripts/settings/agy-build.json | 1 | ["doc-fix"] | env | no | Doc-fix only; test-fix refused until #8606 regardless of settings. Production confinement unavailable; repair size 1. |
 | allowedSigners | scripts/settings/card-ledger-trust.json | 1 | [] | pr | no | Trusted card-ledger signers. |
 | archive | scripts/settings/archive-retention.json | 1 | {"runsBatchCap":5000} | pr | no | Archive retention and bounded archive batch policy. |

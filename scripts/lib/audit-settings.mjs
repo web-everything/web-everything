@@ -113,6 +113,7 @@ const REVIEW_AUTH_IMPORTS = Object.freeze([
  * form (`'settings/x.json'`, `join(dir, 'settings', 'x.json')`, a file next to the module), onto the floor.
  */
 const FLOOR_SETTINGS = Object.freeze([
+  'scripts/settings/build-priority-scope.json',
   'scripts/settings/daemon-tasks.json',
   'scripts/settings/card-ledger-legacy-identities.json', 'scripts/settings/card-ledger-trust.json', 'scripts/settings/card-numbering.json',
   'scripts/settings/red-team.json', 'scripts/settings/github-auth.json', 'scripts/settings/human-review-surfaces.json',

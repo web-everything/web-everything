@@ -1,6 +1,6 @@
 /** Fail-closed evidence readers and the single atomic runtime-list writer. */
 import fs from 'node:fs';
-import { basename, dirname, join, relative, resolve } from 'node:path';
+import { basename, dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { randomUUID } from 'node:crypto';
 import { execFileSync } from 'node:child_process';
@@ -14,33 +14,63 @@ import { buildPrioritySetOperation, BUILD_PRIORITY_SET_EFFECT, validateBuildPrio
 import { TRUST_CHAIN } from '../lib/gate-config.mjs';
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '../..');
-let guardImportClosure;
+// Execution controls and the guard remain protected wherever a copy is relocated.
+const EXECUTION_CONTROLS = [
+  /^package\.json$/, /^vitest.*\.config\..+$/, /setup.*\.(?:js|ts|mjs)$/, /^vitest\.setup\..+$/,
+  /^(?:cli-adapter|engine|effect-executor|build-priority-set-io|build-priority-set|build-priority-set\.test|build-priority-set-io-real\.test)\.mjs$/,
+];
+// Explicit snapshot of the guard's internal dependencies, protected in every directory.
+// The test-only import-graph witness checks this list for drift; admission does no source scanning.
+const GUARD_DEPENDENCY_BASENAMES = new Set([
+  'atomic-json-file.mjs', 'automation-home.mjs', 'backlog-status.cjs',
+  'bounded-child.mjs', 'build-priority-set-io.mjs', 'build-priority-set.mjs',
+  'build-queue.mjs', 'command-redact.mjs', 'constellation-repos.mjs',
+  'container-exec.mjs', 'coordination-root.mjs', 'daemon-clone-layout.mjs',
+  'daemon-events.mjs', 'daemon-last-good.mjs', 'declared-homes.mjs',
+  'delivery-priority.mjs', 'dispatch-lane.mjs', 'dispatch-task-type.mjs',
+  'dispatch-throttle.mjs', 'drain-lock.mjs', 'file-locks.mjs',
+  'finished-ci-cache.mjs', 'forge-cache-prune.mjs', 'forge-exec-bases.mjs',
+  'forge-exec-limits.mjs', 'forge-exec-manifest.mjs', 'forge-exec-run.mjs',
+  'forge-exec-siblings.mjs', 'forge-key-structure.mjs', 'forge-manifest-tracked.mjs',
+  'forge-remote-health.mjs', 'forge-run-finish.mjs', 'forge-share.mjs',
+  'forge-slot-markers.mjs', 'forge-telemetry.mjs', 'free-scope.mjs',
+  'gate-config.mjs', 'gh-argv.mjs', 'gh-deferred.mjs',
+  'gh-throttle-holders.mjs', 'gh-throttle.mjs', 'github-auth-policy.mjs',
+  'handoff-path.mjs', 'handoff-settings.mjs', 'heavy-admission.mjs',
+  'heavy-queue-io.mjs', 'heavy-queue-projection.mjs', 'heavy-queue.mjs',
+  'heavy-repair-priority.mjs', 'host-capacity-render.mjs', 'host-capacity.mjs',
+  'host-load.mjs', 'host-overload-settings.mjs', 'host-sample.mjs',
+  'infra-blocked.mjs', 'lane-git-hardening.mjs', 'lane-lease.mjs',
+  'lane-partition.mjs', 'lane-pool-paths.mjs', 'memory-warn-corroboration.mjs',
+  'model-proposer.mjs', 'needs-git-route.mjs', 'no-prompt-command-rules.mjs',
+  'operator-override-reader.mjs', 'pid-alive.mjs', 'pid-liveness.mjs',
+  'policy-cascade.mjs', 'pr-land-reasons.mjs', 'pr-snapshot-store.mjs',
+  'queue-store.mjs', 'registry.mjs', 'remote-exec.mjs',
+  'remote-git-bundle.mjs', 'repo-names.mjs', 'resource-admission.mjs',
+  'resource-gate.mjs', 'resource-policy.mjs', 'scope-glob-overlap.cjs',
+  'scope-lease.mjs', 'session-slug.mjs', 'settings-files.mjs',
+  'settings-safe-direction.mjs', 'standards-cache.mjs', 'standards-sections.mjs',
+  'step-kinds.mjs', 'telemetry-machine.mjs', 'telemetry-store.mjs',
+  'telemetry-summary-io.mjs', 'telemetry-summary.mjs', 'telemetry.mjs',
+  'tools-root-guard.mjs', 'tools-root.mjs', 'under-test.mjs',
+  'write-all-sync.mjs',
+]);
+const SCOPE_SETTINGS = 'scripts/settings/build-priority-scope.json';
+const normalSegments = path => path.split('/').every(segment =>
+  /^[a-z0-9_-][a-z0-9_.-]*$/.test(segment) && !segment.includes('..'));
 
-/** Read the guard's static relative imports once; missing source never grants admission. */
-function readGuardImportClosure() {
-  if (guardImportClosure) return guardImportClosure;
-  const files = new Set();
-  function visit(file) {
-    if (files.has(file)) return;
-    if (file.startsWith('../') || file === '..') refuse(`unresolvable guard import ${file}`);
-    files.add(file);
-    let source;
-    try { source = fs.readFileSync(resolve(ROOT, file), 'utf8'); }
-    catch { refuse(`unreadable or unresolvable guard import ${file}`); }
-    // Static imports only, including side-effect imports; node: and packages are external.
-    const imports = /^\s*import\s+(?:[^;'"()]*?\s+from\s*)?['"]([^'"]+)['"]/gm;
-    for (const match of source.matchAll(imports)) {
-      if (!match[1].startsWith('./') && !match[1].startsWith('../')) continue;
-      visit(relative(ROOT, resolve(ROOT, dirname(file), match[1])));
-    }
-  }
-  visit('scripts/operations/build-priority-set-io.mjs');
-  visit('scripts/operations/build-priority-set.mjs');
-  // Protect the tests without treating their test-runner imports as guard dependencies.
-  files.add('scripts/operations/__tests__/build-priority-set.test.mjs');
-  files.add('scripts/operations/__tests__/build-priority-set-io-real.test.mjs');
-  guardImportClosure = files;
-  return files;
+function readAllowedDirs(options) {
+  try {
+    const settings = JSON.parse(fs.readFileSync(options.scopeSettingsPath ?? join(ROOT, SCOPE_SETTINGS), 'utf8'));
+    if (!Array.isArray(settings?.allowedDirs) || !settings.allowedDirs.length) throw new Error('empty allowedDirs');
+    return settings.allowedDirs.map(dir => {
+      if (typeof dir !== 'string') throw new Error('invalid directory');
+      const path = dir.toLowerCase();
+      if (!path.endsWith('/') || !normalSegments(path.slice(0, -1))
+          || path.slice(0, -1).split('/').some(segment => segment.includes('.'))) throw new Error('invalid directory');
+      return path;
+    });
+  } catch { refuse(`unreadable or malformed scope settings ${SCOPE_SETTINGS}`); }
 }
 const READ_OPTIONS = { encoding: 'utf8', maxBuffer: 8 * 1024 * 1024, timeout: 10000, stdio: ['ignore', 'pipe', 'pipe'] };
 const canonicalId = id => id.replace(/^0+(?=\d)/, '');
@@ -51,12 +81,17 @@ export function readPriorityCards({ git = args => execFileSync('git', args, {
   ...READ_OPTIONS, maxBuffer: 8 * 1024 * 1024, cwd: ROOT, env: { ...process.env, GIT_NO_LAZY_FETCH: '1' },
 }) } = {}) {
   let sha, names;
-  return id => {
-    if (!names) {
-      sha = git(['rev-parse', '--verify', 'refs/remotes/origin/main']).trim();
-      if (!/^[0-9a-f]{40}$/.test(sha)) refuse('unreadable origin/main');
-      names = git(['ls-tree', '-r', '--name-only', '-z', sha, '--', 'backlog']).split('\0').filter(Boolean);
+  const snapshot = () => {
+    if (!sha) {
+      const candidate = git(['rev-parse', '--verify', 'refs/remotes/origin/main']).trim();
+      if (!/^[0-9a-f]{40}$/.test(candidate)) refuse('unreadable origin/main');
+      sha = candidate;
     }
+    return sha;
+  };
+  const read = id => {
+    snapshot();
+    names ??= git(['ls-tree', '-r', '--name-only', '-z', sha, '--', 'backlog']).split('\0').filter(Boolean);
     const matches = names.filter(name => {
       const match = /^backlog\/(\d+)-[^/]+\.md$/.exec(name);
       return match && canonicalId(match[1]) === canonicalId(id);
@@ -68,6 +103,15 @@ export function readPriorityCards({ git = args => execFileSync('git', args, {
     const data = yaml.load(front[1]);
     return { scope: data?.scope };
   };
+  // Literal pathspec and NUL records preserve exact filenames; symlinks are blobs too,
+  // so the mode is part of the evidence. Both readers share the same pinned SHA.
+  read.pathType = path => {
+    const rows = git(['--literal-pathspecs', 'ls-tree', '-z', snapshot(), '--', path]).split('\0').filter(Boolean);
+    if (rows.length !== 1) return 'missing';
+    const match = /^(100644|100755) blob [0-9a-f]{40}\t([^\0]+)$/.exec(rows[0]);
+    return match && match[2] === path ? 'file' : 'non-file';
+  };
+  return read;
 }
 
 /** At most three bounded list calls. At either cap, an operator must drain and retry. */
@@ -92,6 +136,8 @@ function prepare(input, options) {
   const { actor, reason, ids, mode, ttlHours } = validateBuildPriorityInput(input);
   if (new Set(ids.map(canonicalId)).size !== ids.length) refuse('duplicate numeric card identities');
   const readCard = options.readCard ?? readPriorityCards();
+  const pathType = options.pathType ?? readCard.pathType ?? readPriorityCards().pathType;
+  const allowedDirs = readAllowedDirs(options);
   let gateFiles;
   try {
     if (!Array.isArray(TRUST_CHAIN) || !TRUST_CHAIN.length) refuse('empty or unreadable gate TRUST_CHAIN');
@@ -113,11 +159,8 @@ function prepare(input, options) {
   }
   if (!Array.isArray(gateFiles) || !gateFiles.length
       || gateFiles.some(home => typeof home !== 'string' || !home.trim())) refuse('empty or unreadable gate files');
-  const protectedPaths = new Set([...gateFiles, ...readGuardImportClosure()]);
+  const protectedPaths = new Set(gateFiles.map(path => path.toLowerCase()));
   const protectedBasenames = new Set([...protectedPaths].map(file => basename(file)));
-  const repoPrefixes = new Set([
-    ...Object.keys(CONSTELLATION_REPOS), ...Object.keys(SCOPE_PREFIX_ALIASES), ...Object.values(SCOPE_PREFIX_ALIASES),
-  ]);
   const scopes = ids.flatMap(id => {
     const card = readCard(id);
     const raw = typeof card?.scope === 'string' ? [card.scope] : card?.scope;
@@ -125,18 +168,26 @@ function prepare(input, options) {
     return raw.map(entry => {
       const match = typeof entry === 'string' && /^([a-z-]+):(.+)$/i.exec(entry);
       const prefix = match && match[1].toLowerCase();
-      const path = match && match[2];
+      const path = match && match[2].toLowerCase();
       const segments = path ? path.split('/') : [];
-      if (!match || /[\s,]/.test(entry) || !repoPrefixes.has(prefix)
-          || segments.some((segment, index) => !/^[a-z0-9_-][a-z0-9_.-]*$/i.test(segment)
-            || (index < segments.length - 1 && segment.includes('.')))
+      if (!match || /[\s,]/.test(entry) || prefix !== 'we'
+          || !normalSegments(path)
+          || segments.slice(0, -1).some(segment => segment.includes('.'))
           || !/\.(mjs|js|ts|json|md|sh|yml|yaml|css|html)$/.test(segments.at(-1))) {
         refuse(`card ${id} scope entry ${JSON.stringify(entry)} must be an exact file path`);
       }
-      if (protectedPaths.has(path) || protectedBasenames.has(basename(path))) {
+      if (protectedPaths.has(path) || protectedBasenames.has(basename(path))
+          || GUARD_DEPENDENCY_BASENAMES.has(basename(path))
+          || EXECUTION_CONTROLS.some(pattern => pattern.test(basename(path)))) {
         refuse(`card ${id} scope entry ${JSON.stringify(entry)} overlaps gate file ${path}`);
       }
-      return `${SCOPE_PREFIX_ALIASES[prefix] ?? prefix}:${path}`;
+      if (!allowedDirs.some(dir => path.startsWith(dir))) {
+        refuse(`card ${id} scope entry ${JSON.stringify(entry)} outside allowedDirs`);
+      }
+      let type;
+      try { type = pathType(path); } catch { /* Unreadable Git evidence refuses below. */ }
+      if (type !== 'file') refuse(`card ${id} scope entry ${JSON.stringify(entry)} not a readable regular file on origin/main`);
+      return `we:${path}`;
     });
   });
   const prs = (options.readPrs ?? readPriorityPrs)();
@@ -148,7 +199,7 @@ function prepare(input, options) {
     if (pr.files.some(f => /[\s,]/.test(f))) refuse('PR filenames cannot be represented by scope syntax');
     const key = repoKeyFor(pr.repo);
     // Use the card scope vocabulary while keeping PR filenames literal (including colons).
-    const files = pr.files.map(f => `${SCOPE_PREFIX_ALIASES[key] ?? key}:${f}`);
+    const files = pr.files.map(f => `${SCOPE_PREFIX_ALIASES[key] ?? key}:${f.toLowerCase()}`);
     if (scopes.some(scope => prHoldsFile({ ...pr, files }, scope))) refuse(`scope overlaps open PR ${pr.repo}#${pr.number}`);
   }
   const at = (options.now?.() ?? new Date()).toISOString();

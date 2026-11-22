@@ -394,6 +394,10 @@ describe('audit settings (R528)', () => {
       expect(e.value.guardFloorPaths, raw).toEqual([...GUARD_FLOOR, '**', 'custom/**']);
     }
   });
+  it('keeps the build-priority scope settings on the immutable audit floor', () => {
+    expect(GUARD_FLOOR).toContain('scripts/settings/build-priority-scope.json');
+  });
+
   it('the built-in floor and the shipped file hold the guard hooks and the lane lease (PR #6381 red team)', () => {
     for (const p of ['scripts/guard-*', 'scripts/lib/lane-lease.mjs', '.claude/settings.json']) expect(GUARD_FLOOR).toContain(p);
     const shipped = resolveAuditSettings({ platform: null, env: {}, log: () => {} });
