@@ -178,6 +178,7 @@ describe('merge-queue same-head failure admission', () => {
         const start = source.indexOf('  function enqueueWithSameHeadGuard(');
         const end = source.indexOf('  // xym8nt4 — post-approval', start);
         const wiring = { ...dependencies, assertCapability, DRY_RUN: false, mqSameHeadRefreshStore: f.store,
+          mqFixerRoutes: { start() {}, settle: async () => {} },
           execFileSyncThrottled: exec, createMqLiveReader: (reader = exec) => queueSafety.createMqLiveReader(reader),
           readCompletePrComments, readPinnedChangedFiles,
           readDrainQueueSafety: () => ({ value: { waitForRedTeamBeforeEnqueue: true } }),
