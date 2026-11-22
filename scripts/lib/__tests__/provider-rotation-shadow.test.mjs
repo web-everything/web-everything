@@ -1,5 +1,5 @@
 import { describe, it, expect, afterEach } from 'vitest';
-import { readFileSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, readFileSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { appendScorecard } from '../../conveyor/run-scorecard-store.mjs';
@@ -36,6 +36,51 @@ function observation(input, options = {}) {
 }
 
 describe('provider rotation shadow', () => {
+  it('invokes the observer only after releasing the real store lock', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'rotation-shadow-lock-')); dirs.push(dir);
+    const path = join(dir, 'run-scorecards.json');
+    writeFileSync(path, JSON.stringify({ version: 1, records: [] }));
+    let lockHeldDuringRead;
+    const observations = [];
+    const stored = appendScorecard(row(), { path, requireLock: true,
+      read: target => {
+        lockHeldDuringRead = existsSync(`${path}.lock`);
+        return readFileSync(target, 'utf8');
+      },
+      rotationShadow: { policy, capacity, append: () => {
+        observations.push({ locked: existsSync(`${path}.lock`), store: JSON.parse(readFileSync(path, 'utf8')) });
+      } } });
+    expect(lockHeldDuringRead).toBe(true);
+    expect(observations).toEqual([{ locked: false, store: { version: 1, records: [stored] } }]);
+    expect(existsSync(`${path}.lock`)).toBe(false);
+  });
+
+  it.each(['slow', 'throwing'])('%s observer leaves the write durable, lock released and stamped return/bytes unchanged', behavior => {
+    const dir = mkdtempSync(join(tmpdir(), 'rotation-shadow-durable-')); dirs.push(dir);
+    const path = join(dir, 'run-scorecards.json'), baselinePath = join(dir, 'shadow-off.json');
+    const input = row(), before = structuredClone(input);
+    const expected = appendScorecard(input, { path: baselinePath, requireLock: true,
+      rotationShadow: { policy: { ...policy, mode: 'off' } } });
+    const expectedBytes = readFileSync(baselinePath, 'utf8');
+    const observations = [];
+    const stored = appendScorecard(input, { path, requireLock: true,
+      rotationShadow: { policy, capacity, append: () => {
+        observations.push({ locked: existsSync(`${path}.lock`), bytes: readFileSync(path, 'utf8') });
+        if (behavior === 'throwing') throw new Error('observer failed');
+        // Block synchronously: persistence and lock release must already have completed.
+        Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 30);
+        observations.push({ locked: existsSync(`${path}.lock`), bytes: readFileSync(path, 'utf8') });
+      } } });
+    expect(observations).toEqual(Array.from({ length: behavior === 'slow' ? 2 : 1 },
+      () => ({ locked: false, bytes: expectedBytes })));
+    expect(stored).toEqual(expected);
+    expect(stored).toMatchObject({ v: 1, outcome: null, scoredAt: input.scoredAt });
+    expect(JSON.parse(readFileSync(path, 'utf8')).records).toEqual([stored]);
+    expect(readFileSync(path, 'utf8')).toBe(expectedBytes);
+    expect(existsSync(`${path}.lock`)).toBe(false);
+    expect(input).toEqual(before);
+  });
+
   it.each(['review-seat', 'review-seat:', 'review', 'review-pr'])('missing lens on %s records a refusal with ok false (audit 4)', kind => {
     expect(observation(row(kind))).toMatchObject({ shadowPick: null, refusal: 'unknown-lens', crossVendor: { ok: false } });
   });
