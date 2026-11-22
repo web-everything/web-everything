@@ -5,6 +5,7 @@
  * the red team. No real process, model, git or GitHub call: every effect is a fake.
  */
 import { describe, it, expect } from 'vitest';
+import { buildDelegationMarker } from '../../lib/delegation-marker.mjs';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -22,7 +23,7 @@ const HEAD_2 = 'f'.repeat(40);
 const NOW = Date.parse('2026-10-10T14:03:00Z');
 
 const read = (rev) => ({
-  title: 'fix the thing', body: 'Claims: adds a guard.', diffText: 'diff --git a/x.mjs b/x.mjs\n+export const f = (n) => 10 / n;\n',
+  title: 'fix the thing', body: 'Claims: adds a guard.\n' + buildDelegationMarker({ provider: 'claude', model: 'claude-sonnet-5-5', taskType: 'bugfix' }), diffText: 'diff --git a/x.mjs b/x.mjs\n+export const f = (n) => 10 / n;\n',
   netChangedFiles: ['x.mjs'], netBasis: { base: 'b'.repeat(40), rev },
 });
 const ACCEPTS = { correctness: 'accept', security: 'accept', simplicity: 'accept' };
@@ -133,6 +134,7 @@ describe('runRedTeam — the pass itself honours the advisory accept and stays o
       newId: (() => { let n = 0; return () => `call-${++n}`; })(),
       log: () => {},
       readRecords: () => records,
+      readBuilderRecords: () => [],
       reserveCalls: () => { calls.push(['reserve']); return { callIds: [], ledger: null }; },
       append: () => {},
       cliAvailable: () => true,

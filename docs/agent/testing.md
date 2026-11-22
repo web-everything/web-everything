@@ -1143,9 +1143,16 @@ fallbacks and observed model identities. Unknown builder or unavailable independ
 the review with an operator-visible WAIT. Gemini builders use Claude or Codex correctness.
 Other lenses may use any vendor. The human gate remains unchanged.
 
-Watch-only Carbon shadows, the agy advisory reviewer and post-accept advisory snapshots use the
-existing deterministic PR hash sampler at a default rate of 0.1. Post-accept loop/rating evidence
+Watch-only Carbon shadows, the agy advisory reviewer and enabled post-accept advisory snapshots use the
+existing deterministic PR hash sampler at a default rate of 0.1. The repository post-accept observer
+remains off after shadow retirement. Post-accept loop/rating evidence
 continues recording so later outcomes can be joined to sampled snapshots. Settings log provenance.
+
+Historical review fixtures must pin promotion state and a consistent builder provider/model pair.
+Inject builder-ledger reads and seat-ledger writes instead of using host state. Provider failure tests
+need a sampled-in PR identity; sampling tests cover sampled-out and invalid inputs separately and
+assert explicit not-launched telemetry. Explicit tool-free provider pins still refuse tool-bearing
+requests before independence routing; automatically selected independent fallbacks retain their own tools policy.
 
 `scripts/lib/__tests__/review-shadow-model.test.mjs` covers Carbon evidence and failure boundaries;
 `scripts/lib/__tests__/review-seat-independence.test.mjs` covers the builder/seat assignment table,

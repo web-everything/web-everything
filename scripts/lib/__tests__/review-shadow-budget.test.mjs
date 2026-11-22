@@ -15,7 +15,8 @@ const resolve = (options = {}) => resolveReviewSeatSafeguards({
 beforeEach(() => vi.stubEnv('WE_REVIEW_SEAT_CAP_AGY_GEMINI', '5'));
 afterEach(() => vi.unstubAllEnvs());
 describe('high-care shadow admission', () => {
-  const settings = loadReviewSeatSettings({ safeguards: resolve({ env: { WE_REVIEW_SHADOW_AGY_ENABLED: 'true' } }), log: () => {} });
+  const settings = loadReviewSeatSettings({ promoted: { value: false, source: 'fixture' },
+    safeguards: resolve({ env: { WE_REVIEW_SHADOW_AGY_ENABLED: 'true' } }), log: () => {} });
   it.each(['scripts/lib/review-seat-provider.mjs', 'scripts/lib/gate-config.mjs'])('seats an earned high-care PR: %s', (file) => {
     const earnedShape = buildShapePlan({ changedFiles: [file] });
     expect(['elevated', 'high']).toContain(earnedShape.careLevel);

@@ -14,6 +14,7 @@
  */
 
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+import { buildDelegationMarker } from '../../lib/delegation-marker.mjs';
 
 // `importOriginal` keeps `requireAllProperties`/`stripNulls` REAL — `resolveJudgeProvider`'s 'codex' branch
 // imports both from this same module (see `cli-adapter.mjs`'s own import comment on why: NOT from
@@ -446,12 +447,14 @@ describe('createDefaultJudge - a codex-routed request never carries the lane cwd
 });
 
 describe('createDefaultJudge - the REAL review-pr requests route correctly through ONE factory (PR #2117 review: dispatch/`--provider=codex` composed path)', () => {
-  const read = { repo: 'o/r', pr: 1, title: 't', body: '', netChangedFiles: ['a.mjs'], diffText: 'diff' };
+  const read = { repo: 'o/r', pr: 1, title: 't',
+    body: buildDelegationMarker({ provider: 'codex', model: 'gpt-6-astra', taskType: 'bugfix' }),
+    netChangedFiles: ['a.mjs'], diffText: 'diff' };
 
   it('a mandatory (tool-bearing) seat goes to the claude provider WITH its lane cwd and tools; the advisory seat goes to codex with NO tools, NO cwd, NO Claude model', async () => {
     const claudeCalls = [];
-    const claudeStub = async (req) => { claudeCalls.push(req); return { value: {}, costUsd: 0 }; };
-    const judgeFn = createDefaultJudge({ cwd: '/some/lane', provider: claudeStub });
+    const claudeStub = async (req) => { claudeCalls.push(req); return { value: {}, costUsd: 0, servedModel: 'claude-sonnet-5-5' }; };
+    const judgeFn = createDefaultJudge({ cwd: '/some/lane', provider: claudeStub, readBuilderRecords: () => [], appendSeat: () => true });
 
     await judgeFn(buildReviewJudgeRequest({ read, lens: DEFAULT_LENS }));
     expect(claudeCalls).toHaveLength(1);
@@ -472,14 +475,14 @@ describe('createDefaultJudge - the REAL review-pr requests route correctly throu
 
   it('`--provider=codex` for the whole run (factory providerName codex) is refused at the first tool-bearing seat - exactly why review-dispatch refuses it', async () => {
     codexJudgeSpawnCalls.length = 0;
-    const judgeFn = createDefaultJudge({ providerName: 'codex', cwd: '/some/lane' });
+    const judgeFn = createDefaultJudge({ providerName: 'codex', cwd: '/some/lane', readBuilderRecords: () => [], appendSeat: () => true });
     await expect(judgeFn(buildReviewJudgeRequest({ read, lens: DEFAULT_LENS }))).rejects.toThrow(/TOOL-FREE panelist only/);
     expect(codexJudgeSpawnCalls).toHaveLength(0);
   });
 
   it('the opt-in advisory seat still runs on codex under the same whole-run `--provider=codex` factory', async () => {
     codexJudgeSpawnCalls.length = 0;
-    const judgeFn = createDefaultJudge({ providerName: 'codex', cwd: '/some/lane' });
+    const judgeFn = createDefaultJudge({ providerName: 'codex', cwd: '/some/lane', readBuilderRecords: () => [], appendSeat: () => true });
     await expect(judgeFn(buildReviewAdvisoryJudgeRequest({ read }))).resolves.toBeDefined();
     expect(codexJudgeSpawnCalls).toHaveLength(1);
     expect(codexJudgeSpawnCalls[0].cwd).toBeUndefined();
@@ -489,6 +492,23 @@ describe('createDefaultJudge - the REAL review-pr requests route correctly throu
 
 
 // These historical provider-port fixtures explicitly exercise a manually promoted Carbon seat.
+describe('explicit tool-free pins precede independence routing', () => {
+  it.each(['codex', 'antigravity'].flatMap(providerName => ['codex', 'claude', 'unknown'].map(builder => [providerName, builder])))(
+    '%s refuses tools before reading the %s builder or writing the ledger', async (providerName, builder) => {
+      const provider = vi.fn(), readBuilderRecords = vi.fn(), appendSeat = vi.fn();
+      const judge = createDefaultJudge({ providerName, provider, readBuilderRecords, appendSeat });
+      const request = buildReviewJudgeRequest({ lens: DEFAULT_LENS, read: {
+        repo: 'o/r', pr: 1, title: 'fixture', diffText: 'diff', netChangedFiles: ['a.mjs'],
+        body: builder === 'unknown' ? '' : buildDelegationMarker({ provider: builder,
+          model: builder === 'codex' ? 'gpt-6-astra' : 'claude-sonnet-5-5', taskType: 'bugfix' }),
+      } });
+      await expect(judge(request)).rejects.toThrow(/TOOL-FREE panelist only/);
+      expect(provider).not.toHaveBeenCalled();
+      expect(readBuilderRecords).not.toHaveBeenCalled();
+      expect(appendSeat).not.toHaveBeenCalled();
+    });
+});
+
 beforeEach(() => vi.stubEnv('WE_REVIEW_SHADOW_AGY_PROMOTED', 'true'));
 afterEach(() => vi.unstubAllEnvs());
 it('the default Carbon pin and explicit Carbon overrides refuse non-shadow use before promotion', () => {

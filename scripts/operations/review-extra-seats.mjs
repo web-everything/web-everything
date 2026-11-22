@@ -1914,7 +1914,7 @@ export async function speculateRedTeam({
     let builderHeadMessage = '';
     // Vendor independence also applies when builder-based preference is switched off.
     try { builderHeadMessage = io.readHeadMessage(lanePath, rev) ?? ''; } catch { /* unknown builder keeps routing */ }
-    const builder = resolveBuilder({ repo: read.repo, pr: read.pr, head: rev, body: read.body, headMessage: builderHeadMessage });
+    const builder = resolveBuilder({ repo, pr, head: rev, body: read.body, headMessage: builderHeadMessage }, { readRecords: io.readBuilderRecords });
     const codexBuilder = builder.provider === 'codex';
     const preferred = !routeByBuilder ? null : builder.provider === 'codex' ? 'agy-gemini'
       : ['claude', 'agy-claude'].includes(builder.provider) ? 'codex' : null;
@@ -1948,8 +1948,13 @@ export async function speculateRedTeam({
       }
       available.push(p);
     }
-    available = available.filter(p => isIndependentReviewSeat('red-team', p, builder.model !== 'unknown' ? builder.model : builder.provider));
-    if (!available.length) return { status: 'skipped', deferredByCap: true, reason: `WAIT: no cross-vendor red-team provider available (${unavailable.join('; ') || 'builder vendor only or unknown builder'})` };
+    const independent = available.filter(p => isIndependentReviewSeat('red-team', p, builder.model !== 'unknown' ? builder.model : builder.provider));
+    if (available.length && !independent.length) {
+      const reason = `WAIT: no cross-vendor red-team provider available; no available route (${unavailable.join('; ') || 'builder vendor only or unknown builder'})`;
+      io.log(`red team skipped: ${reason}`);
+      return { status: 'skipped', deferredByCap: true, reason };
+    }
+    available = independent;
     let provider = null;
     let callId = null;
     let lastReason = null;
@@ -2176,7 +2181,7 @@ export async function completeRedTeam({ pr, repo, loopPayload, pass, post = true
     const reason = ran ? null : (seatRow.reason || seatRow.error || `red-team seat ${seatRow.status}`);
     const confirmed = findings.filter((f) => f.confirmedByRecheck);
     const foldedVerdict = foldRedTeamVerdict({ ran, findings: confirmed });
-    const builder = resolveBuilder({ repo, pr, head: rev, body: pass.body, headMessage: pass.headMessage ?? '' });
+    const builder = resolveBuilder({ repo, pr, head: rev, body: pass.body, headMessage: pass.headMessage ?? '' }, { readRecords: io.readBuilderRecords });
 
     const row = {
       ...seatRow,

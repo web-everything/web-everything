@@ -1,4 +1,5 @@
 import { describe, it, expect, vi } from 'vitest';
+import { buildDelegationMarker } from '../../lib/delegation-marker.mjs';
 import { createRedTeamIo, priorRedTeamRow, redTeamAlreadyRan, redTeamMarker, runRedTeam, speculateRedTeam } from '../review-extra-seats.mjs';
 import { readStore } from '../../conveyor/run-scorecard-store.mjs';
 import { readCompletePrComments } from '../../conveyor/pr-comments-complete.mjs';
@@ -56,7 +57,8 @@ describe('red-team CLI --resume-only', () => {
 });
 
 const pr = 5762, repo = 'web-everything/web-everything', rev = 'a'.repeat(40);
-const read = { netBasis: { rev }, netChangedFiles: ['scripts/example.mjs'], diffText: '+export const example = true;' };
+const read = { body: buildDelegationMarker({ provider: 'claude', model: 'claude-sonnet-5-5', taskType: 'bugfix' }),
+  netBasis: { rev }, netChangedFiles: ['scripts/example.mjs'], diffText: '+export const example = true;' };
 const loopPayload = { verdict: { verdict: 'accept' }, findings: { read } };
 const prior = { dispatchKind: 'review-seat', seat: 'red-team', status: 'ok', pr, repo, rev,
   callId: 'stored-call', provider: 'codex', model: 'm', findings: [], foldedVerdict: 'accept' };

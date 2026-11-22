@@ -961,7 +961,13 @@ export function createDefaultJudge({
   const routedJudge = async (request, opts = null) => {
     // #4815 — a request that already carries its own answer (`skipSpawn.answer`) spawns nothing: the step declared a judge turn
     // whose work turned out to be empty (no claim to verify) or impossible (no readable diff), and says what to record instead.
-    if (request?.skipSpawn && typeof request.skipSpawn === 'object' && request.skipSpawn.answer != null) return judgeOutcome(request.skipSpawn.answer);
+    if (request?.skipSpawn && typeof request.skipSpawn === 'object' && request.skipSpawn.answer != null) return judgeOutcome(request.skipSpawn.answer, request.skipSpawn.telemetry);
+    // Explicit tool-free provider pins keep their refusal contract before seat routing can
+    // replace the provider or strip tools. Automatically selected fallbacks remain tool-free.
+    const explicitProvider = request?.providerName ?? factoryProviderName;
+    if (!request?.seatProvider && TOOL_FREE_JUDGE_PROVIDER_NAMES.includes(explicitProvider) && request?.allowedTools?.length) {
+      throw new Error(`operations: ${explicitProvider} provider is seated as a TOOL-FREE panelist only; refusing a TOOL-BEARING judge request`);
+    }
     const laneCwd = opts?.cwd || factoryCwd;
     let builder;
     if (request.reviewContext) {

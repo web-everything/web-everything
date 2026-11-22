@@ -1,6 +1,7 @@
 import { CONFIRMED_BREAKS_DEFAULTS, parseRedTeamComment, planRedTeamActions } from '../../lib/red-team-gate.mjs';
 import { FINDING_CLASSES } from '../../lib/finding-class-policy.mjs';
 import { readRoutingPolicy } from '../../lib/dispatch-routing-policy-io.mjs';
+import { buildDelegationMarker } from '../../lib/delegation-marker.mjs';
 /**
  * #4194 — ADDED NON-CLAUDE REVIEW SEATS: advisory lenses + one extra juror routed to Codex/Gemini through the
  * direct-task scripts, BESIDE Claude's mandatory seats. No real codex/agy/git/GitHub process: every effect is a fake.
@@ -41,7 +42,7 @@ const REPO = 'web-everything/web-everything';
 const NOW = Date.parse('2026-09-26T15:00:00Z');
 
 const CARBON_PROMOTION_CASES = [
-  { name: 'unpromoted (default)', env: { [PROVIDER_CAP_ENV['agy-gemini']]: '5' }, promoted: false, seatCount: 2 },
+  { name: 'unpromoted (default)', env: { WE_REVIEW_SHADOW_AGY_PROMOTED: 'false', [PROVIDER_CAP_ENV['agy-gemini']]: '5' }, promoted: false, seatCount: 2 },
   { name: 'manually promoted with a positive cap', env: { WE_REVIEW_SHADOW_AGY_PROMOTED: 'true', [PROVIDER_CAP_ENV['agy-gemini']]: '5' }, promoted: true, seatCount: 3 },
 ];
 
@@ -50,7 +51,7 @@ const LOOP_PAYLOAD = {
   runId: 'review-pr-1', stopped: 'complete', verdict: { verdict: 'changes' },
   findings: {
     read: {
-      title: 'fix the thing', body: 'Claims: adds a guard.', diffText: 'diff --git a/x b/x\n+1\n',
+      title: 'fix the thing', body: 'Claims: adds a guard.\n' + buildDelegationMarker({ provider: 'claude', model: 'claude-sonnet-5-5', taskType: 'bugfix' }), diffText: 'diff --git a/x b/x\n+1\n',
       netChangedFiles: ['scripts/lib/ai-pr-authorship.mjs'], netBasis: { base: 'b'.repeat(40), rev: 'a'.repeat(40) },
     },
     judge: { findings: [CLAUDE_FINDING] },
@@ -62,8 +63,8 @@ const answer = (lenses) => `I reviewed it.\n\n\`\`\`json\n${JSON.stringify({ len
 const VALID_SEAT_FINDING = { summary: 'Real finding', category: 'failing-input', impactIfUnfixed: 'broken', file: null, line: null, failure_scenario: 'A concrete failure.' };
 
 describe('red-team reservation routing under operator overrides', () => {
-  const run = (io, env) => speculateRedTeam({ pr: 5, repo: REPO, lanePath: 'lane',
-    read: LOOP_PAYLOAD.findings.read, env, post: false, record: false }, io);
+  const run = (io, env, read = LOOP_PAYLOAD.findings.read) => speculateRedTeam({ pr: 5, repo: REPO, lanePath: 'lane',
+    read, env, post: false, record: false }, io);
   const policyFor = (fallback = []) => {
     const policy = structuredClone(readRoutingPolicy());
     policy.operations['review-seat:red-team'] = { provider: 'codex', model: 'sol', fallback };
@@ -133,7 +134,10 @@ describe('red-team reservation routing under operator overrides', () => {
     });
     const reserve = io.reserveCalls;
     io.reserveCalls = o => o.provider === 'codex' ? { used: 5000, callIds: [] } : reserve(o);
-    expect((await run(io, { ...caps, WE_REVIEW_SEAT_CAP_AGY_CLAUDE: '300' })).status).toBe('speculated');
+    // Both the primary and fallback must be independent of this Google builder.
+    const read = { ...LOOP_PAYLOAD.findings.read,
+      body: buildDelegationMarker({ provider: 'agy-gemini', model: 'gemini-4-carbon-high', taskType: 'bugfix' }) };
+    expect((await run(io, { ...caps, WE_REVIEW_SEAT_CAP_AGY_CLAUDE: '300' }, read)).status).toBe('speculated');
     expect(calls.find(c => c[0] === 'seat')[1].provider).toBe('agy-claude');
   });
   it('never reserves a routing-disabled provider even with a positive environment cap', async () => {
@@ -160,6 +164,7 @@ function fakeSeatIo(over = {}, ledgerBox = {}) {
     newId: (() => { let n = 0; return () => `call-${++n}`; })(),
     log: (l) => calls.push(['log', l]),
     readRecords: () => [],
+    readBuilderRecords: () => [],
     reserveCalls: ({ provider, want, dailyCap, now }) => {
       const r = reserveSeatCalls({ ledger: ledgerBox[provider] ?? null, records: io.readRecords(), want, dailyCap, now, newId: io.newId, provider });
       ledgerBox[provider] = r.ledger;
