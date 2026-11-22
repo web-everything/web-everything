@@ -128,14 +128,21 @@ export function readNetFileSets({ dir, rows, git, remote = 'origin', base = 'mai
   if (readOnly) {
     for (const name of bases) {
       let tip = null;
-      try { tip = String(git(dir, ['ls-remote', '--exit-code', '--end-of-options', remote, `refs/heads/${name}`])).split(/\s/)[0]; } catch { /* use the local ref */ }
+      // `ls-remote` matches its pattern as a TAIL, so `refs/heads/main` also lists `refs/heads/refs/heads/main`: only the exact ref counts.
+      try {
+        const lines = String(git(dir, ['ls-remote', '--exit-code', '--end-of-options', remote, `refs/heads/${name}`])).split(/\r?\n/);
+        const exact = lines.map((line) => line.split('\t')).filter(([, ref]) => ref === `refs/heads/${name}`);
+        if (exact.length === 1) tip = exact[0][0];
+      } catch { /* use the local ref */ }
       if (tip && SHA.test(tip)) { against.set(name, tip); if (!present(tip)) wants.push(tip); } else against.set(name, `${remote}/${name}`);
     }
   } else for (const name of bases) against.set(name, `${remote}/${name}`);
   const wanted = [...(readOnly ? wants : bases.map((name) => `+refs/heads/${name}:refs/remotes/${remote}/${name}`)), ...missing.map((row) => `refs/pull/${row.number}/head`)];
   // A fetch with no refspec would apply the remote's default one and move refs, so a read-only run with nothing to fetch skips it.
   if (wanted.length) {
-    try { git(dir, ['fetch', '--quiet', '--no-write-fetch-head', '--end-of-options', remote, ...wanted]); }
+    // Read-only: no auto-gc or maintenance and no submodule recursion, so the fetch touches nothing but the quarantine.
+    const prefix = readOnly ? ['-c', 'gc.auto=0', '-c', 'maintenance.auto=false'] : [];
+    try { git(dir, [...prefix, 'fetch', '--quiet', '--no-write-fetch-head', ...(readOnly ? ['--no-recurse-submodules'] : []), '--end-of-options', remote, ...wanted]); }
     catch { /* offline or a head gone: diff whatever is present; the rest falls back below */ }
   }
   for (const row of valid) {
@@ -146,7 +153,10 @@ export function readNetFileSets({ dir, rows, git, remote = 'origin', base = 'mai
       const raw = String(git(dir, ['diff', '--no-ext-diff', '--no-renames', '--name-status', '-z', '--end-of-options', mergeBase, row.headRefOid]));
       const tokens = raw.split('\0').filter(Boolean);
       const files = [], added = [];
-      for (let i = 0; i + 1 < tokens.length; i += 2) {
+      // A truncated or corrupt `-z` stream must never become a shorter file set: an odd token count or an unknown status is unreadable.
+      if (tokens.length % 2 !== 0) throw new Error('git diff output is incomplete (odd token count)');
+      for (let i = 0; i < tokens.length; i += 2) {
+        if (!/^[ADMTUXB]$/.test(tokens[i])) throw new Error(`git diff output has an unknown status "${String(tokens[i]).slice(0, 8)}"`);
         files.push(tokens[i + 1]);
         if (tokens[i] === 'A') added.push(tokens[i + 1]);
       }

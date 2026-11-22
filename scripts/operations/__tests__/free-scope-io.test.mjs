@@ -3,14 +3,14 @@
  * @description Filesystem and CLI probes with a private registry and executable fake gh. No real host
  * or home state is read or written; fixtures exercise the same subprocess and YAML boundaries as production.
  */
-import { beforeEach, afterEach, it, expect } from 'vitest';
+import { beforeEach, afterEach, describe, it, expect } from 'vitest';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { execFileSync } from 'node:child_process';
 import { lockIdFor } from '../../readiness/file-locks.mjs';
 import { withPathLock } from '../../readiness/with-lock.mjs';
-import { defaultRegistryPath, readRegistry, writeRegistry, updateRegistry, ghExec, readOpenPrs, findCardFile, readCardScope, collectFreeScope } from '../free-scope-io.mjs';
+import { defaultRegistryPath, readRegistry, writeRegistry, updateRegistry, ghExec, readOpenPrs, readNetFileSets, findCardFile, readCardScope, collectFreeScope } from '../free-scope-io.mjs';
 import { main } from '../free-scope-cli.mjs';
 let root, registry, env;
 const now = () => Date.parse('2026-10-05T10:00:00Z');
@@ -223,4 +223,49 @@ it('keeps which PR files are newly ADDED, so a new backlog card is never read as
   const [p] = readOpenPrs({ repos: ['fixture/repo'], exec }).prs;
   expect(p.files).toEqual(['backlog/x1-new.md', 'backlog/x2-old.md']);
   expect(p.added).toEqual(['backlog/x1-new.md']);
+});
+
+// Fail closed on partial git evidence (PR 7256 round 4): a shortened or mis-sourced answer must be unreadable, never a smaller set.
+describe('readNetFileSets rejects partial or mis-sourced git evidence', () => {
+  const SHA_A = 'a'.repeat(40), SHA_B = 'b'.repeat(40), SHA_C = 'c'.repeat(40);
+  const rows = [{ number: 1, headRefOid: SHA_A, baseRefName: 'main' }];
+  const fakeGit = ({ diff = 'M\0a.mjs\0', lsRemote = `${SHA_B}\trefs/heads/main\n`, calls = [], absent = [] } = {}) => (dir, args) => {
+    calls.push(args);
+    const cmd = args.find((a) => ['cat-file', 'ls-remote', 'fetch', 'merge-base', 'diff'].includes(a));
+    if (cmd === 'cat-file') { if (absent.some((sha) => args.join(' ').includes(sha))) throw new Error('missing object'); return ''; }
+    if (cmd === 'ls-remote') return lsRemote;
+    if (cmd === 'merge-base') return `${SHA_C}\n`;
+    if (cmd === 'diff') return diff;
+    return '';
+  };
+  it.each([['odd token count', 'M\0a.mjs\0M'], ['dangling status', 'M\0a.mjs\0A'], ['unknown status', 'Z\0a.mjs\0'], ['status as a path', 'a.mjs\0M\0']])
+  ('treats a corrupt git diff stream as unreadable: %s', (_name, diff) => {
+    expect(readNetFileSets({ dir: '/x', rows, git: fakeGit({ diff }), perRowBase: true, readOnly: true }).get(1)).toMatchObject({ ok: false });
+  });
+  it('reads a well-formed stream completely', () => {
+    expect(readNetFileSets({ dir: '/x', rows, git: fakeGit({ diff: 'M\0a.mjs\0A\0b.mjs\0' }), perRowBase: true, readOnly: true }).get(1))
+      .toEqual({ ok: true, files: ['a.mjs', 'b.mjs'], added: ['b.mjs'] });
+  });
+  it('takes the base tip only from the exact ref, never from a branch whose name merely ends with it', () => {
+    const calls = [];
+    const lsRemote = `${SHA_A}\trefs/heads/refs/heads/main\n${SHA_B}\trefs/heads/main\n`;
+    readNetFileSets({ dir: '/x', rows, git: fakeGit({ lsRemote, calls }), perRowBase: true, readOnly: true });
+    expect(calls.find((a) => a.includes('merge-base'))).toContain(SHA_B);
+    const spoof = [];
+    readNetFileSets({ dir: '/x', rows, git: fakeGit({ lsRemote: `${'d'.repeat(40)}\trefs/heads/refs/heads/main\n`, calls: spoof }), perRowBase: true, readOnly: true });
+    // No exact ref: fall back to the local remote-tracking ref (older, so only wider), never the spoofed tip.
+    expect(spoof.find((a) => a.includes('merge-base'))).toContain('origin/main');
+    expect(spoof.find((a) => a.includes('merge-base'))).not.toContain('d'.repeat(40));
+  });
+  it('keeps a read-only fetch from running gc, maintenance or submodule recursion, and never fetches with no refspec', () => {
+    const calls = [];
+    readNetFileSets({ dir: '/x', rows, git: fakeGit({ calls, absent: [SHA_B] }), perRowBase: true, readOnly: true });
+    const fetch = calls.find((a) => a.includes('fetch'));
+    expect(fetch).toEqual(expect.arrayContaining(['gc.auto=0', 'maintenance.auto=false', '--no-recurse-submodules', SHA_B]));
+    // Nothing to fetch (the base tip and the head are already present): no fetch at all, since a bare `git fetch` moves refs.
+    const quiet = [];
+    readNetFileSets({ dir: '/x', rows: [{ number: 1, headRefOid: SHA_A, baseRefName: 'main' }], perRowBase: true, readOnly: true,
+      git: (d, a) => { quiet.push(a); return a.includes('merge-base') ? `${SHA_C}\n` : a.includes('ls-remote') ? `${SHA_B}\trefs/heads/main\n` : ''; } });
+    expect(quiet.some((a) => a.includes('fetch'))).toBe(false);
+  });
 });
