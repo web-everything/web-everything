@@ -129,10 +129,14 @@ describe('read-only live reconciliation', () => {
     expect(runReconcilePass({ ...options(), readOnly: true })).not.toHaveProperty('owedFixRecovery');
     expect(probe.writes).toEqual([]);
   });
-  it('the planner-input registry is bounded; an evicted or foreign token resolves to null', () => {
+  it('the planner-input registry is bounded per repo; an evicted or foreign token resolves to null', () => {
     const first = rememberOwedFixRecoveryInput({ repo: 'we', marker: 'first' });
     expect(owedFixRecoveryInput({ owedFixRecovery: first })).toMatchObject({ marker: 'first' });
-    for (let i = 0; i < 16; i++) rememberOwedFixRecoveryInput({ repo: 'we', marker: i });
+    // Other repos' passes (and this repo's 4 bounded re-plans) between its fix and CI-heal phases never evict it.
+    for (let i = 0; i < 40; i++) rememberOwedFixRecoveryInput({ repo: i % 2 ? 'frontierui' : 'plateau-app', marker: i });
+    for (let i = 0; i < 4; i++) rememberOwedFixRecoveryInput({ repo: 'we', marker: `reread-${i}` });
+    expect(owedFixRecoveryInput({ owedFixRecovery: first })).toMatchObject({ marker: 'first' });
+    for (let i = 0; i < 8; i++) rememberOwedFixRecoveryInput({ repo: 'we', marker: i });
     expect(owedFixRecoveryInput({ owedFixRecovery: first })).toBeNull();
     expect(owedFixRecoveryInput({ owedFixRecovery: { v: 1, token: 'other-host:1' } })).toBeNull();
     expect(owedFixRecoveryInput({})).toBeNull();

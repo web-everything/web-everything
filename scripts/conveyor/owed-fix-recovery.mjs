@@ -128,11 +128,13 @@ export function createOwedFixRecoveryLedger({ transact = recoveryTransaction, lo
 }
 
 /** A consumer's effective recovery IO: an explicit value (`null` = off) wins; omitted means on with the default
- *  live IO, except under a test runner, where that IO would touch live claim, GitHub and coordination state. */
-export function resolveOwedFixRecoveryIo(value, underTest) {
+ *  live IO, except under a test runner or inside the daemon live smoke's stubbed-dispatch child (it always sets
+ *  `WE_SMOKE_DRYRUN_ONLY`, see we:scripts/lib/daemon-live-smoke.mjs#checkDispatchDryRun): there that IO would
+ *  write real recovery state and release real claims for launches that never happen. */
+export function resolveOwedFixRecoveryIo(value, underTest, env = process.env) {
   if (value === null) return null;
   if (value !== undefined) return value;
-  return underTest ? null : {};
+  return underTest || env?.WE_SMOKE_DRYRUN_ONLY !== undefined ? null : {};
 }
 
 /**
@@ -212,7 +214,12 @@ export function recoverOwedFixes(input, {
     if (!planned || !live || [...planned, ...live].some(name => typeof name !== 'string')
       || JSON.stringify(planned) !== JSON.stringify(live)) throw new Error('PR labels changed since plan; refresh PR evidence');
   };
-  for (const row of eligible.dispatch.filter(owned)) {
+  // Act only on PRs the consumer's own plan still offers (an owned row) or withholds for a fixer claim. A caller
+  // that narrowed the plan (one PR, or the pass cache's stale/touched filter) must never get rows back from the
+  // wider planner input.
+  const offered = new Set([...(base ? out.dispatch.filter(owned) : eligible.dispatch.filter(owned)).map(row => row.prNumber),
+    ...out.refusals.filter(refusal => refusal.kind === 'fix-claimed').map(refusal => refusal.prNumber)]);
+  for (const row of eligible.dispatch.filter(row => owned(row) && offered.has(row.prNumber))) {
     const pr = input.prs.find(pr => pr.number === row.prNumber);
     const identity = { repo: input.repo, pr: row.prNumber };
     const head = row.headRefOid;

@@ -3220,12 +3220,33 @@ describe('owed fix recovery through the production dispatch consumers', () => {
     expect(w.states.size).toBe(0);
   });
 
-  it('recovery is on by default in production, off under a test runner unless injected, and null always disables', async () => {
+  it('recovery is on by default in production, off under a test runner or the live smoke unless injected, and null always disables', async () => {
     const { resolveOwedFixRecoveryIo } = await import('../owed-fix-recovery.mjs');
-    expect(resolveOwedFixRecoveryIo(undefined, false)).toEqual({});
-    expect(resolveOwedFixRecoveryIo(undefined, true)).toBeNull();
-    expect(resolveOwedFixRecoveryIo(null, false)).toBeNull();
+    expect(resolveOwedFixRecoveryIo(undefined, false, {})).toEqual({});
+    expect(resolveOwedFixRecoveryIo(undefined, true, {})).toBeNull();
+    // The live smoke's stubbed-dispatch child always sets WE_SMOKE_DRYRUN_ONLY (possibly empty).
+    expect(resolveOwedFixRecoveryIo(undefined, false, { WE_SMOKE_DRYRUN_ONLY: '' })).toBeNull();
+    expect(resolveOwedFixRecoveryIo(null, false, {})).toBeNull();
     const io = { readLive: () => null };
-    expect(resolveOwedFixRecoveryIo(io, true)).toBe(io);
+    expect(resolveOwedFixRecoveryIo(io, true, {})).toBe(io);
+  });
+
+  it('a caller that narrowed the plan never gets rows or claim releases back from the wider planner input', () => {
+    const w = world({ claimed: true });
+    const dispatch = vi.fn(launchResult);
+    // e.g. orphan-fix-round keeps one PR, or the pass cache dropped a stale PR: no fix-claimed row for #7400 here.
+    runFix(w, start, { dispatch, reconcile: () => ({ ...w.planAt(start), dispatch: [], refusals: [] }) });
+    expect(dispatch).not.toHaveBeenCalled();
+    expect(w.effects.release).not.toHaveBeenCalled();
+    expect(w.io.readLive).not.toHaveBeenCalled();
+  });
+
+  it('a conflict resume probe that throws started nothing and gives the allowance back', () => {
+    const w = world();
+    w.row.isConflict = true;
+    const tryResume = vi.fn(() => { throw new Error('agent listing lag'); });
+    runFix(w, start, { tryResume });
+    expect(tryResume).toHaveBeenCalled();
+    expect([...w.states.values()]).toEqual([{}]);
   });
 });

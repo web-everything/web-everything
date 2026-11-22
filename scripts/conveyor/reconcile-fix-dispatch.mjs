@@ -2378,6 +2378,8 @@ function runReconcileFixDispatchPass({
       try {
         attempt = fixStep('resume', () => tryResume(entry, { root, repo: repoKey }), entry.pr);
       } catch (e) {
+        // The resume probe reads before it resumes anything (see above): a throw here started nothing.
+        owedFixLedger?.notLaunched(entry.pr);
         refusals.push({ pr: entry.pr, kind: 'dispatch-failed', why: describeDispatchFailure(e) });
         continue;
       }
