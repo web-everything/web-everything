@@ -344,10 +344,15 @@ test('malformed names, unexpected entries and unreadable per-key JSON fail close
   assert.throws(() => renderMarkdown(f.build()), /settings-registry-metadata\.d\/settings\/broken.json/);
 });
 
-test('generated documentation preserves original bytes except the per-key instruction and drain policy description', () => {
+test('generated documentation preserves original bytes except the per-key instruction and removed drain retry policy', () => {
   const doc = readFileSync(join(ROOT, 'docs/agent/settings-registry.md'), 'utf8');
   const originalInstruction = 'For repo defaults, edit the owner file through a PR and rebuild the consuming daemon. Add or update metadata in scripts/lib/settings-registry-metadata.json, then run `node scripts/lib/settings-registry.mjs --write`. Verify with `node scripts/lib/settings-registry.mjs --check`. Missing declarations or invalid evidence block generation; repair the named file before regenerating.';
   const original = doc.replace(/^For repo defaults,.*$/m, originalInstruction)
+    // Restore only the two inventory effects of deleting drain-mq-retry.json;
+    // keep the historical digest pinned so every other byte remains guarded.
+    .replace('- Declared leaves: 615 (platform copies counted separately).', '- Declared leaves: 618 (platform copies counted separately).')
+    .replace('| drain | scripts/settings/drain-async-shadow.json, scripts/settings/drain-card-group.json | 4 |',
+      '| drain | scripts/settings/drain-async-shadow.json, scripts/settings/drain-card-group.json, scripts/settings/drain-mq-retry.json | 7 |')
     .replace('Merge drain grouping and asynchronous facts shadow policy.', originalMetadata.settings.drain.description);
   assert.equal(createHash('sha256').update(original).digest('hex'), '239663dfb7c702b1f8cf475f1b8659d16fea92c2deaa92c027f3a67f5106cc8d');
   execFileSync(process.execPath, [join(ROOT, 'scripts/lib/settings-registry.mjs'), '--check']);
