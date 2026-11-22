@@ -58,6 +58,16 @@ const codeql = [{ name: 'CodeQL', status: 'COMPLETED', conclusion: 'FAILURE', co
 const manifestBody = `${MANIFEST_BODY_BEGIN}\n${JSON.stringify({ item: '123', blockedBy: ['9'], dismissedFindings: 2 })}\n${MANIFEST_BODY_END}`;
 
 describe('red-team check run merge gate', () => {
+  it('a refreshed PR cannot merge with a non-green merge group', () => {
+    const membership = { nums: [7, 8], complete: true, reasons: [], heads: { 7: HEAD, 8: HEAD } };
+    const member = (num, green) => evaluatePrGates(facts({ num, pr: { number: num,
+      statusCheckRollup: green ? [] : codeql }, duplicateIds: { main: [], group: [] } }), { mergeEvent: 'merge_group' });
+    const first = member(7, true), failing = member(8, false);
+    expect(first.ok).toBe(true);
+    expect(failing.ok).toBe(false);
+    expect(evaluateGroup([first, failing], membership)).toMatchObject({ ok: false, reason: 'held: #8' });
+    expect(evaluateGroup([first, member(8, true)], membership).ok).toBe(true);
+  });
   it('merge-group members sharing a head require their own PR-bound red-team check', () => {
     const gh = () => JSON.stringify({ total_count: 1, check_runs: [{ id: 1, name: 'red-team', head_sha: HEAD,
       external_id: 'o/r#7', app: { id: 5037855 }, status: 'completed', conclusion: 'success' }] });
