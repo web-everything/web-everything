@@ -19,7 +19,7 @@ Vitest's thread pool cannot chdir. Run it sequentially within each test file.
 The gh/git function ports also generate the executable shims for the two `*.real.test.mjs` smokes.
 Those files are explicitly excluded from the PR unit config. There is currently no filename-based
 scheduled real-process config discovery; scheduled-runner enrollment remains separate.
-> Authors: APPEND new sections at the END of this file, never right after the title (`.gitattributes` union-merges it, but appending avoids overlapping insertions).
+> Authors: add new testing notes in their own file under [testing/](testing/README.md). This file keeps existing sections only; do not append new notes here.
 
 ## Review PR transport isolation (R37)
 
@@ -6311,7 +6311,7 @@ It never infers clearance authority from a saved review or a newly read head.
 `scripts/operations/__tests__/record-verdict.test.mjs` covers request validation;
 `scripts/operations/__tests__/record-verdict-cli.test.mjs` drives both CLI adapters through
 staging the JSON request. The applier carries that pin to `review-set-label` as `--expect-head`.
-## Live-owner review adapter collection
+## Per-topic notes
 
 `pr-live-owner-watch.test.mjs` imports the manual dispatcher, review job and reconcile
 graph statically during collection. The first `review-dispatch` case otherwise loads
@@ -6355,3 +6355,4 @@ shards exactly as the default would, so it is still recognized as the default ga
 Gate ceilings get one capped retry tied to lane, head and killed job. Detached jobs settle in
 `verify-gate-job.mjs`, so recovery must cover that consumer as well as `verify-dispatch.mjs`'s
 in-process sweep. Persist the retry identity in job input to dedupe the enqueue-before-marker crash window.
+- [Testing topic notes and authoring guidance](testing/README.md)
