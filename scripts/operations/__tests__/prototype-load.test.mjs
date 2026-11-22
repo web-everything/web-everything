@@ -3658,3 +3658,28 @@ describe('recorder-to-load same-diff waiver admission', () => {
     } finally { rmSync(dir, { recursive: true, force: true }); }
   });
 });
+
+
+describe('round-2 hotpatch fetch input security', () => {
+  it.each(['x:refs/heads/victim', '--upload-pack=payload', 'a'.repeat(40) + '\n', 'a'.repeat(40) + '-extra'])(
+    'refuses matching malformed hotpatch branch/SHA before any fetch: %j', async sha => {
+      const f = fixture({ hotpatchReaders: hotpatchFixture().readers });
+      expect(await f.run({ branch: `hotpatch/${sha}`, sha })).toMatchObject({
+        ok: false, stopReason: 'no-ready', detail: 'hotpatch-ref-sha-mismatch',
+      });
+      expect(f.calls.filter(c => c.cmd === 'git' && c.args[0] === 'fetch')).toEqual([]);
+      expect(mutations(f, 'add')).toEqual([]);
+    },
+  );
+  it('passes validated hotpatch refs after the fetch option terminator', async () => {
+    const f = fixture({ hotpatchReaders: hotpatchFixture().readers });
+    const branch = `hotpatch/${SHA}`;
+    expect(await f.run({ branch })).toMatchObject({ ok: true });
+    const fetches = f.calls.filter(c => c.cmd === 'git' && c.args[0] === 'fetch' && c.args.includes(branch));
+    expect(fetches.length).toBeGreaterThan(0);
+    for (const { args } of fetches) {
+      expect(args.indexOf('--')).toBeGreaterThan(0);
+      expect(args.indexOf(branch)).toBeGreaterThan(args.indexOf('--'));
+    }
+  });
+});

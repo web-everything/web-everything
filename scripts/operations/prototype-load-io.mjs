@@ -404,6 +404,13 @@ export function createPrototypeLoader({ exec, fs, now, sleep, env, settings, com
       return out.retired.map((r) => r.ref);
     };
     try {
+      const hotpatch = typeof input.branch === 'string' && input.branch.startsWith('hotpatch/');
+      // Validate before any fetch: an unvalidated SHA/branch can be interpreted as a refspec.
+      if (hotpatch && (!/^hotpatch\/[a-f0-9]{40}(?![\s\S])/.test(input.branch)
+        || typeof input.sha !== 'string' || !/^[a-f0-9]{40}(?![\s\S])/.test(input.sha)
+        || input.branch !== `hotpatch/${input.sha}`)) return stop('no-ready', {
+        detail: 'hotpatch-ref-sha-mismatch', fallback: 'The ref suffix must equal --sha exactly: hotpatch/<40-hex sha>.',
+      });
       const resolved = resolveDaemonKey(config.daemons, config.daemonAliases, input.daemon);
       if (!resolved.key) {
         const list = resolved.valid.join(', ');
@@ -491,11 +498,9 @@ export function createPrototypeLoader({ exec, fs, now, sleep, env, settings, com
         out.ok = true; return out;
       }
       if (input.replace !== undefined && input.replace !== '' && (!safeRegistrationRef(input.replace) || input.replace === input.branch)) return stop('bad-input', { detail: 'invalid --replace ref' });
-      const hotpatch = typeof input.branch === 'string' && input.branch.startsWith('hotpatch/');
       if (hotpatch && input.urgent) return stop('no-ready', { detail: 'hotpatch-needs-ci-receipt', fallback: 'A hotpatch ref never loads on an urgent marker: wait for the CI test receipt and the own-sha audit.' });
-      if (hotpatch && input.branch !== `hotpatch/${input.sha}`) return stop('no-ready', { detail: 'hotpatch-ref-sha-mismatch', fallback: 'The ref suffix must equal --sha exactly: hotpatch/<40-hex sha>.' });
       if (hotpatch) {
-        requireGit('fetch', 'origin', input.branch);
+        requireGit('fetch', 'origin', ...(hotpatch ? ['--'] : []), input.branch);
         if (requireGit('rev-parse', `origin/${input.branch}`) !== input.sha) return stop('no-ready', { detail: 'hotpatch-ref-sha-mismatch' });
         const admission = await admitHotpatch(input.sha, hotpatchReaders ?? createHotpatchReaders({ cwd: gitRepo, env: childEnv, exec, files: fs }));
         if (admission.outcome !== 'pass') return stop('no-ready', admission);
@@ -663,11 +668,11 @@ export function createPrototypeLoader({ exec, fs, now, sleep, env, settings, com
       out.gate ||= { source: 'canonical-check-run', record: producedReady };
       stage = 'no-ready';
       readinessStep = 'branch-tip-unreadable';
-      requireGit('fetch', 'origin', input.branch);
+      requireGit('fetch', 'origin', ...(hotpatch ? ['--'] : []), input.branch);
       const tip = requireGit('rev-parse', `origin/${input.branch}`);
       if (tip !== input.sha) return stop('no-ready', { detail: hotpatch ? 'hotpatch-ref-sha-mismatch' : 'sha-not-branch-tip', gate: { ...out.gate, reason: 'sha-not-branch-tip', tip }, fallback: `${input.sha} is not the tip of ${input.branch}: the branch tip is ${tip}. Load the tip (re-run tests and audit if the code changed) or push the branch back to the tested sha.` });
       stage = 'check-unverifiable';
-      requireGit('fetch', 'origin', 'main', input.branch);
+      requireGit('fetch', 'origin', ...(hotpatch ? ['--'] : []), 'main', input.branch);
       const own = changedPaths(requireGit('diff', '--name-status', '-z', `origin/main...${input.sha}`));
       const dispatchFiles = matchDispatchPaths(own, DISPATCH_PATH_DEFAULTS);
       if (dispatchFiles.length) {
@@ -855,7 +860,7 @@ export function createPrototypeLoader({ exec, fs, now, sleep, env, settings, com
       const registeredAt = now();
       stage = 'no-ready';
       readinessStep = 'branch-tip-unreadable';
-      requireGit('fetch', 'origin', out.effectiveRef);
+      requireGit('fetch', 'origin', ...(hotpatch ? ['--'] : []), out.effectiveRef);
       const movedTip = requireGit('rev-parse', `origin/${out.effectiveRef}`);
       if (movedTip !== out.effectiveSha) return stop('no-ready', { detail: 'sha-moved', tip: movedTip, fallback: 'Retest and audit the current branch tip, then retry.' });
       stage = 'register-failed';

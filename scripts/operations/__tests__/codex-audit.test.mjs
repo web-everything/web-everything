@@ -8,6 +8,7 @@ import { fileURLToPath, URL as NodeURL } from 'node:url';
 import { describe, it, expect, vi } from 'vitest';
 import { CANONICAL_QUESTION, EXHAUSTIVE_INSTRUCTION, QUESTION_HASH, main, findAudit, isAcceptedQuestionHash, resolvePriorQuestionHashes, MAX_PRIOR_WINDOW_MS } from '../codex-audit.mjs';
 import { createAuditDeps } from '../codex-audit-io.mjs';
+import { canonicalAuditEvidence } from '../prototype-load.mjs';
 
 // Lets one test swap the text codex-audit.mjs reads for its settings file; every other read passes through.
 const settingsOverride = vi.hoisted(() => ({ text: null }));
@@ -561,4 +562,18 @@ describe('findAudit ordering and clock trust (#7011)', () => {
     expect(find([first, second])).toBe(second);
     expect(find([second, first])).toBe(first);
   });
+});
+
+
+it('round-2: malformed appended findings cannot erase a carried WEAKENED through another passing base', () => {
+  const fingerprint = 'e'.repeat(64);
+  const weak = { base: BASE, head: HEAD, questionHash: QUESTION_HASH, at: AT, verdict: 'WEAKENED', findings: ['guard weakened'], fingerprint };
+  const pass = { ...weak, base: 'c'.repeat(40), verdict: 'NOT WEAKENED', findings: [] };
+  const malformed = { ...weak, findings: 'WEAKENED' };
+  const query = { head: HEAD, base: BASE, questionHash: QUESTION_HASH, priorQuestionHashes: [] };
+  expect(findAudit([weak, malformed], query)).toBe(weak);
+  for (const records of [[weak, pass], [weak, pass, malformed]]) {
+    expect(canonicalAuditEvidence(records, 'd'.repeat(40), () => true, fingerprint, { priorQuestionHashes: [] }))
+      .toMatchObject({ ok: false, reason: 'weakened' });
+  }
 });

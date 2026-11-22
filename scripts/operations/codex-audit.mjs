@@ -82,7 +82,7 @@ export function findAudit(records, { head, base, questionHash, priorQuestionHash
     if (!isAcceptedQuestionHash(record.questionHash, { priorQuestionHashes, now, at: record.at }) || !Number.isFinite(Date.parse(record.at))
       || (record.verdict !== 'NOT WEAKENED' && record.verdict !== 'WEAKENED')) continue;
     if (record.findings !== undefined && (!Array.isArray(record.findings) || record.findings.some(f => typeof f !== 'string'))) {
-      if (isCurrent) latest = null; else prior = null;
+      // Unusable findings cannot supersede an existing negative (including carried evidence).
       continue;
     }
     if (Array.isArray(record.findings) && hasConflictingVerdict(record.verdict, record.findings)) continue;

@@ -1,6 +1,7 @@
 /** Read-only admission decisions. Readers throw on incomplete or unreadable evidence. */
 import { canonicalAuditEvidence, testWorkflowBound, TEST_CHECK_APP_ID } from '../operations/prototype-load.mjs';
 import { resolveCascade } from './policy-cascade.mjs';
+import { findAudit, QUESTION_HASH } from '../operations/codex-audit.mjs';
 const defaults = Object.freeze({ liveWhen: 'after-receipt-and-audit', auditBar: 'no-pr-introduced-security', receiptSource: 'ci-full-suite', parallel: true });
 const result = (outcome, detail) => ({ outcome, detail, ...(outcome === 'pass' ? {} : {
   fallback: 'Wait for complete CI and an own-sha audit; repair or archive evidence exceeding 100 API rows/calls or 2 MiB, or use the normal merge path.',
@@ -54,7 +55,9 @@ export async function auditGuard(sha, readers) {
     if (!Array.isArray(records) || !Array.isArray(rulings)) return unknown();
     // No fingerprint argument: only the requested head can contribute canonical evidence.
     const own = records.filter(r => r?.head?.toLowerCase() === sha);
-    if (own.some(r => !Array.isArray(r.findings) || r.findings.some(f => typeof f !== 'string'))) return unknown();
+    // Judge each record on its own: an older pass must never conceal unusable newer evidence.
+    if (own.some(r => !Array.isArray(r.findings) || r.findings.some(f => typeof f !== 'string')
+      || findAudit([r], { head: r.head, base: r.base, questionHash: QUESTION_HASH, now, priorQuestionHashes }) !== r)) return unknown();
     const evidence = canonicalAuditEvidence(own, sha, base => {
       const covered = readers.covers(base, sha);
       if (typeof covered !== 'boolean') throw new Error('unreadable audit base');

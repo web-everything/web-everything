@@ -210,3 +210,16 @@ describe('round-1 receipt and audit negatives', () => {
     expect((await auditGuard(SHA, readers)).outcome).not.toBe('pass');
   });
 });
+
+
+it.each(['contradictory findings', 'invalid timestamp'])(
+  'round-2: newer unusable WEAKENED on a passing SHA/base yields unknown: %s', async kind => {
+    const { data, readers } = hotpatchFixture();
+    const newer = { ...data.audits[0], verdict: 'WEAKENED', findings: ['guard weakened'] };
+    if (kind === 'contradictory findings') newer.findings = ['NOT WEAKENED'];
+    else newer.at = 'unreadable timestamp';
+    data.audits.push(newer);
+    expect(await auditGuard(SHA, readers)).toMatchObject({ outcome: 'unknown' });
+    expect(await admitHotpatch(SHA, readers)).toMatchObject({ outcome: 'unknown' });
+  },
+);
