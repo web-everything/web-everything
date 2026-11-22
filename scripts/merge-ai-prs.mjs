@@ -5903,12 +5903,15 @@ export async function main(argv, { env = process.env, stdout = process.stdout, e
     // Cross-PR gates need: open item/dependency identities (blockedBy/stackParents), couple refs
     // and carrier health, card-group membership, and complete file sets for overlap/queue ordering.
     // The lean number/head/updatedAt/base/draft/state inventory validates cached facts; only the target
-    // and its dependency/couple/group/overlap component need full live PR/check reads. Commits are target-only.
+    // and its dependency/couple/group/overlap component need full live PR/check reads in target scope.
+    // Full-scope lifecycle reconciliation also needs live CI/mergeability for every PR it can mutate:
+    // check reruns need not change the PR's head or updatedAt. Commits follow the same scope policy.
     // Catch-up shares base facts across children; each reuse revalidates lean membership. Unknown evidence defers.
     const rows = await __t.timeAsync('listing', () => readFastDrainContext({ repos: slugs, targetRepo: localSlug, onlyPr,
       concurrency: resolvedMergePolicy.policy.concurrency.gateReads, failClosed: !!flags['from-catch-up'],
       readInventory: flags['from-catch-up'] && listingSnapshot ? () => readFastDrainPassInventory({ path: listingSnapshot,
         repos: slugs, targetRepo: localSlug, readSnapshot, listLean,
+        log: line => process.stderr.write(`${line}\n`),
         concurrency: resolvedMergePolicy.policy.concurrency.gateReads,
         readMain: async repo => {
           const defaultBranch = await verifyDefaultBranch(repo);
@@ -5921,6 +5924,7 @@ export async function main(argv, { env = process.env, stdout = process.stdout, e
       readSnapshot,
       listLean,
       readFull: (repo, num) => readFullListingPr(repo, num, true),
+      refreshPr: repo => RECONCILE && fastDrain.scope === 'full' && REPOS.some(r => (r || localSlug) === repo),
       readManifests: async entries => {
         // Reuse the normal bounded manifest/commit reader and its identity cache; collectContext
         // then consumes these same reads instead of repeating the legacy-manifest fan-out.

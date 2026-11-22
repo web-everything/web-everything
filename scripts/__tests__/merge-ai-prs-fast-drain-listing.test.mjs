@@ -1,7 +1,11 @@
-import { mkdtempSync, rmSync, writeFileSync, readFileSync, truncateSync } from 'node:fs';
-import { join } from 'node:path';
+import { mkdtempSync, rmSync, writeFileSync, readFileSync, truncateSync, existsSync } from 'node:fs';
+import { join, dirname } from 'node:path';
 import { setImmediate } from 'node:timers/promises';
 import { readFastDrainContext, readFastDrainPassInventory, LEAN_OPEN_PR_FIELDS, readFastDrainFacts } from '../lib/fast-drain-context.mjs';
+import { readSharedOpenPrs, SNAPSHOT_FIELDS } from '../lib/pr-snapshot.mjs';
+import { snapshotPath, PR_SNAPSHOT_VERSION, markPrSnapshotDirty } from '../lib/pr-snapshot-store.mjs';
+import { runEnqueueCandidates } from '../lib/drain-concurrency.mjs';
+import { overlapYieldWaits } from '../conveyor/land-overlap-yield.mjs';
 import { reviewCiGate } from '../lib/review-ci-gate.mjs';
 import fixture from './fixtures/fast-drain-18-prs.json';
 import recorded from './fixtures/fast-drain-18-prs.recorded.json';
@@ -26,7 +30,7 @@ it('tier 1: catch-up without --from-green-event makes zero full-PR pagination ca
 });
 
 process.env.WE_UNDER_TEST = '1';
-const { classifyPr, planLabelDrain, readFreshGateChecks } = await import('../merge-ai-prs.mjs');
+const { readFreshGateChecks, reduceOpenPrContext, prepareDrainVerdicts, planDrainPass, buildOverlapRows, revalidateForMerge } = await import('../merge-ai-prs.mjs');
 const { repo, rows } = fixture;
 const inventory = prs => ({ rows: prs.map(p => Object.fromEntries(LEAN_OPEN_PR_FIELDS.split(',').map(f => [f, p[f]]))),
   totalCount: prs.length, hasNextPage: false, truncated: false });
@@ -36,7 +40,7 @@ function pass(extra = {}) {
   const dir = mkdtempSync(join(process.env.TMPDIR, 'fast-pass-'));
   const options = { path: join(dir, 'round.json'), repos: [repo], targetRepo: repo,
     snapshots: new Map([[repo, rows]]), readMain: async () => head, listLean: async () => inventory(rows),
-    now: () => 1000, ...extra };
+    now: () => 1000, env: {}, ...extra };
   return { options, close: () => rmSync(dir, { recursive: true, force: true }) };
 }
 
@@ -48,28 +52,94 @@ it('three concurrent catch-up drains share one base snapshot and revalidate lean
   try {
     const results = await Promise.all([1, 2, 3].map(() => readFastDrainPassInventory(f.options)));
     expect(pages).toBe(3); // Fresh lean membership for each child; no full-PR pages.
-    expect(snapshotReads).toBe(1);
+    expect(snapshotReads).toBe(4);
     expect(mains).toBe(6); // Each cold waiter also rechecks after acquiring the pass lock.
     expect(results.every(r => r.inventories.get(repo).totalCount === 18)).toBe(true);
   } finally { f.close(); }
 });
 
 for (const invalid of ['main moved', 'TTL expired', 'future', 'corrupt', 'oversized', 'legacy round']) {
-  it(`fails closed on ${invalid}: stale inventory cannot hide a newly opened blocker`, async () => {
+  it(`${invalid} invalidates the pass and publishes new source rows under the lock`, async () => {
     const f = pass();
     try {
       await readFastDrainPassInventory(f.options);
-      const next = { ...f.options, listLean: async () => { throw Error('fresh inventory unreadable'); } };
+      const replacement = rows.map(p => ({ ...p, body: 'replacement source facts' }));
+      let locked = 0;
+      const next = { ...f.options, readSnapshot: () => replacement,
+        lock: async fn => { locked++; return { ok: true, value: await fn(() => true) }; } };
       if (invalid === 'main moved') next.readMain = async () => ({ ...head, sha: 'b'.repeat(40) });
       if (invalid === 'TTL expired') next.now = () => 61_000;
       if (invalid === 'future') next.now = () => 999;
       if (invalid === 'corrupt') writeFileSync(f.options.path, '{');
       if (invalid === 'oversized') truncateSync(f.options.path, 64 * 1024 * 1024 + 1);
       if (invalid === 'legacy round') writeFileSync(f.options.path, JSON.stringify({ repo, writtenAt: 1000, rows, defaultBranch: 'main' }));
-      await expect(readFastDrainPassInventory(next)).rejects.toThrow('fresh inventory unreadable');
+      const result = await readFastDrainPassInventory(next);
+      expect(locked).toBe(1);
+      expect(result.snapshots.get(repo)).toEqual(replacement);
+      expect(JSON.parse(readFileSync(f.options.path, 'utf8')).rows).toEqual(replacement);
     } finally { f.close(); }
   });
 }
+
+for (const fence of ['lost', 'missing']) {
+  it(`a ${fence} ownership fence refuses publication before a reader can observe it`, async () => {
+    let held = true, valueReturned = false;
+    const f = pass({ listLean: async () => { held = false; return inventory(rows); },
+      lock: async fn => { const value = await fn(fence === 'lost' ? () => held : undefined); valueReturned = true; return { ok: false, value, reason: 'lock-lost' }; } });
+    try {
+      await expect(readFastDrainPassInventory(f.options)).rejects.toThrow('lock-lost');
+      expect(valueReturned).toBe(false);
+      expect(existsSync(f.options.path)).toBe(false);
+    } finally { f.close(); }
+  });
+}
+
+for (const ttl of ['2', '120', '0']) {
+  it(`pass reuse honours configured snapshot TTL=${ttl}s, including cache disable`, async () => {
+    let now = 1000, locks = 0;
+    const f = pass({ now: () => now, env: { WE_FAST_DRAIN_LISTING_SNAPSHOT_TTL_SEC: ttl },
+      lock: async fn => { locks++; return { ok: true, value: await fn(() => true) }; } });
+    try {
+      if (ttl === '0') {
+        await expect(readFastDrainPassInventory(f.options)).rejects.toThrow('snapshot disabled');
+        expect(locks).toBe(0);
+        expect(existsSync(f.options.path)).toBe(false);
+      } else {
+        await readFastDrainPassInventory(f.options);
+        now += Number(ttl) * 1000 - 1;
+        await readFastDrainPassInventory(f.options);
+        expect(locks).toBe(1);
+        now++;
+        await readFastDrainPassInventory(f.options);
+        expect(locks).toBe(2);
+      }
+    } finally { f.close(); }
+  });
+}
+
+for (const underLock of [false, true]) {
+  it(`expiry during awaited membership refuses a ${underLock ? 'locked' : 'direct'} hit`, async () => {
+    let now = 1000;
+    const f = pass({ now: () => now });
+    try {
+      await readFastDrainPassInventory(f.options);
+      let reads = 0;
+      const read = path => { if (underLock && ++reads === 1) throw Error('force lock recheck'); return JSON.parse(readFileSync(path, 'utf8')); };
+      await expect(readFastDrainPassInventory({ ...f.options, read,
+        listLean: async () => { now += 70_000; return inventory(rows); },
+      })).rejects.toThrow('expired while reading');
+    } finally { f.close(); }
+  });
+}
+
+it('expiry during cold membership reads refuses publication', async () => {
+  let now = 1000;
+  const f = pass({ now: () => now, listLean: async () => { now += 70_000; return inventory(rows); } });
+  try {
+    await expect(readFastDrainPassInventory(f.options)).rejects.toThrow('expired while reading');
+    expect(existsSync(f.options.path)).toBe(false);
+  } finally { f.close(); }
+});
 
 it('unknown main, incomplete/oversized inventory and lock refusal defer explicitly to the next pass', async () => {
   for (const patch of [
@@ -84,38 +154,61 @@ it('unknown main, incomplete/oversized inventory and lock refusal defer explicit
   }
 });
 
-it('18-PR frozen fixture: full listing and narrowed reads have identical enqueue/skip and blocker decisions', async () => {
-  expect(rows).toHaveLength(18);
-  const decisions = (prs, onlyPr) => {
-    const p = prs.find(p => p.number === onlyPr);
-    const gate = classifyPr(p, { defaultBranch: 'main' });
-    if (gate.decision !== 'merge') return { enqueue: [], skip: [[onlyPr, gate.reason]] };
-    const m = p.manifest;
-    const plan = planLabelDrain([{ num: onlyPr, repo, headSha: p.headRefOid, ...gate,
-      item: m.item, blockedBy: m.blockedBy, stackParents: m.stackParents, hasManifest: true }],
-    { extraOpenItems: prs.map(p => p.manifest.item), contextComplete: true, isWeRepo: () => true });
-    return { enqueue: plan.ready.map(p => p.num), skip: plan.deferred.map(p => [p.num, p.waitOn]) };
-  };
-  const f = pass();
-  try {
-    let reads = 0;
-    const before = [], after = [];
-    for (const target of rows) {
-      const context = await readFastDrainContext({ repos: [repo], targetRepo: repo, onlyPr: target.number,
-        readSnapshot: () => rows, readInventory: () => readFastDrainPassInventory(f.options),
-        listLean: () => { throw Error('unshared listing'); }, failClosed: true,
-        readFull: async (_repo, n) => { reads++; return rows.find(p => p.number === n); },
-        readManifest: async (_repo, p) => p.manifest });
-      before.push(decisions(rows, target.number));
-      after.push(decisions(context.get(repo), target.number));
-    }
-    expect(after).toEqual(before);
-    expect(before.some(p => p.enqueue.length)).toBe(true);
-    expect(before.some(p => p.skip.length)).toBe(true);
-    expect(before[0]).toEqual({ enqueue: [], skip: [[7, [108]]] });
-    expect(reads).toBeLessThan(18 * 18);
-  } finally { f.close(); }
-});
+// Use the same reduction, carrier health/join, overlap planner and final head gate as the drain.
+async function productionDecision(byRepo, targetRepo, number, fresh, { degraded = false } = {}) {
+  const localRepo = [...byRepo.keys()][0];
+  const listings = [...byRepo].map(([repo, prs]) => ({ repo, prs: structuredClone(prs) }));
+  const reads = new Map(listings.flatMap(({ repo, prs }) => prs.map(p => [`${repo}::${p.number}`,
+    { manifest: p.manifest ?? p.recordedManifest, commits: p.commits ?? [], degraded }])));
+  const openPrContext = reduceOpenPrContext({ listings, reads });
+  const options = { listings, openPrContext, repos: [...byRepo.keys()], onlyPr: String(number), onlyRepo: targetRepo,
+    localSlug: localRepo, isLocalRepo: r => r === localRepo, defaultBranchOf: () => 'main', label: 'ready-to-merge',
+    readOf: (r, n) => reads.get(`${r}::${n}`) };
+  const { verdicts } = prepareDrainVerdicts(options);
+  const overlap = buildOverlapRows({ candidates: verdicts, verdicts, openPrContext, localSlug: localRepo });
+  const waits = overlapYieldWaits({ candidates: overlap.candidateRows.map(p => ({ ...p, readyAtMs: 1000, windowMs: 60_000 })),
+    openPrs: overlap.openPrRows, nowMs: 2000 });
+  const { plan, carrierHealth } = planDrainPass({ ...options, verdicts, overlapContext: waits });
+  const enqueue = [], refused = [];
+  await runEnqueueCandidates(plan.ready, { run: async c => {
+    const gate = revalidateForMerge(await fresh(c), { defaultBranch: 'main', expectedHeadSha: c.listedHeadSha });
+    if (gate.decision === 'merge') enqueue.push(c.num);
+    else refused.push([c.num, gate.reason]);
+  } });
+  return { enqueue, refused, ready: plan.ready.map(p => p.num),
+    skipped: verdicts.filter(p => p.decision !== 'merge').map(p => [p.num, p.reason]),
+    deferred: plan.deferred.map(p => [p.num, p.waitOn, p.coupleDeferReason]),
+    health: [...carrierHealth], waits: [...waits], complete: openPrContext.contextComplete };
+}
+
+for (const [name, recording] of [['frozen', fixture], ['recorded', recorded]]) {
+  it(`${name} 18-PR parity uses production reduction, planning and enqueue revalidation with differing live facts`, async () => {
+    const { repo: targetRepo, rows: source } = recording;
+    expect(source).toHaveLength(18);
+    const live = structuredClone(source);
+    // A target and every related component must refresh despite identical head/updatedAt.
+    const snapshot = source.map(p => ({ ...p, mergeable: 'UNKNOWN', statusCheckRollup: [] }));
+    let listings = 0;
+    const f = pass({ repos: [targetRepo], targetRepo, readSnapshot: () => snapshot,
+      listLean: async () => { listings++; return inventory(live); } });
+    try {
+      const before = [], after = [];
+      for (const p of live) {
+        const context = await readFastDrainContext({ repos: [targetRepo], targetRepo, onlyPr: p.number,
+          readInventory: () => readFastDrainPassInventory(f.options), failClosed: true,
+          readFull: async (_repo, n) => live.find(p => p.number === n),
+          readManifest: async (_repo, p) => p.manifest ?? p.recordedManifest });
+        const fresh = c => live.find(p => p.number === c.num);
+        before.push(await productionDecision(new Map([[targetRepo, live]]), targetRepo, p.number, fresh));
+        after.push(await productionDecision(context, targetRepo, p.number, fresh));
+      }
+      expect(after).toEqual(before);
+      expect(before.some(p => p.enqueue.length)).toBe(true);
+      expect(before.some(p => p.skipped.length || p.deferred.length)).toBe(true);
+      expect(listings).toBe(18);
+    } finally { f.close(); }
+  });
+}
 
 it('listing context reads overlap within the configured bound and preserve the blocked target', async () => {
   let active = 0, peak = 0;
@@ -134,16 +227,25 @@ it('catch-up holds on incomplete context without falling back to full pagination
   expect(r.stderr).toContain('retry next pass');
 });
 
-it('a published pass remains usable when a sibling enqueue dirties the host cache', async () => {
-  let snapshotReads = 0;
-  const f = pass({ readSnapshot: () => { if (++snapshotReads > 1) throw Error('host cache dirty'); return rows; } });
-  try {
-    await readFastDrainPassInventory(f.options);
-    const shared = await readFastDrainPassInventory(f.options);
-    expect(shared.snapshots.get(repo)).toEqual(rows);
-    expect(snapshotReads).toBe(1);
-  } finally { f.close(); }
-});
+for (const invalid of ['TTL expired', 'dirty', 'disabled']) {
+  it(`pass reuse rejects a source snapshot that became ${invalid}, without refreshing it`, async () => {
+    const f = pass();
+    let now = 20_000, refreshes = 0;
+    const env = { WE_PR_SNAPSHOT_DIR: dirname(f.options.path), WE_PR_SNAPSHOT: '1', WE_PR_SNAPSHOT_TTL_MS: '75000' };
+    writeFileSync(snapshotPath(env.WE_PR_SNAPSHOT_DIR, repo), JSON.stringify({ v: PR_SNAPSHOT_VERSION,
+      repo, prs: rows, fields: SNAPSHOT_FIELDS, fetchedAtMs: 0 }));
+    f.options.readSnapshot = r => readSharedOpenPrs({ repo: r, fields: SNAPSHOT_FIELDS, env, now: () => now,
+      cacheOnly: true, exec: () => { refreshes++; throw Error('must not refresh'); } });
+    try {
+      await readFastDrainPassInventory(f.options);
+      if (invalid === 'TTL expired') now = 75_000;
+      if (invalid === 'dirty') markPrSnapshotDirty({ repo, env, nowMs: now });
+      if (invalid === 'disabled') env.WE_PR_SNAPSHOT = '0';
+      await expect(readFastDrainPassInventory(f.options)).rejects.toThrow('snapshot unavailable/disabled/stale/dirty');
+      expect(refreshes).toBe(0);
+    } finally { f.close(); }
+  });
+}
 
 it('cascade sibling reads run within gateReads, keep result order and join failures before releasing the pool', async () => {
   let active = 0, peak = 0, settled = 0;
@@ -191,7 +293,7 @@ it('cascade missing status pages never turn a green check-run into complete evid
 it('a main move while waiting for the pass lock is rebound before any snapshot is published', async () => {
   let sha = head.sha;
   const f = pass({ readMain: async () => ({ ...head, sha }),
-    lock: async fn => { sha = 'b'.repeat(40); return { ok: true, value: await fn() }; } });
+    lock: async fn => { sha = 'b'.repeat(40); return { ok: true, value: await fn(() => true) }; } });
   try {
     await readFastDrainPassInventory(f.options);
     expect(JSON.parse(readFileSync(f.options.path, 'utf8')).heads[repo].sha).toBe(sha);
@@ -211,41 +313,6 @@ it('main-SHA and minimal inventory reads fan out within gateReads across context
   } finally { f.close(); }
 });
 
-it('recorded 18 real PRs: before/after enqueue and skip decisions are identical', async () => {
-  const { repo, rows } = recorded;
-  expect(rows).toHaveLength(18);
-  let listings = 0, snapshotReads = 0;
-  const f = pass({ repos: [repo], targetRepo: repo,
-    readSnapshot: () => { snapshotReads++; return rows; },
-    listLean: async () => { listings++; return inventory(rows); } });
-  const decide = (prs, number) => {
-    const p = prs.find(p => p.number === number);
-    const gate = classifyPr(p, { defaultBranch: 'main' });
-    if (gate.decision !== 'merge') return { enqueue: [], skip: [[number, gate.reason]] };
-    const m = p.recordedManifest;
-    const plan = planLabelDrain([{ ...gate, repo, num: number, headSha: p.headRefOid,
-      item: m?.item, blockedBy: m?.blockedBy ?? [], stackParents: m?.stackParents ?? [], hasManifest: !!m }],
-    { extraOpenItems: prs.map(p => p.recordedManifest?.item).filter(Boolean), contextComplete: true, isWeRepo: () => true });
-    return { enqueue: plan.ready.map(p => p.num), skip: plan.deferred.map(p => [p.num, p.waitOn]) };
-  };
-  try {
-    const before = [], after = [];
-    for (const p of rows) {
-      const context = await readFastDrainContext({ repos: [repo], targetRepo: repo, onlyPr: p.number,
-        readInventory: () => readFastDrainPassInventory(f.options), failClosed: true,
-        readFull: async (_repo, number) => rows.find(p => p.number === number),
-        readManifest: async (_repo, p) => p.recordedManifest });
-      before.push(decide(rows, p.number));
-      after.push(decide(context.get(repo), p.number));
-    }
-    expect(after).toEqual(before);
-    expect(listings).toBe(rows.length);
-    expect(snapshotReads).toBe(1);
-    expect(before.some(d => d.enqueue.length > 0)).toBe(true);
-    expect(before.some(d => d.skip.length > 0)).toBe(true);
-  } finally { f.close(); }
-});
-
 it('a newly opened blocker prevents enqueue during valid pass reuse with unchanged main and TTL', async () => {
   const target = rows[0], blocker = rows[1];
   let live = [target], snapshotReads = 0, membershipReads = 0;
@@ -256,18 +323,15 @@ it('a newly opened blocker prevents enqueue during valid pass reuse with unchang
     readInventory: () => readFastDrainPassInventory(f.options), failClosed: true,
     readFull: async (_repo, number) => { fullReads.push(number); return live.find(p => p.number === number); },
     readManifest: async (_repo, p) => p.manifest });
-  const decide = prs => planLabelDrain([{ num: target.number, repo, decision: 'merge',
-    item: target.manifest.item, blockedBy: target.manifest.blockedBy, hasManifest: true }],
-  { extraOpenItems: prs.map(p => p.manifest.item), contextComplete: true, isWeRepo: () => true });
   try {
-    expect(decide((await context()).get(repo)).ready.map(p => p.num)).toEqual([7]);
+    expect((await productionDecision(await context(), repo, target.number, () => target)).enqueue).toEqual([7]);
     // The same main SHA and clock keep the pass valid; opening this PR does not move main.
     live = [target, blocker];
-    const plan = decide((await context()).get(repo));
-    expect(plan.ready).toEqual([]);
-    expect(plan.deferred.map(p => [p.num, p.waitOn])).toEqual([[7, [108]]]);
+    const decision = await productionDecision(await context(), repo, target.number, () => target);
+    expect(decision.enqueue).toEqual([]);
+    expect(decision.deferred.map(([num, waitOn]) => [num, waitOn])).toEqual([[7, [108]]]);
     expect(membershipReads).toBe(2);
-    expect(snapshotReads).toBe(1);
+    expect(snapshotReads).toBe(3);
     expect(fullReads).toEqual([7, 7, 8]);
   } finally { f.close(); }
 });
@@ -287,3 +351,131 @@ it('valid pass reuse fails closed when live membership revalidation is unreadabl
     }
   } finally { f.close(); }
 });
+
+for (const conclusion of ['FAILURE', 'SUCCESS']) {
+  it(`scope=full reconciles an unrelated same-head PR from live ${conclusion} checks and labels`, () => {
+    const result = runFastDrainContextCli({ catchUp: true, scope: 'full', rowCount: 18,
+      livePatches: { 8: { mergeable: 'UNKNOWN',
+        labels: [{ name: 'ready-to-merge' }, { name: 'review:accepted' }, ...(conclusion === 'SUCCESS' ? [{ name: 'ci:failed' }] : [])],
+        statusCheckRollup: [{ __typename: 'CheckRun', name: 'test', status: 'COMPLETED', conclusion }] } } });
+    expect(result.status, result.stderr).toBe(0);
+    expect(result.fullListings + result.heavyListings).toBe(0);
+    expect(result.calls.some(a => a[0] === 'pr' && a[1] === 'view' && a[2] === '8'
+      && a[a.indexOf('--json') + 1].includes('statusCheckRollup'))).toBe(true);
+    expect(JSON.parse(result.stdout).reconciledLabels).toContain(8);
+  });
+}
+
+it('production couple health holds an impl when its same-head carrier gained a live review hold', async () => {
+  const implRepo = 'fixture/frontierui';
+  const impl = { ...rows[16], manifest: null };
+  const carrier = { ...rows[15], manifest: { item: 122, blockedBy: [], stackParents: [],
+    repos: [{ repo: 'we', ref: rows[15].headRefName }, { repo: 'fui', ref: impl.headRefName }] } };
+  const liveCarrier = { ...carrier, labels: [{ name: 'review:changes' }] };
+  const byRepo = new Map([[repo, [liveCarrier]], [implRepo, [impl]]]);
+  const context = await readFastDrainContext({ repos: [...byRepo.keys()], targetRepo: implRepo, onlyPr: impl.number,
+    readSnapshot: r => r === repo ? [carrier] : [impl], listLean: async r => inventory(byRepo.get(r)), failClosed: true,
+    readFull: async (r, n) => byRepo.get(r).find(p => p.number === n), readManifest: async (_r, p) => p.manifest });
+  const fresh = () => impl;
+  const before = await productionDecision(byRepo, implRepo, impl.number, fresh);
+  const after = await productionDecision(context, implRepo, impl.number, fresh);
+  expect(after).toEqual(before);
+  expect(after.health[0][1].held).toBe(true);
+  expect(after.deferred).toHaveLength(1);
+  expect(after.enqueue).toEqual([]);
+  // A positive control makes the live carrier refresh load-bearing.
+  const stale = await productionDecision(new Map([[repo, [carrier]], [implRepo, [impl]]]), implRepo, impl.number, fresh);
+  expect(stale.enqueue).toEqual([impl.number]);
+});
+
+it('production context reduction refuses absent-carrier proof after a degraded read', async () => {
+  const implRepo = 'fixture/frontierui', impl = { ...rows[16], manifest: null };
+  const byRepo = new Map([[repo, []], [implRepo, [impl]]]);
+  expect((await productionDecision(byRepo, implRepo, impl.number, () => impl)).enqueue).toEqual([impl.number]);
+  const incomplete = await productionDecision(byRepo, implRepo, impl.number, () => impl, { degraded: true });
+  expect(incomplete.complete).toBe(false);
+  expect(incomplete.enqueue).toEqual([]);
+  expect(incomplete.deferred).toHaveLength(1);
+});
+
+it('production overlap planning refreshes a related same-head red check before choosing enqueue order', async () => {
+  const green = rows[16];
+  const target = { ...green, number: 100, files: [{ path: 'src/shared.mjs', additions: 1, deletions: 0 }] };
+  const partner = { ...rows[15], files: [{ path: 'src/shared.mjs', additions: 100, deletions: 0 }] };
+  const redPartner = { ...partner, statusCheckRollup: [{ name: 'test', status: 'COMPLETED', conclusion: 'FAILURE' }] };
+  const live = [target, redPartner];
+  const context = await readFastDrainContext({ repos: [repo], targetRepo: repo, onlyPr: target.number,
+    readSnapshot: () => [target, partner], listLean: async () => inventory(live), failClosed: true,
+    readFull: async (_r, n) => live.find(p => p.number === n), readManifest: async (_r, p) => p.manifest });
+  const after = await productionDecision(context, repo, target.number, () => target);
+  expect(after).toEqual(await productionDecision(new Map([[repo, live]]), repo, target.number, () => target));
+  expect(after.enqueue).toEqual([target.number]);
+  const stale = await productionDecision(new Map([[repo, [target, partner]]]), repo, target.number, () => target);
+  expect(stale.waits).toHaveLength(1);
+  expect(stale.enqueue).toEqual([]);
+});
+
+for (const change of ['head', 'CI', 'review hold']) {
+  it(`production enqueue revalidation refuses a target whose ${change} changed after planning`, async () => {
+    const target = rows[16];
+    const context = await readFastDrainContext({ repos: [repo], targetRepo: repo, onlyPr: target.number,
+      readSnapshot: () => [target], listLean: async () => inventory([target]), failClosed: true,
+      readFull: async () => target, readManifest: async (_r, p) => p.manifest });
+    const fresh = { ...target, ...(change === 'head' ? { headRefOid: 'f'.repeat(40) } : change === 'CI'
+      ? { statusCheckRollup: [{ name: 'test', status: 'COMPLETED', conclusion: 'FAILURE' }] }
+      : { labels: [{ name: 'ready-to-merge' }, { name: 'review:changes' }] }) };
+    const result = await productionDecision(context, repo, target.number, () => fresh);
+    expect(result.ready).toEqual([target.number]);
+    expect(result.enqueue).toEqual([]);
+    expect(result.refused).toHaveLength(1);
+  });
+}
+
+for (const phase of ['cold', 'direct hit', 'locked hit']) {
+  for (const invalid of ['expired', 'dirty']) {
+    it(`source snapshot becoming ${invalid} during ${phase} membership reads defers without publication`, async () => {
+      const f = pass();
+      let now = 20_000;
+      const env = { WE_PR_SNAPSHOT_DIR: dirname(f.options.path), WE_PR_SNAPSHOT: '1', WE_PR_SNAPSHOT_TTL_MS: '75000' };
+      writeFileSync(snapshotPath(env.WE_PR_SNAPSHOT_DIR, repo), JSON.stringify({ v: PR_SNAPSHOT_VERSION,
+        repo, prs: rows, fields: SNAPSHOT_FIELDS, fetchedAtMs: 0 }));
+      f.options.readSnapshot = r => readSharedOpenPrs({ repo: r, fields: SNAPSHOT_FIELDS, env, now: () => now, cacheOnly: true,
+        exec: () => { throw Error('cache-only source must never refresh'); } });
+      try {
+        if (phase !== 'cold') await readFastDrainPassInventory(f.options);
+        let reads = 0, writes = 0;
+        await expect(readFastDrainPassInventory({ ...f.options,
+          read: path => { if (phase === 'locked hit' && ++reads === 1) throw Error('force locked hit'); return JSON.parse(readFileSync(path, 'utf8')); },
+          write: () => { writes++; },
+          listLean: async () => {
+            if (invalid === 'expired') now = 75_000;
+            else markPrSnapshotDirty({ repo, env, nowMs: now });
+            return inventory(rows);
+          },
+        })).rejects.toThrow('snapshot unavailable/disabled/stale/dirty');
+        expect(writes).toBe(0);
+      } finally { f.close(); }
+    });
+  }
+}
+
+for (const number of [7, 8]) {
+  it(`full scope resolves capped live checks for ${number === 7 ? 'the target gate' : 'unrelated lifecycle reconciliation'}`, () => {
+    const sha = number.toString(16).padStart(40, '0');
+    const result = runFastDrainContextCli({ catchUp: true, scope: 'full', rowCount: 18,
+      livePatches: { [number]: {
+        statusCheckRollup: Array.from({ length: 100 }, (_, i) => ({ __typename: 'CheckRun', name: i ? `check-${i}` : 'test',
+          status: 'COMPLETED', conclusion: 'SUCCESS' })),
+        liveCheckRuns: [{ id: 12345, name: 'test', status: 'completed', conclusion: 'failure', head_sha: sha }],
+      } } });
+    expect(result.status, result.stderr).toBe(0);
+    expect(result.calls.some(a => a[0] === 'api' && a[1]?.includes(`${sha}/check-runs?`)
+      && a.includes('--paginate') && a.includes('--slurp'))).toBe(true);
+    const decision = JSON.parse(result.stdout);
+    expect(decision.reconciledLabels).toContain(number);
+    if (number === 7) {
+      expect(decision.toMerge).toEqual([]);
+      expect(decision.skipped.some(p => p.num === 7 && /required check/.test(p.reason))).toBe(true);
+    }
+  });
+}

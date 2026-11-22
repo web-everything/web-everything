@@ -11,7 +11,7 @@ import { fastDrainArgs } from '../../lib/enqueue-on-event.mjs';
 import { daemonAppEnv } from './daemon-app-env.mjs';
 
 export function runFastDrainContextCli({ root = resolve(dirname(fileURLToPath(import.meta.url)), '../../..'), killSwitch = false,
-  catchUp = false, targetLabels = null, failDefaultBranch = false, outputAsJson = true, cachedBranch = null, liveDefaultBranch = 'main', roundBranch = null, rowCount = 48, leanIncomplete = false, fullIncomplete = false, leanPageError = false, targetBaseRefName = 'main' } = {}) {
+  catchUp = false, scope = 'target', livePatches = {}, targetLabels = null, failDefaultBranch = false, outputAsJson = true, cachedBranch = null, liveDefaultBranch = 'main', roundBranch = null, rowCount = 48, leanIncomplete = false, fullIncomplete = false, leanPageError = false, targetBaseRefName = 'main' } = {}) {
   const dir = mkdtempSync(join(process.env.TMPDIR, 'fast-context-cli-'));
   try {
     const bin = join(dir, 'bin'), snapshots = join(dir, 'snapshots');
@@ -36,7 +36,9 @@ export function runFastDrainContextCli({ root = resolve(dirname(fileURLToPath(im
     const roundPath = join(dir, 'round.json');
     if (roundBranch) writeFileSync(roundPath, JSON.stringify({ repo: 'fixture/web-everything',
       writtenAt: Date.now(), defaultBranch: roundBranch }));
-    writeFileSync(join(dir, 'rows.json'), JSON.stringify(rows));
+    // Snapshot and live transports intentionally diverge without changing membership identity.
+    const liveRows = rows.map(p => ({ ...p, ...(livePatches[p.number] ?? {}) }));
+    writeFileSync(join(dir, 'rows.json'), JSON.stringify(liveRows));
     writeFileSync(join(dir, 'calls.jsonl'), '');
     writeFileSync(join(bin, 'git'), '#!/bin/sh\nif [ "$1 $2" = "remote get-url" ]; then echo https://github.com/fixture/web-everything.git; exit 0; fi\nexit 1\n', { mode: 0o755 });
     writeFileSync(join(bin, 'gh'), `#!/usr/bin/env node
@@ -52,6 +54,10 @@ if (a[0] === 'repo' && a[1] === 'view') {
   fs.writeSync(1, process.env.CONTEXT_LIVE_BRANCH); process.exit(0);
 }
 if (a[0] === 'api' && a[1]?.includes('/git/ref/heads/')) { fs.writeSync(1, 'a'.repeat(40)); process.exit(0); }
+if (a[0] === 'api' && a[1]?.includes('/check-runs?')) {
+  const p = rows.find(p => Array.isArray(p.liveCheckRuns) && a[1].includes(p.headRefOid));
+  if (p) out([{total_count:p.liveCheckRuns.length,check_runs:p.liveCheckRuns}]);
+}
 if (a[0] === 'pr' && a[1] === 'list') {
   const fields = a[a.indexOf('--json') + 1].split(',');
   out(selected.map(p => Object.fromEntries(fields.map(f => [f, p[f]]))));
@@ -91,7 +97,7 @@ out({});
       env: { ...process.env, ...daemonAppEnv(dir), PATH: `${bin}:${process.env.PATH}`, WE_UNDER_TEST: '1',
         WE_PR_SNAPSHOT: '1', WE_PR_SNAPSHOT_DIR: snapshots, WE_FAST_DRAIN_LISTING: 'snapshot',
         WE_DEFAULT_BRANCH_CACHE_DIR: join(dir, 'branch-cache'), CONTEXT_FAIL_BRANCH: failDefaultBranch ? '1' : '0', CONTEXT_LIVE_BRANCH: liveDefaultBranch,
-        WE_FAST_DRAIN_CONTEXT: killSwitch ? 'live' : 'snapshot', WE_PR_SNAPSHOT_TTL_MS: '75000',
+        WE_FAST_DRAIN_SCOPE: scope, WE_FAST_DRAIN_CONTEXT: killSwitch ? 'live' : 'snapshot', WE_PR_SNAPSHOT_TTL_MS: '75000',
         WE_GH_THROTTLE_GH_BIN: join(bin, 'gh'), WE_GH_THROTTLE_COST_HEADERS: '0', WE_GH_THROTTLE_RETRY_MAX_ATTEMPTS: '1',
         CONTEXT_LEAN_INCOMPLETE: leanIncomplete ? '1' : '0', CONTEXT_FULL_INCOMPLETE: fullIncomplete ? '1' : '0',
         CONTEXT_LEAN_PAGE_ERROR: leanPageError ? '1' : '0',
