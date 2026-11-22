@@ -11,7 +11,7 @@ import { fastDrainArgs } from '../../lib/enqueue-on-event.mjs';
 import { daemonAppEnv } from './daemon-app-env.mjs';
 
 export function runFastDrainContextCli({ root = resolve(dirname(fileURLToPath(import.meta.url)), '../../..'), killSwitch = false,
-  catchUp = false, scope = 'target', livePatches = {}, targetLabels = null, failDefaultBranch = false, outputAsJson = true, cachedBranch = null, liveDefaultBranch = 'main', branchAfterMembership = null, roundBranch = null, rowCount = 48, leanIncomplete = false, fullIncomplete = false, leanPageError = false, targetBaseRefName = 'main' } = {}) {
+  catchUp = false, scope = 'target', livePatches = {}, targetLabels = null, failDefaultBranch = false, outputAsJson = true, cachedBranch = null, liveDefaultBranch = 'main', branchAfterMembership = null, roundBranch = null, rowCount = 48, leanIncomplete = false, fullIncomplete = false, leanPageError = false, targetBaseRefName = 'main', workflowEditSetting = null } = {}) {
   const dir = mkdtempSync(join(process.env.TMPDIR, 'fast-context-cli-'));
   try {
     const bin = join(dir, 'bin'), snapshots = join(dir, 'snapshots');
@@ -23,6 +23,7 @@ export function runFastDrainContextCli({ root = resolve(dirname(fileURLToPath(im
         mergeable: 'MERGEABLE', mergeStateStatus: 'CLEAN', reviewDecision: 'APPROVED',
         labels: number === 7 && targetLabels ? targetLabels : [{ name: 'ready-to-merge' }, { name: 'review:accepted' }], files: [{ path: `src/${number}.mjs` }],
         body: embedManifestInBody('fixture', buildManifest({ item: number, repos: [{ repo: 'we', ref: `lane/${number}` }] })),
+        comments: [{ author: { login: 'chalbert' }, body: `<!-- reviewed-sha: ${headRefOid} -->` }],
         rowsHead: headRefOid, rowsComplete: true,
         statusCheckRollup: [{ __typename: 'CheckRun', name: 'test', status: 'COMPLETED', conclusion: 'SUCCESS', workflowName: 'test' }] };
     });
@@ -55,9 +56,23 @@ if (a[0] === 'repo' && a[1] === 'view') {
   fs.writeSync(1, fs.readFileSync(process.env.CONTEXT_BRANCH_FILE, 'utf8')); process.exit(0);
 }
 if (a[0] === 'api' && a[1]?.includes('/git/ref/heads/')) { fs.writeSync(1, 'a'.repeat(40)); process.exit(0); }
-if (a[0] === 'api' && a[1]?.includes('/check-runs?')) {
-  const p = rows.find(p => Array.isArray(p.liveCheckRuns) && a[1].includes(p.headRefOid));
-  if (p) out([{total_count:p.liveCheckRuns.length,check_runs:p.liveCheckRuns}]);
+const endpoint = a.find(v => v.startsWith('repos/') && v.includes('/commits/'));
+if (a[0] === 'api' && endpoint) {
+  const p = selected.find(p => endpoint.includes(p.headRefOid));
+  if (p && endpoint.includes('/check-runs?')) {
+    if (endpoint.includes('filter=all') && Object.hasOwn(p, 'liveCheckRunPages')) out(p.liveCheckRunPages);
+    const runs = p.liveCheckRuns ?? (p.statusCheckRollup ?? []).filter(c => c.__typename === 'CheckRun')
+      .map((c, i) => ({...c, id:i+1, head_sha:p.headRefOid}));
+    const checkName = /[?&]check_name=([^&]+)/.exec(endpoint)?.[1];
+    const filtered = checkName ? runs.filter(c => c.name === decodeURIComponent(checkName)) : runs;
+    out([{total_count:filtered.length,check_runs:filtered}]);
+  }
+  if (p && endpoint.includes('/status?')) {
+    if (Object.hasOwn(p, 'liveStatusPages')) out(p.liveStatusPages);
+    const statuses = (p.statusCheckRollup ?? []).filter(c => c.__typename === 'StatusContext')
+      .map((c, i) => ({...c, id:i+1}));
+    out([{total_count:statuses.length,statuses}]);
+  }
 }
 if (a[0] === 'pr' && a[1] === 'list') {
   const fields = a[a.indexOf('--json') + 1].split(',');
@@ -65,8 +80,12 @@ if (a[0] === 'pr' && a[1] === 'list') {
 }
 if (a[0] === 'pr' && a[1] === 'view') {
   const fields = (a[a.indexOf('--json') + 1] || '').split(',');
-  if (fields.length === 1 && fields[0] === 'commits') out({commits:[]});
-  out(selected.find(p => p.number === Number(a[2])) || {});
+  const realFields = new Set('number,headRefOid,headRefName,title,state,updatedAt,baseRefName,isDraft,mergeable,mergeStateStatus,reviewDecision,labels,files,body,statusCheckRollup,commits,comments'.split(','));
+  if (fields.some(f => !realFields.has(f))) process.exit(1);
+  const p = selected.find(p => p.number === Number(a[2]));
+  const view = p ? Object.fromEntries(fields.map(f => [f, f === 'commits' ? [] : p[f]])) : {};
+  fs.appendFileSync(process.env.CONTEXT_CALLS + '.views', JSON.stringify({fields,view}) + '\\n');
+  out(view);
 }
 if (a[0] === 'api' && a[1] === 'graphql' && a.some(v => v.includes('pullRequests(states:OPEN'))) {
   const query = a.find(v => v.includes('pullRequests(states:OPEN'));
@@ -99,6 +118,7 @@ out({});
       '--no-red-main-freeze', '--no-review-escalation', '--repoll-delay=0'], {
       cwd: dir, encoding: 'utf8', timeout: 30_000, maxBuffer: 8 * 1024 * 1024,
       env: { ...process.env, ...daemonAppEnv(dir), PATH: `${bin}:${process.env.PATH}`, WE_UNDER_TEST: '1',
+        ...(workflowEditSetting ? { WE_DRAIN_WORKFLOW_EDIT_HUMAN: workflowEditSetting } : {}),
         WE_PR_SNAPSHOT: '1', WE_PR_SNAPSHOT_DIR: snapshots, WE_FAST_DRAIN_LISTING: 'snapshot',
         WE_DEFAULT_BRANCH_CACHE_DIR: join(dir, 'branch-cache'), CONTEXT_FAIL_BRANCH: failDefaultBranch ? '1' : '0',
         CONTEXT_BRANCH_FILE: join(dir, 'live-branch'), CONTEXT_BRANCH_AFTER_MEMBERSHIP: branchAfterMembership ?? '',
@@ -110,6 +130,8 @@ out({});
     });
     const calls = readFileSync(join(dir, 'calls.jsonl'), 'utf8').trim().split('\n').filter(Boolean).map(JSON.parse);
     return { status: result.status, stdout: result.stdout, stderr: result.stderr, calls,
+      prViews: existsSync(join(dir, 'calls.jsonl.views'))
+        ? readFileSync(join(dir, 'calls.jsonl.views'), 'utf8').trim().split('\n').map(JSON.parse) : [],
       passSnapshotPublished: existsSync(roundPath),
       cachedBranch: readDefaultBranchCache('fixture/web-everything', { env: cacheEnv }),
       fullListings: calls.filter(a => a[0] === 'api' && a[1] === 'graphql' && a.some(v => v.includes('pullRequests(states:OPEN') && v.includes('statusCheckRollup'))).length,

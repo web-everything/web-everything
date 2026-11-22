@@ -29,6 +29,52 @@ it('tier 1: catch-up without --from-green-event makes zero full-PR pagination ca
     && a[a.indexOf('--json') + 1].includes('body')).map(a => a[2])).toEqual(['7']);
 });
 
+it('catch-up computes complete head-bound checks from PR views containing only requested gh fields', () => {
+  const result = runFastDrainContextCli({ catchUp: true, rowCount: 18, workflowEditSetting: 'off' });
+  expect(result.status, result.stderr).toBe(0);
+  expect(JSON.parse(result.stdout).toMerge.map(p => p.num), result.stdout).toEqual([7]);
+  expect(result.prViews.length).toBeGreaterThan(0);
+  for (const { fields, view } of result.prViews) {
+    expect(Object.keys(view).every(f => fields.includes(f))).toBe(true);
+    expect(view).not.toHaveProperty('rowsComplete');
+    expect(view).not.toHaveProperty('rowsHead');
+  }
+  const endpoints = result.calls.filter(a => a[0] === 'api' && a.includes('--paginate') && a.includes('--slurp')).map(a => a.at(-1));
+  expect(endpoints).toContain(`repos/fixture/web-everything/commits/${'7'.padStart(40, '0')}/check-runs?per_page=100&filter=all`);
+  expect(endpoints).toContain(`repos/fixture/web-everything/commits/${'7'.padStart(40, '0')}/status?per_page=100`);
+});
+
+const passingRun = { id: 1, name: 'test', status: 'completed', conclusion: 'success', head_sha: '7'.padStart(40, '0') };
+it.each([
+  ['capped check pages', { liveCheckRunPages: [{ total_count: 101, check_runs: [passingRun] }] }],
+  ['missing check pages', { liveCheckRunPages: [] }],
+  ['unknown check count', { liveCheckRunPages: [{ check_runs: [passingRun] }] }],
+  ['unreadable check pages', { liveCheckRunPages: {} }],
+  ['missing status pages', { liveStatusPages: [] }],
+])('catch-up skips %s despite a green required check and cached completeness', (_name, patch) => {
+  const result = runFastDrainContextCli({ catchUp: true, rowCount: 18, workflowEditSetting: 'off',
+    livePatches: { 7: { ...patch,
+      statusCheckRollup: Array.from({ length: 100 }, (_, i) => ({ __typename: 'CheckRun', name: i ? `check-${i}` : 'test',
+        status: 'COMPLETED', conclusion: 'SUCCESS' })), liveCheckRuns: [passingRun] } } });
+  expect(result.status, result.stderr).toBe(0);
+  const decision = JSON.parse(result.stdout);
+  expect(decision.toMerge).toEqual([]);
+  expect(decision.skipped.some(p => p.num === 7 && /check evidence incomplete.*complete live check read/.test(p.reason))).toBe(true);
+});
+
+it('catch-up discovers failing CodeQL omitted from a capped PR view even when the required check passes', () => {
+  const result = runFastDrainContextCli({ catchUp: true, rowCount: 18, workflowEditSetting: 'off',
+    livePatches: { 7: {
+      statusCheckRollup: Array.from({ length: 100 }, (_, i) => ({ __typename: 'CheckRun', name: i ? `check-${i}` : 'test',
+        status: 'COMPLETED', conclusion: 'SUCCESS' })),
+      liveCheckRuns: [passingRun, { ...passingRun, id: 2, name: 'CodeQL', conclusion: 'failure' }],
+    } } });
+  expect(result.status, result.stderr).toBe(0);
+  const decision = JSON.parse(result.stdout);
+  expect(decision.toMerge).toEqual([]);
+  expect(decision.skipped.some(p => p.num === 7 && /CodeQL/.test(p.reason)), result.stdout).toBe(true);
+});
+
 it('a live default-branch change during membership is read afresh, refuses publication and falls back to slow classification', () => {
   const result = runFastDrainContextCli({ catchUp: true, rowCount: 18, branchAfterMembership: 'develop' });
   expect(result.status, result.stderr).toBe(0);

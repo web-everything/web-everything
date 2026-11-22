@@ -5887,10 +5887,22 @@ export async function main(argv, { env = process.env, stdout = process.stdout, e
   const readFullListingPr = async (repo, num, fullContext = false) => {
     const fields = fullContext || RECONCILE ? SWEEP_LIST_FIELDS
       : CANDIDATE_ONLY_FIELDS + (workflowEditSetting.value !== 'off' ? ',files' : '');
-    const { stdout } = await execFileP('gh', ['pr', 'view', String(num), '--repo', repo || localSlug, '--json', `${fields},updatedAt,state`],
+    const { stdout } = await execFileP('gh', ['pr', 'view', String(num), '--repo', repo || localSlug, '--json', `${fields},updatedAt,state,isDraft`],
       { encoding: 'utf8', maxBuffer: 64 * 1024 * 1024 });
     const pr = JSON.parse(stdout.trim() || 'null');
-    return pr ? (await resolveListedChecks(repo, [pr]))[0] : null;
+    if (!pr) return null;
+    const resolved = (await resolveListedChecks(repo, [pr]))[0];
+    // Flattened gh views cannot attest completeness. Read every check/status on the
+    // listed head so a capped rollup cannot hide CodeQL or another blocking context.
+    try {
+      const checks = await readFreshGateChecks({ repo: repo || localSlug, headSha: pr.headRefOid,
+        concurrency: resolvedMergePolicy.policy.concurrency.gateReads });
+      return { ...resolved, statusCheckRollup: checks,
+        rowsComplete: checks.rowsComplete === true, rowsHead: checks.rowsHead };
+    } catch {
+      // Keep the ordinary incomplete-evidence skip and its complete-live-read retry.
+      return { ...resolved, rowsComplete: false, rowsHead: null };
+    }
   };
   if (fastContextEnabled) {
     // Canonical slugs here; the rest of the drain retains its cwd/null repo sentinel.
