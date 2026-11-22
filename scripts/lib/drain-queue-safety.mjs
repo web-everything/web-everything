@@ -740,6 +740,7 @@ function readMqRetryEvidence(options) {
     : { ...evidence, mergeState: readMqMergeState({ repo: options.repo, pr: options.pr, head, exec: uncachedExec }) };
   const baseOptions = { ...options, exec, now };
   const base = readMqBaseRetryEvidence(baseOptions);
+  if (base?.logNormalizationFailed) return base;
   if (base?.infra === 'cancelled-regroup') return live(base);
   if (base?.mergeState === 'CLEAN' && (base.infra === 'quarantined'
     || base.mainGreen === true && ['infra', 'rerun-green', 'main-red'].includes(base.infra))) return live(base);
@@ -954,7 +955,13 @@ function readMqBaseRetryEvidence({ repo, pr, head, timeline, exec, rerunScope, d
           });
           if (typeof text !== 'string' || !text.trim()) throw new Error('unreadable log');
           // Infrastructure signatures use a bounded tail; failure wording is checked across the full log.
-          const plain = stripAnsiLogText(text);
+          let plain;
+          try { plain = stripAnsiLogText(text); }
+          catch {
+            // Invalid control bytes are unsafe evidence, never a transport failure eligible for retry.
+            return { logNormalizationFailed: true,
+              logReason: 'job log normalization failed; operator must inspect failed jobs and enqueue manually' };
+          }
           const tail = Buffer.from(plain.slice(-MQ_INFRA_SCAN_BYTES), 'utf8').subarray(-MQ_INFRA_SCAN_BYTES).toString('utf8');
           let truncatedLine = false;
           // A real failure anywhere in the log vetoes an infrastructure phrase in the tail.

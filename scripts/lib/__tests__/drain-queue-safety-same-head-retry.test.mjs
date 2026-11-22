@@ -112,6 +112,19 @@ describe('merge-queue same-head retry for unreadable failed-job logs', () => {
       .toContain('--allow-escape-sequences');
   }));
 
+  it.each(['FAIL scripts/x.test.mjs > broken case', 'AssertionError: expected true'])
+    ('holds real failure plus OSC with green main and CLEAN PR: %s', failure => setup(f => {
+      f.logs[31] = `${failure}\n\x1b]0;title\x07`;
+      expectHeld(f);
+      expect(f.exec.mock.calls.some(([, args]) => args.includes('POST'))).toBe(false);
+    }));
+
+  it.each(['FAIL scripts/x.test.mjs > broken case', 'Unhandled Rejection'])('holds infra retry with ESC[%s without erasing evidence', failure => setup(f => {
+    f.logs[31] = `\x1b[${failure}\nfatal: could not fetch abc123 from promisor remote\n`;
+    expectHeld(f);
+    expect(f.exec.mock.calls.some(([, args]) => args.includes('POST'))).toBe(false);
+  }));
+
   it('404 gate log fails closed with flagged transport', () => setup(f => {
     f.checks[0].name = 'merge-gate';
     f.logErrors[31] = new Error('HTTP 404: Not Found');
@@ -278,12 +291,18 @@ describe('merge-queue same-head retry for quarantined failures', () => {
     expect(reads.every(([, args]) => args.includes('--allow-escape-sequences'))).toBe(true);
   }));
 
-  it.each(['\x1b[2K', '\x1b[K', '\x1b '])
+  it.each(['\x1b[2K', '\x1b[K', '\x1b ', '\x9b'])
     ('holds quarantined failures with an escape-prefixed unhandled-error summary (%j)', prefix => fixture(f => {
       f.logs[31] += `${prefix}Errors 1 error\n`;
       expect(f.guard().hold).toBe(true);
       expect(declined(f)).toHaveLength(1);
     }));
+
+  it.each(['FAIL scripts/x.test.mjs > broken case', 'Unhandled Rejection'])('holds quarantine retry with ESC[%s without erasing evidence', failure => fixture(f => {
+    f.logs[31] += `\x1b[${failure}\n`;
+    expect(f.guard().hold).toBe(true);
+    expect(declined(f)).toHaveLength(1);
+  }));
 
   it('allows one retry when every failing test is in the active quarantine', () => fixture(f => {
     const result = f.guard();
@@ -657,6 +676,14 @@ describe('merge-queue exact-test extra retry after two failed_checks removals', 
     expect(f.log.mock.calls.some(([line]) => /^mq-same-head-retry:/.test(line))).toBe(false);
   };
 
+  it('holds normalization failure without reaching the exact-test retry fallback', () => exactFixture(f => {
+    f.logs[31] += '\x1b]0;title\x07';
+    expectExactHold(f);
+    expect(declined(f).join("\n")).toContain('normalization failed');
+    expect(f.exec.mock.calls.some(([, args]) => args.some(arg => /\/artifacts(?:\/|\?)/.test(arg)))).toBe(false);
+    expect(f.exec.mock.calls.some(([, args]) => args.includes('POST'))).toBe(false);
+  }));
+
   it('reads ANSI exact-test summary with one shared log read', () => exactFixture(f => {
     f.logs[31] = `\x1b[31m${f.logs[31]}\x1b[0m`;
     expectExtraRetry(f);
@@ -665,7 +692,7 @@ describe('merge-queue exact-test extra retry after two failed_checks removals', 
     expect(reads[0][1]).toContain('--allow-escape-sequences');
   }));
 
-  it.each(['\x1b[2K', '\x1b[K'])
+  it.each(['\x1b[2K', '\x1b[K', '\x9b'])
     ('holds exact-test retry with an escape-prefixed unhandled-error summary (%j)', prefix => exactFixture(f => {
       f.logs[31] += `2026-11-16T07:54:50.5192657Z ${prefix}Errors 1 error\n`;
       expect(f.guard().hold).toBe(true);
@@ -997,10 +1024,10 @@ describe('merge-queue exact-test extra retry after two failed_checks removals', 
     expect(declined(f)).toHaveLength(1);
   }));
 
-  it('holds a plain main-freeze row alongside an escape-prefixed red-team hold', () => exactFixture(f => {
+  it.each(['\x1b', '\x9b'])('holds a plain main-freeze row alongside a control-prefixed red-team hold (%j)', prefix => exactFixture(f => {
     f.mqChecks = [check(36, 'merge-gate', 800, 'failure')];
     f.logs[36] = '2026-11-07T23:00:00Z hold  red-main-freeze  main is RED (freeze: fixture)\n'
-      + '\x1b2026-11-07T23:00:00Z hold  red-team  review required\n';
+      + `${prefix}2026-11-07T23:00:00Z hold  red-team  review required\n`;
     f.artifacts = {}; f.reports = {};
     expect(f.guard().hold).toBe(true);
     expect(declined(f)).toHaveLength(1);

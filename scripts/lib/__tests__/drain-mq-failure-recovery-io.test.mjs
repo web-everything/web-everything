@@ -62,6 +62,7 @@ function fixture(mode = 'real') {
       if (mode === 'expired log') throw new Error('410 expired');
       if (mode === 'OSC') return `${failureLog}\n\x1b]0;Errors 1 error\x07`;
       if (mode === 'ESC[Errors') return `${failureLog}\n\x1b[Errors 1 error`;
+      if (mode === 'C1') return `${failureLog}\n\x9bErrors 1 error`;
       if (mode === 'ANSI') return `\x1b[31m${failureLog}\x1b[0m`;
       return mode === 'infra' ? 'The runner has lost communication with the server.'
         : mode === 'incomplete test paths' ? `${failureLog}\nFAIL unidentified failing test\nAssertionError: expected false`
@@ -94,7 +95,7 @@ describe('drain MQ failure production adapter', () => {
     expect(await routeMqFailureOnHold(f.options)).toMatchObject({ routed: true });
   });
 
-  it.each(['OSC', 'ESC[Errors'])('readJobLog with %s error evidence stays incomplete and retains the hold', async mode => {
+  it.each(['OSC', 'ESC[Errors', 'C1'])('readJobLog with %s error evidence stays incomplete and retains the hold', async mode => {
     const f = fixture(mode);
     const evidence = await f.options.io.collectEvidence({ removal: {
       ...identity, mergeGroupHead: mergeHead, branch,

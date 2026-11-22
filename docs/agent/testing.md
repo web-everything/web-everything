@@ -5937,7 +5937,10 @@ assertions intact; consumers without callable entries retain the fresh-import pa
 ## Drain log evidence normalization
 
 Drain queue and recovery log consumers share `stripAnsiLogText` before parsing evidence.
-Keep negative cases for non-colour CSI, BEL/ST-terminated OSC, and stray ESC before
-`Errors`: colour-only stripping misses erase-line commands, and generic terminal stripping
-can consume the first letter of evidence after a stray ESC. Real test-failure wording
+Strip only SGR sequences; reject any remaining ESC byte or C1 control (U+0080–U+009F).
+Keep negative cases for non-colour CSI, BEL/ST-terminated OSC, stray ESC before
+`FAIL`/`Unhandled`/`Errors`, and C1-prefixed evidence: generic terminal stripping
+can consume the first letter of evidence after a stray ESC. A normalization failure
+holds for operator inspection; it never qualifies for the unreadable-log transport
+retry or falls through to another retry proof. Real test-failure wording
 anywhere in a job log vetoes infrastructure signatures, including beyond the signature tail.
