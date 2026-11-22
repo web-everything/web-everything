@@ -1,10 +1,7 @@
 ---
 kind: story
 size: 5
-status: closed
-closedReason: duplicate
-closedInto: "2209"
-dateClosed: "2026-11-22"
+status: open
 parent: "2256"
 blockedBy: ["2209", "2250", "2251", "2252", "2253"]
 locus: webeverything

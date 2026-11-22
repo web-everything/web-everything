@@ -2,10 +2,7 @@
 bornAs: x9ah1zb
 kind: epic
 parent: "3383"
-status: closed
-closedReason: duplicate
-closedInto: "6202"
-dateClosed: "2026-11-22"
+status: open
 dateOpened: "2026-09-22"
 tags: []
 ---
