@@ -121,6 +121,7 @@ export default defineConfig({
       },
     },
     include: [
+      'design-systems/**/__tests__/**/*.test.ts', // Design-system token source contracts.
       'contracts/**/*.test.ts', // Declarative wire-contract conformance.
       // #1047: WE's plug tests relocated to FUI (the canonical impl home) when `we:plugs/` was deleted.
       'blocks/**/__tests__/**/*.test.{ts,tsx}',
