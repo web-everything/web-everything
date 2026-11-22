@@ -1718,6 +1718,7 @@ export function enrichPrsWithLedgerHolds(prs, { readOnly = false, repo, now = Da
  */
 export function runReconcilePass({
   readOnly = false,
+  recoverOwedFixes = null,
   readPrs = defaultReadPrs, readAgents = defaultReadAgents, enrich = enrichAgents,
   excuseMergeGateHolds = excusePrMergeGateHolds, readMergeGateVerdict = defaultReadMergeGateVerdict,
   readFreeze = readSharedFreeze, mergeGateSetting,
@@ -1921,7 +1922,8 @@ export function runReconcilePass({
     mainRedPriority: readPriority(),
     ...(readOnly ? { shadowDeps: { mode: 'off', appendLine: () => {}, readLocals: () => undefined } } : {}),
   };
-  const plan = step('plan', () => planReconcile(plannerInput));
+  const plan = step('plan', () => !readOnly && recoverOwedFixes
+    ? recoverOwedFixes(plannerInput, { plan: planReconcile }) : planReconcile(plannerInput));
   const { prs: _prs, agents: _agents, repo: _repo, now: _now, durableCounts: _counts, ...plannerOptions } = plannerInput;
   return { ...plan, ...(readOnly ? { enrichedPrs: prs, agentList: agents, agentsIncomplete: Object.hasOwn(agents, 'incomplete'), plannerOptions } : {}), owedTriggers: hydrated.owedTriggers, notes: [...hydrated.notes, ...plan.notes], refusals: [...hydrated.refusals, ...plan.refusals], prs: rawPrs.length, agents: agents.length,
     openPrFiles: rawPrs.map((pr) => ({ pr: pr.number, files: Array.isArray(pr.files) && pr.files.length < 100

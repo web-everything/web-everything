@@ -68,6 +68,7 @@ import { assertCapability, repoProfile, briefTokensForRepo } from '../lib/repo-p
 import { resolvePrWorkUnit } from '../conveyor/pr-work-unit.mjs';
 import { freeLaneNumbers, fetchPrDiffPaths, queueBudgetFrom, queueCapWhy, fixerTableFor } from '../conveyor/reconcile-fix-dispatch.mjs'; // queueBudgetFrom/queueCapWhy: card xkyw1x4
 import { runReconcilePass } from '../conveyor/reconcile-pass.mjs';
+import { recoverOwedFixes } from '../conveyor/owed-fix-recovery.mjs';
 import { readUnsupported, recordUnsupported } from '../conveyor/unsupported-repo.mjs';
 import { readPrsFromFile } from '../conveyor/open-pr-fetch.mjs';
 import {
@@ -480,7 +481,11 @@ export async function runReconcileCiHealDispatch({
   timeoutFollowups = await flushTimeouts({ root, repo: CONSTELLATION_REPOS[repoKey].slug });
   flushSkippedRepos.delete(repoKey);
   flushForced = false;
-  const reconciled = reconcile({ repo, ...(prsFile ? { readPrs: () => readPrsFromFile(prsFile) } : {}) });
+  const reconciled = reconcile({ repo,
+    ...(reconcile === runReconcilePass ? {
+      recoverOwedFixes: (input, io) => recoverOwedFixes(input, { ...io, kinds: ['ci-heal'] }),
+    } : {}),
+    ...(prsFile ? { readPrs: () => readPrsFromFile(prsFile) } : {}) });
   // A DEFERRED read planned nothing: owed is UNKNOWN, not zero. Skip the tick — no timeout reruns, no dispatch, no
   // unsupported-row rewrite (that would RELEASE rows the unread PRs still owe) — and say so.
   if (reconciled?.deferred === true) {

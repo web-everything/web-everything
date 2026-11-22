@@ -5933,3 +5933,16 @@ contract. Set `cliMain` in `prFileContract` for callable entries so repeated arg
 the loaded graph. Resetting the entire daemon graph twice inside the CLI test exceeded its
 60-second deadline on a coverage shard. Keep the file/standalone output comparison and zero-GitHub
 assertions intact; consumers without callable entries retain the fresh-import path.
+
+## Owed fix without a session
+
+`owed-fix-recovery.mjs` is enabled only by the fix and CI-heal dispatch consumers,
+each for its own dispatch kind. Recovery must run the ordinary planner with only
+the fixer claim removed; park, stand-down, cap and liveness refusals still apply.
+Keep the per-head reservation under the shared sidecar lock, retain every new
+claim’s full 30-minute session-listing grace, and refuse absent or unreadable
+claim evidence when the planner says a fixer holds it. Escalation delivery flags
+are saved separately after each successful effect, so a failed stream append
+does not replay a successful needs-you publication. The scoped regressions live
+in `reconcile-fix-dispatch.test.mjs`; `reconcile-pass-read-only.test.mjs` proves
+that read-only planning never enables this writer.

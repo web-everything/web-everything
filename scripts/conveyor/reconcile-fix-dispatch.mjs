@@ -176,6 +176,7 @@ import { resolveOperationRoute, resolvePolicyModel } from '../lib/dispatch-routi
 import { countRearmComments } from './rearm-review.mjs';
 import { countAdvisoryComments } from './advisory-round-count.mjs';
 import { readCompletePrComments } from './pr-comments-complete.mjs';
+import { recoverOwedFixes } from './owed-fix-recovery.mjs';
 
 // card 302 — resolve red-main capacity through the shared policy layers.
 export function resolveMainFixCapacity(env = process.env) {
@@ -1958,6 +1959,9 @@ export function runReconcileFixDispatch({
   // stale. Run it for every repo.
   assertMainNotStale(root, checkStaleness, FIX_STALE_GUARD_OPTS);
   const reconciledRaw = reconcile({ repo, allowStandDownAutoProceed,
+    ...(!dryRun && reconcile === runReconcilePass ? {
+      recoverOwedFixes: (input, io) => recoverOwedFixes(input, { ...io, kinds: ['fix'] }),
+    } : {}),
     ...(readPrs ? { readPrs } : {}),
     ...(prsFile ? { readPrs: () => readPrsFromFile(prsFile) } : {}) });
   // A DEFERRED read (gh low budget / slot throttle / author-lookup budget) planned nothing: owed is UNKNOWN, not zero.

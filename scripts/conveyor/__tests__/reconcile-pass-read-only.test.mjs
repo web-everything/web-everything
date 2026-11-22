@@ -116,6 +116,16 @@ describe('read-only live reconciliation', () => {
     expect(probe.writes).toContain('rmSync');
     expect(result).not.toHaveProperty('enrichedPrs');
   });
+  it('owed-fix recovery receives production planner inputs only in a writable dispatch pass', () => {
+    const recoverOwedFixes = vi.fn((input, { plan }) => plan(input));
+    runReconcilePass({ ...options(), recoverOwedFixes });
+    expect(recoverOwedFixes).toHaveBeenCalledTimes(1);
+    expect(recoverOwedFixes.mock.calls[0][0]).toMatchObject({ repo: 'we', prs: [expect.objectContaining({ number: 1 })] });
+    recoverOwedFixes.mockClear(); probe.writes = [];
+    runReconcilePass({ ...options(), readOnly: true, recoverOwedFixes });
+    expect(recoverOwedFixes).not.toHaveBeenCalled();
+    expect(probe.writes).toEqual([]);
+  });
   it('preserves the non-enumerable incomplete marker through merged listings and enrichment', () => {
     const incomplete = ['unreadable-worker'];
     const wrapped = Object.defineProperty([], 'incomplete', { value: incomplete });

@@ -20,6 +20,196 @@ import { CONFLICT_LABEL } from '../parked-pr-conflict-watch.mjs';
 import { resolvePrWorkUnit } from '../pr-work-unit.mjs';
 import { DISPATCHED_AGENT_SYSTEM_PROMPT_FILE, dispatchSessionCwd } from '../../operations/dispatch-lane-io.mjs';
 import { buildAuthorActorMarker } from '../../lib/review-independence.mjs';
+import { recoverOwedFixes } from '../owed-fix-recovery.mjs';
+import { planReconcile } from '../reconcile-core.mjs';
+import { buildStandDownComment } from '../stand-down.mjs';
+
+describe('owed fix recovery', () => {
+  const head = 'a'.repeat(40), start = Date.parse('2026-11-20T12:00:00Z'), minute = 60_000;
+  function fixture(extra = {}) {
+    const states = new Map(); let claims = [];
+    const pr = { number: 7307, state: 'OPEN', isDraft: false, headRefOid: head,
+      headRefName: 'lane/3438-wire-reconcile-pass', labels: [{ name: 'review:human' }],
+      comments: [], blockRuledReferrals: [{ direction: 'repair it' }],
+      statusCheckRollup: [{ name: 'test', status: 'COMPLETED', conclusion: 'SUCCESS' }], ...extra };
+    const effects = { release: vi.fn(() => ({ released: true })), attention: vi.fn(() => true), update: vi.fn(() => true) };
+    const io = { plan: planReconcile, readHead: () => head, readClaims: () => claims,
+      transact: (key, fn) => fn(states.get(key) ?? {}, next => { states.set(key, structuredClone(next)); }),
+      releaseClaim: effects.release, publish: effects.attention, appendUpdate: effects.update,
+      authGate: () => ({ paused: false }) };
+    const tick = (now = start, overrides = {}) => recoverOwedFixes({ repo: 'we', prs: [pr], agents: [],
+      requiredChecks: ['test'], roundCap: 3, roundCapAction: 'person', now, ...overrides }, io);
+    return { tick, io, effects, pr, setClaims: value => { claims = value; } };
+  }
+  it('fix owed >=30 min with no live fixer session is re-dispatched once, then escalated', () => {
+    const f = fixture();
+    expect(f.tick().dispatch).toHaveLength(1);
+    expect(f.tick(start + 30 * minute).dispatch).toHaveLength(1);
+    expect(f.tick(start + 31 * minute).dispatch).toHaveLength(0);
+    expect(f.tick(start + 60 * minute).dispatch).toHaveLength(0);
+    f.tick(start + 90 * minute);
+    expect(f.effects.attention).toHaveBeenCalledTimes(1);
+    expect(f.effects.update).toHaveBeenCalledTimes(1);
+    expect(f.effects.release).not.toHaveBeenCalled();
+  });
+  it('releases a real stale claim only after 30 minutes and never treats an absent record as stale', () => {
+    const f = fixture({ fixClaim: { who: 'fix-7307', claimedAt: new Date(start).toISOString() } });
+    f.setClaims([{ owner: 'holder', meta: { repo: 'we', pr: 7307, kind: 'fixing', headSha: head,
+      who: 'fix-7307', claimedAt: new Date(start).toISOString() } }]);
+    expect(f.tick(start + 29 * minute).dispatch).toHaveLength(0);
+    expect(f.tick(start + 30 * minute).dispatch).toHaveLength(1);
+    expect(f.effects.release).toHaveBeenCalledTimes(1);
+    const absent = fixture({ fixClaim: { who: 'fix-7307', claimedAt: new Date(start).toISOString() } });
+    expect(absent.tick(start + 60 * minute).dispatch).toHaveLength(0);
+    expect(absent.effects.release).not.toHaveBeenCalled();
+  });
+  it.each(['park', 'draft', 'stand-down', 'cap', 'auth'])('never recovers through %s', kind => {
+    const f = fixture();
+    f.tick();
+    if (kind === 'park') f.pr.referralHold = { head, why: 'operator parked' };
+    if (kind === 'draft') f.pr.isDraft = true;
+    if (kind === 'stand-down') f.pr.comments.push({ body: buildStandDownComment({ reason: 'needs-judgment', head }), viewerDidAuthor: true });
+    if (kind === 'auth') f.io.authGate = () => ({ paused: true });
+    const out = f.tick(start + 30 * minute, kind === 'cap' ? { durableCounts: { 7307: 3 } } : {});
+    expect(out.dispatch).toHaveLength(0);
+    expect(f.effects.release).not.toHaveBeenCalled();
+    expect(f.effects.attention).not.toHaveBeenCalled();
+  });
+  it.each([null, Object.assign([], { incomplete: true })])('unreadable liveness refuses recovery', agents => {
+    const f = fixture(); f.tick();
+    expect(f.tick(start + 30 * minute, { agents }).dispatch).toHaveLength(0);
+    expect(f.effects.release).not.toHaveBeenCalled();
+  });
+  it('a live fixer session prevents release or redispatch', () => {
+    const f = fixture(); f.tick();
+    expect(f.tick(start + 30 * minute, { agents: [{ name: 'fix-7307', state: 'working' }] }).dispatch).toHaveLength(0);
+    expect(f.effects.release).not.toHaveBeenCalled();
+  });
+  it.each(['b'.repeat(40), 'aaaaaaa', head + '\n'])('refuses a moved or non-exact 40-hex head %s', observed => {
+    const f = fixture(); f.tick(); f.io.readHead = () => observed;
+    expect(f.tick(start + 30 * minute).dispatch).toHaveLength(0);
+    expect(f.effects.release).not.toHaveBeenCalled();
+  });
+  it('persists each escalation dedupe only after its effect succeeds', () => {
+    const f = fixture(); f.tick(); f.tick(start + 30 * minute);
+    f.effects.attention.mockImplementationOnce(() => { throw new Error('unavailable'); });
+    f.tick(start + 60 * minute);
+    f.effects.update.mockImplementationOnce(() => { throw new Error('unavailable'); });
+    f.tick(start + 61 * minute); f.tick(start + 62 * minute); f.tick(start + 63 * minute);
+    expect(f.effects.attention).toHaveBeenCalledTimes(2);
+    expect(f.effects.update).toHaveBeenCalledTimes(2);
+  });
+  it('claim read failure and a different-head claim refuse recovery without release', () => {
+    const f = fixture(); f.tick();
+    f.io.readClaims = () => { throw new Error('denied'); };
+    expect(f.tick(start + 30 * minute).dispatch).toHaveLength(0);
+    f.io.readClaims = () => [{ owner: 'holder', meta: { repo: 'we', pr: 7307, kind: 'fix',
+      headSha: 'b'.repeat(40), claimedAt: new Date(start).toISOString() } }];
+    expect(f.tick(start + 31 * minute).dispatch).toHaveLength(0);
+    expect(f.effects.release).not.toHaveBeenCalled();
+  });
+  it('a claim changed during recovery is retained and cannot get a second retry', () => {
+    const f = fixture(); f.tick();
+    f.io.readClaims = vi.fn().mockReturnValueOnce([]).mockReturnValue([{ owner: 'new' }]);
+    expect(f.tick(start + 30 * minute).dispatch).toHaveLength(0);
+    expect(f.effects.release).not.toHaveBeenCalled();
+  });
+  it('a newly acquired claim retains its full grace even when the owed episode is older', () => {
+    const f = fixture(); f.tick();
+    f.setClaims([{ owner: 'new-holder', meta: { repo: 'we', pr: 7307, kind: 'fix', headSha: head,
+      claimedAt: new Date(start + 29 * minute).toISOString() } }]);
+    expect(f.tick(start + 30 * minute).dispatch).toHaveLength(0);
+    expect(f.effects.release).not.toHaveBeenCalled();
+    expect(f.tick(start + 59 * minute).dispatch).toHaveLength(1);
+    expect(f.effects.release).toHaveBeenCalledTimes(1);
+  });
+  it('failed effect return values do not persist dedupe', () => {
+    const f = fixture(); f.tick(); f.tick(start + 30 * minute);
+    f.effects.attention.mockReturnValueOnce(false);
+    f.tick(start + 60 * minute);
+    f.effects.update.mockReturnValueOnce(false);
+    f.tick(start + 61 * minute); f.tick(start + 62 * minute);
+    expect(f.effects.attention).toHaveBeenCalledTimes(2);
+    expect(f.effects.update).toHaveBeenCalledTimes(2);
+  });
+  it('unknown auth input refuses and does not reserve the recovery', () => {
+    const f = fixture(); f.tick();
+    f.io.authGate = () => null;
+    expect(f.tick(start + 30 * minute).dispatch).toHaveLength(0);
+    f.io.authGate = () => ({ paused: false });
+    expect(f.tick(start + 31 * minute).dispatch).toHaveLength(1);
+  });
+  it('a head moved during stale-claim release refuses the recovered dispatch', () => {
+    const f = fixture({ fixClaim: { who: 'fix-7307' } });
+    f.setClaims([{ owner: 'holder', meta: { repo: 'we', pr: 7307, kind: 'fixing', headSha: head,
+      who: 'fix-7307', claimedAt: new Date(start).toISOString() } }]);
+    f.io.readHead = vi.fn().mockReturnValueOnce(head).mockReturnValue('b'.repeat(40));
+    expect(f.tick(start + 30 * minute).dispatch).toHaveLength(0);
+  });
+  it('each dispatch consumer reserves recovery only for its own kind', () => {
+    const f = fixture();
+    f.io.kinds = ['ci-heal']; f.tick();
+    f.tick(start + 30 * minute);
+    expect(f.effects.attention).not.toHaveBeenCalled();
+    f.io.kinds = ['fix'];
+    expect(f.tick(start + 60 * minute).dispatch).toHaveLength(1);
+    expect(f.effects.attention).not.toHaveBeenCalled();
+  });
+  it('live head reads are bounded with an explicit next-tick/operator fallback', () => {
+    const f = fixture();
+    f.io.readHead = vi.fn(() => head);
+    const prs = Array.from({ length: 10 }, (_, i) => ({ ...f.pr, number: 7307 + i }));
+    f.tick(start, { prs });
+    const out = f.tick(start + 30 * minute, { prs });
+    expect(f.io.readHead.mock.calls.length).toBeLessThanOrEqual(8);
+    expect(out.refusals.some(row => /budget exhausted.*operator/.test(row.why))).toBe(true);
+  });
+  it('persisted recovery survives a fresh reader and appends exactly one stream line', async () => {
+    const { mkdtempSync, rmSync, readFileSync } = await import('node:fs');
+    const { join } = await import('node:path');
+    const { tmpdir } = await import('node:os');
+    const { recoveryTransaction, appendRecoveryUpdate } = await import('../owed-fix-recovery.mjs');
+    const root = mkdtempSync(join(tmpdir(), 'owed-fix-recovery-'));
+    try {
+      const f = fixture(), path = join(root, 'updates', 'stream.jsonl');
+      f.io.transact = (key, fn) => recoveryTransaction(key, fn, { root });
+      f.io.appendUpdate = item => appendRecoveryUpdate(item, { path });
+      f.tick(); f.tick(start + 30 * minute); f.tick(start + 60 * minute);
+      // New IO object, same persisted state, as after a daemon restart.
+      const fresh = fixture(); Object.assign(fresh.io, f.io);
+      fresh.tick(start + 90 * minute);
+      expect(f.effects.attention).toHaveBeenCalledTimes(1);
+      const lines = readFileSync(path, 'utf8').trim().split('\n');
+      expect(lines).toHaveLength(1);
+      expect(JSON.parse(lines[0])).toMatchObject({ kind: 'needs-you', head, pr: 7307 });
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  });
+  it('oversized/corrupt persisted state and unreadable/absent claim records fail closed', async () => {
+    const { mkdtempSync, rmSync, readdirSync, mkdirSync, writeFileSync } = await import('node:fs');
+    const { join } = await import('node:path');
+    const { tmpdir } = await import('node:os');
+    const { recoveryTransaction, readRecoveryClaims } = await import('../owed-fix-recovery.mjs');
+    const { lockDirFor } = await import('../../readiness/file-locks.mjs');
+    const { fixDispatchResource } = await import('../fix-claim-store.mjs');
+    const root = mkdtempSync(join(tmpdir(), 'owed-fix-evidence-'));
+    try {
+      recoveryTransaction('key', (_state, save) => save({ since: start }), { root });
+      const file = join(root, 'owed-fix-recovery', readdirSync(join(root, 'owed-fix-recovery'))[0]);
+      writeFileSync(file, ' '.repeat(65537));
+      expect(() => recoveryTransaction('key', () => {}, { root })).toThrow(/oversized.*inspect/);
+      writeFileSync(file, '{broken');
+      expect(() => recoveryTransaction('key', () => {}, { root })).toThrow();
+      expect(readRecoveryClaims({ repo: 'we', pr: 7307 }, { root })).toEqual([]);
+      const dir = lockDirFor(root, fixDispatchResource({ repo: 'we', pr: 7307, kind: 'fix' }));
+      mkdirSync(dir, { recursive: true });
+      expect(() => readRecoveryClaims({ repo: 'we', pr: 7307 }, { root })).toThrow(/missing.*inspect/);
+      writeFileSync(join(dir, 'lock.json'), '{broken');
+      expect(() => readRecoveryClaims({ repo: 'we', pr: 7307 }, { root })).toThrow(/invalid.*inspect/);
+      writeFileSync(join(dir, 'lock.json'), ' '.repeat(65537));
+      expect(() => readRecoveryClaims({ repo: 'we', pr: 7307 }, { root })).toThrow(/oversized.*inspect/);
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  });
+});
 
 // Existing resume fixtures have no completion record; never consult the host store.
 vi.mock('../../operations/completion-store.mjs', async (importOriginal) => ({
