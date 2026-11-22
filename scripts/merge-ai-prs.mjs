@@ -133,7 +133,7 @@ import { resolveSkipRebaseApprovedHumanSurface, readApprovedHumanSurfaceHold, re
 // re-exported-only names) — every existing importer of THIS file keeps resolving all five unchanged.
 import { runRenamedPrRefresh, resolveRefreshSettings, logRefreshSettings } from './lib/renamed-pr-refresh.mjs';
 import { shaCacheRepo, resolveFastDrainScopeSetting, resolveFastDrainListingSetting, readFastDrainRoundListing, readFastDrainRoundDefaultBranch, mergeLiveTargetIntoRows, shouldReadContextCommits, filterToFastDrainTarget, readLegacyManifestCached, readLegacyLocalManifestAt } from './lib/fast-drain-scope.mjs';
-import { listLeanOpenPrsPaged, useFastDrainContext, readFastDrainContext, fastDrainPrKey, fastDrainListingAfterBranches } from './lib/fast-drain-context.mjs';
+import { listLeanOpenPrsPaged, useFastDrainContext, readFastDrainContext, readFastDrainPassInventory, readFastDrainFacts, fastDrainPrKey, fastDrainListingAfterBranches } from './lib/fast-drain-context.mjs';
 import { resolveCachedDefaultBranch, createLiveDefaultBranchReader, defaultBranchHold, validDefaultBranch } from './lib/default-branch-cache.mjs';
 import { isTrustedMarkerAuthor, isOperatorAuthored } from './lib/marker-authorship.mjs';
 import { isAiGeneratedPr, hasLabel } from './lib/ai-pr-authorship.mjs';
@@ -1474,6 +1474,23 @@ export function routeRebaseBeforeEnqueue(v, { setting, mergeStrategy, manifestFr
     return null;
   }
   return rebase;
+}
+
+/** Independent check-run/status reads for cascade revalidation. Keep the existing completeness
+ * parser and provenance; only the transport is async, bounded, and routed through the gh throttle.
+ */
+export async function readFreshGateChecks({ repo, headSha, concurrency = 2, exec = execFileP }) {
+  const argv = ['check-runs?per_page=100&filter=all', 'status?per_page=100'].map(endpoint =>
+    ['api', '--paginate', '--slurp', `repos/${repo}/commits/${headSha}/${endpoint}`]);
+  const pages = await readFastDrainFacts(argv, concurrency, async args => {
+    const { stdout } = await exec('gh', args, { encoding: 'utf8', timeout: 60_000, maxBuffer: 64 * 1024 * 1024 });
+    return [JSON.stringify(args), stdout];
+  });
+  const responses = new Map(pages);
+  return readReviewChecks({ repo, headSha, run: args => {
+    if (!responses.has(JSON.stringify(args))) throw new Error('unreadable fresh check response');
+    return responses.get(JSON.stringify(args));
+  } });
 }
 
 /** Fresh bypass evidence: exhaust the head's rollup, bounded to 1,000 contexts.
@@ -5087,7 +5104,7 @@ export async function main(argv, { env = process.env, stdout = process.stdout, e
   // (read-only, no gh call); the old 100 when there is no snapshot to size from (first pass, tests, cwd repo).
   const candidateListLimit = (repo) => { const n = repo ? snapshotOpenCount(repo) : null; return n == null ? 100 : Math.min(100, nextLimit(n)); };
   const isLocalRepo = (repo) => repo == null || repo === localSlug; // git-side ops only run against the local clone
-  const fastContextEnabled = REPOS.some(isLocalRepo) && useFastDrainContext({ onlyPr, fromGreenEvent: flags['from-green-event'], onlyRepo, localSlug, ...fastDrainListing });
+  const fastContextEnabled = REPOS.some(isLocalRepo) && useFastDrainContext({ onlyPr, fromGreenEvent: flags['from-green-event'], fromCatchUp: flags['from-catch-up'], listingSnapshot, onlyRepo, localSlug, ...fastDrainListing });
   const isFastDrainTarget = (repo, p) => REPOS.includes(repo) && matchesOnlyTarget({ prNumber: p.number, onlyPr, repo, onlyRepo, isLocal: isLocalRepo(repo), repoCount: REPOS.length });
   const fastDrainPrs = (repo, prs) => filterToFastDrainTarget(prs, { onlyPr, scope: fastDrain.scope, isTarget: (p) => isFastDrainTarget(repo, p) });
   const repoTag = (repo) => (repo && repo !== localSlug ? `${repo.split('/').pop()}#` : '#'); // display prefix per PR
@@ -5316,7 +5333,8 @@ export async function main(argv, { env = process.env, stdout = process.stdout, e
       const resolved = await resolveChecks(repo, data);
       // Flattened `gh pr view` rows carry no completeness or head provenance.
       // Revalidation must use the same complete, head-scoped read as pre-stage.
-      const checks = readReviewChecks({ repo: repo || localSlug, headSha: data.headRefOid });
+      const checks = await readFreshGateChecks({ repo: repo || localSlug, headSha: data.headRefOid,
+        concurrency: resolvedMergePolicy.policy.concurrency.gateReads });
       const hydrated = { ...resolved, statusCheckRollup: checks,
         rowsComplete: checks.rowsComplete, rowsHead: checks.rowsHead };
       return data.mergeStateStatus === 'BEHIND' && mergeStrategy.queueOwnsFreshness(repo)
@@ -5510,6 +5528,7 @@ export async function main(argv, { env = process.env, stdout = process.stdout, e
   // `liveListingsByRepo` explicitly.
   const fetchContextReads = async (flat) => {
     const readsRaw = await fetchPrReadsCached(flat, {
+      concurrency: resolvedMergePolicy.policy.concurrency.gateReads,
       cache: ctxReadCache,
       keyOf: ({ repo, p }) => prCacheKey(repo, p.number),
       shaOf: ({ p }) => prReadCacheIdentity(p),
@@ -5873,15 +5892,34 @@ export async function main(argv, { env = process.env, stdout = process.stdout, e
   if (fastContextEnabled) {
     // Canonical slugs here; the rest of the drain retains its cwd/null repo sentinel.
     const slugs = [...new Set(CONTEXT_REPOS.map(repo => repo || localSlug))];
+    const listLean = repo => listLeanOpenPrsPaged({ repo,
+      readPage: async query => {
+        const { stdout } = await execFileP('gh', ['api', 'graphql', '-f', `query=${query}`],
+          { encoding: 'utf8', maxBuffer: 64 * 1024 * 1024, timeout: 60_000, env: { ...process.env, GH_REPO: repo } });
+        return stdout;
+      },
+    });
+    const readSnapshot = repo => readSharedOpenPrs({ repo, fields: `${SWEEP_LIST_FIELDS},updatedAt,rowsHead,rowsComplete`, caller: 'merge-ai-prs.mjs', cacheOnly: true });
+    // Cross-PR gates need: open item/dependency identities (blockedBy/stackParents), couple refs
+    // and carrier health, card-group membership, and complete file sets for overlap/queue ordering.
+    // The lean number/head/updatedAt/base/draft/state inventory validates cached facts; only the target
+    // and its dependency/couple/group/overlap component need full live PR/check reads. Commits are target-only.
+    // Catch-up shares base facts across children; each reuse revalidates lean membership. Unknown evidence defers.
     const rows = await __t.timeAsync('listing', () => readFastDrainContext({ repos: slugs, targetRepo: localSlug, onlyPr,
-      readSnapshot: repo => readSharedOpenPrs({ repo, fields: `${SWEEP_LIST_FIELDS},updatedAt,rowsHead,rowsComplete`, caller: 'merge-ai-prs.mjs', cacheOnly: true }),
-      listLean: repo => listLeanOpenPrsPaged({ repo,
-        readPage: async query => {
-          const { stdout } = await execFileP('gh', ['api', 'graphql', '-f', `query=${query}`],
-            { encoding: 'utf8', maxBuffer: 64 * 1024 * 1024, timeout: 60_000, env: { ...process.env, GH_REPO: repo } });
-          return stdout;
+      concurrency: resolvedMergePolicy.policy.concurrency.gateReads, failClosed: !!flags['from-catch-up'],
+      readInventory: flags['from-catch-up'] && listingSnapshot ? () => readFastDrainPassInventory({ path: listingSnapshot,
+        repos: slugs, targetRepo: localSlug, readSnapshot, listLean,
+        concurrency: resolvedMergePolicy.policy.concurrency.gateReads,
+        readMain: async repo => {
+          const defaultBranch = await verifyDefaultBranch(repo);
+          if (!defaultBranch) throw new Error('default branch unresolved live');
+          const { stdout } = await execFileP('gh', ['api', `repos/${repo}/git/ref/heads/${defaultBranch}`, '--jq', '.object.sha'],
+            { encoding: 'utf8', timeout: 60_000, maxBuffer: 1024 * 1024 });
+          return { sha: stdout.trim(), defaultBranch };
         },
-      }),
+      }) : undefined,
+      readSnapshot,
+      listLean,
       readFull: (repo, num) => readFullListingPr(repo, num, true),
       readManifests: async entries => {
         // Reuse the normal bounded manifest/commit reader and its identity cache; collectContext
@@ -5956,7 +5994,7 @@ export async function main(argv, { env = process.env, stdout = process.stdout, e
           const fields = RECONCILE ? SWEEP_LIST_FIELDS
             : CANDIDATE_ONLY_FIELDS + (workflowEditSetting.value !== 'off' ? ',files' : '');
           try {
-            const snap = __t.time('listing.snapshot', () => readSharedOpenPrs({ repo: slug, fields: `${fields},updatedAt`, caller: 'merge-ai-prs.mjs' }));
+            const snap = __t.time('listing.snapshot', () => readSharedOpenPrs({ repo: slug, fields: `${fields},updatedAt`, caller: 'merge-ai-prs.mjs', cacheOnly: true }));
             if (snap == null) {
               process.stderr.write('fast-drain: listing fell back to live (snapshot disabled/unavailable)\n');
             } else {
@@ -6017,7 +6055,7 @@ export async function main(argv, { env = process.env, stdout = process.stdout, e
     readRound: () => listingSnapshot && isFastDrainTarget(repo, { number: onlyPr })
       ? readFastDrainRoundDefaultBranch({ path: listingSnapshot, repo: repo || localSlug }) : null,
   });
-  const resolveBranches = () => __t.timeAsync('listing.defaultBranch', () => Promise.all(REPOS.filter(repo => fastContextEnabled || !(listingSnapshot && isFastDrainTarget(repo, { number: onlyPr }))).map(resolveDefaultBranch)));
+  const resolveBranches = () => __t.timeAsync('listing.defaultBranch', () => mapWithConcurrency(REPOS.filter(repo => fastContextEnabled || !(listingSnapshot && isFastDrainTarget(repo, { number: onlyPr }))), resolvedMergePolicy.policy.concurrency.gateReads, resolveDefaultBranch));
   const listRepos = () => mapWithConcurrency(REPOS, REPOS.length, listOne);
   let [listings] = await __t.timeAsync('listing', () => fastContextEnabled
     ? fastDrainListingAfterBranches({ resolveBranches, list: async () => [await listRepos()] })
@@ -6083,8 +6121,8 @@ export async function main(argv, { env = process.env, stdout = process.stdout, e
   }
   // Issue live branch reads after ALL synchronous page work, including context/eviction fallback.
   // A parent's round snapshot or host cache never populates the authoritative map.
-  await __t.timeAsync('gate.defaultBranch', () => Promise.all(REPOS
-    .filter(repo => prsByRepo.get(repo)?.length).map(repo => verifyDefaultBranch(repo || localSlug))));
+  await __t.timeAsync('gate.defaultBranch', () => mapWithConcurrency(REPOS
+    .filter(repo => prsByRepo.get(repo)?.length), resolvedMergePolicy.policy.concurrency.gateReads, repo => verifyDefaultBranch(repo || localSlug)));
   // #xc7p3q9 (R2) — the operator escape hatch symmetric to `--no-review-escalation`: `--assume-complete-context`
   // FORCES the context complete so a genuinely-stuck couple (e.g. a persistent read-noise fail-closed) can land
   // short of editing the script. Prints a LOUD one-line waiver. Off by default; the fail-closed gate stays live.
@@ -7608,13 +7646,17 @@ export async function main(argv, { env = process.env, stdout = process.stdout, e
           // stale / refused member holds the whole couple (the stale one has been refreshed by its gate).
           const siblings = !mergeQueueHookEnabled(MERGE_QUEUE) ? [] : coupleStep.ordered.filter((x) => x !== c && isImplHalf(x) && `${x.coupleCarrier.repo || 'cwd'}::${x.coupleCarrier.num}` === ck
             && !heldThisIteration.has(candKey(x)) && !merged.some((m) => candKey(m) === candKey(x)));
-          let siblingHold = null;
-          for (const sib of siblings) {
-            const sibFresh = await revalidateFresh(sib.repo, sib.num, {
+          // Independent sibling revalidations are read-only; keep refresh/writes ordered below.
+          // execFileP retains the shared gh throttle, while gateReads bounds this fan-out.
+          const siblingReads = await readFastDrainFacts(siblings, resolvedMergePolicy.policy.concurrency.gateReads, sib =>
+            revalidateFresh(sib.repo, sib.num, {
               queueRequiredChecks: queueRequiredChecksOf(sib.repo),
               requiredCheck: REQUIRED, allowPendingReview: (escalationRelief.prs || []).includes(Number(sib.num)) || (!!escalationRelief.passWide && !!label),
               defaultBranch: defaultBranchOf(sib.repo), expectedHeadSha: sib.listedHeadSha || sib.headSha || null,
-            });
+            }));
+          let siblingHold = null;
+          for (const [index, sib] of siblings.entries()) {
+            const sibFresh = siblingReads[index];
             if (sibFresh.decision !== 'merge') { siblingHold = { sib, why: `its impl half ${repoTag(sib.repo)}${sib.num} would not merge (${sibFresh.reason})` }; break; }
             if (!(await mergeQueueGate(sib, sibFresh.headSha, { precheck: true }))) { siblingHold = { sib, why: `its impl half ${repoTag(sib.repo)}${sib.num} is not merge-fresh (merge-queue) — refreshed/held` }; break; }
           }

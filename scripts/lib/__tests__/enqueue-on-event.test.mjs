@@ -240,6 +240,12 @@ describe('overlayRefreshPending', () => {
 });
 
 describe('fast drain helpers', () => {
+  it('catch-up children explicitly select the shared pass context without claiming a green event', () => {
+    expect(fastDrainArgs({ scriptRoot: '/code', num: 42, listingSnapshot: '/scratch/round.json' })).toEqual([
+      join('/code', 'scripts', 'merge-ai-prs.mjs'), '--only=42', '--label=ready-to-merge', '--this-repo', '--json',
+      '--from-catch-up', '--listing-snapshot=/scratch/round.json',
+    ]);
+  });
   it('builds the exact single-PR fast drain arguments', () => {
     expect(fastDrainArgs({ scriptRoot: '/code', num: 42 })).toEqual([
       join('/code', 'scripts', 'merge-ai-prs.mjs'), '--only=42', '--label=ready-to-merge', '--this-repo', '--json',

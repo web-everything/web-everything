@@ -7,10 +7,11 @@ import { SNAPSHOT_FIELDS } from '../../lib/pr-snapshot.mjs';
 import { writeDefaultBranchCache, readDefaultBranchCache } from '../../lib/default-branch-cache.mjs';
 import { PR_SNAPSHOT_VERSION } from '../../lib/pr-snapshot-store.mjs';
 import { buildManifest, embedManifestInBody } from '../../readiness/lane-manifest.mjs';
+import { fastDrainArgs } from '../../lib/enqueue-on-event.mjs';
 import { daemonAppEnv } from './daemon-app-env.mjs';
 
 export function runFastDrainContextCli({ root = resolve(dirname(fileURLToPath(import.meta.url)), '../../..'), killSwitch = false,
-  failDefaultBranch = false, outputAsJson = true, cachedBranch = null, liveDefaultBranch = 'main', roundBranch = null, rowCount = 48, leanIncomplete = false, fullIncomplete = false, leanPageError = false, targetBaseRefName = 'main' } = {}) {
+  catchUp = false, targetLabels = null, failDefaultBranch = false, outputAsJson = true, cachedBranch = null, liveDefaultBranch = 'main', roundBranch = null, rowCount = 48, leanIncomplete = false, fullIncomplete = false, leanPageError = false, targetBaseRefName = 'main' } = {}) {
   const dir = mkdtempSync(join(process.env.TMPDIR, 'fast-context-cli-'));
   try {
     const bin = join(dir, 'bin'), snapshots = join(dir, 'snapshots');
@@ -20,7 +21,7 @@ export function runFastDrainContextCli({ root = resolve(dirname(fileURLToPath(im
       return { number, headRefOid, headRefName: `lane/${number}`, title: `Fixture ${number}`, state: 'OPEN',
         updatedAt: '2026-11-18T00:00:00Z', baseRefName: number === 7 ? targetBaseRefName : 'main', isDraft: false,
         mergeable: 'MERGEABLE', mergeStateStatus: 'CLEAN', reviewDecision: 'APPROVED',
-        labels: [{ name: 'ready-to-merge' }, { name: 'review:accepted' }], files: [{ path: `src/${number}.mjs` }],
+        labels: number === 7 && targetLabels ? targetLabels : [{ name: 'ready-to-merge' }, { name: 'review:accepted' }], files: [{ path: `src/${number}.mjs` }],
         body: embedManifestInBody('fixture', buildManifest({ item: number, repos: [{ repo: 'we', ref: `lane/${number}` }] })),
         rowsHead: headRefOid, rowsComplete: true,
         statusCheckRollup: [{ __typename: 'CheckRun', name: 'test', status: 'COMPLETED', conclusion: 'SUCCESS', workflowName: 'test' }] };
@@ -50,6 +51,7 @@ if (a[0] === 'repo' && a[1] === 'view') {
   if (process.env.CONTEXT_FAIL_BRANCH === '1') { fs.writeSync(2, 'fixture default branch failure'); process.exit(1); }
   fs.writeSync(1, process.env.CONTEXT_LIVE_BRANCH); process.exit(0);
 }
+if (a[0] === 'api' && a[1]?.includes('/git/ref/heads/')) { fs.writeSync(1, 'a'.repeat(40)); process.exit(0); }
 if (a[0] === 'pr' && a[1] === 'list') {
   const fields = a[a.indexOf('--json') + 1].split(',');
   out(selected.map(p => Object.fromEntries(fields.map(f => [f, p[f]]))));
@@ -80,9 +82,11 @@ if (a[0] === 'api' && a[1] === 'graphql' && a.some(v => v.includes('pullRequests
 }
 out({});
 `, { mode: 0o755 });
-    const result = spawnSync(process.execPath, [join(root, 'scripts/merge-ai-prs.mjs'), '--this-repo', '--only=7',
-      '--from-green-event', '--label=ready-to-merge', '--dry-run', ...(outputAsJson ? ['--json'] : []), '--no-drain-lease',
-      '--no-red-main-freeze', '--no-review-escalation', '--repoll-delay=0', ...(roundBranch ? [`--listing-snapshot=${roundPath}`] : [])], {
+    const args = catchUp ? fastDrainArgs({ scriptRoot: root, num: 7, listingSnapshot: roundPath })
+      : [join(root, 'scripts/merge-ai-prs.mjs'), '--this-repo', '--only=7', '--from-green-event', '--label=ready-to-merge',
+        ...(outputAsJson ? ['--json'] : []), ...(roundBranch ? [`--listing-snapshot=${roundPath}`] : [])];
+    const result = spawnSync(process.execPath, [...args, '--dry-run', '--no-drain-lease',
+      '--no-red-main-freeze', '--no-review-escalation', '--repoll-delay=0'], {
       cwd: dir, encoding: 'utf8', timeout: 30_000, maxBuffer: 8 * 1024 * 1024,
       env: { ...process.env, ...daemonAppEnv(dir), PATH: `${bin}:${process.env.PATH}`, WE_UNDER_TEST: '1',
         WE_PR_SNAPSHOT: '1', WE_PR_SNAPSHOT_DIR: snapshots, WE_FAST_DRAIN_LISTING: 'snapshot',

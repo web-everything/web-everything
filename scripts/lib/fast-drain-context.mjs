@@ -1,10 +1,14 @@
 /**
- * Single green-event drain context. The live, lean inventory owns membership; a cache-only
+ * Single-PR drain context (green events and catch-up). The live, lean inventory owns membership; a cache-only
  * shared snapshot contributes full rows only at the same number/head/updatedAt. Unknown
- * inventory or evidence falls back to the drain's existing full listing. Related components
+ * inventory or evidence defers catch-up; legacy green events retain their full-list fallback. Related components
  * are refreshed before returning any evidence to gates; none of the merge gates lives here.
  * IO is injected so cost, freshness, fallback and ordering can be exercised without GitHub.
  */
+import { readFileSync, statSync } from 'node:fs';
+import { writeJsonAtomic } from './atomic-json-file.mjs';
+import { withFastDrainRoundLock } from './fast-drain-scope.mjs';
+import { mapWithConcurrency } from './drain-concurrency.mjs';
 import { asItemId, isItemId } from '../readiness/lane-manifest.mjs';
 import { isDegradedOpenPrListing, OPEN_PR_LIST_LIMIT } from './no-search-backed-pr-list.mjs';
 import { assertInventoryComplete, buildOpenPrPageQuery, parseOpenPrPage } from './pr-list-paged.mjs';
@@ -13,8 +17,8 @@ import { queueFileOverlap, completeListedFiles } from './queue-file-overlap.mjs'
 export const LEAN_OPEN_PR_FIELDS = 'number,headRefOid,updatedAt,baseRefName,isDraft,state';
 export const fastDrainPrKey = (repo, number) => `${repo}#${number}`;
 
-export function useFastDrainContext({ onlyPr, fromGreenEvent, onlyRepo, localSlug, listing, context }) {
-  return onlyPr != null && !!fromGreenEvent && (!onlyRepo || onlyRepo === localSlug) && !!localSlug
+export function useFastDrainContext({ onlyPr, fromGreenEvent, fromCatchUp, listingSnapshot, onlyRepo, localSlug, listing, context }) {
+  return onlyPr != null && (!!fromGreenEvent || (!!fromCatchUp && !!listingSnapshot)) && (!onlyRepo || onlyRepo === localSlug) && !!localSlug
     && listing !== 'live' && context !== 'live';
 }
 
@@ -118,13 +122,89 @@ export function relatedFastDrainPrs(entries, targetKey, groups = []) {
   return selected;
 }
 
-async function hydrateLiveInventory({ repos, snapshots, target, targetRepo, onlyPr, listLean, readFull, liveReads }) {
+/** Join the entire bounded read pool before throwing: a failed sibling must not release the
+ * pass lock while other reads are still running. Mutations/refreshes stay outside this pool.
+ */
+export async function readFastDrainFacts(items, concurrency, read) {
+  const results = await mapWithConcurrency(items, concurrency, async (item, index) => {
+    try { return { value: await read(item, index) }; }
+    catch (error) { return { error }; }
+  });
+  const failed = results.find(r => Object.hasOwn(r, 'error'));
+  if (failed) throw failed.error;
+  return results.map(r => r.value);
+}
+
+/** One base snapshot per catch-up pass, single-flight across child processes. Every reader
+ * checks live main SHAs AND revalidates lean PR membership: opening a blocker does not move main.
+ * Changed/expired base evidence is refreshed under the shared lock or deferred to the next pass.
+ * Rows are published only for the parent's existing snapshotFirst readiness check, not gate authority.
+ */
+export async function readFastDrainPassInventory({ path, repos, targetRepo, snapshots, readSnapshot = repo => snapshots?.get(repo), readMain,
+  listLean, concurrency = 4, now = Date.now, write = writeJsonAtomic,
+  read = p => { if (statSync(p).size > 64 * 1024 * 1024) throw new Error('pass snapshot oversized'); return JSON.parse(readFileSync(p, 'utf8')); },
+  lock = fn => withFastDrainRoundLock(path, fn),
+}) {
+  const observedAt = now();
+  const readHeads = async () => Object.fromEntries(await readFastDrainFacts(repos, concurrency, async repo => {
+    const head = await readMain(repo);
+    if (!/^[a-f0-9]{40}$/i.test(head?.sha ?? '') || typeof head.defaultBranch !== 'string' || !head.defaultBranch.trim()) {
+      throw new Error('pass main SHA unreadable — retry next pass');
+    }
+    return [repo, head];
+  }));
+  let heads = await readHeads();
+  const cached = () => {
+    try {
+      const s = read(path), age = now() - s.writtenAt;
+      if (s.v !== 1 || s.repo !== targetRepo || !Number.isFinite(age) || age < 0 || age >= 60_000
+        || !Array.isArray(s.repos) || s.repos.length !== repos.length || !repos.every(r => s.repos.includes(r))) return null;
+      for (const repo of repos) {
+        if (s.heads?.[repo]?.sha !== heads[repo].sha || s.heads[repo].defaultBranch !== heads[repo].defaultBranch) return null;
+        validateLeanOpenPrs(s.inventories?.[repo], OPEN_PR_LIST_LIMIT, repo);
+        if (!Array.isArray(s.snapshots?.[repo])) return null;
+      }
+      return { inventories: new Map(repos.map(r => [r, s.inventories[r]])),
+        snapshots: new Map(repos.map(r => [r, s.snapshots[r]])) };
+    } catch { return null; }
+  };
+  const readInventories = async () => new Map(await readFastDrainFacts(repos, concurrency, async repo => {
+    const inventory = await listLean(repo);
+    validateLeanOpenPrs(inventory, OPEN_PR_LIST_LIMIT, repo);
+    return [repo, inventory];
+  }));
+  // The pass shares base row facts, never membership authority. Fresh head/updatedAt identities
+  // also force hydration of new/changed PRs before dependency, couple or overlap gates run.
+  const revalidateMembership = async base => ({ ...base, inventories: await readInventories() });
+  const hit = cached();
+  if (hit) return revalidateMembership(hit);
+  const result = await lock(async () => {
+    // A main move while waiting for another child invalidates our pre-lock SHA too.
+    heads = await readHeads();
+    const hit = cached();
+    if (hit) return revalidateMembership(hit);
+    const writtenAt = observedAt; // Include main-read/lock wait time in the freshness bound.
+    const snapshots = new Map(repos.map(repo => {
+      const rows = readSnapshot(repo);
+      if (!Array.isArray(rows)) throw new Error('snapshot unavailable/disabled/stale/dirty — retry next pass');
+      return [repo, rows];
+    }));
+    const inventories = Object.fromEntries(await readInventories());
+    if (now() - writtenAt >= 60_000) throw new Error('pass inventory expired while reading — retry next pass');
+    write(path, { v: 1, repo: targetRepo, repos, heads, inventories, snapshots: Object.fromEntries(snapshots), writtenAt,
+      rows: snapshots.get(targetRepo), defaultBranch: heads[targetRepo].defaultBranch });
+    return { inventories: new Map(repos.map(r => [r, inventories[r]])), snapshots };
+  });
+  if (!result.ok) throw new Error(`pass snapshot unavailable (${result.reason || 'lock failure'}) — retry next pass`);
+  return result.value;
+}
+
+async function hydrateLiveInventory({ repos, snapshots, target, targetRepo, onlyPr, listLean, readFull, liveReads, concurrency }) {
   const byRepo = new Map();
-  for (const repo of repos) {
+  await mapWithConcurrency(repos, 1, async repo => {
     const lean = validateLeanOpenPrs(await listLean(repo), OPEN_PR_LIST_LIMIT, repo);
     const snap = new Map(snapshots.get(repo).map(p => [p.number, p]));
-    const rows = [];
-    for (const p of lean) {
+    const rows = await readFastDrainFacts(lean, concurrency, async p => {
       let row;
       const isTarget = repo === targetRepo && p.number === Number(onlyPr);
       if (isTarget && matchingSnapshotRow(target, p)) row = target;
@@ -133,20 +213,19 @@ async function hydrateLiveInventory({ repos, snapshots, target, targetRepo, only
         row = requireFullPr(await readFull(repo, p.number), p.number);
         liveReads.add(fastDrainPrKey(repo, p.number));
       }
-      if (row.state === 'OPEN') rows.push(row);
-    }
-    byRepo.set(repo, rows);
-  }
+      return row;
+    });
+    byRepo.set(repo, rows.filter(row => row.state === 'OPEN'));
+  });
   return byRepo;
 }
 
-async function readManifestEntries(entries, readManifest) {
-  const manifests = new Map();
-  for (const { repo, p } of entries) manifests.set(fastDrainPrKey(repo, p.number), await readManifest(repo, p));
-  return manifests;
+async function readManifestEntries(entries, readManifest, concurrency) {
+  return new Map(await readFastDrainFacts(entries, concurrency, async ({ repo, p }) =>
+    [fastDrainPrKey(repo, p.number), await readManifest(repo, p)]));
 }
 
-async function refreshRelatedContext({ byRepo, readGroups, readManifests, targetRepo, onlyPr, readFull, liveReads }) {
+async function refreshRelatedContext({ byRepo, readGroups, readManifests, targetRepo, onlyPr, readFull, liveReads, concurrency }) {
   const state = await readGroups();
   if (state?.unreadable) throw new Error('card-group state unreadable');
   // Recompute after hydration: a live related row can expose another edge. Each PR is read at most once.
@@ -162,32 +241,44 @@ async function refreshRelatedContext({ byRepo, readGroups, readManifests, target
     const related = relatedFastDrainPrs(entries, fastDrainPrKey(targetRepo, onlyPr), state?.groups);
     const pending = entries.filter(e => related.has(fastDrainPrKey(e.repo, e.p.number)) && !liveReads.has(fastDrainPrKey(e.repo, e.p.number)));
     if (!pending.length) break;
-    for (const { repo, p } of pending) {
+    await readFastDrainFacts(pending, concurrency, async ({ repo, p }) => {
       const live = requireFullPr(await readFull(repo, p.number), p.number);
       liveReads.add(fastDrainPrKey(repo, p.number));
       byRepo.set(repo, byRepo.get(repo).flatMap(row => row.number !== p.number ? [row] : live.state === 'OPEN' ? [live] : []));
-    }
+    });
   }
 }
 
-/** Either return a complete per-repo row map or null: the caller then runs its old full path. */
+/** Complete per-repo context, or defer catch-up. Legacy callers may opt into the full-list fallback. */
 export async function readFastDrainContext({ repos, targetRepo, onlyPr, readSnapshot, listLean, readFull,
-  readManifest, readManifests = entries => readManifestEntries(entries, readManifest),
+  readManifest, concurrency = 4, readInventory, failClosed = false,
+  readManifests = entries => readManifestEntries(entries, readManifest, concurrency),
   readGroups = () => ({ groups: [] }), time = (_phase, f) => f(), log = () => {} }) {
   try {
-    const snapshots = new Map();
-    for (const repo of repos) {
-      const rows = readSnapshot(repo);
-      if (!Array.isArray(rows)) throw new Error('snapshot unavailable/disabled/stale/dirty');
-      snapshots.set(repo, rows);
-    }
-    const target = requireFullPr(await time('listing.target', () => readFull(targetRepo, Number(onlyPr))), Number(onlyPr));
+    const loadInventory = () => {
+      if (readInventory) return readInventory();
+      const snapshots = new Map(repos.map(repo => {
+        const rows = readSnapshot(repo);
+        if (!Array.isArray(rows)) throw new Error('snapshot unavailable/disabled/stale/dirty');
+        return [repo, rows];
+      }));
+      return { snapshots };
+    };
+    // A pass hit owns the base facts too: a sibling enqueue may dirty the host cache while
+    // the main-SHA-bound pass remains valid. Never refresh that host cache inside a child.
+    const readTarget = () => time('listing.target', async () => requireFullPr(await readFull(targetRepo, Number(onlyPr)), Number(onlyPr)));
+    let base, target;
+    if (readInventory) [base, target] = await readFastDrainFacts(
+      [() => time('listing.inventory', loadInventory), readTarget], 2, read => read());
+    else { base = loadInventory(); target = await readTarget(); }
+    const { snapshots, inventories } = base;
     const liveReads = new Set([fastDrainPrKey(targetRepo, onlyPr)]);
-    const byRepo = await time('listing.lean', () => hydrateLiveInventory({ repos, snapshots, target, targetRepo, onlyPr, listLean, readFull, liveReads }));
-    await time('listing.related', () => refreshRelatedContext({ byRepo, readGroups, readManifests, targetRepo, onlyPr, readFull, liveReads }));
+    const byRepo = await time('listing.lean', () => hydrateLiveInventory({ repos, snapshots, target, targetRepo, onlyPr, listLean: inventories ? repo => inventories.get(repo) : listLean, readFull, liveReads, concurrency }));
+    await time('listing.related', () => refreshRelatedContext({ byRepo, readGroups, readManifests, targetRepo, onlyPr, readFull, liveReads, concurrency }));
     return byRepo;
   } catch (e) {
     const reason = String(e?.message ?? e).replace(/[\x00-\x1f\x7f-\x9f]/g, ' ').slice(0, 180);
+    if (failClosed) throw new Error(`fast-drain: incomplete pass context (${reason}) — retry next pass`, { cause: e });
     log(`fast-drain: context fell back to full listing (${reason})`);
     return null;
   }
