@@ -1,12 +1,13 @@
 import { afterEach, describe, expect, it } from 'vitest';
 import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { pathToFileURL } from 'node:url';
 import { createAsyncShadow, summarize } from '../lib/drain-async-shadow.mjs';
 
 const roots = [];
-const temp = () => { const dir = mkdtempSync(join(process.env.TMPDIR, 'async-shadow-')); roots.push(dir); return dir; };
+const temp = () => { const dir = mkdtempSync(join(process.env.TMPDIR || tmpdir(), 'async-shadow-')); roots.push(dir); return dir; };
 const lines = path => readFileSync(path, 'utf8').trim().split('\n').map(JSON.parse);
 const candidate = { repo: 'owner/repo', num: 7, headSha: 'head-a', readyAtMs: 10 };
 const key = c => `${c.repo}#${c.num}@${c.headSha}`;

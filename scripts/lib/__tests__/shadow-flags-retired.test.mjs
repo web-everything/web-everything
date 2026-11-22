@@ -2,19 +2,22 @@
 // Tier 1: hermetic policy boundaries, no forge calls or counted-path mutations.
 import { afterEach, expect, it, vi } from 'vitest';
 import { mkdtempSync, readFileSync, readdirSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import yaml from 'js-yaml';
 import { resolvePostAcceptAdvisorySettings } from '../post-accept-advisory-settings.mjs';
 import { resolveTimingPolicy } from '../review-timing-settings.mjs';
 import { resolveReviewChurn } from '../../conveyor/review-churn.mjs';
 import { resolveDeliveryCapacity } from '../delivery-capacity.mjs';
-import { readDeliveryPrioritySettings } from '../../conveyor/delivery-priority-shadow.mjs';
-import { resolveStaleReferralHumanShadow } from '../../conveyor/stale-referral-human-shadow.mjs';
+import { logFixPassPriorityShadow, readDeliveryPrioritySettings } from '../../conveyor/delivery-priority-shadow.mjs';
+import { decideStaleReferralHumanHold, resolveStaleReferralHumanShadow } from '../../conveyor/stale-referral-human-shadow.mjs';
 import { createAsyncShadow } from '../drain-async-shadow.mjs';
 import { traceEnabled } from '../test-cache-trace.mjs';
-import { derivePanelVerdict, MANDATORY_LENSES } from '../jury-core.mjs';
-import { reviewMustVoid } from '../review-timing.mjs';
-import { classifyPr } from '../../merge-ai-prs.mjs';
+import { derivePanelVerdict } from '../jury-core.mjs';
+import { REVIEW_TIMING_DEFAULTS, reviewStartGate } from '../review-timing.mjs';
+import { postAcceptAdvisoryDecision } from '../review-loop-policy.mjs';
+import { planReconcile } from '../../conveyor/reconcile-core.mjs';
+import { createDeliveryCapacityTune } from '../../operations/delivery-capacity-tune-shell.mjs';
 import { evaluatePrGates } from '../merge-gate-ci.mjs';
 import { build, verify } from '../drain-verdict.mjs';
 
@@ -22,7 +25,8 @@ const root = new URL('../../../', import.meta.url);
 const read = path => readFileSync(new URL(path, root), 'utf8');
 const workflow = name => yaml.load(read(`.github/workflows/${name}.yml`));
 const dirs = [];
-const temp = () => { const dir = mkdtempSync(join(process.env.TMPDIR, 'retired-shadow-')); dirs.push(dir); return dir; };
+// Linux CI may leave TMPDIR unset; join(undefined, …) would throw before any assertion runs.
+const temp = () => { const dir = mkdtempSync(join(process.env.TMPDIR || tmpdir(), 'retired-shadow-')); dirs.push(dir); return dir; };
 afterEach(() => { vi.unstubAllEnvs(); for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true }); });
 
 // Resolver probes BEFORE edits, with empty env/platform (2026-11-21):
@@ -76,73 +80,153 @@ const provenance = { runId: '123456', event: 'workflow_dispatch', ref: 'refs/hea
 const inputs = { repo: 'o/r', pr: 7, headSha: HEAD, mainSha: MAIN, computedAt: '2026-11-21T12:00:00.000Z', decision: 'enqueue', provenance };
 const now = Date.parse(inputs.computedAt);
 
-// Adapted from merge-gate-ci.test.mjs: pinned, accepted, prose-only PR; inject all IO.
-function facts() {
-  return {
-    repo: 'o/r', num: 7, defaultBranch: 'main',
-    pr: { number: 7, title: 't', body: 'A real body', baseRefName: 'main', headRefName: 'lane/x', headRefOid: HEAD,
-      isCrossRepository: false, labels: [{ name: 'ready-to-merge' }, { name: 'review:accepted' }],
-      commits: [{ oid: HEAD, messageHeadline: 'x', messageBody: 'Co-Authored-By: Claude <noreply@anthropic.com>' }], statusCheckRollup: [] },
-    manifest: { live: null }, netSignals: { scored: true, changedFiles: ['docs/a.md'], diffLines: 2,
-      humanBasisFiles: ['docs/a.md'], cumulativeDiffLines: 2, basisNarrowed: true,
-      netDiffText: { text: 'diff --git a/docs/a.md b/docs/a.md\n@@ -0,0 +1 @@\n+doc\n', scored: true, rev: HEAD }, diffHunks: '' },
-    acceptance: { headSha: HEAD, acceptedSha: HEAD, headReadFailed: false },
-    bodyHistory: { bodies: ['A real body'], complete: true }, duplicateIds: { main: [] },
-    redMain: { source: 'ops/red-main', frozen: false }, enqueueClearance: null,
-    redTeamCheck: { ok: true, reason: 'red-team check run succeeded on head' },
-    ledger: { authority: 'labels', folded: null, derived: null }, pinnedHead: { sha: HEAD }, gatePaths: { files: ['docs/a.md'] },
-  };
-}
-function countedOutputs() {
-  const f = facts();
-  const options = { carrySetting: { value: 'off', source: 'test' }, proveCarry: () => { throw Error('unexpected IO'); }, write: () => {} };
-  const verdict = build(inputs);
-  return JSON.stringify({
-    review: ['accept', 'changes', 'needs-human'].map(v => derivePanelVerdict({ findings: [],
-      lensVerdicts: Object.fromEntries(MANDATORY_LENSES.map(lens => [lens, v])) })),
-    drain: [classifyPr(f.pr), classifyPr({ ...f.pr, statusCheckRollup: null }), classifyPr({ ...f.pr, isDraft: true })],
-    merge: [evaluatePrGates(f, options), evaluatePrGates({ num: 7, prReadError: 'unreadable' }, options)],
-    headBinding: [verify(verdict, inputs, { now }), verify(verdict, { ...inputs, headSha: MAIN }, { now }),
-      verify(null, inputs, { now }), reviewMustVoid({ reviewedHead: HEAD, currentHead: MAIN, checks: [] })],
-  });
-}
+it('the drain-async probe runs where TMPDIR is unset (Linux CI)', () => {
+  const saved = process.env.TMPDIR;
+  delete process.env.TMPDIR; // vi.stubEnv(…, undefined) can leave the string 'undefined' behind
+  try {
+    const drainAsync = flags.find(([name]) => name === 'drain-async');
+    expect(drainAsync[4]({ WE_ASYNC_DRAIN: 'shadow' })).toBe('shadow');
+  } finally { if (saved !== undefined) process.env.TMPDIR = saved; }
+});
 
 it('each retired shadow flag resolves off', () => {
   for (const [name, , , , resolve] of flags) expect.soft(resolve(), name).toBe('off');
 });
 
-// File-only settings use the production resolver's read seam; no repository settings are edited.
-function resolveObserver(name, env, value, resolve) {
-  if (name === 'delivery-capacity auto tune') return resolveDeliveryCapacity({ env, platform: {},
-    read: () => ({ deliveryCapacity: { autoTune: { mode: value } } }) }).value.autoTune.mode;
-  if (name === 'delivery-priority') return readDeliveryPrioritySettings({ env,
-    read: () => JSON.stringify({ deliveryPriority: { mode: value } }) }).mode;
-  return resolve(env);
-}
+// ── Consumer equivalence: each flag's resolved value is fed to the code that READS it in production. ──
+// `observed` is the shadow side effect and MUST differ between the old and retired value: it proves the varied
+// input reached the consumer (a negative control; without it a byte-identical comparison is vacuous).
+// `counted` is the live decision that consumer feeds and MUST be byte-identical. A flag whose only consumer is an
+// observer has `counted: null`: retiring it is proven by its observer going silent, not by an equivalence claim.
+const at = h => `2026-10-10T${String(h).padStart(2, '0')}:00:00Z`;
+const BOT = { login: 'web-everything' };
+const accept = (head, h) => ({ author: BOT, createdAt: at(h), body: `✅ review — accepted\n\n<!-- reviewed-sha: ${head} -->` });
+const REQUIRED = ['standards', 'test-shard (1)', 'test'];
+const ok = name => ({ name, status: 'COMPLETED', conclusion: 'SUCCESS', headSha: HEAD });
+const CHECK_SHAPES = {
+  green: REQUIRED.map(ok),
+  pending: [ok('standards'), ok('test-shard (1)'), { name: 'test', status: 'IN_PROGRESS', conclusion: null, headSha: HEAD }],
+  fastPending: [ok('standards'), { name: 'test-shard (1)', status: 'IN_PROGRESS', conclusion: null, headSha: HEAD }, ok('test')],
+  fastMissing: [ok('standards'), ok('test')],
+  red: [{ name: 'standards', status: 'COMPLETED', conclusion: 'FAILURE', headSha: HEAD }, ok('test-shard (1)'), ok('test')],
+};
+const reconcilePr = (checks, extra = {}) => ({
+  number: 7, headRefName: 'lane/x-thing', headRefOid: HEAD, baseRefName: 'main', isDraft: false, createdAt: at(0),
+  labels: [{ name: 'review:pending' }], files: [{ path: 'src/a.mjs' }], statusCheckRollup: checks,
+  rowsComplete: true, rowsHead: HEAD, comments: [], ...extra });
+const plan = (pr, reviewTiming = { startAfter: 'ci-green' }) => planReconcile({ reviewTiming, prs: [pr], agents: [],
+  durableCounts: {}, now: Date.parse(at(20)), requiredChecks: REQUIRED });
+const rowOf = result => result.dispatch.find(row => row.prNumber === 7) ?? null;
+const without = (value, key) => JSON.stringify(value, (k, v) => k === key ? undefined : v);
+const churnPlan = (settings, comments, trees) => plan(reconcilePr(REQUIRED.map(ok), { comments,
+  reviewChurn: { settings, headTree: 't'.repeat(40), trees } }));
+const startGate = (policy, checks) => reviewStartGate({ headSha: HEAD, checks, requiredChecks: REQUIRED,
+  rowsHead: HEAD, rowsComplete: true, repo: 'we', policy });
+// Both strings mean "a required check is not registered yet"; reconcile-core#ciMissingRerun treats them alike.
+const MISSING_CHECK_REASONS = ['ci-not-registered', 'required-checks-not-successful'];
 
-it.each(flags.filter(([name]) => !['test-selection-measure', 'drain-verdict'].includes(name)))(
-  '%s: real resolver selects old shadow and retired values with byte-identical counted verdicts',
-  (name, envKey, before, off, resolve) => {
-    const env = {};
-    if (envKey) { env[envKey] = before; vi.stubEnv(envKey, before); }
-    expect(resolveObserver(name, env, before, resolve), `${name} old shadow`).toBe('shadow');
-    const previous = countedOutputs();
-    if (envKey) { env[envKey] = off; vi.stubEnv(envKey, off); }
-    expect(resolveObserver(name, env, off, resolve), `${name} retired`).toBe('off');
-    expect(countedOutputs(), name).toBe(previous);
+const consumers = {
+  'review-churn same tree': env => {
+    const twin = 'c'.repeat(40);
+    const result = churnPlan(resolveReviewChurn({ env, platform: {} }), [accept(twin, 1)], { [twin]: 't'.repeat(40) });
+    return { observed: rowOf(result)?.churnShadow?.kind ?? null, counted: without(result, 'churnShadow') };
+  },
+  'review-churn cap': env => {
+    const heads = ['c', 'd', 'e'].map(c => c.repeat(40));
+    const settings = { ...resolveReviewChurn({ env, platform: {} }), maxLoopsPerPr: 2 };
+    const result = churnPlan(settings, heads.map((head, i) => accept(head, i + 1)), {});
+    return { observed: rowOf(result)?.churnShadow?.kind ?? null, counted: without(result, 'churnShadow') };
+  },
+  'review-early-start': env => {
+    // The repo's resolved policy (startAfter=push) never reads startEarly, so its gates and plans must be
+    // byte-identical. The standard startAfter (fast-checks) is where startEarly IS read: the observer fires there.
+    const live = resolveTimingPolicy({ env, platformReview: {}, platformFix: {} }).review;
+    const standard = { ...REVIEW_TIMING_DEFAULTS, startEarly: live.startEarly };
+    const shapes = Object.values(CHECK_SHAPES);
+    return {
+      observed: startGate(standard, CHECK_SHAPES.fastPending).wouldStartEarly ?? null,
+      // Under the standard policy the refusal REASON for a missing fast check is renamed; it is pinned below.
+      counted: JSON.stringify({ live: shapes.map(checks => startGate(live, checks)),
+        standardAllowed: shapes.map(checks => startGate(standard, checks).allowed),
+        plans: shapes.map(checks => plan(reconcilePr(checks), live)) }),
+    };
+  },
+  'delivery-capacity auto tune': (env, mode) => {
+    const resolvePolicy = () => resolveDeliveryCapacity({ env, platform: {},
+      read: () => ({ deliveryCapacity: { autoTune: { mode } } }) });
+    const touched = [];
+    const io = { statSync: file => { touched.push(file); throw Object.assign(Error('absent'), { code: 'ENOENT' }); },
+      readFileSync: () => '' };
+    const tune = createDeliveryCapacityTune({ resolvePolicy, io, coordinationRoot: () => 'coord', now: () => now,
+      exec: () => { touched.push('gh'); throw Error('no network in this test'); },
+      readOpenPrs: () => [], readSources: () => ({}) });
+    const readout = { units: 4, mode: 'units' };
+    const before = JSON.stringify(readout);
+    tune(readout);
+    const { autoTune, ...enforced } = resolvePolicy().value;
+    return { observed: touched.length > 0,
+      counted: JSON.stringify({ enforced, readoutUnchanged: JSON.stringify(readout) === before }) };
+  },
+  'delivery-priority': (env, mode) => {
+    const lines = [];
+    const planned = [{ pr: 7, kind: 'fix', headRefOid: HEAD }];
+    const before = JSON.stringify(planned);
+    logFixPassPriorityShadow({ planned, env, now, log: line => lines.push(line), readOwner: () => null,
+      readSettings: () => readDeliveryPrioritySettings({ env, read: () => JSON.stringify({ deliveryPriority: { mode } }) }) });
+    return { observed: lines.length > 0, counted: JSON.stringify({ plannedUnchanged: JSON.stringify(planned) === before }) };
+  },
+  // review-loop-cli computes the advisory decision and records it only when mode !== 'off'; the live push is
+  // driveRun's and never reads the mode. Observer-only: the shadow decision exists, the retired value computes none.
+  'post-accept-advisory': env => {
+    const { mode } = resolvePostAcceptAdvisorySettings({ env, platform: {}, log: () => {} }).value;
+    const decision = mode === 'off' ? null
+      : postAcceptAdvisoryDecision({ verdict: { verdict: 'accept', findings: [] }, mode, invalid: false });
+    return { observed: decision?.action === 'push', counted: null };
+  },
+  'stale-referral-human': async env => {
+    const decision = await decideStaleReferralHumanHold({ repo: 'o/r', headRefOid: HEAD, labels: [{ name: 'review:human' }] },
+      { settings: resolveStaleReferralHumanShadow({ env, platform: {} }) });
+    return { observed: decision.why !== 'shadow disabled', counted: null };
+  },
+  'test-result-cache trace': env => ({ observed: traceEnabled(env), counted: null }),
+  'drain-async': env => ({ observed: flags.find(([name]) => name === 'drain-async')[4](env) === 'shadow', counted: null }),
+};
+
+it('every retired setting flag has a consumer probe', () => {
+  const settingFlags = flags.map(([name]) => name).filter(name => !['test-selection-measure', 'drain-verdict'].includes(name));
+  expect(Object.keys(consumers).sort()).toEqual(settingFlags.sort());
+});
+
+it.each(flags.filter(([name]) => consumers[name]))(
+  '%s: the real consumer observes the old shadow value and the retired value leaves its counted decision unchanged',
+  async (name, envKey, before, off) => {
+    const envFor = value => envKey ? { [envKey]: value } : {};
+    const old = await consumers[name](envFor(before), before);
+    const retired = await consumers[name](envFor(off), off);
+    expect(old.observed, `${name}: the shadow value must reach the consumer (negative control)`).toBeTruthy();
+    expect(retired.observed, `${name}: the retired value leaves the observer silent`).toBeFalsy();
+    expect(retired.counted, `${name}: counted decision`).toBe(old.counted);
   });
 
-// Workflow triggers have no settings resolver. Exercise the real YAML loader for both shapes.
-it.each(['test-selection-measure', 'drain-verdict'])(
-  '%s: old automatic and retired manual triggers leave counted verdict bytes identical', name => {
-    const doc = workflow(name);
-    expect(Object.keys(doc.on)).toEqual(['workflow_dispatch']);
-    const retired = countedOutputs();
-    const old = yaml.load(yaml.dump({ ...doc, on: { ...doc.on,
-      ...(name === 'drain-verdict' ? { schedule: [{ cron: '*/10 * * * *' }] } : { push: { branches: ['main'] } }) } }));
-    expect(Object.keys(old.on)).toContain(name === 'drain-verdict' ? 'schedule' : 'push');
-    expect(countedOutputs()).toBe(retired);
-  });
+it('review-early-start: under the standard startAfter, retiring renames only the missing-fast-check refusal, which reconcile reads both ways', () => {
+  const policy = value => ({ ...REVIEW_TIMING_DEFAULTS,
+    startEarly: resolveTimingPolicy({ env: { WE_REVIEW_START_EARLY: value }, platformReview: {}, platformFix: {} }).review.startEarly });
+  const shadow = startGate(policy('shadow'), CHECK_SHAPES.fastMissing);
+  const off = startGate(policy('off'), CHECK_SHAPES.fastMissing);
+  expect([shadow.reason, off.reason]).toEqual(['ci-not-registered', 'required-checks-not-successful']);
+  expect(off.allowed).toBe(shadow.allowed);
+  expect(off.affected).toEqual(shadow.affected);
+  expect(MISSING_CHECK_REASONS).toEqual(expect.arrayContaining([shadow.reason, off.reason]));
+  expect(read('scripts/conveyor/reconcile-core.mjs')).toContain("['required-checks-not-successful', 'ci-not-registered'].includes(gate.reason)");
+  for (const shape of ['green', 'pending', 'red', 'fastPending'])
+    expect(startGate(policy('off'), CHECK_SHAPES[shape]).reason, shape).toBe(startGate(policy('shadow'), CHECK_SHAPES[shape]).reason);
+});
+
+// Workflow triggers have no in-process consumer: no counted function reads a workflow file, so there is no
+// equivalence to compare. The guard is the trigger shape itself (and auditWorkflow's refusal of other triggers).
+it.each(['test-selection-measure', 'drain-verdict'])('%s: only a manual trigger remains', name => {
+  expect(Object.keys(workflow(name).on)).toEqual(['workflow_dispatch']);
+});
 
 it('absent evidence and a moved head remain closed after retirement', () => {
   expect(verify(null, inputs, { now }).ok).toBe(false);
