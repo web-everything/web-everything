@@ -48,6 +48,45 @@ describe('soak precheck at PR open', () => {
     expect(soakPrecheckAtOpen({ ...addedBreak, timings: undefined, readTimings }).ok).toBe(true);
     expect(readTimings).not.toHaveBeenCalled();
   });
+  it('ignores a caller-supplied timings value of any shape', () => {
+    for (const timings of [null, '2', 0, -2, NaN, Infinity, undefined, true, [], { [breakTest]: -1 }]) {
+      expect(soakPrecheckAtOpen({ ...addedBreak, timings })).toEqual(soakPrecheckAtOpen(addedBreak));
+    }
+  });
+  it('gives a timed and an untimed added break test the identical verdict', () => {
+    expect(soakPrecheckAtOpen({ ...addedBreak, timings: { [breakTest]: 2 } })).toEqual(soakPrecheckAtOpen(addedBreak));
+  });
+  it('accepts several untimed added break tests at once with no timing hint', () => {
+    const files = ['a', 'b', 'c'].map(n => ({ path: `scripts/conveyor/soak/breaks/${n}.soak.test.mjs`, changeType: 'ADDED' }));
+    const verdict = soakPrecheckAtOpen({ ...addedBreak, files });
+    expect(verdict.ok).toBe(true);
+    expect(verdict.missingTimings).toBeUndefined();
+    expect(verdict.message ?? '').not.toContain('test-timings.json');
+  });
+  it('does not require a test-timings.json edit next to an added break test', () => {
+    const files = [{ path: breakTest, changeType: 'ADDED' }, { path: 'scripts/ci/test-timings.json', changeType: 'MODIFIED' }];
+    expect(soakPrecheckAtOpen({ ...addedBreak, files }).ok).toBe(true);
+    expect(soakPrecheckAtOpen({ ...addedBreak, files: files.slice(0, 1) }).ok).toBe(true);
+  });
+  it('accepts a daemon fix whose replay evidence is an untimed added break test', () => {
+    const files = [...fix.files, { path: breakTest, changeType: 'ADDED' }];
+    expect(soakPrecheckAtOpen({ ...fix, files, timings: {} })).toMatchObject({ ok: true });
+  });
+  it('still refuses a daemon fix whose only added break file is deleted, even with a timed sibling', () => {
+    const files = [...fix.files, { path: breakTest, changeType: 'DELETED' }];
+    expect(soakPrecheckAtOpen({ ...fix, files, timings: { [breakTest]: 2 } }).ok).toBe(false);
+  });
+  it('treats a nested or non-test added file under breaks/ the same whether timed or not', () => {
+    for (const path of ['scripts/conveyor/soak/breaks/sub/x.soak.test.mjs', 'scripts/conveyor/soak/breaks/x.mjs']) {
+      const input = { ...addedBreak, files: [{ path, changeType: 'ADDED' }] };
+      expect(soakPrecheckAtOpen({ ...input, timings: { [path]: 2 } })).toEqual(soakPrecheckAtOpen(input));
+    }
+  });
+  it('never mentions test-timings.json in a refusal message', () => {
+    const verdict = soakPrecheckAtOpen(fix);
+    expect(verdict.ok).toBe(false);
+    expect(verdict.message).not.toContain('test-timings.json');
+  });
   it('disables the check on opt-out', () => {
     expect(soakPrecheckAtOpen({ ...addedBreak, env: { [SOAK_PRECHECK_ENV]: '0' } }))
       .toEqual({ ok: true, skipped: 'disabled' });
