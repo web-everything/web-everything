@@ -5,9 +5,7 @@ name: Test-selection measure
 # (#5000), so it delayed every main CI verdict. Its own workflow + own group means it never holds main CI and
 # never cancels another workflow. Evidence-gathering only: nothing requires this check.
 on:
-  push:
-    branches: [main]
-  # Not on pull_request/merge_group: the full-suite re-run is costly, so measure only the merged diff on main.
+  # Retired automatic measurement: explicit manual dispatch only.
   workflow_dispatch:
 
 concurrency:
