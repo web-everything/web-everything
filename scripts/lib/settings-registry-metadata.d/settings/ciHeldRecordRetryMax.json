@@ -1,0 +1,6 @@
+{
+  "description": "Maximum CI-held record recovery retries.",
+  "owner": "scripts/settings/review-red-team-on-skip.json",
+  "changeVia": "pr",
+  "instant": false
+}

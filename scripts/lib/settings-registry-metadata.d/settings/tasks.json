@@ -1,0 +1,6 @@
+{
+  "description": "Daemon task definitions used to render launchd plists.",
+  "owner": "scripts/settings/daemon-tasks.json",
+  "changeVia": "pr",
+  "instant": false
+}

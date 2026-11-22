@@ -1,0 +1,6 @@
+{
+  "description": "Advisory red-team checks on briefs before implementation.",
+  "owner": "scripts/settings/brief-red-team.json",
+  "changeVia": "pr",
+  "instant": false
+}

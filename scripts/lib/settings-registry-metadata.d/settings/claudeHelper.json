@@ -1,0 +1,6 @@
+{
+  "description": "Default Claude helper and juror model.",
+  "owner": "scripts/settings/claude-helper.json",
+  "changeVia": "pr",
+  "instant": false
+}

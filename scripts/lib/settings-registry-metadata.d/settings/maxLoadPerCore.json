@@ -1,0 +1,6 @@
+{
+  "description": "Host load ceiling per CPU core for dispatch admission.",
+  "owner": "scripts/dispatch-settings.json",
+  "changeVia": "pr",
+  "instant": false
+}

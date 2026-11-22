@@ -1,0 +1,6 @@
+{
+  "description": "Carry an accept to a new head with an identical reviewed net diff.",
+  "owner": "scripts/settings/accept-carry-forward.json",
+  "changeVia": "pr",
+  "instant": false
+}
