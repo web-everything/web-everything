@@ -5326,12 +5326,19 @@ coverage for both agents and Codex review/edit modes, with the offending key in 
 diagnostic and zero resolver/spawn calls. The real-Git `ext::` regression must prove
 its local marker payload runs with the raw malformed env, then cannot run through
 the launcher. Removing the key check must redden both refusal and behavioral cases.
-Runtime loader variables and Git transport settings pass through unchanged.
-Environment narrowing is deferred to S1e (`designs/sec1-s1e-env-narrowing-prep-2026-11-20.md`);
-#7022 remains open. Keep the real Node preload fixture as a parity pin: the caller's
-`NODE_OPTIONS` still executes the local payload. The launcher never merges the ambient environment. The differential
-matrix in `agent-launch.test.mjs` compares review and edit runs with main's env formula,
-including runtime loader variables, Git config pairs/parameters and protocol allowlists,
+Runtime loader variables never reach the child: `NODE_OPTIONS`, `NODE_PATH`,
+`NODE_REPL_EXTERNAL_MODULE`, every `LD_*` and `DYLD_*` key, the Python/Perl/Ruby/Java
+loader keys and `GCONV_PATH` are dropped, compared upper-cased. They load caller code into
+the agent process before its sandbox exists. Keep the real Node preload fixture for both
+agents and both Codex modes: its positive control proves the caller's `NODE_OPTIONS` runs
+the local payload unfiltered, and through the launcher it must not run. Admission sees the
+same filtered env. Git transport settings, shell startup variables and bypass flags still
+pass through; that narrowing is S1e (`designs/sec1-s1e-env-narrowing-prep-2026-11-20.md`).
+The launcher never merges the ambient environment. The differential
+matrix in `agent-launch.test.mjs` compares review and edit runs with main's env formula
+minus the loader keys (an independent oracle in the test, with case variants and
+look-alikes such as `NODE_ENV` and `LDFLAGS` that must stay),
+including Git config pairs/parameters and protocol allowlists,
 HOME, Git/gh isolation, policy sources, roots, gates, and retry limits.
 Pin undefined omission, null refusal and reported/spawned
 argv equality at the direct-task boundary as well.

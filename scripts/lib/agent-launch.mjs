@@ -1,8 +1,10 @@
 /**
  * Closed-grammar process boundary: snapshot plain data, then build argv and directly exec.
- * Child env = caller record verbatim (undefined omitted), with optional PATH prefix
- * and task TMP roots. Refused before spawn: non-string/NUL values, empty/=/NUL keys.
- * Environment narrowing is deferred to S1e.
+ * Child env = caller record minus runtime loader variables (undefined omitted), with optional
+ * PATH prefix and task TMP roots. Refused before spawn: non-string/NUL values, empty/=/NUL keys.
+ * Loader variables (NODE_OPTIONS, LD_*, DYLD_*, ...) run caller code inside the agent process
+ * before its sandbox exists, so they are always dropped. Wider narrowing (shell startup, Git,
+ * bypass flags) is S1e.
  * Codex must resolve to the same executable on caller PATH as the fixed installation lookup.
  * io.spawn/io.resolveBinary are trusted test seams, never descriptor capabilities.
  */
@@ -72,14 +74,25 @@ function paths(value, name) {
   if (!Array.isArray(value)) fail(`${name} must be an array`);
   return value.map(p => absolute(p, name));
 }
-// Validate serialization only; environment policy belongs to S1e.
+// Runtime loader variables: each makes a runtime load caller-chosen code at startup — the agent's
+// own Node or native loader first, then any interpreter it starts. Compared upper-cased, so a
+// case variant cannot slip through on a case-folding platform. Dropped, never passed.
+const LOADER_PREFIXES = ['LD_', 'DYLD_'];
+const LOADER_KEYS = new Set(['NODE_OPTIONS', 'NODE_PATH', 'NODE_REPL_EXTERNAL_MODULE',
+  'PYTHONPATH', 'PYTHONSTARTUP', 'PYTHONHOME', 'PYTHONUSERBASE', 'PERL5OPT', 'PERL5LIB', 'PERLLIB', 'PERL5DB',
+  'RUBYOPT', 'RUBYLIB', 'JAVA_TOOL_OPTIONS', '_JAVA_OPTIONS', 'JDK_JAVA_OPTIONS', 'GCONV_PATH']);
+function isLoaderKey(key) {
+  const upper = key.toUpperCase();
+  return LOADER_KEYS.has(upper) || LOADER_PREFIXES.some(prefix => upper.startsWith(prefix));
+}
+// Validate serialization; then drop loader variables. Other environment policy belongs to S1e.
 function envRecord(value) {
   record(value, 'env');
   for (const [key, entry] of Object.entries(value)) {
     if (!key || key.includes('=') || key.includes('\0')) fail(`env key ${JSON.stringify(key)} must be non-empty and contain neither '=' nor NUL`);
     if (entry !== undefined && (typeof entry !== 'string' || entry.includes('\0'))) fail(`env.${key} must be a NUL-free string or undefined`);
   }
-  return Object.fromEntries(Object.entries(value).filter(([, entry]) => entry !== undefined));
+  return Object.fromEntries(Object.entries(value).filter(([key, entry]) => entry !== undefined && !isLoaderKey(key)));
 }
 function configValue(key, value) {
   switch (key) {

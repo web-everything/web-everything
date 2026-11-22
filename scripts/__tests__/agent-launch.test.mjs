@@ -32,9 +32,26 @@ function mainCodexShimPath(env) {
   const rest = String(env.PATH ?? '').split(':').filter((d) => d && d !== CODEX_SHIM_DIR);
   return [CODEX_SHIM_DIR, ...rest].join(':');
 }
+// Independent oracle: runtime loader variables inject caller code into the agent process
+// (or the interpreters it starts) before any agent sandbox exists, so they never reach the child.
+const LOADER_ORACLE = {
+  NODE_OPTIONS: '--import=/attacker/payload.mjs', NODE_PATH: '/attacker/modules',
+  NODE_REPL_EXTERNAL_MODULE: '/attacker/repl.js',
+  LD_PRELOAD: '/attacker/lib', LD_LIBRARY_PATH: '/attacker/libs', LD_AUDIT: '/attacker/audit',
+  DYLD_INSERT_LIBRARIES: '/attacker/lib', DYLD_LIBRARY_PATH: '/attacker/libs', DYLD_FRAMEWORK_PATH: '/attacker/fw',
+  PYTHONPATH: '/attacker/python', PYTHONSTARTUP: '/attacker/startup.py', PYTHONHOME: '/attacker/home',
+  PYTHONUSERBASE: '/attacker/user', PERL5OPT: '-Mattacker', PERL5LIB: '/attacker/perl', PERLLIB: '/attacker/perl',
+  PERL5DB: 'BEGIN{attacker}', RUBYOPT: '-rattacker', RUBYLIB: '/attacker/ruby',
+  JAVA_TOOL_OPTIONS: '-javaagent:/attacker.jar', _JAVA_OPTIONS: '-javaagent:/attacker.jar',
+  JDK_JAVA_OPTIONS: '-javaagent:/attacker.jar', GCONV_PATH: '/attacker/gconv',
+  // Case variants: dropped too, so a case-folding platform can never revive one.
+  node_options: '--require=/attacker/x.cjs', Ld_Preload: '/attacker/lib', dyld_insert_libraries: '/attacker/lib',
+};
+const withoutLoaders = env => Object.fromEntries(Object.entries(env).filter(([key]) => !Object.hasOwn(LOADER_ORACLE, key)));
 const matrix = [
-  ...['NODE_OPTIONS', 'NODE_PATH', 'JAVA_TOOL_OPTIONS', 'CUSTOM_OPTIONS', 'LD_PRELOAD',
-    'DYLD_INSERT_LIBRARIES', 'PYTHONPATH', 'PERL5OPT', 'RUBYOPT'].map(key => [key, { [key]: 'caller-value' }]),
+  ...Object.keys(LOADER_ORACLE).map(key => [key, { [key]: 'caller-value' }]),
+  ['CUSTOM_OPTIONS', { CUSTOM_OPTIONS: 'caller-value' }],
+  ['loader look-alikes stay', { NODE_ENV: 'production', PYTHONUNBUFFERED: '1', LDFLAGS: '-L/x', OLD_PRELOAD: 'x' }],
   ['Git config parameters', { GIT_CONFIG_PARAMETERS: "'protocol.ext.allow'='user'" }],
   ['Git transport pair', { GIT_CONFIG_COUNT: '1', GIT_CONFIG_KEY_0: 'protocol.ext.allow', GIT_CONFIG_VALUE_0: 'always' }],
   ['Git protocol allowlist', { GIT_ALLOW_PROTOCOL: 'https:ext' }],
@@ -116,7 +133,7 @@ describe('B1/B2 caller environment follows main verbatim, without any ambient me
     const descriptor = buildCodexDirectTaskDescriptor({ cwd, env, review, tempRoot });
     expect(descriptor.env).toBe(env);
     const io = seam(); launchAgent(descriptor, io);
-    const defined = Object.fromEntries(Object.entries(env).filter(([, value]) => value !== undefined));
+    const defined = withoutLoaders(Object.fromEntries(Object.entries(env).filter(([, value]) => value !== undefined)));
     expect(io.spawn.mock.calls[0][2].env).toEqual(review ? defined : {
       ...defined, PATH: mainCodexShimPath(env), TMPDIR: tempRoot, TMP: tempRoot, TEMP: tempRoot,
     });
@@ -301,34 +318,37 @@ describe('closed grammar rejection: the PR #7022 attack classes', () => {
   it('10 refuses execPath, execArgv and fork-style launches', () => {
     for (const field of ['execPath', 'execArgv', 'fork', 'file', 'args', 'argv', 'stdio', 'detached']) refused({ ...base(), [field]: [] }, new RegExp(field));
   });
-  it.each(['codex', 'claude'])('11 preserves caller runtime loader variables for %s (narrowing deferred to S1e)', agent => {
-    const env = { PATH: bin, SAFE: 'kept', NODE_OPTIONS: '--import=/attacker/payload.mjs',
-      NODE_PATH: '/attacker/modules', CUSTOM_OPTIONS: 'x', LD_PRELOAD: '/attacker/lib',
-      LD_LIBRARY_PATH: '/attacker/libs', LD_AUDIT: '/attacker/audit',
-      DYLD_INSERT_LIBRARIES: '/attacker/lib', DYLD_LIBRARY_PATH: '/attacker/libs',
-      PYTHONPATH: '/attacker/python', PYTHONSTARTUP: '/attacker/startup.py',
-      PERL5OPT: '-Mattacker', PERL5LIB: '/attacker/perl', RUBYOPT: '-rattacker', RUBYLIB: '/attacker/ruby' };
-    const io = seam();
+  it.each(['codex', 'claude'])('11 drops caller runtime loader variables for %s, admission and spawn alike', agent => {
+    const kept = { PATH: bin, SAFE: 'kept', CUSTOM_OPTIONS: 'x', NODE_ENV: 'production', PYTHONUNBUFFERED: '1', LDFLAGS: '-L/x' };
+    const env = { ...kept, ...LOADER_ORACLE };
+    const io = { ...seam(), admit: vi.fn(spec => { expect(spec.options.env).toEqual(kept); return true; }) };
     io.spawn.mockImplementation((_file, _args, options) => {
-      expect(options.env).toEqual(env);
+      expect(options.env).toEqual(kept);
       return 'child';
     });
     expect(launchAgent({ ...(agent === 'codex' ? base() : claude()), env }, io)).toBe('child');
+    expect(io.admit).toHaveBeenCalledOnce();
     expect(io.spawn).toHaveBeenCalledOnce();
-    expect(env.NODE_OPTIONS).toBe('--import=/attacker/payload.mjs');
+    expect(env.NODE_OPTIONS).toBe('--import=/attacker/payload.mjs'); // caller record is never mutated
   });
-  it('11 preserves NODE_OPTIONS preload execution in a real Node child (S1e)', () => {
+  for (const [path, descriptor] of envLaunchPaths) it(`11 never runs a caller NODE_OPTIONS preload in a real Node child (${path})`, () => {
     const payload = join(root, 'payload.mjs'), marker = join(root, 'payload-executed');
     writeFileSync(payload, `import { writeFileSync } from 'node:fs'; writeFileSync(${JSON.stringify(marker)}, 'executed');`);
-    const env = { PATH: bin, NODE_OPTIONS: `--import=${JSON.stringify(payload)}` };
-    const invocation = buildAgentInvocation({ ...base(), env }, seam());
-    const child = spawnSync(invocation.file, ['-e', 'process.stdout.write("agent started")'], {
-      ...invocation.options, encoding: 'utf8', timeout: 5000, maxBuffer: 64 * 1024,
+    const run = options => spawnSync(binary, ['-e', 'process.stdout.write("agent started")'], {
+      ...options, encoding: 'utf8', timeout: 5000, maxBuffer: 64 * 1024,
     });
+    const env = { PATH: bin, NODE_OPTIONS: `--import=${JSON.stringify(payload)}` };
+    // Positive control: this env really executes the payload when it reaches a Node child unfiltered.
+    const exposed = run({ cwd, env });
+    expect(exposed.status, exposed.stderr).toBe(0);
+    expect(readFileSync(marker, 'utf8')).toBe('executed');
+    rmSync(marker);
+    const invocation = buildAgentInvocation(descriptor(env), seam());
+    const child = run(invocation.options);
     expect(child.error).toBeUndefined();
     expect(child.status, child.stderr).toBe(0);
     expect(child.stdout).toBe('agent started');
-    expect(readFileSync(marker, 'utf8')).toBe('executed');
+    expect(existsSync(marker), 'caller preload must never execute in the agent').toBe(false);
   });
   it('12 passes shell startup variables through as main does', () => {
     const env = { ...base().env, BASH_ENV: '/caller/startup', ENV: '/caller/env', ZDOTDIR: '/caller/zsh', SHELL: '/caller/shell' };
