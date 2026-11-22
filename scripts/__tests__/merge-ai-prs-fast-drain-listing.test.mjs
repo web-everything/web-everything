@@ -53,7 +53,7 @@ it('three concurrent catch-up drains share one base snapshot and revalidate lean
     const results = await Promise.all([1, 2, 3].map(() => readFastDrainPassInventory(f.options)));
     expect(pages).toBe(3); // Fresh lean membership for each child; no full-PR pages.
     expect(snapshotReads).toBe(4);
-    expect(mains).toBe(6); // Each cold waiter also rechecks after acquiring the pass lock.
+    expect(mains).toBe(9); // Each reader rechecks after membership, and cold waiters also recheck under the lock.
     expect(results.every(r => r.inventories.get(repo).totalCount === 18)).toBe(true);
   } finally { f.close(); }
 });
@@ -432,6 +432,77 @@ for (const change of ['head', 'CI', 'review hold']) {
 }
 
 for (const phase of ['cold', 'direct hit', 'locked hit']) {
+  for (const invalid of ['expired', 'dirty']) {
+    it(`source refresh during ${phase} membership replaces ${invalid} pass rows with fresh cache-only evidence`, async () => {
+      const f = pass();
+      let now = 20_000, refreshes = 0;
+      const env = { WE_PR_SNAPSHOT_DIR: dirname(f.options.path), WE_PR_SNAPSHOT: '1', WE_PR_SNAPSHOT_TTL_MS: '75000' };
+      const sourcePath = snapshotPath(env.WE_PR_SNAPSHOT_DIR, repo);
+      const publish = (prs, fetchedAtMs) => writeFileSync(sourcePath, JSON.stringify({ v: PR_SNAPSHOT_VERSION,
+        repo, prs, fields: SNAPSHOT_FIELDS, fetchedAtMs }));
+      publish(rows, 0);
+      f.options.readSnapshot = r => readSharedOpenPrs({ repo: r, fields: SNAPSHOT_FIELDS, env, now: () => now,
+        cacheOnly: true, exec: () => { refreshes++; throw Error('must not refresh'); } });
+      const replacement = rows.map(p => ({ ...p, labels: [{ name: 'review:changes' }],
+        statusCheckRollup: [{ name: 'test', status: 'COMPLETED', conclusion: 'FAILURE' }] }));
+      try {
+        if (phase !== 'cold') await readFastDrainPassInventory(f.options);
+        let reads = 0;
+        const result = await readFastDrainPassInventory({ ...f.options,
+          read: path => { if (phase === 'locked hit' && ++reads === 1) throw Error('force locked hit'); return JSON.parse(readFileSync(path, 'utf8')); },
+          listLean: async () => {
+            await setImmediate();
+            if (invalid === 'expired') now = 75_000;
+            else markPrSnapshotDirty({ repo, env, nowMs: now });
+            expect(f.options.readSnapshot(repo)).toBeNull(); // The old source no longer passes cacheOnly validation.
+            publish(replacement, ++now);
+            return inventory(rows); // Identical head/updatedAt cannot make the pass's old checks reusable.
+          },
+        });
+        const freshRows = f.options.readSnapshot(repo);
+        expect(freshRows).not.toBeNull();
+        expect(result.snapshots.get(repo)).toEqual(freshRows);
+        expect(result.snapshots.get(repo)[0].statusCheckRollup[0].conclusion).toBe('FAILURE');
+        if (phase === 'cold') expect(JSON.parse(readFileSync(f.options.path, 'utf8')).rows).toEqual(freshRows);
+        expect(refreshes).toBe(0);
+      } finally { f.close(); }
+    });
+  }
+
+  it(`main moving during ${phase} membership discards the snapshot and falls back to live listing`, async () => {
+    const sibling = 'fixture/sibling';
+    let siblingHead = head;
+    const f = pass({ repos: [repo, sibling], readSnapshot: () => rows,
+      readMain: async r => r === sibling ? siblingHead : head });
+    try {
+      if (phase !== 'cold') await readFastDrainPassInventory(f.options);
+      const before = phase === 'cold' ? null : readFileSync(f.options.path, 'utf8');
+      let reads = 0, writes = 0, membershipFinished = false;
+      const logs = [];
+      const result = await readFastDrainContext({ repos: f.options.repos, targetRepo: repo, onlyPr: 7,
+        readInventory: () => readFastDrainPassInventory({ ...f.options,
+          read: path => { if (phase === 'locked hit' && ++reads === 1) throw Error('force locked hit'); return JSON.parse(readFileSync(path, 'utf8')); },
+          write: () => { writes++; },
+          listLean: async () => {
+            await setImmediate();
+            siblingHead = { ...head, sha: 'b'.repeat(40) };
+            membershipFinished = true;
+            return inventory(rows);
+          },
+        }),
+        readFull: async (_repo, number) => rows.find(p => p.number === number),
+        readManifest: async (_repo, p) => p.manifest,
+        log: line => logs.push(line),
+      });
+      expect(membershipFinished).toBe(true);
+      expect(result).toBeNull(); // The caller selects its slow live-listing path on null.
+      expect(logs).toEqual([expect.stringContaining('context fell back to full listing (pass main changed while reading')]);
+      expect(writes).toBe(0);
+      if (phase === 'cold') expect(existsSync(f.options.path)).toBe(false);
+      else expect(readFileSync(f.options.path, 'utf8')).toBe(before);
+    } finally { f.close(); }
+  });
+
   for (const invalid of ['expired', 'dirty']) {
     it(`source snapshot becoming ${invalid} during ${phase} membership reads defers without publication`, async () => {
       const f = pass();
