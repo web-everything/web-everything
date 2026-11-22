@@ -6,7 +6,7 @@ import { runGhSync } from '../../lib/gh-throttle.mjs';
 import { createJudgeSweepFactsReader, createShapeCache, JUDGE_SWEEP_REPO, operatorGh, readCheckoutState, readFromFreshOrigin } from '../judge-sweep-facts-io.mjs';
 import { execFileSync } from 'node:child_process';
 import { existsSync, mkdirSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
-import { tmpdir } from 'node:os';
+import { homedir, tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { buildJudgeSweepBundle } from '../judge-sweep-facts.mjs';
 import { buildShapePlan } from '../../review-core-cli.mjs';
@@ -38,7 +38,8 @@ it.each([
     }) }];
   const calls = [];
   const reader = createJudgeSweepFactsReader({ findSuspendedRuns: () => [],
-    checkoutState: () => ({ behind: 0 }),
+    readExitRulings: () => ({ prs: new Set(), errors: [] }),
+  checkoutState: () => ({ behind: 0 }),
     gh: args => {
       calls.push(args);
       if (args[0] !== 'pr' || !['list', 'view'].includes(args[1])) throw new Error('unexpected extra GitHub read');
@@ -64,6 +65,7 @@ const pr = (extra = {}) => ({ number: 1, title: 'IO fixture', headRefOid: head,
 const options = (extra = {}) => {
   const opts = ({
   findSuspendedRuns: () => [],
+  readExitRulings: () => ({ prs: new Set(), errors: [] }),
   checkoutState: () => ({ behind: 0 }),
   exec,
   gh: () => JSON.stringify([pr()]), now: () => Date.parse(at), baseCap,
@@ -798,6 +800,168 @@ it.each([9, 10, 11, 12, null])('selects detail at cap minus two or unknown round
   const row = f.read().prs[0];
   expect(row.round).toBe(round);
   expect(f.gh.mock.calls.filter(([a]) => a[1] === 'view')).toHaveLength(round === 9 ? 0 : 1);
+});
+
+it('a PR with a review.loop.exit ruling always gets detail', () => {
+  const ruled = selectiveReader({ readExitRulings: () => ({ prs: new Set([1]), errors: [] }) });
+  expect(ruled.read().prs[0]).toMatchObject({ round: 1, detail: 'read' });
+  expect(selectiveReader().read().prs[0]).toMatchObject({ round: 1, detail: 'skipped' });
+});
+
+it('unreadable exit rulings record a bundle error without widening round-one selection', async () => {
+  const { readExitRulingPrs } = await import('../judge-sweep-exit-rulings.mjs');
+  const rulingReader = () => readExitRulingPrs({ path: 'missing.jsonl', readFile: () => { throw Error('unreadable'); } });
+  expect(rulingReader()).toEqual({ prs: new Set(), errors: ['exit rulings unreadable'] });
+  const f = selectiveReader({ listing: [pr(), pr({ number: 2 })], readExitRulings: rulingReader });
+  const facts = f.read();
+  expect(facts.prs.every(p => p.round === 1 && p.detail === 'skipped'
+    && p.evidenceErrors.includes('exit rulings unreadable'))).toBe(true);
+  expect(f.gh.mock.calls.filter(([a]) => a[1] === 'view')).toHaveLength(0);
+});
+
+it.each(['review:human', 'status:at-round-limit'])('%s does not cause or clear detail selection', label => {
+  const listing = [pr({ labels: [{ name: label }] })];
+  expect(selectiveReader({ listing }).read().prs[0].detail).toBe('skipped');
+  expect(selectiveReader({ listing, readExitRulings: () => ({ prs: new Set([1]), errors: [] }) })
+    .read().prs[0].detail).toBe('read');
+});
+
+it('skips and counts malformed ruling lines and ignores PRs outside the listing', async () => {
+  const { readExitRulingPrs } = await import('../judge-sweep-exit-rulings.mjs');
+  const rulings = readExitRulingPrs({ path: 'fixture.jsonl', readFile: () => [
+    '{broken', JSON.stringify({ key: 'review.loop.exit.pr999' }),
+    JSON.stringify({ ruling: { key: 'review.loop.exit.pr2.final' } }),
+    JSON.stringify({ key: 'other.pr1' }), '',
+  ].join('\n') });
+  expect(rulings.prs).toEqual(new Set([999, 2]));
+  expect(rulings.errors).toEqual(['exit rulings malformed lines: 1']);
+  const f = selectiveReader({ listing: [pr(), pr({ number: 2 })], readExitRulings: () => rulings });
+  const facts = f.read();
+  expect(facts.prs.map(p => [p.number, p.detail])).toEqual([[1, 'skipped'], [2, 'read']]);
+  expect(facts.prs.every(p => p.evidenceErrors.includes('exit rulings malformed lines: 1'))).toBe(true);
+  expect(f.gh.mock.calls.filter(([a]) => a[1] === 'view').map(([a]) => a[2])).toEqual(['2']);
+});
+
+it('resolves the default exit rulings path when settings are absent', async () => {
+  const { readExitRulingPrs } = await import('../judge-sweep-exit-rulings.mjs');
+  const readFile = vi.fn(path => {
+    if (path instanceof URL) throw Object.assign(Error('settings absent'), { code: 'ENOENT' });
+    return JSON.stringify({ key: 'review.loop.exit.pr1' });
+  });
+  expect(readExitRulingPrs({ readFile }).prs).toEqual(new Set([1]));
+  expect(readFile.mock.lastCall).toEqual([join(homedir(), 'workspace/.operations/handoff/rulings-history.jsonl'), 'utf8']);
+});
+
+it('resolves the exit rulings path from optional tool settings', async () => {
+  const { readExitRulingPrs } = await import('../judge-sweep-exit-rulings.mjs');
+  const readFile = vi.fn(path => path instanceof URL
+    ? JSON.stringify({ judgeSweepStall: { exitRulingsPath: 'custom.jsonl' } })
+    : JSON.stringify({ ruling: { key: 'review.loop.exit.pr1' } }));
+  expect(readExitRulingPrs({ readFile }).prs).toEqual(new Set([1]));
+  expect(readFile).toHaveBeenLastCalledWith('custom.jsonl', 'utf8');
+});
+
+it.each([
+  ['exit rulings malformed lines: 2'],
+  ['exit rulings settings invalid'],
+  ['exit rulings unreadable', 'another reader error'],
+])('propagates every exit-ruling reader error to every PR (%j)', async (...errors) => {
+  const f = selectiveReader({ listing: [pr(), pr({ number: 2 })],
+    readExitRulings: () => ({ prs: new Set(), errors }) });
+  const facts = f.read();
+  expect(facts.prs).toHaveLength(2);
+  for (const p of facts.prs) expect(p.evidenceErrors).toEqual(expect.arrayContaining(errors));
+});
+
+it.each([
+  null, false, 42, 'record', [], {}, { ruling: {} }, { key: null }, { key: 1 },
+  { key: {} }, { key: '' }, { key: ' ' }, { ruling: { key: false } },
+  { key: null, ruling: { key: 'unrelated.valid.key' } },
+])('counts a parseable corrupt exit-ruling record as a malformed line (%j)', async record => {
+  const { readExitRulingPrs } = await import('../judge-sweep-exit-rulings.mjs');
+  const rulings = readExitRulingPrs({ path: 'fixture.jsonl', readFile: () => [
+    JSON.stringify(record), JSON.stringify({ key: 'review.loop.exit.pr2' }),
+  ].join('\n') });
+  expect(rulings).toEqual({ prs: new Set([2]), errors: ['exit rulings malformed lines: 1'] });
+});
+
+it.each([
+  ['review.loop.exit.pr1', 1],
+  ['review.loop.exit.pr7279.final', 7279],
+  ['review.loop.exit.pr9007199254740991', Number.MAX_SAFE_INTEGER],
+])('accepts exact exit-ruling keys with positive safe PR numbers (%s)', async (key, number) => {
+  const { readExitRulingPrs } = await import('../judge-sweep-exit-rulings.mjs');
+  expect(readExitRulingPrs({ path: 'fixture.jsonl', readFile: () => JSON.stringify({ key }) }))
+    .toEqual({ prs: new Set([number]), errors: [] });
+});
+
+it.each([
+  'other.pr1', 'review.loop.exit.pr1garbage', 'review.loop.exit.pr1.scope',
+  'review.loop.exit.pr1.finalgarbage', 'review.loop.exit.pr1.final.extra',
+  'prefix.review.loop.exit.pr1', 'review.loop.exit.pr1\nother',
+  'review.loop.exit.pr1\n', 'review.loop.exit.pr1.final\r',
+])('ignores valid string keys outside the exact observed exit-ruling forms (%s)', async key => {
+  const { readExitRulingPrs } = await import('../judge-sweep-exit-rulings.mjs');
+  expect(readExitRulingPrs({ path: 'fixture.jsonl', readFile: () => JSON.stringify({ ruling: { key } }) }))
+    .toEqual({ prs: new Set(), errors: [] });
+});
+
+it.each(['0', '9007199254740992', '9'.repeat(400)])(
+  'rejects and reports exit-ruling PR numbers outside the positive safe range (%s)', async number => {
+    const { readExitRulingPrs } = await import('../judge-sweep-exit-rulings.mjs');
+    expect(readExitRulingPrs({ path: 'fixture.jsonl', readFile: () => JSON.stringify({ key: `review.loop.exit.pr${number}` }) }))
+      .toEqual({ prs: new Set(), errors: ['exit rulings malformed lines: 1'] });
+  });
+
+it.each([
+  '{broken', 'null', '{}',
+  JSON.stringify({ judgeSweepStall: { exitRulingsPath: null } }),
+  JSON.stringify({ judgeSweepStall: { exitRulingsPath: 42 } }),
+  JSON.stringify({ judgeSweepStall: { exitRulingsPath: {} } }),
+  JSON.stringify({ judgeSweepStall: { exitRulingsPath: '' } }),
+  JSON.stringify({ judgeSweepStall: { exitRulingsPath: ' ' } }),
+])('reports invalid exit-ruling settings without reading a fallback history (%s)', async settings => {
+  const { readExitRulingPrs } = await import('../judge-sweep-exit-rulings.mjs');
+  const readFile = vi.fn(() => settings);
+  expect(readExitRulingPrs({ readFile })).toEqual({ prs: new Set(), errors: ['exit rulings settings invalid'] });
+  expect(readFile).toHaveBeenCalledTimes(1);
+  expect(readFile.mock.calls[0][0]).toBeInstanceOf(URL);
+});
+
+it.each(['EACCES', 'EIO', undefined])(
+  'reports unreadable exit-ruling settings without reading a fallback history (%s)', async code => {
+    const { readExitRulingPrs } = await import('../judge-sweep-exit-rulings.mjs');
+    const readFile = vi.fn(() => { throw Object.assign(Error('unreadable settings'), { code }); });
+    expect(readExitRulingPrs({ readFile })).toEqual({ prs: new Set(), errors: ['exit rulings settings unreadable'] });
+    expect(readFile).toHaveBeenCalledTimes(1);
+  });
+
+it.each(['ruling', 'cap-1', 'cap', 'null'])('reads must-detail PRs placed last before other detail or comment calls (%s)', kind => {
+  const listing = Array.from({ length: kind === 'null' ? 120 : 130 }, (_, i) => pr({ number: i + 1 }));
+  const f = selectiveReader({ listing,
+    rows: kind === 'null' ? [] : listing.flatMap(p => rounds(p.number,
+      p.number === 130 ? (kind === 'ruling' ? 1 : kind === 'cap-1' ? 11 : 12) : 10)),
+    ...(kind === 'null' ? { readLedgerRows: () => { throw Error('unreadable'); } } : {}),
+    readExitRulings: () => ({ prs: new Set(kind === 'ruling' ? [130] : []), errors: [] }),
+  });
+  const facts = f.read();
+  expect(facts.prs.map(p => p.number)).toEqual(listing.map(p => p.number));
+  expect(facts.prs.at(-1).detail).toBe('read');
+  expect(f.gh.mock.calls[1][0].slice(0, 3)).toEqual(['pr', 'view', kind === 'null' ? '1' : '130']);
+  expect(f.gh).toHaveBeenCalledTimes(128);
+  if (kind === 'null') expect(f.gh.mock.calls.slice(1, 121).every(([a]) => a[1] === 'view')).toBe(true);
+});
+
+it('reads all mandatory details before a mandatory PR consumes the comment budget', () => {
+  const readComments = vi.fn(({ exec }) => {
+    exec('gh', ['api', 'comments']);
+    return [];
+  });
+  const f = selectiveReader({ listing: [pr(), pr({ number: 2 })],
+    readExitRulings: () => ({ prs: new Set([1, 2]), errors: [] }), readComments });
+  expect(f.read().prs.every(p => p.detail === 'read')).toBe(true);
+  expect(f.gh.mock.calls.slice(1, 3).map(([a]) => a.slice(0, 3)))
+    .toEqual([['pr', 'view', '1'], ['pr', 'view', '2']]);
 });
 
 it('skipped detail never counts as clear even with accepted labels and active CI or a fixer', () => {

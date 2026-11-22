@@ -16,9 +16,9 @@ For repo defaults, edit the owner file through a PR and rebuild the consuming da
 
 ## Summary
 
-- Top-level keys: 161 (163 declaration rows).
-- Declared leaves: 589 (platform copies counted separately).
-- Instant top-level keys: 0; not instant: 161.
+- Top-level keys: 163 (165 declaration rows).
+- Declared leaves: 592 (platform copies counted separately).
+- Instant top-level keys: 0; not instant: 163.
 - Instant capacity leaves: 15.
 - Constants to settle: 312.
 - Instant gaps: 28.
@@ -101,12 +101,13 @@ Operator-prefs layer: ~/.plateau/platform-preferences.json is the requested oper
 | description | scripts/settings/node-heap-cap.json | 1 | "V8 old-space caps for review child processes and the revie… | pr | no | Documentation of V8 old-space memory caps. |
 | directionAwareHuman | scripts/settings/direction-aware-human.json | 1 | "shadow" | pr | no | Direction-aware human review classification mode. |
 | draftPromotion | scripts/settings/draft-promotion.json | 1 | {"absentRequiredChecksNotApplicable":["merge-gate"]} | pr | no | Required-check exceptions for draft promotion. |
-| drain | scripts/settings/drain-card-group.json, scripts/settings/drain-mq-retry.json | 6 | {"group":{"enabled":true,"maxSize":8,"eligibility":"card-on… | pr | no | Merge drain grouping, recovery and infrastructure classification policy. |
+| drain | scripts/settings/drain-async-shadow.json, scripts/settings/drain-card-group.json, scripts/settings/drain-mq-retry.json | 7 | {"asyncShadow":"shadow","group":{"enabled":true,"maxSize":8… | pr | no | Merge drain grouping, recovery and infrastructure classification policy. |
 | drainFactsSource | scripts/settings/drain-facts-source.json | 1 | {"source":"store-first"} | pr | no | Preferred source of merge drain facts. |
 | drainFollowupJob | scripts/settings/drain-followup-job.json | 1 | "on" | pr | no | Enable follow-up drain jobs. |
 | enabled | scripts/settings/review-red-team-on-skip.json | 1 | true | pr | no | Enable recovery of missing red-team results on reviewed heads. |
 | enforce | scripts/settings/claude-accounts.json | 1 | false | pr | no | Enable Claude daemon account enforcement. |
 | entries | scripts/settings/privacy-terms-allowlist.json | 1 | [{"path":"scripts/lib/__tests__/daemon-jobs-runtime.test.mj… | pr | no | Explicit portability exceptions pinned to matched text and line hashes. |
+| expectations | scripts/settings/expectations.json | 1 | [{"id":"ready-no-gate","after":["clear-human","ready-to-mer… | pr | no | Observe-only PR expectation triggers, deadlines and proposed responses; responses are recorded but never executed. |
 | expectedLocalReasons | scripts/settings/forge-share.json | 1 | ["command-not-allowed","needs-git"] | pr | no | Local execution reasons excluded from remote-share warnings. |
 | externalJurors | scripts/settings/review.json | 2 | {"firstOutputMs":120000,"cooldownMs":1800000} | pr | no | First-output timeout and cooldown for external review jurors. |
 | fix | scripts/settings/fix-context-pack.json, scripts/settings/fix-safety.json, scripts/settings/fix.json | 18 | {"contextPack":true,"contextLines":30,"contextMaxBytes":800… | pr | no | Fix context, local verification, round limits and exception policy. |
@@ -146,6 +147,7 @@ Operator-prefs layer: ~/.plateau/platform-preferences.json is the requested oper
 | mergeQueue | scripts/settings/approved-human-surface-hold.json, scripts/settings/human-only-enqueue.json, scripts/settings/merge-queue-numbering.json, scripts/settings/merge-queue-obsolete-runs.json, scripts/settings/merge-queue-refresh.json, scripts/settings/merge-queue.json | 31 | {"skipRebaseApprovedHumanSurface":"on","humanOnly":{"approv… | pr | no | Enqueue, human approval, card numbering and obsolete-run cancellation policy. |
 | mergeQueueBatching | scripts/settings/merge-queue-batching.json | 3 | {"enabled":true,"groupSize":3,"maxGroupsInFlight":8} | pr | no | Merge queue group size and groups in flight. |
 | minNonClaudeSeats | scripts/settings/review.json | 1 | 1 | pr | no | Minimum number of non-Claude review seats. |
+| mode | scripts/settings/expectations.json | 1 | "observe" | env | no | Expectation babysitter mode: off or observe. WE_EXPECTATIONS_MODE overrides the repository default. |
 | modes | scripts/settings/delivery-routes.json | 4 | {"debug":"DEBUG MODE (R817/R823/R826/R852). Diagnose on the… | pr | no | Instructions defining the available delivery modes. |
 | openPrCap | scripts/settings/open-pr-cap.json | 2 | {"excludeCardOnly":true,"excludeAccepted":true} | pr | no | Population exclusions for the open PR cap. |
 | operatorCli | scripts/settings/operator-cli.json | 1 | {"freshFallback":"on"} | pr | no | Allow a fresh operator CLI fallback. |
