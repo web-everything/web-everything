@@ -286,6 +286,39 @@ it.each([['a corrupt terminated line', '{"file":\n'], ['a non-object row', '[1]\
     expect(fs.readFileSync(index, 'utf8')).toBe(`${bad}{"file":"1-x.json"}\n`);
     expect(h.emit).toHaveBeenCalledWith(expect.objectContaining({ detail: expect.objectContaining({ reason: expect.stringMatching(/invalid change-evidence index/) }) }));
   });
+it.each([['NUL bytes', '\0\0\0\0'], ['a non-row fragment', '[{"file":"x"']])(
+  'an unterminated tail of %s is not a torn row and fails closed', async (_, tail) => {
+    const h = harness(), index = path.join(h.dir, 'index.jsonl'), bytes = `{"file":"1-x.json"}\n${tail}`;
+    fs.mkdirSync(h.dir, { recursive: true }); fs.writeFileSync(index, bytes);
+    await writeChangeEvidenceForMerged(h.options);
+    expect(h.pending()).toHaveLength(1); expect(fs.existsSync(h.file)).toBe(false); expect(fs.readFileSync(index, 'utf8')).toBe(bytes);
+    expect(h.emit).toHaveBeenCalledWith(expect.objectContaining({ detail: expect.objectContaining({ reason: expect.stringMatching(/invalid change-evidence index/) }) }));
+  });
+it('every shared write is fsynced before its rename and its directory after', async () => {
+  const h = harness(), log = [], fds = new Map();
+  const io = { ...fs,
+    openSync: (file, flags) => { const fd = fs.openSync(file, flags); fds.set(fd, file); return fd; },
+    fsyncSync: fd => { log.push(['fsync', fds.get(fd)]); fs.fsyncSync(fd); },
+    renameSync: (src, dst) => { log.push(['rename', src, dst]); fs.renameSync(src, dst); } };
+  await writeChangeEvidenceForMerged({ ...h.options, io });
+  expect(h.pending()).toEqual([]);
+  const renames = log.filter(e => e[0] === 'rename');
+  expect(renames.map(e => path.basename(e[2]))).toEqual(expect.arrayContaining([path.basename(h.file), 'index.jsonl', 'change-evidence-pending.json']));
+  for (const [, src, dst] of renames) {
+    const at = log.findIndex(e => e[0] === 'rename' && e[1] === src);
+    expect(log.slice(0, at).some(e => e[0] === 'fsync' && e[1] === src)).toBe(true);
+    expect(log.slice(at).some(e => e[0] === 'fsync' && e[1] === path.dirname(dst))).toBe(true);
+  }
+});
+it.each([['pending ledger', h => path.join(h.options.coordination, 'change-evidence-pending.json'), /pending ledger/],
+  ['incoming batch', h => path.join(h.options.coordination, 'change-evidence-incoming', 'zz-empty.json'), /incoming evidence batch/],
+  ['existing record', h => h.file, /existing record/]])(
+  'an empty %s (power loss) fails closed naming the file to repair', async (_, where, reason) => {
+    const h = harness(), file = where(h); fs.mkdirSync(path.dirname(file), { recursive: true }); fs.writeFileSync(file, '');
+    await writeChangeEvidenceForMerged(h.options);
+    expect(fs.existsSync(path.join(h.dir, 'index.jsonl'))).toBe(false);
+    expect(h.emit).toHaveBeenCalledWith(expect.objectContaining({ detail: expect.objectContaining({ reason: expect.stringMatching(reason) }) }));
+  });
 it('the index is only ever replaced by rename, never written in place', async () => {
   const h = harness(), index = path.join(h.dir, 'index.jsonl'), inPlace = [];
   const io = { ...fs,

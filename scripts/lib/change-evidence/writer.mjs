@@ -27,14 +27,26 @@ export function resolveChangeEvidenceMode({ tool = readSettings().changeEvidence
   return cascadePolicy('changeEvidence', tool, { standard: { mode: 'shadow' }, platform, env, log,
     envValues: { mode: env.WE_CHANGE_EVIDENCE_MODE }, valid: { mode: v => ['off', 'shadow', 'on'].includes(v) } });
 }
+function fsyncPath(io, target) {
+  const fd = io.openSync(target, 'r');
+  try { io.fsyncSync(fd); } finally { io.closeSync(fd); }
+}
+/** tmp + fsync + rename + directory fsync: neither a process crash nor a power loss leaves a torn or empty file. */
 function atomic(io, file, bytes) {
-  io.mkdirSync(path.dirname(file), { recursive: true });
+  const dir = path.dirname(file);
+  io.mkdirSync(dir, { recursive: true });
   const tmp = `${file}.${randomUUID()}.tmp`;
-  try { io.writeFileSync(tmp, bytes); io.renameSync(tmp, file); }
+  try { io.writeFileSync(tmp, bytes); fsyncPath(io, tmp); io.renameSync(tmp, file); }
   finally { if (io.existsSync(tmp)) io.unlinkSync(tmp); }
+  // Some platforms refuse fsync on a directory; the file itself is already durable then.
+  try { fsyncPath(io, dir); } catch (error) { if (!['EISDIR', 'EINVAL', 'EPERM', 'EBADF'].includes(error.code)) throw error; }
 }
 function optional(io, file, fallback) {
   try { return io.readFileSync(file, 'utf8'); } catch (error) { if (error.code === 'ENOENT') return fallback; throw error; }
+}
+/** A shared file that does not parse fails closed with the file named, never a bare SyntaxError. */
+function parsed(bytes, what) {
+  try { return JSON.parse(bytes); } catch { throw Error(`unreadable ${what}; operator must repair or remove it, then retry backfill`); }
 }
 function identity(item, repo) {
   const slug = item.repo || repo, num = Number(item.num ?? item.number);
@@ -83,15 +95,20 @@ function collect(item, reads, maxPages) {
 
 /**
  * Valid index lines, byte for byte. The index is only ever replaced whole by an atomic rename, so a crash cannot
- * tear it; an index written by an in-place append can still end in a torn, unterminated line, which is dropped
- * (its record is re-indexed on retry). Any other unreadable row fails closed for an operator to repair.
+ * tear it; an index written by an in-place append can still end in a torn, unterminated row prefix, which is
+ * dropped (its merge is still pending, so it is re-indexed). Anything else unreadable, including an unterminated
+ * tail that is not a row prefix, fails closed for an operator to repair.
  */
+const ROW_PREFIX = '{"file":';
 function indexLines(bytes) {
   const lines = bytes.split('\n'), tail = lines.pop();
   const valid = (line, torn) => {
     let row;
     try { row = JSON.parse(line); } catch {
-      if (torn) return false;
+      if (torn && line.startsWith(ROW_PREFIX)) {
+        console.error('change-evidence: dropped a torn index.jsonl tail left by an interrupted append; re-indexing it');
+        return false;
+      }
       throw Error('invalid change-evidence index line; operator must repair index.jsonl and retry backfill');
     }
     if (!row || typeof row !== 'object' || Array.isArray(row) || typeof row.file !== 'string')
@@ -114,7 +131,7 @@ function publish({ io, dir, record, retire }) {
   if (existed) {
     // Recollect first, then reconcile a crash only if the persisted statement agrees.
     // Recorder/time metadata may differ across retries; subject, policy and verdict may not.
-    const saved = JSON.parse(io.readFileSync(file, 'utf8'));
+    const saved = parsed(io.readFileSync(file, 'utf8'), `existing record ${name}`);
     const normalize = value => JSON.parse(JSON.stringify(value, (k, v) =>
       ['recordedAt', 'recorder', 'evaluatedAt'].includes(k) ? undefined : v));
     const expected = structuredClone(record);
@@ -130,8 +147,9 @@ function publish({ io, dir, record, retire }) {
       const row = JSON.stringify({ file: name, pr: record.predicate.change.number,
         mergeSha: record.subject[0].digest.gitCommit, recordedAt: record.predicate.recordedAt });
       // Never an in-place append: a crash mid-append leaves a partial line no retry could parse.
-      atomic(io, index, [...lines, row].map(line => `${line}\n`).join(''));
+      // Mark before the call: a failure after the rename (directory fsync) must still restore the old index.
       indexWritten = true;
+      atomic(io, index, [...lines, row].map(line => `${line}\n`).join(''));
     }
     retire();
   } catch (error) {
@@ -159,11 +177,11 @@ export async function writeChangeEvidenceForMerged({ merged = [], queueFollowUps
     if (incoming.length) atomic(io, path.join(inbox, `${randomUUID()}.json`), JSON.stringify(incoming));
     withLedgerAppendLock(`change-evidence:${coordination}`, () => {
       const pendingFile = path.join(coordination, 'change-evidence-pending.json');
-      let pending = JSON.parse(optional(io, pendingFile, '[]'));
+      let pending = parsed(optional(io, pendingFile, '[]'), 'change-evidence pending ledger change-evidence-pending.json');
       if (!Array.isArray(pending)) throw Error('invalid change-evidence pending ledger; operator must repair it');
       const batches = io.existsSync(inbox) ? io.readdirSync(inbox).filter(name => name.endsWith('.json')) : [];
       const queued = batches.flatMap(name => {
-        const batch = JSON.parse(io.readFileSync(path.join(inbox, name), 'utf8'));
+        const batch = parsed(io.readFileSync(path.join(inbox, name), 'utf8'), `incoming evidence batch change-evidence-incoming/${name}`);
         if (!Array.isArray(batch)) throw Error('invalid incoming evidence batch; operator must repair it');
         return batch;
       });

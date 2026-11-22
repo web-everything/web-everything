@@ -5987,9 +5987,12 @@ the pending ledger under lock so confirmed merges survive contention. Existing s
 files are reconciled against freshly collected subject, policy, clauses and verdict before
 indexing or retirement; mismatches stay pending for operator inspection and backfill.
 The shadow `index.jsonl` is only ever replaced whole by an atomic rename, never appended in
-place, so a crash cannot leave a partial line. A torn, unterminated last line from an older
-in-place append is dropped and its record re-indexed on retry; any other unreadable row fails
-closed with the merge kept pending. The tests seed a torn tail and corrupt rows.
+place, so a crash cannot leave a partial line. A torn, unterminated last row prefix from an
+older in-place append is dropped and its record re-indexed on retry; any other unreadable row
+or tail fails closed with the merge kept pending. Every shared write fsyncs the temporary file
+before its rename and the directory after, so a power loss cannot leave an empty file; an
+unparseable pending ledger, incoming batch or record fails closed naming the file to repair.
+The tests seed a torn tail, corrupt rows and tails, empty files and check the fsync order.
 Backfill discovery pages all PRs newest-update first and stops at the first row updated
 before `--since` (a merge updates its PR), so a long merged history never blocks a recent
 window. Rows must carry a number and readable timestamps or the listing is refused; a window
