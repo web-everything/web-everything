@@ -1089,8 +1089,9 @@ the card path does. `prepare.runner=codex` passes that card path to routing; `sc
 gating, and `claude` forces the daemon fallback. Use a named critical gate file (for example,
 `scripts/lib/dispatch-contracts.mjs`) in scope-gating fixtures: arbitrary `scripts/lib/` files are not
 critical by directory alone. Decision preparation remains a Claude judgment role.
-Flash keeps the Codex read-only checker; a checker refusal undoes the attempt.
-`test-fix` uses Flash without a separate simple flag and refuses non-test worker diffs.
+Hydrogen keeps the Codex read-only checker; a checker refusal undoes the attempt.
+`test-fix` can select Hydrogen without a separate simple flag, but the live delivery admission
+refuses it until the task type and confinement are admitted; non-test worker diffs are also refused.
 The CI-heal decision currently has no structured failing-file list; do not infer one from check names.
 Standalone Findings are publication text: strip absolute local paths, qualify code references using the
 standards locus detector, and cap the final excerpt. The temporary-lane regression runs the actual
@@ -5967,3 +5968,20 @@ contract. Set `cliMain` in `prFileContract` for callable entries so repeated arg
 the loaded graph. Resetting the entire daemon graph twice inside the CLI test exceeded its
 60-second deadline on a coverage shard. Keep the file/standalone output comparison and zero-GitHub
 assertions intact; consumers without callable entries retain the fresh-import path.
+
+
+## Hydrogen build admission
+
+Documentation and filing defaults use Hydrogen medium; Hydrogen delivery must pass the live admission in
+`scripts/lib/agy-sandbox.mjs` and the production confinement refusal. A post-run diff cannot
+prove lane confinement. Directory scopes that cover protected descendants are critical even
+without enumerating the directory. `agy-hydrogen-dispatch.test.mjs` exercises the real routing,
+launcher refusal, and live delivery registry rather than supplying a critical-work verdict.
+
+## Review model role eligibility
+
+`review-model-eligibility.test.mjs` covers policy aliases/overrides, persisted routes,
+mandatory juror execution, direct advisory/red-team spawning, and merge-sensitive shapes.
+Small tiers stay ineligible even when delivery probation or Carbon promotion is enabled.
+Keep the established Carbon/Argon/Opus/Sonnet roster and Carbon's separate promotion tests;
+new model identities need a review role in `model-probation.json`, not just delivery probation.

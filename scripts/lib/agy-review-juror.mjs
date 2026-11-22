@@ -1,3 +1,4 @@
+import { reviewModelEligible } from './review-model-eligibility.mjs';
 /**
  * agy-review-juror.mjs — ONE agy (Antigravity CLI) review juror, run in its OWN juror lane, with an escape check
  * (card 84, review half).
@@ -465,6 +466,9 @@ export async function runAgyReviewJuror({ request, laneCwd, model, watch = [], d
   const result = (status, extra = {}) => ({
     status, reasons: [], sessionId: null, model, wallMs: now() - started, transcriptFile: null, ...extra,
   });
+  if (!reviewModelEligible('antigravity', model)) {
+    return result('skipped', { reasons: ['review model refused: select an eligible review model or request operator review'] });
+  }
   if (typeof laneCwd !== 'string' || !laneCwd.trim()) {
     return result('failed', { reasons: ['no review lane to clone a juror lane from'] });
   }

@@ -22,7 +22,7 @@ describe('the Antigravity Claude models were checked against the live catalog', 
   it('pins the two Claude backends `agy models` lists on agy 1.2.12, and records the check', () => {
     expect(AGY_CLAUDE_MODEL_BY_TIER).toEqual({ sonnet: 'claude-sonnet-4-6', opus: 'claude-opus-4-6-thinking' });
     expect(AGY_MODEL_CATALOG_CHECK).toEqual({ agyVersion: '1.2.12', checkedOn: '2026-09-27' });
-    expect(AGY_GEMINI_SIMPLE_MODEL).toMatch(/^gemini-3\.8-flash-/);
+    expect(AGY_GEMINI_SIMPLE_MODEL).toBe('gemini-4-hydrogen-medium');
   });
 });
 
@@ -184,15 +184,15 @@ describe('decideDispatchRoute carries the pick on the record', () => {
 
 
 describe('test-fix probation (#4551)', () => {
-  it('routes an all-test build or fix to Flash with the Codex checker without a simple flag', () => {
+  it('routes an all-test build or fix to Hydrogen with the Codex checker without a simple flag', () => {
     for (const kind of ['build', 'fix']) {
       const filesTouched = ['scripts/__tests__/repair.test.mjs'];
       const { taskType } = taskTypeFor({ kind, scopePaths: filesTouched });
       expect(taskType).toBe('test-fix');
       const route = selectProvider({ taskType }, { kind, filesTouched, estimatedSize: 20, ...open });
-      expect(route.probationWorker).toMatchObject({ id: 'antigravity-gemini', model: 'gemini-3.8-flash-high', checker: 'codex' });
+      expect(route.probationWorker).toMatchObject({ id: 'antigravity-gemini', model: 'gemini-4-hydrogen-medium', checker: 'codex' });
       expect(decideDispatchRoute({ kind, scopePaths: filesTouched, size: 1 }).probationWorker).toMatchObject({
-        id: 'antigravity-gemini', model: 'gemini-3.8-flash-high', checker: 'codex', taskType: 'test-fix',
+        id: 'antigravity-gemini', model: 'gemini-4-hydrogen-medium', checker: 'codex', taskType: 'test-fix',
       });
     }
   });
@@ -343,7 +343,7 @@ describe('build.argon settings cascade', () => {
       expect(model).toBe('gemini-4-argon-high');
     }
   });
-  it.each(['gemini-3.8-flash-high', 'gemini-3.8-flash', 'gemini-3.1-pro'])('rejects non-simple model overrides through settings and injection: %s', (model) => {
+  it.each(['gemini-4-hydrogen-medium', 'gemini-4-hydrogen-low', 'gemini-4-neon-high'])('rejects non-simple model overrides through settings and injection: %s', (model) => {
     for (const settings of [
       { read: () => ({ build: { argon: { model } } }), platform: {} },
       { read: () => ({}), platform: { argon: { model } } },

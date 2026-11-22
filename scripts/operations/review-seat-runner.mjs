@@ -1,3 +1,4 @@
+import { reviewModelEligible } from '../lib/review-model-eligibility.mjs';
 import { carbonNonShadowAllowed } from '../lib/review-seat-settings.mjs';
 /**
  * review-seat-runner.mjs — RUN ONE REVIEW SEAT ON THE PROVIDER ITS SETTING NAMES (card 84, review half).
@@ -55,6 +56,9 @@ export async function runSeatWithProvider(request, {
   }
   const model = directive.model;
   const runAgy = async (runModel = model) => {
+    if (!reviewModelEligible('antigravity', runModel)) {
+      return { status: 'skipped', reasons: ['review model refused: select an eligible review model or request operator review'] };
+    }
     // Both switches apply to Carbon shadows. The daemon plist sets AGY_GEMINI=0 today;
     // enabling Carbon shadows is an explicit operator step: set that cap above 0.
     const carbonShadow = directive.mode === 'shadow' && /carbon/i.test(String(runModel));

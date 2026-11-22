@@ -157,10 +157,10 @@ export const AGY_MODEL_CATALOG_CHECK = Object.freeze({ agyVersion: '1.2.12', che
 
 /**
  * The Gemini model an Antigravity-Gemini probation worker runs (#3922: Gemini takes only SIMPLE steps, under a
- * Claude/Codex checker). Flash, not Pro: the one clean Antigravity record so far is Flash on already-understood
- * mechanical work (conflict resolution, 10 landed). `high` is the Flash tier's top reasoning setting.
+ * Claude/Codex checker). Operator-selected Hydrogen medium handles small mechanical work.
+ * Historical Flash trials do not establish Hydrogen delivery or confinement evidence.
  */
-export const AGY_GEMINI_SIMPLE_MODEL = 'gemini-3.8-flash-high';
+export const AGY_GEMINI_SIMPLE_MODEL = 'gemini-4-hydrogen-medium';
 
 // @test-only-export-ok: Shared library exported for interactive Claude sessions and conveyor runners
 export const SUPERVISION_LEVELS = Object.freeze({
@@ -362,9 +362,17 @@ export const PROBATION_ROSTER = Object.freeze({
 });
 
 /** Preserve worker authorization and checker identity across explicit policy hand-offs. */
-export function probationWorkerForRoute({ provider, model, effort }, taskType) {
+export function probationWorkerForRoute({ provider, model, effort }, taskType, admission = {}) {
   const id = provider === 'codex' ? 'codex' : model.startsWith('claude-') ? 'antigravity-claude'
     : resolveBuildArgonModel(model) ? 'antigravity-argon' : 'antigravity-gemini';
+  if (PROBATION_WORKERS[id].simpleOnly) {
+    if (admission.simple !== true && taskType !== 'test-fix')
+      throw new Error('Hydrogen requires a simple task; use another provider or request operator review');
+    if (!Array.isArray(admission.filesTouched) || !admission.filesTouched.length
+      || !Number.isFinite(admission.estimatedSize)
+      || !isWithinProvenEnvelope(taskType, admission.estimatedSize, admission.filesTouched.length))
+      throw new Error('Hydrogen scope exceeds or lacks a proven envelope; use another provider or request operator review');
+  }
   return { ...PROBATION_WORKERS[id], model, effort, taskType };
 }
 

@@ -4,11 +4,12 @@ import { finishAiRouting } from '../ai-routing.mjs';
 import { OPERATIONS } from '../run.mjs';
 
 it('ai-routing prints settings, each role input, sources and invalid diagnostics', () => {
-  const verdict = { settings: { fix: { executors: ['claude'] } },
+  const verdict = { deliveryRoutes: { 'doc-fix': { provider: 'agy-gemini', model: 'gemini-4-hydrogen-medium', source: 'routing-policy' } }, settings: { fix: { executors: ['claude'] } },
     inputs: { fix: { executors: ['claude'] } }, sources: { 'fix.executors': 'platform' }, invalid: ['tool.fix: invalid'] };
   expect(finishAiRouting({ run: { verdict }, code: 0, lines: ['original'], json: false })).toEqual({ code: 0, lines: [
     'settings: {"fix":{"executors":["claude"]}}',
     'fix: {"executors":["claude"]}',
+    'doc-fix: {"provider":"agy-gemini","model":"gemini-4-hydrogen-medium","source":"routing-policy"}',
     'sources: {"fix.executors":"platform"}',
     'invalid: ["tool.fix: invalid"]',
   ] });
@@ -28,12 +29,13 @@ it('registered ai-routing collector returns all ten roles, settings, sources and
     expect(operation.sinks).toEqual({});
     const payload = operation.declaration.steps.find(({ name }) => name === 'read').step.fn();
     expect(read).toHaveBeenCalledOnce();
-    expect(payload).toEqual({ settings: resolved.value, sources: resolved.sources, invalid: resolved.invalid,
+    expect(payload).toEqual({ deliveryRoutes: Object.fromEntries(['doc-fix', 'prevention-card', 'prepare-card'].map(kind =>
+      [kind, expect.objectContaining({ provider: 'agy-gemini', model: 'gemini-4-hydrogen-medium', source: 'routing-policy' })])), settings: resolved.value, sources: resolved.sources, invalid: resolved.invalid,
       inputs: Object.fromEntries(['review', 'red-team', 'red-team-recheck', 'fix', 'build', 'prepare', 'ci-heal', 'worker', 'judge', 'helper']
         .map(role => [role, role === 'fix' ? { coordinator: undefined, executors: ['claude'] }
           : { coordinator: undefined, executors: undefined }])) });
     expect(payload.invalid.length).toBeGreaterThan(0);
-    expect(operation.finish({ run: { verdict: payload }, code: 0, json: false }).lines).toHaveLength(13);
+    expect(operation.finish({ run: { verdict: payload }, code: 0, json: false }).lines).toHaveLength(16);
   } finally {
     read.mockRestore();
   }

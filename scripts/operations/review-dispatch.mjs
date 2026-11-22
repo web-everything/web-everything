@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import { reviewModelEligible } from '../lib/review-model-eligibility.mjs';
 import { carbonNonShadowAllowed } from '../lib/review-seat-settings.mjs';
 import { resolveTimingPolicy } from '../lib/review-timing-settings.mjs';
 import { reviewUsesRequiredChecks } from '../lib/review-timing.mjs';
@@ -273,6 +274,10 @@ export function reviewSeatRoutes({ env = process.env, available = REVIEW_SEAT_PR
     const { model, effort } = pick.provider === 'codex'
       ? resolveCodexTaskRoute({ kind: 'review', model: configured?.model, effort: configured?.effort, log: false, aiRouting: seatAiRouting })
       : REVIEW_SEAT_MODELS[pick.provider];
+    if (!reviewModelEligible(pick.provider, configured?.model ?? model)) {
+      skipped.push({ ...s, reason: 'review model refused: select an eligible review model or request operator review' });
+      continue;
+    }
     if (!carbonNonShadowAllowed(configured?.model ?? model, { env })) {
       skipped.push({ ...s, reason: 'Carbon not promoted — non-shadow seat refused' });
       continue;

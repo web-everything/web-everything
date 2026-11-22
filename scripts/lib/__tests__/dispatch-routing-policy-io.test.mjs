@@ -246,9 +246,9 @@ it.each([
 });
 
 it.each([
-  ['agy-gemini', 'flash'],
-  ['agy-gemini', 'gemini-3.8-flash'],
-  ['antigravity', 'flash'],
+  ['agy-gemini', 'neon'],
+  ['agy-gemini', 'gemini-4-hydrogen-medium'],
+  ['antigravity', 'neon'],
   ['antigravity', 'pro'],
   ['antigravity', 'carbon'],
   ['antigravity', 'sonnet', false],

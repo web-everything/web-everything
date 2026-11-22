@@ -25,6 +25,7 @@ import { createHash } from 'node:crypto';
 import { carbonNonShadowAllowed, resolveReviewSeatSafeguards, resolveShadowSeatModel } from './review-seat-settings.mjs';
 import { readRoutingPolicy } from './dispatch-routing-policy-io.mjs';
 import { resolveOperationRoute } from './dispatch-routing-policy.mjs';
+import { assertReviewModelEligible } from './review-model-eligibility.mjs';
 
 /** The closed provider vocabulary for a seat. */
 export const SEAT_PROVIDERS = Object.freeze(['claude', 'agy', 'shadow']);
@@ -145,7 +146,9 @@ function modelDirective(settings, lens, mode) {
   if (typeof model !== 'string' || !model) throw new TypeError(`review-seat-provider: the ${lens} seat names no agy model`);
   const budget = mode === 'shadow' && settings.shadowPolicy ? { dailyCap: settings.shadowPolicy.dailyCap ?? 100 } : {};
   const override = settings.shadowModelOverride;
+  assertReviewModelEligible('antigravity', model);
   if (mode === 'shadow' && override?.model && override.model !== model) {
+    assertReviewModelEligible('antigravity', override.model);
     return Object.freeze({ ...budget, mode, model: override.model, fallbackModel: model, modelSource: override.source, onEscape: 'claude' });
   }
   // No override: today's directive, unchanged. The runner reads an absent `modelSource` as `routing-policy`.

@@ -204,6 +204,9 @@ describe('graduation-progress-report-io: promotions and probation sources', () =
       { provider: 'codex', model: 'gpt-6-astra' },
       { provider: 'antigravity', model: 'gemini-4-argon-high' },
       { provider: 'antigravity', model: 'gemini-4-carbon-high' },
+      // routing.gemini4Tiers: both Hydrogen delivery tiers enter probation.
+      { provider: 'antigravity', model: 'gemini-4-hydrogen-medium' },
+      { provider: 'antigravity', model: 'gemini-4-hydrogen-low' },
     ]);
   });
 });

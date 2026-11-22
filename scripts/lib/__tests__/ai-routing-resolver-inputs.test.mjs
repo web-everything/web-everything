@@ -86,8 +86,9 @@ describe('aiRouting resolver inputs: audit regressions', () => {
     expect(() => codex({ kind: 'build', aiRouting })).toThrow(/does not support effort/);
   });
 
+  // routing.gemini4Tiers: the default mandatory shadow now uses Sonnet.
   it('explicit default shadow coordinator preserves mandatory review routing', () => {
-    const resolved = resolve({ review: { coordinator: { provider: 'agy-claude', model: 'opus-5-5', effort: 'high' } } });
+    const resolved = resolve({ review: { coordinator: { provider: 'agy-claude', model: 'sonnet', effort: 'high' } } });
     expect(resolved.invalid).toEqual([]);
     const options = { operation: 'review-seat', taskType: 'mandatory:correctness', operatorKeys: [] };
     const baseline = resolveOperationRoute(options);
@@ -138,15 +139,16 @@ describe('aiRouting resolver inputs: audit regressions', () => {
       .toThrow(/fallback requires a concrete primary/);
   });
 
+  // routing.gemini4Tiers: retain counting safety with the ruled Sonnet shadow.
   it.each(['removed', 'disabled', 'held', 'unavailable', 'vetoed', 'gate-closed'])('explicit shadow input preserves counting safety when %s', constraint => {
-    const aiRouting = coordinator('review', { provider: 'agy-claude', model: 'opus-5-5', effort: 'high' });
+    const aiRouting = coordinator('review', { provider: 'agy-claude', model: 'sonnet', effort: 'high' });
     const policy = structuredClone(DEFAULT_ROUTING_POLICY);
     const options = { operation: 'review-seat', taskType: 'mandatory:correctness', operatorKeys: [], policy, aiRouting };
     if (constraint === 'removed') aiRouting.fallback = [];
     if (constraint === 'disabled') policy.operations['review-seat:mandatory:correctness'].disabledProviders = ['claude'];
     if (constraint === 'held') options.availability = { claude: 'held' };
     if (constraint === 'unavailable') options.available = ['agy-claude'];
-    if (constraint === 'vetoed') options.vetoes = [{ provider: 'antigravity', model: 'claude-opus-5-5-high' }];
+    if (constraint === 'vetoed') options.vetoes = [{ provider: 'antigravity', model: 'claude-sonnet-5-5-high' }];
     if (constraint === 'gate-closed') options.gateClosed = true;
     if (['vetoed', 'gate-closed'].includes(constraint)) {
       const result = resolveOperationRoute(options);
@@ -385,16 +387,18 @@ describe('aiRouting resolver inputs: audit regressions', () => {
     const aiRouting = aiRoutingInputs('fix', resolve()).coordinator;
     expect(aiRouting).toBeUndefined();
     expect(operation({ aiRouting })).toEqual(operation({}));
-    expect(operation({ aiRouting })).toMatchObject({ provider: 'codex', model: 'gpt-6.1-sol' });
+    // routing.gemini4Tiers: ordinary doc-fix defaults to Hydrogen delivery.
+    expect(operation({ aiRouting })).toMatchObject({ provider: 'agy-gemini', model: 'gemini-4-hydrogen-medium' });
   });
 
   it('inherited_routes_enforce_final_policy: inherited slices still pass gate, holds, vetoes and exhaustion checks', () => {
     const aiRouting = aiRoutingInputs('fix', resolve()).coordinator;
-    for (const constraints of [{ gateClosed: true }, { availability: { codex: 'held' } },
-      { vetoes: [{ provider: 'codex', model: 'gpt-6.1-sol' }] }]) {
+    // routing.gemini4Tiers: exercise holds and vetoes against the current Hydrogen primary.
+    for (const constraints of [{ gateClosed: true }, { availability: { 'agy-gemini': 'held' } },
+      { vetoes: [{ provider: 'antigravity', model: 'gemini-4-hydrogen-medium' }] }]) {
       expect(operation({ aiRouting, ...constraints })).toMatchObject({ provider: 'claude', fallback: [] });
     }
-    expect(() => operation({ aiRouting, availability: { codex: 'held', claude: 'held' } })).toThrow(/no available route/);
+    expect(() => operation({ aiRouting, availability: { 'agy-gemini': 'held', claude: 'held' } })).toThrow(/no available route/);
     expect(() => operation({ aiRouting: codexRoute })).not.toThrow();
     expect(operation({ aiRouting: codexRoute, gateClosed: true })).toMatchObject({ provider: 'claude' });
     expect(operation({ aiRouting: codexRoute, availability: { codex: 'held' } })).toMatchObject({ provider: 'claude' });

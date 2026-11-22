@@ -60,6 +60,12 @@ describe('repair scope admission', () => {
     expect(deriveAgyFixAdmission({ size: 1, scope: ['we:docs/guide.md'] }, { scope: 'we:docs' }))
       .toEqual({ kind: 'doc-fix', size: 1, scope: ['docs/guide.md'] });
   });
+  it('a broad docs envelope cannot admit protected descendants or an equally broad item', () => {
+    for (const scope of [['docs'], ['docs/agent/testing.md']]) {
+      expect(deriveAgyFixAdmission({ taskKind: 'doc-fix', size: 1, scope }, { scope: ['docs'] }))
+        .toBeNull();
+    }
+  });
   it('test-fix is refused until #8606', () => {
     for (const taskKind of ['test-fix', 'fix', 'doc-fix', 'feature'])
       expect(admit({ taskKind, size: 1, scope: ['blocks/selection/__tests__/a.test.ts'] })).toBeNull();
