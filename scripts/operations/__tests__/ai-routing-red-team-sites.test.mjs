@@ -1,4 +1,3 @@
-// routing.gemini4Tiers: review fixtures use eligible Argon, never small Neon/Hydrogen tiers.
 import { test, vi } from 'vitest';
 import assert from 'node:assert/strict';
 import { tmpdir } from 'node:os';

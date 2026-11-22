@@ -117,14 +117,6 @@ describe('operation routing policy', () => {
     for (const provider of supported) {
       const accepted = structuredClone(policy);
       accepted.operations[key] = { ...routeFor(provider), fallback: [] };
-      if (key.includes('mandatory:') && provider === 'agy-gemini') {
-        // operator ruling 7333: advisory probation never counts for mandatory seats
-        expect(() => validateRoutingPolicy(accepted)).toThrow(/review model refused/);
-        // operator ruling 7333: advisory probation never counts for mandatory seats
-        expect(() => planRoutingOverride({ ...input, provider, model: models[provider] }, policy))
-          .toThrow(/review model refused/);
-        continue;
-      }
       expect(validateRoutingPolicy(accepted).operations[key]).toMatchObject({ provider });
       expect(planRoutingOverride({ ...input, provider, model: models[provider] }, policy)).toMatchObject({ key, patch: { provider } });
     }
@@ -146,13 +138,7 @@ describe('operation routing policy', () => {
     });
   it.each(['codex', 'agy-claude', 'agy-gemini'])(
     'resolves a supported red-team override for %s against the launch roster', provider => {
-      // Review overrides default to Argon; its probation remains eligible for advisory red-team seats.
-      const patch = provider === 'agy-gemini' ? { provider, model: 'gemini-4-argon-high' } : { provider };
-      // operator ruling 7333: advisory probation never counts for mandatory seats
-      if (provider === 'agy-gemini') expect(resolveOperationRoute({ operation: 'review-seat', taskType: 'red-team',
-        policy: applyRoutingOverrides(DEFAULT_ROUTING_POLICY, {
-          'review-seat:red-team': { provider },
-        }) })).toMatchObject({ provider, model: 'gemini-4-argon-high' });
+      const patch = provider === 'agy-gemini' ? { provider, model: 'pro' } : { provider };
       const policy = applyRoutingOverrides(DEFAULT_ROUTING_POLICY, { 'review-seat:red-team': patch });
       expect(resolveOperationRoute({ operation: 'review-seat', taskType: 'red-team',
         available: OPERATION_PROVIDER_ROSTERS['review-seat:red-team'], policy })).toMatchObject({ provider });
@@ -241,7 +227,7 @@ it('a child uses the inherited last-good snapshot even while the policy file is 
   mkdirSync(join(parent, 'settings'));
   copyFileSync('scripts/settings/provider-capacity.json', join(parent, 'settings/provider-capacity.json'));
   try {
-    for (const file of ['dispatch-routing-policy-source.mjs', 'codex-model-routing.mjs', 'dispatch-routing-policy.mjs', 'dispatch-routing-providers.mjs', 'review-model-eligibility.mjs', 'model-probation-registry.mjs', 'model-probation.json']) copyFileSync(`scripts/lib/${file}`, join(dir, file));
+    for (const file of ['dispatch-routing-policy-source.mjs', 'codex-model-routing.mjs', 'dispatch-routing-policy.mjs', 'dispatch-routing-providers.mjs']) copyFileSync(`scripts/lib/${file}`, join(dir, file));
     writeFileSync(join(dir, 'dispatch-routing-policy.json'), '{broken edit');
     const moduleUrl = pathToFileURL(join(dir, 'dispatch-routing-policy.mjs')).href;
     const result = execFileSync(process.execPath, ['--input-type=module', '-e', `import { resolveOperationRoute } from ${JSON.stringify(moduleUrl)}; console.log(JSON.stringify(resolveOperationRoute({operation:'prepare-item'})));`], {

@@ -36,7 +36,7 @@ function fixture() {
   const calls = [];
   let mutated = false;
   const run = (act = () => {}, steps = (cwd) => [tool(join(cwd, 'file.txt'))], options = {}) => runAgyReviewJuror({
-    request: { mandate: 'review', input: 'diff', shape: {} }, laneCwd: lane, model: 'gemini-4-argon-high', watch: [extra],
+    request: { mandate: 'review', input: 'diff', shape: {} }, laneCwd: lane, model: 'test', watch: [extra],
     deps: {
       repoRoot: shared, home,
       mkTempDir: () => mkdtempSync(join(root, 'juror-')),

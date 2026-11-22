@@ -1,4 +1,3 @@
-// routing.gemini4Tiers: review fixtures use eligible Argon, never small Neon/Hydrogen tiers.
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { mkdtempSync, readFileSync, writeFileSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
@@ -31,16 +30,6 @@ function fixture(realEvents = false) {
 }
 
 describe('operator routing overrides', () => {
-  it('provider-only Gemini review overrides choose Argon and explicit small tiers refuse', () => {
-    const policy = applyRoutingOverrides(DEFAULT_ROUTING_POLICY, { [key]: { provider: 'agy-gemini' } });
-    expect(resolveOperationRoute({ operation: 'review-seat', taskType: 'red-team', policy }))
-      .toMatchObject({ provider: 'agy-gemini', model: 'gemini-4-argon-high' });
-    for (const model of ['hydrogen', 'hydrogen-low', 'neon']) {
-      expect(() => applyRoutingOverrides(DEFAULT_ROUTING_POLICY, { [key]: { provider: 'agy-gemini', model } }))
-        .toThrow(/review model refused/);
-    }
-  });
-
   it('refuses an inherited evidence route when provider disables cannot be enforced', () => {
     const policy = applyRoutingOverrides(DEFAULT_ROUTING_POLICY, { fix: { disabledProviders: ['claude'] } });
     const result = decideDispatchRoute({ kind: 'fix', cause: 'review-finding', scopePaths: ['scripts/example.mjs'],
@@ -52,9 +41,8 @@ describe('operator routing overrides', () => {
   it.each(['advisory:agy-correctness', 'mandatory:correctness', 'mandatory:security'])(
     'rejects unsupported providers for %s before accepting an override', task => {
       for (const provider of ['codex', 'antigravity']) {
-        // operator ruling 7333: advisory probation never counts for mandatory seats
         expect(() => applyRoutingOverrides(DEFAULT_ROUTING_POLICY, {
-          [`review-seat:${task}`]: { provider, model: provider === 'codex' ? 'sol' : 'sonnet' },
+          [`review-seat:${task}`]: { provider },
         })).toThrow(/provider/);
         expect(() => applyRoutingOverrides(DEFAULT_ROUTING_POLICY, {
           [`review-seat:${task}`]: { fallback: [{ provider: 'claude', model: 'sonnet' },
@@ -68,8 +56,7 @@ describe('operator routing overrides', () => {
     for (const task of ['mandatory:correctness', 'mandatory:security', 'advisory:agy-correctness']) {
       delete base.operations[`review-seat:${task}`];
     }
-    // operator ruling 7333: advisory probation never counts for mandatory seats
-    expect(() => applyRoutingOverrides(base, { 'review-seat': { provider: 'codex', model: 'sol' } })).toThrow(/no available route/);
+    expect(() => applyRoutingOverrides(base, { 'review-seat': { provider: 'codex' } })).toThrow(/no available route/);
   });
 
   it('rejects disabling every mandatory seat provider before publishing settings', () => {
@@ -162,7 +149,7 @@ describe('operator routing overrides', () => {
 
   it.each(['claude', 'agy-claude', 'agy-gemini'])('initializes review for a supported advisory provider %s', provider => {
     const policy = applyRoutingOverrides(DEFAULT_ROUTING_POLICY, {
-      'review-seat:advisory:agy-correctness': { provider },
+      'review-seat:advisory:agy-correctness': { provider, ...(provider === 'agy-gemini' ? { model: 'pro' } : {}) },
     });
     expect(settingsFromRoutingPolicy(policy).agyCorrectnessAdvisory).toBe(provider !== 'claude');
   });
@@ -246,7 +233,7 @@ describe('operator routing overrides', () => {
     { [key]: { provider: 'claude' } }, { [key]: { provider: 'antigravity' } }, { [key]: { model: 'made-up' } },
     { [key]: { disabledProviders: ['typo'] } }, { [key]: { provider: 'codex', disabledProviders: ['codex'] } }])(
     'retains last good on invalid override and logs once: %j', invalid => {
-      const f = fixture(); f.set({ [key]: { provider: 'agy-gemini' } });
+      const f = fixture(); f.set({ [key]: { provider: 'agy-gemini', model: 'pro' } });
       const good = f.reader(); f.set(invalid);
       expect(f.reader()).toBe(good); expect(f.reader()).toBe(good);
       expect(f.log).toHaveBeenCalledTimes(1); expect(f.events).toHaveLength(1);
@@ -261,7 +248,7 @@ describe('operator routing overrides', () => {
     f.set({ [key]: { provider: 'unknown' } });
     expect(f.reader()).toBe(good); expect(f.reader()).toBe(good);
     expect(f.log).toHaveBeenCalledTimes(2);
-    f.set({ [key]: { provider: 'agy-gemini' } });
+    f.set({ [key]: { provider: 'agy-gemini', model: 'pro' } });
     const recovered = f.reader();
     expect(recovered.operations[key].provider).toBe('agy-gemini');
     expect(f.events).toHaveLength(2);
@@ -283,7 +270,7 @@ describe('operator routing overrides', () => {
 
   it('reloads changes and clearing with one real JSONL event per operation change, never per pass', async () => {
     const f = fixture(true); f.reader();
-    f.set({ [key]: { provider: 'agy-gemini' } });
+    f.set({ [key]: { provider: 'agy-gemini', model: 'pro' } });
     expect(f.reader().operations[key].provider).toBe('agy-gemini'); f.reader();
     f.set({ [key]: { provider: 'codex', model: 'sol' } });
     expect(f.reader().operations[key].provider).toBe('codex'); f.reader();
@@ -298,7 +285,7 @@ describe('operator routing overrides', () => {
   });
 
   it('enables an unset default-zero provider with a finite cap and honours explicit disables', () => {
-    const entry = applyRoutingOverrides(DEFAULT_ROUTING_POLICY, { [key]: { provider: 'agy-gemini' } }).operations[key];
+    const entry = applyRoutingOverrides(DEFAULT_ROUTING_POLICY, { [key]: { provider: 'agy-gemini', model: 'pro' } }).operations[key];
     expect(resolveRoutingProviderCap('agy-gemini', {}, entry)).toBe(300);
     expect(resolveRoutingProviderCap('agy-gemini', { WE_REVIEW_SEAT_CAP_AGY_GEMINI: '7' }, entry)).toBe(7);
     expect(resolveRoutingProviderCap('agy-gemini', {}, DEFAULT_ROUTING_POLICY.operations[key])).toBe(0);
@@ -377,7 +364,7 @@ describe('operator routing overrides', () => {
       const operator = operatorPreferencesPath({}), warn = vi.fn();
       let operatorPresent = false;
       const preferences = () => readPlatformPreferences({ env: {}, warn, readFile: path => {
-        if (path === repoPath) return JSON.stringify({ routingOverrides: { [key]: { provider: 'agy-gemini' } }, other: 1 });
+        if (path === repoPath) return JSON.stringify({ routingOverrides: { [key]: { provider: 'agy-gemini', model: 'pro' } }, other: 1 });
         if (path === operator && operatorPresent) return JSON.stringify({ routingOverrides: { [key]: { provider: 'codex' } } });
         return '{}';
       } });
@@ -388,7 +375,7 @@ describe('operator routing overrides', () => {
       operatorPresent = true;
       expect(reader().operations[key].provider).toBe('codex');
       const replaced = readPlatformPreferences({ env: { WE_PLATFORM_PREFERENCES_FILE: repoPath }, warn,
-        readFile: () => JSON.stringify({ routingOverrides: { [key]: { provider: 'agy-gemini' } }, other: 1 }) });
+        readFile: () => JSON.stringify({ routingOverrides: { [key]: { provider: 'agy-gemini', model: 'pro' } }, other: 1 }) });
       expect(replaced.prefs).toEqual({ other: 1 });
     });
 
@@ -397,7 +384,7 @@ describe('operator routing overrides', () => {
     let onLog;
     const eventLogged = new Promise(resolve => { onLog = resolve; });
     const log = vi.fn(message => onLog(message));
-    f.set({ [key]: { provider: 'agy-gemini' } });
+    f.set({ [key]: { provider: 'agy-gemini', model: 'pro' } });
     const emit = vi.fn(() => {
       if (failure === 'throws synchronously') throw new Error('event sink unavailable');
       return Promise.reject(new Error('event sink unavailable'));

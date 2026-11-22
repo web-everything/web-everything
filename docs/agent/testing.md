@@ -5978,10 +5978,6 @@ prove lane confinement. Directory scopes that cover protected descendants are cr
 without enumerating the directory. `agy-hydrogen-dispatch.test.mjs` exercises the real routing,
 launcher refusal, and live delivery registry rather than supplying a critical-work verdict.
 
-## Review model role eligibility
-
-`review-model-eligibility.test.mjs` covers policy aliases/overrides, persisted routes,
-mandatory juror execution, direct advisory/red-team spawning, and merge-sensitive shapes.
-Small tiers stay ineligible even when delivery probation or Carbon promotion is enabled.
-Keep the established Carbon/Argon/Opus/Sonnet roster and Carbon's separate promotion tests;
-new model identities need a review role in `model-probation.json`, not just delivery probation.
+Hydrogen, Neon and retired Flash models are refused on review, juror, judge and merge-path
+operation keys by `dispatch-routing-policy.mjs`. Test both declared policy entries and effective
+routes inherited from task types or wildcard entries, including fallbacks and AI routing overlays.

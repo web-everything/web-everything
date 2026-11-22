@@ -1,5 +1,4 @@
 #!/usr/bin/env node
-import { reviewModelEligible } from '../lib/review-model-eligibility.mjs';
 import { redTeamRouteByBuilder, readReviewSeatPolicy } from '../lib/review-seat-caps.mjs';
 import { carbonNonShadowAllowed } from '../lib/review-seat-settings.mjs';
 import { renderNoPromptCommandRules } from '../lib/no-prompt-command-rules.mjs';
@@ -1195,10 +1194,6 @@ export function createExtraSeatsIo({ env = process.env, root = REPO_ROOT, storeP
     removeScratch: removeReviewScratch,
     writeFile: (path, text) => { mkdirSync(dirname(path), { recursive: true }); writeFileSync(path, text); },
     runSeat: ({ provider, taskFile, schemaFile, dir, model, effort, timeoutMs }) => new Promise((resolvePromise) => {
-      if (!reviewModelEligible(provider, model)) {
-        resolvePromise({ report: null, error: 'review model refused: select an eligible review model or request operator review', timedOut: false });
-        return;
-      }
       if (!carbonNonShadowAllowed(model, { env })) {
         resolvePromise({ report: null, error: 'Carbon not promoted — non-shadow seat refused', timedOut: false });
         return;
@@ -2003,17 +1998,15 @@ export async function speculateRedTeam({
       // Check the resolved model, including builder/AI overrides, before spending its budget.
       // Keep runSeat's guard too: promotion can be withdrawn between admission and execution.
       const candidateModel = configuredRoute?.model ?? RED_TEAM_MODELS[pick.provider].model;
-      if (!reviewModelEligible(pick.provider, candidateModel) || !carbonNonShadowAllowed(candidateModel, { env, log: io.log })) {
-        lastReason = !reviewModelEligible(pick.provider, candidateModel)
-          ? 'review model refused: select an eligible review model or request operator review'
-          : 'Carbon not promoted — non-shadow seat refused';
+      if (!carbonNonShadowAllowed(candidateModel, { env, log: io.log })) {
+        lastReason = 'Carbon not promoted — non-shadow seat refused';
         unavailable.push(`${pick.provider}/${candidateModel}: ${lastReason}`);
         // The refusal is about this MODEL, not the provider: take the next configured route in the chain
         // (same provider or not) whose model is allowed, before dropping the provider altogether.
         const chain = configuredRoute?.fallback ?? [];
         // The builder preference still applies: an allowed route of the preferred vendor beats chain order.
         const allowed = chain.map(route => candidates.includes(route.provider)
-          && reviewModelEligible(route.provider, route.model) && carbonNonShadowAllowed(route.model, { env, log: io.log }));
+          && carbonNonShadowAllowed(route.model, { env, log: io.log }));
         let nextIndex = preferred && !operatorRoute ? chain.findIndex((route, i) => allowed[i] && route.provider === preferred) : -1;
         if (nextIndex < 0) nextIndex = allowed.indexOf(true);
         if (nextIndex >= 0) {

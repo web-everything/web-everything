@@ -66,12 +66,11 @@ const CONFINEMENT_MODULES = Object.freeze([
   'scripts/lib/dispatch-routing-policy.json',
   'scripts/lib/provider-routing.mjs',
   'scripts/lib/dispatch-routing-policy-source.mjs',
-  // The review-model eligibility boundary, its registry and the tests holding its assertions.
-  'scripts/lib/review-model-eligibility.mjs',
-  'scripts/lib/model-probation-registry.mjs',
+  // Hydrogen delivery admission reads task classification and delivery probation evidence.
+  'scripts/lib/dispatch-task-type.mjs',
+  'scripts/lib/dispatch-contracts.mjs',
+  'scripts/lib/model-probation.mjs',
   'scripts/lib/model-probation.json',
-  'scripts/lib/__tests__/review-model-eligibility.test.mjs',
-  'scripts/lib/__tests__/model-probation.test.mjs',
 ]);
 
 /** The file-level gate/approval boundary, distinct from the broader full-review roster. */

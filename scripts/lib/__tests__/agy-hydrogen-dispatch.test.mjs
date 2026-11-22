@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from 'vitest';
-import { DEFAULT_ROUTING_POLICY } from '../dispatch-routing-policy.mjs';
+import { DEFAULT_ROUTING_POLICY, applyRoutingOverrides, resolveOperationRoute, validateRoutingPolicy } from '../dispatch-routing-policy.mjs';
 import { resolveDispatchRoute } from '../dispatch-routing-policy-io.mjs';
 import { decideDispatchRoute } from '../dispatch-contracts.mjs';
 import { criticalWorkVerdict } from '../critical-work.mjs';
@@ -80,5 +80,83 @@ describe('production Hydrogen dispatch admission', () => {
     expect(result).toMatchObject({ outcome: 'escalated-needs-human', executor: 'none', detail: expect.stringMatching(taskType === 'doc-fix' ? /confinement unavailable/ : /documentation builds/) });
     expect(runWorker).not.toHaveBeenCalled();
     expect(claim).not.toHaveBeenCalled();
+  });
+});
+
+
+describe('Hydrogen never resolves on review, juror, judge or merge-path routes', () => {
+  const identities = ['hydrogen', 'hydrogen-low', 'gemini-4-hydrogen-medium', 'gemini-4-hydrogen-low'];
+  const keys = [...new Set([
+    'review-seat', 'review-seat:mandatory:security', 'review-seat:mandatory:correctness',
+    'review-seat:advisory:*', 'review-seat:advisory:agy-correctness', 'review-seat:red-team',
+    'extra-juror:*', 'extra-juror:security', 'review-seat:extra-juror:security',
+    'judge', 'judge:review-pr', 'review', 'red-team', 'merge', 'land',
+    ...Object.keys(DEFAULT_ROUTING_POLICY.operations).filter(key => /review|juror|judge|red-team|merge|land/.test(key)),
+  ])];
+  const inputs = keys.flatMap(operation => {
+    const separator = operation.indexOf(':');
+    return [{ operation }, ...(separator < 0 ? [] : [{
+      operation: operation.slice(0, separator), taskType: operation.slice(separator + 1),
+    }])];
+  });
+  const safeRoute = { provider: 'claude', model: 'sonnet', fallback: [] };
+  const unsafe = (provider, model) => ({ provider, model, fallback: [] });
+
+  it.each(inputs)('default policy excludes Hydrogen for %j', input => {
+    const route = resolveOperationRoute(input);
+    for (const seat of route ? [route, ...route.fallback] : []) {
+      expect(seat.model).not.toMatch(/hydrogen/);
+    }
+  });
+
+  for (const provider of ['agy-gemini', 'antigravity']) {
+    it.each(identities)(`${provider}/%s refuses every protected operation override before resolution`, model => {
+      for (const input of inputs) {
+        const key = input.taskType ? `${input.operation}:${input.taskType}` : input.operation;
+        const base = structuredClone(DEFAULT_ROUTING_POLICY);
+        base.operations[key] = { inherit: true };
+        expect(() => resolveOperationRoute({ ...input,
+          policy: applyRoutingOverrides(base, { [key]: unsafe(provider, model) }),
+        })).toThrow(/small-tier model.*refused.*larger model or request operator review/);
+      }
+    });
+
+    it.each(identities)(`${provider}/%s cannot bypass validation through inherited routes or fallbacks`, model => {
+      for (const input of inputs) {
+        for (const placement of ['primary', 'fallback', 'task-type', 'wildcard', 'overlay']) {
+          const policy = structuredClone(DEFAULT_ROUTING_POLICY);
+          const key = input.taskType ? `${input.operation}:${input.taskType}` : input.operation;
+          const route = unsafe(provider, model);
+          const options = { ...input, policy };
+          if (placement === 'primary') policy.operations[key] = route;
+          if (placement === 'fallback') policy.operations[key] = { ...safeRoute, fallback: [route] };
+          if (placement === 'task-type') {
+            policy.operations[key] = { inherit: true };
+            options.taskType = input.taskType ?? 'small-delivery';
+            policy.taskTypes[options.taskType] = route;
+          }
+          if (placement === 'wildcard') {
+            delete policy.operations[key];
+            delete policy.operations[input.operation];
+            delete policy.operations[input.operation.split(':')[0]];
+            policy.operations['*'] = route;
+          }
+          if (placement === 'overlay') {
+            policy.operations[key] = { inherit: true };
+            options.aiRouting = route;
+            options.operatorKeys = [];
+          }
+          const refusal = placement === 'overlay' && provider === 'antigravity'
+            ? /small-tier model.*refused|unsupported seat provider/ : /small-tier model.*refused/;
+          expect(() => resolveOperationRoute(options), `${key}: ${placement}`).toThrow(refusal);
+        }
+      }
+    });
+  }
+
+  it.each(['neon', 'gemini-4-neon-high'])('also refuses the small tier %s in protected policy entries', model => {
+    const policy = structuredClone(DEFAULT_ROUTING_POLICY);
+    policy.operations.judge = unsafe('agy-gemini', model);
+    expect(() => validateRoutingPolicy(policy)).toThrow(/small-tier model.*refused/);
   });
 });

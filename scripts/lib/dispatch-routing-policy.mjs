@@ -2,7 +2,6 @@
 import { CODEX_EFFORT_MAP } from './codex-model-routing.mjs';
 import { initialRoutingPolicy as defaults } from './dispatch-routing-policy-source.mjs';
 import { rosterForKey } from './dispatch-routing-providers.mjs';
-import { assertReviewModelEligible, requiresReviewModel } from './review-model-eligibility.mjs';
 
 const CATALOG = Object.freeze({
   claude: ['claude-haiku-5-5', 'claude-sonnet-5-5', 'claude-opus-5-5'],
@@ -85,13 +84,13 @@ export function validateRoutingPolicy(input) {
         fail(`${path}.mode must be "shadow", with a claude route in fallback to count`);
       }
       const resolvedModel = modelFor(policy, entry.provider, entry.model, path);
-      if (requiresReviewModel(name)) assertReviewModelEligible(entry.provider, resolvedModel, name);
+      assertOperationModel(name, resolvedModel);
       validateEffort(entry.effort, entry.provider);
       if (!Array.isArray(entry.fallback)) fail(`${path}.fallback must be an array`);
       for (const [i, next] of entry.fallback.entries()) {
         keys(next, ['provider', 'model', 'effort'], `${path}.fallback[${i}]`);
         const fallbackModel = modelFor(policy, next.provider, next.model, `${path}.fallback[${i}]`);
-        if (requiresReviewModel(name)) assertReviewModelEligible(next.provider, fallbackModel, name);
+        assertOperationModel(name, fallbackModel);
         validateEffort(next.effort, next.provider);
       }
       const allowedProviders = group === 'operations' && rosterForKey(name);
@@ -121,12 +120,17 @@ function validateProviderControls(entry, path) {
   if (entry?.enabledProviders?.some(p => entry.disabledProviders?.includes(p))) fail(`${path}: provider cannot be both enabled and disabled`);
 }
 
-export function defaultPolicyModel(provider, operation = '') {
-  // Provider-only review overrides must choose a review-eligible model. Explicit small tiers still refuse.
-  if (provider === 'agy-gemini' && requiresReviewModel(operation)) return 'pro';
+export function defaultPolicyModel(provider) {
   const model = { claude: 'sonnet', codex: 'default', antigravity: 'sonnet', 'agy-claude': 'sonnet', 'agy-gemini': 'neon' }[provider];
   if (!model) fail(`unknown provider ${JSON.stringify(provider)}`);
   return model;
+}
+
+// Validate both declared keys and effective inherited routes before selecting any candidate.
+function assertOperationModel(operation, model) {
+  if (/review|juror|judge|red-team|merge|land/i.test(operation) && /hydrogen|neon|flash/i.test(model)) {
+    fail(`${operation}: small-tier model ${model} refused; configure a larger model or request operator review`);
+  }
 }
 
 /** Arrays replace; nested effort maps merge. Overrides never mutate the repo snapshot. */
@@ -140,7 +144,7 @@ export function applyRoutingOverrides(base, overrides = {}) {
     if (object(patch.effort)) entry.effort = { ...(object(policy.operations[name].effort) ? policy.operations[name].effort : {}), ...patch.effort };
     if (patch.provider !== undefined) {
       delete entry.inherit;
-      entry.model = patch.model ?? (patch.provider === policy.operations[name].provider ? policy.operations[name].model : defaultPolicyModel(patch.provider, name));
+      entry.model = patch.model ?? (patch.provider === policy.operations[name].provider ? policy.operations[name].model : defaultPolicyModel(patch.provider));
       entry.fallback ??= [];
       // Selecting a provider explicitly is also a live enable, including a default-zero Gemini cap.
       entry.enabledProviders = [...new Set([...(entry.enabledProviders ?? []), patch.provider])];
@@ -213,9 +217,7 @@ export function resolveOperationRoute({ operation, taskType, size, designQuestio
     if (!entry || entry.inherit) return inheritRoute();
   }
   const candidates = [entry, ...entry.fallback].map(({ provider, model, effort }) => ({ provider, model: modelFor(policy, provider, model, operation), effort: resolvePolicyEffort(provider, typeof effort === 'string' ? effort : effort?.[provider] ?? operationEffort(operation, provider, taskType, policy)) }));
-  if (requiresReviewModel(`${operation}:${taskType ?? ''}`)) {
-    for (const route of candidates) assertReviewModelEligible(route.provider, route.model, `${operation}:${taskType ?? ''}`);
-  }
+  for (const route of candidates) assertOperationModel(`${operation}:${taskType ?? ''}`, route.model);
   const chain = candidates.filter(route => !disabledProviders.has(route.provider) && !entry.disabledProviders?.includes(route.provider))
     .filter(route => (!gateClosed || route.provider === 'claude') && (route.provider === 'claude' || !vetoes.some(veto => veto.model === route.model && veto.provider === (route.provider.startsWith('agy-') ? 'antigravity' : route.provider))))
     .filter(route => !availability?.[route.provider]

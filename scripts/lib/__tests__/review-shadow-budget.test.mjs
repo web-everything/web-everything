@@ -55,7 +55,7 @@ describe('daily session cap', () => {
     ['quota-hold', 'quota-exhausted', 'cap'].map(kind => ({ mode, onEscape, kind })))))
   ('$mode with onEscape=$onEscape preserves the Claude answer policy on $kind', async ({ mode, onEscape, kind }) => {
     let claudeCalls = 0;
-    const result = await runSeatWithProvider({ lens: 'correctness', seatProvider: { mode, onEscape, model: 'claude-opus-5-5-high' } }, {
+    const result = await runSeatWithProvider({ lens: 'correctness', seatProvider: { mode, onEscape, model: 'm' } }, {
       cwd: '.', unwrap: x => x, wrap: value => value,
       claudeJudge: async () => { claudeCalls++; return { value: { summary: 'Claude judged', findings: [] } }; },
       agyJuror: async () => kind === 'cap' ? { status: 'skipped', reasons: ['daily cap reached'] }
@@ -92,7 +92,7 @@ describe('daily session cap', () => {
       writeFileSync(path, 'occupied');
       const models = [];
       const result = await runSeatWithProvider({ lens: 'correctness', seatProvider: {
-        mode: 'shadow', model: 'gemini-4-argon-high', fallbackModel: 'opus', dailyCap: 1,
+        mode: 'shadow', model: 'gemini', fallbackModel: 'opus', dailyCap: 1,
       } }, {
         cwd: '.', unwrap: x => x, wrap: value => value,
         claudeJudge: async () => ({ value: { summary: 'Claude judged', findings: [] } }),
@@ -109,7 +109,7 @@ describe('daily session cap', () => {
     const events = [];
     let reservations = 0;
     const result = await runSeatWithProvider({ lens: 'correctness', seatProvider: {
-      mode: 'shadow', model: 'gemini-4-argon-high', fallbackModel: 'opus', dailyCap: 1,
+      mode: 'shadow', model: 'gemini', fallbackModel: 'opus', dailyCap: 1,
     } }, {
       cwd: '.', unwrap: x => x, wrap: value => value,
       claudeJudge: async () => ({ value: { summary: 'Claude judged', findings: [] } }),
@@ -117,7 +117,7 @@ describe('daily session cap', () => {
       reserveSession: () => { events.push('reserve'); return { allowed: ++reservations === 1, reason: 'daily cap reached' }; },
       appendRow: () => true, log: () => {},
     });
-    expect(events).toEqual(['reserve', 'gemini-4-argon-high', 'reserve']);
+    expect(events).toEqual(['reserve', 'gemini', 'reserve']);
     expect(result.summary).toBe('Claude judged');
     expect(result.shadow).toMatchObject({ status: 'skipped', reasons: ['daily cap reached'] });
   });

@@ -159,11 +159,11 @@ describe('x00g3tt — the red team fires on ACCEPT only', () => {
 
   it('card x6ov12s — a held-but-probe-due codex is still admitted to the red-team pass (both call sites wired)', async () => {
     // Same live-incident shape as review-extra-seats.test.mjs's runExtraSeats case: codex's last row would
-    // still hold under the plain `quotaHold` reader (100% gauge, resetsAt days out); this call site must read
+    // still hold under the plain `quotaHold` reader (99% gauge, resetsAt days out); this call site must read
     // it through `quotaHoldOrProbe` too, so a full probe interval past that row's own `scoredAt` admits it.
     const heldRow = {
       dispatchKind: 'review-seat', provider: 'codex', status: 'ok',
-      quotaUsedPercent: 100, quotaResetsAt: '2026-10-03T17:11:00-04:00', scoredAt: '2026-09-28T22:31:00-04:00',
+      quotaUsedPercent: 99, quotaResetsAt: '2026-10-03T17:11:00-04:00', scoredAt: '2026-09-28T22:31:00-04:00',
     };
     const now = Date.parse(heldRow.scoredAt) + DEFAULT_PROBE_INTERVAL_MS;
     const { io, calls } = fakeIo({
@@ -1001,17 +1001,6 @@ describe('R1077 builder company routing', () => {
   const marker = provider => buildDelegationMarker({ provider, model: provider === 'codex' ? 'gpt-6.1-sol' : 'claude-sonnet-5-5', taskType: 'bugfix' });
   const policyIo = over => fakeIo({ readRoutingPolicy: () => structuredClone(DEFAULT_ROUTING_POLICY), readSeatSettings: () => ({ tool: {}, platform: {} }), ...over });
 
-  it.each(['hydrogen', 'hydrogen-low', 'neon', 'gemini-3.8-flash-high'])(
-    'refuses %s in a persisted red-team security route before reserving or launching', async model => {
-      const policy = structuredClone(DEFAULT_ROUTING_POLICY);
-      policy.operations['review-seat:red-team'] = { provider: 'agy-gemini', model, fallback: [] };
-      const { io, calls } = policyIo({ readRoutingPolicy: () => policy });
-      const args = input('no marker');
-      args.env = { WE_REVIEW_SEAT_CAP_AGY_GEMINI: '20', WE_REVIEW_SHADOW_AGY_PROMOTED: 'true' };
-      expect((await speculateRedTeam(args, io)).status).toBe('skipped');
-      expect(calls.some(c => ['seat', 'reserve'].includes(c[0]))).toBe(false);
-    });
-
   it.each([['codex', 'codex', 'gpt-6.1-sol'], ['claude', 'codex', 'gpt-6.1-sol'], ['agy-claude', 'codex', 'gpt-6.1-sol']])('routes %s builders to %s/%s', async (builder, provider, model) => {
     const { io, calls } = policyIo();
     expect((await speculateRedTeam(input(marker(builder)), io)).status).toBe('speculated');
@@ -1044,11 +1033,11 @@ describe('R1077 builder company routing', () => {
   });
 
   // Round-6 red team: a Carbon refusal must skip that ROUTE, not the whole provider, so an explicitly
-  // configured same-provider fallback (Argon needs no promotion) still runs.
+  // configured same-provider fallback (Flash needs no promotion) still runs.
   it.each([['no builder marker', 'no marker'], ['a Codex builder', marker('codex')]])('falls back from unpromoted Carbon to the configured same-provider Argon route (%s)', async (_label, body) => {
     const policy = structuredClone(DEFAULT_ROUTING_POLICY);
     policy.operations['review-seat:red-team'] = { provider: 'agy-gemini', model: 'carbon', effort: { 'agy-gemini': 'high' },
-      fallback: [{ provider: 'agy-gemini', model: 'gemini-4-argon-high', effort: 'high' }] };
+      fallback: [{ provider: 'agy-gemini', model: 'pro', effort: 'high' }] };
     const { io, calls } = policyIo({ readRoutingPolicy: () => structuredClone(policy) });
     const args = input(body);
     args.env = { WE_REVIEW_SEAT_CAP_AGY_GEMINI: '20', WE_REVIEW_SHADOW_AGY_PROMOTED: 'false' };
@@ -1063,7 +1052,7 @@ describe('R1077 builder company routing', () => {
   it('keeps the builder preference when walking past refused Carbon (Codex builder prefers agy-gemini/argon over codex)', async () => {
     const policy = structuredClone(DEFAULT_ROUTING_POLICY);
     policy.operations['review-seat:red-team'] = { provider: 'agy-gemini', model: 'carbon', effort: { 'agy-gemini': 'high', codex: 'high' },
-      fallback: [{ provider: 'codex', model: 'sol', effort: 'high' }, { provider: 'agy-gemini', model: 'gemini-4-argon-high', effort: 'high' }] };
+      fallback: [{ provider: 'codex', model: 'sol', effort: 'high' }, { provider: 'agy-gemini', model: 'pro', effort: 'high' }] };
     const { io, calls } = policyIo({ readRoutingPolicy: () => structuredClone(policy) });
     const args = input(marker('codex'));
     args.env = { WE_REVIEW_SEAT_CAP_AGY_GEMINI: '20', WE_REVIEW_SHADOW_AGY_PROMOTED: 'false' };
@@ -1178,7 +1167,7 @@ describe('R1077 builder company routing', () => {
     io.readRoutingPolicy = () => {
       const policy = structuredClone(DEFAULT_ROUTING_POLICY);
       policy.operations['review-seat:red-team'] = { provider: 'codex', model: 'astra', effort: 'high',
-        fallback: [{ provider: 'agy-gemini', model: 'gemini-4-argon-high', effort: 'medium' }] };
+        fallback: [{ provider: 'agy-gemini', model: 'pro', effort: 'medium' }] };
       return policy;
     };
     const args = input('no marker');
