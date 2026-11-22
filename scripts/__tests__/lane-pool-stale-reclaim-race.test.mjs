@@ -104,4 +104,26 @@ describe('#x96v5hl — two concurrent stale-lease reclaimers never both "win"', 
     // explicit --lane=N with no free alternative fails outright when the lane is unexpectedly gone.
     expect(pausedExitCode).not.toBe(0);
   });
+
+  it('a lease RENEWED by its holder after the stale verdict is kept — renewal is not "the same stale lease"', async () => {
+    const barrier = join(base, 'reclaim-barrier');
+    const paused = spawn('node', [...emptyCwdsArgs, SCRIPT, 'acquire', '--lane=1', ...REPO(), '--session=reclaimer-A'], {
+      env: withGhStub({ ...process.env, LANE_POOL_ROOT: poolRoot, LANE_POOL_ACQUIRE_RECLAIM_TEST_BARRIER: barrier }),
+    });
+    const pausedDone = new Promise((res) => paused.on('exit', res));
+    for (let i = 0; i < 600 && !existsSync(`${barrier}.ready`); i++) await new Promise((r) => setTimeout(r, 50));
+    expect(existsSync(`${barrier}.ready`)).toBe(true);
+
+    // INSIDE the pause: the still-working holder's heartbeat renews the lease (same acquiredAt/session/holder,
+    // fresh renewedAt) — exactly what `renewLaneLease` writes. The lease is now live again.
+    const judged = JSON.parse(readFileSync(leaseMarker(1), 'utf8'));
+    const renewed = `${JSON.stringify({ ...judged, ttlMinutes: 60, renewedAt: new Date().toISOString() }, null, 2)}\n`;
+    writeFileSync(leaseMarker(1), renewed);
+
+    writeFileSync(`${barrier}.go`, '');
+    const pausedExitCode = await pausedDone;
+
+    expect(readFileSync(leaseMarker(1), 'utf8')).toBe(renewed);
+    expect(pausedExitCode).not.toBe(0);
+  });
 });

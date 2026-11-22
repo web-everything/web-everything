@@ -5143,8 +5143,11 @@ function laneRemovalEligibility(repo, n, { remoteShasBox, nowMs, ttlMs, deadReas
 }
 
 /** Same lease? A re-acquire always rewrites `acquiredAt` (and a reclaim mints a fresh `holder`), so these three
- *  fields tell "the dead lease we judged" apart from "a new hold written since". */
-const sameLease = (a, b) => !!a && !!b && a.acquiredAt === b.acquiredAt && a.session === b.session && a.holder === b.holder;
+ *  fields tell "the dead lease we judged" apart from "a new hold written since". `renewedAt` is compared too: a
+ *  holder's heartbeat (`renewLaneLease`) keeps the other three and only moves `renewedAt`, and a lease renewed
+ *  after a stale verdict is LIVE again — never "the same stale lease", so no reclaim/trim/reap may take it. */
+const sameLease = (a, b) => !!a && !!b && a.acquiredAt === b.acquiredAt && a.session === b.session && a.holder === b.holder
+  && a.renewedAt === b.renewedAt;
 
 const TRIM_REACQUIRED = { kind: 'leased', reason: 're-leased after trim evaluated it — a live hold now owns it, kept' };
 
