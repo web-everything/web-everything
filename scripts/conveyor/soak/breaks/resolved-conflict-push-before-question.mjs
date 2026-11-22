@@ -14,6 +14,7 @@ export default {
     const imp = p => import(pathToFileURL(join(root, p)).href);
     const { runTickAllRepos, resolveFixPassBudgets } = await imp('skills-src/conveyor/reconcile-fix-dispatch-daemon.mjs');
     const { runResolvedSideBranchPass } = await imp('scripts/conveyor/resolved-side-branch-push.mjs');
+    const { buildConcurrentAuthorPauseComment, AUTOMATION_LOGINS } = await imp('scripts/conveyor/stand-down.mjs');
     const { planReconcile } = await imp('scripts/conveyor/reconcile-core.mjs');
     const { runReconcileFixDispatch } = await imp('scripts/conveyor/reconcile-fix-dispatch.mjs');
     const { workflowEditFact } = await imp('scripts/lib/merge-gate-ci.mjs');
@@ -21,15 +22,19 @@ export default {
     const saved = { name: 'lane/topic-fix-7329-conflict-alt', sha: S, ancestors: [S, H, B] };
     let pr = { number: 7329, headRefName: 'lane/topic', headRefOid: H, baseRefName: 'main', baseRefOid: B,
       state: 'OPEN', isCrossRepository: false, mergeStateStatus: 'DIRTY',
-      comments: [{ body: 'Reviewer: resolve scripts/x.mjs:1', author: { login: 'web-everything' } }], labels: ['review:human', 'review:changes'] };
+      comments: [{ body: buildConcurrentAuthorPauseComment({ head: H, alt: saved.name, altSha: S }), author: { login: AUTOMATION_LOGINS[0] } }, { body: 'Reviewer: resolve scripts/x.mjs:1', author: { login: 'web-everything' } }], labels: ['review:human', 'review:changes'] };
     const empty = () => ({ dispatched: [], refusals: [] });
     const mechanical = () => ({ dispatch: [], refusals: [], applied: [] });
     const result = await runTickAllRepos({ repos: ['web-everything/web-everything'],
       resolvedSideBranchSetting: { value: true, source: 'standard' },
+      resolvedSideBranchStaleGuard: () => {},
       resolvedSideBranchTick: ({ repo }) => runResolvedSideBranchPass({ repo }, {
         listPrs: () => [pr], readBranches: () => [saved], readPr: () => pr,
-        appToken: () => 'ghs_soak', pushRefusal: () => null,
-        push: () => { order.push('push'); pr = { ...pr, headRefOid: S }; },
+        acquireClaim: () => ({ ok: true }), checkClaim: () => true, releaseClaim: () => {},
+        admitPush: () => true, protect: ({ bodies }) => { pr = { ...pr, comments: [...pr.comments, ...bodies.map(body => ({ body, author: { login: AUTOMATION_LOGINS[0] } }))] }; },
+        appToken: () => 'ghs_soak',
+        preparePush: () => ({ verification: { sha: S, status: 'green' },
+          push: () => { order.push('push'); pr = { ...pr, headRefOid: S }; }, close: () => {} }),
         record: () => order.push('record'), log: () => {},
       }),
       fixTick: options => {

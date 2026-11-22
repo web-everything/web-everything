@@ -134,7 +134,6 @@ import { fixDetachedProvider } from '../operations/dispatch-providers/fix.mjs';
 import { removePromptFile } from '../operations/fix-run.mjs';
 import { listBuildDispatchClaims } from './build-dispatch-claim.mjs';
 import { runReconcilePass, resolveLaneHead, PR_LIST_JSON_FIELDS } from './reconcile-pass.mjs';
-import { enrichResolvedSideBranches } from './resolved-side-branch-push.mjs';
 import { readUnsupported, recordUnsupported } from './unsupported-repo.mjs';
 import { readPrsFromFile } from './open-pr-fetch.mjs';
 import { CONFLICT_LABEL } from './parked-pr-conflict-watch.mjs';
@@ -1886,7 +1885,7 @@ export function runReconcileFixDispatch({
   tryResumeRound = isUnderTestEnv() ? null : tryResumeRoundFix,
   dispatch = dispatchFix,
   reconcile = runReconcilePass,
-  enrichResolvedBranches = isUnderTestEnv() ? null : enrichResolvedSideBranches,
+  enrichResolvedBranches,
   resolvedSideBranchPushes = [],
   readPrs,
   readFreshPr = readFreshFixPr,
@@ -2044,7 +2043,7 @@ export function runReconcileFixDispatch({
     dispatch: [...(Array.isArray(reconciled.dispatch) ? reconciled.dispatch : []), ...recovered] };
   if (netScope) reconciled = fixStep('net-scope', () => netScope(reconciled, { root, repoKey }));
   // A push earlier THIS tick must not immediately launch from a stale bounce. Head binding makes this
-  // a one-tick handoff to fresh gate evidence, not a persistent exemption from fixing later findings.
+  // a same-tick backstop; the durable pre-push marker owes re-arm on subsequent ticks.
   const pushedNow = entry => resolvedSideBranchPushes.some(row => row.repo === ghRepoSlug(repo ?? 'we')
     && row.pr === entry.prNumber && row.sha === entry.headRefOid);
   const pushedRows = (reconciled.dispatch ?? []).filter(pushedNow);

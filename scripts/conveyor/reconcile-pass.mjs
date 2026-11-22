@@ -1,3 +1,5 @@
+import { enrichResolvedSideBranches } from './resolved-side-branch-push.mjs';
+import { isUnderTest as resolvedScanUnderTest } from '../lib/under-test.mjs';
 import { greenLedgerDir, hasGreenLedger } from '../lib/lane-verify.mjs';
 import { unread } from './dispatch-eligibility.mjs';
 import { isDrainTransientPath } from '../lib/transient-paths.mjs';
@@ -1719,7 +1721,7 @@ export function enrichPrsWithLedgerHolds(prs, { readOnly = false, repo, now = Da
 export function runReconcilePass({
   readOnly = false,
   readPrs = defaultReadPrs, readAgents = defaultReadAgents, enrich = enrichAgents,
-  enrichResolvedBranches = null,
+  enrichResolvedBranches = resolvedScanUnderTest() ? null : enrichResolvedSideBranches,
   excuseMergeGateHolds = excusePrMergeGateHolds, readMergeGateVerdict = defaultReadMergeGateVerdict,
   readFreeze = readSharedFreeze, mergeGateSetting,
   enrichMainRed = enrichPrsWithMainRedFacts, enrichAlreadyLanded = enrichPrsWithAlreadyLandedFacts,
@@ -1904,13 +1906,14 @@ export function runReconcilePass({
   console.error(`fix.standDownHoldsAcrossHeads=${standDownHoldsAcrossHeads.value} (source: ${standDownHoldsAcrossHeads.source})`);
   const timing = resolveTimingPolicy({ env });
   const prs = step('enrich-verify-green', () => enrichVerifyGreen(rulingPrs, { policy: timing.review, env }));
+  const resolvedPrs = enrichResolvedBranches ? step('resolved-side-branches', () => enrichResolvedBranches(prs, { repo: repoKey })) : prs;
   const plannerInput = {
     reviewTiming: timing.review, fixTiming: timing.fix,
     standDownHoldsAcrossHeads,
     owedCiRerun: owedCiRerunSetting.value,
     staleCiRerun: staleCiRerunSetting.value,
     roundCap: resolveRoundCap(env),
-    repo: repoKey, prs: enrichResolvedBranches ? step('resolved-side-branches', () => enrichResolvedBranches(prs, { repo: repoKey })) : prs,
+    repo: repoKey, prs: resolvedPrs,
     agents, durableCounts: durableCountsFrom(prs), now, defaultBranch, mainRedWindows,
     mainLatestCheckRuns, requiredChecks, mainSha, fixerLadder,
     ...fixCapSettings(() => fixSettings, env, loadTakeoverBudget),
@@ -1925,7 +1928,7 @@ export function runReconcilePass({
   };
   const plan = step('plan', () => planReconcile(plannerInput));
   const { prs: _prs, agents: _agents, repo: _repo, now: _now, durableCounts: _counts, ...plannerOptions } = plannerInput;
-  return { ...plan, ...(readOnly ? { enrichedPrs: prs, agentList: agents, agentsIncomplete: Object.hasOwn(agents, 'incomplete'), plannerOptions } : {}), owedTriggers: hydrated.owedTriggers, notes: [...hydrated.notes, ...plan.notes], refusals: [...hydrated.refusals, ...plan.refusals], prs: rawPrs.length, agents: agents.length,
+  return { ...plan, ...(readOnly ? { enrichedPrs: resolvedPrs, agentList: agents, agentsIncomplete: Object.hasOwn(agents, 'incomplete'), plannerOptions } : {}), owedTriggers: hydrated.owedTriggers, notes: [...hydrated.notes, ...plan.notes], refusals: [...hydrated.refusals, ...plan.refusals], prs: rawPrs.length, agents: agents.length,
     openPrFiles: rawPrs.map((pr) => ({ pr: pr.number, files: Array.isArray(pr.files) && pr.files.length < 100
       ? pr.files.map((file) => typeof file === 'string' ? file : file.path) : null })),
   };

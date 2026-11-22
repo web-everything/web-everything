@@ -3,7 +3,7 @@ import { assertCapability, repoProfile } from '../lib/repo-profile.mjs';
  * Pure planning plus injectable IO. A quiet host retries one saved fix, never force-pushing.
  */
 import os from 'node:os';
-import { mkdtempSync, mkdirSync, rmSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, rmSync, readFileSync, accessSync, constants } from 'node:fs';
 import { execFileSync } from 'node:child_process';
 import { resolve, dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -18,6 +18,7 @@ import { redactSecrets } from './ci-heal-mark.mjs';
 import { RUNNER_LOCK_ROOT } from '../../skills-src/conveyor/runner-lock.mjs';
 import { admit, shadowAdmission } from '../lib/resource-admission.mjs';
 import { resolveCutoverMode } from '../lib/resource-gate.mjs';
+import { RISKY_LANE_CONFIG_RE } from '../lib/lane-git-hardening.mjs';
 
 export const VERIFY_ENV_ALLOWLIST = Object.freeze([
   'PATH', 'LANG', 'LC_ALL', 'LC_CTYPE', 'TZ', 'TERM', 'CI', 'NODE_ENV', 'NODE_OPTIONS', 'FORCE_COLOR', 'NO_COLOR',
@@ -303,7 +304,7 @@ export function scrubVerifyEnv(env = process.env, { allow = [], scratchDir, home
   return clean;
 }
 
-export function defaultReverifyIo({ run = execFileSync, runVerification = runBounded, verifyEnvAllow = [], readComments, root = resolve(dirname(fileURLToPath(import.meta.url)), '../..'),
+export function defaultReverifyIo({ run = execFileSync, runVerification = runBounded, verifyEnvAllow = [], readComments, root = resolve(dirname(fileURLToPath(import.meta.url)), '../..'), normalPush = false,
   shadow = shadowAdmission, admitFn = admit, env = process.env } = {}) {
   const command = (bin, args, opts = {}) => run(bin, args, { cwd: root, encoding: 'utf8', timeout: 120_000, maxBuffer: 16 * 1024 * 1024, ...opts });
   const gh = (args) => JSON.parse(command('gh', args));
@@ -350,10 +351,10 @@ export function defaultReverifyIo({ run = execFileSync, runVerification = runBou
       const scratchDir = mkdtempSync(join(os.tmpdir(), 'we-reverify-'));
       try {
         mkdirSync(join(scratchDir, 'home')); mkdirSync(join(scratchDir, 'tmp'));
-        const env = scrubVerifyEnv(process.env, { allow: verifyEnvAllow, scratchDir });
-        env.CONVEYOR_RUNNER_LOCK_ROOT ??= RUNNER_LOCK_ROOT;
-        env.PLAYWRIGHT_BROWSERS_PATH ??= join(os.homedir(), process.platform === 'darwin' ? 'Library/Caches' : '.cache', 'ms-playwright');
-        await runVerification(process.execPath, [resolve(root, 'scripts/verify-lane.mjs')], { cwd, env, timeoutMs: 40 * 60_000, maxBytes: 16 * 1024 * 1024 });
+        const verifyEnv = scrubVerifyEnv(env, { allow: verifyEnvAllow, scratchDir });
+        verifyEnv.CONVEYOR_RUNNER_LOCK_ROOT ??= RUNNER_LOCK_ROOT;
+        verifyEnv.PLAYWRIGHT_BROWSERS_PATH ??= join(os.homedir(), process.platform === 'darwin' ? 'Library/Caches' : '.cache', 'ms-playwright');
+        await runVerification(process.execPath, [resolve(root, 'scripts/verify-lane.mjs')], { cwd, env: verifyEnv, timeoutMs: 40 * 60_000, maxBytes: 16 * 1024 * 1024 });
         return { ok: true };
       }
       catch (e) { return { ok: false, summary: `${e.stdout ?? ''}\n${e.stderr ?? ''}\n${e.message ?? ''}`.slice(-1500) }; }
@@ -364,14 +365,49 @@ export function defaultReverifyIo({ run = execFileSync, runVerification = runBou
         catch (e) { console.warn(`load-flake reverify: could not remove scratch dir ${scratchDir}: ${e.message}`); }
       }
     },
-    // Pushed from the daemon's own checkout, never the lane: the lane just ran fixer-authored code that could have
-    // planted hooks or git config there. `prepare` already fetched the saved commit into this checkout. Hooks are
-    // off, and a plain refspec (no force) means a non-fast-forward is refused.
-    push: (_laneCwd, sha, branch) => command('git', ['-c', 'core.hooksPath=/dev/null', 'push', '--no-verify', 'origin', `${sha}:refs/heads/${branch}`]),
+    // Saved-repair callers opt into the normal lane hook chain. Legacy load-flake callers
+    // retain their existing daemon-checkout transport.
+    push: (laneCwd, sha, branch, context) => normalPush
+      ? normalLanePush({ ...context, cwd: laneCwd, sha, branch, root, command })
+      : command('git', ['-c', 'core.hooksPath=/dev/null', 'push', '--no-verify', 'origin', `${sha}:refs/heads/${branch}`]),
     comment: (slug, pr, body) => command('gh', ['pr', 'comment', String(pr), '--repo', slug, '--body', body]),
     // #xg0rkxn — merge main into the PR head in this daemon checkout (plumbing only, no force), see load-flake-merge-main.mjs.
     mergeMain: (args) => defaultMergeMain(args, { run, cwd: root }),
   };
+}
+
+/** Normal repository hooks, including the advertised-head restriction. Never install or override hooks. */
+export function normalLanePush({ cwd, sha, branch, expectedHead, env, root, command }) {
+  if (!/^[a-f0-9]{40}$/.test(sha ?? '') || !/^[a-f0-9]{40}$/.test(expectedHead ?? '')
+    || !/^lane\/[\w./-]+$/.test(branch ?? '') || /\.\.|\/\/|\.lock(?:\/|$)|\/$/.test(branch)) throw Error('invalid saved push binding');
+  // Verification executed lane-authored code. Read names without values (which may
+  // contain credentials), with NUL framing so a subsection newline cannot hide a key.
+  const maxConfigBytes = 256 * 1024;
+  const refuseConfig = () => { throw Error('unsafe or unreadable lane transport configuration; operator inspection required'); };
+  let config;
+  try { config = command('git', ['config', '--null', '--name-only', '--show-scope', '--list', '--includes'], { cwd, maxBuffer: maxConfigBytes }); }
+  catch { refuseConfig(); }
+  if (typeof config !== 'string' || !config || Buffer.byteLength(config) > maxConfigBytes || !config.endsWith('\0')) refuseConfig();
+  const parts = config.slice(0, -1).split('\0');
+  if (parts.length % 2) refuseConfig();
+  for (let i = 0; i < parts.length; i += 2) {
+    const [scope, key] = parts.slice(i, i + 2);
+    if (!['system', 'global', 'local', 'worktree', 'command'].includes(scope) || !key) refuseConfig();
+    // Only these credential/header pins come from the trusted caller's clean env/argv.
+    if (scope === 'command' && /^(?:credential\.(?:helper|https:\/\/github\.com\.helper)|http\.extraheader)$/i.test(key)) continue;
+    if (RISKY_LANE_CONFIG_RE.test(key) || /^(?:core\.(?:sshcommand|fsmonitor|alternaterefscommand)|ssh\.|push\.)/i.test(key)
+      || /^remote\./i.test(key) && !/^remote\.origin\.(?:url|fetch)$/i.test(key)) refuseConfig();
+  }
+  const hooks = command('git', ['config', '--get', 'core.hooksPath'], { cwd }).trim();
+  if (resolve(cwd, hooks) !== resolve(cwd, '.githooks')) throw Error('normal repository hooks unavailable');
+  for (const path of ['.githooks/pre-push', 'scripts/guard-git-push.mjs', 'scripts/guard-prototype-tracker.mjs', 'scripts/lib/lane-lease.mjs']) {
+    if (!readFileSync(resolve(cwd, path)).equals(readFileSync(resolve(root, path)))) throw Error('normal repository hooks changed; operator inspection required');
+  }
+  try { accessSync(resolve(cwd, '.githooks/pre-push'), constants.X_OK); }
+  catch { throw Error('normal pre-push hook is not executable'); }
+  if (command('git', ['rev-parse', 'HEAD'], { cwd }).trim() !== sha) throw Error('verified lane head moved');
+  return command('git', ['push', `https://github.com/${env.WE_SAVED_PUSH_REPO}.git`, `${sha}:refs/heads/${branch}`], { cwd,
+    env: { ...env, WE_SAVED_PUSH_HEAD: expectedHead, WE_SAVED_PUSH_SHA: sha, WE_SAVED_PUSH_REF: `refs/heads/${branch}` } });
 }
 
 if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {

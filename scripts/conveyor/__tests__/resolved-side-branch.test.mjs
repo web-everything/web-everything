@@ -1,6 +1,7 @@
 // @vitest-environment node
 import { describe, it, expect, vi } from 'vitest';
 import { planReconcile } from '../reconcile-core.mjs';
+import { AUTOMATION_LOGINS, buildConcurrentAuthorPauseComment } from '../stand-down.mjs';
 import { workflowEditFact, evaluatePrGates } from '../../lib/merge-gate-ci.mjs';
 
 const H = '1'.repeat(40), B = '2'.repeat(40), S = '3'.repeat(40), T = '4'.repeat(40);
@@ -9,19 +10,23 @@ const pr = { number: 7329, state: 'OPEN', headRefName: 'lane/topic', headRefOid:
   baseRefName: 'main', baseRefOid: B, isCrossRepository: false, mergeStateStatus: 'DIRTY',
   labels: [{ name: 'review:changes' }, { name: 'review:human' }],
   comments: [{ body: 'Reviewer: resolve the conflict in scripts/x.mjs:1', author: { login: 'web-everything' } }], statusCheckRollup: [] };
+const proofPr = { ...pr, comments: [...pr.comments, { author: { login: AUTOMATION_LOGINS[0] },
+  body: buildConcurrentAuthorPauseComment({ head: H, alt: branch.name, altSha: S }) }] };
 const core = () => import(/* @vite-ignore */ new URL('../resolved-side-branch.mjs', import.meta.url).href);
 const pass = () => import(/* @vite-ignore */ new URL('../resolved-side-branch-push.mjs', import.meta.url).href);
 function fixture(overrides = {}) {
-  let live = { ...pr };
+  let live = { ...proofPr };
   const order = [];
   const io = {
-    listPrs: vi.fn(() => [pr]), readBranches: vi.fn(() => [branch]),
+    listPrs: vi.fn(() => [proofPr]), readBranches: vi.fn(() => [branch]),
     readPr: vi.fn(() => ({ ...live })), appToken: vi.fn(() => 'ghs_fixture'),
-    pushRefusal: vi.fn(() => null),
+    acquireClaim: vi.fn(() => ({ ok: true })), checkClaim: vi.fn(() => true), releaseClaim: vi.fn(),
+    admitPush: vi.fn(() => true), protect: vi.fn(),
     push: vi.fn(() => { order.push('push'); live = { ...live, headRefOid: S }; }),
     record: vi.fn(() => order.push('record')), log: vi.fn(),
     ...overrides,
   };
+  io.preparePush = vi.fn(() => ({ push: () => io.push({ sha: S, head: H, branch: pr.headRefName, token: 'ghs_fixture' }), close: vi.fn() }));
   return { io, order, live: () => live };
 }
 
@@ -30,15 +35,16 @@ describe('resolved conflict side branch', () => {
     // Prove the fixture would actually launch without saved-branch evidence.
     const ordinary = planReconcile({ prs: [pr], now: Date.now() });
     expect(ordinary.dispatch.some(d => d.kind === 'fix')).toBe(true);
-    const plan = planReconcile({ prs: [{ ...pr, resolvedSideBranches: [branch] }], now: Date.now() });
+    const plan = planReconcile({ prs: [{ ...proofPr, resolvedSideBranches: [branch] }], now: Date.now() });
     expect(plan.dispatch.filter(d => d.prNumber === pr.number)).toEqual([]);
     expect(plan.refusals).toContainEqual(expect.objectContaining({ kind: 'resolved-side-branch-owed', sha: S, branch: branch.name }));
   });
   it('orders commits by ancestry, ignoring reversed or absent timestamps; divergent tips are ambiguous', async () => {
     const { findResolvedSideBranch: find } = await core();
+    const orderedPr = { ...proofPr, comments: [...proofPr.comments, { author: { login: AUTOMATION_LOGINS[0] }, body: buildConcurrentAuthorPauseComment({ head: H, alt: 'lane/topic-fix-7329-merge-abc', altSha: T }) }] };
     const newer = { ...branch, name: 'lane/topic-fix-7329-merge-abc', sha: T, ancestors: [T, S, H, B], committedAt: 0 };
-    expect(find({ pr, branches: [{ ...branch, committedAt: 9999999 }, newer] })).toEqual(newer);
-    expect(find({ pr, branches: [branch, { ...newer, ancestors: [T, H, B] }] })).toBeNull();
+    expect(find({ pr: orderedPr, branches: [{ ...branch, committedAt: 9999999 }, newer] })).toEqual(newer);
+    expect(find({ pr: orderedPr, branches: [branch, { ...newer, ancestors: [T, H, B] }] })).toBeNull();
   });
   it.each([
     ['different PR', { ...branch, name: 'lane/topic-fix-17329-alt' }],
@@ -52,17 +58,17 @@ describe('resolved conflict side branch', () => {
     ['unreadable entry', null],
   ])('never selects or pushes %s', async (_name, bad) => {
     const { findResolvedSideBranch } = await core();
-    expect(findResolvedSideBranch({ pr, branches: [bad] })).toBeNull();
+    expect(findResolvedSideBranch({ pr: proofPr, branches: [bad] })).toBeNull();
     const { io } = fixture({ readBranches: () => [bad] });
     await (await pass()).runResolvedSideBranchPass({ repo: 'web-everything/web-everything' }, io);
     expect(io.push).not.toHaveBeenCalled();
   });
   it('missing/unreadable input, oversized input, and missing exact base fail closed with operator fallback', async () => {
     const { findResolvedSideBranch: find } = await core();
-    expect(find({ pr, branches: null })).toBeNull();
-    expect(find({ pr: { ...pr, baseRefOid: undefined }, branches: [branch] })).toBeNull();
-    expect(find({ pr, branches: Array.from({ length: 17 }, () => branch) })).toBeNull();
-    expect(find({ pr, branches: [{ ...branch, ancestors: Array.from({ length: 32769 }, () => S) }] })).toBeNull();
+    expect(find({ pr: proofPr, branches: null })).toBeNull();
+    expect(find({ pr: { ...proofPr, baseRefOid: undefined }, branches: [branch] })).toBeNull();
+    expect(find({ pr: proofPr, branches: Array.from({ length: 17 }, () => branch) })).toBeNull();
+    expect(find({ pr: proofPr, branches: [{ ...branch, ancestors: Array.from({ length: 32769 }, () => S) }] })).toBeNull();
     const { io } = fixture({ readBranches: () => { throw Error('unreadable'); } });
     const rows = await (await pass()).runResolvedSideBranchPass({ repo: 'web-everything/web-everything' }, io);
     expect(rows[0].why).toMatch(/operator/);
@@ -83,18 +89,19 @@ describe('resolved conflict side branch', () => {
       pinnedHead: { sha: S }, gatePaths: { files: ['.github/workflows/ci.yml'] }, acceptance: { humanClearedSha: H },
     }, { write: () => {} });
     expect(decision.results).toContainEqual(expect.objectContaining({ id: 'review-acceptance', status: 'hold' }));
-    expect(io.log).toHaveBeenCalledWith(expect.stringContaining('pushed (no fixer launch)'));
+    expect(io.protect).toHaveBeenCalledTimes(1);
+    expect(io.releaseClaim).toHaveBeenCalledTimes(1);
   });
   it.each(['before-write', 'after-write'])('head moved %s: no dedupe; moved before write is never pushed', async when => {
     let reads = 0;
-    const { io } = fixture({ readPr: () => ({ ...pr, headRefOid: ++reads >= (when === 'before-write' ? 2 : 3) ? T : H }) });
+    const { io } = fixture({ readPr: () => ({ ...proofPr, headRefOid: ++reads >= (when === 'before-write' ? 2 : 3) ? T : H }) });
     const rows = await (await pass()).runResolvedSideBranchPass({ repo: 'web-everything/web-everything' }, io);
-    expect(rows[0].result).toBe('refused');
+    expect(rows[0].result).toBe(when === 'after-write' ? 'pushed-unrecorded' : 'refused');
     if (when === 'before-write') expect(io.push).not.toHaveBeenCalled();
     expect(io.record).not.toHaveBeenCalled();
   });
   it.each([undefined, { held: true }])('missing or held fix-claim evidence refuses (%s)', async claim => {
-    const { io } = fixture({ pushRefusal: () => claim });
+    const { io } = fixture({ checkClaim: () => claim === null });
     await (await pass()).runResolvedSideBranchPass({ repo: 'web-everything/web-everything' }, io);
     expect(io.push).not.toHaveBeenCalled();
   });

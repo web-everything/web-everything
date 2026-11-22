@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import { assertMainNotStale } from '../../scripts/lib/main-staleness.mjs';
 import { safeAdoptYield } from '../../scripts/lib/daemon-rebuild/adopt-yield.mjs';
 /**
  * @file skills-src/conveyor/reconcile-fix-dispatch-daemon.mjs
@@ -61,7 +62,7 @@ import {
   RUNNER_LOCK_ROOT, makeOwner,
   acquireRunnerLease, heartbeatRunnerLease, releaseRunnerLeaseIfOwned,
 } from './runner-lock.mjs';
-import { runReconcileFixDispatch, writePrivateBorrowedPrompt, routeFixExecutor } from '../../scripts/conveyor/reconcile-fix-dispatch.mjs';
+import { runReconcileFixDispatch, writePrivateBorrowedPrompt, routeFixExecutor, FIX_STALE_GUARD_OPTS } from '../../scripts/conveyor/reconcile-fix-dispatch.mjs';
 import { runAwaitVerifyPassDefault, formatAwaitVerifyLines } from '../../scripts/conveyor/await-verify-pass.mjs';
 // xn025gx (fixer proposal A1 + A2 part 1, rulings P1/P2) — the fast push-on-green loop and the active-only fix slot.
 import { withCiHealCycleLock, spawnCiHealLoop, createCiHealLoopController } from '../../scripts/conveyor/ci-heal-loop.mjs';
@@ -1133,6 +1134,7 @@ export function createPassCallRecorder() {
 export async function runTickAllRepos({
   repos = FIX_DISPATCH_DAEMON_REPOS, fixTick, ciHealTick, hungCiTick, mainRedRebaseTick, missingRunTick, promoteDraftTick, rulingStandDownTick, notesTick, notesDryRun,
   resolvedSideBranchTick,
+  resolvedSideBranchStaleGuard = () => assertMainNotStale(DAEMON_REPO_ROOT, undefined, FIX_STALE_GUARD_OPTS),
   resolvedSideBranchSetting = resolveResolvedSideBranchSetting(),
   authGateOverride,
   // s2: false while the ci-heal child loop is alive; the inline step otherwise runs under the same single-run lock.
@@ -1193,6 +1195,8 @@ export async function runTickAllRepos({
     ? createReconcilePlanCache({ reconcile: reconcilePass, now, readFingerprints: readPlanFingerprint, readClaims: readPlanClaimSet }) : null;
   const budgets = Object.fromEntries(Object.entries(FIX_PASS_LIMITS).map(([key, rule]) =>
     [rule.phase, { budgetMs: passBudgets[key].value, hit: false, skipped: [] }]));
+  // Share the existing fix budget setting; this phase has its own persisted repo/PR cursors.
+  budgets['push-resolved-side-branch'] = { budgetMs: budgets.fix.budgetMs, hit: false, skipped: [] };
   // A generator lets the existing sequential fan-outs yield only BETWEEN complete repo ticks.
   // `known` is every repo this pass could ever reach for the phase; `candidates` is the subset eligible NOW (the
   // orphan guard can exclude a repo for one pass). A rotation head naming a known-but-excluded repo is kept, not
@@ -1271,13 +1275,16 @@ export async function runTickAllRepos({
     console.error(`fix.pushResolvedSideBranch=${resolvedSideBranchSetting.value} (source: ${resolvedSideBranchSetting.source})`);
     const rows = [];
     if (!resolvedSideBranchSetting.value || (anyTickInjected && !resolvedSideBranchTick)) return rows;
-    for (const repo of repos) {
-      try { rows.push(...(await (resolvedSideBranchTick ?? runResolvedSideBranchPass)({ repo })).map(row => ({ ...row, repo }))); }
-      catch { console.error(`push-resolved-side-branch: ${repo} unreadable — operator inspection required`); }
+    const tick = boundedPrTick('push-resolved-side-branch', resolvedSideBranchTick ?? runResolvedSideBranchPass);
+    for (const repo of budgetRepos('push-resolved-side-branch', repos)) {
+      try {
+        resolvedSideBranchStaleGuard();
+        rows.push(...(await tick({ repo })).map(row => ({ ...row, repo })));
+      } catch { console.error(`push-resolved-side-branch: ${repo} unreadable/stale — operator inspection required`); }
     }
     return rows;
   });
-  const resolvedSideBranchPushes = resolvedSideBranches.filter(row => row.result === 'pushed');
+  const resolvedSideBranchPushes = resolvedSideBranches.filter(row => ['pushed', 'pushed-unrecorded'].includes(row.result));
   planCache?.markTouched({ dispatched: resolvedSideBranchPushes });
   // #5137 — FIRST, before any fresh dispatch: a fixer that ended its turn awaiting a verdict is pushed (green,
   // exact sha) or resumed (red) here, so the model never holds a turn open on `check --wait`. Pushing needs no

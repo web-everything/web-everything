@@ -1,68 +1,56 @@
-# Saved conflict repairs
+# Saved conflict repairs — normal lane verification
 
-`resolved-side-branch.mjs` is pure. Its branch evidence contains a ref name, exact tip,
-and bounded complete ancestry (tip included). The PR carries exact head and current base
-tips. Only this PR's `lane/*-fix-<PR>-*` refs count. The unique descendant of all eligible
-tips wins; divergent tips require operator inspection. Dates never choose a repair.
+Bare transport is discovery only. The writer reuses load-flake reverify IO to prepare
+the saved ref, acquire a build lane, check its exact SHA, and run verify-lane with
+the sanitized verification environment. Host-load deferral, red or unreadable verify,
+or unreadable admission publishes a stand-down and fix-question-asked; no fixer is
+relaunched. A green result permits only a normal, non-forced git push FROM that lane,
+with the repository's complete pre-push hook chain. Hooks are never replaced or disabled.
+The normal push guard additionally checks the advertised destination SHA against the
+expected PR head. A lane with missing, changed or obsolete hooks requires operator
+inspection; the writer never installs a private hook to get past that refusal.
+After verification and immediately before transport, read the lane's complete effective
+Git configuration, including worktree settings and includes. Refuse URL rewrites,
+credential sources, proxies, transport commands, URL-shaped remote aliases and other
+unsafe lane configuration; never silently scrub it to make the push pass. Unknown,
+unreadable, truncated or oversized configuration requires operator inspection. The App
+credential helper is scoped to HTTPS on github.com so another host cannot request it.
 
-`resolved-side-branch-push.mjs` discovers saved remote refs (the fixer brief already pushes
-the alt ref), proves ancestry in a disposable bare repository, and pushes the pinned SHA
-with the owner's fresh App installation token. The planner emits `resolved-side-branch-owed`
-instead of a fixer; unreadable, oversized or ambiguous evidence holds dispatch and names
-operator inspection as the fallback. A daemon tick scans at most eight PRs per repo;
-operators can inspect/reduce the held inventory and let the next tick retry. Inventories
-of 100 PRs, over 16 matching refs, or over 32,768 ancestors refuse rather than truncate.
+Promotion also needs a complete App-authored stand-down/alt record binding this PR's
+exact branch and full SHA, bounded ancestry containing current head and base, an open
+same-repository PR headed under lane/, and head-bound verification/CI admission.
+Missing verification records trigger normal verification, even with pushBeforeGate
+enabled: a saved ref has no live early-push waiter. Previous-head CI uses the normal
+fixPushGate and configured timing policy; unknown evidence refuses. Known
+load-flake repairs remain owned by the retry-limited load-flake worker. This limits
+the feature deliberately rather than weakening either existing rule.
 
-`fix.pushResolvedSideBranch` defaults on. It resolves standard → platform →
-`scripts/settings/fix-resolved-side-branch.json` → `WE_FIX_PUSH_RESOLVED_SIDE_BRANCH=on|off`.
-The daemon logs the value and source, and runs this pass before dispatch and question notes.
-Unreadable/invalid settings disable writes. Planner suppression remains in effect when the
-push switch is off; turning it off never restarts a fixer over an already-saved repair.
+The injectable write protocol acquires the fixing and dispatch claims, rechecks
+inside the claim, prepares transport, persists the exact repair handoff and carries
+unanswered questions BEFORE pushing, then rereads open/head/base immediately before
+and after the write. A successful push remains pushed-unrecorded if readback or
+recording fails. A pending head-bound handoff suppresses old findings after a crash
+and lets the existing rearmPushedFixes worker re-arm for review. Carrying a question
+never carries an acceptance or human clearance. Writes use only an owner-bound App
+token; GitHub calls pin the real executable, github.com, a clean environment, and
+personalRoute=false on each throttled call.
 
-Push success is read back before the observational dedupe record/event is written.
-No persistent record authorizes a push: strict ancestry against the live head makes retries
-stateless. A crash after push cannot replay that same SHA as a strict descendant. The
-daemon also suppresses fixer launch for that exact pushed head for the rest of its tick.
-The next head is evaluated by the existing gate/review machinery. This pass never edits
-gate results, review labels, stand-down markers, waivers or human clearance, and never
-declares verify green. A human-only workflow/test-gaming/red-team hold remains a merge hold.
+Scans rotate under the daemon's existing phase budgets, PR cursors and adoption
+yield. Only actually unreadable scans hold a PR; unscanned PRs retain their ordinary
+reconciliation. A full 100-PR inventory, over 16 saved refs, over 32,768 ancestors,
+or an exhausted shared API budget requires operator inspection. The shared reconcile
+pass supplies evidence to both fixer and ci-heal consumers.
 
-After a durable stand-down question is posted, the CLI and daemon note publisher emit
-`fix-question-asked` through `daemon-events.jsonl` (shared `appendDaemonEvent`). It carries
-repo, PR, head and `detail.needsYou=true`. This distinct kind reaches watches filtering
-`fix-stood-down`, `status:needs-you` and `drain-skip:conflicting`; monitor configuration
-outside this repo needs no edit. Failed question publication emits no question event.
+Merge-path checklist: producer identity is the shared marker-authorship login list,
+with exact record bindings; missing signals refuse; comment sequence (not dates)
+closes a repair round; claims and live rechecks protect read/write races; all writes
+bind full head/base SHA and PR; handoffs bind source head, repair SHA and branch;
+unknown inputs refuse; success recording follows the effect; pending protection
+precedes it; no personal credentials or hostile environment reach transport; no label
+waives admission; no child runs concurrently with an unowned claim. The simplest
+safe hook and verification fallback is refusal, with the existing guarded workers
+as the operator-visible recovery path. Negative probes for all sixteen audit items
+live in resolved-side-branch*.test.mjs.
 
-Merge-path checklist answers and negative probes (tests in `__tests__/resolved-side-branch*.test.mjs`):
-
-1. Producer identity: push credentials come only from the owner-bound App cache. Status
-   or comment success cannot authorize this push or clear a gate. Personal-token negatives
-   refuse before any child call; question events are emitted by the actual publisher.
-2. Missing evidence: missing exact base, ancestry, claim result or token refuses. Missing
-   input and unreadable scan tests pin the operator fallback.
-3. Ordering: ancestry only; reversed/absent timestamp and divergent-tip tests.
-4. Races: API reads before preparation, immediately before write, and after push. Tests
-   move the head before/after write and at Git's advertisement boundary.
-5. Head binding: full 40-hex throughout; a trusted pre-push hook checks the advertised
-   old oid, new oid and destination ref. Plain push then uses the server's ordinary CAS.
-   Short/newline SHA and moved-fetch tests refuse, with no force fallback.
-6. Round binding: no verdict, hold or clearance is carried. The real workflow gate test
-   proves old-head human clearance cannot clear the new head.
-7. Catches: scan/credential/push failures refuse; no exception produces allow. The
-   unreadable and failed-push tests assert no push/state respectively.
-8. Write ordering: effect, readback, record. Failed-push and changed-readback tests
-   assert no dedupe record.
-9. Crash windows: no gate is opened, even if record writing dies after push. The crash
-   test retries at the new head without another push.
-10. Credentials: no personal fallback, gh auth-token call, stored helper or inherited PAT.
-    Cache-missing and both personal-token formats have negative tests.
-11. Environment: fresh bare repo, fixed system git/PATH, empty system/global config,
-    no replace/lazy objects or commit graph. Every fetched SHA is verified. The transport
-    test plants hostile environment/config and checks the actual command producer.
-12. Exemptions: no label or policy can waive ancestry or a merge hold. Different-PR,
-    force-needed and new-head workflow-hold tests.
-13. Liveness: no fixer code or verification child runs here; a live fix claim refuses.
-    The held/unknown-claim negatives prevent racing an active author.
-14. Simplicity: no retry loop, force push, carry, acceptance marker or new gate bypass.
-    The crash test exercises the stateless alternative; the daemon soak checks order
-    and preserves a new-head workflow hold.
+Question publication still emits fix-question-asked only after the comment succeeds.
+No merge-gate, waiver, acceptance or human-clearance result is changed by this pass.

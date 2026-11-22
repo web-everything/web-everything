@@ -65,8 +65,19 @@ export function mainPushRefs(stdin, { protectedBranch = 'main' } = {}) {
  * @param {{override?:boolean, protectedBranch?:string, lease?:object, leaseReadError?:boolean}} opts
  *   override = MAIN_PUSH_OK=1 was set; it never bypasses a pinned or unreadable lease.
  */
-export function pushGuardDecision(stdin, { override = false, protectedBranch = 'main', lease = null, leaseReadError = false } = {}) {
+export function pushGuardDecision(stdin, { override = false, protectedBranch = 'main', lease = null, leaseReadError = false, expectedPush = null } = {}) {
   if (leaseReadError) return 'pre-push BLOCKED: cannot read lane lease; inspect repository lease metadata and retry.';
+  // Additional restriction for a saved repair. Git's advertisement, then the server's
+  // ordinary compare-and-swap, pins a non-forced push across the final API read race.
+  if (expectedPush) {
+    const rows = String(stdin || '').trim().split('\n').map(line => line.trim().split(/\s+/));
+    if (!/^[a-f0-9]{40}$/.test(expectedPush.head ?? '') || !/^[a-f0-9]{40}$/.test(expectedPush.sha ?? '')
+      || !/^refs\/heads\/lane\/[\w./-]+$/.test(expectedPush.ref ?? '')
+      || rows.length !== 1 || rows[0].length !== 4 || rows[0][1] !== expectedPush.sha
+      || rows[0][2] !== expectedPush.ref || rows[0][3] !== expectedPush.head) {
+      return 'pre-push BLOCKED: saved repair destination/head changed or is unreadable; operator inspection required.';
+    }
+  }
   // Do not expire this protection or compare at to HEAD: a worker may have committed or checked out away
   // from the pin. Only the pool release/recovery path should clear the pinned runner's lease.
   if (lease && Object.hasOwn(lease, 'at')) {
@@ -87,7 +98,9 @@ if (IS_CLI) {
   try { stdin = readFileSync(0, 'utf8'); } catch { stdin = ''; } // no readable stdin → nothing to block (fail-open on read error)
   let lease = null, leaseReadError = false;
   try { lease = readPushLease(); } catch { leaseReadError = true; }
-  const reason = pushGuardDecision(stdin, { override: process.env.MAIN_PUSH_OK === '1', lease, leaseReadError });
+  const expectedPush = ['WE_SAVED_PUSH_HEAD', 'WE_SAVED_PUSH_SHA', 'WE_SAVED_PUSH_REF'].some(k => process.env[k] !== undefined)
+    ? { head: process.env.WE_SAVED_PUSH_HEAD, sha: process.env.WE_SAVED_PUSH_SHA, ref: process.env.WE_SAVED_PUSH_REF } : null;
+  const reason = pushGuardDecision(stdin, { override: process.env.MAIN_PUSH_OK === '1', lease, leaseReadError, expectedPush });
   if (reason) { process.stderr.write(`✗ ${reason}\n`); process.exit(1); }
   process.exit(0);
 }
