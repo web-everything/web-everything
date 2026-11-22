@@ -487,6 +487,7 @@
   "scripts/conveyor/__tests__/fake-gh-lock.test.mjs": 2.57,
   "scripts/conveyor/__tests__/finished-ci-heal-does-not-freeze-builds.test.mjs": 0.01,
   "scripts/conveyor/__tests__/fix-context-pack.test.mjs": 1.14,
+  "scripts/conveyor/__tests__/fix-dispatch-claim-stale-release.test.mjs": 0.5,
   "scripts/conveyor/__tests__/fix-dispatch-claim.test.mjs": 2.13,
   "scripts/conveyor/__tests__/fix-dispatch-queue-cap.test.mjs": 1.02,
   "scripts/conveyor/__tests__/fix-executor-routing.test.mjs": 0.81,
@@ -2047,6 +2048,7 @@
   "scripts/lib/__tests__/daemon-rebuild-recovery.test.mjs": 1
  },
  "soak": {
+    "scripts/conveyor/soak/breaks/verify-related-cap-ceiling.soak.test.mjs": 2,
   "scripts/conveyor/soak/breaks/lane-pool-release-unpushed-guard.soak.test.mjs": 315.93,
   "scripts/conveyor/soak/breaks/lane-pool-git-diet.soak.test.mjs": 354.59,
   "scripts/conveyor/soak/breaks/runtime-admission-infra-retention.soak.test.mjs": 0.1,
@@ -2230,6 +2232,7 @@
   "scripts/conveyor/soak/breaks/smoke-github-outage.soak.test.mjs": 131.46,
   "scripts/conveyor/soak/breaks/stacked-pr-missing-checks-refused.soak.test.mjs": 0.76,
   "scripts/conveyor/soak/breaks/required-admission-gates-deadlock-review.soak.test.mjs": 2.6,
+  "scripts/conveyor/soak/breaks/stale-fix-claim-released-when-owner-gone.soak.test.mjs": 0.5,
   "scripts/conveyor/soak/breaks/stale-fixing-label-ci-heal-owed.soak.test.mjs": 30.95,
   "scripts/conveyor/soak/breaks/stalled-label-freezes-whole-build-queue.soak.test.mjs": 0.01,
   "scripts/conveyor/soak/breaks/stalled-review-feed-poll.soak.test.mjs": 0.05,

@@ -94,7 +94,7 @@ import { writeAllSync } from './lib/write-all-sync.mjs';
 import { laneGitHardeningEnv, hardenLaneGitArgs } from './lib/lane-git-hardening.mjs';
 import { classifyRedCause, reachesChanged } from './lib/red-cause.mjs';
 import { baseRerunCandidate, measureBaseFailures, classifyPreExisting, runVitestOnBase } from './lib/verify-base-rerun.mjs';
-import { CARD_ONLY_SKIP_GATE, alwaysRunPlan, alwaysRunInventory, gateCommandsEqual, matchRequestedDefaultGate, verifySetting, verifySettingSource, phaseAdmissionKind, verifyPhaseAdmissionEnabled,buildPhaseOutcome, buildVerifyPhases, formatVerifyPhases, resolveDefaultGate, explicitGateRefusal, describeGate, scaledTimeoutFlags, laneRelevantChangeSinceForRecord, computeWorkingTreeHash, stableTreeHash, localChangedSet } from './lib/verify-lane-gate.mjs';
+import { CARD_ONLY_SKIP_GATE, capExplicitRelatedGate, alwaysRunPlan, alwaysRunInventory, gateCommandsEqual, matchRequestedDefaultGate, verifySetting, verifySettingSource, phaseAdmissionKind, verifyPhaseAdmissionEnabled,buildPhaseOutcome, buildVerifyPhases, formatVerifyPhases, resolveDefaultGate, explicitGateRefusal, describeGate, scaledTimeoutFlags, laneRelevantChangeSinceForRecord, computeWorkingTreeHash, stableTreeHash, localChangedSet } from './lib/verify-lane-gate.mjs';
 import { readAwaitVerifyRecord } from './conveyor/await-verify.mjs';
 import { revertRedForVerify, appendRevertRedLog, recoverRevertRed, applyRevertRedToVerdict } from './lib/verify-revert-red.mjs';
 import { createRevertProbe } from './operations/mutation-check-io.mjs';
@@ -122,7 +122,7 @@ Usage: node scripts/verify-lane.mjs [verify|request|check|reset|run] [flags]
   check     read-only verdict for HEAD (--wait=<ms> blocks until it settles)
   reset     clear a stale marker
   run       synchronous marker-less run
-Flags: --repo=<dir> --json --require-verified --dry-run (print default gate only) --help/-h
+Flags: --gate-uncapped (preserve explicit related gate; audited) --repo=<dir> --json --require-verified --dry-run (print default gate only) --help/-h
 Exit: 0 ok, 2 red, 3 usage/refused. Full docs: the header of scripts/verify-lane.mjs.
 `);
   process.exit(0);
@@ -171,9 +171,10 @@ const readMarker = () => readVerifyMarker(GIT_DIR);
 
 // #5141 — older/corrupt markers have no phase telemetry to transport.
 function markerPhases(record) {
-  return record && typeof record === 'object' && !record.corrupt
-    && record.phases && typeof record.phases === 'object' && !Array.isArray(record.phases)
-    ? { phases: record.phases } : {};
+  if (!record || typeof record !== 'object' || record.corrupt) return {};
+  return { ...(record.phases && typeof record.phases === 'object' && !Array.isArray(record.phases) ? { phases: record.phases } : {}),
+    ...(record.selection ? { selection: record.selection } : {}), ...(record.requeue ? { requeue: record.requeue } : {}),
+    ...(record.gateUncapped ? { gateUncapped: true } : {}) };
 }
 
 // #5466 — the revert-red result rides along on `check` (the fixer pastes its `line` into the evidence comment). Only for a
@@ -421,15 +422,30 @@ function isExplicitFullPolicy(policy) { return policy.finalGate === 'full' && ['
 function runsWholeUnitTier(policy, scripts) { return isExplicitFullPolicy(policy) && !!scripts?.includes('test:unit'); }
 // Preview resolves the same default as verify, before any gate, admission or marker writes.
 if (MODE === 'print-gate') {
-  const gate = resolveBuildDefaultGate(process.env);
+  const gate = typeof flags.gate === 'string'
+    ? capExplicitRelatedGate({ gate: flags.gate, uncapped: flags['gate-uncapped'] === true, runGit: git, readRepoFile })
+    : resolveBuildDefaultGate(process.env);
+  gate.decision ??= { reasons: [] }; gate.gateReasons ??= [];
   writeAllSync(1, JSON.stringify({ command: gate.command, reasons: [...gate.decision.reasons, ...gate.gateReasons],
     standards: gate.decision.standards ?? null, decision: gate.decision }) + '\n');
   process.exit(0);
 }
 let GATE;
 let resolvedGate;
+let explicitSelection;
 if (typeof flags.gate === 'string') {
-  GATE = flags.gate;
+  let capped;
+  let capRefusal;
+  try {
+    capped = capExplicitRelatedGate({ gate: flags.gate, uncapped: flags['gate-uncapped'] === true,
+      runGit: git, readRepoFile, env: process.env });
+  } catch (error) {
+    capRefusal = error.message;
+    capped = { command: flags.gate };
+  }
+  GATE = capped.command;
+  if (capped.notice) process.stderr.write(`${capped.notice}\n`);
+  explicitSelection = capped.selection;
   // PR #6769 send-back — recognize a stamped DEFAULT gate (including one resolved under the other build.finalGate)
   // BEFORE the explicit-gate refusal below: a full gate opted into under the requester's `full`, consumed by a child
   // under `related` whose own selection is blocked, is the requester's default gate, not an agent-supplied override.
@@ -453,7 +469,7 @@ if (typeof flags.gate === 'string') {
       const scripts = readCheckoutScripts();
       return runsWholeUnitTier(policy, scripts) && GATE === 'npm run test:unit' + (scripts.includes('check:standards') ? ' && npm run check:standards' : '');
     } catch { return false; } })();
-    const refusal = defaultBlocked && !policyFull && !resolvedGate ? explicitGateRefusal(GATE) : null;
+    const refusal = capRefusal || (defaultBlocked && !policyFull && !resolvedGate ? explicitGateRefusal(flags.gate) || explicitGateRefusal(GATE) : null);
     if (refusal) {
       // A dispatched child must leave a TERMINAL record (red, exit 3) — leaving the `running` request as it was would
       // make the dispatcher re-spawn this same refusal on every sweep. A plain `request` records nothing.
@@ -464,6 +480,7 @@ if (typeof flags.gate === 'string') {
       emit({ sha: headSha, status: 'gate-refused', reason: 'explicit-gate-not-affected-test', ok: false, redCause: 'refused', redCauseFiles: [], detail: `${refusal}. The default selection is blocked for this diff, so supply an affected-test gate such as \`--gate="npx vitest related <files> --run"\`; ${dispatchedChild ? 'recorded a red marker so it is not re-dispatched' : 'no marker was recorded'}.` }, 3);
     }
   }
+  if (capRefusal) throw new Error(capRefusal);
 } else {
   const resolved = resolveBuildDefaultGate(process.env);
   if (resolved.decision.mode === 'blocked') emit({ sha: headSha, status: 'selection-required', reason: 'local-selection-bound', ok: false, redCause: 'refused', redCauseFiles: [], detail: describeGate(resolved) }, 3);
@@ -534,6 +551,14 @@ if (!resolvedGate && typeof flags.gate === 'string') {
   }
 }
 
+const priorAudit = readMarker();
+// A dispatched --gate transports the original request; preserve its explicit/default provenance.
+const gateExplicit = DISPATCHED_RUN ? priorAudit?.sha === headSha && priorAudit?.gateExplicit === true
+  : typeof flags.gate === 'string';
+const gateAudit = { ...(gateExplicit ? { gateExplicit: true } : {}),
+  ...(explicitSelection || resolvedGate?.decision?.selection ? { selection: explicitSelection ?? resolvedGate.decision.selection } : {}),
+  ...(flags['gate-uncapped'] === true ? { gateUncapped: true } : {}),
+  ...(DISPATCHED_RUN && priorAudit?.sha === headSha && priorAudit?.requeue ? { requeue: priorAudit.requeue, selection: priorAudit.selection } : {}) };
 SELECTION = summarizeSelection({ gate: resolvedGate, explicitGate: typeof flags.gate === 'string' });
 if (DISPATCHED_RUN && MODE === 'verify') process.stderr.write(`${selectionNotice({ sha: headSha, summary: SELECTION })}\n`);
 
@@ -640,7 +665,7 @@ if (MODE === 'request') {
   }
 }
 
-if (MODE !== 'run') writeMarker({ ...verifyStartBody({ sha: headSha, suites: GATE, startedAt: new Date().toISOString(), treeHash: currentTreeHash, runId: typeof flags['run-id'] === 'string' ? flags['run-id'] : undefined }), ...(FORCE_LOCAL ? { local: true } : {}) });
+if (MODE !== 'run') writeMarker({ ...verifyStartBody({ sha: headSha, suites: GATE, startedAt: new Date().toISOString(), treeHash: currentTreeHash, ...gateAudit, runId: typeof flags['run-id'] === 'string' ? flags['run-id'] : undefined }), ...(FORCE_LOCAL ? { local: true } : {}) });
 
 // #3105 — `request` stops HERE: the marker is stamped, nothing has run yet, and this call already returns
 // (`emit` calls `process.exit`). The actual suite run is picked up by `scripts/conveyor/verify-dispatch.mjs`

@@ -199,7 +199,9 @@ describe('child trace parsing', () => {
 
 describe('trace switches and sampling', () => {
   it.each([
-    [{}, true], [{ CI: '1' }, false], [{ WE_TEST_CACHE: '0' }, false], [{ WE_TEST_CACHE_TRACE: '0' }, false],
+    [{}, false], [{ WE_TEST_CACHE_TRACE: '1' }, true],
+    [{ CI: '1', WE_TEST_CACHE_TRACE: '1' }, false], [{ WE_TEST_CACHE: '0', WE_TEST_CACHE_TRACE: '1' }, false],
+    [{ WE_TEST_CACHE_TRACE: '0' }, false], [{ WE_TEST_CACHE_TRACE: 'invalid' }, false],
   ])('evaluates trace enablement for %j', (env, expected) => {
     expect(traceEnabled(env)).toBe(expected);
   });
