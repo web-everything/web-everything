@@ -8,6 +8,7 @@ import { newRunRecord, readRun, writeRun } from '../../operations/run-store.mjs'
 import { readRedTeamPublicationHold } from '../drain-red-team-evidence.mjs';
 import { historicalCardOnlySkipCandidate, readDrainRedTeamEvidence, recordRedTeamStatus, readRedTeamStatus, redTeamStatusDir } from '../drain-red-team-evidence.mjs';
 import { redTeamEnqueueHold } from '../drain-queue-safety.mjs';
+import { redTeamMarker } from '../red-team-gate.mjs';
 import { redTeamOwedFor } from '../review-red-team-policy.mjs';
 import { pidStartTime } from '../pid-alive.mjs';
 import { reviewRunIndexPath } from '../review-run-index.mjs';
@@ -25,8 +26,15 @@ function fixture() {
   return { repo: 'web-everything/web-everything', pr: 5439, head: 'b'.repeat(40), runsDir,
     readScorecards: () => [], env: { WE_SHARED_RUNS_DIR: runsDir } };
 }
+// RL A0: a result only releases an enqueue/publication hold when it is a COMPLETED review (verdict line plus the
+// canonical "reported nothing" line), the shape the red-team writer posts; a bare heading is not publishable proof.
+const cleanResultBody = f => [`<!-- we:red-team-advisory pr=${f.pr} rev=${f.head} -->`, '### Post-accept red team — no break found', '',
+  `Advisory only: this comment changes no label itself. Head \`${f.head.slice(0, 12)}\` · red team fixture/fixture · recorded verdict \`accept\`.`,
+  '', 'The red team tried to break this change and reported nothing.'].join('\n');
+// RL A0: enqueue with no owed round still needs head-bound proof (a trusted policy-clear for this PR and head).
+const policyClearComment = f => ({ author: { login: 'web-everything' }, body: `${redTeamMarker(f.pr, f.head)}\nRed team not required on this head: not owed.` });
 const cleanResultComment = f => ({ author: { login: 'web-everything' }, body:
-  `<!-- we:red-team-advisory pr=${f.pr} rev=${f.head} -->\n### Post-accept red team — no break found` });
+  cleanResultBody(f) });
 // Seal at finish (#6535, operator ruling R907): the seat's sealer is the shared publisher in seal-only mode over the
 // exact-head seat row. This one runs it for real over a fixture row and thread.
 const seatRow = (head, findings = []) => ({ rev: head, findings, provider: 'fixture', model: 'fixture', callId: 'c',
@@ -95,7 +103,7 @@ describe('status persistence and check publication share one claim', () => {
     const input = { ...f, loopPayload: payload(f.head), status: 'finished', result: 'ran' };
     const options = { env: f.env, log: () => {}, sealFinished: sealAtFinish(f),
       comments: [{ author: { login: 'web-everything' }, body:
-        `<!-- we:red-team-advisory pr=${f.pr} rev=${f.head} -->\n### Post-accept red team — no break found` }],
+        cleanResultBody(f) }],
       gh: () => JSON.stringify({ headRefOid: f.head, labels }),
       postCheckRun: ({ payload: check }) => { checks.push(check); return { ok: true }; } };
 
@@ -219,7 +227,7 @@ describe('status persistence and check publication share one claim', () => {
     const input = { ...f, loopPayload: payload(f.head), status: 'finished' };
     const options = { env: f.env, log: () => {}, sealFinished: sealAtFinish(f),
       comments: [{ author: { login: 'web-everything' }, body:
-        `<!-- we:red-team-advisory pr=${f.pr} rev=${f.head} -->\n### Post-accept red team — no break found` }],
+        cleanResultBody(f) }],
       gh: () => JSON.stringify({ headRefOid: f.head, labels: ['ready-to-merge', 'review:accepted'] }),
       postCheckRun: ({ payload: check }) => {
         runs.push({ ...check, id: runs.length + 1, app: { id: appId } });
@@ -285,7 +293,7 @@ describe('status persistence and check publication share one claim', () => {
     const options = {
       env: f.env, sealFinished: sealAtFinish(f),
       comments: [{ author: { login: 'web-everything' }, body:
-        `<!-- we:red-team-advisory pr=${f.pr} rev=${f.head} -->\n### Post-accept red team — no break found` }],
+        cleanResultBody(f) }],
       gh: () => JSON.stringify({ headRefOid: f.head, labels: ['ready-to-merge', 'review:accepted'] }),
       log: line => logs.push(JSON.parse(line)),
       postCheckRun: ({ payload: check }) => {
@@ -497,7 +505,7 @@ describe('status persistence and check publication share one claim', () => {
     recordRedTeamStatus({ ...input, status: 'finished', result: 'ran' }, {
       env: f.env, sealFinished: sealAtFinish(f),
       comments: [{ author: { login: 'web-everything' }, body:
-        `<!-- we:red-team-advisory pr=${f.pr} rev=${f.head} -->\n### Post-accept red team — no break found` }],
+        cleanResultBody(f) }],
       gh: () => JSON.stringify({ headRefOid: f.head, labels: ['ready-to-merge', 'review:accepted'] }),
       postCheckRun: args => {
         // A is paused after persistence, before its success reaches GitHub. B
@@ -793,7 +801,9 @@ describe('drain reads actual head-bound review scheduler inputs', () => {
     const f = fixture();
     const evidence = readDrainRedTeamEvidence(f);
     // #5439/#5443: an acceptance label alone cannot invent scheduler work that never existed.
-    expect(redTeamEnqueueHold({ ...f, ...evidence, labels: ['review:accepted'], comments: [] })).toBeNull();
+    // With nothing owed the enqueue still needs head-bound proof (RL A0): none holds, a trusted policy-clear releases.
+    expect(redTeamEnqueueHold({ ...f, ...evidence, labels: ['review:accepted'], comments: [] })).toMatch(/unknown\(missing\)/);
+    expect(redTeamEnqueueHold({ ...f, ...evidence, labels: ['review:accepted'], comments: [policyClearComment(f)] })).toBeNull();
     // A persisted accepting verdict holds before the job publishes its first status: the loop applies the labels
     // before the job can write one. It is not a live queue entry, so the never-scheduled deadline still applies.
     const run = { ...newRunRecord({ id: 'review-pr-5439', op: 'review-pr', input: { repo: f.repo, pr: f.pr } }), ...payload(f.head) };
@@ -807,7 +817,7 @@ describe('drain reads actual head-bound review scheduler inputs', () => {
     expect(readDrainRedTeamEvidence(f).scheduled).toBe(false);
     writeRun(run, f.runsDir);
     recordRedTeamStatus({ ...f, loopPayload: payload(f.head), status: 'finished', result: 'skipped' }, f);
-    expect(redTeamEnqueueHold({ ...f, ...readDrainRedTeamEvidence(f), comments: [] })).toBeNull();
+    expect(redTeamEnqueueHold({ ...f, ...readDrainRedTeamEvidence(f), comments: [policyClearComment(f)] })).toBeNull();
   });
   it('an earlier finished status on the same head never supersedes a newer accepting run', () => {
     const f = fixture();
@@ -815,13 +825,14 @@ describe('drain reads actual head-bound review scheduler inputs', () => {
     recordRedTeamStatus({ ...f, loopPayload: payload(f.head), status: 'finished', result: 'not-owed' }, f);
     const statusFile = join(redTeamStatusDir(f.env), `${encodeURIComponent(f.repo)}-${f.pr}-${f.head}.json`);
     utimesSync(statusFile, new Date(1_000_000), new Date(1_000_000));
-    expect(redTeamEnqueueHold({ ...f, ...readDrainRedTeamEvidence(f), comments: [] })).toBeNull();
+    expect(redTeamEnqueueHold({ ...f, ...readDrainRedTeamEvidence(f), comments: [] })).toMatch(/unknown\(missing\)/);
+    expect(redTeamEnqueueHold({ ...f, ...readDrainRedTeamEvidence(f), comments: [policyClearComment(f)] })).toBeNull();
     writeRun({ ...newRunRecord({ id: 'review-pr-2', op: 'review-pr', input: { repo: f.repo, pr: f.pr } }), ...payload(f.head) }, f.runsDir);
     expect(readDrainRedTeamEvidence(f)).toMatchObject({ scheduled: true, inFlight: false });
     expect(redTeamEnqueueHold({ ...f, ...readDrainRedTeamEvidence(f), comments: [] })).toMatch(/no recorded result/);
     // The re-review's own later status supersedes the run again.
     recordRedTeamStatus({ ...f, loopPayload: payload(f.head), status: 'finished', result: 'skipped' }, f);
-    expect(redTeamEnqueueHold({ ...f, ...readDrainRedTeamEvidence(f), comments: [] })).toBeNull();
+    expect(redTeamEnqueueHold({ ...f, ...readDrainRedTeamEvidence(f), comments: [policyClearComment(f)] })).toBeNull();
   });
   it('a newer accepting run does not hide a finished but unpublished result on the same head', () => {
     const f = fixture();
@@ -870,7 +881,7 @@ describe('drain reads actual head-bound review scheduler inputs', () => {
     expect(readDrainRedTeamEvidence(live).skipCardOnly).toBe(false);
     expect(redTeamEnqueueHold({ ...f, ...readDrainRedTeamEvidence(live), comments: [] })).toMatch(/no recorded result/);
     recordRedTeamStatus({ ...f, loopPayload: cardOnly, status: 'queued' }, { ...f, env: { ...f.env, WE_RED_TEAM_SKIP_CARD_ONLY: 'true' }, readPidStart: () => 'start' });
-    expect(redTeamEnqueueHold({ ...f, ...readDrainRedTeamEvidence(live), env: { WE_RED_TEAM_SKIP_CARD_ONLY: 'false' }, comments: [] })).toBeNull();
+    expect(redTeamEnqueueHold({ ...f, ...readDrainRedTeamEvidence(live), env: { WE_RED_TEAM_SKIP_CARD_ONLY: 'false' }, comments: [policyClearComment(f)] })).toBeNull();
   });
   it('holds an owing card-only run until the job records its skip decision', () => {
     const f = fixture();
@@ -879,7 +890,7 @@ describe('drain reads actual head-bound review scheduler inputs', () => {
     expect(readDrainRedTeamEvidence(f).skipCardOnly).toBe(false);
     expect(redTeamEnqueueHold({ ...f, ...readDrainRedTeamEvidence(f), env: { WE_RED_TEAM_SKIP_CARD_ONLY: 'true' }, comments: [] })).toMatch(/no recorded result/);
     recordRedTeamStatus({ ...f, loopPayload: { verdict: { verdict: 'accept' }, findings: { read } }, status: 'queued' }, { ...f, env: { ...f.env, WE_RED_TEAM_SKIP_CARD_ONLY: 'true' }, readPidStart: () => 'start' });
-    expect(redTeamEnqueueHold({ ...f, ...readDrainRedTeamEvidence({ ...f, isAlive: () => true, readPidStart: () => 'start' }), comments: [] })).toBeNull();
+    expect(redTeamEnqueueHold({ ...f, ...readDrainRedTeamEvidence({ ...f, isAlive: () => true, readPidStart: () => 'start' }), comments: [policyClearComment(f)] })).toBeNull();
   });
   it('does not mistake a reused pid for the original red-team process', () => {
     const f = fixture();
