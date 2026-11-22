@@ -69,7 +69,10 @@ export function probeLaneStatus(dir, { run = spawnSync } = {}) {
         || !wellFormedConfigList(config.stdout) || laneFilterDrivers(config.stdout).length > 0) return null;
     // Status recurses into submodules whose config was not covered by the read
     // above. Refuse gitlinks until their work can be inspected separately.
-    const staged = run('git', [...laneGitConfigArgs(), 'ls-files', '--stage', '-z'], options);
+    // The full index listing exceeds 1 MiB even in clean lanes (~1.9 MiB here).
+    // Allow growth while keeping oversized or incomplete evidence fail-closed.
+    const staged = run('git', [...laneGitConfigArgs(), 'ls-files', '--stage', '-z'],
+      { ...options, maxBuffer: 8 * 1024 * 1024 });
     if (staged.error || staged.status !== 0 || typeof staged.stdout !== 'string'
         || !wellFormedStageList(staged.stdout)
         || staged.stdout.split('\0').some(entry => entry.startsWith('160000 '))) return null;

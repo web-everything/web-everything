@@ -1,8 +1,46 @@
 import { it, expect, vi } from 'vitest';
+import { spawnSync } from 'node:child_process';
 import { holderPidAlive, laneReclaimDecision, probeLaneReclaim } from '../lane-lease-liveness.mjs';
 import { applyReclaimSafety } from '../../conveyor/lease-reaper.mjs';
 import { laneGitConfigArgs, laneGitHardeningEnv, scrubGitRepoEnv, LANE_CONFIG_LIST_ARGS } from '../lane-git-hardening.mjs';
 import { leaseBody } from '../lane-lease.mjs';
+
+it.each([
+  { name: 'clean', bytes: 2 * 1024 * 1024, status: '', gitlink: false, safe: true },
+  { name: 'dirty', bytes: 2 * 1024 * 1024, status: ' M work.txt\n', gitlink: false, safe: false },
+  { name: 'trailing gitlink', bytes: 2 * 1024 * 1024, status: '', gitlink: true, safe: false },
+  { name: 'over budget', bytes: 9 * 1024 * 1024, status: '', gitlink: false, safe: false },
+])('handles a large $name index through the subprocess buffer', ({ bytes, status, gitlink, safe }) => {
+  // Emit valid, distinct stage entries through a real child pipe so maxBuffer is
+  // enforced by Node. No repository/index writes are needed for this fixture.
+  const script = `
+    const entry = '100644 ' + 'a'.repeat(40) + ' 0\\t' + 'x'.repeat(128);
+    const entries = Array.from({ length: Math.ceil(${bytes} / entry.length) },
+      (_, i) => entry + i + '\\0').join('');
+    process.stdout.write(entries + ${gitlink ? JSON.stringify(`160000 ${'a'.repeat(40)} 0\tsubmodule\0`) : "''"});
+  `;
+  let staged;
+  const run = vi.fn((_file, args, options) => {
+    if (args.includes('ls-files')) {
+      staged = spawnSync(process.execPath, ['-e', script], options);
+      return staged;
+    }
+    return { status: 0, stdout: args.includes('status') ? status : '' };
+  });
+  const candidate = { dir: '.', lease: {}, reason: 'pr-merged' };
+  const plan = applyReclaimSafety({ reap: [candidate], keep: [] }, {
+    check: (dir, lease) => probeLaneReclaim(dir, lease, { run }),
+  });
+  if (bytes > 8 * 1024 * 1024) {
+    expect(staged.error?.code).toBe('ENOBUFS');
+  } else {
+    expect(staged.error).toBeUndefined();
+    expect(Buffer.byteLength(staged.stdout)).toBeGreaterThanOrEqual(bytes);
+  }
+  expect(run.mock.calls.some(([, args]) => args.includes('status'))).toBe(!gitlink && bytes <= 8 * 1024 * 1024);
+  expect(plan.reap).toEqual(safe ? [candidate] : []);
+  expect(plan.keep).toEqual(safe ? [] : [{ ...candidate, reason: 'stale-but-dirty' }]);
+});
 
 it.each(['clean', 'smudge', 'process'])('refuses lane-defined %s filters before status in the conveyor', driver => {
   const run = vi.fn((_file, args) => args.includes('config')
