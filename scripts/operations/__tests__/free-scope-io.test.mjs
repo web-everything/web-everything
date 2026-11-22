@@ -12,6 +12,7 @@ import { lockIdFor } from '../../readiness/file-locks.mjs';
 import { withPathLock } from '../../readiness/with-lock.mjs';
 import { defaultRegistryPath, readRegistry, writeRegistry, updateRegistry, ghExec, readOpenPrs, readNetFileSets, findCardFile, readCardScope, collectFreeScope } from '../free-scope-io.mjs';
 import { main } from '../free-scope-cli.mjs';
+import { assessFreeScope } from '../free-scope.mjs';
 let root, registry, env;
 const now = () => Date.parse('2026-10-05T10:00:00Z');
 beforeEach(() => {
@@ -238,13 +239,35 @@ describe('readNetFileSets rejects partial or mis-sourced git evidence', () => {
     if (cmd === 'diff') return diff;
     return '';
   };
-  it.each([['odd token count', 'M\0a.mjs\0M'], ['dangling status', 'M\0a.mjs\0A'], ['unknown status', 'Z\0a.mjs\0'], ['status as a path', 'a.mjs\0M\0']])
+  it.each([['odd token count', 'M\0a.mjs\0M'], ['dangling status', 'M\0a.mjs\0A'], ['unknown status', 'Z\0a.mjs\0'], ['status as a path', 'a.mjs\0M\0'],
+    ['missing final terminator', 'M\0a.mjs'], ['empty path and status', 'M\0\0\0a.mjs\0'], ['empty stream record', '\0']])
   ('treats a corrupt git diff stream as unreadable: %s', (_name, diff) => {
     expect(readNetFileSets({ dir: '/x', rows, git: fakeGit({ diff }), perRowBase: true, readOnly: true }).get(1)).toMatchObject({ ok: false });
   });
   it('reads a well-formed stream completely', () => {
     expect(readNetFileSets({ dir: '/x', rows, git: fakeGit({ diff: 'M\0a.mjs\0A\0b.mjs\0' }), perRowBase: true, readOnly: true }).get(1))
       .toEqual({ ok: true, files: ['a.mjs', 'b.mjs'], added: ['b.mjs'] });
+  });
+  it('preserves unusual filenames and accepts an actually empty diff', () => {
+    const file = 'space and\nnewline\t`quote".mjs';
+    expect(readNetFileSets({ dir: '/x', rows, git: fakeGit({ diff: `M\0${file}\0` }), perRowBase: true, readOnly: true }).get(1))
+      .toEqual({ ok: true, files: [file], added: [] });
+    expect(readNetFileSets({ dir: '/x', rows, git: fakeGit({ diff: '' }), perRowBase: true, readOnly: true }).get(1))
+      .toEqual({ ok: true, files: [], added: [] });
+  });
+  it.each(['M\0a.mjs', 'M\0\0\0a.mjs\0', '\0'])('never clears scope from a corrupt git stream when fallback is unavailable: %j', diff => {
+    const repo = 'web-everything/web-everything';
+    const exec = args => {
+      if (args[0] === 'pr') return JSON.stringify(rows);
+      throw new Error('files API unavailable');
+    };
+    const snapshot = readOpenPrs({ repos: [repo], exec, git: fakeGit({ diff }), gitDirFor: () => '/x', readOnly: true });
+    expect(snapshot.unreadable).toEqual([{ repo, error: expect.stringContaining('git diff output') }]);
+    expect(assessFreeScope({ ...snapshot, files: ['we:elsewhere.mjs'], nowMs: now(), strict: true }).status).toBe('unknown');
+    const recovered = readOpenPrs({ repos: [repo], exec: args => args[0] === 'pr' ? JSON.stringify(rows)
+      : JSON.stringify({ s: 'modified', f: 'elsewhere.mjs' }), git: fakeGit({ diff }), gitDirFor: () => '/x', readOnly: true });
+    expect(recovered.unreadable).toEqual([]);
+    expect(assessFreeScope({ ...recovered, files: ['we:elsewhere.mjs'], nowMs: now(), strict: true }).status).toBe('occupied');
   });
   it('takes the base tip only from the exact ref, never from a branch whose name merely ends with it', () => {
     const calls = [];

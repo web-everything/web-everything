@@ -151,12 +151,16 @@ export function readNetFileSets({ dir, rows, git, remote = 'origin', base = 'mai
       if (!SHA.test(mergeBase)) throw new Error('no merge-base with the base branch');
       // --no-renames: a rename holds both its old and new path. -z: paths are NUL-separated, never quoted.
       const raw = String(git(dir, ['diff', '--no-ext-diff', '--no-renames', '--name-status', '-z', '--end-of-options', mergeBase, row.headRefOid]));
-      const tokens = raw.split('\0').filter(Boolean);
+      // Remove only the final record terminator. Filtering empty tokens hides corrupt records, and a missing
+      // final NUL can be a truncated filename even when the remaining token count is even.
+      if (raw && !raw.endsWith('\0')) throw new Error('git diff output is incomplete (missing final terminator)');
+      const tokens = raw ? raw.slice(0, -1).split('\0') : [];
       const files = [], added = [];
       // A truncated or corrupt `-z` stream must never become a shorter file set: an odd token count or an unknown status is unreadable.
       if (tokens.length % 2 !== 0) throw new Error('git diff output is incomplete (odd token count)');
       for (let i = 0; i < tokens.length; i += 2) {
         if (!/^[ADMTUXB]$/.test(tokens[i])) throw new Error(`git diff output has an unknown status "${String(tokens[i]).slice(0, 8)}"`);
+        if (!tokens[i + 1]) throw new Error('git diff output has an empty path');
         files.push(tokens[i + 1]);
         if (tokens[i] === 'A') added.push(tokens[i + 1]);
       }
