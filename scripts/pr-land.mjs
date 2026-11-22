@@ -979,13 +979,29 @@ async function runCli() {
     const remoteTipLine = pushUrl ? tryGit(['ls-remote', '--', pushUrl, remoteHeadRef]) : null;
     const remoteTipMatch = /^([0-9a-f]{40})\t([^\r\n]+)$/i.exec(remoteTipLine ?? '');
     const remoteTip = remoteTipMatch?.[2] === remoteHeadRef ? remoteTipMatch[1] : null;
-    return { remoteTip, validRefSha, alreadyPublished: validRefSha && remoteTip !== null && remoteTip === refSha };
+    return { remoteTip, validRefSha, pushUrl, remoteHeadRef, alreadyPublished: validRefSha && remoteTip !== null && remoteTip === refSha };
+  }
+
+  // git's OWN non-force push checks fast-forward on the client: in a shallow clone, or with the push target's tip
+  // object missing locally, it rejects even a true fast-forward ("fetch first" / non-fast-forward). So before the
+  // push, best-effort: unshallow from REMOTE, then fetch the tip from the push URL (the one URL pushSkipDecision
+  // proved ls-remote and the push both contact). Each fetch is bounded and its failure is ignored: the guarded
+  // push still runs and git decides. It never forces and never moves a local branch (the tip lands in FETCH_HEAD).
+  function completeHistoryForPush({ remoteTip, pushUrl, remoteHeadRef }) {
+    const fetchQuiet = (args) => {
+      try {
+        execFileSync('git', ['fetch', '-q', '--no-tags', ...args], { cwd: REPO, stdio: ['ignore', 'ignore', 'pipe'],
+          timeout: 120_000, maxBuffer: 1024 * 1024, env: { ...process.env, GIT_TERMINAL_PROMPT: '0' } });
+      } catch { /* best effort: the push runs and git validates */ }
+    };
+    if (tryGit(['rev-parse', '--is-shallow-repository']) === 'true') fetchQuiet(['--unshallow', REMOTE]);
+    if (pushUrl && tryGit(['cat-file', '-e', `${remoteTip}^{commit}`]) === null) fetchQuiet(['--', pushUrl, remoteHeadRef]);
   }
 
   // Refuse before pushing ONLY on proof that the push target's tip is not an ancestor of refSha: merge-base exits
   // exactly 1 in a clone git confirms is NOT shallow (past a shallow boundary merge-base can answer 1 falsely).
   // A missing tip object (exit 128), a shallow or unreadable clone state, or any other failure proves nothing,
-  // so the guarded non-force push runs and the server validates fast-forward itself. Local refs/replace objects
+  // so the guarded non-force push runs and git's own push validates fast-forward. Local refs/replace objects
   // are ignored (`--no-replace-objects`): they rewrite local history the server never sees.
   function provenNotAncestor(remoteTip) {
     if (tryGit(['rev-parse', '--is-shallow-repository']) !== 'false') return false;
@@ -1163,7 +1179,9 @@ async function runCli() {
   // 2. Publish the source commit to the lane ref on origin (guard-safe: lane/*). Never force, no local branch.
   // Only an exact, readable remote tip can authorize skipping the guarded push.
   // Failed/malformed remote reads retain the normal push path and its pre-push guard.
-  const { remoteTip, validRefSha, alreadyPublished } = pushSkipDecision();
+  const pushTarget = pushSkipDecision();
+  const { remoteTip, validRefSha, alreadyPublished } = pushTarget;
+  if (!alreadyPublished && validRefSha && remoteTip) completeHistoryForPush(pushTarget);
   if (alreadyPublished) {
     process.stderr.write(`pr-land [${REPO}] · push skipped: ${REMOTE} already at ${refSha}\n`);
   } else if (validRefSha && remoteTip && provenNotAncestor(remoteTip)) {

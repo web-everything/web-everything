@@ -65,7 +65,7 @@ function run({ check = true, fail = false, override = '', count = 15, exempt = f
       if (cmd !== 'git') throw new Error('unexpected external effect: ' + cmd);
       // realGit: the publish step's remote reads, ancestry/shallow checks and the push run against real local
       // bare repositories; every other git call stays stubbed.
-      if (${!!realGit} && (['ls-remote', 'push'].includes(args[0]) || args.includes('merge-base') || (args[0] === 'remote' && args.includes('--all'))
+      if (${!!realGit} && (['ls-remote', 'push', 'fetch', 'cat-file'].includes(args[0]) || args.includes('merge-base') || (args[0] === 'remote' && args.includes('--all'))
         || args.includes('--is-shallow-repository'))) return execFileSync(cmd, args, opts);
       if (args.includes('--is-shallow-repository')) { if (${JSON.stringify(shallow)} === null) throw new Error('shallow unreadable'); return ${JSON.stringify(shallow)}; }
       if (args[0] === 'rev-parse') return args.includes('--absolute-git-dir') ? ${JSON.stringify(dir)} : ${JSON.stringify(sha)};
@@ -443,5 +443,19 @@ describe('pr-land lane publish against real local remotes', () => {
     expect(result.reason).not.toBe('push-failed');
     expect(status).toBe(0);
     expect(tipOf(upstream)).toBe(head);
+  }), 30_000);
+
+  it('a shallow clone whose push target diverged still refuses (completed history proves it), and the tip is untouched', () => withRepos(({ root, upstream }) => {
+    const seed = join(root, 'seed'); git(root, 'init', '-q', seed);
+    commit(seed, 'c1'); const head = commit(seed, 'c2');
+    git(seed, 'push', '-q', upstream, 'HEAD:refs/heads/main');
+    git(seed, 'checkout', '-q', '-b', 'side', 'HEAD~1'); const diverged = commit(seed, 'side');
+    git(seed, 'push', '-q', upstream, `${diverged}:${ref}`, '--force');
+    const work = join(root, 'work');
+    git(root, 'clone', '-q', '--depth=1', '--branch=main', pathToFileURL(upstream).href, work);
+    const { status, result } = publishReal(work, head);
+    expect(status).toBe(3);
+    expect(result.reason).toBe('push-failed');
+    expect(tipOf(upstream)).toBe(diverged);
   }), 30_000);
 });
