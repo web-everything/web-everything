@@ -348,11 +348,21 @@ describe('pr-land lane publish remote-tip check', () => {
     expect(status).toBe(expected);
   });
 
-  it('pushurl differs and the fork already holds HEAD: skips the push even though upstream differs', () => {
-    const { effects, stderr } = publish({ remoteTip: tip(different), pushUrls: fork, forkTip: tip(sha), refusePush: true });
+  it.each([false, true])('pushurl differs and the fork already holds HEAD: guards run before skipping, refusal=%s', refusePush => {
+    const { status, result, effects, stderr } = publish({ remoteTip: tip(different), pushUrls: fork, forkTip: tip(sha), refusePush });
     expect(pushes(effects)).toEqual([]);
-    expect(stderr).toContain(`push skipped: origin already at ${sha}`);
-    expect(effects.some(([cmd]) => cmd === 'create')).toBe(true);
+    const guards = effects.filter(([cmd, args]) => cmd === process.execPath && /guard-.*\.mjs$/.test(args[0]));
+    expect(guards.map(([, args]) => args)).toEqual((refusePush
+      ? ['guard-git-push.mjs'] : ['guard-git-push.mjs', 'guard-prototype-tracker.mjs'])
+      .map(guard => [resolve('scripts', guard), 'origin', fork]));
+    expect(effects.some(([cmd]) => cmd === 'create')).toBe(!refusePush);
+    expect(status).toBe(refusePush ? 3 : 0);
+    if (refusePush) {
+      expect(result.reason).toBe('push-failed');
+      expect(stderr).not.toContain('push skipped');
+    } else {
+      expect(stderr).toContain(`push skipped: origin already at ${sha}`);
+    }
   });
 
   it('pushurl differs and the fork tip is provably not an ancestor: refuses before push', () => {
