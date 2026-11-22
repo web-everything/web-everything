@@ -270,6 +270,16 @@ it.each([false, true])('refuses a lane that defines a Git filter driver before a
   refused(dryRun ? { 'dry-run': true } : {}, /filter driver/);
   expect(existsSync(ran)).toBe(false);
 });
+it.each([false, true])('refuses a filter driver before the verify-passed hold check can run status (dry-run: %s)', dryRun => {
+  const ran = join(root, 'filter-ran-passed');
+  git(lane, 'config', 'filter.sneaky.clean', `sh -c 'touch "${ran}"; cat'`);
+  writeFileSync(join(lane, '.git', 'info', 'attributes'), 'file.txt filter=sneaky\n');
+  const future = new Date(Date.now() + 5000);
+  utimesSync(join(lane, 'file.txt'), future, future);
+  writeFileSync(join(lane, '.git', '.lane-verify'), JSON.stringify({ sha: tip, status: 'passed', startedAt: new Date().toISOString() }));
+  refused(dryRun ? { 'dry-run': true } : {}, /filter driver/);
+  expect(existsSync(ran)).toBe(false);
+});
 it.each([false, true])('refuses a lane that stages a gitlink before any status call (dry-run: %s)', dryRun => {
   git(lane, 'update-index', '--add', '--cacheinfo', `160000,${tip},sub`);
   refused(dryRun ? { 'dry-run': true } : {}, /gitlink/);

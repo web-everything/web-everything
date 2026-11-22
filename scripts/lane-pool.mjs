@@ -5782,12 +5782,9 @@ function cmdBranch(repo) {
   if (typeof lease.holder !== 'string' || !lease.holder.trim()) refuse('lease holder unknown');
   if (lease.holder !== flags.session) refuse('session does not match lease holder');
   if (!Number.isFinite(Date.parse(lease.acquiredAt)) || isLeaseStale(lease, Date.now(), ttlMsFromFlags())) refuse('lease stale or undatable; re-acquire the lane');
-  const hold = checkLaneHold(dir, { action: 'reset', byHolder: true });
-  if (!hold.allowed) refuse(hold.reason);
-  try { branchGit(['check-ref-format', `refs/heads/${name}`]); }
-  catch { refuse('invalid --name for a git branch'); }
   // A clean filter runs on worktree content during `git status`, so a lane defining one is refused BEFORE the first
-  // status call (dry-run included). An unreadable config list is never read as "no drivers".
+  // status call (dry-run included) — including the status checkLaneHold's verify-marker path can run.
+  // An unreadable config list is never read as "no drivers".
   const laneConfig = releaseEvidenceGit([...LANE_CONFIG_LIST_ARGS], dir, {}, { GIT_CONFIG_NOSYSTEM: '1' });
   if (laneConfig === null) refuse('lane config unreadable');
   if (laneFilterDrivers(laneConfig).length) refuse('lane defines a Git filter driver; unset it before branching');
@@ -5795,6 +5792,10 @@ function cmdBranch(repo) {
   const staged = releaseEvidenceGit(['ls-files', '--stage', '-z'], dir);
   if (staged === null) refuse('staged index listing unreadable');
   if (staged.split('\0').some(entry => entry.startsWith('160000 '))) refuse('lane stages a submodule/gitlink; inspect it separately before branching');
+  const hold = checkLaneHold(dir, { action: 'reset', byHolder: true });
+  if (!hold.allowed) refuse(hold.reason);
+  try { branchGit(['check-ref-format', `refs/heads/${name}`]); }
+  catch { refuse('invalid --name for a git branch'); }
   try {
     // Unlike tryGit/status fallbacks, a failed read must never mean clean or absent.
     const branches = branchGit(['for-each-ref', '--format=%(refname)', `refs/heads/${name}`]).split('\n');
