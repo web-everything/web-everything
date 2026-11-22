@@ -116,7 +116,7 @@
         "name": "signal-running",
         "value": {
           "dusk": "#4fe0ef",
-          "day": "#0b7f8c"
+          "day": "#0a717d"
         },
         "usage": "Status text and dot: an agent is working (build, review). On surface in both themes."
       },
@@ -132,7 +132,7 @@
         "name": "signal-landed",
         "value": {
           "dusk": "#6fe3c1",
-          "day": "#0f7a5c"
+          "day": "#0e7457"
         },
         "usage": "Status text and dot: merged to main. Always with the word 'Landed' and a check."
       },
@@ -196,7 +196,7 @@
         "name": "signal-warn",
         "value": {
           "dusk": "#f2cf4e",
-          "day": "#8a7000"
+          "day": "#865e00"
         },
         "usage": "Amber warning; sun is needs-you only. Warn always carries a word or icon."
       },
@@ -217,7 +217,7 @@
         "name": "running-soft",
         "value": {
           "dusk": "#203357",
-          "day": "#d8ebed"
+          "day": "#d8e8ea"
         },
         "usage": "16 percent signal-running over surface; soft status or selection fill.",
         "derive": {
@@ -230,7 +230,7 @@
         "name": "landed-soft",
         "value": {
           "dusk": "#253350",
-          "day": "#d9eae5"
+          "day": "#d8e9e4"
         },
         "usage": "16 percent signal-landed over surface; soft status or selection fill.",
         "derive": {
@@ -256,7 +256,7 @@
         "name": "warn-soft",
         "value": {
           "dusk": "#3a303d",
-          "day": "#ece8d6"
+          "day": "#ece5d6"
         },
         "usage": "16 percent signal-warn over surface; soft status or selection fill.",
         "derive": {
@@ -309,9 +309,9 @@
         "name": "hatch-ink",
         "value": {
           "dusk": "#6d62b3",
-          "day": "#8f87b8"
+          "day": "#8880af"
         },
-        "usage": "Forecast hatch stroke; matches line-strong."
+        "usage": "Forecast hatch stroke; dusk matches line-strong, day is tuned to reach 3:1 on hatch-ground."
       }
     ]
   },
