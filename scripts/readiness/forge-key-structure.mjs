@@ -170,6 +170,23 @@ function encodedText(text) {
 }
 
 // All representations (including mixed base64 alphabets) converge here, before detection.
+// Last index of anything that could form or hide the JWK member name `kty`: the literal, any backslash escape,
+// a computed or spread member (`[` or `...` after `{`, `,`, `*`, get/set/async, whitespace/comments skipped), or a
+// quote next to `+`. Conservative: a comment before the `[`/`...` always counts. -1 when none.
+function lastSignal(text) {
+  let last=Math.max(text.lastIndexOf('kty'),text.lastIndexOf('\\'));
+  for(const match of text.matchAll(/["'`]\s*\+|\+\s*["'`]/g))last=Math.max(last,match.index);
+  const computed=at=>{
+    let i=at-1;
+    while(i>=0&&/\s/.test(text[i]))i--;
+    if(i<0)return false;
+    const c=text[i];
+    return c==='{'||c===','||c==='*'||c==='/'||/(?:^|\W)(?:get|set|async)$/.test(text.slice(Math.max(0,i-5),i+1));
+  };
+  for(const match of text.matchAll(/\[|\.\.\./g))if(computed(match.index))last=Math.max(last,match.index);
+  return last;
+}
+
 function canonicalize(bytes,emit,tick,{comments=true,utf16=true}={}) {
   const text=bytes.toString('utf8');
   // JSON token boundaries preserve object scope and decode JSON string escapes once.
@@ -210,10 +227,8 @@ function canonicalize(bytes,emit,tick,{comments=true,utf16=true}={}) {
   // (an odd count before a JWK swallows its opening brace). Every `{` is therefore matched on its own, string-aware
   // from that brace only, bounded in length, so nothing before it can hide the object.
   // Any escape can hide the key type: stringValue also supports identity escapes and line continuations.
-  // jwkFinding matches the exact-case member name `kty`: without a backslash escape it must appear literally, so the
-  // case-sensitive literal (`byTaskType` is not it) is exact. A markdown table-cell escape `\|` yields `|`, which can
-  // never form or hide the name, so a backslash followed by `|` does not count (every other backslash still does).
-  if(/kty|\\(?!\|)/.test(text)) {
+  const lastSig=lastSignal(text);
+  if(lastSig>=0||/kty|\\/i.test(text)) {
     const pieces=/"(?:\\[\s\S]|[^"\\])*"|'(?:\\[\s\S]|[^'\\])*'|\/\/[^\r\n\u2028\u2029]*|\/\*[\s\S]*?(?:\*\/|$)|[{}]/g;
     for(let at=text.indexOf('{');at!==-1;at=text.indexOf('{',at+1)) {
       // A brace the pass above already treated as a container opener is detected there; only the rest (hidden by
@@ -224,14 +239,21 @@ function canonicalize(bytes,emit,tick,{comments=true,utf16=true}={}) {
       if(!startsObjectMember(text,at+1))continue;
       tick();
       const limit=Math.min(text.length,at+65536);
-      let depth=0,closed=false;
+      let depth=0;
       pieces.lastIndex=at;
-      for(let piece=pieces.exec(text);piece&&pieces.lastIndex<=limit;piece=pieces.exec(text)) {
+      for(let piece=pieces.exec(text);piece;piece=pieces.exec(text)) {
+        if(pieces.lastIndex>limit)tick();
         if(piece[0]==='{')depth++;
-        else if(piece[0]==='}'&&--depth===0) {emit(Buffer.from(text.slice(at,pieces.lastIndex)),{expand:false});closed=true;break;}
+        else if(piece[0]==='}'&&--depth===0) {
+          // A candidate longer than the bound is never silently skipped: fail closed.
+          if(pieces.lastIndex>limit)throw EXHAUSTED;
+          emit(Buffer.from(text.slice(at,pieces.lastIndex)),{expand:false});
+          depth=-1;break;
+        }
       }
-      // A candidate longer than the bound is never silently skipped: fail closed.
-      if(!closed&&at+65536<text.length)throw EXHAUSTED;
+      // Never closes and extends past the bound: fail closed unless no signal that could build or hide the member
+      // name `kty` (literal, escape, computed/spread member, string concatenation) occurs at or after the brace.
+      if(depth>=0&&at+65536<text.length&&lastSig>=at)throw EXHAUSTED;
     }
   }
   // Decimal/signed/0x byte arrays: comments are whitespace, never squeezed into numbers.
