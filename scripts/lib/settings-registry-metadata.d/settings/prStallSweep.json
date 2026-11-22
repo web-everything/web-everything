@@ -1,0 +1,6 @@
+{
+  "description": "Stalled PR recovery modes, cadence and action limits.",
+  "owner": "scripts/settings/pr-stall-sweep.json",
+  "changeVia": "pr",
+  "instant": false
+}

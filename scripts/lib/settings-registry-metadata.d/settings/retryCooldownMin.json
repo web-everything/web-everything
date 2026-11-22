@@ -1,0 +1,6 @@
+{
+  "description": "Cooldown in minutes between missing red-team recovery attempts.",
+  "owner": "scripts/settings/review-red-team-on-skip.json",
+  "changeVia": "pr",
+  "instant": false
+}

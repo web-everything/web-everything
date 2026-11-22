@@ -1,0 +1,6 @@
+{
+  "description": "Documentation of V8 old-space memory caps.",
+  "owner": "scripts/settings/node-heap-cap.json",
+  "changeVia": "pr",
+  "instant": false
+}

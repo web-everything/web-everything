@@ -1,0 +1,6 @@
+{
+  "description": "Build queue priority enforcement and request ordering within a class.",
+  "owner": "scripts/settings/build-queue-priority.json",
+  "changeVia": "pr",
+  "instant": false
+}

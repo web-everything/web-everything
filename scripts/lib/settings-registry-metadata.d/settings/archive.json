@@ -1,0 +1,6 @@
+{
+  "description": "Archive retention and bounded archive batch policy.",
+  "owner": "scripts/settings/archive-retention.json",
+  "changeVia": "pr",
+  "instant": false
+}

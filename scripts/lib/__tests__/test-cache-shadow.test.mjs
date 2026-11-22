@@ -27,14 +27,15 @@ const pass = (n = 2) => ({ type: 'suite', result: { state: 'pass', duration: 40 
 const failing = (message) => ({ type: 'suite', result: { state: 'fail', duration: 9 }, tasks: [{ type: 'test', mode: 'run', result: { state: 'fail', errors: [{ message }] } }] });
 const row = { file: 'a.test.mjs', key: 'ab'.repeat(32), cacheable: true, tier: 'pure', reason: null };
 const run = { runId: 'r1', lane: 'lane-9', baseSha: 'abc', storeAllowed: true, now: '2026-10-07T00:00:00Z' };
+const trace = { denies: [], tracedMap: {}, admitted: true, cleanRuns: 3 };
 const stored = { outcome: 'pass', passed: 2, skipped: 0, durationMs: 40 };
 
 describe('prepare-124 S2 — decideShadow', () => {
   it('records a miss, stores a full pass, and would-skip on the next run', () => {
-    const first = decideShadow({ row, summary: summarizeFile(pass()), stored: null, quarantined: false, run });
+    const first = decideShadow({ trace, row, summary: summarizeFile(pass()), stored: null, quarantined: false, run });
     expect(first.record).toMatchObject({ wouldSkip: false, reason: 'no-entry', outcome: 'pass', falseSkip: null });
     expect(first.store).toMatchObject({ outcome: 'pass', passed: 2 });
-    const second = decideShadow({ row, summary: summarizeFile(pass()), stored: first.store, quarantined: false, run });
+    const second = decideShadow({ trace, row, summary: summarizeFile(pass()), stored: first.store, quarantined: false, run });
     expect(second.record).toMatchObject({ wouldSkip: true, reason: 'hit', falseSkip: null, storedDurationMs: 40 });
   });
 
@@ -46,20 +47,30 @@ describe('prepare-124 S2 — decideShadow', () => {
       [pass(3), 'count-changed'],
     ];
     for (const [file, category] of cases) {
-      const d = decideShadow({ row, summary: summarizeFile(file), stored, quarantined: false, run });
+      const d = decideShadow({ trace, row, summary: summarizeFile(file), stored, quarantined: false, run });
       expect(d.record.falseSkip, category).toBe(category);
       expect(d.quarantine).toEqual({ category });
       expect(d.store).toBeNull();
     }
   });
 
+  it.each([null, stored, { ...stored, traced: { 'repo:fixture.json': 'old-hash' } }])(
+    'without tracing, refuses hits and preserves stored dependencies: %j', previous => {
+      const before = JSON.stringify(previous);
+      const result = decideShadow({ row, summary: summarizeFile(pass()), stored: previous, quarantined: false, run });
+      expect(result.record).toMatchObject({ reason: 'no-trace', wouldSkip: false, falseSkip: null });
+      expect(result.store).toBeNull();
+      expect(result.quarantine).toBeNull();
+      expect(JSON.stringify(previous)).toBe(before);
+    });
+
   it('never stores failures, uncacheable files, quarantined files, only-runs or filtered runs', () => {
     const only = { ...pass(), tasks: [{ type: 'test', mode: 'only', result: { state: 'pass' } }] };
-    expect(decideShadow({ row, summary: summarizeFile(failing('x')), stored: null, quarantined: false, run }).store).toBeNull();
-    expect(decideShadow({ row: { ...row, cacheable: false, key: null, reason: 'network' }, summary: summarizeFile(pass()), stored: null, quarantined: false, run }).record.reason).toBe('not-cacheable: network');
-    expect(decideShadow({ row, summary: summarizeFile(pass()), stored, quarantined: true, run }).record.reason).toBe('quarantined');
-    expect(decideShadow({ row, summary: summarizeFile(only), stored: null, quarantined: false, run }).store).toBeNull();
-    expect(decideShadow({ row, summary: summarizeFile(pass()), stored: null, quarantined: false, run: { ...run, storeAllowed: false } }).store).toBeNull();
+    expect(decideShadow({ trace, row, summary: summarizeFile(failing('x')), stored: null, quarantined: false, run }).store).toBeNull();
+    expect(decideShadow({ trace, row: { ...row, cacheable: false, key: null, reason: 'network' }, summary: summarizeFile(pass()), stored: null, quarantined: false, run }).record.reason).toBe('not-cacheable: network');
+    expect(decideShadow({ trace, row, summary: summarizeFile(pass()), stored, quarantined: true, run }).record.reason).toBe('quarantined');
+    expect(decideShadow({ trace, row, summary: summarizeFile(only), stored: null, quarantined: false, run }).store).toBeNull();
+    expect(decideShadow({ trace, row, summary: summarizeFile(pass()), stored: null, quarantined: false, run: { ...run, storeAllowed: false } }).store).toBeNull();
     expect(storeAllowedForRun({ testNamePattern: 'x' })).toBe(false);
     expect(storeAllowedForRun({ shard: '1/4' })).toBe(false);
     expect(storeAllowedForRun({ runErrors: [new Error('x')] })).toBe(false);
@@ -102,17 +113,18 @@ describe('prepare-124 S2 — reporter', () => {
     expect(readdirSync(dir)).toEqual([]);
   });
 
-  it('writes an entry on the first run and logs would-skip on the second, then a false-skip when it fails', () => {
+  it('with tracing off, logs misses without storing unchecked entries or quarantining failures', () => {
     const dir = tmp();
     const root = process.cwd();
     const name = 'scripts/test-cache/__tests__/seeded-unkeyed-input.test.mjs';
     finish(new ShadowReporter({ env: {}, dir }), root, [{ name, file: pass() }]);
-    expect(cacheable(dir)).toBe(1);
+    expect(cacheable(dir)).toBe(0);
     finish(new ShadowReporter({ env: {}, dir }), root, [{ name, file: pass() }]);
     finish(new ShadowReporter({ env: {}, dir }), root, [{ name, file: failing('boom') }]);
     const logs = readdirSync(join(dir, 'shadow')).flatMap((d) => readdirSync(join(dir, 'shadow', d)).map((f) => JSON.parse(readFileSync(join(dir, 'shadow', d, f), 'utf8').trim())));
-    expect(logs.map((l) => [l.wouldSkip, l.falseSkip]).sort()).toEqual([[false, null], [true, 'assertion'], [true, null]].sort());
-    expect(isQuarantined(dir, name)).toBe(true);
+    expect(logs).toHaveLength(3);
+    expect(logs.every(l => !l.wouldSkip && l.reason === 'no-trace' && l.falseSkip === null)).toBe(true);
+    expect(isQuarantined(dir, name)).toBe(false);
   });
 
   it('names a lane from its checkout path', () => {

@@ -1,0 +1,6 @@
+{
+  "description": "Allow a fresh operator CLI fallback.",
+  "owner": "scripts/settings/operator-cli.json",
+  "changeVia": "pr",
+  "instant": false
+}

@@ -1,0 +1,6 @@
+{
+  "description": "Main-red dispatch freeze policy.",
+  "owner": "scripts/dispatch-settings.json",
+  "changeVia": "pr",
+  "instant": false
+}
