@@ -1149,6 +1149,7 @@ Every finding requires a non-empty file and positive integer line, and all findi
 non-error `read_file` of a diff path in the served transcript; summary phrases do not prove inspection.
 An observed matching served model, no timeout (including salvaged answers), and a successful ledger
 append remain required. Any missing or invalid evidence falls back to Claude.
+A promoted Carbon accept always runs the Claude correctness seat and needs its corroborating accept; Carbon blocking findings still count directly.
 The pure `assertCrossVendorPanel` helper retains its existing cross-vendor check.
 
 The agy mandatory-seat shadows are off by default (operator 2026-10-16).

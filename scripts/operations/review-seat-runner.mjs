@@ -1,5 +1,5 @@
 import { readFileSync } from 'node:fs';
-import { scopeFindingsToCitedFiles } from '../lib/jury-core.mjs';
+import { scopeFindingsToCitedFiles, deriveVerdict } from '../lib/jury-core.mjs';
 import { carbonNonShadowAllowed } from '../lib/review-seat-settings.mjs';
 /**
  * review-seat-runner.mjs — RUN ONE REVIEW SEAT ON THE PROVIDER ITS SETTING NAMES (card 84, review half).
@@ -200,6 +200,14 @@ export async function runSeatWithProvider(request, {
     }
   }
   if (agyRun.status === 'ok' && agyRun.sessionId) {
+    // Carbon may send back directly, but can never clear correctness without an independent Claude answer.
+    if (promoted && deriveVerdict(agyRun.value) === 'accept') {
+      logReviewSeat(log, 'review-seat: promoted Carbon accept requires Claude correctness corroboration');
+      const claude = unwrap(await claudeJudge(plain));
+      return wrap({ ...claude.value, seatProvider: { provider: 'claude',
+        carbonAccept: { provider: 'agy', model, sessionId: agyRun.sessionId },
+      } }, claude.telemetry);
+    }
     const t = agyRun.telemetry ?? {};
     return wrap(
       { ...agyRun.value, seatProvider: { provider: 'agy', model, sessionId: agyRun.sessionId } },

@@ -716,14 +716,14 @@ describe('promotion verdict authorization audit', () => {
     return validateRoutingPolicy(policy);
   };
   const selection = policy => loadReviewSeatSettings({ policy, aiRouting: {}, log: () => {} });
-  async function attempt(result = good, { lens = 'correctness', promoted = true, policy = DEFAULT_ROUTING_POLICY, append = () => true, scope = [finding.file], transcript = servedReadTrace(finding.file) } = {}) {
+  async function attempt(result = good, { lens = 'correctness', promoted = true, policy = DEFAULT_ROUTING_POLICY, append = () => true, scope = [finding.file], transcript = servedReadTrace(finding.file), claude = claudeAnswer } = {}) {
     vi.stubEnv('WE_REVIEW_SHADOW_AGY_PROMOTED', 'true');
     const rows = [], calls = [];
     const answer = await runSeatWithProvider({ lens, runId: 'audit', shape: REVIEW_JUDGE_SHAPE, seatProvider: {
       mode: 'agy', promoted, model: carbon, onEscape: 'claude', repo: 'o/r', pr: 7, head: 'a'.repeat(40), citationScope: scope,
     } }, {
       cwd: '.', unwrap: x => x, wrap: value => value,
-      claudeJudge: async () => { calls.push('claude'); return { value: claudeAnswer }; },
+      claudeJudge: async () => { calls.push('claude'); if (claude instanceof Error) throw claude; return { value: claude }; },
       agyJuror: async () => { calls.push('carbon'); return result; }, readTranscript: () => transcript,
       readRoutingPolicy: () => policy, readSeatSettings: () => ({ tool: {}, platform: {} }),
       appendPromotion: row => { rows.push(row); return append(row); }, reserveSession: () => ({ allowed: true }), log: () => {},
@@ -825,9 +825,10 @@ describe('promotion verdict authorization audit', () => {
     fellBack(await attempt({ ...good, transcriptFile: 'served.jsonl', value: { summary: 'Clean', findings: [] } }, { transcript }));
   });
   it('zero findings can count only with a served successful read_file of a diff path', async () => {
-    const result = await attempt({ ...good, transcriptFile: 'served.jsonl', value: { summary: 'Clean', findings: [] } }, { transcript: readTrace(finding.file) });
-    expect(result.calls).toEqual(['carbon']);
-    expect(result.answer.seatProvider.provider).toBe('agy');
+    const result = await attempt({ ...good, transcriptFile: 'served.jsonl', value: { summary: 'Clean', findings: [] } }, { transcript: readTrace(finding.file), claude: claudeClean });
+    expect(result.calls).toEqual(['carbon', 'claude']);
+    expect(deriveVerdict(result.answer)).toBe('accept');
+    expect(result.answer.seatProvider.provider).toBe('claude');
   });
 
   it('schema-valid nonblocking placeholder with file and line but no reads falls back to Claude', async () => {
@@ -851,9 +852,10 @@ describe('promotion verdict authorization audit', () => {
 
   it.each(['./src/config.json', '/lane/src/config.json', '/lane/src/../src/config.json', 'src\\config.json'])('exact repo-relative successful reads admit a counted answer: %s', async path => {
     const result = await attempt({ ...good, value: { summary: 'Clean', findings: [] } }, {
-      scope: ['src/config.json'], transcript: readTrace(path),
+      scope: ['src/config.json'], transcript: readTrace(path), claude: claudeClean,
     });
-    expect(result.calls).toEqual(['carbon']);
+    expect(result.calls).toEqual(['carbon', 'claude']);
+    expect(deriveVerdict(result.answer)).toBe('accept');
   });
   it.each(['/lane/config.json', '/other/src/config.json', 'src/../config.json'])('a normalized read outside the exact scoped path runs Claude: %s', async path => {
     fellBack(await attempt({ ...good, value: { summary: 'Clean', findings: [] } }, {
@@ -891,9 +893,47 @@ describe('promotion verdict authorization audit', () => {
   });
   it('whole-file reads of every changed file at the reviewed HEAD allow a clean Carbon answer', async () => {
     const result = await attempt({ ...good, checkoutHead: 'a'.repeat(40), value: { summary: 'Clean', findings: [] } }, {
-      scope: [finding.file, 'scripts/second.mjs'], transcript: twoFileReads(),
+      scope: [finding.file, 'scripts/second.mjs'], transcript: twoFileReads(), claude: claudeClean,
     });
+    expect(result.calls).toEqual(['carbon', 'claude']);
+    expect(deriveVerdict(result.answer)).toBe('accept');
+  });
+
+  const carbonClean = { ...good, value: { summary: 'Carbon clean', findings: [] } };
+  const claudeClean = { summary: 'Claude inspected the diff and accepts', findings: [] };
+  it('Carbon accept alone never accepts without running the Claude correctness seat', async () => {
+    const result = await attempt(carbonClean);
+    expect(result.calls).toEqual(['carbon', 'claude']);
+    expect(deriveVerdict(result.answer)).toBe('changes');
+  });
+  it('nonblocking Carbon finding after one line of one file in a two-file diff still requires Claude', async () => {
+    const probe = { ...good, value: { summary: 'Carbon accepts', findings: [{ ...finding, disposition: 'nit', impactIfUnfixed: 'cosmetic', introduced: false, worseThanBase: false, parallelizable: true }] } };
+    expect(deriveVerdict(probe.value)).toBe('accept');
+    const result = await attempt(probe, {
+      scope: [finding.file, 'scripts/second.mjs'],
+      transcript: readTrace(finding.file, 'DONE', { tool_info: { parameters: { AbsolutePath: finding.file, start_line: 1, end_line: 1 } } }),
+    });
+    expect(result.calls).toEqual(['carbon', 'claude']);
+    expect(deriveVerdict(result.answer)).toBe('changes');
+  });
+  it('Carbon blocking findings still count directly and yield a send-back', async () => {
+    const result = await attempt(good);
     expect(result.calls).toEqual(['carbon']);
+    expect(deriveVerdict(result.answer)).toBe('changes');
+    expect(result.answer.seatProvider.provider).toBe('agy');
+  });
+  it('Carbon accept plus Claude accept yields accept', async () => {
+    const result = await attempt(carbonClean, { claude: claudeClean });
+    expect(result.calls).toEqual(['carbon', 'claude']);
+    expect(deriveVerdict(result.answer)).toBe('accept');
+  });
+  it('Carbon accept plus Claude send-back yields send-back', async () => {
+    const result = await attempt(carbonClean, { claude: claudeAnswer });
+    expect(result.calls).toEqual(['carbon', 'claude']);
+    expect(deriveVerdict(result.answer)).toBe('changes');
+  });
+  it('Carbon accept never clears the lens when Claude fails to answer', async () => {
+    await expect(attempt(carbonClean, { claude: new Error('Claude unavailable') })).rejects.toThrow('Claude unavailable');
   });
 
 });
