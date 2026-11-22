@@ -22,6 +22,9 @@ import { DISPATCHED_AGENT_SYSTEM_PROMPT_FILE, dispatchSessionCwd } from '../../o
 import { buildAuthorActorMarker } from '../../lib/review-independence.mjs';
 import { recoverOwedFixes } from '../owed-fix-recovery.mjs';
 import { planReconcile } from '../reconcile-core.mjs';
+import { isClaimRunnerDead } from '../../lib/dispatch-throttle.mjs';
+import { releaseFixDispatchClaim } from '../fix-dispatch-claim.mjs';
+import { planClaudeAuthDispatchGate } from '../claude-auth-health.mjs';
 import { buildStandDownComment } from '../stand-down.mjs';
 
 describe('owed fix recovery', () => {
@@ -36,11 +39,92 @@ describe('owed fix recovery', () => {
     const io = { plan: planReconcile, readHead: () => head, readClaims: () => claims,
       transact: (key, fn) => fn(states.get(key) ?? {}, next => { states.set(key, structuredClone(next)); }),
       releaseClaim: effects.release, publish: effects.attention, appendUpdate: effects.update,
-      authGate: () => ({ paused: false }) };
+      authGate: () => ({ paused: false }), runnerDead: () => false,
+      awaitingVerifyFor: () => ({ awaiting: false }) };
     const tick = (now = start, overrides = {}) => recoverOwedFixes({ repo: 'we', prs: [pr], agents: [],
       requiredChecks: ['test'], roundCap: 3, roundCapAction: 'person', now, ...overrides }, io);
-    return { tick, io, effects, pr, setClaims: value => { claims = value; } };
+    return { tick, io, effects, pr, setClaims: value => { claims = value.map(claim => ({ heartbeatAt: new Date(start).toISOString(), ...claim })); } };
   }
+  const staleClaim = (meta = {}) => ({ owner: 'holder', heartbeatAt: new Date(start).toISOString(),
+    meta: { repo: 'we', pr: 7307, kind: 'fix', headSha: head,
+      claimedAt: new Date(start).toISOString(), ...meta } });
+  it.each(['alive', 'unknown'])('retains a %s runner without a session row', verdict => {
+    const f = fixture();
+    f.setClaims([staleClaim({ runnerPid: 123 })]);
+    f.io.runnerDead = vi.fn(claim => isClaimRunnerDead(claim,
+      () => verdict === 'alive' ? true : null, () => ({ alive: verdict === 'alive' ? true : null })));
+    expect(f.tick(start + 60 * minute).dispatch).toHaveLength(0);
+    expect(f.io.runnerDead).toHaveBeenCalled();
+    expect(f.effects.release).not.toHaveBeenCalled();
+  });
+  it('retains a fresh heartbeat despite an old claim and absent session', () => {
+    const f = fixture();
+    f.setClaims([{ ...staleClaim(), heartbeatAt: new Date(start + 59 * minute).toISOString() }]);
+    expect(f.tick(start + 60 * minute).dispatch).toHaveLength(0);
+    expect(f.effects.release).not.toHaveBeenCalled();
+  });
+  it.each(['awaiting', 'idle observation', 'idle with activity', 'idle policy disabled'])('retains %s protection beyond claim age', protection => {
+    const f = fixture();
+    f.setClaims([staleClaim(protection === 'idle observation' ? { idleHead: { sha: head } } : {})]);
+    if (protection === 'awaiting') f.io.awaitingVerifyFor = () => ({ awaiting: true });
+    const agents = protection.startsWith('idle ') && protection !== 'idle observation'
+      ? [{ name: 'fix-7307', state: 'idle', hung: true, sessionId: 'current' }] : [];
+    if (protection === 'idle policy disabled') vi.stubEnv('WE_IDLE_CLAIM_RELEASE_ENABLED', '0');
+    try {
+      expect(f.tick(start + 60 * minute, { agents }).dispatch).toHaveLength(0);
+      expect(f.effects.release).not.toHaveBeenCalled();
+    } finally { vi.unstubAllEnvs(); }
+  });
+  it('records the initial claimless attempt so listing lag cannot launch every tick', () => {
+    const f = fixture();
+    expect(f.tick().dispatch).toHaveLength(1);
+    expect(f.tick(start + minute).dispatch).toHaveLength(0);
+    expect(f.tick(start + 29 * minute).dispatch).toHaveLength(0);
+    expect(f.tick(start + 30 * minute).dispatch).toHaveLength(1);
+    expect(f.tick(start + 31 * minute).dispatch).toHaveLength(0);
+  });
+  it('requires a positive login probe even when health and transcript reads supply no signal', () => {
+    const f = fixture(), probe = vi.fn(() => false);
+    f.io.authGate = options => planClaudeAuthDispatchGate({ ...options,
+      health: () => ({ broken: false, source: 'no-signal' }), probe, readMaintenance: () => null });
+    expect(f.tick().dispatch).toHaveLength(0);
+    expect(probe).toHaveBeenCalledTimes(1);
+    probe.mockReturnValue(true);
+    expect(f.tick().dispatch).toHaveLength(1);
+  });
+  it('keeps eligibility shadow evidence on the claim-free recovered plan', () => {
+    const f = fixture({ fixClaim: { who: 'fix-7307' } }), appendLine = vi.fn();
+    f.setClaims([staleClaim({ kind: 'fixing', who: 'fix-7307' })]);
+    expect(f.tick(start + 60 * minute, { shadowDeps: { mode: 'shadow', appendLine,
+      readLocals: () => undefined } }).dispatch).toHaveLength(1);
+    expect(appendLine).toHaveBeenCalled();
+    expect(JSON.parse(appendLine.mock.calls[0][0])).toMatchObject({ pr: 7307, pathId: 'reconcile-core' });
+  });
+  it('accepts production open-PR rows which omit state', () => {
+    const f = fixture(); delete f.pr.state;
+    expect(f.tick().dispatch).toHaveLength(1);
+  });
+  it.each(['owner', 'claimedAt', 'runnerPid', 'headSha', 'heartbeatAt'])('conditional release retains a concurrently changed %s', async field => {
+    const { mkdtempSync, mkdirSync, writeFileSync, rmSync } = await import('node:fs');
+    const { join } = await import('node:path');
+    const { tmpdir } = await import('node:os');
+    const { lockDirFor } = await import('../../readiness/file-locks.mjs');
+    const { fixDispatchResource } = await import('../fix-claim-store.mjs');
+    const root = mkdtempSync(join(tmpdir(), 'owed-claim-race-'));
+    try {
+      const expected = staleClaim(), replacement = structuredClone(expected);
+      if (field === 'owner') replacement.owner = 'new-holder';
+      else if (field === 'heartbeatAt') replacement.heartbeatAt = new Date(start + minute).toISOString();
+      else replacement.meta[field] = field === 'runnerPid' ? 123 : 'replaced';
+      const dir = lockDirFor(root, fixDispatchResource({ repo: 'we', pr: 7307, kind: 'fix' }));
+      mkdirSync(dir, { recursive: true });
+      writeFileSync(join(dir, 'lock.json'), JSON.stringify(replacement));
+      expect(releaseFixDispatchClaim({ repo: 'we', pr: 7307, kind: 'fix', owner: expected.owner,
+        expected, lockRoot: root }).released).toBe(false);
+      const { readFixDispatchClaim } = await import('../fix-claim-store.mjs');
+      expect(readFixDispatchClaim({ repo: 'we', pr: 7307, kind: 'fix', lockRoot: root })).toMatchObject(replacement);
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  });
   it('fix owed >=30 min with no live fixer session is re-dispatched once, then escalated', () => {
     const f = fixture();
     expect(f.tick().dispatch).toHaveLength(1);
@@ -59,6 +143,10 @@ describe('owed fix recovery', () => {
     expect(f.tick(start + 29 * minute).dispatch).toHaveLength(0);
     expect(f.tick(start + 30 * minute).dispatch).toHaveLength(1);
     expect(f.effects.release).toHaveBeenCalledTimes(1);
+    expect(f.effects.release).toHaveBeenCalledWith(expect.objectContaining({
+      owner: 'holder', expected: expect.objectContaining({ owner: 'holder',
+        meta: expect.objectContaining({ claimedAt: new Date(start).toISOString() }) }),
+    }));
     const absent = fixture({ fixClaim: { who: 'fix-7307', claimedAt: new Date(start).toISOString() } });
     expect(absent.tick(start + 60 * minute).dispatch).toHaveLength(0);
     expect(absent.effects.release).not.toHaveBeenCalled();
@@ -86,7 +174,9 @@ describe('owed fix recovery', () => {
     expect(f.effects.release).not.toHaveBeenCalled();
   });
   it.each(['b'.repeat(40), 'aaaaaaa', head + '\n'])('refuses a moved or non-exact 40-hex head %s', observed => {
-    const f = fixture(); f.tick(); f.io.readHead = () => observed;
+    const f = fixture(); f.tick();
+    if (observed !== 'b'.repeat(40)) f.pr.headRefOid = observed;
+    f.io.readHead = () => observed;
     expect(f.tick(start + 30 * minute).dispatch).toHaveLength(0);
     expect(f.effects.release).not.toHaveBeenCalled();
   });
@@ -155,11 +245,21 @@ describe('owed fix recovery', () => {
     expect(f.tick(start + 60 * minute).dispatch).toHaveLength(1);
     expect(f.effects.attention).not.toHaveBeenCalled();
   });
-  it('live head reads are bounded with an explicit next-tick/operator fallback', () => {
+  it('live head reads are bounded and deferred initial attempts dispatch next tick', () => {
     const f = fixture();
     f.io.readHead = vi.fn(() => head);
     const prs = Array.from({ length: 10 }, (_, i) => ({ ...f.pr, number: 7307 + i }));
-    f.tick(start, { prs });
+    const initial = f.tick(start, { prs });
+    expect(initial.dispatch).toHaveLength(8);
+    expect(initial.refusals.filter(row => /budget exhausted.*operator/.test(row.why))).toHaveLength(2);
+    expect(f.io.readHead.mock.calls.length).toBeLessThanOrEqual(8);
+    f.io.readHead.mockClear();
+    const nextTick = f.tick(start + minute, { prs });
+    expect(nextTick.dispatch.map(row => row.prNumber)).toEqual([7315, 7316]);
+    expect(f.io.readHead.mock.calls.length).toBeLessThanOrEqual(8);
+    f.io.readHead.mockClear();
+    expect(f.tick(start + 2 * minute, { prs }).dispatch).toHaveLength(0);
+    f.io.readHead.mockClear();
     const out = f.tick(start + 30 * minute, { prs });
     expect(f.io.readHead.mock.calls.length).toBeLessThanOrEqual(8);
     expect(out.refusals.some(row => /budget exhausted.*operator/.test(row.why))).toBe(true);

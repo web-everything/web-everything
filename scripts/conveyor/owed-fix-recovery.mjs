@@ -7,9 +7,12 @@ import { withFileLock, writeJsonAtomic } from '../lib/atomic-json-file.mjs';
 import { handoffHome } from '../lib/handoff-path.mjs';
 import { resolveCoordinationRoot } from '../operations/coordination-root.mjs';
 import { publishAttention, appendLines } from '../operations/needs-you-feed.mjs';
-import { fixDispatchClaimRoot, fixDispatchResource } from './fix-claim-store.mjs';
-import { lockDirFor, parseLockEntry } from '../readiness/file-locks.mjs';
+import { fixDispatchClaimRoot, fixDispatchResource, fixDispatchSessionName,
+  DEFAULT_FIX_DISPATCH_CLAIM_TTL_MINUTES } from './fix-claim-store.mjs';
+import { lockDirFor, parseLockEntry, isLeaseExpired } from '../readiness/file-locks.mjs';
 import { isClaimSessionLive, releaseFixDispatchClaim, readPrHead } from './fix-dispatch-claim.mjs';
+import { makeAwaitingVerifyResolver } from './await-verify.mjs';
+import { isClaimRunnerDead } from '../lib/dispatch-throttle.mjs';
 import { planClaudeAuthDispatchGate } from './claude-auth-health.mjs';
 import { ghRepoSlug } from '../lib/constellation-repos.mjs';
 
@@ -70,7 +73,8 @@ export function recoverOwedFixes(input, {
   plan, readHead = readPrHead, readClaims = readRecoveryClaims,
   transact = recoveryTransaction, releaseClaim = releaseFixDispatchClaim,
   publish = publishAttention, appendUpdate = appendRecoveryUpdate,
-  authGate = planClaudeAuthDispatchGate, kinds = ['fix', 'ci-heal'],
+  authGate = planClaudeAuthDispatchGate, runnerDead = isClaimRunnerDead,
+  awaitingVerifyFor = makeAwaitingVerifyResolver({ now: () => input.now }), kinds = ['fix', 'ci-heal'],
 } = {}) {
   const empty = { dispatch: [], refusals: [], notes: [] };
   const refuse = (out, prNumber, why) => {
@@ -83,21 +87,20 @@ export function recoverOwedFixes(input, {
     return { ...empty, refusals: [{ kind: 'owed-fix-evidence-unknown', why: 'liveness unreadable; repair the session inventory before retrying' }] };
   }
   try {
-    if (authGate({ listAgents: () => input.agents, now: input.now })?.paused !== false) throw new Error('auth paused or unknown; restore login before retrying');
+    if (authGate({ listAgents: () => input.agents, now: input.now, requireLogin: true })?.paused !== false) throw new Error('auth paused or unknown; restore login before retrying');
   } catch {
     return { ...empty, refusals: [{ kind: 'owed-fix-auth-paused', why: 'auth paused or unknown; restore login before retrying' }] };
   }
   const out = plan(input);
   // A draft can produce promote-draft rather than a repair row; operator parks hold that too.
-  const operatorParked = pr => pr.state !== 'OPEN' || pr.isDraft || (pr.referralHold
+  const operatorParked = pr => (pr.state != null && pr.state !== 'OPEN') || pr.isDraft || (pr.referralHold
     && pr.referralHold.kind !== 'same-head' && pr.referralHoldAutoResolve?.outcome !== 'send-back');
   for (const pr of input.prs.filter(operatorParked)) {
     out.dispatch = out.dispatch.filter(row => row.prNumber !== pr.number);
     out.refusals.push({ kind: 'owed-fix-operator-park', prNumber: pr.number, why: 'operator park; waiting for operator release' });
   }
   // Re-run the SAME policy with only the claim hold removed. This does not bypass any other refusal.
-  const eligible = plan({ ...input, prs: input.prs.map(pr => ({ ...pr, fixClaim: null })),
-    shadowDeps: { mode: 'off', appendLine: () => {}, readLocals: () => undefined } });
+  const eligible = plan({ ...input, prs: input.prs.map(pr => ({ ...pr, fixClaim: null })) });
   let headReads = 0;
   const checkHead = (identity, head) => {
     if (++headReads > MAX_HEAD_READS) throw new Error('live-head budget exhausted; retry next tick, operator may inspect PR now');
@@ -119,6 +122,28 @@ export function recoverOwedFixes(input, {
           || !['fixing', 'fix', 'ci-heal'].includes(claim.meta.kind) || claim.meta.headSha !== head
           || !Number.isFinite(Date.parse(claim.meta.claimedAt))) throw new Error('claim identity/head/age unknown; inspect claim store');
       }
+      for (const claim of claims) {
+        if (!Number.isFinite(Date.parse(claim.heartbeatAt))
+          || !isLeaseExpired(claim, input.now, DEFAULT_FIX_DISPATCH_CLAIM_TTL_MINUTES)) {
+          throw new Error('claim heartbeat fresh or unknown; wait for the claim sweep or inspect claim store');
+        }
+        if (claim.meta.runnerPid != null && runnerDead(claim) !== true) {
+          throw new Error('claim runner alive or unknown; wait for its completion');
+        }
+        const name = claim.meta.who || fixDispatchSessionName({ ...identity, kind: claim.meta.kind });
+        const sessions = input.agents.filter(agent => agent.name === name
+          || (claim.meta.sessionId && [agent.id, agent.sessionId].includes(claim.meta.sessionId)));
+        // Also consult persisted verification by session/name when the listing has lost the row.
+        const holder = { name, sessionId: claim.meta.sessionId, cwd: claim.meta.cwd ?? '' };
+        if ([holder, ...sessions].some(session => awaitingVerifyFor(session, { pr: row.prNumber })?.awaiting === true)) {
+          throw new Error('claim awaiting verification; wait for verification to finish');
+        }
+        // The shared refresh sweep owns observed idleness, transcript/subagent activity and policy.
+        // Recovery never substitutes claim age for that observation window, even for hung idle rows.
+        if (claim.meta.idleHead || sessions.some(session => session.state === 'idle')) {
+          throw new Error('claim idle observation protected; wait for the claim sweep or inspect idle-release policy');
+        }
+      }
       const live = ['fix', 'ci-heal'].some(kind => isClaimSessionLive({ ...identity, kind, agentsAll: input.agents }))
         || claims.some(claim => isClaimSessionLive({ ...identity, kind: claim.meta.kind,
           name: claim.meta.who || null, agentsAll: input.agents })
@@ -128,7 +153,10 @@ export function recoverOwedFixes(input, {
       const key = `${input.repo}:${row.prNumber}:${head}`;
       const allow = transact(key, (stored, save) => {
         const state = { ...stored };
-        if (state.since === undefined) {
+        const firstObservation = state.since === undefined;
+        if (firstObservation) {
+          // A deferred head probe must leave the initial attempt available next tick.
+          if (!pr.fixClaim && claims.length === 0) checkHead(identity, head);
           state.since = Math.min(input.now, ...claims.map(claim => Date.parse(claim.meta.claimedAt)));
           save(state);
         }
@@ -136,7 +164,11 @@ export function recoverOwedFixes(input, {
         // never authorizes releasing a newly acquired claim before its own full grace expires.
         if (claims.some(claim => input.now - Date.parse(claim.meta.claimedAt) < WINDOW_MS)) return false;
         if (state.retryAt !== undefined && input.now - state.retryAt < WINDOW_MS) return false;
-        if (state.retryAt === undefined && input.now - state.since < WINDOW_MS) return !pr.fixClaim;
+        if (state.retryAt === undefined && input.now - state.since < WINDOW_MS) {
+          // Persisted since already reserves the initial attempt, including legacy episodes.
+          if (!firstObservation || pr.fixClaim || claims.length) return false;
+          return true;
+        }
         if (state.attention && state.update) return false;
         // One tick shares this small live-head budget. Deferred entries explicitly retry next tick.
         checkHead(identity, head);
@@ -159,7 +191,7 @@ export function recoverOwedFixes(input, {
         state.retryAt = input.now; save(state);
         if (JSON.stringify(readClaims(identity)) !== JSON.stringify(claims)) throw new Error('claim changed; inspect holder before retrying');
         for (const claim of claims) {
-          if (releaseClaim({ ...identity, kind: claim.meta.kind, owner: claim.owner })?.released !== true) {
+          if (releaseClaim({ ...identity, kind: claim.meta.kind, owner: claim.owner, expected: claim })?.released !== true) {
             throw new Error('claim release failed; inspect claim store');
           }
         }
