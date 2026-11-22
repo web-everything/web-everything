@@ -212,6 +212,7 @@ function canonicalize(bytes,emit,tick,{comments=true,utf16=true}={}) {
   // Any escape can hide the key type: stringValue also supports identity escapes and line continuations.
   if(/kty|\\/i.test(text)) {
     const pieces=/"(?:\\[\s\S]|[^"\\])*"|'(?:\\[\s\S]|[^'\\])*'|\/\/[^\r\n\u2028\u2029]*|\/\*[\s\S]*?(?:\*\/|$)|[{}]/g;
+    const lastMarker=Math.max(text.lastIndexOf('kty'),text.lastIndexOf('\\'));
     for(let at=text.indexOf('{');at!==-1;at=text.indexOf('{',at+1)) {
       // A brace the pass above already treated as a container opener is detected there; only the rest (hidden by
       // quote pairing or rejected as prose) needs its own candidate, which keeps ordinary large JSON linear.
@@ -227,8 +228,11 @@ function canonicalize(bytes,emit,tick,{comments=true,utf16=true}={}) {
         if(piece[0]==='{')depth++;
         else if(piece[0]==='}'&&--depth===0) {emit(Buffer.from(text.slice(at,pieces.lastIndex)),{expand:false});closed=true;break;}
       }
-      // A candidate longer than the bound is never silently skipped: fail closed.
-      if(!closed&&at+65536<text.length)throw EXHAUSTED;
+      // A candidate longer than the bound is never silently skipped: scan its whole tail instead of exhausting.
+      // jwkFinding only reports an object that names `kty` (literally or through a backslash escape), so a tail
+      // with neither marker cannot hold a JWK: that skip is exact, not an exemption. Unclosed JSON-shaped prose
+      // (truncated table cells) no longer exhausts the budget; a real key beyond the bound is still found.
+      if(!closed&&at+65536<text.length&&lastMarker>=at)emit(Buffer.from(text.slice(at)),{expand:false});
     }
   }
   // Decimal/signed/0x byte arrays: comments are whitespace, never squeezed into numbers.
