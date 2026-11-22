@@ -147,3 +147,70 @@ it('unknown never advances and intents never claim a successful loaded guard', a
   expect(completed.transition.predicate.outcome).toBe('pass');
   expect(f.log.indexOf(intent)).toBeLessThan(f.log.indexOf(completed));
 });
+
+async function productionFixture() {
+  const { readers, data } = hotpatchFixture();
+  const transport = { ref: `${sha}\trefs/heads/hotpatch/${sha}`, refusal: false };
+  const exec = vi.fn((cmd, args) => {
+    if (cmd === 'git' && args[0] === 'rev-parse') return 'c'.repeat(40);
+    if (cmd === 'git' && args[0] === 'ls-remote') {
+      if (transport.ref instanceof Error) throw transport.ref;
+      return transport.ref;
+    }
+    if (cmd === 'node') {
+      if (transport.refusal) throw Error('prototype-load admission refused');
+      return JSON.stringify({ ok: true, registered: true });
+    }
+    throw Error(`Unexpected fixture child: ${cmd} ${args[0]}`);
+  });
+  const adapter = await productionAdapter({ env: { HOME: process.env.HOME }, exec,
+    authenticate: async () => ({ applied: true }),
+    originResolver: () => ({ repo: 'o/r', gh: () => ({ code: 0, stdout: JSON.stringify(pr) }) }) });
+  Object.assign(adapter.io.readers, readers);
+  return { adapter, data, transport, exec, run: { pr: 7, sha, daemon: 'review' } };
+}
+it('production load uses non-urgent SHA-bound prototype-load and propagates its admission refusal', async () => {
+  const f = await productionFixture();
+  f.transport.refusal = true;
+  await expect(f.adapter.perform(f.run, 'load')).rejects.toThrow(/admission refused/);
+  f.transport.refusal = false; await f.adapter.perform(f.run, 'load');
+  const calls = f.exec.mock.calls.filter(([cmd]) => cmd === 'node');
+  expect(calls).toHaveLength(2);
+  for (const [, args, opts] of calls) {
+    expect(args[0]).toMatch(/scripts\/operations\/run\.mjs$/);
+    expect(args.slice(1)).toEqual(['prototype-load', '--daemon=review', `--branch=hotpatch/${sha}`, `--sha=${sha}`, '--json']);
+    expect(opts).toEqual(expect.objectContaining({ timeout: expect.any(Number), maxBuffer: 2097152 }));
+  }
+});
+it('live rereads the canonical audit: a new WEAKENED verdict cannot pass', async () => {
+  const f = await productionFixture(); expect((await f.adapter.read(f.run, 'live')).outcome).toBe('pass');
+  f.data.audits[0].verdict = 'WEAKENED'; f.data.audits[0].findings = ['new security finding'];
+  expect((await f.adapter.read(f.run, 'live')).outcome).toBe('fail');
+});
+it.each(['moved', 'deleted', 'unreadable', 'malformed'])('live ref %s escalates and cannot authorize unload', async kind => {
+  const f = await productionFixture();
+  f.transport.ref = { moved: `${'d'.repeat(40)}\trefs/heads/hotpatch/${sha}`, deleted: '',
+    unreadable: Error('remote unavailable'), malformed: `${sha}\trefs/heads/other` }[kind];
+  expect(await f.adapter.read(f.run, 'live')).toEqual(expect.objectContaining({ outcome: 'unknown', escalate: true }));
+  await expect(f.adapter.perform(f.run, 'unload')).rejects.toThrow(/unload not authorized/);
+  expect(f.exec.mock.calls.some(([cmd]) => cmd === 'node')).toBe(false);
+  expect(f.exec.mock.calls.find(([cmd, args]) => cmd === 'git' && args[0] === 'ls-remote')[1])
+    .toEqual(['ls-remote', '--exit-code', 'origin', `refs/heads/hotpatch/${sha}`]);
+});
+it.each(['missing', 'unreadable'])('live canonical audit %s is unknown and cannot authorize unload', async kind => {
+  const f = await productionFixture();
+  if (kind === 'missing') f.data.audits = [];
+  else f.adapter.io.readers.audits = () => { throw Error('ledger unreadable'); };
+  expect(await f.adapter.read(f.run, 'live')).toEqual(expect.objectContaining({ outcome: 'unknown', escalate: true }));
+  await expect(f.adapter.perform(f.run, 'unload')).rejects.toThrow(/unload not authorized/);
+  expect(f.exec.mock.calls.some(([cmd]) => cmd === 'node')).toBe(false);
+});
+it('malformed terminal journal completion escalates before monitoring can stop', async () => {
+  const f = fixture(); await waiting(f); await f.runner.tick();
+  const runKey = f.log.find(r => r.phase === 'run').runKey;
+  f.log.push({ runKey, phase: 'done', transition: { predicate: { route: 'advance', to: 'refused' } } });
+  const before = f.log.length; await f.runner.tick();
+  expect(f.log.slice(before)).toEqual([expect.objectContaining({ phase: 'escalation' })]);
+  expect(f.io.remove).not.toHaveBeenCalled();
+  expect(() => f.runner.status(7)).toThrow();
+});

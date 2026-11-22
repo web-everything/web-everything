@@ -11,7 +11,12 @@ const key = (r, state) => `hp:${r.repo}#${r.pr}:${r.sha}:${r.daemon}:${state}`;
 export function createHotpatchRunner({ adapter: a, read, append }) {
   const rows = r => read().filter(v => v.runKey === key(r, 'run'));
   const records = r => rows(r).filter(v => v.phase === 'done').map(v => v.transition);
-  const state = r => records(r).reduce((s, v) => v.predicate.route === 'advance' ? v.predicate.to : s, 'intake');
+  const state = r => {
+    const history = records(r);
+    plan(flow, { flowDigest: flow.digest, seq: history.length, records: history,
+      repo: r.repo, pr: r.pr, head: r.sha, netDiff: r.netDiff });
+    return history.reduce((s, v) => v.predicate.route === 'advance' ? v.predicate.to : s, 'intake');
+  };
   const write = async (r, row) => append({ runKey: key(r, 'run'), ...row });
   const step = (r, outcome) => {
     const history = records(r);

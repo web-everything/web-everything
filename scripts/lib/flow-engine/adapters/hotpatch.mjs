@@ -1,4 +1,4 @@
-/** Effects remain outside FlowEngine; overlay add owns the admission decision. */
+/** Effects remain outside FlowEngine; prototype-load owns load admission. */
 import { execFileSync } from 'node:child_process';
 import fs from 'node:fs';
 import { resolve, dirname, join } from 'node:path';
@@ -55,7 +55,7 @@ export function createHotpatchAdapter(io) {
     if (step === 'audit') return io.audit(run); // Output is never evidence.
     if (step === 'load') {
       if ((await read(run, 'ready')).outcome !== 'pass') throw Error('readiness changed; escalate and re-evaluate');
-      return io.add(run); // Existing guarded prototype registration path, no rebuild/adoption.
+      return io.add(run); // Non-urgent prototype-load operation owns smoke and overlap admission.
     }
     if (step === 'unload') {
       if ((await read(run, 'live')).outcome !== 'fail') throw Error('unload not authorized');
@@ -64,7 +64,7 @@ export function createHotpatchAdapter(io) {
     throw Error('undeclared effect');
   } };
 }
-export async function productionAdapter({ env = { ...process.env }, exec = execFileSync, authenticate = ensureFreshGithubAppEnv } = {}) {
+export async function productionAdapter({ env = { ...process.env }, exec = execFileSync, authenticate = ensureFreshGithubAppEnv, originResolver = resolveOriginRepository } = {}) {
   env.WE_GH_DAEMON_CALLER = 'hot-patch.mjs';
   delete env.GH_TOKEN; delete env.GITHUB_TOKEN;
   const auth = await authenticate({ env, daemon: true, perOwner: true, caller: 'hot-patch.mjs' });
@@ -76,7 +76,7 @@ export async function productionAdapter({ env = { ...process.env }, exec = execF
   };
   const gh = args => ({ code: 0, stdout: String(execFileSyncThrottled('gh', args, { cwd: root, env, encoding: 'utf8', timeout: 30000,
     maxBuffer: 2097152, throttle: { caller: 'hot-patch.mjs', exec: (a, o) => boundedExec('gh', a, o) } })) });
-  const origin = resolveOriginRepository({ git: args => ({ code: 0, stdout: git.run(args) }), gh });
+  const origin = originResolver({ git: args => ({ code: 0, stdout: git.run(args) }), gh });
   if (!origin.repo) throw Error('origin unavailable');
   const api = args => { const r = origin.gh(['api', ...args]); if (r.code) throw Error('API unavailable'); return JSON.parse(r.stdout); };
   const config = JSON.parse(fs.readFileSync(join(root, 'scripts/settings/prototype-load.json'), 'utf8'));
@@ -107,14 +107,24 @@ export async function productionAdapter({ env = { ...process.env }, exec = execF
     },
     audit: r => exec('node', [join(root, 'scripts/operations/run.mjs'), 'codex-audit', '--base=origin/main', `--head=${r.sha}`],
       { cwd: root, env, encoding: 'utf8', timeout: 7200000, maxBuffer: 2097152 }),
-    add: r => overlay('add', r), list: r => { const v = overlay('list', r); if (v.corrupt || !Array.isArray(v.list)) throw Error('list unreadable'); return v.list; },
+    add: r => {
+      const v = JSON.parse(String(exec('node', [join(root, 'scripts/operations/run.mjs'), 'prototype-load',
+        `--daemon=${r.daemon}`, `--branch=hotpatch/${r.sha}`, `--sha=${r.sha}`, '--json'],
+        { cwd: root, env, encoding: 'utf8', timeout: 7200000, maxBuffer: 2097152 })));
+      if (v.ok !== true) throw Error('prototype-load admission refused');
+      return v;
+    }, list: r => { const v = overlay('list', r); if (v.corrupt || !Array.isArray(v.list)) throw Error('list unreadable'); return v.list; },
     remove: r => overlay('remove', r), live: async r => {
       const p = api([`repos/${origin.repo}/pulls/${r.pr}`]);
       if (p.merged_at) return 'superseded';
       if (p.state === 'closed') return 'fail';
       if (p.state !== 'open' || !p.head?.sha) return 'unknown';
-      const receipt = await receiptGuard(r.sha, readers);
-      return receipt.outcome === 'fail' ? 'fail' : receipt.outcome === 'pass' ? 'pass' : 'unknown';
+      const [receipt, audit] = await Promise.all([receiptGuard(r.sha, readers), auditGuard(r.sha, readers)]);
+      const ref = `refs/heads/hotpatch/${r.sha}`;
+      if (git.run(['ls-remote', '--exit-code', 'origin', ref]) !== `${r.sha}\t${ref}`) return 'unknown';
+      const outcomes = [receipt.outcome, audit.outcome];
+      if (outcomes.some(o => !['pass', 'fail'].includes(o))) return 'unknown';
+      return outcomes.includes('fail') ? 'fail' : 'pass';
     },
   });
 }
