@@ -227,7 +227,15 @@ test('migration preserves the registry built from the original repository metada
   const f = fixture(t);
   rmSync(join(f.root, 'scripts/settings/feature.json'));
   for (const row of buildRegistry().rows) for (const owner of row.owners) f.write(owner, JSON.parse(readFileSync(join(ROOT, owner), 'utf8')));
-  f.write(META, originalMetadata);
+  // Keep the original entries as the migration oracle, adding metadata only for
+  // declarations introduced since that snapshot. Both layouts see all live keys.
+  const legacyMetadata = structuredClone(originalMetadata), currentMetadata = readMetadata();
+  for (const section of ['settings', 'capacityLeaves']) {
+    for (const [key, value] of Object.entries(currentMetadata[section])) {
+      if (!Object.hasOwn(legacyMetadata[section], key)) legacyMetadata[section][key] = value;
+    }
+  }
+  f.write(META, legacyMetadata);
   assert.deepEqual(buildRegistry(), buildRegistry({ root: f.root }));
 });
 test('a new metadata key file alone adds a row without editing the base metadata', t => {
@@ -342,8 +350,15 @@ test('malformed names, unexpected entries and unreadable per-key JSON fail close
   assert.throws(() => renderMarkdown(f.build()), /settings-registry-metadata\.d\/settings\/broken.json/);
 });
 
-test('generated documentation preserves original bytes except the intentional per-key authoring instruction', () => {
-  const doc = readFileSync(join(ROOT, 'docs/agent/settings-registry.md'), 'utf8');
+test('generated documentation for the original keys preserves bytes except the per-key authoring instruction', () => {
+  // The frozen digest covers the migration's original key set. New declarations
+  // remain covered by the complete live registry/document equality test above.
+  const registry = buildRegistry();
+  assert.deepEqual(registry.problems, []);
+  const doc = renderMarkdown({ ...registry,
+    rows: registry.rows.filter(row => Object.hasOwn(originalMetadata.settings, row.key)),
+    capacityRows: registry.capacityRows.filter(row => Object.hasOwn(originalMetadata.capacityLeaves, row.key)),
+  });
   const originalInstruction = 'For repo defaults, edit the owner file through a PR and rebuild the consuming daemon. Add or update metadata in scripts/lib/settings-registry-metadata.json, then run `node scripts/lib/settings-registry.mjs --write`. Verify with `node scripts/lib/settings-registry.mjs --check`. Missing declarations or invalid evidence block generation; repair the named file before regenerating.';
   const original = doc.replace(/^For repo defaults,.*$/m, originalInstruction);
   assert.equal(createHash('sha256').update(original).digest('hex'), '239663dfb7c702b1f8cf475f1b8659d16fea92c2deaa92c027f3a67f5106cc8d');
