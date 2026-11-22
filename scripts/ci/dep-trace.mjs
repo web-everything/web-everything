@@ -28,7 +28,11 @@ const bufferFrom = Buffer.from, bufferToString = Buffer.prototype.toString;
 /** Above these sizes the tracer stops reading and marks the evidence incomplete (Node judges the call). */
 const MAX_ARGS = 65536, MAX_PATH_BYTES = 65536;
 /** Node options with which the hook may not load, or the work runs outside Node (`--run` uses a shell). */
-const UNTRACED_FLAGS = ['--run', '--permission', '--experimental-permission', '--check', '-c'];
+// An env or config file can supply trace settings the parent never had, so it is untraced too.
+const UNTRACED_FLAGS = ['--run', '--permission', '--experimental-permission', '--check', '-c', '--env-file',
+  '--env-file-if-exists', '--experimental-config-file', '--experimental-default-config-file', '--experimental-sea-config'];
+/** node:url's own URL getters, captured at load: a getter a test later installs is caller code. */
+const urlGetters = new Set(Object.values(Object.getOwnPropertyDescriptors(NodeURL.prototype)).map(d => d.get).filter(Boolean));
 const untracedFlag = word => typeof word === 'string' && UNTRACED_FLAGS.some(flag => word === flag || word.startsWith(`${flag}=`));
 
 /**
@@ -70,7 +74,7 @@ function peek(obj, key) {
     const d = Reflect.getOwnPropertyDescriptor(o, key);
     if (!d) continue;
     if (Object.hasOwn(d, 'value')) return d.value;
-    return o === NodeURL.prototype && typeof d.get === 'function' ? Reflect.apply(d.get, obj, []) : UNSAFE;
+    return o === NodeURL.prototype && urlGetters.has(d.get) ? Reflect.apply(d.get, obj, []) : UNSAFE;
   }
   return undefined;
 }
@@ -170,7 +174,8 @@ export function createTracer({ test, root, record = () => {}, fs: io = {}, child
       if ([cwdOption, envOption, shell, forkExec, execArgv].includes(UNSAFE)) return markIncomplete();
       const values = [command];
       const nodeArgs = readList(list);
-      const forkArgs = name === 'fork' && execArgv != null ? readList(Array.isArray(execArgv) ? execArgv : null) : [];
+      // Node spreads any iterable execArgv (a falsy one means the parent's own); only an array can be read safely.
+      const forkArgs = name === 'fork' && execArgv ? (Array.isArray(execArgv) ? readList(execArgv) : null) : [];
       if (nodeArgs === null || forkArgs === null) return markIncomplete();
       values.push(...nodeArgs);
       // Resolve every cwd form Node accepts; any other value is left for Node to judge.

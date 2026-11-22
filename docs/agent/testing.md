@@ -5113,7 +5113,12 @@ the same `WE_TRACE_TEST`, a `WE_TRACE_DIR` resolving to the same directory, or t
 A non-Node child also marks it `incomplete`: `execSync` and any `shell` option (a shell runs first), a
 command whose realpath is not the running Node binary (a bare name is looked up on the child's PATH; a
 relative or empty PATH entry is unknown), `fork` with a non-Node `execPath`, and a Node child whose args,
-`execArgv` or `NODE_OPTIONS` carry `--run`, `--permission`, `--experimental-permission` or `--check`/`-c`.
+`execArgv` or `NODE_OPTIONS` carry `--run`, `--permission`, `--experimental-permission`, `--check`/`-c`,
+an env or config file flag (`--env-file`, `--env-file-if-exists`, `--experimental-config-file`,
+`--experimental-default-config-file`) or `--experimental-sea-config`; a non-array `execArgv` is unknown.
+URL getters are trusted only as captured from node:url at load. Patched built-in array and string
+methods are not guarded, and script arguments are scanned as flags (a safe over-flag); carded as `x7m3x86`.
+`Worker`, `ChildProcess.prototype.spawn` and `process.execve` are neither traced nor flagged; carded as `xlh3igo`.
 An inheriting child is judged by the live `process.env` at call time. Args arrays over 65536 entries and
 path buffers over 65536 bytes are not read and mark the trace `incomplete`. A `file:` string is a URL only
 for loader edges; to `fs` it is a literal path, and a URL object converts from its hostname and pathname.

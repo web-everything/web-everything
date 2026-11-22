@@ -4,7 +4,7 @@
  */
 import { describe, it, expect, vi } from 'vitest';
 import { dirname, resolve } from 'node:path';
-import { pathToFileURL } from 'node:url';
+import { pathToFileURL, URL as NodeURL } from 'node:url';
 import { promisify } from 'node:util';
 import { spawnSync } from 'node:child_process';
 import { existsSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
@@ -265,7 +265,11 @@ describe('shadow dependency tracer', () => {
     ['node --check=…', f => f.child_process.execFileSync('node', ['--check=1', 'script.mjs']), true],
     ['fork with a --permission execArgv', f => f.child_process.fork('script.mjs', [], { execArgv: ['--permission'] }), true],
     ['fork with a getter execArgv element', f => f.child_process.fork('script.mjs', [], { execArgv: Object.defineProperty([], 0, { enumerable: true, get: count }) }), true],
-    ['fork with plain execArgv', f => f.child_process.fork('script.mjs', [], { execArgv: ['--conditions=x'] }), false],
+    ['fork with an iterable, non-array execArgv', f => f.child_process.fork('script.mjs', [], { execArgv: new Set(['--permission']) }), true],
+    ['node --env-file (it can supply trace settings)', f => f.child_process.spawn('node', ['--env-file=e.env', 'script.mjs']), true],
+    ['NODE_OPTIONS carrying --env-file-if-exists', f => f.child_process.spawn('node', [], { env: traceEnv({ NODE_OPTIONS: `--env-file-if-exists=e.env --import=${hookUrl}` }) }), true],
+    ['fork with falsy execArgv (the parent\'s own)', f => f.child_process.fork('script.mjs', [], { execArgv: null }), false],
+    ['fork with plain execArgv',f => f.child_process.fork('script.mjs', [], { execArgv: ['--conditions=x'] }), false],
     ['NODE_OPTIONS carrying --permission', f => f.child_process.spawn('node', [], { env: traceEnv({ NODE_OPTIONS: `--permission --import=${hookUrl}` }) }), true],
     ['a huge sparse args array, bounded', f => f.child_process.spawn('node', new Array(2 ** 32 - 1)), true],    ['fork with no execPath', f => f.child_process.fork('script.mjs'), false],
     ['fork with execPath Node', f => f.child_process.fork('script.mjs', [], { execPath: process.execPath }), false],
@@ -359,6 +363,15 @@ describe('shadow dependency tracer', () => {
     expect(files).toContain('loaded.mjs');
     expect(files).not.toContain('package.json');
     expect(files).not.toContain('wrong');
+  });
+  it('never runs a URL getter a test installs after load', () => {
+    reads = 0;
+    const f = fixture();
+    const original = Object.getOwnPropertyDescriptor(NodeURL.prototype, 'href');
+    Object.defineProperty(NodeURL.prototype, 'href', { ...original, get() { count(); return Reflect.apply(original.get, this, []); } });
+    try { f.fs.readFileSync(pathToFileURL(resolve(root, 'a.json'))); } finally { Object.defineProperty(NodeURL.prototype, 'href', original); }
+    expect(reads).toBe(0);
+    expect(f.tracer.snapshot()).toMatchObject({ incomplete: true, edges: [] });
   });
   it('never calls a patched Buffer.from, and bounds a huge Buffer path', () => {
     const f = fixture();
