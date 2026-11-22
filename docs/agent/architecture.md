@@ -85,6 +85,13 @@ input. All-readers-unknown preserves the historical builder threshold only for a
 If measured providers are excluded, an eligible unknown legacy fallback (then native Claude) may
 run without a capacity score or account attribution. Holds, tier and kind restrictions still apply.
 
+`signedOutFrom` on a provider/account is a status-only `plateau-usage-file` reader. A fresh
+`status: "signed-out"` with an explicit valid `at` suppresses all windows and operator/calendar
+fallbacks, sets health to zero and blocks selection. Other, stale, future or unreadable evidence
+leaves capacity unchanged; inspect the provider manually when status is unknown. It never supplies
+quota percentages. Antigravity shares sign-out status across models, but `agy-usage.json` supplies
+quota windows only to agy-gemini; agy-claude keeps its empty capacity readers.
+
 The pure `scripts/lib/capacity-planner.mjs` handles fixed-window end-of-window burn, rolling usage
 rates and restart-on-reset inventories. Each manual reset restores a full window and forfeits the
 remainder. Banked resets on hand are authoritative: grant cadence is informational and never enters
