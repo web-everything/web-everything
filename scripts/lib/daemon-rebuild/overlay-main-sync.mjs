@@ -929,7 +929,7 @@ export async function runOverlayMainSync({ root, ref, token, env = process.env, 
     const rawChunkFiles = env.WE_OVERLAY_MAIN_SYNC_CHUNK_FILES;
     const chunkFiles = Number(rawChunkFiles);
     const validChunkFiles = /^\d+$/.test(String(rawChunkFiles ?? '')) && Number.isSafeInteger(chunkFiles) && chunkFiles >= 1;
-    const chunkSize = Math.min(validChunkFiles ? chunkFiles : 10, resolveFastMaxFiles(env));
+    const chunkSize = Math.min(50, validChunkFiles ? chunkFiles : 10, resolveFastMaxFiles(env));
     const cap = overlayRelatedTestCap(env);
     // The overlay's own changed tests are never dropped; only dependents beyond the cap are.
     const ownCount = tests.filter(file => own.includes(file)).length;

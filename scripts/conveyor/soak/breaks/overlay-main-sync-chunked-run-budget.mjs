@@ -41,7 +41,7 @@ export default {
       return result.stdout.trim();
     };
     const violations = [], events = [], reports = [], chunks = [];
-    let testCalls = 0, pushes = 0;
+    let testCalls = 0, pushes = 0, pushedEarly = false;
     try {
       mkdirSync(root); mkdirSync(join(root, 'node_modules'));
       ok(['init', '-q', '-b', 'main']);
@@ -67,7 +67,7 @@ export default {
           git: (args, opts) => {
             // Both heads already exist locally. Never fetch or publish from the replay.
             if (args[0] === 'fetch') return { status: 0, stdout: '', stderr: '' };
-            if (args[0] === 'push') { pushes++; return { status: 0, stdout: '', stderr: '' }; }
+            if (args[0] === 'push') { pushes++; if (testCalls !== 3) pushedEarly = true; return { status: 0, stdout: '', stderr: '' }; }
             return git(args, opts);
           },
           appendDaemonEvent: event => { events.push(event); },
@@ -90,7 +90,8 @@ export default {
       } catch (error) { failure = error; }
       if (failure || !result?.pushed) violations.push(`30-file fixture did not complete: ${failure?.message ?? 'no publication'}`);
       if (testCalls !== 3 || chunks.some(files => files.length !== 10)) violations.push('expected three chunks of ten files');
-      if (new Set(chunks.flat()).size !== 30 || result?.tests?.length !== 30) violations.push('not all 30 selected files executed');
+      if (new Set(chunks.flat()).size !== 30 || result?.tests?.length !== 30 || FILES.some(file => !chunks.flat().includes(file))) violations.push('not all 30 selected files executed');
+      if (pushedEarly) violations.push('published before all chunks finished');
       if (new Set(reports).size !== 3) violations.push('chunk reports were not distinct');
       if (pushes !== 1) violations.push('expected exactly one publication after all chunks passed');
       if (events.some(event => event.kind === 'overlay-main-sync-failed')) violations.push('chunked run emitted failure');
