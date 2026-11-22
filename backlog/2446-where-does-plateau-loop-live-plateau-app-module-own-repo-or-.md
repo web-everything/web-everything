@@ -4,6 +4,8 @@ kind: decision
 parent: "2445"
 size: 3
 status: parked
+parkedReason: maturityGated
+maturityTrigger: "adoptionSignal: DZ P3 planned in the Plateau UI pipeline"
 priority: low
 dateOpened: "2026-07-11"
 preparedDate: "2026-07-28"

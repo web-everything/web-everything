@@ -3,6 +3,8 @@ bornAs: xsde084
 kind: epic
 parent: "2445"
 status: parked
+parkedReason: maturityGated
+maturityTrigger: "adoptionSignal: DZ P3 planned in the Plateau UI pipeline"
 priority: low
 dateOpened: "2026-07-12"
 tags: []

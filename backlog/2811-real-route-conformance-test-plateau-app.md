@@ -4,6 +4,8 @@ kind: story
 size: 8
 parent: "2804"
 status: parked
+parkedReason: maturityGated
+maturityTrigger: "adoptionSignal: DZ P3 planned in the Plateau UI pipeline"
 blockedBy: ["2809", "2810"]
 scope:
   - plateau-app:tests/visual/real-route-fidelity.spec.ts
