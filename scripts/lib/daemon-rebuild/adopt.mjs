@@ -465,9 +465,18 @@ async function finalizeRebuildLocked({
   // Every exit from this (locked) phase ends the build, so every exit releases its lease and persists that.
   releaseBuildLease(state, lease);
   const terminal = (result) => {
-    if (result.adopted && state.setAside) {
-      for (const a of state.adopted?.applied ?? []) delete state.setAside[a.ref];
-      if (Object.keys(state.setAside).length === 0) state.setAside = null;
+    if (result.adopted && lease?.token !== 'force-adopt-rollback') {
+      const aside = { ...state.setAside };
+      for (const ref of Object.keys(aside)) {
+        if (!live.overlays.some(o => o.ref === ref)
+          || plan.decisions?.some(d => d.ref === ref && d.action === 'remove')) delete aside[ref];
+      }
+      for (const d of plan.decisions ?? []) if (d.setAside) aside[d.ref] = d.setAside;
+      for (const a of state.adopted?.applied ?? []) delete aside[a.ref];
+      // Unknown history must survive an adoption that still holds an unaudited ref.
+      if (state.setAside !== undefined || !plan.decisions?.some(d => d.reason === 'unaudited-tip-held')) {
+        state.setAside = Object.keys(aside).length ? aside : null;
+      }
     }
     writeState();
     const stale = staleAlertDetail(result, state);
@@ -498,8 +507,9 @@ async function finalizeRebuildLocked({
   }
 
   // Registrations can be pinned while smoke runs unlocked. Re-read under the
-  // add guard before any adoption (including already-adopted reconciliation).
-  const live = readOverlayState(root, { env });
+  // add guard before normal adoption (including already-adopted reconciliation).
+  // The health watch must always be able to return to last-good without changing registrations.
+  const live = isRollback ? { overlays: [] } : readOverlayState(root, { env });
   if (live.corrupt) {
     alert('overlay-state-corrupt', { message: 'cannot re-check omitted overlay pins; repair the overlay registry' });
     return terminal({ moved: false, reason: 'overlay-state-corrupt', plan });

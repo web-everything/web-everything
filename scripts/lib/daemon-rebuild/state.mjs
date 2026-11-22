@@ -53,7 +53,7 @@ export function alertsFilePath(root, env = process.env) {
 }
 
 const EMPTY_STATE = Object.freeze({
-  setAside: null,
+  setAside: undefined,
   adopted: null, rejected: null, inProgress: null, quarantine: null, unverified: null, building: null, held: null, busySkippedTrees: null, forceUnverifiedTrees: null, smokePassed: null, pinnedNotified: null,
 });
 
@@ -132,7 +132,9 @@ function readState(root, env, strict, read = readFileSync) {
         throw new Error(`Invalid rebuild state ${key}`);
       }
     }
-    // Optional for persisted pre-continuity states; present malformed records fail closed.
+    // Legacy/missing continuity remains unknown (undefined), not a known empty map.
+    // Planning must require audit evidence before any omitted content can return.
+    // Present malformed records fail closed.
     if (strict && parsed.setAside != null && (!object(parsed.setAside)
       || !Object.values(parsed.setAside).every(v => fields(v,
         { eligible: v => v === true, ref: string, sha: v => typeof v === 'string' && FULL_SHA_RE.test(v),
@@ -151,7 +153,7 @@ function readState(root, env, strict, read = readFileSync) {
       forceUnverifiedTrees: parsed?.forceUnverifiedTrees ?? null,
       smokePassed: parsed?.smokePassed ?? null,
       pinnedNotified: parsed?.pinnedNotified ?? null,
-      setAside: parsed?.setAside ?? null,
+      setAside: parsed?.setAside,
     };
   } catch (error) {
     if (strict && error?.code !== 'ENOENT') throw error;

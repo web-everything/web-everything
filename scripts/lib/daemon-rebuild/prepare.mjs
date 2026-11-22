@@ -414,7 +414,7 @@ export async function prepareRebuild({
   try { mainSyncConflicts = readMainSyncConflicts(root, env); }
   catch (error) { alert('overlay-main-sync-state-unknown', { message: `${error.message}; keeping existing overlay loss protections — repair main-sync state` }); }
   const plan = await planRebuild({
-    auditedTip: makeAuditedTipGate(env), mainSyncConflicts, setAside: state.setAside ?? {},
+    auditedTip: makeAuditedTipGate(env), mainSyncConflicts, setAside: state.setAside === undefined ? null : state.setAside ?? {},
     git, headSha: prevHead, mainRef: 'origin/main', overlays: overlaysBefore, prState, mainOnly, edgeResolve,
     stackMode: stack.mode, stackModeSource: stack.source, prBaseChain: chainOf,
     prForcePushes: prForcePushes ?? chainOf.forcePushes ?? null,
@@ -430,20 +430,8 @@ export async function prepareRebuild({
   if (!strictState && chainOf.fresh?.size > 0) {
     try { persistStackBases(root, chainOf.fresh, { env }); } catch (e) { alert('stack-bases-not-recorded', { error: String(e?.message ?? e) }); }
   }
-  // Durable set-aside bookkeeping uses the same completed plan as adoption. Preserve
-  // unresolved records on partial refusals; applied candidates clear only after adoption.
+  // Omission records describe adopted content only. Finalize commits them after smoke.
   const asideBefore = state.setAside ?? {};
-  const asideNow = { ...asideBefore };
-  if (plan.ok) {
-    // A failed rebase/audit attempt must not erase the outstanding operator record.
-    for (const ref of Object.keys(asideNow)) {
-      if (!overlaysBefore.some(o => o.ref === ref)
-        || plan.decisions.some(d => d.ref === ref && d.action === 'remove')) delete asideNow[ref];
-    }
-    for (const d of plan.decisions) if (d.setAside) asideNow[d.ref] = d.setAside;
-  }
-  const asideChanged = JSON.stringify(asideBefore) !== JSON.stringify(asideNow);
-  if (strictState && asideChanged) return mutationDue('overlay-set-aside');
   // overlay-pin — `overlay-pinned` is logged ONCE per (ref, new tip), not every tick the pin holds; the record
   // (`state.pinnedNotified`: ref → the new tip last reported) is pruned only after a complete plan.
   const pinnedBefore = state.pinnedNotified && typeof state.pinnedNotified === 'object' ? state.pinnedNotified : {};
@@ -487,10 +475,6 @@ export async function prepareRebuild({
       const { pr, ref, files, collidesWith } = event.detail;
       markOverlayConflictWake(env, { pr, ref, files, collidesWith, at: nowIso(), clone: root });
     }
-  }
-  if (!strictState && asideChanged) {
-    state.setAside = Object.keys(asideNow).length ? asideNow : null;
-    writeState();
   }
   if (!strictState && JSON.stringify(pinnedBefore) !== JSON.stringify(pinnedNow)) {
     state.pinnedNotified = Object.keys(pinnedNow).length ? pinnedNow : null;

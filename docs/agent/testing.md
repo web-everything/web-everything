@@ -6376,3 +6376,16 @@ cover adoption of main, duplicate suppression and automatic return after branch 
 conflict wake before testing rebuild's wake producer; otherwise the worker masks a missing
 rebuild notification. Omission evidence is not adopted ancestry: inspect merge ancestry
 and retain the durable set-aside record through failed smoke, then clear it only on adoption.
+
+
+### Set-aside adoption and unknown history
+
+Prepare must leave omission history unchanged until smoke and adoption succeed; finalize
+publishes the new `setAside` records and clears repaired entries on success. Missing files
+and legacy snapshots without `setAside` have unknown history, so audited mode requires
+evidence before applying a replacement and preserves that requirement across later ticks.
+An explicitly known empty history is `setAside: null`. Classify pins across every running
+SHA for the registration. Prove independence using the final combined candidate delta from
+main, including edge changes and replayed resolutions, rather than original tips pairwise.
+The omitted-pin gate exempts `force-adopt-rollback`, which must reach last-good even when
+that build lacks a registered pin. These cases live in `main-sync-set-aside.test.mjs`.

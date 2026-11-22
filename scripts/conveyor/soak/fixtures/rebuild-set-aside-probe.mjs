@@ -6,7 +6,7 @@ import { spawnSync } from 'node:child_process';
 import { rebuildClone, readRebuildState } from '../../../lib/daemon-rebuild.mjs';
 import { runOverlayMainSync } from '../../../lib/daemon-rebuild/overlay-main-sync.mjs';
 import { addOverlay, readOverlays, overlayFilePath } from '../../../lib/daemon-overlays.mjs';
-import { alertsFilePath } from '../../../lib/daemon-rebuild/state.mjs';
+import { writeRebuildState, alertsFilePath } from '../../../lib/daemon-rebuild/state.mjs';
 
 export async function createSetAsideFixture({ pinned = false, guard = false, audited = false, sibling = false, pr = null } = {}) {
   const base = mkdtempSync(join(tmpdir(), 'rebuild-set-aside-'));
@@ -39,6 +39,8 @@ export async function createSetAsideFixture({ pinned = false, guard = false, aud
     git(author, ['checkout', '-qb', ref]); write(author, file, 'export const value = 1;\n'); commit(author, 'overlay');
     git(author, ['push', '-q', 'origin', ref]);
     addOverlay(root, { ref, pinned, pr }, { env });
+    // This fixture explicitly starts with no prior omissions. Missing state is strict.
+    writeRebuildState(root, { setAside: null }, env);
     const initial = await rebuild();
     if (!initial.adopted) throw new Error(`initial adoption: ${initial.reason}`);
     git(author, ['checkout', '-q', 'main']); write(author, file, 'export const value = 2;\n'); commit(author, 'new main');

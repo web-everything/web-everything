@@ -1,6 +1,7 @@
 import { it, expect, vi } from 'vitest';
 import * as planner from '../plan.mjs';
-import { writeFileSync, readFileSync } from 'node:fs';
+import { writeFileSync, readFileSync, unlinkSync } from 'node:fs';
+import { finalizeRebuild } from '../adopt.mjs';
 import { prepareRebuild } from '../prepare.mjs';
 import { gitRun } from '../../main-staleness.mjs';
 import { clearOverlayConflictWake, readOverlayConflictWakes } from '../../overlay-conflict-wake.mjs';
@@ -121,7 +122,7 @@ it('keeps the old hold when the overlay also conflicts with an applied overlay',
 it('keeps the hold when independence from another overlay cannot be proved', async () => {
   const f = await createSetAsideFixture({ sibling: true });
   try {
-    const git = args => args[0] === 'merge-tree' && args.includes(f.tip) && !args.includes(f.main)
+    const git = args => args[0] === 'merge-tree' && args.includes(f.tip) && args.some(a => a.startsWith('--merge-base='))
       ? { status: 128, stdout: '' } : f.git(args);
     const plan = await planner.planRebuild({ git, headSha: f.head(), mainRef: 'origin/main',
       overlays: f.overlays(), edgeResolve: false, mainSyncConflicts: readMainSyncConflicts(f.root, f.env) });
@@ -195,5 +196,99 @@ it.each(['sha', 'mainSha'])('strict set-aside validation rejects coerced array %
     state.setAside[f.ref][field] = [state.setAside[f.ref][field]];
     writeFileSync(path, JSON.stringify(state));
     expect(() => readRebuildStateStrict(f.root, f.env)).toThrow('Invalid rebuild state setAside');
+  } finally { f.cleanup(); }
+}, 60_000);
+
+
+it('failed first set-aside smoke preserves omission history and rechecks conflict evidence', async () => {
+  const f = await createSetAsideFixture();
+  try {
+    const before = f.state();
+    const result = await f.rebuild({ runSmoke: async () => { throw new Error('failed smoke'); } });
+    expect(result.adopted).not.toBe(true);
+    expect(f.state().adopted).toEqual(before.adopted);
+    expect(f.state().setAside).toEqual(before.setAside);
+    const path = `${overlayFilePath(f.root, f.env)}.main-sync.state`;
+    writeFileSync(path, '{broken');
+    expect(await f.rebuild()).toMatchObject({ reason: 'established-overlay-conflict' });
+  } finally { f.cleanup(); }
+}, 60_000);
+
+it.each(['legacy', 'missing'])('unknown continuity evidence does not restore first-adoption exemption: %s', async kind => {
+  const f = await createSetAsideFixture({ audited: true });
+  try {
+    await f.rebuild();
+    const path = rebuildStatePath(f.root, f.env);
+    const state = JSON.parse(readFileSync(path, 'utf8'));
+    delete state.setAside;
+    writeFileSync(path, JSON.stringify(state));
+    if (kind === 'missing') unlinkSync(path);
+    await f.repair();
+    expect(f.state().adopted?.applied.some(o => o.ref === f.ref)).not.toBe(true);
+    await f.rebuild();
+    expect(f.state().adopted?.applied.some(o => o.ref === f.ref)).not.toBe(true);
+    expect(f.state().setAside).toBeUndefined();
+  } finally { f.cleanup(); }
+}, 60_000);
+
+it('retains a mechanism pin from any running sha after a replacement tip removes it', async () => {
+  const f = await createSetAsideFixture();
+  try {
+    const base = f.git(['rev-parse', `${f.tip}^`]).stdout.trim();
+    const tree = f.git(['rev-parse', `${f.tip}^{tree}`]).stdout.trim();
+    const newer = f.git(['-c', 'user.name=t', '-c', 'user.email=t@t', 'commit-tree', tree, '-p', base, '-m', 'newer overlay']).stdout.trim();
+    const replacement = f.git(['-c', 'user.name=t', '-c', 'user.email=t@t', 'commit-tree', tree, '-p', base, '-m', 'replacement']).stdout.trim();
+    const running = f.git(['-c', 'user.name=daemon-rebuild', '-c', 'user.email=daemon-rebuild@localhost',
+      'commit-tree', tree, '-p', f.head(), '-p', newer, '-m',
+      `daemon-rebuild: merge overlay ${f.ref} onto ${f.head()}`]).stdout.trim();
+    expect(f.git(['update-ref', `refs/remotes/origin/${f.ref}`, replacement]).status).toBe(0);
+    const git = (args, options) => args[0] === 'diff' && args.includes(f.tip)
+      ? { status: 0, stdout: 'scripts/lib/daemon-rebuild.mjs\n' } : f.git(args, options);
+    const plan = await planner.planRebuild({ git, headSha: running, mainRef: 'origin/main',
+      overlays: f.overlays(), edgeResolve: false,
+      mainSyncConflicts: { conflictMain: { [f.ref]: f.main }, conflictTip: { [f.ref]: replacement } } });
+    expect(plan.establishedLost.map(o => o.ref)).toContain(f.ref);
+    expect(plan.decisions.some(d => d.setAside)).toBe(false);
+  } finally { f.cleanup(); }
+}, 60_000);
+
+it.each([1, 128])('holds when combined applied content conflicts or is unknown despite clean original tips: %s', async status => {
+  const f = await createSetAsideFixture({ sibling: true });
+  try {
+    const sibling = f.git(['rev-parse', 'refs/remotes/origin/lane/sibling']).stdout.trim();
+    const tree = f.git(['rev-parse', `${sibling}^{tree}`]).stdout.trim();
+    let combinedSha;
+    const git = (args, options) => {
+      if (args[0] === 'merge-tree' && args.includes(f.tip) && args.includes(sibling))
+        return { status: 0, stdout: tree + '\n' };
+      if (args[0] === 'merge-tree' && args.includes(f.tip) && args.some(a => a.startsWith('--merge-base='))) {
+        combinedSha = args.at(-2);
+        return { status, stdout: '' };
+      }
+      return f.git(args, options);
+    };
+    const plan = await planner.planRebuild({ git, headSha: f.head(), mainRef: 'origin/main',
+      overlays: f.overlays(), edgeResolve: false, mainSyncConflicts: readMainSyncConflicts(f.root, f.env) });
+    expect(plan.establishedLost.map(o => o.ref)).toContain(f.ref);
+    expect(plan.decisions.some(d => d.setAside)).toBe(false);
+    expect(combinedSha).toBe(plan.finalSha);
+    expect(combinedSha).not.toBe(sibling);
+    expect(combinedSha).not.toBe(f.main);
+  } finally { f.cleanup(); }
+}, 60_000);
+
+it.each([false, true])('omitted registered pin blocks normal adoption but permits safety rollback: rollback=%s', async rollback => {
+  const f = await createSetAsideFixture({ pinned: true });
+  try {
+    const result = await finalizeRebuild({ root: f.root, env: f.env, run: gitRun, now: Date.now,
+      prevHead: f.head(), lease: { token: rollback ? 'force-adopt-rollback' : 'normal' },
+      plan: { ok: true, finalSha: f.main, mainSha: f.main, inputsKey: 'rollback-test', applied: [], decisions: [] } });
+    if (rollback) {
+      expect(result.adopted).toBe(true);
+      expect(f.head()).toBe(f.main);
+    } else {
+      expect(result).toMatchObject({ reason: 'established-overlay-conflict' });
+      expect(f.head()).not.toBe(f.main);
+    }
   } finally { f.cleanup(); }
 }, 60_000);
