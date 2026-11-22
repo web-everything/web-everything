@@ -1,10 +1,13 @@
 import { describe, it, expect, vi } from 'vitest';
-import { mkdtempSync, mkdirSync, readFileSync, writeFileSync, rmSync, existsSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, readFileSync, writeFileSync, rmSync, existsSync, utimesSync, chmodSync, statSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describeBlockedChecks, decideGateSendBack, sendBackBlockedGate, sendBackBlockedGates } from '../drain-blocked-reason.mjs';
 import { classifyPr, unlandableStateReason } from '../../merge-ai-prs.mjs';
 import { classifySkipReason } from '../drain-skip-reasons.mjs';
+import { deriveWaitingOn } from '../../operations/pr-sweep-core.mjs';
+import { classifyStall } from '../../conveyor/pr-stall-classify.mjs';
+import soakBreak from '../../conveyor/soak/breaks/drain-blocked-reason-names-failed-check.mjs';
 import { FAILED_CHECK_CONCLUSIONS } from '../rollup-collapse.mjs';
 
 const head = 'a'.repeat(40);
@@ -14,6 +17,8 @@ const fixture = (extra = {}) => ({ number: 7196, headRefOid: head, baseRefName: 
   labels: [{ name: 'ready-to-merge' }, { name: 'review:accepted' }], mergeable: 'MERGEABLE', mergeStateStatus: 'BLOCKED',
   rowsComplete: true, rowsHead: head, statusCheckRollup: [row('test'), row('merge-gate', 'FAILURE', { summary: '\n test-gaming\nignored second line' })], ...extra });
 const opts = { defaultBranch: 'main', queueRequiredChecks: requiredChecks };
+const cliExec = fn => vi.fn((command, argv, options) => command === 'gh'
+  ? { status: 0, stdout: JSON.stringify({ headRefOid: head }) } : fn(command, argv, options));
 const decision = (pr = fixture(), ledger = {}) => decideGateSendBack({ pr, headSha: pr.headRefOid, requiredChecks, ledger });
 
 describe('BLOCKED required-check evidence', () => {
@@ -103,47 +108,74 @@ describe('gate send-back', () => {
   }
   it('never clears a hold: invokes only --to=changes and records only after success, once per head', () => withLedger(ledgerPath => {
     const pr = fixture({ labels: [...fixture().labels, { name: 'review:human' }, { name: 'review:changes' }, { name: 'review:held-mechanical' }] });
+    let liveHead = head;
     const exec = vi.fn((command, argv, options) => {
+      if (command === 'gh') return { status: 0, stdout: JSON.stringify({ headRefOid: liveHead }) };
       expect(command).toBe(process.execPath);
       expect(argv.filter(a => a.startsWith('--to='))).toEqual(['--to=changes']);
       expect(argv).not.toEqual(expect.arrayContaining([expect.stringMatching(/--(?:remove|add)-label/)]));
       expect(argv).toContain('--repo=o/r');
       expect(options.maxBuffer).toBeGreaterThan(0);
       expect(readFileSync(argv.find(a => a.startsWith('--body-file=')).slice(12), 'utf8')).toBe(decision().body);
-      if (exec.mock.calls.length === 1) expect(existsSync(ledgerPath)).toBe(false);
+      if (exec.mock.calls.length === 2) expect(existsSync(ledgerPath)).toBe(false);
       return { status: 0 };
     });
     const run = p => sendBackBlockedGate({ pr: p, headSha: p.headRefOid, requiredChecks, repo: 'o/r', ledgerPath, exec });
     expect(run(pr).sent).toBe(true);
     expect(run(pr).sent).toBe(false);
-    expect(exec).toHaveBeenCalledTimes(1);
-    expect(run({ ...pr, headRefOid: 'b'.repeat(40) }).sent).toBe(true);
     expect(exec).toHaveBeenCalledTimes(2);
+    liveHead = 'b'.repeat(40);
+    expect(run({ ...pr, headRefOid: liveHead, rowsHead: liveHead }).sent).toBe(true);
+    expect(exec).toHaveBeenCalledTimes(4);
     expect(run(pr).sent).toBe(false);
-    expect(exec).toHaveBeenCalledTimes(2);
+    expect(exec).toHaveBeenCalledTimes(4);
     expect(readFileSync(ledgerPath, 'utf8')).toContain('b'.repeat(40));
   }));
   it.each(['nonzero', 'throw'])('does not record the head when review-set-label fails: %s', mode => withLedger(ledgerPath => {
-    const exec = vi.fn(() => { if (mode === 'throw') throw Error('failed'); return { status: 1 }; });
+    const exec = cliExec(() => { if (mode === 'throw') throw Error('failed'); return { status: 1 }; });
     expect(sendBackBlockedGate({ pr: fixture(), headSha: head, requiredChecks, repo: 'o/r', ledgerPath, exec }).sent).toBe(false);
     expect(existsSync(ledgerPath)).toBe(false);
+    expect(existsSync(`${ledgerPath}.${head}.refused`)).toBe(true);
+    expect(sendBackBlockedGate({ pr: fixture(), headSha: head, requiredChecks, repo: 'o/r', ledgerPath, exec }))
+      .toMatchObject({ sent: false, reason: expect.stringContaining('refusal marker') });
+    expect(exec).toHaveBeenCalledTimes(2);
+  }));
+  it('retains the refusal marker after an external mutation followed by timeout and prevents a second writer invocation', () => withLedger(ledgerPath => {
+    let mutations = 0;
+    const exec = cliExec(() => {
+      mutations++;
+      return { status: null, signal: 'SIGTERM', error: Object.assign(Error('writer timed out'), { code: 'ETIMEDOUT' }) };
+    });
+    const run = () => sendBackBlockedGate({ pr: fixture(), headSha: head, requiredChecks, repo: 'o/r', ledgerPath, exec });
+    expect(run()).toMatchObject({ sent: false, reason: expect.stringContaining('operator must reconcile') });
+    expect(mutations).toBe(1);
+    expect(existsSync(ledgerPath)).toBe(false);
+    expect(readFileSync(`${ledgerPath}.${head}.refused`, 'utf8')).toContain('operator must reconcile');
+    expect(run()).toMatchObject({ sent: false, reason: expect.stringContaining('refusal marker') });
+    expect(mutations).toBe(1);
+    expect(exec).toHaveBeenCalledTimes(2);
   }));
   it('runs send-back at the BLOCKED skip pass with injected exec, leaving red PRs skipped', () => withLedger(ledgerPath => {
     const pr = fixture();
     const verdict = { ...classifyPr(pr, opts), repo: null, listedHeadSha: head };
-    const exec = vi.fn(() => ({ status: 0 }));
+    const exec = cliExec(() => ({ status: 0 }));
     const outcomes = sendBackBlockedGates({ prsByRepo: new Map([[null, [pr]]]), verdicts: [verdict],
       requiredChecksOf: () => requiredChecks, localSlug: 'o/r', cwdOf: () => undefined, ledgerPath, exec });
     expect(outcomes).toEqual([{ num: pr.number, repo: null, sent: true, recorded: true }]);
     expect(verdict.decision).toBe('skip');
-    expect(exec).toHaveBeenCalledOnce();
+    expect(exec).toHaveBeenCalledTimes(2);
   }));
   it('reports ledger persistence failure after a successful send-back for operator repair', () => withLedger(ledgerPath => {
-    const exec = vi.fn(() => {
+    const exec = cliExec(() => {
       // Make the destination unwritable as a file after the successful CLI response.
       mkdirSync(ledgerPath); return { status: 0 }; });
     expect(sendBackBlockedGate({ pr: fixture(), headSha: head, requiredChecks, repo: 'o/r', ledgerPath, exec }))
       .toMatchObject({ sent: true, recorded: false, reason: expect.stringContaining('operator must repair') });
+    expect(readFileSync(`${ledgerPath}.${head}.refused`, 'utf8')).toContain('operator must reconcile');
+    rmSync(ledgerPath, { recursive: true });
+    expect(sendBackBlockedGate({ pr: fixture(), headSha: head, requiredChecks, repo: 'o/r', ledgerPath, exec }))
+      .toMatchObject({ sent: false, reason: expect.stringContaining('refusal marker') });
+    expect(exec).toHaveBeenCalledTimes(2);
   }));
   it('refuses a corrupt persisted ledger without invoking the CLI', () => withLedger(ledgerPath => {
     writeFileSync(ledgerPath, 'broken');
@@ -151,4 +183,141 @@ describe('gate send-back', () => {
     expect(sendBackBlockedGate({ pr: fixture(), headSha: head, requiredChecks, repo: 'o/r', ledgerPath, exec }).sent).toBe(false);
     expect(exec).not.toHaveBeenCalled();
   }));
+});
+
+
+describe('audit safeguards', () => {
+  const run = (ledgerPath, exec, pr = fixture(), extra = {}) => sendBackBlockedGate({ pr, headSha: head, requiredChecks, repo: 'o/r', ledgerPath, exec, ...extra });
+  const withLedger = fn => {
+    const directory = mkdtempSync(join(tmpdir(), 'drain-audit-'));
+    try { fn(join(directory, 'ledger.json')); }
+    finally { chmodSync(directory, 0o700); rmSync(directory, { recursive: true, force: true }); }
+  };
+  it.each([{ rowsComplete: false }, { rowsComplete: undefined }, { rowsComplete: 'true' }, { rowsHead: undefined }, { rowsHead: 'b'.repeat(40) }])('refuses incomplete or unpinned rows: %j', extra => {
+    expect(decision(fixture(extra))).toEqual({ send: false });
+    expect(describeBlockedChecks(fixture(extra), requiredChecks).failed).toHaveLength(1);
+  });
+  it.each(['summary', 'title'])('extracts REST output.%s findings', field => {
+    const pr = fixture({ statusCheckRollup: [row('merge-gate', 'FAILURE', { output: { [field]: '\n nested finding\nignored' } })] });
+    expect(decision(pr).body).toBe('required check "merge-gate" FAILURE: nested finding');
+  });
+  it('still sends a generic failure without finding text', () => withLedger(path => {
+    const exec = cliExec((_command, argv) => {
+      expect(readFileSync(argv.find(a => a.startsWith('--body-file=')).slice(12), 'utf8')).toBe('required check "merge-gate" FAILURE');
+      return { status: 0 };
+    });
+    expect(run(path, exec, fixture({ statusCheckRollup: [row('merge-gate', 'FAILURE')] })).sent).toBe(true);
+  }));
+  it.each(['moved', 'failed', 'malformed'])('refuses a %s live head immediately before the writer', mode => withLedger(path => {
+    const exec = vi.fn(() => ({ status: mode === 'failed' ? 1 : 0,
+      stdout: mode === 'malformed' ? '?' : JSON.stringify({ headRefOid: 'b'.repeat(40) }) }));
+    expect(run(path, exec).sent).toBe(false);
+    expect(exec).toHaveBeenCalledOnce();
+    expect(exec.mock.calls[0][0]).toBe('gh');
+    expect(exec.mock.calls[0][1]).toEqual(['pr', 'view', '7196', '--repo=o/r', '--json=headRefOid']);
+    expect(existsSync(path)).toBe(false);
+  }));
+  it('skips contention and preserves different-PR ledger updates on the next locked read', () => withLedger(path => {
+    const nested = cliExec(() => ({ status: 0 }));
+    const exec = cliExec(() => {
+      expect(run(path, nested, fixture({ number: 7197 })).reason).toContain('locked');
+      return { status: 0 };
+    });
+    expect(run(path, exec).recorded).toBe(true);
+    expect(nested).not.toHaveBeenCalled();
+    expect(run(path, nested, fixture({ number: 7197 })).recorded).toBe(true);
+    expect(JSON.parse(readFileSync(path, 'utf8'))).toEqual({ 'o/r#7196': { [head]: true }, 'o/r#7197': { [head]: true } });
+  }));
+  it('reaps an abandoned lock but waits until the next pass to send', () => withLedger(path => {
+    writeFileSync(`${path}.lock`, '');
+    utimesSync(`${path}.lock`, new Date(0), new Date(0));
+    const exec = cliExec(() => ({ status: 0 }));
+    expect(run(path, exec).reason).toContain('locked');
+    expect(exec).not.toHaveBeenCalled();
+    expect(run(path, exec).recorded).toBe(true);
+    expect(existsSync(`${path}.lock`)).toBe(false);
+  }));
+  it('serializes two stale reapers and a replacement writer, preserving exclusive ownership and both PR entries', () => withLedger(path => {
+    writeFileSync(`${path}.lock`, '');
+    utimesSync(`${path}.lock`, new Date(0), new Date(0));
+    const otherPr = fixture({ number: 7197 });
+    const secondReaperExec = cliExec(() => ({ status: 0 }));
+    const replacementExec = cliExec(() => ({ status: 0 }));
+    let secondReaper, replacementDuringReap, concurrentWriter, heldLock;
+    // Pause the first reaper after its stale snapshot; interleave the second
+    // reaper and a replacement acquisition before the first can unlink.
+    const firstReaper = run(path, cliExec(() => ({ status: 0 })), fixture(), { statLock: lockPath => {
+      const snapshot = statSync(lockPath);
+      secondReaper = run(path, secondReaperExec, otherPr);
+      replacementDuringReap = run(path, replacementExec);
+      return snapshot;
+    } });
+    expect(firstReaper.reason).toContain('locked');
+    expect(secondReaper).toMatchObject({ sent: false, reason: expect.stringContaining('guard busy') });
+    expect(replacementDuringReap).toMatchObject({ sent: false, reason: expect.stringContaining('guard busy') });
+    expect(secondReaperExec).not.toHaveBeenCalled();
+    expect(replacementExec).not.toHaveBeenCalled();
+    const writer = cliExec(() => {
+      concurrentWriter = run(path, secondReaperExec, otherPr);
+      heldLock = existsSync(`${path}.lock`);
+      return { status: 0 };
+    });
+    expect(run(path, writer)).toMatchObject({ sent: true, recorded: true });
+    expect(concurrentWriter).toMatchObject({ sent: false, reason: expect.stringContaining('locked') });
+    expect(heldLock).toBe(true);
+    expect(secondReaperExec).not.toHaveBeenCalled();
+    expect(run(path, secondReaperExec, otherPr)).toMatchObject({ sent: true, recorded: true });
+    expect(JSON.parse(readFileSync(path, 'utf8'))).toEqual({ 'o/r#7196': { [head]: true }, 'o/r#7197': { [head]: true } });
+    expect(existsSync(`${path}.lock`)).toBe(false);
+    expect(existsSync(`${path}.lock.guard`)).toBe(false);
+  }));
+  it('refuses an abandoned acquisition guard and names operator repair without deleting it', () => withLedger(path => {
+    writeFileSync(`${path}.lock.guard`, '');
+    utimesSync(`${path}.lock.guard`, new Date(0), new Date(0));
+    const exec = cliExec(() => ({ status: 0 }));
+    expect(run(path, exec)).toMatchObject({ sent: false, reason: expect.stringContaining('operator must repair a persistent guard') });
+    expect(exec).not.toHaveBeenCalled();
+    expect(existsSync(`${path}.lock.guard`)).toBe(true);
+  }));
+  it.each([0o300, 0o500])('refuses unreadable or unwritable ledger directories (%s)', mode => withLedger(path => {
+    const directory = join(path, '..');
+    chmodSync(directory, mode);
+    const exec = vi.fn();
+    try { expect(run(path, exec).sent).toBe(false); expect(exec).not.toHaveBeenCalled(); }
+    finally { chmodSync(directory, 0o700); }
+  }));
+  it('refuses an unreadable refusal marker', () => withLedger(path => {
+    mkdirSync(`${path}.${head}.refused`);
+    const exec = vi.fn();
+    expect(run(path, exec).sent).toBe(false);
+    expect(exec).not.toHaveBeenCalled();
+  }));
+  it('uses an independent soak fix signal even when the diagnostic scenario fails', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'drain-soak-'));
+    const previous = process.env.SOAK_TREE_ROOT;
+    try {
+      mkdirSync(join(root, 'scripts/lib'), { recursive: true });
+      const source = join(process.cwd(), 'scripts/lib/drain-skip-reasons.mjs');
+      writeFileSync(join(root, 'scripts/lib/drain-skip-reasons.mjs'), readFileSync(source));
+      writeFileSync(join(root, 'scripts/lib/drain-blocked-reason.mjs'), 'export const describeBlockedChecks = () => null;');
+      process.env.SOAK_TREE_ROOT = root;
+      expect(soakBreak.fixPresent(root)).toBe(true);
+      expect(soakBreak.judge(await soakBreak.run())).toHaveLength(1);
+    } finally {
+      if (previous === undefined) delete process.env.SOAK_TREE_ROOT; else process.env.SOAK_TREE_ROOT = previous;
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+  it('maps failed checks to the same CI actor and stalled recovery as pending checks', () => {
+    const row = { repo: 'web-everything/web-everything', number: 7196, waitingOn: 'drain-skip:checks-failed', actor: 'ci',
+      stalled: true, liveJob: null, why: 'required check failed', evidence: [], next: null };
+    const derived = deriveWaitingOn({ ...fixture(), repo: row.repo, comments: [], statusCheckRollup: [] },
+      { now: Date.now(), drainSkips: [{ num: row.number, repo: row.repo, kind: 'checks-failed', reason: row.why }] });
+    expect(derived).toMatchObject({ state: row.waitingOn, actor: 'ci' });
+    const result = classifyStall({ row, head });
+    expect(result).toMatchObject({ lane: 'system', action: 'tooling-card', smell: 'ci-job-hung' });
+    expect(classifyStall({ row: { ...row, stalled: false }, head })).toBeNull();
+    expect(classifyStall({ row: { ...row, liveJob: 'ci' }, head })).toBeNull();
+    expect(classifyStall({ row: { ...row, actor: 'operator' }, head }).reason).toContain('does not fit');
+  });
 });

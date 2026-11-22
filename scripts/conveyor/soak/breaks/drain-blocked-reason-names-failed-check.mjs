@@ -19,7 +19,13 @@ export default {
   title: 'The drain hides the failed required check behind merge state BLOCKED',
   card: 'BLOCKED names the required check and first gate finding',
   fixedBy: { sha: 'pending', where: 'lane/drain-blocked-reason', paths: ['scripts/lib/drain-blocked-reason.mjs', 'scripts/merge-ai-prs.mjs'] },
-  fixPresent(root) { return probe(root)?.text === 'required check "merge-gate" FAILURE: test-gaming'; },
+  fixPresent(root) {
+    const result = spawnSync(process.execPath, ['--input-type=module', '-e',
+      `const { classifySkipReason } = await import(process.argv[1]); process.exit(classifySkipReason('merge state BLOCKED; required check "merge-gate" FAILURE') === 'checks-failed' ? 0 : 1);`,
+      pathToFileURL(join(root, 'scripts/lib/drain-skip-reasons.mjs')).href],
+    { encoding: 'utf8', timeout: 15000, maxBuffer: 65536 });
+    return !result.error && result.status === 0;
+  },
   async run() {
     const root = process.env.SOAK_TREE_ROOT || new URL('../../../../', import.meta.url).pathname;
     const p = probe(root);

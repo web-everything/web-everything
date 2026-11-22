@@ -2,14 +2,14 @@
 import { latestCheckNamed, isFailedCheckRow } from './rollup-collapse.mjs';
 import { classifySkipReason } from './drain-skip-reasons.mjs';
 import { spawnSync } from 'node:child_process';
-import { readFileSync, writeFileSync, mkdirSync, mkdtempSync, renameSync, rmSync } from 'node:fs';
+import { readFileSync, writeFileSync, mkdirSync, mkdtempSync, renameSync, rmSync, openSync, closeSync, statSync, accessSync, constants, fsyncSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { tmpdir } from 'node:os';
 
 const shaPattern = /^[0-9a-f]{40}$/i;
 const record = value => !!value && typeof value === 'object' && !Array.isArray(value);
 const clean = value => value.replace(/[\x00-\x08\x0b-\x1f\x7f-\x9f]/g, '').trim();
-const firstLine = row => [row.summary, row.title, row.description]
+const firstLine = row => [row.summary, row.output?.summary, row.title, row.output?.title, row.description]
   .filter(value => typeof value === 'string').flatMap(value => value.split(/\r?\n/).map(clean)).find(Boolean) || '';
 
 /** Pure; unknown evidence retains the caller's original BLOCKED reason. Missing rows wait. */
@@ -44,6 +44,7 @@ const validLedger = ledger => record(ledger) && Object.entries(ledger).every(([h
 export function decideGateSendBack({ pr, headSha, requiredChecks, ledger } = {}) {
   try {
     if (typeof headSha !== 'string' || !shaPattern.test(headSha) || headSha !== pr?.headRefOid
+      || pr.rowsComplete !== true || pr.rowsHead !== headSha
       || !validLedger(ledger) || ledger[headSha.toLowerCase()]
       || !Array.isArray(pr.labels) || !pr.labels.some(label => (typeof label === 'string' ? label : label?.name) === 'ready-to-merge')) return { send: false };
     const description = describeBlockedChecks(pr, requiredChecks);
@@ -55,11 +56,35 @@ export function decideGateSendBack({ pr, headSha, requiredChecks, ledger } = {})
 /** CLI uses argv/body-file, never a shell. Persist only AFTER the sanctioned label writer succeeds.
  * An unreadable ledger refuses send-back; the drain still skips the red PR and logs the retry reason.
  */
-export function sendBackBlockedGate({ pr, headSha, requiredChecks, ledgerPath, repo, cwd, exec = spawnSync } = {}) {
-  let temp;
+export function sendBackBlockedGate({ pr, headSha, requiredChecks, ledgerPath, repo, cwd, statLock = statSync, exec = (command, args, options) => command === 'gh'
+    ? spawnSync(process.execPath, [new URL('./gh-throttle.mjs', import.meta.url).pathname, ...args], options)
+    : spawnSync(command, args, options) } = {}) {
+  let temp, lockPath, lockFd, refusalPath;
   try {
     if (typeof repo !== 'string' || !/^[^/\s]+\/[^/\s]+$/.test(repo)
       || !Number.isSafeInteger(pr?.number) || pr.number <= 0) return { sent: false, reason: 'send-back repo/PR unavailable' };
+    const directory = dirname(ledgerPath);
+    mkdirSync(directory, { recursive: true });
+    accessSync(directory, constants.R_OK | constants.W_OK | constants.X_OK);
+    lockPath = `${ledgerPath}.lock`;
+    // Acquisition and stale removal share a guard: a delayed reaper must never
+    // remove a replacement writer's lock. A crashed guard requires operator repair.
+    const guardPath = `${lockPath}.guard`;
+    let guardFd;
+    try { guardFd = openSync(guardPath, 'wx', 0o600); }
+    catch (error) {
+      if (error.code !== 'EEXIST') throw error;
+      return { sent: false, reason: 'send-back lock guard busy; kept skipped; retry next pass (operator must repair a persistent guard)' };
+    }
+    try {
+      try { lockFd = openSync(lockPath, 'wx', 0o600); }
+      catch (error) {
+        if (error.code !== 'EEXIST') throw error;
+        // The writer is bounded to two minutes; abandoned locks expire after five.
+        if (Date.now() - statLock(lockPath).mtimeMs > 5 * 60_000) rmSync(lockPath);
+        return { sent: false, reason: 'send-back ledger locked; kept skipped; retry next pass (repair a persistent lock)' };
+      }
+    } finally { closeSync(guardFd); rmSync(guardPath); }
     let ledger;
     try { ledger = JSON.parse(readFileSync(ledgerPath, 'utf8')); }
     catch (error) { if (error.code !== 'ENOENT') throw error; ledger = {}; }
@@ -67,14 +92,29 @@ export function sendBackBlockedGate({ pr, headSha, requiredChecks, ledgerPath, r
     const key = `${repo}#${pr.number}`;
     const decision = decideGateSendBack({ pr, headSha, requiredChecks, ledger: ledger[key] || {} });
     if (!decision.send) return { sent: false };
-    mkdirSync(dirname(ledgerPath), { recursive: true });
+    refusalPath = `${ledgerPath}.${headSha.toLowerCase()}.refused`;
+    try {
+      readFileSync(refusalPath, 'utf8');
+      return { sent: false, reason: 'send-back refusal marker present; operator must repair the ledger before retrying' };
+    } catch (error) { if (error.code !== 'ENOENT') throw error; }
     temp = mkdtempSync(join(tmpdir(), 'drain-gate-send-back-'));
     const bodyPath = join(temp, 'findings.md');
     writeFileSync(bodyPath, decision.body, { mode: 0o600 });
+    const live = exec('gh', ['pr', 'view', String(pr.number), `--repo=${repo}`, '--json=headRefOid'],
+      { cwd, encoding: 'utf8', timeout: 30000, maxBuffer: 1024 * 1024 });
+    if (live?.status !== 0 || JSON.parse(live.stdout).headRefOid !== headSha)
+      return { sent: false, reason: 'live head changed or unreadable; kept skipped; retry next pass' };
+    // Reserve a durable refusal before the external write, including crash/ledger-failure recovery.
+    const marker = openSync(refusalPath, 'wx', 0o600);
+    try { writeFileSync(marker, 'send-back may have succeeded; operator must reconcile the ledger before retrying\n'); fsyncSync(marker); }
+    finally { closeSync(marker); }
     const result = exec(process.execPath, [new URL('../review-set-label.mjs', import.meta.url).pathname,
       String(pr.number), `--repo=${repo}`, '--to=changes', `--body-file=${bodyPath}`],
     { cwd, encoding: 'utf8', timeout: 120000, maxBuffer: 1024 * 1024 });
-    if (result?.status !== 0) return { sent: false, reason: 'review-set-label failed; head not recorded; retry next pass' };
+    if (result?.status !== 0) {
+      // A failed process may already have mutated the PR; keep the reservation.
+      return { sent: false, reason: 'review-set-label outcome uncertain; refusal marker retained; operator must reconcile the ledger before retrying' };
+    }
     ledger[key] = { ...(ledger[key] || {}), [headSha.toLowerCase()]: true };
     const pending = `${ledgerPath}.${process.pid}.pending`;
     try {
@@ -82,11 +122,18 @@ export function sendBackBlockedGate({ pr, headSha, requiredChecks, ledgerPath, r
       renameSync(pending, ledgerPath);
     } catch {
       return { sent: true, recorded: false, reason: 'send-back succeeded but ledger write failed; operator must repair the ledger before retrying' };
-    } finally { rmSync(pending, { force: true }); }
+    } finally { try { rmSync(pending, { force: true }); } catch { /* Refusal marker survives cleanup failure. */ } }
+    rmSync(refusalPath);
     return { sent: true, recorded: true };
   } catch {
     return { sent: false, reason: 'send-back evidence, ledger, or CLI unreadable; kept skipped; repair/retry next pass' };
-  } finally { if (temp) rmSync(temp, { recursive: true, force: true }); }
+  } finally {
+    try { if (temp) rmSync(temp, { recursive: true, force: true }); } catch { /* Best effort cleanup. */ }
+    if (lockFd !== undefined) {
+      closeSync(lockFd);
+      try { rmSync(lockPath, { force: true }); } catch { /* A stranded lock expires; refusal markers remain authoritative. */ }
+    }
+  }
 }
 
 /** Side effects live in the pass, never in classifyPr's pure BLOCKED arm. */
