@@ -101,7 +101,7 @@ import { createGhProvider } from '../lib/review-label-provider.mjs';
 import { RED_TEAM_STATUS_LABEL_META } from '../lib/red-team-status-label-meta.mjs';
 import { publishAttention } from './needs-you-feed.mjs';
 
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { closeSync, existsSync, mkdirSync, mkdtempSync, openSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { homedir, hostname, tmpdir } from 'node:os';
 import { basename, dirname, join, resolve } from 'node:path';
@@ -113,6 +113,7 @@ import {
 } from './review-job-store.mjs';
 import { assertMainNotStale, dispatchReview, isReviewCodePath, planReviewDispatch } from './review-dispatch.mjs';
 import { runReport } from './completion-cli.mjs';
+import { shadowReviewStep } from '../lib/flow-engine/shadow.mjs';
 import { writeReviewJobDone, writeReviewJobStarted } from './review-job-envelope.mjs';
 import { reviewSeatLaunchEnv } from '../lib/review-seat-caps.mjs';
 import { workerWrapperEnabledFor } from './worker-wrapper-launch.mjs';
@@ -602,14 +603,28 @@ export function createReviewJobIo({ root = REPO_ROOT, env = process.env, dir = r
     now: () => Date.now(),
     newActorId: () => randomUUID(),
     readPrevCompletion: (slug) => { try { return tryReadCompletion(slug); } catch { return null; } },
+    reviewNetDiff: ({ lanePath, head }) => createHash('sha256').update(exec('git',
+      ['diff', '--no-ext-diff', '--no-textconv', `origin/main...${head}`],
+      { cwd: lanePath, env, encoding: null, timeout: 10_000, maxBuffer: READ_MAX_BUFFER })).digest('hex'),
     // 117 S3b — the job writes its record as the v2 envelope (launcher `node-job`): its own pid/timeout on `started`,
     // a schema-checked result + action on `done`, the v1 words unchanged. `WE_WORKER_WRAPPER=off` keeps the v1 report.
     report: (flags) => {
-      if (!workerWrapperEnabledFor('review', env)) return runReport(flags);
+      const classified = { outcome: flags.outcome, loopOutcome: flags.verdict ?? null, runId: flags.runId ?? null, label: flags.label ?? null,
+        ...(flags.head !== undefined ? { head: flags.head } : {}),
+        ...(flags.netDiff !== undefined ? { netDiff: flags.netDiff } : {}),
+        ...(flags.round !== undefined ? { round: flags.round } : {}),
+      };
+      if (!workerWrapperEnabledFor('review', env)) {
+        const result = runReport(flags);
+        // Observe only after the durable v1 result; shadow failures never affect the report.
+        if (flags.status === 'done') {
+          try { Promise.resolve(shadowReviewStep(structuredClone({ repo: flags.repo ?? null, pr: flags.pr ?? null, classified, session: flags.session }))).catch(() => {}); } catch { /* shadow never affects the tick */ }
+        }
+        return result;
+      }
       if (flags.status === 'started') return writeReviewJobStarted({ session: flags.session, pr: flags.pr, timeoutMs: flags.timeoutMs ?? null });
       return writeReviewJobDone({
-        session: flags.session, pr: flags.pr ?? null, repo: flags.repo ?? null,
-        classified: { outcome: flags.outcome, loopOutcome: flags.verdict ?? null, runId: flags.runId ?? null, label: flags.label ?? null },
+        session: flags.session, pr: flags.pr ?? null, repo: flags.repo ?? null, classified,
       });
     },
     claim: (slug, record) => {
@@ -1599,9 +1614,19 @@ function runReviewArc({
     return result({ ...classified, lanePath });
   } finally {
     const done = classified ?? { outcome: BLOCKED_ON_INFRA, label: 'review-job exited without an outcome' };
+    let identity = {};
+    try {
+      const rev = seatsBox.input?.loopPayload?.findings?.read?.netBasis?.rev;
+      const head = (isRealHead(rev) ? rev : seatsBox.laneHead)?.toLowerCase();
+      if (!redTeamOnly && lanePath && isRealHead(head)) {
+        const netDiff = io.reviewNetDiff?.({ lanePath, head });
+        if (/^[a-f0-9]{64}$/.test(netDiff ?? '')) identity = { head, netDiff };
+      }
+    } catch { /* Missing diff evidence skips shadow observation, never completion reporting. */ }
     try {
       if (!redTeamOnly) io.report({
         session: slug, pr: String(planned.pr), repo: planned.repo, status: 'done', outcome: done.outcome,
+        ...identity,
         ...(done.loopOutcome ? { verdict: done.loopOutcome } : {}),
         ...(done.runId ? { runId: done.runId } : {}),
         ...(done.label ? { label: String(done.label).slice(0, 500) } : {}),
