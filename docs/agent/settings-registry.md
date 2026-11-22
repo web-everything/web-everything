@@ -16,9 +16,9 @@ For repo defaults, edit the owner file through a PR and rebuild the consuming da
 
 ## Summary
 
-- Top-level keys: 162 (164 declaration rows).
-- Declared leaves: 590 (platform copies counted separately).
-- Instant top-level keys: 0; not instant: 162.
+- Top-level keys: 165 (167 declaration rows).
+- Declared leaves: 616 (platform copies counted separately).
+- Instant top-level keys: 0; not instant: 165.
 - Instant capacity leaves: 15.
 - Constants to settle: 312.
 - Instant gaps: 28.
@@ -108,6 +108,7 @@ Operator-prefs layer: ~/.plateau/platform-preferences.json is the requested oper
 | enabled | scripts/settings/review-red-team-on-skip.json | 1 | true | pr | no | Enable recovery of missing red-team results on reviewed heads. |
 | enforce | scripts/settings/claude-accounts.json | 1 | false | pr | no | Enable Claude daemon account enforcement. |
 | entries | scripts/settings/privacy-terms-allowlist.json | 1 | [{"path":"scripts/lib/__tests__/daemon-jobs-runtime.test.mj… | pr | no | Explicit portability exceptions pinned to matched text and line hashes. |
+| expectations | scripts/settings/expectations.json | 1 | [{"id":"ready-no-gate","after":["clear-human","ready-to-mer… | pr | no | Observe-only PR expectation triggers, deadlines and proposed responses; responses are recorded but never executed. |
 | expectedLocalReasons | scripts/settings/forge-share.json | 1 | ["command-not-allowed","needs-git"] | pr | no | Local execution reasons excluded from remote-share warnings. |
 | externalJurors | scripts/settings/review.json | 2 | {"firstOutputMs":120000,"cooldownMs":1800000} | pr | no | First-output timeout and cooldown for external review jurors. |
 | fix | scripts/settings/fix-context-pack.json, scripts/settings/fix-safety.json, scripts/settings/fix.json | 18 | {"contextPack":true,"contextLines":30,"contextMaxBytes":800… | pr | no | Fix context, local verification, round limits and exception policy. |
@@ -147,6 +148,7 @@ Operator-prefs layer: ~/.plateau/platform-preferences.json is the requested oper
 | mergeQueue | scripts/settings/approved-human-surface-hold.json, scripts/settings/human-only-enqueue.json, scripts/settings/merge-queue-numbering.json, scripts/settings/merge-queue-obsolete-runs.json, scripts/settings/merge-queue-refresh.json, scripts/settings/merge-queue.json | 31 | {"skipRebaseApprovedHumanSurface":"on","humanOnly":{"approv… | pr | no | Enqueue, human approval, card numbering and obsolete-run cancellation policy. |
 | mergeQueueBatching | scripts/settings/merge-queue-batching.json | 3 | {"enabled":true,"groupSize":3,"maxGroupsInFlight":8} | pr | no | Merge queue group size and groups in flight. |
 | minNonClaudeSeats | scripts/settings/review.json | 1 | 1 | pr | no | Minimum number of non-Claude review seats. |
+| mode | scripts/settings/expectations.json | 1 | "observe" | env | no | Expectation babysitter mode: off or observe. WE_EXPECTATIONS_MODE overrides the repository default. |
 | modes | scripts/settings/delivery-routes.json | 4 | {"debug":"DEBUG MODE (R817/R823/R826/R852). Diagnose on the… | pr | no | Instructions defining the available delivery modes. |
 | openPrCap | scripts/settings/open-pr-cap.json | 2 | {"excludeCardOnly":true,"excludeAccepted":true} | pr | no | Population exclusions for the open PR cap. |
 | operatorCli | scripts/settings/operator-cli.json | 1 | {"freshFallback":"on"} | pr | no | Allow a fresh operator CLI fallback. |
@@ -167,6 +169,7 @@ Operator-prefs layer: ~/.plateau/platform-preferences.json is the requested oper
 | prepareStaleHours | scripts/settings/coroner-postmortem.json | 1 | 24 | pr | no | Age in hours at which preparation is treated as stale. |
 | prevention | scripts/settings/prevention-batch.json | 4 | {"$comment":"batchFiling enables rolling prevention PRs; fa… | pr | no | Prevention card batching and filing limits. |
 | providerCapacity | scripts/settings/provider-capacity.json | 1 | {"providers":[{"id":"codex","launcher":"codex","tier":3,"al… | pr | no | Provider/account quota windows, readers, reserves, banked resets and minimum tiers for capacity-based routing. |
+| providerRotation | scripts/settings/provider-rotation.json | 24 | {"mode":"shadow","catalog":[{"provider":"codex","model":"gp… | pr | no | Pure provider rotation input: mode, arm catalog/shares, identity families, exhaustion/reserve bounds, strong/small guards and Carbon promotion evidence. |
 | quarantine | scripts/settings/card-ledger-trust.json | 1 | [] | pr | no | Quarantined card-ledger identities. |
 | raisedByMigrate | scripts/settings/raised-by-migrate.json | 1 | {"maxPrsPerRun":10} | pr | no | Maximum PRs attempted per raised-by migration apply run. |
 | readyRecordPath | scripts/settings/prototype-load.json | 1 | "~/workspace/.operations/coordination/fix-ready.jsonl" | pr | no | Fix readiness coordination record location. |
