@@ -302,7 +302,7 @@ describe('lean repair background argv', () => {
     const requests = [];
     const grant = { additionalDirectories: ['/lanes/web-everything/lane-40'], allow: ['Edit(/lanes/web-everything/lane-40/**)'] };
     const sinks = createDispatchSinks({
-      root: '/Users/op/workspace/webeverything', mintSessionId: () => 'sess-grant-1', now: () => new Date('2026-11-22T00:00:00Z'),
+      root: '/repo/webeverything', mintSessionId: () => 'sess-grant-1', now: () => new Date('2026-11-22T00:00:00Z'),
       sessionCwdFor: () => '/tmp/scratch-grant', ensureSessionCwd: (d) => d, resolveSettingsEnv: () => ({}),
       resolveLaneGrant: () => grant, grantLanePermission: () => {}, ensureWorktreeIsolation: () => {},
       reserveLane: () => ({ reserved: false }), releaseLane: () => {},
@@ -467,7 +467,7 @@ describe('the tick reader handoff', () => {
 describe('x87v3ed — the build launch reserves its lane first', () => {
   const payload = { num: '5189', launchKind: 'build', lane: 2, sessionSlug: 'conveyor-5189', scope: ['we:scripts/a.mjs'], prompt: 'brief' };
   const baseSinks = (extra) => createDispatchSinks({
-    root: '/Users/op/workspace/webeverything', mintSessionId: () => 'sess-1', now: () => new Date('2026-10-08T00:00:00Z'),
+    root: '/repo/webeverything', mintSessionId: () => 'sess-1', now: () => new Date('2026-10-08T00:00:00Z'),
     sessionCwdFor: () => '/tmp/scratch', ensureSessionCwd: (d) => d, resolveSettingsEnv: () => ({}),
     resolveLaneGrant: () => ({}), grantLanePermission: () => {}, ensureWorktreeIsolation: () => {},
     ...extra,
@@ -539,7 +539,7 @@ describe('PR #5729 — daemon dispatch fails closed without the gh refusal shim'
     return { invoked, cleanup: () => { chmodSync(claude, 0o700); rmSync(dir, { recursive: true, force: true }); } };
   }
   const sinksWith = (provider) => createDispatchSinks({
-    root: '/Users/op/workspace/webeverything', mintSessionId: () => 'sess-1', now: () => new Date('2026-10-22T00:00:00Z'),
+    root: '/repo/webeverything', mintSessionId: () => 'sess-1', now: () => new Date('2026-10-22T00:00:00Z'),
     sessionCwdFor: () => '/tmp/scratch', ensureSessionCwd: (d) => d, resolveSettingsEnv: resolveDispatchSettingsEnv,
     resolveLaneGrant: () => ({}), grantLanePermission: () => {}, ensureWorktreeIsolation: () => {},
     reserveLane: () => ({ reserved: false }), releaseLane: () => {}, provider,
