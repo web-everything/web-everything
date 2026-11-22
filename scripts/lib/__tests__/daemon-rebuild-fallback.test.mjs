@@ -296,6 +296,28 @@ describe('smokeAndAdopt fallback-plain-main (x5wbsbc)', () => {
     expect(runSmoke).toHaveBeenCalledTimes(2);
   });
 
+  it('a fallback whose plain-main smoke reused a row from an earlier run is NOT adopted (no fresh smoke)', async () => {
+    const { originDir, cloneDir, env } = makeFixture();
+    const prevHead = gitOk(cloneDir, ['rev-parse', 'HEAD']).trim();
+    advanceMain(originDir, (dir) => writeFile(dir, 'main-moved.txt', 'y\n'));
+    pushBranch(originDir, 'lane/bad', (dir) => writeFile(dir, 'bad.txt', 'x\n'));
+    addOverlay(cloneDir, { ref: 'lane/bad' }, { env });
+    const reusedPass = () => {
+      const pass = fullPass();
+      pass.smoke.results[0] = { ...pass.smoke.results[0], reused: true };
+      return pass;
+    };
+    const runSmoke = vi.fn(async ({ root }) => (existsSync(join(root, 'bad.txt'))
+      ? { verdict: 'code', attempts: 1, smoke: { results: [{ ok: false, name: 'x', detail: 'boom' }] } }
+      : reusedPass()));
+    const result = await rebuildClone({
+      root: cloneDir, env, runSmoke, prState: async () => null, lockOpts: LOCK_OPTS,
+    });
+    expect(result.adopted).not.toBe(true);
+    expect(gitOk(cloneDir, ['rev-parse', 'HEAD']).trim()).toBe(prevHead);
+    expect(readOverlays(cloneDir, { env }).map(o => o.ref)).toEqual(['lane/bad']);
+  });
+
   it('a bad NON-pinned overlay: falls back to plain main, adopts it, drops the overlay, alerts both kinds', async () => {
     const { originDir, cloneDir, env } = makeFixture();
     const prevHead = gitOk(cloneDir, ['rev-parse', 'HEAD']).trim();

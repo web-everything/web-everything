@@ -635,7 +635,9 @@ export async function smokeAndAdopt({
     }
     // strictAdopt: the fresh-smoke mark rides the ready record so a deferred adoption can prove its smoke was complete.
     const strictBuild = planStrictAdopt(p) || planStrictAdopt(plan);
-    const freshSmoke = !overFailedSmoke && readyMeta?.forced !== true && completeSmokePass(smokeResult) ? p.finalSha : null;
+    // Fresh means every row ran in THIS run for THIS candidate: no row reused from an earlier candidate/attempt.
+    const freshSmoke = !overFailedSmoke && readyMeta?.forced !== true && completeSmokePass(smokeResult)
+      && !smokeResult.smoke.results.some(row => row?.reused) ? p.finalSha : null;
     writeReadyCandidate(root, {
       ...readyMeta,
       strictAdopt: strictBuild,
