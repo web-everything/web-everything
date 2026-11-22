@@ -4,7 +4,7 @@ kind: story
 size: 3
 status: parked
 parkedReason: maturityGated
-maturityTrigger: "adoptionSignal: before any external user gets access (first customer or public beta)."
+maturityTrigger: "adoptionSignal: the first-external-access gate card (x9sujbc) is scheduled"
 dateParked: "2026-11-22"
 scope: ["plateau:worker.js", "plateau:wrangler.toml", "plateau:scripts/worker-gate.test.mjs"]
 dateOpened: "2026-09-21"
@@ -79,3 +79,5 @@ Plateau's new automated throttle/session tests pass, real preview evidence demon
 - Testing lesson: Node's package module mode can prevent direct import of an otherwise valid Worker. Use each repo's existing Vitest harness for implementation verification and separately exercise actual durable bindings in preview. Keep this lesson here; do not append it to shared agent documentation.
 
 Parked 2026-11-22 (plateau ruling, master plan). Unpark when: before any external user gets access (first customer or public beta).
+
+Gate card: x9sujbc (First external access (beta) release gate) is blockedBy this card. Unpark when the first-external-access gate card is scheduled.
