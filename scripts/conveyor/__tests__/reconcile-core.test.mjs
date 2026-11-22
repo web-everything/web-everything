@@ -4994,3 +4994,11 @@ it.each([
   expect(reviewHoldCiWaivable({ pr, requiredChecks })).toBe(true);
   expect(reviewHoldCiWaivable({ pr: { ...pr, ...evidence }, requiredChecks })).toBe(false);
 });
+
+import { extractFindings } from '../fix-context-pack.mjs';
+import redTeamSendBack from './fixtures/pr7312-red-team-send-back.json';
+it('red-team gate send-back counts as a finding', () => {
+  const comment = redTeamSendBack;
+  expect(countFindings([comment])).toBeGreaterThanOrEqual(1);
+  expect(extractFindings([comment]).findings.length).toBeGreaterThanOrEqual(1);
+});
