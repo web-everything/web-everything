@@ -1,6 +1,7 @@
 import { it, expect, vi } from 'vitest';
 import { roundEndRefusal, applyIntakeEffects, applyIntakeEffectsSync } from '../round-end-gates.mjs';
 const readIntake = () => ({ verdict: 'fail', reason: 'split-required', lines: 585 });
+const sizeSettings = { dataExtensions: ['.json'], dataDirs: [], dataPaths: [] };
 it('on refuses split and unreadable evidence; off never reads; shadow only observes', () => {
   expect(roundEndRefusal({ pr: {}, attempts: 1, readIntake, enforce: 'on' }).kind).toBe('split-required');
   expect(roundEndRefusal({ pr: {}, attempts: 1, enforce: 'on', readIntake: () => { throw Error('read'); } }).kind).toBe('intake-unmeasurable');
@@ -9,9 +10,10 @@ it('on refuses split and unreadable evidence; off never reads; shadow only obser
 });
 it('card must succeed before event; failure retries and shadow never files', async () => {
   const events = [], card = vi.fn(async () => ({ cardPublished: true }));
-  const note = { kind: 'intake-effect', intake: { kind: 'split-required', lines: 585 }, pr: { number: 7181 } };
+  const note = { kind: 'intake-effect', intake: { kind: 'split-required', lines: 585, sizeSettings }, pr: { number: 7181 } };
   await applyIntakeEffects({ notes: [note] }, { runSize: card, appendEvent: async e => events.push(e) });
   expect(card).toHaveBeenCalledTimes(1); expect(events[0].kind).toBe('intake-split-required');
+  expect(card).toHaveBeenCalledWith(expect.objectContaining({ requireSplit: true, sizeSettings }));
   await expect(applyIntakeEffects({ notes: [note] }, { runSize: async () => ({ body: '' }), appendEvent: async e => events.push(e) })).rejects.toThrow();
   expect(events).toHaveLength(1);
   await applyIntakeEffects({ notes: [{ ...note, intake: { ...note.intake, shadow: true } }] }, { runSize: card, appendEvent: async e => events.push(e) });
@@ -19,7 +21,7 @@ it('card must succeed before event; failure retries and shadow never files', asy
 });
 
 it('moved head refuses effects before card and after card without appending event', async () => {
-  const note = { kind: 'intake-effect', intake: { kind: 'split-required' }, pr: { number: 1, headRefOid: 'a'.repeat(40) } };
+  const note = { kind: 'intake-effect', intake: { kind: 'split-required', sizeSettings }, pr: { number: 1, headRefOid: 'a'.repeat(40) } };
   const card = vi.fn(async () => ({ cardPublished: true })), event = vi.fn();
   await expect(applyIntakeEffects({ notes: [note] }, { runSize: card, appendEvent: event, readHead: () => 'b'.repeat(40) })).rejects.toThrow('stale size request');
   expect(card).not.toHaveBeenCalled();

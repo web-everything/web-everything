@@ -6,10 +6,19 @@ import { OPEN_PR_MAX_NON_TEST_LINES, parseNumstat, measureEntries } from '../pr-
 import { createGitReader } from '../pr-size-admission.mjs';
 import { isTrustedMarkerAuthor } from '../marker-authorship.mjs';
 import { cascadePolicy } from '../policy-cascade.mjs';
+import { loadPrSizeSettingsFile } from '../pr-size-settings.mjs';
 const standard = { maxLines: OPEN_PR_MAX_NON_TEST_LINES, ...defaults.intake };
 const sha = /^[a-f0-9]{40}(?![\s\S])/;
 const unknown = () => ({ verdict: 'unknown', reason: 'unverifiable', lines: null, round: null });
-export function readIntakeSettings({ env = process.env, tool = standard, ...options } = {}) {
+const SIZE_KEYS = ['dataExtensions', 'dataDirs', 'dataPaths'];
+/** The size runner's own resolved data classification. Anything else is unmeasurable, never a silent default. */
+function sizeSettingsOf(value) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)
+    || !SIZE_KEYS.every(k => Array.isArray(value[k]) && value[k].every(v => typeof v === 'string'))) throw Error('invalid size settings');
+  return Object.freeze(Object.fromEntries(SIZE_KEYS.map(k => [k, Object.freeze([...value[k]])])));
+}
+/** Resolve once, with the caller's environment, and carry the result into every later stage. */
+export function readIntakeSettings({ env = process.env, tool = standard, loadSize = e => loadPrSizeSettingsFile(undefined, { env: e }), ...options } = {}) {
   const envValues = Object.fromEntries(Object.entries(standard).map(([key, value]) => {
     const raw = env[`WE_REVIEW_INTAKE_${key.replace(/[A-Z]/g, c => `_${c}`).toUpperCase()}`];
     return [key, raw === undefined ? undefined : typeof value === 'number' ? Number(raw)
@@ -21,7 +30,12 @@ export function readIntakeSettings({ env = process.env, tool = standard, ...opti
     || value.countRule !== 'non-test-non-data' || value.overCapAction !== 'split-after-rounds'
     || !['exemptPaths', 'generatedPaths', 'atomicExempt'].every(k => Array.isArray(value[k]) && value[k].every(v => typeof v === 'string'))
     || typeof value.urgentExempt !== 'boolean' || typeof value.trackOverrides !== 'boolean') throw Error('invalid intake settings; operator must repair policy');
-  return value;
+  // A bad prSize layer makes each PR's intake unknown (human review), as it makes the size runner unknown.
+  let sizeSettings = null;
+  try { sizeSettings = sizeSettingsOf(loadSize(env)); } catch {
+    try { console.error('prSize settings unreadable; intake unknown for every PR; operator must repair prSize policy'); } catch { /* best-effort */ }
+  }
+  return { ...value, sizeSettings };
 }
 export function check(subject, params = {}) {
   try {
@@ -35,8 +49,10 @@ export function check(subject, params = {}) {
         || !Number.isSafeInteger(e.changed) || e.changed < 0) throw Error('invalid numstat');
       return !(e.paths.length === 2 && e.changed === 0 && p.atomicExempt.includes('rename-only')) && !e.paths.every(path => exempt(path) || generated(path));
     });
-    const { lines } = measureEntries(counted);
-    const result = { verdict: 'pass', reason: 'under-cap', lines, round, head, baseSha };
+    // Same classification as the size runner: the caller's resolved settings, else this process's resolution.
+    const sizeSettings = sizeSettingsOf(Object.hasOwn(params, 'sizeSettings') ? params.sizeSettings : loadPrSizeSettingsFile());
+    const { lines } = measureEntries(counted, sizeSettings);
+    const result = { verdict: 'pass', reason: 'under-cap', lines, round, head, baseSha, sizeSettings };
     let urgent, override;
     for (const marker of markers) {
       if (!isTrustedMarkerAuthor(marker)) continue;

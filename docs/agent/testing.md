@@ -5971,6 +5971,9 @@ assertions intact; consumers without callable entries retain the fresh-import pa
 ## Review intake round-end effects
 
 Intake decisions use merge-base numstat and `roundAttempts()`, with labels excluded from evidence.
+Intake counts data lines with the resolved `prSize` settings, read once with the reconcile environment.
+The split request carries those settings to the size runner, so both stages classify every path the same way.
+Unreadable `prSize` settings make intake unknown, never the built-in default.
 The synchronous reconcile shell awaits the async size-card runner through a bounded child, then emits
 an event only after explicit publication confirmation and live head checks on both sides. Keep the
 refusal mutation, publication-failure, moved-head, shadow, and read-only CLI fixtures scoped through heavy admission.

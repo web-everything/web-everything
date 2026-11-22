@@ -301,6 +301,16 @@ export function replaceOwnedSection(body, sectionText) {
   return body + (body ? '\n\n' : '') + section;
 }
 
+/** Settings an intake caller already resolved. Incomplete or malformed settings are unknown size, never defaults. */
+function requestedSizeSettings(value) {
+  const keys = ['dataExtensions', 'dataDirs', 'dataPaths'];
+  if (!value || typeof value !== 'object' || Array.isArray(value)
+    || !keys.every((key) => Array.isArray(value[key]) && value[key].every((entry) => typeof entry === 'string'))) {
+    throw new Error('invalid requested size settings');
+  }
+  return Object.fromEntries(keys.map((key) => [key, [...value[key]]]));
+}
+
 function splitCardId(value) {
   const id = typeof value === 'number' && Number.isSafeInteger(value) ? String(value) : value;
   return typeof id === 'string' && /^[A-Za-z0-9]{1,64}(?![\s\S])/.test(id) ? id : null;
@@ -325,7 +335,10 @@ export function createSizeAdmissionRunner({ cwd = process.cwd(), env = process.e
         throw new Error('stale size request');
       }
       entries = parseNumstat(text);
-      plan = planSizeAdmission(measureEntries(entries, loadSizeSettings(undefined, { env })));
+      // A requested split carries the settings intake measured with; never re-resolve them in another process.
+      const settings = request.requireSplit === true && request.sizeSettings !== undefined
+        ? requestedSizeSettings(request.sizeSettings) : loadSizeSettings(undefined, { env });
+      plan = planSizeAdmission(measureEntries(entries, settings));
     } catch (error) { plan = planSizeAdmission(error); }
     if (request.requireSplit === true && plan.status === 'ok' && plan.lines > 0) plan.status = 'over';
     const result = { ...plan, body, reviewLabel: null, ...(pinnedSha ? { sha: pinnedSha } : {}) };

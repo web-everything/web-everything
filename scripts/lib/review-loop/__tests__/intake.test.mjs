@@ -52,6 +52,56 @@ describe('intake', () => {
   });
 });
 
+describe('intake and the size runner share one resolved PR-size setting', async () => {
+  const { loadPrSizeSettingsFile } = await import('../../pr-size-settings.mjs');
+  const { createSizeAdmissionRunner } = await import('../../pr-size-admission.mjs');
+  const { BUILT_IN_PR_SIZE_SETTINGS } = await import('../../pr-size-defaults.mjs');
+  const resolve = env => readIntakeSettings({ env, platform: {}, operatorOverride: {}, loadSize: e => loadPrSizeSettingsFile(undefined, { env: e, platform: {} }) });
+  const feature = '585\t0\tconfig/feature.json\0', contract = '585\t0\tschemas/contract.json\0';
+  const runner = text => {
+    const fileItem = vi.fn(() => ({ verdict: { num: 9001 } }));
+    // The effects child resolves its own environment: model one that never saw the parent's overrides.
+    const run = createSizeAdmissionRunner({ loadSizeSettings: () => BUILT_IN_PR_SIZE_SETTINGS, diffStat: () => ({ text, sha: head, baseSha }),
+      fileItem, lookupSplitCard: () => null, publishSplitCard: async () => ({ batched: true }) });
+    return { run, fileItem };
+  };
+  const effect = async (settings, text) => {
+    const pr = { number: 7181, headRefOid: head, headRefName: 'lane/x', baseRefName: 'main', body: '' };
+    const intake = roundEndRefusal({ pr, attempts: 1, enforce: 'on', readIntake: () => check(subject({ entries: parseNumstat(text) }), settings) });
+    const { run, fileItem } = runner(text), appendEvent = vi.fn(async () => true);
+    if (intake) await applyIntakeEffects({ notes: [{ kind: 'intake-effect', pr, intake }] }, { runSize: run, appendEvent });
+    return { intake, fileItem, appendEvent };
+  };
+  it('an emptied data-directory list counts config files in intake too', async () => {
+    const settings = resolve({ WE_PR_SIZE_DATA_DIRS: '[]' });
+    expect(settings.sizeSettings.dataDirs).toEqual([]);
+    expect(check(subject({ entries: parseNumstat(feature) }), settings)).toMatchObject({ verdict: 'fail', reason: 'split-required', lines: 585 });
+    const { intake, fileItem, appendEvent } = await effect(settings, feature);
+    expect(intake).toMatchObject({ kind: 'split-required', lines: 585 });
+    expect(fileItem).toHaveBeenCalledOnce();
+    expect(appendEvent).toHaveBeenCalledWith(expect.objectContaining({ kind: 'intake-split-required', detail: expect.objectContaining({ lines: 585 }) }));
+  });
+  it('a declared data path is data in intake too, so no split is demanded', async () => {
+    const settings = resolve({ WE_PR_SIZE_DATA_PATHS: '["schemas/contract.json"]' });
+    expect(check(subject({ entries: parseNumstat(contract) }), settings)).toMatchObject({ verdict: 'pass', lines: 0 });
+    const { intake, fileItem } = await effect(settings, contract);
+    expect(intake).toBeNull();
+    expect(fileItem).not.toHaveBeenCalled();
+  });
+  it('unreadable or malformed size settings are unknown, never the built-in default', () => {
+    const bad = readIntakeSettings({ env: {}, platform: {}, operatorOverride: {}, loadSize: () => { throw Error('Invalid prSize env.dataDirs'); } });
+    expect(bad.sizeSettings).toBeNull();
+    for (const sizeSettings of [null, {}, { dataExtensions: ['.json'], dataDirs: 'config', dataPaths: [] }, { ...BUILT_IN_PR_SIZE_SETTINGS, dataPaths: [7] }])
+      expect(check(subject({ entries: parseNumstat(feature) }), { sizeSettings })).toMatchObject({ verdict: 'unknown', reason: 'unverifiable' });
+    expect(roundEndRefusal({ pr: {}, attempts: 1, enforce: 'on', readIntake: () => check(subject(), bad) }).kind).toBe('intake-unmeasurable');
+  });
+  it('enforced split effects refuse a note that lost its measured settings', async () => {
+    const runSize = vi.fn(async () => ({ cardPublished: true }));
+    await expect(applyIntakeEffects({ notes: [{ kind: 'intake-effect', pr: { number: 1 }, intake: { kind: 'split-required', lines: 585 } }] }, { runSize, appendEvent: vi.fn() })).rejects.toThrow('operator');
+    expect(runSize).not.toHaveBeenCalled();
+  });
+});
+
 it('CLI pins numstat and lists would-splits read-only for one PR and all open PRs', async () => {
   const comments = await import('../../../conveyor/pr-comments-complete.mjs');
   const { REARM_COMMENT_MARKER } = await import('../../../conveyor/rearm-review.mjs');

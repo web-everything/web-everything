@@ -20,7 +20,9 @@ export async function applyIntakeEffects(plan, { runSize = createSizeAdmissionRu
     const repo = note.repo ? ghRepoSlug(note.repo) : undefined;
     if (readHead && await readHead(pr, repo) !== pr.headRefOid) throw Error('stale size request; remeasure next tick');
     if (intake.kind === 'split-required' && !intake.shadow) {
-      const result = await runSize({ repo, pr: pr.number, ref: pr.headRefName, sha: pr.headRefOid, base: pr.baseRefName ?? 'main', body: pr.body ?? '', requireSplit: true });
+      // The card must count with the settings intake measured with, not this child's own resolution.
+      if (!intake.sizeSettings) throw Error('intake size settings missing; operator must retry intake');
+      const result = await runSize({ repo, pr: pr.number, ref: pr.headRefName, sha: pr.headRefOid, base: pr.baseRefName ?? 'main', body: pr.body ?? '', requireSplit: true, sizeSettings: intake.sizeSettings });
       if (result.cardPublished !== true) throw Error('split card not published; operator must retry intake');
     }
     if (readHead && await readHead(pr, repo) !== pr.headRefOid) throw Error('stale size request; remeasure next tick');

@@ -1647,3 +1647,20 @@ it('intake split uses the existing idempotent card path below the legacy default
   const failed = await sizeAdmission.createSizeAdmissionRunner(effects({ publishSplitCard: async () => { throw Error('offline'); } }))({ ...request, body: `<!-- size-published:${KEY} -->` });
   expect(failed.cardPublished).toBe(false);
 });
+
+it('an intake split counts with the settings intake resolved, never a re-resolution in this process', async () => {
+  const text = '585\t0\tconfig/feature.json\0';
+  const loadSizeSettings = vi.fn(() => BUILT_IN_PR_SIZE_SETTINGS);
+  const io = effects({ loadSizeSettings, diffStat: () => ({ text, sha: HEAD_SHA, baseSha: BASE_SHA }) });
+  const run = sizeAdmission.createSizeAdmissionRunner(io);
+  // Built-in settings call config/ data: the runner alone would answer ok with nothing to split.
+  expect(await run({ ...request, requireSplit: true })).toMatchObject({ status: 'ok', lines: 0 });
+  const split = await run({ ...request, requireSplit: true, sizeSettings: { dataExtensions: ['.json'], dataDirs: [], dataPaths: [] } });
+  expect(split).toMatchObject({ status: 'over', lines: 585, cardPublished: true });
+  expect(loadSizeSettings).toHaveBeenCalledTimes(1);
+  for (const sizeSettings of [null, {}, { dataExtensions: ['.json'], dataDirs: 'config', dataPaths: [] }]) {
+    expect(await run({ ...request, requireSplit: true, sizeSettings })).toMatchObject({ status: 'unknown', reviewLabel: 'review:pending' });
+  }
+  // Only an intake split may carry settings; ordinary admission keeps its own resolution.
+  expect(await run({ ...request, sizeSettings: { dataExtensions: ['.json'], dataDirs: [], dataPaths: [] } })).toMatchObject({ status: 'ok', lines: 0 });
+});
