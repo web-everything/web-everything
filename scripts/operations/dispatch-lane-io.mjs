@@ -2400,30 +2400,37 @@ export function laneRepoKey(payload) {
  * sinks write into the scratch cwd's settings.local.json never reaches it, and its file tools are confined to
  * the working directories (a lane read without `--add-dir` was refused live: "outside <cwd>; --restricted
  * confines the file tools to the working directory"). It is the explicit grant (the sink's, for the assigned
- * lane), plus `<pool>/lane-N` when the payload names a lane, plus the pool roots of the dispatch's repo
- * ({@link laneRepoKey}). The pool roots are always included because fix and ci-heal lanes are not reserved
- * before launch: when the assigned lane is leased, the brief's acquire takes another free lane in the same pool.
- * Lane clones only, never a primary checkout; the repo's Edit/Write lane guard still applies inside them. The
- * derivation does no filesystem I/O: a missing `--add-dir` path is accepted by the CLI (checked live), and a
- * pure builder keeps every argv test hermetic. Fails closed when no directory remains.
+ * lane). Grant exactly one named lane in the dispatch repo's pool. A missing assignment, a broader explicit
+ * directory or unrelated allow rule refuses dispatch; changing lanes requires a new scoped dispatch.
  * @param {{lane?:string|number|null, scope?:string|string[]|null, launchKind?:string}} payload
  * @param {{additionalDirectories?:string[], allow?:string[]}|null} [laneGrant]
  * @returns {{additionalDirectories:string[], allow:string[]}}
  */
 export function leanRepairGrant(payload, laneGrant = null, {
-  root = REPO_ROOT, poolDirs = (repoKey) => laneWorkspacePoolDirs(root, repoKey),
+  root = REPO_ROOT, poolDirs = (repoKey) => laneWorkspacePoolDirs(root, repoKey), exists = existsSync,
 } = {}) {
   const clean = (list) => (Array.isArray(list) ? list.filter(v => typeof v === 'string' && v.trim()) : []);
+  if (laneGrant && ['additionalDirectories', 'allow'].some(key => laneGrant[key] !== undefined
+    && (!Array.isArray(laneGrant[key]) || laneGrant[key].some(value => typeof value !== 'string' || !value.trim())))) {
+    throw notApplied('dispatch-lane: no lane directory grant with valid explicit permissions; repair the malformed grant');
+  }
   const pools = clean(poolDirs(laneRepoKey(payload)));
   const lane = payload?.lane == null ? '' : String(payload.lane).trim();
-  const dirs = [...clean(laneGrant?.additionalDirectories),
-    ...(/^\d+$/.test(lane) ? pools.map(pool => join(pool, `lane-${lane}`)) : []), ...pools];
-  const allow = [...clean(laneGrant?.allow), ...dirs.flatMap(d => [`Edit(${d}/**)`, `Write(${d}/**)`]),
-    ...conflictHelperAllowRules(root), ...rearmReviewAllowRules(root)];
-  if (!dirs.length) {
-    throw notApplied('dispatch-lane: no lane directory to grant this restricted repair session; check the lane pool and retry');
+  if (!/^[1-9]\d*$/.test(lane) || !pools.length) {
+    throw notApplied('dispatch-lane: no lane directory to grant this restricted repair session; assign a named lane and retry');
   }
-  return { additionalDirectories: [...new Set(dirs)], allow: [...new Set(allow)] };
+  const candidates = pools.map(pool => join(pool, `lane-${lane}`));
+  const explicit = clean(laneGrant?.additionalDirectories);
+  if (explicit.length > 1 || explicit.some(dir => !candidates.includes(dir))) {
+    throw notApplied('dispatch-lane: restricted repair grant must name only the assigned lane');
+  }
+  const dirs = [explicit[0] ?? candidates.find(exists) ?? candidates[0]];
+  const allow = [...dirs.flatMap(d => [`Edit(${d}/**)`, `Write(${d}/**)`]),
+    ...conflictHelperAllowRules(root), ...rearmReviewAllowRules(root)];
+  if (clean(laneGrant?.allow).some(rule => !allow.includes(rule))) {
+    throw notApplied('dispatch-lane: restricted repair grant contains permissions outside the assigned lane');
+  }
+  return { additionalDirectories: dirs, allow: [...new Set(allow)] };
 }
 
 /**
@@ -2660,6 +2667,8 @@ export function buildAgentArgv({
   advisor = null,
   // PR #7332 — the dispatch's lane grant ({additionalDirectories, allow}); fix/ci-heal only, see leanRepairGrant.
   laneGrant = null,
+  // Injectable reader for hermetic probes; production uses the validated repository settings.
+  loadRepairSettings = LEAN_FIX_HOOKS_SETTINGS,
 }) {
   const prompt = String(payload?.prompt || '');
   if (!prompt.trim()) throw notApplied('dispatch-lane: refusing to start an agent with an empty prompt');
@@ -2689,9 +2698,9 @@ export function buildAgentArgv({
   let addDirArgs = [];
   if (leanFix) {
     const forbidden = extraArgs.map(String).find(arg =>
-      /^--(?:settings|tools|setting-sources|bare|safe-mode|dangerously-skip-permissions|permission-mode|add-dir|mcp-config)(?:=|$)/.test(arg));
+      /^--(?:settings|tools|allowedTools|allowed-tools|disallowedTools|disallowed-tools|setting-sources|bare|safe-mode|(?:allow-)?dangerously-skip-permissions|permission-mode|add-dir|mcp-config)(?:=|$)/.test(arg));
     if (forbidden) throw notApplied(`dispatch-lane: lean repair extraArgs cannot override ${forbidden.split('=')[0]}`);
-    try { Object.assign(sessionSettings, LEAN_FIX_HOOKS_SETTINGS()); }
+    try { Object.assign(sessionSettings, loadRepairSettings()); }
     catch (error) {
       throw notApplied(`dispatch-lane: cannot load lean repair hooks from .claude/settings.json; restore the repo settings before retrying: ${error.message}`);
     }

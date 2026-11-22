@@ -24,13 +24,21 @@ import { LEAN_FIX_HOOKS_SETTINGS, LEAN_FIX_TOOLS } from '../../operations/minima
 // A fix dispatch is a lean repair session (PR #7332): its `--settings` carries the repo hooks + tool allowlist
 // beside the env/worktree pair, and its argv adds the restricted-session flags. Derive both from the real
 // helper so these assertions track the repo settings, never a hand-copied hook blob. Round 2: `--restricted`
-// ignores settings.local.json, so the lane grant (this path reserves no lane: the repo's pool roots) rides
-// in the `--settings` permissions and as `--add-dir` flags.
-const LEAN_GRANT = leanRepairGrant({ launchKind: 'fix' });
+// ignores settings.local.json, so the planner's named lane rides in settings and --add-dir.
+vi.mock('../../operations/minimal-context-provider.mjs', async (original) => {
+  const actual = await original();
+  const root = new URL('../../..', import.meta.url).pathname;
+  return { ...actual, LEAN_FIX_HOOKS_SETTINGS: () => actual.LEAN_FIX_HOOKS_SETTINGS(
+    new URL('../../operations/__tests__/fixtures/lean-hooks-claude-settings.json', import.meta.url).pathname,
+    { repoRoot: root, guardRoot: root },
+  ) };
+});
+const LEAN_GRANT = leanRepairGrant({ launchKind: 'fix', lane: 9 });
 const leanFixSettings = (env) => {
   const hooks = LEAN_FIX_HOOKS_SETTINGS();
   return JSON.stringify({ env, worktree: { bgIsolation: 'none' }, ...hooks, permissions: {
-    allow: [...hooks.permissions.allow, ...LEAN_GRANT.allow], additionalDirectories: LEAN_GRANT.additionalDirectories } });
+    ...hooks.permissions, allow: [...new Set([...hooks.permissions.allow, ...LEAN_GRANT.allow])],
+    additionalDirectories: LEAN_GRANT.additionalDirectories } });
 };
 const LEAN_FIX_FLAGS = [...LEAN_GRANT.additionalDirectories.flatMap(dir => ['--add-dir', dir]),
   '--restricted', '--tools', LEAN_FIX_TOOLS, '--strict-mcp-config', '--disable-slash-commands'];

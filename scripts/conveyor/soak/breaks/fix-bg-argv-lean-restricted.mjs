@@ -18,6 +18,9 @@ const GUARD_FAULTS = [
   { event: 'Stop', script: 'scripts/guard-stop-passive-wait.mjs' },
   { event: 'PostToolUse', script: 'scripts/broadcast-inject.mjs' },
   { event: 'PostToolUse', script: 'scripts/backlog-guard.mjs' },
+  { event: 'PreToolUse', script: 'scripts/guard-bash.mjs', fault: 'async' },
+  { event: 'PreToolUse', script: 'scripts/guard-bash.mjs', fault: 'echo' },
+  { event: 'Stop', script: 'scripts/guard-stop-passive-wait.mjs', fault: 'launcher' },
 ];
 const GUARDS = {
   Bash: ['guard-bash.mjs'],
@@ -28,10 +31,16 @@ const GUARDS = {
 // caching a different tree's builder or settings. No agent is spawned by buildAgentArgv.
 const PROBE = `
 const { buildAgentArgv } = await import(process.argv[1]);
+const { LEAN_FIX_HOOKS_SETTINGS } = await import(process.argv[2]);
+const { fileURLToPath } = await import('node:url');
+const repoRoot = fileURLToPath(new URL('../../', process.argv[2]));
+const hookOptions = { repoRoot, guardRoot: repoRoot };
+const loadRepairSettings = () => LEAN_FIX_HOOKS_SETTINGS(process.argv[3], hookOptions);
 const observations = ['fix', 'ci-heal'].map(launchKind => {
   try {
     return { launchKind, argv: buildAgentArgv({
-      payload: { launchKind, num: '3037', sessionSlug: 'repair-3037', prompt: 'Repair this PR.' },
+      payload: { launchKind, lane: 7, num: '3037', sessionSlug: 'repair-3037', prompt: 'Repair this PR.' },
+      loadRepairSettings,
       settingsEnv: { PATH: '/fixture/bin' }, worktreeSettings: { bgIsolation: 'none' },
     }) };
   } catch (error) { return { launchKind, error: error.message }; }
@@ -41,18 +50,24 @@ const { join } = await import('node:path');
 const { tmpdir } = await import('node:os');
 let guardFaults;
 try {
-  const { LEAN_FIX_HOOKS_SETTINGS } = await import(process.argv[2]);
   const canonical = readFileSync(process.argv[3], 'utf8');
   const dir = mkdtempSync(join(tmpdir(), 'soak-lean-guards-'));
   try {
-    guardFaults = JSON.parse(process.argv[4]).map(({ event, script }) => {
+    // A successful baseline prevents missing infrastructure from making every refusal look correct.
+    loadRepairSettings();
+    guardFaults = JSON.parse(process.argv[4]).map(({ event, script, fault }) => {
       const settings = JSON.parse(canonical);
       for (const entry of settings.hooks?.[event] ?? []) {
-        for (const hook of entry.hooks ?? []) hook.command = String(hook.command).split(script).join('scripts/noop.mjs');
+        for (const hook of entry.hooks ?? []) {
+          if (!hook.command.includes(script)) continue;
+          if (fault === 'async') hook.async = true;
+          else if (fault === 'echo') hook.command = 'echo ' + script;
+          else if (fault !== 'launcher') hook.command = String(hook.command).split(script).join('scripts/noop.mjs');
+        }
       }
       const path = join(dir, 'settings.json');
       writeFileSync(path, JSON.stringify(settings));
-      try { LEAN_FIX_HOOKS_SETTINGS(path); return { event, script, refused: false }; }
+      try { LEAN_FIX_HOOKS_SETTINGS(path, { ...hookOptions, ...(fault === 'launcher' ? { guardRoot: dir } : {}) }); return { event, script, refused: false }; }
       catch { return { event, script, refused: true }; }
     });
   } finally { rmSync(dir, { recursive: true, force: true }); }
@@ -92,8 +107,8 @@ function judge(report) {
     }
     // Round 2: --restricted ignores settings.local.json, so the lane grant must ride in the argv as --add-dir.
     const addDirs = argv.flatMap((arg, i) => (arg === '--add-dir' ? [argv[i + 1]] : []));
-    if (!addDirs.some(dir => typeof dir === 'string' && /\/\.lanes\/[^/]+(?:\/lane-\d+)?$/.test(dir))) {
-      violations.push(`${kind}: no --add-dir lane grant (restricted mode ignores settings.local.json)`);
+    if (addDirs.length !== 1 || !/\/\.lanes\/[^/]+\/lane-7$/.test(addDirs[0])) {
+      violations.push(`${kind}: grant must name only lane-7 (never its pool or a sibling lane)`);
     }
     // Count equals-form overrides as well: a second settings argument can erase the guards.
     const settingsFlags = argv.filter(arg => arg === '--settings' || arg.startsWith('--settings='));
@@ -103,6 +118,8 @@ function judge(report) {
     }
     try {
       const settings = JSON.parse(argv[argv.indexOf('--settings') + 1]);
+      if (settings.permissions?.allow?.includes('Agent')) violations.push(`${kind}: invented blanket Agent allow`);
+      if (JSON.stringify(settings.hooks).includes('node scripts/')) violations.push(`${kind}: unresolved relative hook`);
       const pre = settings?.hooks?.PreToolUse;
       for (const [matcher, guards] of Object.entries(GUARDS)) {
         const hooks = Array.isArray(pre)
@@ -154,11 +171,12 @@ export default {
     check('missing builder evidence fails closed', judge({}).length === 0);
     if (judge(report).length === 0) {
       for (const kind of KINDS) {
-        for (const fault of ['--restricted', '--strict-mcp-config', 'Bash', 'Edit|Write', 'duplicate settings', 'invalid JSON',
+        for (const fault of ['--restricted', '--strict-mcp-config', 'Bash', 'Edit|Write', 'duplicate settings', 'invalid JSON', 'pool grant',
           'Stop guard', 'broadcast']) {
           const broken = structuredClone(report);
           const row = broken.observations.find(entry => entry.launchKind === kind);
           if (fault.startsWith('--')) row.argv = row.argv.filter(arg => arg !== fault);
+          else if (fault === 'pool grant') row.argv.push('--add-dir', '/w/.lanes/web-everything');
           else if (fault === 'duplicate settings') row.argv.push('--settings={}');
           else {
             const index = row.argv.indexOf('--settings') + 1;

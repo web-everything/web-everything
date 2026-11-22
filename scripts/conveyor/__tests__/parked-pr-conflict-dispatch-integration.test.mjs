@@ -31,7 +31,7 @@
  * real subprocess cost does not belong in the ~2000-file unit pool) and `vitest.integration.config.ts`'s
  * `test.include` (so `npm run test:integration:vitest`, CI's own gate, still runs it before merge).
  */
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, vi } from 'vitest';
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { execFileSync } from 'node:child_process';
@@ -43,8 +43,16 @@ import { LEAN_FIX_HOOKS_SETTINGS, LEAN_FIX_TOOLS } from '../../operations/minima
 import { stopSession } from '../../operations/dispatch-abort.mjs';
 import { buildAuthorActorMarker } from '../../lib/review-independence.mjs';
 
-// PR #7332 round 2 — the reconcile fix path reserves no lane, so its restricted session is granted the pool roots.
-const LEAN_GRANT = leanRepairGrant({ launchKind: 'fix' });
+// Validate hooks against fixture files and pin the planner's single lane grant.
+vi.mock('../../operations/minimal-context-provider.mjs', async (original) => {
+  const actual = await original();
+  const root = new URL('../../..', import.meta.url).pathname;
+  return { ...actual, LEAN_FIX_HOOKS_SETTINGS: () => actual.LEAN_FIX_HOOKS_SETTINGS(
+    new URL('../../operations/__tests__/fixtures/lean-hooks-claude-settings.json', import.meta.url).pathname,
+    { repoRoot: root, guardRoot: root },
+  ) };
+});
+const LEAN_GRANT = leanRepairGrant({ launchKind: 'fix', lane: 13 });
 
 import {
   isParkedConflictTarget, planConflictLabelChange, isStatuteTierConflict, buildConflictFindingBody,
@@ -260,7 +268,9 @@ describe('#xu2krte end-to-end — a REAL merge conflict, dispatched through the 
           // and the restricted-session flags follow it.
           // Round 2: `--restricted` ignores settings.local.json, so the lane grant rides `--settings` and `--add-dir`.
           '--settings', JSON.stringify({ env: { WE_CONVEYOR_WORKER: '1' }, worktree: { bgIsolation: 'none' }, ...LEAN_FIX_HOOKS_SETTINGS(),
-            permissions: { allow: [...LEAN_FIX_TOOLS.split(','), ...LEAN_GRANT.allow], additionalDirectories: LEAN_GRANT.additionalDirectories } }),
+            permissions: { ...LEAN_FIX_HOOKS_SETTINGS().permissions,
+              allow: [...new Set([...LEAN_FIX_HOOKS_SETTINGS().permissions.allow, ...LEAN_GRANT.allow])],
+              additionalDirectories: LEAN_GRANT.additionalDirectories } }),
           ...LEAN_GRANT.additionalDirectories.flatMap(dir => ['--add-dir', dir]),
           '--restricted', '--tools', LEAN_FIX_TOOLS, '--strict-mcp-config', '--disable-slash-commands',
           '--append-system-prompt-file', DISPATCHED_AGENT_SYSTEM_PROMPT_FILE,

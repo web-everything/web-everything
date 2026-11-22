@@ -1,6 +1,7 @@
 import { describe, it, expect, vi, afterEach } from 'vitest';
 import * as fs from 'node:fs';
 import { createHash } from 'node:crypto';
+import { execFileSync } from 'node:child_process';
 import { mkdtempSync, mkdirSync, writeFileSync, chmodSync, rmSync, existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
@@ -20,13 +21,112 @@ vi.mock('../minimal-context-provider.mjs', async (importOriginal) => {
 const here = dirname(fileURLToPath(import.meta.url));
 const realSettings = resolve(here, '../../../.claude/settings.json');
 const CANONICAL_SETTINGS = existsSync(realSettings) ? realSettings : resolve(here, 'fixtures/lean-hooks-claude-settings.json');
-vi.mocked(LEAN_FIX_HOOKS_SETTINGS).mockImplementation(((actual) => (p = CANONICAL_SETTINGS) => actual(p))(
+vi.mocked(LEAN_FIX_HOOKS_SETTINGS).mockImplementation(((actual) => (p = CANONICAL_SETTINGS) => actual(p, {
+  repoRoot: resolve(here, '../../..'), guardRoot: resolve(here, '../../..'),
+}))(
   vi.mocked(LEAN_FIX_HOOKS_SETTINGS).getMockImplementation(),
 ));
 
+describe('lean repair security boundaries', () => {
+  async function fixture(run) {
+    const { LEAN_FIX_HOOKS_SETTINGS: read } = await vi.importActual('../minimal-context-provider.mjs');
+    const root = mkdtempSync(join(tmpdir(), "lean 'security $ "));
+    const repoRoot = join(root, 'repo');
+    const guardRoot = join(root, 'pinned');
+    const settings = JSON.parse(fs.readFileSync(CANONICAL_SETTINGS, 'utf8'));
+    const scripts = [...JSON.stringify(settings).matchAll(/scripts\/[\w/-]+\.mjs/g)].map(m => m[0]);
+    for (const base of [repoRoot, guardRoot]) {
+      for (const script of scripts) {
+        const path = join(base, script);
+        mkdirSync(dirname(path), { recursive: true });
+        writeFileSync(path, 'process.stdout.write("hook ran");');
+      }
+    }
+    const path = join(root, 'settings.json');
+    const load = () => { writeFileSync(path, JSON.stringify(settings)); return read(path, { repoRoot, guardRoot }); };
+    try { await run({ settings, load, root, repoRoot, guardRoot }); }
+    finally { rmSync(root, { recursive: true, force: true }); }
+  }
+
+  it('retains deny and ask rules without inventing blanket Bash or Agent allows', async () => {
+    await fixture(({ settings, load }) => {
+      settings.permissions = { allow: ['Read'], deny: ['Bash(rm:*)', 'Edit(secret/**)'], ask: ['Agent', 'Bash(git push:*)'] };
+      expect(load().permissions).toEqual(settings.permissions);
+      for (const launchKind of ['fix', 'ci-heal']) {
+        const argv = buildAgentArgv({ payload: { launchKind, lane: 7, prompt: 'Repair this PR.' }, loadRepairSettings: load });
+        const { permissions } = JSON.parse(argv[argv.indexOf('--settings') + 1]);
+        expect(permissions.deny).toEqual(settings.permissions.deny);
+        expect(permissions.ask).toEqual(settings.permissions.ask);
+        expect(permissions.allow).not.toContain('Bash');
+        expect(permissions.allow).not.toContain('Agent');
+      }
+    });
+  });
+
+  it.each(['async', 'echo', 'comment', 'shell tail', 'wrong launcher', 'missing Stop launcher', 'symlink target'])(
+    'rejects %s guards based on their actual execution target', async (fault) => {
+      await fixture(({ settings, load, root, repoRoot, guardRoot }) => {
+        expect(() => load()).not.toThrow();
+        const bash = settings.hooks.PreToolUse.find(e => e.matcher === 'Bash').hooks[0];
+        if (fault === 'async') bash.async = true;
+        if (fault === 'echo') bash.command = 'echo scripts/guard-bash.mjs';
+        if (fault === 'comment') bash.command = 'true # scripts/guard-bash.mjs';
+        if (fault === 'shell tail') bash.command += ' || true';
+        if (fault === 'wrong launcher') bash.command = bash.command.replace('node "$launcher"', 'echo "$launcher"');
+        if (fault === 'missing Stop launcher') rmSync(join(guardRoot, 'scripts/hooks/run-pinned-guard.mjs'));
+        if (fault === 'symlink target') {
+          const target = join(repoRoot, 'scripts/broadcast-inject.mjs');
+          rmSync(target);
+          const noop = join(root, 'noop.mjs');
+          writeFileSync(noop, '');
+          fs.symlinkSync(noop, target);
+        }
+        expect(() => load()).toThrow();
+      });
+    },
+  );
+
+  it.each(['Stop', 'SubagentStop', 'PostToolUse', 'UserPromptSubmit'])(
+    'rejects asynchronous %s hooks too', async event => {
+      await fixture(({ settings, load }) => {
+        expect(() => load()).not.toThrow();
+        settings.hooks[event][0].hooks[0].async = true;
+        expect(() => load()).toThrow();
+      });
+    },
+  );
+
+  it('resolves hooks before executing from scratch with quoted paths and a different HOME', async () => {
+    await fixture(({ load, root }) => {
+      const hooks = load().hooks;
+      const commands = Object.values(hooks).flatMap(entries => entries.flatMap(e => e.hooks)).map(h => h.command);
+      const direct = commands.filter(command => command.startsWith('node '));
+      expect(direct.length).toBeGreaterThan(0);
+      for (const command of commands) {
+        expect(execFileSync('sh', ['-c', command], {
+          cwd: root, encoding: 'utf8', env: { ...process.env, HOME: join(root, 'different-home') },
+        })).toBe('hook ran');
+      }
+    });
+  });
+
+  it('never grants a pool, a sibling lane, or unrelated explicit permissions', () => {
+    const options = { poolDirs: () => ['/w/.lanes/web-everything'] };
+    const payload = { launchKind: 'fix', lane: 7 };
+    expect(leanRepairGrant(payload, null, options).additionalDirectories).toEqual(['/w/.lanes/web-everything/lane-7']);
+    for (const dir of ['/w/.lanes/web-everything', '/w/.lanes/web-everything/lane-8', '/primary', '/w/.lanes/web-everything/lane-7/..']) {
+      expect(() => leanRepairGrant(payload, { additionalDirectories: [dir], allow: ['Bash'] }, options)).toThrow();
+    }
+    expect(() => leanRepairGrant({ launchKind: 'fix' }, null, options)).toThrow();
+    expect(() => leanRepairGrant(payload, {
+      additionalDirectories: ['/w/.lanes/web-everything/lane-7'], allow: ['Bash'],
+    }, options)).toThrow(/permissions outside/);
+  });
+});
+
 describe('lean repair background argv', () => {
   const options = (launchKind) => ({
-    payload: { launchKind, num: '3037', sessionSlug: 'repair-3037', prompt: 'Repair this PR.' },
+    payload: { launchKind, lane: 7, num: '3037', sessionSlug: 'repair-3037', prompt: 'Repair this PR.' },
     settingsEnv: { PATH: '/fixture/bin' },
     worktreeSettings: { bgIsolation: 'none' },
   });
@@ -67,32 +167,31 @@ describe('lean repair background argv', () => {
       const text = JSON.stringify(buildAgentArgv({ ...options(kind), systemPromptFile: '/repo/.operations/brief.md' }));
       expect(text).not.toMatch(/\.claude\/(CLAUDE\.md|projects|settings)/);
       expect(text).not.toMatch(/\/memory\b|MEMORY\.md/);
-      expect(text).not.toContain(process.env.HOME ?? '\u0000no-home');
+      expect(text).not.toContain(`${process.env.HOME}/.claude`);
     }
   });
 
-  it('fix and ci-heal settings copy canonical pinned guards and Stop verbatim', () => {
+  it('fix and ci-heal preserve permissions and pinned hooks while resolving direct hooks', () => {
     const canonical = JSON.parse(fs.readFileSync(CANONICAL_SETTINGS, 'utf8'));
     const expectedPre = canonical.hooks.PreToolUse.filter(entry => ['Edit|Write', 'Bash'].includes(entry.matcher));
-    const canonicalCommands = Object.values(canonical.hooks).flatMap(entries => entries.flatMap(entry => entry.hooks.map(hook => hook.command)));
     for (const kind of ['fix', 'ci-heal']) {
       const argv = buildAgentArgv(options(kind));
       expect(argv.filter(arg => arg === '--settings')).toHaveLength(1);
       const settings = JSON.parse(argv[argv.indexOf('--settings') + 1]);
       expect(settings.env).toEqual({ PATH: '/fixture/bin', WE_CONVEYOR_WORKER: '1' });
       expect(settings.worktree).toEqual({ bgIsolation: 'none' });
-      // The lean tools, then exactly the lane grant's rules (PR #7332 round 2) — nothing else.
-      expect(settings.permissions?.allow).toEqual(['Bash', 'Edit', 'Write', 'Read', 'Glob', 'Grep', 'Agent',
-        ...leanRepairGrant(options(kind).payload).allow]);
-      // Every event and matcher, verbatim: nothing filtered (PostToolUse, broadcast and catch-alls included).
-      expect(settings.hooks).toEqual(canonical.hooks);
+      expect(settings.permissions?.allow).toEqual([...new Set([
+        ...canonical.permissions.allow, ...leanRepairGrant(options(kind).payload).allow])]);
+      expect(settings.permissions?.deny).toEqual(canonical.permissions.deny);
+      expect(settings.permissions?.ask).toEqual(canonical.permissions.ask);
+      expect(settings.hooks).toEqual(LEAN_FIX_HOOKS_SETTINGS().hooks);
       expect(Object.keys(settings.hooks)).toEqual(Object.keys(canonical.hooks));
       expect(expectedPre.length).toBeGreaterThan(0);
       const commands = ['PreToolUse', 'Stop'].flatMap(event => settings.hooks[event].flatMap(entry => entry.hooks.map(hook => hook.command)));
       for (const command of commands) {
-        expect(canonicalCommands).toContain(command);
         expect(command).not.toMatch(/^node scripts\//);
-        expect(command).toContain('$HOME/workspace/.guard-main/scripts/hooks/run-pinned-guard.mjs');
+        expect(command).not.toContain('$HOME');
+        expect(command).toContain('scripts/hooks/run-pinned-guard.mjs');
       }
       for (const [matcher, guards] of [
         ['Bash', ['guard-bash.mjs']],
@@ -105,7 +204,9 @@ describe('lean repair background argv', () => {
     }
   });
 
-  it.each(['--settings', '--tools', '--setting-sources', '--bare', '--safe-mode', '--dangerously-skip-permissions', '--permission-mode', '--add-dir', '--mcp-config'])(
+  it.each(['--settings', '--tools', '--allowedTools', '--allowed-tools', '--disallowedTools', '--disallowed-tools',
+    '--setting-sources', '--bare', '--safe-mode', '--dangerously-skip-permissions', '--allow-dangerously-skip-permissions',
+    '--permission-mode', '--add-dir', '--mcp-config'])(
     'refuses %s boundary overrides for fix and ci-heal, while build and resume retain their behavior', (flag) => {
       for (const extraArgs of [[flag, 'override'], [`${flag}=override`]]) {
         for (const kind of ['fix', 'ci-heal']) {
@@ -131,6 +232,8 @@ describe('lean repair background argv', () => {
     }
   };
   const GUARD_FAULTS = {
+    'async Bash guard': (h) => { h.PreToolUse.find(e => e.matcher === 'Bash').hooks[0].async = true; },
+    'echo stand-in Bash guard': (h) => { h.PreToolUse.find(e => e.matcher === 'Bash').hooks[0].command = 'echo scripts/guard-bash.mjs'; },
     'missing Bash guard-bash (entry kept)': (h) => swapGuard(h, 'PreToolUse', 'Bash', 'scripts/guard-bash.mjs', 'scripts/noop.mjs'),
     'look-alike Bash guard-bash': (h) => swapGuard(h, 'PreToolUse', 'Bash', 'scripts/guard-bash.mjs', 'scripts/guard-bash.mjs.disabled'),
     'missing Edit|Write guard-lane (entry kept)': (h) => dropGuard(h, 'PreToolUse', 'Edit|Write', 'scripts/guard-lane.mjs'),
@@ -218,25 +321,20 @@ describe('lean repair background argv', () => {
   // itself — one `--add-dir` per directory plus the `--settings` permissions — or the repair cannot edit its lane.
   const settingsOf = (argv) => JSON.parse(argv[argv.indexOf('--settings') + 1]);
   const addDirsOf = (argv) => argv.flatMap((arg, i) => (arg === '--add-dir' ? [argv[i + 1]] : []));
-  const LANE_GRANT = Object.freeze({
-    additionalDirectories: ['/lanes/web-everything/lane-7'],
-    allow: ['Edit(/lanes/web-everything/lane-7/**)', 'Write(/lanes/web-everything/lane-7/**)', 'Bash(node /we/scripts/conveyor/rearm-review.mjs:*)'],
-  });
+  const LANE_GRANT = leanRepairGrant({ launchKind: 'fix', lane: 7 });
 
   it('carries an explicit lane grant into --add-dir and the --settings permissions for fix and ci-heal', () => {
     for (const kind of ['fix', 'ci-heal']) {
       const argv = buildAgentArgv({ ...options(kind), laneGrant: LANE_GRANT });
-      // The assigned lane first, then the repo's pool roots: fix/ci-heal lanes are not reserved, so the brief's
-      // acquire may take another free lane in the same pool.
-      const pools = ['web-everything', 'webeverything'].map(pool => expect.stringMatching(new RegExp(`/\\.lanes/${pool}$`)));
-      expect(addDirsOf(argv)).toEqual(['/lanes/web-everything/lane-7', ...pools]);
+      expect(addDirsOf(argv)).toEqual(LANE_GRANT.additionalDirectories);
+      expect(addDirsOf(argv)).toHaveLength(1);
       // `--add-dir <directories...>` is variadic: a flag must close it, so the prompt is never read as a directory.
       const last = argv.lastIndexOf('--add-dir');
       expect(argv[last + 2]).toMatch(/^--/);
       expect(argv.at(-1)).toBe('Repair this PR.');
       const { permissions } = settingsOf(argv);
       expect(permissions.additionalDirectories).toEqual(addDirsOf(argv));
-      expect(permissions.allow).toEqual(expect.arrayContaining([...LEAN_FIX_TOOLS.split(','), ...LANE_GRANT.allow]));
+      expect(permissions.allow).toEqual(expect.arrayContaining(LANE_GRANT.allow));
       expect(buildAgentArgv({ ...options(kind), laneGrant: LANE_GRANT, resumeSessionId: 'existing-session' }))
         .toEqual(['--bg', '--resume', 'existing-session', 'Repair this PR.']);
     }
@@ -246,20 +344,18 @@ describe('lean repair background argv', () => {
   it('derives the grant from the payload lane and scope when none is passed (the direct reconcile fix path)', () => {
     const payload = { ...options('fix').payload, lane: 12, scope: ['we:scripts/a.mjs'] };
     const argv = buildAgentArgv({ ...options('fix'), payload });
-    expect(addDirsOf(argv)).toEqual([
-      ...['web-everything', 'webeverything'].map(pool => expect.stringMatching(new RegExp(`/\\.lanes/${pool}/lane-12$`))),
-      ...['web-everything', 'webeverything'].map(pool => expect.stringMatching(new RegExp(`/\\.lanes/${pool}$`)))]);
+    expect(addDirsOf(argv)).toEqual([expect.stringMatching(/\/\.lanes\/web(?:-)?everything\/lane-12$/)]);
     expect(settingsOf(argv).permissions.allow).toEqual(expect.arrayContaining([expect.stringMatching(/^Edit\(.*\/lane-12\/\*\*\)$/)]));
   });
 
   // Self-review (round 2): the repo comes from the dispatch's own `repo`, never only from the scope — a sibling
   // repo's card may list a `we:` path first, and a ci-heal may carry no scope at all.
-  it('grants the dispatch repo\'s own lane pool, whatever the scope lists first', () => {
+  it('grants only the named lane in the dispatch repo, whatever the scope lists first', () => {
     for (const repo of ['frontierui', 'frontier-ui/frontierui']) {
       for (const scope of [undefined, [], ['we:scripts/a.mjs', 'frontierui:src/b.ts']]) {
         const payload = { ...options('fix').payload, lane: 3, repo, scope };
         const dirs = addDirsOf(buildAgentArgv({ ...options('fix'), payload }));
-        expect(dirs).toEqual([expect.stringMatching(/\/\.lanes\/frontierui\/lane-3$/), expect.stringMatching(/\/\.lanes\/frontierui$/)]);
+        expect(dirs).toEqual([expect.stringMatching(/\/\.lanes\/frontierui\/lane-3$/)]);
         expect(dispatchLaneGrant(payload, { root: '/w/webeverything', exists: () => false }).additionalDirectories)
           .toEqual(['/w/.lanes/frontierui/lane-3']);
       }
@@ -270,14 +366,11 @@ describe('lean repair background argv', () => {
     expect(laneRepoKey({})).toBe('we');
   });
 
-  it('a laneless lean launch, or one with an empty explicit grant, still gets its repo lane pool — never no directory', () => {
+  it('refuses laneless launches even with an empty explicit grant', () => {
     for (const laneGrant of [undefined, {}, { additionalDirectories: [], allow: [] }]) {
       for (const scope of [undefined, ['plateau-app:src/a.ts']]) {
-        const argv = buildAgentArgv({ ...options('ci-heal'), laneGrant, payload: { ...options('ci-heal').payload, scope } });
-        const dirs = addDirsOf(argv);
-        expect(dirs.length).toBeGreaterThan(0);
-        for (const dir of dirs) expect(dir).toMatch(scope ? /\/\.lanes\/plateau-app$/ : /\/\.lanes\/web(?:-)?everything$/);
-        expect(settingsOf(argv).permissions.additionalDirectories).toEqual(dirs);
+        expect(() => buildAgentArgv({ ...options('ci-heal'), laneGrant,
+          payload: { ...options('ci-heal').payload, lane: undefined, scope } })).toThrow(/no lane directory/);
       }
     }
   });
@@ -290,17 +383,15 @@ describe('lean repair background argv', () => {
           .toThrow(expect.objectContaining({ notApplied: true, message: expect.stringContaining('no lane directory') }));
       }
     }
-    expect(leanRepairGrant({ launchKind: 'fix' }, null, { root: '/we', poolDirs: () => ['/w/.lanes/web-everything'] }))
-      .toMatchObject({ additionalDirectories: ['/w/.lanes/web-everything'], allow: expect.arrayContaining([
-        'Edit(/w/.lanes/web-everything/**)', 'Bash(node /we/scripts/conveyor/rearm-review.mjs:*)']) });
-    // A lane name that is not a plain number never becomes a path segment.
-    expect(leanRepairGrant({ launchKind: 'fix', lane: '../x' }, null, { poolDirs: () => ['/w/.lanes/web-everything'] }).additionalDirectories)
-      .toEqual(['/w/.lanes/web-everything']);
+    for (const lane of [undefined, '', '../x', '.', '0', '01', '7\n8', '７']) {
+      expect(() => leanRepairGrant({ launchKind: 'fix', lane }, null,
+        { poolDirs: () => ['/w/.lanes/web-everything'] })).toThrow(/no lane directory/);
+    }
   });
 
   it('the sink forwards its lane grant to the launch argv, not only to settings.local.json', async () => {
     const requests = [];
-    const grant = { additionalDirectories: ['/lanes/web-everything/lane-40'], allow: ['Edit(/lanes/web-everything/lane-40/**)'] };
+    const grant = leanRepairGrant({ launchKind: 'ci-heal', lane: 40 });
     const sinks = createDispatchSinks({
       root: '/repo/webeverything', mintSessionId: () => 'sess-grant-1', now: () => new Date('2026-11-22T00:00:00Z'),
       sessionCwdFor: () => '/tmp/scratch-grant', ensureSessionCwd: (d) => d, resolveSettingsEnv: () => ({}),
@@ -314,9 +405,8 @@ describe('lean repair background argv', () => {
     defaultClaudeProvider({ ...requests[0], cwd: '/tmp/scratch-grant' }, {
       spawnAgent: (argv) => { argvs.push(argv); return ''; }, wrapKind: () => false,
     });
-    expect(addDirsOf(argvs[0])[0]).toBe('/lanes/web-everything/lane-40');
-    expect(addDirsOf(argvs[0]).slice(1)).toEqual(leanRepairGrant({ launchKind: 'ci-heal', lane: 40 }).additionalDirectories);
-    expect(settingsOf(argvs[0]).permissions.allow).toEqual(expect.arrayContaining(['Edit(/lanes/web-everything/lane-40/**)']));
+    expect(addDirsOf(argvs[0])).toEqual(grant.additionalDirectories);
+    expect(settingsOf(argvs[0]).permissions.allow).toEqual(expect.arrayContaining(grant.allow));
   });
 
   it('accepts a required guard moved to a combined or catch-all matcher that still covers the lean tool', () => {
@@ -328,7 +418,10 @@ describe('lean repair background argv', () => {
     const path = join(dir, 'settings.json');
     try {
       writeFileSync(path, JSON.stringify(canonical));
-      expect(read(path).hooks).toEqual(canonical.hooks);
+      const loaded = read(path).hooks;
+      expect(loaded.PreToolUse.map(entry => entry.matcher)).toEqual(canonical.hooks.PreToolUse.map(entry => entry.matcher));
+      expect(loaded.PreToolUse.map(entry => entry.hooks)).toEqual(LEAN_FIX_HOOKS_SETTINGS().hooks.PreToolUse.map(entry => entry.hooks));
+      expect(Object.keys(loaded)).toEqual(Object.keys(canonical.hooks));
     } finally { rmSync(dir, { recursive: true, force: true }); }
   });
 });

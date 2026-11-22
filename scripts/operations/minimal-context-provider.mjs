@@ -33,9 +33,11 @@
  */
 import { execFileSync } from 'node:child_process';
 import { dirname, resolve } from 'node:path';
+import { homedir } from 'node:os';
 import { fileURLToPath } from 'node:url';
 import { claudeSpawnAlias } from '../lib/dispatch-routing-policy.mjs';
-import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { mkdirSync, readFileSync, realpathSync, statSync, writeFileSync } from 'node:fs';
+import { pinnedHookScript, pinnedStopHookScript } from '../lib/pinned-hook-command.mjs';
 
 // #3383 — the delivery-telemetry recorder. Imported here, in the ONE module all six dispatch wrappers share,
 // so `lane.acquire` and `verify.gate` spans are captured for EVERY dispatch kind from a single edit rather
@@ -148,7 +150,7 @@ export const LEAN_FIX_TOOLS = `${RESTRICTED_PROVIDER_TOOLS},Agent`;
 
 /** Every guard and broadcast hook a lean repair session must keep, by event and the lean tools it must cover
  *  (`tools` absent = an event with no tool matcher). Each `script` (with its mode flag, where the blocking mode
- *  needs one) must appear as an exact token in a command hook of an entry whose matcher covers every listed
+ *  needs one) must resolve to an existing target in a synchronous command whose matcher covers every listed
  *  tool. Matcher presence alone is not enough: an entry that survives with one guard dropped, swapped,
  *  renamed or narrowed off a lean tool fails the dispatch closed. Extend it here when a guard is added: a test
  *  fails while any hook in the repo settings that covers a lean tool is not listed here. */
@@ -178,24 +180,71 @@ function matcherCovers(matcher, tool) {
   try { return new RegExp(`^(?:${matcher})$`).test(tool); } catch { return false; }
 }
 
-/** The exact token, mode flag included: a look-alike path does not match, and neither does the same script run
- *  with a mode flag the manifest does not name (a post-mode guard swapped for its `--pre` form is missing). */
-const commandHasScript = (command, script) =>
-  new RegExp(`(?<![\\w./-])${script.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}(?![\\w.-]|\\s+--)`).test(command);
+const shellQuote = value => `'${value.replace(/'/g, "'\\''")}'`;
+
+/** Resolve the actual file, refusing missing files and symlink substitutions. No shell is evaluated. */
+function hookFile(root, script) {
+  const expected = resolve(realpathSync(root), script);
+  if (realpathSync(expected) !== expected || !statSync(expected).isFile()) {
+    throw new Error(`invalid repair hook target: ${script}`);
+  }
+  return expected;
+}
+
+/** Recognize only the committed pinned wrappers or a single node invocation. A script name in echo,
+ * comments, shell branches or extra arguments is never execution evidence. Unknown forms fail closed. */
+function resolveRepairHook(hook, { repoRoot, guardRoot }) {
+  if (hook?.type !== 'command' || typeof hook.command !== 'string' || (hook.async !== undefined && hook.async !== false)) {
+    throw new Error('repair hooks must be synchronous commands');
+  }
+  const command = hook.command;
+  const pinned = pinnedHookScript(command);
+  const stop = pinnedStopHookScript(command);
+  if (pinned || stop) {
+    const launcher = hookFile(guardRoot, 'scripts/hooks/run-pinned-guard.mjs');
+    hookFile(guardRoot, pinned || stop);
+    const flags = command.slice(command.indexOf(pinned || stop) + (pinned || stop).length).match(/^(?: --[\w-]+)*/)[0];
+    // Bind execution to the file we validated even if the worker receives a different HOME.
+    const body = command.slice("sh -c '".length, -1).replace(
+      'launcher="$HOME/workspace/.guard-main/scripts/hooks/run-pinned-guard.mjs"', `launcher=${shellQuote(launcher)}`,
+    );
+    return { hook: { ...hook, command: `sh -c ${shellQuote(body)}` },
+      script: `${stop ? '--stop-hook ' : ''}${pinned || stop}${flags}`, pinned: true };
+  }
+  // Simple literal argv only; quoted paths support checkouts containing spaces. Shell syntax is refused.
+  const match = /^node (?:"([^"$`\\]+)"|'([^']+)'|([^\s'"$`\\;|&<>]+))((?: [\w-]+)*)$/.exec(command);
+  if (!match) throw new Error('unrecognized repair hook command');
+  const path = match[1] ?? match[2] ?? match[3];
+  const root = realpathSync(repoRoot);
+  const absolute = resolve(root, path);
+  const script = absolute.slice(root.length + 1);
+  if (!absolute.startsWith(`${root}/`) || !/^scripts\/(?:[\w-]+\/)*[\w-]+\.mjs$/.test(script)) {
+    throw new Error('repair hook outside repository scripts');
+  }
+  const target = hookFile(root, script);
+  return { hook: { ...hook, command: `node ${shellQuote(target)}${match[4]}` }, script: `${script}${match[4]}`, pinned: false };
+}
 
 /** Every {@link LEAN_FIX_REQUIRED_GUARDS} requirement the given `hooks` object does not meet, as
  *  `<event>[<tool>] <script>` strings (empty = all present). Unknown or malformed shapes count as missing. */
-export function leanFixGuardGaps(hooks) {
+export function leanFixGuardGaps(hooks, options = {
+  repoRoot: REPO_ROOT, guardRoot: resolve(homedir(), 'workspace/.guard-main'),
+}) {
   const missing = [];
   for (const { event, tools = [undefined], scripts } of LEAN_FIX_REQUIRED_GUARDS) {
     const entries = Array.isArray(hooks?.[event]) ? hooks[event] : [];
     for (const tool of tools) {
       const commands = entries.filter(entry => tool === undefined || matcherCovers(entry?.matcher, tool))
         .flatMap(entry => (Array.isArray(entry?.hooks) ? entry.hooks : []))
-        .filter(hook => hook?.type === 'command' && typeof hook.command === 'string')
-        .map(hook => hook.command);
+        .flatMap(hook => {
+          try {
+            const resolved = resolveRepairHook(hook, options);
+            // Pre/Stop guards must execute through the pinned clone, never a mutable lane copy.
+            return ['PreToolUse', 'Stop', 'SubagentStop'].includes(event) && !resolved.pinned ? [] : [resolved.script];
+          } catch { return []; }
+        });
       for (const script of scripts) {
-        if (!commands.some(command => commandHasScript(command, script))) missing.push(`${event}${tool ? `[${tool}]` : ''} ${script}`);
+        if (!commands.includes(script)) missing.push(`${event}${tool ? `[${tool}]` : ''} ${script}`);
       }
     }
   }
@@ -203,20 +252,29 @@ export function leanFixGuardGaps(hooks) {
 }
 
 /** Derive restricted repair hooks from this checkout at call time; never silently omit repo guards. */
-export function LEAN_FIX_HOOKS_SETTINGS(settingsPath = resolve(dirname(fileURLToPath(import.meta.url)), '../../.claude/settings.json')) {
-  const { hooks } = JSON.parse(readFileSync(settingsPath, 'utf8'));
+export function LEAN_FIX_HOOKS_SETTINGS(settingsPath = resolve(dirname(fileURLToPath(import.meta.url)), '../../.claude/settings.json'), {
+  repoRoot = resolve(dirname(settingsPath), '..'), guardRoot = resolve(homedir(), 'workspace/.guard-main'),
+} = {}) {
+  const { hooks, permissions = {} } = JSON.parse(readFileSync(settingsPath, 'utf8'));
   if (!hooks || typeof hooks !== 'object' || Array.isArray(hooks)) throw new Error('missing hooks');
   const validEntry = (entry) => Array.isArray(entry?.hooks) && entry.hooks.length > 0
     && entry.hooks.every(hook => hook?.type === 'command' && typeof hook.command === 'string' && hook.command.trim());
-  // EVERY event and matcher is copied verbatim (catch-all and combined included): the broadcast hook is the
-  // operator's stop channel, and the lean session must lose nothing the main session's repo hooks provide.
+  // Retain every event, matcher and option; bind executable paths for the scratch cwd and worker HOME.
   const all = Object.values(hooks).flatMap(entries => (Array.isArray(entries) ? entries : [null]));
   if (!all.every(validEntry)) throw new Error('incomplete repair hook entries');
-  const missing = leanFixGuardGaps(hooks);
+  const options = { repoRoot, guardRoot };
+  const missing = leanFixGuardGaps(hooks, options);
   if (missing.length) throw new Error(`missing required repair guards: ${missing.join('; ')}`);
+  if (!permissions || typeof permissions !== 'object' || Array.isArray(permissions)
+      || ['allow', 'deny', 'ask'].some(key => permissions[key] !== undefined
+        && (!Array.isArray(permissions[key]) || !permissions[key].every(rule => typeof rule === 'string')))) {
+    throw new Error('invalid repair permissions');
+  }
   return {
-    hooks,
-    permissions: { allow: LEAN_FIX_TOOLS.split(',') },
+    hooks: Object.fromEntries(Object.entries(hooks).map(([event, entries]) => [event,
+      entries.map(entry => ({ ...entry, hooks: entry.hooks.map(hook => resolveRepairHook(hook, options).hook) })),
+    ])),
+    permissions,
   };
 }
 

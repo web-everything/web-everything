@@ -245,6 +245,9 @@ export function createWorld({ repos = ['we'], lanes = 3, clockStartOffsetMs = 0 
   // (c) fake HOME
   const home = join(root, 'home');
   mkdirSync(home, { recursive: true });
+  // Dispatch validates the pinned launcher and targets even when the fake CLI never runs hooks.
+  mkdirSync(join(home, 'workspace'), { recursive: true });
+  symlinkSync(simClone, join(home, 'workspace/.guard-main'), 'dir');
 
   // (d) lane pool root (provisioned below, once the merged env exists)
   const lanePoolRoot = join(root, 'lanes');
