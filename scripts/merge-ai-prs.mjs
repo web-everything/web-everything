@@ -1481,16 +1481,16 @@ export function routeRebaseBeforeEnqueue(v, { setting, mergeStrategy, manifestFr
  * parser and provenance; only the transport is async, bounded, and routed through the gh throttle.
  */
 export async function readFreshGateChecks({ repo, headSha, concurrency = 2, exec = execFileP }) {
-  const argv = ['check-runs?per_page=100&filter=all', 'status?per_page=100'].map(endpoint =>
-    ['api', '--paginate', '--slurp', `repos/${repo}/commits/${headSha}/${endpoint}`]);
-  const pages = await readFastDrainFacts(argv, concurrency, async args => {
-    const { stdout } = await exec('gh', args, { encoding: 'utf8', timeout: 60_000, maxBuffer: 64 * 1024 * 1024 });
-    return [JSON.stringify(args), stdout];
+  const endpoints = ['check-runs?per_page=100&filter=all', 'status?per_page=100'].map(endpoint =>
+    `repos/${repo}/commits/${headSha}/${endpoint}`);
+  const pages = await readFastDrainFacts(endpoints, concurrency, async endpoint => {
+    const { stdout } = await exec('gh', ['api', '--paginate', '--slurp', endpoint], { encoding: 'utf8', timeout: 60_000, maxBuffer: 64 * 1024 * 1024 });
+    return [endpoint, stdout];
   });
   const responses = new Map(pages);
   return readReviewChecks({ repo, headSha, run: args => {
-    if (!responses.has(JSON.stringify(args))) throw new Error('unreadable fresh check response');
-    return responses.get(JSON.stringify(args));
+    if (!responses.has(args.at(-1))) throw new Error('unreadable fresh check response');
+    return responses.get(args.at(-1));
   } });
 }
 
@@ -2994,13 +2994,19 @@ export function planLabelDrain(candidates, { landedThisPass = new Set(), provenO
         waitOn: ['required-check-read'], reason: c.requiredCheckReadError, ...skipInfo });
       continue;
     }
-    if (c.decision !== 'merge') continue; // @merge-gate-exempt builds the merge-ORDERING lists (ready/deferred); a held PR is `skip` and correctly not ordered for landing — it must not join the merge cascade
     // Fast drain only: failed/truncated context cannot establish that an absent HASH blocker has landed. A numeric
     // id exists only post-land (arm (4) above), and no caller proves numerics, so those keep clearing by absence.
     // A malformed id coerces to NaN in `asItemId`; only a real positive NNN may clear by absence.
     const absentUnproven = (b) => strictAbsentHashDependencies === true && absenceUnproven && !(Number.isInteger(b) && b > 0);
     const blockWait = (Array.isArray(c.blockedBy) ? c.blockedBy : []).map(asItemId).filter((b) => (openItems.has(b) || absentUnproven(b)) && !provenLanded(b));
     const stackWait = (Array.isArray(c.stackParents) ? c.stackParents : []).map(asItemId).filter((sp) => !stackProven(sp));
+    if (c.decision !== 'merge') {
+      // Incomplete live checks can skip a refreshed round target before ordering.
+      // Retain its dependency waits from the live context without admitting it to ready.
+      const waitOn = [...new Set([...blockWait, ...stackWait])].filter(w => c.item == null || String(w) !== String(c.item));
+      if (waitOn.length) deferred.push({ num: c.num, item: c.item, waitOn, ...skipInfo, headSha: c.headSha ?? null });
+      continue; // @merge-gate-exempt skipped PRs never enter the merge cascade
+    }
     // #xc7p3q9 — the COUPLE gate: a manifest-less impl PR joined to a WE couple defers with its carrier
     // when `joinImplToCouples` stamped `coupleDefer` — a carrier that is OPEN-AND-HELD, unnameable, degraded, or
     // in a truncated listing (all knowable from the label/only-blind context, NEVER from the narrowed `list`).

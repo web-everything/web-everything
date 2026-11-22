@@ -9,6 +9,7 @@
  */
 import { describe, it, expect, vi } from 'vitest';
 import { withResolutionBasis, buildDrainReasonComment, hasDrainReasonComment, buildDrainVerdicts, classifyPr, isRebaseDropCandidate, isBehindButClean, headTreeLacksManifestFile, routeRebaseBeforeEnqueue, retainCheckedQueueHead, retainBypassedQueueHead, readFreshQueueRollup, revalidateWithUnknownRetry, resolveRebaseBeforeEnqueue, buildLiveListingsByRepo, unlandableStateReason } from '../merge-ai-prs.mjs';
+import { planLabelDrain } from '../merge-ai-prs.mjs';
 import { readFastDrainRoundListing, withFastDrainRoundLock } from '../lib/fast-drain-scope.mjs';
 import { mkdtempSync, readFileSync, rmSync, writeFileSync, chmodSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -19,6 +20,19 @@ import { daemonAppEnv } from './fixtures/daemon-app-env.mjs';
 import { pinnedLeafDiffFixture } from './fixtures/pinned-leaf-diff-fixture.mjs';
 import { buildManifest, manifestBodyBlock } from '../readiness/lane-manifest.mjs';
 import { deriveResolutionBasis, graduatedToFromBody } from '../lib/review-render.mjs';
+
+describe('incomplete round targets retain live dependency ordering', () => {
+  it.each([true, false])('keeps incomplete checks skipped when the live blocker is open=%s', open => {
+    const verdict = { ...classifyPr({ number: 42, rowsComplete: false }, { defaultBranch: 'main' }),
+      item: 42, blockedBy: [43] };
+    expect(verdict.decision).toBe('skip');
+    expect(verdict.reason).toContain('check evidence incomplete');
+    const plan = planLabelDrain([verdict], { extraOpenItems: open ? [43] : [] });
+    expect(plan.ready).toEqual([]);
+    expect(plan.deferred).toEqual(open ? [expect.objectContaining({ num: 42, waitOn: [43] })] : []);
+    expect(verdict.decision).toBe('skip');
+  });
+});
 
 describe('isBehindButClean — retain only proven clean BEHIND heads', () => {
   const clean = { decision: 'skip', reason: unlandableStateReason('BEHIND'), state: 'BEHIND', mergeable: 'MERGEABLE', hasManifest: false,

@@ -6365,3 +6365,9 @@ Keep the tier-1 zero-full-pagination assertion and frozen/recorded 18-PR parity 
 carrier health/couple join, overlap planning and enqueue head revalidation with differing
 snapshot/live facts. Invalidation tests must distinguish rebuilding from reuse, and
 lost-ownership tests must assert no file was published, not merely an eventual error.
+
+Round target check hydration can fail closed before dependency ordering. Keep live
+`blockedBy`/`stackParents` waits visible for skipped targets while excluding them from
+`ready`, even after their blocker lands. The round CLI freshness regressions in
+`merge-ai-prs.test.mjs` cover newly opened siblings with fresh and expired snapshots;
+its incomplete-target cases pin the separate check hold with and without an open blocker.
