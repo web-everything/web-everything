@@ -5952,8 +5952,10 @@ An immutable incoming batch is persisted before the writer lock, then transferre
 the pending ledger under lock so confirmed merges survive contention. Existing statement
 files are reconciled against freshly collected subject, policy, clauses and verdict before
 indexing or retirement; mismatches stay pending for operator inspection and backfill.
-Backfill discovery pages closed PRs newest-update first and stops at the first row updated
+Backfill discovery pages all PRs newest-update first and stops at the first row updated
 before `--since` (a merge updates its PR), so a long merged history never blocks a recent
 window. Rows must carry a number and readable timestamps or the listing is refused; a window
 that outruns the page cap fails closed naming a later `--since` or a larger `--max-pages`,
-and the tests pin both recoveries plus the 1,000-merge history case.
+and the tests pin both recoveries plus the 1,000-merge history case. Offset pages shift when
+a PR is touched or reopened mid-scan, so a multi-page scan re-reads page 1 and rescans on any
+change; a listing that never settles fails closed. The tests touch a PR between page reads.

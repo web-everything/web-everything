@@ -29,9 +29,11 @@ function harness() {
   const gh = vi.fn(args => {
     if (args[0] === 'pr') return x.pr;
     const endpoint = args[1];
-    if (endpoint.includes('/pulls?state=closed&sort=updated&direction=desc&')) {
+    if (endpoint.includes('/pulls?state=all&sort=updated&direction=desc&')) {
       const page = Number(new URL(endpoint, 'https://x/').searchParams.get('page'));
-      return x.listing.slice((page - 1) * 100, page * 100);
+      const rows = x.listing.slice((page - 1) * 100, page * 100);
+      x.onPage?.(page); // lets a test touch a PR between page reads
+      return rows;
     }
     if (endpoint.includes('/events?')) return x.events;
     if (endpoint.includes('/comments?')) return x.comments;
@@ -161,7 +163,7 @@ it('backfill recovers one recent merge from a 1,000-merge history and stops list
   const h = harness(); h.x.listing = history(1, 999);
   await expect(backfillChangeEvidence({ ...h.options, since: '2026-11-21' })).resolves.toHaveLength(1);
   expect(fs.existsSync(h.file)).toBe(true);
-  expect(h.gh.mock.calls.filter(([a]) => a[1]?.includes('/pulls?state=closed'))).toHaveLength(1);
+  expect(h.gh.mock.calls.filter(([a]) => a[1]?.includes('/pulls?state='))).toHaveLength(1);
 });
 it('backfill keeps an old merge that was updated recently out of the window', async () => {
   const h = harness(); h.x.listing = [{ number: 30000, merged_at: '2026-11-01T00:00:00Z', updated_at: '2026-11-21T20:00:00Z' }, ...h.x.listing];
@@ -187,13 +189,43 @@ it.each([
   ['a non-string merged_at', [{ number: 5, merged_at: 7, updated_at: '2026-11-21T00:00:00Z' }]],
   ['an unparseable merged_at', [{ number: 5, merged_at: 'soon', updated_at: '2026-11-21T00:00:00Z' }]],
 ])('backfill refuses a listing with %s', async (_, page) => {
-  const h = harness(); h.gh.mockImplementation(args => { if (args[1]?.includes('/pulls?state=closed')) return page; throw Error('no'); });
+  const h = harness(); h.gh.mockImplementation(args => { if (args[1]?.includes('/pulls?state=')) return page; throw Error('no'); });
   await expect(backfillChangeEvidence({ ...h.options, since: '2026-11-21' })).rejects.toThrow(/listing/);
 });
-it('backfill refuses an invalid repo slug before building the listing URL', async () => {
+it.each(['a/b?x=1', '../..', 'a/..', '.'])('backfill refuses repo slug %s before building the listing URL', async repo => {
   const h = harness();
-  await expect(backfillChangeEvidence({ ...h.options, since: '2026-11-21', repo: 'a/b?x=1' })).rejects.toThrow(/repo/);
+  await expect(backfillChangeEvidence({ ...h.options, since: '2026-11-21', repo })).rejects.toThrow(/--repo/);
   expect(h.gh).not.toHaveBeenCalled();
+});
+it.each([0, -1, 1.5, NaN])('backfill refuses --max-pages=%s by name before any read', async maxPages => {
+  const h = harness();
+  await expect(backfillChangeEvidence({ ...h.options, since: '2026-11-21', maxPages })).rejects.toThrow(/--max-pages/);
+  expect(h.gh).not.toHaveBeenCalled();
+});
+// Self-review must-fix: offset pages shift when a PR is touched mid-scan; the touched PR jumps to the read page 1.
+const crowded = h => { h.x.listing = [...Array.from({ length: 100 }, (_, i) => ({ number: 50000 + i, merged_at: null, updated_at: '2026-11-21T20:00:00Z' })),
+  { number: pr.number, merged_at: '2026-11-21T15:00:00Z', updated_at: '2026-11-21T15:00:02Z' }, ...history(0, 5)]; };
+const touch = (h, num, at) => { const i = h.x.listing.findIndex(r => r.number === num); h.x.listing.unshift({ ...h.x.listing.splice(i, 1)[0], updated_at: at }); };
+it('backfill rescans when an in-window merge is touched between page reads instead of dropping it', async () => {
+  const h = harness(); crowded(h);
+  let touched = false;
+  h.x.onPage = page => { if (page === 1 && !touched) { touched = true; touch(h, pr.number, '2026-11-21T23:00:00Z'); } };
+  await expect(backfillChangeEvidence({ ...h.options, since: '2026-11-21' })).resolves.toHaveLength(1);
+  expect(fs.existsSync(h.file)).toBe(true);
+});
+it('backfill rescans when a closed PR on a read page is reopened mid-scan', async () => {
+  const h = harness(); crowded(h);
+  let touched = false; // state=all: a reopen bumps the PR to the top instead of shifting later rows up past a boundary
+  h.x.onPage = page => { if (page === 1 && !touched) { touched = true; touch(h, 50003, '2026-11-21T23:30:00Z'); } };
+  await expect(backfillChangeEvidence({ ...h.options, since: '2026-11-21' })).resolves.toHaveLength(1);
+  expect(h.gh.mock.calls.filter(([a]) => a[1]?.includes('/pulls?state=') && a[1].endsWith('page=1')).length).toBeGreaterThan(2);
+});
+it('backfill fails closed when the listing never settles across scans', async () => {
+  const h = harness(); crowded(h);
+  let tick = 0;
+  h.x.onPage = page => { if (page === 1) touch(h, 50000 + (tick++ % 100), `2026-11-21T23:${String(10 + tick).padStart(2, '0')}:00Z`); };
+  await expect(backfillChangeEvidence({ ...h.options, since: '2026-11-21' })).rejects.toThrow(/kept changing/);
+  expect(h.gh.mock.calls.some(([a]) => a[0] === 'pr')).toBe(false);
 });
 it('backfill never emits daemon events and its call budget scales with the merge count', async () => {
   const h = harness(), original = h.gh.getMockImplementation();
