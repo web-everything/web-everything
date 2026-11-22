@@ -11,8 +11,8 @@ import { normalizeBriefScope, SCOPE_PREFIX_ALIASES } from './dispatch-lane.mjs';
 import { GH_LIST_FILE_CAP, prHoldsFile, qualifyFile, repoKeyFor } from './free-scope.mjs';
 import { resolveCoordinationRoot } from './coordination-root.mjs';
 import { buildPrioritySetOperation, BUILD_PRIORITY_SET_EFFECT, validateBuildPriorityInput } from './build-priority-set.mjs';
-import { isSubtreeEntry, scopeEntriesOverlap } from '../readiness/scope-lease.mjs';
-import { isTrustChainPath, TRUST_CHAIN, TRUST_CHAIN_BASENAMES } from '../lib/gate-config.mjs';
+import { scopeEntriesOverlap } from '../readiness/scope-lease.mjs';
+import { TRUST_CHAIN, TRUST_CHAIN_BASENAMES } from '../lib/gate-config.mjs';
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '../..');
 const SCOPE_GUARD_FILES = [
@@ -21,6 +21,8 @@ const SCOPE_GUARD_FILES = [
   'scripts/operations/free-scope.mjs',
   'scripts/readiness/scope-lease.mjs',
   'scripts/lib/build-queue.mjs',
+  'scripts/operations/__tests__/build-priority-set.test.mjs',
+  'scripts/operations/__tests__/build-priority-set-io-real.test.mjs',
 ];
 const READ_OPTIONS = { encoding: 'utf8', maxBuffer: 8 * 1024 * 1024, timeout: 10000, stdio: ['ignore', 'pipe', 'pipe'] };
 const canonicalId = id => id.replace(/^0+(?=\d)/, '');
@@ -114,8 +116,9 @@ function prepare(input, options) {
         if (scopeEntriesOverlap(entry, home)) refuse(`card ${id} scope overlaps gate file ${home}`);
       }
       const pathWithoutPrefix = entry.slice(entry.indexOf(':') + 1);
-      if (isTrustChainPath(pathWithoutPrefix)) refuse(`card ${id} scope overlaps gate file ${pathWithoutPrefix}`);
-      if (isSubtreeEntry(entry)) {
+      if (gateBasenames.has(basename(pathWithoutPrefix))) refuse(`card ${id} scope overlaps gate file ${pathWithoutPrefix}`);
+      // Only literal paths with known source extensions can bypass relocation checks.
+      if (/[*?]/.test(pathWithoutPrefix) || !/\.(mjs|js|ts|json|md|sh|yml|yaml|css|html)$/.test(pathWithoutPrefix)) {
         // A gate member can move into any leased directory. For globs, retain the
         // authored filename pattern so only candidates that it covers are refused.
         const directory = /[*?]/.test(pathWithoutPrefix)

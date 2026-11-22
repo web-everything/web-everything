@@ -42,6 +42,11 @@ it.each([
   'we:scripts/operations/free-scope.mjs',
   'we:scripts/readiness/scope-lease.mjs',
   'we:scripts/lib/build-queue.mjs',
+  'we:scripts/operations/__tests__/build-priority-set.test.mjs',
+  'we:scripts/operations/__tests__/build-priority-set-io-real.test.mjs',
+  ...['build-priority-set-io.mjs', 'build-priority-set.mjs', 'free-scope.mjs',
+    'scope-lease.mjs', 'build-queue.mjs', 'build-priority-set.test.mjs',
+    'build-priority-set-io-real.test.mjs'].map(name => `we:relocated/${name}`),
 ])('refuses gate scope coverage %s without writing a runtime file', async scope => {
   for (const preview of [false, true]) {
     const f = fixture({ readCard: id => ({ scope: id === '43' ? [scope] : ['we:scripts/a.mjs'] }) });
@@ -54,7 +59,7 @@ it.each([
 });
 
 it.each(['we:', 'plateau:', 'fui:', 'frontierui:', 'webeverything:', 'plateau-app:', 'pa:'].flatMap(prefix =>
-  ['tools/drain-daemon/', 'tools/drain-daemon/*.mjs', 'relocated/', 'relocated/*.mjs',
+  ['tools/drain-daemon/', 'tools/drain-daemon/*.mjs', 'relocated/', 'relocated.v2', 'relocated/*.mjs',
     'scripts/operations/build-priority-set-*.mjs', 'relocated/build-priority-set-*.mjs'].map(path => `${prefix}${path}`),
 ))('refuses directory or glob gate coverage %s in preview and install', async scope => {
   for (const preview of [false, true]) {
@@ -66,6 +71,19 @@ it.each(['we:', 'plateau:', 'fui:', 'frontierui:', 'webeverything:', 'plateau-ap
     untouched(f);
   }
 });
+
+it.each(['we:', 'fui:'])(
+  'refuses a non-gate literal scope overlapping an open PR directory in %s', async prefix => {
+    const repo = { 'we:': 'web-everything/web-everything', 'fui:': 'frontier-ui/frontierui' }[prefix];
+    const f = fixture({ gateFiles: ['scripts/unrelated.mjs'],
+      readCard: () => ({ scope: [`${prefix}scripts/example/a.mjs`] }),
+      readPrs: vi.fn(() => [{ repo, number: 1, files: ['scripts/example/'] }]) });
+    const result = await f.command();
+    expect(result.code).not.toBe(0);
+    expect(f.options.readPrs).toHaveBeenCalled();
+    expect(result.lines.join('\n')).toContain(`scope overlaps open PR ${repo}#1`);
+    untouched(f);
+  });
 
 it.each([
   ['unreadable', () => { throw new Error('cannot read gates'); }],
