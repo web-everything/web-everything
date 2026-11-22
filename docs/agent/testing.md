@@ -6332,7 +6332,6 @@ the loaded graph. Resetting the entire daemon graph twice inside the CLI test ex
 60-second deadline on a coverage shard. Keep the file/standalone output comparison and zero-GitHub
 assertions intact; consumers without callable entries retain the fresh-import path.
 
-
 ## Change-evidence merge-time snapshots
 
 `change-evidence-writer.test.mjs` pins #7289's clause evidence and exercises wrong-app
@@ -6365,6 +6364,7 @@ that outruns the page cap fails closed naming a later `--since` or a larger `--m
 and the tests pin both recoveries plus the 1,000-merge history case. Offset pages shift when
 a PR is touched or reopened mid-scan, so a multi-page scan re-reads page 1 and rescans on any
 change; a listing that never settles fails closed. The tests touch a PR between page reads.
+
 ## Bounded verify selection and ceiling recovery
 
 Verify gates execute explicit sorted test files, including complete graph selections. Graph failures,
