@@ -1,0 +1,39 @@
+{
+ "policyType": "https://everstandards.dev/core/rubric-policy/v0.1",
+ "id": "https://github.com/plateauapp/plateau-settings/blob/main/review/rubric-policy/company",
+ "level": "company",
+ "seats": [
+  {
+   "lens": "security",
+   "rubric": {
+    "uri": "https://github.com/plateauapp/plateau-settings/blob/main/review/rubrics/security",
+    "digest": {
+     "sha256": "d305745436416844a3c65efa471fac33f8b801466077551a08189113d4014ec1"
+    }
+   },
+   "required": "all",
+   "na": {
+    "allowed": true,
+    "neverNa": [
+     "SB1"
+    ]
+   },
+   "evidence": {
+    "minKind": "quoted-citation"
+   },
+   "citeScope": "tree"
+  },
+  {
+   "lens": "correctness",
+   "rubricFrom": "subject",
+   "required": "all",
+   "na": {
+    "allowed": false
+   },
+   "evidence": {
+    "minKind": "resolved-citation"
+   },
+   "citeScope": "tree"
+  }
+ ]
+}
