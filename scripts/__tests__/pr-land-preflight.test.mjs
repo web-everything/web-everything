@@ -12,12 +12,13 @@ function run({ check = true, fail = false, override = '', count = 15, exempt = f
   body = 'Description', earlyPr = false, labelOnGreen = false, headEvidence = 'matching',
   sha = 'a'.repeat(40), remoteTip = '', forkTip = '', remoteError = false, ancestor = true, refusePush = false,
   shallow = 'false', fetchUrls = null, pushUrls = null, dryRun = false, createFails = false, fallbackGit = false,
-  getUrl = null, realGit = null } = {}) {
+  getUrl = null, realGit = null, lease = null } = {}) {
   const dir = mkdtempSync(join(tmpdir(), 'pr-land-preflight-'));
   const trace = join(dir, 'effects.jsonl');
   const root = resolve('scripts');
   const hook = join(dir, 'pre-push');
   writeFileSync(hook, '#!/bin/sh\necho "fixture pre-push refuses" >&2\nexit 1\n');
+  if (lease !== null) writeFileSync(join(dir, '.lane-lease'), lease);
   const record = `import { appendFileSync } from 'node:fs'; const effect = value => appendFileSync(${JSON.stringify(trace)}, JSON.stringify(value) + '\\n');`;
   const stubs = {
     './operations/canonical-audit-gate.mjs': 'export const checkCanonicalAuditForOpen = () => ({ ok: true });',
@@ -62,6 +63,11 @@ function run({ check = true, fail = false, override = '', count = 15, exempt = f
     const execFileSync = cp.execFileSync;
     cp.execFileSync = (cmd, args, opts) => {
       effect([cmd, args]);
+      if (cmd === process.execPath && /guard-(?:git-push|prototype-tracker)\\.mjs$/.test(args[0])) {
+        // Run the actual hook guards in fresh processes, with only Git/forge ports stubbed.
+        if (${refusePush}) return execFileSync('sh', [${JSON.stringify(hook)}], { encoding: 'utf8' });
+        return execFileSync(cmd, ['--import', ${JSON.stringify(preload)}, ...args], opts);
+      }
       if (cmd === 'node') return ''; // locus linter is read-only and independently tested
       if (cmd !== 'git') throw new Error('unexpected external effect: ' + cmd);
       // realGit: the publish step's remote reads, ancestry/shallow checks and the push run against real local
@@ -69,7 +75,7 @@ function run({ check = true, fail = false, override = '', count = 15, exempt = f
       if (${!!realGit} && (['ls-remote', 'push', 'fetch', 'cat-file'].includes(args[0]) || args.includes('merge-base') || (args[0] === 'remote' && args.includes('--all'))
         || args.includes('--is-shallow-repository') || (args[0] === 'config' && args.includes('core.sshCommand')))) return execFileSync(cmd, args, opts);
       if (args.includes('--is-shallow-repository')) { if (${JSON.stringify(shallow)} === null) throw new Error('shallow unreadable'); return ${JSON.stringify(shallow)}; }
-      if (args[0] === 'rev-parse') return args.includes('--absolute-git-dir') ? ${JSON.stringify(dir)} : ${JSON.stringify(sha)};
+      if (args[0] === 'rev-parse') return args.includes('--git-path') ? ${JSON.stringify(join(dir, '.lane-lease'))} : args.includes('--absolute-git-dir') ? ${JSON.stringify(dir)} : ${JSON.stringify(sha)};
       if (args[0] === 'log') return 'fix: admission';
       if (args[0] === 'remote' && args.includes('--all')) {
         // get-url --all: a string is the URL list git prints; a number is a failed read with that exit status.
@@ -177,15 +183,51 @@ describe('pr-land lane publish remote-tip check', () => {
   const publish = options => run({ check: false, count: 0, ...options });
   const pushes = effects => effects.filter(([cmd, args]) => cmd === 'git' && args[0] === 'push');
 
-  it('origin equals HEAD: skips push even with a refusing hook and reaches PR creation', () => {
-    const { effects, stderr } = publish({ remoteTip: tip(sha), refusePush: true });
+  it('origin equals HEAD: runs the pre-push hook, skips the network push and reaches PR creation', () => {
+    const { effects, stderr } = publish({ remoteTip: tip(sha) });
     expect(pushes(effects)).toEqual([]);
+    const guards = effects.filter(([cmd, args]) => cmd === process.execPath && /guard-.*\.mjs$/.test(args[0]));
+    const hookGuards = Array.from(readFileSync(resolve('.githooks/pre-push'), 'utf8').matchAll(/node scripts\/(guard-[\w-]+\.mjs)/g), m => m[1]);
+    expect(hookGuards).not.toEqual([]);
+    expect(guards.map(([, args]) => args[0].split('/').at(-1))).toEqual(hookGuards);
     // The tip is read from the resolved PUSH URL, never from the remote name (which reads the fetch URL).
     expect(effects).toContainEqual(['git', ['remote', 'get-url', '--push', '--all', 'origin']]);
     expect(effects).toContainEqual(['git', ['ls-remote', '--', 'https://github.com/web-everything/web-everything.git', 'refs/heads/lane/preflight']]);
     expect(effects.some(([cmd, args]) => cmd === 'git' && args[0] === 'ls-remote' && args.includes('origin'))).toBe(false);
     expect(effects.some(([cmd]) => cmd === 'create')).toBe(true);
     expect(stderr).toContain(`push skipped: origin already at ${sha}`);
+  });
+
+  it.each([
+    ['pinned runner', JSON.stringify({ at: sha }), 'pinned runner cannot push'],
+    ['expired pin at a different commit', JSON.stringify({ at: different, expiresAt: 0 }), 'pinned runner cannot push'],
+    ['corrupt lane lease', '{broken', 'cannot read lane lease'],
+    ['invalid lane lease shape', '[]', 'cannot read lane lease'],
+  ])('origin equals HEAD: %s still refuses before PR creation', (_name, lease, diagnostic) => {
+    const { status, result, effects, stderr } = publish({ remoteTip: tip(sha), lease });
+    expect(status).toBe(3);
+    expect(result.reason).toBe('push-failed');
+    expect(result.detail).toContain(diagnostic);
+    expect(pushes(effects)).toEqual([]);
+    expect(effects.some(([cmd]) => cmd === 'create')).toBe(false);
+    expect(stderr).not.toContain('push skipped');
+  });
+
+  it('origin equals HEAD: a refusing pre-push hook prevents PR creation', () => {
+    const { status, result, effects } = publish({ remoteTip: tip(sha), refusePush: true });
+    expect(status).toBe(3);
+    expect(result.reason).toBe('push-failed');
+    expect(pushes(effects)).toEqual([]);
+    expect(effects.some(([cmd]) => cmd === 'create')).toBe(false);
+  });
+
+  it('a guard child failure never includes credentials from its push-URL argument', () => {
+    const { status, result } = publish({ pushUrls: 'https://user:secret@fixture.test/repo.git', forkTip: tip(sha), refusePush: true });
+    expect(status).toBe(3);
+    expect(result.reason).toBe('push-failed');
+    expect(result.detail).toContain('pre-push guards exit 1');
+    expect(result.detail).not.toContain('user:secret');
+    expect(result.detail).not.toContain('fixture.test');
   });
 
   it('origin behind: attempts the exact non-force push and preserves pre-push refusal', () => {
@@ -251,9 +293,24 @@ describe('pr-land lane publish remote-tip check', () => {
   // so a tip can neither skip nor refuse the push — it runs once and the server validates.
   const url = 'https://github.com/web-everything/web-everything.git';
   const fork = 'git@github.com:fork/web-everything.git';
+  it.each([' ', '\t', '\r', '\u00a0'])('does not trim %j from the push URL before reading its tip', suffix => {
+    const { status, effects, stderr } = publish({ pushUrls: url + suffix + '\n', remoteTip: tip(sha), forkTip: '', refusePush: true });
+    expect(effects).toContainEqual(['git', ['ls-remote', '--', url + suffix, 'refs/heads/lane/preflight']]);
+    expect(pushes(effects)).toHaveLength(1);
+    expect(status).toBe(3);
+    expect(stderr).not.toContain('push skipped');
+  });
+
+  it.each([' ', '\t', '\r', '\u00a0'])('does not trim %j from the ls-remote URL comparison', suffix => {
+    const { effects, stderr } = publish({ pushUrls: url, getUrl: url + suffix + '\n', remoteTip: tip(sha), refusePush: true });
+    expect(effects.some(([cmd, args]) => cmd === 'git' && args[0] === 'ls-remote' && args[1] !== '--get-url')).toBe(false);
+    expect(pushes(effects)).toHaveLength(1);
+    expect(stderr).not.toContain('push skipped');
+  });
   it.each([
     ['two remote.origin.url values (push goes to both)', { fetchUrls: `${url}\nhttps://mirror.test/we.git`, pushUrls: `${url}\nhttps://mirror.test/we.git` }],
     ['two push URLs', { pushUrls: `${url}\n${fork}` }],
+    ['an extra blank URL line', { pushUrls: `${url}\n\n` }],
     ['an empty push URL read', { pushUrls: '' }],
     ['the push URL read fails (exit 2)', { pushUrls: 2 }],
     ['the push URL starts with "-" (would be read as an ls-remote option)', { pushUrls: '--upload-pack=touch /tmp/x' }],
@@ -382,15 +439,16 @@ describe('pr-land lane publish against real local remotes', () => {
     expect(effects.some(([cmd]) => cmd === 'create')).toBe(true);
   }), 30_000);
 
-  it('origin.pushurl=fork already at HEAD: the push-URL read skips the push (a refusing pre-push hook is never run)', () => withRepos(({ root, upstream, forkRepo }) => {
+  it('origin.pushurl=fork already at HEAD: runs repository guards and skips only the network push', () => withRepos(({ root, upstream, forkRepo }) => {
     const work = join(root, 'work'); git(root, 'init', '-q', work);
     const sha = commit(work, 'a');
     git(work, 'push', '-q', forkRepo, `HEAD:${ref}`);
     git(work, 'remote', 'add', 'origin', upstream); git(work, 'config', 'remote.origin.pushurl', forkRepo);
-    refuseHook(work);
     const { status, stderr, effects } = publishReal(work, sha);
     expect(stderr).toContain(`push skipped: origin already at ${sha}`);
     expect(status).toBe(0);
+    expect(effects.filter(([cmd, args]) => cmd === process.execPath && /guard-.*\.mjs$/.test(args[0]))).toHaveLength(2);
+    expect(effects.some(([cmd, args]) => cmd === 'git' && args[0] === 'push')).toBe(false);
     expect(effects.some(([cmd]) => cmd === 'create')).toBe(true);
   }), 30_000);
 

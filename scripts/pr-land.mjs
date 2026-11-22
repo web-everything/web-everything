@@ -794,7 +794,10 @@ if (IS_CLI) runCli().catch((error) => emit({ repo: REPO, merged: false, reason: 
 async function runCli() {
   // Install the closure before setup so the entry-point catch can use the normal failure output.
   emit = emitResult;
-  const gitC = (args) => execFileSync('git', args, { cwd: REPO, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }).trim();
+  const gitRaw = (args) => execFileSync('git', args, { cwd: REPO, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
+  const gitC = (args) => gitRaw(args).trim();
+  // Git URL commands print one terminating LF. All other bytes belong to the URL, including whitespace.
+  const gitUrl = (args) => gitRaw(args).replace(/\n$/, '');
   // #2217 — pr-land is a SANCTIONED main-writer (fallback-git merge, post-land heal/regen). Those pushes go to
   // `main`, so they must carry the MAIN_PUSH_OK=1 override the new pre-push hook (guard-git-push.mjs) checks —
   // otherwise the strict-lock hook would block pr-land's own legitimate landing. Scoped to THESE calls only, so
@@ -978,12 +981,12 @@ async function runCli() {
     const validRefSha = /^[0-9a-f]{40}$/i.test(refSha);
     let pushUrl = null;
     try {
-      const pushUrls = gitC(['remote', 'get-url', '--push', '--all', REMOTE]).split('\n').map(s => s.trim()).filter(Boolean);
-      if (pushUrls.length === 1 && !pushUrls[0].startsWith('-')) pushUrl = pushUrls[0];
+      const pushUrls = gitUrl(['remote', 'get-url', '--push', '--all', REMOTE]).split('\n');
+      if (pushUrls.length === 1 && pushUrls[0] && !pushUrls[0].startsWith('-')) pushUrl = pushUrls[0];
       // `get-url --push` already applied insteadOf/pushInsteadOf; `ls-remote <url>` applies insteadOf AGAIN, so a
       // chained rule (X→B, B→C) would read C while the push writes B. Read only when ls-remote would contact
       // exactly the URL the push goes to; otherwise read nothing and push.
-      if (pushUrl && gitC(['ls-remote', '--get-url', '--', pushUrl]) !== pushUrl) pushUrl = null;
+      if (pushUrl && gitUrl(['ls-remote', '--get-url', '--', pushUrl]) !== pushUrl) pushUrl = null;
     } catch { pushUrl = null; }
     const remoteTipLine = pushUrl ? tryGit(['ls-remote', '--', pushUrl, remoteHeadRef]) : null;
     const remoteTipMatch = /^([0-9a-f]{40})\t([^\r\n]+)$/i.exec(remoteTipLine ?? '');
@@ -1203,12 +1206,28 @@ async function runCli() {
     detail: ['all pre-push gates passed', ...info].join('\n') }, 0);
 
   // 2. Publish the source commit to the lane ref on origin (guard-safe: lane/*). Never force, no local branch.
-  // Only an exact, readable remote tip can authorize skipping the guarded push.
-  // Failed/malformed remote reads retain the normal push path and its pre-push guard.
+  // Only an exact, readable remote tip can authorize skipping the network push. The repository's
+  // pre-push guards still run with the same ref payload, including pinned/corrupt lease enforcement.
   const pushTarget = pushSkipDecision();
   const { remoteTip, validRefSha, alreadyPublished } = pushTarget;
   if (!alreadyPublished && validRefSha && remoteTip) completeHistoryForPush(pushTarget);
   if (alreadyPublished) {
+    try {
+      // These are the two guards wired by .githooks/pre-push. Resolve their entrypoints here so --repo
+      // also works for a checkout outside WE; each guard still reads the target checkout's lease via cwd.
+      for (const guard of ['./guard-git-push.mjs', './guard-prototype-tracker.mjs']) {
+        execFileSync(process.execPath, [fileURLToPath(new URL(guard, import.meta.url)), REMOTE, pushTarget.pushUrl], {
+          cwd: REPO, encoding: 'utf8', stdio: ['pipe', 'pipe', 'pipe'],
+          input: `${refSha} ${refSha} refs/heads/${REF} ${remoteTip}\n`, timeout: 30_000, maxBuffer: 1024 * 1024,
+        });
+      }
+    } catch (e) {
+      // execFileSync's message includes argv (and potentially URL credentials). Keep only a guard's own
+      // refusal diagnostic, or a bounded status when the guard failed before producing one.
+      const guardReason = String(e.stderr ?? '').split('\n').find(line => line.startsWith('✗ pre-push BLOCKED:') || line.startsWith('pre-push BLOCKED —'))
+        ?? `pre-push guards ${childFailureNote(e)}`;
+      emit({ repo: REPO, merged: false, reason: 'push-failed', detail: pushFailedDetail(guardReason, { SRC, REF, REMOTE }) }, 3);
+    }
     process.stderr.write(`pr-land [${REPO}] · push skipped: ${REMOTE} already at ${refSha}\n`);
   } else if (validRefSha && remoteTip && provenNotAncestor(remoteTip)) {
     emit({ repo: REPO, merged: false, reason: 'push-failed',
