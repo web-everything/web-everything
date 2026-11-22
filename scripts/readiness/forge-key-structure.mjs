@@ -249,12 +249,9 @@ function canonicalize(bytes,emit,tick,{comments=true,utf16=true}={}) {
       if(!startsObjectMember(text,at+1))continue;
       tick();
       const limit=Math.min(text.length,at+65536);
-      // Scanning past the bound is charged by bytes (64 per step) so repeated tails stay inside the work budget.
-      if(at+65536<text.length)for(let n=(text.length-at)>>6;n>0;n--)tick();
       let depth=0;
       pieces.lastIndex=at;
       for(let piece=pieces.exec(text);piece;piece=pieces.exec(text)) {
-        if(pieces.lastIndex>limit)tick();
         if(piece[0]==='{')depth++;
         else if(piece[0]==='}'&&--depth===0) {
           // A candidate longer than the bound is never silently skipped: fail closed.
@@ -263,6 +260,9 @@ function canonicalize(bytes,emit,tick,{comments=true,utf16=true}={}) {
           depth=-1;break;
         }
       }
+      // Only an unclosed candidate scans the whole remaining tail. Charge bytes beyond the bound (64 per step),
+      // including a final regex search with no match; small closed objects pay no overflow charge.
+      if(depth>=0)for(let n=(text.length-limit)>>6;n>0;n--)tick();
       // Never closes and extends past the bound: fail closed unless no signal that could build or hide the member
       // name `kty` (literal, escape, computed/spread member, string concatenation) occurs at or after the brace.
       if(depth>=0&&at+65536<text.length&&lastSig>=at)throw EXHAUSTED;

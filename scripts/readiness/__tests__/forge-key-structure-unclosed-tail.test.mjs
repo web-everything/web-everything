@@ -23,6 +23,18 @@ describe('forge key structure: unclosed object tails stay linear without weakeni
   it('does not exhaust on truncated cells with no signal after them',()=>{
     expect(keyStructureFinding(Buffer.from(truncated+prose+'a b'))).toBeNull();
   });
+  it('differential corpus: small closed objects hidden behind a stray quote stay within budget',()=>{
+    const members=['"a":1',"'a':1",'a:1','/* comment */ "a":1','// comment\r\n"a":1','// comment\u2028"a":1'];
+    for(const member of members) {
+      const body=stray+'\\| '+('{'+member+'}\n').repeat(3000)+pad(400000);
+      // Every candidate closes within the bound, regardless of the remaining document length.
+      expect(keyStructureFinding(Buffer.from(body)),member).toBeNull();
+    }
+  });
+  it('charges repeated unsignalled unclosed tails even when the last regex search finds no token',()=>{
+    const body='\\| '+stray+('{"a":1\n').repeat(1000)+pad(400000);
+    expect(keyStructureFinding(Buffer.from(body))).toBe(EXH);
+  });
   it('fails closed on an overflowing brace when kty, an escape, a computed or spread member or concatenation follows',()=>{
     const tails=[
       '{'+pad(66000)+q+kt+q+':`oct`,'+q+'k'+q+':`YQ`}',
