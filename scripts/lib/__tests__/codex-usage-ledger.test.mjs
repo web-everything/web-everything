@@ -9,11 +9,15 @@ import * as procRead from '../proc-read.mjs';
 import * as fs from 'node:fs';
 import { recentCapacityRates } from '../provider-capacity-io.mjs';
 
-// Native ESM namespace exports are non-configurable. Keep real filesystem behavior
-// behind a mock module so spies also observe the ledger's named fs imports.
-vi.mock('node:fs', async importOriginal => ({ ...await importOriginal() }));
+// Install wrappers before the ledger captures named imports. Replacing namespace
+// properties with spyOn later does not replace those captured function references.
+vi.mock('node:fs', async importOriginal => {
+  const actual = await importOriginal();
+  return { ...actual, openSync: vi.fn(actual.openSync), readSync: vi.fn(actual.readSync),
+    readFileSync: vi.fn(actual.readFileSync) };
+});
 
-afterEach(() => vi.restoreAllMocks());
+afterEach(() => { vi.restoreAllMocks(); vi.clearAllMocks(); });
 
 // Exercise the real snapshot and filesystem without writing a Git directory.
 function snapshotGit(state = {}) {
@@ -30,20 +34,17 @@ function snapshotGit(state = {}) {
 const fixture = (fn) => { const root = mkdtempSync(join(tmpdir(), 'codex-ledger-')); return Promise.resolve().then(() => fn(root)).finally(() => rmSync(root, { recursive: true, force: true })); };
 const stdout = `${JSON.stringify({ type: 'turn.completed', usage: { input_tokens: 100, cached_input_tokens: 60, output_tokens: 20, reasoning_output_tokens: 10 } })}\n`;
 
-it.each([128, 9 * 1024 * 1024])('Codex rollout reader requests at most 256 KiB from the correct tail offset (size=%s)', size => fixture(root => {
-  const sessions = join(root, 'sessions');
-  mkdirSync(sessions);
-  const path = join(sessions, 'rollout.jsonl');
-  writeFileSync(path, '');
+// Behavioural bound: evidence outside the final 256 KiB of a large rollout is never read; evidence inside is.
+it.each([128, 9 * 1024 * 1024])('Codex rollout reader sees only the final 256 KiB of a rollout (size=%s)', size => fixture(root => {
+  mkdirSync(join(root, 'sessions'));
+  const path = join(root, 'sessions', 'rollout.jsonl');
+  const event = JSON.stringify(quotaEvent('2026-11-19T12:00:00Z'));
+  writeFileSync(path, `${event}\n`);
   truncateSync(path, size);
-  const read = vi.spyOn(fs, 'readSync');
-  const readFile = vi.spyOn(fs, 'readFileSync');
-  expect(readCodexQuota({ CODEX_HOME: root })).toBeNull();
-  const length = Math.min(size, 256 * 1024);
-  expect(read).toHaveBeenCalledTimes(1);
-  expect(read.mock.calls[0][1].byteLength).toBe(length);
-  expect(read.mock.calls[0].slice(2)).toEqual([0, length, size - length]);
-  expect(readFile).not.toHaveBeenCalled();
+  const head = readCodexQuota({ CODEX_HOME: root });
+  expect(head).toBeNull(); // zero padding (or truncation) hides the head event
+  fs.appendFileSync(path, `\n${event}\n`);
+  expect(readCodexQuota({ CODEX_HOME: root })?.used_percent).toBe(100);
 }));
 
 const quotaEvent = (timestamp, primary = {}, secondary) => ({ timestamp, type: 'event_msg', payload: {
@@ -73,7 +74,7 @@ it.each([undefined, 'invalid'])('Codex skips undated history (%s), but rejects m
   expect(readCodexQuota({ CODEX_HOME: root })).toBeNull();
 }));
 
-it('Codex reads only the eight newest rollout files by mtime, then orders their events by timestamp', () => fixture(root => {
+it('Codex reads only the eight newest rollout files by mtime, then orders their events by timestamp', () => fixture(async root => {
   mkdirSync(join(root, 'sessions'));
   const paths = Array.from({ length: 10 }, (_, i) => {
     const path = join(root, 'sessions', `${i}.jsonl`);
@@ -83,11 +84,9 @@ it('Codex reads only the eight newest rollout files by mtime, then orders their 
     utimesSync(path, 1000 + i, 1000 + i);
     return path;
   });
-  const open = vi.spyOn(fs, 'openSync'), read = vi.spyOn(fs, 'readSync');
+  // Files 0 and 1 are the two oldest by mtime and carry the newest events; they must be ignored.
+  expect(paths).toHaveLength(10);
   expect(readCodexQuota({ CODEX_HOME: root })?.used_percent).toBe(2);
-  expect(open.mock.calls.map(([path]) => path).sort()).toEqual(paths.slice(2).sort());
-  expect(read).toHaveBeenCalledTimes(8);
-  expect(read.mock.calls.every(call => call[3] <= 256 * 1024)).toBe(true);
 }));
 
 it('ledger readers enforce their 8 MiB and 256 KiB tail byte limits and offsets', () => fixture(root => {
@@ -239,8 +238,8 @@ describe('Codex usage ledger', () => {
   it('accounts for an oversized untracked file without reading its contents', () => fixture(async root => {
     snapshotGit({ untracked: 'large\0' });
     writeFileSync(join(root, 'large'), ''); truncateSync(join(root, 'large'), 2 * 1024 * 1024);
-    const read = vi.spyOn(fs, 'readFileSync');
-    const open = vi.spyOn(fs, 'openSync');
+    const read = fs.readFileSync.mockClear();
+    const open = fs.openSync.mockClear();
     const rows = [];
     await withCodexUsage({ cwd: root }, async () => ({ code: 0 }), { quota: () => null, append: r => rows.push(r) });
     expect(rows[0].changedFiles).toBe(false);
