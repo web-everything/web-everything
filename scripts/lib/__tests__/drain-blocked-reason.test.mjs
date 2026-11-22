@@ -14,7 +14,7 @@ const head = 'a'.repeat(40);
 const requiredChecks = ['test', 'merge-gate'];
 const row = (name, conclusion = 'SUCCESS', extra = {}) => ({ __typename: 'CheckRun', name, status: 'COMPLETED', conclusion,
   startedAt: '2026-01-01T00:00:00Z', completedAt: '2026-01-01T00:01:00Z',
-  detailsUrl: 'https://example.test/checks/100', checkRunId: 100, appSlug: 'github-actions', appId: 15368, ...extra });
+  detailsUrl: 'https://example.test/checks/100', checkRunId: 100, appSlug: 'github-actions', ...extra });
 const restRow = (name, conclusion = 'success', extra = {}) => ({ id: 100, name, status: 'completed', conclusion,
   output: { title: '', summary: '' }, head_sha: head, ...extra });
 const fixture = (extra = {}) => ({ number: 7196, headRefOid: head, baseRefName: 'main', body: 'Fix the gate.', title: 'Gate',
