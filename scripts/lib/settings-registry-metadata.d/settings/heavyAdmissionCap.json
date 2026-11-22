@@ -1,0 +1,6 @@
+{
+  "description": "Maximum concurrent heavy commands admitted on the host.",
+  "owner": "scripts/dispatch-settings.json",
+  "changeVia": "pr",
+  "instant": false
+}

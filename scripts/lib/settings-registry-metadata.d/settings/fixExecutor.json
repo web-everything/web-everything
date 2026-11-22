@@ -1,0 +1,6 @@
+{
+  "description": "Fix executor fallback chain and critical Claude routing rung.",
+  "owner": "scripts/settings/fix-executor.json",
+  "changeVia": "pr",
+  "instant": false
+}

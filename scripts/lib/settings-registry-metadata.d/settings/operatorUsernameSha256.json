@@ -1,0 +1,6 @@
+{
+  "description": "Hashed operator usernames recognized by the portability gate.",
+  "owner": "scripts/settings/privacy-terms-allowlist.json",
+  "changeVia": "pr",
+  "instant": false
+}

@@ -620,6 +620,8 @@ describe('#3036 read-only is a property of the DECLARING MODULE — the part tha
     'operator-override-set': 'operator-override.mjs',
     'operator-override-clear': 'operator-override.mjs',
     'ruled-weakened-add': 'ruled-weakened-add.mjs',
+    // Writes: resolves a generated-file merge conflict in a worktree by regenerating it; listed for module-map coverage only.
+    'resolve-generated': 'resolve-generated.mjs',
     'delivery-capacity-hold': 'delivery-capacity-override.mjs',
     'delivery-capacity-pin': 'delivery-capacity-override.mjs',
     'delivery-capacity-clear': 'delivery-capacity-override.mjs',

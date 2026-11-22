@@ -22,7 +22,7 @@ export default {
   fixPresent(root) {
     try {
       const source = readFileSync(join(root, 'scripts/lib/daemon-rebuild/rebuild-job.mjs'), 'utf8');
-      return /r\?\.moved \|\| r\?\.adopted/.test(source) && /readReadyCandidate\(root, env\)/.test(source);
+      return /r\?\.moved \|\| r\?\.adopted/.test(source) && /readReady(?:Candidate)?\(root, env\)/.test(source);
     } catch {
       return false;
     }
@@ -52,8 +52,10 @@ export default {
             const env = { WE_DAEMON_STATE_DIR: join(root, 'state') };
             const store = createJobStore(join(root, 'jobs'));
             mkdirSync(store.dir, { recursive: true });
-            const ready = { kind: 'candidate', prevHead: 'a'.repeat(40), tree: 'passed-tree',
-              passedAt: new Date().toISOString(), adopt: { finalSha: 'b'.repeat(40), applied: [] } };
+            // A complete record, as the real publisher writes it (admission refuses an incomplete one as unreadable).
+            const ready = { kind: 'candidate', forced: false, prevHead: 'a'.repeat(40), tree: 'passed-tree',
+              passedAt: new Date().toISOString(),
+              adopt: { finalSha: 'b'.repeat(40), inputsKey: 'soak', mainSha: 'd'.repeat(40), applied: [] } };
             const publish = () => {
               if (!writeReadyCandidate(root, ready, env) || !readReadyCandidate(root, env)) {
                 throw new Error(`${mode}: failed to seed ready evidence`);

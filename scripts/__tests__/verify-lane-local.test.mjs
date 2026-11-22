@@ -213,7 +213,7 @@ describe('verify-lane --local', () => {
     const startLine = source.split('\n').find(line => line.startsWith("if (MODE !== 'run') writeMarker("));
     const context = {
       MODE: 'request', process: { env: {} }, verifyStartBody: value => value,
-      headSha: 'head', GATE: selectedTests, currentTreeHash: 'tree', writeMarker: vi.fn(),
+      headSha: 'head', GATE: selectedTests, currentTreeHash: 'tree', writeMarker: vi.fn(), gateAudit: {},
     };
     parseCli(context, local);
     runInNewContext(startLine, context);
@@ -278,7 +278,7 @@ describe('verify-lane --local', () => {
     const writeMarker = vi.fn();
     const context = {
       MODE: 'verify', writeMarker, process: { env: {} },
-      verifyStartBody: value => value, headSha: 'head', GATE: 'gate', currentTreeHash: 'tree', flags: {},
+      verifyStartBody: value => value, headSha: 'head', GATE: 'gate', currentTreeHash: 'tree', flags: {}, gateAudit: {},
       finished: { status: 'green' }, overallRunLocation: () => ({ location: 'local' }), ranOnPhases: {},
       resolvedGate: null, redCauseFields: {}, phases: {}, revertRed: null,
     };

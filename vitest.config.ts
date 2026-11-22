@@ -29,7 +29,7 @@ export default defineConfig({
     // `action-cli.test.mjs`/`action-records.test.mjs` rely on: their `createActionStore()` calls take no
     // explicit root, so without it they would write real attempts to `~/workspace/.operations/coordination`.
     // prepare-124 S3: the shadow tracer setup file goes FIRST so it snapshots env before vitest.setup.ts strips `WE_*`.
-    // Same off switches as the reporter, plus WE_TEST_CACHE_TRACE=0 (it records only; it never skips a test).
+    // Retired tracing requires WE_TEST_CACHE_TRACE=1 plus the reporter's cache switches (observation only).
     setupFiles: [...(testTraceEnabled(process.env) ? ['./scripts/test-cache/trace-setup.mjs'] : []), './vitest.setup.ts'],
     // prepare-124 S2: SHADOW-ONLY test-result cache. The reporter never skips or changes a test; it records "would
     // skip" next to the real outcome in ~/.cache/we-vitest-results. Absent under CI / GITHUB_ACTIONS / WE_TEST_CACHE=0
@@ -121,12 +121,14 @@ export default defineConfig({
       },
     },
     include: [
+      'design-systems/**/__tests__/**/*.test.ts', // Design-system token source contracts.
       'contracts/**/*.test.ts', // Declarative wire-contract conformance.
       // #1047: WE's plug tests relocated to FUI (the canonical impl home) when `we:plugs/` was deleted.
       'blocks/**/__tests__/**/*.test.{ts,tsx}',
       'src/**/__tests__/**/*.test.{ts,tsx}', // build-time data files (e.g. burndown accounting)
       'scripts/**/__tests__/**/*.test.mjs', // build/CI tooling (e.g. conformance auto-fix engine, #095)
       'scripts/ci-minutes/**/*.test.ts', // CI-minutes tracker (CI-MIN.S1.1)
+      'scripts/lib/provider-capacity.test.mjs', // Co-located capacity routing regression suite.
       'scripts/lib/red-team-gate-catchup.test.mjs', // Co-located Gap 1 regression suite.
       'skills-src/**/__tests__/**/*.test.mjs', // skill-local mechanism modules (e.g. the conveyor headless runner, #2702)
       'tools/**/__tests__/**/*.test.{ts,tsx}', // build-time Vite plugins (e.g. the trait-enforcer codegen, #484)

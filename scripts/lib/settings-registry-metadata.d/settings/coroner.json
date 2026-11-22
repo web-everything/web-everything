@@ -1,0 +1,6 @@
+{
+  "description": "Nightly analysis and postmortem policy overrides.",
+  "owner": "scripts/settings/coroner-postmortem.json",
+  "changeVia": "pr",
+  "instant": false
+}
