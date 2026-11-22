@@ -6345,3 +6345,13 @@ shards exactly as the default would, so it is still recognized as the default ga
 Gate ceilings get one capped retry tied to lane, head and killed job. Detached jobs settle in
 `verify-gate-job.mjs`, so recovery must cover that consumer as well as `verify-dispatch.mjs`'s
 in-process sweep. Persist the retry identity in job input to dedupe the enqueue-before-marker crash window.
+
+## Build-priority named-file allowlist fixtures
+
+The shipped `scripts/settings/build-priority-scope.json` has `allowedFiles: []`.
+An empty array is valid settings evidence and refuses every scope with
+`allowlist is empty; add the file by a reviewed settings PR`. Missing or unreadable
+settings, a missing key, non-array values, non-string entries and inexact paths
+still refuse as invalid evidence. Tests needing listed files must inject
+`readScopeSettings` with an explicit allowlist; real Git reader tests commit their
+own settings blob and pin it with the card snapshot. Never depend on a shipped seed.

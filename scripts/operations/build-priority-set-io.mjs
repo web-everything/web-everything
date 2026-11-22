@@ -75,7 +75,7 @@ function readAllowedFiles(readSettings) {
     if (typeof contents !== 'string' || Buffer.byteLength(contents, 'utf8') > CONTENT_LIMIT) throw new Error('invalid settings content');
     const settings = JSON.parse(contents);
     if (!settings || Object.hasOwn(settings, 'allowedDirs')
-        || !Array.isArray(settings.allowedFiles) || !settings.allowedFiles.length) throw new Error('empty allowedFiles');
+        || !Array.isArray(settings.allowedFiles)) throw new Error('invalid allowedFiles');
     return new Set(settings.allowedFiles.map(file => {
       if (typeof file !== 'string' || !exactSourceFile(file)) throw new Error('invalid file');
       return file;
@@ -154,6 +154,7 @@ function prepare(input, options) {
   const pathType = options.pathType ?? source.pathType;
   const readContent = options.readContent ?? source.readContent;
   const allowedFiles = readAllowedFiles(options.readScopeSettings ?? source.readScopeSettings);
+  if (!allowedFiles.size) refuse('allowlist is empty; add the file by a reviewed settings PR');
   let gateFiles;
   try {
     if (!Array.isArray(TRUST_CHAIN) || !TRUST_CHAIN.length) refuse('empty or unreadable gate TRUST_CHAIN');

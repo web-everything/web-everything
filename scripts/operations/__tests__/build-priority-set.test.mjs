@@ -14,12 +14,12 @@ const dirs = [];
 const at = '2026-11-20T12:00:00.000Z';
 const flags = ['--ids=42,43', '--mode=only', '--ttl-hours=2', '--actor=operator', '--reason=priority call'];
 afterEach(() => { for (const dir of dirs.splice(0)) fs.rmSync(dir, { recursive: true, force: true }); });
-function fixture({ allowedFiles = ['scripts/conveyor/a.mjs', 'scripts/conveyor/a.test.mjs', 'scripts/lib/ledger-readiness-daily.mjs', 'scripts/conveyor/renamed.mjs'], ...overrides } = {}, createOperation = createBuildPrioritySet) {
+function fixture({ allowedFiles = ['scripts/conveyor/a.mjs', 'scripts/conveyor/a.test.mjs', 'scripts/conveyor/renamed.mjs'], ...overrides } = {}, createOperation = createBuildPrioritySet) {
   const dir = fs.mkdtempSync(join(process.env.TMPDIR, 'build-priority-set-')); dirs.push(dir);
   const path = join(dir, 'build-priority.runtime.json');
   const settingsDir = fs.mkdtempSync(join(process.env.TMPDIR, 'priority-scope-')); dirs.push(settingsDir);
   const scopeSettingsPath = join(settingsDir, 'scope.json');
-  fs.writeFileSync(scopeSettingsPath, JSON.stringify({ allowedFiles: allowedFiles.filter(file => /\.(mjs|js|ts|json|md|sh|yml|yaml|css|html)$/i.test(file)).concat('scripts/conveyor/a.mjs') }));
+  fs.writeFileSync(scopeSettingsPath, JSON.stringify({ allowedFiles: allowedFiles.filter(file => /\.(mjs|js|ts|json|md|sh|yml|yaml|css|html)$/i.test(file)).concat(allowedFiles.length ? ['scripts/conveyor/a.mjs'] : []) }));
   const readCard = vi.fn(() => ({ scope: ['we:scripts/conveyor/a.mjs', 'we:scripts/conveyor/a.test.mjs'] }));
   const readPrs = vi.fn(() => []);
   const options = { env: { WE_BUILD_PRIORITY_RUNTIME_FILE: path }, readCard, readPrs, pathType: () => 'file', readContent: () => 'export {};\n', readScopeSettings: () => fs.readFileSync(scopeSettingsPath, 'utf8'), now: () => new Date(at), ...overrides };
@@ -130,7 +130,7 @@ it('refuses a root directory named relocated.mjs outside the allowlist', async (
 });
 
 it.each(['missing', 'unreadable', '', '{', '{}', 'null', '{"allowedDirs":["scripts/conveyor/"]}',
-  '{"allowedFiles":[]}', '{"allowedFiles":"scripts/a.mjs"}',
+  '{"allowedFiles":"scripts/a.mjs"}',
   '{"allowedDirs":[],"allowedFiles":["scripts/a.mjs"]}',
   ...[null, 42, '', 'scripts/conveyor/', 'scripts/lib', '/scripts/a.mjs', 'scripts//a.mjs',
     'scripts/../a.mjs', 'scripts/./a.mjs', 'scripts/.hidden/a.mjs', 'scripts/lib.v2/a.mjs',
@@ -149,6 +149,45 @@ it.each(['missing', 'unreadable', '', '{', '{}', 'null', '{"allowedDirs":["scrip
   expect(f.readPrs).not.toHaveBeenCalled();
   untouched(f, contents === 'missing' ? [] : ['scope.json']);
 });
+
+it('refuses a missing allowedFiles key as malformed settings', async () => {
+  const f = fixture({ readScopeSettings: () => '{}' });
+  const result = await f.command();
+  expect(result.code).not.toBe(0);
+  expect(result.lines.join('\n')).toMatch(/malformed scope settings/);
+  expect(f.readCard).not.toHaveBeenCalled();
+  expect(f.readPrs).not.toHaveBeenCalled();
+  untouched(f);
+});
+
+it('accepts an empty array as a setting and refuses scopes instead of the settings read', async () => {
+  const f = fixture({ allowedFiles: [] });
+  const result = await f.command();
+  expect(result.code).not.toBe(0);
+  expect(result.lines.join('\n')).toContain('allowlist is empty; add the file by a reviewed settings PR');
+  expect(result.lines.join('\n')).not.toMatch(/malformed scope settings/);
+  expect(f.readPrs).not.toHaveBeenCalled();
+  untouched(f);
+});
+
+it.each(['we:scripts/lib/ledger-readiness-daily.mjs', 'we:scripts/conveyor/plain.mjs',
+  'we:scripts/lib/gate-config.mjs', 'fui:scripts/conveyor/plain.mjs', 'we:scripts/*.mjs'])(
+  'refuses any scope with the empty shipped allowlist, including plain files: %s', async scope => {
+    for (const preview of [false, true]) {
+      const f = fixture({
+        readScopeSettings: () => fs.readFileSync(resolve('scripts/settings/build-priority-scope.json'), 'utf8'),
+        readCard: () => ({ scope: [scope] }),
+        pathType: vi.fn(() => 'file'), readContent: vi.fn(() => 'export {};\n'),
+      });
+      const result = await f.command([...flags, ...(preview ? ['--preview'] : [])]);
+      expect(result.code).not.toBe(0);
+      expect(result.lines.join('\n')).toContain('allowlist is empty; add the file by a reviewed settings PR');
+      expect(f.options.pathType).not.toHaveBeenCalled();
+      expect(f.options.readContent).not.toHaveBeenCalled();
+      expect(f.readPrs).not.toHaveBeenCalled();
+      untouched(f);
+    }
+  });
 
 it('ignores a broader worktree allowlist and uses the pinned snapshot allowlist', async () => {
   const sha = 'a'.repeat(40);
@@ -347,7 +386,8 @@ it('keeps PR overlap comparisons case-insensitive', async () => {
 it.each(['scripts/lib/Ledger-Readiness-Daily.mjs', 'SCRIPTS/LIB/LEDGER-READINESS-DAILY.MJS'])(
   'refuses scope casing different from the allowlist: %s', async path => {
     const pathType = vi.fn(() => 'file');
-    const f = fixture({ readCard: () => ({ scope: [`we:${path}`] }), pathType });
+    const f = fixture({ allowedFiles: ['scripts/lib/ledger-readiness-daily.mjs'],
+      readCard: () => ({ scope: [`we:${path}`] }), pathType });
     const result = await f.command();
     expect(result.code).not.toBe(0);
     expect(result.lines.join('\n')).toMatch(/outside allowedFiles/);

@@ -78,15 +78,15 @@ it('bounds real Git content output at 64 KiB and refuses overflow', async () => 
 it('reads scope settings from the same pinned SHA as cards and ignores broader worktree and ref state', async () => {
   await withRealRepo(async ctx => {
     const settings = 'scripts/settings/build-priority-scope.json';
-    const seed = 'scripts/lib/ledger-readiness-daily.mjs';
-    const original = JSON.stringify({ allowedFiles: [seed] });
-    ctx.commit({ [settings]: original, 'backlog/42-example.md': '---\nscope: ["we:scripts/lib/ledger-readiness-daily.mjs"]\n---\n' });
+    const listed = 'scripts/conveyor/a.mjs';
+    const original = JSON.stringify({ allowedFiles: [listed] });
+    ctx.commit({ [settings]: original, 'backlog/42-example.md': '---\nscope: ["we:scripts/conveyor/a.mjs"]\n---\n' });
     ctx.git(['update-ref', 'refs/remotes/origin/main', 'HEAD']);
     const sha = ctx.git(['rev-parse', 'HEAD']).trim();
     const calls = [];
     const read = readPriorityCards({ git: (args, options) => { calls.push(args); return ctx.git(args); } });
     read('42');
-    const broader = JSON.stringify({ allowedFiles: [seed, 'scripts/lib/unlisted.mjs'] });
+    const broader = JSON.stringify({ allowedFiles: [listed, 'scripts/lib/unlisted.mjs'] });
     writeFileSync(join(ctx.root, settings), broader);
     expect(read.readScopeSettings()).toBe(original);
     ctx.commit({ [settings]: broader });
