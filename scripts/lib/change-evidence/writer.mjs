@@ -217,7 +217,7 @@ function mergedSince({ listing, repo, since, maxPages }) {
     // One page is one atomic read: nothing can shift. Otherwise page 1 must be unchanged after the scan.
     if (pages === 1 || signature(page(1)) === first) return prs;
   }
-  throw Error(`merged listing kept changing during ${LISTING_SCANS} scans; operator: retry backfill when the repository is quieter`);
+  throw Error(`merged listing kept changing during ${LISTING_SCANS} scans; operator: retry backfill with a later --since (a one-page window is read atomically)`);
 }
 
 export async function backfillChangeEvidence({ since, repo = DEFAULT_REPO, gh = defaultGh, maxCalls = 256, maxPages = 10, ...options } = {}) {
@@ -230,7 +230,8 @@ export async function backfillChangeEvidence({ since, repo = DEFAULT_REPO, gh = 
   const prs = mergedSince({ listing, repo, since: Date.parse(`${since}T00:00:00Z`), maxPages });
   // Root cause of the first live backfill failing ~20 of 30: ONE 256-call budget shared by every merge (about 9 reads
   // each). The backfill budget scales with the number of merges, and per merge with --max-pages (collect reads up to
-  // four paged endpoints), so raising --max-pages never trips the call budget instead. Backfill never emits to the
+  // four paged endpoints), so raising --max-pages does not by itself exhaust the per-merge share (pending retries
+  // from earlier passes share the same budget and stay pending on exhaustion). Backfill never emits to the
   // live daemon-events log (only the drain hook at merge time does); failures stay on stderr and in the pending ledger.
   const reads = reader(gh, Math.max(maxCalls, Math.max(64, 4 * maxPages + 8) * prs.length), maxPages);
   return writeChangeEvidenceForMerged({ ...options, emit: async () => {}, repo, gh, maxPages, reads,

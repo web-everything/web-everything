@@ -224,7 +224,7 @@ it('backfill fails closed when the listing never settles across scans', async ()
   const h = harness(); crowded(h);
   let tick = 0;
   h.x.onPage = page => { if (page === 1) touch(h, 50000 + (tick++ % 100), `2026-11-21T23:${String(10 + tick).padStart(2, '0')}:00Z`); };
-  await expect(backfillChangeEvidence({ ...h.options, since: '2026-11-21' })).rejects.toThrow(/kept changing/);
+  await expect(backfillChangeEvidence({ ...h.options, since: '2026-11-21' })).rejects.toThrow(/kept changing.*later --since/);
   expect(h.gh.mock.calls.some(([a]) => a[0] === 'pr')).toBe(false);
 });
 it('backfill never emits daemon events and its call budget scales with the merge count', async () => {
