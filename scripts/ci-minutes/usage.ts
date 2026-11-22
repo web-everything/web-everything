@@ -41,7 +41,8 @@ export function parseUsageSummary(
   for (const item of json.usageItems) {
     if (!record(item) || typeof item.product !== 'string'
       || typeof item.unitType !== 'string') return error();
-    if (item.product !== 'actions' || item.unitType.toLowerCase() !== 'minutes') continue;
+    // GitHub documents the capitalized product name "Actions"; match it like unitType.
+    if (item.product.toLowerCase() !== 'actions' || item.unitType.toLowerCase() !== 'minutes') continue;
     const discount = item.discountQuantity;
     const net = item.netQuantity;
     if (!nonnegative(discount) || !nonnegative(net)) return error();

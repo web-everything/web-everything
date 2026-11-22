@@ -82,6 +82,22 @@ describe('usage', () => {
       .toMatchObject({ state: 'fresh', usedMinutes: 30, pct: 30 });
   });
 
+  it('matches the product case-insensitively, including the documented "Actions" name', () => {
+    for (const product of ['Actions', 'ACTIONS', 'actions']) {
+      const parsed = parseUsageSummary({ ...summary, usageItems: [
+        { product, sku: 'actions_linux', unitType: 'minutes', discountQuantity: 0, netQuantity: 1000 },
+      ] }, { includedMinutes: 1000 });
+      expect(parsed).toMatchObject({ state: 'fresh', usedMinutes: 1000, pct: 100 });
+      expect(evaluateThresholds(parsed as never, []).firedKeys).toEqual([
+        'ci-min:web-everything:80:2026-11', 'ci-min:web-everything:95:2026-11',
+      ]);
+    }
+    // A different product that merely contains the word must still be excluded.
+    expect(parseUsageSummary({ ...summary, usageItems: [
+      { product: 'Copilot Actions', unitType: 'minutes', discountQuantity: 0, netQuantity: 5 },
+    ] }, { includedMinutes: 100 })).toMatchObject({ state: 'fresh', usedMinutes: 0 });
+  });
+
   it('fails closed on every malformed usage row, including unrelated rows', () => {
     for (const item of [null, undefined, [], 'actions', 3, {},
       { product: 'actions' }, { unitType: 'Minutes' },
