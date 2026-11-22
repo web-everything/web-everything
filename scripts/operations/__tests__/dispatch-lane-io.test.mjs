@@ -167,7 +167,7 @@ describe('lean repair background argv', () => {
       const text = JSON.stringify(buildAgentArgv({ ...options(kind), systemPromptFile: '/repo/.operations/brief.md' }));
       expect(text).not.toMatch(/\.claude\/(CLAUDE\.md|projects|settings)/);
       expect(text).not.toMatch(/\/memory\b|MEMORY\.md/);
-      expect(text).not.toContain(`${process.env.HOME}/.claude`);
+      expect(text.includes(`${process.env.HOME}/.claude`)).toBe(false);
     }
   });
 

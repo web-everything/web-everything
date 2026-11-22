@@ -45,12 +45,8 @@ import { buildAuthorActorMarker } from '../../lib/review-independence.mjs';
 
 // Validate hooks against fixture files and pin the planner's single lane grant.
 vi.mock('../../operations/minimal-context-provider.mjs', async (original) => {
-  const actual = await original();
-  const root = new URL('../../..', import.meta.url).pathname;
-  return { ...actual, LEAN_FIX_HOOKS_SETTINGS: () => actual.LEAN_FIX_HOOKS_SETTINGS(
-    new URL('../../operations/__tests__/fixtures/lean-hooks-claude-settings.json', import.meta.url).pathname,
-    { repoRoot: root, guardRoot: root },
-  ) };
+  const { withLeanRepairSettingsFixture } = await import('../../operations/__tests__/helpers/lean-repair-settings.mjs');
+  return withLeanRepairSettingsFixture(await original());
 });
 const LEAN_GRANT = leanRepairGrant({ launchKind: 'fix', lane: 13 });
 

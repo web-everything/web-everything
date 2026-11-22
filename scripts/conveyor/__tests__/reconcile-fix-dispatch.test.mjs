@@ -26,12 +26,8 @@ import { LEAN_FIX_HOOKS_SETTINGS, LEAN_FIX_TOOLS } from '../../operations/minima
 // helper so these assertions track the repo settings, never a hand-copied hook blob. Round 2: `--restricted`
 // ignores settings.local.json, so the planner's named lane rides in settings and --add-dir.
 vi.mock('../../operations/minimal-context-provider.mjs', async (original) => {
-  const actual = await original();
-  const root = new URL('../../..', import.meta.url).pathname;
-  return { ...actual, LEAN_FIX_HOOKS_SETTINGS: () => actual.LEAN_FIX_HOOKS_SETTINGS(
-    new URL('../../operations/__tests__/fixtures/lean-hooks-claude-settings.json', import.meta.url).pathname,
-    { repoRoot: root, guardRoot: root },
-  ) };
+  const { withLeanRepairSettingsFixture } = await import('../../operations/__tests__/helpers/lean-repair-settings.mjs');
+  return withLeanRepairSettingsFixture(await original());
 });
 const LEAN_GRANT = leanRepairGrant({ launchKind: 'fix', lane: 9 });
 const leanFixSettings = (env) => {
