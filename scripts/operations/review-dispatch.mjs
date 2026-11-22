@@ -460,7 +460,7 @@ const REVIEW_CODE_PATH_FILES = new Set([
   'scripts/operations/run-record.mjs', 'scripts/operations/run-store.mjs', 'scripts/operations/run.mjs',
   'scripts/operations/scaffold-io.mjs', 'scripts/operations/step-kinds.mjs',
   // cli-adapter's submit outcome summary and spawn diagnostic redaction helpers
-  'scripts/operations/open-pr.mjs', 'scripts/lib/describe-spawn-failure.mjs',
+  'scripts/operations/open-pr.mjs', 'scripts/lib/describe-spawn-failure.mjs', 'scripts/lib/flow-engine/shadow.mjs',
   // Shared card-only classification is a direct dependency of the review entry points.
   'scripts/ci-card-only.mjs',
   // review-pr's remaining direct imports
