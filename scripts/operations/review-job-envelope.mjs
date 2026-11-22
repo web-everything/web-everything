@@ -91,7 +91,7 @@ export function writeReviewJobDone({ session, pr, repo = null, classified, pid =
     };
     writeCompletion(rec, dir);
     // Observe only AFTER the actual durable result. No shadow value enters the result or router.
-    try { Promise.resolve(flowShadow(structuredClone({ repo, pr, classified }))).catch(() => {}); } catch { /* shadow never affects the tick */ }
+    try { Promise.resolve(flowShadow(structuredClone({ repo, pr, classified, session, completionsDir: dir }))).catch(() => {}); } catch { /* shadow never affects the tick */ }
     return rec;
   }, { dir });
 }

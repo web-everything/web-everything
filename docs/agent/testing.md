@@ -6345,3 +6345,11 @@ shards exactly as the default would, so it is still recognized as the default ga
 Gate ceilings get one capped retry tied to lane, head and killed job. Detached jobs settle in
 `verify-gate-job.mjs`, so recovery must cover that consumer as well as `verify-dispatch.mjs`'s
 in-process sweep. Persist the retry identity in job input to dedupe the enqueue-before-marker crash window.
+
+## Flow-v0 review shadow evidence and leases
+
+The shadow reads the job's durable completion after publication, with a cloned
+context and the same completion directory. Its evidence clock is injectable;
+shared append-lock leases must use real wall time so historical evidence fixtures
+cannot immediately expire an active lease. Keep the concurrent-observation and
+byte-identical completion/return-value cases in the flow-engine contract suite.

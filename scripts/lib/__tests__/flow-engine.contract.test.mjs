@@ -1,11 +1,11 @@
 import { test as nodeTest } from 'node:test';
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
-import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { mkdtempSync, readFileSync, rmSync, writeFileSync, symlinkSync, linkSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import * as engine from '../flow-engine/index.mjs';
-import { comparePlans, shadowReviewStep } from '../flow-engine/shadow.mjs';
+import { comparePlans, shadowReviewStep, resolveFlowShadow } from '../flow-engine/shadow.mjs';
 import { writeReviewJobDone } from '../../operations/review-job-envelope.mjs';
 const test = process.env.VITEST ? (await import('vitest')).it : nodeTest;
 
@@ -354,99 +354,144 @@ test('approval fail cannot advance and observer role cannot bypass approval-vali
 });
 
 function shadowFixture() {
-  const def = fixture(), flow = engine.load(def), rows = [], logs = [];
-  const input = { definition: def, projection: projection(flow), ctx: { ...ctx }, logPath: 'records.jsonl' };
-  let bytes, position;
-  const reads = [], closed = [];
-  const options = { file: 'fixture', stat: () => ({ isFile: () => true }), open: () => { bytes = Buffer.from(JSON.stringify(input)); position = 0; return 42; },
-    read: (fd, buffer, offset, length) => {
-      assert.equal(fd, 42); reads.push(length);
-      const n = Math.min(length, bytes.length - position, 97);
-      bytes.copy(buffer, offset, position, position + n); position += n; return n;
-    }, close: fd => closed.push(fd),
-    engine: { ...engine, appendTransition: async (_, row) => { rows.push(row); return true; } }, log: s => logs.push(s) };
-  // Exactly the fields passed by review-job's production completion adapter (no verdict).
-  const actual = { repo: ctx.repo, pr: ctx.pr, classified: { loopOutcome: 'converged', outcome: 'auto-cleared', runId: null, label: null } };
-  return { input, actual, options, rows, logs, reads, closed };
+  const dir = mkdtempSync(join(tmpdir(), 'flow-shadow-')), logs = [];
+  const actual = { repo: 'o/r', pr: 7, session: 'review-7', completionsDir: dir,
+    classified: { head: ctx.head, netDiff: ctx.netDiff, round: 1, runId: 'run-1', outcome: 'bounced', loopOutcome: 'complete' } };
+  const options = { env: { WE_PLATFORM_PREFERENCES_FILE: join(dir, 'absent') }, tool: {}, file: join(dir, 'shadow.jsonl'), executorCommit: () => ctx.executorCommit, now: () => ctx.at, log: s => logs.push(s) };
+  const done = (round = 1, outcome = 'bounced', loopOutcome = 'complete') => {
+    Object.assign(actual.classified, { round, runId: `run-${round}`, outcome, loopOutcome });
+    return writeReviewJobDone({ dir, session: actual.session, repo: actual.repo, pr: actual.pr, classified: actual.classified, now: () => ctx.at, flowShadow: () => {} });
+  };
+  done();
+  return { dir, actual, options, logs, done, cleanup: () => rmSync(dir, { recursive: true, force: true }), rows: () => readFileSync(options.file, 'utf8').trim().split('\n').map(JSON.parse) };
 }
 
-test('shadow refuses a non-regular file without opening it (no blocking open)', async () => {
+test('shadow settings default, platform, tool, environment override and disabled provenance', async () => {
   const f = shadowFixture();
-  let opened = false;
-  await shadowReviewStep(f.actual, { ...f.options, stat: () => ({ isFile: () => false }), open: () => { opened = true; return 1; } });
-  assert.equal(opened, false); assert.equal(f.rows.length, 0);
+  try {
+    const env = { ...f.options.env, WE_COORDINATION_ROOT: f.dir };
+    assert.equal(resolveFlowShadow(env, { tool: {} }).file, join(f.dir, 'flow-v0-shadow.jsonl'));
+    assert.equal(resolveFlowShadow(env, { tool: {} }).enabled, true);
+    const platform = join(f.dir, 'platform.json');
+    writeFileSync(platform, JSON.stringify({ 'reviewLoop.flowShadow': { enabled: false, file: 'platform.jsonl' } }));
+    env.WE_PLATFORM_PREFERENCES_FILE = platform;
+    let r = resolveFlowShadow(env, { tool: {} });
+    assert.equal(r.enabled, false); assert.equal(r.sources.enabled, 'platform');
+    r = resolveFlowShadow(env, { tool: { enabled: true, file: 'tool.jsonl' } });
+    assert.equal(r.file, 'tool.jsonl'); assert.equal(r.sources.file, 'tool');
+    r = resolveFlowShadow({ ...env, WE_FLOW_V0_SHADOW_FILE: 'env.jsonl' }, { tool: { enabled: false } });
+    assert.equal(r.file, 'env.jsonl'); assert.equal(r.sources.file, 'env'); assert.equal(r.enabled, false);
+    await shadowReviewStep(f.actual, { ...f.options, tool: { enabled: false }, stat: () => { throw Error('disabled performed IO'); } });
+    assert(!f.logs.some(s => s.includes('failed'))); assert(f.logs.some(s => s.includes('"enabled":false')));
+  } finally { f.cleanup(); }
 });
 
-test('shadow maps production completion fields for successful and bounced reviews', async () => {
+test('shadow derives synthetic completion evidence and appends three contiguous PR rounds with agreement', async () => {
   const f = shadowFixture();
-  await shadowReviewStep(f.actual, f.options);
-  assert.equal(f.rows.length, 1); assert(f.logs.some(s => s.includes('"agreement":true')));
-  f.input.projection.outcome = 'continue'; f.logs.length = 0;
-  await shadowReviewStep({ ...f.actual, classified: { outcome: 'bounced', loopOutcome: 'not-converged' } }, f.options);
-  assert(f.logs.some(s => s.includes('"agreement":true')));
-});
-
-test('shadow unrecognized actual never agrees with planned unknown', async () => {
-  const f = shadowFixture(); f.input.projection.outcome = 'unknown';
-  await shadowReviewStep({ ...f.actual, classified: { outcome: 'new-word' } }, f.options);
-  assert(f.logs.some(s => s.includes('"agreement":false')));
-  assert(f.logs.some(s => s.includes('shadow disagreement')));
-});
-
-test('shadow compares route and target as well as outcome', async () => {
-  for (const change of [{ route: 'wait' }, { to: 'parked' }]) {
-    const f = shadowFixture();
-    const step = engine.plan(engine.load(f.input.definition), f.input.projection)[0];
-    await shadowReviewStep(f.actual, { ...f.options, engine: { ...f.options.engine, plan: () => [{ ...step, ...change }] } });
-    assert(f.logs.some(s => s.includes('"agreement":false')));
-    assert(f.logs.some(s => s.includes('shadow disagreement')));
-  }
-});
-
-test('shadow refuses stale PR, head, net-diff, round and run before comparison or recording', async () => {
-  for (const name of ['repo', 'pr', 'head', 'netDiff', 'round', 'runId']) {
-    for (const nested of [false, true]) {
-      const f = shadowFixture(); f.input.ctx.round = 1; f.input.ctx.runId = 'old-run';
-      const actual = structuredClone(f.actual);
-      if (nested && !['repo', 'pr'].includes(name)) actual.classified[name] = 'new-value';
-      else actual[name] = 'new-value';
-      await shadowReviewStep(actual, f.options);
-      assert.equal(f.rows.length, 0, name); assert(f.logs.some(s => s.includes('context does not match')), name);
-      assert(!f.logs.some(s => s.includes('"agreement":true')));
+  try {
+    for (const round of [1, 2, 3]) {
+      f.done(round, round === 3 ? 'auto-cleared' : 'bounced', round === 3 ? 'converged' : 'complete');
+      await shadowReviewStep(f.actual, f.options);
     }
+    const rows = f.rows();
+    assert.deepEqual(rows.map(r => r.predicate.seq), [1, 2, 3]);
+    assert.deepEqual(rows.map(r => r.predicate.round), [1, 2, 3]);
+    assert(rows.every(r => r.predicate.inputs[0].endsWith('/review-7.json')));
+    assert.equal(rows[2].predicate.to, 'accepted');
+    assert.equal(f.logs.filter(s => s.includes('"agreement":true')).length, 3);
+    await shadowReviewStep(f.actual, f.options);
+    assert.equal(f.rows().length, 3); assert(f.logs.some(s => s.includes('already observed')));
+  } finally { f.cleanup(); }
+});
+
+test('shadow compares route and target, and reports unknown and empty-plan disagreement', async () => {
+  for (const change of [{ route: 'wait' }, { to: 'parked' }, null]) {
+    const f = shadowFixture();
+    try {
+      await shadowReviewStep(f.actual, { ...f.options, engine: { ...engine, plan: (flow, p) => change ? [{ ...engine.plan(flow, p)[0], ...change }] : [] } });
+      assert(f.logs.some(s => s.includes('"agreement":false'))); assert(f.logs.some(s => s.includes('shadow disagreement')));
+    } finally { f.cleanup(); }
+  }
+  const f = shadowFixture();
+  try {
+    f.done(1, 'new-word', null); await shadowReviewStep(f.actual, f.options);
+    assert(f.logs.some(s => s.includes('"agreement":false')));
+  } finally { f.cleanup(); }
+});
+
+test('shadow refuses missing required evidence without inventing hashes', async () => {
+  for (const missing of ['head', 'netDiff', 'repo', 'session']) {
+    const f = shadowFixture();
+    try {
+      if (missing in f.actual.classified) delete f.actual.classified[missing]; else delete f.actual[missing];
+      await shadowReviewStep(f.actual, f.options);
+      assert(f.logs.some(s => s.includes('required'))); assert.throws(f.rows);
+    } finally { f.cleanup(); }
   }
 });
 
-test('shadow empty plan reports disagreement', async () => {
-  const f = shadowFixture();
-  await shadowReviewStep(f.actual, { ...f.options, engine: { ...f.options.engine, plan: () => [] } });
-  assert.equal(f.rows.length, 0);
-  assert(f.logs.some(s => s.includes('"agreement":false')));
-  assert(f.logs.some(s => s.includes('shadow disagreement')));
+test('shadow refuses regular-file violations and completion aliases without changing completion bytes', async () => {
+  for (const kind of ['directory', 'symlink', 'hardlink', 'same']) {
+    const f = shadowFixture();
+    try {
+      const completion = join(f.dir, 'review-7.json'), before = readFileSync(completion, 'utf8');
+      if (kind === 'directory') f.options.file = f.dir;
+      if (kind === 'symlink') symlinkSync(completion, f.options.file);
+      if (kind === 'hardlink') linkSync(completion, f.options.file);
+      if (kind === 'same') f.options.file = completion;
+      await shadowReviewStep(f.actual, f.options);
+      assert.equal(readFileSync(completion, 'utf8'), before);
+      assert(f.logs.some(s => s.includes('not a regular file') || s.includes('aliases')));
+    } finally { f.cleanup(); }
+  }
 });
 
-test('shadow fd reads stop at limit plus one despite growing input, close fd and name operator fallback', async () => {
-  const f = shadowFixture(); let total = 0;
-  await shadowReviewStep(f.actual, { ...f.options, read: (fd, buffer, offset, length) => {
-    assert.equal(fd, 42); assert.equal(buffer.length, 262145);
-    const n = Math.min(length, 10000); buffer.fill(32, offset, offset + n); total += n; return n;
-  } });
-  assert.equal(total, 262145); assert.deepEqual(f.closed, [42]); assert.equal(f.rows.length, 0);
-  assert(f.logs.some(s => s.includes('operator must supply a bounded projection')));
-  await shadowReviewStep(f.actual, f.options);
-  assert.equal(f.reads[0], 262145); assert.equal(f.rows.length, 1); // short reads are accumulated
+test('shadow bounded log reads close fd, refuse oversized input and name operator fallback', async () => {
+  const f = shadowFixture(); let total = 0, closed = false;
+  try {
+    writeFileSync(f.options.file, '');
+    await shadowReviewStep(f.actual, { ...f.options, open: () => 42, close: () => { closed = true; }, read: (_, buffer, offset, length) => {
+      const n = Math.min(length, 10000); buffer.fill(32, offset, offset + n); total += n; return n;
+    } });
+    assert.equal(total, 262145); assert(closed); assert(f.logs.some(s => s.includes('operator must archive')));
+  } finally { f.cleanup(); }
+});
+
+test('shadow refuses duplicate sequence and concurrent observations', async () => {
+  const f = shadowFixture();
+  try {
+    await Promise.all([shadowReviewStep(f.actual, f.options), shadowReviewStep(f.actual, f.options)]);
+    assert.equal(f.rows().length, 1);
+    const bytes = readFileSync(f.options.file, 'utf8'); writeFileSync(f.options.file, bytes + bytes);
+    f.done(2); await shadowReviewStep(f.actual, f.options);
+    assert.equal(readFileSync(f.options.file, 'utf8'), bytes + bytes);
+    assert(f.logs.some(s => s.includes('duplicate or noncontiguous')));
+  } finally { f.cleanup(); }
 });
 
 test('shadow IO, append, engine and logger failures never throw into the tick', async () => {
   const f = shadowFixture();
-  await shadowReviewStep(f.actual, { ...f.options, read: () => { throw Error('unreadable'); } });
-  assert(f.logs.some(s => s.includes('unreadable'))); assert.deepEqual(f.closed, [42]);
-  await shadowReviewStep(f.actual, { ...f.options, engine: { ...f.options.engine, appendTransition: async () => false } });
-  assert(f.logs.some(s => s.includes('append failed; operator')));
-  await shadowReviewStep(f.actual, { ...f.options, engine: { ...f.options.engine, appendTransition: async () => { throw Error('append rejected'); } } });
-  assert(f.logs.some(s => s.includes('append rejected')));
-  await shadowReviewStep(f.actual, { ...f.options, engine: { load: () => { throw Error('boom'); } }, log: () => { throw Error('logger failure'); } });
-  await shadowReviewStep(f.actual, { file: '', open: () => { throw Error('disabled must do no IO'); } });
+  try {
+    for (const options of [ { executorCommit: () => { throw Error('unreadable HEAD'); } },
+      { engine: { ...engine, appendTransition: async () => false } },
+      { engine: { ...engine, appendTransition: async () => { throw Error('append rejected'); } } },
+      { engine: { load: () => { throw Error('boom'); } }, log: () => { throw Error('logger failure'); } } ]) {
+      await shadowReviewStep(f.actual, { ...f.options, ...options });
+    }
+    assert(f.logs.some(s => s.includes('unreadable HEAD'))); assert(f.logs.some(s => s.includes('append failed; operator'))); assert(f.logs.some(s => s.includes('append rejected')));
+  } finally { f.cleanup(); }
+});
+
+test('negative: actual completion bytes and return value are identical with real shadow on versus off', async () => {
+  const f = shadowFixture();
+  try {
+    const args = { dir: f.dir, session: 'review-7', pr: 7, repo: 'o/r', classified: f.actual.classified, now: () => ctx.at };
+    const off = writeReviewJobDone({ ...args, flowShadow: () => {} });
+    const bytes = readFileSync(join(f.dir, 'review-7.json'), 'utf8'); let observation;
+    const on = writeReviewJobDone({ ...args, flowShadow: input => { observation = shadowReviewStep(input, f.options); } });
+    await observation;
+    assert.equal(f.rows().length, 1); assert.equal(JSON.stringify(on), JSON.stringify(off)); assert.equal(readFileSync(join(f.dir, 'review-7.json'), 'utf8'), bytes);
+  } finally { f.cleanup(); }
 });
 
 test('negative: real daemon completion/merge routing is byte-equal with shadow disabled, mutating, throwing or rejecting', async () => {

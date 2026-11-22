@@ -26,16 +26,25 @@ schemas: only reference names were relocated into local `$defs`. There is no
 runtime dependency on another checkout. The legacy keys extension is explicit in
 `load.mjs`. Reference code is validation only, not another executor.
 
-The review daemon's detached job calls the shadow beside its durable completion
-in `scripts/operations/review-job-envelope.mjs`. Set `WE_FLOW_V0_SHADOW_FILE` to an
-operator-prepared JSON file containing `{definition, projection, ctx, logPath}`.
-`ctx` carries repo, pr, head, netDiff, executorCommit, seq, at and input record ids.
-Keep the projection independent of the observed completion and pinned to that PR
-round. Input over 256 KiB is refused with an operator diagnostic. Append is best
-effort, asynchronous and append-only; it never changes a returned worker/merge
-outcome. The legacy comparison currently recognizes convergence accept/continue;
-other observed words are unknown and disagreement is reported conservatively.
-No default path, external read, GitHub call or deployment is introduced.
+The review job observes its durable completion through `shadowReviewStep`.
+`reviewLoop.flowShadow` resolves standard → platform → tool → environment;
+`scripts/settings/review-flow-shadow.json` declares enabled=true and file=null.
+Null selects `<coordination dir>/flow-v0-shadow.jsonl` using the shared resolver.
+`WE_FLOW_V0_SHADOW_FILE` overrides the log destination; it is no longer an input file.
+Effective values and sources are logged. Disable with `flowShadow.enabled=false`.
+
+The built-in `review-definition.mjs` describes only judge-convergence and its
+accepted/parked outcomes. The conveyor job diagram is not a loadable definition.
+Completion records supply observed outcomes and input ids; classified fields supply
+head/netDiff/round/runId. Missing hashes skip observation, never synthesize hashes.
+Round/runId may be explicitly unknown; executor commit comes from repository HEAD
+or `WE_FLOW_V0_EXECUTOR_COMMIT`. Same-PR Transitions replay in contiguous sequence.
+The interim engine refuses changed subject versions and terminal-state continuation;
+these refusals require operator inspection, never modify production decisions.
+Log reads are bounded at 256 KiB; archive an oversized log before retrying.
+A shared nonwaiting lock protects replay/append, repeated completions are skipped,
+and completion aliases and nonregular logs are refused. Append is best effort and
+never enters the actual completion or merge result.
 
 `comparePlans` requires canonical byte equality for replacement engines; any
 difference blocks retirement and returns a finding. Live acceptance still requires
