@@ -1,0 +1,6 @@
+{
+  "description": "Adoption of eligible descendant heads in card batches.",
+  "owner": "scripts/settings/card-batch.json",
+  "changeVia": "pr",
+  "instant": false
+}

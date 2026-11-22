@@ -1,0 +1,6 @@
+{
+  "description": "GitHub authentication mode and documented personal-identity exceptions.",
+  "owner": "scripts/settings/github-auth.json",
+  "changeVia": "pr",
+  "instant": false
+}

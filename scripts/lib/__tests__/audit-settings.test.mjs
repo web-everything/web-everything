@@ -514,3 +514,7 @@ describe('audit settings (R528)', () => {
     expect(r.value.releaseStage).toBe('prerelease');
   });
 });
+
+it('audit freshness protects per-key settings and capacity metadata inputs', () => {
+  expect(GUARD_FLOOR).toContain('scripts/lib/settings-registry-metadata.d/**/*.json');
+});

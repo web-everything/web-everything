@@ -50,6 +50,7 @@ export default {
         checkStaleness: () => ({}),
         readHeadCheckState: () => ({ state: 'green' }),
         readPrLabels: () => [],
+        readComments: () => [],
         clearAwaitingCi: () => {},
         deadlineAt,
         now: () => time,

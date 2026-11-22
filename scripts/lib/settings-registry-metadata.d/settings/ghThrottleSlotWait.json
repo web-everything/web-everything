@@ -1,0 +1,6 @@
+{
+  "description": "GitHub slot wait budgets by caller pattern.",
+  "owner": "scripts/settings/gh-throttle.json",
+  "changeVia": "pr",
+  "instant": false
+}

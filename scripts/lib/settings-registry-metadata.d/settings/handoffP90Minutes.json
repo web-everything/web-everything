@@ -1,0 +1,6 @@
+{
+  "description": "Recorded p90 handoff durations in minutes by delivery transition.",
+  "owner": "scripts/settings/coroner-postmortem.json",
+  "changeVia": "pr",
+  "instant": false
+}

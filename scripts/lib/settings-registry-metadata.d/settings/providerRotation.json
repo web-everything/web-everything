@@ -1,0 +1,6 @@
+{
+  "description": "Pure provider rotation input: mode, arm catalog/shares, identity families, exhaustion/reserve bounds, strong/small guards and Carbon promotion evidence.",
+  "owner": "scripts/settings/provider-rotation.json",
+  "changeVia": "pr",
+  "instant": false
+}
