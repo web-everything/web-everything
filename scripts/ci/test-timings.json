@@ -1052,18 +1052,9 @@
   "scripts/lib/__tests__/drain-merge-strategy.test.mjs": 2.59,
   "scripts/lib/__tests__/drain-mq-failure-recovery-io.test.mjs": 0.17,
   "scripts/lib/__tests__/drain-mq-failure-recovery.test.mjs": 0.03,
-  "scripts/lib/__tests__/drain-mq-flake-reenqueue.test.mjs": 0.14,
-  "scripts/lib/__tests__/drain-mq-flake-rerun.test.mjs": 0.05,
-  "scripts/lib/__tests__/drain-mq-retry-aggregate-evidence.test.mjs": 0.07,
-  "scripts/lib/__tests__/drain-mq-retry-aggregate-jobs.test.mjs": 0.21,
-  "scripts/lib/__tests__/drain-mq-retry-freeze-ejection.test.mjs": 0.26,
-  "scripts/lib/__tests__/drain-mq-retry-infra-allowlist.test.mjs": 0.22,
-  "scripts/lib/__tests__/drain-mq-retry-main-green.test.mjs": 0.1,
-  "scripts/lib/__tests__/drain-mq-retry-policy-regressions.test.mjs": 0.23,
   "scripts/lib/__tests__/drain-poison-admission.test.mjs": 0.4,
   "scripts/lib/__tests__/drain-poison-guard.test.mjs": 6.47,
   "scripts/lib/__tests__/drain-prestage.test.mjs": 0.2,
-  "scripts/lib/__tests__/drain-queue-safety-run-lookup.test.mjs": 0.11,
   "scripts/lib/__tests__/drain-queue-safety-same-head-retry.test.mjs": 2.27,
   "scripts/lib/__tests__/drain-queue-safety.test.mjs": 1.83,
   "scripts/lib/__tests__/drain-red-team-evidence.test.mjs": 22.11,
@@ -2434,7 +2425,9 @@
   "scripts/conveyor/soak/breaks/rebuild-launch-before-next-tick.soak.test.mjs": 2,
   "scripts/conveyor/soak/breaks/rebuild-held-recovery.soak.test.mjs": 1,
   "scripts/conveyor/soak/breaks/rebuild-evidence-compatibility.soak.test.mjs": 1,
-  "scripts/conveyor/soak/breaks/mq-unreadable-log-single-retry.soak.test.mjs": 1
+  "scripts/conveyor/soak/breaks/mq-unreadable-log-single-retry.soak.test.mjs": 1,
+  "scripts/conveyor/soak/breaks/mq-same-head-unexecuted-refresh-retry.soak.test.mjs": 1,
+  "scripts/conveyor/soak/breaks/drain-mq-log-reader-escape-sequences.soak.test.mjs": 1
  },
  "integration": {}
 }
