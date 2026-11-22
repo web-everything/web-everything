@@ -9,11 +9,13 @@ import { runGhSync } from '../lib/gh-throttle.mjs';
 import { CONSTELLATION_REPOS } from '../lib/constellation-repos.mjs';
 import { normalizeBriefScope, SCOPE_PREFIX_ALIASES } from './dispatch-lane.mjs';
 import { GH_LIST_FILE_CAP, prHoldsFile, qualifyFile, repoKeyFor } from './free-scope.mjs';
+import { readPagedFiles } from './free-scope-io.mjs';
 import { resolveCoordinationRoot } from './coordination-root.mjs';
 import { buildPrioritySetOperation, BUILD_PRIORITY_SET_EFFECT, validateBuildPriorityInput } from './build-priority-set.mjs';
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '../..');
 const READ_OPTIONS = { encoding: 'utf8', maxBuffer: 8 * 1024 * 1024, timeout: 10000, stdio: ['ignore', 'pipe', 'pipe'] };
+const PAGED_FILE_LIMIT = 3000; // GitHub's files API stops at 3000 files; at that size the read may be truncated
 const canonicalId = id => id.replace(/^0+(?=\d)/, '');
 const refuse = why => { throw new Error(`build-priority-set: ${why}; repair evidence or drain open PRs and retry`); };
 
@@ -49,9 +51,16 @@ export function readPriorityPrs({ gh = args => runGhSync(args, READ_OPTIONS) } =
     if (!Array.isArray(rows) || rows.length >= 200) refuse('incomplete open PR list (limit 200)');
     for (const row of rows) {
       if (!Number.isInteger(row?.number) || row.number <= 0 || !Array.isArray(row.files)
-          || row.files.length >= GH_LIST_FILE_CAP || row.files.some(f => typeof f?.path !== 'string' || !f.path.trim()
+          || row.files.some(f => typeof f?.path !== 'string' || !f.path.trim()
             || (f.previousFilename != null && typeof f.previousFilename !== 'string'))) {
         refuse('incomplete open PR files');
+      }
+      if (row.files.length >= GH_LIST_FILE_CAP) {
+        // The bulk list is capped: page only this PR; any failed or truncated read still refuses.
+        const paged = readPagedFiles({ repo: slug, number: row.number, exec: gh });
+        if (!paged.ok || paged.files.length < row.files.length || paged.files.length >= PAGED_FILE_LIMIT) refuse('incomplete open PR files');
+        prs.push({ repo: slug, number: row.number, files: paged.files });
+        continue;
       }
       prs.push({ repo: slug, number: row.number, files: row.files.flatMap(f => [f.path, ...(f.previousFilename ? [f.previousFilename] : [])]) });
     }

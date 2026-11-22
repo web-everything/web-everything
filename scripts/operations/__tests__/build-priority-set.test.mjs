@@ -251,10 +251,30 @@ it('PR reader uses bounded gh list and refuses truncated or malformed evidence w
   const gh = vi.fn(() => '[]');
   expect(readPriorityPrs({ gh })).toEqual([]);
   expect(gh.mock.calls[0][0]).toEqual(expect.arrayContaining(['pr', 'list', '--state', 'open', '--limit']));
-  for (const value of [null, [{}], Array.from({ length: 200 }, () => ({})), [{ number: 1, files: Array.from({ length: 100 }, () => ({ path: 'a' })) }]]) {
+  for (const value of [null, [{}], Array.from({ length: 200 }, () => ({}))]) {
     expect(() => readPriorityPrs({ gh: () => JSON.stringify(value) })).toThrow(/repair|drain|retry/i);
   }
   expect(() => readPriorityPrs({ gh: () => { throw new Error('unreadable'); } })).toThrow();
+});
+
+const capped = [{ number: 1, files: Array.from({ length: 100 }, (_, i) => ({ path: `f${i}` })) }];
+const pagedLines = n => Array.from({ length: n }, (_, i) => JSON.stringify({ s: 'modified', f: `f${i}` })).join('\n');
+
+it('a PR at the bulk file cap is read with a per-PR paginated call and overlap uses all 140 files', () => {
+  const calls = [];
+  const gh = args => { calls.push(args); return args[0] === 'api' ? pagedLines(140) : JSON.stringify(args.includes('web-everything/web-everything') ? capped : []); };
+  const prs = readPriorityPrs({ gh });
+  expect(prs).toHaveLength(1);
+  expect(prs[0].files).toHaveLength(140);
+  expect(prs[0].files).toContain('f139');
+  expect(calls.filter(a => a[0] === 'api')).toHaveLength(1);
+});
+
+it('a failed or truncated per-PR read for a capped PR still refuses', () => {
+  const run = paged => readPriorityPrs({ gh: args => (args[0] === 'api' ? paged() : JSON.stringify(args.includes('web-everything/web-everything') ? capped : [])) });
+  expect(() => run(() => { throw new Error('boom'); })).toThrow(/repair|drain|retry/i);
+  expect(() => run(() => pagedLines(50))).toThrow(/repair|drain|retry/i);
+  expect(() => run(() => 'not json')).toThrow(/repair|drain|retry/i);
 });
 
 
