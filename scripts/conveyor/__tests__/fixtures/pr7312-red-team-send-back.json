@@ -1,0 +1,7 @@
+{
+  "author": {
+    "login": "web-everything"
+  },
+  "createdAt": "2026-11-21T19:57:27Z",
+  "body": "🔁 review — changes requested\n\nRed-team gate send-back: 2 confirmed breaks (live-reproduced).\n\n1. `scripts/backlog-move/cli.mjs:150` — live-reproduced: the move command loses the source card when the destination write fails. Preserve the source until the write succeeds.\n2. `scripts/backlog-move/manifest.mjs:20` — live-reproduced: a duplicate manifest entry overwrites an existing destination. Refuse the collision before writing.\n"
+}
