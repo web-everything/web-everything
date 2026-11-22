@@ -2,7 +2,7 @@ import { test as nodeTest } from 'node:test';
 const test = process.env.VITEST ? (await import('vitest')).it : nodeTest;
 import assert from 'node:assert/strict';
 import { checkOverlays } from '../daemon-overlay-audit-check.mjs';
-test('old registrations with unresolved tips fail closed and registered sha wins', () => {
+test('gone refs fail closed even with a stored SHA', () => {
   const sha = 'a'.repeat(40);
   const result = checkOverlays({ states: [{ clone: '/fixture/clone', overlays: [
     { ref: 'lane/old', addedAt: '2026-11-10T00:00:00Z' },
@@ -11,7 +11,7 @@ test('old registrations with unresolved tips fail closed and registered sha wins
   assert.equal(result.length, 2);
   assert.equal(result[0].ok, false);
   assert.equal(result[0].sha, null);
-  assert.equal(result[1].sha, sha);
+  assert.equal(result[1].sha, null);
   assert.equal(result[1].ageDays, 12);
 });
 
@@ -44,8 +44,8 @@ test('CLI temp HOME smoke: legacy file, JSON, corruption and zero writes', () =>
     mkdirSync(ledger, { recursive: true });
     writeFileSync(join(ledger, 'audits.jsonl'), JSON.stringify({ head: sha, base: 'b'.repeat(40), verdict: 'NOT WEAKENED' }) + '\n');
     result = run([]);
-    assert.equal(result.status, 0, result.stderr);
-    assert.match(result.stdout, /OK 1 overlays audited/);
+    assert.equal(result.status, 1, result.stderr);
+    assert.match(result.stdout, /UNAUDITED/);
     writeFileSync(join(dir, 'fedcba9876543210.json'), '{broken');
     result = run(['--json']);
     assert.equal(result.status, 1);
@@ -66,6 +66,9 @@ test('CLI resolves old registrations from local refs and leaves Git refs untouch
   try {
     mkdirSync(clone); mkdirSync(dir);
     git(['init', '-q']); git(['commit', '--allow-empty', '-qm', 'local fixture']);
+    const base = git(['rev-parse', 'HEAD']);
+    git(['update-ref', 'refs/remotes/origin/main', base]);
+    git(['commit', '--allow-empty', '-qm', 'overlay']);
     const sha = git(['rev-parse', 'HEAD']);
     git(['update-ref', 'refs/remotes/origin/lane/old', sha]);
     const before = git(['show-ref']);
@@ -74,5 +77,45 @@ test('CLI resolves old registrations from local refs and leaves Git refs untouch
     assert.equal(result.status, 1);
     assert.equal(JSON.parse(result.stdout)[0].sha, sha);
     assert.equal(git(['show-ref']), before);
+    const ledger = join(home, 'workspace/.operations/coordination');
+    mkdirSync(ledger, { recursive: true });
+    writeFileSync(join(ledger, 'audits.jsonl'), JSON.stringify({ head: sha, base, verdict: 'NOT WEAKENED', questionHash: QUESTION_HASH, at: '2026-11-10T00:00:00Z', findings: [] }) + '\n');
+    const run = () => spawnSync(process.execPath, [cli], { env, encoding: 'utf8', timeout: 15000, maxBuffer: 65536 });
+    const green = run();
+    assert.equal(green.status, 0, green.stderr);
+    assert.match(green.stdout, /OK 1 overlays audited/);
+    writeFileSync(join(dir, '0123456789abcdef.json'), JSON.stringify({ clone, overlays: [{ ref: 'lane/old', sha, addedAt: '2026-11-10T00:00:00Z' }] }));
+    git(['commit', '--allow-empty', '-qm', 'moved']);
+    const current = git(['rev-parse', 'HEAD']);
+    git(['update-ref', 'refs/remotes/origin/lane/old', current]);
+    const moved = run();
+    assert.equal(moved.status, 1, moved.stderr);
+    assert.ok(moved.stdout.includes(`sha=${current} moved-from=${sha}`), moved.stdout);
+    git(['update-ref', '-d', 'refs/remotes/origin/lane/old']);
+    const gone = run();
+    assert.equal(gone.status, 1, gone.stderr);
+    assert.ok(gone.stdout.includes(`sha=unresolved moved-from=${sha}`), gone.stdout);
   } finally { rmSync(home, { recursive: true, force: true }); }
+});
+
+test('moved refs evaluate current tip instead of historical green evidence', () => {
+  const stored = 'a'.repeat(40), current = 'c'.repeat(40);
+  const result = checkOverlays({ states: [{ clone: '/fixture/clone', overlays: [{ ref: 'lane/fix', sha: stored }] }],
+    evidence: { auditRecords: [{ head: stored, base: 'b'.repeat(40), verdict: 'NOT WEAKENED' }], waivers: [] },
+    resolveSha: () => current });
+  assert.equal(result[0].ok, false);
+  assert.equal(result[0].sha, current);
+  assert.equal(result[0].movedFrom, stored);
+});
+
+import { QUESTION_HASH } from '../operations/codex-audit.mjs';
+
+test('inventory binds waivers to each overlay ref, even for an identical SHA', () => {
+  const sha = 'a'.repeat(40);
+  const waiver = { ref: 'lane/approved', sha, ruling: 'R12', findings: ['accepted'], actor: 'operator', quote: 'approved', at: '2026-11-10T00:00:00Z' };
+  const results = checkOverlays({ states: [{ clone: '/fixture/clone', overlays: [{ ref: waiver.ref, sha }, { ref: 'lane/other', sha }] }],
+    resolveSha: () => sha, covers: () => true,
+    evidence: { waivers: [waiver], auditRecords: [{ head: sha, base: 'b'.repeat(40), questionHash: QUESTION_HASH, at: waiver.at, verdict: 'WEAKENED', findings: waiver.findings }] } });
+  assert.equal(results[0].kind, 'waiver');
+  assert.equal(results[1].ok, false);
 });

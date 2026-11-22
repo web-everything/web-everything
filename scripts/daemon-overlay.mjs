@@ -80,7 +80,7 @@
  * otherwise — including a `remove` of a ref that was never present, which is not a usage error.
  *
  * AUDIT ADMISSION: add/replace require exact-SHA canonical NOT WEAKENED evidence or a ruled-weakened
- * waiver. overlaySafety.auditEvidence defaults to refuse; WE_OVERLAY_AUDIT_EVIDENCE=refuse|warn|off
+ * waiver. overlaySafety.auditEvidence defaults to refuse; WE_OVERLAY_AUDIT_EVIDENCE=refuse|warn|off (environment may only tighten settings)
  * overrides it. --unaudited-reason=<at least 10 characters> logs a warning and unaudited-override event.
  * --audit-checked-by=prototype-load records the upstream checker in the added event; it grants no bypass.
  * --check stays read-only and does not run audit admission.
@@ -131,7 +131,7 @@ import { mergeRefBase, planRetirements, planFetchFailed, resolveOriginRepository
 import { isDeepStrictEqual, stripVTControlCharacters } from 'node:util';
 import { safeRegistrationRef, validSha } from './operations/prototype-load.mjs';
 import { previewOverlayConflict, writeRebuildRequest } from './lib/daemon-rebuild.mjs';
-import { auditEvidenceFor, loadAuditEvidence } from './lib/overlay-audit-evidence.mjs';
+import { auditEvidenceFor, loadAuditEvidence, mainCovers } from './lib/overlay-audit-evidence.mjs';
 import { overlaySafetySettings } from './lib/daemon-load-overlay.mjs';
 import { pruneStaleOverlayRecords } from './lib/daemon-clone-registry.mjs';
 import { workspaceFor } from './lib/lane-pool-paths.mjs';
@@ -642,7 +642,7 @@ export async function retireRegistration({ root, ref, expectedTip, expectedEntry
 }
 
 /** Enforce exact-SHA audit admission inside the caller's add-guard lock. */
-export function registrationAuditGate({ root, ref, sha, by, unauditedReason, env = process.env }) {
+export function registrationAuditGate({ root, ref, sha, by, unauditedReason, env = process.env, readOnly = false }) {
   const settings = overlaySafetySettings(env);
   const mode = settings.auditEvidence;
   process.stderr.write(`daemon-overlay: overlaySafety.auditEvidence=${mode} (${settings.auditEvidenceSource})\n`);
@@ -651,12 +651,12 @@ export function registrationAuditGate({ root, ref, sha, by, unauditedReason, env
     return false;
   }
   if (unauditedReason !== undefined) {
-    appendOverlayEvent(root, { kind: 'unaudited-override', ref, sha, reason: unauditedReason.trim(), by }, { env });
+    if (!readOnly) appendOverlayEvent(root, { kind: 'unaudited-override', ref, sha, reason: unauditedReason.trim(), by }, { env });
     process.stderr.write(`daemon-overlay: WARNING — unaudited override for ${sha}: ${stripVTControlCharacters(unauditedReason.trim()).replace(/[\x00-\x1f\x7f-\x9f]/g, ' ')}\n`);
     return true;
   }
   if (mode === 'off') return true;
-  const evidence = auditEvidenceFor(sha, loadAuditEvidence({ env }));
+  const evidence = auditEvidenceFor(sha, { ...loadAuditEvidence({ env }), ref, covers: base => mainCovers(base, { cwd: root || process.cwd(), env }) });
   if (evidence.ok) return true;
   process.stderr.write(`daemon-overlay: ${mode === 'warn' ? 'WARNING' : 'REFUSED'} — ${evidence.detail}. Run codex-audit or supply --unaudited-reason=<at least 10 characters>.\n`);
   return mode === 'warn';
@@ -690,7 +690,13 @@ export async function replaceRegistration({ root, ref, old, expectedSha, pr = nu
     if (!check.clean) return { ok: false, refused: 'conflict', containment, check, code: 3 };
     return { ok: true, oldEntry, containment, check };
   };
-  if (checkOnly) return prove();
+  if (checkOnly) {
+    const proof = await prove();
+    if (!proof.ok) return proof;
+    if (!registrationAuditGate({ root, ref, sha: expectedSha, by, unauditedReason, env, readOnly: true }))
+      return { ...proof, ok: false, code: 3, refused: 'no-canonical-audit' };
+    return proof;
+  }
   return withAddGuardLock(root, env, async () => {
     const settled = await settlePendingDrops({ root, env, by, deps: { tip } });
     const proof = await prove();
@@ -984,7 +990,7 @@ export async function main(argv = process.argv.slice(2), deps = {}) {
     const runGuard = async () => {
       const overlayState = readOverlayState(root, { env });
       if (overlayState.corrupt) return { ok: false, reason: 'overlay-store-corrupt', corruptStore: true };
-      const check = await stackAwareOverlayCheck({ root, ref: flags.ref, pr, existingOverlays: overlayState.overlays, env });
+      const check = await (deps.stackAwareOverlayCheck ?? stackAwareOverlayCheck)({ root, ref: flags.ref, pr, existingOverlays: overlayState.overlays, env });
       // Compare the guard's fetched candidate INSIDE the add lock, before any registration write.
       if (check.ok && flags['expected-sha'] && check.candSha !== flags['expected-sha']) {
         return { ...check, ok: false, reason: 'sha-moved', expectedSha: flags['expected-sha'] };
@@ -1005,10 +1011,15 @@ export async function main(argv = process.argv.slice(2), deps = {}) {
       const check = await runGuard();
       warnSetAside(check);
       reportStackConflict(check);
+      const auditOk = check.ok && (check.clean || allowConflict) && registrationAuditGate({
+        root, ref: flags.ref, sha: check.candSha, by, unauditedReason: flags['unaudited-reason'], env, readOnly: true,
+      });
       if (asJson) {
-        process.stdout.write(`${JSON.stringify({ check, wouldRegister: check.ok && (check.clean || allowConflict) })}\n`);
+        process.stdout.write(`${JSON.stringify({ check, wouldRegister: !!auditOk, ...(!auditOk && check.ok && (check.clean || allowConflict) ? { refused: 'no-canonical-audit' } : {}) })}\n`);
       } else if (!check.ok) {
         process.stdout.write(`daemon-overlay --check: could not verify — ${describeFailure(check)}\n`);
+      } else if (!auditOk && (check.clean || allowConflict)) {
+        process.stdout.write('daemon-overlay --check: audit evidence missing — would be REFUSED.\n');
       } else if (check.clean) {
         process.stdout.write(`daemon-overlay --check: ${flags.ref} merges clean against origin/main + every registered overlay — would register.\n`);
       } else {
@@ -1016,7 +1027,7 @@ export async function main(argv = process.argv.slice(2), deps = {}) {
         process.stdout.write(`daemon-overlay --check: ${flags.ref} CONFLICTS in ${check.files.join(', ')} with: ${against} — `
           + `would be REFUSED${allowConflict ? ' (but --allow-conflict is set, so it would register anyway)' : ''}.\n`);
       }
-      if (check.ok && !check.clean && !allowConflict) process.exitCode = 3;
+      if (check.ok && !auditOk) process.exitCode = 3;
       else if (!check.ok) process.exitCode = check.reason === 'sha-moved' ? 3 : 1;
       return;
     }
@@ -1125,7 +1136,7 @@ export async function main(argv = process.argv.slice(2), deps = {}) {
         + `${r.registered ? `; ${flags.ref} is registered and ${old} was kept` : ''}\n`);
     }
     if (flags.check) {
-      process.stdout.write(`${JSON.stringify({ check: r.check ?? null, containment: r.containment ?? null, wouldReplace: !!r.ok, refused: r.refused ?? null })}\n`);
+      process.stdout.write(`${JSON.stringify({ check: r.check ?? null, containment: r.containment ?? null, wouldReplace: !!r.ok, wouldRegister: !!r.ok, refused: r.refused ?? null })}\n`);
       return;
     }
     output = {

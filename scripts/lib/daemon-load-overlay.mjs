@@ -80,7 +80,7 @@ import {
  */
 export async function guardedRegister({ root, ref, pr, env, gate, register }) {
   // Lazy: daemon-overlay.mjs imports this module (overlaySafetySettings), so a static import would be a cycle.
-  const { stackAwareOverlayCheck, withAddGuardLock } = await import('../daemon-overlay.mjs');
+  const { stackAwareOverlayCheck, withAddGuardLock, registrationAuditGate } = await import('../daemon-overlay.mjs');
   return withAddGuardLock(root, env, async () => {
     const st = readOverlayState(root, { env });
     if (st.corrupt) return { registered: false, reason: 'overlay-store-corrupt' };
@@ -89,6 +89,8 @@ export async function guardedRegister({ root, ref, pr, env, gate, register }) {
     });
     if (!check.ok) return { registered: false, reason: 'conflict-check-failed', check };
     if (!check.clean && !gate.override) return { registered: false, reason: 'conflict', check };
+    if (!registrationAuditGate({ root, ref, sha: check.candSha, env }))
+      return { registered: false, reason: 'no-canonical-audit', check };
     register(!check.clean ? { ...gate.override, files: check.files, conflicting: check.conflicting } : null);
     return { registered: true, check };
   });

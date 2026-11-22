@@ -1,8 +1,9 @@
 /** Canonical, exact-head evidence for standing overlay admission and inspection. */
 import { readFileSync } from 'node:fs';
+import { spawnSync } from 'node:child_process';
 import { readAuditSettings, resolveAuditRecordPath } from '../operations/codex-audit-io.mjs';
-import { readStore, storePath } from '../operations/ruled-weakened-store.mjs';
-import { jsonLines } from '../operations/prototype-load.mjs';
+import { readStore, storePath, validateEntry, withdrawnRevocations } from '../operations/ruled-weakened-store.mjs';
+import { jsonLines, canonicalAuditEvidence } from '../operations/prototype-load.mjs';
 
 const fullSha = value => typeof value === 'string' && /^[a-f0-9]{40}(?![\s\S])/i.test(value);
 /** Name the evidence an operator must supply. */
@@ -10,19 +11,30 @@ export function describeMissing(sha) {
   return `no NOT WEAKENED canonical audit record and no waiver in ruled-weakened.jsonl for ${typeof sha === 'string' ? sha : 'invalid SHA'}`;
 }
 
-/** Judge exact-head records in ledger order; every base's latest verdict must be green. Pure. */
-export function auditEvidenceFor(sha, { auditRecords = [], waivers = [] } = {}) {
+/** Read-only canonical coverage; unknown Git state grants no coverage. Never fetches. */
+export function mainCovers(base, { cwd = process.cwd(), env = process.env } = {}) {
+  if (!fullSha(base)) return false;
+  try {
+    const result = spawnSync('git', ['merge-base', '--is-ancestor', base, 'origin/main'], {
+      cwd, env: { ...env, GIT_NO_LAZY_FETCH: '1', GIT_OPTIONAL_LOCKS: '0' },
+      encoding: 'utf8', timeout: 15000, maxBuffer: 65536,
+    });
+    return !result.error && result.status === 0;
+  } catch { return false; }
+}
+
+/** Canonical evaluation. Supplying covers keeps evaluation pure; default IO is read-only Git. */
+export function auditEvidenceFor(sha, { auditRecords = [], waivers = [], ref, covers = mainCovers } = {}) {
   const missing = { ok: false, kind: null, detail: describeMissing(sha) };
   if (!fullSha(sha)) return missing;
-  const matches = value => fullSha(value) && value.toLowerCase() === sha.toLowerCase();
-  const latest = new Map();
-  for (const record of auditRecords) {
-    if (matches(record?.head) && fullSha(record.base)) latest.set(record.base.toLowerCase(), record);
+  const covered = base => { try { return !!covers(base); } catch { return false; } };
+  const evaluate = ruledWeakened => canonicalAuditEvidence(auditRecords, sha, covered, null, { ruledWeakened });
+  if (evaluate().ok) return { ok: true, kind: 'audit', detail: `NOT WEAKENED canonical audit record for ${sha}` };
+  for (const entry of waivers) {
+    if (!validateEntry(entry) || entry.ref !== ref || entry.sha.toLowerCase() !== sha.toLowerCase()) continue;
+    if (evaluate({ record: entry, ruledWeakened: entry }).ok)
+      return { ok: true, kind: 'waiver', detail: `waiver in ruled-weakened.jsonl for ${ref} ${sha}` };
   }
-  if (latest.size && [...latest.values()].every(record => record.verdict === 'NOT WEAKENED'))
-    return { ok: true, kind: 'audit', detail: `NOT WEAKENED canonical audit record for ${sha}` };
-  if (waivers.some(entry => matches(entry?.sha)))
-    return { ok: true, kind: 'waiver', detail: `waiver in ruled-weakened.jsonl for ${sha}` };
   return missing;
 }
 
@@ -39,7 +51,8 @@ export function loadAuditEvidence({ env = process.env } = {}) {
   try {
     let damaged = false;
     const store = readStore({ path: storePath(env), warn: () => { damaged = true; } });
-    if (!store.error && !damaged) waivers = store.entries;
+    const revoked = withdrawnRevocations({ env });
+    if (!store.error && !damaged) waivers = store.entries.filter(entry => !revoked(entry));
   } catch { /* Missing or unreadable waiver ledger: no waiver evidence. */ }
   return { auditRecords, waivers };
 }

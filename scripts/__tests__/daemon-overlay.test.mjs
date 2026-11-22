@@ -74,7 +74,9 @@ function makeFixture() {
   gitOk(cloneDir, ['push', '-q', '-u', 'origin', 'main']);
   gitOk(cloneDir, ['fetch', '-q', 'origin']);
   const overlayDir = mktemp('we-overlay-cli-state-');
-  const env = { ...process.env, WE_OVERLAY_AUDIT_EVIDENCE: 'off', WE_DAEMON_OVERLAY_DIR: overlayDir, WE_DAEMON_OVERLAY_STACK_BASES: '{}' };
+  const prefs = join(base, 'prefs.json');
+  writeFileSync(prefs, JSON.stringify({ overlaySafety: { auditEvidence: 'off' } }));
+  const env = { ...process.env, WE_PLATFORM_PREFERENCES_FILE: prefs, WE_OVERLAY_AUDIT_EVIDENCE: 'off', WE_DAEMON_OVERLAY_DIR: overlayDir, WE_DAEMON_OVERLAY_STACK_BASES: '{}' };
   return { originDir, cloneDir, overlayDir, env };
 }
 
@@ -413,9 +415,11 @@ function deadPid() {
 
 function lockFixture(waitMs) {
   const overlayDir = mktemp('we-overlay-lock-');
-  const env = { ...process.env, WE_OVERLAY_AUDIT_EVIDENCE: 'off', WE_DAEMON_OVERLAY_DIR: overlayDir, WE_DAEMON_OVERLAY_STACK_BASES: '{}' };
-  if (waitMs) env.WE_DAEMON_OVERLAY_ADD_GUARD_WAIT_MS = String(waitMs);
   const root = mktemp('we-overlay-lock-root-');
+  const prefs = join(root, 'prefs.json');
+  writeFileSync(prefs, JSON.stringify({ overlaySafety: { auditEvidence: 'off' } }));
+  const env = { ...process.env, WE_PLATFORM_PREFERENCES_FILE: prefs, WE_OVERLAY_AUDIT_EVIDENCE: 'off', WE_DAEMON_OVERLAY_DIR: overlayDir, WE_DAEMON_OVERLAY_STACK_BASES: '{}' };
+  if (waitMs) env.WE_DAEMON_OVERLAY_ADD_GUARD_WAIT_MS = String(waitMs);
   const lockDir = `${overlayFilePath(root, env)}.add-guard.lock`;
   return { env, root, lockDir };
 }
