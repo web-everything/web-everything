@@ -5986,6 +5986,10 @@ An immutable incoming batch is persisted before the writer lock, then transferre
 the pending ledger under lock so confirmed merges survive contention. Existing statement
 files are reconciled against freshly collected subject, policy, clauses and verdict before
 indexing or retirement; mismatches stay pending for operator inspection and backfill.
+The shadow `index.jsonl` is only ever replaced whole by an atomic rename, never appended in
+place, so a crash cannot leave a partial line. A torn, unterminated last line from an older
+in-place append is dropped and its record re-indexed on retry; any other unreadable row fails
+closed with the merge kept pending. The tests seed a torn tail and corrupt rows.
 Backfill discovery pages all PRs newest-update first and stops at the first row updated
 before `--since` (a merge updates its PR), so a long merged history never blocks a recent
 window. Rows must carry a number and readable timestamps or the listing is refused; a window

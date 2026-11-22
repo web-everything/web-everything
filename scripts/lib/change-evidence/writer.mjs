@@ -81,13 +81,35 @@ function collect(item, reads, maxPages) {
   return { pr, events, comments, mergeCommit, commits, checkRuns };
 }
 
-/** Atomic record, then index, then pending retirement. Retry reconciles either crash window. */
+/**
+ * Valid index lines, byte for byte. The index is only ever replaced whole by an atomic rename, so a crash cannot
+ * tear it; an index written by an in-place append can still end in a torn, unterminated line, which is dropped
+ * (its record is re-indexed on retry). Any other unreadable row fails closed for an operator to repair.
+ */
+function indexLines(bytes) {
+  const lines = bytes.split('\n'), tail = lines.pop();
+  const valid = (line, torn) => {
+    let row;
+    try { row = JSON.parse(line); } catch {
+      if (torn) return false;
+      throw Error('invalid change-evidence index line; operator must repair index.jsonl and retry backfill');
+    }
+    if (!row || typeof row !== 'object' || Array.isArray(row) || typeof row.file !== 'string')
+      throw Error('invalid change-evidence index row; operator must repair index.jsonl and retry backfill');
+    return true;
+  };
+  const kept = lines.filter(line => line.trim() && valid(line, false));
+  if (tail.trim() && valid(tail, true)) kept.push(tail);
+  return kept;
+}
+
+/** Atomic record, then atomic index, then pending retirement. Retry reconciles every crash window. */
 function publish({ io, dir, record, retire }) {
   const name = `${record.predicate.change.number}-${record.subject[0].digest.gitCommit}.json`;
   const file = path.join(dir, name), index = path.join(dir, 'index.jsonl');
   const before = optional(io, index, '');
-  const rows = before.trim() ? before.trim().split('\n').map(line => JSON.parse(line)) : [];
-  const indexed = rows.some(row => row.file === name);
+  const lines = indexLines(before);
+  const indexed = lines.some(line => JSON.parse(line).file === name);
   const existed = io.existsSync(file);
   if (existed) {
     // Recollect first, then reconcile a crash only if the persisted statement agrees.
@@ -101,19 +123,20 @@ function publish({ io, dir, record, retire }) {
     if (!isDeepStrictEqual(normalize(saved), normalize(expected)))
       throw Error('existing record differs from verified subject, policy or verdict; operator must inspect record and retry backfill');
   }
-  let appended = false;
+  let indexWritten = false;
   try {
     if (!existed) atomic(io, file, `${JSON.stringify(record, null, 2)}\n`);
     if (!indexed) {
-      // Mark before the call: a failed append may have written a partial line.
-      appended = true;
-      io.appendFileSync(index, `${JSON.stringify({ file: name, pr: record.predicate.change.number,
-        mergeSha: record.subject[0].digest.gitCommit, recordedAt: record.predicate.recordedAt })}\n`);
+      const row = JSON.stringify({ file: name, pr: record.predicate.change.number,
+        mergeSha: record.subject[0].digest.gitCommit, recordedAt: record.predicate.recordedAt });
+      // Never an in-place append: a crash mid-append leaves a partial line no retry could parse.
+      atomic(io, index, [...lines, row].map(line => `${line}\n`).join(''));
+      indexWritten = true;
     }
     retire();
   } catch (error) {
     if (!existed && io.existsSync(file)) io.unlinkSync(file);
-    if (appended) atomic(io, index, before);
+    if (indexWritten) atomic(io, index, before);
     throw error;
   }
   return file;

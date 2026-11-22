@@ -108,15 +108,16 @@ it('writes atomically and clears pending only after write and index', async () =
   const h = harness(), order = [];
   const io = { ...fs, renameSync: (src, dst) => {
     if (dst === h.file) { expect(fs.existsSync(dst)).toBe(false); expect(h.pending()).toHaveLength(1); order.push('rename'); }
+    if (dst === path.join(h.dir, 'index.jsonl')) { expect(fs.existsSync(h.file)).toBe(true); expect(h.pending()).toHaveLength(1); order.push('index'); }
     fs.renameSync(src, dst);
-  }, appendFileSync: (file, bytes) => {
-    expect(fs.existsSync(h.file)).toBe(true); expect(h.pending()).toHaveLength(1); order.push('index'); fs.appendFileSync(file, bytes);
   } };
   await writeChangeEvidenceForMerged({ ...h.options, io });
   expect(order).toEqual(['rename', 'index']); expect(h.pending()).toEqual([]);
 });
 it('rolls back a record on index failure and retries pending idempotently', async () => {
-  const h = harness(); await writeChangeEvidenceForMerged({ ...h.options, io: { ...fs, appendFileSync: () => { throw Error('disk full'); } } });
+  const h = harness(); await writeChangeEvidenceForMerged({ ...h.options, io: { ...fs, renameSync: (src, dst) => {
+    if (dst === path.join(h.dir, 'index.jsonl')) throw Error('disk full'); fs.renameSync(src, dst);
+  } } });
   expect(h.pending()).toHaveLength(1); expect(fs.existsSync(h.file)).toBe(false);
   await writeChangeEvidenceForMerged({ ...h.options, merged: [] });
   const bytes = fs.readFileSync(h.file, 'utf8'); h.gh.mockClear();
@@ -249,14 +250,51 @@ it('a failed atomic rename leaves no visible record or temporary file', async ()
   } } });
   expect(h.pending()).toHaveLength(1); expect(fs.readdirSync(h.dir)).toEqual([]);
 });
-it('a partial index append is rolled back before retry', async () => {
-  const h = harness();
-  await writeChangeEvidenceForMerged({ ...h.options, io: { ...fs, appendFileSync: (file, bytes) => {
-    fs.appendFileSync(file, bytes.slice(0, 9)); throw Error('partial append');
+it('a partial index write never reaches the index and is retried', async () => {
+  const h = harness(), index = path.join(h.dir, 'index.jsonl');
+  await writeChangeEvidenceForMerged({ ...h.options, io: { ...fs, writeFileSync: (file, bytes) => {
+    if (file.startsWith(`${index}.`)) { fs.writeFileSync(file, bytes.slice(0, 9)); throw Error('partial write'); }
+    fs.writeFileSync(file, bytes);
   } } });
   expect(fs.existsSync(h.file)).toBe(false); expect(h.pending()).toHaveLength(1);
+  expect(fs.existsSync(index)).toBe(false); expect(fs.readdirSync(h.dir)).toEqual([]);
   await writeChangeEvidenceForMerged({ ...h.options, merged: [] });
   expect(JSON.parse(fs.readFileSync(path.join(h.dir, 'index.jsonl'), 'utf8')).pr).toBe(pr.number);
+});
+it('a torn index tail left by a crashed append is repaired on the next retry', async () => {
+  const h = harness(), index = path.join(h.dir, 'index.jsonl'), other = { file: '1-x.json', pr: 1, mergeSha: 'x', recordedAt: 'r' };
+  fs.mkdirSync(h.dir, { recursive: true }); fs.writeFileSync(index, `${JSON.stringify(other)}\n{"file":"${pr.number}-${sha.slice(0, 7)}`);
+  await writeChangeEvidenceForMerged(h.options);
+  expect(h.emit).not.toHaveBeenCalled(); expect(h.pending()).toEqual([]); expect(fs.existsSync(h.file)).toBe(true);
+  const bytes = fs.readFileSync(index, 'utf8');
+  expect(bytes.endsWith('\n')).toBe(true);
+  expect(bytes.trim().split('\n').map(line => JSON.parse(line).file)).toEqual([other.file, `${pr.number}-${sha}.json`]);
+});
+it('an unterminated but complete index tail is kept, not dropped', async () => {
+  const h = harness(), index = path.join(h.dir, 'index.jsonl'), other = { file: '1-x.json', pr: 1, mergeSha: 'x', recordedAt: 'r' };
+  fs.mkdirSync(h.dir, { recursive: true }); fs.writeFileSync(index, JSON.stringify(other));
+  await writeChangeEvidenceForMerged(h.options);
+  expect(h.pending()).toEqual([]);
+  expect(fs.readFileSync(index, 'utf8').trim().split('\n').map(line => JSON.parse(line).file)).toEqual([other.file, `${pr.number}-${sha}.json`]);
+});
+it.each([['a corrupt terminated line', '{"file":\n'], ['a non-object row', '[1]\n'], ['a row without a file name', '{"pr":1}\n']])(
+  '%s inside the index fails closed and keeps the merge pending', async (_, bad) => {
+    const h = harness(), index = path.join(h.dir, 'index.jsonl');
+    fs.mkdirSync(h.dir, { recursive: true }); fs.writeFileSync(index, `${bad}{"file":"1-x.json"}\n`);
+    await writeChangeEvidenceForMerged(h.options);
+    expect(h.pending()).toHaveLength(1); expect(fs.existsSync(h.file)).toBe(false);
+    expect(fs.readFileSync(index, 'utf8')).toBe(`${bad}{"file":"1-x.json"}\n`);
+    expect(h.emit).toHaveBeenCalledWith(expect.objectContaining({ detail: expect.objectContaining({ reason: expect.stringMatching(/invalid change-evidence index/) }) }));
+  });
+it('the index is only ever replaced by rename, never written in place', async () => {
+  const h = harness(), index = path.join(h.dir, 'index.jsonl'), inPlace = [];
+  const io = { ...fs,
+    appendFileSync: file => { inPlace.push(['append', file]); throw Error('in-place append'); },
+    writeFileSync: (file, bytes) => { if (file === index) inPlace.push(['write', file]); fs.writeFileSync(file, bytes); } };
+  await writeChangeEvidenceForMerged({ ...h.options, io });
+  await writeChangeEvidenceForMerged({ ...h.options, merged: [{ num: pr.number, repo: null }], io });
+  expect(inPlace).toEqual([]); expect(h.pending()).toEqual([]);
+  expect(fs.readFileSync(index, 'utf8').trim().split('\n')).toHaveLength(1);
 });
 it('failed pending retirement rolls back the record and index', async () => {
   const h = harness();
