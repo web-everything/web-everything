@@ -1,6 +1,6 @@
 /** Host-local, append-only accounting. Observations may include concurrent Codex runs;
  * quota deltas are bucket percentage points, not exact per-run billing. */
-import { appendFileSync, mkdirSync, readdirSync, statSync, lstatSync, realpathSync, openSync, readSync, closeSync } from 'node:fs';
+import { appendFileSync, mkdirSync, readdirSync, statSync, fstatSync, lstatSync, realpathSync, openSync, readSync, closeSync } from 'node:fs';
 import { dirname, join, isAbsolute } from 'node:path';
 import { homedir } from 'node:os';
 import { createHash } from 'node:crypto';
@@ -35,40 +35,90 @@ export function codexUsageLedgerPath(env = process.env) {
   return env.WE_CODEX_USAGE_LEDGER || join(daemonConveyorStateRoot(env), 'codex-usage.jsonl');
 }
 
-/** Only the newest persisted rollout with a Codex bucket is used; never invoke Codex to probe quota. */
+/** Newest event timestamp wins within the eight newest rollouts by mtime; read at most 256 KiB each. */
 export function readCodexQuota(env = process.env) {
+  if (env.WE_CAPACITY_READERS === 'off') return null;
   try {
     const files = [];
     const walk = (dir) => {
       for (const e of readdirSync(dir, { withFileTypes: true })) {
         const path = join(dir, e.name);
         if (e.isDirectory()) walk(path);
-        else if (e.isFile() && e.name.endsWith('.jsonl')) files.push({ path, mtime: statSync(path).mtimeMs });
+        else if (e.isFile() && e.name.endsWith('.jsonl')) files.push(path);
       }
     };
     walk(join(env.CODEX_HOME || join(homedir(), '.codex'), 'sessions'));
-    files.sort((a, b) => b.mtime - a.mtime);
-    for (const { path } of files.slice(0, 8)) {
+    let newest = null;
+    // Stat before opening: cap aggregate tail IO at 8 × 256 KiB. Older rollouts
+    // are outside the evidence horizon; refresh a rollout or use an operator reading.
+    const recent = files.map(path => ({ path, mtime: statSync(path).mtimeMs }))
+      .sort((a, b) => b.mtime - a.mtime).slice(0, 8);
+    for (const { path } of recent) {
       let fd;
-      let text;
+      let lines, mtime;
       try {
         fd = openSync(path, 'r');
-        const size = statSync(path).size;
+        const stat = fstatSync(fd), size = stat.size;
+        mtime = stat.mtimeMs;
         const buf = Buffer.alloc(Math.min(size, 256 * 1024));
         const bytes = readSync(fd, buf, 0, buf.length, size - buf.length);
-        text = buf.subarray(0, bytes).toString('utf8');
+        lines = buf.subarray(0, bytes).toString('utf8').split('\n');
+        if (size > buf.length) lines.shift(); // Never parse a truncated first line.
       } finally { if (fd !== undefined) closeSync(fd); }
-      for (const line of text.split('\n').reverse()) {
+      for (const line of lines) {
         let e;
         try { e = JSON.parse(line); } catch { continue; }
         const limits = e?.type === 'event_msg' && e.payload?.type === 'token_count' ? e.payload.rate_limits : null;
-        if (limits?.limit_id === 'codex' && Number.isFinite(limits.primary?.used_percent)) {
-          return { used_percent: limits.primary.used_percent, resets_at: limits.primary.resets_at ?? null };
+        if (limits?.limit_id === 'codex') {
+          const at = typeof e.timestamp === 'string' ? Date.parse(e.timestamp) : NaN;
+          if (!Number.isFinite(at)) continue; // Undated history cannot participate in event ordering.
+          if (!newest || at >= newest.time) newest = { time: at, at: e.timestamp, limits, mtime };
         }
       }
     }
+    const valid = w => Number.isFinite(w?.used_percent) && w.used_percent >= 0 && w.used_percent <= 100
+      && Number.isFinite(w.resets_at) && w.resets_at > 0
+      && Number.isFinite(w.window_minutes) && w.window_minutes > 0;
+    // Validate the newest evidence, never fall back to an older percentage on format drift.
+    if (!newest || !valid(newest.limits.primary) || (newest.limits.secondary != null && !valid(newest.limits.secondary))) return null;
+    const window = ({ used_percent, resets_at, window_minutes }) => ({ used_percent, resets_at, window_minutes });
+    return { ...window(newest.limits.primary), at: newest.at, mtime: newest.mtime,
+      ...(newest.limits.secondary ? { secondary: window(newest.limits.secondary) } : {}) };
   } catch { /* absent/unreadable quota is unknown */ }
   return null;
+}
+
+/** Read a bounded ledger tail. Legacy rows infer resets from percentage drops; new rows identify windows. */
+export function readCodexBurnRate({ env = process.env, now = Date.now(), lookbackHours = 24, window, read = readSync } = {}) {
+  if (env.WE_CAPACITY_READERS === 'off') return null;
+  let fd;
+  try {
+    if (!Number.isFinite(lookbackHours) || lookbackHours <= 0 || !window) return null;
+    fd = openSync(codexUsageLedgerPath(env), 'r');
+    const size = fstatSync(fd).size, buffer = Buffer.alloc(Math.min(size, 8 * 1024 * 1024));
+    const bytes = read(fd, buffer, 0, buffer.length, size - buffer.length);
+    const lines = buffer.subarray(0, bytes).toString('utf8').split('\n');
+    if (size > buffer.length) lines.shift();
+    const epoch = v => typeof v === 'number' ? (v < 1e12 ? v * 1000 : v) : Date.parse(v);
+    const reset = epoch(window.resetsAt);
+    const start = Math.max(now - lookbackHours * 3600000, reset - window.lengthHours * 3600000);
+    const rows = lines.flatMap(line => {
+      try {
+        const row = JSON.parse(line), at = Date.parse(row.at), used = row.quota?.after_used_percent;
+        return Number.isFinite(at) && at >= start && at <= now && Number.isFinite(used) && used >= 0 && used <= 100
+          ? [{ at, used, before: row.quota.before_used_percent, reset: row.quota.after_resets_at }] : [];
+      } catch { return []; }
+    }).sort((a, b) => a.at - b.at);
+    let samples = [];
+    for (const row of rows) {
+      if (row.reset != null && epoch(row.reset) !== reset) { samples = []; continue; }
+      if (row.used < samples.at(-1)?.used || (Number.isFinite(row.before) && row.used < row.before)) samples = [];
+      samples.push(row);
+    }
+    const first = samples[0], last = samples.at(-1);
+    if (samples.length < 2 || last.at <= first.at || last.used > window.usedPercent) return null;
+    return (last.used - first.used) / ((last.at - first.at) / 3600000);
+  } catch { return null; } finally { if (fd !== undefined) closeSync(fd); }
 }
 
 export function codexRunTokens(stdout = '') {
@@ -97,6 +147,7 @@ export function appendCodexUsage(record, { env = process.env, append = appendFil
       ...(record.pr != null ? { pr: record.pr } : {}), ...(record.card ? { card: record.card } : {}),
       tokens: record.tokens ?? codexRunTokens(record.stdout),
       quota: { before_used_percent: before, after_used_percent: after,
+        before_resets_at: record.quotaBefore?.resets_at ?? null, after_resets_at: record.quotaAfter?.resets_at ?? null,
         delta: Number.isFinite(before) && Number.isFinite(after) && sameWindow && after >= before ? after - before : null },
       durationMs: record.durationMs ?? null,
       outcome: { changedFiles: record.changedFiles ?? null, exit: record.exit ?? null, timedOut: Boolean(record.timedOut) },
