@@ -257,24 +257,54 @@ it('PR reader uses bounded gh list and refuses truncated or malformed evidence w
   expect(() => readPriorityPrs({ gh: () => { throw new Error('unreadable'); } })).toThrow();
 });
 
-const capped = [{ number: 1, files: Array.from({ length: 100 }, (_, i) => ({ path: `f${i}` })) }];
-const pagedLines = n => Array.from({ length: n }, (_, i) => JSON.stringify({ s: 'modified', f: `f${i}` })).join('\n');
-
-it('a PR at the bulk file cap is read with a per-PR paginated call and overlap uses all 140 files', () => {
+const HEAD = 'a'.repeat(40);
+const capped = [{ number: 1, headRefOid: HEAD, files: Array.from({ length: 100 }, (_, i) => ({ path: `f${i}` })) }];
+const row = i => JSON.stringify({ f: `f${i}`, p: null });
+const pagedLines = n => Array.from({ length: n }, (_, i) => row(i)).join('\n');
+/** gh stub: list -> capped PR; paginated files -> paged(); head read -> head(). */
+const stub = ({ paged = () => pagedLines(140), head = () => HEAD, list = capped } = {}) => {
   const calls = [];
-  const gh = args => { calls.push(args); return args[0] === 'api' ? pagedLines(140) : JSON.stringify(args.includes('web-everything/web-everything') ? capped : []); };
+  const gh = args => {
+    calls.push(args);
+    if (args[0] === 'api' && args.includes('--paginate')) return paged();
+    if (args[0] === 'api') return head();
+    return JSON.stringify(args.includes('web-everything/web-everything') ? list : []);
+  };
+  return { gh, calls };
+};
+const REFUSE = /repair|drain|retry/i;
+
+it('a PR at the bulk file cap is paged per PR and overlap admission sees all 140 files', async () => {
+  const { gh, calls } = stub();
   const prs = readPriorityPrs({ gh });
   expect(prs).toHaveLength(1);
   expect(prs[0].files).toHaveLength(140);
-  expect(prs[0].files).toContain('f139');
-  expect(calls.filter(a => a[0] === 'api')).toHaveLength(1);
+  const page = calls.find(a => a.includes('--paginate'));
+  expect(page.join(' ')).toContain('repos/web-everything/web-everything/pulls/1/files');
+  const f = fixture({ readCard: () => ({ scope: ['we:f139'] }), readPrs: () => prs });
+  const result = await f.command();
+  expect(result.code).not.toBe(0);
+  expect(result.lines.join('\n')).toContain('scope overlaps open PR');
 });
 
-it('a failed or truncated per-PR read for a capped PR still refuses', () => {
-  const run = paged => readPriorityPrs({ gh: args => (args[0] === 'api' ? paged() : JSON.stringify(args.includes('web-everything/web-everything') ? capped : [])) });
-  expect(() => run(() => { throw new Error('boom'); })).toThrow(/repair|drain|retry/i);
-  expect(() => run(() => pagedLines(50))).toThrow(/repair|drain|retry/i);
-  expect(() => run(() => 'not json')).toThrow(/repair|drain|retry/i);
+it.each([
+  ['failed read', { paged: () => { throw new Error('boom'); } }],
+  ['malformed json', { paged: () => 'not json' }],
+  ['too few rows', { paged: () => pagedLines(50) }],
+  ['rows at the 3000-file API cap', { paged: () => pagedLines(3000) }],
+  ['bulk filenames missing (duplicates)', { paged: () => Array.from({ length: 140 }, () => row(0)).join('\n') }],
+  ['renames halve the count', { paged: () => Array.from({ length: 50 }, (_, i) => JSON.stringify({ f: `n${i}`, p: `o${i}` })).join('\n') }],
+  ['numeric rename source', { paged: () => `${pagedLines(139)}\n${JSON.stringify({ f: 'f139', p: 7 })}` }],
+  ['head moved while paging', { head: () => 'b'.repeat(40) }],
+  ['failed head read', { head: () => { throw new Error('boom'); } }],
+  ['no head in the list', { list: [{ number: 1, files: capped[0].files }] }],
+])('a capped PR with a %s still refuses', (_name, options) => {
+  expect(() => readPriorityPrs({ gh: stub(options).gh })).toThrow(REFUSE);
+});
+
+it('rename sources from the paged read are kept for overlap', () => {
+  const lines = `${pagedLines(139)}\n${JSON.stringify({ f: 'f139', p: 'old/f139' })}`;
+  expect(readPriorityPrs({ gh: stub({ paged: () => lines }).gh })[0].files).toContain('old/f139');
 });
 
 

@@ -9,7 +9,6 @@ import { runGhSync } from '../lib/gh-throttle.mjs';
 import { CONSTELLATION_REPOS } from '../lib/constellation-repos.mjs';
 import { normalizeBriefScope, SCOPE_PREFIX_ALIASES } from './dispatch-lane.mjs';
 import { GH_LIST_FILE_CAP, prHoldsFile, qualifyFile, repoKeyFor } from './free-scope.mjs';
-import { readPagedFiles } from './free-scope-io.mjs';
 import { resolveCoordinationRoot } from './coordination-root.mjs';
 import { buildPrioritySetOperation, BUILD_PRIORITY_SET_EFFECT, validateBuildPriorityInput } from './build-priority-set.mjs';
 
@@ -43,11 +42,31 @@ export function readPriorityCards({ git = args => execFileSync('git', args, {
   };
 }
 
+/** Strict per-PR paginated read: every row validated, head pinned before and after, 3000-file API cap refused. */
+function readPagedPrFiles({ gh, repo, number, head }) {
+  if (typeof head !== 'string' || !/^[0-9a-f]{40}$/.test(head)) refuse('incomplete open PR files');
+  try {
+    const raw = gh(['api', '--paginate', `repos/${repo}/pulls/${number}/files?per_page=100`,
+      '--jq', '.[] | {f: .filename, p: .previous_filename}']);
+    const files = [];
+    let rows = 0;
+    for (const line of String(raw).split(/\r?\n/).filter(l => l.trim())) {
+      const row = JSON.parse(line);
+      if (typeof row?.f !== 'string' || !row.f.trim() || (row.p != null && (typeof row.p !== 'string' || !row.p.trim()))) throw new Error('bad row');
+      rows += 1;
+      files.push(row.f, ...(row.p ? [row.p] : []));
+    }
+    if (rows < GH_LIST_FILE_CAP || rows >= PAGED_FILE_LIMIT) throw new Error('truncated');
+    if (String(gh(['api', `repos/${repo}/pulls/${number}`, '--jq', '.head.sha'])).trim() !== head) throw new Error('head moved');
+    return files;
+  } catch { return refuse('incomplete open PR files'); }
+}
+
 /** At most three bounded list calls. At either cap, an operator must drain and retry. */
 export function readPriorityPrs({ gh = args => runGhSync(args, READ_OPTIONS) } = {}) {
   const prs = [];
   for (const { slug } of Object.values(CONSTELLATION_REPOS)) {
-    const rows = JSON.parse(gh(['pr', 'list', '--repo', slug, '--state', 'open', '--limit', '200', '--json', 'number,files']));
+    const rows = JSON.parse(gh(['pr', 'list', '--repo', slug, '--state', 'open', '--limit', '200', '--json', 'number,files,headRefOid']));
     if (!Array.isArray(rows) || rows.length >= 200) refuse('incomplete open PR list (limit 200)');
     for (const row of rows) {
       if (!Number.isInteger(row?.number) || row.number <= 0 || !Array.isArray(row.files)
@@ -56,10 +75,12 @@ export function readPriorityPrs({ gh = args => runGhSync(args, READ_OPTIONS) } =
         refuse('incomplete open PR files');
       }
       if (row.files.length >= GH_LIST_FILE_CAP) {
-        // The bulk list is capped: page only this PR; any failed or truncated read still refuses.
-        const paged = readPagedFiles({ repo: slug, number: row.number, exec: gh });
-        if (!paged.ok || paged.files.length < row.files.length || paged.files.length >= PAGED_FILE_LIMIT) refuse('incomplete open PR files');
-        prs.push({ repo: slug, number: row.number, files: paged.files });
+        // The bulk list is capped: page only this PR; any failed, malformed, truncated or moved read refuses.
+        const known = row.files.flatMap(f => [f.path, ...(f.previousFilename ? [f.previousFilename] : [])]);
+        const files = readPagedPrFiles({ gh, repo: slug, number: row.number, head: row.headRefOid });
+        const have = new Set(files);
+        if (known.some(p => !have.has(p))) refuse('incomplete open PR files');
+        prs.push({ repo: slug, number: row.number, files });
         continue;
       }
       prs.push({ repo: slug, number: row.number, files: row.files.flatMap(f => [f.path, ...(f.previousFilename ? [f.previousFilename] : [])]) });
