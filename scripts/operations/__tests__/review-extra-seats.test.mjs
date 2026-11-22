@@ -41,7 +41,8 @@ const REPO = 'web-everything/web-everything';
 const NOW = Date.parse('2026-09-26T15:00:00Z');
 
 const CARBON_PROMOTION_CASES = [
-  { name: 'unpromoted (default)', env: { [PROVIDER_CAP_ENV['agy-gemini']]: '5' }, promoted: false, seatCount: 2 },
+  // The shipped tool setting promotes Carbon (operator 2026-11-21), so the unpromoted case is an explicit env override.
+  { name: 'unpromoted (explicit)', env: { WE_REVIEW_SHADOW_AGY_PROMOTED: 'false', [PROVIDER_CAP_ENV['agy-gemini']]: '5' }, promoted: false, seatCount: 2 },
   { name: 'manually promoted with a positive cap', env: { WE_REVIEW_SHADOW_AGY_PROMOTED: 'true', [PROVIDER_CAP_ENV['agy-gemini']]: '5' }, promoted: true, seatCount: 3 },
 ];
 

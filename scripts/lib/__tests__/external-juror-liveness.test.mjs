@@ -122,8 +122,8 @@ describe('review external juror setting cascade', () => {
     expect(settings({ readFile: () => '{"advisorySeats":{"antigravityReview":"probation"}}' }))
       .toMatchObject({ value: { antigravityReview: 'probation' }, sources: { antigravityReview: 'tool' } });
   });
-  it('shipped probation keeps existing unruled Antigravity referrals enabled and saved rosters intact', () => {
-    expect(referralSeatDisabled('judgeAntigravityReview', {})).toBe(false);
+  it('shipped off (operator 2026-11-21) disables new unruled Antigravity referrals and keeps saved rosters intact', () => {
+    expect(referralSeatDisabled('judgeAntigravityReview', {})).toBe(true);
     expect(reviewSeatOptionsForRun({ findings: { read: { seatSteps: ['judge', 'judgeSecurity', 'judgeAntigravityReview'] }, judgeAntigravityReview: {} } }, null, { antigravityReview: false }).antigravityReview).toBe(true);
   });
 });

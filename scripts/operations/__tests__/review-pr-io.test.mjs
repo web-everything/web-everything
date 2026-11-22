@@ -3015,10 +3015,11 @@ describe('#4315 durable referral effects', () => {
     expect(mandatoryReferralState(h.state.comments, { head: 'b'.repeat(40) }).blocked).toEqual(result === 'block' ? [old.referrals[0].key] : []);
   });
 
+  // The shipped tool settings promote Carbon and turn the Carbon advisory seat off (operator 2026-11-21), so each case
+  // pins promotion off explicitly; a seat the shipped config switches off drops its referrals (covered above).
   it.each([
-    {},
-    { REVIEW_PR_ANTIGRAVITY_REVIEW: '1' },
-    { REVIEW_PR_ANTIGRAVITY_REVIEW: '1', WE_REVIEW_SEAT_CAP_AGY_GEMINI: '40' },
+    { WE_REVIEW_SHADOW_AGY_PROMOTED: 'false', REVIEW_PR_ANTIGRAVITY_REVIEW: '1' },
+    { WE_REVIEW_SHADOW_AGY_PROMOTED: 'false', REVIEW_PR_ANTIGRAVITY_REVIEW: '1', WE_REVIEW_SEAT_CAP_AGY_GEMINI: '40' },
   ])('unpromoted Carbon keeps prior referrals pending through the sink and acceptance gate (%j)', async env => {
     const h = harness({ env });
     const old = seedReferrals(h, ['judgeAntigravityReview'], h.state.headRefOid);

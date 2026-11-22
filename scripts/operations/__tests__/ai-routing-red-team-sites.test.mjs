@@ -535,16 +535,26 @@ test.each(['cap', 'CLI', 'quota', 'reservation'])('explicit agy-claude operator 
   if (blocked !== 'reservation') assert.deepEqual(actual.reservations, []);
 });
 
+const redTeamOverrideReader = route => createRoutingPolicyReader({ env: {}, read: () => JSON.stringify(DEFAULT_ROUTING_POLICY),
+  preferences: () => ({ errors: [], prefs: { routingOverrides: { 'review-seat:red-team': route } } }), emit: () => {},
+});
+
 test('operator review-seat:red-team override wins over builder preference', async () => {
-  const readRoutingPolicy = createRoutingPolicyReader({ env: {}, read: () => JSON.stringify(DEFAULT_ROUTING_POLICY),
-    preferences: () => ({ errors: [], prefs: { routingOverrides: {
-      'review-seat:red-team': { provider: 'codex', model: 'sol', effort: 'xhigh', fallback: [] },
-    } } }), emit: () => {},
-  });
-  const actual = await builderSeat('codex', { readRoutingPolicy }, { WE_REVIEW_SEAT_CAP_AGY_GEMINI: '20' });
+  // A Claude builder prefers Codex; the operator's agy-claude route must still win.
+  const readRoutingPolicy = redTeamOverrideReader({ provider: 'agy-claude', model: 'sonnet', effort: 'high', fallback: [] });
+  const actual = await builderSeat('claude', { readRoutingPolicy }, { WE_REVIEW_SEAT_CAP_AGY_GEMINI: '20' });
   assert.equal(actual.result.status, 'speculated', actual.result.reason);
   assert.deepEqual([actual.calls[0].provider, actual.calls[0].model, actual.calls[0].effort],
-    ['codex', DEFAULT_ROUTING_POLICY.aliases.codex.sol, 'xhigh']);
+    ['agy-claude', DEFAULT_ROUTING_POLICY.aliases['agy-claude'].sonnet, 'high']);
+});
+
+test('an operator codex-only red-team route is refused for a Codex builder (never same-vendor)', async () => {
+  const readRoutingPolicy = redTeamOverrideReader({ provider: 'codex', model: 'sol', effort: 'xhigh', fallback: [] });
+  const actual = await builderSeat('codex', { readRoutingPolicy }, { WE_REVIEW_SEAT_CAP_AGY_GEMINI: '20' });
+  assert.equal(actual.result.status, 'skipped');
+  assert.match(actual.result.reason, /no available route/);
+  assert.deepEqual(actual.calls, []);
+  assert.deepEqual(actual.reservations, []);
 });
 
 for (const defect of ['model', 'effort']) {
