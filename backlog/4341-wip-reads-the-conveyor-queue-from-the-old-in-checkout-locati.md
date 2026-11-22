@@ -2,10 +2,8 @@
 bornAs: xykd1x3
 kind: story
 size: 2
-status: closed
-closedReason: fixed-elsewhere
-closedBy: "plan step DZ-RETIRE-WIP"
-dateClosed: "2026-11-22"
+status: open
+scopeRationale: "the old in-checkout queue file is the stale path being replaced, not a deliverable"
 scope: ["plateau:src/wip/wip-read.ts", "plateau:src/wip/wip-read.test.ts"]
 dateOpened: "2026-09-28"
 preparedDate: "2026-09-30"
@@ -109,6 +107,4 @@ against `we:scripts/conveyor/queue.mjs list --json`.
    conveyor-queue read goes through `resolveQueuePath()` (not a hardcoded `we:.conveyor/queue.json` join),
    plus the old-shaped-`weRoot` degrade case.
 
-Superseded 2026-11-22 by plan step DZ-RETIRE-WIP (Fix lives in /wip publisher code that DZ-RETIRE-WIP removes. Reopen only if /wip stays past W12.) [PL-WIP-CLEANUP / plateau rulings].
-
-Acceptance items carried (2026-11-22): plan step PD-LIVE (delivery plan): resolver-based queue read and the degrade tests.
+Will be closed when plan step PD-LIVE (delivery plan) delivers; ruled 2026-11-22 (PL-WIP-CLEANUP).

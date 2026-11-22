@@ -3,10 +3,8 @@ bornAs: xtjsuum
 kind: story
 size: 2
 parent: "2676"
-status: closed
-closedReason: duplicate
-closedInto: "2707"
-dateClosed: "2026-11-22"
+status: open
+scopeRationale: "we:scripts/lib/jury-core.mjs is read-only context here; the rules in it must stay unchanged"
 scope:
   - we:skills-src/jury/subject-jury.workflow.js
   - we:skills-src/jury/SKILL.md
@@ -175,8 +173,4 @@ One incremental, single-repo (WE) PR — prompt text + one doc line + one new te
 cross-repo change; does not touch #2695's or #2950's files, so it can land independently of both and in any order
 relative to them.
 
-Superseded 2026-11-22 by #2707 (Its mandatory post-jury red-team mechanism already shipped as #2707 (per its own prep note).) [PL-WIP-CLEANUP / plateau rulings].
-
-Acceptance items carried (2026-11-22): plan step DZ-STUDIO-RATIFY (design plan): honesty-lens checklist and its regression assertions; data-model truth also overlaps #2695.
-
-Acceptance items also tracked on new card x7ihyw5.
+Will be closed when carry card x7ihyw5 delivers; ruled 2026-11-22 (master plan).

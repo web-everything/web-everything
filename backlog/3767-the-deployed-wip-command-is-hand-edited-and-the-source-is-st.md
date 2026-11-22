@@ -3,10 +3,7 @@ bornAs: x9mic7n
 kind: story
 size: 2
 parent: "3383"
-status: closed
-closedReason: fixed-elsewhere
-closedBy: "plan step DZ-RETIRE-WIP"
-dateClosed: "2026-11-22"
+status: open
 scope: ["we:.claude/commands/wip.md", "we:scripts/bootstrap-session.mjs", "we:scripts/sync-commands-deploy.mjs"]
 dateOpened: "2026-09-20"
 tags: []
@@ -47,8 +44,4 @@ PR #2360 (merge commit 2866bdfcc, 2026-09-21) delivered the source-tracking half
 
 Remaining before this card can resolve: the state-naming cleanup and its scan test (Done-when 6), and the choice on the pre-overwrite warning (design point 4). The hard-coded personal clone in we:.claude/commands/wip.md goes away when the report CLI graduates to main (#3443, PR #2360 "Owed").
 
-Superseded 2026-11-22 by plan step DZ-RETIRE-WIP (Fix lives in /wip publisher code that DZ-RETIRE-WIP removes. Reopen only if /wip stays past W12.) [PL-WIP-CLEANUP / plateau rulings].
-
-Acceptance items carried (2026-11-22): plan step DZ-LINT (design plan): continue/handoff hard-coded state scan test and the pre-overwrite warning choice.
-
-Acceptance items also tracked on new card x23lblp.
+Will be closed when carry card x23lblp delivers; ruled 2026-11-22 (PL-WIP-CLEANUP).

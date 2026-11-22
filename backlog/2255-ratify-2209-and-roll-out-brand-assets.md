@@ -1,10 +1,7 @@
 ---
 kind: story
 size: 5
-status: closed
-closedReason: duplicate
-closedInto: "2209"
-dateClosed: "2026-11-22"
+status: open
 parent: "2256"
 blockedBy: ["2209", "2250", "2251", "2252", "2253"]
 locus: webeverything
@@ -221,8 +218,4 @@ unblocked, informed by the actual ratified gate wording.
   construction (owned by #2252), `plateau-app:favicon.svg`'s construction (owned by #2253), and the act
   of ratifying #2209 itself (owned by the decision-owner on the #2209 card, not this story).
 
-Superseded 2026-11-22 by #2209 (Its ratify step repeats #2209; keep only the rollout, which becomes DZ-BRAND and DZ-SITES.) [PL-WIP-CLEANUP / plateau rulings].
-
-Acceptance items carried (2026-11-22): plan step DZ-BRAND (design plan): check:branding validator, icon cleanup, gradient hue-span normalization and the asset rollout.
-
-Acceptance items also tracked on new card xt9bmkj.
+Will be closed when carry card xt9bmkj delivers; ruled 2026-11-22 (PL-BRAND-RATIFY).

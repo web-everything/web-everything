@@ -16,6 +16,7 @@ Plan step DZ-SHELL in the plateau design plan (PL-ROUTES: five task sections own
 
 - [A1] **Executable** — a plateau-app webcase/e2e test (named by the build slice) fails before this lands and passes after: the new route table declares a guard for every route, the five task sections own the URLs, and a logged-off visit to each of the five routes #3130 lists is refused by a test (each of the five tested individually; #3130 itself is parked until beta). Linked plan step: DZ-SHELL.
 - [A2] Carried from #2512: legacy URLs keep working after the route move: static, dynamic (:id) and query-string redirects from each old path to its new path, query string and id preserved, redirect runs before the auth guard, no redirect loop; one browser test per class, each asserting the real destination content mounts with no visible 404 (not only the URL).
+- [A3] Carried from #2512: a sweep finds zero old internal links; every link, nav item and deep link points at the new path directly, not through a redirect.
 
 
 

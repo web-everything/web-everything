@@ -14,6 +14,7 @@ Carried from closed #2697: add a named honesty-lens checklist (internal contradi
 ## Acceptance
 
 - [A1] **Executable** — running the jury red-team test suite: a test asserts redTeamPrompt names all five honesty checks and fails on main (the prompt names none today), and the existing panel-fanout suite stays green.
+- [A2] RED_TEAM_SCHEMA, redTeamRequired, foldRedTeamVerdict and DISPOSITIONS stay unchanged (fail-closed invariants), pinned by tests that fail if any of them changes.
 
 
 
