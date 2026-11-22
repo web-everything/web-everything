@@ -5782,8 +5782,6 @@ function cmdBranch(repo) {
   if (typeof lease.holder !== 'string' || !lease.holder.trim()) refuse('lease holder unknown');
   if (lease.holder !== flags.session) refuse('session does not match lease holder');
   if (!Number.isFinite(Date.parse(lease.acquiredAt)) || isLeaseStale(lease, Date.now(), ttlMsFromFlags())) refuse('lease stale or undatable; re-acquire the lane');
-  const hold = checkLaneHold(dir, { action: 'reset', byHolder: true });
-  if (!hold.allowed) refuse(hold.reason);
   try { branchGit(['check-ref-format', `refs/heads/${name}`]); }
   catch { refuse('invalid --name for a git branch'); }
   // A clean filter runs on worktree content during `git status`, so a lane defining one is refused BEFORE the first
@@ -5795,6 +5793,9 @@ function cmdBranch(repo) {
   const staged = releaseEvidenceGit(['ls-files', '--stage', '-z'], dir);
   if (staged === null) refuse('staged index listing unreadable');
   if (staged.split('\0').some(entry => entry.startsWith('160000 '))) refuse('lane stages a submodule/gitlink; inspect it separately before branching');
+  // The hold check can run `git status` (laneStateSnapshot) in the lane, so it comes only AFTER the filter and gitlink guards.
+  const hold = checkLaneHold(dir, { action: 'reset', byHolder: true });
+  if (!hold.allowed) refuse(hold.reason);
   try {
     // Unlike tryGit/status fallbacks, a failed read must never mean clean or absent.
     const branches = branchGit(['for-each-ref', '--format=%(refname)', `refs/heads/${name}`]).split('\n');
@@ -5818,7 +5819,7 @@ function cmdBranch(repo) {
     return;
   }
   // --no-overwrite-ignore: an ignored local file the target commit tracks must never be silently overwritten.
-  try { branchGit(['switch', '--no-overwrite-ignore', '-c', name, commit]); }
+  try { branchGit(['switch', '--no-overwrite-ignore', '--no-recurse-submodules', '-c', name, commit]); }
   catch (error) { refuse(`git switch failed: ${String(error.message).replace(/[\p{Cc}\p{Cf}\u2028\u2029]/gu, ' ')}`); }
   process.stdout.write(`${name}\n`);
 }
