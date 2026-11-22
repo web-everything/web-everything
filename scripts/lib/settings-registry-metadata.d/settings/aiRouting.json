@@ -1,0 +1,6 @@
+{
+  "description": "AI role routing overrides; empty preserves existing resolvers.",
+  "owner": "scripts/settings/ai-routing.json",
+  "changeVia": "pr",
+  "instant": false
+}

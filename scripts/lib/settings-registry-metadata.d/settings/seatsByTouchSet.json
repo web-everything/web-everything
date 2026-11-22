@@ -1,0 +1,6 @@
+{
+  "description": "Select review seats using the touched paths.",
+  "owner": "scripts/settings/review.json",
+  "changeVia": "pr",
+  "instant": false
+}

@@ -1,0 +1,6 @@
+{
+  "description": "Configuration paths requiring guarded landing readiness.",
+  "owner": "scripts/settings/pr-land-ready.json",
+  "changeVia": "pr",
+  "instant": false
+}

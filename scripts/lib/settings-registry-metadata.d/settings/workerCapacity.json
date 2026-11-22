@@ -1,0 +1,6 @@
+{
+  "description": "Shadow worker load target and worker ceiling.",
+  "owner": "scripts/settings/worker-capacity.json",
+  "changeVia": "pr",
+  "instant": false
+}

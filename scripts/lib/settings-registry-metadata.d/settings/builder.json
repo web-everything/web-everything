@@ -1,0 +1,6 @@
+{
+  "description": "Health polling cadence while the builder is paused.",
+  "owner": "scripts/settings/builder-paused-poll.json",
+  "changeVia": "pr",
+  "instant": false
+}
