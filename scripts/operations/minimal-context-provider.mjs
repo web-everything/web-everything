@@ -150,7 +150,8 @@ export const LEAN_FIX_TOOLS = `${RESTRICTED_PROVIDER_TOOLS},Agent`;
  *  (`tools` absent = an event with no tool matcher). Each `script` (with its mode flag, where the blocking mode
  *  needs one) must appear as an exact token in a command hook of an entry whose matcher covers every listed
  *  tool. Matcher presence alone is not enough: an entry that survives with one guard dropped, swapped,
- *  renamed or narrowed off a lean tool fails the dispatch closed. Extend it here when a guard is added. */
+ *  renamed or narrowed off a lean tool fails the dispatch closed. Extend it here when a guard is added: a test
+ *  fails while any hook in the repo settings that covers a lean tool is not listed here. */
 const LEAN_EDIT_GUARDS = ['scripts/guard-lane.mjs', 'scripts/lint-locus-prefix.mjs --pre', 'scripts/lint-invisible-characters.mjs',
   'scripts/check-memory.mjs --pre', 'scripts/backlog-guard.mjs --pre', 'scripts/guard-backward-edge.mjs'];
 export const LEAN_FIX_REQUIRED_GUARDS = Object.freeze([
@@ -159,6 +160,9 @@ export const LEAN_FIX_REQUIRED_GUARDS = Object.freeze([
   { event: 'PreToolUse', tools: ['Agent'], scripts: ['scripts/guard-prep.mjs'] },
   { event: 'Stop', scripts: ['scripts/guard-stop-passive-wait.mjs'] },
   { event: 'SubagentStop', scripts: ['scripts/guard-stop-passive-wait.mjs', 'scripts/guard-stop-background-running.mjs'] },
+  // The post-edit checks (post-mode lint and backlog guard, touch record) run after every Edit/Write too.
+  { event: 'PostToolUse', tools: ['Edit', 'Write'],
+    scripts: ['scripts/lint-locus-prefix.mjs', 'scripts/readiness/record-touch.mjs', 'scripts/backlog-guard.mjs'] },
   // The broadcast hook is the operator's stop channel: it must fire after every lean tool and on every prompt.
   { event: 'PostToolUse', tools: LEAN_FIX_TOOLS.split(','), scripts: ['scripts/broadcast-inject.mjs'] },
   { event: 'UserPromptSubmit', scripts: ['scripts/broadcast-inject.mjs'] },

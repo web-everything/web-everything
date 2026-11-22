@@ -6,7 +6,7 @@ import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { buildAgentArgv, createTickReader, createDispatchSinks, reserveBuildLane, resolveDispatchSettingsEnv, DISPATCH_BASH_TIMEOUT_ENV } from '../dispatch-lane-io.mjs';
-import { LEAN_FIX_HOOKS_SETTINGS } from '../minimal-context-provider.mjs';
+import { LEAN_FIX_HOOKS_SETTINGS, LEAN_FIX_REQUIRED_GUARDS, LEAN_FIX_TOOLS } from '../minimal-context-provider.mjs';
 import { spawnPreventionLandingJob } from '../../lib/prevention-landing-job.mjs';
 import { NO_PROMPT_COMMAND_RULES } from '../../lib/no-prompt-command-rules.mjs';
 import { shapeDispatchRead, DISPATCH_EFFECT } from '../dispatch-lane.mjs';
@@ -138,6 +138,8 @@ describe('lean repair background argv', () => {
     'missing Agent|Task guard-prep': (h) => dropGuard(h, 'PreToolUse', 'Agent|Task', 'scripts/guard-prep.mjs'),
     'missing Stop guard (entry kept)': (h) => swapGuard(h, 'Stop', undefined, 'scripts/guard-stop-passive-wait.mjs', 'scripts/noop.mjs'),
     'missing SubagentStop background-running guard': (h) => dropGuard(h, 'SubagentStop', undefined, 'scripts/guard-stop-background-running.mjs'),
+    'missing PostToolUse Edit|Write backlog-guard (entry kept)': (h) => dropGuard(h, 'PostToolUse', 'Edit|Write', 'scripts/backlog-guard.mjs'),
+    'missing PostToolUse Edit|Write record-touch (entry kept)': (h) => dropGuard(h, 'PostToolUse', 'Edit|Write', 'scripts/readiness/record-touch.mjs'),
     'missing PostToolUse broadcast': (h) => dropGuard(h, 'PostToolUse', undefined, 'scripts/broadcast-inject.mjs'),
     'PostToolUse broadcast narrowed to Read': (h) => { entriesOf(h, 'PostToolUse', undefined).forEach(entry => { entry.matcher = 'Read'; }); },
     'missing UserPromptSubmit broadcast': (h) => { delete h.UserPromptSubmit; },
@@ -174,6 +176,36 @@ describe('lean repair background argv', () => {
       expect(() => buildAgentArgv(options('fix'))).not.toThrow();
     },
   );
+
+  // The manifest must name every hook the repo settings run on a lean tool, so a guard added to the settings
+  // and later dropped is caught too. Session bookkeeping events are not guards; any other event must be listed.
+  it('the required-guard manifest names every repo hook that covers a lean tool', () => {
+    const BOOKKEEPING_EVENTS = ['SessionStart', 'SessionEnd'];
+    const { hooks } = JSON.parse(fs.readFileSync(CANONICAL_SETTINGS, 'utf8'));
+    const manifestEvents = new Set(LEAN_FIX_REQUIRED_GUARDS.map(rule => rule.event));
+    expect(Object.keys(hooks).filter(event => !manifestEvents.has(event) && !BOOKKEEPING_EVENTS.includes(event))).toEqual([]);
+    const covers = (matcher, tool) => matcher === undefined || matcher === '' || matcher === '*'
+      || new RegExp(`^(?:${matcher})$`).test(tool);
+    // The guard a command runs: its last `scripts/…mjs` (with a mode flag), never the launcher or its repair hint.
+    const scriptOf = (command) => [...command.matchAll(/scripts\/[\w./-]+\.mjs(?: --[\w-]+)?/g)]
+      .map(match => match[0]).filter(script => !script.startsWith('scripts/hooks/')).at(-1);
+    const unlisted = [];
+    for (const event of manifestEvents) {
+      const rules = LEAN_FIX_REQUIRED_GUARDS.filter(rule => rule.event === event);
+      const tools = rules.some(rule => rule.tools) ? LEAN_FIX_TOOLS.split(',') : [undefined];
+      for (const tool of tools) {
+        const listed = rules.filter(rule => !rule.tools || rule.tools.includes(tool)).flatMap(rule => rule.scripts);
+        for (const entry of hooks[event] ?? []) {
+          if (tool !== undefined && !covers(entry.matcher, tool)) continue;
+          for (const hook of entry.hooks) {
+            const script = scriptOf(hook.command);
+            if (!listed.includes(script)) unlisted.push(`${event}${tool ? `[${tool}]` : ''} ${script ?? hook.command}`);
+          }
+        }
+      }
+    }
+    expect(unlisted).toEqual([]);
+  });
 
   it('accepts a required guard moved to a combined or catch-all matcher that still covers the lean tool', () => {
     const read = vi.mocked(LEAN_FIX_HOOKS_SETTINGS).getMockImplementation();

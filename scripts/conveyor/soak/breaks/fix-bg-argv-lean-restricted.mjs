@@ -17,6 +17,7 @@ const GUARD_FAULTS = [
   { event: 'PreToolUse', script: 'scripts/guard-lane.mjs' },
   { event: 'Stop', script: 'scripts/guard-stop-passive-wait.mjs' },
   { event: 'PostToolUse', script: 'scripts/broadcast-inject.mjs' },
+  { event: 'PostToolUse', script: 'scripts/backlog-guard.mjs' },
 ];
 const GUARDS = {
   Bash: ['guard-bash.mjs'],
