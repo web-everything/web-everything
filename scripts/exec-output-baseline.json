@@ -63,7 +63,6 @@
   "scripts/readiness/test-selection.mjs": 1,
   "scripts/session-replay.mjs": 2,
   "scripts/soak-replay-gate-cli.mjs": 1,
-  "scripts/sync-skills-deploy.mjs": 1,
   "scripts/verify-lane.mjs": 1,
   "scripts/wait-green.mjs": 1,
   "skills-src/conveyor/verify-daemon.mjs": 1
