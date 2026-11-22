@@ -3,7 +3,10 @@ bornAs: xqjl5lf
 kind: story
 size: 3
 parent: "3383"
-status: open
+status: closed
+closedReason: duplicate
+closedInto: "6202"
+dateClosed: "2026-11-22"
 locus: plateau-app
 blockedBy: ["4056", "4051"]
 scope: ["plateau:src/wip/types.ts", "plateau:src/wip/wip-model.ts", "plateau:src/wip/wip-model.test.ts", "plateau:src/wip/wip-view.ts", "plateau:src/wip/wip-view.css", "plateau:src/wip/wip-view.test.ts", "plateau:src/wip/wip-view.hostile.test.ts", "plateau:src/wip/wip-read.ts", "plateau:src/wip/wip-read.test.ts", "plateau:src/wip/fleet-read.ts", "plateau:src/wip/fleet-read.test.ts", "plateau:src/wip/wip-source.test.ts", "plateau:src/wip/wip-publish.test.ts", "plateau:src/wip/wip-live.test.ts", "plateau:src/wip/wip-relay-contract.test.ts", "plateau:wip-relay.js", "plateau:scripts/wip-relay.test.mjs", "plateau:tools/drain-daemon/daemon.mjs", "plateau:tools/drain-daemon/cli.mjs", "plateau:tools/drain-daemon/lib.mjs", "plateau:tools/drain-daemon/lib.test.mjs"]
