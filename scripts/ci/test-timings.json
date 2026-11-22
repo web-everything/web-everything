@@ -2386,6 +2386,8 @@
   "scripts/conveyor/soak/breaks/merge-watch-budget-starvation.soak.test.mjs": 0.51,
   "scripts/conveyor/soak/breaks/merge-watch-discovery-before-evidence.soak.test.mjs": 0.18,
   "scripts/conveyor/soak/breaks/no-ask-note-not-needs-decision.soak.test.mjs": 0.74,
+  "scripts/conveyor/soak/breaks/orphan-guard-bounded-per-pr.mjs": 1,
+  "scripts/conveyor/soak/breaks/orphan-guard-bounded-per-pr.soak.test.mjs": 2,
   "scripts/conveyor/soak/breaks/overlay-main-sync-corrupt-alerts.soak.test.mjs": 0.07,
   "scripts/conveyor/soak/breaks/pass-exit-leaves-process-group.soak.test.mjs": 0.28,
   "scripts/conveyor/soak/breaks/pass-reattach-during-launch.soak.test.mjs": 0.18,
