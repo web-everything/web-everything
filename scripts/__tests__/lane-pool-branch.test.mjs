@@ -1,6 +1,6 @@
 import { beforeEach, afterEach, expect, it } from 'vitest';
 import { execFileSync, spawnSync } from 'node:child_process';
-import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync, symlinkSync, copyFileSync, readdirSync, utimesSync, existsSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync, symlinkSync, copyFileSync, readdirSync, utimesSync, existsSync, renameSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { tmpdir } from 'node:os';
 
@@ -121,6 +121,11 @@ it.each([undefined, 'main', 'lane/../x', 'lane/a..b', '-x', 'lane/-x', 'lane/x\n
   refused({ name }, /name/);
 });
 it('refuses an existing branch', () => { git(lane, 'branch', 'lane/test'); refused({}, /already exists/); });
+it('refuses an existing dangling symbolic branch ref', () => {
+  mkdirSync(join(lane, '.git', 'refs', 'heads', 'lane'));
+  writeFileSync(join(lane, '.git', 'refs', 'heads', 'lane', 'test'), 'ref: refs/heads/missing\n');
+  refused({}, /already exists/);
+});
 it.each(['tracked', 'untracked', 'staged'])('refuses a dirty worktree (%s)', kind => {
   writeFileSync(join(lane, kind === 'untracked' ? 'new.txt' : 'file.txt'), 'dirty\n');
   if (kind === 'staged') git(lane, 'add', '.');
@@ -167,6 +172,88 @@ it('uses --ttl-minutes for leases without their own TTL', () => {
   writeFileSync(marker, JSON.stringify({ holder: 'holder', acquiredAt: new Date(Date.now() - 120_000).toISOString() }));
   refused({ 'ttl-minutes': 1 }, /lease stale/);
 });
+it.each([false, true])('cannot extend an expired legacy lease using --ttl-minutes (dry-run: %s)', dryRun => {
+  writeFileSync(marker, JSON.stringify({ holder: 'holder', acquiredAt: new Date(Date.now() - 300 * 60_000).toISOString() }));
+  refused({ 'ttl-minutes': 10000, 'dry-run': dryRun || undefined }, /lease stale/);
+});
+it.each(['refs', 'refs/heads', 'refs/heads/lane', 'refs/heads/lane/test',
+  'logs', 'logs/refs', 'logs/refs/heads', 'logs/refs/heads/lane', 'logs/refs/heads/lane/test', 'logs/HEAD'])('refuses a symlink in the branch ref/log path: %s', path => {
+  const target = join(lane, '.git', path);
+  const outside = join(root, 'outside-refs');
+  mkdirSync(dirname(target), { recursive: true });
+  if (existsSync(target)) renameSync(target, outside);
+  else if (!path.endsWith('/test')) mkdirSync(outside);
+  symlinkSync(outside, target); // The leaf case is deliberately dangling.
+  refused({}, /symlink/);
+  refused({ 'dry-run': true }, /symlink/);
+  expect(existsSync(join(outside, 'test'))).toBe(false);
+});
+it.each(['green', 'corrupt'])('keeps a %s verification hold when origin/main is forged at HEAD', status => {
+  git(lane, '-c', 'user.name=Test', '-c', 'user.email=test@example.com', 'commit', '--quiet', '--allow-empty', '-m', 'private');
+  const head = git(lane, 'rev-parse', 'HEAD');
+  git(lane, 'update-ref', 'refs/remotes/origin/main', head);
+  writeFileSync(join(lane, '.git', '.lane-verify'), status === 'corrupt' ? '{' : JSON.stringify({ sha: head, status, finishedAt: new Date().toISOString() }));
+  refused({}, /lane-hold/);
+  refused({ 'dry-run': true }, /lane-hold/);
+});
+it('does not clear a verification hold when fresh main cannot be fetched', () => {
+  writeFileSync(join(lane, '.git', '.lane-verify'), JSON.stringify({ sha: tip, status: 'green', finishedAt: new Date().toISOString() }));
+  renameSync(origin, `${origin}.unavailable`);
+  refused({}, /lane-hold/);
+});
+it.each(['sha1', 'sha256'])('clears a verification hold when fresh main contains HEAD (%s)', format => {
+  if (format === 'sha256') {
+    rmSync(root, { recursive: true, force: true });
+    setupFixture(format);
+  }
+  writeFileSync(join(lane, '.git', '.lane-verify'), JSON.stringify({ sha: tip, status: 'green', finishedAt: new Date().toISOString() }));
+  git(lane, 'update-ref', 'refs/remotes/origin/main', first);
+  // Main advances beyond the lane, so the proof must accept ancestry, not just equal tips.
+  git(primary, '-c', 'user.name=Test', '-c', 'user.email=test@example.com', 'commit', '--quiet', '--allow-empty', '-m', 'new main');
+  git(primary, 'push', '--quiet', origin, 'main');
+  const before = git(lane, 'show-ref');
+  const dryRun = run({ 'dry-run': true });
+  expect(dryRun.status, dryRun.stderr).toBe(0);
+  expect(git(lane, 'show-ref')).toBe(before);
+  const result = run();
+  expect(result.status, result.stderr).toBe(0);
+});
+it('clears a hold for work genuinely pushed to a lane branch', () => {
+  git(lane, '-c', 'user.name=Test', '-c', 'user.email=test@example.com', 'commit', '--quiet', '--allow-empty', '-m', 'pushed work');
+  const head = git(lane, 'rev-parse', 'HEAD');
+  git(lane, 'push', '--quiet', origin, 'HEAD:refs/heads/lane/pushed');
+  writeFileSync(join(lane, '.git', '.lane-verify'), JSON.stringify({ sha: head, status: 'green', finishedAt: new Date().toISOString() }));
+  const result = run();
+  expect(result.status, result.stderr).toBe(0);
+});
+it.each(['lane', 'template'])('does not trust a %s URL rewrite that makes private HEAD look like main', source => {
+  git(lane, '-c', 'user.name=Test', '-c', 'user.email=test@example.com', 'commit', '--quiet', '--allow-empty', '-m', 'private');
+  const head = git(lane, 'rev-parse', 'HEAD');
+  const attacker = join(root, 'attacker.git');
+  git(root, 'clone', '--quiet', '--bare', lane, attacker);
+  const env = {};
+  if (source === 'template') {
+    const template = join(root, 'template');
+    mkdirSync(template);
+    git(root, 'config', '--file', join(template, 'config'), `url.${attacker}.insteadOf`, origin);
+    env.GIT_TEMPLATE_DIR = template;
+  } else git(lane, 'config', `url.${attacker}.insteadOf`, origin);
+  git(lane, 'update-ref', 'refs/remotes/origin/main', head);
+  writeFileSync(join(lane, '.git', '.lane-verify'), JSON.stringify({ sha: head, status: 'green', finishedAt: new Date().toISOString() }));
+  refused({}, /lane-hold/, env);
+});
+it('journals a successful switch with its old and new heads, but never a dry-run or refusal', () => {
+  const journal = join(pool, 'fixture', '.lane-journal.jsonl');
+  expect(run({ from: first, 'dry-run': true }).status).toBe(0);
+  refused({ from: 'missing' }, /commit/);
+  expect(existsSync(journal)).toBe(false);
+  const result = run({ from: first });
+  expect(result.status, result.stderr).toBe(0);
+  const entries = readFileSync(journal, 'utf8').trim().split('\n').map(JSON.parse);
+  expect(entries).toHaveLength(1);
+  expect(entries[0]).toMatchObject({ action: 'branch-switch', lane: 1, headBefore: tip, headAfter: first });
+  expect(entries[0].reason).toContain('lane/test');
+});
 it('honours a renewed lease', () => {
   writeFileSync(marker, JSON.stringify({ holder: 'holder', acquiredAt: '2000-01-01T00:00:00Z', renewedAt: new Date().toISOString() }));
   const result = run();
@@ -210,7 +297,7 @@ it('rejects --from on acquire as an unknown flag before any mutation', () => {
   expect(readFileSync(marker, 'utf8')).toBe(lease);
   expect(git(lane, 'branch', '--show-current')).toBe('main');
 });
-it.each(['changed', 'removed', 'corrupt', 'expired'])('rechecks ownership before switching when lease is %s', state => {
+it.each(['changed', 'removed', 'corrupt', 'expired', 'legacy-expired'])('rechecks ownership before switching when lease is %s', state => {
   const preload = join(root, 'change-lease.mjs');
   writeFileSync(preload, `
     import fs from 'node:fs';
@@ -226,6 +313,7 @@ it.each(['changed', 'removed', 'corrupt', 'expired'])('rechecks ownership before
           const lease = JSON.parse(original(path, 'utf8'));
           if (state === 'changed') lease.holder = 'someone-else';
           else { lease.acquiredAt = '2000-01-01T00:00:00Z'; delete lease.renewedAt; }
+          if (state === 'legacy-expired') delete lease.ttlMinutes;
           fs.writeFileSync(path, JSON.stringify(lease));
         }
       }
@@ -233,7 +321,7 @@ it.each(['changed', 'removed', 'corrupt', 'expired'])('rechecks ownership before
     };
     syncBuiltinESMExports();
   `);
-  refused({}, /lease.*(holder changed|unreadable)/, {
+  refused(state === 'legacy-expired' ? { 'ttl-minutes': 1e9 } : {}, /lease.*(holder changed|unreadable)/, {
     NODE_OPTIONS: `--import=${preload}`, TEST_LEASE: marker, TEST_LEASE_STATE: state,
   });
 });
@@ -267,6 +355,8 @@ it.each([false, true])('refuses a lane that defines a Git filter driver before a
   writeFileSync(join(lane, '.git', 'info', 'attributes'), 'file.txt filter=sneaky\n');
   const future = new Date(Date.now() + 5000);
   utimesSync(join(lane, 'file.txt'), future, future);
+  // A corrupt marker forces the hold reader to inspect work state, including status.
+  writeFileSync(join(lane, '.git', '.lane-verify'), '{');
   refused(dryRun ? { 'dry-run': true } : {}, /filter driver/);
   expect(existsSync(ran)).toBe(false);
 });

@@ -110,6 +110,8 @@ import {
   DEFAULT_LEASE_TTL_MINUTES,
   WORKFLOW_LANE_PURPOSE,
   isLeaseStale,
+  laneHoldNeedsWorkState,
+  laneHoldVerdict,
   isReservedLease,
   isLaneAcquirable,
   leaseDisqualifiesAcquire,
@@ -5744,6 +5746,34 @@ function cmdReclaimSalvage(repo, { n, dir, dryRun, lease, proof }) {
 // silences a lane number — it silences THIS content, and the moment the lane's content changes (new work
 // lands, or a fresh `acquire`/`reclaim` resets it for reuse), the old decision stops applying on its own and
 // the lane is free to resurface if it once again needs one.
+// A hold may be cleared only by remote heads (including main) fetched into a private repository. Never trust lane-owned
+// tracking refs, FETCH_HEAD, config, grafts or replacement refs for this proof (including in dry-run).
+function branchHeadOnFreshRemote(repo, dir, head) {
+  if (!repo.originUrl || !/^(?:[a-f0-9]{40}|[a-f0-9]{64})$/.test(head || '')) return false;
+  const remote = /^[^/]*:/.test(repo.originUrl) ? repo.originUrl : resolve(repo.originUrl);
+  let probeDir;
+  try {
+    probeDir = mkdtempSync(join(tmpdir(), 'lane-branch-main-'));
+    const env = laneGitHardeningEnv({
+      ...scrubGitRepoEnv(process.env), GIT_CONFIG_GLOBAL: '/dev/null', GIT_CONFIG_SYSTEM: '/dev/null',
+      GIT_CONFIG_NOSYSTEM: '1', GIT_CEILING_DIRECTORIES: dirname(probeDir),
+    }, { remoteProbe: true });
+    env.GIT_ALLOW_PROTOCOL = 'https:http:git:ssh';
+    if (remote.startsWith('/') || remote.startsWith('file://')) env.GIT_ALLOW_PROTOCOL += ':file';
+    const run = args => git(args, probeDir, { env, timeout: 20_000, maxBuffer: 1024 * 1024 });
+    // A SHA-256 lane needs the same object format in the proof repository.
+    const format = releaseEvidenceGit(['rev-parse', '--show-object-format'], dir);
+    if (!['sha1', 'sha256'].includes(format)) return false;
+    run(['init', '--bare', '--quiet', '--template=', `--object-format=${format}`]);
+    run(['fetch', '--no-tags', '--no-recurse-submodules', '--no-write-fetch-head', '--no-auto-maintenance',
+      '--', remote, 'refs/heads/*:refs/heads/proof/*', '^refs/heads/ops/*']);
+    run(['rev-parse', '--verify', `refs/heads/proof/${repo.branch}^{commit}`]);
+    // A genuinely pushed lane branch also preserves work; only freshly fetched refs may vouch for it.
+    return run(['rev-list', '--max-count=1', head, '--not', '--glob=refs/heads/proof/*']) === '';
+  } catch { return false; } // Missing main, a timeout or unreadable evidence keeps the hold.
+  finally { if (probeDir) rmSync(probeDir, { recursive: true, force: true }); }
+}
+
 // A branch is created only in an independently cloned lane held by this exact holder.
 // No lease branch field exists in leaseBody; leave the marker byte-for-byte unchanged.
 function cmdBranch(repo) {
@@ -5781,9 +5811,9 @@ function cmdBranch(repo) {
   if (!lease) refuse('lane is unleased');
   if (typeof lease.holder !== 'string' || !lease.holder.trim()) refuse('lease holder unknown');
   if (lease.holder !== flags.session) refuse('session does not match lease holder');
-  if (!Number.isFinite(Date.parse(lease.acquiredAt)) || isLeaseStale(lease, Date.now(), ttlMsFromFlags())) refuse('lease stale or undatable; re-acquire the lane');
-  const hold = checkLaneHold(dir, { action: 'reset', byHolder: true });
-  if (!hold.allowed) refuse(hold.reason);
+  // A command-line TTL may tighten a legacy lease, but cannot renew or extend its persisted/default expiry.
+  const branchTtlMs = Math.min(ttlMsFromFlags(), DEFAULT_LEASE_TTL_MINUTES * 60_000);
+  if (!Number.isFinite(Date.parse(lease.acquiredAt)) || isLeaseStale(lease, Date.now(), branchTtlMs)) refuse('lease stale or undatable; re-acquire the lane');
   try { branchGit(['check-ref-format', `refs/heads/${name}`]); }
   catch { refuse('invalid --name for a git branch'); }
   // A clean filter runs on worktree content during `git status`, so a lane defining one is refused BEFORE the first
@@ -5795,6 +5825,26 @@ function cmdBranch(repo) {
   const staged = releaseEvidenceGit(['ls-files', '--stage', '-z'], dir);
   if (staged === null) refuse('staged index listing unreadable');
   if (staged.split('\0').some(entry => entry.startsWith('160000 '))) refuse('lane stages a submodule/gitlink; inspect it separately before branching');
+  const assertRefPaths = () => {
+    // lstat sees dangling links too. Check each ancestor, plus reflog paths which switch also writes.
+    for (const relative of [`refs/heads/${name}`, `logs/refs/heads/${name}`, 'logs/HEAD']) {
+      let path = join(dir, '.git');
+      const parts = relative.split('/');
+      for (const [i, part] of parts.entries()) {
+        path = join(path, part);
+        let stat;
+        try { stat = lstatSync(path); }
+        catch (error) {
+          if (error.code === 'ENOENT') break;
+          refuse('branch ref/log path unreadable');
+        }
+        if (stat.isSymbolicLink()) refuse('branch ref/log path contains a symlink');
+        if (i < parts.length - 1 && !stat.isDirectory()) refuse('branch ref/log parent is not a directory');
+        if (i === parts.length - 1 && relative.startsWith('refs/')) refuse('branch already exists (including an unresolved ref)');
+      }
+    }
+  };
+  assertRefPaths();
   try {
     // Unlike tryGit/status fallbacks, a failed read must never mean clean or absent.
     const branches = branchGit(['for-each-ref', '--format=%(refname)', `refs/heads/${name}`]).split('\n');
@@ -5809,10 +5859,22 @@ function cmdBranch(repo) {
   try { commit = branchGit(['rev-parse', '--verify', `${from}^{commit}`]); }
   catch { refuse('--from does not resolve to a commit'); }
   if (!/^(?:[a-fA-F0-9]{40}|[a-fA-F0-9]{64})$/.test(commit)) refuse('--from commit unreadable');
+  const headBefore = branchGit(['rev-parse', '--verify', 'HEAD']);
+  const settings = resolveLaneHoldSettings({ env: process.env });
+  // Read only the hold signals here. Supplying unpushed=false prevents the shared reader's status/local-ref
+  // fallback; this provisional verdict never authorizes a switch until the fresh-main check below finishes.
+  const hold = checkLaneHold(dir, { action: 'reset', byHolder: true, settings, unpushed: false });
+  if (!hold.allowed) refuse(hold.reason);
+  if (laneHoldNeedsWorkState(hold.facts, settings)) {
+    const pushed = hold.facts.revision === headBefore && branchHeadOnFreshRemote(repo, dir, headBefore);
+    const verifiedHold = laneHoldVerdict({ ...hold.facts, unpushed: !pushed }, settings);
+    if (!verifiedHold.allowed) refuse(`${verifiedHold.reason}; HEAD not proven by freshly fetched remote heads`);
+  }
   const current = readLease(dir, () => refuse('lease unreadable before switch'));
   if (!current || current.holder !== lease.holder
     || !Number.isFinite(Date.parse(current.acquiredAt))
-    || isLeaseStale(current, Date.now(), ttlMsFromFlags())) refuse('lease holder changed or lease stale before switch');
+    || isLeaseStale(current, Date.now(), branchTtlMs)) refuse('lease holder changed or lease stale before switch');
+  assertRefPaths();
   if (flags['dry-run']) {
     process.stdout.write(`would create ${name} at ${commit} in lane-${n}\n`);
     return;
@@ -5820,6 +5882,10 @@ function cmdBranch(repo) {
   // --no-overwrite-ignore: an ignored local file the target commit tracks must never be silently overwritten.
   try { branchGit(['switch', '--no-overwrite-ignore', '-c', name, commit]); }
   catch (error) { refuse(`git switch failed: ${String(error.message).replace(/[\p{Cc}\p{Cf}\u2028\u2029]/gu, ' ')}`); }
+  journalLaneEvent(dir, {
+    action: 'branch-switch', before: { head: headBefore, dirty: 0, workDirty: 0 }, headAfter: laneHead(dir),
+    reason: `created ${name} at ${commit}`, leaseSession: lease.session, holder: lease.holder,
+  });
   process.stdout.write(`${name}\n`);
 }
 
