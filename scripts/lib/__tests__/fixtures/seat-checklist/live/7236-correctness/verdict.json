@@ -1,0 +1,38 @@
+{
+ "_type": "https://in-toto.io/Statement/v1",
+ "subject": [
+  {
+   "name": "web-everything/web-everything#7236",
+   "uri": "https://github.com/web-everything/web-everything/pull/7236",
+   "digest": {
+    "gitCommit": "6a28dc635352f022f9be6e6686d35074599cad8d"
+   }
+  }
+ ],
+ "predicateType": "https://everstandards.dev/core/verdict/v0.1",
+ "predicate": {
+  "verdict": "pass",
+  "policy": {
+   "uri": "https://github.com/plateauapp/plateau-settings/blob/main/review/rubric-policy/company",
+   "digest": {
+    "sha256": "538b129b2ab2b5f60bf6ae71918400aa7543f6d3458e219ef82b993d07be1c90"
+   }
+  },
+  "evaluatedAt": "2026-11-22T09:40:00-05:00",
+  "evaluator": "https://github.com/plateauapp/plateau-settings/blob/main/review/fixtures/security-seat",
+  "examined": {
+   "count": 2,
+   "unit": "criteria"
+  },
+  "evidence": [
+   {
+    "kind": "https://everstandards.dev/core/assessment/v0.1",
+    "uri": "assessment.json",
+    "digest": {
+     "sha256": "71075209458ee5acddbd936abbae5eba39f725d8f3a3ca97ad0e9b7ad949410f"
+    },
+    "provenanceTier": "replayed"
+   }
+  ]
+ }
+}

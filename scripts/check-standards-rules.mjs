@@ -4455,6 +4455,8 @@ export const LEASH_PIN_SNAPSHOT = Object.freeze([
   'deliveryPolicyDefaults.ts',
   'card-ledger-trust.json',
   'card-ledger-legacy-identities.json',
+  'seat-assessment.test.mjs',
+  'seat-ac-rubric.test.mjs',
 ]);
 
 /** A REAL-shaped diff section for `path` whose only change is whitespace — exactly the hunk a content trigger
