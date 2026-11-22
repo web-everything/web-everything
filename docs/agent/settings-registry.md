@@ -16,9 +16,9 @@ For repo defaults, edit the owner file through a PR and rebuild the consuming da
 
 ## Summary
 
-- Top-level keys: 164 (166 declaration rows).
-- Declared leaves: 593 (platform copies counted separately).
-- Instant top-level keys: 1; not instant: 163.
+- Top-level keys: 165 (167 declaration rows).
+- Declared leaves: 617 (platform copies counted separately).
+- Instant top-level keys: 1; not instant: 164.
 - Instant capacity leaves: 15.
 - Constants to settle: 312.
 - Instant gaps: 28.
@@ -169,6 +169,7 @@ Operator-prefs layer: ~/.plateau/platform-preferences.json is the requested oper
 | prepareStaleHours | scripts/settings/coroner-postmortem.json | 1 | 24 | pr | no | Age in hours at which preparation is treated as stale. |
 | prevention | scripts/settings/prevention-batch.json | 4 | {"$comment":"batchFiling enables rolling prevention PRs; fa… | pr | no | Prevention card batching and filing limits. |
 | providerCapacity | scripts/settings/provider-capacity.json | 1 | {"providers":[{"id":"codex","launcher":"codex","tier":3,"al… | pr | no | Provider/account quota windows, readers, reserves, banked resets and minimum tiers for capacity-based routing. |
+| providerRotation | scripts/settings/provider-rotation.json | 24 | {"mode":"shadow","catalog":[{"provider":"codex","model":"gp… | pr | no | Pure provider rotation input: mode, arm catalog/shares, identity families, exhaustion/reserve bounds, strong/small guards and Carbon promotion evidence. |
 | quarantine | scripts/settings/card-ledger-trust.json | 1 | [] | pr | no | Quarantined card-ledger identities. |
 | raisedByMigrate | scripts/settings/raised-by-migrate.json | 1 | {"maxPrsPerRun":10} | pr | no | Maximum PRs attempted per raised-by migration apply run. |
 | readyRecordPath | scripts/settings/prototype-load.json | 1 | "~/workspace/.operations/coordination/fix-ready.jsonl" | pr | no | Fix readiness coordination record location. |
