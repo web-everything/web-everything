@@ -6,7 +6,7 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 import { cascadePolicy } from '../policy-cascade.mjs';
 import { resolveCoordinationRoot } from '../../operations/coordination-root.mjs';
 import { completionPath, listCompletionSessions, tryReadCompletion, resolveCompletionsDir } from '../../operations/completion-store.mjs';
-import { reserve, releaseLockDir } from '../../readiness/file-locks.mjs';
+import { reserve, readLockEntry, releaseLockDirIf } from '../../readiness/file-locks.mjs';
 import definition from './review-definition.mjs';
 import { load, plan, transitionRecord, appendTransition, canonicalJSON } from './index.mjs';
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '../../..');
@@ -56,7 +56,7 @@ export async function shadowReviewStep({ repo, pr, classified, session, completi
   now = () => new Date().toISOString(), log = message => console.error(message),
 } = {}) {
   const note = message => { try { log(message.replace(/[\x00-\x1f\x7f]/g, ' ')); } catch { /* diagnostic only */ } };
-  let lockRoot, locked = false;
+  let lockRoot, lockOwner, locked = false;
   try {
     const setting = resolveFlowShadow(env, { tool, readSetting });
     note(`flow-v0 shadow settings ${JSON.stringify(setting)}`);
@@ -90,7 +90,8 @@ export async function shadowReviewStep({ repo, pr, classified, session, completi
     lockRoot = join(lockRoot, createHash('sha256').update(resource).digest('hex'));
     const stamp = now();
     const lockTime = Date.now(); // Lease age must use wall time, independently of evidence timestamps.
-    locked = reserve(lockRoot, 'append', `${process.pid}:${lockTime}:${Math.random()}`, lockTime, new Date(lockTime).toISOString()).ok;
+    lockOwner = `${process.pid}:${lockTime}:${Math.random()}`;
+    locked = reserve(lockRoot, 'append', lockOwner, lockTime, new Date(lockTime).toISOString()).ok;
     if (!locked) throw Error('shadow log busy; skipped; operator may retry observation');
     logStat = checkPath(logPath); // Recheck size after acquiring the shared lock.
     const archives = readdirSync(dirname(logPath)).filter(n => n.startsWith(basename(logPath) + '.') && /^\d+$/.test(n.slice(basename(logPath).length + 1)))
@@ -114,10 +115,10 @@ export async function shadowReviewStep({ repo, pr, classified, session, completi
     const steps = engine.plan(flow, projection);
     const actualOutcome = classified?.outcome === 'auto-cleared' && classified.loopOutcome === 'converged' ? 'accept' : classified?.outcome === 'bounced' ? 'continue' : null;
     // The declared Visit key part carries this visit's attempt (the review subset permits one).
-    const actual = { from: 'judge-convergence', guard: 'convergence', outcome: actualOutcome,
+    const actual = { from: 'judge-convergence', event: 'done', guard: 'convergence', outcome: actualOutcome,
       route: actualOutcome ? 'advance' : null, to: actualOutcome === 'accept' ? 'accepted' : actualOutcome === 'continue' ? 'judge-convergence' : null,
       key: `review:${encodeURIComponent(`${repo}#${pr}`)}:${seq}.1`, attempt: 1 };
-    const fullStep = step => Object.fromEntries(['from', 'guard', 'outcome', 'route', 'to', 'key', 'attempt'].map(k => [k, step[k]]));
+    const fullStep = step => Object.fromEntries(['from', 'event', 'guard', 'outcome', 'route', 'to', 'key', 'attempt'].map(k => [k, step[k]]));
     const planned = steps.map(fullStep);
     const agreement = steps.length === 1 && comparePlans(planned[0], actual).equal;
     note(`flow-v0 shadow ${canonicalJSON({ repo, pr, seq, steps: planned, actual, agreement })}`);
@@ -140,5 +141,5 @@ export async function shadowReviewStep({ repo, pr, classified, session, completi
       if (!await engine.appendTransition(logPath, record)) note('flow-v0 shadow append failed; operator must inspect review-loop log');
     }
   } catch (e) { note(`flow-v0 shadow failed; operator must inspect evidence: ${String(e?.message ?? e)}`); }
-  finally { if (locked) { try { releaseLockDir(lockRoot, 'append'); } catch { /* best effort */ } } }
+  finally { if (locked) { try { const held = readLockEntry(lockRoot, 'append'); if (held?.owner === lockOwner) releaseLockDirIf(lockRoot, 'append', held); } catch { /* best effort */ } } }
 }

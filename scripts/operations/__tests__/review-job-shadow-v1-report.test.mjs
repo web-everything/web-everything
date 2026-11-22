@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { mkdtempSync, readFileSync, rmSync, writeFileSync, readdirSync } from 'node:fs';
+import { mkdtempSync, readFileSync, rmSync, writeFileSync, readdirSync, realpathSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createReviewJobIo } from '../review-job.mjs';
@@ -109,12 +109,43 @@ describe('S1 full-step evidence', () => {
     const finding = rows(logFile() + '.findings.jsonl')[0];
     const planned = JSON.parse(finding.planned), actual = JSON.parse(finding.actual);
     expect(finding).toMatchObject({ repo: 'o/r', pr: '7', seq: 1 });
-    expect(Object.keys(actual).sort()).toEqual(['attempt', 'from', 'guard', 'key', 'outcome', 'route', 'to']);
+    expect(Object.keys(actual).sort()).toEqual(['attempt', 'event', 'from', 'guard', 'key', 'outcome', 'route', 'to']);
     expect(planned).toEqual({ ...actual, key: actual.key + '-wrong' });
     expect(actual.key).toBe('review:o%2Fr%237:1.1');
     expect(finding.actual).toBe(engine.canonicalJSON(actual));
     expect(finding.planned).toBe(engine.canonicalJSON(planned));
     expect(rows(logFile())[0].predicate.agreement).toBe(false);
+  });
+
+  it('event-only difference reads as disagree and opens a finding', async () => {
+    runReport(flags);
+    const real = await vi.importActual('../../lib/flow-engine/shadow.mjs');
+    const engine = await import('../../lib/flow-engine/index.mjs');
+    await real.shadowReviewStep({ repo: flags.repo, pr: flags.pr, session: flags.session,
+      classified: { ...flags, loopOutcome: flags.verdict } }, {
+      readSetting, log: () => {}, engine: { ...engine, plan: (flow, p) => engine.plan(flow, p).map(s => ({ ...s, event: 'other' })) },
+    });
+    expect(rows(logFile() + '.findings.jsonl')).toHaveLength(1);
+    expect(rows(logFile())[0].predicate.agreement).toBe(false);
+  });
+
+  it('never releases a lock another observer now holds', async () => {
+    runReport(flags);
+    const real = await vi.importActual('../../lib/flow-engine/shadow.mjs');
+    const engine = await import('../../lib/flow-engine/index.mjs');
+    const { reserve, readLockEntry, releaseLockDir } = await import('../../readiness/file-locks.mjs');
+    const locks = join(realpathSync(dir), '.flow-v0-shadow-locks');
+    let lockRoot;
+    await real.shadowReviewStep({ repo: flags.repo, pr: flags.pr, session: flags.session,
+      classified: { ...flags, loopOutcome: flags.verdict } }, {
+      readSetting, log: () => {}, engine: { ...engine, appendTransition: async (...a) => {
+        lockRoot = join(locks, readdirSync(locks)[0]);
+        releaseLockDir(lockRoot, 'append');
+        reserve(lockRoot, 'append', 'successor', Date.now(), new Date().toISOString());
+        return engine.appendTransition(...a);
+      } },
+    });
+    expect(readLockEntry(lockRoot, 'append')?.owner).toBe('successor');
   });
 
   it.each(['bounced', 'auto-cleared'])('shadow on/off preserves %s runReport result, completion and exit behavior', async outcome => {
