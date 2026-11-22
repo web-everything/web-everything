@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { mkdtempSync, writeFileSync, readFileSync, readdirSync, rmSync, mkdirSync, utimesSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { PROVIDER_DEFAULTS, readProviderCapacity, scoreProvider, chooseBuilder, burnWindows, planLine, calendarReset } from './provider-capacity.mjs';
+import { PROVIDER_DEFAULTS, readProviderCapacity, scoreProvider, chooseBuilder, burnWindows, planLine, calendarReset, launcherCapacity } from './provider-capacity.mjs';
 import { effectiveBuilder } from './routing-settings.mjs';
 import { resolveFixExecutorChain, pickChainRung } from './fix-executor-chain.mjs';
 import { recordCapacityDecision, observeCapacity } from './provider-capacity-io.mjs';
@@ -62,8 +62,7 @@ test('rollout tails are bounded and missing or changed quota evidence stays unkn
     assert.equal(readCodexQuota(env), null); // Outside the tail: refresh the rollout or use an operator reading.
     writeFileSync(file, `${'x'.repeat(300 * 1024)}\n${rolloutLine(now)}\n`);
     assert.equal(readCodexQuota(env).used_percent, 94);
-    for (const change of [e => delete e.timestamp, e => e.timestamp = 'bad',
-      e => delete e.payload.rate_limits.primary.window_minutes,
+    for (const change of [e => delete e.payload.rate_limits.primary.window_minutes,
       e => delete e.payload.rate_limits.primary.resets_at,
       e => e.payload.rate_limits.primary.used_percent = '94',
       e => e.payload.rate_limits.primary.used_percent = 101,
@@ -178,8 +177,8 @@ test('all readers failing preserves historical threshold fallback and repair cha
   const out = effectiveBuilder({ repo, env: {}, capacity, now, quota: () => null, record: () => {} });
   assert.equal(out.builder, 'claude'); assert.equal(out.decision.reason, 'all-readers-unknown');
   assert.deepEqual(chain(capacity), ['claude']);
-  assert.deepEqual(resolveFixExecutorChain({ repo, platform: {}, env: {}, capacity, now, quota: () => ({ used_percent: 27 }), record: () => {} }).value, ['codex', 'codex-alt', 'claude']);
-  assert.equal(effectiveBuilder({ repo, env: {}, capacity, now, quota: () => ({ used_percent: 27 }), record: () => {} }).builder, 'codex');
+  assert.deepEqual(resolveFixExecutorChain({ repo, platform: {}, env: {}, capacity, now, quota: () => ({ at: now, used_percent: 27 }), record: () => {} }).value, ['codex', 'codex-alt', 'claude']);
+  assert.equal(effectiveBuilder({ repo, env: {}, capacity, now, quota: () => ({ at: now, used_percent: 27 }), record: () => {} }).builder, 'codex');
 });
 test('explicit builders bypass capacity and disabled auto retains threshold', () => {
   assert.equal(effectiveBuilder({ repo: { routing: { builder: 'codex' } }, env: {}, capacity: [], quota: () => { throw Error(); } }).builder, 'codex');
@@ -210,7 +209,7 @@ test('unknown fallback still rejects held, inactive, disallowed and below-tier C
 test('operator seed only wins against missing or older live Codex readings', () => {
   const settings = { providers: [{ ...providers[0], operatorReading: {
     asOf: now - hour, usedPercent: 10, resetsAt: now + 120 * hour } }] };
-  for (const at of [undefined, null, now]) {
+  for (const at of [now - 1000, now]) {
     const live = readProviderCapacity({ now, settings,
       readers: { codex: () => ({ at, used_percent: 85, resets_at: now + 120 * hour }) } });
     assert.equal(live[0].windows[0].usedPercent, 85);
@@ -282,7 +281,7 @@ test('pace ahead penalizes and behind boosts; long work prefers remaining absolu
   assert.equal(choose([cap('codex', 27, 2), cap('claude', 10, 120)], { longKinds: ['build'] }, 'build').provider, 'claude');
 });
 test('stale, expired, malformed usage and configured resets remain unknown; tightest live window binds', () => {
-  const readers = { codex: () => ({ used_percent: 27, resets_at: (now + 2 * hour) / 1000, secondary: { used_percent: 80, resets_at: (now + 100 * hour) / 1000 } }),
+  const readers = { codex: () => ({ at: now, used_percent: 27, resets_at: (now + 2 * hour) / 1000, secondary: { used_percent: 80, resets_at: (now + 100 * hour) / 1000 } }),
     claude: () => ({ at: new Date(now - 7 * hour).toISOString(), five_hour: { used_percentage: 5, resets_at: new Date(now + hour).toISOString() } }) };
   const cs = readProviderCapacity({ now, readers, settings: { providers, calendar: { claude: { weekly: 'Thu 14:00 America/New_York' } } } });
   assert.equal(cs[0].windows.length, 2); assert.equal(scoreProvider(cs[0], 'fix').usedPercent, 80);
@@ -290,7 +289,7 @@ test('stale, expired, malformed usage and configured resets remain unknown; tigh
   assert.equal(claude.known, false); assert.equal(claude.windows[0].source, 'configured');
   assert.equal(calendarReset('Thu 14:00 America/New_York', now), Date.parse('2026-11-19T19:00:00Z'));
   assert.equal(calendarReset('99:00 Invalid/Zone', now), null);
-  const expired = readProviderCapacity({ now, readers: { codex: () => ({ used_percent: 0, resets_at: now / 1000 }) } });
+  const expired = readProviderCapacity({ now, readers: { codex: () => ({ at: now, used_percent: 0, resets_at: now / 1000 }) } });
   assert.equal(expired[0].known, false);
 });
 test('agy requires allowlisting; unknown emergency requires explicit opt-in and no scored alternative', () => {
@@ -442,4 +441,61 @@ test('multi-account routing scores only the live reader account and logs attribu
   assert.equal(Object.hasOwn(selected, 'account'), false);
   assert.equal(decisions.at(-1).account, 'claude-b');
   assert.deepEqual(decisions.at(-1).inputs.filter(i => i.provider === 'claude').map(i => i.account), ['claude-b']);
+});
+
+
+test('threshold fallback rejects expired, undated and excessively future Codex evidence', () => {
+  const capacity = readProviderCapacity({ now, settings: { providers } });
+  for (const at of [now - 24 * hour - 1, now + 60001, undefined, 'invalid']) {
+    const out = effectiveBuilder({ repo, env: {}, capacity, now,
+      quota: () => ({ at, used_percent: 1 }), record: () => {} });
+    assert.equal(out.builder, 'claude');
+    assert.equal(out.decision.reason, 'all-readers-unknown');
+    assert.equal(out.usedPercent, null);
+  }
+  for (const at of [now, now + 60000]) {
+    assert.equal(effectiveBuilder({ repo, env: {}, capacity, now,
+      quota: () => ({ at, used_percent: 1 }), record: () => {} }).builder, 'codex');
+  }
+});
+
+test('only codex-rollout readers permit 60 seconds of future timestamp skew', () => {
+  const claude = providers.find(p => p.id === 'claude');
+  for (const at of [now + 1, now + 60000]) {
+    const [observation] = readProviderCapacity({ now, settings: { providers: [claude] },
+      readers: { claude: () => ({ at, seven_day: { used_percentage: 20, resets_at: now + hour } }) } });
+    assert.equal(observation.known, false);
+    const [codex] = readProviderCapacity({ now, settings: { providers: [providers[0]] },
+      readers: { codex: () => ({ at, used_percent: 20, resets_at: now + hour }) } });
+    assert.equal(codex.known, true);
+  }
+});
+
+test('Codex live readings require timestamp age evidence even when quota and reset are valid', () => {
+  for (const at of [undefined, null, 'invalid']) {
+    const [observation] = readProviderCapacity({ now, settings: { providers: [providers[0]] },
+      readers: { codex: () => ({ at, used_percent: 20, resets_at: now + hour }) } });
+    assert.equal(observation.known, false);
+    assert.equal(scoreProvider(observation, 'fix').label, 'unknown');
+  }
+});
+
+test('unmapped explicit Claude identity cannot restore the legacy account operator seed at launch', () => {
+  const claude = PROVIDER_DEFAULTS.providers.find(p => p.id === 'claude');
+  const settings = { claudeUsageAccount: 'claude-a', providers: [{ ...claude,
+    accounts: claude.accounts.map(a => ({ ...a, operatorReading: {
+      asOf: now - hour, usedPercent: 10, resetsAt: now + 120 * hour,
+    } })),
+  }] };
+  const read = account => readProviderCapacity({ now, settings,
+    readers: { claude: () => ({ account, at: now, seven_day: { used_percentage: 20, resets_at: now + 120 * hour } }) } });
+  for (const identity of ['unmapped', 'toString']) {
+    const [routable] = launcherCapacity(read(identity), settings);
+    assert.equal(routable.account, null);
+    assert.equal(routable.known, false);
+    assert.deepEqual(routable.windows, []);
+  }
+  const [legacy] = launcherCapacity(read(undefined), settings);
+  assert.equal(legacy.account, 'claude-a');
+  assert.equal(legacy.known, true);
 });

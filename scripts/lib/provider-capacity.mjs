@@ -17,6 +17,13 @@ const lengths = { five_hour: 5, seven_day: 168, daily: 24, weekly: 168 };
 const windowKey = name => name === 'seven_day' ? 'weekly' : name;
 const epoch = v => typeof v === 'number' ? (v < 1e12 ? v * 1000 : v) : Date.parse(v);
 const options = s => ({ ...CAPACITY_DEFAULTS, ...(s?.routing?.capacity ?? s ?? {}) });
+/** Live evidence needs an age; only actively appended Codex rollouts allow read-time skew. */
+export function liveReadingTimestampValid(raw, now, { codexRollout = false, staleHours = CAPACITY_DEFAULTS.staleHours } = {}) {
+  const at = epoch(raw?.at ?? raw?.asOf ?? raw?.mtime);
+  return Number.isFinite(at) && at <= now + (codexRollout ? 60000 : 0)
+    && now - at <= Math.min(24, staleHours) * HOUR;
+}
+
 export const bindingWindow = cap => cap.windows.filter(w => Number.isFinite(w.usedPercent))
   .reduce((a, b) => !a || b.usedPercent > a.usedPercent ? b : a, null);
 
@@ -48,15 +55,15 @@ export function readProviderCapacity({ env = {}, now = Date.now(), readers = {},
         ? raw?.account == null ? s.claudeUsageAccount
           : typeof raw.account === 'string' && Object.hasOwn(s.claudeAccountMap ?? {}, raw.account) ? s.claudeAccountMap[raw.account] : null
         : null;
+      const usageIdentityRejected = owner.id === 'claude' && Boolean(owner.accounts) && raw?.account != null
+        && !owner.accounts.some(a => a.id === usageAccount);
       if (owner.id === 'claude' && owner.accounts && usageAccount !== account.id) raw = null;
       const at = epoch(raw?.at ?? raw?.asOf ?? raw?.mtime);
       const seed = env.WE_CAPACITY_READERS === 'off' ? undefined : def.operatorReading, seedAt = epoch(seed?.asOf);
       const operatorReadingStale = Boolean(seed) && (!Number.isFinite(seedAt) || seedAt > now || now - seedAt > Math.min(24, s.operatorReadingMaxAgeHours) * HOUR);
-      const timestampMissing = raw?.at == null && raw?.asOf == null && raw?.mtime == null;
       const liveStale = Number.isFinite(at) && now - at > Math.min(24, s.staleHours) * HOUR;
-      // A live session appends events while we read, so allow 60 s of read-time skew; further in the future is unusable.
-      const liveUsable = Number.isFinite(at) ? at <= now + 60000 && !liveStale
-        : timestampMissing && Boolean(raw) && owner.readers?.some(r => r.type === 'codex-rollout');
+      const liveUsable = liveReadingTimestampValid(raw, now, { staleHours: s.staleHours,
+        codexRollout: (account.readers ?? owner.readers)?.some(r => r.type === 'codex-rollout') });
       const add = (name, w, source = 'live') => {
         const usedPercent = w?.usedPercent ?? w?.used_percent ?? w?.used_percentage;
         const resetsAt = epoch(w?.resetsAt ?? w?.resets_at);
@@ -92,7 +99,7 @@ export function readProviderCapacity({ env = {}, now = Date.now(), readers = {},
       let held = false;
       try { held = Boolean(readers.hold?.(owner.id, now)); } catch { held = true; }
       return { ...def, provider: entry.id, account: account.id, configuredWindows: def.windows, windows, held, health: held ? 0 : 1,
-        usageAccount: raw ? usageAccount : null,
+        usageAccount: raw ? usageAccount : null, usageIdentityRejected,
         stale: !windows.some(w => Number.isFinite(w.usedPercent)) && (liveStale || operatorReadingStale),
         operatorReadingStale, known: windows.some(w => Number.isFinite(w.usedPercent)), now };
     });
@@ -109,7 +116,8 @@ export function launcherCapacity(capacities, settings = {}) {
     const owner = providers.find(p => p.id === def?.quotaOf) ?? def;
     if ((owner?.accounts?.length ?? new Set(observations.map(c => c.account)).size) <= 1) return observations;
     const attributed = owner?.id === 'claude' || provider === 'claude'
-      ? observations.find(c => c.usageAccount === c.account)?.account ?? settings.claudeUsageAccount : null;
+      ? observations.find(c => c.usageAccount === c.account)?.account
+        ?? (observations.some(c => c.usageIdentityRejected) ? null : settings.claudeUsageAccount) : null;
     const live = attributed && observations.find(c => c.account === attributed);
     return live ? [live] : [{ ...observations[0], account: null, windows: [], known: false,
       held: observations.some(c => c.held) }];

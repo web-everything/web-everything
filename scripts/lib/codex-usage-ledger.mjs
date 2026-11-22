@@ -35,7 +35,7 @@ export function codexUsageLedgerPath(env = process.env) {
   return env.WE_CODEX_USAGE_LEDGER || join(daemonConveyorStateRoot(env), 'codex-usage.jsonl');
 }
 
-/** Newest event timestamp wins, including resets; read at most 256 KiB per rollout. */
+/** Newest event timestamp wins within the eight newest rollouts by mtime; read at most 256 KiB each. */
 export function readCodexQuota(env = process.env) {
   if (env.WE_CAPACITY_READERS === 'off') return null;
   try {
@@ -49,7 +49,11 @@ export function readCodexQuota(env = process.env) {
     };
     walk(join(env.CODEX_HOME || join(homedir(), '.codex'), 'sessions'));
     let newest = null;
-    for (const path of files) {
+    // Stat before opening: cap aggregate tail IO at 8 × 256 KiB. Older rollouts
+    // are outside the evidence horizon; refresh a rollout or use an operator reading.
+    const recent = files.map(path => ({ path, mtime: statSync(path).mtimeMs }))
+      .sort((a, b) => b.mtime - a.mtime).slice(0, 8);
+    for (const { path } of recent) {
       let fd;
       let lines, mtime;
       try {
@@ -67,7 +71,7 @@ export function readCodexQuota(env = process.env) {
         const limits = e?.type === 'event_msg' && e.payload?.type === 'token_count' ? e.payload.rate_limits : null;
         if (limits?.limit_id === 'codex') {
           const at = typeof e.timestamp === 'string' ? Date.parse(e.timestamp) : NaN;
-          if (!Number.isFinite(at)) return null; // Cannot establish ordering: refresh evidence or use an operator reading.
+          if (!Number.isFinite(at)) continue; // Undated history cannot participate in event ordering.
           if (!newest || at >= newest.time) newest = { time: at, at: e.timestamp, limits, mtime };
         }
       }
@@ -77,8 +81,9 @@ export function readCodexQuota(env = process.env) {
       && Number.isFinite(w.window_minutes) && w.window_minutes > 0;
     // Validate the newest evidence, never fall back to an older percentage on format drift.
     if (!newest || !valid(newest.limits.primary) || (newest.limits.secondary != null && !valid(newest.limits.secondary))) return null;
-    return { ...newest.limits.primary, at: newest.at, mtime: newest.mtime,
-      ...(newest.limits.secondary ? { secondary: newest.limits.secondary } : {}) };
+    const window = ({ used_percent, resets_at, window_minutes }) => ({ used_percent, resets_at, window_minutes });
+    return { ...window(newest.limits.primary), at: newest.at, mtime: newest.mtime,
+      ...(newest.limits.secondary ? { secondary: window(newest.limits.secondary) } : {}) };
   } catch { /* absent/unreadable quota is unknown */ }
   return null;
 }

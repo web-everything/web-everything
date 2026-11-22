@@ -46,6 +46,50 @@ it.each([128, 9 * 1024 * 1024])('Codex rollout reader requests at most 256 KiB f
   expect(readFile).not.toHaveBeenCalled();
 }));
 
+const quotaEvent = (timestamp, primary = {}, secondary) => ({ timestamp, type: 'event_msg', payload: {
+  type: 'token_count', rate_limits: { limit_id: 'codex', primary: {
+    used_percent: 100, resets_at: 2000000000, window_minutes: 300, ...primary,
+  }, ...(secondary ? { secondary } : {}) },
+} });
+
+it('Codex quota returns only validated window fields, so camel-case extras cannot hide exhaustion', () => fixture(root => {
+  mkdirSync(join(root, 'sessions'));
+  const at = '2026-11-19T12:00:00Z';
+  const secondary = { used_percent: 40, resets_at: 2000000000, window_minutes: 10080 };
+  writeFileSync(join(root, 'sessions', 'rollout.jsonl'), JSON.stringify(quotaEvent(at,
+    { usedPercent: 0, resetsAt: 1, extra: true }, { ...secondary, usedPercent: 0 })));
+  const quota = readCodexQuota({ CODEX_HOME: root });
+  expect(quota).toEqual({ used_percent: 100, resets_at: 2000000000, window_minutes: 300,
+    secondary, at, mtime: fs.statSync(join(root, 'sessions', 'rollout.jsonl')).mtimeMs });
+}));
+
+it.each([undefined, 'invalid'])('Codex skips undated history (%s), but rejects malformed newest dated evidence', timestamp => fixture(root => {
+  mkdirSync(join(root, 'sessions'));
+  const path = join(root, 'sessions', 'rollout.jsonl');
+  const valid = quotaEvent('2026-11-19T12:00:00Z');
+  writeFileSync(path, [quotaEvent(timestamp), valid, quotaEvent(timestamp)].map(JSON.stringify).join('\n'));
+  expect(readCodexQuota({ CODEX_HOME: root })?.used_percent).toBe(100);
+  writeFileSync(path, [valid, quotaEvent('2026-11-19T12:01:00Z', { used_percent: 'bad' })].map(JSON.stringify).join('\n'));
+  expect(readCodexQuota({ CODEX_HOME: root })).toBeNull();
+}));
+
+it('Codex reads only the eight newest rollout files by mtime, then orders their events by timestamp', () => fixture(root => {
+  mkdirSync(join(root, 'sessions'));
+  const paths = Array.from({ length: 10 }, (_, i) => {
+    const path = join(root, 'sessions', `${i}.jsonl`);
+    // Excluded old files have newer events; among eligible files the oldest mtime wins.
+    const timestamp = new Date(Date.parse('2026-11-19T12:00:00Z') - i * 1000).toISOString();
+    writeFileSync(path, JSON.stringify(quotaEvent(timestamp, { used_percent: i })));
+    utimesSync(path, 1000 + i, 1000 + i);
+    return path;
+  });
+  const open = vi.spyOn(fs, 'openSync'), read = vi.spyOn(fs, 'readSync');
+  expect(readCodexQuota({ CODEX_HOME: root })?.used_percent).toBe(2);
+  expect(open.mock.calls.map(([path]) => path).sort()).toEqual(paths.slice(2).sort());
+  expect(read).toHaveBeenCalledTimes(8);
+  expect(read.mock.calls.every(call => call[3] <= 256 * 1024)).toBe(true);
+}));
+
 it('ledger readers enforce their 8 MiB and 256 KiB tail byte limits and offsets', () => fixture(root => {
   const path = join(root, 'large-ledger.jsonl');
   writeFileSync(path, '');
