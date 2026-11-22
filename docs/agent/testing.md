@@ -2187,6 +2187,14 @@ the same fixture without depending on captured builtin imports or patching nativ
 Review staleness fixtures must use off-path files from the current sandbox import closure.
 Collision healing now pulls `backlog/frontmatter.mjs` onto that path; cover its refusal and
 use `backlog/capacity.mjs` for tolerated unrelated lag in both dispatch modes and the soak.
+Managed-clone staleness fixtures without `dispatchPath` use the process entry module's import
+closure by default (`entryModule` and `codeRoot` are injectable). Unreadable/incomplete closures or
+unknown behind-file lists refuse; the operator remedy remains the gated rebuild's `clone-held-stale`
+alert. Gate/TRUST_CHAIN files, settings modules and registry metadata, and the daemon entry always
+refuse, including with last-good or rebuild grace evidence. Fixtures exercising those fallbacks must
+supply a known, non-strict behind-file list and dispatch scope. Tolerated lag logs deduplicate by
+label, behind count, and sorted file list within the process.
+
 Both collision planners refuse to move a `bornAs` card or a reserved source number. Remote-backed
 heals never reuse a gap below the frontier: trees and reservation refs cannot show whether a gap
 held a legacy card deleted before reservation refs existed. They take a fresh number above every

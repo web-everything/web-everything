@@ -165,7 +165,7 @@ process.stdout.write('dispatched mode=' + MODE + '\\n');
     copyFileSync(join(dirname(MODULE), 'daemon-last-good.mjs'), join(pusher, 'scripts', 'lib', 'daemon-last-good.mjs'));
     // The operator-cli fresh fallback settings knob adds this import; missing settings files are fail-soft.
     copyFileSync(join(dirname(MODULE), 'settings-files.mjs'), join(pusher, 'scripts', 'lib', 'settings-files.mjs'));
-    for (const f of ['daemon-events.mjs', 'handoff-path.mjs']) copyFileSync(join(dirname(MODULE), f), join(pusher, 'scripts', 'lib', f));
+    for (const f of ['daemon-events.mjs', 'handoff-path.mjs', 'import-closure.mjs']) copyFileSync(join(dirname(MODULE), f), join(pusher, 'scripts', 'lib', f));
     writeFileSync(join(pusher, 'cli.mjs'), cli('session'));
     git(pusher, 'add', '.'); git(pusher, 'commit', '-qm', 'old: session mode');
     git(pusher, 'push', '-q', 'origin', 'main');
@@ -183,7 +183,7 @@ process.stdout.write('dispatched mode=' + MODE + '\\n');
   it('fast-forwards, re-executes ONCE, and the NEW code dispatches', () => {
     const { checkout, originHead } = fixture();
     const r = run(checkout);
-    expect(r.status).toBe(0);
+    expect(r.status, r.stderr).toBe(0);
     expect(r.stdout).toBe('loaded mode=session\nloaded mode=job\ndispatched mode=job\n');
     expect(r.stderr).toMatch(/toy-dispatch: re-executing so the fast-forwarded code runs \(1 commit/);
     expect(git(checkout, 'rev-parse', 'HEAD')).toBe(originHead);

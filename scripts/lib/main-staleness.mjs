@@ -18,8 +18,11 @@
 
 import { spawnSync } from 'node:child_process';
 import { appendFileSync, existsSync, mkdirSync, realpathSync, writeSync } from 'node:fs';
-import { dirname, isAbsolute, relative, resolve, sep } from 'node:path';
+import { basename, dirname, isAbsolute, relative, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
+// Sparse copied-CLI fixtures may omit gate-config's graph; without it every behind file counts as strict (refuse).
+const gateConfig = await import('./gate-config.mjs').catch(() => null);
+import { collectImportClosure, closureHits } from './import-closure.mjs';
 import { daemonEventsPath } from './daemon-events.mjs';
 import { lastGoodForClone, lastGoodMaxAgeMs, readRebuildStateFile, rebuildGraceForClone } from './daemon-last-good.mjs';
 import { readSettings as readOperatorSettings } from './settings-files.mjs';
@@ -207,6 +210,22 @@ export function codeDirty(root, run = gitRun) {
   });
 }
 
+// One diagnostic per distinct lag in this process, shared by every dispatch pass.
+const toleratedLagLogs = new Set();
+function logToleratedLag({ label, behind, files, base, reason, write }) {
+  const key = JSON.stringify([label, behind, [...files].sort()]);
+  if (toleratedLagLogs.has(key)) return;
+  write(`${label}: the managed clone is ${behind} commit(s) behind origin/${base} (files: ${files.join(', ')}) — `
+    + `tolerated lag: ${reason}; tolerating the lag and dispatching.\n`);
+  toleratedLagLogs.add(key);
+}
+
+function strictStalePath(path, entry) {
+  return !gateConfig || gateConfig.isTrustChainPath(path) || basename(path) === 'gate-config.mjs'
+    || /^scripts\/lib\/settings-[^/]+(?:\.mjs|\.json)$/.test(path)
+    || path.startsWith('scripts/lib/settings-registry-metadata.d/') || path === entry;
+}
+
 /**
  * ASSERT the calling checkout is not behind `origin/<base>` — refuse LOUDLY rather than silently act on stale
  * code from this checkout's own import path (#3439). A checkout that is merely BEHIND (no local commits ahead)
@@ -218,15 +237,15 @@ export function codeDirty(root, run = gitRun) {
  * @param {string} root
  * @param {(root: string) => ReturnType<typeof checkMainStaleness>} [checkStaleness] - injectable, defaults to
  *   a real `checkMainStaleness` scoped (via `run`'s `cwd`) to `root`.
- * @param {{base?: string, label?: string, dispatchPath?: ((path: string) => boolean)|null}} [o] - `base` is the
+ * @param {{base?: string, label?: string, entryModule?: string, dispatchPath?: ((path: string) => boolean)|null}} [o] - `base` is the
  *   delivery target to measure staleness against (default `main`); `label` prefixes the thrown/logged message so
  *   each caller reads as itself (default `review-dispatch`, this function's original and still most common
  *   caller). `dispatchPath` (#4387) narrows a MANAGED clone's refusal to the files this dispatch actually runs:
- *   when set, a managed clone behind only in files it rejects dispatches and logs the tolerated lag. Unset (the
- *   default) keeps the #4044 rule — any code file behind refuses.
+ *   a managed clone behind only in files it rejects dispatches and logs the tolerated lag. By default, use
+ *   the process entry module import closure. Unknown closure/evidence and strict gate/settings/entry lag refuse.
  */
 export function assertMainNotStale(root, checkStaleness, {
-  base = 'main', label = 'review-dispatch', dispatchPath = null,
+  base = 'main', label = 'review-dispatch', dispatchPath = null, entryModule = process.argv[1],
   listBehindFiles = (r) => behindFiles(r, base),
   // xgqz204 — the self-fast-forward seams (see `selfFastForwardAction`). All default to the real process.
   codeRoot = THIS_CODE_ROOT, armed = selfSyncState.armed, reexeced = selfSyncState.reexeced,
@@ -250,16 +269,37 @@ export function assertMainNotStale(root, checkStaleness, {
   }));
   let st = check(root);
   let behindMemo;
-  const behindList = () => (behindMemo === undefined ? (behindMemo = listBehindFiles(root)) : behindMemo);
+  const behindList = () => {
+    if (behindMemo === undefined) {
+      try { behindMemo = listBehindFiles(root); } catch { behindMemo = null; }
+    }
+    return behindMemo;
+  };
+  let canUseStaleFallback = false;
+  if (st?.action === 'warn' && managedClone) {
+    const files = behindList();
+    const known = Array.isArray(files) && files.length > 0
+      && files.every((f) => typeof f === 'string' && f.length > 0);
+    const entry = entryModule ? relative(codeRoot, resolve(codeRoot, entryModule)).split(sep).join('/') : null;
+    if (typeof dispatchPath !== 'function') {
+      let closure = null;
+      try {
+        closure = collectImportClosure({ root: codeRoot, entries: entry ? [entry] : [], requireResolvedImports: true });
+      } catch { /* unknown closure refuses; rebuild is the operator fallback */ }
+      if (closure?.complete) dispatchPath = (f) => closureHits({ closure, changedFiles: [f] }).length > 0;
+    }
+    canUseStaleFallback = known && !files.some((f) => strictStalePath(f, entry))
+      && typeof dispatchPath === 'function';
+  }
   // #4044 (live 2026-09-25): the drain lands a commit every few minutes, most touching only `backlog/*.md`, and
   // the fix daemon refused WHOLE repos whenever its managed clone was a few such commits behind. This guard
   // exists so a dispatch never runs STALE CODE from this checkout's import path — commits that change no code
   // file cannot make it stale. So a managed clone behind ONLY in non-code files is fresh enough to dispatch;
   // the next tick-start rebuild still brings it current. Unknown diff ⇒ the refusal stands (fail closed).
-  if (st && st.action === 'warn' && managedClone) {
+  if (st && st.action === 'warn' && managedClone && canUseStaleFallback) {
     const files = behindList();
     if (Array.isArray(files) && files.length > 0 && !files.some(isCodePath)) {
-      process.stderr.write(`${label}: the managed clone is ${st.behind} commit(s) behind origin/${base} in non-code files only (${files.length} file(s)) — not stale for dispatch (#4044).\n`);
+      logToleratedLag({ label, behind: st.behind, files, base, reason: 'non-code files only', write });
       st = { fresh: true, behind: st.behind, behindNonCodeOnly: true, files: files.length };
     } else if (Array.isArray(files) && files.length > 0 && typeof dispatchPath === 'function'
       && !files.some((f) => isCodePath(f) && dispatchPath(f))) {
@@ -268,10 +308,7 @@ export function assertMainNotStale(root, checkStaleness, {
       // the code a review dispatch runs. Only a behind file on the caller's own dispatch path can make it stale.
       const codeFiles = files.filter(isCodePath);
       const code = codeFiles.length;
-      // Name what was tolerated (first 5), so the log shows exactly which lag a dispatch ran through.
-      const named = codeFiles.slice(0, 5).join(', ') + (code > 5 ? `, +${code - 5} more` : '');
-      write(`${label}: the managed clone is ${st.behind} commit(s) behind origin/${base} (${code} code file(s), none on `
-        + `this dispatch's code path: ${named || 'none'}) — tolerating the lag and dispatching (#4387).\n`);
+      logToleratedLag({ label, behind: st.behind, files, base, reason: 'none on this dispatch code path', write });
       st = { fresh: true, behind: st.behind, behindOffDispatchPath: true, files: files.length, codeFiles: code, toleratedFiles: codeFiles };
     }
   }
@@ -281,7 +318,7 @@ export function assertMainNotStale(root, checkStaleness, {
   // (`state.adopted.head`) and its tree is clean, that build is known to work: dispatch from it instead of
   // refusing. Past the max age (default 24 h, `WE_DAEMON_LAST_GOOD_MAX_AGE_MS`) it ALERTS on every dispatch but
   // still dispatches; the health watch's `daemon-held-on-last-good` sign notifies the operator after 15 min.
-  if (st && st.action === 'warn' && managedClone) {
+  if (st && st.action === 'warn' && managedClone && canUseStaleFallback) {
     let lg = null;
     // Live 2026-10-04: untracked backlog/*.md cards a review job left in the clone made `st.dirty` true, so the
     // last-good fallback never applied while the rebuild was held. Only a TRACKED change or an untracked CODE
@@ -291,8 +328,8 @@ export function assertMainNotStale(root, checkStaleness, {
     try { lg = lastGood(root, dirty); } catch { lg = null; }
     if (lg && lg.onLastGood) {
       const heldWhy = lg.held ? ` held since ${lg.heldSince} (${lg.held.reason ?? '?'}${lg.held.failed ? `: ${lg.held.failed}` : ''})` : '';
-      write(`${label}: the managed clone is ${st.behind} commit(s) behind origin/${base} but runs its LAST-KNOWN-GOOD `
-        + `build ${String(lg.lastGood).slice(0, 12)}${heldWhy} — dispatching from it, not refusing (x5wbsbc).\n`);
+      logToleratedLag({ label, behind: st.behind, files: behindList(), base, write,
+        reason: `runs its LAST-KNOWN-GOOD build ${String(lg.lastGood).slice(0, 12)}${heldWhy}` });
       if (lg.overAge) {
         write(`${label}: ALERT — the clone has been held on its last-good build for ${Math.round(lg.ageMs / 3_600_000)}h, `
           + `past the max age — still dispatching; fix what the rebuild's alerts name (x5wbsbc).\n`);
@@ -308,16 +345,16 @@ export function assertMainNotStale(root, checkStaleness, {
   // BOUNDED grace covers that window: a live build lease, and a last adoption no older than
   // `WE_STALE_GUARD_REBUILD_GRACE_MS` (default 60 min, 0 = off). Only for a caller that names its dispatch path
   // and only with a KNOWN behind-file list — an unknown diff still refuses.
-  if (st && st.action === 'warn' && managedClone && typeof dispatchPath === 'function') {
+  if (st && st.action === 'warn' && managedClone && canUseStaleFallback && typeof dispatchPath === 'function') {
     const files = behindList();
     let g = null;
     if (Array.isArray(files) && files.length > 0) { try { g = rebuildGrace(root); } catch { g = null; } }
     if (g && g.grace) {
       const onPath = files.filter((f) => isCodePath(f) && dispatchPath(f));
       const named = onPath.slice(0, 5).join(', ') + (onPath.length > 5 ? `, +${onPath.length - 5} more` : '');
-      write(`${label}: the managed clone is ${st.behind} commit(s) behind origin/${base} ON this dispatch's code path `
-        + `(${named}), but its rebuild${g.target ? ` to ${String(g.target).slice(0, 12)}` : ''} is in progress `
-        + `(${Math.round((g.sinceAdoptMs ?? 0) / 60_000)} min since the last adoption, within the grace) — dispatching.\n`);
+      logToleratedLag({ label, behind: st.behind, files, base, write,
+        reason: `ON this dispatch's code path (${named}), but its rebuild${g.target ? ` to ${String(g.target).slice(0, 12)}` : ''}`
+          + ` is in progress (${Math.round((g.sinceAdoptMs ?? 0) / 60_000)} min since the last adoption, within the grace)` });
       st = { fresh: true, behind: st.behind, rebuildGrace: true, onPathFiles: onPath, buildTarget: g.target ?? null };
     }
   }

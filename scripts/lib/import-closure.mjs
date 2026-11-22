@@ -29,15 +29,17 @@ function resolveRelativeSpec(fromFile, spec, exists) {
  * to "any code file changed". `bareDeps` = some file imports a package (a `package*.json` change is relevant).
  * `jsonNames` = basenames of `.json` string literals in closure files (a config read at runtime by name).
  * Never throws: an unreadable entry returns `null` (the caller's conservative fallback).
+ * `requireResolvedImports` additionally marks missing/out-of-root relative imports incomplete.
  * `parsed` may be shared across walks of the SAME tree snapshot (e.g. successive spawned-script hops).
+ * Keep `requireResolvedImports` unchanged when sharing `parsed`.
  * It must be discarded before walking a changed tree; by default every invocation gets a fresh cache.
- * @param {{root:string, entries:string[], readFile?:(p:string)=>string, exists?:(p:string)=>boolean, parsed?:Map}} o
+ * @param {{root:string, entries:string[], readFile?:(p:string)=>string, exists?:(p:string)=>boolean, parsed?:Map, requireResolvedImports?:boolean}} o
  * @returns {{files:Set<string>, complete:boolean, bareDeps:boolean, jsonNames:Set<string>}|null}
  */
 export function collectImportClosure({
   root, entries, readFile = (p) => readFileSync(p, 'utf8'),
   exists = (p) => { try { return statSync(p).isFile(); } catch { return false; } },
-  parsed = new Map(),
+  parsed = new Map(), requireResolvedImports = false,
 }) {
   const absRoot = resolvePath(root);
   // Shared dependencies occur on many edges. Cache probes for this tree snapshot only;
@@ -70,6 +72,7 @@ export function collectImportClosure({
           if (spec.startsWith('./') || spec.startsWith('../')) {
             const hit = resolveRelativeSpec(file, spec, existsOnce);
             if (hit && !relative(absRoot, hit).startsWith('..')) info.imports.push(hit);
+            else if (requireResolvedImports) info.complete = false;
           } else if (!spec.startsWith('node:') && /^[@a-z]/i.test(spec) && !/\s/.test(spec)) {
             info.bareDeps = true;
           }

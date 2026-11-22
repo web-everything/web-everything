@@ -262,7 +262,7 @@ describe('assertMainNotStale — the x5wbsbc last-good fallback (managed clone)'
       overAge: false,
     });
 
-    const result = assertMainNotStale(root, warnCheck(), { lastGood, write: (s) => writes.push(s) });
+    const result = assertMainNotStale(root, warnCheck(), { label: `last-good-${root}`, lastGood, dispatchPath: () => true, listBehindFiles: () => ['scripts/ordinary.mjs'], write: (s) => writes.push(s) });
 
     expect(result.fresh).toBe(true);
     expect(result.onLastGood).toBe(true);
@@ -283,7 +283,7 @@ describe('assertMainNotStale — the x5wbsbc last-good fallback (managed clone)'
       overAge: true,
     });
 
-    const result = assertMainNotStale(root, warnCheck(), { lastGood, write: (s) => writes.push(s) });
+    const result = assertMainNotStale(root, warnCheck(), { label: `last-good-${root}`, lastGood, dispatchPath: () => true, listBehindFiles: () => ['scripts/ordinary.mjs'], write: (s) => writes.push(s) });
 
     expect(result.fresh).toBe(true);
     expect(result.overAge).toBe(true);
@@ -297,7 +297,7 @@ describe('assertMainNotStale — the x5wbsbc last-good fallback (managed clone)'
       onLastGood: false, lastGood: null, held: null, heldSince: null, ageMs: null, overAge: false,
     });
 
-    expect(() => assertMainNotStale(root, warnCheck(), { lastGood, write: () => {} }))
+    expect(() => assertMainNotStale(root, warnCheck(), { label: `last-good-${root}`, lastGood, dispatchPath: () => true, listBehindFiles: () => ['scripts/ordinary.mjs'], write: () => {} }))
       .toThrow(STALE_MAIN_REFUSAL_MARKER);
   });
 
@@ -305,7 +305,7 @@ describe('assertMainNotStale — the x5wbsbc last-good fallback (managed clone)'
     const root = makeRealRepoWithOrigin();
     const lastGood = () => { throw new Error('boom'); };
 
-    expect(() => assertMainNotStale(root, warnCheck(), { lastGood, write: () => {} }))
+    expect(() => assertMainNotStale(root, warnCheck(), { label: `last-good-${root}`, lastGood, dispatchPath: () => true, listBehindFiles: () => ['scripts/ordinary.mjs'], write: () => {} }))
       .toThrow(STALE_MAIN_REFUSAL_MARKER);
   });
 
@@ -315,7 +315,7 @@ describe('assertMainNotStale — the x5wbsbc last-good fallback (managed clone)'
     const lastGood = () => { called = true; return { onLastGood: true }; };
     const freshCheck = () => ({ fresh: true, behind: 0 });
 
-    const result = assertMainNotStale(root, freshCheck, { lastGood, write: () => {} });
+    const result = assertMainNotStale(root, freshCheck, { label: `last-good-${root}`, lastGood, dispatchPath: () => true, listBehindFiles: () => ['scripts/ordinary.mjs'], write: () => {} });
 
     expect(result.fresh).toBe(true);
     expect(called).toBe(false);

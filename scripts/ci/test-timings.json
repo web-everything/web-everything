@@ -2155,6 +2155,7 @@
   "scripts/conveyor/soak/breaks/daemon-entry-boot-crash.soak.test.mjs": 0.06,
   "scripts/conveyor/soak/breaks/daemon-gh-guard-refusal.soak.test.mjs": 0.01,
   "scripts/conveyor/soak/breaks/daemon-overlay-lock-wait.soak.test.mjs": 8.55,
+  "scripts/conveyor/soak/breaks/daemon-stale-guard-refuses-unrelated-lag.soak.test.mjs": 0.73,
   "scripts/conveyor/soak/breaks/daemon-version-switch-mid-tick.soak.test.mjs": 0.18,
   "scripts/conveyor/soak/breaks/detail-head-must-not-release-human-hold.soak.test.mjs": 1,
   "scripts/conveyor/soak/breaks/dispatch-multi-path-scope-refused.soak.test.mjs": 1.36,

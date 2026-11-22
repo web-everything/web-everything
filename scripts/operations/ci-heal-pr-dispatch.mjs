@@ -471,7 +471,7 @@ export async function runReconcileCiHealDispatch({
   if (pastDeadline()) return deadlineResult();
   // #x1rr9rh (multi-repo slice 2) — guards the DISPATCHING checkout (this WE checkout's own import path), not
   // the target repo; see `runReconcileFixDispatch`'s identical note for why this runs for every repo.
-  assertMainNotStale(root, checkStaleness);
+  assertMainNotStale(root, checkStaleness, { label: 'ci-heal-pr-dispatch' });
   // #4352 — retry any budget-refused CI-heal/escalation comment owed on this repo (see the docblock above).
   const healObservations = pollAttempts({ repo: repoKey });
   // The durable flushes are skipped only once per overrun: a flush skipped last pass runs now regardless of the
