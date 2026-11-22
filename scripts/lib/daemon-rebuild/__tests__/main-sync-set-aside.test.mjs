@@ -11,6 +11,70 @@ import { readRebuildStateStrict, rebuildStatePath } from '../state.mjs';
 import { createSetAsideFixture, probeRebuildSetAside } from '../../../conveyor/soak/fixtures/rebuild-set-aside-probe.mjs';
 
 // Negative cases come first: the new policy must retain the old refusal/hold protections.
+it.each(['ordinary', 'strict'])('key/ref mismatch is malformed continuity: %s reader', async reader => {
+  const f = await createSetAsideFixture({ audited: true });
+  try {
+    const before = f.head();
+    const state = f.state();
+    state.setAside = { 'lane/wrong-key': {
+      eligible: true, ref: f.ref, sha: f.tip, mainSha: f.main,
+      reason: 'main-sync-conflict', files: [f.file],
+    } };
+    writeFileSync(rebuildStatePath(f.root, f.env), JSON.stringify(state));
+    if (reader === 'strict') {
+      expect(() => readRebuildStateStrict(f.root, f.env)).toThrow('Invalid rebuild state setAside');
+    } else {
+      expect(f.state().setAside).toBeUndefined();
+      expect(await f.rebuild()).toMatchObject({ reason: 'established-overlay-conflict' });
+      expect(f.head()).toBe(before);
+      expect(f.alerts().some(a => a.kind === 'overlay-main-sync-set-aside')).toBe(false);
+      // With the overlay absent from main, unknown history must still require its audit.
+      expect(f.git(['reset', '--hard', f.main]).status).toBe(0);
+      await f.repair();
+      await f.rebuild();
+      expect(f.head()).toBe(f.main);
+      expect(f.state().adopted?.applied.some(o => o.ref === f.ref)).not.toBe(true);
+      expect(f.state().setAside).toBeUndefined();
+      expect(f.alerts().some(a => a.kind === 'overlay-unaudited-tip')).toBe(true);
+    }
+  } finally { f.cleanup(); }
+}, 60_000);
+
+it.each(['array', 'string', 'record'])('malformed continuity is unknown and holds last-good: %s', async kind => {
+  const f = await createSetAsideFixture({ audited: true });
+  try {
+    const before = f.head();
+    const path = rebuildStatePath(f.root, f.env);
+    const state = f.state();
+    state.setAside = kind === 'array' ? [] : kind === 'string' ? 'bad' : { [f.ref]: { eligible: true } };
+    writeFileSync(path, JSON.stringify(state));
+    expect(f.state().setAside).toBeUndefined();
+    expect(() => readRebuildStateStrict(f.root, f.env)).toThrow('Invalid rebuild state setAside');
+    expect(await f.rebuild()).toMatchObject({ reason: 'established-overlay-conflict' });
+    expect(f.head()).toBe(before);
+    expect(f.alerts().some(a => a.kind === 'overlay-main-sync-set-aside')).toBe(false);
+  } finally { f.cleanup(); }
+}, 60_000);
+
+it.each(['array', 'string', 'record'])('malformed continuity never restores first-adoption exemption: %s', async kind => {
+  const f = await createSetAsideFixture({ audited: true });
+  try {
+    expect(await f.rebuild()).toMatchObject({ adopted: true });
+    const before = f.head();
+    const state = f.state();
+    state.setAside = kind === 'array' ? [] : kind === 'string' ? 'bad'
+      : { [f.ref]: { ...state.setAside[f.ref], files: [] } };
+    writeFileSync(rebuildStatePath(f.root, f.env), JSON.stringify(state));
+    expect(f.state().setAside).toBeUndefined();
+    await f.repair();
+    await f.rebuild();
+    expect(f.head()).toBe(before);
+    expect(f.state().adopted?.applied.some(o => o.ref === f.ref)).not.toBe(true);
+    expect(f.state().setAside).toBeUndefined();
+    expect(f.alerts().some(a => a.kind === 'overlay-unaudited-tip')).toBe(true);
+  } finally { f.cleanup(); }
+}, 60_000);
+
 it.each(['legacy', 'missing'])('unknown continuity holds an established running tip with one existing loss alert per tick: %s', async kind => {
   const f = await createSetAsideFixture({ audited: true });
   try {

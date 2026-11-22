@@ -134,12 +134,13 @@ function readState(root, env, strict, read = readFileSync) {
     }
     // Legacy/missing continuity remains unknown (undefined), not a known empty map.
     // Planning must require audit evidence before any omitted content can return.
-    // Present malformed records fail closed.
-    if (strict && parsed.setAside != null && (!object(parsed.setAside)
-      || !Object.values(parsed.setAside).every(v => fields(v,
+    // Present malformed records are unknown to ordinary ticks; strict admission refuses them.
+    const validSetAside = parsed?.setAside == null || (object(parsed.setAside)
+      && Object.entries(parsed.setAside).every(([ref, v]) => fields(v,
         { eligible: v => v === true, ref: string, sha: v => typeof v === 'string' && FULL_SHA_RE.test(v),
           mainSha: v => typeof v === 'string' && FULL_SHA_RE.test(v), reason: v => v === 'main-sync-conflict',
-          files: v => strings(v) && v.length > 0 })))) throw new Error('Invalid rebuild state setAside');
+          files: v => strings(v) && v.length > 0 }) && ref === v.ref));
+    if (strict && !validSetAside) throw new Error('Invalid rebuild state setAside');
     if (strict) return parsed; // Preserve the one validated snapshot, without legacy coercion.
     return {
       adopted: parsed?.adopted ?? null,
@@ -153,7 +154,7 @@ function readState(root, env, strict, read = readFileSync) {
       forceUnverifiedTrees: parsed?.forceUnverifiedTrees ?? null,
       smokePassed: parsed?.smokePassed ?? null,
       pinnedNotified: parsed?.pinnedNotified ?? null,
-      setAside: parsed?.setAside,
+      setAside: validSetAside ? parsed?.setAside : undefined,
     };
   } catch (error) {
     if (strict && error?.code !== 'ENOENT') throw error;
