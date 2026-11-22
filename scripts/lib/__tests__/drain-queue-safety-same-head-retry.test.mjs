@@ -125,6 +125,14 @@ describe('merge-queue same-head retry for unreadable failed-job logs', () => {
     expect(f.exec.mock.calls.some(([, args]) => args.includes('POST'))).toBe(false);
   }));
 
+  it('holds OSC controls plus runner-loss summary after quarantine log read', () => setup(f => {
+    f.list = { ok: true, list: { version: 1, entries: [entry(`${FILE}::${NAME}`)], mode: 'quarantine' } };
+    f.checks[0].output.summary = 'The self-hosted runner lost connection';
+    f.logs[31] = `${logOf([FILE, NAME])}\x1b]0;title\x07`;
+    expectHeld(f);
+    expect(f.exec.mock.calls.some(([, args]) => args.includes(`repos/${repo}/actions/jobs/31/logs`))).toBe(true);
+  }));
+
   it('404 gate log fails closed with flagged transport', () => setup(f => {
     f.checks[0].name = 'merge-gate';
     f.logErrors[31] = new Error('HTTP 404: Not Found');
@@ -683,6 +691,22 @@ describe('merge-queue exact-test extra retry after two failed_checks removals', 
     expect(f.exec.mock.calls.some(([, args]) => args.some(arg => /\/artifacts(?:\/|\?)/.test(arg)))).toBe(false);
     expect(f.exec.mock.calls.some(([, args]) => args.includes('POST'))).toBe(false);
   }));
+
+  it('holds OSC-wrapped error before the last 64 KiB exact-test window', () => exactFixture(f => {
+    // A buffer response can be replayed by the shared executor into the exact-test reader.
+    f.logs[31] = Buffer.from(`\x1b]0;Error: hidden\x07\n${'ordinary output\n'.repeat(5000)}${f.logs[31]}`);
+    expectExactHold(f);
+    expect(f.exec.mock.calls.some(([, args]) => args.includes(`repos/${repo}/actions/jobs/31/logs`))).toBe(true);
+  }));
+
+  it.each(['Unhandled Rejection', 'Unhandled Error', 'Errors 1 error', 'Errors 2 errors',
+    'Error: unexpected runtime exception', '2026-11-07T23:00:00Z Error: runtime exception'])
+    ('holds coloured SGR failure plus promisor-fetch signature: %s', failure => exactFixture(f => {
+      f.mqChecks = [check(31, 'test-shard (1)', 800, 'failure')];
+      f.logs[31] = `\x1b[31m${failure}\x1b[0m\nfatal: could not fetch abc123 from promisor remote\n`;
+      f.artifacts = {}; f.reports = {};
+      expectExactHold(f);
+    }));
 
   it('reads ANSI exact-test summary with one shared log read', () => exactFixture(f => {
     f.logs[31] = `\x1b[31m${f.logs[31]}\x1b[0m`;

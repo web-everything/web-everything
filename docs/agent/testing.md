@@ -5936,7 +5936,10 @@ assertions intact; consumers without callable entries retain the fresh-import pa
 
 ## Drain log evidence normalization
 
-Drain queue and recovery log consumers share `stripAnsiLogText` before parsing evidence.
+Drain queue and recovery log consumers share `readNormalizedJobLog` before parsing evidence. Normalize the whole log before
+slicing any summary/signature tail. Its `{ ok: false }` result propagates as a terminal
+hold through quarantine, flake, gate and exact-test readers; the recovery IO reader
+returns `complete: false`. The drain log-read source gate guards this shared boundary.
 Strip only SGR sequences; reject any remaining ESC byte or C1 control (U+0080–U+009F).
 Keep negative cases for non-colour CSI, BEL/ST-terminated OSC, stray ESC before
 `FAIL`/`Unhandled`/`Errors`, and C1-prefixed evidence: generic terminal stripping

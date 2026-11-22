@@ -4,7 +4,7 @@ import { redTeamOwedOnHead } from './review-red-team-policy.mjs';
 import { execFileSync } from 'node:child_process';
 import { execFileSyncThrottled } from './gh-throttle.mjs';
 import { ciJobLogApiArgs } from './gh-ci-log.mjs';
-import { stripAnsiLogText } from './ansi-log-text.mjs';
+import { readNormalizedJobLog } from './ansi-log-text.mjs';
 import { mkdirSync, readFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { homedir } from 'node:os';
@@ -432,12 +432,16 @@ const localJob = name => typeof name === 'string' ? name.split(' / ').at(-1) : n
 const entryCoversJob = (entry, job) => entry.job === undefined
   ? /^test-shard \(\d+\)$/.test(localJob(job)) : localJob(entry.job) === localJob(job);
 
+const logNormalizationHold = () => ({ logNormalizationFailed: true,
+  logReason: 'job log normalization failed; operator must inspect failed jobs and enqueue manually' });
+
 /**
  * Are ALL failing checks explained by active quarantine entries? The list must be stamped `quarantine` (else CI
  * skips nothing). Each failing job is bound to this merge-group commit, its log must give a complete vitest failure
  * list (distinct failing tests == the summary's failed-test count, no truncated names), and every failing test must
  * be covered. Aggregators (`test`, `coverage-merge`) must show no uncovered test failure of their own and only
- * count after at least one unit job. Anything unreadable, incomplete or uncovered returns null: the hold stays.
+ * count after at least one unit job. Unsupported controls return a terminal normalization hold;
+ * other unreadable, incomplete or uncovered evidence returns null.
  */
 function readQuarantineCover({ repo, commit, failed, exec, quarantine, flake }) {
   try {
@@ -468,7 +472,9 @@ function readQuarantineCover({ repo, commit, failed, exec, quarantine, flake }) 
       }
       const job = JSON.parse(read1(`repos/${repo}/actions/jobs/${check.id}`, 1024 * 1024));
       if (job?.name !== check.name || mqOid(job?.head_sha) !== commit) return null;
-      const text = stripAnsiLogText(read1(`repos/${repo}/actions/jobs/${check.id}/logs`, 64 * 1024 * 1024));
+      const normalized = readNormalizedJobLog(read1(`repos/${repo}/actions/jobs/${check.id}/logs`, 64 * 1024 * 1024));
+      if (!normalized.ok) return logNormalizationHold();
+      const text = normalized.text;
       const failures = parseVitestFailures(text);
       const plain = text.replace(/^\d{4}-\d\d-\d\dT[\d:.]+Z /gm, '');
       const summary = /^\s*Tests\s+(\d+) failed\b/m.exec(plain);
@@ -636,9 +642,10 @@ function readMqExactTestEvidence({ repo, pr, head, timeline, exec, now }) {
     if (annotations.some(a => !a || typeof a.annotation_level !== 'string' || typeof a.message !== 'string')
       || failureNotes.length !== 1 || failureNotes[0].message.trim() !== 'Process completed with exit code 1.') return null;
     // Additional source: vitest's own final summary block, read from a bounded tail of the failed shard log
-    // only (never classified as a whole; aggregators' logs are never read). `Errors  N error(s)` marks unhandled errors.
-    const rawLog = read(`actions/jobs/${shards[0].id}/logs`, true);
-    const tail = stripAnsiLogText(Buffer.from(rawLog).subarray(-MQ_SUMMARY_TAIL_BYTES).toString('utf8'))
+    // only (normalized as a whole before slicing; aggregators' logs are never read). `Errors  N error(s)` marks unhandled errors.
+    const normalized = readNormalizedJobLog(read(`actions/jobs/${shards[0].id}/logs`, true));
+    if (!normalized.ok) return logNormalizationHold();
+    const tail = Buffer.from(normalized.text).subarray(-MQ_SUMMARY_TAIL_BYTES).toString('utf8')
       .replace(/^\uFEFF?\d{4}-\d\d-\d\dT[\d:.]+Z /gm, '');
     const tailLines = tail.split(/\r?\n/);
     const starts = tailLines.map((line, i) => /^\s*Test Files\s/.test(line) ? i : -1).filter(i => i >= 0);
@@ -839,7 +846,10 @@ function readMqBaseRetryEvidence({ repo, pr, head, timeline, exec, rerunScope, d
       .replace(/[\x00-\x1f\x7f-\x9f\u2028\u2029]/g, ' ')).slice(0, 5);
     // readQuarantineCover validates the aggregators itself (positive evidence, no uncovered failure), so a
     // quarantined shard failure still earns its single retry when `test`/`coverage-merge` fail with it.
-    if (!cancelledRegroup && failed.length <= MQ_INFRA_MAX_JOBS && readQuarantineCover({ repo, commit: oid, failed, exec, quarantine }))
+    const quarantineCover = !cancelledRegroup && failed.length <= MQ_INFRA_MAX_JOBS
+      ? readQuarantineCover({ repo, commit: oid, failed, exec, quarantine }) : null;
+    if (quarantineCover?.logNormalizationFailed) return quarantineCover;
+    if (quarantineCover === true)
       return { mainGreen: false, mainRunId: null, infra: 'quarantined', failedNames, mergeState: readMqMergeState({ repo, pr, head, exec }) };
     // Runner terminology alone also appears in ordinary assertion failures.
     const runnerLoss = /\blost communication\b|\b(?:self-hosted[ \t]+)?runner[ \t]+(?:(?:has|was|is)[ \t]+)?(?:disconnected|went away|lost connection|stopped responding|failed to (?:start|connect))\b/i;
@@ -861,11 +871,12 @@ function readMqBaseRetryEvidence({ repo, pr, head, timeline, exec, rerunScope, d
         const jobPath = /^\/([^/]+)\/([^/]+)\/actions\/runs\/([1-9][0-9]*)\/job\/([1-9][0-9]*)$/.exec(new URL(gates[0].details_url).pathname);
         if (jobPath && `${jobPath[1]}/${jobPath[2]}` === repo && new URL(gates[0].details_url).origin === 'https://github.com') {
           budget--;
-          const rawLog = String(exec('gh', ciJobLogApiArgs(`repos/${repo}/actions/jobs/${Number(jobPath[4])}/logs`), {
+          const normalized = readNormalizedJobLog(exec('gh', ciJobLogApiArgs(`repos/${repo}/actions/jobs/${Number(jobPath[4])}/logs`), {
             encoding: 'utf8', timeout: 60_000, maxBuffer: MQ_INFRA_LOG_BYTES, stdio: ['ignore', 'pipe', 'pipe'], throttle: { maxAttempts: 1 } }));
           // The WHOLE gate log must be read (a hold outside a tail window would be missed): oversize fails closed.
-          if (Buffer.byteLength(rawLog, 'utf8') >= MQ_INFRA_LOG_BYTES) throw new Error('gate log too large to classify');
-          const log = stripAnsiLogText(rawLog);
+          if (!normalized.ok) return logNormalizationHold();
+          if (Buffer.byteLength(normalized.text, 'utf8') >= MQ_INFRA_LOG_BYTES) throw new Error('gate log too large to classify');
+          const log = normalized.text;
           // `fail-closed` rows count too: a red-main freeze read that raced a main CI re-run fails closed
           // ("red-main freeze unreadable: … verdict pending") — main-caused and transient, not this PR's defect.
           const holds = log.split('\n').filter(line => /^\S+\s+(?:hold|fail-closed)\s{2,}\S+/.test(line));
@@ -949,23 +960,19 @@ function readMqBaseRetryEvidence({ repo, pr, head, timeline, exec, rerunScope, d
         if (budget <= 2) throw new Error('retry evidence budget exhausted');
         try {
           budget--;
-          const text = exec('gh', ciJobLogApiArgs(`repos/${repo}/actions/jobs/${jobId}/logs`), {
+          const normalized = readNormalizedJobLog(exec('gh', ciJobLogApiArgs(`repos/${repo}/actions/jobs/${jobId}/logs`), {
             encoding: 'utf8', timeout: 60_000, maxBuffer: MQ_INFRA_LOG_BYTES,
             stdio: ['ignore', 'pipe', 'pipe'], throttle: { maxAttempts: 1 },
-          });
-          if (typeof text !== 'string' || !text.trim()) throw new Error('unreadable log');
+          }));
+          if (!normalized.ok) return logNormalizationHold();
+          const plain = normalized.text;
+          if (!plain.trim()) throw new Error('unreadable log');
           // Infrastructure signatures use a bounded tail; failure wording is checked across the full log.
-          let plain;
-          try { plain = stripAnsiLogText(text); }
-          catch {
-            // Invalid control bytes are unsafe evidence, never a transport failure eligible for retry.
-            return { logNormalizationFailed: true,
-              logReason: 'job log normalization failed; operator must inspect failed jobs and enqueue manually' };
-          }
           const tail = Buffer.from(plain.slice(-MQ_INFRA_SCAN_BYTES), 'utf8').subarray(-MQ_INFRA_SCAN_BYTES).toString('utf8');
           let truncatedLine = false;
           // A real failure anywhere in the log vetoes an infrastructure phrase in the tail.
-          const matched = !testFailure.test(plain) && tail.split('\n').some(line => {
+          const matched = !testFailure.test(plain)
+            && !/\bUnhandled (?:Rejection|Error)s?\b|Errors\s+\d+ errors?\b|^\s*(?:\d{4}-\d\d-\d\dT[\d:.]+Z )?Error:/mi.test(plain) && tail.split('\n').some(line => {
             if (line.length > MQ_INFRA_LINE_CHARS) truncatedLine = true;
             const boundedLine = line.slice(-MQ_INFRA_LINE_CHARS);
             return patterns.some(pattern => pattern.test(boundedLine));
@@ -1127,7 +1134,7 @@ function readMqBaseRetryEvidence({ repo, pr, head, timeline, exec, rerunScope, d
         const headIdentity = new Map();
         flaky = headGreen && failed.every(check => shardArtifact(check) !== undefined || derivedAggregate(check));
         if (flaky) {
-          flaky = readQuarantineCover({ repo, commit: oid, failed, exec, flake: { passed: (file, name, check) => {
+          const flakeCover = readQuarantineCover({ repo, commit: oid, failed, exec, flake: { passed: (file, name, check) => {
             const shard = shardArtifact(check);
             const headRuns = [newestSuccess.get(localJob(check.name))].filter(Boolean);
             const headRunId = headRuns.length === 1 ? runOf(headRuns[0]) : NaN;
@@ -1147,7 +1154,9 @@ function readMqBaseRetryEvidence({ repo, pr, head, timeline, exec, rerunScope, d
             return shard !== undefined && headRuns.length === 1 && headRuns[0].conclusion === 'success'
               && passedIn(readReport(runOf(headRuns[0]), shard, head), file, name)
               && passedIn(readReport(deciding.id, shard, deciding.head_sha), file, name);
-          } } }) === true;
+          } } });
+          if (flakeCover?.logNormalizationFailed) return flakeCover;
+          flaky = flakeCover === true;
         }
         if (!flaky && headGreen && !flakeReason) flakeReason = 'per-test pass proof missing, unreadable, expired or not from this shard (fails closed)';
       } catch { flaky = false; }
