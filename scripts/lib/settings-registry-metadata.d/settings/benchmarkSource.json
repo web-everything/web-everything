@@ -1,0 +1,6 @@
+{
+  "description": "Source of the recorded delivery handoff benchmarks.",
+  "owner": "scripts/settings/coroner-postmortem.json",
+  "changeVia": "pr",
+  "instant": false
+}

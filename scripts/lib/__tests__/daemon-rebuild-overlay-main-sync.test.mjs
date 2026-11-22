@@ -95,6 +95,7 @@ function fixture({ conflict = false, unrelated = false, count = 1, overlayTest =
   ok(root, ['update-ref', 'refs/remotes/origin/main', mainSha]);
   ok(root, ['update-ref', `refs/remotes/origin/${ref}`, oldSha]);
   const env = { ...process.env, TMPDIR: base, WE_DAEMON_OVERLAY_DIR: join(base, 'overlays'),
+    WE_OVERLAY_MAIN_SYNC_CHUNK_FILES: '', WE_HEAVY_ADMISSION_FAST_MAX_FILES: '30',
     WE_DAEMON_STATE_DIR: join(base, 'state'), WE_DAEMON_EVENTS: join(base, 'daemon-events.jsonl'),
     WE_NEEDS_YOU_FEED: join(base, 'needs-you-events.jsonl'), WE_PLATFORM_PREFERENCES_FILE: join(base, 'missing'), WE_DAEMON_OVERLAY_MAIN_SYNC: 'on' };
   addOverlay(root, { ref, pr: 123 }, { env });
@@ -1306,6 +1307,59 @@ describe('overlay main sync', () => {
     expect(fs.readFileSync(marker(f), 'utf8')).toBe('auto-rebase-owner');
   });
 
+  it('30 selected files complete within the run budget using chunks of at most 10 files', async () => {
+    const f = fixture({ count: 30, overlayTest: false }), passing = f.deps.testRunner;
+    f.deps.testRunner = vi.fn(async options => options.args.filter(a => a.endsWith('.test.mjs')).length > 10
+      ? { status: 124, stderr: 'run exceeded 480000ms and was stopped.' } : passing(options));
+    expect(await job(f)).toMatchObject({ pushed: true, tests: expect.any(Array) });
+    const files = f.deps.testRunner.mock.calls.map(([o]) => o.args.filter(a => a.endsWith('.test.mjs')));
+    expect(files.map(chunk => chunk.length)).toEqual([10, 10, 10]);
+    expect(new Set(files.flat()).size).toBe(30);
+    expect(new Set(f.deps.testRunner.mock.calls.map(([o]) => o.testReport)).size).toBe(3);
+    expect(alerts(f)).toEqual([]); unchanged(f);
+  });
+
+  it.each([
+    ['4', [4, 4, 4]], ['1', Array(12).fill(1)], ['999', [12]],
+    ['0', [10, 2]], ['-1', [10, 2]], ['1.5', [10, 2]], ['invalid', [10, 2]],
+    ['', [10, 2]], ['9007199254740992', [10, 2]],
+  ])('chunk size override %j uses bounded batches %j', async (value, sizes) => {
+    const f = fixture({ count: 12, overlayTest: false });
+    f.env.WE_OVERLAY_MAIN_SYNC_CHUNK_FILES = value;
+    expect(await job(f)).toMatchObject({ pushed: true });
+    expect(f.deps.testRunner.mock.calls.map(([o]) => o.args.filter(a => a.endsWith('.test.mjs')).length)).toEqual(sizes);
+  });
+
+  it('oversized chunk override stays capped by the fast file limit', async () => {
+    const f = fixture({ count: 40, overlayTest: false });
+    f.env.WE_OVERLAY_MAIN_SYNC_CHUNK_FILES = '999';
+    expect(await job(f)).toMatchObject({ pushed: true });
+    expect(f.deps.testRunner.mock.calls.map(([o]) => o.args.filter(a => a.endsWith('.test.mjs')).length)).toEqual([30, 10]);
+  });
+
+  it('the default chunk size also respects a smaller fast file limit', async () => {
+    const f = fixture({ count: 12, overlayTest: false });
+    f.env.WE_HEAVY_ADMISSION_FAST_MAX_FILES = '6';
+    expect(await job(f)).toMatchObject({ pushed: true });
+    expect(f.deps.testRunner.mock.calls.map(([o]) => o.args.filter(a => a.endsWith('.test.mjs')).length)).toEqual([6, 6]);
+  });
+
+  it('killed run names selected files in the error and needs-you within 1000 characters', async () => {
+    const f = fixture({ count: 10, overlayTest: false, exhausted: true });
+    ageFailure(f);
+    f.deps.testRunner = vi.fn(async () => ({ status: 124,
+      stderr: 'run exceeded 480000ms and was stopped.' + ' noisy output'.repeat(100) }));
+    const error = await job(f).catch(error => error);
+    expect(error.message).toContain('tests: run killed (timeout 480000ms, 2 attempts, 10 files)');
+    expect(error.message).toContain('worker0.test.mjs');
+    expect(error.message).toContain('worker7.test.mjs +2 more');
+    expect(error.message.length).toBeLessThanOrEqual(1000);
+    expect(error.failedTests).toEqual([]);
+    expect(alerts(f)[0].detail.reason).toBe(error.message);
+    expect(f.deps.testRunner).toHaveBeenCalledTimes(2);
+    expect(f.pushes).toEqual([]); unchanged(f);
+  });
+
   it('a large related set (under the cap) runs in full, sequentially in fast-lane-sized chunks with distinct reports before push', async () => {
     const f = fixture({ count: 101 }), passing = f.deps.testRunner;
     let active = false;
@@ -1318,8 +1372,8 @@ describe('overlay main sync', () => {
     const result = await job(f);
     expect(result.pushed).toBe(true); expect(result.tests).toHaveLength(102);
     const calls = f.deps.testRunner.mock.calls.map(([o]) => o.args);
-    expect(calls.map(args => args.filter(a => a.endsWith('.test.mjs')).length)).toEqual([30, 30, 30, 12]);
-    expect(new Set(f.deps.testRunner.mock.calls.map(([o]) => o.testReport)).size).toBe(4);
+    expect(calls.map(args => args.filter(a => a.endsWith('.test.mjs')).length)).toEqual([...Array(10).fill(10), 2]);
+    expect(new Set(f.deps.testRunner.mock.calls.map(([o]) => o.testReport)).size).toBe(11);
     expect(alerts(f)).toEqual([]); unchanged(f);
   });
 
@@ -1817,14 +1871,30 @@ describe('R372 genuine merge conflict stops retrying', () => {
     expect(json(sidecar(f)).attemptedMain[ref]).toBe(f.mainSha);
   });
 
-  it('emits one overlay-main-sync-conflict event with the conflicting files and the real git output, not a failed event', async () => {
-    const f = fixture({ conflict: true });
-    await expect(job(f)).rejects.toThrow(/merge conflicts/);
+  const expectOneConflictEvent = f => {
     const conflicts = daemonEvents(f).filter(e => e.kind === 'overlay-main-sync-conflict');
     expect(conflicts).toHaveLength(1);
     expect(conflicts[0].detail).toMatchObject({ ref, step: 'merge', main: f.mainSha, tip: f.oldSha, files: ['worker.mjs'] });
     expect(conflicts[0].detail.stderrTail).toMatch(/CONFLICT|Automatic merge failed/);
     expect(daemonEvents(f).filter(e => e.kind === 'overlay-main-sync-failed')).toEqual([]);
+  };
+
+  it('emits one overlay-main-sync-conflict event with the conflicting files and the real git output, not a failed event', async () => {
+    const f = fixture({ conflict: true });
+    await expect(job(f)).rejects.toThrow(/merge conflicts/);
+    expectOneConflictEvent(f);
+  });
+
+  it('emits one overlay-main-sync-conflict event when Git writes the conflict to stdout and a warning to stderr', async () => {
+    const f = fixture({ conflict: true });
+    const realGit = f.deps.git;
+    f.deps.git = (args, opts) => {
+      const result = realGit(args, opts);
+      return gitCommand(args) === 'merge' && result.status !== 0
+        ? { ...result, stderr: `${result.stderr ?? ''}\nbenign Git warning` } : result;
+    };
+    await expect(job(f)).rejects.toThrow(/merge conflicts/);
+    expectOneConflictEvent(f);
   });
 
   it('skips the identical (main, ref tip) pair silently and retries when the ref tip moves', async () => {

@@ -1,3 +1,4 @@
+import { SEAT_ANSWERS_SCHEMA } from './seat-assessment.mjs';
 import { renderNoPromptCommandRules } from './no-prompt-command-rules.mjs';
 import { readTestsFirstPolicy, GUARANTEE_TEST_RULE } from './tests-first-policy.mjs';
 import { cascadePolicy, logCascadeSources, platformPreference } from './policy-cascade.mjs';
@@ -1109,12 +1110,12 @@ export const PR_DIFF_ADAPTER = Object.freeze({
  * as this PR's scope creep. Omitting it (or passing `'net'`) leaves the mandate BYTE-FOR-BYTE what it is
  * without it — the golden fixture with no `diffBasis` passed is unaffected.
  * @param {{lens: string, contextIsolation?: string, netChangedFiles?: string[]|null, goal?: string,
- *   round?: number, fenced?: boolean, aim?: string, diffBasis?: string|null, reviewLevel?: ReturnType<typeof readReviewLevel>}} o
+ *   round?: number, fenced?: boolean, aim?: string, diffBasis?: string|null, reviewLevel?: ReturnType<typeof readReviewLevel>, rubric?: {items: object[]}|null}} o
  * @returns {string}
  */
 export function buildPanelMandate({
   lens, contextIsolation = 'diff-only', netChangedFiles = null, goal = '', round = 1, fenced = false,
-  aim = '', diffBasis = null, reviewLevel = readReviewLevel(),
+  aim = '', diffBasis = null, reviewLevel = readReviewLevel(), rubric = null,
 } = {}) {
   if (!PANEL_LENSES.includes(lens)) {
     throw new Error(`buildPanelMandate: unknown lens "${lens}" — must be one of ${PANEL_LENSES.join(', ')}`);
@@ -1135,6 +1136,13 @@ export function buildPanelMandate({
   // THE LENS'S OWN METHOD (#3035). `buildMandate` passes the lens as a bare NAME, which is enough for a lens
   // whose job is self-evident from the word and not enough for one that is mostly knowing where to look and
   // what settles it. Appended only for lenses that register a brief, so every existing mandate is byte-identical.
+  if (rubric?.items && ['security', 'correctness'].includes(lens)) {
+    parts.push('Return optional assessment.items alongside findings: one answer per supplied rubric item,',
+      '{itemId, outcome: "pass"|"fail"|"n/a", reason?, evidence:[{kind, location:{uri,startLine,endLine?,snippet}}]}.',
+      'Every pass cites evidence at the reviewed head; fail or n/a explains why. Never invent rubric items.',
+      'When no rubric is supplied, omit assessment; findings retain their existing meaning.');
+    if (rubric?.items) parts.push(FENCED_DATA_RULE, fenceUntrusted('rubric', JSON.stringify(rubric.items)));
+  }
   const brief = huntBriefForLens(lens);
   if (brief) parts.push(brief);
   const netFiles = (Array.isArray(netChangedFiles) ? netChangedFiles : []).filter(Boolean).map(String);
@@ -2090,3 +2098,16 @@ export function renderJuryCharter(charter) {
     ...rows,
   ].join('\n');
 }
+
+/** Optional checklist response extension; findings-only legacy responses remain valid. */
+export const REVIEW_SEAT_RESPONSE_SCHEMA = {
+  type: 'object', additionalProperties: true,
+  properties: { findings: { type: 'array', items: { type: 'object' } }, assessment: SEAT_ANSWERS_SCHEMA },
+  if: { required: ['assessment'] },
+  then: { required: ['findings'], properties: { findings: { type: 'array', items: {
+    type: 'object', required: ['summary'], properties: {
+      summary: { type: 'string', minLength: 1, pattern: '\\S' },
+      file: { type: 'string', minLength: 1 }, line: { type: 'integer', minimum: 1 },
+    },
+  } } } },
+};

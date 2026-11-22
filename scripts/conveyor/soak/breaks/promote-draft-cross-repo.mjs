@@ -174,6 +174,7 @@ export default {
           }),
           checkStaleness: () => ({}),
           readHeadCheckState: () => ({ state: 'green', why: 'soak: injected green', counts: {} }),
+          readComments: () => [],
           clearAwaitingCi: () => {},
           // `provider` deliberately OMITTED — the whole point is exercising the REAL default construction.
         }));

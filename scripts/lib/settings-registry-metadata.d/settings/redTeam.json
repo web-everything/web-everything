@@ -1,0 +1,13 @@
+{
+  "description": "Red-team queue floor, idle starts and status publication policy.",
+  "owner": "scripts/settings/red-team-queue.json",
+  "changeVia": "pr",
+  "instant": false,
+  "leaves": {
+    "queue.minConcurrent": {
+      "range": "integer 0–24",
+      "unit": "jobs",
+      "note": "also instant via operator-override capacity leaf"
+    }
+  }
+}

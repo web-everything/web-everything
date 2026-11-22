@@ -1,0 +1,6 @@
+{
+  "description": "Lapse head-bound stand-downs when a new head arrives.",
+  "owner": "scripts/settings/stand-down.json",
+  "changeVia": "pr",
+  "instant": false
+}

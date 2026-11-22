@@ -109,6 +109,8 @@ import {
 } from '../review-pr.mjs';
 import { advanceReviewPrToWriteUp } from '../record-verdict-io.mjs';
 import { loadReviewSeatSettings } from '../../lib/review-seat-provider.mjs';
+import { DEFAULT_ROUTING_POLICY } from '../../lib/dispatch-routing-policy.mjs';
+import { resolveShadowPromoted } from '../../lib/review-seat-settings.mjs';
 import { buildJudgeArgv, deriveSessionId, sessionSeed } from '../../lib/judge-spawn.mjs';
 // #xwk0tzu — the stamps the refusal reads, built through their OWN home rather than hand-written here: a
 // test that spells the marker by hand still passes when the marker's shape changes, which is the mutant the
@@ -4963,12 +4965,22 @@ describe('Gemini admission and the Codex roster', () => {
 
 describe('disabled agy shadows at the launch boundary', () => {
   it.each([undefined, false, true])('runs only Claude for mandatory seats and renders off (setting), without invoking the agy runner (promotion=%s)', async promoted => {
-    const seatSettings = loadReviewSeatSettings({ promoted: promoted === undefined ? undefined : { value: promoted, source: 'fixture' }, safeguards: { value: { shadowEnabled: false, sampleRate: 0.1, minNonClaudeSeats: 1 } }, log: () => {} });
-    const declaration = buildReviewPrOperation({ readPr: stubReader(), seatSettings });
-    const read = shapeReadFinding(stubReader()({ pr: 7, repo: 'o/n' }), { pr: 7, repo: 'o/n' });
+    const seatSettings = loadReviewSeatSettings({ policy: DEFAULT_ROUTING_POLICY, aiRouting: {},
+      shadowModel: { value: 'gemini-4-carbon-high', source: 'fixture' },
+      promoted: resolveShadowPromoted({ env: {}, platform: {}, readFile: () => JSON.stringify({
+        shadowSeats: { antigravity: { ...(promoted === undefined ? {} : { promoted }) } },
+      }), log: () => {} }),
+      promotionReplaces: { value: 'claude', source: 'fixture' },
+      safeguards: { value: { shadowEnabled: false, sampleRate: 0.1, minNonClaudeSeats: 1 } }, log: () => {} });
+    const head = 'a'.repeat(40);
+    const readPr = stubReader({ netRev: head });
+    const declaration = buildReviewPrOperation({ readPr, seatSettings });
+    const read = shapeReadFinding(readPr({ pr: 7, repo: 'o/n' }), { pr: 7, repo: 'o/n' });
     const seatRunner = vi.fn(() => { throw new Error('agy must not start'); });
-    const provider = vi.fn(async () => ({ value: CLEAN_ANSWER }));
-    const judge = createDefaultJudge({ provider, seatRunner });
+    const provider = vi.fn(async () => ({ value: CLEAN_ANSWER, servedModel: 'claude-sonnet-5-5' }));
+    const judge = createDefaultJudge({ provider, seatRunner,
+      readBuilderRecords: () => [{ dispatchKind: 'build', repo: 'o/n', pr: 7, rev: head, provider: 'codex', model: 'gpt-6.1-sol' }],
+      appendSeat: () => true });
     for (const name of ['judge', 'judgeSecurity']) {
       const request = declaration.steps.find(s => s.name === name).step.request({ input: { lens: 'correctness' }, findings: { read } });
       await judge(request);

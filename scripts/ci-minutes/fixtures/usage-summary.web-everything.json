@@ -1,0 +1,66 @@
+{
+  "timePeriod": { "year": 2026, "month": 11 },
+  "organization": "web-everything",
+  "usageItems": [
+    {
+      "product": "actions",
+      "sku": "actions_linux",
+      "unitType": "Minutes",
+      "pricePerUnit": 0.008,
+      "grossQuantity": 4200,
+      "grossAmount": 33.6,
+      "discountQuantity": 4200,
+      "discountAmount": 33.6,
+      "netQuantity": 0,
+      "netAmount": 0
+    },
+    {
+      "product": "actions",
+      "sku": "actions_macos",
+      "unitType": "Minutes",
+      "pricePerUnit": 0.08,
+      "grossQuantity": 100,
+      "grossAmount": 8,
+      "discountQuantity": 40,
+      "discountAmount": 3.2,
+      "netQuantity": 60,
+      "netAmount": 4.8
+    },
+    {
+      "product": "actions",
+      "sku": "actions_windows",
+      "unitType": "Minutes",
+      "pricePerUnit": 0.016,
+      "grossQuantity": 300,
+      "grossAmount": 4.8,
+      "discountQuantity": 100,
+      "discountAmount": 1.6,
+      "netQuantity": 200,
+      "netAmount": 3.2
+    },
+    {
+      "product": "actions",
+      "sku": "actions_storage",
+      "unitType": "GigabyteHours",
+      "pricePerUnit": 0.0004,
+      "grossQuantity": 1000,
+      "grossAmount": 0.4,
+      "discountQuantity": 250,
+      "discountAmount": 0.1,
+      "netQuantity": 750,
+      "netAmount": 0.3
+    },
+    {
+      "product": "copilot",
+      "sku": "copilot_business",
+      "unitType": "Seats",
+      "pricePerUnit": 19,
+      "grossQuantity": 2,
+      "grossAmount": 38,
+      "discountQuantity": 0,
+      "discountAmount": 0,
+      "netQuantity": 2,
+      "netAmount": 38
+    }
+  ]
+}

@@ -1,12 +1,80 @@
 /** Narrow, fail-closed resolution of append-only advisory registries; never resolves source conflicts. */
-import { lstatSync, mkdtempSync, readFileSync, readlinkSync, symlinkSync, writeFileSync, rmSync } from 'node:fs';
-import { join, resolve } from 'node:path';
+import { copyFileSync, mkdirSync, realpathSync, lstatSync, mkdtempSync, readFileSync, readlinkSync, symlinkSync, writeFileSync, rmSync } from 'node:fs';
+import { dirname, join, resolve } from 'node:path';
 import { tmpdir } from 'node:os';
 import { isDeepStrictEqual } from 'node:util';
 import { spawnSync } from 'node:child_process';
+import { fileURLToPath } from 'node:url';
+import { createHash } from 'node:crypto';
 import { FULL_SHA_RE } from './shared.mjs';
 
 export const ADVISORY_MERGE_PATHS = Object.freeze(['scripts/ci/test-timings.json', 'scripts/conveyor/soak/breaks/index.mjs']);
+export const GENERATED_MERGE_PATHS = Object.freeze({
+  'docs/agent/settings-registry.md': Object.freeze({
+    closure: Object.freeze(['scripts/lib/settings-registry.mjs', 'scripts/lib/settings-files.mjs', 'scripts/lib/operator-override-reader.mjs']),
+    inputs: Object.freeze(['scripts/settings/', 'scripts/dispatch-settings.json', 'scripts/lib/settings-registry-metadata.json', 'scripts/lib/settings-registry-metadata.d/',
+      'scripts/lib/delivery-platform-preferences.json', 'scripts/lib/delivery-priority-settings.json']),
+    argv: Object.freeze(['--write']),
+  }),
+});
+const childEnv = () => Object.fromEntries(['PATH', 'HOME', 'TMPDIR'].filter(key => process.env[key] !== undefined).map(key => [key, process.env[key]]));
+
+const daemonRoot = realpathSync(resolve(dirname(fileURLToPath(import.meta.url)), '../../..'));
+const noop = () => {};
+function cleanup(scratch, onDiagnostic) {
+  if (!scratch) return;
+  try { rmSync(scratch, { recursive: true, force: true }); } catch {
+    const diagnostic = 'advisory-merge-cleanup-failed';
+    process.stderr.write(`${diagnostic}\n`);
+    try { onDiagnostic(diagnostic); } catch { /* Diagnostics must preserve the resolution result. */ }
+  }
+}
+
+/** Execute only the daemon checkout's audited closure. Candidate closure drift holds for human resolution;
+ * candidate inputs are JSON data only. trustedRoot is an injection seam for hermetic tests. */
+export function regenerateFromTree({ git, tree, path, trustedRoot = daemonRoot, onDiagnostic = noop }) {
+  let scratch;
+  try {
+    if (!Object.hasOwn(GENERATED_MERGE_PATHS, path) || !FULL_SHA_RE.test(tree)) return null;
+    const { closure, inputs, argv } = GENERATED_MERGE_PATHS[path], required = [...closure, ...inputs];
+    const listed = git(['ls-tree', '-r', '-z', '--full-tree', tree, '--', ...required]);
+    if (listed.status !== 0) return null;
+    const entries = String(listed.stdout).split('\0').filter(Boolean).map(entry => {
+      const match = /^(100644|100755) blob ([0-9a-f]{40})\t(.+)$/.exec(entry);
+      if (!match || match[3].split('/').some(part => !part || part === '.' || part === '..')) throw Error('unsafe generator entry');
+      return { sha: match[2], name: match[3] };
+    });
+    if (required.some(item => !entries.some(({ name }) => item.endsWith('/') ? name.startsWith(item) : name === item))) return null;
+    const trusted = new Map(closure.map(name => {
+      const fullPath = join(realpathSync(trustedRoot), name);
+      if (!lstatSync(fullPath).isFile()) throw Error('unsafe trusted closure');
+      const bytes = readFileSync(fullPath);
+      const sha = createHash('sha1').update(`blob ${bytes.length}\0`).update(bytes).digest('hex');
+      if (entries.find(entry => entry.name === name)?.sha !== sha) throw Error('candidate closure drift');
+      return [name, bytes];
+    }));
+    if (entries.some(({ name }) => !closure.includes(name) && !name.endsWith('.json'))) return null;
+    // realpath: the generator's main-module guard compares import.meta.url (real path) with argv[1]; a symlinked
+    // TMPDIR (macOS /var -> /private/var) would make it silently do nothing and exit 0.
+    scratch = realpathSync(mkdtempSync(join(process.env.TMPDIR || tmpdir(), 'we-generated-merge-')));
+    for (const { sha, name } of entries) {
+      const blob = trusted.has(name) ? { status: 0, stdout: trusted.get(name) } : git(['cat-file', 'blob', sha]);
+      if (blob.status !== 0) return null;
+      mkdirSync(dirname(join(scratch, name)), { recursive: true });
+      writeFileSync(join(scratch, name), blob.stdout);
+    }
+    mkdirSync(dirname(join(scratch, path)), { recursive: true });
+    for (const args of [argv, ['--check']]) {
+      const result = spawnSync(process.execPath, [join(scratch, closure[0]), ...args], {
+        cwd: scratch, env: childEnv(), encoding: 'utf8', timeout: 30_000, killSignal: 'SIGKILL', maxBuffer: 1024 * 1024,
+      });
+      if (result.status !== 0 || result.error) return null;
+    }
+    return readFileSync(join(scratch, path), 'utf8');
+  } catch { return null; }
+  finally { cleanup(scratch, onDiagnostic); }
+}
+
 const object = value => value !== null && typeof value === 'object' && !Array.isArray(value);
 
 /** Union object entries, conservatively retaining the larger numeric observation. */
@@ -71,17 +139,28 @@ function checkModuleSyntax(path) {
   }).status === 0;
 }
 
-function readMerge(git, revisions, path) {
+function readMerge(git, revisions, path, tree, options) {
+  if (Object.hasOwn(GENERATED_MERGE_PATHS, path)) {
+    for (const revision of revisions) {
+      const staged = revision.startsWith(':');
+      const listed = git(staged ? ['ls-files', '-s', '-z', '--', path] : ['ls-tree', '-z', revision, '--', path]);
+      if (listed.status !== 0) return null;
+      const entries = String(listed.stdout).split('\0').filter(Boolean);
+      const expected = staged ? new RegExp(`^100644 [0-9a-f]{40} ${revision.slice(1)}\\t`) : /^100644 blob [0-9a-f]{40}\t/;
+      if (!entries.some(entry => expected.test(entry) && entry.slice(entry.indexOf('\t') + 1) === path)) return null;
+    }
+  }
   const inputs = revisions.map(revision => git(['show', `${revision}:${path}`]));
   if (inputs.some(result => result.status !== 0)) return null;
+  if (Object.hasOwn(GENERATED_MERGE_PATHS, path)) return regenerateFromTree({ git, tree, path, ...options });
   return (path === ADVISORY_MERGE_PATHS[0] ? mergeTimingsJson : mergeRegistryLines)(
     ...inputs.map(result => String(result.stdout)));
 }
 
-const advisoryOnly = paths => paths.length > 0 && paths.every(path => ADVISORY_MERGE_PATHS.includes(path));
+const advisoryOnly = paths => paths.length > 0 && paths.every(path => ADVISORY_MERGE_PATHS.includes(path) || Object.hasOwn(GENERATED_MERGE_PATHS, path));
 
 /** Builds a tree using an isolated index, leaving the caller's index and checkout untouched. */
-export function resolveAdvisoryConflicts({ git, cur, ovSha }) {
+export function resolveAdvisoryConflicts({ git, cur, ovSha, trustedRoot = daemonRoot, onDiagnostic = noop }) {
   let scratch;
   try {
     if (![cur, ovSha].every(revision => FULL_SHA_RE.test(revision))) return null;
@@ -101,12 +180,13 @@ export function resolveAdvisoryConflicts({ git, cur, ovSha }) {
     const options = { env: { GIT_INDEX_FILE: join(scratch, 'index') } };
     if (git(['read-tree', tree], options).status !== 0) return null;
     for (const path of paths) {
-      const text = readMerge(git, [baseSha, cur, ovSha], path);
+      const text = readMerge(git, [baseSha, cur, ovSha], path, tree, { trustedRoot, onDiagnostic });
       if (text === null) return null;
       const blobPath = join(scratch, path.endsWith('.mjs') ? 'index.mjs' : 'timings.json');
       writeFileSync(blobPath, text);
       if (path.endsWith('.mjs') && !checkModuleSyntax(blobPath)) return null;
-      const blob = git(['hash-object', '-w', '--', blobPath]);
+      // --no-filters: store exactly the validated bytes; a clean filter matching the scratch name must not swap them.
+      const blob = git(['hash-object', '-w', '--no-filters', '--', blobPath]);
       const blobSha = String(blob.stdout ?? '').trim();
       if (blob.status !== 0 || !FULL_SHA_RE.test(blobSha)) return null;
       if (git(['update-index', '--add', '--cacheinfo', '100644', blobSha, path], options).status !== 0) return null;
@@ -116,24 +196,42 @@ export function resolveAdvisoryConflicts({ git, cur, ovSha }) {
     return written.status === 0 && FULL_SHA_RE.test(mergedTree)
       ? { ok: true, via: 'advisory-merge', tree: mergedTree } : null;
   } catch { return null; }
-  finally { if (scratch) rmSync(scratch, { recursive: true, force: true }); }
+  finally { cleanup(scratch, onDiagnostic); }
 }
 
 /** Resolves only an advisory-only in-progress merge, then completes its merge commit. */
-export function resolveAdvisoryInWorktree({ git, cwd }) {
+export function resolveAdvisoryInWorktree({ git, cwd, commit = true, trustedRoot = daemonRoot, onDiagnostic = noop }) {
+  let scratch;
   try {
     const unmerged = git(['diff', '--name-only', '-z', '--diff-filter=U']);
     if (unmerged.status !== 0) return false;
     const paths = String(unmerged.stdout ?? '').split('\0').filter(Boolean);
     if (!advisoryOnly(paths)) return false;
     const mergeHead = git(['rev-parse', '--verify', 'MERGE_HEAD']);
-    if (mergeHead.status !== 0 || !FULL_SHA_RE.test(String(mergeHead.stdout ?? '').trim())) return false;
-    const merged = paths.map(path => ({ path, text: readMerge(git, [':1', ':2', ':3'], path) }));
+    const inProgress = mergeHead.status === 0 ? mergeHead : !commit ? git(['rev-parse', '--verify', 'REBASE_HEAD']) : mergeHead;
+    if (inProgress.status !== 0 || !FULL_SHA_RE.test(String(inProgress.stdout ?? '').trim())) return false;
+    let tree;
+    if (paths.some(path => Object.hasOwn(GENERATED_MERGE_PATHS, path))) {
+      const index = git(['rev-parse', '--git-path', 'index']);
+      if (index.status !== 0 || !String(index.stdout ?? '').trim()) return false;
+      scratch = mkdtempSync(join(process.env.TMPDIR || tmpdir(), 'we-generated-index-'));
+      copyFileSync(resolve(cwd, String(index.stdout).trim()), join(scratch, 'index'));
+      // Some legacy git callbacks accept argv only. Run the private-index writes directly so they cannot
+      // silently drop GIT_INDEX_FILE and mutate the caller's index. Removing unmerged paths leaves stage 0.
+      const privateGit = args => spawnSync('git', args, { cwd, encoding: 'utf8', timeout: 30_000,
+        killSignal: 'SIGKILL', maxBuffer: 1024 * 1024, env: { ...childEnv(), GIT_INDEX_FILE: join(scratch, 'index') } });
+      if (privateGit(['update-index', '--force-remove', '--', ...paths]).status !== 0) return false;
+      const written = privateGit(['write-tree']);
+      tree = String(written.stdout ?? '').trim();
+      if (written.status !== 0 || !FULL_SHA_RE.test(tree)) return false;
+    }
+    const merged = paths.map(path => ({ path, text: readMerge(git, [':1', ':2', ':3'], path, tree, { trustedRoot, onDiagnostic }) }));
     if (merged.some(({ text }) => text === null)) return false;
     // Back up only the files we will stage and the index, for rollback on any failure.
     const originals = new Map(paths.map(path => {
       const fullPath = join(cwd, path);
       const stat = lstatSync(fullPath);
+      if (Object.hasOwn(GENERATED_MERGE_PATHS, path) && stat.isSymbolicLink()) throw new Error('generated file is a symlink');
       if (!stat.isFile() && !stat.isSymbolicLink()) throw new Error('unsupported advisory file');
       return [path, { link: stat.isSymbolicLink(),
         data: stat.isSymbolicLink() ? readlinkSync(fullPath) : readFileSync(fullPath) }];
@@ -158,13 +256,24 @@ export function resolveAdvisoryInWorktree({ git, cwd }) {
     };
     try {
       for (const { path, text } of merged) writeFileSync(join(cwd, path), text);
-      for (const { path } of merged) {
+      // Expected blob ids come from the validated bytes themselves. `git add` applies clean filters and
+      // attributes (ident, eol, working-tree-encoding — some settable by the merged .gitattributes), so every
+      // staged path, generated or not, must hash to exactly what was validated or the resolution is refused.
+      const expectedHashes = new Map();
+      for (const { path, text } of merged) {
         if (path.endsWith('.mjs') && !checkModuleSyntax(join(cwd, path))) return restore();
+        const bytes = Buffer.from(text);
+        expectedHashes.set(path, createHash('sha1').update(`blob ${bytes.length}\0`).update(bytes).digest('hex'));
       }
       if (git(['add', '--', ...paths]).status !== 0) return restore();
+      for (const [path, sha] of expectedHashes) {
+        const staged = git(['rev-parse', `:${path}`]);
+        if (staged.status !== 0 || String(staged.stdout ?? '').trim() !== sha) return restore();
+      }
       const remaining = git(['diff', '--name-only', '-z', '--diff-filter=U']);
       if (remaining.status !== 0 || String(remaining.stdout ?? '') !== '') return restore();
-      return git(['commit', '--no-edit']).status === 0 || restore();
+      return !commit || git(['commit', '--no-edit']).status === 0 || restore();
     } catch { return restore(); }
   } catch { return false; }
+  finally { cleanup(scratch, onDiagnostic); }
 }

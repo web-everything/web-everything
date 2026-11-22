@@ -1,0 +1,6 @@
+{
+  "description": "Reuse of passing rebuild proofs and boot retry/concurrency bounds.",
+  "owner": "scripts/settings/rebuild-smoke.json",
+  "changeVia": "pr",
+  "instant": false
+}

@@ -109,6 +109,51 @@ const { extractAnchors } = createRequire(import.meta.url)('./rules-loader.cjs');
  * fail-closed direction is human, never committee.
  */
 export const TRUST_CHAIN = [
+  {
+    role: 'lane-git-hardening', file: 'lane-git-hardening.mjs', tier: 'policy', leash: 'code',
+    desc: 'Immutable Git input and configuration trust boundary', homes: ['scripts/lib/lane-git-hardening.mjs'],
+  },
+  {
+    role: 'drain-red-team-evidence', file: 'drain-red-team-evidence.mjs', tier: 'policy', leash: 'code',
+    desc: 'Merge admission red-team evidence validation', homes: ['scripts/lib/drain-red-team-evidence.mjs'],
+  },
+  {
+    role: 'red-team-check-run', file: 'red-team-check-run.mjs', tier: 'policy', leash: 'code',
+    desc: 'Red-team check success and provenance validation', homes: ['scripts/lib/red-team-check-run.mjs'],
+  },
+  {
+    role: 'checklist-seat-assessment',
+    file: 'seat-assessment.mjs',
+    tier: 'policy',
+    leash: 'code',
+    desc: 'CKLST-B checklist seat derivation',
+    homes: ['scripts/lib/seat-assessment.mjs'],
+  },
+  {
+    role: 'checklist-seat-ac-rubric',
+    file: 'seat-ac-rubric.mjs',
+    tier: 'policy',
+    leash: 'code',
+    desc: 'CKLST-B checklist seat derivation',
+    homes: ['scripts/lib/seat-ac-rubric.mjs'],
+  },
+  {
+    role: 'checklist-seat-assessment.test',
+    file: 'seat-assessment.test.mjs',
+    tier: 'policy',
+    leash: 'spec',
+    desc: 'CKLST-B checklist conformance contract',
+    homes: ['scripts/lib/__tests__/seat-assessment.test.mjs'],
+  },
+  {
+    role: 'checklist-seat-ac-rubric.test',
+    file: 'seat-ac-rubric.test.mjs',
+    tier: 'policy',
+    leash: 'spec',
+    desc: 'CKLST-B checklist conformance contract',
+    homes: ['scripts/lib/__tests__/seat-ac-rubric.test.mjs'],
+  },
+
   ...['card-ledger-trust.json', 'card-ledger-legacy-identities.json'].map(file => ({
     role: file === 'card-ledger-trust.json' ? 'card-ledger-trust' : 'card-ledger-legacy-identities',
     file, tier: 'policy', leash: 'spec', homes: [`scripts/settings/${file}`],

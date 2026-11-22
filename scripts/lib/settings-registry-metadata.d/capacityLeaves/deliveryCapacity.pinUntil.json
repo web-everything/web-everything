@@ -1,0 +1,5 @@
+{
+  "description": "Expiry of a delivery capacity pin.",
+  "range": "positive safe integer ≤ now + 72 hours",
+  "unit": "epoch milliseconds"
+}

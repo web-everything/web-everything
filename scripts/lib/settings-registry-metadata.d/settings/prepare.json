@@ -1,0 +1,6 @@
+{
+  "description": "Preparation retries, sizing, runner and per-tick PR listing budgets.",
+  "owner": "scripts/settings/prepare.json",
+  "changeVia": "pr",
+  "instant": false
+}

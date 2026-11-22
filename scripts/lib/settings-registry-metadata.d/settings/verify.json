@@ -1,0 +1,6 @@
+{
+  "description": "Verification load and infrastructure retries and gate ceiling policy.",
+  "owner": "scripts/settings/verify-recovery.json",
+  "changeVia": "pr",
+  "instant": false
+}

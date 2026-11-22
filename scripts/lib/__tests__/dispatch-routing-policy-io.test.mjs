@@ -159,7 +159,7 @@ it('excludes a policy-disabled Claude capacity winner before reserving Codex for
   const dispatch = { kind: 'prepare-item', size: 3, scopePaths: ['we:scripts/example.mjs'] };
   const record = vi.fn();
   const options = { env: {}, repo: { routing: { builder: 'auto', capacity: { claudeUsageAccount: 'claude-a' } } },
-    routingPolicy: policy, capacity, now, quota: () => ({ used_percent: 20 }), record, scorecards: [] };
+    routingPolicy: policy, capacity, now, quota: () => ({ at: now, used_percent: 20 }), record, scorecards: [] };
   expect(chooseBuilder({ kind: dispatch.kind, capacities: capacity, settings: { now }, fallback: null }).provider).toBe('claude');
   expect(resolveDispatchRoute(dispatch, { ...options,
     repo: { routing: { builder: 'auto', capacity: { enabled: false } } } }))
@@ -203,7 +203,7 @@ it.each([
   const capacity = providers.map(p => ({ ...p, provider: p.id, health: 1, known: !p.emergencyOnly,
     windows: p.emergencyOnly ? [] : [{ usedPercent: 10, resetsAt: now + (p.launcher === 'claude' ? 2 : 120) * 3600000 }] }));
   const record = vi.fn();
-  const options = { env: {}, routingPolicy: policy, now, quota: () => ({ used_percent: 20 }), record, scorecards: [], capacity,
+  const options = { env: {}, routingPolicy: policy, now, quota: () => ({ at: now, used_percent: 20 }), record, scorecards: [], capacity,
     repo: { routing: { builder: 'auto', capacity: { allowUnknownEmergency: true } }, providerCapacity: { providers } } };
   const route = resolveDispatchRoute(dispatch, options);
   expect(route).toMatchObject({ outcome: variant === 'build' ? 'routed' : 'role', executed: 'codex' });
@@ -232,7 +232,7 @@ it.each([
       resetsAt: now + (p.id === 'codex' ? 120 : 2) * 3600000 }] }));
   const record = vi.fn();
   const dispatch = { kind, size: 3, scopePaths: ['we:scripts/example.mjs'] };
-  const options = { env: {}, routingPolicy: DEFAULT_ROUTING_POLICY, now, quota: () => ({ used_percent: 20 }), record,
+  const options = { env: {}, routingPolicy: DEFAULT_ROUTING_POLICY, now, quota: () => ({ at: now, used_percent: 20 }), record,
     scorecards: [], capacity, [holdSource]: { [held]: 'operator hold' },
     repo: { routing: { builder: 'auto', capacity: { claudeUsageAccount: 'claude-a', allowUnknownEmergency: true } },
       providerCapacity: { providers } } };
