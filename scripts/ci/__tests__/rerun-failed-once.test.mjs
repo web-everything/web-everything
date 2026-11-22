@@ -79,9 +79,16 @@ it('duplicate enabled keys in platform JSON disable retries', async () => {
   try {
     const file = join(dir, 'policy.json');
     writeFileSync(file, '{"ciUnitRerun":{"enabled":false,"enabled":true}}');
-    await refused(fixture({ policy: resolve({ platform: undefined, env: { WE_PLATFORM_PREFERENCES_FILE: file },
-      readPreferences: options => { const result = readPlatformPreferences(options);
-        expect(result.errors[0]).toContain('duplicate JSON property'); return result; } }) }));
+    const log = vi.fn();
+    await refused(fixture({ policy: resolve({ platform: undefined, env: { WE_PLATFORM_PREFERENCES_FILE: file }, log }) }));
+    expect(log).toHaveBeenCalledWith(expect.stringContaining('platform preference read error'));
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+it('shared preferences preserve stricter lanes with an unrelated duplicate key and no errors', () => {
+  const dir = mkdtempSync(join(process.env.TMPDIR, 'ci-unit-rerun-'));
+  try { const file = join(dir, 'policy.json');
+    writeFileSync(file, '{"lanes":{"maxConcurrent":1},"unrelated":{"key":false,"key":true}}');
+    expect(readPlatformPreferences({ env: { WE_PLATFORM_PREFERENCES_FILE: file } })).toEqual({ prefs: { lanes: { maxConcurrent: 1 }, unrelated: { key: true } }, errors: [] });
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
 it('oversized evidence refuses retry with a manual fallback', async () => {

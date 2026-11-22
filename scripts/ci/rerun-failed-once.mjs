@@ -13,9 +13,15 @@ import { fileURLToPath } from 'node:url';
 import { spawnSync } from 'node:child_process';
 import { readSettingsChecked } from '../lib/settings-files.mjs';
 import { cascadePolicy, readPlatformPreferences } from '../lib/policy-cascade.mjs';
+import { hasDuplicateProperties } from '../lib/settings-registry.mjs';
 
 export function resolvePolicy({ tool, platform, env = {}, log = console.error,
-  readSettings = readSettingsChecked, readPreferences = readPlatformPreferences } = {}) {
+  readSettings = readSettingsChecked, readPreferences = ({ env }) => readPlatformPreferences({ env,
+    readFile: (path, enc) => {
+      const raw = readFileSync(path, enc);
+      if (hasDuplicateProperties(String(raw))) throw new Error('duplicate JSON property');
+      return raw;
+    } }) } = {}) {
   const standard = { enabled: false, maxFiles: 10, flakeAllowlist: [] };
   try {
     if (tool === undefined) {

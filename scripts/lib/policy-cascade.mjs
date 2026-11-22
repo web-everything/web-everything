@@ -30,7 +30,6 @@ import { homedir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { readOperatorOverrides, CAPACITY_LEAVES, failClosedCapacity } from './operator-override-reader.mjs';
-import { hasDuplicateProperties } from './settings-registry.mjs';
 import { isUnderTest } from './under-test.mjs';
 import { classify, directionFor, isLoosening } from './settings-safe-direction.mjs';
 
@@ -70,8 +69,7 @@ export function readPlatformPreferences({ env = process.env, readFile = readFile
   const errors = [];
   for (const path of paths) {
     try {
-      const raw = String(readFile(path, 'utf8')), data = JSON.parse(raw);
-      if (hasDuplicateProperties(raw)) throw new Error('duplicate JSON property');
+      const data = JSON.parse(String(readFile(path, 'utf8')));
       if (!isObj(data)) { errors.push(`${path}: not a JSON object`); continue; }
       for (const [k, v] of Object.entries(data)) {
         if (['routingOverrides', 'findingClasses'].includes(k) && (path !== operatorPreferencesPath(env)
