@@ -43,7 +43,7 @@ try {
     reconcile: () => ({ dispatch: [{ kind: 'promote-draft', prNumber: ${PR}, headRefOid: 'a'.repeat(40) }], refusals: [] }),
     provider: { ready: (n) => out.ready.push(n) },
     readHeadCheckState: () => ({ state: 'green', why: 'all required checks succeeded', counts: {} }),
-    readPrLabels: () => [], clearAwaitingCi: () => {},
+    readPrLabels: () => [], readComments: () => [], clearAwaitingCi: () => {},
   });
 } catch (e) { out.threw = String(e.message).split('\\n')[0]; }
 const empty = () => ({ dispatched: [], refusals: [] });

@@ -61,7 +61,7 @@ export default {
           provider: { ready: number => readyCalls.push(number) },
           checkStaleness: () => ({ fresh: true, behind: 0 }),
           readHeadCheckState: () => ({ state: 'green', why: 'required checks succeeded' }),
-          readPrLabels: () => labels(fresh), clearAwaitingCi: () => {},
+          readPrLabels: () => labels(fresh), readComments: () => [], clearAwaitingCi: () => {},
         });
         check(readyCalls.length === expected, `${name}: provider.ready called ${readyCalls.length} times, expected ${expected}`);
         check(result.dispatched.length === expected, `${name}: unexpected dispatch report`);

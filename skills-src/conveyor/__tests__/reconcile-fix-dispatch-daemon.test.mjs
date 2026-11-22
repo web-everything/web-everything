@@ -2146,7 +2146,7 @@ describe('runTickAllRepos — one reconcile plan per repo per pass', () => {
     const readHeadCheckState = vi.fn(() => ({ state: live.invalid ? 'red' : 'green', why: 'live check' }));
     vi.spyOn(promoteDispatch, 'runReconcilePromoteDraftDispatch').mockImplementation(options => realPromote({
       ...options, root: '/fixture', checkStaleness, readHeadCheckState,
-      readPrLabels: () => [], provider: { ready: promote },
+      readPrLabels: () => [], readComments: () => [], provider: { ready: promote },
     }));
     let elapsed = 0;
     const planner = vi.spyOn(reconcilePass, 'runReconcilePass').mockImplementation(() => {
