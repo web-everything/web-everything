@@ -1,0 +1,6 @@
+{
+  "description": "Review churn detection and loop cap policy.",
+  "owner": "scripts/settings/review.json",
+  "changeVia": "pr",
+  "instant": false
+}

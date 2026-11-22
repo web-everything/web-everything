@@ -1,0 +1,5 @@
+{
+  "description": "Delivery slots held back for CI-heal work.",
+  "range": "integer 0–12",
+  "unit": "slots"
+}

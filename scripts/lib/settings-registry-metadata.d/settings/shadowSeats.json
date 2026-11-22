@@ -1,0 +1,6 @@
+{
+  "description": "Shadow review provider trials, sample rate and promotion policy.",
+  "owner": "scripts/settings/review.json",
+  "changeVia": "pr",
+  "instant": false
+}

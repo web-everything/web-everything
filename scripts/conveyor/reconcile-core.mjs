@@ -107,7 +107,7 @@ import { runEligibilityShadow, eligibilityShadowDeps, reportShadowError } from '
  * branch below is reachable in a test with no network and no credential.
  */
 import { roundExtensionGrants } from './round-extension-mark.mjs';
-import { isAiGeneratedPr } from '../lib/ai-pr-authorship.mjs';
+import { isAiGeneratedPr, isMechanicalMergeCommit, isDrainBookkeepingCommit } from '../lib/ai-pr-authorship.mjs';
 import { reviewCiGate } from '../lib/review-ci-gate.mjs';
 import { REFERRAL_HOLD_MARKER } from './review-referral-hold.mjs';
 import { rulingDisputeText, noticedRungs } from '../lib/ruling-ledger.mjs';
@@ -170,6 +170,7 @@ import {
   isLatestAdvisoryFindingAddressed, isAdvisoryMechanismStandDownSuperseded,
 } from './advisory-fix-mark.mjs';
 import { CONFLICT_LABEL } from './conflict-label.mjs';
+import { isOperatorParked, OPERATOR_PARK_MARKER, OPERATOR_PARK_RELEASE_MARKER } from './draft-promotion-rule.mjs';
 // advisory-after-cap (web-everything/web-everything#2766 live incident, 2026-09-27) — see the ADVISORY-FIX
 // cap-exhausted branch below for why the "is a fresh review owed on a stale advisory note" check reuses these
 // two, never a second reimplementation of "does the newest advisory comment name this PR's CURRENT head".
@@ -190,7 +191,7 @@ import {
 // second derivation): `parseReviewedSha` recovers the head an ACCEPT-shaped verdict (`accepted`/`clear-human`/
 // `restamp`) covered. See {@link planReconcile}'s ONE-REVIEW-PER-HEAD refusal for why this pass needs it too.
 import {
-  parseReviewedSha, headEverHumanCleared, planConvertSupersededVerdict, targetedCheckQuestion, findAcceptVerdictComment, REVIEW_LABELS,
+  parseReviewedSha, parseLatestHumanClearedSha, headEverHumanCleared, planConvertSupersededVerdict, targetedCheckQuestion, findAcceptVerdictComment, REVIEW_LABELS,
 } from '../lib/review-escalation.mjs';
 import { loadExternalCheckApps, isExternalAppCheck } from './external-check-apps.mjs';
 // live incident, web-everything/web-everything PR #2752 (#4034/#2748) — a PR whose own content is ALREADY on `main`,
@@ -305,7 +306,7 @@ export const DISPATCH_KINDS = Object.freeze(['fix', 'review', 'ci-heal', 'ci-tim
 export const REFUSAL_KINDS = Object.freeze([
   'split-required', 'intake-unmeasurable',
   'fix-join-wait',
-  'review-ci', 'review-referrals-pending',
+  'review-ci', 'review-referrals-pending', 'advisory-unreadable',
   'stood-down', 'load-flake-hold', 'load-flake-rearm-owed', 'no-findings', 'cap-exhausted',
   'live-process', 'awaiting-permission', 'liveness-unknown',
   'owed-elsewhere', 'owed-main-rule', 'owed-ci-rerun', 'nothing-owed', 'already-reviewed-head', 'already-landed',
@@ -694,6 +695,8 @@ export function countFindings(comments) {
     if (typeof body !== 'string') continue;
     const head = body.trimStart();
     if (BOOKKEEPING_MARKERS.some((m) => head.startsWith(m))) continue;
+    // Park/release markers are bookkeeping ONLY from a trusted author: an untrusted comment starting with one must not hide findings.
+    if ([OPERATOR_PARK_MARKER, OPERATOR_PARK_RELEASE_MARKER].some((m) => head.startsWith(m)) && isTrustedMarkerAuthor(c)) continue;
     if (head.split(/\r?\n/, 1)[0] === NOTE_COMMENT_MARKER && isTrustedMarkerAuthor(c)
       && /^<!-- conveyor-note-key: [a-z][a-z0-9-]*:(?:\d+|unknown)(?::[^\r\n<>]*)? -->$/m.test(body)) continue;
     n += 1;
@@ -1628,7 +1631,30 @@ function advisoryHeadState(pr) {
   return { headSha, latest, advisoryIsCurrent, alreadyReviewed, unpinnedAdvisory };
 }
 
-/** Unreadable or unpinned history grants nothing; cross-head chronology must agree with thread order. */
+/**
+ * A review:human head that moved only mechanically (a main merge / update-branch / drain bookkeeping / conveyor
+ * recovery commit) owes one fresh advisory. Decided on the trusted advisory comment and the 40-hex live head:
+ * `{ owed: true, head }` when a readable advisory exists, does not cover the head, and no verdict covers it either;
+ * `{ unreadable: true }` when an advisory note exists but none is readable (no advisory dispatch);
+ * repair and operator-ruling owners remain independent. Otherwise `{ owed: false }`.
+ */
+export function advisoryHeadMoveState(pr) {
+  const { headSha, latest, advisoryIsCurrent, alreadyReviewed, unpinnedAdvisory } = advisoryHeadState(pr);
+  if (!/^[0-9a-f]{40}$/.test(headSha)) return { owed: false };
+  const trusted = (Array.isArray(pr?.comments) ? pr.comments : []).filter(isTrustedMarkerAuthor);
+  const hasNote = trusted.some(c => String(c?.body ?? '').trimStart().startsWith(ADVISORY_NOTE_MARKER));
+  const commits = Array.isArray(pr?.commits) ? pr.commits : [];
+  const tip = commits.find(commit => String(commit?.oid ?? '').toLowerCase() === headSha);
+  const mechanical = Boolean(tip) && String(tip.oid ?? '').toLowerCase() === headSha
+    && (isMechanicalMergeCommit(tip) || isDrainBookkeepingCommit(tip) || /^Conveyor-[A-Za-z-]+:/m.test(String(tip.messageBody ?? '')));
+  if (advisoryIsCurrent || alreadyReviewed || parseLatestHumanClearedSha(trusted) === headSha) return { owed: false };
+  // Current-head coverage wins over unrelated unreadable history. Otherwise fail closed for this advisory.
+  if (!latest) return hasNote && mechanical ? { owed: false, unreadable: true } : { owed: false };
+  if (unpinnedAdvisory) return mechanical ? { owed: false, unreadable: true } : { owed: false };
+  return mechanical ? { owed: true, head: headSha, latestHead: latest.head ?? null } : { owed: false };
+}
+
+/** Current-head chronology uses only that head; cross-head grants require readable, ordered history. */
 function latestHeadReview(pr, { currentHeadOnly = false } = {}) {
   const reviews = (Array.isArray(pr?.comments) ? pr.comments : [])
     .map((c, index) => ({ c, index }))
@@ -1636,13 +1662,14 @@ function latestHeadReview(pr, { currentHeadOnly = false } = {}) {
     // Operator send-backs are requests, not finished reviews of a head.
     .filter(({ c }) => !isOperatorAuthored(c) || !openOperatorSendBacks({ comments: [c] }).length)
     .map(({ c, index }) => ({ index, head: reviewedHeadsOf(c).at(-1) ?? latestAdvisory([c])?.head, at: Date.parse(c.createdAt) }));
-  if (!reviews.length || reviews.some(r => !r.head || !Number.isFinite(r.at))) return null;
+  if (!reviews.length) return null;
   const current = reviews.filter(r => sameHeadSha(r.head, pr.headRefOid));
   if (currentHeadOnly) {
-    // Other heads' clocks cannot hide a newer operator request on this head.
-    if (current.some((r, i) => i > 0 && r.at <= current[i - 1].at)) return null;
+    // Unpinned history and other heads' clocks cannot hide a newer operator request on this head.
+    if (current.some((r, i) => !Number.isFinite(r.at) || (i > 0 && r.at <= current[i - 1].at))) return null;
     return current.at(-1) ?? null;
   }
+  if (reviews.some(r => !r.head || !Number.isFinite(r.at))) return null;
   // Coverage is independent of chronology: a skewed old-head review cannot reopen this head.
   if (current.length || reviews.some((r, i) => i > 0 && r.at <= reviews[i - 1].at)) return null;
   return reviews.at(-1);
@@ -2890,6 +2917,14 @@ export function planReconcile({
         refuse('draft', { ...withPhase, why: 'draft PR is withdrawn — explicit release is required before promotion' });
         continue;
       }
+      if (!Array.isArray(pr.comments)) {
+        refuse('draft', { ...withPhase, why: 'draft PR comments are missing or malformed — re-read the complete thread before promotion' });
+        continue;
+      }
+      if (isOperatorParked(pr.comments)) {
+        refuse('draft', { ...withPhase, why: 'draft PR is operator-parked — explicit release is required before promotion' });
+        continue;
+      }
       const redTeamHold = labelNames(pr.labels).find(label => ['red-team:blocked', 'red-team:pending'].includes(label));
       if (redTeamHold) {
         refuse('draft', { ...withPhase, why: `${redTeamHold} — a draft held by red team is never promoted` });
@@ -3682,13 +3717,42 @@ export function planReconcile({
       continue;
     }
 
+    // Repair, send-back and ruling owners above keep priority over an advisory, including an unreadable one.
+    // One advisory per mechanical head; it is not a repair round and does not apply the red-team seat's hold.
+    let unreadableHeadMoveAdvisory = false;
+    if (advisoryReviewOnHumanHandoff === 'on' && phase === 'needs-human' && !withPhase.labels.includes(ADVISORY_LABELS.CHANGES)) {
+      const moved = advisoryHeadMoveState(pr);
+      unreadableHeadMoveAdvisory = Boolean(moved.unreadable);
+      if (moved.owed) {
+        const rowsBefore = dispatch.length;
+        const buffered = [];
+        const bufferRefusal = (...args) => buffered.push(args);
+        dispatchReviewRow({
+          pr, requiredChecks, withPhase, base, attempts: roundAttempts(), roundCap: effectiveRoundCap, now, dispatch,
+          refuse: bufferRefusal, refuseCapExhausted: capExhaustedVia(bufferRefusal), extra: { headMovedAdvisory: true },
+          advisoryReview: { head: moved.head, reason: 'head-moved-advisory',
+            why: `the head moved mechanically to \`${moved.head}\` and the newest advisory is on \`${moved.latestHead ?? 'none'}\`;`
+              + ' one advisory review runs on the live head so the human sees a current verdict; it never accepts a review:human PR' },
+        });
+        if (dispatch.length > rowsBefore) {
+          if (dispatch.slice(rowsBefore).every(d => d.kind === 'review' && d.advisoryReview)) {
+            buffered.forEach(args => refuse(...args));
+            continue;
+          }
+          dispatch.length = rowsBefore;
+        }
+        // A speculative review gate may refuse or propose a repair. Discard it with its rows; the normal
+        // path below owns the final refusal/repair, so the report records this PR only once.
+      }
+    }
+
     // A pushed repair owes its review even if fix-end left the old findings/advisory labels in place.
     // Claims and live reviewers already refused above; completed red CI still belongs to its repair path.
     // Both the timestamp and original thread index must put the release after that review.
     // A released fix does not supersede a conflict still owed its existing repair route and cap.
     const lastReview = latestHeadReview(pr);
     const release = releasedFixClaim(pr);
-    if (OWED[phase] && lastReview && release && release.releasedAtMs > lastReview.at
+    if (OWED[phase] && !unreadableHeadMoveAdvisory && lastReview && release && release.releasedAtMs > lastReview.at
       && !withPhase.labels.includes(CONFLICT_LABEL) && String(pr?.mergeStateStatus ?? '').toUpperCase() !== 'DIRTY'
       && release.index > lastReview.index
       && !sameHeadSha(lastReview.head, pr.headRefOid)
@@ -4003,6 +4067,11 @@ export function planReconcile({
     // All three checks (the head guard, no-findings, the cap) live in {@link dispatchReviewRow} — the ONE copy,
     // shared with the ci-red-parallel review above (PR #2783 review: the review decision was duplicated here).
     if (OWED[phase] === 'review') {
+      // Unreadable history blocks the advisory, while missing-job and other repair owners above still run.
+      if (unreadableHeadMoveAdvisory) {
+        refuse('advisory-unreadable', { ...withPhase, why: 'the newest advisory on this review:human PR cannot be read, so no review is dispatched; a person must read the thread' });
+        continue;
+      }
       dispatchReviewRow({ pr, requiredChecks, withPhase, base, attempts: roundAttempts(), roundCap: effectiveRoundCap, refuse, refuseCapExhausted, dispatch, now });
       continue;
     }

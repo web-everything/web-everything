@@ -1,0 +1,6 @@
+{
+  "description": "Head-bound review intake size cap, path exemptions, trusted overrides and round-end enforcement.",
+  "owner": "scripts/settings/review-intake.json",
+  "changeVia": "env",
+  "instant": false
+}

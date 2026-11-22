@@ -1,0 +1,6 @@
+{
+  "description": "Bounded cooldown releases when a review verdict never lands.",
+  "owner": "scripts/settings/review-no-verdict-retry.json",
+  "changeVia": "pr",
+  "instant": false
+}
