@@ -3,7 +3,9 @@ bornAs: xnlo0ns
 kind: story
 size: 8
 parent: "2804"
-status: open
+status: parked
+parkedReason: maturityGated
+maturityTrigger: "adoptionSignal: DZ P3 planned in the Plateau UI pipeline"
 blockedBy: []
 scope:
   - "plateau-app:src/backlog-view/lane-board.ts"
