@@ -1,4 +1,6 @@
 #!/usr/bin/env node
+import { admitHotpatch } from './lib/hotpatch-guards.mjs';
+import { createHotpatchReaders } from './lib/hotpatch-readers.mjs';
 /**
  * @file scripts/daemon-overlay.mjs
  * Pinned remove/retire publishes a durable rebuild request for the clone owner; unpinned withdrawals do not.
@@ -954,7 +956,14 @@ export async function main(argv = process.argv.slice(2), deps = {}) {
     const runGuard = async () => {
       const overlayState = readOverlayState(root, { env });
       if (overlayState.corrupt) return { ok: false, reason: 'overlay-store-corrupt', corruptStore: true };
+      const hotpatchSha = flags.ref.startsWith('hotpatch/') ? flags.ref.slice(9) : null;
+      if (hotpatchSha !== null) {
+        const admission = await admitHotpatch(hotpatchSha, deps.hotpatchReaders ?? createHotpatchReaders({ cwd: root, env }));
+        if (admission.outcome !== 'pass') return { ok: false, reason: admission.detail, admission };
+        if (flags['expected-sha'] && flags['expected-sha'] !== hotpatchSha) return { ok: false, reason: 'hotpatch-ref-sha-mismatch' };
+      }
       const check = await stackAwareOverlayCheck({ root, ref: flags.ref, pr, existingOverlays: overlayState.overlays, env });
+      if (check.ok && hotpatchSha !== null && check.candSha !== hotpatchSha) return { ...check, ok: false, reason: 'hotpatch-ref-sha-mismatch' };
       // Compare the guard's fetched candidate INSIDE the add lock, before any registration write.
       if (check.ok && flags['expected-sha'] && check.candSha !== flags['expected-sha']) {
         return { ...check, ok: false, reason: 'sha-moved', expectedSha: flags['expected-sha'] };

@@ -16,9 +16,9 @@ For repo defaults, edit the owner file through a PR and rebuild the consuming da
 
 ## Summary
 
-- Top-level keys: 164 (166 declaration rows).
-- Declared leaves: 618 (platform copies counted separately).
-- Instant top-level keys: 0; not instant: 164.
+- Top-level keys: 168 (170 declaration rows).
+- Declared leaves: 622 (platform copies counted separately).
+- Instant top-level keys: 4; not instant: 164.
 - Instant capacity leaves: 15.
 - Constants to settle: 312.
 - Instant gaps: 28.
@@ -65,6 +65,7 @@ Operator-prefs layer: ~/.plateau/platform-preferences.json is the requested oper
 | allowedSigners | scripts/settings/card-ledger-trust.json | 1 | [] | pr | no | Trusted card-ledger signers. |
 | archive | scripts/settings/archive-retention.json | 1 | {"runsBatchCap":5000} | pr | no | Archive retention and bounded archive batch policy. |
 | audit | scripts/settings/codex-audit.json | 10 | {"verdict":{"mode":"model"},"preExisting":{"mode":"block","… | pr | no | Audit verdict, pre-existing finding and protected path policy. |
+| auditBar | scripts/settings/hotpatch.json | 1 | "no-pr-introduced-security" | pr | yes | Hotpatch security audit bar; ruled WEAKENED evidence remains unverifiable. |
 | auditRecordPath | scripts/settings/prototype-load.json | 1 | "~/workspace/.operations/coordination/audits.jsonl" | pr | no | Audit coordination record location. |
 | authority | scripts/settings/orchestrator-authority.json | 1 | {"redMainQuarantine":false} | pr | no | Repository grant for orchestrator red-main quarantine authority. |
 | autoRoundGrant | scripts/settings/review.json | 3 | {"cardOnly":{"enabled":true,"maxPerPr":3,"repos":["web-ever… | pr | no | Automatic bounded extra review rounds for eligible card-only work. |
@@ -132,6 +133,7 @@ Operator-prefs layer: ~/.plateau/platform-preferences.json is the requested oper
 | humanReviewSurfaces | scripts/settings/human-review-surfaces.json | 1 | "narrow" | pr | no | Scope of surfaces requiring human review. |
 | kindMaxSize | scripts/settings/agy-build.json | 1 | 3 | env | no | Maximum direct confined agy build size for allowedKinds; repair dispatch remains size 1. |
 | launchAgentsDir | scripts/settings/prototype-load.json | 1 | "~/Library/LaunchAgents" | pr | no | Host directory for rendered launchd agent definitions. |
+| liveWhen | scripts/settings/hotpatch.json | 1 | "after-receipt-and-audit" | pr | yes | Hotpatch loads require completed CI and canonical audit admission. |
 | livenessSweep | scripts/settings/liveness-sweep.json | 11 | {"prNoMovementMinutes":120,"prRedUnownedMinutes":60,"selfUp… | pr | no | Staleness thresholds, escalation rungs and recovery attempt limits. |
 | loadGovernor | scripts/settings/load-governor.json | 10 | {"enabled":true,"targetLoadPerCore":2,"resumeBelowPerCore":… | pr | no | Host load targets, pause priorities and resumption thresholds. |
 | loaderCli | scripts/settings/prototype-load.json | 1 | "scripts/daemon-overlay.mjs" | pr | no | CLI used to load daemon overlays. |
@@ -153,6 +155,7 @@ Operator-prefs layer: ~/.plateau/platform-preferences.json is the requested oper
 | operatorCli | scripts/settings/operator-cli.json | 1 | {"freshFallback":"on"} | pr | no | Allow a fresh operator CLI fallback. |
 | operatorUsernameSha256 | scripts/settings/privacy-terms-allowlist.json | 1 | ["cb89fdbcb4b894166b90fca32c9a56935d21f27c40f0f8c1611ee4624… | pr | no | Hashed operator usernames recognized by the portability gate. |
 | overlayDropped | scripts/settings/overlay-dropped.json | 1 | {"freshMinutes":30} | pr | no | Freshness window for detecting dropped overlays. |
+| parallel | scripts/settings/hotpatch.json | 1 | true | pr | yes | Start hotpatch audit in parallel with CI. |
 | parallelSeats | scripts/settings/review.json | 1 | "on" | pr | no | Enable parallel review seats. |
 | postAcceptAdvisory | scripts/settings/review.json | 1 | {"mode":"off"} | pr | no | Advisory review mode after acceptance; retired observer defaults off. |
 | prLandReady | scripts/settings/pr-land-ready.json | 1 | {"guardConfigPaths":["scripts/settings/prototype-load.json"… | pr | no | Configuration paths requiring guarded landing readiness. |
@@ -175,6 +178,7 @@ Operator-prefs layer: ~/.plateau/platform-preferences.json is the requested oper
 | rebuildSmoke | scripts/settings/rebuild-smoke.json | 5 | {"reuseEnabled":true,"reuseHours":12,"bootSignalRetries":1,… | pr | no | Reuse of passing rebuild proofs and boot retry/concurrency bounds. |
 | rebuildSmokeDryRun | scripts/settings/rebuild-smoke.json | 3 | {"prSample":12,"snapshotStaleOkMs":900000,"lanePoolListCach… | pr | no | PR sample, snapshot age and lane list cache for dry-run smoke. |
 | rebuildSmokeReadMemo | scripts/settings/rebuild-smoke.json | 1 | {"enabled":true} | pr | no | Share identical read-only GitHub calls within a rebuild smoke. |
+| receiptSource | scripts/settings/hotpatch.json | 1 | "ci-full-suite" | pr | yes | Hotpatch receipts come from the bound full CI suite. |
 | recordPath | scripts/settings/prototype-load.json | 1 | "~/workspace/.operations/coordination/prototype-loads.jsonl" | pr | no | Prototype load coordination record location. |
 | redMainHold | scripts/settings/red-main-hold.json | 1 | "on" | pr | no | Contain merge drain work while main CI is red. |
 | redMainMode | scripts/settings/red-main-hold.json | 1 | "quarantine" | pr | no | Stop or quarantine behavior while main CI is red. |

@@ -1,3 +1,5 @@
+import { admitHotpatch } from '../lib/hotpatch-guards.mjs';
+import { createHotpatchReaders } from '../lib/hotpatch-readers.mjs';
 /**
  * @file Injected prototype admission transaction.
  * WHY (incident 2026-10-22): preserve main, reject incomplete evidence, and retain mutable
@@ -238,7 +240,7 @@ export function loadRuledWeakened({ platform, tool, fs, env, warn = console.warn
 }
 export function createPrototypeLoader({ exec, fs, now, sleep, env, settings, combinedTest, cloneKey: keyForClone = cloneKey,
   readState = readOverlayState,
-  retirePlanner = defaultRetirePlanner, fingerprint = null, testCheck = null, readUrgentKey = () => fs.readFileSync(urgentKeyPath(env.HOME)), dispatchSmoke = null, realDispatchSmoke = runRealDispatchSmoke, removeRegistration = null,
+  retirePlanner = defaultRetirePlanner, hotpatchReaders = null, fingerprint = null, testCheck = null, readUrgentKey = () => fs.readFileSync(urgentKeyPath(env.HOME)), dispatchSmoke = null, realDispatchSmoke = runRealDispatchSmoke, removeRegistration = null,
   resolveOperatorIdentity: operatorIdentity = resolveOperatorIdentity }) {
   const expand = (p) => p.startsWith('~/') ? join(env.HOME, p.slice(2)) : p;
   const read = (p) => { try { return fs.readFileSync(p, 'utf8'); } catch (e) { if (e.code === 'ENOENT') return ''; throw e; } };
@@ -492,8 +494,12 @@ export function createPrototypeLoader({ exec, fs, now, sleep, env, settings, com
       const hotpatch = typeof input.branch === 'string' && input.branch.startsWith('hotpatch/');
       if (hotpatch && input.urgent) return stop('no-ready', { detail: 'hotpatch-needs-ci-receipt', fallback: 'A hotpatch ref never loads on an urgent marker: wait for the CI test receipt and the own-sha audit.' });
       if (hotpatch && input.branch !== `hotpatch/${input.sha}`) return stop('no-ready', { detail: 'hotpatch-ref-sha-mismatch', fallback: 'The ref suffix must equal --sha exactly: hotpatch/<40-hex sha>.' });
-      // P8-b adds the receipt and own-sha audit admission (admitHotpatch); until it lands no hotpatch ref loads here.
-      if (hotpatch) return stop('no-ready', { detail: 'hotpatch-needs-ci-receipt', fallback: 'Hotpatch admission (CI receipt plus own-sha audit) is not available yet; use the normal lane/ path.' });
+      if (hotpatch) {
+        requireGit('fetch', 'origin', input.branch);
+        if (requireGit('rev-parse', `origin/${input.branch}`) !== input.sha) return stop('no-ready', { detail: 'hotpatch-ref-sha-mismatch' });
+        const admission = await admitHotpatch(input.sha, hotpatchReaders ?? createHotpatchReaders({ cwd: gitRepo, env: childEnv, exec, files: fs }));
+        if (admission.outcome !== 'pass') return stop('no-ready', admission);
+      }
       if (!hotpatch && !safeRef(input.branch)) return stop('bad-input', { detail: 'bad-branch', fallback: 'Pass --branch=lane/<name>: a branch under lane/ with only letters, digits, dot, dash, underscore and slash.' });
       if (!validSha(input.sha)) return stop('bad-input', { detail: 'bad-sha', fallback: 'Use the full 40-character sha (git rev-parse origin/<branch>), not a short sha.' });
       if (!Number.isFinite(config.adoption?.timeoutMs) || config.adoption.timeoutMs < 0
@@ -659,7 +665,7 @@ export function createPrototypeLoader({ exec, fs, now, sleep, env, settings, com
       readinessStep = 'branch-tip-unreadable';
       requireGit('fetch', 'origin', input.branch);
       const tip = requireGit('rev-parse', `origin/${input.branch}`);
-      if (tip !== input.sha) return stop('no-ready', { detail: 'sha-not-branch-tip', gate: { ...out.gate, reason: 'sha-not-branch-tip', tip }, fallback: `${input.sha} is not the tip of ${input.branch}: the branch tip is ${tip}. Load the tip (re-run tests and audit if the code changed) or push the branch back to the tested sha.` });
+      if (tip !== input.sha) return stop('no-ready', { detail: hotpatch ? 'hotpatch-ref-sha-mismatch' : 'sha-not-branch-tip', gate: { ...out.gate, reason: 'sha-not-branch-tip', tip }, fallback: `${input.sha} is not the tip of ${input.branch}: the branch tip is ${tip}. Load the tip (re-run tests and audit if the code changed) or push the branch back to the tested sha.` });
       stage = 'check-unverifiable';
       requireGit('fetch', 'origin', 'main', input.branch);
       const own = changedPaths(requireGit('diff', '--name-status', '-z', `origin/main...${input.sha}`));
@@ -698,6 +704,7 @@ export function createPrototypeLoader({ exec, fs, now, sleep, env, settings, com
       // `conflict` is set only after exact-head GitHub evidence and a signed full-suite receipt.
       // Keep that tested head intact: merging main would either refuse its known conflict or
       // publish a different, unreceipted tree. The target overlay checks below still must pass.
+      if (hotpatch && !contains) return stop('no-ready', { detail: 'hotpatch-behind-main', fallback: 'Rebase through the normal merge path and obtain receipts on the new SHA.' });
       if (!contains && !conflict) {
         const merge = git('merge-tree', '--write-tree', 'origin/main', input.sha);
         if (merge.code === 1) {

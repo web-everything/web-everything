@@ -17,6 +17,7 @@ import { recordWaivers } from '../ruled-weakened-record.mjs';
 import { createPrototypeLoader, defaultDeps } from '../prototype-load-io.mjs';
 import { netDiffFingerprint } from '../../lib/net-diff-fingerprint.mjs';
 import { resolveDaemonKey, changedPaths, comparePaths, nextMergeRef, prototypeLoadOperation, PROTOTYPE_LOAD_EFFECT } from '../prototype-load.mjs';
+import { hotpatchFixture } from '../../lib/__tests__/fixtures/hotpatch.mjs';
 import { urgentSignature } from '../urgent-verify-marker.mjs';
 const urgentKey = Buffer.alloc(32, 7);
 import * as prototypeLoad from '../prototype-load.mjs';
@@ -275,7 +276,7 @@ function fixture(options = {}) {
     readState: options.readState ?? (() => ({ corrupt: false, overlays: [...registrations.values(), ...admitted] })),
     // defaultTestCheck leaves the seam unset so the production check-run reader (gh api + workflow binding) runs.
     testCheck: options.defaultTestCheck ? undefined : options.testCheck ?? (async ({ sha }) => ({ sha, name: 'test', status: 'completed', conclusion: 'success', appId: 15368 })),
-    dispatchSmoke: options.dispatchSmoke, removeRegistration: options.removeRegistration, ...(options.fingerprint ? { fingerprint: options.fingerprint } : {}), ...(options.defaultCombined ? {} : { combinedTest }), settings: structuredClone({ ...settings, auditRecordPath: '~/canonical-audits.jsonl', ...options.settings }), now: () => clock,
+    hotpatchReaders: options.hotpatchReaders, dispatchSmoke: options.dispatchSmoke, removeRegistration: options.removeRegistration, ...(options.fingerprint ? { fingerprint: options.fingerprint } : {}), ...(options.defaultCombined ? {} : { combinedTest }), settings: structuredClone({ ...settings, auditRecordPath: '~/canonical-audits.jsonl', ...options.settings }), now: () => clock,
     cloneKey: (root) => { cloneRoots.push(root); return 'test-clone-key'; },
     sleep: async (ms) => { sleeps.push(ms); clock += ms; await options.onSleep?.(); } });
   return { calls, records, readyWrites, sleeps, admitted, reads, cloneRoots, lateChanges, registrations, combinedTest, retirePlanner, run: (input = {}) => load({ ...BASE, sha: candidateSha, ...input }) };
@@ -344,19 +345,24 @@ describe('urgent prototype admission', () => {
     expect(f.readyWrites.at(-1)).toMatchObject({ tests: 'green', testCheck: { source: 'urgent-local-full', marker, reason } });
     expect(f.records).toContainEqual(expect.objectContaining({ type: 'prototype-load.urgent', clone: expect.any(String), registration: expect.objectContaining({ clone: expect.any(String), ref: expect.any(String), sha: SHA }), ref: BASE.branch, sha: SHA, reason, marker }));
   });
-  it('hotpatch ref loads only with a bound green CI test receipt and a NOT WEAKENED own-sha audit; urgent marker and pending CI refuse (P8-a: urgent refusal and ref/sha binding)', async () => {
-    const f = fixture({ testCheck: async () => null, urgentLedger: JSON.stringify(marker) });
+  it('hotpatch ref loads only with a bound green CI test receipt and a NOT WEAKENED own-sha audit; urgent marker and pending CI refuse', async () => {
+    const pending = hotpatchFixture(); pending.data.checks.check_runs[0].status = 'queued';
+    pending.data.checks.check_runs[0].conclusion = null;
+    const f = fixture({ hotpatchReaders: pending.readers, testCheck: async () => null, urgentLedger: JSON.stringify(marker) });
     expect(await f.run({ branch: `hotpatch/${SHA}`, urgent: true, reason })).toMatchObject({ ok: false, stopReason: 'no-ready', detail: 'hotpatch-needs-ci-receipt' });
     expect(mutations(f, 'add')).toEqual([]);
-    expect(f.readyWrites).toEqual([]);
-    const g = fixture({ testCheck: async () => null, urgentLedger: JSON.stringify(marker) });
-    expect(await g.run({ branch: `hotpatch/${'d'.repeat(40)}`, reason })).toMatchObject({ ok: false, stopReason: 'no-ready', detail: 'hotpatch-ref-sha-mismatch' });
+    const weak = hotpatchFixture(); weak.data.audits[0].verdict = 'WEAKENED'; weak.data.audits[0].findings = ['security'];
+    weak.data.ruledWeakened = [{ sha: SHA, ref: `hotpatch/${SHA}`, ruling: 'R1', findings: ['security'] }];
+    const w = fixture({ hotpatchReaders: weak.readers });
+    expect(await w.run({ branch: `hotpatch/${SHA}` })).toMatchObject({ ok: false, detail: 'hotpatch-audit-unverifiable' });
+    expect(mutations(w, 'add')).toEqual([]);
+    const g = fixture({ hotpatchReaders: hotpatchFixture().readers, sha: TREE });
+    expect(await g.run({ branch: `hotpatch/${SHA}`, sha: SHA })).toMatchObject({ ok: false, detail: 'hotpatch-ref-sha-mismatch' });
     expect(mutations(g, 'add')).toEqual([]);
-    const k = fixture({ testCheck: async () => ({ sha: SHA, name: 'test', status: 'completed', conclusion: 'success' }) });
-    expect(await k.run({ branch: `hotpatch/${SHA}` })).toMatchObject({ ok: false, detail: 'hotpatch-needs-ci-receipt' });
-    expect(mutations(k, 'add')).toEqual([]);
-    const h = fixture({ testCheck: async () => null, urgentLedger: JSON.stringify(marker) });
-    expect(await h.run({ branch: 'hotpatch/short', reason })).toMatchObject({ ok: false, detail: 'hotpatch-ref-sha-mismatch' });
+    const h = fixture({ hotpatchReaders: hotpatchFixture().readers });
+    expect(await h.run({ branch: `hotpatch/${SHA}` })).toMatchObject({ ok: true });
+    expect(mutations(h, 'add')).toHaveLength(1);
+    expect(mutations(h, 'add')[0].args).toContain(`--expected-sha=${SHA}`);
   });
   it.each(['ledger', 'workflow'])('refuses unreadable %s with an operator fallback', async (missing) => {
     const f = fixture({ testCheck: async () => null, ...(missing === 'workflow' ? { urgentLedger: JSON.stringify(marker), urgentWorkflow: 'broken' } : {}) });

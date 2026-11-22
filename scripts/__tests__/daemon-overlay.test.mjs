@@ -15,7 +15,7 @@ import { tmpdir } from 'node:os';
 import { join, dirname, resolve } from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
-import { withAddGuardLock, stackAwareOverlayCheck, findStackBases } from '../daemon-overlay.mjs';
+import { main as overlayMain, withAddGuardLock, stackAwareOverlayCheck, findStackBases } from '../daemon-overlay.mjs';
 import { overlayFilePath } from '../lib/daemon-overlays.mjs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
@@ -726,5 +726,51 @@ describe('findStackBases', () => {
       expect(cmd).toBe('git');
       expect(opts).toMatchObject({ cwd: '/clone', env: { GIT_OPTIONAL_LOCKS: '0' } });
     }
+  });
+});
+
+describe('hotpatch add admission', () => {
+  async function hotpatchAdd(f, readers) {
+    const tip = gitOk(f.cloneDir, ['rev-parse', 'HEAD']).trim();
+    gitOk(f.originDir, ['update-ref', `refs/heads/hotpatch/${tip}`, tip]);
+    const oldEnv = { ...process.env }, oldCode = process.exitCode;
+    Object.assign(process.env, f.env);
+    const stdout = vi.spyOn(process.stdout, 'write').mockImplementation(() => true);
+    const stderr = vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
+    try {
+      process.exitCode = 0;
+      await overlayMain(['add', `--clone=${f.cloneDir}`, `--ref=hotpatch/${tip}`, '--pr=1', '--json'], { hotpatchReaders: readers, pruneStaleOverlayRecords: () => {} });
+      return { code: process.exitCode, output: stdout.mock.calls.map(c => c[0]).join('') };
+    } finally {
+      stdout.mockRestore(); stderr.mockRestore(); process.env = oldEnv; process.exitCode = oldCode;
+    }
+  }
+  it('direct add of hotpatch/<sha> runs the same receipt and audit admission', async () => {
+    const { hotpatchFixture } = await import('../lib/__tests__/fixtures/hotpatch.mjs');
+    const f = makeFixture(), fixture = hotpatchFixture();
+    const tip = gitOk(f.cloneDir, ['rev-parse', 'HEAD']).trim();
+    for (const check of fixture.data.checks.check_runs) check.head_sha = tip;
+    fixture.data.workflows.workflow_runs[0].head_sha = tip; fixture.data.audits[0].head = tip;
+    const audit = fixture.data.audits[0]; fixture.data.audits = [];
+    const checks = vi.fn(fixture.readers.checks); fixture.readers.checks = checks;
+    const result = await hotpatchAdd(f, fixture.readers);
+    expect(checks).toHaveBeenCalled();
+    expect(result.code).not.toBe(0);
+    expect(overlayStateFile(f.overlayDir, f.cloneDir)?.overlays ?? []).toEqual([]);
+    fixture.data.audits = [audit];
+    expect((await hotpatchAdd(f, fixture.readers)).code).toBe(0);
+    expect(overlayStateFile(f.overlayDir, f.cloneDir).overlays).toEqual([expect.objectContaining({ ref: `hotpatch/${tip}` })]);
+  });
+  it("hotpatch add refuses when the test check turns failed between prototype-load's read and add", async () => {
+    const { hotpatchFixture } = await import('../lib/__tests__/fixtures/hotpatch.mjs');
+    const { admitHotpatch } = await import('../lib/hotpatch-guards.mjs');
+    const f = makeFixture(), fixture = hotpatchFixture();
+    const tip = gitOk(f.cloneDir, ['rev-parse', 'HEAD']).trim();
+    for (const check of fixture.data.checks.check_runs) check.head_sha = tip;
+    fixture.data.workflows.workflow_runs[0].head_sha = tip; fixture.data.audits[0].head = tip;
+    expect(await admitHotpatch(tip, fixture.readers)).toMatchObject({ outcome: 'pass' });
+    fixture.data.checks.check_runs[0].conclusion = 'failure';
+    expect((await hotpatchAdd(f, fixture.readers)).code).not.toBe(0);
+    expect(overlayStateFile(f.overlayDir, f.cloneDir)?.overlays ?? []).toEqual([]);
   });
 });
