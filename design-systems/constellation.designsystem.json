@@ -1,0 +1,11 @@
+{
+  "extends": "@webtheme/default",
+  "themeTokens": "./constellation.tokens.json",
+  "intentDefaults": {
+    "density": "comfortable",
+    "motion": "natural"
+  },
+  "traitDefaults": {
+    "radius": "md"
+  }
+}
