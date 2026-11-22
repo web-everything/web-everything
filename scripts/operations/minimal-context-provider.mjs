@@ -143,6 +143,9 @@ export function laneHasCommitAhead({ lane, base = 'origin/main', run: runFn = ru
  *  agent needs to build/edit + report; extend it here, in the one place, if a future brief needs more. */
 export const RESTRICTED_PROVIDER_TOOLS = 'Bash,Edit,Write,Read,Glob,Grep';
 
+/** Fix and ci-heal briefs require an adversarial subagent review, so their allowlist also carries `Agent`. */
+export const LEAN_FIX_TOOLS = `${RESTRICTED_PROVIDER_TOOLS},Agent`;
+
 /** Derive restricted repair hooks from this checkout at call time; never silently omit repo guards.
  * Agent|Task and Monitor guards are nontrivial and outside the six-tool repair surface. */
 export function LEAN_FIX_HOOKS_SETTINGS(settingsPath = resolve(dirname(fileURLToPath(import.meta.url)), '../../.claude/settings.json')) {
@@ -161,7 +164,7 @@ export function LEAN_FIX_HOOKS_SETTINGS(settingsPath = resolve(dirname(fileURLTo
   if (!all.every(validEntry)) throw new Error('incomplete repair hook entries');
   return {
     hooks,
-    permissions: { allow: RESTRICTED_PROVIDER_TOOLS.split(',') },
+    permissions: { allow: LEAN_FIX_TOOLS.split(',') },
   };
 }
 

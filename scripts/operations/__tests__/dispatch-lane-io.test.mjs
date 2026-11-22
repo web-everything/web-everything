@@ -35,7 +35,9 @@ describe('lean repair background argv', () => {
     for (const kind of ['fix', 'ci-heal']) {
       const argv = buildAgentArgv(options(kind));
       expect(argv).toContain('--restricted');
-      expect(argv[argv.indexOf('--tools') + 1]).toBe('Bash,Edit,Write,Read,Glob,Grep');
+      expect(argv[argv.indexOf('--tools') + 1]).toBe('Bash,Edit,Write,Read,Glob,Grep,Agent');
+      expect(argv[argv.indexOf('--tools') + 1].split(',')).toContain('Agent');
+      expect(buildAgentArgv(options('build'))).not.toContain('--tools');
       expect(argv).toContain('--strict-mcp-config');
       expect(argv).toContain('--disable-slash-commands');
       expect(argv).toContain('--model');
@@ -79,7 +81,7 @@ describe('lean repair background argv', () => {
       const settings = JSON.parse(argv[argv.indexOf('--settings') + 1]);
       expect(settings.env).toEqual({ PATH: '/fixture/bin', WE_CONVEYOR_WORKER: '1' });
       expect(settings.worktree).toEqual({ bgIsolation: 'none' });
-      expect(settings.permissions?.allow).toEqual(['Bash', 'Edit', 'Write', 'Read', 'Glob', 'Grep']);
+      expect(settings.permissions?.allow).toEqual(['Bash', 'Edit', 'Write', 'Read', 'Glob', 'Grep', 'Agent']);
       // Every event and matcher, verbatim: nothing filtered (PostToolUse, broadcast and catch-alls included).
       expect(settings.hooks).toEqual(canonical.hooks);
       expect(Object.keys(settings.hooks)).toEqual(Object.keys(canonical.hooks));

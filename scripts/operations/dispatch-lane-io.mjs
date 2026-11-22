@@ -1,5 +1,5 @@
 import { NO_PROMPT_SESSION_KINDS } from '../lib/no-prompt-command-rules.mjs';
-import { LEAN_FIX_HOOKS_SETTINGS, RESTRICTED_PROVIDER_TOOLS } from './minimal-context-provider.mjs';
+import { LEAN_FIX_HOOKS_SETTINGS, LEAN_FIX_TOOLS } from './minimal-context-provider.mjs';
 import { appendBuildRequirements, resolveBuildPolicy } from '../lib/build-policy.mjs';
 import { applyTestsFirstPolicy } from '../lib/tests-first-policy.mjs';
 import { readPreparePolicy } from '../conveyor/prepare-policy-settings.mjs';
@@ -2683,7 +2683,7 @@ export function buildAgentArgv({
     // #x9fbg1x — `worktree` rides in the SAME object, never a second `--settings` flag (the CLI would only
     // honour the last one anyway).
     '--settings', JSON.stringify(sessionSettings),
-    ...(leanFix ? ['--restricted', '--tools', RESTRICTED_PROVIDER_TOOLS, '--strict-mcp-config', '--disable-slash-commands'] : []),
+    ...(leanFix ? ['--restricted', '--tools', LEAN_FIX_TOOLS, '--strict-mcp-config', '--disable-slash-commands'] : []),
     ...(systemPromptFile ? ['--append-system-prompt-file', String(systemPromptFile)] : []),
     ...(table ? [...effortArgs, ...modelArgs] : []),
     ...args,
