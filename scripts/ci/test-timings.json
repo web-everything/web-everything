@@ -2031,7 +2031,10 @@
   "webcases/__tests__/requirementValidator.test.ts": 0.02,
   "webtraits/__tests__/intentProfileResolver.test.ts": 0.01,
   "webtraits/__tests__/surfaceIntentResolver.test.ts": 0.02,
-  "wrapper-conformance/__tests__/runner.test.ts": 0.01
+  "wrapper-conformance/__tests__/runner.test.ts": 0.01,
+  "scripts/lib/__tests__/daemon-rebuild-early-launch.test.mjs": 1,
+  "scripts/lib/__tests__/daemon-rebuild-early-timing.test.mjs": 1,
+  "scripts/lib/__tests__/daemon-rebuild-recovery.test.mjs": 1
  },
  "soak": {
   "scripts/conveyor/soak/breaks/lane-pool-release-unpushed-guard.soak.test.mjs": 315.93,
@@ -2413,6 +2416,9 @@
   "scripts/conveyor/soak/breaks/capacity-routing-ignores-expiring-quota.soak.test.mjs": 0.1,
   "scripts/conveyor/soak/breaks/daemon-git-developer-dir.soak.test.mjs": 1,
   "scripts/conveyor/soak/breaks/watchdog-pr-list-transient-retry.soak.test.mjs": 3,
+  "scripts/conveyor/soak/breaks/rebuild-launch-before-next-tick.soak.test.mjs": 2,
+  "scripts/conveyor/soak/breaks/rebuild-held-recovery.soak.test.mjs": 1,
+  "scripts/conveyor/soak/breaks/rebuild-evidence-compatibility.soak.test.mjs": 1,
   "scripts/conveyor/soak/breaks/mq-unreadable-log-single-retry.soak.test.mjs": 1,
   "scripts/conveyor/soak/breaks/mq-same-head-unexecuted-refresh-retry.soak.test.mjs": 1,
   "scripts/conveyor/soak/breaks/drain-mq-log-reader-escape-sequences.soak.test.mjs": 1
