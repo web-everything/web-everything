@@ -50,6 +50,7 @@
   "scripts/lint-locus-prefix.mjs": 2,
   "scripts/measure-judge-spawn.mjs": 2,
   "scripts/mine-golden-corpus.mjs": 2,
+  "scripts/operations/build-priority-set-io.mjs": 1,
   "scripts/operations/dispatch-lane-io.mjs": 2,
   "scripts/operations/handoff-home.mjs": 2,
   "scripts/operations/record-verdict-io.mjs": 2,
