@@ -8,6 +8,8 @@ import {scanBundleRange} from '../remote-git-bundle.mjs';
 
 const yieldLoop=()=>new Promise(resolve=>setImmediate(resolve));
 const ceiling=1024*1024;
+// Each 1 MiB scan is CPU-bound; a loaded CI shard blew vitest's 5 s default (PR 7348 shard 1).
+const scanTimeoutMs=60_000;
 const binary=createHash('shake256',{outputLength:ceiling}).update('forge admission ceiling fixture').digest();
 
 // Bounded CI sweep includes prose, large structured text and compressed binary blobs.
@@ -41,7 +43,7 @@ describe('Forge key structure tracked fixture sources',()=>{
       await yieldLoop();
       expect(credentialBufferFinding(content)).toBeNull();
     }
-  });
+  },scanTimeoutMs);
   it.each(['DER','JWK','UTF-16LE','UTF-16BE'])('still detects embedded %s in 1 MiB binary views',async format=>{
     const jwk=JSON.stringify({['k'+'ty']:'oct',k:'a'});
     const payload={DER:Buffer.from([48,6,2,1,1,4,1,7]),JWK:Buffer.from(jwk),
@@ -52,7 +54,7 @@ describe('Forge key structure tracked fixture sources',()=>{
     expect(keyStructureFinding(content)).toBe('private-key-structure');
     await yieldLoop();
     expect(credentialBufferFinding(content)).toBe('private-key-structure');
-  });
+  },scanTimeoutMs);
   it.each(fixtures)('adds no finding over ordinary tracked fixture source %s',async file=>{
     const content=readFileSync(file);
     await yieldLoop();
@@ -60,7 +62,7 @@ describe('Forge key structure tracked fixture sources',()=>{
     // The bundle scanner uses this shared admission hook for every added blob.
     await yieldLoop();
     expect(credentialBufferFinding(content)).not.toBe('private-key-scan-budget-exhausted-use-local');
-  });
+  },scanTimeoutMs);
   it.each(ordinaryTextFixtures)(
     'admits the ordinary tracked blob through the bundle scanner: %s',async file=>{
       const content=readFileSync(file),commit='a'.repeat(40),blob='b'.repeat(40);
