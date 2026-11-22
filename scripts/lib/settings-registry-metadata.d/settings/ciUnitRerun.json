@@ -1,5 +1,5 @@
 {
-  "description": "Enable one retry of failed unit files and bound the number of files retried.",
+  "description": "Control one bounded retry of failed unit files and the allowlist permitted to recover a shard.",
   "owner": "scripts/settings/ci-unit-rerun.json",
   "changeVia": "pr",
   "instant": false

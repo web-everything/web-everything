@@ -346,6 +346,6 @@ test('generated documentation preserves original bytes except the intentional pe
   const doc = readFileSync(join(ROOT, 'docs/agent/settings-registry.md'), 'utf8');
   const originalInstruction = 'For repo defaults, edit the owner file through a PR and rebuild the consuming daemon. Add or update metadata in scripts/lib/settings-registry-metadata.json, then run `node scripts/lib/settings-registry.mjs --write`. Verify with `node scripts/lib/settings-registry.mjs --check`. Missing declarations or invalid evidence block generation; repair the named file before regenerating.';
   const original = doc.replace(/^For repo defaults,.*$/m, originalInstruction);
-  assert.equal(createHash('sha256').update(original).digest('hex'), '89e2cf659a4ff5b79ce12881783181ee2b321aeb73dfd43344e2f3f7ce0c900d');
+  assert.equal(createHash('sha256').update(original).digest('hex'), '76cf30afed6cf657e1f4f5939437e3b469b4247662d1aee0f4fa26970bd77564');
   execFileSync(process.execPath, [join(ROOT, 'scripts/lib/settings-registry.mjs'), '--check']);
 });

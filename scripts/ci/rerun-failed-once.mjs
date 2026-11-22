@@ -1,38 +1,57 @@
 /**
  * A single bounded retry distinguishes intermittent unit failures from reproducible breaks without
- * hiding either: every retried file is recorded, and only proven passing retries can recover a shard.
+ * hiding either: every retried file is recorded, and only allowlisted passing retries can recover a shard.
  * The original coverage is retained; retries use the same coverage mode in a separate directory. Missing evidence, process errors,
  * and widespread failures stay red for operator inspection. This is evidence collection, not quarantine.
+ * Requires coverage/first-run-<shard>.json with {runId, sha} matching GITHUB_RUN_ID/GITHUB_SHA.
+ * Slice 2 writes that sidecar in the workflow and wires the teardown marker writer in vitest.globalSetup.mjs.
  * Usage (only after a nonzero first run): node scripts/ci/rerun-failed-once.mjs --shard=N --mode=covered|nocov --first-exit=<code> -- [quarantine args]
  */
 import { existsSync, readFileSync, writeFileSync, mkdirSync, rmSync } from 'node:fs';
 import { resolve, relative, isAbsolute } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { spawnSync } from 'node:child_process';
-import { readSettings } from '../lib/settings-files.mjs';
-import { cascadePolicy } from '../lib/policy-cascade.mjs';
+import { readSettingsChecked } from '../lib/settings-files.mjs';
+import { cascadePolicy, readPlatformPreferences } from '../lib/policy-cascade.mjs';
 
-export function resolvePolicy({ tool, platform, env = {}, log = console.error } = {}) {
-  const enabled = env.WE_CI_UNIT_RERUN_ENABLED;
-  const envValues = {
-    enabled: enabled === undefined ? undefined : /^(true|1)$/.test(enabled) ? true : /^(false|0)$/.test(enabled) ? false : enabled,
-    maxFiles: env.WE_CI_UNIT_RERUN_MAX_FILES === undefined ? undefined : Number(env.WE_CI_UNIT_RERUN_MAX_FILES),
-  };
-  const valid = { enabled: v => typeof v === 'boolean', maxFiles: v => Number.isSafeInteger(v) && v > 0 };
-  const { value, platform: loadedPlatform } = cascadePolicy('ciUnitRerun', tool, {
-    standard: { enabled: true, maxFiles: 10 }, platform, operatorOverride: {}, envValues, valid,
-    env: { ...env, WE_POLICY_CASCADE_LOG: '1' }, log,
-  });
-  // Fail closed: a malformed setting at any layer (a typo'd disable, a bad cap) turns retries OFF rather than
-  // falling back to the permissive default, so a broken config can never grant failure recovery.
-  // Validate the same platform snapshot the cascade used, including preferences loaded from disk.
-  const invalid = [['platform', loadedPlatform], ['tool', tool], ['env', envValues]].flatMap(([layer, values]) =>
-    Object.entries(values ?? {}).filter(([k, v]) => v !== undefined && valid[k] && !valid[k](v)).map(([k]) => `${k} (${layer})`));
-  if (invalid.length) {
-    log(`ciUnitRerun: invalid ${invalid.join(', ')}; retries disabled`);
-    return { ...value, enabled: false };
+export function resolvePolicy({ tool, platform, env = {}, log = console.error,
+  readSettings = readSettingsChecked, readPreferences = readPlatformPreferences } = {}) {
+  const standard = { enabled: false, maxFiles: 10, flakeAllowlist: [] };
+  try {
+    if (tool === undefined) {
+      const settings = readSettings();
+      if (settings.taint.length) throw new Error('settings read/shape error');
+      tool = settings.value.ciUnitRerun;
+    }
+    if (platform === undefined) {
+      const preferences = readPreferences({ env });
+      if (preferences.errors.length) throw new Error('platform preference read error');
+      platform = preferences.prefs.ciUnitRerun;
+    }
+    const enabled = env.WE_CI_UNIT_RERUN_ENABLED;
+    const envValues = {
+      enabled: enabled === undefined ? undefined : /^(true|1)$/.test(enabled) ? true : /^(false|0)$/.test(enabled) ? false : enabled,
+      maxFiles: env.WE_CI_UNIT_RERUN_MAX_FILES === undefined ? undefined : Number(env.WE_CI_UNIT_RERUN_MAX_FILES),
+    };
+    const valid = { enabled: v => typeof v === 'boolean', maxFiles: v => Number.isSafeInteger(v) && v > 0,
+      flakeAllowlist: v => Array.isArray(v) && v.every(file => typeof file === 'string' && file.length > 0
+        && !isAbsolute(file) && !/[\\\x00-\x1f\x7f]/.test(file) && !file.startsWith('-')
+        && file.split('/').every(part => part && part !== '.' && part !== '..')) };
+    for (const [layer, values] of [['platform', platform], ['tool', tool], ['env', envValues]]) {
+      if (values === undefined) continue;
+      if (values === null || Object.getPrototypeOf(values) !== Object.prototype) throw new Error(`invalid ${layer} policy object`);
+      for (const [key, value] of Object.entries(values)) {
+        if (!Object.hasOwn(valid, key) || (value !== undefined && !valid[key](value))) throw new Error(`invalid ${key} (${layer})`);
+      }
+    }
+    return cascadePolicy('ciUnitRerun', tool, {
+      standard, platform: platform ?? {}, operatorOverride: {}, envValues, valid,
+      env: { ...env, WE_POLICY_CASCADE_LOG: '1' }, log,
+    }).value;
+  } catch (e) {
+    log(`ciUnitRerun: ${String(e.message).replace(/[\x00-\x1f\x7f]/g, ' ')}; enabled=false (fail-closed); inspect settings and original run`);
+    return standard;
   }
-  return value;
 }
 
 /** PURE: validate JSON evidence and normalize runner-absolute filenames to portable record keys. */
@@ -82,7 +101,7 @@ export function planRetry(text, policy, root) {
   return files;
 }
 
-export function retryVerdict(first, rerunText, { shard, sha, runId, root, exitCode }) {
+export function retryVerdict(first, rerunText, { shard, sha, runId, root, exitCode, flakeAllowlist = [] }) {
   let results = [];
   try { results = parseReport(rerunText, root); } catch { /* incomplete evidence records failures */ }
   const files = first.map(({ file, failedTests, tests }) => {
@@ -95,7 +114,7 @@ export function retryVerdict(first, rerunText, { shard, sha, runId, root, exitCo
       && (failedTests.length > 0 || retry.tests.some(t => t.status === 'passed'));
     return { file, firstRun: 'failed', rerun: recovered ? 'passed' : 'failed', failedTests };
   });
-  return { passed: exitCode === 0 && files.every(f => f.rerun === 'passed'),
+  return { passed: exitCode === 0 && files.every(f => f.rerun === 'passed' && flakeAllowlist.includes(f.file)),
     record: { shard, sha, runId, files } };
 }
 
@@ -112,6 +131,9 @@ export async function rerunOnce({ shard, mode, firstExit, teardownFailed = file 
     if (String(firstExit) !== '1') throw new Error(`first run exit ${firstExit} is not a plain test failure (1)`);
     // Exit 1 is also what the global teardown's tmp-leak policy sets (vitest.globalSetup.mjs); it leaves this marker.
     if (teardownFailed(`coverage/teardown-failed-unit-${shard}`)) throw new Error('first run failed in global teardown; a file retry cannot clear it');
+    const identity = JSON.parse(read(`coverage/first-run-${shard}.json`));
+    if (!env.GITHUB_RUN_ID?.trim() || !env.GITHUB_SHA?.trim()
+      || identity?.runId !== env.GITHUB_RUN_ID || identity?.sha !== env.GITHUB_SHA) throw new Error('missing/stale first-run identity');
     const first = planRetry(read(`coverage/timing-unit-${shard}.json`), policy, root);
     // Vitest positional filters are substrings: refuse ambiguous filters rather than run extra files.
     const all = await listFiles();
@@ -122,7 +144,7 @@ export async function rerunOnce({ shard, mode, firstExit, teardownFailed = file 
     const result = run(['run', mode === 'covered' ? 'test:coverage:shard' : 'test:unit', '--', ...coverageArgs, '--reporter=default', '--reporter=./scripts/ci/unit-json-reporter.mjs', `--outputFile.json=${output}`, ...first.map(f => f.file), ...skipArgs]);
     let text;
     try { text = read(output); } catch { /* record all files as failed */ }
-    const verdict = retryVerdict(first, text, { shard, sha: env.GITHUB_SHA ?? '', runId: env.GITHUB_RUN_ID ?? '', root, exitCode: result.status });
+    const verdict = retryVerdict(first, text, { shard, sha: env.GITHUB_SHA ?? '', runId: env.GITHUB_RUN_ID ?? '', root, exitCode: result.status, flakeAllowlist: policy.flakeAllowlist });
     write(`coverage/flaky-unit-${shard}.json`, `${JSON.stringify(verdict.record, null, 2)}\n`);
     for (const file of verdict.record.files.filter(f => f.rerun === 'passed')) warn(`::warning::flaky test file ${file.file.replaceAll('%', '%25')}`);
     return verdict.passed ? 0 : 1;
@@ -140,6 +162,6 @@ if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.ur
   const firstExit = options.find(arg => arg.startsWith('--first-exit='))?.slice('--first-exit='.length);
   const { listUnitTestFiles } = await import('./shard-assign.mjs');
   mkdirSync('coverage', { recursive: true });
-  const policy = resolvePolicy({ tool: readSettings().ciUnitRerun, env: process.env });
+  const policy = resolvePolicy({ env: process.env });
   process.exitCode = await rerunOnce({ shard, mode, firstExit, policy, skipArgs: args.includes('--') ? args.slice(args.indexOf('--') + 1) : [], listFiles: listUnitTestFiles });
 }
