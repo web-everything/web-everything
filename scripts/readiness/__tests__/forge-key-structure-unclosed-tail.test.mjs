@@ -1,7 +1,8 @@
 // @vitest-environment node
 import {readFileSync} from 'node:fs';
-import {describe,expect,it} from 'vitest';
+import {describe,expect,it,vi} from 'vitest';
 import {keyStructureFinding} from '../forge-key-structure.mjs';
+import {credentialBufferFinding} from '../forge-exec-manifest.mjs';
 
 const q='"';
 const FINDING='private-key-structure';
@@ -13,15 +14,51 @@ const truncated=Array.from({length:40},(_,i)=>'| row'+i+' | {"a":{"service":"x",
 const prose='plain words about settings and tables. '.repeat(3000);
 const stray='an unclosed '+q+' ';
 
-describe('forge key structure: unclosed object tails stay linear without weakening detection',()=>{
-  it('scans the real settings registry within budget (red on main: budget exhausted)',()=>{
+describe('forge key structure: bounded unclosed object scans fail closed',()=>{
+  it('refuses the real settings registry promptly when an oversized candidate cannot be closed',()=>{
     const bytes=readFileSync(new URL('../../../docs/agent/settings-registry.md',import.meta.url));
     const started=Date.now();
-    expect(keyStructureFinding(bytes)).toBeNull();
+    // The operator requires fail-closed overflow even when the last signal precedes a truncated table cell.
+    expect(keyStructureFinding(bytes)).toBe(EXH);
     expect(Date.now()-started).toBeLessThan(5000);
   });
-  it('does not exhaust on truncated cells with no signal after them',()=>{
+  it('does not exhaust on truncated cells without any recognized signal',()=>{
     expect(keyStructureFinding(Buffer.from(truncated+prose+'a b'))).toBeNull();
+  });
+  it('fails closed on an oversized unclosed candidate even when every signal precedes its brace',()=>{
+    for(const prefix of [kt+' '+q+' ', '\\| '+stray]) {
+      const bytes=Buffer.from(prefix+'{a:1 '+pad(66000));
+      expect(keyStructureFinding(bytes)).toBe(EXH);
+      expect(credentialBufferFinding(bytes)).toBe(EXH);
+    }
+  });
+  it('does not mistake braces inside a string cut by the scan window for a closing candidate',()=>{
+    for(const quote of [q,"'"]) {
+      for(const ending of ['', '\\']) {
+        const member='{a:'+quote+'}'+pad(66000);
+        // Put the escape, when present, exactly at the end of the independent scan window.
+        const open=member.slice(0,65536-ending.length)+ending;
+        expect(keyStructureFinding(Buffer.from(kt+' '+q+' '+open+pad(1000)+quote))).toBe(EXH);
+      }
+    }
+  });
+  it('bounds independent candidate traversal before a long final search or repeated tail scans',()=>{
+    const exec=RegExp.prototype.exec;
+    const lengths=[];
+    const spy=vi.spyOn(RegExp.prototype,'exec').mockImplementation(function(text) {
+      // Only the independent brace scanner ends in this token alternative.
+      if(this.source.endsWith('|[{}]'))lengths.push(text.length);
+      return exec.call(this,text);
+    });
+    try {
+      for(const tail of [pad(400000),q+pad(400000)+q,'/*'+pad(400000)+'*/','{a:1 '.repeat(1000)+pad(400000)]) {
+        lengths.length=0;
+        const finding=keyStructureFinding(Buffer.from(kt+' '+q+' {a:1 '+tail));
+        expect(lengths.length).toBeGreaterThan(0);
+        expect(Math.max(...lengths)).toBeLessThanOrEqual(65536);
+        expect(finding).toBe(EXH);
+      }
+    } finally {spy.mockRestore();}
   });
   it('differential corpus: small closed objects hidden behind a stray quote stay within budget',()=>{
     const members=['"a":1',"'a':1",'a:1','/* comment */ "a":1','// comment\r\n"a":1','// comment\u2028"a":1'];
@@ -31,7 +68,7 @@ describe('forge key structure: unclosed object tails stay linear without weakeni
       expect(keyStructureFinding(Buffer.from(body)),member).toBeNull();
     }
   });
-  it('charges repeated unsignalled unclosed tails even when the last regex search finds no token',()=>{
+  it('refuses repeated unsignalled unclosed tails even when the last regex search finds no token',()=>{
     const body='\\| '+stray+('{"a":1\n').repeat(1000)+pad(400000);
     expect(keyStructureFinding(Buffer.from(body))).toBe(EXH);
   });

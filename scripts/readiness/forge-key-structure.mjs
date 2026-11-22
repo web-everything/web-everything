@@ -239,7 +239,9 @@ function canonicalize(bytes,emit,tick,{comments=true,utf16=true}={}) {
   // Any escape can hide the key type: stringValue also supports identity escapes and line continuations.
   const lastSig=lastSignal(text);
   if(lastSig>=0||/kty|\\/i.test(text)) {
-    const pieces=/"(?:\\[\s\S]|[^"\\])*"|'(?:\\[\s\S]|[^'\\])*'|\/\/[^\r\n\u2028\u2029]*|\/\*[\s\S]*?(?:\*\/|$)|[{}]/g;
+    // Unterminated literals consume the rest of the window, including a trailing escape. Truncation must
+    // never expose a `}` inside a long string as the candidate's closing brace.
+    const pieces=/"(?:\\[\s\S]|[^"\\])*(?:"|\\?$)|'(?:\\[\s\S]|[^'\\])*(?:'|\\?$)|\/\/[^\r\n\u2028\u2029]*|\/\*[\s\S]*?(?:\*\/|$)|[{}]/g;
     for(let at=text.indexOf('{');at!==-1;at=text.indexOf('{',at+1)) {
       // A brace the pass above already treated as a container opener is detected there; only the rest (hidden by
       // quote pairing or rejected as prose) needs its own candidate, which keeps ordinary large JSON linear.
@@ -248,24 +250,22 @@ function canonicalize(bytes,emit,tick,{comments=true,utf16=true}={}) {
       // No lookahead bound: whitespace or comments of any length between the brace and the name must not hide it.
       if(!startsObjectMember(text,at+1))continue;
       tick();
-      const limit=Math.min(text.length,at+65536);
+      // Bound the regex input itself: checking lastIndex after exec would still scan an arbitrarily long
+      // unmatched string/comment or token-free tail. Every candidate shares the global processing budget.
+      const candidate=text.slice(at,at+65536);
       let depth=0;
-      pieces.lastIndex=at;
-      for(let piece=pieces.exec(text);piece;piece=pieces.exec(text)) {
+      pieces.lastIndex=0;
+      for(let piece=pieces.exec(candidate);piece;piece=pieces.exec(candidate)) {
+        tick();
         if(piece[0]==='{')depth++;
         else if(piece[0]==='}'&&--depth===0) {
-          // A candidate longer than the bound is never silently skipped: fail closed.
-          if(pieces.lastIndex>limit)throw EXHAUSTED;
-          emit(Buffer.from(text.slice(at,pieces.lastIndex)),{expand:false});
+          emit(Buffer.from(candidate.slice(0,pieces.lastIndex)),{expand:false});
           depth=-1;break;
         }
       }
-      // Only an unclosed candidate scans the whole remaining tail. Charge bytes beyond the bound (64 per step),
-      // including a final regex search with no match; small closed objects pay no overflow charge.
-      if(depth>=0)for(let n=(text.length-limit)>>6;n>0;n--)tick();
-      // Never closes and extends past the bound: fail closed unless no signal that could build or hide the member
-      // name `kty` (literal, escape, computed/spread member, string concatenation) occurs at or after the brace.
-      if(depth>=0&&at+65536<text.length&&lastSig>=at)throw EXHAUSTED;
+      // Incomplete evidence past the bound always refuses remote admission, even when the signal preceded
+      // this brace. A truncated token at the window edge cannot turn an oversized candidate into a pass.
+      if(depth>=0&&at+candidate.length<text.length)throw EXHAUSTED;
     }
   }
   // Decimal/signed/0x byte arrays: comments are whitespace, never squeezed into numbers.
