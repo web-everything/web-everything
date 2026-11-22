@@ -270,6 +270,7 @@
   "scripts/__tests__/merge-ai-prs-merge-failure-isolation.test.mjs": 33.28,
   "scripts/__tests__/merge-ai-prs-merge-queue-hook-wiring.test.mjs": 247.81,
   "scripts/__tests__/merge-ai-prs-merge-trace-post-confirm.test.mjs": 0.02,
+  "scripts/__tests__/merge-ai-prs-mq-fixer-route.test.mjs": 0.01,
   "scripts/__tests__/merge-ai-prs-net-diff-computation.test.mjs": 9.64,
   "scripts/__tests__/merge-ai-prs-one-repo-listing-fails.test.mjs": 42.12,
   "scripts/__tests__/merge-ai-prs-overlap-yield.test.mjs": 0.05,

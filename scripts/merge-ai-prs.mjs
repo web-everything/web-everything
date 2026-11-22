@@ -6,6 +6,7 @@ import { writeLabelWithHandoff, signalFixDispatch } from './lib/fix-handoff.mjs'
 import { readCompletePrComments } from './conveyor/pr-comments-complete.mjs';
 import { createMqLiveReader, mqSameHeadGuard, createMqSameHeadRefreshStore, createMqSameHeadRefreshOptions, mqSameHeadRefreshStatePath, readDrainQueueSafety, redTeamEnqueueHold } from './lib/drain-queue-safety.mjs';
 import { readDrainRedTeamEvidence } from './lib/drain-red-team-evidence.mjs';
+import { createDrainMqRouteWiring } from './lib/drain-mq-route-wiring.mjs';
 import { readStandingRuling, readOperatorIssues, headIsCardOnly, headBelongsToPr, readUneditedCommentIds, standingRulingScope } from './conveyor/standing-ruling-io.mjs';
 import { resolveApprovalLicensesEnqueue, proveHumanOnlyLicense } from './lib/human-only-enqueue-license.mjs';
 import { isDrainTransientPath } from './lib/transient-paths.mjs';
@@ -5183,6 +5184,7 @@ export async function main(argv, { env = process.env, stdout = process.stdout, e
   const mergeStrategy = createDrainMergeStrategy({ resolved: resolvedMergePolicy, dryRun: DRY_RUN, quiet: AS_JSON, isLocalRepo, localSlug, isMainFix,
     withLock: (fn) => withLandWriteLock(fn, { runUnlockedOnContention: false }), primary: resolvePrimaryPath(process.cwd(), { flag: flags.primary, env: env.WE_PRIMARY }) }); // xtpxusq — logs strategy + source once per pass
   const prestageCache = createPrestageCache();
+  const mqFixerRoutes = createDrainMqRouteWiring({ log: line => process.stderr.write(`${line}\n`) });
   function enqueueWithSameHeadGuard(c, sha, options, approvedHeadHold, shadow) {
     // Admission must precede same-head recovery, which can update the branch.
     const refusal = assertCapability(c.repo ?? localSlug, 'review');
@@ -5236,7 +5238,10 @@ export async function main(argv, { env = process.env, stdout = process.stdout, e
       log: line => process.stderr.write(`${line}\n`) });
     // The visible reason (decline/accept text with the deciding main run id) replaces the bare hold line.
     const shown = { line: guard.reason ?? guard.line };
-    if (guard.hold) return { enqueued: false, kind: 'mq-same-head-failed', reason: shown.line };
+    if (guard.hold) {
+      mqFixerRoutes.start({ repo: c.repo ?? localSlug, pr: c.num, head: sha, guard, dryRun: DRY_RUN });
+      return { enqueued: false, kind: 'mq-same-head-failed', reason: shown.line };
+    }
     const result = mergeStrategy.enqueue(c, sha, { ...options,
       // The early queued bypass authorizes bookkeeping only. If membership disappears during the
       // strategy's other checks, require fresh timeline admission immediately before any mutation.
@@ -5736,6 +5741,7 @@ export async function main(argv, { env = process.env, stdout = process.stdout, e
   // emit/exit), so the watch loop can call it repeatedly. A gh-list failure still hard-fails (bad env).
   const drainHeavyCacheByRepo = new Map(); // Reuse heavy fields across --watch passes.
   const sweepOnce = async () => {
+  try {
   const __t = createStepTimer();
   const __passStart = Date.now();
   // Shared by the full cascade and the green-event shortcut, including --json callers.
@@ -8257,6 +8263,7 @@ export async function main(argv, { env = process.env, stdout = process.stdout, e
   }
   if (followup.mode === 'job' || followup.job) result.followupJob = { handedOff: followup.handedOff, job: followup.job ?? null, actions: followup.actions ?? [], ...(followup.handedOff ? {} : { reason: followup.reason }) }; // x4y74wj — a launch-failed job rides along (handedOff:false) so the fallback to inline is visible
   return { result, merged, failedMerges, pendingRebased: pendingAll, deferred, duplicateIdsOnMain };
+  } finally { await mqFixerRoutes.settle(); }
   }; // end sweepOnce
 
   // ── Whole-process drain lease — ALWAYS-ON for full/label sweeps + watches (#2449; #2391/#2424/#2443) ──────
