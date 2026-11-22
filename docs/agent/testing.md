@@ -6372,4 +6372,8 @@ remain inert. Keep the import-graph assertion in `build-priority-set.test.mjs` a
 the repository-wide inertness check in `audit-verdict.test.mjs`; protected module names
 in `guard-auditor-roots.json` are path data, not module dependencies. The existing audit
 exports re-export the shared vocabulary and matcher so their callers keep the same API.
+
+Settings-registry migration checks use the key roster in the immutable original metadata
+fixture. Compare historical declarations and rendered bytes within that roster; keep the
+live inventory and committed-document drift check responsible for subsequently added keys.
 - [Testing topic notes and authoring guidance](testing/README.md)

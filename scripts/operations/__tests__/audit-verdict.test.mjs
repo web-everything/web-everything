@@ -1359,7 +1359,12 @@ describe('AU1 PR-A is inert', () => {
       { cwd: root, encoding: 'utf8', maxBuffer: 1 << 24 });
     expect(callers.error).toBeUndefined();
     expect(callers.status).toBe(0);
+    // BLD-S1 moved the protected path vocabulary into JSON. These entries name
+    // protected files; they do not execute either module. Keep the exception
+    // confined to that exact data file and verify its full contents.
+    expect(JSON.parse(readFileSync(join(root, 'scripts/lib/guard-auditor-roots.json'), 'utf8'))).toEqual(AUDITOR_FLOOR);
     expect(callers.stdout.split('\n').filter(l => l && !/__tests__\//.test(l)
+      && !l.startsWith('scripts/lib/guard-auditor-roots.json:')
       && !/^scripts\/(lib\/audit-(settings|finding-key)|operations\/audit-base-repro)\.mjs:/.test(l))).toEqual([]);
   });
   it('the inertness check ignores a comment-only mention but catches code that names the module (PR #6381 merge)', () => {
