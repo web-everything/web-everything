@@ -210,9 +210,11 @@ function canonicalize(bytes,emit,tick,{comments=true,utf16=true}={}) {
   // (an odd count before a JWK swallows its opening brace). Every `{` is therefore matched on its own, string-aware
   // from that brace only, bounded in length, so nothing before it can hide the object.
   // Any escape can hide the key type: stringValue also supports identity escapes and line continuations.
-  if(/kty|\\/i.test(text)) {
+  // jwkFinding matches the exact-case member name `kty`: without a backslash escape it must appear literally, so the
+  // case-sensitive literal (`byTaskType` is not it) is exact. A markdown table-cell escape `\|` yields `|`, which can
+  // never form or hide the name, so a backslash followed by `|` does not count (every other backslash still does).
+  if(/kty|\\(?!\|)/.test(text)) {
     const pieces=/"(?:\\[\s\S]|[^"\\])*"|'(?:\\[\s\S]|[^'\\])*'|\/\/[^\r\n\u2028\u2029]*|\/\*[\s\S]*?(?:\*\/|$)|[{}]/g;
-    const lastMarker=Math.max(text.lastIndexOf('kty'),text.lastIndexOf('\\'));
     for(let at=text.indexOf('{');at!==-1;at=text.indexOf('{',at+1)) {
       // A brace the pass above already treated as a container opener is detected there; only the rest (hidden by
       // quote pairing or rejected as prose) needs its own candidate, which keeps ordinary large JSON linear.
@@ -229,9 +231,7 @@ function canonicalize(bytes,emit,tick,{comments=true,utf16=true}={}) {
         else if(piece[0]==='}'&&--depth===0) {emit(Buffer.from(text.slice(at,pieces.lastIndex)),{expand:false});closed=true;break;}
       }
       // A candidate longer than the bound is never silently skipped: fail closed.
-      // A JWK must name `kty`, literally or through a backslash escape, so a tail with neither marker cannot
-      // hold one under any parser: only then is the candidate dropped (exact, not an exemption).
-      if(!closed&&at+65536<text.length&&lastMarker>=at)throw EXHAUSTED;
+      if(!closed&&at+65536<text.length)throw EXHAUSTED;
     }
   }
   // Decimal/signed/0x byte arrays: comments are whitespace, never squeezed into numbers.
