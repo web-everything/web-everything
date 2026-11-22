@@ -2435,6 +2435,7 @@
   "scripts/conveyor/soak/breaks/capacity-routing-ignores-expiring-quota.soak.test.mjs": 0.1,
   "scripts/conveyor/soak/breaks/daemon-git-developer-dir.soak.test.mjs": 1,
   "scripts/conveyor/soak/breaks/watchdog-pr-list-transient-retry.soak.test.mjs": 3,
+  "scripts/conveyor/soak/breaks/ready-pin-stale-loop-sets-aside.soak.test.mjs": 3,
   "scripts/conveyor/soak/breaks/rebuild-launch-before-next-tick.soak.test.mjs": 2,
   "scripts/conveyor/soak/breaks/rebuild-held-recovery.soak.test.mjs": 1,
   "scripts/conveyor/soak/breaks/rebuild-evidence-compatibility.soak.test.mjs": 1,
