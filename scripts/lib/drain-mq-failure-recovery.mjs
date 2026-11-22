@@ -4,7 +4,9 @@ import { buildMqFailureRoute } from './mq-failure-route.mjs';
 export async function drainMqFailureRecovery({ removal, hold, ledger, io, dryRun = false }) {
   const skip = note => ({ action: 'skip', note });
   if (dryRun || hold?.reason !== 'mq-same-head-failed' || hold.historyComplete !== true
-    || hold.mergeState !== 'CLEAN' || hold.retriesExhausted !== false) return skip('Safety hold retained; operator inspection required');
+    || hold.mergeState !== 'CLEAN'
+    || (hold.retriesExhausted !== false && !(hold.retriesExhausted === true && hold.forceFixer === true)))
+    return skip('Safety hold retained; operator inspection required');
   let evidence, labels;
   try {
     evidence = await io.collectEvidence({ removal });

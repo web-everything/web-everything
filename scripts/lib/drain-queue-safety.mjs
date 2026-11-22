@@ -298,6 +298,7 @@ function mqSameHeadRefresh({ repo, pr, head, exec, log, store, allow }) {
     const message = safe(String(error?.stderr || error?.message || error).split('\n')[0]).slice(0, 240);
     log(`${prefix}update-branch refused (${message}); not retrying at this head`);
   }
+  return true; // The claim is spent even when update-branch refuses the request.
 }
 
 const timelineHasConflict = timeline => Array.isArray(timeline?.nodes)
@@ -373,7 +374,7 @@ export function mqSameHeadGuard({ repo, pr, head, exec = execFileSyncThrottled, 
     : allowAlreadyQueued && queue.inQueue === true ? { hold: false, line: null }
       : decideMqSameHead({ pr, head, timeline: (timeline = readMqTimeline({ repo, pr, exec })),
         mergeState: timelineHasConflict(timeline) ? readMqMergeState({ repo, pr, head: currentHead, exec }) : undefined });
-  let recoveryAction = null, detail = null;
+  let recoveryAction = null, detail = null, retriesExhausted;
   if (decision.hold) {
     log(decision.line);
     // Unknown/incomplete history cannot authorize a mutation or a recovery route.
@@ -409,19 +410,22 @@ export function mqSameHeadGuard({ repo, pr, head, exec = execFileSyncThrottled, 
         }
       }
       catch { ledgerUnreadable = true; }
+      retriesExhausted = ledgerUnreadable ? undefined : spent;
       if (removals.length > 1 || spent || ledgerUnreadable) {
         recoveryAction = 'fixer';
         detail = ledgerUnreadable ? 'refresh ledger unreadable; hold for fixer inspection'
           : 'single refresh already spent or second same-head failure; hold for fixer';
-        if (spent && refresh && !dryRun) mqSameHeadRefresh({ repo, pr, head: currentHead, exec, log, ...refresh });
+        // Queue additions never renew a claim for this exact authored head.
+        if (spent && refresh && !dryRun) logMqRefreshSkip({ repo, pr, head: currentHead, log }, 'already requested');
         if (ledgerUnreadable && refresh && !dryRun) logMqRefreshSkip({ repo, pr, head: currentHead, log },
           'state unavailable; inspect shared refresh ledger and lock before retrying');
       } else {
         const diagnostic = readMqFailureLog({ repo, removal: removals.at(-1), exec });
         recoveryAction = diagnostic.realFailure ? 'fixer' : 'refresh-first';
         detail = diagnostic.detail;
-        if (refresh && !dryRun && !diagnostic.realFailure)
-          mqSameHeadRefresh({ repo, pr, head: currentHead, exec, log, ...refresh });
+        if (refresh && !dryRun && !diagnostic.realFailure
+          && mqSameHeadRefresh({ repo, pr, head: currentHead, exec, log, ...refresh }) === true)
+          retriesExhausted = true;
       }
       log(`mq-same-head-recovery: #${String(pr).replace(/\D/g, '')} head ${currentHead} — ${detail}`);
     }
@@ -429,6 +433,7 @@ export function mqSameHeadGuard({ repo, pr, head, exec = execFileSyncThrottled, 
   Object.defineProperties(decision, {
     reason: { value: detail ? `${decision.line}; ${detail}` : decision.line },
     recoveryAction: { value: recoveryAction },
+    retriesExhausted: { value: retriesExhausted },
   });
   return decision;
 }

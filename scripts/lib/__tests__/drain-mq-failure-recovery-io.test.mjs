@@ -70,13 +70,38 @@ function fixture(mode = 'real') {
     }
     throw new Error('Unexpected request');
   });
-  const io = createDrainMqFailureRecoveryIo({ exec, ledger });
+  const refreshed = new Set();
+  const refreshStore = { has: key => refreshed.has(key), claim: key => refreshed.add(key) };
+  const io = createDrainMqFailureRecoveryIo({ exec, ledger, refreshStore });
   const log = vi.fn();
   const options = { ...identity, guard, dryRun: false, log, io };
-  return { options, exec, log, writes: () => exec.mock.calls.filter(([, args]) => args.includes('POST') || (args[0] === 'pr' && args[1] === 'comment')) };
+  return { options, exec, log, refreshStore, writes: () => exec.mock.calls.filter(([, args]) => args.includes('POST') || (args[0] === 'pr' && args[1] === 'comment')) };
 }
 
 describe('drain MQ failure production adapter', () => {
+  it('reads the exact-head refresh count and routes an exhausted infrastructure failure only to the fixer', async () => {
+    const f = fixture('infra');
+    expect(f.options.io.readRefreshCount(identity)).toBe(0);
+    f.refreshStore.claim(`${identity.repo}#${identity.pr}@${identity.head}`);
+    expect(f.options.io.forRoute().readRefreshCount(identity)).toBe(1);
+    expect(f.options.io.readRefreshCount({ ...identity, head: 'd'.repeat(40) })).toBe(0);
+    expect(await routeMqFailureOnHold(f.options)).toMatchObject({ routed: true });
+    expect(guard.hold).toBe(true);
+    const body = f.writes().find(([, args]) => args[1] === 'comment')[2].input;
+    const route = parseMqFailureRoute({ expected: identity, comment: { body, author: { login: 'chalbert' } } });
+    expect(admitMqFailureRoute({ ...identity, route,
+      changedFiles: { ...identity, complete: true, files: [] } })).toMatchObject({ recoveryAction: 'fix' });
+    expect(await routeMqFailureOnHold(f.options)).toMatchObject({ routed: false });
+    expect(f.writes()).toHaveLength(2);
+  });
+  it('an unreadable refresh ledger retains the hold with operator escalation and no writes', async () => {
+    const f = fixture();
+    f.refreshStore.has = () => { throw new Error('unreadable ledger'); };
+    expect(await routeMqFailureOnHold(f.options)).toMatchObject({ routed: false,
+      reason: expect.stringMatching(/operator inspection required/) });
+    expect(f.writes()).toEqual([]);
+    expect(f.exec.mock.calls.some(([, args]) => args.some(arg => arg.includes('/actions/')))).toBe(false);
+  });
   it('real failure routes to the fixer even when every failing test is outside the PR diff', async () => {
     const f = fixture();
     expect(await routeMqFailureOnHold(f.options)).toMatchObject({ routed: true });

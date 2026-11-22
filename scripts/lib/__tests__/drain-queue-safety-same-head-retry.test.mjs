@@ -121,6 +121,16 @@ describe('same-head failures never authorize re-enqueue from logs', () => {
     expect(f.run()).toMatchObject({ hold: true, recoveryAction: 'fixer' });
     expect(f.writes).toHaveLength(0);
   }));
+  it('two manual re-enqueues never renew the exact-head refresh budget', () => fixture(f => {
+    expect(f.run({ dryRun: true })).toMatchObject({ hold: true, retriesExhausted: false });
+    expect(f.run()).toMatchObject({ hold: true, retriesExhausted: true });
+    expect(f.writes).toHaveLength(1);
+    f.events.push(added, removed());
+    expect(f.run()).toMatchObject({ hold: true, recoveryAction: 'fixer', retriesExhausted: true });
+    f.events.push(added, removed());
+    expect(f.run()).toMatchObject({ hold: true, recoveryAction: 'fixer', retriesExhausted: true });
+    expect(f.writes).toHaveLength(1);
+  }));
   it('shared ledger blocks another pass and store; a new PR-authored head gets one refresh', () => fixture(f => {
     f.run(); f.run();
     expect(f.writes).toHaveLength(1);
