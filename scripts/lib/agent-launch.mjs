@@ -75,10 +75,12 @@ function paths(value, name) {
   return value.map(p => absolute(p, name));
 }
 // Runtime loader variables: each makes a runtime load caller-chosen code at startup — the agent's
-// own Node or native loader first, then any interpreter it starts. Compared upper-cased, so a
-// case variant cannot slip through on a case-folding platform. Dropped, never passed.
+// own Node or native loader first (OPENSSL_* config can name a provider/engine shared library
+// that Node loads at startup), plus the common interpreter loader keys. Compared upper-cased,
+// which over-drops case variants (fail-safe). Dropped, never passed.
 const LOADER_PREFIXES = ['LD_', 'DYLD_'];
 const LOADER_KEYS = new Set(['NODE_OPTIONS', 'NODE_PATH', 'NODE_REPL_EXTERNAL_MODULE',
+  'OPENSSL_CONF', 'OPENSSL_MODULES', 'OPENSSL_ENGINES',
   'PYTHONPATH', 'PYTHONSTARTUP', 'PYTHONHOME', 'PYTHONUSERBASE', 'PERL5OPT', 'PERL5LIB', 'PERLLIB', 'PERL5DB',
   'RUBYOPT', 'RUBYLIB', 'JAVA_TOOL_OPTIONS', '_JAVA_OPTIONS', 'JDK_JAVA_OPTIONS', 'GCONV_PATH']);
 function isLoaderKey(key) {

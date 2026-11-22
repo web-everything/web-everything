@@ -37,6 +37,7 @@ function mainCodexShimPath(env) {
 const LOADER_ORACLE = {
   NODE_OPTIONS: '--import=/attacker/payload.mjs', NODE_PATH: '/attacker/modules',
   NODE_REPL_EXTERNAL_MODULE: '/attacker/repl.js',
+  OPENSSL_CONF: '/attacker/openssl.cnf', OPENSSL_MODULES: '/attacker/ossl-modules', OPENSSL_ENGINES: '/attacker/engines',
   LD_PRELOAD: '/attacker/lib', LD_LIBRARY_PATH: '/attacker/libs', LD_AUDIT: '/attacker/audit',
   DYLD_INSERT_LIBRARIES: '/attacker/lib', DYLD_LIBRARY_PATH: '/attacker/libs', DYLD_FRAMEWORK_PATH: '/attacker/fw',
   PYTHONPATH: '/attacker/python', PYTHONSTARTUP: '/attacker/startup.py', PYTHONHOME: '/attacker/home',

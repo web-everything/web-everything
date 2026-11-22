@@ -1269,7 +1269,11 @@ describe('runCodexDirectExec / codexDirectTask — the orchestrator, over an inj
     const dir = mkdtempSync(join(tmpdir(), 'we-codex-permissions-test-'));
     weCheckout(dir);
     const allocated = [];
-    const env = { ...process.env, LANE_POOL_ROOT: join(dir, 'pool override'), TMPDIR: '/old/tmp' };
+    // The launcher drops runtime loader variables (NODE_OPTIONS, LD_*, ...); keep the ambient copy
+    // free of them so the review-branch equality below never depends on the developer's shell.
+    const loader = /^(NODE_OPTIONS|NODE_PATH|NODE_REPL_EXTERNAL_MODULE|OPENSSL_(CONF|MODULES|ENGINES)|LD_.*|DYLD_.*|PYTHON(PATH|STARTUP|HOME|USERBASE)|PERL5OPT|PERL5LIB|PERLLIB|PERL5DB|RUBYOPT|RUBYLIB|JAVA_TOOL_OPTIONS|_JAVA_OPTIONS|JDK_JAVA_OPTIONS|GCONV_PATH)$/i;
+    const ambient = Object.fromEntries(Object.entries(process.env).filter(([key]) => !loader.test(key)));
+    const env = { ...ambient, LANE_POOL_ROOT: join(dir, 'pool override'), TMPDIR: '/old/tmp' };
     const execFn = (bin, args) => args.includes('--absolute-git-dir') ? join(dir, 'metadata') : args.includes('rev-parse') ? 'sha' : '';
     try {
       for (const review of [false, false, true]) {
