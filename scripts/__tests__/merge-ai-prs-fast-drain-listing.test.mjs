@@ -29,6 +29,17 @@ it('tier 1: catch-up without --from-green-event makes zero full-PR pagination ca
     && a[a.indexOf('--json') + 1].includes('body')).map(a => a[2])).toEqual(['7']);
 });
 
+it('catch-up excludes incomplete check evidence from the fast snapshot and reaches slow classification', () => {
+  const result = runFastDrainContextCli({ catchUp: true, rowCount: 18,
+    livePatches: { 7: { liveCheckRunPages: [] } } });
+  expect(result.status, result.stderr).toBe(0);
+  expect(result.leanListings).toBeGreaterThan(0);
+  expect(result.fullListings + result.heavyListings).toBeGreaterThan(0);
+  const decision = JSON.parse(result.stdout);
+  expect(decision.toMerge).toEqual([]);
+  expect(decision.skipped.some(p => p.num === 7 && /check evidence incomplete.*complete live check read/.test(p.reason))).toBe(true);
+});
+
 it('catch-up computes complete head-bound checks from PR views containing only requested gh fields', () => {
   const result = runFastDrainContextCli({ catchUp: true, rowCount: 18, workflowEditSetting: 'off' });
   expect(result.status, result.stderr).toBe(0);

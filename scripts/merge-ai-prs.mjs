@@ -5965,7 +5965,11 @@ export async function main(argv, { env = process.env, stdout = process.stdout, e
       process.stderr.write('fast-drain: default branch changed during membership — discarded pass snapshot; falling back to live listing\n');
       return null;
     });
-    if (rows) fastContextRows = new Map([...new Set([...CONTEXT_REPOS, ...REPOS])].map(repo => [repo, rows.get(repo || localSlug)]));
+    // Fast rows replace the whole repo listing: an incomplete PR must send its repo through
+    // the existing slow path, rather than disappear from labels, rebase or classification.
+    if (rows) fastContextRows = new Map([...new Set([...CONTEXT_REPOS, ...REPOS])]
+      .map(repo => [repo, rows.get(repo || localSlug)])
+      .filter(([, prs]) => prs?.every(p => p.rowsComplete === true)));
   }
   // #2257 — collect + classify across EVERY repo in the sweep set into ONE global candidate list. PR numbers
   // are per-repo (WE #10 ≠ FUI #10), so each verdict carries its own `repo` + head ref instead of a
