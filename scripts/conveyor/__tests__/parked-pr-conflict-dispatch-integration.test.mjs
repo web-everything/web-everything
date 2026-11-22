@@ -38,10 +38,13 @@ import { execFileSync } from 'node:child_process';
 
 import { withRealRepo, git } from '../../operations/__tests__/helpers/real-repo.mjs';
 import { withFakeClaude } from '../../operations/__tests__/helpers/fake-claude.mjs';
-import { defaultSpawnAgent, defaultListAgents, DISPATCHED_AGENT_SYSTEM_PROMPT_FILE } from '../../operations/dispatch-lane-io.mjs';
+import { defaultSpawnAgent, defaultListAgents, DISPATCHED_AGENT_SYSTEM_PROMPT_FILE, leanRepairGrant } from '../../operations/dispatch-lane-io.mjs';
 import { LEAN_FIX_HOOKS_SETTINGS, LEAN_FIX_TOOLS } from '../../operations/minimal-context-provider.mjs';
 import { stopSession } from '../../operations/dispatch-abort.mjs';
 import { buildAuthorActorMarker } from '../../lib/review-independence.mjs';
+
+// PR #7332 round 2 — the reconcile fix path reserves no lane, so its restricted session is granted the pool roots.
+const LEAN_GRANT = leanRepairGrant({ launchKind: 'fix' });
 
 import {
   isParkedConflictTarget, planConflictLabelChange, isStatuteTierConflict, buildConflictFindingBody,
@@ -255,7 +258,10 @@ describe('#xu2krte end-to-end — a REAL merge conflict, dispatched through the 
           '--bg', '-n', 'fix-8802',
           // PR #7332 — a fix dispatch is a lean repair session: repo hooks + tool allowlist ride `--settings`,
           // and the restricted-session flags follow it.
-          '--settings', JSON.stringify({ env: { WE_CONVEYOR_WORKER: '1' }, worktree: { bgIsolation: 'none' }, ...LEAN_FIX_HOOKS_SETTINGS() }),
+          // Round 2: `--restricted` ignores settings.local.json, so the lane grant rides `--settings` and `--add-dir`.
+          '--settings', JSON.stringify({ env: { WE_CONVEYOR_WORKER: '1' }, worktree: { bgIsolation: 'none' }, ...LEAN_FIX_HOOKS_SETTINGS(),
+            permissions: { allow: [...LEAN_FIX_TOOLS.split(','), ...LEAN_GRANT.allow], additionalDirectories: LEAN_GRANT.additionalDirectories } }),
+          ...LEAN_GRANT.additionalDirectories.flatMap(dir => ['--add-dir', dir]),
           '--restricted', '--tools', LEAN_FIX_TOOLS, '--strict-mcp-config', '--disable-slash-commands',
           '--append-system-prompt-file', DISPATCHED_AGENT_SYSTEM_PROMPT_FILE,
           // WE routing policy — every fresh launch also carries an explicit per-operation --effort (fix → high).

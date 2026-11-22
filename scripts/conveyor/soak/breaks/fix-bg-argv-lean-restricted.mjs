@@ -90,6 +90,11 @@ function judge(report) {
     for (const flag of ['--bg', '--restricted', '--strict-mcp-config']) {
       if (!argv.includes(flag)) violations.push(`${kind}: missing ${flag}`);
     }
+    // Round 2: --restricted ignores settings.local.json, so the lane grant must ride in the argv as --add-dir.
+    const addDirs = argv.flatMap((arg, i) => (arg === '--add-dir' ? [argv[i + 1]] : []));
+    if (!addDirs.some(dir => typeof dir === 'string' && /\/\.lanes\/[^/]+(?:\/lane-\d+)?$/.test(dir))) {
+      violations.push(`${kind}: no --add-dir lane grant (restricted mode ignores settings.local.json)`);
+    }
     // Count equals-form overrides as well: a second settings argument can erase the guards.
     const settingsFlags = argv.filter(arg => arg === '--settings' || arg.startsWith('--settings='));
     if (settingsFlags.length !== 1 || !argv.includes('--settings')) {

@@ -109,6 +109,8 @@ for (let i = 0; i < argv.length; i += 1) {
   // PR #7332 — the lean fix/ci-heal session flags (real claude --help options): \`--tools <list>\` takes one
   // value; the other three are bare switches. Recorded through the call log's argv, not interpreted.
   if (a === '--tools') { i += 1; extraFlagCount += 1; continue; }
+  // The lane grant: \`--add-dir <dir>\`, one directory per flag as \`buildAgentArgv\` emits it.
+  if (a === '--add-dir') { i += 1; extraFlagCount += 1; continue; }
   if (a === '--restricted' || a === '--strict-mcp-config' || a === '--disable-slash-commands') { extraFlagCount += 1; continue; }
   // NO \`--\` END-OF-OPTIONS BRANCH, deliberately. \`buildAgentArgv\` never emits one, so a branch here would
   // model the very escape hatch dispatch-lane-io.mjs says it DECLINED to bet on — a fidelity claim with

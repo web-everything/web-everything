@@ -18,14 +18,22 @@ import {
 } from '../reconcile-fix-dispatch.mjs';
 import { CONFLICT_LABEL } from '../parked-pr-conflict-watch.mjs';
 import { resolvePrWorkUnit } from '../pr-work-unit.mjs';
-import { DISPATCHED_AGENT_SYSTEM_PROMPT_FILE, dispatchSessionCwd } from '../../operations/dispatch-lane-io.mjs';
+import { DISPATCHED_AGENT_SYSTEM_PROMPT_FILE, dispatchSessionCwd, leanRepairGrant } from '../../operations/dispatch-lane-io.mjs';
 import { LEAN_FIX_HOOKS_SETTINGS, LEAN_FIX_TOOLS } from '../../operations/minimal-context-provider.mjs';
 
 // A fix dispatch is a lean repair session (PR #7332): its `--settings` carries the repo hooks + tool allowlist
 // beside the env/worktree pair, and its argv adds the restricted-session flags. Derive both from the real
-// helper so these assertions track the repo settings, never a hand-copied hook blob.
-const leanFixSettings = (env) => JSON.stringify({ env, worktree: { bgIsolation: 'none' }, ...LEAN_FIX_HOOKS_SETTINGS() });
-const LEAN_FIX_FLAGS = ['--restricted', '--tools', LEAN_FIX_TOOLS, '--strict-mcp-config', '--disable-slash-commands'];
+// helper so these assertions track the repo settings, never a hand-copied hook blob. Round 2: `--restricted`
+// ignores settings.local.json, so the lane grant (this path reserves no lane: the repo's pool roots) rides
+// in the `--settings` permissions and as `--add-dir` flags.
+const LEAN_GRANT = leanRepairGrant({ launchKind: 'fix' });
+const leanFixSettings = (env) => {
+  const hooks = LEAN_FIX_HOOKS_SETTINGS();
+  return JSON.stringify({ env, worktree: { bgIsolation: 'none' }, ...hooks, permissions: {
+    allow: [...hooks.permissions.allow, ...LEAN_GRANT.allow], additionalDirectories: LEAN_GRANT.additionalDirectories } });
+};
+const LEAN_FIX_FLAGS = [...LEAN_GRANT.additionalDirectories.flatMap(dir => ['--add-dir', dir]),
+  '--restricted', '--tools', LEAN_FIX_TOOLS, '--strict-mcp-config', '--disable-slash-commands'];
 import { buildAuthorActorMarker } from '../../lib/review-independence.mjs';
 
 // Existing resume fixtures have no completion record; never consult the host store.

@@ -1597,7 +1597,10 @@ export function createDispatchSinks({
       // #xrv69j6 — grant the lane BEFORE the agent is spawned into this cwd, so the settings file already
       // carries the grant by the time the session's own first Bash/Edit tool call reads it. Best-effort (the
       // function itself never throws) — a grant failure must never block the dispatch it is here to unblock.
-      grantLanePermission(sessionCwd, resolveLaneGrant(payload));
+      // PR #7332 — the same grant also rides on the request: a `--restricted` fix/ci-heal session ignores
+      // settings.local.json, so `buildAgentArgv` carries it in the launch argv itself.
+      const laneGrant = resolveLaneGrant(payload);
+      grantLanePermission(sessionCwd, laneGrant);
       // #x9fbg1x — same "write into the scratch cwd BEFORE the agent starts" timing as the lane grant above,
       // so the guard is already off by the time the session's own first Edit runs. Best-effort (the function
       // itself never throws) — a write failure here must never block the dispatch it exists to unblock.
@@ -1649,6 +1652,7 @@ export function createDispatchSinks({
           groupMembers: payload?.groupMembers,
           lane: payload?.lane,
           scope: payload?.scope,
+          laneGrant,
           pr: payload?.pr,
           reason: payload?.reason,
           // agy-launcher-probation — the router's probation pick (a ci-heal dispatch carries it directly; a tick
@@ -1988,7 +1992,12 @@ export function defaultClaudeProvider(request, {
   const argv = buildAgentArgv({
     advisor,
     sessionId: request.sessionId,
-    payload: { prompt: request.prompt, sessionSlug: request.sessionSlug, num: request.num, launchKind: request.launchKind },
+    payload: {
+      prompt: request.prompt, sessionSlug: request.sessionSlug, num: request.num, launchKind: request.launchKind,
+      lane: request.lane, scope: request.scope,
+    },
+    // PR #7332 — the sink's lane grant; a restricted repair session gets it only through the argv.
+    laneGrant: request.laneGrant ?? null,
     extraArgs: request.extraArgs,
     systemPromptFile: request.systemPromptFile,
     // #x8mpubm — resolved once by the SINK (`createDispatchSinks`), not here: this function never reaches
@@ -2371,6 +2380,40 @@ export function dispatchLaneGrant(payload, { root = REPO_ROOT, exists = existsSy
 }
 
 /**
+ * PR #7332 — THE LANE GRANT a `--restricted` fix/ci-heal session receives through its launch argv. Restricted
+ * mode ignores user, project and local settings files (`claude --help`), so the {@link dispatchLaneGrant} the
+ * sinks write into the scratch cwd's settings.local.json never reaches it, and its file tools are confined to
+ * the working directories (a lane read without `--add-dir` was refused live: "outside <cwd>; --restricted
+ * confines the file tools to the working directory"). Order: a non-empty explicit grant (the sink's, for its
+ * reserved lane); else one derived from the payload — `<pool>/lane-N` under every pool basename of the scope's
+ * repo when a lane is named, else the pool roots themselves (the direct reconcile fix path, which reserves no
+ * lane). The derivation does no filesystem I/O: a missing `--add-dir` path is accepted by the CLI (checked
+ * live), and a pure builder keeps every argv test hermetic. Fails closed when no directory remains.
+ * @param {{lane?:string|number|null, scope?:string|string[]|null, launchKind?:string}} payload
+ * @param {{additionalDirectories?:string[], allow?:string[]}|null} [laneGrant]
+ * @returns {{additionalDirectories:string[], allow:string[]}}
+ */
+export function leanRepairGrant(payload, laneGrant = null, {
+  root = REPO_ROOT, poolDirs = (repoKey) => laneWorkspacePoolDirs(root, repoKey),
+} = {}) {
+  const clean = (list) => (Array.isArray(list) ? list.filter(v => typeof v === 'string' && v.trim()) : []);
+  const given = clean(laneGrant?.additionalDirectories);
+  let dirs = given;
+  let allow = given.length ? clean(laneGrant?.allow) : [];
+  if (!given.length) {
+    const pools = clean(poolDirs(repoKeyForScope(payload?.scope) ?? 'we'));
+    const lane = payload?.lane == null ? '' : String(payload.lane).trim();
+    dirs = /^\d+$/.test(lane) ? pools.map(pool => join(pool, `lane-${lane}`)) : pools;
+    allow = [...dirs.flatMap(d => [`Edit(${d}/**)`, `Write(${d}/**)`]),
+      ...conflictHelperAllowRules(root), ...rearmReviewAllowRules(root)];
+  }
+  if (!dirs.length) {
+    throw notApplied('dispatch-lane: no lane directory to grant this restricted repair session; check the lane pool and retry');
+  }
+  return { additionalDirectories: [...new Set(dirs)], allow: [...new Set(allow)] };
+}
+
+/**
  * #3850 (live-caught 2026-10-04, 151 "Workspace not trusted" refusals in the fix-dispatch log) — the policy
  * switch for TRUSTING THE SCRATCH ROOT. Default ON: a dispatch into `<root>/<uuid>` trusts `<root>` once, and
  * every later session dir under it is trusted by inheritance (the CLI walks a non-git cwd's ancestors for a
@@ -2602,6 +2645,8 @@ export function buildAgentArgv({
   // on, the fresh launch gets `--advisor <model>` and one brief line; `null`/off keeps the argv byte-identical.
   // Never applied on resume (a resume must stay a bare `--bg --resume`). The worker's `--model` is untouched.
   advisor = null,
+  // PR #7332 — the dispatch's lane grant ({additionalDirectories, allow}); fix/ci-heal only, see leanRepairGrant.
+  laneGrant = null,
 }) {
   const prompt = String(payload?.prompt || '');
   if (!prompt.trim()) throw notApplied('dispatch-lane: refusing to start an agent with an empty prompt');
@@ -2628,6 +2673,7 @@ export function buildAgentArgv({
   const sessionEnv = workerMarkerSettingsEnv(settingsEnv);
   const leanFix = payload.launchKind === 'fix' || payload.launchKind === 'ci-heal';
   const sessionSettings = worktreeSettings ? { env: sessionEnv, worktree: worktreeSettings } : { env: sessionEnv };
+  let addDirArgs = [];
   if (leanFix) {
     const forbidden = extraArgs.map(String).find(arg =>
       /^--(?:settings|tools|setting-sources|bare|safe-mode|dangerously-skip-permissions|permission-mode|add-dir|mcp-config)(?:=|$)/.test(arg));
@@ -2636,6 +2682,14 @@ export function buildAgentArgv({
     catch (error) {
       throw notApplied(`dispatch-lane: cannot load lean repair hooks from .claude/settings.json; restore the repo settings before retrying: ${error.message}`);
     }
+    // `--restricted` ignores the local settings file the lane grant is written to, so carry it here.
+    const grant = leanRepairGrant(payload, laneGrant);
+    sessionSettings.permissions = {
+      ...sessionSettings.permissions,
+      allow: [...new Set([...(sessionSettings.permissions?.allow ?? []), ...grant.allow])],
+      additionalDirectories: grant.additionalDirectories,
+    };
+    addDirArgs = grant.additionalDirectories.flatMap(dir => ['--add-dir', dir]);
   }
   // #3857 — the decided model goes FIRST as exactly one `--model <id>`; a hand-set one in `extraArgs` is
   // honoured only with a reason (see {@link resolveWorkerModel}), and never left riding alongside.
@@ -2683,7 +2737,8 @@ export function buildAgentArgv({
     // #x9fbg1x — `worktree` rides in the SAME object, never a second `--settings` flag (the CLI would only
     // honour the last one anyway).
     '--settings', JSON.stringify(sessionSettings),
-    ...(leanFix ? ['--restricted', '--tools', LEAN_FIX_TOOLS, '--strict-mcp-config', '--disable-slash-commands'] : []),
+    // `--add-dir <directories...>` is variadic, so it goes right before `--restricted`, which closes it.
+    ...(leanFix ? [...addDirArgs, '--restricted', '--tools', LEAN_FIX_TOOLS, '--strict-mcp-config', '--disable-slash-commands'] : []),
     ...(systemPromptFile ? ['--append-system-prompt-file', String(systemPromptFile)] : []),
     ...(table ? [...effortArgs, ...modelArgs] : []),
     ...args,
