@@ -321,10 +321,12 @@ export const DEFAULT_VERIFY_TTL_MINUTES = 30;
  *  `computeWorkingTreeHash`) the IO shell computed BEFORE this call — carried through so a later `request`/
  *  `verify` can tell "the tree is byte-identical to what this record verified" apart from "same commit, tree
  *  moved since"; omitted/`null` (every existing caller) never enables that fast path. */
-export function verifyStartBody({ sha, suites, startedAt, treeHash, runId }) {
+export function verifyStartBody({ sha, suites, startedAt, treeHash, runId, selection, requeue, gateUncapped, gateExplicit }) {
   return {
     sha: sha || null,
     status: 'running',
+    ...(gateExplicit ? { gateExplicit: true } : {}),
+    ...(selection ? { selection: { ...selection, tests: Array.isArray(selection.tests) ? selection.tests.length : selection.tests } } : {}), ...(requeue ? { requeue } : {}), ...(gateUncapped ? { gateUncapped: true } : {}),
     startedAt: startedAt || null,
     finishedAt: null,
     suites: suites || null,
@@ -373,6 +375,7 @@ export function verifyFinishBody(prev, { finishedAt, exitCode, sha, treeHash, su
   return {
     sha: sha ?? base.sha ?? null,
     status: failure ? 'infrastructure-failure' : green ? 'green' : 'red',
+    ...Object.fromEntries(['selection', 'requeue', 'gateUncapped', 'gateExplicit', 'runId'].filter(k => base[k] !== undefined).map(k => [k, base[k]])),
     ...(failure ? { infrastructure: failure } : {}),
     ...retryAuditOf({ retriedTimeouts, retriedFailures, isolatedRetry, flakes }),
     // A test verdict only: an infrastructure failure produced no verdict, so it carries no failing-test names.
