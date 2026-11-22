@@ -1,5 +1,15 @@
 {
   "version": 1,
-  "entries": [],
+  "entries": [
+    {
+      "test": "scripts/conveyor/soak/daemon-soak.soak.test.mjs",
+      "brokenSha": "70001b920c55f4423d028a2a18d3d79c8a8b2757",
+      "owner": "orchestrator",
+      "reason": "daemon-soak 50-tick test hits its 1020s timeout (passed in 1017s on the parent); fix #7372 raises the limit; R1087 / rule 29",
+      "addedAt": 1795391776243,
+      "expiresAt": 1795406176243,
+      "job": "soak-shard (1)"
+    }
+  ],
   "mode": "quarantine"
 }
