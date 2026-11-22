@@ -20,6 +20,12 @@ import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 // `jury-core.mjs`, a real import-graph regression that broke the ephemeral-clone CLI tests), and the whole
 // point of the second test below is proving the transform ACTUALLY ran on the shape `codexJudgeSpawn` received.
 const codexJudgeSpawnCalls = [];
+// PR #7337 (review.crossVendorKeySeats): a counted correctness/security seat is admitted only with a CLI-OBSERVED
+// served model. The real claude/codex spawns do not report one yet (filed as a follow-up card on PR #7337), so the
+// tests that drive a counted seat end to end opt in to a stubbed served model here; every other test leaves both
+// unset. Reset after each test.
+const servedModels = { claude: null, codex: null };
+afterEach(() => { servedModels.claude = null; servedModels.codex = null; });
 vi.mock('../../lib/codex-judge-spawn.mjs', async (importOriginal) => {
   const actual = await importOriginal();
   return {
@@ -29,6 +35,7 @@ vi.mock('../../lib/codex-judge-spawn.mjs', async (importOriginal) => {
       return {
         value: { ok: true }, sessionId: 'codex-sess', costUsd: 0, durationMs: 1, wallMs: 1, numTurns: 1,
         stopReason: 'turn.completed', usage: {}, loadedContextTokens: 0, timedOut: false, argv: [],
+        ...(servedModels.codex ? { servedModel: servedModels.codex } : {}),
       };
     },
   };
@@ -66,6 +73,7 @@ vi.mock('../../lib/judge-spawn.mjs', async (importOriginal) => {
       return {
         value: { fromClaude: true }, sessionId: 'claude-sess', costUsd: 0.01, durationMs: 1, wallMs: 1,
         numTurns: 1, stopReason: 'tool_use', usage: {}, loadedContextTokens: 0, timedOut: false, argv: [],
+        ...(servedModels.claude ? { servedModel: servedModels.claude } : {}),
       };
     },
   };
@@ -74,6 +82,15 @@ vi.mock('../../lib/judge-spawn.mjs', async (importOriginal) => {
 const { createDefaultJudge, resolveJudgeProvider, JUDGE_PROVIDER_NAMES, unwrapJudgeOutcome } = await import('../cli-adapter.mjs');
 const { judgeSpawn } = await import('../../lib/judge-spawn.mjs');
 const { buildReviewJudgeRequest, buildReviewAdvisoryJudgeRequest, DEFAULT_LENS } = await import('../review-pr.mjs');
+const { buildDelegationMarker } = await import('../../lib/delegation-marker.mjs');
+
+// Hermetic builder identity for the counted-seat tests: the PR body carries a delegation marker, the dispatch
+// ledger reads empty, and seat-ledger appends are captured, so nothing reads or writes host state.
+const builderBody = (provider, model) => buildDelegationMarker({ provider, model, taskType: 'bugfix' });
+const CODEX_BUILT = builderBody('codex', 'gpt-6.1-sol');
+const CLAUDE_BUILT = builderBody('claude', 'claude-opus-5-5');
+const hermeticSeat = () => ({ readBuilderRecords: () => [], appendSeat: () => true });
+const everyCodexCallToolFree = () => codexJudgeSpawnCalls.every(call => call.allowedTools === undefined && call.cwd === undefined);
 
 describe('JUDGE_PROVIDER_NAMES', () => {
   it('is exactly claude, codex, antigravity — additive, claude first/default', () => {
@@ -196,16 +213,24 @@ describe('createDefaultJudge — providerName selection end to end (no injected 
   // are `review-pr`'s only current caller of this dispatch's `--judge-provider`/`--provider` threading
   // (`we:scripts/operations/review-dispatch.mjs`). `buildReviewJudgeRequest` is the actual recipe those steps
   // use, and it is UNCONDITIONALLY tool-bearing (`REVIEW_JUROR_TOOLS`, by ratified design — see its own header).
-  // This drives THAT real request, not a stand-in, to pin down the actual, intended outcome: `--provider=codex`
-  // can never reach a real `review-pr` judge step today.
-  it('the REAL review-pr.mjs judge request (not a synthetic stand-in) is refused for providerName: \'codex\'', async () => {
-    const judgeFn = createDefaultJudge({ providerName: 'codex', cwd: '/tmp/x' });
+  // This drives THAT real request, not a stand-in. PR #7337 (operator ruling R1035: review.crossVendorKeySeats
+  // supersedes the #2115 refusal): a whole-run `--provider=codex` no longer refuses the mandatory seat; the seat
+  // reroutes to a provider other than codex, and codex never receives the seat's tools or the lane cwd.
+  it('the REAL review-pr.mjs judge request (not a synthetic stand-in) under providerName: \'codex\' reroutes the mandatory seat off codex; codex never gets tools or cwd', async () => {
+    codexJudgeSpawnCalls.length = 0;
+    claudeJudgeSpawnCalls.length = 0;
+    servedModels.claude = 'claude-sonnet-5-5';
+    const judgeFn = createDefaultJudge({ providerName: 'codex', cwd: '/tmp/x', ...hermeticSeat() });
     const read = {
-      repo: 'o/r', pr: 1, title: 't', body: '', netChangedFiles: ['a.mjs'], diffText: 'diff',
+      repo: 'o/r', pr: 1, title: 't', body: CODEX_BUILT, headMessage: 'build', netChangedFiles: ['a.mjs'], diffText: 'diff',
     };
     const request = buildReviewJudgeRequest({ read, lens: DEFAULT_LENS });
     expect(request.allowedTools).toBeTruthy();
-    await expect(judgeFn(request)).rejects.toThrow(/TOOL-FREE panelist only/);
+    await expect(judgeFn(request)).resolves.toBeDefined();
+    expect(codexJudgeSpawnCalls).toHaveLength(0);
+    expect(claudeJudgeSpawnCalls).toHaveLength(1);
+    expect(claudeJudgeSpawnCalls[0].allowedTools.length).toBeGreaterThan(0);
+    expect(claudeJudgeSpawnCalls[0].cwd).toBe('/tmp/x');
   });
 
   // #3383 — the fifth seat's provider, same coverage shape as the codex seat's above.
@@ -446,12 +471,14 @@ describe('createDefaultJudge - a codex-routed request never carries the lane cwd
 });
 
 describe('createDefaultJudge - the REAL review-pr requests route correctly through ONE factory (PR #2117 review: dispatch/`--provider=codex` composed path)', () => {
-  const read = { repo: 'o/r', pr: 1, title: 't', body: '', netChangedFiles: ['a.mjs'], diffText: 'diff' };
+  // PR #7337: a counted seat needs a known builder (cross-vendor rule); this PR was built by codex, so the Claude
+  // seat is the independent one. Builder identity is hermetic (see hermeticSeat above).
+  const read = { repo: 'o/r', pr: 1, title: 't', body: CODEX_BUILT, headMessage: 'build', netChangedFiles: ['a.mjs'], diffText: 'diff' };
 
   it('a mandatory (tool-bearing) seat goes to the claude provider WITH its lane cwd and tools; the advisory seat goes to codex with NO tools, NO cwd, NO Claude model', async () => {
     const claudeCalls = [];
-    const claudeStub = async (req) => { claudeCalls.push(req); return { value: {}, costUsd: 0 }; };
-    const judgeFn = createDefaultJudge({ cwd: '/some/lane', provider: claudeStub });
+    const claudeStub = async (req) => { claudeCalls.push(req); return { value: {}, costUsd: 0, servedModel: 'claude-sonnet-5-5' }; };
+    const judgeFn = createDefaultJudge({ cwd: '/some/lane', provider: claudeStub, ...hermeticSeat() });
 
     await judgeFn(buildReviewJudgeRequest({ read, lens: DEFAULT_LENS }));
     expect(claudeCalls).toHaveLength(1);
@@ -470,16 +497,37 @@ describe('createDefaultJudge - the REAL review-pr requests route correctly throu
     expect(codexJudgeSpawnCalls[0].model).toBe('gpt-6-astra');
   });
 
-  it('`--provider=codex` for the whole run (factory providerName codex) is refused at the first tool-bearing seat - exactly why review-dispatch refuses it', async () => {
+  // Operator ruling R1035 (PR #7337): review.crossVendorKeySeats supersedes the #2115 tool-free refusal. A
+  // whole-run `--provider=codex` factory no longer throws at the first tool-bearing seat: the mandatory seat
+  // reroutes to an independent provider, and codex is never handed the seat's tools or the lane cwd.
+  it('`--provider=codex` for the whole run (factory providerName codex): a codex-built PR reroutes the mandatory seat to claude, with tools and cwd; codex is never called', async () => {
     codexJudgeSpawnCalls.length = 0;
-    const judgeFn = createDefaultJudge({ providerName: 'codex', cwd: '/some/lane' });
-    await expect(judgeFn(buildReviewJudgeRequest({ read, lens: DEFAULT_LENS }))).rejects.toThrow(/TOOL-FREE panelist only/);
+    claudeJudgeSpawnCalls.length = 0;
+    servedModels.claude = 'claude-sonnet-5-5';
+    const judgeFn = createDefaultJudge({ providerName: 'codex', cwd: '/some/lane', ...hermeticSeat() });
+    await expect(judgeFn(buildReviewJudgeRequest({ read, lens: DEFAULT_LENS }))).resolves.toBeDefined();
     expect(codexJudgeSpawnCalls).toHaveLength(0);
+    expect(claudeJudgeSpawnCalls).toHaveLength(1);
+    expect(claudeJudgeSpawnCalls[0].allowedTools.length).toBeGreaterThan(0);
+    expect(claudeJudgeSpawnCalls[0].cwd).toBe('/some/lane');
+  });
+
+  it('`--provider=codex` for the whole run: a Claude-built PR reroutes the mandatory seat to codex WITHOUT tools and WITHOUT the lane cwd; claude is never called', async () => {
+    codexJudgeSpawnCalls.length = 0;
+    claudeJudgeSpawnCalls.length = 0;
+    servedModels.codex = 'gpt-6.1-sol';
+    const judgeFn = createDefaultJudge({ providerName: 'codex', cwd: '/some/lane', ...hermeticSeat() });
+    const request = buildReviewJudgeRequest({ read: { ...read, body: CLAUDE_BUILT }, lens: DEFAULT_LENS });
+    expect(request.allowedTools.length).toBeGreaterThan(0);
+    await expect(judgeFn(request)).resolves.toBeDefined();
+    expect(claudeJudgeSpawnCalls).toHaveLength(0);
+    expect(codexJudgeSpawnCalls).toHaveLength(1);
+    expect(everyCodexCallToolFree()).toBe(true);
   });
 
   it('the opt-in advisory seat still runs on codex under the same whole-run `--provider=codex` factory', async () => {
     codexJudgeSpawnCalls.length = 0;
-    const judgeFn = createDefaultJudge({ providerName: 'codex', cwd: '/some/lane' });
+    const judgeFn = createDefaultJudge({ providerName: 'codex', cwd: '/some/lane', ...hermeticSeat() });
     await expect(judgeFn(buildReviewAdvisoryJudgeRequest({ read }))).resolves.toBeDefined();
     expect(codexJudgeSpawnCalls).toHaveLength(1);
     expect(codexJudgeSpawnCalls[0].cwd).toBeUndefined();

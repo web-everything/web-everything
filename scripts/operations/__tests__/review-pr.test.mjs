@@ -8,6 +8,7 @@ import { createReviewPrSinks, fullReviewAnchor } from '../review-pr-io.mjs';
 import { frozenWriteUpStore } from './helpers/frozen-writeup-store.mjs';
 import { assertMandatoryReferralsCleared, buildVerdictComment } from '../../review-set-label.mjs';
 import { reviewedHeadsOf } from '../../conveyor/mechanical-round-cap.mjs';
+import { buildDelegationMarker } from '../../lib/delegation-marker.mjs';
 /**
  * @file review-pr.test.mjs — the `review-pr` declaration and its derived command line (#3035).
  *
@@ -4965,10 +4966,13 @@ describe('disabled agy shadows at the launch boundary', () => {
   it.each([undefined, false, true])('runs only Claude for mandatory seats and renders off (setting), without invoking the agy runner (promotion=%s)', async promoted => {
     const seatSettings = loadReviewSeatSettings({ promoted: promoted === undefined ? undefined : { value: promoted, source: 'fixture' }, safeguards: { value: { shadowEnabled: false, sampleRate: 0.1, minNonClaudeSeats: 1 } }, log: () => {} });
     const declaration = buildReviewPrOperation({ readPr: stubReader(), seatSettings });
-    const read = shapeReadFinding(stubReader()({ pr: 7, repo: 'o/n' }), { pr: 7, repo: 'o/n' });
+    // PR #7337 (cross-vendor counted seats): a hermetic codex builder identity, so the Claude seats are the
+    // independent ones; the stub reports the served model the observed-model admission check requires.
+    const read = { ...shapeReadFinding(stubReader()({ pr: 7, repo: 'o/n' }), { pr: 7, repo: 'o/n' }),
+      body: buildDelegationMarker({ provider: 'codex', model: 'gpt-6.1-sol', taskType: 'bugfix' }), headMessage: 'build' };
     const seatRunner = vi.fn(() => { throw new Error('agy must not start'); });
-    const provider = vi.fn(async () => ({ value: CLEAN_ANSWER }));
-    const judge = createDefaultJudge({ provider, seatRunner });
+    const provider = vi.fn(async () => ({ value: CLEAN_ANSWER, servedModel: 'claude-sonnet-5-5' }));
+    const judge = createDefaultJudge({ provider, seatRunner, readBuilderRecords: () => [], appendSeat: () => true });
     for (const name of ['judge', 'judgeSecurity']) {
       const request = declaration.steps.find(s => s.name === name).step.request({ input: { lens: 'correctness' }, findings: { read } });
       await judge(request);
