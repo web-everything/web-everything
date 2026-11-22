@@ -40,7 +40,16 @@ export function prFileContract({ name, load, reader, run, fields, cliMain, recon
         const key = reconcile ? 'readPrs' : 'listPrs';
         const expected = mod[run]({ ...options, [key]: () => fixture });
         const actual = mod[run]({ ...options, [key]: () => readPrsFromFile(path) });
-        expect(actual).toEqual(expected);
+        // owedFixRecovery.token is a per-call lookup key (process-wide sequence), so two plans never share it.
+        // Pin that each plan carries its own distinct token, then compare everything else.
+        const withoutToken = (plan) => {
+          if (!reconcile || !plan.owedFixRecovery) return plan;
+          const { token, ...rest } = plan.owedFixRecovery;
+          expect(typeof token).toBe('string');
+          return { ...plan, owedFixRecovery: rest };
+        };
+        if (reconcile) expect(actual.owedFixRecovery?.token).not.toBe(expected.owedFixRecovery?.token);
+        expect(withoutToken(actual)).toEqual(withoutToken(expected));
         expect(reconcile ? actual.dispatch.length + actual.refusals.length : actual.length).toBeGreaterThan(0);
       });
     });
